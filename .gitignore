@@ -61,7 +61,7 @@ htmlcov/
 tests/temp_test_output/
 
 # Claude Code - Research Files (not structure)
-# Ignore research files in root claudedocs
+# Ignore research files in root claudedocs (eco-coach shared)
 /claudedocs/*.md
 /claudedocs/**/*.md
 /claudedocs/**/*.json

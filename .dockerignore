@@ -1,0 +1,62 @@
+# Prevent copying host instances directory with sessions
+instances/
+
+# Prevent copying host logs
+logs/
+
+# Documentation and examples
+claudedocs/
+docs/
+examples/
+
+# Tests
+tests/
+
+# Claude Code user config
+.claude/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.pytest_cache/
+
+# Virtual Environments
+venv/
+ENV/
+env/
+.venv/
+
+# Environment Variables
+.env
+.env.local
+.env.*.local
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Git
+.git/
+.gitignore
+
+# Testing
+.coverage
+htmlcov/
+tests/temp_test_output/
+
+# Secrets
+secrets/
+
+# Temporary
+temp/
+tmp/
+*.tmp
+.wrapper-*.pid

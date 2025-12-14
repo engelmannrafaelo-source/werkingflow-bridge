@@ -92,7 +92,7 @@ async def test_progress_monitoring_http():
         print("   ⚠️  No session ID found in response - checking logs for session IDs...")
         # Read recent wrapper logs to find session ID
         try:
-            log_file = Path("/app/edeaibridge/logs/app.log")
+            log_file = Path("/Users/lorenz/ECO/projects/eco-openai-wrapper/logs/app.log")
             with open(log_file) as f:
                 lines = f.readlines()
                 # Get last 100 lines
@@ -117,13 +117,13 @@ async def test_progress_monitoring_http():
     # Wait a bit for files to be written
     time.sleep(3)
 
-    session_dir = Path(f"/tmp/edeaibridge-sessions/{session_id}")
+    session_dir = Path(f"/tmp/eco-wrapper-sessions/{session_id}")
 
     print("\n2. Checking session directory...")
     if not session_dir.exists():
         print(f"   ❌ Session directory not found: {session_dir}")
         print(f"   Checking if any sessions exist...")
-        sessions_base = Path("/tmp/edeaibridge-sessions")
+        sessions_base = Path("/tmp/eco-wrapper-sessions")
         if sessions_base.exists():
             sessions = list(sessions_base.iterdir())
             print(f"   Found {len(sessions)} sessions:")

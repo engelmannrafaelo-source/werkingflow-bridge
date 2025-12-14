@@ -1299,7 +1299,7 @@ def create_session_dir(session_id: str, base_dir: Optional[Path] = None) -> Path
     # Determine base directory for sessions
     if base_dir is None:
         # Fallback to /tmp if no base_dir provided
-        base_dir = Path("/tmp/edeaibridge-sessions")
+        base_dir = Path("/tmp/eco-wrapper-sessions")
     else:
         # Use instance-specific temp directory
         base_dir = base_dir / "temp" / "sessions"

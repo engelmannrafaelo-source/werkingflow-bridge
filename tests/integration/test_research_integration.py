@@ -83,7 +83,7 @@ def check_claudedocs_directory() -> Path:
     """Finde claudedocs/ directory wo Research Reports landen."""
     # Check verschiedene mögliche Locations
     possible_paths = [
-        Path("/app/edeaibridge/claudedocs"),
+        Path("/Users/lorenz/ECO/projects/eco-openai-wrapper/claudedocs"),
         Path.cwd() / "claudedocs",
         Path.home() / "claudedocs"
     ]
@@ -412,7 +412,7 @@ MANUAL RUN INSTRUCTIONS
 ===========================================
 
 1. Start Wrapper:
-   cd /app/edeaibridge
+   cd /Users/lorenz/ECO/projects/eco-openai-wrapper
    ./start-wrappers.sh
 
 2. Set Environment Variables:
@@ -436,7 +436,7 @@ MANUAL RUN INSTRUCTIONS
    ls -lah tests/integration/research_outputs/
 
    # Research Reports (falls erstellt)
-   ls -lah /app/edeaibridge/claudedocs/
+   ls -lah /Users/lorenz/ECO/projects/eco-openai-wrapper/claudedocs/
 
 ===========================================
 EXPECTED BEHAVIOR

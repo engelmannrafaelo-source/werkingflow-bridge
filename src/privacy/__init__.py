@@ -1,5 +1,5 @@
 """
-Privacy Module for EDEAIBridge
+Privacy Module for eco-openai-wrapper
 
 DSGVO-compliant PII detection and anonymization using Microsoft Presidio.
 Provides transparent middleware for automatic message anonymization/de-anonymization.

@@ -57,7 +57,7 @@ async def test_progress_monitoring():
         print("   ❌ No session ID found")
         return False
 
-    session_dir = Path(f"/tmp/edeaibridge-sessions/{session_id}")
+    session_dir = Path(f"/tmp/eco-wrapper-sessions/{session_id}")
 
     # Wait a bit for files to be written
     time.sleep(2)

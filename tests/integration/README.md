@@ -11,7 +11,7 @@ Diese Integration Tests führen **ECHTE Research-Anfragen** über den OpenAI Wra
 ### 1. Wrapper muss laufen
 
 ```bash
-cd /Users/lorenz/ECO/projects/edeaibridge
+cd /Users/lorenz/ECO/projects/eco-openai-wrapper
 ./start-wrappers.sh
 ```
 
@@ -101,7 +101,7 @@ tests/integration/research_outputs/
 
 ### Research Reports (SuperClaude)
 ```
-/Users/lorenz/ECO/projects/edeaibridge/claudedocs/
+/Users/lorenz/ECO/projects/eco-openai-wrapper/claudedocs/
 ├── research_report_20251012_143045.md
 └── ...
 ```
@@ -120,7 +120,7 @@ tests/integration/research_outputs/
 ⏱️  End: 14:33:45 (Duration: 203.2s)
 ✅ Response received: 8543 characters
 💾 Saved to: tests/integration/research_outputs/research_async_await_20251012_143022.txt
-📂 Checking for research report in: /Users/lorenz/ECO/projects/edeaibridge/claudedocs
+📂 Checking for research report in: /Users/lorenz/ECO/projects/eco-openai-wrapper/claudedocs
 📄 Found research report: research_report_20251012_143045.md
    Size: 12.3 KB
    Modified: 14:33:45
@@ -167,7 +167,7 @@ claude login
 
 Diese Tests gehören zu **Phase 3: E2E Tests** im Test Plan, nicht Phase 1 Unit Tests!
 
-Siehe: `/Users/lorenz/ECO/projects/edeaibridge/temp_debugging_lorenz_20251011_083328/TEST_PLAN.md`
+Siehe: `/Users/lorenz/ECO/projects/eco-openai-wrapper/temp_debugging_lorenz_20251011_083328/TEST_PLAN.md`
 
 ## Debugging
 
@@ -179,10 +179,10 @@ pytest tests/integration/test_research_integration.py -v -s --log-cli-level=DEBU
 ### Check Wrapper Logs
 ```bash
 # Main wrapper log
-tail -f /Users/lorenz/ECO/projects/edeaibridge/logs/wrapper_main_*.log
+tail -f /Users/lorenz/ECO/projects/eco-openai-wrapper/logs/wrapper_main_*.log
 
 # Session logs
-tail -f /Users/lorenz/ECO/projects/edeaibridge/logs/wrapper_main_session_*.log
+tail -f /Users/lorenz/ECO/projects/eco-openai-wrapper/logs/wrapper_main_session_*.log
 ```
 
 ### Manual Testing

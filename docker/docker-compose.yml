@@ -1,16 +1,18 @@
 services:
-  # EDEAIBridge - OpenAI-compatible Claude Gateway
-  edeaibridge:
+  # Universal Wrapper - accessible on all 3 ports for backwards compatibility
+  eco-wrapper:
     build:
       context: ..
       dockerfile: docker/Dockerfile
-    container_name: edeaibridge
+    container_name: eco-wrapper-universal
 
-    # Port mapping
+    # Multi-port mapping: One container, accessible on all legacy ports
     ports:
-      - "8000:8000"
+      - "8000:8000"  # Primary port
+      - "8010:8000"  # eco-backend compatibility
+      - "8020:8000"  # eco-diagnostics compatibility
 
-    # Memory limit: 4 GB
+    # Memory limit: 4 GB (down from ~8 GB with 3 containers)
     deploy:
       resources:
         limits:
@@ -18,11 +20,11 @@ services:
         reservations:
           memory: 1G
 
-    # Persistent storage
+    # Unified persistent storage
     volumes:
-      - edeaibridge-logs:/app/logs
-      - edeaibridge-instances:/app/instances
-      - ~/edeaibridge-research-output:/app/research_output
+      - eco-wrapper-logs:/app/logs
+      - eco-wrapper-instances:/app/instances
+      - ~/eco-research-output:/app/research_output
 
     # OAuth Token via Secret
     secrets:
@@ -41,10 +43,13 @@ services:
       - FILTER_SENSITIVE_DATA=true
 
       # Instance Name
-      - INSTANCE_NAME=edeaibridge
+      - INSTANCE_NAME=eco-wrapper-universal
 
       # Working Directory (for session isolation)
       - CLAUDE_CWD=/app/instances
+
+      # MCP Isolation
+      - DISABLE_COACH_MCP=true
 
       # Timeout (40 min for research)
       - MAX_TIMEOUT=2400000
@@ -74,11 +79,11 @@ services:
     # Restart Policy
     restart: unless-stopped
 
-# Named Volumes
+# Unified Named Volumes (simplified from 6 to 2 volumes)
 volumes:
-  edeaibridge-logs:
+  eco-wrapper-logs:
     driver: local
-  edeaibridge-instances:
+  eco-wrapper-instances:
     driver: local
 
 # Secrets

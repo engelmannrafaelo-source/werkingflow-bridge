@@ -87,13 +87,11 @@ class MessageAdapter:
             for pattern in tool_patterns:
                 content = re.sub(pattern, '', content, flags=re.DOTALL)
         
-        # Pattern to match image references or base64 data
-        image_pattern = r'\[Image:.*?\]|data:image/.*?;base64,.*?(?=\s|$)'
-        
-        def replace_image(match):
-            return "[Image: Content not supported by Claude Code]"
-        
-        content = re.sub(image_pattern, replace_image, content)
+        # NOTE: Image handling moved to VisionProvider
+        # Images are now routed to direct Anthropic API instead of being filtered out
+        # Only remove image placeholders that were already processed
+        placeholder_pattern = r'\[Image: Content not supported by Claude Code\]'
+        content = re.sub(placeholder_pattern, '', content)
         
         # Clean up extra whitespace and newlines
         content = re.sub(r'\n\s*\n\s*\n', '\n\n', content)  # Multiple newlines to double

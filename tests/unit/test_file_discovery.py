@@ -285,7 +285,7 @@ MANUAL RUN INSTRUCTIONS
 ===========================================
 
 1. Activate virtual environment:
-   cd /app/edeaibridge
+   cd /Users/lorenz/ECO/projects/eco-openai-wrapper
    source .venv/bin/activate
 
 2. Run all file discovery tests:

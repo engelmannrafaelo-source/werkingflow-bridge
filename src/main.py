@@ -43,6 +43,7 @@ from src.models import (
 )
 from src.claude_cli import ClaudeCodeCLI
 from src.message_adapter import MessageAdapter
+from src.vision_provider import VisionProvider, get_vision_provider
 from src.auth import verify_api_key, security, validate_claude_code_auth, get_claude_code_auth_info
 from src.parameter_validator import ParameterValidator, CompatibilityReporter
 from src.file_discovery import FileDiscoveryService
@@ -158,7 +159,7 @@ async def cleanup_old_sessions():
 
     Scans all instance directories for temp/sessions folders.
     """
-    INSTANCES_DIR = Path(os.getenv("CLAUDE_CWD", "/app/instances"))
+    INSTANCES_DIR = Path("/Users/lorenz/ECO/projects/eco-openai-wrapper/instances")
     RETENTION_HOURS = 24
     CHECK_INTERVAL_SECONDS = 3600  # 1 hour
 
@@ -378,7 +379,8 @@ async def lifespan(app: FastAPI):
         logger.debug(f"   DEBUG_MODE: {DEBUG_MODE}")
         logger.debug(f"   VERBOSE: {VERBOSE}")
         logger.debug(f"   PORT: {os.getenv('PORT', '8000')}")
-        logger.debug(f"   CORS_ORIGINS: {os.getenv('CORS_ORIGINS', '[\"*\"]')}")
+        cors_default = '["*"]'
+        logger.debug(f"   CORS_ORIGINS: {os.getenv('CORS_ORIGINS', cors_default)}")
         logger.debug(f"   MAX_TIMEOUT: {os.getenv('MAX_TIMEOUT', '600000')}")
         logger.debug(f"   CLAUDE_CWD: {os.getenv('CLAUDE_CWD', 'Not set')}")
         logger.debug(f"🔧 Available endpoints:")
@@ -556,6 +558,83 @@ async def generate_streaming_response(
     streaming_started = asyncio.Event()  # Signal when streaming starts (prevents race condition)
 
     try:
+        # ===================================================================
+        # VISION ROUTING: Check for images and route to direct Anthropic API
+        # For streaming, we do a "fake stream" - send vision response as chunks
+        # ===================================================================
+        messages_for_vision = [
+            {'role': m.role, 'content': m.content}
+            for m in request.messages
+        ]
+
+        if VisionProvider.has_images(messages_for_vision):
+            logger.info("🖼️ Vision streaming request detected - routing to direct Anthropic API")
+
+            vision_provider = get_vision_provider()
+
+            try:
+                vision_response = await vision_provider.analyze(
+                    messages=messages_for_vision,
+                    model=request.model,
+                    max_tokens=request.max_tokens or 4096,
+                    temperature=request.temperature or 0.7
+                )
+
+                # Send initial role chunk
+                initial_chunk = ChatCompletionStreamResponse(
+                    id=request_id,
+                    model=request.model,
+                    choices=[StreamChoice(
+                        index=0,
+                        delta={"role": "assistant", "content": ""},
+                        finish_reason=None
+                    )]
+                )
+                yield f"data: {initial_chunk.model_dump_json()}\n\n"
+
+                # Send content as single chunk (could be split for better UX)
+                content_chunk = ChatCompletionStreamResponse(
+                    id=request_id,
+                    model=request.model,
+                    choices=[StreamChoice(
+                        index=0,
+                        delta={"content": vision_response.content},
+                        finish_reason=None
+                    )]
+                )
+                yield f"data: {content_chunk.model_dump_json()}\n\n"
+
+                # Send final chunk
+                final_chunk = ChatCompletionStreamResponse(
+                    id=request_id,
+                    model=request.model,
+                    choices=[StreamChoice(
+                        index=0,
+                        delta={},
+                        finish_reason="stop"
+                    )]
+                )
+                yield f"data: {final_chunk.model_dump_json()}\n\n"
+                yield "data: [DONE]\n\n"
+
+                logger.info("✅ Vision streaming request completed")
+                return  # Exit generator after vision response
+
+            except Exception as e:
+                logger.error(f"❌ Vision streaming request failed: {e}", exc_info=True)
+                error_chunk = {
+                    "error": {
+                        "message": f"Vision analysis failed: {str(e)}",
+                        "type": "vision_error"
+                    }
+                }
+                yield f"data: {json.dumps(error_chunk)}\n\n"
+                return
+
+        # ===================================================================
+        # END VISION ROUTING - Continue with normal SDK streaming
+        # ===================================================================
+
         # Process messages with session management
         all_messages, actual_session_id = session_manager.process_messages(
             request.messages, request.session_id
@@ -1011,6 +1090,78 @@ async def chat_completions(
             )
         else:
             # Non-streaming response
+
+            # ===================================================================
+            # VISION ROUTING: Check for images and route to direct Anthropic API
+            # Claude Code SDK doesn't support multimodal - use VisionProvider
+            # ===================================================================
+            messages_for_vision = [
+                {'role': m.role, 'content': m.content}
+                for m in request_body.messages
+            ]
+
+            if VisionProvider.has_images(messages_for_vision):
+                logger.info("🖼️ Vision request detected - routing to direct Anthropic API")
+
+                vision_provider = get_vision_provider()
+
+                try:
+                    vision_response = await vision_provider.analyze(
+                        messages=messages_for_vision,
+                        model=request_body.model,
+                        max_tokens=request_body.max_tokens or 4096,
+                        temperature=request_body.temperature or 0.7
+                    )
+
+                    # Build OpenAI-compatible response
+                    response = ChatCompletionResponse(
+                        id=request_id,
+                        model=vision_response.model,
+                        choices=[Choice(
+                            index=0,
+                            message=Message(role="assistant", content=vision_response.content),
+                            finish_reason="stop"
+                        )],
+                        usage=Usage(
+                            prompt_tokens=vision_response.usage["prompt_tokens"],
+                            completion_tokens=vision_response.usage["completion_tokens"],
+                            total_tokens=vision_response.usage["total_tokens"]
+                        )
+                    )
+
+                    # Log vision completion
+                    duration = time.time() - start_time
+                    EventLogger.log_chat_completion(
+                        session_id="vision",
+                        model=request_body.model,
+                        message_count=len(request_body.messages),
+                        stream=False,
+                        duration=duration,
+                        tokens=vision_response.usage["total_tokens"],
+                        tools_enabled=False
+                    )
+
+                    logger.info(
+                        f"✅ Vision request completed",
+                        extra={
+                            "duration": duration,
+                            "tokens": vision_response.usage["total_tokens"]
+                        }
+                    )
+
+                    return response
+
+                except Exception as e:
+                    logger.error(f"❌ Vision request failed: {e}", exc_info=True)
+                    raise HTTPException(
+                        status_code=500,
+                        detail=f"Vision analysis failed: {str(e)}"
+                    )
+
+            # ===================================================================
+            # END VISION ROUTING - Continue with normal SDK flow
+            # ===================================================================
+
             # Process messages with session management
             all_messages, actual_session_id = session_manager.process_messages(
                 request_body.messages, request_body.session_id
@@ -1510,32 +1661,15 @@ async def research(
                 )
                 # Don't fail the request, just log the error
 
-        # Get file size and content
+        # Get file size if available
         file_size_bytes = None
-        research_content = None
-
-        # Read content from container_file (where Claude Code writes it)
-        if container_file and Path(container_file).exists():
-            try:
-                research_content = Path(container_file).read_text(encoding='utf-8')
-                file_size_bytes = len(research_content.encode('utf-8'))
-                logger.info(f"📄 Read research content: {file_size_bytes} bytes from {container_file}")
-            except Exception as e:
-                logger.error(f"❌ Failed to read research content: {e}")
-        elif output_file and Path(output_file).exists():
-            # Fallback to output_file if container_file doesn't exist
-            try:
-                research_content = Path(output_file).read_text(encoding='utf-8')
-                file_size_bytes = len(research_content.encode('utf-8'))
-                logger.info(f"📄 Read research content: {file_size_bytes} bytes from {output_file}")
-            except Exception as e:
-                logger.error(f"❌ Failed to read research content: {e}")
+        if output_file and Path(output_file).exists():
+            file_size_bytes = Path(output_file).stat().st_size
 
         return ResearchResponse(
             status="success",
             query=request_body.query,
             model=request_body.model,
-            content=research_content,
             output_file=output_file,
             container_file=container_file,
             execution_time_seconds=round(execution_time, 2),
@@ -1560,7 +1694,6 @@ async def research(
             status="error",
             query=request_body.query,
             model=request_body.model,
-            content=None,
             output_file=None,
             container_file=None,
             execution_time_seconds=round(execution_time, 2),

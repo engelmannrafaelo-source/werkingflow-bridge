@@ -257,15 +257,11 @@ class ResearchResponse(BaseModel):
     """
     Response model for research endpoint.
 
-    Returns the full research content directly, plus file paths and execution metadata.
+    Returns both container and host file paths, plus execution metadata.
     """
     status: Literal["success", "error"]
     query: str
     model: str
-    content: Optional[str] = Field(
-        default=None,
-        description="The full research report content (markdown text)"
-    )
     output_file: Optional[str] = Field(
         default=None,
         description="Host filesystem path where research report was saved"

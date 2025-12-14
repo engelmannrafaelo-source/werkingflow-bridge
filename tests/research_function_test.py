@@ -28,19 +28,19 @@ logger = logging.getLogger(__name__)
 # Test configuration - each instance gets a different topic
 WRAPPER_INSTANCES = [
     {
-        "name": "edeaibridge-1",
+        "name": "eco-wrapper-1",
         "port": 8000,
         "topic": "Python async/await best practices",
         "keywords": ["async", "await", "asyncio", "python"]
     },
     {
-        "name": "edeaibridge-2",
+        "name": "eco-wrapper-2",
         "port": 8010,
         "topic": "Docker container security hardening",
         "keywords": ["docker", "container", "security", "hardening"]
     },
     {
-        "name": "edeaibridge-3",
+        "name": "eco-wrapper-3",
         "port": 8020,
         "topic": "React hooks performance optimization",
         "keywords": ["react", "hooks", "performance", "optimization"]
