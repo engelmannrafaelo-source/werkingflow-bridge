@@ -88,3 +88,7 @@ tmp/
 # Secrets & SuperClaude
 secrets/
 superclaude/
+secrets/
+secrets/*
+instances/
+dist/

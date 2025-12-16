@@ -50,26 +50,25 @@ class ClaudeCodeAuthManager:
     def _detect_auth_method(self) -> str:
         """Detect which Claude Code authentication method is configured.
 
-        IMPORTANT: ANTHROPIC_API_KEY auth has been REMOVED!
-        This wrapper ONLY supports Claude CLI OAuth (free, no token costs).
-
-        If ANTHROPIC_API_KEY is detected in environment, it will be IGNORED
-        and a warning will be logged.
+        Priority order:
+        1. Bedrock (CLAUDE_CODE_USE_BEDROCK=1)
+        2. Vertex (CLAUDE_CODE_USE_VERTEX=1)
+        3. Docker/Server: ANTHROPIC_API_KEY (when PRIVACY_ENABLED=true or IN_DOCKER=true)
+        4. Local: Claude CLI OAuth (free, no token costs)
         """
-        # Check for ANTHROPIC_API_KEY and warn if present
-        if os.getenv("ANTHROPIC_API_KEY"):
-            logger.warning("⚠️  ANTHROPIC_API_KEY detected in environment!")
-            logger.warning("⚠️  This wrapper uses Claude CLI OAuth ONLY (no token costs)")
-            logger.warning("⚠️  Remove ANTHROPIC_API_KEY from ~/.zshrc or environment")
-            logger.warning("⚠️  ANTHROPIC_API_KEY will be IGNORED")
-
         if os.getenv("CLAUDE_CODE_USE_BEDROCK") == "1":
             return "bedrock"
         elif os.getenv("CLAUDE_CODE_USE_VERTEX") == "1":
             return "vertex"
-        else:
-            # ALWAYS use Claude CLI OAuth (free, no token costs)
-            return "claude_cli"
+
+        # Docker/Server context: Use ANTHROPIC_API_KEY if available
+        is_docker = os.getenv("PRIVACY_ENABLED") == "true" or os.getenv("IN_DOCKER") == "true"
+        if is_docker and os.getenv("ANTHROPIC_API_KEY"):
+            logger.info("✅ Docker context detected, using ANTHROPIC_API_KEY for authentication")
+            return "anthropic_api"
+
+        # Local context: Use Claude CLI OAuth
+        return "claude_cli"
     
     def _validate_auth_method(self) -> Dict[str, Any]:
         """Validate the detected authentication method."""
@@ -85,6 +84,8 @@ class ClaudeCodeAuthManager:
             status.update(self._validate_bedrock_auth())
         elif method == "vertex":
             status.update(self._validate_vertex_auth())
+        elif method == "anthropic_api":
+            status.update(self._validate_anthropic_api_auth())
         elif method == "claude_cli":
             status.update(self._validate_claude_cli_auth())
         else:
@@ -155,6 +156,26 @@ class ClaudeCodeAuthManager:
             "config": config
         }
     
+    def _validate_anthropic_api_auth(self) -> Dict[str, Any]:
+        """Validate Anthropic API key authentication (Docker/Server context)."""
+        errors = []
+        config = {}
+
+        api_key = os.getenv("ANTHROPIC_API_KEY")
+        if not api_key:
+            errors.append("ANTHROPIC_API_KEY environment variable not set")
+        elif not api_key.startswith("sk-ant-"):
+            errors.append("ANTHROPIC_API_KEY has invalid format (should start with 'sk-ant-')")
+
+        config["api_key_present"] = bool(api_key)
+        config["api_key_valid_format"] = bool(api_key and api_key.startswith("sk-ant-"))
+
+        return {
+            "valid": len(errors) == 0,
+            "errors": errors,
+            "config": config
+        }
+
     def _validate_claude_cli_auth(self) -> Dict[str, Any]:
         """Validate that Claude Code CLI is already authenticated."""
         # For CLI authentication, we assume it's valid and let the SDK handle auth
@@ -171,10 +192,11 @@ class ClaudeCodeAuthManager:
     def get_claude_code_env_vars(self) -> Dict[str, str]:
         """Get environment variables needed for Claude Code SDK.
 
-        IMPORTANT: ANTHROPIC_API_KEY support has been REMOVED!
-        This wrapper ONLY supports Claude CLI OAuth authentication.
-
-        Supports Docker Secrets via CLAUDE_CODE_OAUTH_TOKEN_FILE.
+        Supports:
+        - Bedrock (AWS)
+        - Vertex (GCP)
+        - Anthropic API Key (Docker/Server context)
+        - Claude CLI OAuth (local development)
         """
         env_vars = {}
 
@@ -195,6 +217,13 @@ class ClaudeCodeAuthManager:
                 env_vars["CLOUD_ML_REGION"] = os.getenv("CLOUD_ML_REGION")
             if os.getenv("GOOGLE_APPLICATION_CREDENTIALS"):
                 env_vars["GOOGLE_APPLICATION_CREDENTIALS"] = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
+
+        elif self.auth_method == "anthropic_api":
+            # Docker/Server context: Use ANTHROPIC_API_KEY directly
+            api_key = os.getenv("ANTHROPIC_API_KEY")
+            if api_key:
+                env_vars["ANTHROPIC_API_KEY"] = api_key
+                logger.info("✅ Using ANTHROPIC_API_KEY for Claude Code SDK")
 
         elif self.auth_method == "claude_cli":
             # Docker Secrets support: Read token from file if specified

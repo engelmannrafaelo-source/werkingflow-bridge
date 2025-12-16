@@ -26,14 +26,7 @@ services:
       - eco-wrapper-instances:/app/instances
       - ~/eco-research-output:/app/research_output
 
-    # OAuth Token via Secret
-    secrets:
-      - claude_token
-
     environment:
-      # Token aus Secret lesen (SDK unterstützt file-basiertes Token)
-      - CLAUDE_CODE_OAUTH_TOKEN_FILE=/run/secrets/claude_token
-
       # Timezone
       - TZ=Europe/Vienna
 
@@ -89,8 +82,3 @@ volumes:
     driver: local
   eco-wrapper-instances:
     driver: local
-
-# Secrets
-secrets:
-  claude_token:
-    file: ../secrets/claude_token.txt
