@@ -1,0 +1,27 @@
+{
+  "name": "ai-bridge-sdk",
+  "version": "1.0.0",
+  "description": "AI-Bridge Client SDK - Smart URL resolution with optional fallback",
+  "main": "ai-bridge-client.js",
+  "types": "ai-bridge-client.d.ts",
+  "scripts": {
+    "build": "tsc",
+    "test": "npx tsx ai-bridge-client.ts"
+  },
+  "dependencies": {
+    "openai": "^4.0.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.0.0"
+  },
+  "peerDependencies": {
+    "openai": ">=4.0.0"
+  },
+  "keywords": [
+    "ai-bridge",
+    "openai",
+    "claude",
+    "sdk"
+  ],
+  "license": "MIT"
+}
