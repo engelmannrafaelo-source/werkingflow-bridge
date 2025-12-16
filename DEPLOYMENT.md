@@ -137,6 +137,35 @@ const response = await fetch(`${AI_BASE_URL}/chat/completions`, {
 
 ---
 
+## Quick-Update Workflow (Häufig genutzt!)
+
+**Wenn du lokale Änderungen auf Hetzner deployen willst:**
+
+```bash
+# 1. Lokal: Änderungen committen und pushen
+cd /Users/rafael/Documents/GitHub/ai-bridge
+git add -A && git commit -m "fix: beschreibung" && git push
+
+# 2. SSH zum Hetzner Server
+ssh root@95.217.180.242
+
+# 3. Auf Hetzner: Pullen und neu bauen
+cd /root/ai-bridge
+git pull
+docker-compose down && docker-compose build --no-cache && docker-compose up -d
+
+# 4. Verifizieren
+curl http://localhost:8000/health
+curl http://localhost:8000/v1/privacy/status
+```
+
+**One-Liner für Hetzner (wenn schon per SSH verbunden):**
+```bash
+cd /root/ai-bridge && git pull && docker-compose down && docker-compose build --no-cache && docker-compose up -d && sleep 30 && curl http://localhost:8000/health
+```
+
+---
+
 ## Wartung & Monitoring
 
 ### Logs anschauen

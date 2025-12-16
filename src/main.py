@@ -49,6 +49,12 @@ from src.parameter_validator import ParameterValidator, CompatibilityReporter
 from src.file_discovery import FileDiscoveryService
 from src.session_manager import session_manager
 from src.privacy import get_privacy_middleware
+from src.tenant import (
+    TenantMiddleware,
+    get_tenant_from_request,
+    get_privacy_mode_from_request,
+    track_request_usage
+)
 # Rate limiting is optional - disable if slowapi not available
 try:
     from src.rate_limiter import limiter, rate_limit_exceeded_handler, get_rate_limit_for_endpoint, rate_limit_endpoint
@@ -423,6 +429,10 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Add tenant-aware middleware for WerkingFlow integration
+# Provides per-tenant privacy modes, rate limiting, and usage tracking
+app.add_middleware(TenantMiddleware)
+
 # Add performance monitoring middleware (FIRST - to track all requests)
 # Pure ASGI implementation - streaming-safe
 from src.middleware.performance_monitor import PerformanceMonitorMiddleware
@@ -644,21 +654,27 @@ async def generate_streaming_response(
         logger.info(f"Chat completion: session_id={actual_session_id}, total_messages={len(all_messages)}")
 
         # Privacy: Anonymize user messages before sending to Claude
+        # Uses tenant's privacy mode from request.state (set by TenantMiddleware)
         privacy_middleware = get_privacy_middleware()
         anonymization_mapping = {}
+        privacy_mode = get_privacy_mode_from_request(fastapi_request) if fastapi_request else "full"
+
         if privacy_middleware.enabled:
             messages_for_anon = [
                 {'role': m.role, 'content': m.content}
                 for m in all_messages
             ]
-            anon_messages, anonymization_mapping = privacy_middleware.anonymize_messages(messages_for_anon)
+            anon_messages, anonymization_mapping = privacy_middleware.anonymize_messages(
+                messages_for_anon,
+                privacy_mode=privacy_mode
+            )
             # Update all_messages with anonymized content
             all_messages = [
                 Message(role=m['role'], content=m['content'])
                 for m in anon_messages
             ]
             if anonymization_mapping:
-                logger.info(f"Privacy (streaming): Anonymized {len(anonymization_mapping)} PII entities")
+                logger.info(f"Privacy (streaming): Anonymized {len(anonymization_mapping)} PII entities (mode={privacy_mode})")
 
         # Convert messages to prompt
         prompt, system_prompt = MessageAdapter.messages_to_prompt(all_messages)
@@ -1095,8 +1111,18 @@ async def chat_completions(
             # VISION ROUTING: Check for images and route to direct Anthropic API
             # Claude Code SDK doesn't support multimodal - use VisionProvider
             # ===================================================================
+            # Convert Pydantic content parts to dicts for VisionProvider compatibility
+            def serialize_content(content):
+                if isinstance(content, str):
+                    return content
+                # List of ContentPart Pydantic models -> list of dicts
+                return [
+                    part.model_dump() if hasattr(part, 'model_dump') else part
+                    for part in content
+                ]
+
             messages_for_vision = [
-                {'role': m.role, 'content': m.content}
+                {'role': m.role, 'content': serialize_content(m.content)}
                 for m in request_body.messages
             ]
 
@@ -1170,21 +1196,27 @@ async def chat_completions(
             logger.info(f"Chat completion: session_id={actual_session_id}, total_messages={len(all_messages)}")
 
             # Privacy: Anonymize user messages before sending to Claude
+            # Uses tenant's privacy mode from request.state (set by TenantMiddleware)
             privacy_middleware = get_privacy_middleware()
             anonymization_mapping = {}
+            privacy_mode = get_privacy_mode_from_request(request)
+
             if privacy_middleware.enabled:
                 messages_for_anon = [
                     {'role': m.role, 'content': m.content}
                     for m in all_messages
                 ]
-                anon_messages, anonymization_mapping = privacy_middleware.anonymize_messages(messages_for_anon)
+                anon_messages, anonymization_mapping = privacy_middleware.anonymize_messages(
+                    messages_for_anon,
+                    privacy_mode=privacy_mode
+                )
                 # Update all_messages with anonymized content
                 all_messages = [
                     Message(role=m['role'], content=m['content'])
                     for m in anon_messages
                 ]
                 if anonymization_mapping:
-                    logger.info(f"Privacy: Anonymized {len(anonymization_mapping)} PII entities")
+                    logger.info(f"Privacy: Anonymized {len(anonymization_mapping)} PII entities (mode={privacy_mode})")
 
             # Convert messages to prompt
             prompt, system_prompt = MessageAdapter.messages_to_prompt(all_messages)

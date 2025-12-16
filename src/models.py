@@ -1,5 +1,5 @@
-from typing import List, Optional, Dict, Any, Union, Literal
-from pydantic import BaseModel, Field, field_validator, model_validator
+from typing import List, Optional, Dict, Any, Union, Literal, Annotated
+from pydantic import BaseModel, Field, field_validator, model_validator, Discriminator
 from enum import Enum
 from datetime import datetime
 import uuid
@@ -9,33 +9,90 @@ from config.logging_config import get_logger
 logger = get_logger(__name__)
 
 
-class ContentPart(BaseModel):
-    """Content part for multimodal messages (OpenAI format)."""
+class TextContentPart(BaseModel):
+    """Text content part for multimodal messages."""
     type: Literal["text"]
     text: str
+
+
+class ImageUrlDetail(BaseModel):
+    """Image URL detail object (OpenAI format)."""
+    url: str
+    detail: Optional[Literal["auto", "low", "high"]] = "auto"
+
+
+class ImageUrlContentPart(BaseModel):
+    """Image URL content part for multimodal messages (OpenAI format)."""
+    type: Literal["image_url"]
+    image_url: ImageUrlDetail
+
+
+class ImageSourceDetail(BaseModel):
+    """Image source detail object (Anthropic format)."""
+    type: Literal["base64"]
+    media_type: str
+    data: str
+
+
+class ImageContentPart(BaseModel):
+    """Image content part for multimodal messages (Anthropic format)."""
+    type: Literal["image"]
+    source: ImageSourceDetail
+
+
+# Union type for all content parts - supports text and images
+# Using Discriminator for proper Pydantic v2 union parsing based on "type" field
+ContentPart = Annotated[
+    Union[TextContentPart, ImageUrlContentPart, ImageContentPart],
+    Discriminator("type")
+]
 
 
 class Message(BaseModel):
     role: Literal["system", "user", "assistant"]
     content: Union[str, List[ContentPart]]
     name: Optional[str] = None
-    
+
     @model_validator(mode='after')
     def normalize_content(self):
-        """Convert array content to string for Claude Code compatibility."""
+        """Convert array content to string for Claude Code compatibility.
+
+        IMPORTANT: If content contains images, do NOT normalize - VisionProvider handles it.
+        """
         if isinstance(self.content, list):
-            # Extract text from content parts and concatenate
+            # Check if content contains images - if so, DON'T normalize
+            has_images = any(
+                (isinstance(part, (ImageUrlContentPart, ImageContentPart))) or
+                (isinstance(part, dict) and part.get("type") in ("image_url", "image"))
+                for part in self.content
+            )
+
+            if has_images:
+                # Keep as list for VisionProvider to handle
+                return self
+
+            # Text-only content: Extract text from content parts and concatenate
             text_parts = []
             for part in self.content:
-                if isinstance(part, ContentPart) and part.type == "text":
+                if isinstance(part, TextContentPart):
                     text_parts.append(part.text)
                 elif isinstance(part, dict) and part.get("type") == "text":
                     text_parts.append(part.get("text", ""))
-            
+
             # Join all text parts with newlines
             self.content = "\n".join(text_parts) if text_parts else ""
-            
+
         return self
+
+    def has_images(self) -> bool:
+        """Check if this message contains image content."""
+        if isinstance(self.content, str):
+            return False
+        return any(
+            isinstance(part, (ImageUrlContentPart, ImageContentPart)) or
+            (isinstance(part, dict) and part.get("type") in ("image_url", "image"))
+            for part in self.content
+        )
 
 
 class ChatCompletionRequest(BaseModel):

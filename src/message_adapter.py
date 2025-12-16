@@ -20,14 +20,28 @@ class MessageAdapter:
                 # Use the last system message as the system prompt
                 system_prompt = message.content
             elif message.role == "user":
+                # Handle multi-modal content (list) vs string content
+                content = message.content
+                if isinstance(content, list):
+                    # Extract text from multi-modal content for prefix detection
+                    text_content = ""
+                    for part in content:
+                        if isinstance(part, dict) and part.get("type") == "text":
+                            text_content += part.get("text", "")
+                        elif hasattr(part, 'type') and part.type == "text":
+                            text_content += getattr(part, 'text', "")
+                    content_str = text_content
+                else:
+                    content_str = content if content else ""
+
                 # Smart Prefix Detection: Slash commands need no "Human:" prefix
                 # for SDK to recognize them (e.g., /sc:research, /sc:test, etc.)
-                if message.content.strip().startswith('/'):
+                if content_str.strip().startswith('/'):
                     # Direct slash command - no prefix
-                    conversation_parts.append(message.content)
+                    conversation_parts.append(content_str)
                 else:
                     # Normal conversation - with prefix
-                    conversation_parts.append(f"Human: {message.content}")
+                    conversation_parts.append(f"Human: {content_str}")
             elif message.role == "assistant":
                 conversation_parts.append(f"Assistant: {message.content}")
         

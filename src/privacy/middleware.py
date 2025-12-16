@@ -83,17 +83,47 @@ class PrivacyMiddleware:
             return False
         return self.anonymizer.is_available
 
-    def anonymize_message(self, content: str) -> tuple[str, Dict[str, str]]:
+    def should_anonymize(self, privacy_mode: Optional[str] = None) -> bool:
+        """
+        Check if anonymization should be performed.
+
+        Privacy modes (from tenant settings):
+        - "none": No anonymization (fast, for internal/technical data)
+        - "basic": Basic anonymization (names, emails only)
+        - "full": Full DSGVO-compliant anonymization (default)
+
+        Args:
+            privacy_mode: Per-request privacy mode override
+
+        Returns:
+            True if anonymization should be performed
+        """
+        # If middleware globally disabled, never anonymize
+        if not self.enabled:
+            return False
+
+        # Check per-request privacy mode
+        if privacy_mode == "none":
+            return False
+
+        return True
+
+    def anonymize_message(
+        self,
+        content: str,
+        privacy_mode: Optional[str] = None
+    ) -> tuple[str, Dict[str, str]]:
         """
         Anonymize a single message content.
 
         Args:
             content: Message content to anonymize
+            privacy_mode: Per-request privacy mode ("none", "basic", "full")
 
         Returns:
             Tuple of (anonymized_content, mapping)
         """
-        if not self.enabled or not content:
+        if not self.should_anonymize(privacy_mode) or not content:
             return content, {}
 
         try:
@@ -101,10 +131,11 @@ class PrivacyMiddleware:
 
             if self.log_detections and result.detected_entities:
                 logger.info(
-                    f"PII detected: {result.entity_count} entities",
+                    f"PII detected: {result.entity_count} entities (mode={privacy_mode or 'default'})",
                     extra={
                         'entity_types': [e.entity_type for e in result.detected_entities],
-                        'language': result.language
+                        'language': result.language,
+                        'privacy_mode': privacy_mode
                     }
                 )
 
@@ -118,7 +149,8 @@ class PrivacyMiddleware:
 
     def anonymize_messages(
         self,
-        messages: List[Dict[str, Any]]
+        messages: List[Dict[str, Any]],
+        privacy_mode: Optional[str] = None
     ) -> tuple[List[Dict[str, Any]], Dict[str, str]]:
         """
         Anonymize all user messages in a message list.
@@ -128,11 +160,12 @@ class PrivacyMiddleware:
 
         Args:
             messages: List of message dicts with 'role' and 'content'
+            privacy_mode: Per-request privacy mode ("none", "basic", "full")
 
         Returns:
             Tuple of (anonymized_messages, combined_mapping)
         """
-        if not self.enabled:
+        if not self.should_anonymize(privacy_mode):
             return messages, {}
 
         combined_mapping: Dict[str, str] = {}
@@ -144,7 +177,7 @@ class PrivacyMiddleware:
 
             # Only anonymize user messages
             if role == 'user' and isinstance(content, str):
-                anon_content, mapping = self.anonymize_message(content)
+                anon_content, mapping = self.anonymize_message(content, privacy_mode)
                 combined_mapping.update(mapping)
 
                 anonymized_messages.append({
@@ -155,7 +188,7 @@ class PrivacyMiddleware:
                 anonymized_messages.append(msg)
 
         if combined_mapping:
-            logger.debug(f"Anonymized {len(combined_mapping)} entities across messages")
+            logger.debug(f"Anonymized {len(combined_mapping)} entities (mode={privacy_mode or 'default'})")
 
         return anonymized_messages, combined_mapping
 

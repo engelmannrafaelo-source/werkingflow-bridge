@@ -118,6 +118,30 @@ class VisionProvider:
                                         "data": match.group(2)
                                     }
                                 })
+                        elif url.startswith("http://") or url.startswith("https://"):
+                            # External URL - download and convert to base64
+                            try:
+                                import httpx
+                                import base64
+                                headers = {"User-Agent": "Mozilla/5.0 (compatible; AIBridge/1.0)"}
+                                with httpx.Client(timeout=30.0, headers=headers, follow_redirects=True) as client:
+                                    response = client.get(url)
+                                    response.raise_for_status()
+                                    image_data = base64.b64encode(response.content).decode('utf-8')
+                                    # Determine media type from content-type header or URL
+                                    content_type = response.headers.get('content-type', 'image/png')
+                                    if ';' in content_type:
+                                        content_type = content_type.split(';')[0].strip()
+                                    images.append({
+                                        "type": "image",
+                                        "source": {
+                                            "type": "base64",
+                                            "media_type": content_type,
+                                            "data": image_data
+                                        }
+                                    })
+                            except Exception as e:
+                                logger.warning(f"Failed to download image from {url}: {e}")
                     elif block.get("type") == "image":
                         # Already Anthropic format
                         images.append(block)

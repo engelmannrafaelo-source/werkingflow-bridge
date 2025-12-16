@@ -1,27 +1,66 @@
-# ECO OpenAI Wrapper - Project Context
+# AI-Bridge - Project Context for Claude
 
-## Repository History
+## Repository
 
-**Repository Location**: `/Users/rafael/Documents/GitHub/eco-openai-wrapper`
-
-**Status**: 🆕 **New Repository** - No prior Git history exists
-
-**Created**: 2025-10-04
-
-## Important Notes
-
-- 🆕 This is a newly created repository with no prior version
-- 📚 Git history starts from repository creation
-- 🔄 Part of the ECO system alongside other repositories
-- 🎯 Active development from initial commit
+**Location**: `/Users/rafael/Documents/GitHub/ai-bridge`
+**Server**: `http://95.217.180.242:8000` (Hetzner Production)
 
 ## Purpose
 
-OpenAI API wrapper and integration layer for the ECO system.
+OpenAI-kompatibler API-Wrapper für Claude Code SDK mit:
+- DSGVO-konformer Presidio-Anonymisierung
+- Vision/Bild-Analyse Support
+- Research Endpoint für tiefgehende Analysen
+- Session-Management
 
-## Related ECO System Repositories
+## Key Endpoints
 
-- **eco-backend**: `/Users/rafael/Documents/GitHub/eco-backend` (migrated from FINALE_REPORTS)
-- **eco-projects**: `/Users/rafael/Documents/GitHub/eco-projects` (migrated from FINALE_REPORTS)
-- **eco-coach**: `/Users/rafael/Documents/GitHub/eco-coach` (migrated from B-0076_Coach)
-- **eco-diagnostics**: `/Users/rafael/Documents/GitHub/eco-diagnostics` (unchanged)
+| Endpoint | Beschreibung |
+|----------|--------------|
+| `/v1/chat/completions` | OpenAI-kompatibel (Haupt-Endpoint) |
+| `/v1/research` | Deep Research mit Hops |
+| `/v1/models` | Verfügbare Modelle |
+| `/v1/privacy/status` | Presidio-Status |
+| `/health` | Health Check |
+
+## Quick Commands
+
+### Lokal testen
+```bash
+cd /Users/rafael/Documents/GitHub/ai-bridge
+./start-wrappers.sh
+curl http://localhost:8000/health
+```
+
+### Auf Hetzner deployen
+```bash
+# 1. Lokal committen und pushen
+git add -A && git commit -m "fix: beschreibung" && git push
+
+# 2. SSH zu Hetzner und updaten
+ssh root@95.217.180.242
+cd /root/ai-bridge && git pull && docker-compose down && docker-compose build --no-cache && docker-compose up -d
+```
+
+## Architecture
+
+```
+src/
+├── main.py              # FastAPI Endpoints
+├── claude_cli.py        # Claude Code SDK Integration
+├── models.py            # Pydantic Models (OpenAI-kompatibel)
+├── vision_provider.py   # Bild-Analyse (URL + Base64)
+├── message_adapter.py   # Format-Konvertierung
+└── privacy/
+    └── middleware.py    # Presidio PII-Anonymisierung
+```
+
+## Important Files
+
+- `docker/docker-compose.yml` - Container-Konfiguration
+- `docker/.env` - Environment (ANTHROPIC_API_KEY, TAVILY_API_KEY)
+- `DEPLOYMENT.md` - Deployment-Anleitung inkl. Quick-Update
+
+---
+
+*Last Updated: December 2025*

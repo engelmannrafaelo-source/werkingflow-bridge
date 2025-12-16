@@ -613,9 +613,29 @@ CRITICAL: Write file EARLY to avoid context overflow. Use Write tool for clauded
                 tools_used = set()
                 start_time = datetime.now()
 
+                # === LARGE PROMPT HANDLING ===
+                # OS has ARG_MAX limit (~128-256KB) for command-line arguments.
+                # String prompts are passed as CLI args and fail with [Errno 7] if too large.
+                # Solution: Use streaming mode (stdin) for large prompts.
+                LARGE_PROMPT_THRESHOLD = 100_000  # ~100KB, safely under ARG_MAX
+
+                async def _prompt_to_stream(prompt_text: str):
+                    """Convert string prompt to AsyncIterable for streaming mode."""
+                    yield {
+                        "type": "user",
+                        "message": {"role": "user", "content": prompt_text}
+                    }
+
+                if len(prompt) > LARGE_PROMPT_THRESHOLD:
+                    logger.info(f"🔄 Large prompt detected ({len(prompt):,} chars > {LARGE_PROMPT_THRESHOLD:,}), using streaming mode to bypass ARG_MAX")
+                    prompt_source = _prompt_to_stream(prompt)
+                else:
+                    prompt_source = prompt
+                # === END LARGE PROMPT HANDLING ===
+
                 try:
                     async with asyncio.timeout(self.timeout):
-                        async for message in query(prompt=prompt, options=options):
+                        async for message in query(prompt=prompt_source, options=options):
                             chunks_received += 1
 
                             # Collect message for file discovery

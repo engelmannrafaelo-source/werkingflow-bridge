@@ -60,6 +60,10 @@ services:
       # MCP API Keys
       - TAVILY_API_KEY=${TAVILY_API_KEY}
 
+      # Anthropic API Key for Vision/Image Analysis (VisionProvider)
+      # OAuth doesn't support multimodal - images require direct API access
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+
       # Privacy/DSGVO (Presidio-based PII anonymization)
       - PRIVACY_ENABLED=true
       - PRIVACY_LANGUAGE=de
