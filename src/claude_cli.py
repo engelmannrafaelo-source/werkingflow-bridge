@@ -181,20 +181,76 @@ class ClaudeCodeCLI:
 
         except Exception as e:
             # Unknown error - treat as CRITICAL (LAW 1)
-            error_msg = (
-                f"CRITICAL: Claude Code SDK verification failed with unexpected error!\n"
-                f"  Error Type: {type(e).__name__}\n"
-                f"  Error Message: {e}\n"
-                f"\n"
-                f"This is an unexpected failure. Check logs for details."
-            )
+            error_str = str(e).lower()
+
+            # Specific error detection for actionable guidance
+            if "credit balance" in error_str or "balance is too low" in error_str:
+                error_msg = (
+                    "=" * 70 + "\n"
+                    "🚨 CRITICAL: OAuth Token Expired or Invalid!\n"
+                    "=" * 70 + "\n"
+                    f"  Error: {e}\n"
+                    "\n"
+                    "The OAuth token has expired or is linked to an account without credits.\n"
+                    "\n"
+                    "TO FIX THIS:\n"
+                    "  1. Generate a new OAuth token (valid for 1 year):\n"
+                    "     $ claude setup-token\n"
+                    "\n"
+                    "  2. Save the token to secrets file:\n"
+                    "     $ echo 'YOUR_NEW_TOKEN' > /path/to/secrets/claude_token.txt\n"
+                    "\n"
+                    "  3. Restart the container:\n"
+                    "     $ docker compose restart\n"
+                    "\n"
+                    "⚠️  IMPORTANT: This wrapper NEVER falls back to ANTHROPIC_API_KEY!\n"
+                    "    If OAuth fails, the request fails. No silent API charges.\n"
+                    "=" * 70
+                )
+            elif "authentication" in error_str or "unauthorized" in error_str:
+                error_msg = (
+                    "=" * 70 + "\n"
+                    "🚨 CRITICAL: Claude Code Authentication Failed!\n"
+                    "=" * 70 + "\n"
+                    f"  Error: {e}\n"
+                    "\n"
+                    "Claude Code CLI is not authenticated.\n"
+                    "\n"
+                    "TO FIX THIS:\n"
+                    "  1. Authenticate Claude Code:\n"
+                    "     $ claude login\n"
+                    "\n"
+                    "  2. Or generate a long-lived token:\n"
+                    "     $ claude setup-token\n"
+                    "\n"
+                    "  3. Save token and restart container\n"
+                    "=" * 70
+                )
+            else:
+                error_msg = (
+                    "=" * 70 + "\n"
+                    "🚨 CRITICAL: Claude Code SDK Verification Failed!\n"
+                    "=" * 70 + "\n"
+                    f"  Error Type: {type(e).__name__}\n"
+                    f"  Error Message: {e}\n"
+                    "\n"
+                    "This is an unexpected failure.\n"
+                    "\n"
+                    "TROUBLESHOOTING:\n"
+                    "  1. Check OAuth token is valid:\n"
+                    "     $ claude setup-token\n"
+                    "\n"
+                    "  2. Verify CLI works:\n"
+                    "     $ claude -p 'Hello' --max-turns 1\n"
+                    "\n"
+                    "  3. Check container logs for details\n"
+                    "\n"
+                    "⚠️  This wrapper NEVER falls back to ANTHROPIC_API_KEY!\n"
+                    "    All requests use OAuth only - no silent API charges.\n"
+                    "=" * 70
+                )
+
             logger.error(error_msg)
-            logger.warning("Please ensure Claude Code is installed and authenticated:")
-            logger.warning("  1. Install: npm install -g @anthropic-ai/claude-code")
-            logger.warning("  2. Authenticate via OAuth: claude login")
-            logger.warning("  3. Test: claude --print 'Hello'")
-            logger.warning("")
-            logger.warning("⚠️  DO NOT use ANTHROPIC_API_KEY - this wrapper requires OAuth!")
             # Re-raise as RuntimeError with context
             raise RuntimeError(error_msg) from e
 

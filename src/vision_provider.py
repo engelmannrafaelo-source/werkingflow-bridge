@@ -49,9 +49,11 @@ class VisionProvider:
     ]
 
     def __init__(self):
-        self.api_key = os.getenv("ANTHROPIC_API_KEY")
+        # Use ANTHROPIC_VISION_API_KEY (renamed by auth.py to prevent OAuth fallback)
+        # Falls back to ANTHROPIC_API_KEY for backwards compatibility
+        self.api_key = os.getenv("ANTHROPIC_VISION_API_KEY") or os.getenv("ANTHROPIC_API_KEY")
         if not self.api_key:
-            logger.warning("ANTHROPIC_API_KEY not set - vision requests will fail")
+            logger.warning("ANTHROPIC_VISION_API_KEY not set - vision requests will fail")
 
     @staticmethod
     def has_images(messages: List[Dict[str, Any]]) -> bool:
@@ -281,8 +283,8 @@ class VisionProvider:
         """
         if not self.api_key:
             raise ValueError(
-                "ANTHROPIC_API_KEY environment variable not set. "
-                "Vision requests require direct API access."
+                "ANTHROPIC_VISION_API_KEY environment variable not set. "
+                "Vision/Image requests require direct API access (not OAuth)."
             )
 
         # Convert messages to Anthropic format

@@ -26,7 +26,14 @@ services:
       - eco-wrapper-instances:/app/instances
       - ~/eco-research-output:/app/research_output
 
+    # OAuth Token via Secret (ORIGINAL WORKING CONFIG from Dec 14)
+    secrets:
+      - claude_token
+
     environment:
+      # Token aus Secret lesen (SDK unterstützt file-basiertes Token)
+      - CLAUDE_CODE_OAUTH_TOKEN_FILE=/run/secrets/claude_token
+
       # Timezone
       - TZ=Europe/Vienna
 
@@ -53,14 +60,18 @@ services:
       # MCP API Keys
       - TAVILY_API_KEY=${TAVILY_API_KEY}
 
-      # Anthropic API Key for Vision/Image Analysis (VisionProvider)
-      # OAuth doesn't support multimodal - images require direct API access
+      # Anthropic API Key for Vision/Image Analysis ONLY
+      # auth.py renames this to ANTHROPIC_VISION_API_KEY and removes ANTHROPIC_API_KEY
+      # This prevents Claude CLI from using it as OAuth fallback
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
 
       # Privacy/DSGVO (Presidio-based PII anonymization)
       - PRIVACY_ENABLED=true
       - PRIVACY_LANGUAGE=de
       - PRIVACY_LOG_DETECTIONS=false
+
+      # SDK verification enabled (OAuth working with new token)
+      # - SKIP_SDK_VERIFICATION=true
 
     # Health Check
     healthcheck:
@@ -82,3 +93,8 @@ volumes:
     driver: local
   eco-wrapper-instances:
     driver: local
+
+# Secrets
+secrets:
+  claude_token:
+    file: ../secrets/claude_token.txt

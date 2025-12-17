@@ -344,39 +344,45 @@ async def lifespan(app: FastAPI):
     else:
         logger.info(f"✅ Claude Code authentication validated: {auth_info['method']}")
 
-    # Then verify CLI
-    # LAW 1: verify_cli() now raises RuntimeError on critical failures
-    # We catch it here to provide additional context before re-raising
-    try:
-        cli_verified = await claude_cli.verify_cli()
+    # Then verify CLI (unless skipped for debugging)
+    skip_verification = os.getenv('SKIP_SDK_VERIFICATION', 'false').lower() in ('true', '1', 'yes', 'on')
+    if skip_verification:
+        logger.warning("⚠️  SKIP_SDK_VERIFICATION is set - skipping Claude Code SDK verification!")
+        logger.warning("   This is for debugging only. SDK calls may fail at runtime.")
+        cli_verified = True
+    else:
+        # LAW 1: verify_cli() now raises RuntimeError on critical failures
+        # We catch it here to provide additional context before re-raising
+        try:
+            cli_verified = await claude_cli.verify_cli()
 
-        if cli_verified:
-            logger.info("✅ Claude Code CLI verified successfully")
-        else:
-            # verify_cli() returned False = non-critical failure (SDK not installed)
-            # This is NOT a RuntimeError, so we handle it here
-            logger.error("❌ Claude Code CLI verification failed (non-critical)!")
-            logger.error("   Reason: SDK not installed or not in PATH")
-            logger.error("   Impact: Server will NOT start")
+            if cli_verified:
+                logger.info("✅ Claude Code CLI verified successfully")
+            else:
+                # verify_cli() returned False = non-critical failure (SDK not installed)
+                # This is NOT a RuntimeError, so we handle it here
+                logger.error("❌ Claude Code CLI verification failed (non-critical)!")
+                logger.error("   Reason: SDK not installed or not in PATH")
+                logger.error("   Impact: Server will NOT start")
+                logger.error("")
+                logger.error("Action required: Install Claude Code SDK")
+                raise RuntimeError(
+                    "Claude Code SDK not installed - server startup aborted. "
+                    "Install with: npm install -g @anthropic-ai/claude-code"
+                )
+
+        except RuntimeError as e:
+            # LAW 1: Critical failure from verify_cli() - add context and re-raise
+            logger.error("="*70)
+            logger.error("STARTUP ABORTED: Claude Code SDK verification failed")
+            logger.error("="*70)
+            logger.error(f"Error: {e}")
             logger.error("")
-            logger.error("Action required: Install Claude Code SDK")
-            raise RuntimeError(
-                "Claude Code SDK not installed - server startup aborted. "
-                "Install with: npm install -g @anthropic-ai/claude-code"
-            )
-
-    except RuntimeError as e:
-        # LAW 1: Critical failure from verify_cli() - add context and re-raise
-        logger.error("="*70)
-        logger.error("STARTUP ABORTED: Claude Code SDK verification failed")
-        logger.error("="*70)
-        logger.error(f"Error: {e}")
-        logger.error("")
-        logger.error("The wrapper cannot start without a working Claude Code SDK.")
-        logger.error("Please fix the issue above and restart the wrapper.")
-        logger.error("="*70)
-        # Re-raise to trigger uvicorn shutdown
-        raise
+            logger.error("The wrapper cannot start without a working Claude Code SDK.")
+            logger.error("Please fix the issue above and restart the wrapper.")
+            logger.error("="*70)
+            # Re-raise to trigger uvicorn shutdown
+            raise
     
     # Log debug information if debug mode is enabled
     if DEBUG_MODE or VERBOSE:
