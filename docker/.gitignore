@@ -1,0 +1,7 @@
+# Environment files - use .env.example as template
+.env
+.env.local
+.env.*.local
+
+# Keep the example file
+!.env.example

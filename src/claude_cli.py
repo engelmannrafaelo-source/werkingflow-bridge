@@ -395,12 +395,12 @@ OUTPUT STRUCTURE:
 CRITICAL: Write file EARLY to avoid context overflow. Use Write tool for claudedocs/research_output.md.
 """
 
-            # Set reasonable max_turns to prevent context overflow
-            if max_turns < 15:
-                max_turns = 15
+            # Set reasonable max_turns - increased to 25 for complex research queries
+            if max_turns < 20:
+                max_turns = 20
                 logger.info(f"   Set max_turns to {max_turns} for research")
-            elif max_turns > 15:
-                max_turns = 15  # Cap at 15 to prevent overflow
+            elif max_turns > 25:
+                max_turns = 25  # Cap at 25 to prevent overflow
                 logger.info(f"   Capped max_turns to {max_turns} to prevent context overflow")
 
             # Enable file discovery for research output
@@ -775,6 +775,16 @@ CRITICAL: Write file EARLY to avoid context overflow. Use Write tool for clauded
                                 if message.get('subtype') in ['complete', 'success']:
                                     response_complete = True
                                     logger.debug("✅ Response completion marker detected")
+                                elif message.get('subtype') == 'error_max_turns':
+                                    response_complete = True
+                                    logger.warning(
+                                        f"⚠️ Research hit max_turns limit - output may be incomplete",
+                                        extra={
+                                            "cli_session_id": cli_session_id,
+                                            "num_turns": message.get('num_turns'),
+                                            "total_cost_usd": message.get('total_cost_usd')
+                                        }
+                                    )
 
                             # Progress tracking: Accumulate text for final response
                             if progress_tracking_enabled:
@@ -1106,6 +1116,30 @@ CRITICAL: Write file EARLY to avoid context overflow. Use Write tool for clauded
 
         except Exception as e:
             logger.error(f"Claude Code SDK error: {e}")
+
+            # Check if this is an auth/rate-limit error that warrants token rotation
+            error_str = str(e).lower()
+            is_auth_error = any(x in error_str for x in [
+                "credit balance", "balance is too low", "rate limit",
+                "authentication", "unauthorized", "token", "oauth",
+                "exit code 1"  # Generic CLI failure often means auth issue
+            ])
+
+            if is_auth_error:
+                # Import token_rotator and try rotating
+                from src.auth import token_rotator
+                new_token = token_rotator.mark_token_failed(str(e))
+                if new_token:
+                    logger.warning(f"🔄 Token rotated due to error, will be used on next request")
+                    # Yield error with retry hint
+                    yield {
+                        "type": "result",
+                        "subtype": "token_rotated",
+                        "is_error": True,
+                        "error_message": f"Token failed, rotated to backup. Original error: {e}",
+                        "action_required": "RETRY_IMMEDIATELY"
+                    }
+                    return
 
             # Attempt recovery from cache if available
             if cache_file and cache_file.exists() and cache_file.stat().st_size > 0:

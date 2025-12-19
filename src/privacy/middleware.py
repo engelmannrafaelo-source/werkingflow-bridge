@@ -219,6 +219,104 @@ class PrivacyMiddleware:
             logger.error(f"De-anonymization failed: {e}", exc_info=True)
             return content
 
+    def deanonymize_streaming_chunk(
+        self,
+        chunk: str,
+        buffer: str,
+        mapping: Optional[Dict[str, str]] = None
+    ) -> tuple[str, str]:
+        """
+        De-anonymize a streaming chunk with buffering for split placeholders.
+
+        Handles the case where ANON_XXX placeholders are split across chunks:
+        - Chunk 1: "text with ANON_IP_"
+        - Chunk 2: "ADDRESS_001 more text"
+
+        Args:
+            chunk: Current streaming chunk
+            buffer: Buffer from previous chunks (may contain partial placeholder)
+            mapping: Mapping dict for de-anonymization
+
+        Returns:
+            Tuple of (text_to_yield, new_buffer)
+            - text_to_yield: De-anonymized text safe to send to client
+            - new_buffer: Text to buffer for next chunk (may contain partial placeholder)
+        """
+        import re
+
+        if not self.enabled:
+            return chunk, ""
+
+        if mapping is None:
+            mapping = _anonymization_context.get()
+
+        if not mapping:
+            return chunk, ""
+
+        # Combine buffer with new chunk
+        combined = buffer + chunk
+
+        # Pattern to detect partial ANON_ placeholders at end of text
+        # Full pattern: ANON_ENTITYTYPE_NNN (e.g., ANON_IP_ADDRESS_001, ANON_PERSON_001)
+        # We need to buffer if text ends with partial pattern
+        partial_pattern = r'ANON_[A-Z_]*\d*$'
+
+        # Find if there's a partial placeholder at the end
+        match = re.search(partial_pattern, combined)
+
+        if match:
+            # Check if this is a COMPLETE placeholder (exists in mapping)
+            potential_placeholder = match.group(0)
+            if potential_placeholder in mapping:
+                # It's complete - de-anonymize everything
+                result = self.anonymizer.deanonymize(combined, mapping)
+                return result, ""
+            else:
+                # It's partial - buffer it for next chunk
+                safe_text = combined[:match.start()]
+                new_buffer = combined[match.start():]
+
+                # De-anonymize the safe part
+                if safe_text:
+                    safe_text = self.anonymizer.deanonymize(safe_text, mapping)
+
+                return safe_text, new_buffer
+        else:
+            # No partial placeholder - de-anonymize everything
+            result = self.anonymizer.deanonymize(combined, mapping)
+            return result, ""
+
+    def flush_streaming_buffer(self, buffer: str, mapping: Optional[Dict[str, str]] = None) -> str:
+        """
+        Flush remaining buffer at end of stream.
+
+        Called when stream ends to ensure any buffered content is sent.
+
+        Args:
+            buffer: Remaining buffer content
+            mapping: Mapping dict for de-anonymization
+
+        Returns:
+            De-anonymized buffer content
+        """
+        if not buffer:
+            return ""
+
+        if not self.enabled:
+            return buffer
+
+        if mapping is None:
+            mapping = _anonymization_context.get()
+
+        if not mapping:
+            return buffer
+
+        try:
+            return self.anonymizer.deanonymize(buffer, mapping)
+        except Exception as e:
+            logger.error(f"Buffer flush de-anonymization failed: {e}", exc_info=True)
+            return buffer
+
     def set_context_mapping(self, mapping: Dict[str, str]) -> None:
         """Store mapping in request context for later de-anonymization."""
         _anonymization_context.set(mapping)

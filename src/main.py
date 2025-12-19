@@ -15,7 +15,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, Request, Depends
 from fastapi.security import HTTPAuthorizationCredentials
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse, JSONResponse
+from fastapi.responses import StreamingResponse, JSONResponse, Response
 from fastapi.exceptions import RequestValidationError
 from pydantic import ValidationError
 from dotenv import load_dotenv
@@ -777,6 +777,7 @@ async def generate_streaming_response(
         chunks_buffer = []
         role_sent = False  # Track if we've sent the initial role chunk
         content_sent = False  # Track if we've sent any content
+        deanon_buffer = ""  # Buffer for streaming de-anonymization (handles split placeholders)
 
         # Background task for disconnect detection
         async def monitor_client_disconnect():
@@ -904,10 +905,10 @@ async def generate_streaming_response(
                         # Filter out tool usage and thinking blocks
                         filtered_text = MessageAdapter.filter_content(raw_text)
 
-                        # Privacy: De-anonymize chunk (restore original PII)
+                        # Privacy: De-anonymize chunk with buffering (handles split placeholders)
                         if anonymization_mapping and filtered_text:
-                            filtered_text = privacy_middleware.deanonymize_response(
-                                filtered_text, anonymization_mapping
+                            filtered_text, deanon_buffer = privacy_middleware.deanonymize_streaming_chunk(
+                                filtered_text, deanon_buffer, anonymization_mapping
                             )
 
                         if filtered_text and not filtered_text.isspace():
@@ -929,10 +930,10 @@ async def generate_streaming_response(
                     # Filter out tool usage and thinking blocks
                     filtered_content = MessageAdapter.filter_content(content)
 
-                    # Privacy: De-anonymize chunk (restore original PII)
+                    # Privacy: De-anonymize chunk with buffering (handles split placeholders)
                     if anonymization_mapping and filtered_content:
-                        filtered_content = privacy_middleware.deanonymize_response(
-                            filtered_content, anonymization_mapping
+                        filtered_content, deanon_buffer = privacy_middleware.deanonymize_streaming_chunk(
+                            filtered_content, deanon_buffer, anonymization_mapping
                         )
 
                     if filtered_content and not filtered_content.isspace():
@@ -949,7 +950,23 @@ async def generate_streaming_response(
                         
                         yield f"data: {stream_chunk.model_dump_json()}\n\n"
                         content_sent = True
-        
+
+        # Flush any remaining de-anonymization buffer at end of stream
+        if anonymization_mapping and deanon_buffer:
+            flushed_content = privacy_middleware.flush_streaming_buffer(deanon_buffer, anonymization_mapping)
+            if flushed_content and not flushed_content.isspace():
+                flush_chunk = ChatCompletionStreamResponse(
+                    id=request_id,
+                    model=request.model,
+                    choices=[StreamChoice(
+                        index=0,
+                        delta={"content": flushed_content},
+                        finish_reason=None
+                    )]
+                )
+                yield f"data: {flush_chunk.model_dump_json()}\n\n"
+                content_sent = True
+
         # Handle case where no role was sent (send at least role chunk)
         if not role_sent:
             # Send role chunk with empty content if we never got any assistant messages
@@ -1599,6 +1616,12 @@ async def research(
             if chunk.get("type") == "x_claude_metadata":
                 file_metadata = chunk
                 logger.info(f"📦 Found file metadata: {len(chunk.get('files_created', []))} files")
+                # CRITICAL: Use cli_session_id for directory matching, not SDK's session_id
+                if "session_tracking" in chunk:
+                    cli_session_id = chunk["session_tracking"].get("cli_session_id")
+                    if cli_session_id:
+                        session_id = cli_session_id
+                        logger.info(f"📁 Using cli_session_id: {session_id}")
 
         if not all_chunks:
             raise ValueError("No response received from Claude Code execution")
@@ -1739,6 +1762,55 @@ async def research(
             error=str(e),
             session_id=session_id
         )
+
+
+@app.get("/v1/research/{session_id}/content")
+async def get_research_content(
+    session_id: str,
+    request: Request,
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(security)
+):
+    """Download research output content by session ID.
+
+    Returns the markdown output file or final_response.json as fallback.
+    """
+    await verify_api_key(request, credentials)
+
+    wrapper_root = Path(os.environ.get("INSTANCES_DIR", "/app/instances"))
+
+    # Find session directory (pattern: YYYY-MM-DD-HHMM_{session_id})
+    matching_dirs = list(wrapper_root.glob(f"*_{session_id}"))
+    if not matching_dirs:
+        logger.warning(f"Session not found: {session_id}", extra={"session_id": session_id})
+        raise HTTPException(status_code=404, detail=f"Session not found: {session_id}")
+
+    session_dir = matching_dirs[0]
+    claudedocs_dir = session_dir / "claudedocs"
+
+    # Find markdown output
+    md_files = list(claudedocs_dir.glob("*.md")) if claudedocs_dir.exists() else []
+
+    if md_files:
+        output_file = md_files[0]
+        logger.info(f"📄 Returning research output: {output_file.name}", extra={"session_id": session_id})
+        return Response(
+            content=output_file.read_text(encoding='utf-8'),
+            media_type="text/markdown",
+            headers={"Content-Disposition": f'attachment; filename="{output_file.name}"'}
+        )
+
+    # Fallback: return final_response.json if no .md file
+    final_response_file = session_dir / "final_response.json"
+    if final_response_file.exists():
+        logger.info(f"📄 Returning final_response.json (no .md found)", extra={"session_id": session_id})
+        return Response(
+            content=final_response_file.read_text(encoding='utf-8'),
+            media_type="application/json",
+            headers={"Content-Disposition": f'attachment; filename="final_response.json"'}
+        )
+
+    logger.warning(f"No output file found for session: {session_id}", extra={"session_id": session_id})
+    raise HTTPException(status_code=404, detail=f"No output file found for session: {session_id}")
 
 
 @app.get("/v1/models")

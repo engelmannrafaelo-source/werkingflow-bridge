@@ -110,6 +110,70 @@ Die SDK-Verifikation dauert ~45-60 Sekunden beim Start. Das ist normal wegen:
 
 ---
 
+## API Endpoints
+
+| Endpoint | Methode | Beschreibung |
+|----------|---------|--------------|
+| `/v1/chat/completions` | POST | OpenAI-kompatibler Chat |
+| `/v1/research` | POST | Research starten |
+| `/v1/research/{session_id}/content` | GET | Research-Output downloaden |
+| `/v1/models` | GET | Verfügbare Modelle |
+| `/health` | GET | Health Check |
+
+### Research Workflow
+
+```bash
+# 1. Research starten
+curl -X POST "http://95.217.180.242:8000/v1/research" \
+  -H "Authorization: Bearer test" \
+  -H "Content-Type: application/json" \
+  -d '{"query": "...", "depth": "deep"}'
+
+# Response: {"session_id": "abc-123", ...}
+
+# 2. Output downloaden
+curl "http://95.217.180.242:8000/v1/research/abc-123/content" \
+  -H "Authorization: Bearer test" \
+  -o research_output.md
+```
+
+---
+
+## Bedrock-Modus (DSGVO-konform)
+
+Für volle DSGVO-Konformität kann die Bridge mit AWS Bedrock in eu-central-1 (Frankfurt) betrieben werden.
+
+### Voraussetzungen
+
+1. **AWS Bedrock Model Access** aktiviert (siehe `docs/manual-tasks/BEDROCK_SETUP.md`)
+2. **AWS Credentials** in `.env.bedrock`
+
+### Starten
+
+```bash
+# Mit Bedrock statt OAuth
+docker compose -f docker-compose.yml -f docker-compose.bedrock.yml --env-file .env.bedrock up -d
+```
+
+### Dateien
+
+| Datei | Beschreibung |
+|-------|--------------|
+| `docker/docker-compose.bedrock.yml` | Bedrock-Override |
+| `docker/.env.bedrock` | AWS Credentials |
+| `docs/manual-tasks/BEDROCK_SETUP.md` | Setup-Anleitung |
+
+### Unterschiede zu OAuth
+
+| Aspekt | OAuth | Bedrock |
+|--------|-------|---------|
+| Kosten | Kostenlos | AWS-Kosten (pay-per-token) |
+| DSGVO | Presidio-Anonymisierung | Volle EU-Datenresidenz |
+| Setup | OAuth Token | AWS Model Access |
+| Region | US (Anthropic) | eu-central-1 (Frankfurt) |
+
+---
+
 ## Lokale Entwicklung
 
 ```bash

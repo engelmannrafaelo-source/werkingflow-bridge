@@ -1,5 +1,6 @@
 import os
-from typing import Optional, Dict, Any, Tuple
+from pathlib import Path
+from typing import Optional, Dict, Any, Tuple, List
 from fastapi import HTTPException, Request
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from dotenv import load_dotenv
@@ -8,6 +9,117 @@ from config.logging_config import get_logger
 
 logger = get_logger(__name__)
 load_dotenv()
+
+
+class TokenRotator:
+    """Manages multiple OAuth tokens with automatic fallback.
+
+    When one token fails (rate limit, auth error), automatically
+    switches to the next available token.
+
+    Token files are read from CLAUDE_CODE_OAUTH_TOKEN_DIR or /run/secrets/
+    Files matching pattern: claude_token*.txt
+    """
+
+    def __init__(self):
+        self.tokens: List[str] = []
+        self.current_index: int = 0
+        self.token_files: List[Path] = []
+        self._load_tokens()
+
+    def _load_tokens(self):
+        """Load all available tokens from files."""
+        # Primary token file
+        primary_file = os.getenv("CLAUDE_CODE_OAUTH_TOKEN_FILE")
+        if primary_file:
+            primary_path = Path(primary_file)
+            if primary_path.exists():
+                self.token_files.append(primary_path)
+
+        # Look for additional tokens in secrets directory
+        secrets_dirs = [
+            Path("/run/secrets"),
+            Path("/app/secrets"),
+            Path(os.getenv("CLAUDE_CODE_OAUTH_TOKEN_DIR", "/run/secrets"))
+        ]
+
+        for secrets_dir in secrets_dirs:
+            if secrets_dir.exists():
+                # Find all claude_token* files (with or without .txt extension)
+                # Docker secrets don't have .txt extension
+                for token_file in secrets_dir.glob("claude_token*"):
+                    # Skip directories and example files
+                    if token_file.is_file() and "example" not in token_file.name:
+                        if token_file not in self.token_files:
+                            self.token_files.append(token_file)
+
+        # Load tokens from files
+        for token_file in self.token_files:
+            try:
+                token = token_file.read_text().strip()
+                if token and token not in self.tokens:
+                    self.tokens.append(token)
+                    logger.info(f"✅ Loaded token from {token_file.name} ({token[:20]}...)")
+            except Exception as e:
+                logger.warning(f"⚠️ Failed to read {token_file}: {e}")
+
+        if self.tokens:
+            logger.info(f"🔑 TokenRotator initialized with {len(self.tokens)} tokens")
+        else:
+            logger.warning("⚠️ TokenRotator: No tokens found!")
+
+    def get_current_token(self) -> Optional[str]:
+        """Get the currently active token."""
+        if not self.tokens:
+            return None
+        return self.tokens[self.current_index]
+
+    def rotate_token(self) -> Optional[str]:
+        """Switch to the next available token.
+
+        Returns the new token, or None if no more tokens available.
+        """
+        if len(self.tokens) <= 1:
+            logger.warning("⚠️ No fallback tokens available!")
+            return None
+
+        old_index = self.current_index
+        self.current_index = (self.current_index + 1) % len(self.tokens)
+
+        new_token = self.tokens[self.current_index]
+
+        # Update environment variable
+        os.environ["CLAUDE_CODE_OAUTH_TOKEN"] = new_token
+
+        logger.warning(f"🔄 Token rotated: index {old_index} → {self.current_index}")
+        logger.info(f"🔑 New active token: {new_token[:20]}...")
+
+        return new_token
+
+    def mark_token_failed(self, error_msg: str = "") -> Optional[str]:
+        """Mark current token as failed and rotate to next.
+
+        Call this when you detect rate limiting or auth errors.
+        Returns the new token, or None if no more tokens.
+        """
+        logger.error(f"❌ Token failed: {self.tokens[self.current_index][:20]}... - {error_msg}")
+        return self.rotate_token()
+
+    def apply_current_token(self):
+        """Apply the current token to environment."""
+        token = self.get_current_token()
+        if token:
+            os.environ["CLAUDE_CODE_OAUTH_TOKEN"] = token
+            logger.info(f"✅ Applied token to environment: {token[:20]}...")
+
+
+# Global token rotator instance
+token_rotator = TokenRotator()
+
+# Apply the first token to environment on module load
+if token_rotator.tokens:
+    token_rotator.apply_current_token()
+    logger.info(f"🔑 TokenRotator: {len(token_rotator.tokens)} tokens available, first applied")
 
 
 class ClaudeCodeAuthManager:

@@ -26,9 +26,11 @@ services:
       - eco-wrapper-instances:/app/instances
       - ~/eco-research-output:/app/research_output
 
-    # OAuth Token via Secret (ORIGINAL WORKING CONFIG from Dec 14)
+    # OAuth Tokens via Secrets (multiple for fallback)
     secrets:
       - claude_token
+      - claude_token_account1
+      - claude_token_account2
 
     environment:
       # Token aus Secret lesen (SDK unterstützt file-basiertes Token)
@@ -70,8 +72,8 @@ services:
       - PRIVACY_LANGUAGE=de
       - PRIVACY_LOG_DETECTIONS=false
 
-      # SDK verification enabled (OAuth working with new token)
-      # - SKIP_SDK_VERIFICATION=true
+      # SDK verification disabled (tokens verified on first request)
+      - SKIP_SDK_VERIFICATION=true
 
     # Health Check
     healthcheck:
@@ -94,7 +96,11 @@ volumes:
   eco-wrapper-instances:
     driver: local
 
-# Secrets
+# Secrets - Multiple tokens for fallback
 secrets:
   claude_token:
     file: ../secrets/claude_token.txt
+  claude_token_account1:
+    file: ../secrets/claude_token_account1.txt
+  claude_token_account2:
+    file: ../secrets/claude_token_account2.txt

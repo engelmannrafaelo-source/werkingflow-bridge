@@ -1,0 +1,33 @@
+# DSGVO-konformer Bedrock-Modus
+# Verwendet AWS Bedrock in eu-central-1 (Frankfurt) statt OAuth
+#
+# Nutzung:
+#   docker compose -f docker-compose.yml -f docker-compose.bedrock.yml up -d
+#
+# Voraussetzungen:
+#   1. AWS Credentials in .env.bedrock
+#   2. Bedrock Model Access für Claude aktiviert (AWS Console)
+#   3. IAM Permissions: bedrock:InvokeModel, bedrock:InvokeModelWithResponseStream
+
+services:
+  eco-wrapper:
+    environment:
+      # Bedrock aktivieren (überschreibt OAuth)
+      - CLAUDE_CODE_USE_BEDROCK=1
+
+      # AWS Credentials aus .env.bedrock
+      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
+      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
+      - AWS_REGION=${AWS_REGION:-eu-central-1}
+
+      # OAuth Token nicht benötigt für Bedrock
+      - CLAUDE_CODE_OAUTH_TOKEN_FILE=
+
+    # Secrets nicht benötigt für Bedrock
+    secrets: []
+
+    # Labels für Monitoring
+    labels:
+      - "werkingflow.mode=bedrock"
+      - "werkingflow.region=eu-central-1"
+      - "werkingflow.dsgvo=compliant"
