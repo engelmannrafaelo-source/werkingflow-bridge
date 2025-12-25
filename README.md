@@ -1,8 +1,20 @@
-# ECO OpenAI Wrapper
+# AI-Bridge (werkingflow)
 
-**Shared API Service for ECO Diagnostics Ecosystem**
+**OpenAI-kompatibler Claude Code Wrapper**
 
-A robust FastAPI-based wrapper that provides OpenAI-compatible API endpoints for Claude AI, enabling unified LLM integration across ECO backend and frontend services.
+FastAPI-basierter Wrapper für Claude AI mit OpenAI-kompatiblen Endpoints. DSGVO-konform mit Presidio-Anonymisierung.
+
+## Production Server
+
+**Hetzner**: `http://49.12.72.66:8000`
+
+```bash
+# Health Check
+curl http://49.12.72.66:8000/health
+
+# Privacy/Presidio Status
+curl http://49.12.72.66:8000/v1/privacy/status
+```
 
 ## 🎯 Purpose
 
@@ -357,5 +369,5 @@ Proprietary - ECO Energy Group
 ---
 
 **Maintained by**: Rafael Rengelmann
-**Organization**: ECO Energy Group
-**Last Updated**: October 2025
+**Organization**: Werkingflow
+**Last Updated**: December 2025

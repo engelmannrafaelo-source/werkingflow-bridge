@@ -30,7 +30,7 @@ import httpx
 logger = logging.getLogger("ai_bridge_sdk")
 
 # Constants
-HETZNER_URL = "http://95.217.180.242:8000"
+HETZNER_URL = "http://49.12.72.66:8000"
 LOCAL_URL = "http://localhost:8000"
 HETZNER_TIMEOUT = 3.0  # seconds
 LOCAL_TIMEOUT = 1.0  # seconds

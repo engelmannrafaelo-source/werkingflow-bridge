@@ -15,7 +15,9 @@ class ParameterValidator:
     # Supported Claude Code SDK models
     SUPPORTED_MODELS = {
         "claude-sonnet-4-5-20250929",  # Latest Sonnet 4.5
-        "claude-opus-4-1-20250805",    # Latest Opus 4.1
+        "claude-sonnet-4-20250514",    # Sonnet 4 (May 2025)
+        "claude-opus-4-20250514",      # Opus 4 (May 2025)
+        "claude-opus-4-1-20250805",    # Opus 4.1
         "claude-3-7-sonnet-20250219",
         "claude-3-5-sonnet-20241022",
         "claude-3-5-haiku-20241022"

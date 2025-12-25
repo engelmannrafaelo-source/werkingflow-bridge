@@ -1,0 +1,9 @@
+// Syncthing Ignore - NIEMALS .git synchronisieren!
+.git
+.next
+node_modules/.cache
+.turbo
+*.tmp
+.syncthing.*
+playwright-report
+test-results

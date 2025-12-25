@@ -83,7 +83,7 @@ const response = await client.chat.completions.create({
 
 | Endpoint | URL |
 |----------|-----|
-| Hetzner (Production) | `http://95.217.180.242:8000` |
+| Hetzner (Production) | `http://49.12.72.66:8000` |
 | Local (Development) | `http://localhost:8000` |
 
 ## Error Handling

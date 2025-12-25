@@ -44,6 +44,7 @@ from src.models import (
 from src.claude_cli import ClaudeCodeCLI
 from src.message_adapter import MessageAdapter
 from src.vision_provider import VisionProvider, get_vision_provider
+from src.routing.vision_router import check_and_route_vision, prepare_messages_for_vision, has_vision_content
 from src.auth import verify_api_key, security, validate_claude_code_auth, get_claude_code_auth_info
 from src.parameter_validator import ParameterValidator, CompatibilityReporter
 from src.file_discovery import FileDiscoveryService
@@ -55,14 +56,30 @@ from src.tenant import (
     get_privacy_mode_from_request,
     track_request_usage
 )
-# Rate limiting is optional - disable if slowapi not available
+# Rate limiting - required in production, optional in development
 try:
     from src.rate_limiter import limiter, rate_limit_exceeded_handler, get_rate_limit_for_endpoint, rate_limit_endpoint
     RATE_LIMITING_ENABLED = True
 except ImportError:
     RATE_LIMITING_ENABLED = False
     limiter = None
-    # No-op decorator when rate limiting not available
+
+    # Check if we're in production (Docker) - rate limiting should be required
+    IN_DOCKER = os.path.exists('/.dockerenv') or os.getenv('DOCKER_CONTAINER', 'false').lower() == 'true'
+    if IN_DOCKER:
+        raise RuntimeError(
+            "CRITICAL: Rate limiting is required in production but slowapi is not installed. "
+            "Install with: pip install slowapi"
+        )
+
+    # Development fallback with visible warning
+    import warnings
+    warnings.warn(
+        "Rate limiting disabled (slowapi not installed). This is a SECURITY RISK in production!",
+        RuntimeWarning
+    )
+
+    # No-op decorator for development only
     def rate_limit_endpoint(endpoint_name: str):
         def decorator(func):
             return func
@@ -165,7 +182,8 @@ async def cleanup_old_sessions():
 
     Scans all instance directories for temp/sessions folders.
     """
-    INSTANCES_DIR = Path("/Users/lorenz/ECO/projects/eco-openai-wrapper/instances")
+    # Use environment variable with Docker-friendly default
+    INSTANCES_DIR = Path(os.getenv("INSTANCES_DIR", "/app/instances"))
     RETENTION_HOURS = 24
     CHECK_INTERVAL_SECONDS = 3600  # 1 hour
 
@@ -256,6 +274,15 @@ async def cleanup_old_sessions():
 
                         if timestamp < cutoff:
                             # Session is old enough to delete
+                            # Security: Validate path is actually under INSTANCES_DIR (no symlink escape)
+                            real_session_path = Path(os.path.realpath(session_dir))
+                            real_instances_path = Path(os.path.realpath(INSTANCES_DIR))
+
+                            if not str(real_session_path).startswith(str(real_instances_path)):
+                                logger.error(f"❌ Security: Session path escapes instances dir (symlink?): {session_dir}",
+                                             extra={"session_dir": str(session_dir), "real_path": str(real_session_path)})
+                                continue
+
                             try:
                                 shutil.rmtree(session_dir)
                                 cleaned += 1
@@ -574,82 +601,50 @@ async def generate_streaming_response(
     streaming_started = asyncio.Event()  # Signal when streaming starts (prevents race condition)
 
     try:
-        # ===================================================================
         # VISION ROUTING: Check for images and route to direct Anthropic API
-        # For streaming, we do a "fake stream" - send vision response as chunks
-        # ===================================================================
-        messages_for_vision = [
-            {'role': m.role, 'content': m.content}
-            for m in request.messages
-        ]
+        messages_for_vision = prepare_messages_for_vision(request.messages)
 
-        if VisionProvider.has_images(messages_for_vision):
-            logger.info("🖼️ Vision streaming request detected - routing to direct Anthropic API")
-
-            vision_provider = get_vision_provider()
+        if has_vision_content(messages_for_vision):
+            logger.info("🖼️ Vision streaming request detected")
 
             try:
-                vision_response = await vision_provider.analyze(
-                    messages=messages_for_vision,
+                vision_result = await check_and_route_vision(
+                    messages=request.messages,
                     model=request.model,
-                    max_tokens=request.max_tokens or 4096,
-                    temperature=request.temperature or 0.7
+                    max_tokens=request.max_tokens,
+                    temperature=request.temperature
                 )
 
-                # Send initial role chunk
+                # Stream vision response as SSE chunks
                 initial_chunk = ChatCompletionStreamResponse(
                     id=request_id,
                     model=request.model,
-                    choices=[StreamChoice(
-                        index=0,
-                        delta={"role": "assistant", "content": ""},
-                        finish_reason=None
-                    )]
+                    choices=[StreamChoice(index=0, delta={"role": "assistant", "content": ""}, finish_reason=None)]
                 )
                 yield f"data: {initial_chunk.model_dump_json()}\n\n"
 
-                # Send content as single chunk (could be split for better UX)
                 content_chunk = ChatCompletionStreamResponse(
                     id=request_id,
                     model=request.model,
-                    choices=[StreamChoice(
-                        index=0,
-                        delta={"content": vision_response.content},
-                        finish_reason=None
-                    )]
+                    choices=[StreamChoice(index=0, delta={"content": vision_result.content}, finish_reason=None)]
                 )
                 yield f"data: {content_chunk.model_dump_json()}\n\n"
 
-                # Send final chunk
                 final_chunk = ChatCompletionStreamResponse(
                     id=request_id,
                     model=request.model,
-                    choices=[StreamChoice(
-                        index=0,
-                        delta={},
-                        finish_reason="stop"
-                    )]
+                    choices=[StreamChoice(index=0, delta={}, finish_reason="stop")]
                 )
                 yield f"data: {final_chunk.model_dump_json()}\n\n"
                 yield "data: [DONE]\n\n"
 
-                logger.info("✅ Vision streaming request completed")
-                return  # Exit generator after vision response
-
-            except Exception as e:
-                logger.error(f"❌ Vision streaming request failed: {e}", exc_info=True)
-                error_chunk = {
-                    "error": {
-                        "message": f"Vision analysis failed: {str(e)}",
-                        "type": "vision_error"
-                    }
-                }
-                yield f"data: {json.dumps(error_chunk)}\n\n"
+                logger.info("✅ Vision streaming completed")
                 return
 
-        # ===================================================================
-        # END VISION ROUTING - Continue with normal SDK streaming
-        # ===================================================================
+            except Exception as e:
+                logger.error(f"❌ Vision streaming failed: {e}", exc_info=True)
+                yield f"data: {json.dumps({'error': {'message': f'Vision analysis failed: {str(e)}', 'type': 'vision_error'}})}\n\n"
+                return
 
         # Process messages with session management
         all_messages, actual_session_id = session_manager.process_messages(
@@ -704,13 +699,6 @@ async def generate_streaming_response(
         # Validate model
         if claude_options.get('model'):
             ParameterValidator.validate_model(claude_options['model'])
-        
-        # ===================================================================
-        # TEMPORARY DIAGNOSTIC LOGGING - 2025-10-09 - Lorenz
-        # Purpose: Debug tool-decision logic bug in /sc:research workflow
-        # Can be removed after: Bug is identified and fixed
-        # Removal range: Lines containing 🔴🟡🔵 emoji markers in tool-decision section
-        # ===================================================================
 
         # Handle X-Claude-Allowed-Tools header (for /sc:research support)
         request_headers = fastapi_request.headers if fastapi_request else {}
@@ -718,22 +706,15 @@ async def generate_streaming_response(
         x_claude_max_turns = request_headers.get('X-Claude-Max-Turns', '').strip()
         x_claude_file_discovery = request_headers.get('X-Claude-File-Discovery', '').strip()
 
-        # 🔵 DIAGNOSTIC: Request context
-        logger.error(f"🔵 Tool Decision Context: enable_tools={request.enable_tools}, X-Claude-Allowed-Tools='{x_claude_allowed_tools}', X-Claude-Max-Turns='{x_claude_max_turns}'")
-
         if x_claude_allowed_tools:
             # Special case: '*' means "allow all tools" (don't set allowed_tools, use SDK default)
             if x_claude_allowed_tools == '*':
                 logger.info("X-Claude-Allowed-Tools='*' → Using SDK default (all tools allowed)")
-                # 🔵 DIAGNOSTIC: Wildcard detected
-                logger.error(f"🔵 Wildcard Detected: X-Claude-Allowed-Tools='*' → Using SDK default (all tools allowed)")
             else:
                 # Parse allowed tools from header
                 allowed_tools_list = [t.strip() for t in x_claude_allowed_tools.split(',') if t.strip()]
                 claude_options['allowed_tools'] = allowed_tools_list
                 logger.info(f"X-Claude-Allowed-Tools: {allowed_tools_list}")
-                # 🔵 DIAGNOSTIC: Header-based tool configuration
-                logger.error(f"🔵 Tool Configuration: X-Claude-Allowed-Tools header detected → Setting allowed_tools={allowed_tools_list}")
 
         # Handle tools - disabled by default for OpenAI compatibility
         if not request.enable_tools and not x_claude_allowed_tools:
@@ -744,31 +725,16 @@ async def generate_streaming_response(
             claude_options['disallowed_tools'] = disallowed_tools
             claude_options['max_turns'] = 1  # Single turn for Q&A (can be overridden by X-Claude-Max-Turns header)
             logger.info("Tools disabled (default behavior for OpenAI compatibility)")
-            # 🔴 DIAGNOSTIC: Tools disabled path
-            logger.error(f"🔴 TOOLS DISABLED: enable_tools=False AND no X-Claude-Allowed-Tools header → disallowed_tools={disallowed_tools}, max_turns=1")
         else:
             logger.info(f"Tools enabled by user request (enable_tools={request.enable_tools}, X-Claude-Allowed-Tools={bool(x_claude_allowed_tools)})")
-            # 🔵 DIAGNOSTIC: Tools enabled path
-            logger.error(f"🔵 TOOLS ENABLED: enable_tools={request.enable_tools} OR X-Claude-Allowed-Tools present → allowed_tools={claude_options.get('allowed_tools', 'default')}, max_turns={claude_options.get('max_turns', 10)}")
 
         # X-Claude-Max-Turns header MUST be processed AFTER enable_tools logic to allow override
         if x_claude_max_turns:
             try:
                 claude_options['max_turns'] = int(x_claude_max_turns)
                 logger.info(f"X-Claude-Max-Turns: {x_claude_max_turns}")
-                # 🔵 DIAGNOSTIC: Max turns override
-                logger.error(f"🔵 Max Turns Override: X-Claude-Max-Turns header detected → Setting max_turns={x_claude_max_turns}")
             except ValueError:
                 logger.warning(f"Invalid X-Claude-Max-Turns value: {x_claude_max_turns}")
-                # 🟡 DIAGNOSTIC: Invalid header value
-                logger.error(f"🟡 Invalid Header Value: X-Claude-Max-Turns='{x_claude_max_turns}' is not a valid integer")
-
-        # 🟣 DIAGNOSTIC: Final claude_options before SDK call
-        logger.error(f"🟣 Final SDK Options: model={claude_options.get('model')}, max_turns={claude_options.get('max_turns')}, allowed_tools={claude_options.get('allowed_tools')}, disallowed_tools={claude_options.get('disallowed_tools')}")
-
-        # ===================================================================
-        # END TEMPORARY DIAGNOSTIC LOGGING
-        # ===================================================================
 
         # Handle X-Claude-File-Discovery header (opt-in file discovery)
         handle_file_discovery_header(request_headers, prompt, claude_options)
@@ -1130,51 +1096,29 @@ async def chat_completions(
         else:
             # Non-streaming response
 
-            # ===================================================================
             # VISION ROUTING: Check for images and route to direct Anthropic API
-            # Claude Code SDK doesn't support multimodal - use VisionProvider
-            # ===================================================================
-            # Convert Pydantic content parts to dicts for VisionProvider compatibility
-            def serialize_content(content):
-                if isinstance(content, str):
-                    return content
-                # List of ContentPart Pydantic models -> list of dicts
-                return [
-                    part.model_dump() if hasattr(part, 'model_dump') else part
-                    for part in content
-                ]
+            try:
+                vision_result = await check_and_route_vision(
+                    messages=request_body.messages,
+                    model=request_body.model,
+                    max_tokens=request_body.max_tokens,
+                    temperature=request_body.temperature
+                )
 
-            messages_for_vision = [
-                {'role': m.role, 'content': serialize_content(m.content)}
-                for m in request_body.messages
-            ]
-
-            if VisionProvider.has_images(messages_for_vision):
-                logger.info("🖼️ Vision request detected - routing to direct Anthropic API")
-
-                vision_provider = get_vision_provider()
-
-                try:
-                    vision_response = await vision_provider.analyze(
-                        messages=messages_for_vision,
-                        model=request_body.model,
-                        max_tokens=request_body.max_tokens or 4096,
-                        temperature=request_body.temperature or 0.7
-                    )
-
-                    # Build OpenAI-compatible response
+                if vision_result:
+                    # Build OpenAI-compatible response from vision result
                     response = ChatCompletionResponse(
                         id=request_id,
-                        model=vision_response.model,
+                        model=vision_result.model,
                         choices=[Choice(
                             index=0,
-                            message=Message(role="assistant", content=vision_response.content),
+                            message=Message(role="assistant", content=vision_result.content),
                             finish_reason="stop"
                         )],
                         usage=Usage(
-                            prompt_tokens=vision_response.usage["prompt_tokens"],
-                            completion_tokens=vision_response.usage["completion_tokens"],
-                            total_tokens=vision_response.usage["total_tokens"]
+                            prompt_tokens=vision_result.usage["prompt_tokens"],
+                            completion_tokens=vision_result.usage["completion_tokens"],
+                            total_tokens=vision_result.usage["total_tokens"]
                         )
                     )
 
@@ -1186,31 +1130,17 @@ async def chat_completions(
                         message_count=len(request_body.messages),
                         stream=False,
                         duration=duration,
-                        tokens=vision_response.usage["total_tokens"],
+                        tokens=vision_result.usage["total_tokens"],
                         tools_enabled=False
                     )
-
-                    logger.info(
-                        f"✅ Vision request completed",
-                        extra={
-                            "duration": duration,
-                            "tokens": vision_response.usage["total_tokens"]
-                        }
-                    )
-
+                    logger.info(f"✅ Vision request completed", extra={"duration": duration, "tokens": vision_result.usage["total_tokens"]})
                     return response
 
-                except Exception as e:
-                    logger.error(f"❌ Vision request failed: {e}", exc_info=True)
-                    raise HTTPException(
-                        status_code=500,
-                        detail=f"Vision analysis failed: {str(e)}"
-                    )
+            except Exception as e:
+                logger.error(f"❌ Vision request failed: {e}", exc_info=True)
+                raise HTTPException(status_code=500, detail=f"Vision analysis failed: {str(e)}")
 
-            # ===================================================================
-            # END VISION ROUTING - Continue with normal SDK flow
-            # ===================================================================
-
+            # Continue with normal SDK flow (no vision content)
             # Process messages with session management
             all_messages, actual_session_id = session_manager.process_messages(
                 request_body.messages, request_body.session_id
@@ -1264,16 +1194,6 @@ async def chat_completions(
             if claude_options.get('model'):
                 ParameterValidator.validate_model(claude_options['model'])
 
-            # ===================================================================
-            # TEMPORARY DIAGNOSTIC LOGGING - 2025-10-09 - Lorenz
-            # Purpose: Debug tool-decision logic bug in /sc:research workflow (non-streaming)
-            # Can be removed after: Bug is identified and fixed
-            # Removal range: Lines containing 🔴🟡🔵 emoji markers in non-streaming tool-decision
-            # ===================================================================
-
-            # 🔵 DIAGNOSTIC: Non-streaming request context
-            logger.error(f"🔵 Non-Streaming Tool Decision: enable_tools={request_body.enable_tools}")
-
             # Handle tools - disabled by default for OpenAI compatibility
             if not request_body.enable_tools:
                 # Set disallowed_tools to all available tools to disable them
@@ -1283,12 +1203,8 @@ async def chat_completions(
                 claude_options['disallowed_tools'] = disallowed_tools
                 claude_options['max_turns'] = 1  # Single turn for Q&A
                 logger.info("Tools disabled (default behavior for OpenAI compatibility)")
-                # 🔴 DIAGNOSTIC: Non-streaming tools disabled path
-                logger.error(f"🔴 NON-STREAMING TOOLS DISABLED: enable_tools=False → disallowed_tools={disallowed_tools}, max_turns=1")
             else:
                 logger.info("Tools enabled by user request")
-                # 🔵 DIAGNOSTIC: Non-streaming tools enabled path
-                logger.error(f"🔵 NON-STREAMING TOOLS ENABLED: enable_tools={request_body.enable_tools} → allowed_tools={claude_options.get('allowed_tools', 'default')}, max_turns={claude_options.get('max_turns', 10)}")
 
             # Process x-claude-max-turns header (applies to BOTH enable_tools paths)
             request_headers = request.headers if request else {}
@@ -1299,13 +1215,6 @@ async def chat_completions(
                     logger.info(f"x-claude-max-turns header override: {x_claude_max_turns}")
                 except ValueError:
                     logger.warning(f"Invalid x-claude-max-turns value: {x_claude_max_turns}")
-
-            # 🟣 DIAGNOSTIC: Final non-streaming SDK options
-            logger.error(f"🟣 Non-Streaming Final SDK Options: model={claude_options.get('model')}, max_turns={claude_options.get('max_turns')}, allowed_tools={claude_options.get('allowed_tools')}, disallowed_tools={claude_options.get('disallowed_tools')}")
-
-            # ===================================================================
-            # END TEMPORARY DIAGNOSTIC LOGGING
-            # ===================================================================
 
             # Handle X-Claude-File-Discovery header (opt-in file discovery)
             # request_headers already defined above for max_turns processing
@@ -1453,30 +1362,20 @@ async def chat_completions(
 
                 # Return enriched response with session ID header
                 headers = {}
-                if not cli_session_id:
-                    # Defensive fallback: Get session ID from CLI session manager
-                    from src.cli_session_manager import cli_session_manager
-                    recent_sessions = cli_session_manager.list_sessions(status_filter="completed")
-                    if recent_sessions:
-                        cli_session_id = recent_sessions[-1]['cli_session_id']
-                        logger.info(f"🔄 Retrieved session ID from CLI manager fallback: {cli_session_id}")
-
                 if cli_session_id:
                     headers["X-Claude-Session-ID"] = cli_session_id
+                else:
+                    # No fallback - better no header than wrong session ID (multi-tenant safety)
+                    logger.warning("Session ID not available - X-Claude-Session-ID header omitted")
                 return JSONResponse(content=response_dict, headers=headers)
 
             # Return response with session ID header
             headers = {}
-            if not cli_session_id:
-                # Defensive fallback: Get session ID from CLI session manager
-                from src.cli_session_manager import cli_session_manager
-                recent_sessions = cli_session_manager.list_sessions(status_filter="completed")
-                if recent_sessions:
-                    cli_session_id = recent_sessions[-1]['cli_session_id']
-                    logger.info(f"🔄 Retrieved session ID from CLI manager fallback: {cli_session_id}")
-
             if cli_session_id:
                 headers["X-Claude-Session-ID"] = cli_session_id
+            else:
+                # No fallback - better no header than wrong session ID (multi-tenant safety)
+                logger.warning("Session ID not available - X-Claude-Session-ID header omitted")
             return JSONResponse(content=response.model_dump(), headers=headers)
 
     except HTTPException as http_exc:
@@ -1826,11 +1725,12 @@ async def list_models(
         "object": "list",
         "data": [
             {"id": "claude-sonnet-4-5-20250929", "object": "model", "owned_by": "anthropic"},  # Sonnet 4.5 (neueste)
+            {"id": "claude-haiku-4-5-20251001", "object": "model", "owned_by": "anthropic"},  # Haiku 4.5 (neueste, für Vision)
             {"id": "claude-sonnet-4-20250514", "object": "model", "owned_by": "anthropic"},
             {"id": "claude-opus-4-20250514", "object": "model", "owned_by": "anthropic"},
             {"id": "claude-3-7-sonnet-20250219", "object": "model", "owned_by": "anthropic"},
             {"id": "claude-3-5-sonnet-20241022", "object": "model", "owned_by": "anthropic"},
-            {"id": "claude-3-5-haiku-20241022", "object": "model", "owned_by": "anthropic"},
+            {"id": "claude-3-5-haiku-20241022", "object": "model", "owned_by": "anthropic"},  # Legacy
         ]
     }
 

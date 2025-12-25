@@ -71,7 +71,7 @@ Für den DSGVO-konformen Bedrock-Modus muss einmalig der Model Access in AWS akt
 
 ```bash
 # Auf Hetzner:
-ssh root@95.217.180.242
+ssh root@49.12.72.66
 
 # Dateien synchronisieren
 cd /root/werkingflow-bridge
@@ -90,7 +90,7 @@ curl http://localhost:8000/health
 
 ```bash
 # Einfacher Test
-curl -X POST http://95.217.180.242:8000/v1/chat/completions \
+curl -X POST http://49.12.72.66:8000/v1/chat/completions \
   -H "Authorization: Bearer test" \
   -H "Content-Type: application/json" \
   -d '{"model": "claude-3-5-sonnet-20241022", "messages": [{"role": "user", "content": "Hello"}]}'

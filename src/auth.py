@@ -74,14 +74,14 @@ class TokenRotator:
             return None
         return self.tokens[self.current_index]
 
-    def rotate_token(self) -> Optional[str]:
+    def rotate_token(self) -> str:
         """Switch to the next available token.
 
-        Returns the new token, or None if no more tokens available.
+        Returns the new token.
+        Raises RuntimeError if no fallback tokens available (defensive programming).
         """
         if len(self.tokens) <= 1:
-            logger.warning("⚠️ No fallback tokens available!")
-            return None
+            raise RuntimeError("Token rotation failed: No fallback tokens available. Configure multiple tokens or check authentication.")
 
         old_index = self.current_index
         self.current_index = (self.current_index + 1) % len(self.tokens)
@@ -96,11 +96,12 @@ class TokenRotator:
 
         return new_token
 
-    def mark_token_failed(self, error_msg: str = "") -> Optional[str]:
+    def mark_token_failed(self, error_msg: str = "") -> str:
         """Mark current token as failed and rotate to next.
 
         Call this when you detect rate limiting or auth errors.
-        Returns the new token, or None if no more tokens.
+        Returns the new token.
+        Raises RuntimeError if no more tokens available.
         """
         logger.error(f"❌ Token failed: {self.tokens[self.current_index][:20]}... - {error_msg}")
         return self.rotate_token()

@@ -110,11 +110,11 @@ class MessageAdapter:
         # Clean up extra whitespace and newlines
         content = re.sub(r'\n\s*\n\s*\n', '\n\n', content)  # Multiple newlines to double
         content = content.strip()
-        
-        # If content is now empty or only whitespace, provide a fallback
+
+        # Defensive: If content is empty after filtering, raise error (no silent fallback)
         if not content or content.isspace():
-            return "I understand you're testing the system. How can I help you today?"
-            
+            raise ValueError("Message content is empty after filtering. Check if Claude responded with only tool usage or unsupported content.")
+
         return content
     
     @staticmethod

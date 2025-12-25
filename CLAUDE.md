@@ -1,5 +1,9 @@
 # AI-Bridge (Claude Code OpenAI Wrapper)
 
+**Setup & Installation:** Siehe [README.md](README.md)
+
+---
+
 ## Authentifizierung
 
 ### KRITISCH: Kein automatischer Fallback auf ANTHROPIC_API_KEY!
@@ -34,10 +38,10 @@ claude setup-token
 echo 'DEIN_NEUES_TOKEN' > /path/to/bridge/secrets/claude_token.txt
 
 # Auf Server synchronisieren:
-rsync -avz secrets/ root@95.217.180.242:/root/werkingflow-bridge/secrets/
+rsync -avz secrets/ root@49.12.72.66:/root/werkingflow-bridge/secrets/
 
 # Container neustarten:
-ssh root@95.217.180.242 "cd /root/werkingflow-bridge/docker && docker compose restart"
+ssh root@49.12.72.66 "cd /root/werkingflow-bridge/docker && docker compose restart"
 ```
 
 Token ist 1 Jahr gültig.
@@ -46,8 +50,8 @@ Token ist 1 Jahr gültig.
 
 ## Hetzner Server (Production)
 
-**URL:** `http://95.217.180.242:8000`
-**SSH:** `ssh root@95.217.180.242`
+**URL:** `http://49.12.72.66:8000`
+**SSH:** `ssh root@49.12.72.66`
 
 ### Features
 - DSGVO-konforme Presidio-Anonymisierung (automatisch aktiv)
@@ -58,16 +62,16 @@ Token ist 1 Jahr gültig.
 
 ```bash
 # Logs prüfen
-ssh root@95.217.180.242 "docker logs eco-wrapper-universal --tail 50"
+ssh root@49.12.72.66 "docker logs eco-wrapper-universal --tail 50"
 
 # Health-Check
-curl http://95.217.180.242:8000/health
+curl http://49.12.72.66:8000/health
 
 # Manueller Cleanup
-ssh root@95.217.180.242 "docker builder prune -f && docker image prune -f"
+ssh root@49.12.72.66 "docker builder prune -f && docker image prune -f"
 
 # Rebuild mit automatischem Cleanup
-ssh root@95.217.180.242 "cd /root/werkingflow-bridge/docker && ./rebuild.sh"
+ssh root@49.12.72.66 "cd /root/werkingflow-bridge/docker && ./rebuild.sh"
 ```
 
 ### Automatischer Disk-Cleanup
@@ -124,7 +128,7 @@ Die SDK-Verifikation dauert ~45-60 Sekunden beim Start. Das ist normal wegen:
 
 ```bash
 # 1. Research starten
-curl -X POST "http://95.217.180.242:8000/v1/research" \
+curl -X POST "http://49.12.72.66:8000/v1/research" \
   -H "Authorization: Bearer test" \
   -H "Content-Type: application/json" \
   -d '{"query": "...", "depth": "deep"}'
@@ -132,7 +136,7 @@ curl -X POST "http://95.217.180.242:8000/v1/research" \
 # Response: {"session_id": "abc-123", ...}
 
 # 2. Output downloaden
-curl "http://95.217.180.242:8000/v1/research/abc-123/content" \
+curl "http://49.12.72.66:8000/v1/research/abc-123/content" \
   -H "Authorization: Bearer test" \
   -o research_output.md
 ```

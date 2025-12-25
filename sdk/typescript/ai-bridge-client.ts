@@ -24,7 +24,7 @@
 import OpenAI from "openai";
 
 // Constants
-export const HETZNER_URL = "http://95.217.180.242:8000";
+export const HETZNER_URL = "http://49.12.72.66:8000";
 export const LOCAL_URL = "http://localhost:8000";
 const HETZNER_TIMEOUT = 3000; // ms
 const LOCAL_TIMEOUT = 1000; // ms
