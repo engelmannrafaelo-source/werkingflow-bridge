@@ -13,9 +13,9 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from src.privacy.anonymizer import PresidioAnonymizer, AnonymizationResult, DetectedEntity
 
 
-def demo_mock_anonymization():
+def demo_bypass_anonymization():
     """
-    Demo the anonymization logic with mock data (no Presidio required).
+    Demo the anonymization logic with sample data (no Presidio required).
     Shows the complete flow: Original → Anonymized → Claude → De-Anonymized
     """
     print("=" * 70)
@@ -217,8 +217,8 @@ def test_real_presidio():
 
 
 if __name__ == "__main__":
-    # Always run mock demo
-    demo_mock_anonymization()
+    # Always run sample demo
+    demo_bypass_anonymization()
 
     # Try real Presidio test
     test_real_presidio()
