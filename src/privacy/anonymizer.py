@@ -4,11 +4,18 @@ Presidio-based PII Anonymization Engine
 DSGVO-compliant PII detection and pseudonymization using Microsoft Presidio.
 Supports German and English languages with custom patterns for Austrian/German phone numbers.
 
+Features:
+- Async support for non-blocking FastAPI integration
+- Thread pool execution for CPU-bound NLP operations
+- Lazy loading of spaCy models
+
 Based on: bacher-zt-ai-hub/src/services/presidio/anonymizer.py
 """
 
 import os
 import logging
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
 from typing import Dict, List, Any, Optional
 from dataclasses import dataclass, field
 
@@ -83,6 +90,20 @@ class AnonymizationResult:
         }
 
 
+# Thread pool for async operations (shared across instances)
+_executor: Optional[ThreadPoolExecutor] = None
+
+
+def _get_executor() -> ThreadPoolExecutor:
+    """Get or create the shared thread pool executor."""
+    global _executor
+    if _executor is None:
+        # Use 2 workers - Presidio is CPU-bound, more workers don't help
+        _executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="presidio")
+        logger.info("Presidio thread pool initialized (2 workers)")
+    return _executor
+
+
 class PresidioAnonymizer:
     """
     DSGVO-compliant PII anonymization using Microsoft Presidio.
@@ -92,6 +113,7 @@ class PresidioAnonymizer:
     - Custom Austrian/German phone number patterns
     - Reversible pseudonymization (mapping preserved)
     - Thread-safe singleton engines
+    - Async methods for non-blocking FastAPI integration
     """
 
     # Supported entity types for detection
@@ -337,3 +359,64 @@ class PresidioAnonymizer:
             result = result.replace(placeholder, original)
 
         return result
+
+    # =========================================================================
+    # ASYNC METHODS (Non-blocking for FastAPI)
+    # =========================================================================
+
+    async def anonymize_async(self, text: str, language: Optional[str] = None) -> AnonymizationResult:
+        """
+        Async version of anonymize() - runs NLP in thread pool.
+
+        This prevents blocking the FastAPI event loop during CPU-intensive
+        Presidio/spaCy analysis.
+
+        Args:
+            text: Input text containing PII
+            language: Language code ('de' or 'en'), defaults to instance language
+
+        Returns:
+            AnonymizationResult with anonymized text, mapping, and detected entities
+        """
+        if not text or not text.strip():
+            return AnonymizationResult(
+                anonymized_text=text,
+                mapping={},
+                detected_entities=[],
+                language=language or self.language
+            )
+
+        # Run CPU-bound Presidio analysis in thread pool
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(
+            _get_executor(),
+            self.anonymize,
+            text,
+            language
+        )
+
+    async def deanonymize_async(self, anonymized_text: str, mapping: Dict[str, str]) -> str:
+        """
+        Async version of deanonymize() - runs in thread pool.
+
+        De-anonymization is fast (simple string replacement), but we provide
+        an async version for API consistency.
+
+        Args:
+            anonymized_text: Text with ANON_XXX placeholders
+            mapping: { 'ANON_PERSON_001': 'Patrick Pichlbauer', ... }
+
+        Returns:
+            Original text with PII restored
+        """
+        if not anonymized_text or not mapping:
+            return anonymized_text
+
+        # De-anonymization is fast, but run in executor for consistency
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(
+            _get_executor(),
+            self.deanonymize,
+            anonymized_text,
+            mapping
+        )

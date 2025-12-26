@@ -114,7 +114,7 @@ class PrivacyMiddleware:
         privacy_mode: Optional[str] = None
     ) -> tuple[str, Dict[str, str]]:
         """
-        Anonymize a single message content.
+        Anonymize a single message content (synchronous version).
 
         Args:
             content: Message content to anonymize
@@ -145,6 +145,46 @@ class PrivacyMiddleware:
             logger.error(f"Anonymization failed: {e}", exc_info=True)
             # Fail open: return original content if anonymization fails
             # This ensures the service remains available
+            return content, {}
+
+    async def anonymize_message_async(
+        self,
+        content: str,
+        privacy_mode: Optional[str] = None
+    ) -> tuple[str, Dict[str, str]]:
+        """
+        Anonymize a single message content (async version - non-blocking).
+
+        Runs Presidio NLP in a thread pool to avoid blocking the event loop.
+
+        Args:
+            content: Message content to anonymize
+            privacy_mode: Per-request privacy mode ("none", "basic", "full")
+
+        Returns:
+            Tuple of (anonymized_content, mapping)
+        """
+        if not self.should_anonymize(privacy_mode) or not content:
+            return content, {}
+
+        try:
+            result = await self.anonymizer.anonymize_async(content, self.language)
+
+            if self.log_detections and result.detected_entities:
+                logger.info(
+                    f"PII detected: {result.entity_count} entities (mode={privacy_mode or 'default'})",
+                    extra={
+                        'entity_types': [e.entity_type for e in result.detected_entities],
+                        'language': result.language,
+                        'privacy_mode': privacy_mode
+                    }
+                )
+
+            return result.anonymized_text, result.mapping
+
+        except Exception as e:
+            logger.error(f"Anonymization failed: {e}", exc_info=True)
+            # Fail open: return original content if anonymization fails
             return content, {}
 
     def anonymize_messages(
@@ -189,6 +229,58 @@ class PrivacyMiddleware:
 
         if combined_mapping:
             logger.debug(f"Anonymized {len(combined_mapping)} entities (mode={privacy_mode or 'default'})")
+
+        return anonymized_messages, combined_mapping
+
+    async def anonymize_messages_async(
+        self,
+        messages: List[Dict[str, Any]],
+        privacy_mode: Optional[str] = None
+    ) -> tuple[List[Dict[str, Any]], Dict[str, str]]:
+        """
+        Anonymize all user messages (async version - non-blocking).
+
+        Uses asyncio.gather() to parallelize anonymization of multiple messages.
+
+        Args:
+            messages: List of message dicts with 'role' and 'content'
+            privacy_mode: Per-request privacy mode ("none", "basic", "full")
+
+        Returns:
+            Tuple of (anonymized_messages, combined_mapping)
+        """
+        if not self.should_anonymize(privacy_mode):
+            return messages, {}
+
+        # Collect user messages that need anonymization
+        user_message_indices = []
+        for i, msg in enumerate(messages):
+            if msg.get('role') == 'user' and isinstance(msg.get('content', ''), str):
+                user_message_indices.append(i)
+
+        if not user_message_indices:
+            return messages, {}
+
+        # Anonymize all user messages in parallel
+        tasks = [
+            self.anonymize_message_async(messages[i]['content'], privacy_mode)
+            for i in user_message_indices
+        ]
+        results = await asyncio.gather(*tasks)
+
+        # Build result
+        combined_mapping: Dict[str, str] = {}
+        anonymized_messages = list(messages)  # Copy
+
+        for idx, (anon_content, mapping) in zip(user_message_indices, results):
+            combined_mapping.update(mapping)
+            anonymized_messages[idx] = {
+                **messages[idx],
+                'content': anon_content
+            }
+
+        if combined_mapping:
+            logger.debug(f"Anonymized {len(combined_mapping)} entities async (mode={privacy_mode or 'default'})")
 
         return anonymized_messages, combined_mapping
 
@@ -369,13 +461,13 @@ def anonymize_request(func: Callable) -> Callable:
         if request_body is None and len(args) > 0:
             request_body = args[0]
 
-        # Anonymize messages if present
+        # Anonymize messages if present (using async for non-blocking)
         if hasattr(request_body, 'messages') and request_body.messages:
             original_messages = [
                 {'role': m.role, 'content': m.content}
                 for m in request_body.messages
             ]
-            anon_messages, mapping = middleware.anonymize_messages(original_messages)
+            anon_messages, mapping = await middleware.anonymize_messages_async(original_messages)
 
             # Store mapping for response de-anonymization
             middleware.set_context_mapping(mapping)
