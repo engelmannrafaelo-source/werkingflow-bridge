@@ -517,9 +517,13 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
         try:
             body = await request.body()
             if body:
-                debug_info["raw_request_body"] = body.decode()
-        except:
-            debug_info["raw_request_body"] = "Could not read request body"
+                debug_info["raw_request_body"] = body.decode('utf-8', errors='replace')
+        except UnicodeDecodeError as e:
+            debug_info["raw_request_body"] = f"Could not decode request body: {e}"
+            logger.debug(f"Request body decode error: {e}")
+        except Exception as e:
+            debug_info["raw_request_body"] = f"Could not read request body: {type(e).__name__}: {e}"
+            logger.debug(f"Request body read error: {e}")
     
     error_response = {
         "error": {
@@ -1761,6 +1765,19 @@ async def check_compatibility(request_body: ChatCompletionRequest):
 async def health_check(request: Request):
     """Health check endpoint."""
     return {"status": "healthy", "service": "claude-code-openai-wrapper"}
+
+
+@app.get("/debug/tokens")
+async def debug_tokens(request: Request):
+    """Debug endpoint to check TokenRotator status."""
+    from src.auth import token_rotator
+    return {
+        "total_tokens": len(token_rotator.tokens),
+        "current_index": token_rotator.current_index,
+        "token_files": [str(f) for f in token_rotator.token_files],
+        "token_previews": [t[:25] + "..." for t in token_rotator.tokens] if token_rotator.tokens else [],
+        "status": "ok" if len(token_rotator.tokens) > 1 else "warning_single_token"
+    }
 
 
 @app.get("/stats")

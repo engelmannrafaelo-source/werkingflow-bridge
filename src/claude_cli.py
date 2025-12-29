@@ -743,8 +743,9 @@ CRITICAL: Write file EARLY to avoid context overflow. Use Write tool for clauded
                                             attr_value = getattr(message, attr_name)
                                             if not callable(attr_value):  # Skip methods
                                                 message_dict[attr_name] = attr_value
-                                        except:
-                                            pass
+                                        except (AttributeError, TypeError) as e:
+                                            # Expected for properties that raise or computed attributes
+                                            logger.debug(f"Could not get attribute '{attr_name}': {e}")
 
                                 logger.debug(f"Converted message dict: {message_dict}")
                                 message = message_dict
