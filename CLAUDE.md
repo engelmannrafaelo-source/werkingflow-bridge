@@ -181,7 +181,7 @@ docker compose -f docker-compose.yml -f docker-compose.bedrock.yml --env-file .e
 ## Lokale Entwicklung
 
 ```bash
-cd /Users/rafael/Documents/GitHub/werkingflow/bridge
+cd /root/projekte/werkingflow/bridge
 
 # Container starten
 ./start-wrappers.sh
