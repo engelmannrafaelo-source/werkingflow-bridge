@@ -1110,6 +1110,12 @@ async def chat_completions(
                 )
 
                 if vision_result:
+                    # Count images in messages for AI usage tracking
+                    image_count = sum(
+                        1 for msg in request_body.messages
+                        if hasattr(msg, 'has_images') and msg.has_images()
+                    )
+
                     # Build OpenAI-compatible response from vision result
                     response = ChatCompletionResponse(
                         id=request_id,
@@ -1122,7 +1128,8 @@ async def chat_completions(
                         usage=Usage(
                             prompt_tokens=vision_result.usage["prompt_tokens"],
                             completion_tokens=vision_result.usage["completion_tokens"],
-                            total_tokens=vision_result.usage["total_tokens"]
+                            total_tokens=vision_result.usage["total_tokens"],
+                            image_count=image_count  # Track images for billing
                         )
                     )
 
@@ -1321,7 +1328,8 @@ async def chat_completions(
                 usage=Usage(
                     prompt_tokens=prompt_tokens,
                     completion_tokens=completion_tokens,
-                    total_tokens=prompt_tokens + completion_tokens
+                    total_tokens=prompt_tokens + completion_tokens,
+                    image_count=0  # Text-only request (no images)
                 )
             )
 

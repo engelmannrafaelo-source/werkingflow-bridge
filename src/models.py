@@ -175,6 +175,10 @@ class Usage(BaseModel):
     prompt_tokens: int
     completion_tokens: int
     total_tokens: int
+    # Extended fields for AI usage tracking (added 2026-01-13)
+    cache_read_tokens: Optional[int] = None
+    cache_write_tokens: Optional[int] = None
+    image_count: Optional[int] = None  # Number of images analyzed (vision calls)
 
 
 class ChatCompletionResponse(BaseModel):
