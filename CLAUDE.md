@@ -4,47 +4,94 @@
 
 ---
 
-## Authentifizierung
+## KRITISCH FÜR CLAUDE-SESSIONS
 
-### KRITISCH: Kein automatischer Fallback auf ANTHROPIC_API_KEY!
+**NIEMALS die Bridge modifizieren, debuggen oder "reparieren"!**
 
-Diese Bridge verwendet **nur OAuth** für Claude CLI Aufrufe:
+Die Bridge ist ein **isoliertes System**. Bei Problemen:
 
-| Auth-Methode | Verwendung | Kosten |
-|--------------|------------|--------|
-| OAuth Token | Text-Requests (Chat, Research) | Kostenlos |
-| ANTHROPIC_API_KEY | Nur Vision/Bilder | API-Kosten |
-| Bedrock | Optional (CLAUDE_CODE_USE_BEDROCK=1) | AWS-Kosten |
-| Vertex | Optional (CLAUDE_CODE_USE_VERTEX=1) | GCP-Kosten |
+1. **NICHT** Docker-Container manuell starten/stoppen
+2. **NICHT** Logs analysieren um "Probleme zu fixen"
+3. **NICHT** Code in `/root/projekte/werkingflow/bridge/` ändern
+4. **NICHT** Token-Dateien ändern oder überschreiben
 
-### Sicherheitsmechanismus
+**Was stattdessen tun:**
+- Bei 5xx Errors: **Warten** (automatischer Retry durch nginx)
+- Bei Token-Problemen: **User informieren** (manuelles Token-Update nötig)
 
-Beim Start passiert Folgendes automatisch (`src/auth.py`):
+**ABSOLUTE REGEL: Arbeite NIEMALS selbstständig an der Bridge ohne explizite Anweisung vom User!**
 
-1. `ANTHROPIC_API_KEY` wird erkannt
-2. Wird umbenannt zu `ANTHROPIC_VISION_API_KEY` (für Vision)
-3. `ANTHROPIC_API_KEY` wird aus dem Environment **gelöscht**
-4. Claude CLI sieht nur OAuth → kann nicht auf API-Key zurückfallen
+---
 
-**Garantie:** Wenn OAuth fehlschlägt → Request fehlschlägt. Keine versteckten API-Kosten!
+## Multi-Worker Architektur
 
-### OAuth Token erneuern
+Die Bridge läuft mit **2 Workern + nginx Load Balancer**:
 
-```bash
-# Lokal ausführen:
-claude setup-token
-
-# Token speichern:
-echo 'DEIN_NEUES_TOKEN' > /path/to/bridge/secrets/claude_token.txt
-
-# Auf Server synchronisieren:
-rsync -avz secrets/ root@49.12.72.66:/root/werkingflow-bridge/secrets/
-
-# Container neustarten:
-ssh root@49.12.72.66 "cd /root/werkingflow-bridge/docker && docker compose restart"
+```
+┌─────────────────────────────────────────────────────────────┐
+│  nginx Load Balancer (Port 8000)                            │
+│  Round-Robin Strategy                                       │
+├─────────────────────────────────────────────────────────────┤
+│  Worker 1                    │  Worker 2                    │
+│  rafael@engelmann.at         │  office@data-energyneering   │
+│  claude_token_account1.txt   │  claude_token_account3.txt   │
+└─────────────────────────────────────────────────────────────┘
 ```
 
-Token ist 1 Jahr gültig.
+### Container-Übersicht
+
+| Container | Funktion |
+|-----------|----------|
+| `eco-wrapper-lb` | nginx Load Balancer |
+| `eco-wrapper-worker1` | Worker mit Account 1 Token |
+| `eco-wrapper-worker2` | Worker mit Account 3 Token |
+
+### KRITISCH: Nur Multi-Worker Config verwenden!
+
+```bash
+# RICHTIG - Multi-Worker Setup
+docker compose -f docker-compose.multi.yml up -d
+
+# FALSCH - Alte Single-Container Config
+# docker-compose.yml ist disabled
+```
+
+---
+
+## Authentifizierung
+
+### Token-Architektur (Einjahres-Tokens)
+
+**Es gibt KEIN Auto-Refresh!** Tokens werden manuell gesetzt und sind 1 Jahr gültig.
+
+| Worker | Account | Token-Datei |
+|--------|---------|-------------|
+| Worker 1 | `rafael@engelmann.at` | `claude_token_account1.txt` |
+| Worker 2 | `office@data-energyneering.at` | `claude_token_account3.txt` |
+| (PAUSED) | `engelmann.rafaelo` | `claude_token_account2.txt` |
+
+### Token-Dateien auf Hetzner
+
+```
+/root/werkingflow-bridge/secrets/
+├── claude_token_account1.txt    # Einjahres-Token Account 1
+├── claude_token_account3.txt    # Einjahres-Token Account 3
+├── claude_token_account2.txt    # PAUSED
+└── hetzner_token.txt            # Hetzner API Token
+```
+
+### Neues Token setzen
+
+```bash
+# Token für Account 1 setzen
+ssh root@49.12.72.66 "echo 'sk-ant-oat01-...' > /root/werkingflow-bridge/secrets/claude_token_account1.txt"
+
+# Token für Account 3 setzen
+ssh root@49.12.72.66 "echo 'sk-ant-oat01-...' > /root/werkingflow-bridge/secrets/claude_token_account3.txt"
+
+# Worker neustarten damit neue Tokens geladen werden
+ssh root@49.12.72.66 "cd /root/werkingflow-bridge/docker && docker compose -f docker-compose.multi.yml restart"
+```
 
 ---
 
@@ -53,64 +100,36 @@ Token ist 1 Jahr gültig.
 **URL:** `http://49.12.72.66:8000`
 **SSH:** `ssh root@49.12.72.66`
 
-### Features
-- DSGVO-konforme Presidio-Anonymisierung (automatisch aktiv)
-- 40 Minuten Timeout für Research-Tasks
-- Automatischer Disk-Cleanup bei >80% Auslastung
+### Status prüfen
+
+```bash
+# Health + Worker-Info
+curl http://49.12.72.66:8000/health
+
+# Load Balancer Status (Accounts, Workers)
+curl http://49.12.72.66:8000/lb-status
+
+# Container-Status
+ssh root@49.12.72.66 "docker ps"
+```
 
 ### Server-Wartung
 
 ```bash
 # Logs prüfen
-ssh root@49.12.72.66 "docker logs eco-wrapper-universal --tail 50"
+ssh root@49.12.72.66 "docker compose -f /root/werkingflow-bridge/docker/docker-compose.multi.yml logs -f"
 
-# Health-Check
-curl http://49.12.72.66:8000/health
+# Neustarten
+ssh root@49.12.72.66 "cd /root/werkingflow-bridge/docker && docker compose -f docker-compose.multi.yml restart"
 
-# Manueller Cleanup
-ssh root@49.12.72.66 "docker builder prune -f && docker image prune -f"
-
-# Rebuild mit automatischem Cleanup
-ssh root@49.12.72.66 "cd /root/werkingflow-bridge/docker && ./rebuild.sh"
+# Rebuild
+ssh root@49.12.72.66 "cd /root/werkingflow-bridge/docker && docker compose -f docker-compose.multi.yml up -d --build"
 ```
 
-### Automatischer Disk-Cleanup
-
-Cronjob läuft stündlich (`/etc/cron.hourly/docker-cleanup`):
-- Prüft Disk-Auslastung
-- Bei >80%: Docker Cache + alte Images werden gelöscht
-- Log: `/var/log/docker-cleanup.log`
-
----
-
-## Fehlerbehebung
-
-### "Credit balance is too low"
-
-**Problem:** OAuth Token ist abgelaufen oder ANTHROPIC_API_KEY wird fälschlicherweise verwendet.
-
-**Lösung:**
-1. Neues OAuth Token generieren: `claude setup-token`
-2. Token auf Server synchronisieren
-3. Container neustarten
-
-### Container startet nicht
-
-```bash
-# Logs prüfen
-docker logs eco-wrapper-universal
-
-# Bei Disk-Problemen
-docker system prune -a -f
-docker builder prune -a -f
-```
-
-### SDK Verification Timeout
-
-Die SDK-Verifikation dauert ~45-60 Sekunden beim Start. Das ist normal wegen:
-- OAuth Token Validierung
-- MCP Server Initialisierung
-- spaCy Model Loading (Presidio)
+### Features
+- DSGVO-konforme Presidio-Anonymisierung (automatisch aktiv)
+- 40 Minuten Timeout für Research-Tasks
+- Round-Robin Load Balancing (doppelte Rate-Limits)
 
 ---
 
@@ -122,7 +141,8 @@ Die SDK-Verifikation dauert ~45-60 Sekunden beim Start. Das ist normal wegen:
 | `/v1/research` | POST | Research starten |
 | `/v1/research/{session_id}/content` | GET | Research-Output downloaden |
 | `/v1/models` | GET | Verfügbare Modelle |
-| `/health` | GET | Health Check |
+| `/health` | GET | Health Check + Worker-Info |
+| `/lb-status` | GET | Load Balancer Status |
 
 ### Research Workflow
 
@@ -143,38 +163,33 @@ curl "http://49.12.72.66:8000/v1/research/abc-123/content" \
 
 ---
 
-## Bedrock-Modus (DSGVO-konform)
+## Fehlerbehebung
 
-Für volle DSGVO-Konformität kann die Bridge mit AWS Bedrock in eu-central-1 (Frankfurt) betrieben werden.
+### "OAuth token has expired"
 
-### Voraussetzungen
+**Problem:** Einjahres-Token ist abgelaufen.
 
-1. **AWS Bedrock Model Access** aktiviert (siehe `docs/manual-tasks/BEDROCK_SETUP.md`)
-2. **AWS Credentials** in `.env.bedrock`
-
-### Starten
-
+**Lösung:** Neues Token generieren und setzen:
 ```bash
-# Mit Bedrock statt OAuth
-docker compose -f docker-compose.yml -f docker-compose.bedrock.yml --env-file .env.bedrock up -d
+ssh root@49.12.72.66 "echo 'NEUES_TOKEN' > /root/werkingflow-bridge/secrets/claude_token_accountX.txt"
+ssh root@49.12.72.66 "cd /root/werkingflow-bridge/docker && docker compose -f docker-compose.multi.yml restart"
 ```
 
-### Dateien
+### 503 Service Unavailable
 
-| Datei | Beschreibung |
-|-------|--------------|
-| `docker/docker-compose.bedrock.yml` | Bedrock-Override |
-| `docker/.env.bedrock` | AWS Credentials |
-| `docs/manual-tasks/BEDROCK_SETUP.md` | Setup-Anleitung |
+**Problem:** Worker temporär nicht verfügbar.
 
-### Unterschiede zu OAuth
+**Lösung:** nginx macht automatisch Failover zum anderen Worker. Bei persistenten 503s Token prüfen.
 
-| Aspekt | OAuth | Bedrock |
-|--------|-------|---------|
-| Kosten | Kostenlos | AWS-Kosten (pay-per-token) |
-| DSGVO | Presidio-Anonymisierung | Volle EU-Datenresidenz |
-| Setup | OAuth Token | AWS Model Access |
-| Region | US (Anthropic) | eu-central-1 (Frankfurt) |
+### Container startet nicht
+
+```bash
+# Logs prüfen
+ssh root@49.12.72.66 "docker compose -f /root/werkingflow-bridge/docker/docker-compose.multi.yml logs"
+
+# Bei Disk-Problemen
+ssh root@49.12.72.66 "docker system prune -a -f"
+```
 
 ---
 
@@ -183,7 +198,7 @@ docker compose -f docker-compose.yml -f docker-compose.bedrock.yml --env-file .e
 ```bash
 cd /root/projekte/werkingflow/bridge
 
-# Container starten
+# Container starten (Multi-Worker)
 ./start-wrappers.sh
 
 # Container stoppen
@@ -194,6 +209,7 @@ cd /root/projekte/werkingflow/bridge
 
 # Health-Check
 curl http://localhost:8000/health
+curl http://localhost:8000/lb-status
 ```
 
 ---
@@ -202,14 +218,47 @@ curl http://localhost:8000/health
 
 | Datei | Beschreibung |
 |-------|--------------|
-| `src/auth.py` | Authentifizierung, API-Key → Vision-Key Umbenennung |
-| `src/claude_cli.py` | SDK-Integration, Fehlerbehandlung |
-| `src/vision_provider.py` | Bild-Analyse (nutzt ANTHROPIC_VISION_API_KEY) |
-| `docker/docker-compose.yml` | Container-Konfiguration |
-| `docker/.env` | API-Keys (TAVILY, ANTHROPIC) |
-| `secrets/claude_token.txt` | OAuth Token (1 Jahr gültig) |
-| `docker/rebuild.sh` | Rebuild mit automatischem Cleanup |
+| `docker/docker-compose.multi.yml` | Multi-Worker Config (VERWENDEN!) |
+| `docker/nginx.conf` | Load Balancer Config |
+| `secrets/claude_token_account1.txt` | Token Account 1 |
+| `secrets/claude_token_account3.txt` | Token Account 3 |
+| `src/auth.py` | Authentifizierung |
+| `src/claude_cli.py` | SDK-Integration |
 
 ---
 
-*Letzte Aktualisierung: Dezember 2025*
+## Dritten Account reaktivieren
+
+Wenn `engelmann.rafaelo` wieder aktiv ist:
+
+1. Neues Token setzen:
+   ```bash
+   ssh root@49.12.72.66 "echo 'NEUES_TOKEN' > /root/werkingflow-bridge/secrets/claude_token_account2.txt"
+   ```
+
+2. In `docker-compose.multi.yml` worker3 uncomment
+
+3. In `nginx.conf` worker3 uncomment
+
+4. Neustarten:
+   ```bash
+   ssh root@49.12.72.66 "cd /root/werkingflow-bridge/docker && docker compose -f docker-compose.multi.yml up -d --build"
+   ```
+
+---
+
+## Automatische Wartung
+
+| Cron | Script | Funktion |
+|------|--------|----------|
+| `0 3 * * *` | `daily_cleanup.sh` | Tägliche Docker + Log Bereinigung |
+| `0 * * * *` | `disk_check.sh` | Stündlich: Cleanup wenn Disk >70% |
+
+### Logs-Retention
+
+- **Logs**: 1 Tag
+- **Research Output**: 7 Tage
+
+---
+
+*Letzte Aktualisierung: Januar 2026*

@@ -41,7 +41,7 @@ from src.models import (
     ResearchRequest,
     ResearchResponse
 )
-from src.claude_cli import ClaudeCodeCLI
+from src.claude_cli import ClaudeCodeCLI, WorkerUnavailableError
 from src.message_adapter import MessageAdapter
 from src.vision_provider import VisionProvider, get_vision_provider
 from src.routing.vision_router import check_and_route_vision, prepare_messages_for_vision, has_vision_content
@@ -546,10 +546,52 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
     # Add debug info if available
     if debug_info:
         error_response["error"]["debug"] = debug_info
-    
+
     return JSONResponse(
         status_code=422,
         content=error_response
+    )
+
+
+# =============================================================================
+# Worker Unavailable Exception Handler - Enables Nginx Failover
+# =============================================================================
+@app.exception_handler(WorkerUnavailableError)
+async def worker_unavailable_handler(request: Request, exc: WorkerUnavailableError):
+    """
+    Handle WorkerUnavailableError by returning HTTP 503 Service Unavailable.
+
+    This triggers Nginx's proxy_next_upstream directive to automatically
+    retry the request on another worker. The user never sees this error
+    because Nginx seamlessly fails over.
+
+    Nginx config required:
+        proxy_next_upstream error timeout http_500 http_502 http_503 http_504;
+        proxy_next_upstream_tries 2;
+    """
+    logger.warning(
+        f"🔄 Worker unavailable, returning 503 for Nginx failover",
+        extra={
+            "path": str(request.url),
+            "method": request.method,
+            "error": str(exc)
+        }
+    )
+
+    return JSONResponse(
+        status_code=503,
+        content={
+            "error": {
+                "message": "Worker temporarily unavailable, request will be retried on another worker",
+                "type": "service_unavailable",
+                "code": "503",
+                "retry": True
+            }
+        },
+        headers={
+            "Retry-After": "0",  # Immediate retry OK
+            "X-Worker-Failover": "true"
+        }
     )
 
 
@@ -1015,6 +1057,10 @@ async def generate_streaming_response(
 
         yield "data: [DONE]\n\n"
 
+    except WorkerUnavailableError:
+        # Re-raise to trigger HTTP 503 and Nginx failover
+        raise
+
     except Exception as e:
         logger.error(f"Streaming error: {e}")
         error_chunk = {
@@ -1088,13 +1134,17 @@ async def chat_completions(
             logger.debug(f"Compatibility report: {compatibility_report}")
         
         if request_body.stream:
-            # Return streaming response
+            # Worker instance for multi-worker deployments
+            worker_instance = os.getenv("INSTANCE_NAME", "unknown")
+
+            # Return streaming response with worker info header
             return StreamingResponse(
                 generate_streaming_response(request_body, request_id, claude_headers, fastapi_request=request),
                 media_type="text/event-stream",
                 headers={
                     "Cache-Control": "no-cache",
                     "Connection": "keep-alive",
+                    "X-Worker-Instance": worker_instance,
                 }
             )
         else:
@@ -1345,6 +1395,9 @@ async def chat_completions(
                 tools_enabled=request_body.enable_tools
             )
 
+            # Worker instance info for multi-worker deployments
+            worker_instance = os.getenv("INSTANCE_NAME", "unknown")
+
             # Add file metadata if available (OpenAI-compatible extension)
             if metadata_chunk:
                 # Convert response to dict and add metadata
@@ -1352,7 +1405,8 @@ async def chat_completions(
                 response_dict["x_claude_metadata"] = {
                     "files_created": metadata_chunk.get("files_created", []),
                     "session_tracking": metadata_chunk.get("session_tracking", {}),
-                    "discovery_status": metadata_chunk.get("discovery_status", "unknown")
+                    "discovery_status": metadata_chunk.get("discovery_status", "unknown"),
+                    "worker_instance": worker_instance
                 }
 
                 # Include discovery_method if present
@@ -1372,8 +1426,8 @@ async def chat_completions(
                     }
                 )
 
-                # Return enriched response with session ID header
-                headers = {}
+                # Return enriched response with session ID and worker headers
+                headers = {"X-Worker-Instance": worker_instance}
                 if cli_session_id:
                     headers["X-Claude-Session-ID"] = cli_session_id
                 else:
@@ -1381,14 +1435,17 @@ async def chat_completions(
                     logger.warning("Session ID not available - X-Claude-Session-ID header omitted")
                 return JSONResponse(content=response_dict, headers=headers)
 
-            # Return response with session ID header
-            headers = {}
+            # Return response with session ID and worker headers
+            # Also add worker_instance to response for non-metadata cases
+            response_dict = response.model_dump()
+            response_dict["x_claude_metadata"] = {"worker_instance": worker_instance}
+            headers = {"X-Worker-Instance": worker_instance}
             if cli_session_id:
                 headers["X-Claude-Session-ID"] = cli_session_id
             else:
                 # No fallback - better no header than wrong session ID (multi-tenant safety)
                 logger.warning("Session ID not available - X-Claude-Session-ID header omitted")
-            return JSONResponse(content=response.model_dump(), headers=headers)
+            return JSONResponse(content=response_dict, headers=headers)
 
     except HTTPException as http_exc:
         # CRITICAL: Log HTTPException before re-raising (prevents silent failures)
@@ -1403,6 +1460,9 @@ async def chat_completions(
             tools_enabled=request_body.enable_tools
         )
         logger.error(f"Chat completion HTTP error: {http_exc.status_code} - {http_exc.detail}")
+        raise
+    except WorkerUnavailableError:
+        # Re-raise to trigger HTTP 503 and Nginx failover
         raise
     except Exception as e:
         # Log error event
@@ -1650,6 +1710,11 @@ async def research(
             session_id=session_id
         )
 
+    except WorkerUnavailableError:
+        # Re-raise to trigger HTTP 503 and Nginx failover to another worker
+        # User will NOT see this error - Nginx handles it transparently
+        raise
+
     except Exception as e:
         execution_time = time.time() - start_time
         logger.error(
@@ -1772,7 +1837,12 @@ async def check_compatibility(request_body: ChatCompletionRequest):
 @rate_limit_endpoint("health")
 async def health_check(request: Request):
     """Health check endpoint."""
-    return {"status": "healthy", "service": "claude-code-openai-wrapper"}
+    worker_instance = os.getenv("INSTANCE_NAME", "unknown")
+    return {
+        "status": "healthy",
+        "service": "claude-code-openai-wrapper",
+        "worker_instance": worker_instance
+    }
 
 
 @app.get("/debug/tokens")

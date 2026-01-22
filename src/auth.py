@@ -29,11 +29,16 @@ class TokenRotator:
 
     def _load_tokens(self):
         """Load all available tokens from files."""
-        # Primary token file
+        # First check entrypoint-created token file (highest priority)
+        entrypoint_token = Path("/tmp/claude_token")
+        if entrypoint_token.exists():
+            self.token_files.append(entrypoint_token)
+
+        # Primary token file from environment
         primary_file = os.getenv("CLAUDE_CODE_OAUTH_TOKEN_FILE")
         if primary_file:
             primary_path = Path(primary_file)
-            if primary_path.exists():
+            if primary_path.exists() and primary_path not in self.token_files:
                 self.token_files.append(primary_path)
 
         # Look for additional tokens in secrets directory

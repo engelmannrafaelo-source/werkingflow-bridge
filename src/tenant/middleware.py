@@ -88,11 +88,17 @@ class TenantMiddleware(BaseHTTPMiddleware):
         # Extract tenant headers
         tenant_api_key = request.headers.get("X-Tenant-API-Key")
         tenant_id_header = request.headers.get("X-Tenant-ID")
+        privacy_mode_header = request.headers.get("X-Privacy-Mode")
 
         # Initialize request state defaults
         request.state.tenant = None
         request.state.privacy_mode = self.default_privacy_mode
         request.state.tenant_validated = False
+
+        # Allow per-request privacy mode override via header
+        # Valid values: "none", "basic", "full"
+        if privacy_mode_header in ("none", "basic", "full"):
+            request.state.privacy_mode = privacy_mode_header
 
         # Skip tenant validation for non-AI endpoints
         if self._is_exempt_path(request.url.path):

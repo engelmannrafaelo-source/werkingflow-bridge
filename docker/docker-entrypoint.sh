@@ -5,6 +5,22 @@ set -e
 # This must run as root before dropping to claude user
 chown -R claude:claude /app/logs /app/instances
 
+# Load OAuth token from file and write to a persistent env file
+# The SDK subprocess needs CLAUDE_CODE_OAUTH_TOKEN at spawn time
+if [ -n "$CLAUDE_CODE_OAUTH_TOKEN_FILE" ] && [ -f "$CLAUDE_CODE_OAUTH_TOKEN_FILE" ]; then
+    TOKEN=$(cat "$CLAUDE_CODE_OAUTH_TOKEN_FILE")
+    # Remove old token file if exists (may have wrong permissions after restart)
+    rm -f /tmp/claude_token 2>/dev/null || true
+    # Write to a file that can be sourced or read
+    echo "$TOKEN" > /tmp/claude_token
+    chmod 644 /tmp/claude_token
+    chown claude:claude /tmp/claude_token
+    # Also export for this shell
+    export CLAUDE_CODE_OAUTH_TOKEN="$TOKEN"
+    echo "✅ Loaded OAuth token from $CLAUDE_CODE_OAUTH_TOKEN_FILE (${TOKEN:0:30}...)"
+    echo "   Token saved to /tmp/claude_token for subprocess inheritance"
+fi
+
 # Graceful shutdown handler
 shutdown_handler() {
     echo "🛑 Graceful shutdown initiated..."
@@ -40,7 +56,12 @@ shutdown_handler() {
 trap shutdown_handler SIGTERM SIGINT
 
 # Drop privileges and execute CMD as claude user in background
-gosu claude "$@" &
+# Pass CLAUDE_CODE_OAUTH_TOKEN explicitly via env command
+if [ -n "$CLAUDE_CODE_OAUTH_TOKEN" ]; then
+    gosu claude env CLAUDE_CODE_OAUTH_TOKEN="$CLAUDE_CODE_OAUTH_TOKEN" "$@" &
+else
+    gosu claude "$@" &
+fi
 
 # Store child PID
 CHILD_PID=$!

@@ -35,6 +35,17 @@ class ProgressWriteError(ProgressTrackingError):
     pass
 
 
+class WorkerUnavailableError(Exception):
+    """
+    Raised when the Claude Code SDK fails in a way that indicates
+    this worker cannot handle requests (auth error, rate limit, etc.).
+
+    This triggers HTTP 503 response which allows Nginx to failover
+    to another worker automatically.
+    """
+    pass
+
+
 class ClaudeCodeCLI:
     def __init__(self, timeout: int = 1200000, cwd: Optional[str] = None):
         self.timeout = timeout / 1000  # Convert ms to seconds
@@ -1118,29 +1129,32 @@ CRITICAL: Write file EARLY to avoid context overflow. Use Write tool for clauded
         except Exception as e:
             logger.error(f"Claude Code SDK error: {e}")
 
-            # Check if this is an auth/rate-limit error that warrants token rotation
+            # Check if this is an auth/rate-limit error that warrants failover
             error_str = str(e).lower()
-            is_auth_error = any(x in error_str for x in [
+
+            # Errors that indicate this worker cannot handle ANY requests right now
+            is_worker_unavailable = any(x in error_str for x in [
                 "credit balance", "balance is too low", "rate limit",
-                "authentication", "unauthorized", "token", "oauth",
-                "exit code 1"  # Generic CLI failure often means auth issue
+                "authentication failed", "unauthorized", "invalid token",
+                "oauth token", "token expired", "401", "invalid api key",
+                "exit code 1"  # Generic SDK failure - let another worker try
             ])
 
-            if is_auth_error:
-                # Import token_rotator and try rotating
-                from src.auth import token_rotator
-                new_token = token_rotator.mark_token_failed(str(e))
-                if new_token:
-                    logger.warning(f"🔄 Token rotated due to error, will be used on next request")
-                    # Yield error with retry hint
-                    yield {
-                        "type": "result",
-                        "subtype": "token_rotated",
-                        "is_error": True,
-                        "error_message": f"Token failed, rotated to backup. Original error: {e}",
-                        "action_required": "RETRY_IMMEDIATELY"
-                    }
-                    return
+            if is_worker_unavailable:
+                # Mark session as failed
+                cli_session_manager.complete_session(cli_session_id, status="failed")
+
+                # Try token rotation (but it may fail if no backup tokens)
+                try:
+                    from src.auth import token_rotator
+                    token_rotator.mark_token_failed(str(e))
+                    logger.warning(f"🔄 Token rotated for future requests")
+                except RuntimeError as rotation_error:
+                    logger.warning(f"⚠️  Token rotation failed (expected with single token): {rotation_error}")
+
+                # CRITICAL: Raise exception to trigger HTTP 503 → Nginx failover to other worker
+                logger.error(f"🚨 Worker unavailable, raising for Nginx failover: {e}")
+                raise WorkerUnavailableError(f"Claude SDK failed: {e}") from e
 
             # Attempt recovery from cache if available
             if cache_file and cache_file.exists() and cache_file.stat().st_size > 0:

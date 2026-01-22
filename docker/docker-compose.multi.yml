@@ -1,0 +1,201 @@
+services:
+  # =============================================================================
+  # NGINX Load Balancer - Round-Robin über 2 aktive Worker
+  # =============================================================================
+  nginx:
+    image: nginx:alpine
+    container_name: eco-wrapper-lb
+    ports:
+      - "8000:80"      # Primary API
+      - "8010:80"      # eco-backend compatibility
+      - "8020:80"      # eco-diagnostics compatibility
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+    # Remove default.conf that overrides our config
+    command: ["/bin/sh", "-c", "rm -f /etc/nginx/conf.d/default.conf && nginx -g 'daemon off;'"]
+    depends_on:
+      - worker1
+      - worker2
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:80/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    restart: unless-stopped
+
+  # =============================================================================
+  # Worker 1 - Account 1: rafael@engelmann.at
+  # =============================================================================
+  worker1:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    container_name: eco-wrapper-worker1
+
+    # Internal port only - accessed via nginx
+    expose:
+      - "8000"
+
+    deploy:
+      resources:
+        limits:
+          memory: 4G
+        reservations:
+          memory: 1G
+
+    volumes:
+      - eco-wrapper-logs:/app/logs
+      - eco-wrapper-instances-shared:/app/instances
+      - ~/eco-research-output:/app/research_output
+
+    secrets:
+      - claude_token_1
+
+    environment:
+      - CLAUDE_CODE_OAUTH_TOKEN_FILE=/run/secrets/claude_token_1
+      - TZ=Europe/Vienna
+      - LOG_LEVEL=INFO
+      - LOG_TO_FILE=true
+      - FILTER_SENSITIVE_DATA=true
+      - INSTANCE_NAME=worker1
+      - CLAUDE_CWD=/app/instances
+      - DISABLE_COACH_MCP=true
+      - MAX_TIMEOUT=2400000
+      - CLAUDE_PERMISSION_MODE=bypassPermissions
+      - TAVILY_API_KEY=${TAVILY_API_KEY}
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+      - PRIVACY_ENABLED=true
+      - PRIVACY_LANGUAGE=de
+      - PRIVACY_LOG_DETECTIONS=false
+      - SKIP_SDK_VERIFICATION=true
+
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+    restart: unless-stopped
+
+  # =============================================================================
+  # Worker 2 - Account 3: office@data-energyneering.at
+  # =============================================================================
+  worker2:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    container_name: eco-wrapper-worker2
+
+    expose:
+      - "8000"
+
+    deploy:
+      resources:
+        limits:
+          memory: 4G
+        reservations:
+          memory: 1G
+
+    volumes:
+      - eco-wrapper-logs:/app/logs
+      - eco-wrapper-instances-shared:/app/instances
+      - ~/eco-research-output:/app/research_output
+
+    secrets:
+      - claude_token_2
+
+    environment:
+      - CLAUDE_CODE_OAUTH_TOKEN_FILE=/run/secrets/claude_token_2
+      - TZ=Europe/Vienna
+      - LOG_LEVEL=INFO
+      - LOG_TO_FILE=true
+      - FILTER_SENSITIVE_DATA=true
+      - INSTANCE_NAME=worker2
+      - CLAUDE_CWD=/app/instances
+      - DISABLE_COACH_MCP=true
+      - MAX_TIMEOUT=2400000
+      - CLAUDE_PERMISSION_MODE=bypassPermissions
+      - TAVILY_API_KEY=${TAVILY_API_KEY}
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+      - PRIVACY_ENABLED=true
+      - PRIVACY_LANGUAGE=de
+      - PRIVACY_LOG_DETECTIONS=false
+      - SKIP_SDK_VERIFICATION=true
+
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+    restart: unless-stopped
+
+  # =============================================================================
+  # Worker 3 - Account 2: engelmann.rafaelo@gmail.com (PAUSED - Token invalid)
+  # =============================================================================
+  # Uncomment when account is reactivated:
+  # worker3:
+  #   build:
+  #     context: ..
+  #     dockerfile: docker/Dockerfile
+  #   container_name: eco-wrapper-worker3
+  #   expose:
+  #     - "8000"
+  #   deploy:
+  #     resources:
+  #       limits:
+  #         memory: 4G
+  #       reservations:
+  #         memory: 1G
+  #   volumes:
+  #     - eco-wrapper-logs:/app/logs
+  #     - eco-wrapper-instances-3:/app/instances
+  #     - ~/eco-research-output:/app/research_output
+  #   secrets:
+  #     - claude_token_3
+  #   environment:
+  #     - CLAUDE_CODE_OAUTH_TOKEN_FILE=/run/secrets/claude_token_3
+  #     - TZ=Europe/Vienna
+  #     - LOG_LEVEL=INFO
+  #     - LOG_TO_FILE=true
+  #     - FILTER_SENSITIVE_DATA=true
+  #     - INSTANCE_NAME=worker3
+  #     - CLAUDE_CWD=/app/instances
+  #     - DISABLE_COACH_MCP=true
+  #     - MAX_TIMEOUT=2400000
+  #     - CLAUDE_PERMISSION_MODE=bypassPermissions
+  #     - TAVILY_API_KEY=${TAVILY_API_KEY}
+  #     - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+  #     - PRIVACY_ENABLED=true
+  #     - PRIVACY_LANGUAGE=de
+  #     - PRIVACY_LOG_DETECTIONS=false
+  #     - SKIP_SDK_VERIFICATION=true
+  #   healthcheck:
+  #     test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+  #     interval: 30s
+  #     timeout: 10s
+  #     retries: 3
+  #     start_period: 40s
+  #   restart: unless-stopped
+
+# =============================================================================
+# Volumes - Shared instance dir for all workers (session sync!)
+# =============================================================================
+volumes:
+  eco-wrapper-logs:
+    driver: local
+  eco-wrapper-instances-shared:
+    driver: local
+
+# =============================================================================
+# Secrets - 2 active tokens (Account 2 paused)
+# =============================================================================
+secrets:
+  claude_token_1:
+    file: ../secrets/claude_token_account1.txt    # rafael@engelmann.at
+  claude_token_2:
+    file: ../secrets/claude_token_account3.txt    # office@data-energyneering.at
+  # claude_token_3:
+  #   file: ../secrets/claude_token_account2.txt  # engelmann.rafaelo (PAUSED)

@@ -58,7 +58,11 @@ class VisionProvider:
     @staticmethod
     def has_images(messages: List[Dict[str, Any]]) -> bool:
         """
-        Check if any message contains image content.
+        Check if any USER message contains image content.
+
+        Only checks user messages - assistant messages may contain base64 data
+        from API responses (e.g., QR codes from MFA setup) which should NOT
+        trigger vision routing.
 
         Supports multiple formats:
         - OpenAI format: {"type": "image_url", "image_url": {"url": "data:image/..."}}
@@ -67,6 +71,12 @@ class VisionProvider:
         - Bracketed format: "[data:image/jpeg;base64,...]" in text content
         """
         for message in messages:
+            # Skip non-user messages - assistant responses may contain base64
+            # API data that shouldn't trigger vision processing
+            role = message.get("role", "")
+            if role != "user":
+                continue
+
             content = message.get("content")
 
             # Check array content (OpenAI/Anthropic multimodal format)
@@ -109,15 +119,21 @@ class VisionProvider:
                         # OpenAI format -> Anthropic format
                         url = block.get("image_url", {}).get("url", "")
                         if url.startswith("data:"):
-                            # Parse data URL
-                            match = re.match(r'data:(image/[^;]+);base64,(.+)', url)
+                            # Parse data URL - use regex that only matches valid base64 chars
+                            # Base64 alphabet: A-Z, a-z, 0-9, +, /, = (padding)
+                            match = re.match(r'data:(image/[^;]+);base64,([A-Za-z0-9+/=]+)', url)
                             if match:
+                                base64_data = match.group(2).strip()
+                                # Ensure proper padding
+                                padding_needed = len(base64_data) % 4
+                                if padding_needed:
+                                    base64_data += '=' * (4 - padding_needed)
                                 images.append({
                                     "type": "image",
                                     "source": {
                                         "type": "base64",
                                         "media_type": match.group(1),
-                                        "data": match.group(2)
+                                        "data": base64_data
                                     }
                                 })
                         elif url.startswith("http://") or url.startswith("https://"):
@@ -322,7 +338,7 @@ class VisionProvider:
             request_body["system"] = final_system
 
         # Make API request
-        async with httpx.AsyncClient(timeout=120.0) as client:
+        async with httpx.AsyncClient(timeout=300.0) as client:
             response = await client.post(
                 self.ANTHROPIC_API_URL,
                 headers={
