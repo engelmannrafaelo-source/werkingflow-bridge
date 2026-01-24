@@ -55,8 +55,12 @@ class PrivacyMiddleware:
             log_detections: Log detected entities (useful for debugging, disable in production)
         """
         # Read from environment if not explicitly set
+        # WICHTIG: Default MUSS auf 'false' stehen!
+        # Presidio anonymisiert technische Begriffe, Variablennamen, Pfade etc. falsch.
+        # Viele Features (Workflows, Code-Generierung, File-Paths) funktionieren nicht
+        # wenn Privacy aktiviert ist. Nur für explizite DSGVO-Workloads aktivieren.
         if enabled is None:
-            enabled = os.getenv('PRIVACY_ENABLED', 'true').lower() in ('true', '1', 'yes', 'on')
+            enabled = os.getenv('PRIVACY_ENABLED', 'false').lower() in ('true', '1', 'yes', 'on')
 
         self.enabled = enabled
         self.language = os.getenv('PRIVACY_LANGUAGE', language)
