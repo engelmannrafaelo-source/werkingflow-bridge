@@ -75,6 +75,9 @@ services:
       # SDK verification disabled (tokens verified on first request)
       - SKIP_SDK_VERIFICATION=true
 
+      # Rate Limiting disabled (handled by Claude's own limits)
+      - RATE_LIMIT_ENABLED=false
+
     # Health Check
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/health"]

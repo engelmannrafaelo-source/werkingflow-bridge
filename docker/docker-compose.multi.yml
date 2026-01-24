@@ -68,6 +68,7 @@ services:
       - PRIVACY_LANGUAGE=de
       - PRIVACY_LOG_DETECTIONS=false
       - SKIP_SDK_VERIFICATION=true
+      - RATE_LIMIT_ENABLED=false
 
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
@@ -122,6 +123,7 @@ services:
       - PRIVACY_LANGUAGE=de
       - PRIVACY_LOG_DETECTIONS=false
       - SKIP_SDK_VERIFICATION=true
+      - RATE_LIMIT_ENABLED=false
 
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
