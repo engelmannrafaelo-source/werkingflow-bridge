@@ -170,8 +170,8 @@ class VisionProvider:
 
         elif isinstance(content, str):
             # Extract inline base64 images from text
-            # Pattern 1: [data:image/xxx;base64,...]
-            pattern = r'\[data:(image/[^;]+);base64,([^\]]+)\]'
+            # Pattern 1: [data:image/xxx;base64,...] - ONLY valid base64 chars
+            pattern = r'\[data:(image/[^;]+);base64,([A-Za-z0-9+/=]+)\]'
 
             last_end = 0
             for match in re.finditer(pattern, content):
@@ -199,7 +199,8 @@ class VisionProvider:
 
             # If no bracketed images found, check for raw data URLs
             if not images:
-                pattern2 = r'data:(image/[^;]+);base64,([^\s\]]+)'
+                # ONLY valid base64 chars: A-Z, a-z, 0-9, +, /, =
+                pattern2 = r'data:(image/[^;]+);base64,([A-Za-z0-9+/=]+)'
                 for match in re.finditer(pattern2, content):
                     images.append({
                         "type": "image",
