@@ -47,6 +47,12 @@ from src.vision_provider import VisionProvider, get_vision_provider
 from src.routing.vision_router import check_and_route_vision, prepare_messages_for_vision, has_vision_content
 from src.auth import verify_api_key, security, validate_claude_code_auth, get_claude_code_auth_info
 from src.parameter_validator import ParameterValidator, CompatibilityReporter
+from src.model_registry import (
+    get_models_for_api,
+    resolve_model,
+    ModelResolutionError,
+    get_all_model_ids
+)
 from src.file_discovery import FileDiscoveryService
 from src.session_manager import session_manager
 from src.privacy import get_privacy_middleware
@@ -1124,7 +1130,31 @@ async def chat_completions(
     
     try:
         request_id = f"chatcmpl-{os.urandom(8).hex()}"
-        
+
+        # MODEL RESOLUTION: Fuzzy match model names (e.g., "sonnet" -> "claude-sonnet-4-5-20250929")
+        original_model = request_body.model
+        resolved_model, resolution_msg = resolve_model(original_model)
+
+        if resolved_model is None:
+            # Model not found - return clear error
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "error": {
+                        "message": f"Model '{original_model}' not supported.",
+                        "type": "invalid_request_error",
+                        "param": "model",
+                        "code": "model_not_found",
+                        "hint": f"Use 'sonnet', 'haiku', 'opus' for latest, or exact IDs: {', '.join(get_all_model_ids())}"
+                    }
+                }
+            )
+
+        # Update request with resolved model
+        if resolved_model != original_model:
+            logger.info(f"Model resolved: '{original_model}' -> '{resolved_model}'")
+            request_body.model = resolved_model
+
         # Extract Claude-specific parameters from headers
         claude_headers = ParameterValidator.extract_claude_headers(dict(request.headers))
 
@@ -1519,6 +1549,22 @@ async def research(
     container_file = None
     output_file = None
 
+    # MODEL RESOLUTION for research endpoint
+    original_model = request_body.model
+    resolved_model, resolution_msg = resolve_model(original_model)
+
+    if resolved_model is None:
+        return ResearchResponse(
+            status="error",
+            query=request_body.query,
+            model=original_model,
+            error=f"Model '{original_model}' not supported. Use 'sonnet', 'haiku', 'opus' for latest, or exact IDs: {', '.join(get_all_model_ids())}"
+        )
+
+    if resolved_model != original_model:
+        logger.info(f"Research model resolved: '{original_model}' -> '{resolved_model}'")
+        request_body.model = resolved_model
+
     try:
         logger.info(
             f"🔬 Research request received",
@@ -1794,21 +1840,17 @@ async def list_models(
     request: Request,
     credentials: Optional[HTTPAuthorizationCredentials] = Depends(security)
 ):
-    """List available models."""
+    """List available models.
+
+    Models are defined centrally in model_registry.py.
+    Supports fuzzy matching: "sonnet" -> latest Sonnet, "haiku" -> latest Haiku
+    """
     # Check FastAPI API key if configured
     await verify_api_key(request, credentials)
-    
+
     return {
         "object": "list",
-        "data": [
-            {"id": "claude-sonnet-4-5-20250929", "object": "model", "owned_by": "anthropic"},  # Sonnet 4.5 (neueste)
-            {"id": "claude-haiku-4-5-20251001", "object": "model", "owned_by": "anthropic"},  # Haiku 4.5 (neueste, für Vision)
-            {"id": "claude-sonnet-4-20250514", "object": "model", "owned_by": "anthropic"},
-            {"id": "claude-opus-4-20250514", "object": "model", "owned_by": "anthropic"},
-            {"id": "claude-3-7-sonnet-20250219", "object": "model", "owned_by": "anthropic"},
-            {"id": "claude-3-5-sonnet-20241022", "object": "model", "owned_by": "anthropic"},
-            {"id": "claude-3-5-haiku-20241022", "object": "model", "owned_by": "anthropic"},  # Legacy
-        ]
+        "data": get_models_for_api()
     }
 
 

@@ -2,8 +2,15 @@
 Parameter validation and mapping utilities for OpenAI to Claude Code SDK conversion.
 """
 
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Tuple
 from src.models import ChatCompletionRequest
+from src.model_registry import (
+    get_all_model_ids,
+    is_model_supported,
+    resolve_model,
+    resolve_model_strict,
+    ModelResolutionError
+)
 from config.logging_config import get_logger
 
 logger = get_logger(__name__)
@@ -11,28 +18,46 @@ logger = get_logger(__name__)
 
 class ParameterValidator:
     """Validates and maps OpenAI Chat Completions parameters to Claude Code SDK options."""
-    
-    # Supported Claude Code SDK models
-    SUPPORTED_MODELS = {
-        "claude-sonnet-4-5-20250929",  # Latest Sonnet 4.5
-        "claude-sonnet-4-20250514",    # Sonnet 4 (May 2025)
-        "claude-opus-4-20250514",      # Opus 4 (May 2025)
-        "claude-opus-4-1-20250805",    # Opus 4.1
-        "claude-3-7-sonnet-20250219",
-        "claude-3-5-sonnet-20241022",
-        "claude-3-5-haiku-20241022"
-    }
-    
+
+    # SUPPORTED_MODELS now comes from model_registry
+    # This property is kept for backward compatibility
+    SUPPORTED_MODELS = set(get_all_model_ids())
+
     # Valid permission modes for Claude Code SDK
     VALID_PERMISSION_MODES = {"default", "acceptEdits", "bypassPermissions"}
-    
+
     @classmethod
     def validate_model(cls, model: str) -> bool:
         """Validate that the model is supported by Claude Code SDK."""
-        if model not in cls.SUPPORTED_MODELS:
-            logger.warning(f"Model '{model}' may not be supported by Claude Code SDK. Supported models: {cls.SUPPORTED_MODELS}")
+        if not is_model_supported(model):
+            # Try fuzzy resolution
+            resolved, msg = resolve_model(model)
+            if resolved:
+                logger.info(f"Model '{model}' resolved to '{resolved}': {msg}")
+                return True
+            logger.warning(f"Model '{model}' not supported. Available: {get_all_model_ids()}")
             return False
         return True
+
+    @classmethod
+    def resolve_model_name(cls, model: str) -> Tuple[str, Optional[str]]:
+        """
+        Resolve a model name with fuzzy matching.
+
+        Args:
+            model: Model ID or fuzzy name (e.g., "sonnet", "haiku")
+
+        Returns:
+            Tuple of (resolved_model_id, info_message)
+            - info_message is None if exact match, otherwise explains resolution
+
+        Raises:
+            ModelResolutionError: If model cannot be resolved
+        """
+        resolved_id, message = resolve_model(model)
+        if resolved_id is None:
+            raise ModelResolutionError(model, get_all_model_ids())
+        return (resolved_id, message)
     
     @classmethod
     def validate_permission_mode(cls, permission_mode: str) -> bool:
