@@ -149,7 +149,7 @@ ssh root@49.12.72.66 "cd /root/werkingflow-bridge/docker && docker compose -f do
 ```bash
 # 1. Research starten
 curl -X POST "http://49.12.72.66:8000/v1/research" \
-  -H "Authorization: Bearer test" \
+  -H "Authorization: Bearer $AI_BRIDGE_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{"query": "...", "depth": "deep"}'
 
@@ -157,7 +157,7 @@ curl -X POST "http://49.12.72.66:8000/v1/research" \
 
 # 2. Output downloaden
 curl "http://49.12.72.66:8000/v1/research/abc-123/content" \
-  -H "Authorization: Bearer test" \
+  -H "Authorization: Bearer $AI_BRIDGE_API_KEY" \
   -o research_output.md
 ```
 

@@ -41,7 +41,7 @@ from src.models import (
     ResearchRequest,
     ResearchResponse
 )
-from src.claude_cli import ClaudeCodeCLI, WorkerUnavailableError
+from src.claude_cli import ClaudeCodeCLI, WorkerUnavailableError, RateLimitError, rate_limit_tracker
 from src.message_adapter import MessageAdapter
 from src.vision_provider import VisionProvider, get_vision_provider
 from src.routing.vision_router import check_and_route_vision, prepare_messages_for_vision, has_vision_content
@@ -575,28 +575,90 @@ async def worker_unavailable_handler(request: Request, exc: WorkerUnavailableErr
         proxy_next_upstream error timeout http_500 http_502 http_503 http_504;
         proxy_next_upstream_tries 2;
     """
+    worker_id = os.getenv("INSTANCE_NAME", "unknown")
+    retry_after = rate_limit_tracker.get_retry_after(worker_id) or 0
+
     logger.warning(
         f"🔄 Worker unavailable, returning 503 for Nginx failover",
         extra={
             "path": str(request.url),
             "method": request.method,
-            "error": str(exc)
+            "error": str(exc),
+            "worker_id": worker_id,
+            "retry_after": retry_after
         }
     )
+
+    # Include rate limit info if this worker is rate-limited
+    rate_limited = rate_limit_tracker.is_rate_limited(worker_id)
+    error_message = "Worker temporarily unavailable, request will be retried on another worker"
+    if rate_limited:
+        error_message = f"Worker {worker_id} rate-limited. Retrying on another worker. Reset in {retry_after}s."
 
     return JSONResponse(
         status_code=503,
         content={
             "error": {
-                "message": "Worker temporarily unavailable, request will be retried on another worker",
+                "message": error_message,
                 "type": "service_unavailable",
                 "code": "503",
-                "retry": True
+                "retry": True,
+                "worker_id": worker_id,
+                "rate_limited": rate_limited,
+                "retry_after_seconds": retry_after
             }
         },
         headers={
-            "Retry-After": "0",  # Immediate retry OK
-            "X-Worker-Failover": "true"
+            "Retry-After": str(retry_after) if retry_after > 0 else "0",
+            "X-Worker-Failover": "true",
+            "X-Worker-Id": worker_id,
+            "X-Rate-Limited": str(rate_limited).lower()
+        }
+    )
+
+
+# =============================================================================
+# Rate Limit Exception Handler - Returns 429 with Retry-After
+# =============================================================================
+@app.exception_handler(RateLimitError)
+async def rate_limit_handler(request: Request, exc: RateLimitError):
+    """
+    Handle RateLimitError by returning HTTP 429 Too Many Requests.
+
+    This is used when ALL workers are exhausted and no failover is possible.
+    The Retry-After header tells the client when to retry.
+    """
+    worker_id = os.getenv("INSTANCE_NAME", "unknown")
+    retry_after = exc.retry_after_seconds
+
+    logger.error(
+        f"🚫 ALL WORKERS RATE LIMITED - returning 429",
+        extra={
+            "path": str(request.url),
+            "method": request.method,
+            "error": str(exc),
+            "worker_id": worker_id,
+            "retry_after": retry_after,
+            "reset_time": exc.reset_time.isoformat() if exc.reset_time else None
+        }
+    )
+
+    return JSONResponse(
+        status_code=429,
+        content={
+            "error": {
+                "message": f"All workers rate-limited. Please retry after {retry_after} seconds.",
+                "type": "rate_limit_exceeded",
+                "code": "429",
+                "retry": True,
+                "retry_after_seconds": retry_after,
+                "reset_time": exc.reset_time.isoformat() if exc.reset_time else None
+            }
+        },
+        headers={
+            "Retry-After": str(retry_after),
+            "X-Rate-Limit-Reset": exc.reset_time.isoformat() if exc.reset_time else "",
+            "X-Worker-Id": worker_id
         }
     )
 
@@ -1533,7 +1595,7 @@ async def research(
         ```bash
         curl -X POST http://localhost:8000/v1/research \\
           -H 'Content-Type: application/json' \\
-          -H 'Authorization: Bearer test-key' \\
+          -H "Authorization: Bearer $AI_BRIDGE_API_KEY" \\
           -d '{
             "query": "Latest AI developments in 2025",
             "model": "claude-sonnet-4-5-20250929",
@@ -1900,6 +1962,37 @@ async def debug_tokens(request: Request):
     }
 
 
+@app.get("/rate-limits")
+async def get_rate_limits(request: Request):
+    """
+    Get current rate limit status for all workers.
+    Useful for monitoring and debugging rate limit issues.
+    """
+    from datetime import datetime
+    worker_instance = os.getenv("INSTANCE_NAME", "unknown")
+    rate_limits = rate_limit_tracker.get_all_rate_limits()
+
+    # Check if current worker is rate-limited
+    current_worker_limited = rate_limit_tracker.is_rate_limited(worker_instance)
+    retry_after = rate_limit_tracker.get_retry_after(worker_instance)
+
+    # Format rate limits for JSON response
+    formatted_limits = {}
+    for worker_id, reset_time in rate_limits.items():
+        formatted_limits[worker_id] = {
+            "reset_time": reset_time.isoformat(),
+            "retry_after_seconds": max(0, int((reset_time - datetime.now()).total_seconds()))
+        }
+
+    return {
+        "current_worker": worker_instance,
+        "current_worker_rate_limited": current_worker_limited,
+        "current_worker_retry_after": retry_after,
+        "all_rate_limits": formatted_limits,
+        "total_workers_limited": len(rate_limits)
+    }
+
+
 @app.get("/stats")
 async def get_stats(request: Request):
     """Get wrapper statistics including request limiting and memory usage."""
@@ -1910,6 +2003,114 @@ async def get_stats(request: Request):
         "status": "healthy" if stats['active_requests'] < stats['max_concurrent'] else "busy",
         "can_accept_requests": stats['active_requests'] < stats['max_concurrent'] and stats['memory_usage_percent'] < stats['memory_threshold']
     }
+
+
+@app.get("/license-health")
+async def license_health_check(request: Request):
+    """
+    Test this worker's Claude license/token by making a minimal API call.
+
+    Returns:
+    - status: "healthy" | "rate_limited" | "error"
+    - worker_id: which worker this is
+    - token_preview: first 25 chars of token
+    - reset_time: when rate limit resets (if rate_limited)
+    - test_response: the actual response from Claude (if healthy)
+
+    Usage: Query each worker directly or through load balancer to check all licenses.
+
+    Example aggregation script:
+    ```bash
+    # Check all workers
+    for worker in "worker1:8000" "worker2:8000" "host:8001" "host:8002"; do
+      curl -s "http://$worker/license-health" | jq -c '{worker: .worker_id, status: .status}'
+    done
+    ```
+    """
+    import time
+    from datetime import datetime
+
+    worker_id = os.getenv("INSTANCE_NAME", "unknown")
+    from src.auth import token_rotator
+    token_preview = token_rotator.tokens[0][:25] + "..." if token_rotator.tokens else "NO_TOKEN"
+
+    # Check if already known to be rate-limited
+    if rate_limit_tracker.is_rate_limited(worker_id):
+        retry_after = rate_limit_tracker.get_retry_after(worker_id)
+        rate_limits = rate_limit_tracker.get_all_rate_limits()
+        reset_time = rate_limits.get(worker_id)
+        return {
+            "status": "rate_limited",
+            "worker_id": worker_id,
+            "token_preview": token_preview,
+            "reset_time": reset_time.isoformat() if reset_time else None,
+            "retry_after_seconds": retry_after,
+            "message": f"Token rate-limited until {reset_time}"
+        }
+
+    # Try a minimal test call
+    start_time = time.time()
+    try:
+        # Create a minimal test prompt
+        test_messages = [{"role": "user", "content": "Reply with exactly: OK"}]
+
+        # Use the ClaudeCodeCLI to test
+        cli = ClaudeCodeCLI(timeout=30000)  # 30 second timeout
+        response_text = ""
+
+        async for message in cli.run_completion(
+            prompt="Reply with exactly: OK",
+            system_prompt=None,
+            model="claude-haiku-4-5-20251001",
+            max_turns=1
+        ):
+            # Check for rate limit in response
+            if hasattr(message, 'content') and message.content:
+                for block in message.content:
+                    if hasattr(block, 'text') and block.text:
+                        text_lower = block.text.lower()
+                        if "hit your limit" in text_lower or "rate limit" in text_lower:
+                            # Mark as rate-limited
+                            rate_limit_tracker.mark_rate_limited(worker_id, block.text)
+                            return {
+                                "status": "rate_limited",
+                                "worker_id": worker_id,
+                                "token_preview": token_preview,
+                                "reset_time": None,
+                                "message": block.text[:100]
+                            }
+                        response_text = block.text
+
+        duration = time.time() - start_time
+        return {
+            "status": "healthy",
+            "worker_id": worker_id,
+            "token_preview": token_preview,
+            "test_response": response_text[:50] if response_text else "NO_RESPONSE",
+            "test_duration_seconds": round(duration, 2),
+            "message": "License is active and working"
+        }
+
+    except WorkerUnavailableError as e:
+        # Token failed, likely rate-limited
+        rate_limit_tracker.mark_rate_limited(worker_id, str(e))
+        return {
+            "status": "rate_limited",
+            "worker_id": worker_id,
+            "token_preview": token_preview,
+            "error": str(e)[:100],
+            "message": "Token appears to be rate-limited"
+        }
+
+    except Exception as e:
+        logger.error(f"License health check failed: {e}")
+        return {
+            "status": "error",
+            "worker_id": worker_id,
+            "token_preview": token_preview,
+            "error": str(e)[:100],
+            "message": "Unexpected error during license check"
+        }
 
 
 @app.post("/v1/debug/request")

@@ -91,7 +91,7 @@ curl http://localhost:8000/health
 ```bash
 # Einfacher Test
 curl -X POST http://49.12.72.66:8000/v1/chat/completions \
-  -H "Authorization: Bearer test" \
+  -H "Authorization: Bearer $AI_BRIDGE_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{"model": "claude-3-5-sonnet-20241022", "messages": [{"role": "user", "content": "Hello"}]}'
 ```

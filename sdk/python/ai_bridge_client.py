@@ -116,9 +116,20 @@ def get_bridge_url(fallback_enabled: Optional[bool] = None) -> str:
     raise AIBridgeConnectionError(msg)
 
 
+def _get_api_key(api_key: Optional[str] = None) -> str:
+    """Get API key from parameter or environment variable."""
+    key = api_key or os.getenv("AI_BRIDGE_API_KEY")
+    if not key:
+        raise ValueError(
+            "[ai-bridge-sdk] AI_BRIDGE_API_KEY not set. "
+            "Set it in environment or pass via api_key parameter."
+        )
+    return key
+
+
 def create_client(
     fallback_enabled: Optional[bool] = None,
-    api_key: str = "not-required",
+    api_key: Optional[str] = None,
 ):
     """
     Create an OpenAI-compatible client connected to AI-Bridge.
@@ -126,13 +137,14 @@ def create_client(
     Args:
         fallback_enabled: Enable fallback to local. If None, checks
                          AI_BRIDGE_FALLBACK env var.
-        api_key: API key (default: "not-required" for AI-Bridge)
+        api_key: API key. If not provided, reads from AI_BRIDGE_API_KEY env var.
 
     Returns:
         OpenAI client configured for AI-Bridge
 
     Raises:
         AIBridgeConnectionError: If no AI-Bridge instance is reachable
+        ValueError: If API key is not configured
         ImportError: If openai package is not installed
     """
     try:
@@ -143,10 +155,11 @@ def create_client(
         ) from e
 
     base_url = get_bridge_url(fallback_enabled=fallback_enabled)
+    resolved_api_key = _get_api_key(api_key)
 
     return OpenAI(
         base_url=f"{base_url}/v1",
-        api_key=api_key,
+        api_key=resolved_api_key,
     )
 
 

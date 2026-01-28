@@ -46,6 +46,124 @@ class WorkerUnavailableError(Exception):
     pass
 
 
+class RateLimitError(Exception):
+    """
+    Raised when rate limit is detected. Contains reset time information.
+    This triggers HTTP 429 with Retry-After header.
+    """
+    def __init__(self, message: str, reset_time: Optional[datetime] = None, retry_after_seconds: Optional[int] = None):
+        super().__init__(message)
+        self.reset_time = reset_time
+        self.retry_after_seconds = retry_after_seconds or self._calculate_retry_after()
+
+    def _calculate_retry_after(self) -> int:
+        """Calculate seconds until reset, default 3600 (1 hour) if unknown"""
+        if self.reset_time:
+            delta = self.reset_time - datetime.now()
+            return max(60, int(delta.total_seconds()))  # Minimum 60 seconds
+        return 3600  # Default 1 hour
+
+
+class RateLimitTracker:
+    """
+    Tracks rate limit status per worker instance.
+    Parses reset times from Claude's rate limit messages.
+    """
+    _instance = None
+
+    def __new__(cls):
+        if cls._instance is None:
+            cls._instance = super().__new__(cls)
+            cls._instance._initialized = False
+        return cls._instance
+
+    def __init__(self):
+        if self._initialized:
+            return
+        self._rate_limits: Dict[str, datetime] = {}  # worker_id -> reset_time
+        self._initialized = True
+        self._logger = get_logger(__name__)
+
+    def parse_reset_time(self, message: str) -> Optional[datetime]:
+        """
+        Parse reset time from Claude's rate limit messages.
+        Examples:
+        - "resets 1pm (Europe/Vienna)"
+        - "resets 2pm (Europe/Vienna)"
+        """
+        import re
+        from datetime import datetime
+        import pytz
+
+        # Pattern: "resets Xpm" or "resets Xam"
+        pattern = r'resets\s+(\d{1,2})(am|pm)\s*\(([^)]+)\)'
+        match = re.search(pattern, message.lower())
+
+        if match:
+            hour = int(match.group(1))
+            am_pm = match.group(2)
+            timezone_str = match.group(3).strip()
+
+            # Convert to 24-hour format
+            if am_pm == 'pm' and hour != 12:
+                hour += 12
+            elif am_pm == 'am' and hour == 12:
+                hour = 0
+
+            try:
+                # Try to parse timezone
+                tz = pytz.timezone(timezone_str)
+                now = datetime.now(tz)
+                reset_time = now.replace(hour=hour, minute=0, second=0, microsecond=0)
+
+                # If reset time is in the past, it's for tomorrow
+                if reset_time <= now:
+                    reset_time += timedelta(days=1)
+
+                self._logger.info(f"📅 Parsed reset time: {reset_time} ({timezone_str})")
+                return reset_time
+            except Exception as e:
+                self._logger.warning(f"Failed to parse timezone '{timezone_str}': {e}")
+
+        # Fallback: 1 hour from now
+        return datetime.now() + timedelta(hours=1)
+
+    def mark_rate_limited(self, worker_id: str, message: str) -> datetime:
+        """Mark a worker as rate-limited and extract reset time"""
+        reset_time = self.parse_reset_time(message)
+        self._rate_limits[worker_id] = reset_time
+        self._logger.warning(f"🚫 Worker {worker_id} rate-limited until {reset_time}")
+        return reset_time
+
+    def is_rate_limited(self, worker_id: str) -> bool:
+        """Check if a specific worker is rate-limited"""
+        if worker_id not in self._rate_limits:
+            return False
+        if datetime.now() >= self._rate_limits[worker_id]:
+            # Rate limit expired
+            del self._rate_limits[worker_id]
+            return False
+        return True
+
+    def get_retry_after(self, worker_id: str) -> Optional[int]:
+        """Get seconds until rate limit resets for a worker"""
+        if worker_id in self._rate_limits:
+            delta = self._rate_limits[worker_id] - datetime.now()
+            return max(60, int(delta.total_seconds()))
+        return None
+
+    def get_all_rate_limits(self) -> Dict[str, datetime]:
+        """Get all current rate limits"""
+        # Clean up expired limits
+        now = datetime.now()
+        self._rate_limits = {k: v for k, v in self._rate_limits.items() if v > now}
+        return self._rate_limits.copy()
+
+
+# Global rate limit tracker instance
+rate_limit_tracker = RateLimitTracker()
+
+
 class ClaudeCodeCLI:
     def __init__(self, timeout: int = 1200000, cwd: Optional[str] = None):
         self.timeout = timeout / 1000  # Convert ms to seconds
@@ -824,6 +942,58 @@ CRITICAL: Write file EARLY to avoid context overflow. Use Write tool for clauded
                                                     accumulated_text_parts.append(block['text'])
                                 except (AttributeError, TypeError, KeyError) as e:
                                     logger.debug(f"🔍 Could not extract text from message: {e}")
+
+                            # =================================================================
+                            # EARLY RATE LIMIT DETECTION
+                            # Must detect BEFORE yielding - once data is sent to client,
+                            # Nginx cannot failover to another worker!
+                            # =================================================================
+                            if type(message).__name__ == 'AssistantMessage':
+                                if hasattr(message, 'content') and message.content:
+                                    for block in message.content:
+                                        if hasattr(block, 'text') and block.text:
+                                            text_lower = block.text.lower()
+                                            # Check for rate limit patterns
+                                            rate_limit_patterns = [
+                                                "hit your limit",
+                                                "you've hit your limit",
+                                                "rate limit",
+                                                "usage limit",
+                                                "quota exceeded",
+                                                "too many requests",
+                                                "capacity",
+                                                "try again later"
+                                            ]
+                                            if any(pattern in text_lower for pattern in rate_limit_patterns):
+                                                error_msg = block.text[:200]
+                                                full_msg = block.text
+                                                logger.warning(f"🚫 RATE LIMIT DETECTED (early): {error_msg}")
+
+                                                # Track rate limit with reset time
+                                                worker_id = os.environ.get("INSTANCE_NAME", "unknown")
+                                                reset_time = rate_limit_tracker.mark_rate_limited(worker_id, full_msg)
+                                                retry_after = rate_limit_tracker.get_retry_after(worker_id)
+
+                                                logger.warning(f"   Worker: {worker_id}")
+                                                logger.warning(f"   Reset time: {reset_time}")
+                                                logger.warning(f"   Retry-After: {retry_after}s")
+                                                logger.warning(f"   Raising WorkerUnavailableError for Nginx failover")
+
+                                                # Mark session as failed before raising
+                                                cli_session_manager.complete_session(cli_session_id, status="failed")
+
+                                                # Raise WorkerUnavailableError (triggers 503 for Nginx failover)
+                                                # The RateLimitError is used when ALL workers are exhausted
+                                                raise WorkerUnavailableError(f"Rate limit detected: {error_msg}")
+
+                            # =================================================================
+                            # SKIP SYSTEMMESSAGE - Don't yield to client
+                            # SystemMessage contains only internal metadata (init, session_id, tools)
+                            # NOT yielding it allows Nginx failover if SDK crashes afterward
+                            # =================================================================
+                            if type(message).__name__ == 'SystemMessage':
+                                logger.debug(f"⏭️  Skipping SystemMessage (internal only, not for client)")
+                                continue
 
                             # Yield chunk immediately (no in-memory accumulation)
                             yield message

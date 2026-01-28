@@ -126,12 +126,26 @@ export async function getBridgeUrl(
 }
 
 /**
+ * Get the API key from environment or options.
+ */
+function getApiKey(optionsKey?: string): string {
+  const key = optionsKey ?? process.env.AI_BRIDGE_API_KEY;
+  if (!key) {
+    throw new Error(
+      "[ai-bridge-sdk] AI_BRIDGE_API_KEY not set. Set it in environment or pass via options."
+    );
+  }
+  return key;
+}
+
+/**
  * Create an OpenAI-compatible client connected to AI-Bridge.
  *
  * @param options.fallbackEnabled - Enable fallback to local
- * @param options.apiKey - API key (default: "not-required")
+ * @param options.apiKey - API key (reads from AI_BRIDGE_API_KEY env var if not provided)
  * @returns OpenAI client configured for AI-Bridge
  * @throws AIBridgeConnectionError if no instance is reachable
+ * @throws Error if API key is not configured
  */
 export async function createClient(
   options: CreateClientOptions = {}
@@ -140,9 +154,11 @@ export async function createClient(
     fallbackEnabled: options.fallbackEnabled,
   });
 
+  const apiKey = getApiKey(options.apiKey);
+
   return new OpenAI({
     baseURL: `${baseUrl}/v1`,
-    apiKey: options.apiKey ?? "not-required",
+    apiKey: apiKey,
   });
 }
 

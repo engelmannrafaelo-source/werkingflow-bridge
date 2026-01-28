@@ -20,6 +20,7 @@ claude-code-sdk = "0.0.22"
 slowapi = "^0.1.9"
 tavily-python = "^0.7.12"
 psutil = "^6.1.0"
+pytz = ">=2024.1"
 
 # Privacy/DSGVO compliance (Presidio-based PII anonymization)
 presidio-analyzer = {version = "^2.2.0", optional = true}
