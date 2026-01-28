@@ -237,3 +237,73 @@ def resolve_model_strict(model_input: str) -> str:
         logger.info(warning)
 
     return resolved_id
+
+
+# =============================================================================
+# AWS BEDROCK MODEL ID CONVERSION
+# =============================================================================
+
+def to_bedrock_model_id(anthropic_model_id: str) -> str:
+    """Convert Anthropic model ID to AWS Bedrock model ID.
+
+    Bedrock uses format: anthropic.{model-name}-v{version}:{revision}
+
+    Args:
+        anthropic_model_id: e.g., 'claude-sonnet-4-5-20250929'
+
+    Returns:
+        Bedrock model ID: e.g., 'anthropic.claude-sonnet-4-5-20250929-v1:0'
+
+    Raises:
+        ValueError: If model ID format is not recognized
+
+    Examples:
+        >>> to_bedrock_model_id("claude-sonnet-4-5-20250929")
+        "anthropic.claude-sonnet-4-5-20250929-v1:0"
+
+        >>> to_bedrock_model_id("claude-haiku-4-5-20251001")
+        "anthropic.claude-haiku-4-5-20251001-v1:0"
+    """
+    if not anthropic_model_id.startswith("claude-"):
+        raise ValueError(
+            f"Cannot convert non-Claude model '{anthropic_model_id}' to Bedrock ID. "
+            f"Model must start with 'claude-'"
+        )
+
+    # Bedrock format: anthropic.{model-id}-v1:0
+    return f"anthropic.{anthropic_model_id}-v1:0"
+
+
+def from_bedrock_model_id(bedrock_model_id: str) -> str:
+    """Convert AWS Bedrock model ID back to Anthropic model ID.
+
+    Args:
+        bedrock_model_id: e.g., 'anthropic.claude-sonnet-4-5-20250929-v1:0'
+
+    Returns:
+        Anthropic model ID: e.g., 'claude-sonnet-4-5-20250929'
+
+    Raises:
+        ValueError: If Bedrock model ID format is invalid
+
+    Examples:
+        >>> from_bedrock_model_id("anthropic.claude-sonnet-4-5-20250929-v1:0")
+        "claude-sonnet-4-5-20250929"
+    """
+    if not bedrock_model_id.startswith("anthropic."):
+        raise ValueError(
+            f"Invalid Bedrock model ID format: '{bedrock_model_id}'. "
+            f"Expected format: anthropic.claude-*-v1:0"
+        )
+
+    # Remove 'anthropic.' prefix
+    model_part = bedrock_model_id[10:]
+
+    # Remove version suffix (-v1:0, -v1:1, -v2:0, etc.)
+    if "-v1:0" in model_part:
+        model_part = model_part.rsplit("-v1:0", 1)[0]
+    elif "-v" in model_part:
+        # Handle other version formats
+        model_part = model_part.rsplit("-v", 1)[0]
+
+    return model_part

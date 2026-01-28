@@ -351,8 +351,85 @@ class ClaudeCodeAuthManager:
         return env_vars
 
 
-# Initialize the auth manager
+class BedrockCredentialManager:
+    """Manages AWS Bedrock credentials for per-request backend selection.
+
+    Unlike ClaudeCodeAuthManager (global auth), this handles per-request Bedrock routing
+    where the server may have both OAuth (for dev) and Bedrock (for prod) configured.
+
+    DSGVO-compliant: Default region is eu-central-1 (Frankfurt).
+
+    Environment variables (in order of priority):
+    - AWS_ACCESS_KEY_ID_BEDROCK / AWS_SECRET_ACCESS_KEY_BEDROCK (Bedrock-specific)
+    - AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY (standard AWS)
+    - AWS_REGION_BEDROCK / AWS_REGION (region, default: eu-central-1)
+    """
+
+    def __init__(self):
+        # Look for Bedrock-specific credentials first, fall back to standard AWS
+        self.aws_access_key = os.getenv("AWS_ACCESS_KEY_ID_BEDROCK") or os.getenv("AWS_ACCESS_KEY_ID")
+        self.aws_secret_key = os.getenv("AWS_SECRET_ACCESS_KEY_BEDROCK") or os.getenv("AWS_SECRET_ACCESS_KEY")
+        self.default_region = os.getenv("AWS_REGION_BEDROCK") or os.getenv("AWS_REGION") or "eu-central-1"
+
+        self._log_init_status()
+
+    def _log_init_status(self):
+        """Log credential status on init (but don't fail - Bedrock may be optional)."""
+        if self.is_configured():
+            logger.info(f"✅ Bedrock credentials configured (region={self.default_region})")
+        else:
+            logger.info("ℹ️  Bedrock credentials not configured (backend='bedrock' requests will fail)")
+
+    def is_configured(self) -> bool:
+        """Check if Bedrock credentials are available."""
+        return bool(self.aws_access_key and self.aws_secret_key)
+
+    def validate(self) -> Tuple[bool, Dict[str, Any]]:
+        """Validate Bedrock credentials.
+
+        Returns:
+            Tuple of (is_valid, info_dict) where info_dict contains:
+            - errors: List of error messages (if invalid)
+            - region: Configured region
+        """
+        errors = []
+
+        if not self.aws_access_key:
+            errors.append("AWS_ACCESS_KEY_ID_BEDROCK (or AWS_ACCESS_KEY_ID) not set")
+        if not self.aws_secret_key:
+            errors.append("AWS_SECRET_ACCESS_KEY_BEDROCK (or AWS_SECRET_ACCESS_KEY) not set")
+
+        return (len(errors) == 0, {"errors": errors, "region": self.default_region})
+
+    def get_bedrock_env_vars(self, region: Optional[str] = None) -> Dict[str, str]:
+        """Get environment variables needed for Bedrock SDK routing.
+
+        Args:
+            region: Override region (default: self.default_region)
+
+        Returns:
+            Dict of env vars to set for Claude Code SDK subprocess.
+
+        Raises:
+            RuntimeError: If credentials not configured (defensive programming - fail loud).
+        """
+        if not self.is_configured():
+            raise RuntimeError(
+                "Bedrock credentials not configured. "
+                "Set AWS_ACCESS_KEY_ID_BEDROCK and AWS_SECRET_ACCESS_KEY_BEDROCK environment variables."
+            )
+
+        return {
+            "CLAUDE_CODE_USE_BEDROCK": "1",
+            "AWS_ACCESS_KEY_ID": self.aws_access_key,
+            "AWS_SECRET_ACCESS_KEY": self.aws_secret_key,
+            "AWS_REGION": region or self.default_region,
+        }
+
+
+# Initialize managers
 auth_manager = ClaudeCodeAuthManager()
+bedrock_credential_manager = BedrockCredentialManager()
 
 # HTTP Bearer security scheme (for FastAPI endpoint protection)
 security = HTTPBearer(auto_error=False)

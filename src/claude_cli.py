@@ -462,9 +462,26 @@ class ClaudeCodeCLI:
         disallowed_tools: Optional[List[str]] = None,
         session_id: Optional[str] = None,
         continue_session: bool = False,
-        enable_file_discovery: bool = False
+        enable_file_discovery: bool = False,
+        backend_env_vars: Optional[Dict[str, str]] = None
     ) -> AsyncGenerator[Dict[str, Any], None]:
-        """Run Claude Code using the Python SDK and yield response chunks."""
+        """Run Claude Code using the Python SDK and yield response chunks.
+
+        Args:
+            prompt: The user prompt to send to Claude
+            system_prompt: Optional system prompt
+            model: Model ID to use
+            stream: Whether to stream responses
+            max_turns: Maximum conversation turns
+            allowed_tools: List of tools to allow
+            disallowed_tools: List of tools to disallow
+            session_id: Optional session ID for continuity
+            continue_session: Whether to continue existing session
+            enable_file_discovery: Enable file discovery for research
+            backend_env_vars: Additional env vars for backend routing (e.g., Bedrock).
+                              These are merged with auth env vars and override them if keys conflict.
+                              Cleaned up after request completes.
+        """
 
         # Register CLI session for tracking and cancellation
         from src.cli_session_manager import cli_session_manager
@@ -542,6 +559,18 @@ CRITICAL: Write file EARLY to avoid context overflow. Use Write tool for clauded
                 for key, value in self.claude_env_vars.items():
                     original_env[key] = os.environ.get(key)
                     os.environ[key] = value
+
+            # Apply per-request backend env vars (e.g., for Bedrock routing)
+            # These OVERRIDE auth env vars if both specify the same key
+            if backend_env_vars:
+                for key, value in backend_env_vars.items():
+                    if key not in original_env:  # Don't double-save original values
+                        original_env[key] = os.environ.get(key)
+                    os.environ[key] = value
+                    # Log with masked value for security
+                    masked_value = value[:8] + "..." if len(value) > 8 else "***"
+                    logger.debug(f"🔀 Backend env var set: {key}={masked_value}")
+                logger.info(f"🔀 Backend routing active: {len(backend_env_vars)} env vars set")
 
             # ALWAYS disable Coach MCP in wrapper to prevent infinite spawn loop
             # Coach MCP spawns Claude → /sc:research spawns Coach → LOOP!
