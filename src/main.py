@@ -39,13 +39,17 @@ from src.models import (
     SessionInfo,
     SessionListResponse,
     ResearchRequest,
-    ResearchResponse
+    ResearchResponse,
+    BackendType,
+    PrivacyMode,
+    BackendInfo
 )
 from src.claude_cli import ClaudeCodeCLI, WorkerUnavailableError, RateLimitError, rate_limit_tracker
 from src.message_adapter import MessageAdapter
 from src.vision_provider import VisionProvider, get_vision_provider
 from src.routing.vision_router import check_and_route_vision, prepare_messages_for_vision, has_vision_content
-from src.auth import verify_api_key, security, validate_claude_code_auth, get_claude_code_auth_info
+from src.routing.backend_router import resolve_backend_config, get_backend_info_dict, BackendConfig
+from src.auth import verify_api_key, security, validate_claude_code_auth, get_claude_code_auth_info, bedrock_credential_manager
 from src.parameter_validator import ParameterValidator, CompatibilityReporter
 from src.model_registry import (
     get_models_for_api,
@@ -708,9 +712,18 @@ async def generate_streaming_response(
     request: ChatCompletionRequest,
     request_id: str,
     claude_headers: Optional[Dict[str, Any]] = None,
-    fastapi_request: Optional[Request] = None
+    fastapi_request: Optional[Request] = None,
+    backend_config: Optional[BackendConfig] = None
 ) -> AsyncGenerator[str, None]:
-    """Generate SSE formatted streaming response with automatic disconnect detection."""
+    """Generate SSE formatted streaming response with automatic disconnect detection.
+
+    Args:
+        request: The chat completion request
+        request_id: Unique request ID
+        claude_headers: Optional Claude-specific headers
+        fastapi_request: FastAPI request object for tenant/privacy context
+        backend_config: Backend routing configuration (Anthropic vs Bedrock)
+    """
     cli_session_for_disconnect = None  # Track CLI session for disconnect detection
     streaming_started = asyncio.Event()  # Signal when streaming starts (prevents race condition)
 
@@ -770,11 +783,15 @@ async def generate_streaming_response(
 
         # Privacy: Anonymize user messages before sending to Claude
         # Uses tenant's privacy mode from request.state (set by TenantMiddleware)
+        # OR backend_config's privacy_enabled if backend routing is active
         privacy_middleware = get_privacy_middleware()
         anonymization_mapping = {}
         privacy_mode = get_privacy_mode_from_request(fastapi_request) if fastapi_request else "full"
 
-        if privacy_middleware.enabled:
+        # Backend routing can override privacy (e.g., Bedrock EU disables privacy automatically)
+        privacy_enabled = backend_config.privacy_enabled if backend_config else privacy_middleware.enabled
+
+        if privacy_enabled:
             messages_for_anon = [
                 {'role': m.role, 'content': m.content}
                 for m in all_messages
@@ -920,7 +937,8 @@ async def generate_streaming_response(
             allowed_tools=claude_options.get('allowed_tools'),
             disallowed_tools=claude_options.get('disallowed_tools'),
             stream=True,
-            enable_file_discovery=claude_options.get('enable_file_discovery', False)
+            enable_file_discovery=claude_options.get('enable_file_discovery', False),
+            backend_env_vars=backend_config.env_vars if backend_config else None
         ):
             # Capture metadata chunk (don't stream it in SSE)
             if isinstance(chunk, dict) and chunk.get("type") == "x_claude_metadata":
@@ -1217,6 +1235,29 @@ async def chat_completions(
             logger.info(f"Model resolved: '{original_model}' -> '{resolved_model}'")
             request_body.model = resolved_model
 
+        # BACKEND ROUTING: Resolve backend configuration (Anthropic SDK vs Bedrock)
+        backend_config = None
+        try:
+            backend_config = resolve_backend_config(
+                backend=request_body.backend or BackendType.ANTHROPIC,
+                model=resolved_model,
+                privacy=request_body.privacy or PrivacyMode.AUTO,
+                bedrock_region=request_body.bedrock_region
+            )
+        except RuntimeError as e:
+            # Bedrock requested but not configured
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "error": {
+                        "message": str(e),
+                        "type": "configuration_error",
+                        "code": "bedrock_not_configured",
+                        "hint": "Contact server administrator to configure AWS credentials for Bedrock"
+                    }
+                }
+            )
+
         # Extract Claude-specific parameters from headers
         claude_headers = ParameterValidator.extract_claude_headers(dict(request.headers))
 
@@ -1231,12 +1272,17 @@ async def chat_completions(
 
             # Return streaming response with worker info header
             return StreamingResponse(
-                generate_streaming_response(request_body, request_id, claude_headers, fastapi_request=request),
+                generate_streaming_response(
+                    request_body, request_id, claude_headers,
+                    fastapi_request=request,
+                    backend_config=backend_config
+                ),
                 media_type="text/event-stream",
                 headers={
                     "Cache-Control": "no-cache",
                     "Connection": "keep-alive",
                     "X-Worker-Instance": worker_instance,
+                    "X-Backend": backend_config.backend.value if backend_config else "anthropic",
                 }
             )
         else:
@@ -1303,11 +1349,15 @@ async def chat_completions(
 
             # Privacy: Anonymize user messages before sending to Claude
             # Uses tenant's privacy mode from request.state (set by TenantMiddleware)
+            # OR backend_config's privacy_enabled if backend routing is active
             privacy_middleware = get_privacy_middleware()
             anonymization_mapping = {}
             privacy_mode = get_privacy_mode_from_request(request)
 
-            if privacy_middleware.enabled:
+            # Backend routing can override privacy (e.g., Bedrock EU disables privacy automatically)
+            privacy_enabled = backend_config.privacy_enabled if backend_config else privacy_middleware.enabled
+
+            if privacy_enabled:
                 messages_for_anon = [
                     {'role': m.role, 'content': m.content}
                     for m in all_messages
@@ -1385,7 +1435,8 @@ async def chat_completions(
                 allowed_tools=claude_options.get('allowed_tools'),
                 disallowed_tools=claude_options.get('disallowed_tools'),
                 stream=False,
-                enable_file_discovery=claude_options.get('enable_file_discovery', False)
+                enable_file_discovery=claude_options.get('enable_file_discovery', False),
+                backend_env_vars=backend_config.env_vars if backend_config else None
             ):
                 # Capture metadata chunk separately
                 if isinstance(chunk, dict) and chunk.get("type") == "x_claude_metadata":
@@ -1458,7 +1509,7 @@ async def chat_completions(
             prompt_tokens = MessageAdapter.estimate_tokens(prompt)
             completion_tokens = MessageAdapter.estimate_tokens(assistant_content)
 
-            # Create response
+            # Create response with backend info
             response = ChatCompletionResponse(
                 id=request_id,
                 model=request_body.model,
@@ -1472,7 +1523,8 @@ async def chat_completions(
                     completion_tokens=completion_tokens,
                     total_tokens=prompt_tokens + completion_tokens,
                     image_count=0  # Text-only request (no images)
-                )
+                ),
+                x_backend_info=BackendInfo(**get_backend_info_dict(backend_config)) if backend_config else None
             )
 
             # Log successful chat completion event
@@ -1627,6 +1679,23 @@ async def research(
         logger.info(f"Research model resolved: '{original_model}' -> '{resolved_model}'")
         request_body.model = resolved_model
 
+    # BACKEND ROUTING: Resolve backend configuration for research
+    backend_config = None
+    try:
+        backend_config = resolve_backend_config(
+            backend=request_body.backend or BackendType.ANTHROPIC,
+            model=resolved_model,
+            privacy=request_body.privacy or PrivacyMode.AUTO,
+            bedrock_region=request_body.bedrock_region
+        )
+    except RuntimeError as e:
+        return ResearchResponse(
+            status="error",
+            query=request_body.query,
+            model=request_body.model,
+            error=str(e)
+        )
+
     try:
         logger.info(
             f"🔬 Research request received",
@@ -1636,7 +1705,8 @@ async def research(
                 "depth": request_body.depth,
                 "strategy": request_body.strategy,
                 "max_hops": request_body.max_hops,
-                "output_path": request_body.output_path
+                "output_path": request_body.output_path,
+                "backend": backend_config.backend.value if backend_config else "anthropic"
             }
         )
 
@@ -1683,7 +1753,8 @@ async def research(
             max_turns=request_body.max_turns,
             allowed_tools=None,  # None means all tools allowed
             stream=True,
-            enable_file_discovery=True
+            enable_file_discovery=True,
+            backend_env_vars=backend_config.env_vars if backend_config else None
         ):
             all_chunks.append(chunk)
 
@@ -1801,10 +1872,25 @@ async def research(
                 )
                 # Don't fail the request, just log the error
 
-        # Get file size if available
+        # Get file size and content if available
         file_size_bytes = None
+        content = None
+
+        # Try to read content from output_file or container_file
+        content_file = None
         if output_file and Path(output_file).exists():
-            file_size_bytes = Path(output_file).stat().st_size
+            content_file = output_file
+        elif container_file and Path(container_file).exists():
+            content_file = container_file
+
+        if content_file:
+            file_size_bytes = Path(content_file).stat().st_size
+            try:
+                with open(content_file, 'r', encoding='utf-8') as f:
+                    content = f.read()
+                logger.info(f"📄 Read content: {len(content)} chars from {content_file}")
+            except Exception as e:
+                logger.warning(f"⚠️ Could not read content: {e}")
 
         return ResearchResponse(
             status="success",
@@ -1814,6 +1900,7 @@ async def research(
             container_file=container_file,
             execution_time_seconds=round(execution_time, 2),
             file_size_bytes=file_size_bytes,
+            content=content,
             error=None,
             session_id=session_id
         )
@@ -2209,14 +2296,28 @@ async def get_privacy_status():
 @app.get("/v1/auth/status")
 @rate_limit_endpoint("auth")
 async def get_auth_status(request: Request):
-    """Get Claude Code authentication status."""
-    from auth import auth_manager
-    
+    """Get Claude Code authentication status and backend availability."""
+    from src.auth import auth_manager
+
     auth_info = get_claude_code_auth_info()
     active_api_key = auth_manager.get_api_key()
-    
+
+    # Check Bedrock availability
+    bedrock_valid, bedrock_info = bedrock_credential_manager.validate()
+
     return {
         "claude_code_auth": auth_info,
+        "backends": {
+            "anthropic": {
+                "available": auth_info["status"]["valid"],
+                "method": auth_info["method"]
+            },
+            "bedrock": {
+                "available": bedrock_valid,
+                "region": bedrock_info.get("region"),
+                "errors": bedrock_info.get("errors", []) if not bedrock_valid else []
+            }
+        },
         "server_info": {
             "api_key_required": bool(active_api_key),
             "api_key_source": "environment" if os.getenv("API_KEY") else ("runtime" if runtime_api_key else "none"),

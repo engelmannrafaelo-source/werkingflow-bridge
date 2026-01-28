@@ -9,6 +9,23 @@ from config.logging_config import get_logger
 logger = get_logger(__name__)
 
 
+# ============================================================================
+# Backend Types for Multi-Provider Support
+# ============================================================================
+
+class BackendType(str, Enum):
+    """Backend provider for Claude API requests."""
+    ANTHROPIC = "anthropic"  # Claude Code SDK (default, full tool support)
+    BEDROCK = "bedrock"      # AWS Bedrock (DSGVO-compliant, EU data residency)
+
+
+class PrivacyMode(str, Enum):
+    """Privacy mode for PII anonymization."""
+    AUTO = "auto"        # Bedrock EU → disabled, otherwise global setting
+    ENABLED = "enabled"  # Always anonymize
+    DISABLED = "disabled"  # Never anonymize
+
+
 class TextContentPart(BaseModel):
     """Text content part for multimodal messages."""
     type: Literal["text"]
@@ -110,7 +127,21 @@ class ChatCompletionRequest(BaseModel):
     user: Optional[str] = None
     session_id: Optional[str] = Field(default=None, description="Optional session ID for conversation continuity")
     enable_tools: Optional[bool] = Field(default=False, description="Enable Claude Code tools (Read, Write, Bash, etc.) - disabled by default for OpenAI compatibility")
-    
+
+    # Backend selection for multi-provider support
+    backend: Optional[BackendType] = Field(
+        default=BackendType.ANTHROPIC,
+        description="Backend provider: 'anthropic' (default, Claude Code SDK) or 'bedrock' (AWS Bedrock EU for DSGVO compliance)"
+    )
+    bedrock_region: Optional[str] = Field(
+        default=None,
+        description="AWS region for Bedrock backend (default: eu-central-1). Only used when backend='bedrock'"
+    )
+    privacy: Optional[PrivacyMode] = Field(
+        default=PrivacyMode.AUTO,
+        description="Privacy mode: 'auto' (disable for Bedrock EU), 'enabled' (always anonymize), 'disabled' (never anonymize)"
+    )
+
     @field_validator('n')
     @classmethod
     def validate_n(cls, v):
@@ -181,6 +212,14 @@ class Usage(BaseModel):
     image_count: Optional[int] = None  # Number of images analyzed (vision calls)
 
 
+class BackendInfo(BaseModel):
+    """Backend routing information (non-standard OpenAI extension)."""
+    backend: str = Field(description="Backend used: 'anthropic' or 'bedrock'")
+    region: Optional[str] = Field(default=None, description="AWS region (only for Bedrock)")
+    privacy_applied: bool = Field(description="Whether PII anonymization was applied")
+    model_id_used: str = Field(description="Actual model ID sent to backend")
+
+
 class ChatCompletionResponse(BaseModel):
     id: str = Field(default_factory=lambda: f"chatcmpl-{uuid.uuid4().hex}")
     object: Literal["chat.completion"] = "chat.completion"
@@ -189,6 +228,10 @@ class ChatCompletionResponse(BaseModel):
     choices: List[Choice]
     usage: Optional[Usage] = None
     system_fingerprint: Optional[str] = None
+    x_backend_info: Optional[BackendInfo] = Field(
+        default=None,
+        description="Backend routing information (non-standard OpenAI extension)"
+    )
 
 
 class StreamChoice(BaseModel):
@@ -313,6 +356,20 @@ class ResearchRequest(BaseModel):
         description="Maximum conversation turns for research task (increased for deep research)"
     )
 
+    # Backend selection for multi-provider support
+    backend: Optional[BackendType] = Field(
+        default=BackendType.ANTHROPIC,
+        description="Backend provider: 'anthropic' (default) or 'bedrock' (AWS Bedrock EU for DSGVO)"
+    )
+    bedrock_region: Optional[str] = Field(
+        default=None,
+        description="AWS region for Bedrock backend (default: eu-central-1)"
+    )
+    privacy: Optional[PrivacyMode] = Field(
+        default=PrivacyMode.AUTO,
+        description="Privacy mode: 'auto', 'enabled', or 'disabled'"
+    )
+
 
 class ResearchResponse(BaseModel):
     """
@@ -342,6 +399,10 @@ class ResearchResponse(BaseModel):
     error: Optional[str] = Field(
         default=None,
         description="Error message if status is 'error'"
+    )
+    content: Optional[str] = Field(
+        default=None,
+        description="Actual research output content (markdown)"
     )
     session_id: Optional[str] = Field(
         default=None,
