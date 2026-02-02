@@ -120,7 +120,10 @@ class ChatCompletionRequest(BaseModel):
     n: Optional[int] = Field(default=1, ge=1)
     stream: Optional[bool] = False
     stop: Optional[Union[str, List[str]]] = None
-    max_tokens: Optional[int] = None
+    max_tokens: Optional[int] = Field(
+        default=64000,
+        description="Maximum tokens in response. Defaults to 64000 (Claude 4.5 max) if not specified."
+    )
     presence_penalty: Optional[float] = Field(default=0, ge=-2, le=2)
     frequency_penalty: Optional[float] = Field(default=0, ge=-2, le=2)
     logit_bias: Optional[Dict[str, float]] = None
@@ -159,8 +162,8 @@ class ChatCompletionRequest(BaseModel):
         if self.top_p != 1.0:
             warnings.append(f"top_p={self.top_p} is not supported by Claude Code SDK and will be ignored")
             
-        if self.max_tokens is not None:
-            warnings.append(f"max_tokens={self.max_tokens} is not supported by Claude Code SDK and will be ignored. Consider using max_turns to limit conversation length")
+        # Note: max_tokens IS used for vision and Bedrock paths, only ignored by Claude Code SDK
+        # No warning needed since we have a sensible default now
         
         if self.presence_penalty != 0:
             warnings.append(f"presence_penalty={self.presence_penalty} is not supported by Claude Code SDK and will be ignored")
