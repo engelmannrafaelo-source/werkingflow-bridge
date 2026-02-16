@@ -26,6 +26,11 @@ from .usage_tracker import (
     get_usage_tracker,
     track_request_usage
 )
+from .budget_checker import (
+    check_budget,
+    BudgetCheckResult,
+    get_budget_cache
+)
 
 __all__ = [
     # Middleware
@@ -41,5 +46,9 @@ __all__ = [
     'UsageTracker',
     'UsageRecord',
     'get_usage_tracker',
-    'track_request_usage'
+    'track_request_usage',
+    # Budget Checking
+    'check_budget',
+    'BudgetCheckResult',
+    'get_budget_cache',
 ]

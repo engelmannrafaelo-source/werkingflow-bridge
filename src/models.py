@@ -15,8 +15,10 @@ logger = get_logger(__name__)
 
 class BackendType(str, Enum):
     """Backend provider for Claude API requests."""
-    ANTHROPIC = "anthropic"  # Claude Code SDK (default, full tool support)
-    BEDROCK = "bedrock"      # AWS Bedrock (DSGVO-compliant, EU data residency)
+    ANTHROPIC = "anthropic"            # Claude Code SDK (default, full tool support)
+    BEDROCK = "bedrock"                # AWS Bedrock (DSGVO-compliant, EU data residency)
+    OPENAI_COMPATIBLE = "openai_compatible"  # Generic OpenAI-compatible API (OpenRouter, etc.)
+    GEMINI_CLI = "gemini_cli"          # Gemini CLI subprocess (Google OAuth, subscription models)
 
 
 class PrivacyMode(str, Enum):
@@ -143,6 +145,10 @@ class ChatCompletionRequest(BaseModel):
     privacy: Optional[PrivacyMode] = Field(
         default=PrivacyMode.AUTO,
         description="Privacy mode: 'auto' (disable for Bedrock EU), 'enabled' (always anonymize), 'disabled' (never anonymize)"
+    )
+    provider_tier: Optional[str] = Field(
+        default=None,
+        description="Provider tier for multi-provider routing (e.g. 'claude-premium', 'dsgvo-deutschland', 'eu-standard'). Overrides backend selection."
     )
 
     @field_validator('n')
@@ -410,4 +416,81 @@ class ResearchResponse(BaseModel):
     session_id: Optional[str] = Field(
         default=None,
         description="Claude Code session ID used for research"
+    )
+
+
+# ============================================================================
+# Smart Anonymization Endpoint Models
+# ============================================================================
+
+class SmartAnonymizeRequest(BaseModel):
+    """
+    Request model for /v1/privacy/smart-anonymize endpoint.
+
+    3-stage pseudonymization:
+    1. Presidio detects all PII aggressively
+    2. Claude Haiku evaluates which entities are safe to restore
+    3. Client-side encryption of mapping (handled in frontend)
+    """
+    text: str = Field(..., description="Text to smart-anonymize")
+    language: Optional[str] = Field(
+        default="de",
+        description="Language for PII detection: 'de' or 'en'"
+    )
+    context_hint: Optional[str] = Field(
+        default=None,
+        description="Document context hint (e.g. 'Baugutachten', 'Energieausweis', 'Schallschutzgutachten')"
+    )
+    prefix: Optional[str] = Field(
+        default=None,
+        description="Document-scoped prefix for placeholders (e.g. 'Da1b2c3'). Default: 'ANON'"
+    )
+
+
+class SmartAnonymizeResponse(BaseModel):
+    """
+    Response model for smart anonymization.
+
+    Returns both raw Presidio results and AI-refined results for comparison.
+    """
+    status: Literal["success", "error"]
+
+    # Stage 1: Raw Presidio result
+    raw_anonymized_text: Optional[str] = Field(
+        default=None,
+        description="Presidio-anonymized text (all entities replaced)"
+    )
+    raw_entity_count: Optional[int] = Field(
+        default=None,
+        description="Number of entities detected by Presidio"
+    )
+
+    # Stage 2: AI-refined result
+    smart_anonymized_text: Optional[str] = Field(
+        default=None,
+        description="Smart-anonymized text (only real PII replaced)"
+    )
+    smart_entity_count: Optional[int] = Field(
+        default=None,
+        description="Number of entities that remain anonymized after AI refinement"
+    )
+    restored_entities: Optional[List[Dict[str, Any]]] = Field(
+        default=None,
+        description="Entities restored by AI (with decision reason)"
+    )
+
+    # Mapping for client-side encryption
+    mapping: Optional[Dict[str, str]] = Field(
+        default=None,
+        description="Reduced mapping (only kept entities): placeholder → original"
+    )
+    detected_entities: Optional[List[Dict[str, Any]]] = Field(
+        default=None,
+        description="All detected entities with AI decisions"
+    )
+
+    # Meta
+    error: Optional[str] = Field(
+        default=None,
+        description="Error message if status is 'error'"
     )

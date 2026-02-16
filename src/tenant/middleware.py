@@ -7,13 +7,15 @@ Routes requests with per-tenant configuration:
 - Model restrictions
 - Usage tracking for billing
 
-Headers:
-- X-Tenant-ID: Tenant UUID (optional, for context)
-- X-Tenant-API-Key: Tenant API key (required for tenant features)
+Headers (in priority order):
+1. X-Tenant-API-Key: Tenant API key (legacy, validates against Supabase)
+2. X-Tenant-ID + X-Tenant-Timestamp + X-Tenant-Signature: Signed tenant (new, HMAC)
 """
 
 import os
 import time
+import hmac
+import hashlib
 import logging
 import asyncio
 from typing import Optional, Callable
@@ -27,7 +29,62 @@ from .client import (
     get_tenant_client
 )
 
+# Shared secret for signed tenant headers
+BRIDGE_TENANT_SECRET = os.getenv("BRIDGE_TENANT_SECRET")
+
 logger = logging.getLogger(__name__)
+
+
+def validate_signed_tenant(request: Request, max_age_seconds: int = 300) -> Optional[str]:
+    """
+    Validate signed tenant headers (HMAC-SHA256).
+
+    Headers required:
+    - X-Tenant-ID: Tenant identifier
+    - X-Tenant-Timestamp: Unix timestamp (seconds)
+    - X-Tenant-Signature: HMAC-SHA256(tenant_id:timestamp, secret)
+
+    Args:
+        request: Starlette request
+        max_age_seconds: Maximum age of timestamp (default: 5 minutes)
+
+    Returns:
+        tenant_id if valid, None otherwise
+    """
+    if not BRIDGE_TENANT_SECRET:
+        return None
+
+    tenant_id = request.headers.get("X-Tenant-ID")
+    timestamp = request.headers.get("X-Tenant-Timestamp")
+    signature = request.headers.get("X-Tenant-Signature")
+
+    if not all([tenant_id, timestamp, signature]):
+        return None
+
+    # Check timestamp age
+    try:
+        ts = int(timestamp)
+        now = int(time.time())
+        if abs(now - ts) > max_age_seconds:
+            logger.warning(f"Signed tenant timestamp too old: {abs(now - ts)}s")
+            return None
+    except ValueError:
+        logger.warning(f"Invalid tenant timestamp: {timestamp}")
+        return None
+
+    # Validate signature
+    payload = f"{tenant_id}:{timestamp}"
+    expected = hmac.new(
+        BRIDGE_TENANT_SECRET.encode(),
+        payload.encode(),
+        hashlib.sha256
+    ).hexdigest()
+
+    if not hmac.compare_digest(signature, expected):
+        logger.warning(f"Invalid tenant signature for {tenant_id}")
+        return None
+
+    return tenant_id
 
 
 class TenantMiddleware(BaseHTTPMiddleware):
@@ -104,7 +161,7 @@ class TenantMiddleware(BaseHTTPMiddleware):
         if self._is_exempt_path(request.url.path):
             return await call_next(request)
 
-        # Validate tenant if API key provided
+        # Method 1: Validate tenant via API key (legacy, Supabase lookup)
         if tenant_api_key and self.tenant_client.enabled:
             settings = await self.tenant_client.validate_api_key(tenant_api_key)
 
@@ -127,11 +184,8 @@ class TenantMiddleware(BaseHTTPMiddleware):
                         }
                     )
 
-                # Validate model if specified in request
-                # (Model validation happens later in the request flow)
-
                 logger.debug(
-                    f"Tenant context set: {settings.tenant_slug} "
+                    f"Tenant context set (API key): {settings.tenant_slug} "
                     f"(privacy={settings.privacy_mode})"
                 )
 
@@ -154,12 +208,42 @@ class TenantMiddleware(BaseHTTPMiddleware):
                         }
                     )
                 else:
-                    # Log warning but continue with defaults
                     logger.warning(
                         f"Invalid tenant API key provided, using defaults"
                     )
 
-        elif self.require_tenant_auth and self._requires_tenant_auth(request.url.path):
+        # Method 2: Validate tenant via signed headers (new, HMAC)
+        elif not request.state.tenant_validated:
+            signed_tenant_id = validate_signed_tenant(request)
+
+            if signed_tenant_id:
+                # Valid signed tenant - create minimal settings
+                # Note: We trust the signature, so we don't need full Supabase lookup
+                # The tenant_id is used for usage tracking
+                request.state.tenant = TenantSettings(
+                    tenant_id=signed_tenant_id,
+                    tenant_slug=signed_tenant_id,
+                    tenant_name=signed_tenant_id,
+                    privacy_mode=self.default_privacy_mode,
+                    allowed_models=[],  # No model restrictions for signed tenants
+                    rate_limit_rpm=60,
+                    budget_limit_eur=None,
+                    budget_alert_threshold=0.8,
+                    is_enabled=True,
+                    billing_mode="platform_managed",
+                    monthly_token_limit=None,
+                    monthly_vision_limit=None,
+                    billing_margin=1.5,
+                    plan="pro"
+                )
+                request.state.tenant_validated = True
+
+                logger.debug(
+                    f"Tenant context set (signed): {signed_tenant_id}"
+                )
+
+        # No valid tenant authentication
+        if not request.state.tenant_validated and self.require_tenant_auth and self._requires_tenant_auth(request.url.path):
             # Tenant auth required but no key provided
             return JSONResponse(
                 status_code=401,

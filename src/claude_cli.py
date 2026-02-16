@@ -1347,12 +1347,12 @@ CRITICAL: Write file EARLY to avoid context overflow. Use Write tool for clauded
                 try:
                     from src.auth import token_rotator
                     token_rotator.mark_token_failed(str(e))
-                    logger.warning(f"🔄 Token rotated for future requests")
+                    logger.debug(f"Token rotated for future requests")
                 except RuntimeError as rotation_error:
-                    logger.warning(f"⚠️  Token rotation failed (expected with single token): {rotation_error}")
+                    logger.debug(f"Token rotation failed (expected with single token): {rotation_error}")
 
-                # CRITICAL: Raise exception to trigger HTTP 503 → Nginx failover to other worker
-                logger.error(f"🚨 Worker unavailable, raising for Nginx failover: {e}")
+                # Raise exception to trigger HTTP 503 → Nginx failover to other worker
+                logger.debug(f"Worker unavailable, Nginx failover: {e}")
                 raise WorkerUnavailableError(f"Claude SDK failed: {e}") from e
 
             # Attempt recovery from cache if available

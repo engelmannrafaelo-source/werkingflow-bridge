@@ -7,10 +7,12 @@ Provides transparent middleware for automatic message anonymization/de-anonymiza
 
 from .anonymizer import PresidioAnonymizer, AnonymizationResult
 from .middleware import PrivacyMiddleware, get_privacy_middleware
+from .smart_anonymizer import smart_anonymize
 
 __all__ = [
     'PresidioAnonymizer',
     'AnonymizationResult',
     'PrivacyMiddleware',
-    'get_privacy_middleware'
+    'get_privacy_middleware',
+    'smart_anonymize'
 ]

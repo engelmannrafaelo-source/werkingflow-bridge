@@ -240,7 +240,7 @@ class PresidioAnonymizer:
 
         return analyzer
 
-    def anonymize(self, text: str, language: Optional[str] = None) -> AnonymizationResult:
+    def anonymize(self, text: str, language: Optional[str] = None, prefix: Optional[str] = None) -> AnonymizationResult:
         """
         Anonymize PII in text and return structured mapping.
 
@@ -303,8 +303,9 @@ class PresidioAnonymizer:
                 entity_counters[entity_type] = 0
             entity_counters[entity_type] += 1
 
-            # Create structured placeholder: ANON_PERSON_001, ANON_ORG_001, etc.
-            placeholder = f"ANON_{entity_type}_{entity_counters[entity_type]:03d}"
+            # Create structured placeholder: Da1b2c3_PERSON_001, ANON_PERSON_001, etc.
+            effective_prefix = prefix or "ANON"
+            placeholder = f"{effective_prefix}_{entity_type}_{entity_counters[entity_type]:03d}"
 
             # Replace in text
             anonymized_text = (
@@ -364,7 +365,7 @@ class PresidioAnonymizer:
     # ASYNC METHODS (Non-blocking for FastAPI)
     # =========================================================================
 
-    async def anonymize_async(self, text: str, language: Optional[str] = None) -> AnonymizationResult:
+    async def anonymize_async(self, text: str, language: Optional[str] = None, prefix: Optional[str] = None) -> AnonymizationResult:
         """
         Async version of anonymize() - runs NLP in thread pool.
 
@@ -392,7 +393,8 @@ class PresidioAnonymizer:
             _get_executor(),
             self.anonymize,
             text,
-            language
+            language,
+            prefix
         )
 
     async def deanonymize_async(self, anonymized_text: str, mapping: Dict[str, str]) -> str:

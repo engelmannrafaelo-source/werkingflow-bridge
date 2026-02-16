@@ -108,7 +108,7 @@ class TokenRotator:
         Returns the new token.
         Raises RuntimeError if no more tokens available.
         """
-        logger.error(f"❌ Token failed: {self.tokens[self.current_index][:20]}... - {error_msg}")
+        logger.debug(f"Token failed: {self.tokens[self.current_index][:20]}... - {error_msg}")
         return self.rotate_token()
 
     def apply_current_token(self):
@@ -148,7 +148,8 @@ class ClaudeCodeAuthManager:
     """
 
     def __init__(self):
-        self.env_api_key = os.getenv("API_KEY")  # Environment API key (for FastAPI protection, NOT Claude auth)
+        # Check both API_KEY (legacy) and AI_BRIDGE_API_KEY (new standard)
+        self.env_api_key = os.getenv("AI_BRIDGE_API_KEY") or os.getenv("API_KEY")
         self.auth_method = self._detect_auth_method()
         self.auth_status = self._validate_auth_method()
     

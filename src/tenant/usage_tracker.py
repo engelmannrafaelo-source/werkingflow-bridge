@@ -21,16 +21,29 @@ from .client import get_tenant_client, TenantSettings
 logger = logging.getLogger(__name__)
 
 
-# Default pricing (EUR per 1K tokens) - fallback if Supabase not configured
-DEFAULT_PRICING = {
-    "claude-haiku-4-20250514": {"input": 0.0008, "output": 0.004},
-    "claude-sonnet-4-20250514": {"input": 0.003, "output": 0.015},
-    "claude-opus-4-5-20251101": {"input": 0.015, "output": 0.075},
-    "gemini-2.0-flash": {"input": 0.0001, "output": 0.0004},
+# Default pricing (USD per 1M tokens) - Anthropic pricing as of Jan 2026
+# Source: https://www.anthropic.com/pricing
+DEFAULT_PRICING_USD = {
+    # Sonnet family
+    "claude-sonnet-4-5-20250929": {"input": 3.00, "output": 15.00},
+    "claude-sonnet-4-20250514": {"input": 3.00, "output": 15.00},
+    "claude-3-7-sonnet-20250219": {"input": 3.00, "output": 15.00},
+    "claude-3-5-sonnet-20241022": {"input": 3.00, "output": 15.00},
+    # Haiku family
+    "claude-haiku-4-5-20251001": {"input": 0.80, "output": 4.00},
+    "claude-3-5-haiku-20241022": {"input": 0.80, "output": 4.00},
+    # Opus family
+    "claude-opus-4-20250514": {"input": 15.00, "output": 75.00},
+    "claude-opus-4-1-20250805": {"input": 15.00, "output": 75.00},
+    # Bedrock model IDs (same pricing)
+    "eu.anthropic.claude-sonnet-4-5-20250929-v1:0": {"input": 3.00, "output": 15.00},
+    "eu.anthropic.claude-haiku-4-5-20251001-v1:0": {"input": 0.80, "output": 4.00},
+    "us.anthropic.claude-sonnet-4-5-20250929-v1:0": {"input": 3.00, "output": 15.00},
 }
 
-# Default markup factor (2x = 100% margin)
-DEFAULT_MARKUP = 2.0
+# Default markup factor (1.0 = no markup, 1.5 = 50% margin)
+# This is applied on top of the billing_margin from TenantSettings
+DEFAULT_MARKUP = 1.0
 
 
 @dataclass
@@ -72,40 +85,46 @@ class UsageTracker:
 
         logger.info(f"Usage tracker initialized (markup={self.markup_factor}x)")
 
-    def calculate_cost(
+    def calculate_cost_usd(
         self,
         model: str,
         input_tokens: int,
         output_tokens: int
     ) -> float:
         """
-        Calculate request cost in EUR.
+        Calculate request cost in USD.
 
         Args:
-            model: Model name
+            model: Model name (or Bedrock model ID)
             input_tokens: Input token count
             output_tokens: Output token count
 
         Returns:
-            Cost in EUR (including markup)
+            Cost in USD (raw, without markup - markup applied in Supabase trigger)
         """
         # Get pricing for model
-        pricing = DEFAULT_PRICING.get(model)
+        pricing = DEFAULT_PRICING_USD.get(model)
 
         if not pricing:
-            # Unknown model - use Sonnet pricing as fallback
-            logger.warning(f"Unknown model pricing: {model}, using Sonnet fallback")
-            pricing = DEFAULT_PRICING["claude-sonnet-4-20250514"]
+            # Try to find partial match (e.g., "sonnet" in model name)
+            model_lower = model.lower()
+            if "sonnet" in model_lower:
+                pricing = DEFAULT_PRICING_USD["claude-sonnet-4-5-20250929"]
+            elif "haiku" in model_lower:
+                pricing = DEFAULT_PRICING_USD["claude-haiku-4-5-20251001"]
+            elif "opus" in model_lower:
+                pricing = DEFAULT_PRICING_USD["claude-opus-4-20250514"]
+            else:
+                # Unknown model - use Sonnet pricing as fallback
+                logger.warning(f"Unknown model pricing: {model}, using Sonnet fallback")
+                pricing = DEFAULT_PRICING_USD["claude-sonnet-4-5-20250929"]
 
-        # Calculate raw cost
-        input_cost = (input_tokens / 1000) * pricing["input"]
-        output_cost = (output_tokens / 1000) * pricing["output"]
+        # Calculate raw cost (pricing is per 1M tokens)
+        input_cost = (input_tokens / 1_000_000) * pricing["input"]
+        output_cost = (output_tokens / 1_000_000) * pricing["output"]
         raw_cost = input_cost + output_cost
 
-        # Apply markup
-        final_cost = raw_cost * self.markup_factor
-
-        return round(final_cost, 6)
+        return round(raw_cost, 6)
 
     async def track(self, record: UsageRecord) -> None:
         """
@@ -118,12 +137,36 @@ class UsageTracker:
             logger.debug("Usage tracking disabled (Supabase not configured)")
             return
 
-        # Calculate cost
-        cost_eur = self.calculate_cost(
+        # Calculate cost in USD
+        cost_usd = self.calculate_cost_usd(
             record.model,
             record.input_tokens,
             record.output_tokens
         )
+
+        # Determine operation type from endpoint
+        operation = "prompt"
+        if "vision" in record.endpoint.lower():
+            operation = "vision"
+        elif "tool" in record.endpoint.lower():
+            operation = "tool_use"
+
+        # Build metadata for additional fields
+        metadata = {
+            "endpoint": record.endpoint,
+            "latency_ms": record.latency_ms,
+            "status": record.status,
+            "privacy_mode": record.privacy_mode,
+        }
+        if record.pii_detected:
+            metadata["pii_detected"] = record.pii_detected
+            metadata["pii_entities_count"] = record.pii_entities_count
+        if record.workflow_id:
+            metadata["workflow_id"] = record.workflow_id
+        if record.job_id:
+            metadata["job_id"] = record.job_id
+        if record.error_message:
+            metadata["error_message"] = record.error_message
 
         # Log to Supabase (async, non-blocking)
         try:
@@ -132,21 +175,16 @@ class UsageTracker:
                 model=record.model,
                 input_tokens=record.input_tokens,
                 output_tokens=record.output_tokens,
-                cost_eur=cost_eur,
-                privacy_mode=record.privacy_mode,
-                workflow_id=record.workflow_id,
-                job_id=record.job_id,
-                endpoint=record.endpoint,
-                latency_ms=record.latency_ms,
-                status=record.status,
-                error_message=record.error_message,
-                pii_detected=record.pii_detected,
-                pii_entities_count=record.pii_entities_count
+                estimated_cost_usd=cost_usd,
+                operation=operation,
+                billing_mode="platform_managed",  # Will be set correctly via tenant settings
+                image_count=1 if operation == "vision" else 0,
+                metadata=metadata
             )
 
             logger.debug(
                 f"Usage tracked: {record.tenant_id} - {record.model} "
-                f"({record.input_tokens}+{record.output_tokens} tokens = {cost_eur})"
+                f"({record.input_tokens}+{record.output_tokens} tokens = ${cost_usd:.6f})"
             )
 
         except Exception as e:

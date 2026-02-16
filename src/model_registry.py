@@ -243,26 +243,51 @@ def resolve_model_strict(model_input: str) -> str:
 # AWS BEDROCK MODEL ID CONVERSION
 # =============================================================================
 
-def to_bedrock_model_id(anthropic_model_id: str) -> str:
-    """Convert Anthropic model ID to AWS Bedrock model ID.
+def _get_bedrock_region_prefix(region: str) -> str:
+    """Get the regional prefix for Bedrock model IDs.
 
-    Bedrock uses format: anthropic.{model-name}-v{version}:{revision}
+    AWS Bedrock requires regional prefixes for cross-region inference profiles.
+
+    Args:
+        region: AWS region (e.g., 'eu-central-1', 'us-east-1', 'ap-northeast-1')
+
+    Returns:
+        Regional prefix: 'eu', 'us', or 'apac'
+    """
+    if region.startswith("eu-"):
+        return "eu"
+    elif region.startswith("ap-"):
+        return "apac"
+    else:
+        # US regions and default
+        return "us"
+
+
+def to_bedrock_model_id(anthropic_model_id: str, region: str = "eu-central-1") -> str:
+    """Convert Anthropic model ID to AWS Bedrock model ID with regional prefix.
+
+    Bedrock uses format: {region}.anthropic.{model-name}-v{version}:{revision}
+    The regional prefix is required for cross-region inference profiles.
 
     Args:
         anthropic_model_id: e.g., 'claude-sonnet-4-5-20250929'
+        region: AWS region (default: 'eu-central-1' for DSGVO compliance)
 
     Returns:
-        Bedrock model ID: e.g., 'anthropic.claude-sonnet-4-5-20250929-v1:0'
+        Bedrock model ID: e.g., 'eu.anthropic.claude-sonnet-4-5-20250929-v1:0'
 
     Raises:
         ValueError: If model ID format is not recognized
 
     Examples:
-        >>> to_bedrock_model_id("claude-sonnet-4-5-20250929")
-        "anthropic.claude-sonnet-4-5-20250929-v1:0"
+        >>> to_bedrock_model_id("claude-sonnet-4-5-20250929", "eu-central-1")
+        "eu.anthropic.claude-sonnet-4-5-20250929-v1:0"
 
-        >>> to_bedrock_model_id("claude-haiku-4-5-20251001")
-        "anthropic.claude-haiku-4-5-20251001-v1:0"
+        >>> to_bedrock_model_id("claude-haiku-4-5-20251001", "us-east-1")
+        "us.anthropic.claude-haiku-4-5-20251001-v1:0"
+
+        >>> to_bedrock_model_id("claude-sonnet-4-5-20250929", "ap-northeast-1")
+        "apac.anthropic.claude-sonnet-4-5-20250929-v1:0"
     """
     if not anthropic_model_id.startswith("claude-"):
         raise ValueError(
@@ -270,15 +295,21 @@ def to_bedrock_model_id(anthropic_model_id: str) -> str:
             f"Model must start with 'claude-'"
         )
 
-    # Bedrock format: anthropic.{model-id}-v1:0
-    return f"anthropic.{anthropic_model_id}-v1:0"
+    prefix = _get_bedrock_region_prefix(region)
+    # Bedrock format: {prefix}.anthropic.{model-id}-v1:0
+    return f"{prefix}.anthropic.{anthropic_model_id}-v1:0"
 
 
 def from_bedrock_model_id(bedrock_model_id: str) -> str:
     """Convert AWS Bedrock model ID back to Anthropic model ID.
 
+    Handles both regional and non-regional formats:
+    - eu.anthropic.claude-sonnet-4-5-20250929-v1:0
+    - us.anthropic.claude-sonnet-4-5-20250929-v1:0
+    - anthropic.claude-sonnet-4-5-20250929-v1:0 (legacy)
+
     Args:
-        bedrock_model_id: e.g., 'anthropic.claude-sonnet-4-5-20250929-v1:0'
+        bedrock_model_id: e.g., 'eu.anthropic.claude-sonnet-4-5-20250929-v1:0'
 
     Returns:
         Anthropic model ID: e.g., 'claude-sonnet-4-5-20250929'
@@ -287,17 +318,30 @@ def from_bedrock_model_id(bedrock_model_id: str) -> str:
         ValueError: If Bedrock model ID format is invalid
 
     Examples:
-        >>> from_bedrock_model_id("anthropic.claude-sonnet-4-5-20250929-v1:0")
+        >>> from_bedrock_model_id("eu.anthropic.claude-sonnet-4-5-20250929-v1:0")
         "claude-sonnet-4-5-20250929"
-    """
-    if not bedrock_model_id.startswith("anthropic."):
-        raise ValueError(
-            f"Invalid Bedrock model ID format: '{bedrock_model_id}'. "
-            f"Expected format: anthropic.claude-*-v1:0"
-        )
 
-    # Remove 'anthropic.' prefix
-    model_part = bedrock_model_id[10:]
+        >>> from_bedrock_model_id("us.anthropic.claude-haiku-4-5-20251001-v1:0")
+        "claude-haiku-4-5-20251001"
+    """
+    # Handle regional prefixes (eu., us., apac.)
+    regional_prefixes = ["eu.anthropic.", "us.anthropic.", "apac.anthropic."]
+    model_part = None
+
+    for prefix in regional_prefixes:
+        if bedrock_model_id.startswith(prefix):
+            model_part = bedrock_model_id[len(prefix):]
+            break
+
+    # Fallback: legacy format without regional prefix
+    if model_part is None:
+        if bedrock_model_id.startswith("anthropic."):
+            model_part = bedrock_model_id[10:]
+        else:
+            raise ValueError(
+                f"Invalid Bedrock model ID format: '{bedrock_model_id}'. "
+                f"Expected format: [eu|us|apac].anthropic.claude-*-v1:0"
+            )
 
     # Remove version suffix (-v1:0, -v1:1, -v2:0, etc.)
     if "-v1:0" in model_part:

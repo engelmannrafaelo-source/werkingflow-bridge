@@ -42,7 +42,9 @@ from src.models import (
     ResearchResponse,
     BackendType,
     PrivacyMode,
-    BackendInfo
+    BackendInfo,
+    SmartAnonymizeRequest,
+    SmartAnonymizeResponse
 )
 from src.claude_cli import ClaudeCodeCLI, WorkerUnavailableError, RateLimitError, rate_limit_tracker
 from src.message_adapter import MessageAdapter
@@ -447,6 +449,24 @@ async def lifespan(app: FastAPI):
     asyncio.create_task(cleanup_old_sessions())
     logger.info("🧹 Progress monitoring cleanup task started (24h retention)")
 
+    # Start Gemini daily rate limit reset task
+    async def _gemini_daily_reset():
+        """Reset Gemini rate limit counter at midnight UTC."""
+        from datetime import datetime, timezone, timedelta
+        while True:
+            now = datetime.now(timezone.utc)
+            tomorrow = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+            seconds_until_midnight = (tomorrow - now).total_seconds()
+            await asyncio.sleep(seconds_until_midnight)
+            try:
+                from src.providers.gemini_oauth import gemini_oauth_manager
+                gemini_oauth_manager.reset_daily_counter()
+            except Exception as e:
+                logger.warning(f"Gemini daily reset failed: {e}")
+
+    asyncio.create_task(_gemini_daily_reset())
+    logger.info("🔄 Gemini daily rate limit reset task scheduled (midnight UTC)")
+
     yield
     
     # Cleanup on shutdown
@@ -582,8 +602,8 @@ async def worker_unavailable_handler(request: Request, exc: WorkerUnavailableErr
     worker_id = os.getenv("INSTANCE_NAME", "unknown")
     retry_after = rate_limit_tracker.get_retry_after(worker_id) or 0
 
-    logger.warning(
-        f"🔄 Worker unavailable, returning 503 for Nginx failover",
+    logger.debug(
+        f"Worker failover (normal operation) - Nginx retries on next worker",
         extra={
             "path": str(request.url),
             "method": request.method,
@@ -1211,6 +1231,30 @@ async def chat_completions(
     try:
         request_id = f"chatcmpl-{os.urandom(8).hex()}"
 
+        # =======================================================================
+        # BUDGET ENFORCEMENT: Check tenant limits before processing
+        # =======================================================================
+        tenant = get_tenant_from_request(request)
+        if tenant:
+            from src.tenant import check_budget
+            budget_result = await check_budget(tenant)
+            if not budget_result.allowed:
+                logger.warning(f"Budget exceeded for {tenant.tenant_slug}: {budget_result.reason}")
+                raise HTTPException(
+                    status_code=402,
+                    detail={
+                        "error": {
+                            "message": budget_result.reason,
+                            "type": "budget_exceeded",
+                            "code": "payment_required",
+                            "billing_mode": budget_result.billing_mode,
+                            "current_tokens": budget_result.current_tokens,
+                            "token_limit": budget_result.token_limit,
+                            "usage_percent": budget_result.token_usage_percent,
+                        }
+                    }
+                )
+
         # MODEL RESOLUTION: Fuzzy match model names (e.g., "sonnet" -> "claude-sonnet-4-5-20250929")
         original_model = request_body.model
         resolved_model, resolution_msg = resolve_model(original_model)
@@ -1235,28 +1279,171 @@ async def chat_completions(
             logger.info(f"Model resolved: '{original_model}' -> '{resolved_model}'")
             request_body.model = resolved_model
 
-        # BACKEND ROUTING: Resolve backend configuration (Anthropic SDK vs Bedrock)
+        # BACKEND ROUTING: Resolve backend configuration (Anthropic / Bedrock / OpenAI-Compatible)
         backend_config = None
         try:
             backend_config = resolve_backend_config(
                 backend=request_body.backend or BackendType.ANTHROPIC,
                 model=resolved_model,
                 privacy=request_body.privacy or PrivacyMode.AUTO,
-                bedrock_region=request_body.bedrock_region
+                bedrock_region=request_body.bedrock_region,
+                provider_tier=request_body.provider_tier,
             )
         except RuntimeError as e:
-            # Bedrock requested but not configured
             raise HTTPException(
                 status_code=400,
                 detail={
                     "error": {
                         "message": str(e),
                         "type": "configuration_error",
-                        "code": "bedrock_not_configured",
-                        "hint": "Contact server administrator to configure AWS credentials for Bedrock"
+                        "code": "provider_not_configured",
+                        "hint": "Contact server administrator to configure the requested provider"
                     }
                 }
             )
+
+        # =======================================================================
+        # BEDROCK ROUTING: Direct boto3 call, bypass Claude Code SDK
+        # =======================================================================
+        if backend_config and backend_config.backend == BackendType.BEDROCK:
+            from src.bedrock_service import call_bedrock, stream_bedrock
+            logger.info(f"🔀 Routing to Bedrock (region={backend_config.region})")
+
+            if request_body.stream:
+                return StreamingResponse(
+                    stream_bedrock(request_body, backend_config.region),
+                    media_type="text/event-stream",
+                    headers={
+                        "Cache-Control": "no-cache",
+                        "Connection": "keep-alive",
+                        "X-Backend": "bedrock",
+                        "X-Backend-Region": backend_config.region or "eu-central-1",
+                    }
+                )
+            else:
+                response = await call_bedrock(request_body, backend_config.region)
+                duration = time.time() - start_time
+                logger.info(f"✅ Bedrock request completed in {duration:.2f}s")
+
+                # Track usage for Bedrock (non-streaming)
+                if tenant and response.usage:
+                    from src.tenant import track_request_usage
+                    await track_request_usage(
+                        tenant=tenant,
+                        model=resolved_model,
+                        input_tokens=response.usage.prompt_tokens,
+                        output_tokens=response.usage.completion_tokens,
+                        endpoint="/v1/chat/completions",
+                        latency_ms=int(duration * 1000),
+                        status="success",
+                    )
+
+                return response
+
+        # =======================================================================
+        # OPENAI-COMPATIBLE ROUTING: Generic httpx call (IONOS, Mistral, etc.)
+        # =======================================================================
+        if backend_config and backend_config.backend == BackendType.OPENAI_COMPATIBLE:
+            from src.providers.openai_compatible import call_openai_compatible, stream_openai_compatible
+            tier = backend_config.provider_tier or "unknown"
+            logger.info(f"🔀 Routing to OpenAI-compatible provider (tier={tier})")
+
+            if request_body.stream:
+                return StreamingResponse(
+                    stream_openai_compatible(
+                        request_body,
+                        backend_config.provider_base_url,
+                        backend_config.provider_api_key,
+                        model_override=backend_config.provider_model,
+                    ),
+                    media_type="text/event-stream",
+                    headers={
+                        "Cache-Control": "no-cache",
+                        "Connection": "keep-alive",
+                        "X-Backend": "openai_compatible",
+                        "X-Provider-Tier": tier,
+                    }
+                )
+            else:
+                response_data = await call_openai_compatible(
+                    request_body,
+                    backend_config.provider_base_url,
+                    backend_config.provider_api_key,
+                    model_override=backend_config.provider_model,
+                )
+                duration = time.time() - start_time
+                logger.info(f"✅ OpenAI-compatible request completed in {duration:.2f}s (tier={tier})")
+
+                # Track usage
+                usage = response_data.get("usage", {})
+                if tenant and usage:
+                    from src.tenant import track_request_usage
+                    await track_request_usage(
+                        tenant=tenant,
+                        model=backend_config.provider_model or resolved_model,
+                        input_tokens=usage.get("prompt_tokens", 0),
+                        output_tokens=usage.get("completion_tokens", 0),
+                        endpoint="/v1/chat/completions",
+                        latency_ms=int(duration * 1000),
+                        status="success",
+                    )
+
+                return response_data
+
+        # =======================================================================
+        # GEMINI CLI ROUTING: Subprocess call to `gemini` binary
+        # =======================================================================
+        if backend_config and backend_config.backend == BackendType.GEMINI_CLI:
+            from src.gemini_cli import call_gemini_cli
+            tier = backend_config.provider_tier or "gemini-flash"
+            gemini_model = backend_config.provider_model or "gemini-2.5-flash"
+            logger.info(f"🔀 Routing to Gemini CLI (tier={tier}, model={gemini_model})")
+
+            # Extract prompt from messages (last user message)
+            user_messages = [m for m in request_body.messages if m.role == "user"]
+            system_messages = [m for m in request_body.messages if m.role == "system"]
+
+            prompt_text = user_messages[-1].content if user_messages else ""
+            system_text = system_messages[0].content if system_messages else None
+
+            if isinstance(prompt_text, list):
+                # Multimodal: extract text parts only
+                prompt_text = "\n".join(
+                    p.text for p in prompt_text if hasattr(p, "text")
+                )
+            if system_text and isinstance(system_text, list):
+                system_text = "\n".join(
+                    p.text for p in system_text if hasattr(p, "text")
+                )
+
+            response_data = await call_gemini_cli(
+                prompt=prompt_text,
+                model=gemini_model,
+                system_prompt=system_text,
+            )
+
+            duration = time.time() - start_time
+            logger.info(f"✅ Gemini CLI request completed in {duration:.2f}s (tier={tier})")
+
+            # Track usage
+            usage = response_data.get("usage", {})
+            if tenant and usage:
+                from src.tenant import track_request_usage
+                await track_request_usage(
+                    tenant=tenant,
+                    model=gemini_model,
+                    input_tokens=usage.get("prompt_tokens", 0),
+                    output_tokens=usage.get("completion_tokens", 0),
+                    endpoint="/v1/chat/completions",
+                    latency_ms=int(duration * 1000),
+                    status="success",
+                )
+
+            return response_data
+
+        # =======================================================================
+        # ANTHROPIC ROUTING: Continue with Claude Code SDK (default)
+        # =======================================================================
 
         # Extract Claude-specific parameters from headers
         claude_headers = ParameterValidator.extract_claude_headers(dict(request.headers))
@@ -1333,6 +1520,20 @@ async def chat_completions(
                         tools_enabled=False
                     )
                     logger.info(f"✅ Vision request completed", extra={"duration": duration, "tokens": vision_result.usage["total_tokens"]})
+
+                    # Track usage for Vision
+                    if tenant:
+                        from src.tenant import track_request_usage
+                        await track_request_usage(
+                            tenant=tenant,
+                            model=vision_result.model,
+                            input_tokens=vision_result.usage["prompt_tokens"],
+                            output_tokens=vision_result.usage["completion_tokens"],
+                            endpoint="/v1/chat/completions/vision",
+                            latency_ms=int(duration * 1000),
+                            status="success",
+                        )
+
                     return response
 
             except Exception as e:
@@ -1539,6 +1740,19 @@ async def chat_completions(
                 tools_enabled=request_body.enable_tools
             )
 
+            # Track usage for SDK (non-streaming)
+            if tenant:
+                from src.tenant import track_request_usage
+                await track_request_usage(
+                    tenant=tenant,
+                    model=request_body.model,
+                    input_tokens=prompt_tokens,
+                    output_tokens=completion_tokens,
+                    endpoint="/v1/chat/completions",
+                    latency_ms=int(duration * 1000),
+                    status="success",
+                )
+
             # Worker instance info for multi-worker deployments
             worker_instance = os.getenv("INSTANCE_NAME", "unknown")
 
@@ -1609,6 +1823,91 @@ async def chat_completions(
         # Re-raise to trigger HTTP 503 and Nginx failover
         raise
     except Exception as e:
+        # =======================================================================
+        # FALLBACK: Attempt alternate providers if primary failed (non-streaming)
+        # =======================================================================
+        if not request_body.stream:
+            try:
+                from src.providers.fallback import (
+                    is_retryable_error, record_failure, record_success,
+                    get_fallback_tiers, FALLBACK_DELAY_SECONDS,
+                )
+                import asyncio
+
+                primary_tier = request_body.provider_tier or "claude-premium"
+
+                if is_retryable_error(e):
+                    record_failure(primary_tier, str(e)[:200])
+                    fallback_tiers = get_fallback_tiers(primary_tier)[1:]  # Skip primary
+
+                    for fallback_tier in fallback_tiers:
+                        try:
+                            logger.warning(
+                                f"⚠️ {primary_tier} failed: {e}. "
+                                f"Attempting fallback: {fallback_tier}"
+                            )
+                            await asyncio.sleep(FALLBACK_DELAY_SECONDS)
+
+                            fallback_config = resolve_backend_config(
+                                backend=request_body.backend or BackendType.ANTHROPIC,
+                                model=resolved_model,
+                                privacy=request_body.privacy or PrivacyMode.AUTO,
+                                bedrock_region=request_body.bedrock_region,
+                                provider_tier=fallback_tier,
+                            )
+
+                            if fallback_config.backend == BackendType.OPENAI_COMPATIBLE:
+                                from src.providers.openai_compatible import call_openai_compatible
+                                response_data = await call_openai_compatible(
+                                    request_body,
+                                    fallback_config.provider_base_url,
+                                    fallback_config.provider_api_key,
+                                    model_override=fallback_config.provider_model,
+                                )
+
+                                fb_duration = time.time() - start_time
+                                record_success(fallback_tier)
+                                logger.info(
+                                    f"✅ Fallback to {fallback_tier} successful "
+                                    f"in {fb_duration:.2f}s"
+                                )
+
+                                # Track usage
+                                usage = response_data.get("usage", {})
+                                if tenant and usage:
+                                    from src.tenant import track_request_usage
+                                    await track_request_usage(
+                                        tenant=tenant,
+                                        model=fallback_config.provider_model or resolved_model,
+                                        input_tokens=usage.get("prompt_tokens", 0),
+                                        output_tokens=usage.get("completion_tokens", 0),
+                                        endpoint="/v1/chat/completions",
+                                        latency_ms=int(fb_duration * 1000),
+                                        status="fallback_success",
+                                    )
+
+                                # Mark response with fallback metadata
+                                response_data["x_fallback"] = {
+                                    "used": True,
+                                    "original_provider": primary_tier,
+                                    "fallback_provider": fallback_tier,
+                                    "original_error": str(e)[:200],
+                                }
+                                return response_data
+
+                        except Exception as fallback_error:
+                            record_failure(fallback_tier, str(fallback_error)[:200])
+                            logger.warning(
+                                f"⚠️ Fallback {fallback_tier} also failed: {fallback_error}"
+                            )
+                            continue
+
+                    logger.error(
+                        f"❌ All fallback providers exhausted for {primary_tier}"
+                    )
+            except ImportError:
+                pass  # Fallback module not available, continue to error handler
+
         # Log error event
         duration = time.time() - start_time
         EventLogger.log_chat_completion(
@@ -2024,16 +2323,75 @@ async def check_compatibility(request_body: ChatCompletionRequest):
     }
 
 
+@app.get("/v1/usage/status")
+async def usage_status(request: Request):
+    """
+    Get current AI usage status for a tenant.
+
+    Returns token usage, limits, and budget information.
+    Requires X-Tenant-API-Key header.
+    """
+    tenant = get_tenant_from_request(request)
+    if not tenant:
+        raise HTTPException(
+            status_code=401,
+            detail={
+                "error": {
+                    "message": "Tenant API key required. Set X-Tenant-API-Key header.",
+                    "type": "authentication_required",
+                    "code": "missing_tenant_key"
+                }
+            }
+        )
+
+    from src.tenant import check_budget
+    budget = await check_budget(tenant)
+
+    return {
+        "tenant_id": tenant.tenant_id,
+        "tenant_slug": tenant.tenant_slug,
+        "billing_mode": budget.billing_mode,
+        "current_month": {
+            "tokens_used": budget.current_tokens,
+            "vision_calls": budget.current_vision_calls,
+            "cost_usd": budget.current_cost_usd,
+        },
+        "limits": {
+            "monthly_token_limit": budget.token_limit,
+            "monthly_vision_limit": budget.vision_limit,
+            "budget_limit_eur": budget.budget_limit_eur,
+        },
+        "usage_percent": {
+            "tokens": round(budget.token_usage_percent, 1),
+            "budget": round(budget.budget_usage_percent, 1),
+        },
+        "allowed": budget.allowed,
+        "reason": budget.reason,
+    }
+
+
 @app.get("/health")
 @rate_limit_endpoint("health")
 async def health_check(request: Request):
-    """Health check endpoint."""
+    """Health check endpoint with provider health status."""
     worker_instance = os.getenv("INSTANCE_NAME", "unknown")
-    return {
+
+    result = {
         "status": "healthy",
         "service": "claude-code-openai-wrapper",
-        "worker_instance": worker_instance
+        "worker_instance": worker_instance,
     }
+
+    # Include provider fallback health if available
+    try:
+        from src.providers.fallback import get_all_provider_health
+        provider_health = get_all_provider_health()
+        if provider_health:
+            result["providers"] = provider_health
+    except ImportError:
+        pass
+
+    return result
 
 
 @app.get("/debug/tokens")
@@ -2269,6 +2627,13 @@ async def debug_request_validation(request: Request):
         }
 
 
+@app.get("/v1/providers")
+async def list_providers():
+    """List available LLM provider tiers and their configurations."""
+    from src.providers.registry import list_available_providers
+    return {"providers": list_available_providers()}
+
+
 @app.get("/v1/privacy/status")
 async def get_privacy_status():
     """Get privacy middleware status and configuration."""
@@ -2291,6 +2656,37 @@ async def get_privacy_status():
             }
         }
     }
+
+
+@app.post("/v1/privacy/smart-anonymize")
+async def smart_anonymize_endpoint(request_body: SmartAnonymizeRequest):
+    """
+    Smart pseudonymization: Presidio detection + AI refinement.
+
+    Stage 1: Presidio detects all potential PII aggressively
+    Stage 2: Claude Haiku evaluates each entity — restores non-PII context
+    Result: Only real personal data stays anonymized
+
+    Works independently of PRIVACY_ENABLED (always available).
+    """
+    from src.privacy import smart_anonymize
+
+    try:
+        result = await smart_anonymize(
+            text=request_body.text,
+            language=request_body.language or "de",
+            context_hint=request_body.context_hint,
+            prefix=request_body.prefix
+        )
+
+        return SmartAnonymizeResponse(**result)
+
+    except Exception as e:
+        logger.error(f"Smart anonymization failed: {e}", exc_info=True)
+        return SmartAnonymizeResponse(
+            status="error",
+            error=str(e)
+        )
 
 
 @app.get("/v1/auth/status")

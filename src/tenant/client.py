@@ -33,11 +33,18 @@ class TenantSettings:
     tenant_id: str
     tenant_slug: str
     privacy_mode: str = "full"  # none | basic | full
-    allowed_models: List[str] = field(default_factory=lambda: ["claude-sonnet-4-20250514", "claude-haiku-4-20250514"])
+    allowed_models: List[str] = field(default_factory=lambda: ["claude-sonnet-4-5-20250929", "claude-haiku-4-5-20251001"])
     rate_limit_rpm: int = 60
     budget_limit_eur: float = 1000.0
     budget_alert_threshold: float = 0.8
     is_enabled: bool = True
+    # Billing fields (added for usage tracking)
+    billing_mode: str = "platform_managed"  # demo | byo_key | platform_managed
+    monthly_token_limit: Optional[int] = None  # None = unlimited
+    monthly_vision_limit: Optional[int] = None  # None = unlimited
+    billing_margin: float = 1.50  # 1.50 = 50% markup
+    plan: str = "free"  # free | trial | starter | pro | enterprise
+    tenant_name: str = ""
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "TenantSettings":
@@ -45,12 +52,18 @@ class TenantSettings:
         return cls(
             tenant_id=data.get("tenant_id", ""),
             tenant_slug=data.get("tenant_slug", ""),
+            tenant_name=data.get("tenant_name", ""),
             privacy_mode=data.get("privacy_mode", "full"),
-            allowed_models=data.get("allowed_models", ["claude-sonnet-4-20250514"]),
+            allowed_models=data.get("allowed_models", ["claude-sonnet-4-5-20250929"]),
             rate_limit_rpm=data.get("rate_limit_rpm", 60),
-            budget_limit_eur=data.get("budget_limit_eur", 1000.0),
-            budget_alert_threshold=data.get("budget_alert_threshold", 0.8),
-            is_enabled=data.get("is_enabled", True)
+            budget_limit_eur=float(data.get("budget_limit_eur", 1000.0) or 1000.0),
+            budget_alert_threshold=float(data.get("budget_alert_threshold", 0.8) or 0.8),
+            is_enabled=data.get("is_enabled", True),
+            billing_mode=data.get("billing_mode", "platform_managed"),
+            monthly_token_limit=data.get("monthly_token_limit"),  # Can be None
+            monthly_vision_limit=data.get("monthly_vision_limit"),  # Can be None
+            billing_margin=float(data.get("billing_margin", 1.50) or 1.50),
+            plan=data.get("plan", "free"),
         )
 
     def is_model_allowed(self, model: str) -> bool:
@@ -58,6 +71,18 @@ class TenantSettings:
         if not self.allowed_models:
             return True  # No restrictions
         return model in self.allowed_models
+
+    def is_budget_unlimited(self) -> bool:
+        """Check if tenant has unlimited token budget."""
+        return self.monthly_token_limit is None
+
+    def is_demo_mode(self) -> bool:
+        """Check if tenant is in demo (free) mode."""
+        return self.billing_mode == "demo"
+
+    def is_byo_key(self) -> bool:
+        """Check if tenant uses their own API key."""
+        return self.billing_mode == "byo_key"
 
 
 @dataclass
@@ -215,70 +240,76 @@ class SupabaseTenantClient:
         model: str,
         input_tokens: int,
         output_tokens: int,
-        cost_eur: float,
-        privacy_mode: str = "full",
-        workflow_id: Optional[str] = None,
-        job_id: Optional[str] = None,
-        endpoint: str = "/v1/chat/completions",
-        latency_ms: Optional[int] = None,
-        status: str = "success",
-        error_message: Optional[str] = None,
-        pii_detected: bool = False,
-        pii_entities_count: int = 0
+        estimated_cost_usd: float,
+        operation: str = "prompt",  # prompt | vision | tool_use
+        billing_mode: str = "platform_managed",
+        image_count: int = 0,
+        cache_read_tokens: int = 0,
+        cache_write_tokens: int = 0,
+        user_id: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None
     ) -> None:
         """
-        Log AI usage to Supabase for billing.
+        Log AI usage to Supabase ai_usage_events table for billing.
+
+        This triggers the PostgreSQL trigger that auto-aggregates to ai_usage_monthly.
 
         Args:
             tenant_id: Tenant UUID
-            model: Model name used
+            model: Model name used (e.g., claude-sonnet-4-5-20250929)
             input_tokens: Input token count
             output_tokens: Output token count
-            cost_eur: Calculated cost in EUR
-            privacy_mode: Privacy mode used
-            workflow_id: Optional workflow identifier
-            job_id: Optional job UUID
-            endpoint: API endpoint called
-            latency_ms: Request latency in ms
-            status: Request status (success, error, rate_limited)
-            error_message: Error message if status != success
-            pii_detected: Whether PII was detected
-            pii_entities_count: Number of PII entities anonymized
+            estimated_cost_usd: Calculated cost in USD (Anthropic pricing)
+            operation: Operation type (prompt, vision, tool_use)
+            billing_mode: Billing mode (demo, byo_key, platform_managed)
+            image_count: Number of images processed (for vision)
+            cache_read_tokens: Cached tokens read
+            cache_write_tokens: Cached tokens written
+            user_id: Optional user UUID
+            metadata: Optional JSONB metadata (endpoint, latency, pii_info, etc.)
         """
         if not self.enabled:
             return
 
         try:
+            # Build payload matching ai_usage_events schema
+            payload = {
+                "tenant_id": tenant_id,
+                "model": model,
+                "operation": operation,
+                "input_tokens": input_tokens,
+                "output_tokens": output_tokens,
+                "cache_read_tokens": cache_read_tokens,
+                "cache_write_tokens": cache_write_tokens,
+                "image_count": image_count,
+                "estimated_cost_usd": estimated_cost_usd,
+                "billing_mode": billing_mode,
+                "metadata": metadata or {}
+            }
+
+            # Add user_id if provided
+            if user_id:
+                payload["user_id"] = user_id
+
             async with httpx.AsyncClient(timeout=5.0) as client:
-                await client.post(
-                    f"{self.supabase_url}/rest/v1/ai_usage_logs",
+                response = await client.post(
+                    f"{self.supabase_url}/rest/v1/ai_usage_events",  # FIXED: was ai_usage_logs
                     headers={
                         "apikey": self.supabase_key,
                         "Authorization": f"Bearer {self.supabase_key}",
                         "Content-Type": "application/json",
                         "Prefer": "return=minimal"
                     },
-                    json={
-                        "tenant_id": tenant_id,
-                        "model": model,
-                        "input_tokens": input_tokens,
-                        "output_tokens": output_tokens,
-                        "cost_eur": cost_eur,
-                        "privacy_mode": privacy_mode,
-                        "workflow_id": workflow_id,
-                        "job_id": job_id,
-                        "endpoint": endpoint,
-                        "latency_ms": latency_ms,
-                        "status": status,
-                        "error_message": error_message,
-                        "pii_detected": pii_detected,
-                        "pii_entities_count": pii_entities_count
-                    }
+                    json=payload
                 )
-                logger.debug(f"Usage logged for tenant {tenant_id}: {model} ({input_tokens}+{output_tokens} tokens)")
+
+                if response.status_code >= 400:
+                    logger.warning(f"Failed to log usage: {response.status_code} - {response.text}")
+                else:
+                    logger.debug(f"Usage logged for tenant {tenant_id}: {model} ({input_tokens}+{output_tokens} tokens)")
 
         except Exception as e:
-            # Non-critical - just log
+            # Non-critical - just log, don't fail the request
             logger.warning(f"Failed to log usage: {e}")
 
     async def _get_cached(self, key_hash: str) -> Optional[TenantSettings]:
