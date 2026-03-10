@@ -48,7 +48,18 @@ DEFAULT_MARKUP = 1.0
 
 @dataclass
 class UsageRecord:
-    """Usage record for a single API request."""
+    """
+    Usage record for a single API request with multi-dimension attribution.
+
+    Dimensions:
+    - Tenant: Organization/tenant identifier (required)
+    - User: Individual user identifier (optional)
+    - App: Application identifier (e.g., "werking-report", "werking-energy")
+    - Agent: Autonomous agent identifier (e.g., "herbert", "sarah")
+    - Session: Session UUID (e.g., Claude Code session)
+    - Workflow: Workflow type identifier (e.g., "energy-report-v2")
+    - Job: Job/run identifier (e.g., workflow execution UUID)
+    """
     tenant_id: str
     model: str
     input_tokens: int
@@ -59,6 +70,11 @@ class UsageRecord:
     status: str
     pii_detected: bool = False
     pii_entities_count: int = 0
+    # Multi-dimension attribution (optional)
+    user_id: Optional[str] = None
+    app_id: Optional[str] = None
+    agent_id: Optional[str] = None
+    session_id: Optional[str] = None
     workflow_id: Optional[str] = None
     job_id: Optional[str] = None
     error_message: Optional[str] = None
@@ -158,13 +174,23 @@ class UsageTracker:
             "status": record.status,
             "privacy_mode": record.privacy_mode,
         }
+        # Multi-dimension attribution
+        if record.app_id:
+            metadata["app_id"] = record.app_id
+        if record.agent_id:
+            metadata["agent_id"] = record.agent_id
+        if record.session_id:
+            metadata["session_id"] = record.session_id
+        # PII detection
         if record.pii_detected:
             metadata["pii_detected"] = record.pii_detected
             metadata["pii_entities_count"] = record.pii_entities_count
+        # Workflow context
         if record.workflow_id:
             metadata["workflow_id"] = record.workflow_id
         if record.job_id:
             metadata["job_id"] = record.job_id
+        # Error tracking
         if record.error_message:
             metadata["error_message"] = record.error_message
 
@@ -179,6 +205,7 @@ class UsageTracker:
                 operation=operation,
                 billing_mode="platform_managed",  # Will be set correctly via tenant settings
                 image_count=1 if operation == "vision" else 0,
+                user_id=record.user_id,  # Multi-dimension attribution
                 metadata=metadata
             )
 
@@ -223,11 +250,16 @@ async def track_request_usage(
     error_message: Optional[str] = None,
     pii_detected: bool = False,
     pii_entities_count: int = 0,
+    # Multi-dimension attribution
+    user_id: Optional[str] = None,
+    app_id: Optional[str] = None,
+    agent_id: Optional[str] = None,
+    session_id: Optional[str] = None,
     workflow_id: Optional[str] = None,
     job_id: Optional[str] = None
 ) -> None:
     """
-    Convenience function to track request usage.
+    Convenience function to track request usage with multi-dimension attribution.
 
     Args:
         tenant: Tenant settings (or None for anonymous requests)
@@ -240,8 +272,13 @@ async def track_request_usage(
         error_message: Error message if failed
         pii_detected: Whether PII was detected
         pii_entities_count: Number of PII entities
-        workflow_id: Optional workflow ID
-        job_id: Optional job ID
+        # Multi-dimension attribution
+        user_id: User identifier (e.g., Supabase user UUID)
+        app_id: Application identifier (e.g., "werking-report", "werking-energy")
+        agent_id: Autonomous agent identifier (e.g., "herbert", "sarah")
+        session_id: Session identifier (e.g., Claude Code session UUID)
+        workflow_id: Workflow type identifier (e.g., "energy-report-v2")
+        job_id: Job/run identifier (e.g., workflow execution UUID)
     """
     if not tenant:
         # No tenant - skip tracking (anonymous request)
@@ -260,6 +297,11 @@ async def track_request_usage(
         status=status,
         pii_detected=pii_detected,
         pii_entities_count=pii_entities_count,
+        # Multi-dimension attribution
+        user_id=user_id,
+        app_id=app_id,
+        agent_id=agent_id,
+        session_id=session_id,
         workflow_id=workflow_id,
         job_id=job_id,
         error_message=error_message

@@ -1,18 +1,42 @@
 services:
-  # Universal Wrapper - accessible on all 3 ports for backwards compatibility
-  eco-wrapper:
+  # =============================================================================
+  # NGINX Load Balancer - Round-Robin über 3 aktive Worker
+  # =============================================================================
+  nginx:
+    image: nginx:alpine
+    container_name: eco-wrapper-lb
+    ports:
+      - "8000:80"      # Primary API
+      - "8010:80"      # eco-backend compatibility
+      - "8020:80"      # eco-diagnostics compatibility
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+    # Remove default.conf that overrides our config
+    command: ["/bin/sh", "-c", "rm -f /etc/nginx/conf.d/default.conf && nginx -g 'daemon off;'"]
+    depends_on:
+      - worker1
+      - worker2
+      - worker3
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:80/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    restart: unless-stopped
+
+  # =============================================================================
+  # Worker 1 - Account 1: rafael@engelmann.at
+  # =============================================================================
+  worker1:
     build:
       context: ..
       dockerfile: docker/Dockerfile
-    container_name: eco-wrapper-universal
+    container_name: eco-wrapper-worker1
 
-    # Multi-port mapping: One container, accessible on all legacy ports
-    ports:
-      - "8000:8000"  # Primary port
-      - "8010:8000"  # eco-backend compatibility
-      - "8020:8000"  # eco-diagnostics compatibility
+    # Internal port only - accessed via nginx
+    expose:
+      - "8000"
 
-    # Memory limit: 4 GB (down from ~8 GB with 3 containers)
     deploy:
       resources:
         limits:
@@ -20,65 +44,33 @@ services:
         reservations:
           memory: 1G
 
-    # Unified persistent storage
     volumes:
       - eco-wrapper-logs:/app/logs
-      - eco-wrapper-instances:/app/instances
+      - eco-wrapper-instances-shared:/app/instances
       - ~/eco-research-output:/app/research_output
 
-    # OAuth Tokens via Secrets (multiple for fallback)
     secrets:
-      - claude_token
-      - claude_token_account1
-      - claude_token_account2
+      - claude_token_1
 
     environment:
-      # Token aus Secret lesen (SDK unterstützt file-basiertes Token)
-      - CLAUDE_CODE_OAUTH_TOKEN_FILE=/run/secrets/claude_token
-
-      # Timezone
+      - CLAUDE_CODE_OAUTH_TOKEN_FILE=/run/secrets/claude_token_1
       - TZ=Europe/Vienna
-
-      # Logging
       - LOG_LEVEL=INFO
       - LOG_TO_FILE=true
       - FILTER_SENSITIVE_DATA=true
-
-      # Instance Name
-      - INSTANCE_NAME=eco-wrapper-universal
-
-      # Working Directory (for session isolation)
+      - INSTANCE_NAME=worker1
       - CLAUDE_CWD=/app/instances
-
-      # MCP Isolation
       - DISABLE_COACH_MCP=true
-
-      # Timeout (40 min for research)
       - MAX_TIMEOUT=2400000
-
-      # Permissions (bypassPermissions for autonomous research)
       - CLAUDE_PERMISSION_MODE=bypassPermissions
-
-      # MCP API Keys
       - TAVILY_API_KEY=${TAVILY_API_KEY}
-
-      # Anthropic API Key for Vision/Image Analysis ONLY
-      # auth.py renames this to ANTHROPIC_VISION_API_KEY and removes ANTHROPIC_API_KEY
-      # This prevents Claude CLI from using it as OAuth fallback
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
-
-      # Privacy/DSGVO (Presidio-based PII anonymization)
       - PRIVACY_ENABLED=true
       - PRIVACY_LANGUAGE=de
       - PRIVACY_LOG_DETECTIONS=false
-
-      # SDK verification disabled (tokens verified on first request)
       - SKIP_SDK_VERIFICATION=true
-
-      # Rate Limiting disabled (handled by Claude's own limits)
       - RATE_LIMIT_ENABLED=false
 
-    # Health Check
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
       interval: 30s
@@ -86,24 +78,134 @@ services:
       retries: 3
       start_period: 40s
 
-    # Graceful Shutdown
-    stop_grace_period: 15s
-
-    # Restart Policy
     restart: unless-stopped
 
-# Unified Named Volumes (simplified from 6 to 2 volumes)
+  # =============================================================================
+  # Worker 2 - Account 3: office@data-energyneering.at
+  # =============================================================================
+  worker2:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    container_name: eco-wrapper-worker2
+
+    expose:
+      - "8000"
+
+    deploy:
+      resources:
+        limits:
+          memory: 4G
+        reservations:
+          memory: 1G
+
+    volumes:
+      - eco-wrapper-logs:/app/logs
+      - eco-wrapper-instances-shared:/app/instances
+      - ~/eco-research-output:/app/research_output
+
+    secrets:
+      - claude_token_2
+
+    environment:
+      - CLAUDE_CODE_OAUTH_TOKEN_FILE=/run/secrets/claude_token_2
+      - TZ=Europe/Vienna
+      - LOG_LEVEL=INFO
+      - LOG_TO_FILE=true
+      - FILTER_SENSITIVE_DATA=true
+      - INSTANCE_NAME=worker2
+      - CLAUDE_CWD=/app/instances
+      - DISABLE_COACH_MCP=true
+      - MAX_TIMEOUT=2400000
+      - CLAUDE_PERMISSION_MODE=bypassPermissions
+      - TAVILY_API_KEY=${TAVILY_API_KEY}
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+      - PRIVACY_ENABLED=true
+      - PRIVACY_LANGUAGE=de
+      - PRIVACY_LOG_DETECTIONS=false
+      - SKIP_SDK_VERIFICATION=true
+      - RATE_LIMIT_ENABLED=false
+
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+    restart: unless-stopped
+
+  # =============================================================================
+  # Worker 3 - Account 2: engelmann.rafaelo@gmail.com
+  # =============================================================================
+  worker3:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    container_name: eco-wrapper-worker3
+
+    expose:
+      - "8000"
+
+    deploy:
+      resources:
+        limits:
+          memory: 4G
+        reservations:
+          memory: 1G
+
+    volumes:
+      - eco-wrapper-logs:/app/logs
+      - eco-wrapper-instances-shared:/app/instances
+      - ~/eco-research-output:/app/research_output
+
+    secrets:
+      - claude_token_3
+
+    environment:
+      - CLAUDE_CODE_OAUTH_TOKEN_FILE=/run/secrets/claude_token_3
+      - TZ=Europe/Vienna
+      - LOG_LEVEL=INFO
+      - LOG_TO_FILE=true
+      - FILTER_SENSITIVE_DATA=true
+      - INSTANCE_NAME=worker3
+      - CLAUDE_CWD=/app/instances
+      - DISABLE_COACH_MCP=true
+      - MAX_TIMEOUT=2400000
+      - CLAUDE_PERMISSION_MODE=bypassPermissions
+      - TAVILY_API_KEY=${TAVILY_API_KEY}
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+      - PRIVACY_ENABLED=true
+      - PRIVACY_LANGUAGE=de
+      - PRIVACY_LOG_DETECTIONS=false
+      - SKIP_SDK_VERIFICATION=true
+      - RATE_LIMIT_ENABLED=false
+
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+    restart: unless-stopped
+
+# =============================================================================
+# Volumes - Shared instance dir for all workers (session sync!)
+# =============================================================================
 volumes:
   eco-wrapper-logs:
     driver: local
-  eco-wrapper-instances:
+  eco-wrapper-instances-shared:
     driver: local
 
-# Secrets - Multiple tokens for fallback
+# =============================================================================
+# Secrets - 3 active tokens
+# =============================================================================
 secrets:
-  claude_token:
-    file: ../secrets/claude_token.txt
-  claude_token_account1:
-    file: ../secrets/claude_token_account1.txt
-  claude_token_account2:
-    file: ../secrets/claude_token_account2.txt
+  claude_token_1:
+    file: ../secrets/claude_token_account1.txt    # rafael@engelmann.at
+  claude_token_2:
+    file: ../secrets/claude_token_account3.txt    # office@data-energyneering.at
+  claude_token_3:
+    file: ../secrets/claude_token_account2.txt    # engelmann.rafaelo@gmail.com

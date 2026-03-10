@@ -66,6 +66,12 @@ from src.tenant import (
     TenantMiddleware,
     get_tenant_from_request,
     get_privacy_mode_from_request,
+    get_user_id_from_request,
+    get_app_id_from_request,
+    get_agent_id_from_request,
+    get_session_id_from_request,
+    get_workflow_id_from_request,
+    get_job_id_from_request,
     track_request_usage
 )
 # Rate limiting - required in production, optional in development
@@ -1191,6 +1197,38 @@ async def generate_streaming_response(
             logger.debug("✅ Disconnect monitor task already completed")
 
 
+# =============================================================================
+# ATTRIBUTION HELPER
+# =============================================================================
+
+def extract_attribution_context(request: Request) -> dict:
+    """
+    Extract multi-dimension attribution headers from request.
+
+    Returns dict with all attribution dimensions:
+    - user_id: User identifier (X-User-ID)
+    - app_id: Application identifier (X-App-ID)
+    - agent_id: Autonomous agent identifier (X-Agent-ID)
+    - session_id: Session UUID (X-Session-ID)
+    - workflow_id: Workflow type (X-Workflow-ID)
+    - job_id: Job/run UUID (X-Job-ID)
+
+    All values are optional (None if not provided).
+    """
+    return {
+        "user_id": get_user_id_from_request(request),
+        "app_id": get_app_id_from_request(request),
+        "agent_id": get_agent_id_from_request(request),
+        "session_id": get_session_id_from_request(request),
+        "workflow_id": get_workflow_id_from_request(request),
+        "job_id": get_job_id_from_request(request),
+    }
+
+
+# =============================================================================
+# API ENDPOINTS
+# =============================================================================
+
 @app.post("/v1/chat/completions")
 @rate_limit_endpoint("chat")
 async def chat_completions(
@@ -1328,6 +1366,7 @@ async def chat_completions(
                 # Track usage for Bedrock (non-streaming)
                 if tenant and response.usage:
                     from src.tenant import track_request_usage
+                    attribution = extract_attribution_context(request)
                     await track_request_usage(
                         tenant=tenant,
                         model=resolved_model,
@@ -1336,6 +1375,7 @@ async def chat_completions(
                         endpoint="/v1/chat/completions",
                         latency_ms=int(duration * 1000),
                         status="success",
+                        **attribution
                     )
 
                 return response
@@ -1378,6 +1418,7 @@ async def chat_completions(
                 usage = response_data.get("usage", {})
                 if tenant and usage:
                     from src.tenant import track_request_usage
+                    attribution = extract_attribution_context(request)
                     await track_request_usage(
                         tenant=tenant,
                         model=backend_config.provider_model or resolved_model,
@@ -1386,6 +1427,7 @@ async def chat_completions(
                         endpoint="/v1/chat/completions",
                         latency_ms=int(duration * 1000),
                         status="success",
+                        **attribution
                     )
 
                 return response_data
@@ -1429,6 +1471,7 @@ async def chat_completions(
             usage = response_data.get("usage", {})
             if tenant and usage:
                 from src.tenant import track_request_usage
+                attribution = extract_attribution_context(request)
                 await track_request_usage(
                     tenant=tenant,
                     model=gemini_model,
@@ -1437,6 +1480,7 @@ async def chat_completions(
                     endpoint="/v1/chat/completions",
                     latency_ms=int(duration * 1000),
                     status="success",
+                    **attribution
                 )
 
             return response_data
@@ -1524,6 +1568,7 @@ async def chat_completions(
                     # Track usage for Vision
                     if tenant:
                         from src.tenant import track_request_usage
+                        attribution = extract_attribution_context(request)
                         await track_request_usage(
                             tenant=tenant,
                             model=vision_result.model,
@@ -1532,6 +1577,7 @@ async def chat_completions(
                             endpoint="/v1/chat/completions/vision",
                             latency_ms=int(duration * 1000),
                             status="success",
+                            **attribution
                         )
 
                     return response
@@ -1743,6 +1789,7 @@ async def chat_completions(
             # Track usage for SDK (non-streaming)
             if tenant:
                 from src.tenant import track_request_usage
+                attribution = extract_attribution_context(request)
                 await track_request_usage(
                     tenant=tenant,
                     model=request_body.model,
@@ -1751,6 +1798,7 @@ async def chat_completions(
                     endpoint="/v1/chat/completions",
                     latency_ms=int(duration * 1000),
                     status="success",
+                    **attribution
                 )
 
             # Worker instance info for multi-worker deployments
@@ -1876,6 +1924,7 @@ async def chat_completions(
                                 usage = response_data.get("usage", {})
                                 if tenant and usage:
                                     from src.tenant import track_request_usage
+                                    attribution = extract_attribution_context(request)
                                     await track_request_usage(
                                         tenant=tenant,
                                         model=fallback_config.provider_model or resolved_model,
@@ -1884,6 +1933,7 @@ async def chat_completions(
                                         endpoint="/v1/chat/completions",
                                         latency_ms=int(fb_duration * 1000),
                                         status="fallback_success",
+                                        **attribution
                                     )
 
                                 # Mark response with fallback metadata

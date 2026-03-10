@@ -93,7 +93,7 @@ const client = await createClient({ fallbackEnabled: true });
 ## Abhängigkeiten
 
 - **Verwendet**: OpenAI SDK (`openai`)
-- **Wird verwendet von**: `werkingflow/platform`, `apps/*`, `tecc-safety-expert`
+- **Wird verwendet von**: `werkingflow/platform`, `apps/*`, `werking-safety`
 - **Verbindet zu**: AI-Bridge Backend (Hetzner oder lokal)
 
 ---

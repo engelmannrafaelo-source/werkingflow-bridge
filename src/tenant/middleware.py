@@ -336,3 +336,87 @@ def get_privacy_mode_from_request(request: Request) -> str:
     Returns "full" if no tenant context (DSGVO-safe default).
     """
     return getattr(request.state, "privacy_mode", "full")
+
+
+def get_user_id_from_request(request: Request) -> Optional[str]:
+    """
+    Extract user ID from request headers.
+
+    Supported headers (case-insensitive):
+    - X-User-ID: User UUID or identifier
+    - x-user-id: Alternative casing
+
+    Returns:
+        User ID string or None if not present
+    """
+    return request.headers.get("X-User-ID") or request.headers.get("x-user-id")
+
+
+def get_app_id_from_request(request: Request) -> Optional[str]:
+    """
+    Extract application identifier from request headers.
+
+    Supported headers:
+    - X-App-ID: Application identifier (e.g., "werking-report", "werking-energy")
+    - x-app-id: Alternative casing
+
+    Returns:
+        App ID string or None if not present
+    """
+    return request.headers.get("X-App-ID") or request.headers.get("x-app-id")
+
+
+def get_agent_id_from_request(request: Request) -> Optional[str]:
+    """
+    Extract autonomous agent identifier from request headers.
+
+    Supported headers:
+    - X-Agent-ID: Agent identifier (e.g., "herbert", "sarah", "klaus")
+    - x-agent-id: Alternative casing
+
+    Returns:
+        Agent ID string or None if not present
+    """
+    return request.headers.get("X-Agent-ID") or request.headers.get("x-agent-id")
+
+
+def get_session_id_from_request(request: Request) -> Optional[str]:
+    """
+    Extract session identifier from request headers.
+
+    Supported headers:
+    - X-Session-ID: Session UUID or identifier (e.g., Claude Code session)
+    - x-session-id: Alternative casing
+
+    Returns:
+        Session ID string or None if not present
+    """
+    return request.headers.get("X-Session-ID") or request.headers.get("x-session-id")
+
+
+def get_workflow_id_from_request(request: Request) -> Optional[str]:
+    """
+    Extract workflow identifier from request headers.
+
+    Supported headers:
+    - X-Workflow-ID: Workflow type identifier (e.g., "energy-report-v2")
+    - x-workflow-id: Alternative casing
+
+    Returns:
+        Workflow ID string or None if not present
+    """
+    return request.headers.get("X-Workflow-ID") or request.headers.get("x-workflow-id")
+
+
+def get_job_id_from_request(request: Request) -> Optional[str]:
+    """
+    Extract job/run identifier from request headers.
+
+    Supported headers:
+    - X-Job-ID: Job/run UUID
+    - x-job-id: Alternative casing
+
+    Returns:
+        Job ID string or None if not present
+    """
+    return request.headers.get("X-Job-ID") or request.headers.get("x-job-id")

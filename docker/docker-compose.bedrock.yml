@@ -1,33 +1,125 @@
-# DSGVO-konformer Bedrock-Modus
-# Verwendet AWS Bedrock in eu-central-1 (Frankfurt) statt OAuth
-#
-# Nutzung:
-#   docker compose -f docker-compose.yml -f docker-compose.bedrock.yml up -d
-#
-# Voraussetzungen:
-#   1. AWS Credentials in .env.bedrock
-#   2. Bedrock Model Access für Claude aktiviert (AWS Console)
-#   3. IAM Permissions: bedrock:InvokeModel, bedrock:InvokeModelWithResponseStream
+# Docker Compose with Bedrock Routing
+# Uses OpenResty for body-based routing between Wrapper and Bedrock service
 
 services:
+  # ==========================================================================
+  # OpenResty Router - Body-based Backend Routing
+  # ==========================================================================
+  router:
+    image: openresty/openresty:alpine
+    container_name: ai-bridge-router
+    ports:
+      - "8000:80"    # Primary port
+      - "8010:80"    # eco-backend compatibility
+      - "8020:80"    # eco-diagnostics compatibility
+    volumes:
+      - ./nginx-router.conf:/usr/local/openresty/nginx/conf/nginx.conf:ro
+      - router-logs:/var/log/nginx
+    depends_on:
+      - eco-wrapper
+      - bedrock
+    restart: unless-stopped
+
+  # ==========================================================================
+  # Main Wrapper - Claude Code SDK (Development, Tools)
+  # ==========================================================================
   eco-wrapper:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    container_name: eco-wrapper-universal
+
+    # Internal port only - router handles external access
+    expose:
+      - "8000"
+
+    deploy:
+      resources:
+        limits:
+          memory: 4G
+        reservations:
+          memory: 1G
+
+    volumes:
+      - eco-wrapper-logs:/app/logs
+      - eco-wrapper-instances:/app/instances
+      - ~/eco-research-output:/app/research_output
+
+    secrets:
+      - claude_token
+      - claude_token_account1
+      - claude_token_account2
+
     environment:
-      # Bedrock aktivieren (überschreibt OAuth)
-      - CLAUDE_CODE_USE_BEDROCK=1
+      - CLAUDE_CODE_OAUTH_TOKEN_FILE=/run/secrets/claude_token
+      - TZ=Europe/Vienna
+      - LOG_LEVEL=INFO
+      - LOG_TO_FILE=true
+      - FILTER_SENSITIVE_DATA=true
+      - INSTANCE_NAME=eco-wrapper-universal
+      - CLAUDE_CWD=/app/instances
+      - DISABLE_COACH_MCP=true
+      - MAX_TIMEOUT=2400000
+      - CLAUDE_PERMISSION_MODE=bypassPermissions
+      - TAVILY_API_KEY=${TAVILY_API_KEY}
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+      - PRIVACY_ENABLED=true
+      - PRIVACY_LANGUAGE=de
+      - PRIVACY_LOG_DETECTIONS=false
+      - SKIP_SDK_VERIFICATION=true
+      - RATE_LIMIT_ENABLED=false
+      # AWS Bedrock Credentials (for DSGVO-compliant routing)
+      - AWS_ACCESS_KEY_ID_BEDROCK=${AWS_ACCESS_KEY_ID_BEDROCK}
+      - AWS_SECRET_ACCESS_KEY_BEDROCK=${AWS_SECRET_ACCESS_KEY_BEDROCK}
+      - AWS_REGION_BEDROCK=${AWS_REGION_BEDROCK:-eu-central-1}
 
-      # AWS Credentials aus .env.bedrock
-      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
-      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
-      - AWS_REGION=${AWS_REGION:-eu-central-1}
+    restart: unless-stopped
 
-      # OAuth Token nicht benötigt für Bedrock
-      - CLAUDE_CODE_OAUTH_TOKEN_FILE=
+  # ==========================================================================
+  # Bedrock Service - Lightweight DSGVO-compliant Backend
+  # ==========================================================================
+  bedrock:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.bedrock
+    container_name: ai-bridge-bedrock
 
-    # Secrets nicht benötigt für Bedrock
-    secrets: []
+    # Internal port only
+    expose:
+      - "8001"
 
-    # Labels für Monitoring
-    labels:
-      - "werkingflow.mode=bedrock"
-      - "werkingflow.region=eu-central-1"
-      - "werkingflow.dsgvo=compliant"
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+        reservations:
+          memory: 128M
+
+    environment:
+      - TZ=Europe/Vienna
+      - LOG_LEVEL=INFO
+      # AWS Bedrock Credentials
+      - AWS_ACCESS_KEY_ID_BEDROCK=${AWS_ACCESS_KEY_ID_BEDROCK}
+      - AWS_SECRET_ACCESS_KEY_BEDROCK=${AWS_SECRET_ACCESS_KEY_BEDROCK}
+      - AWS_REGION_BEDROCK=${AWS_REGION_BEDROCK:-eu-central-1}
+
+    restart: unless-stopped
+
+# ==========================================================================
+# Volumes
+# ==========================================================================
+volumes:
+  eco-wrapper-logs:
+  eco-wrapper-instances:
+  router-logs:
+
+# ==========================================================================
+# Secrets
+# ==========================================================================
+secrets:
+  claude_token:
+    file: ../secrets/claude_token.txt
+  claude_token_account1:
+    file: ../secrets/claude_token_account1.txt
+  claude_token_account2:
+    file: ../secrets/claude_token_account2.txt

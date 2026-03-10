@@ -17,7 +17,13 @@ from .middleware import (
     TenantMiddleware,
     get_tenant_middleware,
     get_tenant_from_request,
-    get_privacy_mode_from_request
+    get_privacy_mode_from_request,
+    get_user_id_from_request,
+    get_app_id_from_request,
+    get_agent_id_from_request,
+    get_session_id_from_request,
+    get_workflow_id_from_request,
+    get_job_id_from_request
 )
 from .client import SupabaseTenantClient, TenantSettings, get_tenant_client
 from .usage_tracker import (
@@ -38,6 +44,12 @@ __all__ = [
     'get_tenant_middleware',
     'get_tenant_from_request',
     'get_privacy_mode_from_request',
+    'get_user_id_from_request',
+    'get_app_id_from_request',
+    'get_agent_id_from_request',
+    'get_session_id_from_request',
+    'get_workflow_id_from_request',
+    'get_job_id_from_request',
     # Client
     'SupabaseTenantClient',
     'TenantSettings',

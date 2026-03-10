@@ -9,6 +9,7 @@ from typing import AsyncGenerator, Dict, Any, Optional, List
 from pathlib import Path
 
 from claude_code_sdk import query, ClaudeCodeOptions, Message
+from claude_code_sdk._errors import MessageParseError
 from config.logging_config import get_logger
 from datetime import datetime, timedelta
 import shutil
@@ -17,6 +18,44 @@ import shutil
 from src.file_discovery import FileDiscoveryService, FileMetadata, SDKMessageParsingError, DirectoryScanError
 
 logger = get_logger(__name__)
+
+
+# =============================================================================
+# MONKEY-PATCH: Make Python SDK resilient to unknown message types
+# =============================================================================
+# The Python SDK (claude-code-sdk) crashes on unrecognized message types like
+# "rate_limit_event" (introduced in Node.js SDK v2.1.62+). This kills the entire
+# async generator, losing all subsequent messages.
+#
+# Fix: Patch parse_message() to skip unknown types instead of raising.
+# This allows the stream to continue and all content to be delivered.
+# =============================================================================
+try:
+    import claude_code_sdk._internal.client as _sdk_client
+    from claude_code_sdk._internal.message_parser import parse_message as _original_parse_message
+
+    _SKIPPED_TYPES_LOG = set()  # Track which types we've logged (avoid spam)
+
+    def _resilient_parse_message(data):
+        """Wrapper that skips unknown message types instead of crashing."""
+        try:
+            return _original_parse_message(data)
+        except MessageParseError as e:
+            error_msg = str(e).lower()
+            if "unknown message type" in error_msg:
+                msg_type = data.get("type", "unknown") if isinstance(data, dict) else "unknown"
+                if msg_type not in _SKIPPED_TYPES_LOG:
+                    logger.info(f"ℹ️ Skipping unrecognized SDK message type: {msg_type}")
+                    _SKIPPED_TYPES_LOG.add(msg_type)
+                return None  # Skip this message, continue stream
+            raise  # Re-raise genuine parse errors
+
+    _sdk_client.parse_message = _resilient_parse_message
+    logger.info("✅ SDK message parser patched for unknown type resilience")
+except Exception as patch_err:
+    logger.warning(f"⚠️ Could not patch SDK message parser: {patch_err}")
+    logger.warning("   Unknown message types will crash the stream (fallback to except handler)")
+# =============================================================================
 
 
 # Custom Exceptions for Progress Tracking
@@ -850,6 +889,10 @@ CRITICAL: Write file EARLY to avoid context overflow. Use Write tool for clauded
                 try:
                     async with asyncio.timeout(self.timeout):
                         async for message in query(prompt=prompt_source, options=options):
+                            # Skip None messages (from monkey-patched parse_message for unknown types)
+                            if message is None:
+                                continue
+
                             chunks_received += 1
 
                             # Collect message for file discovery
@@ -1051,6 +1094,22 @@ CRITICAL: Write file EARLY to avoid context overflow. Use Write tool for clauded
                         "action_required": "INCREASE_TIMEOUT_OR_REDUCE_PROMPT"
                     }
                     raise  # Re-raise to ensure proper cleanup
+
+                except MessageParseError as parse_err:
+                    # Handle unknown message types from newer Claude Code SDK versions.
+                    # The Python SDK (claude-code-sdk) throws MessageParseError for
+                    # unrecognized types like "rate_limit_event" (Node.js SDK v2.1.62+).
+                    # These are informational messages that appear AFTER content delivery.
+                    # The actual content was already yielded before this error occurs.
+                    error_msg_str = str(parse_err).lower()
+                    if "unknown message type" in error_msg_str:
+                        logger.info(f"ℹ️ SDK stream ended with unrecognized message type (non-fatal): {parse_err}")
+                        logger.info(f"   Chunks received before error: {chunks_received}")
+                        logger.info(f"   Continuing with post-processing (file discovery, metadata)")
+                        # DON'T re-raise — content was already delivered.
+                        # Continue to post-processing below (file discovery, completion check, etc.)
+                    else:
+                        raise  # Re-raise genuine parse errors to outer handler
 
                 # Post-streaming validation: Check for completion marker
                 if not response_complete and chunks_received > 0:
