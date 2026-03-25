@@ -37,7 +37,8 @@ RUN mkdir -p /app/logs /app/instances
 
 # Install Python dependencies with Poetry (as root, creates virtualenv in /app/.venv)
 # Including privacy extras for DSGVO-compliant PII anonymization
-RUN poetry config virtualenvs.in-project true && poetry install --no-root --extras "privacy"
+# poetry.lock is in .gitignore so we must regenerate it from pyproject.toml
+RUN poetry config virtualenvs.in-project true && poetry lock && poetry install --no-root --extras "privacy"
 
 # Download spaCy language models for Presidio PII detection
 RUN poetry run python -m spacy download de_core_news_lg && \
