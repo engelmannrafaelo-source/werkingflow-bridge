@@ -3,12 +3,16 @@ Smart Anonymizer — AI-refined pseudonymization
 
 2-stage process:
 1. Presidio detects ALL potential PII (aggressive, catches everything)
-2. Claude Haiku evaluates each detection: real PII → keep anonymized,
+2. Claude evaluates each detection: real PII → keep anonymized,
    context-relevant non-PII → restore original value
 
 This produces a "smart" pseudonymized text where only actual personal data
 is masked, while context-relevant information (city names, dates,
 organization types) is preserved.
+
+IMPORTANT: AI refinement uses the Bridge's own /v1/chat/completions endpoint
+(localhost self-call via OAuth — free, no API key needed). This is a text-only
+call, NOT vision — there is zero reason to use the paid ANTHROPIC_API_KEY.
 """
 
 import os
@@ -22,20 +26,10 @@ from .anonymizer import PresidioAnonymizer, AnonymizationResult
 
 logger = logging.getLogger(__name__)
 
-ANTHROPIC_API_URL = "https://api.anthropic.com/v1/messages"
-ANTHROPIC_VERSION = "2023-06-01"
+# Refinement uses the Bridge's own OpenAI-compatible endpoint (OAuth, free)
+# NOT the direct Anthropic API (paid, requires ANTHROPIC_API_KEY)
+BRIDGE_SELF_URL = "http://localhost:8000/v1/chat/completions"
 HAIKU_MODEL = "claude-haiku-4-5-20251001"
-
-
-def _get_api_key() -> str:
-    """Get Anthropic API key for refinement calls."""
-    key = os.getenv("ANTHROPIC_VISION_API_KEY") or os.getenv("ANTHROPIC_API_KEY")
-    if not key:
-        raise RuntimeError(
-            "ANTHROPIC_VISION_API_KEY not set. "
-            "Smart anonymization requires direct API access for AI refinement."
-        )
-    return key
 
 
 def _build_refinement_prompt(
@@ -88,7 +82,10 @@ async def refine_anonymization(
     context_hint: Optional[str] = None
 ) -> Dict[str, Any]:
     """
-    Use Claude Haiku to evaluate which anonymized entities should be restored.
+    Use Claude to evaluate which anonymized entities should be restored.
+
+    Routes through the Bridge's own /v1/chat/completions endpoint (OAuth, free).
+    This is a TEXT-ONLY call — no vision, no paid API key needed.
 
     Args:
         result: Presidio AnonymizationResult with all detected entities
@@ -107,8 +104,6 @@ async def refine_anonymization(
             "keep_placeholders": []
         }
 
-    api_key = _get_api_key()
-
     # Build entity info for the prompt
     entities = [
         {
@@ -123,36 +118,40 @@ async def refine_anonymization(
         result.anonymized_text, entities, context_hint
     )
 
-    # Call Claude Haiku via Anthropic API
+    # Call via Bridge's own OpenAI-compatible endpoint (OAuth, free)
+    # This is a localhost self-call — no external API key needed
     request_body = {
         "model": HAIKU_MODEL,
         "max_tokens": 2000,
         "temperature": 0,
+        "stream": False,
         "messages": [
             {"role": "user", "content": prompt}
         ]
     }
 
     logger.info(
-        f"Smart anonymize: refining {len(entities)} entities with {HAIKU_MODEL}",
+        f"Smart anonymize: refining {len(entities)} entities with {HAIKU_MODEL} (via Bridge self-call)",
         extra={"entity_count": len(entities), "context": context_hint}
     )
 
-    async with httpx.AsyncClient(timeout=30.0) as client:
+    # Optional: Bridge API key for endpoint protection (not Anthropic key)
+    headers = {"Content-Type": "application/json"}
+    bridge_api_key = os.getenv("API_KEY")
+    if bridge_api_key:
+        headers["Authorization"] = f"Bearer {bridge_api_key}"
+
+    async with httpx.AsyncClient(timeout=60.0) as client:
         response = await client.post(
-            ANTHROPIC_API_URL,
-            headers={
-                "Content-Type": "application/json",
-                "x-api-key": api_key,
-                "anthropic-version": ANTHROPIC_VERSION
-            },
+            BRIDGE_SELF_URL,
+            headers=headers,
             json=request_body
         )
 
     if response.status_code != 200:
         error_body = response.text
         logger.error(
-            f"Refinement API error: {response.status_code}",
+            f"Refinement self-call error: {response.status_code}",
             extra={"status_code": response.status_code, "error": error_body[:500]}
         )
         raise RuntimeError(
@@ -161,17 +160,17 @@ async def refine_anonymization(
 
     data = response.json()
 
-    # Extract text response
-    content_blocks = data.get("content", [])
+    # OpenAI-compatible response format
+    choices = data.get("choices", [])
     response_text = ""
-    for block in content_blocks:
-        if block.get("type") == "text":
-            response_text += block.get("text", "")
+    if choices:
+        message = choices[0].get("message", {})
+        response_text = message.get("content", "")
 
     usage = data.get("usage", {})
     logger.info(
-        f"Refinement response: {usage.get('input_tokens', 0)} in, "
-        f"{usage.get('output_tokens', 0)} out tokens"
+        f"Refinement response: {usage.get('prompt_tokens', 0)} in, "
+        f"{usage.get('completion_tokens', 0)} out tokens"
     )
 
     # Parse JSON response
