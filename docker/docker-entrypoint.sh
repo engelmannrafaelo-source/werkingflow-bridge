@@ -55,8 +55,18 @@ shutdown_handler() {
 # Trap SIGTERM and SIGINT (sent by docker stop)
 trap shutdown_handler SIGTERM SIGINT
 
+# CRITICAL: Remove ANTHROPIC_API_KEY from environment to prevent SDK fallback
+# Vision uses ANTHROPIC_VISION_API_KEY (set in docker-compose.yml directly)
+# If ANTHROPIC_API_KEY leaks in, the SDK silently falls back to paid API!
+if [ -n "$ANTHROPIC_API_KEY" ]; then
+    echo "⚠️  ANTHROPIC_API_KEY detected in environment - REMOVING to prevent SDK fallback!"
+    echo "   Vision key should be set via ANTHROPIC_VISION_API_KEY instead."
+    unset ANTHROPIC_API_KEY
+fi
+
 # Drop privileges and execute CMD as claude user in background
 # Pass CLAUDE_CODE_OAUTH_TOKEN explicitly via env command
+# IMPORTANT: Do NOT pass ANTHROPIC_API_KEY - OAuth only!
 if [ -n "$CLAUDE_CODE_OAUTH_TOKEN" ]; then
     gosu claude env CLAUDE_CODE_OAUTH_TOKEN="$CLAUDE_CODE_OAUTH_TOKEN" "$@" &
 else

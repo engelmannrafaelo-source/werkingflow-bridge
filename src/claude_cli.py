@@ -592,6 +592,22 @@ CRITICAL: Write file EARLY to avoid context overflow. Use Write tool for clauded
             enable_file_discovery = True
 
         try:
+            # CRITICAL: Verify ANTHROPIC_API_KEY is NOT in environment
+            # If present, the SDK silently falls back to paid API when OAuth fails.
+            # This must NEVER happen — OAuth failure = error, not silent fallback.
+            if os.getenv("ANTHROPIC_API_KEY"):
+                logger.error("=" * 70)
+                logger.error("FATAL: ANTHROPIC_API_KEY found in environment!")
+                logger.error("This causes silent fallback to paid API when OAuth fails.")
+                logger.error("Remove ANTHROPIC_API_KEY from docker-compose.yml.")
+                logger.error("Vision should use ANTHROPIC_VISION_API_KEY instead.")
+                logger.error("=" * 70)
+                raise RuntimeError(
+                    "ANTHROPIC_API_KEY must not be in environment. "
+                    "It causes silent fallback to paid API. "
+                    "Use ANTHROPIC_VISION_API_KEY for vision-only access."
+                )
+
             # Set authentication environment variables (if any)
             original_env = {}
             if self.claude_env_vars:  # Only set env vars if we have any

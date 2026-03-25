@@ -49,11 +49,12 @@ class VisionProvider:
     ]
 
     def __init__(self):
-        # Use ANTHROPIC_VISION_API_KEY (renamed by auth.py to prevent OAuth fallback)
-        # Falls back to ANTHROPIC_API_KEY for backwards compatibility
-        self.api_key = os.getenv("ANTHROPIC_VISION_API_KEY") or os.getenv("ANTHROPIC_API_KEY")
+        # ONLY use ANTHROPIC_VISION_API_KEY (set directly in docker-compose.yml)
+        # NO fallback to ANTHROPIC_API_KEY — that key must never exist in environment!
+        self.api_key = os.getenv("ANTHROPIC_VISION_API_KEY")
         if not self.api_key:
             logger.warning("ANTHROPIC_VISION_API_KEY not set - vision requests will fail")
+            logger.warning("Set ANTHROPIC_VISION_API_KEY in docker-compose.yml for image analysis")
 
     @staticmethod
     def has_images(messages: List[Dict[str, Any]]) -> bool:

@@ -182,22 +182,17 @@ class ClaudeCodeAuthManager:
 
         NEVER silently fall back to paid API - always fail loud with clear error!
         """
-        # CRITICAL: Remove ANTHROPIC_API_KEY from environment to prevent fallback
-        # This prevents Claude CLI from silently using API key when OAuth fails
-        # BUT: Save it for Vision/Image analysis which requires direct API access
+        # CRITICAL: ANTHROPIC_API_KEY must NEVER be in environment!
+        # Docker-compose.yml passes vision key as ANTHROPIC_VISION_API_KEY directly.
+        # If ANTHROPIC_API_KEY is present, something is misconfigured — remove it
+        # and log a loud warning. No silent fallback to paid API!
         if os.getenv("ANTHROPIC_API_KEY"):
-            # Save for Vision before removing
-            vision_key = os.getenv("ANTHROPIC_API_KEY")
-            os.environ["ANTHROPIC_VISION_API_KEY"] = vision_key
-
-            logger.warning("=" * 70)
-            logger.warning("⚠️  ANTHROPIC_API_KEY DETECTED - MOVING TO VISION-ONLY!")
-            logger.warning("=" * 70)
-            logger.warning("This wrapper uses OAuth for Claude CLI (no token costs).")
-            logger.warning("ANTHROPIC_API_KEY saved as ANTHROPIC_VISION_API_KEY for image analysis.")
-            logger.warning("Claude CLI will NOT use this key - OAuth only!")
-            logger.warning("=" * 70)
-            # CRITICAL: Remove from main env so Claude CLI doesn't use it
+            logger.error("=" * 70)
+            logger.error("ANTHROPIC_API_KEY found in environment — REMOVING!")
+            logger.error("This is a misconfiguration. Vision key must be")
+            logger.error("ANTHROPIC_VISION_API_KEY (set in docker-compose.yml).")
+            logger.error("OAuth is the ONLY auth method for chat. No fallback!")
+            logger.error("=" * 70)
             del os.environ["ANTHROPIC_API_KEY"]
 
         if os.getenv("CLAUDE_CODE_USE_BEDROCK") == "1":
