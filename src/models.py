@@ -494,3 +494,55 @@ class SmartAnonymizeResponse(BaseModel):
         default=None,
         description="Error message if status is 'error'"
     )
+
+
+# ============================================================================
+# PDF Conversion Endpoint Models (Docling)
+# ============================================================================
+
+class ConvertPdfResponse(BaseModel):
+    """
+    Response model for /v1/convert-pdf endpoint.
+
+    Returns Markdown content + extracted images as base64.
+    Docling runs locally on Bridge (Hetzner) — no external data transfer.
+    """
+    status: Literal["success", "error"]
+
+    # Conversion result
+    markdown: Optional[str] = Field(
+        default=None,
+        description="Converted Markdown content with image references"
+    )
+    images: Optional[Dict[str, str]] = Field(
+        default=None,
+        description="Extracted images as {filename: base64_data} dict"
+    )
+    image_count: Optional[int] = Field(
+        default=None,
+        description="Number of extracted images"
+    )
+
+    # Metadata
+    pages: Optional[int] = Field(
+        default=None,
+        description="Number of pages in source PDF"
+    )
+    original_size_bytes: Optional[int] = Field(
+        default=None,
+        description="Size of original PDF in bytes"
+    )
+    markdown_size_bytes: Optional[int] = Field(
+        default=None,
+        description="Size of generated Markdown in bytes"
+    )
+    conversion_time_seconds: Optional[float] = Field(
+        default=None,
+        description="Time taken for conversion in seconds"
+    )
+
+    # Error
+    error: Optional[str] = Field(
+        default=None,
+        description="Error message if status is 'error'"
+    )

@@ -1,11 +1,13 @@
 FROM python:3.12-slim
 
-# Install system deps for Node.js, gosu, and general utils
+# Install system deps for Node.js, gosu, Docling (OpenCV, image processing), and general utils
 RUN apt-get update && apt-get install -y \
     curl \
     nodejs \
     npm \
     gosu \
+    libgl1-mesa-glx \
+    libglib2.0-0 \
     && rm -rf /var/lib/apt/lists/*
 
 # Create non-root user for Claude Code (required for bypassPermissions)
@@ -36,13 +38,27 @@ COPY config/docker-claude.json /home/claude/.claude.json
 RUN mkdir -p /app/logs /app/instances
 
 # Install Python dependencies with Poetry (as root, creates virtualenv in /app/.venv)
-# Including privacy extras for DSGVO-compliant PII anonymization
+# Including privacy + pdf extras for DSGVO-compliant PII anonymization + Docling PDF conversion
 # poetry.lock is in .gitignore so we must regenerate it from pyproject.toml
-RUN poetry config virtualenvs.in-project true && poetry lock && poetry install --no-root --extras "privacy"
+# NOTE: PyTorch CPU-only via extra index URL to keep image size smaller
+RUN poetry config virtualenvs.in-project true && poetry lock && poetry install --no-root --extras "privacy" --extras "pdf"
 
 # Download spaCy language models for Presidio PII detection
 RUN poetry run python -m spacy download de_core_news_lg && \
     poetry run python -m spacy download en_core_web_lg
+
+# Pre-download Docling OCR models (avoids download on first request)
+RUN poetry run python -c "\
+from docling.document_converter import DocumentConverter; \
+from docling.datamodel.pipeline_options import PdfPipelineOptions; \
+from docling.datamodel.base_models import InputFormat; \
+from docling.document_converter import PdfFormatOption; \
+opts = PdfPipelineOptions(); \
+opts.generate_picture_images = True; \
+opts.do_ocr = True; \
+converter = DocumentConverter(format_options={InputFormat.PDF: PdfFormatOption(pipeline_options=opts)}); \
+print('Docling models downloaded successfully') \
+" || echo "WARNING: Docling model pre-download failed (will download on first use)"
 
 # Set ownership of entire app directory and claude home to claude user
 RUN chown -R claude:claude /app /home/claude

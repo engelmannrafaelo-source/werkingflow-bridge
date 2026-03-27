@@ -44,7 +44,8 @@ from src.models import (
     PrivacyMode,
     BackendInfo,
     SmartAnonymizeRequest,
-    SmartAnonymizeResponse
+    SmartAnonymizeResponse,
+    ConvertPdfResponse
 )
 from src.claude_cli import ClaudeCodeCLI, WorkerUnavailableError, RateLimitError, rate_limit_tracker
 from src.message_adapter import MessageAdapter
@@ -2736,6 +2737,174 @@ async def smart_anonymize_endpoint(request_body: SmartAnonymizeRequest):
         return SmartAnonymizeResponse(
             status="error",
             error=str(e)
+        )
+
+
+# ============================================================================
+# PDF Conversion Endpoint (Docling — Local, DSGVO-safe)
+# ============================================================================
+
+@app.post("/v1/convert-pdf", response_model=ConvertPdfResponse)
+async def convert_pdf_endpoint(
+    request: Request,
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(security)
+):
+    """
+    Convert PDF to Markdown + extract images using Docling.
+
+    Runs entirely on Bridge (Hetzner) — no external data transfer.
+    Accepts multipart/form-data with PDF file upload.
+
+    Max file size: 100 MB.
+    Returns: Markdown content + images as base64 dict.
+    """
+    await verify_api_key(request, credentials)
+
+    import base64
+    import tempfile
+    import time as _time
+
+    MAX_FILE_SIZE = 100 * 1024 * 1024  # 100 MB
+
+    try:
+        # --- Parse multipart form data ---
+        form = await request.form()
+        file = form.get("file")
+        if not file:
+            return ConvertPdfResponse(
+                status="error",
+                error="No file uploaded. Send PDF as multipart/form-data with field name 'file'."
+            )
+
+        # Validate file type
+        filename = getattr(file, "filename", "upload.pdf") or "upload.pdf"
+        if not filename.lower().endswith(".pdf"):
+            return ConvertPdfResponse(
+                status="error",
+                error=f"Invalid file type: {filename}. Only PDF files are accepted."
+            )
+
+        # Read file content
+        pdf_bytes = await file.read()
+        original_size = len(pdf_bytes)
+
+        if original_size == 0:
+            return ConvertPdfResponse(
+                status="error",
+                error="Uploaded file is empty."
+            )
+
+        if original_size > MAX_FILE_SIZE:
+            return ConvertPdfResponse(
+                status="error",
+                error=f"File too large: {original_size / 1024 / 1024:.1f} MB. Maximum: {MAX_FILE_SIZE / 1024 / 1024:.0f} MB."
+            )
+
+        logger.info(f"PDF conversion started: {filename} ({original_size / 1024:.1f} KB)")
+
+        # --- Docling conversion (runs in thread pool to avoid blocking) ---
+        t_start = _time.time()
+
+        def _convert_pdf():
+            """Synchronous Docling conversion — runs in executor."""
+            from docling.document_converter import DocumentConverter, PdfFormatOption
+            from docling.datamodel.pipeline_options import PdfPipelineOptions
+            from docling.datamodel.base_models import InputFormat
+            from docling_core.types.doc.base import ImageRefMode
+
+            # Configure pipeline: extract images!
+            pipeline_options = PdfPipelineOptions()
+            pipeline_options.generate_picture_images = True
+            pipeline_options.generate_table_images = False  # Tables as Markdown, not images
+            pipeline_options.do_ocr = True
+
+            converter = DocumentConverter(
+                format_options={
+                    InputFormat.PDF: PdfFormatOption(
+                        pipeline_options=pipeline_options,
+                    )
+                }
+            )
+
+            # Write PDF to temp file for Docling
+            with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp_pdf:
+                tmp_pdf.write(pdf_bytes)
+                tmp_pdf_path = tmp_pdf.name
+
+            try:
+                result = converter.convert(tmp_pdf_path)
+
+                # Save as Markdown with REFERENCED images (separate files)
+                with tempfile.TemporaryDirectory() as tmp_dir:
+                    md_path = os.path.join(tmp_dir, "output.md")
+                    result.document.save_as_markdown(
+                        md_path,
+                        image_mode=ImageRefMode.REFERENCED
+                    )
+
+                    # Read markdown
+                    with open(md_path, "r") as f:
+                        markdown = f.read()
+
+                    # Collect extracted images as base64
+                    images = {}
+                    artifacts_dir = os.path.join(tmp_dir, "output_artifacts")
+                    if os.path.exists(artifacts_dir):
+                        for img_name in os.listdir(artifacts_dir):
+                            if img_name.lower().endswith((".png", ".jpg", ".jpeg")):
+                                img_path = os.path.join(artifacts_dir, img_name)
+                                with open(img_path, "rb") as img_f:
+                                    images[img_name] = base64.b64encode(img_f.read()).decode("utf-8")
+
+                    # Fix image references in markdown: replace absolute paths with just filenames
+                    for img_name in images:
+                        markdown = markdown.replace(
+                            os.path.join(artifacts_dir, img_name),
+                            img_name
+                        )
+
+                    # Count pages
+                    page_count = len(result.document.pages) if hasattr(result.document, "pages") else None
+
+                    return markdown, images, page_count
+
+            finally:
+                os.unlink(tmp_pdf_path)
+
+        # Run in thread pool (Docling is CPU-bound)
+        loop = asyncio.get_event_loop()
+        markdown, images, page_count = await loop.run_in_executor(None, _convert_pdf)
+
+        conversion_time = _time.time() - t_start
+
+        logger.info(
+            f"PDF conversion complete: {filename} → "
+            f"{len(markdown)} chars, {len(images)} images, "
+            f"{conversion_time:.1f}s"
+        )
+
+        return ConvertPdfResponse(
+            status="success",
+            markdown=markdown,
+            images=images if images else None,
+            image_count=len(images),
+            pages=page_count,
+            original_size_bytes=original_size,
+            markdown_size_bytes=len(markdown.encode("utf-8")),
+            conversion_time_seconds=round(conversion_time, 2)
+        )
+
+    except ImportError as e:
+        logger.error(f"Docling not installed: {e}")
+        return ConvertPdfResponse(
+            status="error",
+            error="Docling is not installed on this Bridge instance. Rebuild Docker image with Docling dependency."
+        )
+    except Exception as e:
+        logger.error(f"PDF conversion failed: {e}", exc_info=True)
+        return ConvertPdfResponse(
+            status="error",
+            error=f"PDF conversion failed: {str(e)}"
         )
 
 
