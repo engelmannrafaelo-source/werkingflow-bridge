@@ -23,35 +23,31 @@ services:
       timeout: 5s
       retries: 3
     restart: unless-stopped
+    networks:
+      - bridge-net
 
   # =============================================================================
-  # Worker 1 - Account 1: rafael@engelmann.at
+  # Worker 1 - Account 1: rafael@engelmann.at (LIGHTWEIGHT — no Presidio/Docling)
   # =============================================================================
   worker1:
     build:
       context: ..
-      dockerfile: docker/Dockerfile
+      dockerfile: docker/Dockerfile.worker
     container_name: eco-wrapper-worker1
-
-    # Internal port only - accessed via nginx
     expose:
       - "8000"
-
     deploy:
       resources:
         limits:
-          memory: 4G
+          memory: 2G
         reservations:
-          memory: 1G
-
+          memory: 512M
     volumes:
       - eco-wrapper-logs:/app/logs
       - eco-wrapper-instances-shared:/app/instances
       - ~/eco-research-output:/app/research_output
-
     secrets:
       - claude_token_1
-
     environment:
       - CLAUDE_CODE_OAUTH_TOKEN_FILE=/run/secrets/claude_token_1
       - TZ=Europe/Vienna
@@ -70,43 +66,39 @@ services:
       - PRIVACY_LOG_DETECTIONS=false
       - SKIP_SDK_VERIFICATION=true
       - RATE_LIMIT_ENABLED=false
-
+      - PRIVACY_SERVICE_URL=http://privacy-service:8100
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
       interval: 30s
       timeout: 10s
       retries: 3
       start_period: 40s
-
     restart: unless-stopped
+    networks:
+      - bridge-net
 
   # =============================================================================
-  # Worker 2 - Account 3: office@data-energyneering.at
+  # Worker 2 - Account 3: office@data-energyneering.at (LIGHTWEIGHT)
   # =============================================================================
   worker2:
     build:
       context: ..
-      dockerfile: docker/Dockerfile
+      dockerfile: docker/Dockerfile.worker
     container_name: eco-wrapper-worker2
-
     expose:
       - "8000"
-
     deploy:
       resources:
         limits:
-          memory: 4G
+          memory: 2G
         reservations:
-          memory: 1G
-
+          memory: 512M
     volumes:
       - eco-wrapper-logs:/app/logs
       - eco-wrapper-instances-shared:/app/instances
       - ~/eco-research-output:/app/research_output
-
     secrets:
       - claude_token_2
-
     environment:
       - CLAUDE_CODE_OAUTH_TOKEN_FILE=/run/secrets/claude_token_2
       - TZ=Europe/Vienna
@@ -125,43 +117,39 @@ services:
       - PRIVACY_LOG_DETECTIONS=false
       - SKIP_SDK_VERIFICATION=true
       - RATE_LIMIT_ENABLED=false
-
+      - PRIVACY_SERVICE_URL=http://privacy-service:8100
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
       interval: 30s
       timeout: 10s
       retries: 3
       start_period: 40s
-
     restart: unless-stopped
+    networks:
+      - bridge-net
 
   # =============================================================================
-  # Worker 3 - Account 2: engelmann.rafaelo@gmail.com
+  # Worker 3 - Account 2: engelmann.rafaelo@gmail.com (LIGHTWEIGHT)
   # =============================================================================
   worker3:
     build:
       context: ..
-      dockerfile: docker/Dockerfile
+      dockerfile: docker/Dockerfile.worker
     container_name: eco-wrapper-worker3
-
     expose:
       - "8000"
-
     deploy:
       resources:
         limits:
-          memory: 4G
+          memory: 2G
         reservations:
-          memory: 1G
-
+          memory: 512M
     volumes:
       - eco-wrapper-logs:/app/logs
       - eco-wrapper-instances-shared:/app/instances
       - ~/eco-research-output:/app/research_output
-
     secrets:
       - claude_token_3
-
     environment:
       - CLAUDE_CODE_OAUTH_TOKEN_FILE=/run/secrets/claude_token_3
       - TZ=Europe/Vienna
@@ -180,28 +168,62 @@ services:
       - PRIVACY_LOG_DETECTIONS=false
       - SKIP_SDK_VERIFICATION=true
       - RATE_LIMIT_ENABLED=false
-
+      - PRIVACY_SERVICE_URL=http://privacy-service:8100
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
       interval: 30s
       timeout: 10s
       retries: 3
       start_period: 40s
-
     restart: unless-stopped
+    networks:
+      - bridge-net
 
-# =============================================================================
-# Volumes - Shared instance dir for all workers (session sync!)
-# =============================================================================
+  # =============================================================================
+  # Privacy + PDF Service (HEAVY — single instance, Presidio + spaCy + Docling)
+  # =============================================================================
+  privacy-service:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.privacy-pdf
+    container_name: eco-privacy-pdf-service
+    expose:
+      - "8100"
+    deploy:
+      resources:
+        limits:
+          memory: 6G
+        reservations:
+          memory: 2G
+    environment:
+      - TZ=Europe/Vienna
+      - LOG_LEVEL=INFO
+      - PRIVACY_ENABLED=true
+      - PRIVACY_LANGUAGE=de
+      - PRIVACY_LOG_DETECTIONS=false
+      # Smart-anonymize self-calls back to workers via nginx
+      - BRIDGE_SELF_URL=http://nginx:80/v1/chat/completions
+      - API_KEY=${API_KEY:-}
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8100/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    restart: unless-stopped
+    networks:
+      - bridge-net
+
+networks:
+  bridge-net:
+    driver: bridge
+
 volumes:
   eco-wrapper-logs:
     driver: local
   eco-wrapper-instances-shared:
     driver: local
 
-# =============================================================================
-# Secrets - 3 active tokens
-# =============================================================================
 secrets:
   claude_token_1:
     file: ../secrets/claude_token_account1.txt    # rafael@engelmann.at

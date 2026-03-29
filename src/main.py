@@ -62,7 +62,8 @@ from src.model_registry import (
 )
 from src.file_discovery import FileDiscoveryService
 from src.session_manager import session_manager
-from src.privacy import get_privacy_middleware
+# Privacy: Use lightweight HTTP client (no Presidio/spaCy in worker)
+from src.privacy_client import get_privacy_client
 from src.tenant import (
     TenantMiddleware,
     get_tenant_from_request,
@@ -811,19 +812,19 @@ async def generate_streaming_response(
         # Privacy: Anonymize user messages before sending to Claude
         # Uses tenant's privacy mode from request.state (set by TenantMiddleware)
         # OR backend_config's privacy_enabled if backend routing is active
-        privacy_middleware = get_privacy_middleware()
+        privacy_client = get_privacy_client()
         anonymization_mapping = {}
         privacy_mode = get_privacy_mode_from_request(fastapi_request) if fastapi_request else "full"
 
         # Backend routing can override privacy (e.g., Bedrock EU disables privacy automatically)
-        privacy_enabled = backend_config.privacy_enabled if backend_config else privacy_middleware.enabled
+        privacy_enabled = backend_config.privacy_enabled if backend_config else privacy_client.enabled
 
         if privacy_enabled:
             messages_for_anon = [
                 {'role': m.role, 'content': m.content}
                 for m in all_messages
             ]
-            anon_messages, anonymization_mapping = privacy_middleware.anonymize_messages(
+            anon_messages, anonymization_mapping = await privacy_client.anonymize_messages(
                 messages_for_anon,
                 privacy_mode=privacy_mode
             )
@@ -1032,7 +1033,7 @@ async def generate_streaming_response(
 
                         # Privacy: De-anonymize chunk with buffering (handles split placeholders)
                         if anonymization_mapping and filtered_text:
-                            filtered_text, deanon_buffer = privacy_middleware.deanonymize_streaming_chunk(
+                            filtered_text, deanon_buffer = privacy_client.deanonymize_streaming_chunk(
                                 filtered_text, deanon_buffer, anonymization_mapping
                             )
 
@@ -1057,7 +1058,7 @@ async def generate_streaming_response(
 
                     # Privacy: De-anonymize chunk with buffering (handles split placeholders)
                     if anonymization_mapping and filtered_content:
-                        filtered_content, deanon_buffer = privacy_middleware.deanonymize_streaming_chunk(
+                        filtered_content, deanon_buffer = privacy_client.deanonymize_streaming_chunk(
                             filtered_content, deanon_buffer, anonymization_mapping
                         )
 
@@ -1078,7 +1079,7 @@ async def generate_streaming_response(
 
         # Flush any remaining de-anonymization buffer at end of stream
         if anonymization_mapping and deanon_buffer:
-            flushed_content = privacy_middleware.flush_streaming_buffer(deanon_buffer, anonymization_mapping)
+            flushed_content = privacy_client.flush_streaming_buffer(deanon_buffer, anonymization_mapping)
             if flushed_content and not flushed_content.isspace():
                 flush_chunk = ChatCompletionStreamResponse(
                     id=request_id,
@@ -1598,19 +1599,19 @@ async def chat_completions(
             # Privacy: Anonymize user messages before sending to Claude
             # Uses tenant's privacy mode from request.state (set by TenantMiddleware)
             # OR backend_config's privacy_enabled if backend routing is active
-            privacy_middleware = get_privacy_middleware()
+            privacy_client = get_privacy_client()
             anonymization_mapping = {}
             privacy_mode = get_privacy_mode_from_request(request)
 
             # Backend routing can override privacy (e.g., Bedrock EU disables privacy automatically)
-            privacy_enabled = backend_config.privacy_enabled if backend_config else privacy_middleware.enabled
+            privacy_enabled = backend_config.privacy_enabled if backend_config else privacy_client.enabled
 
             if privacy_enabled:
                 messages_for_anon = [
                     {'role': m.role, 'content': m.content}
                     for m in all_messages
                 ]
-                anon_messages, anonymization_mapping = privacy_middleware.anonymize_messages(
+                anon_messages, anonymization_mapping = await privacy_client.anonymize_messages(
                     messages_for_anon,
                     privacy_mode=privacy_mode
                 )
@@ -1743,7 +1744,7 @@ async def chat_completions(
 
             # Privacy: De-anonymize response (restore original PII)
             if anonymization_mapping:
-                assistant_content = privacy_middleware.deanonymize_response(
+                assistant_content = privacy_client.deanonymize_response(
                     assistant_content, anonymization_mapping
                 )
                 logger.debug("Privacy: De-anonymized response content")
@@ -2687,51 +2688,34 @@ async def list_providers():
 
 @app.get("/v1/privacy/status")
 async def get_privacy_status():
-    """Get privacy middleware status and configuration."""
-    middleware = get_privacy_middleware()
+    """Get privacy service status. Proxies to privacy-pdf-service container."""
+    privacy_client = get_privacy_client()
+    try:
+        client = await privacy_client._get_client()
+        response = await client.get("/status")
+        response.raise_for_status()
+        service_status = response.json()
+    except Exception as e:
+        logger.warning(f"Privacy service unreachable: {e}")
+        service_status = {"enabled": False, "available": False, "error": str(e)}
 
-    return {
-        "privacy": {
-            "enabled": middleware.enabled,
-            "available": middleware.is_available() if middleware.enabled else False,
-            "language": middleware.language,
-            "log_detections": middleware.log_detections,
-            "supported_entities": middleware.anonymizer.SUPPORTED_ENTITIES if middleware.enabled else [],
-            "info": {
-                "description": "DSGVO-compliant PII anonymization using Microsoft Presidio",
-                "env_vars": {
-                    "PRIVACY_ENABLED": "Enable/disable privacy middleware (default: true)",
-                    "PRIVACY_LANGUAGE": "Default language for PII detection (default: de)",
-                    "PRIVACY_LOG_DETECTIONS": "Log detected entities (default: false)"
-                }
-            }
-        }
-    }
+    return {"privacy": service_status}
 
 
 @app.post("/v1/privacy/smart-anonymize")
 async def smart_anonymize_endpoint(request_body: SmartAnonymizeRequest):
-    """
-    Smart pseudonymization: Presidio detection + AI refinement.
-
-    Stage 1: Presidio detects all potential PII aggressively
-    Stage 2: Claude Haiku evaluates each entity — restores non-PII context
-    Result: Only real personal data stays anonymized
-
-    Works independently of PRIVACY_ENABLED (always available).
-    """
-    from src.privacy import smart_anonymize
-
+    """Smart pseudonymization. Proxied to privacy-pdf-service container."""
+    privacy_client = get_privacy_client()
     try:
-        result = await smart_anonymize(
-            text=request_body.text,
-            language=request_body.language or "de",
-            context_hint=request_body.context_hint,
-            prefix=request_body.prefix
-        )
-
-        return SmartAnonymizeResponse(**result)
-
+        client = await privacy_client._get_client()
+        response = await client.post("/smart-anonymize", json={
+            "text": request_body.text,
+            "language": request_body.language or "de",
+            "context_hint": request_body.context_hint,
+            "prefix": request_body.prefix,
+        }, timeout=120.0)  # Smart-anonymize involves AI call, needs longer timeout
+        response.raise_for_status()
+        return SmartAnonymizeResponse(**response.json())
     except Exception as e:
         logger.error(f"Smart anonymization failed: {e}", exc_info=True)
         return SmartAnonymizeResponse(
@@ -2741,7 +2725,7 @@ async def smart_anonymize_endpoint(request_body: SmartAnonymizeRequest):
 
 
 # ============================================================================
-# PDF Conversion Endpoint (Docling — Local, DSGVO-safe)
+# PDF Conversion Endpoint — Proxied to privacy-pdf-service (has Docling)
 # ============================================================================
 
 @app.post("/v1/convert-pdf", response_model=ConvertPdfResponse)
@@ -2749,25 +2733,10 @@ async def convert_pdf_endpoint(
     request: Request,
     credentials: Optional[HTTPAuthorizationCredentials] = Depends(security)
 ):
-    """
-    Convert PDF to Markdown + extract images using Docling.
-
-    Runs entirely on Bridge (Hetzner) — no external data transfer.
-    Accepts multipart/form-data with PDF file upload.
-
-    Max file size: 100 MB.
-    Returns: Markdown content + images as base64 dict.
-    """
+    """Convert PDF to Markdown. Proxied to privacy-pdf-service (has Docling)."""
     await verify_api_key(request, credentials)
 
-    import base64
-    import tempfile
-    import time as _time
-
-    MAX_FILE_SIZE = 100 * 1024 * 1024  # 100 MB
-
     try:
-        # --- Parse multipart form data ---
         form = await request.form()
         file = form.get("file")
         if not file:
@@ -2776,132 +2745,24 @@ async def convert_pdf_endpoint(
                 error="No file uploaded. Send PDF as multipart/form-data with field name 'file'."
             )
 
-        # Validate file type
         filename = getattr(file, "filename", "upload.pdf") or "upload.pdf"
-        if not filename.lower().endswith(".pdf"):
-            return ConvertPdfResponse(
-                status="error",
-                error=f"Invalid file type: {filename}. Only PDF files are accepted."
-            )
-
-        # Read file content
         pdf_bytes = await file.read()
-        original_size = len(pdf_bytes)
 
-        if original_size == 0:
-            return ConvertPdfResponse(
-                status="error",
-                error="Uploaded file is empty."
-            )
+        privacy_client = get_privacy_client()
+        client = await privacy_client._get_client()
 
-        if original_size > MAX_FILE_SIZE:
-            return ConvertPdfResponse(
-                status="error",
-                error=f"File too large: {original_size / 1024 / 1024:.1f} MB. Maximum: {MAX_FILE_SIZE / 1024 / 1024:.0f} MB."
-            )
-
-        logger.info(f"PDF conversion started: {filename} ({original_size / 1024:.1f} KB)")
-
-        # --- Docling conversion (runs in thread pool to avoid blocking) ---
-        t_start = _time.time()
-
-        def _convert_pdf():
-            """Synchronous Docling conversion — runs in executor."""
-            from docling.document_converter import DocumentConverter, PdfFormatOption
-            from docling.datamodel.pipeline_options import PdfPipelineOptions
-            from docling.datamodel.base_models import InputFormat
-            from docling_core.types.doc.base import ImageRefMode
-
-            # Configure pipeline: extract images!
-            pipeline_options = PdfPipelineOptions()
-            pipeline_options.generate_picture_images = True
-            pipeline_options.generate_table_images = False  # Tables as Markdown, not images
-            pipeline_options.do_ocr = True
-
-            converter = DocumentConverter(
-                format_options={
-                    InputFormat.PDF: PdfFormatOption(
-                        pipeline_options=pipeline_options,
-                    )
-                }
-            )
-
-            # Write PDF to temp file for Docling
-            with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp_pdf:
-                tmp_pdf.write(pdf_bytes)
-                tmp_pdf_path = tmp_pdf.name
-
-            try:
-                result = converter.convert(tmp_pdf_path)
-
-                # Save as Markdown with REFERENCED images (separate files)
-                with tempfile.TemporaryDirectory() as tmp_dir:
-                    md_path = os.path.join(tmp_dir, "output.md")
-                    result.document.save_as_markdown(
-                        md_path,
-                        image_mode=ImageRefMode.REFERENCED
-                    )
-
-                    # Read markdown
-                    with open(md_path, "r") as f:
-                        markdown = f.read()
-
-                    # Collect extracted images as base64
-                    images = {}
-                    artifacts_dir = os.path.join(tmp_dir, "output_artifacts")
-                    if os.path.exists(artifacts_dir):
-                        for img_name in os.listdir(artifacts_dir):
-                            if img_name.lower().endswith((".png", ".jpg", ".jpeg")):
-                                img_path = os.path.join(artifacts_dir, img_name)
-                                with open(img_path, "rb") as img_f:
-                                    images[img_name] = base64.b64encode(img_f.read()).decode("utf-8")
-
-                    # Fix image references in markdown: replace absolute paths with just filenames
-                    for img_name in images:
-                        markdown = markdown.replace(
-                            os.path.join(artifacts_dir, img_name),
-                            img_name
-                        )
-
-                    # Count pages
-                    page_count = len(result.document.pages) if hasattr(result.document, "pages") else None
-
-                    return markdown, images, page_count
-
-            finally:
-                os.unlink(tmp_pdf_path)
-
-        # Run in thread pool (Docling is CPU-bound)
-        loop = asyncio.get_event_loop()
-        markdown, images, page_count = await loop.run_in_executor(None, _convert_pdf)
-
-        conversion_time = _time.time() - t_start
-
-        logger.info(
-            f"PDF conversion complete: {filename} → "
-            f"{len(markdown)} chars, {len(images)} images, "
-            f"{conversion_time:.1f}s"
+        # Forward as multipart to privacy-pdf-service
+        response = await client.post(
+            "/convert-pdf",
+            files={"file": (filename, pdf_bytes, "application/pdf")},
+            timeout=300.0,  # PDF conversion can take a while
         )
+        response.raise_for_status()
+        data = response.json()
+        return ConvertPdfResponse(**data)
 
-        return ConvertPdfResponse(
-            status="success",
-            markdown=markdown,
-            images=images if images else None,
-            image_count=len(images),
-            pages=page_count,
-            original_size_bytes=original_size,
-            markdown_size_bytes=len(markdown.encode("utf-8")),
-            conversion_time_seconds=round(conversion_time, 2)
-        )
-
-    except ImportError as e:
-        logger.error(f"Docling not installed: {e}")
-        return ConvertPdfResponse(
-            status="error",
-            error="Docling is not installed on this Bridge instance. Rebuild Docker image with Docling dependency."
-        )
     except Exception as e:
-        logger.error(f"PDF conversion failed: {e}", exc_info=True)
+        logger.error(f"PDF conversion proxy failed: {e}", exc_info=True)
         return ConvertPdfResponse(
             status="error",
             error=f"PDF conversion failed: {str(e)}"

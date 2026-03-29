@@ -1,0 +1,60 @@
+FROM python:3.12-slim
+
+# System deps for Docling (OpenCV, image processing)
+RUN apt-get update && apt-get install -y \
+    curl \
+    libgl1 \
+    libglib2.0-0 \
+    && rm -rf /var/lib/apt/lists/*
+
+# Create non-root user
+RUN useradd -m -u 1001 -s /bin/bash claude
+
+# Install Poetry
+RUN curl -sSL https://install.python-poetry.org | POETRY_HOME=/usr/local python3 -
+
+ENV PATH="/usr/local/bin:${PATH}"
+
+# NOTE: No Node.js, no Claude Code CLI — this service has no SDK calls
+
+# Copy the app code
+COPY . /app
+
+WORKDIR /app
+
+# Create directories
+RUN mkdir -p /app/logs
+
+# Install Python deps WITH privacy + pdf extras
+RUN poetry config virtualenvs.in-project true && \
+    poetry lock && \
+    poetry install --no-root --extras "privacy" --extras "pdf"
+
+# Download spaCy language models for Presidio PII detection
+RUN poetry run python -m spacy download de_core_news_lg && \
+    poetry run python -m spacy download en_core_web_lg
+
+# Pre-download Docling OCR models (avoids download on first request)
+RUN poetry run python -c "\
+from docling.document_converter import DocumentConverter; \
+from docling.datamodel.pipeline_options import PdfPipelineOptions; \
+from docling.datamodel.base_models import InputFormat; \
+from docling.document_converter import PdfFormatOption; \
+opts = PdfPipelineOptions(); \
+opts.generate_picture_images = True; \
+opts.do_ocr = True; \
+converter = DocumentConverter(format_options={InputFormat.PDF: PdfFormatOption(pipeline_options=opts)}); \
+print('Docling models downloaded successfully') \
+" || echo "WARNING: Docling model pre-download failed (will download on first use)"
+
+# Set ownership
+RUN chown -R claude:claude /app /home/claude
+
+USER claude
+
+EXPOSE 8100
+
+HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
+  CMD curl -f http://localhost:8100/health || exit 1
+
+CMD ["poetry", "run", "uvicorn", "src.privacy_service.app:app", "--host", "0.0.0.0", "--port", "8100"]

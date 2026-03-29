@@ -1,0 +1,55 @@
+FROM python:3.12-slim
+
+# System deps: Node.js + gosu only (NO libgl1/libglib for Docling)
+RUN apt-get update && apt-get install -y \
+    curl \
+    nodejs \
+    npm \
+    gosu \
+    && rm -rf /var/lib/apt/lists/*
+
+# Create non-root user for Claude Code (required for bypassPermissions)
+RUN useradd -m -u 1001 -s /bin/bash claude
+
+# Install Poetry globally
+RUN curl -sSL https://install.python-poetry.org | POETRY_HOME=/usr/local python3 -
+
+ENV PATH="/usr/local/bin:${PATH}"
+
+# Install Claude Code CLI globally (for SDK compatibility)
+RUN npm install -g @anthropic-ai/claude-code
+
+# Copy the app code
+COPY . /app
+
+WORKDIR /app
+
+# Copy SuperClaude Framework plugins and commands for claude user (if available)
+RUN mkdir -p /home/claude/.claude/plugins /home/claude/.claude/commands
+
+# Copy container-specific MCP config for claude user
+COPY config/docker-claude.json /home/claude/.claude.json
+
+# Create directories for volumes
+RUN mkdir -p /app/logs /app/instances
+
+# Install Python deps WITHOUT privacy/pdf extras (core only — lightweight!)
+# NO spaCy, NO Presidio, NO Docling, NO PyTorch
+RUN poetry config virtualenvs.in-project true && poetry lock && poetry install --no-root
+
+# Set ownership
+RUN chown -R claude:claude /app /home/claude
+
+# Copy and set up entrypoint script
+COPY docker/docker-entrypoint.sh /usr/local/bin/
+RUN chmod +x /usr/local/bin/docker-entrypoint.sh
+
+# Container starts as root to fix volume permissions, then drops to claude user
+ENTRYPOINT ["docker-entrypoint.sh"]
+
+EXPOSE 8000
+
+HEALTHCHECK --interval=30s --timeout=10s --start-period=40s --retries=3 \
+  CMD curl -f http://localhost:8000/health || exit 1
+
+CMD ["poetry", "run", "uvicorn", "src.main:app", "--host", "0.0.0.0", "--port", "8000"]

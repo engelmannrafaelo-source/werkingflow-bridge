@@ -28,7 +28,9 @@ logger = logging.getLogger(__name__)
 
 # Refinement uses the Bridge's own OpenAI-compatible endpoint (OAuth, free)
 # NOT the direct Anthropic API (paid, requires ANTHROPIC_API_KEY)
-BRIDGE_SELF_URL = "http://localhost:8000/v1/chat/completions"
+# When running in privacy-service container, localhost:8000 won't work.
+# Use BRIDGE_SELF_URL env var to point to nginx LB.
+BRIDGE_SELF_URL = os.getenv("BRIDGE_SELF_URL", "http://localhost:8000/v1/chat/completions")
 HAIKU_MODEL = "claude-haiku-4-5-20251001"
 
 
