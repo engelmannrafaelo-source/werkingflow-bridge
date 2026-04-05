@@ -17,6 +17,7 @@ services:
       - worker1
       - worker2
       - worker3
+      - worker4
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:80/health"]
       interval: 30s
@@ -61,6 +62,7 @@ services:
       - CLAUDE_PERMISSION_MODE=bypassPermissions
       - TAVILY_API_KEY=${TAVILY_API_KEY}
       - ANTHROPIC_VISION_API_KEY=${ANTHROPIC_API_KEY}
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
       - PRIVACY_ENABLED=true
       - PRIVACY_LANGUAGE=de
       - PRIVACY_LOG_DETECTIONS=false
@@ -112,6 +114,7 @@ services:
       - CLAUDE_PERMISSION_MODE=bypassPermissions
       - TAVILY_API_KEY=${TAVILY_API_KEY}
       - ANTHROPIC_VISION_API_KEY=${ANTHROPIC_API_KEY}
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
       - PRIVACY_ENABLED=true
       - PRIVACY_LANGUAGE=de
       - PRIVACY_LOG_DETECTIONS=false
@@ -163,6 +166,59 @@ services:
       - CLAUDE_PERMISSION_MODE=bypassPermissions
       - TAVILY_API_KEY=${TAVILY_API_KEY}
       - ANTHROPIC_VISION_API_KEY=${ANTHROPIC_API_KEY}
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - PRIVACY_ENABLED=true
+      - PRIVACY_LANGUAGE=de
+      - PRIVACY_LOG_DETECTIONS=false
+      - SKIP_SDK_VERIFICATION=true
+      - RATE_LIMIT_ENABLED=false
+      - PRIVACY_SERVICE_URL=http://privacy-service:8100
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    restart: unless-stopped
+    networks:
+      - bridge-net
+
+  # =============================================================================
+  # Worker 4 - Account 4: werkingflow account (LIGHTWEIGHT)
+  # =============================================================================
+  worker4:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.worker
+    container_name: eco-wrapper-worker4
+    expose:
+      - "8000"
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+        reservations:
+          memory: 512M
+    volumes:
+      - eco-wrapper-logs:/app/logs
+      - eco-wrapper-instances-shared:/app/instances
+      - ~/eco-research-output:/app/research_output
+    secrets:
+      - claude_token_4
+    environment:
+      - CLAUDE_CODE_OAUTH_TOKEN_FILE=/run/secrets/claude_token_4
+      - TZ=Europe/Vienna
+      - LOG_LEVEL=INFO
+      - LOG_TO_FILE=true
+      - FILTER_SENSITIVE_DATA=true
+      - INSTANCE_NAME=worker4
+      - CLAUDE_CWD=/app/instances
+      - DISABLE_COACH_MCP=true
+      - MAX_TIMEOUT=2400000
+      - CLAUDE_PERMISSION_MODE=bypassPermissions
+      - TAVILY_API_KEY=${TAVILY_API_KEY}
+      - ANTHROPIC_VISION_API_KEY=${ANTHROPIC_API_KEY}
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
       - PRIVACY_ENABLED=true
       - PRIVACY_LANGUAGE=de
       - PRIVACY_LOG_DETECTIONS=false
@@ -231,3 +287,5 @@ secrets:
     file: ../secrets/claude_token_account3.txt    # office@data-energyneering.at
   claude_token_3:
     file: ../secrets/claude_token_account2.txt    # engelmann.rafaelo@gmail.com
+  claude_token_4:
+    file: ../secrets/claude_token.txt             # werkingflow account
