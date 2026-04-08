@@ -189,6 +189,58 @@ class RequestLimiterMiddleware(BaseHTTPMiddleware):
             await self.limiter.release()
 
 
+class PureASGIRequestLimiter:
+    """
+    Pure ASGI middleware for concurrent request limiting.
+    Compatible with Python 3.13 + Starlette 0.46 (no BaseHTTPMiddleware issues).
+
+    Usage:
+        app.add_middleware(PureASGIRequestLimiter, max_concurrent=5, memory_threshold=90.0)
+    """
+
+    def __init__(self, app, max_concurrent: int = 5, memory_threshold: float = 90.0):
+        self.app = app
+        self.limiter = get_limiter(max_concurrent=max_concurrent, memory_threshold=memory_threshold)
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] not in ("http", "websocket"):
+            await self.app(scope, receive, send)
+            return
+
+        path = scope.get("path", "")
+        if path in ["/health", "/metrics", "/stats", "/lb-status"]:
+            await self.app(scope, receive, send)
+            return
+
+        can_accept, reason = await self.limiter.can_accept_request()
+        if not can_accept:
+            import json as _json
+            body = _json.dumps({
+                "error": "Bridge overloaded — too many concurrent requests",
+                "reason": reason,
+                "retry_after_seconds": 15,
+                "worker": WORKER_NAME,
+                "stats": self.limiter.get_stats(),
+            }).encode()
+            await send({
+                "type": "http.response.start",
+                "status": 503,
+                "headers": [
+                    [b"content-type", b"application/json"],
+                    [b"retry-after", b"15"],
+                    [b"content-length", str(len(body)).encode()],
+                ],
+            })
+            await send({"type": "http.response.body", "body": body})
+            return
+
+        await self.limiter.acquire()
+        try:
+            await self.app(scope, receive, send)
+        finally:
+            await self.limiter.release()
+
+
 # Global limiter instance
 limiter: Optional[RequestLimiter] = None
 

@@ -106,7 +106,7 @@ except ImportError:
         return decorator
 
 # Request limiting for memory protection
-from src.request_limiter import get_limiter, RequestLimiterMiddleware, concurrency_limit
+from src.request_limiter import get_limiter, RequestLimiterMiddleware, PureASGIRequestLimiter, concurrency_limit
 
 # Configure centralized logging
 # Backwards compatibility: Support DEBUG_MODE/VERBOSE for log level override
