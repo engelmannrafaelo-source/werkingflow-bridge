@@ -260,6 +260,7 @@ services:
       # Smart-anonymize self-calls back to workers via nginx
       - BRIDGE_SELF_URL=http://nginx:80/v1/chat/completions
       - API_KEY=${API_KEY:-}
+      - CONVERTAPI_SECRET=${CONVERTAPI_SECRET}
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8100/health"]
       interval: 30s

@@ -74,6 +74,27 @@ class ConvertSemanticHtmlResponse(BaseModel):
 
 app = FastAPI(title="Privacy & PDF Service", version="1.0.0")
 
+# Active request counter for graceful shutdown
+_active_requests = 0
+_active_requests_lock = asyncio.Lock()
+
+
+@app.middleware("http")
+async def track_active_requests(request: Request, call_next):
+    global _active_requests
+    if request.url.path not in ("/health", "/ready", "/status"):
+        async with _active_requests_lock:
+            _active_requests += 1
+        try:
+            response = await call_next(request)
+            return response
+        finally:
+            async with _active_requests_lock:
+                _active_requests -= 1
+    else:
+        return await call_next(request)
+
+
 # Lazy-initialized middleware singleton
 _privacy_middleware = None
 
@@ -662,6 +683,16 @@ async def convert_semantic_html_endpoint(req: ConvertSemanticHtmlRequest):
 async def health():
     return {
         "status": "healthy",
+        "service": "privacy-pdf-service",
+    }
+
+
+@app.get("/ready")
+async def ready():
+    """Readiness endpoint for graceful rebuild. Returns active request count."""
+    return {
+        "ready_for_shutdown": _active_requests == 0,
+        "active_requests": _active_requests,
         "service": "privacy-pdf-service",
     }
 

@@ -2490,6 +2490,18 @@ async def get_rate_limits(request: Request):
     }
 
 
+@app.get("/ready")
+async def ready_check(request: Request):
+    """Readiness endpoint for graceful rebuild. Returns active request count."""
+    stats = request_limiter.get_stats()
+    return {
+        "ready_for_shutdown": stats['active_requests'] == 0,
+        "active_requests": stats['active_requests'],
+        "service": "claude-code-openai-wrapper",
+        "worker": os.getenv("INSTANCE_NAME", "unknown"),
+    }
+
+
 @app.get("/stats")
 async def get_stats(request: Request):
     """Get wrapper statistics including request limiting and memory usage."""
