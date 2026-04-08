@@ -279,9 +279,10 @@ async def convert_pdf_service_endpoint(request: Request):
 
 # ======================== Semantic HTML Conversion ========================
 
-# Same pattern as smart_anonymizer.py: use Bridge's own chat-completions endpoint
-BRIDGE_SELF_URL = os.getenv("BRIDGE_SELF_URL", "http://localhost:8000/v1/chat/completions")
+# Direct Anthropic API — bypasses Bridge workers to avoid rate-limit contention
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 HAIKU_MODEL = "claude-haiku-4-5-20251001"
+ANTHROPIC_API_URL = "https://api.anthropic.com/v1/messages"
 
 SEMANTIC_CONVERTER_SYSTEM_PROMPT = """# HTML-Strukturkonverter fuer Dokumenten-Templates
 
@@ -400,41 +401,51 @@ def _strip_markdown_fences(text: str) -> str:
 
 
 async def _call_ai_for_conversion(html_chunk: str, max_retries: int = 4) -> str:
-    """Call Bridge chat-completions for one HTML chunk with retry on failure."""
+    """Call Anthropic API directly for HTML conversion (bypasses Bridge workers)."""
     import asyncio
     import httpx
+
+    if not ANTHROPIC_API_KEY:
+        raise RuntimeError("ANTHROPIC_API_KEY not set — required for semantic HTML conversion")
 
     request_body = {
         "model": HAIKU_MODEL,
         "max_tokens": 16000,
+        "system": SEMANTIC_CONVERTER_SYSTEM_PROMPT,
         "messages": [
-            {"role": "system", "content": SEMANTIC_CONVERTER_SYSTEM_PROMPT},
             {"role": "user", "content": html_chunk},
         ],
     }
 
-    headers = {"Content-Type": "application/json"}
-    api_key = os.getenv("AI_BRIDGE_API_KEY", "")
-    if api_key:
-        headers["Authorization"] = f"Bearer {api_key}"
+    headers = {
+        "Content-Type": "application/json",
+        "x-api-key": ANTHROPIC_API_KEY,
+        "anthropic-version": "2023-06-01",
+    }
 
     last_error = None
     for attempt in range(max_retries):
         try:
             async with httpx.AsyncClient(timeout=300.0) as client:
-                response = await client.post(BRIDGE_SELF_URL, headers=headers, json=request_body)
+                response = await client.post(ANTHROPIC_API_URL, headers=headers, json=request_body)
 
             if response.status_code == 200:
                 result = response.json()
-                content = result.get("choices", [{}])[0].get("message", {}).get("content", "")
+                content = result.get("content", [{}])[0].get("text", "")
                 return _strip_markdown_fences(content)
 
-            last_error = f"AI Bridge returned {response.status_code}: {response.text[:300]}"
+            if response.status_code == 429:
+                retry_after = int(response.headers.get("retry-after", 30))
+                logger.warning(f"[SemanticConverter] Rate limited, waiting {retry_after}s")
+                await asyncio.sleep(retry_after)
+                continue
+
+            last_error = f"Anthropic API returned {response.status_code}: {response.text[:300]}"
             logger.warning(
                 f"[SemanticConverter] AI call failed (attempt {attempt + 1}/{max_retries}): {last_error}"
             )
         except (httpx.TimeoutException, httpx.ConnectError, httpx.RemoteProtocolError) as e:
-            last_error = f"AI Bridge connection error: {e}"
+            last_error = f"Anthropic API connection error: {e}"
             logger.warning(
                 f"[SemanticConverter] AI call failed (attempt {attempt + 1}/{max_retries}): {last_error}"
             )
@@ -481,12 +492,15 @@ async def _convert_pixel_to_semantic_html(pixel_html: str) -> Tuple[str, int, bo
     else:
         pages = [small_html]
 
-    # Step 3: Convert via AI (per page or whole)
-    converted_parts = []
-    for i, page_html in enumerate(pages):
+    # Step 3: Convert via AI (parallel per page)
+    import asyncio
+
+    async def _convert_page(i: int, page_html: str) -> str:
         logger.info(f"[SemanticConverter] Processing page {i + 1}/{len(pages)} ({len(page_html) / 1024:.0f} KB)")
-        result = await _call_ai_for_conversion(page_html)
-        converted_parts.append(result)
+        return await _call_ai_for_conversion(page_html)
+
+    tasks = [_convert_page(i, ph) for i, ph in enumerate(pages)]
+    converted_parts = list(await asyncio.gather(*tasks))
 
     semantic_html = "\n".join(converted_parts)
 
