@@ -7,13 +7,14 @@ Internal-only: not exposed to nginx/public internet.
 """
 
 import os
+import re
 import json
 import asyncio
 import logging
 import base64
 import tempfile
 import time as _time
-from typing import Dict, List, Optional, Any
+from typing import Dict, List, Optional, Any, Tuple
 
 from pydantic import BaseModel, Field
 from fastapi import FastAPI, Request
@@ -56,6 +57,17 @@ class StatusResponse(BaseModel):
     available: bool
     language: str
     supported_entities: List[str]
+
+
+class ConvertSemanticHtmlRequest(BaseModel):
+    html: str
+
+
+class ConvertSemanticHtmlResponse(BaseModel):
+    status: str
+    html: str
+    pages: int
+    converted: bool
 
 
 # ======================== App Setup ========================
@@ -242,6 +254,240 @@ async def convert_pdf_service_endpoint(request: Request):
     except Exception as e:
         logger.error(f"PDF conversion failed: {e}", exc_info=True)
         return {"status": "error", "error": f"PDF conversion failed: {str(e)}"}
+
+
+# ======================== Semantic HTML Conversion ========================
+
+# Same pattern as smart_anonymizer.py: use Bridge's own chat-completions endpoint
+BRIDGE_SELF_URL = os.getenv("BRIDGE_SELF_URL", "http://localhost:8000/v1/chat/completions")
+HAIKU_MODEL = "claude-haiku-4-5-20251001"
+
+SEMANTIC_CONVERTER_SYSTEM_PROMPT = """# HTML-Strukturkonverter fuer Dokumenten-Templates
+
+## Kontext
+
+Du erhaeltst HTML aus einer automatischen PDF-zu-HTML-Konvertierung. Dieses HTML verwendet
+absolute Positionierung (position: absolute, left/top in rem) fuer jedes Element. Die visuelle
+Darstellung ist pixelperfekt, aber die Struktur ist flach — alle Elemente liegen als Geschwister
+in einem page-Container.
+
+Das HTML enthaelt mehrere <div class="page">-Bloecke. Jede Seite hat dieselbe Grundstruktur.
+
+## Aufgabe
+
+Wandle dieses pixel-positionierte HTML in semantisches HTML mit CSS Flexbox um. Das Ergebnis
+soll die gleiche visuelle Struktur ausdruecken, aber mit logischer DOM-Hierarchie statt absoluter
+Koordinaten.
+
+## Zonen-Erkennung ueber Y-Koordinaten
+
+Die top-Werte in rem verraten die Dokumentzonen:
+- Elemente mit top < 15rem gehoeren zum Seitenkopf (Logo, Firmeninfo, Kontaktdaten)
+- Elemente mit top zwischen 15rem und 73rem gehoeren zum Hauptinhalt
+- Elemente mit top > 73rem gehoeren zur Fusszeile
+
+Innerhalb jeder Zone:
+- Elemente mit aehnlichem top-Wert (Differenz < 3rem) stehen nebeneinander → flexbox row
+- Elemente mit aufsteigendem top-Wert stehen untereinander → normaler Fluss
+
+## CSS-Klassen als semantische Hinweise
+
+Die bestehenden CSS-Klassen zeigen die Textart:
+- .title → Hauptueberschrift (wird h1)
+- .heading-1 → Kapitelueberschrift (wird h2)
+- .heading-2 → Unterueberschrift (wird h3)
+- .body-text → Fliesstext (wird p)
+- .list-paragraph → Listenpunkt (wird li in ul/ol)
+- .table-paragraph → Tabellentext
+- .textbox → Umrandeter Bereich (wird div mit border)
+
+## Ausgabe-Format
+
+Ein HTML-Fragment bestehend aus:
+1. Ein <style>-Tag mit allen CSS-Regeln (Flexbox, keine absolute Positionierung)
+2. Pro Seite ein <div class="page">
+3. Innerhalb jeder Seite: <header>, <main>, <footer> Bereiche
+4. Semantische Tags: h1, h2, h3, p, table, ul, ol, figure
+
+## Erhaltung
+
+- Bild-Platzhalter wie src="{{IMG_0}}" muessen 1:1 erhalten bleiben (werden spaeter durch echte Bilder ersetzt)
+- Alle SVG-Elemente 1:1 erhalten (koennen in header oder footer als Deko-Grafik stehen)
+- Farben, Schriftarten und Schriftgroessen aus dem CSS-Block und inline-Styles uebernehmen
+- Text-Inhalte 1:1 uebernehmen, auch gekuerzte Texte mit "[...]"
+- Kein <!DOCTYPE>, <html>, <head>, <body> — nur <style> + <div class="page">-Bloecke
+
+Antworte ausschliesslich mit dem konvertierten HTML. Keine Erklaerungen, kein Markdown."""
+
+PAGE_SPLIT_PATTERN = re.compile(r'(<div\s+class="page"[^>]*>)', re.IGNORECASE)
+BASE64_SRC_PATTERN = re.compile(r'src="(data:image/[^"]+)"')
+IMG_PLACEHOLDER_PATTERN = re.compile(r'\{\{IMG_\d+\}\}')
+PAGE_SIZE_THRESHOLD = 100 * 1024  # 100 KB
+
+
+def _replace_base64_with_placeholders(html: str) -> Tuple[str, List[Tuple[str, str]]]:
+    """Replace base64 data:-URLs with {{IMG_N}} placeholders to reduce size for AI."""
+    placeholders: List[Tuple[str, str]] = []
+    index = 0
+
+    def replacer(match: re.Match) -> str:
+        nonlocal index
+        data_uri = match.group(1)
+        placeholder = f"{{{{IMG_{index}}}}}"
+        placeholders.append((placeholder, data_uri))
+        index += 1
+        return f'src="{placeholder}"'
+
+    result = BASE64_SRC_PATTERN.sub(replacer, html)
+    return result, placeholders
+
+
+def _restore_placeholders(html: str, placeholders: List[Tuple[str, str]]) -> str:
+    """Restore {{IMG_N}} placeholders back to original base64 data:-URLs."""
+    result = html
+    for placeholder, original_src in placeholders:
+        result = result.replace(placeholder, original_src)
+    return result
+
+
+def _split_pages(html: str) -> List[str]:
+    """Split HTML into per-page chunks at <div class="page"> boundaries."""
+    parts = PAGE_SPLIT_PATTERN.split(html)
+    if len(parts) <= 1:
+        return [html]
+
+    # parts[0] = preamble (style block etc.), parts[1] = first <div class="page">, parts[2] = content, ...
+    preamble = parts[0]
+    pages = []
+    for i in range(1, len(parts), 2):
+        tag = parts[i]
+        content = parts[i + 1] if i + 1 < len(parts) else ""
+        pages.append(preamble + tag + content)
+    return pages
+
+
+def _strip_markdown_fences(text: str) -> str:
+    """Remove markdown code fences if AI wrapped output."""
+    text = text.strip()
+    if text.startswith("```html"):
+        text = text[7:]
+    elif text.startswith("```"):
+        text = text[3:]
+    if text.endswith("```"):
+        text = text[:-3]
+    return text.strip()
+
+
+async def _call_ai_for_conversion(html_chunk: str) -> str:
+    """Call Bridge chat-completions for one HTML chunk."""
+    import httpx
+
+    request_body = {
+        "model": HAIKU_MODEL,
+        "max_tokens": 16000,
+        "messages": [
+            {"role": "system", "content": SEMANTIC_CONVERTER_SYSTEM_PROMPT},
+            {"role": "user", "content": html_chunk},
+        ],
+    }
+
+    headers = {"Content-Type": "application/json"}
+    api_key = os.getenv("AI_BRIDGE_API_KEY", "")
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+
+    async with httpx.AsyncClient(timeout=120.0) as client:
+        response = await client.post(BRIDGE_SELF_URL, headers=headers, json=request_body)
+
+    if response.status_code != 200:
+        raise RuntimeError(
+            f"AI Bridge returned {response.status_code}: {response.text[:300]}"
+        )
+
+    result = response.json()
+    content = result.get("choices", [{}])[0].get("message", {}).get("content", "")
+    return _strip_markdown_fences(content)
+
+
+@app.post("/convert-semantic-html", response_model=ConvertSemanticHtmlResponse)
+async def convert_semantic_html_endpoint(req: ConvertSemanticHtmlRequest):
+    """Convert pixel-positioned HTML (from ConvertAPI PDF→HTML) to semantic Flexbox HTML.
+
+    Port of SemanticHtmlConverter.ts logic:
+    1. Replace base64 images with {{IMG_N}} placeholders
+    2. If HTML > 100KB, split by <div class="page"> and process per-page
+    3. Send to AI (Haiku 4.5) for structural transformation
+    4. Restore image placeholders
+    5. Validate output
+    """
+    pixel_html = req.html
+
+    # Skip if already semantic (few absolute positions)
+    absolute_count = len(re.findall(r'position:\s*absolute', pixel_html))
+    if absolute_count < 5:
+        logger.info(
+            f"[SemanticConverter] Already semantic ({absolute_count} absolute positions), skipping"
+        )
+        return ConvertSemanticHtmlResponse(
+            status="success", html=pixel_html, pages=1, converted=False
+        )
+
+    logger.info(
+        f"[SemanticConverter] Converting pixel HTML "
+        f"({len(pixel_html) / 1024:.0f} KB, {absolute_count} absolute positions)"
+    )
+    t0 = _time.time()
+
+    # Step 1: Replace base64 images with placeholders
+    small_html, placeholders = _replace_base64_with_placeholders(pixel_html)
+    logger.info(
+        f"[SemanticConverter] {len(placeholders)} images replaced "
+        f"({len(pixel_html) / 1024:.0f} KB → {len(small_html) / 1024:.0f} KB)"
+    )
+
+    # Step 2: Split into pages if too large
+    if len(small_html) > PAGE_SIZE_THRESHOLD:
+        pages = _split_pages(small_html)
+        logger.info(f"[SemanticConverter] Large HTML, processing {len(pages)} pages separately")
+    else:
+        pages = [small_html]
+
+    # Step 3: Convert via AI (per page or whole)
+    converted_parts = []
+    for i, page_html in enumerate(pages):
+        logger.info(f"[SemanticConverter] Processing page {i + 1}/{len(pages)} ({len(page_html) / 1024:.0f} KB)")
+        result = await _call_ai_for_conversion(page_html)
+        converted_parts.append(result)
+
+    semantic_html = "\n".join(converted_parts)
+
+    # Step 4: Restore placeholders
+    semantic_html = _restore_placeholders(semantic_html, placeholders)
+
+    # Step 5: Validate
+    if "<style" not in semantic_html or len(semantic_html) < 500:
+        raise RuntimeError(
+            f"Conversion output invalid ({len(semantic_html)} chars, "
+            f"has <style>: {'<style' in semantic_html})"
+        )
+
+    remaining = len(IMG_PLACEHOLDER_PATTERN.findall(semantic_html))
+    if remaining > 0:
+        raise RuntimeError(f"{remaining} image placeholders not restored in output")
+
+    duration = _time.time() - t0
+    logger.info(
+        f"[SemanticConverter] Done: {len(pixel_html) / 1024:.0f} KB → "
+        f"{len(semantic_html) / 1024:.0f} KB ({duration:.1f}s, "
+        f"{len(placeholders)} images restored, {len(pages)} pages)"
+    )
+
+    return ConvertSemanticHtmlResponse(
+        status="success",
+        html=semantic_html,
+        pages=len(pages),
+        converted=True,
+    )
 
 
 # ======================== Health & Status ========================
