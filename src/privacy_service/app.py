@@ -17,7 +17,7 @@ import time as _time
 from typing import Dict, List, Optional, Any, Tuple
 
 from pydantic import BaseModel, Field
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, UploadFile, File
 from fastapi.responses import JSONResponse
 
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
@@ -409,28 +409,19 @@ async def _call_ai_for_conversion(html_chunk: str) -> str:
     return _strip_markdown_fences(content)
 
 
-@app.post("/convert-semantic-html", response_model=ConvertSemanticHtmlResponse)
-async def convert_semantic_html_endpoint(req: ConvertSemanticHtmlRequest):
-    """Convert pixel-positioned HTML (from ConvertAPI PDF→HTML) to semantic Flexbox HTML.
+async def _convert_pixel_to_semantic_html(pixel_html: str) -> Tuple[str, int, bool]:
+    """Internal: convert pixel-positioned HTML to semantic Flexbox HTML.
 
-    Port of SemanticHtmlConverter.ts logic:
-    1. Replace base64 images with {{IMG_N}} placeholders
-    2. If HTML > 100KB, split by <div class="page"> and process per-page
-    3. Send to AI (Haiku 4.5) for structural transformation
-    4. Restore image placeholders
-    5. Validate output
+    Returns (semantic_html, page_count, converted).
+    Reused by /convert-semantic-html and /convert-pdf-to-semantic-html.
     """
-    pixel_html = req.html
-
     # Skip if already semantic (few absolute positions)
     absolute_count = len(re.findall(r'position:\s*absolute', pixel_html))
     if absolute_count < 5:
         logger.info(
             f"[SemanticConverter] Already semantic ({absolute_count} absolute positions), skipping"
         )
-        return ConvertSemanticHtmlResponse(
-            status="success", html=pixel_html, pages=1, converted=False
-        )
+        return pixel_html, 1, False
 
     logger.info(
         f"[SemanticConverter] Converting pixel HTML "
@@ -482,11 +473,186 @@ async def convert_semantic_html_endpoint(req: ConvertSemanticHtmlRequest):
         f"{len(placeholders)} images restored, {len(pages)} pages)"
     )
 
+    return semantic_html, len(pages), True
+
+
+FINAL_IMAGE_PATTERN = re.compile(r'src="(data:image/(png|jpeg|gif|svg\+xml);base64,([^"]+))"')
+
+
+def _extract_images_from_html(html: str) -> Tuple[str, List[Dict[str, str]]]:
+    """Extract base64 images from HTML, replace with {{IMAGE_N}} placeholders.
+
+    Returns (cleaned_html, images_array).
+    """
+    images: List[Dict[str, str]] = []
+    index = 0
+
+    def replacer(match: re.Match) -> str:
+        nonlocal index
+        mime_type = match.group(2)
+        b64_data = match.group(3)
+        ext = "png"
+        if "jpeg" in mime_type:
+            ext = "jpg"
+        elif "gif" in mime_type:
+            ext = "gif"
+        elif "svg" in mime_type:
+            ext = "svg"
+        images.append({
+            "index": index,
+            "data": b64_data,
+            "contentType": f"image/{mime_type}",
+            "filename": f"image_{index}.{ext}",
+        })
+        placeholder = f'src="{{{{IMAGE_{index}}}}}"'
+        index += 1
+        return placeholder
+
+    cleaned_html = FINAL_IMAGE_PATTERN.sub(replacer, html)
+    return cleaned_html, images
+
+
+@app.post("/convert-pdf-to-semantic-html")
+async def convert_pdf_to_semantic_html_endpoint(file: UploadFile = File(...)):
+    """Full pipeline: PDF → pixel HTML (ConvertAPI) → semantic HTML → images extracted.
+
+    Accepts multipart/form-data with a PDF file.
+    Returns semantic HTML with {{IMAGE_N}} placeholders and images as separate array.
+    """
+    import httpx
+
+    # Validate file
+    filename = file.filename or "upload.pdf"
+    if not filename.lower().endswith(".pdf"):
+        return JSONResponse(
+            status_code=400,
+            content={"status": "error", "error": f"Invalid file type: {filename}. Expected PDF."},
+        )
+
+    pdf_bytes = await file.read()
+    if len(pdf_bytes) == 0:
+        return JSONResponse(
+            status_code=400,
+            content={"status": "error", "error": "Uploaded file is empty."},
+        )
+
+    MAX_FILE_SIZE = 100 * 1024 * 1024
+    if len(pdf_bytes) > MAX_FILE_SIZE:
+        return JSONResponse(
+            status_code=400,
+            content={"status": "error", "error": f"File too large: {len(pdf_bytes) / 1024 / 1024:.1f} MB. Maximum: 100 MB."},
+        )
+
+    logger.info(f"[PDF→SemanticHTML] Starting pipeline for {filename} ({len(pdf_bytes) / 1024:.1f} KB)")
+    t_start = _time.time()
+
+    # --- Step 1: PDF → pixel-perfect HTML via ConvertAPI ---
+    convert_api_secret = os.getenv("CONVERTAPI_SECRET")
+    if not convert_api_secret:
+        return JSONResponse(
+            status_code=500,
+            content={"status": "error", "error": "CONVERTAPI_SECRET not configured."},
+        )
+
+    try:
+        async with httpx.AsyncClient(timeout=120.0) as client:
+            resp = await client.post(
+                "https://v2.convertapi.com/convert/pdf/to/html",
+                headers={"Authorization": f"Bearer {convert_api_secret}"},
+                files={"File": (filename, pdf_bytes, "application/pdf")},
+                data={"StoreFile": "true"},
+            )
+
+        if resp.status_code != 200:
+            logger.error(f"[PDF→SemanticHTML] ConvertAPI error {resp.status_code}: {resp.text[:500]}")
+            return JSONResponse(
+                status_code=502,
+                content={"status": "error", "error": f"ConvertAPI failed with status {resp.status_code}: {resp.text[:200]}"},
+            )
+
+        convert_result = resp.json()
+        files = convert_result.get("Files", [])
+        if not files:
+            return JSONResponse(
+                status_code=502,
+                content={"status": "error", "error": "ConvertAPI returned no files."},
+            )
+
+        # Get HTML content — either download from URL or decode FileData
+        file_entry = files[0]
+        if file_entry.get("Url"):
+            async with httpx.AsyncClient(timeout=60.0) as client:
+                html_resp = await client.get(file_entry["Url"])
+            pixel_html = html_resp.text
+        elif file_entry.get("FileData"):
+            pixel_html = base64.b64decode(file_entry["FileData"]).decode("utf-8")
+        else:
+            return JSONResponse(
+                status_code=502,
+                content={"status": "error", "error": "ConvertAPI response has neither Url nor FileData."},
+            )
+
+        page_count_hint = len(files)
+        logger.info(f"[PDF→SemanticHTML] ConvertAPI done: {len(pixel_html) / 1024:.0f} KB HTML")
+
+    except httpx.TimeoutException:
+        return JSONResponse(
+            status_code=502,
+            content={"status": "error", "error": "ConvertAPI request timed out."},
+        )
+    except Exception as e:
+        logger.error(f"[PDF→SemanticHTML] ConvertAPI call failed: {e}", exc_info=True)
+        return JSONResponse(
+            status_code=502,
+            content={"status": "error", "error": f"ConvertAPI call failed: {str(e)}"},
+        )
+
+    # --- Step 2: pixel HTML → semantic Flexbox HTML ---
+    try:
+        semantic_html, page_count, converted = await _convert_pixel_to_semantic_html(pixel_html)
+    except RuntimeError as e:
+        logger.error(f"[PDF→SemanticHTML] Semantic conversion failed: {e}", exc_info=True)
+        return JSONResponse(
+            status_code=500,
+            content={"status": "error", "error": f"Semantic HTML conversion failed: {str(e)}"},
+        )
+
+    # --- Step 3: Extract base64 images into separate array ---
+    cleaned_html, images = _extract_images_from_html(semantic_html)
+
+    duration = _time.time() - t_start
+    logger.info(
+        f"[PDF→SemanticHTML] Pipeline complete: {filename} → "
+        f"{len(cleaned_html) / 1024:.0f} KB HTML, {len(images)} images, "
+        f"{page_count} pages ({duration:.1f}s)"
+    )
+
+    return {
+        "status": "success",
+        "html": cleaned_html,
+        "images": images,
+        "pages": page_count,
+        "converted": converted,
+    }
+
+
+@app.post("/convert-semantic-html", response_model=ConvertSemanticHtmlResponse)
+async def convert_semantic_html_endpoint(req: ConvertSemanticHtmlRequest):
+    """Convert pixel-positioned HTML (from ConvertAPI PDF→HTML) to semantic Flexbox HTML.
+
+    Port of SemanticHtmlConverter.ts logic:
+    1. Replace base64 images with {{IMG_N}} placeholders
+    2. If HTML > 100KB, split by <div class="page"> and process per-page
+    3. Send to AI (Haiku 4.5) for structural transformation
+    4. Restore image placeholders
+    5. Validate output
+    """
+    semantic_html, page_count, converted = await _convert_pixel_to_semantic_html(req.html)
     return ConvertSemanticHtmlResponse(
         status="success",
         html=semantic_html,
-        pages=len(pages),
-        converted=True,
+        pages=page_count,
+        converted=converted,
     )
 
 
