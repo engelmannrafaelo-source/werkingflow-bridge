@@ -399,7 +399,7 @@ def _strip_markdown_fences(text: str) -> str:
     return text.strip()
 
 
-async def _call_ai_for_conversion(html_chunk: str, max_retries: int = 3) -> str:
+async def _call_ai_for_conversion(html_chunk: str, max_retries: int = 4) -> str:
     """Call Bridge chat-completions for one HTML chunk with retry on failure."""
     import asyncio
     import httpx
@@ -421,7 +421,7 @@ async def _call_ai_for_conversion(html_chunk: str, max_retries: int = 3) -> str:
     last_error = None
     for attempt in range(max_retries):
         try:
-            async with httpx.AsyncClient(timeout=180.0) as client:
+            async with httpx.AsyncClient(timeout=300.0) as client:
                 response = await client.post(BRIDGE_SELF_URL, headers=headers, json=request_body)
 
             if response.status_code == 200:
@@ -433,14 +433,14 @@ async def _call_ai_for_conversion(html_chunk: str, max_retries: int = 3) -> str:
             logger.warning(
                 f"[SemanticConverter] AI call failed (attempt {attempt + 1}/{max_retries}): {last_error}"
             )
-        except (httpx.TimeoutException, httpx.ConnectError) as e:
+        except (httpx.TimeoutException, httpx.ConnectError, httpx.RemoteProtocolError) as e:
             last_error = f"AI Bridge connection error: {e}"
             logger.warning(
                 f"[SemanticConverter] AI call failed (attempt {attempt + 1}/{max_retries}): {last_error}"
             )
 
         if attempt < max_retries - 1:
-            wait = 10 * (attempt + 1)
+            wait = 15 * (attempt + 1)
             logger.info(f"[SemanticConverter] Retrying in {wait}s...")
             await asyncio.sleep(wait)
 
@@ -593,7 +593,7 @@ async def convert_pdf_to_semantic_html_endpoint(file: UploadFile = File(...)):
         )
 
     try:
-        async with httpx.AsyncClient(timeout=120.0) as client:
+        async with httpx.AsyncClient(timeout=300.0) as client:
             resp = await client.post(
                 "https://v2.convertapi.com/convert/pdf/to/html",
                 headers={"Authorization": f"Bearer {convert_api_secret}"},
@@ -619,7 +619,7 @@ async def convert_pdf_to_semantic_html_endpoint(file: UploadFile = File(...)):
         # Get HTML content — either download from URL or decode FileData
         file_entry = files[0]
         if file_entry.get("Url"):
-            async with httpx.AsyncClient(timeout=60.0) as client:
+            async with httpx.AsyncClient(timeout=120.0) as client:
                 html_resp = await client.get(file_entry["Url"])
             pixel_html = html_resp.text
         elif file_entry.get("FileData"):
