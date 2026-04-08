@@ -1,20 +1,30 @@
 """
-Request Limiter Middleware - Prevent Memory Overload
+Request Limiter - Prevent Concurrent Overload
 
-Limits concurrent requests to prevent memory exhaustion.
-Monitors system memory and rejects requests when unsafe.
+Limits concurrent requests per worker to prevent Claude Code SDK overload.
+When limit is reached, returns 503 immediately so the client can retry.
+
+Usage (FastAPI Dependency — avoids Python 3.13 + Starlette BaseHTTPMiddleware bug):
+    @app.post("/v1/chat/completions")
+    async def chat_completions(..., _=Depends(concurrency_limit)):
+        ...
 """
 
 import asyncio
+import os
 import psutil
-from datetime import datetime
+from contextlib import asynccontextmanager
 from typing import Optional
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.responses import JSONResponse
+from fastapi import HTTPException
 
 from config.logging_config import get_logger
 
 logger = get_logger(__name__)
+
+# Worker name for log context (set via WORKER_NAME env var in docker-compose)
+WORKER_NAME = os.getenv("WORKER_NAME", "worker")
 
 
 class RequestLimiter:
@@ -51,15 +61,23 @@ class RequestLimiter:
             # Check concurrent limit
             if self.active_requests >= self.max_concurrent:
                 reason = f"Max concurrent requests reached ({self.active_requests}/{self.max_concurrent})"
-                logger.warning(f"🚫 {reason}")
+                self.rejected_requests += 1
+                logger.error(
+                    f"🚫 [{WORKER_NAME}] OVERLOAD — {reason} "
+                    f"(total_rejected={self.rejected_requests}, total_requests={self.total_requests})"
+                )
                 return False, reason
 
             # Check memory usage
             memory = psutil.virtual_memory()
             if memory.percent >= self.memory_threshold:
-                reason = f"Memory threshold exceeded ({memory.percent:.1f}% > {self.memory_threshold}%)"
-                logger.warning(f"🚫 {reason}")
-                logger.warning(f"   Used: {memory.used / 1024**3:.1f}GB / {memory.total / 1024**3:.1f}GB")
+                reason = f"Memory threshold exceeded ({memory.percent:.1f}% >= {self.memory_threshold}%)"
+                self.rejected_requests += 1
+                logger.error(
+                    f"🚫 [{WORKER_NAME}] MEMORY OVERLOAD — {reason} "
+                    f"used={memory.used / 1024**3:.1f}GB / {memory.total / 1024**3:.1f}GB "
+                    f"(total_rejected={self.rejected_requests})"
+                )
                 return False, reason
 
             return True, None
@@ -71,7 +89,10 @@ class RequestLimiter:
             self.total_requests += 1
 
             memory = psutil.virtual_memory()
-            logger.info(f"ℹ️  Request started (active: {self.active_requests}/{self.max_concurrent}, mem: {memory.percent:.1f}%)")
+            logger.info(
+                f"▶️  [{WORKER_NAME}] Request accepted "
+                f"(active: {self.active_requests}/{self.max_concurrent}, mem: {memory.percent:.1f}%)"
+            )
 
     async def release(self):
         """Mark request as completed"""
@@ -79,7 +100,38 @@ class RequestLimiter:
             self.active_requests = max(0, self.active_requests - 1)
 
             memory = psutil.virtual_memory()
-            logger.info(f"🟢 Request completed (active: {self.active_requests}/{self.max_concurrent}, mem: {memory.percent:.1f}%)")
+            logger.info(
+                f"✅ [{WORKER_NAME}] Request completed "
+                f"(active: {self.active_requests}/{self.max_concurrent}, mem: {memory.percent:.1f}%)"
+            )
+
+    @asynccontextmanager
+    async def throttled(self):
+        """
+        Async context manager: acquire on enter, release on exit.
+        Raises HTTPException(503) if limit reached.
+
+        Usage:
+            async with request_limiter.throttled():
+                ... do work ...
+        """
+        can_accept, reason = await self.can_accept_request()
+        if not can_accept:
+            raise HTTPException(
+                status_code=503,
+                detail={
+                    "error": "Bridge overloaded — too many concurrent requests",
+                    "reason": reason,
+                    "retry_after_seconds": 15,
+                    "worker": WORKER_NAME,
+                    "stats": self.get_stats(),
+                }
+            )
+        await self.acquire()
+        try:
+            yield
+        finally:
+            await self.release()
 
     def get_stats(self) -> dict:
         """Get current limiter statistics"""
@@ -141,9 +193,26 @@ class RequestLimiterMiddleware(BaseHTTPMiddleware):
 limiter: Optional[RequestLimiter] = None
 
 
-def get_limiter(max_concurrent: int = 3, memory_threshold: float = 90.0) -> RequestLimiter:
+def get_limiter(max_concurrent: int = 5, memory_threshold: float = 90.0) -> RequestLimiter:
     """Get or create global limiter instance"""
     global limiter
     if limiter is None:
         limiter = RequestLimiter(max_concurrent, memory_threshold)
     return limiter
+
+
+async def concurrency_limit():
+    """
+    FastAPI Dependency — enforces concurrent request limit.
+
+    Add to any endpoint that runs Claude Code SDK:
+        @app.post("/v1/chat/completions")
+        async def chat_completions(..., _=Depends(concurrency_limit)):
+
+    Raises HTTPException(503) with retry_after when limit reached.
+    Avoids Python 3.13 + Starlette 0.46 BaseHTTPMiddleware bug.
+    """
+    if limiter is None:
+        return  # Limiter not initialized yet — let request through
+    async with limiter.throttled():
+        yield

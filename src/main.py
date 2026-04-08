@@ -106,7 +106,7 @@ except ImportError:
         return decorator
 
 # Request limiting for memory protection
-from src.request_limiter import get_limiter, RequestLimiterMiddleware
+from src.request_limiter import get_limiter, RequestLimiterMiddleware, concurrency_limit
 
 # Configure centralized logging
 # Backwards compatibility: Support DEBUG_MODE/VERBOSE for log level override
@@ -511,14 +511,12 @@ from src.middleware.event_logger import EventLogger
 # TEMPORARILY DISABLED: Python 3.13 + Starlette 0.46 BaseHTTPMiddleware bug
 # app.add_middleware(PerformanceMonitorMiddleware)
 
-# Add request limiting middleware (AFTER performance monitoring)
-# Protects against memory exhaustion from too many concurrent requests
-# BaseHTTPMiddleware but safe (does NOT read request body)
-max_concurrent = int(os.getenv("MAX_CONCURRENT_REQUESTS", "3"))
+# Concurrency limiter — enforced via FastAPI Depends() instead of BaseHTTPMiddleware
+# (BaseHTTPMiddleware disabled due to Python 3.13 + Starlette 0.46 bug)
+# Set MAX_CONCURRENT_REQUESTS per worker in docker-compose (default 5 = 20 total with 4 workers)
+max_concurrent = int(os.getenv("MAX_CONCURRENT_REQUESTS", "5"))
 memory_threshold = float(os.getenv("MEMORY_THRESHOLD_PERCENT", "90.0"))
 request_limiter = get_limiter(max_concurrent=max_concurrent, memory_threshold=memory_threshold)
-# TEMPORARILY DISABLED: Python 3.13 + Starlette 0.46 BaseHTTPMiddleware bug
-# app.add_middleware(RequestLimiterMiddleware, limiter=request_limiter)
 
 # Add rate limiting error handler
 if limiter:
@@ -1236,7 +1234,8 @@ def extract_attribution_context(request: Request) -> dict:
 async def chat_completions(
     request_body: ChatCompletionRequest,
     request: Request,
-    credentials: Optional[HTTPAuthorizationCredentials] = Depends(security)
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(security),
+    _concurrency=Depends(concurrency_limit)
 ):
     """OpenAI-compatible chat completions endpoint."""
     import time
@@ -1980,7 +1979,8 @@ async def chat_completions(
 async def research(
     request_body: ResearchRequest,
     request: Request,
-    credentials: Optional[HTTPAuthorizationCredentials] = Depends(security)
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(security),
+    _concurrency=Depends(concurrency_limit)
 ):
     """
     Dedicated research endpoint for Claude Code research tasks.
@@ -2767,6 +2767,68 @@ async def convert_pdf_endpoint(
             status="error",
             error=f"PDF conversion failed: {str(e)}"
         )
+
+
+@app.post("/v1/audio/transcriptions")
+async def audio_transcriptions(
+    request: Request,
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(security)
+):
+    """Proxy OpenAI Whisper audio transcription. Requires OPENAI_API_KEY in Bridge env."""
+    await verify_api_key(request, credentials)
+
+    openai_api_key = os.getenv("OPENAI_API_KEY")
+    if not openai_api_key:
+        raise HTTPException(
+            status_code=503,
+            detail="OPENAI_API_KEY not configured on Bridge — contact admin"
+        )
+
+    try:
+        form = await request.form()
+        audio_file = form.get("file")
+        if not audio_file:
+            raise HTTPException(status_code=400, detail="No file uploaded. Send audio as multipart/form-data with field name 'file'.")
+
+        filename = getattr(audio_file, "filename", "audio.mp3") or "audio.mp3"
+        audio_bytes = await audio_file.read()
+        content_type = getattr(audio_file, "content_type", "audio/mpeg") or "audio/mpeg"
+
+        # Collect optional parameters
+        model = form.get("model", "whisper-1")
+        language = form.get("language")
+        response_format = form.get("response_format", "json")
+        prompt = form.get("prompt")
+        temperature = form.get("temperature")
+
+        # Build multipart fields for OpenAI
+        files = {"file": (filename, audio_bytes, content_type)}
+        data = {"model": model, "response_format": response_format}
+        if language:
+            data["language"] = language
+        if prompt:
+            data["prompt"] = prompt
+        if temperature:
+            data["temperature"] = temperature
+
+        async with httpx.AsyncClient(timeout=120.0) as client:
+            response = await client.post(
+                "https://api.openai.com/v1/audio/transcriptions",
+                headers={"Authorization": f"Bearer {openai_api_key}"},
+                files=files,
+                data=data,
+            )
+            response.raise_for_status()
+            return JSONResponse(content=response.json(), status_code=response.status_code)
+
+    except httpx.HTTPStatusError as e:
+        logger.error(f"OpenAI Whisper API error: {e.response.status_code} {e.response.text}")
+        raise HTTPException(status_code=e.response.status_code, detail=f"OpenAI Whisper error: {e.response.text}")
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Audio transcription proxy failed: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Audio transcription failed: {str(e)}")
 
 
 @app.get("/v1/auth/status")
