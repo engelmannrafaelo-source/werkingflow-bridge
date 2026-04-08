@@ -399,8 +399,9 @@ def _strip_markdown_fences(text: str) -> str:
     return text.strip()
 
 
-async def _call_ai_for_conversion(html_chunk: str) -> str:
-    """Call Bridge chat-completions for one HTML chunk."""
+async def _call_ai_for_conversion(html_chunk: str, max_retries: int = 3) -> str:
+    """Call Bridge chat-completions for one HTML chunk with retry on failure."""
+    import asyncio
     import httpx
 
     request_body = {
@@ -417,17 +418,33 @@ async def _call_ai_for_conversion(html_chunk: str) -> str:
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
 
-    async with httpx.AsyncClient(timeout=120.0) as client:
-        response = await client.post(BRIDGE_SELF_URL, headers=headers, json=request_body)
+    last_error = None
+    for attempt in range(max_retries):
+        try:
+            async with httpx.AsyncClient(timeout=180.0) as client:
+                response = await client.post(BRIDGE_SELF_URL, headers=headers, json=request_body)
 
-    if response.status_code != 200:
-        raise RuntimeError(
-            f"AI Bridge returned {response.status_code}: {response.text[:300]}"
-        )
+            if response.status_code == 200:
+                result = response.json()
+                content = result.get("choices", [{}])[0].get("message", {}).get("content", "")
+                return _strip_markdown_fences(content)
 
-    result = response.json()
-    content = result.get("choices", [{}])[0].get("message", {}).get("content", "")
-    return _strip_markdown_fences(content)
+            last_error = f"AI Bridge returned {response.status_code}: {response.text[:300]}"
+            logger.warning(
+                f"[SemanticConverter] AI call failed (attempt {attempt + 1}/{max_retries}): {last_error}"
+            )
+        except (httpx.TimeoutException, httpx.ConnectError) as e:
+            last_error = f"AI Bridge connection error: {e}"
+            logger.warning(
+                f"[SemanticConverter] AI call failed (attempt {attempt + 1}/{max_retries}): {last_error}"
+            )
+
+        if attempt < max_retries - 1:
+            wait = 10 * (attempt + 1)
+            logger.info(f"[SemanticConverter] Retrying in {wait}s...")
+            await asyncio.sleep(wait)
+
+    raise RuntimeError(last_error)
 
 
 async def _convert_pixel_to_semantic_html(pixel_html: str) -> Tuple[str, int, bool]:
