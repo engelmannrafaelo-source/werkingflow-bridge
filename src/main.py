@@ -1867,9 +1867,39 @@ async def chat_completions(
             tools_enabled=request_body.enable_tools
         )
         logger.error(f"Chat completion HTTP error: {http_exc.status_code} - {http_exc.detail}")
+        # Track error in prompt metrics (even without tenant)
+        try:
+            from src.middleware.prompt_metrics import get_prompt_metrics
+            attribution = extract_attribution_context(request)
+            get_prompt_metrics().record(
+                app_id=attribution.get("app_id"),
+                agent_id=attribution.get("agent_id"),
+                workflow_id=attribution.get("workflow_id"),
+                duration_ms=int(duration * 1000),
+                status="error",
+                model=request_body.model,
+                error_code=str(http_exc.status_code),
+            )
+        except Exception:
+            pass
         raise
     except WorkerUnavailableError:
-        # Re-raise to trigger HTTP 503 and Nginx failover
+        # Track 503 in prompt metrics before re-raise for Nginx failover
+        try:
+            duration = time.time() - start_time
+            from src.middleware.prompt_metrics import get_prompt_metrics
+            attribution = extract_attribution_context(request)
+            get_prompt_metrics().record(
+                app_id=attribution.get("app_id"),
+                agent_id=attribution.get("agent_id"),
+                workflow_id=attribution.get("workflow_id"),
+                duration_ms=int(duration * 1000),
+                status="error",
+                model=request_body.model,
+                error_code="503",
+            )
+        except Exception:
+            pass
         raise
     except Exception as e:
         # =======================================================================
