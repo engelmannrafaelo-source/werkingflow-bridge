@@ -3096,6 +3096,56 @@ async def get_performance_metrics(
     }
 
 
+# ============================================================================
+# Prompt Performance Metrics (per app + agent)
+# ============================================================================
+
+@app.get("/v1/metrics/prompt-performance")
+async def get_prompt_performance(
+    hours: int = 24,
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(security)
+):
+    """
+    Get per-prompt-type performance stats (duration, error rate, tokens).
+
+    Grouped by app_id + agent_id so you can see which AI function
+    is slow or broken.
+
+    Query params:
+        hours: Time window (default 24, max 168 = 7 days)
+    """
+    from middleware.prompt_metrics import get_prompt_metrics
+
+    hours = min(max(hours, 1), 168)  # Clamp 1-168h
+    collector = get_prompt_metrics()
+    return collector.get_stats(hours=hours)
+
+
+@app.get("/v1/metrics/prompt-performance/timeline")
+async def get_prompt_timeline(
+    app_id: str,
+    agent_id: str,
+    hours: int = 24,
+    bucket_minutes: int = 60,
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(security)
+):
+    """
+    Get timeline data for a specific app+agent combo (for charts).
+
+    Query params:
+        app_id: Application identifier (e.g., "werking-report")
+        agent_id: Agent identifier (e.g., "gutachten-generate")
+        hours: Time window (default 24)
+        bucket_minutes: Bucket size in minutes (default 60)
+    """
+    from middleware.prompt_metrics import get_prompt_metrics
+
+    hours = min(max(hours, 1), 168)
+    bucket_minutes = min(max(bucket_minutes, 5), 360)
+    collector = get_prompt_metrics()
+    return collector.get_timeline(app_id=app_id, agent_id=agent_id, hours=hours, bucket_minutes=bucket_minutes)
+
+
 @app.exception_handler(HTTPException)
 async def http_exception_handler(request: Request, exc: HTTPException):
     """Format HTTP exceptions as OpenAI-style errors."""

@@ -309,3 +309,21 @@ async def track_request_usage(
 
     # Fire-and-forget
     tracker.track_async(record)
+
+    # Also record in prompt performance metrics (in-memory, for CUI dashboard)
+    try:
+        from middleware.prompt_metrics import get_prompt_metrics
+        collector = get_prompt_metrics()
+        collector.record(
+            app_id=app_id,
+            agent_id=agent_id,
+            workflow_id=workflow_id,
+            duration_ms=latency_ms,
+            status=status,
+            model=model,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            error_code=error_message,
+        )
+    except Exception:
+        pass  # Non-critical — don't break usage tracking
