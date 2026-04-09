@@ -180,8 +180,8 @@ class PerformanceMonitorMiddleware:
                             tools_enabled=tools_enabled,
                             client_ip=client_host,
                         )
-                    except Exception:
-                        pass  # Non-critical
+                    except Exception as _rl_err:
+                        logger.debug(f"Request log write failed: {_rl_err}")
 
             # Send original message
             await send(message)
