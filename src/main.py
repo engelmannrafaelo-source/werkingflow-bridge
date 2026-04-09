@@ -1907,6 +1907,9 @@ async def chat_completions(
                 status="error",
                 model=request_body.model,
                 error_code=str(http_exc.status_code),
+                user_id=attribution.get("user_id"),
+                session_id=attribution.get("session_id"),
+                job_id=attribution.get("job_id"),
             )
         except Exception:
             pass
@@ -1925,6 +1928,9 @@ async def chat_completions(
                 status="error",
                 model=request_body.model,
                 error_code="503",
+                user_id=attribution.get("user_id"),
+                session_id=attribution.get("session_id"),
+                job_id=attribution.get("job_id"),
             )
         except Exception:
             pass
@@ -3170,11 +3176,11 @@ async def get_prompt_performance(
     is slow or broken.
 
     Query params:
-        hours: Time window (default 24, max 168 = 7 days)
+        hours: Time window (default 24, 0 = all time)
     """
     from src.middleware.prompt_metrics import get_prompt_metrics
 
-    hours = min(max(hours, 1), 168)  # Clamp 1-168h
+    hours = max(hours, 0)  # 0 = all time
     collector = get_prompt_metrics()
     return collector.get_stats(hours=hours)
 

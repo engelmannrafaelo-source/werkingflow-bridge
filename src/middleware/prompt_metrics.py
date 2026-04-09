@@ -5,10 +5,11 @@ Tracks per-prompt-type (app_id + agent_id) performance stats:
 - Duration (avg, p50, p95, min, max)
 - Success/Error/Timeout rates
 - Token usage
+- User/session attribution
 - Call count
 
-Data is persisted to JSONL files on a shared Docker volume so metrics
-survive worker restarts and are visible across all workers.
+Data is persisted permanently to JSONL files on a shared Docker volume.
+All data is cumulative — no pruning, no retention limit.
 
 File layout (shared volume at /app/logs/bridge-metrics/):
     prompt_calls.worker1.jsonl
@@ -36,10 +37,6 @@ METRICS_DIR = os.path.join(
     "bridge-metrics"
 )
 
-# Retention: auto-prune calls older than this
-RETENTION_DAYS = 7
-RETENTION_SECONDS = RETENTION_DAYS * 24 * 3600
-
 
 @dataclass
 class PromptCall:
@@ -55,6 +52,10 @@ class PromptCall:
     output_tokens: int
     error_code: Optional[str] = None
     worker: Optional[str] = None
+    # Attribution
+    user_id: Optional[str] = None
+    session_id: Optional[str] = None
+    job_id: Optional[str] = None
 
 
 @dataclass
@@ -70,9 +71,30 @@ class AgentStats:
     total_input_tokens: int = 0
     total_output_tokens: int = 0
     models: Dict[str, int] = field(default_factory=lambda: defaultdict(int))
+    users: Dict[str, int] = field(default_factory=lambda: defaultdict(int))
     last_call: float = 0
     last_error: Optional[str] = None
     last_error_time: Optional[float] = None
+
+
+def _parse_call(data: dict, fallback_worker: str = "unknown") -> PromptCall:
+    """Parse a JSONL dict into a PromptCall. Tolerant of missing fields."""
+    return PromptCall(
+        timestamp=data["timestamp"],
+        app_id=data.get("app_id", "unknown"),
+        agent_id=data.get("agent_id", "unknown"),
+        workflow_id=data.get("workflow_id", "unknown"),
+        duration_ms=data.get("duration_ms", 0),
+        status=data.get("status", "unknown"),
+        model=data.get("model", "unknown"),
+        input_tokens=data.get("input_tokens", 0),
+        output_tokens=data.get("output_tokens", 0),
+        error_code=data.get("error_code"),
+        worker=data.get("worker", fallback_worker),
+        user_id=data.get("user_id"),
+        session_id=data.get("session_id"),
+        job_id=data.get("job_id"),
+    )
 
 
 class PromptMetricsCollector:
@@ -81,6 +103,7 @@ class PromptMetricsCollector:
 
     Thread-safe. Persists to JSONL on shared volume.
     Each worker writes its own file, reads all files for aggregation.
+    All data is kept permanently (cumulative).
     """
 
     def __init__(self):
@@ -106,7 +129,6 @@ class PromptMetricsCollector:
             logger.info(f"No existing metrics file: {self._jsonl_path}")
             return
 
-        cutoff = time.time() - RETENTION_SECONDS
         loaded = 0
         skipped = 0
 
@@ -118,23 +140,7 @@ class PromptMetricsCollector:
                         continue
                     try:
                         data = json.loads(line)
-                        if data.get("timestamp", 0) < cutoff:
-                            skipped += 1
-                            continue
-                        call = PromptCall(
-                            timestamp=data["timestamp"],
-                            app_id=data.get("app_id", "unknown"),
-                            agent_id=data.get("agent_id", "unknown"),
-                            workflow_id=data.get("workflow_id", "unknown"),
-                            duration_ms=data.get("duration_ms", 0),
-                            status=data.get("status", "unknown"),
-                            model=data.get("model", "unknown"),
-                            input_tokens=data.get("input_tokens", 0),
-                            output_tokens=data.get("output_tokens", 0),
-                            error_code=data.get("error_code"),
-                            worker=data.get("worker", self._worker_id),
-                        )
-                        self._calls.append(call)
+                        self._calls.append(_parse_call(data, self._worker_id))
                         loaded += 1
                     except (json.JSONDecodeError, KeyError) as e:
                         logger.debug(f"Skipping malformed metrics line: {e}")
@@ -142,7 +148,7 @@ class PromptMetricsCollector:
 
             logger.info(
                 f"Loaded {loaded} metrics from disk "
-                f"(skipped {skipped} old/malformed), file: {self._jsonl_path}"
+                f"(skipped {skipped} malformed), file: {self._jsonl_path}"
             )
         except OSError as e:
             logger.warning(f"Cannot read metrics file: {e}")
@@ -184,20 +190,7 @@ class PromptMetricsCollector:
                             data = json.loads(line)
                             if data.get("timestamp", 0) < cutoff:
                                 continue
-                            call = PromptCall(
-                                timestamp=data["timestamp"],
-                                app_id=data.get("app_id", "unknown"),
-                                agent_id=data.get("agent_id", "unknown"),
-                                workflow_id=data.get("workflow_id", "unknown"),
-                                duration_ms=data.get("duration_ms", 0),
-                                status=data.get("status", "unknown"),
-                                model=data.get("model", "unknown"),
-                                input_tokens=data.get("input_tokens", 0),
-                                output_tokens=data.get("output_tokens", 0),
-                                error_code=data.get("error_code"),
-                                worker=data.get("worker", worker_name),
-                            )
-                            all_calls.append(call)
+                            all_calls.append(_parse_call(data, worker_name))
                         except (json.JSONDecodeError, KeyError):
                             continue
             except OSError:
@@ -216,6 +209,9 @@ class PromptMetricsCollector:
         input_tokens: int = 0,
         output_tokens: int = 0,
         error_code: Optional[str] = None,
+        user_id: Optional[str] = None,
+        session_id: Optional[str] = None,
+        job_id: Optional[str] = None,
     ) -> None:
         """Record a single prompt call (in-memory + disk)."""
         call = PromptCall(
@@ -230,6 +226,9 @@ class PromptMetricsCollector:
             output_tokens=output_tokens,
             error_code=error_code,
             worker=self._worker_id,
+            user_id=user_id,
+            session_id=session_id,
+            job_id=job_id,
         )
         with self._lock:
             self._calls.append(call)
@@ -237,44 +236,17 @@ class PromptMetricsCollector:
         # Persist to disk (outside lock — append is atomic enough for JSONL)
         self._append_to_disk(call)
 
-    def _prune(self) -> None:
-        """Remove calls older than retention window. Must hold lock."""
-        cutoff = time.time() - RETENTION_SECONDS
-        self._calls = [c for c in self._calls if c.timestamp >= cutoff]
-
-    def prune_disk(self) -> None:
-        """
-        Rewrite this worker's JSONL file without expired entries.
-
-        Call periodically (e.g., daily) to keep file size bounded.
-        """
-        cutoff = time.time() - RETENTION_SECONDS
-
-        with self._lock:
-            self._prune()
-            current_calls = list(self._calls)
-
-        try:
-            tmp_path = self._jsonl_path + ".tmp"
-            with open(tmp_path, "w") as f:
-                for call in current_calls:
-                    f.write(json.dumps(asdict(call), separators=(",", ":")) + "\n")
-            os.replace(tmp_path, self._jsonl_path)
-            logger.info(f"Pruned metrics file: {len(current_calls)} calls retained")
-        except OSError as e:
-            logger.warning(f"Cannot prune metrics file: {e}")
-
     def get_stats(self, hours: int = 24) -> Dict[str, Any]:
         """
         Get aggregated stats per app+agent for the last N hours.
 
         Reads from ALL worker files for complete cross-worker view.
         """
-        cutoff = time.time() - (hours * 3600)
+        # hours=0 means all time
+        cutoff = time.time() - (hours * 3600) if hours > 0 else 0
 
         # Get this worker's in-memory calls
         with self._lock:
-            self._prune()
             own_calls = [c for c in self._calls if c.timestamp >= cutoff]
 
         # Get other workers' calls from disk
@@ -295,6 +267,8 @@ class PromptMetricsCollector:
             b.total_input_tokens += call.input_tokens
             b.total_output_tokens += call.output_tokens
             b.models[call.model] += 1
+            if call.user_id:
+                b.users[call.user_id] += 1
             b.last_call = max(b.last_call, call.timestamp)
 
             if call.status == "success":
@@ -336,6 +310,7 @@ class PromptMetricsCollector:
                     "total_output": b.total_output_tokens,
                 },
                 "models": dict(b.models),
+                "users": dict(b.users),
                 "last_call_ago_s": round(time.time() - b.last_call) if b.last_call > 0 else None,
                 "last_error": b.last_error,
                 "last_error_ago_s": round(time.time() - b.last_error_time) if b.last_error_time else None,

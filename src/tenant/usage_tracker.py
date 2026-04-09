@@ -310,7 +310,7 @@ async def track_request_usage(
     # Fire-and-forget
     tracker.track_async(record)
 
-    # Also record in prompt performance metrics (in-memory, for CUI dashboard)
+    # Also record in prompt performance metrics (persistent JSONL, for CUI dashboard)
     try:
         from src.middleware.prompt_metrics import get_prompt_metrics
         collector = get_prompt_metrics()
@@ -324,6 +324,9 @@ async def track_request_usage(
             input_tokens=input_tokens,
             output_tokens=output_tokens,
             error_code=error_message,
+            user_id=user_id,
+            session_id=session_id,
+            job_id=job_id,
         )
     except Exception:
         pass  # Non-critical — don't break usage tracking
