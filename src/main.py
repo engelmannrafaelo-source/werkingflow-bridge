@@ -1214,11 +1214,39 @@ def extract_attribution_context(request: Request) -> dict:
     - job_id: Job/run UUID (X-Job-ID)
 
     All values are optional (None if not provided).
+    Fallback: Parses X-Client-ID (e.g., "werking-energy/wizard/analyze-smart")
+    into app_id and agent_id if the dedicated headers are missing.
     """
+    app_id = get_app_id_from_request(request)
+    agent_id = get_agent_id_from_request(request)
+
+    # Fallback: parse X-Client-ID if app_id or agent_id missing
+    if not app_id or not agent_id:
+        client_id = request.headers.get("x-client-id") or request.headers.get("X-Client-ID")
+        if client_id:
+            # Parse patterns:
+            #   "werking-energy/wizard/generate-questions" → app=werking-energy, agent=generate-questions
+            #   "werking-energy/api/llm-client"            → app=werking-energy, agent=llm-client
+            #   "workflow/werking-energy/vision-handler/s1" → app=werking-energy, agent=vision-handler
+            #   "phase10-standalone/context"                → app=phase10-standalone, agent=context
+            parts = [p for p in client_id.strip().split("/") if p]
+            # Skip "workflow" prefix — it's just a namespace
+            if parts and parts[0] == "workflow":
+                parts = parts[1:]
+            if len(parts) >= 1 and not app_id:
+                app_id = parts[0]  # e.g., "werking-energy"
+            if len(parts) >= 3 and not agent_id:
+                # 3+ parts: use middle part as category context
+                # "werking-energy/wizard/generate-questions" → agent = "generate-questions"
+                # "werking-energy/pipeline/research/ctx"     → agent = "research"
+                agent_id = parts[-1] if len(parts) == 3 else parts[2]
+            elif len(parts) >= 2 and not agent_id:
+                agent_id = parts[-1]
+
     return {
         "user_id": get_user_id_from_request(request),
-        "app_id": get_app_id_from_request(request),
-        "agent_id": get_agent_id_from_request(request),
+        "app_id": app_id,
+        "agent_id": agent_id,
         "session_id": get_session_id_from_request(request),
         "workflow_id": get_workflow_id_from_request(request),
         "job_id": get_job_id_from_request(request),
