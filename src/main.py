@@ -3114,7 +3114,7 @@ async def get_prompt_performance(
     Query params:
         hours: Time window (default 24, max 168 = 7 days)
     """
-    from middleware.prompt_metrics import get_prompt_metrics
+    from src.middleware.prompt_metrics import get_prompt_metrics
 
     hours = min(max(hours, 1), 168)  # Clamp 1-168h
     collector = get_prompt_metrics()
@@ -3138,7 +3138,7 @@ async def get_prompt_timeline(
         hours: Time window (default 24)
         bucket_minutes: Bucket size in minutes (default 60)
     """
-    from middleware.prompt_metrics import get_prompt_metrics
+    from src.middleware.prompt_metrics import get_prompt_metrics
 
     hours = min(max(hours, 1), 168)
     bucket_minutes = min(max(bucket_minutes, 5), 360)

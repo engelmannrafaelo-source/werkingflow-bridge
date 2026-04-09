@@ -312,7 +312,7 @@ async def track_request_usage(
 
     # Also record in prompt performance metrics (in-memory, for CUI dashboard)
     try:
-        from middleware.prompt_metrics import get_prompt_metrics
+        from src.middleware.prompt_metrics import get_prompt_metrics
         collector = get_prompt_metrics()
         collector.record(
             app_id=app_id,
