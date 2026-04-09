@@ -161,13 +161,27 @@ class PerformanceMonitorMiddleware:
                             f"status={response_status} client={client_host}"
                         )
 
-                    # Record metrics
+                    # Record metrics (in-memory)
                     metrics.record_request(
                         endpoint=path,
                         duration=duration,
                         slow_threshold=slow,
                         very_slow_threshold=very_slow
                     )
+
+                    # Persist to JSONL (disk)
+                    try:
+                        from src.middleware.bridge_metrics_store import get_request_log
+                        get_request_log().record(
+                            method=method,
+                            endpoint=path,
+                            status_code=response_status or 0,
+                            duration_s=duration,
+                            tools_enabled=tools_enabled,
+                            client_ip=client_host,
+                        )
+                    except Exception:
+                        pass  # Non-critical
 
             # Send original message
             await send(message)

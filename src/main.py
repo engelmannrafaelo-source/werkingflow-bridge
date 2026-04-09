@@ -3210,6 +3210,80 @@ async def get_prompt_timeline(
     return collector.get_timeline(app_id=app_id, agent_id=agent_id, hours=hours, bucket_minutes=bucket_minutes)
 
 
+# ============================================================================
+# Persistent Request Log (all HTTP requests, stored on disk)
+# ============================================================================
+
+@app.get("/v1/metrics/request-log")
+async def get_request_log_endpoint(
+    hours: int = 24,
+    endpoint: Optional[str] = None,
+    status: Optional[str] = None,
+    limit: int = 200,
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(security)
+):
+    """
+    Get persistent request log from all workers.
+
+    Query params:
+        hours: Time window (default 24, 0 = all time)
+        endpoint: Filter by endpoint substring (e.g., "/v1/chat")
+        status: Filter by "success" or "error"
+        limit: Max recent entries (default 200)
+    """
+    from src.middleware.bridge_metrics_store import get_request_log
+    return get_request_log().query(
+        hours=max(hours, 0),
+        endpoint_filter=endpoint,
+        status_filter=status,
+        limit=min(limit, 1000),
+    )
+
+
+# ============================================================================
+# CC-Usage Snapshots (account limit history)
+# ============================================================================
+
+@app.get("/v1/metrics/cc-usage-history")
+async def get_cc_usage_history(
+    hours: int = 168,
+    limit: int = 500,
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(security)
+):
+    """
+    Get Claude Code account usage snapshot history.
+
+    Query params:
+        hours: Time window (default 168 = 7 days, 0 = all time)
+        limit: Max snapshots (default 500)
+    """
+    from src.middleware.bridge_metrics_store import get_cc_usage_store
+    return get_cc_usage_store().get_history(
+        hours=max(hours, 0),
+        limit=min(limit, 2000),
+    )
+
+
+@app.post("/v1/metrics/cc-usage-snapshot")
+async def save_cc_usage_snapshot(
+    request: Request,
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(security)
+):
+    """
+    Save a CC usage snapshot (called by CUI scraper after each scrape).
+
+    Body: { "accounts": [ { account, plan, currentSession, ... } ] }
+    """
+    body = await request.json()
+    accounts = body.get("accounts", [])
+    if not accounts:
+        raise HTTPException(status_code=400, detail="No accounts data provided")
+
+    from src.middleware.bridge_metrics_store import get_cc_usage_store
+    get_cc_usage_store().record_snapshot(accounts)
+    return {"status": "ok", "accounts_saved": len(accounts)}
+
+
 @app.exception_handler(HTTPException)
 async def http_exception_handler(request: Request, exc: HTTPException):
     """Format HTTP exceptions as OpenAI-style errors."""
