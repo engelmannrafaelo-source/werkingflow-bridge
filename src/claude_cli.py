@@ -1407,11 +1407,12 @@ CRITICAL: Write file EARLY to avoid context overflow. Use Write tool for clauded
             error_str = str(e).lower()
 
             # Errors that indicate this worker cannot handle ANY requests right now
+            # NOTE: "exit code 1" removed — SDK often returns exit code 1 even on
+            # successful completions. Cache recovery (below) handles this case.
             is_worker_unavailable = any(x in error_str for x in [
                 "credit balance", "balance is too low", "rate limit",
                 "authentication failed", "unauthorized", "invalid token",
                 "oauth token", "token expired", "401", "invalid api key",
-                "exit code 1"  # Generic SDK failure - let another worker try
             ])
 
             if is_worker_unavailable:
