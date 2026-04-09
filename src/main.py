@@ -508,8 +508,8 @@ app.add_middleware(TenantMiddleware)
 # Pure ASGI implementation - streaming-safe
 from src.middleware.performance_monitor import PerformanceMonitorMiddleware
 from src.middleware.event_logger import EventLogger
-# TEMPORARILY DISABLED: Python 3.13 + Starlette 0.46 BaseHTTPMiddleware bug
-# app.add_middleware(PerformanceMonitorMiddleware)
+# Re-enabled: Pure ASGI implementation, not affected by BaseHTTPMiddleware bug
+app.add_middleware(PerformanceMonitorMiddleware)
 
 # Concurrency limiter — enforced via FastAPI Depends() instead of BaseHTTPMiddleware
 # (BaseHTTPMiddleware disabled due to Python 3.13 + Starlette 0.46 bug)
