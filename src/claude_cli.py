@@ -106,9 +106,11 @@ class RateLimitError(Exception):
 class RateLimitTracker:
     """
     Tracks rate limit status per worker instance.
-    Parses reset times from Claude's rate limit messages.
+    Max cooldown: 10 minutes. After cooldown expires, worker is retried automatically.
+    If Anthropic still returns 429, a new 10-min cooldown is set.
     """
     _instance = None
+    MAX_COOLDOWN_SECONDS = 600  # 10 minutes — never block longer than this
 
     def __new__(cls):
         if cls._instance is None:
@@ -123,12 +125,18 @@ class RateLimitTracker:
         self._initialized = True
         self._logger = get_logger(__name__)
 
-    def parse_reset_time(self, message: str) -> Optional[datetime]:
+    def _cap_reset_time(self, reset_time: datetime) -> datetime:
+        """Cap reset time to MAX_COOLDOWN_SECONDS from now."""
+        max_reset = datetime.now() + timedelta(seconds=self.MAX_COOLDOWN_SECONDS)
+        if reset_time > max_reset:
+            self._logger.info(f"⏱️ Capping cooldown to {self.MAX_COOLDOWN_SECONDS}s (original: {reset_time})")
+            return max_reset
+        return reset_time
+
+    def parse_reset_time(self, message: str) -> datetime:
         """
         Parse reset time from Claude's rate limit messages.
-        Examples:
-        - "resets 1pm (Europe/Vienna)"
-        - "resets 2pm (Europe/Vienna)"
+        Always capped to MAX_COOLDOWN_SECONDS (10 min).
         """
         import re
         from datetime import datetime
@@ -150,28 +158,27 @@ class RateLimitTracker:
                 hour = 0
 
             try:
-                # Try to parse timezone
                 tz = pytz.timezone(timezone_str)
                 now = datetime.now(tz)
                 reset_time = now.replace(hour=hour, minute=0, second=0, microsecond=0)
 
-                # If reset time is in the past, it's for tomorrow
                 if reset_time <= now:
                     reset_time += timedelta(days=1)
 
                 self._logger.info(f"📅 Parsed reset time: {reset_time} ({timezone_str})")
-                return reset_time
+                return self._cap_reset_time(reset_time.replace(tzinfo=None))
             except Exception as e:
                 self._logger.warning(f"Failed to parse timezone '{timezone_str}': {e}")
 
-        # Fallback: 1 hour from now
-        return datetime.now() + timedelta(hours=1)
+        # Fallback: 10 minutes (was 1 hour)
+        return datetime.now() + timedelta(seconds=self.MAX_COOLDOWN_SECONDS)
 
     def mark_rate_limited(self, worker_id: str, message: str) -> datetime:
-        """Mark a worker as rate-limited and extract reset time"""
+        """Mark a worker as rate-limited. Cooldown capped to 10 minutes."""
         reset_time = self.parse_reset_time(message)
         self._rate_limits[worker_id] = reset_time
-        self._logger.warning(f"🚫 Worker {worker_id} rate-limited until {reset_time}")
+        remaining = int((reset_time - datetime.now()).total_seconds())
+        self._logger.warning(f"🚫 Worker {worker_id} rate-limited for {remaining}s (until {reset_time})")
         return reset_time
 
     def is_rate_limited(self, worker_id: str) -> bool:
@@ -179,8 +186,9 @@ class RateLimitTracker:
         if worker_id not in self._rate_limits:
             return False
         if datetime.now() >= self._rate_limits[worker_id]:
-            # Rate limit expired
+            # Cooldown expired — retry this worker
             del self._rate_limits[worker_id]
+            self._logger.info(f"✅ Worker {worker_id} cooldown expired, retrying")
             return False
         return True
 
@@ -188,12 +196,12 @@ class RateLimitTracker:
         """Get seconds until rate limit resets for a worker"""
         if worker_id in self._rate_limits:
             delta = self._rate_limits[worker_id] - datetime.now()
-            return max(60, int(delta.total_seconds()))
+            seconds = int(delta.total_seconds())
+            return max(0, min(seconds, self.MAX_COOLDOWN_SECONDS))
         return None
 
     def get_all_rate_limits(self) -> Dict[str, datetime]:
         """Get all current rate limits"""
-        # Clean up expired limits
         now = datetime.now()
         self._rate_limits = {k: v for k, v in self._rate_limits.items() if v > now}
         return self._rate_limits.copy()
