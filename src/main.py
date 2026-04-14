@@ -2845,6 +2845,46 @@ async def convert_pdf_endpoint(
         )
 
 
+@app.post("/v1/convert-pdf-to-semantic-html")
+async def convert_pdf_to_semantic_html_endpoint(
+    request: Request,
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(security)
+):
+    """Convert PDF to semantic HTML via ConvertAPI + AI. Proxied to privacy-pdf-service."""
+    await verify_api_key(request, credentials)
+
+    try:
+        form = await request.form()
+        file = form.get("file")
+        if not file:
+            return JSONResponse(
+                status_code=400,
+                content={"status": "error", "error": "No file uploaded. Send PDF as multipart/form-data with field name 'file'."}
+            )
+
+        filename = getattr(file, "filename", "upload.pdf") or "upload.pdf"
+        pdf_bytes = await file.read()
+
+        privacy_client = get_privacy_client()
+        client = await privacy_client._get_client()
+
+        # Forward as multipart to privacy-pdf-service
+        response = await client.post(
+            "/convert-pdf-to-semantic-html",
+            files={"file": (filename, pdf_bytes, "application/pdf")},
+            timeout=600.0,  # ConvertAPI + AI conversion can take several minutes
+        )
+        response.raise_for_status()
+        return JSONResponse(content=response.json())
+
+    except Exception as e:
+        logger.error(f"PDF-to-semantic-HTML proxy failed: {e}", exc_info=True)
+        return JSONResponse(
+            status_code=500,
+            content={"status": "error", "error": f"PDF-to-semantic-HTML conversion failed: {str(e)}"}
+        )
+
+
 @app.post("/v1/audio/transcriptions")
 async def audio_transcriptions(
     request: Request,
