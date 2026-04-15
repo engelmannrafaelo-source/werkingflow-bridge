@@ -27,9 +27,29 @@ logger = get_logger(__name__)
 # "rate_limit_event" (introduced in Node.js SDK v2.1.62+). This kills the entire
 # async generator, losing all subsequent messages.
 #
-# Fix: Patch parse_message() to skip unknown types instead of raising.
-# This allows the stream to continue and all content to be delivered.
+# CRITICAL FIX (Apr 2026):
+# "rate_limit_event" is NOT an error — it means the CLI detected a rate limit
+# and is WAITING to retry internally. The SDK should let the CLI handle it.
+# Previously we raised WorkerUnavailableError on rate-limit text detection,
+# which ABORTED the task. Now we:
+# 1. Parse rate_limit_event → log + track state (for monitoring/new request routing)
+# 2. Let the stream continue → CLI waits + retries → task completes
+# 3. Only abort if the overall timeout is exceeded
 # =============================================================================
+
+# Sentinel class for rate_limit_event messages (SDK doesn't have a type for these)
+class RateLimitEvent:
+    """Parsed rate_limit_event from Claude Code CLI. Not an error — CLI is retrying."""
+    def __init__(self, data: dict):
+        self.type = "rate_limit_event"
+        self.retry_after = data.get("retry_after", None)
+        self.reset_at = data.get("reset_at", None)
+        self.message = data.get("message", "")
+        self.raw = data
+
+    def __repr__(self):
+        return f"RateLimitEvent(retry_after={self.retry_after}, message={self.message[:80]})"
+
 try:
     import claude_code_sdk._internal.client as _sdk_client
     from claude_code_sdk._internal.message_parser import parse_message as _original_parse_message
@@ -37,13 +57,20 @@ try:
     _SKIPPED_TYPES_LOG = set()  # Track which types we've logged (avoid spam)
 
     def _resilient_parse_message(data):
-        """Wrapper that skips unknown message types instead of crashing."""
+        """Wrapper that handles unknown message types instead of crashing."""
         try:
             return _original_parse_message(data)
         except MessageParseError as e:
             error_msg = str(e).lower()
             if "unknown message type" in error_msg:
                 msg_type = data.get("type", "unknown") if isinstance(data, dict) else "unknown"
+
+                # SPECIAL HANDLING: rate_limit_event — parse it, don't skip
+                if msg_type == "rate_limit_event":
+                    logger.info(f"⏳ rate_limit_event received — CLI is waiting to retry internally")
+                    return RateLimitEvent(data)
+
+                # All other unknown types: skip silently
                 if msg_type not in _SKIPPED_TYPES_LOG:
                     logger.info(f"ℹ️ Skipping unrecognized SDK message type: {msg_type}")
                     _SKIPPED_TYPES_LOG.add(msg_type)
@@ -51,7 +78,7 @@ try:
             raise  # Re-raise genuine parse errors
 
     _sdk_client.parse_message = _resilient_parse_message
-    logger.info("✅ SDK message parser patched for unknown type resilience")
+    logger.info("✅ SDK message parser patched (rate_limit_event aware)")
 except Exception as patch_err:
     logger.warning(f"⚠️ Could not patch SDK message parser: {patch_err}")
     logger.warning("   Unknown message types will crash the stream (fallback to except handler)")
@@ -917,6 +944,23 @@ CRITICAL: Write file EARLY to avoid context overflow. Use Write tool for clauded
                             if message is None:
                                 continue
 
+                            # =============================================================
+                            # RATE LIMIT EVENT: CLI is waiting to retry — track but DON'T abort.
+                            # The CLI handles rate limits internally (waits + retries).
+                            # We just track the state so NEW requests are routed elsewhere.
+                            # =============================================================
+                            if isinstance(message, RateLimitEvent):
+                                worker_id = os.environ.get("INSTANCE_NAME", "unknown")
+                                logger.warning(
+                                    f"⏳ Worker {worker_id} received rate_limit_event — "
+                                    f"CLI is handling retry internally. "
+                                    f"retry_after={message.retry_after}, message={message.message[:120]}"
+                                )
+                                # Track for new-request routing (pre-check rejects new requests)
+                                rate_limit_tracker.mark_rate_limited(worker_id, message.message or "rate_limit_event")
+                                # DON'T raise, DON'T abort — let the stream continue
+                                continue
+
                             chunks_received += 1
 
                             # Collect message for file discovery
@@ -1040,16 +1084,21 @@ CRITICAL: Write file EARLY to avoid context overflow. Use Write tool for clauded
                                     logger.debug(f"🔍 Could not extract text from message: {e}")
 
                             # =================================================================
-                            # EARLY RATE LIMIT DETECTION
-                            # Must detect BEFORE yielding - once data is sent to client,
-                            # Nginx cannot failover to another worker!
+                            # RATE LIMIT TEXT DETECTION (track only, DON'T abort)
+                            #
+                            # The CLI handles rate limits internally — it waits and retries.
+                            # We track the state so NEW requests get routed to other workers,
+                            # but we do NOT abort this in-progress task.
+                            #
+                            # Previously this raised WorkerUnavailableError which killed
+                            # the task and wasted all tokens spent so far. Now the task
+                            # continues and completes after the CLI retries.
                             # =================================================================
                             if type(message).__name__ == 'AssistantMessage':
                                 if hasattr(message, 'content') and message.content:
                                     for block in message.content:
                                         if hasattr(block, 'text') and block.text:
                                             text_lower = block.text.lower()
-                                            # Check for rate limit patterns
                                             rate_limit_patterns = [
                                                 "hit your limit",
                                                 "you've hit your limit",
@@ -1057,30 +1106,22 @@ CRITICAL: Write file EARLY to avoid context overflow. Use Write tool for clauded
                                                 "usage limit",
                                                 "quota exceeded",
                                                 "too many requests",
-                                                "capacity",
-                                                "try again later"
                                             ]
                                             if any(pattern in text_lower for pattern in rate_limit_patterns):
-                                                error_msg = block.text[:200]
-                                                full_msg = block.text
-                                                logger.warning(f"🚫 RATE LIMIT DETECTED (early): {error_msg}")
-
-                                                # Track rate limit with reset time
                                                 worker_id = os.environ.get("INSTANCE_NAME", "unknown")
-                                                reset_time = rate_limit_tracker.mark_rate_limited(worker_id, full_msg)
+                                                full_msg = block.text
+                                                rate_limit_tracker.mark_rate_limited(worker_id, full_msg)
                                                 retry_after = rate_limit_tracker.get_retry_after(worker_id)
 
-                                                logger.warning(f"   Worker: {worker_id}")
-                                                logger.warning(f"   Reset time: {reset_time}")
-                                                logger.warning(f"   Retry-After: {retry_after}s")
-                                                logger.warning(f"   Raising WorkerUnavailableError for Nginx failover")
-
-                                                # Mark session as failed before raising
-                                                cli_session_manager.complete_session(cli_session_id, status="failed")
-
-                                                # Raise WorkerUnavailableError (triggers 503 for Nginx failover)
-                                                # The RateLimitError is used when ALL workers are exhausted
-                                                raise WorkerUnavailableError(f"Rate limit detected: {error_msg}")
+                                                logger.warning(
+                                                    f"⏳ Rate limit text detected on {worker_id} — "
+                                                    f"CLI will retry internally (reset in {retry_after}s). "
+                                                    f"Task continues, NOT aborting. "
+                                                    f"Message: {full_msg[:150]}"
+                                                )
+                                                # DON'T yield this message (it's not real content)
+                                                # DON'T raise — let the CLI handle the retry
+                                                continue
 
                             # =================================================================
                             # SKIP SYSTEMMESSAGE - Don't yield to client
