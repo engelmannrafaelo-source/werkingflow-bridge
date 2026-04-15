@@ -1405,6 +1405,20 @@ async def chat_completions(
         request_id = f"chatcmpl-{os.urandom(8).hex()}"
 
         # =======================================================================
+        # RATE LIMIT PRE-CHECK: Fail fast if this worker is already rate-limited.
+        # Returns 503 immediately so NGINX routes to another worker (no wasted
+        # Anthropic API call). This is the proactive counterpart to NGINX's
+        # reactive fail_timeout — the worker KNOWS it's rate-limited and says so.
+        # =======================================================================
+        worker_id = os.getenv("INSTANCE_NAME", "unknown")
+        if rate_limit_tracker.is_rate_limited(worker_id):
+            retry_after = rate_limit_tracker.get_retry_after(worker_id) or 60
+            logger.info(f"⏭️ Worker {worker_id} rate-limited, fast-rejecting (retry in {retry_after}s)")
+            raise WorkerUnavailableError(
+                f"Worker {worker_id} rate-limited. Reset in {retry_after}s."
+            )
+
+        # =======================================================================
         # BUDGET ENFORCEMENT: Check tenant limits before processing
         # =======================================================================
         tenant = get_tenant_from_request(request)
@@ -2187,6 +2201,15 @@ async def research(
     # Attribution enforcement
     enforce_attribution(request)
 
+    # Rate limit pre-check (fail fast → NGINX failover)
+    worker_id = os.getenv("INSTANCE_NAME", "unknown")
+    if rate_limit_tracker.is_rate_limited(worker_id):
+        retry_after = rate_limit_tracker.get_retry_after(worker_id) or 60
+        logger.info(f"⏭️ Worker {worker_id} rate-limited, fast-rejecting research (retry in {retry_after}s)")
+        raise WorkerUnavailableError(
+            f"Worker {worker_id} rate-limited. Reset in {retry_after}s."
+        )
+
     start_time = time.time()
     session_id = None
     container_file = None
@@ -2689,6 +2712,43 @@ async def get_stats(request: Request):
         "request_limiting": stats,
         "status": "healthy" if stats['active_requests'] < stats['max_concurrent'] else "busy",
         "can_accept_requests": stats['active_requests'] < stats['max_concurrent'] and stats['memory_usage_percent'] < stats['memory_threshold']
+    }
+
+
+@app.get("/worker-capacity")
+async def worker_capacity(request: Request):
+    """
+    Worker capacity endpoint for smart load balancing.
+
+    Returns this worker's current capacity status:
+    - available: Can accept requests
+    - rate_limited: Rate-limited, includes reset time
+    - busy: At max concurrent requests
+
+    NGINX or a smart router can poll this to route proactively
+    instead of waiting for 503 failover.
+    """
+    worker_id = os.getenv("INSTANCE_NAME", "unknown")
+    stats = request_limiter.get_stats()
+    is_limited = rate_limit_tracker.is_rate_limited(worker_id)
+    retry_after = rate_limit_tracker.get_retry_after(worker_id)
+
+    if is_limited:
+        status = "rate_limited"
+    elif stats['active_requests'] >= stats['max_concurrent']:
+        status = "busy"
+    else:
+        status = "available"
+
+    return {
+        "worker_id": worker_id,
+        "status": status,
+        "available": status == "available",
+        "active_requests": stats['active_requests'],
+        "max_concurrent": stats['max_concurrent'],
+        "rate_limited": is_limited,
+        "retry_after_seconds": retry_after,
+        "memory_usage_percent": stats.get('memory_usage_percent', 0),
     }
 
 
