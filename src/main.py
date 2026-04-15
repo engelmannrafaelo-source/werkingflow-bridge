@@ -752,6 +752,7 @@ async def generate_streaming_response(
     """
     cli_session_for_disconnect = None  # Track CLI session for disconnect detection
     streaming_started = asyncio.Event()  # Signal when streaming starts (prevents race condition)
+    stream_start_time = time.time()
 
     try:
         # VISION ROUTING: Check for images and route to direct Anthropic API
@@ -1169,6 +1170,54 @@ async def generate_streaming_response(
 
         yield "data: [DONE]\n\n"
 
+        # =====================================================================
+        # USAGE TRACKING for streaming (estimated tokens)
+        # Without this, streaming calls show 0 tokens in Bridge Monitor.
+        # =====================================================================
+        try:
+            stream_duration = time.time() - stream_start_time
+
+            # Estimate tokens from buffered chunks
+            assistant_text = claude_cli.parse_claude_message(chunks_buffer) if chunks_buffer else ""
+            est_prompt_tokens = MessageAdapter.estimate_tokens(prompt) if prompt else 0
+            est_completion_tokens = MessageAdapter.estimate_tokens(assistant_text) if assistant_text else 0
+
+            # Track with tenant (if available via request state)
+            tenant = get_tenant_from_request(fastapi_request) if fastapi_request else None
+            if tenant and (est_prompt_tokens > 0 or est_completion_tokens > 0):
+                from src.tenant import track_request_usage
+                attribution = extract_attribution_context(fastapi_request) if fastapi_request else {}
+                await track_request_usage(
+                    tenant=tenant,
+                    model=request.model,
+                    input_tokens=est_prompt_tokens,
+                    output_tokens=est_completion_tokens,
+                    endpoint="/v1/chat/completions/stream",
+                    latency_ms=int(stream_duration * 1000),
+                    status="success",
+                    **attribution
+                )
+                logger.info(f"📊 Streaming usage tracked: {est_prompt_tokens}+{est_completion_tokens} tokens")
+
+            # Log to prompt metrics (always, even without tenant)
+            from src.middleware.prompt_metrics import prompt_metrics_collector
+            if fastapi_request:
+                attr = extract_attribution_context(fastapi_request)
+                prompt_metrics_collector.record(
+                    app_id=attr.get("app_id") or "unknown",
+                    agent_id=attr.get("agent_id") or "unknown",
+                    workflow_id=attr.get("workflow_id"),
+                    model=request.model,
+                    input_tokens=est_prompt_tokens,
+                    output_tokens=est_completion_tokens,
+                    duration_ms=int(stream_duration * 1000),
+                    status="success",
+                    user_id=attr.get("user_id"),
+                    session_id=attr.get("session_id"),
+                )
+        except Exception as track_err:
+            logger.warning(f"⚠️ Streaming usage tracking failed (non-fatal): {track_err}")
+
     except WorkerUnavailableError:
         # Re-raise to trigger HTTP 503 and Nginx failover
         raise
@@ -1200,6 +1249,63 @@ async def generate_streaming_response(
 # =============================================================================
 # ATTRIBUTION HELPER
 # =============================================================================
+
+# Known app IDs for attribution enforcement.
+# Calls without X-App-ID (or X-Client-ID fallback) are warned, not rejected,
+# during the rollout phase. Set ENFORCE_ATTRIBUTION=strict to reject.
+KNOWN_APP_IDS = {
+    "engelmann", "werking-report", "werking-energy", "werking-safety",
+    "werking-noise", "cui", "platform", "acro-community",
+}
+
+
+def enforce_attribution(request: Request) -> dict:
+    """
+    Extract and enforce attribution headers.
+
+    Phase 1 (default): Log warnings for missing attribution, allow request.
+    Phase 2 (ENFORCE_ATTRIBUTION=strict): Reject requests without X-App-ID.
+
+    Returns the attribution context dict.
+    Raises HTTPException(400) in strict mode if X-App-ID is missing.
+    """
+    attribution = extract_attribution_context(request)
+    enforce_mode = os.environ.get("ENFORCE_ATTRIBUTION", "warn")
+
+    missing = []
+    if not attribution.get("app_id"):
+        missing.append("X-App-ID")
+    if not attribution.get("agent_id"):
+        missing.append("X-Agent-ID")
+
+    if missing:
+        client_id = request.headers.get("x-client-id") or request.headers.get("X-Client-ID") or "unknown"
+        auth_header = request.headers.get("authorization") or ""
+        bearer_hint = auth_header.split(" ")[-1][:16] + "..." if auth_header else "none"
+
+        logger.warning(
+            f"⚠️ ATTRIBUTION MISSING: {', '.join(missing)} | "
+            f"X-Client-ID={client_id} | Bearer={bearer_hint} | "
+            f"Resolved: app={attribution.get('app_id')}, agent={attribution.get('agent_id')}"
+        )
+
+        if enforce_mode == "strict" and "X-App-ID" in missing:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "error": {
+                        "message": "Missing required attribution header: X-App-ID",
+                        "type": "attribution_error",
+                        "code": "missing_app_id",
+                        "missing_headers": missing,
+                        "hint": "Add 'X-App-ID: <app-name>' header to your request. "
+                                f"Known apps: {', '.join(sorted(KNOWN_APP_IDS))}",
+                    }
+                }
+            )
+
+    return attribution
+
 
 def extract_attribution_context(request: Request) -> dict:
     """
@@ -1321,6 +1427,11 @@ async def chat_completions(
                         }
                     }
                 )
+
+        # =======================================================================
+        # ATTRIBUTION ENFORCEMENT: Ensure callers identify themselves
+        # =======================================================================
+        attribution = enforce_attribution(request)
 
         # MODEL RESOLUTION: Fuzzy match model names (e.g., "sonnet" -> "claude-sonnet-4-5-20250929")
         original_model = request_body.model
@@ -2072,6 +2183,9 @@ async def research(
     """
     # Verify API key
     await verify_api_key(request, credentials)
+
+    # Attribution enforcement
+    enforce_attribution(request)
 
     start_time = time.time()
     session_id = None
@@ -3248,6 +3362,58 @@ async def get_prompt_timeline(
     bucket_minutes = min(max(bucket_minutes, 5), 360)
     collector = get_prompt_metrics()
     return collector.get_timeline(app_id=app_id, agent_id=agent_id, hours=hours, bucket_minutes=bucket_minutes)
+
+
+@app.get("/v1/metrics/prompt-performance/calls")
+async def get_prompt_calls(
+    hours: int = 24,
+    limit: int = 200,
+    app_id: Optional[str] = None,
+    user_id: Optional[str] = None,
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(security)
+):
+    """
+    Get raw individual prompt calls (newest first) for activity feeds.
+
+    Unlike /prompt-performance which returns aggregated stats, this returns
+    individual call records with full attribution: app_id, user_id, model,
+    tokens, duration, status.
+
+    Query params:
+        hours: Time window (default 24, 0 = all time)
+        limit: Max entries (default 200, max 1000)
+        app_id: Filter by app (optional)
+        user_id: Filter by user (optional)
+    """
+    from src.middleware.prompt_metrics import get_prompt_metrics
+
+    collector = get_prompt_metrics()
+    return collector.get_recent_calls(
+        hours=max(hours, 0),
+        limit=min(limit, 1000),
+        app_id=app_id,
+        user_id=user_id,
+    )
+
+
+@app.get("/v1/metrics/usage-breakdown")
+async def get_usage_breakdown(
+    hours: int = 24,
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(security)
+):
+    """
+    Get token/cost breakdown per app, per user, per model.
+
+    Returns hierarchical data suitable for Sankey diagrams, cost analysis,
+    and per-user/per-app dashboards.
+
+    Query params:
+        hours: Time window (default 24, 0 = all time)
+    """
+    from src.middleware.prompt_metrics import get_prompt_metrics
+
+    collector = get_prompt_metrics()
+    return collector.get_usage_breakdown(hours=max(hours, 0))
 
 
 # ============================================================================
