@@ -41,6 +41,7 @@ from src.middleware.bridge_error import (
     BridgeError,
     throttle_error,
     queue_timeout_error,
+    account_exhausted_error,
 )
 
 logger = logging.getLogger(__name__)
@@ -79,6 +80,58 @@ up before responding with `queue_timeout`. Apps see latency, not an error.
 Set to 0 to disable queueing (immediate throttle reject)."""
 
 QUEUE_POLL_INTERVAL_SEC = float(os.getenv("ADAPTIVE_QUEUE_POLL_SEC", "0.5"))
+
+
+# ----------------------------------------------------------------------
+# Predictive weekly-budget throttle
+# ----------------------------------------------------------------------
+# The smart-worker-routing.sh marks a worker "down" in nginx when weekly=95%,
+# but that's a cliff: requests route fine at 94%, then suddenly no capacity.
+# To avoid the cliff we drop the admit budget as the weekly % climbs, so apps
+# experience gradual back-pressure (latency + throttle envelopes) rather than
+# sudden 503s from nginx.
+#
+# Ramp: identity below WEEKLY_THROTTLE_START_PCT, linear ramp down to MIN multi
+# between START and CEILING, then hard-reject above CEILING.
+WEEKLY_THROTTLE_START_PCT   = float(os.getenv("ADAPTIVE_WEEKLY_START_PCT", "80"))
+WEEKLY_THROTTLE_CEILING_PCT = float(os.getenv("ADAPTIVE_WEEKLY_CEILING_PCT", "95"))
+WEEKLY_THROTTLE_MIN_MULT    = float(os.getenv("ADAPTIVE_WEEKLY_MIN_MULT", "0.10"))
+WEEKLY_CACHE_TTL_SEC        = int(os.getenv("ADAPTIVE_WEEKLY_CACHE_TTL_SEC", "30"))
+
+# Account name → worker name (keep in sync with smart-worker-routing.sh)
+_WORKER_ACCOUNT_MAP = {
+    "worker1": "engelmann",
+    "worker2": "office",
+    "worker3": "gmail",
+    "worker4": "werking",
+}
+
+
+def _weekly_budget_multiplier(weekly_pct: float, session_pct: float) -> float:
+    """
+    Derive an admit-budget multiplier in [0.0, 1.0] from current weekly %
+    and session %. The stricter of the two wins.
+
+    Examples with defaults (START=80, CEILING=95, MIN=0.10):
+      weekly=50% → 1.00  (no throttle)
+      weekly=80% → 1.00  (ramp start)
+      weekly=87.5% → 0.55 (half-way down)
+      weekly=95% → 0.10  (barely any admission)
+      weekly=98% → 0.0   (reject — already past the wall)
+    """
+    def _mult(pct: float) -> float:
+        if pct <= WEEKLY_THROTTLE_START_PCT:
+            return 1.0
+        if pct >= WEEKLY_THROTTLE_CEILING_PCT:
+            # Above the routing cliff — nginx is about to mark us down. Let
+            # the last few calls through ONLY if well under the ceiling, else 0.
+            return 0.0 if pct >= WEEKLY_THROTTLE_CEILING_PCT + 2 else WEEKLY_THROTTLE_MIN_MULT
+        # Linear ramp from 1.0 → MIN across [START, CEILING]
+        span = max(0.01, WEEKLY_THROTTLE_CEILING_PCT - WEEKLY_THROTTLE_START_PCT)
+        t = (pct - WEEKLY_THROTTLE_START_PCT) / span
+        return max(WEEKLY_THROTTLE_MIN_MULT, 1.0 - t * (1.0 - WEEKLY_THROTTLE_MIN_MULT))
+
+    return min(_mult(weekly_pct), _mult(session_pct))
 
 
 # ----------------------------------------------------------------------
@@ -129,6 +182,16 @@ class AdaptiveLoadLimiter:
         # Counter of how many requests are currently parked in the queue.
         # Useful for the snapshot endpoint and for backpressure awareness.
         self._queued_count = 0
+
+        # Cached view of own-account weekly + session usage (refreshed via
+        # _refresh_account_usage every WEEKLY_CACHE_TTL_SEC). Keeps the hot
+        # path O(1) — no file I/O on every request.
+        self._account_usage: Dict[str, float] = {
+            "weekly_pct": 0.0,
+            "session_pct": 0.0,
+            "ts": 0.0,
+            "budget_multiplier": 1.0,
+        }
 
         os.makedirs(METRICS_DIR, exist_ok=True)
         self.state = self._load_state()
@@ -195,10 +258,60 @@ class AdaptiveLoadLimiter:
         except Exception:
             return 0
 
+    def _refresh_account_usage(self) -> None:
+        """
+        Update the cached own-account weekly+session %. Reads the shared
+        cc_usage_snapshots store; cheap enough to call once per admission
+        decision thanks to the TTL check. Silent-on-error (keeps last value).
+        """
+        now = time.time()
+        last_ts = self._account_usage.get("ts", 0.0)
+        if now - last_ts < WEEKLY_CACHE_TTL_SEC:
+            return
+        try:
+            from src.middleware.bridge_metrics_store import get_cc_usage_store
+            history = get_cc_usage_store().get_history(hours=1, limit=1)
+            snapshots = history.get("snapshots") or []
+            if not snapshots:
+                self._account_usage["ts"] = now  # mark attempted
+                return
+            target_account = _WORKER_ACCOUNT_MAP.get(self.worker)
+            for acc in snapshots[0].get("accounts", []):
+                if acc.get("account") != target_account:
+                    continue
+                weekly  = float(acc.get("weeklyAllModels", {}).get("percent", 0) or 0)
+                session = float(acc.get("currentSession", {}).get("percent", 0) or 0)
+                mult = _weekly_budget_multiplier(weekly, session)
+                self._account_usage = {
+                    "weekly_pct": weekly,
+                    "session_pct": session,
+                    "budget_multiplier": mult,
+                    "ts": now,
+                }
+                return
+            # No entry for us in the snapshot — mark attempted, keep prior
+            self._account_usage["ts"] = now
+        except Exception as e:
+            logger.debug(f"_refresh_account_usage failed: {e}")
+            self._account_usage["ts"] = now  # back off until next TTL
+
     def _effective_cap(self) -> int:
-        """Cap reduced by the safety margin — the actual admit threshold."""
+        """
+        Cap after safety margin AND predictive weekly-budget throttle.
+
+        Admit threshold = cap * (SAFETY_MARGIN_PCT/100) * budget_multiplier
+
+        When the account's weekly usage approaches the nginx-routing cliff
+        (95% marks worker `down`), the multiplier ramps from 1.0 to 0.1 across
+        the 80–95% band. Above 97% the multiplier becomes 0.0, rejecting all
+        admissions — nginx will mark us down shortly anyway, so refusing now
+        prevents in-flight requests from wasting the last few tokens of budget.
+        """
+        self._refresh_account_usage()
         margin = max(0.0, min(100.0, SAFETY_MARGIN_PCT))
-        return max(1, int(self.state.cap_tokens * margin / 100.0))
+        mult = float(self._account_usage.get("budget_multiplier", 1.0))
+        base = self.state.cap_tokens * margin / 100.0 * mult
+        return max(0, int(base))
 
     async def can_accept(self, est_tokens: int) -> tuple[bool, Optional[str], Dict[str, Any]]:
         """
@@ -211,6 +324,10 @@ class AdaptiveLoadLimiter:
             cap = self.state.cap_tokens
             effective_cap = self._effective_cap()
             would_be = inflight_tokens + max(0, est_tokens)
+            acct = self._account_usage
+            weekly_pct = float(acct.get("weekly_pct", 0.0))
+            session_pct = float(acct.get("session_pct", 0.0))
+            budget_mult = float(acct.get("budget_multiplier", 1.0))
             snapshot = {
                 "worker": self.worker,
                 "inflight_tokens": inflight_tokens,
@@ -222,6 +339,9 @@ class AdaptiveLoadLimiter:
                 "safety_margin_pct": SAFETY_MARGIN_PCT,
                 "utilization_pct": round(inflight_tokens * 100.0 / cap, 1) if cap > 0 else 0.0,
                 "hard_request_ceiling": HARD_REQUEST_CEILING,
+                "account_weekly_pct": weekly_pct,
+                "account_session_pct": session_pct,
+                "weekly_budget_multiplier": round(budget_mult, 3),
             }
             if inflight_count >= HARD_REQUEST_CEILING:
                 return False, (
@@ -229,11 +349,24 @@ class AdaptiveLoadLimiter:
                     f"({inflight_count}/{HARD_REQUEST_CEILING})"
                 ), snapshot
             if would_be > effective_cap:
-                return False, (
-                    f"In-flight token budget would exceed effective cap "
-                    f"({inflight_tokens:,} + {est_tokens:,} = {would_be:,} > "
-                    f"{effective_cap:,} = {SAFETY_MARGIN_PCT:.0f}% of {cap:,})"
-                ), snapshot
+                # If the weekly-budget multiplier has throttled us to near-zero,
+                # surface that as the primary reason (the cap_tokens number is
+                # irrelevant — the weekly limit is what's actually blocking).
+                if budget_mult < 0.5 and weekly_pct >= WEEKLY_THROTTLE_START_PCT:
+                    reason = (
+                        f"Weekly budget {weekly_pct:.1f}% (session {session_pct:.1f}%) "
+                        f"triggered predictive throttle (mult={budget_mult:.2f}). "
+                        f"Effective cap shrunk to {effective_cap:,} tokens; "
+                        f"would_be={would_be:,}."
+                    )
+                else:
+                    reason = (
+                        f"In-flight token budget would exceed effective cap "
+                        f"({inflight_tokens:,} + {est_tokens:,} = {would_be:,} > "
+                        f"{effective_cap:,} = {SAFETY_MARGIN_PCT:.0f}% of {cap:,}"
+                        + (f" * {budget_mult:.2f} weekly)" if budget_mult < 1.0 else ")")
+                    )
+                return False, reason, snapshot
             # Track peak utilization
             self._track_peak(time.time(), inflight_tokens)
             return True, None, snapshot
@@ -281,11 +414,26 @@ class AdaptiveLoadLimiter:
         # Fast-fail when the request size ALONE exceeds the effective cap.
         # No amount of waiting will admit it — let the caller know now so
         # they don't sit in the queue for the full timeout window.
-        if est_tokens > snap.get("effective_cap_tokens", 0):
-            return False, (
-                f"Request size {est_tokens:,} tokens exceeds effective cap "
-                f"{snap.get('effective_cap_tokens'):,} on its own; cannot be admitted."
-            ), snap, time.time() - start
+        effective_cap = snap.get("effective_cap_tokens", 0)
+        if est_tokens > effective_cap:
+            mult = snap.get("weekly_budget_multiplier", 1.0)
+            weekly = snap.get("account_weekly_pct", 0.0)
+            # When the weekly throttle has squeezed the cap to near-zero, the
+            # real blocker is the account budget — say so explicitly so apps
+            # can surface "account near limit" rather than "request too big".
+            if mult < 0.5 and weekly >= WEEKLY_THROTTLE_START_PCT:
+                reason = (
+                    f"Weekly budget {weekly:.1f}% has throttled effective cap "
+                    f"to {effective_cap:,} tokens (mult={mult:.2f}); "
+                    f"{est_tokens:,}-token request cannot be admitted. "
+                    f"Retry after weekly reset or try another worker."
+                )
+            else:
+                reason = (
+                    f"Request size {est_tokens:,} tokens exceeds effective cap "
+                    f"{effective_cap:,} on its own; cannot be admitted."
+                )
+            return False, reason, snap, time.time() - start
 
         # Slow path: park until either capacity frees up or we time out.
         ev = self._ensure_capacity_event()
@@ -450,10 +598,13 @@ class AdaptiveLoadLimiter:
         inflight_tokens = self._current_inflight_tokens()
         cap = self.state.cap_tokens
         recent_events = self._read_recent_events(limit=20)
+        # Ensure account_usage is fresh (also populates self._account_usage).
+        effective_cap = self._effective_cap()
+        acct = self._account_usage
         return {
             "worker": self.worker,
             "cap_tokens": cap,
-            "effective_cap_tokens": self._effective_cap(),
+            "effective_cap_tokens": effective_cap,
             "safety_margin_pct": SAFETY_MARGIN_PCT,
             "floor_tokens": self.state.floor_tokens,
             "ceiling_tokens": self.state.ceiling_tokens,
@@ -465,6 +616,9 @@ class AdaptiveLoadLimiter:
             "last_shrink_ts": self.state.last_shrink_ts,
             "last_tune_ts": self.state.last_tune_ts,
             "hard_request_ceiling": HARD_REQUEST_CEILING,
+            "account_weekly_pct": round(float(acct.get("weekly_pct", 0.0)), 2),
+            "account_session_pct": round(float(acct.get("session_pct", 0.0)), 2),
+            "weekly_budget_multiplier": round(float(acct.get("budget_multiplier", 1.0)), 3),
             "recent_events": recent_events,
             "config": {
                 "shrink_factor": SHRINK_FACTOR,
@@ -475,6 +629,9 @@ class AdaptiveLoadLimiter:
                 "grow_utilization_pct": GROW_UTILIZATION_PCT,
                 "tune_interval_sec": TUNE_INTERVAL_SEC,
                 "queue_wait_timeout_sec": QUEUE_WAIT_TIMEOUT_SEC,
+                "weekly_throttle_start_pct": WEEKLY_THROTTLE_START_PCT,
+                "weekly_throttle_ceiling_pct": WEEKLY_THROTTLE_CEILING_PCT,
+                "weekly_throttle_min_mult": WEEKLY_THROTTLE_MIN_MULT,
             },
         }
 
@@ -518,6 +675,11 @@ def estimate_request_tokens(body_dict: Dict[str, Any]) -> int:
     separately by the sliding-window TPM if/when needed.
     """
     chars = 0
+    # Defensive: this runs BEFORE FastAPI's pydantic validation, so the body
+    # may be malformed (e.g. messages=string). Treat any unexpected shape as
+    # zero-chars and let the schema validator return a proper 422 envelope.
+    if not isinstance(body_dict, dict):
+        return 1
     sys = body_dict.get("system")
     if isinstance(sys, str):
         chars += len(sys)
@@ -525,16 +687,20 @@ def estimate_request_tokens(body_dict: Dict[str, Any]) -> int:
         for blk in sys:
             if isinstance(blk, dict):
                 t = blk.get("text") or ""
-                chars += len(t)
-    for m in body_dict.get("messages", []) or []:
-        c = m.get("content")
-        if isinstance(c, str):
-            chars += len(c)
-        elif isinstance(c, list):
-            for blk in c:
-                if isinstance(blk, dict):
-                    t = blk.get("text") or ""
-                    chars += len(t)
+                chars += len(t) if isinstance(t, str) else 0
+    messages = body_dict.get("messages")
+    if isinstance(messages, list):
+        for m in messages:
+            if not isinstance(m, dict):
+                continue
+            c = m.get("content")
+            if isinstance(c, str):
+                chars += len(c)
+            elif isinstance(c, list):
+                for blk in c:
+                    if isinstance(blk, dict):
+                        t = blk.get("text") or ""
+                        chars += len(t) if isinstance(t, str) else 0
     return max(1, chars // 4)
 
 
@@ -579,9 +745,21 @@ async def adaptive_limit_dependency(request: Request) -> None:
         return
 
     # Queue exhausted — emit structured envelope. Caller sees a Retry-After
-    # header and a clear "bridge_internal/queue_timeout" body.
+    # header and a clear body tagged by the reason:
+    #   * weekly budget exhausted → account_exhausted (source=bridge_account)
+    #   * queue timeout after wait → queue_timeout     (source=bridge_internal)
+    #   * cap-full w/o waiting     → throttle          (source=bridge_internal)
     cap = snap.get("cap_tokens", 0)
     inflight = snap.get("inflight_tokens", 0)
+    mult = snap.get("weekly_budget_multiplier", 1.0)
+    weekly_pct = snap.get("account_weekly_pct", 0.0)
+
+    # If the weekly throttle is what's blocking (not transient queue pressure),
+    # report as account-level — apps should back off for a long time, not retry
+    # in 30s. Retry-After is best-effort: a plain hour if we can't be smarter.
+    if mult <= WEEKLY_THROTTLE_MIN_MULT and weekly_pct >= WEEKLY_THROTTLE_START_PCT:
+        raise BridgeError(account_exhausted_error(retry_after_s=3600))
+
     if waited_s >= max(1.0, QUEUE_WAIT_TIMEOUT_SEC * 0.5):
         raise BridgeError(queue_timeout_error(cap, inflight, waited_s))
     # If we never actually waited (queue disabled), report as plain throttle.

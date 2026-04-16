@@ -258,3 +258,64 @@ def internal_error(
         status_code=status_code,
         retry_after_s=10 if status_code >= 500 else None,
     )
+
+
+# ----------------------------------------------------------------------
+# Exception classifier — maps raw Exceptions from SDK / network layers
+# onto the correct bridge error envelope so callers can discriminate
+# `upstream_anthropic` vs `upstream_network` vs `bridge_internal`.
+# ----------------------------------------------------------------------
+_UPSTREAM_TRANSIENT_MARKERS = (
+    "overloaded", "overloaded_error", "overload",
+    "too many requests", "rate_limit_error", "rate limit",
+    "503", "502", "504", "529", "500",
+    "service_unavailable", "bad_gateway", "gateway_timeout",
+    "temporarily unavailable",
+)
+_UPSTREAM_NETWORK_MARKERS = (
+    "timeout", "timed out", "connection reset", "connection refused",
+    "connectionerror", "readtimeout", "connecttimeout",
+    "dns", "name resolution", "broken pipe", "eof",
+)
+
+
+def classify_exception(exc: Exception) -> JSONResponse:
+    """
+    Map an arbitrary Exception to the most specific bridge error envelope.
+
+    Preference order:
+      1. Network/timeout markers  → upstream_timeout (source=upstream_network, 504)
+      2. Upstream HTTP markers    → upstream_error   (source=upstream_anthropic, 502)
+      3. Everything else          → internal_error   (source=bridge_internal, 500)
+
+    The caller should `raise BridgeError(classify_exception(e))` — the global
+    handler then returns the envelope as the HTTP response.
+    """
+    msg = str(exc) or exc.__class__.__name__
+    lower = msg.lower()
+
+    # 1. Network / timeout — distinct from API-level errors
+    if any(marker in lower for marker in _UPSTREAM_NETWORK_MARKERS):
+        # Try to extract waited duration from msg; otherwise 0
+        import re as _re
+        m = _re.search(r"(\d+(?:\.\d+)?)\s*s\b", lower)
+        waited = float(m.group(1)) if m else 0.0
+        return upstream_timeout_error(waited_s=waited, retry_after_s=15)
+
+    # 2. Upstream API error (Anthropic or other backend)
+    if any(marker in lower for marker in _UPSTREAM_TRANSIENT_MARKERS):
+        # Map common HTTP codes — pick the most relevant status for the envelope
+        status_code = 502
+        if any(x in lower for x in ("504", "gateway_timeout", "gateway timeout")):
+            status_code = 504
+        elif any(x in lower for x in ("503", "service_unavailable", "overloaded", "529")):
+            status_code = 503
+        return upstream_error(detail=msg[:200], status_code=status_code, retry_after_s=15)
+
+    # 3. Fallthrough — bridge-internal unexpected
+    return internal_error(detail=msg[:200], status_code=500)
+
+
+def raise_classified(exc: Exception) -> None:
+    """Convenience: classify + raise in one call."""
+    raise BridgeError(classify_exception(exc))

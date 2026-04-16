@@ -116,10 +116,17 @@ from src.middleware.adaptive_limiter import (
 from src.middleware.bridge_error import (
     BridgeError,
     bridge_error,
+    classify_exception,
     SOURCE_BRIDGE_INTERNAL,
     SOURCE_UPSTREAM_ANTHROPIC,
     TYPE_INTERNAL,
 )
+# Starlette's HTTPException is raised by the router itself (e.g. for 404 Not
+# Found). It's a PARENT class of fastapi.HTTPException — the FastAPI one inherits
+# from it — so a handler registered for the Starlette base class also catches
+# every FastAPI HTTPException. Without this, 404s from missing routes return a
+# raw {"detail": "Not Found"} instead of our envelope.
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
 # Configure centralized logging
 # Backwards compatibility: Support DEBUG_MODE/VERBOSE for log level override
@@ -591,11 +598,20 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
             debug_info["raw_request_body"] = f"Could not read request body: {type(e).__name__}: {e}"
             logger.debug(f"Request body read error: {e}")
     
+    # Validation errors originate in the bridge (before any upstream call) but
+    # they're client-caused: retrying won't fix them. Tag as bridge_internal /
+    # validation_error with retryable=false so callers know not to retry.
     error_response = {
         "error": {
-            "message": "Request validation failed - the request body doesn't match the expected format",
-            "type": "validation_error", 
+            "message": f"[Bridge {os.getenv('INSTANCE_NAME', 'unknown')}] Request validation failed - the request body doesn't match the expected format",
+            "type": "validation_error",
             "code": "invalid_request_error",
+            "source": SOURCE_BRIDGE_INTERNAL,
+            "bridge_type": "validation_error",
+            "retryable": False,
+            "retry_after_s": None,
+            "bridge_worker": os.getenv("INSTANCE_NAME", "unknown"),
+            "timestamp": int(time.time()),
             "details": error_details,
             "help": {
                 "common_issues": [
@@ -608,7 +624,7 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
             }
         }
     }
-    
+
     # Add debug info if available
     if debug_info:
         error_response["error"]["debug"] = debug_info
@@ -1825,7 +1841,8 @@ async def chat_completions(
 
             except Exception as e:
                 logger.error(f"❌ Vision request failed: {e}", exc_info=True)
-                raise HTTPException(status_code=500, detail=f"Vision analysis failed: {str(e)}")
+                # Vision provider errors are upstream — tag accordingly
+                raise BridgeError(classify_exception(e))
 
             # Continue with normal SDK flow (no vision content)
             # Process messages with session management
@@ -2341,7 +2358,11 @@ async def chat_completions(
             logger.debug(f"rolling_metrics completion (Exception) failed: {_e}")
 
         logger.error(f"Chat completion error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        # Classify — upstream markers (overloaded/gateway/timeout) get tagged
+        # as source=upstream_anthropic / upstream_network so apps can tell the
+        # error came from Anthropic, not the bridge itself. Only unclassifiable
+        # exceptions fall through to `bridge_internal` / internal.
+        raise BridgeError(classify_exception(e))
 
 
 @app.post("/v1/research", response_model=ResearchResponse)
@@ -3912,10 +3933,14 @@ async def bridge_error_handler(request: Request, exc: BridgeError):
     return exc.response
 
 
-@app.exception_handler(HTTPException)
-async def http_exception_handler(request: Request, exc: HTTPException):
+@app.exception_handler(StarletteHTTPException)
+async def http_exception_handler(request: Request, exc: StarletteHTTPException):
     """
     Format HTTP exceptions as OpenAI-style errors WITH bridge discriminators.
+
+    Registered against the Starlette base class so this ALSO catches 404s
+    raised by the router itself (missing route) and 405s (method not allowed),
+    not just fastapi.HTTPException instances from our own `raise` statements.
 
     Existing handlers in this file still `raise HTTPException(...)` for various
     reasons (auth, validation, upstream errors). We don't want callers to
@@ -3947,6 +3972,25 @@ async def http_exception_handler(request: Request, exc: HTTPException):
         message=str(detail),
         status_code=exc.status_code,
     )
+
+
+@app.exception_handler(Exception)
+async def generic_exception_handler(request: Request, exc: Exception):
+    """
+    Last-resort catch-all: any unhandled exception in a dependency or handler
+    becomes a structured envelope instead of Starlette's raw
+    `Internal Server Error` plain-text 500. This is critical — without it,
+    apps would see plain text on edge cases (malformed body, pre-validator
+    crashes, etc.) and could not programmatically discriminate bridge errors.
+
+    Classification reuses the upstream/network/internal marker logic from
+    `classify_exception`, so e.g. a bubbled-up `httpx.ConnectTimeout` still
+    ends up tagged `upstream_network` rather than `bridge_internal`.
+    """
+    logger.exception(
+        f"Unhandled exception on {request.method} {request.url.path}: {exc}"
+    )
+    return classify_exception(exc)
 
 
 def find_available_port(start_port: int = 8000, max_attempts: int = 10) -> int:
