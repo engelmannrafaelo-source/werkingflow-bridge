@@ -113,6 +113,13 @@ from src.middleware.adaptive_limiter import (
     get_adaptive_limiter,
     estimate_request_tokens,
 )
+from src.middleware.bridge_error import (
+    BridgeError,
+    bridge_error,
+    SOURCE_BRIDGE_INTERNAL,
+    SOURCE_UPSTREAM_ANTHROPIC,
+    TYPE_INTERNAL,
+)
 
 # Configure centralized logging
 # Backwards compatibility: Support DEBUG_MODE/VERBOSE for log level override
@@ -652,13 +659,20 @@ async def worker_unavailable_handler(request: Request, exc: WorkerUnavailableErr
         status_code=503,
         content={
             "error": {
-                "message": error_message,
+                # OpenAI-compat
+                "message": f"[Bridge {worker_id}] {error_message}",
                 "type": "service_unavailable",
                 "code": "503",
+                # Bridge discriminators — let apps distinguish "bridge failover"
+                # from a real upstream error.
+                "source": "bridge_account",
+                "bridge_type": "worker_unavailable",
+                "bridge_worker": worker_id,
+                "retryable": True,
                 "retry": True,
-                "worker_id": worker_id,
                 "rate_limited": rate_limited,
-                "retry_after_seconds": retry_after
+                "retry_after_s": retry_after,
+                "retry_after_seconds": retry_after,  # legacy alias
             }
         },
         headers={
@@ -700,12 +714,22 @@ async def rate_limit_handler(request: Request, exc: RateLimitError):
         status_code=429,
         content={
             "error": {
-                "message": f"All workers rate-limited. Please retry after {retry_after} seconds.",
+                # OpenAI-compat
+                "message": (
+                    f"[Bridge {worker_id}] All Anthropic accounts at weekly limit. "
+                    f"Retry after {retry_after}s."
+                ),
                 "type": "rate_limit_exceeded",
                 "code": "429",
+                # Bridge discriminators
+                "source": "bridge_account",
+                "bridge_type": "account_exhausted",
+                "bridge_worker": worker_id,
+                "retryable": True,
                 "retry": True,
-                "retry_after_seconds": retry_after,
-                "reset_time": exc.reset_time.isoformat() if exc.reset_time else None
+                "retry_after_s": retry_after,
+                "retry_after_seconds": retry_after,  # legacy alias
+                "reset_time": exc.reset_time.isoformat() if exc.reset_time else None,
             }
         },
         headers={
@@ -3880,18 +3904,48 @@ async def get_queue_forecast(
     }
 
 
+@app.exception_handler(BridgeError)
+async def bridge_error_handler(request: Request, exc: BridgeError):
+    """Unwrap BridgeError → its carried structured response. The envelope is
+    pre-built by helpers in src/middleware/bridge_error.py so apps see a
+    consistent `{error: {source, bridge_type, retry_after_s, ...}}` shape."""
+    return exc.response
+
+
 @app.exception_handler(HTTPException)
 async def http_exception_handler(request: Request, exc: HTTPException):
-    """Format HTTP exceptions as OpenAI-style errors."""
-    return JSONResponse(
+    """
+    Format HTTP exceptions as OpenAI-style errors WITH bridge discriminators.
+
+    Existing handlers in this file still `raise HTTPException(...)` for various
+    reasons (auth, validation, upstream errors). We don't want callers to
+    confuse "Anthropic returned 502" with "bridge had an internal problem", so
+    every HTTPException is annotated as `source: bridge_internal` here. Code
+    paths that know better (e.g. upstream proxy) should `raise BridgeError(
+    upstream_error(...))` instead so the source is correctly tagged.
+    """
+    detail = exc.detail
+    # If detail is already a dict with our envelope shape, pass through.
+    if isinstance(detail, dict) and "source" in detail:
+        return JSONResponse(status_code=exc.status_code, content={"error": detail})
+    # If detail is a dict with arbitrary fields, preserve them as extra.
+    if isinstance(detail, dict):
+        message = detail.get("message") or detail.get("error") or str(detail)
+        extra = {k: v for k, v in detail.items() if k not in ("message", "error")}
+        return bridge_error(
+            source=SOURCE_BRIDGE_INTERNAL,
+            error_type=TYPE_INTERNAL,
+            message=str(message),
+            status_code=exc.status_code,
+            retry_after_s=detail.get("retry_after_seconds") or detail.get("retry_after_s"),
+            extra=extra,
+        )
+    # Plain string detail
+    return bridge_error(
+        source=SOURCE_BRIDGE_INTERNAL,
+        error_type=TYPE_INTERNAL,
+        message=str(detail),
         status_code=exc.status_code,
-        content={
-            "error": {
-                "message": exc.detail,
-                "type": "api_error",
-                "code": str(exc.status_code)
-            }
-        }
     )
 
 

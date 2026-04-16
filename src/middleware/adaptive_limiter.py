@@ -37,6 +37,12 @@ from typing import Optional, Dict, Any, List
 
 from fastapi import HTTPException, Request
 
+from src.middleware.bridge_error import (
+    BridgeError,
+    throttle_error,
+    queue_timeout_error,
+)
+
 logger = logging.getLogger(__name__)
 
 # ----------------------------------------------------------------------
@@ -61,6 +67,18 @@ HARD_REQUEST_CEILING = int(os.getenv("ADAPTIVE_HARD_REQUEST_CEILING", "100"))
 """Optional safety net: never allow more than this many in-flight requests
 regardless of token budget. Protects against runaway memory if estimates
 are way off. 100 is generous; this is just a backstop, not a primary limit."""
+
+SAFETY_MARGIN_PCT = float(os.getenv("ADAPTIVE_SAFETY_MARGIN_PCT", "85"))
+"""Reserve the top N% of cap as a buffer. New requests are admitted only up
+to (cap * SAFETY_MARGIN_PCT / 100). Protects against the first 429 slipping
+through while the auto-tuner is still converging on the true ceiling."""
+
+QUEUE_WAIT_TIMEOUT_SEC = int(os.getenv("ADAPTIVE_QUEUE_WAIT_SEC", "60"))
+"""When the cap is full, await up to this many seconds for capacity to free
+up before responding with `queue_timeout`. Apps see latency, not an error.
+Set to 0 to disable queueing (immediate throttle reject)."""
+
+QUEUE_POLL_INTERVAL_SEC = float(os.getenv("ADAPTIVE_QUEUE_POLL_SEC", "0.5"))
 
 
 # ----------------------------------------------------------------------
@@ -105,6 +123,12 @@ class AdaptiveLoadLimiter:
         self._lock = asyncio.Lock()
         self._tune_task: Optional[asyncio.Task] = None
         self._stopped = False
+        # Signaled whenever a request completes — wakes up any tasks waiting
+        # for capacity. Created lazily so we bind it to the running event loop.
+        self._capacity_event: Optional[asyncio.Event] = None
+        # Counter of how many requests are currently parked in the queue.
+        # Useful for the snapshot endpoint and for backpressure awareness.
+        self._queued_count = 0
 
         os.makedirs(METRICS_DIR, exist_ok=True)
         self.state = self._load_state()
@@ -171,6 +195,11 @@ class AdaptiveLoadLimiter:
         except Exception:
             return 0
 
+    def _effective_cap(self) -> int:
+        """Cap reduced by the safety margin — the actual admit threshold."""
+        margin = max(0.0, min(100.0, SAFETY_MARGIN_PCT))
+        return max(1, int(self.state.cap_tokens * margin / 100.0))
+
     async def can_accept(self, est_tokens: int) -> tuple[bool, Optional[str], Dict[str, Any]]:
         """
         Returns (accepted, reject_reason, snapshot).
@@ -180,6 +209,7 @@ class AdaptiveLoadLimiter:
             inflight_tokens = self._current_inflight_tokens()
             inflight_count = self._current_inflight_count()
             cap = self.state.cap_tokens
+            effective_cap = self._effective_cap()
             would_be = inflight_tokens + max(0, est_tokens)
             snapshot = {
                 "worker": self.worker,
@@ -188,6 +218,8 @@ class AdaptiveLoadLimiter:
                 "estimated_request_tokens": est_tokens,
                 "would_be_total": would_be,
                 "cap_tokens": cap,
+                "effective_cap_tokens": effective_cap,
+                "safety_margin_pct": SAFETY_MARGIN_PCT,
                 "utilization_pct": round(inflight_tokens * 100.0 / cap, 1) if cap > 0 else 0.0,
                 "hard_request_ceiling": HARD_REQUEST_CEILING,
             }
@@ -196,14 +228,90 @@ class AdaptiveLoadLimiter:
                     f"Hard request ceiling reached "
                     f"({inflight_count}/{HARD_REQUEST_CEILING})"
                 ), snapshot
-            if would_be > cap:
+            if would_be > effective_cap:
                 return False, (
-                    f"In-flight token budget would exceed cap "
-                    f"({inflight_tokens:,} + {est_tokens:,} = {would_be:,} > {cap:,})"
+                    f"In-flight token budget would exceed effective cap "
+                    f"({inflight_tokens:,} + {est_tokens:,} = {would_be:,} > "
+                    f"{effective_cap:,} = {SAFETY_MARGIN_PCT:.0f}% of {cap:,})"
                 ), snapshot
             # Track peak utilization
             self._track_peak(time.time(), inflight_tokens)
             return True, None, snapshot
+
+    def _ensure_capacity_event(self) -> asyncio.Event:
+        """Lazy-create the capacity event on the running loop."""
+        if self._capacity_event is None:
+            self._capacity_event = asyncio.Event()
+        return self._capacity_event
+
+    def signal_capacity_freed(self) -> None:
+        """
+        Called by the request lifecycle (record_completion path) whenever a
+        request ends, so any task parked in `acquire_with_wait` can re-check
+        capacity. Cheap; safe to call from the request thread.
+        """
+        ev = self._capacity_event
+        if ev is not None and not ev.is_set():
+            try:
+                ev.set()
+            except Exception:
+                pass
+
+    async def acquire_with_wait(
+        self,
+        est_tokens: int,
+        timeout_s: Optional[float] = None,
+    ) -> tuple[bool, Optional[str], Dict[str, Any], float]:
+        """
+        Try to admit a request, awaiting up to `timeout_s` for capacity if
+        currently full. Returns (accepted, reason, snapshot, waited_s).
+
+        If `timeout_s` is None, uses QUEUE_WAIT_TIMEOUT_SEC. Pass 0 for
+        immediate-reject behaviour (no queueing).
+        """
+        if timeout_s is None:
+            timeout_s = float(QUEUE_WAIT_TIMEOUT_SEC)
+
+        start = time.time()
+        # Fast path — usually capacity is available, no queueing needed.
+        accepted, reason, snap = await self.can_accept(est_tokens)
+        if accepted or timeout_s <= 0:
+            return accepted, reason, snap, time.time() - start
+
+        # Fast-fail when the request size ALONE exceeds the effective cap.
+        # No amount of waiting will admit it — let the caller know now so
+        # they don't sit in the queue for the full timeout window.
+        if est_tokens > snap.get("effective_cap_tokens", 0):
+            return False, (
+                f"Request size {est_tokens:,} tokens exceeds effective cap "
+                f"{snap.get('effective_cap_tokens'):,} on its own; cannot be admitted."
+            ), snap, time.time() - start
+
+        # Slow path: park until either capacity frees up or we time out.
+        ev = self._ensure_capacity_event()
+        deadline = start + timeout_s
+        self._queued_count += 1
+        try:
+            while True:
+                remaining = deadline - time.time()
+                if remaining <= 0:
+                    break
+                ev.clear()
+                try:
+                    await asyncio.wait_for(
+                        ev.wait(),
+                        timeout=min(QUEUE_POLL_INTERVAL_SEC, remaining),
+                    )
+                except asyncio.TimeoutError:
+                    pass  # poll-tick — re-check capacity
+                accepted, reason, snap = await self.can_accept(est_tokens)
+                if accepted:
+                    return accepted, None, snap, time.time() - start
+            # Timed out — final snapshot for diagnostics
+            _, reason_final, snap_final = await self.can_accept(est_tokens)
+            return False, reason_final or reason, snap_final, time.time() - start
+        finally:
+            self._queued_count = max(0, self._queued_count - 1)
 
     def _track_peak(self, now: float, inflight_tokens: int) -> None:
         cutoff = now - max(GROW_TRIGGER_SEC, 600)
@@ -345,10 +453,13 @@ class AdaptiveLoadLimiter:
         return {
             "worker": self.worker,
             "cap_tokens": cap,
+            "effective_cap_tokens": self._effective_cap(),
+            "safety_margin_pct": SAFETY_MARGIN_PCT,
             "floor_tokens": self.state.floor_tokens,
             "ceiling_tokens": self.state.ceiling_tokens,
             "inflight_tokens": inflight_tokens,
             "inflight_count": self._current_inflight_count(),
+            "queued_count": self._queued_count,
             "utilization_pct": round(inflight_tokens * 100.0 / cap, 1) if cap > 0 else 0.0,
             "last_rate_limit_ts": self.state.last_rate_limit_ts,
             "last_shrink_ts": self.state.last_shrink_ts,
@@ -363,6 +474,7 @@ class AdaptiveLoadLimiter:
                 "shrink_cooldown_sec": SHRINK_COOLDOWN_SEC,
                 "grow_utilization_pct": GROW_UTILIZATION_PCT,
                 "tune_interval_sec": TUNE_INTERVAL_SEC,
+                "queue_wait_timeout_sec": QUEUE_WAIT_TIMEOUT_SEC,
             },
         }
 
@@ -430,9 +542,11 @@ async def adaptive_limit_dependency(request: Request) -> None:
     """
     FastAPI dependency for chat-completions endpoints. Reads the request body
     once, stashes it on the request for the handler to reuse, then enforces
-    the adaptive token budget.
+    the adaptive token budget — queueing if necessary so the caller sees
+    latency, not an error.
 
-    Raises HTTPException(503) when over budget.
+    Raises BridgeError (handled globally → structured envelope) only when the
+    queue itself times out.
 
     NOTE: `request` MUST have the `Request` type annotation; otherwise FastAPI
     treats it as a required query parameter and rejects every request with 422.
@@ -455,15 +569,20 @@ async def adaptive_limit_dependency(request: Request) -> None:
     request.state.adaptive_est_tokens = est
 
     limiter = get_adaptive_limiter()
-    accepted, reason, snap = await limiter.can_accept(est)
-    if not accepted:
-        raise HTTPException(
-            status_code=503,
-            detail={
-                "error": "Bridge token-budget exceeded",
-                "reason": reason,
-                "retry_after_seconds": 5,
-                "worker": WORKER_NAME,
-                "snapshot": snap,
-            },
-        )
+    accepted, reason, snap, waited_s = await limiter.acquire_with_wait(est)
+    if accepted:
+        if waited_s > 0.5:
+            logger.info(
+                f"adaptive_limit: queued {waited_s:.2f}s before admission "
+                f"(est_tokens={est}, inflight={snap.get('inflight_tokens')})"
+            )
+        return
+
+    # Queue exhausted — emit structured envelope. Caller sees a Retry-After
+    # header and a clear "bridge_internal/queue_timeout" body.
+    cap = snap.get("cap_tokens", 0)
+    inflight = snap.get("inflight_tokens", 0)
+    if waited_s >= max(1.0, QUEUE_WAIT_TIMEOUT_SEC * 0.5):
+        raise BridgeError(queue_timeout_error(cap, inflight, waited_s))
+    # If we never actually waited (queue disabled), report as plain throttle.
+    raise BridgeError(throttle_error(cap, inflight))

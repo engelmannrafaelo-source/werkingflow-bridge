@@ -107,6 +107,8 @@ class RollingMetrics:
     ) -> None:
         """
         Mark a request as finished. `status` is "success" / "error" / "timeout".
+        Also signals the AdaptiveLoadLimiter so any queued requests waiting
+        for capacity wake up immediately (no polling delay).
         """
         with self._lock:
             ts = self._now_bucket()
@@ -125,6 +127,17 @@ class RollingMetrics:
             self._in_flight_input_tokens[worker] = max(
                 0, self._in_flight_input_tokens[worker] - decrement
             )
+
+        # Wake any task parked in AdaptiveLoadLimiter.acquire_with_wait. We
+        # do this OUTSIDE the metrics lock to avoid lock-ordering issues, and
+        # only when the worker matches our process (the limiter is per-worker).
+        if worker == WORKER_NAME:
+            try:
+                from src.middleware.adaptive_limiter import get_adaptive_limiter
+                get_adaptive_limiter().signal_capacity_freed()
+            except Exception:
+                # Limiter may not be initialised yet during early startup.
+                pass
 
     def record_rate_limit(self, worker: str) -> None:
         """Mark that a real rate-limit event was observed on `worker`."""
