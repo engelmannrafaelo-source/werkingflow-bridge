@@ -107,6 +107,12 @@ except ImportError:
 
 # Request limiting for memory protection
 from src.request_limiter import get_limiter, RequestLimiterMiddleware, PureASGIRequestLimiter, concurrency_limit
+# Adaptive token-budget limiter (replaces static MAX_CONCURRENT_REQUESTS gating)
+from src.middleware.adaptive_limiter import (
+    adaptive_limit_dependency,
+    get_adaptive_limiter,
+    estimate_request_tokens,
+)
 
 # Configure centralized logging
 # Backwards compatibility: Support DEBUG_MODE/VERBOSE for log level override
@@ -475,11 +481,28 @@ async def lifespan(app: FastAPI):
     asyncio.create_task(_gemini_daily_reset())
     logger.info("🔄 Gemini daily rate limit reset task scheduled (midnight UTC)")
 
+    # Initialize adaptive token-budget limiter and start its background tune loop.
+    # The limiter persists its cap across restarts, so we don't reset state here —
+    # we just spin up the periodic auto-tune task.
+    try:
+        _ad_limiter = get_adaptive_limiter()
+        _ad_limiter.start_tune_loop()
+        logger.info(
+            f"🎚️  AdaptiveLoadLimiter active: cap={_ad_limiter.state.cap_tokens:,} tokens "
+            f"(floor={_ad_limiter.state.floor_tokens:,}, ceiling={_ad_limiter.state.ceiling_tokens:,})"
+        )
+    except Exception as _e:
+        logger.error(f"Failed to start AdaptiveLoadLimiter: {_e}")
+
     yield
-    
+
     # Cleanup on shutdown
     logger.info("Shutting down session manager...")
     session_manager.shutdown()
+    try:
+        get_adaptive_limiter().stop()
+    except Exception:
+        pass
 
 
 # Create FastAPI app
@@ -1245,6 +1268,31 @@ async def generate_streaming_response(
         elif monitor_task:
             logger.debug("✅ Disconnect monitor task already completed")
 
+        # Rolling-metrics completion for streaming. Without this, streaming
+        # requests would never decrement in_flight/in_flight_input_tokens —
+        # poisoning the AdaptiveLoadLimiter's view of capacity.
+        try:
+            if fastapi_request and getattr(fastapi_request.state, "arrival_recorded", False):
+                from src.middleware.rolling_metrics import get_rolling_metrics
+                _stream_dur_ms = int((time.time() - stream_start_time) * 1000)
+                # Best-effort token counts; if streaming-success block computed
+                # them, use those. Otherwise fall back to estimate of 0.
+                _in_tok = int(locals().get("est_prompt_tokens", 0) or 0)
+                _out_tok = int(locals().get("est_completion_tokens", 0) or 0)
+                get_rolling_metrics().record_completion(
+                    worker=os.getenv("INSTANCE_NAME", "unknown"),
+                    status="success" if _in_tok or _out_tok else "error",
+                    duration_ms=_stream_dur_ms,
+                    input_tokens=_in_tok,
+                    output_tokens=_out_tok,
+                    est_input_tokens_at_arrival=int(
+                        getattr(fastapi_request.state, "adaptive_est_tokens", 0) or 0
+                    ),
+                )
+                fastapi_request.state.arrival_recorded = False
+        except Exception as _e:
+            logger.debug(f"rolling_metrics completion (stream finally) failed: {_e}")
+
 
 # =============================================================================
 # ATTRIBUTION HELPER
@@ -1369,7 +1417,7 @@ async def chat_completions(
     request_body: ChatCompletionRequest,
     request: Request,
     credentials: Optional[HTTPAuthorizationCredentials] = Depends(security),
-    _concurrency=Depends(concurrency_limit)
+    _adaptive=Depends(adaptive_limit_dependency)
 ):
     """OpenAI-compatible chat completions endpoint."""
     import time
@@ -1403,6 +1451,21 @@ async def chat_completions(
     
     try:
         request_id = f"chatcmpl-{os.urandom(8).hex()}"
+
+        # Rolling-metrics arrival event (per-worker rate tracking, in-memory).
+        # We pass the same token estimate the AdaptiveLoadLimiter used so that
+        # in-flight token accounting matches the gating decision exactly.
+        _arrival_est_tokens = int(getattr(request.state, "adaptive_est_tokens", 0) or 0)
+        request.state.arrival_recorded = False
+        try:
+            from src.middleware.rolling_metrics import get_rolling_metrics
+            get_rolling_metrics().record_arrival(
+                os.getenv("INSTANCE_NAME", "unknown"),
+                est_input_tokens=_arrival_est_tokens,
+            )
+            request.state.arrival_recorded = True
+        except Exception as _e:
+            logger.debug(f"rolling_metrics arrival hook failed: {_e}")
 
         # =======================================================================
         # RATE LIMIT PRE-CHECK: Fail fast if this worker is already rate-limited.
@@ -1958,6 +2021,43 @@ async def chat_completions(
             # Worker instance info for multi-worker deployments
             worker_instance = os.getenv("INSTANCE_NAME", "unknown")
 
+            # Rolling-metrics completion (non-streaming success).
+            # Releases this request's slice of the in-flight token budget.
+            try:
+                if getattr(request.state, "arrival_recorded", False):
+                    from src.middleware.rolling_metrics import get_rolling_metrics
+                    get_rolling_metrics().record_completion(
+                        worker=worker_instance,
+                        status="success",
+                        duration_ms=int(duration * 1000),
+                        input_tokens=int(prompt_tokens or 0),
+                        output_tokens=int(completion_tokens or 0),
+                        est_input_tokens_at_arrival=int(getattr(request.state, "adaptive_est_tokens", 0) or 0),
+                    )
+                    request.state.arrival_recorded = False
+            except Exception as _e:
+                logger.debug(f"rolling_metrics completion (success) hook failed: {_e}")
+
+            # Track non-streaming success in prompt metrics (with token estimates)
+            try:
+                from src.middleware.prompt_metrics import get_prompt_metrics
+                attribution = extract_attribution_context(request)
+                get_prompt_metrics().record(
+                    app_id=attribution.get("app_id"),
+                    agent_id=attribution.get("agent_id"),
+                    workflow_id=attribution.get("workflow_id"),
+                    duration_ms=int(duration * 1000),
+                    status="success",
+                    model=request_body.model,
+                    input_tokens=prompt_tokens,
+                    output_tokens=completion_tokens,
+                    user_id=attribution.get("user_id"),
+                    session_id=attribution.get("session_id"),
+                    job_id=attribution.get("job_id"),
+                )
+            except Exception as e:
+                logger.warning(f"prompt_metrics record (success) failed: {e}")
+
             # Add file metadata if available (OpenAI-compatible extension)
             if metadata_chunk:
                 # Convert response to dict and add metadata
@@ -2020,10 +2120,28 @@ async def chat_completions(
             tools_enabled=request_body.enable_tools
         )
         logger.error(f"Chat completion HTTP error: {http_exc.status_code} - {http_exc.detail}")
+        # Rolling-metrics completion (HTTP error path). MUST decrement in-flight
+        # so the AdaptiveLoadLimiter's budget recovers.
+        try:
+            if getattr(request.state, "arrival_recorded", False):
+                from src.middleware.rolling_metrics import get_rolling_metrics
+                get_rolling_metrics().record_completion(
+                    worker=os.getenv("INSTANCE_NAME", "unknown"),
+                    status="error",
+                    duration_ms=int(duration * 1000),
+                    input_tokens=0,
+                    output_tokens=0,
+                    est_input_tokens_at_arrival=int(getattr(request.state, "adaptive_est_tokens", 0) or 0),
+                )
+                request.state.arrival_recorded = False
+        except Exception as _e:
+            logger.debug(f"rolling_metrics completion (HTTPException) failed: {_e}")
         # Track error in prompt metrics (even without tenant)
         try:
             from src.middleware.prompt_metrics import get_prompt_metrics
             attribution = extract_attribution_context(request)
+            # Estimate input tokens if prompt was already built
+            est_input = MessageAdapter.estimate_tokens(prompt) if 'prompt' in locals() and prompt else 0
             get_prompt_metrics().record(
                 app_id=attribution.get("app_id"),
                 agent_id=attribution.get("agent_id"),
@@ -2031,6 +2149,8 @@ async def chat_completions(
                 duration_ms=int(duration * 1000),
                 status="error",
                 model=request_body.model,
+                input_tokens=est_input,
+                output_tokens=0,
                 error_code=str(http_exc.status_code),
                 user_id=attribution.get("user_id"),
                 session_id=attribution.get("session_id"),
@@ -2040,11 +2160,29 @@ async def chat_completions(
             pass
         raise
     except WorkerUnavailableError:
+        # Rolling-metrics completion (worker rate-limited 503 path).
+        try:
+            if getattr(request.state, "arrival_recorded", False):
+                _wud = time.time() - start_time
+                from src.middleware.rolling_metrics import get_rolling_metrics
+                get_rolling_metrics().record_completion(
+                    worker=os.getenv("INSTANCE_NAME", "unknown"),
+                    status="error",
+                    duration_ms=int(_wud * 1000),
+                    input_tokens=0,
+                    output_tokens=0,
+                    est_input_tokens_at_arrival=int(getattr(request.state, "adaptive_est_tokens", 0) or 0),
+                )
+                request.state.arrival_recorded = False
+        except Exception as _e:
+            logger.debug(f"rolling_metrics completion (WorkerUnavailableError) failed: {_e}")
         # Track 503 in prompt metrics before re-raise for Nginx failover
         try:
             duration = time.time() - start_time
             from src.middleware.prompt_metrics import get_prompt_metrics
             attribution = extract_attribution_context(request)
+            # Estimate input tokens if prompt was already built
+            est_input = MessageAdapter.estimate_tokens(prompt) if 'prompt' in locals() and prompt else 0
             get_prompt_metrics().record(
                 app_id=attribution.get("app_id"),
                 agent_id=attribution.get("agent_id"),
@@ -2052,6 +2190,8 @@ async def chat_completions(
                 duration_ms=int(duration * 1000),
                 status="error",
                 model=request_body.model,
+                input_tokens=est_input,
+                output_tokens=0,
                 error_code="503",
                 user_id=attribution.get("user_id"),
                 session_id=attribution.get("session_id"),
@@ -2160,6 +2300,22 @@ async def chat_completions(
             tools_enabled=request_body.enable_tools
         )
 
+        # Rolling-metrics completion (generic exception path).
+        try:
+            if getattr(request.state, "arrival_recorded", False):
+                from src.middleware.rolling_metrics import get_rolling_metrics
+                get_rolling_metrics().record_completion(
+                    worker=os.getenv("INSTANCE_NAME", "unknown"),
+                    status="error",
+                    duration_ms=int(duration * 1000),
+                    input_tokens=0,
+                    output_tokens=0,
+                    est_input_tokens_at_arrival=int(getattr(request.state, "adaptive_est_tokens", 0) or 0),
+                )
+                request.state.arrival_recorded = False
+        except Exception as _e:
+            logger.debug(f"rolling_metrics completion (Exception) failed: {_e}")
+
         logger.error(f"Chat completion error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -2169,7 +2325,7 @@ async def research(
     request_body: ResearchRequest,
     request: Request,
     credentials: Optional[HTTPAuthorizationCredentials] = Depends(security),
-    _concurrency=Depends(concurrency_limit)
+    _adaptive=Depends(adaptive_limit_dependency)
 ):
     """
     Dedicated research endpoint for Claude Code research tasks.
@@ -3456,6 +3612,36 @@ async def get_prompt_calls(
     )
 
 
+@app.get("/v1/metrics/throughput")
+async def get_throughput(
+    hours: int = 24,
+    bucket_seconds: int = 60,
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(security)
+):
+    """
+    Per-worker request/token throughput timeline + empirical rate-limit ceiling.
+
+    For each worker returns a time-bucketed series of:
+      rpm, in_tpm, out_tpm, err_count, had_429, had_503
+
+    Plus an empirical "ceiling" object per worker that derives a safe
+    throttle setting from observed throughput vs error events:
+      - first_error_*       : throughput when errors first started
+      - max_clean_*         : highest sustained throughput with zero errors
+      - recommendation_*    : suggested bridge throttle (safety margin applied)
+
+    Query params:
+        hours          : lookback window (default 24, max 168)
+        bucket_seconds : bucket size (default 60, min 10, max 600)
+    """
+    from src.middleware.prompt_metrics import get_prompt_metrics
+
+    hours = min(max(hours, 1), 168)
+    bucket_seconds = min(max(bucket_seconds, 10), 600)
+    collector = get_prompt_metrics()
+    return collector.get_throughput(hours=hours, bucket_seconds=bucket_seconds)
+
+
 @app.get("/v1/metrics/usage-breakdown")
 async def get_usage_breakdown(
     hours: int = 24,
@@ -3548,6 +3734,150 @@ async def save_cc_usage_snapshot(
     from src.middleware.bridge_metrics_store import get_cc_usage_store
     get_cc_usage_store().record_snapshot(accounts)
     return {"status": "ok", "accounts_saved": len(accounts)}
+
+
+@app.get("/v1/metrics/queue-forecast")
+async def get_queue_forecast(
+    window: int = 60,
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(security)
+):
+    """
+    Short-term load + queue forecast based on rolling in-memory metrics
+    AND the latest CC-usage snapshot.
+
+    Query params:
+        window: aggregation window in seconds (default 60, max 600)
+
+    Returns per-worker arrival/completion rates, in-flight counts, and
+    a `forecast` block with simple drain/saturation estimates.
+
+    NOTE: Rolling metrics live ONLY in this worker process (the one that
+    serves this request). The values are best read while the request flows
+    through nginx in a round-robin fashion — over a few requests, all four
+    workers will report. The CC-usage block is global (shared snapshot store).
+    """
+    from src.middleware.rolling_metrics import get_rolling_metrics
+    from src.middleware.bridge_metrics_store import get_cc_usage_store
+
+    summary = get_rolling_metrics().get_summary(window_seconds=window)
+
+    # Latest CC-usage snapshot (per account / per worker via account map)
+    latest_snapshot: Optional[Dict[str, Any]] = None
+    try:
+        history = get_cc_usage_store().get_history(hours=1, limit=1)
+        snapshots = history.get("snapshots") or []
+        if snapshots:
+            latest_snapshot = snapshots[0]
+    except Exception as e:
+        logger.warning(f"queue-forecast: cannot read cc-usage-history: {e}")
+
+    account_to_worker = {
+        "engelmann": "worker1",
+        "office":    "worker2",
+        "gmail":     "worker3",
+        "werking":   "worker4",
+    }
+    worker_limits: Dict[str, Dict[str, Any]] = {}
+    if latest_snapshot:
+        for acc in latest_snapshot.get("accounts", []):
+            name = acc.get("account", "")
+            worker = account_to_worker.get(name)
+            if not worker:
+                continue
+            weekly = acc.get("weeklyAllModels", {}).get("percent", 0) or 0
+            session = acc.get("currentSession", {}).get("percent", 0) or 0
+            worker_limits[worker] = {
+                "account": name,
+                "weekly_percent": weekly,
+                "session_percent": session,
+                "active": (weekly < 95) and (session < 95),
+            }
+
+    # Compute simple forecast
+    totals = summary["totals"]
+    workers = summary["workers"]
+    in_flight_total = totals.get("in_flight", 0)
+    completions_per_min = totals.get("completions_per_min", 0)
+    arrivals_per_min = totals.get("arrivals_per_min", 0)
+    drain_per_s = round(completions_per_min / 60.0, 3)
+    arrival_per_s = round(arrivals_per_min / 60.0, 3)
+
+    # ETA empty: in-flight count / drain-rate
+    eta_empty_s = (
+        round(in_flight_total / drain_per_s, 1)
+        if drain_per_s > 0 and in_flight_total > 0 else
+        (0 if in_flight_total == 0 else None)
+    )
+
+    # Active workers (not rate-limited per latest snapshot)
+    active_workers = sum(1 for w in worker_limits.values() if w["active"]) \
+        if worker_limits else None
+
+    # Net: positive = queue building up, negative = draining
+    net_per_s = round(arrival_per_s - drain_per_s, 3)
+    backlog_trend = (
+        "growing" if net_per_s > 0.05 else
+        "draining" if net_per_s < -0.05 else
+        "stable"
+    )
+
+    # Simple risk scoring per worker (saturated if very few completions and many in-flight)
+    saturation: Dict[str, str] = {}
+    for w_name, w in workers.items():
+        in_flight = w.get("in_flight", 0)
+        comp_pm = w.get("completions_per_min", 0)
+        rl_hits = w.get("rate_limit_hits", 0)
+        if rl_hits > 0:
+            saturation[w_name] = "rate_limited"
+        elif in_flight >= 5:
+            saturation[w_name] = "saturated"
+        elif in_flight >= 3:
+            saturation[w_name] = "busy"
+        elif comp_pm > 0 or in_flight > 0:
+            saturation[w_name] = "ok"
+        else:
+            saturation[w_name] = "idle"
+
+    rate_limit_risk = (
+        "high" if totals.get("rate_limit_hits", 0) > 0 or (active_workers is not None and active_workers <= 1) else
+        "medium" if (active_workers is not None and active_workers == 2) else
+        "low"
+    )
+
+    # Adaptive token-budget limiter snapshot (this worker only — each worker
+    # auto-tunes independently because each owns its own Anthropic account).
+    adaptive_limiter_snapshot: Optional[Dict[str, Any]] = None
+    try:
+        adaptive_limiter_snapshot = get_adaptive_limiter().snapshot()
+    except Exception as _e:
+        logger.debug(f"queue-forecast: adaptive limiter snapshot unavailable: {_e}")
+
+    return {
+        "window_seconds": summary["window_seconds"],
+        "now": summary["now"],
+        "worker_self": summary["worker_self"],
+        "workers": workers,
+        "worker_limits": worker_limits,
+        "saturation": saturation,
+        "totals": totals,
+        "forecast": {
+            "in_flight_total": in_flight_total,
+            "drain_rate_per_s": drain_per_s,
+            "arrival_rate_per_s": arrival_per_s,
+            "net_per_s": net_per_s,
+            "backlog_trend": backlog_trend,
+            "eta_empty_s": eta_empty_s,
+            "active_workers": active_workers,
+            "rate_limit_risk": rate_limit_risk,
+        },
+        "adaptive_limiter": adaptive_limiter_snapshot,
+        "note": (
+            "Rolling-metrics are per-process; only THIS worker's view is shown. "
+            "Account-limit data is global (shared snapshot store). "
+            "adaptive_limiter is per-worker; collect from all 4 workers to see "
+            "the full bridge picture."
+        ),
+    }
 
 
 @app.exception_handler(HTTPException)
