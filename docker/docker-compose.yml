@@ -276,6 +276,42 @@ services:
     networks:
       - bridge-net
 
+  # =============================================================================
+  # Metrics Reader — decoupled read-only historical metrics service
+  # =============================================================================
+  # Survives worker crashes / 503-storms. Serves /v1/metrics/* endpoints from
+  # JSONL on disk so the CUI Bridge Monitor keeps working even when the whole
+  # worker pool is down. Volume is mounted READ-ONLY as defence-in-depth.
+  metrics-reader:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.metrics-reader
+    container_name: eco-wrapper-metrics-reader
+    expose:
+      - "8000"
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+        reservations:
+          memory: 64M
+    volumes:
+      # READ-ONLY mount — reader must never write to the metrics volume.
+      - eco-wrapper-logs:/app/logs:ro
+    environment:
+      - METRICS_DIR=/app/logs
+      - LOG_LEVEL=INFO
+      - TZ=Europe/Vienna
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    restart: unless-stopped
+    networks:
+      - bridge-net
+
 networks:
   bridge-net:
     driver: bridge

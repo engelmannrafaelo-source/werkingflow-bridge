@@ -382,6 +382,388 @@ class PromptMetricsCollector:
             "timeline": timeline,
         }
 
+    def get_usage_breakdown(self, hours: int = 24) -> Dict[str, Any]:
+        """
+        Token/cost breakdown grouped by app, user, model.
+
+        Used by the Stats tab and Sankey visualisation.
+
+        Returns:
+          summary       — totals (calls, in/out/total tokens, errors)
+          apps          — per app_id with nested agents+users counts
+          users         — per user_id with nested apps counts
+          models        — per model
+          sankey_links  — app → user → model flow links
+        """
+        cutoff = time.time() - (hours * 3600) if hours > 0 else 0
+
+        with self._lock:
+            own_calls = [c for c in self._calls if c.timestamp >= cutoff]
+        other_calls = self._load_all_workers(cutoff)
+        all_calls = own_calls + other_calls
+
+        # Per-app
+        app_buckets: Dict[str, Dict[str, Any]] = {}
+        # Per-user
+        user_buckets: Dict[str, Dict[str, Any]] = {}
+        # Per-model
+        model_buckets: Dict[str, Dict[str, Any]] = {}
+        # Sankey edges (counts)
+        app_user: Dict[tuple, int] = defaultdict(int)
+        user_model: Dict[tuple, int] = defaultdict(int)
+
+        total_calls = 0
+        total_in = 0
+        total_out = 0
+        total_err = 0
+
+        for c in all_calls:
+            in_tok = c.input_tokens or 0
+            out_tok = c.output_tokens or 0
+            tot_tok = in_tok + out_tok
+            is_err = c.status != "success"
+
+            total_calls += 1
+            total_in += in_tok
+            total_out += out_tok
+            if is_err:
+                total_err += 1
+
+            # App
+            a = app_buckets.setdefault(c.app_id, {
+                "app_id": c.app_id,
+                "calls": 0, "input_tokens": 0, "output_tokens": 0,
+                "total_tokens": 0, "errors": 0,
+                "agents": defaultdict(int), "users": defaultdict(int),
+            })
+            a["calls"] += 1
+            a["input_tokens"] += in_tok
+            a["output_tokens"] += out_tok
+            a["total_tokens"] += tot_tok
+            if is_err:
+                a["errors"] += 1
+            a["agents"][c.agent_id] += 1
+            if c.user_id:
+                a["users"][c.user_id] += 1
+
+            # User
+            uid = c.user_id or "anonymous"
+            u = user_buckets.setdefault(uid, {
+                "user_id": uid,
+                "calls": 0, "input_tokens": 0, "output_tokens": 0,
+                "total_tokens": 0, "apps": defaultdict(int),
+            })
+            u["calls"] += 1
+            u["input_tokens"] += in_tok
+            u["output_tokens"] += out_tok
+            u["total_tokens"] += tot_tok
+            u["apps"][c.app_id] += 1
+
+            # Model
+            m = model_buckets.setdefault(c.model, {
+                "model": c.model,
+                "calls": 0, "input_tokens": 0, "output_tokens": 0,
+                "total_tokens": 0,
+            })
+            m["calls"] += 1
+            m["input_tokens"] += in_tok
+            m["output_tokens"] += out_tok
+            m["total_tokens"] += tot_tok
+
+            # Sankey
+            app_user[(c.app_id, uid)] += 1
+            user_model[(uid, c.model)] += 1
+
+        # Convert defaultdicts → regular dicts and compute error_rate
+        apps_list = []
+        for a in sorted(app_buckets.values(), key=lambda x: x["total_tokens"], reverse=True):
+            apps_list.append({
+                **a,
+                "agents": dict(a["agents"]),
+                "users": dict(a["users"]),
+                "error_rate": round((a["errors"] / a["calls"]) * 100, 1) if a["calls"] > 0 else 0.0,
+            })
+
+        users_list = []
+        for u in sorted(user_buckets.values(), key=lambda x: x["total_tokens"], reverse=True):
+            users_list.append({**u, "apps": dict(u["apps"])})
+
+        models_list = sorted(model_buckets.values(), key=lambda x: x["total_tokens"], reverse=True)
+
+        sankey_links = []
+        for (src, tgt), val in app_user.items():
+            sankey_links.append({"source": f"app:{src}", "target": f"user:{tgt}", "value": val})
+        for (src, tgt), val in user_model.items():
+            sankey_links.append({"source": f"user:{src}", "target": f"model:{tgt}", "value": val})
+
+        return {
+            "summary": {
+                "total_calls": total_calls,
+                "total_input_tokens": total_in,
+                "total_output_tokens": total_out,
+                "total_tokens": total_in + total_out,
+                "total_errors": total_err,
+            },
+            "apps": apps_list,
+            "users": users_list,
+            "models": models_list,
+            "sankey_links": sankey_links,
+            "period_hours": hours,
+        }
+
+    def get_recent_calls(
+        self,
+        hours: int = 24,
+        limit: int = 200,
+        app_id: Optional[str] = None,
+        user_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """
+        Return raw individual calls (newest first) with full attribution.
+
+        Used by the Stats / Activity tab to show a live feed of recent prompts
+        with model, tokens, status, duration, and user.
+        """
+        cutoff = time.time() - (hours * 3600) if hours > 0 else 0
+
+        with self._lock:
+            own_calls = [c for c in self._calls if c.timestamp >= cutoff]
+        other_calls = self._load_all_workers(cutoff)
+
+        all_calls = own_calls + other_calls
+
+        # Optional filters
+        if app_id:
+            all_calls = [c for c in all_calls if c.app_id == app_id]
+        if user_id:
+            all_calls = [c for c in all_calls if c.user_id == user_id]
+
+        # Newest first
+        all_calls.sort(key=lambda c: c.timestamp, reverse=True)
+        truncated = all_calls[:limit]
+
+        return {
+            "calls": [asdict(c) for c in truncated],
+            "period_hours": hours,
+            "limit": limit,
+            "returned": len(truncated),
+            "total_matching": len(all_calls),
+            "filters": {"app_id": app_id, "user_id": user_id},
+        }
+
+    def get_throughput(self, hours: int = 24, bucket_seconds: int = 60) -> Dict[str, Any]:
+        """
+        Per-worker throughput timeline + empirical capacity ceiling.
+
+        Each prompt-call record falls into one of three categories:
+          1. success                — worker handled the call, upstream OK
+          2. bridge_concurrency_503 — worker rejected (max_concurrent reached);
+                                      logged once per rejection, then nginx
+                                      retries the next worker. This is the
+                                      bridge's BACKPRESSURE signal — when this
+                                      starts firing, we are at internal capacity.
+          3. upstream_error         — worker tried, upstream returned non-OK
+                                      (429 rate limit, 5xx, timeout, fallback fail)
+
+        Per bucket we expose all three rates so the operator can SEE which
+        ceiling we hit first (bridge concurrency vs Anthropic limits).
+
+        Per bucket fields:
+          - success_rpm     : successful requests per minute
+          - upstream_err_rpm: non-503 errors per minute (real upstream failures)
+          - reject_rpm      : 503 concurrency rejections per minute (backpressure)
+          - offered_rpm     : success + upstream_err + reject  (= total demand)
+          - in_tpm/out_tpm  : tokens per minute (success calls only)
+          - had_429         : any "rate_limit" / 429 marker in bucket
+          - had_5xx         : any non-503 5xx in bucket
+
+        Empirical capacity ceiling (per worker):
+          - first_reject_rpm  : offered_rpm at the bucket where 503 rejections
+                                first appeared (= the rate at which this worker
+                                started saturating its concurrency slot)
+          - max_clean_rpm     : highest sustained success_rpm with 0 rejects + 0 errors
+          - recommendation_rpm: safe per-worker throttle =
+                                  min(max_clean × 0.9, first_reject × 0.8)
+
+        The recommendation is an instruction to the CALLER:
+          "keep your offered load below this many req/min PER WORKER and the
+           bridge will not start dropping concurrency-limited requests."
+        Multiply by N workers for total bridge capacity.
+        """
+        cutoff = time.time() - (hours * 3600) if hours > 0 else 0
+        norm_factor = 60.0 / bucket_seconds
+
+        with self._lock:
+            own_calls = [c for c in self._calls if c.timestamp >= cutoff]
+        other_calls = self._load_all_workers(cutoff)
+        all_calls = own_calls + other_calls
+
+        per_worker: Dict[str, List[PromptCall]] = defaultdict(list)
+        for call in all_calls:
+            wkey = call.worker or "unknown"
+            per_worker[wkey].append(call)
+
+        result: Dict[str, Any] = {}
+
+        for wkey, calls in per_worker.items():
+            buckets: Dict[int, Dict[str, Any]] = defaultdict(
+                lambda: {"success": 0, "upstream_err": 0, "reject_503": 0,
+                         "in": 0, "out": 0,
+                         "had_429": False, "had_5xx": False}
+            )
+            errors_list: List[Dict[str, Any]] = []
+
+            for c in calls:
+                bk = int(c.timestamp // bucket_seconds) * bucket_seconds
+                b = buckets[bk]
+
+                code = (c.error_code or "").lower()
+                is_success = c.status == "success"
+                is_503 = (not is_success) and ("503" in code)
+
+                if is_success:
+                    b["success"] += 1
+                    b["in"] += c.input_tokens or 0
+                    b["out"] += c.output_tokens or 0
+                elif is_503:
+                    b["reject_503"] += 1
+                else:
+                    b["upstream_err"] += 1
+                    if "rate_limit" in code or "429" in code:
+                        b["had_429"] = True
+                    elif code:
+                        b["had_5xx"] = True
+                    errors_list.append({
+                        "ts": c.timestamp,
+                        "code": c.error_code,
+                        "status": c.status,
+                        "duration_ms": c.duration_ms,
+                    })
+
+            sorted_buckets = []
+            for ts in sorted(buckets.keys()):
+                b = buckets[ts]
+                offered = b["success"] + b["upstream_err"] + b["reject_503"]
+                sorted_buckets.append({
+                    "ts": ts,
+                    "success_rpm": round(b["success"] * norm_factor, 2),
+                    "upstream_err_rpm": round(b["upstream_err"] * norm_factor, 2),
+                    "reject_rpm": round(b["reject_503"] * norm_factor, 2),
+                    "offered_rpm": round(offered * norm_factor, 2),
+                    "in_tpm": round(b["in"] * norm_factor),
+                    "out_tpm": round(b["out"] * norm_factor),
+                    "had_429": b["had_429"],
+                    "had_5xx": b["had_5xx"],
+                    # legacy aliases for older clients
+                    "rpm": round(b["success"] * norm_factor, 2),
+                    "err_count": b["upstream_err"],
+                    "rejected": b["reject_503"],
+                    "rejected_per_min": round(b["reject_503"] * norm_factor, 2),
+                })
+
+            # Empirical ceiling
+            reject_buckets = [b for b in sorted_buckets if b["reject_rpm"] > 0]
+            err_buckets = [b for b in sorted_buckets if b["upstream_err_rpm"] > 0]
+            clean_buckets = [
+                b for b in sorted_buckets
+                if b["reject_rpm"] == 0 and b["upstream_err_rpm"] == 0 and b["success_rpm"] > 0
+            ]
+
+            ceiling: Dict[str, Any] = {
+                "samples_total": len(sorted_buckets),
+                "samples_clean": len(clean_buckets),
+                "samples_with_rejects": len(reject_buckets),
+                "samples_with_upstream_errors": len(err_buckets),
+                "first_reject_offered_rpm": None,
+                "first_reject_success_rpm": None,
+                "first_reject_ts": None,
+                "first_upstream_err_offered_rpm": None,
+                "first_upstream_err_ts": None,
+                "max_clean_success_rpm": None,
+                "max_clean_in_tpm": None,
+                "max_clean_out_tpm": None,
+                "recommendation_rpm": None,
+                "recommendation_in_tpm": None,
+                "recommendation_out_tpm": None,
+                "basis": "no_data",
+            }
+
+            if reject_buckets:
+                first_r = reject_buckets[0]
+                ceiling["first_reject_offered_rpm"] = first_r["offered_rpm"]
+                ceiling["first_reject_success_rpm"] = first_r["success_rpm"]
+                ceiling["first_reject_ts"] = first_r["ts"]
+
+            if err_buckets:
+                first_e = err_buckets[0]
+                ceiling["first_upstream_err_offered_rpm"] = first_e["offered_rpm"]
+                ceiling["first_upstream_err_ts"] = first_e["ts"]
+
+            if clean_buckets:
+                ceiling["max_clean_success_rpm"] = max(b["success_rpm"] for b in clean_buckets)
+                ceiling["max_clean_in_tpm"] = max(b["in_tpm"] for b in clean_buckets)
+                ceiling["max_clean_out_tpm"] = max(b["out_tpm"] for b in clean_buckets)
+
+            # Recommendation: stay below whichever ceiling we hit first
+            candidates = []
+            if ceiling["max_clean_success_rpm"] is not None:
+                candidates.append(("clean", ceiling["max_clean_success_rpm"] * 0.9))
+            if ceiling["first_reject_offered_rpm"] is not None:
+                candidates.append(("reject", ceiling["first_reject_offered_rpm"] * 0.8))
+            if ceiling["first_upstream_err_offered_rpm"] is not None:
+                candidates.append(("upstream", ceiling["first_upstream_err_offered_rpm"] * 0.8))
+
+            if candidates:
+                basis, rec = min(candidates, key=lambda x: x[1])
+                ceiling["recommendation_rpm"] = round(rec, 2)
+                ceiling["basis"] = basis
+                if ceiling["max_clean_in_tpm"] is not None:
+                    # scale token recommendation proportionally to rpm reduction
+                    if ceiling["max_clean_success_rpm"]:
+                        scale = rec / ceiling["max_clean_success_rpm"]
+                    else:
+                        scale = 1.0
+                    ceiling["recommendation_in_tpm"] = round(ceiling["max_clean_in_tpm"] * scale)
+                    ceiling["recommendation_out_tpm"] = round(ceiling["max_clean_out_tpm"] * scale)
+
+            current = sorted_buckets[-1] if sorted_buckets else None
+
+            result[wkey] = {
+                "buckets": sorted_buckets,
+                "errors": errors_list,
+                "ceiling": ceiling,
+                "current": current,
+            }
+
+        # Aggregate totals across all workers
+        total_success = sum(1 for c in all_calls if c.status == "success")
+        total_503 = sum(
+            1 for c in all_calls
+            if c.status != "success" and "503" in (c.error_code or "")
+        )
+        total_upstream_err = sum(
+            1 for c in all_calls
+            if c.status != "success" and "503" not in (c.error_code or "")
+        )
+        bridge_recommendation = sum(
+            (w["ceiling"].get("recommendation_rpm") or 0) for w in result.values()
+        )
+
+        return {
+            "lookback_hours": hours,
+            "bucket_seconds": bucket_seconds,
+            "now": time.time(),
+            "workers": result,
+            "totals": {
+                "calls": len(all_calls),
+                "successes": total_success,
+                "concurrency_rejects_503": total_503,
+                "upstream_errors": total_upstream_err,
+                "workers_seen": len(per_worker),
+                "bridge_recommendation_rpm": round(bridge_recommendation, 2),
+            },
+        }
+
 
 # Singleton
 _collector: Optional[PromptMetricsCollector] = None
