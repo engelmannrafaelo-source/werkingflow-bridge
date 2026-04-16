@@ -2200,7 +2200,7 @@ async def chat_completions(
         except Exception:
             pass
         raise
-    except WorkerUnavailableError:
+    except WorkerUnavailableError as wue:
         # Rolling-metrics completion (worker rate-limited 503 path).
         try:
             if getattr(request.state, "arrival_recorded", False):
@@ -2217,7 +2217,7 @@ async def chat_completions(
                 request.state.arrival_recorded = False
         except Exception as _e:
             logger.debug(f"rolling_metrics completion (WorkerUnavailableError) failed: {_e}")
-        # Track 503 in prompt metrics before re-raise for Nginx failover
+        # Track 503 in prompt metrics before cross-bridge fallback / re-raise
         try:
             duration = time.time() - start_time
             from src.middleware.prompt_metrics import get_prompt_metrics
@@ -2240,6 +2240,85 @@ async def chat_completions(
             )
         except Exception:
             pass
+        # =====================================================================
+        # CROSS-BRIDGE FALLBACK on worker rate-limit
+        # ---------------------------------------------------------------------
+        # nginx's proxy_next_upstream can only retry on a WORKER that is still
+        # in the upstream pool and not marked `down` by smart-routing. When all
+        # non-current workers have weekly=100% (marked `down`), a rate-limit
+        # on the only live worker would otherwise bubble out as a raw 503.
+        #
+        # Instead we route the request to the provider fallback chain — which
+        # ends in `bridge-prod-emergency` (Sahori on production). The primary
+        # tier call never happened, so this path is defence-in-depth without
+        # cost: fallback chain only runs when our own workers are exhausted.
+        # =====================================================================
+        if not request_body.stream:
+            try:
+                from src.providers.fallback import (
+                    record_failure as _fb_fail, record_success as _fb_ok,
+                    get_fallback_tiers as _fb_tiers, FALLBACK_DELAY_SECONDS as _fb_delay,
+                )
+                import asyncio as _fb_asyncio
+
+                _primary_tier = request_body.provider_tier or "claude-premium"
+                _fb_fail(_primary_tier, f"worker_rate_limited: {wue}")
+                _fallback_chain = _fb_tiers(_primary_tier)[1:]  # skip primary
+
+                for _ft in _fallback_chain:
+                    try:
+                        logger.warning(
+                            f"⚠️ Worker rate-limited on {_primary_tier}. "
+                            f"Cross-bridge fallback: {_ft}"
+                        )
+                        await _fb_asyncio.sleep(_fb_delay)
+
+                        _fb_cfg = resolve_backend_config(
+                            backend=request_body.backend or BackendType.ANTHROPIC,
+                            model=(resolved_model if 'resolved_model' in locals() else request_body.model),
+                            privacy=request_body.privacy or PrivacyMode.AUTO,
+                            bedrock_region=request_body.bedrock_region,
+                            provider_tier=_ft,
+                        )
+
+                        if _fb_cfg.backend == BackendType.OPENAI_COMPATIBLE:
+                            from src.providers.openai_compatible import call_openai_compatible
+                            _fb_resp = await call_openai_compatible(
+                                request_body,
+                                _fb_cfg.provider_base_url,
+                                _fb_cfg.provider_api_key,
+                                model_override=_fb_cfg.provider_model,
+                            )
+                            _fb_ok(_ft)
+                            logger.info(
+                                f"✅ Cross-bridge fallback {_ft} succeeded "
+                                f"(primary worker rate-limited)"
+                            )
+                            _fb_resp["x_fallback"] = {
+                                "used": True,
+                                "original_provider": _primary_tier,
+                                "fallback_provider": _ft,
+                                "original_error": f"worker rate-limited: {wue}",
+                                "trigger": "worker_unavailable",
+                            }
+                            return _fb_resp
+                    except Exception as _fb_err:
+                        _fb_fail(_ft, str(_fb_err)[:200])
+                        logger.warning(f"⚠️ Cross-bridge fallback {_ft} failed: {_fb_err}")
+                        continue
+
+                logger.error(
+                    f"❌ All cross-bridge fallbacks exhausted for {_primary_tier} "
+                    f"(worker rate-limited)"
+                )
+            except ImportError:
+                pass  # fallback module unavailable — fall through to raise
+            except Exception as _fb_setup_err:
+                logger.error(
+                    f"Cross-bridge fallback setup error: {_fb_setup_err}"
+                )
+        # Fallback didn't help (or streaming) — re-raise so nginx can try
+        # another worker and/or the 503 envelope reaches the client.
         raise
     except Exception as e:
         # =======================================================================
@@ -3929,7 +4008,114 @@ async def get_queue_forecast(
 async def bridge_error_handler(request: Request, exc: BridgeError):
     """Unwrap BridgeError → its carried structured response. The envelope is
     pre-built by helpers in src/middleware/bridge_error.py so apps see a
-    consistent `{error: {source, bridge_type, retry_after_s, ...}}` shape."""
+    consistent `{error: {source, bridge_type, retry_after_s, ...}}` shape.
+
+    Cross-bridge escape hatch: when the BridgeError was raised by the adaptive
+    limiter (account_exhausted / throttle / queue_timeout on /v1/chat/completions)
+    AND a usable fallback tier exists AND we have the cached request body, we
+    try the fallback chain (terminating in `bridge-prod-emergency`) BEFORE
+    surfacing the envelope. This closes the gap where dep-raised BridgeErrors
+    never reached the route handler's own fallback path.
+    """
+    # Only the chat-completions path is a candidate for cross-bridge fallback.
+    # Other endpoints (research, health, metrics) keep the original envelope.
+    try:
+        path = request.url.path
+        is_chat_completions = path.endswith("/v1/chat/completions")
+        cached_body = getattr(request.state, "cached_body_dict", None)
+        if not is_chat_completions or not cached_body or cached_body.get("stream"):
+            return exc.response
+
+        # Only attempt for retryable bridge-side errors (not, e.g., auth failures).
+        err_body = getattr(exc, "response", None)
+        err_content = getattr(err_body, "body", None) if err_body else None
+        # We pulled the body from the JSONResponse to introspect source/type.
+        import json as _json
+        try:
+            err_obj = _json.loads(err_content) if err_content else {}
+        except Exception:
+            err_obj = {}
+        err_fields = (err_obj.get("error") or {})
+        err_source = err_fields.get("source", "")
+        err_type = err_fields.get("bridge_type", "")
+        # Only these dep-raised categories warrant cross-bridge fallback.
+        if not (
+            (err_source == "bridge_account" and err_type == "account_exhausted")
+            or (err_source == "bridge_internal" and err_type in ("throttle", "queue_timeout"))
+        ):
+            return exc.response
+
+        from src.providers.fallback import (
+            get_fallback_tiers as _fb_tiers,
+            record_failure as _fb_fail,
+            record_success as _fb_ok,
+            FALLBACK_DELAY_SECONDS as _fb_delay,
+        )
+        import asyncio as _fb_asyncio
+
+        primary_tier = cached_body.get("provider_tier") or "claude-premium"
+        _fb_fail(primary_tier, f"dep_bridge_error: {err_type}")
+        fallback_chain = _fb_tiers(primary_tier)[1:]  # skip primary
+        if not fallback_chain:
+            return exc.response  # nothing to try
+
+        # Build ChatCompletionRequest from cached body so call_openai_compatible
+        # has the right shape. Any validation error → fall back to envelope.
+        try:
+            _req = ChatCompletionRequest(**cached_body)
+        except Exception as _rebuild_err:
+            logger.warning(
+                f"Cross-bridge fallback: could not rebuild request model: {_rebuild_err}"
+            )
+            return exc.response
+
+        for _ft in fallback_chain:
+            try:
+                logger.warning(
+                    f"⚠️ Adaptive limiter raised {err_type} on {primary_tier}. "
+                    f"Cross-bridge fallback (dep-level): {_ft}"
+                )
+                await _fb_asyncio.sleep(_fb_delay)
+                _fb_cfg = resolve_backend_config(
+                    backend=BackendType.ANTHROPIC,
+                    model=_req.model,
+                    privacy=_req.privacy or PrivacyMode.AUTO,
+                    bedrock_region=_req.bedrock_region,
+                    provider_tier=_ft,
+                )
+                if _fb_cfg.backend != BackendType.OPENAI_COMPATIBLE:
+                    continue  # Only OPENAI_COMPATIBLE tiers are fallback-callable here
+                from src.providers.openai_compatible import call_openai_compatible
+                _fb_resp = await call_openai_compatible(
+                    _req,
+                    _fb_cfg.provider_base_url,
+                    _fb_cfg.provider_api_key,
+                    model_override=_fb_cfg.provider_model,
+                )
+                _fb_ok(_ft)
+                logger.info(
+                    f"✅ Cross-bridge fallback {_ft} succeeded "
+                    f"(dep-level: {err_type})"
+                )
+                _fb_resp["x_fallback"] = {
+                    "used": True,
+                    "original_provider": primary_tier,
+                    "fallback_provider": _ft,
+                    "original_error": f"{err_type} from adaptive limiter",
+                    "trigger": "dep_bridge_error",
+                }
+                return JSONResponse(content=_fb_resp)
+            except Exception as _fb_err:
+                _fb_fail(_ft, str(_fb_err)[:200])
+                logger.warning(f"⚠️ Cross-bridge fallback {_ft} failed: {_fb_err}")
+                continue
+
+        logger.error(
+            f"❌ All cross-bridge fallbacks exhausted (dep-level {err_type})"
+        )
+    except Exception as _handler_err:
+        # Any error inside the fallback helper itself → fall through to envelope.
+        logger.error(f"bridge_error_handler cross-fallback error: {_handler_err}")
     return exc.response
 
 
