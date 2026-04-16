@@ -111,14 +111,22 @@ print('# Last snapshot: {} | Down-threshold: {}% | Ramp-start: {}% | Min-weight:
 print('upstream claude_workers {')
 for worker in ['worker1', 'worker2', 'worker3', 'worker4']:
     if worker not in workers:
-        print('    server {}:8000 weight=100 max_fails=5 fail_timeout=300s;'.format(worker))
+        # Fallback when the usage-snapshot is missing this worker entirely:
+        # keep tight timeouts so a one-off container hiccup recovers in 30s
+        # rather than blackballing the worker for 5 minutes.
+        print('    server {}:8000 weight=100 max_fails=2 fail_timeout=30s;'.format(worker))
         continue
     w = workers[worker]
     if w['down']:
         print('    server {}:8000 down;  # {} weekly={}% session={}% rate-limited'
               .format(worker, w['email'], w['weekly'], w['session']))
     else:
-        print('    server {}:8000 weight={} max_fails=3 fail_timeout=300s;  # {} weekly={}% session={}%'
+        # max_fails=2 + fail_timeout=30s: nginx marks the worker unavailable
+        # after 2 consecutive connect/5xx failures and retries in 30s. The 1-min
+        # cron below re-evaluates the weekly-budget state anyway, so we don't
+        # need the old 5-minute blackball — short window is safe and drops
+        # worst-case recovery from 5 min to 30s after a restart.
+        print('    server {}:8000 weight={} max_fails=2 fail_timeout=30s;  # {} weekly={}% session={}%'
               .format(worker, w['weight'], w['email'], w['weekly'], w['session']))
 print('')
 print('    keepalive 32;')
