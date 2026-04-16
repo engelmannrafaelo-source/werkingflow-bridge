@@ -83,16 +83,25 @@ QUEUE_POLL_INTERVAL_SEC = float(os.getenv("ADAPTIVE_QUEUE_POLL_SEC", "0.5"))
 
 
 # ----------------------------------------------------------------------
-# Predictive weekly-budget throttle
+# Predictive weekly-budget throttle  (DISABLED by default — "capacity egal")
 # ----------------------------------------------------------------------
-# The smart-worker-routing.sh marks a worker "down" in nginx when weekly=95%,
-# but that's a cliff: requests route fine at 94%, then suddenly no capacity.
-# To avoid the cliff we drop the admit budget as the weekly % climbs, so apps
-# experience gradual back-pressure (latency + throttle envelopes) rather than
-# sudden 503s from nginx.
+# Historical design: drop the admit budget as the weekly-% climbs toward the
+# smart-routing 95% cliff, so apps see gradual back-pressure rather than a
+# sudden nginx-drop. In practice this shut apps out with an account_exhausted
+# envelope LONG before the actual Anthropic streaming-window was full — weekly
+# % is a rolling aggregate, not an instantaneous capacity signal.
 #
-# Ramp: identity below WEEKLY_THROTTLE_START_PCT, linear ramp down to MIN multi
-# between START and CEILING, then hard-reject above CEILING.
+# New design (Rafael directive 2026-04-16, "capacity egal, streaming window"):
+# let the actual 5h streaming-window govern capacity. The adaptive cap already
+# auto-shrinks when a real 429 is observed (SHRINK_FACTOR); combined with the
+# cross-bridge fallback (WorkerUnavailableError / BridgeError → Sahori prod),
+# weekly-budget prediction is no longer needed to prevent hard failures.
+#
+# The mechanism is kept in code (gated by env) so it can be re-enabled
+# instantly if streaming-window behaviour ever proves insufficient.
+WEEKLY_PREDICTIVE_THROTTLE_ENABLED = (
+    os.getenv("ADAPTIVE_WEEKLY_PREDICTIVE_THROTTLE", "false").lower() == "true"
+)
 WEEKLY_THROTTLE_START_PCT   = float(os.getenv("ADAPTIVE_WEEKLY_START_PCT", "80"))
 WEEKLY_THROTTLE_CEILING_PCT = float(os.getenv("ADAPTIVE_WEEKLY_CEILING_PCT", "95"))
 WEEKLY_THROTTLE_MIN_MULT    = float(os.getenv("ADAPTIVE_WEEKLY_MIN_MULT", "0.10"))
@@ -118,7 +127,14 @@ def _weekly_budget_multiplier(weekly_pct: float, session_pct: float) -> float:
       weekly=87.5% → 0.55 (half-way down)
       weekly=95% → 0.10  (barely any admission)
       weekly=98% → 0.0   (reject — already past the wall)
+
+    When WEEKLY_PREDICTIVE_THROTTLE_ENABLED=false (default), this always
+    returns 1.0 — the 5h streaming-window cap + cross-bridge fallback handle
+    exhaustion instead of the predictive weekly-% curve.
     """
+    if not WEEKLY_PREDICTIVE_THROTTLE_ENABLED:
+        return 1.0
+
     def _mult(pct: float) -> float:
         if pct <= WEEKLY_THROTTLE_START_PCT:
             return 1.0
@@ -754,10 +770,15 @@ async def adaptive_limit_dependency(request: Request) -> None:
     mult = snap.get("weekly_budget_multiplier", 1.0)
     weekly_pct = snap.get("account_weekly_pct", 0.0)
 
-    # If the weekly throttle is what's blocking (not transient queue pressure),
-    # report as account-level — apps should back off for a long time, not retry
-    # in 30s. Retry-After is best-effort: a plain hour if we can't be smarter.
-    if mult <= WEEKLY_THROTTLE_MIN_MULT and weekly_pct >= WEEKLY_THROTTLE_START_PCT:
+    # Predictive weekly-budget throttle (kept for opt-in use). With the new
+    # "capacity egal, streaming window" policy this path is dormant because
+    # the multiplier is always 1.0 — only reachable if an operator re-enables
+    # ADAPTIVE_WEEKLY_PREDICTIVE_THROTTLE=true.
+    if (
+        WEEKLY_PREDICTIVE_THROTTLE_ENABLED
+        and mult <= WEEKLY_THROTTLE_MIN_MULT
+        and weekly_pct >= WEEKLY_THROTTLE_START_PCT
+    ):
         raise BridgeError(account_exhausted_error(retry_after_s=3600))
 
     if waited_s >= max(1.0, QUEUE_WAIT_TIMEOUT_SEC * 0.5):
