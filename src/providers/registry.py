@@ -104,9 +104,46 @@ PROVIDERS: dict[str, ProviderConfig] = {
         dsgvo_compliant=False,
         description="Claude via OpenRouter Gateway. Automatisches Failover bei Anthropic-Ausfall.",
     ),
+
+    # =========================================================================
+    # Production Bridge Emergency Fallback (Sahori Account)
+    # Last resort: only when ALL dev-bridge OAuth tokens are exhausted.
+    # Requires AI_BRIDGE_URL_PROD_FALLBACK env var. Silently skipped if absent.
+    # =========================================================================
+    "bridge-prod-emergency": ProviderConfig(
+        tier_id="bridge-prod-emergency",
+        name="Production Bridge Emergency Fallback (Sahori)",
+        backend=BackendType.OPENAI_COMPATIBLE,
+        model="claude-sonnet-4-5-20250929",
+        base_url=(os.getenv("AI_BRIDGE_URL_PROD_FALLBACK", "") + "/v1") if os.getenv("AI_BRIDGE_URL_PROD_FALLBACK") else None,
+        api_key_env="AI_BRIDGE_API_KEY",
+        pricing_input=3.00,
+        pricing_output=15.00,
+        dsgvo_compliant=False,
+        description="Notfall-Fallback auf Production Bridge mit Sahori-Account. Nur wenn alle Dev-Tokens erschoepft.",
+    ),
 }
 
 DEFAULT_TIER = "claude-premium"
+
+
+def is_tier_usable(tier_id: str) -> bool:
+    """Check if a provider tier is usable (all required config present).
+
+    For OPENAI_COMPATIBLE tiers, requires both base_url and api_key to be set.
+    Returns False (and logs a warning) if the tier is not usable — no crash.
+    """
+    config = PROVIDERS.get(tier_id)
+    if not config:
+        return False
+    if config.backend == BackendType.OPENAI_COMPATIBLE:
+        if not config.base_url:
+            logger.warning(f"⚠️ Provider tier '{tier_id}' skipped: base_url not configured (env var missing)")
+            return False
+        if config.api_key_env and not os.getenv(config.api_key_env):
+            logger.warning(f"⚠️ Provider tier '{tier_id}' skipped: {config.api_key_env} not set")
+            return False
+    return True
 
 
 def get_provider(tier_id: Optional[str]) -> ProviderConfig:

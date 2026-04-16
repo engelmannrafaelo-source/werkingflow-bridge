@@ -17,6 +17,7 @@ from typing import Optional
 
 import httpx
 
+from src.auth import AllTokensExhausted
 from src.providers.openai_compatible import ProviderError
 
 logger = logging.getLogger(__name__)
@@ -27,8 +28,8 @@ logger = logging.getLogger(__name__)
 # =============================================================================
 
 FALLBACK_CHAINS: dict[str, list[str]] = {
-    # Anthropic Direct down → OpenRouter routes Claude via different infra
-    "claude-premium": ["openrouter-claude"],
+    # Anthropic Direct down → OpenRouter → Production Bridge (last resort: token exhaustion)
+    "claude-premium": ["openrouter-claude", "bridge-prod-emergency"],
 
     # DSGVO: No fallback — data residency must stay in EU (Bedrock Frankfurt)
     # "claude-dsgvo": [],
@@ -108,18 +109,33 @@ def get_all_provider_health() -> dict[str, dict]:
 # =============================================================================
 
 def get_fallback_tiers(primary_tier: str) -> list[str]:
-    """Get the ordered list of fallback tier IDs for a primary provider.
+    """Get the ordered list of usable fallback tier IDs for a primary provider.
 
     Returns the full chain: [primary, fallback1, fallback2, ...].
+    Tiers that are not usable (missing config/URL) are silently filtered out.
     If no chain is configured, returns just [primary].
     """
+    from src.providers.registry import is_tier_usable
+
     chain = [primary_tier]
     chain.extend(FALLBACK_CHAINS.get(primary_tier, []))
-    return chain
+
+    # Filter out tiers that are not configured (e.g. bridge-prod-emergency without URL)
+    usable = []
+    for tier_id in chain:
+        if tier_id == primary_tier or is_tier_usable(tier_id):
+            usable.append(tier_id)
+        else:
+            logger.debug(f"🔕 Fallback tier '{tier_id}' filtered (not usable — config missing)")
+    return usable
 
 
 def is_retryable_error(error: Exception) -> bool:
     """Check if an error should trigger a fallback attempt."""
+    # AllTokensExhausted: all dev-bridge OAuth tokens gone → try next fallback
+    if isinstance(error, AllTokensExhausted):
+        return True
+
     # ProviderError with retryable status code
     if isinstance(error, ProviderError):
         return error.status_code in RETRYABLE_STATUS_CODES

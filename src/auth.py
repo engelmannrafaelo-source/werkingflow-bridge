@@ -11,6 +11,12 @@ logger = get_logger(__name__)
 load_dotenv()
 
 
+class AllTokensExhausted(Exception):
+    """Raised when all OAuth tokens on this bridge are exhausted.
+    Catch this to trigger cross-bridge fallback to the production bridge."""
+    pass
+
+
 class TokenRotator:
     """Manages multiple OAuth tokens with automatic fallback.
 
@@ -83,10 +89,10 @@ class TokenRotator:
         """Switch to the next available token.
 
         Returns the new token.
-        Raises RuntimeError if no fallback tokens available (defensive programming).
+        Raises AllTokensExhausted if no fallback tokens available (triggers cross-bridge fallback).
         """
         if len(self.tokens) <= 1:
-            raise RuntimeError("Token rotation failed: No fallback tokens available. Configure multiple tokens or check authentication.")
+            raise AllTokensExhausted("Token rotation failed: No fallback tokens available. All dev-bridge OAuth tokens are exhausted.")
 
         old_index = self.current_index
         self.current_index = (self.current_index + 1) % len(self.tokens)
