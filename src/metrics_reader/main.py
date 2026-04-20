@@ -64,6 +64,10 @@ logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 # Production Bridge URL — if set, aggregate metrics from both servers.
 PROD_BRIDGE_URL = os.getenv("BRIDGE_PROD_URL", "").rstrip("/")
 
+# Worker hostnames in this docker-compose network (comma-separated).
+# Dev-Bridge default: worker1..worker4.  Production: worker-prod.
+BRIDGE_WORKERS = [w.strip() for w in os.getenv("BRIDGE_WORKERS", "worker1,worker2,worker3,worker4").split(",") if w.strip()]
+
 # Whether production has a metrics-reader (JSONL endpoints work).
 # Probed once on first request; re-probed every 5 minutes.
 _prod_has_metrics_reader: bool | None = None  # None = not yet probed
@@ -436,8 +440,8 @@ def lb_status() -> JSONResponse:
     import urllib.error
     import socket
 
-    # These are the worker hostnames inside the docker-compose network.
-    workers = ["worker1", "worker2", "worker3", "worker4"]
+    # Worker hostnames from env (BRIDGE_WORKERS) — adapts to dev/prod compose.
+    workers = BRIDGE_WORKERS
 
     results: dict[str, dict] = {}
     up_count = 0
