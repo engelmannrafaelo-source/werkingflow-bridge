@@ -304,6 +304,8 @@ services:
       - METRICS_DIR=/app/logs
       - LOG_LEVEL=INFO
       - TZ=Europe/Vienna
+      # Aggregate metrics from production server (Server 2) if configured
+      - BRIDGE_PROD_URL=${BRIDGE_PROD_URL:-}
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://localhost:8000/health"]
       interval: 30s
