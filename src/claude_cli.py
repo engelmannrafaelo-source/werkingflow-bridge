@@ -945,23 +945,21 @@ CRITICAL: Write file EARLY to avoid context overflow. Use Write tool for clauded
                                 continue
 
                             # =============================================================
-                            # RATE LIMIT EVENT: Abort this task (stream concat = corrupt output)
-                            # but do NOT mark the worker as rate-limited. The CLI handles
-                            # rate limits internally. Blocking the worker for 10 minutes
-                            # causes a cascade where all workers get blocked and the bridge
-                            # becomes completely unresponsive despite tokens being available.
+                            # RATE LIMIT EVENT: CLI is handling retry internally — DON'T abort.
+                            # rate_limit_event means the CLI detected a transient rate limit
+                            # and is WAITING to retry. We just skip this message and let the
+                            # stream continue. The CLI will retry and send the actual response.
+                            # DO NOT mark_rate_limited (cascade failure).
+                            # DO NOT raise/abort (wastes all tokens spent so far).
                             # =============================================================
                             if isinstance(message, RateLimitEvent):
                                 worker_id = os.environ.get("INSTANCE_NAME", "unknown")
-                                logger.warning(
+                                logger.info(
                                     f"⏳ Worker {worker_id} received rate_limit_event — "
-                                    f"aborting task (stream concat produces corrupt output). "
+                                    f"CLI is handling retry internally. "
                                     f"retry_after={message.retry_after}, message={message.message[:120]}"
                                 )
-                                # DO NOT mark_rate_limited — that blocks all future requests
-                                # for 10 minutes and causes cascade failure across all workers.
-                                cli_session_manager.complete_session(cli_session_id, status="failed")
-                                raise WorkerUnavailableError(f"Rate limit event on {worker_id}")
+                                continue
 
                             chunks_received += 1
 
@@ -1112,17 +1110,15 @@ CRITICAL: Write file EARLY to avoid context overflow. Use Write tool for clauded
                                             if any(pattern in text_lower for pattern in rate_limit_patterns):
                                                 worker_id = os.environ.get("INSTANCE_NAME", "unknown")
                                                 full_msg = block.text
-                                                # DO NOT mark_rate_limited — causes cascade failure.
-                                                # Abort task (stream concat = corrupt output) but
-                                                # let the worker accept new requests immediately.
+                                                # CLI handles rate limits internally — DON'T abort.
+                                                # Just skip this message (it's not real content).
                                                 logger.warning(
-                                                    f"🚫 Rate limit text detected on {worker_id} — "
-                                                    f"aborting task (corrupt output risk). "
-                                                    f"Worker NOT blocked. "
+                                                    f"⏳ Rate limit text on {worker_id} — "
+                                                    f"CLI will retry internally, task continues. "
                                                     f"Message: {full_msg[:150]}"
                                                 )
-                                                cli_session_manager.complete_session(cli_session_id, status="failed")
-                                                raise WorkerUnavailableError(f"Rate limit detected: {full_msg[:200]}")
+                                                # Don't yield this rate-limit text to the client
+                                                continue
 
                             # =================================================================
                             # SKIP SYSTEMMESSAGE - Don't yield to client
