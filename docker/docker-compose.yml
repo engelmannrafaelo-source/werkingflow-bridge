@@ -11,8 +11,10 @@ services:
       - "8020:80"      # eco-diagnostics compatibility
     volumes:
       - ./nginx.conf:/etc/nginx/nginx.conf:ro
-    # Remove default.conf that overrides our config
-    command: ["/bin/sh", "-c", "rm -f /etc/nginx/conf.d/default.conf && nginx -g 'daemon off;'"]
+    environment:
+      - BRIDGE_PROD_HOST=${BRIDGE_PROD_HOST:-127.0.0.1}
+    # envsubst resolves ${BRIDGE_PROD_HOST} in nginx.conf, then start nginx
+    command: ["/bin/sh", "-c", "rm -f /etc/nginx/conf.d/default.conf && envsubst '$$BRIDGE_PROD_HOST' < /etc/nginx/nginx.conf > /tmp/nginx.conf && mv /tmp/nginx.conf /etc/nginx/nginx.conf && nginx -g 'daemon off;'"]
     depends_on:
       - worker1
       - worker2
