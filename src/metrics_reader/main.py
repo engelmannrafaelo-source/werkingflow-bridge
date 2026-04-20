@@ -259,7 +259,7 @@ def get_prompt_performance(hours: int = Query(24, ge=0)) -> dict:
     local = get_prompt_metrics().get_stats(hours=hours)
     # Production aggregation: works once production has its own metrics-reader.
     # Without metrics-reader on prod, these calls timeout gracefully (returns local only).
-    prod = _fetch_prod(f"/v1/metrics/prompt-performance?hours={hours}", timeout=8)
+    prod = _fetch_prod(f"/v1/metrics/prompt-performance?hours={hours}", timeout=3)
     if prod:
         return _merge_prompt_performance(local, prod)
     return local
@@ -300,7 +300,7 @@ def get_prompt_calls(
         params += f"&app_id={app_id}"
     if user_id:
         params += f"&user_id={user_id}"
-    prod = _fetch_prod(f"/v1/metrics/prompt-performance/calls{params}", timeout=8)
+    prod = _fetch_prod(f"/v1/metrics/prompt-performance/calls{params}", timeout=3)
     if prod:
         return _merge_calls(local, prod, limit)
     return local
@@ -322,7 +322,7 @@ def get_throughput(
 def get_usage_breakdown(hours: int = Query(24, ge=0)) -> dict:
     """Token/cost breakdown per app, per user, per model."""
     local = get_prompt_metrics().get_usage_breakdown(hours=hours)
-    prod = _fetch_prod(f"/v1/metrics/usage-breakdown?hours={hours}", timeout=8)
+    prod = _fetch_prod(f"/v1/metrics/usage-breakdown?hours={hours}", timeout=3)
     if prod:
         return _merge_usage_breakdown(local, prod)
     return local
@@ -351,7 +351,7 @@ def get_request_log_endpoint(
         params += f"&endpoint={endpoint}"
     if status:
         params += f"&status={status}"
-    prod = _fetch_prod(f"/v1/metrics/request-log{params}", timeout=8)
+    prod = _fetch_prod(f"/v1/metrics/request-log{params}", timeout=3)
     if prod:
         return _merge_request_log(local, prod, limit)
     return local
