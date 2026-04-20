@@ -64,6 +64,12 @@ logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 # Production Bridge URL — if set, aggregate metrics from both servers.
 PROD_BRIDGE_URL = os.getenv("BRIDGE_PROD_URL", "").rstrip("/")
 
+# Whether production has a metrics-reader (JSONL endpoints work).
+# Probed once on first request; re-probed every 5 minutes.
+_prod_has_metrics_reader: bool | None = None  # None = not yet probed
+_prod_last_probe: float = 0.0
+_PROBE_INTERVAL = 300  # re-probe every 5 minutes
+
 app = FastAPI(
     title="Bridge Metrics Reader",
     description="Decoupled read-only service for historical Bridge metrics.",
@@ -75,14 +81,55 @@ app = FastAPI(
 # Production Aggregation Helper
 # ============================================================================
 
-def _fetch_prod(path: str, timeout: float = 5.0) -> dict | None:
-    """Fetch an endpoint from the production Bridge. Returns None on any error.
-
-    If production has no metrics-reader, JSONL endpoints will timeout
-    and return None (graceful fallback to local-only). Once production
-    deploys its own metrics-reader, aggregation works automatically.
-    """
+def _prod_metrics_available() -> bool:
+    """Check if production has a working metrics-reader. Cached with re-probe."""
+    global _prod_has_metrics_reader, _prod_last_probe
     if not PROD_BRIDGE_URL:
+        return False
+    import time
+    now = time.time()
+    if _prod_has_metrics_reader is not None and (now - _prod_last_probe) < _PROBE_INTERVAL:
+        return _prod_has_metrics_reader
+
+    # Probe: try a fast metrics-reader-only endpoint
+    import urllib.request
+    import json as _json
+    _prod_last_probe = now
+    try:
+        url = f"{PROD_BRIDGE_URL}/v1/metrics/usage-breakdown?hours=0"
+        with urllib.request.urlopen(url, timeout=3) as resp:
+            data = _json.loads(resp.read())
+            _prod_has_metrics_reader = "summary" in data
+            logger.info(f"Prod metrics-reader probe: {'available' if _prod_has_metrics_reader else 'unavailable'}")
+    except Exception as e:
+        _prod_has_metrics_reader = False
+        logger.info(f"Prod metrics-reader probe: unavailable ({e})")
+    return _prod_has_metrics_reader
+
+
+def _fetch_prod_direct(path: str, timeout: float = 5.0) -> dict | None:
+    """Fetch any endpoint from production (no metrics-reader check).
+    Use for fast endpoints like /health that work on any server."""
+    if not PROD_BRIDGE_URL:
+        return None
+    import urllib.request
+    import json as _json
+    try:
+        url = f"{PROD_BRIDGE_URL}{path}"
+        with urllib.request.urlopen(url, timeout=timeout) as resp:
+            return _json.loads(resp.read())
+    except Exception as e:
+        logger.debug(f"Prod direct fetch {path} failed: {e}")
+        return None
+
+
+def _fetch_prod(path: str, timeout: float = 5.0) -> dict | None:
+    """Fetch a JSONL-based endpoint from the production Bridge.
+
+    Returns None immediately if production has no metrics-reader (avoids
+    3s timeout penalty on every request). Re-probes every 5 minutes.
+    """
+    if not _prod_metrics_available():
         return None
     import urllib.request
     import urllib.error
@@ -417,11 +464,12 @@ def lb_status() -> JSONResponse:
     else:
         agg = "degraded"
 
-    # Also check production server if configured
+    # Also check production server if configured (direct fetch, not via _fetch_prod
+    # which requires metrics-reader — /health works on any server)
     prod_results: dict[str, dict] = {}
     prod_up = 0
     if PROD_BRIDGE_URL:
-        prod_health = _fetch_prod("/health", timeout=3)
+        prod_health = _fetch_prod_direct("/health", timeout=3)
         if prod_health and prod_health.get("status") == "healthy":
             worker_name = prod_health.get("worker_instance", "worker-prod")
             prod_results[worker_name] = {"status": "up", "server": "production"}
