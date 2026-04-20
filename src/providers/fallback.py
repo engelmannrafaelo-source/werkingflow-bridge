@@ -92,6 +92,21 @@ def record_failure(tier_id: str, error_msg: str) -> None:
     health.consecutive_failures += 1
 
 
+def reset_provider_health(tier_id: str) -> bool:
+    """Reset health state for a provider. Returns True if provider existed."""
+    if tier_id in _provider_health:
+        _provider_health[tier_id] = ProviderHealth()
+        return True
+    return False
+
+
+def reset_all_provider_health() -> int:
+    """Reset health state for all providers. Returns count of reset providers."""
+    count = len(_provider_health)
+    _provider_health.clear()
+    return count
+
+
 def get_all_provider_health() -> dict[str, dict]:
     """Get health status for all tracked providers (for /health endpoint)."""
     result = {}

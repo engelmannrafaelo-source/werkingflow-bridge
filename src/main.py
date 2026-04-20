@@ -2262,7 +2262,10 @@ async def chat_completions(
                 import asyncio as _fb_asyncio
 
                 _primary_tier = request_body.provider_tier or "claude-premium"
-                _fb_fail(_primary_tier, f"worker_rate_limited: {wue}")
+                # DO NOT record_failure for rate-limiting — rate-limited ≠ broken.
+                # The provider works fine, workers just need a cooldown.
+                # Recording failure here caused a deadlock: provider marked "down"
+                # → never retried → no success → stays "down" forever.
                 _fallback_chain = _fb_tiers(_primary_tier)[1:]  # skip primary
 
                 for _ft in _fallback_chain:
@@ -2925,6 +2928,29 @@ async def health_check(request: Request):
         pass
 
     return result
+
+
+@app.post("/health/reset")
+async def reset_provider_health_endpoint(request: Request):
+    """Reset provider health counters (clears consecutive_failures deadlocks).
+
+    Body (optional): {"provider": "claude-premium"} to reset a specific provider.
+    Empty body or {} resets all providers.
+    """
+    from src.providers.fallback import reset_provider_health, reset_all_provider_health
+
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+
+    provider = body.get("provider")
+    if provider:
+        found = reset_provider_health(provider)
+        return {"reset": provider, "found": found}
+    else:
+        count = reset_all_provider_health()
+        return {"reset": "all", "count": count}
 
 
 @app.get("/debug/tokens")
