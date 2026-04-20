@@ -1508,13 +1508,22 @@ async def chat_completions(
             logger.debug(f"rolling_metrics arrival hook failed: {_e}")
 
         # =======================================================================
-        # RATE LIMIT PRE-CHECK: DISABLED.
-        # Previously rejected requests when worker was marked rate-limited.
-        # This caused cascade failures: all 4 workers get marked → bridge dead
-        # for 10 minutes despite Anthropic tokens being available (2-5% usage).
-        # Rate limits are transient — let each request try Anthropic directly.
+        # RATE LIMIT PRE-CHECK: Soft routing for new requests.
+        # If this worker has a penalty, return 503 so NGINX routes to next worker.
+        # Hard limits always reject. Soft penalties reject unless almost expired.
+        # Safety: in-progress tasks NEVER abort — this only affects NEW requests.
         # =======================================================================
         worker_id = os.getenv("INSTANCE_NAME", "unknown")
+        from src.claude_cli import rate_limit_tracker
+        if rate_limit_tracker.should_reject_new_request(worker_id):
+            retry_after = rate_limit_tracker.get_retry_after(worker_id)
+            limit_type = "HARD" if rate_limit_tracker.is_hard_limited(worker_id) else "soft"
+            logger.info(f"⏳ Worker {worker_id} has {limit_type} penalty — rejecting (NGINX failover), retry in {retry_after}s")
+            return JSONResponse(
+                status_code=503,
+                content={"error": {"message": f"Worker {worker_id} rate-limited ({limit_type})", "retry_after_seconds": retry_after}},
+                headers={"Retry-After": str(retry_after or 30)}
+            )
 
         # =======================================================================
         # BUDGET ENFORCEMENT: Check tenant limits before processing
@@ -2479,8 +2488,18 @@ async def research(
     # Attribution enforcement
     enforce_attribution(request)
 
-    # Rate limit pre-check: DISABLED (same reason as chat endpoint)
+    # Rate limit pre-check: soft routing (same logic as chat endpoint)
     worker_id = os.getenv("INSTANCE_NAME", "unknown")
+    from src.claude_cli import rate_limit_tracker as _research_rlt
+    if _research_rlt.should_reject_new_request(worker_id):
+        retry_after = _research_rlt.get_retry_after(worker_id)
+        limit_type = "HARD" if _research_rlt.is_hard_limited(worker_id) else "soft"
+        logger.info(f"⏳ Worker {worker_id} has {limit_type} penalty — rejecting research (NGINX failover)")
+        return JSONResponse(
+            status_code=503,
+            content={"error": {"message": f"Worker {worker_id} rate-limited ({limit_type})", "retry_after_seconds": retry_after}},
+            headers={"Retry-After": str(retry_after or 30)}
+        )
 
     start_time = time.time()
     session_id = None

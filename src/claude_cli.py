@@ -131,13 +131,21 @@ class RateLimitError(Exception):
 
 
 class RateLimitTracker:
-    """
-    Tracks rate limit status per worker instance.
-    Max cooldown: 10 minutes. After cooldown expires, worker is retried automatically.
-    If Anthropic still returns 429, a new 10-min cooldown is set.
+    """Tracks rate limit status per worker instance with soft routing.
+
+    Two levels of rate limiting:
+    - SOFT penalty: Worker got a transient rate_limit_event. Short cooldown (60s).
+      Pre-check returns 503 so NGINX tries next worker, BUT if ALL workers have
+      soft penalty, the pre-check lets requests through (no total block).
+    - HARD limit: Worker got an explicit rate-limit text with reset time.
+      Longer cooldown (parsed from message, capped to 10 min).
+      Pre-check always blocks (real rate limit, Anthropic won't accept).
+
+    In-progress tasks NEVER abort on rate_limit_event — only new request routing.
     """
     _instance = None
     MAX_COOLDOWN_SECONDS = 600  # 10 minutes — never block longer than this
+    SOFT_PENALTY_SECONDS = 60   # Transient rate_limit_event — short penalty
 
     def __new__(cls):
         if cls._instance is None:
@@ -149,6 +157,7 @@ class RateLimitTracker:
         if self._initialized:
             return
         self._rate_limits: Dict[str, datetime] = {}  # worker_id -> reset_time
+        self._hard_limits: set = set()  # worker_ids with hard limits
         self._initialized = True
         self._logger = get_logger(__name__)
 
@@ -161,8 +170,7 @@ class RateLimitTracker:
         return reset_time
 
     def parse_reset_time(self, message: str) -> datetime:
-        """
-        Parse reset time from Claude's rate limit messages.
+        """Parse reset time from Claude's rate limit messages.
         Always capped to MAX_COOLDOWN_SECONDS (10 min).
         """
         import re
@@ -178,7 +186,6 @@ class RateLimitTracker:
             am_pm = match.group(2)
             timezone_str = match.group(3).strip()
 
-            # Convert to 24-hour format
             if am_pm == 'pm' and hour != 12:
                 hour += 12
             elif am_pm == 'am' and hour == 12:
@@ -197,30 +204,73 @@ class RateLimitTracker:
             except Exception as e:
                 self._logger.warning(f"Failed to parse timezone '{timezone_str}': {e}")
 
-        # Fallback: 10 minutes (was 1 hour)
+        # Fallback: 10 minutes
         return datetime.now() + timedelta(seconds=self.MAX_COOLDOWN_SECONDS)
 
+    def mark_soft_penalty(self, worker_id: str, retry_after: Optional[int] = None) -> datetime:
+        """Set a soft penalty on a worker (transient rate_limit_event).
+
+        Soft penalties are short (60s default) and can be overridden by NGINX
+        if all workers have penalties (safety valve).
+        """
+        seconds = min(retry_after or self.SOFT_PENALTY_SECONDS, self.MAX_COOLDOWN_SECONDS)
+        reset_time = datetime.now() + timedelta(seconds=seconds)
+        self._rate_limits[worker_id] = reset_time
+        self._hard_limits.discard(worker_id)  # Soft, not hard
+        self._logger.info(f"⏳ Worker {worker_id} soft penalty for {seconds}s")
+        return reset_time
+
     def mark_rate_limited(self, worker_id: str, message: str) -> datetime:
-        """Mark a worker as rate-limited. Cooldown capped to 10 minutes."""
+        """Mark a worker as hard rate-limited. Cooldown parsed from message."""
         reset_time = self.parse_reset_time(message)
         self._rate_limits[worker_id] = reset_time
+        self._hard_limits.add(worker_id)
         remaining = int((reset_time - datetime.now()).total_seconds())
-        self._logger.warning(f"🚫 Worker {worker_id} rate-limited for {remaining}s (until {reset_time})")
+        self._logger.warning(f"🚫 Worker {worker_id} HARD rate-limited for {remaining}s (until {reset_time})")
         return reset_time
 
     def is_rate_limited(self, worker_id: str) -> bool:
-        """Check if a specific worker is rate-limited"""
+        """Check if a specific worker is rate-limited (soft or hard)."""
         if worker_id not in self._rate_limits:
             return False
         if datetime.now() >= self._rate_limits[worker_id]:
-            # Cooldown expired — retry this worker
             del self._rate_limits[worker_id]
+            self._hard_limits.discard(worker_id)
             self._logger.info(f"✅ Worker {worker_id} cooldown expired, retrying")
             return False
         return True
 
+    def is_hard_limited(self, worker_id: str) -> bool:
+        """Check if worker has a HARD rate limit (real Anthropic rate limit)."""
+        return self.is_rate_limited(worker_id) and worker_id in self._hard_limits
+
+    def should_reject_new_request(self, worker_id: str) -> bool:
+        """Decide if a new request should be rejected (503 for NGINX failover).
+
+        Returns True if this worker should reject. NGINX routes to next worker.
+        Safety valve: if ALL workers are soft-limited, allow through anyway.
+        Hard limits always reject (real Anthropic rate limit).
+        """
+        if not self.is_rate_limited(worker_id):
+            return False
+
+        # Hard limit: always reject (Anthropic won't accept)
+        if worker_id in self._hard_limits:
+            return True
+
+        # Soft limit: reject ONLY if other workers might be available.
+        # We can't know from here, but NGINX will try all workers.
+        # The safety valve: if this soft penalty is older than 30s,
+        # there's a good chance the transient issue is resolved.
+        remaining = self.get_retry_after(worker_id)
+        if remaining is not None and remaining < 30:
+            # Penalty almost expired — let it through
+            return False
+
+        return True
+
     def get_retry_after(self, worker_id: str) -> Optional[int]:
-        """Get seconds until rate limit resets for a worker"""
+        """Get seconds until rate limit resets for a worker."""
         if worker_id in self._rate_limits:
             delta = self._rate_limits[worker_id] - datetime.now()
             seconds = int(delta.total_seconds())
@@ -228,9 +278,10 @@ class RateLimitTracker:
         return None
 
     def get_all_rate_limits(self) -> Dict[str, datetime]:
-        """Get all current rate limits"""
+        """Get all current rate limits."""
         now = datetime.now()
         self._rate_limits = {k: v for k, v in self._rate_limits.items() if v > now}
+        self._hard_limits = {w for w in self._hard_limits if w in self._rate_limits}
         return self._rate_limits.copy()
 
 
@@ -947,10 +998,9 @@ CRITICAL: Write file EARLY to avoid context overflow. Use Write tool for clauded
                             # =============================================================
                             # RATE LIMIT EVENT: CLI is handling retry internally — DON'T abort.
                             # rate_limit_event means the CLI detected a transient rate limit
-                            # and is WAITING to retry. We just skip this message and let the
-                            # stream continue. The CLI will retry and send the actual response.
-                            # DO NOT mark_rate_limited (cascade failure).
-                            # DO NOT raise/abort (wastes all tokens spent so far).
+                            # and is WAITING to retry. We skip this message, let the stream
+                            # continue, and set a soft penalty so NEW requests get routed
+                            # to other workers (but this task completes normally).
                             # =============================================================
                             if isinstance(message, RateLimitEvent):
                                 worker_id = os.environ.get("INSTANCE_NAME", "unknown")
@@ -958,6 +1008,10 @@ CRITICAL: Write file EARLY to avoid context overflow. Use Write tool for clauded
                                     f"⏳ Worker {worker_id} received rate_limit_event — "
                                     f"CLI is handling retry internally. "
                                     f"retry_after={message.retry_after}, message={message.message[:120]}"
+                                )
+                                # Soft penalty for NEW request routing (short, non-blocking)
+                                rate_limit_tracker.mark_soft_penalty(
+                                    worker_id, message.retry_after
                                 )
                                 continue
 
@@ -1110,11 +1164,12 @@ CRITICAL: Write file EARLY to avoid context overflow. Use Write tool for clauded
                                             if any(pattern in text_lower for pattern in rate_limit_patterns):
                                                 worker_id = os.environ.get("INSTANCE_NAME", "unknown")
                                                 full_msg = block.text
-                                                # CLI handles rate limits internally — DON'T abort.
-                                                # Just skip this message (it's not real content).
+                                                # HARD rate limit from text — CLI will retry.
+                                                # Task continues, but mark HARD limit for new routing.
+                                                rate_limit_tracker.mark_rate_limited(worker_id, full_msg)
                                                 logger.warning(
-                                                    f"⏳ Rate limit text on {worker_id} — "
-                                                    f"CLI will retry internally, task continues. "
+                                                    f"🚫 Rate limit text on {worker_id} — "
+                                                    f"HARD limit set, CLI retrying internally. "
                                                     f"Message: {full_msg[:150]}"
                                                 )
                                                 # Don't yield this rate-limit text to the client
