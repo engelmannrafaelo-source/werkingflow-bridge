@@ -75,8 +75,12 @@ app = FastAPI(
 # Production Aggregation Helper
 # ============================================================================
 
-def _fetch_prod(path: str, timeout: float = 5.0) -> dict | None:
-    """Fetch an endpoint from the production Bridge. Returns None on any error."""
+def _fetch_prod(path: str, timeout: float = 15.0) -> dict | None:
+    """Fetch an endpoint from the production Bridge. Returns None on any error.
+
+    Default timeout is 15s because production has no metrics-reader — JSONL
+    endpoints are served by the worker inline and can be slow.
+    """
     if not PROD_BRIDGE_URL:
         return None
     import urllib.request
@@ -252,7 +256,7 @@ def health() -> dict:
 def get_prompt_performance(hours: int = Query(24, ge=0)) -> dict:
     """Per-prompt-type stats. hours=0 ⇒ all time."""
     local = get_prompt_metrics().get_stats(hours=hours)
-    prod = _fetch_prod(f"/v1/metrics/prompt-performance?hours={hours}")
+    prod = _fetch_prod(f"/v1/metrics/prompt-performance?hours={hours}", timeout=30)
     if prod:
         return _merge_prompt_performance(local, prod)
     return local
@@ -293,7 +297,7 @@ def get_prompt_calls(
         params += f"&app_id={app_id}"
     if user_id:
         params += f"&user_id={user_id}"
-    prod = _fetch_prod(f"/v1/metrics/prompt-performance/calls{params}")
+    prod = _fetch_prod(f"/v1/metrics/prompt-performance/calls{params}", timeout=30)
     if prod:
         return _merge_calls(local, prod, limit)
     return local
@@ -315,7 +319,7 @@ def get_throughput(
 def get_usage_breakdown(hours: int = Query(24, ge=0)) -> dict:
     """Token/cost breakdown per app, per user, per model."""
     local = get_prompt_metrics().get_usage_breakdown(hours=hours)
-    prod = _fetch_prod(f"/v1/metrics/usage-breakdown?hours={hours}")
+    prod = _fetch_prod(f"/v1/metrics/usage-breakdown?hours={hours}", timeout=30)
     if prod:
         return _merge_usage_breakdown(local, prod)
     return local
@@ -344,7 +348,7 @@ def get_request_log_endpoint(
         params += f"&endpoint={endpoint}"
     if status:
         params += f"&status={status}"
-    prod = _fetch_prod(f"/v1/metrics/request-log{params}")
+    prod = _fetch_prod(f"/v1/metrics/request-log{params}", timeout=30)
     if prod:
         return _merge_request_log(local, prod, limit)
     return local
