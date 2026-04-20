@@ -3668,7 +3668,7 @@ async def get_performance_metrics(
         Performance summary including request counts, average duration,
         slow requests, and per-endpoint statistics.
     """
-    from middleware.performance_monitor import metrics
+    from src.middleware.performance_monitor import metrics
 
     summary = metrics.get_summary()
 
