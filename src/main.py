@@ -1508,18 +1508,13 @@ async def chat_completions(
             logger.debug(f"rolling_metrics arrival hook failed: {_e}")
 
         # =======================================================================
-        # RATE LIMIT PRE-CHECK: Fail fast if this worker is already rate-limited.
-        # Returns 503 immediately so NGINX routes to another worker (no wasted
-        # Anthropic API call). This is the proactive counterpart to NGINX's
-        # reactive fail_timeout — the worker KNOWS it's rate-limited and says so.
+        # RATE LIMIT PRE-CHECK: DISABLED.
+        # Previously rejected requests when worker was marked rate-limited.
+        # This caused cascade failures: all 4 workers get marked → bridge dead
+        # for 10 minutes despite Anthropic tokens being available (2-5% usage).
+        # Rate limits are transient — let each request try Anthropic directly.
         # =======================================================================
         worker_id = os.getenv("INSTANCE_NAME", "unknown")
-        if rate_limit_tracker.is_rate_limited(worker_id):
-            retry_after = rate_limit_tracker.get_retry_after(worker_id) or 60
-            logger.info(f"⏭️ Worker {worker_id} rate-limited, fast-rejecting (retry in {retry_after}s)")
-            raise WorkerUnavailableError(
-                f"Worker {worker_id} rate-limited. Reset in {retry_after}s."
-            )
 
         # =======================================================================
         # BUDGET ENFORCEMENT: Check tenant limits before processing
@@ -2484,14 +2479,8 @@ async def research(
     # Attribution enforcement
     enforce_attribution(request)
 
-    # Rate limit pre-check (fail fast → NGINX failover)
+    # Rate limit pre-check: DISABLED (same reason as chat endpoint)
     worker_id = os.getenv("INSTANCE_NAME", "unknown")
-    if rate_limit_tracker.is_rate_limited(worker_id):
-        retry_after = rate_limit_tracker.get_retry_after(worker_id) or 60
-        logger.info(f"⏭️ Worker {worker_id} rate-limited, fast-rejecting research (retry in {retry_after}s)")
-        raise WorkerUnavailableError(
-            f"Worker {worker_id} rate-limited. Reset in {retry_after}s."
-        )
 
     start_time = time.time()
     session_id = None
