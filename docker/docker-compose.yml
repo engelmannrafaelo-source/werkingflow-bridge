@@ -294,9 +294,9 @@ services:
     deploy:
       resources:
         limits:
-          memory: 512M
+          memory: 1536M
         reservations:
-          memory: 128M
+          memory: 256M
     volumes:
       # READ-ONLY mount — reader must never write to the metrics volume.
       - eco-wrapper-logs:/app/logs:ro
