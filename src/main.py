@@ -2477,6 +2477,40 @@ async def chat_completions(
         # error came from Anthropic, not the bridge itself. Only unclassifiable
         # exceptions fall through to `bridge_internal` / internal.
         raise BridgeError(classify_exception(e))
+    finally:
+        # Safety net for inflight counter leaks. All three except-blocks above
+        # (HTTPException / WorkerUnavailableError / Exception) call
+        # record_completion and clear `arrival_recorded`. But some terminations
+        # bypass ALL of them — most notably asyncio.CancelledError (Python 3.8+
+        # inherits from BaseException, not Exception), which fires when the
+        # client disconnects mid-stream, the worker is OOM-killed, or the
+        # ASGI server cancels the task. Without this finally, those cases
+        # leave `_in_flight[worker]` and `_in_flight_input_tokens[worker]`
+        # permanently incremented, starving the AdaptiveLoadLimiter until
+        # the process is restarted.
+        if getattr(request.state, "arrival_recorded", False):
+            try:
+                from src.middleware.rolling_metrics import get_rolling_metrics
+                _leak_dur_ms = int((time.time() - start_time) * 1000)
+                _leak_worker = os.getenv("INSTANCE_NAME", "unknown")
+                _leak_est = int(getattr(request.state, "adaptive_est_tokens", 0) or 0)
+                get_rolling_metrics().record_completion(
+                    worker=_leak_worker,
+                    status="error",
+                    duration_ms=_leak_dur_ms,
+                    input_tokens=0,
+                    output_tokens=0,
+                    est_input_tokens_at_arrival=_leak_est,
+                )
+                request.state.arrival_recorded = False
+                logger.warning(
+                    f"inflight counter leak prevented: request ended without hitting "
+                    f"any completion site (likely CancelledError/abort). "
+                    f"worker={_leak_worker} est_tokens_released={_leak_est} "
+                    f"duration_ms={_leak_dur_ms}"
+                )
+            except Exception as _e:
+                logger.debug(f"rolling_metrics outer-finally safety net failed: {_e}")
 
 
 @app.post("/v1/research", response_model=ResearchResponse)
