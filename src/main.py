@@ -4020,7 +4020,36 @@ async def get_queue_forecast(
         "stable"
     )
 
-    # Simple risk scoring per worker (saturated if very few completions and many in-flight)
+    # Adaptive token-budget limiter snapshot (this worker only — each worker
+    # auto-tunes independently because each owns its own Anthropic account).
+    adaptive_limiter_snapshot: Optional[Dict[str, Any]] = None
+    try:
+        adaptive_limiter_snapshot = get_adaptive_limiter().snapshot()
+    except Exception as _e:
+        logger.debug(f"queue-forecast: adaptive limiter snapshot unavailable: {_e}")
+
+    # Risk scoring per worker — token-utilization-based (matches adaptive_limiter reality).
+    # For SELF worker we know the exact utilization_pct from adaptive_limiter.
+    # For other workers rolling_metrics is per-process (won't see them), so they rarely
+    # appear here; if they do, we fall back to a count-based heuristic calibrated to
+    # the real token-concurrency era (dozens of concurrent requests are normal).
+    self_worker = summary.get("worker_self")
+    self_util_pct: Optional[float] = None
+    try:
+        if adaptive_limiter_snapshot:
+            self_util_pct = float(adaptive_limiter_snapshot.get("utilization_pct", 0.0))
+    except Exception:
+        self_util_pct = None
+
+    def _classify_by_util(util_pct: float) -> str:
+        if util_pct >= 90:
+            return "saturated"
+        if util_pct >= 70:
+            return "busy"
+        if util_pct > 0:
+            return "ok"
+        return "idle"
+
     saturation: Dict[str, str] = {}
     for w_name, w in workers.items():
         in_flight = w.get("in_flight", 0)
@@ -4028,9 +4057,11 @@ async def get_queue_forecast(
         rl_hits = w.get("rate_limit_hits", 0)
         if rl_hits > 0:
             saturation[w_name] = "rate_limited"
-        elif in_flight >= 5:
+        elif w_name == self_worker and self_util_pct is not None:
+            saturation[w_name] = _classify_by_util(self_util_pct)
+        elif in_flight >= 25:
             saturation[w_name] = "saturated"
-        elif in_flight >= 3:
+        elif in_flight >= 15:
             saturation[w_name] = "busy"
         elif comp_pm > 0 or in_flight > 0:
             saturation[w_name] = "ok"
@@ -4042,14 +4073,6 @@ async def get_queue_forecast(
         "medium" if (active_workers is not None and active_workers == 2) else
         "low"
     )
-
-    # Adaptive token-budget limiter snapshot (this worker only — each worker
-    # auto-tunes independently because each owns its own Anthropic account).
-    adaptive_limiter_snapshot: Optional[Dict[str, Any]] = None
-    try:
-        adaptive_limiter_snapshot = get_adaptive_limiter().snapshot()
-    except Exception as _e:
-        logger.debug(f"queue-forecast: adaptive limiter snapshot unavailable: {_e}")
 
     return {
         "window_seconds": summary["window_seconds"],
