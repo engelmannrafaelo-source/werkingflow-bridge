@@ -409,6 +409,339 @@ def get_request_log_endpoint(
 
 
 # ============================================================================
+# Contract Observability (file-based aggregation of request_log)
+# ============================================================================
+
+@app.get("/v1/metrics/contract")
+def get_contract_stats(
+    hours: int = Query(24, ge=1, le=168),
+    recent_limit: int = Query(50, ge=1, le=500),
+) -> dict:
+    """
+    Contract-violation & 429-reason aggregation.
+
+    Reads the per-worker request_log JSONL and buckets non-2xx responses by
+    status × reason × source. Drives the panel's Contract tab. Goals:
+
+    - "violations" count  → how many 500/502/503/504 escaped to the client
+      (after Phase 1+2, should trend toward zero)
+    - "capacity_429" count → healthy rejections; expected to be non-zero
+    - "reason_breakdown"  → which capacity mechanism fired how often
+
+    Surfaces recent violations separately so operators can drill in.
+    """
+    # Pull raw entries (bounded large window for stable aggregation).
+    raw = get_request_log().query(
+        hours=hours,
+        endpoint_filter=None,
+        status_filter=None,
+        limit=10000,
+    )
+    entries = raw.get("entries") or []
+
+    # Buckets. Reason/source aggregate across all non-2xx so operators can
+    # see, for a given reason, which status codes it produced. That catches
+    # the case where a reason is emitted at both 429 (expected) and 5xx
+    # (contract violation) — a nuance a flat count would hide.
+    total = 0
+    total_2xx = 0
+    total_429 = 0
+    total_5xx = 0
+    total_4xx_client = 0  # 4xx that are NOT 429 (client-side problems)
+    reason_stats: dict[str, dict] = {}
+    source_stats: dict[str, dict] = {}
+    worker_violations: dict[str, int] = {}
+    violations: list[dict] = []
+
+    def _bump_reason(reason: str, status: int, endpoint: str) -> None:
+        bucket = reason_stats.setdefault(
+            reason, {"count": 0, "statuses": {}, "sample_endpoints": []}
+        )
+        bucket["count"] += 1
+        bucket["statuses"][str(status)] = bucket["statuses"].get(str(status), 0) + 1
+        if endpoint and endpoint not in bucket["sample_endpoints"] and len(bucket["sample_endpoints"]) < 5:
+            bucket["sample_endpoints"].append(endpoint)
+
+    def _bump_source(source: str, status: int) -> None:
+        bucket = source_stats.setdefault(source, {"count": 0, "statuses": {}})
+        bucket["count"] += 1
+        bucket["statuses"][str(status)] = bucket["statuses"].get(str(status), 0) + 1
+
+    for e in entries:
+        status = int(e.get("status") or 0)
+        if status == 0:
+            continue
+        total += 1
+        if 200 <= status < 300:
+            total_2xx += 1
+            continue
+
+        # Non-2xx: always record reason/source for the breakdown.
+        reason = e.get("reason") or "unknown"
+        source = e.get("source") or "unknown"
+        endpoint = e.get("endpoint") or "unknown"
+        _bump_reason(reason, status, endpoint)
+        _bump_source(source, status)
+
+        if status == 429:
+            total_429 += 1
+            continue
+        if 500 <= status < 600:
+            total_5xx += 1
+            worker = e.get("worker") or "unknown"
+            worker_violations[worker] = worker_violations.get(worker, 0) + 1
+            violations.append({
+                "ts": e.get("ts"),
+                "method": e.get("method"),
+                "worker": worker,
+                "endpoint": endpoint,
+                "status": status,
+                "reason": e.get("reason"),
+                "source": e.get("source"),
+                "duration_s": e.get("duration_s"),
+            })
+            continue
+        if 400 <= status < 500:
+            total_4xx_client += 1
+
+    # Recent violations first.
+    violations.sort(key=lambda v: v.get("ts") or 0, reverse=True)
+    violations = violations[:recent_limit]
+
+    # Contract verdict.
+    if total_5xx == 0:
+        verdict = "ok"
+    elif total_5xx < 5:
+        verdict = "degraded"
+    else:
+        verdict = "violating"
+
+    violation_rate_pct = round((total_5xx / total) * 100, 2) if total > 0 else 0.0
+
+    return {
+        "period_hours": hours,
+        "verdict": verdict,
+        "totals": {
+            "requests": total,
+            "success_2xx": total_2xx,
+            "capacity_429": total_429,
+            "client_4xx": total_4xx_client,
+            "violations_5xx": total_5xx,
+            "violation_rate_pct": violation_rate_pct,
+        },
+        "reason_breakdown": reason_stats,
+        "source_breakdown": source_stats,
+        "violations_by_worker": worker_violations,
+        "recent_violations": violations,
+    }
+
+
+# ============================================================================
+# Upstream Health — Claude API reachability proxy, derived from request log.
+# ============================================================================
+
+@app.get("/v1/metrics/upstream-health")
+def get_upstream_health(
+    recent_window_min: int = Query(5, ge=1, le=120),
+    lookback_hours: int = Query(6, ge=1, le=168),
+) -> dict:
+    """
+    Claude API reachability indicator derived from recent bridge requests.
+
+    We do NOT actively ping claude.ai (no synthetic traffic). Instead the
+    request log acts as a passive probe: every 5xx with a
+    `claude_upstream_error` / `claude_upstream_timeout` reason = the worker
+    saw a real upstream failure. That's a better signal than a synthetic
+    ping because it reflects the actual auth/routing path the users take.
+
+    Response verdict:
+      * "ok"         — no upstream errors in the recent window
+      * "degraded"   — 1..4 upstream errors in window OR worker-subset failing
+      * "unreachable"— ≥5 upstream errors in window (every worker sees it)
+    """
+    import time as _time
+    raw = get_request_log().query(hours=lookback_hours, limit=20000)
+    entries = raw.get("entries") or []
+
+    now = _time.time()
+    recent_cutoff = now - (recent_window_min * 60)
+
+    upstream_reasons = {"claude_upstream_error", "claude_upstream_timeout"}
+    per_worker: dict[str, dict] = {}
+    recent_errors = 0
+    total_recent = 0
+    last_upstream_error_ts: float | None = None
+
+    for e in entries:
+        ts = e.get("ts") or 0
+        worker = e.get("worker") or "unknown"
+        w = per_worker.setdefault(worker, {
+            "total": 0, "upstream_errors": 0, "last_error_ts": None,
+            "recent_upstream_errors": 0,
+        })
+        w["total"] += 1
+        reason = e.get("reason")
+        if reason in upstream_reasons:
+            w["upstream_errors"] += 1
+            if w["last_error_ts"] is None or ts > w["last_error_ts"]:
+                w["last_error_ts"] = ts
+            if last_upstream_error_ts is None or ts > last_upstream_error_ts:
+                last_upstream_error_ts = ts
+            if ts >= recent_cutoff:
+                w["recent_upstream_errors"] += 1
+                recent_errors += 1
+        if ts >= recent_cutoff:
+            total_recent += 1
+
+    if recent_errors == 0:
+        verdict = "ok"
+    elif recent_errors < 5:
+        verdict = "degraded"
+    else:
+        verdict = "unreachable"
+
+    recent_error_rate_pct = (
+        round((recent_errors / total_recent) * 100, 2)
+        if total_recent > 0 else 0.0
+    )
+
+    seconds_since_last_error = (
+        int(now - last_upstream_error_ts)
+        if last_upstream_error_ts is not None else None
+    )
+
+    return {
+        "verdict": verdict,
+        "recent_window_min": recent_window_min,
+        "recent_upstream_errors": recent_errors,
+        "recent_total_requests": total_recent,
+        "recent_error_rate_pct": recent_error_rate_pct,
+        "last_upstream_error_ts": last_upstream_error_ts,
+        "seconds_since_last_error": seconds_since_last_error,
+        "lookback_hours": lookback_hours,
+        "workers": per_worker,
+    }
+
+
+# ============================================================================
+# Limiter Trajectory — cap / inflight / utilization over time per worker.
+# ============================================================================
+
+import glob as _glob
+import json as _json
+
+
+@app.get("/v1/metrics/limiter-trajectory")
+def get_limiter_trajectory(
+    hours: int = Query(24, ge=1, le=168),
+    max_points: int = Query(500, ge=50, le=5000),
+) -> dict:
+    """
+    Time-series of limiter cap auto-tune + load per worker.
+
+    Reads `limiter_events.{worker}.jsonl` files written by AdaptiveLoadLimiter
+    every TUNE_INTERVAL_SEC (~60s). Each point carries cap_after,
+    effective_cap_tokens, inflight_tokens, queued_count, and direction
+    (shrink/grow/hold).
+
+    When the raw series exceeds max_points, it's uniformly downsampled
+    (simple stride) to keep the payload bounded. Tune *events* (shrink/grow)
+    are always preserved in the downsample output.
+    """
+    import time as _time
+    cutoff = _time.time() - (hours * 3600) if hours > 0 else 0
+    pattern = os.path.join(
+        os.getenv("METRICS_DIR", "/app/logs"),
+        "bridge-metrics",
+        "limiter_events.*.jsonl",
+    )
+
+    workers: dict[str, list[dict]] = {}
+    tune_counts: dict[str, dict[str, int]] = {}
+
+    for filepath in sorted(_glob.glob(pattern)):
+        # Worker name = filename between "limiter_events." and ".jsonl"
+        base = os.path.basename(filepath)
+        worker = base.removeprefix("limiter_events.").removesuffix(".jsonl") or "unknown"
+        workers.setdefault(worker, [])
+        tune_counts.setdefault(worker, {"shrink": 0, "grow": 0, "hold": 0})
+        try:
+            with open(filepath, "r") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        ev = _json.loads(line)
+                    except _json.JSONDecodeError:
+                        continue
+                    ts = ev.get("ts") or 0
+                    if ts < cutoff:
+                        continue
+                    direction = ev.get("direction", "hold")
+                    tune_counts[worker][direction] = tune_counts[worker].get(direction, 0) + 1
+                    # Compact point — keep payload small for long windows.
+                    workers[worker].append({
+                        "ts": ts,
+                        "direction": direction,
+                        "cap": ev.get("cap_after", ev.get("cap_before", 0)),
+                        "effective_cap": ev.get("effective_cap_tokens", 0),
+                        "inflight_tokens": ev.get("inflight_tokens", 0),
+                        "inflight_count": ev.get("inflight_count", 0),
+                        "queued": ev.get("queued_count", 0),
+                        "peak_util_pct": ev.get("observed_peak_util_pct", 0.0),
+                        "rate_limits": ev.get("observed_rate_limits", 0),
+                        "weekly_pct": ev.get("account_weekly_pct", 0.0),
+                    })
+        except OSError:
+            continue
+
+    # Downsample per worker if oversized. Always keep tune events (non-"hold").
+    for worker, points in workers.items():
+        points.sort(key=lambda p: p["ts"])
+        if len(points) > max_points:
+            tune_events = [p for p in points if p["direction"] != "hold"]
+            holds = [p for p in points if p["direction"] == "hold"]
+            # Remaining budget for hold points after reserving tune events.
+            budget = max(0, max_points - len(tune_events))
+            if budget > 0 and len(holds) > budget:
+                stride = max(1, len(holds) // budget)
+                holds = holds[::stride][:budget]
+            merged = sorted(tune_events + holds, key=lambda p: p["ts"])
+            workers[worker] = merged
+
+    # Build per-worker summary: current cap, latest util, recent tune activity.
+    summary: dict[str, dict] = {}
+    for worker, points in workers.items():
+        if not points:
+            summary[worker] = {
+                "points": 0, "current_cap": 0, "current_inflight": 0,
+                "utilization_pct": 0.0, "tune_counts": tune_counts.get(worker, {}),
+            }
+            continue
+        last = points[-1]
+        cap = last.get("cap") or 0
+        util = round((last.get("inflight_tokens", 0) / cap) * 100, 1) if cap > 0 else 0.0
+        summary[worker] = {
+            "points": len(points),
+            "current_cap": cap,
+            "current_effective_cap": last.get("effective_cap", 0),
+            "current_inflight": last.get("inflight_tokens", 0),
+            "current_inflight_count": last.get("inflight_count", 0),
+            "current_queued": last.get("queued", 0),
+            "utilization_pct": util,
+            "weekly_pct": last.get("weekly_pct", 0.0),
+            "tune_counts": tune_counts.get(worker, {}),
+        }
+
+    return {
+        "period_hours": hours,
+        "workers": workers,
+        "summary": summary,
+    }
+
+
+# ============================================================================
 # CC-Usage Snapshots (file-based, read-only)
 # ============================================================================
 

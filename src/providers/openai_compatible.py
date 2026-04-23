@@ -6,8 +6,13 @@ provider that implements the OpenAI /v1/chat/completions endpoint.
 Architecture:
     Request comes in OpenAI format → forward to provider → return response unchanged.
     No message conversion needed — the Bridge API is already OpenAI-compatible.
+    Transient upstream errors (5xx, network blips) are retried here with bounded
+    exponential backoff BEFORE surfacing — this absorbs upstream glitches so
+    fewer worker-level BridgeErrors leak out of the bridge.
 """
 
+import asyncio
+import random
 import time
 import logging
 from typing import Optional, AsyncGenerator
@@ -20,6 +25,36 @@ logger = logging.getLogger(__name__)
 
 # Timeout: 5 min for generation (long prompts), 30s connect
 TIMEOUT = httpx.Timeout(timeout=300.0, connect=30.0)
+
+# Transient-error retry policy for upstream OpenAI-compatible providers.
+# 429 is included because external providers' own rate-limits are often brief.
+# 5xx are transient upstream issues. 4xx (400/401/403/404) are client-side
+# mistakes and retrying won't help — surface immediately.
+_RETRY_STATUS_CODES = frozenset({408, 425, 429, 500, 502, 503, 504})
+_MAX_RETRIES = 2  # i.e. up to 3 total attempts
+_BASE_BACKOFF_S = 1.0
+_MAX_BACKOFF_S = 6.0
+
+
+def _is_transient_httpx_exc(exc: Exception) -> bool:
+    """Network-layer exceptions that are worth retrying once."""
+    return isinstance(exc, (
+        httpx.ConnectError,
+        httpx.ConnectTimeout,
+        httpx.ReadTimeout,
+        httpx.WriteTimeout,
+        httpx.PoolTimeout,
+        httpx.RemoteProtocolError,
+        httpx.NetworkError,
+    ))
+
+
+def _backoff_delay(attempt: int) -> float:
+    """Exponential backoff with jitter. attempt is 0-indexed (0 = first retry)."""
+    raw = _BASE_BACKOFF_S * (2 ** attempt)
+    capped = min(raw, _MAX_BACKOFF_S)
+    # Full jitter keeps colliding retries from synchronizing under sustained 5xx.
+    return random.uniform(0, capped)
 
 
 class ProviderError(RuntimeError):
@@ -83,24 +118,67 @@ async def call_openai_compatible(
     start = time.time()
     logger.info(f"🌐 OpenAI-compatible call: {url} (model: {body['model']})")
 
+    last_error: Optional[Exception] = None
     async with httpx.AsyncClient(timeout=TIMEOUT) as client:
-        response = await client.post(url, json=body, headers=headers)
+        for attempt in range(_MAX_RETRIES + 1):
+            try:
+                response = await client.post(url, json=body, headers=headers)
+            except Exception as net_exc:
+                if _is_transient_httpx_exc(net_exc) and attempt < _MAX_RETRIES:
+                    delay = _backoff_delay(attempt)
+                    logger.warning(
+                        f"🔁 Network error calling {base_url} "
+                        f"(attempt {attempt + 1}/{_MAX_RETRIES + 1}): "
+                        f"{type(net_exc).__name__}: {str(net_exc)[:120]} — "
+                        f"retrying in {delay:.1f}s"
+                    )
+                    last_error = net_exc
+                    await asyncio.sleep(delay)
+                    continue
+                raise
 
-    duration = time.time() - start
+            if response.status_code == 200:
+                data = response.json()
+                duration = time.time() - start
+                logger.info(
+                    f"✅ OpenAI-compatible response in {duration:.2f}s "
+                    f"(tokens: {data.get('usage', {}).get('total_tokens', '?')}, "
+                    f"attempts: {attempt + 1})"
+                )
+                return data
 
-    if response.status_code != 200:
-        error_text = response.text[:500]
-        logger.error(f"❌ Provider error ({response.status_code}): {error_text}")
-        error = ProviderError(response.status_code, error_text)
-        raise error
+            # Non-200. Retry transient upstream statuses; surface the rest.
+            error_text = response.text[:500]
+            if response.status_code in _RETRY_STATUS_CODES and attempt < _MAX_RETRIES:
+                # Honour Retry-After when provided (bounded so we don't stall forever).
+                retry_after_hdr = response.headers.get("Retry-After")
+                try:
+                    hinted = float(retry_after_hdr) if retry_after_hdr else None
+                except ValueError:
+                    hinted = None
+                delay = min(hinted, _MAX_BACKOFF_S) if hinted else _backoff_delay(attempt)
+                logger.warning(
+                    f"🔁 Transient upstream {response.status_code} from {base_url} "
+                    f"(attempt {attempt + 1}/{_MAX_RETRIES + 1}): "
+                    f"{error_text[:160]} — retrying in {delay:.1f}s"
+                )
+                last_error = ProviderError(response.status_code, error_text)
+                await asyncio.sleep(delay)
+                continue
 
-    data = response.json()
-    logger.info(
-        f"✅ OpenAI-compatible response in {duration:.2f}s "
-        f"(tokens: {data.get('usage', {}).get('total_tokens', '?')})"
+            logger.error(f"❌ Provider error ({response.status_code}): {error_text}")
+            raise ProviderError(response.status_code, error_text)
+
+    # Loop exhausted without returning — raise the last transient error.
+    logger.error(
+        f"❌ Exhausted {_MAX_RETRIES + 1} attempts against {base_url}: {last_error}"
     )
-
-    return data
+    if isinstance(last_error, ProviderError):
+        raise last_error
+    raise ProviderError(
+        status_code=599,
+        message=f"Transient network error after retries: {last_error}",
+    )
 
 
 async def stream_openai_compatible(
@@ -132,15 +210,63 @@ async def stream_openai_compatible(
 
     logger.info(f"🌐 OpenAI-compatible stream: {url} (model: {body['model']})")
 
+    # Pre-stream retry: we can only retry BEFORE the first chunk is yielded.
+    # Once streaming has started, a mid-stream failure must surface (the client
+    # has already received partial output; re-running would duplicate content
+    # and double-bill tokens).
+    last_error: Optional[Exception] = None
     async with httpx.AsyncClient(timeout=TIMEOUT) as client:
-        async with client.stream("POST", url, json=body, headers=headers) as response:
-            if response.status_code != 200:
-                error_text = await response.aread()
-                raise ProviderError(response.status_code, error_text.decode()[:500])
+        for attempt in range(_MAX_RETRIES + 1):
+            try:
+                async with client.stream("POST", url, json=body, headers=headers) as response:
+                    if response.status_code != 200:
+                        error_bytes = await response.aread()
+                        error_text = error_bytes.decode(errors="replace")[:500]
+                        if (
+                            response.status_code in _RETRY_STATUS_CODES
+                            and attempt < _MAX_RETRIES
+                        ):
+                            delay = _backoff_delay(attempt)
+                            logger.warning(
+                                f"🔁 Transient upstream {response.status_code} on stream "
+                                f"to {base_url} (attempt {attempt + 1}/{_MAX_RETRIES + 1}): "
+                                f"{error_text[:160]} — retrying in {delay:.1f}s"
+                            )
+                            last_error = ProviderError(response.status_code, error_text)
+                            await asyncio.sleep(delay)
+                            continue
+                        raise ProviderError(response.status_code, error_text)
 
-            async for line in response.aiter_lines():
-                if line.startswith("data: "):
-                    yield f"{line}\n\n"
-                elif line == "data: [DONE]":
-                    yield "data: [DONE]\n\n"
-                    break
+                    # Success — stream through. Any error past this point must
+                    # bubble as-is (can't safely restart a partially-delivered stream).
+                    async for line in response.aiter_lines():
+                        if line.startswith("data: "):
+                            yield f"{line}\n\n"
+                        elif line == "data: [DONE]":
+                            yield "data: [DONE]\n\n"
+                            break
+                    return
+            except Exception as net_exc:
+                if _is_transient_httpx_exc(net_exc) and attempt < _MAX_RETRIES:
+                    delay = _backoff_delay(attempt)
+                    logger.warning(
+                        f"🔁 Network error on stream setup to {base_url} "
+                        f"(attempt {attempt + 1}/{_MAX_RETRIES + 1}): "
+                        f"{type(net_exc).__name__}: {str(net_exc)[:120]} — "
+                        f"retrying in {delay:.1f}s"
+                    )
+                    last_error = net_exc
+                    await asyncio.sleep(delay)
+                    continue
+                raise
+
+    # Stream retries exhausted without ever succeeding.
+    logger.error(
+        f"❌ Stream retries exhausted against {base_url}: {last_error}"
+    )
+    if isinstance(last_error, ProviderError):
+        raise last_error
+    raise ProviderError(
+        status_code=599,
+        message=f"Transient network error after retries: {last_error}",
+    )

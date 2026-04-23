@@ -51,7 +51,8 @@ class RequestLogStore:
 
     Fields per entry:
         timestamp, method, endpoint, status_code, duration_s,
-        tools_enabled, worker, client_ip
+        tools_enabled, worker, client_ip,
+        [reason, source]  — only present on non-2xx; drives the contract tab.
     """
 
     def __init__(self):
@@ -69,9 +70,11 @@ class RequestLogStore:
         duration_s: float,
         tools_enabled: bool = False,
         client_ip: str = "unknown",
+        reason: Optional[str] = None,
+        source: Optional[str] = None,
     ) -> None:
         """Append a request log entry to disk."""
-        entry = {
+        entry: Dict[str, Any] = {
             "ts": round(time.time(), 3),
             "method": method,
             "endpoint": endpoint,
@@ -81,6 +84,10 @@ class RequestLogStore:
             "worker": self._worker_id,
             "client": client_ip,
         }
+        if reason:
+            entry["reason"] = reason
+        if source:
+            entry["source"] = source
         try:
             with open(self._jsonl_path, "a") as f:
                 f.write(json.dumps(entry, separators=(",", ":")) + "\n")

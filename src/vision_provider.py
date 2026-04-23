@@ -7,7 +7,7 @@ bypassing the SDK while maintaining the same response format.
 
 Usage:
     provider = VisionProvider()
-    response = await provider.analyze(messages, model="claude-sonnet-4-20250514")
+    response = await provider.analyze(messages, model="claude-sonnet-4-5-20250929")
 """
 
 import os
@@ -281,7 +281,7 @@ class VisionProvider:
     async def analyze(
         self,
         messages: List[Dict[str, Any]],
-        model: str = "claude-sonnet-4-20250514",
+        model: str = "claude-sonnet-4-5-20250929",
         max_tokens: int = 4096,
         temperature: float = 0.7,
         system_prompt: Optional[str] = None

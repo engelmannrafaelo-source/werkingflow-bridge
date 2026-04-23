@@ -105,8 +105,13 @@ except ImportError:
             return func
         return decorator
 
-# Request limiting for memory protection
-from src.request_limiter import get_limiter, RequestLimiterMiddleware, PureASGIRequestLimiter, concurrency_limit
+# Legacy request limiter — kept only for the /stats, /ready, /worker-capacity
+# endpoints, which expose active_requests + memory stats. The real concurrency
+# gating is done by AdaptiveLoadLimiter below; the legacy counter is never
+# incremented anymore (was wired via concurrency_limit / middleware, both
+# removed). Marked for full removal once consumers migrate to the new
+# endpoints (/v1/metrics/limiter-trajectory, /v1/metrics/upstream-health).
+from src.request_limiter import get_limiter
 # Adaptive token-budget limiter (replaces static MAX_CONCURRENT_REQUESTS gating)
 from src.middleware.adaptive_limiter import (
     adaptive_limit_dependency,
@@ -648,7 +653,7 @@ async def worker_unavailable_handler(request: Request, exc: WorkerUnavailableErr
     because Nginx seamlessly fails over.
 
     Nginx config required:
-        proxy_next_upstream error timeout http_500 http_502 http_503 http_504;
+        proxy_next_upstream error timeout http_500 http_502 http_503 http_504 http_429;
         proxy_next_upstream_tries 2;
     """
     worker_id = os.getenv("INSTANCE_NAME", "unknown")
@@ -671,18 +676,23 @@ async def worker_unavailable_handler(request: Request, exc: WorkerUnavailableErr
     if rate_limited:
         error_message = f"Worker {worker_id} rate-limited. Retrying on another worker. Reset in {retry_after}s."
 
+    # 429 = "come back later". nginx listens via proxy_next_upstream http_429
+    # and routes to the next worker exactly like the previous 503 did. When all
+    # workers are exhausted the final 429 is the correct client-facing contract
+    # (no 5xx needed; Retry-After header tells the client when to try again).
     return JSONResponse(
-        status_code=503,
+        status_code=429,
         content={
             "error": {
                 # OpenAI-compat
                 "message": f"[Bridge {worker_id}] {error_message}",
                 "type": "service_unavailable",
-                "code": "503",
+                "code": "429",
                 # Bridge discriminators — let apps distinguish "bridge failover"
                 # from a real upstream error.
                 "source": "bridge_account",
                 "bridge_type": "worker_unavailable",
+                "reason": "worker_unavailable_for_failover",
                 "bridge_worker": worker_id,
                 "retryable": True,
                 "retry": True,
@@ -1478,16 +1488,18 @@ async def chat_completions(
             metadata={"errors": auth_info.get('errors', [])}
         )
 
-        error_detail = {
-            "message": "Claude Code authentication failed",
-            "errors": auth_info.get('errors', []),
-            "method": auth_info.get('method', 'none'),
-            "help": "Check /v1/auth/status for detailed authentication information"
-        }
-        raise HTTPException(
-            status_code=503,
-            detail=error_detail
+        # Auth failure on this worker = config issue (credentials missing/expired).
+        # Contract: worker returns 500 config_error (non-retryable on same worker)
+        # so operators see it loud. Nginx failover to a healthy worker still works
+        # because this is raised before we hit the chat path.
+        from src.middleware.bridge_error import BridgeError, config_error
+        detail = (
+            f"Claude Code authentication failed "
+            f"(method={auth_info.get('method', 'none')}, "
+            f"errors={auth_info.get('errors', [])}). "
+            f"See /v1/auth/status."
         )
+        raise BridgeError(config_error(detail=detail))
     
     try:
         request_id = f"chatcmpl-{os.urandom(8).hex()}"
@@ -1519,9 +1531,24 @@ async def chat_completions(
             retry_after = rate_limit_tracker.get_retry_after(worker_id)
             limit_type = "HARD" if rate_limit_tracker.is_hard_limited(worker_id) else "soft"
             logger.info(f"⏳ Worker {worker_id} has {limit_type} penalty — rejecting (NGINX failover), retry in {retry_after}s")
+            # 429 = correct semantics ("retry after N seconds"). nginx.conf lists
+            # http_429 in proxy_next_upstream, so this triggers failover to another
+            # worker exactly like the previous 503 did. When all workers are
+            # penalised the final 429 reaches the client with a Retry-After header,
+            # which is the intended contract outcome — no 5xx envelope needed.
             return JSONResponse(
-                status_code=503,
-                content={"error": {"message": f"Worker {worker_id} rate-limited ({limit_type})", "retry_after_seconds": retry_after}},
+                status_code=429,
+                content={"error": {
+                    "message": f"[Bridge {worker_id}] Worker rate-limited ({limit_type})",
+                    "type": "api_error",
+                    "code": "429",
+                    "source": "bridge_account",
+                    "bridge_type": "worker_unavailable",
+                    "reason": "worker_account_rate_limited",
+                    "bridge_worker": worker_id,
+                    "retryable": True,
+                    "retry_after_s": retry_after,
+                }},
                 headers={"Retry-After": str(retry_after or 30)}
             )
 
@@ -2205,7 +2232,7 @@ async def chat_completions(
             pass
         raise
     except WorkerUnavailableError as wue:
-        # Rolling-metrics completion (worker rate-limited 503 path).
+        # Rolling-metrics completion (worker rate-limited 429 path).
         try:
             if getattr(request.state, "arrival_recorded", False):
                 _wud = time.time() - start_time
@@ -2221,7 +2248,8 @@ async def chat_completions(
                 request.state.arrival_recorded = False
         except Exception as _e:
             logger.debug(f"rolling_metrics completion (WorkerUnavailableError) failed: {_e}")
-        # Track 503 in prompt metrics before cross-bridge fallback / re-raise
+        # Track 429 in prompt metrics before cross-bridge fallback / re-raise.
+        # The HTTP status returned to the client is 429 (see worker_unavailable_handler).
         try:
             duration = time.time() - start_time
             from src.middleware.prompt_metrics import get_prompt_metrics
@@ -2237,7 +2265,7 @@ async def chat_completions(
                 model=request_body.model,
                 input_tokens=est_input,
                 output_tokens=0,
-                error_code="503",
+                error_code="429",
                 user_id=attribution.get("user_id"),
                 session_id=attribution.get("session_id"),
                 job_id=attribution.get("job_id"),
@@ -2495,9 +2523,21 @@ async def research(
         retry_after = _research_rlt.get_retry_after(worker_id)
         limit_type = "HARD" if _research_rlt.is_hard_limited(worker_id) else "soft"
         logger.info(f"⏳ Worker {worker_id} has {limit_type} penalty — rejecting research (NGINX failover)")
+        # 429 = correct semantics; nginx http_429 in proxy_next_upstream triggers
+        # failover to the next worker. Same rationale as chat/completions path.
         return JSONResponse(
-            status_code=503,
-            content={"error": {"message": f"Worker {worker_id} rate-limited ({limit_type})", "retry_after_seconds": retry_after}},
+            status_code=429,
+            content={"error": {
+                "message": f"[Bridge {worker_id}] Worker rate-limited ({limit_type})",
+                "type": "api_error",
+                "code": "429",
+                "source": "bridge_account",
+                "bridge_type": "worker_unavailable",
+                "reason": "worker_account_rate_limited",
+                "bridge_worker": worker_id,
+                "retryable": True,
+                "retry_after_s": retry_after,
+            }},
             headers={"Retry-After": str(retry_after or 30)}
         )
 
@@ -3383,10 +3423,11 @@ async def audio_transcriptions(
 
     openai_api_key = os.getenv("OPENAI_API_KEY")
     if not openai_api_key:
-        raise HTTPException(
-            status_code=503,
+        # Config issue — surface as 500 config_error (non-retryable).
+        from src.middleware.bridge_error import BridgeError, config_error
+        raise BridgeError(config_error(
             detail="OPENAI_API_KEY not configured on Bridge — contact admin"
-        )
+        ))
 
     try:
         form = await request.form()

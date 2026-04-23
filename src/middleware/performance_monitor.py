@@ -16,7 +16,7 @@ Usage:
 import time
 import json
 import os
-from typing import Callable
+from typing import Callable, Optional
 from starlette.types import ASGIApp, Scope, Receive, Send, Message
 from config.logging_config import get_logger
 
@@ -120,16 +120,32 @@ class PerformanceMonitorMiddleware:
         # Track response status and completion
         response_status = None
         response_started = False
+        # For non-2xx responses we try to parse the error envelope so the
+        # contract tab can aggregate by `reason` / `source` instead of just
+        # status code. Body bytes are buffered only for error responses and
+        # capped — we MUST NOT buffer streaming success bodies.
+        error_body_chunks: list[bytes] = []
+        capture_error_body = False
 
         async def send_with_timing(message: Message) -> None:
-            nonlocal response_status, response_started
+            nonlocal response_status, response_started, capture_error_body
 
             if message["type"] == "http.response.start":
                 response_status = message["status"]
                 response_started = True
+                capture_error_body = response_status is not None and response_status >= 400
 
-            # Log when response is complete (last body chunk)
             elif message["type"] == "http.response.body":
+                # For error responses, accumulate body chunks up to a small
+                # cap so we can parse the JSON envelope below. 8 KiB is plenty
+                # for bridge error envelopes and safe against memory blow-up.
+                if capture_error_body:
+                    chunk = message.get("body", b"")
+                    if chunk:
+                        total = sum(len(c) for c in error_body_chunks)
+                        if total < 8192:
+                            error_body_chunks.append(chunk[: 8192 - total])
+
                 if not message.get("more_body", False):
                     # Calculate duration
                     duration = time.time() - start_time
@@ -169,6 +185,21 @@ class PerformanceMonitorMiddleware:
                         very_slow_threshold=very_slow
                     )
 
+                    # Extract bridge-envelope reason/source from error body if
+                    # present. These drive the Contract tab in the panel.
+                    err_reason: Optional[str] = None
+                    err_source: Optional[str] = None
+                    if error_body_chunks and (response_status or 0) >= 400:
+                        try:
+                            raw = b"".join(error_body_chunks)
+                            parsed = json.loads(raw.decode("utf-8", errors="replace"))
+                            err_obj = parsed.get("error") if isinstance(parsed, dict) else None
+                            if isinstance(err_obj, dict):
+                                err_reason = err_obj.get("reason")
+                                err_source = err_obj.get("source")
+                        except Exception:
+                            pass  # best-effort only
+
                     # Persist to JSONL (disk)
                     try:
                         from src.middleware.bridge_metrics_store import get_request_log
@@ -179,6 +210,8 @@ class PerformanceMonitorMiddleware:
                             duration_s=duration,
                             tools_enabled=tools_enabled,
                             client_ip=client_host,
+                            reason=err_reason,
+                            source=err_source,
                         )
                     except Exception as _rl_err:
                         logger.debug(f"Request log write failed: {_rl_err}")

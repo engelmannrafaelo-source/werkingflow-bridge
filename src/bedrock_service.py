@@ -171,7 +171,11 @@ async def call_bedrock(
     try:
         client = get_bedrock_client()
     except RuntimeError as e:
-        raise HTTPException(status_code=503, detail=str(e))
+        # Bedrock client init failed = missing AWS credentials / region = config issue.
+        # Surface as 500 config_error (non-retryable) so operators see it in the
+        # contract-violation feed rather than as a silent transient 503.
+        from src.middleware.bridge_error import BridgeError, config_error
+        raise BridgeError(config_error(detail=str(e)))
 
     # Resolve model
     resolved_model, _ = resolve_model(request.model)

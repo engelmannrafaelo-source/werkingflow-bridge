@@ -162,6 +162,15 @@ class TuneEvent:
     cap_after: int
     observed_rate_limits: int = 0
     observed_peak_util_pct: float = 0.0
+    # Point-in-time snapshot taken during the tune tick — populated for every
+    # event (even "hold") so the panel can plot a continuous trajectory from
+    # the same file without a second sampler. Defaults keep old log entries
+    # (without these fields) decodable.
+    inflight_tokens: int = 0
+    inflight_count: int = 0
+    queued_count: int = 0
+    effective_cap_tokens: int = 0
+    account_weekly_pct: float = 0.0
 
 
 @dataclass
@@ -566,6 +575,14 @@ class AdaptiveLoadLimiter:
                     )
 
             self.state.last_tune_ts = now
+
+            # Snapshot point-in-time load for the trajectory graph. The
+            # effective cap is what actually gates admissions (cap × safety
+            # margin × weekly multiplier) so operators see the real ceiling,
+            # not just the theoretical one.
+            effective_cap_now = self._effective_cap()
+            weekly_pct_now = float(self._account_usage.get("weekly_pct", 0.0))
+
             ev = TuneEvent(
                 ts=now,
                 direction=direction,
@@ -574,6 +591,11 @@ class AdaptiveLoadLimiter:
                 cap_after=self.state.cap_tokens,
                 observed_rate_limits=rate_limit_hits,
                 observed_peak_util_pct=round(peak_pct, 1),
+                inflight_tokens=inflight_now,
+                inflight_count=self._current_inflight_count(),
+                queued_count=self._queued_count,
+                effective_cap_tokens=effective_cap_now,
+                account_weekly_pct=round(weekly_pct_now, 2),
             )
             self._save_state()
             self._append_event(ev)
