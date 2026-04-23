@@ -11,6 +11,7 @@ services:
       - "8020:80"      # eco-diagnostics compatibility
     volumes:
       - ./nginx.conf:/etc/nginx/nginx.conf:ro
+      - ../logs/nginx:/var/log/nginx
     environment:
       - BRIDGE_PROD_HOST=${BRIDGE_PROD_HOST:-127.0.0.1}
     # envsubst resolves ${BRIDGE_PROD_HOST} in nginx.conf, then start nginx
@@ -63,7 +64,7 @@ services:
       - ADAPTIVE_CEILING_TOKENS=4000000
       - ADAPTIVE_GROW_TRIGGER_SEC=300
       - ADAPTIVE_GROW_FACTOR=1.10
-      - ADAPTIVE_QUEUE_WAIT_SEC=180
+      - ADAPTIVE_QUEUE_WAIT_SEC=5
       - CLAUDE_CWD=/app/instances
       - DISABLE_COACH_MCP=true
       - MAX_TIMEOUT=2400000
@@ -122,7 +123,7 @@ services:
       - ADAPTIVE_CEILING_TOKENS=4000000
       - ADAPTIVE_GROW_TRIGGER_SEC=300
       - ADAPTIVE_GROW_FACTOR=1.10
-      - ADAPTIVE_QUEUE_WAIT_SEC=180
+      - ADAPTIVE_QUEUE_WAIT_SEC=5
       - CLAUDE_CWD=/app/instances
       - DISABLE_COACH_MCP=true
       - MAX_TIMEOUT=2400000
@@ -181,7 +182,7 @@ services:
       - ADAPTIVE_CEILING_TOKENS=4000000
       - ADAPTIVE_GROW_TRIGGER_SEC=300
       - ADAPTIVE_GROW_FACTOR=1.10
-      - ADAPTIVE_QUEUE_WAIT_SEC=180
+      - ADAPTIVE_QUEUE_WAIT_SEC=5
       - CLAUDE_CWD=/app/instances
       - DISABLE_COACH_MCP=true
       - MAX_TIMEOUT=2400000
@@ -240,7 +241,7 @@ services:
       - ADAPTIVE_CEILING_TOKENS=4000000
       - ADAPTIVE_GROW_TRIGGER_SEC=300
       - ADAPTIVE_GROW_FACTOR=1.10
-      - ADAPTIVE_QUEUE_WAIT_SEC=180
+      - ADAPTIVE_QUEUE_WAIT_SEC=5
       - CLAUDE_CWD=/app/instances
       - DISABLE_COACH_MCP=true
       - MAX_TIMEOUT=2400000
