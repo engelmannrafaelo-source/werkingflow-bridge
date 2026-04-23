@@ -1153,6 +1153,11 @@ CRITICAL: Write file EARLY to avoid context overflow. Use Write tool for clauded
                                     for block in message.content:
                                         if hasattr(block, 'text') and block.text:
                                             text_lower = block.text.lower()
+                                            # Anthropic account-level exhaustion phrasings. Keep this list
+                                            # wide — a false positive just parks the worker for 10min (capped
+                                            # by MAX_COOLDOWN_SECONDS); a false negative leaks the text to the
+                                            # client AND leaves the dead worker in the round-robin pool, so
+                                            # the next request lands back on it instead of a healthy account.
                                             rate_limit_patterns = [
                                                 "hit your limit",
                                                 "you've hit your limit",
@@ -1160,6 +1165,16 @@ CRITICAL: Write file EARLY to avoid context overflow. Use Write tool for clauded
                                                 "usage limit",
                                                 "quota exceeded",
                                                 "too many requests",
+                                                # Anthropic Pro/Max "extra usage" budget exhausted —
+                                                # wording seen in the wild 2026-04 (Vienna reset).
+                                                "out of extra usage",
+                                                "out of usage",
+                                                # Weekly / monthly plan caps
+                                                "weekly limit",
+                                                "monthly limit",
+                                                # Alternate phrasings we've seen
+                                                "reached your limit",
+                                                "reached your usage",
                                             ]
                                             if any(pattern in text_lower for pattern in rate_limit_patterns):
                                                 worker_id = os.environ.get("INSTANCE_NAME", "unknown")
