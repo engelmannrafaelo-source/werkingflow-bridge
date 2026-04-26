@@ -49,6 +49,7 @@ from src.models import (
 )
 from src.claude_cli import ClaudeCodeCLI, WorkerUnavailableError, RateLimitError, rate_limit_tracker
 from src.message_adapter import MessageAdapter
+from src.tool_leak_detector import hardened_system_prompt, looks_like_tool_leak
 from src.vision_provider import VisionProvider, get_vision_provider
 from src.routing.vision_router import check_and_route_vision, prepare_messages_for_vision, has_vision_content
 from src.routing.backend_router import resolve_backend_config, get_backend_info_dict, BackendConfig
@@ -2028,6 +2029,54 @@ async def chat_completions(
             
             # Filter out tool usage and thinking blocks
             assistant_content = MessageAdapter.filter_content(raw_assistant_content)
+
+            # Tool-leak guard: when tools are disallowed and max_turns=1, Claude can
+            # emit a pre-tool-use intro ("I'll write…") whose subsequent tool call is
+            # blocked, leaving only the intro as the response. Retry once with a
+            # hardened system prompt and max_turns=2 so a blocked-tool turn can still
+            # recover with real text.
+            if (
+                not request_body.enable_tools
+                and looks_like_tool_leak(assistant_content, prompt_chars=len(prompt or ""))
+            ):
+                logger.warning(
+                    "🚨 Tool-leak detected in response — retrying once with hardened system prompt: "
+                    f"len={len(assistant_content)} chars, intro={assistant_content[:80]!r}"
+                )
+                retry_options = dict(claude_options)
+                retry_options['max_turns'] = max(int(retry_options.get('max_turns') or 1), 2)
+                retry_system_prompt = hardened_system_prompt(system_prompt)
+                retry_chunks = []
+                async for chunk in claude_cli.run_completion(
+                    prompt=prompt,
+                    system_prompt=retry_system_prompt,
+                    model=retry_options.get('model'),
+                    max_turns=retry_options.get('max_turns', 2),
+                    allowed_tools=retry_options.get('allowed_tools'),
+                    disallowed_tools=retry_options.get('disallowed_tools'),
+                    stream=False,
+                    enable_file_discovery=retry_options.get('enable_file_discovery', False),
+                    backend_env_vars=backend_config.env_vars if backend_config else None
+                ):
+                    if isinstance(chunk, dict) and chunk.get("type") == "x_claude_metadata":
+                        continue
+                    retry_chunks.append(chunk)
+                retry_raw = claude_cli.parse_claude_message(retry_chunks)
+                if retry_raw:
+                    retry_content = MessageAdapter.filter_content(retry_raw)
+                    if not looks_like_tool_leak(retry_content, prompt_chars=len(prompt or "")):
+                        logger.info(
+                            f"✅ Tool-leak retry recovered: {len(retry_content)} chars "
+                            f"(was {len(assistant_content)})"
+                        )
+                        assistant_content = retry_content
+                    else:
+                        logger.error(
+                            "❌ Tool-leak retry still leaked — returning best-effort original response. "
+                            f"retry_len={len(retry_content)}, retry_intro={retry_content[:80]!r}"
+                        )
+                else:
+                    logger.error("❌ Tool-leak retry returned no parsable assistant message")
 
             # Privacy: De-anonymize response (restore original PII)
             if anonymization_mapping:
