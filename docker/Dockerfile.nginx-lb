@@ -5,8 +5,14 @@ FROM openresty/openresty:1.27.1.1-alpine
 # perl required by opm package manager.
 RUN apk add --no-cache gettext curl perl
 
-# lua-resty-http — used by pool_router.lua to fetch /v1/metrics/account-pool-state
-RUN /usr/local/openresty/bin/opm install ledgetech/lua-resty-http
+# lua-resty-http — used by pool_router.lua to fetch /v1/metrics/account-pool-state.
+# Direct curl install instead of opm (opm needs working network + perl + complex setup).
+ARG LUA_RESTY_HTTP_VERSION=v0.17.2
+RUN mkdir -p /usr/local/openresty/lualib/resty && \
+    cd /usr/local/openresty/lualib/resty && \
+    curl -fsSL "https://raw.githubusercontent.com/ledgetech/lua-resty-http/${LUA_RESTY_HTTP_VERSION}/lib/resty/http.lua" -o http.lua && \
+    curl -fsSL "https://raw.githubusercontent.com/ledgetech/lua-resty-http/${LUA_RESTY_HTTP_VERSION}/lib/resty/http_headers.lua" -o http_headers.lua && \
+    curl -fsSL "https://raw.githubusercontent.com/ledgetech/lua-resty-http/${LUA_RESTY_HTTP_VERSION}/lib/resty/http_connect.lua" -o http_connect.lua
 
 # Lua router script baked into image (pool_router.lua + any future helpers)
 COPY docker/lua /etc/nginx/lua
