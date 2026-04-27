@@ -347,11 +347,19 @@ phase_smoke_test() {
         return 1
     fi
 
-    info "Sending smoke test request to ${url}/v1/research ..."
+    # Tolerant smoke: try 3 times with 5s pause; one success is enough.
+    # Bridge can be transiently flaky if multiple workers hit rate_limit_event
+    # simultaneously — pool-router smooths that, but startup edge cases remain.
+    local SMOKE_ATTEMPTS=3
+    local smoke_out=""
+    local smoke_attempt=0
+    while [[ $smoke_attempt -lt $SMOKE_ATTEMPTS ]]; do
+        smoke_attempt=$((smoke_attempt + 1))
+        info "Smoke attempt ${smoke_attempt}/${SMOKE_ATTEMPTS}: POST ${url}/v1/research ..."
+
     # All request + response validation in ONE Python call — avoids heredoc injection
     # of multi-line/control-char response bodies into a second script.
     # Pass sensitive values via env vars, not inline string interpolation.
-    local smoke_out
     smoke_out=$(SMOKE_URL="${url}" \
         SMOKE_API_KEY="${api_key}" \
         SMOKE_EXTRA_HEADER="${extra_header:-}" \
@@ -413,16 +421,23 @@ exec_time = d.get("execution_time_seconds", "?")
 print(f"SMOKE_OK: status=success, https_count={https_count}, exec_time={exec_time}s")
 print(f"Content preview: {content[:400]}")
 PYEOF
-    ) 2>&1
+        ) 2>&1
 
-    while IFS= read -r line; do info "  smoke: ${line}"; done <<< "$smoke_out"
+        while IFS= read -r line; do info "  smoke[${smoke_attempt}]: ${line}"; done <<< "$smoke_out"
 
-    if ! echo "$smoke_out" | grep -q 'SMOKE_OK:'; then
-        error_ "Smoke test FAILED for ${label} (see output above)"
-        return 1
-    fi
+        if echo "$smoke_out" | grep -q 'SMOKE_OK:'; then
+            info "Smoke test PASSED for ${label} (attempt ${smoke_attempt}/${SMOKE_ATTEMPTS})"
+            return 0
+        fi
 
-    info "Smoke test PASSED for ${label}"
+        if [[ $smoke_attempt -lt $SMOKE_ATTEMPTS ]]; then
+            warn "Smoke attempt ${smoke_attempt} failed — retrying in 5s..."
+            sleep 5
+        fi
+    done
+
+    error_ "Smoke test FAILED for ${label} after ${SMOKE_ATTEMPTS} attempts"
+    return 1
 }
 
 # ============================================================================

@@ -1,15 +1,15 @@
 -- pool_router.lua — Bridge nginx account-aware pool router
 --
--- PHASE B (SHADOW MODE): Logs routing decisions but does NOT change actual
--- upstream. Existing nginx round-robin remains in effect. When Phase C is
--- approved, shadow_log() switches to route() and sets $upstream_target.
+-- PHASE C (LIVE): route() is called from balancer_by_lua_block in upstream
+-- claude_workers. Picks the worker whose Anthropic account has the most
+-- headroom (token-budget aware) and sets balancer.set_current_peer().
 --
 -- Decision logic:
---   1. Reads /v1/metrics/account-pool-state from metrics-reader every 10s
---   2. Per request: estimates input tokens, picks account with most headroom
---   3. Skips accounts: session >= 95%, cooldown_remaining > 0, headroom <= est
---   4. If state stale (>30s): log warning, fall through to round-robin
---   5. Shadow mode: writes X-Pool-Shadow header + INFO log; no routing change
+--   1. Refresh timer reads /v1/metrics/account-pool-state every 10s
+--   2. Per request: estimates input tokens from request_length
+--   3. Skips accounts: session >= 95%, cooldown > 0, headroom <= est
+--   4. State stale (>30s) → random worker (graceful degradation)
+--   5. All accounts exhausted → bogus peer → triggers @bridge_full 503
 
 local cjson = require "cjson.safe"
 local http  = require "resty.http"
@@ -146,44 +146,65 @@ function M.init()
 end
 
 
--- Shadow mode: decide + log, but do NOT change actual routing.
--- Sets X-Pool-Shadow response header for visibility in CUI panels.
-function M.shadow_log()
+-- Live routing — called from balancer_by_lua_block in upstream claude_workers.
+-- Cannot read body, cannot ngx.exit(); only set_current_peer() is allowed here.
+-- For exhaustion fallback: set bogus peer → upstream returns 502 → nginx error_page
+-- routes to @bridge_full which emits canonical 429 envelope with Retry-After.
+function M.route()
+    local balancer = require "ngx.balancer"
+
     local state_str = shared:get("state")
     local state_ts  = tonumber(shared:get("ts")) or 0
     local age       = ngx.now() - state_ts
 
+    -- Stale state: round-robin-style random fallback across all 4 workers
     if not state_str or age > STALE_THRESHOLD_S then
-        ngx.log(ngx.WARN, "pool_router shadow: state stale (",
-                string.format("%.0f", age), "s) — round-robin fallback")
-        ngx.header["X-Pool-Shadow"] = "stale/round-robin"
+        local workers = {"worker1", "worker2", "worker3", "worker4"}
+        local pick = workers[math.random(1, 4)]
+        local ok, err = balancer.set_current_peer(pick, 8000)
+        if not ok then
+            ngx.log(ngx.ERR, "pool_router stale-fallback failed: ", err)
+        end
+        ngx.log(ngx.WARN, "pool_router: state stale (",
+                string.format("%.0f", age), "s) — random fallback to ", pick)
         return
     end
 
-    local ok, data = pcall(cjson.decode, state_str)
-    if not ok or type(data) ~= "table" or type(data.accounts) ~= "table" then
-        ngx.log(ngx.WARN, "pool_router shadow: invalid cached state")
-        ngx.header["X-Pool-Shadow"] = "error/round-robin"
+    local ok_d, data = pcall(cjson.decode, state_str)
+    if not ok_d or type(data) ~= "table" or type(data.accounts) ~= "table" then
+        balancer.set_current_peer("worker1", 8000)
+        ngx.log(ngx.ERR, "pool_router: invalid cached state, fallback worker1")
         return
     end
 
-    -- Read request body for token estimate
-    ngx.req.read_body()
-    local body      = ngx.req.get_body_data()
-    local est_tokens = estimate_tokens(body)
+    -- balancer phase cannot read body; estimate from Content-Length header
+    -- (request_length includes headers; close enough for sizing purposes)
+    local req_len   = tonumber(ngx.var.request_length) or 1000
+    local est_tokens = math.max(500, math.floor(req_len / 4))
 
-    local best_account, best_headroom = choose_best_account(data.accounts, est_tokens)
-    local would_worker = (best_account and ACCOUNT_WORKER[best_account]) or "round-robin"
+    local best, best_headroom = choose_best_account(data.accounts, est_tokens)
 
-    ngx.log(ngx.INFO,
-        "pool_router shadow: would_route_to=", best_account or "none",
-        " worker=", would_worker,
-        " headroom=", best_headroom,
-        " est_tokens=", est_tokens,
-        " state_age_s=", string.format("%.1f", age))
+    if not best then
+        -- All accounts exhausted: route to bogus peer → upstream 502
+        -- → @bridge_full handler returns canonical "bridge capacity full" 429
+        ngx.log(ngx.WARN, "pool_router: all accounts exhausted (est_tokens=",
+                est_tokens, "), routing to bogus peer for @bridge_full handoff")
+        balancer.set_current_peer("0.0.0.1", 1)
+        return
+    end
 
-    local shadow_val = (best_account or "none") .. "/" .. would_worker
-    ngx.header["X-Pool-Shadow"] = shadow_val
+    local worker = ACCOUNT_WORKER[best] or "worker1"
+    local ok_b, err = balancer.set_current_peer(worker, 8000)
+    if not ok_b then
+        ngx.log(ngx.ERR, "pool_router: set_current_peer failed for ", worker,
+                ": ", err, " — falling back to worker1")
+        balancer.set_current_peer("worker1", 8000)
+        return
+    end
+
+    ngx.log(ngx.INFO, "pool_router: routed_to=", best, "/", worker,
+            " headroom=", best_headroom, " est_tokens=", est_tokens,
+            " state_age_s=", string.format("%.1f", age))
 end
 
 return M
