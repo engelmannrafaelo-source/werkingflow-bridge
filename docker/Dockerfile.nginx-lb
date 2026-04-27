@@ -2,7 +2,11 @@ FROM openresty/openresty:1.27.1.1-alpine
 
 # envsubst needed for ${BRIDGE_PROD_HOST}/${BRIDGE_ID} template substitution
 # (replicates the nginx:alpine behavior used in the original service)
-RUN apk add --no-cache gettext curl
+# perl required by opm package manager.
+RUN apk add --no-cache gettext curl perl
+
+# lua-resty-http — used by pool_router.lua to fetch /v1/metrics/account-pool-state
+RUN /usr/local/openresty/bin/opm install ledgetech/lua-resty-http
 
 # Lua router script baked into image (pool_router.lua + any future helpers)
 COPY docker/lua /etc/nginx/lua
