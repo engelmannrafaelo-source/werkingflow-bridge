@@ -177,6 +177,18 @@ function M.route()
         return
     end
 
+    -- Empty accounts table = workers don't have /v1/metrics/account-pool-state
+    -- endpoint yet (deploy lag) → graceful degrade to random fallback
+    local has_any = false
+    for _ in pairs(data.accounts) do has_any = true; break end
+    if not has_any then
+        local workers = {"worker1", "worker2", "worker3", "worker4"}
+        local pick = workers[math.random(1, 4)]
+        balancer.set_current_peer(pick, 8000)
+        ngx.log(ngx.WARN, "pool_router: empty accounts state — random fallback to ", pick)
+        return
+    end
+
     -- balancer phase cannot read body; estimate from Content-Length header
     -- (request_length includes headers; close enough for sizing purposes)
     local req_len   = tonumber(ngx.var.request_length) or 1000
