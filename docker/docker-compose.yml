@@ -51,6 +51,9 @@ services:
       - eco-wrapper-logs:/app/logs
       - eco-wrapper-instances-shared:/app/instances
       - ~/eco-research-output:/app/research_output
+      - /root/.claude/commands/sc:/home/claude/.claude/commands/sc:ro
+      - /root/.claude/agents:/home/claude/.claude/agents:ro
+      - /root/.claude/superclaude:/home/claude/.claude/superclaude:ro
     secrets:
       - claude_token_1
     environment:
@@ -70,7 +73,6 @@ services:
       - DISABLE_COACH_MCP=true
       - MAX_TIMEOUT=2400000
       - CLAUDE_PERMISSION_MODE=bypassPermissions
-      - TAVILY_API_KEY=${TAVILY_API_KEY}
       - ANTHROPIC_VISION_API_KEY=${ANTHROPIC_API_KEY}
       - OPENAI_API_KEY=${OPENAI_API_KEY}
       - PRIVACY_ENABLED=true
@@ -110,6 +112,9 @@ services:
       - eco-wrapper-logs:/app/logs
       - eco-wrapper-instances-shared:/app/instances
       - ~/eco-research-output:/app/research_output
+      - /root/.claude/commands/sc:/home/claude/.claude/commands/sc:ro
+      - /root/.claude/agents:/home/claude/.claude/agents:ro
+      - /root/.claude/superclaude:/home/claude/.claude/superclaude:ro
     secrets:
       - claude_token_2
     environment:
@@ -129,7 +134,6 @@ services:
       - DISABLE_COACH_MCP=true
       - MAX_TIMEOUT=2400000
       - CLAUDE_PERMISSION_MODE=bypassPermissions
-      - TAVILY_API_KEY=${TAVILY_API_KEY}
       - ANTHROPIC_VISION_API_KEY=${ANTHROPIC_API_KEY}
       - OPENAI_API_KEY=${OPENAI_API_KEY}
       - PRIVACY_ENABLED=true
@@ -169,6 +173,9 @@ services:
       - eco-wrapper-logs:/app/logs
       - eco-wrapper-instances-shared:/app/instances
       - ~/eco-research-output:/app/research_output
+      - /root/.claude/commands/sc:/home/claude/.claude/commands/sc:ro
+      - /root/.claude/agents:/home/claude/.claude/agents:ro
+      - /root/.claude/superclaude:/home/claude/.claude/superclaude:ro
     secrets:
       - claude_token_3
     environment:
@@ -188,7 +195,6 @@ services:
       - DISABLE_COACH_MCP=true
       - MAX_TIMEOUT=2400000
       - CLAUDE_PERMISSION_MODE=bypassPermissions
-      - TAVILY_API_KEY=${TAVILY_API_KEY}
       - ANTHROPIC_VISION_API_KEY=${ANTHROPIC_API_KEY}
       - OPENAI_API_KEY=${OPENAI_API_KEY}
       - PRIVACY_ENABLED=true
@@ -228,6 +234,9 @@ services:
       - eco-wrapper-logs:/app/logs
       - eco-wrapper-instances-shared:/app/instances
       - ~/eco-research-output:/app/research_output
+      - /root/.claude/commands/sc:/home/claude/.claude/commands/sc:ro
+      - /root/.claude/agents:/home/claude/.claude/agents:ro
+      - /root/.claude/superclaude:/home/claude/.claude/superclaude:ro
     secrets:
       - claude_token_4
     environment:
@@ -247,7 +256,6 @@ services:
       - DISABLE_COACH_MCP=true
       - MAX_TIMEOUT=2400000
       - CLAUDE_PERMISSION_MODE=bypassPermissions
-      - TAVILY_API_KEY=${TAVILY_API_KEY}
       - ANTHROPIC_VISION_API_KEY=${ANTHROPIC_API_KEY}
       - OPENAI_API_KEY=${OPENAI_API_KEY}
       - PRIVACY_ENABLED=true
