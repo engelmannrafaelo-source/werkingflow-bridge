@@ -641,7 +641,7 @@ class ClaudeCodeCLI:
 QUERY: {research_query}
 
 PROTOCOL (execute in order):
-1. Use mcp__tavily__tavily-search for 2-3 TARGETED searches only
+1. Use WebSearch and WebFetch for 2-3 TARGETED searches only
 2. Extract ONLY key findings (keep summaries under 150 words each)
 3. Write report to claudedocs/research_output.md IMMEDIATELY after searches
 4. DO NOT conduct additional searches after writing file
