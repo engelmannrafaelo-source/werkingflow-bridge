@@ -146,75 +146,62 @@ function M.init()
 end
 
 
--- Live routing — called from balancer_by_lua_block in upstream claude_workers.
--- Cannot read body, cannot ngx.exit(); only set_current_peer() is allowed here.
--- For exhaustion fallback: set bogus peer → upstream returns 502 → nginx error_page
--- routes to @bridge_full which emits canonical 429 envelope with Retry-After.
-function M.route()
-    local balancer = require "ngx.balancer"
-
+-- Live routing — called from access_by_lua_block in /v1/(chat/completions|research)
+-- Sets ngx.var.target_worker to one of: worker1, worker2, worker3, worker4, unavailable
+-- nginx map directive then resolves $target_worker → $target_pool upstream.
+-- "unavailable" maps to a bogus upstream that fails fast → @bridge_full handler
+-- emits canonical 429 envelope.
+function M.choose()
     local state_str = shared:get("state")
     local state_ts  = tonumber(shared:get("ts")) or 0
     local age       = ngx.now() - state_ts
 
-    -- Stale state: round-robin-style random fallback across all 4 workers
+    -- Stale state: random fallback across all 4 workers
     if not state_str or age > STALE_THRESHOLD_S then
         local workers = {"worker1", "worker2", "worker3", "worker4"}
         local pick = workers[math.random(1, 4)]
-        local ok, err = balancer.set_current_peer(pick, 8000)
-        if not ok then
-            ngx.log(ngx.ERR, "pool_router stale-fallback failed: ", err)
-        end
-        ngx.log(ngx.WARN, "pool_router: state stale (",
+        ngx.var.target_worker = pick
+        ngx.log(ngx.WARN, "pool_router.choose: state stale (",
                 string.format("%.0f", age), "s) — random fallback to ", pick)
         return
     end
 
     local ok_d, data = pcall(cjson.decode, state_str)
     if not ok_d or type(data) ~= "table" or type(data.accounts) ~= "table" then
-        balancer.set_current_peer("worker1", 8000)
-        ngx.log(ngx.ERR, "pool_router: invalid cached state, fallback worker1")
+        ngx.var.target_worker = "worker1"
+        ngx.log(ngx.ERR, "pool_router.choose: invalid cached state, fallback worker1")
         return
     end
 
-    -- Empty accounts table = workers don't have /v1/metrics/account-pool-state
-    -- endpoint yet (deploy lag) → graceful degrade to random fallback
+    -- Empty accounts: workers don't yet have /v1/metrics/account-pool-state endpoint
     local has_any = false
     for _ in pairs(data.accounts) do has_any = true; break end
     if not has_any then
         local workers = {"worker1", "worker2", "worker3", "worker4"}
         local pick = workers[math.random(1, 4)]
-        balancer.set_current_peer(pick, 8000)
-        ngx.log(ngx.WARN, "pool_router: empty accounts state — random fallback to ", pick)
+        ngx.var.target_worker = pick
+        ngx.log(ngx.WARN, "pool_router.choose: empty accounts state — random fallback to ", pick)
         return
     end
 
-    -- balancer phase cannot read body; estimate from Content-Length header
-    -- (request_length includes headers; close enough for sizing purposes)
+    -- Token estimation from Content-Length (we're in access phase, can read body
+    -- if needed but request_length is sufficient for routing decisions)
     local req_len   = tonumber(ngx.var.request_length) or 1000
     local est_tokens = math.max(500, math.floor(req_len / 4))
 
     local best, best_headroom = choose_best_account(data.accounts, est_tokens)
 
     if not best then
-        -- All accounts exhausted: route to bogus peer → upstream 502
-        -- → @bridge_full handler returns canonical "bridge capacity full" 429
-        ngx.log(ngx.WARN, "pool_router: all accounts exhausted (est_tokens=",
-                est_tokens, "), routing to bogus peer for @bridge_full handoff")
-        balancer.set_current_peer("0.0.0.1", 1)
+        -- All accounts exhausted: route to bogus upstream → @bridge_full
+        ngx.var.target_worker = "unavailable"
+        ngx.log(ngx.WARN, "pool_router.choose: all accounts exhausted (est_tokens=",
+                est_tokens, "), routing to claude_unavail")
         return
     end
 
     local worker = ACCOUNT_WORKER[best] or "worker1"
-    local ok_b, err = balancer.set_current_peer(worker, 8000)
-    if not ok_b then
-        ngx.log(ngx.ERR, "pool_router: set_current_peer failed for ", worker,
-                ": ", err, " — falling back to worker1")
-        balancer.set_current_peer("worker1", 8000)
-        return
-    end
-
-    ngx.log(ngx.INFO, "pool_router: routed_to=", best, "/", worker,
+    ngx.var.target_worker = worker
+    ngx.log(ngx.INFO, "pool_router.choose: routed_to=", best, "/", worker,
             " headroom=", best_headroom, " est_tokens=", est_tokens,
             " state_age_s=", string.format("%.1f", age))
 end
