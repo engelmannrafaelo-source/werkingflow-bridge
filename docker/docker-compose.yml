@@ -44,9 +44,9 @@ services:
     deploy:
       resources:
         limits:
-          memory: 2G
+          memory: 4G
         reservations:
-          memory: 512M
+          memory: 1G
     volumes:
       - eco-wrapper-logs:/app/logs
       - eco-wrapper-instances-shared:/app/instances
@@ -103,9 +103,9 @@ services:
     deploy:
       resources:
         limits:
-          memory: 2G
+          memory: 4G
         reservations:
-          memory: 512M
+          memory: 1G
     volumes:
       - eco-wrapper-logs:/app/logs
       - eco-wrapper-instances-shared:/app/instances
@@ -162,9 +162,9 @@ services:
     deploy:
       resources:
         limits:
-          memory: 2G
+          memory: 4G
         reservations:
-          memory: 512M
+          memory: 1G
     volumes:
       - eco-wrapper-logs:/app/logs
       - eco-wrapper-instances-shared:/app/instances
@@ -209,7 +209,7 @@ services:
       - bridge-net
 
   # =============================================================================
-  # Worker 4 - Account 4: werkingflow account (LIGHTWEIGHT)
+  # Worker 4 - Account 4: dev-server account (claude_token_account4.txt / Oezp)
   # =============================================================================
   worker4:
     build:
@@ -221,9 +221,9 @@ services:
     deploy:
       resources:
         limits:
-          memory: 2G
+          memory: 4G
         reservations:
-          memory: 512M
+          memory: 1G
     volumes:
       - eco-wrapper-logs:/app/logs
       - eco-wrapper-instances-shared:/app/instances
@@ -360,4 +360,4 @@ secrets:
   claude_token_3:
     file: ../secrets/claude_token_account2.txt    # engelmann.rafaelo@gmail.com
   claude_token_4:
-    file: ../secrets/claude_token.txt             # werkingflow account
+    file: ../secrets/claude_token_account4.txt    # dev-server account / 4. Token (Apr 16, sk-ant-oat01-Oezp)
