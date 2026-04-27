@@ -3,7 +3,9 @@ services:
   # NGINX Load Balancer - Round-Robin über 3 aktive Worker
   # =============================================================================
   nginx:
-    image: nginx:alpine
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.nginx-lb
     container_name: eco-wrapper-lb
     ports:
       - "8000:80"      # Primary API
@@ -15,8 +17,8 @@ services:
     environment:
       - BRIDGE_PROD_HOST=${BRIDGE_PROD_HOST:-127.0.0.1}
       - BRIDGE_ID=${BRIDGE_ID:-dev}
-    # envsubst resolves ${BRIDGE_PROD_HOST} and ${BRIDGE_ID} in nginx.conf, then start nginx
-    command: ["/bin/sh", "-c", "rm -f /etc/nginx/conf.d/default.conf && envsubst '$$BRIDGE_PROD_HOST $$BRIDGE_ID' < /etc/nginx/nginx.conf > /tmp/nginx.conf && nginx -c /tmp/nginx.conf -g 'daemon off;'"]
+    # envsubst resolves ${BRIDGE_PROD_HOST} and ${BRIDGE_ID} in nginx.conf, then start openresty
+    command: ["/bin/sh", "-c", "envsubst '$$BRIDGE_PROD_HOST $$BRIDGE_ID' < /etc/nginx/nginx.conf > /tmp/nginx.conf && openresty -c /tmp/nginx.conf -g 'daemon off;'"]
     depends_on:
       - worker1
       - worker2

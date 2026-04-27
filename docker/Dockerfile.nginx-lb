@@ -1,0 +1,11 @@
+FROM openresty/openresty:1.27.1.1-alpine
+
+# envsubst needed for ${BRIDGE_PROD_HOST}/${BRIDGE_ID} template substitution
+# (replicates the nginx:alpine behavior used in the original service)
+RUN apk add --no-cache gettext curl
+
+# Lua router script baked into image (pool_router.lua + any future helpers)
+COPY docker/lua /etc/nginx/lua
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+    CMD curl -f http://localhost:80/health || exit 1

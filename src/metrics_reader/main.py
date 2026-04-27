@@ -847,6 +847,50 @@ def lb_status() -> JSONResponse:
 
 
 # ============================================================================
+# Account Pool State — aggregated from all workers for nginx Lua pool-router
+# ============================================================================
+
+@app.get("/v1/metrics/account-pool-state")
+def get_account_pool_state():
+    """Poll each worker for its limiter state and return a combined snapshot."""
+    import time as _time
+    import urllib.request
+    import json as _json
+
+    now = int(_time.time())
+    accounts: dict = {}
+    errors: list = []
+
+    for worker in BRIDGE_WORKERS:
+        url = f"http://{worker}:8000/v1/metrics/account-pool-state"
+        try:
+            with urllib.request.urlopen(url, timeout=3) as resp:
+                data = _json.loads(resp.read())
+            account = data.get("account", worker)
+            accounts[account] = {
+                "worker": data.get("worker", worker),
+                "session_percent": data.get("session_percent", 0),
+                "session_reset_in_s": data.get("session_reset_in_s", 0),
+                "weekly_percent": data.get("weekly_percent", 0),
+                "adaptive_cap_tokens": data.get("adaptive_cap_tokens", 0),
+                "current_in_flight_tokens": data.get("current_in_flight_tokens", 0),
+                "headroom_tokens": data.get("headroom_tokens", 0),
+                "headroom_percent": data.get("headroom_percent", 0.0),
+                "last_rate_limit_ts": data.get("last_rate_limit_ts"),
+                "cooldown_remaining_s": data.get("cooldown_remaining_s", 0),
+                "available": data.get("available", False),
+            }
+        except Exception as e:
+            errors.append({"worker": worker, "error": str(e)})
+            logger.warning(f"account-pool-state: {worker} unreachable: {e}")
+
+    result: dict = {"ts": now, "accounts": accounts}
+    if errors:
+        result["errors"] = errors
+    return result
+
+
+# ============================================================================
 # Catch-all for misrouted requests — loud fail, not silent
 # ============================================================================
 

@@ -4360,6 +4360,55 @@ async def generic_exception_handler(request: Request, exc: Exception):
     return classify_exception(exc)
 
 
+# ============================================================================
+# Account Pool State — per-worker limiter snapshot for nginx Lua pool-router
+# ============================================================================
+
+@app.get("/v1/metrics/account-pool-state")
+async def get_account_pool_state():
+    """Exposes this worker's adaptive limiter state for the nginx pool-router."""
+    import time as _time
+    from src.middleware.adaptive_limiter import (
+        SAFETY_MARGIN_PCT,
+        SHRINK_TRIGGER_SEC,
+        _WORKER_ACCOUNT_MAP,
+    )
+    lim = get_adaptive_limiter()
+    lim._refresh_account_usage()
+    state = lim.state
+    inflight = lim._current_inflight_tokens()
+    acct = lim._account_usage
+
+    cap = state.cap_tokens
+    safety_cap = int(cap * SAFETY_MARGIN_PCT / 100)
+    headroom = max(0, safety_cap - inflight)
+    headroom_pct = round(headroom * 100.0 / cap, 1) if cap > 0 else 0.0
+
+    now = _time.time()
+    cooldown_remaining_s = 0
+    if state.last_rate_limit_ts is not None:
+        elapsed = now - state.last_rate_limit_ts
+        cooldown_remaining_s = max(0, int(SHRINK_TRIGGER_SEC - elapsed))
+
+    account_name = _WORKER_ACCOUNT_MAP.get(lim.worker, lim.worker)
+    session_pct = float(acct.get("session_pct", 0.0))
+
+    return {
+        "ts": int(now),
+        "worker": lim.worker,
+        "account": account_name,
+        "session_percent": round(session_pct, 1),
+        "weekly_percent": round(float(acct.get("weekly_pct", 0.0)), 1),
+        "adaptive_cap_tokens": cap,
+        "current_in_flight_tokens": inflight,
+        "headroom_tokens": headroom,
+        "headroom_percent": headroom_pct,
+        "last_rate_limit_ts": state.last_rate_limit_ts,
+        "cooldown_remaining_s": cooldown_remaining_s,
+        "available": session_pct < 95.0 and headroom > 0,
+    }
+
+
 def find_available_port(start_port: int = 8000, max_attempts: int = 10) -> int:
     """Find an available port starting from start_port."""
     import socket
