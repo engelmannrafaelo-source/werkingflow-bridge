@@ -6,12 +6,12 @@
 -- Sets ngx.var.x_pool_decision to: best_account | round_robin | exhausted
 --
 -- Decision logic:
---   1. Refresh timer reads /v1/metrics/account-pool-state every 10s
+--   1. Refresh timer reads /v1/metrics/account-pool-state every 2s
 --   2. Per request: estimates input tokens from request_length
 --   3. Skips accounts: session >= 95%, cooldown > 0, headroom <= est
 --   4. One clear winner → route to its worker (best_account)
 --   5. Equal-headroom tie among eligible accounts → deterministic round-robin (rr_counter % 4)
---   6. State stale (>30s) → deterministic round-robin (not random — avoids clustering)
+--   6. State stale (>10s) → deterministic round-robin (not random — avoids clustering)
 --   7. All accounts exhausted → bogus peer → triggers @bridge_full 503
 
 local cjson = require "cjson.safe"
@@ -20,8 +20,8 @@ local http  = require "resty.http"
 local shared = ngx.shared.pool_state
 
 local METRICS_URL        = "http://metrics-reader:8000"
-local REFRESH_INTERVAL_S = 10
-local STALE_THRESHOLD_S  = 30
+local REFRESH_INTERVAL_S = 2
+local STALE_THRESHOLD_S  = 10
 
 -- Account name → worker upstream name (must match docker-compose service names)
 local ACCOUNT_WORKER = {
