@@ -145,7 +145,10 @@ class RateLimitTracker:
     """
     _instance = None
     MAX_COOLDOWN_SECONDS = 600  # 10 minutes — never block longer than this
-    SOFT_PENALTY_SECONDS = 60   # Transient rate_limit_event — short penalty
+    SOFT_PENALTY_SECONDS = 15   # Transient rate_limit_event — short penalty
+    # Note: 15s (down from 60s) — SDK is also retrying internally, so this is
+    # only protection for *new* request routing. Long lock created cascades
+    # where Pool-Router shut down all 4 accounts on phantom heartbeat events.
 
     def __new__(cls):
         if cls._instance is None:
@@ -1004,15 +1007,32 @@ CRITICAL: Write file EARLY to avoid context overflow. Use Write tool for clauded
                             # =============================================================
                             if isinstance(message, RateLimitEvent):
                                 worker_id = os.environ.get("INSTANCE_NAME", "unknown")
-                                logger.info(
-                                    f"⏳ Worker {worker_id} received rate_limit_event — "
-                                    f"CLI is handling retry internally. "
-                                    f"retry_after={message.retry_after}, message={message.message[:120]}"
+                                # Distinguish phantom heartbeat (SDK self-throttling, no
+                                # Anthropic-side info) from real rate limit (retry_after
+                                # or message present). Phantoms must NOT trigger penalty —
+                                # the SDK is already retrying internally, blocking new
+                                # request routing on top creates cascade-failure when all
+                                # 4 workers heartbeat in succession.
+                                has_anthropic_info = (
+                                    message.retry_after is not None
+                                    or (message.message and message.message.strip())
+                                    or message.reset_at is not None
                                 )
-                                # Soft penalty for NEW request routing (short, non-blocking)
-                                rate_limit_tracker.mark_soft_penalty(
-                                    worker_id, message.retry_after
-                                )
+                                if has_anthropic_info:
+                                    logger.info(
+                                        f"⏳ Worker {worker_id} received rate_limit_event "
+                                        f"(real Anthropic limit) — soft penalty applied. "
+                                        f"retry_after={message.retry_after}, "
+                                        f"message={message.message[:120]}"
+                                    )
+                                    rate_limit_tracker.mark_soft_penalty(
+                                        worker_id, message.retry_after
+                                    )
+                                else:
+                                    logger.debug(
+                                        f"phantom rate_limit_event for {worker_id} "
+                                        f"(SDK heartbeat, no Anthropic info) — no penalty"
+                                    )
                                 continue
 
                             chunks_received += 1
