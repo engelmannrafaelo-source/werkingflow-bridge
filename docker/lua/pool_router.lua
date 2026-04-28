@@ -1,18 +1,22 @@
 -- pool_router.lua — Bridge nginx account-aware pool router
 --
 -- PHASE C (LIVE): choose() is called from access_by_lua_block in /v1/(chat/completions|research).
--- Picks the worker whose Anthropic account has the most headroom (token-budget aware).
+-- Distributes load across all eligible Anthropic accounts (token-budget aware).
 -- Sets ngx.var.target_worker to one of: worker1, worker2, worker3, worker4, unavailable
--- Sets ngx.var.x_pool_decision to: best_account | round_robin | exhausted
+-- Sets ngx.var.x_pool_decision to: round_robin | exhausted
 --
 -- Decision logic:
 --   1. Refresh timer reads /v1/metrics/account-pool-state every 2s
 --   2. Per request: estimates input tokens from request_length
---   3. Skips accounts: session >= 95%, cooldown > 0, headroom <= est
---   4. One clear winner → route to its worker (best_account)
---   5. Equal-headroom tie among eligible accounts → deterministic round-robin (rr_counter % 4)
---   6. State stale (>10s) → deterministic round-robin (not random — avoids clustering)
---   7. All accounts exhausted → bogus peer → triggers @bridge_full 503
+--   3. Eligible = available AND session<95% AND cooldown=0 AND headroom>est_tokens
+--   4. Round-robin across ALL eligible accounts (deterministic counter, alphabetical order)
+--   5. State stale (>10s) OR no accounts → round-robin across all 4 workers
+--   6. Zero eligible → bogus peer → triggers @bridge_full 429 envelope
+--
+-- Why no "best account" picker: max-headroom-wins monopolizes the lightly-loaded
+-- worker until it saturates, then cascades. Plain round-robin across eligible spreads
+-- load evenly. Accounts with low headroom drop out of eligible naturally; accounts
+-- in cooldown drop out via available=false.
 
 local cjson = require "cjson.safe"
 local http  = require "resty.http"
@@ -144,42 +148,28 @@ local function count_decision(worker)
 end
 
 -- ---------------------------------------------------------------------------
--- Account selection: returns list of tied candidates at max headroom.
--- "Tie" = multiple eligible accounts share the identical highest headroom.
--- Single winner returns a 1-element list; all exhausted returns empty list.
+-- Eligible-account selection: returns list of all accounts that pass the
+-- admission filter, sorted alphabetically for deterministic round-robin order.
+-- Empty list = all accounts exhausted.
+--
+-- No max-headroom preference: spreading load evenly across eligible accounts
+-- is more robust than monopolizing the "best" one (which saturates first then
+-- cascades). Accounts with low headroom drop out via the headroom>est filter;
+-- accounts in cooldown drop out via available=false.
 -- ---------------------------------------------------------------------------
-local function choose_best_accounts(accounts, est_tokens)
-    -- First pass: find maximum headroom among all eligible accounts
-    local best_headroom = -1
+local function eligible_accounts(accounts, est_tokens)
+    local eligible = {}
     for name, info in pairs(accounts) do
         local session_pct = tonumber(info.session_percent) or 100
         local cooldown    = tonumber(info.cooldown_remaining_s) or 0
         local headroom    = tonumber(info.headroom_tokens) or 0
         local available   = info.available
         if available and session_pct < 95 and cooldown == 0 and headroom > (est_tokens or 0) then
-            if headroom > best_headroom then
-                best_headroom = headroom
-            end
+            eligible[#eligible + 1] = name
         end
     end
-
-    if best_headroom == -1 then
-        return {}  -- all accounts exhausted / ineligible
-    end
-
-    -- Second pass: collect all accounts tied at best_headroom
-    local tied = {}
-    for name, info in pairs(accounts) do
-        local session_pct = tonumber(info.session_percent) or 100
-        local cooldown    = tonumber(info.cooldown_remaining_s) or 0
-        local headroom    = tonumber(info.headroom_tokens) or 0
-        local available   = info.available
-        if available and session_pct < 95 and cooldown == 0 and headroom == best_headroom then
-            tied[#tied + 1] = name
-        end
-    end
-
-    return tied, best_headroom
+    table.sort(eligible)  -- deterministic order: alphabetical
+    return eligible
 end
 
 -- ---------------------------------------------------------------------------
@@ -265,9 +255,9 @@ function M.choose()
     local req_len    = tonumber(ngx.var.request_length) or 1000
     local est_tokens = math.max(500, math.floor(req_len / 4))
 
-    local tied, best_headroom = choose_best_accounts(data.accounts, est_tokens)
+    local eligible = eligible_accounts(data.accounts, est_tokens)
 
-    if #tied == 0 then
+    if #eligible == 0 then
         -- All accounts exhausted → bogus upstream → @bridge_full emits 429
         ngx.var.target_worker   = "unavailable"
         ngx.var.x_pool_decision = "exhausted"
@@ -278,28 +268,18 @@ function M.choose()
         return
     end
 
-    if #tied == 1 then
-        -- Clear single winner
-        local worker = ACCOUNT_WORKER[tied[1]] or "worker1"
-        count_decision(worker)
-        ngx.var.target_worker   = worker
-        ngx.var.x_pool_decision = "best_account"
-        ngx.log(ngx.INFO, "pool_router.choose: best_account=", tied[1], "/", worker,
-                " headroom=", best_headroom, " est_tokens=", est_tokens,
-                " state_age_s=", string.format("%.1f", age))
-        return
-    end
-
-    -- Equal-headroom tie among multiple accounts → deterministic round-robin across all 4 workers
-    -- Using counter % 4 (not % #tied) so distribution covers all worker slots uniformly
-    local pick = round_robin_worker()
-    count_decision(pick)
-    ngx.var.target_worker   = pick
+    -- Round-robin across eligible accounts (deterministic counter, alphabetical order).
+    -- Spreads load evenly — no monopoly on best-headroom worker, no saturation cascade.
+    local idx     = shared:incr("rr_counter", 1, 0)
+    local picked  = eligible[((idx - 1) % #eligible) + 1]
+    local worker  = ACCOUNT_WORKER[picked] or "worker1"
+    count_decision(worker)
+    ngx.var.target_worker   = worker
     ngx.var.x_pool_decision = "round_robin"
-    ngx.log(ngx.INFO, "pool_router.choose: equal-headroom tie (#tied=", #tied,
-            " headroom=", best_headroom, ")",
-            " state_age_s=", string.format("%.1f", age),
-            " — round_robin to ", pick)
+    ngx.log(ngx.INFO, "pool_router.choose: round_robin=", picked, "/", worker,
+            " (eligible=", #eligible, "/", 4, ")",
+            " est_tokens=", est_tokens,
+            " state_age_s=", string.format("%.1f", age))
 end
 
 -- ---------------------------------------------------------------------------
