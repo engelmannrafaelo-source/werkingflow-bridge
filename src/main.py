@@ -4385,17 +4385,49 @@ async def get_account_pool_state():
     headroom_pct = round(headroom * 100.0 / cap, 1) if cap > 0 else 0.0
 
     now = _time.time()
-    cooldown_remaining_s = 0
+
+    # Adaptive-limiter cooldown (token-budget based)
+    adaptive_cooldown_s = 0
     if state.last_rate_limit_ts is not None:
         elapsed = now - state.last_rate_limit_ts
-        cooldown_remaining_s = max(0, int(SHRINK_TRIGGER_SEC - elapsed))
+        adaptive_cooldown_s = max(0, int(SHRINK_TRIGGER_SEC - elapsed))
 
-    account_name = _WORKER_ACCOUNT_MAP.get(lim.worker, lim.worker)
+    # RateLimitTracker: soft/hard penalty from rate_limit_event stream
+    worker_id = lim.worker
+    if not isinstance(worker_id, str):
+        raise ValueError(f"lim.worker must be str, got {type(worker_id)!r}")
+
+    try:
+        tracker_remaining = rate_limit_tracker.get_retry_after(worker_id)  # None or int seconds
+        tracker_is_limited = rate_limit_tracker.is_rate_limited(worker_id)
+        tracker_is_hard = rate_limit_tracker.is_hard_limited(worker_id)
+    except Exception as exc:
+        logger.error(f"rate_limit_tracker query failed for worker {worker_id!r}: {exc}")
+        raise
+
+    # Merged cooldown: max of token-budget cooldown and soft/hard penalty
+    soft_penalty_remaining_s = tracker_remaining if tracker_remaining is not None else 0
+    cooldown_remaining_s = max(adaptive_cooldown_s, soft_penalty_remaining_s)
+
+    # Merged last_rate_limit_ts: newer of adaptive ts and tracker event start approximation
+    # tracker start ≈ (now + remaining) - window, where window = SOFT_PENALTY or MAX_COOLDOWN
+    merged_last_rate_limit_ts = state.last_rate_limit_ts
+    if tracker_remaining is not None:
+        window = (
+            rate_limit_tracker.MAX_COOLDOWN_SECONDS
+            if tracker_is_hard
+            else rate_limit_tracker.SOFT_PENALTY_SECONDS
+        )
+        tracker_last_ts = now + tracker_remaining - window
+        if merged_last_rate_limit_ts is None or tracker_last_ts > merged_last_rate_limit_ts:
+            merged_last_rate_limit_ts = tracker_last_ts
+
+    account_name = _WORKER_ACCOUNT_MAP.get(worker_id, worker_id)
     session_pct = float(acct.get("session_pct", 0.0))
 
     return {
         "ts": int(now),
-        "worker": lim.worker,
+        "worker": worker_id,
         "account": account_name,
         "session_percent": round(session_pct, 1),
         "weekly_percent": round(float(acct.get("weekly_pct", 0.0)), 1),
@@ -4403,9 +4435,11 @@ async def get_account_pool_state():
         "current_in_flight_tokens": inflight,
         "headroom_tokens": headroom,
         "headroom_percent": headroom_pct,
-        "last_rate_limit_ts": state.last_rate_limit_ts,
+        "last_rate_limit_ts": merged_last_rate_limit_ts,
         "cooldown_remaining_s": cooldown_remaining_s,
-        "available": session_pct < 95.0 and headroom > 0,
+        "available": session_pct < 95.0 and headroom > 0 and not tracker_is_limited,
+        "soft_penalty_remaining_s": soft_penalty_remaining_s,
+        "is_hard_limited": tracker_is_hard,
     }
 
 
