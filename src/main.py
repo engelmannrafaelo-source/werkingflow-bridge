@@ -1529,29 +1529,63 @@ async def chat_completions(
         worker_id = os.getenv("INSTANCE_NAME", "unknown")
         from src.claude_cli import rate_limit_tracker
         if rate_limit_tracker.should_reject_new_request(worker_id):
-            retry_after = rate_limit_tracker.get_retry_after(worker_id)
+            retry_after = rate_limit_tracker.get_retry_after(worker_id) or 0
             limit_type = "HARD" if rate_limit_tracker.is_hard_limited(worker_id) else "soft"
-            logger.info(f"⏳ Worker {worker_id} has {limit_type} penalty — rejecting (NGINX failover), retry in {retry_after}s")
-            # 429 = correct semantics ("retry after N seconds"). nginx.conf lists
-            # http_429 in proxy_next_upstream, so this triggers failover to another
-            # worker exactly like the previous 503 did. When all workers are
-            # penalised the final 429 reaches the client with a Retry-After header,
-            # which is the intended contract outcome — no 5xx envelope needed.
-            return JSONResponse(
-                status_code=429,
-                content={"error": {
-                    "message": f"[Bridge {worker_id}] Worker rate-limited ({limit_type})",
-                    "type": "api_error",
-                    "code": "429",
-                    "source": "bridge_account",
-                    "bridge_type": "worker_unavailable",
-                    "reason": "worker_account_rate_limited",
-                    "bridge_worker": worker_id,
-                    "retryable": True,
-                    "retry_after_s": retry_after,
-                }},
-                headers={"Retry-After": str(retry_after or 30)}
-            )
+
+            # =================================================================
+            # AUTOBAHN-AUFFAHRT QUEUE: For SOFT penalties with bounded wait, hold
+            # the request in-process until cooldown expires, then fall through to
+            # the normal handling path. Apps see latency, not a 429 → no token-
+            # waste from app-side retry/replan cycles.
+            #
+            # HARD limits (real Anthropic ceiling) reject immediately — no point
+            # waiting if the account is hard-locked for minutes. Soft penalties
+            # are short (max 15s post phantom-filter); we wait for those.
+            # =================================================================
+            MAX_QUEUE_WAIT_S = 30  # cap to avoid request-timeout cascade
+            if limit_type == "soft" and 0 < retry_after <= MAX_QUEUE_WAIT_S:
+                logger.info(
+                    f"⏳ Worker {worker_id} soft-penalty {retry_after}s — "
+                    f"queueing request (autobahn auffahrt)"
+                )
+                wait_start = time.time()
+                # Sleep in 1s slices so we honor request cancellation
+                while rate_limit_tracker.should_reject_new_request(worker_id):
+                    if time.time() - wait_start >= retry_after + 1:
+                        break
+                    await asyncio.sleep(1)
+                # Re-check after wait — if still penalised (e.g. fresh event landed),
+                # fall through to 429 below
+                if not rate_limit_tracker.should_reject_new_request(worker_id):
+                    logger.info(
+                        f"✅ Worker {worker_id} cooldown expired after "
+                        f"{time.time() - wait_start:.1f}s — proceeding"
+                    )
+                    # Fall through to normal request handling — do NOT return
+                else:
+                    retry_after = rate_limit_tracker.get_retry_after(worker_id) or 30
+
+            # Either: hard limit, soft penalty > MAX_QUEUE_WAIT_S, or queue timed out
+            if rate_limit_tracker.should_reject_new_request(worker_id):
+                logger.info(
+                    f"⏳ Worker {worker_id} {limit_type} penalty — rejecting "
+                    f"(NGINX failover), retry in {retry_after}s"
+                )
+                return JSONResponse(
+                    status_code=429,
+                    content={"error": {
+                        "message": f"[Bridge {worker_id}] Worker rate-limited ({limit_type})",
+                        "type": "api_error",
+                        "code": "429",
+                        "source": "bridge_account",
+                        "bridge_type": "worker_unavailable",
+                        "reason": "worker_account_rate_limited",
+                        "bridge_worker": worker_id,
+                        "retryable": True,
+                        "retry_after_s": retry_after,
+                    }},
+                    headers={"Retry-After": str(retry_after or 30)}
+                )
 
         # =======================================================================
         # BUDGET ENFORCEMENT: Check tenant limits before processing
