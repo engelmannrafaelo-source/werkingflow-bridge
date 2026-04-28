@@ -17,8 +17,18 @@ import time as _time
 from typing import Dict, List, Optional, Any, Tuple
 
 from pydantic import BaseModel, Field
-from fastapi import FastAPI, Request, UploadFile, File
+from fastapi import FastAPI, Request, UploadFile, File, HTTPException
 from fastapi.responses import JSONResponse
+
+from src.privacy_service.document_converter import (
+    convert_pdf_bytes,
+    UnsupportedFormatError,
+)
+from src.privacy_service.adapters import (
+    AdapterChain,
+    AdapterError,
+    build_default_chain,
+)
 
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 logger = logging.getLogger("privacy-service")
@@ -185,68 +195,11 @@ async def convert_pdf_service_endpoint(request: Request):
 
         t_start = _time.time()
 
-        def _convert_pdf():
-            """Synchronous Docling conversion — runs in executor."""
-            from docling.document_converter import DocumentConverter, PdfFormatOption
-            from docling.datamodel.pipeline_options import PdfPipelineOptions
-            from docling.datamodel.base_models import InputFormat
-            from docling_core.types.doc.base import ImageRefMode
-
-            pipeline_options = PdfPipelineOptions()
-            pipeline_options.generate_picture_images = True
-            pipeline_options.generate_table_images = False
-            pipeline_options.do_ocr = True
-
-            converter = DocumentConverter(
-                format_options={
-                    InputFormat.PDF: PdfFormatOption(pipeline_options=pipeline_options)
-                }
-            )
-
-            with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp_pdf:
-                tmp_pdf.write(pdf_bytes)
-                tmp_pdf_path = tmp_pdf.name
-
-            try:
-                result = converter.convert(tmp_pdf_path)
-
-                with tempfile.TemporaryDirectory() as tmp_dir:
-                    md_path = os.path.join(tmp_dir, "output.md")
-                    result.document.save_as_markdown(
-                        md_path, image_mode=ImageRefMode.REFERENCED
-                    )
-
-                    with open(md_path, "r") as f:
-                        markdown = f.read()
-
-                    images = {}
-                    artifacts_dir = os.path.join(tmp_dir, "output_artifacts")
-                    if os.path.exists(artifacts_dir):
-                        for img_name in os.listdir(artifacts_dir):
-                            if img_name.lower().endswith((".png", ".jpg", ".jpeg")):
-                                img_path = os.path.join(artifacts_dir, img_name)
-                                with open(img_path, "rb") as img_f:
-                                    images[img_name] = base64.b64encode(
-                                        img_f.read()
-                                    ).decode("utf-8")
-
-                    for img_name in images:
-                        markdown = markdown.replace(
-                            os.path.join(artifacts_dir, img_name), img_name
-                        )
-
-                    page_count = (
-                        len(result.document.pages)
-                        if hasattr(result.document, "pages")
-                        else None
-                    )
-                    return markdown, images, page_count
-
-            finally:
-                os.unlink(tmp_pdf_path)
-
         loop = asyncio.get_event_loop()
-        markdown, images, page_count = await loop.run_in_executor(None, _convert_pdf)
+        markdown, metadata, images = await loop.run_in_executor(
+            None, convert_pdf_bytes, pdf_bytes
+        )
+        page_count = metadata.get("pages")
         conversion_time = _time.time() - t_start
 
         logger.info(
@@ -275,6 +228,213 @@ async def convert_pdf_service_endpoint(request: Request):
     except Exception as e:
         logger.error(f"PDF conversion failed: {e}", exc_info=True)
         return {"status": "error", "error": f"PDF conversion failed: {str(e)}"}
+
+
+# ======================== Universal Document Conversion ========================
+#
+# Routes any supported office/email/spreadsheet/HTML/image document to Markdown.
+# Reuses the Docling PDF pipeline for PDF and Office (via LibreOffice → PDF).
+# Apps that historically used /convert-pdf can either keep that endpoint or
+# migrate to /document/convert which auto-routes by MIME/extension.
+
+DOCUMENT_MAX_FILE_SIZE = 100 * 1024 * 1024  # 100 MB — same cap as /convert-pdf
+
+
+# Adapter chain is built lazily so unit-test imports of ``app`` do not
+# eagerly construct heavy adapters and so test code can monkey-patch
+# ``_get_chain`` to inject a stub.
+_DOCUMENT_CHAIN: Optional[AdapterChain] = None
+
+
+def _get_chain() -> AdapterChain:
+    global _DOCUMENT_CHAIN
+    if _DOCUMENT_CHAIN is None:
+        ai_disabled = os.getenv("DISABLE_AI_FALLBACK", "").lower() in ("1", "true", "yes")
+        _DOCUMENT_CHAIN = build_default_chain(enable_ai_fallback=not ai_disabled)
+    return _DOCUMENT_CHAIN
+
+
+async def _read_uploaded_file(request: Request) -> Tuple[bytes, str, Optional[str], Dict[str, Any]]:
+    """Extract ``file`` (and optional form fields) from a multipart request.
+
+    Returns ``(content_bytes, filename, mime_type_hint, extra_form_fields)``.
+    Raises ``HTTPException`` on missing/empty/oversized files so handlers can
+    surface a 4xx response cleanly.
+    """
+    form = await request.form()
+    file = form.get("file")
+    if not file or not hasattr(file, "read"):
+        raise HTTPException(
+            status_code=400,
+            detail="No file uploaded. Send the document as multipart/form-data with field name 'file'.",
+        )
+    filename = getattr(file, "filename", "upload.bin") or "upload.bin"
+    content = await file.read()
+    if not content:
+        raise HTTPException(status_code=400, detail="Uploaded file is empty.")
+    if len(content) > DOCUMENT_MAX_FILE_SIZE:
+        raise HTTPException(
+            status_code=413,
+            detail=(
+                f"File too large: {len(content) / 1024 / 1024:.1f} MB. "
+                f"Maximum: {DOCUMENT_MAX_FILE_SIZE / 1024 / 1024:.0f} MB."
+            ),
+        )
+
+    # Pull a few well-known optional fields out so handlers can read them
+    # without re-parsing the multipart form.
+    mime_hint = form.get("mime_type_hint") or getattr(file, "content_type", None)
+    extras: Dict[str, Any] = {
+        "language": form.get("language"),
+        "privacy_mode": form.get("privacy_mode"),
+        "context_hint": form.get("context_hint"),
+    }
+    return content, filename, mime_hint, extras
+
+
+@app.post("/document/convert")
+async def document_convert_endpoint(request: Request):
+    """Convert any supported document type to Markdown.
+
+    Multipart form fields:
+    - ``file`` (required): the document to convert.
+    - ``mime_type_hint`` (optional): explicit MIME type override.
+
+    Response: ``{success, format, markdown, metadata, images?, image_count?}``.
+    Returns 415 on unknown formats and 500 on adapter failures (fail-loud).
+    """
+    content, filename, mime_hint, _ = await _read_uploaded_file(request)
+
+    t_start = _time.time()
+    loop = asyncio.get_event_loop()
+    chain = _get_chain()
+
+    try:
+        result = await loop.run_in_executor(
+            None, chain.convert, content, filename, mime_hint
+        )
+    except UnsupportedFormatError as e:
+        logger.warning(f"document/convert unsupported: {e}")
+        raise HTTPException(status_code=415, detail=str(e))
+    except AdapterError as e:
+        logger.error(f"document/convert adapter error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+    except RuntimeError as e:
+        logger.error(f"document/convert chain error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+    duration = _time.time() - t_start
+    logger.info(
+        f"document/convert done: {filename} -> format={result.fmt} "
+        f"adapter={result.metadata.get('adapter')} "
+        f"chars={len(result.markdown)} images={len(result.images or {})} "
+        f"({duration:.2f}s)"
+    )
+
+    body = result.to_response()
+    body["conversion_time_seconds"] = round(duration, 2)
+    return body
+
+
+@app.post("/document/convert-and-anonymize")
+async def document_convert_and_anonymize_endpoint(request: Request):
+    """Atomically convert + smart-anonymize a document.
+
+    Multipart form fields:
+    - ``file`` (required)
+    - ``mime_type_hint`` (optional)
+    - ``language`` (optional, default ``de``)
+    - ``privacy_mode`` (optional, ``smart`` (default) or ``basic``)
+    - ``context_hint`` (optional, passed to smart-anonymize for better decisions)
+
+    Response: ``{success, format, anonymized_markdown, mapping, metadata, ...}``.
+    The mapping is *not* persisted by the Bridge — apps store it themselves so
+    they can re-deanonymize later without leaking PII back into Bridge state.
+    """
+    content, filename, mime_hint, extras = await _read_uploaded_file(request)
+
+    language = (extras.get("language") or "de").lower()
+    privacy_mode = (extras.get("privacy_mode") or "smart").lower()
+    context_hint = extras.get("context_hint")
+    if privacy_mode not in ("smart", "basic"):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid privacy_mode: {privacy_mode!r}. Expected 'smart' or 'basic'.",
+        )
+
+    t_start = _time.time()
+    loop = asyncio.get_event_loop()
+    chain = _get_chain()
+
+    # Step 1 — convert via adapter chain (deterministic adapters first, AI fallback last)
+    try:
+        conversion = await loop.run_in_executor(
+            None, chain.convert, content, filename, mime_hint
+        )
+    except UnsupportedFormatError as e:
+        logger.warning(f"convert-and-anonymize unsupported: {e}")
+        raise HTTPException(status_code=415, detail=str(e))
+    except AdapterError as e:
+        logger.error(f"convert-and-anonymize adapter error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+    except RuntimeError as e:
+        logger.error(f"convert-and-anonymize convert step failed: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+    convert_time = _time.time() - t_start
+
+    # Step 2 — anonymize
+    if privacy_mode == "smart":
+        from src.privacy.smart_anonymizer import smart_anonymize
+
+        try:
+            anon = await smart_anonymize(
+                text=conversion.markdown,
+                language=language,
+                context_hint=context_hint,
+            )
+        except Exception as e:
+            logger.error(f"smart_anonymize failed: {e}", exc_info=True)
+            raise HTTPException(status_code=500, detail=f"Anonymization failed: {e}")
+        anonymized_text = anon.get("smart_anonymized_text") or conversion.markdown
+        mapping = anon.get("mapping") or {}
+        detected_entities = anon.get("detected_entities") or []
+        restored_entities = anon.get("restored_entities") or []
+    else:
+        # Basic mode: Presidio-only, no AI refinement.
+        middleware = get_middleware()
+        anon_messages, mapping = middleware.anonymize_messages(
+            [{"role": "user", "content": conversion.markdown}],
+            privacy_mode="full",
+        )
+        anonymized_text = (
+            anon_messages[0].get("content", conversion.markdown)
+            if anon_messages
+            else conversion.markdown
+        )
+        detected_entities = []
+        restored_entities = []
+
+    duration = _time.time() - t_start
+    logger.info(
+        f"convert-and-anonymize done: {filename} format={conversion.fmt} "
+        f"convert={convert_time:.2f}s total={duration:.2f}s "
+        f"entities_kept={len(mapping)}"
+    )
+
+    return {
+        "success": True,
+        "format": conversion.fmt,
+        "anonymized_markdown": anonymized_text,
+        "mapping": mapping,
+        "detected_entities": detected_entities,
+        "restored_entities": restored_entities,
+        "metadata": conversion.metadata,
+        "privacy_mode": privacy_mode,
+        "language": language,
+        "convert_time_seconds": round(convert_time, 2),
+        "total_time_seconds": round(duration, 2),
+    }
 
 
 # ======================== Semantic HTML Conversion ========================

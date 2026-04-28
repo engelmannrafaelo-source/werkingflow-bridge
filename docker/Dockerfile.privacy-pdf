@@ -1,10 +1,20 @@
 FROM python:3.12-slim
 
-# System deps for Docling (OpenCV, image processing)
-RUN apt-get update && apt-get install -y \
+# System deps:
+#   - libgl1/libglib2.0-0: Docling (OpenCV)
+#   - libreoffice headless components: DOCX/PPTX/XLSX legacy → PDF
+#   - fonts-*: ensure non-ASCII text renders when LibreOffice rasterises
+RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     libgl1 \
     libglib2.0-0 \
+    libreoffice-core \
+    libreoffice-writer \
+    libreoffice-impress \
+    libreoffice-calc \
+    fonts-dejavu \
+    fonts-liberation \
+    fonts-noto-core \
     && rm -rf /var/lib/apt/lists/*
 
 # Create non-root user
@@ -25,10 +35,12 @@ WORKDIR /app
 # Create directories
 RUN mkdir -p /app/logs
 
-# Install Python deps WITH privacy + pdf extras
+# Install Python deps WITH privacy + pdf + documents extras.
+# documents pulls openpyxl/pandas/tabulate/markdownify/extract-msg so the
+# universal /document/convert endpoint can handle XLSX/CSV/HTML/MSG/EML.
 RUN poetry config virtualenvs.in-project true && \
     poetry lock && \
-    poetry install --no-root --extras "privacy" --extras "pdf"
+    poetry install --no-root --extras "privacy" --extras "pdf" --extras "documents"
 
 # Download spaCy language models for Presidio PII detection
 RUN poetry run python -m spacy download de_core_news_lg && \

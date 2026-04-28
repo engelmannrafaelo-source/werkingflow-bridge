@@ -3530,6 +3530,92 @@ async def convert_pdf_to_semantic_html_endpoint(
         )
 
 
+# ============================================================================
+# Universal Document Conversion — proxied to privacy-pdf-service
+# Routes any supported document type (PDF/DOCX/PPTX/XLSX/CSV/HTML/MSG/EML/image)
+# to Markdown, optionally with atomic smart-anonymize in one shot.
+# ============================================================================
+
+
+async def _proxy_document_endpoint(
+    request: Request, downstream_path: str, timeout: float
+) -> JSONResponse:
+    """Forward a multipart document upload to the privacy-pdf-service.
+
+    Preserves filename, MIME type and any extra string form fields the caller
+    sent (e.g. ``language``, ``privacy_mode``, ``mime_type_hint``).
+    """
+    try:
+        form = await request.form()
+        file = form.get("file")
+        if not file or not hasattr(file, "read"):
+            return JSONResponse(
+                status_code=400,
+                content={"status": "error", "error": "No file uploaded. Send the document as multipart/form-data with field name 'file'."},
+            )
+
+        filename = getattr(file, "filename", "upload.bin") or "upload.bin"
+        content_type = getattr(file, "content_type", None) or "application/octet-stream"
+        content = await file.read()
+
+        # Pass through any extra string form fields untouched.
+        extra_data: Dict[str, str] = {}
+        for key, value in form.multi_items():
+            if key == "file":
+                continue
+            if isinstance(value, str):
+                extra_data[key] = value
+
+        privacy_client = get_privacy_client()
+        client = await privacy_client._get_client()
+
+        response = await client.post(
+            downstream_path,
+            files={"file": (filename, content, content_type)},
+            data=extra_data,
+            timeout=timeout,
+        )
+
+        # Surface upstream status codes 1:1 so callers see 415/413/etc.
+        try:
+            payload = response.json()
+        except Exception:
+            payload = {"status": "error", "error": response.text[:500]}
+        return JSONResponse(status_code=response.status_code, content=payload)
+
+    except Exception as e:
+        logger.error(f"Document proxy ({downstream_path}) failed: {e}", exc_info=True)
+        return JSONResponse(
+            status_code=500,
+            content={"status": "error", "error": f"Document conversion failed: {str(e)}"},
+        )
+
+
+@app.post("/v1/document/convert")
+async def convert_document_endpoint(
+    request: Request,
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(security),
+):
+    """Convert any supported document type to Markdown via the privacy service."""
+    await verify_api_key(request, credentials)
+    return await _proxy_document_endpoint(request, "/document/convert", timeout=600.0)
+
+
+@app.post("/v1/document/convert-and-anonymize")
+async def convert_and_anonymize_document_endpoint(
+    request: Request,
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(security),
+):
+    """Atomic convert + smart-anonymize via the privacy service.
+
+    Bridge does not persist the returned mapping — apps store it themselves.
+    """
+    await verify_api_key(request, credentials)
+    return await _proxy_document_endpoint(
+        request, "/document/convert-and-anonymize", timeout=900.0
+    )
+
+
 @app.post("/v1/audio/transcriptions")
 async def audio_transcriptions(
     request: Request,
