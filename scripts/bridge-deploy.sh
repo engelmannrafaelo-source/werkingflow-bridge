@@ -549,11 +549,13 @@ PYEOF
 
     info "  raw state: ${state_raw}"
 
+    # Pass JSON via env var — avoids pipe+heredoc stdin conflict with python3 -
     local state_check
-    state_check=$(echo "$state_raw" | python3 - <<'PYEOF'
-import sys, json
+    state_check=$(STATE_JSON="${state_raw}" python3 - <<'PYEOF'
+import os, sys, json
+raw = os.environ.get("STATE_JSON", "")
 try:
-    d = json.load(sys.stdin)
+    d = json.loads(raw)
 except Exception as e:
     print(f"STATE_FAIL: response is not valid JSON: {e}", file=sys.stderr)
     sys.exit(1)
