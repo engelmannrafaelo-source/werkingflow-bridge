@@ -33,7 +33,7 @@ HETZNER_SVC_worker4="eco-wrapper-worker4"
 HETZNER_SVC_privacy_service="eco-privacy-pdf-service"
 HETZNER_SVC_metrics_reader="eco-wrapper-metrics-reader"
 HETZNER_ALL="nginx worker1 worker2 worker3 worker4 privacy-service metrics-reader"
-HETZNER_NEEDS_BUILD="worker1 worker2 worker3 worker4 privacy-service metrics-reader"
+HETZNER_NEEDS_BUILD="nginx worker1 worker2 worker3 worker4 privacy-service metrics-reader"
 
 # Server-2: service → container name (use _ not - for var names)
 SERVER2_SVC_nginx="eco-prod-lb"
@@ -441,6 +441,149 @@ PYEOF
 }
 
 # ============================================================================
+# Phase 5b: Distribution Test — validates pool-router spreads load across workers
+# Runs 8 sequential /v1/chat/completions calls; checks X-Target-Worker header
+# distribution and the /internal/pool-router/state endpoint via docker exec.
+# ============================================================================
+phase_distribution_test() {
+    local host="$1"
+    local url="$2"
+    local lb_container="$3"  # e.g. eco-wrapper-lb
+
+    step "Phase 5b: Distribution + State Test (${label:-dist} @ ${url})"
+
+    if [[ "$DRY_RUN" == "true" ]]; then
+        info "[DRY-RUN] Would send 8 chat/completions calls and check /internal/pool-router/state"
+        return 0
+    fi
+
+    # Load Infisical env
+    # shellcheck source=/root/.infisical/infisical-api.sh
+    source /root/.infisical/infisical-api.sh 2>/dev/null || true
+    local api_key
+    api_key=$(infisical_get_secret "${INFISICAL_WS_DEV_SERVER}" dev AI_BRIDGE_API_KEY 2>/dev/null) || true
+    if [[ -z "${api_key:-}" ]]; then
+        error_ "Failed to retrieve AI_BRIDGE_API_KEY from Infisical"
+        return 1
+    fi
+
+    # 8 sequential chat/completions calls; parse X-Target-Worker header
+    info "Sending 8 chat/completions calls to ${url} to validate worker distribution..."
+    local dist_out
+    dist_out=$(DIST_URL="${url}" DIST_API_KEY="${api_key}" python3 - <<'PYEOF'
+import os, sys, json, requests
+from collections import Counter
+
+url     = os.environ["DIST_URL"]
+api_key = os.environ["DIST_API_KEY"]
+
+headers = {
+    "Authorization": f"Bearer {api_key}",
+    "Content-Type": "application/json",
+    "X-Client-ID": "bridge-deploy/dist-test",
+}
+
+workers_hit = []
+for i in range(8):
+    try:
+        r = requests.post(
+            f"{url}/v1/chat/completions",
+            headers=headers,
+            json={
+                "model": "claude-haiku-4-5-20251001",
+                "max_tokens": 10,
+                "messages": [{"role": "user", "content": "Reply with one word: ok"}],
+            },
+            timeout=60,
+        )
+    except Exception as e:
+        print(f"DIST_FAIL: call {i+1}/8 request error: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    if r.status_code != 200:
+        print(f"DIST_FAIL: call {i+1}/8 HTTP {r.status_code}: {r.text[:300]}", file=sys.stderr)
+        sys.exit(1)
+
+    worker = r.headers.get("X-Target-Worker", "unknown")
+    print(f"  call {i+1}/8: worker={worker}")
+    if worker and worker != "unknown":
+        workers_hit.append(worker)
+
+unique_workers = set(workers_hit)
+distribution   = dict(Counter(workers_hit))
+print(f"Distribution: {len(unique_workers)}/4 unique workers — {distribution}")
+
+if len(unique_workers) < 3:
+    print(
+        f"DIST_FAIL: only {len(unique_workers)} unique worker(s) hit across 8 calls "
+        f"(need >=3): {sorted(unique_workers)}. "
+        f"Pool router is not distributing load — check pool_router.lua tie-breaker logic.",
+        file=sys.stderr,
+    )
+    sys.exit(1)
+
+print(f"DIST_OK: {len(unique_workers)} unique workers hit — {distribution}")
+PYEOF
+    ) 2>&1
+    rc_dist=$?
+
+    while IFS= read -r line; do info "  dist: ${line}"; done <<< "$dist_out"
+
+    if [[ $rc_dist -ne 0 ]] || ! echo "$dist_out" | grep -q 'DIST_OK:'; then
+        error_ "Distribution test FAILED — pool router not spreading load across workers"
+        return 1
+    fi
+
+    # Check /internal/pool-router/state via docker exec inside the lb container
+    info "Checking /internal/pool-router/state on ${host} (via docker exec ${lb_container})..."
+    local state_raw
+    state_raw=$(rssh "$host" "docker exec '${lb_container}' curl -sf http://127.0.0.1/internal/pool-router/state" 2>&1)
+    local rc_state=$?
+    if [[ $rc_state -ne 0 ]] || [[ -z "$state_raw" ]]; then
+        error_ "Failed to reach /internal/pool-router/state via docker exec (rc=${rc_state}): ${state_raw}"
+        return 1
+    fi
+
+    info "  raw state: ${state_raw}"
+
+    local state_check
+    state_check=$(echo "$state_raw" | python3 - <<'PYEOF'
+import sys, json
+try:
+    d = json.load(sys.stdin)
+except Exception as e:
+    print(f"STATE_FAIL: response is not valid JSON: {e}", file=sys.stderr)
+    sys.exit(1)
+
+status    = d.get("last_refresh_status", "unknown")
+age_s     = float(d.get("state_age_s", 9999))
+last_err  = d.get("last_refresh_err", "")
+
+if status != "ok":
+    print(f"STATE_FAIL: last_refresh_status={status!r} (expected 'ok'); err={last_err!r}", file=sys.stderr)
+    sys.exit(1)
+if age_s >= 30:
+    print(f"STATE_FAIL: state_age_s={age_s:.1f}s >= 30s — metrics-reader refresh not working", file=sys.stderr)
+    sys.exit(1)
+
+counters = d.get("decision_counter_per_worker", {})
+print(f"STATE_OK: status={status}, age={age_s:.1f}s, counters={counters}")
+PYEOF
+    )
+    rc_sc=$?
+
+    while IFS= read -r line; do info "  state: ${line}"; done <<< "$state_check"
+
+    if [[ $rc_sc -ne 0 ]] || ! echo "$state_check" | grep -q 'STATE_OK:'; then
+        error_ "Pool-router state check FAILED"
+        return 1
+    fi
+
+    info "Distribution + State test PASSED"
+    return 0
+}
+
+# ============================================================================
 # Phase 6: Rollback
 # ============================================================================
 phase_rollback() {
@@ -598,8 +741,20 @@ deploy_server() {
     if [[ "$server_name" == "hetzner" ]]; then
         # Source env to get AI_BRIDGE_URL
         source /root/.infisical/infisical-api.sh 2>/dev/null || true
-        phase_smoke_test "hetzner" "${AI_BRIDGE_URL:-http://${HETZNER_HOST}:8000}" "" || {
+        local hetzner_url="${AI_BRIDGE_URL:-http://${HETZNER_HOST}:8000}"
+
+        phase_smoke_test "hetzner" "${hetzner_url}" "" || {
             error_ "Smoke test failed for hetzner — rolling back"
+            if [[ ${#DEPLOYED_SERVICES[@]} -gt 0 ]]; then
+                phase_rollback "$host" "$compose" "$ROLLBACK_SHA" "$build_list" "${DEPLOYED_SERVICES[@]}"
+                local rc=$?
+                (( rc == 2 )) && return 2
+            fi
+            return 1
+        }
+
+        phase_distribution_test "$host" "${hetzner_url}" "${HETZNER_SVC_nginx}" || {
+            error_ "Distribution test failed for hetzner — rolling back"
             if [[ ${#DEPLOYED_SERVICES[@]} -gt 0 ]]; then
                 phase_rollback "$host" "$compose" "$ROLLBACK_SHA" "$build_list" "${DEPLOYED_SERVICES[@]}"
                 local rc=$?
