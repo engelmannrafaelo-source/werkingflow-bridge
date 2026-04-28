@@ -500,12 +500,15 @@ for i in range(8):
         print(f"DIST_FAIL: call {i+1}/8 request error: {e}", file=sys.stderr)
         sys.exit(1)
 
-    if r.status_code != 200:
-        print(f"DIST_FAIL: call {i+1}/8 HTTP {r.status_code}: {r.text[:300]}", file=sys.stderr)
+    # 200 = success, 429 = worker rate-limited but routing decision was made (still counts)
+    # 5xx = infrastructure failure → hard fail
+    if r.status_code not in (200, 429):
+        print(f"DIST_FAIL: call {i+1}/8 unexpected HTTP {r.status_code}: {r.text[:300]}", file=sys.stderr)
         sys.exit(1)
 
     worker = r.headers.get("X-Target-Worker", "unknown")
-    print(f"  call {i+1}/8: worker={worker}")
+    note  = "" if r.status_code == 200 else " (429 worker rate-limited — counts as hit)"
+    print(f"  call {i+1}/8: worker={worker} HTTP {r.status_code}{note}")
     if worker and worker != "unknown":
         workers_hit.append(worker)
 
