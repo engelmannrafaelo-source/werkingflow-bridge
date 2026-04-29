@@ -12,9 +12,25 @@ load_dotenv()
 
 
 class AllTokensExhausted(Exception):
-    """Raised when all OAuth tokens on this bridge are exhausted.
+    """Raised when no OAuth tokens are loaded at all (token file missing).
     Catch this to trigger cross-bridge fallback to the production bridge."""
     pass
+
+
+class TokenInvalidError(Exception):
+    """Raised when an OAuth token is INVALID (401 from Anthropic).
+
+    Token has been revoked or expired. NOT recoverable by retry.
+    Worker stays down until the token file is replaced and the container restarts.
+    """
+    def __init__(self, worker_id: str, account: Optional[str] = None, message: str = ""):
+        self.worker_id = worker_id
+        self.account = account or "unknown"
+        super().__init__(
+            f"Token for worker {worker_id} (account={self.account}) is INVALID. "
+            f"Replace the token file with fresh credentials. "
+            f"Worker will stay down until restart. {message}".strip()
+        )
 
 
 class TokenRotator:
@@ -88,11 +104,24 @@ class TokenRotator:
     def rotate_token(self) -> str:
         """Switch to the next available token.
 
-        Returns the new token.
-        Raises AllTokensExhausted if no fallback tokens available (triggers cross-bridge fallback).
+        Multi-token (>1): rotates round-robin to next token.
+        Single-token (==1): cannot rotate; marks soft-penalty so nginx-LB
+            cascades to next worker via 503. Returns the current token.
+        Zero tokens: raises AllTokensExhausted (token file missing).
         """
-        if len(self.tokens) <= 1:
-            raise AllTokensExhausted("Token rotation failed: No fallback tokens available. All dev-bridge OAuth tokens are exhausted.")
+        if len(self.tokens) == 0:
+            raise AllTokensExhausted(
+                "Token rotation failed: No tokens loaded. "
+                "Token file missing or unreadable."
+            )
+
+        if len(self.tokens) == 1:
+            # Single-token-per-worker setup (current Hetzner deployment, see audit
+            # 2026-04-29). Worker is bound to one token by design — cross-worker
+            # failover happens at the nginx-LB level via 503 response.
+            worker_id = os.getenv("INSTANCE_NAME", "unknown")
+            self._apply_soft_penalty(worker_id, retry_after=15)
+            return self.tokens[0]
 
         old_index = self.current_index
         self.current_index = (self.current_index + 1) % len(self.tokens)
@@ -107,15 +136,63 @@ class TokenRotator:
 
         return new_token
 
+    def _apply_soft_penalty(self, worker_id: str, retry_after: int = 15) -> None:
+        """Apply soft-penalty cooldown via RateLimitTracker.
+
+        Lazy import to avoid circular dependency with claude_cli.
+        Failure to import is logged but not fatal — caller still gets a token back.
+        """
+        try:
+            from src.claude_cli import rate_limit_tracker
+            rate_limit_tracker.mark_soft_penalty(worker_id, retry_after=retry_after)
+            logger.info(
+                f"⏳ Single-token worker {worker_id} soft-penalty {retry_after}s "
+                f"(no rotation possible — nginx-LB will failover via 503)"
+            )
+        except ImportError as e:
+            logger.warning(
+                f"rate_limit_tracker unavailable for soft-penalty on {worker_id}: {e}"
+            )
+
     def mark_token_failed(self, error_msg: str = "") -> str:
         """Mark current token as failed and rotate to next.
 
-        Call this when you detect rate limiting or auth errors.
-        Returns the new token.
-        Raises RuntimeError if no more tokens available.
+        Call this when you detect rate limiting (429) or other transient errors.
+        Returns the new (or same, in single-token case) token.
+        Raises AllTokensExhausted only if no tokens are loaded at all.
+
+        For 401 / token-invalid errors, use mark_token_invalid instead.
         """
-        logger.debug(f"Token failed: {self.tokens[self.current_index][:20]}... - {error_msg}")
+        if self.tokens:
+            logger.debug(f"Token failed: {self.tokens[self.current_index][:20]}... - {error_msg}")
         return self.rotate_token()
+
+    def mark_token_invalid(self, error_msg: str = "", account: Optional[str] = None) -> None:
+        """Mark current token as INVALID (401 from Anthropic).
+
+        Token has been revoked or expired and is NOT recoverable by retry.
+        Logs CRITICAL with operator instructions and raises TokenInvalidError.
+        NEVER returns — always raises.
+        """
+        worker_id = os.getenv("INSTANCE_NAME", "unknown")
+        if self.token_files:
+            try:
+                token_file_name = self.token_files[self.current_index].name
+            except IndexError:
+                token_file_name = "unknown"
+        else:
+            token_file_name = "unknown"
+
+        logger.critical("=" * 70)
+        logger.critical(f"❌ Token for worker {worker_id} (account={account or 'unknown'}) is INVALID.")
+        logger.critical(f"   Token file: /run/secrets/{token_file_name}")
+        logger.critical(f"   Replace the token file with a fresh OAuth token.")
+        logger.critical(f"   Worker will stay down until container restart.")
+        if error_msg:
+            logger.critical(f"   Anthropic error: {error_msg[:200]}")
+        logger.critical("=" * 70)
+
+        raise TokenInvalidError(worker_id=worker_id, account=account, message=error_msg)
 
     def apply_current_token(self):
         """Apply the current token to environment."""
