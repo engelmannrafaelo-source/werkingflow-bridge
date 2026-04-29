@@ -145,16 +145,27 @@ local function count_decision(worker)
 end
 
 -- ---------------------------------------------------------------------------
--- Best-account picker: returns the eligible account with the highest
--- headroom_percent, plus that percent value.
--- Returns nil, -1 when all accounts are exhausted or ineligible.
+-- Best-account picker: two-stage selection to prevent single-worker monopoly.
+--
+-- Stage 1 — PRIMARY sort: headroom_percent (highest = most capacity)
+-- Stage 2 — SECONDARY sort (Tie-Breaker): current_in_flight_tokens (lowest wins)
+--   Applied within a NEAR-TIE window of 5pp: accounts whose headroom_percent is
+--   within 5pp of the maximum are treated as equal for stage-1, so the one with
+--   fewest in-flight tokens wins. Without this window, the 1pp-ahead account
+--   monopolises all traffic until it saturates (original round-robin comment:
+--   "max-headroom-wins monopolizes the lightly-loaded worker until it saturates").
+--
+-- Returns best_name, best_pct, best_in_flight  (all nil/-1/nil when none eligible)
 --
 -- Eligible = available AND session_percent<95 AND cooldown=0 AND
 --            headroom_tokens > est_tokens
 -- ---------------------------------------------------------------------------
+local NEAR_TIE_PP = 5  -- accounts within 5pp of max headroom are treated as tied
+
 local function pick_best_account(accounts, est_tokens)
-    local best_name = nil
-    local best_pct  = -1
+    local eligible = {}
+    local max_pct  = -1
+
     for name, info in pairs(accounts) do
         local session_pct  = tonumber(info.session_percent) or 100
         local cooldown     = tonumber(info.cooldown_remaining_s) or 0
@@ -163,13 +174,41 @@ local function pick_best_account(accounts, est_tokens)
         local available    = info.available
         if available and session_pct < 95 and cooldown == 0
                 and headroom_tok > (est_tokens or 0) then
-            if headroom_pct > best_pct then
-                best_pct  = headroom_pct
-                best_name = name
+            local in_flight = tonumber(info.current_in_flight_tokens) or 0
+            eligible[#eligible + 1] = {
+                name      = name,
+                pct       = headroom_pct,
+                in_flight = in_flight,
+            }
+            if headroom_pct > max_pct then
+                max_pct = headroom_pct
             end
         end
     end
-    return best_name, best_pct
+
+    if #eligible == 0 then
+        return nil, -1, nil
+    end
+
+    -- Collect near-max candidates (within NEAR_TIE_PP of the best headroom)
+    local near_max = {}
+    for _, e in ipairs(eligible) do
+        if e.pct >= max_pct - NEAR_TIE_PP then
+            near_max[#near_max + 1] = e
+        end
+    end
+
+    -- Among near-max: pick lowest in_flight (tie-break by higher pct)
+    local best = near_max[1]
+    for i = 2, #near_max do
+        local c = near_max[i]
+        if c.in_flight < best.in_flight
+                or (c.in_flight == best.in_flight and c.pct > best.pct) then
+            best = c
+        end
+    end
+
+    return best.name, best.pct, best.in_flight
 end
 
 -- ---------------------------------------------------------------------------
@@ -255,7 +294,7 @@ function M.choose()
     local req_len    = tonumber(ngx.var.request_length) or 1000
     local est_tokens = math.max(500, math.floor(req_len / 4))
 
-    local picked, picked_pct = pick_best_account(data.accounts, est_tokens)
+    local picked, picked_pct, picked_in_flight = pick_best_account(data.accounts, est_tokens)
 
     if not picked then
         -- All accounts exhausted → bogus upstream → @bridge_full emits 429
@@ -268,7 +307,7 @@ function M.choose()
         return
     end
 
-    -- Route to account with highest headroom_percent
+    -- Route: highest headroom within near-tie window, tie-broken by lowest in_flight
     local worker = ACCOUNT_WORKER[picked] or "worker1"
     count_decision(worker)
     ngx.var.target_worker   = worker
@@ -276,6 +315,7 @@ function M.choose()
     ngx.log(ngx.INFO, "pool_router.choose: routed_to=", worker,
             " reason=highest_headroom_", string.format("%.0f", picked_pct), "pct",
             " account=", picked,
+            " in_flight=", picked_in_flight,
             " est_tokens=", est_tokens,
             " state_age_s=", string.format("%.1f", age))
 end
