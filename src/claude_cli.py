@@ -366,13 +366,9 @@ class ClaudeCodeCLI:
             # Add 60 second timeout for SDK verification
             try:
                 async with asyncio.timeout(60):
-                    async for message in query(
-                        prompt="Hello",
-                        options=ClaudeCodeOptions(
-                            max_turns=1,
-                            cwd=self.cwd
-                        )
-                    ):
+                    _verify_opts = ClaudeCodeOptions(max_turns=1, cwd=self.cwd)
+                    _verify_opts.mcp_servers = {}
+                    async for message in query(prompt="Hello", options=_verify_opts):
                         messages.append(message)
                         # Break early on first response to speed up verification
                         # Handle both dict and object types
@@ -860,6 +856,7 @@ CRITICAL: Write file EARLY to avoid context overflow. Use Write tool for clauded
                     max_turns=max_turns,
                     cwd=research_cwd
                 )
+                options.mcp_servers = {}
 
                 # Set permission mode if specified via environment variable
                 permission_mode = os.getenv("CLAUDE_PERMISSION_MODE")
