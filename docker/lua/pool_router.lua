@@ -3,20 +3,17 @@
 -- PHASE C (LIVE): choose() is called from access_by_lua_block in /v1/(chat/completions|research).
 -- Distributes load across all eligible Anthropic accounts (token-budget aware).
 -- Sets ngx.var.target_worker to one of: worker1, worker2, worker3, worker4, unavailable
--- Sets ngx.var.x_pool_decision to: round_robin | exhausted
+-- Sets ngx.var.x_pool_decision to: highest_headroom | round_robin_fallback | all_unavail
 --
 -- Decision logic:
 --   1. Refresh timer reads /v1/metrics/account-pool-state every 2s
 --   2. Per request: estimates input tokens from request_length
 --   3. Eligible = available AND session<95% AND cooldown=0 AND headroom>est_tokens
---   4. Round-robin across ALL eligible accounts (deterministic counter, alphabetical order)
---   5. State stale (>10s) OR no accounts → round-robin across all 4 workers
+--   4. Pick eligible account with HIGHEST headroom_percent → pool_decision=highest_headroom
+--   5. State stale (>10s) OR fetch/decode error → round-robin across all 4 workers
+--      → pool_decision=round_robin_fallback
 --   6. Zero eligible → bogus peer → triggers @bridge_full 429 envelope
---
--- Why no "best account" picker: max-headroom-wins monopolizes the lightly-loaded
--- worker until it saturates, then cascades. Plain round-robin across eligible spreads
--- load evenly. Accounts with low headroom drop out of eligible naturally; accounts
--- in cooldown drop out via available=false.
+--      → pool_decision=all_unavail
 
 local cjson = require "cjson.safe"
 local http  = require "resty.http"
@@ -148,28 +145,31 @@ local function count_decision(worker)
 end
 
 -- ---------------------------------------------------------------------------
--- Eligible-account selection: returns list of all accounts that pass the
--- admission filter, sorted alphabetically for deterministic round-robin order.
--- Empty list = all accounts exhausted.
+-- Best-account picker: returns the eligible account with the highest
+-- headroom_percent, plus that percent value.
+-- Returns nil, -1 when all accounts are exhausted or ineligible.
 --
--- No max-headroom preference: spreading load evenly across eligible accounts
--- is more robust than monopolizing the "best" one (which saturates first then
--- cascades). Accounts with low headroom drop out via the headroom>est filter;
--- accounts in cooldown drop out via available=false.
+-- Eligible = available AND session_percent<95 AND cooldown=0 AND
+--            headroom_tokens > est_tokens
 -- ---------------------------------------------------------------------------
-local function eligible_accounts(accounts, est_tokens)
-    local eligible = {}
+local function pick_best_account(accounts, est_tokens)
+    local best_name = nil
+    local best_pct  = -1
     for name, info in pairs(accounts) do
-        local session_pct = tonumber(info.session_percent) or 100
-        local cooldown    = tonumber(info.cooldown_remaining_s) or 0
-        local headroom    = tonumber(info.headroom_tokens) or 0
-        local available   = info.available
-        if available and session_pct < 95 and cooldown == 0 and headroom > (est_tokens or 0) then
-            eligible[#eligible + 1] = name
+        local session_pct  = tonumber(info.session_percent) or 100
+        local cooldown     = tonumber(info.cooldown_remaining_s) or 0
+        local headroom_tok = tonumber(info.headroom_tokens) or 0
+        local headroom_pct = tonumber(info.headroom_percent) or 0
+        local available    = info.available
+        if available and session_pct < 95 and cooldown == 0
+                and headroom_tok > (est_tokens or 0) then
+            if headroom_pct > best_pct then
+                best_pct  = headroom_pct
+                best_name = name
+            end
         end
     end
-    table.sort(eligible)  -- deterministic order: alphabetical
-    return eligible
+    return best_name, best_pct
 end
 
 -- ---------------------------------------------------------------------------
@@ -208,17 +208,17 @@ function M.choose()
     local refresh_status = shared:get("last_refresh_status") or "unknown"
     local refresh_err    = shared:get("last_refresh_err") or ""
 
-    -- Stale state: deterministic round-robin (never random — avoids clustering on one worker)
+    -- Stale state: deterministic round-robin fallback (never random — avoids clustering)
     if not state_str or age > STALE_THRESHOLD_S then
         local pick = round_robin_worker()
         count_decision(pick)
         ngx.var.target_worker   = pick
-        ngx.var.x_pool_decision = "round_robin"
+        ngx.var.x_pool_decision = "round_robin_fallback"
         ngx.log(ngx.WARN, "pool_router.choose: state stale",
                 " state_age_s=", string.format("%.1f", age),
                 " refresh_status=", refresh_status,
                 " last_err=", refresh_err,
-                " — round_robin to ", pick)
+                " — round_robin_fallback to ", pick)
         return
     end
 
@@ -227,12 +227,12 @@ function M.choose()
         local pick = round_robin_worker()
         count_decision(pick)
         ngx.var.target_worker   = pick
-        ngx.var.x_pool_decision = "round_robin"
+        ngx.var.x_pool_decision = "round_robin_fallback"
         ngx.log(ngx.ERR, "pool_router.choose: invalid cached state",
                 " state_age_s=", string.format("%.1f", age),
                 " refresh_status=", refresh_status,
                 " last_err=", refresh_err,
-                " — round_robin to ", pick)
+                " — round_robin_fallback to ", pick)
         return
     end
 
@@ -243,11 +243,11 @@ function M.choose()
         local pick = round_robin_worker()
         count_decision(pick)
         ngx.var.target_worker   = pick
-        ngx.var.x_pool_decision = "round_robin"
+        ngx.var.x_pool_decision = "round_robin_fallback"
         ngx.log(ngx.WARN, "pool_router.choose: empty accounts",
                 " state_age_s=", string.format("%.1f", age),
                 " refresh_status=", refresh_status,
-                " — round_robin to ", pick)
+                " — round_robin_fallback to ", pick)
         return
     end
 
@@ -255,29 +255,27 @@ function M.choose()
     local req_len    = tonumber(ngx.var.request_length) or 1000
     local est_tokens = math.max(500, math.floor(req_len / 4))
 
-    local eligible = eligible_accounts(data.accounts, est_tokens)
+    local picked, picked_pct = pick_best_account(data.accounts, est_tokens)
 
-    if #eligible == 0 then
+    if not picked then
         -- All accounts exhausted → bogus upstream → @bridge_full emits 429
         ngx.var.target_worker   = "unavailable"
-        ngx.var.x_pool_decision = "exhausted"
-        ngx.log(ngx.WARN, "pool_router.choose: all accounts exhausted",
+        ngx.var.x_pool_decision = "all_unavail"
+        ngx.log(ngx.WARN, "pool_router.choose: all_unavail",
                 " est_tokens=", est_tokens,
                 " state_age_s=", string.format("%.1f", age),
                 " refresh_status=", refresh_status)
         return
     end
 
-    -- Round-robin across eligible accounts (deterministic counter, alphabetical order).
-    -- Spreads load evenly — no monopoly on best-headroom worker, no saturation cascade.
-    local idx     = shared:incr("rr_counter", 1, 0)
-    local picked  = eligible[((idx - 1) % #eligible) + 1]
-    local worker  = ACCOUNT_WORKER[picked] or "worker1"
+    -- Route to account with highest headroom_percent
+    local worker = ACCOUNT_WORKER[picked] or "worker1"
     count_decision(worker)
     ngx.var.target_worker   = worker
-    ngx.var.x_pool_decision = "round_robin"
-    ngx.log(ngx.INFO, "pool_router.choose: round_robin=", picked, "/", worker,
-            " (eligible=", #eligible, "/", 4, ")",
+    ngx.var.x_pool_decision = "highest_headroom"
+    ngx.log(ngx.INFO, "pool_router.choose: routed_to=", worker,
+            " reason=highest_headroom_", string.format("%.0f", picked_pct), "pct",
+            " account=", picked,
             " est_tokens=", est_tokens,
             " state_age_s=", string.format("%.1f", age))
 end
