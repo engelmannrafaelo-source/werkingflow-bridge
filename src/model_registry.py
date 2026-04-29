@@ -33,12 +33,19 @@ class ModelInfo:
 MODELS: List[ModelInfo] = [
     # Sonnet Familie
     ModelInfo(
+        id="claude-sonnet-4-6",
+        family="sonnet",
+        version="4.6",
+        release_date=date(2026, 2, 17),
+        description="Sonnet 4.6 - Neuestes Sonnet, 1M context, extended thinking",
+        is_default=True
+    ),
+    ModelInfo(
         id="claude-sonnet-4-5-20250929",
         family="sonnet",
         version="4.5",
         release_date=date(2025, 9, 29),
-        description="Sonnet 4.5 - Neuestes und schnellstes Sonnet",
-        is_default=True
+        description="Sonnet 4.5 - September 2025 Release"
     ),
     ModelInfo(
         id="claude-sonnet-4-20250514",
@@ -81,12 +88,26 @@ MODELS: List[ModelInfo] = [
 
     # Opus Familie
     ModelInfo(
-        id="claude-opus-4-20250514",
+        id="claude-opus-4-7",
         family="opus",
-        version="4",
-        release_date=date(2025, 5, 14),
-        description="Opus 4 - Leistungsfaehigstes Modell",
+        version="4.7",
+        release_date=date(2026, 4, 14),
+        description="Opus 4.7 - Neuestes und leistungsfaehigstes Modell, 1M context",
         is_default=True
+    ),
+    ModelInfo(
+        id="claude-opus-4-6",
+        family="opus",
+        version="4.6",
+        release_date=date(2026, 2, 4),
+        description="Opus 4.6 - Februar 2026 Release"
+    ),
+    ModelInfo(
+        id="claude-opus-4-5-20251101",
+        family="opus",
+        version="4.5",
+        release_date=date(2025, 11, 24),
+        description="Opus 4.5 - November 2025 Release"
     ),
     ModelInfo(
         id="claude-opus-4-1-20250805",
@@ -95,11 +116,28 @@ MODELS: List[ModelInfo] = [
         release_date=date(2025, 8, 5),
         description="Opus 4.1 - August 2025 Release"
     ),
+    ModelInfo(
+        id="claude-opus-4-20250514",
+        family="opus",
+        version="4",
+        release_date=date(2025, 5, 14),
+        description="Opus 4 - May 2025 Release"
+    ),
 ]
 
 # Build lookup dictionaries
 _MODEL_BY_ID: Dict[str, ModelInfo] = {m.id: m for m in MODELS}
-_DEFAULT_BY_FAMILY: Dict[str, ModelInfo] = {m.family: m for m in MODELS if m.is_default}
+
+def _compute_family_defaults() -> Dict[str, ModelInfo]:
+    """Pick newest model per family by release_date — dynamic, no manual is_default flag needed."""
+    by_family: Dict[str, ModelInfo] = {}
+    for m in MODELS:
+        cur = by_family.get(m.family)
+        if cur is None or m.release_date > cur.release_date:
+            by_family[m.family] = m
+    return by_family
+
+_DEFAULT_BY_FAMILY: Dict[str, ModelInfo] = _compute_family_defaults()
 
 
 def get_all_model_ids() -> List[str]:
@@ -150,16 +188,26 @@ def resolve_model(model_input: str) -> tuple[str, Optional[str]]:
     """
     model_lower = model_input.lower().strip()
 
-    # 1. Exact match
+    # 1. Exact match — but ONLY honor it if this IS the family default (latest).
+    # Older versions get force-upgraded via fuzzy match below.
     if model_input in _MODEL_BY_ID:
-        logger.debug(f"Model exact match: {model_input}")
-        return (model_input, None)
+        info = _MODEL_BY_ID[model_input]
+        latest = _DEFAULT_BY_FAMILY.get(info.family)
+        if latest and info.id == latest.id:
+            logger.debug(f"Model exact match (latest): {model_input}")
+            return (model_input, None)
+        # Older version explicitly requested — force-upgrade to latest of family.
+        logger.info(f"Force-upgrade: '{model_input}' -> '{latest.id}' (older version, always-latest policy)")
+        return (latest.id, f"Force-upgraded '{model_input}' to '{latest.id}' (always-latest policy)")
 
-    # 2. Case-insensitive exact match
+    # 2. Case-insensitive exact match — same force-upgrade rule.
     for model_id in _MODEL_BY_ID:
         if model_id.lower() == model_lower:
-            logger.info(f"Model case-insensitive match: {model_input} -> {model_id}")
-            return (model_id, f"Resolved '{model_input}' to '{model_id}' (case corrected)")
+            info = _MODEL_BY_ID[model_id]
+            latest = _DEFAULT_BY_FAMILY.get(info.family)
+            if latest and info.id == latest.id:
+                return (model_id, f"Resolved '{model_input}' to '{model_id}' (case corrected)")
+            return (latest.id, f"Force-upgraded '{model_input}' to '{latest.id}' (always-latest policy, case corrected)")
 
     # 3. Fuzzy match by family name
     family_keywords = {
