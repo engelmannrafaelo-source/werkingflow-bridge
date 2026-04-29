@@ -1539,33 +1539,76 @@ CRITICAL: Write file EARLY to avoid context overflow. Use Write tool for clauded
         except Exception as e:
             logger.error(f"Claude Code SDK error: {e}")
 
-            # Check if this is an auth/rate-limit error that warrants failover
+            # Classify error type to apply the right cooldown strategy:
+            # - 401 (auth)        → TokenInvalidError, worker dies, CRITICAL log
+            # - 429 (rate limit)  → mark_rate_limited (HARD), nginx routes elsewhere
+            # - other 5xx-ish     → mark_soft_penalty (transient, 15s)
             error_str = str(e).lower()
+            worker_id = os.environ.get("INSTANCE_NAME", "unknown")
 
-            # Errors that indicate this worker cannot handle ANY requests right now
-            # NOTE: "exit code 1" removed — SDK often returns exit code 1 even on
-            # successful completions. Cache recovery (below) handles this case.
-            is_worker_unavailable = any(x in error_str for x in [
-                "credit balance", "balance is too low", "rate limit",
-                "authentication failed", "unauthorized", "invalid token",
-                "oauth token", "token expired", "401", "invalid api key",
-            ])
+            auth_indicators = [
+                "401", "authentication failed", "unauthorized",
+                "invalid token", "invalid api key", "token expired",
+                "oauth token",
+            ]
+            rate_limit_indicators = [
+                "429", "rate limit", "too many requests",
+                "credit balance", "balance is too low",
+            ]
+            transient_indicators = [
+                "500", "502", "503", "504",
+                "internal server error", "bad gateway", "service unavailable",
+                "gateway timeout", "connection reset", "connection refused",
+            ]
 
-            if is_worker_unavailable:
-                # Mark session as failed
+            is_auth_error = any(x in error_str for x in auth_indicators)
+            is_rate_limit = (
+                not is_auth_error
+                and any(x in error_str for x in rate_limit_indicators)
+            )
+            is_transient = (
+                not is_auth_error
+                and not is_rate_limit
+                and any(x in error_str for x in transient_indicators)
+            )
+
+            if is_auth_error:
+                # Token invalid — not recoverable by retry. Worker dies until restart.
+                # mark_token_invalid logs CRITICAL with operator instructions.
                 cli_session_manager.complete_session(cli_session_id, status="failed")
+                from src.auth import token_rotator, TokenInvalidError
+                try:
+                    token_rotator.mark_token_invalid(str(e))
+                except TokenInvalidError as token_err:
+                    logger.error(
+                        f"Worker {worker_id} dead until restart with fresh token: {token_err}"
+                    )
+                # 503 → nginx failover. Container needs restart with new token file.
+                raise WorkerUnavailableError(
+                    f"Token invalid for {worker_id}: {e}"
+                ) from e
 
-                # Try token rotation (but it may fail if no backup tokens)
+            if is_rate_limit:
+                # HARD rate limit on this worker; nginx routes new requests elsewhere.
+                cli_session_manager.complete_session(cli_session_id, status="failed")
+                rate_limit_tracker.mark_rate_limited(worker_id, str(e))
                 try:
                     from src.auth import token_rotator
                     token_rotator.mark_token_failed(str(e))
-                    logger.debug(f"Token rotated for future requests")
-                except RuntimeError as rotation_error:
-                    logger.debug(f"Token rotation failed (expected with single token): {rotation_error}")
+                except Exception as rotation_error:
+                    logger.debug(
+                        f"Token rotation failed (expected single-token): {rotation_error}"
+                    )
+                raise WorkerUnavailableError(f"Claude SDK rate-limited: {e}") from e
 
-                # Raise exception to trigger HTTP 503 → Nginx failover to other worker
-                logger.debug(f"Worker unavailable, Nginx failover: {e}")
-                raise WorkerUnavailableError(f"Claude SDK failed: {e}") from e
+            if is_transient:
+                # 5xx / connection error: short soft-penalty so nginx tries another
+                # worker for new requests. Fall through to cache recovery for this
+                # in-flight task.
+                rate_limit_tracker.mark_soft_penalty(worker_id, retry_after=15)
+                logger.warning(
+                    f"⏳ Transient error on {worker_id} — soft-penalty applied: {e}"
+                )
 
             # Attempt recovery from cache if available
             if cache_file and cache_file.exists() and cache_file.stat().st_size > 0:
