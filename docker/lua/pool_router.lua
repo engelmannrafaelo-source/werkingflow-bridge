@@ -145,15 +145,21 @@ local function count_decision(worker)
 end
 
 -- ---------------------------------------------------------------------------
--- Best-account picker: two-stage selection to prevent single-worker monopoly.
+-- Best-account picker: three-stage selection to prevent single-worker monopoly.
 --
 -- Stage 1 — PRIMARY sort: headroom_percent (highest = most capacity)
--- Stage 2 — SECONDARY sort (Tie-Breaker): current_in_flight_tokens (lowest wins)
---   Applied within a NEAR-TIE window of 5pp: accounts whose headroom_percent is
---   within 5pp of the maximum are treated as equal for stage-1, so the one with
---   fewest in-flight tokens wins. Without this window, the 1pp-ahead account
---   monopolises all traffic until it saturates (original round-robin comment:
---   "max-headroom-wins monopolizes the lightly-loaded worker until it saturates").
+-- Stage 2 — TIE-BREAKER within 5pp window: current_in_flight_tokens (lowest wins)
+--   Accounts whose headroom_percent is within 5pp of the maximum are treated
+--   as equal for stage-1, so the one with fewest in-flight tokens wins.
+-- Stage 3 — TIE-BREAKER on total tie: decision_counter (least routes wins)
+--   When stage 1+2 tie (typical at idle: all 4 workers report 85% headroom +
+--   0 in-flight), fall through to the per-worker decision_counter so traffic
+--   spreads automatically over time. Without stage 3, Lua's `pairs(accounts)`
+--   hash-iteration order picks the same first account every request — the
+--   live decision_counter we observed was 99.6% on worker1, 0.1% each on the
+--   other three. Using the counter as final tie-breaker is deterministic
+--   (no randomness), self-balancing (the laggards catch up automatically),
+--   and reuses data we already collect for /internal/pool-router/state.
 --
 -- Returns best_name, best_pct, best_in_flight  (all nil/-1/nil when none eligible)
 --
@@ -161,6 +167,17 @@ end
 --            headroom_tokens > est_tokens
 -- ---------------------------------------------------------------------------
 local NEAR_TIE_PP = 5  -- accounts within 5pp of max headroom are treated as tied
+
+-- Read this worker's decision counter from shared dict. 0 if never routed yet,
+-- which naturally promotes a fresh worker to first pick.
+local function _decision_count_for_worker(worker_name)
+    for i, w in ipairs(WORKER_NAMES) do
+        if w == worker_name then
+            return tonumber(shared:get("rr_worker_count_" .. i)) or 0
+        end
+    end
+    return 0
+end
 
 local function pick_best_account(accounts, est_tokens)
     local eligible = {}
@@ -175,10 +192,13 @@ local function pick_best_account(accounts, est_tokens)
         if available and session_pct < 95 and cooldown == 0
                 and headroom_tok > (est_tokens or 0) then
             local in_flight = tonumber(info.current_in_flight_tokens) or 0
+            local worker    = ACCOUNT_WORKER[name] or ""
+            local decisions = _decision_count_for_worker(worker)
             eligible[#eligible + 1] = {
                 name      = name,
                 pct       = headroom_pct,
                 in_flight = in_flight,
+                decisions = decisions,
             }
             if headroom_pct > max_pct then
                 max_pct = headroom_pct
@@ -198,13 +218,17 @@ local function pick_best_account(accounts, est_tokens)
         end
     end
 
-    -- Among near-max: pick lowest in_flight (tie-break by higher pct)
+    -- Three-stage comparator: lowest in_flight; then highest pct; then lowest decisions.
+    local function better_than(c, b)
+        if c.in_flight ~= b.in_flight then return c.in_flight < b.in_flight end
+        if c.pct       ~= b.pct       then return c.pct       > b.pct       end
+        return c.decisions < b.decisions
+    end
+
     local best = near_max[1]
     for i = 2, #near_max do
-        local c = near_max[i]
-        if c.in_flight < best.in_flight
-                or (c.in_flight == best.in_flight and c.pct > best.pct) then
-            best = c
+        if better_than(near_max[i], best) then
+            best = near_max[i]
         end
     end
 

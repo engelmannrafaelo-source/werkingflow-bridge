@@ -2034,6 +2034,39 @@ async def chat_completions(
             # Extract assistant message
             raw_assistant_content = claude_cli.parse_claude_message(chunks)
 
+            # Rate-limit phrasing in the assistant text (non-streaming path).
+            # The streaming loop in claude_cli already calls detect_in_text per
+            # block, but a sync chat completion comes back as a single message
+            # — without this check the rate-limit phrase would be returned to
+            # the caller as response content while the worker stayed marked
+            # available, so the pool router would route the next request to
+            # the same exhausted account.
+            if raw_assistant_content:
+                from src.claude_cli import rate_limit_tracker as _rl_tracker
+                _self_worker = os.getenv("INSTANCE_NAME", "unknown")
+                _rl_match = _rl_tracker.detect_in_text(raw_assistant_content, _self_worker)
+                if _rl_match:
+                    _retry_after = _rl_tracker.get_retry_after(_self_worker) or 60
+                    logger.warning(
+                        f"🚫 Rate-limit response from worker {_self_worker} "
+                        f"(pattern={_rl_match!r}) — surfacing 429 instead of leaking phrase"
+                    )
+                    return JSONResponse(
+                        status_code=429,
+                        content={"error": {
+                            "message": f"[Bridge {_self_worker}] Account exhausted ({_rl_match})",
+                            "type": "api_error",
+                            "code": "429",
+                            "source": "bridge_account",
+                            "bridge_type": "worker_unavailable",
+                            "reason": "worker_account_rate_limited",
+                            "bridge_worker": _self_worker,
+                            "retryable": True,
+                            "retry_after_s": _retry_after,
+                        }},
+                        headers={"Retry-After": str(_retry_after)}
+                    )
+
             if not raw_assistant_content:
                 # CRITICAL: Detailed error logging for debugging
                 logger.error(f"❌ parse_claude_message returned None!")
@@ -4501,8 +4534,31 @@ async def get_account_pool_state():
 
     cap = state.cap_tokens
     safety_cap = int(cap * SAFETY_MARGIN_PCT / 100)
-    headroom = max(0, safety_cap - inflight)
-    headroom_pct = round(headroom * 100.0 / cap, 1) if cap > 0 else 0.0
+
+    # Real headroom must be the minimum of three independent ceilings:
+    #   1) inflight (local Bridge admit budget — sinks as concurrent load rises)
+    #   2) Anthropic 5h session window  (session_percent reports its consumption)
+    #   3) Anthropic weekly plan window (weekly_percent reports its consumption)
+    # The previous formula divided (safety_cap - inflight) by cap and reported
+    # SAFETY_MARGIN_PCT (≈85) for every idle worker. That's a constant of the
+    # admit-threshold formula, not a capacity signal — so the pool router saw
+    # all four idle workers as identical and routed every request to the
+    # alphabetically-first account (decision_counter showed 99.6% on worker1).
+    # Using the true min lets the router rank workers by which Anthropic
+    # account is actually freshest, even when the Bridge itself is idle.
+    session_pct = float(acct.get("session_pct", 0.0))
+    weekly_pct = float(acct.get("weekly_pct", 0.0))
+
+    inflight_headroom_pct = (
+        max(0.0, (safety_cap - inflight) * 100.0 / safety_cap) if safety_cap > 0 else 0.0
+    )
+    session_remaining_pct = max(0.0, 100.0 - session_pct)
+    weekly_remaining_pct = max(0.0, 100.0 - weekly_pct)
+    headroom_pct = round(
+        min(inflight_headroom_pct, session_remaining_pct, weekly_remaining_pct),
+        1,
+    )
+    headroom = int(safety_cap * headroom_pct / 100.0) if safety_cap > 0 else 0
 
     now = _time.time()
 
@@ -4543,14 +4599,13 @@ async def get_account_pool_state():
             merged_last_rate_limit_ts = tracker_last_ts
 
     account_name = _WORKER_ACCOUNT_MAP.get(worker_id, worker_id)
-    session_pct = float(acct.get("session_pct", 0.0))
 
     return {
         "ts": int(now),
         "worker": worker_id,
         "account": account_name,
         "session_percent": round(session_pct, 1),
-        "weekly_percent": round(float(acct.get("weekly_pct", 0.0)), 1),
+        "weekly_percent": round(weekly_pct, 1),
         "adaptive_cap_tokens": cap,
         "current_in_flight_tokens": inflight,
         "headroom_tokens": headroom,

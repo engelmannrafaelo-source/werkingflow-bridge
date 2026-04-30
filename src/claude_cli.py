@@ -150,6 +150,32 @@ class RateLimitTracker:
     # only protection for *new* request routing. Long lock created cascades
     # where Pool-Router shut down all 4 accounts on phantom heartbeat events.
 
+    # Anthropic account-level exhaustion phrasings. Single source of truth —
+    # the streaming and non-streaming response paths both read this list via
+    # detect_in_text() so a new wording only has to be added here. Wider is
+    # safer than narrower: a false positive parks the worker for 10min (capped
+    # by MAX_COOLDOWN_SECONDS) while a false negative leaks the rate-limit
+    # text to the client AND keeps the dead worker in the routing pool, so the
+    # next request lands back on it instead of a healthy account.
+    RATE_LIMIT_PATTERNS = (
+        "hit your limit",
+        "you've hit your limit",
+        "rate limit",
+        "usage limit",
+        "quota exceeded",
+        "too many requests",
+        # Anthropic Pro/Max "extra usage" budget exhausted —
+        # wording seen in the wild 2026-04 (Vienna reset).
+        "out of extra usage",
+        "out of usage",
+        # Weekly / monthly plan caps
+        "weekly limit",
+        "monthly limit",
+        # Alternate phrasings we've seen
+        "reached your limit",
+        "reached your usage",
+    )
+
     def __new__(cls):
         if cls._instance is None:
             cls._instance = super().__new__(cls)
@@ -231,6 +257,36 @@ class RateLimitTracker:
         remaining = int((reset_time - datetime.now()).total_seconds())
         self._logger.warning(f"🚫 Worker {worker_id} HARD rate-limited for {remaining}s (until {reset_time})")
         return reset_time
+
+    def detect_in_text(self, text: str, worker_id: str) -> Optional[str]:
+        """Scan an assistant text for an Anthropic rate-limit phrasing and,
+        on hit, mark the worker HARD-limited.
+
+        Single entry point for both response paths — streaming and the
+        non-streaming SDK extractor. Without this the streaming loop saw the
+        phrase and parked the worker, but a non-streaming sync request
+        returned the same phrase as response content with the worker still
+        marked available. The pool-router then kept routing every new
+        request to the same exhausted worker.
+
+        Returns the matched pattern (so the caller can surface it in logs or
+        decide what to put in the error envelope) or None if no pattern
+        matched. The worker-marking side effect makes this idempotent —
+        calling it on already-rate-limited workers just refreshes the
+        cooldown.
+        """
+        if not text:
+            return None
+        text_lower = text.lower()
+        for pattern in self.RATE_LIMIT_PATTERNS:
+            if pattern in text_lower:
+                self.mark_rate_limited(worker_id, text)
+                self._logger.warning(
+                    f"🚫 Rate-limit phrase on {worker_id} (pattern={pattern!r}) "
+                    f"— HARD limit set. Phrase: {text[:150]!r}"
+                )
+                return pattern
+        return None
 
     def is_rate_limited(self, worker_id: str) -> bool:
         """Check if a specific worker is rate-limited (soft or hard)."""
@@ -1161,51 +1217,21 @@ CRITICAL: Write file EARLY to avoid context overflow. Use Write tool for clauded
                             # We track the state so NEW requests get routed to other workers,
                             # but we do NOT abort this in-progress task.
                             #
-                            # Previously this raised WorkerUnavailableError which killed
-                            # the task and wasted all tokens spent so far. Now the task
-                            # continues and completes after the CLI retries.
+                            # Detection logic + pattern list lives on RateLimitTracker so the
+                            # non-streaming response extractor uses the same rules.
                             # =================================================================
                             if type(message).__name__ == 'AssistantMessage':
                                 if hasattr(message, 'content') and message.content:
+                                    skip_yield = False
                                     for block in message.content:
                                         if hasattr(block, 'text') and block.text:
-                                            text_lower = block.text.lower()
-                                            # Anthropic account-level exhaustion phrasings. Keep this list
-                                            # wide — a false positive just parks the worker for 10min (capped
-                                            # by MAX_COOLDOWN_SECONDS); a false negative leaks the text to the
-                                            # client AND leaves the dead worker in the round-robin pool, so
-                                            # the next request lands back on it instead of a healthy account.
-                                            rate_limit_patterns = [
-                                                "hit your limit",
-                                                "you've hit your limit",
-                                                "rate limit",
-                                                "usage limit",
-                                                "quota exceeded",
-                                                "too many requests",
-                                                # Anthropic Pro/Max "extra usage" budget exhausted —
-                                                # wording seen in the wild 2026-04 (Vienna reset).
-                                                "out of extra usage",
-                                                "out of usage",
-                                                # Weekly / monthly plan caps
-                                                "weekly limit",
-                                                "monthly limit",
-                                                # Alternate phrasings we've seen
-                                                "reached your limit",
-                                                "reached your usage",
-                                            ]
-                                            if any(pattern in text_lower for pattern in rate_limit_patterns):
-                                                worker_id = os.environ.get("INSTANCE_NAME", "unknown")
-                                                full_msg = block.text
-                                                # HARD rate limit from text — CLI will retry.
-                                                # Task continues, but mark HARD limit for new routing.
-                                                rate_limit_tracker.mark_rate_limited(worker_id, full_msg)
-                                                logger.warning(
-                                                    f"🚫 Rate limit text on {worker_id} — "
-                                                    f"HARD limit set, CLI retrying internally. "
-                                                    f"Message: {full_msg[:150]}"
-                                                )
-                                                # Don't yield this rate-limit text to the client
-                                                continue
+                                            worker_id = os.environ.get("INSTANCE_NAME", "unknown")
+                                            if rate_limit_tracker.detect_in_text(block.text, worker_id):
+                                                skip_yield = True
+                                                break
+                                    if skip_yield:
+                                        # Don't yield this rate-limit text to the client
+                                        continue
 
                             # =================================================================
                             # SKIP SYSTEMMESSAGE - Don't yield to client
