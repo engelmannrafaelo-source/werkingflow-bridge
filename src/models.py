@@ -298,8 +298,8 @@ class ResearchRequest(BaseModel):
 
     # Model Configuration
     model: Optional[str] = Field(
-        default="claude-sonnet-4-6",
-        description="Claude model to use for research (default: latest Sonnet)"
+        default="claude-sonnet-4-5-20250929",
+        description="Claude model to use for research (default: latest stable Sonnet)"
     )
 
     # Output Configuration

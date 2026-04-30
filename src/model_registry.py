@@ -32,20 +32,19 @@ class ModelInfo:
 
 MODELS: List[ModelInfo] = [
     # Sonnet Familie
-    ModelInfo(
-        id="claude-sonnet-4-6",
-        family="sonnet",
-        version="4.6",
-        release_date=date(2026, 2, 17),
-        description="Sonnet 4.6 - Neuestes Sonnet, 1M context, extended thinking",
-        is_default=True
-    ),
+    # Sonnet 4.6 (2026-02-17 release) ist hier bewusst NICHT registriert:
+    # dokumentierte Regression bei instruction-following + ~4.8x Token-Verbrauch
+    # (siehe Anthropic GitHub #46935). Token-Inflation triggert claude_code_sdk
+    # Worker context-compaction bei großen Pipeline-Prompts und liefert
+    # Compaction-Summary statt code zurück. Sonnet 4.5 bleibt der Sonnet-Default
+    # bis ein stabiler 4.6-Nachfolger verfügbar ist.
     ModelInfo(
         id="claude-sonnet-4-5-20250929",
         family="sonnet",
         version="4.5",
         release_date=date(2025, 9, 29),
-        description="Sonnet 4.5 - September 2025 Release"
+        description="Sonnet 4.5 - stabiler Default (4.6 hat dokumentierte Regression)",
+        is_default=True
     ),
     ModelInfo(
         id="claude-sonnet-4-20250514",
