@@ -2055,6 +2055,9 @@ async def chat_completions(
                         f"🚫 Rate-limit response from worker {_self_worker} "
                         f"(pattern={_rl_match!r}) — surfacing 429 instead of leaking phrase"
                     )
+                    # Feed the AdaptiveLoadLimiter — direct-return path bypasses rate_limit_handler.
+                    from src.middleware.rolling_metrics import get_rolling_metrics
+                    get_rolling_metrics().record_rate_limit(_self_worker)
                     return JSONResponse(
                         status_code=429,
                         content={"error": {

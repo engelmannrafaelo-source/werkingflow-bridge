@@ -364,20 +364,6 @@ class RateLimitTracker:
 rate_limit_tracker = RateLimitTracker()
 
 
-_QUOTA_EXHAUSTION_RE = None
-
-def detect_quota_exhaustion(content_text: str) -> bool:
-    """Return True if response text signals Anthropic quota exhaustion (not covered by rate_limit_tracker)."""
-    import re as _re
-    global _QUOTA_EXHAUSTION_RE
-    if _QUOTA_EXHAUSTION_RE is None:
-        _QUOTA_EXHAUSTION_RE = _re.compile(
-            r"out of extra usage|ran out of context|resets \d+:\d+ ?(am|pm)",
-            _re.IGNORECASE,
-        )
-    return bool(_QUOTA_EXHAUSTION_RE.search(content_text))
-
-
 class ClaudeCodeCLI:
     def __init__(self, timeout: int = 1200000, cwd: Optional[str] = None):
         self.timeout = timeout / 1000  # Convert ms to seconds
