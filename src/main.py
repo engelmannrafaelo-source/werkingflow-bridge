@@ -737,6 +737,10 @@ async def rate_limit_handler(request: Request, exc: RateLimitError):
         }
     )
 
+    from src.middleware.rolling_metrics import get_rolling_metrics
+    get_rolling_metrics().record_rate_limit(worker_id)
+    logger.info(f"📊 Recorded 429 for adaptive limiter feedback (worker={worker_id})")
+
     return JSONResponse(
         status_code=429,
         content={
@@ -2065,6 +2069,17 @@ async def chat_completions(
                             "retry_after_s": _retry_after,
                         }},
                         headers={"Retry-After": str(_retry_after)}
+                    )
+
+                # Quota-content detection: phrases that arrive as response text, not API errors.
+                from src.claude_cli import detect_quota_exhaustion as _dqe
+                if _dqe(raw_assistant_content):
+                    logger.warning(
+                        f"🚫 Quota-exhaustion phrase in response from {_self_worker} "
+                        f"— raising RateLimitError so adaptive limiter is notified"
+                    )
+                    raise RateLimitError(
+                        f"[Bridge {_self_worker}] Quota exhaustion detected in response content"
                     )
 
             if not raw_assistant_content:

@@ -130,6 +130,22 @@ class RateLimitError(Exception):
         return 3600  # Default 1 hour
 
 
+import re as _re
+_QUOTA_EXHAUSTION_RE = _re.compile(
+    r'out of extra usage|ran out of context|resets\s+\d+:\d+\s*(?:am|pm)',
+    _re.IGNORECASE
+)
+
+
+def detect_quota_exhaustion(content_text: str) -> bool:
+    """Return True if response content signals account quota is exhausted.
+
+    Catches Claude's inline quota messages that arrive as response text
+    rather than API errors (e.g. weekly-cap reached, context exhausted).
+    """
+    return bool(_QUOTA_EXHAUSTION_RE.search(content_text))
+
+
 class RateLimitTracker:
     """Tracks rate limit status per worker instance with soft routing.
 
@@ -346,6 +362,20 @@ class RateLimitTracker:
 
 # Global rate limit tracker instance
 rate_limit_tracker = RateLimitTracker()
+
+
+_QUOTA_EXHAUSTION_RE = None
+
+def detect_quota_exhaustion(content_text: str) -> bool:
+    """Return True if response text signals Anthropic quota exhaustion (not covered by rate_limit_tracker)."""
+    import re as _re
+    global _QUOTA_EXHAUSTION_RE
+    if _QUOTA_EXHAUSTION_RE is None:
+        _QUOTA_EXHAUSTION_RE = _re.compile(
+            r"out of extra usage|ran out of context|resets \d+:\d+ ?(am|pm)",
+            _re.IGNORECASE,
+        )
+    return bool(_QUOTA_EXHAUSTION_RE.search(content_text))
 
 
 class ClaudeCodeCLI:
