@@ -4542,7 +4542,9 @@ async def get_account_pool_state():
     from src.middleware.adaptive_limiter import (
         SAFETY_MARGIN_PCT,
         SHRINK_TRIGGER_SEC,
+        WEEKLY_PREDICTIVE_THROTTLE_ENABLED,
         _WORKER_ACCOUNT_MAP,
+        _weekly_budget_multiplier,
     )
     lim = get_adaptive_limiter()
     lim._refresh_account_usage()
@@ -4618,6 +4620,9 @@ async def get_account_pool_state():
 
     account_name = _WORKER_ACCOUNT_MAP.get(worker_id, worker_id)
 
+    budget_multiplier = _weekly_budget_multiplier(weekly_pct, session_pct)
+    effective_cap_tokens = int(safety_cap * budget_multiplier)
+
     return {
         "ts": int(now),
         "worker": worker_id,
@@ -4628,6 +4633,9 @@ async def get_account_pool_state():
         "current_in_flight_tokens": inflight,
         "headroom_tokens": headroom,
         "headroom_percent": headroom_pct,
+        "predictive_throttle_enabled": WEEKLY_PREDICTIVE_THROTTLE_ENABLED,
+        "budget_multiplier": round(budget_multiplier, 3),
+        "effective_cap_tokens": effective_cap_tokens,
         "last_rate_limit_ts": merged_last_rate_limit_ts,
         "cooldown_remaining_s": cooldown_remaining_s,
         "available": session_pct < 95.0 and headroom > 0 and not tracker_is_limited,
