@@ -1,19 +1,31 @@
 -- pool_router.lua — Bridge nginx account-aware pool router
 --
--- PHASE C (LIVE): choose() is called from access_by_lua_block in /v1/(chat/completions|research).
--- Distributes load across all eligible Anthropic accounts (token-budget aware).
+-- PHASE D (LIVE): choose() is called from access_by_lua_block in /v1/(chat/completions|research).
+-- Distributes load across all eligible Anthropic accounts proportional to the
+-- capacity their per-worker auto-tuner has converged to (cap_tokens × safety
+-- × predictive_multiplier − current_in_flight). Every account participates;
+-- the auto-tuned values do all the balancing.
+--
 -- Sets ngx.var.target_worker to one of: worker1, worker2, worker3, worker4, unavailable
--- Sets ngx.var.x_pool_decision to: highest_headroom | round_robin_fallback | all_unavail
+-- Sets ngx.var.x_pool_decision to: weighted_capacity | round_robin_fallback | all_unavail
 --
 -- Decision logic:
 --   1. Refresh timer reads /v1/metrics/account-pool-state every 2s
 --   2. Per request: estimates input tokens from request_length
---   3. Eligible = available AND session<95% AND cooldown=0 AND headroom>est_tokens
---   4. Pick eligible account with HIGHEST headroom_percent → pool_decision=highest_headroom
+--   3. Eligible = available AND cooldown=0 AND (effective_cap − in_flight) > est_tokens
+--   4. Pick weighted-random by (effective_cap_tokens − current_in_flight_tokens)
+--      → pool_decision=weighted_capacity
 --   5. State stale (>10s) OR fetch/decode error → round-robin across all 4 workers
 --      → pool_decision=round_robin_fallback
 --   6. Zero eligible → bogus peer → triggers @bridge_full 429 envelope
 --      → pool_decision=all_unavail
+--
+-- Why weighted by effective_cap_tokens, not by headroom_percent:
+--   The per-worker AdaptiveLoadLimiter already learns each account's true
+--   capacity (cap_tokens shrinks on rate-limit-hits, grows on sustained
+--   utilization). The predictive throttle reduces effective_cap as weekly_pct
+--   approaches the wall. Using (eff_cap − in_flight) as routing weight lets
+--   the auto-tuner do the work — no hardcoded bias constants in the router.
 
 local cjson = require "cjson.safe"
 local http  = require "resty.http"
@@ -166,73 +178,47 @@ end
 -- Eligible = available AND session_percent<95 AND cooldown=0 AND
 --            headroom_tokens > est_tokens
 -- ---------------------------------------------------------------------------
-local NEAR_TIE_PP = 5  -- accounts within 5pp of max headroom are treated as tied
-
--- Read this worker's decision counter from shared dict. 0 if never routed yet,
--- which naturally promotes a fresh worker to first pick.
-local function _decision_count_for_worker(worker_name)
-    for i, w in ipairs(WORKER_NAMES) do
-        if w == worker_name then
-            return tonumber(shared:get("rr_worker_count_" .. i)) or 0
-        end
-    end
-    return 0
-end
-
-local function pick_best_account(accounts, est_tokens)
-    local eligible = {}
-    local max_pct  = -1
+-- Weighted-capacity picker
+--
+-- Returns picked_name, picked_weight, total_weight (all nil/-1/-1 when none eligible).
+-- Weight = effective_cap_tokens − current_in_flight_tokens (= live admit headroom).
+-- Weighted-random pick distributes load proportional to remaining capacity per
+-- account. As an account approaches its wall, its predictive_multiplier shrinks
+-- effective_cap; as in_flight rises, the residual shrinks too — so heavy
+-- accounts fade out automatically without explicit deprioritisation.
+local function pick_weighted_account(accounts, est_tokens)
+    local eligible    = {}
+    local total       = 0
+    local min_required = est_tokens or 0
 
     for name, info in pairs(accounts) do
-        local session_pct  = tonumber(info.session_percent) or 100
-        local cooldown     = tonumber(info.cooldown_remaining_s) or 0
-        local headroom_tok = tonumber(info.headroom_tokens) or 0
-        local headroom_pct = tonumber(info.headroom_percent) or 0
-        local available    = info.available
-        if available and session_pct < 95 and cooldown == 0
-                and headroom_tok > (est_tokens or 0) then
-            local in_flight = tonumber(info.current_in_flight_tokens) or 0
-            local worker    = ACCOUNT_WORKER[name] or ""
-            local decisions = _decision_count_for_worker(worker)
-            eligible[#eligible + 1] = {
-                name      = name,
-                pct       = headroom_pct,
-                in_flight = in_flight,
-                decisions = decisions,
-            }
-            if headroom_pct > max_pct then
-                max_pct = headroom_pct
-            end
+        local available  = info.available
+        local cooldown   = tonumber(info.cooldown_remaining_s) or 0
+        local eff_cap    = tonumber(info.effective_cap_tokens) or 0
+        local in_flight  = tonumber(info.current_in_flight_tokens) or 0
+        local capacity   = eff_cap - in_flight
+        if available and cooldown == 0 and capacity > min_required then
+            eligible[#eligible + 1] = { name = name, weight = capacity }
+            total = total + capacity
         end
     end
 
-    if #eligible == 0 then
-        return nil, -1, nil
+    if #eligible == 0 or total <= 0 then
+        return nil, -1, -1
     end
 
-    -- Collect near-max candidates (within NEAR_TIE_PP of the best headroom)
-    local near_max = {}
+    -- Weighted random: r ∈ [0, total) → cumulative-sum walk
+    local r   = math.random() * total
+    local acc = 0
     for _, e in ipairs(eligible) do
-        if e.pct >= max_pct - NEAR_TIE_PP then
-            near_max[#near_max + 1] = e
+        acc = acc + e.weight
+        if r <= acc then
+            return e.name, e.weight, total
         end
     end
-
-    -- Three-stage comparator: lowest in_flight; then highest pct; then lowest decisions.
-    local function better_than(c, b)
-        if c.in_flight ~= b.in_flight then return c.in_flight < b.in_flight end
-        if c.pct       ~= b.pct       then return c.pct       > b.pct       end
-        return c.decisions < b.decisions
-    end
-
-    local best = near_max[1]
-    for i = 2, #near_max do
-        if better_than(near_max[i], best) then
-            best = near_max[i]
-        end
-    end
-
-    return best.name, best.pct, best.in_flight
+    -- Floating-point safety: fall through to last
+    local last = eligible[#eligible]
+    return last.name, last.weight, total
 end
 
 -- ---------------------------------------------------------------------------
@@ -241,6 +227,11 @@ end
 local M = {}
 
 function M.init()
+    -- Seed math.random per nginx worker process — without this, every worker
+    -- starts with the same default sequence and weighted-random pick clusters.
+    -- ngx.worker.id() distinguishes processes; ngx.now() adds time entropy.
+    math.randomseed(math.floor((ngx.now() * 1000) + (ngx.worker.id() or 0) * 1000003))
+
     -- Initial fetch (best-effort, non-blocking)
     local ok, err = ngx.timer.at(0, function(premature)
         if premature then return end
@@ -318,7 +309,7 @@ function M.choose()
     local req_len    = tonumber(ngx.var.request_length) or 1000
     local est_tokens = math.max(500, math.floor(req_len / 4))
 
-    local picked, picked_pct, picked_in_flight = pick_best_account(data.accounts, est_tokens)
+    local picked, picked_weight, total_weight = pick_weighted_account(data.accounts, est_tokens)
 
     if not picked then
         -- All accounts exhausted → bogus upstream → @bridge_full emits 429
@@ -331,15 +322,18 @@ function M.choose()
         return
     end
 
-    -- Route: highest headroom within near-tie window, tie-broken by lowest in_flight
+    -- Route: weighted-random by (effective_cap − in_flight) per account
     local worker = ACCOUNT_WORKER[picked] or "worker1"
     count_decision(worker)
     ngx.var.target_worker   = worker
-    ngx.var.x_pool_decision = "highest_headroom"
+    ngx.var.x_pool_decision = "weighted_capacity"
+    local share_pct = (total_weight > 0) and (picked_weight * 100.0 / total_weight) or 0
     ngx.log(ngx.INFO, "pool_router.choose: routed_to=", worker,
-            " reason=highest_headroom_", string.format("%.0f", picked_pct), "pct",
+            " reason=weighted_capacity",
             " account=", picked,
-            " in_flight=", picked_in_flight,
+            " weight=", picked_weight,
+            " share_pct=", string.format("%.1f", share_pct),
+            " total_weight=", total_weight,
             " est_tokens=", est_tokens,
             " state_age_s=", string.format("%.1f", age))
 end
