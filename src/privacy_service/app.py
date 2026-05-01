@@ -868,6 +868,249 @@ async def convert_semantic_html_endpoint(req: ConvertSemanticHtmlRequest):
     )
 
 
+@app.post("/convert-html-to-docx")
+async def convert_html_to_docx_endpoint(request: Request):
+    """Convert HTML → DOCX via ConvertAPI Microsoft Word 15 engine.
+
+    Accepts JSON body: { "html": "<html>…</html>", "filename": "input.html" (optional) }.
+    Returns DOCX as base64 string + raw byte length + ConvertAPI cost (seconds).
+
+    Centralizing the ConvertAPI call here means apps no longer need their own
+    CONVERTAPI_SECRET — only this service does.
+    """
+    import httpx
+
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse(
+            status_code=400,
+            content={"status": "error", "error": "Invalid JSON body."},
+        )
+
+    html = body.get("html")
+    if not isinstance(html, str) or not html.strip():
+        return JSONResponse(
+            status_code=400,
+            content={"status": "error", "error": "Missing or empty 'html' field."},
+        )
+
+    filename = body.get("filename") or "input.html"
+    if not isinstance(filename, str):
+        filename = "input.html"
+
+    MAX_HTML_BYTES = 50 * 1024 * 1024  # 50 MB
+    html_bytes = html.encode("utf-8")
+    if len(html_bytes) > MAX_HTML_BYTES:
+        return JSONResponse(
+            status_code=400,
+            content={"status": "error", "error": f"HTML too large: {len(html_bytes) / 1024 / 1024:.1f} MB. Maximum: 50 MB."},
+        )
+
+    convert_api_secret = os.getenv("CONVERTAPI_SECRET")
+    if not convert_api_secret:
+        return JSONResponse(
+            status_code=500,
+            content={"status": "error", "error": "CONVERTAPI_SECRET not configured on privacy-pdf-service."},
+        )
+
+    logger.info(f"[HTML→DOCX] Starting conversion ({len(html_bytes) / 1024:.1f} KB)")
+    t_start = _time.time()
+
+    try:
+        async with httpx.AsyncClient(timeout=300.0) as client:
+            resp = await client.post(
+                "https://v2.convertapi.com/convert/html/to/docx",
+                headers={"Authorization": f"Bearer {convert_api_secret}"},
+                files={"File": (filename, html_bytes, "text/html")},
+                data={"StoreFile": "true"},
+            )
+
+        if resp.status_code != 200:
+            logger.error(f"[HTML→DOCX] ConvertAPI error {resp.status_code}: {resp.text[:500]}")
+            return JSONResponse(
+                status_code=502,
+                content={"status": "error", "error": f"ConvertAPI failed with status {resp.status_code}: {resp.text[:200]}"},
+            )
+
+        result = resp.json()
+        cost = float(result.get("ConversionCost", 0))
+        files_arr = result.get("Files", [])
+        if not files_arr:
+            return JSONResponse(
+                status_code=502,
+                content={"status": "error", "error": "ConvertAPI returned no DOCX files."},
+            )
+
+        file_entry = files_arr[0]
+        if file_entry.get("FileData"):
+            docx_bytes = base64.b64decode(file_entry["FileData"])
+        elif file_entry.get("Url"):
+            async with httpx.AsyncClient(timeout=120.0) as client:
+                docx_resp = await client.get(file_entry["Url"])
+            if docx_resp.status_code != 200:
+                return JSONResponse(
+                    status_code=502,
+                    content={"status": "error", "error": f"DOCX download failed: {docx_resp.status_code}"},
+                )
+            docx_bytes = docx_resp.content
+        else:
+            return JSONResponse(
+                status_code=502,
+                content={"status": "error", "error": "ConvertAPI response has neither Url nor FileData."},
+            )
+
+    except httpx.TimeoutException:
+        return JSONResponse(
+            status_code=502,
+            content={"status": "error", "error": "ConvertAPI request timed out."},
+        )
+    except Exception as e:
+        logger.error(f"[HTML→DOCX] ConvertAPI call failed: {e}", exc_info=True)
+        return JSONResponse(
+            status_code=502,
+            content={"status": "error", "error": f"ConvertAPI call failed: {str(e)}"},
+        )
+
+    duration = _time.time() - t_start
+    logger.info(f"[HTML→DOCX] Done: {len(docx_bytes)} bytes DOCX in {duration:.1f}s, cost={cost}s")
+
+    return JSONResponse(content={
+        "status": "success",
+        "docx_base64": base64.b64encode(docx_bytes).decode("ascii"),
+        "size_bytes": len(docx_bytes),
+        "cost": cost,
+    })
+
+
+@app.post("/convert-pdf-to-html-direct")
+async def convert_pdf_to_html_direct_endpoint(request: Request):
+    """Convert PDF → HTML (pixel-perfect, direct) via ConvertAPI.
+
+    Accepts JSON body: { "pdf_base64": "<base64-encoded PDF>", "filename": "input.pdf" (optional) }.
+    Returns the raw HTML (with absolute positioning + per-character spans + inline base64 images)
+    plus ConvertAPI cost (seconds).
+
+    This is the raw pixel-positioned conversion. For semantic flexbox HTML use
+    /convert-pdf-to-semantic-html (chains direct PDF→HTML + AI restructure).
+    """
+    import httpx
+
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse(
+            status_code=400,
+            content={"status": "error", "error": "Invalid JSON body."},
+        )
+
+    pdf_b64 = body.get("pdf_base64")
+    if not isinstance(pdf_b64, str) or not pdf_b64.strip():
+        return JSONResponse(
+            status_code=400,
+            content={"status": "error", "error": "Missing or empty 'pdf_base64' field."},
+        )
+
+    filename = body.get("filename") or "input.pdf"
+    if not isinstance(filename, str):
+        filename = "input.pdf"
+
+    try:
+        pdf_bytes = base64.b64decode(pdf_b64, validate=True)
+    except Exception:
+        return JSONResponse(
+            status_code=400,
+            content={"status": "error", "error": "Invalid base64 in 'pdf_base64'."},
+        )
+
+    MAX_PDF_BYTES = 50 * 1024 * 1024  # 50 MB
+    if len(pdf_bytes) > MAX_PDF_BYTES:
+        return JSONResponse(
+            status_code=400,
+            content={"status": "error", "error": f"PDF too large: {len(pdf_bytes) / 1024 / 1024:.1f} MB. Maximum: 50 MB."},
+        )
+
+    convert_api_secret = os.getenv("CONVERTAPI_SECRET")
+    if not convert_api_secret:
+        return JSONResponse(
+            status_code=500,
+            content={"status": "error", "error": "CONVERTAPI_SECRET not configured on privacy-pdf-service."},
+        )
+
+    logger.info(f"[PDF→HTML] Starting conversion ({len(pdf_bytes) / 1024:.1f} KB)")
+    t_start = _time.time()
+
+    try:
+        async with httpx.AsyncClient(timeout=300.0) as client:
+            resp = await client.post(
+                "https://v2.convertapi.com/convert/pdf/to/html",
+                headers={"Authorization": f"Bearer {convert_api_secret}"},
+                files={"File": (filename, pdf_bytes, "application/pdf")},
+                data={"StoreFile": "true"},
+            )
+
+        if resp.status_code != 200:
+            logger.error(f"[PDF→HTML] ConvertAPI error {resp.status_code}: {resp.text[:500]}")
+            return JSONResponse(
+                status_code=502,
+                content={"status": "error", "error": f"ConvertAPI failed with status {resp.status_code}: {resp.text[:200]}"},
+            )
+
+        result = resp.json()
+        cost = float(result.get("ConversionCost", 0))
+        files_arr = result.get("Files", [])
+        if not files_arr:
+            return JSONResponse(
+                status_code=502,
+                content={"status": "error", "error": "ConvertAPI returned no HTML files."},
+            )
+
+        html_entry = next(
+            (f for f in files_arr if f.get("FileName", "").lower().endswith((".html", ".htm"))),
+            files_arr[0],
+        )
+
+        if html_entry.get("FileData"):
+            html_bytes = base64.b64decode(html_entry["FileData"])
+        elif html_entry.get("Url"):
+            async with httpx.AsyncClient(timeout=120.0) as client:
+                html_resp = await client.get(html_entry["Url"])
+            if html_resp.status_code != 200:
+                return JSONResponse(
+                    status_code=502,
+                    content={"status": "error", "error": f"HTML download failed: {html_resp.status_code}"},
+                )
+            html_bytes = html_resp.content
+        else:
+            return JSONResponse(
+                status_code=502,
+                content={"status": "error", "error": "ConvertAPI response has neither Url nor FileData."},
+            )
+
+        html_str = html_bytes.decode("utf-8", errors="replace")
+
+    except httpx.TimeoutException:
+        return JSONResponse(
+            status_code=502,
+            content={"status": "error", "error": "ConvertAPI request timed out."},
+        )
+    except Exception as e:
+        logger.error(f"[PDF→HTML] ConvertAPI call failed: {e}", exc_info=True)
+        return JSONResponse(
+            status_code=502,
+            content={"status": "error", "error": f"ConvertAPI call failed: {str(e)}"},
+        )
+
+    duration = _time.time() - t_start
+    logger.info(f"[PDF→HTML] Done: {len(html_str)} chars HTML in {duration:.1f}s, cost={cost}s")
+
+    return JSONResponse(content={
+        "status": "success",
+        "html": html_str,
+        "cost": cost,
+    })
+
+
 # ======================== Health & Status ========================
 
 @app.get("/health")

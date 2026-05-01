@@ -3581,6 +3581,76 @@ async def convert_pdf_to_semantic_html_endpoint(
         )
 
 
+@app.post("/v1/convert-html-to-docx")
+async def convert_html_to_docx_endpoint(
+    request: Request,
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(security)
+):
+    """Convert HTML to DOCX via ConvertAPI. Proxied to privacy-pdf-service."""
+    await verify_api_key(request, credentials)
+
+    try:
+        body = await request.json()
+        if not isinstance(body, dict) or not body.get("html"):
+            return JSONResponse(
+                status_code=400,
+                content={"status": "error", "error": "Request body must be JSON with 'html' field."}
+            )
+
+        privacy_client = get_privacy_client()
+        client = await privacy_client._get_client()
+
+        response = await client.post(
+            "/convert-html-to-docx",
+            json=body,
+            timeout=600.0,
+        )
+        response.raise_for_status()
+        return JSONResponse(content=response.json())
+
+    except Exception as e:
+        logger.error(f"HTML-to-DOCX proxy failed: {e}", exc_info=True)
+        return JSONResponse(
+            status_code=500,
+            content={"status": "error", "error": f"HTML-to-DOCX conversion failed: {str(e)}"}
+        )
+
+
+@app.post("/v1/convert-pdf-to-html-direct")
+async def convert_pdf_to_html_direct_endpoint(
+    request: Request,
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(security)
+):
+    """Convert PDF to pixel-perfect HTML via ConvertAPI. Proxied to privacy-pdf-service."""
+    await verify_api_key(request, credentials)
+
+    try:
+        body = await request.json()
+        if not isinstance(body, dict) or not body.get("pdf_base64"):
+            return JSONResponse(
+                status_code=400,
+                content={"status": "error", "error": "Request body must be JSON with 'pdf_base64' field."}
+            )
+
+        privacy_client = get_privacy_client()
+        client = await privacy_client._get_client()
+
+        response = await client.post(
+            "/convert-pdf-to-html-direct",
+            json=body,
+            timeout=600.0,
+        )
+        response.raise_for_status()
+        return JSONResponse(content=response.json())
+
+    except Exception as e:
+        logger.error(f"PDF-to-HTML-direct proxy failed: {e}", exc_info=True)
+        return JSONResponse(
+            status_code=500,
+            content={"status": "error", "error": f"PDF-to-HTML-direct conversion failed: {str(e)}"}
+        )
+
+
 # ============================================================================
 # Universal Document Conversion — proxied to privacy-pdf-service
 # Routes any supported document type (PDF/DOCX/PPTX/XLSX/CSV/HTML/MSG/EML/image)
