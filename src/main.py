@@ -1034,125 +1034,140 @@ async def generate_streaming_response(
 
         metadata_chunk = None  # Store file metadata for end of stream
 
-        async for chunk in claude_cli.run_completion(
-            prompt=prompt,
-            system_prompt=system_prompt,
-            model=claude_options.get('model'),
-            max_turns=claude_options.get('max_turns', 10),
-            allowed_tools=claude_options.get('allowed_tools'),
-            disallowed_tools=claude_options.get('disallowed_tools'),
-            stream=True,
-            enable_file_discovery=claude_options.get('enable_file_discovery', False),
-            backend_env_vars=backend_config.env_vars if backend_config else None
-        ):
-            # Capture metadata chunk (don't stream it in SSE)
-            if isinstance(chunk, dict) and chunk.get("type") == "x_claude_metadata":
-                metadata_chunk = chunk
-                logger.info("📦 Captured file metadata from CLI (will send at end of stream)")
-                continue  # Don't add to chunks_buffer, don't stream
+        # Phase 1 of streaming-truthfulness fix: catch mid-stream SDK crashes
+        # (e.g. claude_code_sdk Command-failed exit-1 from compaction events)
+        # so the client sees an explicit error event instead of the previous
+        # fake finish_reason="stop" that hid truncation. Phase 2 will add
+        # buffer-and-replay with internal retry so most crashes never surface.
+        sdk_stream_error: Optional[Exception] = None
 
-            # On first chunk, get the CLI session for disconnect monitoring
-            if not cli_session_for_disconnect:
-                from src.cli_session_manager import cli_session_manager
-                cli_sessions = cli_session_manager.list_sessions(status_filter="running")
-                if cli_sessions:
-                    # Get the most recent running session (just created by claude_cli.run_completion)
-                    cli_session_for_disconnect = cli_sessions[-1]
-                    logger.info(f"🔗 Monitoring CLI session {cli_session_for_disconnect['cli_session_id']} for client disconnect")
+        try:
+            async for chunk in claude_cli.run_completion(
+                prompt=prompt,
+                system_prompt=system_prompt,
+                model=claude_options.get('model'),
+                max_turns=claude_options.get('max_turns', 10),
+                allowed_tools=claude_options.get('allowed_tools'),
+                disallowed_tools=claude_options.get('disallowed_tools'),
+                stream=True,
+                enable_file_discovery=claude_options.get('enable_file_discovery', False),
+                backend_env_vars=backend_config.env_vars if backend_config else None
+            ):
+                # Capture metadata chunk (don't stream it in SSE)
+                if isinstance(chunk, dict) and chunk.get("type") == "x_claude_metadata":
+                    metadata_chunk = chunk
+                    logger.info("📦 Captured file metadata from CLI (will send at end of stream)")
+                    continue  # Don't add to chunks_buffer, don't stream
 
-                    # SIGNAL: Streaming has started, monitor can now check disconnects
-                    streaming_started.set()
-                    logger.debug(f"✅ Streaming started signal sent, CLI session: {cli_session_for_disconnect['cli_session_id']}")
+                # On first chunk, get the CLI session for disconnect monitoring
+                if not cli_session_for_disconnect:
+                    from src.cli_session_manager import cli_session_manager
+                    cli_sessions = cli_session_manager.list_sessions(status_filter="running")
+                    if cli_sessions:
+                        # Get the most recent running session (just created by claude_cli.run_completion)
+                        cli_session_for_disconnect = cli_sessions[-1]
+                        logger.info(f"🔗 Monitoring CLI session {cli_session_for_disconnect['cli_session_id']} for client disconnect")
 
-            chunks_buffer.append(chunk)
+                        # SIGNAL: Streaming has started, monitor can now check disconnects
+                        streaming_started.set()
+                        logger.debug(f"✅ Streaming started signal sent, CLI session: {cli_session_for_disconnect['cli_session_id']}")
 
-            # Check if we have an assistant message
-            # Handle both old format (type/message structure) and new format (direct content)
-            content = None
-            if chunk.get("type") == "assistant" and "message" in chunk:
-                # Old format: {"type": "assistant", "message": {"content": [...]}}
-                message = chunk["message"]
-                if isinstance(message, dict) and "content" in message:
-                    content = message["content"]
-            elif "content" in chunk and isinstance(chunk["content"], list):
-                # New format: {"content": [TextBlock(...)]}  (converted AssistantMessage)
-                content = chunk["content"]
+                chunks_buffer.append(chunk)
+
+                # Check if we have an assistant message
+                # Handle both old format (type/message structure) and new format (direct content)
+                content = None
+                if chunk.get("type") == "assistant" and "message" in chunk:
+                    # Old format: {"type": "assistant", "message": {"content": [...]}}
+                    message = chunk["message"]
+                    if isinstance(message, dict) and "content" in message:
+                        content = message["content"]
+                elif "content" in chunk and isinstance(chunk["content"], list):
+                    # New format: {"content": [TextBlock(...)]}  (converted AssistantMessage)
+                    content = chunk["content"]
             
-            if content is not None:
-                # Send initial role chunk if we haven't already
-                if not role_sent:
-                    initial_chunk = ChatCompletionStreamResponse(
-                        id=request_id,
-                        model=request.model,
-                        choices=[StreamChoice(
-                            index=0,
-                            delta={"role": "assistant", "content": ""},
-                            finish_reason=None
-                        )]
-                    )
-                    yield f"data: {initial_chunk.model_dump_json()}\n\n"
-                    role_sent = True
+                if content is not None:
+                    # Send initial role chunk if we haven't already
+                    if not role_sent:
+                        initial_chunk = ChatCompletionStreamResponse(
+                            id=request_id,
+                            model=request.model,
+                            choices=[StreamChoice(
+                                index=0,
+                                delta={"role": "assistant", "content": ""},
+                                finish_reason=None
+                            )]
+                        )
+                        yield f"data: {initial_chunk.model_dump_json()}\n\n"
+                        role_sent = True
                 
-                # Handle content blocks
-                if isinstance(content, list):
-                    for block in content:
-                        # Handle TextBlock objects from Claude Code SDK
-                        if hasattr(block, 'text'):
-                            raw_text = block.text
-                        # Handle dictionary format for backward compatibility
-                        elif isinstance(block, dict) and block.get("type") == "text":
-                            raw_text = block.get("text", "")
-                        else:
-                            continue
+                    # Handle content blocks
+                    if isinstance(content, list):
+                        for block in content:
+                            # Handle TextBlock objects from Claude Code SDK
+                            if hasattr(block, 'text'):
+                                raw_text = block.text
+                            # Handle dictionary format for backward compatibility
+                            elif isinstance(block, dict) and block.get("type") == "text":
+                                raw_text = block.get("text", "")
+                            else:
+                                continue
                             
+                            # Filter out tool usage and thinking blocks
+                            filtered_text = MessageAdapter.filter_content(raw_text)
+
+                            # Privacy: De-anonymize chunk with buffering (handles split placeholders)
+                            if anonymization_mapping and filtered_text:
+                                filtered_text, deanon_buffer = privacy_client.deanonymize_streaming_chunk(
+                                    filtered_text, deanon_buffer, anonymization_mapping
+                                )
+
+                            if filtered_text and not filtered_text.isspace():
+                                # Create streaming chunk
+                                stream_chunk = ChatCompletionStreamResponse(
+                                    id=request_id,
+                                    model=request.model,
+                                    choices=[StreamChoice(
+                                        index=0,
+                                        delta={"content": filtered_text},
+                                        finish_reason=None
+                                    )]
+                                )
+                            
+                                yield f"data: {stream_chunk.model_dump_json()}\n\n"
+                                content_sent = True
+                
+                    elif isinstance(content, str):
                         # Filter out tool usage and thinking blocks
-                        filtered_text = MessageAdapter.filter_content(raw_text)
+                        filtered_content = MessageAdapter.filter_content(content)
 
                         # Privacy: De-anonymize chunk with buffering (handles split placeholders)
-                        if anonymization_mapping and filtered_text:
-                            filtered_text, deanon_buffer = privacy_client.deanonymize_streaming_chunk(
-                                filtered_text, deanon_buffer, anonymization_mapping
+                        if anonymization_mapping and filtered_content:
+                            filtered_content, deanon_buffer = privacy_client.deanonymize_streaming_chunk(
+                                filtered_content, deanon_buffer, anonymization_mapping
                             )
 
-                        if filtered_text and not filtered_text.isspace():
+                        if filtered_content and not filtered_content.isspace():
                             # Create streaming chunk
                             stream_chunk = ChatCompletionStreamResponse(
                                 id=request_id,
                                 model=request.model,
                                 choices=[StreamChoice(
                                     index=0,
-                                    delta={"content": filtered_text},
+                                    delta={"content": filtered_content},
                                     finish_reason=None
                                 )]
                             )
-                            
+                        
                             yield f"data: {stream_chunk.model_dump_json()}\n\n"
                             content_sent = True
-                
-                elif isinstance(content, str):
-                    # Filter out tool usage and thinking blocks
-                    filtered_content = MessageAdapter.filter_content(content)
+        except Exception as e:
+            sdk_stream_error = e
+            logger.error(
+                f"❌ Streaming SDK crash mid-stream: {type(e).__name__}: {e}",
+                exc_info=True,
+            )
 
-                    # Privacy: De-anonymize chunk with buffering (handles split placeholders)
-                    if anonymization_mapping and filtered_content:
-                        filtered_content, deanon_buffer = privacy_client.deanonymize_streaming_chunk(
-                            filtered_content, deanon_buffer, anonymization_mapping
-                        )
-
-                    if filtered_content and not filtered_content.isspace():
-                        # Create streaming chunk
-                        stream_chunk = ChatCompletionStreamResponse(
-                            id=request_id,
-                            model=request.model,
-                            choices=[StreamChoice(
-                                index=0,
-                                delta={"content": filtered_content},
-                                finish_reason=None
-                            )]
-                        )
-                        
-                        yield f"data: {stream_chunk.model_dump_json()}\n\n"
-                        content_sent = True
 
         # Flush any remaining de-anonymization buffer at end of stream
         if anonymization_mapping and deanon_buffer:
@@ -1205,17 +1220,35 @@ async def generate_streaming_response(
                 assistant_message = Message(role="assistant", content=assistant_content)
                 session_manager.add_assistant_response(actual_session_id, assistant_message)
         
-        # Send final chunk with finish reason
-        final_chunk = ChatCompletionStreamResponse(
-            id=request_id,
-            model=request.model,
-            choices=[StreamChoice(
-                index=0,
-                delta={},
-                finish_reason="stop"
-            )]
-        )
-        yield f"data: {final_chunk.model_dump_json()}\n\n"
+        # Send final chunk. On SDK crash: emit an explicit SSE `event: error`
+        # envelope and skip the [DONE] sentinel — OpenAI-compatible clients
+        # see the error event + missing [DONE] as failure signal instead of
+        # misreading a half-truncated stream as complete.
+        if sdk_stream_error is None:
+            final_chunk = ChatCompletionStreamResponse(
+                id=request_id,
+                model=request.model,
+                choices=[StreamChoice(
+                    index=0,
+                    delta={},
+                    finish_reason="stop"
+                )]
+            )
+            yield f"data: {final_chunk.model_dump_json()}\n\n"
+        else:
+            err_type = type(sdk_stream_error).__name__
+            err_msg  = str(sdk_stream_error)[:300]
+            error_payload = {
+                "error": {
+                    "message": f"[Bridge] SDK stream interrupted: {err_type}: {err_msg}",
+                    "type": "sdk_stream_failure",
+                    "code": "sdk_crash",
+                    "source": "bridge_internal",
+                    "retryable": True,
+                }
+            }
+            yield f"event: error\ndata: {json.dumps(error_payload)}\n\n"
+            # Skip [DONE] sentinel below — return early after metadata.
 
         # Send file metadata as separate SSE event (if available)
         if metadata_chunk:
@@ -1246,7 +1279,10 @@ async def generate_streaming_response(
             yield f"event: x_claude_metadata\n"
             yield f"data: {json.dumps(metadata_event)}\n\n"
 
-        yield "data: [DONE]\n\n"
+        # [DONE] sentinel only on clean completion — its absence is the
+        # "stream did not finish successfully" signal for the client.
+        if sdk_stream_error is None:
+            yield "data: [DONE]\n\n"
 
         # =====================================================================
         # USAGE TRACKING for streaming (estimated tokens)
