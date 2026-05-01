@@ -1,17 +1,20 @@
 #!/usr/bin/env python3
 """
-Auto-refresh model registry from Anthropic /v1/models endpoint.
+Detect new Claude models from Anthropic /v1/models endpoint.
 
-Pulls the live model list from Anthropic, compares with the registry, and
-adds any new models. Newest model in each family becomes the default
-(via dynamic _compute_family_defaults()).
+Pulls the live model list, compares with the registry, and prints new
+models so Rafael can review + commit + deploy manually. Does NOT auto-add
+or auto-rebuild — every model promotion is a human decision.
 
-Idempotent: safe to run repeatedly. Only modifies registry when changes detected.
+History: this script was originally cron'd daily with --rebuild and
+silent-reverted commit b548e13 (Sonnet 4.6 rollback) on 2026-05-01 by
+re-adding the blacklisted model. The --rebuild path is removed; auto-add
+respects BLACKLIST.
 
 Usage:
-    python3 refresh_model_registry.py [--dry-run] [--rebuild]
+    python3 refresh_model_registry.py [--dry-run]
 """
-import argparse, os, re, subprocess, sys, urllib.request, json
+import argparse, os, re, sys, urllib.request, json
 from datetime import datetime, date
 from pathlib import Path
 
@@ -21,6 +24,14 @@ TOKEN_PATHS = [
     '/root/werkingflow-bridge/secrets/claude_token_account1.txt',
     '/root/werkingflow-bridge/secrets/claude_token.txt',
 ]
+
+# Models known to have regressions; never auto-added even when Anthropic
+# advertises them. Document the reason next to each entry.
+BLACKLIST: dict[str, str] = {
+    # 19x error-rate, 4.8x token use, instruction-following regression
+    # (Anthropic GH #46935). Rolled back in commit b548e13 on 2026-04-30.
+    'claude-sonnet-4-6': 'instruction-following regression — see commit b548e13',
+}
 
 def load_token():
     for p in TOKEN_PATHS:
@@ -85,8 +96,7 @@ def insert_model_entry(content: str, model: dict) -> str:
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument('--dry-run', action='store_true')
-    ap.add_argument('--rebuild', action='store_true', help='Run docker rebuild + recreate after changes')
+    ap.add_argument('--dry-run', action='store_true', help='List new models, do not write registry')
     args = ap.parse_args()
 
     token = load_token()
@@ -94,10 +104,18 @@ def main():
     print(f'[refresh] Anthropic returned {len(live)} models')
     content = REGISTRY_PATH.read_text()
     registered = get_registered_ids(content)
-    new_ids = [m for m in live if m['id'] not in registered and parse_family(m['id'])]
+
+    candidates = [m for m in live if m['id'] not in registered and parse_family(m['id'])]
+    blocked = [m for m in candidates if m['id'] in BLACKLIST]
+    new_ids = [m for m in candidates if m['id'] not in BLACKLIST]
+
+    for m in blocked:
+        print(f'[refresh] BLOCKED {m["id"]}: {BLACKLIST[m["id"]]}')
+
     if not new_ids:
         print('[refresh] no new Claude models to add')
         return 0
+
     print(f'[refresh] {len(new_ids)} new Claude models detected:')
     for m in new_ids:
         print(f'    + {m["id"]} ({m.get("display_name","")}, {m.get("created_at","")[:10]})')
@@ -110,12 +128,9 @@ def main():
     for m in new_ids:
         content = insert_model_entry(content, m)
     REGISTRY_PATH.write_text(content)
-    print('[refresh] registry updated')
-    if args.rebuild:
-        print('[refresh] rebuilding workers...')
-        subprocess.check_call(['docker','compose','-f','/root/werkingflow-bridge/docker/docker-compose.yml','build','worker1','worker2','worker3','worker4'])
-        subprocess.check_call(['docker','compose','-f','/root/werkingflow-bridge/docker/docker-compose.yml','up','-d','--force-recreate','worker1','worker2','worker3','worker4'])
-        print('[refresh] rebuild + recreate done')
+    print('[refresh] registry updated — REVIEW + COMMIT + DEPLOY MANUALLY')
+    print('[refresh] git diff src/model_registry.py')
+    print('[refresh] then: bridge-deploy.sh (rolling restart)')
     return 0
 
 if __name__ == '__main__':
