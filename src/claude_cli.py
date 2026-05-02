@@ -1076,45 +1076,45 @@ CRITICAL: Write file EARLY to avoid context overflow. Use Write tool for clauded
                             # =============================================================
                             if isinstance(message, RateLimitEvent):
                                 worker_id = os.environ.get("INSTANCE_NAME", "unknown")
-                                # Every rate_limit_event triggers a soft penalty — even
-                                # the "phantom" heartbeats without Anthropic-side info.
-                                # Reason: when an event fires, this worker is in some
-                                # form of pacing state from the SDK side. Letting new
-                                # requests route here while the SDK is silently retrying
-                                # makes them queue up on a busy worker. With short
-                                # SOFT_PENALTY_SECONDS (15s) the cascade-risk is low —
-                                # phantom on all 4 in succession parks the pool for max
-                                # ~60s, but cross-worker retry (in main.py) catches that.
-                                # The previous "phantom must not penalize" rule predates
-                                # cross-worker retry and was the silent reason rafael's
-                                # client kept hitting 429 even when 2 accounts were free.
+                                # Distinguish real Anthropic-side rate limit (with
+                                # retry_after / message / reset_at) from phantom
+                                # heartbeats (the SDK self-throttling without any
+                                # upstream signal). Phantoms must NOT penalize:
+                                # in 2026-05-02 testing, penalizing phantoms caused
+                                # all 4 workers to enter cooldown in succession
+                                # (~60s pool-exhausted) — exactly the cascade the
+                                # original code comment warned about. Real limits
+                                # do penalize and feed the adaptive limiter so
+                                # cap_tokens can shrink on flaky accounts.
                                 has_anthropic_info = (
                                     message.retry_after is not None
                                     or (message.message and message.message.strip())
                                     or message.reset_at is not None
                                 )
-                                tag = "real Anthropic limit" if has_anthropic_info else "phantom heartbeat"
-                                logger.info(
-                                    f"⏳ Worker {worker_id} received rate_limit_event "
-                                    f"({tag}) — soft penalty applied. "
-                                    f"retry_after={message.retry_after}, "
-                                    f"message={(message.message or '')[:120]}"
-                                )
-                                rate_limit_tracker.mark_soft_penalty(
-                                    worker_id, message.retry_after
-                                )
-                                # Feed the AdaptiveLoadLimiter so cap_tokens shrinks
-                                # over time on workers that keep hitting limits — the
-                                # rolling_metrics signal is what drives _tune_loop's
-                                # SHRINK path. Without this, the cooldown hides the
-                                # event from the cap-tuner and growth keeps over-
-                                # admitting on a flaky account.
-                                try:
-                                    from src.middleware.rolling_metrics import get_rolling_metrics
-                                    get_rolling_metrics().record_rate_limit(worker_id)
-                                except Exception as exc:
+                                if has_anthropic_info:
+                                    logger.info(
+                                        f"⏳ Worker {worker_id} received rate_limit_event "
+                                        f"(real Anthropic limit) — soft penalty applied. "
+                                        f"retry_after={message.retry_after}, "
+                                        f"message={(message.message or '')[:120]}"
+                                    )
+                                    rate_limit_tracker.mark_soft_penalty(
+                                        worker_id, message.retry_after
+                                    )
+                                    # Feed the AdaptiveLoadLimiter — only on real
+                                    # signals. Phantoms would inject false rate-
+                                    # limit hits into the cap-tuner.
+                                    try:
+                                        from src.middleware.rolling_metrics import get_rolling_metrics
+                                        get_rolling_metrics().record_rate_limit(worker_id)
+                                    except Exception as exc:
+                                        logger.debug(
+                                            f"rolling_metrics.record_rate_limit failed: {exc}"
+                                        )
+                                else:
                                     logger.debug(
-                                        f"rolling_metrics.record_rate_limit failed: {exc}"
+                                        f"phantom rate_limit_event for {worker_id} "
+                                        f"(SDK heartbeat, no Anthropic info) — no penalty"
                                     )
                                 continue
 
