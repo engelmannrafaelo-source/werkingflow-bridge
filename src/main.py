@@ -714,19 +714,133 @@ async def worker_unavailable_handler(request: Request, exc: WorkerUnavailableErr
 # =============================================================================
 # Rate Limit Exception Handler - Returns 429 with Retry-After
 # =============================================================================
+# CROSS-WORKER RETRY — when one worker is rate-limited but others have
+# capacity, the bridge transparently retries on the next-best worker so the
+# client only sees the final successful response. Bounded to 2 retries via
+# X-Bridge-Retry-Count header (3 attempts total). The X-Bridge-Retry-Excluded
+# header carries the cumulative list of already-tried workers so loop
+# prevention is local to the call chain (no shared state required).
+# =============================================================================
+async def _pick_alternative_worker(
+    exclude_workers: set[str], min_capacity_tokens: int = 500
+) -> Optional[str]:
+    """Pick the worker with the highest free capacity, excluding any in the
+    given set. Capacity = effective_cap_tokens − current_in_flight_tokens.
+    Returns None if no eligible worker has at least min_capacity_tokens free.
+    """
+    import httpx
+    try:
+        async with httpx.AsyncClient(timeout=3.0) as client:
+            r = await client.get(
+                "http://metrics-reader:8000/v1/metrics/account-pool-state"
+            )
+            r.raise_for_status()
+            data = r.json()
+    except Exception as exc:
+        logger.warning(f"_pick_alternative_worker: fetch failed: {exc}")
+        return None
+
+    candidates: list[tuple[str, int]] = []
+    for _account, info in (data.get("accounts") or {}).items():
+        worker = info.get("worker")
+        if not worker or worker in exclude_workers:
+            continue
+        if not info.get("available"):
+            continue
+        if int(info.get("cooldown_remaining_s") or 0) > 0:
+            continue
+        eff_cap = int(info.get("effective_cap_tokens") or 0)
+        in_flight = int(info.get("current_in_flight_tokens") or 0)
+        capacity = eff_cap - in_flight
+        if capacity > min_capacity_tokens:
+            candidates.append((worker, capacity))
+
+    if not candidates:
+        return None
+    return max(candidates, key=lambda x: x[1])[0]
+
+
+async def _cross_worker_retry(
+    request: Request, self_worker: str
+) -> Optional[JSONResponse]:
+    """Try the same chat-completions request on a different worker.
+    Returns the alternative worker's JSONResponse on attempt, or None when
+    no retry is possible (caller falls back to its own error envelope).
+
+    Loop prevention via X-Bridge-Retry-Count (max 2) and X-Bridge-Retry-Excluded
+    (cumulative worker exclusion set). Streaming requests are skipped — those
+    need buffer-and-replay (separate streaming-truthfulness phase).
+    """
+    retry_count = int(request.headers.get("x-bridge-retry-count") or "0")
+    if retry_count >= 2:
+        return None
+
+    excluded_raw = request.headers.get("x-bridge-retry-excluded") or ""
+    excluded: set[str] = {w for w in excluded_raw.split(",") if w}
+    excluded.add(self_worker)
+
+    cached_body = getattr(request.state, "cached_body_dict", None)
+    if not cached_body or cached_body.get("stream"):
+        return None  # streaming retries need different machinery
+
+    target = await _pick_alternative_worker(excluded)
+    if not target:
+        logger.info(
+            f"🔄 cross-worker retry: no alternative for {self_worker} "
+            f"(excluded={sorted(excluded)})"
+        )
+        return None
+
+    import httpx
+    headers = {"content-type": "application/json"}
+    for h in ("authorization", "x-claude-allowed-tools", "x-claude-max-turns",
+              "x-claude-file-discovery", "x-priority"):
+        if h in request.headers:
+            headers[h] = request.headers[h]
+    headers["x-bridge-retry-count"] = str(retry_count + 1)
+    headers["x-bridge-retry-excluded"] = ",".join(sorted(excluded))
+
+    logger.info(
+        f"🔄 cross-worker retry #{retry_count + 1}: {self_worker} → {target} "
+        f"(excluded={sorted(excluded)})"
+    )
+
+    try:
+        async with httpx.AsyncClient(timeout=120.0) as client:
+            r = await client.post(
+                f"http://{target}:8000/v1/chat/completions",
+                json=cached_body,
+                headers=headers,
+            )
+        # Pass through whatever the alternative worker returned. If it also
+        # 429s, the recursive _cross_worker_retry on that worker either found
+        # yet another candidate or reached the retry-count cap; either way
+        # the answer is now authoritative.
+        try:
+            content = r.json()
+        except Exception:
+            content = {"error": {"message": "non-json retry response"}}
+        return JSONResponse(status_code=r.status_code, content=content)
+    except Exception as exc:
+        logger.error(
+            f"cross-worker retry HTTP call to {target} failed: {exc}", exc_info=True
+        )
+        return None
+
+
 @app.exception_handler(RateLimitError)
 async def rate_limit_handler(request: Request, exc: RateLimitError):
     """
-    Handle RateLimitError by returning HTTP 429 Too Many Requests.
+    Handle RateLimitError by attempting a cross-worker retry first, then
+    falling back to HTTP 429 if no eligible alternative is available.
 
-    This is used when ALL workers are exhausted and no failover is possible.
-    The Retry-After header tells the client when to retry.
+    Cross-worker retry is bounded to 2 attempts via X-Bridge-Retry-Count.
     """
     worker_id = os.getenv("INSTANCE_NAME", "unknown")
     retry_after = exc.retry_after_seconds
 
     logger.error(
-        f"🚫 ALL WORKERS RATE LIMITED - returning 429",
+        f"🚫 RateLimitError on worker {worker_id} - attempting cross-worker retry",
         extra={
             "path": str(request.url),
             "method": request.method,
@@ -740,6 +854,13 @@ async def rate_limit_handler(request: Request, exc: RateLimitError):
     from src.middleware.rolling_metrics import get_rolling_metrics
     get_rolling_metrics().record_rate_limit(worker_id)
     logger.info(f"📊 Recorded 429 for adaptive limiter feedback (worker={worker_id})")
+
+    # Try cross-worker retry on /v1/chat/completions sync requests before
+    # surfacing the 429 to the client.
+    if request.url.path.endswith("/v1/chat/completions"):
+        retry_response = await _cross_worker_retry(request, worker_id)
+        if retry_response is not None:
+            return retry_response
 
     return JSONResponse(
         status_code=429,
@@ -4502,6 +4623,16 @@ async def bridge_error_handler(request: Request, exc: BridgeError):
             or (err_source == "bridge_internal" and err_type in ("throttle", "queue_timeout"))
         ):
             return exc.response
+
+        # First: try a cross-worker retry on this same bridge before falling
+        # over to a different provider tier. The current worker's local
+        # admission control rejected the request, but other workers on this
+        # bridge may still have capacity. Bounded to 2 attempts via the same
+        # X-Bridge-Retry-Count header used by rate_limit_handler.
+        self_worker = os.getenv("INSTANCE_NAME", "unknown")
+        cross_worker_response = await _cross_worker_retry(request, self_worker)
+        if cross_worker_response is not None:
+            return cross_worker_response
 
         from src.providers.fallback import (
             get_fallback_tiers as _fb_tiers,
