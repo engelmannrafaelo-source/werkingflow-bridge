@@ -806,7 +806,12 @@ async def _cross_worker_retry(
     )
 
     try:
-        async with httpx.AsyncClient(timeout=120.0) as client:
+        # 30s timeout: short enough that a hung retry doesn't itself become
+        # the 429 source, long enough for a normal sync chat to complete
+        # (typical 5-15s, p95 ~25s). On timeout the caller's original 429
+        # surfaces to the client — better than waiting 120s and serving the
+        # same outcome.
+        async with httpx.AsyncClient(timeout=30.0) as client:
             r = await client.post(
                 f"http://{target}:8000/v1/chat/completions",
                 json=cached_body,

@@ -186,6 +186,14 @@ end
 -- account. As an account approaches its wall, its predictive_multiplier shrinks
 -- effective_cap; as in_flight rises, the residual shrinks too — so heavy
 -- accounts fade out automatically without explicit deprioritisation.
+-- Hard wall — accounts above this weekly% are never eligible regardless
+-- of effective_cap_tokens. Guards against weekly_pct flicker (e.g. 96 ↔ 97
+-- across the Anthropic-side rolling window) where mult bounces between
+-- 0.10 (eligible at ~127K capacity) and 0.0 (excluded). The flicker would
+-- briefly route real traffic to a near-wall account and trigger Anthropic
+-- 429s that the cross-worker retry then has to clean up.
+local WEEKLY_HARD_EXCLUDE_PCT = 96
+
 local function pick_weighted_account(accounts, est_tokens)
     local eligible    = {}
     local total       = 0
@@ -196,8 +204,12 @@ local function pick_weighted_account(accounts, est_tokens)
         local cooldown   = tonumber(info.cooldown_remaining_s) or 0
         local eff_cap    = tonumber(info.effective_cap_tokens) or 0
         local in_flight  = tonumber(info.current_in_flight_tokens) or 0
+        local weekly_pct = tonumber(info.weekly_percent) or 0
         local capacity   = eff_cap - in_flight
-        if available and cooldown == 0 and capacity > min_required then
+        if available
+                and cooldown == 0
+                and capacity > min_required
+                and weekly_pct < WEEKLY_HARD_EXCLUDE_PCT then
             eligible[#eligible + 1] = { name = name, weight = capacity }
             total = total + capacity
         end
