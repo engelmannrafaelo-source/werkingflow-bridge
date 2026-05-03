@@ -160,7 +160,14 @@ class RateLimitTracker:
     In-progress tasks NEVER abort on rate_limit_event — only new request routing.
     """
     _instance = None
-    MAX_COOLDOWN_SECONDS = 600  # 10 minutes — never block longer than this
+    # 60s instead of 600s — bounds the blast radius of a false-positive
+    # detect_in_text match. A real Anthropic rate-limit reset is typically
+    # minutes-to-hours, but 60s is enough to let the request that hit the
+    # limit complete elsewhere; further requests will trigger the limit
+    # again and re-arm the cooldown if it's real. False positives (Claude
+    # generating a response that mentions one of the patterns in user
+    # content) recover in 60s instead of 10 minutes.
+    MAX_COOLDOWN_SECONDS = 60
     SOFT_PENALTY_SECONDS = 15   # Transient rate_limit_event — short penalty
     # Note: 15s (down from 60s) — SDK is also retrying internally, so this is
     # only protection for *new* request routing. Long lock created cascades
@@ -274,9 +281,19 @@ class RateLimitTracker:
         self._logger.warning(f"🚫 Worker {worker_id} HARD rate-limited for {remaining}s (until {reset_time})")
         return reset_time
 
+    # Real Anthropic rate-limit messages are short (typically <500 chars,
+    # almost always <1500). Long content with the phrase embedded somewhere
+    # — e.g. a status table, a markdown report, documentation — is the user
+    # talking ABOUT rate limits, not Anthropic delivering a rate-limit
+    # message. Restricting detect_in_text to short responses eliminates the
+    # false-positive class verified 2026-05-03 12:19 UTC where worker1 was
+    # hard-limited because Claude generated a session-status table that
+    # mentioned "out of extra usage" in a description.
+    DETECT_MAX_TEXT_LEN = 1500
+
     def detect_in_text(self, text: str, worker_id: str) -> Optional[str]:
-        """Scan an assistant text for an Anthropic rate-limit phrasing and,
-        on hit, mark the worker HARD-limited.
+        """Scan a SHORT assistant text for an Anthropic rate-limit phrasing
+        and, on hit, mark the worker HARD-limited.
 
         Single entry point for both response paths — streaming and the
         non-streaming SDK extractor. Without this the streaming loop saw the
@@ -285,13 +302,19 @@ class RateLimitTracker:
         marked available. The pool-router then kept routing every new
         request to the same exhausted worker.
 
-        Returns the matched pattern (so the caller can surface it in logs or
-        decide what to put in the error envelope) or None if no pattern
-        matched. The worker-marking side effect makes this idempotent —
-        calling it on already-rate-limited workers just refreshes the
-        cooldown.
+        Length guard (DETECT_MAX_TEXT_LEN): a real Anthropic rate-limit
+        message replaces the model's response with a short apology. If the
+        assistant text is longer than that, it's the model GENERATING content
+        that incidentally contains one of the patterns — false positive,
+        skip detection. The previous behavior (match anywhere in any text
+        length) hard-limited workers for 10 minutes whenever Claude wrote
+        about rate limits in any context.
+
+        Returns the matched pattern or None.
         """
         if not text:
+            return None
+        if len(text) > self.DETECT_MAX_TEXT_LEN:
             return None
         text_lower = text.lower()
         for pattern in self.RATE_LIMIT_PATTERNS:
