@@ -1112,89 +1112,71 @@ CRITICAL: Write file EARLY to avoid context overflow. Use Write tool for clauded
                             # =============================================================
                             if isinstance(message, RateLimitEvent):
                                 worker_id = os.environ.get("INSTANCE_NAME", "unknown")
-                                # Distinguish real Anthropic-side rate limit (with
-                                # retry_after / message / reset_at) from phantom
-                                # heartbeats (the SDK self-throttling without any
-                                # upstream signal). Phantoms must NOT penalize:
-                                # in 2026-05-02 testing, penalizing phantoms caused
-                                # all 4 workers to enter cooldown in succession
-                                # (~60s pool-exhausted) — exactly the cascade the
-                                # original code comment warned about. Real limits
-                                # do penalize and feed the adaptive limiter so
-                                # cap_tokens can shrink on flaky accounts.
-                                # 2026-05-04: Anthropic liefert real rate-limit info
-                                # im nested rate_limit_info dict (camelCase keys:
-                                # resetsAt, rateLimitType, utilization). Top-level
-                                # Felder sind dann None — vorher als phantom
-                                # klassifiziert + ignoriert. Worker-Log 19:08:43
-                                # zeigte utilization=0.97, surpassedThreshold=0.9
-                                # ohne Penalty.
-                                _raw = getattr(message, "raw", None)
-                                _rli = _raw.get("rate_limit_info", {}) if isinstance(_raw, dict) else {}
-                                has_anthropic_info = (
-                                    message.retry_after is not None
-                                    or (message.message and message.message.strip())
-                                    or message.reset_at is not None
-                                    or bool(_rli.get("resetsAt"))
-                                    or _rli.get("utilization") is not None
+                                # Single source of truth: rate_limit_info.status from Anthropic.
+                                #   'allowed' / None    → heartbeat              → no penalty
+                                #   'allowed_warning'   → approaching limit ≥90% → soft penalty
+                                #   anything else + reset/retry signal → hit     → lock until Anthropic reset
+                                # Lock duration ONLY from Anthropic (retry_after, reset_at, resetsAt).
+                                # If Anthropic doesn't tell us when, soft penalty only — no arbitrary lock.
+                                raw = getattr(message, "raw", None)
+                                rli = raw.get("rate_limit_info", {}) if isinstance(raw, dict) else {}
+                                rl_status = rli.get("status")
+                                rl_type = rli.get("rateLimitType") or "anthropic"
+                                reset_target = None
+                                if message.reset_at is not None:
+                                    reset_target = float(message.reset_at)
+                                elif rli.get("resetsAt"):
+                                    reset_target = float(rli["resetsAt"])
+                                is_heartbeat = rl_status in (None, "allowed")
+                                is_warning = (rl_status == "allowed_warning")
+                                is_hit = (
+                                    not is_heartbeat
+                                    and not is_warning
+                                    and (rl_status is not None
+                                         or message.retry_after is not None
+                                         or (message.message and message.message.strip()))
                                 )
-                                if has_anthropic_info:
+                                if is_heartbeat:
+                                    logger.debug(
+                                        f"rate_limit_event heartbeat for {worker_id} "
+                                        f"(status={rl_status}, type={rl_type}) — no penalty"
+                                    )
+                                elif is_warning:
                                     logger.info(
-                                        f"⏳ Worker {worker_id} received rate_limit_event "
-                                        f"(real Anthropic limit) — soft penalty applied. "
-                                        f"retry_after={message.retry_after}, "
-                                        f"message={(message.message or '')[:120]}"
+                                        f"⏳ Worker {worker_id} approaching {rl_type} limit "
+                                        f"(status={rl_status}, util={rli.get('utilization')}, "
+                                        f"surpassed={rli.get('surpassedThreshold')}) — soft penalty"
                                     )
-                                    rate_limit_tracker.mark_soft_penalty(
-                                        worker_id, message.retry_after
+                                    rate_limit_tracker.mark_soft_penalty(worker_id, 60)
+                                elif is_hit:
+                                    logger.info(
+                                        f"🔒 Worker {worker_id} hit {rl_type} limit "
+                                        f"(status={rl_status}, retry_after={message.retry_after}, "
+                                        f"reset_at={reset_target}) — capacity lock"
                                     )
-                                    # Capacity lock — deterministic hold until Anthropic reset_at.
-                                    # Orthogonal to soft penalty: soft handles concurrency, this
-                                    # handles quota-window exhaustion with no MAX_COOLDOWN cap.
+                                    rate_limit_tracker.mark_soft_penalty(worker_id, message.retry_after or 60)
                                     try:
                                         from src.middleware.capacity_lock import get_capacity_lock as _get_cap_lock
                                         _cap = _get_cap_lock()
-                                        _nested_reset = _rli.get("resetsAt")
-                                        _nested_type = _rli.get("rateLimitType") or "anthropic_explicit"
-                                        if message.reset_at is not None:
-                                            _cap.lock_until(worker_id, float(message.reset_at), "anthropic_explicit")
-                                        elif _nested_reset:
-                                            _cap.lock_until(worker_id, float(_nested_reset), str(_nested_type))
-                                        elif "weekly" in (message.message or "").lower():
-                                            _cap.lock_until(worker_id, time.time() + 86400, "weekly_window")
+                                        if reset_target:
+                                            _cap.lock_until(worker_id, reset_target, rl_type)
                                         else:
-                                            _cap.lock_until(worker_id, time.time() + 1800, "session_window")
-                                    except Exception as _cap_exc:
-                                        logger.error(f"capacity_lock.lock_until failed: {_cap_exc}")
-                                    # Feed the AdaptiveLoadLimiter — only on real
-                                    # signals. Phantoms would inject false rate-
-                                    # limit hits into the cap-tuner.
+                                            logger.warning(
+                                                f"rate_limit hit on {worker_id} but no reset signal — "
+                                                f"soft penalty only, adaptive_limiter polling will catch ≥95%"
+                                            )
+                                    except Exception as exc:
+                                        logger.error(f"capacity_lock.lock_until failed: {exc}")
                                     try:
                                         from src.middleware.rolling_metrics import get_rolling_metrics
                                         get_rolling_metrics().record_rate_limit(worker_id)
                                     except Exception as exc:
-                                        logger.debug(
-                                            f"rolling_metrics.record_rate_limit failed: {exc}"
-                                        )
+                                        logger.debug(f"rolling_metrics.record_rate_limit failed: {exc}")
                                 else:
-                                    # Promoted to INFO + dump raw — we want to see
-                                    # exactly what fields are present so we can
-                                    # decide whether to widen has_anthropic_info
-                                    # (e.g. camelCase variants like retryAfter).
-                                    try:
-                                        _raw = getattr(message, "raw", None)
-                                        _raw_keys = list(_raw.keys()) if isinstance(_raw, dict) else "non-dict"
-                                        _raw_str = str(_raw)[:500] if _raw is not None else "<no .raw>"
-                                        logger.info(
-                                            f"phantom rate_limit_event for {worker_id} "
-                                            f"(no Anthropic info — no penalty). "
-                                            f"raw_keys={_raw_keys} raw={_raw_str}"
-                                        )
-                                    except Exception as _log_err:
-                                        logger.info(
-                                            f"phantom rate_limit_event for {worker_id} "
-                                            f"(failed to dump raw: {_log_err})"
-                                        )
+                                    logger.info(
+                                        f"rate_limit_event unknown status for {worker_id} "
+                                        f"(status={rl_status}, raw={str(raw)[:200]}) — no action"
+                                    )
                                 continue
 
                             chunks_received += 1
