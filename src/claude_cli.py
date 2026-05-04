@@ -1122,10 +1122,21 @@ CRITICAL: Write file EARLY to avoid context overflow. Use Write tool for clauded
                                 # original code comment warned about. Real limits
                                 # do penalize and feed the adaptive limiter so
                                 # cap_tokens can shrink on flaky accounts.
+                                # 2026-05-04: Anthropic liefert real rate-limit info
+                                # im nested rate_limit_info dict (camelCase keys:
+                                # resetsAt, rateLimitType, utilization). Top-level
+                                # Felder sind dann None — vorher als phantom
+                                # klassifiziert + ignoriert. Worker-Log 19:08:43
+                                # zeigte utilization=0.97, surpassedThreshold=0.9
+                                # ohne Penalty.
+                                _raw = getattr(message, "raw", None)
+                                _rli = _raw.get("rate_limit_info", {}) if isinstance(_raw, dict) else {}
                                 has_anthropic_info = (
                                     message.retry_after is not None
                                     or (message.message and message.message.strip())
                                     or message.reset_at is not None
+                                    or bool(_rli.get("resetsAt"))
+                                    or _rli.get("utilization") is not None
                                 )
                                 if has_anthropic_info:
                                     logger.info(
@@ -1143,8 +1154,12 @@ CRITICAL: Write file EARLY to avoid context overflow. Use Write tool for clauded
                                     try:
                                         from src.middleware.capacity_lock import get_capacity_lock as _get_cap_lock
                                         _cap = _get_cap_lock()
+                                        _nested_reset = _rli.get("resetsAt")
+                                        _nested_type = _rli.get("rateLimitType") or "anthropic_explicit"
                                         if message.reset_at is not None:
                                             _cap.lock_until(worker_id, float(message.reset_at), "anthropic_explicit")
+                                        elif _nested_reset:
+                                            _cap.lock_until(worker_id, float(_nested_reset), str(_nested_type))
                                         elif "weekly" in (message.message or "").lower():
                                             _cap.lock_until(worker_id, time.time() + 86400, "weekly_window")
                                         else:
