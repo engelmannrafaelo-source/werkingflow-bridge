@@ -882,6 +882,8 @@ def get_account_pool_state():
                 "last_rate_limit_ts": data.get("last_rate_limit_ts"),
                 "cooldown_remaining_s": data.get("cooldown_remaining_s", 0),
                 "available": data.get("available", False),
+                "capacity_lock_remaining_s": data.get("capacity_lock_remaining_s", 0),
+                "capacity_lock_reason": data.get("capacity_lock_reason", None),
             }
         except Exception as e:
             errors.append({"worker": worker, "error": str(e)})

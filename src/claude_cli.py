@@ -1137,6 +1137,20 @@ CRITICAL: Write file EARLY to avoid context overflow. Use Write tool for clauded
                                     rate_limit_tracker.mark_soft_penalty(
                                         worker_id, message.retry_after
                                     )
+                                    # Capacity lock — deterministic hold until Anthropic reset_at.
+                                    # Orthogonal to soft penalty: soft handles concurrency, this
+                                    # handles quota-window exhaustion with no MAX_COOLDOWN cap.
+                                    try:
+                                        from src.middleware.capacity_lock import get_capacity_lock as _get_cap_lock
+                                        _cap = _get_cap_lock()
+                                        if message.reset_at is not None:
+                                            _cap.lock_until(worker_id, float(message.reset_at), "anthropic_explicit")
+                                        elif "weekly" in (message.message or "").lower():
+                                            _cap.lock_until(worker_id, time.time() + 86400, "weekly_window")
+                                        else:
+                                            _cap.lock_until(worker_id, time.time() + 1800, "session_window")
+                                    except Exception as _cap_exc:
+                                        logger.error(f"capacity_lock.lock_until failed: {_cap_exc}")
                                     # Feed the AdaptiveLoadLimiter — only on real
                                     # signals. Phantoms would inject false rate-
                                     # limit hits into the cap-tuner.

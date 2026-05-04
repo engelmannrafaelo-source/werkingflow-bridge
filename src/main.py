@@ -4938,9 +4938,16 @@ async def get_account_pool_state():
         logger.error(f"rate_limit_tracker query failed for worker {worker_id!r}: {exc}")
         raise
 
-    # Merged cooldown: max of token-budget cooldown and soft/hard penalty
+    # Capacity lock — deterministic hold based on Anthropic-provided reset_at
+    from src.middleware.capacity_lock import get_capacity_lock as _get_cap_lock
+    cap_lock = _get_cap_lock()
+    cap_lock_remaining_s = cap_lock.remaining_s(worker_id)
+    cap_lock_info = cap_lock.get_lock_info(worker_id)
+    cap_lock_reason = cap_lock_info["reason"] if cap_lock_info else None
+
+    # Merged cooldown: max of token-budget cooldown, soft/hard penalty, and capacity lock
     soft_penalty_remaining_s = tracker_remaining if tracker_remaining is not None else 0
-    cooldown_remaining_s = max(adaptive_cooldown_s, soft_penalty_remaining_s)
+    cooldown_remaining_s = max(adaptive_cooldown_s, soft_penalty_remaining_s, cap_lock_remaining_s)
 
     # Merged last_rate_limit_ts: newer of adaptive ts and tracker event start approximation
     # tracker start ≈ (now + remaining) - window, where window = SOFT_PENALTY or MAX_COOLDOWN
@@ -4975,9 +4982,16 @@ async def get_account_pool_state():
         "effective_cap_tokens": effective_cap_tokens,
         "last_rate_limit_ts": merged_last_rate_limit_ts,
         "cooldown_remaining_s": cooldown_remaining_s,
-        "available": session_pct < 95.0 and headroom > 0 and not tracker_is_limited,
+        "available": (
+            not cap_lock.is_locked(worker_id)
+            and session_pct < 95.0
+            and headroom > 0
+            and not tracker_is_limited
+        ),
         "soft_penalty_remaining_s": soft_penalty_remaining_s,
         "is_hard_limited": tracker_is_hard,
+        "capacity_lock_remaining_s": cap_lock_remaining_s,
+        "capacity_lock_reason": cap_lock_reason,
     }
 
 
