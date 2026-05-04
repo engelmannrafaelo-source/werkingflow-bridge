@@ -28,6 +28,7 @@ ever changes, the per-worker cap interpretation needs to be revisited.
 from __future__ import annotations
 
 import os
+import re
 import json
 import time
 import asyncio
@@ -45,6 +46,25 @@ from src.middleware.bridge_error import (
 )
 
 logger = logging.getLogger(__name__)
+
+_RESET_PATTERN = re.compile(r'(\d+)\s*([dhm])')
+
+
+def _parse_reset_string(s: str) -> Optional[int]:
+    """Parse 'resets in 4h 29m' → 16140 (seconds). '' or unparseable → None."""
+    if not isinstance(s, str) or not s:
+        return None
+    total = 0
+    for n, unit in _RESET_PATTERN.findall(s):
+        n = int(n)
+        if unit == 'd':
+            total += n * 86400
+        elif unit == 'h':
+            total += n * 3600
+        elif unit == 'm':
+            total += n * 60
+    return total if total > 0 else None
+
 
 # ----------------------------------------------------------------------
 # Configuration (env-tunable)
@@ -309,6 +329,7 @@ class AdaptiveLoadLimiter:
                     continue
                 weekly  = float(acc.get("weeklyAllModels", {}).get("percent", 0) or 0)
                 session = float(acc.get("currentSession", {}).get("percent", 0) or 0)
+                self._maybe_set_capacity_lock(acc)
                 mult = _weekly_budget_multiplier(weekly, session)
                 self._account_usage = {
                     "weekly_pct": weekly,
@@ -322,6 +343,29 @@ class AdaptiveLoadLimiter:
         except Exception as e:
             logger.debug(f"_refresh_account_usage failed: {e}")
             self._account_usage["ts"] = now  # back off until next TTL
+
+    def _maybe_set_capacity_lock(self, acc: dict) -> None:
+        """Lock this worker until Anthropic's reported reset time when at quota wall (≥95%)."""
+        try:
+            from src.middleware.capacity_lock import get_capacity_lock
+            cap_lock = get_capacity_lock()
+            weekly_pct  = float(acc.get("weeklyAllModels", {}).get("percent", 0) or 0)
+            session_pct = float(acc.get("currentSession",  {}).get("percent", 0) or 0)
+            if weekly_pct >= 95:
+                reset_in = _parse_reset_string(
+                    acc.get("weeklyAllModels", {}).get("resetDate", "")
+                )
+                if reset_in:
+                    cap_lock.lock_until(self.worker, time.time() + reset_in, "weekly_window")
+                    return
+            if session_pct >= 95:
+                reset_in = _parse_reset_string(
+                    acc.get("currentSession", {}).get("resetIn", "")
+                )
+                if reset_in:
+                    cap_lock.lock_until(self.worker, time.time() + reset_in, "session_window")
+        except Exception as e:
+            logger.error(f"_maybe_set_capacity_lock failed: {e}")
 
     def _effective_cap(self) -> int:
         """
