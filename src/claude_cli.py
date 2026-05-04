@@ -67,7 +67,20 @@ try:
 
                 # SPECIAL HANDLING: rate_limit_event — parse it, don't skip
                 if msg_type == "rate_limit_event":
-                    logger.info(f"⏳ rate_limit_event received — CLI is waiting to retry internally")
+                    # Diagnostic: dump raw payload so we can verify whether
+                    # Anthropic is sending real throttle info (retry_after,
+                    # message, reset_at) or whether these are SDK-internal
+                    # heartbeats with empty payload.
+                    try:
+                        _keys = list(data.keys()) if isinstance(data, dict) else "non-dict"
+                        _raw_str = str(data)[:500]
+                        logger.info(
+                            f"⏳ rate_limit_event received — keys={_keys} raw={_raw_str}"
+                        )
+                    except Exception as _log_err:
+                        logger.info(
+                            f"⏳ rate_limit_event received (failed to dump raw: {_log_err})"
+                        )
                     return RateLimitEvent(data)
 
                 # All other unknown types: skip silently
@@ -1135,10 +1148,24 @@ CRITICAL: Write file EARLY to avoid context overflow. Use Write tool for clauded
                                             f"rolling_metrics.record_rate_limit failed: {exc}"
                                         )
                                 else:
-                                    logger.debug(
-                                        f"phantom rate_limit_event for {worker_id} "
-                                        f"(SDK heartbeat, no Anthropic info) — no penalty"
-                                    )
+                                    # Promoted to INFO + dump raw — we want to see
+                                    # exactly what fields are present so we can
+                                    # decide whether to widen has_anthropic_info
+                                    # (e.g. camelCase variants like retryAfter).
+                                    try:
+                                        _raw = getattr(message, "raw", None)
+                                        _raw_keys = list(_raw.keys()) if isinstance(_raw, dict) else "non-dict"
+                                        _raw_str = str(_raw)[:500] if _raw is not None else "<no .raw>"
+                                        logger.info(
+                                            f"phantom rate_limit_event for {worker_id} "
+                                            f"(no Anthropic info — no penalty). "
+                                            f"raw_keys={_raw_keys} raw={_raw_str}"
+                                        )
+                                    except Exception as _log_err:
+                                        logger.info(
+                                            f"phantom rate_limit_event for {worker_id} "
+                                            f"(failed to dump raw: {_log_err})"
+                                        )
                                 continue
 
                             chunks_received += 1
