@@ -554,10 +554,11 @@ from src.middleware.event_logger import EventLogger
 # Re-enabled: Pure ASGI implementation, not affected by BaseHTTPMiddleware bug
 app.add_middleware(PerformanceMonitorMiddleware)
 
-# Concurrency limiter — enforced via FastAPI Depends() instead of BaseHTTPMiddleware
-# (BaseHTTPMiddleware disabled due to Python 3.13 + Starlette 0.46 bug)
-# Set MAX_CONCURRENT_REQUESTS per worker in docker-compose (default 5 = 20 total with 4 workers)
-max_concurrent = int(os.getenv("MAX_CONCURRENT_REQUESTS", "5"))
+# Concurrency limiter — only memory-threshold safety net.
+# Adaptive cap_tokens does the real throttling per worker; hardcoded
+# concurrency caps would override that learning. Default is effectively
+# unlimited; set MAX_CONCURRENT_REQUESTS in env only to override.
+max_concurrent = int(os.getenv("MAX_CONCURRENT_REQUESTS", "1000"))
 memory_threshold = float(os.getenv("MEMORY_THRESHOLD_PERCENT", "90.0"))
 request_limiter = get_limiter(max_concurrent=max_concurrent, memory_threshold=memory_threshold)
 
