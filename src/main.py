@@ -805,15 +805,20 @@ async def _cross_worker_retry(
         f"(excluded={sorted(excluded)})"
     )
 
+    # Path-dependent timeout: chat is sub-30s, research is 5-40 minutes.
+    # Use a generous research timeout so the alternative worker has room to
+    # complete a real research run; chat keeps the original tight 30s budget
+    # so a hung retry does not itself become the 429 source.
+    request_path = str(request.url.path) or "/v1/chat/completions"
+    if request_path.endswith("/v1/research"):
+        retry_timeout_s = 2400.0  # match SDK 2400s ceiling
+    else:
+        retry_timeout_s = 30.0
+
     try:
-        # 30s timeout: short enough that a hung retry doesn't itself become
-        # the 429 source, long enough for a normal sync chat to complete
-        # (typical 5-15s, p95 ~25s). On timeout the caller's original 429
-        # surfaces to the client — better than waiting 120s and serving the
-        # same outcome.
-        async with httpx.AsyncClient(timeout=30.0) as client:
+        async with httpx.AsyncClient(timeout=retry_timeout_s) as client:
             r = await client.post(
-                f"http://{target}:8000/v1/chat/completions",
+                f"http://{target}:8000{request_path}",
                 json=cached_body,
                 headers=headers,
             )
@@ -860,9 +865,12 @@ async def rate_limit_handler(request: Request, exc: RateLimitError):
     get_rolling_metrics().record_rate_limit(worker_id)
     logger.info(f"📊 Recorded 429 for adaptive limiter feedback (worker={worker_id})")
 
-    # Try cross-worker retry on /v1/chat/completions sync requests before
-    # surfacing the 429 to the client.
-    if request.url.path.endswith("/v1/chat/completions"):
+    # Try cross-worker retry on /v1/chat/completions AND /v1/research sync
+    # requests before surfacing the 429 to the client. Research uses the same
+    # adaptive_limit_dependency that caches request.state.cached_body_dict, so
+    # the retry machinery applies symmetrically. Streaming requests are still
+    # skipped inside _cross_worker_retry (chat streaming only).
+    if request.url.path.endswith(("/v1/chat/completions", "/v1/research")):
         retry_response = await _cross_worker_retry(request, worker_id)
         if retry_response is not None:
             return retry_response
@@ -3104,6 +3112,80 @@ async def research(
                 logger.info(f"📄 Read content: {len(content)} chars from {content_file}")
             except Exception as e:
                 logger.warning(f"⚠️ Could not read content: {e}")
+
+        # ====================================================================
+        # DEFENSIVE: lift chat_completions defenses to research endpoint
+        # --------------------------------------------------------------------
+        # The chat completions endpoint (line ~2240) raises HTTPException 500
+        # when parse_claude_message returns None and RateLimitError when
+        # detect_quota_exhaustion fires on the response text. Without these,
+        # research silently returns status=success with empty content/output
+        # whenever the SDK gets rate-limited or stalls -- pipelines then crash
+        # 40 minutes later on a meaningless empty response. Same defenses
+        # applied here.
+        # ====================================================================
+        from src.claude_cli import detect_quota_exhaustion as _dqe
+
+        # 1) Parse chunks the same way chat_completions does
+        try:
+            parsed_assistant_text = claude_cli.parse_claude_message(all_chunks)
+        except Exception as _parse_err:
+            logger.error(
+                f"\u274c Research parse_claude_message raised: {_parse_err}",
+                exc_info=True,
+            )
+            parsed_assistant_text = None
+
+        # 2) Quota exhaustion phrase scan on whatever text we have.
+        #    If the SDK silently bailed on rate-limit, the marker is in either
+        #    the parsed assistant text or the file content (rare).
+        for _candidate, _label in (
+            (parsed_assistant_text, "assistant text"),
+            (content, "file content"),
+        ):
+            if _candidate and _dqe(_candidate):
+                logger.warning(
+                    f"\U0001f6ab Research: quota-exhaustion phrase detected in {_label} "
+                    f"-- raising RateLimitError so adaptive limiter is notified"
+                )
+                raise RateLimitError(
+                    f"[Bridge research] Quota exhaustion detected in {_label}"
+                )
+
+        # 3) Empty-output guard: if discovery + parse both came up empty, this
+        #    is a stalled/quota-killed run masquerading as success. Fail loud
+        #    so Nginx / the consumer can see it instead of inheriting None.
+        if not discovered_files and not content and not parsed_assistant_text:
+            logger.error(
+                f"\u274c Research produced no output: "
+                f"discovered_files=0, content=None, parsed_text=None, "
+                f"chunks={len(all_chunks)}, session_id={session_id}"
+            )
+            raise HTTPException(
+                status_code=500,
+                detail={
+                    "message": "Research SDK completed but produced no output",
+                    "chunks_received": len(all_chunks),
+                    "session_id": session_id,
+                    "execution_time_seconds": round(execution_time, 2),
+                    "hint": (
+                        "Likely cause: rate_limit_event with internal retry that "
+                        "never recovered, or session-id mismatch in file discovery. "
+                        "Check worker logs for rate_limit_event around session start."
+                    ),
+                },
+            )
+
+        # 4) Parsed text fallback: discovery failed and no file content, but the
+        #    SDK did emit assistant text -- carry that as the content payload
+        #    rather than returning None.
+        if not content and parsed_assistant_text:
+            empty_chars = len(parsed_assistant_text)
+            logger.warning(
+                f"\u26a0\ufe0f  Research: file content unavailable but parsed_text exists "
+                f"({empty_chars} chars) -- using parsed_text as content fallback"
+            )
+            content = parsed_assistant_text
 
         return ResearchResponse(
             status="success",
