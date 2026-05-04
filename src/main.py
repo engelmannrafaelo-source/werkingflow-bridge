@@ -2280,6 +2280,19 @@ async def chat_completions(
                     "max_turns": claude_options.get('max_turns'),
                     "tools_enabled": request_body.enable_tools
                 }
+                # Feed adaptive limiter so it shrinks cap and Lua-routing avoids
+                # this worker temporarily. Symmetric to the 429-feedback path.
+                try:
+                    from src.middleware.rolling_metrics import get_rolling_metrics
+                    get_rolling_metrics().record_worker_crash(_self_worker)
+                    logger.warning(
+                        f"🚨 record_worker_crash({_self_worker}) — SDK silent stall "
+                        f"(chunks={len(chunks)}, prompt_len={len(prompt)}) — "
+                        f"adaptive cap will shrink at next tune tick"
+                    )
+                except Exception as _rce:
+                    logger.error(f"record_worker_crash failed (non-fatal): {_rce}")
+
                 raise HTTPException(status_code=500, detail=f"No response from Claude Code: {error_detail}")
             
             # Filter out tool usage and thinking blocks

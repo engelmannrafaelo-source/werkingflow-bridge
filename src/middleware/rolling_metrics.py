@@ -33,6 +33,7 @@ class _Bucket:
     """One 1-second bucket of metrics."""
     __slots__ = (
         "arrivals", "completions", "errors", "rate_limit_hits",
+        "crash_hits",
         "input_tokens", "output_tokens", "duration_ms_sum",
     )
 
@@ -41,6 +42,7 @@ class _Bucket:
         self.completions = 0
         self.errors = 0
         self.rate_limit_hits = 0
+        self.crash_hits = 0
         self.input_tokens = 0
         self.output_tokens = 0
         self.duration_ms_sum = 0
@@ -146,6 +148,16 @@ class RollingMetrics:
             self._prune(ts)
             self._bucket(worker, ts).rate_limit_hits += 1
 
+    def record_worker_crash(self, worker: str) -> None:
+        """Mark that an SDK silent-stall (status=500, no assistant content)
+        was observed on `worker`. Symmetric to record_rate_limit — feeds the
+        AdaptiveLoadLimiter shrink path so a misbehaving worker is auto-
+        drained instead of being repeatedly hit by Lua-routing."""
+        with self._lock:
+            ts = self._now_bucket()
+            self._prune(ts)
+            self._bucket(worker, ts).crash_hits += 1
+
     # ------------------------------------------------------------------
     # Read API (called from /v1/metrics/queue-forecast)
     # ------------------------------------------------------------------
@@ -167,13 +179,14 @@ class RollingMetrics:
                     continue
                 w = per_worker.setdefault(worker, {
                     "arrivals": 0, "completions": 0, "errors": 0,
-                    "rate_limit_hits": 0, "input_tokens": 0,
+                    "rate_limit_hits": 0, "crash_hits": 0, "input_tokens": 0,
                     "output_tokens": 0, "duration_ms_sum": 0,
                 })
                 w["arrivals"] += b.arrivals
                 w["completions"] += b.completions
                 w["errors"] += b.errors
                 w["rate_limit_hits"] += b.rate_limit_hits
+                w["crash_hits"] += b.crash_hits
                 w["input_tokens"] += b.input_tokens
                 w["output_tokens"] += b.output_tokens
                 w["duration_ms_sum"] += b.duration_ms_sum
@@ -187,6 +200,7 @@ class RollingMetrics:
                     "completions": comp,
                     "errors": agg["errors"],
                     "rate_limit_hits": agg["rate_limit_hits"],
+                    "crash_hits": agg["crash_hits"],
                     "input_tokens": agg["input_tokens"],
                     "output_tokens": agg["output_tokens"],
                     "arrivals_per_min": round(agg["arrivals"] * 60.0 / window_seconds, 2),
@@ -203,7 +217,7 @@ class RollingMetrics:
                 if w_name not in workers_out:
                     workers_out[w_name] = {
                         "arrivals": 0, "completions": 0, "errors": 0,
-                        "rate_limit_hits": 0,
+                        "rate_limit_hits": 0, "crash_hits": 0,
                         "input_tokens": 0, "output_tokens": 0,
                         "arrivals_per_min": 0, "completions_per_min": 0,
                         "input_tokens_per_min": 0, "output_tokens_per_min": 0,
@@ -218,6 +232,7 @@ class RollingMetrics:
                 "completions": sum(w["completions"] for w in workers_out.values()),
                 "errors": sum(w["errors"] for w in workers_out.values()),
                 "rate_limit_hits": sum(w["rate_limit_hits"] for w in workers_out.values()),
+                "crash_hits": sum(w["crash_hits"] for w in workers_out.values()),
                 "input_tokens": sum(w["input_tokens"] for w in workers_out.values()),
                 "output_tokens": sum(w["output_tokens"] for w in workers_out.values()),
                 "in_flight": sum(w["in_flight"] for w in workers_out.values()),

@@ -161,6 +161,7 @@ class TuneEvent:
     cap_before: int
     cap_after: int
     observed_rate_limits: int = 0
+    observed_crash_hits: int = 0
     observed_peak_util_pct: float = 0.0
     # Point-in-time snapshot taken during the tune tick — populated for every
     # event (even "hold") so the panel can plot a continuous trajectory from
@@ -181,6 +182,7 @@ class LimiterState:
     floor_tokens: int
     ceiling_tokens: int
     last_rate_limit_ts: Optional[float] = None
+    last_crash_ts: Optional[float] = None
     last_shrink_ts: Optional[float] = None
     last_tune_ts: float = 0.0
     peak_inflight_window: List[tuple] = field(default_factory=list)
@@ -238,6 +240,7 @@ class AdaptiveLoadLimiter:
                     floor_tokens=int(raw.get("floor_tokens", FLOOR_TOKENS)),
                     ceiling_tokens=int(raw.get("ceiling_tokens", CEILING_TOKENS)),
                     last_rate_limit_ts=raw.get("last_rate_limit_ts"),
+                    last_crash_ts=raw.get("last_crash_ts"),
                     last_shrink_ts=raw.get("last_shrink_ts"),
                     last_tune_ts=float(raw.get("last_tune_ts", 0.0)),
                     peak_inflight_window=[tuple(x) for x in raw.get("peak_inflight_window", [])],
@@ -502,15 +505,19 @@ class AdaptiveLoadLimiter:
             inflight_now = self._current_inflight_tokens()
             self._track_peak(now, inflight_now)
 
-            # Recent rate-limit hits via rolling_metrics
+            # Recent rate-limit and crash hits via rolling_metrics
             rate_limit_hits = 0
+            crash_hits = 0
             try:
                 from src.middleware.rolling_metrics import get_rolling_metrics
                 summ = get_rolling_metrics().get_summary(window_seconds=SHRINK_TRIGGER_SEC)
                 wstats = summ.get("workers", {}).get(self.worker, {})
                 rate_limit_hits = int(wstats.get("rate_limit_hits", 0) or 0)
+                crash_hits = int(wstats.get("crash_hits", 0) or 0)
                 if rate_limit_hits > 0:
                     self.state.last_rate_limit_ts = now
+                if crash_hits > 0:
+                    self.state.last_crash_ts = now
             except Exception as e:
                 logger.debug(f"tune: cannot read rolling_metrics: {e}")
 
@@ -528,22 +535,39 @@ class AdaptiveLoadLimiter:
                 self.state.last_rate_limit_ts is not None
                 and (now - self.state.last_rate_limit_ts) < SHRINK_TRIGGER_SEC
             )
+            had_recent_crash = (
+                self.state.last_crash_ts is not None
+                and (now - self.state.last_crash_ts) < SHRINK_TRIGGER_SEC
+            )
             clean_long_enough = (
-                self.state.last_rate_limit_ts is None
-                or (now - self.state.last_rate_limit_ts) >= GROW_TRIGGER_SEC
+                (self.state.last_rate_limit_ts is None
+                 or (now - self.state.last_rate_limit_ts) >= GROW_TRIGGER_SEC)
+                and
+                (self.state.last_crash_ts is None
+                 or (now - self.state.last_crash_ts) >= GROW_TRIGGER_SEC)
             )
 
             direction = "hold"
             reason = "no signal"
 
-            if had_recent_rate_limit and shrink_cooldown_ok:
+            if (had_recent_rate_limit or had_recent_crash) and shrink_cooldown_ok:
                 new_cap = max(self.state.floor_tokens, int(cap_before * SHRINK_FACTOR))
                 if new_cap < cap_before:
                     direction = "shrink"
-                    reason = (
-                        f"rate-limit observed within last {SHRINK_TRIGGER_SEC}s "
-                        f"(hits={rate_limit_hits})"
-                    )
+                    if had_recent_rate_limit and had_recent_crash:
+                        reason = (
+                            f"rate_limit ({rate_limit_hits}) + worker_crash ({crash_hits}) "
+                            f"in last {SHRINK_TRIGGER_SEC}s"
+                        )
+                    elif had_recent_rate_limit:
+                        reason = (
+                            f"rate-limit observed within last {SHRINK_TRIGGER_SEC}s "
+                            f"(hits={rate_limit_hits})"
+                        )
+                    else:
+                        reason = (
+                            f"worker_crash ({crash_hits}) in last {SHRINK_TRIGGER_SEC}s"
+                        )
                     self.state.cap_tokens = new_cap
                     self.state.last_shrink_ts = now
                 else:
@@ -562,11 +586,15 @@ class AdaptiveLoadLimiter:
                     direction = "hold"
                     reason = "at ceiling; cannot grow further"
             else:
-                if had_recent_rate_limit:
-                    reason = "rate-limit seen but in shrink-cooldown"
+                if had_recent_rate_limit or had_recent_crash:
+                    reason = "rate-limit/crash seen but in shrink-cooldown"
                 elif not clean_long_enough:
+                    secs_since = min(
+                        int(now - self.state.last_rate_limit_ts) if self.state.last_rate_limit_ts else 999999,
+                        int(now - self.state.last_crash_ts) if self.state.last_crash_ts else 999999,
+                    )
                     reason = (
-                        f"recent rate-limit ({int(now - self.state.last_rate_limit_ts)}s ago); "
+                        f"recent signal ({secs_since}s ago); "
                         f"waiting {GROW_TRIGGER_SEC}s clean before growing"
                     )
                 else:
@@ -590,6 +618,7 @@ class AdaptiveLoadLimiter:
                 cap_before=cap_before,
                 cap_after=self.state.cap_tokens,
                 observed_rate_limits=rate_limit_hits,
+                observed_crash_hits=crash_hits,
                 observed_peak_util_pct=round(peak_pct, 1),
                 inflight_tokens=inflight_now,
                 inflight_count=self._current_inflight_count(),
