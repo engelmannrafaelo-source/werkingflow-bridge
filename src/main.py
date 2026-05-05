@@ -1638,8 +1638,6 @@ def extract_attribution_context(request: Request) -> dict:
 # API ENDPOINTS
 # =============================================================================
 
-@app.post("/v1/chat/completions")
-@rate_limit_endpoint("chat")
 def enforce_tools_policy(enable_tools: bool, x_claude_allowed_tools: str) -> bool:
     """Bridge contract: tools are research-only.
 
@@ -1652,6 +1650,8 @@ def enforce_tools_policy(enable_tools: bool, x_claude_allowed_tools: str) -> boo
     return enable_tools
 
 
+@app.post("/v1/chat/completions")
+@rate_limit_endpoint("chat")
 async def chat_completions(
     request_body: ChatCompletionRequest,
     request: Request,
