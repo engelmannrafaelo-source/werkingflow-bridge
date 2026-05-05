@@ -1377,29 +1377,11 @@ CRITICAL: Write file EARLY to avoid context overflow. Use Write tool for clauded
                     else:
                         raise  # Re-raise genuine parse errors to outer handler
 
-                # Post-streaming validation: Check for completion marker.
-                # 2026-05-05: SDK-early-termination from Anthropic side (mid-stream
-                # cuts during seven_day rate_limit_event warnings, capacity
-                # pressure, or upstream issues) was previously logged as warning
-                # only — fake-200 with empty content was returned to client. Now
-                # we (a) feed the adaptive limiter so Lua routes new requests
-                # away from this worker, (b) apply a short soft penalty, and
-                # (c) yield is_error so the caller can return 503 instead of 200.
+                # Post-streaming validation: Check for completion marker
                 if not response_complete and chunks_received > 0:
-                    worker_id = os.environ.get("INSTANCE_NAME", "unknown")
                     logger.warning(f"⚠️  SDK finished but NO completion marker detected!")
                     logger.warning(f"   Chunks received: {chunks_received}")
-                    logger.warning(f"   Worker {worker_id} — applying soft penalty + adaptive_limiter feedback")
-
-                    try:
-                        rate_limit_tracker.mark_soft_penalty(worker_id, 30)
-                    except Exception as exc:
-                        logger.debug(f"mark_soft_penalty failed: {exc}")
-                    try:
-                        from src.middleware.rolling_metrics import get_rolling_metrics
-                        get_rolling_metrics().record_rate_limit(worker_id)
-                    except Exception as exc:
-                        logger.debug(f"record_rate_limit failed: {exc}")
+                    logger.warning(f"   This indicates potentially incomplete response")
 
                     # Yield explicit incomplete marker
                     yield {

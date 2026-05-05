@@ -2195,46 +2195,6 @@ async def chat_completions(
 
                 chunks.append(chunk)
 
-            # 2026-05-05: detect no_completion_marker chunk (SDK terminated early).
-            # Return 503 so client knows to retry — adaptive_limiter has already
-            # been fed inside run_completion, so Lua will route the retry
-            # to a healthier worker.
-            _incomplete_chunk = next(
-                (c for c in chunks
-                 if isinstance(c, dict)
-                 and c.get("type") == "result"
-                 and c.get("subtype") == "no_completion_marker"
-                 and c.get("is_error")),
-                None,
-            )
-            if _incomplete_chunk:
-                _self_worker = os.getenv("INSTANCE_NAME", "unknown")
-                _chunks_recv = _incomplete_chunk.get("chunks_received", len(chunks))
-                logger.warning(
-                    f"⚠️  Incomplete SDK response on worker {_self_worker} "
-                    f"({_chunks_recv} chunks, no completion marker) — returning 503"
-                )
-                raise HTTPException(
-                    status_code=503,
-                    detail={
-                        "error": {
-                            "message": (
-                                f"[Bridge {_self_worker}] Upstream SDK terminated early "
-                                f"({_chunks_recv} chunks, no completion marker). Retry."
-                            ),
-                            "type": "service_unavailable",
-                            "code": "503",
-                            "source": "bridge_internal",
-                            "bridge_type": "incomplete_response",
-                            "reason": "sdk_early_termination",
-                            "retryable": True,
-                            "retry_after_s": 30,
-                            "bridge_worker": _self_worker,
-                            "chunks_received": _chunks_recv,
-                        }
-                    },
-                )
-
             # Log chunk collection for debugging
             logger.info(f"Collected {len(chunks)} chunks from Claude Code SDK")
             if DEBUG_MODE or VERBOSE:
