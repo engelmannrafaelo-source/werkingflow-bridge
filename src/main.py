@@ -2209,6 +2209,48 @@ async def chat_completions(
             # Extract assistant message
             raw_assistant_content = claude_cli.parse_claude_message(chunks)
 
+            # 2026-05-05 v2: detect SDK-early-termination (layered, post-parse).
+            # Pure-function helpers in claude_cli.py validated by pytest.
+            from src.claude_cli import is_incomplete_response, chunks_have_tool_use
+            _has_tools = chunks_have_tool_use(chunks)
+            if is_incomplete_response(len(chunks), raw_assistant_content, _has_tools):
+                _self_worker = os.getenv("INSTANCE_NAME", "unknown")
+                logger.warning(
+                    f"⚠️  Incomplete SDK response on worker {_self_worker} "
+                    f"(chunks={len(chunks)}, content_empty=True, has_tools=False) "
+                    f"— surfacing 503 + adaptive_limiter feedback"
+                )
+                from src.claude_cli import rate_limit_tracker as _rl_tracker
+                try:
+                    _rl_tracker.mark_soft_penalty(_self_worker, 30)
+                except Exception as exc:
+                    logger.debug(f"mark_soft_penalty failed: {exc}")
+                try:
+                    from src.middleware.rolling_metrics import get_rolling_metrics
+                    get_rolling_metrics().record_rate_limit(_self_worker)
+                except Exception as exc:
+                    logger.debug(f"record_rate_limit failed: {exc}")
+                raise HTTPException(
+                    status_code=503,
+                    detail={
+                        "error": {
+                            "message": (
+                                f"[Bridge {_self_worker}] Upstream SDK terminated early "
+                                f"({len(chunks)} chunks, no content). Retry."
+                            ),
+                            "type": "service_unavailable",
+                            "code": "503",
+                            "source": "bridge_internal",
+                            "bridge_type": "incomplete_response",
+                            "reason": "sdk_early_termination",
+                            "retryable": True,
+                            "retry_after_s": 30,
+                            "bridge_worker": _self_worker,
+                            "chunks_received": len(chunks),
+                        }
+                    },
+                )
+
             # Rate-limit phrasing in the assistant text (non-streaming path).
             # The streaming loop in claude_cli already calls detect_in_text per
             # block, but a sync chat completion comes back as a single message

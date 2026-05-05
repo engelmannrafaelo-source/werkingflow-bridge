@@ -400,6 +400,62 @@ class RateLimitTracker:
 rate_limit_tracker = RateLimitTracker()
 
 
+def chunks_have_tool_use(chunks: list) -> bool:
+    """True if any chunk contains a tool_use content block.
+
+    Tool-only responses (no text content but tool calls present) are valid
+    — they are returned as text=None to the caller, but the tool_use is
+    the actual response and shouldn't trigger incomplete detection.
+    """
+    for chunk in chunks:
+        if not isinstance(chunk, dict):
+            continue
+        # SDK shape varies — check both shapes
+        candidates = []
+        if "content" in chunk:
+            candidates.append(chunk["content"])
+        msg = chunk.get("message")
+        if isinstance(msg, dict) and "content" in msg:
+            candidates.append(msg["content"])
+        for content in candidates:
+            if not isinstance(content, list):
+                continue
+            for block in content:
+                if isinstance(block, dict) and block.get("type") == "tool_use":
+                    return True
+    return False
+
+
+def is_incomplete_response(
+    chunks_received: int,
+    raw_content: str | None,
+    has_tool_calls: bool,
+) -> bool:
+    """
+    Detect SDK-early-termination: stream ended with chunks but no useful output.
+
+    The Anthropic CLI SDK occasionally terminates streams mid-flight under
+    capacity pressure (seven_day rate_limit warnings, upstream issues).
+    Worker would otherwise return HTTP 200 with empty content — clients
+    parse the empty body, retry to the same broken worker, infinite loop.
+
+    Returns True when the response is broken and 503 should be surfaced.
+
+    Decisions:
+      - chunks_received == 0: separate failure mode (handled elsewhere)
+      - has_tool_calls == True: tool-only response is valid (no text needed)
+      - raw_content non-empty after strip(): legitimate text response
+      - else: chunks arrived but nothing useful came out -> incomplete
+    """
+    if chunks_received == 0:
+        return False
+    if has_tool_calls:
+        return False
+    if raw_content and raw_content.strip():
+        return False
+    return True
+
+
 class ClaudeCodeCLI:
     def __init__(self, timeout: int = 1200000, cwd: Optional[str] = None):
         self.timeout = timeout / 1000  # Convert ms to seconds
