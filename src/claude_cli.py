@@ -403,26 +403,38 @@ rate_limit_tracker = RateLimitTracker()
 def chunks_have_tool_use(chunks: list) -> bool:
     """True if any chunk contains a tool_use content block.
 
-    Tool-only responses (no text content but tool calls present) are valid
-    — they are returned as text=None to the caller, but the tool_use is
-    the actual response and shouldn't trigger incomplete detection.
+    Real SDK chunks are dataclass instances (AssistantMessage with
+    content=[TextBlock|ToolUseBlock|...]) — NOT dicts. Tests in the
+    bridge also pass dict shapes for legacy paths. Handle both.
+
+    Tool-only responses (no text content but tool calls present) are
+    valid responses; they shouldn't trigger incomplete detection.
     """
     for chunk in chunks:
-        if not isinstance(chunk, dict):
+        if chunk is None:
             continue
-        # SDK shape varies — check both shapes
-        candidates = []
-        if "content" in chunk:
-            candidates.append(chunk["content"])
-        msg = chunk.get("message")
-        if isinstance(msg, dict) and "content" in msg:
-            candidates.append(msg["content"])
-        for content in candidates:
-            if not isinstance(content, list):
-                continue
-            for block in content:
-                if isinstance(block, dict) and block.get("type") == "tool_use":
-                    return True
+        # Find content list, supporting both dict and object shapes
+        content_list = None
+        if isinstance(chunk, dict):
+            if isinstance(chunk.get("content"), list):
+                content_list = chunk["content"]
+            else:
+                msg = chunk.get("message")
+                if isinstance(msg, dict) and isinstance(msg.get("content"), list):
+                    content_list = msg["content"]
+        else:
+            attr_content = getattr(chunk, "content", None)
+            if isinstance(attr_content, list):
+                content_list = attr_content
+        if content_list is None:
+            continue
+        for block in content_list:
+            # dict-shape block
+            if isinstance(block, dict) and block.get("type") == "tool_use":
+                return True
+            # dataclass-shape block (ToolUseBlock from claude_code_sdk.types)
+            if type(block).__name__ == "ToolUseBlock":
+                return True
     return False
 
 
