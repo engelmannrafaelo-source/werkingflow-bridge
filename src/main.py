@@ -123,6 +123,7 @@ from src.middleware.bridge_error import (
     BridgeError,
     bridge_error,
     classify_exception,
+    config_error,
     SOURCE_BRIDGE_INTERNAL,
     SOURCE_UPSTREAM_ANTHROPIC,
     TYPE_INTERNAL,
@@ -1639,6 +1640,18 @@ def extract_attribution_context(request: Request) -> dict:
 
 @app.post("/v1/chat/completions")
 @rate_limit_endpoint("chat")
+def enforce_tools_policy(enable_tools: bool, x_claude_allowed_tools: str) -> bool:
+    """Bridge contract: tools are research-only.
+
+    chat_completions clients sending enable_tools=true without an
+    X-Claude-Allowed-Tools header get silently dropped to false.
+    Research opt-in MUST signal via the header (parsed downstream).
+    """
+    if enable_tools and not x_claude_allowed_tools:
+        return False
+    return enable_tools
+
+
 async def chat_completions(
     request_body: ChatCompletionRequest,
     request: Request,
@@ -1649,6 +1662,17 @@ async def chat_completions(
     import time
     from fastapi.responses import JSONResponse
     start_time = time.time()
+
+    # Force tools-policy: tools are research-only (X-Claude-Allowed-Tools header).
+    # Drop accidental enable_tools=true from any client unless they signal research.
+    _hdr_allowed = (request.headers.get("X-Claude-Allowed-Tools") or "").strip()
+    _orig_enable = request_body.enable_tools
+    request_body.enable_tools = enforce_tools_policy(_orig_enable, _hdr_allowed)
+    if _orig_enable != request_body.enable_tools:
+        logger.warning(
+            "Force-disabled enable_tools=true (no X-Claude-Allowed-Tools header). "
+            "Bridge policy: tools are research-only."
+        )
 
     # Check FastAPI API key if configured
     await verify_api_key(request, credentials)
@@ -1668,7 +1692,6 @@ async def chat_completions(
         # Contract: worker returns 500 config_error (non-retryable on same worker)
         # so operators see it loud. Nginx failover to a healthy worker still works
         # because this is raised before we hit the chat path.
-        from src.middleware.bridge_error import BridgeError, config_error
         detail = (
             f"Claude Code authentication failed "
             f"(method={auth_info.get('method', 'none')}, "
@@ -4048,7 +4071,6 @@ async def audio_transcriptions(
     openai_api_key = os.getenv("OPENAI_API_KEY")
     if not openai_api_key:
         # Config issue — surface as 500 config_error (non-retryable).
-        from src.middleware.bridge_error import BridgeError, config_error
         raise BridgeError(config_error(
             detail="OPENAI_API_KEY not configured on Bridge — contact admin"
         ))

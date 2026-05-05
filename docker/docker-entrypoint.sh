@@ -3,7 +3,7 @@ set -e
 
 # Fix permissions for volume directories at runtime
 # This must run as root before dropping to claude user
-chown -R claude:claude /app/logs /app/instances
+chown -R claude:claude /app/logs /app/instances /app/research_output
 
 # Load OAuth token from file and write to a persistent env file
 # The SDK subprocess needs CLAUDE_CODE_OAUTH_TOKEN at spawn time
