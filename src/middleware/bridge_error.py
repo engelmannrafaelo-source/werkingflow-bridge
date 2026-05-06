@@ -385,6 +385,17 @@ def classify_exception(exc: Exception) -> JSONResponse:
     msg = str(exc) or exc.__class__.__name__
     lower = msg.lower()
 
+    # 0. RateLimitError from claude_cli -- surface as account_exhausted so the
+    # BridgeError handler runs _cross_worker_retry. Inline import avoids a
+    # module-load cycle (claude_cli does not import bridge_error).
+    try:
+        from src.claude_cli import RateLimitError as _RLE
+        if isinstance(exc, _RLE):
+            retry_after = getattr(exc, "retry_after_seconds", None) or 3600
+            return account_exhausted_error(retry_after_s=int(retry_after))
+    except ImportError:
+        pass
+
     # 1. Configuration errors — surface loud and clear; not retryable.
     if any(marker in lower for marker in _CONFIG_MARKERS):
         return config_error(detail=msg[:300])

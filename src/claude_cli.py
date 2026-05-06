@@ -400,6 +400,93 @@ class RateLimitTracker:
 rate_limit_tracker = RateLimitTracker()
 
 
+def _handle_rate_limit_event(message, worker_id):
+    """Process a rate_limit_event from the SDK.
+
+    Returns None for heartbeat/warning/unknown status (caller continues).
+    Raises RateLimitError for "hit" so the FastAPI exception flow can
+    attempt a cross-worker retry. classify_exception in bridge_error.py
+    maps RateLimitError to account_exhausted_error so the BridgeError
+    handler runs _cross_worker_retry.
+    """
+    raw = getattr(message, "raw", None)
+    rli = raw.get("rate_limit_info", {}) if isinstance(raw, dict) else {}
+    rl_status = rli.get("status")
+    rl_type = rli.get("rateLimitType") or "anthropic"
+
+    reset_target = None
+    if message.reset_at is not None:
+        reset_target = float(message.reset_at)
+    elif rli.get("resetsAt"):
+        reset_target = float(rli["resetsAt"])
+
+    is_heartbeat = rl_status in (None, "allowed")
+    is_warning = (rl_status == "allowed_warning")
+    is_hit = (
+        not is_heartbeat
+        and not is_warning
+        and (rl_status is not None
+             or message.retry_after is not None
+             or (message.message and message.message.strip()))
+    )
+
+    if is_heartbeat:
+        logger.debug(
+            f"rate_limit_event heartbeat for {worker_id} "
+            f"(status={rl_status}, type={rl_type}) — no penalty"
+        )
+        return None
+
+    if is_warning:
+        util = rli.get("utilization")
+        surpassed = rli.get("surpassedThreshold")
+        logger.info(
+            f"⏳ Worker {worker_id} approaching {rl_type} limit "
+            f"(status={rl_status}, util={util}, "
+            f"surpassed={surpassed}) — soft penalty"
+        )
+        rate_limit_tracker.mark_soft_penalty(worker_id, 60)
+        return None
+
+    if is_hit:
+        logger.info(
+            f"🔒 Worker {worker_id} hit {rl_type} limit "
+            f"(status={rl_status}, retry_after={message.retry_after}, "
+            f"reset_at={reset_target}) — capacity lock + raise"
+        )
+        rate_limit_tracker.mark_soft_penalty(worker_id, message.retry_after or 60)
+        try:
+            from src.middleware.capacity_lock import get_capacity_lock as _get_cap_lock
+            _cap = _get_cap_lock()
+            if reset_target:
+                _cap.lock_until(worker_id, reset_target, rl_type)
+            else:
+                logger.warning(
+                    f"rate_limit hit on {worker_id} but no reset signal — "
+                    f"soft penalty only, adaptive_limiter polling will catch >=95%"
+                )
+        except Exception as exc:
+            logger.error(f"capacity_lock.lock_until failed: {exc}")
+        try:
+            from src.middleware.rolling_metrics import get_rolling_metrics
+            get_rolling_metrics().record_rate_limit(worker_id)
+        except Exception as exc:
+            logger.debug(f"rolling_metrics.record_rate_limit failed: {exc}")
+
+        reset_dt = datetime.fromtimestamp(reset_target) if reset_target else None
+        raise RateLimitError(
+            f"[{worker_id}] Anthropic {rl_type} limit hit",
+            reset_time=reset_dt,
+            retry_after_seconds=message.retry_after,
+        )
+
+    logger.info(
+        f"rate_limit_event unknown status for {worker_id} "
+        f"(status={rl_status}, raw={str(raw)[:200]}) — no action"
+    )
+    return None
+
+
 def chunks_have_tool_use(chunks: list) -> bool:
     """True if any chunk contains a tool_use content block.
 
@@ -1180,71 +1267,7 @@ CRITICAL: Write file EARLY to avoid context overflow. Use Write tool for clauded
                             # =============================================================
                             if isinstance(message, RateLimitEvent):
                                 worker_id = os.environ.get("INSTANCE_NAME", "unknown")
-                                # Single source of truth: rate_limit_info.status from Anthropic.
-                                #   'allowed' / None    → heartbeat              → no penalty
-                                #   'allowed_warning'   → approaching limit ≥90% → soft penalty
-                                #   anything else + reset/retry signal → hit     → lock until Anthropic reset
-                                # Lock duration ONLY from Anthropic (retry_after, reset_at, resetsAt).
-                                # If Anthropic doesn't tell us when, soft penalty only — no arbitrary lock.
-                                raw = getattr(message, "raw", None)
-                                rli = raw.get("rate_limit_info", {}) if isinstance(raw, dict) else {}
-                                rl_status = rli.get("status")
-                                rl_type = rli.get("rateLimitType") or "anthropic"
-                                reset_target = None
-                                if message.reset_at is not None:
-                                    reset_target = float(message.reset_at)
-                                elif rli.get("resetsAt"):
-                                    reset_target = float(rli["resetsAt"])
-                                is_heartbeat = rl_status in (None, "allowed")
-                                is_warning = (rl_status == "allowed_warning")
-                                is_hit = (
-                                    not is_heartbeat
-                                    and not is_warning
-                                    and (rl_status is not None
-                                         or message.retry_after is not None
-                                         or (message.message and message.message.strip()))
-                                )
-                                if is_heartbeat:
-                                    logger.debug(
-                                        f"rate_limit_event heartbeat for {worker_id} "
-                                        f"(status={rl_status}, type={rl_type}) — no penalty"
-                                    )
-                                elif is_warning:
-                                    logger.info(
-                                        f"⏳ Worker {worker_id} approaching {rl_type} limit "
-                                        f"(status={rl_status}, util={rli.get('utilization')}, "
-                                        f"surpassed={rli.get('surpassedThreshold')}) — soft penalty"
-                                    )
-                                    rate_limit_tracker.mark_soft_penalty(worker_id, 60)
-                                elif is_hit:
-                                    logger.info(
-                                        f"🔒 Worker {worker_id} hit {rl_type} limit "
-                                        f"(status={rl_status}, retry_after={message.retry_after}, "
-                                        f"reset_at={reset_target}) — capacity lock"
-                                    )
-                                    rate_limit_tracker.mark_soft_penalty(worker_id, message.retry_after or 60)
-                                    try:
-                                        from src.middleware.capacity_lock import get_capacity_lock as _get_cap_lock
-                                        _cap = _get_cap_lock()
-                                        if reset_target:
-                                            _cap.lock_until(worker_id, reset_target, rl_type)
-                                        else:
-                                            logger.warning(
-                                                f"rate_limit hit on {worker_id} but no reset signal — "
-                                                f"soft penalty only, adaptive_limiter polling will catch ≥95%"
-                                            )
-                                    except Exception as exc:
-                                        logger.error(f"capacity_lock.lock_until failed: {exc}")
-                                    try:
-                                        from src.middleware.rolling_metrics import get_rolling_metrics
-                                        get_rolling_metrics().record_rate_limit(worker_id)
-                                    except Exception as exc:
-                                        logger.debug(f"rolling_metrics.record_rate_limit failed: {exc}")
-                                else:
-                                    logger.info(
-                                        f"rate_limit_event unknown status for {worker_id} "
-                                        f"(status={rl_status}, raw={str(raw)[:200]}) — no action"
-                                    )
+                                _handle_rate_limit_event(message, worker_id)
                                 continue
 
                             chunks_received += 1
