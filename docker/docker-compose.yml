@@ -83,6 +83,7 @@ services:
       - PRIVACY_LOG_DETECTIONS=false
       - SKIP_SDK_VERIFICATION=true
       - RATE_LIMIT_ENABLED=false
+      - DEFAULT_PRIVACY_MODE=none
       - PRIVACY_SERVICE_URL=http://privacy-service:8100
       - AI_BRIDGE_URL_PROD_FALLBACK=${AI_BRIDGE_URL_PROD_FALLBACK:-}
     healthcheck:
@@ -145,6 +146,7 @@ services:
       - PRIVACY_LOG_DETECTIONS=false
       - SKIP_SDK_VERIFICATION=true
       - RATE_LIMIT_ENABLED=false
+      - DEFAULT_PRIVACY_MODE=none
       - PRIVACY_SERVICE_URL=http://privacy-service:8100
       - AI_BRIDGE_URL_PROD_FALLBACK=${AI_BRIDGE_URL_PROD_FALLBACK:-}
     healthcheck:
@@ -207,6 +209,7 @@ services:
       - PRIVACY_LOG_DETECTIONS=false
       - SKIP_SDK_VERIFICATION=true
       - RATE_LIMIT_ENABLED=false
+      - DEFAULT_PRIVACY_MODE=none
       - PRIVACY_SERVICE_URL=http://privacy-service:8100
       - AI_BRIDGE_URL_PROD_FALLBACK=${AI_BRIDGE_URL_PROD_FALLBACK:-}
     healthcheck:
@@ -269,6 +272,7 @@ services:
       - PRIVACY_LOG_DETECTIONS=false
       - SKIP_SDK_VERIFICATION=true
       - RATE_LIMIT_ENABLED=false
+      - DEFAULT_PRIVACY_MODE=none
       - PRIVACY_SERVICE_URL=http://privacy-service:8100
       - AI_BRIDGE_URL_PROD_FALLBACK=${AI_BRIDGE_URL_PROD_FALLBACK:-}
     healthcheck:

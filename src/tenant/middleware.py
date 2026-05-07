@@ -97,13 +97,13 @@ class TenantMiddleware(BaseHTTPMiddleware):
     - Rate limiting (per-tenant)
     - Usage tracking
 
-    If no tenant headers: Uses default DSGVO-compliant settings (full privacy).
+    If no tenant headers: Privacy is OFF by default. Opt-in via X-Privacy-Mode header (basic or full).
     """
 
     def __init__(
         self,
         app,
-        default_privacy_mode: str = "full",
+        default_privacy_mode: str = "none",
         require_tenant_auth: bool = False
     ):
         """
@@ -333,9 +333,9 @@ def get_privacy_mode_from_request(request: Request) -> str:
     """
     Get privacy mode from request state.
 
-    Returns "full" if no tenant context (DSGVO-safe default).
+    Returns "none" if no tenant context (privacy off by default; opt-in via X-Privacy-Mode header).
     """
-    return getattr(request.state, "privacy_mode", "full")
+    return getattr(request.state, "privacy_mode", "none")
 
 
 def get_user_id_from_request(request: Request) -> Optional[str]:
