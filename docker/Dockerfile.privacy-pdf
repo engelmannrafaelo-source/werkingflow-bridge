@@ -69,4 +69,7 @@ EXPOSE 8100
 HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
   CMD curl -f http://localhost:8100/health || exit 1
 
-CMD ["poetry", "run", "uvicorn", "src.privacy_service.app:app", "--host", "0.0.0.0", "--port", "8100"]
+# UVICORN_WORKERS env var controls process pool size (default 1 for backwards compat).
+# Each worker loads spaCy + Presidio + Docling models into memory (~2-3 GiB),
+# so size according to host RAM. Set DOCLING_THREADS for per-PDF parallelism.
+CMD ["sh", "-c", "poetry run uvicorn src.privacy_service.app:app --host 0.0.0.0 --port 8100 --workers ${UVICORN_WORKERS:-1}"]

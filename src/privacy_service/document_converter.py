@@ -141,7 +141,11 @@ def convert_pdf_bytes(pdf_bytes: bytes) -> Tuple[str, Dict[str, Any], Dict[str, 
     rewrite).
     """
     from docling.document_converter import DocumentConverter, PdfFormatOption
-    from docling.datamodel.pipeline_options import PdfPipelineOptions
+    from docling.datamodel.pipeline_options import (
+        PdfPipelineOptions,
+        AcceleratorOptions,
+        AcceleratorDevice,
+    )
     from docling.datamodel.base_models import InputFormat
     from docling_core.types.doc.base import ImageRefMode
 
@@ -149,6 +153,10 @@ def convert_pdf_bytes(pdf_bytes: bytes) -> Tuple[str, Dict[str, Any], Dict[str, 
     pipeline_options.generate_picture_images = True
     pipeline_options.generate_table_images = False
     pipeline_options.do_ocr = True
+    pipeline_options.accelerator_options = AcceleratorOptions(
+        num_threads=int(os.getenv("DOCLING_THREADS", "1")),
+        device=AcceleratorDevice.CPU,
+    )
 
     converter = DocumentConverter(
         format_options={InputFormat.PDF: PdfFormatOption(pipeline_options=pipeline_options)}

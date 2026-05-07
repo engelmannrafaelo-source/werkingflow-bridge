@@ -109,15 +109,18 @@ services:
     deploy:
       resources:
         limits:
-          memory: 4G
+          memory: 5G
         reservations:
-          memory: 1G
+          memory: 2G
     environment:
       - TZ=Europe/Vienna
       - LOG_LEVEL=INFO
       - PRIVACY_ENABLED=true
       - PRIVACY_LANGUAGE=de
       - PRIVACY_LOG_DETECTIONS=false
+      # 4-core host: 2 uvicorn workers x 2 Docling threads -> uses all cores under load
+      - UVICORN_WORKERS=2
+      - DOCLING_THREADS=2
       - BRIDGE_SELF_URL=http://nginx:80/v1/chat/completions
       - API_KEY=${API_KEY:-}
       - CONVERTAPI_SECRET=${CONVERTAPI_SECRET}
@@ -127,7 +130,7 @@ services:
       interval: 30s
       timeout: 10s
       retries: 3
-      start_period: 60s
+      start_period: 120s
     restart: unless-stopped
     networks:
       - bridge-prod-net
