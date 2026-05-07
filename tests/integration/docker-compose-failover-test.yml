@@ -1,0 +1,58 @@
+version: "3.8"
+# Isolated test stack for nginx Default Pool failover tests.
+# Always run with: --project-name nginx-test
+# NEVER use --remove-orphans
+
+services:
+  worker1:
+    image: python:3.11-slim
+    environment:
+      STATUS_CODE: "${WORKER1_STATUS:-500}"
+    volumes:
+      - ./mock_worker.py:/app/mock_worker.py:ro
+    command: ["python3", "/app/mock_worker.py"]
+
+  worker2:
+    image: python:3.11-slim
+    environment:
+      STATUS_CODE: "${WORKER2_STATUS:-500}"
+    volumes:
+      - ./mock_worker.py:/app/mock_worker.py:ro
+    command: ["python3", "/app/mock_worker.py"]
+
+  worker3:
+    image: python:3.11-slim
+    environment:
+      STATUS_CODE: "${WORKER3_STATUS:-500}"
+    volumes:
+      - ./mock_worker.py:/app/mock_worker.py:ro
+    command: ["python3", "/app/mock_worker.py"]
+
+  worker4:
+    image: python:3.11-slim
+    environment:
+      STATUS_CODE: "${WORKER4_STATUS:-500}"
+    volumes:
+      - ./mock_worker.py:/app/mock_worker.py:ro
+    command: ["python3", "/app/mock_worker.py"]
+
+  metrics-reader:
+    image: python:3.11-slim
+    volumes:
+      - ./mock_metrics_reader.py:/app/mock_metrics_reader.py:ro
+    command: ["python3", "/app/mock_metrics_reader.py"]
+
+  nginx-lb:
+    image: docker-nginx:latest
+    ports:
+      - "19080:80"
+    volumes:
+      - ./nginx-test.conf:/etc/nginx/nginx.conf:ro
+      - ../../docker/lua:/etc/nginx/lua:ro
+    depends_on:
+      - worker1
+      - worker2
+      - worker3
+      - worker4
+      - metrics-reader
+    command: ["/bin/sh", "-c", "mkdir -p /var/log/nginx && touch /var/log/nginx/access.jsonl && openresty -c /etc/nginx/nginx.conf -g 'daemon off;'"]

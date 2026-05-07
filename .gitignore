@@ -99,3 +99,4 @@ logs/
 # Generator outputs (regenerate per host)
 docker/docker-compose.generated.yml
 docker/upstreams.generated.conf
+tests/integration/nginx-test.conf
