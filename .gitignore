@@ -95,3 +95,7 @@ dist/
 
 # Local runtime logs
 logs/
+
+# Generator outputs (regenerate per host)
+docker/docker-compose.generated.yml
+docker/upstreams.generated.conf
