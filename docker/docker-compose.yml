@@ -308,7 +308,7 @@ services:
       - PRIVACY_LANGUAGE=de
       - PRIVACY_LOG_DETECTIONS=false
       # 16-core host: 4 uvicorn workers x 4 Docling threads -> uses all cores under load
-      - UVICORN_WORKERS=4
+      - UVICORN_WORKERS=2
       - DOCLING_THREADS=4
       # Smart-anonymize self-calls back to workers via nginx
       - BRIDGE_SELF_URL=http://nginx:80/v1/chat/completions
