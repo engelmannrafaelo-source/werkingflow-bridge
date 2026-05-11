@@ -16,6 +16,7 @@ import re
 import httpx
 from typing import List, Dict, Any, Optional, Tuple
 from dataclasses import dataclass
+from fastapi import HTTPException
 from config.logging_config import get_logger
 
 logger = get_logger(__name__)
@@ -360,6 +361,11 @@ class VisionProvider:
                     "error": error_body[:500]
                 }
             )
+            if 400 <= response.status_code < 500 and response.status_code != 429:
+                raise HTTPException(
+                    status_code=response.status_code,
+                    detail=error_body[:1000]
+                )
             raise RuntimeError(
                 f"Anthropic API error ({response.status_code}): {error_body[:200]}"
             )
