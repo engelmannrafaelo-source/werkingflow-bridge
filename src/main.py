@@ -1725,6 +1725,7 @@ async def chat_completions(
         # Safety: in-progress tasks NEVER abort — this only affects NEW requests.
         # =======================================================================
         worker_id = os.getenv("INSTANCE_NAME", "unknown")
+        _self_worker = worker_id  # defined once; all error branches below use this
         from src.claude_cli import rate_limit_tracker
         if rate_limit_tracker.should_reject_new_request(worker_id):
             retry_after = rate_limit_tracker.get_retry_after(worker_id) or 0
@@ -2237,7 +2238,6 @@ async def chat_completions(
             from src.claude_cli import is_incomplete_response, chunks_have_tool_use
             _has_tools = chunks_have_tool_use(chunks)
             if is_incomplete_response(len(chunks), raw_assistant_content, _has_tools):
-                _self_worker = os.getenv("INSTANCE_NAME", "unknown")
                 logger.warning(
                     f"⚠️  Incomplete SDK response on worker {_self_worker} "
                     f"(chunks={len(chunks)}, content_empty=True, has_tools=False) "
@@ -2283,7 +2283,6 @@ async def chat_completions(
             # the same exhausted account.
             if raw_assistant_content:
                 from src.claude_cli import rate_limit_tracker as _rl_tracker
-                _self_worker = os.getenv("INSTANCE_NAME", "unknown")
                 _rl_match = _rl_tracker.detect_in_text(raw_assistant_content, _self_worker)
                 if _rl_match:
                     _retry_after = _rl_tracker.get_retry_after(_self_worker) or 60
