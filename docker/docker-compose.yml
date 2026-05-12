@@ -91,7 +91,7 @@ services:
       interval: 30s
       timeout: 10s
       retries: 3
-      start_period: 40s
+      start_period: 240s
     restart: unless-stopped
     networks:
       - bridge-net
@@ -154,7 +154,7 @@ services:
       interval: 30s
       timeout: 10s
       retries: 3
-      start_period: 40s
+      start_period: 240s
     restart: unless-stopped
     networks:
       - bridge-net
@@ -217,7 +217,7 @@ services:
       interval: 30s
       timeout: 10s
       retries: 3
-      start_period: 40s
+      start_period: 240s
     restart: unless-stopped
     networks:
       - bridge-net
@@ -280,7 +280,7 @@ services:
       interval: 30s
       timeout: 10s
       retries: 3
-      start_period: 40s
+      start_period: 240s
     restart: unless-stopped
     networks:
       - bridge-net
