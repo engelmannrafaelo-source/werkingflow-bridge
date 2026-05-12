@@ -233,7 +233,7 @@ phase_validate() {
         # Server-2: envsubst '$BRIDGE_PRIMARY_HOST $BRIDGE_ID', upstreams: worker-prod, metrics-reader-prod
         nginx_conf="docker/nginx-prod.conf"
         envsubst_vars='$BRIDGE_PRIMARY_HOST $BRIDGE_ID'
-        add_hosts="--add-host=worker-prod:127.0.0.1 --add-host=metrics-reader-prod:127.0.0.1"
+        add_hosts="--add-host=worker-sahori:127.0.0.1 --add-host=worker-kurt:127.0.0.1 --add-host=metrics-reader-prod:127.0.0.1"
     else
         # Hetzner: envsubst '$BRIDGE_PROD_HOST $BRIDGE_ID', upstreams: worker1-4, metrics-reader
         nginx_conf="docker/nginx.conf"
