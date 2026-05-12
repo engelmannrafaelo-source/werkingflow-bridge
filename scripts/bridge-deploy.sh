@@ -231,17 +231,38 @@ phase_validate() {
     # then nginx -t inside nginx:alpine with --add-host for all internal upstream hostnames
     # (needed because nginx -t resolves upstream hosts; they only exist inside the compose
     # network at runtime, not in this test container).
+    #
+    # add-host list is derived from the compose service names so a worker rename
+    # (e.g. worker-prod → worker-sahori + worker-kurt, commit ad14f82) doesn't
+    # silently break the next deploy — the previous hardcoded list was the
+    # actual root cause of three rolled-back server2 deploys on 12.05.2026.
     local nginx_conf envsubst_vars add_hosts
     if [[ "$compose" == *"prod"* ]]; then
-        # Server-2: envsubst '$BRIDGE_PRIMARY_HOST $BRIDGE_ID', upstreams: worker-prod, metrics-reader-prod
         nginx_conf="docker/nginx-prod.conf"
         envsubst_vars='$BRIDGE_PRIMARY_HOST $BRIDGE_ID'
-        add_hosts="--add-host=worker-sahori:127.0.0.1 --add-host=worker-kurt:127.0.0.1 --add-host=metrics-reader-prod:127.0.0.1"
     else
-        # Hetzner: envsubst '$BRIDGE_PROD_HOST $BRIDGE_ID', upstreams: worker1-4, metrics-reader
         nginx_conf="docker/nginx.conf"
         envsubst_vars='$BRIDGE_PROD_HOST $BRIDGE_ID'
-        add_hosts="--add-host=worker1:127.0.0.1 --add-host=worker2:127.0.0.1 --add-host=worker3:127.0.0.1 --add-host=worker4:127.0.0.1 --add-host=metrics-reader:127.0.0.1"
+    fi
+    # Pull every top-level service from the compose file, drop the lb itself
+    # (nginx is the test target, doesn't need to resolve itself), map each
+    # to 127.0.0.1 so nginx -t's upstream resolution succeeds in the test
+    # container even though those services only exist inside the compose net.
+    # awk stays in_services until the next top-level YAML section so
+    # networks/volumes/secrets entries don't bleed into the host list.
+    add_hosts=$(rssh "$host" "
+        cd ${REMOTE_REPO}
+        awk '
+          /^services:/ { in_services=1; next }
+          /^[a-z][a-zA-Z0-9_-]*:\$/ { in_services=0 }
+          in_services && /^  [a-zA-Z0-9_-]+:\$/ { gsub(/[ :]/, \"\"); print }
+        ' ${compose} \
+          | grep -vE '^(nginx|lb)\$' \
+          | sed 's|^|--add-host=|;s|\$|:127.0.0.1|' \
+          | tr '\n' ' '
+    " 2>&1) || add_hosts=""
+    if [ -z "$add_hosts" ]; then
+        warn "Could not derive add_hosts from ${compose} — nginx test will run without it"
     fi
     info "nginx config syntax check (${nginx_conf})..."
     local nginx_output
