@@ -21,8 +21,12 @@ SSH_BASE_OPTS="-i ${SSH_KEY} -o ConnectTimeout=10 -o StrictHostKeyChecking=no -o
 REMOTE_REPO="/root/werkingflow-bridge"
 HETZNER_COMPOSE="docker/docker-compose.yml"
 SERVER2_COMPOSE="docker/docker-compose-prod.yml"
-HEALTH_TIMEOUT=120
-ROLLBACK_HEALTH_TIMEOUT=240   # SDK init on rollback takes >60s; give 4 min
+# Worker SDK-init reliably takes 90-150s on a fresh container — the old
+# default of 120s was tighter than the actual boot time and triggered
+# spurious auto-rollbacks on healthy deploys. Match the rollback budget
+# (4 min) by default; per-call override stays available via env var.
+HEALTH_TIMEOUT="${HEALTH_TIMEOUT:-240}"
+ROLLBACK_HEALTH_TIMEOUT="${ROLLBACK_HEALTH_TIMEOUT:-240}"   # SDK init on rollback takes >60s; give 4 min
 SKIP_DIST_TEST="${SKIP_DIST_TEST:-false}"  # escape hatch: SKIP_DIST_TEST=true bridge-deploy.sh hetzner
 MIN_FREE_KB=$(( 5 * 1024 * 1024 ))  # 5 GB in KiB
 
