@@ -21,12 +21,16 @@ SSH_BASE_OPTS="-i ${SSH_KEY} -o ConnectTimeout=10 -o StrictHostKeyChecking=no -o
 REMOTE_REPO="/root/werkingflow-bridge"
 HETZNER_COMPOSE="docker/docker-compose.yml"
 SERVER2_COMPOSE="docker/docker-compose-prod.yml"
-# Worker SDK-init reliably takes 90-150s on a fresh container — the old
-# default of 120s was tighter than the actual boot time and triggered
-# spurious auto-rollbacks on healthy deploys. Match the rollback budget
-# (4 min) by default; per-call override stays available via env var.
-HEALTH_TIMEOUT="${HEALTH_TIMEOUT:-240}"
-ROLLBACK_HEALTH_TIMEOUT="${ROLLBACK_HEALTH_TIMEOUT:-240}"   # SDK init on rollback takes >60s; give 4 min
+# Worker init on a fresh container is much slower than expected: container
+# bootstrap (~60s) + a ~80s blocking pause inside lifespan between
+# "Session cleanup task started" and "AdaptiveLoadLimiter tune loop started"
+# (root cause of that pause not yet investigated, observed Apr/May 2026).
+# Total time-to-healthy is consistently ~4 min in production, occasionally
+# longer. Old 120s/240s defaults were both too tight and triggered
+# spurious auto-rollbacks on otherwise-healthy deploys. 360s gives
+# enough headroom; per-call override stays available via env var.
+HEALTH_TIMEOUT="${HEALTH_TIMEOUT:-360}"
+ROLLBACK_HEALTH_TIMEOUT="${ROLLBACK_HEALTH_TIMEOUT:-360}"   # symmetric: rollback restart hits the same lifespan pause
 SKIP_DIST_TEST="${SKIP_DIST_TEST:-false}"  # escape hatch: SKIP_DIST_TEST=true bridge-deploy.sh hetzner
 MIN_FREE_KB=$(( 5 * 1024 * 1024 ))  # 5 GB in KiB
 
