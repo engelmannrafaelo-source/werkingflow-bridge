@@ -47,11 +47,14 @@ HETZNER_NEEDS_BUILD="nginx worker1 worker2 worker3 worker4 privacy-service metri
 
 # Server-2: service → container name (use _ not - for var names)
 SERVER2_SVC_nginx="eco-prod-lb"
-SERVER2_SVC_worker_prod="eco-prod-worker"
+# Replaces the old single worker-prod after commit ad14f82 split it into
+# two-account workers (sahori + kurt) for ~2x rate-limit capacity.
+SERVER2_SVC_worker_sahori="eco-prod-worker-sahori"
+SERVER2_SVC_worker_kurt="eco-prod-worker-kurt"
 SERVER2_SVC_privacy_prod="eco-prod-privacy"
 SERVER2_SVC_metrics_reader_prod="eco-prod-metrics-reader"
-SERVER2_ALL="nginx worker-prod privacy-prod metrics-reader-prod"
-SERVER2_NEEDS_BUILD="worker-prod privacy-prod metrics-reader-prod"
+SERVER2_ALL="nginx worker-sahori worker-kurt privacy-prod metrics-reader-prod"
+SERVER2_NEEDS_BUILD="worker-sahori worker-kurt privacy-prod metrics-reader-prod"
 
 # State (reset per server in deploy_server)
 ROLLBACK_SHA=""
