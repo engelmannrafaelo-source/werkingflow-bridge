@@ -3798,7 +3798,31 @@ async def get_privacy_status():
 
 @app.post("/v1/privacy/smart-anonymize")
 async def smart_anonymize_endpoint(request_body: SmartAnonymizeRequest):
-    """Smart pseudonymization. Proxied to privacy-pdf-service container."""
+    """Smart pseudonymization. Proxied to privacy-pdf-service container.
+
+    When ``BRIDGE_ANONYMIZE_ENABLED`` is unset/false (the current default
+    while the privacy-service backend is unstable) the bridge bypasses the
+    downstream call entirely and echoes the input back as a successful
+    no-op anonymization: same text, empty mapping, zero entities. Callers
+    that store the mapping for later de-anonymization keep working — they
+    just won't have anything to substitute back.
+
+    Flip to true on the Hetzner host once the privacy-service is reliable
+    again; no app-side change required.
+    """
+    if os.environ.get("BRIDGE_ANONYMIZE_ENABLED", "").lower() != "true":
+        return SmartAnonymizeResponse(
+            status="success",
+            raw_anonymized_text=request_body.text,
+            raw_entity_count=0,
+            smart_anonymized_text=request_body.text,
+            smart_entity_count=0,
+            restored_entities=[],
+            mapping={},
+            detected_entities=[],
+            error=None,
+        )
+
     privacy_client = get_privacy_client()
     try:
         client = await privacy_client._get_client()
@@ -4052,8 +4076,29 @@ async def convert_and_anonymize_document_endpoint(
     """Atomic convert + smart-anonymize via the privacy service.
 
     Bridge does not persist the returned mapping — apps store it themselves.
+
+    BRIDGE_ANONYMIZE_ENABLED off (current default) routes the call through
+    plain /document/convert and stitches an empty ``mapping`` field onto the
+    response so the response shape matches what the document-pipeline client
+    expects — convert runs, anonymize is a no-op.
     """
     await verify_api_key(request, credentials)
+
+    if os.environ.get("BRIDGE_ANONYMIZE_ENABLED", "").lower() != "true":
+        # Plain convert + empty mapping. Conversion still hits the privacy-pdf
+        # container (Docling lives there) but the smart-anonymize step is skipped.
+        response = await _proxy_document_endpoint(
+            request, "/document/convert", timeout=600.0
+        )
+        try:
+            payload = json.loads(response.body)
+        except Exception:
+            return response
+        if isinstance(payload, dict) and payload.get("status") != "error":
+            payload.setdefault("mapping", {})
+            payload.setdefault("entity_count", 0)
+        return JSONResponse(status_code=response.status_code, content=payload)
+
     return await _proxy_document_endpoint(
         request, "/document/convert-and-anonymize", timeout=900.0
     )
