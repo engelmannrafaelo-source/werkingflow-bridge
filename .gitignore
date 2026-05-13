@@ -100,3 +100,8 @@ logs/
 docker/docker-compose.generated.yml
 docker/upstreams.generated.conf
 tests/integration/nginx-test.conf
+
+# Platform-Layer migration backups (timestamp-tagged, never commit)
+*.bak-pre-*
+**/*.bak-pre-*
+docker/nginx.conf.bak.*

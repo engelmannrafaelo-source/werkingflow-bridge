@@ -397,6 +397,22 @@ async def cleanup_old_sessions():
         await asyncio.sleep(CHECK_INTERVAL_SECONDS)
 
 
+# Bridge platform layer — DB-backed Identity/Tenants/Budget/Billing/Activity.
+# Optional: only mounted when BRIDGE_DB_URL is set. The existing LLM-routing
+# code paths are untouched.
+try:
+    from src.db.client import init_pool, close_pool, is_db_enabled
+    from src.db.admin_routes import router as admin_db_router
+    from src.identity.routes import router as identity_router
+    from src.budget.routes import router as budget_router
+    from src.billing.routes import router as billing_router
+    from src.activity.routes import router as activity_router
+    BRIDGE_DB_LAYER_AVAILABLE = True
+except Exception as _db_imp_err:
+    BRIDGE_DB_LAYER_AVAILABLE = False
+    logger.warning(f"Bridge DB layer unavailable ({_db_imp_err}); running LLM-routing only.")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Verify Claude Code authentication and CLI on startup."""
@@ -515,6 +531,17 @@ async def lifespan(app: FastAPI):
     except Exception as _e:
         logger.error(f"Failed to start AdaptiveLoadLimiter: {_e}")
 
+    # Bridge platform-layer: initialise Postgres pool BEFORE serving requests.
+    # If BRIDGE_DB_URL is not set, is_db_enabled() returns False and init_pool()
+    # is a no-op — keeps the LLM-only deployment path working.
+    if BRIDGE_DB_LAYER_AVAILABLE and is_db_enabled():
+        try:
+            await init_pool()
+            logger.info("✅ Bridge DB pool initialised (asyncpg)")
+        except Exception as e:
+            logger.error(f"❌ Bridge DB pool init failed: {e}")
+            raise
+
     yield
 
     # Cleanup on shutdown
@@ -524,6 +551,12 @@ async def lifespan(app: FastAPI):
         get_adaptive_limiter().stop()
     except Exception:
         pass
+    if BRIDGE_DB_LAYER_AVAILABLE and is_db_enabled():
+        try:
+            await close_pool()
+            logger.info("✅ Bridge DB pool closed")
+        except Exception:
+            pass
 
 
 # Create FastAPI app
@@ -533,6 +566,15 @@ app = FastAPI(
     version="1.0.0",
     lifespan=lifespan
 )
+
+# Bridge platform routes — only mounted when DB is configured.
+if BRIDGE_DB_LAYER_AVAILABLE and is_db_enabled():
+    app.include_router(admin_db_router)
+    app.include_router(identity_router)
+    app.include_router(budget_router)
+    app.include_router(billing_router)
+    app.include_router(activity_router)
+    logger.info("✅ Bridge platform routes mounted: /v1/users /v1/auth /v1/budget /v1/billing /v1/activity")
 
 # Configure CORS
 cors_origins = json.loads(os.getenv("CORS_ORIGINS", '["*"]'))

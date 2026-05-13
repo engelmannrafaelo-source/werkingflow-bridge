@@ -1,0 +1,54 @@
+# =============================================================================
+# Bridge Platform-Layer — Additive Overlay für docker-compose-prod.yml
+#
+# Adds Postgres for Identity/Tenants/Budget/Billing/Activity.
+# Worker-Services in docker-compose-prod.yml bleiben unverändert; ihre Env wird
+# über die separate platform.env-Datei erweitert (siehe deploy notes).
+#
+# Usage:
+#   docker compose -f docker-compose-prod.yml -f docker-compose-prod-platform.yml up -d postgres-prod
+#
+# Postgres läuft im gleichen Network (bridge-prod-net) wie die Worker, damit
+# der Bridge-Hostname "postgres-prod:5432" funktioniert.
+# =============================================================================
+
+services:
+  postgres-prod:
+    image: postgres:16-alpine
+    container_name: bridge-postgres-prod
+    # Host-Port absichtlich NICHT exposed (5432:5432) — Postgres ist nur
+    # innerhalb des bridge-prod-net erreichbar. Reduziert Attack Surface.
+    expose:
+      - "5432"
+    environment:
+      - POSTGRES_USER=bridge
+      - POSTGRES_PASSWORD_FILE=/run/secrets/postgres_password
+      - POSTGRES_DB=bridge
+    volumes:
+      - bridge-postgres-prod-data:/var/lib/postgresql/data
+      - ./init-db.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
+    secrets:
+      - postgres_password
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U bridge -d bridge"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    restart: unless-stopped
+    networks:
+      - bridge-prod-net
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+        reservations:
+          memory: 256M
+
+volumes:
+  bridge-postgres-prod-data:
+    driver: local
+
+secrets:
+  postgres_password:
+    file: ../secrets/postgres_password.txt

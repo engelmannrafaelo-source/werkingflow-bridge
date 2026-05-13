@@ -19,8 +19,8 @@ SERVER2_HOST="178.104.178.79"
 SSH_KEY="/root/.ssh/id_ed25519"
 SSH_BASE_OPTS="-i ${SSH_KEY} -o ConnectTimeout=10 -o StrictHostKeyChecking=no -o BatchMode=yes"
 REMOTE_REPO="/root/werkingflow-bridge"
-HETZNER_COMPOSE="docker/docker-compose.yml"
-SERVER2_COMPOSE="docker/docker-compose-prod.yml"
+HETZNER_COMPOSE="-f docker/docker-compose.yml -f docker/docker-compose-platform-overlay.yml"
+SERVER2_COMPOSE="-f docker/docker-compose-prod.yml -f docker/docker-compose-prod-platform.yml"
 # Worker init on a fresh container is much slower than expected: container
 # bootstrap (~60s) + a ~80s blocking pause inside lifespan between
 # "Session cleanup task started" and "AdaptiveLoadLimiter tune loop started"
@@ -224,7 +224,7 @@ phase_validate() {
 
     # Compose config syntax
     info "Compose syntax check..."
-    rssh "$host" "cd ${REMOTE_REPO} && docker compose -f ${compose} config --quiet" > /dev/null
+    rssh "$host" "cd ${REMOTE_REPO} && docker compose ${compose} config --quiet" > /dev/null
     info "Compose OK"
 
     # nginx config syntax: envsubst with EXACT same variable list as the container uses,
@@ -307,7 +307,7 @@ deploy_one_service() {
     # Build if this service has a Dockerfile
     if service_needs_build "$svc" "$build_list"; then
         info "Building ${svc}..."
-        dry_rssh "$host" "cd ${REMOTE_REPO} && docker compose -f ${compose} build --no-cache ${svc} 2>&1" || {
+        dry_rssh "$host" "cd ${REMOTE_REPO} && docker compose ${compose} build --no-cache ${svc} 2>&1" || {
             error_ "Build failed for ${svc} on ${host}"
             return 1
         }
@@ -318,7 +318,7 @@ deploy_one_service() {
 
     # Recreate — NEVER --remove-orphans
     info "Recreating ${svc}..."
-    dry_rssh "$host" "cd ${REMOTE_REPO} && docker compose -f ${compose} up -d --no-deps --force-recreate ${svc} 2>&1" || {
+    dry_rssh "$host" "cd ${REMOTE_REPO} && docker compose ${compose} up -d --no-deps --force-recreate ${svc} 2>&1" || {
         error_ "docker compose up failed for ${svc} on ${host}"
         return 1
     }
@@ -659,14 +659,14 @@ phase_rollback() {
         warn "Rolling back ${svc} (${container})..."
 
         if service_needs_build "$svc" "$build_list"; then
-            rssh "$host" "cd ${REMOTE_REPO} && docker compose -f ${compose} build --no-cache ${svc} 2>&1" || {
+            rssh "$host" "cd ${REMOTE_REPO} && docker compose ${compose} build --no-cache ${svc} 2>&1" || {
                 error_ "CRITICAL: rollback build failed for ${svc}"
                 failed=true
                 continue
             }
         fi
 
-        rssh "$host" "cd ${REMOTE_REPO} && docker compose -f ${compose} up -d --no-deps --force-recreate ${svc} 2>&1" || {
+        rssh "$host" "cd ${REMOTE_REPO} && docker compose ${compose} up -d --no-deps --force-recreate ${svc} 2>&1" || {
             error_ "CRITICAL: rollback recreate failed for ${svc}"
             failed=true
             continue

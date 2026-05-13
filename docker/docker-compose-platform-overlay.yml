@@ -1,0 +1,45 @@
+# =============================================================================
+# Bridge Platform-Layer — Overlay for docker-compose.yml (live workers)
+#
+# Adds env_file (platform secrets) to all live workers AND creates the
+# postgres-prod service if not already running. Apply with:
+#
+#   docker compose -f docker-compose.yml -f docker-compose-platform-overlay.yml up -d --build worker1
+#
+# Sequence (one worker at a time, smoke between each):
+#   1) worker1 → smoke /health + /v1/chat/completions + /v1/db/health
+#   2) worker2 → smoke
+#   3) worker3 → smoke
+#   4) worker4 → smoke
+# =============================================================================
+
+services:
+  worker1:
+    env_file:
+      - ../secrets/platform.env
+    networks:
+      - bridge-net
+      - bridge-prod-net    # access to postgres-prod
+  worker2:
+    env_file:
+      - ../secrets/platform.env
+    networks:
+      - bridge-net
+      - bridge-prod-net
+  worker3:
+    env_file:
+      - ../secrets/platform.env
+    networks:
+      - bridge-net
+      - bridge-prod-net
+  worker4:
+    env_file:
+      - ../secrets/platform.env
+    networks:
+      - bridge-net
+      - bridge-prod-net
+
+networks:
+  bridge-prod-net:
+    external: true
+    name: docker_bridge-prod-net
