@@ -105,3 +105,4 @@ tests/integration/nginx-test.conf
 *.bak-pre-*
 **/*.bak-pre-*
 docker/nginx.conf.bak.*
+backups/
