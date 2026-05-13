@@ -58,6 +58,8 @@ services:
       - /root/.claude/superclaude:/home/claude/.claude/superclaude:ro
     secrets:
       - claude_token_1
+    env_file:
+      - ../secrets/platform.env
     environment:
       - CLAUDE_CODE_OAUTH_TOKEN_FILE=/run/secrets/claude_token_1
       - TZ=Europe/Vienna
@@ -95,6 +97,7 @@ services:
     restart: unless-stopped
     networks:
       - bridge-net
+      - bridge-prod-net
 
   # =============================================================================
   # Worker 2 - Account 3: office@data-energyneering.at (LIGHTWEIGHT)
@@ -121,6 +124,8 @@ services:
       - /root/.claude/superclaude:/home/claude/.claude/superclaude:ro
     secrets:
       - claude_token_2
+    env_file:
+      - ../secrets/platform.env
     environment:
       - CLAUDE_CODE_OAUTH_TOKEN_FILE=/run/secrets/claude_token_2
       - TZ=Europe/Vienna
@@ -158,6 +163,7 @@ services:
     restart: unless-stopped
     networks:
       - bridge-net
+      - bridge-prod-net
 
   # =============================================================================
   # Worker 3 - Account 2: engelmann.rafaelo@gmail.com (LIGHTWEIGHT)
@@ -184,6 +190,8 @@ services:
       - /root/.claude/superclaude:/home/claude/.claude/superclaude:ro
     secrets:
       - claude_token_3
+    env_file:
+      - ../secrets/platform.env
     environment:
       - CLAUDE_CODE_OAUTH_TOKEN_FILE=/run/secrets/claude_token_3
       - TZ=Europe/Vienna
@@ -221,6 +229,7 @@ services:
     restart: unless-stopped
     networks:
       - bridge-net
+      - bridge-prod-net
 
   # =============================================================================
   # Worker 4 - Account 4: dev-server account (claude_token_account4.txt / Oezp)
@@ -247,6 +256,8 @@ services:
       - /root/.claude/superclaude:/home/claude/.claude/superclaude:ro
     secrets:
       - claude_token_4
+    env_file:
+      - ../secrets/platform.env
     environment:
       - CLAUDE_CODE_OAUTH_TOKEN_FILE=/run/secrets/claude_token_4
       - TZ=Europe/Vienna
@@ -284,6 +295,7 @@ services:
     restart: unless-stopped
     networks:
       - bridge-net
+      - bridge-prod-net
 
   # =============================================================================
   # Privacy + PDF Service (HEAVY — single instance, Presidio + spaCy + Docling)
@@ -366,6 +378,9 @@ services:
 networks:
   bridge-net:
     driver: bridge
+  bridge-prod-net:
+    external: true
+    name: docker_bridge-prod-net
 
 volumes:
   eco-wrapper-logs:
