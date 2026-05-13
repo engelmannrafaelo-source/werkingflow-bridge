@@ -408,6 +408,9 @@ try:
     from src.billing.routes import router as billing_router
     from src.activity.routes import router as activity_router
     from src.feedback.routes import router as feedback_router
+    from src.audit.routes import router as audit_router
+    from src.dev_tokens.routes import router as dev_tokens_router
+    from src.stammdaten.routes import router as stammdaten_router
     BRIDGE_DB_LAYER_AVAILABLE = True
 except Exception as _db_imp_err:
     BRIDGE_DB_LAYER_AVAILABLE = False
@@ -576,6 +579,9 @@ if BRIDGE_DB_LAYER_AVAILABLE and is_db_enabled():
     app.include_router(billing_router)
     app.include_router(activity_router)
     app.include_router(feedback_router)
+    app.include_router(audit_router)
+    app.include_router(dev_tokens_router)
+    app.include_router(stammdaten_router)
     logger.info("✅ Bridge platform routes mounted: /v1/users /v1/auth /v1/budget /v1/billing /v1/activity")
 
 # Configure CORS
