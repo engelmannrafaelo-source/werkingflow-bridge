@@ -8,15 +8,128 @@ Auth model:
   - /v1/billing/topup/...            require_jwt_or_service
   - /v1/billing/{user_id}/...        require_self_or_admin
 """
+import json
 from typing import Any, Dict
 
 from fastapi import APIRouter, Depends, Form, HTTPException, Response
 from pydantic import BaseModel, Field
 
 from src.billing import billing_service
-from src.api_auth import require_jwt_or_service, require_self_or_admin, AuthClaims
+from src.api_auth import require_admin, require_jwt_or_service, require_self_or_admin, AuthClaims
+from src.budget.plans import PLANS
+from src.db.client import get_pool
 
 router = APIRouter(prefix="/v1/billing", tags=["billing"])
+
+
+# ---------------------------------------------------------------------------
+# Overview — admin dashboard cross-tenant aggregates
+# ---------------------------------------------------------------------------
+
+@router.get("/overview")
+async def billing_overview(
+    _claims: AuthClaims = Depends(require_admin),
+) -> Dict[str, Any]:
+    """
+    Cross-tenant billing snapshot for the Platform Admin dashboard.
+
+    Reads two sources:
+      1. `subscriptions` table — authoritative once Mollie write-through is on
+      2. `activities` table — fallback during migration (rows imported from
+         the old werking-report storage live here as
+         category='billing' / eventType='subscription.imported.<status>')
+
+    MRR is estimated, not invoiced: trial=€0, plan-prices from
+    src/budget/plans.py multiplied by seats. Replaces with real Mollie totals
+    once the live billing path is hot.
+    """
+    pool = get_pool()
+    plan_prices = {pid: p.price for pid, p in PLANS.items()}
+    # Legacy plan-id aliases from werking-report's own catalog. Remove once the
+    # migration script in apps/werking-report/scripts/ rewrites plan_ids on insert.
+    plan_prices["standard"] = plan_prices.get("report-standard", 250)
+    plan_prices["pro"] = plan_prices.get("report-standard", 250)
+
+    by_plan: Dict[str, int] = {}
+    by_status: Dict[str, int] = {}
+    by_app: Dict[str, int] = {}
+    total_mrr_eur = 0.0
+    active_subs = 0
+    cancelled_subs = 0
+    source = "subscriptions"
+
+    async with pool.acquire() as conn:
+        sub_rows = await conn.fetch(
+            "SELECT status, plan_id, seats, app_id FROM subscriptions"
+        )
+
+    if sub_rows:
+        for r in sub_rows:
+            status = r["status"]
+            plan_id = r["plan_id"]
+            seats = r["seats"] or 1
+            app_id = r["app_id"]
+
+            by_status[status] = by_status.get(status, 0) + 1
+            by_plan[plan_id] = by_plan.get(plan_id, 0) + 1
+            by_app[app_id] = by_app.get(app_id, 0) + 1
+
+            if status == "active":
+                active_subs += 1
+                total_mrr_eur += float(plan_prices.get(plan_id, 0)) * seats
+            elif status == "cancelled":
+                cancelled_subs += 1
+    else:
+        # Subscriptions table empty — derive from migrated activities so
+        # the dashboard isn't blank during the WR→Bridge transition.
+        source = "activities"
+        async with pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT payload, app_id
+                FROM activities
+                WHERE category = 'billing'
+                  AND event_type LIKE 'subscription.imported.%'
+                """
+            )
+        for r in rows:
+            payload = r["payload"] if isinstance(r["payload"], dict) else json.loads(r["payload"] or "{}")
+            plan_id = payload.get("planId", "unknown")
+            status = payload.get("status", "unknown")
+            seats = int(payload.get("seats", 1) or 1)
+            app_id = r["app_id"] or "werking-report"
+
+            by_status[status] = by_status.get(status, 0) + 1
+            by_plan[plan_id] = by_plan.get(plan_id, 0) + 1
+            by_app[app_id] = by_app.get(app_id, 0) + 1
+
+            if status == "active":
+                active_subs += 1
+                total_mrr_eur += float(plan_prices.get(plan_id, 0)) * seats
+            elif status == "cancelled":
+                cancelled_subs += 1
+
+    # Top-up totals
+    async with pool.acquire() as conn:
+        topup_sum_row = await conn.fetchrow(
+            "SELECT COALESCE(SUM(pack_eur), 0) AS total, COUNT(*) AS count FROM credit_purchases"
+        )
+        topup_balances_row = await conn.fetchrow(
+            "SELECT COALESCE(SUM(balance_eur), 0) AS total FROM user_topup_balances"
+        )
+
+    return {
+        "source": source,
+        "totalMrrEur": round(total_mrr_eur, 2),
+        "activeSubscriptions": active_subs,
+        "cancelledSubscriptions": cancelled_subs,
+        "totalTopupRevenueEur": float(topup_sum_row["total"]),
+        "topupPurchasesCount": int(topup_sum_row["count"]),
+        "totalUserBalanceEur": float(topup_balances_row["total"]),
+        "byPlan": by_plan,
+        "byStatus": by_status,
+        "byApp": by_app,
+    }
 
 
 class CustomerRequest(BaseModel):
