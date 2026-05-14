@@ -218,6 +218,13 @@ async def _activate_subscription(
                 source="mollie-webhook",
                 payload={"planId": plan_id, "seats": seats},
             )
+            await auto_create_invoice(
+                user_id=user_id,
+                amount_eur=float(amount),
+                description=f"{plan_id} — Erste Monatsabrechnung ({seats} Sitz" + ("e" if seats > 1 else "") + ")",
+                subscription_id=str(row["id"]),
+                mollie_payment_id=first_payment_id,
+            )
             return _serialize_subscription(row)
 
         # Conflict: another webhook delivery raced us between the probe
@@ -397,6 +404,12 @@ async def _credit_topup(user_id: str, amount_eur: float, mollie_payment_id: str)
         source="mollie-webhook",
         payload={"newBalanceEur": float(new_balance)},
     )
+    await auto_create_invoice(
+        user_id=user_id,
+        amount_eur=amount_eur,
+        description=f"API-Top-Up € {amount_eur:.2f}",
+        mollie_payment_id=mollie_payment_id,
+    )
     return {"alreadyCredited": False, "balanceEur": float(new_balance)}
 
 
@@ -524,4 +537,101 @@ async def log_billing_event(
             source,
             _json.dumps(payload or {}),
         )
+
+
+# ---------------------------------------------------------------------------
+# Auto-invoice helper — called from Mollie-webhook handlers after a paid event.
+# ---------------------------------------------------------------------------
+
+async def auto_create_invoice(
+    *,
+    user_id: str,
+    amount_eur: float,
+    description: str,
+    subscription_id: str | None = None,
+    credit_purchase_id: str | None = None,
+    mollie_payment_id: str | None = None,
+    tax_rate: float = 20.0,
+) -> str | None:
+    """Insert one invoice row, mark it 'paid', return the id.
+
+    Idempotent: if an invoice already exists for this mollie_payment_id, return
+    the existing id without re-inserting (fixes Mollie webhook retries).
+    """
+    import json as _json
+    from decimal import Decimal
+    from datetime import datetime, timezone
+
+    pool = get_pool()
+    if mollie_payment_id:
+        async with pool.acquire() as conn:
+            existing = await conn.fetchval(
+                "SELECT id FROM invoices WHERE mollie_payment_id = $1",
+                mollie_payment_id,
+            )
+        if existing:
+            return str(existing)
+
+    subtotal = Decimal(str(amount_eur))
+    tax = (subtotal * Decimal(str(tax_rate)) / Decimal("100")).quantize(Decimal("0.01"))
+    total = (subtotal + tax).quantize(Decimal("0.01"))
+
+    line_items = [{
+        "description": description,
+        "quantity": 1,
+        "unitPriceEur": float(subtotal),
+        "totalEur": float(subtotal),
+        "metadata": {},
+    }]
+
+    now = datetime.now(timezone.utc)
+    year = now.year
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            await conn.execute(f"CREATE SEQUENCE IF NOT EXISTS invoice_seq_{year} START 1 INCREMENT 1")
+            seq_n = await conn.fetchval(f"SELECT nextval('invoice_seq_{year}')")
+            invoice_number = f"INV-{year}-{int(seq_n):05d}"
+
+            row = await conn.fetchrow(
+                """
+                INSERT INTO invoices
+                  (invoice_number, user_id, subscription_id, credit_purchase_id,
+                   mollie_payment_id, status, subtotal_eur, tax_rate, tax_eur, total_eur,
+                   currency, line_items, issued_at, paid_at, metadata)
+                VALUES ($1, $2, $3, $4, $5, 'paid', $6, $7, $8, $9, 'EUR', $10::jsonb,
+                        NOW(), NOW(), $11::jsonb)
+                ON CONFLICT (mollie_payment_id) DO NOTHING
+                RETURNING id
+                """,
+                invoice_number,
+                uuid.UUID(user_id),
+                uuid.UUID(subscription_id) if subscription_id else None,
+                uuid.UUID(credit_purchase_id) if credit_purchase_id else None,
+                mollie_payment_id,
+                subtotal, tax_rate, tax, total,
+                _json.dumps(line_items),
+                _json.dumps({"autoCreated": True, "source": "mollie-webhook"}),
+            )
+
+    if row:
+        invoice_id = str(row["id"])
+        await log_billing_event(
+            "invoice.issued",
+            user_id=user_id,
+            subscription_id=subscription_id,
+            invoice_id=invoice_id,
+            mollie_payment_id=mollie_payment_id,
+            amount_eur=float(total),
+            source="mollie-webhook",
+            payload={"invoiceNumber": invoice_number, "auto": True},
+        )
+        return invoice_id
+    # ON CONFLICT means another concurrent call won — find their id.
+    if mollie_payment_id:
+        async with pool.acquire() as conn:
+            return str(await conn.fetchval(
+                "SELECT id FROM invoices WHERE mollie_payment_id = $1",
+                mollie_payment_id,
+            ))
+    return None
 

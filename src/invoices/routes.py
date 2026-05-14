@@ -412,3 +412,91 @@ async def render_invoice_html(
         raise HTTPException(status_code=403, detail="Forbidden: not your invoice")
     html = _render_html(_row(r))
     return Response(content=html, media_type="text/html")
+
+
+# ---------------------------------------------------------------------------
+# Send via Resend — email invoice HTML to the customer.
+# ---------------------------------------------------------------------------
+
+@router.post("/{invoice_id}/send")
+async def send_invoice(
+    invoice_id: str,
+    _claims: AuthClaims = Depends(require_admin),
+) -> Dict[str, Any]:
+    """
+    Send the invoice as an email (HTML body) via Resend.
+
+    Pulls recipient from the linked user's email. Marks the invoice's
+    sent_at and writes a billing_events trail. Fail-fast when RESEND_API_KEY
+    or sender email is not configured — no silent skip for outbound
+    customer email.
+    """
+    import os
+    import json as _json
+    import httpx as _httpx
+
+    resend_key = os.environ.get("RESEND_API_KEY")
+    sender = os.environ.get("RESEND_INVOICE_SENDER", "billing@werking.tools")
+    if not resend_key:
+        raise HTTPException(status_code=503, detail="RESEND_API_KEY not configured on bridge")
+
+    pool = get_pool()
+    async with pool.acquire() as conn:
+        r = await conn.fetchrow(
+            "SELECT i.*, u.email AS user_email, u.name AS user_name FROM invoices i "
+            "JOIN users u ON u.id = i.user_id WHERE i.id = $1",
+            uuid.UUID(invoice_id),
+        )
+    if not r:
+        raise HTTPException(status_code=404, detail=f"Invoice {invoice_id} not found")
+    recipient = r["user_email"]
+    if not recipient:
+        raise HTTPException(status_code=409, detail="Invoice user has no email — cannot send")
+
+    invoice_dict = _row(r)
+    html_body = _render_html(invoice_dict)
+    subject = f"Rechnung {invoice_dict['invoiceNumber']} — Werkingflow"
+
+    async with _httpx.AsyncClient(timeout=10.0) as client:
+        resp = await client.post(
+            "https://api.resend.com/emails",
+            headers={
+                "Authorization": f"Bearer {resend_key}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "from": sender,
+                "to": [recipient],
+                "subject": subject,
+                "html": html_body,
+            },
+        )
+    if resp.status_code >= 400:
+        raise HTTPException(status_code=502, detail=f"Resend error {resp.status_code}: {resp.text[:200]}")
+    resend_payload = resp.json()
+    resend_id = resend_payload.get("id")
+
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            await conn.execute(
+                "UPDATE invoices SET sent_at = COALESCE(sent_at, NOW()), status = CASE WHEN status = 'draft' THEN 'issued'::invoice_status ELSE status END, updated_at = NOW() WHERE id = $1",
+                uuid.UUID(invoice_id),
+            )
+            await conn.execute(
+                """
+                INSERT INTO billing_events
+                  (event_type, user_id, invoice_id, amount_eur, source, payload)
+                VALUES ('invoice.sent', $1, $2, $3, 'admin', $4::jsonb)
+                """,
+                r["user_id"],
+                uuid.UUID(invoice_id),
+                r["total_eur"],
+                _json.dumps({"recipient": recipient, "resendId": resend_id, "subject": subject}),
+            )
+    return {
+        "invoiceId": invoice_id,
+        "recipient": recipient,
+        "resendId": resend_id,
+        "sentAt": "now",
+    }
+
