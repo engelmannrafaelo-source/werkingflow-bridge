@@ -412,6 +412,7 @@ try:
     from src.dev_tokens.routes import router as dev_tokens_router
     from src.stammdaten.routes import router as stammdaten_router
     from src.invoices.routes import router as invoices_router
+    from src.metrics.routes import router as metrics_router
     from src.system.routes import router as system_router
     from src.impersonation.routes import router as impersonation_router
     BRIDGE_DB_LAYER_AVAILABLE = True
@@ -586,6 +587,7 @@ if BRIDGE_DB_LAYER_AVAILABLE and is_db_enabled():
     app.include_router(dev_tokens_router)
     app.include_router(stammdaten_router)
     app.include_router(invoices_router)
+    app.include_router(metrics_router)
     app.include_router(system_router)
     app.include_router(impersonation_router)
     logger.info("✅ Bridge platform routes mounted: /v1/users /v1/auth /v1/budget /v1/billing /v1/activity")
