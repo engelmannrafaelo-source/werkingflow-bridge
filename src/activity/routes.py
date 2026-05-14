@@ -90,6 +90,7 @@ async def activity_query(
     since: Optional[str] = Query(None, description="ISO timestamp"),
     until: Optional[str] = Query(None, description="ISO timestamp"),
     limit: int = Query(100, ge=1, le=1000),
+    mode: Optional[str] = Query(None, description="prod|staging|local — filter by tenant.category"),
     _claims: AuthClaims = Depends(require_jwt_or_service),
 ) -> Dict[str, Any]:
     where: List[str] = []
@@ -120,10 +121,20 @@ async def activity_query(
     if until:
         add("timestamp <= $$", until)
 
-    sql = """
-      SELECT id, timestamp, category, event_type, actor_user_id, target_user_id,
-             tenant_id, app_id, ip, user_agent, payload
-        FROM activities
+    if mode:
+        if mode not in ("prod", "staging", "local"):
+            raise HTTPException(status_code=400, detail=f"Invalid mode: {mode}")
+        args.append(mode)
+        where.append(f"t.category = ${len(args)}::tenant_category")
+        join_clause = "LEFT JOIN tenants t ON t.id = activities.tenant_id"
+    else:
+        join_clause = ""
+
+    sql = f"""
+      SELECT activities.id, activities.timestamp, activities.category, activities.event_type,
+             activities.actor_user_id, activities.target_user_id,
+             activities.tenant_id, activities.app_id, activities.ip, activities.user_agent, activities.payload
+        FROM activities {join_clause}
     """
     if where:
         sql += " WHERE " + " AND ".join(where)
@@ -153,3 +164,5 @@ async def activity_query(
         ],
         "count": len(rows),
     }
+
+# mode_filter applied

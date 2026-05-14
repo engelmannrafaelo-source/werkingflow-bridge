@@ -85,15 +85,42 @@ def _user_row_to_dict(row: Any) -> Dict[str, Any]:
 @router.get("/v1/users")
 async def list_users(
     limit: int = Query(default=100, le=1000),
+    mode: Optional[str] = Query(default=None, description="Filter by tenant category: prod|staging|local"),
     _claims: AuthClaims = Depends(require_admin),
 ) -> List[Dict[str, Any]]:
+    """List users. Optional `mode` filters by tenant.category."""
+    if mode and mode not in ("prod", "staging", "local"):
+        raise HTTPException(status_code=400, detail=f"Invalid mode: {mode}")
+
     pool = get_pool()
     async with pool.acquire() as conn:
-        rows = await conn.fetch(
-            "SELECT id, email, name, tenant_id, created_at, updated_at FROM users ORDER BY created_at DESC LIMIT $1",
-            limit,
-        )
-    return [_user_row_to_dict(r) for r in rows]
+        if mode:
+            rows = await conn.fetch(
+                """
+                SELECT u.id, u.email, u.name, u.tenant_id, u.created_at, u.updated_at, t.category::text AS tenant_category
+                FROM users u
+                LEFT JOIN tenants t ON t.id = u.tenant_id
+                WHERE t.category = $1::tenant_category
+                ORDER BY u.created_at DESC
+                LIMIT $2
+                """,
+                mode, limit,
+            )
+        else:
+            rows = await conn.fetch(
+                """
+                SELECT u.id, u.email, u.name, u.tenant_id, u.created_at, u.updated_at, t.category::text AS tenant_category
+                FROM users u
+                LEFT JOIN tenants t ON t.id = u.tenant_id
+                ORDER BY u.created_at DESC
+                LIMIT $1
+                """,
+                limit,
+            )
+    return [
+        {**_user_row_to_dict(r), "tenant_category": r["tenant_category"]}
+        for r in rows
+    ]
 
 
 @router.post("/v1/users", status_code=201)
@@ -193,24 +220,43 @@ class TenantCreateRequest(BaseModel):
     id: Optional[str] = None
     name: str
     owner_user_id: Optional[str] = None
+    category: Optional[str] = None  # prod|staging|local — default 'prod' if omitted
 
 
 @router.get("/v1/tenants")
 async def list_tenants(
     limit: int = Query(default=100, le=1000),
+    mode: Optional[str] = Query(default=None, description="Filter by category: prod|staging|local"),
     _claims: AuthClaims = Depends(require_admin),
 ) -> List[Dict[str, Any]]:
+    if mode and mode not in ("prod", "staging", "local"):
+        raise HTTPException(status_code=400, detail=f"Invalid mode: {mode}")
+
     pool = get_pool()
     async with pool.acquire() as conn:
-        rows = await conn.fetch(
-            "SELECT id, name, owner_user_id, created_at FROM tenants ORDER BY created_at DESC LIMIT $1",
-            limit,
-        )
+        if mode:
+            rows = await conn.fetch(
+                """
+                SELECT id, name, owner_user_id, created_at, category::text AS category
+                FROM tenants WHERE category = $1::tenant_category
+                ORDER BY created_at DESC LIMIT $2
+                """,
+                mode, limit,
+            )
+        else:
+            rows = await conn.fetch(
+                """
+                SELECT id, name, owner_user_id, created_at, category::text AS category
+                FROM tenants ORDER BY created_at DESC LIMIT $1
+                """,
+                limit,
+            )
     return [
         {
             "id": r["id"],
             "name": r["name"],
             "owner_user_id": str(r["owner_user_id"]) if r["owner_user_id"] else None,
+            "category": r["category"],
             "created_at": r["created_at"].isoformat(),
         }
         for r in rows
@@ -229,16 +275,20 @@ async def create_tenant(
     owner_uid = uuid.UUID(body.owner_user_id) if body.owner_user_id else None
 
     async with pool.acquire() as conn:
+        category = body.category or "prod"
+        if category not in ("prod", "staging", "local"):
+            raise HTTPException(status_code=400, detail=f"Invalid category: {category}")
         try:
             row = await conn.fetchrow(
                 """
-                INSERT INTO tenants (id, name, owner_user_id, created_at)
-                VALUES ($1, $2, $3, $4)
-                RETURNING id, name, owner_user_id, created_at
+                INSERT INTO tenants (id, name, owner_user_id, category, created_at)
+                VALUES ($1, $2, $3, $4::tenant_category, $5)
+                RETURNING id, name, owner_user_id, category::text AS category, created_at
                 """,
                 tenant_id,
                 body.name,
                 owner_uid,
+                category,
                 now,
             )
         except asyncpg.UniqueViolationError:
@@ -254,6 +304,63 @@ async def create_tenant(
         "id": row["id"],
         "name": row["name"],
         "owner_user_id": str(row["owner_user_id"]) if row["owner_user_id"] else None,
+        "category": row["category"],
+        "created_at": row["created_at"].isoformat(),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Tenant updates — category is the main mutable field for now.
+# ---------------------------------------------------------------------------
+
+class TenantUpdateRequest(BaseModel):
+    name: Optional[str] = None
+    category: Optional[str] = None
+    owner_user_id: Optional[str] = None
+
+
+@router.patch("/v1/tenants/{tenant_id}")
+async def update_tenant(
+    tenant_id: str,
+    body: TenantUpdateRequest,
+    _claims: AuthClaims = Depends(require_admin),
+) -> Dict[str, Any]:
+    if body.category and body.category not in ("prod", "staging", "local"):
+        raise HTTPException(status_code=400, detail=f"Invalid category: {body.category}")
+
+    sets: List[str] = []
+    args: List[Any] = []
+
+    def _add(col: str, val: Any, cast: str = "") -> None:
+        args.append(val)
+        sets.append(f"{col} = ${len(args)}{cast}")
+
+    if body.name is not None:
+        _add("name", body.name)
+    if body.category is not None:
+        _add("category", body.category, "::tenant_category")
+    if body.owner_user_id is not None:
+        _add("owner_user_id", uuid.UUID(body.owner_user_id) if body.owner_user_id else None)
+
+    if not sets:
+        raise HTTPException(status_code=400, detail="No fields to update")
+
+    args.append(tenant_id)
+    sql = (
+        "UPDATE tenants SET " + ", ".join(sets) +
+        f" WHERE id = ${len(args)} RETURNING id, name, owner_user_id, category::text AS category, created_at"
+    )
+
+    pool = get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(sql, *args)
+    if not row:
+        raise HTTPException(status_code=404, detail=f"Tenant '{tenant_id}' not found")
+    return {
+        "id": row["id"],
+        "name": row["name"],
+        "owner_user_id": str(row["owner_user_id"]) if row["owner_user_id"] else None,
+        "category": row["category"],
         "created_at": row["created_at"].isoformat(),
     }
 

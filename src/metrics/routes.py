@@ -97,12 +97,15 @@ async def usage_metrics(
     appId: Optional[str] = Query(None),
     tenantId: Optional[str] = Query(None),
     userId: Optional[str] = Query(None),
+    mode: Optional[str] = Query(None, description="prod|staging|local — filter by tenant.category"),
     _claims: AuthClaims = Depends(require_admin),
 ) -> Dict[str, Any]:
     """
     Aggregate AI-call activities with EUR cost. Admin only — exposes
     cross-tenant data and pricing.
     """
+    if mode and mode not in ("prod", "staging", "local"):
+        raise HTTPException(status_code=400, detail=f"Invalid mode: {mode}")
     if groupBy not in _ALLOWED_GROUP_BY:
         raise HTTPException(status_code=400, detail=f"groupBy must be one of {sorted(_ALLOWED_GROUP_BY)}")
     if appId and appId not in _ALLOWED_APP_IDS:
@@ -131,15 +134,21 @@ async def usage_metrics(
             raise HTTPException(status_code=400, detail=f"Invalid userId UUID: {userId}")
         _add("actor_user_id = $$", uid)
 
-    where_sql = " AND ".join(f"({c})" if " OR " in c else c for c in where)
+    join_tenants = ""
+    if mode:
+        args.append(mode)
+        where.append(f"t.category = ${len(args)}::tenant_category")
+        join_tenants = "LEFT JOIN tenants t ON t.id = a.tenant_id"
+
+    where_sql = " AND ".join(f"({cx})" if " OR " in cx else cx for cx in where)
     sql = f"""
         SELECT
-          actor_user_id, tenant_id, app_id, event_type,
-          payload->>'model'                       AS model,
-          (payload->>'promptTokens')::bigint      AS prompt_tokens,
-          (payload->>'completionTokens')::bigint  AS completion_tokens,
-          (payload->>'totalTokens')::bigint       AS total_tokens
-        FROM activities
+          a.actor_user_id, a.tenant_id, a.app_id, a.event_type,
+          a.payload->>'model'                       AS model,
+          (a.payload->>'promptTokens')::bigint      AS prompt_tokens,
+          (a.payload->>'completionTokens')::bigint  AS completion_tokens,
+          (a.payload->>'totalTokens')::bigint       AS total_tokens
+        FROM activities a {join_tenants}
         WHERE {where_sql}
     """
 
@@ -254,11 +263,14 @@ async def usage_timeseries(
     since: Optional[str] = Query(None),
     until: Optional[str] = Query(None),
     appId: Optional[str] = Query(None),
+    mode: Optional[str] = Query(None, description="prod|staging|local"),
     _claims: AuthClaims = Depends(require_admin),
 ) -> Dict[str, Any]:
     """
     Time-bucketed usage for charts. Buckets calls + EUR cost per day or hour.
     """
+    if mode and mode not in ("prod", "staging", "local"):
+        raise HTTPException(status_code=400, detail=f"Invalid mode: {mode}")
     if bucket not in ("day", "hour"):
         raise HTTPException(status_code=400, detail="bucket must be 'day' or 'hour'")
     if appId and appId not in _ALLOWED_APP_IDS:
@@ -274,18 +286,25 @@ async def usage_timeseries(
     args: List[Any] = [since_dt, until_dt]
     if appId:
         args.append(appId)
-        where.append(f"app_id = ${len(args)}")
+        where.append(f"a.app_id = ${len(args)}")
 
-    where_sql = " AND ".join(where)
+    join_tenants = ""
+    if mode:
+        args.append(mode)
+        where.append(f"t.category = ${len(args)}::tenant_category")
+        join_tenants = "LEFT JOIN tenants t ON t.id = a.tenant_id"
+
+    # Re-namespace columns to a.* for the JOIN-or-not flexibility.
+    where_sql = " AND ".join(w if "a." in w or "t." in w else "a." + w for w in where)
     sql = f"""
         SELECT
-          date_trunc('{bucket}', timestamp) AS bucket_ts,
-          app_id,
-          payload->>'model'                       AS model,
-          (payload->>'promptTokens')::bigint      AS prompt_tokens,
-          (payload->>'completionTokens')::bigint  AS completion_tokens,
-          event_type
-        FROM activities
+          date_trunc('{bucket}', a.timestamp) AS bucket_ts,
+          a.app_id,
+          a.payload->>'model'                       AS model,
+          (a.payload->>'promptTokens')::bigint      AS prompt_tokens,
+          (a.payload->>'completionTokens')::bigint  AS completion_tokens,
+          a.event_type
+        FROM activities a {join_tenants}
         WHERE {where_sql}
         ORDER BY bucket_ts ASC
     """
@@ -323,3 +342,5 @@ async def usage_timeseries(
         "series": sorted(series.values(), key=lambda x: x["bucket"]),
         "usdToEurRate": eur_rate,
     }
+
+# mode_filter applied

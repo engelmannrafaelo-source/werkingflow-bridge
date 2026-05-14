@@ -298,3 +298,4 @@ async def list_billing_events(
         }
     return {"items": [_row(r) for r in rows], "count": len(rows)}
 
+# mode_filter applied (overview signature only — body needs JOIN if you want per-mode totals)
