@@ -114,8 +114,11 @@ async def usage_metrics(
     until_dt = _parse_iso(until) or datetime.now(timezone.utc)
     since_dt = _parse_iso(since) or (until_dt - timedelta(days=30))
 
-    where = ["category = 'workflow'", "event_type LIKE 'ai-call:%' OR event_type LIKE 'ai-call-error:%'",
-             "timestamp >= $1", "timestamp <= $2"]
+    # All activity columns explicitly qualified as `a.*` — `category` exists on
+    # both `activities` (workflow|...) and `tenants` (prod|staging|local) and
+    # would be ambiguous once we LEFT JOIN tenants below.
+    where = ["a.category = 'workflow'", "a.event_type LIKE 'ai-call:%' OR a.event_type LIKE 'ai-call-error:%'",
+             "a.timestamp >= $1", "a.timestamp <= $2"]
     args: List[Any] = [since_dt, until_dt]
 
     def _add(cond: str, val: Any) -> None:
@@ -123,16 +126,16 @@ async def usage_metrics(
         where.append(cond.replace("$$", f"${len(args)}"))
 
     if appId:
-        _add("app_id = $$", appId)
+        _add("a.app_id = $$", appId)
     if tenantId:
-        _add("tenant_id = $$", tenantId)
+        _add("a.tenant_id = $$", tenantId)
     if userId:
         import uuid as _uuid
         try:
             uid = _uuid.UUID(userId)
         except ValueError:
             raise HTTPException(status_code=400, detail=f"Invalid userId UUID: {userId}")
-        _add("actor_user_id = $$", uid)
+        _add("a.actor_user_id = $$", uid)
 
     join_tenants = ""
     if mode:
@@ -280,9 +283,11 @@ async def usage_timeseries(
     default_lookback = timedelta(days=30 if bucket == "day" else 2)
     since_dt = _parse_iso(since) or (until_dt - default_lookback)
 
-    where = ["category = 'workflow'",
-             "(event_type LIKE 'ai-call:%' OR event_type LIKE 'ai-call-error:%')",
-             "timestamp >= $1", "timestamp <= $2"]
+    # All activity columns explicitly qualified — `category` is on both
+    # activities and tenants and would be ambiguous once we LEFT JOIN tenants.
+    where = ["a.category = 'workflow'",
+             "(a.event_type LIKE 'ai-call:%' OR a.event_type LIKE 'ai-call-error:%')",
+             "a.timestamp >= $1", "a.timestamp <= $2"]
     args: List[Any] = [since_dt, until_dt]
     if appId:
         args.append(appId)
@@ -294,8 +299,7 @@ async def usage_timeseries(
         where.append(f"t.category = ${len(args)}::tenant_category")
         join_tenants = "LEFT JOIN tenants t ON t.id = a.tenant_id"
 
-    # Re-namespace columns to a.* for the JOIN-or-not flexibility.
-    where_sql = " AND ".join(w if "a." in w or "t." in w else "a." + w for w in where)
+    where_sql = " AND ".join(where)
     sql = f"""
         SELECT
           date_trunc('{bucket}', a.timestamp) AS bucket_ts,

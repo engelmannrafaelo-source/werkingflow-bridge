@@ -100,26 +100,28 @@ async def activity_query(
         args.append(val)
         where.append(cond.replace("$$", f"${len(args)}"))
 
+    # All activity columns explicitly qualified — `category` is on both
+    # activities and tenants and would be ambiguous once we LEFT JOIN tenants.
     if tenantId:
-        add("tenant_id = $$", tenantId)
+        add("activities.tenant_id = $$", tenantId)
     if userId:
         u = _to_uuid(userId)
         args.append(u)
-        where.append(f"(actor_user_id = ${len(args)} OR target_user_id = ${len(args)})")
+        where.append(f"(activities.actor_user_id = ${len(args)} OR activities.target_user_id = ${len(args)})")
     if appId:
         if appId not in _ALLOWED_APP_IDS:
             raise HTTPException(status_code=400, detail=f"Unknown appId: {appId}")
-        add("app_id = $$", appId)
+        add("activities.app_id = $$", appId)
     if category:
         if category not in _ALLOWED_CATEGORIES:
             raise HTTPException(status_code=400, detail=f"Unknown category: {category}")
-        add("category = $$", category)
+        add("activities.category = $$", category)
     if eventType:
-        add("event_type = $$", eventType)
+        add("activities.event_type = $$", eventType)
     if since:
-        add("timestamp >= $$", since)
+        add("activities.timestamp >= $$", since)
     if until:
-        add("timestamp <= $$", until)
+        add("activities.timestamp <= $$", until)
 
     if mode:
         if mode not in ("prod", "staging", "local"):
@@ -138,7 +140,7 @@ async def activity_query(
     """
     if where:
         sql += " WHERE " + " AND ".join(where)
-    sql += " ORDER BY timestamp DESC LIMIT $" + str(len(args) + 1)
+    sql += " ORDER BY activities.timestamp DESC LIMIT $" + str(len(args) + 1)
     args.append(limit)
 
     pool = get_pool()

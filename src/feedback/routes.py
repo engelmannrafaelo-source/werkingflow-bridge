@@ -100,11 +100,15 @@ async def create_feedback(
     return _row_to_dict(row)
 
 
+_ALLOWED_MODES = {"prod", "staging", "local"}
+
+
 @router.get("")
 async def list_feedback(
     appId: Optional[str] = Query(default=None),
     status: Optional[str] = Query(default=None),
     limit: int = Query(default=100, ge=1, le=500),
+    mode: Optional[str] = Query(default=None, description="prod|staging|local"),
     _claims: AuthClaims = Depends(require_admin),
 ) -> Dict[str, Any]:
     where: List[str] = []
@@ -117,20 +121,29 @@ async def list_feedback(
     if appId:
         if appId not in _ALLOWED_APPS:
             raise HTTPException(status_code=400, detail=f"Unknown appId: {appId}")
-        add("app_id = $$", appId)
+        add("feedback.app_id = $$", appId)
     if status:
         if status not in _ALLOWED_STATUS:
             raise HTTPException(status_code=400, detail=f"Unknown status: {status}")
-        add("status = $$", status)
+        add("feedback.status = $$", status)
 
-    sql = """
-      SELECT id, user_id, tenant_id, app_id, rating, category, title, body,
-             status, metadata, created_at, updated_at
-        FROM feedback
+    join_clause = ""
+    if mode:
+        if mode not in _ALLOWED_MODES:
+            raise HTTPException(status_code=400, detail=f"Unknown mode: {mode}")
+        args.append(mode)
+        where.append(f"t.category = ${len(args)}::tenant_category")
+        join_clause = "LEFT JOIN tenants t ON t.id = feedback.tenant_id"
+
+    sql = f"""
+      SELECT feedback.id, feedback.user_id, feedback.tenant_id, feedback.app_id,
+             feedback.rating, feedback.category, feedback.title, feedback.body,
+             feedback.status, feedback.metadata, feedback.created_at, feedback.updated_at
+        FROM feedback {join_clause}
     """
     if where:
         sql += " WHERE " + " AND ".join(where)
-    sql += " ORDER BY created_at DESC LIMIT $" + str(len(args) + 1)
+    sql += " ORDER BY feedback.created_at DESC LIMIT $" + str(len(args) + 1)
     args.append(limit)
 
     pool = get_pool()
