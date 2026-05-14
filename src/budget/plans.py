@@ -81,3 +81,18 @@ def get_plan(plan_id: str) -> PlanConfig:
     if not plan:
         raise ValueError(f"[PlanManager] Unknown plan: {plan_id}")
     return plan
+
+
+def find_trial_plan_for(plan_id: str) -> "PlanConfig | None":
+    """Find a trial-plan with same app_id as the given plan. Returns None
+    if no trial-sibling exists for this app (most apps have none)."""
+    plan = PLANS.get(plan_id)
+    if plan is None:
+        raise ValueError(f"[PlanManager] Unknown plan: {plan_id}")
+    if plan.trial:
+        # This plan IS the trial; no separate sibling exists.
+        return None
+    for p in PLANS.values():
+        if p.app_id == plan.app_id and p.trial:
+            return p
+    return None
