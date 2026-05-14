@@ -247,3 +247,54 @@ async def billing_cancel_sub(
     except LookupError as e:
         raise HTTPException(status_code=404, detail=str(e))
     return Response(status_code=204)
+
+
+# ---------------------------------------------------------------------------
+# Events — Mollie audit trail
+# ---------------------------------------------------------------------------
+
+@router.get("/events")
+async def list_billing_events(
+    userId: str | None = None,
+    tenantId: str | None = None,
+    eventType: str | None = None,
+    limit: int = 200,
+    _claims: AuthClaims = Depends(require_admin),
+) -> Dict[str, Any]:
+    """Append-only billing audit trail. Admin only."""
+    import uuid as _uuid
+    from typing import List, Any
+    pool = get_pool()
+    where: list = []
+    args: list = []
+    def add(cond: str, val: Any) -> None:
+        args.append(val); where.append(cond.replace("$$", f"${len(args)}"))
+    if userId:    add("user_id = $$", _uuid.UUID(userId))
+    if tenantId:  add("tenant_id = $$", tenantId)
+    if eventType: add("event_type = $$", eventType)
+
+    sql = "SELECT id, timestamp, event_type, user_id, tenant_id, subscription_id, invoice_id, mollie_payment_id, amount_eur, source, payload FROM billing_events"
+    if where:
+        sql += " WHERE " + " AND ".join(where)
+    sql += f" ORDER BY timestamp DESC LIMIT ${len(args) + 1}"
+    args.append(min(max(1, limit), 1000))
+
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(sql, *args)
+
+    def _row(r):
+        return {
+            "id": str(r["id"]),
+            "timestamp": r["timestamp"].isoformat(),
+            "eventType": r["event_type"],
+            "userId": str(r["user_id"]) if r["user_id"] else None,
+            "tenantId": r["tenant_id"],
+            "subscriptionId": str(r["subscription_id"]) if r["subscription_id"] else None,
+            "invoiceId": str(r["invoice_id"]) if r["invoice_id"] else None,
+            "molliePaymentId": r["mollie_payment_id"],
+            "amountEur": float(r["amount_eur"]) if r["amount_eur"] is not None else None,
+            "source": r["source"],
+            "payload": r["payload"] if isinstance(r["payload"], dict) else {},
+        }
+    return {"items": [_row(r) for r in rows], "count": len(rows)}
+

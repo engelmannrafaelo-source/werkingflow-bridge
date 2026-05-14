@@ -75,6 +75,12 @@ async def get_or_create_customer(user_id: str, email: str, name: str) -> Dict[st
             user_uuid, mollie_id, email, name,
         )
         if row:
+            await log_billing_event(
+                "customer.created",
+                user_id=user_id,
+                source="system",
+                payload={"mollieCustomerId": str(row["mollie_customer_id"]), "email": email, "name": name},
+            )
             return _serialize_customer(row)
 
         # Conflict: another writer raced us. Use the row they wrote.
@@ -203,6 +209,15 @@ async def _activate_subscription(
             customer_id, sub_resp["subscriptionId"], first_payment_id, seats,
         )
         if row:
+            await log_billing_event(
+                "subscription.activated",
+                user_id=user_id,
+                subscription_id=str(row["id"]),
+                mollie_payment_id=first_payment_id,
+                amount_eur=float(amount),
+                source="mollie-webhook",
+                payload={"planId": plan_id, "seats": seats},
+            )
             return _serialize_subscription(row)
 
         # Conflict: another webhook delivery raced us between the probe
@@ -288,6 +303,12 @@ async def cancel_subscription(user_id: str, subscription_id: str) -> None:
                 "UPDATE subscriptions SET status='cancelled', cancelled_at=NOW() WHERE id=$1",
                 sub_uuid,
             )
+            await log_billing_event(
+                "subscription.cancelled",
+                user_id=user_id,
+                subscription_id=subscription_id,
+                source="admin",
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -368,6 +389,14 @@ async def _credit_topup(user_id: str, amount_eur: float, mollie_payment_id: str)
                 """,
                 user_uuid, amount_eur,
             )
+    await log_billing_event(
+        "topup.credited",
+        user_id=user_id,
+        mollie_payment_id=mollie_payment_id,
+        amount_eur=amount_eur,
+        source="mollie-webhook",
+        payload={"newBalanceEur": float(new_balance)},
+    )
     return {"alreadyCredited": False, "balanceEur": float(new_balance)}
 
 
@@ -456,3 +485,43 @@ def _serialize_subscription(row: Any) -> Dict[str, Any]:
         "startedAt": row["started_at"].isoformat() if row["started_at"] else None,
         "cancelledAt": row["cancelled_at"].isoformat() if row["cancelled_at"] else None,
     }
+
+
+# ---------------------------------------------------------------------------
+# Billing-event audit trail
+# ---------------------------------------------------------------------------
+
+async def log_billing_event(
+    event_type: str,
+    *,
+    user_id: Optional[str] = None,
+    tenant_id: Optional[str] = None,
+    subscription_id: Optional[str] = None,
+    invoice_id: Optional[str] = None,
+    mollie_payment_id: Optional[str] = None,
+    amount_eur: Optional[float] = None,
+    source: str = "system",
+    payload: Optional[Dict[str, Any]] = None,
+) -> None:
+    """Append a row to billing_events. Append-only — never updates."""
+    import json as _json
+    pool = get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO billing_events
+              (event_type, user_id, tenant_id, subscription_id, invoice_id,
+               mollie_payment_id, amount_eur, source, payload)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb)
+            """,
+            event_type,
+            uuid.UUID(user_id) if user_id else None,
+            tenant_id,
+            uuid.UUID(subscription_id) if subscription_id else None,
+            uuid.UUID(invoice_id) if invoice_id else None,
+            mollie_payment_id,
+            amount_eur,
+            source,
+            _json.dumps(payload or {}),
+        )
+
