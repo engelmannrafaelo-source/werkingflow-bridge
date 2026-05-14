@@ -16,7 +16,7 @@ from typing import Any, Dict, List, Optional
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
 
-from src.api_auth import require_jwt_or_service, AuthClaims
+from src.api_auth import require_jwt_or_service, AuthClaims, resolve_tenant_id
 from src.db.client import get_pool
 
 router = APIRouter(prefix="/v1/activity", tags=["activity"])
@@ -55,12 +55,17 @@ def _to_uuid(s: Optional[str]) -> Optional[uuid.UUID]:
 @router.post("/log")
 async def activity_log(
     body: LogRequest,
-    _claims: AuthClaims = Depends(require_jwt_or_service),
+    claims: AuthClaims = Depends(require_jwt_or_service),
 ) -> Dict[str, Any]:
     if body.category not in _ALLOWED_CATEGORIES:
         raise HTTPException(status_code=400, detail=f"Unknown category: {body.category}")
     if body.appId and body.appId not in _ALLOWED_APP_IDS:
         raise HTTPException(status_code=400, detail=f"Unknown appId: {body.appId}")
+
+    # tenant_id is derived from auth context (user-JWT) or required in body
+    # (service-token). Apps stop passing it for user-flows; the body field is
+    # only honoured for cross-tenant service jobs. See ADR 0007.
+    tenant_id = await resolve_tenant_id(claims, body.tenantId)
 
     pool = get_pool()
     async with pool.acquire() as conn:
@@ -74,7 +79,7 @@ async def activity_log(
             """,
             body.category, body.eventType,
             _to_uuid(body.actorUserId), _to_uuid(body.targetUserId),
-            body.tenantId, body.appId, body.ip, body.userAgent,
+            tenant_id, body.appId, body.ip, body.userAgent,
             json.dumps(body.payload or {}),
         )
     return {"id": str(row["id"]), "timestamp": row["timestamp"].isoformat()}

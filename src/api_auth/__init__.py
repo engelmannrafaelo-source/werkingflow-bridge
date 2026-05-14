@@ -7,6 +7,7 @@ from src.api_auth.deps import (
     require_self_or_admin,
     AuthClaims,
 )
+from src.api_auth.tenant_resolver import resolve_tenant_id
 
 __all__ = [
     "require_jwt",
@@ -15,4 +16,5 @@ __all__ = [
     "require_admin",
     "require_self_or_admin",
     "AuthClaims",
+    "resolve_tenant_id",
 ]

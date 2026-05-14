@@ -16,7 +16,7 @@ import asyncpg
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
 
-from src.api_auth import require_admin, require_jwt_or_service, AuthClaims
+from src.api_auth import require_admin, require_jwt_or_service, AuthClaims, resolve_tenant_id
 from src.db.client import get_pool
 
 router = APIRouter(prefix="/v1/feedback", tags=["feedback"])
@@ -75,6 +75,10 @@ async def create_feedback(
     user_id = claims.user_id if claims.is_user else body.userId
     user_uuid = uuid.UUID(user_id) if user_id else None
 
+    # tenant_id from auth context (user-JWT) or required in body (service-token).
+    # See ADR 0007.
+    tenant_id = await resolve_tenant_id(claims, body.tenantId)
+
     pool = get_pool()
     try:
         async with pool.acquire() as conn:
@@ -87,7 +91,7 @@ async def create_feedback(
                           status, metadata, created_at, updated_at
                 """,
                 user_uuid,
-                body.tenantId,
+                tenant_id,
                 body.appId,
                 body.rating,
                 body.category,
