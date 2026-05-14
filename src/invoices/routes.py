@@ -318,83 +318,299 @@ async def update_invoice(
 
 
 # ---------------------------------------------------------------------------
-# HTML rendering — phase-1 stand-in for PDF (browser print or copy as basis)
+# HTML rendering — professional invoice layout (Engelmann ZT e.U.)
+#
+# Issuer info is env-driven so we can change company data, IBAN, BIC etc.
+# without redeploying code. Defaults match the Engelmann Data Energyneering
+# ZT e.U. business setup.
 # ---------------------------------------------------------------------------
+
+import os as _os
+
+
+def _issuer() -> Dict[str, str]:
+    return {
+        "name":     _os.environ.get("INVOICE_ISSUER_NAME",     "Engelmann Data Energyneering ZT e.U."),
+        "street":   _os.environ.get("INVOICE_ISSUER_STREET",   "Florianigasse 17/19"),
+        "city":     _os.environ.get("INVOICE_ISSUER_CITY",     "1080 Wien"),
+        "country":  _os.environ.get("INVOICE_ISSUER_COUNTRY",  "Österreich"),
+        "phone":    _os.environ.get("INVOICE_ISSUER_PHONE",    "+43 676 542 3883"),
+        "email":    _os.environ.get("INVOICE_ISSUER_EMAIL",    "office@data-energyneering.at"),
+        "web":      _os.environ.get("INVOICE_ISSUER_WEB",      "www.werkingflow.at"),
+        "vatId":    _os.environ.get("INVOICE_ISSUER_VAT_ID",   "ATU78156638"),
+        "taxNr":    _os.environ.get("INVOICE_ISSUER_TAX_NR",   "06 289/4969"),
+        "regCourt": _os.environ.get("INVOICE_ISSUER_REG_COURT","Landesgericht Wien"),
+        "iban":     _os.environ.get("INVOICE_ISSUER_IBAN",     ""),
+        "bic":      _os.environ.get("INVOICE_ISSUER_BIC",      ""),
+        "bankName": _os.environ.get("INVOICE_ISSUER_BANK_NAME",""),
+        "ownerName":_os.environ.get("INVOICE_ISSUER_OWNER",    "Dipl.-Ing. Dr. Rafael Engelmann"),
+    }
+
+
+def _human_date(iso: Optional[str]) -> str:
+    """Format ISO datetime as DD.MM.YYYY (AT/DE convention)."""
+    if not iso:
+        return "—"
+    try:
+        d = datetime.fromisoformat(iso.replace("Z", "+00:00"))
+        return d.strftime("%d.%m.%Y")
+    except Exception:
+        return iso[:10] if len(iso) >= 10 else iso
+
 
 _HTML_TEMPLATE = """<!doctype html>
 <html lang="de"><head><meta charset="utf-8">
 <title>Rechnung {invoice_number}</title>
 <style>
-  body {{ font-family: -apple-system, sans-serif; color: #222; max-width: 800px; margin: 40px auto; padding: 0 20px; }}
-  h1 {{ font-size: 24px; margin: 0 0 4px; }}
-  .meta {{ color: #666; font-size: 12px; }}
-  .addr {{ white-space: pre-line; margin: 24px 0; font-size: 13px; }}
-  table {{ width: 100%; border-collapse: collapse; margin: 20px 0; font-size: 13px; }}
-  th, td {{ padding: 8px 6px; border-bottom: 1px solid #ddd; text-align: left; }}
-  th {{ background: #f5f5f5; font-weight: 600; }}
-  td.num, th.num {{ text-align: right; font-variant-numeric: tabular-nums; }}
-  .totals {{ margin: 12px 0 24px; text-align: right; font-size: 13px; }}
-  .totals .grand {{ font-size: 16px; font-weight: 700; padding-top: 6px; border-top: 2px solid #222; display: inline-block; min-width: 200px; }}
-  .status {{ display: inline-block; padding: 2px 8px; border-radius: 3px; font-size: 11px; text-transform: uppercase; letter-spacing: 0.05em; }}
-  .status-paid {{ background: #d4edda; color: #155724; }}
-  .status-issued {{ background: #cce5ff; color: #004085; }}
-  .status-draft {{ background: #e2e3e5; color: #383d41; }}
-  .status-cancelled, .status-refunded {{ background: #f8d7da; color: #721c24; }}
-  .notes {{ font-size: 12px; color: #666; margin-top: 24px; padding-top: 12px; border-top: 1px solid #eee; }}
+  @page {{ size: A4; margin: 18mm 14mm 22mm 14mm; }}
+  * {{ box-sizing: border-box; }}
+  html, body {{ margin: 0; padding: 0; }}
+  body {{
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Helvetica Neue", Arial, sans-serif;
+    color: #1f2933;
+    font-size: 12px;
+    line-height: 1.45;
+    background: #fff;
+  }}
+  .page {{ max-width: 800px; margin: 0 auto; padding: 32px 40px 48px; }}
+  .header {{
+    display: flex;
+    justify-content: space-between;
+    align-items: flex-start;
+    border-bottom: 2px solid #1f2933;
+    padding-bottom: 18px;
+    margin-bottom: 28px;
+  }}
+  .brand .logo {{ font-size: 22px; font-weight: 700; color: #1f2933; letter-spacing: -0.5px; }}
+  .brand .tag {{ color: #6b7280; font-size: 11px; margin-top: 4px; }}
+  .issuer {{ text-align: right; font-size: 11px; color: #374151; line-height: 1.5; }}
+  .issuer .name {{ font-weight: 600; color: #111827; }}
+  .row {{ display: flex; gap: 40px; margin-bottom: 28px; }}
+  .row > div {{ flex: 1; }}
+  .label {{
+    font-size: 10px; text-transform: uppercase; letter-spacing: 0.08em;
+    color: #6b7280; margin-bottom: 6px;
+  }}
+  .addr {{ white-space: pre-line; font-size: 12px; color: #1f2933; }}
+  .meta-table {{ width: 100%; font-size: 12px; }}
+  .meta-table td {{ padding: 2px 0; vertical-align: top; }}
+  .meta-table td.k {{ color: #6b7280; padding-right: 14px; white-space: nowrap; }}
+  h1 {{ font-size: 28px; margin: 0 0 4px; color: #1f2933; font-weight: 700; letter-spacing: -0.5px; }}
+  .status {{
+    display: inline-block; padding: 3px 10px; border-radius: 4px;
+    font-size: 10px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.08em;
+  }}
+  .status-paid {{ background: #d1fae5; color: #065f46; }}
+  .status-issued {{ background: #dbeafe; color: #1e3a8a; }}
+  .status-draft {{ background: #e5e7eb; color: #374151; }}
+  .status-cancelled, .status-refunded {{ background: #fee2e2; color: #991b1b; }}
+  table.items {{ width: 100%; border-collapse: collapse; margin: 8px 0 16px; font-size: 12px; }}
+  table.items thead th {{
+    background: #f3f4f6; color: #374151; font-weight: 600; text-align: left;
+    padding: 10px 8px; border-bottom: 2px solid #1f2933;
+    font-size: 11px; text-transform: uppercase; letter-spacing: 0.05em;
+  }}
+  table.items tbody td {{ padding: 10px 8px; border-bottom: 1px solid #e5e7eb; vertical-align: top; }}
+  table.items td.num, table.items th.num {{ text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }}
+  table.items td.desc {{ width: 60%; color: #1f2933; }}
+  .totals-wrap {{ display: flex; justify-content: flex-end; margin-top: 8px; }}
+  .totals {{ min-width: 280px; font-size: 12px; }}
+  .totals .line {{ display: flex; justify-content: space-between; padding: 4px 0; }}
+  .totals .line .k {{ color: #6b7280; }}
+  .totals .line .v {{ font-variant-numeric: tabular-nums; }}
+  .totals .grand {{
+    border-top: 2px solid #1f2933; margin-top: 6px; padding-top: 8px;
+    font-size: 16px; font-weight: 700; color: #1f2933;
+  }}
+  .payment {{
+    margin: 32px 0 24px; padding: 16px 18px;
+    background: #f9fafb; border-left: 3px solid #1f2933; font-size: 12px;
+  }}
+  .payment.paid {{ background: #d1fae5; border-color: #065f46; color: #065f46; }}
+  .payment h3 {{ margin: 0 0 8px; font-size: 13px; font-weight: 600; }}
+  .payment table {{ width: 100%; }}
+  .payment td.k {{ color: #6b7280; padding-right: 12px; padding-bottom: 2px; white-space: nowrap; }}
+  .payment td.v {{ font-variant-numeric: tabular-nums; }}
+  .notes {{
+    margin: 16px 0; padding: 12px 14px;
+    background: #fffbeb; border-left: 3px solid #d97706;
+    font-size: 11px; color: #78350f;
+  }}
+  .footer {{
+    margin-top: 40px; padding-top: 16px; border-top: 1px solid #e5e7eb;
+    font-size: 10px; color: #6b7280; line-height: 1.5;
+  }}
+  .footer .grid {{ display: flex; gap: 30px; }}
+  .footer .grid > div {{ flex: 1; }}
+  .footer strong {{ color: #374151; font-weight: 600; }}
+  @media print {{
+    body {{ font-size: 11px; }}
+    .page {{ padding: 0; max-width: none; }}
+  }}
 </style></head><body>
-<h1>Rechnung {invoice_number}</h1>
-<div class="meta">
-  Status: <span class="status status-{status}">{status}</span>
-  &middot; Ausgestellt: {issued_at_human}
-  &middot; Fällig: {due_at_human}
+<div class="page">
+
+<div class="header">
+  <div class="brand">
+    <div class="logo">{issuer_name}</div>
+    <div class="tag">Werkingflow — Engineering-Automatisierung mit KI</div>
+  </div>
+  <div class="issuer">
+    <div class="name">{issuer_name}</div>
+    <div>{issuer_street}</div>
+    <div>{issuer_city}</div>
+    <div>{issuer_country}</div>
+    <div style="margin-top:6px;">Tel: {issuer_phone}</div>
+    <div>{issuer_email}</div>
+    <div>{issuer_web}</div>
+  </div>
 </div>
-<div class="addr">{billing_address_block}</div>
-<table>
-  <thead><tr><th>Position</th><th class="num">Menge</th><th class="num">Einzelpreis</th><th class="num">Summe</th></tr></thead>
+
+<div class="row">
+  <div>
+    <div class="label">Rechnung an</div>
+    <div class="addr">{billing_address_block}</div>
+  </div>
+  <div>
+    <h1>Rechnung</h1>
+    <div style="margin-bottom:10px;"><span class="status status-{status}">{status}</span></div>
+    <table class="meta-table">
+      <tr><td class="k">Rechnungs-Nr.</td><td><strong>{invoice_number}</strong></td></tr>
+      <tr><td class="k">Ausgestellt am</td><td>{issued_at_human}</td></tr>
+      <tr><td class="k">Fällig am</td><td>{due_at_human}</td></tr>
+      <tr><td class="k">Bezahlt am</td><td>{paid_at_human}</td></tr>
+    </table>
+  </div>
+</div>
+
+<table class="items">
+  <thead>
+    <tr>
+      <th class="desc">Position</th>
+      <th class="num">Menge</th>
+      <th class="num">Einzelpreis</th>
+      <th class="num">Summe</th>
+    </tr>
+  </thead>
   <tbody>{rows_html}</tbody>
 </table>
-<div class="totals">
-  Zwischensumme: € {subtotal_eur}<br>
-  USt {tax_rate}%: € {tax_eur}<br>
-  <span class="grand">Gesamt: € {total_eur}</span>
-</div>
+
+<div class="totals-wrap"><div class="totals">
+  <div class="line"><span class="k">Zwischensumme (netto)</span><span class="v">€ {subtotal_eur}</span></div>
+  <div class="line"><span class="k">USt {tax_rate}%</span><span class="v">€ {tax_eur}</span></div>
+  <div class="line grand"><span class="k">Gesamtbetrag</span><span class="v">€ {total_eur}</span></div>
+</div></div>
+
+{payment_block}
+
 {notes_block}
+
+<div class="footer">
+  <div class="grid">
+    <div>
+      <strong>{issuer_name}</strong><br>
+      {issuer_owner}<br>
+      {issuer_street}<br>
+      {issuer_city}, {issuer_country}
+    </div>
+    <div>
+      <strong>Kontakt</strong><br>
+      Tel: {issuer_phone}<br>
+      {issuer_email}<br>
+      {issuer_web}
+    </div>
+    <div>
+      <strong>Steuer &amp; Recht</strong><br>
+      UID: {issuer_vat_id}<br>
+      Steuer-Nr.: {issuer_tax_nr}<br>
+      {issuer_reg_court}
+    </div>
+  </div>
+</div>
+
+</div>
 </body></html>"""
 
 
 def _render_html(inv: Dict[str, Any]) -> str:
+    issuer = _issuer()
     addr = inv.get("billingAddress") or {}
-    addr_block = ""
+    addr_lines = []
     if addr:
-        addr_block = "\n".join(filter(None, [
-            addr.get("name", ""),
-            addr.get("street", ""),
-            f"{addr.get('postcode','')} {addr.get('city','')}".strip(),
-            addr.get("country", ""),
-            f"USt-ID: {addr['vatId']}" if addr.get("vatId") else "",
-        ]))
+        if addr.get("name"):    addr_lines.append(addr["name"])
+        if addr.get("street"):  addr_lines.append(addr["street"])
+        city_line = f"{addr.get('postcode','')} {addr.get('city','')}".strip()
+        if city_line:           addr_lines.append(city_line)
+        if addr.get("country"): addr_lines.append(addr["country"])
+        if addr.get("vatId"):   addr_lines.append(f"USt-ID: {addr['vatId']}")
+    addr_block = "\n".join(addr_lines) if addr_lines else "—"
+
     rows_html = "".join(
-        f"<tr><td>{li.get('description','')}</td>"
+        f"<tr><td class='desc'>{li.get('description','')}</td>"
         f"<td class='num'>{li.get('quantity','')}</td>"
-        f"<td class='num'>{li.get('unitPriceEur',0):.2f}</td>"
-        f"<td class='num'>{li.get('totalEur',0):.2f}</td></tr>"
+        f"<td class='num'>{float(li.get('unitPriceEur',0)):.2f}</td>"
+        f"<td class='num'>{float(li.get('totalEur',0)):.2f}</td></tr>"
         for li in (inv.get("lineItems") or [])
-    )
+    ) or "<tr><td colspan='4' style='color:#9ca3af;text-align:center;padding:18px;'>Keine Positionen</td></tr>"
+
     notes_block = f"<div class='notes'>{inv['notes']}</div>" if inv.get("notes") else ""
-    def _human(iso: Optional[str]) -> str:
-        return iso[:10] if iso else "—"
+
+    status = inv.get("status", "draft")
+    if status == "paid":
+        payment_block = (
+            "<div class='payment paid'>"
+            "<h3>✓ Bezahlt</h3>"
+            f"Diese Rechnung wurde am {_human_date(inv.get('paidAt'))} beglichen. "
+            "Vielen Dank für Ihre Zahlung."
+            "</div>"
+        )
+    elif issuer["iban"]:
+        payment_block = (
+            "<div class='payment'>"
+            "<h3>Zahlungsinformationen</h3>"
+            "<table>"
+            f"<tr><td class='k'>Empfänger</td><td class='v'>{issuer['name']}</td></tr>"
+            f"<tr><td class='k'>IBAN</td><td class='v'>{issuer['iban']}</td></tr>"
+            f"<tr><td class='k'>BIC</td><td class='v'>{issuer['bic'] or '—'}</td></tr>"
+            f"<tr><td class='k'>Bank</td><td class='v'>{issuer['bankName'] or '—'}</td></tr>"
+            f"<tr><td class='k'>Verwendungszweck</td><td class='v'><strong>{inv.get('invoiceNumber','')}</strong></td></tr>"
+            "</table>"
+            "</div>"
+        )
+    else:
+        payment_block = (
+            "<div class='payment'>"
+            "<h3>Zahlungsinformationen</h3>"
+            f"Bitte überweisen Sie den Gesamtbetrag bis {_human_date(inv.get('dueAt'))} "
+            f"unter Angabe der Rechnungsnummer <strong>{inv.get('invoiceNumber','')}</strong>."
+            "</div>"
+        )
+
     return _HTML_TEMPLATE.format(
         invoice_number=inv["invoiceNumber"],
-        status=inv["status"],
-        issued_at_human=_human(inv.get("issuedAt")),
-        due_at_human=_human(inv.get("dueAt")),
-        billing_address_block=addr_block or "—",
+        status=status,
+        issued_at_human=_human_date(inv.get("issuedAt")),
+        due_at_human=_human_date(inv.get("dueAt")),
+        paid_at_human=_human_date(inv.get("paidAt")),
+        billing_address_block=addr_block,
         rows_html=rows_html,
         subtotal_eur=inv["subtotalEur"],
         tax_rate=inv["taxRate"],
         tax_eur=inv["taxEur"],
         total_eur=inv["totalEur"],
+        payment_block=payment_block,
         notes_block=notes_block,
+        issuer_name=issuer["name"],
+        issuer_street=issuer["street"],
+        issuer_city=issuer["city"],
+        issuer_country=issuer["country"],
+        issuer_phone=issuer["phone"],
+        issuer_email=issuer["email"],
+        issuer_web=issuer["web"],
+        issuer_owner=issuer["ownerName"],
+        issuer_vat_id=issuer["vatId"],
+        issuer_tax_nr=issuer["taxNr"],
+        issuer_reg_court=issuer["regCourt"],
     )
 
 
