@@ -8,6 +8,7 @@ Budget Rules:
 - billing_mode "demo": Always allowed (free, dev partners)
 - billing_mode "byo_key": Always allowed (user pays directly)
 - billing_mode "platform_managed": Check monthly_token_limit and budget_limit_eur
+- billing_mode "subscription": Always allowed (sandbox OAuth-lease flow, no deduct)
 """
 
 import os
@@ -120,6 +121,14 @@ async def check_budget(tenant: TenantSettings) -> BudgetCheckResult:
             allowed=True,
             billing_mode="byo_key",
             reason="BYO key - user pays directly"
+        )
+
+    # Subscription mode: allowed (sandbox OAuth-lease flow handles quota via account pool)
+    if tenant.billing_mode == "subscription":
+        return BudgetCheckResult(
+            allowed=True,
+            billing_mode="subscription",
+            reason="Subscription mode - no budget deduct"
         )
 
     # Platform managed: check limits

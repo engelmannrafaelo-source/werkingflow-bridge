@@ -39,7 +39,7 @@ class TenantSettings:
     budget_alert_threshold: float = 0.8
     is_enabled: bool = True
     # Billing fields (added for usage tracking)
-    billing_mode: str = "platform_managed"  # demo | byo_key | platform_managed
+    billing_mode: str = "platform_managed"  # demo | byo_key | platform_managed | subscription
     monthly_token_limit: Optional[int] = None  # None = unlimited
     monthly_vision_limit: Optional[int] = None  # None = unlimited
     billing_margin: float = 1.50  # 1.50 = 50% markup
