@@ -62,10 +62,10 @@ async def activity_log(
     if body.appId and body.appId not in _ALLOWED_APP_IDS:
         raise HTTPException(status_code=400, detail=f"Unknown appId: {body.appId}")
 
-    # tenant_id is derived from auth context (user-JWT) or required in body
-    # (service-token). Apps stop passing it for user-flows; the body field is
-    # only honoured for cross-tenant service jobs. See ADR 0007.
-    tenant_id = await resolve_tenant_id(claims, body.tenantId)
+    # tenant_id is derived from auth context. user-JWT → from JWT.
+    # service-token → from body.tenantId, or derived from body.actorUserId
+    # (apps logging on behalf of a signed-in user). See ADR 0007.
+    tenant_id = await resolve_tenant_id(claims, body.tenantId, body.actorUserId)
 
     pool = get_pool()
     async with pool.acquire() as conn:

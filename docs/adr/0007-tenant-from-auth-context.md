@@ -21,10 +21,15 @@ request body for user-flows.
    does not carry it, the Bridge falls back to looking up
    `users.tenant_id` for the `sub` user. Body `tenantId` is **ignored**
    to prevent tenant spoofing.
-2. **Service-token flow:** there is no user context. The caller (an app
-   backend, internal job, etc.) **must** pass `tenantId` in the request
-   body. Service tokens are cross-tenant on purpose; the body field is
-   how they say *which* tenant. Missing → `400 Bad Request`.
+2. **Service-token flow:** there is no user context. The caller passes
+   either `tenantId` *or* `actorUserId` in the request body:
+   - `tenantId` → used directly (cross-tenant jobs that know the tenant).
+   - `actorUserId` → the Bridge derives the tenant from that user's
+     `users.tenant_id`. This supports apps that authenticate to the
+     Bridge with a service token but log *on behalf of a signed-in user*
+     (e.g. werking-report's `logAiActivity`, which already sends
+     `actorUserId`). The app does not need to plumb tenant through.
+   - Neither → `400 Bad Request`.
 3. **Anything else:** `400 Bad Request`. No silent NULLs.
 
 ### Defense in depth

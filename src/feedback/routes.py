@@ -75,9 +75,9 @@ async def create_feedback(
     user_id = claims.user_id if claims.is_user else body.userId
     user_uuid = uuid.UUID(user_id) if user_id else None
 
-    # tenant_id from auth context (user-JWT) or required in body (service-token).
-    # See ADR 0007.
-    tenant_id = await resolve_tenant_id(claims, body.tenantId)
+    # tenant_id from auth context (user-JWT) or, for service-token, from
+    # body.tenantId / derived from body.userId. See ADR 0007.
+    tenant_id = await resolve_tenant_id(claims, body.tenantId, body.userId)
 
     pool = get_pool()
     try:

@@ -28,9 +28,20 @@ from src.api_auth.deps import AuthClaims
 from src.db.client import get_pool
 
 
+async def _tenant_of_user(user_id: str) -> Optional[str]:
+    """Look up users.tenant_id. Returns None if user unknown or has no tenant."""
+    pool = get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT tenant_id FROM users WHERE id = $1", user_id
+        )
+    return row["tenant_id"] if row and row["tenant_id"] else None
+
+
 async def resolve_tenant_id(
     claims: AuthClaims,
     body_tenant_id: Optional[str] = None,
+    body_actor_user_id: Optional[str] = None,
 ) -> str:
     """
     Return the tenant_id this request writes against. Raises 400 if it can't
@@ -40,8 +51,12 @@ async def resolve_tenant_id(
       1. User-JWT with tenant_id in JWT → use it (fast path, no DB hit)
       2. User-JWT without tenant_id → DB-lookup users.tenant_id (defensive
          fallback for malformed JWTs / legacy tokens)
-      3. Service-token → require body_tenant_id, else 400
-      4. Anything else → 400
+      3. Service-token with body_tenant_id → use it
+      4. Service-token with body_actor_user_id → derive from that user's
+         tenant (apps that log on behalf of a signed-in user but authenticate
+         to the Bridge with a service token — e.g. werking-report's
+         logAiActivity)
+      5. Anything else → 400
 
     Users that pass tenantId in the body when they have a JWT: ignored.
     The JWT is authoritative — body overrides would be a tenant-spoofing
@@ -58,25 +73,30 @@ async def resolve_tenant_id(
                 status_code=400,
                 detail="Cannot resolve tenant: JWT has neither tenant_id nor user_id",
             )
-        pool = get_pool()
-        async with pool.acquire() as conn:
-            row = await conn.fetchrow(
-                "SELECT tenant_id FROM users WHERE id = $1", claims.user_id
-            )
-        if not row or not row["tenant_id"]:
+        tenant = await _tenant_of_user(claims.user_id)
+        if not tenant:
             raise HTTPException(
                 status_code=400,
                 detail=f"Cannot resolve tenant: user {claims.user_id} has no tenant_id",
             )
-        return row["tenant_id"]
+        return tenant
 
     if claims.is_service:
-        if not body_tenant_id:
+        if body_tenant_id:
+            return body_tenant_id
+        if body_actor_user_id:
+            tenant = await _tenant_of_user(body_actor_user_id)
+            if tenant:
+                return tenant
             raise HTTPException(
                 status_code=400,
-                detail="Service-token requests must pass tenantId in the body",
+                detail=f"Service-token request: actor user {body_actor_user_id} "
+                       f"has no tenant_id and no tenantId given in body",
             )
-        return body_tenant_id
+        raise HTTPException(
+            status_code=400,
+            detail="Service-token requests must pass tenantId or actorUserId in the body",
+        )
 
     raise HTTPException(
         status_code=400,
