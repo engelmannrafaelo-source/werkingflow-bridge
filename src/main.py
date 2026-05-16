@@ -1525,6 +1525,19 @@ async def generate_streaming_response(
                     user_id=attr.get("user_id"),
                     session_id=attr.get("session_id"),
                 )
+                # Bridge self-log: streaming success activity. See ADR 0007.
+                from src.activity.ai_call_writer import persist_ai_call_activity
+                await persist_ai_call_activity(
+                    app_id=attr.get("app_id"),
+                    user_id=attr.get("user_id"),
+                    agent_id=attr.get("agent_id"),
+                    workflow_id=attr.get("workflow_id"),
+                    model=request.model,
+                    input_tokens=est_prompt_tokens or 0,
+                    output_tokens=est_completion_tokens or 0,
+                    status="success",
+                    duration_ms=int(stream_duration * 1000),
+                )
         except Exception as track_err:
             logger.warning(f"⚠️ Streaming usage tracking failed (non-fatal): {track_err}")
 
@@ -2569,6 +2582,21 @@ async def chat_completions(
                     session_id=attribution.get("session_id"),
                     job_id=attribution.get("job_id"),
                 )
+                # Bridge self-log: persist to the tenant-scoped activities table
+                # so the Platform Admin sees every call. The Bridge logs it
+                # itself — apps no longer POST /v1/activity/log. See ADR 0007.
+                from src.activity.ai_call_writer import persist_ai_call_activity
+                await persist_ai_call_activity(
+                    app_id=attribution.get("app_id"),
+                    user_id=attribution.get("user_id"),
+                    agent_id=attribution.get("agent_id"),
+                    workflow_id=attribution.get("workflow_id"),
+                    model=request_body.model,
+                    input_tokens=prompt_tokens or 0,
+                    output_tokens=completion_tokens or 0,
+                    status="success",
+                    duration_ms=int(duration * 1000),
+                )
             except Exception as e:
                 logger.warning(f"prompt_metrics record (success) failed: {e}")
 
@@ -2670,6 +2698,20 @@ async def chat_completions(
                 session_id=attribution.get("session_id"),
                 job_id=attribution.get("job_id"),
             )
+            # Bridge self-log: error activity. See ADR 0007.
+            from src.activity.ai_call_writer import persist_ai_call_activity
+            await persist_ai_call_activity(
+                app_id=attribution.get("app_id"),
+                user_id=attribution.get("user_id"),
+                agent_id=attribution.get("agent_id"),
+                workflow_id=attribution.get("workflow_id"),
+                model=request_body.model,
+                input_tokens=est_input or 0,
+                output_tokens=0,
+                status="error",
+                duration_ms=int(duration * 1000),
+                error_code=str(http_exc.status_code),
+            )
         except Exception:
             pass
         raise
@@ -2711,6 +2753,20 @@ async def chat_completions(
                 user_id=attribution.get("user_id"),
                 session_id=attribution.get("session_id"),
                 job_id=attribution.get("job_id"),
+            )
+            # Bridge self-log: 429 rate-limit error activity. See ADR 0007.
+            from src.activity.ai_call_writer import persist_ai_call_activity
+            await persist_ai_call_activity(
+                app_id=attribution.get("app_id"),
+                user_id=attribution.get("user_id"),
+                agent_id=attribution.get("agent_id"),
+                workflow_id=attribution.get("workflow_id"),
+                model=request_body.model,
+                input_tokens=est_input or 0,
+                output_tokens=0,
+                status="error",
+                duration_ms=int(duration * 1000),
+                error_code="429",
             )
         except Exception:
             pass
