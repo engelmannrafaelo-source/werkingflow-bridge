@@ -82,3 +82,30 @@ async def resolve_tenant_id(
         status_code=400,
         detail=f"Unknown auth kind: {claims.kind}",
     )
+
+
+async def resolve_tenant_for_user(user_id: str) -> str:
+    """
+    Resolve the tenant_id that a given user belongs to.
+
+    Used by endpoints where the row's owner is NOT the caller — e.g. an admin
+    creating an invoice *for* a customer. The tenant is a property of the
+    invoice's user, not of the admin's auth context.
+
+    Raises 400 if the user is unknown or has no tenant_id. Never returns None.
+    """
+    if not user_id:
+        raise HTTPException(status_code=400, detail="user_id required to resolve tenant")
+    pool = get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT tenant_id FROM users WHERE id = $1", user_id
+        )
+    if not row:
+        raise HTTPException(status_code=400, detail=f"Unknown user: {user_id}")
+    if not row["tenant_id"]:
+        raise HTTPException(
+            status_code=400,
+            detail=f"User {user_id} has no tenant_id",
+        )
+    return row["tenant_id"]

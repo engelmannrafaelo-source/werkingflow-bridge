@@ -26,6 +26,7 @@ from src.api_auth import (
     require_jwt_or_service,
     require_self_or_admin,
     AuthClaims,
+    resolve_tenant_for_user,
 )
 from src.db.client import get_pool
 
@@ -164,6 +165,10 @@ async def create_invoice(
     line_items_json = [li.model_dump() for li in body.lineItems]
     due_at_dt = datetime.fromisoformat(body.dueAt.replace("Z", "+00:00")) if body.dueAt else None
 
+    # tenant_id is a property of the invoice's user, not of the admin creating
+    # it. Derive it from body.userId — body.tenantId is ignored. See ADR 0007.
+    tenant_id = await resolve_tenant_for_user(body.userId)
+
     pool = get_pool()
     async with pool.acquire() as conn:
         async with conn.transaction():
@@ -183,7 +188,7 @@ async def create_invoice(
                     """,
                     invoice_number,
                     uuid.UUID(body.userId),
-                    body.tenantId,
+                    tenant_id,
                     uuid.UUID(body.subscriptionId) if body.subscriptionId else None,
                     uuid.UUID(body.creditPurchaseId) if body.creditPurchaseId else None,
                     body.molliePaymentId,

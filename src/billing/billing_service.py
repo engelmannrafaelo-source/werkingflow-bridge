@@ -516,8 +516,18 @@ async def log_billing_event(
     source: str = "system",
     payload: Optional[Dict[str, Any]] = None,
 ) -> None:
-    """Append a row to billing_events. Append-only — never updates."""
+    """
+    Append a row to billing_events. Append-only — never updates.
+
+    tenant_id falls back to the user's tenant when not given explicitly, so
+    billing events stay mode-filterable even if a caller forgets it. A truly
+    user-less system event (no user_id, no tenant_id) is allowed — those are
+    global and not tenant-scoped. See ADR 0007.
+    """
     import json as _json
+    if tenant_id is None and user_id:
+        from src.api_auth.tenant_resolver import resolve_tenant_for_user
+        tenant_id = await resolve_tenant_for_user(user_id)
     pool = get_pool()
     async with pool.acquire() as conn:
         await conn.execute(
