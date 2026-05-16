@@ -195,11 +195,13 @@ async def record_usage(
     cache_creation_tokens: int,
     hypothetical_cost_eur: float,
     billing_mode: str,
-) -> None:
+) -> bool:
     """
     INSERT usage event. ON CONFLICT (litellm_call_id) DO NOTHING for idempotency.
+    Returns True if a row was actually inserted, False if it was a duplicate —
+    the caller uses this to avoid double-writing the mirrored activities row.
     """
-    await conn.execute(
+    row = await conn.fetchrow(
         """
         INSERT INTO sandbox_usage_events (
             litellm_call_id, user_id, tenant_id, session_id, lease_id,
@@ -208,6 +210,7 @@ async def record_usage(
             hypothetical_cost_eur, real_cost_eur, billing_mode
         ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
         ON CONFLICT (litellm_call_id) DO NOTHING
+        RETURNING id
         """,
         litellm_call_id,
         user_id,
@@ -225,6 +228,7 @@ async def record_usage(
         0.0,  # real_cost_eur = 0 for subscription
         billing_mode,
     )
+    return row is not None
 
 
 async def get_session_aggregate(conn: Any, session_id: str) -> dict:
