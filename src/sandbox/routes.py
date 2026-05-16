@@ -269,8 +269,12 @@ async def record_usage(
                 actor_uuid = uuid.UUID(str(body.userId))
             except (ValueError, AttributeError, TypeError):
                 actor_uuid = None
+            # event_type uses the ai-call: prefix so the platform Usage panel
+            # (which filters event_type LIKE 'ai-call:%') picks it up. The
+            # feature suffix sandbox-<app> keeps sandbox calls identifiable.
+            feature = f"sandbox-{body.app}"
             activity_payload = {
-                "feature": f"sandbox:{body.app}",
+                "feature": feature,
                 "model": body.model,
                 "promptTokens": body.inputTokens,
                 "completionTokens": body.outputTokens,
@@ -291,7 +295,7 @@ async def record_usage(
                     VALUES (gen_random_uuid(), NOW(), 'workflow', $1, $2,
                             NULL, $3, $4, NULL, NULL, $5::jsonb)
                     """,
-                    f"sandbox-call:{body.app}",
+                    f"ai-call:{feature}",
                     actor_uuid,
                     tenant_id,
                     body.app if body.app in _ACTIVITY_APP_IDS else None,
