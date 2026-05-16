@@ -50,6 +50,7 @@ services:
         reservations:
           memory: 1G
     volumes:
+      - /root/werkingflow-bridge/secrets:/app/secrets:ro
       - eco-wrapper-logs:/app/logs
       - eco-wrapper-instances-shared:/app/instances
       - ~/eco-research-output:/app/research_output
@@ -66,6 +67,7 @@ services:
       - LOG_LEVEL=INFO
       - LOG_TO_FILE=true
       - FILTER_SENSITIVE_DATA=true
+      - BRIDGE_SECRETS_DIR=/app/secrets
       - INSTANCE_NAME=worker1
       - ADAPTIVE_INITIAL_CAP_TOKENS=1000000
       - ADAPTIVE_FLOOR_TOKENS=500000
@@ -116,6 +118,7 @@ services:
         reservations:
           memory: 1G
     volumes:
+      - /root/werkingflow-bridge/secrets:/app/secrets:ro
       - eco-wrapper-logs:/app/logs
       - eco-wrapper-instances-shared:/app/instances
       - ~/eco-research-output:/app/research_output
@@ -132,6 +135,7 @@ services:
       - LOG_LEVEL=INFO
       - LOG_TO_FILE=true
       - FILTER_SENSITIVE_DATA=true
+      - BRIDGE_SECRETS_DIR=/app/secrets
       - INSTANCE_NAME=worker2
       - ADAPTIVE_INITIAL_CAP_TOKENS=1000000
       - ADAPTIVE_FLOOR_TOKENS=500000
@@ -182,6 +186,7 @@ services:
         reservations:
           memory: 1G
     volumes:
+      - /root/werkingflow-bridge/secrets:/app/secrets:ro
       - eco-wrapper-logs:/app/logs
       - eco-wrapper-instances-shared:/app/instances
       - ~/eco-research-output:/app/research_output
@@ -198,6 +203,7 @@ services:
       - LOG_LEVEL=INFO
       - LOG_TO_FILE=true
       - FILTER_SENSITIVE_DATA=true
+      - BRIDGE_SECRETS_DIR=/app/secrets
       - INSTANCE_NAME=worker3
       - ADAPTIVE_INITIAL_CAP_TOKENS=1000000
       - ADAPTIVE_FLOOR_TOKENS=500000
@@ -248,6 +254,7 @@ services:
         reservations:
           memory: 1G
     volumes:
+      - /root/werkingflow-bridge/secrets:/app/secrets:ro
       - eco-wrapper-logs:/app/logs
       - eco-wrapper-instances-shared:/app/instances
       - ~/eco-research-output:/app/research_output
@@ -264,6 +271,7 @@ services:
       - LOG_LEVEL=INFO
       - LOG_TO_FILE=true
       - FILTER_SENSITIVE_DATA=true
+      - BRIDGE_SECRETS_DIR=/app/secrets
       - INSTANCE_NAME=worker4
       - ADAPTIVE_INITIAL_CAP_TOKENS=1000000
       - ADAPTIVE_FLOOR_TOKENS=500000
