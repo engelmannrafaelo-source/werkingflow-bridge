@@ -83,6 +83,18 @@ def get_plan(plan_id: str) -> PlanConfig:
     return plan
 
 
+def find_plan_for_app(app_id: str) -> "PlanConfig | None":
+    """
+    Return the billable (non-trial) plan for an app, or None if the app
+    has no plan in the catalog. Used by the chat/completions budget gate
+    to resolve which plan a call is metered against.
+    """
+    for p in PLANS.values():
+        if p.app_id == app_id and not p.trial:
+            return p
+    return None
+
+
 def find_trial_plan_for(plan_id: str) -> "PlanConfig | None":
     """Find a trial-plan with same app_id as the given plan. Returns None
     if no trial-sibling exists for this app (most apps have none)."""

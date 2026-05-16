@@ -1781,6 +1781,30 @@ async def chat_completions(
         # in-flight token accounting matches the gating decision exactly.
         _arrival_est_tokens = int(getattr(request.state, "adaptive_est_tokens", 0) or 0)
         request.state.arrival_recorded = False
+
+        # ===================================================================
+        # BUDGET GATE — hard 402 when the user's app budget is exhausted.
+        # Runs before the LLM call. Fail-open on infra errors; only a real
+        # "budget empty" blocks. See src/budget/gate.py.
+        # ===================================================================
+        try:
+            from src.budget.gate import enforce_budget
+            _gate_attr = extract_attribution_context(request)
+            # Rough pre-call cost estimate: input estimate + max_tokens output,
+            # priced at Sonnet rates (EUR/1M: ~2.90 in, ~14.50 out). The gate
+            # only needs "is there money left", exact billing is deduct's job.
+            _gate_out_tokens = int(getattr(request_body, "max_tokens", 0) or 1024)
+            _gate_cost = (_arrival_est_tokens / 1_000_000) * 2.90 \
+                + (_gate_out_tokens / 1_000_000) * 14.50
+            await enforce_budget(
+                user_id=_gate_attr.get("user_id"),
+                app_id=_gate_attr.get("app_id"),
+                estimated_cost_eur=_gate_cost,
+            )
+        except HTTPException:
+            raise  # 402 — propagate to the client
+        except Exception as _ge:  # noqa: BLE001 — gate must never crash the path
+            logger.error(f"budget gate unexpected error (letting call through): {_ge}")
         try:
             from src.middleware.rolling_metrics import get_rolling_metrics
             get_rolling_metrics().record_arrival(

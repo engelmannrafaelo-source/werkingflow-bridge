@@ -150,26 +150,31 @@ class CheckRequest(BaseModel):
     estimatedCostEur: float = Field(ge=0)
 
 
-@router.post("/check")
-async def budget_check(
-    body: CheckRequest,
-    _claims: AuthClaims = Depends(require_jwt_or_service),
+async def evaluate_budget(
+    user_id: uuid.UUID,
+    plan_id: str,
+    estimated_cost_eur: float,
 ) -> Dict[str, Any]:
-    user_id = _parse_user_id(body.userId)
-    try:
-        get_plan(body.planId)
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
+    """
+    Core budget evaluation — load, auto-provision trial, expiry-check, check.
+
+    Pure logic, no HTTP. Shared by the POST /v1/budget/check endpoint and the
+    chat/completions budget gate (src/budget/gate.py). Raises ValueError for
+    an unknown plan_id; callers map that to 400.
+
+    Returns the same dict shape the /check endpoint returns.
+    """
+    get_plan(plan_id)  # raises ValueError on unknown plan
 
     pool = get_pool()
-    effective_plan_id = body.planId
+    effective_plan_id = plan_id
 
     async with pool.acquire() as conn:
         budget = await _load_user_budget(conn, user_id)
 
         # Auto-provision trial when user is unlicensed and a trial sibling exists.
-        if budget.monthly_budgets.get(body.planId) is None:
-            trial = find_trial_plan_for(body.planId)
+        if budget.monthly_budgets.get(plan_id) is None:
+            trial = find_trial_plan_for(plan_id)
             if trial is not None:
                 effective_plan_id = trial.id
                 if budget.monthly_budgets.get(trial.id) is None:
@@ -189,10 +194,10 @@ async def budget_check(
                 "totalRemainingEur": budget.top_up_balance_eur,
             }
 
-    result = check_budget(budget, effective_plan_id, body.estimatedCostEur)
+    result = check_budget(budget, effective_plan_id, estimated_cost_eur)
 
     reason = result.reason
-    if result.allowed and effective_plan_id != body.planId:
+    if result.allowed and effective_plan_id != plan_id:
         reason = "trial_active"
 
     return {
@@ -203,6 +208,18 @@ async def budget_check(
         "topUpRemainingEur": result.top_up_remaining_eur,
         "totalRemainingEur": result.total_remaining_eur,
     }
+
+
+@router.post("/check")
+async def budget_check(
+    body: CheckRequest,
+    _claims: AuthClaims = Depends(require_jwt_or_service),
+) -> Dict[str, Any]:
+    user_id = _parse_user_id(body.userId)
+    try:
+        return await evaluate_budget(user_id, body.planId, body.estimatedCostEur)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
 
 # ---------------------------------------------------------------------------
