@@ -81,6 +81,44 @@ rssh() {
     sudo -n ssh $SSH_BASE_OPTS "root@${host}" "$@"
 }
 
+# rssh_run: run a multi-line bash script on a remote host via stdin.
+#
+# Defensive against the quote-escaping hell of `rssh host "$big_string"`:
+# the remote runs `bash -s` and reads the entire script from stdin, so
+# single quotes, backticks, awk programs and dollar-signs travel literally
+# without needing layers of \" and \$ escapes.
+#
+# `errexit -o pipefail` is enabled inside the remote shell so a failing
+# command in the middle of the script does not silently leak its exit
+# status — the caller sees the first failure as the script exit code.
+# The local caller still decides what to do on non-zero (|| / && chains).
+#
+# The script body is captured from THIS function's stdin so a heredoc at
+# the call site is the natural input. Both remote stdout and stderr flow
+# back over SSH and are visible to the caller's command substitution —
+# matching the single-stream behaviour callers already had from rssh().
+#
+# Local variables in the heredoc are expanded BEFORE rssh_run sees them
+# (normal bash heredoc semantics), so `${REMOTE_REPO}` etc. are baked in.
+# To keep a literal `$foo` on the remote side, escape it as `\$foo`.
+#
+# Usage:
+#   output=$(rssh_run "$host" <<EOF
+#     cd ${REMOTE_REPO}
+#     awk '/^services:/ { print }' docker/compose.yml
+#   EOF
+#   )
+rssh_run() {
+    local host="$1"
+    local script_body
+    script_body=$(cat)
+    # shellcheck disable=SC2086
+    sudo -n ssh $SSH_BASE_OPTS "root@${host}" "bash -s" <<EOF
+set -euo pipefail
+${script_body}
+EOF
+}
+
 svc_to_varname() {
     # Convert service name to bash variable segment: worker-prod → worker_prod
     echo "${1//-/_}"
@@ -250,41 +288,90 @@ phase_validate() {
     # container even though those services only exist inside the compose net.
     # awk stays in_services until the next top-level YAML section so
     # networks/volumes/secrets entries don't bleed into the host list.
-    add_hosts=$(rssh "$host" "
-        cd ${REMOTE_REPO}
-        awk '
-          /^services:/ { in_services=1; next }
-          /^[a-z][a-zA-Z0-9_-]*:\$/ { in_services=0 }
-          in_services && /^  [a-zA-Z0-9_-]+:\$/ { gsub(/[ :]/, \"\"); print }
-        ' ${compose} \
-          | grep -vE '^(nginx|lb)\$' \
-          | sed 's|^|--add-host=|;s|\$|:127.0.0.1|' \
-          | tr '\n' ' '
-    " 2>&1) || add_hosts=""
-    if [ -z "$add_hosts" ]; then
-        warn "Could not derive add_hosts from ${compose} — nginx test will run without it"
+    #
+    # Two defensive moves over the previous implementation:
+    #
+    #   1. The compose variable holds `-f file1.yml -f file2.yml` flags, but
+    #      awk treats `-f` as "read program from file" — so passing it through
+    #      directly produced `awk: cannot open '-f' for reading`. Strip the
+    #      flags first, leaving only the YAML paths.
+    #
+    #   2. The awk program contains single quotes and `$` regex anchors that
+    #      previously had to survive three layers of escaping inside an ssh
+    #      "double-quoted" command string. We now pipe the whole script
+    #      through rssh_run via heredoc — no escaping needed beyond the
+    #      standard `\$` required by an UNquoted heredoc to defer expansion
+    #      to the remote side.
+    #
+    # The `sort -u` deduplicates entries that appear in both the base and
+    # overlay compose files (worker1..4 in our case).
+    local compose_files
+    compose_files=$(echo "$compose" | tr ' ' '\n' | grep -v '^-f$' | grep -v '^$' | tr '\n' ' ')
+    local add_hosts_output add_hosts_rc
+    add_hosts_output=$(rssh_run "$host" <<EOF
+cd ${REMOTE_REPO}
+awk '
+  /^services:/ { in_services=1; next }
+  /^[a-z][a-zA-Z0-9_-]*:\$/ { in_services=0 }
+  in_services && /^  [a-zA-Z0-9_-]+:\$/ { gsub(/[ :]/, ""); print }
+' ${compose_files} \
+  | grep -vE '^(nginx|lb)\$' \
+  | sort -u \
+  | sed 's|^|--add-host=|;s|\$|:127.0.0.1|' \
+  | tr '\n' ' '
+EOF
+    )
+    add_hosts_rc=$?
+    if [ $add_hosts_rc -ne 0 ]; then
+        # Fail-fast: a non-zero exit here is almost always a malformed compose
+        # file or an SSH-side bash error — both must be fixed before deploy,
+        # not silently swallowed. Emit the captured output so the operator
+        # has something to grep.
+        error_ "Could not derive add_hosts from ${compose} (rc=${add_hosts_rc}). Captured output:"
+        while IFS= read -r line; do error_ "  add_hosts: ${line}"; done <<< "$add_hosts_output"
+        return 1
+    fi
+    add_hosts="$add_hosts_output"
+    if [ -z "${add_hosts// /}" ]; then
+        warn "add_hosts list is empty for ${compose} — nginx test will run without it"
+        add_hosts=""
     fi
     info "nginx config syntax check (${nginx_conf})..."
-    local nginx_output
-    nginx_output=$(rssh "$host" "
-        cd ${REMOTE_REPO}
-        BRIDGE_PROD_HOST=127.0.0.1 BRIDGE_PRIMARY_HOST=127.0.0.1 BRIDGE_ID=validate-probe \\
-            envsubst '${envsubst_vars}' \\
-            < ${nginx_conf} > /tmp/bridge-nginx-check.conf 2>&1
-        if docker run --rm \\
-            ${add_hosts} \\
-            --tmpfs /var/log/nginx \\
-            -v /tmp/bridge-nginx-check.conf:/etc/nginx/nginx.conf:ro \\
-            -v ${REMOTE_REPO}/docker/lua:/etc/nginx/lua:ro \\
-            openresty/openresty:1.27.1.1-alpine sh -c 'touch /var/log/nginx/access.jsonl && openresty -t -c /etc/nginx/nginx.conf' 2>&1; then
-            echo __NGINX_OK__
-        else
-            echo __NGINX_FAIL__
-        fi
-        rm -f /tmp/bridge-nginx-check.conf
-    " 2>&1) || true
+    local nginx_output nginx_rc
+    nginx_output=$(rssh_run "$host" <<EOF
+cd ${REMOTE_REPO}
+BRIDGE_PROD_HOST=127.0.0.1 BRIDGE_PRIMARY_HOST=127.0.0.1 BRIDGE_ID=validate-probe \
+    envsubst '${envsubst_vars}' \
+    < ${nginx_conf} > /tmp/bridge-nginx-check.conf 2>&1
+if docker run --rm \
+    ${add_hosts} \
+    --tmpfs /var/log/nginx \
+    -v /tmp/bridge-nginx-check.conf:/etc/nginx/nginx.conf:ro \
+    -v ${REMOTE_REPO}/docker/lua:/etc/nginx/lua:ro \
+    openresty/openresty:1.27.1.1-alpine \
+    sh -c 'touch /var/log/nginx/access.jsonl && openresty -t -c /etc/nginx/nginx.conf' 2>&1
+then
+    echo __NGINX_OK__
+else
+    echo __NGINX_FAIL__
+fi
+rm -f /tmp/bridge-nginx-check.conf
+EOF
+    )
+    nginx_rc=$?
 
     while IFS= read -r line; do info "  nginx-t: ${line}"; done <<< "$nginx_output"
+    # Two failure modes to distinguish (fail-fast on each, but with separate
+    # diagnostic messages so the operator knows where to look):
+    #   1. nginx_rc != 0 → the wrapper script itself failed on the remote
+    #      (bash syntax, envsubst missing, docker daemon down, …). NOT an
+    #      nginx-config problem; do not silently retry.
+    #   2. nginx_rc == 0 but output does not contain __NGINX_OK__ → the
+    #      nginx config itself is invalid. Real config-fix needed.
+    if [ $nginx_rc -ne 0 ]; then
+        error_ "nginx validation wrapper FAILED on ${host} (rc=${nginx_rc}) — this is a script/env problem, not an nginx-config problem. See output above."
+        return 1
+    fi
     if ! echo "$nginx_output" | grep -q '__NGINX_OK__'; then
         error_ "nginx config validation FAILED (see output above)"
         return 1

@@ -97,7 +97,7 @@ async def usage_metrics(
     appId: Optional[str] = Query(None),
     tenantId: Optional[str] = Query(None),
     userId: Optional[str] = Query(None),
-    mode: Optional[str] = Query(None, description="prod|staging|local — filter by tenant.category"),
+    mode: Optional[str] = Query(None, description="prod|staging|local — filter by app_env (X-App-Env)"),
     _claims: AuthClaims = Depends(require_admin),
 ) -> Dict[str, Any]:
     """
@@ -114,9 +114,7 @@ async def usage_metrics(
     until_dt = _parse_iso(until) or datetime.now(timezone.utc)
     since_dt = _parse_iso(since) or (until_dt - timedelta(days=30))
 
-    # All activity columns explicitly qualified as `a.*` — `category` exists on
-    # both `activities` (workflow|...) and `tenants` (prod|staging|local) and
-    # would be ambiguous once we LEFT JOIN tenants below.
+    # Activity columns stay qualified as `a.*` for readability.
     where = ["a.category = 'workflow'", "a.event_type LIKE 'ai-call:%' OR a.event_type LIKE 'ai-call-error:%'",
              "a.timestamp >= $1", "a.timestamp <= $2"]
     args: List[Any] = [since_dt, until_dt]
@@ -137,11 +135,12 @@ async def usage_metrics(
             raise HTTPException(status_code=400, detail=f"Invalid userId UUID: {userId}")
         _add("a.actor_user_id = $$", uid)
 
-    join_tenants = ""
+    # "mode" filters by the environment the call came from
+    # (X-App-Env → activities.app_env), not the customer's tenant.category.
+    # NULL app_env (pre-migration / no header) is excluded when filtered.
     if mode:
         args.append(mode)
-        where.append(f"t.category = ${len(args)}::tenant_category")
-        join_tenants = "LEFT JOIN tenants t ON t.id = a.tenant_id"
+        where.append(f"a.app_env = ${len(args)}::tenant_category")
 
     where_sql = " AND ".join(f"({cx})" if " OR " in cx else cx for cx in where)
     sql = f"""
@@ -151,7 +150,7 @@ async def usage_metrics(
           (a.payload->>'promptTokens')::bigint      AS prompt_tokens,
           (a.payload->>'completionTokens')::bigint  AS completion_tokens,
           (a.payload->>'totalTokens')::bigint       AS total_tokens
-        FROM activities a {join_tenants}
+        FROM activities a
         WHERE {where_sql}
     """
 
@@ -283,8 +282,7 @@ async def usage_timeseries(
     default_lookback = timedelta(days=30 if bucket == "day" else 2)
     since_dt = _parse_iso(since) or (until_dt - default_lookback)
 
-    # All activity columns explicitly qualified — `category` is on both
-    # activities and tenants and would be ambiguous once we LEFT JOIN tenants.
+    # Activity columns stay qualified as `a.*` for readability.
     where = ["a.category = 'workflow'",
              "(a.event_type LIKE 'ai-call:%' OR a.event_type LIKE 'ai-call-error:%')",
              "a.timestamp >= $1", "a.timestamp <= $2"]
@@ -293,11 +291,12 @@ async def usage_timeseries(
         args.append(appId)
         where.append(f"a.app_id = ${len(args)}")
 
-    join_tenants = ""
+    # "mode" filters by the environment the call came from
+    # (X-App-Env → activities.app_env), not the customer's tenant.category.
+    # NULL app_env (pre-migration / no header) is excluded when filtered.
     if mode:
         args.append(mode)
-        where.append(f"t.category = ${len(args)}::tenant_category")
-        join_tenants = "LEFT JOIN tenants t ON t.id = a.tenant_id"
+        where.append(f"a.app_env = ${len(args)}::tenant_category")
 
     where_sql = " AND ".join(where)
     sql = f"""
@@ -308,7 +307,7 @@ async def usage_timeseries(
           (a.payload->>'promptTokens')::bigint      AS prompt_tokens,
           (a.payload->>'completionTokens')::bigint  AS completion_tokens,
           a.event_type
-        FROM activities a {join_tenants}
+        FROM activities a
         WHERE {where_sql}
         ORDER BY bucket_ts ASC
     """
