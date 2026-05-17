@@ -140,7 +140,7 @@ async def usage_metrics(
     # NULL app_env (pre-migration / no header) is excluded when filtered.
     if mode:
         args.append(mode)
-        where.append(f"a.app_env = ${len(args)}::tenant_category")
+        where.append(f"a.app_env = ${len(args)}::app_env")
 
     where_sql = " AND ".join(f"({cx})" if " OR " in cx else cx for cx in where)
     sql = f"""
@@ -296,7 +296,7 @@ async def usage_timeseries(
     # NULL app_env (pre-migration / no header) is excluded when filtered.
     if mode:
         args.append(mode)
-        where.append(f"a.app_env = ${len(args)}::tenant_category")
+        where.append(f"a.app_env = ${len(args)}::app_env")
 
     where_sql = " AND ".join(where)
     sql = f"""

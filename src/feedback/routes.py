@@ -13,11 +13,12 @@ import uuid
 from typing import Any, Dict, List, Optional
 
 import asyncpg
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel, Field
 
 from src.api_auth import require_admin, require_jwt_or_service, AuthClaims, resolve_tenant_id
 from src.db.client import get_pool
+from src.tenant import get_app_env_from_request, normalize_app_env
 
 router = APIRouter(prefix="/v1/feedback", tags=["feedback"])
 
@@ -65,6 +66,7 @@ class FeedbackCreateRequest(BaseModel):
 @router.post("", status_code=201)
 async def create_feedback(
     body: FeedbackCreateRequest,
+    request: Request,
     claims: AuthClaims = Depends(require_jwt_or_service),
 ) -> Dict[str, Any]:
     if body.appId not in _ALLOWED_APPS:
@@ -79,14 +81,21 @@ async def create_feedback(
     # body.tenantId / derived from body.userId. See ADR 0007.
     tenant_id = await resolve_tenant_id(claims, body.tenantId, body.userId)
 
+    # app_env: the environment the app variant this feedback came from runs
+    # in. Read from X-App-Env, normalised to prod/staging/local. Absent
+    # header → NULL (honest un-attributed, never guessed). Drives the
+    # Platform Admin "mode" filter. See migration 009.
+    app_env = normalize_app_env(get_app_env_from_request(request))
+
     pool = get_pool()
     try:
         async with pool.acquire() as conn:
             row = await conn.fetchrow(
                 """
                 INSERT INTO feedback
-                  (user_id, tenant_id, app_id, rating, category, title, body, metadata)
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb)
+                  (user_id, tenant_id, app_id, rating, category, title, body, metadata,
+                   app_env)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9::app_env)
                 RETURNING id, user_id, tenant_id, app_id, rating, category, title, body,
                           status, metadata, created_at, updated_at
                 """,
@@ -98,6 +107,7 @@ async def create_feedback(
                 body.title,
                 body.body,
                 json.dumps(body.metadata or {}),
+                app_env,
             )
     except asyncpg.PostgresError:
         raise HTTPException(status_code=500, detail="Database error")
@@ -131,19 +141,20 @@ async def list_feedback(
             raise HTTPException(status_code=400, detail=f"Unknown status: {status}")
         add("feedback.status = $$", status)
 
-    join_clause = ""
+    # "mode" filters by the environment the feedback was submitted from
+    # (X-App-Env → feedback.app_env), NOT by the customer's hand-set
+    # tenant.category. Rows with NULL app_env (pre-migration / no header)
+    # are honestly un-attributed and excluded when a mode is requested.
     if mode:
         if mode not in _ALLOWED_MODES:
             raise HTTPException(status_code=400, detail=f"Unknown mode: {mode}")
-        args.append(mode)
-        where.append(f"t.category = ${len(args)}::tenant_category")
-        join_clause = "LEFT JOIN tenants t ON t.id = feedback.tenant_id"
+        add("feedback.app_env = $$::app_env", mode)
 
-    sql = f"""
+    sql = """
       SELECT feedback.id, feedback.user_id, feedback.tenant_id, feedback.app_id,
              feedback.rating, feedback.category, feedback.title, feedback.body,
              feedback.status, feedback.metadata, feedback.created_at, feedback.updated_at
-        FROM feedback {join_clause}
+        FROM feedback
     """
     if where:
         sql += " WHERE " + " AND ".join(where)

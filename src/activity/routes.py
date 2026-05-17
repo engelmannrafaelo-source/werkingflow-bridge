@@ -82,7 +82,7 @@ async def activity_log(
               (id, timestamp, category, event_type, actor_user_id, target_user_id,
                tenant_id, app_id, ip, user_agent, payload, app_env)
             VALUES (gen_random_uuid(), NOW(), $1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb,
-                    $10::tenant_category)
+                    $10::app_env)
             RETURNING id, timestamp
             """,
             body.category, body.eventType,
@@ -143,7 +143,7 @@ async def activity_query(
     if mode:
         if mode not in ("prod", "staging", "local"):
             raise HTTPException(status_code=400, detail=f"Invalid mode: {mode}")
-        add("activities.app_env = $$::tenant_category", mode)
+        add("activities.app_env = $$::app_env", mode)
 
     sql = """
       SELECT activities.id, activities.timestamp, activities.category, activities.event_type,

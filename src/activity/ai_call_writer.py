@@ -104,7 +104,7 @@ async def persist_ai_call_activity(
                    target_user_id, tenant_id, app_id, ip, user_agent, payload,
                    app_env)
                 VALUES (gen_random_uuid(), NOW(), 'workflow', $1, $2,
-                        NULL, $3, $4, NULL, NULL, $5::jsonb, $6::tenant_category)
+                        NULL, $3, $4, NULL, NULL, $5::jsonb, $6::app_env)
                 """,
                 event_type,
                 actor_uuid,
