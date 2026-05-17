@@ -75,6 +75,8 @@ from src.tenant import (
     get_session_id_from_request,
     get_workflow_id_from_request,
     get_job_id_from_request,
+    get_app_env_from_request,
+    normalize_app_env,
     track_request_usage
 )
 # Rate limiting - required in production, optional in development
@@ -1537,6 +1539,7 @@ async def generate_streaming_response(
                     output_tokens=est_completion_tokens or 0,
                     status="success",
                     duration_ms=int(stream_duration * 1000),
+                    app_env=attr.get("app_env"),
                 )
         except Exception as track_err:
             logger.warning(f"⚠️ Streaming usage tracking failed (non-fatal): {track_err}")
@@ -1666,6 +1669,8 @@ def extract_attribution_context(request: Request) -> dict:
     - session_id: Session UUID (X-Session-ID)
     - workflow_id: Workflow type (X-Workflow-ID)
     - job_id: Job/run UUID (X-Job-ID)
+    - app_env: Normalised app-variant environment (X-App-Env →
+               prod|staging|local), None if header absent
 
     All values are optional (None if not provided).
     Fallback: Parses X-Client-ID (e.g., "werking-energy/wizard/analyze-smart")
@@ -1704,6 +1709,10 @@ def extract_attribution_context(request: Request) -> dict:
         "session_id": get_session_id_from_request(request),
         "workflow_id": get_workflow_id_from_request(request),
         "job_id": get_job_id_from_request(request),
+        # Normalised app-variant environment (prod/staging/local) — the
+        # truth source for the Platform Admin "mode" filter. None when the
+        # app sent no X-App-Env header (honest un-attributed).
+        "app_env": normalize_app_env(get_app_env_from_request(request)),
     }
 
 
@@ -2620,6 +2629,7 @@ async def chat_completions(
                     output_tokens=completion_tokens or 0,
                     status="success",
                     duration_ms=int(duration * 1000),
+                    app_env=attribution.get("app_env"),
                 )
             except Exception as e:
                 logger.warning(f"prompt_metrics record (success) failed: {e}")
@@ -2735,6 +2745,7 @@ async def chat_completions(
                 status="error",
                 duration_ms=int(duration * 1000),
                 error_code=str(http_exc.status_code),
+                app_env=attribution.get("app_env"),
             )
         except Exception:
             pass
@@ -2791,6 +2802,7 @@ async def chat_completions(
                 status="error",
                 duration_ms=int(duration * 1000),
                 error_code="429",
+                app_env=attribution.get("app_env"),
             )
         except Exception:
             pass

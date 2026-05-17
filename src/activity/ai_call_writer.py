@@ -45,11 +45,16 @@ async def persist_ai_call_activity(
     status: str,
     duration_ms: int,
     error_code: Optional[str] = None,
+    app_env: Optional[str] = None,
 ) -> None:
     """
     Write one ai-call activity row. Never raises — tracking is best-effort.
 
     status: "success" | "error"
+    app_env: already-normalised environment bucket (prod|staging|local) the
+        call came from, or None when the app sent no X-App-Env header. The
+        caller normalises it (extract_attribution_context); we just persist
+        it. Drives the Platform Admin "mode" filter.
     """
     try:
         if not user_id:
@@ -96,15 +101,17 @@ async def persist_ai_call_activity(
                 """
                 INSERT INTO activities
                   (id, timestamp, category, event_type, actor_user_id,
-                   target_user_id, tenant_id, app_id, ip, user_agent, payload)
+                   target_user_id, tenant_id, app_id, ip, user_agent, payload,
+                   app_env)
                 VALUES (gen_random_uuid(), NOW(), 'workflow', $1, $2,
-                        NULL, $3, $4, NULL, NULL, $5::jsonb)
+                        NULL, $3, $4, NULL, NULL, $5::jsonb, $6::tenant_category)
                 """,
                 event_type,
                 actor_uuid,
                 tenant_id,
                 app_id,
                 json.dumps(payload),
+                app_env,
             )
     except Exception as e:  # noqa: BLE001 — tracking must never break the call
         logger.warning("persist_ai_call_activity failed (non-blocking): %s", e)
