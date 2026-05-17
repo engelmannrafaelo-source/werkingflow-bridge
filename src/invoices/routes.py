@@ -649,10 +649,13 @@ async def render_invoice_html(
 @router.post("/{invoice_id}/send")
 async def send_invoice(
     invoice_id: str,
-    _claims: AuthClaims = Depends(require_admin),
+    claims: AuthClaims = Depends(require_jwt_or_service),
 ) -> Dict[str, Any]:
     """
     Send the invoice as an email (HTML body) via Resend.
+
+    Auth: the invoice owner may trigger their own send (self-service); admins
+    and service tokens may send any invoice. Same self-scoping as GET /{id}.
 
     Pulls recipient from the linked user's email. Marks the invoice's
     sent_at and writes a billing_events trail. Fail-fast when RESEND_API_KEY
@@ -677,6 +680,8 @@ async def send_invoice(
         )
     if not r:
         raise HTTPException(status_code=404, detail=f"Invoice {invoice_id} not found")
+    if not claims.is_admin and str(r["user_id"]) != claims.user_id:
+        raise HTTPException(status_code=403, detail="Forbidden: not your invoice")
     recipient = r["user_email"]
     if not recipient:
         raise HTTPException(status_code=409, detail="Invoice user has no email — cannot send")

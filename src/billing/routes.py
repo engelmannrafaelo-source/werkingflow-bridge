@@ -132,6 +132,31 @@ async def billing_overview(
     }
 
 
+@router.get("/plans")
+async def list_plans() -> Dict[str, Any]:
+    """
+    Public plan catalog — pricing info for the customer portal.
+
+    No auth required: prices are not sensitive; the frontend needs this
+    to render the plan-comparison table before (and after) the user logs in.
+    """
+    return {
+        "plans": [
+            {
+                "id": p.id,
+                "appId": p.app_id,
+                "name": p.name,
+                "priceEur": p.price,
+                "interval": p.interval,
+                "apiBudgetEur": p.api_budget_eur,
+                "description": p.description,
+                "trial": p.trial,
+            }
+            for p in PLANS.values()
+        ]
+    }
+
+
 class CustomerRequest(BaseModel):
     userId: str
     email: str

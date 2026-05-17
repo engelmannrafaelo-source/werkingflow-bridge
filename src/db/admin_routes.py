@@ -20,7 +20,7 @@ import asyncpg
 from src.identity.password import hash_password
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from pydantic import BaseModel, EmailStr
+from pydantic import BaseModel, EmailStr, Field
 
 from src.api_auth import require_admin, require_jwt_or_service, require_self_or_admin, AuthClaims
 from src.db.client import get_pool
@@ -210,6 +210,49 @@ async def get_user(
         for lr in license_rows
     ]
     return result
+
+
+# ---------------------------------------------------------------------------
+# User self-update
+# ---------------------------------------------------------------------------
+
+class UserSelfUpdateRequest(BaseModel):
+    # Only `name` is exposed for self-edit. Email requires a separate
+    # verification flow. tenant_id and roles are admin-only.
+    name: Optional[str] = Field(default=None, min_length=1, max_length=255)
+
+
+@router.patch("/v1/users/{user_id}")
+async def update_user(
+    user_id: str,
+    body: UserSelfUpdateRequest,
+    claims: AuthClaims = Depends(require_self_or_admin),
+) -> Dict[str, Any]:
+    """
+    Update own profile. Self-scoped: a user may only patch their own record.
+    Admins may patch any user.
+
+    Editable fields: name (email requires a separate verification flow;
+    tenant_id, role, password_hash are admin or dedicated-endpoint only).
+    """
+    if body.name is None:
+        raise HTTPException(status_code=400, detail="No fields to update")
+
+    pool = get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            UPDATE users
+               SET name = $1, updated_at = NOW()
+             WHERE id = $2
+         RETURNING id, email, name, tenant_id, created_at, updated_at
+            """,
+            body.name,
+            uuid.UUID(user_id),
+        )
+    if not row:
+        raise HTTPException(status_code=404, detail=f"User '{user_id}' not found")
+    return _user_row_to_dict(row)
 
 
 # ---------------------------------------------------------------------------
