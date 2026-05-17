@@ -3,13 +3,17 @@ Admin CRUD routes — Identity + DB-health.
 Only mounted when BRIDGE_DB_URL is set.
 
 Auth model:
-  GET  /v1/db/health             — public liveness probe (no PII)
-  GET  /v1/users                 — admin only
-  POST /v1/users                 — admin only (creates accounts)
-  GET  /v1/users/{user_id}       — require_self_or_admin
-  GET  /v1/tenants               — admin only
-  POST /v1/tenants               — admin only
-  GET  /v1/app-licenses?userId=  — require_self_or_admin (if userId given) else admin
+  GET    /v1/db/health                           — public liveness probe (no PII)
+  GET    /v1/users                               — admin only
+  POST   /v1/users                               — admin only (creates accounts)
+  GET    /v1/users/{user_id}                     — require_self_or_admin
+  PATCH  /v1/users/{user_id}                     — require_self_or_admin (name only)
+  GET    /v1/tenants                             — admin only
+  POST   /v1/tenants                             — admin only
+  PATCH  /v1/tenants/{tenant_id}                 — admin only
+  GET    /v1/tenants/{tenant_id}/billing-address — self (own tenant) or admin
+  PATCH  /v1/tenants/{tenant_id}/billing-address — self (own tenant) or admin
+  GET    /v1/app-licenses?userId=                — require_self_or_admin (if userId given) else admin
 """
 import logging
 import uuid
@@ -406,6 +410,116 @@ async def update_tenant(
         "category": row["category"],
         "created_at": row["created_at"].isoformat(),
     }
+
+
+# ---------------------------------------------------------------------------
+# Tenant billing address — self-service (user reads/writes own tenant only)
+# ---------------------------------------------------------------------------
+
+class TenantBillingAddressRequest(BaseModel):
+    name: Optional[str] = Field(default=None, max_length=255)
+    street: Optional[str] = Field(default=None, max_length=255)
+    city: Optional[str] = Field(default=None, max_length=255)
+    postcode: Optional[str] = Field(default=None, max_length=64)
+    country: Optional[str] = Field(default=None, min_length=2, max_length=2, description="ISO 3166-1 alpha-2")
+    vatId: Optional[str] = Field(default=None, max_length=64)
+
+
+def _tenant_billing_address_row(row: Any) -> Dict[str, Any]:
+    return {
+        "name": row["billing_name"],
+        "street": row["billing_street"],
+        "city": row["billing_city"],
+        "postcode": row["billing_postcode"],
+        "country": row["billing_country"],
+        "vatId": row["billing_vat_id"],
+    }
+
+
+@router.get("/v1/tenants/{tenant_id}/billing-address")
+async def get_tenant_billing_address(
+    tenant_id: str,
+    claims: AuthClaims = Depends(require_jwt_or_service),
+) -> Dict[str, Any]:
+    """
+    Read the billing address of a tenant.
+
+    Self-scoped: a user JWT may only read the billing address of their own tenant
+    (claims.tenant_id must equal the path tenant_id). Admins and service tokens
+    may read any tenant.
+    """
+    if not claims.is_admin and claims.tenant_id != tenant_id:
+        raise HTTPException(status_code=403, detail="Forbidden: can only access own tenant")
+
+    pool = get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            SELECT billing_name, billing_street, billing_city,
+                   billing_postcode, billing_country, billing_vat_id
+            FROM tenants WHERE id = $1
+            """,
+            tenant_id,
+        )
+    if not row:
+        raise HTTPException(status_code=404, detail=f"Tenant '{tenant_id}' not found")
+    return _tenant_billing_address_row(row)
+
+
+@router.patch("/v1/tenants/{tenant_id}/billing-address")
+async def update_tenant_billing_address(
+    tenant_id: str,
+    body: TenantBillingAddressRequest,
+    claims: AuthClaims = Depends(require_jwt_or_service),
+) -> Dict[str, Any]:
+    """
+    Update the billing address of a tenant (partial update — only provided fields change).
+
+    Self-scoped: a user JWT may only update the billing address of their own tenant.
+    Admins and service tokens may update any tenant.
+
+    country must be an ISO 3166-1 alpha-2 code (e.g. "AT", "DE").
+    """
+    if not claims.is_admin and claims.tenant_id != tenant_id:
+        raise HTTPException(status_code=403, detail="Forbidden: can only access own tenant")
+
+    sets: List[str] = []
+    args: List[Any] = []
+
+    def _add(col: str, val: Any) -> None:
+        args.append(val)
+        sets.append(f"{col} = ${len(args)}")
+
+    if body.name is not None:
+        _add("billing_name", body.name)
+    if body.street is not None:
+        _add("billing_street", body.street)
+    if body.city is not None:
+        _add("billing_city", body.city)
+    if body.postcode is not None:
+        _add("billing_postcode", body.postcode)
+    if body.country is not None:
+        _add("billing_country", body.country.upper())
+    if body.vatId is not None:
+        _add("billing_vat_id", body.vatId)
+
+    if not sets:
+        raise HTTPException(status_code=400, detail="No fields to update")
+
+    args.append(tenant_id)
+    sql = (
+        "UPDATE tenants SET " + ", ".join(sets) +
+        f" WHERE id = ${len(args)}"
+        " RETURNING billing_name, billing_street, billing_city,"
+        "   billing_postcode, billing_country, billing_vat_id"
+    )
+
+    pool = get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(sql, *args)
+    if not row:
+        raise HTTPException(status_code=404, detail=f"Tenant '{tenant_id}' not found")
+    return _tenant_billing_address_row(row)
 
 
 # ---------------------------------------------------------------------------

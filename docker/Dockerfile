@@ -1,6 +1,8 @@
 FROM python:3.12-slim
 
-# Install system deps for Node.js, gosu, Docling (OpenCV, image processing), and general utils
+# Install system deps for Node.js, gosu, Docling (OpenCV, image processing),
+# WeasyPrint (invoice PDF rendering — Cairo + Pango stack), and general utils.
+# WeasyPrint requires: libpango, libcairo, libgdk-pixbuf, shared-mime-info, fonts.
 RUN apt-get update && apt-get install -y \
     curl \
     nodejs \
@@ -8,6 +10,13 @@ RUN apt-get update && apt-get install -y \
     gosu \
     libgl1 \
     libglib2.0-0 \
+    libpango-1.0-0 \
+    libpangoft2-1.0-0 \
+    libpangocairo-1.0-0 \
+    libcairo2 \
+    libgdk-pixbuf2.0-0 \
+    shared-mime-info \
+    fonts-liberation \
     && rm -rf /var/lib/apt/lists/*
 
 # Create non-root user for Claude Code (required for bypassPermissions)

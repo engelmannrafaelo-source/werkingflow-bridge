@@ -5,9 +5,9 @@ POST   /v1/invoices                    create (admin or service)
 GET    /v1/invoices                    list (admin, with filters)
 GET    /v1/invoices/{id}               detail (self-or-admin)
 GET    /v1/invoices/{id}/html          render HTML invoice (self-or-admin)
+GET    /v1/invoices/{id}/pdf           download PDF invoice (self-or-admin)
 PATCH  /v1/invoices/{id}               status / metadata updates (admin)
-
-PDF + Email-Send are phase 2 (weasyprint + Resend integration).
+POST   /v1/invoices/{id}/send          email invoice to customer (self-or-admin)
 """
 from __future__ import annotations
 
@@ -448,6 +448,11 @@ _HTML_TEMPLATE = """<!doctype html>
     background: #fffbeb; border-left: 3px solid #d97706;
     font-size: 11px; color: #78350f;
   }}
+  .reverse-charge {{
+    margin: 16px 0; padding: 12px 14px;
+    background: #eff6ff; border-left: 3px solid #2563eb;
+    font-size: 11px; color: #1e3a8a; font-weight: 500;
+  }}
   .footer {{
     margin-top: 40px; padding-top: 16px; border-top: 1px solid #e5e7eb;
     font-size: 10px; color: #6b7280; line-height: 1.5;
@@ -515,6 +520,8 @@ _HTML_TEMPLATE = """<!doctype html>
 
 {payment_block}
 
+{reverse_charge_block}
+
 {notes_block}
 
 <div class="footer">
@@ -567,6 +574,11 @@ def _render_html(inv: Dict[str, Any]) -> str:
 
     notes_block = f"<div class='notes'>{inv['notes']}</div>" if inv.get("notes") else ""
 
+    rc_note = (inv.get("metadata") or {}).get("reverseChargeNote")
+    reverse_charge_block = (
+        f"<div class='reverse-charge'>{rc_note}</div>" if rc_note else ""
+    )
+
     status = inv.get("status", "draft")
     if status == "paid":
         payment_block = (
@@ -611,6 +623,7 @@ def _render_html(inv: Dict[str, Any]) -> str:
         tax_eur=inv["taxEur"],
         total_eur=inv["totalEur"],
         payment_block=payment_block,
+        reverse_charge_block=reverse_charge_block,
         notes_block=notes_block,
         issuer_name=issuer["name"],
         issuer_street=issuer["street"],
@@ -640,6 +653,39 @@ async def render_invoice_html(
         raise HTTPException(status_code=403, detail="Forbidden: not your invoice")
     html = _render_html(_row(r))
     return Response(content=html, media_type="text/html")
+
+
+@router.get("/{invoice_id}/pdf", response_class=Response)
+async def render_invoice_pdf(
+    invoice_id: str,
+    claims: AuthClaims = Depends(require_jwt_or_service),
+) -> Response:
+    """
+    Download invoice as PDF (WeasyPrint-rendered from the same HTML template).
+
+    Auth: same self-scoping as GET /{id}/html — invoice owner or admin.
+    Content-Disposition: attachment so browsers prompt a file download.
+    """
+    from weasyprint import HTML as WeasyprintHTML
+
+    pool = get_pool()
+    async with pool.acquire() as conn:
+        r = await conn.fetchrow("SELECT * FROM invoices WHERE id = $1", uuid.UUID(invoice_id))
+    if not r:
+        raise HTTPException(status_code=404, detail=f"Invoice {invoice_id} not found")
+    if not claims.is_admin and str(r["user_id"]) != claims.user_id:
+        raise HTTPException(status_code=403, detail="Forbidden: not your invoice")
+
+    inv = _row(r)
+    html = _render_html(inv)
+    pdf_bytes = WeasyprintHTML(string=html).write_pdf()
+
+    filename = f"invoice-{inv['invoiceNumber']}.pdf"
+    return Response(
+        content=pdf_bytes,
+        media_type="application/pdf",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
 
 
 # ---------------------------------------------------------------------------

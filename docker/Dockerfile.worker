@@ -1,11 +1,19 @@
 FROM python:3.12-slim
 
-# System deps: Node.js + gosu only (NO libgl1/libglib for Docling)
+# System deps: Node.js + gosu + WeasyPrint Cairo/Pango stack (NO libgl1/libglib for Docling).
+# WeasyPrint (invoice PDF) is a non-optional dep — worker serves invoice endpoints too.
 RUN apt-get update && apt-get install -y \
     curl \
     nodejs \
     npm \
     gosu \
+    libpango-1.0-0 \
+    libpangoft2-1.0-0 \
+    libpangocairo-1.0-0 \
+    libcairo2 \
+    libgdk-pixbuf2.0-0 \
+    shared-mime-info \
+    fonts-liberation \
     && rm -rf /var/lib/apt/lists/*
 
 # Create non-root user for Claude Code (required for bypassPermissions)
