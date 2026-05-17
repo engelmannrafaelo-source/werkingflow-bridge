@@ -112,8 +112,9 @@ async def lease_token(
 ):
     pool = get_pool()
     async with pool.acquire() as conn:
-        # 1. Tenant + billing_mode
-        info = await _ls.get_tenant_info(conn, body.userId)
+        # 1. Tenant + billing_mode (JIT-provisions the user if missing, so
+        # first-lease for a new app-side identity does not fail with 404).
+        info = await _ls.get_tenant_info(conn, body.userId, app=body.app)
         billing_mode = info["billing_mode"]
         tenant_id = info["tenant_id"]
 
