@@ -222,7 +222,10 @@ async def list_invoices(
     since: Optional[str] = Query(default=None),
     until: Optional[str] = Query(default=None),
     limit: int = Query(default=100, ge=1, le=500),
-    mode: Optional[str] = Query(default=None, description="prod|staging|local"),
+    account_type: Optional[str] = Query(
+        default=None,
+        description="Filter by tenant.account_type: customer|test|internal",
+    ),
     claims: AuthClaims = Depends(require_jwt_or_service),
 ) -> Dict[str, Any]:
     if not claims.is_admin:
@@ -230,6 +233,11 @@ async def list_invoices(
         if userId and userId != claims.user_id:
             raise HTTPException(status_code=403, detail="Forbidden")
         userId = claims.user_id
+
+    if account_type and account_type not in ("customer", "test", "internal"):
+        raise HTTPException(
+            status_code=400, detail=f"Invalid account_type: {account_type}",
+        )
 
     where: List[str] = []
     args: List[Any] = []
@@ -248,9 +256,9 @@ async def list_invoices(
     if until:     add("issued_at <= $$", until)
 
     join_clause = ""
-    if mode:
-        args.append(mode)
-        where.append(f"t.category = ${len(args)}::tenant_category")
+    if account_type:
+        args.append(account_type)
+        where.append(f"t.account_type = ${len(args)}::account_type")
         join_clause = "LEFT JOIN tenants t ON t.id = invoices.tenant_id"
 
     sql = f"SELECT invoices.* FROM invoices {join_clause}"

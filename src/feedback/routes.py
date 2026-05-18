@@ -143,7 +143,7 @@ async def list_feedback(
 
     # "mode" filters by the environment the feedback was submitted from
     # (X-App-Env → feedback.app_env), NOT by the customer's hand-set
-    # tenant.category. Rows with NULL app_env (pre-migration / no header)
+    # tenant.account_type. Rows with NULL app_env (pre-migration / no header)
     # are honestly un-attributed and excluded when a mode is requested.
     if mode:
         if mode not in _ALLOWED_MODES:

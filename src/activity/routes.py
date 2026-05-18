@@ -138,7 +138,7 @@ async def activity_query(
 
     # "mode" filters by the environment the call actually came from
     # (X-App-Env → activities.app_env), NOT by the customer's hand-set
-    # tenant.category. Rows with NULL app_env (pre-migration / no header)
+    # tenant.account_type. Rows with NULL app_env (pre-migration / no header)
     # are honestly un-attributed and excluded when a mode is requested.
     if mode:
         if mode not in ("prod", "staging", "local"):

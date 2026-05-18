@@ -136,7 +136,7 @@ async def usage_metrics(
         _add("a.actor_user_id = $$", uid)
 
     # "mode" filters by the environment the call came from
-    # (X-App-Env → activities.app_env), not the customer's tenant.category.
+    # (X-App-Env → activities.app_env), not the customer's tenant.account_type.
     # NULL app_env (pre-migration / no header) is excluded when filtered.
     if mode:
         args.append(mode)
@@ -292,7 +292,7 @@ async def usage_timeseries(
         where.append(f"a.app_id = ${len(args)}")
 
     # "mode" filters by the environment the call came from
-    # (X-App-Env → activities.app_env), not the customer's tenant.category.
+    # (X-App-Env → activities.app_env), not the customer's tenant.account_type.
     # NULL app_env (pre-migration / no header) is excluded when filtered.
     if mode:
         args.append(mode)

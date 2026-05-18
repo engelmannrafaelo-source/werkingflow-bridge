@@ -85,31 +85,36 @@ def _user_row_to_dict(row: Any) -> Dict[str, Any]:
 @router.get("/v1/users")
 async def list_users(
     limit: int = Query(default=100, le=1000),
-    mode: Optional[str] = Query(default=None, description="Filter by tenant category: prod|staging|local"),
+    account_type: Optional[str] = Query(
+        default=None,
+        description="Filter by tenant.account_type: customer|test|internal",
+    ),
     _claims: AuthClaims = Depends(require_admin),
 ) -> List[Dict[str, Any]]:
-    """List users. Optional `mode` filters by tenant.category."""
-    if mode and mode not in ("prod", "staging", "local"):
-        raise HTTPException(status_code=400, detail=f"Invalid mode: {mode}")
+    """List users. Optional `account_type` filters by the user's tenant."""
+    if account_type and account_type not in ("customer", "test", "internal"):
+        raise HTTPException(status_code=400, detail=f"Invalid account_type: {account_type}")
 
     pool = get_pool()
     async with pool.acquire() as conn:
-        if mode:
+        if account_type:
             rows = await conn.fetch(
                 """
-                SELECT u.id, u.email, u.name, u.tenant_id, u.created_at, u.updated_at, t.category::text AS tenant_category
+                SELECT u.id, u.email, u.name, u.tenant_id, u.created_at, u.updated_at,
+                       t.account_type::text AS tenant_account_type
                 FROM users u
                 LEFT JOIN tenants t ON t.id = u.tenant_id
-                WHERE t.category = $1::tenant_category
+                WHERE t.account_type = $1::account_type
                 ORDER BY u.created_at DESC
                 LIMIT $2
                 """,
-                mode, limit,
+                account_type, limit,
             )
         else:
             rows = await conn.fetch(
                 """
-                SELECT u.id, u.email, u.name, u.tenant_id, u.created_at, u.updated_at, t.category::text AS tenant_category
+                SELECT u.id, u.email, u.name, u.tenant_id, u.created_at, u.updated_at,
+                       t.account_type::text AS tenant_account_type
                 FROM users u
                 LEFT JOIN tenants t ON t.id = u.tenant_id
                 ORDER BY u.created_at DESC
@@ -118,7 +123,7 @@ async def list_users(
                 limit,
             )
     return [
-        {**_user_row_to_dict(r), "tenant_category": r["tenant_category"]}
+        {**_user_row_to_dict(r), "tenant_account_type": r["tenant_account_type"]}
         for r in rows
     ]
 
@@ -220,33 +225,37 @@ class TenantCreateRequest(BaseModel):
     id: Optional[str] = None
     name: str
     owner_user_id: Optional[str] = None
-    category: Optional[str] = None  # prod|staging|local — default 'prod' if omitted
+    # customer|test|internal — defaults to 'customer' if omitted.
+    account_type: Optional[str] = None
 
 
 @router.get("/v1/tenants")
 async def list_tenants(
     limit: int = Query(default=100, le=1000),
-    mode: Optional[str] = Query(default=None, description="Filter by category: prod|staging|local"),
+    account_type: Optional[str] = Query(
+        default=None,
+        description="Filter by account_type: customer|test|internal",
+    ),
     _claims: AuthClaims = Depends(require_admin),
 ) -> List[Dict[str, Any]]:
-    if mode and mode not in ("prod", "staging", "local"):
-        raise HTTPException(status_code=400, detail=f"Invalid mode: {mode}")
+    if account_type and account_type not in ("customer", "test", "internal"):
+        raise HTTPException(status_code=400, detail=f"Invalid account_type: {account_type}")
 
     pool = get_pool()
     async with pool.acquire() as conn:
-        if mode:
+        if account_type:
             rows = await conn.fetch(
                 """
-                SELECT id, name, owner_user_id, created_at, category::text AS category
-                FROM tenants WHERE category = $1::tenant_category
+                SELECT id, name, owner_user_id, created_at, account_type::text AS account_type
+                FROM tenants WHERE account_type = $1::account_type
                 ORDER BY created_at DESC LIMIT $2
                 """,
-                mode, limit,
+                account_type, limit,
             )
         else:
             rows = await conn.fetch(
                 """
-                SELECT id, name, owner_user_id, created_at, category::text AS category
+                SELECT id, name, owner_user_id, created_at, account_type::text AS account_type
                 FROM tenants ORDER BY created_at DESC LIMIT $1
                 """,
                 limit,
@@ -256,7 +265,7 @@ async def list_tenants(
             "id": r["id"],
             "name": r["name"],
             "owner_user_id": str(r["owner_user_id"]) if r["owner_user_id"] else None,
-            "category": r["category"],
+            "account_type": r["account_type"],
             "created_at": r["created_at"].isoformat(),
         }
         for r in rows
@@ -275,20 +284,22 @@ async def create_tenant(
     owner_uid = uuid.UUID(body.owner_user_id) if body.owner_user_id else None
 
     async with pool.acquire() as conn:
-        category = body.category or "prod"
-        if category not in ("prod", "staging", "local"):
-            raise HTTPException(status_code=400, detail=f"Invalid category: {category}")
+        account_type = body.account_type or "customer"
+        if account_type not in ("customer", "test", "internal"):
+            raise HTTPException(
+                status_code=400, detail=f"Invalid account_type: {account_type}",
+            )
         try:
             row = await conn.fetchrow(
                 """
-                INSERT INTO tenants (id, name, owner_user_id, category, created_at)
-                VALUES ($1, $2, $3, $4::tenant_category, $5)
-                RETURNING id, name, owner_user_id, category::text AS category, created_at
+                INSERT INTO tenants (id, name, owner_user_id, account_type, created_at)
+                VALUES ($1, $2, $3, $4::account_type, $5)
+                RETURNING id, name, owner_user_id, account_type::text AS account_type, created_at
                 """,
                 tenant_id,
                 body.name,
                 owner_uid,
-                category,
+                account_type,
                 now,
             )
         except asyncpg.UniqueViolationError:
@@ -304,18 +315,18 @@ async def create_tenant(
         "id": row["id"],
         "name": row["name"],
         "owner_user_id": str(row["owner_user_id"]) if row["owner_user_id"] else None,
-        "category": row["category"],
+        "account_type": row["account_type"],
         "created_at": row["created_at"].isoformat(),
     }
 
 
 # ---------------------------------------------------------------------------
-# Tenant updates — category is the main mutable field for now.
+# Tenant updates — account_type is the main mutable field for now.
 # ---------------------------------------------------------------------------
 
 class TenantUpdateRequest(BaseModel):
     name: Optional[str] = None
-    category: Optional[str] = None
+    account_type: Optional[str] = None
     owner_user_id: Optional[str] = None
 
 
@@ -325,8 +336,10 @@ async def update_tenant(
     body: TenantUpdateRequest,
     _claims: AuthClaims = Depends(require_admin),
 ) -> Dict[str, Any]:
-    if body.category and body.category not in ("prod", "staging", "local"):
-        raise HTTPException(status_code=400, detail=f"Invalid category: {body.category}")
+    if body.account_type and body.account_type not in ("customer", "test", "internal"):
+        raise HTTPException(
+            status_code=400, detail=f"Invalid account_type: {body.account_type}",
+        )
 
     sets: List[str] = []
     args: List[Any] = []
@@ -337,8 +350,8 @@ async def update_tenant(
 
     if body.name is not None:
         _add("name", body.name)
-    if body.category is not None:
-        _add("category", body.category, "::tenant_category")
+    if body.account_type is not None:
+        _add("account_type", body.account_type, "::account_type")
     if body.owner_user_id is not None:
         _add("owner_user_id", uuid.UUID(body.owner_user_id) if body.owner_user_id else None)
 
@@ -348,7 +361,8 @@ async def update_tenant(
     args.append(tenant_id)
     sql = (
         "UPDATE tenants SET " + ", ".join(sets) +
-        f" WHERE id = ${len(args)} RETURNING id, name, owner_user_id, category::text AS category, created_at"
+        f" WHERE id = ${len(args)} "
+        "RETURNING id, name, owner_user_id, account_type::text AS account_type, created_at"
     )
 
     pool = get_pool()
@@ -360,7 +374,7 @@ async def update_tenant(
         "id": row["id"],
         "name": row["name"],
         "owner_user_id": str(row["owner_user_id"]) if row["owner_user_id"] else None,
-        "category": row["category"],
+        "account_type": row["account_type"],
         "created_at": row["created_at"].isoformat(),
     }
 
