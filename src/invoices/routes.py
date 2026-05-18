@@ -225,11 +225,11 @@ async def list_invoices(
     mode: Optional[str] = Query(default=None, description="prod|staging|local"),
     claims: AuthClaims = Depends(require_jwt_or_service),
 ) -> Dict[str, Any]:
-    if not claims.is_admin:
-        # Non-admin sees own invoices only
-        if userId and userId != claims.user_id:
+    if not claims.is_operator:
+        # Non-operator sees own invoices only (user JWT or service proxy).
+        if userId and userId != claims.effective_user_id:
             raise HTTPException(status_code=403, detail="Forbidden")
-        userId = claims.user_id
+        userId = claims.effective_user_id
 
     where: List[str] = []
     args: List[Any] = []
@@ -278,7 +278,7 @@ async def get_invoice(
         )
     if not r:
         raise HTTPException(status_code=404, detail=f"Invoice {invoice_id} not found")
-    if not claims.is_admin and str(r["user_id"]) != claims.user_id:
+    if not claims.is_operator and str(r["user_id"]) != claims.effective_user_id:
         raise HTTPException(status_code=403, detail="Forbidden: not your invoice")
     return _row(r)
 
@@ -649,7 +649,7 @@ async def render_invoice_html(
         r = await conn.fetchrow("SELECT * FROM invoices WHERE id = $1", uuid.UUID(invoice_id))
     if not r:
         raise HTTPException(status_code=404, detail=f"Invoice {invoice_id} not found")
-    if not claims.is_admin and str(r["user_id"]) != claims.user_id:
+    if not claims.is_operator and str(r["user_id"]) != claims.effective_user_id:
         raise HTTPException(status_code=403, detail="Forbidden: not your invoice")
     html = _render_html(_row(r))
     return Response(content=html, media_type="text/html")
@@ -673,7 +673,7 @@ async def render_invoice_pdf(
         r = await conn.fetchrow("SELECT * FROM invoices WHERE id = $1", uuid.UUID(invoice_id))
     if not r:
         raise HTTPException(status_code=404, detail=f"Invoice {invoice_id} not found")
-    if not claims.is_admin and str(r["user_id"]) != claims.user_id:
+    if not claims.is_operator and str(r["user_id"]) != claims.effective_user_id:
         raise HTTPException(status_code=403, detail="Forbidden: not your invoice")
 
     inv = _row(r)
@@ -726,7 +726,7 @@ async def send_invoice(
         )
     if not r:
         raise HTTPException(status_code=404, detail=f"Invoice {invoice_id} not found")
-    if not claims.is_admin and str(r["user_id"]) != claims.user_id:
+    if not claims.is_operator and str(r["user_id"]) != claims.effective_user_id:
         raise HTTPException(status_code=403, detail="Forbidden: not your invoice")
     recipient = r["user_email"]
     if not recipient:

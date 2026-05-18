@@ -26,7 +26,7 @@ from src.identity.password import hash_password
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, EmailStr, Field
 
-from src.api_auth import require_admin, require_jwt_or_service, require_self_or_admin, AuthClaims
+from src.api_auth import require_admin, require_jwt_or_service, require_self_or_admin, AuthClaims, get_tenant_of_user
 from src.db.client import get_pool
 
 logger = logging.getLogger(__name__)
@@ -416,6 +416,29 @@ async def update_tenant(
 # Tenant billing address — self-service (user reads/writes own tenant only)
 # ---------------------------------------------------------------------------
 
+async def _check_tenant_access(claims: AuthClaims, tenant_id: str) -> None:
+    """
+    Raise 403 if the caller may not access this tenant.
+
+    - Operator (service token without X-User-ID, admin JWT): unrestricted.
+    - Service proxy (service token + X-User-ID): look up the acting user's
+      tenant and require it to equal the path tenant_id.
+    - User JWT: use claims.tenant_id directly (already resolved from JWT).
+    """
+    if claims.is_operator:
+        return
+    if claims.is_service and claims.acting_user_id is not None:
+        acting_tenant = await get_tenant_of_user(claims.acting_user_id)
+        if acting_tenant != tenant_id:
+            raise HTTPException(
+                status_code=403,
+                detail="Forbidden: proxy token acting as user from a different tenant",
+            )
+        return
+    # User JWT: tenant_id in JWT must match path
+    if claims.tenant_id != tenant_id:
+        raise HTTPException(status_code=403, detail="Forbidden: can only access own tenant")
+
 class TenantBillingAddressRequest(BaseModel):
     name: Optional[str] = Field(default=None, max_length=255)
     street: Optional[str] = Field(default=None, max_length=255)
@@ -444,12 +467,10 @@ async def get_tenant_billing_address(
     """
     Read the billing address of a tenant.
 
-    Self-scoped: a user JWT may only read the billing address of their own tenant
-    (claims.tenant_id must equal the path tenant_id). Admins and service tokens
-    may read any tenant.
+    Self-scoped: a user JWT sees only their own tenant; a service proxy
+    (X-User-ID) is scoped to that user's tenant. Operators may read any.
     """
-    if not claims.is_admin and claims.tenant_id != tenant_id:
-        raise HTTPException(status_code=403, detail="Forbidden: can only access own tenant")
+    await _check_tenant_access(claims, tenant_id)
 
     pool = get_pool()
     async with pool.acquire() as conn:
@@ -475,13 +496,12 @@ async def update_tenant_billing_address(
     """
     Update the billing address of a tenant (partial update — only provided fields change).
 
-    Self-scoped: a user JWT may only update the billing address of their own tenant.
-    Admins and service tokens may update any tenant.
+    Self-scoped: a user JWT sees only their own tenant; a service proxy
+    (X-User-ID) is scoped to that user's tenant. Operators may update any.
 
     country must be an ISO 3166-1 alpha-2 code (e.g. "AT", "DE").
     """
-    if not claims.is_admin and claims.tenant_id != tenant_id:
-        raise HTTPException(status_code=403, detail="Forbidden: can only access own tenant")
+    await _check_tenant_access(claims, tenant_id)
 
     sets: List[str] = []
     args: List[Any] = []
@@ -536,11 +556,14 @@ async def list_app_licenses(
     # FastAPI Depends does not naturally branch on a query param.
     claims: AuthClaims = Depends(require_jwt_or_service),
 ) -> List[Dict[str, Any]]:
-    if userId is None:
-        if not claims.is_admin:
-            raise HTTPException(status_code=403, detail="Admin privileges required for unfiltered list")
+    if claims.is_operator:
+        # Operator: userId=None → full list; userId set → any user's licenses.
+        pass
     else:
-        if not claims.is_admin and claims.user_id != userId:
+        # User JWT or service proxy: scope to own licenses.
+        if userId is None:
+            userId = claims.effective_user_id
+        elif userId != claims.effective_user_id:
             raise HTTPException(status_code=403, detail="Forbidden: can only read own app-licenses")
 
     pool = get_pool()
