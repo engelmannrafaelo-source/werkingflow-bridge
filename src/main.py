@@ -1893,28 +1893,22 @@ async def chat_completions(
                 )
 
         # =======================================================================
-        # BUDGET ENFORCEMENT: Check tenant limits before processing
+        # TENANT CONTEXT — resolved here only for downstream usage tracking
+        # (track_request_usage, further below). NO budget enforcement happens
+        # here: the single budget gate is src/budget/gate.py (per-user EUR,
+        # already run above before the LLM call).
+        #
+        # The legacy per-tenant check_budget() gate was removed here on
+        # 2026-05-18 (Naht-Audit Befund 4). It was dead code in the chat
+        # path: no caller sends X-Tenant-API-Key, and HMAC-signed tenants
+        # are built with monthly_token_limit / budget_limit_eur = None, so
+        # check_budget() could never return allowed=False for any real
+        # request. Two parallel budget gates with no defined precedence is
+        # the architecture defect — there is now exactly one.
+        # /v1/usage/status still exposes check_budget() read-only for the
+        # legacy tenant-status API; that surface is intentionally untouched.
         # =======================================================================
         tenant = get_tenant_from_request(request)
-        if tenant:
-            from src.tenant import check_budget
-            budget_result = await check_budget(tenant)
-            if not budget_result.allowed:
-                logger.warning(f"Budget exceeded for {tenant.tenant_slug}: {budget_result.reason}")
-                raise HTTPException(
-                    status_code=402,
-                    detail={
-                        "error": {
-                            "message": budget_result.reason,
-                            "type": "budget_exceeded",
-                            "code": "payment_required",
-                            "billing_mode": budget_result.billing_mode,
-                            "current_tokens": budget_result.current_tokens,
-                            "token_limit": budget_result.token_limit,
-                            "usage_percent": budget_result.token_usage_percent,
-                        }
-                    }
-                )
 
         # =======================================================================
         # ATTRIBUTION ENFORCEMENT: Ensure callers identify themselves
