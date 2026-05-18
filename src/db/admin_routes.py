@@ -3,13 +3,17 @@ Admin CRUD routes — Identity + DB-health.
 Only mounted when BRIDGE_DB_URL is set.
 
 Auth model:
-  GET  /v1/db/health             — public liveness probe (no PII)
-  GET  /v1/users                 — admin only
-  POST /v1/users                 — admin only (creates accounts)
-  GET  /v1/users/{user_id}       — require_self_or_admin
-  GET  /v1/tenants               — admin only
-  POST /v1/tenants               — admin only
-  GET  /v1/app-licenses?userId=  — require_self_or_admin (if userId given) else admin
+  GET    /v1/db/health                           — public liveness probe (no PII)
+  GET    /v1/users                               — admin only
+  POST   /v1/users                               — admin only (creates accounts)
+  GET    /v1/users/{user_id}                     — require_self_or_admin
+  PATCH  /v1/users/{user_id}                     — require_self_or_admin (name only)
+  GET    /v1/tenants                             — admin only
+  POST   /v1/tenants                             — admin only
+  PATCH  /v1/tenants/{tenant_id}                 — admin only
+  GET    /v1/tenants/{tenant_id}/billing-address — self (own tenant) or admin
+  PATCH  /v1/tenants/{tenant_id}/billing-address — self (own tenant) or admin
+  GET    /v1/app-licenses?userId=                — require_self_or_admin (if userId given) else admin
 """
 import logging
 import uuid
@@ -20,9 +24,9 @@ import asyncpg
 from src.identity.password import hash_password
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from pydantic import BaseModel, EmailStr
+from pydantic import BaseModel, EmailStr, Field
 
-from src.api_auth import require_admin, require_jwt_or_service, require_self_or_admin, AuthClaims
+from src.api_auth import require_admin, require_jwt_or_service, require_self_or_admin, AuthClaims, get_tenant_of_user
 from src.db.client import get_pool
 
 logger = logging.getLogger(__name__)
@@ -239,6 +243,49 @@ async def get_user(
 
 
 # ---------------------------------------------------------------------------
+# User self-update
+# ---------------------------------------------------------------------------
+
+class UserSelfUpdateRequest(BaseModel):
+    # Only `name` is exposed for self-edit. Email requires a separate
+    # verification flow. tenant_id and roles are admin-only.
+    name: Optional[str] = Field(default=None, min_length=1, max_length=255)
+
+
+@router.patch("/v1/users/{user_id}")
+async def update_user(
+    user_id: str,
+    body: UserSelfUpdateRequest,
+    claims: AuthClaims = Depends(require_self_or_admin),
+) -> Dict[str, Any]:
+    """
+    Update own profile. Self-scoped: a user may only patch their own record.
+    Admins may patch any user.
+
+    Editable fields: name (email requires a separate verification flow;
+    tenant_id, role, password_hash are admin or dedicated-endpoint only).
+    """
+    if body.name is None:
+        raise HTTPException(status_code=400, detail="No fields to update")
+
+    pool = get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            UPDATE users
+               SET name = $1, updated_at = NOW()
+             WHERE id = $2
+         RETURNING id, email, name, tenant_id, created_at, updated_at
+            """,
+            body.name,
+            uuid.UUID(user_id),
+        )
+    if not row:
+        raise HTTPException(status_code=404, detail=f"User '{user_id}' not found")
+    return _user_row_to_dict(row)
+
+
+# ---------------------------------------------------------------------------
 # Tenants
 # ---------------------------------------------------------------------------
 
@@ -401,6 +448,136 @@ async def update_tenant(
 
 
 # ---------------------------------------------------------------------------
+# Tenant billing address — self-service (user reads/writes own tenant only)
+# ---------------------------------------------------------------------------
+
+async def _check_tenant_access(claims: AuthClaims, tenant_id: str) -> None:
+    """
+    Raise 403 if the caller may not access this tenant.
+
+    - Operator (service token without X-User-ID, admin JWT): unrestricted.
+    - Service proxy (service token + X-User-ID): look up the acting user's
+      tenant and require it to equal the path tenant_id.
+    - User JWT: use claims.tenant_id directly (already resolved from JWT).
+    """
+    if claims.is_operator:
+        return
+    if claims.is_service and claims.acting_user_id is not None:
+        acting_tenant = await get_tenant_of_user(claims.acting_user_id)
+        if acting_tenant != tenant_id:
+            raise HTTPException(
+                status_code=403,
+                detail="Forbidden: proxy token acting as user from a different tenant",
+            )
+        return
+    # User JWT: tenant_id in JWT must match path
+    if claims.tenant_id != tenant_id:
+        raise HTTPException(status_code=403, detail="Forbidden: can only access own tenant")
+
+class TenantBillingAddressRequest(BaseModel):
+    name: Optional[str] = Field(default=None, max_length=255)
+    street: Optional[str] = Field(default=None, max_length=255)
+    city: Optional[str] = Field(default=None, max_length=255)
+    postcode: Optional[str] = Field(default=None, max_length=64)
+    country: Optional[str] = Field(default=None, min_length=2, max_length=2, description="ISO 3166-1 alpha-2")
+    vatId: Optional[str] = Field(default=None, max_length=64)
+
+
+def _tenant_billing_address_row(row: Any) -> Dict[str, Any]:
+    return {
+        "name": row["billing_name"],
+        "street": row["billing_street"],
+        "city": row["billing_city"],
+        "postcode": row["billing_postcode"],
+        "country": row["billing_country"],
+        "vatId": row["billing_vat_id"],
+    }
+
+
+@router.get("/v1/tenants/{tenant_id}/billing-address")
+async def get_tenant_billing_address(
+    tenant_id: str,
+    claims: AuthClaims = Depends(require_jwt_or_service),
+) -> Dict[str, Any]:
+    """
+    Read the billing address of a tenant.
+
+    Self-scoped: a user JWT sees only their own tenant; a service proxy
+    (X-User-ID) is scoped to that user's tenant. Operators may read any.
+    """
+    await _check_tenant_access(claims, tenant_id)
+
+    pool = get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            SELECT billing_name, billing_street, billing_city,
+                   billing_postcode, billing_country, billing_vat_id
+            FROM tenants WHERE id = $1
+            """,
+            tenant_id,
+        )
+    if not row:
+        raise HTTPException(status_code=404, detail=f"Tenant '{tenant_id}' not found")
+    return _tenant_billing_address_row(row)
+
+
+@router.patch("/v1/tenants/{tenant_id}/billing-address")
+async def update_tenant_billing_address(
+    tenant_id: str,
+    body: TenantBillingAddressRequest,
+    claims: AuthClaims = Depends(require_jwt_or_service),
+) -> Dict[str, Any]:
+    """
+    Update the billing address of a tenant (partial update — only provided fields change).
+
+    Self-scoped: a user JWT sees only their own tenant; a service proxy
+    (X-User-ID) is scoped to that user's tenant. Operators may update any.
+
+    country must be an ISO 3166-1 alpha-2 code (e.g. "AT", "DE").
+    """
+    await _check_tenant_access(claims, tenant_id)
+
+    sets: List[str] = []
+    args: List[Any] = []
+
+    def _add(col: str, val: Any) -> None:
+        args.append(val)
+        sets.append(f"{col} = ${len(args)}")
+
+    if body.name is not None:
+        _add("billing_name", body.name)
+    if body.street is not None:
+        _add("billing_street", body.street)
+    if body.city is not None:
+        _add("billing_city", body.city)
+    if body.postcode is not None:
+        _add("billing_postcode", body.postcode)
+    if body.country is not None:
+        _add("billing_country", body.country.upper())
+    if body.vatId is not None:
+        _add("billing_vat_id", body.vatId)
+
+    if not sets:
+        raise HTTPException(status_code=400, detail="No fields to update")
+
+    args.append(tenant_id)
+    sql = (
+        "UPDATE tenants SET " + ", ".join(sets) +
+        f" WHERE id = ${len(args)}"
+        " RETURNING billing_name, billing_street, billing_city,"
+        "   billing_postcode, billing_country, billing_vat_id"
+    )
+
+    pool = get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(sql, *args)
+    if not row:
+        raise HTTPException(status_code=404, detail=f"Tenant '{tenant_id}' not found")
+    return _tenant_billing_address_row(row)
+
+
+# ---------------------------------------------------------------------------
 # App Licenses
 # ---------------------------------------------------------------------------
 
@@ -414,11 +591,14 @@ async def list_app_licenses(
     # FastAPI Depends does not naturally branch on a query param.
     claims: AuthClaims = Depends(require_jwt_or_service),
 ) -> List[Dict[str, Any]]:
-    if userId is None:
-        if not claims.is_admin:
-            raise HTTPException(status_code=403, detail="Admin privileges required for unfiltered list")
+    if claims.is_operator:
+        # Operator: userId=None → full list; userId set → any user's licenses.
+        pass
     else:
-        if not claims.is_admin and claims.user_id != userId:
+        # User JWT or service proxy: scope to own licenses.
+        if userId is None:
+            userId = claims.effective_user_id
+        elif userId != claims.effective_user_id:
             raise HTTPException(status_code=403, detail="Forbidden: can only read own app-licenses")
 
     pool = get_pool()

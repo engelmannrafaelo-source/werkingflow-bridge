@@ -1799,12 +1799,16 @@ async def chat_completions(
         try:
             from src.budget.gate import enforce_budget
             _gate_attr = extract_attribution_context(request)
-            # Rough pre-call cost estimate: input estimate + max_tokens output,
-            # priced at Sonnet rates (EUR/1M: ~2.90 in, ~14.50 out). The gate
-            # only needs "is there money left", exact billing is deduct's job.
+            # Pre-call cost estimate via the pricing SSoT (src/pricing.py):
+            # input estimate + max_tokens output. The gate only needs "is
+            # there money left"; exact billing is the post-call deduction's job.
+            from src.pricing import cost_eur as _cost_eur
             _gate_out_tokens = int(getattr(request_body, "max_tokens", 0) or 1024)
-            _gate_cost = (_arrival_est_tokens / 1_000_000) * 2.90 \
-                + (_gate_out_tokens / 1_000_000) * 14.50
+            _gate_cost = _cost_eur(
+                getattr(request_body, "model", None),
+                _arrival_est_tokens,
+                _gate_out_tokens,
+            )
             await enforce_budget(
                 user_id=_gate_attr.get("user_id"),
                 app_id=_gate_attr.get("app_id"),

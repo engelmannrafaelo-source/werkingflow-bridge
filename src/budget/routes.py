@@ -258,16 +258,29 @@ def _build_monthly_budgets(raw_monthly: dict) -> Dict[str, MonthlyBudgetEntry]:
     }
 
 
-@router.post("/deduct")
-async def budget_deduct(
-    body: DeductRequest,
-    _claims: AuthClaims = Depends(require_jwt_or_service),
+class BudgetDeductionDenied(Exception):
+    """Deduction refused for a budget reason (not a validation error)."""
+    def __init__(self, reason: str):
+        super().__init__(reason)
+        self.reason = reason
+
+
+async def apply_budget_deduction(
+    user_id: uuid.UUID,
+    plan_id: str,
+    actual_cost_eur: float,
 ) -> Dict[str, Any]:
-    user_id = _parse_user_id(body.userId)
-    try:
-        get_plan(body.planId)
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
+    """
+    Atomically deduct actual_cost_eur from the user's budget for plan_id.
+
+    Auto-provisions a trial when the user is unlicensed and a trial sibling
+    exists. Shared by the POST /v1/budget/deduct endpoint and the Bridge's
+    post-call self-deduction (src/activity/ai_call_writer.py).
+
+    Raises ValueError on an unknown plan, BudgetDeductionDenied(reason) on
+    'BUDGET_EXCEEDED' / 'trial_expired'.
+    """
+    get_plan(plan_id)  # raises ValueError on an unknown plan
 
     pool = get_pool()
 
@@ -293,9 +306,9 @@ async def budget_deduct(
             )
 
             # Auto-provision trial when user is unlicensed and a trial sibling exists.
-            effective_plan_id = body.planId
-            if budget.monthly_budgets.get(body.planId) is None:
-                trial = find_trial_plan_for(body.planId)
+            effective_plan_id = plan_id
+            if budget.monthly_budgets.get(plan_id) is None:
+                trial = find_trial_plan_for(plan_id)
                 if trial is not None:
                     effective_plan_id = trial.id
                     if budget.monthly_budgets.get(trial.id) is None:
@@ -316,12 +329,12 @@ async def budget_deduct(
             if get_plan(effective_plan_id).trial:
                 entry = budget.monthly_budgets.get(effective_plan_id)
                 if entry and _is_trial_expired(entry):
-                    raise HTTPException(status_code=402, detail="trial_expired")
+                    raise BudgetDeductionDenied("trial_expired")
 
             try:
-                result = deduct_budget(budget, effective_plan_id, body.actualCostEur)
+                result = deduct_budget(budget, effective_plan_id, actual_cost_eur)
             except ValueError:
-                raise HTTPException(status_code=402, detail="BUDGET_EXCEEDED")
+                raise BudgetDeductionDenied("BUDGET_EXCEEDED")
 
             # Write updated monthly usage back against effective_plan_id.
             updated_raw = dict(raw_monthly)
@@ -359,6 +372,20 @@ async def budget_deduct(
         "newTopUpBalance": result.new_top_up_balance,
         "effectivePlanId": effective_plan_id,
     }
+
+
+@router.post("/deduct")
+async def budget_deduct(
+    body: DeductRequest,
+    _claims: AuthClaims = Depends(require_jwt_or_service),
+) -> Dict[str, Any]:
+    user_id = _parse_user_id(body.userId)
+    try:
+        return await apply_budget_deduction(user_id, body.planId, body.actualCostEur)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except BudgetDeductionDenied as e:
+        raise HTTPException(status_code=402, detail=e.reason)
 
 
 # ---------------------------------------------------------------------------

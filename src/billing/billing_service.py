@@ -10,11 +10,71 @@ from __future__ import annotations
 import json
 import uuid
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from src.config import config
 from src.db.client import get_pool
 from src.billing.mollie_adapter import get_mollie_adapter
+
+
+# ---------------------------------------------------------------------------
+# Tax-rate determination — based on recipient billing address
+# ---------------------------------------------------------------------------
+
+# EU member states, ISO 3166-1 alpha-2.  AT is excluded: it uses the domestic
+# rate and needs no Reverse Charge note.
+_EU_COUNTRIES_NON_AT: frozenset[str] = frozenset({
+    "BE", "BG", "CY", "CZ", "DE", "DK", "EE", "ES", "FI",
+    "FR", "GR", "HR", "HU", "IE", "IT", "LT", "LU", "LV", "MT",
+    "NL", "PL", "PT", "RO", "SE", "SI", "SK",
+})
+
+
+def _determine_tax_rate(
+    billing_address: Optional[Dict[str, Any]],
+) -> Tuple[float, Optional[str]]:
+    """Return (tax_rate_percent, reverse_charge_note_or_None).
+
+    Rules:
+    - No address or no country → 20.0 AT domestic (safe default, explicit)
+    - AT → 20.0 (domestic USt)
+    - EU (non-AT) + vatId present → 0.0, Reverse Charge (B2B)
+    - EU (non-AT) without vatId → 20.0 AT (safe default)
+      OPEN DECISION: EU B2C falls under the OSS-Verfahren; correct rate per
+      destination country is a legal question not answered here.  We use 20%
+      AT as the conservative safe default and mark the invoice metadata with
+      {"taxNote": "EU_B2C_OSS_OPEN"} so operators can identify these cases.
+      This is intentional and must be resolved with a tax advisor before
+      serving significant EU B2C volume.
+    - Non-EU → 0.0 (export, no VAT)
+
+    VIES validation of the vatId is NOT performed here.  A non-empty vatId is
+    treated as a B2B signal; the issuer remains responsible for record-keeping
+    under § 18 UStG.
+    """
+    if not billing_address:
+        return 20.0, None
+
+    country = (billing_address.get("country") or "").upper().strip()
+    vat_id = (billing_address.get("vatId") or "").strip()
+
+    if not country:
+        return 20.0, None
+
+    if country == "AT":
+        return 20.0, None
+
+    if country in _EU_COUNTRIES_NON_AT:
+        if vat_id:
+            return 0.0, (
+                "Steuerschuldnerschaft des Leistungsempfängers "
+                "gem. § 19 Abs. 1 UStG (Reverse Charge)"
+            )
+        # EU B2C — OSS open decision, conservative AT default
+        return 20.0, None
+
+    # Non-EU export
+    return 0.0, None
 
 
 def _now() -> str:
@@ -561,12 +621,20 @@ async def auto_create_invoice(
     subscription_id: str | None = None,
     credit_purchase_id: str | None = None,
     mollie_payment_id: str | None = None,
-    tax_rate: float = 20.0,
 ) -> str | None:
     """Insert one invoice row, mark it 'paid', return the id.
 
     Idempotent: if an invoice already exists for this mollie_payment_id, return
     the existing id without re-inserting (fixes Mollie webhook retries).
+
+    Resolves the tenant's billing address to populate invoices.billing_address
+    and determine the correct tax rate (AT: 20%, EU B2B Reverse Charge: 0%,
+    non-EU export: 0%).  If the address is missing the invoice is still created
+    — the payment happened and the record MUST exist — but metadata carries
+    {"incomplete": True, "missingBillingAddress": True} so operators can
+    identify and correct the gap.
+
+    EU B2C tax (OSS-Verfahren) is an OPEN DECISION: see _determine_tax_rate.
     """
     import json as _json
     from decimal import Decimal
@@ -582,6 +650,47 @@ async def auto_create_invoice(
         if existing:
             return str(existing)
 
+    # Resolve tenant and billing address.  Failure is non-fatal: invoice is
+    # created with NULL billing_address and marked incomplete.
+    tenant_id: str | None = None
+    billing_address: Dict[str, Any] | None = None
+    eu_b2c_flag = False
+    try:
+        async with pool.acquire() as conn:
+            trow = await conn.fetchrow(
+                """
+                SELECT u.tenant_id,
+                       t.billing_name, t.billing_street, t.billing_city,
+                       t.billing_postcode, t.billing_country, t.billing_vat_id
+                FROM users u
+                LEFT JOIN tenants t ON t.id = u.tenant_id
+                WHERE u.id = $1
+                """,
+                uuid.UUID(user_id),
+            )
+        if trow and trow["tenant_id"]:
+            tenant_id = trow["tenant_id"]
+            if trow["billing_name"]:
+                billing_address = {
+                    "name": trow["billing_name"],
+                    "street": trow["billing_street"],
+                    "city": trow["billing_city"],
+                    "postcode": trow["billing_postcode"],
+                    "country": (trow["billing_country"] or "").upper().strip() or None,
+                    "vatId": trow["billing_vat_id"],
+                }
+    except Exception:
+        pass  # billing_address stays None — marked incomplete below
+
+    tax_rate, reverse_charge_note = _determine_tax_rate(billing_address)
+
+    # Detect EU B2C (no vatId in EU non-AT country) — mark for operator review.
+    if billing_address:
+        country = (billing_address.get("country") or "").upper()
+        vat_id = (billing_address.get("vatId") or "").strip()
+        if country in _EU_COUNTRIES_NON_AT and not vat_id:
+            eu_b2c_flag = True
+
     subtotal = Decimal(str(amount_eur))
     tax = (subtotal * Decimal(str(tax_rate)) / Decimal("100")).quantize(Decimal("0.01"))
     total = (subtotal + tax).quantize(Decimal("0.01"))
@@ -594,6 +703,17 @@ async def auto_create_invoice(
         "metadata": {},
     }]
 
+    metadata: Dict[str, Any] = {"autoCreated": True, "source": "mollie-webhook"}
+    if billing_address is None:
+        metadata["incomplete"] = True
+        metadata["missingBillingAddress"] = True
+    if reverse_charge_note:
+        metadata["reverseChargeNote"] = reverse_charge_note
+    if eu_b2c_flag:
+        # EU B2C without vatId — OSS-Verfahren applies, tax rate is approximate.
+        # OPEN DECISION: must be reviewed with tax advisor before serving EU B2C volume.
+        metadata["taxNote"] = "EU_B2C_OSS_OPEN"
+
     now = datetime.now(timezone.utc)
     year = now.year
     async with pool.acquire() as conn:
@@ -605,22 +725,24 @@ async def auto_create_invoice(
             row = await conn.fetchrow(
                 """
                 INSERT INTO invoices
-                  (invoice_number, user_id, subscription_id, credit_purchase_id,
+                  (invoice_number, user_id, tenant_id, subscription_id, credit_purchase_id,
                    mollie_payment_id, status, subtotal_eur, tax_rate, tax_eur, total_eur,
-                   currency, line_items, issued_at, paid_at, metadata)
-                VALUES ($1, $2, $3, $4, $5, 'paid', $6, $7, $8, $9, 'EUR', $10::jsonb,
-                        NOW(), NOW(), $11::jsonb)
+                   currency, line_items, billing_address, issued_at, paid_at, metadata)
+                VALUES ($1, $2, $3, $4, $5, $6, 'paid', $7, $8, $9, $10, 'EUR', $11::jsonb,
+                        $12::jsonb, NOW(), NOW(), $13::jsonb)
                 ON CONFLICT (mollie_payment_id) DO NOTHING
                 RETURNING id
                 """,
                 invoice_number,
                 uuid.UUID(user_id),
+                tenant_id,
                 uuid.UUID(subscription_id) if subscription_id else None,
                 uuid.UUID(credit_purchase_id) if credit_purchase_id else None,
                 mollie_payment_id,
                 subtotal, tax_rate, tax, total,
                 _json.dumps(line_items),
-                _json.dumps({"autoCreated": True, "source": "mollie-webhook"}),
+                _json.dumps(billing_address) if billing_address else None,
+                _json.dumps(metadata),
             )
 
     if row:
@@ -628,6 +750,7 @@ async def auto_create_invoice(
         await log_billing_event(
             "invoice.issued",
             user_id=user_id,
+            tenant_id=tenant_id,
             subscription_id=subscription_id,
             invoice_id=invoice_id,
             mollie_payment_id=mollie_payment_id,

@@ -29,8 +29,45 @@ import logging
 from typing import Optional
 
 from src.db.client import get_pool
+from src.pricing import cost_eur
 
 logger = logging.getLogger(__name__)
+
+
+async def _deduct_call_cost(user_id: str, app_id: str, cost_eur_amount: float) -> None:
+    """
+    Post-call budget deduction — best-effort, never raises.
+
+    Runs after the activity row is written. The activity row is the
+    authoritative usage record; this deduction keeps the user's budget
+    `used_eur` as a running tally so the pre-call gate actually has
+    something to gate against. A failure here degrades to "no deduction"
+    (the prior behaviour) — it can never break the user-facing call.
+    """
+    try:
+        import uuid as _uuid
+        from src.budget.plans import find_plan_for_app
+        from src.budget.routes import apply_budget_deduction, BudgetDeductionDenied
+
+        plan = find_plan_for_app(app_id)
+        if plan is None:
+            return  # app not in the plan catalog — not budget-tracked
+        try:
+            uid = _uuid.UUID(user_id)
+        except (ValueError, AttributeError, TypeError):
+            return
+        try:
+            await apply_budget_deduction(uid, plan.id, cost_eur_amount)
+        except BudgetDeductionDenied as denied:
+            # The call already happened (the gate ran pre-call). A denial
+            # here only means the running tally could not fully absorb the
+            # cost — the activity row remains the authoritative usage record.
+            logger.info(
+                "post-call deduction denied (%s) user=%s app=%s",
+                denied.reason, user_id, app_id,
+            )
+    except Exception as e:  # noqa: BLE001 — deduction must never break the call
+        logger.warning("post-call budget deduction failed (non-blocking): %s", e)
 
 
 async def persist_ai_call_activity(
@@ -56,6 +93,13 @@ async def persist_ai_call_activity(
         caller normalises it (extract_attribution_context); we just persist
         it. Drives the Platform Admin "mode" filter.
     """
+    # Cost from the pricing SSoT. Error calls cost nothing (0.0) — only a
+    # successful completion consumes budget.
+    call_cost_eur = (
+        cost_eur(model, input_tokens, output_tokens)
+        if status == "success" else 0.0
+    )
+
     try:
         if not user_id:
             # No user → no tenant → cannot write a tenant-scoped row.
@@ -83,6 +127,7 @@ async def persist_ai_call_activity(
                 "promptTokens": input_tokens,
                 "completionTokens": output_tokens,
                 "totalTokens": (input_tokens or 0) + (output_tokens or 0),
+                "costEur": call_cost_eur,  # priced via src/pricing.py (SSoT)
                 "latencyMs": duration_ms,
                 "loggedBy": "bridge",  # distinguishes self-log from legacy app POSTs
             }
@@ -115,3 +160,9 @@ async def persist_ai_call_activity(
             )
     except Exception as e:  # noqa: BLE001 — tracking must never break the call
         logger.warning("persist_ai_call_activity failed (non-blocking): %s", e)
+
+    # Post-call budget deduction. Separate step from the activity write:
+    # the activity row is the usage source of truth, the deduction is the
+    # running budget tally. Best-effort — _deduct_call_cost never raises.
+    if user_id and app_id and call_cost_eur > 0:
+        await _deduct_call_cost(user_id, app_id, call_cost_eur)

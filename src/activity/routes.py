@@ -105,8 +105,18 @@ async def activity_query(
     until: Optional[str] = Query(None, description="ISO timestamp"),
     limit: int = Query(100, ge=1, le=1000),
     mode: Optional[str] = Query(None, description="prod|staging|local — filter by app_env (X-App-Env)"),
-    _claims: AuthClaims = Depends(require_jwt_or_service),
+    claims: AuthClaims = Depends(require_jwt_or_service),
 ) -> Dict[str, Any]:
+    # Operators (service token without X-User-ID, admin JWT) may query across
+    # all users. All others are scoped to their own activity: user JWTs see
+    # only their own records; service tokens with X-User-ID see only the
+    # proxied user's activity.
+    if not claims.is_operator:
+        caller_id = claims.effective_user_id
+        if userId and userId != caller_id:
+            raise HTTPException(status_code=403, detail="Forbidden: can only query own activity")
+        userId = caller_id
+
     where: List[str] = []
     args: List[Any] = []
 

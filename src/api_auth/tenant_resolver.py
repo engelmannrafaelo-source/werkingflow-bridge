@@ -28,7 +28,7 @@ from src.api_auth.deps import AuthClaims
 from src.db.client import get_pool
 
 
-async def _tenant_of_user(user_id: str) -> Optional[str]:
+async def get_tenant_of_user(user_id: str) -> Optional[str]:
     """Look up users.tenant_id. Returns None if user unknown or has no tenant."""
     pool = get_pool()
     async with pool.acquire() as conn:
@@ -36,6 +36,10 @@ async def _tenant_of_user(user_id: str) -> Optional[str]:
             "SELECT tenant_id FROM users WHERE id = $1", user_id
         )
     return row["tenant_id"] if row and row["tenant_id"] else None
+
+
+# Module-private alias kept for callers below.
+_tenant_of_user = get_tenant_of_user
 
 
 async def resolve_tenant_id(
