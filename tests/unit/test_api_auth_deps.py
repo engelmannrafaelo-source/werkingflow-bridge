@@ -10,7 +10,7 @@ from __future__ import annotations
 import pytest
 from fastapi import HTTPException
 
-from src.api_auth.deps import AuthClaims
+from src.api_auth.deps import AuthClaims, require_admin, require_self_or_admin
 
 
 # ---------------------------------------------------------------------------
@@ -49,17 +49,8 @@ def _admin_jwt(user_id: str = "admin-1") -> AuthClaims:
     )
 
 
-# Simulates require_self_or_admin without FastAPI dependency injection.
-def _check_self_or_admin(path_user_id: str, claims: AuthClaims) -> AuthClaims:
-    if claims.is_service and claims.acting_user_id is not None:
-        if claims.acting_user_id == path_user_id:
-            return claims
-        raise HTTPException(status_code=403, detail="Forbidden: proxy token scoped to different user")
-    if claims.is_admin:
-        return claims
-    if claims.user_id == path_user_id:
-        return claims
-    raise HTTPException(status_code=403, detail="Forbidden: can only act on own user")
+# require_self_or_admin / require_admin are plain functions — the Depends()
+# default is inert when called directly, so tests exercise the real code.
 
 
 # ---------------------------------------------------------------------------
@@ -102,16 +93,16 @@ class TestEffectiveUserId:
 class TestRequireSelfOrAdmin:
     # Operator service token: unrestricted
     def test_operator_can_access_any_user(self):
-        _check_self_or_admin("user-A", _operator())
-        _check_self_or_admin("user-B", _operator())
+        require_self_or_admin("user-A", _operator())
+        require_self_or_admin("user-B", _operator())
 
     # Service proxy: hard scope to acting_user_id
     def test_proxy_allows_own_user(self):
-        _check_self_or_admin("user-A", _proxy("user-A"))
+        require_self_or_admin("user-A", _proxy("user-A"))
 
     def test_proxy_rejects_other_user(self):
         with pytest.raises(HTTPException) as exc:
-            _check_self_or_admin("user-B", _proxy("user-A"))
+            require_self_or_admin("user-B", _proxy("user-A"))
         assert exc.value.status_code == 403
 
     def test_proxy_cannot_use_is_admin_to_bypass(self):
@@ -119,22 +110,22 @@ class TestRequireSelfOrAdmin:
         proxy = _proxy("user-A")
         assert proxy.is_admin is True  # confirm the credential IS admin
         with pytest.raises(HTTPException) as exc:
-            _check_self_or_admin("user-B", proxy)  # must still be blocked
+            require_self_or_admin("user-B", proxy)  # must still be blocked
         assert exc.value.status_code == 403
 
     # User JWT: self-only
     def test_user_jwt_allows_own_id(self):
-        _check_self_or_admin("user-Z", _user("user-Z"))
+        require_self_or_admin("user-Z", _user("user-Z"))
 
     def test_user_jwt_rejects_other_user(self):
         with pytest.raises(HTTPException) as exc:
-            _check_self_or_admin("user-B", _user("user-A"))
+            require_self_or_admin("user-B", _user("user-A"))
         assert exc.value.status_code == 403
 
     # Admin JWT: unrestricted
     def test_admin_jwt_can_access_any_user(self):
-        _check_self_or_admin("user-A", _admin_jwt())
-        _check_self_or_admin("user-B", _admin_jwt())
+        require_self_or_admin("user-A", _admin_jwt())
+        require_self_or_admin("user-B", _admin_jwt())
 
 
 # ---------------------------------------------------------------------------
@@ -163,3 +154,28 @@ class TestXUserIdOnlyForServiceToken:
         op = _operator()
         assert op.acting_user_id is None
         assert op.is_operator is True
+
+
+# ---------------------------------------------------------------------------
+# require_admin — operator-only gate (must reject the customer proxy)
+# ---------------------------------------------------------------------------
+
+class TestRequireAdmin:
+    def test_operator_allowed(self):
+        assert require_admin(_operator()).is_operator is True
+
+    def test_admin_jwt_allowed(self):
+        assert require_admin(_admin_jwt()).is_operator is True
+
+    def test_proxy_token_rejected(self):
+        """A customer proxy is is_admin=True but must NOT reach operator endpoints."""
+        proxy = _proxy("user-A")
+        assert proxy.is_admin is True  # confirm the credential IS admin
+        with pytest.raises(HTTPException) as exc:
+            require_admin(proxy)
+        assert exc.value.status_code == 403
+
+    def test_regular_user_rejected(self):
+        with pytest.raises(HTTPException) as exc:
+            require_admin(_user("user-A"))
+        assert exc.value.status_code == 403

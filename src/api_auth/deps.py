@@ -61,7 +61,7 @@ class AuthClaims:
     user_id: Optional[str]          # set when kind == "user"
     email: Optional[str]
     tenant_id: Optional[str]
-    is_admin: bool
+    is_admin: bool                  # raw privilege claim — gate authz on is_operator, never on this
     acting_user_id: Optional[str] = field(default=None)
 
     @property
@@ -210,8 +210,14 @@ def require_jwt_or_service(
 
 
 def require_admin(claims: AuthClaims = Depends(require_jwt_or_service)) -> AuthClaims:
-    """Admin-only endpoints (list all users, list all tenants, etc.)."""
-    if not claims.is_admin:
+    """
+    Operator-only endpoints (list all users, list all tenants, etc.).
+
+    Gated on is_operator, NOT is_admin: every service token is is_admin, but a
+    service token carrying X-User-ID is a customer self-service proxy scoped to
+    one user — it must never reach an operator endpoint.
+    """
+    if not claims.is_operator:
         raise HTTPException(status_code=403, detail="Admin privileges required")
     return claims
 
@@ -231,8 +237,8 @@ def require_self_or_admin(
     Service token WITH X-User-ID (customer proxy): scoped to acting_user_id.
     The acting_user_id must equal the path user_id — access to any other user
     is rejected with 403, even though the credential is formally a service token
-    (which would otherwise be treated as admin). This check MUST precede the
-    is_admin check for that reason.
+    (which would otherwise be treated as an operator). This check MUST precede
+    the operator check for that reason.
 
     Rejects 403 otherwise — never silently downgrades.
     """
@@ -245,7 +251,7 @@ def require_self_or_admin(
             detail="Forbidden: proxy token scoped to different user",
         )
     # Operator service token or admin JWT: unrestricted.
-    if claims.is_admin:
+    if claims.is_operator:
         return claims
     # User JWT: must be own user_id.
     if claims.user_id == user_id:

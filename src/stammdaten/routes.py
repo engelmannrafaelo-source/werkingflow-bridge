@@ -53,8 +53,10 @@ async def get_stammdaten(
     claims: AuthClaims = Depends(require_jwt_or_service),
 ) -> Dict[str, Any]:
     _check_app(app_id)
-    # Non-admin users may only read stammdaten for their own tenant.
-    if not claims.is_admin and claims.tenant_id != tenant_id:
+    # Scoped callers may only read stammdaten for their own tenant; operators
+    # any. A customer self-service proxy (service token + X-User-ID) has no
+    # tenant binding and is rejected here — stammdaten is not a portal endpoint.
+    if not claims.is_operator and claims.tenant_id != tenant_id:
         raise HTTPException(status_code=403, detail="Forbidden: foreign tenant")
 
     pool = get_pool()

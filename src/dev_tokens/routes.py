@@ -70,8 +70,9 @@ async def create_token(
     body: TokenCreate,
     claims: AuthClaims = Depends(require_jwt_or_service),
 ) -> Dict[str, Any]:
-    # Owner-or-admin: user may create own tokens, admin/service may create any
-    if claims.is_user and claims.user_id != body.userId:
+    # Scoped callers (user JWT, customer proxy) create only their own tokens;
+    # operators may create tokens for any user.
+    if not claims.is_operator and body.userId != claims.effective_user_id:
         raise HTTPException(status_code=403, detail="Can only create own tokens")
 
     plaintext, sha, last4 = _generate_token()
@@ -99,11 +100,11 @@ async def list_tokens(
     limit: int = Query(default=100, ge=1, le=500),
     claims: AuthClaims = Depends(require_jwt_or_service),
 ) -> Dict[str, Any]:
-    # Non-admin sees only own tokens
-    if not claims.is_admin:
-        if userId and userId != claims.user_id:
+    # Scoped callers see only their own tokens; operators see all.
+    if not claims.is_operator:
+        if userId and userId != claims.effective_user_id:
             raise HTTPException(status_code=403, detail="Forbidden")
-        userId = claims.user_id
+        userId = claims.effective_user_id
 
     where: List[str] = []
     args: List[Any] = []
@@ -146,7 +147,7 @@ async def revoke_token(
         )
         if not row:
             raise HTTPException(status_code=404, detail=f"Token {token_id} not found")
-        if not claims.is_admin and str(row["user_id"]) != claims.user_id:
+        if not claims.is_operator and str(row["user_id"]) != claims.effective_user_id:
             raise HTTPException(status_code=403, detail="Can only revoke own tokens")
         await conn.execute(
             "UPDATE developer_tokens SET revoked_at = NOW() WHERE id = $1 AND revoked_at IS NULL",
@@ -172,7 +173,7 @@ async def rotate_token(
             )
             if not old:
                 raise HTTPException(status_code=404, detail=f"Token {token_id} not found")
-            if not claims.is_admin and str(old["user_id"]) != claims.user_id:
+            if not claims.is_operator and str(old["user_id"]) != claims.effective_user_id:
                 raise HTTPException(status_code=403, detail="Can only rotate own tokens")
 
             # Revoke old
