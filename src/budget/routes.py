@@ -5,10 +5,12 @@ Mounted under /v1/budget — only active when BRIDGE_DB_URL is set.
 Auth model:
   - /v1/budget/check, /deduct   : require_jwt_or_service (app backends call this on every AI call)
   - /v1/budget/topup/credit     : require_service_token (internal/webhook ONLY — credits real money)
+  - GET /v1/budget              : require_admin (platform-admin overview of every user)
   - GET /v1/budget/{user_id}    : require_self_or_admin (a user can read own budget; admin reads any)
 
 POST /v1/budget/check          {userId, planId, estimatedCostEur} -> BudgetCheckResult
 POST /v1/budget/deduct         {userId, planId, actualCostEur} -> BudgetDeductionResult (atomic)
+GET  /v1/budget                -> { items: [BudgetSummary], count }   (admin — all users)
 GET  /v1/budget/{user_id}      -> { monthlyBudgets, topUpBalanceEur, updatedAt }
 POST /v1/budget/topup/credit   {userId, amountEur} -> { newBalance }  (service-token only)
 """
@@ -26,6 +28,7 @@ from src.api_auth import (
     require_jwt_or_service,
     require_service_token,
     require_self_or_admin,
+    require_admin,
     AuthClaims,
 )
 from src.budget.calculator import (
@@ -400,6 +403,63 @@ async def topup_credit(
 # ---------------------------------------------------------------------------
 # GET /v1/budget/{user_id}
 # ---------------------------------------------------------------------------
+
+@router.get("")
+async def list_budgets(
+    _claims: AuthClaims = Depends(require_admin),
+) -> Dict[str, Any]:
+    """Admin overview — one budget summary per user in a single query.
+
+    GET /{user_id} stays the per-user detail view; this list is what the
+    Platform-Admin UI joins against /v1/users to render the budget column.
+    Aggregates usedEur/limitEur across all plan budgets a user holds.
+    """
+    pool = get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT ub.user_id, ub.monthly_budgets, ub.updated_at,
+                   tb.balance_eur AS topup_balance
+            FROM user_budgets ub
+            LEFT JOIN user_topup_balances tb ON tb.user_id = ub.user_id
+            """
+        )
+
+    items = []
+    for row in rows:
+        raw = row["monthly_budgets"]
+        if isinstance(raw, str):
+            raw = json.loads(raw)
+        raw_monthly = raw or {}
+
+        used_eur = 0.0
+        limit_eur = 0.0
+        monthly: Dict[str, Any] = {}
+        for plan_id, entry in raw_monthly.items():
+            e_used = float(entry["usedEur"])
+            e_limit = float(entry["limitEur"])
+            used_eur += e_used
+            limit_eur += e_limit
+            monthly[plan_id] = {
+                "limitEur": e_limit,
+                "usedEur": e_used,
+                "resetAt": entry["resetAt"],
+            }
+
+        topup = float(row["topup_balance"]) if row["topup_balance"] is not None else 0.0
+
+        items.append({
+            "userId": str(row["user_id"]),
+            "monthlyBudgets": monthly,
+            "topUpBalanceEur": topup,
+            "usedEur": round(used_eur, 4),
+            "limitEur": round(limit_eur, 4),
+            "remainingEur": round(limit_eur - used_eur + topup, 4),
+            "updatedAt": row["updated_at"].isoformat() if row["updated_at"] else None,
+        })
+
+    return {"items": items, "count": len(items)}
+
 
 @router.get("/{user_id}")
 async def get_budget(
