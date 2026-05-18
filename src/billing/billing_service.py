@@ -500,11 +500,44 @@ async def list_credit_purchases(user_id: str) -> List[Dict[str, Any]]:
 # Webhook (Mollie ruft auf)
 # ---------------------------------------------------------------------------
 
+async def _record_failed_payment(payment_id: str, status: str) -> None:
+    """Append a billing_event for a Mollie payment that will never complete.
+
+    No state rollback is needed — subscription / topup activation only ever
+    runs on status == "paid" — but a lost payment must stay auditable.
+    """
+    pool = get_pool()
+    async with pool.acquire() as conn:
+        pending = await conn.fetchrow(
+            "SELECT user_id, type, plan_id, amount_eur FROM pending_payments WHERE payment_id = $1",
+            payment_id,
+        )
+    if not pending:
+        # Not one of ours, or the pending row is already gone — nothing to attribute.
+        return
+    await log_billing_event(
+        "payment.failed",
+        user_id=str(pending["user_id"]),
+        mollie_payment_id=payment_id,
+        amount_eur=float(pending["amount_eur"]) if pending["amount_eur"] is not None else None,
+        source="mollie-webhook",
+        payload={"status": status, "type": pending["type"], "planId": pending["plan_id"]},
+    )
+
+
 async def handle_webhook(payment_id: str) -> Dict[str, Any]:
     mollie = get_mollie_adapter()
     payment = await mollie.get_payment(payment_id)
-    if payment.get("status") != "paid":
-        return {"handled": False, "reason": f"status={payment.get('status')}"}
+    status = payment.get("status")
+    if status != "paid":
+        # open / pending / authorized are non-terminal — Mollie fires the
+        # webhook again once the payment settles, so there is nothing to do.
+        # Terminal failures (failed / expired / canceled) get an audit row:
+        # activation is gated on status == "paid" so no state is corrupted,
+        # but a lost payment must never vanish silently from the trail.
+        if status in ("failed", "expired", "canceled"):
+            await _record_failed_payment(payment_id, status)
+        return {"handled": False, "reason": f"status={status}"}
 
     pool = get_pool()
     async with pool.acquire() as conn:
