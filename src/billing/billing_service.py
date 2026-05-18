@@ -525,6 +525,132 @@ async def _record_failed_payment(payment_id: str, status: str) -> None:
     )
 
 
+async def _suspend_subscription_by_mollie_id(
+    mollie_subscription_id: str,
+    payment_id: str,
+    status: str,
+) -> None:
+    """Suspend an active subscription when its recurring Mollie payment fails.
+
+    Mollie fires the webhook for each payment in a subscription — including
+    recurring monthly ones.  Those payments are NOT in pending_payments (only
+    the first payment is), so handle_webhook falls through here.  We look up
+    the subscription by mollie_subscription_id; if it is 'active' we flip it
+    to 'suspended' and leave an audit trail.
+    """
+    pool = get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            UPDATE subscriptions
+               SET status = 'suspended', suspended_at = NOW()
+             WHERE mollie_subscription_id = $1 AND status = 'active'
+            RETURNING id, user_id
+            """,
+            mollie_subscription_id,
+        )
+    if row:
+        await log_billing_event(
+            "subscription.suspended",
+            user_id=str(row["user_id"]),
+            subscription_id=str(row["id"]),
+            mollie_payment_id=payment_id,
+            source="mollie-webhook",
+            payload={"reason": f"recurring_payment_{status}"},
+        )
+
+
+async def expire_subscription_for_user_plan(user_id: str, plan_id: str) -> None:
+    """Mark the user's active subscription for plan_id as 'expired'.
+
+    Called when a trial's budget window closes (trial_expired in evaluate_budget).
+    A no-op when no active subscription row exists (trials provisioned purely
+    through user_budgets have no subscription row).
+    """
+    pool = get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            UPDATE subscriptions
+               SET status = 'expired', expired_at = NOW()
+             WHERE user_id = $1 AND plan_id = $2::plan_id AND status = 'active'
+            RETURNING id
+            """,
+            uuid.UUID(user_id),
+            plan_id,
+        )
+    if row:
+        await log_billing_event(
+            "subscription.expired",
+            user_id=user_id,
+            subscription_id=str(row["id"]),
+            source="budget-check",
+            payload={"planId": plan_id, "reason": "trial_period_ended"},
+        )
+
+
+async def change_subscription(
+    user_id: str,
+    new_plan_id: str,
+    seats: int,
+    success_redirect: str,
+    email: str,
+    name: str,
+) -> Dict[str, Any]:
+    """Upgrade, downgrade, or reseat a subscription.
+
+    Cancels the current active subscription (Mollie + DB) and immediately
+    starts a checkout for the new plan.  The new subscription is activated
+    when the first payment completes via the Mollie webhook.
+
+    Returns the checkout URL together with the ID of the cancelled subscription
+    so the caller can communicate the transition to the user.
+
+    Raises:
+      LookupError  — no active subscription found for the user.
+      ValueError   — new plan/seats are identical to the current ones (no-op guard).
+    """
+    pool = get_pool()
+    async with pool.acquire() as conn:
+        sub = await conn.fetchrow(
+            """
+            SELECT id, plan_id, seats, mollie_customer_id, mollie_subscription_id
+              FROM subscriptions
+             WHERE user_id = $1 AND status = 'active'
+             ORDER BY started_at DESC
+             LIMIT 1
+            """,
+            uuid.UUID(user_id),
+        )
+
+    if not sub:
+        raise LookupError(f"No active subscription for user {user_id}")
+
+    current_plan = sub["plan_id"]
+    current_seats = sub["seats"]
+    if current_plan == new_plan_id and current_seats == seats:
+        raise ValueError(
+            f"New plan ({new_plan_id}, {seats} seats) identical to current — nothing to change"
+        )
+
+    # Validate the new plan exists (raises ValueError for unknown).
+    _plan_price(new_plan_id)
+
+    sub_id = str(sub["id"])
+    await cancel_subscription(user_id, sub_id)
+    checkout = await start_subscription_checkout(
+        user_id, new_plan_id, seats, success_redirect, email, name,
+    )
+    return {
+        "cancelledSubscriptionId": sub_id,
+        "previousPlanId": current_plan,
+        "newPlanId": new_plan_id,
+        "seats": seats,
+        "checkoutUrl": checkout.get("checkoutUrl"),
+        "paymentId": checkout.get("paymentId"),
+    }
+
+
 async def handle_webhook(payment_id: str) -> Dict[str, Any]:
     mollie = get_mollie_adapter()
     payment = await mollie.get_payment(payment_id)
@@ -537,6 +663,11 @@ async def handle_webhook(payment_id: str) -> Dict[str, Any]:
         # but a lost payment must never vanish silently from the trail.
         if status in ("failed", "expired", "canceled"):
             await _record_failed_payment(payment_id, status)
+            # Recurring subscription payments are NOT in pending_payments.
+            # When such a payment fails, suspend the linked subscription.
+            mollie_sub_id = payment.get("subscription_id")
+            if mollie_sub_id:
+                await _suspend_subscription_by_mollie_id(mollie_sub_id, payment_id, status)
         return {"handled": False, "reason": f"status={status}"}
 
     pool = get_pool()
@@ -579,6 +710,10 @@ async def handle_webhook(payment_id: str) -> Dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 def _serialize_subscription(row: Any) -> Dict[str, Any]:
+    def _ts(col: str) -> Optional[str]:
+        v = row[col] if col in row.keys() else None
+        return v.isoformat() if v else None
+
     return {
         "id": str(row["id"]),
         "userId": str(row["user_id"]),
@@ -588,8 +723,10 @@ def _serialize_subscription(row: Any) -> Dict[str, Any]:
         "mollieCustomerId": row["mollie_customer_id"],
         "mollieSubscriptionId": row["mollie_subscription_id"],
         "seats": row["seats"],
-        "startedAt": row["started_at"].isoformat() if row["started_at"] else None,
-        "cancelledAt": row["cancelled_at"].isoformat() if row["cancelled_at"] else None,
+        "startedAt": _ts("started_at"),
+        "cancelledAt": _ts("cancelled_at"),
+        "suspendedAt": _ts("suspended_at"),
+        "expiredAt": _ts("expired_at"),
     }
 
 

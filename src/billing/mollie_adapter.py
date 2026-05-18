@@ -123,7 +123,7 @@ class FakeMollieAdapter:
         if not p:
             raise KeyError(f"Unknown payment {payment_id}")
         # In FakeMollie sind alle gestarteten Payments sofort "paid"
-        return {**p, "status": "paid"}
+        return {**p, "status": "paid", "subscription_id": p.get("subscription_id")}
 
     def _create_payment(self, customer_id: str, amount_eur: float, metadata: Dict[str, str]) -> Dict[str, str]:
         pay_id = f"fake_pay_{uuid.uuid4().hex[:12]}"
@@ -259,6 +259,7 @@ class LiveMollieAdapter:
             "id": payment.id,
             "status": payment.status,
             "customer_id": getattr(payment, "customer_id", None),
+            "subscription_id": getattr(payment, "subscriptionId", None),
             "metadata": payment.metadata or {},
             "amount_eur": float(amount["value"]) if amount else 0.0,
         }

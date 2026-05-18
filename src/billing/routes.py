@@ -311,6 +311,37 @@ async def billing_list_credits(
     return {"creditPurchases": await billing_service.list_credit_purchases(user_id)}
 
 
+class SubscriptionChangeRequest(BaseModel):
+    userId: str
+    email: str
+    name: str
+    newPlanId: str
+    seats: int = Field(default=1, ge=1, le=100)
+    successRedirect: str
+
+
+@router.post("/subscription/change")
+async def billing_sub_change(
+    body: SubscriptionChangeRequest,
+    _claims: AuthClaims = Depends(require_jwt_or_service),
+) -> Dict[str, Any]:
+    """Upgrade, downgrade, or reseat an active subscription.
+
+    Cancels the current active subscription and starts a new checkout.
+    The new subscription activates when the first payment completes.
+    Returns the checkout URL and the ID of the cancelled subscription.
+    """
+    try:
+        return await billing_service.change_subscription(
+            body.userId, body.newPlanId, body.seats, body.successRedirect,
+            body.email, body.name,
+        )
+    except LookupError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
 @router.post("/{user_id}/subscriptions/{sub_id}/cancel", status_code=204)
 async def billing_cancel_sub(
     user_id: str,

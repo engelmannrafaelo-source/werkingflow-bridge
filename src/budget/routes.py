@@ -188,6 +188,16 @@ async def evaluate_budget(
     if get_plan(effective_plan_id).trial:
         entry = budget.monthly_budgets.get(effective_plan_id)
         if entry and _is_trial_expired(entry):
+            # Best-effort: mark any active trial subscription as expired.
+            # Non-fatal — a missing subscription row (trial was budget-only) is fine.
+            try:
+                from src.billing.billing_service import expire_subscription_for_user_plan
+                await expire_subscription_for_user_plan(str(user_id), effective_plan_id)
+            except Exception:
+                logger.warning(
+                    "[BudgetCheck] expire_subscription_for_user_plan failed for user=%s plan=%s",
+                    user_id, effective_plan_id, exc_info=True,
+                )
             return {
                 "allowed": False,
                 "reason": "trial_expired",
