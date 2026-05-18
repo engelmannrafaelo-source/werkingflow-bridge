@@ -9,9 +9,9 @@ Auth model:
   - /v1/billing/{user_id}/...        require_self_or_admin
 """
 import json
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
-from fastapi import APIRouter, Depends, Form, HTTPException, Response
+from fastapi import APIRouter, Depends, Form, HTTPException, Query, Response
 from pydantic import BaseModel, Field
 
 from src.billing import billing_service
@@ -21,6 +21,11 @@ from src.db.client import get_pool
 
 router = APIRouter(prefix="/v1/billing", tags=["billing"])
 
+_ALLOWED_APP_IDS = {
+    "werking-report", "werking-energy", "werking-safety",
+    "werking-noise", "engelmann",
+}
+
 
 # ---------------------------------------------------------------------------
 # Overview — admin dashboard cross-tenant aggregates
@@ -28,6 +33,14 @@ router = APIRouter(prefix="/v1/billing", tags=["billing"])
 
 @router.get("/overview")
 async def billing_overview(
+    app: Optional[str] = Query(
+        default=None,
+        description=(
+            "Filter subscription stats to one app (werking-report|werking-energy|"
+            "werking-safety|werking-noise|engelmann). Top-up totals are "
+            "app-overarching and are returned as null when filtered."
+        ),
+    ),
     _claims: AuthClaims = Depends(require_admin),
 ) -> Dict[str, Any]:
     """
@@ -42,7 +55,16 @@ async def billing_overview(
     MRR is estimated, not invoiced: trial=€0, plan-prices from
     src/budget/plans.py multiplied by seats. Replaces with real Mollie totals
     once the live billing path is hot.
+
+    Optional `app` filter restricts subscription-side stats to one app.
+    Top-up revenue is intentionally NOT app-attributable (credit_purchases
+    has no app dimension — top-ups are a wallet, used across apps) and is
+    returned as null when filtered, so the dashboard doesn't surface a
+    misleading "energy made €X in top-ups".
     """
+    if app and app not in _ALLOWED_APP_IDS:
+        raise HTTPException(status_code=400, detail=f"Unknown app: {app}")
+
     pool = get_pool()
     plan_prices = {pid: p.price for pid, p in PLANS.items()}
     # Legacy plan-id aliases from werking-report's own catalog. Remove once the
@@ -59,9 +81,15 @@ async def billing_overview(
     source = "subscriptions"
 
     async with pool.acquire() as conn:
-        sub_rows = await conn.fetch(
-            "SELECT status, plan_id, seats, app_id FROM subscriptions"
-        )
+        if app:
+            sub_rows = await conn.fetch(
+                "SELECT status, plan_id, seats, app_id FROM subscriptions WHERE app_id = $1::app_id",
+                app,
+            )
+        else:
+            sub_rows = await conn.fetch(
+                "SELECT status, plan_id, seats, app_id FROM subscriptions"
+            )
 
     if sub_rows:
         for r in sub_rows:
@@ -84,14 +112,26 @@ async def billing_overview(
         # the dashboard isn't blank during the WR→Bridge transition.
         source = "activities"
         async with pool.acquire() as conn:
-            rows = await conn.fetch(
-                """
-                SELECT payload, app_id
-                FROM activities
-                WHERE category = 'billing'
-                  AND event_type LIKE 'subscription.imported.%'
-                """
-            )
+            if app:
+                rows = await conn.fetch(
+                    """
+                    SELECT payload, app_id
+                    FROM activities
+                    WHERE category = 'billing'
+                      AND event_type LIKE 'subscription.imported.%'
+                      AND app_id = $1::app_id
+                    """,
+                    app,
+                )
+            else:
+                rows = await conn.fetch(
+                    """
+                    SELECT payload, app_id
+                    FROM activities
+                    WHERE category = 'billing'
+                      AND event_type LIKE 'subscription.imported.%'
+                    """
+                )
         for r in rows:
             payload = r["payload"] if isinstance(r["payload"], dict) else json.loads(r["payload"] or "{}")
             plan_id = payload.get("planId", "unknown")
@@ -109,23 +149,33 @@ async def billing_overview(
             elif status == "cancelled":
                 cancelled_subs += 1
 
-    # Top-up totals
-    async with pool.acquire() as conn:
-        topup_sum_row = await conn.fetchrow(
-            "SELECT COALESCE(SUM(pack_eur), 0) AS total, COUNT(*) AS count FROM credit_purchases"
-        )
-        topup_balances_row = await conn.fetchrow(
-            "SELECT COALESCE(SUM(balance_eur), 0) AS total FROM user_topup_balances"
-        )
+    # Top-up totals — app-overarching. Omit when filtering by app so the
+    # dashboard doesn't misattribute cross-app wallet activity to one app.
+    if app:
+        topup_revenue: Optional[float] = None
+        topup_count: Optional[int] = None
+        topup_balance: Optional[float] = None
+    else:
+        async with pool.acquire() as conn:
+            topup_sum_row = await conn.fetchrow(
+                "SELECT COALESCE(SUM(pack_eur), 0) AS total, COUNT(*) AS count FROM credit_purchases"
+            )
+            topup_balances_row = await conn.fetchrow(
+                "SELECT COALESCE(SUM(balance_eur), 0) AS total FROM user_topup_balances"
+            )
+        topup_revenue = float(topup_sum_row["total"])
+        topup_count = int(topup_sum_row["count"])
+        topup_balance = float(topup_balances_row["total"])
 
     return {
         "source": source,
+        "app": app,
         "totalMrrEur": round(total_mrr_eur, 2),
         "activeSubscriptions": active_subs,
         "cancelledSubscriptions": cancelled_subs,
-        "totalTopupRevenueEur": float(topup_sum_row["total"]),
-        "topupPurchasesCount": int(topup_sum_row["count"]),
-        "totalUserBalanceEur": float(topup_balances_row["total"]),
+        "totalTopupRevenueEur": topup_revenue,
+        "topupPurchasesCount": topup_count,
+        "totalUserBalanceEur": topup_balance,
         "byPlan": by_plan,
         "byStatus": by_status,
         "byApp": by_app,

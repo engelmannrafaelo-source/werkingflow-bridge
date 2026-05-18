@@ -82,6 +82,12 @@ def _user_row_to_dict(row: Any) -> Dict[str, Any]:
     }
 
 
+_ALLOWED_APP_IDS = {
+    "werking-report", "werking-energy", "werking-safety",
+    "werking-noise", "engelmann",
+}
+
+
 @router.get("/v1/users")
 async def list_users(
     limit: int = Query(default=100, le=1000),
@@ -89,39 +95,54 @@ async def list_users(
         default=None,
         description="Filter by tenant.account_type: customer|test|internal",
     ),
+    app: Optional[str] = Query(
+        default=None,
+        description="Filter by app_licenses.app_id — only users with a license for this app",
+    ),
     _claims: AuthClaims = Depends(require_admin),
 ) -> List[Dict[str, Any]]:
-    """List users. Optional `account_type` filters by the user's tenant."""
+    """
+    List users. Optional `account_type` filters by the user's tenant.
+    Optional `app` filters to users holding an app_license for that app
+    (any license row, active or expired — app association is the signal).
+    """
     if account_type and account_type not in ("customer", "test", "internal"):
         raise HTTPException(status_code=400, detail=f"Invalid account_type: {account_type}")
+    if app and app not in _ALLOWED_APP_IDS:
+        raise HTTPException(status_code=400, detail=f"Unknown app: {app}")
+
+    where: List[str] = []
+    args: List[Any] = []
+
+    def _add(cond: str, val: Any, cast: str = "") -> None:
+        args.append(val)
+        where.append(cond.replace("$$", f"${len(args)}{cast}"))
+
+    if account_type:
+        _add("t.account_type = $$", account_type, "::account_type")
+    if app:
+        # EXISTS subquery is cheaper than DISTINCT + JOIN when a user has many
+        # license rows. We want "is this user licensed for app X" — a single
+        # row hit suffices.
+        _add(
+            "EXISTS (SELECT 1 FROM app_licenses al WHERE al.user_id = u.id AND al.app_id = $$::app_id)",
+            app,
+        )
+
+    sql = """
+        SELECT u.id, u.email, u.name, u.tenant_id, u.created_at, u.updated_at,
+               t.account_type::text AS tenant_account_type
+        FROM users u
+        LEFT JOIN tenants t ON t.id = u.tenant_id
+    """
+    if where:
+        sql += " WHERE " + " AND ".join(where)
+    sql += f" ORDER BY u.created_at DESC LIMIT ${len(args) + 1}"
+    args.append(limit)
 
     pool = get_pool()
     async with pool.acquire() as conn:
-        if account_type:
-            rows = await conn.fetch(
-                """
-                SELECT u.id, u.email, u.name, u.tenant_id, u.created_at, u.updated_at,
-                       t.account_type::text AS tenant_account_type
-                FROM users u
-                LEFT JOIN tenants t ON t.id = u.tenant_id
-                WHERE t.account_type = $1::account_type
-                ORDER BY u.created_at DESC
-                LIMIT $2
-                """,
-                account_type, limit,
-            )
-        else:
-            rows = await conn.fetch(
-                """
-                SELECT u.id, u.email, u.name, u.tenant_id, u.created_at, u.updated_at,
-                       t.account_type::text AS tenant_account_type
-                FROM users u
-                LEFT JOIN tenants t ON t.id = u.tenant_id
-                ORDER BY u.created_at DESC
-                LIMIT $1
-                """,
-                limit,
-            )
+        rows = await conn.fetch(sql, *args)
     return [
         {**_user_row_to_dict(r), "tenant_account_type": r["tenant_account_type"]}
         for r in rows
