@@ -2,9 +2,10 @@
 Auth endpoints: login / logout / session.
 Mounted under /v1/auth — only active when BRIDGE_DB_URL is set.
 
-POST /v1/auth/login   {email, password} -> {jwt, user, appLicenses[]}   PUBLIC
-POST /v1/auth/logout  Bearer <jwt> -> 204                              require_jwt
-GET  /v1/auth/session Bearer <jwt> -> {user, appLicenses[]}            require_jwt
+POST /v1/auth/login      {email, password} -> {jwt, user, appLicenses[]}  PUBLIC
+POST /v1/auth/logout     Bearer <jwt> -> 204                             require_jwt
+GET  /v1/auth/session    Bearer <jwt> -> {user, appLicenses[]}           require_jwt
+POST /v1/auth/test-token {email} -> {jwt, user, appLicenses[]}           service-token, test tenants only
 """
 import uuid
 from datetime import datetime, timezone, timedelta
@@ -16,7 +17,7 @@ from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi import Security
 from pydantic import BaseModel, EmailStr
 
-from src.api_auth import require_jwt, AuthClaims
+from src.api_auth import require_jwt, require_service_token, AuthClaims
 from src.db.client import get_pool
 from src.identity.password import verify_password
 from src.identity.jwt_utils import sign_jwt, verify_jwt
@@ -130,6 +131,90 @@ async def login(body: LoginRequest) -> Dict[str, Any]:
 
     user = _user_dict(row, app_licenses)
     return {"jwt": token, "user": user, "appLicenses": app_licenses}
+
+
+# ---------------------------------------------------------------------------
+# POST /v1/auth/test-token
+# ---------------------------------------------------------------------------
+
+class TestTokenRequest(BaseModel):
+    email: EmailStr
+
+
+async def _issue_token(conn: Any, row: Any) -> Dict[str, Any]:
+    """Sign a JWT for an already-fetched user row and persist its session.
+
+    `row` must carry: id, email, name, tenant_id, role, created_at, updated_at.
+    """
+    user_id = row["id"]
+    license_rows = await conn.fetch(
+        "SELECT app_id, plan_id, start_date, end_date, seats FROM app_licenses WHERE user_id = $1",
+        user_id,
+    )
+    app_licenses = [_license_row(lr) for lr in license_rows]
+
+    token = sign_jwt(
+        user_id=str(user_id),
+        email=row["email"],
+        tenant_id=row["tenant_id"],
+        app_licenses=app_licenses,
+        role=row["role"],
+    )
+
+    now = datetime.now(timezone.utc)
+    await conn.execute(
+        "INSERT INTO sessions (user_id, token, created_at, expires_at) VALUES ($1, $2, $3, $4)",
+        user_id,
+        token,
+        now,
+        now + timedelta(hours=_SESSION_TTL_HOURS),
+    )
+    return {"jwt": token, "user": _user_dict(row, app_licenses), "appLicenses": app_licenses}
+
+
+@router.post("/test-token")
+async def test_token(
+    body: TestTokenRequest,
+    _claims: AuthClaims = Depends(require_service_token),
+) -> Dict[str, Any]:
+    """
+    Mint a JWT for a test user without a password — for the unified tester.
+
+    The tester needs Bearer tokens for users it did not create the password
+    for, and must bypass the single-active-session rule. Two hard guards keep
+    this safe in every environment (fail-fast, no silent fallback):
+
+      1. require_service_token — only callers holding the Bridge service token.
+      2. The user's tenant MUST be account_type='test'. A token can never be
+         minted for a 'customer' or 'internal' account, even with a valid
+         service token. This is the wall, not the service token alone.
+    """
+    pool = get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            SELECT u.id, u.email, u.name, u.tenant_id, u.role,
+                   u.created_at, u.updated_at, t.account_type
+            FROM users u
+            JOIN tenants t ON t.id = u.tenant_id
+            WHERE u.email = $1
+            """,
+            body.email,
+        )
+
+        if not row:
+            raise HTTPException(status_code=404, detail="User not found")
+
+        if row["account_type"] != "test":
+            raise HTTPException(
+                status_code=403,
+                detail=(
+                    f"test-token refused: tenant account_type is "
+                    f"'{row['account_type']}', not 'test'"
+                ),
+            )
+
+        return await _issue_token(conn, row)
 
 
 # ---------------------------------------------------------------------------

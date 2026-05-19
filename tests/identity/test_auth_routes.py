@@ -27,6 +27,7 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
+from src.config import config
 from src.identity.routes import router
 from src.identity.password import hash_password
 from src.identity.jwt_utils import verify_jwt
@@ -385,3 +386,110 @@ class TestGetSession:
     def test_no_token_returns_401(self, client: TestClient):
         resp = client.get("/v1/auth/session")
         assert resp.status_code == 401
+
+
+# ---------------------------------------------------------------------------
+# POST /v1/auth/test-token
+# ---------------------------------------------------------------------------
+
+# Send the actually-configured service token so the test is self-consistent
+# regardless of which BRIDGE_SERVICE_TOKEN the environment provides.
+_SERVICE_TOKEN_HEADER = {"X-Bridge-Service-Token": config.service_token}
+
+
+def _test_token_row(
+    user_id: uuid.UUID | None = None,
+    email: str = "test-user@test.werkingflow.com",
+    name: str = "Test User",
+    tenant_id: str = "werking-report-test",
+    role: str = "user",
+    account_type: str = "test",
+) -> dict:
+    """User row as returned by the test-token JOIN (carries account_type)."""
+    uid = user_id or uuid.uuid4()
+    now = datetime.now(timezone.utc)
+    return {
+        "id": uid,
+        "email": email,
+        "name": name,
+        "tenant_id": tenant_id,
+        "role": role,
+        "created_at": now,
+        "updated_at": now,
+        "account_type": account_type,
+    }
+
+
+class TestTestToken:
+    def test_test_tenant_user_gets_token(self, client: TestClient):
+        uid = uuid.uuid4()
+        row = _test_token_row(user_id=uid, email="t@test.werkingflow.com")
+        pool, _ = _mock_pool(row, fetch_result=[])
+
+        with patch("src.identity.routes.get_pool", return_value=pool):
+            resp = client.post(
+                "/v1/auth/test-token",
+                json={"email": "t@test.werkingflow.com"},
+                headers=_SERVICE_TOKEN_HEADER,
+            )
+
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["user"]["email"] == "t@test.werkingflow.com"
+        payload = verify_jwt(body["jwt"])
+        assert payload["sub"] == str(uid)
+
+    def test_session_row_inserted(self, client: TestClient):
+        row = _test_token_row()
+        pool, conn = _mock_pool(row, fetch_result=[])
+
+        with patch("src.identity.routes.get_pool", return_value=pool):
+            resp = client.post(
+                "/v1/auth/test-token",
+                json={"email": row["email"]},
+                headers=_SERVICE_TOKEN_HEADER,
+            )
+
+        assert resp.status_code == 200
+        conn.execute.assert_awaited_once()
+        assert "INSERT INTO sessions" in conn.execute.call_args[0][0]
+
+    def test_missing_service_token_returns_401(self, client: TestClient):
+        resp = client.post(
+            "/v1/auth/test-token",
+            json={"email": "t@test.werkingflow.com"},
+        )
+        assert resp.status_code == 401
+
+    def test_unknown_user_returns_404(self, client: TestClient):
+        pool, _ = _mock_pool(None)
+        with patch("src.identity.routes.get_pool", return_value=pool):
+            resp = client.post(
+                "/v1/auth/test-token",
+                json={"email": "nobody@test.werkingflow.com"},
+                headers=_SERVICE_TOKEN_HEADER,
+            )
+        assert resp.status_code == 404
+
+    def test_customer_tenant_refused_403(self, client: TestClient):
+        """The wall: a service token can never mint a token for a customer."""
+        row = _test_token_row(account_type="customer")
+        pool, _ = _mock_pool(row, fetch_result=[])
+        with patch("src.identity.routes.get_pool", return_value=pool):
+            resp = client.post(
+                "/v1/auth/test-token",
+                json={"email": row["email"]},
+                headers=_SERVICE_TOKEN_HEADER,
+            )
+        assert resp.status_code == 403
+
+    def test_internal_tenant_refused_403(self, client: TestClient):
+        row = _test_token_row(account_type="internal")
+        pool, _ = _mock_pool(row, fetch_result=[])
+        with patch("src.identity.routes.get_pool", return_value=pool):
+            resp = client.post(
+                "/v1/auth/test-token",
+                json={"email": row["email"]},
+                headers=_SERVICE_TOKEN_HEADER,
+            )
+        assert resp.status_code == 403
