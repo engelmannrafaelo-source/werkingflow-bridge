@@ -148,7 +148,21 @@ for t in tenants_to_create:
     if r.status_code == 201:
         print(f"  [ok]    Created tenant: {t['id']} (account_type=test)")
     elif r.status_code == 409:
-        print(f"  [ok]    Already exists (idempotent): {t['id']}")
+        # Tenant pre-exists — reconcile account_type so a tenant created
+        # earlier as 'customer' does not keep its test users misclassified.
+        # Only tenants declared in test-credentials.json are touched.
+        try:
+            pr = requests.patch(f"${BRIDGE_URL}/v1/tenants/{t['id']}",
+                                json={'account_type': 'test'}, headers=headers, timeout=15)
+        except requests.RequestException as e:
+            print(f"  [FAIL]  Tenant {t['id']}: reconcile error — {e}", file=sys.stderr)
+            ok = False
+            continue
+        if pr.status_code == 200:
+            print(f"  [ok]    Reconciled account_type=test: {t['id']}")
+        else:
+            print(f"  [FAIL]  Tenant {t['id']}: reconcile PATCH HTTP {pr.status_code} — {pr.text}", file=sys.stderr)
+            ok = False
     else:
         print(f"  [FAIL]  Tenant {t['id']}: HTTP {r.status_code} — {r.text}", file=sys.stderr)
         ok = False
@@ -180,8 +194,30 @@ headers = {
 }
 default_tenant_id = '${DEFAULT_TENANT_ID}'
 ok = True
-existed = []
 
+# Pre-fetch existing users (email -> id) so a 409 can be reconciled via PATCH.
+existing = {}
+offset = 0
+while True:
+    try:
+        rr = requests.get('${BRIDGE_URL}/v1/users', params={'limit': 200, 'offset': offset},
+                          headers=headers, timeout=15)
+    except requests.RequestException as e:
+        print(f"  [FAIL]  Pre-fetch of existing users failed: {e}", file=sys.stderr)
+        sys.exit(1)
+    if rr.status_code != 200:
+        print(f"  [FAIL]  GET /v1/users HTTP {rr.status_code}: {rr.text}", file=sys.stderr)
+        sys.exit(1)
+    page = rr.json()
+    if not page:
+        break
+    for x in page:
+        existing[x['email'].lower()] = x['id']
+    if len(page) < 200:
+        break
+    offset += 200
+
+created = reconciled = 0
 for key, u in users.items():
     tenant_id = u.get('tenantId') or default_tenant_id
     payload = {
@@ -199,24 +235,38 @@ for key, u in users.items():
         continue
 
     if r.status_code == 201:
+        created += 1
         print(f"  [ok]    Created: {key} ({u['email']}) → tenant={tenant_id}")
     elif r.status_code == 409:
-        # POST /v1/users is create-only. A 409 means the user pre-exists — its
-        # password and tenant are NOT reconciled with test-credentials.json.
-        # This is NOT a clean success: a pre-existing record with a divergent
-        # password will fail login. Report it honestly — never a silent [ok].
-        existed.append(key)
-        print(f"  [warn]  Exists — password/tenant NOT reconciled: {key} ({u['email']})")
+        # User pre-exists. POST is create-only, so reconcile password + role
+        # via PATCH — a stale password carried over from an earlier run would
+        # otherwise silently break login. Idempotent: every re-seed converges.
+        uid = existing.get(u['email'].lower())
+        if not uid:
+            print(f"  [FAIL]  User {key}: 409 but not in user list — cannot reconcile", file=sys.stderr)
+            ok = False
+            continue
+        try:
+            pr = requests.patch(
+                f"${BRIDGE_URL}/v1/users/{uid}",
+                json={'password': u.get('password'), 'role': u.get('role', 'user')},
+                headers=headers, timeout=15,
+            )
+        except requests.RequestException as e:
+            print(f"  [FAIL]  User {key}: reconcile request error — {e}", file=sys.stderr)
+            ok = False
+            continue
+        if pr.status_code == 200:
+            reconciled += 1
+            print(f"  [ok]    Reconciled password/role: {key} ({u['email']})")
+        else:
+            print(f"  [FAIL]  User {key}: reconcile PATCH HTTP {pr.status_code} — {pr.text}", file=sys.stderr)
+            ok = False
     else:
         print(f"  [FAIL]  User {key}: HTTP {r.status_code} — {r.text}", file=sys.stderr)
         ok = False
 
-if existed:
-    print()
-    print(f"  {len(existed)} user(s) already existed and were left untouched.")
-    print(f"  If any cannot log in, the pre-existing Bridge record carries a")
-    print(f"  divergent password — purge that record and re-run this seeder.")
-
+print(f"\n  {created} created, {reconciled} reconciled")
 sys.exit(0 if ok else 1)
 PYEOF
 log_success "Users seeded"
