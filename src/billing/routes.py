@@ -15,7 +15,7 @@ from fastapi import APIRouter, Depends, Form, HTTPException, Query, Response
 from pydantic import BaseModel, Field
 
 from src.billing import billing_service
-from src.api_auth import require_admin, require_jwt_or_service, require_self_or_admin, AuthClaims
+from src.api_auth import require_admin, require_jwt_or_service, require_self_or_admin, require_service_token, AuthClaims
 from src.budget.plans import PLANS
 from src.db.client import get_pool
 
@@ -231,6 +231,35 @@ class SubscriptionCheckoutRequest(BaseModel):
     # endpoint. Tighten further once the real cap is known.
     seats: int = Field(default=1, ge=1, le=100)
     successRedirect: str
+
+
+class SubscriptionProvisionRequest(BaseModel):
+    userId: str
+    planId: str
+    seats: int = Field(default=1, ge=1, le=100)
+
+
+@router.post("/subscription/provision", status_code=201)
+async def billing_sub_provision(
+    body: SubscriptionProvisionRequest,
+    _claims: AuthClaims = Depends(require_service_token),
+) -> Dict[str, Any]:
+    """
+    Directly provision an active subscription without Mollie — service-token only.
+
+    Produces the same DB state as a completed Mollie checkout + webhook cycle
+    (status='active', monthly budget provisioned) without initiating a payment.
+    Intended for seeding test environments.
+
+    Idempotent: if the user already has an active subscription for the given plan,
+    returns it. Refuses trial plans (400) — those auto-provision via evaluate_budget.
+    """
+    try:
+        return await billing_service.provision_subscription(
+            body.userId, body.planId, body.seats
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
 
 @router.post("/subscription/checkout")

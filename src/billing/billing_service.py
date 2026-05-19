@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import json
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 from src.config import config
@@ -777,6 +777,151 @@ async def log_billing_event(
             source,
             _json.dumps(payload or {}),
         )
+
+
+# ---------------------------------------------------------------------------
+# Direct subscription provisioning — for seed/test environments (no Mollie).
+# ---------------------------------------------------------------------------
+
+async def _provision_plan_budget(
+    conn: Any, user_id: uuid.UUID, plan: Any
+) -> None:
+    """Insert a monthly budget entry for a paid plan — idempotent.
+
+    Same guard as _provision_trial: the ON CONFLICT UPDATE fires only when the
+    plan key is absent, so existing usage is never reset by a re-seed.
+    Reset window: 30 days (standard monthly billing cycle).
+    """
+    valid_until = (datetime.now(timezone.utc) + timedelta(days=30)).isoformat()
+    entry_json = json.dumps({
+        plan.id: {
+            "limitEur": float(plan.api_budget_eur),
+            "usedEur": 0.0,
+            "resetAt": valid_until,
+        }
+    })
+    await conn.execute(
+        """
+        INSERT INTO user_budgets (user_id, monthly_budgets, updated_at)
+        VALUES ($1, $2::jsonb, NOW())
+        ON CONFLICT (user_id) DO UPDATE
+        SET monthly_budgets = user_budgets.monthly_budgets || $2::jsonb,
+            updated_at = NOW()
+        WHERE (user_budgets.monthly_budgets -> $3) IS NULL
+        """,
+        user_id,
+        entry_json,
+        plan.id,
+    )
+
+
+async def provision_subscription(
+    user_id: str,
+    plan_id: str,
+    seats: int,
+) -> Dict[str, Any]:
+    """
+    Directly provision an active subscription without Mollie — for seeding.
+
+    Produces exactly the state that a successful Mollie checkout + webhook cycle
+    would produce (status='active', monthly budget entry set) without initiating
+    a payment. Synthetic placeholder values fill the Mollie-specific columns so
+    callers without a real Mollie customer can still own a valid subscription row.
+
+    Idempotent: if the user already has an active subscription for this plan,
+    returns it without creating a duplicate. Refuses trial plans (use the normal
+    checkout flow for those — trial provisioning happens auto in evaluate_budget).
+
+    The synthetic mollie_first_payment_id ('provision-{user_id}-{plan_id}') acts
+    as the idempotency key for concurrent callers, just like the real payment ID
+    does in _activate_subscription.
+    """
+    from src.budget.plans import get_plan
+
+    plan = get_plan(plan_id)  # raises ValueError for unknown plan
+    if plan.trial:
+        raise ValueError(
+            f"provision_subscription: cannot provision trial plan '{plan_id}' — "
+            "trials are auto-provisioned via evaluate_budget"
+        )
+
+    pool = get_pool()
+    user_uuid = uuid.UUID(user_id)
+
+    # Pre-check: if the user already owns an active subscription for this plan,
+    # return it immediately. This covers the common idempotent re-seed case
+    # without going through the INSERT path.
+    async with pool.acquire() as conn:
+        existing = await conn.fetchrow(
+            """
+            SELECT id, user_id, app_id, plan_id, status, mollie_customer_id,
+                   mollie_subscription_id, seats, started_at, cancelled_at,
+                   suspended_at, expired_at
+            FROM subscriptions
+            WHERE user_id = $1 AND plan_id = $2::plan_id AND status = 'active'
+            ORDER BY started_at DESC
+            LIMIT 1
+            """,
+            user_uuid, plan_id,
+        )
+        if existing:
+            return _serialize_subscription(existing)
+
+        # No active subscription yet. Insert with synthetic Mollie identifiers.
+        # mollie_first_payment_id is the UNIQUE idempotency key — concurrent callers
+        # that both passed the pre-check will race here; one wins, one hits ON CONFLICT.
+        synth_payment_id = f"provision-{user_id}-{plan_id}"
+        synth_customer_id = f"seed-{user_id}"
+        sub_uuid = uuid.uuid4()
+
+        row = await conn.fetchrow(
+            """
+            INSERT INTO subscriptions
+              (id, user_id, app_id, plan_id, status,
+               mollie_customer_id, mollie_subscription_id, mollie_first_payment_id,
+               seats, started_at, metadata)
+            VALUES ($1, $2, $3, $4::plan_id, 'active',
+                    $5, NULL, $6, $7, NOW(), '{"provisioned": true}'::jsonb)
+            ON CONFLICT (mollie_first_payment_id) DO NOTHING
+            RETURNING id, user_id, app_id, plan_id, status, mollie_customer_id,
+                      mollie_subscription_id, seats, started_at, cancelled_at,
+                      suspended_at, expired_at
+            """,
+            sub_uuid, user_uuid, plan.app_id, plan_id,
+            synth_customer_id, synth_payment_id, seats,
+        )
+
+        if row:
+            await _provision_plan_budget(conn, user_uuid, plan)
+            sub_dict = _serialize_subscription(row)
+            sub_id = sub_dict["id"]
+        else:
+            # ON CONFLICT: concurrent caller won the race. Return their row.
+            winner = await conn.fetchrow(
+                """
+                SELECT id, user_id, app_id, plan_id, status, mollie_customer_id,
+                       mollie_subscription_id, seats, started_at, cancelled_at,
+                       suspended_at, expired_at
+                FROM subscriptions WHERE mollie_first_payment_id = $1
+                """,
+                synth_payment_id,
+            )
+            if not winner:
+                raise RuntimeError(
+                    f"provision_subscription: ON CONFLICT fired but no row found "
+                    f"for payment_id={synth_payment_id}"
+                )
+            sub_dict = _serialize_subscription(winner)
+            sub_id = sub_dict["id"]
+
+    await log_billing_event(
+        "subscription.provisioned",
+        user_id=user_id,
+        subscription_id=sub_id,
+        source="seed",
+        payload={"planId": plan_id, "seats": seats},
+    )
+    return sub_dict
 
 
 # ---------------------------------------------------------------------------
