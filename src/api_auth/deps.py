@@ -63,6 +63,7 @@ class AuthClaims:
     tenant_id: Optional[str]
     is_admin: bool                  # raw privilege claim — gate authz on is_operator, never on this
     acting_user_id: Optional[str] = field(default=None)
+    role: Optional[str] = field(default=None)  # platform role from JWT; None for service tokens
 
     @property
     def is_user(self) -> bool:
@@ -128,6 +129,7 @@ def _decode_user_jwt(token: str) -> AuthClaims:
         tenant_id=payload.get("tenantId"),
         is_admin=bool(payload.get("isAdmin", False)),
         acting_user_id=uid,  # JWT sub is always the acting identity for user JWTs
+        role=payload.get("role"),
     )
 
 

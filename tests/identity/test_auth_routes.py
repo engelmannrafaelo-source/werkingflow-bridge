@@ -74,6 +74,7 @@ def _user_row(
     name: str = "Test User",
     tenant_id: str = "tenant-1",
     password: str = "secret",
+    role: str = "user",
 ) -> dict:
     uid = user_id or uuid.uuid4()
     now = datetime.now(timezone.utc)
@@ -82,6 +83,7 @@ def _user_row(
         "email": email,
         "name": name,
         "tenant_id": tenant_id,
+        "role": role,
         "password_hash": hash_password(password),
         "created_at": now,
         "updated_at": now,
@@ -216,6 +218,7 @@ class TestLoginFailures:
             "email": "sso@example.com",
             "name": "SSO User",
             "tenant_id": "tenant-sso",
+            "role": "user",
             "password_hash": None,
             "created_at": now,
             "updated_at": now,
@@ -335,6 +338,7 @@ class TestGetSession:
             "email": "sess@example.com",
             "name": "Session User",
             "tenant_id": "t-sess",
+            "role": "user",
             "created_at": now,
             "updated_at": now,
         }

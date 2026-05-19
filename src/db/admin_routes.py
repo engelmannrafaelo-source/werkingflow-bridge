@@ -22,6 +22,7 @@ from typing import Optional, List, Any, Dict
 
 import asyncpg
 from src.identity.password import hash_password
+from src.identity.jwt_utils import VALID_ROLES
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, EmailStr, Field
@@ -54,6 +55,9 @@ async def db_health() -> Dict[str, Any]:
 # Users
 # ---------------------------------------------------------------------------
 
+_VALID_ROLES_LIST = sorted(VALID_ROLES)
+
+
 class UserCreateRequest(BaseModel):
     # EmailStr enforces RFC-5322-ish format at the API boundary so we never
     # persist garbage like "" or "not-an-email" into users.email (which is
@@ -62,6 +66,7 @@ class UserCreateRequest(BaseModel):
     name: str
     tenant_id: Optional[str] = None
     password: Optional[str] = None
+    role: Optional[str] = Field(default=None, description=f"Platform role. One of: {sorted(VALID_ROLES)}. Defaults to 'user'.")
 
 
 class UserResponse(BaseModel):
@@ -69,6 +74,7 @@ class UserResponse(BaseModel):
     email: str
     name: str
     tenant_id: str
+    role: str
     app_licenses: List[Dict[str, Any]]
     created_at: str
     updated_at: str
@@ -80,6 +86,7 @@ def _user_row_to_dict(row: Any) -> Dict[str, Any]:
         "email": row["email"],
         "name": row["name"],
         "tenant_id": row["tenant_id"],
+        "role": row["role"],
         "app_licenses": [],
         "created_at": row["created_at"].isoformat(),
         "updated_at": row["updated_at"].isoformat(),
@@ -134,7 +141,7 @@ async def list_users(
         )
 
     sql = """
-        SELECT u.id, u.email, u.name, u.tenant_id, u.created_at, u.updated_at,
+        SELECT u.id, u.email, u.name, u.tenant_id, u.role, u.created_at, u.updated_at,
                t.account_type::text AS tenant_account_type
         FROM users u
         LEFT JOIN tenants t ON t.id = u.tenant_id
@@ -158,6 +165,13 @@ async def create_user(
     body: UserCreateRequest,
     _claims: AuthClaims = Depends(require_admin),
 ) -> Dict[str, Any]:
+    role = body.role or "user"
+    if role not in VALID_ROLES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid role '{role}'. Must be one of: {_VALID_ROLES_LIST}",
+        )
+
     pool = get_pool()
     now = datetime.now(timezone.utc)
 
@@ -184,13 +198,14 @@ async def create_user(
         try:
             row = await conn.fetchrow(
                 """
-                INSERT INTO users (email, name, tenant_id, password_hash, created_at, updated_at)
-                VALUES ($1, $2, $3, $4, $5, $6)
-                RETURNING id, email, name, tenant_id, created_at, updated_at
+                INSERT INTO users (email, name, tenant_id, role, password_hash, created_at, updated_at)
+                VALUES ($1, $2, $3, $4, $5, $6, $7)
+                RETURNING id, email, name, tenant_id, role, created_at, updated_at
                 """,
                 body.email,
                 body.name,
                 tenant_id,
+                role,
                 pw_hash,
                 now,
                 now,
@@ -215,7 +230,7 @@ async def get_user(
     pool = get_pool()
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
-            "SELECT id, email, name, tenant_id, created_at, updated_at FROM users WHERE id = $1",
+            "SELECT id, email, name, tenant_id, role, created_at, updated_at FROM users WHERE id = $1",
             uuid.UUID(user_id),
         )
     if not row:
@@ -246,39 +261,68 @@ async def get_user(
 # User self-update
 # ---------------------------------------------------------------------------
 
-class UserSelfUpdateRequest(BaseModel):
+class UserUpdateRequest(BaseModel):
     # Only `name` is exposed for self-edit. Email requires a separate
-    # verification flow. tenant_id and roles are admin-only.
+    # verification flow. tenant_id and password_hash are admin or dedicated-endpoint only.
+    # `role` is accepted in the request body but only applied when the caller is an operator.
     name: Optional[str] = Field(default=None, min_length=1, max_length=255)
+    role: Optional[str] = Field(default=None, description=f"Admin-only. One of: {sorted(VALID_ROLES)}.")
+
+
+# Keep the old name as an alias so existing code referencing UserSelfUpdateRequest still works.
+UserSelfUpdateRequest = UserUpdateRequest
 
 
 @router.patch("/v1/users/{user_id}")
 async def update_user(
     user_id: str,
-    body: UserSelfUpdateRequest,
+    body: UserUpdateRequest,
     claims: AuthClaims = Depends(require_self_or_admin),
 ) -> Dict[str, Any]:
     """
-    Update own profile. Self-scoped: a user may only patch their own record.
+    Update a user profile. Self-scoped: a user may only patch their own record.
     Admins may patch any user.
 
-    Editable fields: name (email requires a separate verification flow;
-    tenant_id, role, password_hash are admin or dedicated-endpoint only).
+    Editable fields:
+      - name: all callers
+      - role: operator (admin service token or admin JWT) only; 403 for self-callers
     """
-    if body.name is None:
+    if body.role is not None and not claims.is_operator:
+        raise HTTPException(status_code=403, detail="Only admins may change role")
+
+    if body.role is not None and body.role not in VALID_ROLES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid role '{body.role}'. Must be one of: {_VALID_ROLES_LIST}",
+        )
+
+    if body.name is None and body.role is None:
         raise HTTPException(status_code=400, detail="No fields to update")
+
+    set_clauses: List[str] = ["updated_at = NOW()"]
+    args: List[Any] = []
+
+    if body.name is not None:
+        args.append(body.name)
+        set_clauses.append(f"name = ${len(args)}")
+
+    if body.role is not None:
+        args.append(body.role)
+        set_clauses.append(f"role = ${len(args)}")
+
+    args.append(uuid.UUID(user_id))
+    where_pos = len(args)
 
     pool = get_pool()
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
-            """
+            f"""
             UPDATE users
-               SET name = $1, updated_at = NOW()
-             WHERE id = $2
-         RETURNING id, email, name, tenant_id, created_at, updated_at
+               SET {", ".join(set_clauses)}
+             WHERE id = ${where_pos}
+         RETURNING id, email, name, tenant_id, role, created_at, updated_at
             """,
-            body.name,
-            uuid.UUID(user_id),
+            *args,
         )
     if not row:
         raise HTTPException(status_code=404, detail=f"User '{user_id}' not found")

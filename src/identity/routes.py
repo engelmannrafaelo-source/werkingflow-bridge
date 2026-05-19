@@ -47,6 +47,7 @@ def _user_dict(row: Any, licenses: List[Dict[str, Any]]) -> Dict[str, Any]:
         "email": row["email"],
         "name": row["name"],
         "tenantId": row["tenant_id"],
+        "role": row["role"],
         "appLicenses": licenses,
         "createdAt": row["created_at"].isoformat(),
         "updatedAt": row["updated_at"].isoformat(),
@@ -55,7 +56,7 @@ def _user_dict(row: Any, licenses: List[Dict[str, Any]]) -> Dict[str, Any]:
 
 async def _fetch_user_with_licenses(conn: Any, user_id: uuid.UUID) -> Optional[Dict[str, Any]]:
     row = await conn.fetchrow(
-        "SELECT id, email, name, tenant_id, created_at, updated_at FROM users WHERE id = $1",
+        "SELECT id, email, name, tenant_id, role, created_at, updated_at FROM users WHERE id = $1",
         user_id,
     )
     if not row:
@@ -87,7 +88,7 @@ async def login(body: LoginRequest) -> Dict[str, Any]:
     pool = get_pool()
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
-            "SELECT id, email, name, tenant_id, password_hash, created_at, updated_at FROM users WHERE email = $1",
+            "SELECT id, email, name, tenant_id, role, password_hash, created_at, updated_at FROM users WHERE email = $1",
             body.email,
         )
 
@@ -112,6 +113,7 @@ async def login(body: LoginRequest) -> Dict[str, Any]:
         email=row["email"],
         tenant_id=row["tenant_id"],
         app_licenses=app_licenses,
+        role=row["role"],
     )
 
     # Store session
