@@ -8,7 +8,24 @@ L0-Guard, App-Migration aller 5 Apps). Dieses Dokument hält die Befunde an der
 
 **Status Tracking-Säule:** fertig. Jeder `/v1/chat/completions`-Call wird self-geloggt
 (`ai_call_writer.persist_ai_call_activity`), der L0-Guard `ai_call_tracked` blockt
-ungetrackte Calls. **Status Naht zur Abrechnung:** vier Befunde, einer kritisch.
+ungetrackte Calls. **Status Naht zur Abrechnung:** ursprünglich vier Befunde, einer kritisch — siehe Status unten.
+
+---
+
+## Status 2026-05-19 — Befunde 1–4 aufgelöst
+
+Abschluss-Review des Call-Pfads: alle vier ursprünglichen Befunde sind
+adressiert. Die Detail-Abschnitte darunter bleiben als Historie stehen.
+
+| Befund | Status | Durch |
+|--------|--------|-------|
+| B1 — kein EUR-Betrag im self-log | erledigt | `e223fe7` — `costEur` wird in die Activity geschrieben |
+| B2 — keine Pricing-SSoT | erledigt | `e223fe7` — `src/pricing.py` als SSoT, Gate + Metrics lesen daraus |
+| B3 — Deduction nicht verdrahtet | erledigt | `e223fe7` — `persist_ai_call_activity` → `_deduct_call_cost` → `apply_budget_deduction` |
+| B4 — zwei parallele Budget-Systeme | entschärft | `d11e924` — toter per-Tenant-Gate aus dem Chat-Pfad entfernt; Chat hat einen Gate. `src/tenant`-Budget lebt nur noch read-only (`/v1/usage/status`) |
+
+Derselbe Review fand zwei **neue** Restpunkte → Befund 5 + 6 unten. Beides
+Genauigkeits-/Edge-Case-Themen, **kein Launch-Blocker**.
 
 ---
 
@@ -82,12 +99,44 @@ kein reiner Code-Fix.
 
 ---
 
+## Befund 5 — Streaming-Deduction läuft auf Schätz-Tokens
+
+Der Non-Streaming-Erfolgspfad (`main.py:2620`) übergibt `persist_ai_call_activity`
+echte `usage`-Tokens. Der **Streaming-Pfad (`main.py:1532`) übergibt
+`est_prompt_tokens`/`est_completion_tokens`** — Schätzwerte. Die Budget-Deduction
+für Streaming-Calls beruht damit auf einer Schätzung, nicht auf der echten
+Provider-Usage; `used_eur` driftet von den tatsächlichen Kosten ab.
+
+*Empfehlung:* die echte `usage` aus dem letzten Streaming-Chunk greifen
+(Anthropic liefert sie dort) und an `persist_ai_call_activity` durchreichen.
+Präzisions-Verbesserung, kein Funktionsfehler.
+
+---
+
+## Befund 6 — `deduct_budget` ist all-or-nothing — im Post-Call-Pfad falsch
+
+`src/budget/calculator.py:94`: übersteigt die Ist-Kost das Restbudget, wirft
+`deduct_budget` `BUDGET_EXCEEDED` und zieht **gar nichts** ab. Für den
+Pre-Call-Endpoint `/v1/budget/deduct` ist das korrekt — aber `e223fe7`
+verwendet dieselbe Funktion über `apply_budget_deduction` **post-call** wieder,
+nachdem der Call schon gelaufen ist.
+
+**Folge:** passieren mehrere Calls den Gate gleichzeitig (jeder sieht noch
+Restbudget), übersteigt der überzählige beim Abzug das Limit → `ValueError`
+→ in `_deduct_call_cost` abgefangen, geloggt, **kein Abzug**. Der Kunde hat den
+Call gratis; `used_eur` unterzählt. Begrenzt durch Concurrency (der Gate nutzt
+eine konservative `max_tokens`-Schätzung und blockt die nächste Runde) — also
+kein unbegrenztes Leck, aber real.
+
+*Empfehlung:* im Post-Call-Pfad gedeckelt abziehen (`used_eur` aufs Limit,
+Top-up auf 0 treiben) statt zu werfen. Der Call ist passiert — er muss bezahlt
+werden, soweit Budget da ist. All-or-nothing nur im Pre-Call-Endpoint behalten.
+
+---
+
 ## Reihenfolge für den Billing-Workstream
 
-1. **Befund 3 zuerst** — ohne Deduction ist das gesamte Budget-/Gate-System
-   funktional wirkungslos. Setzt Befund 2 (welches Pricing für die Kost?) und
-   Befund 4 (welches Budget wird abgezogen?) als Entscheidung voraus.
-2. **Befund 4** — Architektur-Entscheidung, welches Budget-System führt.
-3. **Befund 2** — Pricing-SSoT, danach Gate/Metrics/Deduction darauf umstellen.
-4. **Befund 1** — optional: Kost im self-log mitschreiben, sobald die SSoT steht
-   (dann ist die Activity self-contained, kein Nachrechnen mehr nötig).
+Befunde 1–4 erledigt (siehe Status oben). Offen, beide nicht dringend:
+
+1. **Befund 6** — Post-Call-Deduction deckeln. Kleiner, abgegrenzter Fix.
+2. **Befund 5** — echte Streaming-Usage greifen. Präzisions-Verbesserung.
