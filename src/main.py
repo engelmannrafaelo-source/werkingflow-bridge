@@ -418,6 +418,7 @@ try:
     from src.system.routes import router as system_router
     from src.impersonation.routes import router as impersonation_router
     from src.sandbox.routes import router as sandbox_router
+    from src.sandbox.conversation_routes import router as sandbox_conversations_router
     BRIDGE_DB_LAYER_AVAILABLE = True
 except Exception as _db_imp_err:
     BRIDGE_DB_LAYER_AVAILABLE = False
@@ -594,6 +595,7 @@ if BRIDGE_DB_LAYER_AVAILABLE and is_db_enabled():
     app.include_router(system_router)
     app.include_router(impersonation_router)
     app.include_router(sandbox_router)
+    app.include_router(sandbox_conversations_router)
     logger.info("✅ Bridge platform routes mounted: /v1/users /v1/auth /v1/budget /v1/billing /v1/activity")
 
 # Configure CORS
