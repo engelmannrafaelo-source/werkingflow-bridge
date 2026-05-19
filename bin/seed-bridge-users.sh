@@ -180,6 +180,7 @@ headers = {
 }
 default_tenant_id = '${DEFAULT_TENANT_ID}'
 ok = True
+existed = []
 
 for key, u in users.items():
     tenant_id = u.get('tenantId') or default_tenant_id
@@ -200,10 +201,21 @@ for key, u in users.items():
     if r.status_code == 201:
         print(f"  [ok]    Created: {key} ({u['email']}) → tenant={tenant_id}")
     elif r.status_code == 409:
-        print(f"  [ok]    Already exists (idempotent): {key} ({u['email']})")
+        # POST /v1/users is create-only. A 409 means the user pre-exists — its
+        # password and tenant are NOT reconciled with test-credentials.json.
+        # This is NOT a clean success: a pre-existing record with a divergent
+        # password will fail login. Report it honestly — never a silent [ok].
+        existed.append(key)
+        print(f"  [warn]  Exists — password/tenant NOT reconciled: {key} ({u['email']})")
     else:
         print(f"  [FAIL]  User {key}: HTTP {r.status_code} — {r.text}", file=sys.stderr)
         ok = False
+
+if existed:
+    print()
+    print(f"  {len(existed)} user(s) already existed and were left untouched.")
+    print(f"  If any cannot log in, the pre-existing Bridge record carries a")
+    print(f"  divergent password — purge that record and re-run this seeder.")
 
 sys.exit(0 if ok else 1)
 PYEOF
