@@ -327,6 +327,123 @@ PYEOF
 
 log_success "Verification passed"
 
+# ============================================================================
+# PHASE 5: BILLING PROVISION
+#
+# Per test user:
+#   1. POST /v1/billing/subscription/provision — active subscription (no Mollie)
+#   2. POST /v1/budget/topup/credit           — generous test credit
+#
+# Subscription provision is idempotent (existing active sub returned as-is).
+# Top-up is additive, not idempotent — calling the seeder multiple times adds
+# more credits, which is harmless in test environments.
+# ============================================================================
+phase_header 5 "BILLING PROVISION"
+
+python3 - <<PYEOF
+import json, sys, requests
+
+creds = json.load(open('${CREDENTIALS_JSON}'))
+users = creds.get('users', {})
+
+headers = {
+    'Content-Type': 'application/json',
+    'X-Bridge-Service-Token': '${BRIDGE_SERVICE_TOKEN}',
+}
+
+# One paid (non-trial) plan per app — must match src/budget/plans.py
+APP_PLANS = {
+    'werking-report':  'report-standard',
+    'werking-energy':  'energy-project',
+    'werking-safety':  'safety-project',
+    'werking-noise':   'noise-tbd',
+    'engelmann':       'engelmann-custom',
+}
+plan_id = APP_PLANS.get('${APP}')
+if not plan_id:
+    print(f"  [warn]  No plan configured for app '${APP}' — skipping billing provision")
+    sys.exit(0)
+
+# Pre-fetch user IDs (email -> id)
+user_ids = {}
+offset = 0
+while True:
+    try:
+        r = requests.get('${BRIDGE_URL}/v1/users',
+                         params={'limit': 200, 'offset': offset},
+                         headers=headers, timeout=15)
+    except requests.RequestException as e:
+        print(f"  [FAIL]  GET /v1/users failed: {e}", file=sys.stderr)
+        sys.exit(1)
+    if r.status_code != 200:
+        print(f"  [FAIL]  GET /v1/users HTTP {r.status_code}", file=sys.stderr)
+        sys.exit(1)
+    page = r.json()
+    if not page:
+        break
+    for x in page:
+        user_ids[x['email'].lower()] = x['id']
+    if len(page) < 200:
+        break
+    offset += 200
+
+TEST_TOPUP_EUR = 500.0  # generous test credit
+
+ok = True
+for key, u in users.items():
+    email = u['email'].lower()
+    uid = user_ids.get(email)
+    if not uid:
+        print(f"  [FAIL]  User {key} ({u['email']}): not found in Bridge — skipped", file=sys.stderr)
+        ok = False
+        continue
+
+    # 1. Provision active subscription
+    try:
+        r = requests.post(
+            '${BRIDGE_URL}/v1/billing/subscription/provision',
+            json={'userId': uid, 'planId': plan_id, 'seats': 1},
+            headers=headers,
+            timeout=15,
+        )
+    except requests.RequestException as e:
+        print(f"  [FAIL]  User {key}: provision request error — {e}", file=sys.stderr)
+        ok = False
+        continue
+
+    if r.status_code in (200, 201):
+        sub = r.json()
+        status = sub.get('status', '?')
+        print(f"  [ok]    Subscription {status} ({plan_id}): {key} ({u['email']})")
+    else:
+        print(f"  [FAIL]  User {key}: provision HTTP {r.status_code} — {r.text}", file=sys.stderr)
+        ok = False
+        continue
+
+    # 2. Top-up credit (additive — multiple seeds accumulate, harmless for tests)
+    try:
+        r = requests.post(
+            '${BRIDGE_URL}/v1/budget/topup/credit',
+            json={'userId': uid, 'amountEur': TEST_TOPUP_EUR},
+            headers=headers,
+            timeout=15,
+        )
+    except requests.RequestException as e:
+        print(f"  [FAIL]  User {key}: topup request error — {e}", file=sys.stderr)
+        ok = False
+        continue
+
+    if r.status_code == 200:
+        balance = r.json().get('newBalance', '?')
+        print(f"  [ok]    Top-up +EUR {TEST_TOPUP_EUR} → balance EUR {balance}: {key}")
+    else:
+        print(f"  [FAIL]  User {key}: topup HTTP {r.status_code} — {r.text}", file=sys.stderr)
+        ok = False
+
+sys.exit(0 if ok else 1)
+PYEOF
+log_success "Billing provisioned"
+
 echo ""
 printf "${GREEN}${BOLD}Bridge user seed complete — ${APP}${RESET}\n"
 echo ""
