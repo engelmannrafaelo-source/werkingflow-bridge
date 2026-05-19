@@ -224,22 +224,32 @@ creds = json.load(open('${CREDENTIALS_JSON}'))
 expected_emails = {u['email'] for u in creds.get('users', {}).values()}
 
 headers = {'X-Bridge-Service-Token': '${BRIDGE_SERVICE_TOKEN}'}
-try:
-    r = requests.get(
-        '${BRIDGE_URL}/v1/users',
-        params={'account_type': 'test'},
-        headers=headers,
-        timeout=15,
-    )
-except requests.RequestException as e:
-    print(f"  [FAIL]  GET /v1/users failed: {e}", file=sys.stderr)
-    sys.exit(1)
+found_emails = set()
+offset = 0
+page_size = 200
+while True:
+    try:
+        r = requests.get(
+            '${BRIDGE_URL}/v1/users',
+            params={'account_type': 'test', 'limit': page_size, 'offset': offset},
+            headers=headers,
+            timeout=15,
+        )
+    except requests.RequestException as e:
+        print(f"  [FAIL]  GET /v1/users failed: {e}", file=sys.stderr)
+        sys.exit(1)
 
-if r.status_code != 200:
-    print(f"  [FAIL]  GET /v1/users returned HTTP {r.status_code}: {r.text}", file=sys.stderr)
-    sys.exit(1)
+    if r.status_code != 200:
+        print(f"  [FAIL]  GET /v1/users returned HTTP {r.status_code}: {r.text}", file=sys.stderr)
+        sys.exit(1)
 
-found_emails = {u['email'] for u in r.json()}
+    page = r.json()
+    if not page:
+        break
+    found_emails.update(u['email'] for u in page)
+    if len(page) < page_size:
+        break
+    offset += page_size
 app_expected = expected_emails
 app_found    = app_expected & found_emails
 missing      = app_expected - found_emails
