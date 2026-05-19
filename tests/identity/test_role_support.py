@@ -403,6 +403,74 @@ class TestAdminUpdateUserRole:
         assert resp.status_code == 400
         assert "Invalid role" in resp.json()["detail"]
 
+
+# ---------------------------------------------------------------------------
+# Admin CRUD — update password (operator-only; used by the test-user seeder)
+# ---------------------------------------------------------------------------
+
+class TestAdminUpdateUserPassword:
+    def test_admin_can_update_password(self):
+        uid = str(uuid.uuid4())
+        pool = _make_pool_with_row(_db_row())
+        app = _make_admin_app("require_self_or_admin", _operator_claims())
+        client = TestClient(app)
+
+        with patch("src.db.admin_routes.get_pool", return_value=pool):
+            resp = client.patch(f"/v1/users/{uid}", json={"password": "NewSecret2026!"})
+
+        assert resp.status_code == 200
+
+    def test_password_is_bcrypt_hashed_never_stored_plain(self):
+        uid = str(uuid.uuid4())
+        conn = AsyncMock()
+        conn.fetchrow = AsyncMock(return_value=_db_row())
+        conn.execute = AsyncMock()
+
+        @asynccontextmanager
+        async def _acquire():
+            yield conn
+
+        pool = MagicMock()
+        pool.acquire = _acquire
+
+        app = _make_admin_app("require_self_or_admin", _operator_claims())
+        client = TestClient(app)
+
+        with patch("src.db.admin_routes.get_pool", return_value=pool):
+            resp = client.patch(f"/v1/users/{uid}", json={"password": "PlaintextSecret2026!"})
+
+        assert resp.status_code == 200
+        sql = conn.fetchrow.call_args[0][0]
+        args = conn.fetchrow.call_args[0][1:]
+        assert "password_hash" in sql
+        # The plaintext must never reach the DB; a bcrypt hash ($2...) does.
+        assert "PlaintextSecret2026!" not in args
+        assert any(isinstance(a, str) and a.startswith("$2") for a in args)
+
+    def test_non_admin_cannot_update_password(self):
+        uid = str(uuid.uuid4())
+        app = _make_admin_app("require_self_or_admin", _user_claims(uid))
+        client = TestClient(app)
+
+        resp = client.patch(f"/v1/users/{uid}", json={"password": "selfservice-secret"})
+
+        assert resp.status_code == 403
+        assert "password" in resp.json()["detail"].lower()
+
+    def test_password_and_name_together(self):
+        uid = str(uuid.uuid4())
+        pool = _make_pool_with_row(_db_row(name="Renamed"))
+        app = _make_admin_app("require_self_or_admin", _operator_claims())
+        client = TestClient(app)
+
+        with patch("src.db.admin_routes.get_pool", return_value=pool):
+            resp = client.patch(
+                f"/v1/users/{uid}",
+                json={"name": "Renamed", "password": "Secret2026!"},
+            )
+
+        assert resp.status_code == 200
+
     def test_no_fields_returns_400(self):
         uid = str(uuid.uuid4())
         app = _make_admin_app("require_self_or_admin", _operator_claims())

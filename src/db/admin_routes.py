@@ -7,7 +7,7 @@ Auth model:
   GET    /v1/users                               — admin only
   POST   /v1/users                               — admin only (creates accounts)
   GET    /v1/users/{user_id}                     — require_self_or_admin
-  PATCH  /v1/users/{user_id}                     — require_self_or_admin (name only)
+  PATCH  /v1/users/{user_id}                     — require_self_or_admin (name; role/password operator-only)
   GET    /v1/tenants                             — admin only
   POST   /v1/tenants                             — admin only
   PATCH  /v1/tenants/{tenant_id}                 — admin only
@@ -263,10 +263,15 @@ async def get_user(
 
 class UserUpdateRequest(BaseModel):
     # Only `name` is exposed for self-edit. Email requires a separate
-    # verification flow. tenant_id and password_hash are admin or dedicated-endpoint only.
-    # `role` is accepted in the request body but only applied when the caller is an operator.
+    # verification flow. `role` and `password` are operator-only — applied
+    # only when the caller is an admin / service token.
     name: Optional[str] = Field(default=None, min_length=1, max_length=255)
     role: Optional[str] = Field(default=None, description=f"Admin-only. One of: {sorted(VALID_ROLES)}.")
+    password: Optional[str] = Field(
+        default=None,
+        min_length=1,
+        description="Admin-only. Replaces the user's password (stored bcrypt-hashed).",
+    )
 
 
 # Keep the old name as an alias so existing code referencing UserSelfUpdateRequest still works.
@@ -286,9 +291,16 @@ async def update_user(
     Editable fields:
       - name: all callers
       - role: operator (admin service token or admin JWT) only; 403 for self-callers
+      - password: operator only; 403 for self-callers. Used by the test-user
+        seeder to reconcile a pre-existing account whose password has drifted
+        from test-credentials.json. Self-service password changes go through a
+        dedicated flow with old-password verification — not this endpoint.
     """
     if body.role is not None and not claims.is_operator:
         raise HTTPException(status_code=403, detail="Only admins may change role")
+
+    if body.password is not None and not claims.is_operator:
+        raise HTTPException(status_code=403, detail="Only admins may change a password")
 
     if body.role is not None and body.role not in VALID_ROLES:
         raise HTTPException(
@@ -296,7 +308,7 @@ async def update_user(
             detail=f"Invalid role '{body.role}'. Must be one of: {_VALID_ROLES_LIST}",
         )
 
-    if body.name is None and body.role is None:
+    if body.name is None and body.role is None and body.password is None:
         raise HTTPException(status_code=400, detail="No fields to update")
 
     set_clauses: List[str] = ["updated_at = NOW()"]
@@ -309,6 +321,10 @@ async def update_user(
     if body.role is not None:
         args.append(body.role)
         set_clauses.append(f"role = ${len(args)}")
+
+    if body.password is not None:
+        args.append(hash_password(body.password))
+        set_clauses.append(f"password_hash = ${len(args)}")
 
     args.append(uuid.UUID(user_id))
     where_pos = len(args)
