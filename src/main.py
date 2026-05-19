@@ -406,6 +406,7 @@ try:
     from src.db.client import init_pool, close_pool, is_db_enabled
     from src.db.admin_routes import router as admin_db_router
     from src.identity.routes import router as identity_router
+    from src.identity.self_service import router as self_service_router
     from src.budget.routes import router as budget_router
     from src.billing.routes import router as billing_router
     from src.activity.routes import router as activity_router
@@ -583,6 +584,7 @@ app = FastAPI(
 if BRIDGE_DB_LAYER_AVAILABLE and is_db_enabled():
     app.include_router(admin_db_router)
     app.include_router(identity_router)
+    app.include_router(self_service_router)
     app.include_router(budget_router)
     app.include_router(billing_router)
     app.include_router(activity_router)
