@@ -8,13 +8,18 @@ Auth model:
   POST   /v1/users                               — admin only (creates accounts)
   GET    /v1/users/{user_id}                     — require_self_or_admin
   PATCH  /v1/users/{user_id}                     — require_self_or_admin (name; role/password operator-only)
+  GET    /v1/users/{user_id}/stammdaten          — require_self_or_admin
+  PATCH  /v1/users/{user_id}/stammdaten          — require_self_or_admin
   GET    /v1/tenants                             — admin only
   POST   /v1/tenants                             — admin only
   PATCH  /v1/tenants/{tenant_id}                 — admin only
   GET    /v1/tenants/{tenant_id}/billing-address — self (own tenant) or admin
   PATCH  /v1/tenants/{tenant_id}/billing-address — self (own tenant) or admin
+  GET    /v1/tenants/{tenant_id}/stammdaten      — own-tenant member or admin
+  PATCH  /v1/tenants/{tenant_id}/stammdaten      — own-tenant tenant_admin role or operator
   GET    /v1/app-licenses?userId=                — require_self_or_admin (if userId given) else admin
 """
+import json
 import logging
 import uuid
 from datetime import datetime, timezone
@@ -25,7 +30,7 @@ from src.identity.password import hash_password
 from src.identity.jwt_utils import VALID_ROLES
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from pydantic import BaseModel, EmailStr, Field
+from pydantic import BaseModel, ConfigDict, EmailStr, Field
 
 from src.api_auth import require_admin, require_jwt_or_service, require_self_or_admin, AuthClaims, get_tenant_of_user
 from src.db.client import get_pool
@@ -687,3 +692,238 @@ async def list_app_licenses(
         }
         for r in rows
     ]
+
+
+# ---------------------------------------------------------------------------
+# Tenant stammdaten — Firmen-Identität (Bridge validiert Schema)
+#
+# GET:   any tenant member or operator
+# PATCH: tenant_admin role (or operator) — verhindert dass normaler Mitarbeiter
+#        Firmenadresse/Logo für alle ändert.
+# ---------------------------------------------------------------------------
+
+_TENANT_ADMIN_ROLES = frozenset({"tenant_admin", "admin", "super_admin"})
+
+
+async def _check_tenant_admin_role(claims: AuthClaims, tenant_id: str, conn: Any) -> None:
+    """
+    Raises 403 if the acting user is not a tenant_admin (or operator).
+    Must be called AFTER _check_tenant_access has confirmed tenant membership.
+    """
+    if claims.is_operator:
+        return
+
+    # Determine acting user and their role.
+    if claims.is_service and claims.acting_user_id is not None:
+        # Service proxy: look up role from DB.
+        row = await conn.fetchrow(
+            "SELECT role FROM users WHERE id = $1",
+            uuid.UUID(claims.acting_user_id),
+        )
+        if not row:
+            raise HTTPException(status_code=403, detail="Forbidden: acting user not found")
+        role = row["role"]
+    else:
+        # User JWT: role is in claims (may be None for legacy JWTs without role claim).
+        role = claims.role or "user"
+
+    if role not in _TENANT_ADMIN_ROLES:
+        raise HTTPException(
+            status_code=403,
+            detail="Forbidden: tenant_admin role required to update tenant stammdaten",
+        )
+
+
+class _AdresseField(BaseModel):
+    strasse: Optional[str] = Field(default=None, max_length=200)
+    hausnummer: Optional[str] = Field(default=None, max_length=20)
+    plz: Optional[str] = Field(default=None, max_length=10)
+    ort: Optional[str] = Field(default=None, max_length=200)
+
+
+class _FirmaField(BaseModel):
+    name: Optional[str] = Field(default=None, max_length=300)
+    rechtsform: Optional[str] = Field(default=None, max_length=100)
+    adresse: Optional[_AdresseField] = None
+
+
+class TenantStammdatenPatch(BaseModel):
+    firma: Optional[_FirmaField] = None
+    logo: Optional[str] = Field(
+        default=None,
+        max_length=2_097_152,  # ~1.5 MB base64; switch to a Blob endpoint if this stings
+        description="Opaker String — data-URI (Base64) oder URL",
+    )
+    styleSettings: Optional[Dict[str, Any]] = None
+
+
+def _jsonb(raw: Any) -> Dict[str, Any]:
+    """Normalise an asyncpg JSONB value — may arrive as str or dict."""
+    if isinstance(raw, str):
+        try:
+            return json.loads(raw) or {}
+        except Exception:
+            return {}
+    return raw or {}
+
+
+def _tenant_stammdaten_row(r: Any) -> Dict[str, Any]:
+    return {
+        "firma": _jsonb(r["firma"]),
+        "logo": r["logo"],
+        "styleSettings": _jsonb(r["style_settings"]),
+        "updatedAt": r["updated_at"].isoformat() if r["updated_at"] else None,
+        "updatedBy": str(r["updated_by"]) if r["updated_by"] else None,
+    }
+
+
+_TENANT_STAMMDATEN_DEFAULT: Dict[str, Any] = {
+    "firma": {},
+    "logo": None,
+    "styleSettings": {},
+    "updatedAt": None,
+    "updatedBy": None,
+}
+
+
+@router.get("/v1/tenants/{tenant_id}/stammdaten")
+async def get_tenant_stammdaten(
+    tenant_id: str,
+    claims: AuthClaims = Depends(require_jwt_or_service),
+) -> Dict[str, Any]:
+    await _check_tenant_access(claims, tenant_id)
+
+    pool = get_pool()
+    async with pool.acquire() as conn:
+        r = await conn.fetchrow(
+            "SELECT firma, logo, style_settings, updated_at, updated_by FROM tenant_stammdaten WHERE tenant_id = $1",
+            tenant_id,
+        )
+    if not r:
+        return dict(_TENANT_STAMMDATEN_DEFAULT)
+    return _tenant_stammdaten_row(r)
+
+
+@router.patch("/v1/tenants/{tenant_id}/stammdaten")
+async def patch_tenant_stammdaten(
+    tenant_id: str,
+    body: TenantStammdatenPatch,
+    claims: AuthClaims = Depends(require_jwt_or_service),
+) -> Dict[str, Any]:
+    pool = get_pool()
+    async with pool.acquire() as conn:
+        await _check_tenant_access(claims, tenant_id)
+        await _check_tenant_admin_role(claims, tenant_id, conn)
+
+        # Verify tenant exists — fail loud.
+        t = await conn.fetchval("SELECT 1 FROM tenants WHERE id = $1", tenant_id)
+        if not t:
+            raise HTTPException(status_code=404, detail=f"Tenant '{tenant_id}' not found")
+
+        actor_id = uuid.UUID(claims.acting_user_id) if claims.acting_user_id else None
+
+        # Build the upsert with merge semantics per field.
+        # Only fields present in the request body change; absent fields keep their current value.
+        firma_json = (
+            json.dumps(body.firma.model_dump(exclude_none=True)) if body.firma is not None else None
+        )
+        style_json = (
+            json.dumps(body.styleSettings) if body.styleSettings is not None else None
+        )
+
+        # We need COALESCE(existing, '{}') || patch for merge — done in SQL.
+        sets = ["updated_at = NOW()", "updated_by = $1"]
+        args: List[Any] = [actor_id]
+
+        if firma_json is not None:
+            args.append(firma_json)
+            sets.append(f"firma = COALESCE(firma, '{{}}'::jsonb) || ${len(args)}::jsonb")
+        if body.logo is not None:
+            args.append(body.logo)
+            sets.append(f"logo = ${len(args)}")
+        if style_json is not None:
+            args.append(style_json)
+            sets.append(f"style_settings = COALESCE(style_settings, '{{}}'::jsonb) || ${len(args)}::jsonb")
+
+        args.append(tenant_id)
+        tenant_pos = len(args)
+
+        r = await conn.fetchrow(
+            f"""
+            INSERT INTO tenant_stammdaten (tenant_id, firma, logo, style_settings, updated_at, updated_by)
+            VALUES (${tenant_pos}, '{{}}'::jsonb, NULL, '{{}}'::jsonb, NOW(), $1)
+            ON CONFLICT (tenant_id) DO UPDATE SET {", ".join(sets)}
+            RETURNING firma, logo, style_settings, updated_at, updated_by
+            """,
+            *args,
+        )
+    return _tenant_stammdaten_row(r)
+
+
+# ---------------------------------------------------------------------------
+# User stammdaten — Gutachter-Identität (opaker JSONB-Blob)
+#
+# Bridge speichert, werking-report validiert das Schema.
+# Keine tiefe Feld-Validierung hier — nur "ist ein Objekt, vernünftige Größe".
+# ---------------------------------------------------------------------------
+
+_USER_STAMMDATEN_MAX_KEYS = 100  # sanity guard against pathological payloads
+
+
+class UserStammdatenPatch(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+
+def _user_stammdaten_row(r: Any) -> Dict[str, Any]:
+    data = _jsonb(r["data"])
+    result = dict(data)
+    result["updatedAt"] = r["updated_at"].isoformat() if r["updated_at"] else None
+    return result
+
+
+@router.get("/v1/users/{user_id}/stammdaten")
+async def get_user_stammdaten(
+    user_id: str,
+    claims: AuthClaims = Depends(require_self_or_admin),
+) -> Dict[str, Any]:
+    pool = get_pool()
+    async with pool.acquire() as conn:
+        r = await conn.fetchrow(
+            "SELECT data, updated_at FROM user_stammdaten WHERE user_id = $1",
+            uuid.UUID(user_id),
+        )
+    if not r:
+        return {"updatedAt": None}
+    return _user_stammdaten_row(r)
+
+
+@router.patch("/v1/users/{user_id}/stammdaten")
+async def patch_user_stammdaten(
+    user_id: str,
+    body: UserStammdatenPatch,
+    claims: AuthClaims = Depends(require_self_or_admin),
+) -> Dict[str, Any]:
+    patch_data = body.model_dump()
+    if len(patch_data) > _USER_STAMMDATEN_MAX_KEYS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Too many fields in stammdaten patch (max {_USER_STAMMDATEN_MAX_KEYS})",
+        )
+
+    patch_json = json.dumps(patch_data)
+
+    pool = get_pool()
+    async with pool.acquire() as conn:
+        r = await conn.fetchrow(
+            """
+            INSERT INTO user_stammdaten (user_id, data, updated_at)
+            VALUES ($1, $2::jsonb, NOW())
+            ON CONFLICT (user_id) DO UPDATE
+              SET data = COALESCE(user_stammdaten.data, '{}'::jsonb) || EXCLUDED.data,
+                  updated_at = NOW()
+            RETURNING data, updated_at
+            """,
+            uuid.UUID(user_id),
+            patch_json,
+        )
+    return _user_stammdaten_row(r)
