@@ -5,7 +5,9 @@ Mounted under /v1/auth — only active when BRIDGE_DB_URL is set.
 POST /v1/auth/login   {email, password} -> {jwt, user, appLicenses[]}   PUBLIC
 POST /v1/auth/logout  Bearer <jwt> -> 204                              require_jwt
 GET  /v1/auth/session Bearer <jwt> -> {user, appLicenses[]}            require_jwt
+POST /v1/auth/issue   X-Bridge-Service-Token {userId} -> {jwt, expiresAt}  require_service_token
 """
+import logging
 import uuid
 from datetime import datetime, timezone, timedelta
 from typing import Any, Dict, List, Optional
@@ -16,7 +18,7 @@ from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi import Security
 from pydantic import BaseModel, EmailStr
 
-from src.api_auth import require_jwt, AuthClaims
+from src.api_auth import require_jwt, require_service_token, AuthClaims
 from src.db.client import get_pool
 from src.identity.password import verify_password
 from src.identity.jwt_utils import sign_jwt, verify_jwt
@@ -25,6 +27,8 @@ router = APIRouter(prefix="/v1/auth", tags=["auth"])
 _bearer = HTTPBearer(auto_error=False)
 
 _SESSION_TTL_HOURS = 8
+
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -193,3 +197,70 @@ async def get_session(
         raise HTTPException(status_code=404, detail="User not found")
 
     return {"user": user, "appLicenses": user["appLicenses"]}
+
+
+# ---------------------------------------------------------------------------
+# POST /v1/auth/issue  — service-token -> user-scoped JWT
+#
+# Lets a trusted internal service (the agent-sandbox daemon, authenticated by
+# X-Bridge-Service-Token) mint a user-scoped JWT WITHOUT the user's password.
+# This is how a sandbox session is bound to a real Bridge user: the daemon
+# requests a JWT for its configured user id and carries it as the session
+# identity. Never exposed to end users. Every issuance is audit-logged.
+# ---------------------------------------------------------------------------
+
+class IssueTokenRequest(BaseModel):
+    userId: uuid.UUID
+
+
+@router.post("/issue")
+async def issue_token(
+    body: IssueTokenRequest,
+    _claims: AuthClaims = Depends(require_service_token),
+) -> Dict[str, Any]:
+    """
+    Issue a user-scoped JWT for `userId`. Service-token auth only.
+
+    Fails loud: raises 404 if the user does not exist — there is no anonymous
+    or fallback identity. The caller must hold a real, provisioned user id.
+    """
+    pool = get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT id, email, name, tenant_id, created_at, updated_at FROM users WHERE id = $1",
+            body.userId,
+        )
+        if not row:
+            raise HTTPException(status_code=404, detail=f"User {body.userId} not found")
+        license_rows = await conn.fetch(
+            "SELECT app_id, plan_id, start_date, end_date, seats FROM app_licenses WHERE user_id = $1",
+            body.userId,
+        )
+
+    app_licenses = [_license_row(lr) for lr in license_rows]
+
+    token = sign_jwt(
+        user_id=str(row["id"]),
+        email=row["email"],
+        tenant_id=row["tenant_id"],
+        app_licenses=app_licenses,
+    )
+
+    now = datetime.now(timezone.utc)
+    expires_at = now + timedelta(hours=_SESSION_TTL_HOURS)
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO sessions (user_id, token, created_at, expires_at) VALUES ($1, $2, $3, $4)",
+            row["id"],
+            token,
+            now,
+            expires_at,
+        )
+
+    logger.info(
+        "identity.issue: minted service JWT user_id=%s tenant_id=%s expires_at=%s",
+        row["id"],
+        row["tenant_id"],
+        expires_at.isoformat(),
+    )
+    return {"jwt": token, "expiresAt": expires_at.isoformat()}
