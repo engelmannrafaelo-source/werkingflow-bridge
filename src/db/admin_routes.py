@@ -8,6 +8,7 @@ Auth model:
   POST   /v1/users                               — admin only (creates accounts)
   GET    /v1/users/{user_id}                     — require_self_or_admin
   PATCH  /v1/users/{user_id}                     — require_self_or_admin (name; role/password operator-only)
+  DELETE /v1/users/{user_id}                     — admin only (hard delete, refuses on billing-record FK)
   GET    /v1/users/{user_id}/stammdaten          — require_self_or_admin
   PATCH  /v1/users/{user_id}/stammdaten          — require_self_or_admin
   GET    /v1/tenants                             — admin only
@@ -348,6 +349,54 @@ async def update_user(
     if not row:
         raise HTTPException(status_code=404, detail=f"User '{user_id}' not found")
     return _user_row_to_dict(row)
+
+
+# ---------------------------------------------------------------------------
+# Admin: hard-delete a user
+# ---------------------------------------------------------------------------
+
+@router.delete("/v1/users/{user_id}", status_code=204)
+async def delete_user(
+    user_id: str,
+    _claims: AuthClaims = Depends(require_admin),
+) -> None:
+    """
+    Hard-delete a user. Admin only (admin JWT or service token without X-User-ID).
+
+    Schema cascades take care of dependent data:
+      app_licenses, sessions, mollie_customers, pending_payments, user_budgets,
+      user_topup_balances → ON DELETE CASCADE.
+      tenants.owner_user_id → ON DELETE SET NULL.
+
+    Refuses with 409 when the user still owns billing records that must survive
+    for audit reasons:
+      subscriptions      → ON DELETE RESTRICT
+      credit_purchases   → ON DELETE RESTRICT
+    Cancel / refund those first, then retry.
+
+    Returns 204 on success, 404 if the user does not exist.
+    """
+    try:
+        uid = uuid.UUID(user_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid userId (must be UUID)")
+
+    pool = get_pool()
+    try:
+        async with pool.acquire() as conn:
+            result = await conn.execute("DELETE FROM users WHERE id = $1", uid)
+    except asyncpg.ForeignKeyViolationError:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"User '{user_id}' has billing records (subscriptions or "
+                f"credit_purchases) that block deletion. Cancel/refund first."
+            ),
+        )
+
+    # asyncpg returns 'DELETE N' — N=0 means the row was not there.
+    if not result.endswith(" 1"):
+        raise HTTPException(status_code=404, detail=f"User '{user_id}' not found")
 
 
 # ---------------------------------------------------------------------------

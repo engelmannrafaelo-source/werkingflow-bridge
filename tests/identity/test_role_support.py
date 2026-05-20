@@ -36,10 +36,12 @@ try:
 except ImportError:
     _asyncpg_stub = MagicMock()
     _asyncpg_stub.UniqueViolationError = type("UniqueViolationError", (Exception,), {})
+    _asyncpg_stub.ForeignKeyViolationError = type("ForeignKeyViolationError", (Exception,), {})
     _asyncpg_stub.PostgresError = type("PostgresError", (Exception,), {})
     _asyncpg_stub.Connection = MagicMock
     sys.modules["asyncpg"] = _asyncpg_stub
 
+import asyncpg
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
@@ -479,3 +481,78 @@ class TestAdminUpdateUserPassword:
         resp = client.patch(f"/v1/users/{uid}", json={})
 
         assert resp.status_code == 400
+
+
+# ---------------------------------------------------------------------------
+# Admin CRUD — DELETE /v1/users/{user_id} (hard delete)
+# ---------------------------------------------------------------------------
+
+def _delete_pool(execute_return: str = "DELETE 1", execute_raises=None):
+    """Pool whose conn.execute either returns a 'DELETE N' string or raises."""
+    conn = AsyncMock()
+    if execute_raises is not None:
+        conn.execute = AsyncMock(side_effect=execute_raises)
+    else:
+        conn.execute = AsyncMock(return_value=execute_return)
+
+    @asynccontextmanager
+    async def _acquire():
+        yield conn
+
+    pool = MagicMock()
+    pool.acquire = _acquire
+    return pool, conn
+
+
+class TestAdminDeleteUser:
+    def test_admin_can_delete_user(self):
+        uid = str(uuid.uuid4())
+        pool, conn = _delete_pool(execute_return="DELETE 1")
+
+        app = _make_admin_app("require_admin", _operator_claims())
+        client = TestClient(app)
+
+        with patch("src.db.admin_routes.get_pool", return_value=pool):
+            resp = client.delete(f"/v1/users/{uid}")
+
+        assert resp.status_code == 204
+        sql = conn.execute.call_args[0][0]
+        assert "DELETE FROM users" in sql
+
+    def test_unknown_user_returns_404(self):
+        uid = str(uuid.uuid4())
+        pool, _ = _delete_pool(execute_return="DELETE 0")
+
+        app = _make_admin_app("require_admin", _operator_claims())
+        client = TestClient(app)
+
+        with patch("src.db.admin_routes.get_pool", return_value=pool):
+            resp = client.delete(f"/v1/users/{uid}")
+
+        assert resp.status_code == 404
+
+    def test_invalid_uuid_returns_400(self):
+        app = _make_admin_app("require_admin", _operator_claims())
+        client = TestClient(app)
+
+        resp = client.delete("/v1/users/not-a-uuid")
+
+        assert resp.status_code == 400
+        assert "UUID" in resp.json()["detail"]
+
+    def test_fk_restrict_returns_409(self):
+        """User with subscriptions / credit_purchases must not be deletable."""
+        uid = str(uuid.uuid4())
+        fk_err = asyncpg.ForeignKeyViolationError(
+            "update or delete on table \"users\" violates foreign key constraint"
+        )
+        pool, _ = _delete_pool(execute_raises=fk_err)
+
+        app = _make_admin_app("require_admin", _operator_claims())
+        client = TestClient(app)
+
+        with patch("src.db.admin_routes.get_pool", return_value=pool):
+            resp = client.delete(f"/v1/users/{uid}")
+
+        assert resp.status_code == 409
+        assert "billing" in resp.json()["detail"].lower()
