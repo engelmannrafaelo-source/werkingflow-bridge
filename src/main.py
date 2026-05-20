@@ -3027,16 +3027,60 @@ async def chat_completions(
 
 
 # ============================================================================
-# Async research jobs
+# Async research jobs — Filesystem-backed state
 # ----------------------------------------------------------------------------
-# In-memory store for /v1/research jobs running in async_mode. Survives only
-# within a single worker process — if the container restarts, queued/running
-# jobs are lost and the client must retry. Acceptable for the WerkING Check
-# use case (single-shot pipeline, idempotent at the consumer side).
+# Job state lives as JSON files under /app/instances/_async_jobs/ which is
+# mounted from the SHARED `wt-wrapper-instances-shared` named volume. That
+# means any worker can read any other worker's job state — required because
+# the nginx Lua router picks the worker per request based on rate-limit pool
+# capacity, NOT request_id; the POST and the matching GETs routinely land on
+# different containers.
+#
+# Atomicity: writes go to a temp file in the same directory and rename to the
+# final path (POSIX rename is atomic on the same filesystem). Readers either
+# see the previous content or the new content, never a half-written file.
+#
+# Container restart: in-flight running jobs are LOST (the asyncio task dies).
+# The status file is then orphaned at status='running' until cleanup. The
+# client side handles this by surfacing a stale 'running' for the TTL window
+# and then the cleanup task removes the file; next poll returns 404. The
+# WerkING Check consumer treats 404 as "retry the upload" — acceptable
+# trade-off for not needing a Redis / Postgres dependency just for state.
 # ============================================================================
 
-RESEARCH_JOBS: Dict[str, Dict[str, Any]] = {}
 RESEARCH_JOB_TTL_SECONDS = 2 * 60 * 60  # 2h
+RESEARCH_JOBS_DIR = Path(
+    os.environ.get("RESEARCH_JOBS_DIR")
+    or (Path(os.environ.get("INSTANCES_DIR") or "/app/instances") / "_async_jobs")
+)
+
+
+def _research_job_path(job_id: str) -> Path:
+    # Defensive — job_id is a uuid4().hex so this should never trip, but a
+    # malformed value would otherwise let a caller traverse out of the jobs dir.
+    if not job_id or "/" in job_id or "\\" in job_id or job_id.startswith("."):
+        raise ValueError(f"Invalid research job id: {job_id!r}")
+    return RESEARCH_JOBS_DIR / f"{job_id}.json"
+
+
+def _save_research_job(job_id: str, payload: Dict[str, Any]) -> None:
+    """Atomic write: tmp file + rename. Idempotent — overwrites any prior state."""
+    RESEARCH_JOBS_DIR.mkdir(parents=True, exist_ok=True)
+    final_path = _research_job_path(job_id)
+    tmp_path = final_path.with_suffix(f".tmp.{os.getpid()}")
+    tmp_path.write_text(json.dumps(payload, default=str), encoding="utf-8")
+    os.replace(tmp_path, final_path)
+
+
+def _load_research_job(job_id: str) -> Optional[Dict[str, Any]]:
+    path = _research_job_path(job_id)
+    if not path.exists():
+        return None
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as e:
+        logger.warning(f"⚠️ Could not read research job {job_id}: {e}")
+        return None
 
 
 async def _execute_research_impl(
@@ -3289,49 +3333,65 @@ async def _run_async_research_job(
     backend_config: Optional[BackendConfig],
     job_id: str,
 ) -> None:
-    """Background runner that stores ResearchResponse into RESEARCH_JOBS[job_id]."""
-    started_at = RESEARCH_JOBS.get(job_id, {}).get("started_at", time.time())
+    """Background runner that stores ResearchResponse as a JSON file in the
+    shared async-jobs directory. Any worker can read it back."""
+    prior = _load_research_job(job_id) or {}
+    started_at = prior.get("started_at") or time.time()
     try:
         result = await _execute_research_impl(request_body, backend_config)
-        RESEARCH_JOBS[job_id] = {
+        _save_research_job(job_id, {
             "status": "done" if result.status == "success" else "error",
             "started_at": started_at,
             "finished_at": time.time(),
             "result": result.model_dump(),
-        }
+        })
         logger.info(f"📦 Async research job {job_id} finished: {result.status}")
     except WorkerUnavailableError as e:
-        RESEARCH_JOBS[job_id] = {
+        _save_research_job(job_id, {
             "status": "error",
             "started_at": started_at,
             "finished_at": time.time(),
             "error": f"Worker unavailable: {e}",
-        }
+        })
         logger.warning(f"⚠️ Async research job {job_id} hit WorkerUnavailable: {e}")
     except Exception as e:
-        RESEARCH_JOBS[job_id] = {
+        _save_research_job(job_id, {
             "status": "error",
             "started_at": started_at,
             "finished_at": time.time(),
             "error": str(e),
-        }
+        })
         logger.error(f"❌ Async research job {job_id} crashed: {e}", exc_info=True)
 
 
 async def _cleanup_old_research_jobs() -> None:
-    """Periodically remove RESEARCH_JOBS entries older than RESEARCH_JOB_TTL_SECONDS."""
+    """Periodically remove stale research-job state files (older than TTL).
+
+    Runs in every worker — they all share the same directory, so any worker
+    can do the cleanup. unlink() on a missing file is tolerated (another
+    worker may have removed it concurrently)."""
     while True:
         try:
             await asyncio.sleep(30 * 60)  # every 30 min
+            if not RESEARCH_JOBS_DIR.exists():
+                continue
             now = time.time()
-            stale = [
-                jid for jid, job in RESEARCH_JOBS.items()
-                if (job.get("finished_at") or job.get("started_at", now)) < now - RESEARCH_JOB_TTL_SECONDS
-            ]
-            for jid in stale:
-                RESEARCH_JOBS.pop(jid, None)
-            if stale:
-                logger.info(f"🧹 Cleaned up {len(stale)} stale research jobs")
+            removed = 0
+            for path in RESEARCH_JOBS_DIR.glob("*.json"):
+                try:
+                    mtime = path.stat().st_mtime
+                except FileNotFoundError:
+                    continue
+                if mtime < now - RESEARCH_JOB_TTL_SECONDS:
+                    try:
+                        path.unlink()
+                        removed += 1
+                    except FileNotFoundError:
+                        pass
+                    except OSError as e:
+                        logger.warning(f"⚠️ Could not unlink stale job {path.name}: {e}")
+            if removed:
+                logger.info(f"🧹 Cleaned up {removed} stale research jobs")
         except asyncio.CancelledError:
             raise
         except Exception as e:
@@ -3442,11 +3502,11 @@ async def research(
     # Caller polls GET /v1/research/async/{request_id} for the result.
     if request_body.async_mode:
         job_id = uuid.uuid4().hex
-        RESEARCH_JOBS[job_id] = {
+        _save_research_job(job_id, {
             "status": "running",
             "started_at": time.time(),
             "query": request_body.query[:100],
-        }
+        })
         asyncio.create_task(_run_async_research_job(request_body, backend_config, job_id))
         logger.info(f"📨 Async research job {job_id} dispatched (query: {request_body.query[:60]!r})")
         return ResearchResponse(
@@ -3476,11 +3536,15 @@ async def get_async_research_status(
     """
     await verify_api_key(request, credentials)
 
-    job = RESEARCH_JOBS.get(request_id)
+    try:
+        job = _load_research_job(request_id)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
     if not job:
         raise HTTPException(
             status_code=404,
-            detail=f"Async research job not found (unknown id, worker restarted, or expired): {request_id}",
+            detail=f"Async research job not found (unknown id, or expired): {request_id}",
         )
 
     status = job.get("status", "running")
