@@ -371,7 +371,7 @@ async def billing_sub_change(
         raise HTTPException(status_code=400, detail=str(e))
 
 
-@router.post("/{user_id}/subscriptions/{sub_id}/cancel", status_code=204)
+@router.post("/{user_id}/subscriptions/{sub_id}/cancel", status_code=204, response_class=Response)
 async def billing_cancel_sub(
     user_id: str,
     sub_id: str,
