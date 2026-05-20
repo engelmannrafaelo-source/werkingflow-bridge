@@ -12,7 +12,7 @@ from datetime import datetime, timezone, timedelta
 from typing import Any, Dict, List, Optional
 
 import jwt
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi import Security
 from pydantic import BaseModel, EmailStr
@@ -221,7 +221,7 @@ async def test_token(
 # POST /v1/auth/logout
 # ---------------------------------------------------------------------------
 
-@router.post("/logout", status_code=204)
+@router.post("/logout", status_code=204, response_class=Response)
 async def logout(
     credentials: Optional[HTTPAuthorizationCredentials] = Security(_bearer),
     _claims: AuthClaims = Depends(require_jwt),
