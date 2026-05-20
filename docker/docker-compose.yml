@@ -391,10 +391,18 @@ networks:
     name: docker_bridge-prod-net
 
 volumes:
+  # Fixed volume names — independent of the compose project name. Without an
+  # explicit `name:` field, docker prefixes the volume with the current
+  # project (basename of cwd), so running compose from /root/werkingflow-bridge/
+  # vs /root/werkingflow-bridge/docker/ produced two separate volume sets
+  # (docker_eco-wrapper-logs vs werkingflow-bridge_eco-wrapper-logs). Locking
+  # the name makes the data the source of truth, not the cwd.
   wt-wrapper-logs:
     driver: local
+    name: wt-wrapper-logs
   wt-wrapper-instances-shared:
     driver: local
+    name: wt-wrapper-instances-shared
 
 secrets:
   claude_token_1:
