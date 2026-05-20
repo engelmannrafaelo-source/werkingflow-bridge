@@ -137,7 +137,7 @@ Multipart fields:
 Build:
 
 ```bash
-docker build -f docker/Dockerfile.privacy-pdf -t eco-privacy-pdf-service .
+docker build -f docker/Dockerfile.privacy-pdf -t wt-privacy-pdf-service .
 ```
 
 The image installs `libreoffice-{core,writer,impress,calc}` for Office

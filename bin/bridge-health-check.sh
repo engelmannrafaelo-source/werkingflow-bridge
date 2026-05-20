@@ -65,7 +65,7 @@ else
         *)
             local_ts="$(date -Is)"
             log "TRANSITION healthy → unhealthy at ${local_ts}"
-            send_alert "Bridge health: UNHEALTHY" "Hetzner bridge is failing one of /health, /v1/db/health, /v1/models. Last probe at ${local_ts}. Check container status: docker ps --filter name=eco-wrapper"
+            send_alert "Bridge health: UNHEALTHY" "Hetzner bridge is failing one of /health, /v1/db/health, /v1/models. Last probe at ${local_ts}. Check container status: docker ps --filter name=wt-wrapper"
             echo "unhealthy:${local_ts}" > "${STATE_FILE}"
             ;;
     esac

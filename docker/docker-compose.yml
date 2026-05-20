@@ -6,7 +6,7 @@ services:
     build:
       context: ..
       dockerfile: docker/Dockerfile.nginx-lb
-    container_name: eco-wrapper-lb
+    container_name: wt-wrapper-lb
     ports:
       - "8000:80"      # Primary API
       - "8010:80"      # eco-backend compatibility
@@ -40,7 +40,7 @@ services:
     build:
       context: ..
       dockerfile: docker/Dockerfile.worker
-    container_name: eco-wrapper-worker1
+    container_name: wt-wrapper-worker1
     expose:
       - "8000"
     deploy:
@@ -51,8 +51,8 @@ services:
           memory: 1G
     volumes:
       - /root/werkingflow-bridge/secrets:/app/secrets:ro
-      - eco-wrapper-logs:/app/logs
-      - eco-wrapper-instances-shared:/app/instances
+      - wt-wrapper-logs:/app/logs
+      - wt-wrapper-instances-shared:/app/instances
       - ~/eco-research-output:/app/research_output
       - /root/.claude/commands/sc:/home/claude/.claude/commands/sc:ro
       - /root/.claude/agents:/home/claude/.claude/agents:ro
@@ -108,7 +108,7 @@ services:
     build:
       context: ..
       dockerfile: docker/Dockerfile.worker
-    container_name: eco-wrapper-worker2
+    container_name: wt-wrapper-worker2
     expose:
       - "8000"
     deploy:
@@ -119,8 +119,8 @@ services:
           memory: 1G
     volumes:
       - /root/werkingflow-bridge/secrets:/app/secrets:ro
-      - eco-wrapper-logs:/app/logs
-      - eco-wrapper-instances-shared:/app/instances
+      - wt-wrapper-logs:/app/logs
+      - wt-wrapper-instances-shared:/app/instances
       - ~/eco-research-output:/app/research_output
       - /root/.claude/commands/sc:/home/claude/.claude/commands/sc:ro
       - /root/.claude/agents:/home/claude/.claude/agents:ro
@@ -176,7 +176,7 @@ services:
     build:
       context: ..
       dockerfile: docker/Dockerfile.worker
-    container_name: eco-wrapper-worker3
+    container_name: wt-wrapper-worker3
     expose:
       - "8000"
     deploy:
@@ -187,8 +187,8 @@ services:
           memory: 1G
     volumes:
       - /root/werkingflow-bridge/secrets:/app/secrets:ro
-      - eco-wrapper-logs:/app/logs
-      - eco-wrapper-instances-shared:/app/instances
+      - wt-wrapper-logs:/app/logs
+      - wt-wrapper-instances-shared:/app/instances
       - ~/eco-research-output:/app/research_output
       - /root/.claude/commands/sc:/home/claude/.claude/commands/sc:ro
       - /root/.claude/agents:/home/claude/.claude/agents:ro
@@ -244,7 +244,7 @@ services:
     build:
       context: ..
       dockerfile: docker/Dockerfile.worker
-    container_name: eco-wrapper-worker4
+    container_name: wt-wrapper-worker4
     expose:
       - "8000"
     deploy:
@@ -255,8 +255,8 @@ services:
           memory: 1G
     volumes:
       - /root/werkingflow-bridge/secrets:/app/secrets:ro
-      - eco-wrapper-logs:/app/logs
-      - eco-wrapper-instances-shared:/app/instances
+      - wt-wrapper-logs:/app/logs
+      - wt-wrapper-instances-shared:/app/instances
       - ~/eco-research-output:/app/research_output
       - /root/.claude/commands/sc:/home/claude/.claude/commands/sc:ro
       - /root/.claude/agents:/home/claude/.claude/agents:ro
@@ -312,7 +312,7 @@ services:
     build:
       context: ..
       dockerfile: docker/Dockerfile.privacy-pdf
-    container_name: eco-privacy-pdf-service
+    container_name: wt-privacy-pdf-service
     expose:
       - "8100"
     deploy:
@@ -355,7 +355,7 @@ services:
     build:
       context: ..
       dockerfile: docker/Dockerfile.metrics-reader
-    container_name: eco-wrapper-metrics-reader
+    container_name: wt-wrapper-metrics-reader
     expose:
       - "8000"
     deploy:
@@ -366,7 +366,7 @@ services:
           memory: 256M
     volumes:
       # READ-ONLY mount — reader must never write to the metrics volume.
-      - eco-wrapper-logs:/app/logs:ro
+      - wt-wrapper-logs:/app/logs:ro
     environment:
       - METRICS_DIR=/app/logs
       - LOG_LEVEL=INFO
@@ -391,9 +391,9 @@ networks:
     name: docker_bridge-prod-net
 
 volumes:
-  eco-wrapper-logs:
+  wt-wrapper-logs:
     driver: local
-  eco-wrapper-instances-shared:
+  wt-wrapper-instances-shared:
     driver: local
 
 secrets:

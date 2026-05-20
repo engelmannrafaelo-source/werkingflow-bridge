@@ -42,9 +42,9 @@ Die Bridge läuft mit **2 Workern + nginx Load Balancer**:
 
 | Container | Funktion |
 |-----------|----------|
-| `eco-wrapper-lb` | nginx Load Balancer |
-| `eco-wrapper-worker1` | Worker mit Account 1 Token |
-| `eco-wrapper-worker2` | Worker mit Account 3 Token |
+| `wt-wrapper-lb` | nginx Load Balancer |
+| `wt-wrapper-worker1` | Worker mit Account 1 Token |
+| `wt-wrapper-worker2` | Worker mit Account 3 Token |
 
 ### KRITISCH: Nur Multi-Worker Config verwenden!
 

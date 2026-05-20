@@ -35,14 +35,14 @@ SKIP_DIST_TEST="${SKIP_DIST_TEST:-false}"  # escape hatch: SKIP_DIST_TEST=true b
 MIN_FREE_KB=$(( 5 * 1024 * 1024 ))  # 5 GB in KiB
 
 # Hetzner: service → container name
-HETZNER_SVC_nginx="eco-wrapper-lb"
-HETZNER_SVC_worker1="eco-wrapper-worker1"
-HETZNER_SVC_worker2="eco-wrapper-worker2"
-HETZNER_SVC_worker3="eco-wrapper-worker3"
-HETZNER_SVC_worker4="eco-wrapper-worker4"
-HETZNER_SVC_privacy_service="eco-privacy-pdf-service"
-HETZNER_SVC_metrics_reader="eco-wrapper-metrics-reader"
-HETZNER_SVC_platform_api="eco-platform-api"
+HETZNER_SVC_nginx="wt-wrapper-lb"
+HETZNER_SVC_worker1="wt-wrapper-worker1"
+HETZNER_SVC_worker2="wt-wrapper-worker2"
+HETZNER_SVC_worker3="wt-wrapper-worker3"
+HETZNER_SVC_worker4="wt-wrapper-worker4"
+HETZNER_SVC_privacy_service="wt-privacy-pdf-service"
+HETZNER_SVC_metrics_reader="wt-wrapper-metrics-reader"
+HETZNER_SVC_platform_api="wt-platform-api"
 # platform-api is deployed BEFORE nginx so the upstream resolves when nginx
 # restarts. nginx is last so the new routing is live only after platform-api
 # is healthy.
@@ -50,13 +50,13 @@ HETZNER_ALL="platform-api nginx worker1 worker2 worker3 worker4 privacy-service 
 HETZNER_NEEDS_BUILD="platform-api nginx worker1 worker2 worker3 worker4 privacy-service metrics-reader"
 
 # Server-2: service → container name (use _ not - for var names)
-SERVER2_SVC_nginx="eco-prod-lb"
+SERVER2_SVC_nginx="wt-prod-lb"
 # Replaces the old single worker-prod after commit ad14f82 split it into
 # two-account workers (sahori + kurt) for ~2x rate-limit capacity.
-SERVER2_SVC_worker_sahori="eco-prod-worker-sahori"
-SERVER2_SVC_worker_kurt="eco-prod-worker-kurt"
-SERVER2_SVC_privacy_prod="eco-prod-privacy"
-SERVER2_SVC_metrics_reader_prod="eco-prod-metrics-reader"
+SERVER2_SVC_worker_sahori="wt-prod-worker-sahori"
+SERVER2_SVC_worker_kurt="wt-prod-worker-kurt"
+SERVER2_SVC_privacy_prod="wt-prod-privacy"
+SERVER2_SVC_metrics_reader_prod="wt-prod-metrics-reader"
 SERVER2_ALL="nginx worker-sahori worker-kurt privacy-prod metrics-reader-prod"
 SERVER2_NEEDS_BUILD="worker-sahori worker-kurt privacy-prod metrics-reader-prod"
 
@@ -573,7 +573,7 @@ PYEOF
 phase_distribution_test() {
     local host="$1"
     local url="$2"
-    local lb_container="$3"  # e.g. eco-wrapper-lb
+    local lb_container="$3"  # e.g. wt-wrapper-lb
 
     step "Phase 5b: Distribution + State Test (${label:-dist} @ ${url})"
 

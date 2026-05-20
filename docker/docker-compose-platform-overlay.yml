@@ -54,7 +54,7 @@ services:
     build:
       context: ..
       dockerfile: docker/Dockerfile.platform
-    container_name: eco-platform-api
+    container_name: wt-platform-api
     expose:
       - "8000"
     deploy:
