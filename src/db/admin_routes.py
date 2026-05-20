@@ -30,7 +30,7 @@ import asyncpg
 from src.identity.password import hash_password
 from src.identity.jwt_utils import VALID_ROLES
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from pydantic import BaseModel, ConfigDict, EmailStr, Field
 
 from src.api_auth import require_admin, require_jwt_or_service, require_self_or_admin, AuthClaims, get_tenant_of_user
@@ -355,7 +355,7 @@ async def update_user(
 # Admin: hard-delete a user
 # ---------------------------------------------------------------------------
 
-@router.delete("/v1/users/{user_id}", status_code=204)
+@router.delete("/v1/users/{user_id}", status_code=204, response_class=Response)
 async def delete_user(
     user_id: str,
     _claims: AuthClaims = Depends(require_admin),
