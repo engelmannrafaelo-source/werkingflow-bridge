@@ -379,6 +379,15 @@ class ResearchRequest(BaseModel):
         description="Privacy mode: 'auto', 'enabled', or 'disabled'"
     )
 
+    # Async mode (for clients that cannot keep an HTTP connection open for 5-15min,
+    # e.g. Vercel Serverless Functions with 300s hard limit). When true, the endpoint
+    # returns immediately with a request_id; poll GET /v1/research/async/{request_id}
+    # until status='done'.
+    async_mode: Optional[bool] = Field(
+        default=False,
+        description="If true, returns immediately with request_id. Poll /v1/research/async/{request_id} for result."
+    )
+
 
 class ResearchResponse(BaseModel):
     """
@@ -417,6 +426,19 @@ class ResearchResponse(BaseModel):
         default=None,
         description="Claude Code session ID used for research"
     )
+    request_id: Optional[str] = Field(
+        default=None,
+        description="Async job ID (only set when async_mode=true). Use GET /v1/research/async/{request_id} to poll."
+    )
+
+
+class AsyncResearchStatus(BaseModel):
+    """Status response for async research polling."""
+    status: Literal["running", "done", "error", "not_found"]
+    request_id: str
+    elapsed_seconds: Optional[float] = None
+    result: Optional[ResearchResponse] = None
+    error: Optional[str] = None
 
 
 # ============================================================================
