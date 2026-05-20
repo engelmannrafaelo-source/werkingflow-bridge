@@ -395,6 +395,26 @@ deploy_one_service() {
 
     step "Phase 4: Deploy ${svc} (${container}) on ${host}"
 
+    # One-time cleanup for the 2026-05 eco-* → wt-* container rename:
+    # if a container with the legacy name still exists it will block the new
+    # name (port collision + globally unique container names). Compose alone
+    # does not bridge the rename because old containers carry a different
+    # com.docker.compose.project label (working_dir=docker/ vs ../). The
+    # block becomes a no-op after the first successful deploy since the
+    # legacy container no longer exists.
+    if [[ "$DRY_RUN" == "false" ]]; then
+        local legacy_name="${container/wt-/eco-}"
+        if [[ "$legacy_name" != "$container" ]]; then
+            if rssh "$host" "docker inspect '${legacy_name}' >/dev/null 2>&1"; then
+                warn "Removing legacy container '${legacy_name}' (one-time rename cleanup)"
+                rssh "$host" "docker rm -f '${legacy_name}'" || {
+                    error_ "Failed to remove legacy '${legacy_name}'"
+                    return 1
+                }
+            fi
+        fi
+    fi
+
     # Build if this service has a Dockerfile
     if service_needs_build "$svc" "$build_list"; then
         info "Building ${svc}..."
