@@ -42,8 +42,12 @@ HETZNER_SVC_worker3="eco-wrapper-worker3"
 HETZNER_SVC_worker4="eco-wrapper-worker4"
 HETZNER_SVC_privacy_service="eco-privacy-pdf-service"
 HETZNER_SVC_metrics_reader="eco-wrapper-metrics-reader"
-HETZNER_ALL="nginx worker1 worker2 worker3 worker4 privacy-service metrics-reader"
-HETZNER_NEEDS_BUILD="nginx worker1 worker2 worker3 worker4 privacy-service metrics-reader"
+HETZNER_SVC_platform_api="eco-platform-api"
+# platform-api is deployed BEFORE nginx so the upstream resolves when nginx
+# restarts. nginx is last so the new routing is live only after platform-api
+# is healthy.
+HETZNER_ALL="platform-api nginx worker1 worker2 worker3 worker4 privacy-service metrics-reader"
+HETZNER_NEEDS_BUILD="platform-api nginx worker1 worker2 worker3 worker4 privacy-service metrics-reader"
 
 # Server-2: service → container name (use _ not - for var names)
 SERVER2_SVC_nginx="eco-prod-lb"
