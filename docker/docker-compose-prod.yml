@@ -63,7 +63,7 @@ services:
     volumes:
       - prod-logs:/app/logs
       - prod-instances:/app/instances
-      - ~/eco-research-output:/app/research_output
+      - ~/wt-research-output:/app/research_output
     secrets:
       - claude_token_sahori
     environment:
@@ -116,7 +116,7 @@ services:
     volumes:
       - prod-logs:/app/logs
       - prod-instances:/app/instances
-      - ~/eco-research-output:/app/research_output
+      - ~/wt-research-output:/app/research_output
     secrets:
       - claude_token_kurt
     environment:
