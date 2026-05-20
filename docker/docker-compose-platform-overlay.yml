@@ -1,19 +1,23 @@
 # =============================================================================
-# Bridge Platform-Layer — Overlay for docker-compose.yml (live workers)
+# Bridge Platform-Layer — Overlay for docker-compose.yml
 #
-# Adds env_file (platform secrets) to all live workers AND creates the
-# postgres-prod service if not already running. Apply with:
+# Adds:
+#   1) env_file (platform secrets) to all live workers — still needed for
+#      the budget gate + activity tracking pool that workers keep in phase-1.
+#   2) platform-api service — the new dedicated container for all DB-backed
+#      HTTP routes (/v1/auth/*, /v1/users*, /v1/billing/*, etc.).
 #
-#   docker compose -f docker-compose.yml -f docker-compose-platform-overlay.yml up -d --build worker1
+# Zero-downtime migration sequence:
+#   a) Deploy platform-api (new service, additive)
+#   b) Update nginx to route platform paths → platform-api
+#   c) Rebuild workers without the router mounts (already done in main.py)
 #
-# Sequence (one worker at a time, smoke between each):
-#   1) worker1 → smoke /health + /v1/chat/completions + /v1/db/health
-#   2) worker2 → smoke
-#   3) worker3 → smoke
-#   4) worker4 → smoke
+# See: /root/orchestrator/workspaces/devops/specs/bridge-platform-split/PLAN.md
 # =============================================================================
 
 services:
+  # Workers keep platform.env for budget gate + activity tracking (phase-1).
+  # Phase-2: remove env_file from workers once budget gate is an HTTP call.
   worker1:
     env_file:
       - ../secrets/platform.env
@@ -35,6 +39,45 @@ services:
   worker4:
     env_file:
       - ../secrets/platform.env
+    networks:
+      - bridge-net
+      - bridge-prod-net
+
+  # =============================================================================
+  # platform-api — Dedicated DB-backed platform layer (no LLM SDK, no Node)
+  # Serves: /v1/auth/*, /v1/users*, /v1/billing/*, /v1/budget/*, /v1/activity/*,
+  #         /v1/audit/*, /v1/feedback, /v1/dev-tokens/*, /v1/stammdaten/*,
+  #         /v1/invoices/*, /v1/system/*, /v1/impersonation/*, /v1/app-licenses,
+  #         /v1/db/health, /v1/sandbox/conversations/*
+  # =============================================================================
+  platform-api:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.platform
+    container_name: eco-platform-api
+    expose:
+      - "8000"
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+        reservations:
+          memory: 256M
+    env_file:
+      - ../secrets/platform.env
+    environment:
+      - TZ=Europe/Vienna
+      - LOG_LEVEL=INFO
+      - LOG_TO_FILE=false
+      - FILTER_SENSITIVE_DATA=true
+      - CORS_ORIGINS=["*"]
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    restart: unless-stopped
     networks:
       - bridge-net
       - bridge-prod-net
