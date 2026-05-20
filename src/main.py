@@ -399,31 +399,17 @@ async def cleanup_old_sessions():
         await asyncio.sleep(CHECK_INTERVAL_SECONDS)
 
 
-# Bridge platform layer — DB-backed Identity/Tenants/Budget/Billing/Activity.
-# Optional: only mounted when BRIDGE_DB_URL is set. The existing LLM-routing
-# code paths are untouched.
+# DB client — kept in workers for budget gate (pre-call 402) and activity
+# tracking (post-call usage write). HTTP routes are NOT mounted here;
+# they live in platform-api (src/platform_main.py).
+# Phase-2 note: budget gate will become an HTTP call to platform-api,
+# removing the need for a DB pool in workers entirely.
 try:
     from src.db.client import init_pool, close_pool, is_db_enabled
-    from src.db.admin_routes import router as admin_db_router
-    from src.identity.routes import router as identity_router
-    from src.identity.self_service import router as self_service_router
-    from src.budget.routes import router as budget_router
-    from src.billing.routes import router as billing_router
-    from src.activity.routes import router as activity_router
-    from src.feedback.routes import router as feedback_router
-    from src.audit.routes import router as audit_router
-    from src.dev_tokens.routes import router as dev_tokens_router
-    from src.stammdaten.routes import router as stammdaten_router
-    from src.invoices.routes import router as invoices_router
-    from src.metrics.routes import router as metrics_router
-    from src.system.routes import router as system_router
-    from src.impersonation.routes import router as impersonation_router
-    from src.sandbox.routes import router as sandbox_router
-    from src.sandbox.conversation_routes import router as sandbox_conversations_router
-    BRIDGE_DB_LAYER_AVAILABLE = True
+    BRIDGE_DB_CLIENT_AVAILABLE = True
 except Exception as _db_imp_err:
-    BRIDGE_DB_LAYER_AVAILABLE = False
-    logger.warning(f"Bridge DB layer unavailable ({_db_imp_err}); running LLM-routing only.")
+    BRIDGE_DB_CLIENT_AVAILABLE = False
+    logger.warning(f"DB client unavailable ({_db_imp_err}); budget gate + activity tracking disabled.")
 
 
 @asynccontextmanager
@@ -544,15 +530,15 @@ async def lifespan(app: FastAPI):
     except Exception as _e:
         logger.error(f"Failed to start AdaptiveLoadLimiter: {_e}")
 
-    # Bridge platform-layer: initialise Postgres pool BEFORE serving requests.
-    # If BRIDGE_DB_URL is not set, is_db_enabled() returns False and init_pool()
-    # is a no-op — keeps the LLM-only deployment path working.
-    if BRIDGE_DB_LAYER_AVAILABLE and is_db_enabled():
+    # DB pool for budget gate + activity tracking (cross-cutting worker concerns).
+    # Platform routes are served by platform-api; this pool is ONLY for the
+    # pre-call budget check and post-call usage write inside /v1/chat/completions.
+    if BRIDGE_DB_CLIENT_AVAILABLE and is_db_enabled():
         try:
             await init_pool()
-            logger.info("✅ Bridge DB pool initialised (asyncpg)")
+            logger.info("✅ Worker DB pool initialised (asyncpg) — budget gate + activity tracking")
         except Exception as e:
-            logger.error(f"❌ Bridge DB pool init failed: {e}")
+            logger.error(f"❌ Worker DB pool init failed: {e}")
             raise
 
     yield
@@ -564,10 +550,10 @@ async def lifespan(app: FastAPI):
         get_adaptive_limiter().stop()
     except Exception:
         pass
-    if BRIDGE_DB_LAYER_AVAILABLE and is_db_enabled():
+    if BRIDGE_DB_CLIENT_AVAILABLE and is_db_enabled():
         try:
             await close_pool()
-            logger.info("✅ Bridge DB pool closed")
+            logger.info("✅ Worker DB pool closed")
         except Exception:
             pass
 
@@ -580,25 +566,10 @@ app = FastAPI(
     lifespan=lifespan
 )
 
-# Bridge platform routes — only mounted when DB is configured.
-if BRIDGE_DB_LAYER_AVAILABLE and is_db_enabled():
-    app.include_router(admin_db_router)
-    app.include_router(identity_router)
-    app.include_router(self_service_router)
-    app.include_router(budget_router)
-    app.include_router(billing_router)
-    app.include_router(activity_router)
-    app.include_router(feedback_router)
-    app.include_router(audit_router)
-    app.include_router(dev_tokens_router)
-    app.include_router(stammdaten_router)
-    app.include_router(invoices_router)
-    app.include_router(metrics_router)
-    app.include_router(system_router)
-    app.include_router(impersonation_router)
-    app.include_router(sandbox_router)
-    app.include_router(sandbox_conversations_router)
-    logger.info("✅ Bridge platform routes mounted: /v1/users /v1/auth /v1/budget /v1/billing /v1/activity")
+# Platform routes (/v1/auth/*, /v1/users*, /v1/billing/*, etc.) are served
+# by the dedicated platform-api container (src/platform_main.py).
+# Workers serve ONLY LLM routing: /v1/chat/completions, /v1/messages,
+# /v1/research, /v1/document/convert. nginx routes by path prefix.
 
 # Configure CORS
 cors_origins = json.loads(os.getenv("CORS_ORIGINS", '["*"]'))
