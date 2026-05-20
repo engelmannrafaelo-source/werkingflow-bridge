@@ -63,6 +63,11 @@ services:
           memory: 1G
         reservations:
           memory: 256M
+    # Sandbox lease (/v1/sandbox/lease-token) reads OAuth tokens from
+    # BRIDGE_SECRETS_DIR/claude_token_<account>.txt. Same convention as workers,
+    # so the platform-api sees the same symlink set (engelmann → account1, etc.).
+    volumes:
+      - /root/werkingflow-bridge/secrets:/app/secrets:ro
     env_file:
       - ../secrets/platform.env
     environment:
@@ -71,6 +76,7 @@ services:
       - LOG_TO_FILE=false
       - FILTER_SENSITIVE_DATA=true
       - CORS_ORIGINS=["*"]
+      - BRIDGE_SECRETS_DIR=/app/secrets
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://localhost:8000/health"]
       interval: 30s
