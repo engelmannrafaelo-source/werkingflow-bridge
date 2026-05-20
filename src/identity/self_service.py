@@ -36,7 +36,7 @@ async def change_password(
     user_id: str,
     body: ChangePasswordRequest,
     claims: AuthClaims = Depends(require_self_or_admin),
-) -> None:
+) -> Response:
     """
     Self-service password change.
 
@@ -78,6 +78,7 @@ async def change_password(
             new_hash,
             uid,
         )
+    return Response(status_code=204)
 
 
 # ---------------------------------------------------------------------------

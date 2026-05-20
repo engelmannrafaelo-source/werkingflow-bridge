@@ -359,7 +359,7 @@ async def update_user(
 async def delete_user(
     user_id: str,
     _claims: AuthClaims = Depends(require_admin),
-) -> None:
+) -> Response:
     """
     Hard-delete a user. Admin only (admin JWT or service token without X-User-ID).
 
@@ -397,6 +397,7 @@ async def delete_user(
     # asyncpg returns 'DELETE N' — N=0 means the row was not there.
     if not result.endswith(" 1"):
         raise HTTPException(status_code=404, detail=f"User '{user_id}' not found")
+    return Response(status_code=204)
 
 
 # ---------------------------------------------------------------------------

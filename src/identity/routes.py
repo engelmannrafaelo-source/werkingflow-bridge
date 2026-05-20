@@ -225,7 +225,7 @@ async def test_token(
 async def logout(
     credentials: Optional[HTTPAuthorizationCredentials] = Security(_bearer),
     _claims: AuthClaims = Depends(require_jwt),
-) -> None:
+) -> Response:
     """
     Revoke the current JWT's session row. require_jwt has already validated
     the signature + expiry; here we just mark sessions.expires_at = NOW().
@@ -239,6 +239,7 @@ async def logout(
             "UPDATE sessions SET expires_at = NOW() WHERE token = $1",
             token,
         )
+    return Response(status_code=204)
 
 
 # ---------------------------------------------------------------------------
