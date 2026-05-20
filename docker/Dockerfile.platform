@@ -1,0 +1,55 @@
+FROM python:3.12-slim
+
+# System deps: WeasyPrint (invoice PDF rendering) needs Cairo/Pango.
+# NO Node.js, NO npm, NO Claude Code SDK, NO libgl/libglib (no Docling).
+# Much smaller than Dockerfile.worker (no npm install, no Claude Code CLI).
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl \
+    libpango-1.0-0 \
+    libpangoft2-1.0-0 \
+    libpangocairo-1.0-0 \
+    libcairo2 \
+    libgdk-pixbuf-2.0-0 \
+    shared-mime-info \
+    fonts-liberation \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install platform-layer Python deps directly with pip.
+# Explicit version pins match pyproject.toml to avoid drift.
+# NOT using poetry here (would pull in claude-code-sdk + all worker deps).
+RUN pip install --no-cache-dir \
+    "fastapi>=0.115,<1" \
+    "uvicorn[standard]>=0.32,<1" \
+    "asyncpg>=0.29,<1" \
+    "pydantic[email]>=2.10,<3" \
+    "python-dotenv>=1.0,<2" \
+    "httpx>=0.27,<1" \
+    "bcrypt>=4.2,<5" \
+    "pyjwt>=2.9,<3" \
+    "weasyprint>=62,<63" \
+    "mollie-api-python>=3.0,<4" \
+    "psutil>=6.1,<7" \
+    "python-multipart>=0.0.18,<1" \
+    "pytz>=2024.1"
+
+WORKDIR /app
+
+# Copy the full src/ tree — platform modules have intra-package imports
+# (e.g. src.api_auth, src.db.client, src.identity.jwt_utils). The entry
+# point (platform_main.py) mounts ONLY the DB-backed platform routers;
+# worker-only modules (claude_cli, session_manager, etc.) are present in
+# the filesystem but never imported, so their missing deps don't matter.
+COPY src/ /app/src/
+COPY config/ /app/config/
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1
+
+EXPOSE 8000
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
+    CMD curl -fsS http://localhost:8000/health || exit 1
+
+CMD ["uvicorn", "src.platform_main:app", \
+     "--host", "0.0.0.0", "--port", "8000", \
+     "--workers", "2"]
