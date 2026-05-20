@@ -13,11 +13,12 @@ import json
 import uuid
 from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel
 
 from src.api_auth import require_jwt_or_service, AuthClaims, resolve_tenant_id
 from src.db.client import get_pool
+from src.tenant import get_app_env_from_request, normalize_app_env
 
 router = APIRouter(prefix="/v1/activity", tags=["activity"])
 
@@ -55,6 +56,7 @@ def _to_uuid(s: Optional[str]) -> Optional[uuid.UUID]:
 @router.post("/log")
 async def activity_log(
     body: LogRequest,
+    request: Request,
     claims: AuthClaims = Depends(require_jwt_or_service),
 ) -> Dict[str, Any]:
     if body.category not in _ALLOWED_CATEGORIES:
@@ -67,20 +69,27 @@ async def activity_log(
     # (apps logging on behalf of a signed-in user). See ADR 0007.
     tenant_id = await resolve_tenant_id(claims, body.tenantId, body.actorUserId)
 
+    # app_env: the environment the app variant this call came from runs in.
+    # Read from the request header, normalised to prod/staging/local. Absent
+    # header → NULL (honest un-attributed). Drives the "mode" filter.
+    app_env = normalize_app_env(get_app_env_from_request(request))
+
     pool = get_pool()
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
             """
             INSERT INTO activities
               (id, timestamp, category, event_type, actor_user_id, target_user_id,
-               tenant_id, app_id, ip, user_agent, payload)
-            VALUES (gen_random_uuid(), NOW(), $1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb)
+               tenant_id, app_id, ip, user_agent, payload, app_env)
+            VALUES (gen_random_uuid(), NOW(), $1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb,
+                    $10::app_env)
             RETURNING id, timestamp
             """,
             body.category, body.eventType,
             _to_uuid(body.actorUserId), _to_uuid(body.targetUserId),
             tenant_id, body.appId, body.ip, body.userAgent,
             json.dumps(body.payload or {}),
+            app_env,
         )
     return {"id": str(row["id"]), "timestamp": row["timestamp"].isoformat()}
 
@@ -95,9 +104,19 @@ async def activity_query(
     since: Optional[str] = Query(None, description="ISO timestamp"),
     until: Optional[str] = Query(None, description="ISO timestamp"),
     limit: int = Query(100, ge=1, le=1000),
-    mode: Optional[str] = Query(None, description="prod|staging|local — filter by tenant.category"),
-    _claims: AuthClaims = Depends(require_jwt_or_service),
+    mode: Optional[str] = Query(None, description="prod|staging|local — filter by app_env (X-App-Env)"),
+    claims: AuthClaims = Depends(require_jwt_or_service),
 ) -> Dict[str, Any]:
+    # Operators (service token without X-User-ID, admin JWT) may query across
+    # all users. All others are scoped to their own activity: user JWTs see
+    # only their own records; service tokens with X-User-ID see only the
+    # proxied user's activity.
+    if not claims.is_operator:
+        caller_id = claims.effective_user_id
+        if userId and userId != caller_id:
+            raise HTTPException(status_code=403, detail="Forbidden: can only query own activity")
+        userId = caller_id
+
     where: List[str] = []
     args: List[Any] = []
 
@@ -105,8 +124,7 @@ async def activity_query(
         args.append(val)
         where.append(cond.replace("$$", f"${len(args)}"))
 
-    # All activity columns explicitly qualified — `category` is on both
-    # activities and tenants and would be ambiguous once we LEFT JOIN tenants.
+    # Activity columns stay explicitly qualified for readability.
     if tenantId:
         add("activities.tenant_id = $$", tenantId)
     if userId:
@@ -128,20 +146,20 @@ async def activity_query(
     if until:
         add("activities.timestamp <= $$", until)
 
+    # "mode" filters by the environment the call actually came from
+    # (X-App-Env → activities.app_env), NOT by the customer's hand-set
+    # tenant.account_type. Rows with NULL app_env (pre-migration / no header)
+    # are honestly un-attributed and excluded when a mode is requested.
     if mode:
         if mode not in ("prod", "staging", "local"):
             raise HTTPException(status_code=400, detail=f"Invalid mode: {mode}")
-        args.append(mode)
-        where.append(f"t.category = ${len(args)}::tenant_category")
-        join_clause = "LEFT JOIN tenants t ON t.id = activities.tenant_id"
-    else:
-        join_clause = ""
+        add("activities.app_env = $$::app_env", mode)
 
-    sql = f"""
+    sql = """
       SELECT activities.id, activities.timestamp, activities.category, activities.event_type,
              activities.actor_user_id, activities.target_user_id,
              activities.tenant_id, activities.app_id, activities.ip, activities.user_agent, activities.payload
-        FROM activities {join_clause}
+        FROM activities
     """
     if where:
         sql += " WHERE " + " AND ".join(where)

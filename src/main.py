@@ -5,6 +5,7 @@ import secrets
 import string
 import re
 import time
+import uuid
 import subprocess
 from pathlib import Path
 from datetime import datetime, timedelta
@@ -40,6 +41,7 @@ from src.models import (
     SessionListResponse,
     ResearchRequest,
     ResearchResponse,
+    AsyncResearchStatus,
     BackendType,
     PrivacyMode,
     BackendInfo,
@@ -76,6 +78,8 @@ from src.tenant import (
     get_session_id_from_request,
     get_workflow_id_from_request,
     get_job_id_from_request,
+    get_app_env_from_request,
+    normalize_app_env,
     track_request_usage
 )
 # Rate limiting - required in production, optional in development
@@ -398,29 +402,17 @@ async def cleanup_old_sessions():
         await asyncio.sleep(CHECK_INTERVAL_SECONDS)
 
 
-# Bridge platform layer — DB-backed Identity/Tenants/Budget/Billing/Activity.
-# Optional: only mounted when BRIDGE_DB_URL is set. The existing LLM-routing
-# code paths are untouched.
+# DB client — kept in workers for budget gate (pre-call 402) and activity
+# tracking (post-call usage write). HTTP routes are NOT mounted here;
+# they live in platform-api (src/platform_main.py).
+# Phase-2 note: budget gate will become an HTTP call to platform-api,
+# removing the need for a DB pool in workers entirely.
 try:
     from src.db.client import init_pool, close_pool, is_db_enabled
-    from src.db.admin_routes import router as admin_db_router
-    from src.identity.routes import router as identity_router
-    from src.budget.routes import router as budget_router
-    from src.billing.routes import router as billing_router
-    from src.activity.routes import router as activity_router
-    from src.feedback.routes import router as feedback_router
-    from src.audit.routes import router as audit_router
-    from src.dev_tokens.routes import router as dev_tokens_router
-    from src.stammdaten.routes import router as stammdaten_router
-    from src.invoices.routes import router as invoices_router
-    from src.metrics.routes import router as metrics_router
-    from src.system.routes import router as system_router
-    from src.impersonation.routes import router as impersonation_router
-    from src.sandbox.routes import router as sandbox_router
-    BRIDGE_DB_LAYER_AVAILABLE = True
+    BRIDGE_DB_CLIENT_AVAILABLE = True
 except Exception as _db_imp_err:
-    BRIDGE_DB_LAYER_AVAILABLE = False
-    logger.warning(f"Bridge DB layer unavailable ({_db_imp_err}); running LLM-routing only.")
+    BRIDGE_DB_CLIENT_AVAILABLE = False
+    logger.warning(f"DB client unavailable ({_db_imp_err}); budget gate + activity tracking disabled.")
 
 
 @asynccontextmanager
@@ -510,6 +502,10 @@ async def lifespan(app: FastAPI):
     asyncio.create_task(cleanup_old_sessions())
     logger.info("🧹 Progress monitoring cleanup task started (24h retention)")
 
+    # Start async research job cleanup task
+    asyncio.create_task(_cleanup_old_research_jobs())
+    logger.info(f"🧹 Async research job cleanup task started ({RESEARCH_JOB_TTL_SECONDS // 60}min TTL)")
+
     # Start Gemini daily rate limit reset task
     async def _gemini_daily_reset():
         """Reset Gemini rate limit counter at midnight UTC."""
@@ -541,15 +537,15 @@ async def lifespan(app: FastAPI):
     except Exception as _e:
         logger.error(f"Failed to start AdaptiveLoadLimiter: {_e}")
 
-    # Bridge platform-layer: initialise Postgres pool BEFORE serving requests.
-    # If BRIDGE_DB_URL is not set, is_db_enabled() returns False and init_pool()
-    # is a no-op — keeps the LLM-only deployment path working.
-    if BRIDGE_DB_LAYER_AVAILABLE and is_db_enabled():
+    # DB pool for budget gate + activity tracking (cross-cutting worker concerns).
+    # Platform routes are served by platform-api; this pool is ONLY for the
+    # pre-call budget check and post-call usage write inside /v1/chat/completions.
+    if BRIDGE_DB_CLIENT_AVAILABLE and is_db_enabled():
         try:
             await init_pool()
-            logger.info("✅ Bridge DB pool initialised (asyncpg)")
+            logger.info("✅ Worker DB pool initialised (asyncpg) — budget gate + activity tracking")
         except Exception as e:
-            logger.error(f"❌ Bridge DB pool init failed: {e}")
+            logger.error(f"❌ Worker DB pool init failed: {e}")
             raise
 
     yield
@@ -561,10 +557,10 @@ async def lifespan(app: FastAPI):
         get_adaptive_limiter().stop()
     except Exception:
         pass
-    if BRIDGE_DB_LAYER_AVAILABLE and is_db_enabled():
+    if BRIDGE_DB_CLIENT_AVAILABLE and is_db_enabled():
         try:
             await close_pool()
-            logger.info("✅ Bridge DB pool closed")
+            logger.info("✅ Worker DB pool closed")
         except Exception:
             pass
 
@@ -577,23 +573,10 @@ app = FastAPI(
     lifespan=lifespan
 )
 
-# Bridge platform routes — only mounted when DB is configured.
-if BRIDGE_DB_LAYER_AVAILABLE and is_db_enabled():
-    app.include_router(admin_db_router)
-    app.include_router(identity_router)
-    app.include_router(budget_router)
-    app.include_router(billing_router)
-    app.include_router(activity_router)
-    app.include_router(feedback_router)
-    app.include_router(audit_router)
-    app.include_router(dev_tokens_router)
-    app.include_router(stammdaten_router)
-    app.include_router(invoices_router)
-    app.include_router(metrics_router)
-    app.include_router(system_router)
-    app.include_router(impersonation_router)
-    app.include_router(sandbox_router)
-    logger.info("✅ Bridge platform routes mounted: /v1/users /v1/auth /v1/budget /v1/billing /v1/activity")
+# Platform routes (/v1/auth/*, /v1/users*, /v1/billing/*, etc.) are served
+# by the dedicated platform-api container (src/platform_main.py).
+# Workers serve ONLY LLM routing: /v1/chat/completions, /v1/messages,
+# /v1/research, /v1/document/convert. nginx routes by path prefix.
 
 # Configure CORS
 cors_origins = json.loads(os.getenv("CORS_ORIGINS", '["*"]'))
@@ -1588,6 +1571,7 @@ async def generate_streaming_response(
                     output_tokens=est_completion_tokens or 0,
                     status="success",
                     duration_ms=int(stream_duration * 1000),
+                    app_env=attr.get("app_env"),
                 )
         except Exception as track_err:
             logger.warning(f"⚠️ Streaming usage tracking failed (non-fatal): {track_err}")
@@ -1717,6 +1701,8 @@ def extract_attribution_context(request: Request) -> dict:
     - session_id: Session UUID (X-Session-ID)
     - workflow_id: Workflow type (X-Workflow-ID)
     - job_id: Job/run UUID (X-Job-ID)
+    - app_env: Normalised app-variant environment (X-App-Env →
+               prod|staging|local), None if header absent
 
     All values are optional (None if not provided).
     Fallback: Parses X-Client-ID (e.g., "werking-energy/wizard/analyze-smart")
@@ -1755,6 +1741,10 @@ def extract_attribution_context(request: Request) -> dict:
         "session_id": get_session_id_from_request(request),
         "workflow_id": get_workflow_id_from_request(request),
         "job_id": get_job_id_from_request(request),
+        # Normalised app-variant environment (prod/staging/local) — the
+        # truth source for the Platform Admin "mode" filter. None when the
+        # app sent no X-App-Env header (honest un-attributed).
+        "app_env": normalize_app_env(get_app_env_from_request(request)),
     }
 
 
@@ -1841,12 +1831,16 @@ async def chat_completions(
         try:
             from src.budget.gate import enforce_budget
             _gate_attr = extract_attribution_context(request)
-            # Rough pre-call cost estimate: input estimate + max_tokens output,
-            # priced at Sonnet rates (EUR/1M: ~2.90 in, ~14.50 out). The gate
-            # only needs "is there money left", exact billing is deduct's job.
+            # Pre-call cost estimate via the pricing SSoT (src/pricing.py):
+            # input estimate + max_tokens output. The gate only needs "is
+            # there money left"; exact billing is the post-call deduction's job.
+            from src.pricing import cost_eur as _cost_eur
             _gate_out_tokens = int(getattr(request_body, "max_tokens", 0) or 1024)
-            _gate_cost = (_arrival_est_tokens / 1_000_000) * 2.90 \
-                + (_gate_out_tokens / 1_000_000) * 14.50
+            _gate_cost = _cost_eur(
+                getattr(request_body, "model", None),
+                _arrival_est_tokens,
+                _gate_out_tokens,
+            )
             await enforce_budget(
                 user_id=_gate_attr.get("user_id"),
                 app_id=_gate_attr.get("app_id"),
@@ -1935,28 +1929,22 @@ async def chat_completions(
                 )
 
         # =======================================================================
-        # BUDGET ENFORCEMENT: Check tenant limits before processing
+        # TENANT CONTEXT — resolved here only for downstream usage tracking
+        # (track_request_usage, further below). NO budget enforcement happens
+        # here: the single budget gate is src/budget/gate.py (per-user EUR,
+        # already run above before the LLM call).
+        #
+        # The legacy per-tenant check_budget() gate was removed here on
+        # 2026-05-18 (Naht-Audit Befund 4). It was dead code in the chat
+        # path: no caller sends X-Tenant-API-Key, and HMAC-signed tenants
+        # are built with monthly_token_limit / budget_limit_eur = None, so
+        # check_budget() could never return allowed=False for any real
+        # request. Two parallel budget gates with no defined precedence is
+        # the architecture defect — there is now exactly one.
+        # /v1/usage/status still exposes check_budget() read-only for the
+        # legacy tenant-status API; that surface is intentionally untouched.
         # =======================================================================
         tenant = get_tenant_from_request(request)
-        if tenant:
-            from src.tenant import check_budget
-            budget_result = await check_budget(tenant)
-            if not budget_result.allowed:
-                logger.warning(f"Budget exceeded for {tenant.tenant_slug}: {budget_result.reason}")
-                raise HTTPException(
-                    status_code=402,
-                    detail={
-                        "error": {
-                            "message": budget_result.reason,
-                            "type": "budget_exceeded",
-                            "code": "payment_required",
-                            "billing_mode": budget_result.billing_mode,
-                            "current_tokens": budget_result.current_tokens,
-                            "token_limit": budget_result.token_limit,
-                            "usage_percent": budget_result.token_usage_percent,
-                        }
-                    }
-                )
 
         # =======================================================================
         # ATTRIBUTION ENFORCEMENT: Ensure callers identify themselves
@@ -2662,6 +2650,7 @@ async def chat_completions(
                     output_tokens=completion_tokens or 0,
                     status="success",
                     duration_ms=int(duration * 1000),
+                    app_env=attribution.get("app_env"),
                 )
             except Exception as e:
                 logger.warning(f"prompt_metrics record (success) failed: {e}")
@@ -2777,6 +2766,7 @@ async def chat_completions(
                 status="error",
                 duration_ms=int(duration * 1000),
                 error_code=str(http_exc.status_code),
+                app_env=attribution.get("app_env"),
             )
         except Exception:
             pass
@@ -2833,6 +2823,7 @@ async def chat_completions(
                 status="error",
                 duration_ms=int(duration * 1000),
                 error_code="429",
+                app_env=attribution.get("app_env"),
             )
         except Exception:
             pass
@@ -3077,6 +3068,378 @@ async def chat_completions(
                 logger.debug(f"rolling_metrics outer-finally safety net failed: {_e}")
 
 
+# ============================================================================
+# Async research jobs — Filesystem-backed state
+# ----------------------------------------------------------------------------
+# Job state lives as JSON files under /app/instances/_async_jobs/ which is
+# mounted from the SHARED `wt-wrapper-instances-shared` named volume. That
+# means any worker can read any other worker's job state — required because
+# the nginx Lua router picks the worker per request based on rate-limit pool
+# capacity, NOT request_id; the POST and the matching GETs routinely land on
+# different containers.
+#
+# Atomicity: writes go to a temp file in the same directory and rename to the
+# final path (POSIX rename is atomic on the same filesystem). Readers either
+# see the previous content or the new content, never a half-written file.
+#
+# Container restart: in-flight running jobs are LOST (the asyncio task dies).
+# The status file is then orphaned at status='running' until cleanup. The
+# client side handles this by surfacing a stale 'running' for the TTL window
+# and then the cleanup task removes the file; next poll returns 404. The
+# WerkING Check consumer treats 404 as "retry the upload" — acceptable
+# trade-off for not needing a Redis / Postgres dependency just for state.
+# ============================================================================
+
+RESEARCH_JOB_TTL_SECONDS = 2 * 60 * 60  # 2h
+RESEARCH_JOBS_DIR = Path(
+    os.environ.get("RESEARCH_JOBS_DIR")
+    or (Path(os.environ.get("INSTANCES_DIR") or "/app/instances") / "_async_jobs")
+)
+
+
+def _research_job_path(job_id: str) -> Path:
+    # Defensive — job_id is a uuid4().hex so this should never trip, but a
+    # malformed value would otherwise let a caller traverse out of the jobs dir.
+    if not job_id or "/" in job_id or "\\" in job_id or job_id.startswith("."):
+        raise ValueError(f"Invalid research job id: {job_id!r}")
+    return RESEARCH_JOBS_DIR / f"{job_id}.json"
+
+
+def _save_research_job(job_id: str, payload: Dict[str, Any]) -> None:
+    """Atomic write: tmp file + rename. Idempotent — overwrites any prior state."""
+    RESEARCH_JOBS_DIR.mkdir(parents=True, exist_ok=True)
+    final_path = _research_job_path(job_id)
+    tmp_path = final_path.with_suffix(f".tmp.{os.getpid()}")
+    tmp_path.write_text(json.dumps(payload, default=str), encoding="utf-8")
+    os.replace(tmp_path, final_path)
+
+
+def _load_research_job(job_id: str) -> Optional[Dict[str, Any]]:
+    path = _research_job_path(job_id)
+    if not path.exists():
+        return None
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as e:
+        logger.warning(f"⚠️ Could not read research job {job_id}: {e}")
+        return None
+
+
+async def _execute_research_impl(
+    request_body: ResearchRequest,
+    backend_config: Optional[BackendConfig],
+) -> ResearchResponse:
+    """Core research execution. Caller handles auth, rate-limit, and model resolution.
+
+    Returns ResearchResponse always (success or error). Raises WorkerUnavailableError
+    for HTTP 503 propagation through nginx failover.
+    """
+    start_time = time.time()
+    session_id = None
+    container_file = None
+    output_file = None
+
+    try:
+        logger.info(
+            f"🔬 Research request received",
+            extra={
+                "query": request_body.query[:100],
+                "model": request_body.model,
+                "depth": request_body.depth,
+                "strategy": request_body.strategy,
+                "max_hops": request_body.max_hops,
+                "output_path": request_body.output_path,
+                "backend": backend_config.backend.value if backend_config else "anthropic"
+            }
+        )
+
+        # Construct SuperClaude research command with options
+        research_prompt = f"/sc:research \"{request_body.query}\""
+
+        if request_body.depth:
+            research_prompt += f" --depth {request_body.depth}"
+        if request_body.strategy:
+            research_prompt += f" --strategy {request_body.strategy}"
+        if request_body.max_hops:
+            research_prompt += f" --max-hops {request_body.max_hops}"
+        if request_body.confidence_threshold and request_body.confidence_threshold != 0.7:
+            research_prompt += f" --confidence {request_body.confidence_threshold}"
+        if request_body.parallel_searches and request_body.parallel_searches != 5:
+            research_prompt += f" --parallel {request_body.parallel_searches}"
+        if request_body.source_filter:
+            filters = ",".join(request_body.source_filter)
+            research_prompt += f" --sources {filters}"
+
+        logger.info("🚀 Starting research execution...")
+
+        all_chunks = []
+        file_metadata = None
+
+        async for chunk in claude_cli.run_completion(
+            prompt=research_prompt,
+            model=request_body.model,
+            max_turns=request_body.max_turns,
+            allowed_tools=None,
+            stream=True,
+            enable_file_discovery=True,
+            backend_env_vars=backend_config.env_vars if backend_config else None
+        ):
+            all_chunks.append(chunk)
+            if "session_id" in chunk:
+                session_id = chunk["session_id"]
+            if chunk.get("type") == "x_claude_metadata":
+                file_metadata = chunk
+                logger.info(f"📦 Found file metadata: {len(chunk.get('files_created', []))} files")
+                if "session_tracking" in chunk:
+                    cli_session_id = chunk["session_tracking"].get("cli_session_id")
+                    if cli_session_id:
+                        session_id = cli_session_id
+                        logger.info(f"📁 Using cli_session_id: {session_id}")
+
+        if not all_chunks:
+            raise ValueError("No response received from Claude Code execution")
+
+        execution_time = time.time() - start_time
+
+        logger.info(
+            f"✅ Research completed",
+            extra={
+                "session_id": session_id,
+                "execution_time": execution_time,
+                "total_chunks": len(all_chunks)
+            }
+        )
+
+        discovered_files = []
+        if file_metadata and file_metadata.get("files_created"):
+            for file_info in file_metadata["files_created"]:
+                file_path = Path(file_info["path"])
+                discovered_files.append(file_path)
+                logger.info(f"📄 Discovered file from metadata: {file_path}")
+
+        if not discovered_files and session_id:
+            try:
+                wrapper_root = Path(claude_cli.cwd) if claude_cli.cwd else Path.cwd()
+                file_discovery = FileDiscoveryService(wrapper_root)
+                matching_dirs = list(wrapper_root.glob(f"*_{session_id}"))
+                if matching_dirs:
+                    session_dir = matching_dirs[0]
+                    logger.info(f"📁 Found session directory: {session_dir.name}")
+                    claudedocs_dir = session_dir / "claudedocs"
+                    if claudedocs_dir.exists():
+                        for file_path in claudedocs_dir.glob("*.md"):
+                            discovered_files.append(file_path)
+                            logger.info(f"📄 Discovered file: {file_path}")
+                    else:
+                        logger.warning(f"⚠️  Session directory found but no claudedocs/: {session_dir}")
+                else:
+                    logger.warning(f"⚠️  No session directory found for session_id: {session_id}")
+            except Exception as e:
+                logger.warning(f"⚠️  File discovery failed (non-critical): {e}", exc_info=True)
+
+        if discovered_files:
+            container_file = str(discovered_files[0])
+            if request_body.output_path:
+                output_file = request_body.output_path
+            else:
+                filename = discovered_files[0].name
+                output_file = f"/tmp/{filename}"
+
+            try:
+                in_docker = Path("/.dockerenv").exists()
+                if in_docker:
+                    logger.info(f"🐳 Docker environment detected")
+                    if container_file and output_file:
+                        shutil.copy2(container_file, output_file)
+                        logger.info(f"📋 Copied: {container_file} → {output_file}")
+                else:
+                    if container_file and output_file:
+                        shutil.copy2(container_file, output_file)
+                        logger.info(f"📋 Copied: {container_file} → {output_file}")
+            except Exception as e:
+                logger.error(
+                    f"❌ File copy failed: {e}",
+                    exc_info=True,
+                    extra={"container_file": container_file, "output_file": output_file}
+                )
+
+        file_size_bytes = None
+        content = None
+        content_file = None
+        if output_file and Path(output_file).exists():
+            content_file = output_file
+        elif container_file and Path(container_file).exists():
+            content_file = container_file
+
+        if content_file:
+            file_size_bytes = Path(content_file).stat().st_size
+            try:
+                with open(content_file, 'r', encoding='utf-8') as f:
+                    content = f.read()
+                logger.info(f"📄 Read content: {len(content)} chars from {content_file}")
+            except Exception as e:
+                logger.warning(f"⚠️ Could not read content: {e}")
+
+        # Defensive checks (parse, quota exhaustion, empty output, parsed-text fallback)
+        from src.claude_cli import detect_quota_exhaustion as _dqe
+
+        try:
+            parsed_assistant_text = claude_cli.parse_claude_message(all_chunks)
+        except Exception as _parse_err:
+            logger.error(f"❌ Research parse_claude_message raised: {_parse_err}", exc_info=True)
+            parsed_assistant_text = None
+
+        for _candidate, _label in (
+            (parsed_assistant_text, "assistant text"),
+            (content, "file content"),
+        ):
+            if _candidate and _dqe(_candidate):
+                logger.warning(
+                    f"\U0001f6ab Research: quota-exhaustion phrase detected in {_label} "
+                    f"-- raising RateLimitError so adaptive limiter is notified"
+                )
+                raise RateLimitError(f"[Bridge research] Quota exhaustion detected in {_label}")
+
+        if not discovered_files and not content and not parsed_assistant_text:
+            logger.error(
+                f"❌ Research produced no output: "
+                f"discovered_files=0, content=None, parsed_text=None, "
+                f"chunks={len(all_chunks)}, session_id={session_id}"
+            )
+            raise HTTPException(
+                status_code=500,
+                detail={
+                    "message": "Research SDK completed but produced no output",
+                    "chunks_received": len(all_chunks),
+                    "session_id": session_id,
+                    "execution_time_seconds": round(execution_time, 2),
+                    "hint": (
+                        "Likely cause: rate_limit_event with internal retry that "
+                        "never recovered, or session-id mismatch in file discovery. "
+                        "Check worker logs for rate_limit_event around session start."
+                    ),
+                },
+            )
+
+        if not content and parsed_assistant_text:
+            logger.warning(
+                f"⚠️  Research: file content unavailable but parsed_text exists "
+                f"({len(parsed_assistant_text)} chars) -- using parsed_text as content fallback"
+            )
+            content = parsed_assistant_text
+
+        return ResearchResponse(
+            status="success",
+            query=request_body.query,
+            model=request_body.model,
+            output_file=output_file,
+            container_file=container_file,
+            execution_time_seconds=round(execution_time, 2),
+            file_size_bytes=file_size_bytes,
+            content=content,
+            error=None,
+            session_id=session_id
+        )
+
+    except WorkerUnavailableError:
+        # Re-raise to trigger HTTP 503 and Nginx failover to another worker
+        raise
+
+    except Exception as e:
+        execution_time = time.time() - start_time
+        logger.error(
+            f"❌ Research failed: {e}",
+            exc_info=True,
+            extra={
+                "query": request_body.query,
+                "model": request_body.model,
+                "execution_time": execution_time
+            }
+        )
+
+        return ResearchResponse(
+            status="error",
+            query=request_body.query,
+            model=request_body.model,
+            output_file=None,
+            container_file=None,
+            execution_time_seconds=round(execution_time, 2),
+            file_size_bytes=None,
+            error=str(e),
+            session_id=session_id
+        )
+
+
+async def _run_async_research_job(
+    request_body: ResearchRequest,
+    backend_config: Optional[BackendConfig],
+    job_id: str,
+) -> None:
+    """Background runner that stores ResearchResponse as a JSON file in the
+    shared async-jobs directory. Any worker can read it back."""
+    prior = _load_research_job(job_id) or {}
+    started_at = prior.get("started_at") or time.time()
+    try:
+        result = await _execute_research_impl(request_body, backend_config)
+        _save_research_job(job_id, {
+            "status": "done" if result.status == "success" else "error",
+            "started_at": started_at,
+            "finished_at": time.time(),
+            "result": result.model_dump(),
+        })
+        logger.info(f"📦 Async research job {job_id} finished: {result.status}")
+    except WorkerUnavailableError as e:
+        _save_research_job(job_id, {
+            "status": "error",
+            "started_at": started_at,
+            "finished_at": time.time(),
+            "error": f"Worker unavailable: {e}",
+        })
+        logger.warning(f"⚠️ Async research job {job_id} hit WorkerUnavailable: {e}")
+    except Exception as e:
+        _save_research_job(job_id, {
+            "status": "error",
+            "started_at": started_at,
+            "finished_at": time.time(),
+            "error": str(e),
+        })
+        logger.error(f"❌ Async research job {job_id} crashed: {e}", exc_info=True)
+
+
+async def _cleanup_old_research_jobs() -> None:
+    """Periodically remove stale research-job state files (older than TTL).
+
+    Runs in every worker — they all share the same directory, so any worker
+    can do the cleanup. unlink() on a missing file is tolerated (another
+    worker may have removed it concurrently)."""
+    while True:
+        try:
+            await asyncio.sleep(30 * 60)  # every 30 min
+            if not RESEARCH_JOBS_DIR.exists():
+                continue
+            now = time.time()
+            removed = 0
+            for path in RESEARCH_JOBS_DIR.glob("*.json"):
+                try:
+                    mtime = path.stat().st_mtime
+                except FileNotFoundError:
+                    continue
+                if mtime < now - RESEARCH_JOB_TTL_SECONDS:
+                    try:
+                        path.unlink()
+                        removed += 1
+                    except FileNotFoundError:
+                        pass
+                    except OSError as e:
+                        logger.warning(f"⚠️ Could not unlink stale job {path.name}: {e}")
+            if removed:
+                logger.info(f"🧹 Cleaned up {removed} stale research jobs")
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.warning(f"⚠️ Research job cleanup error: {e}", exc_info=True)
+
+
 @app.post("/v1/research", response_model=ResearchResponse)
 async def research(
     request_body: ResearchRequest,
@@ -3177,317 +3540,76 @@ async def research(
             error=str(e)
         )
 
-    try:
-        logger.info(
-            f"🔬 Research request received",
-            extra={
-                "query": request_body.query[:100],
-                "model": request_body.model,
-                "depth": request_body.depth,
-                "strategy": request_body.strategy,
-                "max_hops": request_body.max_hops,
-                "output_path": request_body.output_path,
-                "backend": backend_config.backend.value if backend_config else "anthropic"
-            }
-        )
-
-        # Construct SuperClaude research command with options
-        research_prompt = f"/sc:research \"{request_body.query}\""
-
-        # Add depth parameter
-        if request_body.depth:
-            research_prompt += f" --depth {request_body.depth}"
-
-        # Add strategy parameter
-        if request_body.strategy:
-            research_prompt += f" --strategy {request_body.strategy}"
-
-        # Add max_hops if specified (overrides depth)
-        if request_body.max_hops:
-            research_prompt += f" --max-hops {request_body.max_hops}"
-
-        # Add confidence threshold
-        if request_body.confidence_threshold and request_body.confidence_threshold != 0.7:
-            research_prompt += f" --confidence {request_body.confidence_threshold}"
-
-        # Add parallel searches
-        if request_body.parallel_searches and request_body.parallel_searches != 5:
-            research_prompt += f" --parallel {request_body.parallel_searches}"
-
-        # Add source filter
-        if request_body.source_filter:
-            filters = ",".join(request_body.source_filter)
-            research_prompt += f" --sources {filters}"
-
-        # Execute research via Claude Code SDK
-        logger.info("🚀 Starting research execution...")
-
-        # Execute research (note: claude_cli.run_completion is async generator)
-        # Collect all chunks to extract session_id and file metadata
-        all_chunks = []
-        file_metadata = None
-        session_id = None
-
-        async for chunk in claude_cli.run_completion(
-            prompt=research_prompt,
-            model=request_body.model,
-            max_turns=request_body.max_turns,
-            allowed_tools=None,  # None means all tools allowed
-            stream=True,
-            enable_file_discovery=True,
-            backend_env_vars=backend_config.env_vars if backend_config else None
-        ):
-            all_chunks.append(chunk)
-
-            # Extract session_id from any chunk that has it
-            if "session_id" in chunk:
-                session_id = chunk["session_id"]
-
-            # Extract file metadata from x_claude_metadata chunk
-            if chunk.get("type") == "x_claude_metadata":
-                file_metadata = chunk
-                logger.info(f"📦 Found file metadata: {len(chunk.get('files_created', []))} files")
-                # CRITICAL: Use cli_session_id for directory matching, not SDK's session_id
-                if "session_tracking" in chunk:
-                    cli_session_id = chunk["session_tracking"].get("cli_session_id")
-                    if cli_session_id:
-                        session_id = cli_session_id
-                        logger.info(f"📁 Using cli_session_id: {session_id}")
-
-        if not all_chunks:
-            raise ValueError("No response received from Claude Code execution")
-
-        execution_time = time.time() - start_time
-
-        logger.info(
-            f"✅ Research completed",
-            extra={
-                "session_id": session_id,
-                "execution_time": execution_time,
-                "total_chunks": len(all_chunks)
-            }
-        )
-
-        # Extract discovered files from metadata
-        discovered_files = []
-        if file_metadata and file_metadata.get("files_created"):
-            for file_info in file_metadata["files_created"]:
-                file_path = Path(file_info["path"])  # Use "path" not "absolute_path"
-                discovered_files.append(file_path)
-                logger.info(f"📄 Discovered file from metadata: {file_path}")
-
-        # Fallback: Manual discovery if metadata didn't contain files
-        if not discovered_files and session_id:
-            try:
-                # Initialize file discovery service
-                wrapper_root = Path(claude_cli.cwd) if claude_cli.cwd else Path.cwd()
-                file_discovery = FileDiscoveryService(wrapper_root)
-
-                # Try to discover files from session
-                # Session directory format: YYYY-MM-DD-HHMM_{session_id}
-                # Use glob pattern to find directory with matching session_id suffix
-                matching_dirs = list(wrapper_root.glob(f"*_{session_id}"))
-
-                if matching_dirs:
-                    session_dir = matching_dirs[0]  # Take first match (should be only one)
-                    logger.info(f"📁 Found session directory: {session_dir.name}")
-
-                    # Scan claudedocs directory for research output
-                    claudedocs_dir = session_dir / "claudedocs"
-                    if claudedocs_dir.exists():
-                        for file_path in claudedocs_dir.glob("*.md"):
-                            discovered_files.append(file_path)
-                            logger.info(f"📄 Discovered file: {file_path}")
-                    else:
-                        logger.warning(f"⚠️  Session directory found but no claudedocs/: {session_dir}")
-                else:
-                    logger.warning(f"⚠️  No session directory found for session_id: {session_id}")
-
-            except Exception as e:
-                logger.warning(
-                    f"⚠️  File discovery failed (non-critical): {e}",
-                    exc_info=True
-                )
-
-        # Determine output paths
-        if discovered_files:
-            container_file = str(discovered_files[0])  # Use first markdown file
-
-            # Determine host output path
-            if request_body.output_path:
-                output_file = request_body.output_path
-            else:
-                # Default to /tmp/ with research filename
-                filename = discovered_files[0].name
-                output_file = f"/tmp/{filename}"
-
-            # Copy file from container to host (if in Docker)
-            try:
-                # Check if we're in Docker by checking for /.dockerenv
-                in_docker = Path("/.dockerenv").exists()
-
-                if in_docker:
-                    # In Docker: Copy file to output path
-                    # Since we're inside Docker, we can directly copy the file
-                    # if output_path is accessible
-                    logger.info(f"🐳 Docker environment detected")
-
-                    # For Docker, we just copy locally since we ARE in the container
-                    if container_file and output_file:
-                        shutil.copy2(container_file, output_file)
-                        logger.info(f"📋 Copied: {container_file} → {output_file}")
-                else:
-                    # Not in Docker: Direct file access
-                    if container_file and output_file:
-                        shutil.copy2(container_file, output_file)
-                        logger.info(f"📋 Copied: {container_file} → {output_file}")
-
-            except Exception as e:
-                logger.error(
-                    f"❌ File copy failed: {e}",
-                    exc_info=True,
-                    extra={
-                        "container_file": container_file,
-                        "output_file": output_file
-                    }
-                )
-                # Don't fail the request, just log the error
-
-        # Get file size and content if available
-        file_size_bytes = None
-        content = None
-
-        # Try to read content from output_file or container_file
-        content_file = None
-        if output_file and Path(output_file).exists():
-            content_file = output_file
-        elif container_file and Path(container_file).exists():
-            content_file = container_file
-
-        if content_file:
-            file_size_bytes = Path(content_file).stat().st_size
-            try:
-                with open(content_file, 'r', encoding='utf-8') as f:
-                    content = f.read()
-                logger.info(f"📄 Read content: {len(content)} chars from {content_file}")
-            except Exception as e:
-                logger.warning(f"⚠️ Could not read content: {e}")
-
-        # ====================================================================
-        # DEFENSIVE: lift chat_completions defenses to research endpoint
-        # --------------------------------------------------------------------
-        # The chat completions endpoint (line ~2240) raises HTTPException 500
-        # when parse_claude_message returns None and RateLimitError when
-        # detect_quota_exhaustion fires on the response text. Without these,
-        # research silently returns status=success with empty content/output
-        # whenever the SDK gets rate-limited or stalls -- pipelines then crash
-        # 40 minutes later on a meaningless empty response. Same defenses
-        # applied here.
-        # ====================================================================
-        from src.claude_cli import detect_quota_exhaustion as _dqe
-
-        # 1) Parse chunks the same way chat_completions does
-        try:
-            parsed_assistant_text = claude_cli.parse_claude_message(all_chunks)
-        except Exception as _parse_err:
-            logger.error(
-                f"\u274c Research parse_claude_message raised: {_parse_err}",
-                exc_info=True,
-            )
-            parsed_assistant_text = None
-
-        # 2) Quota exhaustion phrase scan on whatever text we have.
-        #    If the SDK silently bailed on rate-limit, the marker is in either
-        #    the parsed assistant text or the file content (rare).
-        for _candidate, _label in (
-            (parsed_assistant_text, "assistant text"),
-            (content, "file content"),
-        ):
-            if _candidate and _dqe(_candidate):
-                logger.warning(
-                    f"\U0001f6ab Research: quota-exhaustion phrase detected in {_label} "
-                    f"-- raising RateLimitError so adaptive limiter is notified"
-                )
-                raise RateLimitError(
-                    f"[Bridge research] Quota exhaustion detected in {_label}"
-                )
-
-        # 3) Empty-output guard: if discovery + parse both came up empty, this
-        #    is a stalled/quota-killed run masquerading as success. Fail loud
-        #    so Nginx / the consumer can see it instead of inheriting None.
-        if not discovered_files and not content and not parsed_assistant_text:
-            logger.error(
-                f"\u274c Research produced no output: "
-                f"discovered_files=0, content=None, parsed_text=None, "
-                f"chunks={len(all_chunks)}, session_id={session_id}"
-            )
-            raise HTTPException(
-                status_code=500,
-                detail={
-                    "message": "Research SDK completed but produced no output",
-                    "chunks_received": len(all_chunks),
-                    "session_id": session_id,
-                    "execution_time_seconds": round(execution_time, 2),
-                    "hint": (
-                        "Likely cause: rate_limit_event with internal retry that "
-                        "never recovered, or session-id mismatch in file discovery. "
-                        "Check worker logs for rate_limit_event around session start."
-                    ),
-                },
-            )
-
-        # 4) Parsed text fallback: discovery failed and no file content, but the
-        #    SDK did emit assistant text -- carry that as the content payload
-        #    rather than returning None.
-        if not content and parsed_assistant_text:
-            empty_chars = len(parsed_assistant_text)
-            logger.warning(
-                f"\u26a0\ufe0f  Research: file content unavailable but parsed_text exists "
-                f"({empty_chars} chars) -- using parsed_text as content fallback"
-            )
-            content = parsed_assistant_text
-
+    # Async mode: spawn background task, return immediately with request_id.
+    # Caller polls GET /v1/research/async/{request_id} for the result.
+    if request_body.async_mode:
+        job_id = uuid.uuid4().hex
+        _save_research_job(job_id, {
+            "status": "running",
+            "started_at": time.time(),
+            "query": request_body.query[:100],
+        })
+        asyncio.create_task(_run_async_research_job(request_body, backend_config, job_id))
+        logger.info(f"📨 Async research job {job_id} dispatched (query: {request_body.query[:60]!r})")
         return ResearchResponse(
             status="success",
             query=request_body.query,
             model=request_body.model,
-            output_file=output_file,
-            container_file=container_file,
-            execution_time_seconds=round(execution_time, 2),
-            file_size_bytes=file_size_bytes,
-            content=content,
-            error=None,
-            session_id=session_id
+            request_id=job_id,
         )
 
-    except WorkerUnavailableError:
-        # Re-raise to trigger HTTP 503 and Nginx failover to another worker
-        # User will NOT see this error - Nginx handles it transparently
-        raise
+    # Sync path: execute and return the full result
+    return await _execute_research_impl(request_body, backend_config)
 
-    except Exception as e:
-        execution_time = time.time() - start_time
-        logger.error(
-            f"❌ Research failed: {e}",
-            exc_info=True,
-            extra={
-                "query": request_body.query,
-                "model": request_body.model,
-                "execution_time": execution_time
-            }
+
+@app.get("/v1/research/async/{request_id}", response_model=AsyncResearchStatus)
+async def get_async_research_status(
+    request_id: str,
+    request: Request,
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(security)
+):
+    """Poll status of an async research job started with async_mode=true.
+
+    Returns:
+    - status='running': job still executing (poll again)
+    - status='done':    job finished, result field carries the ResearchResponse
+    - status='error':   job failed, error field carries the message
+    - HTTP 404:         job_id unknown (worker restarted, or job expired)
+    """
+    await verify_api_key(request, credentials)
+
+    try:
+        job = _load_research_job(request_id)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    if not job:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Async research job not found (unknown id, or expired): {request_id}",
         )
 
-        return ResearchResponse(
-            status="error",
-            query=request_body.query,
-            model=request_body.model,
-            output_file=None,
-            container_file=None,
-            execution_time_seconds=round(execution_time, 2),
-            file_size_bytes=None,
-            error=str(e),
-            session_id=session_id
-        )
+    status = job.get("status", "running")
+    started_at = job.get("started_at")
+    finished_at = job.get("finished_at")
+    elapsed = None
+    if started_at is not None:
+        elapsed = (finished_at if finished_at else time.time()) - started_at
+
+    result_payload = None
+    if status == "done" and job.get("result"):
+        try:
+            result_payload = ResearchResponse(**job["result"])
+        except Exception as _e:
+            logger.warning(f"⚠️ Could not rehydrate ResearchResponse for {request_id}: {_e}")
+
+    return AsyncResearchStatus(
+        status=status,
+        request_id=request_id,
+        elapsed_seconds=round(elapsed, 2) if elapsed is not None else None,
+        result=result_payload,
+        error=job.get("error"),
+    )
 
 
 @app.get("/v1/research/{session_id}/content")

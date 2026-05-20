@@ -33,7 +33,7 @@ fi
 # Hardware-aware sizing per bridge.
 case "$BRIDGE_ID" in
   primary)
-    CONTAINER_PREFIX="eco-wrapper"
+    CONTAINER_PREFIX="wt-wrapper"
     NETWORK="bridge-net"
     PRIVACY_WORKERS=4
     DOCLING_THREADS=4
@@ -44,7 +44,7 @@ case "$BRIDGE_ID" in
     NGINX_IMAGE_BUILD=true   # OpenResty + Lua
     ;;
   production)
-    CONTAINER_PREFIX="eco-prod"
+    CONTAINER_PREFIX="wt-prod"
     NETWORK="bridge-prod-net"
     PRIVACY_WORKERS=2
     DOCLING_THREADS=2

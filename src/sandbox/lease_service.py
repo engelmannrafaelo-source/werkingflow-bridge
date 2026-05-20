@@ -47,10 +47,23 @@ def read_oauth_token(account_id: str) -> str:
 # Tenant lookup
 # ---------------------------------------------------------------------------
 
-async def get_tenant_info(conn: Any, user_id: uuid.UUID) -> dict:
+async def get_tenant_info(
+    conn: Any,
+    user_id: uuid.UUID,
+    app: Optional[str] = None,
+    auto_provision: bool = True,
+) -> dict:
     """
     Return {'tenant_id': str, 'billing_mode': str} for a user.
-    Raises 404 if user not found, 500 if tenant row missing.
+
+    When the user is missing and `app` + `auto_provision` are set, JIT-provision
+    the user against the app-named tenant (created on demand with the default
+    billing_mode). This unblocks first-time sandbox sessions for users that
+    were created in an app's own auth system (Supabase, etc.) without a
+    matching POST /v1/users call.
+
+    Raises 404 if user not found AND auto-provisioning is disabled or no app
+    was supplied.
     """
     row = await conn.fetchrow(
         """
@@ -62,8 +75,70 @@ async def get_tenant_info(conn: Any, user_id: uuid.UUID) -> dict:
         user_id,
     )
     if row is None:
-        raise HTTPException(status_code=404, detail=f"User {user_id} not found")
+        if auto_provision and app:
+            await _jit_provision_user(conn, user_id, app)
+            row = await conn.fetchrow(
+                """
+                SELECT u.tenant_id, t.billing_mode
+                FROM users u
+                JOIN tenants t ON t.id = u.tenant_id
+                WHERE u.id = $1
+                """,
+                user_id,
+            )
+        if row is None:
+            raise HTTPException(status_code=404, detail=f"User {user_id} not found")
     return {"tenant_id": row["tenant_id"], "billing_mode": row["billing_mode"]}
+
+
+async def _jit_provision_user(conn: Any, user_id: uuid.UUID, app: str) -> None:
+    """
+    Idempotent JIT user+tenant provisioning.
+
+    Convention: tenant_id = app name (one tenant per single-tenant app like
+    'engelmann', 'werking-report', etc.). For multi-tenant apps the caller
+    should provision explicitly via POST /v1/users.
+
+    Email is a synthetic placeholder (`jit-<user_id>@<app>.local`) so the
+    UNIQUE constraint on users.email can never collide with real signups.
+    Apps can PATCH the user row later with the real email once known.
+    """
+    tenant_id = app
+    placeholder_email = f"jit-{user_id}@{app}.local"
+    placeholder_name = f"JIT-provisioned ({app})"
+
+    # Ensure tenant exists. ON CONFLICT DO NOTHING handles the race where two
+    # concurrent first-lease calls for the same fresh tenant arrive together.
+    await conn.execute(
+        """
+        INSERT INTO tenants (id, name, created_at)
+        VALUES ($1, $2, NOW())
+        ON CONFLICT (id) DO NOTHING
+        """,
+        tenant_id,
+        f"JIT tenant for {app}",
+    )
+
+    # Insert user. ON CONFLICT DO NOTHING covers both id-collision (re-entry of
+    # the same provisioning) and the rare email-collision via the placeholder
+    # pattern. The follow-up SELECT in the caller re-reads, so either branch
+    # leaves the system in a consistent state.
+    await conn.execute(
+        """
+        INSERT INTO users (id, email, name, tenant_id, created_at, updated_at)
+        VALUES ($1, $2, $3, $4, NOW(), NOW())
+        ON CONFLICT (id) DO NOTHING
+        """,
+        user_id,
+        placeholder_email,
+        placeholder_name,
+        tenant_id,
+    )
+
+    logger.info(
+        f"JIT-provisioned user={user_id} app={app} tenant={tenant_id} "
+        f"(email=placeholder, name=placeholder)"
+    )
 
 
 # ---------------------------------------------------------------------------

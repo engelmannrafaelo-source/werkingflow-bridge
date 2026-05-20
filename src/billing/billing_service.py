@@ -9,12 +9,72 @@ from __future__ import annotations
 
 import json
 import uuid
-from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from datetime import datetime, timedelta, timezone
+from typing import Any, Dict, List, Optional, Tuple
 
 from src.config import config
 from src.db.client import get_pool
 from src.billing.mollie_adapter import get_mollie_adapter
+
+
+# ---------------------------------------------------------------------------
+# Tax-rate determination — based on recipient billing address
+# ---------------------------------------------------------------------------
+
+# EU member states, ISO 3166-1 alpha-2.  AT is excluded: it uses the domestic
+# rate and needs no Reverse Charge note.
+_EU_COUNTRIES_NON_AT: frozenset[str] = frozenset({
+    "BE", "BG", "CY", "CZ", "DE", "DK", "EE", "ES", "FI",
+    "FR", "GR", "HR", "HU", "IE", "IT", "LT", "LU", "LV", "MT",
+    "NL", "PL", "PT", "RO", "SE", "SI", "SK",
+})
+
+
+def _determine_tax_rate(
+    billing_address: Optional[Dict[str, Any]],
+) -> Tuple[float, Optional[str]]:
+    """Return (tax_rate_percent, reverse_charge_note_or_None).
+
+    Rules:
+    - No address or no country → 20.0 AT domestic (safe default, explicit)
+    - AT → 20.0 (domestic USt)
+    - EU (non-AT) + vatId present → 0.0, Reverse Charge (B2B)
+    - EU (non-AT) without vatId → 20.0 AT (safe default)
+      OPEN DECISION: EU B2C falls under the OSS-Verfahren; correct rate per
+      destination country is a legal question not answered here.  We use 20%
+      AT as the conservative safe default and mark the invoice metadata with
+      {"taxNote": "EU_B2C_OSS_OPEN"} so operators can identify these cases.
+      This is intentional and must be resolved with a tax advisor before
+      serving significant EU B2C volume.
+    - Non-EU → 0.0 (export, no VAT)
+
+    VIES validation of the vatId is NOT performed here.  A non-empty vatId is
+    treated as a B2B signal; the issuer remains responsible for record-keeping
+    under § 18 UStG.
+    """
+    if not billing_address:
+        return 20.0, None
+
+    country = (billing_address.get("country") or "").upper().strip()
+    vat_id = (billing_address.get("vatId") or "").strip()
+
+    if not country:
+        return 20.0, None
+
+    if country == "AT":
+        return 20.0, None
+
+    if country in _EU_COUNTRIES_NON_AT:
+        if vat_id:
+            return 0.0, (
+                "Steuerschuldnerschaft des Leistungsempfängers "
+                "gem. § 19 Abs. 1 UStG (Reverse Charge)"
+            )
+        # EU B2C — OSS open decision, conservative AT default
+        return 20.0, None
+
+    # Non-EU export
+    return 0.0, None
 
 
 def _now() -> str:
@@ -440,11 +500,175 @@ async def list_credit_purchases(user_id: str) -> List[Dict[str, Any]]:
 # Webhook (Mollie ruft auf)
 # ---------------------------------------------------------------------------
 
+async def _record_failed_payment(payment_id: str, status: str) -> None:
+    """Append a billing_event for a Mollie payment that will never complete.
+
+    No state rollback is needed — subscription / topup activation only ever
+    runs on status == "paid" — but a lost payment must stay auditable.
+    """
+    pool = get_pool()
+    async with pool.acquire() as conn:
+        pending = await conn.fetchrow(
+            "SELECT user_id, type, plan_id, amount_eur FROM pending_payments WHERE payment_id = $1",
+            payment_id,
+        )
+    if not pending:
+        # Not one of ours, or the pending row is already gone — nothing to attribute.
+        return
+    await log_billing_event(
+        "payment.failed",
+        user_id=str(pending["user_id"]),
+        mollie_payment_id=payment_id,
+        amount_eur=float(pending["amount_eur"]) if pending["amount_eur"] is not None else None,
+        source="mollie-webhook",
+        payload={"status": status, "type": pending["type"], "planId": pending["plan_id"]},
+    )
+
+
+async def _suspend_subscription_by_mollie_id(
+    mollie_subscription_id: str,
+    payment_id: str,
+    status: str,
+) -> None:
+    """Suspend an active subscription when its recurring Mollie payment fails.
+
+    Mollie fires the webhook for each payment in a subscription — including
+    recurring monthly ones.  Those payments are NOT in pending_payments (only
+    the first payment is), so handle_webhook falls through here.  We look up
+    the subscription by mollie_subscription_id; if it is 'active' we flip it
+    to 'suspended' and leave an audit trail.
+    """
+    pool = get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            UPDATE subscriptions
+               SET status = 'suspended', suspended_at = NOW()
+             WHERE mollie_subscription_id = $1 AND status = 'active'
+            RETURNING id, user_id
+            """,
+            mollie_subscription_id,
+        )
+    if row:
+        await log_billing_event(
+            "subscription.suspended",
+            user_id=str(row["user_id"]),
+            subscription_id=str(row["id"]),
+            mollie_payment_id=payment_id,
+            source="mollie-webhook",
+            payload={"reason": f"recurring_payment_{status}"},
+        )
+
+
+async def expire_subscription_for_user_plan(user_id: str, plan_id: str) -> None:
+    """Mark the user's active subscription for plan_id as 'expired'.
+
+    Called when a trial's budget window closes (trial_expired in evaluate_budget).
+    A no-op when no active subscription row exists (trials provisioned purely
+    through user_budgets have no subscription row).
+    """
+    pool = get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            UPDATE subscriptions
+               SET status = 'expired', expired_at = NOW()
+             WHERE user_id = $1 AND plan_id = $2::plan_id AND status = 'active'
+            RETURNING id
+            """,
+            uuid.UUID(user_id),
+            plan_id,
+        )
+    if row:
+        await log_billing_event(
+            "subscription.expired",
+            user_id=user_id,
+            subscription_id=str(row["id"]),
+            source="budget-check",
+            payload={"planId": plan_id, "reason": "trial_period_ended"},
+        )
+
+
+async def change_subscription(
+    user_id: str,
+    new_plan_id: str,
+    seats: int,
+    success_redirect: str,
+    email: str,
+    name: str,
+) -> Dict[str, Any]:
+    """Upgrade, downgrade, or reseat a subscription.
+
+    Cancels the current active subscription (Mollie + DB) and immediately
+    starts a checkout for the new plan.  The new subscription is activated
+    when the first payment completes via the Mollie webhook.
+
+    Returns the checkout URL together with the ID of the cancelled subscription
+    so the caller can communicate the transition to the user.
+
+    Raises:
+      LookupError  — no active subscription found for the user.
+      ValueError   — new plan/seats are identical to the current ones (no-op guard).
+    """
+    pool = get_pool()
+    async with pool.acquire() as conn:
+        sub = await conn.fetchrow(
+            """
+            SELECT id, plan_id, seats, mollie_customer_id, mollie_subscription_id
+              FROM subscriptions
+             WHERE user_id = $1 AND status = 'active'
+             ORDER BY started_at DESC
+             LIMIT 1
+            """,
+            uuid.UUID(user_id),
+        )
+
+    if not sub:
+        raise LookupError(f"No active subscription for user {user_id}")
+
+    current_plan = sub["plan_id"]
+    current_seats = sub["seats"]
+    if current_plan == new_plan_id and current_seats == seats:
+        raise ValueError(
+            f"New plan ({new_plan_id}, {seats} seats) identical to current — nothing to change"
+        )
+
+    # Validate the new plan exists (raises ValueError for unknown).
+    _plan_price(new_plan_id)
+
+    sub_id = str(sub["id"])
+    await cancel_subscription(user_id, sub_id)
+    checkout = await start_subscription_checkout(
+        user_id, new_plan_id, seats, success_redirect, email, name,
+    )
+    return {
+        "cancelledSubscriptionId": sub_id,
+        "previousPlanId": current_plan,
+        "newPlanId": new_plan_id,
+        "seats": seats,
+        "checkoutUrl": checkout.get("checkoutUrl"),
+        "paymentId": checkout.get("paymentId"),
+    }
+
+
 async def handle_webhook(payment_id: str) -> Dict[str, Any]:
     mollie = get_mollie_adapter()
     payment = await mollie.get_payment(payment_id)
-    if payment.get("status") != "paid":
-        return {"handled": False, "reason": f"status={payment.get('status')}"}
+    status = payment.get("status")
+    if status != "paid":
+        # open / pending / authorized are non-terminal — Mollie fires the
+        # webhook again once the payment settles, so there is nothing to do.
+        # Terminal failures (failed / expired / canceled) get an audit row:
+        # activation is gated on status == "paid" so no state is corrupted,
+        # but a lost payment must never vanish silently from the trail.
+        if status in ("failed", "expired", "canceled"):
+            await _record_failed_payment(payment_id, status)
+            # Recurring subscription payments are NOT in pending_payments.
+            # When such a payment fails, suspend the linked subscription.
+            mollie_sub_id = payment.get("subscription_id")
+            if mollie_sub_id:
+                await _suspend_subscription_by_mollie_id(mollie_sub_id, payment_id, status)
+        return {"handled": False, "reason": f"status={status}"}
 
     pool = get_pool()
     async with pool.acquire() as conn:
@@ -486,6 +710,10 @@ async def handle_webhook(payment_id: str) -> Dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 def _serialize_subscription(row: Any) -> Dict[str, Any]:
+    def _ts(col: str) -> Optional[str]:
+        v = row[col] if col in row.keys() else None
+        return v.isoformat() if v else None
+
     return {
         "id": str(row["id"]),
         "userId": str(row["user_id"]),
@@ -495,8 +723,10 @@ def _serialize_subscription(row: Any) -> Dict[str, Any]:
         "mollieCustomerId": row["mollie_customer_id"],
         "mollieSubscriptionId": row["mollie_subscription_id"],
         "seats": row["seats"],
-        "startedAt": row["started_at"].isoformat() if row["started_at"] else None,
-        "cancelledAt": row["cancelled_at"].isoformat() if row["cancelled_at"] else None,
+        "startedAt": _ts("started_at"),
+        "cancelledAt": _ts("cancelled_at"),
+        "suspendedAt": _ts("suspended_at"),
+        "expiredAt": _ts("expired_at"),
     }
 
 
@@ -550,6 +780,151 @@ async def log_billing_event(
 
 
 # ---------------------------------------------------------------------------
+# Direct subscription provisioning — for seed/test environments (no Mollie).
+# ---------------------------------------------------------------------------
+
+async def _provision_plan_budget(
+    conn: Any, user_id: uuid.UUID, plan: Any
+) -> None:
+    """Insert a monthly budget entry for a paid plan — idempotent.
+
+    Same guard as _provision_trial: the ON CONFLICT UPDATE fires only when the
+    plan key is absent, so existing usage is never reset by a re-seed.
+    Reset window: 30 days (standard monthly billing cycle).
+    """
+    valid_until = (datetime.now(timezone.utc) + timedelta(days=30)).isoformat()
+    entry_json = json.dumps({
+        plan.id: {
+            "limitEur": float(plan.api_budget_eur),
+            "usedEur": 0.0,
+            "resetAt": valid_until,
+        }
+    })
+    await conn.execute(
+        """
+        INSERT INTO user_budgets (user_id, monthly_budgets, updated_at)
+        VALUES ($1, $2::jsonb, NOW())
+        ON CONFLICT (user_id) DO UPDATE
+        SET monthly_budgets = user_budgets.monthly_budgets || $2::jsonb,
+            updated_at = NOW()
+        WHERE (user_budgets.monthly_budgets -> $3) IS NULL
+        """,
+        user_id,
+        entry_json,
+        plan.id,
+    )
+
+
+async def provision_subscription(
+    user_id: str,
+    plan_id: str,
+    seats: int,
+) -> Dict[str, Any]:
+    """
+    Directly provision an active subscription without Mollie — for seeding.
+
+    Produces exactly the state that a successful Mollie checkout + webhook cycle
+    would produce (status='active', monthly budget entry set) without initiating
+    a payment. Synthetic placeholder values fill the Mollie-specific columns so
+    callers without a real Mollie customer can still own a valid subscription row.
+
+    Idempotent: if the user already has an active subscription for this plan,
+    returns it without creating a duplicate. Refuses trial plans (use the normal
+    checkout flow for those — trial provisioning happens auto in evaluate_budget).
+
+    The synthetic mollie_first_payment_id ('provision-{user_id}-{plan_id}') acts
+    as the idempotency key for concurrent callers, just like the real payment ID
+    does in _activate_subscription.
+    """
+    from src.budget.plans import get_plan
+
+    plan = get_plan(plan_id)  # raises ValueError for unknown plan
+    if plan.trial:
+        raise ValueError(
+            f"provision_subscription: cannot provision trial plan '{plan_id}' — "
+            "trials are auto-provisioned via evaluate_budget"
+        )
+
+    pool = get_pool()
+    user_uuid = uuid.UUID(user_id)
+
+    # Pre-check: if the user already owns an active subscription for this plan,
+    # return it immediately. This covers the common idempotent re-seed case
+    # without going through the INSERT path.
+    async with pool.acquire() as conn:
+        existing = await conn.fetchrow(
+            """
+            SELECT id, user_id, app_id, plan_id, status, mollie_customer_id,
+                   mollie_subscription_id, seats, started_at, cancelled_at,
+                   suspended_at, expired_at
+            FROM subscriptions
+            WHERE user_id = $1 AND plan_id = $2::plan_id AND status = 'active'
+            ORDER BY started_at DESC
+            LIMIT 1
+            """,
+            user_uuid, plan_id,
+        )
+        if existing:
+            return _serialize_subscription(existing)
+
+        # No active subscription yet. Insert with synthetic Mollie identifiers.
+        # mollie_first_payment_id is the UNIQUE idempotency key — concurrent callers
+        # that both passed the pre-check will race here; one wins, one hits ON CONFLICT.
+        synth_payment_id = f"provision-{user_id}-{plan_id}"
+        synth_customer_id = f"seed-{user_id}"
+        sub_uuid = uuid.uuid4()
+
+        row = await conn.fetchrow(
+            """
+            INSERT INTO subscriptions
+              (id, user_id, app_id, plan_id, status,
+               mollie_customer_id, mollie_subscription_id, mollie_first_payment_id,
+               seats, started_at, metadata)
+            VALUES ($1, $2, $3, $4::plan_id, 'active',
+                    $5, NULL, $6, $7, NOW(), '{"provisioned": true}'::jsonb)
+            ON CONFLICT (mollie_first_payment_id) DO NOTHING
+            RETURNING id, user_id, app_id, plan_id, status, mollie_customer_id,
+                      mollie_subscription_id, seats, started_at, cancelled_at,
+                      suspended_at, expired_at
+            """,
+            sub_uuid, user_uuid, plan.app_id, plan_id,
+            synth_customer_id, synth_payment_id, seats,
+        )
+
+        if row:
+            await _provision_plan_budget(conn, user_uuid, plan)
+            sub_dict = _serialize_subscription(row)
+            sub_id = sub_dict["id"]
+        else:
+            # ON CONFLICT: concurrent caller won the race. Return their row.
+            winner = await conn.fetchrow(
+                """
+                SELECT id, user_id, app_id, plan_id, status, mollie_customer_id,
+                       mollie_subscription_id, seats, started_at, cancelled_at,
+                       suspended_at, expired_at
+                FROM subscriptions WHERE mollie_first_payment_id = $1
+                """,
+                synth_payment_id,
+            )
+            if not winner:
+                raise RuntimeError(
+                    f"provision_subscription: ON CONFLICT fired but no row found "
+                    f"for payment_id={synth_payment_id}"
+                )
+            sub_dict = _serialize_subscription(winner)
+            sub_id = sub_dict["id"]
+
+    await log_billing_event(
+        "subscription.provisioned",
+        user_id=user_id,
+        subscription_id=sub_id,
+        source="seed",
+        payload={"planId": plan_id, "seats": seats},
+    )
+    return sub_dict
+
+
+# ---------------------------------------------------------------------------
 # Auto-invoice helper — called from Mollie-webhook handlers after a paid event.
 # ---------------------------------------------------------------------------
 
@@ -561,12 +936,20 @@ async def auto_create_invoice(
     subscription_id: str | None = None,
     credit_purchase_id: str | None = None,
     mollie_payment_id: str | None = None,
-    tax_rate: float = 20.0,
 ) -> str | None:
     """Insert one invoice row, mark it 'paid', return the id.
 
     Idempotent: if an invoice already exists for this mollie_payment_id, return
     the existing id without re-inserting (fixes Mollie webhook retries).
+
+    Resolves the tenant's billing address to populate invoices.billing_address
+    and determine the correct tax rate (AT: 20%, EU B2B Reverse Charge: 0%,
+    non-EU export: 0%).  If the address is missing the invoice is still created
+    — the payment happened and the record MUST exist — but metadata carries
+    {"incomplete": True, "missingBillingAddress": True} so operators can
+    identify and correct the gap.
+
+    EU B2C tax (OSS-Verfahren) is an OPEN DECISION: see _determine_tax_rate.
     """
     import json as _json
     from decimal import Decimal
@@ -582,6 +965,47 @@ async def auto_create_invoice(
         if existing:
             return str(existing)
 
+    # Resolve tenant and billing address.  Failure is non-fatal: invoice is
+    # created with NULL billing_address and marked incomplete.
+    tenant_id: str | None = None
+    billing_address: Dict[str, Any] | None = None
+    eu_b2c_flag = False
+    try:
+        async with pool.acquire() as conn:
+            trow = await conn.fetchrow(
+                """
+                SELECT u.tenant_id,
+                       t.billing_name, t.billing_street, t.billing_city,
+                       t.billing_postcode, t.billing_country, t.billing_vat_id
+                FROM users u
+                LEFT JOIN tenants t ON t.id = u.tenant_id
+                WHERE u.id = $1
+                """,
+                uuid.UUID(user_id),
+            )
+        if trow and trow["tenant_id"]:
+            tenant_id = trow["tenant_id"]
+            if trow["billing_name"]:
+                billing_address = {
+                    "name": trow["billing_name"],
+                    "street": trow["billing_street"],
+                    "city": trow["billing_city"],
+                    "postcode": trow["billing_postcode"],
+                    "country": (trow["billing_country"] or "").upper().strip() or None,
+                    "vatId": trow["billing_vat_id"],
+                }
+    except Exception:
+        pass  # billing_address stays None — marked incomplete below
+
+    tax_rate, reverse_charge_note = _determine_tax_rate(billing_address)
+
+    # Detect EU B2C (no vatId in EU non-AT country) — mark for operator review.
+    if billing_address:
+        country = (billing_address.get("country") or "").upper()
+        vat_id = (billing_address.get("vatId") or "").strip()
+        if country in _EU_COUNTRIES_NON_AT and not vat_id:
+            eu_b2c_flag = True
+
     subtotal = Decimal(str(amount_eur))
     tax = (subtotal * Decimal(str(tax_rate)) / Decimal("100")).quantize(Decimal("0.01"))
     total = (subtotal + tax).quantize(Decimal("0.01"))
@@ -594,6 +1018,17 @@ async def auto_create_invoice(
         "metadata": {},
     }]
 
+    metadata: Dict[str, Any] = {"autoCreated": True, "source": "mollie-webhook"}
+    if billing_address is None:
+        metadata["incomplete"] = True
+        metadata["missingBillingAddress"] = True
+    if reverse_charge_note:
+        metadata["reverseChargeNote"] = reverse_charge_note
+    if eu_b2c_flag:
+        # EU B2C without vatId — OSS-Verfahren applies, tax rate is approximate.
+        # OPEN DECISION: must be reviewed with tax advisor before serving EU B2C volume.
+        metadata["taxNote"] = "EU_B2C_OSS_OPEN"
+
     now = datetime.now(timezone.utc)
     year = now.year
     async with pool.acquire() as conn:
@@ -605,22 +1040,24 @@ async def auto_create_invoice(
             row = await conn.fetchrow(
                 """
                 INSERT INTO invoices
-                  (invoice_number, user_id, subscription_id, credit_purchase_id,
+                  (invoice_number, user_id, tenant_id, subscription_id, credit_purchase_id,
                    mollie_payment_id, status, subtotal_eur, tax_rate, tax_eur, total_eur,
-                   currency, line_items, issued_at, paid_at, metadata)
-                VALUES ($1, $2, $3, $4, $5, 'paid', $6, $7, $8, $9, 'EUR', $10::jsonb,
-                        NOW(), NOW(), $11::jsonb)
+                   currency, line_items, billing_address, issued_at, paid_at, metadata)
+                VALUES ($1, $2, $3, $4, $5, $6, 'paid', $7, $8, $9, $10, 'EUR', $11::jsonb,
+                        $12::jsonb, NOW(), NOW(), $13::jsonb)
                 ON CONFLICT (mollie_payment_id) DO NOTHING
                 RETURNING id
                 """,
                 invoice_number,
                 uuid.UUID(user_id),
+                tenant_id,
                 uuid.UUID(subscription_id) if subscription_id else None,
                 uuid.UUID(credit_purchase_id) if credit_purchase_id else None,
                 mollie_payment_id,
                 subtotal, tax_rate, tax, total,
                 _json.dumps(line_items),
-                _json.dumps({"autoCreated": True, "source": "mollie-webhook"}),
+                _json.dumps(billing_address) if billing_address else None,
+                _json.dumps(metadata),
             )
 
     if row:
@@ -628,6 +1065,7 @@ async def auto_create_invoice(
         await log_billing_event(
             "invoice.issued",
             user_id=user_id,
+            tenant_id=tenant_id,
             subscription_id=subscription_id,
             invoice_id=invoice_id,
             mollie_payment_id=mollie_payment_id,

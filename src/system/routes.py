@@ -15,7 +15,7 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 import httpx
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException, Query
 
 from src.api_auth import require_admin, AuthClaims
 from src.db.client import get_pool
@@ -32,6 +32,7 @@ _APP_HEALTH_TARGETS = [
     ("werking-noise",   "https://werking-noise.vercel.app/api/health"),
     ("engelmann",       "https://engelmann.vercel.app/api/health"),
 ]
+_ALLOWED_APP_IDS = {name for name, _ in _APP_HEALTH_TARGETS}
 _PROBE_TIMEOUT_S = 4.0
 
 
@@ -91,6 +92,15 @@ async def _db_snapshot() -> Dict[str, Any]:
 
 @router.get("/health")
 async def system_health_overview(
+    app: Optional[str] = Query(
+        default=None,
+        description=(
+            "Optional app to probe in isolation. When set, only that app's "
+            "frontend health endpoint is probed; `apps` contains a single entry. "
+            "Bridge DB stats stay cross-app — they describe the bridge, not "
+            "one app's usage."
+        ),
+    ),
     _claims: AuthClaims = Depends(require_admin),
 ) -> Dict[str, Any]:
     """
@@ -105,10 +115,18 @@ async def system_health_overview(
     Defensive: a single app being unreachable does NOT fail the whole call —
     we report each result individually so the operator sees the full picture.
     """
+    if app and app not in _ALLOWED_APP_IDS:
+        raise HTTPException(status_code=400, detail=f"Unknown app: {app}")
+
+    targets = (
+        [(name, url) for name, url in _APP_HEALTH_TARGETS if name == app]
+        if app else _APP_HEALTH_TARGETS
+    )
+
     db_task = asyncio.create_task(_db_snapshot())
     async with httpx.AsyncClient(follow_redirects=True) as client:
         app_results = await asyncio.gather(
-            *(_probe_app(client, name, url) for name, url in _APP_HEALTH_TARGETS),
+            *(_probe_app(client, name, url) for name, url in targets),
             return_exceptions=False,
         )
     db = await db_task
@@ -119,6 +137,7 @@ async def system_health_overview(
     return {
         "generatedAt": datetime.now(timezone.utc).isoformat(),
         "summary": summary,
+        "app": app,
         "bridge": db,
         "apps": app_results,
     }

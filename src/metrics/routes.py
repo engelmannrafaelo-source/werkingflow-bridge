@@ -34,40 +34,10 @@ _ALLOWED_APP_IDS = {
     "werking-noise", "engelmann",
 }
 
-# Per-1M-token pricing in USD, defaults match Anthropic public list-prices.
-# Override via env: MODEL_PRICING_JSON='{"claude-opus-4":{"in":15,"out":75}}'
-_DEFAULT_PRICING = {
-    "claude-sonnet-4-5":            {"in": 3.00,  "out": 15.00},
-    "claude-sonnet-4-5-20250929":   {"in": 3.00,  "out": 15.00},
-    "claude-sonnet-4-6":            {"in": 3.00,  "out": 15.00},
-    "claude-opus-4":                {"in": 15.00, "out": 75.00},
-    "claude-opus-4-7":              {"in": 15.00, "out": 75.00},
-    "claude-haiku-4-5":             {"in": 1.00,  "out": 5.00},
-    "claude-haiku-4-5-20251001":    {"in": 1.00,  "out": 5.00},
-    "gpt-5":                        {"in": 5.00,  "out": 15.00},
-    "gpt-5-mini":                   {"in": 0.30,  "out": 1.20},
-}
-
-
-def _load_pricing() -> Dict[str, Dict[str, float]]:
-    """Merge defaults with env override. Env keys are model IDs."""
-    pricing = dict(_DEFAULT_PRICING)
-    override = os.environ.get("MODEL_PRICING_JSON", "")
-    if override:
-        import json as _json
-        try:
-            pricing.update(_json.loads(override))
-        except Exception:
-            pass
-    return pricing
-
-
-def _usd_to_eur_rate() -> float:
-    """Static USD→EUR for invoice predictability. Override via env, default 0.92."""
-    try:
-        return float(os.environ.get("USD_TO_EUR_RATE", "0.92"))
-    except Exception:
-        return 0.92
+# Pricing comes from the Single Source of Truth — src/pricing.py.
+# Kept as thin local aliases so the rest of this module is unchanged.
+from src.pricing import load_pricing as _load_pricing
+from src.pricing import usd_to_eur_rate as _usd_to_eur_rate
 
 
 def _model_cost_eur(model: Optional[str], prompt_tokens: int, completion_tokens: int,
@@ -97,7 +67,7 @@ async def usage_metrics(
     appId: Optional[str] = Query(None),
     tenantId: Optional[str] = Query(None),
     userId: Optional[str] = Query(None),
-    mode: Optional[str] = Query(None, description="prod|staging|local — filter by tenant.category"),
+    mode: Optional[str] = Query(None, description="prod|staging|local — filter by app_env (X-App-Env)"),
     _claims: AuthClaims = Depends(require_admin),
 ) -> Dict[str, Any]:
     """
@@ -114,9 +84,7 @@ async def usage_metrics(
     until_dt = _parse_iso(until) or datetime.now(timezone.utc)
     since_dt = _parse_iso(since) or (until_dt - timedelta(days=30))
 
-    # All activity columns explicitly qualified as `a.*` — `category` exists on
-    # both `activities` (workflow|...) and `tenants` (prod|staging|local) and
-    # would be ambiguous once we LEFT JOIN tenants below.
+    # Activity columns stay qualified as `a.*` for readability.
     where = ["a.category = 'workflow'", "a.event_type LIKE 'ai-call:%' OR a.event_type LIKE 'ai-call-error:%'",
              "a.timestamp >= $1", "a.timestamp <= $2"]
     args: List[Any] = [since_dt, until_dt]
@@ -137,11 +105,12 @@ async def usage_metrics(
             raise HTTPException(status_code=400, detail=f"Invalid userId UUID: {userId}")
         _add("a.actor_user_id = $$", uid)
 
-    join_tenants = ""
+    # "mode" filters by the environment the call came from
+    # (X-App-Env → activities.app_env), not the customer's tenant.account_type.
+    # NULL app_env (pre-migration / no header) is excluded when filtered.
     if mode:
         args.append(mode)
-        where.append(f"t.category = ${len(args)}::tenant_category")
-        join_tenants = "LEFT JOIN tenants t ON t.id = a.tenant_id"
+        where.append(f"a.app_env = ${len(args)}::app_env")
 
     where_sql = " AND ".join(f"({cx})" if " OR " in cx else cx for cx in where)
     sql = f"""
@@ -151,7 +120,7 @@ async def usage_metrics(
           (a.payload->>'promptTokens')::bigint      AS prompt_tokens,
           (a.payload->>'completionTokens')::bigint  AS completion_tokens,
           (a.payload->>'totalTokens')::bigint       AS total_tokens
-        FROM activities a {join_tenants}
+        FROM activities a
         WHERE {where_sql}
     """
 
@@ -283,8 +252,7 @@ async def usage_timeseries(
     default_lookback = timedelta(days=30 if bucket == "day" else 2)
     since_dt = _parse_iso(since) or (until_dt - default_lookback)
 
-    # All activity columns explicitly qualified — `category` is on both
-    # activities and tenants and would be ambiguous once we LEFT JOIN tenants.
+    # Activity columns stay qualified as `a.*` for readability.
     where = ["a.category = 'workflow'",
              "(a.event_type LIKE 'ai-call:%' OR a.event_type LIKE 'ai-call-error:%')",
              "a.timestamp >= $1", "a.timestamp <= $2"]
@@ -293,11 +261,12 @@ async def usage_timeseries(
         args.append(appId)
         where.append(f"a.app_id = ${len(args)}")
 
-    join_tenants = ""
+    # "mode" filters by the environment the call came from
+    # (X-App-Env → activities.app_env), not the customer's tenant.account_type.
+    # NULL app_env (pre-migration / no header) is excluded when filtered.
     if mode:
         args.append(mode)
-        where.append(f"t.category = ${len(args)}::tenant_category")
-        join_tenants = "LEFT JOIN tenants t ON t.id = a.tenant_id"
+        where.append(f"a.app_env = ${len(args)}::app_env")
 
     where_sql = " AND ".join(where)
     sql = f"""
@@ -308,7 +277,7 @@ async def usage_timeseries(
           (a.payload->>'promptTokens')::bigint      AS prompt_tokens,
           (a.payload->>'completionTokens')::bigint  AS completion_tokens,
           a.event_type
-        FROM activities a {join_tenants}
+        FROM activities a
         WHERE {where_sql}
         ORDER BY bucket_ts ASC
     """

@@ -150,8 +150,12 @@ docker compose exec nginx nginx -s reload 2>/dev/null && ok "nginx config reload
 
 # Phase 4: Cleanup
 echo ""
-log "Cleaning up build cache..."
+log "Cleaning up build cache + stale images..."
 docker builder prune -f
+# Each rebuild leaves the previous worker/privacy images dangling — multi-GB
+# each. Without this they pile up until the disk hits 100% and Postgres can no
+# longer write (whole DB layer 503s). Prune unreferenced images every rebuild.
+docker image prune -f
 
 echo ""
 ok "Graceful rebuild complete!"

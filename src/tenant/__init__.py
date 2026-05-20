@@ -23,7 +23,9 @@ from .middleware import (
     get_agent_id_from_request,
     get_session_id_from_request,
     get_workflow_id_from_request,
-    get_job_id_from_request
+    get_job_id_from_request,
+    get_app_env_from_request,
+    normalize_app_env
 )
 from .client import SupabaseTenantClient, TenantSettings, get_tenant_client
 from .usage_tracker import (
@@ -50,6 +52,8 @@ __all__ = [
     'get_session_id_from_request',
     'get_workflow_id_from_request',
     'get_job_id_from_request',
+    'get_app_env_from_request',
+    'normalize_app_env',
     # Client
     'SupabaseTenantClient',
     'TenantSettings',

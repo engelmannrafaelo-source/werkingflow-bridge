@@ -5,10 +5,12 @@ Mounted under /v1/budget — only active when BRIDGE_DB_URL is set.
 Auth model:
   - /v1/budget/check, /deduct   : require_jwt_or_service (app backends call this on every AI call)
   - /v1/budget/topup/credit     : require_service_token (internal/webhook ONLY — credits real money)
+  - GET /v1/budget              : require_admin (platform-admin overview of every user)
   - GET /v1/budget/{user_id}    : require_self_or_admin (a user can read own budget; admin reads any)
 
 POST /v1/budget/check          {userId, planId, estimatedCostEur} -> BudgetCheckResult
 POST /v1/budget/deduct         {userId, planId, actualCostEur} -> BudgetDeductionResult (atomic)
+GET  /v1/budget                -> { items: [BudgetSummary], count }   (admin — all users)
 GET  /v1/budget/{user_id}      -> { monthlyBudgets, topUpBalanceEur, updatedAt }
 POST /v1/budget/topup/credit   {userId, amountEur} -> { newBalance }  (service-token only)
 """
@@ -26,6 +28,7 @@ from src.api_auth import (
     require_jwt_or_service,
     require_service_token,
     require_self_or_admin,
+    require_admin,
     AuthClaims,
 )
 from src.budget.calculator import (
@@ -185,6 +188,16 @@ async def evaluate_budget(
     if get_plan(effective_plan_id).trial:
         entry = budget.monthly_budgets.get(effective_plan_id)
         if entry and _is_trial_expired(entry):
+            # Best-effort: mark any active trial subscription as expired.
+            # Non-fatal — a missing subscription row (trial was budget-only) is fine.
+            try:
+                from src.billing.billing_service import expire_subscription_for_user_plan
+                await expire_subscription_for_user_plan(str(user_id), effective_plan_id)
+            except Exception:
+                logger.warning(
+                    "[BudgetCheck] expire_subscription_for_user_plan failed for user=%s plan=%s",
+                    user_id, effective_plan_id, exc_info=True,
+                )
             return {
                 "allowed": False,
                 "reason": "trial_expired",
@@ -255,16 +268,29 @@ def _build_monthly_budgets(raw_monthly: dict) -> Dict[str, MonthlyBudgetEntry]:
     }
 
 
-@router.post("/deduct")
-async def budget_deduct(
-    body: DeductRequest,
-    _claims: AuthClaims = Depends(require_jwt_or_service),
+class BudgetDeductionDenied(Exception):
+    """Deduction refused for a budget reason (not a validation error)."""
+    def __init__(self, reason: str):
+        super().__init__(reason)
+        self.reason = reason
+
+
+async def apply_budget_deduction(
+    user_id: uuid.UUID,
+    plan_id: str,
+    actual_cost_eur: float,
 ) -> Dict[str, Any]:
-    user_id = _parse_user_id(body.userId)
-    try:
-        get_plan(body.planId)
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
+    """
+    Atomically deduct actual_cost_eur from the user's budget for plan_id.
+
+    Auto-provisions a trial when the user is unlicensed and a trial sibling
+    exists. Shared by the POST /v1/budget/deduct endpoint and the Bridge's
+    post-call self-deduction (src/activity/ai_call_writer.py).
+
+    Raises ValueError on an unknown plan, BudgetDeductionDenied(reason) on
+    'BUDGET_EXCEEDED' / 'trial_expired'.
+    """
+    get_plan(plan_id)  # raises ValueError on an unknown plan
 
     pool = get_pool()
 
@@ -290,9 +316,9 @@ async def budget_deduct(
             )
 
             # Auto-provision trial when user is unlicensed and a trial sibling exists.
-            effective_plan_id = body.planId
-            if budget.monthly_budgets.get(body.planId) is None:
-                trial = find_trial_plan_for(body.planId)
+            effective_plan_id = plan_id
+            if budget.monthly_budgets.get(plan_id) is None:
+                trial = find_trial_plan_for(plan_id)
                 if trial is not None:
                     effective_plan_id = trial.id
                     if budget.monthly_budgets.get(trial.id) is None:
@@ -313,12 +339,12 @@ async def budget_deduct(
             if get_plan(effective_plan_id).trial:
                 entry = budget.monthly_budgets.get(effective_plan_id)
                 if entry and _is_trial_expired(entry):
-                    raise HTTPException(status_code=402, detail="trial_expired")
+                    raise BudgetDeductionDenied("trial_expired")
 
             try:
-                result = deduct_budget(budget, effective_plan_id, body.actualCostEur)
+                result = deduct_budget(budget, effective_plan_id, actual_cost_eur)
             except ValueError:
-                raise HTTPException(status_code=402, detail="BUDGET_EXCEEDED")
+                raise BudgetDeductionDenied("BUDGET_EXCEEDED")
 
             # Write updated monthly usage back against effective_plan_id.
             updated_raw = dict(raw_monthly)
@@ -356,6 +382,20 @@ async def budget_deduct(
         "newTopUpBalance": result.new_top_up_balance,
         "effectivePlanId": effective_plan_id,
     }
+
+
+@router.post("/deduct")
+async def budget_deduct(
+    body: DeductRequest,
+    _claims: AuthClaims = Depends(require_jwt_or_service),
+) -> Dict[str, Any]:
+    user_id = _parse_user_id(body.userId)
+    try:
+        return await apply_budget_deduction(user_id, body.planId, body.actualCostEur)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except BudgetDeductionDenied as e:
+        raise HTTPException(status_code=402, detail=e.reason)
 
 
 # ---------------------------------------------------------------------------
@@ -400,6 +440,63 @@ async def topup_credit(
 # ---------------------------------------------------------------------------
 # GET /v1/budget/{user_id}
 # ---------------------------------------------------------------------------
+
+@router.get("")
+async def list_budgets(
+    _claims: AuthClaims = Depends(require_admin),
+) -> Dict[str, Any]:
+    """Admin overview — one budget summary per user in a single query.
+
+    GET /{user_id} stays the per-user detail view; this list is what the
+    Platform-Admin UI joins against /v1/users to render the budget column.
+    Aggregates usedEur/limitEur across all plan budgets a user holds.
+    """
+    pool = get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT ub.user_id, ub.monthly_budgets, ub.updated_at,
+                   tb.balance_eur AS topup_balance
+            FROM user_budgets ub
+            LEFT JOIN user_topup_balances tb ON tb.user_id = ub.user_id
+            """
+        )
+
+    items = []
+    for row in rows:
+        raw = row["monthly_budgets"]
+        if isinstance(raw, str):
+            raw = json.loads(raw)
+        raw_monthly = raw or {}
+
+        used_eur = 0.0
+        limit_eur = 0.0
+        monthly: Dict[str, Any] = {}
+        for plan_id, entry in raw_monthly.items():
+            e_used = float(entry["usedEur"])
+            e_limit = float(entry["limitEur"])
+            used_eur += e_used
+            limit_eur += e_limit
+            monthly[plan_id] = {
+                "limitEur": e_limit,
+                "usedEur": e_used,
+                "resetAt": entry["resetAt"],
+            }
+
+        topup = float(row["topup_balance"]) if row["topup_balance"] is not None else 0.0
+
+        items.append({
+            "userId": str(row["user_id"]),
+            "monthlyBudgets": monthly,
+            "topUpBalanceEur": topup,
+            "usedEur": round(used_eur, 4),
+            "limitEur": round(limit_eur, 4),
+            "remainingEur": round(limit_eur - used_eur + topup, 4),
+            "updatedAt": row["updated_at"].isoformat() if row["updated_at"] else None,
+        })
+
+    return {"items": items, "count": len(items)}
+
 
 @router.get("/{user_id}")
 async def get_budget(

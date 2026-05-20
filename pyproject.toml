@@ -25,6 +25,13 @@ pytz = ">=2024.1"
 asyncpg = "^0.29.0"
 bcrypt = "^4.2.0"
 pyjwt = "^2.9.0"
+# Invoice PDF rendering (HTML → PDF via WeasyPrint + Cairo/Pango)
+# Requires system packages: libpango-1.0-0, libpangoft2-1.0-0, libpangocairo-1.0-0,
+# libcairo2, libgdk-pixbuf2.0-0, shared-mime-info, fonts-liberation — see Dockerfile.
+weasyprint = "^62.0"
+
+# Mollie payment integration (LiveMollieAdapter — checkout, subscriptions, webhooks)
+mollie-api-python = "^3.0"
 
 # AWS Bedrock support (DSGVO-compliant backend)
 boto3 = "^1.35.0"

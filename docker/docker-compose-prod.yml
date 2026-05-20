@@ -21,7 +21,7 @@ services:
   # ===========================================================================
   nginx:
     image: nginx:alpine
-    container_name: eco-prod-lb
+    container_name: wt-prod-lb
     ports:
       - "8000:80"
     volumes:
@@ -51,7 +51,7 @@ services:
     build:
       context: ..
       dockerfile: docker/Dockerfile.worker
-    container_name: eco-prod-worker-sahori
+    container_name: wt-prod-worker-sahori
     expose:
       - "8000"
     deploy:
@@ -63,7 +63,7 @@ services:
     volumes:
       - prod-logs:/app/logs
       - prod-instances:/app/instances
-      - ~/eco-research-output:/app/research_output
+      - ~/wt-research-output:/app/research_output
     secrets:
       - claude_token_sahori
     environment:
@@ -104,7 +104,7 @@ services:
     build:
       context: ..
       dockerfile: docker/Dockerfile.worker
-    container_name: eco-prod-worker-kurt
+    container_name: wt-prod-worker-kurt
     expose:
       - "8000"
     deploy:
@@ -116,7 +116,7 @@ services:
     volumes:
       - prod-logs:/app/logs
       - prod-instances:/app/instances
-      - ~/eco-research-output:/app/research_output
+      - ~/wt-research-output:/app/research_output
     secrets:
       - claude_token_kurt
     environment:
@@ -157,7 +157,7 @@ services:
     build:
       context: ..
       dockerfile: docker/Dockerfile.privacy-pdf
-    container_name: eco-prod-privacy
+    container_name: wt-prod-privacy
     expose:
       - "8100"
     deploy:
@@ -196,7 +196,7 @@ services:
     build:
       context: ..
       dockerfile: docker/Dockerfile.metrics-reader
-    container_name: eco-prod-metrics-reader
+    container_name: wt-prod-metrics-reader
     expose:
       - "8000"
     deploy:

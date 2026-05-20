@@ -2,10 +2,11 @@
 Auth endpoints: login / logout / session.
 Mounted under /v1/auth — only active when BRIDGE_DB_URL is set.
 
-POST /v1/auth/login   {email, password} -> {jwt, user, appLicenses[]}   PUBLIC
-POST /v1/auth/logout  Bearer <jwt> -> 204                              require_jwt
-GET  /v1/auth/session Bearer <jwt> -> {user, appLicenses[]}            require_jwt
-POST /v1/auth/issue   X-Bridge-Service-Token {userId} -> {jwt, expiresAt}  require_service_token
+POST /v1/auth/login      {email, password} -> {jwt, user, appLicenses[]}  PUBLIC
+POST /v1/auth/logout     Bearer <jwt> -> 204                             require_jwt
+GET  /v1/auth/session    Bearer <jwt> -> {user, appLicenses[]}           require_jwt
+POST /v1/auth/issue      X-Bridge-Service-Token {userId} -> {jwt, expiresAt}  require_service_token
+POST /v1/auth/test-token {email} -> {jwt, user, appLicenses[]}           service-token, test tenants only
 """
 import logging
 import uuid
@@ -13,7 +14,7 @@ from datetime import datetime, timezone, timedelta
 from typing import Any, Dict, List, Optional
 
 import jwt
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi import Security
 from pydantic import BaseModel, EmailStr
@@ -51,6 +52,7 @@ def _user_dict(row: Any, licenses: List[Dict[str, Any]]) -> Dict[str, Any]:
         "email": row["email"],
         "name": row["name"],
         "tenantId": row["tenant_id"],
+        "role": row["role"],
         "appLicenses": licenses,
         "createdAt": row["created_at"].isoformat(),
         "updatedAt": row["updated_at"].isoformat(),
@@ -59,7 +61,7 @@ def _user_dict(row: Any, licenses: List[Dict[str, Any]]) -> Dict[str, Any]:
 
 async def _fetch_user_with_licenses(conn: Any, user_id: uuid.UUID) -> Optional[Dict[str, Any]]:
     row = await conn.fetchrow(
-        "SELECT id, email, name, tenant_id, created_at, updated_at FROM users WHERE id = $1",
+        "SELECT id, email, name, tenant_id, role, created_at, updated_at FROM users WHERE id = $1",
         user_id,
     )
     if not row:
@@ -91,7 +93,7 @@ async def login(body: LoginRequest) -> Dict[str, Any]:
     pool = get_pool()
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
-            "SELECT id, email, name, tenant_id, password_hash, created_at, updated_at FROM users WHERE email = $1",
+            "SELECT id, email, name, tenant_id, role, password_hash, created_at, updated_at FROM users WHERE email = $1",
             body.email,
         )
 
@@ -116,6 +118,7 @@ async def login(body: LoginRequest) -> Dict[str, Any]:
         email=row["email"],
         tenant_id=row["tenant_id"],
         app_licenses=app_licenses,
+        role=row["role"],
     )
 
     # Store session
@@ -135,14 +138,98 @@ async def login(body: LoginRequest) -> Dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# POST /v1/auth/test-token
+# ---------------------------------------------------------------------------
+
+class TestTokenRequest(BaseModel):
+    email: EmailStr
+
+
+async def _issue_token(conn: Any, row: Any) -> Dict[str, Any]:
+    """Sign a JWT for an already-fetched user row and persist its session.
+
+    `row` must carry: id, email, name, tenant_id, role, created_at, updated_at.
+    """
+    user_id = row["id"]
+    license_rows = await conn.fetch(
+        "SELECT app_id, plan_id, start_date, end_date, seats FROM app_licenses WHERE user_id = $1",
+        user_id,
+    )
+    app_licenses = [_license_row(lr) for lr in license_rows]
+
+    token = sign_jwt(
+        user_id=str(user_id),
+        email=row["email"],
+        tenant_id=row["tenant_id"],
+        app_licenses=app_licenses,
+        role=row["role"],
+    )
+
+    now = datetime.now(timezone.utc)
+    await conn.execute(
+        "INSERT INTO sessions (user_id, token, created_at, expires_at) VALUES ($1, $2, $3, $4)",
+        user_id,
+        token,
+        now,
+        now + timedelta(hours=_SESSION_TTL_HOURS),
+    )
+    return {"jwt": token, "user": _user_dict(row, app_licenses), "appLicenses": app_licenses}
+
+
+@router.post("/test-token")
+async def test_token(
+    body: TestTokenRequest,
+    _claims: AuthClaims = Depends(require_service_token),
+) -> Dict[str, Any]:
+    """
+    Mint a JWT for a test user without a password — for the unified tester.
+
+    The tester needs Bearer tokens for users it did not create the password
+    for, and must bypass the single-active-session rule. Two hard guards keep
+    this safe in every environment (fail-fast, no silent fallback):
+
+      1. require_service_token — only callers holding the Bridge service token.
+      2. The user's tenant MUST be account_type='test'. A token can never be
+         minted for a 'customer' or 'internal' account, even with a valid
+         service token. This is the wall, not the service token alone.
+    """
+    pool = get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            SELECT u.id, u.email, u.name, u.tenant_id, u.role,
+                   u.created_at, u.updated_at, t.account_type
+            FROM users u
+            JOIN tenants t ON t.id = u.tenant_id
+            WHERE u.email = $1
+            """,
+            body.email,
+        )
+
+        if not row:
+            raise HTTPException(status_code=404, detail="User not found")
+
+        if row["account_type"] != "test":
+            raise HTTPException(
+                status_code=403,
+                detail=(
+                    f"test-token refused: tenant account_type is "
+                    f"'{row['account_type']}', not 'test'"
+                ),
+            )
+
+        return await _issue_token(conn, row)
+
+
+# ---------------------------------------------------------------------------
 # POST /v1/auth/logout
 # ---------------------------------------------------------------------------
 
-@router.post("/logout", status_code=204)
+@router.post("/logout", status_code=204, response_class=Response)
 async def logout(
     credentials: Optional[HTTPAuthorizationCredentials] = Security(_bearer),
     _claims: AuthClaims = Depends(require_jwt),
-) -> None:
+) -> Response:
     """
     Revoke the current JWT's session row. require_jwt has already validated
     the signature + expiry; here we just mark sessions.expires_at = NOW().
@@ -156,6 +243,7 @@ async def logout(
             "UPDATE sessions SET expires_at = NOW() WHERE token = $1",
             token,
         )
+    return Response(status_code=204)
 
 
 # ---------------------------------------------------------------------------

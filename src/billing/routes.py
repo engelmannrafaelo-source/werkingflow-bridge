@@ -9,17 +9,22 @@ Auth model:
   - /v1/billing/{user_id}/...        require_self_or_admin
 """
 import json
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
-from fastapi import APIRouter, Depends, Form, HTTPException, Response
+from fastapi import APIRouter, Depends, Form, HTTPException, Query, Response
 from pydantic import BaseModel, Field
 
 from src.billing import billing_service
-from src.api_auth import require_admin, require_jwt_or_service, require_self_or_admin, AuthClaims
+from src.api_auth import require_admin, require_jwt_or_service, require_self_or_admin, require_service_token, AuthClaims
 from src.budget.plans import PLANS
 from src.db.client import get_pool
 
 router = APIRouter(prefix="/v1/billing", tags=["billing"])
+
+_ALLOWED_APP_IDS = {
+    "werking-report", "werking-energy", "werking-safety",
+    "werking-noise", "engelmann",
+}
 
 
 # ---------------------------------------------------------------------------
@@ -28,6 +33,14 @@ router = APIRouter(prefix="/v1/billing", tags=["billing"])
 
 @router.get("/overview")
 async def billing_overview(
+    app: Optional[str] = Query(
+        default=None,
+        description=(
+            "Filter subscription stats to one app (werking-report|werking-energy|"
+            "werking-safety|werking-noise|engelmann). Top-up totals are "
+            "app-overarching and are returned as null when filtered."
+        ),
+    ),
     _claims: AuthClaims = Depends(require_admin),
 ) -> Dict[str, Any]:
     """
@@ -42,7 +55,16 @@ async def billing_overview(
     MRR is estimated, not invoiced: trial=€0, plan-prices from
     src/budget/plans.py multiplied by seats. Replaces with real Mollie totals
     once the live billing path is hot.
+
+    Optional `app` filter restricts subscription-side stats to one app.
+    Top-up revenue is intentionally NOT app-attributable (credit_purchases
+    has no app dimension — top-ups are a wallet, used across apps) and is
+    returned as null when filtered, so the dashboard doesn't surface a
+    misleading "energy made €X in top-ups".
     """
+    if app and app not in _ALLOWED_APP_IDS:
+        raise HTTPException(status_code=400, detail=f"Unknown app: {app}")
+
     pool = get_pool()
     plan_prices = {pid: p.price for pid, p in PLANS.items()}
     # Legacy plan-id aliases from werking-report's own catalog. Remove once the
@@ -59,9 +81,15 @@ async def billing_overview(
     source = "subscriptions"
 
     async with pool.acquire() as conn:
-        sub_rows = await conn.fetch(
-            "SELECT status, plan_id, seats, app_id FROM subscriptions"
-        )
+        if app:
+            sub_rows = await conn.fetch(
+                "SELECT status, plan_id, seats, app_id FROM subscriptions WHERE app_id = $1::app_id",
+                app,
+            )
+        else:
+            sub_rows = await conn.fetch(
+                "SELECT status, plan_id, seats, app_id FROM subscriptions"
+            )
 
     if sub_rows:
         for r in sub_rows:
@@ -84,14 +112,26 @@ async def billing_overview(
         # the dashboard isn't blank during the WR→Bridge transition.
         source = "activities"
         async with pool.acquire() as conn:
-            rows = await conn.fetch(
-                """
-                SELECT payload, app_id
-                FROM activities
-                WHERE category = 'billing'
-                  AND event_type LIKE 'subscription.imported.%'
-                """
-            )
+            if app:
+                rows = await conn.fetch(
+                    """
+                    SELECT payload, app_id
+                    FROM activities
+                    WHERE category = 'billing'
+                      AND event_type LIKE 'subscription.imported.%'
+                      AND app_id = $1::app_id
+                    """,
+                    app,
+                )
+            else:
+                rows = await conn.fetch(
+                    """
+                    SELECT payload, app_id
+                    FROM activities
+                    WHERE category = 'billing'
+                      AND event_type LIKE 'subscription.imported.%'
+                    """
+                )
         for r in rows:
             payload = r["payload"] if isinstance(r["payload"], dict) else json.loads(r["payload"] or "{}")
             plan_id = payload.get("planId", "unknown")
@@ -109,26 +149,61 @@ async def billing_overview(
             elif status == "cancelled":
                 cancelled_subs += 1
 
-    # Top-up totals
-    async with pool.acquire() as conn:
-        topup_sum_row = await conn.fetchrow(
-            "SELECT COALESCE(SUM(pack_eur), 0) AS total, COUNT(*) AS count FROM credit_purchases"
-        )
-        topup_balances_row = await conn.fetchrow(
-            "SELECT COALESCE(SUM(balance_eur), 0) AS total FROM user_topup_balances"
-        )
+    # Top-up totals — app-overarching. Omit when filtering by app so the
+    # dashboard doesn't misattribute cross-app wallet activity to one app.
+    if app:
+        topup_revenue: Optional[float] = None
+        topup_count: Optional[int] = None
+        topup_balance: Optional[float] = None
+    else:
+        async with pool.acquire() as conn:
+            topup_sum_row = await conn.fetchrow(
+                "SELECT COALESCE(SUM(pack_eur), 0) AS total, COUNT(*) AS count FROM credit_purchases"
+            )
+            topup_balances_row = await conn.fetchrow(
+                "SELECT COALESCE(SUM(balance_eur), 0) AS total FROM user_topup_balances"
+            )
+        topup_revenue = float(topup_sum_row["total"])
+        topup_count = int(topup_sum_row["count"])
+        topup_balance = float(topup_balances_row["total"])
 
     return {
         "source": source,
+        "app": app,
         "totalMrrEur": round(total_mrr_eur, 2),
         "activeSubscriptions": active_subs,
         "cancelledSubscriptions": cancelled_subs,
-        "totalTopupRevenueEur": float(topup_sum_row["total"]),
-        "topupPurchasesCount": int(topup_sum_row["count"]),
-        "totalUserBalanceEur": float(topup_balances_row["total"]),
+        "totalTopupRevenueEur": topup_revenue,
+        "topupPurchasesCount": topup_count,
+        "totalUserBalanceEur": topup_balance,
         "byPlan": by_plan,
         "byStatus": by_status,
         "byApp": by_app,
+    }
+
+
+@router.get("/plans")
+async def list_plans() -> Dict[str, Any]:
+    """
+    Public plan catalog — pricing info for the customer portal.
+
+    No auth required: prices are not sensitive; the frontend needs this
+    to render the plan-comparison table before (and after) the user logs in.
+    """
+    return {
+        "plans": [
+            {
+                "id": p.id,
+                "appId": p.app_id,
+                "name": p.name,
+                "priceEur": p.price,
+                "interval": p.interval,
+                "apiBudgetEur": p.api_budget_eur,
+                "description": p.description,
+                "trial": p.trial,
+            }
+            for p in PLANS.values()
+        ]
     }
 
 
@@ -156,6 +231,35 @@ class SubscriptionCheckoutRequest(BaseModel):
     # endpoint. Tighten further once the real cap is known.
     seats: int = Field(default=1, ge=1, le=100)
     successRedirect: str
+
+
+class SubscriptionProvisionRequest(BaseModel):
+    userId: str
+    planId: str
+    seats: int = Field(default=1, ge=1, le=100)
+
+
+@router.post("/subscription/provision", status_code=201)
+async def billing_sub_provision(
+    body: SubscriptionProvisionRequest,
+    _claims: AuthClaims = Depends(require_service_token),
+) -> Dict[str, Any]:
+    """
+    Directly provision an active subscription without Mollie — service-token only.
+
+    Produces the same DB state as a completed Mollie checkout + webhook cycle
+    (status='active', monthly budget provisioned) without initiating a payment.
+    Intended for seeding test environments.
+
+    Idempotent: if the user already has an active subscription for the given plan,
+    returns it. Refuses trial plans (400) — those auto-provision via evaluate_budget.
+    """
+    try:
+        return await billing_service.provision_subscription(
+            body.userId, body.planId, body.seats
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
 
 @router.post("/subscription/checkout")
@@ -236,7 +340,38 @@ async def billing_list_credits(
     return {"creditPurchases": await billing_service.list_credit_purchases(user_id)}
 
 
-@router.post("/{user_id}/subscriptions/{sub_id}/cancel", status_code=204)
+class SubscriptionChangeRequest(BaseModel):
+    userId: str
+    email: str
+    name: str
+    newPlanId: str
+    seats: int = Field(default=1, ge=1, le=100)
+    successRedirect: str
+
+
+@router.post("/subscription/change")
+async def billing_sub_change(
+    body: SubscriptionChangeRequest,
+    _claims: AuthClaims = Depends(require_jwt_or_service),
+) -> Dict[str, Any]:
+    """Upgrade, downgrade, or reseat an active subscription.
+
+    Cancels the current active subscription and starts a new checkout.
+    The new subscription activates when the first payment completes.
+    Returns the checkout URL and the ID of the cancelled subscription.
+    """
+    try:
+        return await billing_service.change_subscription(
+            body.userId, body.newPlanId, body.seats, body.successRedirect,
+            body.email, body.name,
+        )
+    except LookupError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.post("/{user_id}/subscriptions/{sub_id}/cancel", status_code=204, response_class=Response)
 async def billing_cancel_sub(
     user_id: str,
     sub_id: str,

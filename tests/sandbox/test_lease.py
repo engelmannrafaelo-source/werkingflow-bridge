@@ -340,3 +340,80 @@ class TestRelease:
         with patch("src.sandbox.lease_service._SECRETS_DIR", tmp_path):
             with pytest.raises(RuntimeError, match="token file not found"):
                 ls.read_oauth_token("nonexistent-account")
+
+
+# ---------------------------------------------------------------------------
+# Criterion 9: JIT user provisioning on first lease
+# ---------------------------------------------------------------------------
+# Apps with their own identity systems (Supabase, Auth0, etc.) create users
+# without calling POST /v1/users. Before this fix, the first sandbox lease
+# for such a user returned 404 and broke the agent editor experience. We
+# now auto-provision a row in users+tenants when the user is missing and
+# the lease request supplies an `app` to anchor the new tenant.
+
+class TestJitUserProvisioning:
+    @pytest.mark.asyncio
+    async def test_unknown_user_is_jit_provisioned(self):
+        from src.sandbox import lease_service as ls
+
+        conn = AsyncMock()
+        # First fetchrow: user not in DB
+        # Second fetchrow (after JIT INSERTs): user now resolves
+        conn.fetchrow.side_effect = [
+            None,
+            {"tenant_id": "engelmann", "billing_mode": "subscription"},
+        ]
+        conn.execute.return_value = None
+
+        info = await ls.get_tenant_info(conn, uuid.uuid4(), app="engelmann")
+
+        assert info["tenant_id"] == "engelmann"
+        assert info["billing_mode"] == "subscription"
+        # Two INSERTs: tenant + user (ON CONFLICT DO NOTHING is idempotent)
+        assert conn.execute.call_count == 2
+
+    @pytest.mark.asyncio
+    async def test_unknown_user_without_app_still_raises_404(self):
+        from src.sandbox import lease_service as ls
+
+        conn = AsyncMock()
+        conn.fetchrow.return_value = None  # never resolves
+
+        with pytest.raises(HTTPException) as exc_info:
+            await ls.get_tenant_info(conn, uuid.uuid4(), app=None)
+
+        assert exc_info.value.status_code == 404
+        # No INSERTs without an app to anchor the tenant
+        assert conn.execute.call_count == 0
+
+    @pytest.mark.asyncio
+    async def test_auto_provision_disabled_raises_404(self):
+        from src.sandbox import lease_service as ls
+
+        conn = AsyncMock()
+        conn.fetchrow.return_value = None
+
+        with pytest.raises(HTTPException) as exc_info:
+            await ls.get_tenant_info(
+                conn, uuid.uuid4(), app="engelmann", auto_provision=False
+            )
+
+        assert exc_info.value.status_code == 404
+        assert conn.execute.call_count == 0
+
+    @pytest.mark.asyncio
+    async def test_existing_user_skips_provision(self):
+        """Happy-path users (already in DB) must not trigger any INSERT."""
+        from src.sandbox import lease_service as ls
+
+        conn = AsyncMock()
+        conn.fetchrow.return_value = {
+            "tenant_id": "engelmann",
+            "billing_mode": "subscription",
+        }
+
+        info = await ls.get_tenant_info(conn, uuid.uuid4(), app="engelmann")
+
+        assert info["tenant_id"] == "engelmann"
+        # No provisioning: the user was found on the first lookup
+        assert conn.execute.call_count == 0

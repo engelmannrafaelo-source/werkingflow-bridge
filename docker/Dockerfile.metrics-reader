@@ -2,7 +2,7 @@
 # Bridge Metrics Reader — lean, read-only, no Claude CLI, no Anthropic deps.
 # =============================================================================
 # Purpose: serve historical Bridge metrics from JSONL on disk, surviving
-# worker crashes and 503-storms. Mounts the eco-wrapper-logs volume read-only.
+# worker crashes and 503-storms. Mounts the wt-wrapper-logs volume read-only.
 # =============================================================================
 FROM python:3.12-slim
 

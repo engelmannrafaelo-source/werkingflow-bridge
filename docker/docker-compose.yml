@@ -6,7 +6,7 @@ services:
     build:
       context: ..
       dockerfile: docker/Dockerfile.nginx-lb
-    container_name: eco-wrapper-lb
+    container_name: wt-wrapper-lb
     ports:
       - "8000:80"      # Primary API
       - "8010:80"      # eco-backend compatibility
@@ -40,7 +40,7 @@ services:
     build:
       context: ..
       dockerfile: docker/Dockerfile.worker
-    container_name: eco-wrapper-worker1
+    container_name: wt-wrapper-worker1
     expose:
       - "8000"
     deploy:
@@ -50,8 +50,9 @@ services:
         reservations:
           memory: 1G
     volumes:
-      - eco-wrapper-logs:/app/logs
-      - eco-wrapper-instances-shared:/app/instances
+      - /root/werkingflow-bridge/secrets:/app/secrets:ro
+      - wt-wrapper-logs:/app/logs
+      - wt-wrapper-instances-shared:/app/instances
       - ~/eco-research-output:/app/research_output
       - /root/.claude/commands/sc:/home/claude/.claude/commands/sc:ro
       - /root/.claude/agents:/home/claude/.claude/agents:ro
@@ -66,6 +67,7 @@ services:
       - LOG_LEVEL=INFO
       - LOG_TO_FILE=true
       - FILTER_SENSITIVE_DATA=true
+      - BRIDGE_SECRETS_DIR=/app/secrets
       - INSTANCE_NAME=worker1
       - ADAPTIVE_INITIAL_CAP_TOKENS=1000000
       - ADAPTIVE_FLOOR_TOKENS=500000
@@ -106,7 +108,7 @@ services:
     build:
       context: ..
       dockerfile: docker/Dockerfile.worker
-    container_name: eco-wrapper-worker2
+    container_name: wt-wrapper-worker2
     expose:
       - "8000"
     deploy:
@@ -116,8 +118,9 @@ services:
         reservations:
           memory: 1G
     volumes:
-      - eco-wrapper-logs:/app/logs
-      - eco-wrapper-instances-shared:/app/instances
+      - /root/werkingflow-bridge/secrets:/app/secrets:ro
+      - wt-wrapper-logs:/app/logs
+      - wt-wrapper-instances-shared:/app/instances
       - ~/eco-research-output:/app/research_output
       - /root/.claude/commands/sc:/home/claude/.claude/commands/sc:ro
       - /root/.claude/agents:/home/claude/.claude/agents:ro
@@ -132,6 +135,7 @@ services:
       - LOG_LEVEL=INFO
       - LOG_TO_FILE=true
       - FILTER_SENSITIVE_DATA=true
+      - BRIDGE_SECRETS_DIR=/app/secrets
       - INSTANCE_NAME=worker2
       - ADAPTIVE_INITIAL_CAP_TOKENS=1000000
       - ADAPTIVE_FLOOR_TOKENS=500000
@@ -172,7 +176,7 @@ services:
     build:
       context: ..
       dockerfile: docker/Dockerfile.worker
-    container_name: eco-wrapper-worker3
+    container_name: wt-wrapper-worker3
     expose:
       - "8000"
     deploy:
@@ -182,8 +186,9 @@ services:
         reservations:
           memory: 1G
     volumes:
-      - eco-wrapper-logs:/app/logs
-      - eco-wrapper-instances-shared:/app/instances
+      - /root/werkingflow-bridge/secrets:/app/secrets:ro
+      - wt-wrapper-logs:/app/logs
+      - wt-wrapper-instances-shared:/app/instances
       - ~/eco-research-output:/app/research_output
       - /root/.claude/commands/sc:/home/claude/.claude/commands/sc:ro
       - /root/.claude/agents:/home/claude/.claude/agents:ro
@@ -198,6 +203,7 @@ services:
       - LOG_LEVEL=INFO
       - LOG_TO_FILE=true
       - FILTER_SENSITIVE_DATA=true
+      - BRIDGE_SECRETS_DIR=/app/secrets
       - INSTANCE_NAME=worker3
       - ADAPTIVE_INITIAL_CAP_TOKENS=1000000
       - ADAPTIVE_FLOOR_TOKENS=500000
@@ -238,7 +244,7 @@ services:
     build:
       context: ..
       dockerfile: docker/Dockerfile.worker
-    container_name: eco-wrapper-worker4
+    container_name: wt-wrapper-worker4
     expose:
       - "8000"
     deploy:
@@ -248,8 +254,9 @@ services:
         reservations:
           memory: 1G
     volumes:
-      - eco-wrapper-logs:/app/logs
-      - eco-wrapper-instances-shared:/app/instances
+      - /root/werkingflow-bridge/secrets:/app/secrets:ro
+      - wt-wrapper-logs:/app/logs
+      - wt-wrapper-instances-shared:/app/instances
       - ~/eco-research-output:/app/research_output
       - /root/.claude/commands/sc:/home/claude/.claude/commands/sc:ro
       - /root/.claude/agents:/home/claude/.claude/agents:ro
@@ -264,6 +271,7 @@ services:
       - LOG_LEVEL=INFO
       - LOG_TO_FILE=true
       - FILTER_SENSITIVE_DATA=true
+      - BRIDGE_SECRETS_DIR=/app/secrets
       - INSTANCE_NAME=worker4
       - ADAPTIVE_INITIAL_CAP_TOKENS=1000000
       - ADAPTIVE_FLOOR_TOKENS=500000
@@ -304,7 +312,7 @@ services:
     build:
       context: ..
       dockerfile: docker/Dockerfile.privacy-pdf
-    container_name: eco-privacy-pdf-service
+    container_name: wt-privacy-pdf-service
     expose:
       - "8100"
     deploy:
@@ -347,7 +355,7 @@ services:
     build:
       context: ..
       dockerfile: docker/Dockerfile.metrics-reader
-    container_name: eco-wrapper-metrics-reader
+    container_name: wt-wrapper-metrics-reader
     expose:
       - "8000"
     deploy:
@@ -358,7 +366,7 @@ services:
           memory: 256M
     volumes:
       # READ-ONLY mount — reader must never write to the metrics volume.
-      - eco-wrapper-logs:/app/logs:ro
+      - wt-wrapper-logs:/app/logs:ro
     environment:
       - METRICS_DIR=/app/logs
       - LOG_LEVEL=INFO
@@ -383,10 +391,18 @@ networks:
     name: docker_bridge-prod-net
 
 volumes:
-  eco-wrapper-logs:
+  # Fixed volume names — independent of the compose project name. Without an
+  # explicit `name:` field, docker prefixes the volume with the current
+  # project (basename of cwd), so running compose from /root/werkingflow-bridge/
+  # vs /root/werkingflow-bridge/docker/ produced two separate volume sets
+  # (docker_eco-wrapper-logs vs werkingflow-bridge_eco-wrapper-logs). Locking
+  # the name makes the data the source of truth, not the cwd.
+  wt-wrapper-logs:
     driver: local
-  eco-wrapper-instances-shared:
+    name: wt-wrapper-logs
+  wt-wrapper-instances-shared:
     driver: local
+    name: wt-wrapper-instances-shared
 
 secrets:
   claude_token_1:

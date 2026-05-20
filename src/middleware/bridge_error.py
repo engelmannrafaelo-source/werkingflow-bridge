@@ -70,6 +70,8 @@ REASON_QUEUE_EXHAUSTED = "worker_queue_exhausted"
 REASON_ACCOUNT_WEEKLY_EXHAUSTED = "worker_account_weekly_exhausted"
 REASON_UPSTREAM_ANTHROPIC_ERROR = "claude_upstream_error"
 REASON_UPSTREAM_ANTHROPIC_TIMEOUT = "claude_upstream_timeout"
+# Vision API direct-key billing exhausted (Anthropic-side, not retryable)
+REASON_VISION_BILLING_EXHAUSTED = "vision_billing_exhausted"
 # 500-class (contract violation — must be investigated)
 REASON_INTERNAL = "worker_internal_error"
 REASON_MISCONFIGURED = "worker_misconfigured"
@@ -240,6 +242,27 @@ def upstream_error(
         message=f"Upstream Anthropic error after retries: {detail}",
         status_code=status_code,
         retry_after_s=retry_after_s,
+    )
+
+
+def vision_billing_error(detail: str) -> JSONResponse:
+    """Vision API (direct Anthropic key) returned 400 credit-balance-too-low.
+
+    Surfaces as HTTP 402 Payment Required, non-retryable. Retry is sinnless —
+    only billing top-up resolves this. The full Anthropic error text is
+    preserved in the message so clients can act on it without log diving.
+
+    Contract: this is NOT a worker-internal contract violation; it is a
+    legitimate billing-state signal from Anthropic. Distinct from
+    `upstream_error` (transient 5xx/429) because retrying does not help.
+    """
+    return bridge_error(
+        source=SOURCE_UPSTREAM_ANTHROPIC,
+        error_type=TYPE_UPSTREAM_ERROR,
+        reason=REASON_VISION_BILLING_EXHAUSTED,
+        message=f"Vision API credit balance exhausted: {detail}",
+        status_code=402,
+        retryable_override=False,
     )
 
 
@@ -429,6 +452,18 @@ def classify_exception(exc: Exception) -> JSONResponse:
     # message; the wire status is 429 per the worker contract.
     if any(marker in lower for marker in _UPSTREAM_TRANSIENT_MARKERS):
         return upstream_error(detail=msg[:200], retry_after_s=15)
+
+    # 3b. Vision API billing exhausted — direct Anthropic 400 with credit-balance
+    # message from vision_provider.py. Non-retryable; distinct from 5xx/429
+    # transient upstream errors. Anthropic exact strings observed in production:
+    #   "Your credit balance is too low to access the Anthropic API."
+    #   "Please go to Plans & Billing to upgrade or purchase credits."
+    if any(m in lower for m in (
+        "credit balance is too low",
+        "purchase credits",
+        "insufficient_credit",
+    )):
+        return vision_billing_error(detail=msg[:200])
 
     # 4. Fallthrough — bridge-internal unexpected. 500 is deliberate here:
     # it means something slipped past classification. Fix-forward, don't mask.

@@ -29,7 +29,7 @@
 set -euo pipefail
 
 BRIDGE_URL="http://localhost:8000"
-NGINX_CONTAINER="eco-wrapper-lb"
+NGINX_CONTAINER="wt-wrapper-lb"
 UPSTREAM_FILE="/etc/nginx/conf.d/upstream-workers.conf"
 THRESHOLD=95              # Worker marked `down` at/above this weekly or session %
 THROTTLE_START=80         # Weight starts dropping at this %

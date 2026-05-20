@@ -27,7 +27,7 @@ services:
     build:
       context: ..
       dockerfile: docker/Dockerfile
-    container_name: eco-wrapper-universal
+    container_name: wt-wrapper-universal
 
     # Internal port only - router handles external access
     expose:
@@ -41,8 +41,8 @@ services:
           memory: 1G
 
     volumes:
-      - eco-wrapper-logs:/app/logs
-      - eco-wrapper-instances:/app/instances
+      - wt-wrapper-logs:/app/logs
+      - wt-wrapper-instances:/app/instances
       - ~/eco-research-output:/app/research_output
 
     secrets:
@@ -56,7 +56,7 @@ services:
       - LOG_LEVEL=INFO
       - LOG_TO_FILE=true
       - FILTER_SENSITIVE_DATA=true
-      - INSTANCE_NAME=eco-wrapper-universal
+      - INSTANCE_NAME=wt-wrapper-universal
       - CLAUDE_CWD=/app/instances
       - DISABLE_COACH_MCP=true
       - MAX_TIMEOUT=2400000
@@ -109,8 +109,8 @@ services:
 # Volumes
 # ==========================================================================
 volumes:
-  eco-wrapper-logs:
-  eco-wrapper-instances:
+  wt-wrapper-logs:
+  wt-wrapper-instances:
   router-logs:
 
 # ==========================================================================

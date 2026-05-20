@@ -9,6 +9,9 @@ import jwt
 _ALGORITHM = "HS256"
 _EXPIRY_HOURS = 8
 
+# Mirrors UserRoleSchema in packages/api-validation/src/common-schemas.ts
+VALID_ROLES = frozenset({"super_admin", "tenant_admin", "admin", "owner", "member", "user"})
+
 
 def _secret() -> str:
     s = os.getenv("BRIDGE_JWT_SECRET")
@@ -22,13 +25,17 @@ def sign_jwt(
     email: str,
     tenant_id: str,
     app_licenses: list[Dict[str, Any]],
+    role: str = "user",
 ) -> str:
+    if role not in VALID_ROLES:
+        raise ValueError(f"Invalid role '{role}'. Must be one of: {sorted(VALID_ROLES)}")
     now = datetime.now(timezone.utc)
     payload = {
         "sub": user_id,
         "email": email,
         "tenantId": tenant_id,
         "appLicenses": app_licenses,
+        "role": role,
         "iat": now,
         "exp": now + timedelta(hours=_EXPIRY_HOURS),
         "jti": str(uuid.uuid4()),

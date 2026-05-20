@@ -420,3 +420,41 @@ def get_job_id_from_request(request: Request) -> Optional[str]:
         Job ID string or None if not present
     """
     return request.headers.get("X-Job-ID") or request.headers.get("x-job-id")
+
+
+# Raw X-App-Env values apps send → the normalised three-value environment
+# bucket the Platform Admin "mode" filter uses (the dedicated `app_env`
+# enum domain: prod/staging/local). Anything else (or a missing header) is
+# left un-attributed (None) — guessing would re-introduce the false
+# bucketing this whole change removes. See migration 009.
+_APP_ENV_NORMALISE = {
+    "production": "prod",
+    "preview": "staging",
+    "development": "local",
+}
+
+
+def get_app_env_from_request(request: Request) -> Optional[str]:
+    """
+    Extract the app-variant environment from request headers.
+
+    Supported headers:
+    - X-App-Env: production | preview | development
+    - x-app-env: Alternative casing
+
+    Returns:
+        Raw header value, or None if not present.
+    """
+    return request.headers.get("X-App-Env") or request.headers.get("x-app-env")
+
+
+def normalize_app_env(raw: Optional[str]) -> Optional[str]:
+    """
+    Normalise a raw X-App-Env value to the prod/staging/local bucket.
+
+    production → prod, preview → staging, development → local.
+    Missing or unrecognised → None (honest un-attributed; never guessed).
+    """
+    if not raw:
+        return None
+    return _APP_ENV_NORMALISE.get(raw.strip().lower())
