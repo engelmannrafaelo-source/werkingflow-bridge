@@ -279,6 +279,22 @@ class BridgeError(Exception):
         self.response = response
 
 
+class SDKDisconnectError(Exception):
+    """
+    Raised when claude_code_sdk exits with 0 chunks (CLI died before producing
+    any usable output). Treated as a retryable transient failure: the exception
+    handler in main.py attempts cross_worker_retry before surfacing 503 to the
+    client. Never surfaces as 500 — a zero-chunk exit is a worker-internal
+    condition, not a bridge bug.
+
+    Defined here (not in claude_cli) so it can be imported without pulling in
+    the full claude_code_sdk dependency chain.
+    """
+    def __init__(self, error_detail: dict) -> None:
+        super().__init__("sdk_disconnect")
+        self.error_detail = error_detail
+
+
 def raise_throttle(cap_tokens: int, inflight_tokens: int, retry_after_s: int = 30) -> None:
     raise BridgeError(throttle_error(cap_tokens, inflight_tokens, retry_after_s))
 

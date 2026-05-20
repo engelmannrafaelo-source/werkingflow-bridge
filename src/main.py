@@ -48,6 +48,7 @@ from src.models import (
     ConvertPdfResponse
 )
 from src.claude_cli import ClaudeCodeCLI, WorkerUnavailableError, RateLimitError, rate_limit_tracker
+from src.middleware.bridge_error import SDKDisconnectError
 from src.message_adapter import MessageAdapter
 from src.tool_leak_detector import hardened_system_prompt, looks_like_tool_leak
 from src.vision_provider import VisionProvider, get_vision_provider
@@ -964,6 +965,56 @@ async def rate_limit_handler(request: Request, exc: RateLimitError):
             "X-Rate-Limit-Reset": exc.reset_time.isoformat() if exc.reset_time else "",
             "X-Worker-Id": worker_id
         }
+    )
+
+
+@app.exception_handler(SDKDisconnectError)
+async def sdk_disconnect_handler(request: Request, exc: SDKDisconnectError):
+    """
+    Handle SDKDisconnectError by attempting cross-worker retry first, then
+    falling back to 503 capacity_busy. Never surfaces 500 — a zero-chunk SDK
+    exit is a transient worker-internal condition, not a bridge contract violation.
+
+    Symmetric to rate_limit_handler but for SDK-level disconnects instead of
+    account-level rate limits. Cross-worker retry bounded to 2 attempts via
+    X-Bridge-Retry-Count.
+    """
+    worker_id = os.getenv("INSTANCE_NAME", "unknown")
+    chunks_received = exc.error_detail.get("chunks_received", 0)
+
+    logger.error(
+        f"🔌 SDKDisconnect on worker {worker_id} "
+        f"(chunks={chunks_received}, prompt_len={exc.error_detail.get('prompt_length', 0)}) "
+        f"— attempting cross-worker retry"
+    )
+
+    try:
+        from src.middleware.rolling_metrics import get_rolling_metrics
+        get_rolling_metrics().record_worker_crash(worker_id)
+        logger.warning(
+            f"🚨 record_worker_crash({worker_id}) — SDK zero-chunk disconnect "
+            f"(chunks={chunks_received}) — adaptive cap will shrink at next tune tick"
+        )
+    except Exception as _rce:
+        logger.debug(f"record_worker_crash failed (non-fatal): {_rce}")
+
+    if request.url.path.endswith(("/v1/chat/completions", "/v1/research")):
+        retry_response = await _cross_worker_retry(request, worker_id)
+        if retry_response is not None:
+            return retry_response
+
+    from src.middleware.bridge_error import bridge_error as _be, SOURCE_BRIDGE_INTERNAL
+    return _be(
+        source=SOURCE_BRIDGE_INTERNAL,
+        error_type="capacity_busy",
+        reason="sdk_disconnect",
+        message=(
+            f"SDK disconnect on all workers "
+            f"(chunks_received={chunks_received}). Retry in ~30s."
+        ),
+        status_code=503,
+        retry_after_s=30,
+        extra={"chunks_received": chunks_received},
     )
 
 
@@ -2442,20 +2493,11 @@ async def chat_completions(
                     "max_turns": claude_options.get('max_turns'),
                     "tools_enabled": request_body.enable_tools
                 }
-                # Feed adaptive limiter so it shrinks cap and Lua-routing avoids
-                # this worker temporarily. Symmetric to the 429-feedback path.
-                try:
-                    from src.middleware.rolling_metrics import get_rolling_metrics
-                    get_rolling_metrics().record_worker_crash(_self_worker)
-                    logger.warning(
-                        f"🚨 record_worker_crash({_self_worker}) — SDK silent stall "
-                        f"(chunks={len(chunks)}, prompt_len={len(prompt)}) — "
-                        f"adaptive cap will shrink at next tune tick"
-                    )
-                except Exception as _rce:
-                    logger.error(f"record_worker_crash failed (non-fatal): {_rce}")
-
-                raise HTTPException(status_code=500, detail=f"No response from Claude Code: {error_detail}")
+                # Raise SDKDisconnectError so the exception handler can attempt
+                # cross_worker_retry before surfacing a 503 to the client.
+                # record_worker_crash + adaptive limiter feedback happen in
+                # sdk_disconnect_handler (single point of control).
+                raise SDKDisconnectError(error_detail)
             
             # Filter out tool usage and thinking blocks
             assistant_content = MessageAdapter.filter_content(raw_assistant_content)

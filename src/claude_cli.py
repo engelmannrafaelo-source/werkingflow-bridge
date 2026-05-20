@@ -143,6 +143,8 @@ class RateLimitError(Exception):
         return 3600  # Default 1 hour
 
 
+from src.middleware.bridge_error import SDKDisconnectError  # noqa: F401 (re-exported)
+
 import re as _re
 _QUOTA_EXHAUSTION_RE = _re.compile(
     r'out of extra usage|ran out of context|resets\s+\d+:\d+\s*(?:am|pm)',
