@@ -181,12 +181,26 @@ phase_header 3 "SEED USERS"
 
 python3 - <<PYEOF
 import json, sys, requests
+from pathlib import Path
 
 creds = json.load(open('${CREDENTIALS_JSON}'))
 users = creds.get('users', {})
 if not users:
     print("  [FAIL]  No users defined in test-credentials.json", file=sys.stderr)
     sys.exit(1)
+
+# Load global registry (ADR-0006) for authoritative tenant lookup.
+# Fall back to per-app tenantId declaration if registry is unavailable.
+REGISTRY_PATH = Path('/root/projekte/werkingflow-production/tests/unified-tester/config/test-users.json')
+registry_users = {}
+if REGISTRY_PATH.exists():
+    try:
+        registry_users = json.loads(REGISTRY_PATH.read_text()).get('users', {})
+        print(f"  [info]  Loaded global registry: {len(registry_users)} entries")
+    except Exception as e:
+        print(f"  [warn]  Could not load global registry: {e} — falling back to per-app tenantId")
+else:
+    print(f"  [warn]  Global registry not found at {REGISTRY_PATH} — falling back to per-app tenantId")
 
 headers = {
     'Content-Type': 'application/json',
@@ -195,7 +209,15 @@ headers = {
 default_tenant_id = '${DEFAULT_TENANT_ID}'
 ok = True
 
-# Pre-fetch existing users (email -> id) so a 409 can be reconciled via PATCH.
+def _canonical_tenant(u: dict) -> str:
+    """Resolve canonical tenant: registry > per-app tenantId > app default."""
+    email = u.get('email', '').lower()
+    reg = registry_users.get(email)
+    if reg and reg.get('tenant'):
+        return reg['tenant']
+    return u.get('tenantId') or default_tenant_id
+
+# Pre-fetch existing users (email -> {id, tenant_id}) so a 409 can be reconciled via PATCH.
 existing = {}
 offset = 0
 while True:
@@ -212,14 +234,14 @@ while True:
     if not page:
         break
     for x in page:
-        existing[x['email'].lower()] = x['id']
+        existing[x['email'].lower()] = {'id': x['id'], 'tenant_id': x.get('tenant_id')}
     if len(page) < 200:
         break
     offset += 200
 
 created = reconciled = 0
 for key, u in users.items():
-    tenant_id = u.get('tenantId') or default_tenant_id
+    tenant_id = _canonical_tenant(u)
     payload = {
         'email':     u['email'],
         'name':      u['name'],
@@ -238,18 +260,27 @@ for key, u in users.items():
         created += 1
         print(f"  [ok]    Created: {key} ({u['email']}) → tenant={tenant_id}")
     elif r.status_code == 409:
-        # User pre-exists. POST is create-only, so reconcile password + role
-        # via PATCH — a stale password carried over from an earlier run would
-        # otherwise silently break login. Idempotent: every re-seed converges.
-        uid = existing.get(u['email'].lower())
-        if not uid:
+        # User pre-exists. Reconcile password + role + tenant_id so every
+        # re-seed converges to the registry's canonical identity (ADR-0006).
+        # Before ADR-0006 the 409-PATCH only updated password+role, leaving
+        # tenant frozen at the first-seeded value — which caused the 3
+        # tenant_mismatch failures in werking-energy Layer-0.
+        existing_entry = existing.get(u['email'].lower())
+        if not existing_entry:
             print(f"  [FAIL]  User {key}: 409 but not in user list — cannot reconcile", file=sys.stderr)
             ok = False
             continue
+        uid = existing_entry['id']
+        current_tenant = existing_entry.get('tenant_id')
+        patch_body = {'password': u.get('password'), 'role': u.get('role', 'user')}
+        # Add tenant_id to PATCH only when it differs from the current Bridge value.
+        # Avoids spurious DB writes on clean re-seeds, while still fixing stale tenants.
+        if current_tenant != tenant_id:
+            patch_body['tenant_id'] = tenant_id
         try:
             pr = requests.patch(
                 f"${BRIDGE_URL}/v1/users/{uid}",
-                json={'password': u.get('password'), 'role': u.get('role', 'user')},
+                json=patch_body,
                 headers=headers, timeout=15,
             )
         except requests.RequestException as e:
@@ -258,7 +289,8 @@ for key, u in users.items():
             continue
         if pr.status_code == 200:
             reconciled += 1
-            print(f"  [ok]    Reconciled password/role: {key} ({u['email']})")
+            tenant_note = f" (tenant: {current_tenant!r} → {tenant_id!r})" if 'tenant_id' in patch_body else ""
+            print(f"  [ok]    Reconciled password/role/tenant: {key} ({u['email']}){tenant_note}")
         else:
             print(f"  [FAIL]  User {key}: reconcile PATCH HTTP {pr.status_code} — {pr.text}", file=sys.stderr)
             ok = False
