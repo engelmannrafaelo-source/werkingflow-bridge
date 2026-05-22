@@ -272,49 +272,80 @@ async def record_usage(
     billing_mode: str,
 ) -> bool:
     """
-    INSERT usage event. ON CONFLICT (litellm_call_id) DO NOTHING for idempotency.
+    INSERT sandbox usage event into usage_events.
+
+    ON CONFLICT (idempotency_key) DO NOTHING for idempotency.
     Returns True if a row was actually inserted, False if it was a duplicate —
     the caller uses this to avoid double-writing the mirrored activities row.
+
+    billing_mode: legacy TEXT from tenants ('subscription'|'pay_per_token').
+    Mapped to billing_mode_enum:
+      subscription  → flat_rate_estimated (real_cost = 0, hypothetical = what it costs)
+      pay_per_token → pay_per_token       (real_cost = hypothetical)
     """
+    import json as _json
+    from src.pricing import PRICING_VERSION
+
+    if billing_mode == "pay_per_token":
+        bm_enum = "pay_per_token"
+        real_cost = hypothetical_cost_eur
+    else:
+        bm_enum = "flat_rate_estimated"
+        real_cost = 0.0
+
     row = await conn.fetchrow(
         """
-        INSERT INTO sandbox_usage_events (
-            litellm_call_id, user_id, tenant_id, session_id, lease_id,
-            account_id, app, model,
+        INSERT INTO usage_events (
+            source,
+            user_id, tenant_id,
+            app, model, provider, region,
             input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens,
-            hypothetical_cost_eur, real_cost_eur, billing_mode
-        ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
-        ON CONFLICT (litellm_call_id) DO NOTHING
+            billing_mode, real_cost_eur, hypothetical_cost_eur, pricing_version,
+            session_id, idempotency_key, provider_metadata
+        ) VALUES (
+            'sandbox',
+            $1, $2,
+            $3, $4, 'anthropic', NULL,
+            $5, $6, $7, $8,
+            $9::billing_mode_enum, $10, $11, $12,
+            $13, $14, $15::jsonb
+        )
+        ON CONFLICT (idempotency_key) DO NOTHING
         RETURNING id
         """,
-        litellm_call_id,
         user_id,
         tenant_id,
-        session_id,
-        lease_id,
-        account_id,
         app,
         model,
         input_tokens,
         output_tokens,
         cache_read_tokens,
         cache_creation_tokens,
+        bm_enum,
+        real_cost,
         hypothetical_cost_eur,
-        0.0,  # real_cost_eur = 0 for subscription
-        billing_mode,
+        PRICING_VERSION,
+        session_id,
+        litellm_call_id,
+        _json.dumps({
+            "litellm_call_id": litellm_call_id,
+            "lease_id": str(lease_id) if lease_id else None,
+            "account_id": account_id,
+        }),
     )
     return row is not None
 
 
 async def get_session_aggregate(conn: Any, session_id: str) -> dict:
+    """Aggregate token/cost totals for one sandbox session from usage_events."""
     row = await conn.fetchrow(
         """
         SELECT
             COALESCE(SUM(input_tokens + output_tokens + cache_read_tokens + cache_creation_tokens), 0)
                 AS total_tokens,
             COALESCE(SUM(hypothetical_cost_eur), 0.0) AS total_hypothetical_eur
-        FROM sandbox_usage_events
-        WHERE session_id = $1
+        FROM usage_events
+        WHERE source = 'sandbox' AND session_id = $1
         """,
         session_id,
     )

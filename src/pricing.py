@@ -16,6 +16,10 @@ from __future__ import annotations
 import json
 import os
 
+# Bump when MODEL_PRICING changes so usage_events rows stay attributable to a
+# specific price table snapshot. Stored in usage_events.pricing_version.
+PRICING_VERSION = "v1"
+
 # USD per 1M tokens. {model_id: {"in": input_price, "out": output_price}}
 MODEL_PRICING: dict[str, dict[str, float]] = {
     "claude-sonnet-4-5":          {"in": 3.00,  "out": 15.00},

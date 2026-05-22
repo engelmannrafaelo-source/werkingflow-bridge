@@ -29,7 +29,7 @@ import logging
 from typing import Optional
 
 from src.db.client import get_pool
-from src.pricing import cost_eur
+from src.pricing import cost_eur, PRICING_VERSION
 
 logger = logging.getLogger(__name__)
 
@@ -109,9 +109,16 @@ async def persist_ai_call_activity(
         pool = get_pool()
         async with pool.acquire() as conn:
             trow = await conn.fetchrow(
-                "SELECT tenant_id FROM users WHERE id = $1", user_id
+                """
+                SELECT u.tenant_id, t.billing_mode
+                FROM users u
+                JOIN tenants t ON t.id = u.tenant_id
+                WHERE u.id = $1
+                """,
+                user_id,
             )
             tenant_id = trow["tenant_id"] if trow else None
+            billing_mode_text = trow["billing_mode"] if trow else "subscription"
             if not tenant_id:
                 # Unknown user or user without tenant — skip (see module docstring).
                 return
@@ -142,6 +149,8 @@ async def persist_ai_call_activity(
             except (ValueError, AttributeError, TypeError):
                 actor_uuid = None
 
+            # Audit record — the activity row is the source of truth for the
+            # audit trail (who called what, when, from which app/env).
             await conn.execute(
                 """
                 INSERT INTO activities
@@ -157,6 +166,56 @@ async def persist_ai_call_activity(
                 app_id,
                 json.dumps(payload),
                 app_env,
+            )
+
+            # Usage ledger — structured row with dedicated token/cost columns so
+            # the Platform Admin can query across workflow + sandbox without JSONB
+            # extraction.  billing_mode maps from the tenant's TEXT column:
+            #   subscription  → flat_rate_estimated (user pays flat; per-call cost
+            #                   is hypothetical only; real_cost = 0)
+            #   pay_per_token → pay_per_token (real_cost = hypothetical_cost)
+            if billing_mode_text == "pay_per_token":
+                bm_enum = "pay_per_token"
+                real_cost = call_cost_eur
+            else:
+                bm_enum = "flat_rate_estimated"
+                real_cost = 0.0
+
+            await conn.execute(
+                """
+                INSERT INTO usage_events (
+                    source,
+                    user_id, tenant_id,
+                    app, app_env, model, provider,
+                    input_tokens, output_tokens,
+                    billing_mode, real_cost_eur, hypothetical_cost_eur, pricing_version,
+                    provider_metadata
+                ) VALUES (
+                    'workflow',
+                    $1, $2,
+                    $3, $4::app_env, $5, 'anthropic',
+                    $6, $7,
+                    $8::billing_mode_enum, $9, $10, $11,
+                    $12::jsonb
+                )
+                """,
+                actor_uuid,
+                tenant_id,
+                app_id,
+                app_env,
+                model,
+                input_tokens or 0,
+                output_tokens or 0,
+                bm_enum,
+                real_cost,
+                call_cost_eur,  # hypothetical = priced at pay-per-token rates
+                PRICING_VERSION,
+                json.dumps({
+                    "feature": feature,
+                    "agent_id": agent_id,
+                    "workflow_id": workflow_id,
+                    "status": status,
+                }),
             )
     except Exception as e:  # noqa: BLE001 — tracking must never break the call
         logger.warning("persist_ai_call_activity failed (non-blocking): %s", e)

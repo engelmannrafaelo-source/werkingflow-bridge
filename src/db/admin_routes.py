@@ -93,6 +93,7 @@ def _user_row_to_dict(row: Any) -> Dict[str, Any]:
         "name": row["name"],
         "tenant_id": row["tenant_id"],
         "role": row["role"],
+        "provider_config": row["provider_config"],  # JSONB or None; None = inherit tenant default
         "app_licenses": [],
         "created_at": row["created_at"].isoformat(),
         "updated_at": row["updated_at"].isoformat(),
@@ -147,7 +148,8 @@ async def list_users(
         )
 
     sql = """
-        SELECT u.id, u.email, u.name, u.tenant_id, u.role, u.created_at, u.updated_at,
+        SELECT u.id, u.email, u.name, u.tenant_id, u.role,
+               u.provider_config, u.created_at, u.updated_at,
                t.account_type::text AS tenant_account_type
         FROM users u
         LEFT JOIN tenants t ON t.id = u.tenant_id
@@ -236,7 +238,7 @@ async def get_user(
     pool = get_pool()
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
-            "SELECT id, email, name, tenant_id, role, created_at, updated_at FROM users WHERE id = $1",
+            "SELECT id, email, name, tenant_id, role, provider_config, created_at, updated_at FROM users WHERE id = $1",
             uuid.UUID(user_id),
         )
     if not row:
@@ -269,8 +271,8 @@ async def get_user(
 
 class UserUpdateRequest(BaseModel):
     # Only `name` is exposed for self-edit. Email requires a separate
-    # verification flow. `role`, `password`, and `tenant_id` are operator-only
-    # — applied only when the caller is an admin / service token.
+    # verification flow. `role`, `password`, `tenant_id`, and `provider_config`
+    # are operator-only — applied only when the caller is an admin / service token.
     name: Optional[str] = Field(default=None, min_length=1, max_length=255)
     role: Optional[str] = Field(default=None, description=f"Admin-only. One of: {sorted(VALID_ROLES)}.")
     password: Optional[str] = Field(
@@ -285,6 +287,17 @@ class UserUpdateRequest(BaseModel):
             "seeder to reconcile stale tenants from the pre-ADR-0006 era where the "
             "seeder only patched password+role on 409, leaving tenant frozen at "
             "first-seeded value. One-time correction per ADR-0006 Phase 1."
+        ),
+    )
+    provider_config: Optional[Any] = Field(
+        default=None,
+        description=(
+            "Admin-only. Per-user provider override for the coming Bedrock switch. "
+            "NULL = inherit tenant default. Shape: "
+            '{"provider": "bedrock", "region": "eu-central-1", '
+            '"model": "<bedrock-model-id>", "billing_mode": "pay_per_token", '
+            '"budget_limit_eur": 100.0}. '
+            "Routing and enforcement are NOT active yet — schema only."
         ),
     )
 
@@ -323,13 +336,17 @@ async def update_user(
     if body.tenant_id is not None and not claims.is_operator:
         raise HTTPException(status_code=403, detail="Only admins may change tenant")
 
+    if body.provider_config is not None and not claims.is_operator:
+        raise HTTPException(status_code=403, detail="Only admins may change provider_config")
+
     if body.role is not None and body.role not in VALID_ROLES:
         raise HTTPException(
             status_code=400,
             detail=f"Invalid role '{body.role}'. Must be one of: {_VALID_ROLES_LIST}",
         )
 
-    if body.name is None and body.role is None and body.password is None and body.tenant_id is None:
+    if (body.name is None and body.role is None and body.password is None
+            and body.tenant_id is None and body.provider_config is None):
         raise HTTPException(status_code=400, detail="No fields to update")
 
     set_clauses: List[str] = ["updated_at = NOW()"]
@@ -351,6 +368,10 @@ async def update_user(
         args.append(body.tenant_id)
         set_clauses.append(f"tenant_id = ${len(args)}")
 
+    if body.provider_config is not None:
+        args.append(json.dumps(body.provider_config))
+        set_clauses.append(f"provider_config = ${len(args)}::jsonb")
+
     args.append(uuid.UUID(user_id))
     where_pos = len(args)
 
@@ -361,7 +382,7 @@ async def update_user(
             UPDATE users
                SET {", ".join(set_clauses)}
              WHERE id = ${where_pos}
-         RETURNING id, email, name, tenant_id, role, created_at, updated_at
+         RETURNING id, email, name, tenant_id, role, provider_config, created_at, updated_at
             """,
             *args,
         )

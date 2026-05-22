@@ -53,6 +53,7 @@ def _user_dict(row: Any, licenses: List[Dict[str, Any]]) -> Dict[str, Any]:
         "name": row["name"],
         "tenantId": row["tenant_id"],
         "role": row["role"],
+        "providerConfig": row["provider_config"],  # JSONB or None; None = inherit tenant default
         "appLicenses": licenses,
         "createdAt": row["created_at"].isoformat(),
         "updatedAt": row["updated_at"].isoformat(),
@@ -61,7 +62,7 @@ def _user_dict(row: Any, licenses: List[Dict[str, Any]]) -> Dict[str, Any]:
 
 async def _fetch_user_with_licenses(conn: Any, user_id: uuid.UUID) -> Optional[Dict[str, Any]]:
     row = await conn.fetchrow(
-        "SELECT id, email, name, tenant_id, role, created_at, updated_at FROM users WHERE id = $1",
+        "SELECT id, email, name, tenant_id, role, provider_config, created_at, updated_at FROM users WHERE id = $1",
         user_id,
     )
     if not row:
@@ -93,7 +94,7 @@ async def login(body: LoginRequest) -> Dict[str, Any]:
     pool = get_pool()
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
-            "SELECT id, email, name, tenant_id, role, password_hash, created_at, updated_at FROM users WHERE email = $1",
+            "SELECT id, email, name, tenant_id, role, provider_config, password_hash, created_at, updated_at FROM users WHERE email = $1",
             body.email,
         )
 
@@ -198,7 +199,7 @@ async def test_token(
         row = await conn.fetchrow(
             """
             SELECT u.id, u.email, u.name, u.tenant_id, u.role,
-                   u.created_at, u.updated_at, t.account_type
+                   u.provider_config, u.created_at, u.updated_at, t.account_type
             FROM users u
             JOIN tenants t ON t.id = u.tenant_id
             WHERE u.email = $1

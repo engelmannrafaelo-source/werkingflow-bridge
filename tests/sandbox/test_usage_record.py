@@ -68,26 +68,27 @@ class TestUsageRecordIdempotency:
     @pytest.mark.asyncio
     async def test_record_usage_called_twice_second_is_noop(self):
         """
-        The second INSERT with the same litellm_call_id must not raise and
-        the aggregate should still reflect only one event.
+        The second INSERT with the same litellm_call_id must not raise.
+        record_usage returns True on first insert and False when ON CONFLICT
+        DO NOTHING causes the second insert to be a no-op.
         """
         user_id = uuid.UUID("cccccccc-cccc-cccc-cccc-cccccccccccc")
         call_id = "lc-idempotency-test-001"
         session_id = "sess-abc"
 
-        call_count = 0
+        insert_count = 0
 
-        async def fake_execute(sql, *args):
-            nonlocal call_count
-            call_count += 1
-            # Both calls succeed (simulate ON CONFLICT DO NOTHING)
+        async def mock_fetchrow(sql, *args):
+            nonlocal insert_count
+            if "INSERT INTO usage_events" in sql:
+                insert_count += 1
+                # First INSERT succeeds; second is a no-op (ON CONFLICT DO NOTHING)
+                return {"id": insert_count} if insert_count == 1 else None
+            # Fallback for any other fetchrow (e.g. aggregate)
+            return {"total_tokens": 1620, "total_hypothetical_eur": 0.0042}
 
         conn = AsyncMock()
-        conn.execute.side_effect = fake_execute
-        conn.fetchrow.return_value = {
-            "total_tokens": 1620,
-            "total_hypothetical_eur": 0.0042,
-        }
+        conn.fetchrow.side_effect = mock_fetchrow
 
         kwargs = dict(
             litellm_call_id=call_id,
@@ -106,13 +107,12 @@ class TestUsageRecordIdempotency:
             billing_mode="subscription",
         )
 
-        # First call
-        await ls.record_usage(conn, **kwargs)
-        # Second call — same call_id
-        await ls.record_usage(conn, **kwargs)
+        first = await ls.record_usage(conn, **kwargs)
+        second = await ls.record_usage(conn, **kwargs)
 
-        # execute was called exactly twice (both calls go to DB, ON CONFLICT handles it)
-        assert call_count == 2
+        assert insert_count == 2, "Both calls must reach the DB"
+        assert first is True, "First insert should succeed"
+        assert second is False, "Second insert is a no-op (idempotent)"
 
     @pytest.mark.asyncio
     async def test_aggregate_returns_current_session_total(self):
@@ -149,9 +149,9 @@ class TestUsageAggregate:
         total_tokens = sum(e["input_tokens"] + e["output_tokens"] for e in events)
         total_cost = sum(e["cost"] for e in events)
 
-        # Mock the DB: execute always succeeds, fetchrow returns running sum
+        # Mock the DB: fetchrow handles both the INSERT RETURNING and the aggregate.
+        # INSERT returns a non-None row (success); aggregate returns the running sum.
         conn = AsyncMock()
-        conn.execute.return_value = None
         conn.fetchrow.return_value = {
             "total_tokens": total_tokens,
             "total_hypothetical_eur": total_cost,
