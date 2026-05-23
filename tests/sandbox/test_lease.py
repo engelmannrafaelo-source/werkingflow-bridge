@@ -417,3 +417,53 @@ class TestJitUserProvisioning:
         assert info["tenant_id"] == "engelmann"
         # No provisioning: the user was found on the first lookup
         assert conn.execute.call_count == 0
+
+    @pytest.mark.asyncio
+    async def test_jit_denied_for_non_whitelisted_app(self):
+        """
+        E1: arbitrary app names must not be able to JIT-provision new tenants.
+        Returns 404 with an actionable error; no INSERT happens. Prevents
+        inflation of account_type='customer' tenants from stray test calls.
+        """
+        from src.sandbox import lease_service as ls
+
+        conn = AsyncMock()
+        conn.fetchrow.return_value = None  # user does not exist
+
+        with pytest.raises(HTTPException) as exc_info:
+            await ls.get_tenant_info(conn, uuid.uuid4(), app="rafael")
+
+        assert exc_info.value.status_code == 404
+        assert "JIT-allowlist" in exc_info.value.detail
+        assert "rafael" in exc_info.value.detail
+        # CRITICAL: no INSERTs — the tenant table must not have been touched
+        assert conn.execute.call_count == 0
+
+    @pytest.mark.asyncio
+    async def test_jit_whitelist_respects_env_override(self, monkeypatch):
+        """
+        BRIDGE_JIT_APP_WHITELIST env var overrides the built-in default.
+        Lets ops add a new production app without a code deploy.
+        """
+        from src.sandbox import lease_service as ls
+
+        monkeypatch.setenv("BRIDGE_JIT_APP_WHITELIST", "custom-app-only")
+
+        conn = AsyncMock()
+        # First fetchrow None, second resolves (after JIT INSERTs)
+        conn.fetchrow.side_effect = [
+            None,
+            {"tenant_id": "custom-app-only", "billing_mode": "subscription"},
+        ]
+
+        info = await ls.get_tenant_info(conn, uuid.uuid4(), app="custom-app-only")
+        assert info["tenant_id"] == "custom-app-only"
+        assert conn.execute.call_count == 2  # tenant + user INSERTs ran
+
+        # Same env, different app → still denied
+        conn2 = AsyncMock()
+        conn2.fetchrow.return_value = None
+        with pytest.raises(HTTPException) as exc_info:
+            await ls.get_tenant_info(conn2, uuid.uuid4(), app="engelmann")
+        assert exc_info.value.status_code == 404
+        assert conn2.execute.call_count == 0

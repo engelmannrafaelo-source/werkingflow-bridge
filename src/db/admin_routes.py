@@ -495,6 +495,102 @@ async def list_tenants(
     ]
 
 
+# Pflichtfelder per stage. Must stay in lockstep with required-fields.yaml
+# (packages/api-validation/required-fields.yaml) and the provision_subscription
+# gate in src/billing/billing_service.py (commit 7400895). When the SSoT YAML
+# adds/removes a field for upgrade-stage, update this list AND bump the
+# Validator in werkingflow-production (tests/unified-tester/validators/fe/
+# required_fields_coverage.mjs).
+_REQUIRED_FIELDS_BY_STAGE: Dict[str, List[str]] = {
+    "upgrade": [
+        "billing_name",
+        "billing_street",
+        "billing_city",
+        "billing_postcode",
+        "billing_country",
+    ],
+    "registration": [],  # placeholder: tightened later via YAML sync
+}
+
+
+@router.get("/v1/tenants/incomplete")
+async def list_incomplete_tenants(
+    account_type: str = Query(
+        default="customer",
+        description="Filter by account_type: customer|test|internal",
+    ),
+    stage: str = Query(
+        default="upgrade",
+        description="Lifecycle stage to evaluate: upgrade|registration|all",
+    ),
+    limit: int = Query(default=200, le=1000),
+    _claims: AuthClaims = Depends(require_admin),
+) -> Dict[str, Any]:
+    """
+    Tenants that fail required-field checks for a given lifecycle stage.
+
+    Counterpart on the live DB to the static YAML/Validator in
+    werkingflow-production. A tenant that fails 'upgrade' here would
+    hard-fail the provision_subscription gate; surfacing it lets ops
+    backfill BEFORE the customer hits the gate at Mollie-checkout.
+
+    stage='all' OR's the required-field sets across stages.
+    test/internal account_types bypass the gate at runtime (354b383) but
+    are still listable here so seeders can be inspected.
+    """
+    if account_type not in ("customer", "test", "internal"):
+        raise HTTPException(status_code=400, detail=f"Invalid account_type: {account_type}")
+    if stage not in ("upgrade", "registration", "all"):
+        raise HTTPException(status_code=400, detail=f"Invalid stage: {stage}")
+
+    if stage == "all":
+        required = sorted({f for fs in _REQUIRED_FIELDS_BY_STAGE.values() for f in fs})
+    else:
+        required = _REQUIRED_FIELDS_BY_STAGE.get(stage, [])
+
+    if not required:
+        return {
+            "account_type": account_type,
+            "stage": stage,
+            "required_fields": [],
+            "tenants": [],
+            "note": "no required fields defined for this stage — nothing to check",
+        }
+
+    null_clause = " OR ".join(f"{f} IS NULL" for f in required)
+    select_cols = ", ".join(required)
+    sql = (
+        f"SELECT id, name, account_type::text AS account_type, created_at, "
+        f"{select_cols} "
+        f"FROM tenants "
+        f"WHERE account_type = $1::account_type AND ({null_clause}) "
+        f"ORDER BY created_at DESC LIMIT $2"
+    )
+
+    pool = get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(sql, account_type, limit)
+
+    out = []
+    for r in rows:
+        missing = [f for f in required if r[f] is None]
+        out.append({
+            "id": r["id"],
+            "name": r["name"],
+            "account_type": r["account_type"],
+            "missing_fields": missing,
+            "created_at": r["created_at"].isoformat(),
+        })
+
+    return {
+        "account_type": account_type,
+        "stage": stage,
+        "required_fields": required,
+        "count": len(out),
+        "tenants": out,
+    }
+
+
 @router.post("/v1/tenants", status_code=201)
 async def create_tenant(
     body: TenantCreateRequest,

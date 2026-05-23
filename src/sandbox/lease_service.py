@@ -19,6 +19,25 @@ logger = logging.getLogger(__name__)
 _SECRETS_DIR = Path(os.getenv("BRIDGE_SECRETS_DIR", "/root/werkingflow-bridge/secrets"))
 
 
+def _load_jit_whitelist() -> set[str]:
+    """
+    Comma-separated app allowlist for JIT tenant provisioning.
+
+    Read fresh on each call so tests can monkeypatch the env var without
+    re-importing the module. The default covers the real production apps
+    that have their own identity systems and legitimately need first-lease
+    auto-provisioning. Any other app value (e.g. a stray test call with
+    app='rafael') is denied with a 404 — preventing inflation of
+    `account_type='customer'` tenants from unknown sources.
+    """
+    raw = os.getenv(
+        "BRIDGE_JIT_APP_WHITELIST",
+        "werking-report,werking-energy,werking-safety,engelmann,"
+        "acro-community,werking-noise,werkingflow-platform",
+    )
+    return {a.strip() for a in raw.split(",") if a.strip()}
+
+
 # ---------------------------------------------------------------------------
 # Token file
 # ---------------------------------------------------------------------------
@@ -76,6 +95,21 @@ async def get_tenant_info(
     )
     if row is None:
         if auto_provision and app:
+            whitelist = _load_jit_whitelist()
+            if app not in whitelist:
+                logger.warning(
+                    f"JIT denied: user={user_id} app={app!r} not in whitelist. "
+                    f"Allowed: {sorted(whitelist)}. Returning 404 — tenant must "
+                    f"be created explicitly via POST /v1/tenants."
+                )
+                raise HTTPException(
+                    status_code=404,
+                    detail=(
+                        f"User {user_id} not found and app '{app}' is not in "
+                        f"the JIT-allowlist. Create the tenant explicitly via "
+                        f"POST /v1/tenants before first sandbox lease."
+                    ),
+                )
             await _jit_provision_user(conn, user_id, app)
             row = await conn.fetchrow(
                 """
