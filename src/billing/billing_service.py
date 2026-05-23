@@ -822,21 +822,50 @@ _REQUIRED_BILLING_ADDRESS_FIELDS = ("billing_name", "billing_street", "billing_c
                                      "billing_postcode", "billing_country")
 
 
-async def _assert_complete_billing_address(conn: Any, user_uuid: uuid.UUID) -> None:
+# Exempt from the billing-address gate. Per the required-fields-yaml SSoT
+# (packages/api-validation/required-fields.yaml stage_exemptions):
+#   - 'test'     — seeded test tenants, fill defaults via seed-bridge-users
+#                  Phase 2b but a re-seed against a freshly-migrated DB still
+#                  needs to provision subscriptions BEFORE Phase 2b runs.
+#   - 'internal' — internal tenants (employees, partners) bypass the customer
+#                  lifecycle entirely.
+# Only account_type='customer' goes through the gate. See the research
+# baseline in docs/research/registration-required-fields-AT-EU-20260523.md
+# for the legal reasoning (§11 UStG applies only to invoiceable B2B sales).
+_BILLING_ADDRESS_GATE_EXEMPT_ACCOUNT_TYPES = frozenset({"test", "internal"})
+
+
+async def _assert_complete_billing_address(
+    conn: Any, user_uuid: uuid.UUID, plan_id: str
+) -> None:
     """
-    Refuse to proceed if the user's tenant lacks any field that an Austrian
+    Refuse to proceed if a CUSTOMER tenant lacks any field that an Austrian
     invoice legally requires (§11 UStG: name + full address). The check runs
     at the subscription-provision boundary so an "active subscription without
     invoice-able state" never exists — defensive, fail-fast.
 
-    Raises ValueError (-> 400 at the route layer) listing the missing fields
-    so the caller knows exactly what to backfill. The seeder fills these as
-    a side-effect of Phase 2b; FE checkout flows must enforce them in the
-    onboarding step.
+    Two-tier exemption (per packages/api-validation/required-fields.yaml):
+      1. Trial plans skip the gate — trials produce no invoice, so §11
+         doesn't bite. The address will be required at upgrade-to-paid time
+         via the Mollie checkout flow.
+      2. Tenants with account_type in {test, internal} skip the gate —
+         test seeders + internal accounts bypass the customer lifecycle.
+
+    For account_type='customer' on a non-trial plan: raises ValueError
+    (-> 400 at the route layer) listing the missing fields so the caller
+    knows exactly what to backfill via PATCH
+    /v1/tenants/{tid}/billing-address.
     """
+    # Trial plans are exempt — checked first to avoid a DB round-trip.
+    from src.budget.plans import get_plan
+    if get_plan(plan_id).trial:
+        return
+
     row = await conn.fetchrow(
         """
-        SELECT t.billing_name, t.billing_street, t.billing_city,
+        SELECT t.id           AS tenant_id,
+               t.account_type::text AS account_type,
+               t.billing_name, t.billing_street, t.billing_city,
                t.billing_postcode, t.billing_country
         FROM users u
         JOIN tenants t ON t.id = u.tenant_id
@@ -849,6 +878,11 @@ async def _assert_complete_billing_address(conn: Any, user_uuid: uuid.UUID) -> N
             f"provision_subscription: user '{user_uuid}' has no tenant — "
             "cannot determine billing address"
         )
+
+    # Test + internal tenants are exempt — see exemption-set comment above.
+    if row["account_type"] in _BILLING_ADDRESS_GATE_EXEMPT_ACCOUNT_TYPES:
+        return
+
     missing = [f for f in _REQUIRED_BILLING_ADDRESS_FIELDS
                if not (row[f] or "").strip()]
     if missing:
@@ -856,8 +890,8 @@ async def _assert_complete_billing_address(conn: Any, user_uuid: uuid.UUID) -> N
         # field names the caller would use to PATCH /v1/tenants/{tid}/billing-address.
         api_names = [f.removeprefix("billing_") for f in missing]
         raise ValueError(
-            f"provision_subscription: tenant for user '{user_uuid}' is missing "
-            f"required billing-address fields: {api_names}. "
+            f"provision_subscription: customer tenant '{row['tenant_id']}' "
+            f"is missing required billing-address fields: {api_names}. "
             f"PATCH /v1/tenants/{{tenant_id}}/billing-address before provisioning."
         )
 
@@ -900,12 +934,13 @@ async def provision_subscription(
     pool = get_pool()
     user_uuid = uuid.UUID(user_id)
 
-    # Fail-fast pre-check: a subscription without billing-address yields
-    # invoices that cannot legally be issued (§11 UStG). Refuse here so the
-    # incomplete state never exists, rather than discovering it later when
-    # auto_create_invoice silently marks the invoice 'incomplete'.
+    # Fail-fast pre-check: a customer subscription without billing-address
+    # yields invoices that cannot legally be issued (§11 UStG). Refuse here
+    # so the incomplete state never exists, rather than discovering it
+    # later when auto_create_invoice silently marks the invoice 'incomplete'.
+    # Trial plans + test/internal tenants are exempt (see helper docstring).
     async with pool.acquire() as conn:
-        await _assert_complete_billing_address(conn, user_uuid)
+        await _assert_complete_billing_address(conn, user_uuid, plan_id)
 
     # Pre-check: if the user already owns an active subscription for this plan,
     # return it immediately. This covers the common idempotent re-seed case
