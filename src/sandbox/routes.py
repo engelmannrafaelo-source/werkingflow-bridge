@@ -21,9 +21,13 @@ from typing import Optional
 # app_id is a Postgres enum — only these values are accepted in activities.
 # Internal sandbox adapters (rafael/private/business/unified-tester) are not
 # enum members; their activity rows carry app_id = NULL.
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel, Field
 
+from src.tenant.middleware import (
+    get_app_env_from_request as _get_app_env_from_request,
+    normalize_app_env as _normalize_app_env,
+)
 from src.api_auth import (
     require_service_token,
     require_self_or_admin,
@@ -223,6 +227,7 @@ async def attach_session_endpoint(
 @router.post("/usage/record", response_model=UsageRecordResponse)
 async def record_usage(
     body: UsageRecordRequest,
+    request: Request,
     _claims: AuthClaims = Depends(require_service_token),
 ):
     pool = get_pool()
@@ -237,6 +242,12 @@ async def record_usage(
             cache_read_tokens=body.cacheReadTokens,
             cache_creation_tokens=body.cacheCreationTokens,
         )
+
+    # app_env: if daemon (or any caller) sets X-App-Env on this POST, the
+    # sandbox call is attributable to a specific app variant. Most sandbox
+    # calls don't — None is semantically correct then (`source='sandbox'`
+    # already carries the dimensional distinction).
+    app_env = _normalize_app_env(_get_app_env_from_request(request))
 
     async with pool.acquire() as conn:
         # Derive tenant_id + billing_mode
@@ -260,6 +271,7 @@ async def record_usage(
             cache_creation_tokens=body.cacheCreationTokens,
             hypothetical_cost_eur=hyp_cost,
             billing_mode=billing_mode,
+            app_env=app_env,
         )
 
         aggregate = await _ls.get_session_aggregate(conn, body.sessionId)

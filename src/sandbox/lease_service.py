@@ -270,6 +270,7 @@ async def record_usage(
     cache_creation_tokens: int,
     hypothetical_cost_eur: float,
     billing_mode: str,
+    app_env: Optional[str] = None,
 ) -> bool:
     """
     INSERT sandbox usage event into usage_events.
@@ -282,6 +283,13 @@ async def record_usage(
     Mapped to billing_mode_enum:
       subscription  → flat_rate_estimated (real_cost = 0, hypothetical = what it costs)
       pay_per_token → pay_per_token       (real_cost = hypothetical)
+
+    app_env: already-normalised environment bucket (prod|staging|local), or
+        None when the caller (sandbox daemon) sent no X-App-Env header. Most
+        sandbox calls run outside any prod/staging/local app context — None
+        is semantically correct; `source='sandbox'` carries the dimensional
+        distinction. The column exists so a sandbox attached to a specific
+        app variant CAN tag itself.
     """
     import json as _json
     from src.pricing import PRICING_VERSION
@@ -298,17 +306,17 @@ async def record_usage(
         INSERT INTO usage_events (
             source,
             user_id, tenant_id,
-            app, model, provider, region,
+            app, app_env, model, provider, region,
             input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens,
             billing_mode, real_cost_eur, hypothetical_cost_eur, pricing_version,
             session_id, idempotency_key, provider_metadata
         ) VALUES (
             'sandbox',
             $1, $2,
-            $3, $4, 'anthropic', NULL,
-            $5, $6, $7, $8,
-            $9::billing_mode_enum, $10, $11, $12,
-            $13, $14, $15::jsonb
+            $3, $4::app_env, $5, 'anthropic', NULL,
+            $6, $7, $8, $9,
+            $10::billing_mode_enum, $11, $12, $13,
+            $14, $15, $16::jsonb
         )
         ON CONFLICT (idempotency_key) DO NOTHING
         RETURNING id
@@ -316,6 +324,7 @@ async def record_usage(
         user_id,
         tenant_id,
         app,
+        app_env,
         model,
         input_tokens,
         output_tokens,

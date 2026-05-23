@@ -100,6 +100,19 @@ async def persist_ai_call_activity(
         if status == "success" else 0.0
     )
 
+    # Diagnostic: surface apps that fail to send X-App-Env so the Platform
+    # Admin "mode" filter (which depends on app_env) stops being blind.
+    # Logged per call (not rate-limited): the noise IS the signal — every
+    # unattributed call is a tracking gap that needs an app-side fix.
+    # When all callers send the header, the warning disappears entirely.
+    if app_env is None and app_id:
+        logger.warning(
+            "ai_call_writer: missing X-App-Env header app=%s user=%s model=%s "
+            "→ usage_events.app_env will be NULL (app-side bug, not bridge). "
+            "Fix: include X-App-Env in the app's outbound bridge headers.",
+            app_id, user_id, model,
+        )
+
     try:
         if not user_id:
             # No user → no tenant → cannot write a tenant-scoped row.
