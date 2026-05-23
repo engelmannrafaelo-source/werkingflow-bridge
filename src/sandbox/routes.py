@@ -127,7 +127,11 @@ async def lease_token(
         except _ar.NoCapacityError as exc:
             raise HTTPException(
                 status_code=503,
-                detail={"error": "no_capacity", "retry_after_s": exc.retry_after_s},
+                detail={
+                    "error": "no_capacity",
+                    "retry_after_s": exc.retry_after_s,
+                    "reasons": exc.reasons,
+                },
             )
         except RuntimeError as exc:
             logger.error(f"account-pool-state failure: {exc}")
