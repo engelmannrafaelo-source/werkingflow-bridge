@@ -180,3 +180,88 @@ async def test_tiebreak_by_shorter_cooldown(monkeypatch):
     })
     picked = await pick_account()
     assert picked.account_id == "engelmann"
+
+
+# ---------------------------------------------------------------------------
+# S7: Fair round-robin via lease_counts
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_round_robin_picks_least_used_account(monkeypatch):
+    """
+    Same headroom on both accounts — the one with fewer recent leases wins.
+    Without S7 the order was deterministic-but-unfair (dict-order + max-headroom);
+    engelmann ended up with 87% of 7d leases in prod.
+    """
+    _patch_pool_state(monkeypatch, {
+        "engelmann": _mk_account(available=True, headroom_percent=100.0, cooldown_remaining_s=0),
+        "office":    _mk_account(available=True, headroom_percent=100.0, cooldown_remaining_s=0),
+        "gmail":     _mk_account(available=True, headroom_percent=100.0, cooldown_remaining_s=0),
+    })
+    lease_counts = {"engelmann": 178, "office": 22, "gmail": 4}
+    picked = await pick_account(lease_counts=lease_counts)
+    assert picked.account_id == "gmail"  # least-used
+
+
+@pytest.mark.asyncio
+async def test_round_robin_missing_account_treated_as_zero(monkeypatch):
+    """
+    A never-used (or recently-idle) account is absent from lease_counts.
+    It MUST be treated as 0 and naturally win the rotation against any account
+    with leases in the window.
+    """
+    _patch_pool_state(monkeypatch, {
+        "engelmann": _mk_account(available=True, headroom_percent=100.0, cooldown_remaining_s=0),
+        "werking":   _mk_account(available=True, headroom_percent=100.0, cooldown_remaining_s=0),
+    })
+    # werking absent → defaults to 0 leases → wins over engelmann's 178
+    lease_counts = {"engelmann": 178}
+    picked = await pick_account(lease_counts=lease_counts)
+    assert picked.account_id == "werking"
+
+
+@pytest.mark.asyncio
+async def test_round_robin_tiebreak_by_headroom(monkeypatch):
+    """
+    Equal lease_count — headroom is the next tiebreaker (highest wins).
+    Guards against the round-robin overriding the meaningful capacity signal
+    when accounts are otherwise equally used.
+    """
+    _patch_pool_state(monkeypatch, {
+        "office":    _mk_account(available=True, headroom_percent=50.0, cooldown_remaining_s=0),
+        "engelmann": _mk_account(available=True, headroom_percent=99.0, cooldown_remaining_s=0),
+    })
+    lease_counts = {"office": 10, "engelmann": 10}
+    picked = await pick_account(lease_counts=lease_counts)
+    assert picked.account_id == "engelmann"  # higher headroom on the tiebreak
+
+
+@pytest.mark.asyncio
+async def test_round_robin_preferred_account_still_wins(monkeypatch):
+    """
+    Even with round-robin active, an eligible preferred_account_id wins.
+    Use-case: client resuming a session that ran on a specific account —
+    fairness must not break session-affinity.
+    """
+    _patch_pool_state(monkeypatch, {
+        "engelmann": _mk_account(available=True, headroom_percent=100.0, cooldown_remaining_s=0),
+        "office":    _mk_account(available=True, headroom_percent=100.0, cooldown_remaining_s=0),
+    })
+    lease_counts = {"engelmann": 200, "office": 1}
+    picked = await pick_account(preferred_account_id="engelmann", lease_counts=lease_counts)
+    assert picked.account_id == "engelmann"
+
+
+@pytest.mark.asyncio
+async def test_empty_lease_counts_falls_back_to_headroom(monkeypatch):
+    """
+    Backward-compat: pick_account() called without lease_counts (or with {})
+    must behave like the pre-S7 implementation — highest headroom wins,
+    cooldown breaks ties.
+    """
+    _patch_pool_state(monkeypatch, {
+        "office":    _mk_account(available=True, headroom_percent=80.0, cooldown_remaining_s=0),
+        "engelmann": _mk_account(available=True, headroom_percent=100.0, cooldown_remaining_s=0),
+    })
+    picked = await pick_account(lease_counts={})
+    assert picked.account_id == "engelmann"

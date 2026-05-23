@@ -250,6 +250,27 @@ async def attach_session(conn: Any, lease_id: uuid.UUID, session_id: str) -> Non
         )
 
 
+async def get_recent_lease_counts(conn: Any, window_hours: int = 24) -> dict[str, int]:
+    """
+    {account_id: lease_count} over the trailing window_hours of sandbox_leases.
+
+    Used by the account router for S7 fair round-robin: least-used account
+    wins. Accounts with zero leases in the window are absent from the dict —
+    the router treats missing entries as 0 (so a never-used account naturally
+    rises to the top of the rotation).
+    """
+    rows = await conn.fetch(
+        """
+        SELECT account_id, count(*) AS n
+        FROM sandbox_leases
+        WHERE leased_at > now() - ($1 || ' hours')::INTERVAL
+        GROUP BY account_id
+        """,
+        str(window_hours),
+    )
+    return {r["account_id"]: int(r["n"]) for r in rows}
+
+
 # ---------------------------------------------------------------------------
 # Usage record
 # ---------------------------------------------------------------------------

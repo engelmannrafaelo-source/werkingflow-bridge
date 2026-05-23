@@ -13,13 +13,14 @@ Filter semantics (architectural contract):
     pacing signal, not a lock — a SHRINK'd account is still serving calls.
   - Additional filter: `headroom_percent > SANDBOX_HEADROOM_THRESHOLD`
     (the account must have enough budget reserve to be worth a lease).
-  - `cooldown_remaining_s` is NEVER a filter here — only a tiebreaker score
-    when ranking eligible accounts.
+  - `cooldown_remaining_s` is NEVER a filter here — only a tiebreaker score.
 
-Selection:
+Selection (fair round-robin, S7):
   - preferred_account_id wins if eligible.
-  - Otherwise: highest headroom_percent; ties broken by shortest
-    cooldown_remaining_s.
+  - Otherwise: least-recently-used by lease count (lease_counts arg, typically
+    leases-issued-in-last-24h from sandbox_leases). Without this argument,
+    sort degenerates to headroom-only — backward-compatible.
+  - Ties broken by (highest headroom, shortest cooldown).
 
 Fail-fast:
   - Metrics-reader unreachable / non-200 / empty accounts → RuntimeError.
@@ -106,9 +107,19 @@ def _evaluate(acct_name: str, info: dict[str, Any]) -> tuple[bool, str, float, i
     return True, "", headroom, cooldown
 
 
-async def pick_account(preferred_account_id: Optional[str] = None) -> PickedAccount:
+async def pick_account(
+    preferred_account_id: Optional[str] = None,
+    lease_counts: Optional[dict[str, int]] = None,
+) -> PickedAccount:
     """
     Query the metrics reader and return the best account for a new lease.
+
+    Args:
+        preferred_account_id: caller hint; wins if eligible (e.g. resume).
+        lease_counts: optional {account_id: recent_lease_count} for fairness
+            ranking (typically leases-issued-in-last-24h from sandbox_leases).
+            Missing accounts default to 0. Without this arg, ranking degrades
+            to headroom-only (backward-compatible).
 
     Raises:
         RuntimeError: metrics reader unreachable / malformed / empty state
@@ -133,7 +144,8 @@ async def pick_account(preferred_account_id: Optional[str] = None) -> PickedAcco
     if not accounts:
         raise RuntimeError(f"account-pool-state returned empty accounts dict from {url}")
 
-    eligible: list[tuple[str, float, int]] = []  # (acct_name, headroom, cooldown_s)
+    lease_counts = lease_counts or {}
+    eligible: list[tuple[str, float, int, int]] = []  # (acct_name, headroom, cooldown, lease_count)
     exclusion_reasons: dict[str, str] = {}
     all_cooldowns: list[int] = []
 
@@ -141,7 +153,7 @@ async def pick_account(preferred_account_id: Optional[str] = None) -> PickedAcco
         ok, reason, headroom, cooldown = _evaluate(acct_name, info)
         all_cooldowns.append(cooldown)
         if ok:
-            eligible.append((acct_name, headroom, cooldown))
+            eligible.append((acct_name, headroom, cooldown, lease_counts.get(acct_name, 0)))
         else:
             exclusion_reasons[acct_name] = reason
 
@@ -157,20 +169,21 @@ async def pick_account(preferred_account_id: Optional[str] = None) -> PickedAcco
 
     # Honour preferred if eligible
     if preferred_account_id:
-        for acct_name, headroom, cooldown in eligible:
+        for acct_name, headroom, cooldown, lc in eligible:
             if acct_name == preferred_account_id:
                 logger.info(
                     f"pick_account: preferred={acct_name} headroom={headroom:.1f}% "
-                    f"cooldown_rem={cooldown}s (of {len(eligible)} eligible)"
+                    f"cooldown_rem={cooldown}s lease_count={lc} (of {len(eligible)} eligible)"
                 )
                 return PickedAccount(account_id=acct_name, headroom_percent=headroom)
 
-    # Rank: highest headroom first, ties broken by shortest cooldown_remaining_s.
-    eligible.sort(key=lambda x: (-x[1], x[2]))
-    picked_name, picked_headroom, picked_cooldown = eligible[0]
+    # Fair round-robin: rank by (lease_count ASC, -headroom ASC, cooldown ASC).
+    # Least-used wins; ties broken by most-budget; final tiebreak shortest cooldown.
+    eligible.sort(key=lambda x: (x[3], -x[1], x[2]))
+    picked_name, picked_headroom, picked_cooldown, picked_lc = eligible[0]
     logger.info(
         f"pick_account: picked={picked_name} headroom={picked_headroom:.1f}% "
-        f"cooldown_rem={picked_cooldown}s (of {len(eligible)} eligible, "
-        f"excluded={list(exclusion_reasons.keys())})"
+        f"cooldown_rem={picked_cooldown}s lease_count={picked_lc} "
+        f"(of {len(eligible)} eligible, excluded={list(exclusion_reasons.keys())})"
     )
     return PickedAccount(account_id=picked_name, headroom_percent=picked_headroom)

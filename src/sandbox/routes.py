@@ -125,9 +125,13 @@ async def lease_token(
                 detail={"error": "lease_not_applicable", "billing_mode": billing_mode},
             )
 
-        # 2. Pick best account
+        # 2. Pick best account — S7 fair round-robin: pass recent lease counts
+        # so the router prefers under-used accounts over the highest-headroom
+        # one. Window is 24h: long enough to smooth bursty per-user sessions,
+        # short enough to forgive a once-busy account that has since gone idle.
+        lease_counts = await _ls.get_recent_lease_counts(conn, window_hours=24)
         try:
-            picked = await _ar.pick_account(body.preferredAccountId)
+            picked = await _ar.pick_account(body.preferredAccountId, lease_counts=lease_counts)
         except _ar.NoCapacityError as exc:
             raise HTTPException(
                 status_code=503,
