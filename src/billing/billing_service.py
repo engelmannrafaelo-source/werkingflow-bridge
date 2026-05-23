@@ -815,6 +815,53 @@ async def _provision_plan_budget(
     )
 
 
+# Fields required on tenants.billing_* for a legally issuable invoice. vat_id
+# stays optional — B2C customers (no UID) are explicitly allowed by §11 UStG.
+# Keep this list in sync with migration 010_tenant_billing_address.sql comment.
+_REQUIRED_BILLING_ADDRESS_FIELDS = ("billing_name", "billing_street", "billing_city",
+                                     "billing_postcode", "billing_country")
+
+
+async def _assert_complete_billing_address(conn: Any, user_uuid: uuid.UUID) -> None:
+    """
+    Refuse to proceed if the user's tenant lacks any field that an Austrian
+    invoice legally requires (§11 UStG: name + full address). The check runs
+    at the subscription-provision boundary so an "active subscription without
+    invoice-able state" never exists — defensive, fail-fast.
+
+    Raises ValueError (-> 400 at the route layer) listing the missing fields
+    so the caller knows exactly what to backfill. The seeder fills these as
+    a side-effect of Phase 2b; FE checkout flows must enforce them in the
+    onboarding step.
+    """
+    row = await conn.fetchrow(
+        """
+        SELECT t.billing_name, t.billing_street, t.billing_city,
+               t.billing_postcode, t.billing_country
+        FROM users u
+        JOIN tenants t ON t.id = u.tenant_id
+        WHERE u.id = $1
+        """,
+        user_uuid,
+    )
+    if row is None:
+        raise ValueError(
+            f"provision_subscription: user '{user_uuid}' has no tenant — "
+            "cannot determine billing address"
+        )
+    missing = [f for f in _REQUIRED_BILLING_ADDRESS_FIELDS
+               if not (row[f] or "").strip()]
+    if missing:
+        # Strip the `billing_` prefix in the error message to match the API
+        # field names the caller would use to PATCH /v1/tenants/{tid}/billing-address.
+        api_names = [f.removeprefix("billing_") for f in missing]
+        raise ValueError(
+            f"provision_subscription: tenant for user '{user_uuid}' is missing "
+            f"required billing-address fields: {api_names}. "
+            f"PATCH /v1/tenants/{{tenant_id}}/billing-address before provisioning."
+        )
+
+
 async def provision_subscription(
     user_id: str,
     plan_id: str,
@@ -832,6 +879,11 @@ async def provision_subscription(
     returns it without creating a duplicate. Refuses trial plans (use the normal
     checkout flow for those — trial provisioning happens auto in evaluate_budget).
 
+    Fail-fast: refuses to provision if the user's tenant has no complete
+    billing-address (§11 UStG — invoices require a recipient address). Seeders
+    must populate the address before provisioning; FE checkout flows must
+    require it during onboarding.
+
     The synthetic mollie_first_payment_id ('provision-{user_id}-{plan_id}') acts
     as the idempotency key for concurrent callers, just like the real payment ID
     does in _activate_subscription.
@@ -847,6 +899,13 @@ async def provision_subscription(
 
     pool = get_pool()
     user_uuid = uuid.UUID(user_id)
+
+    # Fail-fast pre-check: a subscription without billing-address yields
+    # invoices that cannot legally be issued (§11 UStG). Refuse here so the
+    # incomplete state never exists, rather than discovering it later when
+    # auto_create_invoice silently marks the invoice 'incomplete'.
+    async with pool.acquire() as conn:
+        await _assert_complete_billing_address(conn, user_uuid)
 
     # Pre-check: if the user already owns an active subscription for this plan,
     # return it immediately. This covers the common idempotent re-seed case

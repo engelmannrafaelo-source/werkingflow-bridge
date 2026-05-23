@@ -172,6 +172,83 @@ PYEOF
 log_success "Tenants seeded"
 
 # ============================================================================
+# PHASE 2b: SEED TENANT BILLING ADDRESS
+#
+# A tenant with an active subscription but no billing address cannot be
+# invoiced (§11 UStG requires the recipient's address on every invoice).
+# The Bridge `provision_subscription` gate rejects subscription provisioning
+# unless billing-address is complete — so the seeder must populate it for
+# every test tenant BEFORE Phase 5 (billing provision).
+#
+# Idempotent PATCH: re-seeds converge to the same address. Existing
+# addresses with any user-modified field stay intact (PATCH only sets the
+# fields it sends — every field present here overwrites silently, which is
+# the desired behaviour for test tenants whose addresses are seed-owned).
+# ============================================================================
+phase_header "2b" "SEED TENANT BILLING ADDRESS"
+
+python3 - <<PYEOF
+import json, sys, requests
+
+creds = json.load(open('${CREDENTIALS_JSON}'))
+users = creds.get('users', {})
+headers = {
+    'Content-Type': 'application/json',
+    'X-Bridge-Service-Token': '${BRIDGE_SERVICE_TOKEN}',
+}
+
+# Same tenant set as Phase 2 — declared + app-default.
+declared_ids = set()
+for u in users.values():
+    tid = u.get('tenantId')
+    if tid:
+        declared_ids.add(tid)
+
+tenant_ids = sorted(declared_ids)
+default_tid = '${DEFAULT_TENANT_ID}'
+if default_tid not in declared_ids:
+    tenant_ids.insert(0, default_tid)
+
+if not tenant_ids:
+    print('  [warn]  No tenants to address')
+    sys.exit(0)
+
+# Sane test defaults — Austria-based, satisfies the Bridge billing-address
+# completeness gate (name+street+city+postcode+country all required).
+def default_address(tid: str) -> dict:
+    return {
+        'name':     f'Test Tenant {tid}',
+        'street':   'Teststraße 1',
+        'city':     'Wien',
+        'postcode': '1010',
+        'country':  'AT',
+    }
+
+ok = True
+for tid in tenant_ids:
+    try:
+        r = requests.patch(
+            f'${BRIDGE_URL}/v1/tenants/{tid}/billing-address',
+            json=default_address(tid),
+            headers=headers,
+            timeout=15,
+        )
+    except requests.RequestException as e:
+        print(f"  [FAIL]  Billing address {tid}: request error — {e}", file=sys.stderr)
+        ok = False
+        continue
+
+    if r.status_code == 200:
+        print(f"  [ok]    Billing address set: {tid}")
+    else:
+        print(f"  [FAIL]  Billing address {tid}: HTTP {r.status_code} — {r.text}", file=sys.stderr)
+        ok = False
+
+sys.exit(0 if ok else 1)
+PYEOF
+log_success "Tenant billing addresses seeded"
+
+# ============================================================================
 # PHASE 3: SEED USERS
 #
 # Users without tenantId are assigned to the app-default tenant.
