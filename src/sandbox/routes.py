@@ -13,7 +13,6 @@ Auth:
   - GET  /v1/sandbox/usage/by-tenant/:tenantId: require_service_token
   - GET  /v1/sandbox/usage/by-session/:sessionId: require_service_token
 """
-import json
 import logging
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -22,8 +21,6 @@ from typing import Optional
 # app_id is a Postgres enum — only these values are accepted in activities.
 # Internal sandbox adapters (rafael/private/business/unified-tester) are not
 # enum members; their activity rows carry app_id = NULL.
-_ACTIVITY_APP_IDS = {"werking-report", "werking-energy", "werking-safety", "werking-noise", "engelmann"}
-
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
 
@@ -243,7 +240,7 @@ async def record_usage(
         tenant_id = info["tenant_id"]
         billing_mode = info["billing_mode"]
 
-        inserted = await _ls.record_usage(
+        await _ls.record_usage(
             conn,
             litellm_call_id=body.litellmCallId,
             user_id=body.userId,
@@ -260,50 +257,6 @@ async def record_usage(
             hypothetical_cost_eur=hyp_cost,
             billing_mode=billing_mode,
         )
-
-        # Mirror into the activities table so sandbox usage shows up in the
-        # platform usage panel alongside workflow AI-calls. Only on a real
-        # insert — duplicate webhooks must not double-count.
-        if inserted:
-            actor_uuid: Optional[uuid.UUID]
-            try:
-                actor_uuid = uuid.UUID(str(body.userId))
-            except (ValueError, AttributeError, TypeError):
-                actor_uuid = None
-            # event_type uses the ai-call: prefix so the platform Usage panel
-            # (which filters event_type LIKE 'ai-call:%') picks it up. The
-            # feature suffix sandbox-<app> keeps sandbox calls identifiable.
-            feature = f"sandbox-{body.app}"
-            activity_payload = {
-                "feature": feature,
-                "model": body.model,
-                "promptTokens": body.inputTokens,
-                "completionTokens": body.outputTokens,
-                "totalTokens": body.inputTokens + body.outputTokens,
-                "cacheReadTokens": body.cacheReadTokens,
-                "cacheCreationTokens": body.cacheCreationTokens,
-                "hypotheticalCostEur": hyp_cost,
-                "accountId": body.accountId,
-                "sandbox": True,
-                "loggedBy": "sandbox-daemon",
-            }
-            try:
-                await conn.execute(
-                    """
-                    INSERT INTO activities
-                      (id, timestamp, category, event_type, actor_user_id,
-                       target_user_id, tenant_id, app_id, ip, user_agent, payload)
-                    VALUES (gen_random_uuid(), NOW(), 'workflow', $1, $2,
-                            NULL, $3, $4, NULL, NULL, $5::jsonb)
-                    """,
-                    f"ai-call:{feature}",
-                    actor_uuid,
-                    tenant_id,
-                    body.app if body.app in _ACTIVITY_APP_IDS else None,
-                    json.dumps(activity_payload),
-                )
-            except Exception as e:  # noqa: BLE001 — mirror must never break the call
-                logger.warning("activities mirror for sandbox usage failed: %s", e)
 
         aggregate = await _ls.get_session_aggregate(conn, body.sessionId)
 
