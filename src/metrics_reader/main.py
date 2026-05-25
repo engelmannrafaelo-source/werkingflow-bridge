@@ -45,6 +45,7 @@ DEFENSIVE PROGRAMMING
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 from typing import Optional
@@ -67,6 +68,41 @@ PROD_BRIDGE_URL = os.getenv("BRIDGE_PROD_URL", "").rstrip("/")
 # Worker hostnames in this docker-compose network (comma-separated).
 # Dev-Bridge default: worker1..worker4.  Production: worker-prod.
 BRIDGE_WORKERS = [w.strip() for w in os.getenv("BRIDGE_WORKERS", "worker1,worker2,worker3,worker4").split(",") if w.strip()]
+
+# Sandbox observed rate-limits. Bridge workers track 429s on their own
+# /v1/chat/completions calls via rate_limit_tracker. Sandbox containers go
+# through the passthrough proxy directly to api.anthropic.com — those 429s
+# never reach a worker. This file-backed map lets the sandbox-daemon report
+# observed limits so the next pick_account skips the affected account.
+#
+# File-backed (not in-memory) because uvicorn runs --workers 4: each worker
+# is a separate process, so a module-level dict would be invisible to other
+# workers. Container tmpfs is shared across worker processes within the
+# single metrics-reader container. Penalties are short-lived (60-300s) and
+# may be lost on container restart — that's acceptable.
+_PENALTY_FILE = "/tmp/sandbox-observed-penalties.json"
+
+
+def _read_penalties() -> dict[str, float]:
+    """Read the penalty map from /tmp. Returns {} if missing or unreadable."""
+    try:
+        with open(_PENALTY_FILE) as f:
+            return {k: float(v) for k, v in json.load(f).items()}
+    except (FileNotFoundError, ValueError, OSError):
+        return {}
+
+
+def _write_penalties(penalties: dict[str, float]) -> None:
+    """Atomically write the penalty map: tmp + os.replace."""
+    tmp = _PENALTY_FILE + f".tmp.{os.getpid()}"
+    try:
+        with open(tmp, "w") as f:
+            json.dump(penalties, f)
+        os.replace(tmp, _PENALTY_FILE)
+    except OSError as e:
+        logger.warning(f"penalty file write failed: {e}")
+        try: os.unlink(tmp)
+        except OSError: pass
 
 # Whether production has a metrics-reader (JSONL endpoints work).
 # Probed once on first request; re-probed every 5 minutes.
@@ -889,10 +925,68 @@ def get_account_pool_state():
             errors.append({"worker": worker, "error": str(e)})
             logger.warning(f"account-pool-state: {worker} unreachable: {e}")
 
+    # Overlay sandbox-observed penalties: if the daemon reported a 429 for
+    # this account, force available=false until the penalty expires. Workers
+    # don't see sandbox-path 429s, so without this overlay pick_account would
+    # happily hand out a rate-limited account again.
+    penalties = _read_penalties()
+    changed = False
+    expired: list[str] = []
+    for acct_name, until_ts in list(penalties.items()):
+        remaining_s = int(until_ts - now)
+        if remaining_s <= 0:
+            expired.append(acct_name)
+            changed = True
+            continue
+        if acct_name not in accounts:
+            continue
+        info = accounts[acct_name]
+        info["available"] = False
+        info["soft_penalty_remaining_s"] = max(
+            int(info.get("soft_penalty_remaining_s") or 0), remaining_s
+        )
+        info["cooldown_remaining_s"] = max(
+            int(info.get("cooldown_remaining_s") or 0), remaining_s
+        )
+        info["sandbox_observed_penalty_s"] = remaining_s
+    if changed:
+        for k in expired:
+            penalties.pop(k, None)
+        _write_penalties(penalties)
+
     result: dict = {"ts": now, "accounts": accounts}
     if errors:
         result["errors"] = errors
     return result
+
+
+@app.post("/v1/metrics/sandbox-observed-rate-limit")
+def post_observed_rate_limit(payload: dict):
+    """
+    Record an observed 429 on the sandbox passthrough path. Worker-side
+    rate_limit_tracker only sees 429s on the worker's own outbound calls;
+    sandbox containers bypass workers so the daemon posts the signal here
+    and the next /v1/metrics/account-pool-state surfaces it.
+
+    Body: {"account_id": "office", "retry_after_s": 120}
+    """
+    account_id = payload.get("account_id")
+    retry_after_s = int(payload.get("retry_after_s") or 60)
+    if not account_id:
+        raise HTTPException(status_code=400, detail="account_id required")
+    if retry_after_s < 1 or retry_after_s > 3600:
+        raise HTTPException(status_code=400, detail="retry_after_s out of range [1, 3600]")
+
+    import time as _time
+    until_ts = _time.time() + retry_after_s
+    penalties = _read_penalties()
+    penalties[account_id] = until_ts
+    _write_penalties(penalties)
+    logger.info(
+        f"sandbox observed 429: account={account_id} "
+        f"penalty_until={int(until_ts)} ({retry_after_s}s)"
+    )
+    return {"ok": True, "account_id": account_id, "penalty_until_ts": int(until_ts)}
 
 
 # ============================================================================
