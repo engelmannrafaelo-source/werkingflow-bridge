@@ -194,6 +194,9 @@ async def list_plans() -> Dict[str, Any]:
 
     No auth required: prices are not sensitive; the frontend needs this
     to render the plan-comparison table before (and after) the user logs in.
+
+    Source: PLANS dict in src/budget/plans.py, populated from the `plans`
+    table by reload_plans() at Bridge startup and on /plans/reload.
     """
     return {
         "plans": [
@@ -210,6 +213,28 @@ async def list_plans() -> Dict[str, Any]:
             for p in PLANS.values()
         ]
     }
+
+
+@router.post("/plans/reload")
+async def reload_plans_endpoint(
+    _claims: AuthClaims = Depends(require_admin),
+) -> Dict[str, Any]:
+    """
+    Re-read the plans table into the in-memory PLANS cache.
+
+    Operator-only (require_admin) — gated on is_operator, so only service
+    tokens without X-User-ID or admin JWTs can hot-swap pricing. A scoped
+    customer-proxy token must never reach this endpoint.
+
+    Use case: after a UPDATE plans SET price_eur = ... statement, call this
+    to make the new price visible without restarting the Bridge. The
+    /plans GET endpoint reflects the new state on the very next call.
+
+    Returns the new active-plan count.
+    """
+    from src.budget.plans import reload_plans
+    count = await reload_plans()
+    return {"reloaded": True, "activePlans": count}
 
 
 class CustomerRequest(BaseModel):

@@ -1,6 +1,15 @@
 """
-Plan configuration (Python port of PlanManager.ts).
-SSoT: werkingflow-business/shared/operations/PRICING-STRATEGY.md
+Plan configuration — DB-backed since migration 020_plans_table.sql.
+
+The PLANS dict is a runtime cache populated at Bridge startup by
+reload_plans() (called from platform_main.lifespan). Plan attributes
+(price, description, name, ...) now live in the `plans` table and can
+be iterated on without redeploying the Bridge. Plan IDs themselves stay
+in the plan_id Postgres enum (typed FK from subscriptions/app_licenses).
+
+Hot-swap: POST /v1/billing/plans/reload (operator-only) re-reads the
+table and atomically replaces PLANS contents. Workers that hold a
+module-level reference to PLANS see the new state without restart.
 """
 from dataclasses import dataclass
 
@@ -17,61 +26,40 @@ class PlanConfig:
     trial: bool = False
 
 
-PLANS: dict[str, PlanConfig] = {
-    "trial": PlanConfig(
-        id="trial",
-        app_id="werking-report",
-        name="7-Tage-Test",
-        price=0,
-        interval="month",
-        api_budget_eur=5,
-        trial=True,
-        description="7 Tage kostenlos, voller Zugang. Danach EUR 250 oder weg.",
-    ),
-    "report-standard": PlanConfig(
-        id="report-standard",
-        app_id="werking-report",
-        name="Standard",
-        price=250,
-        interval="month",
-        api_budget_eur=50,
-        description="Voller Funktionsumfang. KI-Budget inklusive, weitere Sitze zum gleichen Preis.",
-    ),
-    "energy-project": PlanConfig(
-        id="energy-project",
-        app_id="werking-energy",
-        name="Energy-Projekt",
-        price=1000,
-        interval="project",
-        api_budget_eur=100,
-        description="KI-Budget inklusive. Beliebig viele Neuberechnungen, solange das Budget reicht.",
-    ),
-    # safety-project removed 2026-05-26 — WerkING Safety ist pausiert (nicht in Entwicklung).
-    # Reaktivieren: Eintrag wiederherstellen aus git log, Bridge restart.
-    "noise-tbd": PlanConfig(
-        id="noise-tbd",
-        app_id="werking-noise",
-        name="WerkING Noise",
-        price=0,
-        interval="month",
-        api_budget_eur=0,
-        description="Akustik-Gutachten mit KI-Unterstützung. Aktuell in Beta-Tests.",
-    ),
-    "engelmann-custom": PlanConfig(
-        id="engelmann-custom",
-        app_id="engelmann",
-        name="Engelmann Custom",
-        price=0,
-        interval="month",
-        api_budget_eur=0,
-        description="Custom-Projekt, kein WerkING-Produkt. Separate Konditionen.",
-    ),
-}
+# Mutable runtime cache. Populated by reload_plans() at startup. Mutated
+# in-place by reload — callers holding a reference see the new contents.
+PLANS: dict[str, PlanConfig] = {}
+
+
+async def reload_plans() -> int:
+    """
+    Re-read the plans table and atomically replace the PLANS dict contents.
+    Returns the new plan count. Fails loud if the table is empty.
+
+    Called from platform_main.lifespan on startup, and from the hot-reload
+    admin endpoint after a price/description edit.
+    """
+    # Local import to avoid a startup-time circular dependency: plan_repo
+    # imports PlanConfig from this module.
+    from src.budget.plan_repo import load_plans_from_db
+    new_plans = await load_plans_from_db()
+    PLANS.clear()
+    PLANS.update(new_plans)
+    return len(PLANS)
 
 
 def get_plan(plan_id: str) -> PlanConfig:
     plan = PLANS.get(plan_id)
     if not plan:
+        # Empty PLANS would silently 404 every consumer — surface that as
+        # a distinct error so it's obvious in logs that reload_plans()
+        # never ran (or returned an empty set).
+        if not PLANS:
+            raise RuntimeError(
+                f"[PlanManager] PLANS cache is empty — reload_plans() was "
+                f"never called, or the plans table has no active rows. "
+                f"Cannot resolve plan_id={plan_id!r}."
+            )
         raise ValueError(f"[PlanManager] Unknown plan: {plan_id}")
     return plan
 

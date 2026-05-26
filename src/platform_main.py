@@ -91,6 +91,19 @@ async def lifespan(app: FastAPI):
         logger.error(f"❌ Platform DB pool init failed: {e}")
         raise
 
+    # Plan catalog: load from DB into the in-memory PLANS dict. The plans
+    # table is the source of truth (migration 020); the PLANS dict in
+    # src/budget/plans.py is a runtime cache, populated here and refreshed
+    # by POST /v1/billing/plans/reload. Fail-fast on empty catalog — a
+    # silently zero-plan Bridge would 404 every customer in the portal.
+    from src.budget.plans import reload_plans
+    try:
+        count = await reload_plans()
+        logger.info(f"✅ Plan catalog loaded: {count} active plans")
+    except Exception as e:
+        logger.error(f"❌ Plan catalog load failed: {e}")
+        raise
+
     yield
 
     try:
