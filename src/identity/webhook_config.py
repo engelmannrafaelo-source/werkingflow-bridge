@@ -38,16 +38,23 @@ from typing import Dict, FrozenSet, Optional
 logger = logging.getLogger(__name__)
 
 
-# Apps whose auth flows go through the Bridge and therefore need a webhook
-# receiver. Engelmann is on Supabase (per ADR cross-app/0002) and is
-# intentionally absent. Mirrors _REGISTER_ALLOWED_APP_IDS in
-# src/identity/routes.py minus engelmann; updating one requires updating the
-# other in lock-step.
+# Apps whose auth flows go through the Bridge AND have a working webhook
+# receiver implemented + reachable. Phase M1 rollout is gradual — only
+# werking-report is wired up today (commit adds /api/auth/webhook/token-issued
+# + uses existing src/lib/email.ts pipeline).
+#
+# To add another app: implement the same receiver route, configure
+# BRIDGE_WEBHOOK_URL_<APP_UPPER> + BRIDGE_WEBHOOK_SECRET_<APP_UPPER> in
+# Infisical dev-server, then add the app_id here. Bridge fail-loud at boot
+# verifies the env vars on every reachable app — so the wiring is forced
+# to be complete before the app joins this set.
+#
+# Engelmann is on Supabase (per ADR cross-app/0002) and is intentionally
+# absent. _REGISTER_ALLOWED_APP_IDS in src/identity/routes.py is a SEPARATE
+# set (registration is allowed for more apps than webhook-mail is wired up
+# for — they just stdout-log the token until their receiver lands).
 BRIDGE_AUTH_APP_IDS: FrozenSet[str] = frozenset({
     "werking-report",
-    "werking-energy",
-    "werking-safety",
-    "werking-noise",
 })
 
 
