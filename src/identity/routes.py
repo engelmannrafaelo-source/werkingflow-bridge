@@ -1,8 +1,9 @@
 """
-Auth endpoints: login / logout / session.
+Auth endpoints: login / logout / session / register.
 Mounted under /v1/auth — only active when BRIDGE_DB_URL is set.
 
 POST /v1/auth/login      {email, password} -> {jwt, user, appLicenses[]}  PUBLIC
+POST /v1/auth/register   {email, password, name, appId, checkId?} -> {jwt, user, appLicenses[]}  PUBLIC
 POST /v1/auth/logout     Bearer <jwt> -> 204                             require_jwt
 GET  /v1/auth/session    Bearer <jwt> -> {user, appLicenses[]}           require_jwt
 POST /v1/auth/issue      X-Bridge-Service-Token {userId} -> {jwt, expiresAt}  require_service_token
@@ -13,15 +14,16 @@ import uuid
 from datetime import datetime, timezone, timedelta
 from typing import Any, Dict, List, Optional
 
+import asyncpg
 import jwt
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi import Security
-from pydantic import BaseModel, EmailStr
+from pydantic import BaseModel, EmailStr, Field
 
 from src.api_auth import require_jwt, require_service_token, AuthClaims
 from src.db.client import get_pool
-from src.identity.password import verify_password
+from src.identity.password import hash_password, verify_password
 from src.identity.jwt_utils import sign_jwt, verify_jwt
 
 router = APIRouter(prefix="/v1/auth", tags=["auth"])
@@ -353,3 +355,200 @@ async def issue_token(
         expires_at.isoformat(),
     )
     return {"jwt": token, "expiresAt": expires_at.isoformat()}
+
+
+# ---------------------------------------------------------------------------
+# POST /v1/auth/register  — public self-service registration
+#
+# Replaces the per-app users.json (werking-report standalone-auth.createUser).
+# Bridge becomes the single source of truth for identity: a register-then-login
+# cycle works because both sides write to / read from the same `users` table.
+#
+# Approval flow: the `users` table has no `approved`/`verified` column today, so
+# registration auto-approves and the response includes a JWT (auto-login). If a
+# future migration adds such a column, this endpoint should switch to 202 +
+# {pendingApproval: true} for non-approved users — see the architecture-decision
+# block in the function body.
+# ---------------------------------------------------------------------------
+
+# Mirrors app_id ENUM from migrations/001_initial_schema.sql. If the enum grows,
+# add the value here in the same change — fail-loud beats a confusing 500 from
+# Postgres on an unknown enum literal.
+_REGISTER_ALLOWED_APP_IDS = frozenset({
+    "werking-report", "werking-energy", "werking-safety",
+    "werking-noise", "engelmann",
+})
+
+# Default plan_id assigned to the initial app_license at registration. 'trial'
+# is the only plan_id value in the enum that is app-agnostic and does not
+# pre-commit the new user to a paid tier.
+_REGISTER_DEFAULT_PLAN_ID = "trial"
+
+
+class RegisterRequest(BaseModel):
+    email: EmailStr
+    password: str = Field(min_length=8, description="Minimum 8 characters")
+    name: str = Field(min_length=1, max_length=255)
+    appId: str = Field(description="Initial app context — must be a known app_id")
+    checkId: Optional[str] = Field(
+        default=None,
+        description="Opaque correlation id for app-side flows (e.g. werking-report check)",
+    )
+
+
+@router.post("/register")
+async def register(body: RegisterRequest) -> Dict[str, Any]:
+    """
+    Public self-service registration.
+
+    Creates: tenants row (personal tenant, owner_user_id=new user),
+             users row (password_hash via bcrypt),
+             app_licenses row (initial trial license for `appId`),
+             sessions row (auto-login JWT).
+
+    Fails loud:
+      - 409 Conflict          → email already taken (no enumeration masking on
+                                Bridge — UI may translate as needed)
+      - 422 Unprocessable     → Pydantic schema violation (invalid email,
+                                missing field, password < 8 chars)
+      - 400 Bad Request       → appId not in the app_id enum
+      - 5xx                   → DB / programmer error (re-raised, never silently
+                                returns a half-built user)
+
+    Architecture decision (Approval-Flow):
+      The current schema does NOT have a users.approved / users.verified column.
+      Per the migration plan we auto-approve and return a JWT immediately so
+      werking-report can replace its local users.json without losing the
+      register-then-immediately-use-the-app UX. When approval is later added,
+      branch here on the column and return 202 with {pendingApproval: true}
+      instead of minting a JWT.
+    """
+    if body.appId not in _REGISTER_ALLOWED_APP_IDS:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Unknown appId '{body.appId}'. Must be one of: "
+                f"{sorted(_REGISTER_ALLOWED_APP_IDS)}"
+            ),
+        )
+
+    pool = get_pool()
+    now = datetime.now(timezone.utc)
+    today = now.date()
+    tenant_id = str(uuid.uuid4())
+    password_hash = hash_password(body.password)
+
+    async with pool.acquire() as conn:
+        # All identity rows must succeed together or none — a half-built user
+        # (tenant without user, user without license) is worse than fail-loud.
+        async with conn.transaction():
+            # Email uniqueness is enforced by the UNIQUE constraint on
+            # users.email; pre-checking would race. Catch the violation and
+            # translate to 409 — same pattern as create_user in admin_routes.
+            try:
+                await conn.execute(
+                    """
+                    INSERT INTO tenants (id, name, account_type, created_at)
+                    VALUES ($1, $2, 'customer'::account_type, $3)
+                    """,
+                    tenant_id,
+                    f"Personal tenant for {body.email}",
+                    now,
+                )
+
+                user_row = await conn.fetchrow(
+                    """
+                    INSERT INTO users (email, name, tenant_id, role, password_hash, created_at, updated_at)
+                    VALUES ($1, $2, $3, 'user', $4, $5, $5)
+                    RETURNING id, email, name, tenant_id, role, provider_config, created_at, updated_at
+                    """,
+                    body.email,
+                    body.name,
+                    tenant_id,
+                    password_hash,
+                    now,
+                )
+
+                user_id = user_row["id"]
+
+                # Close the loop: the personal tenant is owned by the user who
+                # just created it. Done after the user insert because
+                # tenants.owner_user_id FK references users(id).
+                await conn.execute(
+                    "UPDATE tenants SET owner_user_id = $1 WHERE id = $2",
+                    user_id,
+                    tenant_id,
+                )
+
+                # Initial app_license — trial. start_date=today, end_date=NULL
+                # (open-ended trial; billing flow may convert it to a paid plan).
+                await conn.execute(
+                    """
+                    INSERT INTO app_licenses (user_id, app_id, plan_id, start_date, end_date, seats)
+                    VALUES ($1, $2::app_id, $3::plan_id, $4, NULL, 1)
+                    """,
+                    user_id,
+                    body.appId,
+                    _REGISTER_DEFAULT_PLAN_ID,
+                    today,
+                )
+            except asyncpg.UniqueViolationError as exc:
+                # Most likely cause: users.email collision. We surface a clear
+                # 409 — per the task brief, anti-enumeration is a UI concern,
+                # not a Bridge concern.
+                msg = str(exc).lower()
+                if "email" in msg or "users_email" in msg:
+                    raise HTTPException(
+                        status_code=409,
+                        detail=f"User with email '{body.email}' already exists",
+                    )
+                # Some other unique constraint — surface it explicitly rather
+                # than swallowing with a generic 500.
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"Registration failed: {exc}",
+                )
+            except asyncpg.PostgresError as exc:
+                # Fail-loud on any DB error. Logged with full detail server-side,
+                # surfaced as 500 with the PG message so it never silently passes.
+                logger.exception("register failed: %s", exc)
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"Database error during registration: {exc}",
+                )
+
+        # Build the JWT outside the transaction — once persisted, the user
+        # exists; auto-login is a separate concern.
+        license_rows = await conn.fetch(
+            "SELECT app_id, plan_id, start_date, end_date, seats FROM app_licenses WHERE user_id = $1",
+            user_id,
+        )
+        app_licenses = [_license_row(lr) for lr in license_rows]
+
+        token = sign_jwt(
+            user_id=str(user_id),
+            email=user_row["email"],
+            tenant_id=user_row["tenant_id"],
+            app_licenses=app_licenses,
+            role=user_row["role"],
+        )
+
+        expires_at = now + timedelta(hours=_SESSION_TTL_HOURS)
+        await conn.execute(
+            "INSERT INTO sessions (user_id, token, created_at, expires_at) VALUES ($1, $2, $3, $4)",
+            user_id,
+            token,
+            now,
+            expires_at,
+        )
+
+    logger.info(
+        "identity.register: created user_id=%s tenant_id=%s appId=%s checkId=%s",
+        user_id,
+        tenant_id,
+        body.appId,
+        body.checkId,
+    )
+
+    user = _user_dict(user_row, app_licenses)
+    return {"jwt": token, "user": user, "appLicenses": app_licenses}
