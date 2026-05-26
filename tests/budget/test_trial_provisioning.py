@@ -47,9 +47,6 @@ class TestFindTrialPlanFor:
     def test_energy_project_has_no_trial(self):
         assert find_trial_plan_for("energy-project") is None
 
-    def test_safety_project_has_no_trial(self):
-        assert find_trial_plan_for("safety-project") is None
-
     def test_engelmann_custom_has_no_trial(self):
         # Criterion 4: apps without trial sibling return None.
         assert find_trial_plan_for("engelmann-custom") is None

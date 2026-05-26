@@ -46,15 +46,8 @@ PLANS: dict[str, PlanConfig] = {
         api_budget_eur=100,
         description="EUR 1.000 pro Projekt, EUR 100 API-Budget inkl., beliebige Neuberechnungen solange Budget reicht.",
     ),
-    "safety-project": PlanConfig(
-        id="safety-project",
-        app_id="werking-safety",
-        name="Safety-Projekt",
-        price=5000,
-        interval="project",
-        api_budget_eur=0,
-        description="EUR 5.000+ pro Projekt (Foerderprojekt oder Direktkauf).",
-    ),
+    # safety-project removed 2026-05-26 — WerkING Safety ist pausiert (nicht in Entwicklung).
+    # Reaktivieren: Eintrag wiederherstellen aus git log, Bridge restart.
     "noise-tbd": PlanConfig(
         id="noise-tbd",
         app_id="werking-noise",
