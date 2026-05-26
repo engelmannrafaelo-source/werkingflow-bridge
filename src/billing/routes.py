@@ -2,11 +2,15 @@
 Billing-Endpoints — Cross-App Mollie-Integration.
 
 Auth model:
-  - /v1/billing/mollie-webhook       PUBLIC (Mollie calls us; we verify by re-fetching payment from Mollie)
-  - /v1/billing/customer             require_jwt_or_service
-  - /v1/billing/subscription/...     require_jwt_or_service
-  - /v1/billing/topup/...            require_jwt_or_service
-  - /v1/billing/{user_id}/...        require_self_or_admin
+  - /v1/billing/mollie-webhook            PUBLIC (Mollie calls us; we verify by re-fetching payment from Mollie)
+  - /v1/billing/customer                  require_jwt_or_service
+  - /v1/billing/subscription/...          require_jwt_or_service
+  - /v1/billing/topup/...                 require_jwt_or_service
+  - /v1/billing/{user_id}/...             require_self_or_admin
+  - /v1/billing/order/invoice             require_jwt_or_service (Rechnungs-Lane)
+  - /v1/users/{user_id}/pending-orders    require_self_or_admin
+  - /v1/admin/orders/pending              require_admin (operator only)
+  - /v1/admin/orders/{order_id}/release   require_admin (operator only)
 """
 import json
 from typing import Any, Dict, Optional
@@ -434,3 +438,107 @@ async def list_billing_events(
     return {"items": [_row(r) for r in rows], "count": len(rows)}
 
 # mode_filter applied (overview signature only — body needs JOIN if you want per-mode totals)
+
+
+# ---------------------------------------------------------------------------
+# Pending-Orders — Rechnungs-Lane (Variante A: manuelle Freigabe)
+# ---------------------------------------------------------------------------
+
+from src.billing import pending_orders_service  # noqa: E402
+
+_pending_router = APIRouter(tags=["billing"])
+_admin_orders_router = APIRouter(tags=["billing"])
+
+
+class InvoiceOrderRequest(BaseModel):
+    planId: str
+    quantity: int = Field(default=1, ge=1, le=100)
+
+
+@_pending_router.post("/v1/billing/order/invoice", status_code=201)
+async def order_invoice(
+    body: InvoiceOrderRequest,
+    claims: AuthClaims = Depends(require_jwt_or_service),
+) -> Dict[str, Any]:
+    """
+    Admin bestellt einen Plan auf Rechnung (manuelle Freigabe durch Operator).
+
+    Erstellt Invoice (status='issued'), pending_orders-Row und sendet Email.
+    Gated auf require_jwt_or_service — Auth wie andere customer-facing Billing-Endpoints.
+    acting_user_id ist der bestellende Admin.
+    """
+    user_id = claims.acting_user_id
+    if not user_id:
+        from fastapi import HTTPException as _HTTPException
+        raise _HTTPException(status_code=401, detail="acting_user_id required — include X-User-ID or use user JWT")
+    try:
+        return await pending_orders_service.create_pending_order(
+            user_id=user_id,
+            plan_id=body.planId,
+            quantity=body.quantity,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except RuntimeError as e:
+        raise HTTPException(status_code=502, detail=str(e))
+
+
+@_pending_router.get("/v1/users/{user_id}/pending-orders")
+async def list_user_pending_orders(
+    user_id: str,
+    _claims: AuthClaims = Depends(require_self_or_admin),
+) -> Dict[str, Any]:
+    """Gibt alle Pending-Orders eines Users zurück (self-or-admin)."""
+    return {"items": await pending_orders_service.list_user_pending_orders(user_id)}
+
+
+@_admin_orders_router.get("/v1/admin/orders/pending")
+async def list_pending_orders(
+    status: Optional[str] = Query(
+        default=None,
+        description="Filter: awaiting_payment | released | expired | cancelled",
+    ),
+    _claims: AuthClaims = Depends(require_admin),
+) -> Dict[str, Any]:
+    """Alle Pending-Orders (operator only). Optional nach status filtern."""
+    _VALID_STATUSES = {"awaiting_payment", "released", "expired", "cancelled"}
+    if status and status not in _VALID_STATUSES:
+        raise HTTPException(status_code=400, detail=f"Invalid status filter: {status}")
+    items = await pending_orders_service.list_all_pending_orders(status_filter=status)
+    return {"items": items, "count": len(items)}
+
+
+class ReleaseOrderRequest(BaseModel):
+    note: Optional[str] = None
+
+
+@_admin_orders_router.post("/v1/admin/orders/{order_id}/release")
+async def release_pending_order(
+    order_id: str,
+    body: ReleaseOrderRequest,
+    claims: AuthClaims = Depends(require_admin),
+) -> Dict[str, Any]:
+    """
+    Gibt eine Pending-Order frei (operator only).
+
+    Aktiviert Subscription, markiert Invoice als bezahlt, updated Order-Status.
+    Idempotent auf DB-Ebene (ON CONFLICT). Bei bereits releastem Order → 409.
+    """
+    operator_id = claims.user_id or "operator"
+    try:
+        return await pending_orders_service.release_order(
+            order_id=order_id,
+            operator_user_id=operator_id,
+            note=body.note,
+        )
+    except LookupError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=409, detail=str(e))
+    except NotImplementedError as e:
+        raise HTTPException(status_code=501, detail=str(e))
+
+
+# Export all routers so platform_main.py can include them.
+pending_orders_router = _pending_router
+admin_orders_router = _admin_orders_router
