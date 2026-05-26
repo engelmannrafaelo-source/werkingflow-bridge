@@ -441,6 +441,246 @@ async def delete_user(
 
 
 # ---------------------------------------------------------------------------
+# Admin: lookup user by email + assign app_license
+#
+# Drift-correction primitives for the app-side seed-users routes. The flow:
+#   1. App posts to /v1/auth/register → 409 (email already taken)
+#   2. App calls GET /v1/admin/users/lookup?email=... → 200 with user_id +
+#      existing app_licenses, or 404 (race: user deleted between 409 and lookup)
+#   3. If the user already holds a license for the caller's app_id: no-op.
+#      Otherwise POST /v1/admin/users/{user_id}/app-licenses to assign it.
+#
+# Both endpoints are operator-only (require_admin → require_jwt_or_service +
+# is_operator). Service token without X-User-ID is the intended caller
+# (apps holding BRIDGE_SERVICE_TOKEN). Admin JWTs work too — same path used
+# by future operator dashboards.
+# ---------------------------------------------------------------------------
+
+
+# plan_id ENUM from 001_initial_schema.sql. Kept here as a Python-side allowlist
+# so a typo at the API boundary surfaces as a 400 with a helpful message
+# instead of a confusing 500 from Postgres on an unknown enum literal.
+_ALLOWED_PLAN_IDS = {
+    "trial", "report-standard", "energy-project", "safety-project",
+    "noise-tbd", "engelmann-custom",
+}
+
+
+class AppLicensePayload(BaseModel):
+    """Single app_license row, shared by the lookup and assign responses."""
+    app_id: str
+    plan_id: str
+    start_date: str
+    end_date: Optional[str] = None
+    seats: int
+
+
+class UserLookupResponse(BaseModel):
+    """
+    Operator-scoped lookup result. Explicit fields — no JsonValueSchema or
+    z.unknown wrapper. The drift-correction caller reads `user_id` + walks
+    `app_licenses` to decide whether to assign a new license.
+
+    `anonymized_at` is included so the caller can detect the "row is closed"
+    edge case. (In practice anonymization rewrites the email to a placeholder,
+    so a real-email lookup will not hit an anonymized row — but exposing the
+    field lets the caller be explicit instead of silently assuming.)
+    """
+    user_id: str
+    email: str
+    name: str
+    tenant_id: str
+    role: str
+    email_verified: bool
+    anonymized_at: Optional[str] = None
+    app_licenses: List[AppLicensePayload]
+    created_at: str
+    updated_at: str
+
+
+@router.get("/v1/admin/users/lookup", response_model=UserLookupResponse)
+async def lookup_user_by_email(
+    email: EmailStr = Query(..., description="Email to look up. EmailStr-validated."),
+    _claims: AuthClaims = Depends(require_admin),
+) -> Dict[str, Any]:
+    """
+    Operator-only: look up a user by email.
+
+    Returns the full identity payload (user_id, profile, app_licenses) on hit,
+    404 on miss. The 200-vs-404 distinction is NOT a public oracle because
+    `require_admin` gates the endpoint; the caller is already authenticated.
+
+    Public-facing anti-enumeration lives in the /v1/auth/forgot-password and
+    /v1/auth/resend-verification flows — operators querying user state by
+    email is the intended use here.
+    """
+    pool = get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            SELECT id, email, name, tenant_id, role, email_verified,
+                   anonymized_at, created_at, updated_at
+              FROM users
+             WHERE email = $1
+            """,
+            email,
+        )
+        if not row:
+            raise HTTPException(
+                status_code=404,
+                detail=f"User with email '{email}' not found",
+            )
+
+        license_rows = await conn.fetch(
+            """
+            SELECT app_id, plan_id, start_date, end_date, seats
+              FROM app_licenses
+             WHERE user_id = $1
+             ORDER BY start_date DESC
+            """,
+            row["id"],
+        )
+
+    return {
+        "user_id": str(row["id"]),
+        "email": row["email"],
+        "name": row["name"],
+        "tenant_id": row["tenant_id"],
+        "role": row["role"],
+        "email_verified": bool(row["email_verified"]),
+        "anonymized_at": (
+            row["anonymized_at"].isoformat() if row["anonymized_at"] else None
+        ),
+        "app_licenses": [
+            {
+                "app_id": lr["app_id"],
+                "plan_id": lr["plan_id"],
+                "start_date": lr["start_date"].isoformat(),
+                "end_date": lr["end_date"].isoformat() if lr["end_date"] else None,
+                "seats": lr["seats"],
+            }
+            for lr in license_rows
+        ],
+        "created_at": row["created_at"].isoformat(),
+        "updated_at": row["updated_at"].isoformat(),
+    }
+
+
+class AppLicenseAssignRequest(BaseModel):
+    app_id: str = Field(description="Target app_id. Must be one of the known app_id enum values.")
+    plan_id: str = Field(
+        default="trial",
+        description="Plan identifier. Defaults to 'trial' to match register-flow.",
+    )
+    seats: int = Field(default=1, ge=1, description="Seat count. Must be ≥ 1.")
+
+
+class AppLicenseAssignResponse(AppLicensePayload):
+    """Echo the assigned license + a `created` flag distinguishing insert vs update."""
+    user_id: str
+    created: bool
+
+
+@router.post(
+    "/v1/admin/users/{user_id}/app-licenses",
+    response_model=AppLicenseAssignResponse,
+)
+async def assign_app_license(
+    user_id: str,
+    body: AppLicenseAssignRequest,
+    _claims: AuthClaims = Depends(require_admin),
+) -> Dict[str, Any]:
+    """
+    Operator-only: assign (or refresh) an app_license to a user.
+
+    Idempotent on (user_id, app_id) — second call updates plan_id/seats and
+    refreshes start_date, returning `created: false`. Used by the drift-correction
+    path of the seed-users routes after a 409 + lookup confirms the user exists
+    but holds no license for the caller's app.
+
+    Status mapping:
+      200  → success ({created: true} on insert, {created: false} on update)
+      400  → invalid user_id (not a UUID), unknown app_id, unknown plan_id
+      404  → user_id does not exist
+    """
+    if body.app_id not in _ALLOWED_APP_IDS:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Unknown app_id '{body.app_id}'. Must be one of: "
+                f"{sorted(_ALLOWED_APP_IDS)}"
+            ),
+        )
+    if body.plan_id not in _ALLOWED_PLAN_IDS:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Unknown plan_id '{body.plan_id}'. Must be one of: "
+                f"{sorted(_ALLOWED_PLAN_IDS)}"
+            ),
+        )
+    try:
+        uid = uuid.UUID(user_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid userId (must be UUID)")
+
+    pool = get_pool()
+    today = datetime.now(timezone.utc).date()
+
+    async with pool.acquire() as conn:
+        # Verify the user exists BEFORE the UPSERT so a missing user 404s
+        # instead of failing on the FK with a confusing 5xx.
+        user_exists = await conn.fetchval(
+            "SELECT 1 FROM users WHERE id = $1", uid
+        )
+        if not user_exists:
+            raise HTTPException(status_code=404, detail=f"User '{user_id}' not found")
+
+        # UPSERT on (user_id, app_id) — the UNIQUE constraint from
+        # 001_initial_schema.sql. The `xmax = 0` predicate distinguishes the
+        # insert path (xmax stays at the row's natural value, here 0) from
+        # the update path (xmax is set to the updating txn id). This is the
+        # canonical PostgreSQL idiom for "tell me if my UPSERT created vs
+        # updated"; no extra round-trip needed.
+        row = await conn.fetchrow(
+            """
+            INSERT INTO app_licenses (user_id, app_id, plan_id, start_date, end_date, seats)
+            VALUES ($1, $2::app_id, $3::plan_id, $4, NULL, $5)
+            ON CONFLICT (user_id, app_id) DO UPDATE
+              SET plan_id    = EXCLUDED.plan_id,
+                  start_date = EXCLUDED.start_date,
+                  seats      = EXCLUDED.seats
+            RETURNING user_id, app_id, plan_id, start_date, end_date, seats,
+                      (xmax = 0) AS created
+            """,
+            uid,
+            body.app_id,
+            body.plan_id,
+            today,
+            body.seats,
+        )
+
+    logger.info(
+        "admin.assign_app_license: user_id=%s app_id=%s plan_id=%s seats=%s created=%s",
+        row["user_id"],
+        row["app_id"],
+        row["plan_id"],
+        row["seats"],
+        row["created"],
+    )
+
+    return {
+        "user_id": str(row["user_id"]),
+        "app_id": row["app_id"],
+        "plan_id": row["plan_id"],
+        "start_date": row["start_date"].isoformat(),
+        "end_date": row["end_date"].isoformat() if row["end_date"] else None,
+        "seats": row["seats"],
+        "created": bool(row["created"]),
+    }
+
+
+# ---------------------------------------------------------------------------
 # Tenants
 # ---------------------------------------------------------------------------
 
