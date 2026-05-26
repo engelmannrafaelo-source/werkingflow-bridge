@@ -13,6 +13,7 @@ Auth model:
   - /v1/admin/orders/{order_id}/release   require_admin (operator only)
 """
 import json
+import uuid
 from typing import Any, Dict, Optional
 
 from fastapi import APIRouter, Depends, Form, HTTPException, Query, Response
@@ -225,16 +226,80 @@ async def billing_customer(
     return await billing_service.get_or_create_customer(body.userId, body.email, body.name)
 
 
+async def _resolve_billing_identity(
+    claims: AuthClaims,
+    body_user_id: Optional[str],
+    body_email: Optional[str],
+    body_name: Optional[str],
+) -> tuple[str, str, str]:
+    """
+    Resolve (user_id, email, name) for a Mollie checkout call.
+
+    Source-of-truth: the auth context's acting_user_id wins over body.userId
+    (clients cannot spoof identity). Operator service-token calls (no
+    acting_user_id) fall back to body.userId. email/name prefer body when
+    explicitly provided, otherwise look them up from the users table.
+
+    Fails fast at every step:
+      - 400 if userId can't be resolved at all
+      - 400 if userId is malformed
+      - 404 if userId doesn't exist in users
+      - 500 if users row has missing email/name (data-integrity bug — never
+        paper over silently, would produce malformed Mollie customers)
+    """
+    user_id = claims.effective_user_id or body_user_id
+    if not user_id:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "userId could not be resolved: pass it in the body (operator "
+                "service token) or via X-User-ID header / Bearer JWT."
+            ),
+        )
+
+    email = body_email
+    name = body_name
+    if not email or not name:
+        try:
+            user_uuid = uuid.UUID(user_id)
+        except ValueError:
+            raise HTTPException(status_code=400, detail=f"Invalid userId: {user_id!r}")
+        pool = get_pool()
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT email, name FROM users WHERE id = $1", user_uuid,
+            )
+        if not row:
+            raise HTTPException(status_code=404, detail=f"User '{user_id}' not found")
+        email = email or row["email"]
+        name = name or row["name"]
+        if not email or not name:
+            raise HTTPException(
+                status_code=500,
+                detail=f"User '{user_id}' has missing email or name in users table",
+            )
+
+    return user_id, email, name
+
+
 class SubscriptionCheckoutRequest(BaseModel):
-    userId: str
-    email: str
-    name: str
+    # planId + successRedirect are always required: only the client knows where
+    # Mollie should redirect after payment, and which plan to purchase.
     planId: str
+    successRedirect: str
     # seats must be a positive small integer. Above 100 we suspect API abuse —
     # a single buyer would never legitimately seat 100 users at once via this
     # endpoint. Tighten further once the real cap is known.
     seats: int = Field(default=1, ge=1, le=100)
-    successRedirect: str
+    # userId/email/name are derived from the auth context (acting_user_id +
+    # users-table lookup) — see _resolve_billing_identity. They remain accepted
+    # in the body for operator-mode service-token calls (no X-User-ID header)
+    # where Bridge has no auth user context to derive them from. Defence in
+    # depth: when the auth context provides acting_user_id, body.userId is
+    # ignored (clients cannot spoof identity by sending a different userId).
+    userId: Optional[str] = None
+    email: Optional[str] = None
+    name: Optional[str] = None
 
 
 class SubscriptionProvisionRequest(BaseModel):
@@ -269,37 +334,45 @@ async def billing_sub_provision(
 @router.post("/subscription/checkout")
 async def billing_sub_checkout(
     body: SubscriptionCheckoutRequest,
-    _claims: AuthClaims = Depends(require_jwt_or_service),
+    claims: AuthClaims = Depends(require_jwt_or_service),
 ) -> Dict[str, str]:
+    user_id, email, name = await _resolve_billing_identity(
+        claims, body.userId, body.email, body.name,
+    )
     try:
         return await billing_service.start_subscription_checkout(
-            body.userId, body.planId, body.seats, body.successRedirect,
-            body.email, body.name,
+            user_id, body.planId, body.seats, body.successRedirect,
+            email, name,
         )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
 
 class TopUpCheckoutRequest(BaseModel):
-    userId: str
-    email: str
-    name: str
     # Top-Up bounds are enforced again in billing_service.start_topup_checkout
     # (defence in depth) — these Pydantic bounds reject obviously bad requests
     # before they hit business logic.
     amountEur: float = Field(ge=50, le=1000)
     successRedirect: str
+    # userId/email/name: see SubscriptionCheckoutRequest above. Same defence-
+    # in-depth rules — auth context wins, body is operator-mode fallback.
+    userId: Optional[str] = None
+    email: Optional[str] = None
+    name: Optional[str] = None
 
 
 @router.post("/topup/checkout")
 async def billing_topup_checkout(
     body: TopUpCheckoutRequest,
-    _claims: AuthClaims = Depends(require_jwt_or_service),
+    claims: AuthClaims = Depends(require_jwt_or_service),
 ) -> Dict[str, str]:
+    user_id, email, name = await _resolve_billing_identity(
+        claims, body.userId, body.email, body.name,
+    )
     try:
         return await billing_service.start_topup_checkout(
-            body.userId, body.amountEur, body.successRedirect,
-            body.email, body.name,
+            user_id, body.amountEur, body.successRedirect,
+            email, name,
         )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
