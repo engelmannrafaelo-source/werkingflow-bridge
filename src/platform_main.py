@@ -59,6 +59,8 @@ from src.db.client import init_pool, close_pool, is_db_enabled  # noqa: E402
 from src.db.admin_routes import router as admin_db_router  # noqa: E402
 from src.identity.routes import router as identity_router  # noqa: E402
 from src.identity.self_service import router as self_service_router  # noqa: E402
+from src.identity.webhook_config import init_webhook_configs  # noqa: E402
+from src.identity.webhook_dispatcher import WebhookDispatcher  # noqa: E402
 from src.budget.routes import router as budget_router  # noqa: E402
 from src.billing.routes import router as billing_router, pending_orders_router, admin_orders_router, project_credits_router  # noqa: E402
 from src.activity.routes import router as activity_router  # noqa: E402
@@ -104,7 +106,32 @@ async def lifespan(app: FastAPI):
         logger.error(f"❌ Plan catalog load failed: {e}")
         raise
 
+    # Auth-token webhook pipeline (ADR cross-app/0002 Phase M1).
+    # init_webhook_configs() raises RuntimeError when any required
+    # BRIDGE_WEBHOOK_URL_<APP> / BRIDGE_WEBHOOK_SECRET_<APP> env is unset —
+    # we want that fail-loud at startup, NOT when the first user clicks
+    # "Forgot password".
+    try:
+        configs = init_webhook_configs()
+        logger.info(f"✅ Webhook configs loaded: {sorted(configs.keys())}")
+    except Exception as e:
+        logger.error(f"❌ Webhook config load failed: {e}")
+        raise
+
+    # Start the background dispatcher. The pool is the one we just initialised.
+    from src.db.client import get_pool as _get_pool
+    dispatcher = WebhookDispatcher(_get_pool())
+    dispatcher.start()
+    app.state.webhook_dispatcher = dispatcher
+    logger.info("✅ Webhook dispatcher started")
+
     yield
+
+    try:
+        await dispatcher.stop()
+        logger.info("✅ Webhook dispatcher stopped")
+    except Exception:
+        pass
 
     try:
         await close_pool()

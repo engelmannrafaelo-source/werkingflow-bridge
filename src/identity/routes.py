@@ -19,11 +19,11 @@ import os
 import secrets
 import uuid
 from datetime import datetime, timezone, timedelta
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import asyncpg
 import jwt
-from fastapi import APIRouter, Depends, HTTPException, Request, Response
+from fastapi import APIRouter, Depends, Header, HTTPException, Request, Response
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi import Security
 from pydantic import BaseModel, EmailStr, Field
@@ -32,6 +32,7 @@ from src.api_auth import require_jwt, require_service_token, AuthClaims
 from src.db.client import get_pool
 from src.identity.password import hash_password, verify_password
 from src.identity.jwt_utils import sign_jwt, verify_jwt
+from src.identity.webhook_config import BRIDGE_AUTH_APP_IDS, get_webhook_config
 
 router = APIRouter(prefix="/v1/auth", tags=["auth"])
 _bearer = HTTPBearer(auto_error=False)
@@ -617,9 +618,9 @@ def _hash_token(cleartext: str) -> str:
 
 async def _issue_auth_token(
     conn: Any, user_id: uuid.UUID, token_type: str
-) -> Optional[str]:
+) -> Optional[Tuple[str, uuid.UUID]]:
     """
-    Mint, persist and return the cleartext token (caller logs / mails it).
+    Mint, persist and return (cleartext, token_id).
 
     Returns None when rate-limited (>= _TOKEN_RATE_LIMIT_PER_HOUR tokens of
     the same type issued in the last hour). Returning None lets the route
@@ -630,6 +631,9 @@ async def _issue_auth_token(
     keeps the (user_id, token_type) partial-unique index from rejecting the
     new insert. Wrapped in a transaction so a half-insert never leaves the
     table without an active token after we've already invalidated the old.
+
+    `token_id` is the DB row UUID and is used by the route handler to
+    enqueue a webhook delivery (auth_token_webhook_deliveries FK).
     """
     recent_count = await conn.fetchval(
         """
@@ -671,10 +675,11 @@ async def _issue_auth_token(
             user_id,
             token_type,
         )
-        await conn.execute(
+        token_id = await conn.fetchval(
             """
             INSERT INTO auth_tokens (user_id, token_hash, token_type, expires_at, created_at)
             VALUES ($1, $2, $3::auth_token_type, $4, $5)
+            RETURNING id
             """,
             user_id,
             token_hash,
@@ -682,7 +687,92 @@ async def _issue_auth_token(
             expires_at,
             now,
         )
-    return cleartext
+    return cleartext, token_id
+
+
+# Token-type → webhook kind. The route handler uses this to enqueue the
+# delivery row with the operator-facing `kind` field (the table CHECK
+# enforces these values).
+_TOKEN_TYPE_TO_KIND_RESET: str = "reset"
+_TOKEN_TYPE_TO_KIND_RESEND: str = "resend"
+_TOKEN_TYPE_TO_KIND_VERIFY: str = "verify"
+
+
+async def _enqueue_webhook_delivery(
+    conn: Any,
+    token_id: uuid.UUID,
+    app_id: str,
+    kind: str,
+    cleartext: str,
+) -> None:
+    """
+    INSERT a pending row that the background dispatcher will pick up.
+
+    Caller has already verified that `app_id` is in BRIDGE_AUTH_APP_IDS
+    and a webhook config exists for it (the route did this BEFORE the
+    DB lookup so the existence-check is anti-enumeration-safe).
+
+    `cleartext` is the user-facing token string. It is required while
+    the row is pending so the dispatcher can put it in the webhook
+    payload (see migration 021 for the cleartext-lifecycle invariant).
+    """
+    await conn.execute(
+        """
+        INSERT INTO auth_token_webhook_deliveries
+               (token_id, app_id, kind, status, attempts, token_cleartext)
+        VALUES ($1, $2::app_id, $3, 'pending', 0, $4)
+        """,
+        token_id,
+        app_id,
+        kind,
+        cleartext,
+    )
+
+
+def _require_app_id_header(x_app_id: Optional[str]) -> str:
+    """
+    Validate the X-App-ID header for token-issuing endpoints.
+
+    Called BEFORE any email/user lookup so a missing/unknown app_id does
+    not double as an oracle for user existence.
+
+    Returns the normalised app_id on success. Raises 400 with an explicit
+    message for missing / unknown / non-Bridge-Auth app_ids (engelmann is
+    on Supabase — see ADR cross-app/0002).
+    """
+    if not x_app_id:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Missing X-App-ID header. Token-issuing endpoints require "
+                "the calling app to identify itself so the Bridge can route "
+                "the resulting webhook to the correct receiver."
+            ),
+        )
+    if x_app_id not in BRIDGE_AUTH_APP_IDS:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Unknown or unsupported X-App-ID {x_app_id!r}. Bridge-Auth "
+                f"apps: {sorted(BRIDGE_AUTH_APP_IDS)}. Engelmann is on "
+                f"Supabase and does not issue Bridge tokens."
+            ),
+        )
+    # Probe the webhook config — if it's missing the Bridge should NEVER have
+    # accepted startup. Re-raise as 503 to make a config drift visible
+    # operationally instead of silently dropping deliveries.
+    try:
+        get_webhook_config(x_app_id)
+    except LookupError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                f"Webhook config for app_id={x_app_id!r} is missing at "
+                f"runtime — Bridge startup must have skipped validation. "
+                f"Refuse to issue a token that cannot be delivered."
+            ),
+        ) from exc
+    return x_app_id
 
 
 # ---------------------------------------------------------------------------
@@ -694,13 +784,26 @@ class ForgotPasswordRequest(BaseModel):
 
 
 @router.post("/forgot-password", status_code=204, response_class=Response)
-async def forgot_password(body: ForgotPasswordRequest) -> Response:
+async def forgot_password(
+    body: ForgotPasswordRequest,
+    x_app_id: Optional[str] = Header(default=None, alias="X-App-ID"),
+) -> Response:
     """
     Request a password-reset token. Anti-enumeration: always 204, regardless
     of whether the email exists, the account is anonymized, or the user is
-    rate-limited. The cleartext token is logged to stdout for the app layer
-    mailer to pick up — mail delivery itself is out-of-scope (per task brief).
+    rate-limited.
+
+    On success, a webhook-delivery row is enqueued for the app identified by
+    X-App-ID; the background dispatcher (see src/identity/webhook_dispatcher.py)
+    POSTs the cleartext token to the app's receiver. The cleartext is still
+    logged at debug level for operator forensics — never at info, to keep
+    prod logs from leaking issuance details.
+
+    X-App-ID is validated UPFRONT (before the email lookup) so a missing
+    header cannot double as an oracle for user existence.
     """
+    app_id = _require_app_id_header(x_app_id)
+
     pool = get_pool()
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
@@ -711,28 +814,46 @@ async def forgot_password(body: ForgotPasswordRequest) -> Response:
         # Anti-enumeration: unknown user / closed account => 204 silent.
         if not row or row["anonymized_at"] is not None:
             logger.info(
-                "identity.forgot_password: silent-skip email=%s known=%s anonymized=%s",
+                "identity.forgot_password: silent-skip email=%s known=%s anonymized=%s app_id=%s",
                 body.email,
                 bool(row),
                 bool(row and row["anonymized_at"]),
+                app_id,
             )
             return Response(status_code=204)
 
-        cleartext = await _issue_auth_token(conn, row["id"], "password_reset")
+        issued = await _issue_auth_token(conn, row["id"], "password_reset")
 
-    if cleartext is None:
-        # Rate-limited — _issue_auth_token already logged it.
-        return Response(status_code=204)
+        if issued is None:
+            # Rate-limited — _issue_auth_token already logged it.
+            return Response(status_code=204)
 
-    # Mail-delivery is the app's job. Bridge writes the cleartext to stdout
-    # so the host service or a sidecar can ship it to the user. Logged as
-    # structured info — operators can grep this; in prod the log handler is
-    # the integration point with the mailer.
-    logger.info(
-        "identity.forgot_password: token issued email=%s user_id=%s token=%s",
+        cleartext, token_id = issued
+
+        # Enqueue the webhook in the SAME connection / transaction context as
+        # the token itself: if the INSERT into auth_token_webhook_deliveries
+        # fails, the row should be rolled back together with the token issue,
+        # leaving the system consistent (no orphan token without a delivery
+        # attempt). asyncpg auto-commits per `execute()` outside an explicit
+        # transaction; wrap to be safe.
+        async with conn.transaction():
+            await _enqueue_webhook_delivery(
+                conn, token_id, app_id, _TOKEN_TYPE_TO_KIND_RESET, cleartext,
+            )
+
+    logger.debug(
+        "identity.forgot_password: token issued email=%s user_id=%s app_id=%s token=%s",
         body.email,
         row["id"],
+        app_id,
         cleartext,
+    )
+    logger.info(
+        "identity.forgot_password: token enqueued email=%s user_id=%s app_id=%s token_id=%s",
+        body.email,
+        row["id"],
+        app_id,
+        token_id,
     )
     return Response(status_code=204)
 
@@ -822,12 +943,21 @@ class ResendVerificationRequest(BaseModel):
 
 
 @router.post("/resend-verification", status_code=204, response_class=Response)
-async def resend_verification(body: ResendVerificationRequest) -> Response:
+async def resend_verification(
+    body: ResendVerificationRequest,
+    x_app_id: Optional[str] = Header(default=None, alias="X-App-ID"),
+) -> Response:
     """
     Request a new email-verification token. Anti-enumeration: 204 on every
     branch — unknown user, already-verified, rate-limited, closed account,
     success. The structured log distinguishes the cases for operators.
+
+    On success the cleartext is delivered via webhook (see forgot_password
+    for the design rationale). X-App-ID is validated before the email
+    lookup so a missing header cannot leak existence.
     """
+    app_id = _require_app_id_header(x_app_id)
+
     pool = get_pool()
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
@@ -838,24 +968,40 @@ async def resend_verification(body: ResendVerificationRequest) -> Response:
         if not row or row["anonymized_at"] is not None or row["email_verified"]:
             logger.info(
                 "identity.resend_verification: silent-skip email=%s "
-                "known=%s anonymized=%s already_verified=%s",
+                "known=%s anonymized=%s already_verified=%s app_id=%s",
                 body.email,
                 bool(row),
                 bool(row and row["anonymized_at"]),
                 bool(row and row["email_verified"]),
+                app_id,
             )
             return Response(status_code=204)
 
-        cleartext = await _issue_auth_token(conn, row["id"], "email_verification")
+        issued = await _issue_auth_token(conn, row["id"], "email_verification")
 
-    if cleartext is None:
-        return Response(status_code=204)
+        if issued is None:
+            return Response(status_code=204)
 
-    logger.info(
-        "identity.resend_verification: token issued email=%s user_id=%s token=%s",
+        cleartext, token_id = issued
+
+        async with conn.transaction():
+            await _enqueue_webhook_delivery(
+                conn, token_id, app_id, _TOKEN_TYPE_TO_KIND_RESEND, cleartext,
+            )
+
+    logger.debug(
+        "identity.resend_verification: token issued email=%s user_id=%s app_id=%s token=%s",
         body.email,
         row["id"],
+        app_id,
         cleartext,
+    )
+    logger.info(
+        "identity.resend_verification: token enqueued email=%s user_id=%s app_id=%s token_id=%s",
+        body.email,
+        row["id"],
+        app_id,
+        token_id,
     )
     return Response(status_code=204)
 
