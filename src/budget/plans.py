@@ -35,7 +35,7 @@ PLANS: dict[str, PlanConfig] = {
         price=250,
         interval="month",
         api_budget_eur=50,
-        description="EUR 250/Sitz/Monat, EUR 50 API-Budget inkl., alle Features, Opus 4.6 verfuegbar.",
+        description="Voller Funktionsumfang. KI-Budget inklusive, weitere Sitze zum gleichen Preis.",
     ),
     "energy-project": PlanConfig(
         id="energy-project",
@@ -44,18 +44,18 @@ PLANS: dict[str, PlanConfig] = {
         price=1000,
         interval="project",
         api_budget_eur=100,
-        description="EUR 1.000 pro Projekt, EUR 100 API-Budget inkl., beliebige Neuberechnungen solange Budget reicht.",
+        description="KI-Budget inklusive. Beliebig viele Neuberechnungen, solange das Budget reicht.",
     ),
     # safety-project removed 2026-05-26 — WerkING Safety ist pausiert (nicht in Entwicklung).
     # Reaktivieren: Eintrag wiederherstellen aus git log, Bridge restart.
     "noise-tbd": PlanConfig(
         id="noise-tbd",
         app_id="werking-noise",
-        name="Noise (TBD)",
+        name="WerkING Noise",
         price=0,
         interval="month",
         api_budget_eur=0,
-        description="Pricing nach Beta-Tests. Kleine Zielgruppe (~400 Akustik-Sachverstaendige AT).",
+        description="Akustik-Gutachten mit KI-Unterstützung. Aktuell in Beta-Tests.",
     ),
     "engelmann-custom": PlanConfig(
         id="engelmann-custom",
