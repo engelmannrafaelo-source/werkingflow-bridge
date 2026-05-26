@@ -1,15 +1,22 @@
 """
-Auth endpoints: login / logout / session / register.
+Auth endpoints: login / logout / session / register + password-reset / email-verification.
 Mounted under /v1/auth — only active when BRIDGE_DB_URL is set.
 
-POST /v1/auth/login      {email, password} -> {jwt, user, appLicenses[]}  PUBLIC
-POST /v1/auth/register   {email, password, name, appId, checkId?} -> {jwt, user, appLicenses[]}  PUBLIC
-POST /v1/auth/logout     Bearer <jwt> -> 204                             require_jwt
-GET  /v1/auth/session    Bearer <jwt> -> {user, appLicenses[]}           require_jwt
-POST /v1/auth/issue      X-Bridge-Service-Token {userId} -> {jwt, expiresAt}  require_service_token
-POST /v1/auth/test-token {email} -> {jwt, user, appLicenses[]}           service-token, test tenants only
+POST /v1/auth/login                       {email, password} -> {jwt, user, appLicenses[]}                    PUBLIC
+POST /v1/auth/register                    {email, password, name, appId, checkId?} -> {jwt, user, ...}        PUBLIC
+POST /v1/auth/logout                      Bearer <jwt> -> 204                                                 require_jwt
+GET  /v1/auth/session                     Bearer <jwt> -> {user, appLicenses[]}                               require_jwt
+POST /v1/auth/issue                       X-Bridge-Service-Token {userId} -> {jwt, expiresAt}                 require_service_token
+POST /v1/auth/test-token                  {email} -> {jwt, user, appLicenses[]}                               service-token, test tenants only
+POST /v1/auth/forgot-password             {email} -> 204                                                      PUBLIC, anti-enumeration
+POST /v1/auth/reset-password-with-token   {token, newPassword} -> 204                                         PUBLIC
+POST /v1/auth/resend-verification         {email} -> 204                                                      PUBLIC, anti-enumeration
+POST /v1/auth/verify-email                {token} -> 204                                                      PUBLIC
 """
+import hashlib
 import logging
+import os
+import secrets
 import uuid
 from datetime import datetime, timezone, timedelta
 from typing import Any, Dict, List, Optional
@@ -552,3 +559,362 @@ async def register(body: RegisterRequest) -> Dict[str, Any]:
 
     user = _user_dict(user_row, app_licenses)
     return {"jwt": token, "user": user, "appLicenses": app_licenses}
+
+
+# ---------------------------------------------------------------------------
+# Password reset + email verification — single-use auth_tokens (migration 018)
+#
+# Two endpoints per token-type:
+#   forgot-password / resend-verification → mint + persist + log cleartext
+#   reset-password-with-token / verify-email → consume + apply effect
+#
+# Anti-enumeration is enforced on the mint endpoints: same 204 response for
+# unknown user / verified user / rate-limited / success. Cleartext is logged
+# to stdout for the app layer to pick up (mailer is out-of-scope per the task).
+# ---------------------------------------------------------------------------
+
+# Token byte length — 32 bytes ≈ 256 bits of entropy, hex-encoded to 64 chars.
+_TOKEN_BYTES = 32
+
+# Rate limit on mint endpoints: refuses to issue more than N tokens of the
+# same type to the same user inside a rolling 1-hour window. Silent at the
+# HTTP layer (still 204) to preserve anti-enumeration; the failure is visible
+# only in server logs.
+_TOKEN_RATE_LIMIT_PER_HOUR = 3
+
+
+def _token_expiry_hours(token_type: str) -> int:
+    """
+    TTL per token type, env-overridable. Hard fail-loud on a non-integer
+    override — silent fallback to a default would let a typo ship a token
+    that never expires (or expires immediately).
+    """
+    if token_type == "password_reset":
+        raw = os.getenv("TOKEN_EXPIRES_HOURS_RESET", "24")
+    elif token_type == "email_verification":
+        raw = os.getenv("TOKEN_EXPIRES_HOURS_VERIFY", "72")
+    else:
+        raise ValueError(f"Unknown token_type '{token_type}'")
+    try:
+        hours = int(raw)
+    except ValueError as exc:
+        raise RuntimeError(
+            f"Invalid TOKEN_EXPIRES_HOURS for {token_type}: {raw!r}"
+        ) from exc
+    if hours <= 0:
+        raise RuntimeError(
+            f"TOKEN_EXPIRES_HOURS for {token_type} must be > 0, got {hours}"
+        )
+    return hours
+
+
+def _hash_token(cleartext: str) -> str:
+    """sha256 hex of the cleartext token. Stable across processes — no salt
+    needed because the token itself is high-entropy random and the hash is
+    the lookup key (must be deterministic)."""
+    return hashlib.sha256(cleartext.encode("utf-8")).hexdigest()
+
+
+async def _issue_auth_token(
+    conn: Any, user_id: uuid.UUID, token_type: str
+) -> Optional[str]:
+    """
+    Mint, persist and return the cleartext token (caller logs / mails it).
+
+    Returns None when rate-limited (>= _TOKEN_RATE_LIMIT_PER_HOUR tokens of
+    the same type issued in the last hour). Returning None lets the route
+    handler stay anti-enumeration-shaped (still 204) while suppressing the
+    cleartext from the structured log.
+
+    Always invalidates any prior unused token of the same type for the user —
+    keeps the (user_id, token_type) partial-unique index from rejecting the
+    new insert. Wrapped in a transaction so a half-insert never leaves the
+    table without an active token after we've already invalidated the old.
+    """
+    recent_count = await conn.fetchval(
+        """
+        SELECT COUNT(*) FROM auth_tokens
+         WHERE user_id    = $1
+           AND token_type = $2::auth_token_type
+           AND created_at > NOW() - INTERVAL '1 hour'
+        """,
+        user_id,
+        token_type,
+    )
+    if recent_count is not None and int(recent_count) >= _TOKEN_RATE_LIMIT_PER_HOUR:
+        logger.info(
+            "identity.auth_token: rate-limited user_id=%s token_type=%s recent=%s",
+            user_id,
+            token_type,
+            recent_count,
+        )
+        return None
+
+    cleartext = secrets.token_hex(_TOKEN_BYTES)
+    token_hash = _hash_token(cleartext)
+    now = datetime.now(timezone.utc)
+    expires_at = now + timedelta(hours=_token_expiry_hours(token_type))
+
+    async with conn.transaction():
+        # Invalidate every existing unused token of the same type for the
+        # user so the partial-unique index lets the new INSERT through.
+        # Using NOW() (not `now`) so the marker reflects DB clock — the row
+        # is an audit artefact, server clock skew is acceptable here.
+        await conn.execute(
+            """
+            UPDATE auth_tokens
+               SET used_at = NOW()
+             WHERE user_id    = $1
+               AND token_type = $2::auth_token_type
+               AND used_at IS NULL
+            """,
+            user_id,
+            token_type,
+        )
+        await conn.execute(
+            """
+            INSERT INTO auth_tokens (user_id, token_hash, token_type, expires_at, created_at)
+            VALUES ($1, $2, $3::auth_token_type, $4, $5)
+            """,
+            user_id,
+            token_hash,
+            token_type,
+            expires_at,
+            now,
+        )
+    return cleartext
+
+
+# ---------------------------------------------------------------------------
+# POST /v1/auth/forgot-password
+# ---------------------------------------------------------------------------
+
+class ForgotPasswordRequest(BaseModel):
+    email: EmailStr
+
+
+@router.post("/forgot-password", status_code=204, response_class=Response)
+async def forgot_password(body: ForgotPasswordRequest) -> Response:
+    """
+    Request a password-reset token. Anti-enumeration: always 204, regardless
+    of whether the email exists, the account is anonymized, or the user is
+    rate-limited. The cleartext token is logged to stdout for the app layer
+    mailer to pick up — mail delivery itself is out-of-scope (per task brief).
+    """
+    pool = get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT id, anonymized_at FROM users WHERE email = $1",
+            body.email,
+        )
+
+        # Anti-enumeration: unknown user / closed account => 204 silent.
+        if not row or row["anonymized_at"] is not None:
+            logger.info(
+                "identity.forgot_password: silent-skip email=%s known=%s anonymized=%s",
+                body.email,
+                bool(row),
+                bool(row and row["anonymized_at"]),
+            )
+            return Response(status_code=204)
+
+        cleartext = await _issue_auth_token(conn, row["id"], "password_reset")
+
+    if cleartext is None:
+        # Rate-limited — _issue_auth_token already logged it.
+        return Response(status_code=204)
+
+    # Mail-delivery is the app's job. Bridge writes the cleartext to stdout
+    # so the host service or a sidecar can ship it to the user. Logged as
+    # structured info — operators can grep this; in prod the log handler is
+    # the integration point with the mailer.
+    logger.info(
+        "identity.forgot_password: token issued email=%s user_id=%s token=%s",
+        body.email,
+        row["id"],
+        cleartext,
+    )
+    return Response(status_code=204)
+
+
+# ---------------------------------------------------------------------------
+# POST /v1/auth/reset-password-with-token
+# ---------------------------------------------------------------------------
+
+class ResetPasswordWithTokenRequest(BaseModel):
+    token: str = Field(min_length=1)
+    newPassword: str = Field(min_length=8)
+
+
+@router.post("/reset-password-with-token", status_code=204, response_class=Response)
+async def reset_password_with_token(body: ResetPasswordWithTokenRequest) -> Response:
+    """
+    Consume a password-reset token and set a new password.
+
+    All token-validation failures collapse to the same 400 message — the
+    caller learns "no, try again" without learning *why* (used vs expired
+    vs invalid). This is anti-enumeration at the consume-side; legitimate
+    users issued the token in the last 24h, they don't need a diagnosis.
+
+    On success: password is rotated AND every existing session for the user
+    is revoked. The reset itself is the "I have lost control of this account"
+    moment — old sessions should not survive it.
+    """
+    token_hash = _hash_token(body.token)
+    pool = get_pool()
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            tok_row = await conn.fetchrow(
+                """
+                SELECT t.id, t.user_id, t.expires_at, t.used_at, u.anonymized_at
+                  FROM auth_tokens t
+                  JOIN users u ON u.id = t.user_id
+                 WHERE t.token_hash = $1
+                   AND t.token_type = 'password_reset'::auth_token_type
+                """,
+                token_hash,
+            )
+
+            if (
+                tok_row is None
+                or tok_row["used_at"] is not None
+                or tok_row["anonymized_at"] is not None
+                or tok_row["expires_at"].replace(tzinfo=timezone.utc)
+                <= datetime.now(timezone.utc)
+            ):
+                raise HTTPException(
+                    status_code=400,
+                    detail="Invalid or expired password-reset token",
+                )
+
+            user_id = tok_row["user_id"]
+            new_hash = hash_password(body.newPassword)
+
+            await conn.execute(
+                "UPDATE users SET password_hash = $1, updated_at = NOW() WHERE id = $2",
+                new_hash,
+                user_id,
+            )
+            await conn.execute(
+                "UPDATE auth_tokens SET used_at = NOW() WHERE id = $1",
+                tok_row["id"],
+            )
+            # Revoke every active session — the Bridge analogue of
+            # bumpSessionGeneration (close_account uses the same pattern).
+            await conn.execute(
+                "DELETE FROM sessions WHERE user_id = $1",
+                user_id,
+            )
+
+    logger.info(
+        "identity.reset_password: password rotated + sessions revoked user_id=%s",
+        user_id,
+    )
+    return Response(status_code=204)
+
+
+# ---------------------------------------------------------------------------
+# POST /v1/auth/resend-verification
+# ---------------------------------------------------------------------------
+
+class ResendVerificationRequest(BaseModel):
+    email: EmailStr
+
+
+@router.post("/resend-verification", status_code=204, response_class=Response)
+async def resend_verification(body: ResendVerificationRequest) -> Response:
+    """
+    Request a new email-verification token. Anti-enumeration: 204 on every
+    branch — unknown user, already-verified, rate-limited, closed account,
+    success. The structured log distinguishes the cases for operators.
+    """
+    pool = get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT id, email_verified, anonymized_at FROM users WHERE email = $1",
+            body.email,
+        )
+
+        if not row or row["anonymized_at"] is not None or row["email_verified"]:
+            logger.info(
+                "identity.resend_verification: silent-skip email=%s "
+                "known=%s anonymized=%s already_verified=%s",
+                body.email,
+                bool(row),
+                bool(row and row["anonymized_at"]),
+                bool(row and row["email_verified"]),
+            )
+            return Response(status_code=204)
+
+        cleartext = await _issue_auth_token(conn, row["id"], "email_verification")
+
+    if cleartext is None:
+        return Response(status_code=204)
+
+    logger.info(
+        "identity.resend_verification: token issued email=%s user_id=%s token=%s",
+        body.email,
+        row["id"],
+        cleartext,
+    )
+    return Response(status_code=204)
+
+
+# ---------------------------------------------------------------------------
+# POST /v1/auth/verify-email
+# ---------------------------------------------------------------------------
+
+class VerifyEmailRequest(BaseModel):
+    token: str = Field(min_length=1)
+
+
+@router.post("/verify-email", status_code=204, response_class=Response)
+async def verify_email(body: VerifyEmailRequest) -> Response:
+    """
+    Consume an email-verification token and flip users.email_verified=true.
+
+    Same 400-on-any-failure shape as reset-password-with-token: caller learns
+    invalid/expired/used as one outcome. Idempotent at the user-row level —
+    a second call with a (now-used) token returns 400, but the user_row is
+    already verified, so the system state is consistent either way.
+    """
+    token_hash = _hash_token(body.token)
+    pool = get_pool()
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            tok_row = await conn.fetchrow(
+                """
+                SELECT t.id, t.user_id, t.expires_at, t.used_at, u.anonymized_at
+                  FROM auth_tokens t
+                  JOIN users u ON u.id = t.user_id
+                 WHERE t.token_hash = $1
+                   AND t.token_type = 'email_verification'::auth_token_type
+                """,
+                token_hash,
+            )
+
+            if (
+                tok_row is None
+                or tok_row["used_at"] is not None
+                or tok_row["anonymized_at"] is not None
+                or tok_row["expires_at"].replace(tzinfo=timezone.utc)
+                <= datetime.now(timezone.utc)
+            ):
+                raise HTTPException(
+                    status_code=400,
+                    detail="Invalid or expired email-verification token",
+                )
+
+            user_id = tok_row["user_id"]
+
+            await conn.execute(
+                "UPDATE users SET email_verified = TRUE, updated_at = NOW() WHERE id = $1",
+                user_id,
+            )
+            await conn.execute(
+                "UPDATE auth_tokens SET used_at = NOW() WHERE id = $1",
+                tok_row["id"],
+            )
+
+    logger.info("identity.verify_email: email marked verified user_id=%s", user_id)
+    return Response(status_code=204)
