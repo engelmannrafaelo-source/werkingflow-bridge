@@ -445,6 +445,7 @@ async def list_billing_events(
 # ---------------------------------------------------------------------------
 
 from src.billing import pending_orders_service  # noqa: E402
+from src.billing import project_credits_service  # noqa: E402
 
 _pending_router = APIRouter(tags=["billing"])
 _admin_orders_router = APIRouter(tags=["billing"])
@@ -539,6 +540,58 @@ async def release_pending_order(
         raise HTTPException(status_code=501, detail=str(e))
 
 
+# ---------------------------------------------------------------------------
+# Project Credits — Slot-Zähler für Projekt-Plans (interval='project')
+# ---------------------------------------------------------------------------
+
+import uuid as _uuid
+
+_project_credits_router = APIRouter(tags=["billing"])
+
+
+@_project_credits_router.get("/v1/users/{user_id}/project-credits")
+async def list_project_credits(
+    user_id: str,
+    _claims: AuthClaims = Depends(require_self_or_admin),
+) -> Dict[str, Any]:
+    """
+    Verfügbare Projekt-Credits eines Users abrufen.
+
+    Aggregiert alle manual_project_credits-Rows nach plan_id.
+    Self-or-Admin: User kann eigene Credits sehen, Operator alle.
+    """
+    try:
+        credits = await project_credits_service.list_user_credits(_uuid.UUID(user_id))
+    except ValueError:
+        raise HTTPException(status_code=400, detail=f"Invalid user_id: {user_id}")
+    return {"credits": credits}
+
+
+@_project_credits_router.post(
+    "/v1/users/{user_id}/project-credits/{plan_id}/consume",
+    status_code=200,
+)
+async def consume_project_credit(
+    user_id: str,
+    plan_id: str,
+    _claims: AuthClaims = Depends(require_service_token),
+) -> Dict[str, Any]:
+    """
+    1 Projekt-Credit für user_id+plan_id verbrauchen.
+
+    Service-Token only (kein User-JWT): nur App-Backends dürfen Credits verbrauchen.
+    Energy-App ruft diesen Endpoint server-seitig vor dem Railway-Backend-Call auf.
+    Gibt 402 zurück wenn keine Credits verfügbar (CreditsExhaustedError).
+    """
+    try:
+        return await project_credits_service.consume_credit(_uuid.UUID(user_id), plan_id)
+    except project_credits_service.CreditsExhaustedError as e:
+        raise HTTPException(status_code=402, detail=str(e))
+    except ValueError:
+        raise HTTPException(status_code=400, detail=f"Invalid user_id: {user_id}")
+
+
 # Export all routers so platform_main.py can include them.
 pending_orders_router = _pending_router
 admin_orders_router = _admin_orders_router
+project_credits_router = _project_credits_router

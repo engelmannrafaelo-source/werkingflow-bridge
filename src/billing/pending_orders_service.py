@@ -3,14 +3,14 @@ PendingOrdersService — Rechnungs-Lane (Variante A: manuelle Freigabe).
 
 Workflow:
   create_pending_order  → erzeugt Invoice (issued) + pending_orders-Row + Email
-  release_order         → Operator gibt frei: Subscription aktivieren + Invoice paid
+  release_order         → Operator gibt frei: Subscription/Credits aktivieren + Invoice paid
 
 Subscription-Plans (interval='month'):
   → subscriptions-Row mit synthetic Mollie-IDs (kein Mollie-Recurring).
 
 Project-Plans (interval='project'):
-  → OPEN DECISION — nicht implementiert, wirft NotImplementedError.
-  Siehe Memory-Memo project_pending_orders_project_plan_open_decision.md.
+  → INSERT in manual_project_credits (Variante 2, 2026-05-26).
+  Energy-App konsumiert Credits via project_credits_service.consume_credit.
 """
 from __future__ import annotations
 
@@ -385,17 +385,26 @@ async def release_order(
             plan = get_plan(order["plan_id"])
 
             if plan.interval == "project":
-                # OPEN DECISION — nicht implementiert.
-                # Semantik von "Projekt-Credit freigeben" unklar:
-                #   Variante 1: user_topup_balances (EUR-Budget als Proxy)
-                #   Variante 2: manual_project_credits Tabelle (Slot-Count)
-                # Bridge-Energy-Integration muss zuerst klären wie Slots gezählt werden.
-                raise NotImplementedError(
-                    f"release_order for project-plan '{plan.interval}' is not implemented. "
-                    "Open decision: see memory memo project_pending_orders_project_plan_open_decision.md"
-                )
+                import asyncpg
+                try:
+                    await conn.execute(
+                        """
+                        INSERT INTO manual_project_credits
+                          (user_id, tenant_id, plan_id, quantity, order_id)
+                        VALUES ($1, $2, $3, $4, $5)
+                        """,
+                        order["user_id"],
+                        order["tenant_id"],
+                        order["plan_id"],
+                        order["quantity"],
+                        order_uuid,
+                    )
+                except asyncpg.UniqueViolationError:
+                    raise ValueError(
+                        f"Order {order_id} already released — duplicate release detected"
+                    )
 
-            if plan.interval == "month":
+            elif plan.interval == "month":
                 # Synthetic IDs — kein Mollie-Recurring für manuelle Billing-Lane.
                 synth_payment_id = f"manual-order-{order_id}"
                 synth_customer_id = "manual-billing"

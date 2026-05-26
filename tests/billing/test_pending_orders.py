@@ -231,10 +231,10 @@ class TestReleaseOrder:
         mock_log.assert_called_once()
         assert mock_log.call_args[0][0] == "order.released"
 
-    async def test_release_project_plan(self):
+    async def test_release_project_plan_inserts_credits(self):
         """
-        energy-project (interval='project') → NotImplementedError (offene Entscheidung).
-        Route gibt 501 zurück.
+        energy-project (interval='project') → INSERT in manual_project_credits.
+        Kein NotImplementedError mehr — Variante 2 implementiert (2026-05-26).
         """
         order_id = str(uuid.uuid4())
         operator_id = str(uuid.uuid4())
@@ -243,18 +243,31 @@ class TestReleaseOrder:
             plan_id="energy-project",
             status="awaiting_payment",
         )
+        released = _order_row(
+            id=uuid.UUID(order_id),
+            plan_id="energy-project",
+            status="released",
+            released_by=uuid.UUID(operator_id),
+        )
 
-        pool, conn = _mock_pool(order)
+        pool, conn = _mock_pool(order, released)
 
         with (
             patch("src.billing.pending_orders_service.get_pool", return_value=pool),
             patch(
                 "src.billing.pending_orders_service.log_billing_event",
                 new_callable=AsyncMock,
-            ),
+            ) as mock_log,
         ):
-            with pytest.raises(NotImplementedError, match="project-plan"):
-                await release_order(order_id, operator_id)
+            result = await release_order(order_id, operator_id)
+
+        assert result["status"] == "released"
+        # INSERT into manual_project_credits must have been called
+        execute_calls = [str(c) for c in conn.execute.call_args_list]
+        insert_calls = [c for c in execute_calls if "manual_project_credits" in c]
+        assert len(insert_calls) == 1, "Expected exactly one INSERT into manual_project_credits"
+        mock_log.assert_called_once()
+        assert mock_log.call_args[0][0] == "order.released"
 
     async def test_release_already_released_returns_value_error(self):
         """
