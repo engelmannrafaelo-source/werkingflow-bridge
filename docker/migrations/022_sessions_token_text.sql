@@ -1,0 +1,21 @@
+-- 022_sessions_token_text.sql
+--
+-- Fix: JWT tokens (signed payload incl. email + appLicenses[] + UUIDs + jti)
+-- can exceed the original VARCHAR(512) limit. Symptom: users with longer
+-- emails or multiple app_licenses crash on /v1/auth/login and /v1/auth/register
+-- with asyncpg.exceptions.StringDataRightTruncationError. nginx surfaces this
+-- as plain-text "500 Internal Server Error" (FastAPI never reaches the JSON
+-- exception handler because the asyncpg error propagates out of the route).
+--
+-- Concrete trigger seen 2026-05-26: user with email
+-- rafael+prodtest-20260526@werkingflow.com (40 chars) + 1 license produced a
+-- JWT of 548 chars. Existing successful sessions in prod max out at 405 chars,
+-- so the breakage is silent until a user with sufficient email length / license
+-- count tries to log in.
+--
+-- Fix: switch token column to TEXT. PostgreSQL stores VARCHAR(n) and TEXT
+-- identically (both are varlena); there is no performance delta. The existing
+-- UNIQUE constraint (sessions_token_key) and btree index (idx_sessions_token)
+-- are preserved across the type change.
+
+ALTER TABLE sessions ALTER COLUMN token TYPE TEXT;
