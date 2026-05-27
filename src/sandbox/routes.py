@@ -40,6 +40,37 @@ from src.sandbox.pricing import compute_hypothetical_cost_eur
 
 logger = logging.getLogger(__name__)
 
+
+async def _deduct_sandbox_budget(
+    user_id: uuid.UUID,
+    app: str,
+    cost_eur: float,
+) -> None:
+    """
+    Post-record budget deduction — best-effort, never raises.
+
+    Analog to ai_call_writer._deduct_call_cost: the usage_events row is the
+    authoritative spend record; this keeps user_budgets.usedEur in sync so
+    the pre-lease gate has something to compare against. A failure here
+    degrades to 'no deduction' — it must never break the caller's response.
+    """
+    try:
+        from src.budget.plans import find_plan_for_app
+        from src.budget.routes import apply_budget_deduction, BudgetDeductionDenied
+
+        plan = find_plan_for_app(app)
+        if plan is None:
+            return  # app not in plan catalog — not budget-tracked
+        try:
+            await apply_budget_deduction(user_id, plan.id, cost_eur)
+        except BudgetDeductionDenied as denied:
+            logger.info(
+                "sandbox post-record deduction denied (%s) user=%s app=%s",
+                denied.reason, user_id, app,
+            )
+    except Exception as e:  # noqa: BLE001
+        logger.warning("sandbox post-record budget deduction failed (non-blocking): %s", e)
+
 router = APIRouter(prefix="/v1/sandbox", tags=["sandbox"])
 
 
@@ -259,7 +290,7 @@ async def record_usage(
         tenant_id = info["tenant_id"]
         billing_mode = info["billing_mode"]
 
-        await _ls.record_usage(
+        inserted = await _ls.record_usage(
             conn,
             litellm_call_id=body.litellmCallId,
             user_id=body.userId,
@@ -279,6 +310,11 @@ async def record_usage(
         )
 
         aggregate = await _ls.get_session_aggregate(conn, body.sessionId)
+
+    # Deduct budget only when the row was actually inserted (not an idempotent
+    # retry of the same litellm_call_id) to prevent double-counting.
+    if inserted and hyp_cost > 0:
+        await _deduct_sandbox_budget(body.userId, body.app, hyp_cost)
 
     return UsageRecordResponse(
         ok=True,
