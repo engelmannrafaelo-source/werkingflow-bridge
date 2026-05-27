@@ -34,6 +34,7 @@ from src.api_auth import (
     AuthClaims,
 )
 from src.db.client import get_pool
+from src.budget.gate import enforce_budget
 from src.sandbox import account_router as _ar
 from src.sandbox import lease_service as _ls
 from src.sandbox.pricing import compute_hypothetical_cost_eur
@@ -156,7 +157,14 @@ async def lease_token(
                 detail={"error": "lease_not_applicable", "billing_mode": billing_mode},
             )
 
-        # 2. Pick best account — S7 fair round-robin: pass recent lease counts
+        # 2. Pre-gate: block if user's budget is exhausted.
+        # estimated_cost=0: we only need to detect "budget gone" states
+        # (all_exhausted / monthly_exceeded_no_topup / trial_expired); the
+        # gate lets unlicensed users through so trial users reach the sandbox.
+        # Fail-open on DB/infra errors (enforce_budget swallows them).
+        await enforce_budget(str(body.userId), body.app, 0.0)
+
+        # 4. Pick best account — S7 fair round-robin: pass recent lease counts
         # so the router prefers under-used accounts over the highest-headroom
         # one. Window is 24h: long enough to smooth bursty per-user sessions,
         # short enough to forgive a once-busy account that has since gone idle.
@@ -176,14 +184,14 @@ async def lease_token(
             logger.error(f"account-pool-state failure: {exc}")
             raise HTTPException(status_code=503, detail={"error": "pool_state_unavailable", "detail": str(exc)})
 
-        # 3. Read token file — fail loud on missing/empty
+        # 5. Read token file — fail loud on missing/empty
         try:
             oauth_token = _ls.read_oauth_token(picked.account_id)
         except RuntimeError as exc:
             logger.error(f"Token file read failed: {exc}")
             raise HTTPException(status_code=500, detail={"error": "token_file_error", "detail": str(exc)})
 
-        # 4. Insert lease
+        # 6. Insert lease
         expires_at = datetime.now(timezone.utc) + timedelta(minutes=body.estimatedDurationMin + 5)
         lease_id = await _ls.create_lease(
             conn,
