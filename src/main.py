@@ -3128,6 +3128,7 @@ def _load_research_job(job_id: str) -> Optional[Dict[str, Any]]:
 async def _execute_research_impl(
     request_body: ResearchRequest,
     backend_config: Optional[BackendConfig],
+    attribution_ctx: Optional[Dict[str, Any]] = None,
 ) -> ResearchResponse:
     """Core research execution. Caller handles auth, rate-limit, and model resolution.
 
@@ -3138,6 +3139,12 @@ async def _execute_research_impl(
     session_id = None
     container_file = None
     output_file = None
+    # R1: token accumulators — populated from SDK result chunks (preferred) or
+    # estimated from prompt/response text (fallback). Initialized outside try so
+    # the error path can read them.
+    accumulated_input_tokens = None
+    accumulated_output_tokens = None
+    research_prompt = None  # built inside try, read in error path for estimates
 
     try:
         logger.info(
@@ -3154,7 +3161,7 @@ async def _execute_research_impl(
         )
 
         # Construct SuperClaude research command with options
-        research_prompt = f"/sc:research \"{request_body.query}\""
+        research_prompt = f"/sc:research \"{request_body.query}\""  # assign before try-inner so error path has it
 
         if request_body.depth:
             research_prompt += f" --depth {request_body.depth}"
@@ -3195,6 +3202,15 @@ async def _execute_research_impl(
                     if cli_session_id:
                         session_id = cli_session_id
                         logger.info(f"📁 Using cli_session_id: {session_id}")
+            # R1: Extract token usage from SDK result message when available
+            if chunk.get("type") == "result":
+                _chunk_usage = chunk.get("usage") or {}
+                _in_tok = _chunk_usage.get("input_tokens")
+                _out_tok = _chunk_usage.get("output_tokens")
+                if _in_tok is not None:
+                    accumulated_input_tokens = (accumulated_input_tokens or 0) + int(_in_tok)
+                if _out_tok is not None:
+                    accumulated_output_tokens = (accumulated_output_tokens or 0) + int(_out_tok)
 
         if not all_chunks:
             raise ValueError("No response received from Claude Code execution")
@@ -3328,6 +3344,46 @@ async def _execute_research_impl(
             )
             content = parsed_assistant_text
 
+        # R1: Persist activity — resolve token counts (SDK-provided preferred, estimate fallback)
+        try:
+            _track_in = accumulated_input_tokens
+            _track_out = accumulated_output_tokens
+            if _track_in is None:
+                logger.warning(
+                    "research token tracking: SDK provided no input_tokens — "
+                    "estimating from prompt text (activity row uses estimates)"
+                )
+                _track_in = MessageAdapter.estimate_tokens(research_prompt) if research_prompt else 0
+            if _track_out is None:
+                _output_source = parsed_assistant_text or content or ""
+                if _output_source:
+                    logger.warning(
+                        "research token tracking: SDK provided no output_tokens — "
+                        "estimating from response text (activity row uses estimates)"
+                    )
+                    _track_out = MessageAdapter.estimate_tokens(_output_source)
+                else:
+                    logger.error(
+                        "research token tracking: SDK provided no output_tokens and no "
+                        "response text found — writing 0 (tracking gap, check worker logs)"
+                    )
+                    _track_out = 0
+            from src.activity.ai_call_writer import persist_ai_call_activity
+            await persist_ai_call_activity(
+                app_id=attribution_ctx.get("app_id") if attribution_ctx else None,
+                user_id=attribution_ctx.get("user_id") if attribution_ctx else None,
+                agent_id=f"research:{request_body.strategy or 'default'}",
+                workflow_id=None,
+                model=request_body.model,
+                input_tokens=_track_in or 0,
+                output_tokens=_track_out or 0,
+                status="success",
+                duration_ms=int(execution_time * 1000),
+                app_env=attribution_ctx.get("app_env") if attribution_ctx else None,
+            )
+        except Exception as _track_err:
+            logger.warning(f"⚠️ research activity tracking failed (non-fatal): {_track_err}")
+
         return ResearchResponse(
             status="success",
             query=request_body.query,
@@ -3357,6 +3413,28 @@ async def _execute_research_impl(
             }
         )
 
+        # R1: Persist error activity (best-effort — must not shadow the original error)
+        try:
+            _err_in = accumulated_input_tokens
+            if _err_in is None and research_prompt:
+                _err_in = MessageAdapter.estimate_tokens(research_prompt)
+            from src.activity.ai_call_writer import persist_ai_call_activity
+            await persist_ai_call_activity(
+                app_id=attribution_ctx.get("app_id") if attribution_ctx else None,
+                user_id=attribution_ctx.get("user_id") if attribution_ctx else None,
+                agent_id=f"research:{request_body.strategy or 'default'}",
+                workflow_id=None,
+                model=request_body.model,
+                input_tokens=_err_in or 0,
+                output_tokens=accumulated_output_tokens or 0,
+                status="error",
+                duration_ms=int(execution_time * 1000),
+                error_code="research_error",
+                app_env=attribution_ctx.get("app_env") if attribution_ctx else None,
+            )
+        except Exception as _track_err:
+            logger.warning(f"⚠️ research error activity tracking failed (non-fatal): {_track_err}")
+
         return ResearchResponse(
             status="error",
             query=request_body.query,
@@ -3374,13 +3452,14 @@ async def _run_async_research_job(
     request_body: ResearchRequest,
     backend_config: Optional[BackendConfig],
     job_id: str,
+    attribution_ctx: Optional[Dict[str, Any]] = None,
 ) -> None:
     """Background runner that stores ResearchResponse as a JSON file in the
     shared async-jobs directory. Any worker can read it back."""
     prior = _load_research_job(job_id) or {}
     started_at = prior.get("started_at") or time.time()
     try:
-        result = await _execute_research_impl(request_body, backend_config)
+        result = await _execute_research_impl(request_body, backend_config, attribution_ctx=attribution_ctx)
         _save_research_job(job_id, {
             "status": "done" if result.status == "success" else "error",
             "started_at": started_at,
