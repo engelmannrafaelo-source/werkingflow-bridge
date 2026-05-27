@@ -505,6 +505,26 @@ async def register(body: RegisterRequest) -> Dict[str, Any]:
                     _REGISTER_DEFAULT_PLAN_ID,
                     today,
                 )
+
+                # Trial subscription — the customer portal's plan-purchase
+                # gate (SubscriptionSection.tsx) reads isTrial from the
+                # subscriptions table. Without this row, the freshly
+                # registered user can't see the "Standard kaufen"-CTA — the
+                # forced-trial funnel was broken end-to-end.
+                # mollie_customer_id stays NULL until the first paid
+                # checkout creates a Mollie customer (see migration 024
+                # for the CHECK constraint enforcing trial-only NULL).
+                await conn.execute(
+                    """
+                    INSERT INTO subscriptions
+                        (user_id, app_id, plan_id, status, mollie_customer_id, seats, started_at)
+                    VALUES
+                        ($1, $2::app_id, 'trial'::plan_id, 'active'::subscription_status, NULL, 1, $3)
+                    """,
+                    user_id,
+                    body.appId,
+                    now,
+                )
             except asyncpg.UniqueViolationError as exc:
                 # Most likely cause: users.email collision. We surface a clear
                 # 409 — per the task brief, anti-enumeration is a UI concern,
