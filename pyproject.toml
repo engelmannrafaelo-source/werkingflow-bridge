@@ -28,7 +28,12 @@ pyjwt = "^2.9.0"
 # Invoice PDF rendering (HTML → PDF via WeasyPrint + Cairo/Pango)
 # Requires system packages: libpango-1.0-0, libpangoft2-1.0-0, libpangocairo-1.0-0,
 # libcairo2, libgdk-pixbuf2.0-0, shared-mime-info, fonts-liberation — see Dockerfile.
+# pydyf>=0.11 broke Stream.transform signature (AttributeError 'super' has no
+# attribute 'transform' on any write_pdf call) — WeasyPrint 62 expects <0.11.
+# Without this pin, poetry pulls 0.12.1 and ALL PDF rendering crashes silently
+# (smoke-tested 2026-05-27 against worker + platform-api containers).
 weasyprint = "^62.0"
+pydyf = ">=0.10.0,<0.11.0"
 
 # Mollie payment integration (LiveMollieAdapter — checkout, subscriptions, webhooks)
 mollie-api-python = "^3.0"
