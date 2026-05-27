@@ -4301,64 +4301,6 @@ async def convert_pdf_to_html_direct_endpoint(
         )
 
 
-@app.post("/v1/render-html-to-pdf")
-async def render_html_to_pdf_endpoint(
-    request: Request,
-    credentials: Optional[HTTPAuthorizationCredentials] = Depends(security)
-):
-    """Render HTML to PDF via WeasyPrint (same engine that produced the original
-    ConvertAPI uploads — pixel-near reproduction of design templates).
-
-    Body: { html: string, base_url?: string }
-      - html:     full or fragment HTML; WeasyPrint wraps fragments automatically
-      - base_url: optional, used to resolve relative asset URLs (logos, images).
-                  Bridge will only fetch http(s) URLs — file:// is blocked.
-
-    Returns: { status, pdf_base64, size_bytes } on success
-    """
-    await verify_api_key(request, credentials)
-
-    try:
-        body = await request.json()
-        if not isinstance(body, dict) or not body.get("html"):
-            return JSONResponse(
-                status_code=400,
-                content={"status": "error", "error": "Request body must be JSON with 'html' field."}
-            )
-
-        html = body["html"]
-        base_url = body.get("base_url")
-        if base_url is not None and not (
-            isinstance(base_url, str) and (base_url.startswith("http://") or base_url.startswith("https://"))
-        ):
-            return JSONResponse(
-                status_code=400,
-                content={"status": "error", "error": "'base_url' must be http(s) URL or omitted."}
-            )
-
-        from weasyprint import HTML as WeasyprintHTML
-        import base64
-
-        weasy_kwargs: Dict[str, Any] = {"string": html}
-        if base_url:
-            weasy_kwargs["base_url"] = base_url
-
-        pdf_bytes = WeasyprintHTML(**weasy_kwargs).write_pdf()
-
-        return JSONResponse(content={
-            "status": "success",
-            "pdf_base64": base64.b64encode(pdf_bytes).decode("ascii"),
-            "size_bytes": len(pdf_bytes),
-        })
-
-    except Exception as e:
-        logger.error(f"HTML-to-PDF render failed: {e}", exc_info=True)
-        return JSONResponse(
-            status_code=500,
-            content={"status": "error", "error": f"HTML-to-PDF render failed: {str(e)}"}
-        )
-
-
 # ============================================================================
 # Universal Document Conversion — proxied to privacy-pdf-service
 # Routes any supported document type (PDF/DOCX/PPTX/XLSX/CSV/HTML/MSG/EML/image)
