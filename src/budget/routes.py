@@ -513,12 +513,42 @@ async def get_budget(
             "SELECT updated_at FROM user_budgets WHERE user_id = $1",
             uid,
         )
+        # Current-month token/cost aggregates from usage_events, grouped by source.
+        # Counts input+output only (cache tokens excluded — minor contribution).
+        # hypothetical_cost_eur is used for both billing modes: for flat-rate users
+        # it represents estimated cost at pay-per-token rates (real_cost is 0).
+        # Note: rows where user_id=NULL (invalid-UUID user from workflow calls)
+        # are not matched here — this is a known gap (P4, separate fix).
+        usage_rows = await conn.fetch(
+            """
+            SELECT
+                source,
+                COALESCE(SUM(input_tokens + output_tokens), 0)::bigint AS tokens_used,
+                COALESCE(SUM(hypothetical_cost_eur), 0.0) AS cost_eur
+            FROM usage_events
+            WHERE user_id = $1
+              AND recorded_at >= date_trunc('month', NOW() AT TIME ZONE 'UTC')
+            GROUP BY source
+            """,
+            uid,
+        )
 
     updated_at = ub_row["updated_at"].isoformat() if ub_row else datetime.now(timezone.utc).isoformat()
+
+    tokens_by_source: Dict[str, int] = {}
+    cost_by_source: Dict[str, float] = {}
+    for row in usage_rows:
+        src = row["source"]
+        tokens_by_source[src] = int(row["tokens_used"])
+        cost_by_source[src] = float(row["cost_eur"])
 
     return {
         "userId": budget.user_id,
         "monthlyBudgets": _serialize_monthly_budgets(budget.monthly_budgets),
         "topUpBalanceEur": budget.top_up_balance_eur,
         "updatedAt": updated_at,
+        "monthlyTokensUsed": sum(tokens_by_source.values()),
+        "sandboxUsedEur": round(cost_by_source.get("sandbox", 0.0), 4),
+        "sandboxTokensUsed": tokens_by_source.get("sandbox", 0),
+        "workflowTokensUsed": tokens_by_source.get("workflow", 0),
     }
