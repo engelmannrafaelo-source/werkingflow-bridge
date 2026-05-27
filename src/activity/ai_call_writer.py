@@ -26,12 +26,17 @@ from __future__ import annotations
 
 import json
 import logging
+from collections import defaultdict
 from typing import Optional
 
 from src.db.client import get_pool
 from src.pricing import cost_eur, PRICING_VERSION
 
 logger = logging.getLogger(__name__)
+
+# Per-identifier skip counters — tracks how often each non-UUID/unresolvable
+# user_id is seen so warnings show frequency, not just isolated occurrences.
+_skip_counts: dict = defaultdict(int)
 
 
 async def _deduct_call_cost(user_id: str, app_id: str, cost_eur_amount: float) -> None:
@@ -118,6 +123,46 @@ async def persist_ai_call_activity(
             # No user → no tenant → cannot write a tenant-scoped row.
             # In-memory prompt-metrics still has it; nothing else to do.
             return
+
+        import uuid as _uuid
+
+        # Validate user_id is a UUID before hitting the DB. PostgreSQL
+        # rejects non-UUID values on uuid-typed columns. Apps (or CUI) may
+        # send emails or system strings — resolve emails via users.email;
+        # skip non-user strings with a loud warning (Defensive Programming:
+        # tracking gaps must never be silent).
+        try:
+            _uuid.UUID(user_id)
+        except (ValueError, AttributeError, TypeError):
+            if "@" in str(user_id):
+                # Email address → look up the corresponding UUID
+                _pool = get_pool()
+                async with _pool.acquire() as _conn:
+                    _row = await _conn.fetchrow(
+                        "SELECT id FROM users WHERE email = $1", user_id
+                    )
+                if _row:
+                    user_id = str(_row["id"])
+                else:
+                    _skip_counts[user_id] += 1
+                    logger.warning(
+                        "persist_ai_call_activity: email not found in users "
+                        "(tracking gap #%d) user=%s app=%s → activity skipped. "
+                        "Fix: caller should send user UUID, not email.",
+                        _skip_counts[user_id], user_id, app_id,
+                    )
+                    return
+            else:
+                # 'system', 'internal', or other non-user strings — semantically
+                # not a real user; nothing to persist in the tenant-scoped table.
+                _skip_counts[user_id] += 1
+                logger.warning(
+                    "persist_ai_call_activity: non-UUID X-User-ID=%r app=%s "
+                    "(skip #%d) → activity skipped (not a real user). "
+                    "Fix: send user UUID or omit X-User-ID for system calls.",
+                    user_id, app_id, _skip_counts[user_id],
+                )
+                return
 
         pool = get_pool()
         async with pool.acquire() as conn:
