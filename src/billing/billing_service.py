@@ -173,6 +173,18 @@ async def start_subscription_checkout(
     user_id: str, plan_id: str, seats: int, success_redirect: str,
     email: str, name: str,
 ) -> Dict[str, str]:
+    # Fail-fast: refuse the Mollie round-trip if the tenant's billing address
+    # is incomplete. Without this gate, a user could complete payment on
+    # Mollie and then provision_subscription (the webhook handler) would
+    # reject the activation because of missing fields — leaving them paid
+    # without an active subscription. Routes catch ValueError and translate
+    # to 422 with a missing_fields detail, matching the existing webhook
+    # error shape. Trial plan does not need this gate, but the FE never
+    # checkouts trial; defence-in-depth.
+    pool = get_pool()
+    async with pool.acquire() as conn:
+        await _assert_complete_billing_address(conn, uuid.UUID(user_id), plan_id)
+
     customer = await get_or_create_customer(user_id, email, name)
     amount = _plan_price(plan_id) * seats
 
