@@ -464,10 +464,15 @@ async def register(body: RegisterRequest) -> Dict[str, Any]:
                     now,
                 )
 
+                # Role: 'owner'. Self-service registration creates a new
+                # personal tenant where this user is the only member. Anything
+                # less than owner blocks them from buying plans / managing
+                # subscriptions in the customer portal (ADMIN_ROLES in
+                # packages/usage-billing-admin SubscriptionSection.tsx).
                 user_row = await conn.fetchrow(
                     """
                     INSERT INTO users (email, name, tenant_id, role, password_hash, created_at, updated_at)
-                    VALUES ($1, $2, $3, 'user', $4, $5, $5)
+                    VALUES ($1, $2, $3, 'owner', $4, $5, $5)
                     RETURNING id, email, name, tenant_id, role, provider_config, created_at, updated_at
                     """,
                     body.email,
