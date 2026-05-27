@@ -334,10 +334,11 @@ async def record_usage(
     Returns True if a row was actually inserted, False if it was a duplicate —
     the caller uses this to avoid double-writing the mirrored activities row.
 
-    billing_mode: legacy TEXT from tenants ('subscription'|'pay_per_token').
-    Mapped to billing_mode_enum:
-      subscription  → flat_rate_estimated (real_cost = 0, hypothetical = what it costs)
-      pay_per_token → pay_per_token       (real_cost = hypothetical)
+    billing_mode: tenant TEXT ('subscription'|'pay_per_token') — kept in the
+        signature for caller context, but does NOT affect the enum stored here.
+        Sandbox calls always use pay_per_token / real_cost = hypothetical_cost_eur
+        because Anthropic charges the Bridge's OAuth account per-token regardless
+        of the tenant's billing arrangement with us (subscription or otherwise).
 
     app_env: already-normalised environment bucket (prod|staging|local), or
         None when the caller (sandbox daemon) sent no X-App-Env header. Most
@@ -349,12 +350,11 @@ async def record_usage(
     import json as _json
     from src.pricing import PRICING_VERSION
 
-    if billing_mode == "pay_per_token":
-        bm_enum = "pay_per_token"
-        real_cost = hypothetical_cost_eur
-    else:
-        bm_enum = "flat_rate_estimated"
-        real_cost = 0.0
+    # Sandbox always has a real cost: Anthropic charges the Bridge OAuth account
+    # per-token. flat_rate_estimated would silently zero out real_cost_eur and
+    # hide the actual spend from financial reporting.
+    bm_enum = "pay_per_token"
+    real_cost = hypothetical_cost_eur
 
     row = await conn.fetchrow(
         """
