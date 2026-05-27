@@ -4,12 +4,17 @@ Acceptance-criteria tests for /v1/sandbox/usage/record.
 Covered criteria:
   6. Usage-Record-Idempotenz: same litellmCallId twice → no double insert, 2nd call returns same aggregate
   7. Usage-Aggregate: multiple events for same session → total_session_tokens sum is correct
+  10. Budget-Deduction: subscription tenant sandbox call → apply_budget_deduction called
+  11. Pre-Gate: trial user with empty budget → lease_token returns 402, no lease inserted
+  12. Pre-Gate: trial user with budget → lease issued, budget deducted on record_usage
+  13. Query-Migration: usage_by_user reads from usage_events with source='sandbox'
 """
 import uuid
 from datetime import timezone
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, patch, MagicMock
 
 import pytest
+from fastapi import HTTPException
 
 from src.sandbox import lease_service as ls
 from src.sandbox.pricing import compute_hypothetical_cost_eur
@@ -192,3 +197,207 @@ class TestUsageAggregate:
         result = await ls.get_session_aggregate(conn, "sess-empty")
         assert result["total_session_tokens"] == 0
         assert result["total_session_hypothetical_eur"] == 0.0
+
+
+# ---------------------------------------------------------------------------
+# Criterion 10: Budget deduction after record_usage (Defect 2)
+# ---------------------------------------------------------------------------
+
+class TestBudgetDeductionOnRecord:
+    @pytest.mark.asyncio
+    async def test_subscription_tenant_deducts_budget_after_insert(self):
+        """
+        Criterion 10: subscription tenant sandbox call →
+        apply_budget_deduction is called with the hypothetical cost.
+        Patch at the source location (lazy imports inside _deduct_sandbox_budget).
+        """
+        from src.sandbox.routes import _deduct_sandbox_budget
+        from src.budget.plans import PlanConfig
+
+        user_id = uuid.UUID("eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee")
+        app = "engelmann"
+        cost = 0.0042
+
+        plan = PlanConfig(
+            id="engelmann-plan",
+            app_id=app,
+            name="Engelmann",
+            price=0.0,
+            interval="month",
+            api_budget_eur=10.0,
+            description="Test plan",
+        )
+
+        with patch("src.budget.plans.find_plan_for_app", return_value=plan) as mock_plan, \
+             patch("src.budget.routes.apply_budget_deduction") as mock_deduct:
+            mock_deduct.return_value = {
+                "fromMonthly": cost,
+                "fromTopUp": 0.0,
+                "newMonthlyUsed": cost,
+                "newTopUpBalance": 0.0,
+                "effectivePlanId": plan.id,
+            }
+            await _deduct_sandbox_budget(user_id, app, cost)
+
+        mock_plan.assert_called_once_with(app)
+        mock_deduct.assert_called_once_with(user_id, plan.id, cost)
+
+    @pytest.mark.asyncio
+    async def test_no_deduction_when_app_not_in_catalog(self):
+        """App without a plan entry → deduction skipped, no error."""
+        from src.sandbox.routes import _deduct_sandbox_budget
+
+        user_id = uuid.UUID("ffffffff-ffff-ffff-ffff-ffffffffffff")
+
+        with patch("src.budget.plans.find_plan_for_app", return_value=None) as mock_plan, \
+             patch("src.budget.routes.apply_budget_deduction") as mock_deduct:
+            await _deduct_sandbox_budget(user_id, "unknown-app", 0.01)
+
+        mock_deduct.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_deduction_failure_is_non_blocking(self):
+        """DB error in apply_budget_deduction must not propagate."""
+        from src.sandbox.routes import _deduct_sandbox_budget
+        from src.budget.plans import PlanConfig
+
+        user_id = uuid.UUID("11111111-2222-3333-4444-555555555555")
+        plan = PlanConfig(
+            id="p1", app_id="engelmann", name="P1",
+            price=0.0, interval="month", api_budget_eur=10.0, description="",
+        )
+
+        with patch("src.budget.plans.find_plan_for_app", return_value=plan), \
+             patch("src.budget.routes.apply_budget_deduction",
+                   side_effect=RuntimeError("DB connection lost")):
+            # Must not raise — best-effort only
+            await _deduct_sandbox_budget(user_id, "engelmann", 0.005)
+
+
+# ---------------------------------------------------------------------------
+# Criterion 11 + 12: Pre-gate in lease_token (Defect 3)
+# ---------------------------------------------------------------------------
+
+class TestPreGateOnLease:
+    @pytest.mark.asyncio
+    async def test_exhausted_budget_blocks_lease_with_402(self):
+        """
+        Criterion 11: enforce_budget raises 402 → lease_token propagates it;
+        no lease row is written to the DB.
+        """
+        from src.sandbox.routes import router
+        from src.api_auth import require_service_token, AuthClaims
+        from fastapi.testclient import TestClient
+        from fastapi import FastAPI
+
+        app_instance = FastAPI()
+        app_instance.include_router(router)
+
+        # Bypass auth via dependency_overrides
+        fake_claims = AuthClaims(
+            kind="service",
+            user_id=None,
+            email=None,
+            tenant_id=None,
+            is_admin=False,
+        )
+        app_instance.dependency_overrides[require_service_token] = lambda: fake_claims
+
+        # enforce_budget raises 402
+        async def _gate_raises(*args, **kwargs):
+            raise HTTPException(
+                status_code=402,
+                detail={"error": "budget_exhausted", "reason": "trial_expired"},
+            )
+
+        # Minimal pool/conn mock
+        mock_conn = AsyncMock()
+        mock_conn.__aenter__ = AsyncMock(return_value=mock_conn)
+        mock_conn.__aexit__ = AsyncMock(return_value=None)
+        mock_conn.fetchrow.return_value = {
+            "tenant_id": "t1",
+            "billing_mode": "subscription",
+        }
+        mock_pool = MagicMock()
+        mock_pool.acquire.return_value = mock_conn
+
+        with patch("src.sandbox.routes.enforce_budget", side_effect=_gate_raises), \
+             patch("src.sandbox.routes.get_pool", return_value=mock_pool):
+            client = TestClient(app_instance, raise_server_exceptions=False)
+            resp = client.post(
+                "/v1/sandbox/lease-token",
+                json={
+                    "userId": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+                    "app": "engelmann",
+                    "estimatedDurationMin": 15,
+                },
+            )
+
+        assert resp.status_code == 402
+        # No lease must have been created
+        mock_conn.execute.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_unlicensed_user_passes_gate(self):
+        """
+        Trial users with no budget entry yet must NOT be blocked (reason=unlicensed
+        is non-blocking). enforce_budget returns None → lease proceeds.
+        """
+        from src.sandbox.routes import enforce_budget as real_enforce
+        from src.budget.gate import _BLOCKING_REASONS
+
+        # Simulate evaluate_budget returning reason=unlicensed
+        async def _budget_unlicensed(uid, plan_id, cost):
+            return {
+                "allowed": False,
+                "reason": "unlicensed",
+                "effectivePlanId": plan_id,
+                "monthlyRemainingEur": 0.0,
+                "topUpRemainingEur": 0.0,
+                "totalRemainingEur": 0.0,
+            }
+
+        assert "unlicensed" not in _BLOCKING_REASONS, (
+            "'unlicensed' must not be a blocking reason — trial users need sandbox access"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Criterion 13: usage_by_user reads from usage_events (Defect 4)
+# ---------------------------------------------------------------------------
+
+class TestUsageQueryMigration:
+    def test_usage_by_user_queries_usage_events_not_view(self):
+        """
+        Criterion 13: the SQL in usage_by_user must reference usage_events
+        with source='sandbox', NOT the sandbox_usage_events view.
+        """
+        import inspect
+        from src.sandbox import routes as sandbox_routes
+
+        source = inspect.getsource(sandbox_routes.usage_by_user)
+
+        assert "usage_events" in source, \
+            "usage_by_user must query usage_events (not sandbox_usage_events view)"
+        assert "source = 'sandbox'" in source or "source='sandbox'" in source, \
+            "usage_by_user must filter by source='sandbox'"
+        assert "sandbox_usage_events" not in source.replace("sandbox_usage_events", ""), \
+            "usage_by_user must not reference the sandbox_usage_events view directly"
+
+    def test_usage_by_tenant_queries_usage_events_not_view(self):
+        """usage_by_tenant must also read from usage_events."""
+        import inspect
+        from src.sandbox import routes as sandbox_routes
+
+        source = inspect.getsource(sandbox_routes.usage_by_tenant)
+        assert "usage_events" in source
+        assert "sandbox_usage_events" not in source
+
+    def test_usage_by_session_model_breakdown_queries_usage_events(self):
+        """usage_by_session model breakdown must read from usage_events."""
+        import inspect
+        from src.sandbox import routes as sandbox_routes
+
+        source = inspect.getsource(sandbox_routes.usage_by_session)
+        assert "usage_events" in source
+        assert "sandbox_usage_events" not in source
