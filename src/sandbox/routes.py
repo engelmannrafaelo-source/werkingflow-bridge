@@ -350,8 +350,8 @@ async def usage_by_user(
                     COUNT(*) AS event_count,
                     COALESCE(SUM(input_tokens + output_tokens + cache_read_tokens + cache_creation_tokens), 0) AS total_tokens,
                     COALESCE(SUM(hypothetical_cost_eur), 0) AS total_hypothetical_eur
-                FROM sandbox_usage_events
-                WHERE user_id = $1 AND recorded_at >= $2
+                FROM usage_events
+                WHERE source = 'sandbox' AND user_id = $1 AND recorded_at >= $2
                 """,
                 user_id,
                 since,
@@ -363,8 +363,8 @@ async def usage_by_user(
                     COUNT(*) AS event_count,
                     COALESCE(SUM(input_tokens + output_tokens + cache_read_tokens + cache_creation_tokens), 0) AS total_tokens,
                     COALESCE(SUM(hypothetical_cost_eur), 0) AS total_hypothetical_eur
-                FROM sandbox_usage_events
-                WHERE user_id = $1
+                FROM usage_events
+                WHERE source = 'sandbox' AND user_id = $1
                 """,
                 user_id,
             )
@@ -396,8 +396,8 @@ async def usage_by_tenant(
                     COUNT(*) AS event_count,
                     COALESCE(SUM(input_tokens + output_tokens + cache_read_tokens + cache_creation_tokens), 0) AS total_tokens,
                     COALESCE(SUM(hypothetical_cost_eur), 0) AS total_hypothetical_eur
-                FROM sandbox_usage_events
-                WHERE tenant_id = $1 AND recorded_at >= $2
+                FROM usage_events
+                WHERE source = 'sandbox' AND tenant_id = $1 AND recorded_at >= $2
                 """,
                 tenant_id,
                 since,
@@ -409,8 +409,8 @@ async def usage_by_tenant(
                     COUNT(*) AS event_count,
                     COALESCE(SUM(input_tokens + output_tokens + cache_read_tokens + cache_creation_tokens), 0) AS total_tokens,
                     COALESCE(SUM(hypothetical_cost_eur), 0) AS total_hypothetical_eur
-                FROM sandbox_usage_events
-                WHERE tenant_id = $1
+                FROM usage_events
+                WHERE source = 'sandbox' AND tenant_id = $1
                 """,
                 tenant_id,
             )
@@ -439,8 +439,8 @@ async def usage_by_session(
             """
             SELECT model, COUNT(*) AS calls,
                    SUM(input_tokens + output_tokens) AS tokens
-            FROM sandbox_usage_events
-            WHERE session_id = $1
+            FROM usage_events
+            WHERE source = 'sandbox' AND session_id = $1
             GROUP BY model
             """,
             session_id,
