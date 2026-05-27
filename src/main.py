@@ -3619,6 +3619,23 @@ async def research(
             error=str(e)
         )
 
+    # R2+R3: Extract attribution context and enforce budget BEFORE any research execution.
+    # This single gate covers both the sync path (R2) and the async job spawn (R3) —
+    # it runs before the if/else branch so a user with an empty budget cannot queue a
+    # job that would only block at worker-pickup time.
+    _research_attr = extract_attribution_context(request)
+    try:
+        from src.budget.gate import enforce_budget
+        await enforce_budget(
+            user_id=_research_attr.get("user_id"),
+            app_id=_research_attr.get("app_id"),
+            estimated_cost_eur=0.0,  # lower bound; gate blocks 'budget gone' states
+        )
+    except HTTPException:
+        raise  # 402 — propagate to the client
+    except Exception as _ge:
+        logger.error(f"budget gate (research) unexpected error (letting call through): {_ge}")
+
     # Async mode: spawn background task, return immediately with request_id.
     # Caller polls GET /v1/research/async/{request_id} for the result.
     if request_body.async_mode:
@@ -3628,7 +3645,7 @@ async def research(
             "started_at": time.time(),
             "query": request_body.query[:100],
         })
-        asyncio.create_task(_run_async_research_job(request_body, backend_config, job_id))
+        asyncio.create_task(_run_async_research_job(request_body, backend_config, job_id, attribution_ctx=_research_attr))
         logger.info(f"📨 Async research job {job_id} dispatched (query: {request_body.query[:60]!r})")
         return ResearchResponse(
             status="success",
@@ -3638,7 +3655,7 @@ async def research(
         )
 
     # Sync path: execute and return the full result
-    return await _execute_research_impl(request_body, backend_config)
+    return await _execute_research_impl(request_body, backend_config, attribution_ctx=_research_attr)
 
 
 @app.get("/v1/research/async/{request_id}", response_model=AsyncResearchStatus)
