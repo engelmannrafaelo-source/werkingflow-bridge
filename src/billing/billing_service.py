@@ -306,12 +306,43 @@ async def _activate_subscription(
 
 
 async def list_subscriptions(user_id: str) -> List[Dict[str, Any]]:
+    """
+    Returns the user's subscriptions, lazy-expiring any active trial whose
+    trial_ends_at has passed. Lazy because:
+      * Forced-trial cohorts are small (one row per registered user) so the
+        UPDATE-on-read overhead is negligible vs. running a cron-job.
+      * Lazy keeps the expiry state correct *for the caller's view* even
+        if a backstop scheduler missed a window — no stale UI possible.
+    A scheduled job would still be a useful belt-and-suspenders defense for
+    apps that don't call list_subscriptions on every request (planned: see
+    follow-up issue). For now this is the single load-bearing expire path.
+
+    The UPDATE runs in a separate transaction-friendly statement BEFORE
+    the SELECT so the returned rows already reflect the new state. A
+    concurrent caller racing the same UPDATE is safe: the WHERE clause
+    re-matches only rows still in the past-due state, the second writer
+    just no-ops.
+    """
     pool = get_pool()
     async with pool.acquire() as conn:
+        # Lazy expiry — UPDATE first so the SELECT below sees the new state.
+        await conn.execute(
+            """
+            UPDATE subscriptions
+            SET status = 'expired'::subscription_status,
+                expired_at = NOW()
+            WHERE user_id = $1
+              AND plan_id = 'trial'
+              AND status = 'active'
+              AND trial_ends_at IS NOT NULL
+              AND trial_ends_at < NOW()
+            """,
+            uuid.UUID(user_id),
+        )
         rows = await conn.fetch(
             """
             SELECT id, user_id, app_id, plan_id, status, mollie_customer_id, mollie_subscription_id,
-                   seats, started_at, cancelled_at
+                   seats, started_at, cancelled_at, suspended_at, expired_at, trial_ends_at
             FROM subscriptions WHERE user_id = $1 ORDER BY started_at DESC
             """,
             uuid.UUID(user_id),
@@ -727,6 +758,7 @@ def _serialize_subscription(row: Any) -> Dict[str, Any]:
         "cancelledAt": _ts("cancelled_at"),
         "suspendedAt": _ts("suspended_at"),
         "expiredAt": _ts("expired_at"),
+        "trialEndsAt": _ts("trial_ends_at"),
     }
 
 

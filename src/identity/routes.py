@@ -514,12 +514,15 @@ async def register(body: RegisterRequest) -> Dict[str, Any]:
                 # mollie_customer_id stays NULL until the first paid
                 # checkout creates a Mollie customer (see migration 024
                 # for the CHECK constraint enforcing trial-only NULL).
+                # trial_ends_at controls the forced-trial-period expiry —
+                # list_subscriptions lazy-expires past-due rows. 7 days
+                # matches the registration stage in required-fields.yaml.
                 await conn.execute(
                     """
                     INSERT INTO subscriptions
-                        (user_id, app_id, plan_id, status, mollie_customer_id, seats, started_at)
+                        (user_id, app_id, plan_id, status, mollie_customer_id, seats, started_at, trial_ends_at)
                     VALUES
-                        ($1, $2::app_id, 'trial'::plan_id, 'active'::subscription_status, NULL, 1, $3)
+                        ($1, $2::app_id, 'trial'::plan_id, 'active'::subscription_status, NULL, 1, $3, $3 + INTERVAL '7 days')
                     """,
                     user_id,
                     body.appId,
