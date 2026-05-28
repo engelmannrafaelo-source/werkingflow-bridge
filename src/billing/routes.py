@@ -356,6 +356,23 @@ async def billing_sub_provision(
         raise HTTPException(status_code=400, detail=str(e))
 
 
+@router.post("/seed-legacy-trials/{app_id}")
+async def billing_seed_legacy_trials(
+    app_id: str,
+    _claims: AuthClaims = Depends(require_service_token),
+) -> Dict[str, Any]:
+    """
+    One-shot backfill: every user without an active subscription for `app_id`
+    gets a 7-day trial. Service-token only. Idempotent — returns counts.
+
+    Run this BEFORE tightening _BLOCKING_REASONS in src/budget/gate.py to
+    include 'unlicensed', otherwise legacy users would be locked out.
+    """
+    if app_id not in _ALLOWED_APP_IDS:
+        raise HTTPException(status_code=400, detail=f"unknown app_id: {app_id}")
+    return await billing_service.seed_legacy_trials(app_id)
+
+
 @router.post("/subscription/checkout")
 async def billing_sub_checkout(
     body: SubscriptionCheckoutRequest,

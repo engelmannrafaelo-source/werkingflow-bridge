@@ -1221,3 +1221,64 @@ async def auto_create_invoice(
             ))
     return None
 
+
+async def seed_legacy_trials(app_id: str) -> Dict[str, int]:
+    """
+    Backfill: for every user without an active subscription for `app_id`,
+    insert a 7-day trial subscription + app_license. Idempotent.
+
+    Mirrors the trial-seeding path in identity/routes.py register() so legacy
+    users (created before the trial-auto-seeding landed) get the same grace
+    window. Returns counts so callers can verify scope before tightening the
+    budget gate to block `unlicensed`.
+
+    trial_ends_at = NOW + 7 days. start_date = today. Same rules as register.
+    """
+    pool = get_pool()
+    now = datetime.now(timezone.utc)
+    today = now.date()
+    trial_ends = now + timedelta(days=7)
+
+    created = 0
+    skipped = 0
+
+    async with pool.acquire() as conn:
+        users = await conn.fetch("SELECT id FROM users")
+        for u in users:
+            uid = u["id"]
+            existing = await conn.fetchval(
+                """
+                SELECT 1 FROM subscriptions
+                WHERE user_id = $1 AND app_id = $2::app_id AND status = 'active'
+                LIMIT 1
+                """,
+                uid, app_id,
+            )
+            if existing:
+                skipped += 1
+                continue
+
+            async with conn.transaction():
+                await conn.execute(
+                    """
+                    INSERT INTO app_licenses (user_id, app_id, plan_id, start_date, end_date, seats)
+                    VALUES ($1, $2::app_id, 'trial'::plan_id, $3, NULL, 1)
+                    ON CONFLICT DO NOTHING
+                    """,
+                    uid, app_id, today,
+                )
+                await conn.execute(
+                    """
+                    INSERT INTO subscriptions
+                        (user_id, app_id, plan_id, status, mollie_customer_id,
+                         seats, started_at, trial_ends_at)
+                    VALUES
+                        ($1, $2::app_id, 'trial'::plan_id, 'active'::subscription_status,
+                         NULL, 1, $3, $4)
+                    """,
+                    uid, app_id, now, trial_ends,
+                )
+            created += 1
+
+    return {"app_id": app_id, "created": created, "skipped": skipped, "total": len(users)}
+
