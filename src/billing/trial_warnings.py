@@ -180,7 +180,34 @@ async def _send_via_resend(
 # Sweep — selects due rows, sends, stamps
 # ---------------------------------------------------------------------------
 
-_SELECT_3D_DUE_SQL = """
+# Why the app_licenses EXISTS gate:
+#
+# Bridge identity is cross-app — a user row exists once across all apps,
+# and the seed-legacy-trials backfill can create trial subscriptions for
+# apps the user has never touched (an artefact of running the seed
+# without a per-app activity filter). Sending "your trial ends" mail to
+# users who never used the app is spam.
+#
+# app_licenses is the right signal because it is created exclusively
+# during the per-app registration flow (identity/routes.py:498): one
+# license per app the user has actually signed up for. Trial subscriptions
+# without a matching app_license were seeded blindly and should NOT receive
+# warning emails.
+#
+# end_date check: NULL = open-ended (default for trial licenses),
+# CURRENT_DATE = still valid. Expired licenses (past end_date) are
+# excluded.
+
+_LICENSE_GATE = """
+  AND  EXISTS (
+        SELECT 1 FROM app_licenses al
+        WHERE  al.user_id = s.user_id
+          AND  al.app_id  = s.app_id
+          AND  (al.end_date IS NULL OR al.end_date >= CURRENT_DATE)
+       )
+"""
+
+_SELECT_3D_DUE_SQL = f"""
 SELECT s.id            AS subscription_id,
        s.user_id       AS user_id,
        s.app_id        AS app_id,
@@ -195,9 +222,10 @@ WHERE  s.plan_id = 'trial'
   AND  s.trial_ends_at IS NOT NULL
   AND  s.trial_ends_at >  NOW()
   AND  s.trial_ends_at <= NOW() + INTERVAL '3 days'
+{_LICENSE_GATE}
 """
 
-_SELECT_1D_DUE_SQL = """
+_SELECT_1D_DUE_SQL = f"""
 SELECT s.id            AS subscription_id,
        s.user_id       AS user_id,
        s.app_id        AS app_id,
@@ -212,6 +240,7 @@ WHERE  s.plan_id = 'trial'
   AND  s.trial_ends_at IS NOT NULL
   AND  s.trial_ends_at >  NOW()
   AND  s.trial_ends_at <= NOW() + INTERVAL '1 day'
+{_LICENSE_GATE}
 """
 
 _STAMP_3D_SQL = (
