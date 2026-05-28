@@ -4,13 +4,17 @@ Chat-completions budget gate.
 Enforced inside /v1/chat/completions BEFORE the LLM call. If the calling
 user's budget for the app is exhausted, the call is rejected with 402.
 
-Design (decided 2026-05-16):
+Design (decided 2026-05-16, tightened 2026-05-28):
   • HARD enforcement: a user whose budget is empty gets 402, no call.
-  • The gate is a *budget cap*, not a licence check. A user with no plan
-    entry yet (`unlicensed`) is let through — provisioning is a separate
-    flow, and apps with a 0-EUR plan (safety/noise/engelmann) would
-    otherwise be unusable. Only `all_exhausted` / `monthly_exceeded` /
-    `trial_expired` block.
+  • As of 2026-05-28, `unlicensed` ALSO blocks: registering a user no longer
+    implicitly grants access — a subscription row (trial or paid) must
+    exist. Run /v1/billing/seed-legacy-trials/<app_id> before deploying
+    this tightened gate so pre-existing users keep working via Trial.
+  • Apps with a 0-EUR plan (safety/noise/engelmann) still need a row in
+    `subscriptions` — the seed-bridge-users.sh provisioner takes care of
+    test users; production users go through the register/checkout flow.
+  • Blocking reasons now: `all_exhausted`, `monthly_exceeded_no_topup`,
+    `trial_expired`, `unlicensed`.
   • Fail-open on infrastructure errors: a DB hiccup in the budget check
     must NEVER take down the AI path. The error is logged loud; the call
     proceeds. Enforcement resumes as soon as the DB recovers.
@@ -32,8 +36,15 @@ from src.budget.routes import evaluate_budget
 
 logger = logging.getLogger(__name__)
 
-# Reasons that mean "had budget, it's gone" → hard block.
-_BLOCKING_REASONS = {"all_exhausted", "monthly_exceeded_no_topup", "trial_expired"}
+# Reasons that hard-block the call.
+#   *_exhausted / *_exceeded_no_topup / trial_expired = "had budget, it's gone"
+#   unlicensed = "never had a plan entry" (added 2026-05-28 — was implicit grant)
+_BLOCKING_REASONS = {
+    "all_exhausted",
+    "monthly_exceeded_no_topup",
+    "trial_expired",
+    "unlicensed",
+}
 
 
 async def enforce_budget(
@@ -88,8 +99,9 @@ async def enforce_budget(
             },
         )
 
-    # Not allowed but not a blocking reason (e.g. "unlicensed") → let through.
-    logger.debug(
-        "budget gate: not-allowed but non-blocking (reason=%s) — letting call through",
+    # Not allowed for some other reason (future enum values). Let through and log
+    # loud so we notice if a new reason needs adding to _BLOCKING_REASONS.
+    logger.warning(
+        "budget gate: not-allowed reason=%s NOT in _BLOCKING_REASONS — letting call through (check if this reason should block)",
         reason,
     )
