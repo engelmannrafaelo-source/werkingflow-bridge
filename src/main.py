@@ -524,6 +524,15 @@ async def lifespan(app: FastAPI):
     asyncio.create_task(_gemini_daily_reset())
     logger.info("🔄 Gemini daily rate limit reset task scheduled (midnight UTC)")
 
+    # Trial-expiry warning emails — daily sweep at 08:00 UTC.
+    # Sends 3-day and 1-day warnings, idempotent via per-row stamps.
+    try:
+        from src.billing.trial_warnings import start_trial_warning_loop
+        start_trial_warning_loop()
+        logger.info("📧 Trial-expiry warning sweep scheduled (daily 08:00 UTC)")
+    except Exception as _e:
+        logger.error(f"Failed to start trial-warning loop: {_e}")
+
     # Initialize adaptive token-budget limiter and start its background tune loop.
     # The limiter persists its cap across restarts, so we don't reset state here —
     # we just spin up the periodic auto-tune task.
