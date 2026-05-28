@@ -3,27 +3,31 @@ Admin CRUD routes — Identity + DB-health.
 Only mounted when BRIDGE_DB_URL is set.
 
 Auth model:
-  GET    /v1/db/health                           — public liveness probe (no PII)
-  GET    /v1/users                               — admin only
-  POST   /v1/users                               — admin only (creates accounts)
-  GET    /v1/users/{user_id}                     — require_self_or_admin
-  PATCH  /v1/users/{user_id}                     — require_self_or_admin (name; role/password operator-only)
-  DELETE /v1/users/{user_id}                     — admin only (hard delete, refuses on billing-record FK)
-  GET    /v1/users/{user_id}/stammdaten          — require_self_or_admin
-  PATCH  /v1/users/{user_id}/stammdaten          — require_self_or_admin
-  GET    /v1/tenants                             — admin only
-  POST   /v1/tenants                             — admin only
-  PATCH  /v1/tenants/{tenant_id}                 — admin only
-  GET    /v1/tenants/{tenant_id}/billing-address — self (own tenant) or admin
-  PATCH  /v1/tenants/{tenant_id}/billing-address — self (own tenant) or admin
-  GET    /v1/tenants/{tenant_id}/stammdaten      — own-tenant member or admin
-  PATCH  /v1/tenants/{tenant_id}/stammdaten      — own-tenant tenant_admin role or operator
-  GET    /v1/app-licenses?userId=                — require_self_or_admin (if userId given) else admin
+  GET    /v1/db/health                                       — public liveness probe (no PII)
+  GET    /v1/users                                           — admin only
+  POST   /v1/users                                           — admin only (creates accounts)
+  GET    /v1/users/{user_id}                                 — require_self_or_admin
+  PATCH  /v1/users/{user_id}                                 — require_self_or_admin (name; role/password operator-only)
+  DELETE /v1/users/{user_id}                                 — admin only (hard delete, refuses on billing-record FK)
+  GET    /v1/users/{user_id}/stammdaten                      — require_self_or_admin
+  PATCH  /v1/users/{user_id}/stammdaten                      — require_self_or_admin
+  POST   /v1/users/{user_id}/app-licenses                    — admin only (grant/update license with explicit dates)
+  DELETE /v1/users/{user_id}/app-licenses/{app_id}           — admin only (revoke license)
+  GET    /v1/tenants                                         — admin only
+  POST   /v1/tenants                                         — admin only
+  PATCH  /v1/tenants/{tenant_id}                             — admin only
+  GET    /v1/tenants/{tenant_id}/billing-address             — self (own tenant) or admin
+  PATCH  /v1/tenants/{tenant_id}/billing-address             — self (own tenant) or admin
+  GET    /v1/tenants/{tenant_id}/stammdaten                  — own-tenant member or admin
+  PATCH  /v1/tenants/{tenant_id}/stammdaten                  — own-tenant tenant_admin role or operator
+  GET    /v1/app-licenses?userId=                            — require_self_or_admin (if userId given) else admin
+  GET    /v1/admin/users/lookup?email=                       — admin only
+  POST   /v1/admin/users/{user_id}/app-licenses              — admin only (legacy drift-correction path, no date control)
 """
 import json
 import logging
 import uuid
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from typing import Optional, List, Any, Dict
 
 import asyncpg
@@ -1353,3 +1357,195 @@ async def patch_user_stammdaten(
             patch_json,
         )
     return _user_stammdaten_row(r)
+
+
+# ---------------------------------------------------------------------------
+# App-License Grant + Revoke — admin-only, date-aware
+#
+# POST /v1/users/{user_id}/app-licenses
+#   Grant (or update) a license for a specific app. Idempotent: second call
+#   on the same (user_id, app_id) pair updates plan_id / end_date / seats and
+#   returns `created: false`. The caller passes explicit start/end dates so
+#   werking.tools and other orchestrators can issue paid licenses with known
+#   validity windows.
+#
+# DELETE /v1/users/{user_id}/app-licenses/{app_id}
+#   Revoke the license for a specific app. 204 on success, 404 if not found.
+#
+# Companion to the legacy POST /v1/admin/users/{user_id}/app-licenses which
+# auto-sets start_date=today and end_date=NULL (drift-correction path).
+# ---------------------------------------------------------------------------
+
+
+def _parse_date(value: Optional[str], field: str) -> Optional[date]:
+    """Parse an ISO date string ('YYYY-MM-DD'). Raises 400 on invalid format."""
+    if value is None:
+        return None
+    try:
+        return date.fromisoformat(value)
+    except ValueError:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid date format for '{field}': {value!r}. Expected YYYY-MM-DD.",
+        )
+
+
+class GrantAppLicenseRequest(BaseModel):
+    appId: str = Field(description="Target app_id. Must be one of the known app_id enum values.")
+    planId: str = Field(
+        default="trial",
+        description="Plan identifier. Defaults to 'trial'.",
+    )
+    startDate: str = Field(description="License start date — ISO format YYYY-MM-DD.")
+    endDate: Optional[str] = Field(
+        default=None,
+        description="License end date — ISO format YYYY-MM-DD, or null for open-ended.",
+    )
+    seats: int = Field(default=1, ge=1, description="Seat count. Must be ≥ 1.")
+
+
+class GrantAppLicenseResponse(BaseModel):
+    userId: str
+    appId: str
+    planId: str
+    startDate: str
+    endDate: Optional[str] = None
+    seats: int
+    created: bool
+
+
+@router.post(
+    "/v1/users/{user_id}/app-licenses",
+    response_model=GrantAppLicenseResponse,
+)
+async def grant_app_license(
+    user_id: str,
+    body: GrantAppLicenseRequest,
+    _claims: AuthClaims = Depends(require_admin),
+) -> Dict[str, Any]:
+    """
+    Admin-only: grant (or update) an app_license for a user, with explicit dates.
+
+    Idempotent on (user_id, app_id) — a second call updates plan_id, end_date,
+    and seats and returns `created: false`.
+
+    Status mapping:
+      200  → success ({created: true} on insert, {created: false} on update)
+      400  → invalid user_id, unknown app_id, unknown plan_id, bad date format
+      404  → user_id does not exist
+    """
+    if body.appId not in _ALLOWED_APP_IDS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unknown appId '{body.appId}'. Must be one of: {sorted(_ALLOWED_APP_IDS)}",
+        )
+    if body.planId not in _ALLOWED_PLAN_IDS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unknown planId '{body.planId}'. Must be one of: {sorted(_ALLOWED_PLAN_IDS)}",
+        )
+    try:
+        uid = uuid.UUID(user_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid userId (must be UUID)")
+
+    start_date = _parse_date(body.startDate, "startDate")
+    end_date = _parse_date(body.endDate, "endDate")
+
+    if end_date is not None and end_date < start_date:
+        raise HTTPException(
+            status_code=400,
+            detail=f"endDate ({body.endDate}) must not be before startDate ({body.startDate})",
+        )
+
+    pool = get_pool()
+    async with pool.acquire() as conn:
+        user_exists = await conn.fetchval("SELECT 1 FROM users WHERE id = $1", uid)
+        if not user_exists:
+            raise HTTPException(status_code=404, detail=f"User '{user_id}' not found")
+
+        row = await conn.fetchrow(
+            """
+            INSERT INTO app_licenses (user_id, app_id, plan_id, start_date, end_date, seats)
+            VALUES ($1, $2::app_id, $3::plan_id, $4, $5, $6)
+            ON CONFLICT (user_id, app_id) DO UPDATE
+              SET plan_id    = EXCLUDED.plan_id,
+                  start_date = EXCLUDED.start_date,
+                  end_date   = EXCLUDED.end_date,
+                  seats      = EXCLUDED.seats
+            RETURNING user_id, app_id, plan_id, start_date, end_date, seats,
+                      (xmax = 0) AS created
+            """,
+            uid,
+            body.appId,
+            body.planId,
+            start_date,
+            end_date,
+            body.seats,
+        )
+
+    logger.info(
+        "admin.grant_app_license: user_id=%s app_id=%s plan_id=%s seats=%s "
+        "start_date=%s end_date=%s created=%s",
+        row["user_id"],
+        row["app_id"],
+        row["plan_id"],
+        row["seats"],
+        row["start_date"],
+        row["end_date"],
+        row["created"],
+    )
+
+    return {
+        "userId": str(row["user_id"]),
+        "appId": row["app_id"],
+        "planId": row["plan_id"],
+        "startDate": row["start_date"].isoformat(),
+        "endDate": row["end_date"].isoformat() if row["end_date"] else None,
+        "seats": row["seats"],
+        "created": bool(row["created"]),
+    }
+
+
+@router.delete(
+    "/v1/users/{user_id}/app-licenses/{app_id}",
+    status_code=204,
+    response_class=Response,
+)
+async def revoke_app_license(
+    user_id: str,
+    app_id: str,
+    _claims: AuthClaims = Depends(require_admin),
+) -> Response:
+    """
+    Admin-only: revoke an app_license for a user.
+
+    Status mapping:
+      204 → success
+      400 → invalid user_id or unknown app_id
+      404 → license not found (user doesn't hold this app license)
+    """
+    if app_id not in _ALLOWED_APP_IDS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unknown app_id '{app_id}'. Must be one of: {sorted(_ALLOWED_APP_IDS)}",
+        )
+    try:
+        uid = uuid.UUID(user_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid userId (must be UUID)")
+
+    pool = get_pool()
+    async with pool.acquire() as conn:
+        result = await conn.execute(
+            "DELETE FROM app_licenses WHERE user_id = $1 AND app_id = $2::app_id",
+            uid,
+            app_id,
+        )
+
+    if not result.endswith(" 1"):
+        raise HTTPException(
+            status_code=404,
+            detail=f"No license found for user '{user_id}' and app '{app_id}'",
+        )
+    return Response(status_code=204)
