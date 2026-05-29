@@ -305,7 +305,18 @@ async def create_pending_order(
         payload={"planId": plan_id, "quantity": quantity, "orderId": str(order_id)},
     )
 
-    await _send_order_email(invoice_id=invoice_id, user_id=user_id)
+    # Email send is best-effort: the order is persisted in pending_orders
+    # before we send. A failed email (Resend down, bad API key, recipient
+    # bounce) must not prevent operators from later releasing the order.
+    # Without this guard a stale Resend key turned every order POST into a
+    # 5xx even though the DB write had already succeeded.
+    try:
+        await _send_order_email(invoice_id=invoice_id, user_id=user_id)
+    except Exception as exc:  # noqa: BLE001 — silent-ok: order is persisted, email send is post-write best-effort, surfaces as a warning instead of a failed 5xx
+        import logging
+        logging.getLogger(__name__).warning(
+            "Order email send failed (order persisted): %s", exc,
+        )
 
     return _serialize_order(row)
 
@@ -340,7 +351,7 @@ async def list_all_pending_orders(
 
 async def release_order(
     order_id: str,
-    operator_user_id: str,
+    operator_user_id: Optional[str],
     note: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
@@ -366,7 +377,9 @@ async def release_order(
 
     pool = get_pool()
     order_uuid = uuid.UUID(order_id)
-    operator_uuid = uuid.UUID(operator_user_id)
+    # None means: released via service-token operator path (no human user).
+    # released_by is nullable in the schema; the release_note carries context.
+    operator_uuid = uuid.UUID(operator_user_id) if operator_user_id else None
 
     async with pool.acquire() as conn:
         async with conn.transaction():

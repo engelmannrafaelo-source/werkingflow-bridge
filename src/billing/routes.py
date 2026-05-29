@@ -640,7 +640,11 @@ async def release_pending_order(
     Aktiviert Subscription, markiert Invoice als bezahlt, updated Order-Status.
     Idempotent auf DB-Ebene (ON CONFLICT). Bei bereits releastem Order → 409.
     """
-    operator_id = claims.user_id or "operator"
+    # Service-token operator has no user_id in the claim. Pass None so
+    # release_order writes NULL into released_by — the release_note still
+    # captures context. Hard-coding the literal string "operator" produced
+    # UUID("operator") errors on cast inside release_order.
+    operator_id = claims.user_id
     try:
         return await pending_orders_service.release_order(
             order_id=order_id,
