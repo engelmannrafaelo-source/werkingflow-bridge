@@ -142,15 +142,34 @@ async def smart_anonymize_service_endpoint(req: SmartAnonymizeServiceRequest):
     """Smart anonymization: Presidio + AI refinement.
 
     The AI refinement step calls BACK to the workers via BRIDGE_SELF_URL.
+
+    Fail-fast boundary: smart_anonymize() raises on any failure — Presidio
+    detection (safety-critical) OR refinement (incl. a truncated response). This
+    guard converts that into an explicit ``status="error"`` response with a
+    descriptive, traceable message. It NEVER returns the input as
+    cleartext-success and NEVER returns a partial/truncated result.
     """
     from src.privacy.smart_anonymizer import smart_anonymize
-    result = await smart_anonymize(
-        text=req.text,
-        language=req.language or "de",
-        context_hint=req.context_hint,
-        prefix=req.prefix,
-    )
-    return result
+    try:
+        return await smart_anonymize(
+            text=req.text,
+            language=req.language or "de",
+            context_hint=req.context_hint,
+            prefix=req.prefix,
+        )
+    except Exception as e:
+        logger.error(f"smart-anonymize failed: {e}", exc_info=True)
+        return {
+            "status": "error",
+            "error": f"smart-anonymize failed: {type(e).__name__}: {e}",
+            "raw_anonymized_text": None,
+            "raw_entity_count": 0,
+            "smart_anonymized_text": None,
+            "smart_entity_count": 0,
+            "restored_entities": [],
+            "mapping": {},
+            "detected_entities": [],
+        }
 
 
 # ======================== PDF Conversion Endpoint ========================
