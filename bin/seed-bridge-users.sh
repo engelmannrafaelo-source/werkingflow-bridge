@@ -553,6 +553,92 @@ sys.exit(0 if ok else 1)
 PYEOF
 log_success "Billing provisioned"
 
+# ============================================================================
+# PHASE 6: APP LICENSE GRANT
+#
+# The login JWT's `appLicenses` claim is read straight from the `app_licenses`
+# table (identity/routes.py). Provisioning a subscription (Phase 5) does NOT
+# create an app_license, so without this phase every seeded user is missing the
+# license that route guards require → pool-wide 403 caps on L1/L2 tests, and
+# any manual backfill is silently lost on the next re-seed. This phase makes
+# the grant durable and idempotent.
+#
+# POST /v1/users/{id}/app-licenses {appId, planId:'trial', startDate:today, endDate:null, seats:1}
+#   - payload is camelCase per the DEPLOYED Bridge contract (appId/startDate required)
+#   - admin scope (X-Bridge-Service-Token, no X-User-ID)
+#   - idempotent on (userId, appId): a re-seed updates and returns created:false
+# ============================================================================
+phase_header 6 "APP LICENSE GRANT"
+
+python3 - <<PYEOF
+import json, sys, requests
+
+creds = json.load(open('${CREDENTIALS_JSON}'))
+users = creds.get('users', {})
+
+headers = {
+    'Content-Type': 'application/json',
+    'X-Bridge-Service-Token': '${BRIDGE_SERVICE_TOKEN}',
+}
+
+app_id = '${APP}'
+from datetime import datetime, timezone
+today = datetime.now(timezone.utc).date().isoformat()
+
+# Pre-fetch user IDs (email -> id) — same pattern as Phase 5.
+user_ids = {}
+offset = 0
+while True:
+    try:
+        r = requests.get('${BRIDGE_URL}/v1/users',
+                         params={'limit': 200, 'offset': offset},
+                         headers=headers, timeout=15)
+    except requests.RequestException as e:
+        print(f"  [FAIL]  GET /v1/users failed: {e}", file=sys.stderr)
+        sys.exit(1)
+    if r.status_code != 200:
+        print(f"  [FAIL]  GET /v1/users HTTP {r.status_code}", file=sys.stderr)
+        sys.exit(1)
+    page = r.json()
+    if not page:
+        break
+    for x in page:
+        user_ids[x['email'].lower()] = x['id']
+    if len(page) < 200:
+        break
+    offset += 200
+
+ok = True
+for key, u in users.items():
+    email = u['email'].lower()
+    uid = user_ids.get(email)
+    if not uid:
+        print(f"  [FAIL]  User {key} ({u['email']}): not found in Bridge — skipped", file=sys.stderr)
+        ok = False
+        continue
+    try:
+        r = requests.post(
+            f"${BRIDGE_URL}/v1/users/{uid}/app-licenses",
+            json={'appId': app_id, 'planId': 'trial', 'startDate': today, 'endDate': None, 'seats': 1},
+            headers=headers,
+            timeout=15,
+        )
+    except requests.RequestException as e:
+        print(f"  [FAIL]  User {key}: app-license request error — {e}", file=sys.stderr)
+        ok = False
+        continue
+    if r.status_code in (200, 201):
+        created = r.json().get('created')
+        verb = 'granted' if created else 'already present (refreshed)'
+        print(f"  [ok]    App-license {verb} ({app_id}/trial): {key} ({u['email']})")
+    else:
+        print(f"  [FAIL]  User {key}: app-license HTTP {r.status_code} — {r.text}", file=sys.stderr)
+        ok = False
+
+sys.exit(0 if ok else 1)
+PYEOF
+log_success "App licenses granted"
+
 echo ""
 printf "${GREEN}${BOLD}Bridge user seed complete — ${APP}${RESET}\n"
 echo ""
