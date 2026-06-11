@@ -4220,17 +4220,19 @@ async def smart_anonymize_endpoint(request_body: SmartAnonymizeRequest):
     again; no app-side change required.
     """
     if os.environ.get("BRIDGE_ANONYMIZE_ENABLED", "").lower() != "true":
-        return SmartAnonymizeResponse(
-            status="success",
-            raw_anonymized_text=request_body.text,
-            raw_entity_count=0,
-            smart_anonymized_text=request_body.text,
-            smart_entity_count=0,
-            restored_entities=[],
-            mapping={},
-            detected_entities=[],
-            error=None,
-        )
+        # Fail loud, never silent: a disabled PII detector must NEVER echo the
+        # caller's text back as a "successful" anonymization. Doing so leaks raw
+        # PII (status=success, mapping={}) while callers persist it as
+        # 'pseudonymized' — an active GDPR exposure. Refuse instead of pretending.
+        raise BridgeError(config_error(
+            detail=(
+                "smart-anonymize is disabled (BRIDGE_ANONYMIZE_ENABLED is not "
+                "'true'). The PII detector is off; the bridge refuses to return "
+                "unprocessed text as anonymized. Enable the flag on the Hetzner "
+                "host once the privacy-service is verified healthy."
+            ),
+            status_code=503,
+        ))
 
     privacy_client = get_privacy_client()
     try:
@@ -4494,19 +4496,20 @@ async def convert_and_anonymize_document_endpoint(
     await verify_api_key(request, credentials)
 
     if os.environ.get("BRIDGE_ANONYMIZE_ENABLED", "").lower() != "true":
-        # Plain convert + empty mapping. Conversion still hits the privacy-pdf
-        # container (Docling lives there) but the smart-anonymize step is skipped.
-        response = await _proxy_document_endpoint(
-            request, "/document/convert", timeout=600.0
-        )
-        try:
-            payload = json.loads(response.body)
-        except Exception:
-            return response
-        if isinstance(payload, dict) and payload.get("status") != "error":
-            payload.setdefault("mapping", {})
-            payload.setdefault("entity_count", 0)
-        return JSONResponse(status_code=response.status_code, content=payload)
+        # Fail loud, never silent: convert-and-anonymize must not silently
+        # degrade to a plain convert that returns document text with an empty
+        # mapping. The caller asked for anonymization; returning un-anonymized
+        # content as success leaks PII. Refuse instead of pretending.
+        raise BridgeError(config_error(
+            detail=(
+                "convert-and-anonymize is disabled (BRIDGE_ANONYMIZE_ENABLED is "
+                "not 'true'). The bridge refuses to return un-anonymized document "
+                "text as anonymized. Use /v1/document/convert explicitly if plain "
+                "conversion without PII handling is intended, or enable the flag "
+                "on the Hetzner host once the privacy-service is healthy."
+            ),
+            status_code=503,
+        ))
 
     return await _proxy_document_endpoint(
         request, "/document/convert-and-anonymize", timeout=900.0

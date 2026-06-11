@@ -477,6 +477,15 @@ class SmartAnonymizeResponse(BaseModel):
     """
     status: Literal["success", "error"]
 
+    # Positive attestation that the real PII detector executed (Presidio ran).
+    # Distinguishes a genuine clean-input pass (0 entities, detector ran) from a
+    # disabled no-op that echoes the input back — consumers fail loud on a
+    # "success" that lacks this. The disabled branch never sets it (it now 503s).
+    anonymization_performed: bool = Field(
+        default=False,
+        description="True iff the Presidio/AI detector actually ran on this request"
+    )
+
     # Stage 1: Raw Presidio result
     raw_anonymized_text: Optional[str] = Field(
         default=None,

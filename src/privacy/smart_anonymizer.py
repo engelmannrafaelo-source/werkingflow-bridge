@@ -234,8 +234,11 @@ async def smart_anonymize(
     raw_result = await anonymizer.anonymize_async(text, language, prefix=prefix)
 
     if raw_result.entity_count == 0:
+        # Detector ran and genuinely found no PII. Attest the run so consumers
+        # can distinguish this from a disabled no-op (byte-identical otherwise).
         return {
             "status": "success",
+            "anonymization_performed": True,
             "raw_anonymized_text": text,
             "raw_entity_count": 0,
             "smart_anonymized_text": text,
@@ -290,6 +293,7 @@ async def smart_anonymize(
 
     return {
         "status": "success",
+        "anonymization_performed": True,
         "raw_anonymized_text": raw_result.anonymized_text,
         "raw_entity_count": raw_result.entity_count,
         "smart_anonymized_text": smart_text,
