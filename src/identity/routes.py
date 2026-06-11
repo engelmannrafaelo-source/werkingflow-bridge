@@ -33,6 +33,7 @@ from src.db.client import get_pool
 from src.identity.password import hash_password, verify_password
 from src.identity.jwt_utils import sign_jwt, verify_jwt
 from src.identity.webhook_config import BRIDGE_AUTH_APP_IDS, get_webhook_config
+from src.billing import billing_service
 
 router = APIRouter(prefix="/v1/auth", tags=["auth"])
 _bearer = HTTPBearer(auto_error=False)
@@ -54,6 +55,31 @@ def _license_row(r: Any) -> Dict[str, Any]:
         "endDate": r["end_date"].isoformat() if r["end_date"] else None,
         "seats": r["seats"],
     }
+
+
+async def _entitlements_for(user_id: Any) -> List[Dict[str, Any]]:
+    """Authorization verdicts for the session JWT `entitlements` claim.
+
+    Derived from the `subscriptions` table — the single source of truth for
+    billing state — via billing_service.list_subscriptions, which lazy-expires
+    any past-due trial on read. This is DISTINCT from app_licenses (provisioning
+    metadata): apps gate on these verdicts (status == 'active'), exactly as the
+    `unlicensed` 402 budget gate and the app-side requireActiveSubscription do.
+
+    Multiple rows per app are kept verbatim (no dedup): the consumer's
+    hasActiveEntitlement passes if ANY row for the app is active — matching the
+    billing gate semantics.
+    """
+    subs = await billing_service.list_subscriptions(str(user_id))
+    return [
+        {
+            "appId": s["appId"],
+            "status": s["status"],
+            "planId": s["planId"],
+            "trialEndsAt": s.get("trialEndsAt"),
+        }
+        for s in subs
+    ]
 
 
 def _user_dict(row: Any, licenses: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -154,8 +180,9 @@ async def login(body: LoginRequest) -> Dict[str, Any]:
             expires_at,
         )
 
+    entitlements = await _entitlements_for(user_id)
     user = _user_dict(row, app_licenses)
-    return {"jwt": token, "user": user, "appLicenses": app_licenses}
+    return {"jwt": token, "user": user, "appLicenses": app_licenses, "entitlements": entitlements}
 
 
 # ---------------------------------------------------------------------------
@@ -194,7 +221,8 @@ async def _issue_token(conn: Any, row: Any) -> Dict[str, Any]:
         now,
         now + timedelta(hours=_SESSION_TTL_HOURS),
     )
-    return {"jwt": token, "user": _user_dict(row, app_licenses), "appLicenses": app_licenses}
+    entitlements = await _entitlements_for(user_id)
+    return {"jwt": token, "user": _user_dict(row, app_licenses), "appLicenses": app_licenses, "entitlements": entitlements}
 
 
 @router.post("/test-token")
@@ -596,8 +624,9 @@ async def register(body: RegisterRequest) -> Dict[str, Any]:
         body.checkId,
     )
 
+    entitlements = await _entitlements_for(user_id)
     user = _user_dict(user_row, app_licenses)
-    return {"jwt": token, "user": user, "appLicenses": app_licenses}
+    return {"jwt": token, "user": user, "appLicenses": app_licenses, "entitlements": entitlements}
 
 
 # ---------------------------------------------------------------------------
