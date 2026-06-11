@@ -18,6 +18,7 @@ call, NOT vision — there is zero reason to use the paid ANTHROPIC_API_KEY.
 import os
 import json
 import logging
+import re
 from typing import List, Dict, Any, Optional
 
 import httpx
@@ -32,6 +33,57 @@ logger = logging.getLogger(__name__)
 # Use BRIDGE_SELF_URL env var to point to nginx LB.
 BRIDGE_SELF_URL = os.getenv("BRIDGE_SELF_URL", "http://localhost:8000/v1/chat/completions")
 HAIKU_MODEL = "claude-haiku-4-5-20251001"
+
+
+# ── PII restore guard (GDPR fail-safe) ──────────────────────────────────────
+# Stage 2 (AI refinement) may choose to RESTORE a placeholder for readability.
+# But an LLM is probabilistic, and Presidio sometimes mislabels a span (observed
+# live: an e-mail tagged BOTH as EMAIL_ADDRESS and LOCATION, then "restored" as a
+# general place name → raw PII leaked into the anonymized output). For a GDPR
+# guarantee we never trust the LLM for hard PII. A placeholder is kept anonymized
+# — regardless of the RESTORE decision — if EITHER its entity type is critical
+# (correctly-labelled PII) OR its original value matches a hard PII pattern
+# (catches the mislabel case by value, independent of the wrong type). The LLM
+# stays advisory; this guard is the deterministic backstop.
+_NEVER_RESTORE_TYPES = frozenset({
+    "PERSON", "EMAIL_ADDRESS", "PHONE_NUMBER", "IBAN_CODE",
+    "CREDIT_CARD", "IP_ADDRESS", "US_SSN", "CRYPTO", "MEDICAL_LICENSE",
+})
+
+_EMAIL_RE = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
+_IBAN_RE = re.compile(r"\b[A-Z]{2}\d{2}[A-Za-z0-9]{10,30}\b")
+_IP_RE = re.compile(r"\b\d{1,3}(?:\.\d{1,3}){3}\b")
+_CC_RE = re.compile(r"\b(?:\d[ -]?){13,19}\b")
+_PHONE_CHARS_RE = re.compile(r"^[\d\s+/().\-]+$")
+
+
+def _value_is_hard_pii(value: str) -> bool:
+    """True if the value looks like hard PII by pattern (type-independent).
+
+    Conservative: a false positive only over-anonymizes (keeps a placeholder
+    masked that could have been restored) — the safe direction.
+    """
+    if not value:
+        return False
+    if _EMAIL_RE.search(value) or _IBAN_RE.search(value) or _IP_RE.search(value):
+        return True
+    if _CC_RE.search(value):
+        return True
+    # Phone-like: only digits/phone separators AND at least 9 digits. The >=9
+    # floor avoids over-blocking 8-digit dates (DDMMYYYY) which the refinement is
+    # allowed to restore; correctly-typed phones are still caught by type.
+    if _PHONE_CHARS_RE.match(value.strip()) and len(re.sub(r"\D", "", value)) >= 9:
+        return True
+    return False
+
+
+def _must_stay_anonymized(
+    placeholder: str, value: str, type_by_placeholder: Dict[str, str]
+) -> bool:
+    """Refuse-restore decision: critical entity type OR hard-PII value pattern."""
+    if type_by_placeholder.get(placeholder, "") in _NEVER_RESTORE_TYPES:
+        return True
+    return _value_is_hard_pii(value)
 
 
 def _build_refinement_prompt(
@@ -256,9 +308,27 @@ async def smart_anonymize(
     smart_mapping = dict(raw_result.mapping)
     restored_entities = []
 
+    # Entity type per placeholder, for the hard-PII restore guard.
+    type_by_placeholder = {
+        e.placeholder: e.entity_type for e in raw_result.detected_entities
+    }
+    refused_restores: List[str] = []
+
     for placeholder in refinement["restore_placeholders"]:
         if placeholder in smart_mapping:
             original = smart_mapping[placeholder]
+
+            # GDPR fail-safe: never restore hard PII, even when the AI said
+            # RESTORE — guards against LLM error and Presidio type-mislabelling.
+            if _must_stay_anonymized(placeholder, original, type_by_placeholder):
+                logger.warning(
+                    "Refinement RESTORE refused for %s (type=%s): hard PII, "
+                    "kept anonymized.",
+                    placeholder, type_by_placeholder.get(placeholder, "?"),
+                )
+                refused_restores.append(placeholder)
+                continue
+
             smart_text = smart_text.replace(placeholder, original)
             del smart_mapping[placeholder]
 
