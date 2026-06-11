@@ -99,6 +99,14 @@ class LoginRequest(BaseModel):
     password: str
 
 
+# Constant-time login guard: a bcrypt hash computed once at import. When the
+# email is unknown (or the user has no password) we STILL verify the supplied
+# password against this dummy hash, so the response time matches the known-user
+# path. Without it, login leaks email existence via timing (~317ms known +
+# bcrypt vs ~39ms unknown fast-reject) → account enumeration.
+_DUMMY_PASSWORD_HASH = hash_password("\x00-no-such-user-constant-time-dummy")
+
+
 @router.post("/login")
 async def login(body: LoginRequest) -> Dict[str, Any]:
     pool = get_pool()
@@ -108,10 +116,12 @@ async def login(body: LoginRequest) -> Dict[str, Any]:
             body.email,
         )
 
-    if not row or not row["password_hash"]:
-        raise HTTPException(status_code=401, detail="Invalid credentials")
-
-    if not verify_password(body.password, row["password_hash"]):
+    # Constant-time: always run bcrypt exactly once — against the real hash, or
+    # the dummy hash when the user is unknown / has no password — so the timing
+    # never reveals whether the email exists (anti-enumeration).
+    stored_hash = row["password_hash"] if row else None
+    password_ok = verify_password(body.password, stored_hash or _DUMMY_PASSWORD_HASH)
+    if stored_hash is None or not password_ok:
         raise HTTPException(status_code=401, detail="Invalid credentials")
 
     user_id = row["id"]
