@@ -21,7 +21,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN useradd -m -u 1001 -s /bin/bash claude
 
 # Install Poetry
-RUN curl -sSL https://install.python-poetry.org | POETRY_HOME=/usr/local python3 -
+RUN curl -sSL https://install.python-poetry.org | POETRY_HOME=/usr/local POETRY_VERSION=2.4.1 python3 -
 
 ENV PATH="/usr/local/bin:${PATH}"
 
@@ -38,8 +38,12 @@ RUN mkdir -p /app/logs
 # Install Python deps WITH privacy + pdf + documents extras.
 # documents pulls openpyxl/pandas/tabulate/markdownify/extract-msg so the
 # universal /document/convert endpoint can handle XLSX/CSV/HTML/MSG/EML.
+# Install from the COMMITTED poetry.lock — reproducible. The previous `poetry
+# lock` re-resolved on every build and drifted docling/torch to a CUDA-13 build
+# whose nvidia-cudnn-cu13 fails to install. Pinned Poetry (2.4.1, above) +
+# committed lock = deterministic. To bump deps: run `poetry lock` locally,
+# verify a build, commit the new lock.
 RUN poetry config virtualenvs.in-project true && \
-    poetry lock && \
     poetry install --no-root --extras "privacy" --extras "pdf" --extras "documents"
 
 # Download spaCy language models for Presidio PII detection
