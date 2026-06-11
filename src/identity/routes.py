@@ -560,7 +560,7 @@ async def register(body: RegisterRequest) -> Dict[str, Any]:
                     INSERT INTO subscriptions
                         (user_id, app_id, plan_id, status, mollie_customer_id, seats, started_at, trial_ends_at)
                     VALUES
-                        ($1, $2::app_id, 'trial'::plan_id, 'active'::subscription_status, NULL, 1, $3, $3 + INTERVAL '7 days')
+                        ($1, $2::app_id, 'trial'::plan_id, 'active'::subscription_status, NULL, 1, $3::timestamptz, $3::timestamptz + INTERVAL '7 days')
                     """,
                     user_id,
                     body.appId,
