@@ -68,6 +68,7 @@ services:
       - LOG_TO_FILE=true
       - FILTER_SENSITIVE_DATA=true
       - BRIDGE_SECRETS_DIR=/app/secrets
+      - BRIDGE_ANONYMIZE_ENABLED=true
       - INSTANCE_NAME=worker1
       - ADAPTIVE_INITIAL_CAP_TOKENS=1000000
       - ADAPTIVE_FLOOR_TOKENS=500000
@@ -136,6 +137,7 @@ services:
       - LOG_TO_FILE=true
       - FILTER_SENSITIVE_DATA=true
       - BRIDGE_SECRETS_DIR=/app/secrets
+      - BRIDGE_ANONYMIZE_ENABLED=true
       - INSTANCE_NAME=worker2
       - ADAPTIVE_INITIAL_CAP_TOKENS=1000000
       - ADAPTIVE_FLOOR_TOKENS=500000
@@ -204,6 +206,7 @@ services:
       - LOG_TO_FILE=true
       - FILTER_SENSITIVE_DATA=true
       - BRIDGE_SECRETS_DIR=/app/secrets
+      - BRIDGE_ANONYMIZE_ENABLED=true
       - INSTANCE_NAME=worker3
       - ADAPTIVE_INITIAL_CAP_TOKENS=1000000
       - ADAPTIVE_FLOOR_TOKENS=500000
@@ -272,6 +275,7 @@ services:
       - LOG_TO_FILE=true
       - FILTER_SENSITIVE_DATA=true
       - BRIDGE_SECRETS_DIR=/app/secrets
+      - BRIDGE_ANONYMIZE_ENABLED=true
       - INSTANCE_NAME=worker4
       - ADAPTIVE_INITIAL_CAP_TOKENS=1000000
       - ADAPTIVE_FLOOR_TOKENS=500000
