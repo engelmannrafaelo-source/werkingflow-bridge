@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import uuid
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
@@ -94,6 +95,25 @@ async def activity_log(
     return {"id": str(row["id"]), "timestamp": row["timestamp"].isoformat()}
 
 
+def _parse_iso_timestamp(value: str, field: str) -> datetime:
+    """ISO-8601 string -> tz-aware datetime for binding against the TIMESTAMPTZ
+    `activities.timestamp` column. asyncpg needs a datetime, not a raw string:
+    binding the raw query-string raised a PG type error -> 500 for ANY since/until
+    (the param is documented as an ISO timestamp). Fail loud with 400 on an
+    unparseable value instead of a 500. Mirrors metrics/routes.py:_parse_iso but
+    rejects (not silently ignores) an invalid value."""
+    try:
+        dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except (ValueError, TypeError):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid {field} timestamp: {value!r} (expected ISO-8601)",
+        )
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
 @router.get("/query")
 async def activity_query(
     tenantId: Optional[str] = None,
@@ -142,9 +162,9 @@ async def activity_query(
     if eventType:
         add("activities.event_type = $$", eventType)
     if since:
-        add("activities.timestamp >= $$", since)
+        add("activities.timestamp >= $$", _parse_iso_timestamp(since, "since"))
     if until:
-        add("activities.timestamp <= $$", until)
+        add("activities.timestamp <= $$", _parse_iso_timestamp(until, "until"))
 
     # "mode" filters by the environment the call actually came from
     # (X-App-Env → activities.app_env), NOT by the customer's hand-set
