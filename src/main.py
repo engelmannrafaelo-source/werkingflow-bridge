@@ -2926,7 +2926,7 @@ async def chat_completions(
         if not request_body.stream:
             try:
                 from src.providers.fallback import (
-                    is_retryable_error, record_failure, record_success,
+                    is_retryable_error, is_breaker_failure, record_failure, record_success,
                     get_fallback_tiers, FALLBACK_DELAY_SECONDS,
                 )
                 import asyncio
@@ -2934,7 +2934,10 @@ async def chat_completions(
                 primary_tier = request_body.provider_tier or "claude-premium"
 
                 if is_retryable_error(e):
-                    record_failure(primary_tier, str(e)[:200])
+                    # Trip the breaker ONLY on genuine brokenness — a 429/throttle is
+                    # retryable (we fall back) but must not pin the provider "down".
+                    if is_breaker_failure(e):
+                        record_failure(primary_tier, str(e)[:200])
                     fallback_tiers = get_fallback_tiers(primary_tier)[1:]  # Skip primary
 
                     for fallback_tier in fallback_tiers:
@@ -5264,7 +5267,11 @@ async def bridge_error_handler(request: Request, exc: BridgeError):
         import asyncio as _fb_asyncio
 
         primary_tier = cached_body.get("provider_tier") or "claude-premium"
-        _fb_fail(primary_tier, f"dep_bridge_error: {err_type}")
+        # Do NOT record_failure here: an adaptive-limiter dep_bridge_error is a
+        # throttle/capacity signal, not provider brokenness. Recording it pinned
+        # the provider "down" in /health forever (transient throttle → marked
+        # down → no success to reset → no time-decay). Same fix as the worker
+        # rate-limit path above. The fallback below still runs.
         fallback_chain = _fb_tiers(primary_tier)[1:]  # skip primary
         if not fallback_chain:
             return exc.response  # nothing to try

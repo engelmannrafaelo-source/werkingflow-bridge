@@ -41,6 +41,17 @@ FALLBACK_CHAINS: dict[str, list[str]] = {
 # HTTP status codes that trigger a fallback attempt
 RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
 
+# Status codes that mean the provider is genuinely BROKEN (≠ rate-limited). A 429
+# is a capacity/throttle signal, NOT brokenness — see is_breaker_failure.
+BREAKER_FAILURE_STATUS_CODES = {500, 502, 503, 504}
+
+# Circuit-breaker: a provider is "down" at/above this many consecutive genuine
+# failures; with no fresh failure for RECOVERY_SECONDS it self-heals. Without
+# time-based decay a transient blip pinned a provider "down" until process
+# restart (the deadlock the comments below describe).
+BREAKER_DOWN_THRESHOLD = 3
+BREAKER_RECOVERY_SECONDS = 120
+
 # Delay between fallback attempts (seconds)
 FALLBACK_DELAY_SECONDS = 1.5
 
@@ -61,7 +72,12 @@ class ProviderHealth:
     def status(self) -> str:
         if self.consecutive_failures == 0:
             return "up"
-        if self.consecutive_failures < 3:
+        # Self-heal: once the recovery window has elapsed since the last error,
+        # report recovered. A non-decaying failure count would pin a provider
+        # "down" forever after a transient blip, with no success to reset it.
+        if self.last_error is not None and (time.time() - self.last_error) >= BREAKER_RECOVERY_SECONDS:
+            return "up"
+        if self.consecutive_failures < BREAKER_DOWN_THRESHOLD:
             return "degraded"
         return "down"
 
@@ -85,9 +101,18 @@ def record_success(tier_id: str) -> None:
 
 
 def record_failure(tier_id: str, error_msg: str) -> None:
-    """Record a failed call to a provider."""
+    """Record a GENUINE provider failure (brokenness only).
+
+    Callers MUST gate on is_breaker_failure — rate-limits / throttles must never
+    reach here, or they pin the provider "down" (see is_breaker_failure).
+    """
     health = get_provider_health(tier_id)
-    health.last_error = time.time()
+    now = time.time()
+    # Decay a stale streak so a fresh failure after a long quiet period starts a
+    # new streak instead of resuming an old "down" state.
+    if health.last_error is not None and (now - health.last_error) >= BREAKER_RECOVERY_SECONDS:
+        health.consecutive_failures = 0
+    health.last_error = now
     health.last_error_msg = error_msg
     health.consecutive_failures += 1
 
@@ -163,6 +188,30 @@ def is_retryable_error(error: Exception) -> bool:
     if isinstance(error, RuntimeError):
         msg = str(error).lower()
         return any(code in msg for code in ["429", "500", "502", "503", "504", "timeout"])
+
+
+def is_breaker_failure(error: Exception) -> bool:
+    """Whether an error means the provider is genuinely BROKEN (trips the breaker).
+
+    DISTINCT from is_retryable_error: a 429 / throttle (or token exhaustion) is
+    retryable — we still fall back — but it must NOT trip the circuit breaker.
+    Recording a rate-limit as a failure was the deadlock that pinned
+    claude-premium "down" forever: marked down on a transient throttle, no
+    success to reset it, no time-based recovery. Only 5xx / connection / timeout
+    count as brokenness.
+    """
+    if isinstance(error, AllTokensExhausted):
+        return False  # capacity exhaustion, not brokenness
+    if isinstance(error, ProviderError):
+        return error.status_code in BREAKER_FAILURE_STATUS_CODES  # excludes 429
+    if isinstance(error, (httpx.ConnectError, httpx.ConnectTimeout, httpx.ReadTimeout)):
+        return True
+    if isinstance(error, RuntimeError):
+        msg = str(error).lower()
+        if "429" in msg or "throttle" in msg or "rate limit" in msg or "rate-limit" in msg:
+            return False
+        return any(code in msg for code in ["500", "502", "503", "504", "timeout", "connection"])
+    return False
 
     return False
 
