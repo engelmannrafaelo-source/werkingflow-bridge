@@ -4384,6 +4384,46 @@ async def convert_html_to_docx_endpoint(
         )
 
 
+@app.post("/v1/convert-html-to-pdf")
+async def convert_html_to_pdf_endpoint(
+    request: Request,
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(security)
+):
+    """Render HTML to PDF via headless Chromium. Proxied to privacy-pdf-service.
+
+    Shared server-side PDF renderer for all report apps — same Chromium engine +
+    print flags as the engelmann local renderer, centralized so Vercel apps (which
+    cannot bundle Chromium) get identical full-bleed PDF output.
+    """
+    await verify_api_key(request, credentials)
+
+    try:
+        body = await request.json()
+        if not isinstance(body, dict) or not body.get("html"):
+            return JSONResponse(
+                status_code=400,
+                content={"status": "error", "error": "Request body must be JSON with 'html' field."}
+            )
+
+        privacy_client = get_privacy_client()
+        client = await privacy_client._get_client()
+
+        response = await client.post(
+            "/convert-html-to-pdf",
+            json=body,
+            timeout=600.0,
+        )
+        response.raise_for_status()
+        return JSONResponse(content=response.json())
+
+    except Exception as e:
+        logger.error(f"HTML-to-PDF proxy failed: {e}", exc_info=True)
+        return JSONResponse(
+            status_code=500,
+            content={"status": "error", "error": f"HTML-to-PDF conversion failed: {str(e)}"}
+        )
+
+
 @app.post("/v1/convert-pdf-to-html-direct")
 async def convert_pdf_to_html_direct_endpoint(
     request: Request,

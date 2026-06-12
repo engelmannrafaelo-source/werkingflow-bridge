@@ -63,6 +63,17 @@ converter = DocumentConverter(format_options={InputFormat.PDF: PdfFormatOption(p
 print('Docling models downloaded successfully') \
 " || echo "WARNING: Docling model pre-download failed (will download on first use)"
 
+# Playwright + Chromium für den HTML→PDF-Renderer (/convert-html-to-pdf).
+# Per pip installiert (NICHT via poetry), um die committete poetry.lock NICHT
+# neu aufzulösen — ein `poetry lock` hat docling/torch schon auf einen kaputten
+# CUDA-13-Build gedriftet (siehe oben). Das Browser-Binary geht nach
+# /ms-playwright (ENV persistiert → der non-root 'claude'-Runtime-User findet es);
+# --with-deps installiert die Chromium-OS-Libs via apt (braucht root, hier noch root).
+ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
+RUN poetry run pip install --no-cache-dir playwright==1.49.1 && \
+    poetry run playwright install --with-deps chromium && \
+    chmod -R a+rx /ms-playwright
+
 # Set ownership
 RUN chown -R claude:claude /app /home/claude
 

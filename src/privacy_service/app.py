@@ -983,6 +983,94 @@ async def convert_html_to_docx_endpoint(request: Request):
     })
 
 
+@app.post("/convert-html-to-pdf")
+async def convert_html_to_pdf_endpoint(request: Request):
+    """Render HTML → PDF via headless Chromium (Playwright).
+
+    Accepts JSON body: { "html": "<html>…</html>", "filename": "input.html" (optional) }.
+    Returns PDF as base64 + byte length.
+
+    Uses the SAME Chromium print path as the engelmann local renderer
+    (prefer_css_page_size + print_background + margin 0): the document's own
+    @page rules fully control page size/margins, so a self-contained Muster
+    with a full-bleed cover (@page :first { margin: 0 }) renders 1:1. This is
+    the shared server-side PDF renderer for all report apps — no per-app
+    Chromium bundling needed (Vercel-Lambdas können kein Chromium tragen).
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse(
+            status_code=400,
+            content={"status": "error", "error": "Invalid JSON body."},
+        )
+
+    html = body.get("html")
+    if not isinstance(html, str) or not html.strip():
+        return JSONResponse(
+            status_code=400,
+            content={"status": "error", "error": "Missing or empty 'html' field."},
+        )
+
+    MAX_HTML_BYTES = 50 * 1024 * 1024  # 50 MB
+    html_bytes = html.encode("utf-8")
+    if len(html_bytes) > MAX_HTML_BYTES:
+        return JSONResponse(
+            status_code=400,
+            content={"status": "error", "error": f"HTML too large: {len(html_bytes) / 1024 / 1024:.1f} MB. Maximum: 50 MB."},
+        )
+
+    try:
+        from playwright.async_api import async_playwright
+    except Exception as e:
+        logger.error(f"[HTML→PDF] Playwright import failed: {e}", exc_info=True)
+        return JSONResponse(
+            status_code=500,
+            content={"status": "error", "error": "Playwright/Chromium not installed on privacy-pdf-service."},
+        )
+
+    logger.info(f"[HTML→PDF] Starting Chromium render ({len(html_bytes) / 1024:.1f} KB)")
+    t_start = _time.time()
+
+    try:
+        async with async_playwright() as pw:
+            # --no-sandbox + --disable-gpu: Container läuft als non-root ohne GPU
+            # (gleiche Args wie der engelmann-puppeteer-Renderer).
+            browser = await pw.chromium.launch(
+                headless=True,
+                args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage", "--disable-gpu"],
+            )
+            try:
+                page = await browser.new_page()
+                # networkidle: auf @font-face/@import-Fonts + Bilder warten, sonst
+                # druckt der erste Versuch mit Fallback-Font.
+                await page.set_content(html, wait_until="networkidle")
+                pdf_bytes = await page.pdf(
+                    format="A4",
+                    print_background=True,
+                    prefer_css_page_size=True,
+                    margin={"top": "0", "right": "0", "bottom": "0", "left": "0"},
+                )
+            finally:
+                await browser.close()
+    except Exception as e:
+        logger.error(f"[HTML→PDF] Chromium render failed: {e}", exc_info=True)
+        return JSONResponse(
+            status_code=502,
+            content={"status": "error", "error": f"PDF render failed: {str(e)}"},
+        )
+
+    duration = _time.time() - t_start
+    logger.info(f"[HTML→PDF] Done: {len(pdf_bytes)} bytes PDF in {duration:.1f}s")
+
+    return JSONResponse(content={
+        "status": "success",
+        "pdf_base64": base64.b64encode(pdf_bytes).decode("ascii"),
+        "size_bytes": len(pdf_bytes),
+        "cost": 0,
+    })
+
+
 @app.post("/convert-pdf-to-html-direct")
 async def convert_pdf_to_html_direct_endpoint(request: Request):
     """Convert PDF → HTML (pixel-perfect, direct) via ConvertAPI.
