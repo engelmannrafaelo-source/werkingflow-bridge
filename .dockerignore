@@ -60,3 +60,15 @@ temp/
 tmp/
 *.tmp
 .wrapper-*.pid
+
+# Postgres backup dumps — bridge-postgres-backup.sh schreibt mehrere hundert MB
+# .sql.gz nach backups/ (zuletzt ~9.8 GB). Ohne diesen Ausschluss kopiert
+# `COPY . /app` sie in JEDES Image → der Build-Context + jedes Image-Layer
+# bläht sich um Gigabytes, /var/lib/docker läuft voll und Builds sterben
+# mitten drin auf "no space left on device" (passiert 2026-06, brach worker3 +
+# verhinderte sogar den Rollback). Backups gehören nie in ein App-Image.
+backups/
+*.sql.gz
+*.bak
+*.bak-*
+*.bak2

@@ -191,6 +191,23 @@ phase_preflight() {
     fi
     info "SSH OK"
 
+    # Reclaim disk BEFORE the build. Every deploy rebuilds --no-cache, which
+    # orphans the previous same-tag image (→ dangling) and leaves build cache;
+    # across a few deploys /var/lib/docker fills until a build dies mid-way on
+    # "no space left on device" (observed 2026-06 — broke a worker build AND
+    # its rollback, requiring manual recovery). Prune here so the disk check
+    # below sees the real free space. Safe: dangling images are orphaned, build
+    # cache is reclaimable, rollback rebuilds from code (never reuses an old
+    # image). Non-fatal — a prune hiccup must never block a deploy.
+    if [[ "$DRY_RUN" == "false" ]]; then
+        info "Reclaiming disk (dangling images + build cache)..."
+        local prune_out
+        prune_out=$(rssh "$host" "docker image prune -f >/dev/null 2>&1; docker builder prune -af 2>&1 | tail -1" 2>&1 || true)
+        info "  ${prune_out:-prune done}"
+    else
+        info "[DRY-RUN] Would prune dangling images + build cache before build"
+    fi
+
     # Disk space (need ≥ 5 GB free on /var/lib/docker)
     info "Disk space check..."
     local free_kb
