@@ -118,6 +118,7 @@ except ImportError:
 # removed). Marked for full removal once consumers migrate to the new
 # endpoints (/v1/metrics/limiter-trajectory, /v1/metrics/upstream-health).
 from src.request_limiter import get_limiter
+from src.api_auth import require_service_token, AuthClaims
 # Adaptive token-budget limiter (replaces static MAX_CONCURRENT_REQUESTS gating)
 from src.middleware.adaptive_limiter import (
     adaptive_limit_dependency,
@@ -3881,8 +3882,15 @@ async def health_check(request: Request):
 
 
 @app.post("/health/reset")
-async def reset_provider_health_endpoint(request: Request):
+async def reset_provider_health_endpoint(
+    request: Request,
+    _claims: AuthClaims = Depends(require_service_token),
+):
     """Reset provider health counters (clears consecutive_failures deadlocks).
+
+    Service-token only: this is an admin mutation that clears breaker state, so
+    it MUST NOT be reachable unauthenticated (GET /health stays public for nginx;
+    only this POST mutation is gated). Missing token → 401 (fail fast).
 
     Body (optional): {"provider": "claude-premium"} to reset a specific provider.
     Empty body or {} resets all providers.
