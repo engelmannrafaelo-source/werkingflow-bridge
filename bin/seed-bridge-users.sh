@@ -473,6 +473,29 @@ if not plan_id:
     print(f"  [warn]  No plan configured for app '${APP}' — skipping billing provision")
     sys.exit(0)
 
+# Is this app's plan slot-based (interval='project', e.g. energy-project)? Such plans
+# gate real job-creation on manual_project_credits SLOTS that only exist after a
+# RELEASED order (no Mollie in test). A provisioned subscription does NOT grant slots,
+# so without seeding them every project-plan test user is correctly NO_CREDITS and all
+# credit-gated scenarios are untestable. Read the LIVE plan (DB truth) — no hardcoding.
+# Fail-loud: a plans-fetch error must not silently skip the slot seeding below.
+plan_interval = None
+try:
+    _pr = requests.get('${BRIDGE_URL}/v1/billing/plans', headers=headers, timeout=15)
+    if _pr.status_code != 200:
+        print(f"  [FAIL]  GET /v1/billing/plans HTTP {_pr.status_code}", file=sys.stderr)
+        sys.exit(1)
+    _raw = _pr.json()
+    _items = _raw.get('plans') if isinstance(_raw, dict) and 'plans' in _raw else (
+        list(_raw.values()) if isinstance(_raw, dict) else _raw)
+    for _p in (_items or []):
+        if isinstance(_p, dict) and _p.get('id') == plan_id:
+            plan_interval = _p.get('interval')
+            break
+except requests.RequestException as e:
+    print(f"  [FAIL]  GET /v1/billing/plans failed: {e}", file=sys.stderr)
+    sys.exit(1)
+
 # Pre-fetch user IDs (email -> id)
 user_ids = {}
 offset = 0
@@ -497,6 +520,7 @@ while True:
     offset += 200
 
 TEST_TOPUP_EUR = 500.0  # generous test credit
+TEST_PROJECT_SLOTS = 50  # generous project-credit slots for slot-based (interval='project') plans
 
 ok = True
 for key, u in users.items():
@@ -548,6 +572,67 @@ for key, u in users.items():
     else:
         print(f"  [FAIL]  User {key}: topup HTTP {r.status_code} — {r.text}", file=sys.stderr)
         ok = False
+
+    # 3. Project-credit SLOTS — ONLY for slot-based (interval='project') plans.
+    #    Mirrors a real purchase: create a pending order, then release it (operator),
+    #    which is the one path that INSERTs manual_project_credits — the slots the
+    #    job-creation gate (canCreateProject) actually checks. Idempotent: skip when
+    #    the user already has available slots so repeated seeds don't pile up.
+    if plan_interval == 'project':
+        try:
+            cr = requests.get(
+                f'${BRIDGE_URL}/v1/users/{uid}/project-credits',
+                headers=headers, timeout=15,
+            )
+        except requests.RequestException as e:
+            print(f"  [FAIL]  User {key}: project-credit check error — {e}", file=sys.stderr)
+            ok = False
+            continue
+        has_slots = cr.status_code == 200 and any(
+            c.get('available', 0) > 0
+            for c in cr.json().get('credits', [])
+            if c.get('planId') == plan_id
+        )
+        if has_slots:
+            print(f"  [ok]    Project-credits already present ({plan_id}): {key}")
+            continue
+        # create pending order (X-User-ID = the user we order for)
+        try:
+            co = requests.post(
+                '${BRIDGE_URL}/v1/billing/order/invoice',
+                json={'planId': plan_id, 'quantity': TEST_PROJECT_SLOTS},
+                headers={**headers, 'X-User-ID': uid},
+                timeout=20,
+            )
+        except requests.RequestException as e:
+            print(f"  [FAIL]  User {key}: order create error — {e}", file=sys.stderr)
+            ok = False
+            continue
+        if co.status_code not in (200, 201):
+            print(f"  [FAIL]  User {key}: order create HTTP {co.status_code} — {co.text}", file=sys.stderr)
+            ok = False
+            continue
+        order_id = co.json().get('id') or co.json().get('orderId')
+        if not order_id:
+            print(f"  [FAIL]  User {key}: order create returned no id — {co.text}", file=sys.stderr)
+            ok = False
+            continue
+        # release it → INSERT manual_project_credits slots
+        try:
+            rel = requests.post(
+                f'${BRIDGE_URL}/v1/admin/orders/{order_id}/release',
+                json={'note': 'test-seed project credits (seed-bridge-users.sh)'},
+                headers=headers, timeout=20,
+            )
+        except requests.RequestException as e:
+            print(f"  [FAIL]  User {key}: order release error — {e}", file=sys.stderr)
+            ok = False
+            continue
+        if rel.status_code in (200, 201):
+            print(f"  [ok]    Project-credits +{TEST_PROJECT_SLOTS} slots ({plan_id}): {key}")
+        else:
+            print(f"  [FAIL]  User {key}: order release HTTP {rel.status_code} — {rel.text}", file=sys.stderr)
+            ok = False
 
 sys.exit(0 if ok else 1)
 PYEOF
