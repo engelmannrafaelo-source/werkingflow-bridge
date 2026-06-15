@@ -20,6 +20,12 @@
 
 set -euo pipefail
 
+# Reap our own children (the `python3 - <<PYEOF` blocks) if this script is
+# interrupted or killed. Without this, an aborted run leaves the python child
+# orphaned to systemd, where it can keep hammering the Bridge — the root of the
+# /v1/users offset-flood incident (paired with the endpoint + safety-cap fixes).
+trap 'pkill -P $$ 2>/dev/null || true' EXIT INT TERM
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 APPS_ROOT="/root/projekte/werkingflow-production/apps"
 
