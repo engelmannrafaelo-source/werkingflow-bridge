@@ -44,6 +44,7 @@ async def _deduct_call_cost(
     app_id: str,
     cost_eur_amount: float,
     workflow_id: Optional[str] = None,
+    tenant_id: Optional[str] = None,
 ) -> None:
     """
     Post-call budget deduction — best-effort, never raises.
@@ -54,11 +55,13 @@ async def _deduct_call_cost(
     something to gate against. A failure here degrades to "no deduction"
     (the prior behaviour) — it can never break the user-facing call.
 
-    Project-interval plans (e.g. Energy) draw from a strictly per-project
-    budget keyed by project_id (== workflow_id), allocated when the project's
-    slot was consumed. If that budget exists it is used; otherwise the call
-    falls back to the monthly tenant budget (legacy / in-flight projects, or a
-    call with no workflow_id) so nothing regresses during rollout.
+    Routing by plan interval:
+    - interval='project' (e.g. Energy): draw from a strictly per-project budget
+      keyed by project_id (== workflow_id). It self-provisions on the project's
+      first call (lazy allocation — the entitling slot was already consumed by
+      the app). Project plans NEVER touch the monthly budget.
+    - interval='month' (Report, Engelmann, ...): draw from the monthly tenant
+      budget as before.
     """
     try:
         import uuid as _uuid
@@ -73,18 +76,34 @@ async def _deduct_call_cost(
         except (ValueError, AttributeError, TypeError):
             return
 
-        if plan.interval == "project" and workflow_id:
+        if plan.interval == "project":
+            # Project plans are fully per-project; they never fall through to the
+            # monthly budget (a real project customer may have no monthly budget).
+            if not workflow_id:
+                logger.warning(
+                    "post-call deduction: project plan %s call without workflow_id "
+                    "for user=%s — cannot attribute to a project budget, skipping",
+                    plan.id, user_id,
+                )
+                return
             from src.billing.project_budgets_service import deduct as _deduct_project
 
-            result = await _deduct_project(uid, plan.id, workflow_id, cost_eur_amount)
-            if result.get("exists"):
-                return  # drawn from the per-project budget — done
-            logger.warning(
-                "post-call deduction: no per-project budget for project=%s plan=%s "
-                "user=%s — falling back to monthly budget (slot consumed without "
-                "project_id, or pre-feature project)",
-                workflow_id, plan.id, user_id,
+            result = await _deduct_project(
+                uid,
+                plan.id,
+                workflow_id,
+                cost_eur_amount,
+                allocate_limit_eur=float(plan.api_budget_eur),
+                tenant_id=tenant_id,
             )
+            if not result.get("exists"):
+                logger.warning(
+                    "post-call deduction: could not resolve/allocate per-project "
+                    "budget for project=%s plan=%s user=%s (tenant_id=%r) — call "
+                    "NOT metered against any budget",
+                    workflow_id, plan.id, user_id, tenant_id,
+                )
+            return
 
         try:
             await apply_budget_deduction(uid, plan.id, cost_eur_amount)
@@ -129,6 +148,11 @@ async def persist_ai_call_activity(
         cost_eur(model, input_tokens, output_tokens)
         if status == "success" else 0.0
     )
+
+    # Resolved from the user row inside the DB block below; initialised here so
+    # the post-call deduction (which runs after that block, even if it failed)
+    # can always pass it to _deduct_call_cost without a NameError.
+    tenant_id: Optional[str] = None
 
     # Diagnostic: surface apps that fail to send X-App-Env so the Platform
     # Admin "mode" filter (which depends on app_env) stops being blind.
@@ -307,4 +331,4 @@ async def persist_ai_call_activity(
     # the activity row is the usage source of truth, the deduction is the
     # running budget tally. Best-effort — _deduct_call_cost never raises.
     if user_id and app_id and call_cost_eur > 0:
-        await _deduct_call_cost(user_id, app_id, call_cost_eur, workflow_id)
+        await _deduct_call_cost(user_id, app_id, call_cost_eur, workflow_id, tenant_id)

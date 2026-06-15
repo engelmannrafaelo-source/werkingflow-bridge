@@ -145,14 +145,24 @@ async def deduct(
     plan_id: str,
     project_id: str,
     cost_eur: float,
+    *,
+    allocate_limit_eur: Optional[float] = None,
+    tenant_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Atomically draw `cost_eur` from a project's budget.
 
     Returns {exists, deductedEur, usedEur, remainingEur}. `exists=False` means
-    no budget row — nothing deducted (the caller logs the gap). The actual
-    deduction is capped at the remaining budget so used_eur never exceeds
-    limit_eur (matching the DB CHECK constraint); over-spend beyond the cap is
-    absorbed silently here because the call already happened.
+    no budget row and no allocation was requested — nothing deducted (the caller
+    logs the gap). The deduction is capped at the remaining budget so used_eur
+    never exceeds limit_eur (matching the DB CHECK constraint); over-spend beyond
+    the cap is absorbed silently here because the call already happened.
+
+    Lazy allocation: when the budget row is missing and both `allocate_limit_eur`
+    and `tenant_id` are given, the row is created in-transaction (idempotent on
+    conflict) and then drawn from. This is how a project's budget
+    self-provisions on its first LLM call — keyed by project_id (== attribution
+    workflow_id) — since the slot that entitles the project was already consumed
+    by the app.
     """
     amount = _eur(cost_eur)
     if amount <= 0:
@@ -176,6 +186,34 @@ async def deduct(
                 plan_id,
                 project_id,
             )
+            if row is None and allocate_limit_eur is not None and tenant_id is not None:
+                # Lazy-allocate this project's budget, then lock+read it. The
+                # INSERT is idempotent; a concurrent first-call serialises on the
+                # subsequent SELECT ... FOR UPDATE so neither double-deducts.
+                await conn.execute(
+                    """
+                    INSERT INTO project_budgets
+                        (user_id, tenant_id, plan_id, project_id, limit_eur, used_eur)
+                    VALUES ($1, $2, $3, $4, $5, 0)
+                    ON CONFLICT (user_id, plan_id, project_id) DO NOTHING
+                    """,
+                    user_id,
+                    tenant_id,
+                    plan_id,
+                    project_id,
+                    _eur(allocate_limit_eur),
+                )
+                row = await conn.fetchrow(
+                    """
+                    SELECT limit_eur, used_eur
+                      FROM project_budgets
+                     WHERE user_id = $1 AND plan_id = $2 AND project_id = $3
+                       FOR UPDATE
+                    """,
+                    user_id,
+                    plan_id,
+                    project_id,
+                )
             if row is None:
                 return {"exists": False, "deductedEur": 0.0, "usedEur": 0.0, "remainingEur": 0.0}
 

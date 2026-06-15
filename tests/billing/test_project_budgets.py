@@ -165,3 +165,49 @@ async def test_deduct_zero_cost_noop_with_state():
     with patch(PG, return_value=pool):
         r = await deduct(uuid.uuid4(), "energy-project", "Proj_1", 0.0)
     assert r["exists"] is True and r["deductedEur"] == 0.0 and r["remainingEur"] == 60.0
+
+
+@pytest.mark.asyncio
+async def test_deduct_lazy_allocates_when_missing():
+    # 1st FOR UPDATE → None (no budget yet); after the INSERT, 2nd FOR UPDATE
+    # returns the freshly-allocated row → deduct draws from it.
+    conn = AsyncMock()
+    conn.execute = AsyncMock(return_value=None)
+    conn.fetchrow = AsyncMock(
+        side_effect=[None, {"limit_eur": Decimal("100"), "used_eur": Decimal("0")}]
+    )
+
+    @asynccontextmanager
+    async def _acquire():
+        yield conn
+
+    @asynccontextmanager
+    async def _transaction():
+        yield
+
+    conn.transaction = _transaction
+    pool = MagicMock()
+    pool.acquire = _acquire
+
+    with patch(PG, return_value=pool):
+        r = await deduct(
+            uuid.uuid4(), "energy-project", "Proj_X", 3.0,
+            allocate_limit_eur=100.0, tenant_id="t",
+        )
+    assert r["exists"] is True
+    assert r["deductedEur"] == 3.0
+    assert r["usedEur"] == 3.0
+    assert r["remainingEur"] == 97.0
+    assert conn.execute.await_count >= 1  # INSERT (alloc) + UPDATE (deduct)
+
+
+@pytest.mark.asyncio
+async def test_deduct_no_lazy_alloc_without_tenant():
+    # Missing row + allocate_limit but no tenant_id → cannot allocate → noop.
+    pool, _ = _mock_pool(fetchrow_result=None)
+    with patch(PG, return_value=pool):
+        r = await deduct(
+            uuid.uuid4(), "energy-project", "Proj_X", 3.0,
+            allocate_limit_eur=100.0, tenant_id=None,
+        )
+    assert r == {"exists": False, "deductedEur": 0.0, "usedEur": 0.0, "remainingEur": 0.0}

@@ -58,10 +58,11 @@ async def enforce_budget(
     Returns None (lets the call proceed) in every other case.
 
     For project-interval plans (e.g. Energy) the budget is per project
-    (keyed by project_id == attribution workflow_id). When a per-project
-    budget exists it gates the call; if none exists yet (legacy / in-flight
-    project, or a call without project_id) the gate falls back to the monthly
-    tenant budget so nothing regresses during rollout.
+    (keyed by project_id == attribution workflow_id). When a per-project budget
+    exists it gates the call; if none exists yet (the project's first call) the
+    call is allowed — the entitling slot was already consumed by the app and the
+    post-call deduction lazily allocates the budget. Project plans never gate on
+    the monthly tenant budget.
     """
     # No user / no app → not a user-budgeted call (internal job). Let through.
     if not user_id or not app_id:
@@ -106,7 +107,11 @@ async def enforce_budget(
                     "message": "Projekt-Budget aufgebraucht. Bitte ein neues Projekt-Paket buchen.",
                 },
             )
-        # No per-project budget yet → fall through to the monthly budget.
+        # Not allocated yet (the project's first call). The entitling slot was
+        # already consumed by the app, and the post-call deduction lazily
+        # allocates this project's budget — let the first call through. Project
+        # plans never gate on the monthly tenant budget.
+        return
 
     try:
         result = await evaluate_budget(uid, plan.id, estimated_cost_eur)
