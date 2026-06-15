@@ -330,6 +330,41 @@ while True:
               file=sys.stderr)
         sys.exit(1)
 
+def _verify_user_exists(email):
+    """GET-verify a single user by email via a fresh paginated /v1/users scan.
+
+    Returns the user dict if the Bridge actually holds the row, else None.
+    Used to disambiguate a 500 from POST /v1/users that may have created the
+    user anyway (see the 500-handling branch in the create loop). Reuses the
+    same pagination + offset safety-cap pattern as the pre-fetch above; the
+    pre-fetched `existing` dict is NOT consulted because a 500-but-created row
+    is created DURING this run, after the pre-fetch already ran.
+    """
+    target = email.lower()
+    off = 0
+    while True:
+        try:
+            vr = requests.get('${BRIDGE_URL}/v1/users', params={'limit': 200, 'offset': off},
+                              headers=headers, timeout=15)
+        except requests.RequestException as e:
+            print(f"  [FAIL]  500-verify GET /v1/users failed: {e}", file=sys.stderr)
+            return None
+        if vr.status_code != 200:
+            print(f"  [FAIL]  500-verify GET /v1/users HTTP {vr.status_code}", file=sys.stderr)
+            return None
+        pg = vr.json()
+        if not pg:
+            return None
+        for x in pg:
+            if x['email'].lower() == target:
+                return x
+        if len(pg) < 200:
+            return None
+        off += 200
+        if off > 100000:
+            print(f"  [FAIL]  500-verify paginated past offset {off} — aborting", file=sys.stderr)
+            return None
+
 created = reconciled = 0
 for key, u in users.items():
     tenant_id = _canonical_tenant(u)
@@ -384,6 +419,30 @@ for key, u in users.items():
             print(f"  [ok]    Reconciled password/role/tenant: {key} ({u['email']}){tenant_note}")
         else:
             print(f"  [FAIL]  User {key}: reconcile PATCH HTTP {pr.status_code} — {pr.text}", file=sys.stderr)
+            ok = False
+    elif r.status_code == 500:
+        # Known Bridge create-hook bug: POST /v1/users can return 500 AFTER the
+        # users row is already committed (a post-insert step fails post-commit,
+        # see src/db/admin_routes.py create_user — any non-unique PostgresError
+        # surfaces as a generic 500). The 500 is therefore AMBIGUOUS: the user
+        # may well exist. Verify the REAL state with a fresh GET before treating
+        # it as fatal (validation-before-fail — NOT a silent fallback): only a
+        # genuinely-absent user is a real error. This unblocks repeatable runs
+        # of the DSGVO delete user (e.g. gdpr-delete@energy-test.com), which is
+        # re-created after every deletion test and otherwise fails the whole
+        # seed at this 500 even though login + delete prove the user exists.
+        #
+        # ROOT FIX is Bridge-lane (POST /v1/users must not 500 when it actually
+        # created the user — the post-insert path in create_user) and has been
+        # routed to Rafael. This seeder-side GET-verify is the defensive guard.
+        verified = _verify_user_exists(u['email'])
+        if verified:
+            created += 1
+            print(f"  [warn]  Bridge 500-but-created, known Bridge create-hook bug "
+                  f"— user verified present, continuing: {key} ({u['email']}) → tenant={tenant_id}")
+        else:
+            print(f"  [FAIL]  User {key}: HTTP 500 and user NOT present on GET-verify "
+                  f"— real failure — {r.text}", file=sys.stderr)
             ok = False
     else:
         print(f"  [FAIL]  User {key}: HTTP {r.status_code} — {r.text}", file=sys.stderr)
