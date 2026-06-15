@@ -13,7 +13,7 @@ Fail-fast:
 from __future__ import annotations
 
 import uuid
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from src.db.client import get_pool
 
@@ -70,20 +70,29 @@ async def list_user_credits(user_id: uuid.UUID) -> List[Dict[str, Any]]:
     ]
 
 
-async def consume_credit(user_id: uuid.UUID, plan_id: str) -> Dict[str, Any]:
+async def consume_credit(
+    user_id: uuid.UUID, plan_id: str, project_id: Optional[str] = None
+) -> Dict[str, Any]:
     """
     Decrement available credit by 1 (FIFO: oldest row first).
 
     Uses SELECT ... FOR UPDATE in a transaction to prevent concurrent double-consume.
     Raises CreditsExhaustedError if no available credit exists.
     Returns the consumed credit row for audit logging.
+
+    When `project_id` is given, the consumed slot's per-project API budget is
+    allocated in the SAME transaction (atomic: a project gets exactly its
+    plan.api_budget_eur the moment its slot is consumed). Allocation is
+    idempotent, so a retried job-create never double-allocates. Omitting
+    project_id keeps the legacy behaviour (slot only; the budget then falls
+    back to the monthly tenant budget downstream).
     """
     pool = get_pool()
     async with pool.acquire() as conn:
         async with conn.transaction():
             row = await conn.fetchrow(
                 """
-                SELECT id, plan_id, quantity, used, granted_at, order_id
+                SELECT id, plan_id, tenant_id, quantity, used, granted_at, order_id
                   FROM manual_project_credits
                  WHERE user_id = $1
                    AND plan_id = $2
@@ -102,6 +111,22 @@ async def consume_credit(user_id: uuid.UUID, plan_id: str) -> Dict[str, Any]:
                 "UPDATE manual_project_credits SET used = used + 1 WHERE id = $1",
                 row["id"],
             )
+
+            if project_id:
+                # Allocate this project's API budget atomically with the slot.
+                from src.budget.plans import get_plan
+                from src.billing.project_budgets_service import allocate_budget
+
+                plan = get_plan(plan_id)
+                await allocate_budget(
+                    conn,
+                    user_id=user_id,
+                    tenant_id=row["tenant_id"],
+                    plan_id=plan_id,
+                    project_id=project_id,
+                    limit_eur=float(plan.api_budget_eur),
+                    credit_id=row["id"],
+                )
 
     return {
         "creditId": str(row["id"]),
