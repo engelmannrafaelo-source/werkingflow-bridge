@@ -779,6 +779,13 @@ log_success "App licenses granted"
 # User details are stored in apps/<app>/config/interactive-credentials.json
 # for the CUI Login-Add-In picker (tester:false → highlighted green). The
 # picker file is the SSoT for the credentials; this phase keeps Bridge in sync.
+#
+# Billing (Steps D–G, added 2026-06-15):
+#   D. Billing address  — PATCH idempotent; required before subscription provision.
+#   E. Subscription     — provision_subscription idempotent per plan; plans that
+#                         don't exist in the DB are skipped (fail-loud on fetch).
+#   F. Top-up credit    — additive (same as Phase 5); harmless on re-seed.
+#   G. Project slots    — idempotent guard (skip when slots already present).
 # ============================================================================
 phase_header 7 "UNIVERSAL INTERACTIVE USER"
 
@@ -895,6 +902,161 @@ for app_id in ALL_APP_IDS:
         print(f"  [ok]    app-license {verb}: {app_id}")
     else:
         print(f"  [FAIL]  app-license {app_id}: HTTP {r.status_code} — {r.text[:200]}", file=sys.stderr)
+        ok = False
+
+# Step D: billing address for interactive-user tenant (idempotent PATCH)
+# Required before subscription provisioning — provision_subscription rejects
+# tenants that have no complete billing address.
+try:
+    r = requests.patch(
+        f'${BRIDGE_URL}/v1/tenants/{INTERACTIVE_TENANT}/billing-address',
+        json={
+            'name':     'Interactive User (Rafael)',
+            'street':   'Teststraße 1',
+            'city':     'Wien',
+            'postcode': '1010',
+            'country':  'AT',
+        },
+        headers=headers,
+        timeout=15,
+    )
+except requests.RequestException as e:
+    print(f"  [FAIL]  Billing address PATCH error: {e}", file=sys.stderr)
+    sys.exit(1)
+if r.status_code == 200:
+    print(f"  [ok]    Billing address set: {INTERACTIVE_TENANT}")
+else:
+    print(f"  [FAIL]  Billing address HTTP {r.status_code}: {r.text[:200]}", file=sys.stderr)
+    sys.exit(1)
+
+# Step E: provision active subscriptions (one per billable plan that exists in DB).
+# Read live plan catalog — no hardcoding. Plans that don't exist in DB are skipped
+# (not an error: safety has no plan yet). provision_subscription is idempotent.
+#
+# INTERACTIVE_APP_PLANS mirrors Phase 5's APP_PLANS restricted to the interactive
+# user's apps. Update when new plans are added to the catalog.
+INTERACTIVE_APP_PLANS = {
+    'werking-report': 'report-standard',
+    'werking-energy': 'energy-project',
+    'werking-noise':  'noise-tbd',
+    'engelmann':      'engelmann-custom',
+    # werking-safety: plan 'safety-project' not yet in DB → omitted; add when available
+}
+try:
+    pr = requests.get('${BRIDGE_URL}/v1/billing/plans', headers=headers, timeout=15)
+    if pr.status_code != 200:
+        print(f"  [FAIL]  GET /v1/billing/plans HTTP {pr.status_code}", file=sys.stderr)
+        sys.exit(1)
+    raw = pr.json()
+    items = raw.get('plans') if isinstance(raw, dict) and 'plans' in raw else (
+        list(raw.values()) if isinstance(raw, dict) else raw)
+    live_plan_intervals = {p['id']: p.get('interval') for p in (items or []) if isinstance(p, dict)}
+except requests.RequestException as e:
+    print(f"  [FAIL]  GET /v1/billing/plans failed: {e}", file=sys.stderr)
+    sys.exit(1)
+
+TEST_TOPUP_EUR    = 500.0  # generous test credit
+TEST_PROJECT_SLOTS = 50   # generous project-credit slots for slot-based plans
+
+for app_id, plan_id in INTERACTIVE_APP_PLANS.items():
+    if plan_id not in live_plan_intervals:
+        print(f"  [warn]  Plan '{plan_id}' not in DB — skipping {app_id}")
+        continue
+    try:
+        r = requests.post(
+            '${BRIDGE_URL}/v1/billing/subscription/provision',
+            json={'userId': uid, 'planId': plan_id, 'seats': 1},
+            headers=headers,
+            timeout=15,
+        )
+    except requests.RequestException as e:
+        print(f"  [FAIL]  provision {plan_id}: {e}", file=sys.stderr)
+        ok = False
+        continue
+    if r.status_code in (200, 201):
+        status = r.json().get('status', '?')
+        print(f"  [ok]    Subscription {status} ({plan_id}): {app_id}")
+    else:
+        print(f"  [FAIL]  provision {plan_id}: HTTP {r.status_code} — {r.text[:200]}", file=sys.stderr)
+        ok = False
+
+# Step F: top-up credit — additive (same as Phase 5; harmless on re-seed)
+try:
+    r = requests.post(
+        '${BRIDGE_URL}/v1/budget/topup/credit',
+        json={'userId': uid, 'amountEur': TEST_TOPUP_EUR},
+        headers=headers,
+        timeout=15,
+    )
+except requests.RequestException as e:
+    print(f"  [FAIL]  Top-up request error: {e}", file=sys.stderr)
+    ok = False
+    r = None
+if r is not None:
+    if r.status_code == 200:
+        balance = r.json().get('newBalance', '?')
+        print(f"  [ok]    Top-up +EUR {TEST_TOPUP_EUR} → balance EUR {balance}")
+    else:
+        print(f"  [FAIL]  Top-up HTTP {r.status_code} — {r.text[:200]}", file=sys.stderr)
+        ok = False
+
+# Step G: project-credit SLOTS — only for slot-based (interval='project') plans.
+# Mirrors Phase 5 pattern: check existing → create order → release.
+# Idempotent guard: skip when any available slot already exists.
+for app_id, plan_id in INTERACTIVE_APP_PLANS.items():
+    if live_plan_intervals.get(plan_id) != 'project':
+        continue
+    try:
+        cr = requests.get(
+            f'${BRIDGE_URL}/v1/users/{uid}/project-credits',
+            headers=headers, timeout=15,
+        )
+    except requests.RequestException as e:
+        print(f"  [FAIL]  project-credits check ({plan_id}): {e}", file=sys.stderr)
+        ok = False
+        continue
+    has_slots = cr.status_code == 200 and any(
+        c.get('available', 0) > 0
+        for c in cr.json().get('credits', [])
+        if c.get('planId') == plan_id
+    )
+    if has_slots:
+        print(f"  [ok]    Project-credits already present ({plan_id}): {app_id}")
+        continue
+    try:
+        co = requests.post(
+            '${BRIDGE_URL}/v1/billing/order/invoice',
+            json={'planId': plan_id, 'quantity': TEST_PROJECT_SLOTS},
+            headers={**headers, 'X-User-ID': uid},
+            timeout=20,
+        )
+    except requests.RequestException as e:
+        print(f"  [FAIL]  order create ({plan_id}): {e}", file=sys.stderr)
+        ok = False
+        continue
+    if co.status_code not in (200, 201):
+        print(f"  [FAIL]  order create ({plan_id}): HTTP {co.status_code} — {co.text[:200]}", file=sys.stderr)
+        ok = False
+        continue
+    order_id = co.json().get('id') or co.json().get('orderId')
+    if not order_id:
+        print(f"  [FAIL]  order create ({plan_id}): no id in response — {co.text[:200]}", file=sys.stderr)
+        ok = False
+        continue
+    try:
+        rel = requests.post(
+            f'${BRIDGE_URL}/v1/admin/orders/{order_id}/release',
+            json={'note': 'test-seed project credits (interactive user, seed-bridge-users.sh)'},
+            headers=headers, timeout=20,
+        )
+    except requests.RequestException as e:
+        print(f"  [FAIL]  order release ({plan_id}): {e}", file=sys.stderr)
+        ok = False
+        continue
+    if rel.status_code in (200, 201):
+        print(f"  [ok]    Project-credits +{TEST_PROJECT_SLOTS} slots ({plan_id}): {app_id}")
+    else:
+        print(f"  [FAIL]  order release ({plan_id}): HTTP {rel.status_code} — {rel.text[:200]}", file=sys.stderr)
         ok = False
 
 sys.exit(0 if ok else 1)
