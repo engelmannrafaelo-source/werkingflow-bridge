@@ -113,6 +113,7 @@ _ALLOWED_APP_IDS = {
 @router.get("/v1/users")
 async def list_users(
     limit: int = Query(default=100, le=1000),
+    offset: int = Query(default=0, ge=0),
     account_type: Optional[str] = Query(
         default=None,
         description="Filter by tenant.account_type: customer|test|internal",
@@ -160,8 +161,9 @@ async def list_users(
     """
     if where:
         sql += " WHERE " + " AND ".join(where)
-    sql += f" ORDER BY u.created_at DESC LIMIT ${len(args) + 1}"
+    sql += f" ORDER BY u.created_at DESC LIMIT ${len(args) + 1} OFFSET ${len(args) + 2}"
     args.append(limit)
+    args.append(offset)
 
     pool = get_pool()
     async with pool.acquire() as conn:

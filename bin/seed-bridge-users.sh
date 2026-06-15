@@ -315,6 +315,14 @@ while True:
     if len(page) < 200:
         break
     offset += 200
+    # Safety cap: the user DB is small (thousands at most). If pagination runs
+    # past this, the server is ignoring 'offset' (infinite-page bug) — fail loud
+    # instead of looping forever and flooding the Bridge.
+    if offset > 100000:
+        print(f"  [FAIL]  /v1/users paginated past offset {offset} without terminating "
+              f"— server likely ignoring 'offset'. Aborting to avoid infinite flood.",
+              file=sys.stderr)
+        sys.exit(1)
 
 created = reconciled = 0
 for key, u in users.items():
@@ -421,6 +429,13 @@ while True:
     if len(page) < page_size:
         break
     offset += page_size
+    # Safety cap (see pre-fetch loop): fail loud if the server ignores 'offset'
+    # instead of looping forever and flooding the Bridge.
+    if offset > 100000:
+        print(f"  [FAIL]  /v1/users paginated past offset {offset} without terminating "
+              f"— server likely ignoring 'offset'. Aborting to avoid infinite flood.",
+              file=sys.stderr)
+        sys.exit(1)
 app_expected = expected_emails
 app_found    = app_expected & found_emails
 missing      = app_expected - found_emails
@@ -518,6 +533,14 @@ while True:
     if len(page) < 200:
         break
     offset += 200
+    # Safety cap: the user DB is small (thousands at most). If pagination runs
+    # past this, the server is ignoring 'offset' (infinite-page bug) — fail loud
+    # instead of looping forever and flooding the Bridge.
+    if offset > 100000:
+        print(f"  [FAIL]  /v1/users paginated past offset {offset} without terminating "
+              f"— server likely ignoring 'offset'. Aborting to avoid infinite flood.",
+              file=sys.stderr)
+        sys.exit(1)
 
 TEST_TOPUP_EUR = 500.0  # generous test credit
 TEST_PROJECT_SLOTS = 50  # generous project-credit slots for slot-based (interval='project') plans
@@ -692,6 +715,14 @@ while True:
     if len(page) < 200:
         break
     offset += 200
+    # Safety cap: the user DB is small (thousands at most). If pagination runs
+    # past this, the server is ignoring 'offset' (infinite-page bug) — fail loud
+    # instead of looping forever and flooding the Bridge.
+    if offset > 100000:
+        print(f"  [FAIL]  /v1/users paginated past offset {offset} without terminating "
+              f"— server likely ignoring 'offset'. Aborting to avoid infinite flood.",
+              file=sys.stderr)
+        sys.exit(1)
 
 ok = True
 for key, u in users.items():
