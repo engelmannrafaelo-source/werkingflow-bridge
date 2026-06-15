@@ -32,6 +32,26 @@ from src.billing.billing_service import (
 from src.db.client import get_pool
 
 
+class OrderNotReleasableError(ValueError):
+    """release_order() wurde auf einer Order aufgerufen, die NICHT im Status
+    'awaiting_payment' ist (z.B. bereits 'released', 'expired', 'cancelled').
+
+    Subklasse von ValueError für Rückwärtskompatibilität: bestehende
+    `except ValueError`-Handler (Admin-Release-Route → 409) fangen sie weiter.
+    Trägt `status`, damit Aufrufer (v.a. der Mollie-Webhook) einen
+    idempotenten Retry (status='released') von einer echten Anomalie
+    (status='expired'/'cancelled' → fail loud) unterscheiden können — ohne
+    fragiles String-Matching auf der Fehlermeldung.
+    """
+
+    def __init__(self, order_id: str, status: str) -> None:
+        self.order_id = order_id
+        self.status = status
+        super().__init__(
+            f"Order {order_id} is '{status}', only 'awaiting_payment' orders can be released"
+        )
+
+
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
@@ -400,10 +420,7 @@ async def release_order(
             if not order:
                 raise LookupError(f"Pending order {order_id} not found")
             if order["status"] != "awaiting_payment":
-                raise ValueError(
-                    f"Order {order_id} is '{order['status']}', "
-                    "only 'awaiting_payment' orders can be released"
-                )
+                raise OrderNotReleasableError(order_id, order["status"])
 
             plan = get_plan(order["plan_id"])
 
@@ -423,9 +440,10 @@ async def release_order(
                         order_uuid,
                     )
                 except asyncpg.UniqueViolationError:
-                    raise ValueError(
-                        f"Order {order_id} already released — duplicate release detected"
-                    )
+                    # Concurrent release hat die Credits für diese order_id
+                    # bereits eingefügt (UNIQUE order_id) → effektiv 'released'.
+                    # Idempotent behandelbar durch den Aufrufer.
+                    raise OrderNotReleasableError(order_id, "released")
 
             elif plan.interval == "month":
                 # Synthetic IDs — kein Mollie-Recurring für manuelle Billing-Lane.

@@ -89,6 +89,26 @@ async def main():
         rejected = "not a project plan" in str(e); d2 = str(e)[:70]
     results.append(("D: report-standard (month) abgelehnt", rejected, d2))
 
+    # --- TEST E: bezahlte Zahlung für stornierte Order → fail loud (defensiv) ---
+    # Kein stilles Schlucken: Geld erhalten, aber Order nicht mehr freigebbar.
+    async with pool.acquire() as conn:
+        uid3, _ = await seed_user(conn, returning=True)
+    co = await billing_service.start_project_pack_checkout(
+        uid3, "energy-project", 2, "https://x/ok", "u3@test.local", "Test3")
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE pending_orders SET status='cancelled' "
+            "WHERE user_id=$1 AND payment_method='mollie' AND status='awaiting_payment'",
+            uuid.UUID(uid3))
+    failed_loud = False; d3 = "kein Fehler!"
+    try:
+        await billing_service.handle_webhook(co["paymentId"])
+    except RuntimeError as e:
+        failed_loud = "non-releasable" in str(e); d3 = str(e)[:70]
+    avail3 = await get_available_credits(uuid.UUID(uid3), "energy-project")
+    results.append(("E: bezahlt+storniert → fail loud, KEINE Credits",
+                    failed_loud and avail3 == 0, f"loud={failed_loud} avail={avail3}"))
+
     await close_pool()
     print("\n=== ERGEBNISSE ===")
     ok = True

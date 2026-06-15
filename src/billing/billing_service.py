@@ -838,20 +838,23 @@ async def handle_webhook(payment_id: str) -> Dict[str, Any]:
         order_id = payment.get("metadata", {}).get("orderId")
         if not order_id:
             raise RuntimeError("project_pack webhook: orderId missing from payment metadata")
-        from src.billing import pending_orders_service
+        from src.billing.pending_orders_service import release_order, OrderNotReleasableError
         try:
-            released = await pending_orders_service.release_order(
+            released = await release_order(
                 order_id, operator_user_id=None, note="self-service Mollie payment",
             )
             return {"handled": True, "type": "project_pack", "order": released}
-        except ValueError as exc:
-            # Webhook-Retry nach bereits erfolgter Freigabe → idempotent ok
-            # (release_order verlangt status='awaiting_payment'; eine schon
-            #  freigegebene Order wirft ValueError, das hier kein Fehler ist).
-            msg = str(exc)
-            if "awaiting_payment" in msg or "already released" in msg:
+        except OrderNotReleasableError as exc:
+            if exc.status == "released":
+                # Webhook-Retry nach bereits erfolgter Freigabe → idempotent ok.
                 return {"handled": True, "type": "project_pack", "idempotent": True}
-            raise
+            # Bezahlte Mollie-Zahlung für eine 'expired'/'cancelled' Order ist
+            # eine echte Anomalie (Geld erhalten, aber Order nicht freigebbar)
+            # → fail loud, kein stilles Schlucken.
+            raise RuntimeError(
+                f"project_pack: paid Mollie payment {payment_id} for order {order_id} "
+                f"in non-releasable state '{exc.status}' — manual investigation required"
+            )
 
     return {"handled": False, "reason": f"unknown type {pending['type']}"}
 
