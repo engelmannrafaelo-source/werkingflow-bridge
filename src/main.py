@@ -1873,6 +1873,7 @@ async def chat_completions(
                 user_id=_gate_attr.get("user_id"),
                 app_id=_gate_attr.get("app_id"),
                 estimated_cost_eur=_gate_cost,
+                project_id=_gate_attr.get("workflow_id"),
             )
         except HTTPException:
             raise  # 402 — propagate to the client
@@ -3661,6 +3662,7 @@ async def research(
             user_id=_research_attr.get("user_id"),
             app_id=_research_attr.get("app_id"),
             estimated_cost_eur=0.0,  # lower bound; gate blocks 'budget gone' states
+            project_id=_research_attr.get("workflow_id"),
         )
     except HTTPException:
         raise  # 402 — propagate to the client

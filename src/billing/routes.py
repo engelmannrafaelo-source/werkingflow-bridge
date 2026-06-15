@@ -718,6 +718,12 @@ async def list_project_credits(
     return {"credits": credits}
 
 
+class ConsumeProjectCreditRequest(BaseModel):
+    # App-side project identifier (== Bridge attribution workflow_id). When
+    # present, the consumed slot's per-project API budget is allocated atomically.
+    project_id: Optional[str] = None
+
+
 @_project_credits_router.post(
     "/v1/users/{user_id}/project-credits/{plan_id}/consume",
     status_code=200,
@@ -725,6 +731,7 @@ async def list_project_credits(
 async def consume_project_credit(
     user_id: str,
     plan_id: str,
+    body: Optional[ConsumeProjectCreditRequest] = None,
     _claims: AuthClaims = Depends(require_service_token),
 ) -> Dict[str, Any]:
     """
@@ -733,9 +740,17 @@ async def consume_project_credit(
     Service-Token only (kein User-JWT): nur App-Backends dürfen Credits verbrauchen.
     Energy-App ruft diesen Endpoint server-seitig vor dem Railway-Backend-Call auf.
     Gibt 402 zurück wenn keine Credits verfügbar (CreditsExhaustedError).
+
+    Optional `project_id` im JSON-Body allokiert das Per-Projekt-API-Budget
+    atomar mit dem Slot. Ohne project_id (Alt-Clients) unverändert (nur Slot;
+    Budget fällt downstream aufs Monatsbudget zurück). JSON-Body, damit Umlauts
+    in project_id sauber durchgehen.
     """
+    project_id = body.project_id if body else None
     try:
-        return await project_credits_service.consume_credit(_uuid.UUID(user_id), plan_id)
+        return await project_credits_service.consume_credit(
+            _uuid.UUID(user_id), plan_id, project_id
+        )
     except project_credits_service.CreditsExhaustedError as e:
         raise HTTPException(status_code=402, detail=str(e))
     except ValueError:

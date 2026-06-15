@@ -51,10 +51,17 @@ async def enforce_budget(
     user_id: Optional[str],
     app_id: Optional[str],
     estimated_cost_eur: float,
+    project_id: Optional[str] = None,
 ) -> None:
     """
     Raise HTTPException(402) if the user's budget for this app is exhausted.
     Returns None (lets the call proceed) in every other case.
+
+    For project-interval plans (e.g. Energy) the budget is per project
+    (keyed by project_id == attribution workflow_id). When a per-project
+    budget exists it gates the call; if none exists yet (legacy / in-flight
+    project, or a call without project_id) the gate falls back to the monthly
+    tenant budget so nothing regresses during rollout.
     """
     # No user / no app → not a user-budgeted call (internal job). Let through.
     if not user_id or not app_id:
@@ -71,6 +78,35 @@ async def enforce_budget(
         # Malformed user id — can't evaluate, don't punish the call.
         logger.warning("budget gate: malformed user_id %r — letting call through", user_id)
         return
+
+    if plan.interval == "project" and project_id:
+        from src.billing.project_budgets_service import evaluate as _eval_project
+
+        try:
+            pr = await _eval_project(uid, plan.id, project_id, estimated_cost_eur)
+        except Exception as e:  # noqa: BLE001 — fail-open: infra error must not kill the AI path
+            logger.error("budget gate: project budget eval failed (%s) — letting call through", e)
+            return
+        if pr.get("exists"):
+            if pr.get("allowed"):
+                return
+            logger.info(
+                "budget gate: BLOCKED (per-project) user=%s app=%s plan=%s project=%s remaining=%.4f",
+                user_id, app_id, plan.id, project_id, pr.get("remainingEur", 0.0),
+            )
+            raise HTTPException(
+                status_code=402,
+                detail={
+                    "error": "budget_exhausted",
+                    "reason": "project_budget_exhausted",
+                    "appId": app_id,
+                    "planId": plan.id,
+                    "projectId": project_id,
+                    "totalRemainingEur": pr.get("remainingEur", 0.0),
+                    "message": "Projekt-Budget aufgebraucht. Bitte ein neues Projekt-Paket buchen.",
+                },
+            )
+        # No per-project budget yet → fall through to the monthly budget.
 
     try:
         result = await evaluate_budget(uid, plan.id, estimated_cost_eur)
