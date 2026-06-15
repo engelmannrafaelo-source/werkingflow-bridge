@@ -761,6 +761,146 @@ sys.exit(0 if ok else 1)
 PYEOF
 log_success "App licenses granted"
 
+# ============================================================================
+# PHASE 7: UNIVERSAL INTERACTIVE USER
+#
+# ONE shared human-login user (interactive@werkingflow.com, role owner) that
+# works in ALL WerkING apps (energy/report/safety/noise/engelmann). It lives
+# in its own tenant ("interactive-user", account_type=customer) so test-tenant
+# sweeps never affect it, and it has active app_licenses for EVERY app so
+# Rafael can stay logged in across all apps simultaneously without triggering
+# the single-active-session rule (each app reads its own session-generation
+# store; this user is never touched by the test runner).
+#
+# WHY app_licenses for ALL apps on every seed run:
+#   The user must be fully licensed after any single seed invocation, not only
+#   after seeding all five apps. Granting is idempotent (created:false = refreshed).
+#
+# User details are stored in apps/<app>/config/interactive-credentials.json
+# for the CUI Login-Add-In picker (tester:false → highlighted green). The
+# picker file is the SSoT for the credentials; this phase keeps Bridge in sync.
+# ============================================================================
+phase_header 7 "UNIVERSAL INTERACTIVE USER"
+
+python3 - <<PYEOF
+import json, sys, requests
+from datetime import datetime, timezone
+
+headers = {
+    'Content-Type': 'application/json',
+    'X-Bridge-Service-Token': '${BRIDGE_SERVICE_TOKEN}',
+}
+
+INTERACTIVE_EMAIL    = 'interactive@werkingflow.com'
+INTERACTIVE_PASSWORD = 'InterAktiv2026!'
+INTERACTIVE_NAME     = 'Rafael (Interactive — alle Apps)'
+INTERACTIVE_ROLE     = 'owner'
+INTERACTIVE_TENANT   = 'interactive-user'
+ALL_APP_IDS          = ['werking-energy', 'werking-report', 'werking-safety', 'werking-noise', 'engelmann']
+
+today = datetime.now(timezone.utc).date().isoformat()
+ok = True
+
+# Step A: ensure tenant (idempotent)
+try:
+    r = requests.post('${BRIDGE_URL}/v1/tenants', json={
+        'id': INTERACTIVE_TENANT,
+        'name': 'Interactive User (Rafael)',
+        'account_type': 'customer',
+    }, headers=headers, timeout=15)
+except requests.RequestException as e:
+    print(f"  [FAIL]  Tenant create error: {e}", file=sys.stderr)
+    sys.exit(1)
+
+if r.status_code == 201:
+    print(f"  [ok]    Tenant created: {INTERACTIVE_TENANT}")
+elif r.status_code == 409:
+    print(f"  [ok]    Tenant exists: {INTERACTIVE_TENANT}")
+else:
+    print(f"  [FAIL]  Tenant HTTP {r.status_code}: {r.text[:200]}", file=sys.stderr)
+    sys.exit(1)
+
+# Step B: create user (idempotent — 409 = already exists)
+try:
+    r = requests.post('${BRIDGE_URL}/v1/users', json={
+        'email': INTERACTIVE_EMAIL,
+        'name':  INTERACTIVE_NAME,
+        'tenant_id': INTERACTIVE_TENANT,
+        'password': INTERACTIVE_PASSWORD,
+        'role': INTERACTIVE_ROLE,
+    }, headers=headers, timeout=15)
+except requests.RequestException as e:
+    print(f"  [FAIL]  User create error: {e}", file=sys.stderr)
+    sys.exit(1)
+
+uid = None
+if r.status_code in (200, 201):
+    data = r.json()
+    uid = (data.get('id') or (data.get('user') or {}).get('id'))
+    print(f"  [ok]    Interactive user created: id={uid}")
+elif r.status_code == 409:
+    print(f"  [ok]    Interactive user already exists — resolving id")
+else:
+    print(f"  [FAIL]  User create HTTP {r.status_code}: {r.text[:200]}", file=sys.stderr)
+    sys.exit(1)
+
+# Resolve uid if not returned by create
+if not uid:
+    offset = 0
+    while True:
+        try:
+            rr = requests.get('${BRIDGE_URL}/v1/users',
+                              params={'limit': 200, 'offset': offset},
+                              headers=headers, timeout=15)
+        except requests.RequestException as e:
+            print(f"  [FAIL]  GET /v1/users error: {e}", file=sys.stderr)
+            sys.exit(1)
+        if rr.status_code != 200:
+            print(f"  [FAIL]  GET /v1/users HTTP {rr.status_code}", file=sys.stderr)
+            sys.exit(1)
+        page = rr.json()
+        if not page:
+            break
+        for u in page:
+            if u['email'].lower() == INTERACTIVE_EMAIL.lower():
+                uid = u['id']
+                break
+        if uid or len(page) < 200:
+            break
+        offset += 200
+        if offset > 100000:
+            print(f"  [FAIL]  /v1/users paginated past offset {offset} — aborting", file=sys.stderr)
+            sys.exit(1)
+    if not uid:
+        print(f"  [FAIL]  Interactive user not found after create", file=sys.stderr)
+        sys.exit(1)
+    print(f"  [ok]    Interactive user id resolved: {uid}")
+
+# Step C: grant app_licenses for ALL apps (idempotent)
+for app_id in ALL_APP_IDS:
+    try:
+        r = requests.post(
+            f'${BRIDGE_URL}/v1/users/{uid}/app-licenses',
+            json={'appId': app_id, 'planId': 'trial', 'startDate': today, 'endDate': None, 'seats': 1},
+            headers=headers,
+            timeout=15,
+        )
+    except requests.RequestException as e:
+        print(f"  [FAIL]  app-license {app_id}: {e}", file=sys.stderr)
+        ok = False
+        continue
+    if r.status_code in (200, 201):
+        created = r.json().get('created')
+        verb = 'granted' if created else 'already present (refreshed)'
+        print(f"  [ok]    app-license {verb}: {app_id}")
+    else:
+        print(f"  [FAIL]  app-license {app_id}: HTTP {r.status_code} — {r.text[:200]}", file=sys.stderr)
+        ok = False
+
+sys.exit(0 if ok else 1)
+PYEOF
+log_success "Universal interactive user provisioned (interactive@werkingflow.com)"
+
 echo ""
 printf "${GREEN}${BOLD}Bridge user seed complete — ${APP}${RESET}\n"
 echo ""
