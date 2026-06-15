@@ -554,6 +554,25 @@ TEST_PROJECT_SLOTS = 50  # generous project-credit slots for slot-based (interva
 ok = True
 for key, u in users.items():
     email = u['email'].lower()
+
+    # Billing-free test users: skip ALL billing provisioning (subscription,
+    # top-up credit, project-credit slots). Declared via "billingFree": true
+    # in the per-app test-credentials.json.
+    #
+    # Why this exists: any billing record blocks the Bridge hard-delete
+    #   DELETE /v1/users/{id} → 409 ForeignKeyViolation, because
+    #   subscriptions/credit_purchases are ON DELETE RESTRICT and
+    #   manual_project_credits.user_id has no ON DELETE clause (PostgreSQL
+    #   default NO ACTION). closeAccount() calls exactly that endpoint, so a
+    #   provisioned user can never exercise the DSGVO Art.17 account-deletion
+    #   path. The dedicated delete/GDPR user must stay billing-free so its
+    #   delete scenarios (account-data-backend, account-loeschen-ui, flow-dsgvo)
+    #   can run end-to-end. App-license grants (Phase 6) are unaffected — those
+    #   are ON DELETE CASCADE and never block deletion.
+    if u.get('billingFree'):
+        print(f"  [info]  Billing-free user — skipping subscription/credits: {key} ({u['email']})")
+        continue
+
     uid = user_ids.get(email)
     if not uid:
         print(f"  [FAIL]  User {key} ({u['email']}): not found in Bridge — skipped", file=sys.stderr)
