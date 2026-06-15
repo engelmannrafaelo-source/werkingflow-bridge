@@ -1071,6 +1071,103 @@ async def convert_html_to_pdf_endpoint(request: Request):
     })
 
 
+@app.post("/convert-html-to-screenshot")
+async def convert_html_to_screenshot_endpoint(request: Request):
+    """Render HTML → PNG-Screenshot via headless Chromium (Playwright).
+
+    Accepts JSON body: { "html": "…", "width": 1440 (optional), "full_page": true (optional) }.
+    Returns PNG as base64 + byte length.
+
+    Gleiche Render-Engine wie /convert-html-to-pdf, aber Screen-Viewport statt
+    A4-Druckseite: zeigt den Report so, wie der User ihn am Bildschirm sieht
+    (Screen-CSS, viewport-Breite) — nicht die paginierte Druckansicht. Damit
+    kann ein Editor-Agent das gerenderte Ergebnis selbst betrachten und gezielt
+    nachbessern. Shared server-side Renderer — kein per-App Chromium nötig.
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse(
+            status_code=400,
+            content={"status": "error", "error": "Invalid JSON body."},
+        )
+
+    html = body.get("html")
+    if not isinstance(html, str) or not html.strip():
+        return JSONResponse(
+            status_code=400,
+            content={"status": "error", "error": "Missing or empty 'html' field."},
+        )
+
+    width = body.get("width", 1440)
+    if not isinstance(width, int) or isinstance(width, bool) or width < 320 or width > 3840:
+        return JSONResponse(
+            status_code=400,
+            content={"status": "error", "error": "'width' must be an integer in [320, 3840]."},
+        )
+
+    full_page = body.get("full_page", True)
+    if not isinstance(full_page, bool):
+        return JSONResponse(
+            status_code=400,
+            content={"status": "error", "error": "'full_page' must be a boolean."},
+        )
+
+    MAX_HTML_BYTES = 50 * 1024 * 1024  # 50 MB
+    html_bytes = html.encode("utf-8")
+    if len(html_bytes) > MAX_HTML_BYTES:
+        return JSONResponse(
+            status_code=400,
+            content={"status": "error", "error": f"HTML too large: {len(html_bytes) / 1024 / 1024:.1f} MB. Maximum: 50 MB."},
+        )
+
+    try:
+        from playwright.async_api import async_playwright
+    except Exception as e:
+        logger.error(f"[HTML→PNG] Playwright import failed: {e}", exc_info=True)
+        return JSONResponse(
+            status_code=500,
+            content={"status": "error", "error": "Playwright/Chromium not installed on privacy-pdf-service."},
+        )
+
+    logger.info(f"[HTML→PNG] Starting Chromium render ({len(html_bytes) / 1024:.1f} KB, width={width}, full_page={full_page})")
+    t_start = _time.time()
+
+    try:
+        async with async_playwright() as pw:
+            # Gleiche Container-Args wie der PDF-Renderer (non-root, keine GPU).
+            browser = await pw.chromium.launch(
+                headless=True,
+                args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage", "--disable-gpu"],
+            )
+            try:
+                # Screen-Viewport: der Report rendert mit seiner Bildschirm-Breite.
+                # height=900 ist nur initial — full_page erfasst die gesamte Höhe.
+                page = await browser.new_page(viewport={"width": width, "height": 900})
+                # networkidle: auf @font-face/@import-Fonts + Bilder warten, sonst
+                # screenshot mit Fallback-Font / fehlenden Bildern.
+                await page.set_content(html, wait_until="networkidle")
+                png_bytes = await page.screenshot(full_page=full_page, type="png")
+            finally:
+                await browser.close()
+    except Exception as e:
+        logger.error(f"[HTML→PNG] Chromium render failed: {e}", exc_info=True)
+        return JSONResponse(
+            status_code=502,
+            content={"status": "error", "error": f"Screenshot render failed: {str(e)}"},
+        )
+
+    duration = _time.time() - t_start
+    logger.info(f"[HTML→PNG] Done: {len(png_bytes)} bytes PNG in {duration:.1f}s")
+
+    return JSONResponse(content={
+        "status": "success",
+        "png_base64": base64.b64encode(png_bytes).decode("ascii"),
+        "size_bytes": len(png_bytes),
+        "cost": 0,
+    })
+
+
 @app.post("/convert-pdf-to-html-direct")
 async def convert_pdf_to_html_direct_endpoint(request: Request):
     """Convert PDF → HTML (pixel-perfect, direct) via ConvertAPI.

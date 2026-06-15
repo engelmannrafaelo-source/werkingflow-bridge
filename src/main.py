@@ -4424,6 +4424,47 @@ async def convert_html_to_pdf_endpoint(
         )
 
 
+@app.post("/v1/convert-html-to-screenshot")
+async def convert_html_to_screenshot_endpoint(
+    request: Request,
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(security)
+):
+    """Render HTML to a PNG screenshot via headless Chromium. Proxied to privacy-pdf-service.
+
+    Same Chromium engine as /v1/convert-html-to-pdf, but a screen viewport instead
+    of an A4 print page: returns the report as the user sees it on screen, so an
+    editor agent can review the rendered result and self-correct. Centralized so
+    Vercel apps (which cannot bundle Chromium) need no per-app browser.
+    """
+    await verify_api_key(request, credentials)
+
+    try:
+        body = await request.json()
+        if not isinstance(body, dict) or not body.get("html"):
+            return JSONResponse(
+                status_code=400,
+                content={"status": "error", "error": "Request body must be JSON with 'html' field."}
+            )
+
+        privacy_client = get_privacy_client()
+        client = await privacy_client._get_client()
+
+        response = await client.post(
+            "/convert-html-to-screenshot",
+            json=body,
+            timeout=600.0,
+        )
+        response.raise_for_status()
+        return JSONResponse(content=response.json())
+
+    except Exception as e:
+        logger.error(f"HTML-to-screenshot proxy failed: {e}", exc_info=True)
+        return JSONResponse(
+            status_code=500,
+            content={"status": "error", "error": f"HTML-to-screenshot conversion failed: {str(e)}"}
+        )
+
+
 @app.post("/v1/convert-pdf-to-html-direct")
 async def convert_pdf_to_html_direct_endpoint(
     request: Request,
