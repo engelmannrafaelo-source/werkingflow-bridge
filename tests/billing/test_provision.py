@@ -110,7 +110,9 @@ def _sub_row(**overrides):
 
 class TestProvisionSubscriptionService:
     async def test_returns_existing_active_sub_idempotent(self):
-        """If the user already has an active sub for this plan, return it, no INSERT."""
+        """Existing active sub → returned as-is, no new subscription INSERT. But the
+        app_license IS still ensured (idempotent UPSERT) so a user with a sub but a
+        missing license gets repaired."""
         uid = str(uuid.uuid4())
         existing = _sub_row(plan_id="report-standard")
 
@@ -121,8 +123,10 @@ class TestProvisionSubscriptionService:
 
         assert result["status"] == "active"
         assert result["planId"] == "report-standard"
-        # No INSERT — fetchrow called once (the pre-check SELECT), no execute
-        assert conn.execute.call_count == 0
+        # Only the app_license UPSERT runs on the idempotent path — no subscription
+        # INSERT, no budget provision.
+        assert conn.execute.call_count == 1
+        assert "app_licenses" in conn.execute.call_args_list[0][0][0]
         # No billing event logged for idempotent return
         mock_log.assert_not_called()
 
@@ -141,10 +145,12 @@ class TestProvisionSubscriptionService:
         assert result["status"] == "active"
         assert result["planId"] == "report-standard"
 
-        # execute called twice: INSERT subscriptions + INSERT user_budgets
-        assert conn.execute.call_count == 1  # only _provision_plan_budget; INSERT uses fetchrow
-        budget_sql = conn.execute.call_args[0][0]
-        assert "user_budgets" in budget_sql
+        # execute called twice: app_license UPSERT + user_budgets provision
+        # (the subscriptions INSERT uses fetchrow, not execute)
+        assert conn.execute.call_count == 2
+        executed_sql = [c[0][0] for c in conn.execute.call_args_list]
+        assert any("app_licenses" in s for s in executed_sql)
+        assert any("user_budgets" in s for s in executed_sql)
 
         # Billing event logged
         mock_log.assert_called_once()

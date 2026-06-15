@@ -1051,6 +1051,36 @@ async def _assert_complete_billing_address(
         )
 
 
+async def _ensure_app_license(
+    conn, user_uuid: uuid.UUID, app_id: str, plan_id: str, seats: int
+) -> None:
+    """Idempotent UPSERT of the app_license for (user, app).
+
+    The login JWT reads its `appLicenses` claim from the app_licenses table —
+    NOT from subscriptions. An active subscription without the matching license
+    is therefore invisible to the apps (403). Granting the license in lockstep
+    with the subscription (see provision_subscription) means the "subscription
+    provisioned but license missing" intermediate state — seed Phase 5 run
+    without Phase 6, which made interactive@'s badge flicker between provisioning
+    runs — can no longer exist.
+
+    Paid provisioning → start today, no end_date (perpetual until cancelled).
+    UPSERT mirrors admin grant_app_license so there is one license-grant shape.
+    """
+    await conn.execute(
+        """
+        INSERT INTO app_licenses (user_id, app_id, plan_id, start_date, end_date, seats)
+        VALUES ($1, $2::app_id, $3::plan_id, CURRENT_DATE, NULL, $4)
+        ON CONFLICT (user_id, app_id) DO UPDATE
+          SET plan_id    = EXCLUDED.plan_id,
+              start_date = EXCLUDED.start_date,
+              end_date   = EXCLUDED.end_date,
+              seats      = EXCLUDED.seats
+        """,
+        user_uuid, app_id, plan_id, seats,
+    )
+
+
 async def provision_subscription(
     user_id: str,
     plan_id: str,
@@ -1101,6 +1131,12 @@ async def provision_subscription(
     # return it immediately. This covers the common idempotent re-seed case
     # without going through the INSERT path.
     async with pool.acquire() as conn:
+        # Grant the app_license FIRST — idempotent and independent of subscription
+        # state, so it also repairs an existing-subscription-but-missing-license
+        # user (not just freshly-provisioned ones). License + subscription + budget
+        # now always move together; "active sub but 403" can no longer occur.
+        await _ensure_app_license(conn, user_uuid, plan.app_id, plan_id, seats)
+
         existing = await conn.fetchrow(
             """
             SELECT id, user_id, app_id, plan_id, status, mollie_customer_id,
