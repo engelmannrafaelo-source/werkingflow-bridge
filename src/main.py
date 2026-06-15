@@ -547,15 +547,33 @@ async def lifespan(app: FastAPI):
     except Exception as _e:
         logger.error(f"Failed to start AdaptiveLoadLimiter: {_e}")
 
-    # DB pool for budget gate + activity tracking (cross-cutting worker concerns).
-    # Platform routes are served by platform-api; this pool is ONLY for the
-    # pre-call budget check and post-call usage write inside /v1/chat/completions.
+    # DB pool + plan catalog for budget gate, activity tracking AND the
+    # post-call budget deduction — all cross-cutting worker concerns that run
+    # inside /v1/chat/completions and /v1/research in THIS process. Platform
+    # routes are served by platform-api; this pool is only for those hooks.
     if BRIDGE_DB_CLIENT_AVAILABLE and is_db_enabled():
         try:
             await init_pool()
             logger.info("✅ Worker DB pool initialised (asyncpg) — budget gate + activity tracking")
         except Exception as e:
             logger.error(f"❌ Worker DB pool init failed: {e}")
+            raise
+
+        # Plan catalog for the post-call budget deduction. _deduct_call_cost
+        # (src/activity/ai_call_writer.py) runs in THIS worker process and maps
+        # app_id → plan via the in-memory PLANS cache. Only platform-api's
+        # lifespan called reload_plans() before, so the worker's cache stayed
+        # empty → find_plan_for_app() returned None → every deduction silently
+        # no-opped (e.g. werking-energy usage bypassed its €100 project budget
+        # entirely). Fail-fast on an empty/failed catalog: a worker that cannot
+        # resolve plans must not silently serve un-metered traffic. reload_plans()
+        # itself raises on an empty plans table.
+        from src.budget.plans import reload_plans
+        try:
+            count = await reload_plans()
+            logger.info(f"✅ Worker plan catalog loaded: {count} active plans (budget deduction)")
+        except Exception as e:
+            logger.error(f"❌ Worker plan catalog load failed: {e}")
             raise
 
     yield
