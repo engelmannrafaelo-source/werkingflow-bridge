@@ -216,6 +216,93 @@ async def start_subscription_checkout(
     return checkout
 
 
+async def start_project_pack_checkout(
+    user_id: str,
+    plan_id: str,
+    quantity: int,
+    success_redirect: str,
+    email: str,
+    name: str,
+) -> Dict[str, str]:
+    """
+    Self-Service-Nachbestellung eines Projekt-Pakets via Mollie-Einmalzahlung.
+
+    Nur für BESTANDSKUNDEN (>=1 bereits freigegebene Bestellung) — die
+    Erstakquise läuft weiter über die manuelle/partner-geführte Lane. Legt eine
+    pending_order (payment_method='mollie', ohne Mahn-Email) an und startet eine
+    Mollie-Einmalzahlung. Der Webhook gibt die Order via release_order() frei →
+    manual_project_credits (dieselbe Logik wie die Operator-Freigabe).
+
+    Raises:
+      ValueError — Plan ist kein Projekt-Plan, quantity < 1, Kunde ist kein
+                   Bestandskunde, oder Rechnungsadresse unvollständig.
+    """
+    from src.budget.plans import get_plan
+    from src.billing import pending_orders_service
+
+    plan = get_plan(plan_id)
+    if plan.interval != "project":
+        raise ValueError(
+            f"plan '{plan_id}' is not a project plan (interval={plan.interval}) — "
+            "self-service pack purchase only applies to project plans"
+        )
+    if quantity < 1:
+        raise ValueError("quantity must be >= 1")
+
+    user_uuid = uuid.UUID(user_id)
+    pool = get_pool()
+    async with pool.acquire() as conn:
+        # Bestandskunden-Gate: Self-Service erst nach >=1 freigegebener Bestellung.
+        # (So bleibt die Erstakquise bewusst manuell/partner-geführt.)
+        is_returning = await conn.fetchval(
+            "SELECT EXISTS(SELECT 1 FROM pending_orders WHERE user_id = $1 AND status = 'released')",
+            user_uuid,
+        )
+        # Rechnungsadresse vollständig (§11 UStG) — gleiche Regel wie Abos.
+        await _assert_complete_billing_address(conn, user_uuid, plan_id)
+    if not is_returning:
+        raise ValueError(
+            "project-pack self-service is only available to returning customers "
+            "(no released order yet — the first purchase runs through the "
+            "contact/manual lane)"
+        )
+
+    # pending_order anlegen — Mollie-Lane, KEINE Mahn-Email (Auto-Release im Webhook).
+    order = await pending_orders_service.create_pending_order(
+        user_id, plan_id, quantity, send_email=False, payment_method="mollie",
+    )
+    order_id = str(order["id"])
+    amount = round(float(plan.price) * quantity, 2)
+
+    customer = await get_or_create_customer(user_id, email, name)
+    mollie = get_mollie_adapter()
+    checkout = await mollie.create_one_time_payment(
+        customer_id=customer["mollieCustomerId"],
+        amount_eur=amount,
+        description=f"{plan.name} × {quantity}",
+        redirect_url=success_redirect,
+        webhook_url=config.mollie_webhook_url,
+        metadata={
+            "type": "project_pack",
+            "userId": user_id,
+            "planId": plan_id,
+            "quantity": str(quantity),
+            "orderId": order_id,
+        },
+    )
+
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO pending_payments (payment_id, user_id, type, plan_id, amount_eur, created_at)
+            VALUES ($1, $2, 'project_pack', $3, $4, NOW())
+            ON CONFLICT (payment_id) DO NOTHING
+            """,
+            checkout["paymentId"], user_uuid, plan_id, amount,
+        )
+    return checkout
+
+
 async def _activate_subscription(
     user_id: str, plan_id: str, seats: int, customer_id: str,
     first_payment_id: str,
@@ -744,6 +831,27 @@ async def handle_webhook(payment_id: str) -> Dict[str, Any]:
             user_id, pending["plan_id"], seats, cust, first_payment_id=payment_id,
         )
         return {"handled": True, "type": "subscription_first", "subscription": sub}
+
+    if pending["type"] == "project_pack":
+        # Self-Service-Projekt-Paket: dieselbe Freigabe-Logik wie der Operator,
+        # nur automatisch ausgelöst durch die bezahlte Mollie-Zahlung.
+        order_id = payment.get("metadata", {}).get("orderId")
+        if not order_id:
+            raise RuntimeError("project_pack webhook: orderId missing from payment metadata")
+        from src.billing import pending_orders_service
+        try:
+            released = await pending_orders_service.release_order(
+                order_id, operator_user_id=None, note="self-service Mollie payment",
+            )
+            return {"handled": True, "type": "project_pack", "order": released}
+        except ValueError as exc:
+            # Webhook-Retry nach bereits erfolgter Freigabe → idempotent ok
+            # (release_order verlangt status='awaiting_payment'; eine schon
+            #  freigegebene Order wirft ValueError, das hier kein Fehler ist).
+            msg = str(exc)
+            if "awaiting_payment" in msg or "already released" in msg:
+                return {"handled": True, "type": "project_pack", "idempotent": True}
+            raise
 
     return {"handled": False, "reason": f"unknown type {pending['type']}"}
 

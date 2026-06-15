@@ -390,6 +390,38 @@ async def billing_sub_checkout(
         raise HTTPException(status_code=400, detail=str(e))
 
 
+class ProjectPackCheckoutRequest(BaseModel):
+    planId: str
+    quantity: int = 1
+    successRedirect: str
+    # Operator-Service-Token darf userId/email/name mitgeben; beim User-JWT
+    # gewinnt die Auth-Identität (siehe _resolve_billing_identity).
+    userId: Optional[str] = None
+    email: Optional[str] = None
+    name: Optional[str] = None
+
+
+@router.post("/project-pack/checkout")
+async def billing_project_pack_checkout(
+    body: ProjectPackCheckoutRequest,
+    claims: AuthClaims = Depends(require_jwt_or_service),
+) -> Dict[str, str]:
+    """
+    Self-Service-Nachbestellung eines Projekt-Pakets (Mollie-Einmalzahlung).
+    Nur Bestandskunden + vollständige Rechnungsadresse (Gate in billing_service).
+    """
+    user_id, email, name = await _resolve_billing_identity(
+        claims, body.userId, body.email, body.name,
+    )
+    try:
+        return await billing_service.start_project_pack_checkout(
+            user_id, body.planId, body.quantity, body.successRedirect,
+            email, name,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
 class TopUpCheckoutRequest(BaseModel):
     # Top-Up bounds are enforced again in billing_service.start_topup_checkout
     # (defence in depth) — these Pydantic bounds reject obviously bad requests
