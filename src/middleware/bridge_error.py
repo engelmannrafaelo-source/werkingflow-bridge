@@ -72,6 +72,11 @@ REASON_UPSTREAM_ANTHROPIC_ERROR = "claude_upstream_error"
 REASON_UPSTREAM_ANTHROPIC_TIMEOUT = "claude_upstream_timeout"
 # Vision API direct-key billing exhausted (Anthropic-side, not retryable)
 REASON_VISION_BILLING_EXHAUSTED = "vision_billing_exhausted"
+# Anthropic 4xx invalid_request_error — the CALLER's request is malformed
+# (bad temperature/top_p, unknown model, oversized payload). Non-retryable:
+# retrying the identical request fails forever. Must NOT collapse to 500
+# (→ nginx exhausts workers → bogus "at capacity") nor 429 (→ client retry-loop).
+REASON_INVALID_REQUEST = "upstream_invalid_request"
 # 500-class (contract violation — must be investigated)
 REASON_INTERNAL = "worker_internal_error"
 REASON_MISCONFIGURED = "worker_misconfigured"
@@ -262,6 +267,33 @@ def vision_billing_error(detail: str) -> JSONResponse:
         reason=REASON_VISION_BILLING_EXHAUSTED,
         message=f"Vision API credit balance exhausted: {detail}",
         status_code=402,
+        retryable_override=False,
+    )
+
+
+def client_request_error(detail: str) -> JSONResponse:
+    """Anthropic returned 400 invalid_request_error — the CALLER's request is
+    malformed (e.g. temperature out of 0..1 range, unknown model, payload too
+    large). Surfaces as HTTP 400 Bad Request, non-retryable.
+
+    WHY THIS EXISTS: without this branch such errors fell through to
+    `internal_error` (500). nginx then retried all workers (proxy_next_upstream
+    includes http_500), exhausted them, and rewrote the result as
+    "Bridge temporarily at capacity" (503) — disguising a bad client parameter
+    as a capacity/infra problem. That made a 5-second fix ("your temperature is
+    1.5, max is 1") look like a fleet-wide outage. Passing the real 400 through
+    with Anthropic's original message makes the whole class self-diagnosing.
+
+    Contract: a legitimate client-side bad-request signal — distinct from
+    `upstream_error` (transient 5xx/429, retryable) and from `internal_error`
+    (bridge bug). nginx does NOT retry a 400, so it reaches the caller verbatim.
+    """
+    return bridge_error(
+        source=SOURCE_UPSTREAM_ANTHROPIC,
+        error_type=TYPE_UPSTREAM_ERROR,
+        reason=REASON_INVALID_REQUEST,
+        message=f"Anthropic rejected the request as invalid (not retryable): {detail}",
+        status_code=400,
         retryable_override=False,
     )
 
@@ -464,6 +496,17 @@ def classify_exception(exc: Exception) -> JSONResponse:
         "insufficient_credit",
     )):
         return vision_billing_error(detail=msg[:200])
+
+    # 3c. Anthropic 400 invalid_request_error — malformed CALLER request (bad
+    # temperature/top_p, unknown model, oversized payload). Non-retryable.
+    # MUST be classified before the 500 fallthrough: otherwise it becomes a
+    # worker_internal_error (500) → nginx retries+exhausts all workers →
+    # rewrites to "Bridge temporarily at capacity" (503), disguising a client
+    # parameter bug as a capacity/infra outage. "invalid_request_error" is
+    # Anthropic's stable, specific error-type token for this class and does not
+    # appear in transient (overloaded/rate-limit/5xx) messages.
+    if "invalid_request_error" in lower:
+        return client_request_error(detail=msg[:300])
 
     # 4. Fallthrough — bridge-internal unexpected. 500 is deliberate here:
     # it means something slipped past classification. Fix-forward, don't mask.
