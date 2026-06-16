@@ -61,6 +61,7 @@ from src.auth import verify_api_key, security, validate_claude_code_auth, get_cl
 from src.jobs.routes import router as jobs_router, set_attribution_extractor
 from src.jobs.registry import register_executor, run_watchdog_pass
 from src.jobs import store as jobs_store
+from src.jobs.executors import ping_executor, chat_executor
 from src.parameter_validator import ParameterValidator, CompatibilityReporter
 from src.model_registry import (
     get_models_for_api,
@@ -516,7 +517,8 @@ async def lifespan(app: FastAPI):
     # other endpoint), and start the watchdog/cleanup loop. The Postgres store is
     # required; without BRIDGE_DB_URL the endpoints return 503 and the loop is
     # skipped. The endpoints themselves stay inert unless BRIDGE_GENERIC_JOBS_ENABLED.
-    register_executor("ping", _job_ping_executor)
+    register_executor("ping", ping_executor)
+    register_executor("chat", chat_executor)
     set_attribution_extractor(extract_attribution_context)
     if is_db_enabled():
         asyncio.create_task(_generic_jobs_maintenance_loop())
@@ -618,13 +620,6 @@ GENERIC_JOB_TTL_SECONDS = 2 * 60 * 60          # 2h, mirrors research jobs
 GENERIC_JOB_STALE_SECONDS = 90                 # ~6 missed heartbeats
 GENERIC_JOB_MAX_ATTEMPTS = 3
 GENERIC_JOB_MAINTENANCE_INTERVAL_S = 30
-
-
-async def _job_ping_executor(payload, attribution, report_progress):
-    """Built-in diagnostic executor — proves dispatch→run→poll end-to-end without
-    the heavy model stack. Reachable only when BRIDGE_GENERIC_JOBS_ENABLED=true."""
-    await report_progress({"phase": "pong", "percent": 100})
-    return {"echo": payload, "attribution": attribution}
 
 
 async def _generic_jobs_maintenance_loop():
