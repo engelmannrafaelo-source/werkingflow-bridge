@@ -4459,6 +4459,41 @@ async def convert_html_to_docx_endpoint(
         )
 
 
+@app.post("/v1/convert-docx-to-html")
+async def convert_docx_to_html_endpoint(
+    request: Request,
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(security)
+):
+    """Convert DOCX to editable HTML via ConvertAPI (Word import). Proxied to privacy-pdf-service."""
+    await verify_api_key(request, credentials)
+
+    try:
+        body = await request.json()
+        if not isinstance(body, dict) or not body.get("docx_base64"):
+            return JSONResponse(
+                status_code=400,
+                content={"status": "error", "error": "Request body must be JSON with 'docx_base64' field."}
+            )
+
+        privacy_client = get_privacy_client()
+        client = await privacy_client._get_client()
+
+        response = await client.post(
+            "/convert-docx-to-html",
+            json=body,
+            timeout=600.0,
+        )
+        response.raise_for_status()
+        return JSONResponse(content=response.json())
+
+    except Exception as e:
+        logger.error(f"DOCX-to-HTML proxy failed: {e}", exc_info=True)
+        return JSONResponse(
+            status_code=500,
+            content={"status": "error", "error": f"DOCX-to-HTML conversion failed: {str(e)}"}
+        )
+
+
 @app.post("/v1/convert-html-to-pdf")
 async def convert_html_to_pdf_endpoint(
     request: Request,

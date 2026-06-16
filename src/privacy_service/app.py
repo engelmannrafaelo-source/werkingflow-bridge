@@ -983,6 +983,132 @@ async def convert_html_to_docx_endpoint(request: Request):
     })
 
 
+@app.post("/convert-docx-to-html")
+async def convert_docx_to_html_endpoint(request: Request):
+    """Convert DOCX → editable HTML via ConvertAPI (Word import for the workspace).
+
+    Reverse of /convert-html-to-docx, same ConvertAPI engine, so an uploaded Word
+    document round-trips back into the TinyMCE editor with styles/tables/images
+    preserved. Images + CSS are embedded so the result is a single self-contained
+    HTML string (no external asset files to host).
+
+    Accepts JSON body: { "docx_base64": "…", "filename": "input.docx" (optional) }.
+    Returns the HTML string + ConvertAPI cost (seconds).
+    """
+    import httpx
+
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse(
+            status_code=400,
+            content={"status": "error", "error": "Invalid JSON body."},
+        )
+
+    docx_b64 = body.get("docx_base64")
+    if not isinstance(docx_b64, str) or not docx_b64.strip():
+        return JSONResponse(
+            status_code=400,
+            content={"status": "error", "error": "Missing or empty 'docx_base64' field."},
+        )
+
+    try:
+        docx_bytes = base64.b64decode(docx_b64)
+    except Exception:
+        return JSONResponse(
+            status_code=400,
+            content={"status": "error", "error": "'docx_base64' is not valid base64."},
+        )
+
+    filename = body.get("filename") or "input.docx"
+    if not isinstance(filename, str):
+        filename = "input.docx"
+
+    MAX_DOCX_BYTES = 50 * 1024 * 1024  # 50 MB
+    if len(docx_bytes) > MAX_DOCX_BYTES:
+        return JSONResponse(
+            status_code=400,
+            content={"status": "error", "error": f"DOCX too large: {len(docx_bytes) / 1024 / 1024:.1f} MB. Maximum: 50 MB."},
+        )
+
+    convert_api_secret = os.getenv("CONVERTAPI_SECRET")
+    if not convert_api_secret:
+        return JSONResponse(
+            status_code=500,
+            content={"status": "error", "error": "CONVERTAPI_SECRET not configured on privacy-pdf-service."},
+        )
+
+    logger.info(f"[DOCX→HTML] Starting conversion ({len(docx_bytes) / 1024:.1f} KB)")
+    t_start = _time.time()
+
+    try:
+        async with httpx.AsyncClient(timeout=300.0) as client:
+            resp = await client.post(
+                "https://v2.convertapi.com/convert/docx/to/html",
+                headers={"Authorization": f"Bearer {convert_api_secret}"},
+                files={"File": (filename, docx_bytes, "application/vnd.openxmlformats-officedocument.wordprocessingml.document")},
+                # EmbedImages/EmbedCss → one self-contained HTML (data-URI images, inline
+                # styles) so TinyMCE gets editable rich text without external asset files.
+                data={"EmbedImages": "true", "EmbedCss": "true", "StoreFile": "true"},
+            )
+
+        if resp.status_code != 200:
+            logger.error(f"[DOCX→HTML] ConvertAPI error {resp.status_code}: {resp.text[:500]}")
+            return JSONResponse(
+                status_code=502,
+                content={"status": "error", "error": f"ConvertAPI failed with status {resp.status_code}: {resp.text[:200]}"},
+            )
+
+        result = resp.json()
+        cost = float(result.get("ConversionCost", 0))
+        files_arr = result.get("Files", [])
+        if not files_arr:
+            return JSONResponse(
+                status_code=502,
+                content={"status": "error", "error": "ConvertAPI returned no HTML files."},
+            )
+
+        file_entry = files_arr[0]
+        if file_entry.get("FileData"):
+            html_bytes = base64.b64decode(file_entry["FileData"])
+        elif file_entry.get("Url"):
+            async with httpx.AsyncClient(timeout=120.0) as client:
+                html_resp = await client.get(file_entry["Url"])
+            if html_resp.status_code != 200:
+                return JSONResponse(
+                    status_code=502,
+                    content={"status": "error", "error": f"HTML download failed: {html_resp.status_code}"},
+                )
+            html_bytes = html_resp.content
+        else:
+            return JSONResponse(
+                status_code=502,
+                content={"status": "error", "error": "ConvertAPI response has neither Url nor FileData."},
+            )
+
+    except httpx.TimeoutException:
+        return JSONResponse(
+            status_code=502,
+            content={"status": "error", "error": "ConvertAPI request timed out."},
+        )
+    except Exception as e:
+        logger.error(f"[DOCX→HTML] ConvertAPI call failed: {e}", exc_info=True)
+        return JSONResponse(
+            status_code=502,
+            content={"status": "error", "error": f"ConvertAPI call failed: {str(e)}"},
+        )
+
+    duration = _time.time() - t_start
+    html_str = html_bytes.decode("utf-8", errors="replace")
+    logger.info(f"[DOCX→HTML] Done: {len(html_str)} chars HTML in {duration:.1f}s, cost={cost}s")
+
+    return JSONResponse(content={
+        "status": "success",
+        "html": html_str,
+        "cost": cost,
+    })
+
+
 @app.post("/convert-html-to-pdf")
 async def convert_html_to_pdf_endpoint(request: Request):
     """Render HTML → PDF via headless Chromium (Playwright).
