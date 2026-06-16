@@ -456,7 +456,20 @@ def classify_exception(exc: Exception) -> JSONResponse:
     msg = str(exc) or exc.__class__.__name__
     lower = msg.lower()
 
-    # 0. RateLimitError from claude_cli -- surface as account_exhausted so the
+    # 0a. Already-classified BridgeError — honor its envelope verbatim.
+    #
+    # A BridgeError reaching classify_exception was deliberately classified
+    # deeper in the stack (e.g. vision_billing_error -> 402 non-retryable).
+    # Re-classifying it is destructive: str(BridgeError) == "bridge_error",
+    # which matches no marker and falls through to internal_error (500). nginx
+    # then retries http_500 across all workers, exhausts them, and rewrites the
+    # result to "503 Bridge temporarily at capacity" -- disguising an empty
+    # Vision credit balance (a billing top-up signal) as a capacity/infra
+    # outage that retries for ~30 min. Pass the original verdict through.
+    if isinstance(exc, BridgeError):
+        return exc.response
+
+    # 0b. RateLimitError from claude_cli -- surface as account_exhausted so the
     # BridgeError handler runs _cross_worker_retry. Inline import avoids a
     # module-load cycle (claude_cli does not import bridge_error).
     try:
