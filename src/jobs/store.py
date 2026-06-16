@@ -163,37 +163,56 @@ async def cleanup_old(ttl_seconds: int) -> int:
         return 0
 
 
-async def find_stale_running(stale_seconds: int, max_attempts: int) -> List[Dict[str, Any]]:
-    """Jobs stuck in 'running' past the heartbeat window and still under the
-    retry cap — the watchdog requeues these (worker died mid-job). A job at/over
-    max_attempts is left for the watchdog to fail loud instead of looping."""
+# "Stale" is measured from the last sign of life: heartbeat_at while running, or
+# created_at for a 'pending' job whose dispatching worker died before it ever
+# started. COALESCE collapses both into one notion so neither a never-started nor
+# a mid-run-orphaned job is ever stranded.
+_STALE_SINCE = "COALESCE(heartbeat_at, created_at)"
+
+
+async def claim_stale_job(stale_seconds: int, max_attempts: int) -> Optional[Dict[str, Any]]:
+    """Atomically claim ONE stale-but-retryable job for requeue and return it
+    (now status='running', attempts bumped). Returns None when none are claimable.
+
+    Multi-worker safe: `FOR UPDATE SKIP LOCKED` guarantees that when several
+    workers run the watchdog at once, each claims a DIFFERENT row — never the same
+    job twice (which would mean paying for the same call twice). Covers both
+    'pending' (never started) and 'running' (worker died mid-run); the retry cap
+    is enforced here so an unrecoverable job is left for find_abandoned()."""
     pool = get_pool()
     async with pool.acquire() as conn:
-        rows = await conn.fetch(
-            """
-            SELECT * FROM ai_jobs
-             WHERE status = 'running'
-               AND heartbeat_at < NOW() - ($1 || ' seconds')::interval
-               AND attempts < $2
-             ORDER BY heartbeat_at ASC
-             LIMIT 50
+        row = await conn.fetchrow(
+            f"""
+            UPDATE ai_jobs
+               SET status = 'running', attempts = attempts + 1,
+                   heartbeat_at = NOW(), updated_at = NOW()
+             WHERE job_id = (
+                 SELECT job_id FROM ai_jobs
+                  WHERE status IN ('pending', 'running')
+                    AND {_STALE_SINCE} < NOW() - ($1 || ' seconds')::interval
+                    AND attempts < $2
+                  ORDER BY {_STALE_SINCE} ASC
+                  FOR UPDATE SKIP LOCKED
+                  LIMIT 1
+             )
+            RETURNING *
             """,
             str(stale_seconds),
             max_attempts,
         )
-    return [_row_to_job(r) for r in rows]
+    return _row_to_job(row) if row else None
 
 
-async def find_dead_running(stale_seconds: int, max_attempts: int) -> List[Dict[str, Any]]:
-    """'running' jobs past the heartbeat window that have EXHAUSTED retries —
-    these get failed loud ('error') so they never sit in 'running' forever."""
+async def find_abandoned(stale_seconds: int, max_attempts: int) -> List[Dict[str, Any]]:
+    """Stale jobs (pending OR running) that have EXHAUSTED their retry budget —
+    the watchdog fails these loud ('error') so nothing sits non-terminal forever."""
     pool = get_pool()
     async with pool.acquire() as conn:
         rows = await conn.fetch(
-            """
+            f"""
             SELECT * FROM ai_jobs
-             WHERE status = 'running'
-               AND heartbeat_at < NOW() - ($1 || ' seconds')::interval
+             WHERE status IN ('pending', 'running')
+               AND {_STALE_SINCE} < NOW() - ($1 || ' seconds')::interval
                AND attempts >= $2
              LIMIT 50
             """,

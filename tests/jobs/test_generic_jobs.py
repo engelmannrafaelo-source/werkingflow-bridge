@@ -94,21 +94,24 @@ async def test_run_generic_job_unknown_kind_fails_loud():
 # ── Watchdog ────────────────────────────────────────────────────────────────
 
 async def test_watchdog_requeues_stale_and_fails_exhausted():
-    stale_job = {"job_id": "j_stale", "kind": "ping", "payload": {}, "attribution": None, "attempts": 1}
+    import asyncio
+
+    stale_job = {"job_id": "j_stale", "kind": "ping", "payload": {}, "attribution": None, "attempts": 2}
     dead_job = {"job_id": "j_dead", "kind": "ping", "payload": {}, "attribution": None, "attempts": 3}
 
+    # claim returns the stale job once (already bumped to running), then None.
     with patch.multiple(
         store,
-        find_stale_running=AsyncMock(return_value=[stale_job]),
-        find_dead_running=AsyncMock(return_value=[dead_job]),
+        claim_stale_job=AsyncMock(side_effect=[stale_job, None]),
+        find_abandoned=AsyncMock(return_value=[dead_job]),
         mark_error=AsyncMock(),
-    ), patch.object(registry, "run_generic_job", new=AsyncMock()) as rgj:
+    ), patch.object(registry, "_run_body", new=AsyncMock()) as run_body:
         counts = await registry.run_watchdog_pass(stale_seconds=90, max_attempts=3)
         assert counts == {"requeued": 1, "failed": 1}
-        # run_generic_job is fired via create_task → give the loop a tick
-        import asyncio
+        # _run_body for the claimed job is spawned → give the loop a tick.
         await asyncio.sleep(0)
-        rgj.assert_awaited()  # stale job re-dispatched
+        run_body.assert_awaited_once()
+        assert run_body.await_args.args[0] == "j_stale"  # NO re-mark_running (already claimed)
         store.mark_error.assert_awaited_once()
         assert store.mark_error.await_args.kwargs.get("code") == "REQUEUE_EXHAUSTED"
 

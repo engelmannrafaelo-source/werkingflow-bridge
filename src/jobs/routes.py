@@ -12,7 +12,6 @@ and injects its canonical attribution extractor (set_attribution_extractor) so w
 reuse the same X-* header parsing/billing as every other endpoint without an import
 cycle (main.py imports this module, not the other way around).
 """
-import asyncio
 import logging
 import os
 import uuid
@@ -26,7 +25,7 @@ from pydantic import BaseModel
 from src.auth import security, verify_api_key
 from src.db.client import is_db_enabled
 from src.jobs import store
-from src.jobs.registry import get_executor, registered_kinds, run_generic_job
+from src.jobs.registry import get_executor, registered_kinds, run_generic_job, spawn
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -86,8 +85,11 @@ async def create_job_endpoint(
         attribution = _attribution_extractor(request)
 
     job_id = "job_" + uuid.uuid4().hex
+    # Persist FIRST (durable 'pending'), then dispatch. If this worker dies before
+    # the task runs, the row survives at 'pending' and the watchdog requeues it
+    # from any worker — the dispatch is never a silent fire-and-forget loss.
     await store.create_job(job_id, body.kind, body.payload, attribution)
-    asyncio.create_task(run_generic_job(job_id, body.kind, body.payload, attribution))
+    spawn(run_generic_job(job_id, body.kind, body.payload, attribution))
     logger.info(f"📨 Async job {job_id} dispatched (kind={body.kind})")
 
     return {"job_id": job_id, "status": "pending", "kind": body.kind}
