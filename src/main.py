@@ -57,6 +57,10 @@ from src.vision_provider import VisionProvider, get_vision_provider
 from src.routing.vision_router import check_and_route_vision, prepare_messages_for_vision, has_vision_content
 from src.routing.backend_router import resolve_backend_config, get_backend_info_dict, BackendConfig
 from src.auth import verify_api_key, security, validate_claude_code_auth, get_claude_code_auth_info, bedrock_credential_manager
+# Generic async-job system (additive, flag-gated via BRIDGE_GENERIC_JOBS_ENABLED).
+from src.jobs.routes import router as jobs_router, set_attribution_extractor
+from src.jobs.registry import register_executor, run_watchdog_pass
+from src.jobs import store as jobs_store
 from src.parameter_validator import ParameterValidator, CompatibilityReporter
 from src.model_registry import (
     get_models_for_api,
@@ -507,6 +511,19 @@ async def lifespan(app: FastAPI):
     asyncio.create_task(_cleanup_old_research_jobs())
     logger.info(f"🧹 Async research job cleanup task started ({RESEARCH_JOB_TTL_SECONDS // 60}min TTL)")
 
+    # Wire the generic async-job system (additive). Register built-in executors,
+    # inject the canonical attribution extractor (so /v1/jobs bills like every
+    # other endpoint), and start the watchdog/cleanup loop. The Postgres store is
+    # required; without BRIDGE_DB_URL the endpoints return 503 and the loop is
+    # skipped. The endpoints themselves stay inert unless BRIDGE_GENERIC_JOBS_ENABLED.
+    register_executor("ping", _job_ping_executor)
+    set_attribution_extractor(extract_attribution_context)
+    if is_db_enabled():
+        asyncio.create_task(_generic_jobs_maintenance_loop())
+        logger.info("🧩 Generic async-job system wired (executors + watchdog loop)")
+    else:
+        logger.info("🧩 Generic async-job executors registered (DB disabled → watchdog loop skipped)")
+
     # Start Gemini daily rate limit reset task
     async def _gemini_daily_reset():
         """Reset Gemini rate limit counter at midnight UTC."""
@@ -593,6 +610,40 @@ async def lifespan(app: FastAPI):
             pass
 
 
+# ── Generic async-job system: built-in executor + maintenance loop ──────────
+# Tuning for the watchdog/cleanup loop (see src/jobs/). Stale window = several
+# missed heartbeats (HEARTBEAT_INTERVAL_S=15) → a 'running' job whose heartbeat
+# froze is presumed worker-dead and requeued (capped by attempts).
+GENERIC_JOB_TTL_SECONDS = 2 * 60 * 60          # 2h, mirrors research jobs
+GENERIC_JOB_STALE_SECONDS = 90                 # ~6 missed heartbeats
+GENERIC_JOB_MAX_ATTEMPTS = 3
+GENERIC_JOB_MAINTENANCE_INTERVAL_S = 30
+
+
+async def _job_ping_executor(payload, attribution, report_progress):
+    """Built-in diagnostic executor — proves dispatch→run→poll end-to-end without
+    the heavy model stack. Reachable only when BRIDGE_GENERIC_JOBS_ENABLED=true."""
+    await report_progress({"phase": "pong", "percent": 100})
+    return {"echo": payload, "attribution": attribution}
+
+
+async def _generic_jobs_maintenance_loop():
+    """Periodic watchdog (requeue dead-worker jobs / fail-loud exhausted) + TTL
+    cleanup. No-op cheap when there are no jobs."""
+    while True:
+        await asyncio.sleep(GENERIC_JOB_MAINTENANCE_INTERVAL_S)
+        try:
+            counts = await run_watchdog_pass(GENERIC_JOB_STALE_SECONDS, GENERIC_JOB_MAX_ATTEMPTS)
+            pruned = await jobs_store.cleanup_old(GENERIC_JOB_TTL_SECONDS)
+            if counts["requeued"] or counts["failed"] or pruned:
+                logger.info(
+                    f"🧩 jobs maintenance: requeued={counts['requeued']} "
+                    f"failed={counts['failed']} pruned={pruned}"
+                )
+        except Exception as e:
+            logger.warning(f"⚠️ generic-jobs maintenance pass failed: {e}")
+
+
 # Create FastAPI app
 app = FastAPI(
     title="Claude Code OpenAI API Wrapper",
@@ -600,6 +651,10 @@ app = FastAPI(
     version="1.0.0",
     lifespan=lifespan
 )
+
+# Generic async-job endpoints (POST /v1/jobs, GET /v1/jobs/{id}) — additive,
+# inert unless BRIDGE_GENERIC_JOBS_ENABLED=true.
+app.include_router(jobs_router)
 
 # Platform routes (/v1/auth/*, /v1/users*, /v1/billing/*, etc.) are served
 # by the dedicated platform-api container (src/platform_main.py).
