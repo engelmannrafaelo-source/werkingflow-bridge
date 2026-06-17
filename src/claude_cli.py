@@ -2,11 +2,14 @@ import asyncio
 import json
 import os
 import subprocess
+import sys
 import uuid
 import time
 import hashlib
+import tempfile
 from typing import AsyncGenerator, Dict, Any, Optional, List
 from pathlib import Path
+from contextvars import ContextVar
 
 from claude_code_sdk import query, ClaudeCodeOptions, Message
 from claude_code_sdk._errors import MessageParseError
@@ -95,6 +98,86 @@ try:
 except Exception as patch_err:
     logger.warning(f"⚠️ Could not patch SDK message parser: {patch_err}")
     logger.warning("   Unknown message types will crash the stream (fallback to except handler)")
+# =============================================================================
+
+
+# =============================================================================
+# LARGE PROMPT HANDLING: Avoid OS ARG_MAX (typically ~128 KB on Linux)
+#
+# The Python SDK spawns:  claude --print --system-prompt <value> --max-turns N
+# When <value> exceeds ARG_MAX the OS rejects exec() with E2BIG (errno 7,
+# "Argument list too long"). The SDK surfaces this silently as 503/capacity_busy.
+#
+# FIX for system_prompt: Intercept asyncio.create_subprocess_exec before it
+# reaches the OS. A ContextVar carries the temp-file path for the current
+# async task; when set, --system-prompt-file <path> is appended to the claude
+# args instead of --system-prompt <large_value>.
+# ContextVar gives each concurrent task its own isolated context (no global state).
+#
+# FIX for run_native_cli prompt: pass via stdin (input= in subprocess.run).
+# =============================================================================
+
+# Threshold: 100 KB — comfortably below the Linux ARG_MAX of ~128 KB
+LARGE_ARG_THRESHOLD_BYTES = 100_000
+
+# Per-async-task path to the temp file for the current request's large system_prompt.
+# None when system_prompt is small enough to pass via argv.
+_current_sys_prompt_tempfile: ContextVar[Optional[str]] = ContextVar(
+    "_bridge_sys_prompt_tempfile", default=None
+)
+
+_subprocess_exec_patch_applied: bool = False
+
+
+def _apply_subprocess_exec_patch() -> None:
+    """Monkey-patch asyncio.create_subprocess_exec once at module load.
+
+    When _current_sys_prompt_tempfile is set for the current async task, the
+    patch appends --system-prompt-file <path> to any claude subprocess args.
+    Also patches SDK internal modules that already bound the reference via
+    `from asyncio import create_subprocess_exec` at their import time.
+    """
+    global _subprocess_exec_patch_applied
+
+    _original_exec = asyncio.create_subprocess_exec
+
+    async def _intercepted_create_subprocess_exec(*args, **kwargs):
+        tempfile_path = _current_sys_prompt_tempfile.get()
+        if tempfile_path and args and str(args[0]).endswith("claude"):
+            # options.system_prompt was intentionally NOT set for this request;
+            # inject --system-prompt-file so the CLI reads from the temp file.
+            args = args + ("--system-prompt-file", tempfile_path)
+            logger.debug(
+                f"🔧 Subprocess patch: injected --system-prompt-file {tempfile_path!r}"
+            )
+        return await _original_exec(*args, **kwargs)
+
+    asyncio.create_subprocess_exec = _intercepted_create_subprocess_exec  # type: ignore[assignment]
+
+    # Also patch direct references already bound in SDK internal modules
+    patched_modules: list = []
+    for _mod_name, _mod in list(sys.modules.items()):
+        if "claude_code_sdk" in _mod_name or "anthropic" in _mod_name.lower():
+            if hasattr(_mod, "create_subprocess_exec"):
+                ref = getattr(_mod, "create_subprocess_exec")
+                if ref is _original_exec:
+                    setattr(_mod, "create_subprocess_exec", _intercepted_create_subprocess_exec)
+                    patched_modules.append(_mod_name)
+
+    _subprocess_exec_patch_applied = True
+    logger.info(
+        f"✅ Subprocess exec patched for large system_prompt (ARG_MAX guard). "
+        f"SDK modules patched: {patched_modules or 'none found'}"
+    )
+
+
+try:
+    _apply_subprocess_exec_patch()
+except Exception as _sp_patch_err:
+    logger.warning(
+        f"⚠️ Could not apply subprocess exec patch for large system_prompt: {_sp_patch_err}. "
+        f"Requests with system_prompt > {LARGE_ARG_THRESHOLD_BYTES:,} bytes will fail loudly."
+    )
 # =============================================================================
 
 
@@ -803,16 +886,16 @@ class ClaudeCodeCLI:
         if model:
             cli_args.extend(["--model", model])
 
-        # Append prompt as final argument
-        cli_args.append(prompt)
-
-        logger.info(f"📝 Executing native CLI: {' '.join(cli_args[:5])}...")
+        # Prompt is passed via stdin to avoid OS ARG_MAX limits.
+        # claude --print reads the prompt from stdin when no positional arg is given.
+        logger.info(f"📝 Executing native CLI: {' '.join(cli_args[:5])}... (prompt via stdin)")
 
         try:
-            # Run claude CLI directly
+            # Run claude CLI directly — prompt via stdin, NOT as argv arg
             result = subprocess.run(
                 cli_args,
-                cwd=str(session_dir),  # Execute in session directory
+                input=prompt,            # prompt → stdin, avoids ARG_MAX
+                cwd=str(session_dir),    # Execute in session directory
                 capture_output=True,
                 text=True,
                 timeout=600  # 10 minute timeout for research
@@ -1115,6 +1198,7 @@ CRITICAL: Write file EARLY to avoid context overflow. Use Write tool for clauded
                 progress_tracking_enabled = False
                 chunks_received = 0
                 chunks_buffer = []
+                _sys_prompt_tempfile_path: Optional[str] = None  # cleanup target for large system_prompt
 
                 # Build SDK options
                 options = ClaudeCodeOptions(
@@ -1132,11 +1216,43 @@ CRITICAL: Write file EARLY to avoid context overflow. Use Write tool for clauded
                 # Set model if specified
                 if model:
                     options.model = model
-                    
-                # Set system prompt if specified
+
+                # === SYSTEM PROMPT: argv-safe handling ===
+                # The SDK passes options.system_prompt as --system-prompt <value> to the
+                # claude CLI subprocess.  Values > ARG_MAX (~128 KB) cause E2BIG: the CLI
+                # never starts and the bridge reports a 503/capacity_busy instead of the
+                # real error (unified-tester sends ~184 KB system prompts).
+                # Fix: write large values to a temp file; the subprocess-exec patch
+                # (see module-level _apply_subprocess_exec_patch) injects
+                # --system-prompt-file <path> into the subprocess args.
                 if system_prompt:
-                    options.system_prompt = system_prompt
-                    
+                    if len(system_prompt.encode("utf-8")) > LARGE_ARG_THRESHOLD_BYTES:
+                        if not _subprocess_exec_patch_applied:
+                            raise RuntimeError(
+                                f"Large system_prompt ({len(system_prompt):,} chars) cannot be "
+                                f"passed as argv (exceeds ARG_MAX) and the subprocess exec patch "
+                                f"was NOT applied at startup. Cannot proceed safely. "
+                                f"Check bridge startup logs for the patch failure reason."
+                            )
+                        _tf = tempfile.NamedTemporaryFile(
+                            mode="w", suffix=".txt",
+                            prefix="bridge_sysprompt_",
+                            delete=False, encoding="utf-8"
+                        )
+                        _tf.write(system_prompt)
+                        _tf.close()
+                        _sys_prompt_tempfile_path = _tf.name
+                        _current_sys_prompt_tempfile.set(_tf.name)
+                        # Do NOT set options.system_prompt — the subprocess patch will
+                        # inject --system-prompt-file into the claude CLI args instead.
+                        logger.info(
+                            f"📁 Large system_prompt ({len(system_prompt):,} chars) written to "
+                            f"temp file for argv-safe delivery: {_tf.name}"
+                        )
+                    else:
+                        options.system_prompt = system_prompt
+                # === END SYSTEM PROMPT HANDLING ===
+
                 # Set tool restrictions
                 if allowed_tools:
                     options.allowed_tools = allowed_tools
@@ -1233,25 +1349,28 @@ CRITICAL: Write file EARLY to avoid context overflow. Use Write tool for clauded
                 tools_used = set()
                 start_time = datetime.now()
 
-                # === LARGE PROMPT HANDLING ===
-                # OS has ARG_MAX limit (~128-256KB) for command-line arguments.
-                # String prompts are passed as CLI args and fail with [Errno 7] if too large.
-                # Solution: Use streaming mode (stdin) for large prompts.
-                LARGE_PROMPT_THRESHOLD = 100_000  # ~100KB, safely under ARG_MAX
+                # === LARGE USER PROMPT HANDLING ===
+                # The SDK passes the user prompt as a positional argv arg.
+                # Values > ARG_MAX (~128 KB) cause E2BIG at exec() time.
+                # Solution: pass as an AsyncIterable so the SDK uses stdin (stream-json).
+                # LARGE_ARG_THRESHOLD_BYTES is defined at module level.
 
                 async def _prompt_to_stream(prompt_text: str):
-                    """Convert string prompt to AsyncIterable for streaming mode."""
+                    """Convert string prompt to AsyncIterable for streaming mode (stdin)."""
                     yield {
                         "type": "user",
                         "message": {"role": "user", "content": prompt_text}
                     }
 
-                if len(prompt) > LARGE_PROMPT_THRESHOLD:
-                    logger.info(f"🔄 Large prompt detected ({len(prompt):,} chars > {LARGE_PROMPT_THRESHOLD:,}), using streaming mode to bypass ARG_MAX")
+                if len(prompt.encode("utf-8")) > LARGE_ARG_THRESHOLD_BYTES:
+                    logger.info(
+                        f"🔄 Large user prompt ({len(prompt):,} chars) → streaming mode (stdin) "
+                        f"to bypass ARG_MAX"
+                    )
                     prompt_source = _prompt_to_stream(prompt)
                 else:
                     prompt_source = prompt
-                # === END LARGE PROMPT HANDLING ===
+                # === END LARGE USER PROMPT HANDLING ===
 
                 try:
                     async with asyncio.timeout(self.timeout):
@@ -1713,6 +1832,16 @@ CRITICAL: Write file EARLY to avoid context overflow. Use Write tool for clauded
                         logger.debug(f"🗑️  Cache file cleaned up: {cache_file.name}")
                 except Exception as cleanup_err:
                     logger.warning(f"Cache cleanup failed: {cleanup_err}")
+
+                # Cleanup large system_prompt temp file (if created for this request)
+                if _sys_prompt_tempfile_path:
+                    try:
+                        os.unlink(_sys_prompt_tempfile_path)
+                        logger.debug(f"🗑️  system_prompt temp file cleaned up: {_sys_prompt_tempfile_path}")
+                    except Exception as sp_cleanup_err:
+                        logger.warning(f"system_prompt temp file cleanup failed: {sp_cleanup_err}")
+                    finally:
+                        _current_sys_prompt_tempfile.set(None)  # Clear ContextVar for this task
 
                 # Restore original environment (if we changed anything)
                 if original_env:
