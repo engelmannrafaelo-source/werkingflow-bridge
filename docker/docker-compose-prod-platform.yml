@@ -44,6 +44,50 @@ services:
         reservations:
           memory: 256M
 
+  # =============================================================================
+  # platform-api — Dedicated DB-backed platform layer (Prod / Server-2).
+  # Mirror of the dev overlay's platform-api, with prod container name + the
+  # single prod network (bridge-prod-net = docker_bridge-prod-net). Serves all
+  # DB-backed routes (/v1/auth|users|tenants|billing|budget|activity|audit|
+  # feedback|dev-tokens|stammdaten|invoices|system|impersonation|app-licenses|
+  # admin, /v1/db/health, /v1/sandbox/*). fail-loud ohne BRIDGE_DB_URL.
+  # =============================================================================
+  platform-api:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.platform
+    container_name: wt-prod-platform-api
+    expose:
+      - "8000"
+    # Sandbox lease (/v1/sandbox/lease-token) liest OAuth-Token aus
+    # BRIDGE_SECRETS_DIR/claude_token_<account>.txt — gleiche Konvention wie Worker.
+    volumes:
+      - /root/werkingflow-bridge/secrets:/app/secrets:ro
+    env_file:
+      - ../secrets/platform.env
+    environment:
+      - TZ=Europe/Vienna
+      - LOG_LEVEL=INFO
+      - LOG_TO_FILE=false
+      - FILTER_SENSITIVE_DATA=true
+      - CORS_ORIGINS=["*"]
+      - BRIDGE_SECRETS_DIR=/app/secrets
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    restart: unless-stopped
+    networks:
+      - bridge-prod-net
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+        reservations:
+          memory: 256M
+
 volumes:
   bridge-postgres-prod-data:
     driver: local

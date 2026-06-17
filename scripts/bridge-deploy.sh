@@ -57,8 +57,11 @@ SERVER2_SVC_worker_sahori="wt-prod-worker-sahori"
 SERVER2_SVC_worker_kurt="wt-prod-worker-kurt"
 SERVER2_SVC_privacy_prod="wt-prod-privacy"
 SERVER2_SVC_metrics_reader_prod="wt-prod-metrics-reader"
-SERVER2_ALL="nginx worker-sahori worker-kurt privacy-prod metrics-reader-prod"
-SERVER2_NEEDS_BUILD="worker-sahori worker-kurt privacy-prod metrics-reader-prod"
+SERVER2_SVC_postgres_prod="bridge-postgres-prod"
+SERVER2_SVC_platform_api="wt-prod-platform-api"
+# postgres-prod zuerst (DB vor platform-api), platform-api vor nginx (Upstream-Resolve).
+SERVER2_ALL="postgres-prod platform-api nginx worker-sahori worker-kurt privacy-prod metrics-reader-prod"
+SERVER2_NEEDS_BUILD="platform-api worker-sahori worker-kurt privacy-prod metrics-reader-prod"
 
 # State (reset per server in deploy_server)
 ROLLBACK_SHA=""
