@@ -29,7 +29,7 @@ from src.claude_cli import (
     ClaudeCodeCLI,
     LARGE_ARG_THRESHOLD_BYTES,
     _current_sys_prompt_tempfile,
-    _subprocess_exec_patch_applied,
+    _open_process_patch_applied,
 )
 
 
@@ -304,11 +304,11 @@ class TestRunCompletionLargeSystemPrompt:
         self, cli, mock_session_mgr, monkeypatch
     ):
         """RuntimeError must be raised when patch is not applied and system_prompt is large."""
-        monkeypatch.setattr(_cli_module, "_subprocess_exec_patch_applied", False)
+        monkeypatch.setattr(_cli_module, "_open_process_patch_applied", False)
 
         large_sp = "Y" * (LARGE_ARG_THRESHOLD_BYTES + 1)
 
-        with pytest.raises(RuntimeError, match="subprocess exec patch was NOT applied"):
+        with pytest.raises(RuntimeError, match="anyio.open_process patch was NOT applied"):
             async for _ in cli.run_completion(
                 prompt="hi",
                 system_prompt=large_sp,
@@ -333,11 +333,91 @@ class TestModuleConstants:
         )
 
     def test_patch_was_applied_at_import(self):
-        """The subprocess exec patch must be applied when the module is imported."""
-        assert _subprocess_exec_patch_applied is True, (
-            "The subprocess exec patch must have been applied during module import"
+        """The anyio.open_process patch must be applied when the module is imported."""
+        assert _open_process_patch_applied is True, (
+            "The anyio.open_process patch must have been applied during module import"
         )
 
     def test_contextvar_default_is_none(self):
         """ContextVar default must be None (no temp file for requests that don't need it)."""
         assert _current_sys_prompt_tempfile.get() is None
+
+
+# ===========================================================================
+# 4. Integration point — the REAL spawn function (anyio.open_process)
+#
+# This is the test that distinguishes "patched the right function" from
+# "patched a function the SDK never calls". The SDK 0.0.22 transport spawns via
+# `anyio.open_process(cmd, ...)` where cmd[0] is the claude binary path. The
+# patch must inject --system-prompt-file into that command list when (and only
+# when) the ContextVar carries a temp-file path.
+# ===========================================================================
+
+class TestAnyioOpenProcessInterception:
+    """The patch must intercept anyio.open_process — the function the SDK uses."""
+
+    @pytest.mark.asyncio
+    async def test_injects_system_prompt_file_when_contextvar_set(self):
+        """With the ContextVar set, a claude command list gets --system-prompt-file appended."""
+        import anyio
+
+        captured = {}
+
+        async def fake_original(command, *args, **kwargs):
+            captured["command"] = command
+            return Mock()
+
+        # Re-apply the patch on top of a known original so we exercise the real
+        # interceptor wrapper (not a test double).
+        with patch.object(anyio, "open_process", side_effect=fake_original):
+            _cli_module._apply_open_process_patch()  # wraps the fake original
+            _current_sys_prompt_tempfile.set("/tmp/sysprompt_under_test.txt")
+            await anyio.open_process(
+                ["/usr/bin/claude", "--output-format", "stream-json", "--verbose"],
+                stdin=None, stdout=None, stderr=None,
+            )
+
+        assert captured["command"][-2:] == ["--system-prompt-file", "/tmp/sysprompt_under_test.txt"], (
+            "Patch must append --system-prompt-file to the claude command list"
+        )
+
+    @pytest.mark.asyncio
+    async def test_no_injection_when_contextvar_unset(self):
+        """Without the ContextVar, the command list passes through untouched."""
+        import anyio
+
+        captured = {}
+
+        async def fake_original(command, *args, **kwargs):
+            captured["command"] = command
+            return Mock()
+
+        with patch.object(anyio, "open_process", side_effect=fake_original):
+            _cli_module._apply_open_process_patch()
+            _current_sys_prompt_tempfile.set(None)
+            original_cmd = ["/usr/bin/claude", "--output-format", "stream-json"]
+            await anyio.open_process(list(original_cmd), stdin=None, stdout=None, stderr=None)
+
+        assert captured["command"] == ["/usr/bin/claude", "--output-format", "stream-json"], (
+            "Without a temp-file ContextVar, the command must be unmodified"
+        )
+
+    @pytest.mark.asyncio
+    async def test_no_injection_for_non_claude_command(self):
+        """A non-claude subprocess must never get --system-prompt-file, even if ContextVar is set."""
+        import anyio
+
+        captured = {}
+
+        async def fake_original(command, *args, **kwargs):
+            captured["command"] = command
+            return Mock()
+
+        with patch.object(anyio, "open_process", side_effect=fake_original):
+            _cli_module._apply_open_process_patch()
+            _current_sys_prompt_tempfile.set("/tmp/should_not_leak.txt")
+            await anyio.open_process(["/usr/bin/node", "some-script.js"], stdin=None)
+
+        assert "--system-prompt-file" not in captured["command"], (
+            "Patch must only touch the claude binary, never unrelated subprocesses"
+        )

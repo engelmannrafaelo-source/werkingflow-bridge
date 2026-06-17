@@ -104,14 +104,16 @@ except Exception as patch_err:
 # =============================================================================
 # LARGE PROMPT HANDLING: Avoid OS ARG_MAX (typically ~128 KB on Linux)
 #
-# The Python SDK spawns:  claude --print --system-prompt <value> --max-turns N
+# The Python SDK spawns (via anyio.open_process):
+#   claude --output-format stream-json --system-prompt <value> ...
 # When <value> exceeds ARG_MAX the OS rejects exec() with E2BIG (errno 7,
 # "Argument list too long"). The SDK surfaces this silently as 503/capacity_busy.
 #
-# FIX for system_prompt: Intercept asyncio.create_subprocess_exec before it
-# reaches the OS. A ContextVar carries the temp-file path for the current
-# async task; when set, --system-prompt-file <path> is appended to the claude
-# args instead of --system-prompt <large_value>.
+# FIX for system_prompt: Intercept anyio.open_process (the function the SDK
+# actually calls — NOT asyncio.create_subprocess_exec) before it reaches the OS.
+# A ContextVar carries the temp-file path for the current async task; when set,
+# --system-prompt-file <path> is appended to the claude command list instead of
+# --system-prompt <large_value>.
 # ContextVar gives each concurrent task its own isolated context (no global state).
 #
 # FIX for run_native_cli prompt: pass via stdin (input= in subprocess.run).
@@ -126,56 +128,88 @@ _current_sys_prompt_tempfile: ContextVar[Optional[str]] = ContextVar(
     "_bridge_sys_prompt_tempfile", default=None
 )
 
-_subprocess_exec_patch_applied: bool = False
+_open_process_patch_applied: bool = False
 
 
-def _apply_subprocess_exec_patch() -> None:
-    """Monkey-patch asyncio.create_subprocess_exec once at module load.
+def _apply_open_process_patch() -> None:
+    """Monkey-patch anyio.open_process once at module load.
 
-    When _current_sys_prompt_tempfile is set for the current async task, the
-    patch appends --system-prompt-file <path> to any claude subprocess args.
-    Also patches SDK internal modules that already bound the reference via
-    `from asyncio import create_subprocess_exec` at their import time.
+    The claude_code_sdk subprocess transport spawns the CLI via
+    `anyio.open_process(cmd, ...)` (claude_code_sdk/_internal/transport/
+    subprocess_cli.py) — NOT asyncio.create_subprocess_exec. `cmd` is a list
+    whose first element is the claude binary path (shutil.which("claude")).
+
+    When _current_sys_prompt_tempfile is set for the current async task, this
+    patch appends ["--system-prompt-file", <path>] to that command list so the
+    CLI reads the (oversized) system prompt from a file instead of argv.
+    ContextVar isolates concurrent async tasks.
+
+    The SDK does `import anyio` and calls `anyio.open_process` (attribute lookup
+    at call time), so patching the anyio module attribute is sufficient. We
+    still verify the SDK transport actually resolves to our wrapper and FAIL
+    LOUD if it does not — a silently-ineffective patch would drop large system
+    prompts without error, which is exactly the failure mode this guards against.
     """
-    global _subprocess_exec_patch_applied
+    global _open_process_patch_applied
 
-    _original_exec = asyncio.create_subprocess_exec
+    import anyio
 
-    async def _intercepted_create_subprocess_exec(*args, **kwargs):
+    _original_open_process = anyio.open_process
+
+    async def _intercepted_open_process(command, *args, **kwargs):
         tempfile_path = _current_sys_prompt_tempfile.get()
-        if tempfile_path and args and str(args[0]).endswith("claude"):
-            # options.system_prompt was intentionally NOT set for this request;
-            # inject --system-prompt-file so the CLI reads from the temp file.
-            args = args + ("--system-prompt-file", tempfile_path)
+        if (
+            tempfile_path
+            and isinstance(command, (list, tuple))
+            and command
+            and str(command[0]).endswith("claude")
+        ):
+            # options.system_prompt was intentionally NOT set for this request
+            # (so the SDK did not add --system-prompt <big>). Inject the file
+            # variant instead, which the claude CLI reads off-argv.
+            command = list(command) + ["--system-prompt-file", tempfile_path]
             logger.debug(
-                f"🔧 Subprocess patch: injected --system-prompt-file {tempfile_path!r}"
+                f"🔧 open_process patch: injected --system-prompt-file {tempfile_path!r}"
             )
-        return await _original_exec(*args, **kwargs)
+        return await _original_open_process(command, *args, **kwargs)
 
-    asyncio.create_subprocess_exec = _intercepted_create_subprocess_exec  # type: ignore[assignment]
+    anyio.open_process = _intercepted_open_process  # type: ignore[assignment]
 
-    # Also patch direct references already bound in SDK internal modules
+    # Defensive: patch any module that bound the reference directly via
+    # `from anyio import open_process` at import time (the 0.0.22 transport uses
+    # `import anyio`, so this normally finds nothing — kept for forward-compat).
     patched_modules: list = []
     for _mod_name, _mod in list(sys.modules.items()):
-        if "claude_code_sdk" in _mod_name or "anthropic" in _mod_name.lower():
-            if hasattr(_mod, "create_subprocess_exec"):
-                ref = getattr(_mod, "create_subprocess_exec")
-                if ref is _original_exec:
-                    setattr(_mod, "create_subprocess_exec", _intercepted_create_subprocess_exec)
-                    patched_modules.append(_mod_name)
+        if "claude_code_sdk" in _mod_name:
+            if getattr(_mod, "open_process", None) is _original_open_process:
+                setattr(_mod, "open_process", _intercepted_open_process)
+                patched_modules.append(_mod_name)
 
-    _subprocess_exec_patch_applied = True
+    # FAIL LOUD: confirm the SDK transport will actually hit our wrapper. If the
+    # SDK ever changes its spawn path, this raises at startup instead of silently
+    # dropping large system prompts at request time.
+    import claude_code_sdk._internal.transport.subprocess_cli as _sdk_transport
+    _effective = getattr(getattr(_sdk_transport, "anyio", None), "open_process", None)
+    if _effective is not _intercepted_open_process and _sdk_transport.__dict__.get("open_process") is not _intercepted_open_process:
+        raise RuntimeError(
+            "anyio.open_process patch did not reach the SDK transport "
+            "(claude_code_sdk._internal.transport.subprocess_cli). The SDK spawn "
+            "path changed; large system_prompt delivery would silently break. "
+            "Re-check how the installed claude_code_sdk spawns the CLI."
+        )
+
+    _open_process_patch_applied = True
     logger.info(
-        f"✅ Subprocess exec patched for large system_prompt (ARG_MAX guard). "
-        f"SDK modules patched: {patched_modules or 'none found'}"
+        f"✅ anyio.open_process patched for large system_prompt (ARG_MAX guard). "
+        f"Extra SDK modules rebound: {patched_modules or 'none (uses import anyio)'}"
     )
 
 
 try:
-    _apply_subprocess_exec_patch()
+    _apply_open_process_patch()
 except Exception as _sp_patch_err:
     logger.warning(
-        f"⚠️ Could not apply subprocess exec patch for large system_prompt: {_sp_patch_err}. "
+        f"⚠️ Could not apply anyio.open_process patch for large system_prompt: {_sp_patch_err}. "
         f"Requests with system_prompt > {LARGE_ARG_THRESHOLD_BYTES:,} bytes will fail loudly."
     )
 # =============================================================================
@@ -1222,15 +1256,15 @@ CRITICAL: Write file EARLY to avoid context overflow. Use Write tool for clauded
                 # claude CLI subprocess.  Values > ARG_MAX (~128 KB) cause E2BIG: the CLI
                 # never starts and the bridge reports a 503/capacity_busy instead of the
                 # real error (unified-tester sends ~184 KB system prompts).
-                # Fix: write large values to a temp file; the subprocess-exec patch
-                # (see module-level _apply_subprocess_exec_patch) injects
+                # Fix: write large values to a temp file; the anyio.open_process patch
+                # (see module-level _apply_open_process_patch) injects
                 # --system-prompt-file <path> into the subprocess args.
                 if system_prompt:
                     if len(system_prompt.encode("utf-8")) > LARGE_ARG_THRESHOLD_BYTES:
-                        if not _subprocess_exec_patch_applied:
+                        if not _open_process_patch_applied:
                             raise RuntimeError(
                                 f"Large system_prompt ({len(system_prompt):,} chars) cannot be "
-                                f"passed as argv (exceeds ARG_MAX) and the subprocess exec patch "
+                                f"passed as argv (exceeds ARG_MAX) and the anyio.open_process patch "
                                 f"was NOT applied at startup. Cannot proceed safely. "
                                 f"Check bridge startup logs for the patch failure reason."
                             )
