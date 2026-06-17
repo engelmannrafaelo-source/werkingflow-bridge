@@ -33,6 +33,7 @@ from fastapi import HTTPException
 
 from src.budget.plans import find_plan_for_app
 from src.budget.routes import evaluate_budget
+from src.identity.user_resolver import resolve_user_id
 
 logger = logging.getLogger(__name__)
 
@@ -74,10 +75,12 @@ async def enforce_budget(
         return
 
     try:
-        uid = uuid.UUID(user_id)
-    except (ValueError, AttributeError, TypeError):
-        # Malformed user id — can't evaluate, don't punish the call.
-        logger.warning("budget gate: malformed user_id %r — letting call through", user_id)
+        uid = await resolve_user_id(user_id)
+    except (ValueError, AttributeError, TypeError) as e:
+        # Unresolvable identity (malformed, or an email with no Bridge user) —
+        # can't evaluate, don't punish the call (gate stays fail-open by design).
+        # Email identities that DO resolve are now enforced like any UUID.
+        logger.warning("budget gate: unresolvable user_id %r (%s) — letting call through", user_id, e)
         return
 
     if plan.interval == "project" and project_id:

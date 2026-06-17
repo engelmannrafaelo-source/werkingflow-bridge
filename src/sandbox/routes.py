@@ -35,6 +35,7 @@ from src.api_auth import (
 )
 from src.db.client import get_pool
 from src.budget.gate import enforce_budget
+from src.identity.user_resolver import resolve_user_id, UnresolvableUserIdentity
 from src.sandbox import account_router as _ar
 from src.sandbox import lease_service as _ls
 from src.sandbox.pricing import compute_hypothetical_cost_eur
@@ -80,7 +81,10 @@ router = APIRouter(prefix="/v1/sandbox", tags=["sandbox"])
 # ---------------------------------------------------------------------------
 
 class LeaseTokenRequest(BaseModel):
-    userId: uuid.UUID
+    # Accepts either a Bridge UUID (most apps) or a licensed email (Engelmann,
+    # which has its own Supabase user pool). Resolved to the canonical UUID in
+    # the handler via resolve_user_id — a uuid.UUID type here would 422 emails.
+    userId: str
     app: str
     estimatedDurationMin: int = Field(default=15, ge=1, le=480)
     preferredAccountId: Optional[str] = None
@@ -143,11 +147,22 @@ async def lease_token(
     body: LeaseTokenRequest,
     _claims: AuthClaims = Depends(require_service_token),
 ):
+    # Resolve the billing identity (Bridge UUID, or a licensed email for
+    # Engelmann) to the canonical UUID. Fail-fast: a lease must be billable, so
+    # an unresolvable identity is a hard 402 rather than a silent JIT-trial.
+    try:
+        uid = await resolve_user_id(body.userId)
+    except UnresolvableUserIdentity:
+        raise HTTPException(
+            status_code=402,
+            detail={"error": "unlicensed", "message": "Kein lizenziertes Bridge-Konto für diese Identität."},
+        )
+
     pool = get_pool()
     async with pool.acquire() as conn:
         # 1. Tenant + billing_mode (JIT-provisions the user if missing, so
         # first-lease for a new app-side identity does not fail with 404).
-        info = await _ls.get_tenant_info(conn, body.userId, app=body.app)
+        info = await _ls.get_tenant_info(conn, uid, app=body.app)
         billing_mode = info["billing_mode"]
         tenant_id = info["tenant_id"]
 
@@ -162,7 +177,7 @@ async def lease_token(
         # (all_exhausted / monthly_exceeded_no_topup / trial_expired); the
         # gate lets unlicensed users through so trial users reach the sandbox.
         # Fail-open on DB/infra errors (enforce_budget swallows them).
-        await enforce_budget(str(body.userId), body.app, 0.0)
+        await enforce_budget(str(uid), body.app, 0.0)
 
         # 4. Pick best account — S7 fair round-robin: pass recent lease counts
         # so the router prefers under-used accounts over the highest-headroom
@@ -195,7 +210,7 @@ async def lease_token(
         expires_at = datetime.now(timezone.utc) + timedelta(minutes=body.estimatedDurationMin + 5)
         lease_id = await _ls.create_lease(
             conn,
-            user_id=body.userId,
+            user_id=uid,
             tenant_id=tenant_id,
             app=body.app,
             account_id=picked.account_id,
@@ -203,7 +218,7 @@ async def lease_token(
         )
 
     logger.info(
-        f"Lease issued: lease={lease_id} user={body.userId} account={picked.account_id} "
+        f"Lease issued: lease={lease_id} user={uid} account={picked.account_id} "
         f"app={body.app} expires={expires_at.isoformat()}"
     )
 
