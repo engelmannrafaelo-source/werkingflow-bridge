@@ -30,6 +30,23 @@ SELF_BASE_URL = os.getenv("BRIDGE_SELF_URL", "http://localhost:8000")
 # alive meanwhile, and the watchdog only requeues a genuinely dead worker.
 CHAT_SELF_CALL_TIMEOUT_S = float(os.getenv("BRIDGE_CHAT_JOB_TIMEOUT_S", "600"))
 
+# Research (esp. deep/exhaustive) can run far longer than a chat — many minutes up
+# to ~40 min. The heartbeat keeps the job row alive for the whole run.
+RESEARCH_SELF_CALL_TIMEOUT_S = float(os.getenv("BRIDGE_RESEARCH_JOB_TIMEOUT_S", "2400"))
+
+# Generic JSON proxy self-call timeout (smart-anonymize etc. — short).
+PROXY_SELF_CALL_TIMEOUT_S = float(os.getenv("BRIDGE_PROXY_JOB_TIMEOUT_S", "300"))
+
+# Allowlist for the generic 'proxy' executor. ONLY these paths may be invoked as a
+# proxy job — never arbitrary paths (no /v1/jobs recursion, no internal routes).
+# JSON-in / JSON-out endpoints ONLY; binary/multipart endpoints (convert-*,
+# document/convert, audio/transcriptions) are deliberately out of scope — they
+# return binary / take file uploads that do not fit the JSON job-result model, and
+# are short calls that gain little from durability.
+PROXY_ALLOWED_PATHS = {
+    "/v1/privacy/smart-anonymize",
+}
+
 # attribution dict key → outgoing header, so the internal chat call bills/attributes
 # to the same app/user/workflow as a direct call would.
 _ATTRIBUTION_HEADERS = {
@@ -98,3 +115,70 @@ async def chat_executor(
         raise RuntimeError(f"chat self-call failed HTTP {response.status_code}: {detail}")
 
     return response.json()
+
+
+async def _self_post_json(
+    path: str,
+    body: Dict[str, Any],
+    attribution: Optional[Dict[str, Any]],
+    timeout_s: float,
+) -> Dict[str, Any]:
+    """POST a JSON body to one of THIS worker's own endpoints (self-HTTP) and return
+    the parsed JSON. Reuses the entire existing path (budget/billing/privacy/rate-
+    limit) exactly like a direct call — same pattern as chat_executor. Fail loud on
+    non-2xx or a non-JSON body so the job records an actionable error."""
+    import httpx
+
+    headers = _build_headers(attribution)
+    async with httpx.AsyncClient(timeout=timeout_s) as client:
+        response = await client.post(f"{SELF_BASE_URL}{path}", json=body, headers=headers)
+
+    if response.status_code >= 400:
+        raise RuntimeError(
+            f"self-call {path} failed HTTP {response.status_code}: {response.text[:500]}"
+        )
+    try:
+        return response.json()
+    except Exception as e:
+        ctype = response.headers.get("content-type", "?")
+        raise RuntimeError(f"self-call {path} returned non-JSON (content-type={ctype}): {e}")
+
+
+async def research_executor(
+    payload: Dict[str, Any],
+    attribution: Optional[Dict[str, Any]],
+    report_progress: Callable[[Dict[str, Any]], Awaitable[None]],
+) -> Dict[str, Any]:
+    """Run a /v1/research call as a durable job. Calls the existing endpoint in
+    BLOCKING mode (async_mode forced off) so this executor receives the full result;
+    durability/requeue comes from the job layer, NOT the legacy file-based research-
+    async path. Returns the research result dict. Fail loud on non-2xx."""
+    # Force blocking: if the caller left async_mode=true we'd get a job-id back
+    # instead of the result. The job layer is the durability mechanism here.
+    body = {**payload, "async_mode": False}
+    await report_progress({"phase": "research", "model": body.get("model")})
+    return await _self_post_json("/v1/research", body, attribution, RESEARCH_SELF_CALL_TIMEOUT_S)
+
+
+async def proxy_executor(
+    payload: Dict[str, Any],
+    attribution: Optional[Dict[str, Any]],
+    report_progress: Callable[[Dict[str, Any]], Awaitable[None]],
+) -> Dict[str, Any]:
+    """Generic durable job for an ALLOWLISTED JSON-in/JSON-out endpoint.
+
+        payload = {"path": "/v1/privacy/smart-anonymize", "body": {...}}
+
+    Rejects (fail loud) any path not in PROXY_ALLOWED_PATHS — no arbitrary self-
+    calls (no /v1/jobs recursion, no internal routes). Binary/multipart endpoints
+    are unsupported by design (see PROXY_ALLOWED_PATHS note)."""
+    path = payload.get("path")
+    body = payload.get("body", {})
+    if path not in PROXY_ALLOWED_PATHS:
+        raise RuntimeError(
+            f"proxy path not allowed: {path!r}. Allowed: {sorted(PROXY_ALLOWED_PATHS)}"
+        )
+    if not isinstance(body, dict):
+        raise RuntimeError("proxy 'body' must be a JSON object")
+    await report_progress({"phase": "proxy", "path": path})
+    return await _self_post_json(path, body, attribution, PROXY_SELF_CALL_TIMEOUT_S)
