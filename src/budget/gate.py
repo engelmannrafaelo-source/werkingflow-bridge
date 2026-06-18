@@ -83,7 +83,26 @@ async def enforce_budget(
         logger.warning("budget gate: unresolvable user_id %r (%s) — letting call through", user_id, e)
         return
 
-    if plan.interval == "project" and project_id:
+    if plan.interval == "project":
+        # Project-interval plans are gated PER PROJECT (keyed by project_id),
+        # NEVER on the monthly tenant budget — a project plan has no monthly
+        # budget entry, so the monthly evaluate_budget path below would always
+        # return reason="unlicensed" and falsely block. This branch owns the
+        # whole project-plan case so the call never leaks into the monthly path.
+        if not project_id:
+            # No project attribution. The canonical case is the sandbox-editor
+            # OAuth lease (/v1/sandbox/lease-token), which acquires a token with
+            # estimated_cost=0 and is not itself a billable call — actual
+            # per-token spend during the session is metered + gated by the
+            # per-project deduction path, which DOES carry the project_id.
+            # Blocking here broke the editor for every Energy user once Energy
+            # moved to a project-interval plan (structural "unlicensed").
+            logger.debug(
+                "budget gate: project plan %s without project_id — letting call "
+                "through (per-project deduction is the real gate)", plan.id,
+            )
+            return
+
         from src.billing.project_budgets_service import evaluate as _eval_project
 
         try:
