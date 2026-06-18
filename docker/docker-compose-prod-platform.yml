@@ -13,6 +13,17 @@
 # =============================================================================
 
 services:
+  # Prod-Worker bekommen platform.env (BRIDGE_DB_URL) — damit der /v1/jobs durable
+  # store + der Budget-Gate/Activity-Pool laufen. Spiegelt das dev-Overlay
+  # (worker1-4 env_file). Das Flag BRIDGE_GENERIC_JOBS_ENABLED steht in der base
+  # docker-compose-prod.yml (wie auf dev).
+  worker-sahori:
+    env_file:
+      - ../secrets/platform.env
+  worker-kurt:
+    env_file:
+      - ../secrets/platform.env
+
   postgres-prod:
     image: postgres:16-alpine
     container_name: bridge-postgres-prod

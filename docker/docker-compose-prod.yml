@@ -73,6 +73,7 @@ services:
       - LOG_TO_FILE=true
       - FILTER_SENSITIVE_DATA=true
       - INSTANCE_NAME=worker-sahori
+      - BRIDGE_GENERIC_JOBS_ENABLED=true
       - CLAUDE_CWD=/app/instances
       - DISABLE_COACH_MCP=true
       - MAX_TIMEOUT=2400000
@@ -126,6 +127,7 @@ services:
       - LOG_TO_FILE=true
       - FILTER_SENSITIVE_DATA=true
       - INSTANCE_NAME=worker-kurt
+      - BRIDGE_GENERIC_JOBS_ENABLED=true
       - CLAUDE_CWD=/app/instances
       - DISABLE_COACH_MCP=true
       - MAX_TIMEOUT=2400000
