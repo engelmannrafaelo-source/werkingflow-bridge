@@ -222,7 +222,16 @@ services:
       start_period: 10s
     restart: unless-stopped
     networks:
-      - bridge-prod-net
+      bridge-prod-net:
+        # Canonical DNS name the consumers hard-code: account_router.py
+        # (BRIDGE_METRICS_READER_URL default) + docker/lua/pool_router.lua +
+        # nginx.conf all resolve `http://metrics-reader:8000`. The dev compose
+        # names the service `metrics-reader`; prod named it `metrics-reader-prod`,
+        # so that hostname did NOT resolve in bridge-prod-net → every sandbox
+        # lease failed `pool_state_unavailable` (503) → app showed "start 500".
+        # Alias restores the canonical name without diverging the code per-env.
+        aliases:
+          - metrics-reader
 
 networks:
   bridge-prod-net:
