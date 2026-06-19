@@ -59,8 +59,10 @@ async def _deduct_sandbox_budget(
     try:
         from src.budget.plans import find_plan_for_app
         from src.budget.routes import apply_budget_deduction, BudgetDeductionDenied
+        from src.sandbox.lease_service import base_app_id
 
-        plan = find_plan_for_app(app)
+        # Coach sub-products bill against their base app's plan (same subscriber).
+        plan = find_plan_for_app(base_app_id(app))
         if plan is None:
             return  # app not in plan catalog — not budget-tracked
         try:

@@ -38,6 +38,23 @@ def _load_jit_whitelist() -> set[str]:
     return {a.strip() for a in raw.split(",") if a.strip()}
 
 
+# Sandbox sub-products use an "<app>-coach" app-id (e.g. 'werking-report-coach')
+# so the daemon can register a distinct adapter, but for identity, JIT-allowlist,
+# plan and budget the coach IS its base app — the same paying customer, the same
+# subscription. Normalising here keeps coach usage tied to the user's own base-app
+# tenant/plan instead of falling outside the catalog (untracked) or, worse, onto a
+# foreign identity. Only the exact, known "-coach" suffix is stripped — anything
+# else is returned verbatim, so an unknown app still fails the allowlist loudly.
+_COACH_SUFFIX = "-coach"
+
+
+def base_app_id(app: str) -> str:
+    """Map a sandbox sub-product app-id to its billing/identity base app."""
+    if app and app.endswith(_COACH_SUFFIX):
+        return app[: -len(_COACH_SUFFIX)]
+    return app
+
+
 # ---------------------------------------------------------------------------
 # Token file
 # ---------------------------------------------------------------------------
@@ -95,12 +112,14 @@ async def get_tenant_info(
     )
     if row is None:
         if auto_provision and app:
+            # Coach sub-products inherit their base app's allowlist + tenant.
+            app_base = base_app_id(app)
             whitelist = _load_jit_whitelist()
-            if app not in whitelist:
+            if app_base not in whitelist:
                 logger.warning(
-                    f"JIT denied: user={user_id} app={app!r} not in whitelist. "
-                    f"Allowed: {sorted(whitelist)}. Returning 404 — tenant must "
-                    f"be created explicitly via POST /v1/tenants."
+                    f"JIT denied: user={user_id} app={app!r} (base={app_base!r}) not "
+                    f"in whitelist. Allowed: {sorted(whitelist)}. Returning 404 — tenant "
+                    f"must be created explicitly via POST /v1/tenants."
                 )
                 raise HTTPException(
                     status_code=404,
@@ -110,7 +129,7 @@ async def get_tenant_info(
                         f"POST /v1/tenants before first sandbox lease."
                     ),
                 )
-            await _jit_provision_user(conn, user_id, app)
+            await _jit_provision_user(conn, user_id, app_base)
             row = await conn.fetchrow(
                 """
                 SELECT u.tenant_id, t.billing_mode
