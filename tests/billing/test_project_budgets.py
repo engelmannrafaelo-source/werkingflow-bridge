@@ -25,6 +25,7 @@ from src.billing.project_budgets_service import (
     deduct,
     evaluate,
     get_budget,
+    list_budgets,
 )
 
 PG = "src.billing.project_budgets_service.get_pool"
@@ -211,3 +212,56 @@ async def test_deduct_no_lazy_alloc_without_tenant():
             allocate_limit_eur=100.0, tenant_id=None,
         )
     assert r == {"exists": False, "deductedEur": 0.0, "usedEur": 0.0, "remainingEur": 0.0}
+
+
+# --- list_budgets ----------------------------------------------------------
+
+def _mock_pool_fetch(*fetch_results):
+    """Pool whose conn.fetch returns each result in order (one per call)."""
+    conn = AsyncMock()
+    conn.fetch = AsyncMock(side_effect=list(fetch_results))
+
+    @asynccontextmanager
+    async def _acquire():
+        yield conn
+
+    pool = MagicMock()
+    pool.acquire = _acquire
+    return pool, conn
+
+
+@pytest.mark.asyncio
+async def test_list_budgets_aggregates_pot_and_joins_tokens():
+    # 2 projects × 100 = 500 pot; tokens joined by project_id; P2 has no tokens.
+    budget_rows = [
+        {"project_id": "P1", "limit_eur": Decimal("100"), "used_eur": Decimal("40")},
+        {"project_id": "P2", "limit_eur": Decimal("100"), "used_eur": Decimal("0")},
+    ]
+    token_rows = [{"project_id": "P1", "tokens_used": 12345}]
+    pool, _ = _mock_pool_fetch(budget_rows, token_rows)
+    with patch(PG, return_value=pool):
+        out = await list_budgets(uuid.uuid4(), "energy-project")
+
+    assert out["totals"] == {
+        "limitEur": 200.0,
+        "usedEur": 40.0,
+        "remainingEur": 160.0,
+        "tokensUsed": 12345,
+        "projectCount": 2,
+    }
+    p1, p2 = out["projects"]
+    assert p1 == {
+        "projectId": "P1", "limitEur": 100.0, "usedEur": 40.0,
+        "remainingEur": 60.0, "tokensUsed": 12345,
+    }
+    assert p2["tokensUsed"] == 0  # budget row without usage rows
+
+
+@pytest.mark.asyncio
+async def test_list_budgets_empty_when_no_projects():
+    pool, _ = _mock_pool_fetch([], [])
+    with patch(PG, return_value=pool):
+        out = await list_budgets(uuid.uuid4(), "energy-project")
+    assert out["projects"] == []
+    assert out["totals"]["projectCount"] == 0
+    assert out["totals"]["limitEur"] == 0.0

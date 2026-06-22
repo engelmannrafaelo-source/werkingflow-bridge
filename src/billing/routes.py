@@ -593,6 +593,7 @@ async def list_billing_events(
 
 from src.billing import pending_orders_service  # noqa: E402
 from src.billing import project_credits_service  # noqa: E402
+from src.billing import project_budgets_service  # noqa: E402
 
 _pending_router = APIRouter(tags=["billing"])
 _admin_orders_router = APIRouter(tags=["billing"])
@@ -716,6 +717,26 @@ async def list_project_credits(
     except ValueError:
         raise HTTPException(status_code=400, detail=f"Invalid user_id: {user_id}")
     return {"credits": credits}
+
+
+@_project_credits_router.get("/v1/users/{user_id}/project-budgets")
+async def list_project_budgets(
+    user_id: str,
+    plan_id: str = "energy-project",
+    _claims: AuthClaims = Depends(require_self_or_admin),
+) -> Dict[str, Any]:
+    """
+    Per-Projekt-Budgets eines Users (für die App-Budget-Anzeige).
+
+    Liefert pro Projekt {projectId, limitEur, usedEur, remainingEur, tokensUsed}
+    plus aggregierte totals (N Projekte × EUR 100 = gemeinsamer Topf). Tokens
+    kommen aus usage_events (workflow_id == project_id). Self-or-Admin: User
+    sieht eigene Budgets, Operator alle.
+    """
+    try:
+        return await project_budgets_service.list_budgets(_uuid.UUID(user_id), plan_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail=f"Invalid user_id: {user_id}")
 
 
 class ConsumeProjectCreditRequest(BaseModel):

@@ -118,6 +118,91 @@ async def get_budget(
     }
 
 
+async def list_budgets(user_id: uuid.UUID, plan_id: str) -> Dict[str, Any]:
+    """All project budgets for (user, plan) plus per-project token usage.
+
+    Read path for the app's budget display. Returns the per-project EUR ledger
+    from project_budgets joined with the per-project token total aggregated from
+    usage_events (workflow rows, attributed by provider_metadata.workflow_id ==
+    project_id), and the aggregated totals across all of the user's projects:
+
+      {
+        "projects": [
+          {projectId, limitEur, usedEur, remainingEur, tokensUsed}, ...
+        ],
+        "totals": {limitEur, usedEur, remainingEur, tokensUsed, projectCount},
+      }
+
+    The aggregated total is the product's "pot" model: N projects × EUR 100 =
+    EUR N*100 shared headroom, while tokensUsed per row answers "which project
+    spent how much". A project with a budget row but no LLM calls yet reports
+    tokensUsed=0; token rows without a matching budget row are ignored (a budget
+    is always allocated before/at the first call, so this only drops pre-feature
+    or cross-plan noise).
+    """
+    pool = get_pool()
+    async with pool.acquire() as conn:
+        budget_rows = await conn.fetch(
+            """
+            SELECT project_id, limit_eur, used_eur
+              FROM project_budgets
+             WHERE user_id = $1 AND plan_id = $2
+             ORDER BY created_at ASC
+            """,
+            user_id,
+            plan_id,
+        )
+        # Per-project token totals from the usage ledger. workflow_id lives in
+        # provider_metadata JSONB (== app project_id). Only workflow rows carry it.
+        token_rows = await conn.fetch(
+            """
+            SELECT provider_metadata->>'workflow_id' AS project_id,
+                   COALESCE(SUM(input_tokens + output_tokens), 0) AS tokens_used
+              FROM usage_events
+             WHERE user_id = $1
+               AND source = 'workflow'
+               AND provider_metadata->>'workflow_id' IS NOT NULL
+             GROUP BY provider_metadata->>'workflow_id'
+            """,
+            user_id,
+        )
+
+    tokens_by_project = {r["project_id"]: int(r["tokens_used"]) for r in token_rows}
+
+    projects = []
+    total_limit = Decimal("0")
+    total_used = Decimal("0")
+    total_tokens = 0
+    for row in budget_rows:
+        project_id = row["project_id"]
+        limit = Decimal(row["limit_eur"])
+        used = Decimal(row["used_eur"])
+        tokens = tokens_by_project.get(project_id, 0)
+        total_limit += limit
+        total_used += used
+        total_tokens += tokens
+        projects.append(
+            {
+                "projectId": project_id,
+                "limitEur": float(limit),
+                "usedEur": float(used),
+                "remainingEur": float(max(Decimal("0"), limit - used)),
+                "tokensUsed": tokens,
+            }
+        )
+
+    return {
+        "projects": projects,
+        "totals": {
+            "limitEur": float(total_limit),
+            "usedEur": float(total_used),
+            "remainingEur": float(max(Decimal("0"), total_limit - total_used)),
+            "tokensUsed": total_tokens,
+            "projectCount": len(projects),
+        },
+    }
+
+
 async def evaluate(
     user_id: uuid.UUID,
     plan_id: str,
