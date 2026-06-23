@@ -117,6 +117,37 @@ def get_middleware():
     return _privacy_middleware
 
 
+@app.on_event("startup")
+async def _warmup_privacy_models() -> None:
+    """Pre-load Presidio/spaCy at boot so the first real smart-anonymize doesn't
+    pay the ~50s cold-start.
+
+    The Presidio analyzer is lazy-built on first use (PrivacyMiddleware.anonymizer).
+    On a cold uvicorn worker that first call takes ~50s, which overruns the inner
+    refinement self-call timeout → the worker returns 500 → nginx maps it to 502
+    (observed intermittently in the "Was die KI sieht" preview, 2026-06-23).
+
+    Runs once per uvicorn worker. Non-blocking (thread executor) so the worker is
+    immediately ready for the /health probe; the models warm within ~1 min, well
+    inside the container's 240s healthcheck start_period. Fail-soft: on any error
+    we simply fall back to the existing lazy-load on first request.
+    """
+    import asyncio
+
+    def _load() -> None:
+        try:
+            mw = get_middleware()
+            mw.anonymize_messages(
+                [{"role": "user", "content": "Warmup: Max Mustermann, Wien."}],
+                privacy_mode="full",
+            )
+            logger.info("[warmup] Presidio/spaCy pre-warmed at startup")
+        except Exception as e:  # noqa: BLE001 — fail-soft; lazy-load stays the fallback
+            logger.warning(f"[warmup] privacy preload failed (lazy-load on demand): {e}")
+
+    asyncio.get_running_loop().run_in_executor(None, _load)
+
+
 # ======================== Privacy Endpoints ========================
 
 @app.post("/anonymize", response_model=AnonymizeResponse)
