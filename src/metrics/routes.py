@@ -199,7 +199,13 @@ async def usage_metrics(
             mb["realCostEur"] = round(mb["realCostEur"] + real, 6)
             mb["hypotheticalCostEur"] = round(mb["hypotheticalCostEur"] + hyp, 6)
             mb["estimatedCostEur"] = mb["hypotheticalCostEur"]
-        b["bySource"][src] = b["bySource"].get(src, 0) + 1
+        sb = b["bySource"].setdefault(src, {
+            "calls": 0, "tokens": 0, "realCostEur": 0.0, "hypotheticalCostEur": 0.0,
+        })
+        sb["calls"] += 1
+        sb["tokens"] += tt
+        sb["realCostEur"] = round(sb["realCostEur"] + real, 6)
+        sb["hypotheticalCostEur"] = round(sb["hypotheticalCostEur"] + hyp, 6)
 
         totals["calls"] += 1
         if is_err:
