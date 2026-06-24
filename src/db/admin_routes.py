@@ -168,10 +168,36 @@ async def list_users(
     pool = get_pool()
     async with pool.acquire() as conn:
         rows = await conn.fetch(sql, *args)
-    return [
-        {**_user_row_to_dict(r), "tenant_account_type": r["tenant_account_type"]}
-        for r in rows
-    ]
+        # Batch-fetch licenses for all returned users in one query.
+        # The list endpoint must not return app_licenses=[] for users that have
+        # licenses — the UI uses this to display the license count column.
+        user_ids = [r["id"] for r in rows]
+        if user_ids:
+            lic_rows = await conn.fetch(
+                "SELECT user_id, app_id, plan_id, start_date, end_date, seats "
+                "FROM app_licenses WHERE user_id = ANY($1::uuid[])",
+                user_ids,
+            )
+        else:
+            lic_rows = []
+
+    licenses_by_user: Dict[Any, List[Dict[str, Any]]] = {}
+    for lr in lic_rows:
+        uid = lr["user_id"]
+        licenses_by_user.setdefault(uid, []).append({
+            "app_id": lr["app_id"],
+            "plan_id": lr["plan_id"],
+            "start_date": lr["start_date"].isoformat(),
+            "end_date": lr["end_date"].isoformat() if lr["end_date"] else None,
+            "seats": lr["seats"],
+        })
+
+    result = []
+    for r in rows:
+        u = {**_user_row_to_dict(r), "tenant_account_type": r["tenant_account_type"]}
+        u["app_licenses"] = licenses_by_user.get(r["id"], [])
+        result.append(u)
+    return result
 
 
 @router.post("/v1/users", status_code=201)
