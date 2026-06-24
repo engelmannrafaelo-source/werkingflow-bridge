@@ -14,7 +14,9 @@ Routing contract (enforced by nginx path-based split):
     /v1/activity/*      activity log
     /v1/audit/*         audit trail
     /v1/feedback        feedback
-    /v1/dev-tokens/*    dev tokens
+    /v1/developer-tokens/*  developer API tokens
+    /v1/metrics/usage   usage aggregates (groupBy=user|tenant|app|model)
+    /v1/metrics/timeseries  usage timeseries
     /v1/stammdaten/*    master data
     /v1/invoices/*      invoice PDF generation
     /v1/system/*        system admin

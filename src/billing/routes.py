@@ -539,30 +539,72 @@ async def billing_cancel_sub(
 # Events — Mollie audit trail
 # ---------------------------------------------------------------------------
 
+_ALLOWED_ACCOUNT_TYPES = {"customer", "test", "internal"}
+
+
 @router.get("/events")
 async def list_billing_events(
     userId: str | None = None,
     tenantId: str | None = None,
     eventType: str | None = None,
+    account_type: str | None = None,
     limit: int = 200,
     _claims: AuthClaims = Depends(require_admin),
 ) -> Dict[str, Any]:
-    """Append-only billing audit trail. Admin only."""
+    """Append-only billing audit trail. Admin only.
+
+    account_type filters by the owning tenant's type (customer|test|internal)
+    via an INNER JOIN on tenants. Events without a tenant_id are excluded when
+    account_type is set — they cannot be attributed to an account type.
+    """
     import uuid as _uuid
-    from typing import List, Any
+
+    if account_type and account_type not in _ALLOWED_ACCOUNT_TYPES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid account_type: {account_type!r}. Must be customer|test|internal",
+        )
+
     pool = get_pool()
     where: list = []
     args: list = []
-    def add(cond: str, val: Any) -> None:
-        args.append(val); where.append(cond.replace("$$", f"${len(args)}"))
-    if userId:    add("user_id = $$", _uuid.UUID(userId))
-    if tenantId:  add("tenant_id = $$", tenantId)
-    if eventType: add("event_type = $$", eventType)
 
-    sql = "SELECT id, timestamp, event_type, user_id, tenant_id, subscription_id, invoice_id, mollie_payment_id, amount_eur, source, payload FROM billing_events"
+    def add(cond: str, val: Any) -> None:
+        args.append(val)
+        where.append(cond.replace("$$", f"${len(args)}"))
+
+    if account_type:
+        # Qualify column names to avoid ambiguity with the tenants JOIN.
+        if userId:
+            add("be.user_id = $$", _uuid.UUID(userId))
+        if tenantId:
+            add("be.tenant_id = $$", tenantId)
+        if eventType:
+            add("be.event_type = $$", eventType)
+        add("t.account_type = $$::account_type", account_type)
+        sql = (
+            "SELECT be.id, be.timestamp, be.event_type, be.user_id, be.tenant_id, "
+            "be.subscription_id, be.invoice_id, be.mollie_payment_id, be.amount_eur, be.source, be.payload "
+            "FROM billing_events be "
+            "JOIN tenants t ON be.tenant_id = t.id"
+        )
+        order_col = "be.timestamp"
+    else:
+        if userId:
+            add("user_id = $$", _uuid.UUID(userId))
+        if tenantId:
+            add("tenant_id = $$", tenantId)
+        if eventType:
+            add("event_type = $$", eventType)
+        sql = (
+            "SELECT id, timestamp, event_type, user_id, tenant_id, subscription_id, "
+            "invoice_id, mollie_payment_id, amount_eur, source, payload FROM billing_events"
+        )
+        order_col = "timestamp"
+
     if where:
         sql += " WHERE " + " AND ".join(where)
-    sql += f" ORDER BY timestamp DESC LIMIT ${len(args) + 1}"
+    sql += f" ORDER BY {order_col} DESC LIMIT ${len(args) + 1}"
     args.append(min(max(1, limit), 1000))
 
     async with pool.acquire() as conn:
@@ -583,8 +625,6 @@ async def list_billing_events(
             "payload": r["payload"] if isinstance(r["payload"], dict) else {},
         }
     return {"items": [_row(r) for r in rows], "count": len(rows)}
-
-# mode_filter applied (overview signature only — body needs JOIN if you want per-mode totals)
 
 
 # ---------------------------------------------------------------------------

@@ -114,6 +114,9 @@ def _parse_iso_timestamp(value: str, field: str) -> datetime:
     return dt
 
 
+_ALLOWED_ACCOUNT_TYPES = {"customer", "test", "internal"}
+
+
 @router.get("/query")
 async def activity_query(
     tenantId: Optional[str] = None,
@@ -125,6 +128,7 @@ async def activity_query(
     until: Optional[str] = Query(None, description="ISO timestamp"),
     limit: int = Query(100, ge=1, le=1000),
     mode: Optional[str] = Query(None, description="prod|staging|local — filter by app_env (X-App-Env)"),
+    account_type: Optional[str] = Query(None, description="customer|test|internal — filter by tenant.account_type (JOIN tenants)"),
     claims: AuthClaims = Depends(require_jwt_or_service),
 ) -> Dict[str, Any]:
     # Operators (service token without X-User-ID, admin JWT) may query across
@@ -136,6 +140,12 @@ async def activity_query(
         if userId and userId != caller_id:
             raise HTTPException(status_code=403, detail="Forbidden: can only query own activity")
         userId = caller_id
+
+    # Validate inputs fail-fast before building any SQL.
+    if mode and mode not in ("prod", "staging", "local"):
+        raise HTTPException(status_code=400, detail=f"Invalid mode: {mode!r}. Must be prod|staging|local")
+    if account_type and account_type not in _ALLOWED_ACCOUNT_TYPES:
+        raise HTTPException(status_code=400, detail=f"Invalid account_type: {account_type!r}. Must be customer|test|internal")
 
     where: List[str] = []
     args: List[Any] = []
@@ -171,15 +181,22 @@ async def activity_query(
     # tenant.account_type. Rows with NULL app_env (pre-migration / no header)
     # are honestly un-attributed and excluded when a mode is requested.
     if mode:
-        if mode not in ("prod", "staging", "local"):
-            raise HTTPException(status_code=400, detail=f"Invalid mode: {mode}")
         add("activities.app_env = $$::app_env", mode)
 
-    sql = """
+    # "account_type" filters by the owning tenant's type (customer|test|internal).
+    # Uses an INNER JOIN so activities without a tenant_id are excluded when
+    # filtering — a tenant-less activity cannot be attributed to an account type.
+    join_clause = ""
+    if account_type:
+        join_clause = "JOIN tenants ON activities.tenant_id = tenants.id"
+        add("tenants.account_type = $$::account_type", account_type)
+
+    sql = f"""
       SELECT activities.id, activities.timestamp, activities.category, activities.event_type,
              activities.actor_user_id, activities.target_user_id,
              activities.tenant_id, activities.app_id, activities.ip, activities.user_agent, activities.payload
         FROM activities
+        {join_clause}
     """
     if where:
         sql += " WHERE " + " AND ".join(where)
@@ -209,5 +226,3 @@ async def activity_query(
         ],
         "count": len(rows),
     }
-
-# mode_filter applied
