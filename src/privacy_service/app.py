@@ -29,6 +29,15 @@ from src.privacy_service.adapters import (
     AdapterError,
     build_default_chain,
 )
+from src.privacy_service.image_describer import (
+    describe_images,
+    append_descriptions_to_markdown,
+)
+
+
+def _truthy(value: Any) -> bool:
+    """Parse a multipart form flag (string) into a bool. Default-safe (None→False)."""
+    return str(value).strip().lower() in ("1", "true", "yes", "on") if value is not None else False
 
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 logger = logging.getLogger("privacy-service")
@@ -198,6 +207,7 @@ async def convert_pdf_service_endpoint(request: Request):
     try:
         form = await request.form()
         file = form.get("file")
+        want_descriptions = _truthy(form.get("describe_images"))
         if not file:
             return JSONResponse(
                 status_code=400,
@@ -231,12 +241,19 @@ async def convert_pdf_service_endpoint(request: Request):
             None, convert_pdf_bytes, pdf_bytes
         )
         page_count = metadata.get("pages")
+
+        # Opt-in image descriptions (see /document/convert + image_describer).
+        image_descriptions = None
+        if want_descriptions and images:
+            image_descriptions = await describe_images(images, context=filename)
+            markdown = append_descriptions_to_markdown(markdown, image_descriptions)
+
         conversion_time = _time.time() - t_start
 
         logger.info(
             f"PDF conversion complete: {filename} -> "
             f"{len(markdown)} chars, {len(images)} images, "
-            f"{conversion_time:.1f}s"
+            f"described={want_descriptions} {conversion_time:.1f}s"
         )
 
         return {
@@ -244,6 +261,7 @@ async def convert_pdf_service_endpoint(request: Request):
             "markdown": markdown,
             "images": images if images else None,
             "image_count": len(images),
+            "image_descriptions": image_descriptions,
             "pages": page_count,
             "original_size_bytes": original_size,
             "markdown_size_bytes": len(markdown.encode("utf-8")),
@@ -319,6 +337,7 @@ async def _read_uploaded_file(request: Request) -> Tuple[bytes, str, Optional[st
         "language": form.get("language"),
         "privacy_mode": form.get("privacy_mode"),
         "context_hint": form.get("context_hint"),
+        "describe_images": form.get("describe_images"),
     }
     return content, filename, mime_hint, extras
 
@@ -334,7 +353,8 @@ async def document_convert_endpoint(request: Request):
     Response: ``{success, format, markdown, metadata, images?, image_count?}``.
     Returns 415 on unknown formats and 500 on adapter failures (fail-loud).
     """
-    content, filename, mime_hint, _ = await _read_uploaded_file(request)
+    content, filename, mime_hint, extras = await _read_uploaded_file(request)
+    want_descriptions = _truthy(extras.get("describe_images"))
 
     t_start = _time.time()
     loop = asyncio.get_event_loop()
@@ -354,15 +374,25 @@ async def document_convert_endpoint(request: Request):
         logger.error(f"document/convert chain error: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
 
+    body = result.to_response()
+
+    # Opt-in: run every extracted image through Vision and append the descriptions
+    # to the Markdown, so the converted document is self-contained without the
+    # raw images. Off by default (callers opt in via describe_images=true) so
+    # existing consumers stay byte-for-byte unchanged.
+    if want_descriptions and result.images:
+        descriptions = await describe_images(result.images, context=filename)
+        body["markdown"] = append_descriptions_to_markdown(body["markdown"], descriptions)
+        body["image_descriptions"] = descriptions
+
     duration = _time.time() - t_start
     logger.info(
         f"document/convert done: {filename} -> format={result.fmt} "
         f"adapter={result.metadata.get('adapter')} "
-        f"chars={len(result.markdown)} images={len(result.images or {})} "
-        f"({duration:.2f}s)"
+        f"chars={len(body['markdown'])} images={len(result.images or {})} "
+        f"described={want_descriptions} ({duration:.2f}s)"
     )
 
-    body = result.to_response()
     body["conversion_time_seconds"] = round(duration, 2)
     return body
 
