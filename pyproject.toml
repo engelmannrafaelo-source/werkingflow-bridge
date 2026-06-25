@@ -45,12 +45,15 @@ boto3 = "^1.35.0"
 presidio-analyzer = {version = "^2.2.0", optional = true}
 presidio-anonymizer = {version = "^2.2.0", optional = true}
 
-# PDF conversion (Docling — local, DSGVO-safe)
-docling = {version = "^2.80.0", optional = true}
-# OCR engine pulled transitively by docling. Pinned >=3.8.3 because 3.8.2 was
-# YANKED (missing arch_config.yaml → every PDF convert crashes the pytorch engine
-# at OCR-model init). The lock had 3.8.2 frozen from before the yank. Explicit
-# constraint stops any future re-lock from re-selecting a yanked version.
+# PDF conversion (Docling — local, DSGVO-safe).
+# extras=["rapidocr"] pulls docling's intended OCR stack: rapidocr + onnxruntime.
+# Without onnxruntime docling's auto-OCR falls back to rapidocr's immature TORCH
+# engine (verified live: 3.8.2 → missing arch_config.yaml; 3.9.0 → unsupported
+# PP-OCRv6 torch config) and EVERY PDF convert crashes at OCR-model init. With
+# onnxruntime, auto selects the onnxruntime engine + PP-OCRv4 onnx models — the
+# supported path.
+docling = {version = "^2.80.0", extras = ["rapidocr"], optional = true}
+# Pin >=3.8.3 because 3.8.2 was YANKED; stops any re-lock re-selecting a yanked build.
 rapidocr = {version = ">=3.8.3", optional = true}
 
 # Universal document conversion (XLSX/CSV/HTML/MSG/EML)
