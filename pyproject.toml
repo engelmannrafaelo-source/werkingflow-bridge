@@ -47,6 +47,11 @@ presidio-anonymizer = {version = "^2.2.0", optional = true}
 
 # PDF conversion (Docling — local, DSGVO-safe)
 docling = {version = "^2.80.0", optional = true}
+# OCR engine pulled transitively by docling. Pinned >=3.8.3 because 3.8.2 was
+# YANKED (missing arch_config.yaml → every PDF convert crashes the pytorch engine
+# at OCR-model init). The lock had 3.8.2 frozen from before the yank. Explicit
+# constraint stops any future re-lock from re-selecting a yanked version.
+rapidocr = {version = ">=3.8.3", optional = true}
 
 # Universal document conversion (XLSX/CSV/HTML/MSG/EML)
 # All optional so the lightweight worker container does not pull them.
@@ -58,7 +63,7 @@ markdownify = {version = "^0.13.1", optional = true}
 
 [tool.poetry.extras]
 privacy = ["presidio-analyzer", "presidio-anonymizer"]
-pdf = ["docling"]
+pdf = ["docling", "rapidocr"]
 documents = ["openpyxl", "pandas", "tabulate", "markdownify", "extract-msg"]
 
 [tool.poetry.group.dev.dependencies]
