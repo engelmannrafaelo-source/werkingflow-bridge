@@ -115,7 +115,8 @@ async def billing_overview(
                 f"""
                 SELECT s.status, s.plan_id, s.seats, s.app_id
                 FROM subscriptions s
-                JOIN tenants t ON t.id = s.tenant_id
+                JOIN users u ON u.id = s.user_id
+                JOIN tenants t ON t.id = u.tenant_id
                 {where_clause}
                 """,
                 *params,
