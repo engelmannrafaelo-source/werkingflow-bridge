@@ -77,7 +77,7 @@ async def usage_metrics(
     Aggregate usage_events ledger. Admin only.
     Covers workflow + sandbox + chat in one view with real vs. hypothetical costs.
     """
-    if mode and mode not in ("prod", "staging", "local"):
+    if mode and mode not in ("prod", "staging", "local", "all"):
         raise HTTPException(status_code=400, detail=f"Invalid mode: {mode}")
     if groupBy not in _ALLOWED_GROUP_BY:
         raise HTTPException(status_code=400, detail=f"groupBy must be one of {sorted(_ALLOWED_GROUP_BY)}")
@@ -106,7 +106,7 @@ async def usage_metrics(
         except ValueError:
             raise HTTPException(status_code=400, detail=f"Invalid userId UUID: {userId}")
         _add("u.user_id = $$", uid)
-    if mode:
+    if mode and mode != "all":
         args.append(mode)
         where.append(f"u.app_env = ${len(args)}::app_env")
     if source:
@@ -275,7 +275,7 @@ async def usage_timeseries(
     Time-bucketed usage for charts. Buckets calls + EUR cost per day or hour.
     Reads from usage_events — covers workflow + sandbox + chat.
     """
-    if mode and mode not in ("prod", "staging", "local"):
+    if mode and mode not in ("prod", "staging", "local", "all"):
         raise HTTPException(status_code=400, detail=f"Invalid mode: {mode}")
     if bucket not in ("day", "hour"):
         raise HTTPException(status_code=400, detail="bucket must be 'day' or 'hour'")
@@ -293,7 +293,7 @@ async def usage_timeseries(
     if appId:
         args.append(appId)
         where.append(f"u.app = ${len(args)}")
-    if mode:
+    if mode and mode != "all":
         args.append(mode)
         where.append(f"u.app_env = ${len(args)}::app_env")
     if source:

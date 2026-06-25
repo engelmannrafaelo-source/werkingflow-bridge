@@ -114,7 +114,7 @@ async def create_feedback(
     return _row_to_dict(row)
 
 
-_ALLOWED_MODES = {"prod", "staging", "local"}
+_ALLOWED_MODES = {"prod", "staging", "local", "all"}
 
 
 @router.get("")
@@ -148,7 +148,8 @@ async def list_feedback(
     if mode:
         if mode not in _ALLOWED_MODES:
             raise HTTPException(status_code=400, detail=f"Unknown mode: {mode}")
-        add("feedback.app_env = $$::app_env", mode)
+        if mode != "all":
+            add("feedback.app_env = $$::app_env", mode)
 
     sql = """
       SELECT feedback.id, feedback.user_id, feedback.tenant_id, feedback.app_id,

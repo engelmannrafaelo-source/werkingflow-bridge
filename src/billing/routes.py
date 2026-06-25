@@ -14,7 +14,7 @@ Auth model:
 """
 import json
 import uuid
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, Form, HTTPException, Query, Response
 from pydantic import BaseModel, Field
@@ -31,6 +31,8 @@ _ALLOWED_APP_IDS = {
     "werking-noise", "engelmann",
 }
 
+_ALLOWED_ACCOUNT_TYPES = {"customer", "test", "internal"}
+
 
 # ---------------------------------------------------------------------------
 # Overview — admin dashboard cross-tenant aggregates
@@ -45,6 +47,10 @@ async def billing_overview(
             "werking-safety|werking-noise|engelmann). Top-up totals are "
             "app-overarching and are returned as null when filtered."
         ),
+    ),
+    account_type: Optional[str] = Query(
+        default=None,
+        description="Filter by tenant account type: customer|test|internal",
     ),
     _claims: AuthClaims = Depends(require_admin),
 ) -> Dict[str, Any]:
@@ -69,6 +75,11 @@ async def billing_overview(
     """
     if app and app not in _ALLOWED_APP_IDS:
         raise HTTPException(status_code=400, detail=f"Unknown app: {app}")
+    if account_type and account_type not in _ALLOWED_ACCOUNT_TYPES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid account_type: {account_type!r}. Must be customer|test|internal",
+        )
 
     pool = get_pool()
     plan_prices = {pid: p.price for pid, p in PLANS.items()}
@@ -86,7 +97,30 @@ async def billing_overview(
     source = "subscriptions"
 
     async with pool.acquire() as conn:
+        conds: List[str] = []
+        params: List[Any] = []
+
+        def _add_cond(cond: str, val: Any) -> None:
+            params.append(val)
+            conds.append(cond.replace("$$", f"${len(params)}"))
+
         if app:
+            _add_cond("s.app_id = $$::app_id", app)
+        if account_type:
+            _add_cond("t.account_type = $$::account_type", account_type)
+
+        where_clause = f"WHERE {' AND '.join(conds)}" if conds else ""
+        if account_type:
+            sub_rows = await conn.fetch(
+                f"""
+                SELECT s.status, s.plan_id, s.seats, s.app_id
+                FROM subscriptions s
+                JOIN tenants t ON t.id = s.tenant_id
+                {where_clause}
+                """,
+                *params,
+            )
+        elif app:
             sub_rows = await conn.fetch(
                 "SELECT status, plan_id, seats, app_id FROM subscriptions WHERE app_id = $1::app_id",
                 app,
@@ -538,8 +572,6 @@ async def billing_cancel_sub(
 # ---------------------------------------------------------------------------
 # Events — Mollie audit trail
 # ---------------------------------------------------------------------------
-
-_ALLOWED_ACCOUNT_TYPES = {"customer", "test", "internal"}
 
 
 @router.get("/events")
