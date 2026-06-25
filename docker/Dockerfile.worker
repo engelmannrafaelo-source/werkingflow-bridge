@@ -43,7 +43,11 @@ RUN mkdir -p /app/logs /app/instances
 
 # Install Python deps WITHOUT privacy/pdf extras (core only — lightweight!)
 # NO spaCy, NO Presidio, NO Docling, NO PyTorch
-RUN poetry config virtualenvs.in-project true && poetry lock && poetry install --no-root
+# Install from the COMMITTED poetry.lock — reproducible. A `poetry lock` here would
+# re-resolve deps on every build and let Dev and Prod drift to DIFFERENT versions
+# from the SAME commit (caret ranges in pyproject). To bump deps: run `poetry lock`
+# locally, verify a build, commit the new lock. (Mirrors Dockerfile.privacy-pdf.)
+RUN poetry config virtualenvs.in-project true && poetry install --no-root
 
 # Set ownership
 RUN chown -R claude:claude /app /home/claude

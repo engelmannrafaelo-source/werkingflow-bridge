@@ -48,9 +48,12 @@ RUN mkdir -p /app/logs /app/instances
 
 # Install Python dependencies with Poetry (as root, creates virtualenv in /app/.venv)
 # Including privacy + pdf extras for DSGVO-compliant PII anonymization + Docling PDF conversion
-# poetry.lock is in .gitignore so we must regenerate it from pyproject.toml
+# Install from the COMMITTED poetry.lock — reproducible. A `poetry lock` here would
+# re-resolve deps on every build and let Dev and Prod drift to DIFFERENT versions
+# from the SAME commit (caret ranges in pyproject). To bump deps: run `poetry lock`
+# locally, verify a build, commit the new lock. (Mirrors Dockerfile.privacy-pdf.)
 # NOTE: PyTorch CPU-only via extra index URL to keep image size smaller
-RUN poetry config virtualenvs.in-project true && poetry lock && poetry install --no-root --extras "privacy" --extras "pdf"
+RUN poetry config virtualenvs.in-project true && poetry install --no-root --extras "privacy" --extras "pdf"
 
 # Download spaCy language models for Presidio PII detection
 RUN poetry run python -m spacy download de_core_news_lg && \

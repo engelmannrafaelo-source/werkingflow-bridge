@@ -27,8 +27,9 @@ ENV/
 env/
 .venv
 
-# Poetry
-poetry.lock
+# Poetry — poetry.lock IS committed on purpose (deterministic, reproducible builds).
+# Do NOT re-add it here: the Dockerfiles install from the committed lock, not a
+# build-time `poetry lock`. Bump deps via `poetry lock` locally + commit the result.
 
 # Environment Variables
 .env
