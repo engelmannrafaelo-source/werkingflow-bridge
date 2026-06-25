@@ -19,6 +19,7 @@ import os
 import json
 import logging
 import re
+import time
 from typing import List, Dict, Any, Optional
 
 import httpx
@@ -33,6 +34,17 @@ logger = logging.getLogger(__name__)
 # Use BRIDGE_SELF_URL env var to point to nginx LB.
 BRIDGE_SELF_URL = os.getenv("BRIDGE_SELF_URL", "http://localhost:8000/v1/chat/completions")
 HAIKU_MODEL = "claude-haiku-4-5-20251001"
+
+# Refinement runs through the full worker pool (nginx → worker → Anthropic) and,
+# under concurrent document-pipeline load, legitimately takes 25-52s+ (observed
+# live; latency is pool-concurrency-bound, NOT output-size-bound — an 8-entity and
+# a 169-entity call both land ~50s). The old hard 60s sat right on that latency
+# band → intermittent ReadTimeout mid-generation. Keep this strictly BELOW the
+# outer proxy timeout (main.py smart-anonymize proxy, 270s) so this inner timeout
+# surfaces first with a clear error instead of being cut blind by the proxy.
+REFINEMENT_TIMEOUT_S = 240.0
+# Above this we log a loud WARNING (call succeeded but pool is under heavy load).
+REFINEMENT_SLOW_WARN_S = 90.0
 
 
 # ── PII restore guard (GDPR fail-safe) ──────────────────────────────────────
@@ -195,11 +207,18 @@ async def refine_anonymization(
     if bridge_api_key:
         headers["Authorization"] = f"Bearer {bridge_api_key}"
 
-    async with httpx.AsyncClient(timeout=60.0) as client:
+    start = time.monotonic()
+    async with httpx.AsyncClient(timeout=REFINEMENT_TIMEOUT_S) as client:
         response = await client.post(
             BRIDGE_SELF_URL,
             headers=headers,
             json=request_body
+        )
+    elapsed = time.monotonic() - start
+    if elapsed > REFINEMENT_SLOW_WARN_S:
+        logger.warning(
+            f"Refinement self-call slow: {elapsed:.1f}s for {len(entities)} entities "
+            f"(timeout={REFINEMENT_TIMEOUT_S:.0f}s). Worker pool likely under concurrent load."
         )
 
     if response.status_code != 200:

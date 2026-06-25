@@ -4325,7 +4325,11 @@ async def smart_anonymize_endpoint(request_body: SmartAnonymizeRequest):
             "language": request_body.language or "de",
             "context_hint": request_body.context_hint,
             "prefix": request_body.prefix,
-        }, timeout=120.0)  # Smart-anonymize involves AI call, needs longer timeout
+        }, timeout=270.0)  # Must stay ABOVE the inner refinement self-call timeout
+        # (smart_anonymizer.REFINEMENT_TIMEOUT_S=240s) so the inner timeout fires
+        # first with a clear error. The refinement runs through the full worker pool
+        # and legitimately takes 25-52s+ under concurrent load; the old 120s could
+        # cut a still-working call. App routes allow 300s on top of this.
         response.raise_for_status()
         return SmartAnonymizeResponse(**response.json())
     except Exception as e:
