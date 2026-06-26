@@ -323,6 +323,11 @@ services:
     container_name: wt-privacy-pdf-service
     expose:
       - "8100"
+    # Tailscale-only host publish so the PROD bridge (server2, 7GB host can't run
+    # the ~13GB Flair model) can route smart-anonymize here. Bound to the dev
+    # Tailscale IP — NOT 0.0.0.0 — so it stays inside the private mesh.
+    ports:
+      - "100.112.98.39:8100:8100"
     deploy:
       resources:
         limits:
