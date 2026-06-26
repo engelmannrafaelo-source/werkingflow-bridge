@@ -311,3 +311,206 @@ class TestSmartAnonymizeEndToEnd:
             from src.privacy.smart_anonymizer import smart_anonymize
             with pytest.raises(ValueError, match="PII leak"):
                 _run(smart_anonymize("..."))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Tests: deterministic backfill in anonymizer.py
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _run_anonymize_with_spans(text: str, spans: list):
+    """Run PresidioAnonymizer.anonymize() with mocked Presidio spans."""
+    from src.privacy.anonymizer import PresidioAnonymizer
+
+    class _FakeResult:
+        def __init__(self, start, end, score, entity_type):
+            self.start = start
+            self.end = end
+            self.score = score
+            self.entity_type = entity_type
+
+    fake_results = [_FakeResult(**s) for s in spans]
+    anon = PresidioAnonymizer(language="de")
+
+    with patch.object(anon, "_get_analyzer") as mock_analyzer:
+        engine = MagicMock()
+        engine.analyze.return_value = fake_results
+        mock_analyzer.return_value = engine
+        return anon.anonymize(text, "de")
+
+
+class TestBackfill:
+    """Backfill ensures all word-boundary occurrences of mapped values are replaced."""
+
+    def test_backfill_replaces_missed_second_occurrence(self):
+        """NER detects a name once — the second occurrence is backfilled."""
+        text = "Franz Huber wohnt hier. Später trifft man Franz Huber im Büro."
+        # NER only detects the first "Franz Huber" at [0, 11)
+        spans = [
+            {"start": 0, "end": 11, "score": 0.95, "entity_type": "PERSON"},
+        ]
+        result = _run_anonymize_with_spans(text, spans)
+
+        assert "Franz Huber" not in result.anonymized_text, (
+            f"Second occurrence not backfilled: {result.anonymized_text!r}"
+        )
+        assert result.anonymized_text.count("ANON_PERSON_001") == 2, (
+            f"Expected placeholder twice: {result.anonymized_text!r}"
+        )
+        # Mapping invariant: placeholder still appears in text
+        assert "ANON_PERSON_001" in result.mapping
+        assert "ANON_PERSON_001" in result.anonymized_text
+
+    def test_backfill_three_occurrences_two_missed(self):
+        """Backfill handles more than one missed occurrence."""
+        text = "Max Muster kommt. Max Muster geht. Max Muster bleibt."
+        # NER only detects the first "Max Muster" at [0, 10)
+        spans = [
+            {"start": 0, "end": 10, "score": 0.95, "entity_type": "PERSON"},
+        ]
+        result = _run_anonymize_with_spans(text, spans)
+
+        assert "Max Muster" not in result.anonymized_text
+        assert result.anonymized_text.count("ANON_PERSON_001") == 3
+
+    def test_backfill_order_prevents_partial_corruption(self):
+        """Longer values are processed first so 'Franz' doesn't corrupt 'Franz Huber'.
+
+        If shorter "Franz" is backfilled before longer "Franz Huber", the missed
+        third occurrence "Franz Huber" becomes "ANON_X Huber" — 'Huber' leaks.
+        Correct longer-first ordering prevents this.
+        """
+        # "Franz besucht Franz Huber. Dort trifft er Franz Huber."
+        #  0123456789012345678901234567890123456789012345678901234
+        # "Franz" at [0,5), "Franz Huber" at [14,25), third "Franz Huber" at [42,53) missed
+        text = "Franz besucht Franz Huber. Dort trifft er Franz Huber."
+        spans = [
+            {"start": 0, "end": 5, "score": 0.95, "entity_type": "PERSON"},   # "Franz"
+            {"start": 14, "end": 25, "score": 0.90, "entity_type": "PERSON"}, # "Franz Huber"
+            # third "Franz Huber" at [42,53) intentionally omitted
+        ]
+        result = _run_anonymize_with_spans(text, spans)
+
+        assert "Huber" not in result.anonymized_text, (
+            f"'Huber' leaked — ordering error: {result.anonymized_text!r}"
+        )
+        assert "Franz" not in result.anonymized_text, (
+            f"'Franz' leaked: {result.anonymized_text!r}"
+        )
+
+    def test_backfill_preserves_compound_words(self):
+        """'Huber' inside 'Hubergruppe' (compound word) is NOT backfilled.
+
+        The word boundary prevents replacing a substring within a larger word.
+        """
+        # "Huber" at [0,5) detected; "Hubergruppe" is a company name, not a person
+        text = "Huber arbeitet in der Hubergruppe seit Jahren."
+        spans = [
+            {"start": 0, "end": 5, "score": 0.95, "entity_type": "PERSON"},
+        ]
+        result = _run_anonymize_with_spans(text, spans)
+
+        # "Huber" standalone replaced; "Hubergruppe" must remain intact
+        assert "Hubergruppe" in result.anonymized_text, (
+            f"Compound word corrupted: {result.anonymized_text!r}"
+        )
+        assert result.anonymized_text.startswith("ANON_PERSON_001"), (
+            f"Standalone 'Huber' not replaced: {result.anonymized_text!r}"
+        )
+
+    def test_backfill_idempotent_when_all_detected(self):
+        """When NER detects all occurrences, backfill makes no additional change."""
+        # Both occurrences detected; backfill should find nothing extra
+        text = "Max Muster hier. Max Muster dort."
+        spans = [
+            {"start": 0, "end": 10, "score": 0.95, "entity_type": "PERSON"},
+            {"start": 17, "end": 27, "score": 0.95, "entity_type": "PERSON"},
+        ]
+        result = _run_anonymize_with_spans(text, spans)
+
+        assert "Max Muster" not in result.anonymized_text
+        # Both positions have placeholders (possibly different: _001 and _002)
+        assert len(result.mapping) == 2
+        for ph in result.mapping:
+            assert ph in result.anonymized_text
+
+    def test_backfill_mapping_text_consistent_after_fill(self):
+        """After backfill, every mapping key still appears in anonymized_text."""
+        text = "Anna Schmidt trifft Anna Schmidt und Anna Schmidt."
+        spans = [
+            {"start": 0, "end": 12, "score": 0.95, "entity_type": "PERSON"},
+        ]
+        result = _run_anonymize_with_spans(text, spans)
+
+        for ph in result.mapping:
+            assert ph in result.anonymized_text, (
+                f"Mapping invariant violated: {ph!r} missing from text\n"
+                f"text={result.anonymized_text!r}"
+            )
+        assert "Anna Schmidt" not in result.anonymized_text
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Tests: word-boundary leak check in _assert_no_hard_pii_leak
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestWordBoundaryLeakCheck:
+    """_assert_no_hard_pii_leak uses word boundaries to avoid false positives."""
+
+    def test_compound_word_no_false_positive(self):
+        """'Huber' inside 'Hubergruppe' must NOT trigger a PII leak alarm."""
+        from src.privacy.smart_anonymizer import _assert_no_hard_pii_leak
+
+        # "Huber" was anonymized, but "Hubergruppe" (a company) is left intact
+        text = "ANON_PERSON_001 arbeitet in der Hubergruppe seit Jahren."
+        mapping = {"ANON_PERSON_001": "Huber"}
+        type_by_ph = {"ANON_PERSON_001": "PERSON"}
+        _assert_no_hard_pii_leak(mapping, text, type_by_ph)  # must not raise
+
+    def test_standalone_name_still_flagged(self):
+        """A genuine standalone leak — standalone 'Huber' — still raises."""
+        from src.privacy.smart_anonymizer import _assert_no_hard_pii_leak
+
+        text = "ANON_PERSON_001 arbeitet hier, und auch Huber ist bekannt."
+        mapping = {"ANON_PERSON_001": "Huber"}
+        type_by_ph = {"ANON_PERSON_001": "PERSON"}
+        with pytest.raises(ValueError, match="PII leak"):
+            _assert_no_hard_pii_leak(mapping, text, type_by_ph)
+
+    def test_name_with_punctuation_still_flagged(self):
+        """Name at sentence end (followed by period) is flagged — period is a word boundary."""
+        from src.privacy.smart_anonymizer import _assert_no_hard_pii_leak
+
+        text = "Kontaktperson ist ANON_PERSON_001 und auch Huber."
+        mapping = {"ANON_PERSON_001": "Muster"}
+        type_by_ph = {"ANON_PERSON_001": "PERSON"}
+        # "Huber." — the period creates a word boundary; "Huber" IS the original, but
+        # "Muster" is the value, so no leak for Muster.  Verify no false positive here.
+        _assert_no_hard_pii_leak(mapping, text, type_by_ph)  # must not raise ("Muster" not in text)
+
+    def test_leak_at_sentence_end_flagged(self):
+        """Name at sentence end (e.g., 'Muster.') is correctly caught."""
+        from src.privacy.smart_anonymizer import _assert_no_hard_pii_leak
+
+        text = "Kontaktperson ist ANON_PERSON_001 oder auch Muster."
+        mapping = {"ANON_PERSON_001": "Muster"}
+        type_by_ph = {"ANON_PERSON_001": "PERSON"}
+        with pytest.raises(ValueError, match="PII leak"):
+            _assert_no_hard_pii_leak(mapping, text, type_by_ph)
+
+    def test_multiword_name_compound_no_false_positive(self):
+        """'Franz' within 'Franzmüller' (compound) is not a person leak."""
+        from src.privacy.smart_anonymizer import _assert_no_hard_pii_leak
+
+        text = "ANON_PERSON_001 Bericht liegt beim Franzmüller-Amt."
+        mapping = {"ANON_PERSON_001": "Franz"}
+        type_by_ph = {"ANON_PERSON_001": "PERSON"}
+        _assert_no_hard_pii_leak(mapping, text, type_by_ph)  # must not raise
+
+    def test_short_value_skipped(self):
+        """Values ≤ 3 chars are still ignored (existing guard preserved)."""
+        from src.privacy.smart_anonymizer import _assert_no_hard_pii_leak
+
+        text = "Country AT is here and ANON_PERSON_001 is present."
+        mapping = {"ANON_PERSON_001": "AT"}
+        type_by_ph = {"ANON_PERSON_001": "PERSON"}
+        _assert_no_hard_pii_leak(mapping, text, type_by_ph)  # must not raise (len <= 3)

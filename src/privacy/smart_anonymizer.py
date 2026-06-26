@@ -136,7 +136,10 @@ def _assert_no_hard_pii_leak(
         entity_type = type_by_placeholder.get(placeholder, "")
         if entity_type not in _NEVER_RESTORE_TYPES:
             continue
-        if len(original) > 3 and original in text:
+        # Word-boundary check: "Huber" inside "Hubergruppe" (compound word, no
+        # word boundary after "Huber") must not trigger a false-positive alarm.
+        # A genuine standalone occurrence (word boundary on both sides) still fires.
+        if len(original) > 3 and re.search(r'\b' + re.escape(original) + r'\b', text):
             leaks.append((placeholder, entity_type))
     if leaks:
         raise ValueError(

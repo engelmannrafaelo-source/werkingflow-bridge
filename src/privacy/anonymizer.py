@@ -13,6 +13,7 @@ Based on: bacher-zt-ai-hub/src/services/presidio/anonymizer.py
 """
 
 import os
+import re
 import logging
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
@@ -374,6 +375,25 @@ class PresidioAnonymizer:
             ))
 
         logger.debug(f"Anonymized {len(detected_entities)} entities in text")
+
+        # Backfill: replace ALL remaining word-boundary occurrences of entity values.
+        # NER is statistical — the same entity value may appear multiple times in the
+        # text but be tagged only once.  Once a value is in the mapping, every further
+        # standalone occurrence is also a PII leak.  Process longer values first so
+        # "Franz Huber" is handled before the shorter "Franz" (prevents "Huber" from
+        # being left as plaintext if shorter-first order corrupts the longer match).
+        if mapping:
+            _value_to_ph: Dict[str, str] = {}
+            for _ph, _val in mapping.items():
+                if _val not in _value_to_ph:
+                    _value_to_ph[_val] = _ph
+            for _val in sorted(_value_to_ph, key=len, reverse=True):
+                _ph = _value_to_ph[_val]
+                _pattern = r'\b' + re.escape(_val) + r'\b'
+                _new = re.sub(_pattern, _ph, anonymized_text)
+                if _new != anonymized_text:
+                    logger.debug("Backfill: additional occurrence(s) of entity replaced with %s", _ph)
+                    anonymized_text = _new
 
         return AnonymizationResult(
             anonymized_text=anonymized_text,
