@@ -159,45 +159,12 @@ services:
       - bridge-prod-net
 
   # ===========================================================================
-  # Production Privacy + Docling Service
+  # Privacy + Docling Service — REMOVED from PROD (2026-06-26).
+  # Flair ner-german-large needs ~13GB; this 7GB host OOM'd at the 5G limit.
+  # PROD now routes smart-anonymize to the DEV-bridge privacy service over
+  # Tailscale: see PRIVACY_SERVICE_URL=http://100.112.98.39:8100 on the workers.
+  # (dev compose publishes wt-privacy-pdf-service on the dev Tailscale IP.)
   # ===========================================================================
-  privacy-prod:
-    build:
-      context: ..
-      dockerfile: docker/Dockerfile.privacy-pdf
-    container_name: wt-prod-privacy
-    expose:
-      - "8100"
-    deploy:
-      resources:
-        limits:
-          memory: 5G
-        reservations:
-          memory: 2G
-    environment:
-      - TZ=Europe/Vienna
-      - LOG_LEVEL=INFO
-      - PRIVACY_ENABLED=true
-      - PRIVACY_LANGUAGE=de
-      - PRIVACY_LOG_DETECTIONS=false
-      # Flair ner-german-large loads ~3.4GB torch model PER uvicorn worker.
-      # 2 workers blew the 5G cgroup limit -> OOM mid-request ("server disconnected").
-      # 1 worker keeps a single Flair process well inside 5G. (was: 2, pre-Flair)
-      - UVICORN_WORKERS=1
-      - DOCLING_THREADS=2
-      - BRIDGE_SELF_URL=http://nginx:80/v1/chat/completions
-      - API_KEY=${API_KEY:-}
-      - CONVERTAPI_SECRET=${CONVERTAPI_SECRET}
-      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8100/health"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 120s
-    restart: unless-stopped
-    networks:
-      - bridge-prod-net
 
   # ===========================================================================
   # Metrics Reader — decoupled read-only JSONL metrics service
