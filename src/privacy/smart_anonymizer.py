@@ -35,6 +35,14 @@ logger = logging.getLogger(__name__)
 BRIDGE_SELF_URL = os.getenv("BRIDGE_SELF_URL", "http://localhost:8000/v1/chat/completions")
 HAIKU_MODEL = "claude-haiku-4-5-20251001"
 
+# Stage-2 refinement toggle. Default OFF: with the local Flair NER now doing
+# precise detection, the cloud-Haiku refiner is redundant — it is blind (sees
+# only placeholders + types, never the values), restored ~1 in 22 entities, and
+# cost 25-52s PER call. Kept behind a flag purely for A/B comparison. The
+# value-aware successor is a LOCAL LLM judge that receives the entity VALUES
+# (see judge prototype) — not this endpoint.
+USE_REFINEMENT = os.getenv("SMART_ANONYMIZE_USE_REFINEMENT", "false").lower() == "true"
+
 # Refinement runs through the full worker pool (nginx → worker → Anthropic) and,
 # under concurrent document-pipeline load, legitimately takes 25-52s+ (observed
 # live; latency is pool-concurrency-bound, NOT output-size-bound — an 8-entity and
@@ -319,7 +327,35 @@ async def smart_anonymize(
             "detected_entities": []
         }
 
-    # Stage 2: AI refinement
+    # Default path: local Flair NER is precise enough — skip the blind cloud
+    # refiner entirely and return the detection result directly. Mapping and
+    # text are inherently consistent (both built in one pass), which also
+    # removes the "placeholder absent from smart_anonymized_text" inconsistency
+    # that the refiner's text-rewrite could introduce.
+    if not USE_REFINEMENT:
+        return {
+            "status": "success",
+            "anonymization_performed": True,
+            "raw_anonymized_text": raw_result.anonymized_text,
+            "raw_entity_count": raw_result.entity_count,
+            "smart_anonymized_text": raw_result.anonymized_text,
+            "smart_entity_count": len(raw_result.mapping),
+            "restored_entities": [],
+            "mapping": dict(raw_result.mapping),
+            "detected_entities": [
+                {
+                    "placeholder": e.placeholder,
+                    "type": e.entity_type,
+                    "original": e.original_text,
+                    "confidence": e.confidence,
+                    "decision": "KEEP",
+                    "reason": ""
+                }
+                for e in raw_result.detected_entities
+            ]
+        }
+
+    # Stage 2: AI refinement (opt-in via SMART_ANONYMIZE_USE_REFINEMENT=true)
     refinement = await refine_anonymization(raw_result, context_hint)
 
     # Stage 2b: Selective restore

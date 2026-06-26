@@ -21,6 +21,25 @@ from dataclasses import dataclass, field
 
 logger = logging.getLogger(__name__)
 
+# Confidence floor. Flair emits ~1.0 for real entities, so this only trims
+# low-confidence noise; kept low enough (0.35) not to drop the default
+# PhoneRecognizer's 0.4 hits. Override via env if needed.
+SCORE_THRESHOLD = float(os.getenv("SMART_ANONYMIZE_SCORE_THRESHOLD", "0.35"))
+
+# Seed allow-list: only STABLE, finite, non-PII terms worth hardcoding once
+# (standards bodies, public agencies). Brand/company names are deliberately NOT
+# listed here — that set is open-ended and unmaintainable by hand; it is meant
+# to be handled by the value-aware judge / user-correction loop instead. Exact
+# span match (incl. common inflected forms).
+SEED_ALLOWLIST = [
+    "Austrian Standards",
+    "ÖNORM",
+    "OIB",
+    "OIB-Richtlinie",
+    "Österreichische Energieagentur",
+    "Österreichischen Energieagentur",
+]
+
 # Lazy load Presidio to avoid import errors when disabled
 _presidio_available: Optional[bool] = None
 _analyzer_engine = None
@@ -116,14 +135,17 @@ class PresidioAnonymizer:
     - Async methods for non-blocking FastAPI integration
     """
 
-    # Supported entity types for detection
+    # Supported entity types for detection.
+    # PERSON / LOCATION / ORGANIZATION come from the local Flair NER (see
+    # flair_recognizer.py); the rest from Presidio's deterministic pattern
+    # recognizers. DATE_TIME deliberately dropped — generic dates are not PII
+    # and were the single largest false-positive source under spaCy.
     SUPPORTED_ENTITIES = [
         'PERSON',
         'EMAIL_ADDRESS',
         'PHONE_NUMBER',
         'LOCATION',
         'ORGANIZATION',
-        'DATE_TIME',
         'IBAN_CODE',
         'CREDIT_CARD',
         'IP_ADDRESS',
@@ -238,6 +260,20 @@ class PresidioAnonymizer:
 
         analyzer.registry.add_recognizer(phone_recognizer)
 
+        # Swap the NER brain: drop spaCy's SpacyRecognizer (it tags nearly every
+        # capitalised German technical noun as PERSON/LOCATION/ORG → the 85%
+        # false-positive flood) and let the local Flair model own PERSON/
+        # LOCATION/ORGANIZATION instead. spaCy stays only as the tokeniser the
+        # nlp_engine needs. Pattern recognizers (email/IBAN/phone/...) are kept.
+        analyzer.registry.recognizers = [
+            r for r in analyzer.registry.recognizers
+            if type(r).__name__ != 'SpacyRecognizer'
+        ]
+
+        from .flair_recognizer import FlairRecognizer
+        analyzer.registry.add_recognizer(FlairRecognizer(supported_language='de'))
+        logger.info("Analyzer NER engine: Flair ner-german-large (local); spaCy NER removed")
+
         return analyzer
 
     def anonymize(self, text: str, language: Optional[str] = None, prefix: Optional[str] = None) -> AnonymizationResult:
@@ -262,11 +298,14 @@ class PresidioAnonymizer:
         lang = language or self.language
         analyzer = self._get_analyzer()
 
-        # Analyze text for PII entities
+        # Analyze text for PII entities. allow_list skips known-stable non-PII
+        # terms (standards bodies); score_threshold trims low-confidence noise.
         results = analyzer.analyze(
             text=text,
             language=lang,
-            entities=self.SUPPORTED_ENTITIES
+            entities=self.SUPPORTED_ENTITIES,
+            allow_list=SEED_ALLOWLIST,
+            score_threshold=SCORE_THRESHOLD
         )
 
         # Remove overlapping entities (keep longer one)

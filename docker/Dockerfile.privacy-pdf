@@ -46,9 +46,24 @@ RUN mkdir -p /app/logs
 RUN poetry config virtualenvs.in-project true && \
     poetry install --no-root --extras "privacy" --extras "pdf" --extras "documents"
 
-# Download spaCy language models for Presidio PII detection
+# Download spaCy language models. de_core_news_lg now only TOKENISES for
+# Presidio (its NER is removed in anonymizer.py); Flair owns name detection.
 RUN poetry run python -m spacy download de_core_news_lg && \
     poetry run python -m spacy download en_core_web_lg
+
+# Flair NER (local German PERSON/LOCATION/ORG detection) — replaces spaCy's
+# over-eager NER. Installed via pip (NOT poetry) to avoid re-resolving the
+# committed poetry.lock, which drifts torch to a broken CUDA build (see note
+# above). torch pinned to the +cpu wheel: CPU-only host, the CUDA build is
+# ~2 GB larger and pulls nvidia-cudnn which fails to install here.
+RUN poetry run pip install --no-cache-dir \
+        --extra-index-url https://download.pytorch.org/whl/cpu \
+        "torch==2.5.1+cpu" "flair==0.15.1"
+
+# Pre-download the Flair model (~1.5 GB) so the first request doesn't block on a
+# download and the service works without network at runtime.
+RUN poetry run python -c "from flair.models import SequenceTagger; SequenceTagger.load('flair/ner-german-large'); print('Flair model downloaded')" \
+    || echo "WARNING: Flair model pre-download failed (will download on first use)"
 
 # Pre-download Docling OCR models (avoids download on first request)
 RUN poetry run python -c "\
