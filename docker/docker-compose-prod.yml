@@ -88,6 +88,7 @@ services:
       - RATE_LIMIT_ENABLED=false
       - DEFAULT_PRIVACY_MODE=none
       - PRIVACY_SERVICE_URL=http://privacy-prod:8100
+      - BRIDGE_ANONYMIZE_ENABLED=true
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
       interval: 30s
@@ -142,6 +143,7 @@ services:
       - RATE_LIMIT_ENABLED=false
       - DEFAULT_PRIVACY_MODE=none
       - PRIVACY_SERVICE_URL=http://privacy-prod:8100
+      - BRIDGE_ANONYMIZE_ENABLED=true
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
       interval: 30s
