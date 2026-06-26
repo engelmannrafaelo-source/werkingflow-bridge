@@ -176,8 +176,10 @@ services:
       - PRIVACY_ENABLED=true
       - PRIVACY_LANGUAGE=de
       - PRIVACY_LOG_DETECTIONS=false
-      # 4-core host: 2 uvicorn workers x 2 Docling threads -> uses all cores under load
-      - UVICORN_WORKERS=2
+      # Flair ner-german-large loads ~3.4GB torch model PER uvicorn worker.
+      # 2 workers blew the 5G cgroup limit -> OOM mid-request ("server disconnected").
+      # 1 worker keeps a single Flair process well inside 5G. (was: 2, pre-Flair)
+      - UVICORN_WORKERS=1
       - DOCLING_THREADS=2
       - BRIDGE_SELF_URL=http://nginx:80/v1/chat/completions
       - API_KEY=${API_KEY:-}
