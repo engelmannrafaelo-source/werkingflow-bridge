@@ -56,9 +56,14 @@ RUN poetry run python -m spacy download de_core_news_lg && \
 # committed poetry.lock, which drifts torch to a broken CUDA build (see note
 # above). torch pinned to the +cpu wheel: CPU-only host, the CUDA build is
 # ~2 GB larger and pulls nvidia-cudnn which fails to install here.
+# torchvision MUST be pinned to the version matching torch 2.5.1 (0.20.1) and
+# +cpu too: flair otherwise pulls torchvision 0.27.0 (built for torch 2.12),
+# whose C++ ops (torchvision::nms) then fail against torch 2.5.1 — that ABI break
+# surfaces as transformers' lazy LayoutLMv2/AutoProcessor imports crashing, which
+# takes down BOTH flair NER and docling OCR (both do `from transformers import`).
 RUN poetry run pip install --no-cache-dir \
         --extra-index-url https://download.pytorch.org/whl/cpu \
-        "torch==2.5.1+cpu" "flair==0.15.1"
+        "torch==2.5.1+cpu" "torchvision==0.20.1+cpu" "flair==0.15.1"
 
 # Pre-download the Flair model (~1.5 GB) so the first request doesn't block on a
 # download and the service works without network at runtime.
