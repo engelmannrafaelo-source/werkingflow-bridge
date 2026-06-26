@@ -4289,7 +4289,7 @@ async def get_privacy_status():
 
 
 @app.post("/v1/privacy/smart-anonymize")
-async def smart_anonymize_endpoint(request_body: SmartAnonymizeRequest):
+async def smart_anonymize_endpoint(request: Request, request_body: SmartAnonymizeRequest):
     """Smart pseudonymization. Proxied to privacy-pdf-service container.
 
     When ``BRIDGE_ANONYMIZE_ENABLED`` is unset/false (the current default
@@ -4317,6 +4317,7 @@ async def smart_anonymize_endpoint(request_body: SmartAnonymizeRequest):
             status_code=503,
         ))
 
+    _start = time.time()
     privacy_client = get_privacy_client()
     try:
         client = await privacy_client._get_client()
@@ -4331,9 +4332,44 @@ async def smart_anonymize_endpoint(request_body: SmartAnonymizeRequest):
         # and legitimately takes 25-52s+ under concurrent load; the old 120s could
         # cut a still-working call. App routes allow 300s on top of this.
         response.raise_for_status()
-        return SmartAnonymizeResponse(**response.json())
+        result = SmartAnonymizeResponse(**response.json())
+        try:
+            _attr = extract_attribution_context(request)
+            from src.activity.ai_call_writer import persist_ai_call_activity
+            await persist_ai_call_activity(
+                app_id=_attr.get("app_id"),
+                user_id=_attr.get("user_id"),
+                agent_id="anonymisierung",
+                workflow_id=_attr.get("workflow_id"),
+                model="privacy-service",
+                input_tokens=0,
+                output_tokens=0,
+                status="success",
+                duration_ms=int((time.time() - _start) * 1000),
+                app_env=_attr.get("app_env"),
+            )
+        except Exception as _te:
+            logger.warning(f"anonymisierung activity tracking failed (non-blocking): {_te}")
+        return result
     except Exception as e:
         logger.error(f"Smart anonymization failed: {e}", exc_info=True)
+        try:
+            _attr = extract_attribution_context(request)
+            from src.activity.ai_call_writer import persist_ai_call_activity
+            await persist_ai_call_activity(
+                app_id=_attr.get("app_id"),
+                user_id=_attr.get("user_id"),
+                agent_id="anonymisierung",
+                workflow_id=_attr.get("workflow_id"),
+                model="privacy-service",
+                input_tokens=0,
+                output_tokens=0,
+                status="error",
+                duration_ms=int((time.time() - _start) * 1000),
+                app_env=_attr.get("app_env"),
+            )
+        except Exception as _te:
+            logger.warning(f"anonymisierung error tracking failed (non-blocking): {_te}")
         return SmartAnonymizeResponse(
             status="error",
             error=str(e)
@@ -4508,6 +4544,7 @@ async def convert_html_to_pdf_endpoint(
     """
     await verify_api_key(request, credentials)
 
+    _start = time.time()
     try:
         body = await request.json()
         if not isinstance(body, dict) or not body.get("html"):
@@ -4525,10 +4562,44 @@ async def convert_html_to_pdf_endpoint(
             timeout=600.0,
         )
         response.raise_for_status()
+        try:
+            _attr = extract_attribution_context(request)
+            from src.activity.ai_call_writer import persist_ai_call_activity
+            await persist_ai_call_activity(
+                app_id=_attr.get("app_id"),
+                user_id=_attr.get("user_id"),
+                agent_id="pdf-export",
+                workflow_id=_attr.get("workflow_id"),
+                model="html-renderer",
+                input_tokens=0,
+                output_tokens=0,
+                status="success",
+                duration_ms=int((time.time() - _start) * 1000),
+                app_env=_attr.get("app_env"),
+            )
+        except Exception as _te:
+            logger.warning(f"pdf-export activity tracking failed (non-blocking): {_te}")
         return JSONResponse(content=response.json())
 
     except Exception as e:
         logger.error(f"HTML-to-PDF proxy failed: {e}", exc_info=True)
+        try:
+            _attr = extract_attribution_context(request)
+            from src.activity.ai_call_writer import persist_ai_call_activity
+            await persist_ai_call_activity(
+                app_id=_attr.get("app_id"),
+                user_id=_attr.get("user_id"),
+                agent_id="pdf-export",
+                workflow_id=_attr.get("workflow_id"),
+                model="html-renderer",
+                input_tokens=0,
+                output_tokens=0,
+                status="error",
+                duration_ms=int((time.time() - _start) * 1000),
+                app_env=_attr.get("app_env"),
+            )
+        except Exception as _te:
+            logger.warning(f"pdf-export error tracking failed (non-blocking): {_te}")
         return JSONResponse(
             status_code=500,
             content={"status": "error", "error": f"HTML-to-PDF conversion failed: {str(e)}"}
@@ -4549,6 +4620,7 @@ async def convert_html_to_screenshot_endpoint(
     """
     await verify_api_key(request, credentials)
 
+    _start = time.time()
     try:
         body = await request.json()
         if not isinstance(body, dict) or not body.get("html"):
@@ -4566,10 +4638,44 @@ async def convert_html_to_screenshot_endpoint(
             timeout=600.0,
         )
         response.raise_for_status()
+        try:
+            _attr = extract_attribution_context(request)
+            from src.activity.ai_call_writer import persist_ai_call_activity
+            await persist_ai_call_activity(
+                app_id=_attr.get("app_id"),
+                user_id=_attr.get("user_id"),
+                agent_id="screenshot",
+                workflow_id=_attr.get("workflow_id"),
+                model="html-renderer",
+                input_tokens=0,
+                output_tokens=0,
+                status="success",
+                duration_ms=int((time.time() - _start) * 1000),
+                app_env=_attr.get("app_env"),
+            )
+        except Exception as _te:
+            logger.warning(f"screenshot activity tracking failed (non-blocking): {_te}")
         return JSONResponse(content=response.json())
 
     except Exception as e:
         logger.error(f"HTML-to-screenshot proxy failed: {e}", exc_info=True)
+        try:
+            _attr = extract_attribution_context(request)
+            from src.activity.ai_call_writer import persist_ai_call_activity
+            await persist_ai_call_activity(
+                app_id=_attr.get("app_id"),
+                user_id=_attr.get("user_id"),
+                agent_id="screenshot",
+                workflow_id=_attr.get("workflow_id"),
+                model="html-renderer",
+                input_tokens=0,
+                output_tokens=0,
+                status="error",
+                duration_ms=int((time.time() - _start) * 1000),
+                app_env=_attr.get("app_env"),
+            )
+        except Exception as _te:
+            logger.warning(f"screenshot error tracking failed (non-blocking): {_te}")
         return JSONResponse(
             status_code=500,
             content={"status": "error", "error": f"HTML-to-screenshot conversion failed: {str(e)}"}
@@ -4679,7 +4785,28 @@ async def convert_document_endpoint(
 ):
     """Convert any supported document type to Markdown via the privacy service."""
     await verify_api_key(request, credentials)
-    return await _proxy_document_endpoint(request, "/document/convert", timeout=600.0)
+    _start = time.time()
+    result = await _proxy_document_endpoint(request, "/document/convert", timeout=600.0)
+    try:
+        _attr = extract_attribution_context(request)
+        from src.activity.ai_call_writer import persist_ai_call_activity
+        _status = "success" if result.status_code < 400 else "error"
+        await persist_ai_call_activity(
+            app_id=_attr.get("app_id"),
+            user_id=_attr.get("user_id"),
+            agent_id="dokument-konvertierung",
+            workflow_id=_attr.get("workflow_id"),
+            model="docling",
+            input_tokens=0,
+            output_tokens=0,
+            status=_status,
+            duration_ms=int((time.time() - _start) * 1000),
+            error_code=str(result.status_code) if _status == "error" else None,
+            app_env=_attr.get("app_env"),
+        )
+    except Exception as _te:
+        logger.warning(f"dokument-konvertierung activity tracking failed (non-blocking): {_te}")
+    return result
 
 
 @app.post("/v1/document/convert-and-anonymize")
@@ -4734,6 +4861,9 @@ async def audio_transcriptions(
             detail="OPENAI_API_KEY not configured on Bridge — contact admin"
         ))
 
+    import httpx  # noqa: PLC0415 — local import; httpx has no module-level import in main.py
+    _start = time.time()
+    _model = "whisper-1"  # updated from form below; used in error paths if form parse fails
     try:
         form = await request.form()
         audio_file = form.get("file")
@@ -4745,7 +4875,7 @@ async def audio_transcriptions(
         content_type = getattr(audio_file, "content_type", "audio/mpeg") or "audio/mpeg"
 
         # Collect optional parameters
-        model = form.get("model", "whisper-1")
+        _model = form.get("model", "whisper-1")
         language = form.get("language")
         response_format = form.get("response_format", "json")
         prompt = form.get("prompt")
@@ -4753,7 +4883,7 @@ async def audio_transcriptions(
 
         # Build multipart fields for OpenAI
         files = {"file": (filename, audio_bytes, content_type)}
-        data = {"model": model, "response_format": response_format}
+        data = {"model": _model, "response_format": response_format}
         if language:
             data["language"] = language
         if prompt:
@@ -4769,15 +4899,68 @@ async def audio_transcriptions(
                 data=data,
             )
             response.raise_for_status()
+            try:
+                _attr = extract_attribution_context(request)
+                from src.activity.ai_call_writer import persist_ai_call_activity
+                await persist_ai_call_activity(
+                    app_id=_attr.get("app_id"),
+                    user_id=_attr.get("user_id"),
+                    agent_id="transkription",
+                    workflow_id=_attr.get("workflow_id"),
+                    model=_model,
+                    input_tokens=0,
+                    output_tokens=0,
+                    status="success",
+                    duration_ms=int((time.time() - _start) * 1000),
+                    app_env=_attr.get("app_env"),
+                )
+            except Exception as _te:
+                logger.warning(f"transkription activity tracking failed (non-blocking): {_te}")
             return JSONResponse(content=response.json(), status_code=response.status_code)
 
     except httpx.HTTPStatusError as e:
         logger.error(f"OpenAI Whisper API error: {e.response.status_code} {e.response.text}")
+        try:
+            _attr = extract_attribution_context(request)
+            from src.activity.ai_call_writer import persist_ai_call_activity
+            await persist_ai_call_activity(
+                app_id=_attr.get("app_id"),
+                user_id=_attr.get("user_id"),
+                agent_id="transkription",
+                workflow_id=_attr.get("workflow_id"),
+                model=_model,
+                input_tokens=0,
+                output_tokens=0,
+                status="error",
+                duration_ms=int((time.time() - _start) * 1000),
+                error_code=str(e.response.status_code),
+                app_env=_attr.get("app_env"),
+            )
+        except Exception as _te:
+            logger.warning(f"transkription error tracking failed (non-blocking): {_te}")
         raise HTTPException(status_code=e.response.status_code, detail=f"OpenAI Whisper error: {e.response.text}")
     except HTTPException:
         raise
     except Exception as e:
         logger.error(f"Audio transcription proxy failed: {e}", exc_info=True)
+        try:
+            _attr = extract_attribution_context(request)
+            from src.activity.ai_call_writer import persist_ai_call_activity
+            await persist_ai_call_activity(
+                app_id=_attr.get("app_id"),
+                user_id=_attr.get("user_id"),
+                agent_id="transkription",
+                workflow_id=_attr.get("workflow_id"),
+                model=_model,
+                input_tokens=0,
+                output_tokens=0,
+                status="error",
+                duration_ms=int((time.time() - _start) * 1000),
+                error_code="500",
+                app_env=_attr.get("app_env"),
+            )
+        except Exception as _te:
+            logger.warning(f"transkription error tracking failed (non-blocking): {_te}")
         raise HTTPException(status_code=500, detail=f"Audio transcription failed: {str(e)}")
 
 
