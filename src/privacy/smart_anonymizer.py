@@ -97,6 +97,55 @@ def _value_is_hard_pii(value: str) -> bool:
     return False
 
 
+# ── Post-pipeline consistency invariants ─────────────────────────────────────
+
+def _assert_mapping_text_consistent(mapping: Dict[str, str], text: str) -> None:
+    """Invariant 1: every mapping key must appear in the anonymized text.
+
+    A violation means a placeholder was registered as "kept" but is absent from
+    the output — de-anonymization would silently fail to restore it, and the
+    consumer adapter rightfully rejects it. Fail loud here rather than return
+    broken data. Root cause is typically overlapping Presidio spans that
+    corrupted the right-to-left replacement loop (now fixed in anonymizer.py,
+    but this assertion is the safety-net for future regressions).
+    """
+    missing = [ph for ph in mapping if ph not in text]
+    if missing:
+        raise ValueError(
+            f"smart_anonymize consistency violation: {len(missing)} mapping "
+            f"placeholder(s) absent from smart_anonymized_text: {missing[:5]} "
+            f"(USE_REFINEMENT={USE_REFINEMENT})"
+        )
+
+
+def _assert_no_hard_pii_leak(
+    mapping: Dict[str, str],
+    text: str,
+    type_by_placeholder: Dict[str, str],
+) -> None:
+    """Invariant 2: original values of hard-PII KEEP entities must NOT appear
+    as plaintext in the anonymized text.
+
+    If a PERSON / EMAIL_ADDRESS / PHONE_NUMBER etc. value is found verbatim in
+    the output, the anonymization pipeline has a data leak — fail loud.
+    Values ≤ 3 chars are skipped to avoid false positives on coincidental
+    single-word matches (e.g. the string "at" appearing naturally).
+    """
+    leaks = []
+    for placeholder, original in mapping.items():
+        entity_type = type_by_placeholder.get(placeholder, "")
+        if entity_type not in _NEVER_RESTORE_TYPES:
+            continue
+        if len(original) > 3 and original in text:
+            leaks.append((placeholder, entity_type))
+    if leaks:
+        raise ValueError(
+            f"smart_anonymize PII leak: {len(leaks)} hard-PII entity value(s) "
+            f"appear as plaintext in smart_anonymized_text — "
+            + ", ".join(f"{ph}({t})" for ph, t in leaks[:5])
+        )
+
+
 def _must_stay_anonymized(
     placeholder: str, value: str, type_by_placeholder: Dict[str, str]
 ) -> bool:
@@ -328,20 +377,22 @@ async def smart_anonymize(
         }
 
     # Default path: local Flair NER is precise enough — skip the blind cloud
-    # refiner entirely and return the detection result directly. Mapping and
-    # text are inherently consistent (both built in one pass), which also
-    # removes the "placeholder absent from smart_anonymized_text" inconsistency
-    # that the refiner's text-rewrite could introduce.
+    # refiner entirely and return the detection result directly.
     if not USE_REFINEMENT:
+        _mapping = dict(raw_result.mapping)
+        _text = raw_result.anonymized_text
+        _type_by_ph = {e.placeholder: e.entity_type for e in raw_result.detected_entities}
+        _assert_mapping_text_consistent(_mapping, _text)
+        _assert_no_hard_pii_leak(_mapping, _text, _type_by_ph)
         return {
             "status": "success",
             "anonymization_performed": True,
-            "raw_anonymized_text": raw_result.anonymized_text,
+            "raw_anonymized_text": _text,
             "raw_entity_count": raw_result.entity_count,
-            "smart_anonymized_text": raw_result.anonymized_text,
-            "smart_entity_count": len(raw_result.mapping),
+            "smart_anonymized_text": _text,
+            "smart_entity_count": len(_mapping),
             "restored_entities": [],
-            "mapping": dict(raw_result.mapping),
+            "mapping": _mapping,
             "detected_entities": [
                 {
                     "placeholder": e.placeholder,
@@ -416,6 +467,8 @@ async def smart_anonymize(
             "reason": decision_info.get("reason", "")
         })
 
+    _assert_mapping_text_consistent(smart_mapping, smart_text)
+    _assert_no_hard_pii_leak(smart_mapping, smart_text, type_by_placeholder)
     return {
         "status": "success",
         "anonymization_performed": True,

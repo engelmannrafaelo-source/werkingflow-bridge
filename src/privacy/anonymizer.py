@@ -308,20 +308,27 @@ class PresidioAnonymizer:
             score_threshold=SCORE_THRESHOLD
         )
 
-        # Remove overlapping entities (keep longer one)
-        # Example: EMAIL_ADDRESS "p.pichlbauer@getec.at" contains URL "getec.at"
+        # Resolve overlapping entities — keep the highest-priority one for any
+        # overlapping position. Priority: higher Presidio score, then longer span
+        # as tiebreak. Handles BOTH full containment and partial overlap.
+        #
+        # The old containment-only filter let partially-overlapping entities
+        # through. In the right-to-left replacement loop below, entity B
+        # (higher start, processed first) gets replaced; then entity A (lower
+        # start, partial overlap) computes anonymized_text[A.end:] on the
+        # modified text — that slice now falls *inside* B's placeholder string,
+        # corrupting it. The corrupted placeholder stays in mapping but is absent
+        # from the final text → the consumer throws "placeholder absent from
+        # smart_anonymized_text". The greedy approach here eliminates partial
+        # overlaps so the replacement loop receives non-overlapping spans only.
+        sorted_by_priority = sorted(
+            results, key=lambda r: (r.score, r.end - r.start), reverse=True
+        )
         results_filtered = []
-        for result in results:
-            is_contained = False
-            for other in results:
-                if result == other:
-                    continue
-                # Check if this result is completely contained in another result
-                if (result.start >= other.start and result.end <= other.end and
-                    (result.start != other.start or result.end != other.end)):
-                    is_contained = True
-                    break
-            if not is_contained:
+        for result in sorted_by_priority:
+            # Two spans [a,b) and [c,d) overlap iff a < d AND c < b (strict).
+            # Adjacent spans (a.end == b.start) do NOT overlap.
+            if not any(result.start < k.end and k.start < result.end for k in results_filtered):
                 results_filtered.append(result)
 
         # Sort by position (reverse) to avoid offset issues during replacement
