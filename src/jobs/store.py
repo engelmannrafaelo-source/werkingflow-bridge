@@ -10,6 +10,7 @@ and read back with _loads (asyncpg returns jsonb as text by default).
 """
 import hashlib
 import json
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 from src.db.client import get_pool
@@ -220,3 +221,106 @@ async def find_abandoned(stale_seconds: int, max_attempts: int) -> List[Dict[str
             max_attempts,
         )
     return [_row_to_job(r) for r in rows]
+
+
+# Valid status values for the list-filter guard (fail loud on unknown status).
+_VALID_STATUSES = frozenset([JOB_STATUS_PENDING, JOB_STATUS_RUNNING, JOB_STATUS_DONE, JOB_STATUS_ERROR])
+
+
+async def list_jobs(
+    *,
+    app_id: Optional[str] = None,
+    user_id: Optional[str] = None,
+    status: Optional[str] = None,
+    limit: int = 50,
+) -> List[Dict[str, Any]]:
+    """Return up to `limit` jobs scoped to app_id/user_id, newest first.
+
+    Requires at least one of app_id/user_id — raises ValueError otherwise.
+    limit is capped at 200; an out-of-range value raises ValueError.
+
+    NOTE: querying attribution JSONB keys without a functional index means a
+    sequential scan on large tables. A future migration should add:
+      CREATE INDEX idx_ai_jobs_attr_app  ON ai_jobs ((attribution->>'app_id'));
+      CREATE INDEX idx_ai_jobs_attr_user ON ai_jobs ((attribution->>'user_id'));
+    """
+    if app_id is None and user_id is None:
+        raise ValueError("list_jobs requires at least one of app_id or user_id")
+    if not (1 <= limit <= 200):
+        raise ValueError(f"limit must be 1–200, got {limit}")
+    if status is not None and status not in _VALID_STATUSES:
+        raise ValueError(f"Unknown status filter '{status}'. Valid: {sorted(_VALID_STATUSES)}")
+
+    conditions: List[str] = []
+    params: List[Any] = []
+
+    if app_id is not None:
+        params.append(app_id)
+        conditions.append(f"attribution->>'app_id' = ${len(params)}")
+
+    if user_id is not None:
+        params.append(user_id)
+        conditions.append(f"attribution->>'user_id' = ${len(params)}")
+
+    if status is not None:
+        params.append(status)
+        conditions.append(f"status = ${len(params)}")
+
+    params.append(limit)
+    limit_placeholder = f"${len(params)}"
+
+    where = " AND ".join(conditions)
+    query = f"""
+        SELECT job_id, kind, status, attribution, result, progress, created_at, updated_at
+          FROM ai_jobs
+         WHERE {where}
+         ORDER BY created_at DESC
+         LIMIT {limit_placeholder}
+    """
+
+    pool = get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(query, *params)
+
+    return [_row_to_list_item(r) for r in rows]
+
+
+def _row_to_list_item(row) -> Dict[str, Any]:
+    """Slim projection for list responses — no payload (potentially large), no error body."""
+    attribution = _loads(row["attribution"])
+    result = _loads(row["result"])
+    progress = _loads(row["progress"])
+    status = row["status"]
+
+    # Extract model/usage best-effort: chat completions put them directly in result
+    # (OpenAI-style); other kinds may surface model in progress.
+    model: Optional[str] = None
+    usage: Optional[Any] = None
+    if isinstance(result, dict):
+        model = result.get("model")
+        usage = result.get("usage")
+    if model is None and isinstance(progress, dict):
+        model = progress.get("model")
+
+    created = row["created_at"]
+    updated = row["updated_at"]
+    elapsed: Optional[float] = None
+    if isinstance(created, datetime) and isinstance(updated, datetime):
+        terminal = status in (JOB_STATUS_DONE, JOB_STATUS_ERROR)
+        end = updated if terminal else datetime.now(timezone.utc)
+        if end.tzinfo is None:
+            end = end.replace(tzinfo=timezone.utc)
+        if created.tzinfo is None:
+            created = created.replace(tzinfo=timezone.utc)
+        elapsed = round((end - created).total_seconds(), 2)
+
+    return {
+        "job_id": row["job_id"],
+        "kind": row["kind"],
+        "status": status,
+        "created_at": created.isoformat() if isinstance(created, datetime) else created,
+        "elapsed_seconds": elapsed,
+        "model": model,
+        "usage": usage,
+        "attribution": attribution,
+    }

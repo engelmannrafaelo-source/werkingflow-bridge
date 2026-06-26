@@ -18,7 +18,7 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.security import HTTPAuthorizationCredentials
 from pydantic import BaseModel
 
@@ -93,6 +93,71 @@ async def create_job_endpoint(
     logger.info(f"📨 Async job {job_id} dispatched (kind={body.kind})")
 
     return {"job_id": job_id, "status": "pending", "kind": body.kind}
+
+
+@router.get("/v1/jobs")
+async def list_jobs_endpoint(
+    request: Request,
+    app_id: Optional[str] = Query(default=None),
+    user_id: Optional[str] = Query(default=None),
+    status: Optional[str] = Query(default=None),
+    limit: int = Query(default=50, ge=1, le=200),
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(security),
+):
+    """List jobs scoped to the calling app/user. At least one of app_id or
+    user_id is required (fail loud otherwise — no unscoped listing).
+
+    Attribution scope check: the caller may only list jobs matching their own
+    X-App-ID / X-User-ID headers. Requesting a different app_id or user_id
+    than the one in the request headers raises 403 (fail loud, no cross-scope
+    leak). Callers with no attribution headers may still filter by the
+    explicit query params they provide (service-to-service use-case where
+    headers are absent but the filter is unambiguous)."""
+    await verify_api_key(request, credentials)
+    _require_enabled()
+
+    if app_id is None and user_id is None:
+        raise HTTPException(
+            status_code=400,
+            detail="At least one of app_id or user_id query parameters is required",
+        )
+
+    if status is not None and status not in (
+        store.JOB_STATUS_PENDING,
+        store.JOB_STATUS_RUNNING,
+        store.JOB_STATUS_DONE,
+        store.JOB_STATUS_ERROR,
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid status filter '{status}'. Valid: done, error, pending, running",
+        )
+
+    # Attribution scope guard: if the caller sends attribution headers, the
+    # filter params MUST match — prevents app-A from listing app-B's jobs.
+    if _attribution_extractor is not None:
+        caller_attr = _attribution_extractor(request)
+        caller_app = caller_attr.get("app_id")
+        caller_user = caller_attr.get("user_id")
+        if app_id is not None and caller_app and caller_app != app_id:
+            raise HTTPException(
+                status_code=403,
+                detail=(
+                    f"app_id filter '{app_id}' does not match "
+                    f"caller attribution '{caller_app}'"
+                ),
+            )
+        if user_id is not None and caller_user and caller_user != user_id:
+            raise HTTPException(
+                status_code=403,
+                detail=(
+                    f"user_id filter '{user_id}' does not match "
+                    f"caller attribution '{caller_user}'"
+                ),
+            )
+
+    jobs = await store.list_jobs(app_id=app_id, user_id=user_id, status=status, limit=limit)
+    return {"jobs": jobs}
 
 
 @router.get("/v1/jobs/{job_id}")
