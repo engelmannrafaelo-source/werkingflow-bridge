@@ -1,4 +1,5 @@
 import os
+import hmac
 from pathlib import Path
 from typing import Optional, Dict, Any, Tuple, List
 from fastapi import HTTPException, Request
@@ -233,6 +234,10 @@ class ClaudeCodeAuthManager:
     def __init__(self):
         # Check both API_KEY (legacy) and AI_BRIDGE_API_KEY (new standard)
         self.env_api_key = os.getenv("AI_BRIDGE_API_KEY") or os.getenv("API_KEY")
+        # Optional second key accepted ONLY during a key rotation overlap window.
+        # Lets us deploy the new key on the bridge while consumers still send the
+        # old one — zero downtime. Remove the env var once all consumers migrated.
+        self.env_api_key_previous = os.getenv("AI_BRIDGE_API_KEY_PREVIOUS")
         self.auth_method = self._detect_auth_method()
         self.auth_status = self._validate_auth_method()
     
@@ -538,8 +543,11 @@ async def verify_api_key(request: Request, credentials: Optional[HTTPAuthorizati
             headers={"WWW-Authenticate": "Bearer"},
         )
     
-    # Verify the API key
-    if credentials.credentials != active_api_key:
+    # Verify the API key. Accept the active key OR the previous key during a
+    # rotation overlap window (AI_BRIDGE_API_KEY_PREVIOUS). Constant-time compare
+    # to avoid timing side-channels.
+    valid_keys = [k for k in (active_api_key, auth_manager.env_api_key_previous) if k]
+    if not any(hmac.compare_digest(credentials.credentials, k) for k in valid_keys):
         raise HTTPException(
             status_code=401,
             detail="Invalid API key",
