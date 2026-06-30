@@ -138,7 +138,7 @@ async def login(body: LoginRequest) -> Dict[str, Any]:
     pool = get_pool()
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
-            "SELECT id, email, name, tenant_id, role, provider_config, password_hash, created_at, updated_at FROM users WHERE email = $1",
+            "SELECT id, email, name, tenant_id, role, provider_config, password_hash, email_verified, created_at, updated_at FROM users WHERE email = $1",
             body.email,
         )
 
@@ -149,6 +149,12 @@ async def login(body: LoginRequest) -> Dict[str, Any]:
     password_ok = verify_password(body.password, stored_hash or _DUMMY_PASSWORD_HASH)
     if stored_hash is None or not password_ok:
         raise HTTPException(status_code=401, detail="Invalid credentials")
+
+    if not row["email_verified"]:
+        raise HTTPException(
+            status_code=403,
+            detail={"message": "E-Mail-Adresse noch nicht bestätigt.", "code": "email_not_verified"},
+        )
 
     user_id = row["id"]
 
@@ -624,9 +630,26 @@ async def register(body: RegisterRequest) -> Dict[str, Any]:
         body.checkId,
     )
 
+    # Issue email-verification token and enqueue webhook delivery so the
+    # calling app can send a confirmation email. Best-effort: a failure here
+    # does NOT roll back the registration — the user can request a resend.
+    if body.appId in BRIDGE_AUTH_APP_IDS:
+        try:
+            async with pool.acquire() as vc:
+                issued = await _issue_auth_token(vc, user_id, "email_verification")
+                if issued:
+                    cleartext, token_id = issued
+                    await _enqueue_webhook_delivery(
+                        vc, token_id, body.appId, _TOKEN_TYPE_TO_KIND_VERIFY, cleartext
+                    )
+        except Exception as exc:
+            logger.warning(
+                "register: email verification token issuance failed (best-effort): %s", exc
+            )
+
     entitlements = await _entitlements_for(user_id)
     user = _user_dict(user_row, app_licenses)
-    return {"jwt": token, "user": user, "appLicenses": app_licenses, "entitlements": entitlements}
+    return {"jwt": token, "user": user, "appLicenses": app_licenses, "entitlements": entitlements, "emailVerified": False}
 
 
 # ---------------------------------------------------------------------------
