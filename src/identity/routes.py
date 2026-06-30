@@ -1109,10 +1109,18 @@ async def verify_email(body: VerifyEmailRequest) -> Response:
     """
     Consume an email-verification token and flip users.email_verified=true.
 
-    Same 400-on-any-failure shape as reset-password-with-token: caller learns
-    invalid/expired/used as one outcome. Idempotent at the user-row level —
-    a second call with a (now-used) token returns 400, but the user_row is
-    already verified, so the system state is consistent either way.
+    Same 400-on-any-failure shape as reset-password-with-token: an invalid,
+    unknown, or garbage token learns nothing (anti-enumeration).
+
+    Idempotent on success: a genuine verification token (hash matches a real
+    email_verification row for this user) whose user is ALREADY verified
+    returns 204 — not 400 — even if the token was already consumed. This is
+    the common production case: a one-time confirmation link gets hit twice
+    (the user double-clicks, or a corporate email security scanner pre-fetches
+    the link and consumes it before the human clicks). The verification effect
+    is already achieved, so re-hitting the real link must read as success, not
+    a scary "invalid token" error. Anti-enumeration is preserved: only the
+    legitimate recipient can present a token whose hash matches.
     """
     token_hash = _hash_token(body.token)
     pool = get_pool()
@@ -1120,7 +1128,8 @@ async def verify_email(body: VerifyEmailRequest) -> Response:
         async with conn.transaction():
             tok_row = await conn.fetchrow(
                 """
-                SELECT t.id, t.user_id, t.expires_at, t.used_at, u.anonymized_at
+                SELECT t.id, t.user_id, t.expires_at, t.used_at,
+                       u.anonymized_at, u.email_verified
                   FROM auth_tokens t
                   JOIN users u ON u.id = t.user_id
                  WHERE t.token_hash = $1
@@ -1129,10 +1138,26 @@ async def verify_email(body: VerifyEmailRequest) -> Response:
                 token_hash,
             )
 
+            # Unknown token or closed account → opaque failure.
+            if tok_row is None or tok_row["anonymized_at"] is not None:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Invalid or expired email-verification token",
+                )
+
+            # Genuine link whose user is already verified (re-click, or an
+            # email security scanner that pre-fetched and consumed the
+            # one-time link) → idempotent success instead of a scary error.
+            if tok_row["email_verified"]:
+                logger.info(
+                    "identity.verify_email: already verified, idempotent ok user_id=%s",
+                    tok_row["user_id"],
+                )
+                return Response(status_code=204)
+
+            # Not yet verified: a used or expired token can no longer verify.
             if (
-                tok_row is None
-                or tok_row["used_at"] is not None
-                or tok_row["anonymized_at"] is not None
+                tok_row["used_at"] is not None
                 or tok_row["expires_at"].replace(tzinfo=timezone.utc)
                 <= datetime.now(timezone.utc)
             ):

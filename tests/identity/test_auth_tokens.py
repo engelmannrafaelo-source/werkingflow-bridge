@@ -162,6 +162,7 @@ def _token_row(
     used: bool = False,
     expired: bool = False,
     anonymized: bool = False,
+    email_verified: bool = False,
 ) -> dict:
     now = datetime.now(timezone.utc)
     return {
@@ -170,6 +171,7 @@ def _token_row(
         "expires_at": now - timedelta(hours=1) if expired else now + timedelta(hours=24),
         "used_at": now if used else None,
         "anonymized_at": now if anonymized else None,
+        "email_verified": email_verified,
     }
 
 
@@ -592,6 +594,25 @@ class TestVerifyEmail:
             )
 
         assert resp.status_code == 400
+
+    def test_already_verified_token_is_idempotent_204(self, client: TestClient):
+        # Genuine link, but the user is already verified — re-click or an
+        # email scanner pre-fetched and consumed the one-time link. Must read
+        # as success, not a scary "invalid token" error. No DB writes.
+        pool, conn = _mock_pool(
+            fetchrow_results=[_token_row(used=True, email_verified=True)]
+        )
+
+        with patch("src.identity.routes.get_pool", return_value=pool):
+            resp = client.post(
+                "/v1/auth/verify-email",
+                json={"token": "already-verified"},
+            )
+
+        assert resp.status_code == 204, resp.text
+        sqls = [c.args[0] for c in conn.execute.await_args_list]
+        assert not any("UPDATE users" in s for s in sqls), sqls
+        assert not any("UPDATE auth_tokens" in s for s in sqls), sqls
 
     def test_anonymized_user_returns_400(self, client: TestClient):
         pool, conn = _mock_pool(fetchrow_results=[_token_row(anonymized=True)])
