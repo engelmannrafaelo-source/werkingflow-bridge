@@ -127,6 +127,7 @@ def _mock_pool(
     if auto_token_id:
         fv.append(uuid.uuid4())
     conn.fetchval = AsyncMock(side_effect=fv)
+    conn.fetch = AsyncMock(return_value=[])
 
     @asynccontextmanager
     async def _transaction():
@@ -635,6 +636,93 @@ class TestVerifyEmail:
             )
 
         assert resp.status_code == 422
+
+
+# ===========================================================================
+# POST /v1/auth/verify-email-login — verify + return identity (magic-link)
+# ===========================================================================
+
+def _full_user_row(uid: uuid.UUID) -> dict:
+    now = datetime.now(timezone.utc)
+    return {
+        "id": uid,
+        "email": "alice@example.com",
+        "name": "Alice",
+        "tenant_id": "tenant-1",
+        "role": "user",
+        "provider_config": None,
+        "created_at": now,
+        "updated_at": now,
+    }
+
+
+class TestVerifyEmailLogin:
+    def test_fresh_token_verifies_and_returns_identity(self, client: TestClient):
+        uid = uuid.uuid4()
+        pool, conn = _mock_pool(
+            fetchrow_results=[_token_row(user_id=uid), _full_user_row(uid)]
+        )
+        with patch("src.identity.routes.get_pool", return_value=pool), patch(
+            "src.identity.routes._entitlements_for", new=AsyncMock(return_value=[])
+        ):
+            resp = client.post(
+                "/v1/auth/verify-email-login", json={"token": "fresh"}
+            )
+
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["user"]["id"] == str(uid)
+        assert body["user"]["email"] == "alice@example.com"
+        assert body["user"]["tenantId"] == "tenant-1"
+        assert "appLicenses" in body and "entitlements" in body
+        sqls = [c.args[0] for c in conn.execute.await_args_list]
+        assert any("UPDATE users" in s and "email_verified" in s for s in sqls), sqls
+
+    def test_already_verified_is_idempotent_no_writes(self, client: TestClient):
+        uid = uuid.uuid4()
+        pool, conn = _mock_pool(
+            fetchrow_results=[
+                _token_row(user_id=uid, used=True, email_verified=True),
+                _full_user_row(uid),
+            ]
+        )
+        with patch("src.identity.routes.get_pool", return_value=pool), patch(
+            "src.identity.routes._entitlements_for", new=AsyncMock(return_value=[])
+        ):
+            resp = client.post(
+                "/v1/auth/verify-email-login", json={"token": "reclick"}
+            )
+
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["user"]["id"] == str(uid)
+        sqls = [c.args[0] for c in conn.execute.await_args_list]
+        assert not any("UPDATE users" in s for s in sqls), sqls
+
+    def test_unknown_token_returns_400(self, client: TestClient):
+        pool, conn = _mock_pool(fetchrow_results=[None])
+        with patch("src.identity.routes.get_pool", return_value=pool):
+            resp = client.post(
+                "/v1/auth/verify-email-login", json={"token": "ghost"}
+            )
+        assert resp.status_code == 400
+
+    def test_used_but_unverified_returns_400(self, client: TestClient):
+        pool, conn = _mock_pool(
+            fetchrow_results=[_token_row(used=True, email_verified=False)]
+        )
+        with patch("src.identity.routes.get_pool", return_value=pool):
+            resp = client.post(
+                "/v1/auth/verify-email-login", json={"token": "burnt"}
+            )
+        assert resp.status_code == 400
+
+    def test_anonymized_user_returns_400(self, client: TestClient):
+        pool, conn = _mock_pool(fetchrow_results=[_token_row(anonymized=True)])
+        with patch("src.identity.routes.get_pool", return_value=pool):
+            resp = client.post(
+                "/v1/auth/verify-email-login", json={"token": "closed"}
+            )
+        assert resp.status_code == 400
 
 
 # ===========================================================================

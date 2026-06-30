@@ -1179,3 +1179,94 @@ async def verify_email(body: VerifyEmailRequest) -> Response:
 
     logger.info("identity.verify_email: email marked verified user_id=%s", user_id)
     return Response(status_code=204)
+
+
+# ---------------------------------------------------------------------------
+# POST /v1/auth/verify-email-login
+# ---------------------------------------------------------------------------
+
+@router.post("/verify-email-login")
+async def verify_email_login(body: VerifyEmailRequest) -> Dict[str, Any]:
+    """
+    Verify an email-verification token AND return the user identity so the
+    calling app can establish a session in the same step — magic-link UX:
+    click the confirmation link in the mail → land logged in, no separate
+    password entry.
+
+    Token semantics are identical to POST /verify-email:
+      - fresh valid token → flip email_verified=true, consume the token
+      - already-verified user (re-click / email-scanner pre-fetch) →
+        idempotent success, no writes
+      - unknown / garbage / used-while-unverified / expired → opaque 400
+        (anti-enumeration: only the legitimate recipient holds a token whose
+        hash matches)
+
+    On success returns the same shape as POST /login minus the jwt
+    ({user, appLicenses, entitlements}); the app re-signs its own session
+    cookie from this identity. The shared /verify-email (204) endpoint is
+    left untouched for callers that only need the verification side effect.
+    """
+    token_hash = _hash_token(body.token)
+    pool = get_pool()
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            tok_row = await conn.fetchrow(
+                """
+                SELECT t.id, t.user_id, t.expires_at, t.used_at,
+                       u.anonymized_at, u.email_verified
+                  FROM auth_tokens t
+                  JOIN users u ON u.id = t.user_id
+                 WHERE t.token_hash = $1
+                   AND t.token_type = 'email_verification'::auth_token_type
+                """,
+                token_hash,
+            )
+
+            if tok_row is None or tok_row["anonymized_at"] is not None:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Invalid or expired email-verification token",
+                )
+
+            already_verified = tok_row["email_verified"]
+            if not already_verified:
+                if (
+                    tok_row["used_at"] is not None
+                    or tok_row["expires_at"].replace(tzinfo=timezone.utc)
+                    <= datetime.now(timezone.utc)
+                ):
+                    raise HTTPException(
+                        status_code=400,
+                        detail="Invalid or expired email-verification token",
+                    )
+                await conn.execute(
+                    "UPDATE users SET email_verified = TRUE, updated_at = NOW() WHERE id = $1",
+                    tok_row["user_id"],
+                )
+                await conn.execute(
+                    "UPDATE auth_tokens SET used_at = NOW() WHERE id = $1",
+                    tok_row["id"],
+                )
+
+            user_id = tok_row["user_id"]
+            user = await _fetch_user_with_licenses(conn, user_id)
+
+    # Defensive: the token JOINed users, so the row exists — but the FK could
+    # theoretically race a delete. Treat as an opaque failure rather than 500.
+    if user is None:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid or expired email-verification token",
+        )
+
+    entitlements = await _entitlements_for(user_id)
+    logger.info(
+        "identity.verify_email_login: session granted user_id=%s already_verified=%s",
+        user_id,
+        already_verified,
+    )
+    return {
+        "user": user,
+        "appLicenses": user["appLicenses"],
+        "entitlements": entitlements,
+    }
