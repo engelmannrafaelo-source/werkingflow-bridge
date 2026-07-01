@@ -148,6 +148,42 @@ autonomously-committable rewrite.
 - A deliberately-dropped route in the shared source fails a pre-deploy parity check (CI), not prod.
 - No `chore: capture live prod config` commits are ever needed again.
 
+## Progress log
+
+**2026-07-01 — Item A applied to the metrics-reader route set (commit `2d4c0f5`), the exact
+incident class. LIVE + verified on primary; gated on prod.**
+
+- New shared `docker/routes-metrics-reader.conf` holds the canonical metrics-reader endpoint
+  allowlist as ONE regex. `docker/nginx.conf` (10 prefix locations → `include`) and
+  `docker/nginx-prod.conf` (regex block → `include`) both include it; each keeps only its own
+  `upstream metrics_reader` target (primary→`metrics-reader:8000`, prod→`metrics-reader-prod:8000`).
+  A metrics endpoint can no longer exist in one config and not the other.
+- Both compose files mount the shared file at `/etc/nginx/routes-metrics-reader.conf`;
+  `scripts/bridge-deploy.sh` mounts it into the `nginx -t` validation container too.
+- Validated locally with `openresty -t` (primary base) AND `nginx -t` (prod nginx:alpine base) —
+  the include works on BOTH bases, so eventual prod cutover is mechanism-proven.
+- **Deployed to primary** (`bridge-deploy.sh hetzner nginx`, SHA `2d4c0f5`): nginx healthy,
+  smoke green. Verified live: `account-pool-state` = aggregate `{accounts:{…}}` (4 accounts);
+  reader GET endpoints 200; `usage`/`timeseries` correctly fall through to platform-api (401 auth);
+  `sandbox-observed-rate-limit` is a **POST-only** reader endpoint (`metrics_reader/main.py:963`,
+  returns `400 account_id required` — reader reached) → routing it to the reader is CORRECT
+  (a GET returns the reader's generic "unsupported" 404; not a routing bug).
+
+Still open (unchanged from Decision above):
+- **Prod NOT yet deployed** — host `178.104.178.79` is at `1f48358`, so it still lacks BOTH the
+  route fix `42748c8` AND this `2d4c0f5`. Prod's `account-pool-state` therefore still returns the
+  FLAT single-worker schema (the incident). Deploying prod (`bridge-deploy.sh server2 nginx`)
+  fixes the drift AND adopts the shared source in one step — **gated on Rafael** (live customer bridge).
+- Item A for the OTHER routes (platform-api/auth/sandbox/health/worker-direct) not yet shared:
+  the auth/sandbox regex *paths* are identical in both, but primary uses `upstream platform_api`
+  while prod uses variable `proxy_pass` + `resolver` (DNS re-resolution) — sharing them needs the
+  proxy mechanism unified first (behavior change, own verification). The LLM routes (chat/research)
+  legitimately differ (Lua per-worker vs fallback pool) until item B.
+- Items B–G unchanged. The generator (`generate-bridge-compose.sh`) is still aspirational: its
+  input `secrets/workers/*.txt` does not exist on either host (real tokens live in `secrets/*`
+  flat, referenced by the hand compose files); wiring it to reality is the large, non-autonomous
+  migration this ADR describes.
+
 ## Links
 - ADR-0005 (Bridge schema drift pre-build validator) — the parity/typing prerequisite for F.
 - Incident + app-side fix: werking-energy `cc1f4d8e2` (preflight tolerates flat schema).
