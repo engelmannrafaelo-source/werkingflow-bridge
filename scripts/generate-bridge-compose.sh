@@ -2,6 +2,15 @@
 # =============================================================================
 # Bridge Compose Generator  —  ⚠️ ASPIRATIONAL / NOT THE LIVE DEPLOY PATH ⚠️
 # =============================================================================
+# SUPERSEDED for the nginx layer (2026-07-01, ADR-0006 B/C): the single-source
+# nginx unification actually shipped a different, narrower way — ONE shared
+# docker/nginx.conf (OpenResty+Lua) + the per-topology worker set emitted by
+# scripts/generate-bridge-upstreams.sh into docker/upstreams-{primary,prod}.conf,
+# wired through the hand compose files + bridge-deploy.sh. This whole-compose
+# generator (with its old ${BRIDGE_PROD_HOST}/${BRIDGE_PRIMARY_HOST} nginx block)
+# is NOT that path and remains unused — kept only as a reference sketch for a
+# possible future full compose generation.
+# =============================================================================
 # STATUS (verified 2026-07-01, ADR-0006): this generator models the *intended*
 # single-source world but does NOT yet match what actually runs on either host.
 # NEITHER bridge is deployed from it — bridge-deploy.sh uses the hand-maintained

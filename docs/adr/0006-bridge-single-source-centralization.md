@@ -1,6 +1,7 @@
 # ADR-0006: Bridge Single-Source Centralization (kill dev/prod config drift)
 
-**Status:** PROPOSED
+**Status:** ACCEPTED — items A + B + C live & verified on primary (single shared
+OpenResty+Lua nginx.conf); prod cutover prepared + startklar, gated on the parent.
 **Date:** 2026-07-01
 **Author:** werking-energy session (root-cause of the Phase-4 "ZERO Anthropic accounts" prod incident)
 **Affects:** AI-Bridge deployments (primary/dev host `49.12.72.66`, production host `178.104.178.79`) and every app whose pipeline reads a Bridge metrics endpoint (werking-energy, -safety, -report, engelmann, platform).
@@ -233,6 +234,68 @@ Still open / gated (unchanged intent):
   nginx:alpine today). Prepared/documented only; needs its own test + approval at cutover, NOT live.
 - **Generator cutover (B/C/full)** — the worker-naming + overlay reconciliation is the tested,
   non-autonomous migration; parameter spec above is turnkey but must be diff-verified on the hosts.
+
+**2026-07-01 (cont.) — Items A+B+C SHIPPED: ONE shared OpenResty+Lua nginx.conf for
+both bridges. LIVE + verified on primary (SHA `65c9650`); prod cutover startklar, gated.**
+
+The nginx layer is now single-source. The unification did NOT go through the
+whole-compose `generate-bridge-compose.sh` (that stays aspirational); it shipped a
+narrower, verifiable mechanism — one shared `nginx.conf` + a focused per-topology
+upstreams generator.
+
+- **`docker/lua/pool_router.lua` topology-agnostic** (commit `14392ff`): removed the
+  hardcoded `ACCOUNT_WORKER` map + fixed `WORKER_NAMES={worker1..4}`. `WORKER_NAMES`
+  now parsed from the `BRIDGE_WORKERS` env (same SSoT the metrics-reader uses;
+  `env BRIDGE_WORKERS;` in nginx main context; empty → loud ERR + safe worker1..4
+  default). Account→worker is read live from each account's own `.worker` field in
+  account-pool-state (verified: `engelmann→worker1` primary, `worker-sahori→worker-sahori`
+  prod), so there is no map to keep in sync. luajit byte-compile verified.
+- **`docker/nginx.conf` = the single shared source** (commit `876cb00`): no worker
+  names anywhere in it. The one legit per-bridge difference (worker set + backup
+  host) is `include /tmp/upstreams.conf`, emitted by the new
+  `scripts/generate-bridge-upstreams.sh` into `docker/upstreams-{primary,prod}.conf`
+  (compose envsubst's `${BRIDGE_BACKUP_HOST}` in). primary: worker1..4, default pool
+  NO backup (dev/prod isolation preserved); prod: worker-sahori/worker-kurt, default
+  pool backs up to the dev bridge (Model-B). `claude_production` backs up to
+  `${BRIDGE_BACKUP_HOST}` on both. `metrics_reader` + `claude_unavail` + the
+  `$backend_pool` map stay shared (`metrics-reader` resolves on both via prod's
+  compose alias). The 4 hardcoded `/workerN/` debug locations collapse to ONE
+  topology-agnostic regex. `${BRIDGE_PROD_HOST}` → `${BRIDGE_BACKUP_HOST}`.
+- **Compose + deploy + parity wired** (commit `65c9650`): both nginx services mount
+  the shared `nginx.conf` + their `upstreams-*.conf`, set `BRIDGE_WORKERS` +
+  `BRIDGE_BACKUP_HOST`; **prod nginx switches nginx:alpine → build Dockerfile.nginx-lb
+  (OpenResty+Lua) = Item B**. `bridge-deploy.sh` validates the shared nginx.conf for
+  BOTH bridges (renders+mounts the upstreams include, `--add-host metrics-reader`) and
+  builds prod nginx; `bridge-parity-check.sh` gains check 4 (in-container
+  `upstreams.conf` == per-bridge repo file).
+- **`docker/nginx-prod.conf` DELETED** (Item C) — no compose/script references it; a
+  failed prod cutover's auto-`git reset` restores it + the nginx:alpine compose.
+
+**Verified on primary (`bridge-deploy.sh hetzner nginx`, canary):** compose config +
+`openresty -t` (BOTH param sets) PASS · nginx built OpenResty · healthy · smoke
+(research 200, 14 URLs) PASS · **`bridge-parity-check.sh hetzner` 4/4 PASS** · live:
+`/health` 200, `/lb-status` 200, `account-pool-state` **aggregate (4 accounts)**,
+`/v1/db/health` 200, `/v1/users` 401, `/worker3/health` 200 (new regex) · pool-router
+`last_refresh_status=ok`. The deploy's distribution test read "1/4 workers", which is a
+**false alarm from live account state, not a regression**: at that moment only `gmail`
+(worker3) was eligible (`available=True`, weekly 29%) — the other 3 were in cooldown /
+near weekly cap (`available=False`), so the router correctly sent all traffic to the one
+account with headroom. The test's "≥2 workers" assumption is invalid when <2 accounts are
+eligible; it is optimization-signal-only and does not roll back.
+
+**PROD CUTOVER — startklar (gated on parent; do NOT run while an energy pipeline is on prod):**
+1. `scripts/bridge-parity-check.sh server2` — will FAIL currency until step 2 pulls (expected).
+2. `scripts/bridge-deploy.sh server2 nginx` — pulls develop, builds the OpenResty nginx,
+   recreates ONLY `wt-prod-lb`. Validation + smoke (X-Priority: production) gate it; auto-
+   rollback on failure. Workers/metrics/platform-api are unchanged by this work (prod
+   metrics-reader-prod already returns the aggregate with `BRIDGE_WORKERS=worker-sahori,worker-kurt`).
+3. Post-cutover verify: `account-pool-state` = aggregate on prod, `/internal/pool-router/state`
+   `last_refresh_status=ok`, `bridge-parity-check.sh server2` 4/4 green.
+
+Still open (unchanged intent): Items D (deploy-only-from-repo discipline), E (endpoint
+schema separation), F/G residue (typed OpenAPI + DB gating from ADR-0005). The
+whole-compose `generate-bridge-compose.sh` stays aspirational (header now points to the
+shipped narrower mechanism).
 
 ## Links
 - ADR-0005 (Bridge schema drift pre-build validator) — the parity/typing prerequisite for F.
