@@ -372,6 +372,7 @@ if docker run --rm \
     ${add_hosts} \
     --tmpfs /var/log/nginx \
     -v /tmp/bridge-nginx-check.conf:/etc/nginx/nginx.conf:ro \
+    -v ${REMOTE_REPO}/docker/routes-metrics-reader.conf:/etc/nginx/routes-metrics-reader.conf:ro \
     -v ${REMOTE_REPO}/docker/lua:/etc/nginx/lua:ro \
     openresty/openresty:1.27.1.1-alpine \
     sh -c 'touch /var/log/nginx/access.jsonl && openresty -t -c /etc/nginx/nginx.conf' 2>&1

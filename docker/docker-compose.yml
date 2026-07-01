@@ -13,6 +13,7 @@ services:
       - "8020:80"      # eco-diagnostics compatibility
     volumes:
       - ./nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./routes-metrics-reader.conf:/etc/nginx/routes-metrics-reader.conf:ro
       - ../logs/nginx:/var/log/nginx
     environment:
       - BRIDGE_PROD_HOST=${BRIDGE_PROD_HOST:-127.0.0.1}
