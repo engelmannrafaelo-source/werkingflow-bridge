@@ -184,6 +184,56 @@ Still open (unchanged from Decision above):
   flat, referenced by the hand compose files); wiring it to reality is the large, non-autonomous
   migration this ADR describes.
 
+**2026-07-01 (cont.) — Item A extended to the platform-api route set (commit `c775655`) +
+deploy-gate F added (commit `b6eba0c`). LIVE + verified on primary; prod still gated.**
+
+- New shared `docker/routes-platform-api.conf` holds ALL platform-api-destined routes (metrics
+  `usage`/`timeseries`, the `auth|users|…|admin` regex, `db/health`, `sandbox`), included by BOTH
+  configs AFTER the metrics-reader include. Unified onto variable `proxy_pass $platform_api` +
+  `resolver`: primary previously used a static `upstream platform_api` (resolve-once → stale-IP
+  502 after a platform-api restart); that block is **removed**. `$platform_api` stays a per-env
+  `set` (the only legit difference). Fail-loud posture standardised: `proxy_next_upstream off` +
+  `proxy_connect_timeout 5s` on all platform routes.
+- Validated both engines (openresty -t primary + nginx -t prod alpine); deployed primary
+  (`bridge-deploy.sh hetzner nginx`, SHA `c775655`, healthy, smoke+dist+state PASS). Live-checked:
+  `db/health` 200 (PostgreSQL — proves variable proxy_pass reaches platform-api), `metrics/usage`
+  + `users` 401 platform-auth (not 502, not a worker), `sandbox/*` → platform-api FastAPI 404
+  (`{"detail":"Not Found"}`, NOT the `[Bridge workerX]` wrapper), `account-pool-state` still
+  aggregate. **Primary is now fully single-sourced for BOTH route sets, no regression.**
+- **Deploy-gate F** (`scripts/bridge-parity-check.sh <hetzner|server2>`): fail-loud checks —
+  (1) currency host HEAD == origin/develop, (2) no modified TRACKED files under `docker/`
+  (untracked `*.bak` only WARNs), (3) the shared includes loaded INSIDE the running nginx
+  container are sha256-identical to the host repo. Verified: PASS on primary, FAIL on prod
+  (deliberately behind, pre-cutover) — it catches the exact drift class from the incident.
+
+**Verified host ground truth (2026-07-01, read-only SSH) — the cutover parameter spec:**
+
+| aspect | primary (`hetzner`, 49.12.72.66) | production (`server2`, 178.104.178.79) |
+|---|---|---|
+| repo SHA | `c775655` (current) | `1f48358` (behind — pre-cutover) |
+| worker set | `worker1..4` | `worker-sahori`, `worker-kurt` |
+| token files | `secrets/claude_token_account1..4.txt` (+ name symlinks) | `secrets/claude_token_worker-{sahori,kurt}.txt` |
+| worker→token map | worker1→account1 … worker4→account4 | worker-sahori→…-sahori, worker-kurt→…-kurt |
+| privacy | LOCAL container, `PRIVACY_SERVICE_URL=http://privacy-service:8100` | REMOTE `http://100.112.98.39:8100` (dev over Tailscale); NO local privacy container |
+| platform-api/DB | platform-api + postgres overlay | same, running (`wt-prod-platform-api`, `bridge-postgres-prod`) |
+| nginx base | OpenResty + Lua | plain `nginx:alpine` (no Lua) — **Item B behaviour change** |
+
+  → generator BRIDGE_ID params to implement at cutover: `WORKER_TOKEN_MAP` (per-host, flat
+  `secrets/claude_token_*.txt`, NOT `secrets/workers/`), `PRIVACY_MODE=local|remote(url)`,
+  `PLATFORM_OVERLAY` (layered `-f *-platform.yml`, as bridge-deploy already does), and the
+  worker-naming reconciliation (generator `worker-<name>` + `upstreams.generated.conf` vs the
+  deployed inline `worker1..4` in `nginx.conf`). `generate-bridge-compose.sh` header now documents
+  each gap and fails loud (it will NOT run blindly / no `mkdir secrets/workers` trap).
+
+Still open / gated (unchanged intent):
+- **Prod NOT deployed** — still `1f48358`; lacks `42748c8`, `2d4c0f5`, `c775655`, `b6eba0c`. Its
+  `account-pool-state` still returns the FLAT schema. One gated cutover (`bridge-deploy.sh server2 …`)
+  after Rafael's OK adopts all four; run `bridge-parity-check.sh server2` first — it must go green.
+- **Item B (OpenResty+Lua on prod)** — real behaviour change to the customer bridge (prod is
+  nginx:alpine today). Prepared/documented only; needs its own test + approval at cutover, NOT live.
+- **Generator cutover (B/C/full)** — the worker-naming + overlay reconciliation is the tested,
+  non-autonomous migration; parameter spec above is turnkey but must be diff-verified on the hosts.
+
 ## Links
 - ADR-0005 (Bridge schema drift pre-build validator) — the parity/typing prerequisite for F.
 - Incident + app-side fix: werking-energy `cc1f4d8e2` (preflight tolerates flat schema).

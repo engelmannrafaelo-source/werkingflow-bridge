@@ -1,19 +1,38 @@
 #!/bin/bash
 # =============================================================================
-# Bridge Compose Generator
+# Bridge Compose Generator  —  ⚠️ ASPIRATIONAL / NOT THE LIVE DEPLOY PATH ⚠️
 # =============================================================================
-# Generates docker-compose.generated.yml from secrets/workers/*.txt token files.
-# Each token file becomes one Claude SDK worker container.
-# nginx upstreams + per-worker dest map are written to docker/upstreams.generated.conf
-# (included by docker/nginx.conf).
+# STATUS (verified 2026-07-01, ADR-0006): this generator models the *intended*
+# single-source world but does NOT yet match what actually runs on either host.
+# NEITHER bridge is deployed from it — bridge-deploy.sh uses the hand-maintained
+# docker-compose{,-prod}.yml. Do NOT `mkdir secrets/workers` and run this to
+# "fix" it: that path is a trap (see gaps below). Closing these gaps is the
+# gated cutover migration in docs/adr/0006-bridge-single-source-centralization.md,
+# to be run + diff-verified ON the hosts (secrets live only there).
 #
-# Usage:
+# VERIFIED reality-gaps this generator must close before it can drive a deploy:
+#   1. SECRETS: real tokens are FLAT `secrets/claude_token_<name>.txt` (+ account
+#      symlinks), NOT `secrets/workers/*.txt`. The worker→token mapping is bespoke
+#      per host (primary: worker1..4 → claude_token_account1..4; production:
+#      worker-sahori/worker-kurt → claude_token_worker-{sahori,kurt}.txt).
+#   2. WORKER NAMING: this script emits `worker-<name>` + upstreams.generated.conf,
+#      but the deployed nginx.conf hardcodes `worker1..4` inline and does NOT
+#      include the generated upstreams. Reconciling the two is part of the cutover.
+#   3. PRIVACY (hardware): primary runs a LOCAL privacy-service (16G box);
+#      production has NO local privacy container — its workers use REMOTE
+#      PRIVACY_SERVICE_URL=http://100.112.98.39:8100 (dev bridge over Tailscale,
+#      because the ~13G model does not fit the 7G prod host). This must become a
+#      BRIDGE_ID param (privacy: local | remote(url)); today it emits local for both.
+#   4. PLATFORM-API/DB OVERLAY: both hosts layer a separate platform-api + postgres
+#      overlay compose (bridge-deploy.sh: `-f base -f *-platform.yml`). Kept as a
+#      layered overlay, not emitted here — model it as a BRIDGE_ID-gated overlay.
+#   5. BASE IMAGE: prod nginx currently runs plain nginx:alpine (no Lua pool
+#      router); this script intends OpenResty for both. Unifying onto OpenResty
+#      for prod is a BEHAVIOUR change (Item B) — test + approval required at cutover.
+#
+# Intended usage (post-cutover):
 #   BRIDGE_ID=primary    scripts/generate-bridge-compose.sh
 #   BRIDGE_ID=production scripts/generate-bridge-compose.sh
-#
-# Conventions:
-#   secrets/workers/<name>.txt     -> worker service "worker-<name>", upstream worker-<name>
-#   Hardware-aware sizing for privacy-service via BRIDGE_ID dispatch.
 # =============================================================================
 set -euo pipefail
 
@@ -62,7 +81,11 @@ esac
 
 # Find worker token files
 if [ ! -d "$WORKERS_DIR" ]; then
-  echo "ERROR: $WORKERS_DIR does not exist. Create it and add <name>.txt files." >&2
+  echo "ERROR: $WORKERS_DIR does not exist — and this is EXPECTED (see header)." >&2
+  echo "  Real tokens are FLAT at secrets/claude_token_<name>.txt, mapped per host." >&2
+  echo "  Do NOT create secrets/workers/ to satisfy this — that produces worker-<name>" >&2
+  echo "  services that do not match the deployed worker1..4 / worker-sahori topology." >&2
+  echo "  This generator is not yet the deploy path; see ADR-0006 for the cutover plan." >&2
   exit 1
 fi
 
