@@ -59,20 +59,27 @@ rssh() { ssh -o StrictHostKeyChecking=no -o ConnectTimeout=15 "root@${HOST}" "$@
 
 log "host=${HOST} repo=${REMOTE_REPO} container=${NGINX_CONTAINER}"
 
-# --- Check 1: CURRENCY -------------------------------------------------------
-# Host HEAD must equal the tip of origin/develop the host knows about (after a
-# fetch). A box behind develop is running stale code; ahead means a live commit
-# never pushed. Both are drift.
-log "check 1/3: currency (host HEAD == origin/develop)"
+# --- Check 1: CURRENCY (deployed surface) ------------------------------------
+# The box must have the docker/ tree it would deploy. Scoped to docker/ on
+# purpose: that IS the deployed surface (compose + nginx + shared includes).
+# A docs- or scripts-only commit on develop does NOT make the bridge stale, so
+# it must not trip this gate. If docker/ at host HEAD != docker/ at origin/develop
+# → the box is behind on files that actually ship. The full-HEAD delta is shown
+# as info only.
+log "check 1/3: currency (docker/ at host HEAD == docker/ at origin/develop)"
 currency=$(rssh "cd ${REMOTE_REPO} && git fetch -q origin develop 2>/dev/null; \
-    local_sha=\$(git rev-parse HEAD); remote_sha=\$(git rev-parse origin/develop); \
-    echo \"\${local_sha} \${remote_sha}\"") || { fail "cannot read git state on host"; }
+    host_head=\$(git rev-parse HEAD); origin_develop=\$(git rev-parse origin/develop); \
+    if git diff --quiet HEAD origin/develop -- docker/; then docker_state=SAME; else docker_state=DIFF; fi; \
+    echo \"\${host_head} \${origin_develop} \${docker_state}\"") \
+    || fail "cannot read git state on host"
 if [ -n "${currency:-}" ]; then
-    host_head="${currency%% *}"; origin_develop="${currency##* }"
-    if [ "$host_head" = "$origin_develop" ]; then
-        log "  OK  host HEAD == origin/develop (${host_head:0:12})"
+    host_head=$(echo "$currency" | awk '{print $1}')
+    origin_develop=$(echo "$currency" | awk '{print $2}')
+    docker_state=$(echo "$currency" | awk '{print $3}')
+    if [ "$docker_state" = "SAME" ]; then
+        log "  OK  docker/ current (host ${host_head:0:12}$( [ "$host_head" != "$origin_develop" ] && echo ", non-docker commits ahead on origin — ok"))"
     else
-        fail "host HEAD ${host_head:0:12} != origin/develop ${origin_develop:0:12} (box out of sync)"
+        fail "docker/ differs: host HEAD ${host_head:0:12} is behind origin/develop ${origin_develop:0:12} on deployed files — git pull before deploy"
     fi
 fi
 
