@@ -20,20 +20,34 @@ services:
   # NGINX — Eigener Load Balancer mit Fallback auf Server 1
   # ===========================================================================
   nginx:
-    image: nginx:alpine
+    # SINGLE SOURCE (ADR-0006 B/C): production now runs the SAME OpenResty+Lua
+    # image + the SAME docker/nginx.conf as primary. nginx-prod.conf is gone; the
+    # only per-bridge difference is upstreams-prod.conf (worker set + backup host).
+    # This gives the customer bridge the intelligent Lua account pool-router.
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.nginx-lb
     container_name: wt-prod-lb
     ports:
       - "8000:80"
     volumes:
-      - ./nginx-prod.conf:/etc/nginx/templates/nginx.conf.template:ro
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+      # Per-topology worker set: worker-sahori/worker-kurt + dev-bridge backup
+      # (Model-B). envsubst'd to /tmp/upstreams.conf in the command below.
+      - ./upstreams-prod.conf:/etc/nginx/upstreams.conf:ro
       - ./routes-metrics-reader.conf:/etc/nginx/routes-metrics-reader.conf:ro
       - ./routes-platform-api.conf:/etc/nginx/routes-platform-api.conf:ro
       - ../logs/nginx:/var/log/nginx
     environment:
-      - BRIDGE_PRIMARY_HOST=${BRIDGE_PRIMARY_HOST:-127.0.0.1}
+      # Backup bridge = the dev/primary bridge (Model-B fallback for the default
+      # pool). nginx.conf references ${BRIDGE_BACKUP_HOST}.
+      - BRIDGE_BACKUP_HOST=${BRIDGE_PRIMARY_HOST:-127.0.0.1}
       - BRIDGE_ID=${BRIDGE_ID:-prod}
-    # envsubst ersetzt ${BRIDGE_PRIMARY_HOST} und ${BRIDGE_ID} in nginx.conf, dann Start
-    command: ["/bin/sh", "-c", "rm -f /etc/nginx/conf.d/default.conf && envsubst '$$BRIDGE_PRIMARY_HOST $$BRIDGE_ID' < /etc/nginx/templates/nginx.conf.template > /etc/nginx/nginx.conf && nginx -g 'daemon off;'"]
+      # Worker set for docker/lua/pool_router.lua (env BRIDGE_WORKERS in nginx.conf).
+      - BRIDGE_WORKERS=worker-sahori,worker-kurt
+    # envsubst nginx.conf + the upstreams include (both need ${BRIDGE_BACKUP_HOST}),
+    # then start openresty. Same mechanism as the primary compose.
+    command: ["/bin/sh", "-c", "envsubst '$$BRIDGE_BACKUP_HOST $$BRIDGE_ID' < /etc/nginx/nginx.conf > /tmp/nginx.conf && envsubst '$$BRIDGE_BACKUP_HOST' < /etc/nginx/upstreams.conf > /tmp/upstreams.conf && openresty -c /tmp/nginx.conf -g 'daemon off;'"]
     depends_on:
       - worker-sahori
       - worker-kurt

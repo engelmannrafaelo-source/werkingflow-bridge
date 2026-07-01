@@ -13,14 +13,22 @@ services:
       - "8020:80"      # eco-diagnostics compatibility
     volumes:
       - ./nginx.conf:/etc/nginx/nginx.conf:ro
+      # Per-topology worker set (ADR-0006 B/C) — envsubst'd to /tmp/upstreams.conf
+      # in the command below (resolves ${BRIDGE_BACKUP_HOST}), then included by nginx.conf.
+      - ./upstreams-primary.conf:/etc/nginx/upstreams.conf:ro
       - ./routes-metrics-reader.conf:/etc/nginx/routes-metrics-reader.conf:ro
       - ./routes-platform-api.conf:/etc/nginx/routes-platform-api.conf:ro
       - ../logs/nginx:/var/log/nginx
     environment:
-      - BRIDGE_PROD_HOST=${BRIDGE_PROD_HOST:-127.0.0.1}
+      # Backup bridge for the production-priority pool = Server-2 (from the deploy
+      # shell's BRIDGE_PROD_HOST). nginx.conf now references ${BRIDGE_BACKUP_HOST}.
+      - BRIDGE_BACKUP_HOST=${BRIDGE_PROD_HOST:-127.0.0.1}
       - BRIDGE_ID=${BRIDGE_ID:-dev}
-    # envsubst resolves ${BRIDGE_PROD_HOST} and ${BRIDGE_ID} in nginx.conf, then start openresty
-    command: ["/bin/sh", "-c", "envsubst '$$BRIDGE_PROD_HOST $$BRIDGE_ID' < /etc/nginx/nginx.conf > /tmp/nginx.conf && openresty -c /tmp/nginx.conf -g 'daemon off;'"]
+      # Worker set for docker/lua/pool_router.lua (env BRIDGE_WORKERS in nginx.conf).
+      - BRIDGE_WORKERS=worker1,worker2,worker3,worker4
+    # envsubst nginx.conf + the upstreams include (both need ${BRIDGE_BACKUP_HOST}),
+    # then start openresty. nginx.conf does `include /tmp/upstreams.conf`.
+    command: ["/bin/sh", "-c", "envsubst '$$BRIDGE_BACKUP_HOST $$BRIDGE_ID' < /etc/nginx/nginx.conf > /tmp/nginx.conf && envsubst '$$BRIDGE_BACKUP_HOST' < /etc/nginx/upstreams.conf > /tmp/upstreams.conf && openresty -c /tmp/nginx.conf -g 'daemon off;'"]
     depends_on:
       - worker1
       - worker2

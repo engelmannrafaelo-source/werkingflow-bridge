@@ -62,7 +62,9 @@ SERVER2_SVC_postgres_prod="bridge-postgres-prod"
 SERVER2_SVC_platform_api="wt-prod-platform-api"
 # postgres-prod zuerst (DB vor platform-api), platform-api vor nginx (Upstream-Resolve).
 SERVER2_ALL="postgres-prod platform-api nginx worker-sahori worker-kurt metrics-reader-prod"
-SERVER2_NEEDS_BUILD="platform-api worker-sahori worker-kurt metrics-reader-prod"
+# nginx now BUILDS from Dockerfile.nginx-lb (OpenResty+Lua) — the same image as
+# primary (ADR-0006 B/C). It was a pre-built nginx:alpine before the unification.
+SERVER2_NEEDS_BUILD="platform-api nginx worker-sahori worker-kurt metrics-reader-prod"
 
 # State (reset per server in deploy_server)
 ROLLBACK_SHA=""
@@ -299,13 +301,15 @@ phase_validate() {
     # (e.g. worker-prod → worker-sahori + worker-kurt, commit ad14f82) doesn't
     # silently break the next deploy — the previous hardcoded list was the
     # actual root cause of three rolled-back server2 deploys on 12.05.2026.
-    local nginx_conf envsubst_vars add_hosts
+    # SINGLE SOURCE (ADR-0006 B/C): BOTH bridges validate the shared docker/nginx.conf.
+    # The only per-bridge input is the generated upstreams include.
+    local nginx_conf upstreams_conf envsubst_vars add_hosts
+    nginx_conf="docker/nginx.conf"
+    envsubst_vars='$BRIDGE_BACKUP_HOST $BRIDGE_ID'
     if [[ "$compose" == *"prod"* ]]; then
-        nginx_conf="docker/nginx-prod.conf"
-        envsubst_vars='$BRIDGE_PRIMARY_HOST $BRIDGE_ID'
+        upstreams_conf="docker/upstreams-prod.conf"
     else
-        nginx_conf="docker/nginx.conf"
-        envsubst_vars='$BRIDGE_PROD_HOST $BRIDGE_ID'
+        upstreams_conf="docker/upstreams-primary.conf"
     fi
     # Pull every top-level service from the compose file, drop the lb itself
     # (nginx is the test target, doesn't need to resolve itself), map each
@@ -365,13 +369,21 @@ EOF
     local nginx_output nginx_rc
     nginx_output=$(rssh_run "$host" <<EOF
 cd ${REMOTE_REPO}
-BRIDGE_PROD_HOST=127.0.0.1 BRIDGE_PRIMARY_HOST=127.0.0.1 BRIDGE_ID=validate-probe \
+BRIDGE_BACKUP_HOST=127.0.0.1 BRIDGE_ID=validate-probe \
     envsubst '${envsubst_vars}' \
     < ${nginx_conf} > /tmp/bridge-nginx-check.conf 2>&1
+# Render the per-topology upstreams include (nginx.conf does include /tmp/upstreams.conf).
+BRIDGE_BACKUP_HOST=127.0.0.1 \
+    envsubst '\$BRIDGE_BACKUP_HOST' \
+    < ${upstreams_conf} > /tmp/bridge-upstreams-check.conf 2>&1
+# --add-host metrics-reader: nginx.conf's metrics_reader upstream hardcodes the
+# name `metrics-reader` (resolves live via prod's compose alias); the derived
+# add_hosts list only carries service names (metrics-reader-prod), so add it here.
 if docker run --rm \
-    ${add_hosts} \
+    ${add_hosts} --add-host=metrics-reader:127.0.0.1 \
     --tmpfs /var/log/nginx \
     -v /tmp/bridge-nginx-check.conf:/etc/nginx/nginx.conf:ro \
+    -v /tmp/bridge-upstreams-check.conf:/tmp/upstreams.conf:ro \
     -v ${REMOTE_REPO}/docker/routes-metrics-reader.conf:/etc/nginx/routes-metrics-reader.conf:ro \
     -v ${REMOTE_REPO}/docker/routes-platform-api.conf:/etc/nginx/routes-platform-api.conf:ro \
     -v ${REMOTE_REPO}/docker/lua:/etc/nginx/lua:ro \
@@ -382,7 +394,7 @@ then
 else
     echo __NGINX_FAIL__
 fi
-rm -f /tmp/bridge-nginx-check.conf
+rm -f /tmp/bridge-nginx-check.conf /tmp/bridge-upstreams-check.conf
 EOF
     )
     nginx_rc=$?

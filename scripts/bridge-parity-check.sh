@@ -31,10 +31,12 @@ case "$SERVER" in
     hetzner)
         HOST="49.12.72.66"
         NGINX_CONTAINER="wt-wrapper-lb"
+        UPSTREAMS_REPO="upstreams-primary.conf"
         ;;
     server2)
         HOST="178.104.178.79"
         NGINX_CONTAINER="wt-prod-lb"
+        UPSTREAMS_REPO="upstreams-prod.conf"
         ;;
     *)
         echo "Usage: bridge-parity-check.sh <hetzner|server2>" >&2
@@ -125,6 +127,30 @@ for inc in "${SHARED_INCLUDES[@]}"; do
         log "  OK  ${inc} (${repo_sum:0:12})"
     fi
 done
+
+# --- Check 4: UPSTREAMS include (per-topology, ADR-0006 B/C) -----------------
+# The generated per-bridge upstreams include is mounted at /etc/nginx/upstreams.conf
+# from a DIFFERENT repo filename per bridge (upstreams-primary.conf vs
+# upstreams-prod.conf). Verify the mounted source (pre-envsubst) matches the repo
+# file, so a hand-edit of the worker set fails here, not in production.
+log "check 4/4: upstreams include (${UPSTREAMS_REPO}) == /etc/nginx/upstreams.conf"
+up_sums=$(rssh "
+    repo_sum=\$(sha256sum ${REMOTE_REPO}/docker/${UPSTREAMS_REPO} 2>/dev/null | awk '{print \$1}')
+    cont_sum=\$(docker exec ${NGINX_CONTAINER} sha256sum /etc/nginx/upstreams.conf 2>/dev/null | awk '{print \$1}')
+    echo \"\${repo_sum:-MISSING_REPO} \${cont_sum:-MISSING_CONTAINER}\"
+") || fail "cannot compare ${UPSTREAMS_REPO} on host"
+if [ -n "${up_sums:-}" ]; then
+    up_repo="${up_sums%% *}"; up_cont="${up_sums##* }"
+    if [ "$up_repo" = "MISSING_REPO" ]; then
+        fail "${UPSTREAMS_REPO}: not present in host repo (${REMOTE_REPO}/docker/${UPSTREAMS_REPO})"
+    elif [ "$up_cont" = "MISSING_CONTAINER" ]; then
+        fail "upstreams.conf: not mounted in ${NGINX_CONTAINER} at /etc/nginx/upstreams.conf (still on old nginx:alpine/nginx-prod.conf?)"
+    elif [ "$up_repo" != "$up_cont" ]; then
+        fail "${UPSTREAMS_REPO}: container copy != repo copy (repo ${up_repo:0:12} vs container ${up_cont:0:12})"
+    else
+        log "  OK  ${UPSTREAMS_REPO} (${up_repo:0:12})"
+    fi
+fi
 
 echo
 if [ "$FAILED" -eq 0 ]; then
