@@ -6,7 +6,9 @@
 -- × predictive_multiplier − current_in_flight). Every account participates;
 -- the auto-tuned values do all the balancing.
 --
--- Sets ngx.var.target_worker to one of: worker1, worker2, worker3, worker4, unavailable
+-- Sets ngx.var.target_worker to one of the configured worker upstream names
+--   (BRIDGE_WORKERS env: worker1..4 on primary, worker-sahori/worker-kurt on
+--    production) or "unavailable".
 -- Sets ngx.var.x_pool_decision to: weighted_capacity | round_robin_fallback | all_unavail
 --
 -- Decision logic:
@@ -36,15 +38,37 @@ local METRICS_URL        = "http://metrics-reader:8000"
 local REFRESH_INTERVAL_S = 2
 local STALE_THRESHOLD_S  = 10
 
--- Account name → worker upstream name (must match docker-compose service names)
-local ACCOUNT_WORKER = {
-    engelmann = "worker1",
-    office    = "worker2",
-    gmail     = "worker3",
-    werking   = "worker4",
-}
+-- Worker upstream names — the SINGLE per-topology parameter, read from the
+-- BRIDGE_WORKERS env var (the SAME SSoT the metrics-reader uses:
+-- src/metrics_reader/main.py `BRIDGE_WORKERS`). Requires `env BRIDGE_WORKERS;`
+-- in the nginx main context. This lets ONE pool_router.lua serve BOTH the
+-- primary (worker1..4) and production (worker-sahori, worker-kurt) topologies
+-- from a single source (ADR-0006 items B/C).
+--
+-- There is deliberately NO hardcoded account-name → worker map anymore: each
+-- account entry in account-pool-state already carries its own `.worker` field
+-- (verified live: engelmann→worker1 on primary, worker-sahori→worker-sahori on
+-- prod), so the mapping is read from the state, never duplicated here.
+local function parse_worker_names()
+    local raw = os.getenv("BRIDGE_WORKERS")
+    local names = {}
+    if raw and #raw > 0 then
+        for name in raw:gmatch("[^,%s]+") do
+            names[#names + 1] = name
+        end
+    end
+    if #names == 0 then
+        -- Defensive: an empty worker list would 500 every routing decision.
+        -- Log loud but keep the primary default so a missing env var can never
+        -- silently empty the pool. Both compose files ALWAYS set BRIDGE_WORKERS.
+        ngx.log(ngx.ERR, "pool_router: BRIDGE_WORKERS env empty/unset — ",
+                "falling back to worker1..4. Set BRIDGE_WORKERS on the nginx service.")
+        names = {"worker1", "worker2", "worker3", "worker4"}
+    end
+    return names
+end
 
-local WORKER_NAMES = {"worker1", "worker2", "worker3", "worker4"}
+local WORKER_NAMES = parse_worker_names()
 
 -- ---------------------------------------------------------------------------
 -- Token estimation (mirrors adaptive_limiter.estimate_request_tokens)
@@ -140,8 +164,9 @@ end
 -- Returns worker name (worker1..worker4)
 -- ---------------------------------------------------------------------------
 local function round_robin_worker()
+    local n = #WORKER_NAMES
     local idx = shared:incr("rr_counter", 1, 0)
-    return WORKER_NAMES[((idx - 1) % 4) + 1]
+    return WORKER_NAMES[((idx - 1) % n) + 1]
 end
 
 -- ---------------------------------------------------------------------------
@@ -210,13 +235,16 @@ local function pick_weighted_account(accounts, est_tokens)
                 and cooldown == 0
                 and capacity > min_required
                 and weekly_pct < WEEKLY_HARD_EXCLUDE_PCT then
-            eligible[#eligible + 1] = { name = name, weight = capacity }
+            -- Carry the account's own worker upstream name (topology-agnostic:
+            -- no hardcoded account→worker map). Fall back to the account name
+            -- only if the state somehow omitted `.worker`.
+            eligible[#eligible + 1] = { name = name, weight = capacity, worker = info.worker or name }
             total = total + capacity
         end
     end
 
     if #eligible == 0 or total <= 0 then
-        return nil, -1, -1
+        return nil, nil, -1, -1
     end
 
     -- Weighted random: r ∈ [0, total) → cumulative-sum walk
@@ -225,12 +253,12 @@ local function pick_weighted_account(accounts, est_tokens)
     for _, e in ipairs(eligible) do
         acc = acc + e.weight
         if r <= acc then
-            return e.name, e.weight, total
+            return e.name, e.worker, e.weight, total
         end
     end
     -- Floating-point safety: fall through to last
     local last = eligible[#eligible]
-    return last.name, last.weight, total
+    return last.name, last.worker, last.weight, total
 end
 
 -- ---------------------------------------------------------------------------
@@ -321,7 +349,7 @@ function M.choose()
     local req_len    = tonumber(ngx.var.request_length) or 1000
     local est_tokens = math.max(500, math.floor(req_len / 4))
 
-    local picked, picked_weight, total_weight = pick_weighted_account(data.accounts, est_tokens)
+    local picked, picked_worker, picked_weight, total_weight = pick_weighted_account(data.accounts, est_tokens)
 
     if not picked then
         -- All accounts exhausted → bogus upstream → @bridge_full emits 429
@@ -334,8 +362,10 @@ function M.choose()
         return
     end
 
-    -- Route: weighted-random by (effective_cap − in_flight) per account
-    local worker = ACCOUNT_WORKER[picked] or "worker1"
+    -- Route: weighted-random by (effective_cap − in_flight) per account.
+    -- Worker comes from the account's own `.worker` field (carried through
+    -- pick_weighted_account) — no hardcoded account→worker map.
+    local worker = picked_worker or WORKER_NAMES[1]
     count_decision(worker)
     ngx.var.target_worker   = worker
     ngx.var.x_pool_decision = "weighted_capacity"
