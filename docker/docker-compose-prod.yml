@@ -27,6 +27,7 @@ services:
     volumes:
       - ./nginx-prod.conf:/etc/nginx/templates/nginx.conf.template:ro
       - ./routes-metrics-reader.conf:/etc/nginx/routes-metrics-reader.conf:ro
+      - ./routes-platform-api.conf:/etc/nginx/routes-platform-api.conf:ro
       - ../logs/nginx:/var/log/nginx
     environment:
       - BRIDGE_PRIMARY_HOST=${BRIDGE_PRIMARY_HOST:-127.0.0.1}
