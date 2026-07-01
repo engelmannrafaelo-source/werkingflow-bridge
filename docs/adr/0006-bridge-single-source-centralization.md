@@ -89,6 +89,45 @@ so OpenAPI becomes a reliable source of truth (today 93% of endpoints are `schem
 Prod DB credentials are injected only when `BRIDGE_ID=production`; a dev deploy cannot reach
 the prod DB.
 
+## Verified state of the generator (2026-07-01, this session)
+
+`scripts/generate-bridge-compose.sh` already models the **clean** intent — for BOTH
+`BRIDGE_ID=primary` and `=production` it emits a compose that uses OpenResty+Lua
+(`Dockerfile.nginx-lb`) + the SHARED `nginx.conf` + generated upstreams, and a LOCAL
+`privacy-service`. **But production is NOT deployed from it.** Gaps that keep prod on the
+hand-maintained files:
+
+- **Deploy uses hand-compose for prod:** `scripts/bridge-deploy.sh` →
+  `SERVER2_COMPOSE="-f docker/docker-compose-prod.yml -f docker/docker-compose-prod-platform.yml"`.
+  The generator is (at most) used for primary.
+- **Remote privacy (hardware):** the 7 GB prod host cannot run the ~13 GB Presidio/Docling/Flair
+  model, so prod workers use `PRIVACY_SERVICE_URL=http://100.112.98.39:8100` (the DEV bridge's
+  privacy-service over Tailscale) and run **no** local privacy container. The generator instead
+  emits a LOCAL `privacy-service` (5 GB) for production — which would not fit / is not what runs.
+- **platform-api / DB overlay:** prod has `docker-compose-prod-platform.yml` + 12 platform-api
+  routes in `nginx-prod.conf` (usage/timeseries/developer-tokens → platform-api, "DB-Auslagerung
+  Phase 2"). The generator does not model this.
+- **No-Lua reality:** the running prod nginx is plain `nginx:alpine` (no Lua pool-router), despite
+  the generator intending OpenResty — another sign prod diverged by hand.
+
+**Conclusion:** "clean" is not "switch prod to the generator as-is" — the generator must first be
+extended to model production's *legitimate* differences as **`BRIDGE_ID`-driven parameters**:
+`privacy: local|remote(url)`, the platform-api/DB overlay, worker set, host sizing. Only the
+route set + base image must be forced identical. This is a **tested migration on the live bridges**
+(secrets live only on the hosts; the bridge cannot be generated or run offline), not an
+autonomously-committable rewrite.
+
+### Safe migration path (must be run where the secrets + hosts are)
+1. On the **primary** host: `BRIDGE_ID=production scripts/generate-bridge-compose.sh` → **diff**
+   the generated compose/nginx against the current `docker-compose-prod.yml`/`nginx-prod.conf`.
+   The diff IS the gap list.
+2. Extend the generator to close each gap as a `BRIDGE_ID` parameter (privacy local/remote,
+   platform-api overlay, routes from the shared source) until the diff is only intended env values.
+3. Deploy the generated stack to a **canary / the primary bridge first**, run `bridge-deploy.sh`'s
+   built-in smoke + dist tests, verify `/v1/metrics/account-pool-state` == aggregate on both.
+4. Cut prod over to the generated compose; delete `nginx-prod.conf` + the parallel compose files.
+5. Add the currency+parity deploy-gate (F) so a future hand-edit / missing route fails the deploy.
+
 ## Migration order
 
 1. **Unblock now (separate, not this ADR):** either deploy the app-side tolerance
