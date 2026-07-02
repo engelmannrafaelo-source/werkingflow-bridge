@@ -224,3 +224,95 @@ async def test_valid_uuid_inserts_activity():
 
     # Insert was called
     conn.execute.assert_called()
+
+
+# ---------------------------------------------------------------------------
+# Anonymous marker → dedicated accounting bucket (migration 032)
+# ---------------------------------------------------------------------------
+
+async def _call_writer_anonymous(user_id):
+    """Wie _call_writer, aber ohne app_id-Default-Verwirrung — expliziter Marker."""
+    await writer.persist_ai_call_activity(
+        app_id="werking-report",
+        user_id=user_id,
+        agent_id=None,
+        workflow_id=None,
+        model="claude-sonnet-4-5",
+        input_tokens=100,
+        output_tokens=50,
+        status="success",
+        duration_ms=1000,
+        app_env="prod",
+    )
+
+
+@pytest.mark.asyncio
+async def test_anonymous_marker_books_to_anonymous_identity():
+    """'anonymous:<grund>' bucht auf die synthetische Identität statt geskippt zu werden."""
+    writer._skip_counts.clear()
+    writer._anonymous_identity_verified = True  # Identität (Migration 032) vorhanden
+
+    t_row = _tenant_row(TENANT_UUID)
+    conn = _make_mock_conn(tenant_row=t_row)
+    pool = _pool_ctx(conn)
+
+    with (
+        patch.object(writer, "get_pool", return_value=pool),
+        patch.object(writer, "_deduct_call_cost") as mock_deduct,
+        patch.object(writer.logger, "warning") as mock_warn,
+    ):
+        await _call_writer_anonymous("anonymous:public-check-funnel")
+
+    # Kein Skip — es wurde gebucht
+    skip_warnings = [c for c in mock_warn.call_args_list if "skipped" in str(c)]
+    assert skip_warnings == []
+    conn.execute.assert_called()
+
+    # Auf die Anonymous-UUID gebucht, Grund in beiden Persist-Zielen
+    all_args = [str(c) for c in conn.execute.call_args_list]
+    assert any(writer.ANONYMOUS_USER_ID in a for a in all_args)
+    assert any("public-check-funnel" in a for a in all_args)
+
+    # Keine Budget-Deduction für den Anonym-Posten
+    mock_deduct.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_legacy_underscore_anonymous_alias_books_too():
+    """Der report-Übergangsalias '_anonymous' verhält sich wie ein anonymous-Marker."""
+    writer._skip_counts.clear()
+    writer._anonymous_identity_verified = True
+
+    t_row = _tenant_row(TENANT_UUID)
+    conn = _make_mock_conn(tenant_row=t_row)
+    pool = _pool_ctx(conn)
+
+    with (
+        patch.object(writer, "get_pool", return_value=pool),
+        patch.object(writer, "_deduct_call_cost") as mock_deduct,
+    ):
+        await _call_writer_anonymous("_anonymous")
+
+    conn.execute.assert_called()
+    all_args = [str(c) for c in conn.execute.call_args_list]
+    assert any(writer.ANONYMOUS_USER_ID in a for a in all_args)
+    mock_deduct.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_anonymous_without_identity_row_skips_loudly():
+    """Fehlt die Migration-032-Identität, wird geskippt + laut gewarnt (kein FK-Crash)."""
+    writer._skip_counts.clear()
+    writer._anonymous_identity_verified = False
+
+    conn = _make_mock_conn(tenant_row=None)  # identity lookup → None
+    pool = _pool_ctx(conn)
+
+    with (
+        patch.object(writer, "get_pool", return_value=pool),
+        patch.object(writer.logger, "warning") as mock_warn,
+    ):
+        await _call_writer_anonymous("anonymous:funnel")
+
+    assert any("migration 032" in str(c) for c in mock_warn.call_args_list)
+    conn.execute.assert_not_called()

@@ -679,6 +679,13 @@ app.add_middleware(
 # Provides per-tenant privacy modes, rate limiting, and usage tracking
 app.add_middleware(TenantMiddleware)
 
+# Fail-closed user attribution (Geld-Invariante). Pure ASGI, fail-open on
+# internal errors. Inert for compliant callers; counts unattributed calls per
+# app (GET /v1/metrics/attribution) and rejects them ONLY when
+# BRIDGE_ATTRIBUTION_ENFORCE=true (default false — staged rollout).
+from src.attribution import AttributionEnforcementMiddleware
+app.add_middleware(AttributionEnforcementMiddleware)
+
 # Add performance monitoring middleware (FIRST - to track all requests)
 # Pure ASGI implementation - streaming-safe
 from src.middleware.performance_monitor import PerformanceMonitorMiddleware
@@ -5341,6 +5348,23 @@ async def get_performance_metrics(
         },
         "note": "Metrics are cumulative since server start. Tool-aware thresholds separate tool vs non-tool requests."
     }
+
+
+@app.get("/v1/metrics/attribution")
+async def get_attribution_metrics(
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(security)
+):
+    """Live attribution counters (per worker, in-memory since start).
+
+    The measurement instrument for the fail-closed attribution rollout:
+    `unattributed_by_app` shows which apps still send user-facing calls
+    without X-User-ID (neither real userId nor 'anonymous:<grund>' marker),
+    `anonymous_by_app` shows the explicit anonymous bucket. Per-worker view —
+    query a specific worker via the nginx /workerN/ prefix, or sample via
+    the LB. See src/attribution.py.
+    """
+    from src.attribution import snapshot
+    return snapshot()
 
 
 # ============================================================================

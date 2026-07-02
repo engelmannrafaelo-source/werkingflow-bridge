@@ -38,6 +38,31 @@ logger = logging.getLogger(__name__)
 # user_id is seen so warnings show frequency, not just isolated occurrences.
 _skip_counts: dict = defaultdict(int)
 
+# Synthetic identity every EXPLICITLY anonymous call books to (fixed UUID,
+# migration 032). Anonymous ≠ missing: 'anonymous:<grund>' is a deliberate
+# app statement ("this call-site has no logged-in user by design") and gets
+# its own accounting bucket; a missing X-User-ID is a leak (counted in
+# src/attribution.py metrics, rejected once BRIDGE_ATTRIBUTION_ENFORCE=true).
+ANONYMOUS_USER_ID = "00000000-0000-4000-a000-000000000001"
+# Set once the identity row is confirmed present — avoids re-querying per call.
+_anonymous_identity_verified = False
+
+
+async def _anonymous_identity_present() -> bool:
+    """Check (once, then cached) that the migration-032 identity exists.
+    Without it an anonymous booking would FK-fail — warn loudly instead of
+    producing a silent tracking gap."""
+    global _anonymous_identity_verified
+    if _anonymous_identity_verified:
+        return True
+    pool = get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow("SELECT 1 FROM users WHERE id = $1", ANONYMOUS_USER_ID)
+    if row:
+        _anonymous_identity_verified = True
+        return True
+    return False
+
 
 async def _deduct_call_cost(
     user_id: str,
@@ -167,6 +192,28 @@ async def persist_ai_call_activity(
             app_id, user_id, model,
         )
 
+    # Explicit anonymous marker ('anonymous:<grund>' or the legacy report
+    # alias '_anonymous') → book to the dedicated anonymous identity. Resolved
+    # BEFORE the UUID check below, which would otherwise skip these as
+    # "non-UUID string" (the pre-032 behaviour = tracking gap).
+    from src.attribution import anonymous_reason
+    anon_reason = anonymous_reason(user_id)
+    if anon_reason is not None:
+        try:
+            if await _anonymous_identity_present():
+                user_id = ANONYMOUS_USER_ID
+                agent_id = agent_id or "anonymous"
+            else:
+                logger.warning(
+                    "persist_ai_call_activity: anonymous call (reason=%s app=%s) but "
+                    "anonymous identity %s is missing — run migration 032. Activity skipped.",
+                    anon_reason, app_id, ANONYMOUS_USER_ID,
+                )
+                return
+        except Exception as e:  # noqa: BLE001 — tracking must never break the call
+            logger.warning("persist_ai_call_activity: anonymous identity check failed: %s", e)
+            return
+
     try:
         if not user_id:
             # No user → no tenant → cannot write a tenant-scoped row.
@@ -247,6 +294,10 @@ async def persist_ai_call_activity(
             }
             if error_code:
                 payload["errorCode"] = error_code
+            if anon_reason is not None:
+                # Which call-site declared itself anonymous — the per-<grund>
+                # breakdown inside the anonymous bucket.
+                payload["anonymousReason"] = anon_reason
 
             # actor_user_id is a uuid column — only set it when user_id parses.
             actor_uuid = None
@@ -322,6 +373,7 @@ async def persist_ai_call_activity(
                     "agent_id": agent_id,
                     "workflow_id": workflow_id,
                     "status": status,
+                    **({"anonymous_reason": anon_reason} if anon_reason is not None else {}),
                 }),
             )
     except Exception as e:  # noqa: BLE001 — tracking must never break the call
@@ -330,5 +382,7 @@ async def persist_ai_call_activity(
     # Post-call budget deduction. Separate step from the activity write:
     # the activity row is the usage source of truth, the deduction is the
     # running budget tally. Best-effort — _deduct_call_cost never raises.
-    if user_id and app_id and call_cost_eur > 0:
+    # Anonymous calls have no budget semantics (internal bucket, real_cost 0)
+    # — deducting would only produce noisy "no budget row" warnings.
+    if user_id and app_id and call_cost_eur > 0 and user_id != ANONYMOUS_USER_ID:
         await _deduct_call_cost(user_id, app_id, call_cost_eur, workflow_id, tenant_id)
