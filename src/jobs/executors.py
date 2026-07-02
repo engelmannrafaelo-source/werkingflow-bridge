@@ -54,7 +54,9 @@ PROXY_ALLOWED_PATHS = {
 }
 
 # attribution dict key → outgoing header, so the internal chat call bills/attributes
-# to the same app/user/workflow as a direct call would.
+# to the same app/user/workflow as a direct call would. Live-verified 2026-07-02:
+# an 'anonymous:<grund>' marker on the job POST arrives intact at the self-called
+# endpoint (the attribution metrics counted it on both hops).
 _ATTRIBUTION_HEADERS = {
     "app_id": "X-App-ID",
     "agent_id": "X-Agent-ID",
@@ -62,7 +64,18 @@ _ATTRIBUTION_HEADERS = {
     "session_id": "X-Session-ID",
     "user_id": "X-User-ID",
     "app_env": "X-App-Env",
+    "job_id": "X-Job-ID",
 }
+
+# Last-resort caller identity for self-calls whose triggering job carried NO
+# app_id: without it, the executor's echo of an unattributed job POST books as
+# app='unknown' on the TARGET path (e.g. /v1/convert-html-to-pdf) and reads like
+# a second, independent leak. This names the true call-site (the job layer)
+# WITHOUT masking the leak — the self-call still has no X-User-ID and keeps
+# counting as unattributed. Never set when a real app_id exists (X-App-ID wins
+# over the X-Client-ID fallback anyway; omitting keeps attributed flows
+# byte-identical).
+_SELFCALL_CLIENT_ID = "bridge-jobs/selfcall"
 
 
 async def ping_executor(
@@ -88,6 +101,8 @@ def _build_headers(attribution: Optional[Dict[str, Any]]) -> Dict[str, str]:
             val = attribution.get(key)
             if val:
                 headers[hdr] = str(val)
+    if "X-App-ID" not in headers:
+        headers["X-Client-ID"] = _SELFCALL_CLIENT_ID
     return headers
 
 

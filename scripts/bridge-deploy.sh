@@ -554,6 +554,10 @@ headers = {
     "Authorization": f"Bearer {api_key}",
     "Content-Type": "application/json",
     "X-Client-ID": "bridge-deploy/smoke-test",
+    # Attribution contract: deploy smokes are deliberate infrastructure calls,
+    # not app traffic — book them to the anonymous bucket instead of polluting
+    # the unattributed leak metric on every rollout.
+    "X-User-ID": "anonymous:bridge-deploy-smoke",
 }
 if extra_header:
     k, v = extra_header.split(": ", 1)
@@ -666,6 +670,9 @@ headers = {
     "Authorization": f"Bearer {api_key}",
     "Content-Type": "application/json",
     "X-Client-ID": "bridge-deploy/dist-test",
+    # Same contract as the smoke test: deploy probes book anonymous, not
+    # unattributed (the dist test fires 8 chat calls per rollout).
+    "X-User-ID": "anonymous:bridge-deploy-dist-test",
 }
 
 workers_hit = []

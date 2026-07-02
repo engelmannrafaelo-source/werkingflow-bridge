@@ -23,11 +23,13 @@ from src.attribution import (
     _anonymous,
     _rejected,
     _unattributed,
+    _unattributed_sources,
 )
 
 
 def _reset_counters():
     _unattributed.clear()
+    _unattributed_sources.clear()
     _anonymous.clear()
     _rejected.clear()
 
@@ -204,3 +206,57 @@ def test_enforced_paths_cover_the_money_surface():
     # Kern-Endpunkte, die nie aus dem Enforce-Set fallen dürfen
     for p in ("/v1/chat/completions", "/v1/research", "/v1/jobs", "/v1/convert-html-to-pdf"):
         assert p in ENFORCED_PATHS
+
+
+# ---------------------------------------------------------------------------
+# Call-Site-Granularität (X-Agent-ID / X-Client-ID im Leak-Detail)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_unattributed_sources_capture_agent_and_client():
+    """Ein Leak trägt agent+client im Source-Detail — Zuordnung ohne Log-Forensik."""
+    _reset_counters()
+    mw = AttributionEnforcementMiddleware(app=None)
+    headers = {**AUTH, "x-agent-id": "pdf-export", "x-client-id": "engelmann/export/pdf"}
+    with patch.dict("os.environ", {"BRIDGE_ATTRIBUTION_ENFORCE": "false"}):
+        await _run(mw, _scope(headers=headers))
+        await _run(mw, _scope(headers=headers))
+    snap = snapshot()
+    assert snap["unattributed_total"] == 2
+    assert snap["unattributed_sources"] == [{
+        "app_id": "test-app",
+        "path": "/v1/chat/completions",
+        "agent_id": "pdf-export",
+        "client_id": "engelmann/export/pdf",
+        "count": 2,
+    }]
+
+
+@pytest.mark.asyncio
+async def test_unattributed_sources_dash_when_headers_absent():
+    _reset_counters()
+    mw = AttributionEnforcementMiddleware(app=None)
+    with patch.dict("os.environ", {"BRIDGE_ATTRIBUTION_ENFORCE": "false"}):
+        await _run(mw, _scope(headers=AUTH))
+    src = snapshot()["unattributed_sources"]
+    assert src == [{
+        "app_id": "test-app",
+        "path": "/v1/chat/completions",
+        "agent_id": "-",
+        "client_id": "-",
+        "count": 1,
+    }]
+
+
+@pytest.mark.asyncio
+async def test_unattributed_sources_distinguish_call_sites():
+    """Zwei Call-Sites derselben App bleiben im Detail getrennt (by_app aggregiert)."""
+    _reset_counters()
+    mw = AttributionEnforcementMiddleware(app=None)
+    with patch.dict("os.environ", {"BRIDGE_ATTRIBUTION_ENFORCE": "false"}):
+        await _run(mw, _scope(headers={**AUTH, "x-client-id": "test-app/site-a"}))
+        await _run(mw, _scope(headers={**AUTH, "x-client-id": "test-app/site-b"}))
+    snap = snapshot()
+    assert snap["unattributed_by_app"]["test-app"]["/v1/chat/completions"] == 2
+    clients = {s["client_id"] for s in snap["unattributed_sources"]}
+    assert clients == {"test-app/site-a", "test-app/site-b"}

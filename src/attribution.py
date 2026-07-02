@@ -115,6 +115,12 @@ def classify_user_id(user_id: Optional[str]) -> str:
 _STARTED_AT = time.time()
 # (app_id, path) → count of calls with NO usable attribution
 _unattributed: Dict[tuple, int] = defaultdict(int)
+# (app_id, path, agent_id, client_id) → count. Same events as _unattributed but
+# keyed by the caller-identifying headers, so a leak traces to its call-site
+# without docker-log forensics (the engelmann burst 2026-07-02 was only
+# attributable by grepping worker logs). Cardinality is bounded: worker-local,
+# resets on restart, and only LEAKING call-sites ever appear here.
+_unattributed_sources: Dict[tuple, int] = defaultdict(int)
 # (app_id, reason) → count of calls with an explicit anonymous marker
 _anonymous: Dict[tuple, int] = defaultdict(int)
 # (app_id, path) → count of rejected calls (toggle ON only)
@@ -126,16 +132,22 @@ _rejected: Dict[tuple, int] = defaultdict(int)
 _UNATTRIBUTED_LOG_EVERY = int(os.getenv("BRIDGE_ATTRIBUTION_LOG_EVERY", "100"))
 
 
-def record_unattributed(app_id: Optional[str], path: str) -> None:
+def record_unattributed(
+    app_id: Optional[str],
+    path: str,
+    agent_id: Optional[str] = None,
+    client_id: Optional[str] = None,
+) -> None:
     key = (app_id or "unknown", path)
     _unattributed[key] += 1
+    _unattributed_sources[(app_id or "unknown", path, agent_id or "-", client_id or "-")] += 1
     n = _unattributed[key]
     if n == 1 or n % _UNATTRIBUTED_LOG_EVERY == 0:
         logger.warning(
-            "attribution: UNATTRIBUTED call #%d app=%s path=%s — no X-User-ID and no "
-            "'anonymous:<grund>' marker. Fix the app call-site; this will be rejected "
-            "once BRIDGE_ATTRIBUTION_ENFORCE=true.",
-            n, app_id or "unknown", path,
+            "attribution: UNATTRIBUTED call #%d app=%s path=%s agent=%s client=%s — no "
+            "X-User-ID and no 'anonymous:<grund>' marker. Fix the app call-site; this "
+            "will be rejected once BRIDGE_ATTRIBUTION_ENFORCE=true.",
+            n, app_id or "unknown", path, agent_id or "-", client_id or "-",
         )
 
 
@@ -161,6 +173,12 @@ def snapshot() -> Dict[str, Any]:
         "uptime_s": int(time.time() - _STARTED_AT),
         "unattributed_total": sum(_unattributed.values()),
         "unattributed_by_app": _nest(_unattributed),
+        # Call-site detail for the same events — which X-Agent-ID/X-Client-ID
+        # produced each leak (or "-" when the caller sent neither).
+        "unattributed_sources": [
+            {"app_id": a, "path": p, "agent_id": ag, "client_id": c, "count": n}
+            for (a, p, ag, c), n in sorted(_unattributed_sources.items())
+        ],
         "anonymous_total": sum(_anonymous.values()),
         "anonymous_by_app": _nest(_anonymous),
         "rejected_total": sum(_rejected.values()),
@@ -226,7 +244,11 @@ class AttributionEnforcementMiddleware:
                     if kind == "anonymous":
                         record_anonymous(app_id, anonymous_reason(user_id) or "unknown")
                     elif kind == "missing":
-                        record_unattributed(app_id, scope["path"])
+                        record_unattributed(
+                            app_id, scope["path"],
+                            agent_id=headers.get("x-agent-id"),
+                            client_id=headers.get("x-client-id"),
+                        )
                         if attribution_enforce_enabled():
                             record_rejected(app_id, scope["path"])
                             reject = True

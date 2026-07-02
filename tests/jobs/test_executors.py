@@ -142,3 +142,51 @@ async def test_pdf_executor_2xx_without_pdf_fails_loud():
         with pytest.raises(RuntimeError) as ei:
             await convert_html_to_pdf_executor({"html": "<p>x</p>"}, None, AsyncMock())
     assert "no PDF" in str(ei.value)
+
+
+# ---------------------------------------------------------------------------
+# Attribution-Durchreichung im Self-Call
+# ---------------------------------------------------------------------------
+
+async def test_selfcall_forwards_full_attribution_incl_job_id():
+    """Alle Attribution-Dimensionen des auslösenden Jobs erreichen den Self-Call —
+    inkl. job_id (X-Job-ID); ein 'anonymous:<grund>'-Marker bleibt intakt."""
+    fake = _FakeClient(_FakeResp(200, {"status": "success", "pdf_base64": "JVBERi0=", "size_bytes": 6}))
+    with patch("httpx.AsyncClient", return_value=fake), \
+         patch("src.auth.auth_manager.get_api_key", return_value="k"):
+        await convert_html_to_pdf_executor(
+            {"html": "<p>x</p>"},
+            {
+                "app_id": "werking-report",
+                "user_id": "anonymous:public-check-funnel",
+                "agent_id": "check",
+                "session_id": "s-1",
+                "workflow_id": "wf-1",
+                "app_env": "prod",
+                "job_id": "job-outer-42",
+            },
+            AsyncMock(),
+        )
+    h = fake.calls[0]["headers"]
+    assert h["X-App-ID"] == "werking-report"
+    assert h["X-User-ID"] == "anonymous:public-check-funnel"
+    assert h["X-Agent-ID"] == "check"
+    assert h["X-Session-ID"] == "s-1"
+    assert h["X-Workflow-ID"] == "wf-1"
+    assert h["X-App-Env"] == "prod"
+    assert h["X-Job-ID"] == "job-outer-42"
+    assert "X-Client-ID" not in h                        # echte App-Identität wird nie überlagert
+
+
+async def test_selfcall_without_app_id_names_the_job_layer():
+    """Job ohne app_id: Self-Call trägt den bridge-jobs-Selfcall-Marker als
+    X-Client-ID, damit das Echo nicht als 'unknown' auf dem Zielpfad bucht.
+    Der Leak bleibt sichtbar (kein X-User-ID wird fabriziert)."""
+    fake = _FakeClient(_FakeResp(200, {"status": "success", "pdf_base64": "JVBERi0=", "size_bytes": 6}))
+    with patch("httpx.AsyncClient", return_value=fake), \
+         patch("src.auth.auth_manager.get_api_key", return_value="k"):
+        await convert_html_to_pdf_executor({"html": "<p>x</p>"}, None, AsyncMock())
+    h = fake.calls[0]["headers"]
+    assert h["X-Client-ID"] == "bridge-jobs/selfcall"
+    assert "X-App-ID" not in h
+    assert "X-User-ID" not in h
