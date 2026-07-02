@@ -2491,6 +2491,47 @@ async def chat_completions(
                     },
                 )
 
+            # Truncation guard (non-streaming path): run_completion yields an
+            # explicit error result chunk (no_completion_marker /
+            # timeout_incomplete) when the SDK stream ended WITHOUT the CLI's
+            # result message — e.g. the Anthropic client inside the CLI hit its
+            # request timeout mid-generation. The partial text parses fine, so
+            # is_incomplete_response() above does NOT catch it; without this
+            # check the caller gets HTTP 200 + finish_reason=stop with a
+            # silently truncated body (downstream JSON consumers then fail on
+            # "Unterminated string"). Fail loud instead: 503 retryable.
+            from src.claude_cli import find_truncation_marker
+            _truncation_marker = find_truncation_marker(chunks)
+            if _truncation_marker is not None:
+                logger.warning(
+                    f"⚠️  Truncated SDK response on worker {_self_worker} "
+                    f"(subtype={_truncation_marker.get('subtype')}, "
+                    f"chunks={len(chunks)}, partial_chars={len(raw_assistant_content or '')}) "
+                    f"— surfacing 503 instead of silent partial content"
+                )
+                raise HTTPException(
+                    status_code=503,
+                    detail={
+                        "error": {
+                            "message": (
+                                f"[Bridge {_self_worker}] Upstream SDK stream ended without "
+                                f"completion marker ({_truncation_marker.get('subtype')}) — "
+                                f"response is truncated. Retry."
+                            ),
+                            "type": "service_unavailable",
+                            "code": "503",
+                            "source": "bridge_internal",
+                            "bridge_type": "incomplete_response",
+                            "reason": _truncation_marker.get("subtype"),
+                            "retryable": True,
+                            "retry_after_s": 15,
+                            "bridge_worker": _self_worker,
+                            "chunks_received": len(chunks),
+                            "partial_content_chars": len(raw_assistant_content or ""),
+                        }
+                    },
+                )
+
             # Rate-limit phrasing in the assistant text (non-streaming path).
             # The streaming loop in claude_cli already calls detect_in_text per
             # block, but a sync chat completion comes back as a single message

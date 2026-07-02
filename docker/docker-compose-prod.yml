@@ -93,6 +93,12 @@ services:
       - CLAUDE_CWD=/app/instances
       - DISABLE_COACH_MCP=true
       - MAX_TIMEOUT=2400000
+      # Anthropic-client request timeout INSIDE the claude CLI subprocess.
+      # Unset, the CLI defaults to 600000ms (10 min) and aborts slow streams
+      # mid-generation -> partial content without result message (silent
+      # truncation upstream of MAX_TIMEOUT). Align with MAX_TIMEOUT so the
+      # bridge's own asyncio timeout is the single governing limit.
+      - API_TIMEOUT_MS=2400000
       - CLAUDE_PERMISSION_MODE=bypassPermissions
       - TAVILY_API_KEY=${TAVILY_API_KEY}
       - ANTHROPIC_VISION_API_KEY=${ANTHROPIC_API_KEY}
@@ -150,6 +156,12 @@ services:
       - CLAUDE_CWD=/app/instances
       - DISABLE_COACH_MCP=true
       - MAX_TIMEOUT=2400000
+      # Anthropic-client request timeout INSIDE the claude CLI subprocess.
+      # Unset, the CLI defaults to 600000ms (10 min) and aborts slow streams
+      # mid-generation -> partial content without result message (silent
+      # truncation upstream of MAX_TIMEOUT). Align with MAX_TIMEOUT so the
+      # bridge's own asyncio timeout is the single governing limit.
+      - API_TIMEOUT_MS=2400000
       - CLAUDE_PERMISSION_MODE=bypassPermissions
       - TAVILY_API_KEY=${TAVILY_API_KEY}
       - ANTHROPIC_VISION_API_KEY=${ANTHROPIC_API_KEY}

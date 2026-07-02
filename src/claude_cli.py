@@ -674,6 +674,36 @@ def is_incomplete_response(
     return True
 
 
+TRUNCATION_MARKER_SUBTYPES = ("no_completion_marker", "timeout_incomplete")
+
+
+def find_truncation_marker(chunks: list) -> Optional[dict]:
+    """
+    Find the explicit truncation marker run_completion yields when the SDK
+    stream ended WITHOUT the CLI's result message.
+
+    That happens e.g. when the Anthropic client inside the claude CLI hits
+    its request timeout (API_TIMEOUT_MS, default 600s) mid-generation: the
+    partial text streamed so far parses fine, so is_incomplete_response()
+    does NOT catch it — without this check the caller gets HTTP 200 +
+    finish_reason=stop with a silently truncated body (downstream JSON
+    consumers then fail on "Unterminated string").
+
+    Returns the marker dict (subtype in TRUNCATION_MARKER_SUBTYPES) or None.
+    Deliberately narrow: genuine SDK error results (error_during_execution,
+    error_max_turns, …) keep their existing handling paths.
+    """
+    for chunk in chunks:
+        if (
+            isinstance(chunk, dict)
+            and chunk.get("type") == "result"
+            and chunk.get("is_error")
+            and chunk.get("subtype") in TRUNCATION_MARKER_SUBTYPES
+        ):
+            return chunk
+    return None
+
+
 class ClaudeCodeCLI:
     def __init__(self, timeout: int = 1200000, cwd: Optional[str] = None):
         self.timeout = timeout / 1000  # Convert ms to seconds
