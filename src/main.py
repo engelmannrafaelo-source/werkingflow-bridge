@@ -3167,14 +3167,28 @@ async def chat_completions(
 # see the previous content or the new content, never a half-written file.
 #
 # Container restart: in-flight running jobs are LOST (the asyncio task dies).
-# The status file is then orphaned at status='running' until cleanup. The
-# client side handles this by surfacing a stale 'running' for the TTL window
-# and then the cleanup task removes the file; next poll returns 404. The
-# WerkING Check consumer treats 404 as "retry the upload" — acceptable
-# trade-off for not needing a Redis / Postgres dependency just for state.
+# The running task therefore heartbeats its status file; the cleanup loop reaps
+# 'running' files with a stale heartbeat into a TERMINAL error with
+# error_kind='orphaned' (machine-readable: the job — not the research — failed,
+# callers may re-dispatch). Before this, an orphaned file stayed 'running'
+# until the TTL deleted it and pollers got a misleading 404 — apps marked
+# healthy jobs as failed and users lost finished work (2026-07-02 diagnosis,
+# werking-report "Check kommt nie an").
 # ============================================================================
 
 RESEARCH_JOB_TTL_SECONDS = 2 * 60 * 60  # 2h
+
+# Running jobs re-stamp heartbeat_at this often; a job whose heartbeat is older
+# than the orphan threshold (5 missed beats — far beyond scheduler jitter) lost
+# its worker (restart/redeploy/OOM) and is reaped as orphaned.
+RESEARCH_JOB_HEARTBEAT_SECONDS = 60
+RESEARCH_JOB_ORPHAN_AFTER_SECONDS = 5 * RESEARCH_JOB_HEARTBEAT_SECONDS
+
+# Files written by pre-heartbeat code have no heartbeat_at; grant them a grace
+# period from started_at that exceeds any legitimate research runtime before
+# reaping. Only relevant across the deploy boundary (which restarts the workers
+# and orphans those jobs anyway).
+RESEARCH_JOB_LEGACY_ORPHAN_AFTER_SECONDS = 30 * 60
 RESEARCH_JOBS_DIR = Path(
     os.environ.get("RESEARCH_JOBS_DIR")
     or (Path(os.environ.get("INSTANCES_DIR") or "/app/instances") / "_async_jobs")
@@ -3539,9 +3553,27 @@ async def _run_async_research_job(
     attribution_ctx: Optional[Dict[str, Any]] = None,
 ) -> None:
     """Background runner that stores ResearchResponse as a JSON file in the
-    shared async-jobs directory. Any worker can read it back."""
+    shared async-jobs directory. Any worker can read it back.
+
+    While running, a sibling heartbeat task re-stamps heartbeat_at in the job
+    file. If THIS process dies (restart/redeploy/OOM), both tasks die, the
+    heartbeat goes stale, and the cleanup loop reaps the file into a terminal
+    error_kind='orphaned' — instead of leaving it 'running' forever.
+    Load→mutate→save in the heartbeat has no await in between, so it cannot
+    interleave with the terminal writes below (single event loop)."""
     prior = _load_research_job(job_id) or {}
     started_at = prior.get("started_at") or time.time()
+
+    async def _heartbeat() -> None:
+        while True:
+            await asyncio.sleep(RESEARCH_JOB_HEARTBEAT_SECONDS)
+            job = _load_research_job(job_id)
+            if not job or job.get("status") != "running":
+                return  # finished (or reaped) — stop stamping
+            job["heartbeat_at"] = time.time()
+            _save_research_job(job_id, job)
+
+    heartbeat_task = asyncio.create_task(_heartbeat())
     try:
         result = await _execute_research_impl(request_body, backend_config, attribution_ctx=attribution_ctx)
         _save_research_job(job_id, {
@@ -3567,21 +3599,31 @@ async def _run_async_research_job(
             "error": str(e),
         })
         logger.error(f"❌ Async research job {job_id} crashed: {e}", exc_info=True)
+    finally:
+        heartbeat_task.cancel()
 
 
 async def _cleanup_old_research_jobs() -> None:
-    """Periodically remove stale research-job state files (older than TTL).
+    """Periodically (1) remove stale research-job state files (older than TTL)
+    and (2) reap orphaned 'running' files — jobs whose worker died — into a
+    terminal error_kind='orphaned' state, so pollers get a truthful, terminal,
+    machine-readable answer instead of an eternal 'running' followed by a 404.
 
     Runs in every worker — they all share the same directory, so any worker
-    can do the cleanup. unlink() on a missing file is tolerated (another
-    worker may have removed it concurrently)."""
+    can do the cleanup. Live jobs of OTHER workers are protected by their
+    fresh heartbeats. unlink() on a missing file is tolerated (another worker
+    may have removed it concurrently)."""
     while True:
         try:
-            await asyncio.sleep(30 * 60)  # every 30 min
+            # 5-min cadence: tight enough that orphans turn terminal promptly
+            # (callers with lost jobs re-dispatch instead of spinning), cheap
+            # enough (a glob + a few small reads) to run often.
+            await asyncio.sleep(5 * 60)
             if not RESEARCH_JOBS_DIR.exists():
                 continue
             now = time.time()
             removed = 0
+            orphaned = 0
             for path in RESEARCH_JOBS_DIR.glob("*.json"):
                 try:
                     mtime = path.stat().st_mtime
@@ -3595,8 +3637,38 @@ async def _cleanup_old_research_jobs() -> None:
                         pass
                     except OSError as e:
                         logger.warning(f"⚠️ Could not unlink stale job {path.name}: {e}")
-            if removed:
-                logger.info(f"🧹 Cleaned up {removed} stale research jobs")
+                    continue
+
+                # Orphan reaping — only 'running' files are candidates.
+                job_id = path.stem
+                try:
+                    job = _load_research_job(job_id)
+                except ValueError:
+                    continue  # unparseable id (e.g. foreign tmp file) — TTL will remove it
+                if not job or job.get("status") != "running":
+                    continue
+                heartbeat_at = job.get("heartbeat_at")
+                last_signal = heartbeat_at or job.get("started_at") or mtime
+                grace = (
+                    RESEARCH_JOB_ORPHAN_AFTER_SECONDS
+                    if heartbeat_at
+                    else RESEARCH_JOB_LEGACY_ORPHAN_AFTER_SECONDS
+                )
+                if float(last_signal) < now - grace:
+                    job.update({
+                        "status": "error",
+                        "error_kind": "orphaned",
+                        "finished_at": now,
+                        "error": (
+                            "Research worker died mid-job (bridge restart/redeploy) — "
+                            "job orphaned. The research itself did not fail; re-dispatch is safe."
+                        ),
+                    })
+                    _save_research_job(job_id, job)
+                    orphaned += 1
+                    logger.warning(f"🪦 Reaped orphaned research job {job_id} (no heartbeat for >{int(grace / 60)}min)")
+            if removed or orphaned:
+                logger.info(f"🧹 Research jobs cleanup: removed {removed} expired, reaped {orphaned} orphaned")
         except asyncio.CancelledError:
             raise
         except Exception as e:
@@ -3728,6 +3800,10 @@ async def research(
         _save_research_job(job_id, {
             "status": "running",
             "started_at": time.time(),
+            # Stamped from second one by the runner's heartbeat task; present
+            # from the start so the orphan reaper never mistakes a fresh
+            # dispatch for a legacy (pre-heartbeat) file.
+            "heartbeat_at": time.time(),
             "query": request_body.query[:100],
         })
         asyncio.create_task(_run_async_research_job(request_body, backend_config, job_id, attribution_ctx=_research_attr))
@@ -3790,6 +3866,8 @@ async def get_async_research_status(
         elapsed_seconds=round(elapsed, 2) if elapsed is not None else None,
         result=result_payload,
         error=job.get("error"),
+        # 'orphaned' = the worker died, not the research — caller may re-dispatch.
+        error_kind=job.get("error_kind"),
     )
 
 

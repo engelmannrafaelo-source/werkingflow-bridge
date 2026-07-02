@@ -439,6 +439,10 @@ class AsyncResearchStatus(BaseModel):
     elapsed_seconds: Optional[float] = None
     result: Optional[ResearchResponse] = None
     error: Optional[str] = None
+    # Machine-readable failure class. Currently only "orphaned": the worker
+    # holding the job died (restart/redeploy) — the JOB was never at fault, so
+    # callers may safely re-dispatch. A plain research failure has no kind.
+    error_kind: Optional[Literal["orphaned"]] = None
 
 
 # ============================================================================
