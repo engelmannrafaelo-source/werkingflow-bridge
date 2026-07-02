@@ -53,9 +53,26 @@ logger = logging.getLogger(__name__)
 # absent. _REGISTER_ALLOWED_APP_IDS in src/identity/routes.py is a SEPARATE
 # set (registration is allowed for more apps than webhook-mail is wired up
 # for — they just stdout-log the token until their receiver lands).
-BRIDGE_AUTH_APP_IDS: FrozenSet[str] = frozenset({
-    "werking-report",
-})
+# Default set applied when the BRIDGE_AUTH_APP_IDS env var is unset/empty —
+# preserves the historical hardcoded behaviour so nothing changes on a plain
+# rebuild without the env var.
+_DEFAULT_BRIDGE_AUTH_APP_IDS = "werking-report"
+
+
+def _load_bridge_auth_app_ids() -> FrozenSet[str]:
+    """Apps whose users must verify their email before login.
+
+    Read from the ``BRIDGE_AUTH_APP_IDS`` env var (comma-separated) so arming a
+    new app becomes an env change + recreate — NOT an image rebuild. Falls back
+    to the historical hardcoded default when the env var is absent or empty, so
+    behaviour is unchanged unless the env var is explicitly set. Whitespace and
+    empty entries are ignored.
+    """
+    raw = os.environ.get("BRIDGE_AUTH_APP_IDS", "").strip() or _DEFAULT_BRIDGE_AUTH_APP_IDS
+    return frozenset(app_id.strip() for app_id in raw.split(",") if app_id.strip())
+
+
+BRIDGE_AUTH_APP_IDS: FrozenSet[str] = _load_bridge_auth_app_ids()
 
 
 @dataclass(frozen=True)
