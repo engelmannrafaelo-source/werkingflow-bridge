@@ -61,7 +61,13 @@ from src.auth import verify_api_key, security, validate_claude_code_auth, get_cl
 from src.jobs.routes import router as jobs_router, set_attribution_extractor
 from src.jobs.registry import register_executor, run_watchdog_pass
 from src.jobs import store as jobs_store
-from src.jobs.executors import ping_executor, chat_executor, research_executor, proxy_executor
+from src.jobs.executors import (
+    ping_executor,
+    chat_executor,
+    research_executor,
+    proxy_executor,
+    convert_html_to_pdf_executor,
+)
 from src.parameter_validator import ParameterValidator, CompatibilityReporter
 from src.model_registry import (
     get_models_for_api,
@@ -521,6 +527,7 @@ async def lifespan(app: FastAPI):
     register_executor("chat", chat_executor)
     register_executor("research", research_executor)
     register_executor("proxy", proxy_executor)
+    register_executor("convert-html-to-pdf", convert_html_to_pdf_executor)
     set_attribution_extractor(extract_attribution_context)
     if is_db_enabled():
         asyncio.create_task(_generic_jobs_maintenance_loop())

@@ -37,12 +37,18 @@ RESEARCH_SELF_CALL_TIMEOUT_S = float(os.getenv("BRIDGE_RESEARCH_JOB_TIMEOUT_S", 
 # Generic JSON proxy self-call timeout (smart-anonymize etc. — short).
 PROXY_SELF_CALL_TIMEOUT_S = float(os.getenv("BRIDGE_PROXY_JOB_TIMEOUT_S", "300"))
 
+# HTML→PDF render self-call timeout — matches the 600s the sync
+# /v1/convert-html-to-pdf endpoint already grants the Chromium render.
+PDF_SELF_CALL_TIMEOUT_S = float(os.getenv("BRIDGE_PDF_JOB_TIMEOUT_S", "600"))
+
 # Allowlist for the generic 'proxy' executor. ONLY these paths may be invoked as a
 # proxy job — never arbitrary paths (no /v1/jobs recursion, no internal routes).
-# JSON-in / JSON-out endpoints ONLY; binary/multipart endpoints (convert-*,
-# document/convert, audio/transcriptions) are deliberately out of scope — they
-# return binary / take file uploads that do not fit the JSON job-result model, and
-# are short calls that gain little from durability.
+# JSON-in / JSON-out endpoints ONLY; binary/multipart endpoints (document/convert,
+# audio/transcriptions) are deliberately out of scope — they return binary / take
+# file uploads that do not fit the JSON job-result model, and are short calls that
+# gain little from durability. /v1/convert-html-to-pdf is JSON-in/JSON-out
+# (base64) but long-running and has its own dedicated kind ('convert-html-to-pdf')
+# with a render-appropriate timeout — keep it out of the generic proxy.
 PROXY_ALLOWED_PATHS = {
     "/v1/privacy/smart-anonymize",
 }
@@ -158,6 +164,34 @@ async def research_executor(
     body = {**payload, "async_mode": False}
     await report_progress({"phase": "research", "model": body.get("model")})
     return await _self_post_json("/v1/research", body, attribution, RESEARCH_SELF_CALL_TIMEOUT_S)
+
+
+async def convert_html_to_pdf_executor(
+    payload: Dict[str, Any],
+    attribution: Optional[Dict[str, Any]],
+    report_progress: Callable[[Dict[str, Any]], Awaitable[None]],
+) -> Dict[str, Any]:
+    """Run the existing /v1/convert-html-to-pdf (shared Chromium renderer, proxied
+    to the privacy-pdf-service) as a durable job. `payload` is the unchanged
+    request body of that endpoint ({"html": "..."}). The renderer is JSON-in/
+    JSON-out ({status, pdf_base64, size_bytes}), so its response IS the job result
+    — no new render logic, billing/activity-tracking happens exactly once inside
+    the existing endpoint (same self-call pattern as chat/research). Fail loud on
+    non-2xx and on a 2xx body without pdf_base64 (never persist a 'done' job whose
+    result cannot be turned into a PDF)."""
+    html = payload.get("html")
+    if not isinstance(html, str) or not html.strip():
+        raise RuntimeError("convert-html-to-pdf payload requires a non-empty 'html' string")
+    await report_progress({"phase": "render-pdf"})
+    result = await _self_post_json(
+        "/v1/convert-html-to-pdf", payload, attribution, PDF_SELF_CALL_TIMEOUT_S
+    )
+    if result.get("status") != "success" or not result.get("pdf_base64"):
+        raise RuntimeError(
+            f"convert-html-to-pdf returned no PDF (status={result.get('status')!r}): "
+            f"{str(result)[:300]}"
+        )
+    return result
 
 
 async def proxy_executor(
