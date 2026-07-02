@@ -1455,6 +1455,27 @@ CRITICAL: Write file EARLY to avoid context overflow. Use Write tool for clauded
                                 _handle_rate_limit_event(message, worker_id)
                                 continue
 
+                            # Completion-marker detection MUST happen on the
+                            # dataclass, BEFORE the attribute->dict conversion
+                            # below: ResultMessage has no `.type` attribute, so
+                            # the converted dict lacks 'type' and the dict-based
+                            # check further down never fires. That latent bug
+                            # made "NO completion marker detected" fire on EVERY
+                            # SDK request — harmless log noise until the 503
+                            # truncation guard (find_truncation_marker) trusted
+                            # it and rejected healthy responses.
+                            if type(message).__name__ == 'ResultMessage':
+                                _result_subtype = getattr(message, 'subtype', None)
+                                if _result_subtype in ('complete', 'success'):
+                                    response_complete = True
+                                    logger.debug("✅ Response completion marker detected (ResultMessage)")
+                                elif _result_subtype == 'error_max_turns':
+                                    response_complete = True
+                                    logger.warning(
+                                        "⚠️ Result hit max_turns limit - output may be incomplete",
+                                        extra={"cli_session_id": cli_session_id},
+                                    )
+
                             chunks_received += 1
 
                             # Collect message for file discovery
