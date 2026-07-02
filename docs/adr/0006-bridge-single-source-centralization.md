@@ -1,8 +1,8 @@
 # ADR-0006: Bridge Single-Source Centralization (kill dev/prod config drift)
 
-**Status:** ACCEPTED — items A + B + C live & verified on primary (single shared
-OpenResty+Lua nginx.conf); prod cutover prepared + startklar, gated on the parent.
-**Date:** 2026-07-01
+**Status:** ACCEPTED — items A + B + C **live & verified on BOTH bridges** (single shared
+OpenResty+Lua nginx.conf); prod cutover DONE (see 2026-07-02 progress entry).
+**Date:** 2026-07-01 (cutover verified 2026-07-02)
 **Author:** werking-energy session (root-cause of the Phase-4 "ZERO Anthropic accounts" prod incident)
 **Affects:** AI-Bridge deployments (primary/dev host `49.12.72.66`, production host `178.104.178.79`) and every app whose pipeline reads a Bridge metrics endpoint (werking-energy, -safety, -report, engelmann, platform).
 
@@ -296,6 +296,27 @@ Still open (unchanged intent): Items D (deploy-only-from-repo discipline), E (en
 schema separation), F/G residue (typed OpenAPI + DB gating from ADR-0005). The
 whole-compose `generate-bridge-compose.sh` stays aspirational (header now points to the
 shipped narrower mechanism).
+
+**2026-07-02 — PROD CUTOVER DONE + verified (both bridges single-source).**
+
+The "startklar/gated" state above is superseded: the prod cutover was executed and both
+bridges now run the shared source. Live-verified read-only this date:
+
+- **Both hosts at SHA `984abe7`** (repo HEAD) — prod (`178.104.178.79`) no longer behind.
+- **`bridge-parity-check.sh` = 4/4 PASS on both** `hetzner` and `server2` (currency + no
+  modified tracked `docker/` files + in-container includes sha256-identical to repo +
+  correct per-host upstreams include). Only WARN: 5 untracked `*.bak` cruft files per host.
+- Shared route includes are **byte-identical across hosts** (`routes-metrics-reader.conf`
+  `69f486c0`, `routes-platform-api.conf` `e4c402d7`); the sole diff is the upstreams include
+  (`upstreams-primary.conf` worker1..4 vs `upstreams-prod.conf` worker-sahori/worker-kurt).
+- **Acceptance criterion met:** `GET /v1/metrics/account-pool-state` returns the aggregate
+  `{ts, accounts}` on BOTH (dev 4 accounts, prod 2) — the flat-schema incident is gone.
+- Prod nginx-LB (`wt-prod-lb`) runs the OpenResty+Lua image (Item B); no local privacy
+  container on prod (remote dev privacy over Tailscale, as designed).
+- No commits and no hand-edits on either host since the 07-01 cutover → **no drift**.
+
+Item D (deploy-only-from-repo discipline) is now documented in `CLAUDE.md` as the standing
+rule; E/F/G residue unchanged.
 
 ## Links
 - ADR-0005 (Bridge schema drift pre-build validator) — the parity/typing prerequisite for F.
