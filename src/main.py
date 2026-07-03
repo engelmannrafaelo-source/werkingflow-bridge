@@ -4459,11 +4459,12 @@ async def smart_anonymize_endpoint(request: Request, request_body: SmartAnonymiz
             "language": request_body.language or "de",
             "context_hint": request_body.context_hint,
             "prefix": request_body.prefix,
-        }, timeout=270.0)  # Local Flair NER inference on CPU takes ~8-11s per
-        # 1K chars under load (measured 2026-07-03), so 270s covers documents up
-        # to roughly 25K chars. Larger documents need this raised together with
-        # the app-route timeout (300s), which must stay ABOVE this value so the
-        # privacy service's own error surfaces before the app cuts the call.
+        }, timeout=1200.0)  # Local Flair NER inference on CPU takes ~8-11s per
+        # 1K chars under load (measured 2026-07-03), so 20min covers documents
+        # up to roughly 110K chars. Memory is bounded regardless of size
+        # (flair_recognizer windowing). Callers (document-pipeline client,
+        # 21min) must stay ABOVE this value so the privacy service's own error
+        # surfaces before the app cuts the call. nginx allows 2500s.
         response.raise_for_status()
         result = SmartAnonymizeResponse(**response.json())
         try:
