@@ -704,6 +704,45 @@ def find_truncation_marker(chunks: list) -> Optional[dict]:
     return None
 
 
+def extract_result_usage(chunk) -> Optional[dict]:
+    """
+    Real API usage from a CLI result chunk, or None if this chunk carries none.
+
+    Two result-chunk shapes reach the caller:
+      - SDK mode: ResultMessage dataclass converted via its public attributes —
+        that dict has 'subtype' + 'usage' but NO 'type' key (ResultMessage has
+        no .type attribute), so `chunk.get("type") == "result"` never matches
+        it. This gap is why usage was char-estimated for years.
+      - CLI JSON mode / synthetic markers: dict WITH type='result'.
+
+    The returned dict uses the ledger's field names; input_tokens is the
+    UNCACHED input (Anthropic semantics), cache tokens are separate.
+    """
+    if not isinstance(chunk, dict):
+        return None
+    # Result chunks only: either explicitly typed, or the converted
+    # ResultMessage (identified by its 'subtype' attribute). AssistantMessage
+    # conversions have neither.
+    if chunk.get("type") != "result" and "subtype" not in chunk:
+        return None
+    if chunk.get("type") not in (None, "result"):
+        return None
+    usage = chunk.get("usage")
+    if not isinstance(usage, dict):
+        return None
+
+    def _tok(key: str) -> int:
+        value = usage.get(key)
+        return int(value) if isinstance(value, (int, float)) else 0
+
+    return {
+        "input_tokens": _tok("input_tokens"),
+        "output_tokens": _tok("output_tokens"),
+        "cache_creation_tokens": _tok("cache_creation_input_tokens"),
+        "cache_read_tokens": _tok("cache_read_input_tokens"),
+    }
+
+
 class ClaudeCodeCLI:
     def __init__(self, timeout: int = 1200000, cwd: Optional[str] = None):
         self.timeout = timeout / 1000  # Convert ms to seconds

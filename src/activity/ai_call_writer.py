@@ -160,6 +160,8 @@ async def persist_ai_call_activity(
     provider: str = "anthropic",
     provider_meta: Optional[dict] = None,
     region: Optional[str] = None,
+    cache_read_tokens: int = 0,
+    cache_creation_tokens: int = 0,
 ) -> None:
     """
     Write one ai-call activity row. Never raises — tracking is best-effort.
@@ -175,11 +177,21 @@ async def persist_ai_call_activity(
     provider_meta: extra provider facts merged into provider_metadata
         (e.g. bedrock_model_id, region, aws_request_id for call-level joins
         with AWS invocation logs).
+    input_tokens: UNCACHED input (Anthropic/Bedrock usage semantics). Prompt-
+        cache traffic goes into cache_read_tokens (0.1x input price) and
+        cache_creation_tokens (1.25x input price) — the physical input of a
+        call is the sum of all three.
     """
     # Cost from the pricing SSoT. Error calls cost nothing (0.0) — only a
     # successful completion consumes budget.
     call_cost_eur = (
-        cost_eur(model, input_tokens, output_tokens)
+        cost_eur(
+            model,
+            input_tokens,
+            output_tokens,
+            cache_read_tokens=cache_read_tokens,
+            cache_creation_tokens=cache_creation_tokens,
+        )
         if status == "success" else 0.0
     )
 
@@ -355,6 +367,7 @@ async def persist_ai_call_activity(
                     user_id, tenant_id,
                     app, app_env, model, provider, region,
                     input_tokens, output_tokens,
+                    cache_read_tokens, cache_creation_tokens,
                     billing_mode, real_cost_eur, hypothetical_cost_eur, pricing_version,
                     provider_metadata
                 ) VALUES (
@@ -362,8 +375,9 @@ async def persist_ai_call_activity(
                     $1, $2,
                     $3, $4::app_env, $5, $6, $7,
                     $8, $9,
-                    $10::billing_mode_enum, $11, $12, $13,
-                    $14::jsonb
+                    $10, $11,
+                    $12::billing_mode_enum, $13, $14, $15,
+                    $16::jsonb
                 )
                 """,
                 actor_uuid,
@@ -375,6 +389,8 @@ async def persist_ai_call_activity(
                 region,
                 input_tokens or 0,
                 output_tokens or 0,
+                cache_read_tokens or 0,
+                cache_creation_tokens or 0,
                 bm_enum,
                 real_cost,
                 call_cost_eur,  # hypothetical = priced at pay-per-token rates

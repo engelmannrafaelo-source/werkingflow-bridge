@@ -49,7 +49,13 @@ from src.models import (
     SmartAnonymizeResponse,
     ConvertPdfResponse
 )
-from src.claude_cli import ClaudeCodeCLI, WorkerUnavailableError, RateLimitError, rate_limit_tracker
+from src.claude_cli import (
+    ClaudeCodeCLI,
+    WorkerUnavailableError,
+    RateLimitError,
+    rate_limit_tracker,
+    extract_result_usage,
+)
 from src.middleware.bridge_error import SDKDisconnectError
 from src.message_adapter import MessageAdapter
 from src.tool_leak_detector import hardened_system_prompt, looks_like_tool_leak
@@ -1617,16 +1623,40 @@ async def generate_streaming_response(
             yield "data: [DONE]\n\n"
 
         # =====================================================================
-        # USAGE TRACKING for streaming (estimated tokens)
+        # USAGE TRACKING for streaming
         # Without this, streaming calls show 0 tokens in Bridge Monitor.
+        # Real usage comes from the CLI result chunk in chunks_buffer; the
+        # char estimate is the loud fallback for streams that died early.
         # =====================================================================
         try:
             stream_duration = time.time() - stream_start_time
 
-            # Estimate tokens from buffered chunks
-            assistant_text = claude_cli.parse_claude_message(chunks_buffer) if chunks_buffer else ""
-            est_prompt_tokens = MessageAdapter.estimate_tokens(prompt) if prompt else 0
-            est_completion_tokens = MessageAdapter.estimate_tokens(assistant_text) if assistant_text else 0
+            stream_result_usage = None
+            for _buffered in chunks_buffer:
+                stream_result_usage = extract_result_usage(_buffered)
+                if stream_result_usage:
+                    break
+
+            est_cache_read = est_cache_creation = 0
+            if stream_result_usage:
+                stream_usage_source = "api"
+                est_uncached_input = stream_result_usage["input_tokens"]
+                est_cache_creation = stream_result_usage["cache_creation_tokens"]
+                est_cache_read = stream_result_usage["cache_read_tokens"]
+                est_completion_tokens = stream_result_usage["output_tokens"]
+                est_prompt_tokens = (
+                    est_uncached_input + est_cache_creation + est_cache_read
+                )
+            else:
+                stream_usage_source = "estimated"
+                assistant_text = claude_cli.parse_claude_message(chunks_buffer) if chunks_buffer else ""
+                est_uncached_input = est_prompt_tokens = MessageAdapter.estimate_tokens(prompt) if prompt else 0
+                est_completion_tokens = MessageAdapter.estimate_tokens(assistant_text) if assistant_text else 0
+                logger.warning(
+                    "⚠️ Streaming: no usage in CLI result chunk — billing falls "
+                    "back to char-estimate (known ~2x undercount). chunks=%d",
+                    len(chunks_buffer),
+                )
 
             # Track with tenant (if available via request state)
             tenant = get_tenant_from_request(fastapi_request) if fastapi_request else None
@@ -1669,11 +1699,16 @@ async def generate_streaming_response(
                     agent_id=attr.get("agent_id"),
                     workflow_id=attr.get("workflow_id"),
                     model=request.model,
-                    input_tokens=est_prompt_tokens or 0,
+                    # Uncached input + cache fields separately — summing them
+                    # into input_tokens would double-bill the cache traffic.
+                    input_tokens=est_uncached_input or 0,
                     output_tokens=est_completion_tokens or 0,
+                    cache_read_tokens=est_cache_read or 0,
+                    cache_creation_tokens=est_cache_creation or 0,
                     status="success",
                     duration_ms=int(stream_duration * 1000),
                     app_env=attr.get("app_env"),
+                    provider_meta={"usage_source": stream_usage_source},
                 )
         except Exception as track_err:
             logger.warning(f"⚠️ Streaming usage tracking failed (non-fatal): {track_err}")
@@ -2529,6 +2564,7 @@ async def chat_completions(
             chunks = []
             metadata_chunk = None  # Store file metadata separately
             cli_session_id = None  # Store session ID for header
+            result_usage = None  # Real API usage from the CLI result chunk
             async for chunk in claude_cli.run_completion(
                 prompt=prompt,
                 system_prompt=system_prompt,
@@ -2550,6 +2586,8 @@ async def chat_completions(
                     continue  # Don't add to chunks (not part of message)
 
                 chunks.append(chunk)
+                if result_usage is None:
+                    result_usage = extract_result_usage(chunk)
 
             # Log chunk collection for debugging
             logger.info(f"Collected {len(chunks)} chunks from Claude Code SDK")
@@ -2787,9 +2825,32 @@ async def chat_completions(
                 assistant_message = Message(role="assistant", content=assistant_content)
                 session_manager.add_assistant_response(actual_session_id, assistant_message)
 
-            # Estimate tokens (rough approximation)
-            prompt_tokens = MessageAdapter.estimate_tokens(prompt)
-            completion_tokens = MessageAdapter.estimate_tokens(assistant_content)
+            # Token accounting. The CLI result chunk carries the REAL API usage
+            # (incl. prompt-cache traffic); the len//4 char estimate survives
+            # only as loud fallback for streams that died before their result
+            # chunk — it undercounts by ~2x (no system-prompt/tool overhead,
+            # no cache, no thinking) and must never be the silent default.
+            if result_usage:
+                usage_source = "api"
+                uncached_input_tokens = result_usage["input_tokens"]
+                cache_creation_tokens = result_usage["cache_creation_tokens"]
+                cache_read_tokens = result_usage["cache_read_tokens"]
+                completion_tokens = result_usage["output_tokens"]
+                # OpenAI usage semantics: prompt_tokens = full billed input,
+                # cached portions broken out separately below.
+                prompt_tokens = (
+                    uncached_input_tokens + cache_creation_tokens + cache_read_tokens
+                )
+            else:
+                usage_source = "estimated"
+                uncached_input_tokens = prompt_tokens = MessageAdapter.estimate_tokens(prompt)
+                completion_tokens = MessageAdapter.estimate_tokens(assistant_content)
+                cache_creation_tokens = cache_read_tokens = 0
+                logger.warning(
+                    "⚠️ No usage in CLI result chunk — billing falls back to "
+                    "char-estimate (known ~2x undercount). chunks=%d model=%s",
+                    len(chunks), request_body.model,
+                )
 
             # Create response with backend info
             response = ChatCompletionResponse(
@@ -2804,6 +2865,8 @@ async def chat_completions(
                     prompt_tokens=prompt_tokens,
                     completion_tokens=completion_tokens,
                     total_tokens=prompt_tokens + completion_tokens,
+                    cache_read_tokens=cache_read_tokens,
+                    cache_write_tokens=cache_creation_tokens,
                     image_count=0  # Text-only request (no images)
                 ),
                 x_backend_info=BackendInfo(**get_backend_info_dict(backend_config)) if backend_config else None
@@ -2883,11 +2946,17 @@ async def chat_completions(
                     agent_id=attribution.get("agent_id"),
                     workflow_id=attribution.get("workflow_id"),
                     model=request_body.model,
-                    input_tokens=prompt_tokens or 0,
+                    # Ledger semantics: uncached input + cache fields separately
+                    # (cost_eur prices each at its own rate — passing the summed
+                    # prompt_tokens here would double-bill the cache traffic).
+                    input_tokens=uncached_input_tokens or 0,
                     output_tokens=completion_tokens or 0,
+                    cache_read_tokens=cache_read_tokens or 0,
+                    cache_creation_tokens=cache_creation_tokens or 0,
                     status="success",
                     duration_ms=int(duration * 1000),
                     app_env=attribution.get("app_env"),
+                    provider_meta={"usage_source": usage_source},
                 )
             except Exception as e:
                 logger.warning(f"prompt_metrics record (success) failed: {e}")
@@ -3399,6 +3468,8 @@ async def _execute_research_impl(
     # the error path can read them.
     accumulated_input_tokens = None
     accumulated_output_tokens = None
+    accumulated_cache_read = 0
+    accumulated_cache_creation = 0
     research_prompt = None  # built inside try, read in error path for estimates
 
     try:
@@ -3457,15 +3528,21 @@ async def _execute_research_impl(
                     if cli_session_id:
                         session_id = cli_session_id
                         logger.info(f"📁 Using cli_session_id: {session_id}")
-            # R1: Extract token usage from SDK result message when available
-            if chunk.get("type") == "result":
-                _chunk_usage = chunk.get("usage") or {}
-                _in_tok = _chunk_usage.get("input_tokens")
-                _out_tok = _chunk_usage.get("output_tokens")
-                if _in_tok is not None:
-                    accumulated_input_tokens = (accumulated_input_tokens or 0) + int(_in_tok)
-                if _out_tok is not None:
-                    accumulated_output_tokens = (accumulated_output_tokens or 0) + int(_out_tok)
+            # R1: Extract token usage from the CLI result chunk when available.
+            # extract_result_usage also matches the SDK ResultMessage attr-dict
+            # (which has NO 'type' key) — the old `type == "result"` check
+            # silently missed it, so research billing always fell back to the
+            # char estimate.
+            _chunk_usage = extract_result_usage(chunk)
+            if _chunk_usage:
+                accumulated_input_tokens = (
+                    (accumulated_input_tokens or 0) + _chunk_usage["input_tokens"]
+                )
+                accumulated_output_tokens = (
+                    (accumulated_output_tokens or 0) + _chunk_usage["output_tokens"]
+                )
+                accumulated_cache_read += _chunk_usage["cache_read_tokens"]
+                accumulated_cache_creation += _chunk_usage["cache_creation_tokens"]
 
         if not all_chunks:
             raise ValueError("No response received from Claude Code execution")
@@ -3632,9 +3709,14 @@ async def _execute_research_impl(
                 model=request_body.model,
                 input_tokens=_track_in or 0,
                 output_tokens=_track_out or 0,
+                cache_read_tokens=accumulated_cache_read or 0,
+                cache_creation_tokens=accumulated_cache_creation or 0,
                 status="success",
                 duration_ms=int(execution_time * 1000),
                 app_env=attribution_ctx.get("app_env") if attribution_ctx else None,
+                provider_meta={
+                    "usage_source": "api" if accumulated_input_tokens is not None else "estimated",
+                },
             )
         except Exception as _track_err:
             logger.warning(f"⚠️ research activity tracking failed (non-fatal): {_track_err}")

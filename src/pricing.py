@@ -15,10 +15,14 @@ from __future__ import annotations
 
 import json
 import os
+import re
 
 # Bump when MODEL_PRICING changes so usage_events rows stay attributable to a
 # specific price table snapshot. Stored in usage_events.pricing_version.
-PRICING_VERSION = "v1"
+# v2 (2026-07-03): opus-4-7 corrected 15/75 -> 5/25 (15/75 is the Opus 4/4.1
+#                  price; Opus 4.5+ lists at 5/25), opus-4-6/4-8 added,
+#                  cache pricing introduced (write 1.25x in, read 0.1x in).
+PRICING_VERSION = "v2"
 
 # USD per 1M tokens. {model_id: {"in": input_price, "out": output_price}}
 MODEL_PRICING: dict[str, dict[str, float]] = {
@@ -26,12 +30,20 @@ MODEL_PRICING: dict[str, dict[str, float]] = {
     "claude-sonnet-4-5-20250929": {"in": 3.00,  "out": 15.00},
     "claude-sonnet-4-6":          {"in": 3.00,  "out": 15.00},
     "claude-opus-4":              {"in": 15.00, "out": 75.00},
-    "claude-opus-4-7":            {"in": 15.00, "out": 75.00},
+    "claude-opus-4-6":            {"in": 5.00,  "out": 25.00},
+    "claude-opus-4-7":            {"in": 5.00,  "out": 25.00},
+    "claude-opus-4-8":            {"in": 5.00,  "out": 25.00},
     "claude-haiku-4-5":           {"in": 1.00,  "out": 5.00},
     "claude-haiku-4-5-20251001":  {"in": 1.00,  "out": 5.00},
     "gpt-5":                      {"in": 5.00,  "out": 15.00},
     "gpt-5-mini":                 {"in": 0.30,  "out": 1.20},
 }
+
+# Prompt-cache token pricing, as a multiple of the model's input price.
+# Anthropic and Bedrock use the same ratios: 5-min cache write 1.25x,
+# cache read 0.1x.
+CACHE_WRITE_MULT = 1.25
+CACHE_READ_MULT = 0.10
 
 _DEFAULT_USD_TO_EUR = 0.92
 
@@ -72,19 +84,36 @@ def normalize_model_id(model: str) -> str:
     return model
 
 
-def cost_eur(model: str | None, input_tokens: int, output_tokens: int) -> float:
+def cost_eur(
+    model: str | None,
+    input_tokens: int,
+    output_tokens: int,
+    cache_read_tokens: int = 0,
+    cache_creation_tokens: int = 0,
+) -> float:
     """
     EUR cost of one LLM call. Unknown / missing model → 0.0; the caller
     decides how to surface that (metrics logs it on the aggregate level,
     the deduction treats 0.0 as "nothing to deduct").
+
+    input_tokens is the UNCACHED input (Anthropic/Bedrock usage semantics);
+    cache writes and reads are billed at their own rates on top.
     """
     if not model:
         return 0.0
-    p = load_pricing().get(normalize_model_id(model))
+    pricing = load_pricing()
+    model_id = normalize_model_id(model)
+    p = pricing.get(model_id)
+    if p is None:
+        # Date-suffixed IDs (claude-opus-4-7-20260115) price as their base
+        # model — keeps the table free of every snapshot variant.
+        p = pricing.get(re.sub(r"-\d{8}$", "", model_id))
     if p is None:
         return 0.0
     usd = (
         (input_tokens or 0) / 1_000_000.0 * p["in"]
+        + (cache_creation_tokens or 0) / 1_000_000.0 * p["in"] * CACHE_WRITE_MULT
+        + (cache_read_tokens or 0) / 1_000_000.0 * p["in"] * CACHE_READ_MULT
         + (output_tokens or 0) / 1_000_000.0 * p["out"]
     )
     return round(usd * usd_to_eur_rate(), 6)
