@@ -1,6 +1,15 @@
 # Manuelle Tasks: AWS Bedrock Setup (Per-User DSGVO-Routing)
 
-## Status: ⏳ Ausstehend (Code-Seite FERTIG — es fehlt nur das AWS-Konto-Setup)
+## Status: ⏳ Es fehlt NUR noch das Anthropic-Use-Case-Formular + Model Access (AWS-Konsole)
+
+**Live-verifiziert 2026-07-03:** Credentials (IAM-User „AI-Reporter-Backend")
+liegen in `secrets/platform.env` auf BEIDEN Bridge-Servern + Infisical
+`dev-server` (AWS_*_BEDROCK). Ein Test-Call `backend:"bedrock"` erreicht AWS
+und scheitert dort mit `ResourceNotFoundException: Model use case details
+have not been submitted for this account` → Routing/Mapping/Region-Kette
+funktioniert end-to-end, AWS wartet auf Schritt 1 unten.
+Hinweis: die Prod-Worker (server-2) übernehmen die frisch verteilten Keys
+beim nächsten Worker-Deploy/Recreate (Hetzner-Worker haben sie bereits).
 
 ## Übersicht
 
@@ -123,12 +132,12 @@ curl -sS -X POST "$AI_BRIDGE_URL/v1/metrics/bedrock-reconciliation/run" \
 
 ## Checkliste
 
-- [ ] Model Access granted (eu-central-1, EU-Inference-Profile)
-- [ ] IAM-User + Minimal-Policy (invoke + cloudwatch read)
-- [ ] Model Invocation Logging an
-- [ ] Keys in `secrets/platform.env` (beide Bridge-Server) + Infisical
-- [ ] Worker-Log: „Bedrock credentials configured"
-- [ ] Test-Call mit `backend:"bedrock"` → `x_backend_info.backend=bedrock`
+- [ ] **Anthropic-Use-Case-Formular + Model Access granted (eu-central-1, EU-Inference-Profile) ← EINZIGER offener Rafael-Schritt**
+- [x] IAM-User existiert („AI-Reporter-Backend") — ⚠ CloudWatch-Read-Policy (GetMetricStatistics/ListMetrics) noch verifizieren, braucht die Reconciliation
+- [ ] Model Invocation Logging an (empfohlen, nicht blockierend)
+- [x] Keys in `secrets/platform.env` (beide Bridge-Server) + Infisical `dev-server` (03.07)
+- [x] Worker-Log: „Bedrock credentials configured" (Hetzner; server-2 nach nächstem Worker-Recreate)
+- [ ] Test-Call mit `backend:"bedrock"` → `x_backend_info.backend=bedrock` (aktuell: AWS ResourceNotFoundException bis Formular submitted)
 - [ ] Test-User gepinnt → `usage_events.provider='bedrock'` Rows
 - [ ] Reconciliation-Run → status `ok`
 
