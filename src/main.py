@@ -2070,6 +2070,28 @@ async def chat_completions(
             logger.info(f"Model resolved: '{original_model}' -> '{resolved_model}'")
             request_body.model = resolved_model
 
+        # PER-USER PROVIDER OVERRIDE: users.provider_config pins a user's
+        # traffic to a backend (operator-set, e.g. Bedrock for DSGVO). Must run
+        # BEFORE backend resolution; a pin failure is 503, never a fallback.
+        from src.routing.user_provider_override import (
+            enforce_user_provider_override, UserProviderOverrideError,
+        )
+        user_pinned_provider = None
+        try:
+            user_pinned_provider = await enforce_user_provider_override(request, request_body)
+        except UserProviderOverrideError as e:
+            raise HTTPException(
+                status_code=503,
+                detail={
+                    "error": {
+                        "message": str(e),
+                        "type": "configuration_error",
+                        "code": "user_provider_override_unavailable",
+                        "hint": "The user is pinned to a specific provider that is currently not servable. No fallback is attempted by design.",
+                    }
+                }
+            )
+
         # BACKEND ROUTING: Resolve backend configuration (Anthropic / Bedrock / OpenAI-Compatible)
         backend_config = None
         try:
@@ -2081,13 +2103,19 @@ async def chat_completions(
                 provider_tier=request_body.provider_tier,
             )
         except RuntimeError as e:
+            # A user PINNED to this backend (provider_config) gets 503, not
+            # 400: the request was fine, the server-side pin is unservable.
+            # Falling back to another backend is forbidden by design.
             raise HTTPException(
-                status_code=400,
+                status_code=503 if user_pinned_provider else 400,
                 detail={
                     "error": {
                         "message": str(e),
                         "type": "configuration_error",
-                        "code": "provider_not_configured",
+                        "code": (
+                            "user_provider_override_unavailable"
+                            if user_pinned_provider else "provider_not_configured"
+                        ),
                         "hint": "Contact server administrator to configure the requested provider"
                     }
                 }
@@ -2976,7 +3004,7 @@ async def chat_completions(
         # tier call never happened, so this path is defence-in-depth without
         # cost: fallback chain only runs when our own workers are exhausted.
         # =====================================================================
-        if not request_body.stream:
+        if not request_body.stream and not user_pinned_provider:
             try:
                 from src.providers.fallback import (
                     record_failure as _fb_fail, record_success as _fb_ok,
@@ -3049,8 +3077,9 @@ async def chat_completions(
     except Exception as e:
         # =======================================================================
         # FALLBACK: Attempt alternate providers if primary failed (non-streaming)
+        # Provider-pinned users (provider_config) are excluded: no fallback by design.
         # =======================================================================
-        if not request_body.stream:
+        if not request_body.stream and not user_pinned_provider:
             try:
                 from src.providers.fallback import (
                     is_retryable_error, is_breaker_failure, record_failure, record_success,
@@ -3812,6 +3841,21 @@ async def research(
     if resolved_model != original_model:
         logger.info(f"Research model resolved: '{original_model}' -> '{resolved_model}'")
         request_body.model = resolved_model
+
+    # PER-USER PROVIDER OVERRIDE: same enforcement as chat completions —
+    # a Bedrock-pinned user's research runs through the SDK-Bedrock env path.
+    from src.routing.user_provider_override import (
+        enforce_user_provider_override, UserProviderOverrideError,
+    )
+    try:
+        await enforce_user_provider_override(request, request_body)
+    except UserProviderOverrideError as e:
+        return ResearchResponse(
+            status="error",
+            query=request_body.query,
+            model=request_body.model,
+            error=f"user provider pin unservable (no fallback by design): {e}"
+        )
 
     # BACKEND ROUTING: Resolve backend configuration for research
     backend_config = None
@@ -5761,6 +5805,12 @@ async def bridge_error_handler(request: Request, exc: BridgeError):
         is_chat_completions = path.endswith("/v1/chat/completions")
         cached_body = getattr(request.state, "cached_body_dict", None)
         if not is_chat_completions or not cached_body or cached_body.get("stream"):
+            return exc.response
+
+        # Provider-pinned traffic (users.provider_config, e.g. Bedrock for
+        # DSGVO) must NEVER be rerouted to a different provider tier — the
+        # pin exists precisely to guarantee where the data goes.
+        if getattr(request.state, "user_provider_pinned", None) or cached_body.get("backend") == "bedrock":
             return exc.response
 
         # Only attempt for retryable bridge-side errors (not, e.g., auth failures).

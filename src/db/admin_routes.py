@@ -325,12 +325,13 @@ class UserUpdateRequest(BaseModel):
     provider_config: Optional[Any] = Field(
         default=None,
         description=(
-            "Admin-only. Per-user provider override for the coming Bedrock switch. "
-            "NULL = inherit tenant default. Shape: "
-            '{"provider": "bedrock", "region": "eu-central-1", '
-            '"model": "<bedrock-model-id>", "billing_mode": "pay_per_token", '
-            '"budget_limit_eur": 100.0}. '
-            "Routing and enforcement are NOT active yet — schema only."
+            "Admin-only. Per-user provider pin, ENFORCED by "
+            "src/routing/user_provider_override.py on chat completions and "
+            "research. NULL = inherit default (anthropic). Shape: "
+            '{"provider": "bedrock"|"anthropic", "region": "eu-central-1"}. '
+            "Send {} to clear an existing pin. A bedrock pin with missing AWS "
+            "credentials yields 503 on every call — no silent fallback. "
+            "Takes effect within the 60s routing cache TTL on all workers."
         ),
     )
 
@@ -378,6 +379,25 @@ async def update_user(
             detail=f"Invalid role '{body.role}'. Must be one of: {_VALID_ROLES_LIST}",
         )
 
+    # Validate provider_config at WRITE time — a typo must fail here, not as a
+    # 503 on the pinned user's next AI call. {} clears the pin.
+    if body.provider_config is not None:
+        from src.routing.user_provider_override import SUPPORTED_PROVIDERS
+        if not isinstance(body.provider_config, dict):
+            raise HTTPException(
+                status_code=400,
+                detail="provider_config must be a JSON object (use {} to clear the pin)",
+            )
+        _pc_provider = body.provider_config.get("provider")
+        if _pc_provider is not None and _pc_provider not in SUPPORTED_PROVIDERS:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"provider_config.provider '{_pc_provider}' not supported. "
+                    f"Must be one of: {sorted(SUPPORTED_PROVIDERS)}"
+                ),
+            )
+
     if (body.name is None and body.role is None and body.password is None
             and body.tenant_id is None and body.provider_config is None):
         raise HTTPException(status_code=400, detail="No fields to update")
@@ -421,6 +441,14 @@ async def update_user(
         )
     if not row:
         raise HTTPException(status_code=404, detail=f"User '{user_id}' not found")
+
+    # Drop this process's routing cache for the user; other workers converge
+    # via the 60s TTL (each worker holds its own in-memory cache).
+    if body.provider_config is not None:
+        from src.routing.user_provider_override import invalidate_cache
+        invalidate_cache(str(row["id"]))
+        invalidate_cache(row["email"])
+
     return _user_row_to_dict(row)
 
 
