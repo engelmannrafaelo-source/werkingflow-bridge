@@ -132,9 +132,9 @@ async def _warmup_privacy_models() -> None:
     pay the ~50s cold-start.
 
     The Presidio analyzer is lazy-built on first use (PrivacyMiddleware.anonymizer).
-    On a cold uvicorn worker that first call takes ~50s, which overruns the inner
-    refinement self-call timeout → the worker returns 500 → nginx maps it to 502
-    (observed intermittently in the "Was die KI sieht" preview, 2026-06-23).
+    On a cold uvicorn worker that first call takes ~50s, which overran caller
+    timeouts → the worker returned 500 → nginx mapped it to 502 (observed
+    intermittently in the "Was die KI sieht" preview, 2026-06-23).
 
     Runs once per uvicorn worker. Non-blocking (thread executor) so the worker is
     immediately ready for the /health probe; the models warm within ~1 min, well
@@ -179,9 +179,10 @@ async def deanonymize_endpoint(req: DeanonymizeRequest):
 
 @app.post("/smart-anonymize")
 async def smart_anonymize_service_endpoint(req: SmartAnonymizeServiceRequest):
-    """Smart anonymization: Presidio + AI refinement.
+    """Smart anonymization: Presidio + local Flair NER, fully deterministic.
 
-    The AI refinement step calls BACK to the workers via BRIDGE_SELF_URL.
+    Runs entirely inside this container — no cloud calls. (The former
+    cloud-Haiku refinement stage was removed 2026-07-03.)
     """
     from src.privacy.smart_anonymizer import smart_anonymize
     result = await smart_anonymize(

@@ -12,7 +12,7 @@ network at `http://privacy-service:8100`.
 |------|---------|
 | `POST /anonymize` | Bulk message anonymisation (Presidio) |
 | `POST /deanonymize` | Reverse a Presidio mapping on a single string |
-| `POST /smart-anonymize` | Presidio + Claude refinement (keeps context-relevant tokens) |
+| `POST /smart-anonymize` | Presidio + local Flair NER, deterministic (no cloud calls) |
 | `POST /convert-pdf` | Legacy PDF → Markdown via Docling (kept for back-compat) |
 | `POST /convert-pdf-to-semantic-html` | PDF → semantic Flexbox HTML via ConvertAPI + AI |
 | `POST /convert-semantic-html` | Pixel HTML → semantic Flexbox HTML |
@@ -129,7 +129,7 @@ Multipart fields:
 | `file` | yes | — | Binary upload |
 | `mime_type_hint` | no | — | Override extension-based detection |
 | `language` | no | `de` | `de` / `en` |
-| `privacy_mode` | no | `smart` | `smart` (Presidio + Claude refinement) or `basic` (Presidio only) |
+| `privacy_mode` | no | `smart` | `smart` (Presidio + local Flair NER) or `basic` (Presidio only) |
 | `context_hint` | no | — | Document type hint to bias Smart-Anonymize decisions |
 
 ## Container

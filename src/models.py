@@ -500,18 +500,19 @@ class SmartAnonymizeResponse(BaseModel):
         description="Number of entities detected by Presidio"
     )
 
-    # Stage 2: AI-refined result
+    # Smart result (identical to raw since the AI-refinement stage was
+    # removed 2026-07-03; fields kept for response-shape compatibility)
     smart_anonymized_text: Optional[str] = Field(
         default=None,
         description="Smart-anonymized text (only real PII replaced)"
     )
     smart_entity_count: Optional[int] = Field(
         default=None,
-        description="Number of entities that remain anonymized after AI refinement"
+        description="Number of entities that remain anonymized"
     )
     restored_entities: Optional[List[Dict[str, Any]]] = Field(
         default=None,
-        description="Entities restored by AI (with decision reason)"
+        description="Always empty since the AI-refinement stage was removed (2026-07-03)"
     )
 
     # Mapping for client-side encryption

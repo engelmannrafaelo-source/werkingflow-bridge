@@ -235,8 +235,8 @@ class TestSmartAnonymizeEndToEnd:
     def _make_fake_anon_result(self, anonymized_text: str, entities: List[DetectedEntity]) -> AnonymizationResult:
         return _make_result(anonymized_text, entities)
 
-    def test_non_refinement_path_consistent(self):
-        """Non-refinement path: mapping and text are consistent, assertions pass."""
+    def test_default_path_consistent(self):
+        """Default path: mapping and text are consistent, assertions pass."""
         entities = [
             DetectedEntity("PERSON", "Max Müller", 0, 10, 0.95, "ANON_PERSON_001"),
             DetectedEntity("URL", "https://example.at", 15, 33, 0.80, "ANON_URL_001"),
@@ -246,8 +246,7 @@ class TestSmartAnonymizeEndToEnd:
             entities,
         )
 
-        with patch("src.privacy.smart_anonymizer.USE_REFINEMENT", False), \
-             patch("src.privacy.smart_anonymizer.PresidioAnonymizer") as MockAnon:
+        with patch("src.privacy.smart_anonymizer.PresidioAnonymizer") as MockAnon:
             instance = MagicMock()
             instance.anonymize_async = AsyncMock(return_value=fake_result)
             MockAnon.return_value = instance
@@ -259,8 +258,8 @@ class TestSmartAnonymizeEndToEnd:
         for ph in result["mapping"]:
             assert ph in result["smart_anonymized_text"]
 
-    def test_non_refinement_path_raises_on_inconsistency(self):
-        """Non-refinement path: if anonymizer produces inconsistent data, fail loud."""
+    def test_default_path_raises_on_inconsistency(self):
+        """Default path: if anonymizer produces inconsistent data, fail loud."""
         # Simulate the partial-overlap bug: ANON_URL_007 is in mapping but text
         # only has a corrupted fragment "L_007" — a regression test.
         entities = [
@@ -278,8 +277,7 @@ class TestSmartAnonymizeEndToEnd:
             language="de",
         )
 
-        with patch("src.privacy.smart_anonymizer.USE_REFINEMENT", False), \
-             patch("src.privacy.smart_anonymizer.PresidioAnonymizer") as MockAnon:
+        with patch("src.privacy.smart_anonymizer.PresidioAnonymizer") as MockAnon:
             instance = MagicMock()
             instance.anonymize_async = AsyncMock(return_value=fake_result)
             MockAnon.return_value = instance
@@ -288,8 +286,8 @@ class TestSmartAnonymizeEndToEnd:
             with pytest.raises(ValueError, match="consistency violation"):
                 _run(smart_anonymize("..."))
 
-    def test_non_refinement_path_raises_on_pii_leak(self):
-        """Non-refinement path: if hard PII appears as plaintext, fail loud."""
+    def test_default_path_raises_on_pii_leak(self):
+        """Default path: if hard PII appears as plaintext, fail loud."""
         entities = [
             DetectedEntity("PERSON", "Max Müller", 0, 10, 0.95, "ANON_PERSON_001"),
         ]
@@ -302,8 +300,7 @@ class TestSmartAnonymizeEndToEnd:
             language="de",
         )
 
-        with patch("src.privacy.smart_anonymizer.USE_REFINEMENT", False), \
-             patch("src.privacy.smart_anonymizer.PresidioAnonymizer") as MockAnon:
+        with patch("src.privacy.smart_anonymizer.PresidioAnonymizer") as MockAnon:
             instance = MagicMock()
             instance.anonymize_async = AsyncMock(return_value=fake_result)
             MockAnon.return_value = instance
