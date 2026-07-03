@@ -50,6 +50,9 @@ _ALLOWED_APP_IDS = {
     "werking-noise", "engelmann",
 }
 _ALLOWED_SOURCES = {"workflow", "sandbox", "chat"}
+# usage_events.provider values the API accepts as filter. Matches what the
+# request paths actually book (ai_call_writer default + the Bedrock branch).
+_ALLOWED_PROVIDERS = {"anthropic", "bedrock"}
 
 
 def _parse_iso(s: Optional[str]) -> Optional[datetime]:
@@ -71,6 +74,7 @@ async def usage_metrics(
     userId: Optional[str] = Query(None),
     mode: Optional[str] = Query(None, description="prod|staging|local — filter by app_env"),
     source: Optional[str] = Query(None, description="workflow|sandbox|chat (default: all)"),
+    provider: Optional[str] = Query(None, description="anthropic|bedrock — filter by serving backend (default: all)"),
     _claims: AuthClaims = Depends(require_admin),
 ) -> Dict[str, Any]:
     """
@@ -85,6 +89,8 @@ async def usage_metrics(
         raise HTTPException(status_code=400, detail=f"Unknown appId: {appId}")
     if source and source not in _ALLOWED_SOURCES:
         raise HTTPException(status_code=400, detail=f"source must be one of {sorted(_ALLOWED_SOURCES)}")
+    if provider and provider not in _ALLOWED_PROVIDERS:
+        raise HTTPException(status_code=400, detail=f"provider must be one of {sorted(_ALLOWED_PROVIDERS)}")
 
     until_dt = _parse_iso(until) or datetime.now(timezone.utc)
     since_dt = _parse_iso(since) or (until_dt - timedelta(days=30))
@@ -112,12 +118,15 @@ async def usage_metrics(
     if source:
         args.append(source)
         where.append(f"u.source = ${len(args)}::usage_source")
+    if provider:
+        _add("u.provider = $$", provider)
 
     where_sql = " AND ".join(where)
     sql = f"""
         SELECT
             u.user_id, u.tenant_id, u.app, u.model,
             u.source::text                                      AS source,
+            u.provider,
             u.input_tokens, u.output_tokens,
             u.cache_read_tokens, u.cache_creation_tokens,
             u.real_cost_eur, u.hypothetical_cost_eur,
@@ -142,6 +151,7 @@ async def usage_metrics(
         "realCostEur": 0.0, "hypotheticalCostEur": 0.0, "estimatedCostEur": 0.0,
     }
     seen_models: set[str] = set()
+    totals_by_provider: Dict[str, Dict[str, Any]] = {}
 
     for r in rows:
         if groupBy == "user":
@@ -158,7 +168,7 @@ async def usage_metrics(
             "promptTokens": 0, "completionTokens": 0, "totalTokens": 0,
             "cacheReadTokens": 0, "cacheCreationTokens": 0,
             "realCostEur": 0.0, "hypotheticalCostEur": 0.0, "estimatedCostEur": 0.0,
-            "byApp": {}, "byModel": {}, "bySource": {},
+            "byApp": {}, "byModel": {}, "bySource": {}, "byProvider": {},
         })
 
         it = int(r["input_tokens"] or 0)
@@ -207,6 +217,23 @@ async def usage_metrics(
         sb["realCostEur"] = round(sb["realCostEur"] + real, 6)
         sb["hypotheticalCostEur"] = round(sb["hypotheticalCostEur"] + hyp, 6)
 
+        prov = r["provider"] or "anthropic"
+        pb = b["byProvider"].setdefault(prov, {
+            "calls": 0, "tokens": 0, "realCostEur": 0.0, "hypotheticalCostEur": 0.0,
+        })
+        pb["calls"] += 1
+        pb["tokens"] += tt
+        pb["realCostEur"] = round(pb["realCostEur"] + real, 6)
+        pb["hypotheticalCostEur"] = round(pb["hypotheticalCostEur"] + hyp, 6)
+
+        tp = totals_by_provider.setdefault(prov, {
+            "calls": 0, "tokens": 0, "realCostEur": 0.0, "hypotheticalCostEur": 0.0,
+        })
+        tp["calls"] += 1
+        tp["tokens"] += tt
+        tp["realCostEur"] = round(tp["realCostEur"] + real, 6)
+        tp["hypotheticalCostEur"] = round(tp["hypotheticalCostEur"] + hyp, 6)
+
         totals["calls"] += 1
         if is_err:
             totals["errors"] += 1
@@ -252,6 +279,7 @@ async def usage_metrics(
         "until": until_dt.isoformat(),
         "rows": out_rows,
         "totals": totals,
+        "totalsByProvider": totals_by_provider,
         "pricing": {
             "modelsKnown": list(pricing.keys()),
             "modelsUnknown": unknown_models,
