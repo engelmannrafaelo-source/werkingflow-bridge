@@ -398,10 +398,16 @@ services:
       - PRIVACY_ENABLED=true
       - PRIVACY_LANGUAGE=de
       - PRIVACY_LOG_DETECTIONS=false
-      # 16-core host: 4 uvicorn workers x 4 Docling threads -> uses all cores under load
-      - UVICORN_WORKERS=2
+      # ONE worker process: each uvicorn worker holds its own copy of the Flair
+      # XLM-R-large stack (~5.5-7GB warm, growing). With 2 workers the combined
+      # baseline (~12.6GB observed) left so little of the 16G cgroup that one
+      # large smart-anonymize request (>10GB peak RSS) got OOM-killed
+      # mid-request (dmesg 2026-07-03 09:39:48Z; 15 worker deaths on 2026-07-02
+      # alone) — callers saw "Server disconnected". Concurrency inside the
+      # process stays: Presidio thread pool + DOCLING_THREADS release the GIL.
+      - UVICORN_WORKERS=1
       - DOCLING_THREADS=4
-      # Smart-anonymize self-calls back to workers via nginx
+      # Used by the PDF-conversion adapter (markdown prompt self-call via nginx)
       - BRIDGE_SELF_URL=http://nginx:80/v1/chat/completions
       - API_KEY=${API_KEY:-}
       - CONVERTAPI_SECRET=${CONVERTAPI_SECRET}

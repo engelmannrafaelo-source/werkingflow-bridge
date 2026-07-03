@@ -61,6 +61,51 @@ class FlairRecognizer(EntityRecognizer):
             logger.info("Flair model loaded")
         return FlairRecognizer._shared_model
 
+    # Memory guard rails (OOM root-cause, 2026-07-03): a single predict() over
+    # ALL sentences of a document let peak memory scale with document size —
+    # a ~12K-char report spiked one uvicorn worker to >10GB anon-RSS and the
+    # 16G container cgroup OOM-killed it mid-request (dmesg 09:39:48Z), which
+    # the caller saw as "Server disconnected without sending a response".
+    # Two bounds make the peak independent of document size:
+    #   - WINDOW_CHARS: the text is pre-split into windows at paragraph/newline
+    #     boundaries before sentence splitting, so segtok can never hand the
+    #     model one giant pseudo-sentence (markdown tables!) and each predict()
+    #     sees a bounded amount of text.
+    #   - MINI_BATCH: transformer memory grows with batch_size × seq_len², so
+    #     predictions run in small mini-batches instead of Flair's default 32.
+    WINDOW_CHARS = 6000
+    MINI_BATCH = 4
+
+    @classmethod
+    def _split_windows(cls, text: str) -> List[tuple]:
+        """Split text into ≤WINDOW_CHARS windows at paragraph/newline boundaries.
+
+        Returns (char_offset, window_text) tuples covering the full input.
+        Boundary preference: blank line, then newline, then hard cut — a hard
+        cut can split a sentence (worst case: one entity straddling the cut is
+        missed), which is acceptable; process death is not.
+        """
+        windows = []
+        pos = 0
+        n = len(text)
+        while pos < n:
+            if n - pos <= cls.WINDOW_CHARS:
+                windows.append((pos, text[pos:]))
+                break
+            cut_zone = text[pos:pos + cls.WINDOW_CHARS]
+            half = cls.WINDOW_CHARS // 2
+            para = cut_zone.rfind("\n\n")
+            line = cut_zone.rfind("\n")
+            if para >= half:
+                cut = para + 2  # separator stays with the current window
+            elif line >= half:
+                cut = line + 1
+            else:
+                cut = cls.WINDOW_CHARS
+            windows.append((pos, text[pos:pos + cut]))
+            pos += cut
+        return windows
+
     def analyze(
         self, text: str, entities: List[str], nlp_artifacts: NlpArtifacts = None
     ) -> List[RecognizerResult]:
@@ -68,26 +113,29 @@ class FlairRecognizer(EntityRecognizer):
 
         model = self._get_model()
         splitter = SegtokSentenceSplitter()
-        sentences = splitter.split(text)
-        if not sentences:
-            return []
-        model.predict(sentences)
 
         results: List[RecognizerResult] = []
-        for sentence in sentences:
-            base = sentence.start_position  # char offset of this sentence in `text`
-            for span in sentence.get_spans("ner"):
-                mapped = self.LABEL_TO_ENTITY.get(span.tag)
-                if mapped is None:
-                    continue  # MISC and anything else → ignored (no over-detection)
-                if entities and mapped not in entities:
-                    continue
-                results.append(
-                    RecognizerResult(
-                        entity_type=mapped,
-                        start=base + span.start_position,
-                        end=base + span.end_position,
-                        score=span.score,
+        for window_offset, window_text in self._split_windows(text):
+            sentences = splitter.split(window_text)
+            if not sentences:
+                continue
+            model.predict(sentences, mini_batch_size=self.MINI_BATCH)
+
+            for sentence in sentences:
+                # char offset of this sentence in `text` = window offset + offset in window
+                base = window_offset + sentence.start_position
+                for span in sentence.get_spans("ner"):
+                    mapped = self.LABEL_TO_ENTITY.get(span.tag)
+                    if mapped is None:
+                        continue  # MISC and anything else → ignored (no over-detection)
+                    if entities and mapped not in entities:
+                        continue
+                    results.append(
+                        RecognizerResult(
+                            entity_type=mapped,
+                            start=base + span.start_position,
+                            end=base + span.end_position,
+                            score=span.score,
+                        )
                     )
-                )
         return results
