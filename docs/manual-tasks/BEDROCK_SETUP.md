@@ -133,7 +133,7 @@ curl -sS -X POST "$AI_BRIDGE_URL/v1/metrics/bedrock-reconciliation/run" \
 ## Checkliste
 
 - [ ] **Anthropic-Use-Case-Formular + Model Access granted (eu-central-1, EU-Inference-Profile) ← EINZIGER offener Rafael-Schritt**
-- [x] IAM-User existiert („AI-Reporter-Backend") — ⚠ CloudWatch-Read-Policy (GetMetricStatistics/ListMetrics) noch verifizieren, braucht die Reconciliation
+- [ ] IAM-User „AI-Reporter-Backend": **CloudWatch-Read-Policy anhängen** (GetMetricStatistics + ListMetrics, Policy-JSON oben) — live verifiziert FEHLEND 03.07: `AccessDenied ... not authorized to perform: cloudwatch:ListMetrics` (Worker-Log, Reconciliation-Loop). Invoke-Rechte für Bedrock selbst sind vorhanden.
 - [ ] Model Invocation Logging an (empfohlen, nicht blockierend)
 - [x] Keys in `secrets/platform.env` (beide Bridge-Server) + Infisical `dev-server` (03.07)
 - [x] Worker-Log: „Bedrock credentials configured" (Hetzner; server-2 nach nächstem Worker-Recreate)
