@@ -1156,11 +1156,17 @@ async def list_app_licenses(
 # Tenant stammdaten — Firmen-Identität (Bridge validiert Schema)
 #
 # GET:   any tenant member or operator
-# PATCH: tenant_admin role (or operator) — verhindert dass normaler Mitarbeiter
-#        Firmenadresse/Logo für alle ändert.
+# PATCH: tenant-admin-equivalent role (or operator) — verhindert dass normaler
+#        Mitarbeiter (role 'member'/'user') Firmenadresse/Logo für alle ändert.
+#
+# 'owner' MUSS enthalten sein: Self-Service-Registrierung (identity/routes.py)
+# vergibt jedem selbst-registrierten Tenant-Chef die Rolle 'owner' — ohne owner
+# hier wäre JEDER Selbst-Signup von der Firmen-Stammdaten-Bearbeitung ausgesperrt
+# (403), obwohl das FE (isTenantAdmin) ihn als Admin behandelt. Diese Allowlist
+# ist die Bridge-Seite des FE↔Bridge-Rollen-Contracts (role_admin_contract).
 # ---------------------------------------------------------------------------
 
-_TENANT_ADMIN_ROLES = frozenset({"tenant_admin", "admin", "super_admin"})
+_TENANT_ADMIN_ROLES = frozenset({"owner", "tenant_admin", "admin", "super_admin"})
 
 
 async def _check_tenant_admin_role(claims: AuthClaims, tenant_id: str, conn: Any) -> None:
