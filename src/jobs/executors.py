@@ -34,8 +34,18 @@ CHAT_SELF_CALL_TIMEOUT_S = float(os.getenv("BRIDGE_CHAT_JOB_TIMEOUT_S", "600"))
 # to ~40 min. The heartbeat keeps the job row alive for the whole run.
 RESEARCH_SELF_CALL_TIMEOUT_S = float(os.getenv("BRIDGE_RESEARCH_JOB_TIMEOUT_S", "2400"))
 
-# Generic JSON proxy self-call timeout (smart-anonymize etc. — short).
+# Generic JSON proxy self-call timeout (default for allowlisted paths — short).
 PROXY_SELF_CALL_TIMEOUT_S = float(os.getenv("BRIDGE_PROXY_JOB_TIMEOUT_S", "300"))
+
+# Per-path overrides where the target endpoint's own internal budget exceeds the
+# generic default. Timeout-chain invariant: the executor's self-call must sit
+# ABOVE the target endpoint's internal budget so the endpoint's own (specific)
+# error surfaces before the executor cuts the connection. /v1/privacy/smart-
+# anonymize grants the privacy service 1200s (main.py) → 1260s here; nginx
+# allows 2500s above both.
+PROXY_PATH_TIMEOUTS_S: Dict[str, float] = {
+    "/v1/privacy/smart-anonymize": float(os.getenv("BRIDGE_ANONYMIZE_JOB_TIMEOUT_S", "1260")),
+}
 
 # HTML→PDF render self-call timeout — matches the 600s the sync
 # /v1/convert-html-to-pdf endpoint already grants the Chromium render.
@@ -230,4 +240,5 @@ async def proxy_executor(
     if not isinstance(body, dict):
         raise RuntimeError("proxy 'body' must be a JSON object")
     await report_progress({"phase": "proxy", "path": path})
-    return await _self_post_json(path, body, attribution, PROXY_SELF_CALL_TIMEOUT_S)
+    timeout_s = PROXY_PATH_TIMEOUTS_S.get(path, PROXY_SELF_CALL_TIMEOUT_S)
+    return await _self_post_json(path, body, attribution, timeout_s)
