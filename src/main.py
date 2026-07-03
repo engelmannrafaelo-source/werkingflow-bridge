@@ -1209,6 +1209,42 @@ async def generate_streaming_response(
                 yield "data: [DONE]\n\n"
 
                 logger.info("✅ Vision streaming completed")
+
+                # Ledger write — vision previously returned here WITHOUT any
+                # usage_events row: the prepaid-key spend was invisible to
+                # billing and only reconstructable from the Anthropic console.
+                try:
+                    _vision_attr = (
+                        extract_attribution_context(fastapi_request)
+                        if fastapi_request else {}
+                    )
+                    _vision_images = sum(
+                        1 for msg in request.messages
+                        if hasattr(msg, 'has_images') and msg.has_images()
+                    )
+                    from src.activity.ai_call_writer import persist_ai_call_activity
+                    await persist_ai_call_activity(
+                        app_id=_vision_attr.get("app_id"),
+                        user_id=_vision_attr.get("user_id"),
+                        agent_id=_vision_attr.get("agent_id"),
+                        workflow_id=_vision_attr.get("workflow_id"),
+                        model=vision_result.model,
+                        input_tokens=vision_result.usage["prompt_tokens"],
+                        output_tokens=vision_result.usage["completion_tokens"],
+                        status="success",
+                        duration_ms=int((time.time() - stream_start_time) * 1000),
+                        app_env=_vision_attr.get("app_env"),
+                        provider_meta={
+                            "usage_source": "api",
+                            "endpoint": "vision",
+                            "api_key_lane": "vision_prepaid",
+                            "image_count": _vision_images,
+                        },
+                    )
+                except Exception as _vision_track_err:
+                    logger.warning(
+                        f"⚠️ Vision streaming usage tracking failed (non-fatal): {_vision_track_err}"
+                    )
                 return
 
             except Exception as e:
@@ -2467,6 +2503,36 @@ async def chat_completions(
                             latency_ms=int(duration * 1000),
                             status="success",
                             **attribution
+                        )
+
+                    # Ledger write — vision previously returned here WITHOUT
+                    # any usage_events row (only the legacy tenant tracker
+                    # above, a no-op without Supabase): the prepaid-key spend
+                    # was invisible to billing and budget deduction.
+                    try:
+                        _vision_attr = extract_attribution_context(request)
+                        from src.activity.ai_call_writer import persist_ai_call_activity
+                        await persist_ai_call_activity(
+                            app_id=_vision_attr.get("app_id"),
+                            user_id=_vision_attr.get("user_id"),
+                            agent_id=_vision_attr.get("agent_id"),
+                            workflow_id=_vision_attr.get("workflow_id"),
+                            model=vision_result.model,
+                            input_tokens=vision_result.usage["prompt_tokens"],
+                            output_tokens=vision_result.usage["completion_tokens"],
+                            status="success",
+                            duration_ms=int(duration * 1000),
+                            app_env=_vision_attr.get("app_env"),
+                            provider_meta={
+                                "usage_source": "api",
+                                "endpoint": "vision",
+                                "api_key_lane": "vision_prepaid",
+                                "image_count": image_count,
+                            },
+                        )
+                    except Exception as _vision_track_err:
+                        logger.warning(
+                            f"⚠️ Vision usage tracking failed (non-fatal): {_vision_track_err}"
                         )
 
                     return response
