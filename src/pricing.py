@@ -56,6 +56,22 @@ def load_pricing() -> dict[str, dict[str, float]]:
     return pricing
 
 
+def normalize_model_id(model: str) -> str:
+    """Map provider-specific model IDs onto the Anthropic IDs this table uses.
+
+    Bedrock IDs ('eu.anthropic.claude-sonnet-4-5-20250929-v1:0') carry the
+    same list price as their Anthropic counterpart — normalising here keeps
+    Bedrock out of the price table and pricing in one ID space.
+    """
+    if ".anthropic." in model or model.startswith("anthropic."):
+        from src.model_registry import from_bedrock_model_id
+        try:
+            return from_bedrock_model_id(model)
+        except ValueError:
+            return model
+    return model
+
+
 def cost_eur(model: str | None, input_tokens: int, output_tokens: int) -> float:
     """
     EUR cost of one LLM call. Unknown / missing model → 0.0; the caller
@@ -64,7 +80,7 @@ def cost_eur(model: str | None, input_tokens: int, output_tokens: int) -> float:
     """
     if not model:
         return 0.0
-    p = load_pricing().get(model)
+    p = load_pricing().get(normalize_model_id(model))
     if p is None:
         return 0.0
     usd = (

@@ -219,6 +219,10 @@ async def call_bedrock(
             body=json.dumps(body)
         )
 
+        # AWS request ID — the join key between our usage_events row and the
+        # AWS invocation log entry (1:1 billing reconciliation).
+        aws_request_id = (response.get("ResponseMetadata") or {}).get("RequestId")
+
         response_body = json.loads(response["body"].read())
 
         # Extract response content
@@ -256,7 +260,8 @@ async def call_bedrock(
                     BackendType.BEDROCK,
                     actual_region
                 ),
-                model_id_used=bedrock_model_id
+                model_id_used=bedrock_model_id,
+                aws_request_id=aws_request_id
             )
         )
 
@@ -267,9 +272,20 @@ async def call_bedrock(
 
 async def stream_bedrock(
     request: ChatCompletionRequest,
-    region: Optional[str] = None
+    region: Optional[str] = None,
+    usage_sink: Optional[Dict[str, Any]] = None
 ) -> AsyncGenerator[str, None]:
-    """Stream response from Bedrock API."""
+    """Stream response from Bedrock API.
+
+    usage_sink: caller-owned dict, filled while streaming so usage tracking
+        survives the generator: input_tokens (message_start), output_tokens
+        (message_delta, cumulative), bedrock_model_id, region, aws_request_id,
+        and status ('success' once the stream finished, 'error' otherwise).
+        Without it, streamed Bedrock usage would be untrackable = unbillable.
+    """
+    if usage_sink is None:
+        usage_sink = {}
+    usage_sink.setdefault("status", "error")  # flipped to success at stream end
 
     try:
         client = get_bedrock_client()
@@ -286,11 +302,13 @@ async def stream_bedrock(
     # Determine region first (needed for model ID)
     actual_region = region or request.bedrock_region or client.default_region
     bedrock_model_id = to_bedrock_model_id(resolved_model, actual_region)
+    usage_sink["bedrock_model_id"] = bedrock_model_id
+    usage_sink["region"] = actual_region
 
     # Convert messages
     system_prompt, messages = convert_messages_to_anthropic(request.messages)
 
-    # Build request body
+    # Build request body (same parameter surface as the non-streaming path)
     body = {
         "anthropic_version": "bedrock-2023-05-31",
         "messages": messages,
@@ -299,6 +317,15 @@ async def stream_bedrock(
 
     if system_prompt:
         body["system"] = system_prompt
+
+    if request.temperature is not None and request.temperature != 1.0:
+        body["temperature"] = request.temperature
+
+    if request.top_p is not None and request.top_p != 1.0:
+        body["top_p"] = request.top_p
+
+    if request.stop:
+        body["stop_sequences"] = request.stop if isinstance(request.stop, list) else [request.stop]
 
     logger.info(f"Streaming from Bedrock: model={bedrock_model_id}, region={actual_region}")
 
@@ -313,8 +340,22 @@ async def stream_bedrock(
             body=json.dumps(body)
         )
 
+        usage_sink["aws_request_id"] = (response.get("ResponseMetadata") or {}).get("RequestId")
+
         for event in response["body"]:
             chunk = json.loads(event["chunk"]["bytes"])
+
+            if chunk.get("type") == "message_start":
+                # Input tokens are only reported here.
+                _msg_usage = (chunk.get("message") or {}).get("usage") or {}
+                if "input_tokens" in _msg_usage:
+                    usage_sink["input_tokens"] = _msg_usage["input_tokens"]
+
+            elif chunk.get("type") == "message_delta":
+                # Cumulative output token count — the last delta wins.
+                _delta_usage = chunk.get("usage") or {}
+                if "output_tokens" in _delta_usage:
+                    usage_sink["output_tokens"] = _delta_usage["output_tokens"]
 
             if chunk.get("type") == "content_block_delta":
                 delta_text = chunk.get("delta", {}).get("text", "")
@@ -347,6 +388,7 @@ async def stream_bedrock(
                 )
                 yield f"data: {stream_response.model_dump_json()}\n\n"
 
+        usage_sink["status"] = "success"
         yield "data: [DONE]\n\n"
 
     except Exception as e:

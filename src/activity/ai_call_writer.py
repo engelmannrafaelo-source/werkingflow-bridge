@@ -157,6 +157,8 @@ async def persist_ai_call_activity(
     duration_ms: int,
     error_code: Optional[str] = None,
     app_env: Optional[str] = None,
+    provider: str = "anthropic",
+    provider_meta: Optional[dict] = None,
 ) -> None:
     """
     Write one ai-call activity row. Never raises — tracking is best-effort.
@@ -166,6 +168,12 @@ async def persist_ai_call_activity(
         call came from, or None when the app sent no X-App-Env header. The
         caller normalises it (extract_attribution_context); we just persist
         it. Drives the Platform Admin "mode" filter.
+    provider: which backend served the call ('anthropic' | 'bedrock' | ...).
+        Drives usage_events.provider — the reconciliation against the
+        provider's own billing (e.g. CloudWatch token counts) keys on it.
+    provider_meta: extra provider facts merged into provider_metadata
+        (e.g. bedrock_model_id, region, aws_request_id for call-level joins
+        with AWS invocation logs).
     """
     # Cost from the pricing SSoT. Error calls cost nothing (0.0) — only a
     # successful completion consumes budget.
@@ -351,10 +359,10 @@ async def persist_ai_call_activity(
                 ) VALUES (
                     'workflow',
                     $1, $2,
-                    $3, $4::app_env, $5, 'anthropic',
-                    $6, $7,
-                    $8::billing_mode_enum, $9, $10, $11,
-                    $12::jsonb
+                    $3, $4::app_env, $5, $6,
+                    $7, $8,
+                    $9::billing_mode_enum, $10, $11, $12,
+                    $13::jsonb
                 )
                 """,
                 actor_uuid,
@@ -362,6 +370,7 @@ async def persist_ai_call_activity(
                 app_id,
                 app_env,
                 model,
+                provider,
                 input_tokens or 0,
                 output_tokens or 0,
                 bm_enum,
@@ -374,6 +383,7 @@ async def persist_ai_call_activity(
                     "workflow_id": workflow_id,
                     "status": status,
                     **({"anonymous_reason": anon_reason} if anon_reason is not None else {}),
+                    **(provider_meta or {}),
                 }),
             )
     except Exception as e:  # noqa: BLE001 — tracking must never break the call

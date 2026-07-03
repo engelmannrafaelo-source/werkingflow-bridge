@@ -227,6 +227,10 @@ class BackendInfo(BaseModel):
     region: Optional[str] = Field(default=None, description="AWS region (only for Bedrock)")
     privacy_applied: bool = Field(description="Whether PII anonymization was applied")
     model_id_used: str = Field(description="Actual model ID sent to backend")
+    aws_request_id: Optional[str] = Field(
+        default=None,
+        description="AWS request ID (Bedrock only) — joins usage_events rows with AWS invocation logs for 1:1 billing reconciliation"
+    )
 
 
 class ChatCompletionResponse(BaseModel):

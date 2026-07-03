@@ -2128,9 +2128,60 @@ async def chat_completions(
             from src.bedrock_service import call_bedrock, stream_bedrock
             logger.info(f"🔀 Routing to Bedrock (region={backend_config.region})")
 
+            from src.activity.ai_call_writer import persist_ai_call_activity
+            bedrock_attribution = extract_attribution_context(request)
+
+            async def _persist_bedrock_usage(
+                *, input_tokens: int, output_tokens: int, status: str,
+                duration_ms: int, provider_meta: dict, error_code: Optional[str] = None,
+            ) -> None:
+                """Bedrock calls bill through the SAME ledger as every other
+                call (usage_events + budget deduction) — provider='bedrock'
+                plus AWS request id enable the 1:1 reconciliation against
+                AWS invocation logs / CloudWatch token counts."""
+                await persist_ai_call_activity(
+                    app_id=bedrock_attribution.get("app_id"),
+                    user_id=bedrock_attribution.get("user_id"),
+                    agent_id=bedrock_attribution.get("agent_id"),
+                    workflow_id=bedrock_attribution.get("workflow_id"),
+                    model=resolved_model,
+                    input_tokens=input_tokens,
+                    output_tokens=output_tokens,
+                    status=status,
+                    duration_ms=duration_ms,
+                    error_code=error_code,
+                    app_env=bedrock_attribution.get("app_env"),
+                    provider="bedrock",
+                    provider_meta=provider_meta,
+                )
+
             if request_body.stream:
+                bedrock_usage_sink: Dict[str, Any] = {}
+
+                async def _tracked_bedrock_stream():
+                    async for chunk in stream_bedrock(
+                        request_body, backend_config.region, usage_sink=bedrock_usage_sink
+                    ):
+                        yield chunk
+                    # Stream drained — persist whatever usage the sink caught.
+                    # A stream that died before message_delta bills 0 output
+                    # tokens with status=error (visible in the ledger, and the
+                    # reconciliation flags any AWS-side count we missed).
+                    await _persist_bedrock_usage(
+                        input_tokens=bedrock_usage_sink.get("input_tokens", 0),
+                        output_tokens=bedrock_usage_sink.get("output_tokens", 0),
+                        status=bedrock_usage_sink.get("status", "error"),
+                        duration_ms=int((time.time() - start_time) * 1000),
+                        error_code=None if bedrock_usage_sink.get("status") == "success" else "stream_aborted",
+                        provider_meta={
+                            "bedrock_model_id": bedrock_usage_sink.get("bedrock_model_id"),
+                            "region": bedrock_usage_sink.get("region"),
+                            "aws_request_id": bedrock_usage_sink.get("aws_request_id"),
+                        },
+                    )
+
                 return StreamingResponse(
-                    stream_bedrock(request_body, backend_config.region),
+                    _tracked_bedrock_stream(),
                     media_type="text/event-stream",
                     headers={
                         "Cache-Control": "no-cache",
@@ -2140,24 +2191,37 @@ async def chat_completions(
                     }
                 )
             else:
-                response = await call_bedrock(request_body, backend_config.region)
+                try:
+                    response = await call_bedrock(request_body, backend_config.region)
+                except HTTPException as bedrock_err:
+                    await _persist_bedrock_usage(
+                        input_tokens=0, output_tokens=0, status="error",
+                        duration_ms=int((time.time() - start_time) * 1000),
+                        error_code=str(bedrock_err.status_code),
+                        provider_meta={
+                            "bedrock_model_id": backend_config.bedrock_model_id,
+                            "region": backend_config.region,
+                        },
+                    )
+                    raise
+
                 duration = time.time() - start_time
                 logger.info(f"✅ Bedrock request completed in {duration:.2f}s")
 
-                # Track usage for Bedrock (non-streaming)
-                if tenant and response.usage:
-                    from src.tenant import track_request_usage
-                    attribution = extract_attribution_context(request)
-                    await track_request_usage(
-                        tenant=tenant,
-                        model=resolved_model,
-                        input_tokens=response.usage.prompt_tokens,
-                        output_tokens=response.usage.completion_tokens,
-                        endpoint="/v1/chat/completions",
-                        latency_ms=int(duration * 1000),
-                        status="success",
-                        **attribution
-                    )
+                await _persist_bedrock_usage(
+                    input_tokens=response.usage.prompt_tokens if response.usage else 0,
+                    output_tokens=response.usage.completion_tokens if response.usage else 0,
+                    status="success",
+                    duration_ms=int(duration * 1000),
+                    provider_meta={
+                        "bedrock_model_id": backend_config.bedrock_model_id,
+                        "region": backend_config.region,
+                        "aws_request_id": (
+                            response.x_backend_info.aws_request_id
+                            if response.x_backend_info else None
+                        ),
+                    },
+                )
 
                 return response
 
