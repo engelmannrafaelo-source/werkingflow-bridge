@@ -13,6 +13,7 @@ from datetime import datetime
 from typing import List, Dict, Any, Optional, AsyncGenerator
 
 import boto3
+from botocore.exceptions import ClientError
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
@@ -27,6 +28,24 @@ from src.model_registry import resolve_model, to_bedrock_model_id
 from src.routing.backend_router import _resolve_privacy_mode
 
 logger = get_logger(__name__)
+
+# AWS error codes that are identical on every worker (account/IAM/model-access
+# misconfiguration). Raised as 424 so nginx does NOT cross-worker-retry and
+# mask the real cause as "capacity_busy" — the client must see the message.
+_BEDROCK_CONFIG_ERROR_CODES = frozenset({
+    "ResourceNotFoundException",      # model access / use-case form missing
+    "AccessDeniedException",          # IAM policy missing
+    "UnrecognizedClientException",    # bad access key
+    "InvalidSignatureException",      # bad secret key
+    "ExpiredTokenException",          # expired STS token
+})
+
+# AWS-side rate limiting — retryable, surfaced as 429.
+_BEDROCK_THROTTLE_ERROR_CODES = frozenset({
+    "ThrottlingException",
+    "TooManyRequestsException",
+    "ServiceQuotaExceededException",
+})
 
 
 def _map_bedrock_stop_reason(bedrock_reason: Optional[str]) -> str:
@@ -265,6 +284,17 @@ async def call_bedrock(
             )
         )
 
+    except ClientError as e:
+        code = (e.response.get("Error") or {}).get("Code", "")
+        detail = f"Bedrock API error ({code or 'unknown'}): {e}"
+        logger.error(detail)
+        if code in _BEDROCK_CONFIG_ERROR_CODES:
+            raise HTTPException(status_code=424, detail=detail)
+        if code == "ValidationException":
+            raise HTTPException(status_code=400, detail=detail)
+        if code in _BEDROCK_THROTTLE_ERROR_CODES:
+            raise HTTPException(status_code=429, detail=detail)
+        raise HTTPException(status_code=500, detail=detail)
     except Exception as e:
         logger.error(f"Bedrock API error: {e}")
         raise HTTPException(status_code=500, detail=f"Bedrock API error: {str(e)}")
