@@ -35,6 +35,7 @@ from src.identity.password import hash_password
 from src.identity.jwt_utils import VALID_ROLES
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Response
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, EmailStr, Field
 
 from src.api_auth import require_admin, require_jwt_or_service, require_self_or_admin, AuthClaims, get_tenant_of_user
@@ -430,10 +431,21 @@ async def update_user(
 @router.delete("/v1/users/{user_id}", status_code=204, response_class=Response)
 async def delete_user(
     user_id: str,
-    _claims: AuthClaims = Depends(require_admin),
+    claims: AuthClaims = Depends(require_jwt_or_service),
 ) -> Response:
     """
-    Hard-delete a user. Admin only (admin JWT or service token without X-User-ID).
+    Operator: hard-delete. Customer self-service: GDPR anonymize (delegated).
+
+    ROUTING SHADOW — this route is registered BEFORE self_service.close_account
+    on the identical path (admin_db_router precedes self_service_router in
+    platform_main.py), so close_account is unreachable over HTTP. Until
+    2026-07-03 this handler was require_admin-only, which meant every customer
+    portal "Konto löschen" (service token WITH X-User-ID → not an operator)
+    died here with 403 and the GDPR anonymize path never ran. Non-operator
+    callers are therefore explicitly delegated to close_account below —
+    operator behaviour (hard-delete, 204/404/409) is unchanged.
+
+    Hard-delete semantics (operator: admin JWT or service token without X-User-ID):
 
     Schema cascades take care of dependent data:
       app_licenses, sessions, mollie_customers, pending_payments, user_budgets,
@@ -448,6 +460,15 @@ async def delete_user(
 
     Returns 204 on success, 404 if the user does not exist.
     """
+    if not claims.is_operator:
+        # Customer self-service (portal proxy / user JWT): GDPR Art. 17
+        # anonymize-with-retention, NOT hard-delete. Enforce the same authz the
+        # shadowed route would have applied (path user == acting user), then
+        # delegate. Deferred import: keeps module-load order independent.
+        require_self_or_admin(user_id, claims)
+        from src.identity.self_service import close_account
+        return JSONResponse(content=await close_account(user_id, claims))
+
     try:
         uid = uuid.UUID(user_id)
     except ValueError:
