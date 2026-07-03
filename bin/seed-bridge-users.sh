@@ -365,6 +365,28 @@ def _verify_user_exists(email):
             print(f"  [FAIL]  500-verify paginated past offset {off} — aborting", file=sys.stderr)
             return None
 
+def _ensure_email_verified(uid, key):
+    """Flip users.email_verified via the operator-only PATCH field.
+
+    Login hard-blocks unverified users (Bridge identity/routes.py), and seeded
+    test users have no reachable inbox to click a verification link — without
+    this flip every fresh seed produces login-blocked users (observed 2026-07-03
+    with the konto-portal users; same durability class as app-license grants).
+    Safe by construction: this seeder only processes test-credentials.json
+    identities (account_type=test tenants), never real customers.
+    """
+    try:
+        vr = requests.patch(f"${BRIDGE_URL}/v1/users/{uid}",
+                            json={'email_verified': True}, headers=headers, timeout=15)
+    except requests.RequestException as e:
+        print(f"  [FAIL]  User {key}: email_verified PATCH error — {e}", file=sys.stderr)
+        return False
+    if vr.status_code != 200:
+        print(f"  [FAIL]  User {key}: email_verified PATCH HTTP {vr.status_code} — {vr.text}",
+              file=sys.stderr)
+        return False
+    return True
+
 created = reconciled = 0
 for key, u in users.items():
     tenant_id = _canonical_tenant(u)
@@ -385,6 +407,9 @@ for key, u in users.items():
     if r.status_code == 201:
         created += 1
         print(f"  [ok]    Created: {key} ({u['email']}) → tenant={tenant_id}")
+        new_uid = (r.json() or {}).get('id')
+        if not new_uid or not _ensure_email_verified(new_uid, key):
+            ok = False
     elif r.status_code == 409:
         # User pre-exists. Reconcile password + role + tenant_id so every
         # re-seed converges to the registry's canonical identity (ADR-0006).
@@ -398,7 +423,8 @@ for key, u in users.items():
             continue
         uid = existing_entry['id']
         current_tenant = existing_entry.get('tenant_id')
-        patch_body = {'password': u.get('password'), 'role': u.get('role', 'user')}
+        patch_body = {'password': u.get('password'), 'role': u.get('role', 'user'),
+                      'email_verified': True}
         # Add tenant_id to PATCH only when it differs from the current Bridge value.
         # Avoids spurious DB writes on clean re-seeds, while still fixing stale tenants.
         if current_tenant != tenant_id:
@@ -440,6 +466,9 @@ for key, u in users.items():
             created += 1
             print(f"  [warn]  Bridge 500-but-created, known Bridge create-hook bug "
                   f"— user verified present, continuing: {key} ({u['email']}) → tenant={tenant_id}")
+            v_uid = verified.get('id') if isinstance(verified, dict) else None
+            if not v_uid or not _ensure_email_verified(v_uid, key):
+                ok = False
         else:
             print(f"  [FAIL]  User {key}: HTTP 500 and user NOT present on GET-verify "
                   f"— real failure — {r.text}", file=sys.stderr)

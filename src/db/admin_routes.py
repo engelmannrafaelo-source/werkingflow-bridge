@@ -334,6 +334,18 @@ class UserUpdateRequest(BaseModel):
             "Takes effect within the 60s routing cache TTL on all workers."
         ),
     )
+    email_verified: Optional[bool] = Field(
+        default=None,
+        description=(
+            "Admin-only. Flips users.email_verified without a verification "
+            "token. Exists for the test-user seeder: login hard-blocks "
+            "unverified users (identity/routes.py), and seeded test users "
+            "have no reachable inbox for the verification link — without this "
+            "every fresh Bridge re-seed produces login-blocked test users "
+            "(same durability class as the app-license grants). Real customer "
+            "verification MUST keep the token flow; self-callers get 403."
+        ),
+    )
 
 
 # Keep the old name as an alias so existing code referencing UserSelfUpdateRequest still works.
@@ -373,6 +385,9 @@ async def update_user(
     if body.provider_config is not None and not claims.is_operator:
         raise HTTPException(status_code=403, detail="Only admins may change provider_config")
 
+    if body.email_verified is not None and not claims.is_operator:
+        raise HTTPException(status_code=403, detail="Only admins may change email_verified")
+
     if body.role is not None and body.role not in VALID_ROLES:
         raise HTTPException(
             status_code=400,
@@ -399,7 +414,8 @@ async def update_user(
             )
 
     if (body.name is None and body.role is None and body.password is None
-            and body.tenant_id is None and body.provider_config is None):
+            and body.tenant_id is None and body.provider_config is None
+            and body.email_verified is None):
         raise HTTPException(status_code=400, detail="No fields to update")
 
     set_clauses: List[str] = ["updated_at = NOW()"]
@@ -424,6 +440,10 @@ async def update_user(
     if body.provider_config is not None:
         args.append(json.dumps(body.provider_config))
         set_clauses.append(f"provider_config = ${len(args)}::jsonb")
+
+    if body.email_verified is not None:
+        args.append(body.email_verified)
+        set_clauses.append(f"email_verified = ${len(args)}")
 
     args.append(uuid.UUID(user_id))
     where_pos = len(args)
