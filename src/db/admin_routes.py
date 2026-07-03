@@ -241,7 +241,7 @@ async def create_user(
                 """
                 INSERT INTO users (email, name, tenant_id, role, password_hash, created_at, updated_at)
                 VALUES ($1, $2, $3, $4, $5, $6, $7)
-                RETURNING id, email, name, tenant_id, role, created_at, updated_at
+                RETURNING id, email, name, tenant_id, role, provider_config, created_at, updated_at
                 """,
                 body.email,
                 body.name,
