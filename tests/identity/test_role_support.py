@@ -254,12 +254,20 @@ def _db_row(role: str = "user", name: str = "Name") -> dict:
 def _make_admin_app(auth_dep_name: str, claims: AuthClaims) -> FastAPI:
     """Create a minimal FastAPI app with admin_routes and a pre-resolved auth override."""
     from src.db.admin_routes import router as admin_router
-    from src.api_auth import require_admin, require_self_or_admin
+    from src.api_auth import require_admin, require_jwt_or_service, require_self_or_admin
 
     app = FastAPI()
     app.include_router(admin_router)
 
-    dep = require_admin if auth_dep_name == "require_admin" else require_self_or_admin
+    deps = {
+        "require_admin": require_admin,
+        # delete_user authorizes via require_jwt_or_service + an explicit
+        # is_operator branch (operator → hard-delete, customer → GDPR
+        # anonymize delegation) since 2026-07-03 — overriding require_admin
+        # no longer reaches it.
+        "require_jwt_or_service": require_jwt_or_service,
+    }
+    dep = deps.get(auth_dep_name, require_self_or_admin)
     app.dependency_overrides[dep] = lambda: claims
     return app
 
@@ -509,7 +517,7 @@ class TestAdminDeleteUser:
         uid = str(uuid.uuid4())
         pool, conn = _delete_pool(execute_return="DELETE 1")
 
-        app = _make_admin_app("require_admin", _operator_claims())
+        app = _make_admin_app("require_jwt_or_service", _operator_claims())
         client = TestClient(app)
 
         with patch("src.db.admin_routes.get_pool", return_value=pool):
@@ -523,7 +531,7 @@ class TestAdminDeleteUser:
         uid = str(uuid.uuid4())
         pool, _ = _delete_pool(execute_return="DELETE 0")
 
-        app = _make_admin_app("require_admin", _operator_claims())
+        app = _make_admin_app("require_jwt_or_service", _operator_claims())
         client = TestClient(app)
 
         with patch("src.db.admin_routes.get_pool", return_value=pool):
@@ -532,7 +540,7 @@ class TestAdminDeleteUser:
         assert resp.status_code == 404
 
     def test_invalid_uuid_returns_400(self):
-        app = _make_admin_app("require_admin", _operator_claims())
+        app = _make_admin_app("require_jwt_or_service", _operator_claims())
         client = TestClient(app)
 
         resp = client.delete("/v1/users/not-a-uuid")
@@ -548,7 +556,7 @@ class TestAdminDeleteUser:
         )
         pool, _ = _delete_pool(execute_raises=fk_err)
 
-        app = _make_admin_app("require_admin", _operator_claims())
+        app = _make_admin_app("require_jwt_or_service", _operator_claims())
         client = TestClient(app)
 
         with patch("src.db.admin_routes.get_pool", return_value=pool):

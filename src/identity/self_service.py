@@ -82,13 +82,21 @@ async def change_password(
 
 
 # ---------------------------------------------------------------------------
-# DELETE /v1/users/{user_id} — GDPR Art. 17 anonymization-with-retention
+# close_account — GDPR Art. 17 anonymization-with-retention
+#
+# NOT a route. Reached via DELETE /v1/users/{user_id} in db/admin_routes
+# (delete_user), which delegates every non-operator caller here after its
+# require_self_or_admin check. It used to carry its own @router.delete on the
+# identical path — permanently shadowed (admin_db_router registers before
+# self_service_router in platform_main), i.e. dead code that four green
+# isolation tests "covered" while every real portal call 403'd in the shadow
+# handler. One path, one handler: decorator removed 2026-07-03;
+# tests/test_route_shadowing.py keeps the route table shadow-free.
 # ---------------------------------------------------------------------------
 
-@router.delete("/v1/users/{user_id}")
 async def close_account(
     user_id: str,
-    claims: AuthClaims = Depends(require_self_or_admin),
+    claims: AuthClaims,
 ) -> Dict[str, Any]:
     """
     GDPR Art. 17 — right to erasure via anonymization-with-retention.

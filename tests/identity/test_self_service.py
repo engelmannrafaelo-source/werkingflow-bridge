@@ -37,6 +37,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from src.config import config
+from src.db.admin_routes import router as admin_db_router
 from src.identity.self_service import router
 from src.identity.password import hash_password
 from src.identity.jwt_utils import sign_jwt
@@ -48,7 +49,16 @@ from src.identity.jwt_utils import sign_jwt
 
 @pytest.fixture(scope="module")
 def app() -> FastAPI:
+    # Mirror the PRODUCTION composition (platform_main.py): admin_db_router is
+    # registered BEFORE self_service_router. This matters: DELETE
+    # /v1/users/{user_id} lives in admin_routes (delete_user) and delegates
+    # non-operator callers to close_account. Mounting the self_service router
+    # alone (as this fixture did until 2026-07-03) tested a composition that
+    # never existed in production — close_account's own route was shadowed and
+    # unreachable, yet its isolation tests were green while every real portal
+    # "Konto löschen" died with 403 in the shadow handler.
     _app = FastAPI()
+    _app.include_router(admin_db_router)
     _app.include_router(router)
     return _app
 
@@ -374,23 +384,50 @@ class TestCloseAccount:
 
         assert resp.status_code == 404
 
-    def test_operator_can_close_any_account(self, client: TestClient):
+    def test_operator_delete_is_hard_delete(self, client: TestClient):
+        # Operator (service token WITHOUT X-User-ID) on DELETE /v1/users/{id}
+        # takes the HARD-DELETE branch in admin_routes.delete_user — it never
+        # reaches close_account. The previous version of this test
+        # ("operator_can_close_any_account") asserted the operator got the
+        # anonymize path — true only in the isolated single-router fixture,
+        # never in production. Composition semantics: operator → hard-delete
+        # (204/404/409), non-operator → GDPR anonymize via delegation.
         uid = uuid.uuid4()
-        user_row = {"id": uid, "anonymized_at": None}
-        pool, conn = _mock_pool_multi(
-            user_row,
-            fetchval_side_effect=[0, 0, 0, 0],
-        )
+        conn = AsyncMock()
+        conn.execute = AsyncMock(return_value="DELETE 1")
+        acquire_cm = MagicMock()
+        acquire_cm.__aenter__ = AsyncMock(return_value=conn)
+        acquire_cm.__aexit__ = AsyncMock(return_value=False)
+        pool = MagicMock()
+        pool.acquire = MagicMock(return_value=acquire_cm)
 
-        with patch("src.identity.self_service.get_pool", return_value=pool):
+        with patch("src.db.admin_routes.get_pool", return_value=pool):
             resp = client.delete(
                 f"/v1/users/{uid}",
                 headers=_SERVICE_HEADER,
             )
 
+        assert resp.status_code == 204
+        sql = conn.execute.call_args_list[0][0][0]
+        assert "DELETE FROM users" in sql
+
+    def test_scoped_service_token_delegates_to_anonymize(self, client: TestClient):
+        # Service token WITH X-User-ID (the portal proxy's credential shape) is
+        # NOT an operator — delete_user must delegate to close_account (GDPR
+        # anonymize). THIS is the exact call shape that returned 403 for every
+        # portal customer until 2026-07-03 (require_admin on the shadow route).
+        uid = uuid.uuid4()
+        ts = datetime.now(timezone.utc)
+        pool, conn = _mock_pool(fetchrow_result={"id": uid, "anonymized_at": ts})
+
+        with patch("src.identity.self_service.get_pool", return_value=pool):
+            resp = client.delete(
+                f"/v1/users/{uid}",
+                headers={**_SERVICE_HEADER, "X-User-ID": str(uid)},
+            )
+
         assert resp.status_code == 200
-        body = resp.json()
-        assert body["userId"] == str(uid)
+        assert resp.json()["alreadyAnonymized"] is True
 
 
 # ---------------------------------------------------------------------------

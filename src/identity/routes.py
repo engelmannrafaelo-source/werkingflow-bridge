@@ -130,7 +130,12 @@ class LoginRequest(BaseModel):
 # password against this dummy hash, so the response time matches the known-user
 # path. Without it, login leaks email existence via timing (~317ms known +
 # bcrypt vs ~39ms unknown fast-reject) → account enumeration.
-_DUMMY_PASSWORD_HASH = hash_password("\x00-no-such-user-constant-time-dummy")
+# NO NUL bytes in the literal: bcrypt >= 4.1 raises ValueError on NUL at
+# hashpw() time, and this line runs at IMPORT — a NUL here is a boot bomb that
+# detonates on the next bcrypt upgrade (platform-api would not start). The
+# literal's content is security-irrelevant: login rejects whenever stored_hash
+# is None regardless of the dummy comparison result.
+_DUMMY_PASSWORD_HASH = hash_password("no-such-user-constant-time-dummy")
 
 
 @router.post("/login")
