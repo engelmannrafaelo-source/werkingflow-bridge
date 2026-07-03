@@ -345,3 +345,69 @@ async def usage_timeseries(
         "series": sorted(series.values(), key=lambda x: x["bucket"]),
         "usdToEurRate": eur_rate,
     }
+
+
+# =============================================================================
+# Bedrock 1:1 reconciliation — our ledger vs. AWS CloudWatch token counts
+# =============================================================================
+
+@router.get("/bedrock-reconciliation")
+async def get_bedrock_reconciliation(
+    days: int = Query(default=30, ge=1, le=365),
+    claims: AuthClaims = Depends(require_admin),
+) -> Dict[str, Any]:
+    """Daily reconciliation rows (newest first). status != 'ok' needs eyes:
+    'drift' = token counts diverge beyond tolerance, 'aws_unavailable' =
+    bridge sums stored but unverified against AWS."""
+    pool = get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT day, bedrock_model_id, region,
+                   bridge_calls, bridge_input_tokens, bridge_output_tokens,
+                   aws_input_tokens, aws_output_tokens,
+                   input_diff_pct, output_diff_pct,
+                   status, detail, checked_at
+            FROM bedrock_reconciliation
+            WHERE day >= (CURRENT_DATE - $1::int)
+            ORDER BY day DESC, bedrock_model_id, region
+            """,
+            days,
+        )
+    items = [
+        {
+            "day": r["day"].isoformat(),
+            "bedrockModelId": r["bedrock_model_id"],
+            "region": r["region"],
+            "bridgeCalls": r["bridge_calls"],
+            "bridgeInputTokens": r["bridge_input_tokens"],
+            "bridgeOutputTokens": r["bridge_output_tokens"],
+            "awsInputTokens": r["aws_input_tokens"],
+            "awsOutputTokens": r["aws_output_tokens"],
+            "inputDiffPct": r["input_diff_pct"],
+            "outputDiffPct": r["output_diff_pct"],
+            "status": r["status"],
+            "detail": r["detail"],
+            "checkedAt": r["checked_at"].isoformat(),
+        }
+        for r in rows
+    ]
+    not_ok = sum(1 for i in items if i["status"] != "ok")
+    return {"days": days, "notOkCount": not_ok, "items": items}
+
+
+@router.post("/bedrock-reconciliation/run")
+async def run_bedrock_reconciliation(
+    day: Optional[str] = Query(default=None, description="UTC day YYYY-MM-DD, default: yesterday"),
+    claims: AuthClaims = Depends(require_admin),
+) -> Dict[str, Any]:
+    """Manually (re-)reconcile one day — e.g. to verify a fresh AWS invoice."""
+    from datetime import date as _date
+    from src.reconciliation import reconcile_bedrock_day
+
+    target = _date.fromisoformat(day) if day else None
+    try:
+        results = await reconcile_bedrock_day(target)
+    except RuntimeError as e:
+        raise HTTPException(status_code=503, detail=str(e))
+    return {"day": day or "yesterday", "items": results}

@@ -562,6 +562,14 @@ async def lifespan(app: FastAPI):
     except Exception as _e:
         logger.error(f"Failed to start trial-warning loop: {_e}")
 
+    # Bedrock 1:1 billing reconciliation — periodic ledger-vs-CloudWatch check.
+    # Self-disables (with an info log) when DB or AWS credentials are absent.
+    try:
+        from src.reconciliation import bedrock_reconciliation_loop
+        asyncio.create_task(bedrock_reconciliation_loop())
+    except Exception as _e:
+        logger.error(f"Failed to start bedrock reconciliation loop: {_e}")
+
     # Initialize adaptive token-budget limiter and start its background tune loop.
     # The limiter persists its cap across restarts, so we don't reset state here —
     # we just spin up the periodic auto-tune task.
@@ -2153,6 +2161,7 @@ async def chat_completions(
                     app_env=bedrock_attribution.get("app_env"),
                     provider="bedrock",
                     provider_meta=provider_meta,
+                    region=provider_meta.get("region") or backend_config.region,
                 )
 
             if request_body.stream:

@@ -159,6 +159,7 @@ async def persist_ai_call_activity(
     app_env: Optional[str] = None,
     provider: str = "anthropic",
     provider_meta: Optional[dict] = None,
+    region: Optional[str] = None,
 ) -> None:
     """
     Write one ai-call activity row. Never raises — tracking is best-effort.
@@ -352,17 +353,17 @@ async def persist_ai_call_activity(
                 INSERT INTO usage_events (
                     source,
                     user_id, tenant_id,
-                    app, app_env, model, provider,
+                    app, app_env, model, provider, region,
                     input_tokens, output_tokens,
                     billing_mode, real_cost_eur, hypothetical_cost_eur, pricing_version,
                     provider_metadata
                 ) VALUES (
                     'workflow',
                     $1, $2,
-                    $3, $4::app_env, $5, $6,
-                    $7, $8,
-                    $9::billing_mode_enum, $10, $11, $12,
-                    $13::jsonb
+                    $3, $4::app_env, $5, $6, $7,
+                    $8, $9,
+                    $10::billing_mode_enum, $11, $12, $13,
+                    $14::jsonb
                 )
                 """,
                 actor_uuid,
@@ -371,6 +372,7 @@ async def persist_ai_call_activity(
                 app_env,
                 model,
                 provider,
+                region,
                 input_tokens or 0,
                 output_tokens or 0,
                 bm_enum,
