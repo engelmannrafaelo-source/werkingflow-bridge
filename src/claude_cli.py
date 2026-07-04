@@ -704,6 +704,26 @@ def find_truncation_marker(chunks: list) -> Optional[dict]:
     return None
 
 
+def _sanitize_seed_filename(raw_name: str) -> str:
+    """
+    Sanitize a caller-provided seed filename to a safe basename.
+
+    Strips any path components (traversal), replaces everything outside a
+    conservative charset, forbids hidden/empty names and caps the length.
+    Raises ValueError for names that sanitize to nothing — fail loud instead
+    of silently dropping a document.
+    """
+    base = os.path.basename(raw_name.replace("\\", "/")).strip()
+    base = _re.sub(r"[^A-Za-z0-9äöüÄÖÜß._() -]", "_", base)
+    base = base.lstrip(".")
+    if not base:
+        raise ValueError(f"Seed filename sanitizes to empty: {raw_name!r}")
+    if len(base) > 120:
+        stem, dot, ext = base.rpartition(".")
+        base = (stem[:100] + (dot + ext if dot else "")) if stem else base[:120]
+    return base
+
+
 def extract_result_usage(chunk) -> Optional[dict]:
     """
     Real API usage from a CLI result chunk, or None if this chunk carries none.
@@ -1038,7 +1058,8 @@ class ClaudeCodeCLI:
         session_id: Optional[str] = None,
         continue_session: bool = False,
         enable_file_discovery: bool = False,
-        backend_env_vars: Optional[Dict[str, str]] = None
+        backend_env_vars: Optional[Dict[str, str]] = None,
+        seed_files: Optional[Dict[str, str]] = None
     ) -> AsyncGenerator[Dict[str, Any], None]:
         """Run Claude Code using the Python SDK and yield response chunks.
 
@@ -1056,6 +1077,10 @@ class ClaudeCodeCLI:
             backend_env_vars: Additional env vars for backend routing (e.g., Bedrock).
                               These are merged with auth env vars and override them if keys conflict.
                               Cleaned up after request completes.
+            seed_files: Optional {relative_name: content} written into
+                        `<session_dir>/unterlagen/` BEFORE the SDK starts, so the
+                        agent can navigate them with Read/Grep/Glob (doc-agent).
+                        Names are sanitized to basenames — no path traversal.
         """
 
         # Register CLI session for tracking and cancellation
@@ -1233,6 +1258,28 @@ CRITICAL: Write file EARLY to avoid context overflow. Use Write tool for clauded
                         extra={"claudedocs_dir": str(claudedocs_dir)}
                     )
                     raise RuntimeError(error_msg) from e
+
+                # Seed caller-provided documents into <session_dir>/unterlagen/
+                # (doc-agent). Fail loud: a seeding error aborts the run — a
+                # silently missing document would make the agent draw wrong
+                # "not in the documents" conclusions.
+                if seed_files:
+                    unterlagen_dir = research_dir / "unterlagen"
+                    unterlagen_dir.mkdir(parents=True, exist_ok=True)
+                    for raw_name, file_content in seed_files.items():
+                        safe_name = _sanitize_seed_filename(raw_name)
+                        target = unterlagen_dir / safe_name
+                        try:
+                            with open(target, 'w', encoding='utf-8') as f:
+                                f.write(file_content)
+                        except OSError as e:
+                            raise RuntimeError(
+                                f"Failed to seed workdir file '{safe_name}': {e}"
+                            ) from e
+                    logger.info(
+                        f"📥 Seeded {len(seed_files)} document(s) into workdir",
+                        extra={"unterlagen_dir": str(unterlagen_dir)}
+                    )
 
                 # Create comprehensive metadata.json with ALL SDK options
                 metadata = {

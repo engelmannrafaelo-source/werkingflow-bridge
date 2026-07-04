@@ -436,6 +436,50 @@ class ResearchResponse(BaseModel):
     )
 
 
+class DocAgentFile(BaseModel):
+    """One seeded document for the doc-agent workdir."""
+    name: str = Field(..., description="Filename (basename only — sanitized server-side)")
+    content: str = Field(..., description="Markdown/text content of the document")
+
+
+class DocAgentRequest(BaseModel):
+    """
+    Request model for /v1/doc-agent — a Claude Code agent that answers a
+    question over a seeded document workdir (Read/Grep/Glob only, no web).
+
+    Unlike /v1/research this never touches the internet: the agent navigates
+    the provided files itself, so callers do not need summary-based
+    pre-selection and the answer scales with any number of documents.
+    """
+    question: str = Field(..., description="User question to answer from the documents")
+    files: List[DocAgentFile] = Field(..., description="Documents seeded into the agent workdir")
+    model: Optional[str] = Field(
+        default="claude-sonnet-4-5-20250929",
+        description="Claude model to use (default: latest stable Sonnet)"
+    )
+    max_turns: Optional[int] = Field(
+        default=25,
+        ge=1,
+        le=60,
+        description="Maximum agent turns for navigating the documents"
+    )
+
+
+class DocAgentResponse(BaseModel):
+    """Response model for /v1/doc-agent."""
+    status: Literal["success", "error"]
+    question: str
+    model: str
+    answer: Optional[str] = Field(default=None, description="Final answer (markdown)")
+    files_read: List[str] = Field(
+        default_factory=list,
+        description="Workdir-relative paths the agent actually read/grepped"
+    )
+    execution_time_seconds: Optional[float] = None
+    session_id: Optional[str] = None
+    error: Optional[str] = None
+
+
 class AsyncResearchStatus(BaseModel):
     """Status response for async research polling."""
     status: Literal["running", "done", "error", "not_found"]

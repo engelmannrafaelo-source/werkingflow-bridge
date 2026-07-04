@@ -37,6 +37,10 @@ RESEARCH_SELF_CALL_TIMEOUT_S = float(os.getenv("BRIDGE_RESEARCH_JOB_TIMEOUT_S", 
 # Generic JSON proxy self-call timeout (default for allowlisted paths — short).
 PROXY_SELF_CALL_TIMEOUT_S = float(os.getenv("BRIDGE_PROXY_JOB_TIMEOUT_S", "300"))
 
+# Doc-agent navigates a seeded workdir with file tools — multi-turn, can take
+# several minutes over many documents.
+DOC_AGENT_SELF_CALL_TIMEOUT_S = float(os.getenv("BRIDGE_DOC_AGENT_JOB_TIMEOUT_S", "1800"))
+
 # Per-path overrides where the target endpoint's own internal budget exceeds the
 # generic default. Timeout-chain invariant: the executor's self-call must sit
 # ABOVE the target endpoint's internal budget so the endpoint's own (specific)
@@ -189,6 +193,18 @@ async def research_executor(
     body = {**payload, "async_mode": False}
     await report_progress({"phase": "research", "model": body.get("model")})
     return await _self_post_json("/v1/research", body, attribution, RESEARCH_SELF_CALL_TIMEOUT_S)
+
+
+async def doc_agent_executor(
+    payload: Dict[str, Any],
+    attribution: Optional[Dict[str, Any]],
+    report_progress: Callable[[Dict[str, Any]], Awaitable[None]],
+) -> Dict[str, Any]:
+    """Run a /v1/doc-agent call (file-tool agent over seeded documents) as a
+    durable job. Same self-call pattern as research: the endpoint owns auth,
+    budget gate and billing; the job layer owns durability/requeue."""
+    await report_progress({"phase": "doc-agent", "model": payload.get("model")})
+    return await _self_post_json("/v1/doc-agent", payload, attribution, DOC_AGENT_SELF_CALL_TIMEOUT_S)
 
 
 async def convert_html_to_pdf_executor(

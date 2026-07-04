@@ -42,6 +42,8 @@ from src.models import (
     ResearchRequest,
     ResearchResponse,
     AsyncResearchStatus,
+    DocAgentRequest,
+    DocAgentResponse,
     BackendType,
     PrivacyMode,
     BackendInfo,
@@ -73,6 +75,7 @@ from src.jobs.executors import (
     research_executor,
     proxy_executor,
     convert_html_to_pdf_executor,
+    doc_agent_executor,
 )
 from src.parameter_validator import ParameterValidator, CompatibilityReporter
 from src.model_registry import (
@@ -532,6 +535,7 @@ async def lifespan(app: FastAPI):
     register_executor("ping", ping_executor)
     register_executor("chat", chat_executor)
     register_executor("research", research_executor)
+    register_executor("doc-agent", doc_agent_executor)
     register_executor("proxy", proxy_executor)
     register_executor("convert-html-to-pdf", convert_html_to_pdf_executor)
     set_attribution_extractor(extract_attribution_context)
@@ -4189,6 +4193,363 @@ async def get_async_research_status(
         # 'orphaned' = the worker died, not the research — caller may re-dispatch.
         error_kind=job.get("error_kind"),
     )
+
+
+# =============================================================================
+# DOC-AGENT: Claude-Code-Agent über einem geseedeten Dokumenten-Workdir
+# =============================================================================
+
+DOC_AGENT_ALLOWED_TOOLS = ["Read", "Grep", "Glob", "LS"]
+DOC_AGENT_DISALLOWED_TOOLS = [
+    "Bash", "Write", "Edit", "MultiEdit", "NotebookEdit",
+    "WebFetch", "WebSearch", "Task", "TodoWrite",
+]
+DOC_AGENT_MAX_FILES = int(os.getenv("BRIDGE_DOC_AGENT_MAX_FILES", "300"))
+DOC_AGENT_MAX_TOTAL_BYTES = int(os.getenv("BRIDGE_DOC_AGENT_MAX_TOTAL_BYTES", str(16 * 1024 * 1024)))
+
+DOC_AGENT_SYSTEM_PROMPT = """Du bist der Unterlagen-Assistent: Du beantwortest die Frage des Nutzers \
+AUSSCHLIESSLICH auf Basis der Dokumente im Ordner `unterlagen/` deines Arbeitsverzeichnisses.
+
+Arbeitsweise:
+- Verschaffe dir mit Glob/LS einen Überblick, nutze Grep zur Stichwortsuche und Read zum Lesen.
+- Lies gezielt die relevanten Dokumente — nicht blind alle.
+- Antworte auf Deutsch, klar strukturiert in Markdown.
+- Belege wesentliche Aussagen mit dem Dateinamen der Quelle in **Fettschrift**.
+- Wenn die Unterlagen die Frage nicht (vollständig) beantworten, sage das ausdrücklich — erfinde nichts.
+- Inhalte können pseudonymisierte Platzhalter enthalten (z. B. PERSON_x, ORG_y). Gib sie unverändert wieder, \
+versuche NICHT sie aufzulösen.
+- Deine LETZTE Nachricht muss die vollständige finale Antwort sein."""
+
+
+def _doc_agent_extract_last_assistant_text(chunks: list) -> Optional[str]:
+    """Final answer = LAST assistant text in the stream (parse_claude_message
+    returns the FIRST, which for a multi-turn agent is just the opening move)."""
+    for message in reversed(chunks):
+        if not isinstance(message, dict):
+            continue
+        content = message.get("content")
+        if not isinstance(content, list):
+            continue
+        text_parts = []
+        for block in content:
+            if hasattr(block, "text"):
+                text_parts.append(block.text)
+            elif isinstance(block, dict) and block.get("type") == "text":
+                text_parts.append(block.get("text", ""))
+            elif isinstance(block, str):
+                text_parts.append(block)
+        joined = "\n".join(p for p in text_parts if p).strip()
+        if joined:
+            return joined
+    return None
+
+
+def _doc_agent_extract_files_read(chunks: list) -> list:
+    """Workdir-relative unterlagen/ paths the agent actually touched (Read/Grep).
+    Order-preserving, deduped; absolute session paths are stripped to the part
+    after 'unterlagen/'. """
+    seen = []
+    for message in chunks:
+        if not isinstance(message, dict):
+            continue
+        content = message.get("content")
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            name = getattr(block, "name", None)
+            if name not in ("Read", "Grep"):
+                continue
+            block_input = getattr(block, "input", None) or {}
+            path = block_input.get("file_path") or block_input.get("path")
+            if not path or not isinstance(path, str):
+                continue
+            marker = "unterlagen/"
+            idx = path.find(marker)
+            rel = path[idx + len(marker):] if idx >= 0 else path
+            # A bare directory hit (Grep over unterlagen/) is not a file read.
+            if not rel or rel.endswith("/"):
+                continue
+            if rel not in seen:
+                seen.append(rel)
+    return seen
+
+
+async def _execute_doc_agent_impl(
+    request_body: DocAgentRequest,
+    attribution_ctx: Optional[Dict[str, Any]] = None,
+) -> DocAgentResponse:
+    """Core doc-agent execution: seed workdir → run file-tool-only agent →
+    extract final answer + files_read. Billing mirrors the research impl."""
+    start_time = time.time()
+    session_id = None
+    accumulated_input_tokens = None
+    accumulated_output_tokens = None
+    accumulated_cache_read = 0
+    accumulated_cache_creation = 0
+
+    # Unique seed map (fail loud on empty; duplicate names get a numeric suffix
+    # instead of silently overwriting one document with another).
+    seed_files: Dict[str, str] = {}
+    for f in request_body.files:
+        name = f.name
+        if name in seed_files:
+            stem, dot, ext = name.rpartition(".")
+            base = stem if stem else name
+            suffix = 2
+            while f"{base}-{suffix}{dot}{ext}" in seed_files:
+                suffix += 1
+            name = f"{base}-{suffix}{dot}{ext}" if stem else f"{name}-{suffix}"
+        seed_files[name] = f.content
+
+    prompt = (
+        f"Im Ordner `unterlagen/` liegen {len(seed_files)} Dokumente des Nutzers.\n\n"
+        f"Frage des Nutzers:\n\n{request_body.question}\n\n"
+        "Finde die relevanten Dokumente, lies sie und beantworte die Frage."
+    )
+
+    try:
+        logger.info(
+            "📚 Doc-agent request received",
+            extra={
+                "question": request_body.question[:100],
+                "model": request_body.model,
+                "files": len(seed_files),
+            },
+        )
+
+        all_chunks = []
+        async for chunk in claude_cli.run_completion(
+            prompt=prompt,
+            system_prompt=DOC_AGENT_SYSTEM_PROMPT,
+            model=request_body.model,
+            max_turns=request_body.max_turns or 25,
+            allowed_tools=DOC_AGENT_ALLOWED_TOOLS,
+            disallowed_tools=DOC_AGENT_DISALLOWED_TOOLS,
+            stream=True,
+            enable_file_discovery=False,
+            seed_files=seed_files,
+        ):
+            all_chunks.append(chunk)
+            if isinstance(chunk, dict) and "session_id" in chunk:
+                session_id = chunk["session_id"]
+            _chunk_usage = extract_result_usage(chunk)
+            if _chunk_usage:
+                accumulated_input_tokens = (accumulated_input_tokens or 0) + _chunk_usage["input_tokens"]
+                accumulated_output_tokens = (accumulated_output_tokens or 0) + _chunk_usage["output_tokens"]
+                accumulated_cache_read += _chunk_usage["cache_read_tokens"]
+                accumulated_cache_creation += _chunk_usage["cache_creation_tokens"]
+
+        if not all_chunks:
+            raise ValueError("No response received from Claude Code execution")
+
+        execution_time = time.time() - start_time
+        answer = _doc_agent_extract_last_assistant_text(all_chunks)
+        files_read = _doc_agent_extract_files_read(all_chunks)
+
+        from src.claude_cli import detect_quota_exhaustion as _dqe
+        if answer and _dqe(answer):
+            raise RateLimitError("[Bridge doc-agent] Quota exhaustion detected in answer")
+
+        if not answer:
+            raise HTTPException(
+                status_code=500,
+                detail={
+                    "message": "Doc-agent completed but produced no answer text",
+                    "chunks_received": len(all_chunks),
+                    "session_id": session_id,
+                },
+            )
+
+        # Billing — same pattern as research (SDK usage preferred, estimate fallback).
+        try:
+            _track_in = accumulated_input_tokens
+            _track_out = accumulated_output_tokens
+            if _track_in is None:
+                _seed_chars = sum(len(c) for c in seed_files.values())
+                _track_in = MessageAdapter.estimate_tokens(prompt) + _seed_chars // 4
+            if _track_out is None:
+                _track_out = MessageAdapter.estimate_tokens(answer)
+            from src.activity.ai_call_writer import persist_ai_call_activity
+            await persist_ai_call_activity(
+                app_id=attribution_ctx.get("app_id") if attribution_ctx else None,
+                user_id=attribution_ctx.get("user_id") if attribution_ctx else None,
+                agent_id="doc-agent",
+                workflow_id=None,
+                model=request_body.model,
+                input_tokens=_track_in or 0,
+                output_tokens=_track_out or 0,
+                cache_read_tokens=accumulated_cache_read or 0,
+                cache_creation_tokens=accumulated_cache_creation or 0,
+                status="success",
+                duration_ms=int(execution_time * 1000),
+                app_env=attribution_ctx.get("app_env") if attribution_ctx else None,
+                provider_meta={
+                    "usage_source": "api" if accumulated_input_tokens is not None else "estimated",
+                },
+            )
+        except Exception as _track_err:
+            logger.warning(f"⚠️ doc-agent activity tracking failed (non-fatal): {_track_err}")
+
+        logger.info(
+            "✅ Doc-agent completed",
+            extra={
+                "session_id": session_id,
+                "execution_time": execution_time,
+                "files_read": len(files_read),
+                "answer_chars": len(answer),
+            },
+        )
+
+        return DocAgentResponse(
+            status="success",
+            question=request_body.question,
+            model=request_body.model,
+            answer=answer,
+            files_read=files_read,
+            execution_time_seconds=round(execution_time, 2),
+            session_id=session_id,
+        )
+
+    except WorkerUnavailableError:
+        raise
+
+    except Exception as e:
+        execution_time = time.time() - start_time
+        logger.error(
+            f"❌ Doc-agent failed: {e}",
+            exc_info=True,
+            extra={"question": request_body.question[:100], "model": request_body.model},
+        )
+        try:
+            from src.activity.ai_call_writer import persist_ai_call_activity
+            await persist_ai_call_activity(
+                app_id=attribution_ctx.get("app_id") if attribution_ctx else None,
+                user_id=attribution_ctx.get("user_id") if attribution_ctx else None,
+                agent_id="doc-agent",
+                workflow_id=None,
+                model=request_body.model,
+                input_tokens=accumulated_input_tokens or 0,
+                output_tokens=accumulated_output_tokens or 0,
+                status="error",
+                duration_ms=int(execution_time * 1000),
+                error_code="doc_agent_error",
+                app_env=attribution_ctx.get("app_env") if attribution_ctx else None,
+            )
+        except Exception as _track_err:
+            logger.warning(f"⚠️ doc-agent error activity tracking failed (non-fatal): {_track_err}")
+
+        return DocAgentResponse(
+            status="error",
+            question=request_body.question,
+            model=request_body.model,
+            execution_time_seconds=round(execution_time, 2),
+            session_id=session_id,
+            error=str(e),
+        )
+
+
+@app.post("/v1/doc-agent", response_model=DocAgentResponse)
+async def doc_agent(
+    request_body: DocAgentRequest,
+    request: Request,
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(security),
+    _adaptive=Depends(adaptive_limit_dependency)
+):
+    """
+    Claude-Code-Agent über einem geseedeten Dokumenten-Workdir.
+
+    Der Aufrufer liefert Frage + Dokumente; der Agent navigiert die Dateien
+    selbst (Read/Grep/Glob, KEIN Web, KEIN Bash) und liefert Antwort +
+    tatsächlich gelesene Dateien. Gedacht als durabler Job via
+    POST /v1/jobs {kind: "doc-agent"} — der Executor ruft diesen Endpoint.
+    """
+    await verify_api_key(request, credentials)
+    enforce_attribution(request)
+
+    # Rate limit pre-check: soft routing (same logic as research endpoint)
+    worker_id = os.getenv("INSTANCE_NAME", "unknown")
+    from src.claude_cli import rate_limit_tracker as _da_rlt
+    if _da_rlt.should_reject_new_request(worker_id):
+        retry_after = _da_rlt.get_retry_after(worker_id)
+        limit_type = "HARD" if _da_rlt.is_hard_limited(worker_id) else "soft"
+        logger.info(f"⏳ Worker {worker_id} has {limit_type} penalty — rejecting doc-agent (NGINX failover)")
+        return JSONResponse(
+            status_code=429,
+            content={"error": {
+                "message": f"[Bridge {worker_id}] Worker rate-limited ({limit_type})",
+                "type": "api_error",
+                "code": "429",
+                "source": "bridge_account",
+                "bridge_type": "worker_unavailable",
+                "reason": "worker_account_rate_limited",
+                "bridge_worker": worker_id,
+                "retryable": True,
+                "retry_after_s": retry_after,
+            }},
+            headers={"Retry-After": str(retry_after or 30)}
+        )
+
+    # Input bounds — fail loud, never silently truncate documents.
+    if not request_body.files:
+        return DocAgentResponse(
+            status="error", question=request_body.question, model=request_body.model or "",
+            error="No files provided — doc-agent needs at least one document.",
+        )
+    if len(request_body.files) > DOC_AGENT_MAX_FILES:
+        return DocAgentResponse(
+            status="error", question=request_body.question, model=request_body.model or "",
+            error=f"Too many files ({len(request_body.files)} > {DOC_AGENT_MAX_FILES}).",
+        )
+    total_bytes = sum(len(f.content.encode("utf-8")) for f in request_body.files)
+    if total_bytes > DOC_AGENT_MAX_TOTAL_BYTES:
+        return DocAgentResponse(
+            status="error", question=request_body.question, model=request_body.model or "",
+            error=f"Documents too large ({total_bytes} bytes > {DOC_AGENT_MAX_TOTAL_BYTES}).",
+        )
+
+    # Model resolution (same as research endpoint)
+    original_model = request_body.model
+    resolved_model, resolution_msg = resolve_model(original_model)
+    if resolved_model is None:
+        return DocAgentResponse(
+            status="error",
+            question=request_body.question,
+            model=original_model or "",
+            error=f"Model '{original_model}' not supported. Use 'sonnet', 'haiku', 'opus' or exact IDs.",
+        )
+    if resolved_model != original_model:
+        logger.info(f"Doc-agent model resolved: '{original_model}' -> '{resolved_model}'")
+        request_body.model = resolved_model
+
+    # Per-user provider pin: doc-agent has no Bedrock env path yet — a pinned
+    # user gets an EXPLICIT error instead of silently running on Anthropic
+    # (503-statt-Fallback, same invariant as chat/research).
+    from src.routing.user_provider_override import get_user_provider_config
+    _pin_config = await get_user_provider_config(request.headers.get("X-User-ID"))
+    if _pin_config:
+        return DocAgentResponse(
+            status="error",
+            question=request_body.question,
+            model=request_body.model,
+            error="doc-agent does not support per-user provider pins yet (no silent fallback by design).",
+        )
+
+    # Budget gate BEFORE execution (same as research)
+    _da_attr = extract_attribution_context(request)
+    try:
+        from src.budget.gate import enforce_budget
+        await enforce_budget(
+            user_id=_da_attr.get("user_id"),
+            app_id=_da_attr.get("app_id"),
+            estimated_cost_eur=0.0,
+            project_id=_da_attr.get("workflow_id"),
+        )
+    except HTTPException:
+        raise
+    except Exception as _ge:
+        logger.error(f"budget gate (doc-agent) unexpected error (letting call through): {_ge}")
+
+    return await _execute_doc_agent_impl(request_body, attribution_ctx=_da_attr)
 
 
 @app.get("/v1/research/{session_id}/content")
