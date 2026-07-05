@@ -519,6 +519,25 @@ bedrock_credential_manager = BedrockCredentialManager()
 security = HTTPBearer(auto_error=False)
 
 
+def _principals_enabled() -> bool:
+    """Live read of the Stufe-2 toggle (getenv is cheap; flipping needs a
+    container recreate anyway). Default OFF → auth is unchanged from Stufe 1."""
+    return os.getenv("BRIDGE_PRINCIPALS_ENABLED", "false").strip().lower() in ("1", "true", "yes")
+
+
+def _principal_app_from_client_id(client_id: Optional[str]) -> Optional[str]:
+    """First segment of X-Client-ID ('werking-report/check/analyze' →
+    'werking-report'), skipping a leading 'workflow' namespace — same convention
+    as attribution._app_from_client_id, duplicated here to avoid an import cycle
+    (attribution imports nothing from auth, keep it that way)."""
+    if not client_id:
+        return None
+    parts = [p for p in client_id.strip().split("/") if p]
+    if parts and parts[0] == "workflow":
+        parts = parts[1:]
+    return parts[0] if parts else None
+
+
 async def verify_api_key(request: Request, credentials: Optional[HTTPAuthorizationCredentials] = None):
     """
     Verify API key if one is configured for FastAPI endpoint protection.
@@ -546,14 +565,54 @@ async def verify_api_key(request: Request, credentials: Optional[HTTPAuthorizati
     # Verify the API key. Accept the active key OR the previous key during a
     # rotation overlap window (AI_BRIDGE_API_KEY_PREVIOUS). Constant-time compare
     # to avoid timing side-channels.
+    token = credentials.credentials
     valid_keys = [k for k in (active_api_key, auth_manager.env_api_key_previous) if k]
-    if not any(hmac.compare_digest(credentials.credentials, k) for k in valid_keys):
+    is_shared_key = any(hmac.compare_digest(token, k) for k in valid_keys)
+
+    # Stufe 2 — service principals (behind BRIDGE_PRINCIPALS_ENABLED, default OFF).
+    # While OFF: the shared-key check below is the whole story (byte-identical to
+    # pre-Stufe-2 behaviour). While ON: the shared key resolves to the synthetic
+    # legacy principal (allowed everywhere) and every other token must be a real
+    # active principal; unknown → 401, wrong app/path → 403. A resolved principal
+    # is stashed on request.state for attribution + the budget gate.
+    if _principals_enabled():
+        from src.principals import LEGACY_PRINCIPAL, resolve_principal_by_token
+
+        if is_shared_key:
+            principal = LEGACY_PRINCIPAL
+        else:
+            # Raises on DB error — never masked into "no principal" (fail-loud).
+            principal = await resolve_principal_by_token(token)
+        if principal is None:
+            raise HTTPException(
+                status_code=401,
+                detail="Invalid API key",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+
+        app_id = request.headers.get("x-app-id") or _principal_app_from_client_id(
+            request.headers.get("x-client-id")
+        )
+        if not principal.may_use_app(app_id):
+            raise HTTPException(
+                status_code=403,
+                detail=f"principal '{principal.name}' may not act as app '{app_id or '-'}'",
+            )
+        if not principal.may_use_path(request.url.path):
+            raise HTTPException(
+                status_code=403,
+                detail=f"principal '{principal.name}' may not call {request.url.path}",
+            )
+        request.state.principal = principal
+        return True
+
+    if not is_shared_key:
         raise HTTPException(
             status_code=401,
             detail="Invalid API key",
             headers={"WWW-Authenticate": "Bearer"},
         )
-    
+
     return True
 
 

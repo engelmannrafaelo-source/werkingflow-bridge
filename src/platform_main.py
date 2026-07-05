@@ -76,6 +76,7 @@ from src.system.routes import router as system_router  # noqa: E402
 from src.impersonation.routes import router as impersonation_router  # noqa: E402
 from src.sandbox.routes import router as sandbox_router  # noqa: E402
 from src.sandbox.conversation_routes import router as sandbox_conversations_router  # noqa: E402
+from src.principals_routes import router as principals_router  # noqa: E402
 
 from src.tenant import TenantMiddleware  # noqa: E402
 
@@ -169,6 +170,7 @@ app.include_router(system_router)
 app.include_router(impersonation_router)
 app.include_router(sandbox_router)
 app.include_router(sandbox_conversations_router)
+app.include_router(principals_router)
 logger.info("✅ Platform routes mounted")
 
 # CORS — same policy as workers
