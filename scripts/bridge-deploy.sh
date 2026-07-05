@@ -512,115 +512,54 @@ phase_smoke_test() {
 
     step "Phase 5: Smoke test (${label} @ ${url})"
 
+    # Functional per-endpoint smoke (bridge_smoke.py): exercises document/convert,
+    # smart-anonymize, the convert family, chat, research and metrics with REAL
+    # payloads and asserts correctness — not just liveness. This is what stops a
+    # broken endpoint (e.g. the /v1/document/convert 415 that shipped for weeks
+    # while /health, /lb-status and the old research-only smoke stayed green) from
+    # going live. Endpoint coverage is enforced by bridge_smoke_coverage.py.
+    # On failure the caller (deploy_server) routes into the existing auto-rollback.
+    local smoke_script
+    smoke_script="$(dirname "${BASH_SOURCE[0]}")/bridge_smoke.py"
+
+    # Map deploy label -> smoke profile. hetzner runs the full suite (incl. the
+    # privacy-pdf endpoints); server2 is LLM-workers only.
+    local profile="hetzner"
+    [[ "$label" == "server2" ]] && profile="server2"
+
     if [[ "$DRY_RUN" == "true" ]]; then
-        info "[DRY-RUN] Would POST ${url}/v1/research query='smoke test' depth='quick'"
+        info "[DRY-RUN] Would run: bridge_smoke.py --base-url ${url} --profile ${profile}"
         return 0
     fi
 
-    # Load Infisical env
+    # Make AI_BRIDGE_API_KEY / INFISICAL_WS_DEV_SERVER available to the smoke
+    # script's key resolution (env first, Infisical fallback).
     # shellcheck source=/root/.infisical/infisical-api.sh
     source /root/.infisical/infisical-api.sh 2>/dev/null || true
-    local api_key
-    api_key=$(infisical_get_secret "${INFISICAL_WS_DEV_SERVER}" dev AI_BRIDGE_API_KEY 2>/dev/null) || true
-    if [[ -z "${api_key:-}" ]]; then
-        error_ "Failed to retrieve AI_BRIDGE_API_KEY from Infisical"
-        return 1
+
+    local extra_args=()
+    [[ -n "$extra_header" ]] && extra_args+=(--extra-header "$extra_header")
+
+    local smoke_out
+    if smoke_out=$(python3 "$smoke_script" --base-url "$url" --profile "$profile" \
+            --attempts 3 "${extra_args[@]}" 2>&1); then
+        while IFS= read -r line; do info "  smoke: ${line}"; done <<< "$smoke_out"
+        info "Smoke test PASSED for ${label}"
+        return 0
     fi
 
-    # Tolerant smoke: try 3 times with 5s pause; one success is enough.
-    # Bridge can be transiently flaky if multiple workers hit rate_limit_event
-    # simultaneously — pool-router smooths that, but startup edge cases remain.
-    local SMOKE_ATTEMPTS=3
-    local smoke_out=""
-    local smoke_attempt=0
-    while [[ $smoke_attempt -lt $SMOKE_ATTEMPTS ]]; do
-        smoke_attempt=$((smoke_attempt + 1))
-        info "Smoke attempt ${smoke_attempt}/${SMOKE_ATTEMPTS}: POST ${url}/v1/research ..."
+    while IFS= read -r line; do error_ "  smoke: ${line}"; done <<< "$smoke_out"
+    error_ "Smoke test FAILED for ${label}"
 
-    # All request + response validation in ONE Python call — avoids heredoc injection
-    # of multi-line/control-char response bodies into a second script.
-    # Pass sensitive values via env vars, not inline string interpolation.
-    smoke_out=$(SMOKE_URL="${url}" \
-        SMOKE_API_KEY="${api_key}" \
-        SMOKE_EXTRA_HEADER="${extra_header:-}" \
-        python3 - <<'PYEOF'
-import os, sys, json, requests
-
-url            = os.environ["SMOKE_URL"]
-api_key        = os.environ["SMOKE_API_KEY"]
-extra_header   = os.environ.get("SMOKE_EXTRA_HEADER", "")
-
-headers = {
-    "Authorization": f"Bearer {api_key}",
-    "Content-Type": "application/json",
-    "X-Client-ID": "bridge-deploy/smoke-test",
-    # Attribution contract: deploy smokes are deliberate infrastructure calls,
-    # not app traffic — book them to the anonymous bucket instead of polluting
-    # the unattributed leak metric on every rollout.
-    "X-User-ID": "anonymous:bridge-deploy-smoke",
-}
-if extra_header:
-    k, v = extra_header.split(": ", 1)
-    headers[k.strip()] = v.strip()
-
-try:
-    r = requests.post(
-        f"{url}/v1/research",
-        headers=headers,
-        json={"query": "smoke test", "depth": "quick", "max_turns": 5},
-        timeout=120,
-    )
-except requests.exceptions.Timeout:
-    print("SMOKE_FAIL: request timed out after 120s", file=sys.stderr)
-    sys.exit(1)
-except Exception as e:
-    print(f"SMOKE_FAIL: request error: {e}", file=sys.stderr)
-    sys.exit(1)
-
-print(f"HTTP {r.status_code}")
-if r.status_code != 200:
-    print(f"SMOKE_FAIL: HTTP {r.status_code}", file=sys.stderr)
-    print(f"Body (first 500): {r.text[:500]}", file=sys.stderr)
-    sys.exit(1)
-
-try:
-    d = r.json()
-except Exception as e:
-    print(f"SMOKE_FAIL: response not valid JSON: {e}", file=sys.stderr)
-    print(f"Body (first 500): {r.text[:500]}", file=sys.stderr)
-    sys.exit(1)
-
-status = d.get("status")
-if status != "success":
-    print(f"SMOKE_FAIL: status={status!r}, expected 'success'", file=sys.stderr)
-    sys.exit(1)
-
-content = d.get("content", "")
-https_count = content.count("https://")
-if https_count < 1:
-    print(f"SMOKE_FAIL: content has {https_count} https:// URLs, expected >=1", file=sys.stderr)
-    sys.exit(1)
-
-exec_time = d.get("execution_time_seconds", "?")
-print(f"SMOKE_OK: status=success, https_count={https_count}, exec_time={exec_time}s")
-print(f"Content preview: {content[:400]}")
-PYEOF
-        ) 2>&1
-
-        while IFS= read -r line; do info "  smoke[${smoke_attempt}]: ${line}"; done <<< "$smoke_out"
-
-        if echo "$smoke_out" | grep -q 'SMOKE_OK:'; then
-            info "Smoke test PASSED for ${label} (attempt ${smoke_attempt}/${SMOKE_ATTEMPTS})"
-            return 0
-        fi
-
-        if [[ $smoke_attempt -lt $SMOKE_ATTEMPTS ]]; then
-            warn "Smoke attempt ${smoke_attempt} failed — retrying in 5s..."
-            sleep 5
-        fi
-    done
-
-    error_ "Smoke test FAILED for ${label} after ${SMOKE_ATTEMPTS} attempts"
+    # Auto-spawn an infra-fix session so a broken endpoint is already being worked
+    # before anyone notices. Best-effort: the hook's own failure must NEVER change
+    # the deploy outcome — the rollback is driven solely by our `return 1` below.
+    local fix_hook
+    fix_hook="$(dirname "${BASH_SOURCE[0]}")/spawn-infra-fix-session.sh"
+    if [[ -x "$fix_hook" ]]; then
+        SMOKE_LABEL="$label" SMOKE_URL="$url" SMOKE_OUTPUT="$smoke_out" \
+            "$fix_hook" || warn "infra-fix-session hook failed (non-fatal)"
+    fi
     return 1
 }
 
