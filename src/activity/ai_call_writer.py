@@ -353,12 +353,17 @@ async def persist_ai_call_activity(
             #   subscription  → flat_rate_estimated (user pays flat; per-call cost
             #                   is hypothetical only; real_cost = 0)
             #   pay_per_token → pay_per_token (real_cost = hypothetical_cost)
+            # Exception: real_cost = 0 only holds for calls served by our
+            # subscription-covered Anthropic accounts. Bedrock invocations are
+            # paid per token to AWS regardless of the tenant's plan — the
+            # ledger must show that cost, or the 1:1 billing audit reads €0
+            # while the AWS invoice grows.
             if billing_mode_text == "pay_per_token":
                 bm_enum = "pay_per_token"
                 real_cost = call_cost_eur
             else:
                 bm_enum = "flat_rate_estimated"
-                real_cost = 0.0
+                real_cost = call_cost_eur if provider == "bedrock" else 0.0
 
             await conn.execute(
                 """
