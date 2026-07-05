@@ -53,6 +53,39 @@ class UserProviderOverrideError(RuntimeError):
     """
 
 
+class BedrockPinRequiredError(RuntimeError):
+    """Bedrock was requested without an operator pin — refused, 403.
+
+    Bedrock ist pay-per-token gegen das eigene AWS-Konto; jeder Call MUSS
+    einem echten User zugeordnet sein (Umlage + 1:1-Audit). Der Operator-Pin
+    (users.provider_config) garantiert genau das: er existiert nur auf einem
+    echten User-Row, also schreibt das Ledger immer. Ein Client-Opt-in
+    (backend=bedrock oder ein Bedrock-provider_tier) ohne Pin könnte dagegen
+    anonyme/System-AWS-Kosten erzeugen. Kein silent-redirect auf die normale
+    Bridge: der Client hat explizit Bedrock verlangt und bekäme sonst still
+    ein anderes Datenresidenz-Verhalten.
+    """
+
+
+def assert_bedrock_is_pinned(effective_backend: Any, pinned: Optional[str]) -> None:
+    """Gate: der EFFEKTIVE Backend (nach tier-/backend-Auflösung) darf nur
+    dann Bedrock sein, wenn der Operator-Pin ihn gesetzt hat.
+
+    Auf den aufgelösten Backend prüfen — nicht auf request_body.backend —
+    damit auch provider_tier-Pfade (z.B. 'claude-dsgvo') erfasst sind.
+    """
+    if effective_backend != BackendType.BEDROCK:
+        return
+    if pinned == "bedrock":
+        return
+    raise BedrockPinRequiredError(
+        "Bedrock is only reachable via the operator-set per-user pin "
+        "(users.provider_config.provider='bedrock', Platform-Admin → Users). "
+        "Client-side backend/provider_tier opt-in is not permitted: every "
+        "Bedrock call must be attributable to a real user."
+    )
+
+
 def invalidate_cache(user_key: Optional[str] = None) -> None:
     """Drop cached configs (all, or one identity) — e.g. after an admin PATCH."""
     if user_key is None:

@@ -2204,6 +2204,28 @@ async def chat_completions(
                 }
             )
 
+        # BEDROCK-GATE: effektiver Backend darf nur per Operator-Pin Bedrock
+        # sein (deckt backend=bedrock UND Bedrock-provider_tiers ab) — jeder
+        # Bedrock-Call muss einem echten User zuordenbar sein.
+        if backend_config:
+            from src.routing.user_provider_override import (
+                assert_bedrock_is_pinned, BedrockPinRequiredError,
+            )
+            try:
+                assert_bedrock_is_pinned(backend_config.backend, user_pinned_provider)
+            except BedrockPinRequiredError as e:
+                raise HTTPException(
+                    status_code=403,
+                    detail={
+                        "error": {
+                            "message": str(e),
+                            "type": "permission_error",
+                            "code": "bedrock_requires_operator_pin",
+                            "hint": "Set users.provider_config.provider='bedrock' via Platform-Admin → Users for this user.",
+                        }
+                    }
+                )
+
         # =======================================================================
         # BEDROCK ROUTING: Direct boto3 call, bypass Claude Code SDK
         # =======================================================================
@@ -4071,9 +4093,11 @@ async def research(
     # a Bedrock-pinned user's research runs through the SDK-Bedrock env path.
     from src.routing.user_provider_override import (
         enforce_user_provider_override, UserProviderOverrideError,
+        assert_bedrock_is_pinned, BedrockPinRequiredError,
     )
+    _research_pinned = None
     try:
-        await enforce_user_provider_override(request, request_body)
+        _research_pinned = await enforce_user_provider_override(request, request_body)
     except UserProviderOverrideError as e:
         return ResearchResponse(
             status="error",
@@ -4097,6 +4121,17 @@ async def research(
             query=request_body.query,
             model=request_body.model,
             error=str(e)
+        )
+
+    # BEDROCK-GATE: wie bei chat completions — Bedrock nur per Operator-Pin.
+    try:
+        assert_bedrock_is_pinned(backend_config.backend, _research_pinned)
+    except BedrockPinRequiredError as e:
+        return ResearchResponse(
+            status="error",
+            query=request_body.query,
+            model=request_body.model,
+            error=f"bedrock_requires_operator_pin: {e}"
         )
 
     # R2+R3: Extract attribution context and enforce budget BEFORE any research execution.
