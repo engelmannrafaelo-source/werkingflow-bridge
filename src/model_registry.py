@@ -46,6 +46,15 @@ MODELS: List[ModelInfo] = [
         description="Sonnet 4.5 - stabiler Default (4.6 hat dokumentierte Regression)",
         is_default=True
     ),
+    # 4.6 ist verfuegbar, aber bewusst NICHT default (Regression s.o.) —
+    # explizite Anforderung per model="claude-sonnet-4-6" ist moeglich.
+    ModelInfo(
+        id="claude-sonnet-4-6",
+        family="sonnet",
+        version="4.6",
+        release_date=date(2026, 2, 4),
+        description="Sonnet 4.6 - verfuegbar, nicht default (Regression #46935)"
+    ),
     ModelInfo(
         id="claude-sonnet-4-20250514",
         family="sonnet",
@@ -87,11 +96,18 @@ MODELS: List[ModelInfo] = [
 
     # Opus Familie
     ModelInfo(
+        id="claude-opus-4-8",
+        family="opus",
+        version="4.8",
+        release_date=date(2026, 6, 1),
+        description="Opus 4.8 - Aktuellstes Opus (nicht default; Wechsel = bewusste Entscheidung)"
+    ),
+    ModelInfo(
         id="claude-opus-4-7",
         family="opus",
         version="4.7",
         release_date=date(2026, 4, 14),
-        description="Opus 4.7 - Neuestes und leistungsfaehigstes Modell, 1M context",
+        description="Opus 4.7 - Opus-Default, 1M context",
         is_default=True
     ),
     ModelInfo(
@@ -343,8 +359,34 @@ def to_bedrock_model_id(anthropic_model_id: str, region: str = "eu-central-1") -
         )
 
     prefix = _get_bedrock_region_prefix(region)
-    # Bedrock format: {prefix}.anthropic.{model-id}-v1:0
-    return f"{prefix}.anthropic.{anthropic_model_id}-v1:0"
+    base = _BEDROCK_PROFILE_BASE_IDS.get(anthropic_model_id)
+    if base is None:
+        raise ValueError(
+            f"No Bedrock inference profile mapped for '{anthropic_model_id}'. "
+            f"AWS profile-ID suffixes are NOT uniform (…-v1:0, …-v1, none) — "
+            f"guessing produces ResourceNotFound. Add the profile to "
+            f"_BEDROCK_PROFILE_BASE_IDS (list via bedrock:ListInferenceProfiles)."
+        )
+    return f"{prefix}.{base}"
+
+
+# Bedrock inference-profile IDs per model, WITHOUT the regional prefix
+# (eu./us./apac. is prepended by to_bedrock_model_id). Explicit table because
+# AWS suffix conventions changed across generations: dated snapshots carry
+# '-v1:0', Opus 4.6 carries '-v1', 4.7+ and Sonnet 4.6 carry no suffix.
+# Verified against ListInferenceProfiles eu-central-1 (2026-07-05).
+_BEDROCK_PROFILE_BASE_IDS: Dict[str, str] = {
+    "claude-sonnet-4-5-20250929": "anthropic.claude-sonnet-4-5-20250929-v1:0",
+    "claude-sonnet-4-5":          "anthropic.claude-sonnet-4-5-20250929-v1:0",
+    "claude-sonnet-4-6":          "anthropic.claude-sonnet-4-6",
+    "claude-haiku-4-5-20251001":  "anthropic.claude-haiku-4-5-20251001-v1:0",
+    "claude-haiku-4-5":           "anthropic.claude-haiku-4-5-20251001-v1:0",
+    "claude-opus-4-5-20251101":   "anthropic.claude-opus-4-5-20251101-v1:0",
+    "claude-opus-4-5":            "anthropic.claude-opus-4-5-20251101-v1:0",
+    "claude-opus-4-6":            "anthropic.claude-opus-4-6-v1",
+    "claude-opus-4-7":            "anthropic.claude-opus-4-7",
+    "claude-opus-4-8":            "anthropic.claude-opus-4-8",
+}
 
 
 def from_bedrock_model_id(bedrock_model_id: str) -> str:
@@ -390,9 +432,12 @@ def from_bedrock_model_id(bedrock_model_id: str) -> str:
                 f"Expected format: [eu|us|apac].anthropic.claude-*-v1:0"
             )
 
-    # Remove version suffix (-v1:0, -v1:1, -v2:0, etc.)
+    # Remove version suffix. Suffix conventions vary by generation:
+    # dated snapshots '-v1:0', Opus 4.6 '-v1', 4.7+/Sonnet 4.6 none.
     if "-v1:0" in model_part:
         model_part = model_part.rsplit("-v1:0", 1)[0]
+    elif model_part.endswith("-v1"):
+        model_part = model_part[: -len("-v1")]
     elif "-v" in model_part:
         # Handle other version formats
         model_part = model_part.rsplit("-v", 1)[0]

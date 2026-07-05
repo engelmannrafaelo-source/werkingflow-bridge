@@ -22,7 +22,9 @@ import re
 # v2 (2026-07-03): opus-4-7 corrected 15/75 -> 5/25 (15/75 is the Opus 4/4.1
 #                  price; Opus 4.5+ lists at 5/25), opus-4-6/4-8 added,
 #                  cache pricing introduced (write 1.25x in, read 0.1x in).
-PRICING_VERSION = "v2"
+# v3 (2026-07-05): opus-4-5 + opus-4-1 ergaenzt (4-5 fehlte trotz
+#                  Registry-Eintrag -> unknown-model warning; 4-1 = 15/75-Tier).
+PRICING_VERSION = "v3"
 
 # USD per 1M tokens. {model_id: {"in": input_price, "out": output_price}}
 MODEL_PRICING: dict[str, dict[str, float]] = {
@@ -30,6 +32,9 @@ MODEL_PRICING: dict[str, dict[str, float]] = {
     "claude-sonnet-4-5-20250929": {"in": 3.00,  "out": 15.00},
     "claude-sonnet-4-6":          {"in": 3.00,  "out": 15.00},
     "claude-opus-4":              {"in": 15.00, "out": 75.00},
+    "claude-opus-4-1":            {"in": 15.00, "out": 75.00},
+    "claude-opus-4-5":            {"in": 5.00,  "out": 25.00},
+    "claude-opus-4-5-20251101":   {"in": 5.00,  "out": 25.00},
     "claude-opus-4-6":            {"in": 5.00,  "out": 25.00},
     "claude-opus-4-7":            {"in": 5.00,  "out": 25.00},
     "claude-opus-4-8":            {"in": 5.00,  "out": 25.00},
