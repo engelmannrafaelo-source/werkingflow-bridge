@@ -127,7 +127,7 @@ async def test_provision_trial_is_not_called_when_trial_entry_exists(monkeypatch
     existing_budget = UserBudget(
         user_id=str(uuid.uuid4()),
         monthly_budgets={"trial": existing_entry},
-        top_up_balance_eur=0.0,
+        top_up_lots=[],
     )
 
     conn = AsyncMock()
@@ -158,7 +158,7 @@ class TestBudgetCheckLogic:
             monthly_budgets={
                 "trial": MonthlyBudgetEntry(limit_eur=5.0, used_eur=used, reset_at=reset_at)
             },
-            top_up_balance_eur=0.0,
+            top_up_lots=[],
         )
 
     def test_criterion1_first_check_after_provision_returns_ok(self):
@@ -182,7 +182,7 @@ class TestBudgetCheckLogic:
         budget = UserBudget(
             user_id=str(uuid.uuid4()),
             monthly_budgets={},
-            top_up_balance_eur=0.0,
+            top_up_lots=[],
         )
         result = check_budget(budget, "engelmann-custom", estimated_cost_eur=0.1)
         assert result.allowed is False
@@ -205,7 +205,7 @@ class TestBudgetCheckLogic:
             monthly_budgets={
                 "trial": MonthlyBudgetEntry(limit_eur=5.0, used_eur=0.0, reset_at=past)
             },
-            top_up_balance_eur=0.0,
+            top_up_lots=[],
         )
         # The pure check_budget does not enforce expiry; routes do.
         # Verify _is_trial_expired detects it correctly.

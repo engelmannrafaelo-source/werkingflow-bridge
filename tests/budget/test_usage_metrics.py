@@ -26,8 +26,21 @@ def _make_budget_row(monthly_budgets: dict | None = None) -> dict:
     }
 
 
-def _make_topup_row(balance: float = 0.0) -> dict:
+def _make_legacy_balance_row(balance: float = 0.0) -> dict:
+    """Legacy user_topup_balances row. 0 = migrated (no fail-loud)."""
     return {"balance_eur": balance}
+
+
+def _make_lot_row(amount: float, months_valid: int = 12) -> dict:
+    """One user_topup_lots row (asyncpg returns datetime for TIMESTAMPTZ)."""
+    from datetime import timedelta
+    now = datetime.now(timezone.utc)
+    return {
+        "id": uuid.uuid4(),
+        "amount_eur": amount,
+        "purchased_at": now,
+        "expires_at": now + timedelta(days=30 * months_valid),
+    }
 
 
 def _make_updated_at_row() -> dict:
@@ -44,11 +57,11 @@ def _build_usage_rows(sandbox_tokens: int, sandbox_cost: float, workflow_tokens:
     return rows
 
 
-def _make_mock_pool(fetchrow_results: list, fetch_result: list):
+def _make_mock_pool(fetchrow_results: list, fetch_results: list):
     conn = AsyncMock()
     conn.execute = AsyncMock()
     conn.fetchrow = AsyncMock(side_effect=fetchrow_results)
-    conn.fetch = AsyncMock(return_value=fetch_result)
+    conn.fetch = AsyncMock(side_effect=fetch_results)
 
     @asynccontextmanager
     async def _acquire():
@@ -61,13 +74,19 @@ def _make_mock_pool(fetchrow_results: list, fetch_result: list):
 
 # ---------------------------------------------------------------------------
 # Helper: call get_budget with mocked pool + claims
+#
+# get_budget's DB call order:
+#   fetchrow: [monthly_budgets, legacy_topup_balance, updated_at]
+#   fetch:    [topup_lots, usage_events]
 # ---------------------------------------------------------------------------
 
-async def _call_get_budget(fetchrow_results: list, fetch_result: list) -> dict:
+async def _call_get_budget(
+    fetchrow_results: list, usage_rows: list, lot_rows: list | None = None
+) -> dict:
     from src.budget.routes import get_budget
     from src.api_auth import AuthClaims
 
-    pool, _ = _make_mock_pool(fetchrow_results, fetch_result)
+    pool, _ = _make_mock_pool(fetchrow_results, [lot_rows or [], usage_rows])
     claims = MagicMock(spec=AuthClaims)
 
     with patch("src.budget.routes.get_pool", return_value=pool):
@@ -88,10 +107,10 @@ async def test_get_budget_sandbox_and_workflow():
     resp = await _call_get_budget(
         fetchrow_results=[
             _make_budget_row(),
-            _make_topup_row(),
+            _make_legacy_balance_row(),
             _make_updated_at_row(),
         ],
-        fetch_result=usage_rows,
+        usage_rows=usage_rows,
     )
 
     assert resp["sandboxTokensUsed"] == 5_000
@@ -110,10 +129,10 @@ async def test_get_budget_no_usage_rows():
     resp = await _call_get_budget(
         fetchrow_results=[
             _make_budget_row(),
-            _make_topup_row(),
+            _make_legacy_balance_row(),
             _make_updated_at_row(),
         ],
-        fetch_result=[],
+        usage_rows=[],
     )
 
     assert resp["sandboxTokensUsed"] == 0
@@ -133,10 +152,10 @@ async def test_get_budget_sandbox_only():
     resp = await _call_get_budget(
         fetchrow_results=[
             _make_budget_row(),
-            _make_topup_row(),
+            _make_legacy_balance_row(),
             _make_updated_at_row(),
         ],
-        fetch_result=usage_rows,
+        usage_rows=usage_rows,
     )
 
     assert resp["sandboxTokensUsed"] == 3_000
@@ -155,10 +174,10 @@ async def test_get_budget_workflow_only():
     resp = await _call_get_budget(
         fetchrow_results=[
             _make_budget_row(),
-            _make_topup_row(),
+            _make_legacy_balance_row(),
             _make_updated_at_row(),
         ],
-        fetch_result=usage_rows,
+        usage_rows=usage_rows,
     )
 
     assert resp["sandboxTokensUsed"] == 0
@@ -182,15 +201,17 @@ async def test_get_budget_existing_fields_intact():
     resp = await _call_get_budget(
         fetchrow_results=[
             _make_budget_row(monthly),
-            _make_topup_row(balance=10.0),
+            _make_legacy_balance_row(),        # migrated: no legacy scalar
             _make_updated_at_row(),
         ],
-        fetch_result=[],
+        usage_rows=[],
+        lot_rows=[_make_lot_row(10.0)],        # 10 EUR sichtbar via aktivem Lot
     )
 
     assert resp["userId"] == str(USER_ID)
     assert "monthlyBudgets" in resp
     assert resp["topUpBalanceEur"] == pytest.approx(10.0)
+    assert resp["topUpNextExpiryAt"] is not None
     assert "updatedAt" in resp
     # New fields present
     assert "monthlyTokensUsed" in resp

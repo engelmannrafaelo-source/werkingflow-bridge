@@ -200,8 +200,10 @@ async def billing_overview(
             topup_sum_row = await conn.fetchrow(
                 "SELECT COALESCE(SUM(pack_eur), 0) AS total, COUNT(*) AS count FROM credit_purchases"
             )
+            # Ausstehender TopUp-Saldo = Summe der aktiven (nicht-abgelaufenen) Lots.
             topup_balances_row = await conn.fetchrow(
-                "SELECT COALESCE(SUM(balance_eur), 0) AS total FROM user_topup_balances"
+                "SELECT COALESCE(SUM(amount_eur), 0) AS total FROM user_topup_lots "
+                "WHERE expires_at > NOW() AND amount_eur > 0"
             )
         topup_revenue = float(topup_sum_row["total"])
         topup_count = int(topup_sum_row["count"])

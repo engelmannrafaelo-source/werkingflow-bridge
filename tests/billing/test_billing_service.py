@@ -411,11 +411,18 @@ class TestCreditTopup:
         cust_row.__getitem__ = lambda self, k: {"mollie_customer_id": "cust_abc"}[k]
 
         pool, conn = _mock_pool()
-        # _credit_topup call sequence: fetchrow(cust), fetchval(existing_purchase), fetchval(new_balance)
+        # _credit_topup call sequence (lots model):
+        #   fetchrow(cust),
+        #   fetchval(existing_purchase) -> None,
+        #   fetchval(INSERT credit_purchases RETURNING paid_at),
+        #   execute(INSERT user_topup_lots),
+        #   fetchval(SUM active lots) -> new balance
+        from datetime import datetime, timezone
         conn.fetchrow = AsyncMock(return_value=cust_row)
         conn.fetchval = AsyncMock(side_effect=[
-            None,            # no existing credit_purchase for this payment_id
-            Decimal("100.00"),  # new balance after upsert
+            None,                                          # no existing credit_purchase
+            datetime(2026, 7, 5, 12, 0, tzinfo=timezone.utc),  # paid_at of the new purchase
+            Decimal("100.00"),                             # SUM of active lots (new balance)
         ])
 
         with patch("src.billing.billing_service.get_pool", return_value=pool), \

@@ -3,7 +3,7 @@ BillingService — orchestriert Subscriptions + Top-Ups + Mollie + DB.
 
 Webhook-Handler: Mollie ruft /v1/billing/mollie-webhook auf, wir branchen nach pending_payments.type.
 - subscription_first -> Mollie-Subscription erstellen, in subscriptions persistieren
-- topup -> credit_purchases persistieren, user_topup_balances erhoehen (gemeinsamer Pool!)
+- topup -> credit_purchases persistieren + datiertes Lot in user_topup_lots (FIFO, 12-Mon-Verfall)
 """
 from __future__ import annotations
 
@@ -560,32 +560,37 @@ async def _credit_topup(user_id: str, amount_eur: float, mollie_payment_id: str)
                 "SELECT id FROM credit_purchases WHERE mollie_payment_id = $1",
                 mollie_payment_id,
             )
+            # Sichtbarer TopUp-Saldo = Summe der aktiven (nicht abgelaufenen) Lots.
+            _active_balance_sql = (
+                "SELECT COALESCE(SUM(amount_eur), 0) FROM user_topup_lots "
+                "WHERE user_id = $1 AND expires_at > NOW() AND amount_eur > 0"
+            )
             if existing:
                 # Hole aktuellen Balance ohne nochmal zu erhoehen
-                balance = await conn.fetchval(
-                    "SELECT balance_eur FROM user_topup_balances WHERE user_id = $1",
-                    user_uuid,
-                )
+                balance = await conn.fetchval(_active_balance_sql, user_uuid)
                 return {"alreadyCredited": True, "balanceEur": float(balance or 0)}
 
-            await conn.execute(
+            purchase_id = uuid.uuid4()
+            paid_at = await conn.fetchval(
                 """
                 INSERT INTO credit_purchases (id, user_id, pack_eur, mollie_customer_id, mollie_payment_id, paid_at)
                 VALUES ($1, $2, $3, $4, $5, NOW())
+                RETURNING paid_at
                 """,
-                uuid.uuid4(), user_uuid, amount_eur, cust["mollie_customer_id"], mollie_payment_id,
+                purchase_id, user_uuid, amount_eur, cust["mollie_customer_id"], mollie_payment_id,
             )
-            new_balance = await conn.fetchval(
+            # TopUp als datiertes Lot (Budget-Modell): purchased_at = realer
+            # Kaufzeitpunkt (credit_purchases.paid_at), expires_at = +12 Monate.
+            # Kein erfundenes Datum — beides aus dem Kauf abgeleitet.
+            await conn.execute(
                 """
-                INSERT INTO user_topup_balances (user_id, balance_eur, updated_at)
-                VALUES ($1, $2, NOW())
-                ON CONFLICT (user_id) DO UPDATE
-                  SET balance_eur = user_topup_balances.balance_eur + EXCLUDED.balance_eur,
-                      updated_at = NOW()
-                RETURNING balance_eur
+                INSERT INTO user_topup_lots
+                    (user_id, amount_eur, purchased_at, expires_at, credit_purchase_id)
+                VALUES ($1, $2, $3, $3 + INTERVAL '12 months', $4)
                 """,
-                user_uuid, amount_eur,
+                user_uuid, amount_eur, paid_at, purchase_id,
             )
+            new_balance = await conn.fetchval(_active_balance_sql, user_uuid)
     await log_billing_event(
         "topup.credited",
         user_id=user_id,

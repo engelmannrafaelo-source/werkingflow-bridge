@@ -11,14 +11,24 @@ Auth model:
 POST /v1/budget/check          {userId, planId, estimatedCostEur} -> BudgetCheckResult
 POST /v1/budget/deduct         {userId, planId, actualCostEur} -> BudgetDeductionResult (atomic)
 GET  /v1/budget                -> { items: [BudgetSummary], count }   (admin — all users)
-GET  /v1/budget/{user_id}      -> { monthlyBudgets, topUpBalanceEur, updatedAt }
+GET  /v1/budget/{user_id}      -> { monthlyBudgets, topUpBalanceEur, topUpNextExpiryAt, updatedAt }
 POST /v1/budget/topup/credit   {userId, amountEur} -> { newBalance }  (service-token only)
+
+Budget-Modell (Design: packages/usage-billing-admin/docs/BUDGET-MODELL.md):
+  - Monatstopf (interval='month') läuft über user_budgets.monthly_budgets.
+  - Projekttopf (interval='project') läuft NICHT hier, sondern per Projekt über
+    project_budgets_service (Tabelle project_budgets) — die Monats-Endpoints hier
+    lehnen project-Interval-Pläne LAUT ab (kein stilles Einordnen in den Monatstopf).
+  - TopUp ist app-übergreifendes, sichtbares Geld: datierte Lots (user_topup_lots),
+    FIFO-Abbuchung, 12-Monate-Verfall. Der alte Skalar (user_topup_balances) ist
+    Legacy; ein nicht-migrierter Restwert fail-loud't beim Laden.
 """
+import calendar
 import json
 import logging
 import uuid
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict
+from typing import Any, Dict, List
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
@@ -34,8 +44,11 @@ from src.api_auth import (
 from src.budget.calculator import (
     UserBudget,
     MonthlyBudgetEntry,
+    TopUpLot,
     check_budget,
     deduct_budget,
+    topup_balance_eur,
+    next_topup_expiry,
 )
 from src.budget.plans import PlanConfig, get_plan, find_trial_plan_for
 
@@ -45,16 +58,114 @@ router = APIRouter(prefix="/v1/budget", tags=["budget"])
 
 
 # ---------------------------------------------------------------------------
+# Interval guard — the monthly path must never silently absorb a project plan.
+# ---------------------------------------------------------------------------
+
+def _require_month_interval(plan_id: str) -> PlanConfig:
+    """Resolve a plan and assert it belongs in the monthly budget path.
+
+    interval='project' → belongs to project_budgets_service (per project_id),
+    not this monthly endpoint. interval anything-else ('once', future values)
+    → no pot defined. Both raise LOUD — no silent fallback (defensive).
+    """
+    plan = get_plan(plan_id)  # raises ValueError on unknown plan
+    if plan.interval == "project":
+        raise ValueError(
+            f"[Budget] plan '{plan_id}' has interval='project' — project budgets are "
+            f"per-project (project_budgets_service, keyed by project_id), not the monthly "
+            f"/v1/budget path. Route this via the workflow-attribution deduction."
+        )
+    if plan.interval != "month":
+        raise ValueError(
+            f"[Budget] plan '{plan_id}' has unsupported interval '{plan.interval}' — "
+            f"no monthly budget pot defined (kein stiller Fallback)."
+        )
+    return plan
+
+
+# ---------------------------------------------------------------------------
+# TopUp lot helpers (datierte Lots — user_topup_lots)
+# ---------------------------------------------------------------------------
+
+class LegacyTopUpBalanceError(RuntimeError):
+    """A user still carries a non-zero scalar top-up balance (old model).
+
+    Raised on load so unmigrated customer money surfaces LOUD instead of
+    silently vanishing behind the lots-only read path. Backfill is a
+    deliberate, gated step (siehe Migrations-Skizze im Report) — never a
+    silent runtime fixup.
+    """
+    def __init__(self, user_id: uuid.UUID, balance_eur: float):
+        super().__init__(
+            f"[Budget] user {user_id} has legacy scalar top-up balance "
+            f"{balance_eur:.4f} EUR in user_topup_balances but the model now uses "
+            f"datierte Lots (user_topup_lots). Refusing to serve a lots-only view "
+            f"that hides this money. Backfill required (see migration sketch)."
+        )
+        self.user_id = user_id
+        self.balance_eur = balance_eur
+
+
+def _plus_12_months(dt: datetime) -> datetime:
+    """dt + 12 Monate (Tag auf Monatslänge geklemmt). Kein Raten — deterministisch."""
+    month_index = dt.month - 1 + 12
+    year = dt.year + month_index // 12
+    month = month_index % 12 + 1
+    day = min(dt.day, calendar.monthrange(year, month)[1])
+    return dt.replace(year=year, month=month, day=day)
+
+
+async def _assert_no_legacy_topup_balance(conn: Any, user_id: uuid.UUID) -> None:
+    row = await conn.fetchrow(
+        "SELECT balance_eur FROM user_topup_balances WHERE user_id = $1",
+        user_id,
+    )
+    if row is not None and float(row["balance_eur"]) > 0:
+        raise LegacyTopUpBalanceError(user_id, float(row["balance_eur"]))
+
+
+async def _load_topup_lots(conn: Any, user_id: uuid.UUID, *, for_update: bool = False) -> List[TopUpLot]:
+    """Load a user's TopUp lots. Fail-loud on a non-migrated legacy scalar balance."""
+    await _assert_no_legacy_topup_balance(conn, user_id)
+    sql = (
+        "SELECT id, amount_eur, purchased_at, expires_at "
+        "FROM user_topup_lots WHERE user_id = $1"
+    )
+    if for_update:
+        sql += " FOR UPDATE"
+    rows = await conn.fetch(sql, user_id)
+    return [
+        TopUpLot(
+            id=str(r["id"]),
+            amount_eur=float(r["amount_eur"]),
+            purchased_at=r["purchased_at"].isoformat(),
+            expires_at=r["expires_at"].isoformat(),
+        )
+        for r in rows
+    ]
+
+
+async def _persist_topup_lots(
+    conn: Any, old_lots: List[TopUpLot], new_lots: List[TopUpLot]
+) -> None:
+    """Write back only the lots whose remaining amount changed (FIFO deduction)."""
+    old_by_id = {lot.id: lot.amount_eur for lot in old_lots}
+    for lot in new_lots:
+        if old_by_id.get(lot.id) != lot.amount_eur:
+            await conn.execute(
+                "UPDATE user_topup_lots SET amount_eur = $2, updated_at = NOW() WHERE id = $1",
+                uuid.UUID(lot.id),
+                lot.amount_eur,
+            )
+
+
+# ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
 async def _load_user_budget(conn: Any, user_id: uuid.UUID) -> UserBudget:
     budget_row = await conn.fetchrow(
         "SELECT monthly_budgets FROM user_budgets WHERE user_id = $1",
-        user_id,
-    )
-    topup_row = await conn.fetchrow(
-        "SELECT balance_eur FROM user_topup_balances WHERE user_id = $1",
         user_id,
     )
 
@@ -74,12 +185,12 @@ async def _load_user_budget(conn: Any, user_id: uuid.UUID) -> UserBudget:
             reset_at=entry["resetAt"],
         )
 
-    top_up = float(topup_row["balance_eur"]) if topup_row else 0.0
+    top_up_lots = await _load_topup_lots(conn, user_id)
 
     return UserBudget(
         user_id=str(user_id),
         monthly_budgets=monthly_budgets,
-        top_up_balance_eur=top_up,
+        top_up_lots=top_up_lots,
     )
 
 
@@ -163,11 +274,12 @@ async def evaluate_budget(
 
     Pure logic, no HTTP. Shared by the POST /v1/budget/check endpoint and the
     chat/completions budget gate (src/budget/gate.py). Raises ValueError for
-    an unknown plan_id; callers map that to 400.
+    an unknown plan_id OR a non-monthly interval (project plans belong to
+    project_budgets_service); callers map that to 400.
 
     Returns the same dict shape the /check endpoint returns.
     """
-    get_plan(plan_id)  # raises ValueError on unknown plan
+    _require_month_interval(plan_id)  # raises on unknown / project / unsupported interval
 
     pool = get_pool()
     effective_plan_id = plan_id
@@ -198,13 +310,14 @@ async def evaluate_budget(
                     "[BudgetCheck] expire_subscription_for_user_plan failed for user=%s plan=%s",
                     user_id, effective_plan_id, exc_info=True,
                 )
+            top_up_remaining = topup_balance_eur(budget.top_up_lots, datetime.now(timezone.utc))
             return {
                 "allowed": False,
                 "reason": "trial_expired",
                 "effectivePlanId": effective_plan_id,
                 "monthlyRemainingEur": 0.0,
-                "topUpRemainingEur": budget.top_up_balance_eur,
-                "totalRemainingEur": budget.top_up_balance_eur,
+                "topUpRemainingEur": top_up_remaining,
+                "totalRemainingEur": top_up_remaining,
             }
 
     result = check_budget(budget, effective_plan_id, estimated_cost_eur)
@@ -281,38 +394,35 @@ async def apply_budget_deduction(
     actual_cost_eur: float,
 ) -> Dict[str, Any]:
     """
-    Atomically deduct actual_cost_eur from the user's budget for plan_id.
+    Atomically deduct actual_cost_eur from the user's MONTHLY budget + TopUp lots.
 
-    Auto-provisions a trial when the user is unlicensed and a trial sibling
-    exists. Shared by the POST /v1/budget/deduct endpoint and the Bridge's
-    post-call self-deduction (src/activity/ai_call_writer.py).
+    Monthly-interval plans only — project plans are per-project (routed by the
+    caller to project_budgets_service). Raises ValueError on unknown/non-monthly
+    plan, BudgetDeductionDenied(reason) on 'BUDGET_EXCEEDED' / 'trial_expired'.
 
-    Raises ValueError on an unknown plan, BudgetDeductionDenied(reason) on
-    'BUDGET_EXCEEDED' / 'trial_expired'.
+    The TopUp portion is drawn FIFO across the user's datierte Lots (oldest
+    purchase first, expired lots skipped) and the reduced lot amounts are
+    persisted in the same transaction.
     """
-    get_plan(plan_id)  # raises ValueError on an unknown plan
+    _require_month_interval(plan_id)  # raises on unknown / project / unsupported interval
 
     pool = get_pool()
 
     async with pool.acquire() as conn:
         async with conn.transaction():
-            # Lock both rows for the duration of the transaction.
+            # Lock monthly + lot rows for the duration of the transaction.
             budget_row = await conn.fetchrow(
                 "SELECT monthly_budgets FROM user_budgets WHERE user_id = $1 FOR UPDATE",
                 user_id,
             )
-            topup_row = await conn.fetchrow(
-                "SELECT balance_eur FROM user_topup_balances WHERE user_id = $1 FOR UPDATE",
-                user_id,
-            )
+            old_lots = await _load_topup_lots(conn, user_id, for_update=True)
 
             raw_monthly = _parse_raw_monthly(budget_row)
             monthly_budgets = _build_monthly_budgets(raw_monthly)
-            top_up = float(topup_row["balance_eur"]) if topup_row else 0.0
             budget = UserBudget(
                 user_id=str(user_id),
                 monthly_budgets=monthly_budgets,
-                top_up_balance_eur=top_up,
+                top_up_lots=old_lots,
             )
 
             # Auto-provision trial when user is unlicensed and a trial sibling exists.
@@ -332,7 +442,7 @@ async def apply_budget_deduction(
                         budget = UserBudget(
                             user_id=str(user_id),
                             monthly_budgets=monthly_budgets,
-                            top_up_balance_eur=top_up,
+                            top_up_lots=old_lots,
                         )
 
             # Trial-expiry check (only for trial plans).
@@ -363,23 +473,14 @@ async def apply_budget_deduction(
                 user_id,
             )
 
-            # Upsert top-up balance.
-            await conn.execute(
-                """
-                INSERT INTO user_topup_balances (user_id, balance_eur, updated_at)
-                VALUES ($1, $2, NOW())
-                ON CONFLICT (user_id) DO UPDATE
-                SET balance_eur = $2, updated_at = NOW()
-                """,
-                user_id,
-                result.new_top_up_balance,
-            )
+            # Persist FIFO-reduced TopUp lots (only the changed ones).
+            await _persist_topup_lots(conn, old_lots, result.new_top_up_lots)
 
     return {
         "fromMonthly": result.from_monthly,
         "fromTopUp": result.from_top_up,
         "newMonthlyUsed": result.new_monthly_used,
-        "newTopUpBalance": result.new_top_up_balance,
+        "newTopUpBalance": result.new_top_up_balance_eur,
         "effectivePlanId": effective_plan_id,
     }
 
@@ -420,21 +521,31 @@ async def topup_credit(
         raise HTTPException(status_code=400, detail="amountEur must be > 0")
     user_id = _parse_user_id(body.userId)
 
+    now = datetime.now(timezone.utc)
+    expires_at = _plus_12_months(now)
+
     pool = get_pool()
     async with pool.acquire() as conn:
-        row = await conn.fetchrow(
-            """
-            INSERT INTO user_topup_balances (user_id, balance_eur, updated_at)
-            VALUES ($1, $2, NOW())
-            ON CONFLICT (user_id) DO UPDATE
-            SET balance_eur = user_topup_balances.balance_eur + $2, updated_at = NOW()
-            RETURNING balance_eur
-            """,
-            user_id,
-            body.amountEur,
-        )
+        async with conn.transaction():
+            # A non-migrated legacy scalar balance would make the new lots-based
+            # balance wrong — surface it LOUD rather than credit on top of it.
+            await _assert_no_legacy_topup_balance(conn, user_id)
+            await conn.execute(
+                """
+                INSERT INTO user_topup_lots (user_id, amount_eur, purchased_at, expires_at)
+                VALUES ($1, $2, $3, $4)
+                """,
+                user_id,
+                body.amountEur,
+                now,
+                expires_at,
+            )
+            lots = await _load_topup_lots(conn, user_id)
 
-    return {"newBalance": float(row["balance_eur"])}
+    return {
+        "newBalance": topup_balance_eur(lots, now),
+        "topUpNextExpiryAt": next_topup_expiry(lots, now),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -449,16 +560,21 @@ async def list_budgets(
 
     GET /{user_id} stays the per-user detail view; this list is what the
     Platform-Admin UI joins against /v1/users to render the budget column.
-    Aggregates usedEur/limitEur across all plan budgets a user holds.
+    Aggregates usedEur/limitEur across all plan budgets a user holds, and the
+    sichtbaren TopUp-Saldo (Summe der aktiven, nicht-abgelaufenen Lots).
     """
+    now = datetime.now(timezone.utc)
     pool = get_pool()
     async with pool.acquire() as conn:
         rows = await conn.fetch(
             """
             SELECT ub.user_id, ub.monthly_budgets, ub.updated_at,
-                   tb.balance_eur AS topup_balance
+                   COALESCE((
+                       SELECT SUM(l.amount_eur)
+                       FROM user_topup_lots l
+                       WHERE l.user_id = ub.user_id AND l.expires_at > NOW() AND l.amount_eur > 0
+                   ), 0) AS topup_balance
             FROM user_budgets ub
-            LEFT JOIN user_topup_balances tb ON tb.user_id = ub.user_id
             """
         )
 
@@ -504,6 +620,7 @@ async def get_budget(
     _claims: AuthClaims = Depends(require_self_or_admin),
 ) -> Dict[str, Any]:
     uid = _parse_user_id(user_id)
+    now = datetime.now(timezone.utc)
     pool = get_pool()
     async with pool.acquire() as conn:
         budget = await _load_user_budget(conn, uid)
@@ -545,7 +662,9 @@ async def get_budget(
     return {
         "userId": budget.user_id,
         "monthlyBudgets": _serialize_monthly_budgets(budget.monthly_budgets),
-        "topUpBalanceEur": budget.top_up_balance_eur,
+        # Abgeleitete Anzeige-Skalare aus den Lots (Summe aktiver Lots + frühestes Ablaufdatum).
+        "topUpBalanceEur": topup_balance_eur(budget.top_up_lots, now),
+        "topUpNextExpiryAt": next_topup_expiry(budget.top_up_lots, now),
         "updatedAt": updated_at,
         "monthlyTokensUsed": sum(tokens_by_source.values()),
         "sandboxUsedEur": round(cost_by_source.get("sandbox", 0.0), 4),

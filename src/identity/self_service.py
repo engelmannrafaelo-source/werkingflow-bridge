@@ -299,8 +299,16 @@ async def export_user_data(
             "SELECT monthly_budgets, updated_at FROM user_budgets WHERE user_id = $1", uid
         )
 
+        # TopUp-Saldo aus den datierten Lots (aktive, nicht-abgelaufene Lots).
+        # Der alte Skalar user_topup_balances ist Legacy und wird nicht mehr gelesen.
         balance_row = await conn.fetchrow(
-            "SELECT balance_eur, updated_at FROM user_topup_balances WHERE user_id = $1", uid
+            """
+            SELECT COALESCE(SUM(amount_eur), 0) AS balance_eur,
+                   MAX(updated_at) AS updated_at
+            FROM user_topup_lots
+            WHERE user_id = $1 AND expires_at > NOW() AND amount_eur > 0
+            """,
+            uid,
         )
 
     return {
