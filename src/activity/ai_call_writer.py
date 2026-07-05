@@ -64,6 +64,27 @@ async def _anonymous_identity_present() -> bool:
     return False
 
 
+def resolve_ledger_cost(
+    billing_mode_text: str, provider: str, call_cost_eur: float
+) -> tuple:
+    """Map (tenant billing mode, serving provider) to the usage_events row's
+    (billing_mode enum, real_cost_eur).
+
+    real_cost_eur answers "what do WE pay the provider for this call":
+    - subscription tenants served by our subscription-covered Anthropic
+      accounts have zero marginal cost → 0.0 (per-call cost is hypothetical).
+    - Bedrock is pay-per-use to AWS regardless of the tenant's plan — its
+      calls ALWAYS carry the real cost, or the 1:1 billing audit reads €0
+      while the AWS invoice grows.
+    - pay_per_token tenants pay per call → real == hypothetical.
+
+    Pure function — unit-tested in tests/billing/test_ledger_real_cost.py.
+    """
+    if billing_mode_text == "pay_per_token":
+        return "pay_per_token", call_cost_eur
+    return "flat_rate_estimated", call_cost_eur if provider == "bedrock" else 0.0
+
+
 async def _deduct_call_cost(
     user_id: str,
     app_id: str,
@@ -349,21 +370,12 @@ async def persist_ai_call_activity(
 
             # Usage ledger — structured row with dedicated token/cost columns so
             # the Platform Admin can query across workflow + sandbox without JSONB
-            # extraction.  billing_mode maps from the tenant's TEXT column:
-            #   subscription  → flat_rate_estimated (user pays flat; per-call cost
-            #                   is hypothetical only; real_cost = 0)
-            #   pay_per_token → pay_per_token (real_cost = hypothetical_cost)
-            # Exception: real_cost = 0 only holds for calls served by our
-            # subscription-covered Anthropic accounts. Bedrock invocations are
-            # paid per token to AWS regardless of the tenant's plan — the
-            # ledger must show that cost, or the 1:1 billing audit reads €0
-            # while the AWS invoice grows.
-            if billing_mode_text == "pay_per_token":
-                bm_enum = "pay_per_token"
-                real_cost = call_cost_eur
-            else:
-                bm_enum = "flat_rate_estimated"
-                real_cost = call_cost_eur if provider == "bedrock" else 0.0
+            # extraction.  billing_mode/real_cost mapping lives in
+            # resolve_ledger_cost (pure, unit-tested) — Bedrock always
+            # carries real AWS cost, subscription-served Anthropic is 0.
+            bm_enum, real_cost = resolve_ledger_cost(
+                billing_mode_text, provider, call_cost_eur
+            )
 
             await conn.execute(
                 """
