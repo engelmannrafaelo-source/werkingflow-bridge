@@ -144,11 +144,21 @@ MODELS: List[ModelInfo] = [
 _MODEL_BY_ID: Dict[str, ModelInfo] = {m.id: m for m in MODELS}
 
 def _compute_family_defaults() -> Dict[str, ModelInfo]:
-    """Pick newest model per family by release_date — dynamic, no manual is_default flag needed."""
+    """Family default = the entry with is_default=True; newest release_date
+    only as fallback for families without an explicit flag.
+
+    is_default MUSS gewinnen: die Defaults sind bewusste Entscheidungen
+    (Sonnet 4.5 wegen 4.6-Regression #46935, Opus 4.7) — ein neu in die
+    Registry aufgenommenes Modell darf den Default nicht still kippen.
+    """
     by_family: Dict[str, ModelInfo] = {}
     for m in MODELS:
         cur = by_family.get(m.family)
-        if cur is None or m.release_date > cur.release_date:
+        if cur is None:
+            by_family[m.family] = m
+        elif m.is_default and not cur.is_default:
+            by_family[m.family] = m
+        elif m.is_default == cur.is_default and m.release_date > cur.release_date:
             by_family[m.family] = m
     return by_family
 
@@ -203,26 +213,28 @@ def resolve_model(model_input: str) -> tuple[str, Optional[str]]:
     """
     model_lower = model_input.lower().strip()
 
-    # 1. Exact match — but ONLY honor it if this IS the family default (latest).
-    # Older versions get force-upgraded via fuzzy match below.
+    # 1. Exact match. Force-upgrade gilt NUR fuer Modelle, die AELTER als der
+    # Familien-Default sind (always-latest raeumt Altbestand weg). Der Default
+    # selbst und NEUERE Modelle werden exakt bedient — wer claude-opus-4-8
+    # explizit anfragt, opted bewusst in ein Nicht-Default-Modell ein; ein
+    # "Upgrade" auf den aelteren Default waere ein stilles Downgrade.
     if model_input in _MODEL_BY_ID:
         info = _MODEL_BY_ID[model_input]
-        latest = _DEFAULT_BY_FAMILY.get(info.family)
-        if latest and info.id == latest.id:
-            logger.debug(f"Model exact match (latest): {model_input}")
+        default = _DEFAULT_BY_FAMILY.get(info.family)
+        if default is None or info.release_date >= default.release_date:
+            logger.debug(f"Model exact match: {model_input}")
             return (model_input, None)
-        # Older version explicitly requested — force-upgrade to latest of family.
-        logger.info(f"Force-upgrade: '{model_input}' -> '{latest.id}' (older version, always-latest policy)")
-        return (latest.id, f"Force-upgraded '{model_input}' to '{latest.id}' (always-latest policy)")
+        logger.info(f"Force-upgrade: '{model_input}' -> '{default.id}' (older than family default)")
+        return (default.id, f"Force-upgraded '{model_input}' to '{default.id}' (always-latest policy)")
 
-    # 2. Case-insensitive exact match — same force-upgrade rule.
+    # 2. Case-insensitive exact match — same rule.
     for model_id in _MODEL_BY_ID:
         if model_id.lower() == model_lower:
             info = _MODEL_BY_ID[model_id]
-            latest = _DEFAULT_BY_FAMILY.get(info.family)
-            if latest and info.id == latest.id:
+            default = _DEFAULT_BY_FAMILY.get(info.family)
+            if default is None or info.release_date >= default.release_date:
                 return (model_id, f"Resolved '{model_input}' to '{model_id}' (case corrected)")
-            return (latest.id, f"Force-upgraded '{model_input}' to '{latest.id}' (always-latest policy, case corrected)")
+            return (default.id, f"Force-upgraded '{model_input}' to '{default.id}' (always-latest policy, case corrected)")
 
     # 3. Fuzzy match by family name
     family_keywords = {
