@@ -54,6 +54,18 @@ def _operator_claims() -> AuthClaims:
     )
 
 
+@pytest.fixture(autouse=True)
+def _stub_list_subscriptions():
+    """lookup now derives `entitlements` via billing_service.list_subscriptions
+    (lazy-expiring SSoT read). Default to "no subscriptions" so every existing
+    test keeps its focus; entitlement-specific tests override the mock."""
+    with patch(
+        "src.db.admin_routes.billing_service.list_subscriptions",
+        new=AsyncMock(return_value=[]),
+    ) as mock:
+        yield mock
+
+
 def _make_app(claims: AuthClaims) -> FastAPI:
     app = FastAPI()
     app.include_router(admin_router)
@@ -412,3 +424,170 @@ class TestDriftCorrectionFlow:
 
         assert assign_resp.status_code == 200
         assert assign_resp.json()["created"] is True
+
+
+# ---------------------------------------------------------------------------
+# Lookup: entitlements (subscription-derived verdicts)
+# ---------------------------------------------------------------------------
+
+class TestLookupEntitlements:
+    def test_entitlements_come_from_billing_service(self, _stub_list_subscriptions):
+        """The gate-relevant field: verdicts derive from subscriptions via the
+        lazy-expiring billing read — NOT from app_licenses."""
+        uid = uuid.uuid4()
+        _stub_list_subscriptions.return_value = [
+            {"appId": "werking-energy", "status": "active",
+             "planId": "energy-project", "trialEndsAt": None,
+             "mollieCustomerId": "seed-x", "seats": 1},
+        ]
+        pool, _conn = _make_pool(
+            fetchrow_results=[_user_row(user_id=uid)], fetch_result=[]
+        )
+        client = TestClient(_make_app(_operator_claims()))
+        with patch("src.db.admin_routes.get_pool", return_value=pool):
+            resp = client.get("/v1/admin/users/lookup?email=alice@example.com")
+
+        assert resp.status_code == 200, resp.text
+        ents = resp.json()["entitlements"]
+        assert ents == [{"appId": "werking-energy", "status": "active",
+                         "planId": "energy-project", "trialEndsAt": None}]
+
+    def test_license_without_subscription_shows_empty_entitlements(self):
+        """The exact 2026-07-06 trap: a valid license but NO active
+        subscription → entitlements empty → operator sees at a glance why
+        the app bounces with reason=no-license."""
+        uid = uuid.uuid4()
+        pool, _conn = _make_pool(
+            fetchrow_results=[_user_row(user_id=uid)],
+            fetch_result=[_license_row(app_id="werking-energy", plan_id="energy-project")],
+        )
+        client = TestClient(_make_app(_operator_claims()))
+        with patch("src.db.admin_routes.get_pool", return_value=pool):
+            resp = client.get("/v1/admin/users/lookup?email=alice@example.com")
+
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["app_licenses"][0]["app_id"] == "werking-energy"
+        assert body["entitlements"] == []
+
+
+# ---------------------------------------------------------------------------
+# POST /v1/admin/users/{user_id}/subscriptions — grant access
+# ---------------------------------------------------------------------------
+
+def _subscription_dict(app_id: str = "werking-energy", plan_id: str = "energy-project") -> dict:
+    return {
+        "id": str(uuid.uuid4()),
+        "userId": str(uuid.uuid4()),
+        "appId": app_id,
+        "planId": plan_id,
+        "status": "active",
+        "mollieCustomerId": "seed-x",
+        "mollieSubscriptionId": None,
+        "seats": 1,
+        "startedAt": datetime.now(timezone.utc).isoformat(),
+        "cancelledAt": None,
+        "suspendedAt": None,
+        "expiredAt": None,
+        "trialEndsAt": None,
+    }
+
+
+def _license_upsert_row(app_id: str = "werking-energy", plan_id: str = "energy-project",
+                        created: bool = True) -> dict:
+    today = datetime.now(timezone.utc).date()
+    return {
+        "user_id": uuid.uuid4(),
+        "app_id": app_id,
+        "plan_id": plan_id,
+        "start_date": today,
+        "end_date": None,
+        "seats": 1,
+        "created": created,
+    }
+
+
+class TestGrantSubscription:
+    def _post(self, *, pool, grant_result, user_id=None, body=None):
+        client = TestClient(_make_app(_operator_claims()))
+        uid = user_id or str(uuid.uuid4())
+        payload = body or {"app_id": "werking-energy", "plan_id": "energy-project"}
+        with patch("src.db.admin_routes.get_pool", return_value=pool), patch(
+            "src.db.admin_routes.billing_service.grant_subscription",
+            new=AsyncMock(return_value=grant_result),
+        ) as grant_mock:
+            resp = client.post(f"/v1/admin/users/{uid}/subscriptions", json=payload)
+        return resp, grant_mock
+
+    def test_grant_creates_subscription_and_license(self):
+        pool, _conn = _make_pool(
+            fetchrow_results=[_license_upsert_row(created=True)], fetchval_result=1
+        )
+        resp, grant_mock = self._post(
+            pool=pool, grant_result=(_subscription_dict(), True)
+        )
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["subscription_created"] is True
+        assert body["license_created"] is True
+        assert body["subscription"]["appId"] == "werking-energy"
+        assert body["subscription"]["status"] == "active"
+        assert body["app_license"]["plan_id"] == "energy-project"
+        grant_mock.assert_awaited_once()
+
+    def test_existing_active_subscription_is_not_mutated(self):
+        """Idempotency: created=false from billing_service surfaces verbatim."""
+        pool, _conn = _make_pool(
+            fetchrow_results=[_license_upsert_row(created=False)], fetchval_result=1
+        )
+        resp, _ = self._post(pool=pool, grant_result=(_subscription_dict(), False))
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["subscription_created"] is False
+
+    def test_unknown_plan_fails_fast_before_any_write(self):
+        pool, conn = _make_pool(fetchval_result=1)
+        resp, grant_mock = self._post(
+            pool=pool, grant_result=(_subscription_dict(), True),
+            body={"app_id": "werking-energy", "plan_id": "does-not-exist"},
+        )
+        assert resp.status_code == 400
+        assert "Unknown plan_id" in resp.json()["detail"]
+        conn.fetchrow.assert_not_awaited()
+        grant_mock.assert_not_awaited()
+
+    def test_unknown_app_fails_fast_before_any_write(self):
+        pool, conn = _make_pool(fetchval_result=1)
+        resp, grant_mock = self._post(
+            pool=pool, grant_result=(_subscription_dict(), True),
+            body={"app_id": "not-an-app", "plan_id": "energy-project"},
+        )
+        assert resp.status_code == 400
+        assert "Unknown app_id" in resp.json()["detail"]
+        conn.fetchrow.assert_not_awaited()
+        grant_mock.assert_not_awaited()
+
+    def test_malformed_user_id_is_400(self):
+        pool, _conn = _make_pool(fetchval_result=1)
+        resp, _ = self._post(
+            pool=pool, grant_result=(_subscription_dict(), True),
+            user_id="not-a-uuid",
+        )
+        assert resp.status_code == 400
+        assert "UUID" in resp.json()["detail"]
+
+    def test_missing_user_is_404(self):
+        pool, _conn = _make_pool(fetchval_result=None)
+        resp, grant_mock = self._post(
+            pool=pool, grant_result=(_subscription_dict(), True)
+        )
+        assert resp.status_code == 404
+        grant_mock.assert_not_awaited()
+
+    def test_plan_id_is_mandatory(self):
+        """No trial default here — an operator grant must state the plan."""
+        pool, _conn = _make_pool(fetchval_result=1)
+        resp, _ = self._post(
+            pool=pool, grant_result=(_subscription_dict(), True),
+            body={"app_id": "werking-energy"},
+        )
+        assert resp.status_code == 422

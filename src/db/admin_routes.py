@@ -23,6 +23,7 @@ Auth model:
   GET    /v1/app-licenses?userId=                            — require_self_or_admin (if userId given) else admin
   GET    /v1/admin/users/lookup?email=                       — admin only
   POST   /v1/admin/users/{user_id}/app-licenses              — admin only (legacy drift-correction path, no date control)
+  POST   /v1/admin/users/{user_id}/subscriptions             — admin only (GRANT ACCESS: subscription = entitlement-SSoT + license in lockstep)
 """
 import json
 import logging
@@ -39,6 +40,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, EmailStr, Field
 
 from src.api_auth import require_admin, require_jwt_or_service, require_self_or_admin, AuthClaims, get_tenant_of_user
+from src.billing import billing_service
 from src.db.client import get_pool
 
 logger = logging.getLogger(__name__)
@@ -576,11 +578,32 @@ class AppLicensePayload(BaseModel):
     seats: int
 
 
+class EntitlementVerdict(BaseModel):
+    """
+    Authorization verdict for one app — the SAME four fields the login
+    response's `entitlements` claim carries (identity/routes.py
+    _entitlements_for). camelCase on purpose: it mirrors the JWT claim
+    shape apps already consume, so an operator comparing lookup output
+    against a captured token sees identical keys.
+    """
+    appId: str
+    status: str
+    planId: str
+    trialEndsAt: Optional[str] = None
+
+
 class UserLookupResponse(BaseModel):
     """
     Operator-scoped lookup result. Explicit fields — no JsonValueSchema or
     z.unknown wrapper. The drift-correction caller reads `user_id` + walks
     `app_licenses` to decide whether to assign a new license.
+
+    `entitlements` is the field that answers "does this user get in?" —
+    app middlewares gate EXCLUSIVELY on these subscription-derived verdicts;
+    `app_licenses` is provisioning/portfolio metadata and grants nothing.
+    Before 2026-07-06 the lookup showed only licenses, which sent operators
+    (and agents) down the wrong diagnosis path when a customer bounced with
+    reason=no-license despite a "valid license".
 
     `anonymized_at` is included so the caller can detect the "row is closed"
     edge case. (In practice anonymization rewrites the email to a placeholder,
@@ -595,6 +618,7 @@ class UserLookupResponse(BaseModel):
     email_verified: bool
     anonymized_at: Optional[str] = None
     app_licenses: List[AppLicensePayload]
+    entitlements: List[EntitlementVerdict]
     created_at: str
     updated_at: str
 
@@ -642,6 +666,21 @@ async def lookup_user_by_email(
             row["id"],
         )
 
+    # Subscription-derived verdicts — the field app gates actually check.
+    # Goes through billing_service.list_subscriptions (NOT raw SQL) so the
+    # lazy-expiry of past-due trials runs and the lookup never shows an
+    # entitlement the login would deny.
+    subscriptions = await billing_service.list_subscriptions(str(row["id"]))
+    entitlements = [
+        {
+            "appId": s["appId"],
+            "status": s["status"],
+            "planId": s["planId"],
+            "trialEndsAt": s.get("trialEndsAt"),
+        }
+        for s in subscriptions
+    ]
+
     return {
         "user_id": str(row["id"]),
         "email": row["email"],
@@ -662,9 +701,38 @@ async def lookup_user_by_email(
             }
             for lr in license_rows
         ],
+        "entitlements": entitlements,
         "created_at": row["created_at"].isoformat(),
         "updated_at": row["updated_at"].isoformat(),
     }
+
+
+async def _upsert_app_license(
+    conn: Any, uid: uuid.UUID, app_id: str, plan_id: str, start_date: date, seats: int
+) -> Any:
+    """UPSERT one app_license row on (user_id, app_id) — the UNIQUE constraint
+    from 001_initial_schema.sql. The `xmax = 0` predicate distinguishes the
+    insert path (xmax stays at the row's natural value, here 0) from the
+    update path (xmax is set to the updating txn id) — the canonical
+    PostgreSQL idiom for "tell me if my UPSERT created vs updated"; no extra
+    round-trip. Shared by the license-assign and subscription-grant routes."""
+    return await conn.fetchrow(
+        """
+        INSERT INTO app_licenses (user_id, app_id, plan_id, start_date, end_date, seats)
+        VALUES ($1, $2::app_id, $3::plan_id, $4, NULL, $5)
+        ON CONFLICT (user_id, app_id) DO UPDATE
+          SET plan_id    = EXCLUDED.plan_id,
+              start_date = EXCLUDED.start_date,
+              seats      = EXCLUDED.seats
+        RETURNING user_id, app_id, plan_id, start_date, end_date, seats,
+                  (xmax = 0) AS created
+        """,
+        uid,
+        app_id,
+        plan_id,
+        start_date,
+        seats,
+    )
 
 
 class AppLicenseAssignRequest(BaseModel):
@@ -737,29 +805,7 @@ async def assign_app_license(
         if not user_exists:
             raise HTTPException(status_code=404, detail=f"User '{user_id}' not found")
 
-        # UPSERT on (user_id, app_id) — the UNIQUE constraint from
-        # 001_initial_schema.sql. The `xmax = 0` predicate distinguishes the
-        # insert path (xmax stays at the row's natural value, here 0) from
-        # the update path (xmax is set to the updating txn id). This is the
-        # canonical PostgreSQL idiom for "tell me if my UPSERT created vs
-        # updated"; no extra round-trip needed.
-        row = await conn.fetchrow(
-            """
-            INSERT INTO app_licenses (user_id, app_id, plan_id, start_date, end_date, seats)
-            VALUES ($1, $2::app_id, $3::plan_id, $4, NULL, $5)
-            ON CONFLICT (user_id, app_id) DO UPDATE
-              SET plan_id    = EXCLUDED.plan_id,
-                  start_date = EXCLUDED.start_date,
-                  seats      = EXCLUDED.seats
-            RETURNING user_id, app_id, plan_id, start_date, end_date, seats,
-                      (xmax = 0) AS created
-            """,
-            uid,
-            body.app_id,
-            body.plan_id,
-            today,
-            body.seats,
-        )
+        row = await _upsert_app_license(conn, uid, body.app_id, body.plan_id, today, body.seats)
 
     logger.info(
         "admin.assign_app_license: user_id=%s app_id=%s plan_id=%s seats=%s created=%s",
@@ -778,6 +824,148 @@ async def assign_app_license(
         "end_date": row["end_date"].isoformat() if row["end_date"] else None,
         "seats": row["seats"],
         "created": bool(row["created"]),
+    }
+
+
+class SubscriptionPayload(BaseModel):
+    """Serialized subscription row (billing_service._serialize_subscription).
+    camelCase mirrors the billing service's canonical wire shape."""
+    id: str
+    userId: str
+    appId: str
+    planId: str
+    status: str
+    mollieCustomerId: Optional[str] = None
+    mollieSubscriptionId: Optional[str] = None
+    seats: int
+    startedAt: Optional[str] = None
+    cancelledAt: Optional[str] = None
+    suspendedAt: Optional[str] = None
+    expiredAt: Optional[str] = None
+    trialEndsAt: Optional[str] = None
+
+
+class SubscriptionGrantRequest(BaseModel):
+    app_id: str = Field(description="Target app_id. Must be one of the known app_id enum values.")
+    plan_id: str = Field(
+        description=(
+            "Plan identifier — EXPLICIT, no default. An operator granting "
+            "access must state the plan; 'trial' re-issues the forced-trial "
+            "window, everything else grants without expiry."
+        ),
+    )
+    seats: int = Field(default=1, ge=1, description="Seat count. Must be ≥ 1.")
+
+
+class SubscriptionGrantResponse(BaseModel):
+    """The grant result: the subscription (SSoT for entitlements) plus the
+    app_license kept in lockstep, each with its created-vs-existing flag."""
+    subscription: SubscriptionPayload
+    subscription_created: bool
+    app_license: AppLicensePayload
+    license_created: bool
+
+
+@router.post(
+    "/v1/admin/users/{user_id}/subscriptions",
+    response_model=SubscriptionGrantResponse,
+)
+async def grant_subscription(
+    user_id: str,
+    body: SubscriptionGrantRequest,
+    claims: AuthClaims = Depends(require_admin),
+) -> Dict[str, Any]:
+    """
+    Operator-only: grant a user ACCESS to an app — subscription + license in
+    one call.
+
+    This is the endpoint operators actually need: app middlewares gate on the
+    subscription-derived `entitlements` claim, so assigning an app_license
+    alone (the sibling endpoint) changes NOTHING about access. Before this
+    endpoint existed, granting access outside a Mollie checkout meant
+    hand-written SQL against the production database (2026-07-06, Kurt
+    Engelmann: valid energy license, bounced with reason=no-license).
+
+    Order of operations: license first (portfolio metadata), then the
+    subscription (the actual grant). If the subscription step fails the
+    caller retries idempotently; the intermediate "license without
+    subscription" state is exactly the harmless pre-existing kind.
+
+    Idempotency: an existing ACTIVE subscription for (user, app) is returned
+    unchanged (`subscription_created: false`) — billing rows are never
+    silently mutated. Changing a live subscription is a deliberate separate
+    operation (cancel + re-grant).
+
+    Status mapping:
+      200 → success (flags distinguish created vs already-present)
+      400 → invalid user_id / unknown app_id / unknown plan_id
+      404 → user_id does not exist
+    """
+    if body.app_id not in _ALLOWED_APP_IDS:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Unknown app_id '{body.app_id}'. Must be one of: "
+                f"{sorted(_ALLOWED_APP_IDS)}"
+            ),
+        )
+    if body.plan_id not in _ALLOWED_PLAN_IDS:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Unknown plan_id '{body.plan_id}'. Must be one of: "
+                f"{sorted(_ALLOWED_PLAN_IDS)}"
+            ),
+        )
+    try:
+        uid = uuid.UUID(user_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid userId (must be UUID)")
+
+    pool = get_pool()
+    today = datetime.now(timezone.utc).date()
+
+    async with pool.acquire() as conn:
+        user_exists = await conn.fetchval("SELECT 1 FROM users WHERE id = $1", uid)
+        if not user_exists:
+            raise HTTPException(status_code=404, detail=f"User '{user_id}' not found")
+
+        license_row = await _upsert_app_license(
+            conn, uid, body.app_id, body.plan_id, today, body.seats
+        )
+
+    granted_by = "service-token" if claims.user_id is None else f"user:{claims.user_id}"
+    subscription, sub_created = await billing_service.grant_subscription(
+        user_id=user_id,
+        app_id=body.app_id,
+        plan_id=body.plan_id,
+        seats=body.seats,
+        granted_by=granted_by,
+    )
+
+    logger.info(
+        "admin.grant_subscription: user_id=%s app_id=%s plan_id=%s seats=%s "
+        "subscription_created=%s license_created=%s granted_by=%s",
+        user_id,
+        body.app_id,
+        body.plan_id,
+        body.seats,
+        sub_created,
+        bool(license_row["created"]),
+        granted_by,
+    )
+
+    return {
+        "subscription": subscription,
+        "subscription_created": sub_created,
+        "app_license": {
+            "app_id": license_row["app_id"],
+            "plan_id": license_row["plan_id"],
+            "start_date": license_row["start_date"].isoformat(),
+            "end_date": license_row["end_date"].isoformat() if license_row["end_date"] else None,
+            "seats": license_row["seats"],
+        },
+        "license_created": bool(license_row["created"]),
     }
 
 

@@ -449,6 +449,107 @@ async def list_subscriptions(user_id: str) -> List[Dict[str, Any]]:
     return [_serialize_subscription(r) for r in rows]
 
 
+# Matches the registration forced-trial window (identity/routes.py register:
+# `trial_ends_at = now + INTERVAL '7 days'`). One constant, one semantic.
+ADMIN_GRANT_TRIAL_DAYS = 7
+
+
+async def grant_subscription(
+    user_id: str,
+    app_id: str,
+    plan_id: str,
+    seats: int = 1,
+    granted_by: str = "operator",
+) -> Tuple[Dict[str, Any], bool]:
+    """
+    Operator grant: create an ACTIVE subscription without a Mollie checkout.
+
+    The admin-side twin of the Mollie activation path — and the ONLY
+    sanctioned way to hand out access outside a payment flow (real-customer
+    onboarding, demos, support). It exists because entitlements — the claim
+    every app gates on — derive exclusively from this table: an app_license
+    alone grants NOTHING. (2026-07-06: a real customer bounced with
+    reason=no-license while holding a valid energy license, and the fix
+    required hand-written SQL against the prod DB. Never again.)
+
+    Semantics (defensive, fail fast):
+      * Caller validates app_id/plan_id against the enum allowlists and maps
+        errors to HTTP — this function trusts its inputs and lets Postgres
+        reject anything that slips through (enum cast raises, no fallback).
+      * If the user already holds an ACTIVE subscription for the app, that
+        row is returned unchanged with created=False. Billing rows are never
+        silently mutated — changing a live subscription is a deliberate,
+        separate operation (cancel + re-grant).
+      * plan 'trial' → trial_ends_at = now + ADMIN_GRANT_TRIAL_DAYS and
+        mollie_customer_id stays NULL (the schema CHECK allows NULL only for
+        trials — list_subscriptions lazy-expires the row past its window).
+      * any other plan → no expiry; the CHECK demands a non-NULL
+        mollie_customer_id although no Mollie customer exists, so we write
+        the established seed marker 'seed-<user_id>' (the same convention the
+        2026-06-18 customer seeding used) — seeded and admin-granted rows
+        stay queryable as one class.
+      * metadata records the honest provenance: the seed marker satisfies
+        the constraint, the metadata says WHY the row exists.
+
+    Returns (serialized_subscription, created).
+    Raises ValueError on a malformed user_id (caller maps to 400).
+    """
+    uid = uuid.UUID(user_id)
+    now = datetime.now(timezone.utc)
+    is_trial = plan_id == "trial"
+    trial_ends_at = now + timedelta(days=ADMIN_GRANT_TRIAL_DAYS) if is_trial else None
+    mollie_customer_id = None if is_trial else f"seed-{user_id}"
+    metadata = json.dumps({"source": "admin-grant", "granted_by": granted_by})
+
+    pool = get_pool()
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            # Idempotency probe inside the transaction. Two racing granters
+            # can at worst insert two active rows — entitlement semantics
+            # tolerate that (ANY active row passes, see identity routes'
+            # _entitlements_for) — the probe keeps the common path single-row.
+            existing = await conn.fetchrow(
+                """
+                SELECT id, user_id, app_id, plan_id, status, mollie_customer_id,
+                       mollie_subscription_id, seats, started_at, cancelled_at,
+                       suspended_at, expired_at, trial_ends_at
+                  FROM subscriptions
+                 WHERE user_id = $1
+                   AND app_id = $2::app_id
+                   AND status = 'active'::subscription_status
+                 ORDER BY started_at DESC
+                 LIMIT 1
+                """,
+                uid,
+                app_id,
+            )
+            if existing:
+                return _serialize_subscription(existing), False
+
+            row = await conn.fetchrow(
+                """
+                INSERT INTO subscriptions
+                    (user_id, app_id, plan_id, status, mollie_customer_id,
+                     seats, started_at, trial_ends_at, metadata)
+                VALUES
+                    ($1, $2::app_id, $3::plan_id, 'active'::subscription_status,
+                     $4, $5, $6, $7, $8::jsonb)
+                RETURNING id, user_id, app_id, plan_id, status, mollie_customer_id,
+                          mollie_subscription_id, seats, started_at, cancelled_at,
+                          suspended_at, expired_at, trial_ends_at
+                """,
+                uid,
+                app_id,
+                plan_id,
+                mollie_customer_id,
+                seats,
+                now,
+                trial_ends_at,
+                metadata,
+            )
+    return _serialize_subscription(row), True
+
+
 async def cancel_subscription(user_id: str, subscription_id: str) -> None:
     """
     Cancel a subscription transactionally.
