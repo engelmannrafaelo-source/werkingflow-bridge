@@ -5649,44 +5649,41 @@ async def convert_and_anonymize_document_endpoint(
     )
 
 
-def _resolve_stt_upstream() -> tuple[str, dict, str]:
-    """Resolve the speech-to-text upstream (URL, auth headers, provider label) for
-    the /v1/audio/transcriptions proxy.
+def _resolve_stt_provider() -> dict:
+    """Resolve the speech-to-text provider config for the /v1/audio/transcriptions
+    endpoint.
 
     EU data-residency (GDPR) is selected via env, NOT hardcoded, so the same Bridge
-    image serves the default US-OpenAI path (backward-compatible) or an EU provider
-    once credentials are provisioned and STT_PROVIDER is flipped. Fail-loud
-    (config_error) when the selected provider is missing required credentials —
-    NEVER silently fall back to a US endpoint (that would defeat the GDPR purpose;
+    image serves the default US-OpenAI path (backward-compatible) or an EU-resident
+    provider once it is provisioned and STT_PROVIDER is flipped. Fail-loud
+    (config_error) when the selected provider is missing required config — NEVER
+    silently fall back to a US endpoint (that would defeat the GDPR purpose;
     defensive-programming: kein silent fail, kein Fallback).
 
     Providers (env STT_PROVIDER, default "openai"):
-      - "openai": https://api.openai.com/v1 — or OPENAI_STT_BASE_URL override.
-                  Set OPENAI_STT_BASE_URL=https://eu.api.openai.com/v1 (+ an
-                  EU-region OPENAI_API_KEY) for OpenAI's own EU data residency.
+      - "openai" (kind="proxy"): OpenAI multipart proxy. Default
+                  https://api.openai.com/v1 (US), or set
+                  OPENAI_STT_BASE_URL=https://eu.api.openai.com/v1 (+ an EU-region
+                  OPENAI_API_KEY) for OpenAI's own EU data residency.
                   Auth: Authorization: Bearer OPENAI_API_KEY.
-      - "azure":  Azure OpenAI Whisper in an EU region (Sweden/France Central,
-                  West Europe). URL carries deployment + api-version; auth is the
-                  api-key header. Multipart form fields are identical to OpenAI.
+      - "aws-sagemaker" (kind="aws-sagemaker"): self-hosted Whisper on Amazon
+                  SageMaker in an EU region (default eu-central-1/Frankfurt),
+                  reusing the same AWS credentials the Bridge already uses for
+                  Bedrock (bedrock_credential_manager). A synchronous
+                  invoke_endpoint call — zero Whisper quality regression, cleanest
+                  fit for this synchronous file->text endpoint. Requires the AWS
+                  key to hold sagemaker:InvokeEndpoint and a deployed Whisper
+                  endpoint (see docs/manual-tasks/EU_DATA_RESIDENCY_STT_EMAIL.md).
+
+    NOTE (Rafael 2026-07-06): AWS is the chosen EU route (AWS is already wired for
+    Bedrock); Azure was rejected (no new Azure account). Amazon Transcribe was
+    evaluated and NOT chosen — it is inherently async (batch/S3) or streaming
+    (PCM + eventstream + transcoding), a poor fit for this synchronous endpoint,
+    and would change ASR quality for German technical dictation.
+
+    Returns a dict with "kind" and "provider" plus kind-specific fields.
     """
     provider = (os.getenv("STT_PROVIDER") or "openai").strip().lower()
-
-    if provider == "azure":
-        endpoint = (os.getenv("AZURE_OPENAI_STT_ENDPOINT") or "").rstrip("/")
-        key = os.getenv("AZURE_OPENAI_STT_KEY")
-        deployment = os.getenv("AZURE_OPENAI_STT_DEPLOYMENT")
-        api_version = os.getenv("AZURE_OPENAI_STT_API_VERSION") or "2024-06-01"
-        missing = [name for name, value in (
-            ("AZURE_OPENAI_STT_ENDPOINT", endpoint),
-            ("AZURE_OPENAI_STT_KEY", key),
-            ("AZURE_OPENAI_STT_DEPLOYMENT", deployment),
-        ) if not value]
-        if missing:
-            raise BridgeError(config_error(
-                detail=f"STT_PROVIDER=azure but missing {', '.join(missing)} on Bridge — contact admin"
-            ))
-        url = f"{endpoint}/openai/deployments/{deployment}/audio/transcriptions?api-version={api_version}"
-        return url, {"api-key": key}, provider
 
     if provider == "openai":
         openai_api_key = os.getenv("OPENAI_API_KEY")
@@ -5696,11 +5693,90 @@ def _resolve_stt_upstream() -> tuple[str, dict, str]:
                 detail="OPENAI_API_KEY not configured on Bridge — contact admin"
             ))
         base = (os.getenv("OPENAI_STT_BASE_URL") or "https://api.openai.com/v1").rstrip("/")
-        return f"{base}/audio/transcriptions", {"Authorization": f"Bearer {openai_api_key}"}, provider
+        return {
+            "kind": "proxy",
+            "provider": "openai",
+            "url": f"{base}/audio/transcriptions",
+            "headers": {"Authorization": f"Bearer {openai_api_key}"},
+        }
+
+    if provider == "aws-sagemaker":
+        from src.auth import bedrock_credential_manager as _bcm  # noqa: PLC0415 — reuse AWS creds
+        endpoint_name = os.getenv("AWS_STT_SAGEMAKER_ENDPOINT")
+        region = os.getenv("AWS_STT_REGION") or _bcm.default_region  # eu-central-1
+        missing = []
+        if not endpoint_name:
+            missing.append("AWS_STT_SAGEMAKER_ENDPOINT")
+        if not _bcm.is_configured():
+            missing.append(
+                "AWS credentials (AWS_ACCESS_KEY_ID_BEDROCK/AWS_SECRET_ACCESS_KEY_BEDROCK "
+                "or AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY)"
+            )
+        if missing:
+            raise BridgeError(config_error(
+                detail=f"STT_PROVIDER=aws-sagemaker but missing {', '.join(missing)} on Bridge — contact admin"
+            ))
+        return {
+            "kind": "aws-sagemaker",
+            "provider": "aws-sagemaker",
+            "endpoint_name": endpoint_name,
+            "region": region,
+            "access_key": _bcm.aws_access_key,
+            "secret_key": _bcm.aws_secret_key,
+        }
 
     raise BridgeError(config_error(
-        detail=f"Unknown STT_PROVIDER={provider!r} on Bridge (expected 'openai' or 'azure') — contact admin"
+        detail=f"Unknown STT_PROVIDER={provider!r} on Bridge (expected 'openai' or 'aws-sagemaker') — contact admin"
     ))
+
+
+def _sagemaker_transcribe_sync(
+    *, endpoint_name: str, region: str, access_key: str, secret_key: str,
+    audio_bytes: bytes, content_type: str,
+) -> dict:
+    """Invoke a SageMaker real-time Whisper endpoint synchronously and return the
+    OpenAI-shaped {"text": ...} dict. Blocking boto3 — call via asyncio.to_thread.
+
+    Endpoint contract (documented in the runbook): the endpoint must be a Whisper
+    ASR endpoint deployed with the HuggingFace ASR inference toolkit (SageMaker
+    JumpStart "Whisper" or the HF ASR DLC), which accepts raw audio bytes with an
+    audio/* content type and returns JSON {"text": "..."}. boto3 signs the request
+    with SigV4 using the (Bedrock) AWS creds — same mechanism as bedrock_service.py.
+
+    ⚠️ This path is off-by-default and has NOT been verified against a live endpoint
+    (no SageMaker endpoint provisioned yet — Rafael's account action). It is
+    fail-loud: any contract mismatch raises, never returns a wrong-but-silent result.
+    """
+    import boto3  # noqa: PLC0415 — local import, matches bedrock_service.py pattern
+    client = boto3.client(
+        "sagemaker-runtime",
+        region_name=region,
+        aws_access_key_id=access_key,
+        aws_secret_access_key=secret_key,
+    )
+    resp = client.invoke_endpoint(
+        EndpointName=endpoint_name,
+        ContentType=content_type or "audio/wav",
+        Accept="application/json",
+        Body=audio_bytes,
+    )
+    raw = resp["Body"].read()
+    try:
+        parsed = json.loads(raw)
+    except (ValueError, TypeError) as exc:
+        raise RuntimeError(
+            f"SageMaker STT endpoint returned non-JSON body (first 200B: {raw[:200]!r})"
+        ) from exc
+    # HF ASR toolkit returns {"text": "..."}; some variants wrap it in a list.
+    if isinstance(parsed, dict) and isinstance(parsed.get("text"), str):
+        return {"text": parsed["text"]}
+    if (isinstance(parsed, list) and parsed and isinstance(parsed[0], dict)
+            and isinstance(parsed[0].get("text"), str)):
+        return {"text": parsed[0]["text"]}
+    raise RuntimeError(
+        "SageMaker STT endpoint JSON missing a string 'text' field: got "
+        f"{list(parsed.keys()) if isinstance(parsed, dict) else type(parsed).__name__}"
+    )
 
 
 @app.post("/v1/audio/transcriptions")
@@ -5708,18 +5784,19 @@ async def audio_transcriptions(
     request: Request,
     credentials: Optional[HTTPAuthorizationCredentials] = Depends(security)
 ):
-    """Proxy Whisper audio transcription to the configured STT provider.
+    """Transcribe audio via the configured STT provider.
 
-    Provider + endpoint are env-driven (see _resolve_stt_upstream): default
-    OpenAI-US, or an EU-resident provider (Azure OpenAI EU / OpenAI EU) once
-    provisioned. App-facing contract is unchanged — apps keep posting the same
-    multipart form to the Bridge.
+    Provider is env-driven (see _resolve_stt_provider): default OpenAI-US proxy,
+    or an EU-resident provider once provisioned — OpenAI EU (base-url override) or
+    self-hosted Whisper on Amazon SageMaker EU (aws-sagemaker). App-facing contract
+    is unchanged — apps keep posting the same multipart form to the Bridge.
     """
     await verify_api_key(request, credentials)
 
-    # Resolve upstream + validate provider credentials before reading the (large)
-    # audio body — fail fast on misconfig.
-    _stt_url, _stt_headers, _stt_provider = _resolve_stt_upstream()
+    # Resolve provider + validate config before reading the (large) audio body —
+    # fail fast on misconfig.
+    _stt = _resolve_stt_provider()
+    _stt_provider = _stt["provider"]
 
     import httpx  # noqa: PLC0415 — local import; httpx has no module-level import in main.py
     _start = time.time()
@@ -5741,42 +5818,63 @@ async def audio_transcriptions(
         prompt = form.get("prompt")
         temperature = form.get("temperature")
 
-        # Build multipart fields for OpenAI
-        files = {"file": (filename, audio_bytes, content_type)}
-        data = {"model": _model, "response_format": response_format}
-        if language:
-            data["language"] = language
-        if prompt:
-            data["prompt"] = prompt
-        if temperature:
-            data["temperature"] = temperature
-
-        async with httpx.AsyncClient(timeout=120.0) as client:
-            response = await client.post(
-                _stt_url,
-                headers=_stt_headers,
-                files=files,
-                data=data,
+        if _stt["kind"] == "aws-sagemaker":
+            # Self-hosted Whisper on SageMaker (EU). Synchronous single invoke; run
+            # the blocking boto3 call off the event loop (same as the Bedrock path).
+            # response_format/prompt/temperature are OpenAI-proxy concepts; the ASR
+            # endpoint returns {"text": ...}, which we pass through as OpenAI-shaped
+            # json. content_type carries the audio format the HF ASR toolkit needs.
+            _content = await asyncio.to_thread(
+                _sagemaker_transcribe_sync,
+                endpoint_name=_stt["endpoint_name"],
+                region=_stt["region"],
+                access_key=_stt["access_key"],
+                secret_key=_stt["secret_key"],
+                audio_bytes=audio_bytes,
+                content_type=content_type,
             )
-            response.raise_for_status()
-            try:
-                _attr = extract_attribution_context(request)
-                from src.activity.ai_call_writer import persist_ai_call_activity
-                await persist_ai_call_activity(
-                    app_id=_attr.get("app_id"),
-                    user_id=_attr.get("user_id"),
-                    agent_id="transkription",
-                    workflow_id=_attr.get("workflow_id"),
-                    model=_model,
-                    input_tokens=0,
-                    output_tokens=0,
-                    status="success",
-                    duration_ms=int((time.time() - _start) * 1000),
-                    app_env=_attr.get("app_env"),
+            _status_code = 200
+        else:
+            # Proxy providers (openai / OpenAI-EU): forward the multipart form upstream.
+            files = {"file": (filename, audio_bytes, content_type)}
+            data = {"model": _model, "response_format": response_format}
+            if language:
+                data["language"] = language
+            if prompt:
+                data["prompt"] = prompt
+            if temperature:
+                data["temperature"] = temperature
+
+            async with httpx.AsyncClient(timeout=120.0) as client:
+                response = await client.post(
+                    _stt["url"],
+                    headers=_stt["headers"],
+                    files=files,
+                    data=data,
                 )
-            except Exception as _te:
-                logger.warning(f"transkription activity tracking failed (non-blocking): {_te}")
-            return JSONResponse(content=response.json(), status_code=response.status_code)
+                response.raise_for_status()
+                _content = response.json()
+                _status_code = response.status_code
+
+        # Shared success path (both providers) — track activity (non-blocking) + return.
+        try:
+            _attr = extract_attribution_context(request)
+            from src.activity.ai_call_writer import persist_ai_call_activity
+            await persist_ai_call_activity(
+                app_id=_attr.get("app_id"),
+                user_id=_attr.get("user_id"),
+                agent_id="transkription",
+                workflow_id=_attr.get("workflow_id"),
+                model=_model,
+                input_tokens=0,
+                output_tokens=0,
+                status="success",
+                duration_ms=int((time.time() - _start) * 1000),
+                app_env=_attr.get("app_env"),
+            )
+        except Exception as _te:
+            logger.warning(f"transkription activity tracking failed (non-blocking): {_te}")
+        return JSONResponse(content=_content, status_code=_status_code)
 
     except httpx.HTTPStatusError as e:
         logger.error(f"STT provider ({_stt_provider}) Whisper API error: {e.response.status_code} {e.response.text}")
@@ -5798,7 +5896,7 @@ async def audio_transcriptions(
             )
         except Exception as _te:
             logger.warning(f"transkription error tracking failed (non-blocking): {_te}")
-        raise HTTPException(status_code=e.response.status_code, detail=f"OpenAI Whisper error: {e.response.text}")
+        raise HTTPException(status_code=e.response.status_code, detail=f"STT provider ({_stt_provider}) Whisper error: {e.response.text}")
     except HTTPException:
         raise
     except Exception as e:

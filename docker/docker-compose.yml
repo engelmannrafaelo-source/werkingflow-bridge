@@ -107,14 +107,13 @@ services:
       - ANTHROPIC_VISION_API_KEY=${ANTHROPIC_API_KEY}
       - OPENAI_API_KEY=${OPENAI_API_KEY}
       # STT / Whisper EU data-residency (GDPR) — default openai (US, backward-compat).
-      # Flip STT_PROVIDER=azure + provision AZURE_* for EU (Sweden/France Central),
-      # or set OPENAI_STT_BASE_URL=https://eu.api.openai.com/v1 for OpenAI EU residency.
+      # EU route (Rafael 2026-07-06): STT_PROVIDER=aws-sagemaker + AWS_STT_SAGEMAKER_ENDPOINT
+      # (self-hosted Whisper on SageMaker EU, reuses the Bedrock AWS creds from env_file);
+      # or OPENAI_STT_BASE_URL=https://eu.api.openai.com/v1 for OpenAI's own EU residency.
       - STT_PROVIDER=${STT_PROVIDER:-openai}
       - OPENAI_STT_BASE_URL=${OPENAI_STT_BASE_URL:-}
-      - AZURE_OPENAI_STT_ENDPOINT=${AZURE_OPENAI_STT_ENDPOINT:-}
-      - AZURE_OPENAI_STT_KEY=${AZURE_OPENAI_STT_KEY:-}
-      - AZURE_OPENAI_STT_DEPLOYMENT=${AZURE_OPENAI_STT_DEPLOYMENT:-}
-      - AZURE_OPENAI_STT_API_VERSION=${AZURE_OPENAI_STT_API_VERSION:-}
+      - AWS_STT_SAGEMAKER_ENDPOINT=${AWS_STT_SAGEMAKER_ENDPOINT:-}
+      - AWS_STT_REGION=${AWS_STT_REGION:-}
       - PRIVACY_ENABLED=true
       - PRIVACY_LANGUAGE=de
       - PRIVACY_LOG_DETECTIONS=false
@@ -198,14 +197,13 @@ services:
       - ANTHROPIC_VISION_API_KEY=${ANTHROPIC_API_KEY}
       - OPENAI_API_KEY=${OPENAI_API_KEY}
       # STT / Whisper EU data-residency (GDPR) — default openai (US, backward-compat).
-      # Flip STT_PROVIDER=azure + provision AZURE_* for EU (Sweden/France Central),
-      # or set OPENAI_STT_BASE_URL=https://eu.api.openai.com/v1 for OpenAI EU residency.
+      # EU route (Rafael 2026-07-06): STT_PROVIDER=aws-sagemaker + AWS_STT_SAGEMAKER_ENDPOINT
+      # (self-hosted Whisper on SageMaker EU, reuses the Bedrock AWS creds from env_file);
+      # or OPENAI_STT_BASE_URL=https://eu.api.openai.com/v1 for OpenAI's own EU residency.
       - STT_PROVIDER=${STT_PROVIDER:-openai}
       - OPENAI_STT_BASE_URL=${OPENAI_STT_BASE_URL:-}
-      - AZURE_OPENAI_STT_ENDPOINT=${AZURE_OPENAI_STT_ENDPOINT:-}
-      - AZURE_OPENAI_STT_KEY=${AZURE_OPENAI_STT_KEY:-}
-      - AZURE_OPENAI_STT_DEPLOYMENT=${AZURE_OPENAI_STT_DEPLOYMENT:-}
-      - AZURE_OPENAI_STT_API_VERSION=${AZURE_OPENAI_STT_API_VERSION:-}
+      - AWS_STT_SAGEMAKER_ENDPOINT=${AWS_STT_SAGEMAKER_ENDPOINT:-}
+      - AWS_STT_REGION=${AWS_STT_REGION:-}
       - PRIVACY_ENABLED=true
       - PRIVACY_LANGUAGE=de
       - PRIVACY_LOG_DETECTIONS=false
@@ -289,14 +287,13 @@ services:
       - ANTHROPIC_VISION_API_KEY=${ANTHROPIC_API_KEY}
       - OPENAI_API_KEY=${OPENAI_API_KEY}
       # STT / Whisper EU data-residency (GDPR) — default openai (US, backward-compat).
-      # Flip STT_PROVIDER=azure + provision AZURE_* for EU (Sweden/France Central),
-      # or set OPENAI_STT_BASE_URL=https://eu.api.openai.com/v1 for OpenAI EU residency.
+      # EU route (Rafael 2026-07-06): STT_PROVIDER=aws-sagemaker + AWS_STT_SAGEMAKER_ENDPOINT
+      # (self-hosted Whisper on SageMaker EU, reuses the Bedrock AWS creds from env_file);
+      # or OPENAI_STT_BASE_URL=https://eu.api.openai.com/v1 for OpenAI's own EU residency.
       - STT_PROVIDER=${STT_PROVIDER:-openai}
       - OPENAI_STT_BASE_URL=${OPENAI_STT_BASE_URL:-}
-      - AZURE_OPENAI_STT_ENDPOINT=${AZURE_OPENAI_STT_ENDPOINT:-}
-      - AZURE_OPENAI_STT_KEY=${AZURE_OPENAI_STT_KEY:-}
-      - AZURE_OPENAI_STT_DEPLOYMENT=${AZURE_OPENAI_STT_DEPLOYMENT:-}
-      - AZURE_OPENAI_STT_API_VERSION=${AZURE_OPENAI_STT_API_VERSION:-}
+      - AWS_STT_SAGEMAKER_ENDPOINT=${AWS_STT_SAGEMAKER_ENDPOINT:-}
+      - AWS_STT_REGION=${AWS_STT_REGION:-}
       - PRIVACY_ENABLED=true
       - PRIVACY_LANGUAGE=de
       - PRIVACY_LOG_DETECTIONS=false
@@ -380,14 +377,13 @@ services:
       - ANTHROPIC_VISION_API_KEY=${ANTHROPIC_API_KEY}
       - OPENAI_API_KEY=${OPENAI_API_KEY}
       # STT / Whisper EU data-residency (GDPR) — default openai (US, backward-compat).
-      # Flip STT_PROVIDER=azure + provision AZURE_* for EU (Sweden/France Central),
-      # or set OPENAI_STT_BASE_URL=https://eu.api.openai.com/v1 for OpenAI EU residency.
+      # EU route (Rafael 2026-07-06): STT_PROVIDER=aws-sagemaker + AWS_STT_SAGEMAKER_ENDPOINT
+      # (self-hosted Whisper on SageMaker EU, reuses the Bedrock AWS creds from env_file);
+      # or OPENAI_STT_BASE_URL=https://eu.api.openai.com/v1 for OpenAI's own EU residency.
       - STT_PROVIDER=${STT_PROVIDER:-openai}
       - OPENAI_STT_BASE_URL=${OPENAI_STT_BASE_URL:-}
-      - AZURE_OPENAI_STT_ENDPOINT=${AZURE_OPENAI_STT_ENDPOINT:-}
-      - AZURE_OPENAI_STT_KEY=${AZURE_OPENAI_STT_KEY:-}
-      - AZURE_OPENAI_STT_DEPLOYMENT=${AZURE_OPENAI_STT_DEPLOYMENT:-}
-      - AZURE_OPENAI_STT_API_VERSION=${AZURE_OPENAI_STT_API_VERSION:-}
+      - AWS_STT_SAGEMAKER_ENDPOINT=${AWS_STT_SAGEMAKER_ENDPOINT:-}
+      - AWS_STT_REGION=${AWS_STT_REGION:-}
       - PRIVACY_ENABLED=true
       - PRIVACY_LANGUAGE=de
       - PRIVACY_LOG_DETECTIONS=false
