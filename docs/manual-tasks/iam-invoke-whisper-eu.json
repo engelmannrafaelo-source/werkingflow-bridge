@@ -1,0 +1,11 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "BridgeInvokeWhisperEU",
+      "Effect": "Allow",
+      "Action": "sagemaker:InvokeEndpoint",
+      "Resource": "arn:aws:sagemaker:eu-central-1:585768177292:endpoint/whisper-large-v3-eu"
+    }
+  ]
+}

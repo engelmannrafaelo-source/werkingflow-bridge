@@ -59,6 +59,35 @@ NICHT gegen einen echten Endpoint verifiziert** (es existiert noch keiner — Ra
 Aktion). Der Pfad ist **off-by-default** und fail-loud: bei Kontrakt-Abweichung wirft er, statt
 still Falsches zu liefern. Der OpenAI-Default-Pfad ist unangetastet → **nichts bricht**.
 
+### Warum der Agent das nicht selbst deployen kann (belegt 2026-07-06)
+
+Der AWS-Key der Bridge ist der IAM-User `AI-Reporter-Backend` (Acct 585768177292) und
+**Bedrock-scoped**. Read-only-Probe via boto3 mit genau diesem Key:
+
+| API | Ergebnis |
+|-----|----------|
+| `sagemaker:ListEndpoints` / `ListModels` | 🔴 **AccessDenied** |
+| `iam:GetUser` (eigene Policy ändern) | 🔴 **AccessDenied** |
+| `bedrock:ListFoundationModels` | ✅ OK |
+
+→ Endpoint-Anlage + IAM-Policy brauchen ein **Admin-AWS-Profil / die AWS-Konsole** (nur Rafael).
+Das ist eine harte Berechtigungsgrenze, kein offener Arbeitsschritt.
+
+### Fertige Artefakte (Agent-vorbereitet — reduziert die Handarbeit auf ~5 min)
+
+- **`deploy-sagemaker-whisper-eu.py`** (dieser Ordner): ein-Kommando-Deploy des Whisper-large-v3
+  Real-Time-Endpoints (HF ASR DLC, eu-central-1) via `sagemaker`-SDK. Mit Admin-Profil ausführen:
+  ```
+  export AWS_PROFILE=<admin>   # NICHT der Bedrock-Key (kein sagemaker:*)
+  python3 deploy-sagemaker-whisper-eu.py --endpoint-name whisper-large-v3-eu
+  ```
+- **`iam-invoke-whisper-eu.json`** (dieser Ordner): least-privilege Policy (nur
+  `sagemaker:InvokeEndpoint` auf genau diesen Endpoint) für den Bridge-Bedrock-Key:
+  ```
+  aws iam put-user-policy --user-name AI-Reporter-Backend \
+    --policy-name stt-invoke-whisper-eu --policy-document file://iam-invoke-whisper-eu.json
+  ```
+
 ### 🔴 Was RAFAEL im Account tun muss
 
 1. **SageMaker-Endpoint deployen** — Whisper large-v3 in **eu-central-1** über die **HuggingFace
