@@ -209,6 +209,7 @@ async def convert_pdf_service_endpoint(request: Request):
         form = await request.form()
         file = form.get("file")
         want_descriptions = _truthy(form.get("describe_images"))
+        describe_prompt = form.get("describe_prompt") or ""
         if not file:
             return JSONResponse(
                 status_code=400,
@@ -246,7 +247,9 @@ async def convert_pdf_service_endpoint(request: Request):
         # Opt-in image descriptions (see /document/convert + image_describer).
         image_descriptions = None
         if want_descriptions and images:
-            image_descriptions = await describe_images(images, context=filename)
+            image_descriptions = await describe_images(
+                images, context=filename, describe_prompt=describe_prompt
+            )
             markdown = append_descriptions_to_markdown(markdown, image_descriptions)
 
         conversion_time = _time.time() - t_start
@@ -339,6 +342,7 @@ async def _read_uploaded_file(request: Request) -> Tuple[bytes, str, Optional[st
         "privacy_mode": form.get("privacy_mode"),
         "context_hint": form.get("context_hint"),
         "describe_images": form.get("describe_images"),
+        "describe_prompt": form.get("describe_prompt"),
     }
     return content, filename, mime_hint, extras
 
@@ -356,6 +360,7 @@ async def document_convert_endpoint(request: Request):
     """
     content, filename, mime_hint, extras = await _read_uploaded_file(request)
     want_descriptions = _truthy(extras.get("describe_images"))
+    describe_prompt = extras.get("describe_prompt") or ""
 
     t_start = _time.time()
     loop = asyncio.get_event_loop()
@@ -382,7 +387,9 @@ async def document_convert_endpoint(request: Request):
     # raw images. Off by default (callers opt in via describe_images=true) so
     # existing consumers stay byte-for-byte unchanged.
     if want_descriptions and result.images:
-        descriptions = await describe_images(result.images, context=filename)
+        descriptions = await describe_images(
+            result.images, context=filename, describe_prompt=describe_prompt
+        )
         body["markdown"] = append_descriptions_to_markdown(body["markdown"], descriptions)
         body["image_descriptions"] = descriptions
 

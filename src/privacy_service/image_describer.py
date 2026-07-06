@@ -48,8 +48,13 @@ _USER_PROMPT = (
 
 
 async def _describe_one(
-    provider, b64: str, model: str, context: str
+    provider, b64: str, model: str, context: str, describe_prompt: str = ""
 ) -> str:
+    # A caller-supplied describe_prompt REPLACES the app-neutral default system
+    # prompt (per-app override). Without it, behaviour is byte-for-byte the
+    # neutral default. The user message (incl. the "übernimm wortgetreu, erfinde
+    # nichts / nur Markdown" guardrails) is unchanged either way.
+    system_prompt = describe_prompt if describe_prompt else _SYSTEM_PROMPT
     user_text = _USER_PROMPT
     if context:
         user_text += f"\n\nKontext (Dateiname/Umgebung): {context}"
@@ -70,7 +75,7 @@ async def _describe_one(
         model=model,
         max_tokens=1500,
         temperature=0.1,
-        system_prompt=_SYSTEM_PROMPT,
+        system_prompt=system_prompt,
     )
     return (resp.content or "").strip()
 
@@ -81,11 +86,16 @@ async def describe_images(
     context: str = "",
     model: str = DEFAULT_VISION_MODEL,
     max_concurrency: int = 4,
+    describe_prompt: str = "",
 ) -> Dict[str, str]:
     """Return ``{filename: description}`` for every extracted image.
 
     One Vision call per image, bounded concurrency. See module docstring for the
     failure policy (per-image = visible marker; missing API key = propagate).
+
+    ``describe_prompt`` is an optional per-app override for the system prompt.
+    Empty (the default) keeps the app-neutral factual prompt, so existing
+    callers are unaffected.
     """
     if not images:
         return {}
@@ -96,7 +106,9 @@ async def describe_images(
     async def run(name: str, b64: str) -> Tuple[str, str]:
         async with sem:
             try:
-                return name, await _describe_one(provider, b64, model, context)
+                return name, await _describe_one(
+                    provider, b64, model, context, describe_prompt
+                )
             except ValueError:
                 # Misconfiguration (e.g. no ANTHROPIC_VISION_API_KEY) — surface loudly.
                 raise
