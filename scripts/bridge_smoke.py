@@ -434,6 +434,23 @@ def main():
     if failures:
         names = ", ".join(f"{r.name}({r.endpoint})" for r in failures)
         print(f"SMOKE_FAIL: {len(failures)}/{len(results)} probes failed: {names}", file=sys.stderr)
+        # Defensive: a 401 "Invalid API key" here almost always means THIS smoke's
+        # OWN gate credential (AI_BRIDGE_API_KEY / a service-principal) is not
+        # accepted on this host — NOT that the service is down. The two prod hosts
+        # run independent Postgres DBs, so a service-principal registered on one
+        # host is unknown on the other → 401 there. Surface that explicitly so a
+        # deploy-gate credential gap is never again mis-read as "the bridge is down".
+        if any(("invalid api key" in (r.detail or "").lower()) or ("http 401" in (r.detail or "").lower())
+               for r in failures):
+            print(
+                "  ⚠️  GATE-CREDENTIAL: a 401/'Invalid API key' means this smoke's key is "
+                "not accepted on THIS host — most likely its service-principal is missing "
+                "from this host's service_principals table (both prod hosts run separate DBs), "
+                "or AI_BRIDGE_API_KEY does not match the host's shared key. This is a "
+                "credential/registration gap, not a service outage — verify before treating "
+                "it as an incident.",
+                file=sys.stderr,
+            )
         for r in failures:
             if r.repro:
                 print(f"  repro[{r.name}]: {r.repro}", file=sys.stderr)
