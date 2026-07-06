@@ -789,6 +789,93 @@ phase_rollback() {
 }
 
 # ============================================================================
+# Phase 3.5 — reconcile the worker auth key with the Infisical SSoT
+# ============================================================================
+# The worker containers authenticate every incoming request against
+# AI_BRIDGE_API_KEY, which they read from the host env_file secrets/platform.env
+# (see the worker `env_file:` in docker-compose*.yml). That file is host-local
+# and gitignored — `git pull` (phase_code_update) never touches it. So when
+# AI_BRIDGE_API_KEY is rotated in Infisical (the single SSoT), any host whose
+# platform.env was not hand-updated keeps serving the OLD key. Until now the
+# deploy only READ the fresh key to run the smoke, never PROVISIONED it — so a
+# stale host force-recreated a container that rejects every authed request with
+# "[Bridge <worker>] Invalid API key" (a cryptic 401), which the smoke then
+# caught and auto-rolled-back. That is exactly the server2 drift seen 2026-07-06.
+#
+# This phase closes the gap at the source: it upserts AI_BRIDGE_API_KEY in the
+# host platform.env from Infisical BEFORE the recreate, so the key the deploy
+# tests and the key the container runs are identical by construction. It is
+# fail-loud (empty key / missing file / verify mismatch → abort, no recreate),
+# idempotent (no-op when already in sync), and preserves every other line.
+phase_reconcile_worker_key() {
+    local host="$1"
+    step "Phase 3.5: reconcile worker AI_BRIDGE_API_KEY (${host})"
+
+    # shellcheck source=/root/.infisical/infisical-api.sh
+    source /root/.infisical/infisical-api.sh 2>/dev/null || true
+    local api_key
+    api_key=$(infisical_get_secret "${INFISICAL_WS_DEV_SERVER}" dev AI_BRIDGE_API_KEY 2>/dev/null | tail -1) || true
+    # Fail fast: the key must be present and a single clean token. A blank,
+    # 'null', or whitespace-bearing value means the Infisical read failed or
+    # returned a diagnostic line — provisioning THAT into platform.env would
+    # brick auth on every worker, so abort BEFORE touching the host file.
+    if [[ -z "${api_key:-}" || "${api_key}" == "null" ]]; then
+        error_ "Cannot reconcile: AI_BRIDGE_API_KEY empty/null from Infisical (dev-server/dev)"
+        return 1
+    fi
+    if [[ "${api_key}" =~ [[:space:]] ]]; then
+        error_ "Cannot reconcile: AI_BRIDGE_API_KEY from Infisical contains whitespace (likely a diagnostic line, not the key) — refusing to write it"
+        return 1
+    fi
+
+    if [[ "$DRY_RUN" == "true" ]]; then
+        info "[DRY-RUN] would upsert AI_BRIDGE_API_KEY in ${REMOTE_REPO}/secrets/platform.env on ${host}"
+        return 0
+    fi
+
+    # base64-transport the secret: it never appears verbatim in the remote script
+    # text, process args or logs, and quoting/special chars become irrelevant.
+    local key_b64
+    key_b64=$(printf '%s' "${api_key}" | base64 -w0)
+
+    local result
+    result=$(rssh_run "$host" <<EOF
+envfile="${REMOTE_REPO}/secrets/platform.env"
+# Fail fast: do NOT create a half-baked secrets file. A missing platform.env
+# means the host was never bootstrapped (it also holds BRIDGE_DB_URL etc.);
+# writing only the API key would silently break the DB-backed services.
+[[ -f "\$envfile" ]] || { echo "MISSING_ENVFILE"; exit 1; }
+newkey=\$(printf '%s' "${key_b64}" | base64 -d)
+cur=\$(grep -E '^AI_BRIDGE_API_KEY=' "\$envfile" | head -1 | cut -d= -f2-)
+if [[ "\$cur" == "\$newkey" ]]; then echo "IN_SYNC"; exit 0; fi
+# Temp in the SAME dir as envfile so mv is an atomic rename (a cross-fs mv is a
+# non-atomic copy — a reader could see a truncated secrets file). trap cleans up
+# the temp on any abort so a failed write never leaks a partial file.
+tmp=\$(mktemp "\${envfile}.reconcile.XXXXXX")
+trap 'rm -f "\$tmp" 2>/dev/null || true' EXIT
+if grep -qE '^AI_BRIDGE_API_KEY=' "\$envfile"; then
+    awk -v k="\$newkey" '/^AI_BRIDGE_API_KEY=/{print "AI_BRIDGE_API_KEY=" k; next} {print}' "\$envfile" > "\$tmp"
+else
+    cat "\$envfile" > "\$tmp"; printf 'AI_BRIDGE_API_KEY=%s\n' "\$newkey" >> "\$tmp"
+fi
+check=\$(grep -E '^AI_BRIDGE_API_KEY=' "\$tmp" | head -1 | cut -d= -f2-)
+[[ "\$check" == "\$newkey" ]] || { echo "VERIFY_FAILED"; exit 1; }
+chmod --reference="\$envfile" "\$tmp" 2>/dev/null || chmod 600 "\$tmp"
+mv "\$tmp" "\$envfile"
+trap - EXIT
+echo "ROTATED"
+EOF
+    ) || { error_ "Key reconcile failed on ${host}: ${result:-<no output>}"; return 1; }
+
+    case "$result" in
+        IN_SYNC) info "AI_BRIDGE_API_KEY already in sync on ${host}" ;;
+        ROTATED) info "AI_BRIDGE_API_KEY reconciled on ${host} — workers pick it up on recreate" ;;
+        *)       error_ "Reconcile aborted on ${host}: ${result}"; return 1 ;;
+    esac
+    return 0
+}
+
+# ============================================================================
 # Main: deploy one server
 # ============================================================================
 deploy_server() {
@@ -848,6 +935,18 @@ deploy_server() {
     # === Phase 3 ===
     phase_validate "$host" "$compose" || {
         error_ "Validation failed — reverting code to ${ROLLBACK_SHA}"
+        if [[ "$DRY_RUN" == "false" ]]; then
+            rssh "$host" "cd ${REMOTE_REPO} && git reset --hard '${ROLLBACK_SHA}'" || true
+        fi
+        return 1
+    }
+
+    # === Phase 3.5: reconcile worker auth key BEFORE any recreate ===
+    # Must run after code_update (repo present) and before Phase 4 so the
+    # force-recreate picks up the correct key via env_file. Failure aborts the
+    # deploy with no container touched; reset code to the pre-deploy SHA.
+    phase_reconcile_worker_key "$host" || {
+        error_ "Key reconcile failed — reverting code to ${ROLLBACK_SHA}"
         if [[ "$DRY_RUN" == "false" ]]; then
             rssh "$host" "cd ${REMOTE_REPO} && git reset --hard '${ROLLBACK_SHA}'" || true
         fi
