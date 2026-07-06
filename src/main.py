@@ -5083,7 +5083,11 @@ async def get_privacy_status():
 
 
 @app.post("/v1/privacy/smart-anonymize")
-async def smart_anonymize_endpoint(request: Request, request_body: SmartAnonymizeRequest):
+async def smart_anonymize_endpoint(
+    request: Request,
+    request_body: SmartAnonymizeRequest,
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(security),
+):
     """Smart pseudonymization. Proxied to privacy-pdf-service container.
 
     When ``BRIDGE_ANONYMIZE_ENABLED`` is unset/false (the current default
@@ -5096,6 +5100,10 @@ async def smart_anonymize_endpoint(request: Request, request_body: SmartAnonymiz
     Flip to true on the Hetzner host once the privacy-service is reliable
     again; no app-side change required.
     """
+    # Security: this endpoint processes caller-supplied text (PII) and was
+    # previously UNauthenticated while reachable mesh-wide on the Tailscale IP.
+    # Require a valid API key like every other data endpoint (e.g. /document/convert).
+    await verify_api_key(request, credentials)
     if os.environ.get("BRIDGE_ANONYMIZE_ENABLED", "").lower() != "true":
         # Fail loud, never silent: a disabled PII detector must NEVER echo the
         # caller's text back as a "successful" anonymization. Doing so leaks raw
