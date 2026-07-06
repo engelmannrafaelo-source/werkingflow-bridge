@@ -110,6 +110,7 @@ class TestSmartAnonymizeTracking:
             patch("src.main.get_privacy_client", return_value=pc),
             patch("src.main.extract_attribution_context", return_value=_fake_attr()),
             patch("src.activity.ai_call_writer.persist_ai_call_activity", mock_persist),
+            patch("src.main.verify_api_key", new=AsyncMock()),
             patch.dict("os.environ", {"BRIDGE_ANONYMIZE_ENABLED": "true"}),
         ):
             await src.main.smart_anonymize_endpoint(
@@ -135,6 +136,7 @@ class TestSmartAnonymizeTracking:
             patch("src.main.get_privacy_client", return_value=pc),
             patch("src.main.extract_attribution_context", return_value=_fake_attr()),
             patch("src.activity.ai_call_writer.persist_ai_call_activity", mock_persist),
+            patch("src.main.verify_api_key", new=AsyncMock()),
             patch.dict("os.environ", {"BRIDGE_ANONYMIZE_ENABLED": "true"}),
         ):
             result = await src.main.smart_anonymize_endpoint(
@@ -158,6 +160,7 @@ class TestSmartAnonymizeTracking:
             patch("src.main.get_privacy_client", return_value=pc),
             patch("src.main.extract_attribution_context", return_value=_fake_attr()),
             patch("src.activity.ai_call_writer.persist_ai_call_activity", mock_persist),
+            patch("src.main.verify_api_key", new=AsyncMock()),
             patch.dict("os.environ", {"BRIDGE_ANONYMIZE_ENABLED": "true"}),
         ):
             result = await src.main.smart_anonymize_endpoint(
@@ -548,3 +551,207 @@ class TestAudioTranscriptionsTracking:
         assert isinstance(resp, JSONResponse)
         assert resp.status_code == 200
         mock_persist.assert_awaited_once()
+
+
+# ---------------------------------------------------------------------------
+# STT EU data-residency: provider resolution + SageMaker Whisper (aws-sagemaker)
+# ---------------------------------------------------------------------------
+import src.auth  # noqa: E402 — singleton bedrock_credential_manager, already loaded via src.main
+
+
+class TestSTTProviderResolution:
+    """_resolve_stt_provider() — env-driven EU provider dispatch. Fail-loud, NO
+    silent US fallback (GDPR). Default stays OpenAI-US (migration off-by-default)."""
+
+    def test_openai_default_us(self, monkeypatch):
+        monkeypatch.delenv("STT_PROVIDER", raising=False)
+        monkeypatch.delenv("OPENAI_STT_BASE_URL", raising=False)
+        monkeypatch.setenv("OPENAI_API_KEY", "sk-x")
+        cfg = src.main._resolve_stt_provider()
+        assert cfg == {
+            "kind": "proxy", "provider": "openai",
+            "url": "https://api.openai.com/v1/audio/transcriptions",
+            "headers": {"Authorization": "Bearer sk-x"},
+        }
+
+    def test_openai_eu_base_url_override(self, monkeypatch):
+        monkeypatch.delenv("STT_PROVIDER", raising=False)
+        monkeypatch.setenv("OPENAI_API_KEY", "sk-eu")
+        monkeypatch.setenv("OPENAI_STT_BASE_URL", "https://eu.api.openai.com/v1")
+        cfg = src.main._resolve_stt_provider()
+        assert cfg["url"] == "https://eu.api.openai.com/v1/audio/transcriptions"
+
+    def test_openai_missing_key_fails_loud(self, monkeypatch):
+        monkeypatch.delenv("STT_PROVIDER", raising=False)
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+        with pytest.raises(src.main.BridgeError) as ei:
+            src.main._resolve_stt_provider()
+        assert b"OPENAI_API_KEY" in ei.value.response.body
+
+    def test_aws_sagemaker_missing_all_fails_loud(self, monkeypatch):
+        monkeypatch.setenv("STT_PROVIDER", "aws-sagemaker")
+        monkeypatch.delenv("AWS_STT_SAGEMAKER_ENDPOINT", raising=False)
+        with (
+            patch.object(src.auth.bedrock_credential_manager, "aws_access_key", None),
+            patch.object(src.auth.bedrock_credential_manager, "aws_secret_key", None),
+        ):
+            with pytest.raises(src.main.BridgeError) as ei:
+                src.main._resolve_stt_provider()
+        body = ei.value.response.body
+        assert b"AWS_STT_SAGEMAKER_ENDPOINT" in body and b"AWS credentials" in body
+
+    def test_aws_sagemaker_missing_endpoint_only(self, monkeypatch):
+        monkeypatch.setenv("STT_PROVIDER", "aws-sagemaker")
+        monkeypatch.delenv("AWS_STT_SAGEMAKER_ENDPOINT", raising=False)
+        with (
+            patch.object(src.auth.bedrock_credential_manager, "aws_access_key", "AK"),
+            patch.object(src.auth.bedrock_credential_manager, "aws_secret_key", "SK"),
+        ):
+            with pytest.raises(src.main.BridgeError) as ei:
+                src.main._resolve_stt_provider()
+        body = ei.value.response.body
+        assert b"AWS_STT_SAGEMAKER_ENDPOINT" in body and b"AWS credentials" not in body
+
+    def test_aws_sagemaker_configured_default_region(self, monkeypatch):
+        monkeypatch.setenv("STT_PROVIDER", "aws-sagemaker")
+        monkeypatch.setenv("AWS_STT_SAGEMAKER_ENDPOINT", "whisper-eu")
+        monkeypatch.delenv("AWS_STT_REGION", raising=False)
+        with (
+            patch.object(src.auth.bedrock_credential_manager, "aws_access_key", "AK"),
+            patch.object(src.auth.bedrock_credential_manager, "aws_secret_key", "SK"),
+            patch.object(src.auth.bedrock_credential_manager, "default_region", "eu-central-1"),
+        ):
+            cfg = src.main._resolve_stt_provider()
+        assert cfg["kind"] == "aws-sagemaker"
+        assert cfg["provider"] == "aws-sagemaker"
+        assert cfg["endpoint_name"] == "whisper-eu"
+        assert cfg["region"] == "eu-central-1"
+        assert cfg["access_key"] == "AK" and cfg["secret_key"] == "SK"
+
+    def test_aws_sagemaker_region_override(self, monkeypatch):
+        monkeypatch.setenv("STT_PROVIDER", "aws-sagemaker")
+        monkeypatch.setenv("AWS_STT_SAGEMAKER_ENDPOINT", "whisper-eu")
+        monkeypatch.setenv("AWS_STT_REGION", "eu-west-1")
+        with (
+            patch.object(src.auth.bedrock_credential_manager, "aws_access_key", "AK"),
+            patch.object(src.auth.bedrock_credential_manager, "aws_secret_key", "SK"),
+        ):
+            cfg = src.main._resolve_stt_provider()
+        assert cfg["region"] == "eu-west-1"
+
+    def test_unknown_provider_fails_loud(self, monkeypatch):
+        monkeypatch.setenv("STT_PROVIDER", "bogus")
+        with pytest.raises(src.main.BridgeError) as ei:
+            src.main._resolve_stt_provider()
+        assert b"aws-sagemaker" in ei.value.response.body
+
+
+class TestSagemakerTranscribeSync:
+    """_sagemaker_transcribe_sync() — synchronous SageMaker Whisper invoke, reuses
+    the Bedrock AWS creds (SigV4 via boto3), normalizes to OpenAI-shaped {"text": ...},
+    fail-loud on any contract mismatch (never a silent wrong result)."""
+
+    @staticmethod
+    def _fake_client(payload_bytes):
+        body = MagicMock()
+        body.read = MagicMock(return_value=payload_bytes)
+        client = MagicMock()
+        client.invoke_endpoint = MagicMock(return_value={"Body": body})
+        return client
+
+    def test_dict_text_normalized_and_creds_forwarded(self):
+        client = self._fake_client(b'{"text": "hallo welt"}')
+        with patch("boto3.client", return_value=client) as mk:
+            out = src.main._sagemaker_transcribe_sync(
+                endpoint_name="whisper-eu", region="eu-central-1",
+                access_key="AK", secret_key="SK",
+                audio_bytes=b"AUDIO", content_type="audio/webm",
+            )
+        assert out == {"text": "hallo welt"}
+        mk.assert_called_once()
+        ck = mk.call_args.kwargs
+        assert ck["region_name"] == "eu-central-1"
+        assert ck["aws_access_key_id"] == "AK" and ck["aws_secret_access_key"] == "SK"
+        iek = client.invoke_endpoint.call_args.kwargs
+        assert iek["EndpointName"] == "whisper-eu"
+        assert iek["Body"] == b"AUDIO"
+        assert iek["ContentType"] == "audio/webm"
+
+    def test_list_wrapped_text_normalized(self):
+        client = self._fake_client(b'[{"text": "aus liste"}]')
+        with patch("boto3.client", return_value=client):
+            out = src.main._sagemaker_transcribe_sync(
+                endpoint_name="e", region="eu-central-1", access_key="AK",
+                secret_key="SK", audio_bytes=b"A", content_type="audio/wav",
+            )
+        assert out == {"text": "aus liste"}
+
+    def test_default_content_type_when_missing(self):
+        client = self._fake_client(b'{"text": "x"}')
+        with patch("boto3.client", return_value=client):
+            src.main._sagemaker_transcribe_sync(
+                endpoint_name="e", region="eu-central-1", access_key="AK",
+                secret_key="SK", audio_bytes=b"A", content_type="",
+            )
+        assert client.invoke_endpoint.call_args.kwargs["ContentType"] == "audio/wav"
+
+    @pytest.mark.parametrize("payload", [
+        b"<html>not json</html>",   # non-JSON body
+        b'{"foo": 1}',              # JSON without text
+        b'{"text": 123}',           # text not a string
+    ])
+    def test_contract_mismatch_fails_loud(self, payload):
+        client = self._fake_client(payload)
+        with patch("boto3.client", return_value=client):
+            with pytest.raises(RuntimeError):
+                src.main._sagemaker_transcribe_sync(
+                    endpoint_name="e", region="eu-central-1", access_key="AK",
+                    secret_key="SK", audio_bytes=b"A", content_type="audio/wav",
+                )
+
+
+class TestAudioTranscriptionsAwsSagemaker:
+    """Endpoint dispatch for STT_PROVIDER=aws-sagemaker: routes to SageMaker Whisper
+    (EU) and still tracks activity as agent_id=transkription."""
+
+    def _make_form(self, model="whisper-1"):
+        audio_file = MagicMock()
+        audio_file.filename = "test.mp3"
+        audio_file.content_type = "audio/mpeg"
+        audio_file.read = AsyncMock(return_value=b"audio-bytes")
+        form = MagicMock()
+        form.get = MagicMock(side_effect=lambda key, default=None: {
+            "file": audio_file, "model": model, "response_format": "json",
+            "language": None, "prompt": None, "temperature": None,
+        }.get(key, default))
+        return form
+
+    @pytest.mark.asyncio
+    async def test_dispatch_logs_success(self):
+        mock_persist = AsyncMock()
+        form = self._make_form(model="whisper-1")
+        mock_request = AsyncMock()
+        mock_request.form = AsyncMock(return_value=form)
+        mock_request.headers = {}
+
+        with (
+            patch("src.main.verify_api_key", new=AsyncMock()),
+            patch.dict("os.environ", {"STT_PROVIDER": "aws-sagemaker",
+                                      "AWS_STT_SAGEMAKER_ENDPOINT": "whisper-eu"}),
+            patch.object(src.auth.bedrock_credential_manager, "aws_access_key", "AK"),
+            patch.object(src.auth.bedrock_credential_manager, "aws_secret_key", "SK"),
+            patch("src.main._sagemaker_transcribe_sync", return_value={"text": "hallo welt"}),
+            patch("src.main.extract_attribution_context", return_value=_fake_attr()),
+            patch("src.activity.ai_call_writer.persist_ai_call_activity", mock_persist),
+        ):
+            from starlette.responses import JSONResponse
+            resp = await src.main.audio_transcriptions(request=mock_request, credentials=None)
+
+        assert isinstance(resp, JSONResponse)
+        assert resp.status_code == 200
+        assert b"hallo welt" in resp.body
+        mock_persist.assert_awaited_once()
+        kw = mock_persist.call_args.kwargs
+        assert kw["agent_id"] == "transkription"
+        assert kw["model"] == "whisper-1"
+        assert kw["status"] == "success"
