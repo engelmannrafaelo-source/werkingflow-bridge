@@ -5641,20 +5641,77 @@ async def convert_and_anonymize_document_endpoint(
     )
 
 
+def _resolve_stt_upstream() -> tuple[str, dict, str]:
+    """Resolve the speech-to-text upstream (URL, auth headers, provider label) for
+    the /v1/audio/transcriptions proxy.
+
+    EU data-residency (GDPR) is selected via env, NOT hardcoded, so the same Bridge
+    image serves the default US-OpenAI path (backward-compatible) or an EU provider
+    once credentials are provisioned and STT_PROVIDER is flipped. Fail-loud
+    (config_error) when the selected provider is missing required credentials —
+    NEVER silently fall back to a US endpoint (that would defeat the GDPR purpose;
+    defensive-programming: kein silent fail, kein Fallback).
+
+    Providers (env STT_PROVIDER, default "openai"):
+      - "openai": https://api.openai.com/v1 — or OPENAI_STT_BASE_URL override.
+                  Set OPENAI_STT_BASE_URL=https://eu.api.openai.com/v1 (+ an
+                  EU-region OPENAI_API_KEY) for OpenAI's own EU data residency.
+                  Auth: Authorization: Bearer OPENAI_API_KEY.
+      - "azure":  Azure OpenAI Whisper in an EU region (Sweden/France Central,
+                  West Europe). URL carries deployment + api-version; auth is the
+                  api-key header. Multipart form fields are identical to OpenAI.
+    """
+    provider = (os.getenv("STT_PROVIDER") or "openai").strip().lower()
+
+    if provider == "azure":
+        endpoint = (os.getenv("AZURE_OPENAI_STT_ENDPOINT") or "").rstrip("/")
+        key = os.getenv("AZURE_OPENAI_STT_KEY")
+        deployment = os.getenv("AZURE_OPENAI_STT_DEPLOYMENT")
+        api_version = os.getenv("AZURE_OPENAI_STT_API_VERSION") or "2024-06-01"
+        missing = [name for name, value in (
+            ("AZURE_OPENAI_STT_ENDPOINT", endpoint),
+            ("AZURE_OPENAI_STT_KEY", key),
+            ("AZURE_OPENAI_STT_DEPLOYMENT", deployment),
+        ) if not value]
+        if missing:
+            raise BridgeError(config_error(
+                detail=f"STT_PROVIDER=azure but missing {', '.join(missing)} on Bridge — contact admin"
+            ))
+        url = f"{endpoint}/openai/deployments/{deployment}/audio/transcriptions?api-version={api_version}"
+        return url, {"api-key": key}, provider
+
+    if provider == "openai":
+        openai_api_key = os.getenv("OPENAI_API_KEY")
+        if not openai_api_key:
+            # Config issue — surface as 500 config_error (non-retryable).
+            raise BridgeError(config_error(
+                detail="OPENAI_API_KEY not configured on Bridge — contact admin"
+            ))
+        base = (os.getenv("OPENAI_STT_BASE_URL") or "https://api.openai.com/v1").rstrip("/")
+        return f"{base}/audio/transcriptions", {"Authorization": f"Bearer {openai_api_key}"}, provider
+
+    raise BridgeError(config_error(
+        detail=f"Unknown STT_PROVIDER={provider!r} on Bridge (expected 'openai' or 'azure') — contact admin"
+    ))
+
+
 @app.post("/v1/audio/transcriptions")
 async def audio_transcriptions(
     request: Request,
     credentials: Optional[HTTPAuthorizationCredentials] = Depends(security)
 ):
-    """Proxy OpenAI Whisper audio transcription. Requires OPENAI_API_KEY in Bridge env."""
+    """Proxy Whisper audio transcription to the configured STT provider.
+
+    Provider + endpoint are env-driven (see _resolve_stt_upstream): default
+    OpenAI-US, or an EU-resident provider (Azure OpenAI EU / OpenAI EU) once
+    provisioned. App-facing contract is unchanged — apps keep posting the same
+    multipart form to the Bridge.
+    """
     await verify_api_key(request, credentials)
 
-    openai_api_key = os.getenv("OPENAI_API_KEY")
-    if not openai_api_key:
-        # Config issue — surface as 500 config_error (non-retryable).
-        raise BridgeError(config_error(
-            detail="OPENAI_API_KEY not configured on Bridge — contact admin"
-        ))
+    # Resolve upstream + validate provider credentials before reading the (large)
+    # audio body — fail fast on misconfig.
+    _stt_url, _stt_headers, _stt_provider = _resolve_stt_upstream()
 
     import httpx  # noqa: PLC0415 — local import; httpx has no module-level import in main.py
     _start = time.time()
@@ -5688,8 +5745,8 @@ async def audio_transcriptions(
 
         async with httpx.AsyncClient(timeout=120.0) as client:
             response = await client.post(
-                "https://api.openai.com/v1/audio/transcriptions",
-                headers={"Authorization": f"Bearer {openai_api_key}"},
+                _stt_url,
+                headers=_stt_headers,
                 files=files,
                 data=data,
             )
@@ -5714,7 +5771,7 @@ async def audio_transcriptions(
             return JSONResponse(content=response.json(), status_code=response.status_code)
 
     except httpx.HTTPStatusError as e:
-        logger.error(f"OpenAI Whisper API error: {e.response.status_code} {e.response.text}")
+        logger.error(f"STT provider ({_stt_provider}) Whisper API error: {e.response.status_code} {e.response.text}")
         try:
             _attr = extract_attribution_context(request)
             from src.activity.ai_call_writer import persist_ai_call_activity

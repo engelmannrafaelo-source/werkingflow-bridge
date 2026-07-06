@@ -109,6 +109,15 @@ services:
       - TAVILY_API_KEY=${TAVILY_API_KEY}
       - ANTHROPIC_VISION_API_KEY=${ANTHROPIC_API_KEY}
       - OPENAI_API_KEY=${OPENAI_API_KEY}
+      # STT / Whisper EU data-residency (GDPR) — default openai (US, backward-compat).
+      # Flip STT_PROVIDER=azure + provision AZURE_* for EU (Sweden/France Central),
+      # or set OPENAI_STT_BASE_URL=https://eu.api.openai.com/v1 for OpenAI EU residency.
+      - STT_PROVIDER=${STT_PROVIDER:-openai}
+      - OPENAI_STT_BASE_URL=${OPENAI_STT_BASE_URL:-}
+      - AZURE_OPENAI_STT_ENDPOINT=${AZURE_OPENAI_STT_ENDPOINT:-}
+      - AZURE_OPENAI_STT_KEY=${AZURE_OPENAI_STT_KEY:-}
+      - AZURE_OPENAI_STT_DEPLOYMENT=${AZURE_OPENAI_STT_DEPLOYMENT:-}
+      - AZURE_OPENAI_STT_API_VERSION=${AZURE_OPENAI_STT_API_VERSION:-}
       - PRIVACY_ENABLED=true
       - PRIVACY_LANGUAGE=de
       - PRIVACY_LOG_DETECTIONS=false
@@ -178,6 +187,15 @@ services:
       - TAVILY_API_KEY=${TAVILY_API_KEY}
       - ANTHROPIC_VISION_API_KEY=${ANTHROPIC_API_KEY}
       - OPENAI_API_KEY=${OPENAI_API_KEY}
+      # STT / Whisper EU data-residency (GDPR) — default openai (US, backward-compat).
+      # Flip STT_PROVIDER=azure + provision AZURE_* for EU (Sweden/France Central),
+      # or set OPENAI_STT_BASE_URL=https://eu.api.openai.com/v1 for OpenAI EU residency.
+      - STT_PROVIDER=${STT_PROVIDER:-openai}
+      - OPENAI_STT_BASE_URL=${OPENAI_STT_BASE_URL:-}
+      - AZURE_OPENAI_STT_ENDPOINT=${AZURE_OPENAI_STT_ENDPOINT:-}
+      - AZURE_OPENAI_STT_KEY=${AZURE_OPENAI_STT_KEY:-}
+      - AZURE_OPENAI_STT_DEPLOYMENT=${AZURE_OPENAI_STT_DEPLOYMENT:-}
+      - AZURE_OPENAI_STT_API_VERSION=${AZURE_OPENAI_STT_API_VERSION:-}
       - PRIVACY_ENABLED=true
       - PRIVACY_LANGUAGE=de
       - PRIVACY_LOG_DETECTIONS=false
