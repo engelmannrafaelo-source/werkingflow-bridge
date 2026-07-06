@@ -412,6 +412,11 @@ services:
       - API_KEY=${API_KEY:-}
       - CONVERTAPI_SECRET=${CONVERTAPI_SECRET}
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+      # Image/Vision descriptions (describe_images) require a DIRECT Anthropic
+      # API key — VisionProvider reads ONLY this var (never ANTHROPIC_API_KEY).
+      # Same aliasing the worker services use; without it every describe_images
+      # call raised ValueError, surfaced misleadingly as a 503 "at capacity".
+      - ANTHROPIC_VISION_API_KEY=${ANTHROPIC_API_KEY:-}
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8100/health"]
       interval: 30s
