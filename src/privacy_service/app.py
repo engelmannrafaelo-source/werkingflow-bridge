@@ -302,8 +302,7 @@ _DOCUMENT_CHAIN: Optional[AdapterChain] = None
 def _get_chain() -> AdapterChain:
     global _DOCUMENT_CHAIN
     if _DOCUMENT_CHAIN is None:
-        ai_disabled = os.getenv("DISABLE_AI_FALLBACK", "").lower() in ("1", "true", "yes")
-        _DOCUMENT_CHAIN = build_default_chain(enable_ai_fallback=not ai_disabled)
+        _DOCUMENT_CHAIN = build_default_chain()
     return _DOCUMENT_CHAIN
 
 

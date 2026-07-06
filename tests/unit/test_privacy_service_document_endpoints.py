@@ -25,11 +25,6 @@ def client():
     pytest.importorskip("tabulate")
     pytest.importorskip("markdownify")
     from fastapi.testclient import TestClient
-    # Disable AI fallback for these tests — they exercise the deterministic
-    # path. The fallback is covered separately in test_adapters.py with a
-    # mocked Bridge self-call.
-    import os as _os
-    _os.environ["DISABLE_AI_FALLBACK"] = "1"
     # Reset cached chain in case another test already initialized it.
     from src.privacy_service import app as app_mod
     app_mod._DOCUMENT_CHAIN = None

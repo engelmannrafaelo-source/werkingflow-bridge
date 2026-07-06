@@ -128,17 +128,166 @@ class ConversionResult:
 
 
 # ----------------------------------------------------------------------------
-# PDF (Docling) — extracted from app.py so other adapters can reuse it.
+# PDF (Docling text + per-page render→Vision cascade)
 # ----------------------------------------------------------------------------
+#
+# A PDF is not one thing: it can be a digital text document, a scanned image, a
+# large-format CAD/architectural plan, a photo, or any mix of those per page.
+# Docling extracts text/tables well but chokes on pages that carry no real text
+# layer or embed enormous (e.g. 132-megapixel) rasters — the latter previously
+# blew up the downstream Vision call.
+#
+# The cascade, per page:
+#   1. Docling runs over the whole document for rich text/table Markdown.
+#   2. A page that has (almost) no native text layer, OR is an oversized
+#      large-format drawing, OR belongs to a document Docling could not parse at
+#      all, is RENDERED to a down-scaled PNG and added to the ``images`` dict.
+#   3. Every image (Docling-extracted figures AND rendered pages) is pushed
+#      through a uniform down-scale guard so no giant raster ever reaches Vision.
+# The rendered pages ride the exact same ``images`` dict that the endpoint hands
+# to ``describe_images(...)`` — so a plan/scan page becomes a Vision description
+# instead of a 415/timeout.
+
+# Long edge (px) a rendered page image is scaled to. ~1600px is the value the
+# whole render→Vision path was validated with on a real large-format plan:
+# small enough to avoid the giant-raster blow-up, detailed enough for Vision to
+# read zoning/hull/PV off the drawing.
+RENDER_PAGE_MAX_EDGE = 1600
+
+# Hard down-scale ceiling applied to EVERY image (Docling figures included).
+# Anything whose long edge exceeds this is resized before it can reach Vision —
+# this is the guard against the 132-MP figure that previously timed out.
+MAX_IMAGE_EDGE = 2000
+
+# A page with fewer than this many native (non-OCR) text-layer characters is
+# treated as image/scan-only and rendered whole for Vision.
+MIN_PAGE_TEXT_CHARS = 40
+
+# A page whose long edge exceeds this (points; 72pt = 1 inch) is a large-format
+# drawing/plan (bigger than A2). Such pages are rendered whole even when they
+# carry a text layer, because the drawing's gestalt (zoning, envelope, symbols)
+# only reads off the full page — Docling's fragmented figure extraction loses it.
+OVERSIZE_PAGE_LONG_EDGE_PT = 1700
 
 
-def convert_pdf_bytes(pdf_bytes: bytes) -> Tuple[str, Dict[str, Any], Dict[str, str]]:
-    """Convert PDF bytes → (markdown, metadata, images).
+def _pdf_page_geometry(pdf_bytes: bytes) -> List[Tuple[int, float]]:
+    """Return ``[(native_text_chars, long_edge_pt), ...]`` per page (0-indexed).
 
-    Uses the same Docling pipeline as the legacy ``/convert-pdf`` endpoint.
-    Returned images are a ``{filename: base64-png}`` dict referenced from the
-    Markdown via plain filenames (Docling's REFERENCED image mode after
-    rewrite).
+    Uses pypdfium2 (a Docling dependency, always present) to read each page's
+    NATIVE text layer — not OCR — so the render decision is independent of
+    Docling's OCR behaviour. Fail loud if the PDF cannot be opened at all
+    (genuinely corrupt input), which callers map to HTTP 500.
+    """
+    import pypdfium2 as pdfium
+
+    try:
+        pdf = pdfium.PdfDocument(pdf_bytes)
+    except Exception as e:  # noqa: BLE001 — genuinely unreadable PDF, fail loud
+        raise RuntimeError(f"Could not open PDF for page inspection: {e}") from e
+
+    geometry: List[Tuple[int, float]] = []
+    try:
+        for i in range(len(pdf)):
+            page = pdf[i]
+            try:
+                width_pt, height_pt = page.get_size()
+                textpage = page.get_textpage()
+                try:
+                    text = textpage.get_text_range() or ""
+                finally:
+                    textpage.close()
+            finally:
+                page.close()
+            geometry.append((len(text.strip()), float(max(width_pt, height_pt))))
+    finally:
+        pdf.close()
+    return geometry
+
+
+def _render_pdf_pages(
+    pdf_bytes: bytes, page_indices: List[int], max_edge: int = RENDER_PAGE_MAX_EDGE
+) -> Dict[str, str]:
+    """Render the given 0-indexed pages to down-scaled PNGs.
+
+    Returns ``{"page-NNN.png": base64-png}`` (1-indexed in the filename so it
+    reads naturally in the appended descriptions). The render scale is chosen so
+    the long edge lands at ``max_edge`` px, which both avoids the giant-raster
+    blow-up and keeps CAD detail legible for Vision.
+    """
+    if not page_indices:
+        return {}
+
+    import pypdfium2 as pdfium
+
+    try:
+        pdf = pdfium.PdfDocument(pdf_bytes)
+    except Exception as e:  # noqa: BLE001
+        raise RuntimeError(f"Could not open PDF for page rendering: {e}") from e
+
+    rendered: Dict[str, str] = {}
+    try:
+        for idx in page_indices:
+            page = pdf[idx]
+            try:
+                width_pt, height_pt = page.get_size()
+                long_edge_pt = max(width_pt, height_pt) or 1.0
+                # pypdfium2 renders at ``scale`` px per point (scale=1 → 72 DPI).
+                scale = min(max_edge / long_edge_pt, 4.0)
+                bitmap = page.render(scale=scale)
+                pil_image = bitmap.to_pil()
+            finally:
+                page.close()
+            if pil_image.mode not in ("RGB", "L"):
+                pil_image = pil_image.convert("RGB")
+            buf = io.BytesIO()
+            pil_image.save(buf, format="PNG")
+            rendered[f"page-{idx + 1:03d}.png"] = base64.b64encode(
+                buf.getvalue()
+            ).decode("utf-8")
+    finally:
+        pdf.close()
+    return rendered
+
+
+def _downscale_b64_png(b64: str, max_edge: int = MAX_IMAGE_EDGE) -> str:
+    """Down-scale a base64 image if its long edge exceeds ``max_edge``.
+
+    Idempotent for already-small images (returned unchanged). This is the guard
+    that stops a Docling-extracted 132-MP figure from ever reaching Vision.
+    Fail-soft: if the bytes cannot be parsed as an image we return the original
+    (the caller's Vision step surfaces any genuine problem loudly).
+    """
+    from PIL import Image
+
+    # Disable Pillow's DecompressionBomb guard for THIS decode: the whole point
+    # here is to shrink an oversized figure, so a huge (>178-MP) raster must be
+    # decodable — otherwise Pillow would raise and we'd hand the giant image
+    # straight to Vision. Input is already size-capped upstream (100 MB PDF).
+    Image.MAX_IMAGE_PIXELS = None
+
+    try:
+        raw = base64.b64decode(b64)
+        with Image.open(io.BytesIO(raw)) as img:
+            if max(img.size) <= max_edge:
+                return b64
+            ratio = max_edge / max(img.size)
+            new_size = (max(1, round(img.width * ratio)), max(1, round(img.height * ratio)))
+            resized = img.resize(new_size, Image.LANCZOS)
+            if resized.mode not in ("RGB", "L"):
+                resized = resized.convert("RGB")
+            buf = io.BytesIO()
+            resized.save(buf, format="PNG")
+            return base64.b64encode(buf.getvalue()).decode("utf-8")
+    except Exception as e:  # noqa: BLE001 — never let the guard itself break conversion
+        logger.warning(f"[pdf] image down-scale skipped (unparseable image): {e}")
+        return b64
+
+
+def _docling_convert_pdf(pdf_bytes: bytes) -> Tuple[str, Optional[int], Dict[str, str]]:
+    """Run Docling over a PDF → (markdown, page_count, figures).
+
+    This is the text/table extraction half of the cascade. Raises on any Docling
+    failure so the caller can fall back to a full page render.
     """
     from docling.document_converter import DocumentConverter, PdfFormatOption
     from docling.datamodel.pipeline_options import (
@@ -176,24 +325,108 @@ def convert_pdf_bytes(pdf_bytes: bytes) -> Tuple[str, Dict[str, Any], Dict[str, 
             with open(md_path, "r") as f:
                 markdown = f.read()
 
-            images: Dict[str, str] = {}
+            figures: Dict[str, str] = {}
             artifacts_dir = os.path.join(tmp_dir, "output_artifacts")
             if os.path.exists(artifacts_dir):
                 for img_name in os.listdir(artifacts_dir):
                     if img_name.lower().endswith((".png", ".jpg", ".jpeg")):
                         img_path = os.path.join(artifacts_dir, img_name)
                         with open(img_path, "rb") as img_f:
-                            images[img_name] = base64.b64encode(img_f.read()).decode("utf-8")
+                            figures[img_name] = base64.b64encode(img_f.read()).decode("utf-8")
 
-            for img_name in images:
+            for img_name in figures:
                 markdown = markdown.replace(os.path.join(artifacts_dir, img_name), img_name)
 
             page_count = (
                 len(result.document.pages) if hasattr(result.document, "pages") else None
             )
-            return markdown, {"pages": page_count}, images
+            return markdown, page_count, figures
     finally:
         os.unlink(tmp_pdf_path)
+
+
+def _render_only_markdown(rendered_pages: Dict[str, str]) -> str:
+    """Markdown body for a PDF that has no usable text layer at all.
+
+    References each rendered page image by filename so the endpoint's
+    ``append_descriptions_to_markdown`` attaches the Vision descriptions in the
+    right place — the document becomes self-contained from the images alone.
+    """
+    lines = [
+        "<!-- PDF ohne verwertbare Textebene: jede Seite als Bild gerendert "
+        "und per Vision beschrieben. -->",
+        "",
+    ]
+    for name in rendered_pages:
+        lines.append(f"![{name}]({name})")
+    return "\n".join(lines)
+
+
+def convert_pdf_bytes(pdf_bytes: bytes) -> Tuple[str, Dict[str, Any], Dict[str, str]]:
+    """Convert PDF bytes → (markdown, metadata, images).
+
+    Docling handles the text/table layer; pages that are image/scan-only or
+    large-format drawings (and every page of a PDF Docling cannot parse) are
+    rendered to down-scaled PNGs and returned in ``images`` so the endpoint's
+    Vision pass describes them. Every returned image passes a hard down-scale
+    guard, so a giant embedded raster never reaches Vision.
+    """
+    geometry = _pdf_page_geometry(pdf_bytes)
+    total_pages = len(geometry)
+
+    # 1. Docling for the text/table Markdown + figure extraction (defensive:
+    #    a Docling failure is not fatal — we render every page instead).
+    docling_markdown = ""
+    docling_page_count: Optional[int] = None
+    figures: Dict[str, str] = {}
+    docling_ok = False
+    try:
+        docling_markdown, docling_page_count, figures = _docling_convert_pdf(pdf_bytes)
+        docling_ok = True
+    except Exception as e:  # noqa: BLE001 — fall back to full page render
+        logger.warning(
+            f"[pdf] Docling could not parse the document ({e}); "
+            f"rendering all {total_pages} page(s) for Vision instead."
+        )
+
+    # 2. Decide which pages to render whole.
+    if docling_ok:
+        pages_to_render = [
+            i
+            for i, (text_chars, long_edge_pt) in enumerate(geometry)
+            if text_chars < MIN_PAGE_TEXT_CHARS
+            or long_edge_pt > OVERSIZE_PAGE_LONG_EDGE_PT
+        ]
+    else:
+        pages_to_render = list(range(total_pages))
+
+    rendered_pages = _render_pdf_pages(pdf_bytes, pages_to_render)
+
+    # 3. Uniform down-scale guard over ALL images (figures + rendered pages).
+    images: Dict[str, str] = {
+        name: _downscale_b64_png(b64) for name, b64 in figures.items()
+    }
+    images.update(rendered_pages)  # rendered pages are already within the cap
+
+    # 4. Markdown: Docling's text if we have it, else a render-only body that
+    #    references the page images (fail loud only if we have literally nothing).
+    if docling_ok:
+        markdown = docling_markdown
+    elif rendered_pages:
+        markdown = _render_only_markdown(rendered_pages)
+    else:
+        raise RuntimeError(
+            "PDF could not be parsed by Docling and no pages could be rendered — "
+            "the file is unreadable."
+        )
+
+    metadata: Dict[str, Any] = {
+        "pages": docling_page_count if docling_page_count is not None else total_pages,
+        "docling_parsed": docling_ok,
+        "rendered_page_numbers": [i + 1 for i in pages_to_render],
+        "rendered_page_count": len(rendered_pages),
+    }
+    return markdown, metadata, images
 
 
 # ----------------------------------------------------------------------------

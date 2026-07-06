@@ -22,14 +22,30 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
+import base64  # noqa: E402
+import io  # noqa: E402
+
+from src.privacy_service import document_converter as dc  # noqa: E402
 from src.privacy_service.document_converter import (  # noqa: E402
+    MAX_IMAGE_EDGE,
+    RENDER_PAGE_MAX_EDGE,
     UnsupportedFormatError,
     convert_document_sync,
     convert_csv_bytes,
     convert_eml_bytes,
     convert_html_bytes,
+    convert_pdf_bytes,
     convert_xlsx_bytes,
     detect_format,
+)
+
+# Real large-format CAD plan (~4564pt long edge, 132-MP embedded rasters). This
+# is exactly the file that used to 415→ai-fallback→401 before the render→Vision
+# cascade. Tests that touch it importorskip pypdfium2/Pillow so a base checkout
+# degrades to skipped rather than failing.
+BAUPLAN_PDF = Path(
+    "/root/projekte/local-storage/test-state/test-data/werking-energy/"
+    "kurt-real/context/19_036_BGN_VA_2020-07-21_gross.pdf"
 )
 
 
@@ -301,3 +317,115 @@ def test_convert_msg_smoke():
     assert isinstance(markdown, str) and len(markdown) > 0
     # Subject may be empty for some samples — just assert key is present.
     assert "subject" in meta
+
+
+# ----------------------------------------------------------------------------
+# PDF render→Vision cascade
+# ----------------------------------------------------------------------------
+
+
+def _png_b64(width: int, height: int) -> str:
+    """Build a plain base64 PNG of the given pixel size (test figure)."""
+    pytest.importorskip("PIL")
+    from PIL import Image
+
+    Image.MAX_IMAGE_PIXELS = None
+    img = Image.new("RGB", (width, height), (180, 160, 140))
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return base64.b64encode(buf.getvalue()).decode("utf-8")
+
+
+def _decoded_size(b64: str):
+    from PIL import Image
+
+    Image.MAX_IMAGE_PIXELS = None
+    with Image.open(io.BytesIO(base64.b64decode(b64))) as im:
+        return im.size
+
+
+def test_downscale_guard_shrinks_giant_figure():
+    """A 132-MP figure (the thing that timed out Vision) is shrunk under the cap."""
+    pytest.importorskip("PIL")
+    giant = _png_b64(12000, 11000)  # 132 MP
+    shrunk = dc._downscale_b64_png(giant)
+    w, h = _decoded_size(shrunk)
+    assert max(w, h) <= MAX_IMAGE_EDGE
+    assert (w, h) != (12000, 11000)
+
+
+def test_downscale_guard_is_idempotent_for_small_images():
+    pytest.importorskip("PIL")
+    small = _png_b64(800, 600)
+    assert dc._downscale_b64_png(small) == small
+
+
+def test_pdf_geometry_reads_native_text_and_size():
+    pytest.importorskip("pypdfium2")
+    if not BAUPLAN_PDF.exists():
+        pytest.skip("Bauplan reference PDF not present in this environment")
+    geometry = dc._pdf_page_geometry(BAUPLAN_PDF.read_bytes())
+    assert len(geometry) == 2
+    # Real text layer (CAD labels) AND large-format dimensions.
+    assert geometry[0][0] > 1000  # native text chars
+    assert geometry[0][1] > dc.OVERSIZE_PAGE_LONG_EDGE_PT  # oversized long edge
+
+
+def test_render_pages_within_edge_cap():
+    pytest.importorskip("pypdfium2")
+    pytest.importorskip("PIL")
+    if not BAUPLAN_PDF.exists():
+        pytest.skip("Bauplan reference PDF not present in this environment")
+    rendered = dc._render_pdf_pages(BAUPLAN_PDF.read_bytes(), [0, 1])
+    assert set(rendered) == {"page-001.png", "page-002.png"}
+    for b64 in rendered.values():
+        w, h = _decoded_size(b64)
+        assert max(w, h) <= RENDER_PAGE_MAX_EDGE
+
+
+def test_convert_pdf_oversized_plan_renders_pages(monkeypatch):
+    """Docling parses the plan's text, but oversized pages are still rendered
+    whole for Vision AND any giant extracted figure is down-scaled."""
+    pytest.importorskip("pypdfium2")
+    pytest.importorskip("PIL")
+    if not BAUPLAN_PDF.exists():
+        pytest.skip("Bauplan reference PDF not present in this environment")
+
+    giant_figure = _png_b64(12000, 11000)
+
+    def _fake_docling(pdf_bytes):
+        return "# Plan text\n\nSTAHLBETON …", 2, {"figure-1.png": giant_figure}
+
+    monkeypatch.setattr(dc, "_docling_convert_pdf", _fake_docling)
+
+    markdown, meta, images = convert_pdf_bytes(BAUPLAN_PDF.read_bytes())
+
+    assert meta["docling_parsed"] is True
+    assert "Plan text" in markdown  # docling text preserved
+    # Both oversized pages rendered whole …
+    assert "page-001.png" in images and "page-002.png" in images
+    assert meta["rendered_page_numbers"] == [1, 2]
+    # … and the 132-MP figure was down-scaled by the guard.
+    fw, fh = _decoded_size(images["figure-1.png"])
+    assert max(fw, fh) <= MAX_IMAGE_EDGE
+
+
+def test_convert_pdf_docling_failure_renders_all_pages(monkeypatch):
+    """When Docling cannot parse the PDF at all, every page is rendered for
+    Vision and the markdown references those page images (no 415/crash)."""
+    pytest.importorskip("pypdfium2")
+    pytest.importorskip("PIL")
+    if not BAUPLAN_PDF.exists():
+        pytest.skip("Bauplan reference PDF not present in this environment")
+
+    def _boom(pdf_bytes):
+        raise RuntimeError("docling exploded on this file")
+
+    monkeypatch.setattr(dc, "_docling_convert_pdf", _boom)
+
+    markdown, meta, images = convert_pdf_bytes(BAUPLAN_PDF.read_bytes())
+
+    assert meta["docling_parsed"] is False
+    assert set(images) == {"page-001.png", "page-002.png"}
+    # Render-only markdown references each page so descriptions attach cleanly.
+    assert "page-001.png" in markdown and "page-002.png" in markdown

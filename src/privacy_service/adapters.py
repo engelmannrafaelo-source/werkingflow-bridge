@@ -4,24 +4,19 @@ Adapter chain for the universal document conversion endpoint.
 Each adapter declares whether it ``can_handle`` a given (format, MIME, filename)
 tuple and, if so, ``convert``s the bytes into a :class:`ConversionResult`.
 
-The :class:`AdapterChain` walks adapters in order. Deterministic adapters come
-first (cheap, free) — :class:`AiFallbackAdapter` is the catch-all last entry
-that calls the Bridge's own ``/v1/chat/completions`` to handle exotic formats
-that none of the deterministic adapters can parse.
-
-This keeps a single ``/v1/document/convert`` endpoint with a clean fallback
-policy instead of two separate endpoints (deterministic vs AI).
+The :class:`AdapterChain` walks adapters in order, deterministic-first. There is
+no AI/self-call fallback: PDFs that carry no text layer (scans, plans, photos)
+are handled inside :func:`convert_pdf_bytes` via a per-page render→Vision
+cascade, and a genuinely unknown format fails loud with HTTP 415 — matching the
+service's "never silently fall back to a different adapter" design constraint.
 """
 
 from __future__ import annotations
 
-import json
 import logging
 import os
 from abc import ABC, abstractmethod
 from typing import List, Optional
-
-import httpx
 
 from .document_converter import (
     ConversionResult,
@@ -201,175 +196,6 @@ class ImageAdapter(_LegacyAdapter):
 
 
 # ----------------------------------------------------------------------------
-# AI fallback — calls the Bridge's own /v1/chat/completions
-# ----------------------------------------------------------------------------
-
-
-class AiFallbackAdapter(BaseAdapter):
-    """Catch-all adapter that delegates to a Claude model via the Bridge.
-
-    Strategy:
-    - Try to text-decode the bytes (utf-8 / utf-16 / cp1252 / latin-1).
-    - If decodable: send the text (truncated) to the Bridge's
-      ``/v1/chat/completions`` and ask Claude for raw Markdown.
-    - If Claude returns the literal token ``<<UNCONVERTIBLE>>``, fail with an
-      :class:`AdapterError` so the chain reports HTTP 415 to the caller.
-    - If the bytes don't decode as text, fail loudly — we don't try to OCR
-      arbitrary binary blobs through this path.
-
-    The fallback only burns AI tokens for files that no deterministic adapter
-    could handle, so the standard formats stay free.
-    """
-
-    name = "ai-fallback"
-    DEFAULT_MODEL = "claude-haiku-4-5-20251001"
-    MAX_TEXT_CHARS = 60_000
-    UNCONVERTIBLE_TOKEN = "<<UNCONVERTIBLE>>"
-
-    def __init__(
-        self,
-        bridge_url: Optional[str] = None,
-        api_key: Optional[str] = None,
-        model: Optional[str] = None,
-        timeout: float = 120.0,
-    ):
-        self.bridge_url = bridge_url or os.getenv(
-            "BRIDGE_SELF_URL", "http://localhost:8000/v1/chat/completions"
-        )
-        self.api_key = api_key if api_key is not None else os.getenv("API_KEY")
-        self.model = model or os.getenv("AI_FALLBACK_MODEL", self.DEFAULT_MODEL)
-        self.timeout = timeout
-
-    def can_handle(self, fmt, mime, filename) -> bool:  # catch-all
-        return True
-
-    def convert(self, content: bytes, filename: str, mime: Optional[str]) -> ConversionResult:
-        text = self._try_decode(content)
-        if text is None:
-            raise AdapterError(
-                self.name,
-                f"Cannot AI-convert binary file {filename!r} (mime={mime!r}): "
-                "not text-decodable and no specific adapter handled it.",
-            )
-
-        truncated = len(text) > self.MAX_TEXT_CHARS
-        sample = text[: self.MAX_TEXT_CHARS] if truncated else text
-
-        prompt = self._build_prompt(filename, mime, sample, truncated)
-
-        body = {
-            "model": self.model,
-            "max_tokens": 8000,
-            "temperature": 0,
-            "stream": False,
-            "messages": [{"role": "user", "content": prompt}],
-        }
-        headers = {"Content-Type": "application/json"}
-        if self.api_key:
-            headers["Authorization"] = f"Bearer {self.api_key}"
-
-        try:
-            with httpx.Client(timeout=self.timeout) as client:
-                resp = client.post(self.bridge_url, headers=headers, json=body)
-        except (httpx.TimeoutException, httpx.ConnectError, httpx.RemoteProtocolError) as e:
-            raise AdapterError(self.name, f"Bridge self-call failed: {e}", cause=e) from e
-
-        if resp.status_code != 200:
-            raise AdapterError(
-                self.name,
-                f"Bridge self-call returned HTTP {resp.status_code}: {resp.text[:300]}",
-            )
-
-        try:
-            data = resp.json()
-        except json.JSONDecodeError as e:
-            raise AdapterError(self.name, f"Bridge response was not JSON: {e}") from e
-
-        choices = data.get("choices") or []
-        if not choices:
-            raise AdapterError(self.name, f"Bridge response had no choices: {data}")
-
-        markdown_raw = (choices[0].get("message") or {}).get("content", "") or ""
-        markdown = markdown_raw.strip()
-
-        if not markdown or markdown == self.UNCONVERTIBLE_TOKEN:
-            raise AdapterError(
-                self.name,
-                f"AI declared {filename!r} unconvertible.",
-            )
-
-        markdown = self._strip_code_fence(markdown)
-
-        usage = data.get("usage") or {}
-        metadata = {
-            "adapter": self.name,
-            "warning": "converted via AI fallback - quality may vary",
-            "ai_model": self.model,
-            "ai_input_tokens": usage.get("prompt_tokens"),
-            "ai_output_tokens": usage.get("completion_tokens"),
-            "truncated": truncated,
-            "input_chars": len(text),
-            "filename": filename,
-            "original_size_bytes": len(content),
-        }
-        return ConversionResult(
-            markdown=markdown,
-            fmt="ai-fallback",
-            metadata=metadata,
-        )
-
-    @staticmethod
-    def _build_prompt(filename: str, mime: Optional[str], sample: str, truncated: bool) -> str:
-        return (
-            "Convert the following file content into clean Markdown.\n"
-            f"Filename: {filename}\n"
-            f"MIME hint: {mime or '(none)'}\n"
-            f"Truncated to first {AiFallbackAdapter.MAX_TEXT_CHARS} chars: {truncated}\n\n"
-            "If the content is unintelligible, encrypted, or cannot meaningfully be "
-            "rendered as Markdown, respond with EXACTLY this token and nothing else:\n"
-            f"{AiFallbackAdapter.UNCONVERTIBLE_TOKEN}\n\n"
-            "Otherwise return ONLY the raw Markdown — no preface, no code fences, "
-            "no explanation.\n\n"
-            "<file_content>\n"
-            f"{sample}\n"
-            "</file_content>"
-        )
-
-    @staticmethod
-    def _try_decode(content: bytes) -> Optional[str]:
-        for enc in ("utf-8-sig", "utf-8", "utf-16", "cp1252", "latin-1"):
-            try:
-                text = content.decode(enc)
-            except UnicodeDecodeError:
-                continue
-            if AiFallbackAdapter._looks_binary(text):
-                return None
-            return text
-        return None
-
-    @staticmethod
-    def _looks_binary(text: str) -> bool:
-        if not text:
-            return False
-        sample = text[:4000]
-        bad = sum(
-            1 for c in sample if c not in "\t\n\r\f\v" and ord(c) < 0x20
-        )
-        return bad / max(len(sample), 1) > 0.05
-
-    @staticmethod
-    def _strip_code_fence(markdown: str) -> str:
-        if not markdown.startswith("```"):
-            return markdown
-        lines = markdown.splitlines()
-        if lines and lines[0].startswith("```"):
-            lines = lines[1:]
-        if lines and lines[-1].strip() == "```":
-            lines = lines[:-1]
-        return "\n".join(lines)
-
-
-# ----------------------------------------------------------------------------
 # Chain
 # ----------------------------------------------------------------------------
 
@@ -377,10 +203,9 @@ class AiFallbackAdapter(BaseAdapter):
 class AdapterChain:
     """Iterate adapters in order; first matching ``can_handle`` that succeeds wins.
 
-    Deterministic adapters are checked first (cheap, free). The AI fallback —
-    if registered — is the catch-all last entry. If even the AI fallback
-    fails, an :class:`UnsupportedFormatError` is raised so the endpoint
-    returns HTTP 415.
+    Deterministic adapters are checked first (cheap, free). If none can convert
+    the file, an :class:`UnsupportedFormatError` is raised so the endpoint
+    returns HTTP 415 — the service never silently AI-guesses an unknown format.
     """
 
     def __init__(self, adapters: List[BaseAdapter]):
@@ -440,10 +265,12 @@ class AdapterChain:
         )
 
 
-def build_default_chain(*, enable_ai_fallback: bool = True) -> AdapterChain:
-    """Build the production adapter chain.
+def build_default_chain() -> AdapterChain:
+    """Build the production adapter chain (deterministic adapters, no AI guess).
 
-    Order matters — deterministic adapters first (cheap), AI fallback last.
+    Order matters — deterministic adapters first (cheap). Image/scan/plan PDFs
+    are covered by the render→Vision cascade inside :func:`convert_pdf_bytes`,
+    so no catch-all AI fallback is needed; unknown formats fail loud (HTTP 415).
     """
     adapters: List[BaseAdapter] = [
         PdfAdapter(),
@@ -456,6 +283,4 @@ def build_default_chain(*, enable_ai_fallback: bool = True) -> AdapterChain:
         EmlAdapter(),
         ImageAdapter(),
     ]
-    if enable_ai_fallback:
-        adapters.append(AiFallbackAdapter())
     return AdapterChain(adapters)
