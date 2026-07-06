@@ -205,6 +205,21 @@ def _serialize_monthly_budgets(monthly_budgets: Dict[str, MonthlyBudgetEntry]) -
     }
 
 
+def _serialize_topup_lots(lots: List[TopUpLot]) -> List[dict]:
+    """Wire shape for the TS TopUpLotSchema (camelCase). purchased_at/expires_at
+    are already ISO strings (see _load_topup_lots). The client derives the visible
+    balance + 'gültig bis' from these lots (topUpBalanceEur/nextTopUpExpiry)."""
+    return [
+        {
+            "id": lot.id,
+            "amountEur": lot.amount_eur,
+            "purchasedAt": lot.purchased_at,
+            "expiresAt": lot.expires_at,
+        }
+        for lot in lots
+    ]
+
+
 def _parse_user_id(raw: str) -> uuid.UUID:
     try:
         return uuid.UUID(raw)
@@ -662,6 +677,13 @@ async def get_budget(
     return {
         "userId": budget.user_id,
         "monthlyBudgets": _serialize_monthly_budgets(budget.monthly_budgets),
+        # projectBudgets kommt vom separaten project-budgets-Endpoint; hier leer,
+        # aber vom TS UserBudgetSchema als Feld verlangt (z.record akzeptiert {}).
+        "projectBudgets": {},
+        # topUpLots = Raw-Shape, die das TS UserBudgetSchema erwartet; der Client
+        # leitet Balance + "gültig bis" daraus ab. Ohne dieses Feld schlägt der
+        # Zod-parse im Frontend fehl → Budget-Widget still leer.
+        "topUpLots": _serialize_topup_lots(budget.top_up_lots),
         # Abgeleitete Anzeige-Skalare aus den Lots (Summe aktiver Lots + frühestes Ablaufdatum).
         "topUpBalanceEur": topup_balance_eur(budget.top_up_lots, now),
         "topUpNextExpiryAt": next_topup_expiry(budget.top_up_lots, now),

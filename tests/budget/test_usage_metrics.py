@@ -187,6 +187,30 @@ async def test_get_budget_workflow_only():
 
 
 # ---------------------------------------------------------------------------
+# Regression: the get_budget wire shape MUST carry every field the TypeScript
+# UserBudgetSchema (@werkingflow/usage-billing-admin) requires. Missing
+# projectBudgets + topUpLots made the frontend Zod-parse fail silently → budget
+# widget blank on the client. Do not drop these keys.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_get_budget_wire_shape_matches_ts_userbudgetschema():
+    resp = await _call_get_budget(
+        fetchrow_results=[
+            _make_budget_row(),
+            _make_legacy_balance_row(),
+            _make_updated_at_row(),
+        ],
+        usage_rows=[],
+    )
+    for key in ("userId", "monthlyBudgets", "projectBudgets", "topUpLots", "updatedAt"):
+        assert key in resp, f"get_budget response missing TS-required field: {key}"
+    assert isinstance(resp["topUpLots"], list)
+    assert isinstance(resp["projectBudgets"], dict)
+    assert isinstance(resp["monthlyBudgets"], dict)
+
+
+# ---------------------------------------------------------------------------
 # Test 5: Existing fields still present
 # ---------------------------------------------------------------------------
 
