@@ -584,6 +584,20 @@ async def verify_api_key(request: Request, credentials: Optional[HTTPAuthorizati
             # Raises on DB error — never masked into "no principal" (fail-loud).
             principal = await resolve_principal_by_token(token)
         if principal is None:
+            # Forensic log — the wire response stays a bare "Invalid API key",
+            # but silently rejecting made the 2026-07-06 energy-phase-4 401s
+            # nearly undiagnosable. token[:8] matches the token_prefix column
+            # stored openly in service_principals, so it identifies the caller
+            # without logging credential material. A token that is valid on the
+            # OTHER host lands here via the nginx cross-host backup upstream —
+            # the per-host Postgres DBs hold different principal tokens
+            # (scripts/check-principal-drift.sh).
+            logger.warning(
+                f"401 unknown principal token (prefix={token[:8]}, "
+                f"path={request.url.path}, x-app-id={request.headers.get('x-app-id') or '-'}). "
+                f"If this caller works on the other bridge host, this is cross-host "
+                f"principal drift — run scripts/check-principal-drift.sh."
+            )
             raise HTTPException(
                 status_code=401,
                 detail="Invalid API key",
@@ -607,6 +621,13 @@ async def verify_api_key(request: Request, credentials: Optional[HTTPAuthorizati
         return True
 
     if not is_shared_key:
+        # Same forensic trail as the principals path above — a silent 401 is
+        # undiagnosable from the client side (the envelope only says
+        # "Invalid API key" + worker name).
+        logger.warning(
+            f"401 shared-key mismatch (prefix={token[:8]}, "
+            f"path={request.url.path}, x-app-id={request.headers.get('x-app-id') or '-'})."
+        )
         raise HTTPException(
             status_code=401,
             detail="Invalid API key",

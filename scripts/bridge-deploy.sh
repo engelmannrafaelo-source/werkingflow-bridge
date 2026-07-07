@@ -1027,6 +1027,32 @@ deploy_server() {
 # ============================================================================
 # Entry point
 # ============================================================================
+
+# Principal-drift visibility (read-only, once per run). The per-host Postgres
+# DBs hold independent service_principals rows; a token valid on one host 401s
+# on the other. Because nginx's claude_production pool backs up CROSS-HOST
+# (prod → dev bridge), drift turns a capacity failover into a spurious,
+# non-retryable 401 "Invalid API key" for a perfectly valid caller — exactly
+# the 2026-07-06 energy-phase-4 incident. Deliberately a loud WARNING, not a
+# gate: whether per-host tokens must be identical (vs. dropping the cross-host
+# backup) is an open architecture decision — reconcile deliberately, see
+# scripts/check-principal-drift.sh.
+drift_check="$(dirname "${BASH_SOURCE[0]}")/check-principal-drift.sh"
+if [[ -x "$drift_check" || -f "$drift_check" ]]; then
+    if drift_out=$(bash "$drift_check" 2>&1); then
+        info "Principal parity: ${drift_out}"
+    else
+        warn "════════════════════════════════════════════════════════════════"
+        warn "SERVICE-PRINCIPAL DRIFT between bridge hosts (see below)."
+        warn "Cross-host failover WILL convert capacity errors into spurious"
+        warn "401 'Invalid API key' for affected callers until reconciled."
+        while IFS= read -r line; do warn "  ${line}"; done <<< "$drift_out"
+        warn "════════════════════════════════════════════════════════════════"
+    fi
+else
+    warn "check-principal-drift.sh not found next to bridge-deploy.sh — skipping parity check"
+fi
+
 case "$SERVER" in
     hetzner)
         deploy_server "hetzner"

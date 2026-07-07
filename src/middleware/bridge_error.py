@@ -117,7 +117,16 @@ def bridge_error(
     # Envelope combines OpenAI-compatible fields (message, type, code) with
     # bridge-specific metadata so callers can ALSO discriminate by `source`
     # without breaking existing OpenAI-style error parsers.
-    if source == SOURCE_BRIDGE_INTERNAL:
+    #
+    # 401/403 are auth rejections, never throttle events. Labeling them
+    # "bridge_throttle" (the generic bridge_internal compat type) sent the
+    # 2026-07-06 energy-phase-4 diagnosis down a throttling rabbit hole while
+    # the real cause was a credential rejection on the cross-host backup hop.
+    # Scoped to 401/403 only: unified-tester relies on type=="bridge_throttle"
+    # to detect a 404 route-not-deployed, so other statuses keep the old label.
+    if status_code in (401, 403):
+        compat_type = "authentication_error"
+    elif source == SOURCE_BRIDGE_INTERNAL:
         compat_type = "bridge_throttle"
     elif source == SOURCE_BRIDGE_CONFIG:
         compat_type = "configuration_error"
