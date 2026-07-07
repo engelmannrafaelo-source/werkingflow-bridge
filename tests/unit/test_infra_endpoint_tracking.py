@@ -552,6 +552,70 @@ class TestAudioTranscriptionsTracking:
         assert resp.status_code == 200
         mock_persist.assert_awaited_once()
 
+    @pytest.mark.asyncio
+    async def test_openai_stt_model_override(self):
+        """OPENAI_STT_MODEL overrides the app-sent model id for OpenAI-compatible EU
+        providers (e.g. Scaleway wants whisper-large-v3; the apps send whisper-1)."""
+        mock_persist = AsyncMock()
+        form = self._make_form(model="whisper-1")
+        mock_request = AsyncMock()
+        mock_request.form = AsyncMock(return_value=form)
+        mock_request.headers = {}
+
+        fake_http_resp = MagicMock()
+        fake_http_resp.status_code = 200
+        fake_http_resp.json = MagicMock(return_value={"text": "ok"})
+        fake_http_resp.raise_for_status = MagicMock()
+        mock_client = AsyncMock()
+        mock_client.post = AsyncMock(return_value=fake_http_resp)
+        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client.__aexit__ = AsyncMock(return_value=None)
+
+        with (
+            patch("src.main.verify_api_key", new=AsyncMock()),
+            patch.dict("os.environ", {"OPENAI_API_KEY": "sk-test",
+                                      "OPENAI_STT_MODEL": "whisper-large-v3"}),
+            patch("httpx.AsyncClient", return_value=mock_client),
+            patch("src.main.extract_attribution_context", return_value=_fake_attr()),
+            patch("src.activity.ai_call_writer.persist_ai_call_activity", mock_persist),
+        ):
+            await src.main.audio_transcriptions(request=mock_request, credentials=None)
+
+        posted = mock_client.post.call_args.kwargs["data"]
+        assert posted["model"] == "whisper-large-v3"  # override, not the app's whisper-1
+
+    @pytest.mark.asyncio
+    async def test_no_override_keeps_app_model(self):
+        """Without OPENAI_STT_MODEL the app's model id is forwarded unchanged (default US)."""
+        mock_persist = AsyncMock()
+        form = self._make_form(model="whisper-1")
+        mock_request = AsyncMock()
+        mock_request.form = AsyncMock(return_value=form)
+        mock_request.headers = {}
+
+        fake_http_resp = MagicMock()
+        fake_http_resp.status_code = 200
+        fake_http_resp.json = MagicMock(return_value={"text": "ok"})
+        fake_http_resp.raise_for_status = MagicMock()
+        mock_client = AsyncMock()
+        mock_client.post = AsyncMock(return_value=fake_http_resp)
+        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client.__aexit__ = AsyncMock(return_value=None)
+
+        import os as _os
+        _os.environ.pop("OPENAI_STT_MODEL", None)
+        with (
+            patch("src.main.verify_api_key", new=AsyncMock()),
+            patch.dict("os.environ", {"OPENAI_API_KEY": "sk-test"}),
+            patch("httpx.AsyncClient", return_value=mock_client),
+            patch("src.main.extract_attribution_context", return_value=_fake_attr()),
+            patch("src.activity.ai_call_writer.persist_ai_call_activity", mock_persist),
+        ):
+            await src.main.audio_transcriptions(request=mock_request, credentials=None)
+
+        posted = mock_client.post.call_args.kwargs["data"]
+        assert posted["model"] == "whisper-1"
+
 
 # ---------------------------------------------------------------------------
 # STT EU data-residency: provider resolution + SageMaker Whisper (aws-sagemaker)

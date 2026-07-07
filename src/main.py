@@ -5683,10 +5683,17 @@ def _resolve_stt_provider() -> dict:
     defensive-programming: kein silent fail, kein Fallback).
 
     Providers (env STT_PROVIDER, default "openai"):
-      - "openai" (kind="proxy"): OpenAI multipart proxy. Default
-                  https://api.openai.com/v1 (US), or set
-                  OPENAI_STT_BASE_URL=https://eu.api.openai.com/v1 (+ an EU-region
-                  OPENAI_API_KEY) for OpenAI's own EU data residency.
+      - "openai" (kind="proxy"): OpenAI or any OpenAI-COMPATIBLE multipart provider.
+                  Default https://api.openai.com/v1 (US). For EU data residency set
+                  OPENAI_STT_BASE_URL to an EU endpoint + OPENAI_API_KEY for that
+                  endpoint. Two EU routes:
+                    · OpenAI's own EU residency: OPENAI_STT_BASE_URL=
+                      https://eu.api.openai.com/v1 (business-verified + approved only).
+                    · An EU provider hosting Whisper large-v3 with an OpenAI-compatible
+                      /audio/transcriptions endpoint — e.g. Scaleway (Paris/FR, GDPR,
+                      pay-per-use, self-serve): OPENAI_STT_BASE_URL=<scaleway v1 url> +
+                      OPENAI_STT_MODEL=whisper-large-v3 (the apps send "whisper-1"; the
+                      model id must be overridden to the provider's).
                   Auth: Authorization: Bearer OPENAI_API_KEY.
       - "aws-sagemaker" (kind="aws-sagemaker"): self-hosted Whisper on Amazon
                   SageMaker in an EU region (default eu-central-1/Frankfurt),
@@ -5857,9 +5864,13 @@ async def audio_transcriptions(
             )
             _status_code = 200
         else:
-            # Proxy providers (openai / OpenAI-EU): forward the multipart form upstream.
+            # Proxy providers (openai / OpenAI-EU / OpenAI-compatible EU providers):
+            # forward the multipart form upstream.
             files = {"file": (filename, audio_bytes, content_type)}
-            data = {"model": _model, "response_format": response_format}
+            # OPENAI_STT_MODEL overrides the app-sent model id for OpenAI-COMPATIBLE
+            # EU providers (e.g. Scaleway wants "whisper-large-v3"; the apps send
+            # "whisper-1"). Unset (default OpenAI-US) → app's model id, unchanged.
+            data = {"model": os.getenv("OPENAI_STT_MODEL") or _model, "response_format": response_format}
             if language:
                 data["language"] = language
             if prompt:

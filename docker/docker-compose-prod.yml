@@ -115,6 +115,7 @@ services:
       # or OPENAI_STT_BASE_URL=https://eu.api.openai.com/v1 for OpenAI's own EU residency.
       - STT_PROVIDER=${STT_PROVIDER:-openai}
       - OPENAI_STT_BASE_URL=${OPENAI_STT_BASE_URL:-}
+      - OPENAI_STT_MODEL=${OPENAI_STT_MODEL:-}
       - AWS_STT_SAGEMAKER_ENDPOINT=${AWS_STT_SAGEMAKER_ENDPOINT:-}
       - AWS_STT_REGION=${AWS_STT_REGION:-}
       - PRIVACY_ENABLED=true
@@ -192,6 +193,7 @@ services:
       # or OPENAI_STT_BASE_URL=https://eu.api.openai.com/v1 for OpenAI's own EU residency.
       - STT_PROVIDER=${STT_PROVIDER:-openai}
       - OPENAI_STT_BASE_URL=${OPENAI_STT_BASE_URL:-}
+      - OPENAI_STT_MODEL=${OPENAI_STT_MODEL:-}
       - AWS_STT_SAGEMAKER_ENDPOINT=${AWS_STT_SAGEMAKER_ENDPOINT:-}
       - AWS_STT_REGION=${AWS_STT_REGION:-}
       - PRIVACY_ENABLED=true
