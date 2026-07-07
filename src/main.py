@@ -187,6 +187,27 @@ logger = get_logger(__name__)
 # Global variable to store runtime-generated API key
 runtime_api_key = None
 
+# Denylist applied when a caller sends enable_tools=false (the OpenAI-compat
+# default): the model must answer in plain text and never call tools. The SDK
+# has no "disable all tools" switch, so this list must NAME every tool — and it
+# DRIFTS with every CLI upgrade. CLI 2.1.201 shipped a whole new harness set
+# (ToolSearch, Workflow, Task*, ...) that the old 16-entry list did not cover;
+# during the 2026-07-06 energy phase-4 incident the model called ToolSearch on
+# a tools-disabled request. When bumping the CLI image, diff this list against
+# the 'tools' array in the SDK init message (logged per instance).
+TOOLS_DISABLED_DENYLIST = [
+    # Classic tool set
+    'Task', 'Bash', 'Glob', 'Grep', 'LS', 'exit_plan_mode',
+    'Read', 'Edit', 'MultiEdit', 'Write', 'NotebookRead',
+    'NotebookEdit', 'WebFetch', 'TodoRead', 'TodoWrite', 'WebSearch',
+    # Harness tools observed in CLI 2.1.201 init
+    'ToolSearch', 'Workflow', 'Skill', 'Agent', 'SendMessage',
+    'TaskCreate', 'TaskGet', 'TaskList', 'TaskOutput', 'TaskStop', 'TaskUpdate',
+    'CronCreate', 'CronDelete', 'CronList', 'Monitor', 'ScheduleWakeup',
+    'DesignSync', 'EnterWorktree', 'ExitWorktree', 'PushNotification',
+    'RemoteTrigger', 'ReportFindings',
+]
+
 def generate_secure_token(length: int = 32) -> str:
     """Generate a secure random token for API authentication."""
     alphabet = string.ascii_letters + string.digits + '-_'
@@ -1135,9 +1156,20 @@ def handle_file_discovery_header(
     """
     x_claude_file_discovery = request_headers.get('X-Claude-File-Discovery', '').strip()
 
+    # Research auto-activation matches claude_cli's own research detection:
+    # the prompt must BE a research command (starts with it), not merely
+    # MENTION one. The old substring check ('/sc:research' in prompt) flipped
+    # any prompt whose CONTENT referenced the tool into file-discovery mode —
+    # the bridge then injected "MUST use the Write tool" while enable_tools=
+    # false had Write disallowed, and the call died deterministically with
+    # sdk_disconnect (energy phase-4 incident 2026-07-06: an 82KB prompt
+    # contained the sentence "...will be sent to an academic research tool
+    # (/sc:research ...)").
+    _stripped_prompt = prompt.strip()
     enable_file_discovery = (
         x_claude_file_discovery.lower() in ('enabled', 'true', '1')
-        or '/sc:research' in prompt
+        or _stripped_prompt.startswith('/sc:research')
+        or _stripped_prompt.startswith('/research')
     )
 
     if enable_file_discovery:
@@ -1333,10 +1365,7 @@ async def generate_streaming_response(
         # Handle tools - disabled by default for OpenAI compatibility
         if not request.enable_tools and not x_claude_allowed_tools:
             # Set disallowed_tools to all available tools to disable them
-            disallowed_tools = ['Task', 'Bash', 'Glob', 'Grep', 'LS', 'exit_plan_mode',
-                                'Read', 'Edit', 'MultiEdit', 'Write', 'NotebookRead',
-                                'NotebookEdit', 'WebFetch', 'TodoRead', 'TodoWrite', 'WebSearch']
-            claude_options['disallowed_tools'] = disallowed_tools
+            claude_options['disallowed_tools'] = list(TOOLS_DISABLED_DENYLIST)
             claude_options['max_turns'] = 1  # Single turn for Q&A (can be overridden by X-Claude-Max-Turns header)
             logger.info("Tools disabled (default behavior for OpenAI compatibility)")
         else:
@@ -2629,10 +2658,7 @@ async def chat_completions(
             # Handle tools - disabled by default for OpenAI compatibility
             if not request_body.enable_tools:
                 # Set disallowed_tools to all available tools to disable them
-                disallowed_tools = ['Task', 'Bash', 'Glob', 'Grep', 'LS', 'exit_plan_mode',
-                                    'Read', 'Edit', 'MultiEdit', 'Write', 'NotebookRead',
-                                    'NotebookEdit', 'WebFetch', 'TodoRead', 'TodoWrite', 'WebSearch']
-                claude_options['disallowed_tools'] = disallowed_tools
+                claude_options['disallowed_tools'] = list(TOOLS_DISABLED_DENYLIST)
                 claude_options['max_turns'] = 1  # Single turn for Q&A
                 logger.info("Tools disabled (default behavior for OpenAI compatibility)")
             else:

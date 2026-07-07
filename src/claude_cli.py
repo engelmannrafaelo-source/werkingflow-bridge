@@ -1335,7 +1335,24 @@ CRITICAL: Write file EARLY to avoid context overflow. Use Write tool for clauded
                 )
 
                 # Inject output path for file discovery (research or opt-in)
-                if enable_file_discovery:
+                if enable_file_discovery and disallowed_tools and 'Write' in disallowed_tools:
+                    # Contradiction guard: file discovery ORDERS the model to
+                    # use the Write tool while this request has Write
+                    # disallowed (enable_tools=false). Injecting anyway makes
+                    # the call fail deterministically — the model obeys the
+                    # "MUST use the Write tool" instruction, cannot, and
+                    # max_turns=1 dies as sdk_disconnect (energy phase-4
+                    # incident 2026-07-06). Skip discovery LOUDLY: a caller
+                    # that genuinely wants file output must enable tools.
+                    logger.error(
+                        "❌ File discovery requested but the Write tool is disallowed "
+                        "(enable_tools=false) — skipping OUTPUT_FILE_PATH injection and "
+                        "file discovery. The model will answer in plain text. "
+                        "Callers needing file output must send enable_tools=true "
+                        "(or X-Claude-Allowed-Tools including Write)."
+                    )
+                    enable_file_discovery = False
+                elif enable_file_discovery:
                     output_file = claudedocs_dir / "output.md"
                     prompt = inject_output_path_for_file_discovery(
                         prompt=prompt,
