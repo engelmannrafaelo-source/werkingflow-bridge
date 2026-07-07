@@ -327,9 +327,24 @@ async def persist_ai_call_activity(
             payload = {
                 "feature": feature,
                 "model": model,
+                # promptTokens = UNCACHED input only (Anthropic usage semantics).
+                # Cache traffic is reported separately so the UI can show the
+                # physical input — without them a cached agent call displays
+                # "10 input tokens" while the priced input is 100k+.
                 "promptTokens": input_tokens,
                 "completionTokens": output_tokens,
-                "totalTokens": (input_tokens or 0) + (output_tokens or 0),
+                "cacheReadTokens": cache_read_tokens or 0,
+                "cacheCreationTokens": cache_creation_tokens or 0,
+                # totalTokens = every token the call physically processed
+                # (uncached input + cache reads/writes + output) — matches what
+                # costEur prices. Legacy rows (pre cache fields) carry only
+                # input+output here.
+                "totalTokens": (
+                    (input_tokens or 0)
+                    + (cache_read_tokens or 0)
+                    + (cache_creation_tokens or 0)
+                    + (output_tokens or 0)
+                ),
                 "costEur": call_cost_eur,  # priced via src/pricing.py (SSoT)
                 "latencyMs": duration_ms,
                 "loggedBy": "bridge",  # distinguishes self-log from legacy app POSTs

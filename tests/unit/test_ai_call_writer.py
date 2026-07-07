@@ -227,6 +227,56 @@ async def test_valid_uuid_inserts_activity():
 
 
 # ---------------------------------------------------------------------------
+# Test: cache tokens land in the activity payload (UI display contract)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_cache_tokens_in_activity_payload():
+    """Cache read/creation tokens are part of the activities payload and
+    totalTokens is the physical sum — otherwise cached agent calls display
+    '10 input tokens' while the priced input is 100k+."""
+    import json as _json
+
+    writer._skip_counts.clear()
+
+    t_row = _tenant_row(TENANT_UUID)
+    conn = _make_mock_conn(tenant_row=t_row)
+    pool = _pool_ctx(conn)
+
+    with (
+        patch.object(writer, "get_pool", return_value=pool),
+        patch.object(writer, "_deduct_call_cost"),
+    ):
+        await writer.persist_ai_call_activity(
+            app_id="werking-energy",
+            user_id=VALID_UUID,
+            agent_id="api/llm-client",
+            workflow_id=None,
+            model="claude-sonnet-4-5",
+            input_tokens=10,
+            output_tokens=39_133,
+            status="success",
+            duration_ms=648_000,
+            app_env="prod",
+            cache_read_tokens=80_000,
+            cache_creation_tokens=5_000,
+        )
+
+    # First execute = activities INSERT; its jsonb arg is the payload.
+    activities_call = conn.execute.call_args_list[0]
+    payload_json = next(
+        a for a in activities_call.args if isinstance(a, str) and "promptTokens" in a
+    )
+    payload = _json.loads(payload_json)
+
+    assert payload["promptTokens"] == 10
+    assert payload["completionTokens"] == 39_133
+    assert payload["cacheReadTokens"] == 80_000
+    assert payload["cacheCreationTokens"] == 5_000
+    assert payload["totalTokens"] == 10 + 39_133 + 80_000 + 5_000
+
+
+# ---------------------------------------------------------------------------
 # Anonymous marker → dedicated accounting bucket (migration 032)
 # ---------------------------------------------------------------------------
 
