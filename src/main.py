@@ -971,11 +971,22 @@ async def _cross_worker_retry(
         return None
 
     import httpx
+    # Forward authorization + EVERY x-* header instead of a hand-picked list.
+    # The old allowlist (authorization, x-claude-*, x-priority) silently
+    # DROPPED the attribution headers (x-app-id, x-user-id, x-client-id, ...)
+    # and x-privacy-mode on every cross-worker hop: retried calls were booked
+    # without attribution, lost their privacy-mode override, and — since
+    # service principals with app allowlists went live (2026-07-05) — died
+    # with a non-retryable 403 "may not act as app '-'" on the peer worker
+    # (energy golden run phase 6, 2026-07-07 09:52Z). An x-* passthrough
+    # cannot re-drift when new x-headers are introduced; the two retry-control
+    # headers are overwritten below either way.
     headers = {"content-type": "application/json"}
-    for h in ("authorization", "x-claude-allowed-tools", "x-claude-max-turns",
-              "x-claude-file-discovery", "x-priority"):
-        if h in request.headers:
-            headers[h] = request.headers[h]
+    if "authorization" in request.headers:
+        headers["authorization"] = request.headers["authorization"]
+    for h, v in request.headers.items():
+        if h.lower().startswith("x-"):
+            headers[h.lower()] = v
     headers["x-bridge-retry-count"] = str(retry_count + 1)
     headers["x-bridge-retry-excluded"] = ",".join(sorted(excluded))
 
