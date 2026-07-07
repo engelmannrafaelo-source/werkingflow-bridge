@@ -24,8 +24,15 @@ RUN curl -sSL https://install.python-poetry.org | POETRY_HOME=/usr/local python3
 
 ENV PATH="/usr/local/bin:${PATH}"
 
-# Install Claude Code CLI globally (for SDK compatibility)
-RUN npm install -g @anthropic-ai/claude-code
+# Install Claude Code CLI globally (for SDK compatibility).
+# PINNED on purpose: unpinned, every image rebuild silently pulled the LATEST
+# CLI — so ANY deploy (even an unrelated feature) swapped the LLM harness under
+# all workers. The 2026-07-06 rebuild bumped 2.1.200→2.1.201 and flipped a
+# months-stable prompt behavior, killing energy phase 4 the same evening
+# (see commit e898c7c). Bump this version DELIBERATELY: change it here, deploy
+# to the dev bridge first, run the smoke + an energy phase-4 style
+# tools-disabled call, then roll to prod.
+RUN npm install -g @anthropic-ai/claude-code@2.1.201
 
 # Copy the app code
 COPY . /app
