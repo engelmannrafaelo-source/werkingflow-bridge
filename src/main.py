@@ -1143,8 +1143,7 @@ def handle_file_discovery_header(
     Handle X-Claude-File-Discovery header for both streaming and non-streaming.
 
     Modifies claude_options in-place to set enable_file_discovery based on:
-    - X-Claude-File-Discovery header (values: 'enabled', 'true', '1')
-    - Prompt containing '/sc:research' (automatic activation)
+    - X-Claude-File-Discovery header (values: 'enabled', 'true', '1') — ONLY
 
     Args:
         request_headers: FastAPI request headers dict
@@ -1156,21 +1155,18 @@ def handle_file_discovery_header(
     """
     x_claude_file_discovery = request_headers.get('X-Claude-File-Discovery', '').strip()
 
-    # Research auto-activation matches claude_cli's own research detection:
-    # the prompt must BE a research command (starts with it), not merely
-    # MENTION one. The old substring check ('/sc:research' in prompt) flipped
-    # any prompt whose CONTENT referenced the tool into file-discovery mode —
-    # the bridge then injected "MUST use the Write tool" while enable_tools=
-    # false had Write disallowed, and the call died deterministically with
-    # sdk_disconnect (energy phase-4 incident 2026-07-06: an 82KB prompt
-    # contained the sentence "...will be sent to an academic research tool
-    # (/sc:research ...)").
-    _stripped_prompt = prompt.strip()
-    enable_file_discovery = (
-        x_claude_file_discovery.lower() in ('enabled', 'true', '1')
-        or _stripped_prompt.startswith('/sc:research')
-        or _stripped_prompt.startswith('/research')
-    )
+    # Header opt-in ONLY — never inferred from prompt content. Endpoint
+    # separation (Rafael, 2026-07-07): /v1/chat/completions imitates the plain
+    # Anthropic API (no tools, no research, no prompt sniffing); research runs
+    # exclusively on /v1/research, which enables file discovery explicitly.
+    # History: the original substring check ('/sc:research' in prompt) flipped
+    # any prompt whose CONTENT merely mentioned the tool into file-discovery
+    # mode — the bridge then injected "MUST use the Write tool" while
+    # enable_tools=false had Write disallowed, and the call died
+    # deterministically with sdk_disconnect (energy phase-4 incident
+    # 2026-07-06: an 82KB prompt contained the sentence "...will be sent to an
+    # academic research tool (/sc:research ...)").
+    enable_file_discovery = x_claude_file_discovery.lower() in ('enabled', 'true', '1')
 
     if enable_file_discovery:
         logger.info(

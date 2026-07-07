@@ -1095,7 +1095,19 @@ class ClaudeCodeCLI:
         # SLASH COMMAND DETECTION: Transform /sc:research into executable protocol
         # SuperClaude commands are not executed by SDK - they're just expanded as context
         # Transform them into direct instructions that will be executed
-        if prompt.strip().startswith("/sc:research") or prompt.strip().startswith("/research"):
+        #
+        # GATED on enable_file_discovery: this transform is the internal
+        # mechanic of /v1/research, which builds the '/sc:research "query"'
+        # prompt itself and passes enable_file_discovery=True explicitly.
+        # Chat-completions traffic (enable_file_discovery False unless the
+        # caller opted in via X-Claude-File-Discovery) must NEVER be
+        # content-sniffed: /v1/chat/completions imitates the plain Anthropic
+        # API, so a prompt that happens to start with '/sc:research' is sent
+        # to the model as ordinary text — research belongs on /v1/research
+        # (Rafael, 2026-07-07, nach dem Energy-Phase-4-Incident).
+        if enable_file_discovery and (
+            prompt.strip().startswith("/sc:research") or prompt.strip().startswith("/research")
+        ):
             logger.info(f"🔍 Detected research command: {prompt[:60]}...")
             logger.info(f"   Transforming into direct execution protocol")
 

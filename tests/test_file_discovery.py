@@ -72,8 +72,14 @@ async def test_file_discovery_header_disabled():
 
 
 @pytest.mark.asyncio
-async def test_file_discovery_research_backwards_compatible():
-    """Test: /sc:research automatically enables file discovery (backwards compat)."""
+async def test_chat_completions_never_sniffs_research_from_prompt():
+    """Endpoint separation (Rafael, 2026-07-07): /v1/chat/completions imitates
+    the plain Anthropic API — a prompt that starts with (or mentions)
+    /sc:research is ordinary text, NEVER an implicit research/file-discovery
+    activation. Research runs exclusively on /v1/research. The old
+    auto-detection turned prompts that merely MENTIONED the tool into
+    file-output mode and killed tools-disabled calls (energy phase-4 incident
+    2026-07-06)."""
 
     async with httpx.AsyncClient() as client:
         response = await client.post(
@@ -88,7 +94,7 @@ async def test_file_discovery_research_backwards_compatible():
             },
             headers={
                 "X-Claude-Max-Turns": "20"
-                # NO X-Claude-File-Discovery header (auto-detected)
+                # NO X-Claude-File-Discovery header → no file discovery, period.
             },
             timeout=600.0
         )
@@ -96,9 +102,8 @@ async def test_file_discovery_research_backwards_compatible():
         assert response.status_code == 200
         data = response.json()
 
-        # Should have metadata (research auto-enables)
-        assert "x_claude_metadata" in data
-        assert "files_created" in data["x_claude_metadata"]
+        # No implicit research mode: no file-discovery metadata block
+        assert "files_created" not in (data.get("x_claude_metadata") or {})
 
 
 @pytest.mark.asyncio
