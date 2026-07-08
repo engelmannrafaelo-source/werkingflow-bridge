@@ -226,3 +226,180 @@ async def activity_query(
         ],
         "count": len(rows),
     }
+
+
+# ---------------------------------------------------------------------------
+# Cost-display verification — "what the user sees == what the ledger says"
+# ---------------------------------------------------------------------------
+
+import logging
+
+logger = logging.getLogger(__name__)
+
+# Per-call costs are round(x, 6) at write time (ai_call_writer). The display
+# must show EXACTLY the ledger value — any per-call difference is a bug.
+# The client-side SUM may differ by float addition order only.
+_TOTAL_TOLERANCE_EUR = 0.0005
+
+_MAX_VERIFY_CALLS = 500
+
+
+class VerifyDisplayCall(BaseModel):
+    id: str
+    costEur: float
+
+
+class VerifyDisplayRequest(BaseModel):
+    appId: str
+    calls: List[VerifyDisplayCall]
+    totalCostEur: float
+
+
+@router.post("/verify-display")
+async def verify_display(
+    body: VerifyDisplayRequest,
+    request: Request,
+    claims: AuthClaims = Depends(require_jwt_or_service),
+) -> Dict[str, Any]:
+    """
+    An app reports the per-call EUR costs it just RENDERED to the user; the
+    Bridge compares them against its own ledger (activities.payload.costEur).
+
+    Any deviation is an accounting inconsistency: it is persisted as a
+    'cost-display-mismatch' billing activity (visible in admin panels),
+    logged as ERROR, and answered with 409 so the app can fail loud in the
+    UI. Displaying costs the Bridge cannot confirm must never pass silently.
+
+    Non-operator callers (user JWT, service token with X-User-ID) may only
+    verify their own activity rows.
+    """
+    if body.appId not in _ALLOWED_APP_IDS:
+        raise HTTPException(status_code=400, detail=f"Unknown appId: {body.appId}")
+    if len(body.calls) > _MAX_VERIFY_CALLS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Too many calls to verify: {len(body.calls)} > {_MAX_VERIFY_CALLS}",
+        )
+    if not body.calls:
+        # Nothing displayed, nothing to verify — trivially consistent.
+        return {"status": "ok", "checked": 0, "ledgerTotalEur": 0.0}
+
+    ids = [_to_uuid(c.id) for c in body.calls]
+    caller_id = claims.effective_user_id
+
+    pool = get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT id, actor_user_id, app_id, payload
+            FROM activities
+            WHERE id = ANY($1::uuid[])
+            """,
+            ids,
+        )
+
+    by_id: Dict[str, Any] = {str(r["id"]): r for r in rows}
+
+    mismatches: List[Dict[str, Any]] = []
+    ledger_total = 0.0
+    for call in body.calls:
+        row = by_id.get(call.id)
+        if row is None:
+            mismatches.append({
+                "id": call.id, "reason": "unknown-event",
+                "displayedCostEur": call.costEur,
+            })
+            continue
+        if row["app_id"] != body.appId:
+            mismatches.append({
+                "id": call.id, "reason": "wrong-app",
+                "ledgerAppId": row["app_id"],
+            })
+            continue
+        if not claims.is_operator:
+            actor = str(row["actor_user_id"]) if row["actor_user_id"] else None
+            if actor != caller_id:
+                # Foreign row probed — treated as mismatch, not as data leak:
+                # no ledger values are echoed back for it.
+                mismatches.append({"id": call.id, "reason": "not-own-activity"})
+                continue
+        payload = row["payload"]
+        if not isinstance(payload, dict):
+            payload = json.loads(payload or "{}")
+        ledger_cost = float(payload.get("costEur") or 0.0)
+        ledger_total += ledger_cost
+        if round(ledger_cost, 6) != round(call.costEur, 6):
+            mismatches.append({
+                "id": call.id, "reason": "cost-differs",
+                "displayedCostEur": call.costEur,
+                "ledgerCostEur": ledger_cost,
+            })
+
+    total_diff = abs(ledger_total - body.totalCostEur)
+    if not mismatches and total_diff > _TOTAL_TOLERANCE_EUR:
+        mismatches.append({
+            "reason": "total-differs",
+            "displayedTotalEur": body.totalCostEur,
+            "ledgerTotalEur": round(ledger_total, 6),
+        })
+
+    if not mismatches:
+        return {
+            "status": "ok",
+            "checked": len(body.calls),
+            "ledgerTotalEur": round(ledger_total, 6),
+        }
+
+    # --- Inconsistency: persist + log loud, answer 409 -----------------------
+    logger.error(
+        "cost-display-mismatch app=%s user=%s checked=%d mismatches=%d "
+        "displayedTotal=%.6f ledgerTotal=%.6f first=%r",
+        body.appId, caller_id, len(body.calls), len(mismatches),
+        body.totalCostEur, ledger_total, mismatches[0],
+    )
+    try:
+        tenant_id = await resolve_tenant_id(claims, None, caller_id)
+        if tenant_id:
+            app_env = normalize_app_env(get_app_env_from_request(request))
+            incident_payload = {
+                "checked": len(body.calls),
+                "mismatches": mismatches[:20],
+                "mismatchCount": len(mismatches),
+                "displayedTotalEur": body.totalCostEur,
+                "ledgerTotalEur": round(ledger_total, 6),
+            }
+            pool = get_pool()
+            async with pool.acquire() as conn:
+                await conn.execute(
+                    """
+                    INSERT INTO activities
+                      (id, timestamp, category, event_type, actor_user_id,
+                       target_user_id, tenant_id, app_id, ip, user_agent,
+                       payload, app_env)
+                    VALUES (gen_random_uuid(), NOW(), 'billing',
+                            'cost-display-mismatch', $1, NULL, $2, $3, NULL,
+                            NULL, $4::jsonb, $5::app_env)
+                    """,
+                    _to_uuid(caller_id) if caller_id else None,
+                    tenant_id, body.appId,
+                    json.dumps(incident_payload), app_env,
+                )
+        else:
+            logger.error(
+                "cost-display-mismatch: no tenant resolvable for user=%s — "
+                "incident NOT persisted (still rejected with 409)", caller_id,
+            )
+    except Exception as e:  # noqa: BLE001 — persisting the incident must not mask the 409
+        logger.error("cost-display-mismatch: incident persist failed: %s", e)
+
+    raise HTTPException(
+        status_code=409,
+        detail={
+            "error": "cost-display-mismatch",
+            "message": "Angezeigte Kosten stimmen nicht mit dem Bridge-Ledger überein.",
+            "mismatchCount": len(mismatches),
+            "mismatches": mismatches[:20],
+            "displayedTotalEur": body.totalCostEur,
+            "ledgerTotalEur": round(ledger_total, 6),
+        },
+    )

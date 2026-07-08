@@ -64,6 +64,34 @@ def _parse_iso(s: Optional[str]) -> Optional[datetime]:
         raise HTTPException(status_code=400, detail=f"Invalid ISO timestamp: {s}")
 
 
+@router.get("/pricing")
+async def pricing_table(
+    _claims: AuthClaims = Depends(require_admin),
+) -> Dict[str, Any]:
+    """
+    Export the pricing SSoT (src/pricing.py). Admin only.
+
+    Consumers (e.g. partner-platform panels that price in-memory/JSONL token
+    counts) MUST read rates from here instead of keeping local price tables —
+    local copies rot (observed: Haiku 20% too cheap, Opus 4.6 billed 3x) and
+    are flagged by the monorepo Layer-0 hardcoded-pricing validator.
+    """
+    from src.pricing import (
+        CACHE_READ_MULT,
+        CACHE_WRITE_MULT,
+        PRICING_VERSION,
+    )
+
+    return {
+        "version": PRICING_VERSION,
+        "usdToEurRate": _usd_to_eur_rate(),
+        "cacheReadMult": CACHE_READ_MULT,
+        "cacheWriteMult": CACHE_WRITE_MULT,
+        # {model_id: {"in": usd_per_mtok, "out": usd_per_mtok}}
+        "ratesUsdPerMTok": _load_pricing(),
+    }
+
+
 @router.get("/usage")
 async def usage_metrics(
     groupBy: str = Query("user", description="user|tenant|app|model"),
