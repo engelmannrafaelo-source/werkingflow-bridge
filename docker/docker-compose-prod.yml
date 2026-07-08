@@ -93,6 +93,18 @@ services:
       # Chat-job self-call timeout (claims/finalize). Default 600s cut long
       # Energy claims calls (observed 728s); align with MAX_TIMEOUT (2400s).
       - BRIDGE_CHAT_JOB_TIMEOUT_S=2400
+      # Adaptive-limiter caps — match hetzner so large prod requests (e.g. the
+      # Energy multi-file analysis) fit. Without these, prod workers used the code
+      # default floor (50k) and shrank to ~60k after Anthropic rate-limits, then
+      # fast-failed any single request > cap with a 429 (even at 0 in-flight, no
+      # failover). Floor 500k keeps caps large enough for big single requests.
+      - ADAPTIVE_INITIAL_CAP_TOKENS=1000000
+      - ADAPTIVE_FLOOR_TOKENS=500000
+      - ADAPTIVE_CEILING_TOKENS=4000000
+      - ADAPTIVE_GROW_TRIGGER_SEC=300
+      - ADAPTIVE_GROW_FACTOR=1.10
+      - ADAPTIVE_QUEUE_WAIT_SEC=5
+      - ADAPTIVE_WEEKLY_PREDICTIVE_THROTTLE=true
       - CLAUDE_CWD=/app/instances
       - DISABLE_COACH_MCP=true
       - MAX_TIMEOUT=2400000
@@ -174,6 +186,18 @@ services:
       # Chat-job self-call timeout (claims/finalize). Default 600s cut long
       # Energy claims calls (observed 728s); align with MAX_TIMEOUT (2400s).
       - BRIDGE_CHAT_JOB_TIMEOUT_S=2400
+      # Adaptive-limiter caps — match hetzner so large prod requests (e.g. the
+      # Energy multi-file analysis) fit. Without these, prod workers used the code
+      # default floor (50k) and shrank to ~60k after Anthropic rate-limits, then
+      # fast-failed any single request > cap with a 429 (even at 0 in-flight, no
+      # failover). Floor 500k keeps caps large enough for big single requests.
+      - ADAPTIVE_INITIAL_CAP_TOKENS=1000000
+      - ADAPTIVE_FLOOR_TOKENS=500000
+      - ADAPTIVE_CEILING_TOKENS=4000000
+      - ADAPTIVE_GROW_TRIGGER_SEC=300
+      - ADAPTIVE_GROW_FACTOR=1.10
+      - ADAPTIVE_QUEUE_WAIT_SEC=5
+      - ADAPTIVE_WEEKLY_PREDICTIVE_THROTTLE=true
       - CLAUDE_CWD=/app/instances
       - DISABLE_COACH_MCP=true
       - MAX_TIMEOUT=2400000
