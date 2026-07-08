@@ -81,6 +81,9 @@ services:
       - BRIDGE_ANONYMIZE_ENABLED=true
       - INSTANCE_NAME=worker1
       - BRIDGE_GENERIC_JOBS_ENABLED=true
+      # Chat-job self-call timeout (claims/finalize). Default 600s cut long
+      # Energy claims calls (observed 728s); align with MAX_TIMEOUT (2400s).
+      - BRIDGE_CHAT_JOB_TIMEOUT_S=2400
       - ADAPTIVE_INITIAL_CAP_TOKENS=1000000
       - ADAPTIVE_FLOOR_TOKENS=500000
       - ADAPTIVE_CEILING_TOKENS=4000000
@@ -172,6 +175,9 @@ services:
       - BRIDGE_ANONYMIZE_ENABLED=true
       - INSTANCE_NAME=worker2
       - BRIDGE_GENERIC_JOBS_ENABLED=true
+      # Chat-job self-call timeout (claims/finalize). Default 600s cut long
+      # Energy claims calls (observed 728s); align with MAX_TIMEOUT (2400s).
+      - BRIDGE_CHAT_JOB_TIMEOUT_S=2400
       - ADAPTIVE_INITIAL_CAP_TOKENS=1000000
       - ADAPTIVE_FLOOR_TOKENS=500000
       - ADAPTIVE_CEILING_TOKENS=4000000
@@ -263,6 +269,9 @@ services:
       - BRIDGE_ANONYMIZE_ENABLED=true
       - INSTANCE_NAME=worker3
       - BRIDGE_GENERIC_JOBS_ENABLED=true
+      # Chat-job self-call timeout (claims/finalize). Default 600s cut long
+      # Energy claims calls (observed 728s); align with MAX_TIMEOUT (2400s).
+      - BRIDGE_CHAT_JOB_TIMEOUT_S=2400
       - ADAPTIVE_INITIAL_CAP_TOKENS=1000000
       - ADAPTIVE_FLOOR_TOKENS=500000
       - ADAPTIVE_CEILING_TOKENS=4000000
@@ -354,6 +363,9 @@ services:
       - BRIDGE_ANONYMIZE_ENABLED=true
       - INSTANCE_NAME=worker4
       - BRIDGE_GENERIC_JOBS_ENABLED=true
+      # Chat-job self-call timeout (claims/finalize). Default 600s cut long
+      # Energy claims calls (observed 728s); align with MAX_TIMEOUT (2400s).
+      - BRIDGE_CHAT_JOB_TIMEOUT_S=2400
       - ADAPTIVE_INITIAL_CAP_TOKENS=1000000
       - ADAPTIVE_FLOOR_TOKENS=500000
       - ADAPTIVE_CEILING_TOKENS=4000000

@@ -90,6 +90,9 @@ services:
       - FILTER_SENSITIVE_DATA=true
       - INSTANCE_NAME=worker-sahori
       - BRIDGE_GENERIC_JOBS_ENABLED=true
+      # Chat-job self-call timeout (claims/finalize). Default 600s cut long
+      # Energy claims calls (observed 728s); align with MAX_TIMEOUT (2400s).
+      - BRIDGE_CHAT_JOB_TIMEOUT_S=2400
       - CLAUDE_CWD=/app/instances
       - DISABLE_COACH_MCP=true
       - MAX_TIMEOUT=2400000
@@ -168,6 +171,9 @@ services:
       - FILTER_SENSITIVE_DATA=true
       - INSTANCE_NAME=worker-kurt
       - BRIDGE_GENERIC_JOBS_ENABLED=true
+      # Chat-job self-call timeout (claims/finalize). Default 600s cut long
+      # Energy claims calls (observed 728s); align with MAX_TIMEOUT (2400s).
+      - BRIDGE_CHAT_JOB_TIMEOUT_S=2400
       - CLAUDE_CWD=/app/instances
       - DISABLE_COACH_MCP=true
       - MAX_TIMEOUT=2400000
