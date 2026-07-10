@@ -30,7 +30,13 @@ RUN pip install --no-cache-dir \
     "mollie-api-python>=3.0,<4" \
     "psutil>=6.1,<7" \
     "python-multipart>=0.0.18,<1" \
-    "pytz>=2024.1"
+    "pytz>=2024.1" \
+    "boto3>=1.35,<2"
+# boto3: platform-api never calls Bedrock InvokeModel itself, but it serves
+# /v1/metrics/bedrock-reconciliation[/run] (src.metrics.routes → reconcile_bedrock_day),
+# which queries CloudWatch directly. Without it, reconciliation silently degrades to
+# "aws_unavailable" with a misleading "missing credentials" detail — it was actually
+# ModuleNotFoundError, not an IAM/credentials problem.
 
 WORKDIR /app
 

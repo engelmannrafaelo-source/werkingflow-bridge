@@ -158,6 +158,10 @@ async def reconcile_bedrock_day(day: Optional[date] = None) -> List[Dict[str, An
     # (model, region) → aws sums; None = CloudWatch unavailable for that region
     aws: Dict[Tuple[str, str], Optional[Dict[str, int]]] = {}
     aws_configured = bcm.is_configured()
+    # region → the exception that made it unavailable, so the stored detail says
+    # WHY (e.g. "No module named 'boto3'" vs "AccessDenied ...") instead of a
+    # generic string that can't tell a missing dependency from an IAM problem.
+    region_errors: Dict[str, str] = {}
 
     def _gather_aws_for_region(region: str, tracked_here: set) -> Dict[str, Dict[str, int]]:
         """Sync boto3 work for one region — run via to_thread off the event loop."""
@@ -181,6 +185,7 @@ async def reconcile_bedrock_day(day: Optional[date] = None) -> List[Dict[str, An
                     aws[(model_id, region)] = sums
             except Exception as e:  # noqa: BLE001 — recorded as aws_unavailable, never silent
                 logger.error("bedrock reconciliation: CloudWatch query failed (region=%s): %s", region, e)
+                region_errors[region] = f"{type(e).__name__}: {e}"
                 for (m, r) in bridge.keys():
                     if r == region:
                         aws[(m, r)] = None
@@ -205,7 +210,11 @@ async def reconcile_bedrock_day(day: Optional[date] = None) -> List[Dict[str, An
 
         if a is None:
             status = "aws_unavailable"
-            detail = "CloudWatch not queryable (missing credentials or API error)"
+            if not aws_configured:
+                detail = "CloudWatch not queried: Bedrock credentials not configured"
+            else:
+                region_error = region_errors.get(region, "unknown error (see server log)")
+                detail = f"CloudWatch not queryable (region={region}): {region_error}"
         else:
             def _diff_pct(aws_v: int, bridge_v: int) -> Optional[float]:
                 if aws_v == 0 and bridge_v == 0:
