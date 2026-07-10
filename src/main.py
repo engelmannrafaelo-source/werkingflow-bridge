@@ -2246,6 +2246,7 @@ async def chat_completions(
         if backend_config:
             from src.routing.user_provider_override import (
                 assert_bedrock_is_pinned, BedrockPinRequiredError,
+                assert_bedrock_attribution_complete, BedrockAttributionIncompleteError,
             )
             try:
                 assert_bedrock_is_pinned(backend_config.backend, user_pinned_provider)
@@ -2258,6 +2259,26 @@ async def chat_completions(
                             "type": "permission_error",
                             "code": "bedrock_requires_operator_pin",
                             "hint": "Set users.provider_config.provider='bedrock' via Platform-Admin → Users for this user.",
+                        }
+                    }
+                )
+            # Real-money (Bedrock) calls must also carry WHERE they are booked —
+            # a NULL app_env records real AWS spend invisible to the mode-filtered
+            # cost dashboard (the €1.30 blind spot, 2026-07-09). Fail loud.
+            try:
+                assert_bedrock_attribution_complete(
+                    backend_config.backend,
+                    normalize_app_env(get_app_env_from_request(request)),
+                )
+            except BedrockAttributionIncompleteError as e:
+                raise HTTPException(
+                    status_code=400,
+                    detail={
+                        "error": {
+                            "message": str(e),
+                            "type": "invalid_request_error",
+                            "code": "bedrock_attribution_incomplete",
+                            "hint": "Add X-App-Env: production|preview|development to the Bridge request.",
                         }
                     }
                 )
@@ -4127,6 +4148,7 @@ async def research(
     from src.routing.user_provider_override import (
         enforce_user_provider_override, UserProviderOverrideError,
         assert_bedrock_is_pinned, BedrockPinRequiredError,
+        assert_bedrock_attribution_complete, BedrockAttributionIncompleteError,
     )
     _research_pinned = None
     try:
@@ -4165,6 +4187,21 @@ async def research(
             query=request_body.query,
             model=request_body.model,
             error=f"bedrock_requires_operator_pin: {e}"
+        )
+
+    # Real-money (Bedrock) research must carry a resolvable X-App-Env, else the
+    # spend is booked invisible to the mode-filtered cost dashboard (2026-07-09).
+    try:
+        assert_bedrock_attribution_complete(
+            backend_config.backend,
+            normalize_app_env(get_app_env_from_request(request)),
+        )
+    except BedrockAttributionIncompleteError as e:
+        return ResearchResponse(
+            status="error",
+            query=request_body.query,
+            model=request_body.model,
+            error=f"bedrock_attribution_incomplete: {e}"
         )
 
     # R2+R3: Extract attribution context and enforce budget BEFORE any research execution.

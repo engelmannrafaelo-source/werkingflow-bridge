@@ -86,6 +86,43 @@ def assert_bedrock_is_pinned(effective_backend: Any, pinned: Optional[str]) -> N
     )
 
 
+class BedrockAttributionIncompleteError(RuntimeError):
+    """A Bedrock (real-money) call lacks a resolvable environment attribution.
+
+    The flat-rate Anthropic pool has €0 marginal cost, so a NULL reporting
+    dimension there is merely cosmetic. Bedrock bills real AWS money per token:
+    a call recorded with app_env=NULL books real spend where NO mode-filtered
+    cost view (the Platform-Admin prod/staging/local filter) can see it — the
+    exact €1.30 that was invisible in the Prod dashboard on 2026-07-09. Real
+    money must be fully attributable, so we fail loud instead of silently
+    booking invisible cost. Surfaced as 400 — the caller must add X-App-Env.
+    """
+
+
+def assert_bedrock_attribution_complete(
+    effective_backend: Any, app_env: Optional[str]
+) -> None:
+    """Gate: a Bedrock call must carry a resolvable X-App-Env (prod/staging/local).
+
+    Complements assert_bedrock_is_pinned (WHO pays) with WHERE the spend is
+    booked. ``app_env`` is the ALREADY-NORMALISED value (normalize_app_env of
+    the X-App-Env header) — None means the header was absent or unrecognised.
+    Only Bedrock is gated: the Anthropic pool is not real-money, so an absent
+    app_env there stays a non-fatal diagnostic (ai_call_writer warns).
+    """
+    if effective_backend != BackendType.BEDROCK:
+        return
+    if app_env:
+        return
+    raise BedrockAttributionIncompleteError(
+        "Bedrock is real-money AWS spend and must be fully attributable, but "
+        "this call carries no resolvable X-App-Env (prod/staging/local). Set "
+        "X-App-Env: production|preview|development on the outbound Bridge "
+        "request. Refusing to bill AWS cost that would be invisible to the "
+        "mode-filtered cost dashboard."
+    )
+
+
 def invalidate_cache(user_key: Optional[str] = None) -> None:
     """Drop cached configs (all, or one identity) — e.g. after an admin PATCH."""
     if user_key is None:

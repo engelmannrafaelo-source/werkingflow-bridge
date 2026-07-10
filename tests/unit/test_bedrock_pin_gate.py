@@ -18,8 +18,10 @@ import pytest
 
 from src.models import BackendType
 from src.routing.user_provider_override import (
+    BedrockAttributionIncompleteError,
     BedrockPinRequiredError,
     UserProviderOverrideError,
+    assert_bedrock_attribution_complete,
     assert_bedrock_is_pinned,
 )
 
@@ -51,3 +53,36 @@ class TestBedrockPinGate:
 
     def test_openai_compatible_passes(self):
         assert_bedrock_is_pinned(BackendType.OPENAI_COMPATIBLE, None)
+
+
+class TestBedrockAttributionComplete:
+    """WHERE the real-money spend is booked (app_env) must be present for
+    Bedrock, else the cost is invisible to the mode-filtered dashboard
+    (the €1.30 blind spot, 2026-07-09)."""
+
+    def test_bedrock_with_app_env_passes(self):
+        assert_bedrock_attribution_complete(BackendType.BEDROCK, "prod")
+        assert_bedrock_attribution_complete(BackendType.BEDROCK, "staging")
+        assert_bedrock_attribution_complete(BackendType.BEDROCK, "local")
+
+    def test_bedrock_without_app_env_refused(self):
+        """Real money + NULL app_env → fail loud, not invisible booking."""
+        with pytest.raises(BedrockAttributionIncompleteError, match="X-App-Env"):
+            assert_bedrock_attribution_complete(BackendType.BEDROCK, None)
+
+    def test_bedrock_with_empty_app_env_refused(self):
+        with pytest.raises(BedrockAttributionIncompleteError):
+            assert_bedrock_attribution_complete(BackendType.BEDROCK, "")
+
+    def test_anthropic_without_app_env_passes(self):
+        """The flat-rate pool is €0 marginal cost — an absent app_env there is a
+        non-fatal diagnostic, not a hard reject (only Bedrock is real money)."""
+        assert_bedrock_attribution_complete(BackendType.ANTHROPIC, None)
+
+    def test_openai_compatible_without_app_env_passes(self):
+        assert_bedrock_attribution_complete(BackendType.OPENAI_COMPATIBLE, None)
+
+    def test_incomplete_is_distinct_error_class(self):
+        """400 (fix your request) is a different class from 403 (pin) and 503."""
+        assert not issubclass(BedrockAttributionIncompleteError, BedrockPinRequiredError)
+        assert not issubclass(BedrockAttributionIncompleteError, UserProviderOverrideError)
