@@ -189,3 +189,83 @@ class TestRenderHtml:
         html = _render_html(_inv())
         assert html.startswith("<!doctype html>")
         assert "</html>" in html
+
+
+# ---------------------------------------------------------------------------
+# _approval_required — outbound-email gate toggle
+# ---------------------------------------------------------------------------
+
+import os as _os_test
+from datetime import datetime as _dt, timezone as _tz
+
+from src.invoices.routes import _approval_required, _row
+
+
+class TestApprovalRequired:
+    def test_default_is_on(self, monkeypatch):
+        monkeypatch.delenv("INVOICE_REQUIRE_APPROVAL", raising=False)
+        assert _approval_required() is True
+
+    @pytest.mark.parametrize("val", ["false", "0", "no", "off", "FALSE", "Off", ""])
+    def test_disabling_values(self, monkeypatch, val):
+        monkeypatch.setenv("INVOICE_REQUIRE_APPROVAL", val)
+        assert _approval_required() is False
+
+    @pytest.mark.parametrize("val", ["true", "1", "yes", "on", "anything"])
+    def test_enabling_values(self, monkeypatch, val):
+        monkeypatch.setenv("INVOICE_REQUIRE_APPROVAL", val)
+        assert _approval_required() is True
+
+
+# ---------------------------------------------------------------------------
+# _row — approval fields surfaced in the API shape
+# ---------------------------------------------------------------------------
+
+def _db_row(overrides=None):
+    """Minimal DB-row (dict) matching every column _row() reads."""
+    now = _dt(2026, 1, 15, 10, 0, tzinfo=_tz.utc)
+    base = {
+        "id": uuid.uuid4(),
+        "invoice_number": "INV-2026-00042",
+        "user_id": uuid.uuid4(),
+        "tenant_id": "tenant_test",
+        "subscription_id": None,
+        "credit_purchase_id": None,
+        "mollie_payment_id": None,
+        "status": "issued",
+        "subtotal_eur": "250.00",
+        "tax_rate": "20.00",
+        "tax_eur": "50.00",
+        "total_eur": "300.00",
+        "currency": "EUR",
+        "line_items": [],
+        "billing_address": None,
+        "issued_at": now,
+        "paid_at": None,
+        "due_at": None,
+        "cancelled_at": None,
+        "refunded_at": None,
+        "sent_at": None,
+        "approved_at": None,
+        "approved_by": None,
+        "notes": None,
+        "metadata": {},
+        "created_at": now,
+        "updated_at": now,
+    }
+    if overrides:
+        base.update(overrides)
+    return base
+
+
+class TestRowApprovalFields:
+    def test_unapproved_row_maps_to_nulls(self):
+        out = _row(_db_row())
+        assert out["approvedAt"] is None
+        assert out["approvedBy"] is None
+
+    def test_approved_row_maps_timestamp_and_actor(self):
+        ts = _dt(2026, 2, 1, 9, 30, tzinfo=_tz.utc)
+        out = _row(_db_row({"approved_at": ts, "approved_by": "rafael"}))
+        assert out["approvedAt"] == ts.isoformat()
+        assert out["approvedBy"] == "rafael"

@@ -35,6 +35,19 @@ router = APIRouter(prefix="/v1/invoices", tags=["invoices"])
 _ALLOWED_STATUS = {"draft", "issued", "paid", "cancelled", "refunded"}
 
 
+def _approval_required() -> bool:
+    """
+    Whether outbound invoice emails require an explicit operator approval first.
+
+    Gate for the initial billing period: no invoice reaches a customer inbox
+    without a human release in Platform Admin. Default ON — must be explicitly
+    disabled (INVOICE_REQUIRE_APPROVAL=false/0/no) to auto-send again.
+    """
+    import os
+    raw = os.environ.get("INVOICE_REQUIRE_APPROVAL", "true").strip().lower()
+    return raw not in ("false", "0", "no", "off", "")
+
+
 def _dec(v: Any) -> str:
     """Serialize NUMERIC to plain string with 2 decimals (no float drift)."""
     if v is None:
@@ -72,6 +85,8 @@ def _row(r: Any) -> Dict[str, Any]:
         "cancelledAt": r["cancelled_at"].isoformat() if r["cancelled_at"] else None,
         "refundedAt": r["refunded_at"].isoformat() if r["refunded_at"] else None,
         "sentAt": r["sent_at"].isoformat() if r["sent_at"] else None,
+        "approvedAt": r["approved_at"].isoformat() if r["approved_at"] else None,
+        "approvedBy": r["approved_by"],
         "notes": r["notes"],
         "metadata": _maybe(r["metadata"]) or {},
         "createdAt": r["created_at"].isoformat(),
@@ -226,6 +241,15 @@ async def list_invoices(
         default=None,
         description="Filter by tenant.account_type: customer|test|internal",
     ),
+    approval: Optional[str] = Query(
+        default=None,
+        description=(
+            "Filter by approval gate: pending (sendable + not yet approved: "
+            "draft/issued with approved_at NULL) | approved (approved_at set). "
+            "'pending' deliberately excludes paid/cancelled/refunded — those are "
+            "not awaiting an outbound release."
+        ),
+    ),
     claims: AuthClaims = Depends(require_jwt_or_service),
 ) -> Dict[str, Any]:
     if not claims.is_operator:
@@ -237,6 +261,10 @@ async def list_invoices(
     if account_type and account_type not in ("customer", "test", "internal"):
         raise HTTPException(
             status_code=400, detail=f"Invalid account_type: {account_type}",
+        )
+    if approval and approval not in ("pending", "approved"):
+        raise HTTPException(
+            status_code=400, detail=f"Invalid approval filter: {approval}",
         )
 
     where: List[str] = []
@@ -254,6 +282,10 @@ async def list_invoices(
         add("status = $$", status)
     if since:     add("issued_at >= $$", since)
     if until:     add("issued_at <= $$", until)
+    if approval == "pending":
+        where.append("approved_at IS NULL AND status IN ('draft', 'issued')")
+    elif approval == "approved":
+        where.append("approved_at IS NOT NULL")
 
     join_clause = ""
     if account_type:
@@ -700,21 +732,16 @@ async def render_invoice_pdf(
 # Send via Resend — email invoice HTML to the customer.
 # ---------------------------------------------------------------------------
 
-@router.post("/{invoice_id}/send")
-async def send_invoice(
-    invoice_id: str,
-    claims: AuthClaims = Depends(require_jwt_or_service),
-) -> Dict[str, Any]:
+async def _dispatch_invoice_email(pool: Any, r: Any) -> Dict[str, Any]:
     """
-    Send the invoice as an email (HTML body) via Resend.
+    Actually put the invoice email on the wire via Resend and record it.
 
-    Auth: the invoice owner may trigger their own send (self-service); admins
-    and service tokens may send any invoice. Same self-scoping as GET /{id}.
+    Pure send: assumes the caller has already fetched the joined invoice+user
+    row `r`, verified auth AND cleared the approval gate. Marks sent_at, flips
+    a draft to issued, and writes an invoice.sent billing_events trail.
 
-    Pulls recipient from the linked user's email. Marks the invoice's
-    sent_at and writes a billing_events trail. Fail-fast when RESEND_API_KEY
-    or sender email is not configured — no silent skip for outbound
-    customer email.
+    Fail-fast when RESEND_API_KEY or recipient is missing — no silent skip for
+    outbound customer email.
     """
     import os
     import json as _json
@@ -725,21 +752,11 @@ async def send_invoice(
     if not resend_key:
         raise HTTPException(status_code=503, detail="RESEND_API_KEY not configured on bridge")
 
-    pool = get_pool()
-    async with pool.acquire() as conn:
-        r = await conn.fetchrow(
-            "SELECT i.*, u.email AS user_email, u.name AS user_name FROM invoices i "
-            "JOIN users u ON u.id = i.user_id WHERE i.id = $1",
-            uuid.UUID(invoice_id),
-        )
-    if not r:
-        raise HTTPException(status_code=404, detail=f"Invoice {invoice_id} not found")
-    if not claims.is_operator and str(r["user_id"]) != claims.effective_user_id:
-        raise HTTPException(status_code=403, detail="Forbidden: not your invoice")
     recipient = r["user_email"]
     if not recipient:
         raise HTTPException(status_code=409, detail="Invoice user has no email — cannot send")
 
+    invoice_id = str(r["id"])
     invoice_dict = _row(r)
     html_body = _render_html(invoice_dict)
     subject = f"Rechnung {invoice_dict['invoiceNumber']} — Werkingflow"
@@ -767,7 +784,7 @@ async def send_invoice(
         async with conn.transaction():
             await conn.execute(
                 "UPDATE invoices SET sent_at = COALESCE(sent_at, NOW()), status = CASE WHEN status = 'draft' THEN 'issued'::invoice_status ELSE status END, updated_at = NOW() WHERE id = $1",
-                uuid.UUID(invoice_id),
+                r["id"],
             )
             await conn.execute(
                 """
@@ -776,7 +793,7 @@ async def send_invoice(
                 VALUES ('invoice.sent', $1, $2, $3, 'admin', $4::jsonb)
                 """,
                 r["user_id"],
-                uuid.UUID(invoice_id),
+                r["id"],
                 r["total_eur"],
                 _json.dumps({"recipient": recipient, "resendId": resend_id, "subject": subject}),
             )
@@ -786,5 +803,118 @@ async def send_invoice(
         "resendId": resend_id,
         "sentAt": "now",
     }
+
+
+async def _fetch_invoice_with_user(pool: Any, invoice_id: str) -> Any:
+    async with pool.acquire() as conn:
+        r = await conn.fetchrow(
+            "SELECT i.*, u.email AS user_email, u.name AS user_name FROM invoices i "
+            "JOIN users u ON u.id = i.user_id WHERE i.id = $1",
+            uuid.UUID(invoice_id),
+        )
+    if not r:
+        raise HTTPException(status_code=404, detail=f"Invoice {invoice_id} not found")
+    return r
+
+
+@router.post("/{invoice_id}/send")
+async def send_invoice(
+    invoice_id: str,
+    claims: AuthClaims = Depends(require_jwt_or_service),
+) -> Dict[str, Any]:
+    """
+    Send the invoice as an email (HTML body) via Resend.
+
+    Auth: the invoice owner may trigger their own send (self-service); admins
+    and service tokens may send any invoice. Same self-scoping as GET /{id}.
+
+    Approval gate: when INVOICE_REQUIRE_APPROVAL is on (default), an invoice
+    that has not been approved cannot be sent — a 409 is raised. Use
+    POST /{id}/approve (operator-only) to release it first, or
+    /approve?send=true to approve-and-send in one step.
+    """
+    pool = get_pool()
+    r = await _fetch_invoice_with_user(pool, invoice_id)
+    if not claims.is_operator and str(r["user_id"]) != claims.effective_user_id:
+        raise HTTPException(status_code=403, detail="Forbidden: not your invoice")
+
+    if _approval_required() and r["approved_at"] is None:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Rechnung nicht freigegeben — Versand blockiert. "
+                "Erst in Platform Admin freigeben (POST /v1/invoices/{id}/approve)."
+            ),
+        )
+
+    return await _dispatch_invoice_email(pool, r)
+
+
+class InvoiceApprove(BaseModel):
+    send: bool = False
+
+
+@router.post("/{invoice_id}/approve")
+async def approve_invoice(
+    invoice_id: str,
+    body: InvoiceApprove | None = None,
+    claims: AuthClaims = Depends(require_admin),
+) -> Dict[str, Any]:
+    """
+    Release an invoice for sending (operator-only).
+
+    Records approved_at / approved_by and writes an invoice.approved trail.
+    Idempotent: re-approving keeps the first approver and timestamp.
+
+    With {"send": true} the invoice is approved AND dispatched in one step
+    (the "Freigeben & Senden" action). Without it the invoice is only marked
+    approved and can be sent later via POST /{id}/send.
+    """
+    import json as _json
+
+    body = body or InvoiceApprove()
+    approver = claims.effective_user_id or "operator"
+
+    pool = get_pool()
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            updated = await conn.fetchrow(
+                """
+                UPDATE invoices
+                   SET approved_at = COALESCE(approved_at, NOW()),
+                       approved_by = COALESCE(approved_by, $2),
+                       updated_at  = NOW()
+                 WHERE id = $1
+                RETURNING id, user_id, total_eur, approved_at, approved_by
+                """,
+                uuid.UUID(invoice_id),
+                approver,
+            )
+            if not updated:
+                raise HTTPException(status_code=404, detail=f"Invoice {invoice_id} not found")
+            await conn.execute(
+                """
+                INSERT INTO billing_events
+                  (event_type, user_id, invoice_id, amount_eur, source, payload)
+                VALUES ('invoice.approved', $1, $2, $3, 'admin', $4::jsonb)
+                """,
+                updated["user_id"],
+                uuid.UUID(invoice_id),
+                updated["total_eur"],
+                _json.dumps({"approvedBy": updated["approved_by"]}),
+            )
+
+    result: Dict[str, Any] = {
+        "invoiceId": invoice_id,
+        "approvedAt": updated["approved_at"].isoformat() if updated["approved_at"] else None,
+        "approvedBy": updated["approved_by"],
+        "sent": False,
+    }
+    if body.send:
+        r = await _fetch_invoice_with_user(pool, invoice_id)
+        sent = await _dispatch_invoice_email(pool, r)
+        result["sent"] = True
+        result["send"] = sent
+    return result
 
 # mode_filter applied

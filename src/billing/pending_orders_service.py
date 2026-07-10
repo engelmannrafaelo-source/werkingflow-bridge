@@ -334,6 +334,21 @@ async def create_pending_order(
         payload={"planId": plan_id, "quantity": quantity, "orderId": str(order_id)},
     )
 
+    # Approval gate: for the initial billing period no invoice email leaves the
+    # system without an explicit operator release in Platform Admin. When the
+    # gate is on we skip the auto-send entirely — the order + invoice are
+    # persisted and wait for an operator to approve (and then send) via
+    # POST /v1/invoices/{id}/approve. This is intentional: the pay-by-invoice
+    # ("Rechnungs-Lane") mail is held back rather than mailed on order creation.
+    from src.invoices.routes import _approval_required
+    if send_email and _approval_required():
+        import logging
+        logging.getLogger(__name__).info(
+            "Invoice %s held for operator approval (INVOICE_REQUIRE_APPROVAL on) — "
+            "auto-send skipped for order of user %s", invoice_id, user_id,
+        )
+        send_email = False
+
     # Email send is best-effort: the order is persisted in pending_orders
     # before we send. A failed email (Resend down, bad API key, recipient
     # bounce) must not prevent operators from later releasing the order.
