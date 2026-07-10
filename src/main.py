@@ -1214,10 +1214,19 @@ async def generate_streaming_response(
     stream_start_time = time.time()
 
     try:
-        # VISION ROUTING: Check for images and route to direct Anthropic API
+        # VISION ROUTING follows the Bedrock pin (Rafael, 2026-07-10): a
+        # Bedrock-pinned request is served over Bedrock (stream_bedrock, which
+        # handles images natively) and must NOT be peeled off to the direct-
+        # Anthropic vision key. The pin already routes it to the Bedrock branch
+        # before this generator runs; this guard makes the coupling explicit so a
+        # future reorder can't silently leak pinned vision (real AWS money on the
+        # wrong provider) to the Anthropic key.
         messages_for_vision = prepare_messages_for_vision(request.messages)
+        _vision_is_bedrock = bool(
+            backend_config and backend_config.backend == BackendType.BEDROCK
+        )
 
-        if has_vision_content(messages_for_vision):
+        if has_vision_content(messages_for_vision) and not _vision_is_bedrock:
             logger.info("🖼️ Vision streaming request detected")
 
             try:
@@ -2530,9 +2539,17 @@ async def chat_completions(
         else:
             # Non-streaming response
 
-            # VISION ROUTING: Check for images and route to direct Anthropic API
+            # VISION ROUTING follows the Bedrock pin (Rafael, 2026-07-10): a
+            # Bedrock-pinned request is served by the Bedrock branch above
+            # (call_bedrock, which handles images natively) and returns before
+            # reaching here, so this direct-Anthropic vision key is the
+            # bedrock-OFF path only. The guard makes that explicit so a reorder
+            # can't silently leak pinned vision (real AWS money) to Anthropic.
+            _vision_is_bedrock = bool(
+                backend_config and backend_config.backend == BackendType.BEDROCK
+            )
             try:
-                vision_result = await check_and_route_vision(
+                vision_result = None if _vision_is_bedrock else await check_and_route_vision(
                     messages=request_body.messages,
                     model=request_body.model,
                     max_tokens=request_body.max_tokens,
