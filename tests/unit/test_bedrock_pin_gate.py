@@ -56,31 +56,48 @@ class TestBedrockPinGate:
 
 
 class TestBedrockAttributionComplete:
-    """WHERE the real-money spend is booked (app_env) must be present for
-    Bedrock, else the cost is invisible to the mode-filtered dashboard
-    (the €1.30 blind spot, 2026-07-09)."""
+    """A real-money (Bedrock) call must be FULLY attributed — app_id AND app_env
+    both present — else the spend is un-attributable in the cost dashboard (the
+    €1.30 blind spot, 2026-07-09). WHO pays is already guaranteed by the pin."""
 
-    def test_bedrock_with_app_env_passes(self):
-        assert_bedrock_attribution_complete(BackendType.BEDROCK, "prod")
-        assert_bedrock_attribution_complete(BackendType.BEDROCK, "staging")
-        assert_bedrock_attribution_complete(BackendType.BEDROCK, "local")
+    def test_bedrock_fully_attributed_passes(self):
+        for env in ("prod", "staging", "local"):
+            assert_bedrock_attribution_complete(
+                BackendType.BEDROCK, app_env=env, app_id="werking-energy"
+            )
 
     def test_bedrock_without_app_env_refused(self):
         """Real money + NULL app_env → fail loud, not invisible booking."""
         with pytest.raises(BedrockAttributionIncompleteError, match="X-App-Env"):
-            assert_bedrock_attribution_complete(BackendType.BEDROCK, None)
+            assert_bedrock_attribution_complete(
+                BackendType.BEDROCK, app_env=None, app_id="werking-energy"
+            )
 
-    def test_bedrock_with_empty_app_env_refused(self):
-        with pytest.raises(BedrockAttributionIncompleteError):
-            assert_bedrock_attribution_complete(BackendType.BEDROCK, "")
+    def test_bedrock_without_app_id_refused(self):
+        """Real money + NULL app_id → fail loud (which app is paying?)."""
+        with pytest.raises(BedrockAttributionIncompleteError, match="X-App-ID"):
+            assert_bedrock_attribution_complete(
+                BackendType.BEDROCK, app_env="prod", app_id=None
+            )
 
-    def test_anthropic_without_app_env_passes(self):
-        """The flat-rate pool is €0 marginal cost — an absent app_env there is a
+    def test_bedrock_missing_both_lists_both(self):
+        with pytest.raises(BedrockAttributionIncompleteError) as exc:
+            assert_bedrock_attribution_complete(
+                BackendType.BEDROCK, app_env="", app_id=""
+            )
+        assert "X-App-Env" in str(exc.value) and "X-App-ID" in str(exc.value)
+
+    def test_anthropic_incomplete_passes(self):
+        """The flat-rate pool is €0 marginal cost — absent dimensions there are a
         non-fatal diagnostic, not a hard reject (only Bedrock is real money)."""
-        assert_bedrock_attribution_complete(BackendType.ANTHROPIC, None)
+        assert_bedrock_attribution_complete(
+            BackendType.ANTHROPIC, app_env=None, app_id=None
+        )
 
-    def test_openai_compatible_without_app_env_passes(self):
-        assert_bedrock_attribution_complete(BackendType.OPENAI_COMPATIBLE, None)
+    def test_openai_compatible_incomplete_passes(self):
+        assert_bedrock_attribution_complete(
+            BackendType.OPENAI_COMPATIBLE, app_env=None, app_id=None
+        )
 
     def test_incomplete_is_distinct_error_class(self):
         """400 (fix your request) is a different class from 403 (pin) and 503."""

@@ -100,26 +100,46 @@ class BedrockAttributionIncompleteError(RuntimeError):
 
 
 def assert_bedrock_attribution_complete(
-    effective_backend: Any, app_env: Optional[str]
+    effective_backend: Any,
+    *,
+    app_env: Optional[str],
+    app_id: Optional[str],
 ) -> None:
-    """Gate: a Bedrock call must carry a resolvable X-App-Env (prod/staging/local).
+    """Gate: a Bedrock (real-money) call must be FULLY attributed, else fail loud.
 
-    Complements assert_bedrock_is_pinned (WHO pays) with WHERE the spend is
-    booked. ``app_env`` is the ALREADY-NORMALISED value (normalize_app_env of
-    the X-App-Env header) — None means the header was absent or unrecognised.
-    Only Bedrock is gated: the Anthropic pool is not real-money, so an absent
-    app_env there stays a non-fatal diagnostic (ai_call_writer warns).
+    The invariant Bedrock cost has to satisfy: what the user is billed == what
+    goes to AWS == what the accounting dashboard shows. That only holds if every
+    real-money call names WHO pays, WHICH app, and WHICH environment — otherwise
+    the spend lands somewhere no cost view can see it (the €1.30 blind spot,
+    2026-07-09). assert_bedrock_is_pinned already guarantees WHO (the pin sits
+    only on a real user row); this adds the two dimensions that were slipping
+    through as NULL:
+
+      * ``app_env`` — ALREADY-NORMALISED (normalize_app_env of X-App-Env);
+        None means the header was absent/unrecognised. Drives the prod/staging/
+        local "mode" filter.
+      * ``app_id`` — the RESOLVED app id (extract_attribution_context, incl. the
+        X-Client-ID fallback); None means the call names no app.
+
+    Pass the SAME resolved values the ledger persists, so the gate rejects
+    exactly the calls that would otherwise record un-attributable AWS cost.
+    Only Bedrock is gated: the flat-rate Anthropic pool is €0 marginal cost, so
+    an absent dimension there stays a non-fatal diagnostic (ai_call_writer warns).
     """
     if effective_backend != BackendType.BEDROCK:
         return
-    if app_env:
+    missing = []
+    if not app_env:
+        missing.append("X-App-Env (production|preview|development)")
+    if not app_id:
+        missing.append("X-App-ID")
+    if not missing:
         return
     raise BedrockAttributionIncompleteError(
         "Bedrock is real-money AWS spend and must be fully attributable, but "
-        "this call carries no resolvable X-App-Env (prod/staging/local). Set "
-        "X-App-Env: production|preview|development on the outbound Bridge "
-        "request. Refusing to bill AWS cost that would be invisible to the "
-        "mode-filtered cost dashboard."
+        "this call is missing: " + ", ".join(missing) + ". Set these headers on "
+        "the outbound Bridge request. Refusing to bill AWS cost that would be "
+        "invisible / un-attributable in the cost dashboard."
     )
 
 

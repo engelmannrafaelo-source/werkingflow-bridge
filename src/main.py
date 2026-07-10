@@ -2262,13 +2262,16 @@ async def chat_completions(
                         }
                     }
                 )
-            # Real-money (Bedrock) calls must also carry WHERE they are booked —
-            # a NULL app_env records real AWS spend invisible to the mode-filtered
-            # cost dashboard (the €1.30 blind spot, 2026-07-09). Fail loud.
+            # Real-money (Bedrock) calls must be FULLY attributed (app + env),
+            # else real AWS spend records where no cost view can see it (the
+            # €1.30 blind spot, 2026-07-09). Check the SAME resolved values the
+            # ledger persists so the gate rejects exactly the un-attributable ones.
+            _bedrock_attr = extract_attribution_context(request)
             try:
                 assert_bedrock_attribution_complete(
                     backend_config.backend,
-                    normalize_app_env(get_app_env_from_request(request)),
+                    app_env=_bedrock_attr["app_env"],
+                    app_id=_bedrock_attr["app_id"],
                 )
             except BedrockAttributionIncompleteError as e:
                 raise HTTPException(
@@ -4189,12 +4192,14 @@ async def research(
             error=f"bedrock_requires_operator_pin: {e}"
         )
 
-    # Real-money (Bedrock) research must carry a resolvable X-App-Env, else the
-    # spend is booked invisible to the mode-filtered cost dashboard (2026-07-09).
+    # Real-money (Bedrock) research must be fully attributed (app + env), else
+    # the spend is booked un-attributable in the cost dashboard (2026-07-09).
+    _research_bedrock_attr = extract_attribution_context(request)
     try:
         assert_bedrock_attribution_complete(
             backend_config.backend,
-            normalize_app_env(get_app_env_from_request(request)),
+            app_env=_research_bedrock_attr["app_env"],
+            app_id=_research_bedrock_attr["app_id"],
         )
     except BedrockAttributionIncompleteError as e:
         return ResearchResponse(
