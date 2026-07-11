@@ -176,6 +176,33 @@ def _resolve_provider_tier(
             bedrock_region=None,
         )
 
+    elif config.backend == BackendType.ANTHROPIC_DIRECT:
+        # Tier maps to the direct Anthropic Messages API, no CLI subprocess
+        # (e.g. 'claude-direct-notools' — see src/providers/anthropic_direct.py).
+        # Reuses the OPENAI_COMPATIBLE BackendConfig fields (provider_api_key/
+        # provider_model) purely as a carrier — main.py's dispatch branches on
+        # backend == ANTHROPIC_DIRECT and calls call_anthropic_direct(), not
+        # call_openai_compatible().
+        api_key = get_provider_api_key(config)
+        if not api_key:
+            raise RuntimeError(
+                f"Provider '{tier_id}' not configured: {config.api_key_env} env var missing"
+            )
+
+        logger.info(f"🔀 Provider tier: {tier_id} → {config.name} (model={config.model})")
+
+        return BackendConfig(
+            backend=BackendType.ANTHROPIC_DIRECT,
+            region=None,
+            model_id=config.model,
+            bedrock_model_id=None,
+            privacy_enabled=not config.dsgvo_compliant if privacy == PrivacyMode.AUTO else (privacy == PrivacyMode.ENABLED),
+            env_vars={},
+            provider_tier=tier_id,
+            provider_api_key=api_key,
+            provider_model=config.model,
+        )
+
     else:
         # Tier maps to Anthropic (e.g. 'claude-premium')
         return resolve_backend_config(

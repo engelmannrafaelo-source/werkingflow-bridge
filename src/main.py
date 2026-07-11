@@ -3325,7 +3325,12 @@ async def chat_completions(
                 # The provider works fine, workers just need a cooldown.
                 # Recording failure here caused a deadlock: provider marked "down"
                 # → never retried → no success → stays "down" forever.
-                _fallback_chain = _fb_tiers(_primary_tier)[1:]  # skip primary
+                # tools_required=False when the request already runs with
+                # enable_tools=false — see claude-direct-notools in
+                # src/providers/fallback.py, which is otherwise excluded.
+                _fallback_chain = _fb_tiers(
+                    _primary_tier, tools_required=bool(request_body.enable_tools)
+                )[1:]  # skip primary
 
                 for _ft in _fallback_chain:
                     try:
@@ -3351,6 +3356,22 @@ async def chat_completions(
                                 _fb_cfg.provider_api_key,
                                 model_override=_fb_cfg.provider_model,
                             )
+                            _fb_ok(_ft)
+                            logger.info(
+                                f"✅ Cross-bridge fallback {_ft} succeeded "
+                                f"(primary worker rate-limited)"
+                            )
+                            _fb_resp["x_fallback"] = {
+                                "used": True,
+                                "original_provider": _primary_tier,
+                                "fallback_provider": _ft,
+                                "original_error": f"worker rate-limited: {wue}",
+                                "trigger": "worker_unavailable",
+                            }
+                            return _fb_resp
+                        elif _fb_cfg.backend == BackendType.ANTHROPIC_DIRECT:
+                            from src.providers.anthropic_direct import call_anthropic_direct
+                            _fb_resp = await call_anthropic_direct(request_body, _fb_cfg)
                             _fb_ok(_ft)
                             logger.info(
                                 f"✅ Cross-bridge fallback {_ft} succeeded "
@@ -3402,7 +3423,12 @@ async def chat_completions(
                     # retryable (we fall back) but must not pin the provider "down".
                     if is_breaker_failure(e):
                         record_failure(primary_tier, str(e)[:200])
-                    fallback_tiers = get_fallback_tiers(primary_tier)[1:]  # Skip primary
+                    # tools_required=False when the request already runs with
+                    # enable_tools=false — see claude-direct-notools in
+                    # src/providers/fallback.py, which is otherwise excluded.
+                    fallback_tiers = get_fallback_tiers(
+                        primary_tier, tools_required=bool(request_body.enable_tools)
+                    )[1:]  # Skip primary
 
                     for fallback_tier in fallback_tiers:
                         try:
@@ -3453,6 +3479,40 @@ async def chat_completions(
                                     )
 
                                 # Mark response with fallback metadata
+                                response_data["x_fallback"] = {
+                                    "used": True,
+                                    "original_provider": primary_tier,
+                                    "fallback_provider": fallback_tier,
+                                    "original_error": str(e)[:200],
+                                }
+                                return response_data
+
+                            elif fallback_config.backend == BackendType.ANTHROPIC_DIRECT:
+                                from src.providers.anthropic_direct import call_anthropic_direct
+                                response_data = await call_anthropic_direct(request_body, fallback_config)
+
+                                fb_duration = time.time() - start_time
+                                record_success(fallback_tier)
+                                logger.info(
+                                    f"✅ Fallback to {fallback_tier} successful "
+                                    f"in {fb_duration:.2f}s"
+                                )
+
+                                usage = response_data.get("usage", {})
+                                if tenant and usage:
+                                    from src.tenant import track_request_usage
+                                    attribution = extract_attribution_context(request)
+                                    await track_request_usage(
+                                        tenant=tenant,
+                                        model=fallback_config.provider_model or resolved_model,
+                                        input_tokens=usage.get("prompt_tokens", 0),
+                                        output_tokens=usage.get("completion_tokens", 0),
+                                        endpoint="/v1/chat/completions",
+                                        latency_ms=int(fb_duration * 1000),
+                                        status="fallback_success",
+                                        **attribution
+                                    )
+
                                 response_data["x_fallback"] = {
                                     "used": True,
                                     "original_provider": primary_tier,

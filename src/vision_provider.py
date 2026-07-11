@@ -285,10 +285,18 @@ class VisionProvider:
         model: str = "claude-sonnet-4-5-20250929",
         max_tokens: int = 4096,
         temperature: float = 0.7,
-        system_prompt: Optional[str] = None
+        system_prompt: Optional[str] = None,
+        timeout: float = 300.0
     ) -> VisionResponse:
         """
         Analyze images using direct Anthropic API.
+
+        ``timeout`` defaults to 300s (fine for image analysis) but callers
+        reusing this path for non-vision fallback (see
+        src/providers/anthropic_direct.py) with a large max_tokens / Extended
+        Thinking budget should pass a longer value — measured: a 32K-output
+        call needs ~290s direct, so 300s has little headroom for the 40-77K
+        output calls this fallback exists for.
 
         Args:
             messages: OpenAI-format messages (may contain images)
@@ -341,7 +349,7 @@ class VisionProvider:
             request_body["system"] = final_system
 
         # Make API request
-        async with httpx.AsyncClient(timeout=300.0) as client:
+        async with httpx.AsyncClient(timeout=timeout) as client:
             response = await client.post(
                 self.ANTHROPIC_API_URL,
                 headers={

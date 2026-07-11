@@ -50,7 +50,8 @@ async def route_to_vision(
     messages: List[Dict[str, Any]],
     model: str,
     max_tokens: int = 4096,
-    temperature: float = 0.7
+    temperature: float = 0.7,
+    timeout: float = 300.0
 ) -> VisionResult:
     """
     Route request to Vision API
@@ -60,6 +61,8 @@ async def route_to_vision(
         model: Model to use
         max_tokens: Maximum tokens for response
         temperature: Temperature for generation
+        timeout: HTTP timeout in seconds — see VisionProvider.analyze()'s
+            docstring for why non-vision fallback callers need this raised.
 
     Returns:
         VisionResult with content, model, and usage info
@@ -75,7 +78,8 @@ async def route_to_vision(
         messages=messages,
         model=model,
         max_tokens=max_tokens,
-        temperature=temperature
+        temperature=temperature,
+        timeout=timeout
     )
 
     return VisionResult(

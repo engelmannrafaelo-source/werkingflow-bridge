@@ -19,6 +19,10 @@ class BackendType(str, Enum):
     BEDROCK = "bedrock"                # AWS Bedrock (DSGVO-compliant, EU data residency)
     OPENAI_COMPATIBLE = "openai_compatible"  # Generic OpenAI-compatible API (OpenRouter, etc.)
     GEMINI_CLI = "gemini_cli"          # Gemini CLI subprocess (Google OAuth, subscription models)
+    ANTHROPIC_DIRECT = "anthropic_direct"  # Direct Anthropic Messages API (ANTHROPIC_VISION_API_KEY,
+                                           # no CLI subprocess/tool support) — fallback-only tier for
+                                           # requests that already run with enable_tools=false, see
+                                           # src/providers/anthropic_direct.py
 
 
 class PrivacyMode(str, Enum):

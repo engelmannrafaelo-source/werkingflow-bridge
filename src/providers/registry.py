@@ -41,6 +41,9 @@ class ProviderConfig:
     pricing_input: float = 3.00         # USD per 1M input tokens
     pricing_output: float = 15.00       # USD per 1M output tokens
     dsgvo_compliant: bool = False       # EU data residency guaranteed
+    supports_tools: bool = True         # False = fallback chains skip this tier
+                                        # for any request with enable_tools=true
+                                        # (get_fallback_tiers(tools_required=...))
     description: str = ""
 
 
@@ -59,6 +62,34 @@ PROVIDERS: dict[str, ProviderConfig] = {
         pricing_output=15.00,
         dsgvo_compliant=False,
         description="Schnellster und intelligentester Anbieter. Daten werden in den USA verarbeitet.",
+    ),
+
+    # =========================================================================
+    # Direct Anthropic Messages API — no CLI subprocess, no tool support.
+    # Fallback tier for claude-premium requests that already run with
+    # enable_tools=false (get_fallback_tiers() excludes this tier whenever
+    # tools_required=True). Same model, ~4K fewer scaffolding tokens/call and
+    # no Claude-Code-SDK subprocess overhead — measured 2026-07-10: a 32K-output
+    # call took 290s here vs. timing out against the CLI path's 2400s ceiling.
+    # Rafael 2026-07-11: root cause of the "Heimbau" pipeline hang was
+    # Extended-Thinking output (40-77K tokens/call), not input size — this
+    # tier is the fix for calls that are safe to reroute (no tools needed).
+    # =========================================================================
+    "claude-direct-notools": ProviderConfig(
+        tier_id="claude-direct-notools",
+        name="Claude Direct (Anthropic Messages API, no tools)",
+        backend=BackendType.ANTHROPIC_DIRECT,
+        model="claude-sonnet-4-5-20250929",
+        api_key_env="ANTHROPIC_VISION_API_KEY",
+        pricing_input=3.00,
+        pricing_output=15.00,
+        dsgvo_compliant=False,
+        supports_tools=False,
+        description=(
+            "Direkter Anthropic-Call ohne Claude-Code-SDK-Subprozess. Kein Tool-"
+            "Support — nur fuer Requests mit enable_tools=false. Fallback wenn "
+            "der CLI-Pfad haengt/timeout (z.B. lang laufendes Extended Thinking)."
+        ),
     ),
 
     # --- DSGVO: Claude via AWS Bedrock EU ---
@@ -131,6 +162,8 @@ def is_tier_usable(tier_id: str) -> bool:
     """Check if a provider tier is usable (all required config present).
 
     For OPENAI_COMPATIBLE tiers, requires both base_url and api_key to be set.
+    For ANTHROPIC_DIRECT, requires the api_key to be set (no base_url — fixed
+    Anthropic Messages API endpoint, see src/providers/anthropic_direct.py).
     Returns False (and logs a warning) if the tier is not usable — no crash.
     """
     config = PROVIDERS.get(tier_id)
@@ -140,6 +173,10 @@ def is_tier_usable(tier_id: str) -> bool:
         if not config.base_url:
             logger.warning(f"⚠️ Provider tier '{tier_id}' skipped: base_url not configured (env var missing)")
             return False
+        if config.api_key_env and not os.getenv(config.api_key_env):
+            logger.warning(f"⚠️ Provider tier '{tier_id}' skipped: {config.api_key_env} not set")
+            return False
+    if config.backend == BackendType.ANTHROPIC_DIRECT:
         if config.api_key_env and not os.getenv(config.api_key_env):
             logger.warning(f"⚠️ Provider tier '{tier_id}' skipped: {config.api_key_env} not set")
             return False

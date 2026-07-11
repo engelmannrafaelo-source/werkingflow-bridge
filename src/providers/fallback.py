@@ -1,11 +1,16 @@
 """Fallback Chain — Automatic provider failover on errors.
 
 Defines fallback chains per primary provider tier:
-- claude-premium   → openrouter-claude (same model, different infra)
+- claude-premium   → claude-direct-notools (same model, no CLI subprocess,
+  skipped when the request needs tools) → openrouter-claude (same model,
+  different infra) → bridge-prod-emergency (last resort)
 - claude-dsgvo     → (no fallback — DSGVO data must stay in EU)
 - openrouter-claude → (no fallback — OpenRouter has its own internal failover)
 
-Triggers: HTTP 429, 500, 502, 503, 504, connect timeout, connection refused.
+Triggers: HTTP 429, 500, 502, 503, 504, connect timeout, connection refused,
+CLI-subprocess session timeout (asyncio.TimeoutError — the Claude Code SDK
+path re-raises this on its own MAX_TIMEOUT ceiling, see claude_cli.py; this
+is the failure mode a long Extended Thinking generation hits).
 Retries once per fallback provider with a short delay.
 """
 
@@ -28,8 +33,11 @@ logger = logging.getLogger(__name__)
 # =============================================================================
 
 FALLBACK_CHAINS: dict[str, list[str]] = {
-    # Anthropic Direct down → OpenRouter → Production Bridge (last resort: token exhaustion)
-    "claude-premium": ["openrouter-claude", "bridge-prod-emergency"],
+    # Claude Code SDK (CLI subprocess) down/hung → direct Anthropic (same
+    # model, no tools — get_fallback_tiers() drops this hop for
+    # tools_required=True) → OpenRouter → Production Bridge (last resort:
+    # token exhaustion)
+    "claude-premium": ["claude-direct-notools", "openrouter-claude", "bridge-prod-emergency"],
 
     # DSGVO: No fallback — data residency must stay in EU (Bedrock Frankfurt)
     # "claude-dsgvo": [],
@@ -148,25 +156,36 @@ def get_all_provider_health() -> dict[str, dict]:
 # FALLBACK LOGIC
 # =============================================================================
 
-def get_fallback_tiers(primary_tier: str) -> list[str]:
+def get_fallback_tiers(primary_tier: str, tools_required: bool = True) -> list[str]:
     """Get the ordered list of usable fallback tier IDs for a primary provider.
 
     Returns the full chain: [primary, fallback1, fallback2, ...].
     Tiers that are not usable (missing config/URL) are silently filtered out.
     If no chain is configured, returns just [primary].
+
+    ``tools_required`` (default True — the safe default) drops any tier whose
+    ``ProviderConfig.supports_tools`` is False, e.g. ``claude-direct-notools``
+    (no CLI subprocess = no tool support). Callers whose request already runs
+    with ``enable_tools=False`` should pass ``tools_required=False`` so that
+    tier stays eligible — nothing is lost by rerouting a call that was never
+    going to use tools anyway.
     """
-    from src.providers.registry import is_tier_usable
+    from src.providers.registry import is_tier_usable, PROVIDERS
 
     chain = [primary_tier]
     chain.extend(FALLBACK_CHAINS.get(primary_tier, []))
 
-    # Filter out tiers that are not configured (e.g. bridge-prod-emergency without URL)
     usable = []
     for tier_id in chain:
-        if tier_id == primary_tier or is_tier_usable(tier_id):
-            usable.append(tier_id)
-        else:
-            logger.debug(f"🔕 Fallback tier '{tier_id}' filtered (not usable — config missing)")
+        if tier_id != primary_tier:
+            if tools_required and not PROVIDERS.get(tier_id, PROVIDERS[primary_tier]).supports_tools:
+                logger.debug(f"🔕 Fallback tier '{tier_id}' filtered (no tool support, request needs tools)")
+                continue
+            # Filter out tiers that are not configured (e.g. bridge-prod-emergency without URL)
+            if not is_tier_usable(tier_id):
+                logger.debug(f"🔕 Fallback tier '{tier_id}' filtered (not usable — config missing)")
+                continue
+        usable.append(tier_id)
     return usable
 
 
@@ -184,10 +203,18 @@ def is_retryable_error(error: Exception) -> bool:
     if isinstance(error, (httpx.ConnectError, httpx.ConnectTimeout, httpx.ReadTimeout)):
         return True
 
+    # CLI-subprocess session-level timeout (claude_cli.py re-raises this bare
+    # on its MAX_TIMEOUT ceiling — NOT a RuntimeError, so needs its own check).
+    # This is the failure mode a long Extended Thinking generation hits.
+    if isinstance(error, asyncio.TimeoutError):
+        return True
+
     # Generic RuntimeError from Bedrock or other backends
     if isinstance(error, RuntimeError):
         msg = str(error).lower()
         return any(code in msg for code in ["429", "500", "502", "503", "504", "timeout"])
+
+    return False
 
 
 def is_breaker_failure(error: Exception) -> bool:
@@ -206,13 +233,15 @@ def is_breaker_failure(error: Exception) -> bool:
         return error.status_code in BREAKER_FAILURE_STATUS_CODES  # excludes 429
     if isinstance(error, (httpx.ConnectError, httpx.ConnectTimeout, httpx.ReadTimeout)):
         return True
+    # Session-level CLI timeout — genuine brokenness (the worker/subprocess
+    # is stuck), not a transient rate-limit, so it trips the breaker.
+    if isinstance(error, asyncio.TimeoutError):
+        return True
     if isinstance(error, RuntimeError):
         msg = str(error).lower()
         if "429" in msg or "throttle" in msg or "rate limit" in msg or "rate-limit" in msg:
             return False
         return any(code in msg for code in ["500", "502", "503", "504", "timeout", "connection"])
-    return False
-
     return False
 
 
