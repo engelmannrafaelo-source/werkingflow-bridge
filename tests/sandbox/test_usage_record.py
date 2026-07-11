@@ -200,6 +200,88 @@ class TestUsageAggregate:
 
 
 # ---------------------------------------------------------------------------
+# real_cost_eur must follow resolve_ledger_cost, not a sandbox-only hardcode
+# ---------------------------------------------------------------------------
+
+class TestRecordUsageRealCost:
+    """
+    Sandbox usage is issued exclusively through OAuth-leased Bridge accounts
+    (routes.lease_token hard-requires billing_mode == 'subscription' before
+    handing out a lease) — Anthropic bills that account at its flat
+    subscription rate, so those calls have zero marginal cost to us. Sandbox
+    must reuse resolve_ledger_cost (the same function the /chat|/research
+    write-path uses) instead of hardcoding real_cost = hypothetical_cost_eur,
+    or a subscription-covered sandbox call shows up as real spend in the
+    ledger while a genuine pay_per_token sandbox usage must still show its
+    real cost.
+    """
+
+    @pytest.mark.asyncio
+    async def test_subscription_billing_mode_has_zero_real_cost(self):
+        conn = AsyncMock()
+        conn.fetchrow.return_value = {"id": 1}
+
+        await ls.record_usage(
+            conn,
+            litellm_call_id="lc-sub-001",
+            user_id=uuid.uuid4(),
+            tenant_id="t1",
+            session_id="sess-sub",
+            lease_id=None,
+            account_id="engelmann",
+            app="engelmann",
+            model="claude-sonnet-4-5",
+            input_tokens=1000,
+            output_tokens=200,
+            cache_read_tokens=0,
+            cache_creation_tokens=0,
+            hypothetical_cost_eur=0.0123,
+            billing_mode="subscription",
+        )
+
+        args = conn.fetchrow.call_args.args
+        bm_enum, real_cost, hypothetical = args[10], args[11], args[12]
+        assert bm_enum == "flat_rate_estimated"
+        assert real_cost == 0.0, (
+            "subscription-leased sandbox call must carry real_cost=0 — "
+            "Anthropic charges the OAuth account a flat subscription rate, "
+            "not per token"
+        )
+        assert hypothetical == 0.0123, "hypothetical must stay priced for reporting"
+
+    @pytest.mark.asyncio
+    async def test_pay_per_token_billing_mode_keeps_real_cost(self):
+        conn = AsyncMock()
+        conn.fetchrow.return_value = {"id": 1}
+
+        await ls.record_usage(
+            conn,
+            litellm_call_id="lc-ppt-001",
+            user_id=uuid.uuid4(),
+            tenant_id="t2",
+            session_id="sess-ppt",
+            lease_id=None,
+            account_id="engelmann",
+            app="engelmann",
+            model="claude-sonnet-4-5",
+            input_tokens=1000,
+            output_tokens=200,
+            cache_read_tokens=0,
+            cache_creation_tokens=0,
+            hypothetical_cost_eur=0.0123,
+            billing_mode="pay_per_token",
+        )
+
+        args = conn.fetchrow.call_args.args
+        bm_enum, real_cost = args[10], args[11]
+        assert bm_enum == "pay_per_token"
+        assert real_cost == 0.0123, (
+            "pay_per_token sandbox usage must keep real_cost == hypothetical — "
+            "a €0 row here would hide genuine per-token spend"
+        )
+
+
+# ---------------------------------------------------------------------------
 # Criterion 10: Budget deduction after record_usage (Defect 2)
 # ---------------------------------------------------------------------------
 

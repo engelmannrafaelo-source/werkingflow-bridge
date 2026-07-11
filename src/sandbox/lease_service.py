@@ -353,11 +353,18 @@ async def record_usage(
     Returns True if a row was actually inserted, False if it was a duplicate —
     the caller uses this to avoid double-writing the mirrored activities row.
 
-    billing_mode: tenant TEXT ('subscription'|'pay_per_token') — kept in the
-        signature for caller context, but does NOT affect the enum stored here.
-        Sandbox calls always use pay_per_token / real_cost = hypothetical_cost_eur
-        because Anthropic charges the Bridge's OAuth account per-token regardless
-        of the tenant's billing arrangement with us (subscription or otherwise).
+    billing_mode: tenant TEXT ('subscription'|'pay_per_token'|...), fed into the
+        same resolve_ledger_cost() the /chat|/research write-path uses, so
+        sandbox is not a special case: every sandbox lease is issued through
+        an OAuth-leased Bridge account (see routes.lease_token, which hard-
+        requires billing_mode == 'subscription') — Anthropic bills that
+        account at its flat subscription rate, not per token, so those calls
+        have zero marginal cost to us (real_cost_eur = 0.0, hypothetical_cost_eur
+        stays priced for reporting). A tenant recorded with billing_mode ==
+        'pay_per_token' (e.g. flipped mid-session by an admin) keeps its real
+        cost == hypothetical, exactly like the non-sandbox path — the ledger
+        must never hide genuine per-token spend. provider is always 'anthropic'
+        here: the sandbox has no Bedrock lease path.
 
     app_env: already-normalised environment bucket (prod|staging|local), or
         None when the caller (sandbox daemon) sent no X-App-Env header. Most
@@ -367,13 +374,10 @@ async def record_usage(
         app variant CAN tag itself.
     """
     import json as _json
+    from src.activity.ai_call_writer import resolve_ledger_cost
     from src.pricing import PRICING_VERSION
 
-    # Sandbox always has a real cost: Anthropic charges the Bridge OAuth account
-    # per-token. flat_rate_estimated would silently zero out real_cost_eur and
-    # hide the actual spend from financial reporting.
-    bm_enum = "pay_per_token"
-    real_cost = hypothetical_cost_eur
+    bm_enum, real_cost = resolve_ledger_cost(billing_mode, "anthropic", hypothetical_cost_eur)
 
     row = await conn.fetchrow(
         """
