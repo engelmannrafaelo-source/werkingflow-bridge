@@ -13,6 +13,7 @@ from datetime import datetime
 from typing import List, Dict, Any, Optional, AsyncGenerator
 
 import boto3
+from botocore.config import Config
 from botocore.exceptions import ClientError
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import StreamingResponse
@@ -28,6 +29,21 @@ from src.model_registry import resolve_model, to_bedrock_model_id
 from src.routing.backend_router import _resolve_privacy_mode
 
 logger = get_logger(__name__)
+
+# botocore defaults to a 60s read_timeout — far too short for a large-prompt
+# generation. The non-streaming invoke_model must receive the WHOLE response
+# within read_timeout, so a long generation (e.g. the wizard's analyze_narrative
+# step: ~176k-char prompt) tripped "Read timeout on endpoint URL" at 60s, and
+# botocore then retried it several times (~5×60s ≈ 300s) before failing.
+# Anthropic's flat-rate pool never hit this — the cap is Bedrock-path only.
+# Give generations room (10 min), fail fast on genuine connect problems, and cap
+# retries so a real hang does not multiply the wait (callers have their own retry
+# loop). Applies to BOTH invoke_model and invoke_model_with_response_stream.
+_BEDROCK_BOTO_CONFIG = Config(
+    connect_timeout=10,
+    read_timeout=600,
+    retries={"max_attempts": 2, "mode": "standard"},
+)
 
 # AWS error codes that are identical on every worker (account/IAM/model-access
 # misconfiguration). Raised as 424 so nginx does NOT cross-worker-retry and
@@ -96,7 +112,8 @@ class BedrockClient:
             "bedrock-runtime",
             region_name=region or self.default_region,
             aws_access_key_id=self.aws_access_key,
-            aws_secret_access_key=self.aws_secret_key
+            aws_secret_access_key=self.aws_secret_key,
+            config=_BEDROCK_BOTO_CONFIG,
         )
 
 
