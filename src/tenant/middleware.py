@@ -431,6 +431,18 @@ _APP_ENV_NORMALISE = {
     "production": "prod",
     "preview": "staging",
     "development": "local",
+    # Idempotency: an already-normalised bucket must survive a second
+    # normalize pass unchanged. The async-job executor re-emits the STORED
+    # (already-normalised) app_env as an X-App-Env header on its internal
+    # chat self-call; the receiving worker then normalises again. Without
+    # these self-maps that second pass turned "prod" → None, which tripped
+    # the Bedrock attribution guard ("missing X-App-Env") for EVERY
+    # Bedrock-pinned async-job call — the sync path only normalises once and
+    # never saw it. Mapping each bucket to itself makes normalize_app_env
+    # idempotent, so the value survives any number of self-call hops.
+    "prod": "prod",
+    "staging": "staging",
+    "local": "local",
 }
 
 
