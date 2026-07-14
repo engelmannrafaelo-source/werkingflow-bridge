@@ -410,13 +410,11 @@ async def billing_seed_legacy_trials(
     return await billing_service.seed_legacy_trials(app_id)
 
 
-async def _assert_self_checkout_allowed(user_id: str) -> None:
-    """403, wenn dieser User nicht selbst buchen darf.
+async def _self_checkout_state(user_id: str) -> tuple[bool, Optional[str]]:
+    """(darf_selbst_buchen, grund). Grund ∈ {global_inactive, tenant_managed} oder None.
 
     Buchbar nur wenn der globale Schalter self_checkout_active AN ist UND der
-    Tenant billing_type='self_service' hat. 'managed'-Tenants (Sondervereinbarungen)
-    und der Beta-Zustand (global AUS) werden serverseitig abgewiesen — nicht nur
-    im Portal versteckt (Defense-in-depth).
+    Tenant billing_type='self_service' hat.
     """
     from src.platform_config import is_self_checkout_active
     pool = get_pool()
@@ -427,17 +425,39 @@ async def _assert_self_checkout_allowed(user_id: str) -> None:
             uuid.UUID(user_id),
         )
     if not await is_self_checkout_active():
-        raise HTTPException(status_code=403, detail={
-            "error": "self_checkout_disabled", "reason": "global_inactive",
-            "message": "Selbstbuchung ist derzeit nicht freigeschaltet. "
-                       "Die Abrechnung wird von uns eingerichtet.",
-        })
+        return False, "global_inactive"
     if (row["bt"] if row else None) != "self_service":
-        raise HTTPException(status_code=403, detail={
-            "error": "self_checkout_disabled", "reason": "tenant_managed",
-            "message": "Ihr Konto wird von uns betreut — die Abrechnung erfolgt "
-                       "über uns, nicht per Selbstbuchung.",
-        })
+        return False, "tenant_managed"
+    return True, None
+
+
+async def _assert_self_checkout_allowed(user_id: str) -> None:
+    """403, wenn dieser User nicht selbst buchen darf.
+
+    'managed'-Tenants (Sondervereinbarungen) und der Beta-Zustand (global AUS)
+    werden serverseitig abgewiesen — nicht nur im Portal versteckt (Defense-in-depth).
+    """
+    allowed, reason = await _self_checkout_state(user_id)
+    if allowed:
+        return
+    msg = ("Selbstbuchung ist derzeit nicht freigeschaltet. Die Abrechnung wird von uns eingerichtet."
+           if reason == "global_inactive"
+           else "Ihr Konto wird von uns betreut — die Abrechnung erfolgt über uns, nicht per Selbstbuchung.")
+    raise HTTPException(status_code=403, detail={
+        "error": "self_checkout_disabled", "reason": reason, "message": msg,
+    })
+
+
+@router.get("/self-checkout-status")
+async def billing_self_checkout_status(
+    claims: AuthClaims = Depends(require_jwt_or_service),
+) -> Dict[str, Any]:
+    """Sagt dem Portal, ob der aktuelle User selbst buchen darf (zeigt/versteckt Checkout)."""
+    user_id = claims.effective_user_id
+    if not user_id:
+        return {"canSelfCheckout": False, "reason": "no_user"}
+    allowed, reason = await _self_checkout_state(user_id)
+    return {"canSelfCheckout": allowed, "reason": reason}
 
 
 @router.post("/subscription/checkout")
