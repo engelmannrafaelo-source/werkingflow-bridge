@@ -917,7 +917,150 @@ async def consume_project_credit(
         raise HTTPException(status_code=400, detail=f"Invalid user_id: {user_id}")
 
 
+# ---------------------------------------------------------------------------
+# Project Resets — operator-gated one-shot "start this project over" grant.
+# See project_resets_service.py + migration 038_project_reset_requests.sql.
+# ---------------------------------------------------------------------------
+
+from src.billing import project_resets_service  # noqa: E402
+from src.api_auth import get_tenant_of_user  # noqa: E402
+
+_project_resets_router = APIRouter(tags=["billing"])
+
+
+class CreateProjectResetRequest(BaseModel):
+    project_id: str
+    argument: str
+    plan_id: str = "energy-project"
+    app_id: Optional[str] = None
+    project_name: Optional[str] = None
+
+
+class DecideProjectResetRequest(BaseModel):
+    operator: Optional[str] = None
+
+
+@_project_resets_router.post("/v1/users/{user_id}/project-resets", status_code=201)
+async def create_project_reset(
+    user_id: str,
+    body: CreateProjectResetRequest,
+    _claims: AuthClaims = Depends(require_service_token),
+) -> Dict[str, Any]:
+    """App files a reset request for one of its projects (status='requested').
+
+    Service-Token only: the app backend (Energy) creates this on the user's
+    behalf. The tenant is resolved server-side from the user. Returns 409 if the
+    project already has an open (requested/approved) request.
+    """
+    try:
+        uid = _uuid.UUID(user_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail=f"Invalid user_id: {user_id}")
+    tenant_id = await get_tenant_of_user(user_id)
+    try:
+        return await project_resets_service.create_request(
+            user_id=uid,
+            project_id=body.project_id,
+            argument=body.argument,
+            plan_id=body.plan_id,
+            tenant_id=tenant_id,
+            app_id=body.app_id,
+            project_name=body.project_name,
+        )
+    except project_resets_service.OpenRequestExistsError as e:
+        raise HTTPException(status_code=409, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@_project_resets_router.get("/v1/project-resets")
+async def list_project_resets(
+    status: Optional[str] = None,
+    app: Optional[str] = None,
+    limit: int = 200,
+    _claims: AuthClaims = Depends(require_admin),
+) -> Dict[str, Any]:
+    """List reset requests for the Platform Admin (operator only). Newest first."""
+    items = await project_resets_service.list_requests(
+        status=status, app_id=app, limit=limit
+    )
+    return {"items": items, "count": len(items)}
+
+
+@_project_resets_router.post("/v1/project-resets/{request_id}/approve")
+async def approve_project_reset(
+    request_id: str,
+    body: Optional[DecideProjectResetRequest] = None,
+    _claims: AuthClaims = Depends(require_admin),
+) -> Dict[str, Any]:
+    """Approve a reset request (operator only). Issues the one-shot grant."""
+    operator = (body.operator if body else None) or _claims.email or _claims.acting_user_id
+    try:
+        return await project_resets_service.decide(
+            request_id=_uuid.UUID(request_id), approve=True, operator=operator
+        )
+    except ValueError:
+        raise HTTPException(status_code=400, detail=f"Invalid request_id: {request_id}")
+    except project_resets_service.RequestNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+
+@_project_resets_router.post("/v1/project-resets/{request_id}/reject")
+async def reject_project_reset(
+    request_id: str,
+    body: Optional[DecideProjectResetRequest] = None,
+    _claims: AuthClaims = Depends(require_admin),
+) -> Dict[str, Any]:
+    """Reject a reset request (operator only)."""
+    operator = (body.operator if body else None) or _claims.email or _claims.acting_user_id
+    try:
+        return await project_resets_service.decide(
+            request_id=_uuid.UUID(request_id), approve=False, operator=operator
+        )
+    except ValueError:
+        raise HTTPException(status_code=400, detail=f"Invalid request_id: {request_id}")
+    except project_resets_service.RequestNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+
+@_project_resets_router.post("/v1/users/{user_id}/project-resets/{project_id}/redeem")
+async def redeem_project_reset(
+    user_id: str,
+    project_id: str,
+    plan_id: str = "energy-project",
+    _claims: AuthClaims = Depends(require_service_token),
+) -> Dict[str, Any]:
+    """Redeem an approved grant: reset the project's budget + consume the grant.
+
+    Service-Token only (app backend). Returns {redeemed, budgetReset}.
+    redeemed=False means no approved grant existed — the caller must NOT treat
+    the project as reset.
+    """
+    try:
+        uid = _uuid.UUID(user_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail=f"Invalid user_id: {user_id}")
+    return await project_resets_service.redeem(
+        user_id=uid, project_id=project_id, plan_id=plan_id
+    )
+
+
+@_project_resets_router.get("/v1/users/{user_id}/project-resets/{project_id}/status")
+async def project_reset_status(
+    user_id: str,
+    project_id: str,
+    _claims: AuthClaims = Depends(require_service_token),
+) -> Dict[str, Any]:
+    """Current open reset state for one project: {status: none|requested|approved}."""
+    try:
+        uid = _uuid.UUID(user_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail=f"Invalid user_id: {user_id}")
+    return await project_resets_service.get_open_status(user_id=uid, project_id=project_id)
+
+
 # Export all routers so platform_main.py can include them.
 pending_orders_router = _pending_router
 admin_orders_router = _admin_orders_router
 project_credits_router = _project_credits_router
+project_resets_router = _project_resets_router

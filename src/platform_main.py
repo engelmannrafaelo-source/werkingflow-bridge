@@ -64,7 +64,7 @@ from src.identity.self_service import router as self_service_router  # noqa: E40
 from src.identity.webhook_config import init_webhook_configs  # noqa: E402
 from src.identity.webhook_dispatcher import WebhookDispatcher  # noqa: E402
 from src.budget.routes import router as budget_router  # noqa: E402
-from src.billing.routes import router as billing_router, pending_orders_router, admin_orders_router, project_credits_router  # noqa: E402
+from src.billing.routes import router as billing_router, pending_orders_router, admin_orders_router, project_credits_router, project_resets_router  # noqa: E402
 from src.activity.routes import router as activity_router  # noqa: E402
 from src.feedback.routes import router as feedback_router  # noqa: E402
 from src.audit.routes import router as audit_router  # noqa: E402
@@ -159,6 +159,7 @@ app.include_router(billing_router)
 app.include_router(pending_orders_router)
 app.include_router(admin_orders_router)
 app.include_router(project_credits_router)
+app.include_router(project_resets_router)
 app.include_router(activity_router)
 app.include_router(feedback_router)
 app.include_router(audit_router)

@@ -326,3 +326,42 @@ async def deduct(
         "usedEur": float(new_used),
         "remainingEur": float(max(Decimal("0"), limit - new_used)),
     }
+
+
+async def reset_budget(
+    conn: Any,
+    *,
+    user_id: uuid.UUID,
+    plan_id: str,
+    project_id: str,
+) -> bool:
+    """Reset a project's API budget back to full (used_eur = 0).
+
+    This is the operator-approved "start this project over" action (redeem of a
+    project_reset_requests grant): the same project_id keeps its limit_eur, but
+    its accumulated spend is zeroed so a finished-and-exhausted project can be
+    re-run within a fresh EUR 100.
+
+    Deliberately SEPARATE from allocate_budget, which is idempotent and MUST NOT
+    reset a running project's budget (a retried job-create would otherwise wipe
+    spend). reset_budget is the only path that intentionally clears used_eur, and
+    it is reachable only behind an approved, one-shot grant.
+
+    Runs on the caller-supplied `conn` so the redeem can mark the grant consumed
+    and reset the budget atomically in one transaction. Returns True when a
+    budget row existed and was reset, False when there was none (a project that
+    never spent — nothing to reset; the next LLM call lazy-allocates a fresh
+    budget anyway, so the redeem still succeeds).
+    """
+    result = await conn.execute(
+        """
+        UPDATE project_budgets
+           SET used_eur = 0, updated_at = NOW()
+         WHERE user_id = $1 AND plan_id = $2 AND project_id = $3
+        """,
+        user_id,
+        plan_id,
+        project_id,
+    )
+    # asyncpg execute() returns a tag like "UPDATE 1" / "UPDATE 0".
+    return not str(result).endswith(" 0")
