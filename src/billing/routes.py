@@ -83,16 +83,21 @@ async def billing_overview(
 
     pool = get_pool()
     plan_prices = {pid: p.price for pid, p in PLANS.items()}
+    plan_intervals = {pid: p.interval for pid, p in PLANS.items()}
     # Legacy plan-id aliases from werking-report's own catalog. Remove once the
     # migration script in apps/werking-report/scripts/ rewrites plan_ids on insert.
     plan_prices["standard"] = plan_prices.get("report-standard", 250)
     plan_prices["pro"] = plan_prices.get("report-standard", 250)
+    plan_intervals.setdefault("standard", "month")
+    plan_intervals.setdefault("pro", "month")
 
     by_plan: Dict[str, int] = {}
     by_status: Dict[str, int] = {}
     by_app: Dict[str, int] = {}
+    by_account_type: Dict[str, int] = {}
     total_mrr_eur = 0.0
     active_subs = 0
+    paying_subs = 0
     cancelled_subs = 0
     source = "subscriptions"
 
@@ -110,26 +115,20 @@ async def billing_overview(
             _add_cond("t.account_type = $$::account_type", account_type)
 
         where_clause = f"WHERE {' AND '.join(conds)}" if conds else ""
-        if account_type:
-            sub_rows = await conn.fetch(
-                f"""
-                SELECT s.status, s.plan_id, s.seats, s.app_id
-                FROM subscriptions s
-                JOIN users u ON u.id = s.user_id
-                JOIN tenants t ON t.id = u.tenant_id
-                {where_clause}
-                """,
-                *params,
-            )
-        elif app:
-            sub_rows = await conn.fetch(
-                "SELECT status, plan_id, seats, app_id FROM subscriptions WHERE app_id = $1::app_id",
-                app,
-            )
-        else:
-            sub_rows = await conn.fetch(
-                "SELECT status, plan_id, seats, app_id FROM subscriptions"
-            )
+        # Immer tenants joinen, damit MRR test/internal ausschliessen kann.
+        # LEFT JOIN: Subscriptions ohne Tenant (Orphans) bleiben in den Zaehlungen,
+        # gelten aber nicht als zahlende Kunden (account_type NULL -> kein MRR).
+        sub_rows = await conn.fetch(
+            f"""
+            SELECT s.status, s.plan_id, s.seats, s.app_id,
+                   t.account_type::text AS account_type
+            FROM subscriptions s
+            LEFT JOIN users u ON u.id = s.user_id
+            LEFT JOIN tenants t ON t.id = u.tenant_id
+            {where_clause}
+            """,
+            *params,
+        )
 
     if sub_rows:
         for r in sub_rows:
@@ -137,14 +136,24 @@ async def billing_overview(
             plan_id = r["plan_id"]
             seats = r["seats"] or 1
             app_id = r["app_id"]
+            acct = r["account_type"]
 
             by_status[status] = by_status.get(status, 0) + 1
             by_plan[plan_id] = by_plan.get(plan_id, 0) + 1
             by_app[app_id] = by_app.get(app_id, 0) + 1
+            if acct:
+                by_account_type[acct] = by_account_type.get(acct, 0) + 1
 
             if status == "active":
                 active_subs += 1
-                total_mrr_eur += float(plan_prices.get(plan_id, 0)) * seats
+                price = float(plan_prices.get(plan_id, 0))
+                interval = plan_intervals.get(plan_id)
+                # MRR = echte monatlich wiederkehrende Umsaetze ZAHLENDER Kunden.
+                # Ausgeschlossen: test/internal (keine Kunden), Nicht-Monats-Plaene
+                # (z.B. energy-project = Einmalzahlung pro Projekt) und Gratis (trial=0).
+                if acct == "customer" and interval == "month" and price > 0:
+                    total_mrr_eur += price * seats
+                    paying_subs += 1
             elif status == "cancelled":
                 cancelled_subs += 1
     else:
@@ -214,6 +223,7 @@ async def billing_overview(
         "app": app,
         "totalMrrEur": round(total_mrr_eur, 2),
         "activeSubscriptions": active_subs,
+        "payingSubscriptions": paying_subs,
         "cancelledSubscriptions": cancelled_subs,
         "totalTopupRevenueEur": topup_revenue,
         "topupPurchasesCount": topup_count,
@@ -221,6 +231,7 @@ async def billing_overview(
         "byPlan": by_plan,
         "byStatus": by_status,
         "byApp": by_app,
+        "byAccountType": by_account_type,
     }
 
 
