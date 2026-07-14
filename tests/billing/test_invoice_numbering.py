@@ -77,8 +77,15 @@ class TestNextInvoiceNumber:
         assert wr == f"WR-{YEAR}-00001"
         assert inv != wr  # unterschiedliche Kreise, keine Doppelvergabe
 
+    async def test_beta_series_single_letter_prefix(self):
+        # Manuelle Beta-Rechnungen laufen auf der einbuchstabigen Serie "B".
+        conn = _FakeConn()
+        assert await next_invoice_number(conn, "B") == f"B-{YEAR}-00001"
+        assert await next_invoice_number(conn, "B") == f"B-{YEAR}-00002"
+        assert _seq_name("B", 2026) == "invoice_seq_b_2026"
+
     async def test_invalid_prefix_raises(self):
         conn = _FakeConn()
-        for bad in ("wr", "W", "TOOLONGX", "W1", "W-", ""):
+        for bad in ("wr", "TOOLONGX", "W1", "W-", ""):
             with pytest.raises(ValueError):
                 await next_invoice_number(conn, bad)

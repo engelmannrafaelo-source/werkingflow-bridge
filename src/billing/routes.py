@@ -410,6 +410,36 @@ async def billing_seed_legacy_trials(
     return await billing_service.seed_legacy_trials(app_id)
 
 
+async def _assert_self_checkout_allowed(user_id: str) -> None:
+    """403, wenn dieser User nicht selbst buchen darf.
+
+    Buchbar nur wenn der globale Schalter self_checkout_active AN ist UND der
+    Tenant billing_type='self_service' hat. 'managed'-Tenants (Sondervereinbarungen)
+    und der Beta-Zustand (global AUS) werden serverseitig abgewiesen — nicht nur
+    im Portal versteckt (Defense-in-depth).
+    """
+    from src.platform_config import is_self_checkout_active
+    pool = get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT t.billing_type::text AS bt "
+            "FROM users u JOIN tenants t ON t.id = u.tenant_id WHERE u.id = $1",
+            uuid.UUID(user_id),
+        )
+    if not await is_self_checkout_active():
+        raise HTTPException(status_code=403, detail={
+            "error": "self_checkout_disabled", "reason": "global_inactive",
+            "message": "Selbstbuchung ist derzeit nicht freigeschaltet. "
+                       "Die Abrechnung wird von uns eingerichtet.",
+        })
+    if (row["bt"] if row else None) != "self_service":
+        raise HTTPException(status_code=403, detail={
+            "error": "self_checkout_disabled", "reason": "tenant_managed",
+            "message": "Ihr Konto wird von uns betreut — die Abrechnung erfolgt "
+                       "über uns, nicht per Selbstbuchung.",
+        })
+
+
 @router.post("/subscription/checkout")
 async def billing_sub_checkout(
     body: SubscriptionCheckoutRequest,
@@ -418,6 +448,7 @@ async def billing_sub_checkout(
     user_id, email, name = await _resolve_billing_identity(
         claims, body.userId, body.email, body.name,
     )
+    await _assert_self_checkout_allowed(user_id)
     try:
         return await billing_service.start_subscription_checkout(
             user_id, body.planId, body.seats, body.successRedirect,
@@ -450,6 +481,7 @@ async def billing_project_pack_checkout(
     user_id, email, name = await _resolve_billing_identity(
         claims, body.userId, body.email, body.name,
     )
+    await _assert_self_checkout_allowed(user_id)
     try:
         return await billing_service.start_project_pack_checkout(
             user_id, body.planId, body.quantity, body.successRedirect,
@@ -480,6 +512,7 @@ async def billing_topup_checkout(
     user_id, email, name = await _resolve_billing_identity(
         claims, body.userId, body.email, body.name,
     )
+    await _assert_self_checkout_allowed(user_id)
     try:
         return await billing_service.start_topup_checkout(
             user_id, body.amountEur, body.successRedirect,

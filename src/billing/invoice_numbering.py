@@ -37,7 +37,8 @@ TOPUP_PREFIX = "TU"  # API-Guthaben-Aufladung — gilt kontoweit, keinem Produkt
 # vergebene INV-Nummern nicht erneut erzeugt werden (invoice_number ist UNIQUE).
 FALLBACK_PREFIX = "INV"
 
-_PREFIX_RE = re.compile(r"^[A-Z]{2,6}$")
+# 1-6 Großbuchstaben: erlaubt Produkt-Präfixe (WR/WE/…) UND die Beta-Serie "B".
+_PREFIX_RE = re.compile(r"^[A-Z]{1,6}$")
 
 
 def prefix_for_app(app_id: str | None) -> str:

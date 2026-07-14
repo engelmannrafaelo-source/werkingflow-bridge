@@ -150,8 +150,9 @@ class InvoiceCreate(BaseModel):
     metadata: Dict[str, Any] = {}
     dueAt: Optional[str] = None
     # Nummernkreis-Praefix (getrennte Zahlenreihen pro Produkt, § 11 UStG).
-    # Default: Fallback-Kreis. Produkt-Rechnungen setzen z. B. WR / WE / TU.
-    numberPrefix: str = Field(default=FALLBACK_PREFIX, pattern=r"^[A-Z]{2,6}$")
+    # Default: Fallback-Kreis. Produkt-Rechnungen setzen z. B. WR / WE / TU;
+    # manuelle Beta-Rechnungen die Serie "B".
+    numberPrefix: str = Field(default=FALLBACK_PREFIX, pattern=r"^[A-Z]{1,6}$")
 
 
 class InvoiceUpdate(BaseModel):

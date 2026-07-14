@@ -973,12 +973,18 @@ async def grant_subscription(
 # Tenants
 # ---------------------------------------------------------------------------
 
+_ALLOWED_BILLING_TYPES = {"self_service", "managed"}
+
+
 class TenantCreateRequest(BaseModel):
     id: Optional[str] = None
     name: str
     owner_user_id: Optional[str] = None
     # customer|test|internal — defaults to 'customer' if omitted.
     account_type: Optional[str] = None
+    # self_service|managed — defaults to 'self_service' if omitted.
+    # managed = Betreiber stellt Rechnung manuell (Sondervereinbarungen).
+    billing_type: Optional[str] = None
 
 
 @router.get("/v1/tenants")
@@ -998,7 +1004,8 @@ async def list_tenants(
         if account_type:
             rows = await conn.fetch(
                 """
-                SELECT id, name, owner_user_id, created_at, account_type::text AS account_type
+                SELECT id, name, owner_user_id, created_at,
+                       account_type::text AS account_type, billing_type::text AS billing_type
                 FROM tenants WHERE account_type = $1::account_type
                 ORDER BY created_at DESC LIMIT $2
                 """,
@@ -1007,7 +1014,8 @@ async def list_tenants(
         else:
             rows = await conn.fetch(
                 """
-                SELECT id, name, owner_user_id, created_at, account_type::text AS account_type
+                SELECT id, name, owner_user_id, created_at,
+                       account_type::text AS account_type, billing_type::text AS billing_type
                 FROM tenants ORDER BY created_at DESC LIMIT $1
                 """,
                 limit,
@@ -1018,6 +1026,7 @@ async def list_tenants(
             "name": r["name"],
             "owner_user_id": str(r["owner_user_id"]) if r["owner_user_id"] else None,
             "account_type": r["account_type"],
+            "billing_type": r["billing_type"],
             "created_at": r["created_at"].isoformat(),
         }
         for r in rows
@@ -1137,17 +1146,24 @@ async def create_tenant(
             raise HTTPException(
                 status_code=400, detail=f"Invalid account_type: {account_type}",
             )
+        billing_type = body.billing_type or "self_service"
+        if billing_type not in _ALLOWED_BILLING_TYPES:
+            raise HTTPException(
+                status_code=400, detail=f"Invalid billing_type: {billing_type}",
+            )
         try:
             row = await conn.fetchrow(
                 """
-                INSERT INTO tenants (id, name, owner_user_id, account_type, created_at)
-                VALUES ($1, $2, $3, $4::account_type, $5)
-                RETURNING id, name, owner_user_id, account_type::text AS account_type, created_at
+                INSERT INTO tenants (id, name, owner_user_id, account_type, billing_type, created_at)
+                VALUES ($1, $2, $3, $4::account_type, $5::billing_type, $6)
+                RETURNING id, name, owner_user_id, account_type::text AS account_type,
+                          billing_type::text AS billing_type, created_at
                 """,
                 tenant_id,
                 body.name,
                 owner_uid,
                 account_type,
+                billing_type,
                 now,
             )
         except asyncpg.UniqueViolationError:
@@ -1164,17 +1180,19 @@ async def create_tenant(
         "name": row["name"],
         "owner_user_id": str(row["owner_user_id"]) if row["owner_user_id"] else None,
         "account_type": row["account_type"],
+        "billing_type": row["billing_type"],
         "created_at": row["created_at"].isoformat(),
     }
 
 
 # ---------------------------------------------------------------------------
-# Tenant updates — account_type is the main mutable field for now.
+# Tenant updates — account_type + billing_type are the mutable fields.
 # ---------------------------------------------------------------------------
 
 class TenantUpdateRequest(BaseModel):
     name: Optional[str] = None
     account_type: Optional[str] = None
+    billing_type: Optional[str] = None
     owner_user_id: Optional[str] = None
 
 
@@ -1188,6 +1206,10 @@ async def update_tenant(
         raise HTTPException(
             status_code=400, detail=f"Invalid account_type: {body.account_type}",
         )
+    if body.billing_type and body.billing_type not in _ALLOWED_BILLING_TYPES:
+        raise HTTPException(
+            status_code=400, detail=f"Invalid billing_type: {body.billing_type}",
+        )
 
     sets: List[str] = []
     args: List[Any] = []
@@ -1200,6 +1222,8 @@ async def update_tenant(
         _add("name", body.name)
     if body.account_type is not None:
         _add("account_type", body.account_type, "::account_type")
+    if body.billing_type is not None:
+        _add("billing_type", body.billing_type, "::billing_type")
     if body.owner_user_id is not None:
         _add("owner_user_id", uuid.UUID(body.owner_user_id) if body.owner_user_id else None)
 
@@ -1210,7 +1234,8 @@ async def update_tenant(
     sql = (
         "UPDATE tenants SET " + ", ".join(sets) +
         f" WHERE id = ${len(args)} "
-        "RETURNING id, name, owner_user_id, account_type::text AS account_type, created_at"
+        "RETURNING id, name, owner_user_id, account_type::text AS account_type, "
+        "billing_type::text AS billing_type, created_at"
     )
 
     pool = get_pool()
@@ -1223,8 +1248,35 @@ async def update_tenant(
         "name": row["name"],
         "owner_user_id": str(row["owner_user_id"]) if row["owner_user_id"] else None,
         "account_type": row["account_type"],
+        "billing_type": row["billing_type"],
         "created_at": row["created_at"].isoformat(),
     }
+
+
+# ---------------------------------------------------------------------------
+# Platform-Config — globale Schalter (Self-Checkout). Admin only.
+# ---------------------------------------------------------------------------
+
+class SelfCheckoutConfig(BaseModel):
+    active: bool
+
+
+@router.get("/v1/platform-config/self-checkout")
+async def get_self_checkout_config(
+    _claims: AuthClaims = Depends(require_admin),
+) -> Dict[str, Any]:
+    from src.platform_config import is_self_checkout_active
+    return {"active": await is_self_checkout_active()}
+
+
+@router.patch("/v1/platform-config/self-checkout")
+async def set_self_checkout_config(
+    body: SelfCheckoutConfig,
+    claims: AuthClaims = Depends(require_admin),
+) -> Dict[str, Any]:
+    from src.platform_config import SELF_CHECKOUT_ACTIVE, set_config, is_self_checkout_active
+    await set_config(SELF_CHECKOUT_ACTIVE, body.active, updated_by=claims.effective_user_id or "operator")
+    return {"active": await is_self_checkout_active()}
 
 
 # ---------------------------------------------------------------------------
