@@ -15,6 +15,12 @@ from typing import Any, Dict, List, Optional, Tuple
 from src.config import config
 from src.db.client import get_pool
 from src.billing.mollie_adapter import get_mollie_adapter
+from src.billing.invoice_numbering import (
+    FALLBACK_PREFIX,
+    TOPUP_PREFIX,
+    next_invoice_number,
+    prefix_for_app,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -383,6 +389,7 @@ async def _activate_subscription(
                 description=f"{plan_id} — Erste Monatsabrechnung ({seats} Sitz" + ("e" if seats > 1 else "") + ")",
                 subscription_id=str(row["id"]),
                 mollie_payment_id=first_payment_id,
+                number_prefix=prefix_for_app(app_id),
             )
             return _serialize_subscription(row)
 
@@ -705,6 +712,7 @@ async def _credit_topup(user_id: str, amount_eur: float, mollie_payment_id: str)
         amount_eur=amount_eur,
         description=f"API-Top-Up € {amount_eur:.2f}",
         mollie_payment_id=mollie_payment_id,
+        number_prefix=TOPUP_PREFIX,
     )
     return {"alreadyCredited": False, "balanceEur": float(new_balance)}
 
@@ -1327,6 +1335,7 @@ async def auto_create_invoice(
     subscription_id: str | None = None,
     credit_purchase_id: str | None = None,
     mollie_payment_id: str | None = None,
+    number_prefix: str = FALLBACK_PREFIX,
 ) -> str | None:
     """Insert one invoice row, mark it 'paid', return the id.
 
@@ -1420,13 +1429,9 @@ async def auto_create_invoice(
         # OPEN DECISION: must be reviewed with tax advisor before serving EU B2C volume.
         metadata["taxNote"] = "EU_B2C_OSS_OPEN"
 
-    now = datetime.now(timezone.utc)
-    year = now.year
     async with pool.acquire() as conn:
         async with conn.transaction():
-            await conn.execute(f"CREATE SEQUENCE IF NOT EXISTS invoice_seq_{year} START 1 INCREMENT 1")
-            seq_n = await conn.fetchval(f"SELECT nextval('invoice_seq_{year}')")
-            invoice_number = f"INV-{year}-{int(seq_n):05d}"
+            invoice_number = await next_invoice_number(conn, number_prefix)
 
             row = await conn.fetchrow(
                 """

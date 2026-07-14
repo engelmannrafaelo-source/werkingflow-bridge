@@ -29,6 +29,10 @@ from src.api_auth import (
     resolve_tenant_for_user,
 )
 from src.db.client import get_pool
+from src.billing.invoice_numbering import (
+    FALLBACK_PREFIX,
+    next_invoice_number,
+)
 
 router = APIRouter(prefix="/v1/invoices", tags=["invoices"])
 
@@ -98,20 +102,16 @@ def _row(r: Any) -> Dict[str, Any]:
 # Invoice number generation (deterministic, gap-free per year)
 # ---------------------------------------------------------------------------
 
-async def _next_invoice_number(conn: asyncpg.Connection) -> str:
+async def _next_invoice_number(conn: asyncpg.Connection, prefix: str = FALLBACK_PREFIX) -> str:
     """
-    Returns INV-<year>-<5-digit-seq>, e.g. INV-2026-00001.
+    Returns <PREFIX>-<year>-<5-digit-seq>, e.g. WR-2026-00001 (Fallback INV-2026-00001).
 
-    Uses a per-year sequence. Sequences are NOT transactional so even if the
-    caller rolls back, the number is "consumed" — which is intentional: we
-    never want to re-use an invoice number that was even briefly visible.
+    Delegates to the shared per-product numbering (src.billing.invoice_numbering):
+    each prefix has its own per-year sequence. Sequences are NOT transactional so
+    even if the caller rolls back, the number is "consumed" — intentional: never
+    re-use an invoice number that was even briefly visible.
     """
-    year = datetime.now(timezone.utc).year
-    seq_name = f"invoice_seq_{year}"
-    # Create sequence on the fly if year just rolled over and DDL wasn't run.
-    await conn.execute(f"CREATE SEQUENCE IF NOT EXISTS {seq_name} START 1 INCREMENT 1")
-    n = await conn.fetchval(f"SELECT nextval('{seq_name}')")
-    return f"INV-{year}-{int(n):05d}"
+    return await next_invoice_number(conn, prefix)
 
 
 # ---------------------------------------------------------------------------
@@ -149,6 +149,9 @@ class InvoiceCreate(BaseModel):
     notes: Optional[str] = None
     metadata: Dict[str, Any] = {}
     dueAt: Optional[str] = None
+    # Nummernkreis-Praefix (getrennte Zahlenreihen pro Produkt, § 11 UStG).
+    # Default: Fallback-Kreis. Produkt-Rechnungen setzen z. B. WR / WE / TU.
+    numberPrefix: str = Field(default=FALLBACK_PREFIX, pattern=r"^[A-Z]{2,6}$")
 
 
 class InvoiceUpdate(BaseModel):
@@ -187,7 +190,7 @@ async def create_invoice(
     pool = get_pool()
     async with pool.acquire() as conn:
         async with conn.transaction():
-            invoice_number = await _next_invoice_number(conn)
+            invoice_number = await _next_invoice_number(conn, body.numberPrefix)
             try:
                 row = await conn.fetchrow(
                     """

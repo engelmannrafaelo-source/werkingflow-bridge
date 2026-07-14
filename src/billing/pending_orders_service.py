@@ -29,6 +29,7 @@ from src.billing.billing_service import (
     _provision_plan_budget,
     log_billing_event,
 )
+from src.billing.invoice_numbering import next_invoice_number, prefix_for_app
 from src.db.client import get_pool
 
 
@@ -77,13 +78,19 @@ def _serialize_order(row: Any) -> Dict[str, Any]:
     }
 
 
-async def _next_invoice_number(conn: Any) -> str:
-    """Per-Jahr-Sequenz: INV-<year>-<5-digit-seq>. Identisch zu invoices/routes.py."""
-    year = datetime.now(timezone.utc).year
-    seq_name = f"invoice_seq_{year}"
-    await conn.execute(f"CREATE SEQUENCE IF NOT EXISTS {seq_name} START 1 INCREMENT 1")
-    n = await conn.fetchval(f"SELECT nextval('{seq_name}')")
-    return f"INV-{year}-{int(n):05d}"
+def _order_number_prefix(plan_id: str) -> str:
+    """Nummernkreis-Praefix fuer eine Pending-Order aus deren plan_id ableiten.
+
+    plan_id -> app_id (Plan-Katalog) -> Produkt-Praefix. Unbekannter Plan faellt
+    sauber auf den Fallback-Kreis zurueck (prefix_for_app), damit die Rechnung
+    nie an der Nummernvergabe scheitert.
+    """
+    from src.budget.plans import get_plan
+    try:
+        app_id = get_plan(plan_id).app_id
+    except Exception:
+        app_id = None
+    return prefix_for_app(app_id)
 
 
 async def _create_order_invoice(
@@ -168,7 +175,7 @@ async def _create_order_invoice(
 
     async with pool.acquire() as conn:
         async with conn.transaction():
-            invoice_number = await _next_invoice_number(conn)
+            invoice_number = await next_invoice_number(conn, _order_number_prefix(plan_id))
             row = await conn.fetchrow(
                 """
                 INSERT INTO invoices
