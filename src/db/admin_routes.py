@@ -1280,6 +1280,48 @@ async def set_self_checkout_config(
 
 
 # ---------------------------------------------------------------------------
+# Einmalumsätze / Verträge — getrennt vom MRR. Pipeline = angebahnt (z.B.
+# unterschriebener/anstehender EP-Vertrag), booked = Rechnung gestellt.
+# ---------------------------------------------------------------------------
+
+_CONTRACT_STATUS = {"pipeline", "booked"}
+
+
+class ContractItem(BaseModel):
+    id: str
+    name: str
+    amountEur: float          # netto
+    status: str               # 'pipeline' | 'booked'
+    note: Optional[str] = None
+
+
+class ContractsPayload(BaseModel):
+    contracts: List[ContractItem]
+
+
+@router.get("/v1/platform-config/contracts")
+async def get_contracts(_claims: AuthClaims = Depends(require_admin)) -> Dict[str, Any]:
+    from src.platform_config import get_config
+    return {"contracts": await get_config("contracts", [])}
+
+
+@router.put("/v1/platform-config/contracts")
+async def set_contracts(
+    body: ContractsPayload,
+    claims: AuthClaims = Depends(require_admin),
+) -> Dict[str, Any]:
+    from src.platform_config import set_config
+    for c in body.contracts:
+        if c.status not in _CONTRACT_STATUS:
+            raise HTTPException(status_code=400, detail=f"Invalid contract status: {c.status!r} (pipeline|booked)")
+        if c.amountEur < 0:
+            raise HTTPException(status_code=400, detail="amountEur must be >= 0")
+    data = [c.model_dump() for c in body.contracts]
+    await set_config("contracts", data, updated_by=claims.effective_user_id or "operator")
+    return {"contracts": data}
+
+
+# ---------------------------------------------------------------------------
 # Tenant billing address — self-service (user reads/writes own tenant only)
 # ---------------------------------------------------------------------------
 
