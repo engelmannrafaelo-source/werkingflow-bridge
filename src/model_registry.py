@@ -32,6 +32,19 @@ class ModelInfo:
 
 MODELS: List[ModelInfo] = [
     # Sonnet Familie
+    # Sonnet 5 (opt-in, NICHT default): potenzieller "stabiler 4.6-Nachfolger"
+    # (neuer Tokenizer, ~30% statt 4.6's ~4.8x Token-Inflation). Bewusst NICHT
+    # default, bis das Grosse-Prompt-Verhalten auf DIESER Bridge validiert ist —
+    # der 4.6-Failure (claude_code_sdk-Worker-Compaction liefert Summary statt
+    # Output, #46935) koennte sonst wiederkehren. Explizit per
+    # model="claude-sonnet-5" anforderbar; Default bleibt Sonnet 4.5.
+    ModelInfo(
+        id="claude-sonnet-5",
+        family="sonnet",
+        version="5",
+        release_date=date(2026, 6, 1),
+        description="Sonnet 5 - verfuegbar (opt-in), NICHT default (Grosse-Prompt-Verhalten auf dieser Bridge noch unvalidiert)"
+    ),
     # Sonnet 4.6 (2026-02-17 release) ist hier bewusst NICHT registriert:
     # dokumentierte Regression bei instruction-following + ~4.8x Token-Verbrauch
     # (siehe Anthropic GitHub #46935). Token-Inflation triggert claude_code_sdk
