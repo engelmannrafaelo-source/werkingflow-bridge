@@ -95,6 +95,8 @@ async def billing_overview(
     by_status: Dict[str, int] = {}
     by_app: Dict[str, int] = {}
     by_account_type: Dict[str, int] = {}
+    # Pro Tenant sammeln, um ECHTE Konten (distinct) statt Abos zu zaehlen.
+    tenant_info: Dict[str, Dict[str, Any]] = {}  # tenant_id -> {acct, monthly_paid, project}
     total_mrr_eur = 0.0
     active_subs = 0
     paying_subs = 0
@@ -121,7 +123,7 @@ async def billing_overview(
         sub_rows = await conn.fetch(
             f"""
             SELECT s.status, s.plan_id, s.seats, s.app_id,
-                   t.account_type::text AS account_type
+                   t.account_type::text AS account_type, t.id AS tenant_id
             FROM subscriptions s
             LEFT JOIN users u ON u.id = s.user_id
             LEFT JOIN tenants t ON t.id = u.tenant_id
@@ -151,9 +153,17 @@ async def billing_overview(
                 # MRR = echte monatlich wiederkehrende Umsaetze ZAHLENDER Kunden.
                 # Ausgeschlossen: test/internal (keine Kunden), Nicht-Monats-Plaene
                 # (z.B. energy-project = Einmalzahlung pro Projekt) und Gratis (trial=0).
-                if acct == "customer" and interval == "month" and price > 0:
+                monthly_paid = acct == "customer" and interval == "month" and price > 0
+                if monthly_paid:
                     total_mrr_eur += price * seats
                     paying_subs += 1
+                tid = r["tenant_id"]
+                if tid:
+                    info = tenant_info.setdefault(str(tid), {"acct": acct, "monthly_paid": False, "project": False})
+                    if monthly_paid:
+                        info["monthly_paid"] = True
+                    if interval == "project":
+                        info["project"] = True
             elif status == "cancelled":
                 cancelled_subs += 1
     else:
@@ -198,6 +208,27 @@ async def billing_overview(
             elif status == "cancelled":
                 cancelled_subs += 1
 
+    # Echte Konten (distinct Tenants mit aktivem Abo), sinnvoll gebucketed —
+    # NICHT Abos zaehlen (ein Kunde mit Report+Energy ist EIN Konto, nicht zwei).
+    #   abo     = customer mit monatlich-zahlendem Abo (report-standard)
+    #   projekt = customer mit Projekt-Kauf (energy-project, Einmalzahlung)
+    #   trial   = customer ohne bezahltes Abo (Test/Gratis)
+    #   test/internal = nach account_type
+    customer_buckets = {"abo": 0, "projekt": 0, "trial": 0, "test": 0, "internal": 0}
+    for info in tenant_info.values():
+        a = info["acct"]
+        if a == "test":
+            customer_buckets["test"] += 1
+        elif a == "internal":
+            customer_buckets["internal"] += 1
+        elif a == "customer":
+            if info["monthly_paid"]:
+                customer_buckets["abo"] += 1
+            elif info["project"]:
+                customer_buckets["projekt"] += 1
+            else:
+                customer_buckets["trial"] += 1
+
     # Top-up totals — app-overarching. Omit when filtering by app so the
     # dashboard doesn't misattribute cross-app wallet activity to one app.
     if app:
@@ -232,6 +263,7 @@ async def billing_overview(
         "byStatus": by_status,
         "byApp": by_app,
         "byAccountType": by_account_type,
+        "customerBuckets": customer_buckets,
     }
 
 
