@@ -221,6 +221,23 @@ async def persist_ai_call_activity(
     # can always pass it to _deduct_call_cost without a NameError.
     tenant_id: Optional[str] = None
 
+    # App-tier billing policy: a Bridge-owned (app, agent, env) policy row may
+    # book this call's COST to an internal account instead of the customer
+    # budget. Re-resolved here from the same (app_id, agent_id, app_env) that
+    # drove routing (not threaded through the request) so billing always follows
+    # the policy definition — a call-site can never forget to pass it. Attribution
+    # (actor/tenant/app/agent on the row below) is UNCHANGED; only the deduction
+    # target changes and a JSONB marker is added. Cached + fail-open: any error
+    # → no billing override (charge the customer as normal), never breaks tracking.
+    billing_account: Optional[str] = None
+    try:
+        from src.routing.app_tier_policy import resolve_app_tier_policy
+        _bill_policy = await resolve_app_tier_policy(app_id, agent_id, app_env)
+        if _bill_policy is not None:
+            billing_account = _bill_policy.billing_account
+    except Exception as _bill_e:  # noqa: BLE001 — billing tag must never break tracking
+        logger.debug("app_tier_policy billing lookup failed (fail-open): %s", _bill_e)
+
     # Diagnostic: surface apps that fail to send X-App-Env so the Platform
     # Admin "mode" filter (which depends on app_env) stops being blind.
     # Logged per call (not rate-limited): the noise IS the signal — every
@@ -432,6 +449,10 @@ async def persist_ai_call_activity(
                     "agent_id": agent_id,
                     "workflow_id": workflow_id,
                     "status": status,
+                    # App-tier policy booked this call's cost to an internal
+                    # account (customer budget NOT charged). Queryable via
+                    # provider_metadata->>'billing_account'.
+                    **({"billing_account": billing_account} if billing_account else {}),
                     **({"anonymous_reason": anon_reason} if anon_reason is not None else {}),
                     **(provider_meta or {}),
                 }),
@@ -444,5 +465,14 @@ async def persist_ai_call_activity(
     # running budget tally. Best-effort — _deduct_call_cost never raises.
     # Anonymous calls have no budget semantics (internal bucket, real_cost 0)
     # — deducting would only produce noisy "no budget row" warnings.
-    if user_id and app_id and call_cost_eur > 0 and user_id != ANONYMOUS_USER_ID:
+    # billing_account set → an app-tier policy books this call to an internal
+    # account; the customer's (project) budget must NOT be deducted. The usage
+    # row above already carries the billing_account marker + full attribution.
+    if billing_account:
+        logger.info(
+            "app_tier_policy: cost booked to internal account %r (app=%s agent=%s) "
+            "— customer deduction skipped (%.6f EUR)",
+            billing_account, app_id, agent_id, call_cost_eur,
+        )
+    elif user_id and app_id and call_cost_eur > 0 and user_id != ANONYMOUS_USER_ID:
         await _deduct_call_cost(user_id, app_id, call_cost_eur, workflow_id, tenant_id)

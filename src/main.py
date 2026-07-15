@@ -2220,6 +2220,37 @@ async def chat_completions(
                 }
             )
 
+        # APP-TIER ROUTING POLICY: the Bridge — not the app — decides that
+        # certain (app, agent, env) routes must run on a specific tier. Concrete
+        # case: werking-energy's large-input 'claims-generierung' overflows the
+        # Claude-Code worker context (SDK compaction truncates the input) and
+        # must use the direct Anthropic Messages API (claude-direct-notools).
+        # Runs ONLY when the user is not provider-pinned — a compliance pin
+        # (user_provider_override) always wins over cost routing. Gated by
+        # BRIDGE_APP_TIER_POLICY_ENABLED and fail-open: any error leaves routing
+        # unchanged (a cost optimisation must never 5xx a live call).
+        if user_pinned_provider is None:
+            try:
+                from src.routing.app_tier_policy import (
+                    resolve_app_tier_policy, apply_app_tier_policy,
+                )
+                _pol_attr = extract_attribution_context(request)
+                _app_policy = await resolve_app_tier_policy(
+                    _pol_attr.get("app_id"),
+                    _pol_attr.get("agent_id"),
+                    _pol_attr.get("app_env"),
+                )
+                if _app_policy is not None:
+                    _applied_tier = apply_app_tier_policy(request_body, _app_policy)
+                    if _applied_tier:
+                        logger.info(
+                            "🎯 App-tier policy: app=%s agent=%s → tier=%s (billing_account=%s)",
+                            _pol_attr.get("app_id"), _pol_attr.get("agent_id"),
+                            _applied_tier, _app_policy.billing_account,
+                        )
+            except Exception as _pol_e:  # noqa: BLE001 — cost routing never breaks a call
+                logger.warning("app_tier_policy application failed (fail-open): %s", _pol_e)
+
         # BACKEND ROUTING: Resolve backend configuration (Anthropic / Bedrock / OpenAI-Compatible)
         backend_config = None
         try:
