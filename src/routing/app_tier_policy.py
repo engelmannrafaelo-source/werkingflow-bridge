@@ -172,6 +172,20 @@ def apply_app_tier_policy(request_body, policy: AppTierPolicy) -> Optional[str]:
         )
         return None
 
+    # Fail-open if the target tier is not configured on THIS deployment (e.g. a
+    # dev/local bridge without the direct-notools API key). Forcing an unusable
+    # tier would 400 the call (provider_not_configured); a cost-routing policy
+    # must never do that — fall through to normal routing instead. Lets the
+    # master flag default on everywhere: a deployment that can't serve the tier
+    # simply ignores the policy.
+    if not _tier_is_usable(target):
+        logger.warning(
+            "app_tier_policy: target tier %r is not usable on this deployment "
+            "(API key missing) — leaving routing unchanged (fail-open).",
+            target,
+        )
+        return None
+
     request_body.provider_tier = target
     return target
 
@@ -189,4 +203,13 @@ def _tier_needs_no_tools(tier_id: str) -> bool:
         cfg = PROVIDERS.get(tier_id)
         return cfg is not None and cfg.supports_tools is False
     except Exception:  # noqa: BLE001 — unknown tier → assume tool-capable (no guard)
+        return False
+
+
+def _tier_is_usable(tier_id: str) -> bool:
+    """True if the tier is configured (required API key present) on this host."""
+    try:
+        from src.providers.registry import is_tier_usable
+        return is_tier_usable(tier_id)
+    except Exception:  # noqa: BLE001 — can't verify → don't force the tier (fail-open)
         return False
