@@ -416,6 +416,7 @@ _BEDROCK_PROFILE_BASE_IDS: Dict[str, str] = {
     "claude-opus-4-6":            "anthropic.claude-opus-4-6-v1",
     "claude-opus-4-7":            "anthropic.claude-opus-4-7",
     "claude-opus-4-8":            "anthropic.claude-opus-4-8",
+    "claude-sonnet-5":            "anthropic.claude-sonnet-5",
 }
 
 

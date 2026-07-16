@@ -24,10 +24,11 @@ import re
 #                  cache pricing introduced (write 1.25x in, read 0.1x in).
 # v3 (2026-07-05): opus-4-5 + opus-4-1 ergaenzt (4-5 fehlte trotz
 #                  Registry-Eintrag -> unknown-model warning; 4-1 = 15/75-Tier).
-PRICING_VERSION = "v3"
+PRICING_VERSION = "v4"
 
 # USD per 1M tokens. {model_id: {"in": input_price, "out": output_price}}
 MODEL_PRICING: dict[str, dict[str, float]] = {
+    "claude-sonnet-5":            {"in": 3.00,  "out": 15.00},  # Liste; Intro $2/$10 bis 2026-08-31 ggf. via MODEL_PRICING_JSON
     "claude-sonnet-4-5":          {"in": 3.00,  "out": 15.00},
     "claude-sonnet-4-5-20250929": {"in": 3.00,  "out": 15.00},
     "claude-sonnet-4-6":          {"in": 3.00,  "out": 15.00},
