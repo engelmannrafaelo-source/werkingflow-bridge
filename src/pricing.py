@@ -90,6 +90,27 @@ def normalize_model_id(model: str) -> str:
     return model
 
 
+def price_entry(model: str | None) -> dict[str, float] | None:
+    """Pricing row for a model — mirrors cost_eur's lookup (normalize provider
+    IDs + strip date suffix). None means the model is NOT in the price table."""
+    if not model:
+        return None
+    pricing = load_pricing()
+    model_id = normalize_model_id(model)
+    p = pricing.get(model_id)
+    if p is None:
+        # Date-suffixed IDs (claude-opus-4-7-20260115) price as their base model.
+        p = pricing.get(re.sub(r"-\d{8}$", "", model_id))
+    return p
+
+
+def is_priced(model: str | None) -> bool:
+    """True iff `model` has a billable price. Admission gates on this: a model
+    with no price would bill 0.0 (silent free serving), so it must be BLOCKED
+    fail-loud, not served — kein Silent-Fail, kein Gratis-Modell."""
+    return price_entry(model) is not None
+
+
 def cost_eur(
     model: str | None,
     input_tokens: int,
@@ -107,14 +128,10 @@ def cost_eur(
     """
     if not model:
         return 0.0
-    pricing = load_pricing()
-    model_id = normalize_model_id(model)
-    p = pricing.get(model_id)
+    p = price_entry(model)
     if p is None:
-        # Date-suffixed IDs (claude-opus-4-7-20260115) price as their base
-        # model — keeps the table free of every snapshot variant.
-        p = pricing.get(re.sub(r"-\d{8}$", "", model_id))
-    if p is None:
+        # Unreachable in normal flow: the is_priced() admission gate blocks
+        # unpriced models before the call. Defense-in-depth backstop only.
         return 0.0
     usd = (
         (input_tokens or 0) / 1_000_000.0 * p["in"]

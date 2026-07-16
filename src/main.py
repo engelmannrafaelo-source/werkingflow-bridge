@@ -2198,6 +2198,23 @@ async def chat_completions(
             logger.info(f"Model resolved: '{original_model}' -> '{resolved_model}'")
             request_body.model = resolved_model
 
+        # PRICING GATE — block models with no billable price (kein Silent-€0).
+        # A model missing from MODEL_PRICING would bill 0.0 → fail loud, not serve.
+        from src.pricing import is_priced
+        if not is_priced(resolved_model):
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "error": {
+                        "message": f"Model '{resolved_model}' has no price in the billing table and is blocked (no silent zero-cost serving).",
+                        "type": "invalid_request_error",
+                        "param": "model",
+                        "code": "model_not_priced",
+                        "hint": "Add the model to src/pricing.py MODEL_PRICING, or request a priced model."
+                    }
+                }
+            )
+
         # PER-USER PROVIDER OVERRIDE: users.provider_config pins a user's
         # traffic to a backend (operator-set, e.g. Bedrock for DSGVO). Must run
         # BEFORE backend resolution; a pin failure is 503, never a fallback.
@@ -4254,6 +4271,16 @@ async def research(
         logger.info(f"Research model resolved: '{original_model}' -> '{resolved_model}'")
         request_body.model = resolved_model
 
+    # PRICING GATE — block models with no billable price (kein Silent-€0).
+    from src.pricing import is_priced
+    if not is_priced(resolved_model):
+        return ResearchResponse(
+            status="error",
+            query=request_body.query,
+            model=resolved_model,
+            error=f"Model '{resolved_model}' has no price in the billing table and is blocked (no silent zero-cost serving). Add it to src/pricing.py MODEL_PRICING or use a priced model."
+        )
+
     # PER-USER PROVIDER OVERRIDE: same enforcement as chat completions —
     # a Bedrock-pinned user's research runs through the SDK-Bedrock env path.
     from src.routing.user_provider_override import (
@@ -4738,6 +4765,16 @@ async def doc_agent(
     if resolved_model != original_model:
         logger.info(f"Doc-agent model resolved: '{original_model}' -> '{resolved_model}'")
         request_body.model = resolved_model
+
+    # PRICING GATE — block models with no billable price (kein Silent-€0).
+    from src.pricing import is_priced
+    if not is_priced(resolved_model):
+        return DocAgentResponse(
+            status="error",
+            question=request_body.question,
+            model=resolved_model or "",
+            error=f"Model '{resolved_model}' has no price in the billing table and is blocked (no silent zero-cost serving). Add it to src/pricing.py MODEL_PRICING or use a priced model."
+        )
 
     # Per-user provider pin: doc-agent has no Bedrock env path yet — a pinned
     # user gets an EXPLICIT error instead of silently running on Anthropic
