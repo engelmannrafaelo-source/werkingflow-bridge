@@ -39,8 +39,8 @@ class ProviderConfig:
     base_url: Optional[str] = None      # Only for OPENAI_COMPATIBLE
     api_key_env: Optional[str] = None   # Env var name for API key
     auth_type: AuthType = AuthType.API_KEY  # API key or OAuth
-    pricing_input: float = 3.00         # USD per 1M input tokens
-    pricing_output: float = 15.00       # USD per 1M output tokens
+    # NB: no per-tier price here — list-price for display comes from pricing.py
+    # (single source of truth) via _tier_pricing(); billing uses pricing.py too.
     dsgvo_compliant: bool = False       # EU data residency guaranteed
     supports_tools: bool = True         # False = fallback chains skip this tier
                                         # for any request with enable_tools=true
@@ -58,6 +58,18 @@ class ProviderConfig:
 # Change the default in model_registry.py, everything here follows on rebuild.
 _DEFAULT_SONNET = get_default_model("sonnet").id
 
+
+def _tier_pricing(model: str) -> dict:
+    """Tier list-price for display, derived from the pricing SSoT (pricing.py) —
+    no price numbers duplicated here. Strips OpenRouter's 'anthropic/' routing
+    prefix; unpriced tiers (Gemini free tier) show 0.0. Billing always uses
+    pricing.py keyed by the actually-served model; this is display metadata."""
+    from src.pricing import price_entry
+    lookup = model.split("/", 1)[-1] if model.startswith("anthropic/") else model
+    p = price_entry(lookup)
+    return {"input_per_1m": p["in"] if p else 0.0, "output_per_1m": p["out"] if p else 0.0}
+
+
 PROVIDERS: dict[str, ProviderConfig] = {
     # --- Default: Claude via Anthropic API ---
     "claude-premium": ProviderConfig(
@@ -65,8 +77,6 @@ PROVIDERS: dict[str, ProviderConfig] = {
         name="Claude Premium (Anthropic)",
         backend=BackendType.ANTHROPIC,
         model=_DEFAULT_SONNET,
-        pricing_input=3.00,
-        pricing_output=15.00,
         dsgvo_compliant=False,
         description="Schnellster und intelligentester Anbieter. Daten werden in den USA verarbeitet.",
     ),
@@ -88,8 +98,6 @@ PROVIDERS: dict[str, ProviderConfig] = {
         backend=BackendType.ANTHROPIC_DIRECT,
         model=_DEFAULT_SONNET,
         api_key_env="ANTHROPIC_VISION_API_KEY",
-        pricing_input=3.00,
-        pricing_output=15.00,
         dsgvo_compliant=False,
         supports_tools=False,
         description=(
@@ -105,8 +113,6 @@ PROVIDERS: dict[str, ProviderConfig] = {
         name="Claude DSGVO (AWS Frankfurt)",
         backend=BackendType.BEDROCK,
         model=_DEFAULT_SONNET,
-        pricing_input=3.00,
-        pricing_output=15.00,
         dsgvo_compliant=True,
         description="Claude-Qualitaet mit EU-Datenresidenz (AWS Frankfurt).",
     ),
@@ -120,8 +126,6 @@ PROVIDERS: dict[str, ProviderConfig] = {
         name="Gemini Flash (CLI)",
         backend=BackendType.GEMINI_CLI,
         model="gemini-2.5-flash",
-        pricing_input=0.00,
-        pricing_output=0.00,
         description="Gemini 2.5 Flash via CLI subprocess. OAuth ueber Google Account.",
     ),
 
@@ -137,8 +141,6 @@ PROVIDERS: dict[str, ProviderConfig] = {
         model=f"anthropic/{_DEFAULT_SONNET}",
         base_url="https://openrouter.ai/api/v1",
         api_key_env="OPENROUTER_API_KEY",
-        pricing_input=3.00,
-        pricing_output=15.00,
         dsgvo_compliant=False,
         description="Claude via OpenRouter Gateway. Automatisches Failover bei Anthropic-Ausfall.",
     ),
@@ -155,8 +157,6 @@ PROVIDERS: dict[str, ProviderConfig] = {
         model="claude-sonnet-4-5-20250929",
         base_url=(os.getenv("AI_BRIDGE_URL_PROD_FALLBACK", "") + "/v1") if os.getenv("AI_BRIDGE_URL_PROD_FALLBACK") else None,
         api_key_env="AI_BRIDGE_API_KEY",
-        pricing_input=3.00,
-        pricing_output=15.00,
         dsgvo_compliant=False,
         description="Notfall-Fallback auf Production Bridge mit Sahori-Account. Nur wenn alle Dev-Tokens erschoepft.",
     ),
@@ -226,10 +226,7 @@ def list_available_providers() -> list[dict]:
             "model": config.model,
             "auth_type": config.auth_type.value,
             "dsgvo_compliant": config.dsgvo_compliant,
-            "pricing": {
-                "input_per_1m": config.pricing_input,
-                "output_per_1m": config.pricing_output,
-            },
+            "pricing": _tier_pricing(config.model),
             "available": has_key,
             "description": config.description,
         }
