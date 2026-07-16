@@ -5,7 +5,7 @@ from datetime import datetime
 import uuid
 
 from config.logging_config import get_logger
-from model_registry import get_default_model
+from src.model_registry import get_default_model
 
 logger = get_logger(__name__)
 
