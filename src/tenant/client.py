@@ -33,7 +33,7 @@ class TenantSettings:
     tenant_id: str
     tenant_slug: str
     privacy_mode: str = "full"  # none | basic | full
-    allowed_models: List[str] = field(default_factory=lambda: ["claude-sonnet-4-5-20250929", "claude-haiku-4-5-20251001"])
+    allowed_models: List[str] = field(default_factory=list)  # [] = keine Restriktion (Modell-Quelle ist model_registry, keine stale IDs hier)
     rate_limit_rpm: int = 60
     budget_limit_eur: float = 1000.0
     budget_alert_threshold: float = 0.8
@@ -54,7 +54,7 @@ class TenantSettings:
             tenant_slug=data.get("tenant_slug", ""),
             tenant_name=data.get("tenant_name", ""),
             privacy_mode=data.get("privacy_mode", "full"),
-            allowed_models=data.get("allowed_models", ["claude-sonnet-4-5-20250929"]),
+            allowed_models=data.get("allowed_models", []),
             rate_limit_rpm=data.get("rate_limit_rpm", 60),
             budget_limit_eur=float(data.get("budget_limit_eur", 1000.0) or 1000.0),
             budget_alert_threshold=float(data.get("budget_alert_threshold", 0.8) or 0.8),

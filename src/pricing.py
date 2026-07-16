@@ -137,6 +137,28 @@ def validate_billing_integrity() -> None:
         )
 
 
+def cost_usd(
+    model: str,
+    input_tokens: int,
+    output_tokens: int,
+    cache_read_tokens: int = 0,
+    cache_creation_tokens: int = 0,
+) -> float:
+    """USD cost of one LLM call — the pricing SSoT (uncached input + cache
+    write/read + output, per Anthropic/Bedrock usage semantics). Raises KeyError
+    if the model has no price: fail loud, NO silent fallback. Callers that need a
+    lenient aggregate (metrics) use cost_eur, which swallows this into 0.0."""
+    p = price_entry(model)
+    if p is None:
+        raise KeyError(f"No price for model {model!r} in MODEL_PRICING")
+    return (
+        (input_tokens or 0) / 1_000_000.0 * p["in"]
+        + (cache_creation_tokens or 0) / 1_000_000.0 * p["in"] * CACHE_WRITE_MULT
+        + (cache_read_tokens or 0) / 1_000_000.0 * p["in"] * CACHE_READ_MULT
+        + (output_tokens or 0) / 1_000_000.0 * p["out"]
+    )
+
+
 def cost_eur(
     model: str | None,
     input_tokens: int,
@@ -145,24 +167,16 @@ def cost_eur(
     cache_creation_tokens: int = 0,
 ) -> float:
     """
-    EUR cost of one LLM call. Unknown / missing model → 0.0; the caller
-    decides how to surface that (metrics logs it on the aggregate level,
-    the deduction treats 0.0 as "nothing to deduct").
-
-    input_tokens is the UNCACHED input (Anthropic/Bedrock usage semantics);
-    cache writes and reads are billed at their own rates on top.
+    EUR cost of one LLM call (cost_usd × fixed EUR rate). Unknown / missing
+    model → 0.0; the caller decides how to surface that (metrics logs it on the
+    aggregate level, the deduction treats 0.0 as "nothing to deduct").
     """
     if not model:
         return 0.0
-    p = price_entry(model)
-    if p is None:
-        # Unreachable in normal flow: the is_priced() admission gate blocks
-        # unpriced models before the call. Defense-in-depth backstop only.
+    try:
+        usd = cost_usd(model, input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens)
+    except KeyError:
+        # Unreachable in normal flow: the is_priced() admission gate + boot
+        # invariant block unpriced models. Defense-in-depth backstop only.
         return 0.0
-    usd = (
-        (input_tokens or 0) / 1_000_000.0 * p["in"]
-        + (cache_creation_tokens or 0) / 1_000_000.0 * p["in"] * CACHE_WRITE_MULT
-        + (cache_read_tokens or 0) / 1_000_000.0 * p["in"] * CACHE_READ_MULT
-        + (output_tokens or 0) / 1_000_000.0 * p["out"]
-    )
     return round(usd * usd_to_eur_rate(), 6)

@@ -17,29 +17,9 @@ from dataclasses import dataclass
 from datetime import datetime
 
 from .client import get_tenant_client, TenantSettings
+from src.pricing import cost_usd  # SSoT — no separate price table here
 
 logger = logging.getLogger(__name__)
-
-
-# Default pricing (USD per 1M tokens) - Anthropic pricing as of Jan 2026
-# Source: https://www.anthropic.com/pricing
-DEFAULT_PRICING_USD = {
-    # Sonnet family
-    "claude-sonnet-4-5-20250929": {"input": 3.00, "output": 15.00},
-    "claude-sonnet-4-20250514": {"input": 3.00, "output": 15.00},
-    "claude-3-7-sonnet-20250219": {"input": 3.00, "output": 15.00},
-    "claude-3-5-sonnet-20241022": {"input": 3.00, "output": 15.00},
-    # Haiku family
-    "claude-haiku-4-5-20251001": {"input": 0.80, "output": 4.00},
-    "claude-3-5-haiku-20241022": {"input": 0.80, "output": 4.00},
-    # Opus family
-    "claude-opus-4-20250514": {"input": 15.00, "output": 75.00},
-    "claude-opus-4-1-20250805": {"input": 15.00, "output": 75.00},
-    # Bedrock model IDs (same pricing)
-    "eu.anthropic.claude-sonnet-4-5-20250929-v1:0": {"input": 3.00, "output": 15.00},
-    "eu.anthropic.claude-haiku-4-5-20251001-v1:0": {"input": 0.80, "output": 4.00},
-    "us.anthropic.claude-sonnet-4-5-20250929-v1:0": {"input": 3.00, "output": 15.00},
-}
 
 # Default markup factor (1.0 = no markup, 1.5 = 50% margin)
 # This is applied on top of the billing_margin from TenantSettings
@@ -117,30 +97,13 @@ class UsageTracker:
 
         Returns:
             Cost in USD (raw, without markup - markup applied in Supabase trigger)
+
+        Raises:
+            KeyError: if the model has no price in the SSoT (src/pricing.py).
+            Fail loud — no silent Sonnet fallback (the old behaviour billed any
+            unpriced model as Sonnet, hiding gaps like the sonnet-5 launch).
         """
-        # Get pricing for model
-        pricing = DEFAULT_PRICING_USD.get(model)
-
-        if not pricing:
-            # Try to find partial match (e.g., "sonnet" in model name)
-            model_lower = model.lower()
-            if "sonnet" in model_lower:
-                pricing = DEFAULT_PRICING_USD["claude-sonnet-4-5-20250929"]
-            elif "haiku" in model_lower:
-                pricing = DEFAULT_PRICING_USD["claude-haiku-4-5-20251001"]
-            elif "opus" in model_lower:
-                pricing = DEFAULT_PRICING_USD["claude-opus-4-20250514"]
-            else:
-                # Unknown model - use Sonnet pricing as fallback
-                logger.warning(f"Unknown model pricing: {model}, using Sonnet fallback")
-                pricing = DEFAULT_PRICING_USD["claude-sonnet-4-5-20250929"]
-
-        # Calculate raw cost (pricing is per 1M tokens)
-        input_cost = (input_tokens / 1_000_000) * pricing["input"]
-        output_cost = (output_tokens / 1_000_000) * pricing["output"]
-        raw_cost = input_cost + output_cost
-
-        return round(raw_cost, 6)
+        return round(cost_usd(model, input_tokens, output_tokens), 6)
 
     async def track(self, record: UsageRecord) -> None:
         """
