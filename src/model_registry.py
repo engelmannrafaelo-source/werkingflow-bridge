@@ -32,18 +32,21 @@ class ModelInfo:
 
 MODELS: List[ModelInfo] = [
     # Sonnet Familie
-    # Sonnet 5 (opt-in, NICHT default): potenzieller "stabiler 4.6-Nachfolger"
-    # (neuer Tokenizer, ~30% statt 4.6's ~4.8x Token-Inflation). Bewusst NICHT
-    # default, bis das Grosse-Prompt-Verhalten auf DIESER Bridge validiert ist —
-    # der 4.6-Failure (claude_code_sdk-Worker-Compaction liefert Summary statt
-    # Output, #46935) koennte sonst wiederkehren. Explizit per
-    # model="claude-sonnet-5" anforderbar; Default bleibt Sonnet 4.5.
+    # Sonnet 5 (Sonnet-Default seit 2026-07-16, bewusste Entscheidung Rafael):
+    # neuer Tokenizer (~30% statt 4.6's ~4.8x Token-Inflation) — der stabile
+    # 4.6-Nachfolger. Umgestellt weg vom konservativen 4.5-Default, um das
+    # Grosse-Prompt-Verhalten auf DIESER Bridge im echten Betrieb zu validieren.
+    # Beobachten: der 4.6-Failure (claude_code_sdk-Worker-Compaction liefert
+    # Summary statt Output, #46935) darf NICHT wiederkehren — bei Reproduktion
+    # is_default zurueck auf Sonnet 4.5 (unten). 4.5 bleibt per model="..."
+    # explizit anforderbar (Fallback).
     ModelInfo(
         id="claude-sonnet-5",
         family="sonnet",
         version="5",
         release_date=date(2026, 6, 1),
-        description="Sonnet 5 - verfuegbar (opt-in), NICHT default (Grosse-Prompt-Verhalten auf dieser Bridge noch unvalidiert)"
+        description="Sonnet 5 - Default (neuer Tokenizer, stabiler 4.6-Nachfolger)",
+        is_default=True
     ),
     # Sonnet 4.6 (2026-02-17 release) ist hier bewusst NICHT registriert:
     # dokumentierte Regression bei instruction-following + ~4.8x Token-Verbrauch
@@ -56,8 +59,7 @@ MODELS: List[ModelInfo] = [
         family="sonnet",
         version="4.5",
         release_date=date(2025, 9, 29),
-        description="Sonnet 4.5 - stabiler Default (4.6 hat dokumentierte Regression)",
-        is_default=True
+        description="Sonnet 4.5 - stabiler Fallback (frueherer Default, per model=... anforderbar)"
     ),
     # 4.6 ist verfuegbar, aber bewusst NICHT default (Regression s.o.) —
     # explizite Anforderung per model="claude-sonnet-4-6" ist moeglich.
@@ -108,20 +110,23 @@ MODELS: List[ModelInfo] = [
     ),
 
     # Opus Familie
+    # Opus 4.8 = Opus-Default seit 2026-07-16 (bewusste Entscheidung Rafael):
+    # aktuellstes Opus, gleiche Request-Surface wie 4.7 (kein Breaking-Change).
+    # 4.7 bleibt per model="claude-opus-4-7" explizit anforderbar (Fallback).
     ModelInfo(
         id="claude-opus-4-8",
         family="opus",
         version="4.8",
         release_date=date(2026, 6, 1),
-        description="Opus 4.8 - Aktuellstes Opus (nicht default; Wechsel = bewusste Entscheidung)"
+        description="Opus 4.8 - Default, aktuellstes Opus, 1M context",
+        is_default=True
     ),
     ModelInfo(
         id="claude-opus-4-7",
         family="opus",
         version="4.7",
         release_date=date(2026, 4, 14),
-        description="Opus 4.7 - Opus-Default, 1M context",
-        is_default=True
+        description="Opus 4.7 - stabiler Fallback (frueherer Default, 1M context)"
     ),
     ModelInfo(
         id="claude-opus-4-6",

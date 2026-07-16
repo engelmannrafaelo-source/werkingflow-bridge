@@ -5,6 +5,7 @@ from datetime import datetime
 import uuid
 
 from config.logging_config import get_logger
+from model_registry import get_default_model
 
 logger = get_logger(__name__)
 
@@ -306,8 +307,8 @@ class ResearchRequest(BaseModel):
 
     # Model Configuration
     model: Optional[str] = Field(
-        default="claude-sonnet-4-5-20250929",
-        description="Claude model to use for research (default: latest stable Sonnet)"
+        default_factory=lambda: get_default_model("sonnet").id,
+        description="Claude model to use for research (default: Sonnet-Default aus model_registry SSoT)"
     )
 
     # Output Configuration
@@ -458,8 +459,8 @@ class DocAgentRequest(BaseModel):
     question: str = Field(..., description="User question to answer from the documents")
     files: List[DocAgentFile] = Field(..., description="Documents seeded into the agent workdir")
     model: Optional[str] = Field(
-        default="claude-sonnet-4-5-20250929",
-        description="Claude model to use (default: latest stable Sonnet)"
+        default_factory=lambda: get_default_model("sonnet").id,
+        description="Claude model to use (default: Sonnet-Default aus model_registry SSoT)"
     )
     max_turns: Optional[int] = Field(
         default=25,
