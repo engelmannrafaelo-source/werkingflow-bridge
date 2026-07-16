@@ -26,11 +26,12 @@ import logging
 from typing import Dict, Tuple
 
 from src.vision_provider import get_vision_provider
+from src.model_registry import get_default_model
 
 logger = logging.getLogger(__name__)
 
 # Current Claude vision model (matches VisionProvider's documented default).
-DEFAULT_VISION_MODEL = "claude-sonnet-4-5-20250929"
+DEFAULT_VISION_MODEL = get_default_model("sonnet").id
 
 _SYSTEM_PROMPT = (
     "Du beschreibst Bilder aus Fachdokumenten (Diagramme, Schemata, Grafiken, "

@@ -461,7 +461,14 @@ except Exception as _db_imp_err:
 async def lifespan(app: FastAPI):
     """Verify Claude Code authentication and CLI on startup."""
     logger.info("Verifying Claude Code authentication and CLI...")
-    
+
+    # FAIL-FAST billing invariant: refuse to boot if any servable model has no
+    # price (would bill EUR 0.0 silently). Catches an unpriced default/model at
+    # deploy time instead of at first request. Defensive coding, fail fast.
+    from src.pricing import validate_billing_integrity
+    validate_billing_integrity()
+    logger.info("✅ Billing integrity OK — every servable model is priced")
+
     # Validate authentication first
     auth_valid, auth_info = validate_claude_code_auth()
     

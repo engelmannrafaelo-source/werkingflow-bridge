@@ -18,6 +18,7 @@ from typing import List, Dict, Any, Optional, Tuple
 from dataclasses import dataclass
 from fastapi import HTTPException
 from config.logging_config import get_logger
+from src.model_registry import get_default_model
 
 logger = get_logger(__name__)
 
@@ -282,7 +283,7 @@ class VisionProvider:
     async def analyze(
         self,
         messages: List[Dict[str, Any]],
-        model: str = "claude-sonnet-4-5-20250929",
+        model: str = get_default_model("sonnet").id,
         max_tokens: int = 4096,
         temperature: float = 0.7,
         system_prompt: Optional[str] = None,

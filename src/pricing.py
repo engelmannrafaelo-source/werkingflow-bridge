@@ -111,6 +111,32 @@ def is_priced(model: str | None) -> bool:
     return price_entry(model) is not None
 
 
+def validate_billing_integrity() -> None:
+    """Fail-fast startup invariant (defensive coding): every Claude model the
+    Bridge can resolve-and-serve MUST have a price in MODEL_PRICING — otherwise
+    it would bill 0.0 (silent free serving). Called at worker startup: if any
+    servable model is unpriced the worker refuses to boot, so an unpriced
+    default (e.g. a freshly-flipped is_default) can never reach production."""
+    from src.model_registry import resolve_model, get_all_model_ids
+    unpriced: list[str] = []
+    # Every fuzzy alias + every registered model must resolve to a priced model.
+    candidates = set(get_all_model_ids()) | {"sonnet", "opus", "haiku"}
+    for c in candidates:
+        try:
+            resolved, _ = resolve_model(c)
+        except Exception:
+            resolved = None  # genuinely unknown -> rejected at request time
+        if resolved and not is_priced(resolved):
+            unpriced.append(f"{c} -> {resolved}")
+    if unpriced:
+        raise RuntimeError(
+            "BILLING INTEGRITY VIOLATION — servable model(s) with no price in "
+            "MODEL_PRICING (would bill EUR 0.0, kein Silent-Fail erlaubt): "
+            + "; ".join(sorted(set(unpriced)))
+            + ". Add the price to src/pricing.py MODEL_PRICING before deploying."
+        )
+
+
 def cost_eur(
     model: str | None,
     input_tokens: int,

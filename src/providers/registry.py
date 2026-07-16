@@ -18,6 +18,7 @@ from typing import Optional
 from dataclasses import dataclass
 
 from src.models import BackendType
+from src.model_registry import get_default_model
 
 logger = logging.getLogger(__name__)
 
@@ -51,13 +52,19 @@ class ProviderConfig:
 # PROVIDER REGISTRY
 # =============================================================================
 
+# Central default model — SINGLE SOURCE OF TRUTH is model_registry.is_default.
+# Claude tiers derive from it so the served model is backend-agnostic: Anthropic,
+# Bedrock (claude-dsgvo) and OpenRouter all follow the ONE registry default.
+# Change the default in model_registry.py, everything here follows on rebuild.
+_DEFAULT_SONNET = get_default_model("sonnet").id
+
 PROVIDERS: dict[str, ProviderConfig] = {
     # --- Default: Claude via Anthropic API ---
     "claude-premium": ProviderConfig(
         tier_id="claude-premium",
         name="Claude Premium (Anthropic)",
         backend=BackendType.ANTHROPIC,
-        model="claude-sonnet-4-5-20250929",
+        model=_DEFAULT_SONNET,
         pricing_input=3.00,
         pricing_output=15.00,
         dsgvo_compliant=False,
@@ -79,7 +86,7 @@ PROVIDERS: dict[str, ProviderConfig] = {
         tier_id="claude-direct-notools",
         name="Claude Direct (Anthropic Messages API, no tools)",
         backend=BackendType.ANTHROPIC_DIRECT,
-        model="claude-sonnet-4-5-20250929",
+        model=_DEFAULT_SONNET,
         api_key_env="ANTHROPIC_VISION_API_KEY",
         pricing_input=3.00,
         pricing_output=15.00,
@@ -97,7 +104,7 @@ PROVIDERS: dict[str, ProviderConfig] = {
         tier_id="claude-dsgvo",
         name="Claude DSGVO (AWS Frankfurt)",
         backend=BackendType.BEDROCK,
-        model="claude-sonnet-4-5-20250929",
+        model=_DEFAULT_SONNET,
         pricing_input=3.00,
         pricing_output=15.00,
         dsgvo_compliant=True,
@@ -127,7 +134,7 @@ PROVIDERS: dict[str, ProviderConfig] = {
         tier_id="openrouter-claude",
         name="OpenRouter Claude Sonnet",
         backend=BackendType.OPENAI_COMPATIBLE,
-        model="anthropic/claude-sonnet-4-5-20250929",
+        model=f"anthropic/{_DEFAULT_SONNET}",
         base_url="https://openrouter.ai/api/v1",
         api_key_env="OPENROUTER_API_KEY",
         pricing_input=3.00,
