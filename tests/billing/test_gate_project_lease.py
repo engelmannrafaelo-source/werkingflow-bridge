@@ -46,8 +46,25 @@ async def test_project_plan_with_exhausted_project_budget_still_blocks():
     with patch("src.budget.gate.find_plan_for_app", return_value=_PROJECT_PLAN), \
          patch("src.budget.gate.resolve_user_id", AsyncMock(return_value=_UID)), \
          patch("src.billing.project_budgets_service.evaluate", AsyncMock(
-             return_value={"exists": True, "allowed": False, "remainingEur": 0.0})):
+             return_value={"exists": True, "allowed": False, "remainingEur": 0.0,
+                           "topUpRemainingEur": 0.0})):
         with pytest.raises(HTTPException) as ei:
             await enforce_budget(str(_UID), "werking-energy", 0.01, project_id="Proj_1")
         assert ei.value.status_code == 402
         assert ei.value.detail["reason"] == "project_budget_exhausted"
+        assert ei.value.detail["totalRemainingEur"] == 0.0
+
+
+@pytest.mark.asyncio
+async def test_project_plan_lets_call_through_when_topup_covers_exhausted_project():
+    """Regression for the KFR bug: project pot exhausted but the user's TopUp
+    balance covers the call — project_budgets_service.evaluate() already
+    folds the TopUp fallback into `allowed`; the gate must trust it and NOT
+    raise 402 while TopUp money sits unused."""
+    with patch("src.budget.gate.find_plan_for_app", return_value=_PROJECT_PLAN), \
+         patch("src.budget.gate.resolve_user_id", AsyncMock(return_value=_UID)), \
+         patch("src.billing.project_budgets_service.evaluate", AsyncMock(
+             return_value={"exists": True, "allowed": True, "remainingEur": 0.0,
+                           "topUpRemainingEur": 15500.0})):
+        # Must not raise — TopUp covers the exhausted project budget.
+        await enforce_budget(str(_UID), "werking-energy", 5.0, project_id="Proj_1")

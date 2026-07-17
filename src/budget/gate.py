@@ -113,9 +113,16 @@ async def enforce_budget(
         if pr.get("exists"):
             if pr.get("allowed"):
                 return
+            # `allowed=False` here means BOTH pots are exhausted — evaluate()
+            # already fell back to the user's TopUp balance before reporting
+            # this (see project_budgets_service.evaluate). Not a bypassable
+            # per-project-only block anymore.
+            total_remaining = pr.get("remainingEur", 0.0) + pr.get("topUpRemainingEur", 0.0)
             logger.info(
-                "budget gate: BLOCKED (per-project) user=%s app=%s plan=%s project=%s remaining=%.4f",
-                user_id, app_id, plan.id, project_id, pr.get("remainingEur", 0.0),
+                "budget gate: BLOCKED (per-project) user=%s app=%s plan=%s project=%s "
+                "projectRemaining=%.4f topUpRemaining=%.4f",
+                user_id, app_id, plan.id, project_id,
+                pr.get("remainingEur", 0.0), pr.get("topUpRemainingEur", 0.0),
             )
             raise HTTPException(
                 status_code=402,
@@ -125,8 +132,8 @@ async def enforce_budget(
                     "appId": app_id,
                     "planId": plan.id,
                     "projectId": project_id,
-                    "totalRemainingEur": pr.get("remainingEur", 0.0),
-                    "message": "Projekt-Budget aufgebraucht. Bitte ein neues Projekt-Paket buchen.",
+                    "totalRemainingEur": total_remaining,
+                    "message": "Projekt- und TopUp-Guthaben aufgebraucht. Bitte ein neues Projekt-Paket buchen oder Guthaben aufladen.",
                 },
             )
         # Not allocated yet (the project's first call). The entitling slot was

@@ -101,12 +101,15 @@ def next_topup_expiry(lots: List[TopUpLot], now: datetime) -> "str | None":
     return min(active, key=lambda lot: _parse_dt(lot.expires_at)).expires_at
 
 
-def _consume_topup_fifo(
+def consume_topup_fifo(
     lots: List[TopUpLot], amount_eur: float, now: datetime
 ) -> Tuple[List[TopUpLot], float]:
     """FIFO-Abbuchung: ältester Kauf zuerst, abgelaufene Lots übersprungen.
 
     Rein — mutiert nichts, gibt (neue Lots, tatsächlich abgebuchter Betrag) zurück.
+    Public: geteilt zwischen dem Monatspfad (deduct_budget unten) und dem
+    Projekt-Pfad (project_budgets_service.deduct) — dieselbe TopUp-FIFO-Logik
+    für beide, kein Zweit-Implementierung.
     """
     ordered = sorted(
         lots,
@@ -202,7 +205,7 @@ def deduct_budget(
     from_monthly = min(actual_cost_eur, monthly_remaining)
     remainder = actual_cost_eur - from_monthly
 
-    new_lots, from_top_up = _consume_topup_fifo(budget.top_up_lots, remainder, now)
+    new_lots, from_top_up = consume_topup_fifo(budget.top_up_lots, remainder, now)
 
     if from_monthly + from_top_up < actual_cost_eur:
         raise ValueError(

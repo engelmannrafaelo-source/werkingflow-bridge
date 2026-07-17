@@ -25,7 +25,7 @@ from src.budget.calculator import (
     topup_balance_eur,
     next_topup_expiry,
     sweep_expired_topup_lots,
-    _consume_topup_fifo,
+    consume_topup_fifo,
 )
 
 NOW = datetime(2026, 7, 5, 12, 0, 0, tzinfo=timezone.utc)
@@ -88,7 +88,7 @@ class TestFifo:
             _lot("new", 50.0, purchased_days_ago=1, expires_in_days=300),
             _lot("old", 50.0, purchased_days_ago=100, expires_in_days=300),
         ]
-        new_lots, consumed = _consume_topup_fifo(lots, 30.0, NOW)
+        new_lots, consumed = consume_topup_fifo(lots, 30.0, NOW)
         assert consumed == pytest.approx(30.0)
         by_id = {lot.id: lot.amount_eur for lot in new_lots}
         assert by_id["old"] == pytest.approx(20.0)   # drawn first
@@ -99,7 +99,7 @@ class TestFifo:
             _lot("old", 20.0, purchased_days_ago=100, expires_in_days=300),
             _lot("new", 50.0, purchased_days_ago=1, expires_in_days=300),
         ]
-        new_lots, consumed = _consume_topup_fifo(lots, 35.0, NOW)
+        new_lots, consumed = consume_topup_fifo(lots, 35.0, NOW)
         assert consumed == pytest.approx(35.0)
         by_id = {lot.id: lot.amount_eur for lot in new_lots}
         assert by_id["old"] == pytest.approx(0.0)    # fully drained
@@ -110,7 +110,7 @@ class TestFifo:
             _lot("expired-old", 100.0, purchased_days_ago=400, expires_in_days=-1),
             _lot("active", 40.0, purchased_days_ago=10, expires_in_days=300),
         ]
-        new_lots, consumed = _consume_topup_fifo(lots, 25.0, NOW)
+        new_lots, consumed = consume_topup_fifo(lots, 25.0, NOW)
         assert consumed == pytest.approx(25.0)
         by_id = {lot.id: lot.amount_eur for lot in new_lots}
         assert by_id["expired-old"] == pytest.approx(100.0)  # untouched (expired)
@@ -118,7 +118,7 @@ class TestFifo:
 
     def test_partial_consume_when_insufficient(self):
         lots = [_lot("a", 10.0, 10, 300)]
-        new_lots, consumed = _consume_topup_fifo(lots, 25.0, NOW)
+        new_lots, consumed = consume_topup_fifo(lots, 25.0, NOW)
         assert consumed == pytest.approx(10.0)  # only what's available
         assert new_lots[0].amount_eur == pytest.approx(0.0)
 
