@@ -95,6 +95,11 @@ services:
       # (enabled column / add-remove rows). Fail-open: no matching row or an
       # unusable target tier → normal routing, never a 5xx.
       - BRIDGE_APP_TIER_POLICY_ENABLED=true
+      # Prepaid Anthropic vision-key daily spend cap (fail-open, read per-call).
+      # Guards the vision_prepaid lane — real prepaid money the ledger books as 0€.
+      # Kill switch: set ENABLED=false + recreate. See src/routing/prepaid_cap.py.
+      - PREPAID_VISION_DAILY_CAP_ENABLED=true
+      - PREPAID_VISION_DAILY_CAP_EUR=30
       # Chat-job self-call timeout (claims/finalize). Default 600s cut long
       # Energy claims calls (observed 728s); align with MAX_TIMEOUT (2400s).
       - BRIDGE_CHAT_JOB_TIMEOUT_S=2400
@@ -193,6 +198,11 @@ services:
       # (enabled column / add-remove rows). Fail-open: no matching row or an
       # unusable target tier → normal routing, never a 5xx.
       - BRIDGE_APP_TIER_POLICY_ENABLED=true
+      # Prepaid Anthropic vision-key daily spend cap (fail-open, read per-call).
+      # Guards the vision_prepaid lane — real prepaid money the ledger books as 0€.
+      # Kill switch: set ENABLED=false + recreate. See src/routing/prepaid_cap.py.
+      - PREPAID_VISION_DAILY_CAP_ENABLED=true
+      - PREPAID_VISION_DAILY_CAP_EUR=30
       # Chat-job self-call timeout (claims/finalize). Default 600s cut long
       # Energy claims calls (observed 728s); align with MAX_TIMEOUT (2400s).
       - BRIDGE_CHAT_JOB_TIMEOUT_S=2400
