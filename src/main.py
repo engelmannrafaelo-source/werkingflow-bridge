@@ -63,6 +63,7 @@ from src.message_adapter import MessageAdapter
 from src.tool_leak_detector import hardened_system_prompt, looks_like_tool_leak
 from src.vision_provider import VisionProvider, get_vision_provider
 from src.routing.vision_router import check_and_route_vision, prepare_messages_for_vision, has_vision_content
+from src.routing.prepaid_cap import prepaid_vision_over_cap
 from src.routing.backend_router import resolve_backend_config, get_backend_info_dict, BackendConfig
 from src.auth import verify_api_key, security, validate_claude_code_auth, get_claude_code_auth_info, bedrock_credential_manager
 # Generic async-job system (additive, flag-gated via BRIDGE_GENERIC_JOBS_ENABLED).
@@ -1234,6 +1235,22 @@ async def generate_streaming_response(
         )
 
         if has_vision_content(messages_for_vision) and not _vision_is_bedrock:
+            # Prepaid vision-key daily cap (fail-open, flag-gated). Streaming path
+            # can't return a status code mid-stream, so emit an error SSE + [DONE].
+            _cap_over, _cap_spent, _cap_max = await prepaid_vision_over_cap()
+            if _cap_over:
+                logger.error(
+                    f"🛑 Prepaid vision daily cap reached ({_cap_spent:.2f} of {_cap_max:.2f} EUR) — rejecting vision stream"
+                )
+                _cap_err = {"error": {
+                    "message": f"Prepaid vision daily cap reached ({_cap_spent:.2f} of {_cap_max:.2f} EUR). Retry once the rolling-24h window drains.",
+                    "type": "prepaid_vision_cap_exceeded",
+                    "code": "prepaid_vision_cap_exceeded",
+                }}
+                yield f"data: {json.dumps(_cap_err)}\n\n"
+                yield "data: [DONE]\n\n"
+                return
+
             logger.info("🖼️ Vision streaming request detected")
 
             try:
@@ -2604,12 +2621,30 @@ async def chat_completions(
                 backend_config and backend_config.backend == BackendType.BEDROCK
             )
             try:
-                vision_result = None if _vision_is_bedrock else await check_and_route_vision(
-                    messages=request_body.messages,
-                    model=request_body.model,
-                    max_tokens=request_body.max_tokens,
-                    temperature=request_body.temperature
-                )
+                vision_result = None
+                if not _vision_is_bedrock and has_vision_content(prepare_messages_for_vision(request_body.messages)):
+                    # Prepaid vision-key daily cap (fail-open, flag-gated). Only a
+                    # confirmed vision call reaches here, so a non-vision call is
+                    # never blocked.
+                    _cap_over, _cap_spent, _cap_max = await prepaid_vision_over_cap()
+                    if _cap_over:
+                        logger.error(
+                            f"🛑 Prepaid vision daily cap reached ({_cap_spent:.2f} of {_cap_max:.2f} EUR) — rejecting vision call"
+                        )
+                        return JSONResponse(
+                            status_code=429,
+                            content={"error": {
+                                "message": f"Prepaid vision daily cap reached ({_cap_spent:.2f} of {_cap_max:.2f} EUR). Retry once the rolling-24h window drains.",
+                                "type": "prepaid_vision_cap_exceeded",
+                                "code": "prepaid_vision_cap_exceeded",
+                            }},
+                        )
+                    vision_result = await check_and_route_vision(
+                        messages=request_body.messages,
+                        model=request_body.model,
+                        max_tokens=request_body.max_tokens,
+                        temperature=request_body.temperature
+                    )
 
                 if vision_result:
                     # Count images in messages for AI usage tracking
