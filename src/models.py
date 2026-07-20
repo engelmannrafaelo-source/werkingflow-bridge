@@ -387,6 +387,17 @@ class ResearchRequest(BaseModel):
         default=PrivacyMode.AUTO,
         description="Privacy mode: 'auto', 'enabled', or 'disabled'"
     )
+    # Mirrors ChatCompletionRequest.provider_tier so the shared provider-routing
+    # path (user_provider_override, app_tier_policy, backend_router) applies to
+    # /v1/research identically to /v1/chat/completions — the research handler
+    # explicitly enforces "the same provider pins as chat completions", but the
+    # model was missing this one field, so a compliance-pin write
+    # (request_body.provider_tier = None) raised "ResearchRequest object has no
+    # field provider_tier" and 500'd the research self-call.
+    provider_tier: Optional[str] = Field(
+        default=None,
+        description="Provider tier for multi-provider routing (e.g. 'claude-premium', 'eu-standard'). Overrides backend selection."
+    )
 
     # Async mode (for clients that cannot keep an HTTP connection open for 5-15min,
     # e.g. Vercel Serverless Functions with 300s hard limit). When true, the endpoint
