@@ -25,6 +25,28 @@ class ModelInfo:
     description: str
     is_default: bool = False  # True if this is the default for its family
 
+    @property
+    def supports_temperature(self) -> bool:
+        """Whether this model accepts the legacy ``temperature`` sampling param.
+
+        Anthropic deprecated the legacy sampling controls (``temperature``,
+        ``top_p``) starting with the 4.5 model generation. The provider enforces
+        this — Bedrock in particular hard-rejects a ``temperature`` field with a
+        400 ``ValidationException`` ("temperature is deprecated for this model"),
+        while the older Anthropic API tolerated it. VERIFIED 2026-07-20 against
+        Bedrock: claude-sonnet-5, claude-sonnet-4-5-20250929 and claude-opus-4-8
+        all reject ``temperature``; models older than 4.5 accept it.
+
+        Deriving from the version (not a per-model flag) is correct because this
+        is a generational API change, not a per-model quirk: every 4.5+ model
+        behaves the same. An unparseable version fails OPEN (assume supported) so
+        an odd future version string can never silently strip a valid param.
+        """
+        try:
+            return float(self.version) < 4.5
+        except ValueError:
+            return True
+
 
 # =============================================================================
 # ZENTRALE MODELL-DEFINITION - EINZIGE QUELLE DER WAHRHEIT
@@ -191,6 +213,30 @@ def get_all_model_ids() -> List[str]:
 def get_model_info(model_id: str) -> Optional[ModelInfo]:
     """Get model info by exact ID."""
     return _MODEL_BY_ID.get(model_id)
+
+
+def model_supports_temperature(model_input: str) -> bool:
+    """Whether the RESOLVED model accepts the legacy ``temperature`` param.
+
+    Checked against the *resolved* model (``resolve_model``), not the raw input,
+    because the Bridge may force-upgrade an app's requested model to the family
+    default (e.g. ``claude-sonnet-4-5-...`` → ``claude-sonnet-5``). The app cannot
+    know about that upgrade, so the Bridge owns making the outgoing request valid
+    for the model it actually sends — the provider adapter (Bedrock / direct)
+    strips ``temperature`` when this returns False. See ``ModelInfo.supports_temperature``.
+
+    Unknown model → True (preserve behaviour) with a loud warning; never silently
+    strips a param for a model we cannot reason about.
+    """
+    resolved, _ = resolve_model(model_input)
+    info = get_model_info(resolved) if resolved else None
+    if info is None:
+        logger.warning(
+            "model_supports_temperature: model %r did not resolve to a known model "
+            "— assuming temperature IS supported (fail-open).", model_input,
+        )
+        return True
+    return info.supports_temperature
 
 
 def is_model_supported(model_id: str) -> bool:

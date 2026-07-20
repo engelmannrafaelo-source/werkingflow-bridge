@@ -25,6 +25,8 @@ from src.model_registry import (
     _DEFAULT_BY_FAMILY,
     _MODEL_BY_ID,
     from_bedrock_model_id,
+    get_model_info,
+    model_supports_temperature,
     resolve_model,
     to_bedrock_model_id,
 )
@@ -125,3 +127,39 @@ class TestBedrockMapping:
     def test_non_claude_raises(self):
         with pytest.raises(ValueError, match="non-Claude"):
             to_bedrock_model_id("gpt-5")
+
+
+# ============================================================================
+# temperature-Capability — generationsbasiert (4.5+ deprecaten sampling-controls)
+# ============================================================================
+
+class TestSupportsTemperature:
+    """`temperature` ist eine GENERATIONS-Capability: Anthropic hat die legacy
+    sampling-controls (temperature/top_p) ab der 4.5-Generation deprecated;
+    Bedrock hard-rejected das Feld mit 400. Verifiziert 2026-07-20 gegen Bedrock:
+    sonnet-5 / sonnet-4-5 / opus-4-8 lehnen `temperature` ab. Die Adapter
+    (bedrock_service, vision_provider) strippen es am RESOLVED-Modell, damit
+    keine App Provider-Quirks kennen muss."""
+
+    @pytest.mark.parametrize("model_id,expected", [
+        ("claude-sonnet-5", False),                 # v5
+        ("claude-opus-4-8", False),                 # v4.8
+        ("claude-sonnet-4-5-20250929", False),      # v4.5 (Grenze)
+        ("claude-sonnet-4-20250514", True),         # v4   < 4.5
+        ("claude-opus-4-1-20250805", True),         # v4.1 < 4.5
+        ("claude-3-5-sonnet-20241022", True),       # v3.5
+    ])
+    def test_intrinsic_property_is_version_gated(self, model_id, expected):
+        assert get_model_info(model_id).supports_temperature is expected
+
+    def test_helper_follows_forced_upgrade(self):
+        # Der Helper prüft am WIRKLICH gesendeten (resolved) Modell: ein älteres
+        # Modell wird zum 4.5+-Default hochgestuft → temperature MUSS gestrippt
+        # werden, obwohl das angefragte Modell es intrinsisch akzeptierte. Genau
+        # der V2-Bug: harmonize sendet sonnet-4-5 → Bridge sendet sonnet-5.
+        assert model_supports_temperature("claude-sonnet-4-5-20250929") is False
+        assert model_supports_temperature("claude-sonnet-4-20250514") is False
+
+    def test_unknown_model_fails_open(self):
+        # Fail-open (nie still einen validen Param für ein unbekanntes Modell strippen).
+        assert model_supports_temperature("totally-unknown-xyz") is True

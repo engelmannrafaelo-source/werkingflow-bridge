@@ -18,7 +18,7 @@ from typing import List, Dict, Any, Optional, Tuple
 from dataclasses import dataclass
 from fastapi import HTTPException
 from config.logging_config import get_logger
-from src.model_registry import get_default_model
+from src.model_registry import get_default_model, model_supports_temperature
 
 logger = get_logger(__name__)
 
@@ -338,13 +338,22 @@ class VisionProvider:
             }
         )
 
-        # Build request body
+        # Build request body. Only forward `temperature` if this model accepts
+        # it — newer (4.5+) models deprecate the legacy sampling controls and the
+        # provider rejects the field. This mirrors the Bedrock adapter so the
+        # Bridge strips provider-incompatible params at a single boundary, no
+        # matter which backend serves the call (see model_supports_temperature).
         request_body = {
             "model": model,
             "max_tokens": max_tokens,
-            "temperature": temperature,
             "messages": anthropic_messages
         }
+        if model_supports_temperature(model):
+            request_body["temperature"] = temperature
+        else:
+            logger.info(
+                "Dropping deprecated `temperature` for model %s (not supported).", model
+            )
 
         if final_system:
             request_body["system"] = final_system

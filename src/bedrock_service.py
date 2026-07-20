@@ -25,7 +25,7 @@ from src.models import (
     BackendInfo, BackendType, PrivacyMode,
     ChatCompletionStreamResponse, StreamChoice
 )
-from src.model_registry import resolve_model, to_bedrock_model_id
+from src.model_registry import resolve_model, to_bedrock_model_id, model_supports_temperature
 from src.routing.backend_router import _resolve_privacy_mode
 
 logger = get_logger(__name__)
@@ -236,7 +236,19 @@ async def call_bedrock(
         body["system"] = system_prompt
 
     if request.temperature is not None and request.temperature != 1.0:
-        body["temperature"] = request.temperature
+        # The Bridge may have force-upgraded the requested model to a newer one
+        # (resolve_model). Only forward `temperature` if the model ACTUALLY sent
+        # to Bedrock accepts it — newer (4.5+) models reject the field with a 400.
+        # Stripping it here is the single boundary that keeps callers oblivious to
+        # provider quirks (see model_registry.model_supports_temperature).
+        if model_supports_temperature(resolved_model):
+            body["temperature"] = request.temperature
+        else:
+            logger.warning(
+                "Dropping deprecated `temperature`=%s: requested model %r resolved "
+                "to %r, which rejects `temperature` on Bedrock.",
+                request.temperature, request.model, resolved_model,
+            )
 
     if request.top_p is not None and request.top_p != 1.0:
         body["top_p"] = request.top_p
@@ -366,7 +378,19 @@ async def stream_bedrock(
         body["system"] = system_prompt
 
     if request.temperature is not None and request.temperature != 1.0:
-        body["temperature"] = request.temperature
+        # The Bridge may have force-upgraded the requested model to a newer one
+        # (resolve_model). Only forward `temperature` if the model ACTUALLY sent
+        # to Bedrock accepts it — newer (4.5+) models reject the field with a 400.
+        # Stripping it here is the single boundary that keeps callers oblivious to
+        # provider quirks (see model_registry.model_supports_temperature).
+        if model_supports_temperature(resolved_model):
+            body["temperature"] = request.temperature
+        else:
+            logger.warning(
+                "Dropping deprecated `temperature`=%s: requested model %r resolved "
+                "to %r, which rejects `temperature` on Bedrock.",
+                request.temperature, request.model, resolved_model,
+            )
 
     if request.top_p is not None and request.top_p != 1.0:
         body["top_p"] = request.top_p
