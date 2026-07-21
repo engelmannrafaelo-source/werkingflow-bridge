@@ -81,6 +81,9 @@ services:
       - BRIDGE_ANONYMIZE_ENABLED=true
       - INSTANCE_NAME=worker1
       - BRIDGE_GENERIC_JOBS_ENABLED=true
+      # OA-Scholarly-Schicht (nur DEV/hetzner — diese Compose ist hetzner-only, PROD nutzt
+      # docker-compose-prod.yml). Aktiviert die legale OA-Volltext-Injektion bei research_mode=academic.
+      - BRIDGE_SCHOLARLY_ENABLED=true
       # Bridge-owned per-(app,agent) tier routing/billing policy (master switch).
       # Per-route control is the app_tier_policies DB table (enabled column).
       # Fail-open: no matching row / unusable target tier → normal routing.
@@ -184,6 +187,9 @@ services:
       - BRIDGE_ANONYMIZE_ENABLED=true
       - INSTANCE_NAME=worker2
       - BRIDGE_GENERIC_JOBS_ENABLED=true
+      # OA-Scholarly-Schicht (nur DEV/hetzner — diese Compose ist hetzner-only, PROD nutzt
+      # docker-compose-prod.yml). Aktiviert die legale OA-Volltext-Injektion bei research_mode=academic.
+      - BRIDGE_SCHOLARLY_ENABLED=true
       # Bridge-owned per-(app,agent) tier routing/billing policy (master switch).
       # Per-route control is the app_tier_policies DB table (enabled column).
       # Fail-open: no matching row / unusable target tier → normal routing.
@@ -287,6 +293,9 @@ services:
       - BRIDGE_ANONYMIZE_ENABLED=true
       - INSTANCE_NAME=worker3
       - BRIDGE_GENERIC_JOBS_ENABLED=true
+      # OA-Scholarly-Schicht (nur DEV/hetzner — diese Compose ist hetzner-only, PROD nutzt
+      # docker-compose-prod.yml). Aktiviert die legale OA-Volltext-Injektion bei research_mode=academic.
+      - BRIDGE_SCHOLARLY_ENABLED=true
       # Bridge-owned per-(app,agent) tier routing/billing policy (master switch).
       # Per-route control is the app_tier_policies DB table (enabled column).
       # Fail-open: no matching row / unusable target tier → normal routing.
@@ -390,6 +399,9 @@ services:
       - BRIDGE_ANONYMIZE_ENABLED=true
       - INSTANCE_NAME=worker4
       - BRIDGE_GENERIC_JOBS_ENABLED=true
+      # OA-Scholarly-Schicht (nur DEV/hetzner — diese Compose ist hetzner-only, PROD nutzt
+      # docker-compose-prod.yml). Aktiviert die legale OA-Volltext-Injektion bei research_mode=academic.
+      - BRIDGE_SCHOLARLY_ENABLED=true
       # Bridge-owned per-(app,agent) tier routing/billing policy (master switch).
       # Per-route control is the app_tier_policies DB table (enabled column).
       # Fail-open: no matching row / unusable target tier → normal routing.
