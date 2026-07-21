@@ -82,17 +82,19 @@ def _unpaywall_oa(doi: str) -> Optional[str]:
 
 
 def _core(query: str, n: int) -> List[Dict[str, Any]]:
+    # CORE ist auch OHNE Key nutzbar (freier Rate-Limit ~5 Req/10s) — Key nur für höheren Durchsatz.
+    # Trailing-Slash-URL ist nötig (sonst 301). Fail-soft.
     key = os.getenv("CORE_API_KEY")
-    if not key:
-        return []
+    headers = {"Authorization": f"Bearer {key}"} if key else {}
     try:
-        r = _get("https://api.core.ac.uk/v3/search/works",
-                 headers={"Authorization": f"Bearer {key}"}, params={"q": query, "limit": n})
-        r.raise_for_status()
+        r = _get("https://api.core.ac.uk/v3/search/works/",
+                 headers=headers, params={"q": query, "limit": n})
+        if r.status_code != 200:
+            return []
         return [{"title": (w.get("title") or "")[:200], "year": w.get("yearPublished"),
                  "doi": w.get("doi"), "oa_url": w.get("downloadUrl")}
                 for w in r.json().get("results", [])]
-    except requests.RequestException:
+    except (requests.RequestException, ValueError):
         return []
 
 
