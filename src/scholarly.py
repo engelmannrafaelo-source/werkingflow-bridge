@@ -1,14 +1,19 @@
 """OA-Scholarly-Schicht für /v1/research (Weg A: deterministische Pre-Retrieval-Injektion).
 
-Holt LEGALE Open-Access-Volltexte (OpenAlex + Unpaywall + optional CORE) zur Recherche-Query und
-formatiert sie als Kontext-Block, der VOR den SuperClaude-Research-Prompt gehängt wird. Damit zitiert
-der Agent echten Paper-Volltext (inkl. der darin zitierten Normwerte VDI/DIN/ÖNORM/EN) statt nur
-Abstracts/Shop-Seiten. Kein Sci-Hub, kein Paywall-Bypass — was nicht OA ist, bleibt außen vor
-(dafür ist WebSearch weiter da).
+Holt LEGALE Open-Access-Fachinhalte (OpenAlex-Abstracts + CORE-Volltext) zur Recherche-Query und
+formatiert sie als Kontext-Block, der VOR den SuperClaude-Research-Prompt gehängt wird. Damit stützt
+sich der Agent auf peer-reviewte Primärliteratur (inkl. der darin zitierten Normwerte VDI/DIN/ÖNORM/EN)
+statt nur auf Snippets/Shop-Seiten. Kein Sci-Hub, kein Paywall-Bypass.
 
-Sicherheit: komplett fail-soft. Jeder Fehler → leerer String → Research läuft unverändert weiter.
-Aktivierung nur wenn BRIDGE_SCHOLARLY_ENABLED=true UND request.research_mode=="academic"
-(Default aus → keine Verhaltensänderung für bestehende Caller).
+Design (bewusst dependency-frei + schnell, für die geteilte Bridge):
+  - OpenAlex: Discovery + `abstract_inverted_index` → rekonstruierter Abstract (immer da, schnell)
+  - CORE:     `fullText` direkt aus dem JSON (57M Repository-/Dissertations-Volltexte), best-effort
+              (keyless rate-limitet → 429 wird fail-soft übersprungen)
+  - KEINE PDF-Downloads/-Extraktion (Worker haben keine PDF-Lib; Downloads waren der Timeout-Treiber)
+  - Alle Netz-Calls parallel + hart budgetiert; komplett fail-soft → bei jedem Fehler leerer String,
+    Research läuft unverändert weiter.
+
+Aktivierung nur wenn BRIDGE_SCHOLARLY_ENABLED=true UND request.research_mode=="academic".
 """
 from __future__ import annotations
 
@@ -17,6 +22,7 @@ import json
 import logging
 import os
 import re
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Dict, List, Optional
 from urllib.parse import quote
 
@@ -26,7 +32,9 @@ logger = logging.getLogger("scholarly")
 
 MAILTO = os.getenv("SCHOLARLY_MAILTO", "office@werking.tools")
 UA = {"User-Agent": f"werkingflow-scholarly (mailto:{MAILTO})"}
-_HTTP_TIMEOUT = 25
+_HTTP_TIMEOUT = 15
+_MAX_ENTRIES = 12          # so viele Quellen maximal in den Kontext-Block
+_EXCERPT_CHARS = 1600      # Zeichen je Quelle (CORE-Volltext gekürzt)
 
 _PLANNER_SYS = (
     "Du bist ein Recherche-Query-Planner für die wissenschaftliche Literatur-API OpenAlex. "
@@ -46,140 +54,122 @@ def scholarly_enabled(research_mode: Optional[str]) -> bool:
     )
 
 
-# ---------- HTTP-Helfer (sync; im Threadpool aufgerufen) ----------
-
 def _get(url: str, **kw) -> requests.Response:
     kw.setdefault("headers", {}).update(UA)
     kw.setdefault("timeout", _HTTP_TIMEOUT)
     return requests.get(url, **kw)
 
 
+def _reconstruct_abstract(inv: Optional[Dict[str, List[int]]]) -> str:
+    """OpenAlex liefert Abstracts als inverted index {wort: [positionen]} → Fließtext."""
+    if not inv:
+        return ""
+    positions: List[tuple] = []
+    for word, idxs in inv.items():
+        for i in idxs:
+            positions.append((i, word))
+    positions.sort()
+    return " ".join(w for _, w in positions)
+
+
 def _openalex(query: str, n: int) -> List[Dict[str, Any]]:
     r = _get("https://api.openalex.org/works",
-             params={"search": query, "per-page": n, "mailto": MAILTO})
-    r.raise_for_status()
+             params={"search": query, "per-page": n, "mailto": MAILTO,
+                     "select": "title,publication_year,doi,open_access,abstract_inverted_index"})
+    if r.status_code != 200:
+        return []
     out = []
     for w in r.json().get("results", []):
         oa = w.get("open_access") or {}
+        abstract = _reconstruct_abstract(w.get("abstract_inverted_index"))
         out.append({
             "title": (w.get("title") or "")[:200],
             "year": w.get("publication_year"),
             "doi": (w.get("doi") or "").replace("https://doi.org/", "") or None,
-            "oa_url": oa.get("oa_url"),
+            "url": oa.get("oa_url"),
+            "text": abstract,
+            "kind": "abstract",
+            "source": "OpenAlex",
         })
     return out
 
 
-def _unpaywall_oa(doi: str) -> Optional[str]:
-    try:
-        r = _get(f"https://api.unpaywall.org/v2/{quote(doi)}", params={"email": MAILTO})
-        if r.status_code != 200:
-            return None
-        loc = (r.json() or {}).get("best_oa_location") or {}
-        return loc.get("url_for_pdf") or loc.get("url")
-    except requests.RequestException:
-        return None
-
-
 def _core(query: str, n: int) -> List[Dict[str, Any]]:
-    # CORE ist auch OHNE Key nutzbar (freier Rate-Limit ~5 Req/10s) — Key nur für höheren Durchsatz.
-    # Trailing-Slash-URL ist nötig (sonst 301). Fail-soft.
+    # CORE keyless (freier Rate-Limit, 429 → fail-soft []). Trailing-Slash nötig. fullText kommt
+    # direkt im JSON — das ist der eigentliche Mehrwert (echter Volltext ohne PDF-Download).
     key = os.getenv("CORE_API_KEY")
     headers = {"Authorization": f"Bearer {key}"} if key else {}
     try:
-        r = _get("https://api.core.ac.uk/v3/search/works/",
-                 headers=headers, params={"q": query, "limit": n})
+        r = _get("https://api.core.ac.uk/v3/search/works/", headers=headers,
+                 params={"q": query, "limit": n})
         if r.status_code != 200:
             return []
-        return [{"title": (w.get("title") or "")[:200], "year": w.get("yearPublished"),
-                 "doi": w.get("doi"), "oa_url": w.get("downloadUrl")}
-                for w in r.json().get("results", [])]
+        out = []
+        for w in r.json().get("results", []):
+            ft = w.get("fullText") or ""
+            out.append({
+                "title": (w.get("title") or "")[:200],
+                "year": w.get("yearPublished"),
+                "doi": w.get("doi"),
+                "url": w.get("downloadUrl") or (w.get("links") or [{}])[0].get("url") if w.get("links") else w.get("downloadUrl"),
+                "text": ft,
+                "kind": "fulltext" if ft else "meta",
+                "source": "CORE",
+            })
+        return out
     except (requests.RequestException, ValueError):
         return []
 
 
-def _pdf_to_text(content: bytes, max_chars: int) -> str:
-    """PDF-Volltext via pypdfium2 (bereits im Bridge-Image über das 'pdf'-Extra/docling —
-    KEIN neuer Dependency, kein System-Poppler). Fail-soft → ''."""
-    try:
-        import pypdfium2 as pdfium
-        pdf = pdfium.PdfDocument(content)
-        parts, total = [], 0
-        try:
-            for page in pdf:
-                tp = page.get_textpage()
-                t = tp.get_text_range() or ""
-                tp.close(); page.close()
-                parts.append(t)
-                total += len(t)
-                if total >= max_chars:
-                    break
-        finally:
-            pdf.close()
-        return "".join(parts)[:max_chars]
-    except Exception:
-        return ""
-
-
-def _fetch_fulltext(url: str, max_chars: int = 4000) -> str:
-    try:
-        r = _get(url, timeout=40, allow_redirects=True)
-        if r.status_code != 200 or (r.content[:5] != b"%PDF-"
-                                    and "pdf" not in r.headers.get("content-type", "").lower()):
-            return ""
-        return _pdf_to_text(r.content, max_chars)
-    except requests.RequestException:
-        return ""
-
-
-def _retrieve_and_format(queries: List[str], max_results: int, max_fulltext: int) -> str:
-    """Sync: OpenAlex(+CORE)-Discovery, Unpaywall-OA-Recovery, Volltext für Top-N, Markdown-Block."""
+def _retrieve_and_format(queries: List[str], per_query: int) -> str:
+    """Parallel je Query OpenAlex+CORE, dedupe, Kontext-Block bauen. Keine PDF-Downloads."""
     papers: List[Dict[str, Any]] = []
     seen = set()
-    for q in queries:
+
+    def fetch(q: str) -> List[Dict[str, Any]]:
+        res = []
         try:
-            hits = _openalex(q, max_results) + _core(q, max_results)
+            res += _openalex(q, per_query)
         except requests.RequestException:
-            continue
-        for p in hits:
-            key = p.get("doi") or p.get("oa_url") or p.get("title")
-            if key and key not in seen:
-                seen.add(key)
-                papers.append(p)
+            pass
+        res += _core(q, per_query)
+        return res
 
-    for p in papers:
-        if not p.get("oa_url") and p.get("doi"):
-            u = _unpaywall_oa(p["doi"])
-            if u:
-                p["oa_url"] = u
+    # Alle Query-Fetches parallel (Discovery ist schnell; kein Download)
+    with ThreadPoolExecutor(max_workers=min(8, max(1, len(queries)))) as pool:
+        futs = [pool.submit(fetch, q) for q in queries]
+        for f in as_completed(futs):
+            try:
+                hits = f.result()
+            except Exception:
+                continue
+            for p in hits:
+                key = (p.get("doi") or "").lower() or p.get("title", "").lower()[:60]
+                if key and key not in seen and p.get("text"):
+                    seen.add(key)
+                    papers.append(p)
 
-    blocks, got = [], 0
-    for p in papers:
-        if got >= max_fulltext:
-            break
-        if not p.get("oa_url"):
-            continue
-        txt = _fetch_fulltext(p["oa_url"])
-        if not txt:
-            continue
-        got += 1
-        excerpt = re.sub(r"[ \t]+", " ", txt).strip()[:1600]
-        doi = f" · doi:{p['doi']}" if p.get("doi") else ""
-        blocks.append(f"### {p['title']} ({p.get('year')}){doi}\nQuelle (OA-Volltext): {p['oa_url']}\n\n{excerpt}")
-
-    if not blocks:
+    if not papers:
         return ""
+
+    # Volltext (CORE) zuerst, dann Abstracts — nach Textlänge
+    papers.sort(key=lambda p: (p["kind"] != "fulltext", -len(p.get("text", ""))))
+    blocks = []
+    for p in papers[:_MAX_ENTRIES]:
+        excerpt = re.sub(r"\s+", " ", p["text"]).strip()[:_EXCERPT_CHARS]
+        doi = f" · doi:{p['doi']}" if p.get("doi") else ""
+        url = f"\nURL: {p['url']}" if p.get("url") else ""
+        tag = "Volltext" if p["kind"] == "fulltext" else "Abstract"
+        blocks.append(f"### {p['title']} ({p.get('year')}){doi}\nQuelle ({p['source']}, {tag}):{url}\n\n{excerpt}")
+
     header = (
-        "## VERIFIZIERTE OA-LITERATUR (echter Volltext, legal via OpenAlex/Unpaywall)\n"
-        "Nutze diese Volltext-Auszüge als PRIMÄRE, zitierbare Quellen (mit URL). Sie stammen aus "
-        "peer-reviewten Open-Access-Papern; darin zitierte Normwerte (VDI/DIN/ÖNORM/EN) dürfen mit "
-        "Quellenangabe übernommen werden. Ergänze offene Web-Suche nur für Herstellerdaten/Tarife/"
-        "Förderungen, die hier fehlen.\n"
+        "## VERIFIZIERTE OA-LITERATUR (legal via OpenAlex/CORE)\n"
+        "Nutze diese peer-reviewten Open-Access-Auszüge als PRIMÄRE, zitierbare Quellen (mit URL/DOI). "
+        "Darin zitierte Normwerte (VDI/DIN/ÖNORM/EN) dürfen mit Quellenangabe übernommen werden. "
+        "Ergänze offene Web-Suche nur für Herstellerdaten/Tarife/Förderungen, die hier fehlen.\n"
     )
     return header + "\n\n".join(blocks)
 
-
-# ---------- LLM-Query-Planner (async, Augenprinzip statt Heuristik) ----------
 
 async def _plan_queries(query: str, attribution: Optional[Dict[str, Any]], model: Optional[str]) -> List[str]:
     """Destilliert die (evtl. sehr lange) Research-Query in Suchbegriffe. Fail-soft → [query[:180]]."""
@@ -194,26 +184,23 @@ async def _plan_queries(query: str, attribution: Optional[Dict[str, Any]], model
                 {"role": "user", "content": query[:9000]},
             ],
         }
-        data = await _self_post_json("/v1/chat/completions", body, attribution, 90.0)
+        data = await _self_post_json("/v1/chat/completions", body, attribution, 60.0)
         content = data["choices"][0]["message"]["content"]
         m = re.search(r"\[.*\]", content, re.DOTALL)
         queries = [q.strip() for q in json.loads(m.group(0)) if isinstance(q, str) and q.strip()]
         return queries[:14] or fallback
     except Exception as e:
-        logger.warning(f"scholarly planner fiel auf raw-query zurück: {e}")
+        logger.warning(f"scholarly planner fiel auf raw-query zurück: {type(e).__name__}: {e}")
         return fallback
 
-
-# ---------- Öffentliche Einstiegsfunktion ----------
 
 async def build_oa_context(
     query: str,
     *,
     attribution: Optional[Dict[str, Any]] = None,
     model: Optional[str] = None,
-    max_results: int = 20,
-    max_fulltext: int = 6,
-    overall_timeout: float = 180.0,
+    per_query: int = 12,
+    overall_timeout: float = 90.0,
 ) -> str:
     """Liefert den OA-Literatur-Kontext-Block (Markdown) oder '' (fail-soft/timeout)."""
     try:
@@ -221,9 +208,9 @@ async def build_oa_context(
             queries = await _plan_queries(query, attribution, model)
             if not queries:
                 return ""
-            return await asyncio.to_thread(_retrieve_and_format, queries, max_results, max_fulltext)
+            return await asyncio.to_thread(_retrieve_and_format, queries, per_query)
 
         return await asyncio.wait_for(_run(), timeout=overall_timeout)
     except Exception as e:  # inkl. TimeoutError — Research darf NIE an dieser Schicht scheitern
-        logger.warning(f"OA-Schicht übersprungen (fail-soft): {e}")
+        logger.warning(f"OA-Schicht übersprungen (fail-soft): {type(e).__name__}: {e}")
         return ""
