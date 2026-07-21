@@ -74,7 +74,6 @@ black = "^24.0.0"
 pytest = "^8.0.0"
 pytest-asyncio = "^0.23.0"
 requests = "^2.32.0"
-pypdf = "^5.1.0"  # OA-Scholarly-Schicht: reine-Python-PDF-Volltext-Extraktion (kein System-Poppler)
 openai = "^1.0.0"
 
 [build-system]

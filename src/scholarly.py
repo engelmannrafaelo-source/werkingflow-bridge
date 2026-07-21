@@ -99,18 +99,23 @@ def _core(query: str, n: int) -> List[Dict[str, Any]]:
 
 
 def _pdf_to_text(content: bytes, max_chars: int) -> str:
-    """Reine-Python-Extraktion (pypdf). Kein System-Poppler nötig. Fail-soft → ''."""
+    """PDF-Volltext via pypdfium2 (bereits im Bridge-Image über das 'pdf'-Extra/docling —
+    KEIN neuer Dependency, kein System-Poppler). Fail-soft → ''."""
     try:
-        import io
-        from pypdf import PdfReader
-        reader = PdfReader(io.BytesIO(content))
+        import pypdfium2 as pdfium
+        pdf = pdfium.PdfDocument(content)
         parts, total = [], 0
-        for page in reader.pages:
-            t = page.extract_text() or ""
-            parts.append(t)
-            total += len(t)
-            if total >= max_chars:
-                break
+        try:
+            for page in pdf:
+                tp = page.get_textpage()
+                t = tp.get_text_range() or ""
+                tp.close(); page.close()
+                parts.append(t)
+                total += len(t)
+                if total >= max_chars:
+                    break
+        finally:
+            pdf.close()
         return "".join(parts)[:max_chars]
     except Exception:
         return ""
