@@ -3819,6 +3819,21 @@ async def _execute_research_impl(
             filters = ",".join(request_body.source_filter)
             research_prompt += f" --sources {filters}"
 
+        # OA-Scholarly-Schicht (Weg A): legale Open-Access-Volltexte VOR den Agent-Run injizieren.
+        # Vollständig fail-soft + gated (BRIDGE_SCHOLARLY_ENABLED + research_mode=="academic").
+        # Default aus → bestehende Caller unverändert.
+        try:
+            from src.scholarly import scholarly_enabled, build_oa_context
+            if scholarly_enabled(getattr(request_body, "research_mode", None)):
+                oa_block = await build_oa_context(
+                    request_body.query, attribution=attribution_ctx, model=request_body.model
+                )
+                if oa_block:
+                    research_prompt += "\n\n" + oa_block
+                    logger.info("📚 OA-Literatur-Kontext injiziert", extra={"chars": len(oa_block)})
+        except Exception as _oa_err:  # Research darf NIE an dieser Zusatzschicht scheitern
+            logger.warning(f"⚠️ OA-Scholarly-Schicht übersprungen (fail-soft): {_oa_err}")
+
         logger.info("🚀 Starting research execution...")
 
         all_chunks = []
