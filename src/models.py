@@ -305,6 +305,14 @@ class ResearchRequest(BaseModel):
     # Core Research Parameters
     query: str = Field(..., description="Research question or topic to investigate")
 
+    # OA-Scholarly-Schicht (Weg A): "academic" aktiviert Pre-Retrieval echter Open-Access-Volltexte
+    # (OpenAlex/Unpaywall) VOR dem Agent-Run. Nur wirksam, wenn zusätzlich BRIDGE_SCHOLARLY_ENABLED=true.
+    # Default "standard" → keine Verhaltensänderung für bestehende Caller.
+    research_mode: Optional[Literal["standard", "academic"]] = Field(
+        default="standard",
+        description="standard = wie bisher (offene Web-Suche); academic = zusätzlich legale OA-Volltext-Injektion"
+    )
+
     # Model Configuration
     model: Optional[str] = Field(
         default_factory=lambda: get_default_model("sonnet").id,
