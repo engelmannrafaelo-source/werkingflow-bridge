@@ -23,7 +23,13 @@ Selection (fair round-robin, S7):
   - Ties broken by (highest headroom, shortest cooldown).
 
 Fail-fast:
-  - Metrics-reader unreachable / non-200 / empty accounts → RuntimeError.
+  - Metrics-reader unreachable / non-200 / empty accounts → RuntimeError,
+    AUSSER es existiert ein Last-known-good-Snapshot juenger als
+    SANDBOX_POOL_STATE_STALE_MAX_S (Default 60s). Der wird dann — laut
+    geloggt, mit Alter — verwendet, damit ein kurzer Reader-Aussetzer
+    (Child-Restart nach OOM, Deploy) laufende Sandbox-Starts nicht killt.
+    Bewusste Design-Entscheidung, kein Silent Fallback: Deckelung hart,
+    Risiko ist ein bis zu 60s veralteter Sperr-Status eines Accounts.
   - Account-pool-state row missing any required field → RuntimeError
     (would mask broken state otherwise).
   - No eligible account → NoCapacityError carrying per-account exclusion
@@ -31,6 +37,7 @@ Fail-fast:
 """
 import logging
 import os
+import time
 from dataclasses import dataclass
 from typing import Any, Optional
 
@@ -40,6 +47,10 @@ logger = logging.getLogger(__name__)
 
 _METRICS_READER_URL = os.getenv("BRIDGE_METRICS_READER_URL", "http://metrics-reader:8000")
 _HEADROOM_THRESHOLD = float(os.getenv("SANDBOX_HEADROOM_THRESHOLD", "10"))
+_STALE_MAX_S = float(os.getenv("SANDBOX_POOL_STATE_STALE_MAX_S", "60"))
+
+# Last-known-good Pool-State: (monotonic-Zeitstempel, accounts-Dict).
+_last_good_state: Optional[tuple[float, dict[str, dict[str, Any]]]] = None
 
 
 class NoCapacityError(Exception):
@@ -107,25 +118,9 @@ def _evaluate(acct_name: str, info: dict[str, Any]) -> tuple[bool, str, float, i
     return True, "", headroom, cooldown
 
 
-async def pick_account(
-    preferred_account_id: Optional[str] = None,
-    lease_counts: Optional[dict[str, int]] = None,
-) -> PickedAccount:
-    """
-    Query the metrics reader and return the best account for a new lease.
-
-    Args:
-        preferred_account_id: caller hint; wins if eligible (e.g. resume).
-        lease_counts: optional {account_id: recent_lease_count} for fairness
-            ranking (typically leases-issued-in-last-24h from sandbox_leases).
-            Missing accounts default to 0. Without this arg, ranking degrades
-            to headroom-only (backward-compatible).
-
-    Raises:
-        RuntimeError: metrics reader unreachable / malformed / empty state
-        NoCapacityError: no account passes the available+headroom filter;
-            carries per-account exclusion reasons for diagnostics.
-    """
+async def _fetch_pool_state() -> dict[str, dict[str, Any]]:
+    """Frischen Pool-State vom metrics-reader holen. RuntimeError bei
+    unreachable / non-200 / leerem accounts-Dict — Bewertung passiert im Caller."""
     url = f"{_METRICS_READER_URL}/v1/metrics/account-pool-state"
     try:
         async with httpx.AsyncClient(timeout=5.0) as client:
@@ -143,6 +138,52 @@ async def pick_account(
 
     if not accounts:
         raise RuntimeError(f"account-pool-state returned empty accounts dict from {url}")
+    return accounts
+
+
+async def pick_account(
+    preferred_account_id: Optional[str] = None,
+    lease_counts: Optional[dict[str, int]] = None,
+) -> PickedAccount:
+    """
+    Query the metrics reader and return the best account for a new lease.
+
+    Args:
+        preferred_account_id: caller hint; wins if eligible (e.g. resume).
+        lease_counts: optional {account_id: recent_lease_count} for fairness
+            ranking (typically leases-issued-in-last-24h from sandbox_leases).
+            Missing accounts default to 0. Without this arg, ranking degrades
+            to headroom-only (backward-compatible).
+
+    Raises:
+        RuntimeError: metrics reader unreachable / malformed / empty state
+            und kein Last-known-good-Snapshot juenger als _STALE_MAX_S.
+        NoCapacityError: no account passes the available+headroom filter;
+            carries per-account exclusion reasons for diagnostics.
+    """
+    global _last_good_state
+    try:
+        accounts = await _fetch_pool_state()
+        _last_good_state = (time.monotonic(), accounts)
+    except RuntimeError as exc:
+        # Kurzer Reader-Aussetzer (uvicorn-Child-Restart nach OOM, Deploy) soll
+        # einen Sandbox-Start nicht sofort killen. Rueckgriff auf den letzten
+        # guten Snapshot ist hart gedeckelt und wird LAUT mit Alter geloggt —
+        # kein Silent Fallback. Restrisiko: eine in der Zwischenzeit gesetzte
+        # Account-Sperre ist bis zu _STALE_MAX_S lang nicht sichtbar.
+        if _last_good_state is None:
+            raise
+        age = time.monotonic() - _last_good_state[0]
+        if age > _STALE_MAX_S:
+            raise RuntimeError(
+                f"metrics-reader unavailable and last-known-good pool state is "
+                f"{age:.0f}s old (max {_STALE_MAX_S:.0f}s): {exc}"
+            ) from exc
+        logger.warning(
+            f"pick_account: metrics-reader unavailable ({exc}) — using "
+            f"last-known-good pool state, age={age:.1f}s (max {_STALE_MAX_S:.0f}s)"
+        )
+        accounts = _last_good_state[1]
 
     lease_counts = lease_counts or {}
     eligible: list[tuple[str, float, int, int]] = []  # (acct_name, headroom, cooldown, lease_count)

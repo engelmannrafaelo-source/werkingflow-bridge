@@ -20,11 +20,21 @@ import pytest
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../..')))
 
+import src.sandbox.account_router as account_router
 from src.sandbox.account_router import (
     NoCapacityError,
     PickedAccount,
     pick_account,
 )
+
+
+@pytest.fixture(autouse=True)
+def _reset_last_good_state():
+    """Der Last-known-good-Cache ist modulweit — zwischen Tests zuruecksetzen,
+    sonst faellt ein Fail-fast-Test still auf den Snapshot des Vortests zurueck."""
+    account_router._last_good_state = None
+    yield
+    account_router._last_good_state = None
 
 
 def _mk_account(
@@ -265,3 +275,80 @@ async def test_empty_lease_counts_falls_back_to_headroom(monkeypatch):
     })
     picked = await pick_account(lease_counts={})
     assert picked.account_id == "engelmann"
+
+
+# ---------------------------------------------------------------------------
+# Last-known-good Fallback (Reader-Aussetzer, z.B. uvicorn-Child-Restart nach
+# OOM): frischer Snapshot ueberbrueckt, alter/fehlender Snapshot bleibt fail-fast.
+# ---------------------------------------------------------------------------
+
+import httpx as _httpx
+import time as _time
+
+
+def _patch_pool_state_unreachable(monkeypatch):
+    """Mock httpx.AsyncClient so every GET raises a RequestError."""
+    client = AsyncMock()
+    client.get = AsyncMock(side_effect=_httpx.RequestError("connection refused"))
+
+    cm = AsyncMock()
+    cm.__aenter__.return_value = client
+    cm.__aexit__.return_value = None
+
+    monkeypatch.setattr(
+        "src.sandbox.account_router.httpx.AsyncClient",
+        lambda *args, **kwargs: cm,
+    )
+
+
+@pytest.mark.asyncio
+async def test_unreachable_uses_fresh_last_known_good(monkeypatch):
+    """Reader weg, aber Snapshot < _STALE_MAX_S alt → Lease klappt weiter."""
+    _patch_pool_state(monkeypatch, {
+        "office": _mk_account(available=True, headroom_percent=80.0, cooldown_remaining_s=0),
+    })
+    first = await pick_account()
+    assert first.account_id == "office"
+
+    _patch_pool_state_unreachable(monkeypatch)
+    picked = await pick_account()
+    assert picked.account_id == "office"
+
+
+@pytest.mark.asyncio
+async def test_unreachable_without_cache_raises(monkeypatch):
+    """Kein Snapshot vorhanden → RuntimeError wie bisher (fail-fast)."""
+    _patch_pool_state_unreachable(monkeypatch)
+    with pytest.raises(RuntimeError, match="unreachable"):
+        await pick_account()
+
+
+@pytest.mark.asyncio
+async def test_unreachable_with_stale_cache_raises(monkeypatch):
+    """Snapshot aelter als _STALE_MAX_S → RuntimeError mit Alter im Text."""
+    _patch_pool_state(monkeypatch, {
+        "office": _mk_account(available=True, headroom_percent=80.0, cooldown_remaining_s=0),
+    })
+    await pick_account()
+    # Snapshot kuenstlich altern lassen (weit ueber die Deckelung hinaus).
+    ts, accounts = account_router._last_good_state
+    account_router._last_good_state = (ts - account_router._STALE_MAX_S - 10, accounts)
+
+    _patch_pool_state_unreachable(monkeypatch)
+    with pytest.raises(RuntimeError, match="last-known-good"):
+        await pick_account()
+
+
+@pytest.mark.asyncio
+async def test_stale_fallback_still_honours_no_capacity(monkeypatch):
+    """Fallback-Snapshot ohne eligible Accounts → weiterhin NoCapacityError,
+    der Cache darf Sperren nicht aufweichen."""
+    _patch_pool_state(monkeypatch, {
+        "office": _mk_account(available=False, headroom_percent=0.0, cooldown_remaining_s=120),
+    })
+    with pytest.raises(NoCapacityError):
+        await pick_account()
+
+    _patch_pool_state_unreachable(monkeypatch)
+    with pytest.raises(NoCapacityError):
+        await pick_account()
