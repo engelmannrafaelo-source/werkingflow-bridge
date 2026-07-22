@@ -20,6 +20,18 @@ from unittest.mock import AsyncMock, MagicMock, patch, mock_open
 import pytest
 from fastapi import HTTPException
 
+
+@pytest.fixture(autouse=True)
+def _reset_account_router_cache():
+    """account_router haelt einen modulweiten Last-known-good-Pool-State —
+    zuruecksetzen, damit Fail-fast-Tests (unreachable → RuntimeError) nicht
+    still auf den Snapshot eines Vortests zurueckfallen."""
+    import src.sandbox.account_router as account_router
+    account_router._last_good_state = None
+    yield
+    account_router._last_good_state = None
+
+
 # ---------------------------------------------------------------------------
 # Criterion 8: subscription is a valid billing_mode (pure unit test)
 # ---------------------------------------------------------------------------
