@@ -53,13 +53,21 @@ _DEFAULT_THRESHOLD = 15
 _DEFAULT_BATCH_SIZE = 20
 
 _TRIAGE_SYSTEM_PROMPT = (
-    "Du sichtest Bilder aus einem Fachdokument und entscheidest je Bild, ob es "
-    "eine detaillierte inhaltliche Analyse verdient. RELEVANT sind "
-    "informationstragende Bilder: Diagramme, Schemata, technische Zeichnungen, "
-    "Grafiken, Karten, Tabellen-Screenshots, Messwert-Anzeigen, Typenschilder. "
-    "NICHT relevant sind rein dekorative oder wiederkehrende Bilder: Logos, "
-    "Wasserzeichen, Icons, Symbole, Zierfotos, Seitendekoration. Im Zweifel: "
-    "RELEVANT. Antworte ausschließlich mit JSON."
+    "Du bist eine Vorauswahl-Stufe in einem Dokument-Konverter. Ein Dokument wird "
+    "gerade in Text umgewandelt, damit nachgelagerte, rein textbasierte Schritte "
+    "damit arbeiten können; die enthaltenen Abbildungen wurden einzeln herausgelöst "
+    "und liegen dir als kleine Vorschaubilder vor. Jedes Bild, das du auswählst, "
+    "wird im nächsten Schritt ausführlich in Text beschrieben — diese Beschreibung "
+    "ersetzt das Bild im Dokument, denn die folgenden Schritte sehen nur noch den "
+    "Text. Nicht ausgewählte Bilder bleiben als kurzer Platzhalter erhalten, ihr "
+    "Inhalt geht dem Text aber verloren.\n\n"
+    "Entscheide deshalb je Bild: Trägt es eigenständige Information, die den Inhalt "
+    "des Dokuments für einen Leser ausmacht, der nur den Text vor sich hat? Dann "
+    "auswählen. Bilder, die keinen Sachinhalt beitragen, sondern der Gestaltung oder "
+    "der Wiedererkennung dienen, brauchen keine ausführliche Beschreibung. Im "
+    "Zweifel auswählen — ein übersehenes informationstragendes Bild fehlt dem Text "
+    "dauerhaft, ein unnötig beschriebenes kostet nur einen zusätzlichen Schritt. "
+    "Antworte ausschließlich mit JSON."
 )
 
 
@@ -105,12 +113,13 @@ def should_triage(figures: Dict[str, str]) -> bool:
 
 def _batch_instruction(n: int) -> str:
     return (
-        f"Hier sind {n} Bilder aus einem Fachdokument (Bild 1 bis {n}). "
-        "Entscheide je Bild, ob es eine detaillierte inhaltliche Analyse verdient. "
-        "Gib AUSSCHLIESSLICH ein JSON-Objekt zurück, ein Eintrag pro Bildnummer, "
-        'z. B. {"1": {"relevant": true, "label": "Hydraulikschema"}, '
-        '"2": {"relevant": false, "label": "Firmenlogo"}}. '
-        "label = kurze Kategorie (max. 3 Wörter). Im Zweifel relevant: true."
+        f"Hier sind {n} Bilder aus dem Dokument (Bild 1 bis {n}). Entscheide je Bild, "
+        "ob es eine ausführliche Textbeschreibung verdient. Gib AUSSCHLIESSLICH ein "
+        "JSON-Objekt zurück, ein Eintrag pro Bildnummer, im Format "
+        '{"1": {"relevant": true, "label": "<kurze Kategorie>"}, '
+        '"2": {"relevant": false, "label": "<kurze Kategorie>"}}. '
+        "label = knappe Benennung dessen, was das Bild zeigt (max. 3 Wörter). Im "
+        "Zweifel relevant: true."
     )
 
 
