@@ -183,6 +183,36 @@ fi
 [[ "$DRY_RUN" == "true" ]] && info "=== DRY-RUN MODE — no changes will be made ==="
 
 # ============================================================================
+# Deploy-Lock — genau EIN Deploy pro Zielhost gleichzeitig
+# ============================================================================
+# Zwei parallele Deploys teilen sich den Checkout auf dem Zielhost: der Auto-
+# Rollback des einen dreht den Checkout zurück, während der andere mitten im
+# Worker-Rollout daraus baut → Mixed-Code-Flotte, die wie ein erfolgreicher
+# Deploy aussieht (passiert 2026-07-22: worker1=6f7f4fc, worker2-4=d3c1f0d;
+# Repair-Deploy nötig). Der Lock gilt pro Host; "both" hält beide Locks für
+# die gesamte Laufzeit. fd bleibt bis Prozessende offen → Lock löst sich bei
+# jedem Exit (auch kill/crash) automatisch.
+acquire_deploy_lock() {
+    local host_label="$1" fd="$2"
+    local lockfile="/var/lock/bridge-deploy.${host_label}.lock"
+    # Append-Modus: das Öffnen darf die Holder-Info eines laufenden Deploys
+    # nicht trunkieren (ein '>' würde das tun, noch VOR dem flock-Versuch).
+    eval "exec ${fd}>>\"\$lockfile\""
+    if ! flock -n "$fd"; then
+        error_ "Another bridge-deploy for '${host_label}' is already running (holder: $(tail -1 "$lockfile" 2>/dev/null || echo unbekannt), lock: ${lockfile})."
+        error_ "Warten bis der laufende Deploy fertig ist — NIEMALS parallel deployen (Mixed-Code-Race)."
+        exit 1
+    fi
+    truncate -s 0 "$lockfile"
+    printf 'pid=%s started=%s user=%s\n' "$$" "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$(whoami)" >&"$fd"
+}
+case "$SERVER" in
+    hetzner) acquire_deploy_lock "hetzner" 210 ;;
+    server2) acquire_deploy_lock "server2" 211 ;;
+    both)    acquire_deploy_lock "hetzner" 210; acquire_deploy_lock "server2" 211 ;;
+esac
+
+# ============================================================================
 # Phase 1: Pre-flight checks (read-only)
 # ============================================================================
 phase_preflight() {
