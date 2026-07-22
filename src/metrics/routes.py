@@ -321,8 +321,15 @@ async def usage_metrics(
 
     out_rows = sorted(buckets.values(), key=lambda x: x["hypotheticalCostEur"], reverse=True)
 
-    # pricing block kept for backward compat — UI reads usdToEurRate + modelsUnknown
-    unknown_models = {m: 1 for m in seen_models if m not in pricing}
+    # pricing block kept for backward compat — UI reads usdToEurRate + modelsUnknown.
+    # Zero-cost service pseudo-models (no token billing by design) are NOT
+    # "unknown" — the warning exists for calls whose cost might be
+    # underreported, and these bill €0 correctly.
+    ZERO_COST_SERVICE_MODELS = {"docling", "html-renderer", "privacy-service"}
+    unknown_models = {
+        m: 1 for m in seen_models
+        if m not in pricing and m not in ZERO_COST_SERVICE_MODELS
+    }
 
     return {
         "groupBy": groupBy,
