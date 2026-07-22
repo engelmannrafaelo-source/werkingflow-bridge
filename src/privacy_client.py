@@ -11,7 +11,8 @@ to avoid HTTP latency per streaming chunk.
 import os
 import re
 import logging
-from typing import Dict, List, Optional, Any, Tuple
+from contextlib import asynccontextmanager
+from typing import AsyncIterator, Dict, List, Optional, Any, Tuple
 
 import httpx
 
@@ -32,6 +33,13 @@ class PrivacyServiceClient:
         self.enabled = os.getenv("PRIVACY_ENABLED", "false").lower() in ("true", "1", "yes", "on")
         self.language = os.getenv("PRIVACY_LANGUAGE", "de")
         self._client: Optional[httpx.AsyncClient] = None
+        # In-process concurrency gauge for calls into the (single-worker,
+        # UVICORN_WORKERS=1) privacy-pdf-service container — the actual
+        # capacity bottleneck of the document/anonymize pipeline. Scoped to
+        # THIS worker process only: with multiple bridge workers sharing one
+        # privacy-service container, true global concurrency is >= this
+        # value. Treat it as a per-worker lower bound, not an exact count.
+        self.active_calls = 0
 
     async def _get_client(self) -> httpx.AsyncClient:
         if self._client is None or self._client.is_closed:
@@ -40,6 +48,23 @@ class PrivacyServiceClient:
                 timeout=30.0,
             )
         return self._client
+
+    @asynccontextmanager
+    async def track_call(self) -> AsyncIterator[int]:
+        """Observe concurrency around a privacy-service call.
+
+        Yields the number of calls already in flight on THIS worker when
+        this call started (0 = no overlap seen). Callers feed this into
+        PromptMetricsCollector.record(concurrent_calls_at_start=...) so the
+        capacity endpoint can show a busy-rate for the privacy-service
+        bottleneck. Purely observational — never rejects or throttles.
+        """
+        concurrent_before = self.active_calls
+        self.active_calls += 1
+        try:
+            yield concurrent_before
+        finally:
+            self.active_calls -= 1
 
     @property
     def is_available(self) -> bool:

@@ -27,7 +27,7 @@ import threading
 import logging
 from collections import defaultdict
 from dataclasses import dataclass, asdict, field
-from typing import Optional, Dict, List, Any
+from typing import Optional, Dict, List, Any, Set
 
 logger = logging.getLogger(__name__)
 
@@ -36,6 +36,23 @@ METRICS_DIR = os.path.join(
     os.getenv("METRICS_DIR", "/app/logs"),
     "bridge-metrics"
 )
+
+# agent_id values used by the document/privacy-service proxy endpoints
+# (src/main.py) — single source of truth for the /v1/metrics/document-performance
+# filter (worker route + metrics_reader route both import this constant so
+# the two stay in sync without duplicating the list).
+DOCUMENT_AGENT_IDS: Set[str] = {
+    "anonymisierung",
+    "dokument-konvertierung",
+    "dokument-konvertierung-anonymisiert",
+    "pdf-konvertierung",
+    "pdf-zu-semantic-html",
+    "pdf-zu-html-direkt",
+    "html-zu-docx",
+    "docx-zu-html",
+    "pdf-export",
+    "screenshot",
+}
 
 
 @dataclass
@@ -56,6 +73,11 @@ class PromptCall:
     user_id: Optional[str] = None
     session_id: Optional[str] = None
     job_id: Optional[str] = None
+    # Capacity: calls already in flight (on the same worker) toward the
+    # downstream service when this call started. Only populated by callers
+    # that track their own concurrency (currently: privacy-service proxy
+    # endpoints); None for everything else (e.g. LLM chat calls).
+    concurrent_calls_at_start: Optional[int] = None
 
 
 @dataclass
@@ -75,6 +97,10 @@ class AgentStats:
     last_call: float = 0
     last_error: Optional[str] = None
     last_error_time: Optional[float] = None
+    # Busy-rate: how often a call started while another was already in
+    # flight on the same worker (see PromptCall.concurrent_calls_at_start).
+    busy_samples: int = 0
+    busy_starts: int = 0
 
 
 def _parse_call(data: dict, fallback_worker: str = "unknown") -> PromptCall:
@@ -94,6 +120,7 @@ def _parse_call(data: dict, fallback_worker: str = "unknown") -> PromptCall:
         user_id=data.get("user_id"),
         session_id=data.get("session_id"),
         job_id=data.get("job_id"),
+        concurrent_calls_at_start=data.get("concurrent_calls_at_start"),
     )
 
 
@@ -212,6 +239,7 @@ class PromptMetricsCollector:
         user_id: Optional[str] = None,
         session_id: Optional[str] = None,
         job_id: Optional[str] = None,
+        concurrent_calls_at_start: Optional[int] = None,
     ) -> None:
         """Record a single prompt call (in-memory + disk)."""
         call = PromptCall(
@@ -229,6 +257,7 @@ class PromptMetricsCollector:
             user_id=user_id,
             session_id=session_id,
             job_id=job_id,
+            concurrent_calls_at_start=concurrent_calls_at_start,
         )
         with self._lock:
             self._calls.append(call)
@@ -236,11 +265,16 @@ class PromptMetricsCollector:
         # Persist to disk (outside lock — append is atomic enough for JSONL)
         self._append_to_disk(call)
 
-    def get_stats(self, hours: int = 24) -> Dict[str, Any]:
+    def get_stats(self, hours: int = 24, agent_ids: Optional[Set[str]] = None) -> Dict[str, Any]:
         """
         Get aggregated stats per app+agent for the last N hours.
 
         Reads from ALL worker files for complete cross-worker view.
+
+        Args:
+            hours: Time window (0 = all time).
+            agent_ids: If given, only include calls whose agent_id is in this
+                set (e.g. DOCUMENT_AGENT_IDS for the document-performance view).
         """
         # hours=0 means all time
         cutoff = time.time() - (hours * 3600) if hours > 0 else 0
@@ -254,6 +288,8 @@ class PromptMetricsCollector:
 
         # Merge all calls
         relevant = own_calls + other_calls
+        if agent_ids is not None:
+            relevant = [c for c in relevant if c.agent_id in agent_ids]
 
         # Aggregate by app_id + agent_id
         buckets: Dict[str, AgentStats] = {}
@@ -270,6 +306,11 @@ class PromptMetricsCollector:
             if call.user_id:
                 b.users[call.user_id] += 1
             b.last_call = max(b.last_call, call.timestamp)
+
+            if call.concurrent_calls_at_start is not None:
+                b.busy_samples += 1
+                if call.concurrent_calls_at_start > 0:
+                    b.busy_starts += 1
 
             if call.status == "success":
                 b.successes += 1
@@ -314,6 +355,11 @@ class PromptMetricsCollector:
                 "last_call_ago_s": round(time.time() - b.last_call) if b.last_call > 0 else None,
                 "last_error": b.last_error,
                 "last_error_ago_s": round(time.time() - b.last_error_time) if b.last_error_time else None,
+                # Only meaningful for callers that pass concurrent_calls_at_start
+                # (currently the privacy-service proxy endpoints). None = not tracked.
+                "busy_samples": b.busy_samples,
+                "busy_starts": b.busy_starts,
+                "busy_rate_pct": round((b.busy_starts / b.busy_samples) * 100, 1) if b.busy_samples > 0 else None,
             })
             total_calls += b.calls
             total_errors += b.errors + b.timeouts

@@ -16,6 +16,7 @@ Read-only, file-based endpoints only (all other Bridge endpoints stay on workers
     GET  /v1/metrics/prompt-performance/calls
     GET  /v1/metrics/throughput
     GET  /v1/metrics/usage-breakdown
+    GET  /v1/metrics/document-performance   (capacity view: convert-*/document/privacy calls)
     GET  /v1/metrics/request-log
     GET  /v1/metrics/cc-usage-history
     GET  /lb-status                  (real worker-health aggregate — Phase 3)
@@ -57,7 +58,7 @@ from fastapi.responses import JSONResponse
 # These files come via COPY in Dockerfile.metrics-reader and are importable
 # from /app/src/middleware/... inside the container.
 from src.middleware.bridge_metrics_store import get_request_log, get_cc_usage_store
-from src.middleware.prompt_metrics import get_prompt_metrics
+from src.middleware.prompt_metrics import get_prompt_metrics, DOCUMENT_AGENT_IDS
 
 logger = logging.getLogger("metrics-reader")
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
@@ -266,6 +267,15 @@ def _merge_prompt_performance(local: dict, prod: dict) -> dict:
                 at = agent.get("tokens", {})
                 if isinstance(et, dict) and isinstance(at, dict):
                     et[tk] = et.get(tk, 0) + at.get(tk, 0)
+            # Busy-rate sums (document-performance view) — recompute the
+            # percentage from the summed raw counts, not from the two
+            # pre-computed percentages (averaging percentages would be wrong).
+            existing["busy_samples"] = existing.get("busy_samples", 0) + agent.get("busy_samples", 0)
+            existing["busy_starts"] = existing.get("busy_starts", 0) + agent.get("busy_starts", 0)
+            existing["busy_rate_pct"] = (
+                round((existing["busy_starts"] / existing["busy_samples"]) * 100, 1)
+                if existing["busy_samples"] > 0 else None
+            )
 
     # Merge summary
     ls = local.get("summary", {})
@@ -412,6 +422,24 @@ def get_usage_breakdown(hours: int = Query(24, ge=0)) -> dict:
     prod = _fetch_prod(f"/v1/metrics/usage-breakdown?hours={hours}", timeout=3)
     if prod:
         return _merge_usage_breakdown(local, prod)
+    return local
+
+
+@app.get("/v1/metrics/document-performance")
+def get_document_performance(hours: int = Query(24, ge=0)) -> dict:
+    """Capacity view for the document/privacy-service pipeline (convert-*,
+    /v1/document/convert*, /v1/privacy/smart-anonymize). Same shape as
+    /v1/metrics/prompt-performance, pre-filtered to document/privacy
+    agent_ids, plus busy_rate_pct per agent (see DOCUMENT_AGENT_IDS /
+    concurrent_calls_at_start in prompt_metrics.py for the exact semantics
+    and the per-worker-lower-bound caveat). No live privacy_service_live
+    snapshot here — that field only exists on the worker route
+    (src/main.py), since this reader has no in-process privacy client.
+    """
+    local = get_prompt_metrics().get_stats(hours=hours, agent_ids=DOCUMENT_AGENT_IDS)
+    prod = _fetch_prod(f"/v1/metrics/document-performance?hours={hours}", timeout=3)
+    if prod:
+        return _merge_prompt_performance(local, prod)
     return local
 
 

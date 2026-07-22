@@ -1785,10 +1785,10 @@ async def generate_streaming_response(
                 logger.info(f"📊 Streaming usage tracked: {est_prompt_tokens}+{est_completion_tokens} tokens")
 
             # Log to prompt metrics (always, even without tenant)
-            from src.middleware.prompt_metrics import prompt_metrics_collector
+            from src.middleware.prompt_metrics import get_prompt_metrics
             if fastapi_request:
                 attr = extract_attribution_context(fastapi_request)
-                prompt_metrics_collector.record(
+                get_prompt_metrics().record(
                     app_id=attr.get("app_id") or "unknown",
                     agent_id=attr.get("agent_id") or "unknown",
                     workflow_id=attr.get("workflow_id"),
@@ -5343,6 +5343,43 @@ async def list_providers():
     return {"providers": list_available_providers()}
 
 
+def _record_document_call_metrics(
+    request: Request,
+    *,
+    agent_id: str,
+    model: str,
+    status: str,
+    duration_ms: int,
+    concurrent_calls_at_start: Optional[int] = None,
+    error_code: Optional[str] = None,
+) -> None:
+    """Feed a document/privacy-service proxy call into the same
+    prompt-performance JSONL pipeline LLM calls use (src/middleware/prompt_metrics.py),
+    so the capacity endpoints see duration/error-rate/busy-rate for the
+    privacy-service bottleneck — not just business Activity records
+    (persist_ai_call_activity, which this does not replace or touch).
+    Non-blocking: a recording failure must never break the actual response.
+    """
+    try:
+        from src.middleware.prompt_metrics import get_prompt_metrics
+        _attr = extract_attribution_context(request)
+        get_prompt_metrics().record(
+            app_id=_attr.get("app_id"),
+            agent_id=agent_id,
+            workflow_id=_attr.get("workflow_id"),
+            duration_ms=duration_ms,
+            status=status,
+            model=model,
+            error_code=error_code,
+            user_id=_attr.get("user_id"),
+            session_id=_attr.get("session_id"),
+            job_id=_attr.get("job_id"),
+            concurrent_calls_at_start=concurrent_calls_at_start,
+        )
+    except Exception as e:
+        logger.warning(f"{agent_id} prompt-metrics recording failed (non-blocking): {e}")
+
+
 @app.get("/v1/privacy/status")
 async def get_privacy_status():
     """Get privacy service status. Proxies to privacy-pdf-service container."""
@@ -5398,21 +5435,24 @@ async def smart_anonymize_endpoint(
 
     _start = time.time()
     privacy_client = get_privacy_client()
+    _concurrent_before = None
     try:
         client = await privacy_client._get_client()
-        response = await client.post("/smart-anonymize", json={
-            "text": request_body.text,
-            "language": request_body.language or "de",
-            "context_hint": request_body.context_hint,
-            "prefix": request_body.prefix,
-        }, timeout=1200.0)  # Local Flair NER inference on CPU takes ~8-11s per
-        # 1K chars under load (measured 2026-07-03), so 20min covers documents
-        # up to roughly 110K chars. Memory is bounded regardless of size
-        # (flair_recognizer windowing). Callers (document-pipeline client,
-        # 21min) must stay ABOVE this value so the privacy service's own error
-        # surfaces before the app cuts the call. nginx allows 2500s.
+        async with privacy_client.track_call() as _concurrent_before:
+            response = await client.post("/smart-anonymize", json={
+                "text": request_body.text,
+                "language": request_body.language or "de",
+                "context_hint": request_body.context_hint,
+                "prefix": request_body.prefix,
+            }, timeout=1200.0)  # Local Flair NER inference on CPU takes ~8-11s per
+            # 1K chars under load (measured 2026-07-03), so 20min covers documents
+            # up to roughly 110K chars. Memory is bounded regardless of size
+            # (flair_recognizer windowing). Callers (document-pipeline client,
+            # 21min) must stay ABOVE this value so the privacy service's own error
+            # surfaces before the app cuts the call. nginx allows 2500s.
         response.raise_for_status()
         result = SmartAnonymizeResponse(**response.json())
+        _duration_ms = int((time.time() - _start) * 1000)
         try:
             _attr = extract_attribution_context(request)
             from src.activity.ai_call_writer import persist_ai_call_activity
@@ -5425,14 +5465,20 @@ async def smart_anonymize_endpoint(
                 input_tokens=0,
                 output_tokens=0,
                 status="success",
-                duration_ms=int((time.time() - _start) * 1000),
+                duration_ms=_duration_ms,
                 app_env=_attr.get("app_env"),
             )
         except Exception as _te:
             logger.warning(f"anonymisierung activity tracking failed (non-blocking): {_te}")
+        _record_document_call_metrics(
+            request, agent_id="anonymisierung", model="privacy-service",
+            status="success", duration_ms=_duration_ms,
+            concurrent_calls_at_start=_concurrent_before,
+        )
         return result
     except Exception as e:
         logger.error(f"Smart anonymization failed: {e}", exc_info=True)
+        _duration_ms = int((time.time() - _start) * 1000)
         try:
             _attr = extract_attribution_context(request)
             from src.activity.ai_call_writer import persist_ai_call_activity
@@ -5445,11 +5491,17 @@ async def smart_anonymize_endpoint(
                 input_tokens=0,
                 output_tokens=0,
                 status="error",
-                duration_ms=int((time.time() - _start) * 1000),
+                duration_ms=_duration_ms,
                 app_env=_attr.get("app_env"),
             )
         except Exception as _te:
             logger.warning(f"anonymisierung error tracking failed (non-blocking): {_te}")
+        _record_document_call_metrics(
+            request, agent_id="anonymisierung", model="privacy-service",
+            status="error", duration_ms=_duration_ms,
+            concurrent_calls_at_start=_concurrent_before,
+            error_code=type(e).__name__,
+        )
         return SmartAnonymizeResponse(
             status="error",
             error=str(e)
@@ -5468,6 +5520,9 @@ async def convert_pdf_endpoint(
     """Convert PDF to Markdown. Proxied to privacy-pdf-service (has Docling)."""
     await verify_api_key(request, credentials)
 
+    _start = time.time()
+    privacy_client = get_privacy_client()
+    _concurrent_before = None
     try:
         form = await request.form()
         file = form.get("file")
@@ -5480,21 +5535,31 @@ async def convert_pdf_endpoint(
         filename = getattr(file, "filename", "upload.pdf") or "upload.pdf"
         pdf_bytes = await file.read()
 
-        privacy_client = get_privacy_client()
         client = await privacy_client._get_client()
 
         # Forward as multipart to privacy-pdf-service
-        response = await client.post(
-            "/convert-pdf",
-            files={"file": (filename, pdf_bytes, "application/pdf")},
-            timeout=300.0,  # PDF conversion can take a while
-        )
+        async with privacy_client.track_call() as _concurrent_before:
+            response = await client.post(
+                "/convert-pdf",
+                files={"file": (filename, pdf_bytes, "application/pdf")},
+                timeout=300.0,  # PDF conversion can take a while
+            )
         response.raise_for_status()
         data = response.json()
+        _record_document_call_metrics(
+            request, agent_id="pdf-konvertierung", model="docling",
+            status="success", duration_ms=int((time.time() - _start) * 1000),
+            concurrent_calls_at_start=_concurrent_before,
+        )
         return ConvertPdfResponse(**data)
 
     except Exception as e:
         logger.error(f"PDF conversion proxy failed: {e}", exc_info=True)
+        _record_document_call_metrics(
+            request, agent_id="pdf-konvertierung", model="docling",
+            status="error", duration_ms=int((time.time() - _start) * 1000),
+            concurrent_calls_at_start=_concurrent_before, error_code=type(e).__name__,
+        )
         return ConvertPdfResponse(
             status="error",
             error=f"PDF conversion failed: {str(e)}"
@@ -5509,6 +5574,9 @@ async def convert_pdf_to_semantic_html_endpoint(
     """Convert PDF to semantic HTML via ConvertAPI + AI. Proxied to privacy-pdf-service."""
     await verify_api_key(request, credentials)
 
+    _start = time.time()
+    privacy_client = get_privacy_client()
+    _concurrent_before = None
     try:
         form = await request.form()
         file = form.get("file")
@@ -5521,20 +5589,30 @@ async def convert_pdf_to_semantic_html_endpoint(
         filename = getattr(file, "filename", "upload.pdf") or "upload.pdf"
         pdf_bytes = await file.read()
 
-        privacy_client = get_privacy_client()
         client = await privacy_client._get_client()
 
         # Forward as multipart to privacy-pdf-service
-        response = await client.post(
-            "/convert-pdf-to-semantic-html",
-            files={"file": (filename, pdf_bytes, "application/pdf")},
-            timeout=600.0,  # ConvertAPI + AI conversion can take several minutes
-        )
+        async with privacy_client.track_call() as _concurrent_before:
+            response = await client.post(
+                "/convert-pdf-to-semantic-html",
+                files={"file": (filename, pdf_bytes, "application/pdf")},
+                timeout=600.0,  # ConvertAPI + AI conversion can take several minutes
+            )
         response.raise_for_status()
+        _record_document_call_metrics(
+            request, agent_id="pdf-zu-semantic-html", model="convertapi",
+            status="success", duration_ms=int((time.time() - _start) * 1000),
+            concurrent_calls_at_start=_concurrent_before,
+        )
         return JSONResponse(content=response.json())
 
     except Exception as e:
         logger.error(f"PDF-to-semantic-HTML proxy failed: {e}", exc_info=True)
+        _record_document_call_metrics(
+            request, agent_id="pdf-zu-semantic-html", model="convertapi",
+            status="error", duration_ms=int((time.time() - _start) * 1000),
+            concurrent_calls_at_start=_concurrent_before, error_code=type(e).__name__,
+        )
         return JSONResponse(
             status_code=500,
             content={"status": "error", "error": f"PDF-to-semantic-HTML conversion failed: {str(e)}"}
@@ -5549,6 +5627,9 @@ async def convert_html_to_docx_endpoint(
     """Convert HTML to DOCX via ConvertAPI. Proxied to privacy-pdf-service."""
     await verify_api_key(request, credentials)
 
+    _start = time.time()
+    privacy_client = get_privacy_client()
+    _concurrent_before = None
     try:
         body = await request.json()
         if not isinstance(body, dict) or not body.get("html"):
@@ -5557,19 +5638,29 @@ async def convert_html_to_docx_endpoint(
                 content={"status": "error", "error": "Request body must be JSON with 'html' field."}
             )
 
-        privacy_client = get_privacy_client()
         client = await privacy_client._get_client()
 
-        response = await client.post(
-            "/convert-html-to-docx",
-            json=body,
-            timeout=600.0,
-        )
+        async with privacy_client.track_call() as _concurrent_before:
+            response = await client.post(
+                "/convert-html-to-docx",
+                json=body,
+                timeout=600.0,
+            )
         response.raise_for_status()
+        _record_document_call_metrics(
+            request, agent_id="html-zu-docx", model="convertapi",
+            status="success", duration_ms=int((time.time() - _start) * 1000),
+            concurrent_calls_at_start=_concurrent_before,
+        )
         return JSONResponse(content=response.json())
 
     except Exception as e:
         logger.error(f"HTML-to-DOCX proxy failed: {e}", exc_info=True)
+        _record_document_call_metrics(
+            request, agent_id="html-zu-docx", model="convertapi",
+            status="error", duration_ms=int((time.time() - _start) * 1000),
+            concurrent_calls_at_start=_concurrent_before, error_code=type(e).__name__,
+        )
         return JSONResponse(
             status_code=500,
             content={"status": "error", "error": f"HTML-to-DOCX conversion failed: {str(e)}"}
@@ -5584,6 +5675,9 @@ async def convert_docx_to_html_endpoint(
     """Convert DOCX to editable HTML via ConvertAPI (Word import). Proxied to privacy-pdf-service."""
     await verify_api_key(request, credentials)
 
+    _start = time.time()
+    privacy_client = get_privacy_client()
+    _concurrent_before = None
     try:
         body = await request.json()
         if not isinstance(body, dict) or not body.get("docx_base64"):
@@ -5592,19 +5686,29 @@ async def convert_docx_to_html_endpoint(
                 content={"status": "error", "error": "Request body must be JSON with 'docx_base64' field."}
             )
 
-        privacy_client = get_privacy_client()
         client = await privacy_client._get_client()
 
-        response = await client.post(
-            "/convert-docx-to-html",
-            json=body,
-            timeout=600.0,
-        )
+        async with privacy_client.track_call() as _concurrent_before:
+            response = await client.post(
+                "/convert-docx-to-html",
+                json=body,
+                timeout=600.0,
+            )
         response.raise_for_status()
+        _record_document_call_metrics(
+            request, agent_id="docx-zu-html", model="convertapi",
+            status="success", duration_ms=int((time.time() - _start) * 1000),
+            concurrent_calls_at_start=_concurrent_before,
+        )
         return JSONResponse(content=response.json())
 
     except Exception as e:
         logger.error(f"DOCX-to-HTML proxy failed: {e}", exc_info=True)
+        _record_document_call_metrics(
+            request, agent_id="docx-zu-html", model="convertapi",
+            status="error", duration_ms=int((time.time() - _start) * 1000),
+            concurrent_calls_at_start=_concurrent_before, error_code=type(e).__name__,
+        )
         return JSONResponse(
             status_code=500,
             content={"status": "error", "error": f"DOCX-to-HTML conversion failed: {str(e)}"}
@@ -5625,6 +5729,8 @@ async def convert_html_to_pdf_endpoint(
     await verify_api_key(request, credentials)
 
     _start = time.time()
+    privacy_client = get_privacy_client()
+    _concurrent_before = None
     try:
         body = await request.json()
         if not isinstance(body, dict) or not body.get("html"):
@@ -5633,15 +5739,16 @@ async def convert_html_to_pdf_endpoint(
                 content={"status": "error", "error": "Request body must be JSON with 'html' field."}
             )
 
-        privacy_client = get_privacy_client()
         client = await privacy_client._get_client()
 
-        response = await client.post(
-            "/convert-html-to-pdf",
-            json=body,
-            timeout=600.0,
-        )
+        async with privacy_client.track_call() as _concurrent_before:
+            response = await client.post(
+                "/convert-html-to-pdf",
+                json=body,
+                timeout=600.0,
+            )
         response.raise_for_status()
+        _duration_ms = int((time.time() - _start) * 1000)
         try:
             _attr = extract_attribution_context(request)
             from src.activity.ai_call_writer import persist_ai_call_activity
@@ -5654,15 +5761,21 @@ async def convert_html_to_pdf_endpoint(
                 input_tokens=0,
                 output_tokens=0,
                 status="success",
-                duration_ms=int((time.time() - _start) * 1000),
+                duration_ms=_duration_ms,
                 app_env=_attr.get("app_env"),
             )
         except Exception as _te:
             logger.warning(f"pdf-export activity tracking failed (non-blocking): {_te}")
+        _record_document_call_metrics(
+            request, agent_id="pdf-export", model="html-renderer",
+            status="success", duration_ms=_duration_ms,
+            concurrent_calls_at_start=_concurrent_before,
+        )
         return JSONResponse(content=response.json())
 
     except Exception as e:
         logger.error(f"HTML-to-PDF proxy failed: {e}", exc_info=True)
+        _duration_ms = int((time.time() - _start) * 1000)
         try:
             _attr = extract_attribution_context(request)
             from src.activity.ai_call_writer import persist_ai_call_activity
@@ -5675,11 +5788,16 @@ async def convert_html_to_pdf_endpoint(
                 input_tokens=0,
                 output_tokens=0,
                 status="error",
-                duration_ms=int((time.time() - _start) * 1000),
+                duration_ms=_duration_ms,
                 app_env=_attr.get("app_env"),
             )
         except Exception as _te:
             logger.warning(f"pdf-export error tracking failed (non-blocking): {_te}")
+        _record_document_call_metrics(
+            request, agent_id="pdf-export", model="html-renderer",
+            status="error", duration_ms=_duration_ms,
+            concurrent_calls_at_start=_concurrent_before, error_code=type(e).__name__,
+        )
         return JSONResponse(
             status_code=500,
             content={"status": "error", "error": f"HTML-to-PDF conversion failed: {str(e)}"}
@@ -5701,6 +5819,8 @@ async def convert_html_to_screenshot_endpoint(
     await verify_api_key(request, credentials)
 
     _start = time.time()
+    privacy_client = get_privacy_client()
+    _concurrent_before = None
     try:
         body = await request.json()
         if not isinstance(body, dict) or not body.get("html"):
@@ -5709,15 +5829,16 @@ async def convert_html_to_screenshot_endpoint(
                 content={"status": "error", "error": "Request body must be JSON with 'html' field."}
             )
 
-        privacy_client = get_privacy_client()
         client = await privacy_client._get_client()
 
-        response = await client.post(
-            "/convert-html-to-screenshot",
-            json=body,
-            timeout=600.0,
-        )
+        async with privacy_client.track_call() as _concurrent_before:
+            response = await client.post(
+                "/convert-html-to-screenshot",
+                json=body,
+                timeout=600.0,
+            )
         response.raise_for_status()
+        _duration_ms = int((time.time() - _start) * 1000)
         try:
             _attr = extract_attribution_context(request)
             from src.activity.ai_call_writer import persist_ai_call_activity
@@ -5730,15 +5851,21 @@ async def convert_html_to_screenshot_endpoint(
                 input_tokens=0,
                 output_tokens=0,
                 status="success",
-                duration_ms=int((time.time() - _start) * 1000),
+                duration_ms=_duration_ms,
                 app_env=_attr.get("app_env"),
             )
         except Exception as _te:
             logger.warning(f"screenshot activity tracking failed (non-blocking): {_te}")
+        _record_document_call_metrics(
+            request, agent_id="screenshot", model="html-renderer",
+            status="success", duration_ms=_duration_ms,
+            concurrent_calls_at_start=_concurrent_before,
+        )
         return JSONResponse(content=response.json())
 
     except Exception as e:
         logger.error(f"HTML-to-screenshot proxy failed: {e}", exc_info=True)
+        _duration_ms = int((time.time() - _start) * 1000)
         try:
             _attr = extract_attribution_context(request)
             from src.activity.ai_call_writer import persist_ai_call_activity
@@ -5751,11 +5878,16 @@ async def convert_html_to_screenshot_endpoint(
                 input_tokens=0,
                 output_tokens=0,
                 status="error",
-                duration_ms=int((time.time() - _start) * 1000),
+                duration_ms=_duration_ms,
                 app_env=_attr.get("app_env"),
             )
         except Exception as _te:
             logger.warning(f"screenshot error tracking failed (non-blocking): {_te}")
+        _record_document_call_metrics(
+            request, agent_id="screenshot", model="html-renderer",
+            status="error", duration_ms=_duration_ms,
+            concurrent_calls_at_start=_concurrent_before, error_code=type(e).__name__,
+        )
         return JSONResponse(
             status_code=500,
             content={"status": "error", "error": f"HTML-to-screenshot conversion failed: {str(e)}"}
@@ -5770,6 +5902,9 @@ async def convert_pdf_to_html_direct_endpoint(
     """Convert PDF to pixel-perfect HTML via ConvertAPI. Proxied to privacy-pdf-service."""
     await verify_api_key(request, credentials)
 
+    _start = time.time()
+    privacy_client = get_privacy_client()
+    _concurrent_before = None
     try:
         body = await request.json()
         if not isinstance(body, dict) or not body.get("pdf_base64"):
@@ -5778,19 +5913,29 @@ async def convert_pdf_to_html_direct_endpoint(
                 content={"status": "error", "error": "Request body must be JSON with 'pdf_base64' field."}
             )
 
-        privacy_client = get_privacy_client()
         client = await privacy_client._get_client()
 
-        response = await client.post(
-            "/convert-pdf-to-html-direct",
-            json=body,
-            timeout=600.0,
-        )
+        async with privacy_client.track_call() as _concurrent_before:
+            response = await client.post(
+                "/convert-pdf-to-html-direct",
+                json=body,
+                timeout=600.0,
+            )
         response.raise_for_status()
+        _record_document_call_metrics(
+            request, agent_id="pdf-zu-html-direkt", model="convertapi",
+            status="success", duration_ms=int((time.time() - _start) * 1000),
+            concurrent_calls_at_start=_concurrent_before,
+        )
         return JSONResponse(content=response.json())
 
     except Exception as e:
         logger.error(f"PDF-to-HTML-direct proxy failed: {e}", exc_info=True)
+        _record_document_call_metrics(
+            request, agent_id="pdf-zu-html-direkt", model="convertapi",
+            status="error", duration_ms=int((time.time() - _start) * 1000),
+            concurrent_calls_at_start=_concurrent_before, error_code=type(e).__name__,
+        )
         return JSONResponse(
             status_code=500,
             content={"status": "error", "error": f"PDF-to-HTML-direct conversion failed: {str(e)}"}
@@ -5805,13 +5950,22 @@ async def convert_pdf_to_html_direct_endpoint(
 
 
 async def _proxy_document_endpoint(
-    request: Request, downstream_path: str, timeout: float
+    request: Request, downstream_path: str, timeout: float,
+    *, agent_id: str, model: str = "docling",
 ) -> JSONResponse:
     """Forward a multipart document upload to the privacy-pdf-service.
 
     Preserves filename, MIME type and any extra string form fields the caller
     sent (e.g. ``language``, ``privacy_mode``, ``mime_type_hint``).
+
+    Records duration/status/concurrency into the prompt-performance metrics
+    pipeline (see _record_document_call_metrics) for every caller of this
+    shared helper — centralized here so /v1/document/convert and
+    /v1/document/convert-and-anonymize don't each need their own tracking.
     """
+    _start = time.time()
+    privacy_client = get_privacy_client()
+    _concurrent_before = None
     try:
         form = await request.form()
         file = form.get("file")
@@ -5833,25 +5987,37 @@ async def _proxy_document_endpoint(
             if isinstance(value, str):
                 extra_data[key] = value
 
-        privacy_client = get_privacy_client()
         client = await privacy_client._get_client()
 
-        response = await client.post(
-            downstream_path,
-            files={"file": (filename, content, content_type)},
-            data=extra_data,
-            timeout=timeout,
-        )
+        async with privacy_client.track_call() as _concurrent_before:
+            response = await client.post(
+                downstream_path,
+                files={"file": (filename, content, content_type)},
+                data=extra_data,
+                timeout=timeout,
+            )
 
         # Surface upstream status codes 1:1 so callers see 415/413/etc.
         try:
             payload = response.json()
         except Exception:
             payload = {"status": "error", "error": response.text[:500]}
+        _record_document_call_metrics(
+            request, agent_id=agent_id, model=model,
+            status="success" if response.status_code < 400 else "error",
+            duration_ms=int((time.time() - _start) * 1000),
+            concurrent_calls_at_start=_concurrent_before,
+            error_code=str(response.status_code) if response.status_code >= 400 else None,
+        )
         return JSONResponse(status_code=response.status_code, content=payload)
 
     except Exception as e:
         logger.error(f"Document proxy ({downstream_path}) failed: {e}", exc_info=True)
+        _record_document_call_metrics(
+            request, agent_id=agent_id, model=model,
+            status="error", duration_ms=int((time.time() - _start) * 1000),
+            concurrent_calls_at_start=_concurrent_before, error_code=type(e).__name__,
+        )
         return JSONResponse(
             status_code=500,
             content={"status": "error", "error": f"Document conversion failed: {str(e)}"},
@@ -5866,7 +6032,9 @@ async def convert_document_endpoint(
     """Convert any supported document type to Markdown via the privacy service."""
     await verify_api_key(request, credentials)
     _start = time.time()
-    result = await _proxy_document_endpoint(request, "/document/convert", timeout=600.0)
+    result = await _proxy_document_endpoint(
+        request, "/document/convert", timeout=600.0, agent_id="dokument-konvertierung",
+    )
     try:
         _attr = extract_attribution_context(request)
         from src.activity.ai_call_writer import persist_ai_call_activity
@@ -5922,7 +6090,8 @@ async def convert_and_anonymize_document_endpoint(
         ))
 
     return await _proxy_document_endpoint(
-        request, "/document/convert-and-anonymize", timeout=900.0
+        request, "/document/convert-and-anonymize", timeout=900.0,
+        agent_id="dokument-konvertierung-anonymisiert",
     )
 
 
@@ -6610,6 +6779,44 @@ async def get_usage_breakdown(
 
     collector = get_prompt_metrics()
     return collector.get_usage_breakdown(hours=max(hours, 0))
+
+
+@app.get("/v1/metrics/document-performance")
+async def get_document_performance(
+    hours: int = 24,
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(security)
+):
+    """
+    Capacity view for the document/privacy-service pipeline (convert-*,
+    /v1/document/convert*, /v1/privacy/smart-anonymize — everything proxied
+    to the privacy-pdf-service container).
+
+    Same duration/error-rate stats as /v1/metrics/prompt-performance, but
+    pre-filtered to just the document/privacy agent_ids, plus a per-agent
+    "busy_rate_pct": the share of calls that started while another call to
+    the (single UVICORN_WORKERS=1) privacy-pdf-service container was already
+    in flight ON THE SAME WORKER. This bridge has N workers sharing ONE
+    privacy-service container, so true cross-worker concurrency is >= what
+    a single agent's busy_rate_pct shows — a per-worker LOWER BOUND signal,
+    not an exact global occupancy number.
+
+    Also includes a live (uncached) snapshot of THIS worker's current
+    in-flight privacy-service calls, for "is it busy right now" checks.
+
+    Query params:
+        hours: Time window (default 24, 0 = all time)
+    """
+    from src.middleware.prompt_metrics import get_prompt_metrics, DOCUMENT_AGENT_IDS
+
+    collector = get_prompt_metrics()
+    stats = collector.get_stats(hours=max(hours, 0), agent_ids=DOCUMENT_AGENT_IDS)
+    privacy_client = get_privacy_client()
+    stats["privacy_service_live"] = {
+        "worker": os.getenv("INSTANCE_NAME", "unknown"),
+        "active_calls_this_worker": privacy_client.active_calls,
+        "note": "Per-worker snapshot only, not a cross-worker total — see busy_rate_pct docstring.",
+    }
+    return stats
 
 
 # ============================================================================

@@ -86,12 +86,26 @@ def _make_httpx_response(status_code=200, json_data=None):
     return resp
 
 
+class _FakeTrackCall:
+    """Stand-in for PrivacyServiceClient.track_call(): an async context
+    manager yielding a fixed concurrency count (0 = no overlap seen)."""
+    def __init__(self, concurrent_before=0):
+        self._concurrent_before = concurrent_before
+
+    async def __aenter__(self):
+        return self._concurrent_before
+
+    async def __aexit__(self, *exc_info):
+        return False
+
+
 def _privacy_client_ctx(response):
     """Return a mock privacy_client whose _get_client() gives an async ctx manager."""
     inner_client = AsyncMock()
     inner_client.post = AsyncMock(return_value=response)
     pc = AsyncMock()
     pc._get_client = AsyncMock(return_value=inner_client)
+    pc.track_call = MagicMock(return_value=_FakeTrackCall())
     return pc
 
 
