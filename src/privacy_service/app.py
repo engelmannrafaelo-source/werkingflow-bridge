@@ -43,6 +43,18 @@ def _truthy(value: Any) -> bool:
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 logger = logging.getLogger("privacy-service")
 
+# Docling conversions are CPU/memory-heavy and ran fully unbounded on the default
+# executor — several large multi-image PDFs converting at once has repeatedly
+# pushed this container's RSS past its cgroup limit and gotten the single
+# uvicorn process OOM-killed, taking down every in-flight request from every
+# caller at once (see incident 2026-07-22: 3x OOM-kill of the uvicorn process
+# at ~16GB RSS within 17h). This semaphore bounds concurrent conversions across
+# /convert-pdf, /document/convert and /document/convert-and-anonymize so memory
+# stays under the ceiling; excess requests queue for a free slot instead of all
+# racing to completion together.
+_MAX_CONCURRENT_CONVERSIONS = int(os.getenv("BRIDGE_MAX_CONCURRENT_CONVERSIONS", "2"))
+_CONVERSION_SEMAPHORE = asyncio.Semaphore(_MAX_CONCURRENT_CONVERSIONS)
+
 
 # ======================== Request/Response Models ========================
 
@@ -240,9 +252,10 @@ async def convert_pdf_service_endpoint(request: Request):
         t_start = _time.time()
 
         loop = asyncio.get_event_loop()
-        markdown, metadata, images = await loop.run_in_executor(
-            None, convert_pdf_bytes, pdf_bytes
-        )
+        async with _CONVERSION_SEMAPHORE:
+            markdown, metadata, images = await loop.run_in_executor(
+                None, convert_pdf_bytes, pdf_bytes
+            )
         page_count = metadata.get("pages")
 
         # Opt-in image descriptions (see /document/convert + image_describer).
@@ -367,9 +380,10 @@ async def document_convert_endpoint(request: Request):
     chain = _get_chain()
 
     try:
-        result = await loop.run_in_executor(
-            None, chain.convert, content, filename, mime_hint
-        )
+        async with _CONVERSION_SEMAPHORE:
+            result = await loop.run_in_executor(
+                None, chain.convert, content, filename, mime_hint
+            )
     except UnsupportedFormatError as e:
         logger.warning(f"document/convert unsupported: {e}")
         raise HTTPException(status_code=415, detail=str(e))
@@ -452,9 +466,10 @@ async def document_convert_and_anonymize_endpoint(request: Request):
 
     # Step 1 — convert via adapter chain (deterministic adapters first, AI fallback last)
     try:
-        conversion = await loop.run_in_executor(
-            None, chain.convert, content, filename, mime_hint
-        )
+        async with _CONVERSION_SEMAPHORE:
+            conversion = await loop.run_in_executor(
+                None, chain.convert, content, filename, mime_hint
+            )
     except UnsupportedFormatError as e:
         logger.warning(f"convert-and-anonymize unsupported: {e}")
         raise HTTPException(status_code=415, detail=str(e))
