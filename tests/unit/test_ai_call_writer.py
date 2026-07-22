@@ -366,3 +366,76 @@ async def test_anonymous_without_identity_row_skips_loudly():
 
     assert any("migration 032" in str(c) for c in mock_warn.call_args_list)
     conn.execute.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Test: error_message persisted (truncated) into activities + usage_events
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_error_message_persisted_truncated():
+    """Error calls carry the provider error text (capped at 500 chars) in BOTH
+    the activities payload (errorMessage) and usage_events provider_metadata
+    (error_message) — a bare errorCode is undiagnosable after log rotation."""
+    writer._skip_counts.clear()
+
+    t_row = _tenant_row(TENANT_UUID)
+    conn = _make_mock_conn(tenant_row=t_row)
+    pool = _pool_ctx(conn)
+
+    long_msg = "Bedrock API error (ValidationException): " + "x" * 600
+
+    with (
+        patch.object(writer, "get_pool", return_value=pool),
+        patch.object(writer, "_deduct_call_cost"),
+    ):
+        await writer.persist_ai_call_activity(
+            app_id="werking-energy",
+            user_id=VALID_UUID,
+            agent_id="upload-verarbeitung",
+            workflow_id="wf-1",
+            model="claude-sonnet-5",
+            input_tokens=0,
+            output_tokens=0,
+            status="error",
+            duration_ms=300,
+            error_code="400",
+            error_message=long_msg,
+            app_env="prod",
+        )
+
+    import json as _json
+    assert conn.execute.call_count == 2
+    activities_payload = _json.loads(conn.execute.call_args_list[0].args[5])
+    usage_metadata = _json.loads(conn.execute.call_args_list[1].args[16])
+
+    assert activities_payload["errorCode"] == "400"
+    assert activities_payload["errorMessage"] == long_msg[:500]
+    assert len(activities_payload["errorMessage"]) == 500
+
+    assert usage_metadata["status"] == "error"
+    assert usage_metadata["error_code"] == "400"
+    assert usage_metadata["error_message"] == long_msg[:500]
+
+
+@pytest.mark.asyncio
+async def test_success_rows_carry_no_error_fields():
+    """Success rows must not grow empty error keys."""
+    writer._skip_counts.clear()
+
+    t_row = _tenant_row(TENANT_UUID)
+    conn = _make_mock_conn(tenant_row=t_row)
+    pool = _pool_ctx(conn)
+
+    with (
+        patch.object(writer, "get_pool", return_value=pool),
+        patch.object(writer, "_deduct_call_cost"),
+    ):
+        await _call_writer(user_id=VALID_UUID)
+
+    import json as _json
+    activities_payload = _json.loads(conn.execute.call_args_list[0].args[5])
+    usage_metadata = _json.loads(conn.execute.call_args_list[1].args[16])
+    assert "errorMessage" not in activities_payload
+    assert "error_message" not in usage_metadata
+    assert "error_code" not in usage_metadata

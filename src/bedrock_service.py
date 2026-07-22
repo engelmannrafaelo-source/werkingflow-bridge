@@ -464,6 +464,9 @@ async def stream_bedrock(
 
     except Exception as e:
         logger.error(f"Bedrock streaming error: {e}")
+        # Surface the provider error to the usage tracker (sink outlives the
+        # generator) — status stays 'error' from the setdefault above.
+        usage_sink["error_message"] = str(e)
         yield f"data: {{\"error\": \"{str(e)}\"}}\n\n"
 
 

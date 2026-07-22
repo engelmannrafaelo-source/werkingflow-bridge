@@ -177,6 +177,7 @@ async def persist_ai_call_activity(
     status: str,
     duration_ms: int,
     error_code: Optional[str] = None,
+    error_message: Optional[str] = None,
     app_env: Optional[str] = None,
     provider: str = "anthropic",
     provider_meta: Optional[dict] = None,
@@ -188,6 +189,11 @@ async def persist_ai_call_activity(
     Write one ai-call activity row. Never raises — tracking is best-effort.
 
     status: "success" | "error"
+    error_message: human-readable provider/bridge error detail (e.g. the
+        Bedrock ValidationException text). Persisted TRUNCATED alongside
+        error_code — a bare "400" is undiagnosable once the container logs
+        have rotated (johann.muehl 2026-07-20: 240 bare-400 rows, root cause
+        only recoverable from an app-side job file).
     app_env: already-normalised environment bucket (prod|staging|local) the
         call came from, or None when the app sent no X-App-Env header. The
         caller normalises it (extract_attribution_context); we just persist
@@ -368,6 +374,8 @@ async def persist_ai_call_activity(
             }
             if error_code:
                 payload["errorCode"] = error_code
+            if error_message:
+                payload["errorMessage"] = str(error_message)[:500]
             if anon_reason is not None:
                 # Which call-site declared itself anonymous — the per-<grund>
                 # breakdown inside the anonymous bucket.
@@ -449,6 +457,8 @@ async def persist_ai_call_activity(
                     "agent_id": agent_id,
                     "workflow_id": workflow_id,
                     "status": status,
+                    **({"error_code": error_code} if error_code else {}),
+                    **({"error_message": str(error_message)[:500]} if error_message else {}),
                     # App-tier policy booked this call's cost to an internal
                     # account (customer budget NOT charged). Queryable via
                     # provider_metadata->>'billing_account'.
