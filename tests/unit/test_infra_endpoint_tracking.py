@@ -39,6 +39,7 @@ for _mod in [
     if _mod not in sys.modules:
         sys.modules[_mod] = _MM()
 
+import httpx
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -84,6 +85,15 @@ def _make_httpx_response(status_code=200, json_data=None):
     resp.json = MagicMock(return_value=json_data or {"status": "ok"})
     resp.raise_for_status = MagicMock()
     return resp
+
+
+def _make_httpx_status_error(status_code: int, detail: str) -> httpx.HTTPStatusError:
+    """A real httpx.HTTPStatusError carrying a JSON {"detail": ...} body, the
+    shape FastAPI's HTTPException produces (e.g. the smart-anonymize
+    admission-control 503)."""
+    request = httpx.Request("POST", "http://privacy-service:8100/smart-anonymize")
+    response = httpx.Response(status_code, json={"detail": detail}, request=request)
+    return httpx.HTTPStatusError(f"{status_code} error", request=request, response=response)
 
 
 class _FakeTrackCall:
@@ -185,6 +195,38 @@ class TestSmartAnonymizeTracking:
         # response must still come through despite persist failing
         assert result.status != "error" or result.error is None or "DB" not in (result.error or "")
         mock_persist.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_downstream_503_surfaces_privacy_service_detail(self):
+        """A privacy-service HTTPException (e.g. admission-control 503) must
+        surface its actual `detail` message, not a generic httpx status string —
+        otherwise a caller sees 'Client error 503 ...' instead of the reason."""
+        mock_persist = AsyncMock()
+        fake_resp = _make_httpx_response(503)
+        fake_resp.raise_for_status = MagicMock(
+            side_effect=_make_httpx_status_error(
+                503,
+                "smart-anonymize at capacity: no free analysis slot after 600s "
+                "(max 2 concurrent). Retry later.",
+            )
+        )
+        pc = _privacy_client_ctx(fake_resp)
+
+        with (
+            patch("src.main.get_privacy_client", return_value=pc),
+            patch("src.main.extract_attribution_context", return_value=_fake_attr()),
+            patch("src.activity.ai_call_writer.persist_ai_call_activity", mock_persist),
+            patch("src.main.verify_api_key", new=AsyncMock()),
+            patch.dict("os.environ", {"BRIDGE_ANONYMIZE_ENABLED": "true"}),
+        ):
+            result = await src.main.smart_anonymize_endpoint(
+                request=_mock_request(),
+                request_body=_mock_request_body(),
+            )
+
+        assert result.status == "error"
+        assert "at capacity" in result.error
+        assert "503" in result.error
 
 
 # ---------------------------------------------------------------------------

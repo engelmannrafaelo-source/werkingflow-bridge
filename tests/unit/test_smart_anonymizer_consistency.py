@@ -48,7 +48,13 @@ def _make_result(
 
 
 def _run(coro):
-    return asyncio.get_event_loop().run_until_complete(coro)
+    # asyncio.run() (not get_event_loop().run_until_complete()): the deprecated
+    # get_event_loop() only auto-vivifies a loop if the thread never had one.
+    # Once anything else in the same pytest session (e.g. a FastAPI TestClient
+    # test) has run and torn down a loop on this thread, Python 3.12 raises
+    # "There is no current event loop" instead of creating a new one — a
+    # session test-order dependency, not a real ordering requirement here.
+    return asyncio.run(coro)
 
 
 # ─────────────────────────────────────────────────────────────────────────────

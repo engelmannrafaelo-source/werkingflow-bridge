@@ -55,6 +55,22 @@ logger = logging.getLogger("privacy-service")
 _MAX_CONCURRENT_CONVERSIONS = int(os.getenv("BRIDGE_MAX_CONCURRENT_CONVERSIONS", "2"))
 _CONVERSION_SEMAPHORE = asyncio.Semaphore(_MAX_CONCURRENT_CONVERSIONS)
 
+# /smart-anonymize has no admission control today: any number of concurrent
+# requests are accepted and all funnel into the same 2-thread Presidio/Flair
+# executor (anonymizer.py._get_executor). Under realistic concurrent load
+# (e.g. werking-report's batched anonymizeMany firing several large-text
+# calls per document-heavy project) requests queued for that executor with NO
+# bound and NO signal to the caller — root-caused 2026-07-22 as the source of
+# reports that smart-anonymize "hangs" on large texts. This semaphore keeps
+# the same admission-control pattern as _CONVERSION_SEMAPHORE above, but adds
+# a bounded wait: a request stuck behind a full queue longer than
+# SMART_ANONYMIZE_QUEUE_TIMEOUT_S fails loud with a clear "at capacity"
+# reason instead of silently waiting for the caller's own client timeout (or
+# worse, an opaque connection reset) to surface first.
+_SMART_ANONYMIZE_MAX_CONCURRENT = int(os.getenv("SMART_ANONYMIZE_MAX_CONCURRENT", "2"))
+_SMART_ANONYMIZE_QUEUE_TIMEOUT_S = float(os.getenv("SMART_ANONYMIZE_QUEUE_TIMEOUT_S", "600"))
+_SMART_ANONYMIZE_SEMAPHORE = asyncio.Semaphore(_SMART_ANONYMIZE_MAX_CONCURRENT)
+
 
 # ======================== Request/Response Models ========================
 
@@ -196,14 +212,36 @@ async def smart_anonymize_service_endpoint(req: SmartAnonymizeServiceRequest):
 
     Runs entirely inside this container — no cloud calls. (The former
     cloud-Haiku refinement stage was removed 2026-07-03.)
+
+    Admission-controlled (see _SMART_ANONYMIZE_SEMAPHORE above): waits for a
+    free analysis slot up to SMART_ANONYMIZE_QUEUE_TIMEOUT_S, then fails loud
+    with 503 rather than queuing indefinitely.
     """
     from src.privacy.smart_anonymizer import smart_anonymize
-    result = await smart_anonymize(
-        text=req.text,
-        language=req.language or "de",
-        context_hint=req.context_hint,
-        prefix=req.prefix,
-    )
+
+    try:
+        await asyncio.wait_for(
+            _SMART_ANONYMIZE_SEMAPHORE.acquire(),
+            timeout=_SMART_ANONYMIZE_QUEUE_TIMEOUT_S,
+        )
+    except asyncio.TimeoutError:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                f"smart-anonymize at capacity: no free analysis slot after "
+                f"{_SMART_ANONYMIZE_QUEUE_TIMEOUT_S:.0f}s "
+                f"(max {_SMART_ANONYMIZE_MAX_CONCURRENT} concurrent). Retry later."
+            ),
+        )
+    try:
+        result = await smart_anonymize(
+            text=req.text,
+            language=req.language or "de",
+            context_hint=req.context_hint,
+            prefix=req.prefix,
+        )
+    finally:
+        _SMART_ANONYMIZE_SEMAPHORE.release()
     return result
 
 

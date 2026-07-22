@@ -5494,7 +5494,21 @@ async def smart_anonymize_endpoint(
         )
         return result
     except Exception as e:
-        logger.error(f"Smart anonymization failed: {e}", exc_info=True)
+        # httpx.HTTPStatusError's own str() is generic ("Client error '503 ...'
+        # for url ...") and drops the privacy-service's actual JSON `detail`
+        # (e.g. the admission-control "at capacity" message) — extract it so
+        # fail-loud errors stay legible end-to-end instead of degrading into a
+        # meaningless status-code string once they cross this proxy hop.
+        import httpx
+        _error_message = str(e)
+        if isinstance(e, httpx.HTTPStatusError):
+            try:
+                _detail = e.response.json().get("detail")
+                if _detail:
+                    _error_message = f"privacy-service {e.response.status_code}: {_detail}"
+            except Exception:
+                pass
+        logger.error(f"Smart anonymization failed: {_error_message}", exc_info=True)
         _duration_ms = int((time.time() - _start) * 1000)
         try:
             _attr = extract_attribution_context(request)
@@ -5521,7 +5535,7 @@ async def smart_anonymize_endpoint(
         )
         return SmartAnonymizeResponse(
             status="error",
-            error=str(e)
+            error=_error_message
         )
 
 

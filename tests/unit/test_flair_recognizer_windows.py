@@ -61,3 +61,30 @@ class TestSplitWindows:
 
     def test_empty_text(self):
         assert FlairRecognizer._split_windows("") == []
+
+
+class TestTorchThreadCap:
+    """_get_model() must bound torch's intra-op thread count.
+
+    Without this, each of the executor's 2 concurrent predict() calls (see
+    anonymizer.py._get_executor) defaults to using every host core, so 2
+    concurrent large-text analyses fight for the same cores instead of
+    getting clean throughput (observed 2026-07-22: concurrent smart-anonymize
+    calls slowed down worse than a simple FIFO queue would predict).
+    """
+
+    def test_get_model_caps_torch_threads(self, monkeypatch):
+        pytest.importorskip("torch")
+        import torch
+        from flair.models import SequenceTagger
+
+        monkeypatch.setattr(FlairRecognizer, "_shared_model", None)
+        monkeypatch.setattr(SequenceTagger, "load", staticmethod(lambda path: object()))
+        monkeypatch.setattr(
+            "src.privacy.flair_recognizer._TORCH_THREADS", 2, raising=True
+        )
+
+        recognizer = FlairRecognizer()
+        recognizer._get_model()
+
+        assert torch.get_num_threads() == 2

@@ -13,11 +13,24 @@ over-detection we are eliminating. We map only the three hard PII classes.
 """
 from typing import List, Optional
 import logging
+import os
 
 from presidio_analyzer import EntityRecognizer, RecognizerResult
 from presidio_analyzer.nlp_engine import NlpArtifacts
 
 logger = logging.getLogger(__name__)
+
+# CPU oversubscription guard: PyTorch's default intra-op parallelism tries to
+# use EVERY host core for a single predict() call. The Presidio executor (see
+# anonymizer.py._get_executor, max_workers=2) runs up to 2 of these predict()
+# calls concurrently — without a cap, 2 concurrent inferences each fighting
+# for all cores causes CPU thrashing instead of clean 2x throughput, and wall
+# time under concurrent load grows worse than linearly with queue depth
+# (observed 2026-07-22: 8 concurrent 10K-char smart-anonymize calls took up to
+# 190s for the last one, more than the ~4x a pure FIFO 2-worker queue would
+# predict). Bounding threads per inference lets concurrent predict() calls
+# actually share the machine instead of contending for it.
+_TORCH_THREADS = int(os.getenv("SMART_ANONYMIZE_TORCH_THREADS", "2"))
 
 
 class FlairRecognizer(EntityRecognizer):
@@ -55,7 +68,13 @@ class FlairRecognizer(EntityRecognizer):
 
     def _get_model(self):
         if FlairRecognizer._shared_model is None:
+            import torch
             from flair.models import SequenceTagger
+            torch.set_num_threads(_TORCH_THREADS)
+            logger.info(
+                "torch intra-op threads capped at %d (SMART_ANONYMIZE_TORCH_THREADS)",
+                _TORCH_THREADS,
+            )
             logger.info("Loading Flair model %s ...", self.model_path)
             FlairRecognizer._shared_model = SequenceTagger.load(self.model_path)
             logger.info("Flair model loaded")
