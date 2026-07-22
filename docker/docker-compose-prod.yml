@@ -287,7 +287,10 @@ services:
     deploy:
       resources:
         limits:
-          memory: 512M
+          # 22.07. (dev-Host): Heavy-Endpoint-Polls OOM-killten den Child am
+          # 1536M-Limit → Reader taub → Sandbox-Leases 503. Prod poll-aermer,
+          # aber gleiche Codepfade — Headroom analog erhoeht (512M→1024M).
+          memory: 1024M
         reservations:
           memory: 128M
     volumes:
@@ -298,9 +301,11 @@ services:
       - TZ=Europe/Vienna
       - BRIDGE_WORKERS=worker-sahori,worker-kurt
     healthcheck:
-      test: ["CMD", "curl", "-fsS", "http://localhost:8000/health"]
+      # Echten Aggregationspfad pruefen, nicht nur den uvicorn-Master (siehe
+      # dev-Compose): 2 Worker-Polls x 3s Worst-Case → max-time 8s.
+      test: ["CMD", "curl", "-fsS", "--max-time", "8", "http://localhost:8000/v1/metrics/account-pool-state"]
       interval: 30s
-      timeout: 5s
+      timeout: 10s
       retries: 3
       start_period: 10s
     restart: unless-stopped

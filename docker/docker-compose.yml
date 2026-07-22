@@ -539,7 +539,11 @@ services:
     deploy:
       resources:
         limits:
-          memory: 1536M
+          # 22.07.: 1536M reichte nicht — parallele Dashboard-Polls der
+          # Heavy-Endpoints OOM-killten den uvicorn-Child im Minutentakt
+          # (Reader 30-60s taub → Sandbox-Leases 503). Headroom verdoppelt;
+          # der eigentliche Fix ist die tail-bounded Query + TTL-Cache.
+          memory: 3072M
         reservations:
           memory: 256M
     volumes:
@@ -552,9 +556,13 @@ services:
       # Aggregate metrics from production server (Server 2) if configured
       - BRIDGE_PROD_URL=${BRIDGE_PROD_URL:-}
     healthcheck:
-      test: ["CMD", "curl", "-fsS", "http://localhost:8000/health"]
+      # Echten Aggregationspfad pruefen, nicht nur den uvicorn-Master:
+      # /health antwortete "healthy", waehrend der OOM-gekillte Child keinen
+      # einzigen pool-state Request mehr beantwortete (22.07.). Worst case
+      # des Endpoints: 4 Worker-Polls x 3s → max-time 13s, timeout 15s.
+      test: ["CMD", "curl", "-fsS", "--max-time", "13", "http://localhost:8000/v1/metrics/account-pool-state"]
       interval: 30s
-      timeout: 5s
+      timeout: 15s
       retries: 3
       start_period: 10s
     restart: unless-stopped
