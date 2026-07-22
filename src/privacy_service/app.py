@@ -33,6 +33,7 @@ from src.privacy_service.image_describer import (
     describe_images,
     append_descriptions_to_markdown,
 )
+from src.privacy_service.image_triage import plan_image_descriptions
 
 
 def _truthy(value: Any) -> bool:
@@ -381,16 +382,31 @@ async def document_convert_endpoint(request: Request):
 
     body = result.to_response()
 
-    # Opt-in: run every extracted image through Vision and append the descriptions
-    # to the Markdown, so the converted document is self-contained without the
-    # raw images. Off by default (callers opt in via describe_images=true) so
-    # existing consumers stay byte-for-byte unchanged.
+    # Opt-in: run extracted images through Vision and append the descriptions to
+    # the Markdown, so the converted document is self-contained without the raw
+    # images. Off by default (callers opt in via describe_images=true) so existing
+    # consumers stay byte-for-byte unchanged.
+    #
+    # For image-heavy documents a cheap triage pass first decides which figures
+    # are worth a full description (see image_triage). Triaged-out figures stay
+    # VISIBLE as a short marker — never silently dropped — and below the triage
+    # threshold nothing changes (to_describe == result.images, triage_meta None).
     if want_descriptions and result.images:
-        descriptions = await describe_images(
-            result.images, context=filename, describe_prompt=describe_prompt
+        triage_prompt = extras.get("triage_prompt") or ""
+        to_describe, skipped_labels, triage_meta = await plan_image_descriptions(
+            result.images, triage_prompt=triage_prompt
         )
+        descriptions = await describe_images(
+            to_describe, context=filename, describe_prompt=describe_prompt
+        )
+        # Keep triaged-out figures present in the document (fail-loud, no drop).
+        for name, label in skipped_labels.items():
+            descriptions[name] = f"_[nicht detailliert analysiert — {label}]_"
         body["markdown"] = append_descriptions_to_markdown(body["markdown"], descriptions)
         body["image_descriptions"] = descriptions
+        if triage_meta:
+            body["described_count"] = len(to_describe)
+            body["triage"] = triage_meta
 
     duration = _time.time() - t_start
     logger.info(
