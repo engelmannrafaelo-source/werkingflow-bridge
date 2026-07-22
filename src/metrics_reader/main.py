@@ -49,7 +49,9 @@ from __future__ import annotations
 import json
 import logging
 import os
-from typing import Optional
+import threading
+import time
+from typing import Dict, Optional
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import JSONResponse
@@ -447,6 +449,16 @@ def get_document_performance(hours: int = Query(24, ge=0)) -> dict:
 # Persistent Request Log (file-based)
 # ============================================================================
 
+# TTL-Cache für den teuersten Lese-Endpoint: mehrere Poller (CUI-Panels,
+# Sandbox-Watchdog) fragen identische Fenster im Sekundentakt ab — ohne Cache
+# scannt jeder Treffer die request_log-Dateien erneut (2026-07-22: 4 Uvicorn-
+# Prozesse × Poller-Sturm × Full-Scan = 389% CPU, Healthcheck tot). Pro
+# Uvicorn-Prozess ein eigener Cache (kein Shared State nötig — TTL ist kurz).
+_REQUEST_LOG_CACHE: Dict[tuple, tuple] = {}
+_REQUEST_LOG_CACHE_TTL_S = float(os.getenv("METRICS_READER_CACHE_TTL_S", "15"))
+_REQUEST_LOG_CACHE_LOCK = threading.Lock()
+
+
 @app.get("/v1/metrics/request-log")
 def get_request_log_endpoint(
     hours: int = Query(24, ge=0),
@@ -455,6 +467,12 @@ def get_request_log_endpoint(
     limit: int = Query(200, ge=1, le=1000),
 ) -> dict:
     """Persistent request log from all workers (JSONL on shared volume)."""
+    cache_key = (hours, endpoint, status, limit)
+    now = time.time()
+    with _REQUEST_LOG_CACHE_LOCK:
+        hit = _REQUEST_LOG_CACHE.get(cache_key)
+        if hit and now - hit[0] < _REQUEST_LOG_CACHE_TTL_S:
+            return hit[1]
     local = get_request_log().query(
         hours=hours,
         endpoint_filter=endpoint,
@@ -467,9 +485,14 @@ def get_request_log_endpoint(
     if status:
         params += f"&status={status}"
     prod = _fetch_prod(f"/v1/metrics/request-log{params}", timeout=3)
-    if prod:
-        return _merge_request_log(local, prod, limit)
-    return local
+    result = _merge_request_log(local, prod, limit) if prod else local
+    with _REQUEST_LOG_CACHE_LOCK:
+        _REQUEST_LOG_CACHE[cache_key] = (now, result)
+        # Cache klein halten — alte Einträge beim Schreiben verdrängen.
+        for k in [k for k, v in _REQUEST_LOG_CACHE.items()
+                  if now - v[0] >= _REQUEST_LOG_CACHE_TTL_S]:
+            del _REQUEST_LOG_CACHE[k]
+    return result
 
 
 # ============================================================================

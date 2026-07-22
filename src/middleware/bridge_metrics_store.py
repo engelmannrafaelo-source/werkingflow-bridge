@@ -1,11 +1,15 @@
 """
 Bridge Metrics Store — Persistent JSONL storage for all Bridge metrics.
 
-Three streams, all cumulative (no pruning):
+Three streams:
 
 1. request_log.{worker}.jsonl
    Every HTTP request through the Bridge (endpoint, status, duration, model, tokens, cost, user, app).
    Replaces the in-memory RequestMetrics for historical queries.
+   Rotiert bei REQUEST_LOG_MAX_BYTES (Default 100 MB) nach .jsonl.1 (eine
+   Alt-Generation). Ohne Rotation wuchsen die Dateien auf 4×750 MB und jede
+   query() parste 3 GB pro Aufruf — das sättigte den metrics-reader bis zum
+   Healthcheck-Tod (2026-07-22).
 
 2. prompt_calls.{worker}.jsonl
    Already handled by prompt_metrics.py — not duplicated here.
@@ -17,13 +21,14 @@ All files live on the shared Docker volume at /app/logs/bridge-metrics/.
 """
 
 import os
+import fcntl
 import json
 import time
 import glob
 import threading
 import logging
 from collections import defaultdict
-from typing import Optional, Dict, List, Any
+from typing import Callable, Optional, Dict, List, Any
 
 logger = logging.getLogger(__name__)
 
@@ -31,6 +36,16 @@ METRICS_DIR = os.path.join(
     os.getenv("METRICS_DIR", "/app/logs"),
     "bridge-metrics"
 )
+
+# Rotation: aktive Datei + genau eine Alt-Generation (.jsonl.1). Bei 100 MB und
+# realen ~5 MB/Tag deckt das zusammen Monate ab — weit mehr als die 24h/7d-Queries.
+REQUEST_LOG_MAX_BYTES = int(os.getenv("REQUEST_LOG_MAX_BYTES", str(100 * 1024 * 1024)))
+# Lese-Budget pro Datei für query(): skaliert mit dem Zeitfenster, hart gedeckelt.
+# Einträge sind append-ordered — der Tail genügt, solange er bis zum Cutoff
+# zurückreicht; ob das der Fall war, meldet query() als coverage_complete.
+_SCAN_BYTES_PER_HOUR = int(os.getenv("REQUEST_LOG_SCAN_BYTES_PER_HOUR", str(2 * 1024 * 1024)))
+_SCAN_BYTES_FLOOR = 16 * 1024 * 1024
+_SCAN_BYTES_CAP = 128 * 1024 * 1024
 
 
 def _ensure_dir():
@@ -91,8 +106,43 @@ class RequestLogStore:
         try:
             with open(self._jsonl_path, "a") as f:
                 f.write(json.dumps(entry, separators=(",", ":")) + "\n")
+            self._maybe_rotate()
         except OSError as e:
             logger.warning(f"Cannot write request log: {e}")
+
+    def _maybe_rotate(self) -> None:
+        """Rotate the active file to .1 once it exceeds REQUEST_LOG_MAX_BYTES.
+
+        Mehrere Uvicorn-Prozesse desselben Workers appenden auf dieselbe Datei;
+        das flock auf der Lock-Datei stellt sicher, dass genau EIN Prozess
+        rotiert (der Verlierer überspringt — beim nächsten Append ist die Datei
+        wieder klein). Offene Append-Handles anderer Prozesse folgen dem
+        umbenannten File harmlos zu Ende (open-per-append macht das Fenster
+        winzig).
+        """
+        try:
+            if os.path.getsize(self._jsonl_path) <= REQUEST_LOG_MAX_BYTES:
+                return
+        except OSError:
+            return
+        lock_path = self._jsonl_path + ".rotate.lock"
+        try:
+            with open(lock_path, "w") as lock_f:
+                try:
+                    fcntl.flock(lock_f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except OSError:
+                    return  # anderer Prozess rotiert gerade
+                # Re-check unter Lock: der Gewinner eines früheren Rennens
+                # kann schon rotiert haben.
+                if os.path.getsize(self._jsonl_path) <= REQUEST_LOG_MAX_BYTES:
+                    return
+                os.replace(self._jsonl_path, self._jsonl_path + ".1")
+                logger.info(
+                    f"request_log rotated: {os.path.basename(self._jsonl_path)} "
+                    f"→ .1 (>{REQUEST_LOG_MAX_BYTES} bytes)"
+                )
+        except OSError as e:
+            logger.warning(f"request_log rotation failed: {e}")
 
     def query(
         self,
@@ -108,6 +158,10 @@ class RequestLogStore:
         """
         cutoff = time.time() - (hours * 3600) if hours > 0 else 0
         pattern = os.path.join(METRICS_DIR, "request_log.*.jsonl")
+        scan_budget = min(
+            _SCAN_BYTES_CAP,
+            max(_SCAN_BYTES_FLOOR, hours * _SCAN_BYTES_PER_HOUR),
+        ) if hours > 0 else _SCAN_BYTES_CAP
 
         all_entries: List[dict] = []
         endpoint_stats: Dict[str, dict] = defaultdict(
@@ -115,44 +169,43 @@ class RequestLogStore:
                      "min_duration": float("inf"), "max_duration": 0.0}
         )
 
+        def _consume(entry: dict) -> None:
+            ep = entry.get("endpoint", "unknown")
+            if endpoint_filter and endpoint_filter not in ep:
+                return
+            if status_filter == "success" and entry.get("status", 0) >= 400:
+                return
+            if status_filter == "error" and entry.get("status", 0) < 400:
+                return
+            all_entries.append(entry)
+            s = endpoint_stats[ep]
+            s["count"] += 1
+            dur = entry.get("duration_s", 0)
+            s["total_duration"] += dur
+            s["min_duration"] = min(s["min_duration"], dur)
+            s["max_duration"] = max(s["max_duration"], dur)
+            if entry.get("status", 200) >= 400:
+                s["errors"] += 1
+
+        # Nur den Datei-Tail lesen (Einträge sind append-ordered): reicht der
+        # Tail nicht bis zum Cutoff zurück, die Alt-Generation (.1) dazunehmen;
+        # reicht auch das nicht, wird das EHRLICH als coverage_complete=False
+        # gemeldet statt still zu fehlen (vorher: Full-Scan über alle
+        # Generationen — 3 GB pro Aufruf, sättigte den metrics-reader).
+        coverage_complete = True
         for filepath in sorted(glob.glob(pattern)):
-            try:
-                with open(filepath, "r") as f:
-                    for line in f:
-                        line = line.strip()
-                        if not line:
-                            continue
-                        try:
-                            entry = json.loads(line)
-                            ts = entry.get("ts", 0)
-                            if ts < cutoff:
-                                continue
-
-                            ep = entry.get("endpoint", "unknown")
-
-                            # Apply filters
-                            if endpoint_filter and endpoint_filter not in ep:
-                                continue
-                            if status_filter == "success" and entry.get("status", 0) >= 400:
-                                continue
-                            if status_filter == "error" and entry.get("status", 0) < 400:
-                                continue
-
-                            all_entries.append(entry)
-
-                            # Aggregate endpoint stats
-                            s = endpoint_stats[ep]
-                            s["count"] += 1
-                            dur = entry.get("duration_s", 0)
-                            s["total_duration"] += dur
-                            s["min_duration"] = min(s["min_duration"], dur)
-                            s["max_duration"] = max(s["max_duration"], dur)
-                            if entry.get("status", 200) >= 400:
-                                s["errors"] += 1
-                        except (json.JSONDecodeError, KeyError):
-                            continue
-            except OSError:
-                continue
+            covered = self._scan_tail(filepath, cutoff, scan_budget, _consume)
+            if not covered:
+                rotated = filepath + ".1"
+                if os.path.exists(rotated):
+                    covered = self._scan_tail(rotated, cutoff, scan_budget, _consume)
+            if not covered:
+                coverage_complete = False
+        if not coverage_complete:
+            logger.warning(
+                f"request_log query({hours}h): scan budget {scan_budget} bytes "
+                f"did not reach the cutoff — results are a truncated window"
+            )
 
         # Sort by timestamp descending, limit
         all_entries.sort(key=lambda e: e.get("ts", 0), reverse=True)
@@ -184,7 +237,56 @@ class RequestLogStore:
             },
             "endpoints": endpoints_summary,
             "period_hours": hours,
+            "coverage_complete": coverage_complete,
         }
+
+    @staticmethod
+    def _scan_tail(
+        filepath: str,
+        cutoff: float,
+        max_bytes: int,
+        consume: Callable[[dict], None],
+    ) -> bool:
+        """Parse at most the last max_bytes of a JSONL file, feeding entries
+        newer than cutoff into consume().
+
+        Returns True when the read window verifiably covers the cutoff: either
+        the file was read from byte 0, or the first (=oldest) parsed entry is
+        older than the cutoff. Returns False when the window might miss older
+        in-range entries — the caller decides how to escalate (Alt-Generation
+        lesen bzw. coverage_complete=False melden).
+        """
+        try:
+            size = os.path.getsize(filepath)
+            with open(filepath, "rb") as f:
+                from_start = size <= max_bytes
+                if not from_start:
+                    f.seek(size - max_bytes)
+                    f.readline()  # partielle Zeile nach dem Seek verwerfen
+                oldest_ts: Optional[float] = None
+                for raw in f:
+                    try:
+                        entry = json.loads(raw)
+                    except json.JSONDecodeError:
+                        continue
+                    ts = entry.get("ts", 0)
+                    if oldest_ts is None:
+                        oldest_ts = ts
+                    if ts < cutoff:
+                        continue
+                    try:
+                        consume(entry)
+                    except KeyError:
+                        continue
+                if from_start:
+                    return True
+                # Tail-Fenster: abgedeckt, wenn der älteste gelesene Eintrag
+                # VOR dem Cutoff liegt (dann fehlt nichts Neueres).
+                return oldest_ts is not None and oldest_ts < cutoff
+        except OSError:
+            # Fehlende/unlesbare Datei fehlt nicht "unabgedeckt" — es gibt sie
+            # schlicht nicht (Glob-Kandidat verschwunden = rotiert worden).
+            return True
 
 
 # Singleton
