@@ -158,7 +158,10 @@ async def usage_metrics(
             u.input_tokens, u.output_tokens,
             u.cache_read_tokens, u.cache_creation_tokens,
             u.real_cost_eur, u.hypothetical_cost_eur,
-            COALESCE((u.provider_metadata->>'status') = 'error', false) AS is_error
+            COALESCE((u.provider_metadata->>'status') = 'error', false) AS is_error,
+            u.recorded_at,
+            u.provider_metadata->>'error_code'              AS error_code,
+            left(u.provider_metadata->>'error_message', 200) AS error_message
         FROM usage_events u
         WHERE {where_sql}
     """
@@ -196,7 +199,7 @@ async def usage_metrics(
             "promptTokens": 0, "completionTokens": 0, "totalTokens": 0,
             "cacheReadTokens": 0, "cacheCreationTokens": 0,
             "realCostEur": 0.0, "hypotheticalCostEur": 0.0, "estimatedCostEur": 0.0,
-            "byApp": {}, "byModel": {}, "bySource": {}, "byProvider": {},
+            "byApp": {}, "byModel": {}, "bySource": {}, "byProvider": {}, "byError": {},
         })
 
         it = int(r["input_tokens"] or 0)
@@ -216,6 +219,26 @@ async def usage_metrics(
         b["calls"] += 1
         if is_err:
             b["errors"] += 1
+            # Error drill-down: WHAT failed, not just how often. Rows written
+            # before the error_message persistence (2026-07-22) show the
+            # explicit "(kein Fehlertext geloggt)" bucket rather than
+            # pretending there were no diagnosable errors.
+            err_key = (
+                f"{r['error_code'] or '?'}: "
+                f"{r['error_message'] or '(kein Fehlertext geloggt)'}"
+            )
+            eb = b["byError"]
+            if err_key in eb or len(eb) < 10:
+                entry = eb.setdefault(err_key, {"count": 0, "lastAt": None})
+            else:
+                entry = eb.setdefault(
+                    "(weitere Fehler — Cap 10 distinct erreicht)",
+                    {"count": 0, "lastAt": None},
+                )
+            entry["count"] += 1
+            rec_at = r["recorded_at"].isoformat() if r["recorded_at"] else None
+            if rec_at and (entry["lastAt"] is None or rec_at > entry["lastAt"]):
+                entry["lastAt"] = rec_at
         b["promptTokens"] += it
         b["completionTokens"] += ot
         b["totalTokens"] += tt
