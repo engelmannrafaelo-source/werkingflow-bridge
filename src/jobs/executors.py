@@ -22,6 +22,21 @@ from typing import Any, Awaitable, Callable, Dict, Optional
 
 logger = logging.getLogger(__name__)
 
+
+class ExecutorHTTPError(RuntimeError):
+    """A self-call answered with an HTTP error — carries the ORIGINAL status.
+
+    Without it every upstream failure collapses into a generic EXECUTOR_ERROR
+    and clients see an opaque job error they treat as retryable (502). A
+    deterministic 400 (e.g. Bedrock ValidationException) then gets hammered
+    by client retry loops: 240 doomed calls / 4.5h customer wait on
+    2026-07-20. The registry persists the status as UPSTREAM_HTTP_<status>
+    so clients can restore proper retry semantics."""
+
+    def __init__(self, status_code: int, message: str):
+        super().__init__(message)
+        self.status_code = status_code
+
 # The worker serves its own FastAPI app here (bypasses the nginx LB + its capacity
 # gate — the self-call hits this worker directly). Overridable for tests/other binds.
 SELF_BASE_URL = os.getenv("BRIDGE_SELF_URL", "http://localhost:8000")
@@ -147,7 +162,10 @@ async def chat_executor(
     if response.status_code >= 400:
         # Surface the upstream status + a trimmed body so the job error is actionable.
         detail = response.text[:500]
-        raise RuntimeError(f"chat self-call failed HTTP {response.status_code}: {detail}")
+        raise ExecutorHTTPError(
+            response.status_code,
+            f"chat self-call failed HTTP {response.status_code}: {detail}",
+        )
 
     return response.json()
 
@@ -169,8 +187,9 @@ async def _self_post_json(
         response = await client.post(f"{SELF_BASE_URL}{path}", json=body, headers=headers)
 
     if response.status_code >= 400:
-        raise RuntimeError(
-            f"self-call {path} failed HTTP {response.status_code}: {response.text[:500]}"
+        raise ExecutorHTTPError(
+            response.status_code,
+            f"self-call {path} failed HTTP {response.status_code}: {response.text[:500]}",
         )
     try:
         return response.json()

@@ -190,3 +190,42 @@ async def test_selfcall_without_app_id_names_the_job_layer():
     assert h["X-Client-ID"] == "bridge-jobs/selfcall"
     assert "X-App-ID" not in h
     assert "X-User-ID" not in h
+
+
+async def test_chat_executor_4xx_carries_original_status():
+    """Ein deterministisches Upstream-400 muss als ExecutorHTTPError mit
+    Original-Status hochkommen — sonst kollabiert es beim Client zu einem
+    retryablen 502 (Retry-Sturm 2026-07-20)."""
+    from src.jobs.executors import ExecutorHTTPError
+
+    fake = _FakeClient(_FakeResp(400, text="Bedrock API error (ValidationException): temperature"))
+    with patch("httpx.AsyncClient", return_value=fake), \
+         patch("src.auth.auth_manager.get_api_key", return_value="k"):
+        with pytest.raises(ExecutorHTTPError) as ei:
+            await chat_executor({"messages": []}, None, AsyncMock())
+    assert ei.value.status_code == 400
+    assert "ValidationException" in str(ei.value)
+
+
+async def test_registry_persists_upstream_status_code():
+    """registry._run_body schreibt UPSTREAM_HTTP_<status> statt EXECUTOR_ERROR,
+    wenn der Executor einen ExecutorHTTPError wirft."""
+    from src.jobs import registry
+    from src.jobs.executors import ExecutorHTTPError
+
+    async def _failing_executor(payload, attribution, report_progress):
+        raise ExecutorHTTPError(400, "chat self-call failed HTTP 400: nope")
+
+    recorded = {}
+
+    async def _mark_error(job_id, message, code=None):
+        recorded.update({"job_id": job_id, "message": message, "code": code})
+
+    with patch.object(registry, "get_executor", return_value=_failing_executor), \
+         patch.object(registry.store, "mark_error", _mark_error), \
+         patch.object(registry.store, "heartbeat", AsyncMock()), \
+         patch.object(registry.store, "update_progress", AsyncMock()):
+        await registry._run_body("job-1", "chat", {}, None)
+
+    assert recorded["code"] == "UPSTREAM_HTTP_400"
+    assert "HTTP 400" in recorded["message"]

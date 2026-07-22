@@ -120,7 +120,14 @@ async def _run_body(
         await store.mark_done(job_id, result)
         logger.info(f"📦 Async job {job_id} (kind={kind}) finished: done")
     except Exception as e:
-        await store.mark_error(job_id, str(e), code="EXECUTOR_ERROR")
+        # Preserve the upstream HTTP status in the error code so clients can
+        # restore retry semantics (a 400 must not read as a retryable 502).
+        from src.jobs.executors import ExecutorHTTPError
+        code = (
+            f"UPSTREAM_HTTP_{e.status_code}"
+            if isinstance(e, ExecutorHTTPError) else "EXECUTOR_ERROR"
+        )
+        await store.mark_error(job_id, str(e), code=code)
         logger.error(f"❌ Async job {job_id} (kind={kind}) crashed: {e}", exc_info=True)
     finally:
         stop.set()
