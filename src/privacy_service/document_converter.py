@@ -283,8 +283,10 @@ def _downscale_b64_png(b64: str, max_edge: int = MAX_IMAGE_EDGE) -> str:
         return b64
 
 
-def _docling_convert_pdf(pdf_bytes: bytes) -> Tuple[str, Optional[int], Dict[str, str]]:
-    """Run Docling over a PDF → (markdown, page_count, figures).
+def _docling_convert_pdf(
+    pdf_bytes: bytes,
+) -> Tuple[str, Optional[int], Dict[str, str], Optional[List[Dict[str, Any]]]]:
+    """Run Docling over a PDF → (markdown, page_count, figures, page_markdowns).
 
     This is the text/table extraction half of the cascade. Raises on any Docling
     failure so the caller can fall back to a full page render.
@@ -340,9 +342,77 @@ def _docling_convert_pdf(pdf_bytes: bytes) -> Tuple[str, Optional[int], Dict[str
             page_count = (
                 len(result.document.pages) if hasattr(result.document, "pages") else None
             )
-            return markdown, page_count, figures
+
+            # Optional per-page split for callers that need page-faithful text
+            # (e.g. selective anonymization: user picks the PII pages, only
+            # those run through smart-anonymize). A SECOND export with an
+            # explicit page-break token keeps the flat `markdown` above
+            # byte-identical to what existing callers have always received,
+            # while the token split preserves the exact same content ordering
+            # (cross-page tables etc.) as the flat export — unlike N separate
+            # per-page exports, which can duplicate page-spanning items.
+            # Fail-safe by absence: any doubt (blank pages make the split
+            # count disagree with page_count, token collision, export error)
+            # → no page_markdowns, callers fall back to whole-document
+            # handling. Never a wrong page map.
+            page_markdowns: Optional[List[Dict[str, Any]]] = None
+            try:
+                paged_path = os.path.join(tmp_dir, "paged.md")
+                result.document.save_as_markdown(
+                    paged_path,
+                    image_mode=ImageRefMode.REFERENCED,
+                    page_break_placeholder=PAGE_BREAK_TOKEN,
+                )
+                with open(paged_path, "r") as f:
+                    paged = f.read()
+                paged_artifacts = os.path.join(tmp_dir, "paged_artifacts")
+                if os.path.exists(paged_artifacts):
+                    for img_name in os.listdir(paged_artifacts):
+                        paged = paged.replace(
+                            os.path.join(paged_artifacts, img_name), img_name
+                        )
+                page_markdowns = _split_paged_markdown(paged, page_count)
+                if page_markdowns is None:
+                    logger.warning(
+                        f"[pdf] page_markdowns omitted: page-break split does not "
+                        f"match page_count={page_count} (blank pages or token "
+                        f"collision) — callers fall back to whole-document handling"
+                    )
+            except Exception as e:  # noqa: BLE001 — enrichment only, never fatal
+                page_markdowns = None
+                logger.warning(f"[pdf] page_markdowns omitted (paged export failed): {e}")
+
+            return markdown, page_count, figures, page_markdowns
     finally:
         os.unlink(tmp_pdf_path)
+
+
+# Unusual fixed token: a real document containing it would corrupt the split —
+# which the page_count check below turns into a safe omission, not a wrong map.
+PAGE_BREAK_TOKEN = "<!-- DOCLING-PAGE-BREAK-7f3acb1e -->"
+
+
+def _split_paged_markdown(
+    paged: str, page_count: Optional[int]
+) -> Optional[List[Dict[str, Any]]]:
+    """Split a page-break-token export into `[{page_no, markdown}, …]`.
+
+    Returns None unless the split produces EXACTLY `page_count` parts: Docling
+    only emits the token between pages that carry content, so a blank page
+    makes `parts` shorter than `page_count` and every later page_no would be
+    wrong. Absence is the documented fallback contract (full-document
+    handling); a silently wrong page map would misdirect selective
+    anonymization onto the wrong pages.
+    """
+    if page_count is None or page_count < 1:
+        return None
+    parts = paged.split(PAGE_BREAK_TOKEN)
+    if len(parts) != page_count:
+        return None
+    return [
+        {"page_no": i + 1, "markdown": part.strip("\n")}
+        for i, part in enumerate(parts)
+    ]
 
 
 def _render_only_markdown(rendered_pages: Dict[str, str]) -> str:
@@ -379,9 +449,10 @@ def convert_pdf_bytes(pdf_bytes: bytes) -> Tuple[str, Dict[str, Any], Dict[str, 
     docling_markdown = ""
     docling_page_count: Optional[int] = None
     figures: Dict[str, str] = {}
+    page_markdowns: Optional[List[Dict[str, Any]]] = None
     docling_ok = False
     try:
-        docling_markdown, docling_page_count, figures = _docling_convert_pdf(pdf_bytes)
+        docling_markdown, docling_page_count, figures, page_markdowns = _docling_convert_pdf(pdf_bytes)
         docling_ok = True
     except Exception as e:  # noqa: BLE001 — fall back to full page render
         logger.warning(
@@ -426,6 +497,12 @@ def convert_pdf_bytes(pdf_bytes: bytes) -> Tuple[str, Dict[str, Any], Dict[str, 
         "rendered_page_numbers": [i + 1 for i in pages_to_render],
         "rendered_page_count": len(rendered_pages),
     }
+    # Page-faithful per-page markdown (selective anonymization). Only present
+    # on the Docling text-layer path AND when the page split is provably
+    # correct — absence is the contract, callers fall back to full-document
+    # handling. Named page_markdowns because `pages` (the count) is taken.
+    if docling_ok and page_markdowns:
+        metadata["page_markdowns"] = page_markdowns
     return markdown, metadata, images
 
 

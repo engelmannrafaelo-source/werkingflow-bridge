@@ -312,7 +312,7 @@ async def convert_pdf_service_endpoint(request: Request):
             f"described={want_descriptions} {conversion_time:.1f}s"
         )
 
-        return {
+        response: Dict[str, Any] = {
             "status": "success",
             "markdown": markdown,
             "images": images if images else None,
@@ -323,6 +323,16 @@ async def convert_pdf_service_endpoint(request: Request):
             "markdown_size_bytes": len(markdown.encode("utf-8")),
             "conversion_time_seconds": round(conversion_time, 2),
         }
+        # Optional per-page markdown ([{page_no, markdown}, …], 1-based,
+        # ascending) for selective anonymization. Only present when the
+        # Docling page split is provably correct — absence is the contract,
+        # callers fall back to whole-document handling. NOTE: `pages` above is
+        # the page COUNT (pre-existing field, kept as-is). image_descriptions
+        # are appended to the flat `markdown` only — document-level, not
+        # page-level.
+        if metadata.get("page_markdowns"):
+            response["page_markdowns"] = metadata["page_markdowns"]
+        return response
 
     except ImportError as e:
         logger.error(f"Docling not installed: {e}")

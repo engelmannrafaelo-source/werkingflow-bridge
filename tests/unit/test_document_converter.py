@@ -429,3 +429,58 @@ def test_convert_pdf_docling_failure_renders_all_pages(monkeypatch):
     assert set(images) == {"page-001.png", "page-002.png"}
     # Render-only markdown references each page so descriptions attach cleanly.
     assert "page-001.png" in markdown and "page-002.png" in markdown
+
+
+# ---------------------------------------------------------------------------
+# _split_paged_markdown (per-page markdown for selective anonymization)
+# ---------------------------------------------------------------------------
+
+from src.privacy_service.document_converter import (  # noqa: E402
+    PAGE_BREAK_TOKEN,
+    _split_paged_markdown,
+)
+
+
+class TestSplitPagedMarkdown:
+    def test_happy_path_three_pages(self):
+        paged = f"Seite eins\n{PAGE_BREAK_TOKEN}\nSeite zwei\n{PAGE_BREAK_TOKEN}\nSeite drei"
+        result = _split_paged_markdown(paged, 3)
+        assert result == [
+            {"page_no": 1, "markdown": "Seite eins"},
+            {"page_no": 2, "markdown": "Seite zwei"},
+            {"page_no": 3, "markdown": "Seite drei"},
+        ]
+
+    def test_single_page_document(self):
+        result = _split_paged_markdown("Nur eine Seite", 1)
+        assert result == [{"page_no": 1, "markdown": "Nur eine Seite"}]
+
+    def test_blank_page_mismatch_returns_none(self):
+        # Docling emits the token only between content-bearing pages: a blank
+        # page yields fewer parts than page_count. A wrong page map would
+        # misdirect selective anonymization — absence is the contract.
+        paged = f"Seite eins\n{PAGE_BREAK_TOKEN}\nSeite vier"
+        assert _split_paged_markdown(paged, 3) is None
+
+    def test_token_collision_returns_none(self):
+        # A document that CONTAINS the token corrupts the split → count
+        # mismatch → safe omission instead of a wrong page map.
+        paged = (
+            f"Text {PAGE_BREAK_TOKEN} mitten im Inhalt\n"
+            f"{PAGE_BREAK_TOKEN}\nSeite zwei"
+        )
+        assert _split_paged_markdown(paged, 2) is None
+
+    def test_page_count_none_returns_none(self):
+        assert _split_paged_markdown("Inhalt", None) is None
+
+    def test_page_count_zero_returns_none(self):
+        assert _split_paged_markdown("", 0) is None
+
+    def test_inner_newlines_preserved_outer_stripped(self):
+        paged = f"\nZeile A\n\nZeile B\n{PAGE_BREAK_TOKEN}\nZeile C\n"
+        result = _split_paged_markdown(paged, 2)
+        assert result == [
+            {"page_no": 1, "markdown": "Zeile A\n\nZeile B"},
+            {"page_no": 2, "markdown": "Zeile C"},
+        ]
