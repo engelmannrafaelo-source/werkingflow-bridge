@@ -6,6 +6,7 @@ Nginx routes these requests here before they reach the main wrapper.
 DSGVO-compliant: Default region is eu-central-1 (Frankfurt).
 """
 
+import asyncio
 import os
 import json
 import uuid
@@ -260,18 +261,27 @@ async def call_bedrock(
 
     try:
         boto_client = client.get_client(actual_region)
-        response = boto_client.invoke_model(
-            modelId=bedrock_model_id,
-            contentType="application/json",
-            accept="application/json",
-            body=json.dumps(body)
-        )
+
+        # boto3 is synchronous — called inline it parks the WHOLE uvicorn event
+        # loop for the duration of the generation (read_timeout grants up to
+        # 10 min). A blocked loop answers neither /health (LB flaps the worker
+        # "down"/503) nor the jobs watchdog, which then requeues the still-running
+        # job and bills the generation twice. Run call + body-read on a worker
+        # thread so the loop stays responsive.
+        def _invoke_sync():
+            resp = boto_client.invoke_model(
+                modelId=bedrock_model_id,
+                contentType="application/json",
+                accept="application/json",
+                body=json.dumps(body)
+            )
+            return resp, json.loads(resp["body"].read())
+
+        response, response_body = await asyncio.to_thread(_invoke_sync)
 
         # AWS request ID — the join key between our usage_events row and the
         # AWS invocation log entry (1:1 billing reconciliation).
         aws_request_id = (response.get("ResponseMetadata") or {}).get("RequestId")
-
-        response_body = json.loads(response["body"].read())
 
         # Extract response content
         content = ""
@@ -404,16 +414,26 @@ async def stream_bedrock(
 
     try:
         boto_client = client.get_client(actual_region)
-        response = boto_client.invoke_model_with_response_stream(
-            modelId=bedrock_model_id,
-            contentType="application/json",
-            accept="application/json",
-            body=json.dumps(body)
+        # Same event-loop discipline as call_bedrock: the initial call AND every
+        # EventStream next() are blocking network reads — pull both on worker
+        # threads so slow chunks never stall /health or the jobs watchdog.
+        response = await asyncio.to_thread(
+            lambda: boto_client.invoke_model_with_response_stream(
+                modelId=bedrock_model_id,
+                contentType="application/json",
+                accept="application/json",
+                body=json.dumps(body)
+            )
         )
 
         usage_sink["aws_request_id"] = (response.get("ResponseMetadata") or {}).get("RequestId")
 
-        for event in response["body"]:
+        _events = iter(response["body"])
+        _stream_end = object()
+        while True:
+            event = await asyncio.to_thread(next, _events, _stream_end)
+            if event is _stream_end:
+                break
             chunk = json.loads(event["chunk"]["bytes"])
 
             if chunk.get("type") == "message_start":
