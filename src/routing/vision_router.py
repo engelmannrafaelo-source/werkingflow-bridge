@@ -51,7 +51,9 @@ async def route_to_vision(
     model: str,
     max_tokens: int = 4096,
     temperature: float = 0.7,
-    timeout: float = 300.0
+    timeout: float = 300.0,
+    thinking: Optional[Dict[str, Any]] = None,
+    output_config: Optional[Dict[str, Any]] = None
 ) -> VisionResult:
     """
     Route request to Vision API
@@ -63,6 +65,10 @@ async def route_to_vision(
         temperature: Temperature for generation
         timeout: HTTP timeout in seconds — see VisionProvider.analyze()'s
             docstring for why non-vision fallback callers need this raised.
+        thinking: Optional passthrough for the Anthropic Messages API
+            'thinking' param — forwarded verbatim to VisionProvider.analyze().
+        output_config: Optional passthrough for the Anthropic Messages API
+            'output_config' param — forwarded verbatim.
 
     Returns:
         VisionResult with content, model, and usage info
@@ -79,7 +85,9 @@ async def route_to_vision(
         model=model,
         max_tokens=max_tokens,
         temperature=temperature,
-        timeout=timeout
+        timeout=timeout,
+        thinking=thinking,
+        output_config=output_config
     )
 
     return VisionResult(
@@ -93,7 +101,9 @@ async def check_and_route_vision(
     messages: List[Any],
     model: str,
     max_tokens: Optional[int] = None,
-    temperature: Optional[float] = None
+    temperature: Optional[float] = None,
+    thinking: Optional[Dict[str, Any]] = None,
+    output_config: Optional[Dict[str, Any]] = None
 ) -> Optional[VisionResult]:
     """
     Check if messages need vision routing, and route if needed
@@ -105,6 +115,10 @@ async def check_and_route_vision(
         model: Model to use
         max_tokens: Maximum tokens (default 4096)
         temperature: Temperature (default 0.7)
+        thinking: Optional passthrough for the Anthropic Messages API
+            'thinking' param — forwarded verbatim to route_to_vision().
+        output_config: Optional passthrough for the Anthropic Messages API
+            'output_config' param — forwarded verbatim.
 
     Returns:
         VisionResult if vision was needed, None otherwise
@@ -121,5 +135,7 @@ async def check_and_route_vision(
         messages=messages_for_vision,
         model=model,
         max_tokens=max_tokens or 4096,
-        temperature=temperature or 0.7
+        temperature=temperature or 0.7,
+        thinking=thinking,
+        output_config=output_config
     )

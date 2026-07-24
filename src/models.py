@@ -156,6 +156,27 @@ class ChatCompletionRequest(BaseModel):
         description="Provider tier for multi-provider routing (e.g. 'claude-premium', 'dsgvo-deutschland', 'eu-standard'). Overrides backend selection."
     )
 
+    # Extended-thinking passthrough (2026-07-24). Forwarded VERBATIM to the raw
+    # Anthropic-Messages-API-format backends only: Bedrock (bedrock_service.py)
+    # and the direct-Anthropic fallback/vision path (vision_provider.py via
+    # src/providers/anthropic_direct.py, src/routing/vision_router.py). Kept as
+    # a raw dict rather than a strict submodel on purpose: Anthropic's thinking
+    # schema is provider-owned and evolving (e.g. the "adaptive" type + sibling
+    # `output_config.effort`), the Bridge is a proxy and must not re-implement
+    # that validation — an unsupported shape/combination is surfaced as the
+    # provider's own error (see call_bedrock's ClientError mapping and
+    # VisionProvider.analyze's 4xx passthrough), never silently dropped.
+    # None (the default) changes NOTHING: no key is added to the outgoing body,
+    # so existing callers get byte-identical requests.
+    thinking: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description="Passthrough for the Anthropic Messages API 'thinking' param, e.g. {'type': 'adaptive'}, {'type': 'enabled', 'budget_tokens': N}, or {'type': 'disabled'}. Only applied on backend='bedrock' or a provider_tier that resolves to anthropic_direct — the default Claude Code SDK backend does not support it (see log_unsupported_parameters). Omit for unchanged default behavior."
+    )
+    output_config: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description="Passthrough for the Anthropic Messages API 'output_config' param, e.g. {'effort': 'low'|'medium'|'high'|'max'}. Same forwarding scope and caveats as 'thinking'. Omit for unchanged default behavior."
+    )
+
     @field_validator('n')
     @classmethod
     def validate_n(cls, v):
@@ -187,7 +208,13 @@ class ChatCompletionRequest(BaseModel):
             
         if self.stop:
             warnings.append(f"stop sequences are not supported by Claude Code SDK and will be ignored")
-        
+
+        if self.thinking is not None:
+            warnings.append(f"thinking={self.thinking} is not supported by the Claude Code SDK backend (only backend='bedrock' or an anthropic_direct provider_tier forward it) and will be ignored")
+
+        if self.output_config is not None:
+            warnings.append(f"output_config={self.output_config} is not supported by the Claude Code SDK backend (only backend='bedrock' or an anthropic_direct provider_tier forward it) and will be ignored")
+
         for warning in warnings:
             logger.warning(f"OpenAI API compatibility: {warning}")
     

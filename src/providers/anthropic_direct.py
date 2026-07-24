@@ -65,6 +65,8 @@ async def call_anthropic_direct(
         max_tokens=request.max_tokens or 4096,
         temperature=request.temperature if request.temperature is not None else 0.7,
         timeout=timeout,
+        thinking=request.thinking,
+        output_config=request.output_config,
     )
 
     return {

@@ -287,7 +287,9 @@ class VisionProvider:
         max_tokens: int = 4096,
         temperature: float = 0.7,
         system_prompt: Optional[str] = None,
-        timeout: float = 300.0
+        timeout: float = 300.0,
+        thinking: Optional[Dict[str, Any]] = None,
+        output_config: Optional[Dict[str, Any]] = None,
     ) -> VisionResponse:
         """
         Analyze images using direct Anthropic API.
@@ -305,6 +307,11 @@ class VisionProvider:
             max_tokens: Maximum response tokens
             temperature: Sampling temperature
             system_prompt: Optional system prompt override
+            thinking: Optional passthrough for the Anthropic Messages API
+                'thinking' param — forwarded verbatim, not validated here
+                (see ChatCompletionRequest.thinking for the full rationale).
+            output_config: Optional passthrough for the Anthropic Messages
+                API 'output_config' param — forwarded verbatim.
 
         Returns:
             VisionResponse with analysis result
@@ -357,6 +364,15 @@ class VisionProvider:
 
         if final_system:
             request_body["system"] = final_system
+
+        # Extended-thinking passthrough — forwarded verbatim, never validated
+        # here. An unsupported shape or incompatible combination comes back
+        # from Anthropic as a 4xx, which the status-code handling below
+        # already turns into a clean HTTPException — see 2026-07-24.
+        if thinking is not None:
+            request_body["thinking"] = thinking
+        if output_config is not None:
+            request_body["output_config"] = output_config
 
         # Make API request
         async with httpx.AsyncClient(timeout=timeout) as client:

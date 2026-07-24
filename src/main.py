@@ -1258,7 +1258,9 @@ async def generate_streaming_response(
                     messages=request.messages,
                     model=request.model,
                     max_tokens=request.max_tokens,
-                    temperature=request.temperature
+                    temperature=request.temperature,
+                    thinking=request.thinking,
+                    output_config=request.output_config
                 )
 
                 # Stream vision response as SSE chunks
@@ -2654,7 +2656,9 @@ async def chat_completions(
                         messages=request_body.messages,
                         model=request_body.model,
                         max_tokens=request_body.max_tokens,
-                        temperature=request_body.temperature
+                        temperature=request_body.temperature,
+                        thinking=request_body.thinking,
+                        output_config=request_body.output_config
                     )
 
                 if vision_result:

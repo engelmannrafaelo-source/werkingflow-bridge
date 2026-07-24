@@ -257,6 +257,16 @@ async def call_bedrock(
     if request.stop:
         body["stop_sequences"] = request.stop if isinstance(request.stop, list) else [request.stop]
 
+    # Extended-thinking passthrough — forwarded verbatim, never validated here.
+    # An unsupported shape or an incompatible combination (e.g. thinking +
+    # temperature) comes back from Bedrock as ValidationException, which the
+    # ClientError handler below already maps to a clean 400 — see 2026-07-24.
+    if request.thinking is not None:
+        body["thinking"] = request.thinking
+
+    if request.output_config is not None:
+        body["output_config"] = request.output_config
+
     logger.info(f"Calling Bedrock: model={bedrock_model_id}, region={actual_region}")
 
     try:
@@ -407,6 +417,13 @@ async def stream_bedrock(
 
     if request.stop:
         body["stop_sequences"] = request.stop if isinstance(request.stop, list) else [request.stop]
+
+    # Extended-thinking passthrough — same as call_bedrock above.
+    if request.thinking is not None:
+        body["thinking"] = request.thinking
+
+    if request.output_config is not None:
+        body["output_config"] = request.output_config
 
     logger.info(f"Streaming from Bedrock: model={bedrock_model_id}, region={actual_region}")
 
