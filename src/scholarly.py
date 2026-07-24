@@ -103,6 +103,10 @@ def _core(query: str, n: int) -> List[Dict[str, Any]]:
         r = _get("https://api.core.ac.uk/v3/search/works/", headers=headers,
                  params={"q": query, "limit": n})
         if r.status_code != 200:
+            if r.status_code == 429:
+                # Keyless-Rate-Limit: Schicht degradiert STILL auf OpenAlex-Abstracts —
+                # unter Last sichtbar machen (CORE_API_KEY hebt das Limit).
+                logger.warning("CORE rate-limited (429, keyless) — Volltext-Anteil degradiert auf Abstracts")
             return []
         out = []
         for w in r.json().get("results", []):
@@ -150,10 +154,13 @@ def _retrieve_and_format(queries: List[str], per_query: int) -> str:
                     papers.append(p)
 
     if not papers:
+        logger.warning("OA-Retrieval ohne verwertbare Quellen (0 Treffer mit Text) — Kontext-Block entfällt")
         return ""
 
     # Volltext (CORE) zuerst, dann Abstracts — nach Textlänge
     papers.sort(key=lambda p: (p["kind"] != "fulltext", -len(p.get("text", ""))))
+    fulltext_n = sum(1 for p in papers[:_MAX_ENTRIES] if p["kind"] == "fulltext")
+    logger.info(f"OA-Kontext: {min(len(papers), _MAX_ENTRIES)} Quellen, davon {fulltext_n} Volltext")
     blocks = []
     for p in papers[:_MAX_ENTRIES]:
         excerpt = re.sub(r"\s+", " ", p["text"]).strip()[:_EXCERPT_CHARS]
