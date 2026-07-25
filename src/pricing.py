@@ -51,6 +51,13 @@ MODEL_PRICING: dict[str, dict[str, float]] = {
 CACHE_WRITE_MULT = 1.25
 CACHE_READ_MULT = 0.10
 
+# Server-side web_search tool fee (Anthropic list price ~$10 / 1000 searches,
+# eval-verified 2026-07-24 in specs/research-cloud-overflow/eval-research.py).
+# Not a per-token cost, so it lives outside MODEL_PRICING/cost_usd's token
+# math — callers billing research-cloud usage add search_count * this rate
+# on top of cost_usd()'s token-based total (see cost_usd's search_count arg).
+WEB_SEARCH_FEE_USD = 0.01
+
 _DEFAULT_USD_TO_EUR = 0.92
 
 
@@ -143,9 +150,11 @@ def cost_usd(
     output_tokens: int,
     cache_read_tokens: int = 0,
     cache_creation_tokens: int = 0,
+    search_count: int = 0,
 ) -> float:
     """USD cost of one LLM call — the pricing SSoT (uncached input + cache
-    write/read + output, per Anthropic/Bedrock usage semantics). Raises KeyError
+    write/read + output, per Anthropic/Bedrock usage semantics, plus
+    per-search fees for server-side web_search usage). Raises KeyError
     if the model has no price: fail loud, NO silent fallback. Callers that need a
     lenient aggregate (metrics) use cost_eur, which swallows this into 0.0."""
     p = price_entry(model)
@@ -156,6 +165,7 @@ def cost_usd(
         + (cache_creation_tokens or 0) / 1_000_000.0 * p["in"] * CACHE_WRITE_MULT
         + (cache_read_tokens or 0) / 1_000_000.0 * p["in"] * CACHE_READ_MULT
         + (output_tokens or 0) / 1_000_000.0 * p["out"]
+        + (search_count or 0) * WEB_SEARCH_FEE_USD
     )
 
 
@@ -165,6 +175,7 @@ def cost_eur(
     output_tokens: int,
     cache_read_tokens: int = 0,
     cache_creation_tokens: int = 0,
+    search_count: int = 0,
 ) -> float:
     """
     EUR cost of one LLM call (cost_usd × fixed EUR rate). Unknown / missing
@@ -174,7 +185,10 @@ def cost_eur(
     if not model:
         return 0.0
     try:
-        usd = cost_usd(model, input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens)
+        usd = cost_usd(
+            model, input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens,
+            search_count=search_count,
+        )
     except KeyError:
         # Unreachable in normal flow: the is_priced() admission gate + boot
         # invariant block unpriced models. Defense-in-depth backstop only.
