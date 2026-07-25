@@ -4543,11 +4543,25 @@ async def research(
     if _research_pinned is None:
         try:
             from src.research_cloud.routing import resolve_research_cloud_routing
+            from src.routing.research_provider_override import ResearchProviderOverrideError
             _use_research_cloud = await resolve_research_cloud_routing(
                 request.headers.get("X-User-ID"), bool(request_body.cloud_overflow)
             )
+        except ResearchProviderOverrideError as _rc_err:
+            # A malformed admin-set research pin is a config error, not a
+            # routing hiccup — surfacing it is the only way it ever gets fixed
+            # (same rule as the global pin above: no fallback by design).
+            return ResearchResponse(
+                status="error",
+                query=request_body.query,
+                model=request_body.model,
+                error=f"research provider pin unservable (no fallback by design): {_rc_err}",
+            )
         except Exception as _rc_err:
-            logger.warning(f"research-cloud routing decision failed (fail-open to pool): {_rc_err}")
+            # Transient failure (e.g. DB blip during pin lookup): the pool is
+            # the safe side (no cloud spend, no external send), but log at
+            # ERROR so this can never become an invisible permanent state.
+            logger.error(f"research-cloud routing decision failed — falling back to pool: {_rc_err}")
             _use_research_cloud = False
 
     # BACKEND ROUTING: Resolve backend configuration for research (skipped
