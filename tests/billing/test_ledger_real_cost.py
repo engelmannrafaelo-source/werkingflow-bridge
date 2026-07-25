@@ -41,8 +41,10 @@ COST = 0.123456
     [
         ("subscription", "anthropic", "flat_rate_estimated", 0.0),
         ("subscription", "bedrock", "flat_rate_estimated", COST),
+        ("subscription", "research-cloud", "flat_rate_estimated", COST),
         ("pay_per_token", "anthropic", "pay_per_token", COST),
         ("pay_per_token", "bedrock", "pay_per_token", COST),
+        ("pay_per_token", "research-cloud", "pay_per_token", COST),
     ],
 )
 def test_resolve_ledger_cost_quadrants(
@@ -64,6 +66,21 @@ def test_bedrock_always_carries_real_cost(billing_mode_text):
     assert real == COST, (
         f"bedrock call with billing_mode={billing_mode_text!r} lost its real "
         f"cost — AWS bills this per token, the ledger must show it"
+    )
+
+
+@pytest.mark.parametrize(
+    "billing_mode_text",
+    ["subscription", "pay_per_token", "", "unknown-future-mode", "trial"],
+)
+def test_research_cloud_always_carries_real_cost(billing_mode_text):
+    """Same invariant as Bedrock: research-cloud is pay-per-use to Anthropic
+    directly (own API key, no subscription coverage) — real_cost must never
+    be zeroed regardless of the tenant's billing_mode text."""
+    _, real = resolve_ledger_cost(billing_mode_text, "research-cloud", COST)
+    assert real == COST, (
+        f"research-cloud call with billing_mode={billing_mode_text!r} lost its "
+        f"real cost — Anthropic bills this per token, the ledger must show it"
     )
 
 
@@ -160,6 +177,27 @@ async def test_bedrock_row_carries_real_cost_for_subscription_tenant():
     assert metadata["aws_request_id"] == aws_request_id, (
         "aws_request_id missing — call-level join with AWS invocation logs broken"
     )
+
+
+@pytest.mark.asyncio
+async def test_research_cloud_row_carries_real_cost_for_subscription_tenant():
+    conn = await _run_persist(
+        "research-cloud",
+        provider_meta={"searches": 12, "fetches": 3, "container_id": "container-abc"},
+    )
+    sql, args = _usage_insert_args(conn)
+
+    provider = args[5]
+    bm_enum = args[11]
+    real_cost = args[12]
+    hypothetical = args[13]
+    metadata = json.loads(args[15])
+
+    assert provider == "research-cloud"
+    assert bm_enum == "flat_rate_estimated"  # Kundenvertrag bleibt Abo …
+    assert real_cost > 0, "research-cloud row wrote €0 real cost — 1:1 audit is blind"
+    assert real_cost == hypothetical  # … aber die Anthropic-API-Kosten sind voll da
+    assert metadata["searches"] == 12
 
 
 @pytest.mark.asyncio

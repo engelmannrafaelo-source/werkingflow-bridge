@@ -76,13 +76,15 @@ def resolve_ledger_cost(
     - Bedrock is pay-per-use to AWS regardless of the tenant's plan — its
       calls ALWAYS carry the real cost, or the 1:1 billing audit reads €0
       while the AWS invoice grows.
+    - research-cloud (Weg C, direct Anthropic API key, no subscription
+      coverage) is pay-per-use the same way — same reasoning as Bedrock.
     - pay_per_token tenants pay per call → real == hypothetical.
 
     Pure function — unit-tested in tests/billing/test_ledger_real_cost.py.
     """
     if billing_mode_text == "pay_per_token":
         return "pay_per_token", call_cost_eur
-    return "flat_rate_estimated", call_cost_eur if provider == "bedrock" else 0.0
+    return "flat_rate_estimated", call_cost_eur if provider in ("bedrock", "research-cloud") else 0.0
 
 
 async def _deduct_call_cost(
