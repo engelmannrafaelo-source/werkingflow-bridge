@@ -6082,6 +6082,47 @@ async def _proxy_document_endpoint(
             payload = response.json()
         except Exception:
             payload = {"status": "error", "error": response.text[:500]}
+        # DSGVO Rechenschaftspflicht: if the proxied response carries a value-free
+        # attestation (only convert-and-anonymize does), persist it to audit_log;
+        # if an anonymize call failed, record that too. NB: never log the filename
+        # (it can itself contain a name) — only the value-free format + counts.
+        # Best-effort: an audit hiccup must not fail the request.
+        try:
+            _is_anon = "anonymize" in downstream_path
+            if _is_anon:
+                from src.audit.recorder import record_audit_event
+                _attr = extract_attribution_context(request)
+                _dur_ms = int((time.time() - _start) * 1000)
+                if response.status_code < 400 and isinstance(payload, dict) and payload.get("attestation"):
+                    await record_audit_event(
+                        "pii.pseudonymized",
+                        actor_user_id=_attr.get("user_id"),
+                        actor_label=_attr.get("app_id") or agent_id,
+                        target_kind="document",
+                        target_id=_attr.get("workflow_id"),
+                        metadata={
+                            **payload["attestation"],
+                            "format": payload.get("format"),
+                            "app_env": _attr.get("app_env"),
+                            "duration_ms": _dur_ms,
+                        },
+                    )
+                elif response.status_code >= 400:
+                    await record_audit_event(
+                        "pii.anonymization_failed",
+                        actor_user_id=_attr.get("user_id"),
+                        actor_label=_attr.get("app_id") or agent_id,
+                        target_kind="document",
+                        target_id=_attr.get("workflow_id"),
+                        metadata={
+                            "status": "error",
+                            "error_code": str(response.status_code),
+                            "app_env": _attr.get("app_env"),
+                            "duration_ms": _dur_ms,
+                        },
+                    )
+        except Exception as _ae:
+            logger.warning(f"pii attestation audit write failed (non-blocking): {_ae}")
         _record_document_call_metrics(
             request, agent_id=agent_id, model=model,
             status="success" if response.status_code < 400 else "error",
