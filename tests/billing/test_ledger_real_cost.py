@@ -126,7 +126,7 @@ def _usage_insert_args(conn):
     raise AssertionError("no usage_events INSERT executed")
 
 
-async def _run_persist(provider: str, provider_meta=None):
+async def _run_persist(provider: str, provider_meta=None, search_count: int = 0):
     pool, conn = _mock_pool()
     with patch("src.activity.ai_call_writer.get_pool", return_value=pool), patch(
         "src.activity.ai_call_writer._deduct_call_cost", new=AsyncMock()
@@ -145,6 +145,7 @@ async def _run_persist(provider: str, provider_meta=None):
             provider=provider,
             provider_meta=provider_meta,
             region="eu-central-1" if provider == "bedrock" else None,
+            search_count=search_count,
         )
     return conn
 
@@ -198,6 +199,18 @@ async def test_research_cloud_row_carries_real_cost_for_subscription_tenant():
     assert real_cost > 0, "research-cloud row wrote €0 real cost — 1:1 audit is blind"
     assert real_cost == hypothetical  # … aber die Anthropic-API-Kosten sind voll da
     assert metadata["searches"] == 12
+
+
+@pytest.mark.asyncio
+async def test_search_count_adds_to_real_cost():
+    """web_search fees must show up in the booked cost, not just tokens."""
+    conn_without = await _run_persist("research-cloud", search_count=0)
+    conn_with = await _run_persist("research-cloud", search_count=15)
+    _, args_without = _usage_insert_args(conn_without)
+    _, args_with = _usage_insert_args(conn_with)
+    assert args_with[12] > args_without[12], (
+        "15 web_search calls did not increase real_cost_eur — search fee not billed"
+    )
 
 
 @pytest.mark.asyncio

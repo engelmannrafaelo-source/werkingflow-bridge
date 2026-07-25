@@ -186,6 +186,7 @@ async def persist_ai_call_activity(
     region: Optional[str] = None,
     cache_read_tokens: int = 0,
     cache_creation_tokens: int = 0,
+    search_count: int = 0,
 ) -> None:
     """
     Write one ai-call activity row. Never raises — tracking is best-effort.
@@ -210,6 +211,9 @@ async def persist_ai_call_activity(
         cache traffic goes into cache_read_tokens (0.1x input price) and
         cache_creation_tokens (1.25x input price) — the physical input of a
         call is the sum of all three.
+    search_count: server-side web_search invocations this call made (research-
+        cloud only) — billed per-search on top of tokens, see src/pricing.py
+        WEB_SEARCH_FEE_USD. Defaults to 0 (no-op for every other caller).
     """
     # Cost from the pricing SSoT. Error calls cost nothing (0.0) — only a
     # successful completion consumes budget.
@@ -220,6 +224,7 @@ async def persist_ai_call_activity(
             output_tokens,
             cache_read_tokens=cache_read_tokens,
             cache_creation_tokens=cache_creation_tokens,
+            search_count=search_count,
         )
         if status == "success" else 0.0
     )
