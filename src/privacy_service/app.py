@@ -543,22 +543,48 @@ async def document_convert_and_anonymize_endpoint(request: Request):
         except Exception as e:
             logger.error(f"smart_anonymize failed: {e}", exc_info=True)
             raise HTTPException(status_code=500, detail=f"Anonymization failed: {e}")
-        anonymized_text = anon.get("smart_anonymized_text") or conversion.markdown
+        # Never fall back to raw markdown. smart_anonymize attests success via
+        # status/anonymization_performed and always sets smart_anonymized_text
+        # on success (raising otherwise). An absent/empty result on a non-empty
+        # source means anonymization did not verifiably run — fail loud rather
+        # than forward raw PII.
+        if anon.get("status") != "success" or not anon.get("anonymization_performed"):
+            raise HTTPException(
+                status_code=500,
+                detail=f"Anonymization did not attest success: status={anon.get('status')!r}",
+            )
+        anonymized_text = anon.get("smart_anonymized_text")
+        if anonymized_text is None or (conversion.markdown and not anonymized_text):
+            raise HTTPException(
+                status_code=500,
+                detail="Anonymization returned empty text for non-empty source — refusing to forward raw content.",
+            )
         mapping = anon.get("mapping") or {}
         detected_entities = anon.get("detected_entities") or []
         restored_entities = anon.get("restored_entities") or []
     else:
         # Basic mode: Presidio-only, no AI refinement.
         middleware = get_middleware()
-        anon_messages, mapping = middleware.anonymize_messages(
-            [{"role": "user", "content": conversion.markdown}],
-            privacy_mode="full",
-        )
-        anonymized_text = (
-            anon_messages[0].get("content", conversion.markdown)
-            if anon_messages
-            else conversion.markdown
-        )
+        try:
+            anon_messages, mapping = middleware.anonymize_messages(
+                [{"role": "user", "content": conversion.markdown}],
+                privacy_mode="full",
+            )
+        except Exception as e:
+            logger.error(f"basic anonymize failed: {e}", exc_info=True)
+            raise HTTPException(status_code=500, detail=f"Anonymization failed: {e}")
+        # Same fail-loud contract as smart mode: never substitute raw markdown.
+        if not anon_messages:
+            raise HTTPException(
+                status_code=500,
+                detail="Basic anonymization produced no messages — refusing to forward raw content.",
+            )
+        anonymized_text = anon_messages[0].get("content")
+        if anonymized_text is None or (conversion.markdown and not anonymized_text):
+            raise HTTPException(
+                status_code=500,
+                detail="Basic anonymization returned empty text for non-empty source — refusing to forward raw content.",
+            )
         detected_entities = []
         restored_entities = []
 

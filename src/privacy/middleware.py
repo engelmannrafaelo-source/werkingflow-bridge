@@ -146,10 +146,12 @@ class PrivacyMiddleware:
             return result.anonymized_text, result.mapping
 
         except Exception as e:
+            # Fail LOUD, never silent: a swallowed error here would send raw PII
+            # downstream — the exact leak this pipeline exists to prevent.
+            # Availability must never trump data protection; the caller decides
+            # how to surface the failure.
             logger.error(f"Anonymization failed: {e}", exc_info=True)
-            # Fail open: return original content if anonymization fails
-            # This ensures the service remains available
-            return content, {}
+            raise
 
     async def anonymize_message_async(
         self,
@@ -187,9 +189,10 @@ class PrivacyMiddleware:
             return result.anonymized_text, result.mapping
 
         except Exception as e:
+            # Fail LOUD, never silent (see sync anonymize_message above): a
+            # swallowed error would forward raw PII downstream.
             logger.error(f"Anonymization failed: {e}", exc_info=True)
-            # Fail open: return original content if anonymization fails
-            return content, {}
+            raise
 
     def anonymize_messages(
         self,

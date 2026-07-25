@@ -104,9 +104,18 @@ class PrivacyServiceClient:
             return data["messages"], data["mapping"]
 
         except Exception as e:
+            # Fail CLOSED, never open: if anonymization was requested but cannot
+            # be verified, the request must NOT proceed to the LLM with raw
+            # content. A privacy-service outage becomes a loud, visible request
+            # failure — never a silent PII leak. Availability must never trump
+            # data protection here. (should_anonymize() already returned early
+            # above for the legitimate "privacy off" config, so reaching this
+            # except means anonymization was expected and genuinely failed.)
             logger.error(f"Privacy service anonymize failed: {e}", exc_info=True)
-            # Fail open: return original messages if service is down
-            return messages, {}
+            raise RuntimeError(
+                "Anonymization failed while privacy is enabled — refusing to "
+                f"forward raw content to the LLM: {e}"
+            ) from e
 
     # ===== LOCAL: De-anonymization (pure string replace, no NLP) =====
 
