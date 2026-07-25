@@ -595,6 +595,20 @@ async def document_convert_and_anonymize_endpoint(request: Request):
         f"entities_kept={len(mapping)}"
     )
 
+    # Value-free accountability record (DSGVO Rechenschaftspflicht): proves WHAT
+    # kinds and HOW MANY entities were pseudonymized, with NO plaintext values —
+    # safe for the caller to persist in the audit log. The actual values stay in
+    # the encrypted per-run mapping only. See src/privacy/attestation.py.
+    from src.privacy.attestation import build_attestation
+
+    attestation = build_attestation(
+        detected_entities,
+        status="success",
+        anonymization_performed=True,
+        mapping_size=len(mapping),
+        mode=privacy_mode,
+    )
+
     return {
         "success": True,
         "format": conversion.fmt,
@@ -602,6 +616,7 @@ async def document_convert_and_anonymize_endpoint(request: Request):
         "mapping": mapping,
         "detected_entities": detected_entities,
         "restored_entities": restored_entities,
+        "attestation": attestation,
         "metadata": conversion.metadata,
         "privacy_mode": privacy_mode,
         "language": language,
