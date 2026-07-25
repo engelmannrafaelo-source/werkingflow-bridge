@@ -5417,33 +5417,31 @@ async def get_privacy_status():
     return {"privacy": service_status}
 
 
-@app.post("/v1/privacy/smart-anonymize")
-async def smart_anonymize_endpoint(
+async def _smart_anonymize_core(
     request: Request,
-    request_body: SmartAnonymizeRequest,
-    credentials: Optional[HTTPAuthorizationCredentials] = Depends(security),
-):
-    """Smart pseudonymization. Proxied to privacy-pdf-service container.
+    *,
+    text: str,
+    language: str = "de",
+    context_hint: Optional[str] = None,
+    prefix: Optional[str] = None,
+) -> SmartAnonymizeResponse:
+    """Core smart-pseudonymization logic: proxy to privacy-pdf-service, persist
+    activity + a value-free DSGVO attestation, feed prompt-metrics. Shared by
+    ``/v1/privacy/smart-anonymize`` (below — returns a status="error" response,
+    never raises) and the research-cloud fail-loud gate
+    (``src/research_cloud/anonymize_gate.py``, which raises on anything but a
+    verified success) — one anonymize-and-attest implementation, two
+    error-surfacing contracts.
 
     When ``BRIDGE_ANONYMIZE_ENABLED`` is unset/false (the current default
-    while the privacy-service backend is unstable) the bridge bypasses the
-    downstream call entirely and echoes the input back as a successful
-    no-op anonymization: same text, empty mapping, zero entities. Callers
-    that store the mapping for later de-anonymization keep working — they
-    just won't have anything to substitute back.
-
-    Flip to true on the Hetzner host once the privacy-service is reliable
-    again; no app-side change required.
+    while the privacy-service backend is unstable) this refuses outright
+    (raises ``BridgeError``) rather than echoing the input back as a fake
+    successful anonymization: a disabled PII detector must NEVER report
+    status=success with an empty mapping — that's an active GDPR exposure,
+    not a graceful degradation. Flip the flag once the privacy-service is
+    verified healthy; no caller-side change required.
     """
-    # Security: this endpoint processes caller-supplied text (PII) and was
-    # previously UNauthenticated while reachable mesh-wide on the Tailscale IP.
-    # Require a valid API key like every other data endpoint (e.g. /document/convert).
-    await verify_api_key(request, credentials)
     if os.environ.get("BRIDGE_ANONYMIZE_ENABLED", "").lower() != "true":
-        # Fail loud, never silent: a disabled PII detector must NEVER echo the
-        # caller's text back as a "successful" anonymization. Doing so leaks raw
-        # PII (status=success, mapping={}) while callers persist it as
-        # 'pseudonymized' — an active GDPR exposure. Refuse instead of pretending.
         raise BridgeError(config_error(
             detail=(
                 "smart-anonymize is disabled (BRIDGE_ANONYMIZE_ENABLED is not "
@@ -5461,10 +5459,10 @@ async def smart_anonymize_endpoint(
         client = await privacy_client._get_client()
         async with privacy_client.track_call() as _concurrent_before:
             response = await client.post("/smart-anonymize", json={
-                "text": request_body.text,
-                "language": request_body.language or "de",
-                "context_hint": request_body.context_hint,
-                "prefix": request_body.prefix,
+                "text": text,
+                "language": language,
+                "context_hint": context_hint,
+                "prefix": prefix,
             }, timeout=1200.0)  # Local Flair NER inference on CPU takes ~8-11s per
             # 1K chars under load (measured 2026-07-03), so 20min covers documents
             # up to roughly 110K chars. Memory is bounded regardless of size
@@ -5586,6 +5584,31 @@ async def smart_anonymize_endpoint(
             status="error",
             error=_error_message
         )
+
+
+@app.post("/v1/privacy/smart-anonymize")
+async def smart_anonymize_endpoint(
+    request: Request,
+    request_body: SmartAnonymizeRequest,
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(security),
+):
+    """Smart pseudonymization. Proxied to privacy-pdf-service container.
+
+    See ``_smart_anonymize_core`` above for the disabled-flag / attestation
+    / activity-tracking behavior — this endpoint is a thin auth wrapper
+    around it.
+    """
+    # Security: this endpoint processes caller-supplied text (PII) and was
+    # previously UNauthenticated while reachable mesh-wide on the Tailscale IP.
+    # Require a valid API key like every other data endpoint (e.g. /document/convert).
+    await verify_api_key(request, credentials)
+    return await _smart_anonymize_core(
+        request,
+        text=request_body.text,
+        language=request_body.language or "de",
+        context_hint=request_body.context_hint,
+        prefix=request_body.prefix,
+    )
 
 
 # ============================================================================
