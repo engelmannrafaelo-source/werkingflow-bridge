@@ -6770,6 +6770,69 @@ async def get_attribution_metrics(
     return snapshot()
 
 
+@app.get("/v1/metrics/anonymization")
+async def get_anonymization_metrics(
+    request: Request,
+    hours: int = 24,
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(security),
+):
+    """Anonymization accountability counters from audit_log (last ``hours``).
+
+    Feeds the failure-alarm cron: ``failed_total`` / ``failed_by_app`` surface
+    anonymization runs that did NOT complete (action pii.anonymization_failed),
+    so a silent gap in the DSGVO gate becomes a visible, alertable number.
+    ``last_failure_ts`` gives the cron idempotency (alert only on a newer
+    failure). ``pseudonymized_total`` is the success baseline. Reads the same
+    audit_log the attestation writer populates.
+    """
+    await verify_api_key(request, credentials)
+    from src.db.client import get_pool, is_db_enabled
+
+    hours = max(1, hours)
+    if not is_db_enabled():
+        return {
+            "db": False, "window_hours": hours, "failed_total": 0,
+            "pseudonymized_total": 0, "failed_by_app": {}, "last_failure_ts": None,
+        }
+
+    pool = get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT action, actor_label, COUNT(*) AS n
+              FROM audit_log
+             WHERE action IN ('pii.pseudonymized', 'pii.anonymization_failed')
+               AND timestamp >= now() - make_interval(hours => $1)
+             GROUP BY action, actor_label
+            """,
+            hours,
+        )
+        last_failure = await conn.fetchval(
+            "SELECT max(timestamp) FROM audit_log WHERE action = 'pii.anonymization_failed'"
+        )
+
+    failed_total = 0
+    pseudonymized_total = 0
+    failed_by_app: Dict[str, int] = {}
+    for r in rows:
+        n = int(r["n"])
+        if r["action"] == "pii.anonymization_failed":
+            failed_total += n
+            label = r["actor_label"] or "unknown"
+            failed_by_app[label] = failed_by_app.get(label, 0) + n
+        else:
+            pseudonymized_total += n
+
+    return {
+        "db": True,
+        "window_hours": hours,
+        "failed_total": failed_total,
+        "pseudonymized_total": pseudonymized_total,
+        "failed_by_app": failed_by_app,
+        "last_failure_ts": last_failure.isoformat() if last_failure else None,
+    }
+
+
 # ============================================================================
 # Prompt Performance Metrics (per app + agent)
 # ============================================================================
