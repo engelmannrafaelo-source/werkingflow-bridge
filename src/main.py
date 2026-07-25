@@ -5491,6 +5491,30 @@ async def smart_anonymize_endpoint(
             )
         except Exception as _te:
             logger.warning(f"anonymisierung activity tracking failed (non-blocking): {_te}")
+        # DSGVO Rechenschaftspflicht: persist a value-free attestation of what
+        # was pseudonymized (types + counts, never values). Best-effort — an
+        # audit-DB hiccup must not fail the anonymization; the warning feeds
+        # alerting (Schicht 1 A5).
+        try:
+            from src.privacy.attestation import build_attestation
+            from src.audit.recorder import record_audit_event
+            _att = build_attestation(
+                result.detected_entities or [],
+                status="success",
+                anonymization_performed=bool(result.anonymization_performed),
+                mapping_size=len(result.mapping or {}),
+                model="flair/ner-german-large",
+            )
+            await record_audit_event(
+                "pii.pseudonymized",
+                actor_user_id=_attr.get("user_id"),
+                actor_label=_attr.get("app_id") or "anonymisierung",
+                target_kind="anonymization",
+                target_id=_attr.get("workflow_id"),
+                metadata={**_att, "app_env": _attr.get("app_env"), "duration_ms": _duration_ms},
+            )
+        except Exception as _ae:
+            logger.warning(f"pii attestation audit write failed (non-blocking): {_ae}")
         _record_document_call_metrics(
             request, agent_id="anonymisierung", model="privacy-service",
             status="success", duration_ms=_duration_ms,
@@ -5531,6 +5555,27 @@ async def smart_anonymize_endpoint(
             )
         except Exception as _te:
             logger.warning(f"anonymisierung error tracking failed (non-blocking): {_te}")
+        # Accountability also covers failures: record that anonymization did NOT
+        # complete (so the audit trail shows a blocked run, never a silent gap).
+        # _error_message is a status/detail string, not the caller's text.
+        try:
+            from src.audit.recorder import record_audit_event
+            await record_audit_event(
+                "pii.anonymization_failed",
+                actor_user_id=_attr.get("user_id"),
+                actor_label=_attr.get("app_id") or "anonymisierung",
+                target_kind="anonymization",
+                target_id=_attr.get("workflow_id"),
+                metadata={
+                    "status": "error",
+                    "error_code": type(e).__name__,
+                    "error": _error_message[:500],
+                    "app_env": _attr.get("app_env"),
+                    "duration_ms": _duration_ms,
+                },
+            )
+        except Exception as _ae:
+            logger.warning(f"pii failure audit write failed (non-blocking): {_ae}")
         _record_document_call_metrics(
             request, agent_id="anonymisierung", model="privacy-service",
             status="error", duration_ms=_duration_ms,
