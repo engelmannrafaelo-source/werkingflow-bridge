@@ -443,6 +443,16 @@ class ResearchRequest(BaseModel):
         description="If true, returns immediately with request_id. Poll /v1/research/async/{request_id} for result."
     )
 
+    # Research-cloud overflow opt-in (Weg C, see src/research_cloud/). Default
+    # false -> existing callers unaffected. Only takes effect when the pool
+    # looks saturated AND RESEARCH_CLOUD_ENABLED is on (src.research_cloud.
+    # routing.resolve_research_cloud_routing) — this flag alone never routes
+    # a request off the subscription pool.
+    cloud_overflow: Optional[bool] = Field(
+        default=False,
+        description="Allow this research call to overflow to the Anthropic-API research-cloud path if the subscription worker pool looks saturated. No effect unless the research-cloud feature is enabled server-side."
+    )
+
 
 class ResearchResponse(BaseModel):
     """

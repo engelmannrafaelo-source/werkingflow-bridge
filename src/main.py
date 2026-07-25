@@ -4137,11 +4137,162 @@ async def _execute_research_impl(
         )
 
 
+async def _execute_research_cloud_impl(
+    request: Request,
+    request_body: ResearchRequest,
+    attribution_ctx: Optional[Dict[str, Any]] = None,
+) -> ResearchResponse:
+    """Research-cloud execution path (Weg C) — Anthropic Messages API with
+    server-side web_search/web_fetch, no CLI subprocess. Mirrors
+    ``_execute_research_impl``'s contract: always returns ResearchResponse
+    (never raises), so the sync/async job-spawn machinery in the /v1/research
+    handler cannot tell which path served the request (formgleich response).
+
+    Fail-loud within the run: an anonymize-gate refusal or executor failure
+    becomes ResearchResponse(status="error", ...) — never a silent fallback
+    to the worker pool mid-run (routing/cap decides pool-vs-cloud BEFORE this
+    function is ever called).
+    """
+    from src.research_cloud.anonymize_gate import CloudAnonymizeError, anonymize_query_for_cloud
+    from src.research_cloud.executor import ResearchCloudExecutorError, run_research_cloud
+    from src.research_cloud.models import ResearchCloudConfig
+    from src.research_cloud.pricing_tiers import customer_price_eur
+    from src.research_cloud.prompt import build_system_prompt, search_budget_for_depth
+
+    start_time = time.time()
+
+    try:
+        anonymized_query = await anonymize_query_for_cloud(request, request_body.query)
+    except CloudAnonymizeError as e:
+        logger.error(f"research-cloud: anonymize gate refused the call: {e}")
+        return ResearchResponse(
+            status="error",
+            query=request_body.query,
+            model=request_body.model,
+            execution_time_seconds=round(time.time() - start_time, 2),
+            error=f"research-cloud requires verified anonymization, which failed: {e}",
+        )
+
+    # OA-Scholarly-Schicht (Weg A) is backend-agnostic prompt injection — same
+    # fail-soft gating as the pool path. Runs AFTER anonymization (the OA
+    # block is external literature, not user-supplied text) so it never
+    # bypasses the anonymize gate.
+    prompt = anonymized_query
+    try:
+        from src.scholarly import scholarly_enabled, build_oa_context
+        if scholarly_enabled(getattr(request_body, "research_mode", None)):
+            oa_block = await build_oa_context(
+                anonymized_query, attribution=attribution_ctx, model=request_body.model
+            )
+            if oa_block:
+                prompt += "\n\n" + oa_block
+    except Exception as _oa_err:
+        logger.warning(f"research-cloud: OA-Scholarly-Schicht übersprungen (fail-soft): {_oa_err}")
+
+    system_prompt = build_system_prompt(request_body.depth)
+    search_max_uses, fetch_max_uses = search_budget_for_depth(request_body.depth)
+    config = ResearchCloudConfig(web_search_max_uses=search_max_uses, web_fetch_max_uses=fetch_max_uses)
+
+    try:
+        result = await run_research_cloud(prompt, system_prompt, config=config)
+    except ResearchCloudExecutorError as e:
+        execution_time = time.time() - start_time
+        logger.error(f"research-cloud: executor failed: {e}", exc_info=True)
+        try:
+            from src.activity.ai_call_writer import persist_ai_call_activity
+            await persist_ai_call_activity(
+                app_id=attribution_ctx.get("app_id") if attribution_ctx else None,
+                user_id=attribution_ctx.get("user_id") if attribution_ctx else None,
+                agent_id=f"research-cloud:{request_body.strategy or 'default'}",
+                workflow_id=None,
+                model=config.model,
+                input_tokens=0,
+                output_tokens=0,
+                status="error",
+                duration_ms=int(execution_time * 1000),
+                error_code="research_cloud_executor_error",
+                app_env=attribution_ctx.get("app_env") if attribution_ctx else None,
+                provider="research-cloud",
+            )
+        except Exception as _track_err:
+            logger.warning(f"research-cloud error activity tracking failed (non-fatal): {_track_err}")
+        return ResearchResponse(
+            status="error",
+            query=request_body.query,
+            model=request_body.model,
+            execution_time_seconds=round(execution_time, 2),
+            error=str(e),
+        )
+
+    # Real-cost ledger booking — research-cloud always books real cost
+    # (src.activity.ai_call_writer.resolve_ledger_cost), tokens + web_search
+    # fees together (persist_ai_call_activity's search_count param).
+    try:
+        from src.activity.ai_call_writer import persist_ai_call_activity
+        await persist_ai_call_activity(
+            app_id=attribution_ctx.get("app_id") if attribution_ctx else None,
+            user_id=attribution_ctx.get("user_id") if attribution_ctx else None,
+            agent_id=f"research-cloud:{request_body.strategy or 'default'}",
+            workflow_id=None,
+            model=result.model,
+            input_tokens=result.usage.input_tokens,
+            output_tokens=result.usage.output_tokens,
+            cache_read_tokens=result.usage.cache_read_input_tokens,
+            cache_creation_tokens=result.usage.cache_creation_input_tokens,
+            search_count=result.searches,
+            status="success",
+            duration_ms=int(result.duration_seconds * 1000),
+            app_env=attribution_ctx.get("app_env") if attribution_ctx else None,
+            provider="research-cloud",
+            provider_meta={
+                "searches": result.searches,
+                "fetches": result.fetches,
+                "iterations": result.iterations,
+                "container_id": result.container_id,
+                "stop_reason": result.stop_reason,
+                "depth": request_body.depth,
+                # Observability only — NOT wired into the deduction path yet,
+                # see src/research_cloud/pricing_tiers.py docstring.
+                "customer_price_eur": customer_price_eur(request_body.depth),
+            },
+        )
+    except Exception as _track_err:
+        logger.warning(f"research-cloud activity tracking failed (non-fatal): {_track_err}")
+
+    # No filesystem/session-id discovery on this path (no CLI subprocess) —
+    # but output_path is still honored: the Bridge writes the report itself
+    # (DESIGN.md: "output_path optional weiterhin bedienen (Bridge schreibt
+    # Datei selbst)").
+    output_file = None
+    file_size_bytes = None
+    if request_body.output_path and result.content:
+        try:
+            with open(request_body.output_path, "w", encoding="utf-8") as f:
+                f.write(result.content)
+            output_file = request_body.output_path
+            file_size_bytes = len(result.content.encode("utf-8"))
+        except OSError as e:
+            logger.warning(f"research-cloud: could not write output_path {request_body.output_path!r}: {e}")
+
+    return ResearchResponse(
+        status="success",
+        query=request_body.query,
+        model=result.model,
+        output_file=output_file,
+        file_size_bytes=file_size_bytes,
+        content=result.content,
+        execution_time_seconds=result.duration_seconds,
+        error=None,
+    )
+
+
 async def _run_async_research_job(
     request_body: ResearchRequest,
     backend_config: Optional[BackendConfig],
     job_id: str,
     attribution_ctx: Optional[Dict[str, Any]] = None,
+    request: Optional[Request] = None,
+    use_research_cloud: bool = False,
 ) -> None:
     """Background runner that stores ResearchResponse as a JSON file in the
     shared async-jobs directory. Any worker can read it back.
@@ -4166,7 +4317,10 @@ async def _run_async_research_job(
 
     heartbeat_task = asyncio.create_task(_heartbeat())
     try:
-        result = await _execute_research_impl(request_body, backend_config, attribution_ctx=attribution_ctx)
+        if use_research_cloud:
+            result = await _execute_research_cloud_impl(request, request_body, attribution_ctx=attribution_ctx)
+        else:
+            result = await _execute_research_impl(request_body, backend_config, attribution_ctx=attribution_ctx)
         _save_research_job(job_id, {
             "status": "done" if result.status == "success" else "error",
             "started_at": started_at,
@@ -4377,50 +4531,71 @@ async def research(
             error=f"user provider pin unservable (no fallback by design): {e}"
         )
 
-    # BACKEND ROUTING: Resolve backend configuration for research
+    # RESEARCH-CLOUD ROUTING: decide pool vs. cloud (Weg C) BEFORE backend
+    # resolution — the cloud path is a different executor entirely (direct
+    # Messages API, no CLI subprocess), not a BackendType the backend_router
+    # resolves. Default off (RESEARCH_CLOUD_ENABLED); even then only takes
+    # effect via an explicit research-scoped pin or pool-saturation overflow
+    # opt-in — see src/research_cloud/routing.py. A user with an existing
+    # GLOBAL provider pin (e.g. Bedrock/DSGVO) keeps that behavior unchanged —
+    # research-cloud never overrides an existing compliance pin.
+    _use_research_cloud = False
+    if _research_pinned is None:
+        try:
+            from src.research_cloud.routing import resolve_research_cloud_routing
+            _use_research_cloud = await resolve_research_cloud_routing(
+                request.headers.get("X-User-ID"), bool(request_body.cloud_overflow)
+            )
+        except Exception as _rc_err:
+            logger.warning(f"research-cloud routing decision failed (fail-open to pool): {_rc_err}")
+            _use_research_cloud = False
+
+    # BACKEND ROUTING: Resolve backend configuration for research (skipped
+    # entirely on the research-cloud path — Bedrock gates don't apply there).
     backend_config = None
-    try:
-        backend_config = resolve_backend_config(
-            backend=request_body.backend or BackendType.ANTHROPIC,
-            model=resolved_model,
-            privacy=request_body.privacy or PrivacyMode.AUTO,
-            bedrock_region=request_body.bedrock_region
-        )
-    except RuntimeError as e:
-        return ResearchResponse(
-            status="error",
-            query=request_body.query,
-            model=request_body.model,
-            error=str(e)
-        )
+    if not _use_research_cloud:
+        try:
+            backend_config = resolve_backend_config(
+                backend=request_body.backend or BackendType.ANTHROPIC,
+                model=resolved_model,
+                privacy=request_body.privacy or PrivacyMode.AUTO,
+                bedrock_region=request_body.bedrock_region
+            )
+        except RuntimeError as e:
+            return ResearchResponse(
+                status="error",
+                query=request_body.query,
+                model=request_body.model,
+                error=str(e)
+            )
 
-    # BEDROCK-GATE: wie bei chat completions — Bedrock nur per Operator-Pin.
-    try:
-        assert_bedrock_is_pinned(backend_config.backend, _research_pinned)
-    except BedrockPinRequiredError as e:
-        return ResearchResponse(
-            status="error",
-            query=request_body.query,
-            model=request_body.model,
-            error=f"bedrock_requires_operator_pin: {e}"
-        )
+        # BEDROCK-GATE: wie bei chat completions — Bedrock nur per Operator-Pin.
+        try:
+            assert_bedrock_is_pinned(backend_config.backend, _research_pinned)
+        except BedrockPinRequiredError as e:
+            return ResearchResponse(
+                status="error",
+                query=request_body.query,
+                model=request_body.model,
+                error=f"bedrock_requires_operator_pin: {e}"
+            )
 
-    # Real-money (Bedrock) research must be fully attributed (app + env), else
-    # the spend is booked un-attributable in the cost dashboard (2026-07-09).
-    _research_bedrock_attr = extract_attribution_context(request)
-    try:
-        assert_bedrock_attribution_complete(
-            backend_config.backend,
-            app_env=_research_bedrock_attr["app_env"],
-            app_id=_research_bedrock_attr["app_id"],
-        )
-    except BedrockAttributionIncompleteError as e:
-        return ResearchResponse(
-            status="error",
-            query=request_body.query,
-            model=request_body.model,
-            error=f"bedrock_attribution_incomplete: {e}"
-        )
+        # Real-money (Bedrock) research must be fully attributed (app + env), else
+        # the spend is booked un-attributable in the cost dashboard (2026-07-09).
+        _research_bedrock_attr = extract_attribution_context(request)
+        try:
+            assert_bedrock_attribution_complete(
+                backend_config.backend,
+                app_env=_research_bedrock_attr["app_env"],
+                app_id=_research_bedrock_attr["app_id"],
+            )
+        except BedrockAttributionIncompleteError as e:
+            return ResearchResponse(
+                status="error",
+                query=request_body.query,
+                model=request_body.model,
+                error=f"bedrock_attribution_incomplete: {e}"
+            )
 
     # R2+R3: Extract attribution context and enforce budget BEFORE any research execution.
     # This single gate covers both the sync path (R2) and the async job spawn (R3) —
@@ -4453,7 +4628,10 @@ async def research(
             "heartbeat_at": time.time(),
             "query": request_body.query[:100],
         })
-        asyncio.create_task(_run_async_research_job(request_body, backend_config, job_id, attribution_ctx=_research_attr))
+        asyncio.create_task(_run_async_research_job(
+            request_body, backend_config, job_id, attribution_ctx=_research_attr,
+            request=request, use_research_cloud=_use_research_cloud,
+        ))
         logger.info(f"📨 Async research job {job_id} dispatched (query: {request_body.query[:60]!r})")
         return ResearchResponse(
             status="success",
@@ -4463,6 +4641,8 @@ async def research(
         )
 
     # Sync path: execute and return the full result
+    if _use_research_cloud:
+        return await _execute_research_cloud_impl(request, request_body, attribution_ctx=_research_attr)
     return await _execute_research_impl(request_body, backend_config, attribution_ctx=_research_attr)
 
 
