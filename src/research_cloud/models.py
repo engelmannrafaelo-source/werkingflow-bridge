@@ -4,6 +4,7 @@ executor produces or consumes is a real model.
 """
 from __future__ import annotations
 
+import os
 from typing import Any, Dict, List, Literal, Optional
 
 from pydantic import BaseModel, Field
@@ -54,7 +55,15 @@ class ResearchCloudConfig(BaseModel):
     http_timeout_seconds: float = 900.0
     web_search_max_uses: int = 15
     web_fetch_max_uses: int = 10
-    inference_geo: Optional[str] = "eu"
+    # Live-verified 2026-07-27: our org's API only accepts 'global'|'us' for
+    # inference_geo — the spec's "eu" intent 400s on every request. Default to
+    # None (omit the param); the env override RESEARCH_CLOUD_INFERENCE_GEO
+    # exists so "eu" can be pinned the day Anthropic offers it to this org.
+    # GDPR posture is unchanged: queries pass the fail-loud anonymize gate
+    # before any cloud send.
+    inference_geo: Optional[str] = Field(
+        default_factory=lambda: os.environ.get("RESEARCH_CLOUD_INFERENCE_GEO") or None
+    )
 
 
 # ---------------------------------------------------------------------------
