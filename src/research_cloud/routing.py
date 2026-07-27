@@ -29,9 +29,18 @@ def research_cloud_enabled() -> bool:
     return os.getenv("RESEARCH_CLOUD_ENABLED", "").strip().lower() in ("1", "true", "yes", "on")
 
 
-async def resolve_research_cloud_routing(raw_user_id: Optional[str], cloud_overflow: bool) -> bool:
+async def resolve_research_cloud_routing(
+    raw_user_id: Optional[str], cloud_overflow: bool, *, implicit_pin: bool = False
+) -> bool:
     """Return True iff this /v1/research call should run on the research-cloud
     path instead of the subscription worker pool.
+
+    implicit_pin=True treats the user as cloud-pinned without reading
+    provider_config.research_provider — used for globally Bedrock-pinned
+    users (Rafael 2026-07-27): the Bedrock pin marks a production user, and
+    research cannot run on Bedrock at all (no WebSearch there — DESIGN.md
+    options matrix), so their research takes the cloud path whenever it is
+    available.
     """
     if not research_cloud_enabled():
         return False
@@ -40,7 +49,7 @@ async def resolve_research_cloud_routing(raw_user_id: Optional[str], cloud_overf
     from src.research_cloud.pool_signal import is_worker_pool_saturated
     from src.routing.research_provider_override import get_user_research_pin
 
-    pinned = await get_user_research_pin(raw_user_id)
+    pinned = "cloud" if implicit_pin else await get_user_research_pin(raw_user_id)
     wants_overflow = bool(cloud_overflow)
 
     if pinned != "cloud" and not (wants_overflow and is_worker_pool_saturated()):

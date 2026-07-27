@@ -4286,6 +4286,34 @@ async def _execute_research_cloud_impl(
     )
 
 
+async def _execute_research_cloud_with_pool_fallback(
+    request: Optional[Request],
+    request_body: ResearchRequest,
+    attribution_ctx: Optional[Dict[str, Any]] = None,
+) -> ResearchResponse:
+    """Cloud first, subscription pool second — a production user never sees a
+    cloud-path failure (Rafael 2026-07-27: "automatisch im Hintergrund gelöst").
+
+    The retry runs on the default pool backend (backend_config=None →
+    subscription OAuth env) — deliberately NOT the caller's original backend:
+    for Bedrock-pinned users that would be a web-search-less research. The
+    fallback is logged at ERROR so monitoring surfaces every occurrence —
+    automatic recovery is not the same as invisible recovery.
+    """
+    result = await _execute_research_cloud_impl(
+        request, request_body, attribution_ctx=attribution_ctx
+    )
+    if result.status != "error":
+        return result
+    logger.error(
+        f"research-cloud run failed — retrying on the subscription pool "
+        f"(reliability fallback): {result.error}"
+    )
+    return await _execute_research_impl(
+        request_body, None, attribution_ctx=attribution_ctx
+    )
+
+
 async def _run_async_research_job(
     request_body: ResearchRequest,
     backend_config: Optional[BackendConfig],
@@ -4318,7 +4346,7 @@ async def _run_async_research_job(
     heartbeat_task = asyncio.create_task(_heartbeat())
     try:
         if use_research_cloud:
-            result = await _execute_research_cloud_impl(request, request_body, attribution_ctx=attribution_ctx)
+            result = await _execute_research_cloud_with_pool_fallback(request, request_body, attribution_ctx=attribution_ctx)
         else:
             result = await _execute_research_impl(request_body, backend_config, attribution_ctx=attribution_ctx)
         _save_research_job(job_id, {
@@ -4536,11 +4564,36 @@ async def research(
     # Messages API, no CLI subprocess), not a BackendType the backend_router
     # resolves. Default off (RESEARCH_CLOUD_ENABLED); even then only takes
     # effect via an explicit research-scoped pin or pool-saturation overflow
-    # opt-in — see src/research_cloud/routing.py. A user with an existing
-    # GLOBAL provider pin (e.g. Bedrock/DSGVO) keeps that behavior unchanged —
-    # research-cloud never overrides an existing compliance pin.
+    # opt-in — see src/research_cloud/routing.py. A user with a GLOBAL
+    # Bedrock pin gets the research exception below (Bedrock cannot serve
+    # research at all); for every other endpoint the compliance pin is
+    # untouched.
     _use_research_cloud = False
-    if _research_pinned is None:
+    if _research_pinned == "bedrock":
+        # RESEARCH EXCEPTION TO THE GLOBAL BEDROCK PIN (Rafael 2026-07-27):
+        # research cannot run on Bedrock at all — WebSearch is not available
+        # there (DESIGN.md options matrix, verified against AWS docs
+        # 2026-07-24), so honoring the pin here would silently ship a
+        # web-search-less research. The query passes the anonymize gate
+        # before any cloud send, which is the compliance basis for running
+        # research over the Anthropic API ("Bedrock nicht nötig" — spec).
+        # The pin stays fully in force for every other endpoint. Cloud when
+        # available (implicit pin), default pool backend otherwise.
+        _research_pinned = None
+        request_body.backend = BackendType.ANTHROPIC
+        request_body.bedrock_region = None
+        try:
+            from src.research_cloud.routing import resolve_research_cloud_routing
+            _use_research_cloud = await resolve_research_cloud_routing(
+                request.headers.get("X-User-ID"), True, implicit_pin=True
+            )
+        except Exception as _rc_err:
+            logger.error(
+                f"research-cloud routing (bedrock research exception) failed — "
+                f"falling back to pool: {_rc_err}"
+            )
+            _use_research_cloud = False
+    elif _research_pinned is None:
         try:
             from src.research_cloud.routing import resolve_research_cloud_routing
             from src.routing.research_provider_override import ResearchProviderOverrideError
@@ -4656,7 +4709,7 @@ async def research(
 
     # Sync path: execute and return the full result
     if _use_research_cloud:
-        return await _execute_research_cloud_impl(request, request_body, attribution_ctx=_research_attr)
+        return await _execute_research_cloud_with_pool_fallback(request, request_body, attribution_ctx=_research_attr)
     return await _execute_research_impl(request_body, backend_config, attribution_ctx=_research_attr)
 
 
