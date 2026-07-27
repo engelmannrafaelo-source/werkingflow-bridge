@@ -136,6 +136,11 @@ services:
       - CLAUDE_PERMISSION_MODE=bypassPermissions
       - TAVILY_API_KEY=${TAVILY_API_KEY}
       - ANTHROPIC_VISION_API_KEY=${ANTHROPIC_API_KEY}
+      # research-cloud (Weg C): executor-only key alias + feature flag.
+      # NEVER add plain ANTHROPIC_API_KEY here — claude_cli.py fatals on it
+      # (subscription pool would silently bill the API otherwise).
+      - RESEARCH_CLOUD_API_KEY=${ANTHROPIC_API_KEY:-}
+      - RESEARCH_CLOUD_ENABLED=${RESEARCH_CLOUD_ENABLED:-}
       - OPENAI_API_KEY=${OPENAI_API_KEY}
       # STT / Whisper EU data-residency (GDPR) — default openai (US, backward-compat).
       # EU route (Rafael 2026-07-06): STT_PROVIDER=aws-sagemaker + AWS_STT_SAGEMAKER_ENDPOINT
@@ -242,6 +247,11 @@ services:
       - CLAUDE_PERMISSION_MODE=bypassPermissions
       - TAVILY_API_KEY=${TAVILY_API_KEY}
       - ANTHROPIC_VISION_API_KEY=${ANTHROPIC_API_KEY}
+      # research-cloud (Weg C): executor-only key alias + feature flag.
+      # NEVER add plain ANTHROPIC_API_KEY here — claude_cli.py fatals on it
+      # (subscription pool would silently bill the API otherwise).
+      - RESEARCH_CLOUD_API_KEY=${ANTHROPIC_API_KEY:-}
+      - RESEARCH_CLOUD_ENABLED=${RESEARCH_CLOUD_ENABLED:-}
       - OPENAI_API_KEY=${OPENAI_API_KEY}
       # STT / Whisper EU data-residency (GDPR) — default openai (US, backward-compat).
       # EU route (Rafael 2026-07-06): STT_PROVIDER=aws-sagemaker + AWS_STT_SAGEMAKER_ENDPOINT

@@ -88,10 +88,21 @@ async def run_research_cloud(
     the seam tests use to inject a mocked httpx.AsyncClient.
     """
     config = config or ResearchCloudConfig()
-    api_key = api_key or os.environ.get("ANTHROPIC_API_KEY")
+    # Workers deliberately never carry ANTHROPIC_API_KEY — claude_cli.py
+    # fatals on it, because the CLI would otherwise silently bill the API
+    # instead of the subscription pool. The executor therefore reads its own
+    # RESEARCH_CLOUD_API_KEY (mapped in docker-compose from the host's
+    # ANTHROPIC_API_KEY). The plain ANTHROPIC_API_KEY fallback exists for
+    # local/dev runs outside a worker container.
+    api_key = (
+        api_key
+        or os.environ.get("RESEARCH_CLOUD_API_KEY")
+        or os.environ.get("ANTHROPIC_API_KEY")
+    )
     if not api_key:
         raise ResearchCloudExecutorError(
-            "ANTHROPIC_API_KEY not set — refusing to run the research-cloud executor"
+            "RESEARCH_CLOUD_API_KEY (or ANTHROPIC_API_KEY) not set — refusing "
+            "to run the research-cloud executor"
         )
 
     headers = {
