@@ -1,5 +1,18 @@
 FROM python:3.12-slim
 
+# TORCH_VARIANT selects the torch/torchvision wheels installed below.
+#   cpu  (default): unchanged CPU-only build — every host builds this today.
+#   cuda: pulls PyPI's default (CUDA-enabled) wheels for the SAME pinned
+#         versions instead of the +cpu ones, for GPU hosts running Flair
+#         inference on an NVIDIA GPU via nvidia-container-toolkit. No CUDA
+#         toolkit/base image needed — the cu-enabled torch wheel bundles its
+#         own CUDA runtime libs (nvidia-cublas-cu12 etc. as pip deps); the
+#         host only needs a driver + nvidia-container-toolkit.
+#   Build with: docker build --build-arg TORCH_VARIANT=cuda ...
+#   Does NOT touch poetry.lock or the poetry install step either way — see
+#   the note on the pip-installed torch/flair block below.
+ARG TORCH_VARIANT=cpu
+
 # System deps:
 #   - libgl1/libglib2.0-0: Docling (OpenCV)
 #   - libreoffice headless components: DOCX/PPTX/XLSX legacy → PDF
@@ -54,16 +67,32 @@ RUN poetry run python -m spacy download de_core_news_lg && \
 # Flair NER (local German PERSON/LOCATION/ORG detection) — replaces spaCy's
 # over-eager NER. Installed via pip (NOT poetry) to avoid re-resolving the
 # committed poetry.lock, which drifts torch to a broken CUDA build (see note
-# above). torch pinned to the +cpu wheel: CPU-only host, the CUDA build is
-# ~2 GB larger and pulls nvidia-cudnn which fails to install here.
-# torchvision MUST be pinned to the version matching torch 2.5.1 (0.20.1) and
-# +cpu too: flair otherwise pulls torchvision 0.27.0 (built for torch 2.12),
-# whose C++ ops (torchvision::nms) then fail against torch 2.5.1 — that ABI break
-# surfaces as transformers' lazy LayoutLMv2/AutoProcessor imports crashing, which
-# takes down BOTH flair NER and docling OCR (both do `from transformers import`).
-RUN poetry run pip install --no-cache-dir \
-        --extra-index-url https://download.pytorch.org/whl/cpu \
-        "torch==2.5.1+cpu" "torchvision==0.20.1+cpu" "flair==0.15.1"
+# above). CPU build (default) pins the +cpu wheel: CPU-only host, the default
+# CUDA build is ~2 GB larger and pulls nvidia-cudnn which fails to install
+# here. torchvision MUST be pinned to the version matching torch 2.5.1
+# (0.20.1) too: flair otherwise pulls torchvision 0.27.0 (built for torch
+# 2.12), whose C++ ops (torchvision::nms) then fail against torch 2.5.1 —
+# that ABI break surfaces as transformers' lazy LayoutLMv2/AutoProcessor
+# imports crashing, which takes down BOTH flair NER and docling OCR (both do
+# `from transformers import`).
+#
+# TORCH_VARIANT=cuda (see ARG above) installs the SAME pinned 2.5.1/0.20.1
+# versions but the default (CUDA-enabled) PyPI wheels instead of +cpu — those
+# bundle CUDA 12.4 runtime libs as pip deps (nvidia-cublas-cu12 etc.), which
+# is the known-good pairing for this torch version, not the newer cu13 build
+# that broke `poetry lock` (see note above). Runtime still needs a host GPU +
+# nvidia-container-toolkit; the build itself does not require one.
+RUN if [ "$TORCH_VARIANT" = "cuda" ]; then \
+        poetry run pip install --no-cache-dir \
+            "torch==2.5.1" "torchvision==0.20.1" "flair==0.15.1"; \
+    elif [ "$TORCH_VARIANT" = "cpu" ]; then \
+        poetry run pip install --no-cache-dir \
+            --extra-index-url https://download.pytorch.org/whl/cpu \
+            "torch==2.5.1+cpu" "torchvision==0.20.1+cpu" "flair==0.15.1"; \
+    else \
+        echo "Unknown TORCH_VARIANT='$TORCH_VARIANT' — expected 'cpu' or 'cuda'" >&2; \
+        exit 1; \
+    fi
 
 # Pre-download the Flair model (~1.5 GB) so the first request doesn't block on a
 # download and the service works without network at runtime.

@@ -514,6 +514,16 @@ services:
       - PRIVACY_ENABLED=true
       - PRIVACY_LANGUAGE=de
       - PRIVACY_LOG_DETECTIONS=false
+      # GPU rollout (2026-07-28): Flair NER can run on CUDA instead of CPU —
+      # see src/privacy/flair_recognizer.py. Unset here on purpose: this
+      # compose file builds Dockerfile.privacy-pdf with the default
+      # TORCH_VARIANT=cpu (no GPU on this host), so PRIVACY_DEVICE defaults
+      # to "auto" -> CPU, i.e. unchanged behaviour. A GPU host builds the
+      # image with --build-arg TORCH_VARIANT=cuda, sets PRIVACY_DEVICE=cuda
+      # (fails loud instead of silently running on CPU if no GPU is visible
+      # there), and raises SMART_ANONYMIZE_MAX_CONCURRENT together with
+      # SMART_ANONYMIZE_EXECUTOR_WORKERS (both default to today's CPU-era
+      # value of 2 if unset) — via its own env/compose override, not here.
       # ONE worker process: each uvicorn worker holds its own copy of the Flair
       # XLM-R-large stack (~5.5-7GB warm, growing). With 2 workers the combined
       # baseline (~12.6GB observed) left so little of the 16G cgroup that one

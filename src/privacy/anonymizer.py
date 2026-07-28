@@ -113,14 +113,28 @@ class AnonymizationResult:
 # Thread pool for async operations (shared across instances)
 _executor: Optional[ThreadPoolExecutor] = None
 
+# CPU-era default: 2 workers, because on CPU-only hosts more Flair/Presidio
+# threads than that just made everything fight for the same cores (see
+# flair_recognizer.py's _TORCH_THREADS comment) rather than adding throughput.
+# On a GPU host that ceiling is wrong — inference moves off the CPU, so this
+# is a RAM/CPU-contention knob, not a fixed constant. Raising
+# SMART_ANONYMIZE_MAX_CONCURRENT (app.py's admission-control semaphore)
+# without also raising this executor would just move the bottleneck here, so
+# the two must be sized together (this should be >= that value).
+_EXECUTOR_WORKERS = int(os.getenv("SMART_ANONYMIZE_EXECUTOR_WORKERS", "2"))
+
 
 def _get_executor() -> ThreadPoolExecutor:
     """Get or create the shared thread pool executor."""
     global _executor
     if _executor is None:
-        # Use 2 workers - Presidio is CPU-bound, more workers don't help
-        _executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="presidio")
-        logger.info("Presidio thread pool initialized (2 workers)")
+        _executor = ThreadPoolExecutor(
+            max_workers=_EXECUTOR_WORKERS, thread_name_prefix="presidio"
+        )
+        logger.info(
+            "Presidio thread pool initialized (%d workers, SMART_ANONYMIZE_EXECUTOR_WORKERS)",
+            _EXECUTOR_WORKERS,
+        )
     return _executor
 
 
