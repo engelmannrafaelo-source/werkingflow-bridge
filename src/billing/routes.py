@@ -554,6 +554,47 @@ async def billing_project_pack_checkout(
         raise HTTPException(status_code=400, detail=str(e))
 
 
+class FirstPurchasePackCheckoutRequest(BaseModel):
+    planId: str
+    quantity: int = Field(default=1, ge=1, le=100)
+    successRedirect: str
+    # Operator-Service-Token darf userId/email/name mitgeben; beim User-JWT
+    # gewinnt die Auth-Identität (siehe _resolve_billing_identity).
+    userId: Optional[str] = None
+    email: Optional[str] = None
+    name: Optional[str] = None
+
+
+@router.post("/first-purchase-pack/checkout")
+async def billing_first_purchase_pack_checkout(
+    body: FirstPurchasePackCheckoutRequest,
+    claims: AuthClaims = Depends(require_jwt_or_service),
+) -> Dict[str, str]:
+    """
+    Self-Service-ERSTKAUF eines allowlisted Projekt-Pakets (Mollie-Einmalzahlung).
+
+    Bewusst OHNE _assert_self_checkout_allowed: dieses Gate koppelt an den
+    globalen self_checkout_active-Schalter (aktuell AUS — Beta der grösseren
+    Subscription/Project-Pack/TopUp-Selbstbuchung) UND tenants.billing_type.
+    Würde diese Route denselben Schalter nutzen, könnte sie entweder nie live
+    gehen (Schalter aus) oder ein Flip für DIESES Feature würde versehentlich
+    auch die drei anderen, bewusst noch nicht live geschalteten Lanes freigeben
+    — grösserer Blast-Radius als die am 2026-07-28 getroffene Entscheidung
+    (nur das Check-Credit-Pack). Sicherheit kommt stattdessen aus
+    start_first_purchase_pack_checkout selbst: Plan-Allowlist + Preis-Cap.
+    """
+    user_id, email, name = await _resolve_billing_identity(
+        claims, body.userId, body.email, body.name,
+    )
+    try:
+        return await billing_service.start_first_purchase_pack_checkout(
+            user_id, body.planId, body.quantity, body.successRedirect,
+            email, name,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
 class TopUpCheckoutRequest(BaseModel):
     # Top-Up bounds are enforced again in billing_service.start_topup_checkout
     # (defence in depth) — these Pydantic bounds reject obviously bad requests

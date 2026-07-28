@@ -309,6 +309,122 @@ async def start_project_pack_checkout(
     return checkout
 
 
+# Plans allowed through start_first_purchase_pack_checkout — the gate-free
+# first-purchase lane. Deliberately explicit allowlist, NOT "any interval=
+# 'project' plan": lifting the returning-customer + billing-address gates
+# is a per-plan decision, not something that should apply transitively to
+# e.g. energy-project just because it shares interval='project'.
+FIRST_PURCHASE_PACK_PLAN_IDS = frozenset({"report-check-credit"})
+
+# Kleinbetragsrechnungs-Grenze in Österreich: § 11 Abs 6 UStG 1994 (400 EUR).
+# Leitplanke gegen Missbrauch des gate-freien Erstkauf-Pfads für teure Käufe,
+# für die die Rechnungsadresspflicht tatsächlich greift — kein Ersatz für
+# eine steuerrechtliche Prüfung, falls dieser Wert je erhöht werden soll.
+FIRST_PURCHASE_PACK_MAX_AMOUNT_EUR = 400.0
+
+
+async def start_first_purchase_pack_checkout(
+    user_id: str,
+    plan_id: str,
+    quantity: int,
+    success_redirect: str,
+    email: str,
+    name: str,
+) -> Dict[str, str]:
+    """
+    Self-Service-ERSTKAUF eines Projekt-Pakets via Mollie-Einmalzahlung.
+
+    Sibling zu start_project_pack_checkout — NICHT diese Funktion verändern.
+    Für kleine, klar allowlisted Pakete (initial: report-check-credit), bei
+    denen weder das Bestandskunden-Gate noch die volle Rechnungsadresspflicht
+    vor dem Mollie-Roundtrip sinnvoll sind: ein Erstkäufer hat per Definition
+    noch keine released order, und für Kleinbeträge unter der
+    Kleinbetragsrechnungs-Grenze (§ 11 Abs 6 UStG) ist eine vorab vollständige
+    Rechnungsadresse keine harte Voraussetzung — _create_order_invoice
+    toleriert eine fehlende Adresse bereits heute graceful (billing_address=
+    None, Steuersatz-Fallback).
+
+    Unterschiede zu start_project_pack_checkout:
+      - KEIN is_returning-Check.
+      - KEIN _assert_complete_billing_address-Aufruf.
+      - Preis-Cap-Guard (FIRST_PURCHASE_PACK_MAX_AMOUNT_EUR) statt Adresspflicht.
+      - Plan-Allowlist (FIRST_PURCHASE_PACK_PLAN_IDS) statt "jeder interval=
+        'project'-Plan" — verhindert, dass ein falsch konfigurierter Aufruf
+        (z.B. planId=energy-project) versehentlich das Bestandskunden-Gate
+        für ein anderes Produkt umgeht.
+
+    metadata.type bleibt "project_pack" (NICHT umbenennen) — handle_webhook
+    branched generisch über release_order(order_id), ohne zu prüfen WIE die
+    Order entstanden ist; der bestehende Branch funktioniert unverändert.
+
+    Raises:
+      ValueError — Plan nicht in der Allowlist, kein Projekt-Plan, quantity
+                   < 1, oder Gesamtbetrag über dem Preis-Cap.
+    """
+    from src.budget.plans import get_plan
+    from src.billing import pending_orders_service
+
+    if plan_id not in FIRST_PURCHASE_PACK_PLAN_IDS:
+        raise ValueError(
+            f"plan '{plan_id}' is not allowlisted for first-purchase self-service "
+            f"checkout (allowed: {sorted(FIRST_PURCHASE_PACK_PLAN_IDS)})"
+        )
+
+    plan = get_plan(plan_id)
+    if plan.interval != "project":
+        raise ValueError(
+            f"plan '{plan_id}' is not a project plan (interval={plan.interval}) — "
+            "first-purchase pack checkout only applies to project plans"
+        )
+    if quantity < 1:
+        raise ValueError("quantity must be >= 1")
+
+    amount = round(float(plan.price) * quantity, 2)
+    if amount > FIRST_PURCHASE_PACK_MAX_AMOUNT_EUR:
+        raise ValueError(
+            f"amount EUR {amount} exceeds the first-purchase pack cap of "
+            f"EUR {FIRST_PURCHASE_PACK_MAX_AMOUNT_EUR} — larger first purchases "
+            "require the invoice-address-gated lane"
+        )
+
+    user_uuid = uuid.UUID(user_id)
+
+    # pending_order anlegen — Mollie-Lane, KEINE Mahn-Email (Auto-Release im Webhook).
+    order = await pending_orders_service.create_pending_order(
+        user_id, plan_id, quantity, send_email=False, payment_method="mollie",
+    )
+    order_id = str(order["id"])
+
+    customer = await get_or_create_customer(user_id, email, name)
+    mollie = get_mollie_adapter()
+    checkout = await mollie.create_one_time_payment(
+        customer_id=customer["mollieCustomerId"],
+        amount_eur=amount,
+        description=f"{plan.name} × {quantity}",
+        redirect_url=success_redirect,
+        webhook_url=config.mollie_webhook_url,
+        metadata={
+            "type": "project_pack",
+            "userId": user_id,
+            "planId": plan_id,
+            "quantity": str(quantity),
+            "orderId": order_id,
+        },
+    )
+
+    pool = get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO pending_payments (payment_id, user_id, type, plan_id, amount_eur, created_at)
+            VALUES ($1, $2, 'project_pack', $3, $4, NOW())
+            ON CONFLICT (payment_id) DO NOTHING
+            """,
+            checkout["paymentId"], user_uuid, plan_id, amount,
+        )
+    return checkout
+
+
 async def _activate_subscription(
     user_id: str, plan_id: str, seats: int, customer_id: str,
     first_payment_id: str,
