@@ -304,9 +304,23 @@ def _docling_convert_pdf(
     pipeline_options.generate_picture_images = True
     pipeline_options.generate_table_images = False
     pipeline_options.do_ocr = True
+    # Device folgt PRIVACY_DEVICE (gleiche Semantik wie Flair, siehe
+    # privacy/flair_recognizer._resolve_device): auto = CUDA falls vorhanden,
+    # cuda = Pflicht (fail loud unten via torch-Check im Recognizer — Docling
+    # selbst probt bei AUTO ebenfalls CUDA→CPU), cpu = erzwungen. Auf den
+    # CPU-Hosts ändert sich nichts (kein CUDA → CPU wie bisher); auf dem
+    # GPU-Host ist Docling-OCR der größte Hebel (~6-8x pro Seite, siehe
+    # local-storage/research-gpu-privacy-optimierung-20260728.md).
+    _privacy_device = os.getenv("PRIVACY_DEVICE", "auto").strip().lower() or "auto"
+    if _privacy_device == "cpu":
+        _docling_device = AcceleratorDevice.CPU
+    elif _privacy_device == "cuda":
+        _docling_device = AcceleratorDevice.CUDA
+    else:
+        _docling_device = AcceleratorDevice.AUTO
     pipeline_options.accelerator_options = AcceleratorOptions(
         num_threads=int(os.getenv("DOCLING_THREADS", "1")),
-        device=AcceleratorDevice.CPU,
+        device=_docling_device,
     )
 
     converter = DocumentConverter(
