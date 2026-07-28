@@ -159,7 +159,7 @@ services:
       - DEFAULT_PRIVACY_MODE=none
       # Routed to the dev-bridge privacy service (Tailscale): the 7GB prod host
       # cannot hold the ~13GB Flair model. dev host has 30GB. See dev compose.
-      - PRIVACY_SERVICE_URL=http://100.112.98.39:8100
+      - PRIVACY_SERVICE_URL=${PRIVACY_SERVICE_URL:-http://100.112.98.39:8100}
       - BRIDGE_ANONYMIZE_ENABLED=true
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
@@ -270,7 +270,7 @@ services:
       - DEFAULT_PRIVACY_MODE=none
       # Routed to the dev-bridge privacy service (Tailscale): the 7GB prod host
       # cannot hold the ~13GB Flair model. dev host has 30GB. See dev compose.
-      - PRIVACY_SERVICE_URL=http://100.112.98.39:8100
+      - PRIVACY_SERVICE_URL=${PRIVACY_SERVICE_URL:-http://100.112.98.39:8100}
       - BRIDGE_ANONYMIZE_ENABLED=true
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
