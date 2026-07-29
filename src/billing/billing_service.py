@@ -736,12 +736,21 @@ async def cancel_subscription(user_id: str, subscription_id: str) -> None:
                 "UPDATE subscriptions SET status='cancelled', cancelled_at=NOW() WHERE id=$1",
                 sub_uuid,
             )
-            await log_billing_event(
-                "subscription.cancelled",
-                user_id=user_id,
-                subscription_id=subscription_id,
-                source="admin",
-            )
+
+    # Log AFTER the transaction commits — NOT inside it. billing_events has an
+    # FK to subscriptions(id); log_billing_event inserts on a SECOND pooled
+    # connection, whose FK check needs a KEY SHARE lock on the very row this
+    # transaction just UPDATEd (and still holds FOR UPDATE). The two connections
+    # wait on each other, Postgres can't see a deadlock (our txn is idle-in-
+    # transaction, not waiting on a DB resource), so it stalls until asyncpg's
+    # command timeout → the whole cancel rolls back and silently never lands.
+    # This mirrors the suspend/expire paths below, which already log post-commit.
+    await log_billing_event(
+        "subscription.cancelled",
+        user_id=user_id,
+        subscription_id=subscription_id,
+        source="admin",
+    )
 
 
 # ---------------------------------------------------------------------------
