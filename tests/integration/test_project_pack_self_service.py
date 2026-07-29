@@ -63,6 +63,16 @@ async def main():
             uuid.UUID(uid))
     results.append(("A: Mollie-Order Invoice 'paid' + Order 'released'", paid == 1, f"matched={paid}"))
 
+    # --- TEST A2: energy-project (NICHT report-check-credit) darf NIE auto-approved
+    # werden — nur der WerkING-Check hat die Auto-Invoice-Lane (Rafael 2026-07-29). ---
+    async with pool.acquire() as conn:
+        not_approved = await conn.fetchval(
+            """SELECT count(*) FROM invoices i JOIN pending_orders o ON o.invoice_id=i.id
+               WHERE o.user_id=$1 AND o.plan_id='energy-project' AND i.approved_at IS NOT NULL""",
+            uuid.UUID(uid))
+    results.append(("A2: energy-project-Rechnung bleibt manuell (approved_at NULL)",
+                    not_approved == 0, f"unexpectedly_approved={not_approved}"))
+
     # --- TEST B: Webhook-Retry idempotent (kein Doppel-Grant) ---
     res2 = await billing_service.handle_webhook(pay_id)
     avail2 = await get_available_credits(uuid.UUID(uid), "energy-project")

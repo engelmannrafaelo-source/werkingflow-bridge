@@ -854,6 +854,52 @@ async def send_invoice(
     return await _dispatch_invoice_email(pool, r)
 
 
+async def auto_approve_and_send_invoice(invoice_id: str, actor: str) -> Dict[str, Any]:
+    """
+    Programmatic approve+send for the report-check-credit self-service lane —
+    the non-HTTP twin of POST /{id}/approve {"send": true}.
+
+    Called ONLY from billing_service.handle_webhook, and ONLY for orders whose
+    plan_id is in pending_orders_service.AUTO_SEND_INVOICE_PLAN_IDS (currently
+    just "report-check-credit", Rafael 2026-07-29: this product must invoice
+    automatically once marketing is live; every other lane — B2B Rechnungs-Lane,
+    project-pack reorders, subscriptions — keeps the manual operator approval in
+    Platform Admin). Deliberately a separate function rather than a refactor of
+    approve_invoice(), so the admin-triggered path stays untouched.
+    """
+    pool = get_pool()
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            updated = await conn.fetchrow(
+                """
+                UPDATE invoices
+                   SET approved_at = COALESCE(approved_at, NOW()),
+                       approved_by = COALESCE(approved_by, $2),
+                       updated_at  = NOW()
+                 WHERE id = $1
+                RETURNING id, user_id, total_eur, approved_at, approved_by
+                """,
+                uuid.UUID(invoice_id),
+                actor,
+            )
+            if not updated:
+                raise LookupError(f"Invoice {invoice_id} not found for auto-send")
+            await conn.execute(
+                """
+                INSERT INTO billing_events
+                  (event_type, user_id, invoice_id, amount_eur, source, payload)
+                VALUES ('invoice.approved', $1, $2, $3, 'system', $4::jsonb)
+                """,
+                updated["user_id"],
+                uuid.UUID(invoice_id),
+                updated["total_eur"],
+                json.dumps({"approvedBy": actor}),
+            )
+
+    r = await _fetch_invoice_with_user(pool, invoice_id)
+    return await _dispatch_invoice_email(pool, r)
+
+
 class InvoiceApprove(BaseModel):
     send: bool = False
 

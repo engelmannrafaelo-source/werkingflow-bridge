@@ -316,6 +316,18 @@ async def start_project_pack_checkout(
 # e.g. energy-project just because it shares interval='project'.
 FIRST_PURCHASE_PACK_PLAN_IDS = frozenset({"report-check-credit"})
 
+# Plans whose invoice is auto-approved + emailed the moment the Mollie webhook
+# releases the order — bypassing INVOICE_REQUIRE_APPROVAL. Deliberately its own
+# allowlist, decoupled from FIRST_PURCHASE_PACK_PLAN_IDS above: "gate-free
+# first-purchase checkout" and "auto-invoice on payment" are separate business
+# decisions that happen to currently coincide for report-check-credit. Rafael
+# 2026-07-29: WerkING-Check must invoice fully automatically once marketing is
+# live (no manual step in the loop); every other product/lane — B2B
+# Rechnungs-Lane, project-pack reorders (e.g. energy-project), subscriptions —
+# keeps the manual operator approval in Platform Admin. Do NOT widen this set
+# without an explicit per-product decision.
+AUTO_SEND_INVOICE_PLAN_IDS = frozenset({"report-check-credit"})
+
 # Kleinbetragsrechnungs-Grenze in Österreich: § 11 Abs 6 UStG 1994 (400 EUR).
 # Leitplanke gegen Missbrauch des gate-freien Erstkauf-Pfads für teure Käufe,
 # für die die Rechnungsadresspflicht tatsächlich greift — kein Ersatz für
@@ -1073,6 +1085,23 @@ async def handle_webhook(payment_id: str) -> Dict[str, Any]:
             released = await release_order(
                 order_id, operator_user_id=None, note="self-service Mollie payment",
             )
+            if released["planId"] in AUTO_SEND_INVOICE_PLAN_IDS:
+                # Best-effort, mirrors create_pending_order's email-send guard:
+                # the order is already released and paid — a Resend hiccup must
+                # not turn an already-committed, successful purchase into a
+                # webhook failure (which would make Mollie retry release_order).
+                from src.invoices.routes import auto_approve_and_send_invoice
+                try:
+                    await auto_approve_and_send_invoice(
+                        released["invoiceId"], actor="system:mollie-auto-send",
+                    )
+                except Exception as exc:  # noqa: BLE001 — silent-ok: invoice is issued+paid regardless; operator can send manually via Platform Admin if this fails
+                    import logging
+                    logging.getLogger(__name__).warning(
+                        "Auto-send invoice %s for order %s failed (order released, "
+                        "invoice paid — manual send via Platform Admin still possible): %s",
+                        released["invoiceId"], order_id, exc,
+                    )
             return {"handled": True, "type": "project_pack", "order": released}
         except OrderNotReleasableError as exc:
             if exc.status == "released":

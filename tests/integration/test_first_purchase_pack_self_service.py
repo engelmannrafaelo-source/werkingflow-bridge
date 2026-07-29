@@ -55,6 +55,17 @@ async def main():
                     avail == 20 and res.get("handled"),
                     f"avail={avail} webhook={res.get('handled')}/{res.get('type')}"))
 
+    # --- TEST A2: report-check-credit invoice is auto-approved (Rafael 2026-07-29:
+    # this plan must invoice fully automatically, unlike every other lane). ---
+    invoice_id = res.get("order", {}).get("invoiceId")
+    async with pool.acquire() as conn:
+        inv_row = await conn.fetchrow(
+            "SELECT approved_at, approved_by FROM invoices WHERE id = $1", uuid.UUID(invoice_id),
+        )
+    auto_approved = bool(inv_row and inv_row["approved_at"] and inv_row["approved_by"] == "system:mollie-auto-send")
+    results.append(("A2: report-check-credit-Rechnung wird auto-approved (system:mollie-auto-send)",
+                    auto_approved, f"approvedBy={inv_row['approved_by'] if inv_row else None}"))
+
     # --- TEST B: Consume-Endpoint (Python-Funktion, wie von der HTTP-Route genutzt) ---
     consumed = await consume_credit(uuid.UUID(uid), "report-check-credit")
     avail_after_consume = await get_available_credits(uuid.UUID(uid), "report-check-credit")
