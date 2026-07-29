@@ -32,7 +32,7 @@ ENV PATH="/usr/local/bin:${PATH}"
 # (see commit e898c7c). Bump this version DELIBERATELY: change it here, deploy
 # to the dev bridge first, run the smoke + an energy phase-4 style
 # tools-disabled call, then roll to prod.
-RUN npm install -g @anthropic-ai/claude-code@2.1.201
+RUN npm install -g @anthropic-ai/claude-code@2.1.220
 
 # Copy the app code
 COPY . /app
