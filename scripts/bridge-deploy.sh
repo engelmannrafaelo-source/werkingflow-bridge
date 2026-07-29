@@ -574,6 +574,16 @@ phase_smoke_test() {
     if smoke_out=$(python3 "$smoke_script" --base-url "$url" --profile "$profile" \
             --attempts 3 "${extra_args[@]}" 2>&1); then
         while IFS= read -r line; do info "  smoke: ${line}"; done <<< "$smoke_out"
+        # SMOKE_CAPACITY = exit 0, but NOT a clean pass: one or more endpoints
+        # were refused by the account-capacity gate before reaching the
+        # deployed code, so they stayed UNVERIFIED. Deliberately not a
+        # rollback (every build gets that same 429 while the Anthropic
+        # accounts sit at their weekly wall), but it must never read as green.
+        if grep -q '^SMOKE_CAPACITY:' <<< "$smoke_out"; then
+            warn "Smoke test PASSED for ${label} WITH UNVERIFIED ENDPOINTS (pool capacity unavailable)"
+            warn "  Re-run the affected probes once the pool recovers — see the SMOKE_CAPACITY line above."
+            return 0
+        fi
         info "Smoke test PASSED for ${label}"
         return 0
     fi

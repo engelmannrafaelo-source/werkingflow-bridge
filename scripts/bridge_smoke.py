@@ -56,6 +56,13 @@ SMOKE_HEADERS = {
     "X-User-ID": "anonymous:bridge-deploy-smoke",
 }
 
+# The repro commands printed on failure MUST carry the same attribution headers
+# the probes send. /v1/research and /v1/chat/completions call
+# enforce_attribution() (src/main.py), so a repro without X-User-ID reproduces a
+# 400 missing_user_attribution instead of the failure being investigated —
+# sending the next operator after a phantom bug (hit 2026-07-29).
+ATTRIBUTION_REPRO = " ".join(f"-H '{k}: {v}'" for k, v in SMOKE_HEADERS.items()) + " "
+
 # A short German PII string used to assert the anonymize *contract*.
 PII_TEXT = "Herr Schmidt wohnt in Wien, Email max.schmidt@example.com, Tel 0176 1234567."
 PII_MARKERS = ["max.schmidt@example.com", "0176 1234567"]  # must NOT appear verbatim in output
@@ -72,6 +79,78 @@ class ProbeResult:
     detail: str
     http_status: Optional[int] = None
     elapsed_ms: Optional[int] = None
+    # Set ONLY when the probe was refused by the Autobahn capacity gate (see
+    # capacity_envelope): the endpoint itself was never exercised, so this is
+    # infrastructure STATE, not a verdict on the deployed code.
+    capacity_reason: Optional[str] = None
+    retry_after_s: Optional[int] = None
+
+
+# ---------------------------------------------------------------------------
+# Capacity classification — "pool full" is STATE, not a broken endpoint
+# ---------------------------------------------------------------------------
+# The Bridge answers a capacity refusal with its own self-describing Autobahn
+# envelope, emitted BEFORE the request ever reaches the deployed application
+# code (nginx pool_router.choose() → @pool_exhausted_response) or by a worker
+# whose Anthropic account is rate-limited. Neither says anything about the
+# image being deployed: when all subscription accounts sit at their weekly
+# wall, EVERY build — old and new — gets the identical 429. Failing the deploy
+# on it rolls a good image back and keeps rolling it back until the Anthropic
+# weekly window resets (observed 2026-07-29: engelmann 100% / office 98%
+# weekly, capacity_lock_remaining_s of 39h and 59h respectively, while the very
+# same /v1/research call had returned HTTP 200 with a full report 90s earlier).
+#
+# So a capacity refusal is reported as an explicit UNVERIFIED gap, never as a
+# pass and never as a deploy-blocking failure — but only under the guard in
+# partition_results(), which demands independent proof that the pool path is
+# actually working before it excuses anything.
+CAPACITY_BRIDGE_TYPES = {"pool_exhausted", "worker_unavailable"}
+CAPACITY_SOURCES = {"bridge_nginx", "bridge_account"}
+CAPACITY_BACKOFF_MAX_S = 30  # cap the honored Retry-After so a deploy cannot stall
+
+# Probes that must pass through the account-capacity gate (nginx location
+# ~ ^/v1/(chat/completions|research) → pool_router.choose()). They share ONE
+# gate, so a pass on any of them proves the gate + routing are healthy.
+POOL_GATED_PROBES = {"research", "chat_completions"}
+
+
+def capacity_envelope(r) -> Optional[tuple]:
+    """Return (reason, retry_after_s) iff `r` is the Bridge's own capacity
+    envelope, else None.
+
+    Deliberately strict — status AND retryable AND bridge_type AND source must
+    all match the documented contract. A genuinely broken endpoint cannot
+    synthesise this envelope: it is written by nginx/the worker's capacity
+    guard, not by any endpoint handler.
+    """
+    if r.status_code != 429:
+        return None
+    try:
+        err = (r.json() or {}).get("error") or {}
+    except ValueError:
+        return None  # non-JSON 429 → not our contract → real failure
+    if not isinstance(err, dict) or not err.get("retryable"):
+        return None
+    if err.get("bridge_type") not in CAPACITY_BRIDGE_TYPES:
+        return None
+    if err.get("source") not in CAPACITY_SOURCES:
+        return None
+    try:
+        retry_after = int(err.get("retry_after_s") or 30)
+    except (TypeError, ValueError):
+        retry_after = 30
+    return str(err.get("reason") or err.get("bridge_type")), retry_after
+
+
+def capacity_result(name: str, ep: str, r, ms: Optional[int]) -> Optional[ProbeResult]:
+    """ProbeResult for a capacity refusal, or None if `r` is a real failure."""
+    cap = capacity_envelope(r)
+    if not cap:
+        return None
+    reason, retry_after = cap
+    return ProbeResult(name, ep, False,
+                       f"pool capacity unavailable ({reason}) — endpoint not exercised",
+                       r.status_code, ms, capacity_reason=reason, retry_after_s=retry_after)
 
 
 @dataclass
@@ -171,14 +250,15 @@ def _timed(fn):
 # Probes — each asserts a CORRECTNESS property, not just HTTP 200
 # ---------------------------------------------------------------------------
 @probe("research", "/v1/research", {"hetzner", "server2"},
-       repro="curl -XPOST $AI_BRIDGE_URL/v1/research -H 'Authorization: Bearer $AI_BRIDGE_API_KEY' -H 'Content-Type: application/json' -d '{\"query\":\"smoke test\",\"depth\":\"quick\",\"max_turns\":5}'")
+       repro="curl -XPOST $AI_BRIDGE_URL/v1/research -H 'Authorization: Bearer $AI_BRIDGE_API_KEY' -H 'Content-Type: application/json' " + ATTRIBUTION_REPRO + "-d '{\"query\":\"smoke test\",\"depth\":\"quick\",\"max_turns\":5}'")
 def _research(ctx: Ctx) -> ProbeResult:
     ep = "/v1/research"
     r, ms = _timed(lambda: requests.post(
         f"{ctx.base_url}{ep}", headers=ctx.headers({"Content-Type": "application/json"}),
         json={"query": "smoke test", "depth": "quick", "max_turns": 5}, timeout=ctx.timeout))
     if r.status_code != 200:
-        return ProbeResult("research", ep, False, f"HTTP {r.status_code}: {r.text[:200]}", r.status_code, ms)
+        return capacity_result("research", ep, r, ms) or \
+            ProbeResult("research", ep, False, f"HTTP {r.status_code}: {r.text[:200]}", r.status_code, ms)
     d = r.json()
     if d.get("status") != "success":
         return ProbeResult("research", ep, False, f"status={d.get('status')!r} expected success", r.status_code, ms)
@@ -188,7 +268,7 @@ def _research(ctx: Ctx) -> ProbeResult:
 
 
 @probe("chat_completions", "/v1/chat/completions", {"hetzner", "server2"},
-       repro="curl -XPOST $AI_BRIDGE_URL/v1/chat/completions -H 'Authorization: Bearer $AI_BRIDGE_API_KEY' -H 'Content-Type: application/json' -d '{\"model\":\"claude-haiku-4-5-20251001\",\"max_tokens\":8,\"messages\":[{\"role\":\"user\",\"content\":\"say OK\"}]}'")
+       repro="curl -XPOST $AI_BRIDGE_URL/v1/chat/completions -H 'Authorization: Bearer $AI_BRIDGE_API_KEY' -H 'Content-Type: application/json' " + ATTRIBUTION_REPRO + "-d '{\"model\":\"claude-haiku-4-5-20251001\",\"max_tokens\":8,\"messages\":[{\"role\":\"user\",\"content\":\"say OK\"}]}'")
 def _chat(ctx: Ctx) -> ProbeResult:
     ep = "/v1/chat/completions"
     r, ms = _timed(lambda: requests.post(
@@ -197,7 +277,8 @@ def _chat(ctx: Ctx) -> ProbeResult:
               "messages": [{"role": "user", "content": "Reply with the single word OK."}]},
         timeout=ctx.timeout))
     if r.status_code != 200:
-        return ProbeResult("chat_completions", ep, False, f"HTTP {r.status_code}: {r.text[:200]}", r.status_code, ms)
+        return capacity_result("chat_completions", ep, r, ms) or \
+            ProbeResult("chat_completions", ep, False, f"HTTP {r.status_code}: {r.text[:200]}", r.status_code, ms)
     d = r.json()
     choices = d.get("choices") or []
     if not choices:
@@ -396,10 +477,39 @@ def run(base_url: str, profile: str, only: Optional[str], extra_header: dict, at
             if last.ok:
                 break
             if attempt < attempts:
-                time.sleep(5)
+                # Honor the envelope's own Retry-After for capacity refusals —
+                # a flat 5s is shorter than every retry_after_s the Bridge
+                # advertises, so the old policy burned all attempts inside a
+                # single cooldown window and never saw the recovery.
+                time.sleep(min(last.retry_after_s or 5, CAPACITY_BACKOFF_MAX_S)
+                           if last.capacity_reason else 5)
         last.repro = p.repro  # attach for fix-session
         results.append(last)
     return results
+
+
+def partition_results(results: list) -> tuple:
+    """Split into (passed, capacity_gaps, failures).
+
+    A capacity refusal is only excused as a gap when the pool path is PROVEN
+    healthy by another probe through the same gate (POOL_GATED_PROBES all share
+    nginx location ~ ^/v1/(chat/completions|research)). If no pool-gated probe
+    passed, nothing proves the deployed image can serve LLM traffic at all — a
+    fresh image that broke the adaptive limiter could plausibly starve the
+    router into all_unavail — so the refusals stay hard failures and the deploy
+    blocks. Excusing only what an independent green probe covers keeps the gate
+    honest in both directions.
+    """
+    passed = [r for r in results if r.ok]
+    refused = [r for r in results if not r.ok and r.capacity_reason]
+    failures = [r for r in results if not r.ok and not r.capacity_reason]
+
+    pool_proven_healthy = any(r.ok for r in results if r.name in POOL_GATED_PROBES)
+    if refused and not pool_proven_healthy:
+        for r in refused:
+            r.detail += " [no pool-gated probe passed — cannot rule out the deployed image]"
+        return passed, [], failures + refused
+    return passed, refused, failures
 
 
 def main():
@@ -422,9 +532,10 @@ def main():
         print(f"SMOKE_FAIL: no probes selected for profile={args.profile} only={args.only}", file=sys.stderr)
         sys.exit(2)
 
-    failures = [r for r in results if not r.ok]
+    passed, capacity_gaps, failures = partition_results(results)
+    gap_names = {r.name for r in capacity_gaps}
     for r in results:
-        mark = "OK  " if r.ok else "FAIL"
+        mark = "OK  " if r.ok else ("CAPA" if r.name in gap_names else "FAIL")
         ms = f"{r.elapsed_ms}ms" if r.elapsed_ms is not None else "-"
         print(f"  [{mark}] {r.name:22s} {r.endpoint:34s} ({ms}) {r.detail}")
 
@@ -455,6 +566,28 @@ def main():
             if r.repro:
                 print(f"  repro[{r.name}]: {r.repro}", file=sys.stderr)
         sys.exit(1)
+
+    if capacity_gaps:
+        # NOT a pass and NOT a rollback: the endpoints below were never
+        # exercised because no Anthropic account had headroom. Loud on stderr
+        # so it can never be mistaken for a clean run.
+        names = ", ".join(f"{r.name}({r.capacity_reason})" for r in capacity_gaps)
+        print(f"SMOKE_CAPACITY: {len(passed)}/{len(results)} probes passed, "
+              f"{len(capacity_gaps)} UNVERIFIED — pool capacity unavailable: {names} "
+              f"(profile={args.profile})", file=sys.stderr)
+        print(
+            "  ⚠️  These endpoints were refused by the account-capacity gate before reaching "
+            "the deployed code — the Bridge's own envelope says retryable. That is "
+            "infrastructure STATE (all Anthropic accounts at their session/weekly wall), not "
+            "a regression in this build, so it does NOT roll the deploy back. It also does "
+            "NOT prove these endpoints work. Re-run once the pool recovers: "
+            "python3 scripts/bridge_smoke.py --base-url <url> --profile <profile> --only <probe>. "
+            "Check the wall with: curl $AI_BRIDGE_URL/v1/metrics/account-pool-state "
+            "-H \"Authorization: Bearer $AI_BRIDGE_API_KEY\" "
+            "(capacity_lock_remaining_s / weekly_percent per account).",
+            file=sys.stderr,
+        )
+        sys.exit(0)
 
     print(f"SMOKE_OK: {len(results)}/{len(results)} probes passed (profile={args.profile})")
     sys.exit(0)
