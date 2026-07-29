@@ -93,6 +93,9 @@ services:
       # OA-Scholarly-Schicht: legale OA-Volltext-Injektion bei research_mode=academic
       # (OpenAlex/CORE, fail-soft). Prod-Aktivierung Rafael-Go 2026-07-25.
       - BRIDGE_SCHOLARLY_ENABLED=true
+      # CORE keyless works without this (lower rate-limit, fail-soft -> []). Empty default is
+      # safe/expected until the CORE_API_KEY registration (running in parallel) lands in Infisical.
+      - CORE_API_KEY=${CORE_API_KEY:-}
       # Bridge-owned per-(app,agent) tier routing/billing policy (master switch).
       # On here; actual per-route control is the app_tier_policies DB table
       # (enabled column / add-remove rows). Fail-open: no matching row or an
@@ -204,6 +207,9 @@ services:
       # OA-Scholarly-Schicht: legale OA-Volltext-Injektion bei research_mode=academic
       # (OpenAlex/CORE, fail-soft). Prod-Aktivierung Rafael-Go 2026-07-25.
       - BRIDGE_SCHOLARLY_ENABLED=true
+      # CORE keyless works without this (lower rate-limit, fail-soft -> []). Empty default is
+      # safe/expected until the CORE_API_KEY registration (running in parallel) lands in Infisical.
+      - CORE_API_KEY=${CORE_API_KEY:-}
       # Bridge-owned per-(app,agent) tier routing/billing policy (master switch).
       # On here; actual per-route control is the app_tier_policies DB table
       # (enabled column / add-remove rows). Fail-open: no matching row or an

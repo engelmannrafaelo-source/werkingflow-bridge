@@ -106,7 +106,7 @@ def _core(query: str, n: int) -> List[Dict[str, Any]]:
             if r.status_code == 429:
                 # Keyless-Rate-Limit: Schicht degradiert STILL auf OpenAlex-Abstracts —
                 # unter Last sichtbar machen (CORE_API_KEY hebt das Limit).
-                logger.warning("CORE rate-limited (429, keyless) — Volltext-Anteil degradiert auf Abstracts")
+                logger.warning("research-cloud: CORE rate-limited (429, keyless) — Volltext-Anteil degradiert auf Abstracts")
             return []
         out = []
         for w in r.json().get("results", []):
@@ -121,7 +121,10 @@ def _core(query: str, n: int) -> List[Dict[str, Any]]:
                 "source": "CORE",
             })
         return out
-    except (requests.RequestException, ValueError):
+    except (requests.RequestException, ValueError) as e:
+        # Timeout/Verbindungsfehler/Malformed-JSON: darf nicht lautlos verschwinden — sonst
+        # degradiert die Recherche-Qualität unbemerkt (fail loud, kein silent fail).
+        logger.warning(f"research-cloud: CORE request failed ({type(e).__name__}: {e}) — Volltext-Anteil degradiert auf Abstracts")
         return []
 
 
