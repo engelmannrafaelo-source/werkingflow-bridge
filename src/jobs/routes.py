@@ -84,6 +84,31 @@ async def create_job_endpoint(
     if attribution is None and _attribution_extractor is not None:
         attribution = _attribution_extractor(request)
 
+    # Placement veto (Autobahn): the job EXECUTES on THIS worker (spawn below),
+    # and the executor's chat self-call pins to localhost — the LLM work can
+    # only ever use THIS worker's account. If that account is capacity-locked
+    # (weekly/session window — Anthropic told us when to retry), accepting the
+    # job would create a row that can only die with account_exhausted after
+    # minutes of doomed in-process retries. Reject SYNCHRONOUSLY with the same
+    # 429 envelope the chat endpoint emits; nginx's /v1/jobs location retries
+    # the POST on the next worker (proxy_next_upstream http_429), so placement
+    # migrates to an account with capacity. Nothing is persisted before this
+    # check — the reject is retry-safe by construction. (Root-caused
+    # 2026-07-29: energy harmonize jobs landed round-robin on weekly-locked
+    # workers and died with UPSTREAM_HTTP_429 wrapped in job errors.)
+    from src.middleware.capacity_lock import get_capacity_lock
+    from src.middleware.bridge_error import account_exhausted_error
+
+    _worker_id = os.getenv("INSTANCE_NAME", "unknown")
+    _cap_lock = get_capacity_lock()
+    if _cap_lock.is_locked(_worker_id):
+        retry_after = max(60, _cap_lock.remaining_s(_worker_id))
+        logger.warning(
+            f"🔒 job submission rejected: worker {_worker_id} capacity-locked "
+            f"({retry_after}s remaining) — nginx retries on next worker"
+        )
+        return account_exhausted_error(retry_after_s=retry_after)
+
     job_id = "job_" + uuid.uuid4().hex
     # Persist FIRST (durable 'pending'), then dispatch. If this worker dies before
     # the task runs, the row survives at 'pending' and the watchdog requeues it
