@@ -295,7 +295,28 @@ end
 
 -- Live routing — called from access_by_lua_block in /v1/(chat/completions|research)
 -- Sets ngx.var.target_worker and ngx.var.x_pool_decision
-function M.choose()
+--
+-- choose() only SETS VARIABLES; it never emits a response. The caller decides
+-- what "unavailable" means for its location (nginx.conf does the ngx.exec into
+-- @pool_exhausted_response), so this stays a pure routing function.
+--
+-- opts.overflow_capable (boolean, default false):
+--   Declares that this endpoint has an execution path which does NOT consume
+--   subscription-pool capacity (/v1/research → research-cloud; /v1/jobs, whose
+--   per-kind placement veto lives in the app). For those a terminal reject is
+--   WRONG: nginx cannot tell which path a request will take — that needs the
+--   caller's provider pin from the database, or the job kind from the body —
+--   and the overflow's own trigger condition is pool saturation, so rejecting
+--   at the gate would make it unreachable in exactly the state it exists for.
+--   Such a request is routed anyway and marked via $pool_exhausted; the app
+--   applies the identical 429 if it turns out to be pool-bound. Admission is
+--   not skipped, it moves to the only layer that knows the execution path.
+--
+--   WHICH endpoints those are is routing policy and lives in nginx.conf
+--   ($pool_overflow_capable map) — this router stays topology- and
+--   endpoint-agnostic.
+function M.choose(opts)
+    local overflow_capable = (opts and opts.overflow_capable) or false
     local state_str      = shared:get("state")
     local state_ts       = tonumber(shared:get("ts")) or 0
     local age            = ngx.now() - state_ts
@@ -352,7 +373,35 @@ function M.choose()
     local picked, picked_worker, picked_weight, total_weight = pick_weighted_account(data.accounts, est_tokens)
 
     if not picked then
-        -- All accounts exhausted → bogus upstream → @bridge_full emits 429
+        if overflow_capable then
+            -- Marker FIRST: routing on without it would tell the app the pool
+            -- is healthy and send it into a call that cannot be served.
+            -- Assigning an nginx variable the location never declared raises in
+            -- Lua, so a missing `set $pool_exhausted "";` must degrade to the
+            -- safe answer (reject) — loudly, never silently.
+            local ok_marker = pcall(function() ngx.var.pool_exhausted = "1" end)
+            if not ok_marker then
+                ngx.log(ngx.ERR, "pool_router.choose: overflow_capable requested but ",
+                        "$pool_exhausted is not declared in this location — refusing to ",
+                        "route on unmarked; rejecting instead. Fix: add ",
+                        "`set $pool_exhausted \"\";` to the location block.")
+                ngx.var.target_worker   = "unavailable"
+                ngx.var.x_pool_decision = "all_unavail"
+                return
+            end
+            local pick = round_robin_worker()
+            count_decision(pick)
+            ngx.var.target_worker   = pick
+            ngx.var.x_pool_decision = "all_unavail_overflow"
+            ngx.log(ngx.WARN, "pool_router.choose: all_unavail_overflow",
+                    " — no eligible account; routing to ", pick,
+                    " with X-Pool-Exhausted:1 so the app can choose pool vs. overflow",
+                    " est_tokens=", est_tokens,
+                    " state_age_s=", string.format("%.1f", age),
+                    " refresh_status=", refresh_status)
+            return
+        end
+        -- All accounts exhausted → caller turns this into @pool_exhausted_response
         ngx.var.target_worker   = "unavailable"
         ngx.var.x_pool_decision = "all_unavail"
         ngx.log(ngx.WARN, "pool_router.choose: all_unavail",

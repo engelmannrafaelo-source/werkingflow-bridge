@@ -9,11 +9,12 @@ its overflow trigger IS pool saturation (src/research_cloud/routing.py). So the
 escape hatch was unreachable in exactly the state it exists for, and
 cloud-PINNED users were blocked outright.
 
-(nginx was NOT a third gate, contrary to the first diagnosis: verified against
-the real nginx.conf that `if ($target_worker = "unavailable")` runs in the
-rewrite phase, before access_by_lua_block sets the variable, so it never fires
-and every request reaches a worker. The app has always been the rejecting
-layer.)
+nginx is a third gate — but only since the rewrite-phase `if ($target_worker =
+"unavailable")` was replaced by an access-phase ngx.exec (it could never fire
+before, so every request reached a worker even on a fully exhausted pool).
+Making that gate real is precisely why /v1/research must be carved out of it
+($pool_overflow_capable) and handed X-Pool-Exhausted instead: a working gate
+would otherwise re-break the overflow it just unblocked.
 
 These tests pin the invariant from both sides: the pool branch still gets every
 gate, and the cloud branch gets none of them.
@@ -60,23 +61,78 @@ def _body(response) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# The nginx marker
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize("value,expected", [
+    ("1", True),
+    (" 1 ", True),
+    ("", False),
+    ("0", False),
+    ("true", False),   # strictly "1" — nginx writes exactly that or nothing
+])
+def test_pool_exhausted_marker_parsing(value, expected):
+    assert src.main._pool_exhausted_marker(_request({"X-Pool-Exhausted": value})) is expected
+
+
+def test_pool_exhausted_marker_absent_header_is_false():
+    assert src.main._pool_exhausted_marker(_request({})) is False
+
+
+def test_pool_exhausted_marker_no_request_is_false():
+    """Internal self-calls (durable research job) bypass nginx entirely — no
+    marker means no claim either way, the worker-local signals still apply."""
+    assert src.main._pool_exhausted_marker(None) is False
+
+
+# ---------------------------------------------------------------------------
 # The pool-capacity signal — ONE definition, shared with the overflow trigger
 # ---------------------------------------------------------------------------
 def test_pool_availability_uses_the_same_signal_as_the_overflow_trigger():
-    """_pool_can_serve_research must be the inverse of is_worker_pool_saturated:
-    if the two ever disagreed, research could pick the cloud path (pool
-    saturated) while still arming the pool fallback (pool 'available')."""
+    """_pool_can_serve_research must agree with is_worker_pool_saturated: if the
+    two ever disagreed, research could pick the cloud path (pool saturated)
+    while still arming the pool fallback (pool 'available')."""
     with patch("src.research_cloud.pool_signal.is_worker_pool_saturated", return_value=True):
-        assert src.main._pool_can_serve_research() is False
+        assert src.main._pool_can_serve_research(_request({})) is False
     with patch("src.research_cloud.pool_signal.is_worker_pool_saturated", return_value=False):
-        assert src.main._pool_can_serve_research() is True
+        assert src.main._pool_can_serve_research(_request({})) is True
+
+
+def test_pool_availability_honours_the_nginx_marker_without_probing():
+    """The marker is authoritative for the WHOLE pool; this worker's own
+    saturation cannot override it."""
+    with patch("src.research_cloud.pool_signal.is_worker_pool_saturated",
+               return_value=False) as probe:
+        assert src.main._pool_can_serve_research(_request({"X-Pool-Exhausted": "1"})) is False
+        probe.assert_not_called()
 
 
 def test_pool_availability_probe_failure_assumes_usable():
     """Unknown capacity must not silently disable the reliability fallback."""
     with patch("src.research_cloud.pool_signal.is_worker_pool_saturated",
                side_effect=RuntimeError("boom")):
-        assert src.main._pool_can_serve_research() is True
+        assert src.main._pool_can_serve_research(_request({})) is True
+
+
+# ---------------------------------------------------------------------------
+# _admit_research_to_pool — the marker is the cheapest gate and short-circuits
+# ---------------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_pool_bound_request_rejected_when_nginx_marks_pool_exhausted():
+    tracker = MagicMock()
+    enforce = AsyncMock()
+    with patch("src.claude_cli.rate_limit_tracker", tracker), \
+         patch.object(src.main, "enforce_pool_admission", enforce):
+        out = await src.main._admit_research_to_pool(
+            _request({"X-Pool-Exhausted": "1"}), "worker1"
+        )
+
+    assert out is not None and out.status_code == 429
+    err = _body(out)["error"]
+    assert err["bridge_type"] == "account_exhausted"
+    assert err["retryable"] is True
+    # Fail FAST: the cheapest gate short-circuits the expensive ones.
+    tracker.should_reject_new_request.assert_not_called()
+    enforce.assert_not_awaited()
 
 
 # ---------------------------------------------------------------------------

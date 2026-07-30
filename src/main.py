@@ -4289,21 +4289,39 @@ async def _execute_research_cloud_impl(
     )
 
 
-def _pool_can_serve_research() -> bool:
-    """False iff THIS worker's subscription-pool capacity is exhausted.
+# nginx's pool_router sets this to "1" when it found no eligible account but
+# routed the request anyway, because the endpoint has a non-pool execution path
+# (docker/nginx.conf $pool_overflow_capable map). nginx ALWAYS writes the header
+# — an empty value makes it drop the header — and strips any inbound copy
+# (more_clear_input_headers), so a client cannot forge it. Absent means the pool
+# had capacity when the request was routed.
+POOL_EXHAUSTED_HEADER = "X-Pool-Exhausted"
 
-    Reuses the signal the research-cloud overflow already triggers on
-    (src/research_cloud/pool_signal.py) rather than inventing a second notion of
-    "pool full" — the two must never disagree, and one function is the only way
-    to guarantee that.
 
-    Deliberately NOT derived from nginx: verified 2026-07-30 against the real
-    nginx.conf + pool_router.lua that nginx does not, in fact, terminally reject
-    an exhausted pool. `if ($target_worker = "unavailable")` is evaluated in the
-    rewrite phase, before access_by_lua_block assigns the variable, so it never
-    fires and every request still reaches a worker. The app has always been the
-    layer that actually rejects — which is exactly where this belongs anyway.
+def _pool_exhausted_marker(request: Optional[Request]) -> bool:
+    """True iff nginx signalled that no account had headroom for this request."""
+    if request is None:
+        # Internal self-call (the durable research job executor posts to
+        # localhost, bypassing nginx). No marker means no claim either way; the
+        # worker-local signals below still apply.
+        return False
+    return (request.headers.get(POOL_EXHAUSTED_HEADER) or "").strip() == "1"
+
+
+def _pool_can_serve_research(request: Optional[Request]) -> bool:
+    """False iff the subscription pool cannot serve this request.
+
+    ONE definition, combining the two signals that exist:
+      - nginx's marker      — the whole pool had no eligible account
+      - is_worker_pool_saturated — THIS worker's own capacity is spent
+
+    Deliberately the same function the overflow trigger reads
+    (src/research_cloud/pool_signal.py) rather than a second notion of "pool
+    full": if the two ever disagreed, research could take the cloud path
+    (saturated) while still arming the pool fallback ("available").
     """
+    if _pool_exhausted_marker(request):
+        return False
     try:
         from src.research_cloud.pool_signal import is_worker_pool_saturated
         return not is_worker_pool_saturated()
@@ -4325,11 +4343,22 @@ async def _admit_research_to_pool(
     MUST NOT be called on the research-cloud branch. That path runs on the
     Anthropic 1P API and consumes zero pool capacity, while its own overflow
     trigger IS pool saturation — gating it here is precisely the inversion this
-    ordering exists to prevent. The two gates, in ascending cost:
+    ordering exists to prevent. The three gates, in ascending cost:
 
-      1. worker tracker  — THIS worker's account is rate-limited
-      2. adaptive budget — this worker's token cap (may queue)
+      1. nginx marker    — the whole pool had no eligible account
+      2. worker tracker  — THIS worker's account is rate-limited
+      3. adaptive budget — this worker's token cap (may queue)
     """
+    if _pool_exhausted_marker(request):
+        # nginx routed us here ONLY so the pool-vs-cloud decision could be made;
+        # no account had headroom. Fail fast with the capacity envelope instead
+        # of starting a run that cannot be served.
+        logger.info(
+            f"⏳ Pool exhausted (nginx marker) and this research is pool-bound "
+            f"— rejecting on worker {worker_id}"
+        )
+        return account_exhausted_error(retry_after_s=60)
+
     from src.claude_cli import rate_limit_tracker as _research_rlt
     if _research_rlt.should_reject_new_request(worker_id):
         retry_after = _research_rlt.get_retry_after(worker_id)
@@ -4579,11 +4608,11 @@ async def research(
     # Attribution enforcement
     enforce_attribution(request)
 
-    # NOTE: the pool capacity gates (worker rate-limit tracker, adaptive token
-    # budget) deliberately do NOT run here. They govern the subscription pool
-    # only, and the pool-vs-cloud decision is not made until the provider pin
-    # has been resolved below. See the "POOL ADMISSION" block after the routing
-    # decision.
+    # NOTE: the pool capacity gates (nginx X-Pool-Exhausted marker, worker
+    # rate-limit tracker, adaptive token budget) do NOT run here. They govern
+    # the subscription pool only, and the pool-vs-cloud decision is not made
+    # until the provider pin has been resolved below. See the "POOL ADMISSION"
+    # block after the routing decision.
 
     worker_id = os.getenv("INSTANCE_NAME", "unknown")
     start_time = time.time()
@@ -4701,11 +4730,11 @@ async def research(
     # consumes zero pool capacity, while its overflow trigger IS pool
     # saturation (src/research_cloud/routing.py). Gating it on pool capacity
     # made the overflow unreachable in exactly the state it was built for, and
-    # blocked cloud-PINNED users outright. Two gates sat in front of the
-    # decision — adaptive_limit_dependency and the worker rate-limit pre-check.
-    # Both now sit behind it.
+    # blocked cloud-PINNED users outright. The gates now sit behind the
+    # block after the routing decision.— adaptive_limit_dependency and the worker rate-limit pre-check.
     #
-    # The pool branch is not weakened: it still passes both, just later.
+    #
+    # The pool branch is not weakened: it still passes every gate, just later.
     if not _use_research_cloud:
         _pool_reject = await _admit_research_to_pool(request, worker_id)
         if _pool_reject is not None:
@@ -4792,7 +4821,7 @@ async def research(
         asyncio.create_task(_run_async_research_job(
             request_body, backend_config, job_id, attribution_ctx=_research_attr,
             request=request, use_research_cloud=_use_research_cloud,
-            pool_available=_pool_can_serve_research(),
+            pool_available=_pool_can_serve_research(request),
         ))
         logger.info(f"📨 Async research job {job_id} dispatched (query: {request_body.query[:60]!r})")
         return ResearchResponse(
@@ -4806,7 +4835,7 @@ async def research(
     if _use_research_cloud:
         return await _execute_research_cloud_with_pool_fallback(
             request, request_body, attribution_ctx=_research_attr,
-            pool_available=_pool_can_serve_research(),
+            pool_available=_pool_can_serve_research(request),
         )
     return await _execute_research_impl(request_body, backend_config, attribution_ctx=_research_attr)
 
