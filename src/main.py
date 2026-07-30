@@ -2064,7 +2064,30 @@ async def chat_completions(
             f"See /v1/auth/status."
         )
         raise BridgeError(config_error(detail=detail))
-    
+
+    # Initialised BEFORE the try: both `except` handlers below read it (the
+    # WorkerUnavailableError and the generic Exception path), but it used to be
+    # assigned ~185 lines INTO the try — so anything raising before that point
+    # (e.g. the pricing gate's clean HTTPException(400 model_not_priced)) made
+    # the handler itself die with
+    #     UnboundLocalError: cannot access local variable 'user_pinned_provider'
+    # which surfaced as an opaque 500 and DESTROYED the original error. Observed
+    # live 2026-07-30 on worker4, crashing an async chat job. An error handler
+    # that cannot run is worse than no handler: it converts a precise 4xx into a
+    # misleading 5xx and sends the reader after the wrong bug.
+    #
+    # `tenant` has the same shape: the handlers read it, but it is assigned
+    # inside the try (unconditionally, but ~130 lines in), so an earlier raise
+    # crashes on it instead. Same one-line cure.
+    #
+    # NOT hoisted here: `prompt`, which the handlers also read. Its first
+    # assignment inside the try was not unambiguous enough to hoist blind, and
+    # there is no test harness for this handler — a speculative edit to a
+    # 1500-line request path can introduce a worse bug than it prevents. Left
+    # documented instead of guessed at.
+    user_pinned_provider = None
+    tenant = None
+
     try:
         request_id = f"chatcmpl-{os.urandom(8).hex()}"
 
