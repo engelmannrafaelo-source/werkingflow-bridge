@@ -4745,6 +4745,20 @@ async def research(
             logger.error(f"research-cloud routing decision failed — falling back to pool: {_rc_err}")
             _use_research_cloud = False
 
+    # Observability for the pool-vs-cloud decision. Added 2026-07-30 because the
+    # decision was UNOBSERVABLE: resolve_research_cloud_routing() returns True
+    # for a cloud-pinned user when called directly inside the worker, yet real
+    # requests from that same user ran on the pool with no log line anywhere to
+    # say why. Every silent `return False` in routing.py is invisible without
+    # this. One INFO per research call (a ~40s operation) is not noise.
+    # No identity value logged — only whether one arrived.
+    logger.info(
+        f"research routing: global_pin={_research_pinned!r} "
+        f"cloud_overflow={bool(request_body.cloud_overflow)} "
+        f"identity_present={bool(request.headers.get('X-User-ID'))} "
+        f"-> use_research_cloud={_use_research_cloud}"
+    )
+
     # ---- POOL ADMISSION ----------------------------------------------------
     # Every subscription-pool capacity gate lives HERE, after the execution
     # path is resolved, and applies ONLY to the pool-bound branch.
@@ -4855,6 +4869,10 @@ async def research(
         )
 
     # Sync path: execute and return the full result
+    logger.info(
+        f"research dispatch: path={'cloud' if _use_research_cloud else 'pool'} "
+        f"async={bool(getattr(request_body, 'async_mode', False))}"
+    )
     if _use_research_cloud:
         return await _execute_research_cloud_with_pool_fallback(
             request, request_body, attribution_ctx=_research_attr,
