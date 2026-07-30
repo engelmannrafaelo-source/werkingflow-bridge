@@ -761,7 +761,12 @@ if refused or (0 <= eligible < 2):
         f"{'; '.join(facts)}. With no spare account, refusing calls or "
         f"concentrating them on the only account with headroom is the CORRECT "
         f"behaviour, not a router defect. Re-run once >=2 accounts have headroom.",
-        file=sys.stderr,
+        # STDOUT, not stderr: the caller captures only stdout into $dist_out
+        # (the `) 2>&1` sits outside the command substitution), and it decides
+        # pass/skip/fail by grepping that variable. Emitting the marker on
+        # stderr meant the skip was printed into the deploy log but invisible to
+        # the check — so the test still reported FAILED on both of today's
+        # rollouts. The marker has to live on the stream the caller reads.
     )
     sys.exit(0)
 
