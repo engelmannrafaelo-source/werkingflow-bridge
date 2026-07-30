@@ -143,10 +143,13 @@ from src.api_auth import require_service_token, AuthClaims
 # Adaptive token-budget limiter (replaces static MAX_CONCURRENT_REQUESTS gating)
 from src.middleware.adaptive_limiter import (
     adaptive_limit_dependency,
+    cache_request_body_dependency,
+    enforce_pool_admission,
     get_adaptive_limiter,
     estimate_request_tokens,
 )
 from src.middleware.bridge_error import (
+    account_exhausted_error,
     BridgeError,
     bridge_error,
     classify_exception,
@@ -4286,10 +4289,81 @@ async def _execute_research_cloud_impl(
     )
 
 
+def _pool_can_serve_research() -> bool:
+    """False iff THIS worker's subscription-pool capacity is exhausted.
+
+    Reuses the signal the research-cloud overflow already triggers on
+    (src/research_cloud/pool_signal.py) rather than inventing a second notion of
+    "pool full" — the two must never disagree, and one function is the only way
+    to guarantee that.
+
+    Deliberately NOT derived from nginx: verified 2026-07-30 against the real
+    nginx.conf + pool_router.lua that nginx does not, in fact, terminally reject
+    an exhausted pool. `if ($target_worker = "unavailable")` is evaluated in the
+    rewrite phase, before access_by_lua_block assigns the variable, so it never
+    fires and every request still reaches a worker. The app has always been the
+    layer that actually rejects — which is exactly where this belongs anyway.
+    """
+    try:
+        from src.research_cloud.pool_signal import is_worker_pool_saturated
+        return not is_worker_pool_saturated()
+    except Exception as exc:
+        # Unknown capacity must not silently disable the reliability fallback;
+        # assume the pool is usable and let the real gates speak.
+        logger.warning(f"pool saturation probe failed, assuming pool usable: {exc}")
+        return True
+
+
+async def _admit_research_to_pool(
+    request: Request, worker_id: str
+) -> Optional[JSONResponse]:
+    """Apply every subscription-pool capacity gate to a POOL-BOUND research call.
+
+    Returns the 429 response to send back, or None when the request is admitted.
+    Raises BridgeError on adaptive-queue timeout, exactly like the chat path.
+
+    MUST NOT be called on the research-cloud branch. That path runs on the
+    Anthropic 1P API and consumes zero pool capacity, while its own overflow
+    trigger IS pool saturation — gating it here is precisely the inversion this
+    ordering exists to prevent. The two gates, in ascending cost:
+
+      1. worker tracker  — THIS worker's account is rate-limited
+      2. adaptive budget — this worker's token cap (may queue)
+    """
+    from src.claude_cli import rate_limit_tracker as _research_rlt
+    if _research_rlt.should_reject_new_request(worker_id):
+        retry_after = _research_rlt.get_retry_after(worker_id)
+        limit_type = "HARD" if _research_rlt.is_hard_limited(worker_id) else "soft"
+        logger.info(f"⏳ Worker {worker_id} has {limit_type} penalty — rejecting research (NGINX failover)")
+        # 429 = correct semantics; nginx http_429 in proxy_next_upstream triggers
+        # failover to the next worker. Same rationale as chat/completions path.
+        return JSONResponse(
+            status_code=429,
+            content={"error": {
+                "message": f"[Bridge {worker_id}] Worker rate-limited ({limit_type})",
+                "type": "api_error",
+                "code": "429",
+                "source": "bridge_account",
+                "bridge_type": "worker_unavailable",
+                "reason": "worker_account_rate_limited",
+                "bridge_worker": worker_id,
+                "retryable": True,
+                "retry_after_s": retry_after,
+            }},
+            headers={"Retry-After": str(retry_after or 30)}
+        )
+
+    # The adaptive token budget — the half of adaptive_limit_dependency that
+    # cache_request_body_dependency deliberately left out.
+    await enforce_pool_admission(request)
+    return None
+
+
 async def _execute_research_cloud_with_pool_fallback(
     request: Optional[Request],
     request_body: ResearchRequest,
     attribution_ctx: Optional[Dict[str, Any]] = None,
+    pool_available: bool = True,
 ) -> ResearchResponse:
     """Cloud first, subscription pool second — a production user never sees a
     cloud-path failure (Rafael 2026-07-27: "automatisch im Hintergrund gelöst").
@@ -4299,11 +4373,23 @@ async def _execute_research_cloud_with_pool_fallback(
     for Bedrock-pinned users that would be a web-search-less research. The
     fallback is logged at ERROR so monitoring surfaces every occurrence —
     automatic recovery is not the same as invisible recovery.
+
+    `pool_available=False` means the caller already established that the pool
+    cannot serve this request (see _pool_can_serve_research). Attempting
+    the fallback then would burn minutes on a call that can only end in
+    account_exhausted and would bury the real cloud error behind a second,
+    misleading one — so the cloud failure is surfaced as-is. Fail loud, once.
     """
     result = await _execute_research_cloud_impl(
         request, request_body, attribution_ctx=attribution_ctx
     )
     if result.status != "error":
+        return result
+    if not pool_available:
+        logger.error(
+            f"research-cloud run failed and the subscription pool is exhausted — "
+            f"no fallback available, surfacing the cloud error: {result.error}"
+        )
         return result
     logger.error(
         f"research-cloud run failed — retrying on the subscription pool "
@@ -4321,6 +4407,7 @@ async def _run_async_research_job(
     attribution_ctx: Optional[Dict[str, Any]] = None,
     request: Optional[Request] = None,
     use_research_cloud: bool = False,
+    pool_available: bool = True,
 ) -> None:
     """Background runner that stores ResearchResponse as a JSON file in the
     shared async-jobs directory. Any worker can read it back.
@@ -4346,7 +4433,10 @@ async def _run_async_research_job(
     heartbeat_task = asyncio.create_task(_heartbeat())
     try:
         if use_research_cloud:
-            result = await _execute_research_cloud_with_pool_fallback(request, request_body, attribution_ctx=attribution_ctx)
+            result = await _execute_research_cloud_with_pool_fallback(
+                request, request_body, attribution_ctx=attribution_ctx,
+                pool_available=pool_available,
+            )
         else:
             result = await _execute_research_impl(request_body, backend_config, attribution_ctx=attribution_ctx)
         _save_research_job(job_id, {
@@ -4453,7 +4543,11 @@ async def research(
     request_body: ResearchRequest,
     request: Request,
     credentials: Optional[HTTPAuthorizationCredentials] = Depends(security),
-    _adaptive=Depends(adaptive_limit_dependency)
+    # Body-caching ONLY — pool admission happens further down, on the
+    # pool-bound branch, once the execution path is resolved. Using the
+    # combined adaptive_limit_dependency here would reject cloud-bound
+    # research for pool capacity it never consumes. See POOL ADMISSION below.
+    _adaptive=Depends(cache_request_body_dependency)
 ):
     """
     Dedicated research endpoint for Claude Code research tasks.
@@ -4485,31 +4579,13 @@ async def research(
     # Attribution enforcement
     enforce_attribution(request)
 
-    # Rate limit pre-check: soft routing (same logic as chat endpoint)
-    worker_id = os.getenv("INSTANCE_NAME", "unknown")
-    from src.claude_cli import rate_limit_tracker as _research_rlt
-    if _research_rlt.should_reject_new_request(worker_id):
-        retry_after = _research_rlt.get_retry_after(worker_id)
-        limit_type = "HARD" if _research_rlt.is_hard_limited(worker_id) else "soft"
-        logger.info(f"⏳ Worker {worker_id} has {limit_type} penalty — rejecting research (NGINX failover)")
-        # 429 = correct semantics; nginx http_429 in proxy_next_upstream triggers
-        # failover to the next worker. Same rationale as chat/completions path.
-        return JSONResponse(
-            status_code=429,
-            content={"error": {
-                "message": f"[Bridge {worker_id}] Worker rate-limited ({limit_type})",
-                "type": "api_error",
-                "code": "429",
-                "source": "bridge_account",
-                "bridge_type": "worker_unavailable",
-                "reason": "worker_account_rate_limited",
-                "bridge_worker": worker_id,
-                "retryable": True,
-                "retry_after_s": retry_after,
-            }},
-            headers={"Retry-After": str(retry_after or 30)}
-        )
+    # NOTE: the pool capacity gates (worker rate-limit tracker, adaptive token
+    # budget) deliberately do NOT run here. They govern the subscription pool
+    # only, and the pool-vs-cloud decision is not made until the provider pin
+    # has been resolved below. See the "POOL ADMISSION" block after the routing
+    # decision.
 
+    worker_id = os.getenv("INSTANCE_NAME", "unknown")
     start_time = time.time()
     session_id = None
     container_file = None
@@ -4617,6 +4693,24 @@ async def research(
             logger.error(f"research-cloud routing decision failed — falling back to pool: {_rc_err}")
             _use_research_cloud = False
 
+    # ---- POOL ADMISSION ----------------------------------------------------
+    # Every subscription-pool capacity gate lives HERE, after the execution
+    # path is resolved, and applies ONLY to the pool-bound branch.
+    #
+    # Why not earlier: the research-cloud path runs on the Anthropic 1P API and
+    # consumes zero pool capacity, while its overflow trigger IS pool
+    # saturation (src/research_cloud/routing.py). Gating it on pool capacity
+    # made the overflow unreachable in exactly the state it was built for, and
+    # blocked cloud-PINNED users outright. Two gates sat in front of the
+    # decision — adaptive_limit_dependency and the worker rate-limit pre-check.
+    # Both now sit behind it.
+    #
+    # The pool branch is not weakened: it still passes both, just later.
+    if not _use_research_cloud:
+        _pool_reject = await _admit_research_to_pool(request, worker_id)
+        if _pool_reject is not None:
+            return _pool_reject
+
     # BACKEND ROUTING: Resolve backend configuration for research (skipped
     # entirely on the research-cloud path — Bedrock gates don't apply there).
     backend_config = None
@@ -4698,6 +4792,7 @@ async def research(
         asyncio.create_task(_run_async_research_job(
             request_body, backend_config, job_id, attribution_ctx=_research_attr,
             request=request, use_research_cloud=_use_research_cloud,
+            pool_available=_pool_can_serve_research(),
         ))
         logger.info(f"📨 Async research job {job_id} dispatched (query: {request_body.query[:60]!r})")
         return ResearchResponse(
@@ -4709,7 +4804,10 @@ async def research(
 
     # Sync path: execute and return the full result
     if _use_research_cloud:
-        return await _execute_research_cloud_with_pool_fallback(request, request_body, attribution_ctx=_research_attr)
+        return await _execute_research_cloud_with_pool_fallback(
+            request, request_body, attribution_ctx=_research_attr,
+            pool_available=_pool_can_serve_research(),
+        )
     return await _execute_research_impl(request_body, backend_config, attribution_ctx=_research_attr)
 
 

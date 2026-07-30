@@ -63,6 +63,52 @@ class JobCreateRequest(BaseModel):
     attribution: Optional[Dict[str, Any]] = None
 
 
+async def _job_runs_off_pool(
+    body: "JobCreateRequest", attribution: Optional[Dict[str, Any]]
+) -> bool:
+    """True iff this job's LLM work provably runs OFF the subscription pool.
+
+    Only the app can answer this: it needs the job kind (request body) and, for
+    research, the caller's provider pin (database) — neither is visible to
+    nginx. A research job self-POSTs /v1/research (executors.research_executor)
+    and inherits that endpoint's pool-vs-cloud routing, so a capacity-locked
+    worker CAN still serve it. Vetoing it here would rebuild, one layer down,
+    exactly the gate that made the research-cloud overflow unreachable in the
+    state it exists for.
+
+    Conservative by construction: anything not provably off-pool returns False
+    and keeps the capacity veto. That deliberately includes globally
+    Bedrock-pinned users (whose research also takes the cloud path via an
+    implicit pin) — resolving that needs the full provider-override chain from
+    the research handler, and duplicating it here would be a drift risk for a
+    strictly smaller win than the correctness it buys. Status quo for them, no
+    regression.
+
+    Inert while RESEARCH_CLOUD_ENABLED is off: resolve_research_cloud_routing
+    short-circuits to False, so the veto behaves exactly as before.
+    """
+    if body.kind != "research":
+        return False
+    try:
+        from src.research_cloud.routing import resolve_research_cloud_routing
+
+        # Same inputs the executor's self-call will carry (it forwards
+        # attribution.user_id as X-User-ID), so this decision and the one the
+        # research handler makes inside the job agree by construction.
+        user_id = (attribution or {}).get("user_id")
+        payload = body.payload or {}
+        return await resolve_research_cloud_routing(
+            user_id, bool(payload.get("cloud_overflow"))
+        )
+    except Exception as exc:
+        # A failed probe must never widen admission — keep the veto, say why.
+        logger.warning(
+            f"job placement: research-cloud routing probe failed, keeping the "
+            f"capacity veto: {exc}"
+        )
+        return False
+
+
 @router.post("/v1/jobs")
 async def create_job_endpoint(
     body: JobCreateRequest,
@@ -101,7 +147,7 @@ async def create_job_endpoint(
 
     _worker_id = os.getenv("INSTANCE_NAME", "unknown")
     _cap_lock = get_capacity_lock()
-    if _cap_lock.is_locked(_worker_id):
+    if _cap_lock.is_locked(_worker_id) and not await _job_runs_off_pool(body, attribution):
         retry_after = max(60, _cap_lock.remaining_s(_worker_id))
         logger.warning(
             f"🔒 job submission rejected: worker {_worker_id} capacity-locked "

@@ -815,21 +815,22 @@ def estimate_request_tokens(body_dict: Dict[str, Any]) -> int:
     return max(1, chars // 4)
 
 
-async def adaptive_limit_dependency(request: Request) -> None:
+async def cache_request_body_dependency(request: Request) -> None:
     """
-    FastAPI dependency for chat-completions endpoints. Reads the request body
-    once, stashes it on the request for the handler to reuse, then enforces
-    the adaptive token budget — queueing if necessary so the caller sees
-    latency, not an error.
+    FastAPI dependency: read+cache the body and estimate its token cost.
+    Performs NO capacity admission.
 
-    Raises BridgeError (handled globally → structured envelope) only when the
-    queue itself times out.
+    For endpoints whose execution path is not yet known at dependency time —
+    /v1/research resolves subscription-pool vs. research-cloud only after an
+    async provider-pin lookup. Pool admission governs the pool alone, so it
+    cannot run here without gating cloud-bound calls on capacity they never
+    consume. Such endpoints call enforce_pool_admission() explicitly once the
+    path IS known; skipping BOTH is a capacity leak, so an endpoint using this
+    dependency MUST call it on its pool-bound branch.
 
     NOTE: `request` MUST have the `Request` type annotation; otherwise FastAPI
     treats it as a required query parameter and rejects every request with 422.
     """
-
-    # Read+cache the JSON body so the handler can reuse it without re-reading.
     body_dict: Dict[str, Any] = {}
     try:
         body_bytes = await request.body()
@@ -839,11 +840,33 @@ async def adaptive_limit_dependency(request: Request) -> None:
         request.state.cached_body_bytes = body_bytes
         request.state.cached_body_dict = body_dict
     except Exception as e:
-        logger.debug(f"adaptive_limit: body read failed (will pass through): {e}")
+        # Leaves adaptive_est_tokens unset — enforce_pool_admission() detects
+        # that and says so rather than silently admitting an unmeasured request.
+        logger.warning(f"adaptive_limit: body read failed (will pass through): {e}")
         return
 
-    est = estimate_request_tokens(body_dict)
-    request.state.adaptive_est_tokens = est
+    request.state.adaptive_est_tokens = estimate_request_tokens(body_dict)
+
+
+async def enforce_pool_admission(request: Request) -> None:
+    """
+    Enforce the adaptive token budget for a POOL-BOUND request — queueing if
+    necessary so the caller sees latency, not an error.
+
+    Raises BridgeError (handled globally → structured envelope) only when the
+    queue itself times out. Requires cache_request_body_dependency() to have
+    run first.
+    """
+    est = getattr(request.state, "adaptive_est_tokens", None)
+    if est is None:
+        # No estimate → nothing to enforce against. Pre-existing pass-through
+        # behaviour for an unreadable body, but logged: an unmeasured request
+        # skipping admission is worth seeing, not worth hiding.
+        logger.warning(
+            "adaptive_limit: no token estimate on request.state — admission "
+            "skipped (body unreadable, or cache_request_body_dependency did not run)"
+        )
+        return
 
     limiter = get_adaptive_limiter()
     accepted, reason, snap, waited_s = await limiter.acquire_with_wait(est)
@@ -880,3 +903,15 @@ async def adaptive_limit_dependency(request: Request) -> None:
         raise BridgeError(queue_timeout_error(cap, inflight, waited_s))
     # If we never actually waited (queue disabled), report as plain throttle.
     raise BridgeError(throttle_error(cap, inflight))
+
+
+async def adaptive_limit_dependency(request: Request) -> None:
+    """
+    FastAPI dependency for endpoints that ALWAYS consume the subscription pool
+    (chat-completions and friends): cache the body, then admit against the
+    adaptive budget. Endpoints with a non-pool execution path must instead use
+    cache_request_body_dependency() + an explicit enforce_pool_admission() on
+    their pool-bound branch — see /v1/research.
+    """
+    await cache_request_body_dependency(request)
+    await enforce_pool_admission(request)

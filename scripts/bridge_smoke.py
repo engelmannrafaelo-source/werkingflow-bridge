@@ -104,7 +104,15 @@ class ProbeResult:
 # pass and never as a deploy-blocking failure — but only under the guard in
 # partition_results(), which demands independent proof that the pool path is
 # actually working before it excuses anything.
-CAPACITY_BRIDGE_TYPES = {"pool_exhausted", "worker_unavailable"}
+# pool_exhausted    — nginx pool_router found no eligible account
+# worker_unavailable — a worker's own account is rate-limited
+# account_exhausted  — all accounts at their weekly Anthropic limit. Emitted by
+#                      the APP (adaptive limiter, /v1/jobs placement veto, and
+#                      the /v1/research pool-admission branch), which is where
+#                      admission moved once endpoints with a non-pool execution
+#                      path stopped being gated at nginx. Same class: written by
+#                      a capacity guard, never by an endpoint handler's logic.
+CAPACITY_BRIDGE_TYPES = {"pool_exhausted", "worker_unavailable", "account_exhausted"}
 CAPACITY_SOURCES = {"bridge_nginx", "bridge_account"}
 CAPACITY_BACKOFF_MAX_S = 30  # cap the honored Retry-After so a deploy cannot stall
 
