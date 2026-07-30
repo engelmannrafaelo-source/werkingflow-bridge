@@ -566,17 +566,28 @@ async def register(body: RegisterRequest) -> Dict[str, Any]:
                 # trial_ends_at controls the forced-trial-period expiry —
                 # list_subscriptions lazy-expires past-due rows. 7 days
                 # matches the registration stage in required-fields.yaml.
-                await conn.execute(
-                    """
-                    INSERT INTO subscriptions
-                        (user_id, app_id, plan_id, status, mollie_customer_id, seats, started_at, trial_ends_at)
-                    VALUES
-                        ($1, $2::app_id, 'trial'::plan_id, 'active'::subscription_status, NULL, 1, $3::timestamptz, $3::timestamptz + INTERVAL '7 days')
-                    """,
-                    user_id,
-                    body.appId,
-                    now,
-                )
+                #
+                # AUSNAHME checkId (Rafael, Produktentscheidung 2026-07-30):
+                # WerkING Check ist nach außen ein EIGENES Produkt — ein
+                # Check-Käufer ist Check-Kunde, kein Report-Trial-Nutzer.
+                # Check-Registrierungen (checkId gesetzt) bekommen daher
+                # KEINE Trial-Subscription: ohne Subscription keine
+                # Entitlements, die App hält den Account sauber auf der
+                # Check-Fläche (Downloads/Credits/Rechnungen). Das entwertet
+                # zugleich die öffentliche Register-Route als Trial-Quelle
+                # am Warteliste-Gate vorbei für diesen Pfad.
+                if body.checkId is None:
+                    await conn.execute(
+                        """
+                        INSERT INTO subscriptions
+                            (user_id, app_id, plan_id, status, mollie_customer_id, seats, started_at, trial_ends_at)
+                        VALUES
+                            ($1, $2::app_id, 'trial'::plan_id, 'active'::subscription_status, NULL, 1, $3::timestamptz, $3::timestamptz + INTERVAL '7 days')
+                        """,
+                        user_id,
+                        body.appId,
+                        now,
+                    )
             except asyncpg.UniqueViolationError as exc:
                 # Most likely cause: users.email collision. We surface a clear
                 # 409 — per the task brief, anti-enumeration is a UI concern,
