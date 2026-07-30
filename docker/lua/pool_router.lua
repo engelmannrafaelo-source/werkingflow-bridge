@@ -9,7 +9,9 @@
 -- Sets ngx.var.target_worker to one of the configured worker upstream names
 --   (BRIDGE_WORKERS env: worker1..4 on primary, worker-sahori/worker-kurt on
 --    production) or "unavailable".
--- Sets ngx.var.x_pool_decision to: weighted_capacity | round_robin_fallback | all_unavail
+-- Sets ngx.var.x_pool_decision to: weighted_capacity | round_robin_fallback |
+--   all_unavail | all_unavail_overflow
+-- Sets ngx.var.pool_exhausted to "1" ONLY in the all_unavail_overflow case.
 --
 -- Decision logic:
 --   1. Refresh timer reads /v1/metrics/account-pool-state every 2s
@@ -19,8 +21,12 @@
 --      → pool_decision=weighted_capacity
 --   5. State stale (>10s) OR fetch/decode error → round-robin across all 4 workers
 --      → pool_decision=round_robin_fallback
---   6. Zero eligible → bogus peer → triggers @bridge_full 429 envelope
+--   6. Zero eligible → target_worker="unavailable"; the CALLER (nginx.conf's
+--      access-phase guard) turns that into @pool_exhausted_response
 --      → pool_decision=all_unavail
+--      ...unless the endpoint is overflow_capable, then the request is routed
+--      anyway and marked $pool_exhausted=1 for the app
+--      → pool_decision=all_unavail_overflow
 --
 -- Why weighted by effective_cap_tokens, not by headroom_percent:
 --   The per-worker AdaptiveLoadLimiter already learns each account's true

@@ -57,20 +57,16 @@ emit_upstream() {
     echo "}"
 }
 
-emit_target_dest_map() {
-    # Vestigial map preserved from nginx.conf (defined but not used in proxy_pass;
-    # kept for structural parity + the "unavailable" sentinel). First worker is
-    # the default. $@ = worker names.
-    local first="$1"
-    echo "map \$target_worker \$target_dest {"
-    echo "    default        \"${first}:8000\";"
-    local w
-    for w in "$@"; do
-        echo "    \"${w}\"  \"${w}:8000\";"
-    done
-    echo "    \"unavailable\"  \"claude_unavail\";"
-    echo "}"
-}
+# NOTE (2026-07-30): the per-worker `map $target_worker $target_dest` that used
+# to be emitted here has been REMOVED, together with the `upstream
+# claude_unavail` sentinel it pointed at. $target_dest was never read — not in a
+# proxy_pass, not anywhere — so the whole chain was dead config that read like
+# live per-worker routing with a failure sentinel. That is the same hazard class
+# as the rewrite-phase `if ($target_worker = "unavailable")` removed in d6066aa:
+# configuration that describes a mechanism which does not run. Routing is done
+# by pool_router.lua setting $target_worker, and the static `proxy_pass
+# http://claude_workers` (static is required — a variable proxy_pass disables
+# proxy_next_upstream). Do not reintroduce a map "for structural parity".
 
 generate() {
     local id="$1"
@@ -108,11 +104,6 @@ HEADER
 
     echo "# Round-robin default pool (used by /health, Lua-routed /v1 SSE, default /)."
     emit_upstream claude_workers 32 "$default_backup" "${workers[@]}"
-    echo
-
-    echo "# Per-worker map — vestigial (\$target_dest is not used in a proxy_pass;"
-    echo "# kept for structural parity + the \"unavailable\" sentinel)."
-    emit_target_dest_map "${workers[@]}"
     echo
 
     echo "# Production-priority pool (X-Priority: production). Backs up to"

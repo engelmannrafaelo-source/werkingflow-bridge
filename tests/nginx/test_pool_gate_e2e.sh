@@ -21,8 +21,9 @@
 # and a stub metrics-reader, so the gate is asserted on behaviour.
 #
 # USAGE
-#     tests/nginx/test_pool_gate_e2e.sh          # both scenarios, exit 1 on failure
-# Requires docker. Builds the real docker/Dockerfile.nginx-lb image.
+#     tests/nginx/test_pool_gate_e2e.sh              # lint + both scenarios
+#     tests/nginx/test_pool_gate_e2e.sh --lint-only  # static check only, no docker
+# Requires docker (except --lint-only). Builds the real docker/Dockerfile.nginx-lb.
 set -uo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -39,6 +40,98 @@ cleanup() {
     docker network rm $NET >/dev/null 2>&1
 }
 trap 'cleanup; rm -rf "$WORK"' EXIT
+
+# ---------------------------------------------------------------------------
+# Step 0 — static phase-order lint (no docker; the class-level guard)
+#
+# Hard-fails when a rewrite-phase directive READS a variable that Lua assigns in
+# the access phase. That combination is always a no-op, and it is invisible to
+# `nginx -t`: it cost this codebase a gate that silently never fired.
+# ---------------------------------------------------------------------------
+lint_phase_order() {
+    python3 - "$REPO" <<'PYEOF'
+import glob
+import os
+import re
+import sys
+
+repo = sys.argv[1]
+lua_files = glob.glob(os.path.join(repo, "docker", "lua", "*.lua"))
+# dict.fromkeys keeps order and de-duplicates: nginx.conf is also matched by the
+# glob, and a finding reported twice reads like two findings.
+conf_files = list(dict.fromkeys(
+    [os.path.join(repo, "docker", "nginx.conf")]
+    + sorted(glob.glob(os.path.join(repo, "docker", "*.conf")))))
+
+# Variables assigned by Lua (access/content phase).
+lua_vars = set()
+for path in lua_files:
+    with open(path, encoding="utf-8") as fh:
+        for line in fh:
+            for m in re.finditer(r"ngx\.var\.([A-Za-z_][A-Za-z0-9_]*)\s*=(?!=)", line):
+                lua_vars.add(m.group(1))
+
+if not lua_vars:
+    print("  lint: no Lua-assigned nginx variables found — nothing to check")
+    sys.exit(0)
+print("  lint: Lua-assigned variables: " + ", ".join(sorted(lua_vars)))
+
+REWRITE_PHASE = re.compile(r"^\s*(if|return|rewrite|set)\b")
+SET_TARGET = re.compile(r"^\s*set\s+\$([A-Za-z_][A-Za-z0-9_]*)")
+
+errors, warnings = [], []
+for path in conf_files:
+    if not os.path.exists(path):
+        continue
+    rel = os.path.relpath(path, repo)
+    with open(path, encoding="utf-8") as fh:
+        for n, raw in enumerate(fh, 1):
+            line = raw.split("#", 1)[0]          # strip comments
+            if not line.strip():
+                continue
+
+            if REWRITE_PHASE.match(line):
+                # `set $X <value>` WRITES $X — that declaration is required.
+                written = SET_TARGET.match(line)
+                written_var = written.group(1) if written else None
+                for var in lua_vars:
+                    if var == written_var:
+                        continue
+                    if re.search(r"\$" + var + r"\b", line):
+                        errors.append(
+                            f"{rel}:{n}: rewrite-phase directive reads ${var}, "
+                            f"which Lua assigns in the access phase — this can "
+                            f"never see the Lua value: {line.strip()}")
+
+            m = re.match(r"\s*map\s+\$([A-Za-z_][A-Za-z0-9_]*)\s+\$", line)
+            if m and m.group(1) in lua_vars:
+                warnings.append(
+                    f"{rel}:{n}: map keyed on Lua-assigned ${m.group(1)} — safe "
+                    f"only if its output is read after the access phase; verify: "
+                    f"{line.strip()}")
+
+for w in warnings:
+    print(f"  lint WARN  {w}")
+for e in errors:
+    print(f"  lint FAIL  {e}")
+if errors:
+    sys.exit(1)
+print(f"  lint: OK — no rewrite-phase reads of Lua-assigned variables "
+      f"({len(warnings)} warning(s))")
+PYEOF
+}
+
+echo "=== Step 0: static phase-order lint ==="
+if ! lint_phase_order; then
+    echo "POOL_GATE_E2E_FAIL: phase-order lint failed"
+    exit 1
+fi
+
+if [ "${1:-}" = "--lint-only" ]; then
+    echo "POOL_GATE_LINT_OK (lint-only mode; scenarios skipped)"
+    exit 0
+fi
+echo
 
 # --- stub worker: echoes the headers nginx forwarded ------------------------
 cat > "$WORK/echo.py" <<'PYEOF'
