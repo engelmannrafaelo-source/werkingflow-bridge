@@ -314,7 +314,21 @@ async def start_project_pack_checkout(
 # 'project' plan": lifting the returning-customer + billing-address gates
 # is a per-plan decision, not something that should apply transitively to
 # e.g. energy-project just because it shares interval='project'.
-FIRST_PURCHASE_PACK_PLAN_IDS = frozenset({"report-check-credit"})
+FIRST_PURCHASE_PACK_PLAN_IDS = frozenset({
+    "report-check-credit",      # 20er-Paket, 5.00 EUR/Check
+    "report-check-credit-5",    # 5er-Paket, 7.00 EUR/Check
+    "report-check-credit-1",    # Einzelkauf, 9.00 EUR/Check
+})
+
+# Feste Kaufmenge je Staffel-Plan. Der Rabatt der Preisstaffel steckt im
+# Stückpreis des Plans — ohne festen Mengen-Guard könnte ein Client den
+# günstigsten Stückpreis mit beliebiger Menge kaufen (quantity=1 auf dem
+# 5-EUR-Plan = Einzel-Check zum 20er-Paketpreis) und die Staffel aushebeln.
+FIRST_PURCHASE_PACK_FIXED_QUANTITIES = {
+    "report-check-credit": 20,
+    "report-check-credit-5": 5,
+    "report-check-credit-1": 1,
+}
 
 # Plans whose invoice is auto-approved + emailed the moment the Mollie webhook
 # releases the order — bypassing INVOICE_REQUIRE_APPROVAL. Deliberately its own
@@ -326,7 +340,11 @@ FIRST_PURCHASE_PACK_PLAN_IDS = frozenset({"report-check-credit"})
 # Rechnungs-Lane, project-pack reorders (e.g. energy-project), subscriptions —
 # keeps the manual operator approval in Platform Admin. Do NOT widen this set
 # without an explicit per-product decision.
-AUTO_SEND_INVOICE_PLAN_IDS = frozenset({"report-check-credit"})
+AUTO_SEND_INVOICE_PLAN_IDS = frozenset({
+    "report-check-credit",
+    "report-check-credit-5",
+    "report-check-credit-1",
+})
 
 # Kleinbetragsrechnungs-Grenze in Österreich: § 11 Abs 6 UStG 1994 (400 EUR).
 # Leitplanke gegen Missbrauch des gate-freien Erstkauf-Pfads für teure Käufe,
@@ -390,6 +408,13 @@ async def start_first_purchase_pack_checkout(
         )
     if quantity < 1:
         raise ValueError("quantity must be >= 1")
+
+    fixed_quantity = FIRST_PURCHASE_PACK_FIXED_QUANTITIES.get(plan_id)
+    if fixed_quantity is not None and quantity != fixed_quantity:
+        raise ValueError(
+            f"plan '{plan_id}' is a fixed-size tier of the Check price ladder "
+            f"(quantity must be exactly {fixed_quantity}, got {quantity})"
+        )
 
     amount = round(float(plan.price) * quantity, 2)
     if amount > FIRST_PURCHASE_PACK_MAX_AMOUNT_EUR:

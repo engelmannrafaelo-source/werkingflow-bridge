@@ -91,25 +91,41 @@ async def main():
     results.append(("D: energy-project nicht allowlisted -> abgelehnt", rejected, d1))
 
     # --- TEST E: Preis-Cap-Guard greift bei zu hoher quantity ---
+    # Der Fixmengen-Guard der Preisstaffel feuert fuer die Check-Plaene frueher —
+    # fuer den Cap-Test die Fixmenge temporaer aufheben (der Cap schuetzt kuenftige
+    # Plaene ohne Fixmenge).
     capped = False; d2 = "kein Fehler!"
+    saved_fixed = billing_service.FIRST_PURCHASE_PACK_FIXED_QUANTITIES.pop("report-check-credit")
     try:
         # 5 EUR * 100 = 500 EUR > FIRST_PURCHASE_PACK_MAX_AMOUNT_EUR (400)
         await billing_service.start_first_purchase_pack_checkout(
             uid2, "report-check-credit", 100, "https://x/ok", "u2@test.local", "Test2")
     except ValueError as e:
         capped = "exceeds the first-purchase pack cap" in str(e); d2 = str(e)[:80]
+    finally:
+        billing_service.FIRST_PURCHASE_PACK_FIXED_QUANTITIES["report-check-credit"] = saved_fixed
     results.append(("E: Preis-Cap-Guard blockt Grossbestellung", capped, d2))
+
+    # --- TEST E2: Fixmengen-Guard der Preisstaffel (Stueckpreis-Arbitrage) ---
+    fixed_blocked = False; d2b = "kein Fehler!"
+    try:
+        # quantity=1 auf dem 5-EUR-Plan des 20er-Pakets = Einzel-Check zum Paketpreis
+        await billing_service.start_first_purchase_pack_checkout(
+            uid2, "report-check-credit", 1, "https://x/ok", "u2@test.local", "Test2")
+    except ValueError as e:
+        fixed_blocked = "fixed-size tier" in str(e); d2b = str(e)[:80]
+    results.append(("E2: Fixmengen-Guard blockt Stueckpreis-Arbitrage", fixed_blocked, d2b))
 
     # --- TEST F: Credits erschöpft -> CreditsExhaustedError (fail loud) ---
     async with pool.acquire() as conn:
         uid3, _ = await seed_user(conn, with_billing_address=False)
     co3 = await billing_service.start_first_purchase_pack_checkout(
-        uid3, "report-check-credit", 1, "https://x/ok", "u3@test.local", "Test3")
+        uid3, "report-check-credit-1", 1, "https://x/ok", "u3@test.local", "Test3")
     await billing_service.handle_webhook(co3["paymentId"])
-    await consume_credit(uuid.UUID(uid3), "report-check-credit")  # verbraucht den einzigen Credit
+    await consume_credit(uuid.UUID(uid3), "report-check-credit-1")  # verbraucht den einzigen Credit
     exhausted = False; d3 = "kein Fehler!"
     try:
-        await consume_credit(uuid.UUID(uid3), "report-check-credit")
+        await consume_credit(uuid.UUID(uid3), "report-check-credit-1")
     except CreditsExhaustedError as e:
         exhausted = True; d3 = str(e)[:80]
     results.append(("F: Credits erschöpft -> fail loud (kein stiller Download)", exhausted, d3))
@@ -126,6 +142,20 @@ async def main():
         still_blocked = "returning customers" in str(e); d4 = str(e)[:80]
     results.append(("G: start_project_pack_checkout unverändert (Bestandskunden-Gate aktiv)",
                     still_blocked, d4))
+
+    # --- TEST H: Preisstaffel 5er-Paket end-to-end (35 EUR, eigener Credit-Bucket) ---
+    async with pool.acquire() as conn:
+        uid5, _ = await seed_user(conn, with_billing_address=False)
+    co5 = await billing_service.start_first_purchase_pack_checkout(
+        uid5, "report-check-credit-5", 5, "https://x/ok", "u5@test.local", "Test5")
+    res5 = await billing_service.handle_webhook(co5["paymentId"])
+    avail5 = await get_available_credits(uuid.UUID(uid5), "report-check-credit-5")
+    async with pool.acquire() as conn:
+        amount5 = await conn.fetchval(
+            "SELECT amount_eur FROM pending_payments WHERE payment_id = $1", co5["paymentId"])
+    results.append(("H: 5er-Staffel gewaehrt 5 Credits fuer 35 EUR (7 EUR/Check)",
+                    avail5 == 5 and float(amount5) == 35.0 and res5.get("handled"),
+                    f"avail={avail5} amount={amount5}"))
 
     await close_pool()
     print("\n=== ERGEBNISSE ===")
