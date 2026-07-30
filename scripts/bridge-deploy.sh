@@ -654,7 +654,46 @@ headers = {
     "X-User-ID": "anonymous:bridge-deploy-dist-test",
 }
 
+def is_pool_exhausted(resp) -> bool:
+    """True iff the router REFUSED this call because no account was eligible.
+
+    First-party signal: @pool_exhausted_response stamps X-Bridge-Capacity, so we
+    read the router's own verdict instead of re-deriving eligibility here.
+    """
+    if resp.status_code != 429:
+        return False
+    if resp.headers.get("X-Bridge-Capacity") == "pool_exhausted":
+        return True
+    try:
+        return (resp.json().get("error") or {}).get("bridge_type") == "pool_exhausted"
+    except Exception:
+        return False
+
+
+def eligible_account_count() -> int:
+    """How many accounts the router could currently route to (-1 = unknown).
+
+    Mirrors pick_weighted_account() in docker/lua/pool_router.lua. Used ONLY to
+    diagnose a <2-unique-worker result — never to decide the happy path — so a
+    drift between the two costs a wrong diagnosis, not a wrong pass/fail on a
+    healthy pool.
+    """
+    try:
+        r = requests.get(f"{url}/v1/metrics/account-pool-state", headers=headers, timeout=20)
+        accounts = (r.json() or {}).get("accounts") or {}
+    except Exception:
+        return -1
+    return sum(
+        1 for a in accounts.values()
+        if a.get("available")
+        and (a.get("cooldown_remaining_s") or 0) == 0
+        and (a.get("effective_cap_tokens") or 0) > (a.get("current_in_flight_tokens") or 0)
+        and (a.get("weekly_percent") or 0) < 96
+    )
+
+
 workers_hit = []
+refused = 0
 for i in range(8):
     try:
         r = requests.post(
@@ -678,30 +717,74 @@ for i in range(8):
         sys.exit(1)
 
     worker = r.headers.get("X-Target-Worker", "unknown")
-    note  = "" if r.status_code == 200 else " (429 worker rate-limited — counts as hit)"
+    if is_pool_exhausted(r):
+        refused += 1
+        note = " (router refused: pool exhausted — no worker reached)"
+    elif r.status_code == 429:
+        note = " (429 worker rate-limited — counts as hit)"
+    else:
+        note = ""
     print(f"  call {i+1}/8: worker={worker} HTTP {r.status_code}{note}")
     if worker and worker != "unknown":
         workers_hit.append(worker)
 
 unique_workers = set(workers_hit)
 distribution   = dict(Counter(workers_hit))
-print(f"Distribution: {len(unique_workers)}/4 unique workers — {distribution}")
+print(f"Distribution: {len(unique_workers)}/4 unique workers — {distribution}"
+      + (f", {refused} refused (pool exhausted)" if refused else ""))
 
-if len(unique_workers) < 2:
+if len(unique_workers) >= 2:
+    print(f"DIST_OK: {len(unique_workers)} unique workers hit — {distribution}")
+    sys.exit(0)
+
+# Fewer than 2 workers hit. That is only a ROUTER defect if the router actually
+# had something to spread across. With 0 or 1 eligible account, sending every
+# call to the one account (or refusing all of them) is the correct behaviour —
+# failing here would report infrastructure STATE as a code defect, the same
+# confusion that made the deploy smoke roll back good builds (f32c801).
+eligible = eligible_account_count()
+
+# A refusal is the router stating, at call time, that nothing was eligible.
+# `eligible` is sampled seconds later and the pool moves fast (a single account
+# can appear and vanish between calls — observed live 2026-07-30), so refusals
+# are the authoritative signal and the later count is reported as context, not
+# used to contradict them. Deciding on that race would produce exactly the kind
+# of flaky red the smoke fix (f32c801) removed.
+if refused or (0 <= eligible < 2):
+    facts = [f"{len(unique_workers)} worker(s) hit"]
+    if refused:
+        facts.append(f"{refused}/8 refused by the router (pool_exhausted)")
+    facts.append(f"{eligible} account(s) eligible when sampled afterwards"
+                 if eligible >= 0 else "eligibility unknown (state probe failed)")
     print(
-        f"DIST_FAIL: only {len(unique_workers)} unique worker(s) hit across 8 calls "
-        f"(need >=2): {sorted(unique_workers)}. "
-        f"Pool router is not distributing load — check pool_router.lua tie-breaker logic.",
+        f"DIST_SKIP: load-spreading is not assertable right now — "
+        f"{'; '.join(facts)}. With no spare account, refusing calls or "
+        f"concentrating them on the only account with headroom is the CORRECT "
+        f"behaviour, not a router defect. Re-run once >=2 accounts have headroom.",
         file=sys.stderr,
     )
-    sys.exit(1)
+    sys.exit(0)
 
-print(f"DIST_OK: {len(unique_workers)} unique workers hit — {distribution}")
+print(
+    f"DIST_FAIL: only {len(unique_workers)} unique worker(s) hit across 8 calls "
+    f"(need >=2): {sorted(unique_workers)}, while {eligible} account(s) were "
+    f"eligible and none were refused. Pool router is not distributing load — "
+    f"check pool_router.lua tie-breaker logic.",
+    file=sys.stderr,
+)
+sys.exit(1)
 PYEOF
     ) 2>&1
     rc_dist=$?
 
     while IFS= read -r line; do info "  dist: ${line}"; done <<< "$dist_out"
+
+    # DIST_SKIP = the assertion was not applicable (pool exhausted / <2 eligible
+    # accounts). Not a pass and not a failure: reported loudly, never silently.
+    if echo "$dist_out" | grep -q 'DIST_SKIP:'; then
+        warn "Distribution test NOT ASSERTABLE — pool has no spare accounts right now (see dist: lines above)"
+        return 0
+    fi
 
     if [[ $rc_dist -ne 0 ]] || ! echo "$dist_out" | grep -q 'DIST_OK:'; then
         error_ "Distribution test FAILED — pool router not spreading load across workers"
