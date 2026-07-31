@@ -290,6 +290,18 @@ async def persist_ai_call_activity(
         if not user_id:
             # No user → no tenant → cannot write a tenant-scoped row.
             # In-memory prompt-metrics still has it; nothing else to do.
+            #
+            # Logged, not silent: "no usage_events row" must always have a
+            # findable reason. A skip that leaves no trace is indistinguishable
+            # from a broken writer, and the ledger is then useless as a
+            # measuring instrument — verified the hard way 2026-07-30, when a
+            # missing row was read as "the research-cloud path does not work"
+            # and cost hours of chasing a defect that did not exist.
+            logger.warning(
+                "persist_ai_call_activity: no user identity (app=%s agent=%s model=%s) "
+                "— NO usage_events row written for this call",
+                app_id, agent_id, model,
+            )
             return
 
         import uuid as _uuid
@@ -346,7 +358,24 @@ async def persist_ai_call_activity(
             tenant_id = trow["tenant_id"] if trow else None
             billing_mode_text = trow["billing_mode"] if trow else "subscription"
             if not tenant_id:
-                # Unknown user or user without tenant — skip (see module docstring).
+                # Skip is correct — a usage_events row is tenant-scoped and there
+                # is no tenant to scope it to. But say so: this was the last
+                # silent exit on the ledger path, and a silently missing row on a
+                # BILLING path is the worst kind of quiet failure — spend that
+                # nobody can see and nobody can reconcile.
+                #
+                # The JOIN is inner, so a missing row means EITHER the user id
+                # does not exist in `users` OR its tenant_id points nowhere. The
+                # old comment lumped both together; the distinction is what tells
+                # an operator whether to look at the user or at the tenant.
+                _skip_counts[user_id] += 1
+                logger.warning(
+                    "persist_ai_call_activity: no users+tenants row for user=%s "
+                    "(app=%s agent=%s model=%s, seen %dx) — user missing or its "
+                    "tenant_id dangling; NO usage_events row written, this call is "
+                    "NOT metered",
+                    user_id, app_id, agent_id, model, _skip_counts[user_id],
+                )
                 return
 
             feature = agent_id or workflow_id or "call"

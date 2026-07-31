@@ -5741,9 +5741,33 @@ async def debug_request_validation(request: Request):
                     ]
                 }
         
+        # Credential-bearing headers are REDACTED. This endpoint echoes the
+        # request back, so `dict(request.headers)` handed the caller its own
+        # Authorization header in cleartext — and, worse, wrote it into whatever
+        # log, terminal or transcript captured the response. That is exactly how
+        # AI_BRIDGE_API_KEY ended up in a session transcript on 2026-07-30 while
+        # debugging an unrelated routing question.
+        #
+        # Redacting rather than dropping: the point of a debug echo is to show
+        # WHICH headers arrived. "<redacted len=64>" answers that ("the key is
+        # present and has the expected length") without reproducing the secret.
+        # Prefix-matched, so x-api-key/authorization variants are covered too.
+        _SECRET_HEADER_PREFIXES = ("authorization", "proxy-authorization", "cookie",
+                                   "x-api-key", "x-auth", "x-bridge-key")
+
+        def _redact_headers(headers) -> dict:
+            out = {}
+            for k, v in headers.items():
+                lk = k.lower()
+                if any(lk.startswith(p) for p in _SECRET_HEADER_PREFIXES):
+                    out[k] = f"<redacted len={len(v)}>"
+                else:
+                    out[k] = v
+            return out
+
         return {
             "debug_info": {
-                "headers": dict(request.headers),
+                "headers": _redact_headers(request.headers),
                 "method": request.method,
                 "url": str(request.url),
                 "raw_body": raw_body,
