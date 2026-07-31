@@ -669,7 +669,9 @@ phase_smoke_test() {
     # payloads and asserts correctness — not just liveness. This is what stops a
     # broken endpoint (e.g. the /v1/document/convert 415 that shipped for weeks
     # while /health, /lb-status and the old research-only smoke stayed green) from
-    # going live. Endpoint coverage is enforced by bridge_smoke_coverage.py.
+    # going live. Endpoint coverage is enforced by the bridge_smoke_coverage.py
+    # pre-flight above — which, until 2026-07-31, this comment claimed while the
+    # validator was called from nowhere.
     # On failure the caller (deploy_server) routes into the existing auto-rollback.
     local smoke_script
     smoke_script="$(dirname "${BASH_SOURCE[0]}")/bridge_smoke.py"
@@ -1321,6 +1323,41 @@ if [[ -x "$drift_check" || -f "$drift_check" ]]; then
     fi
 else
     warn "check-principal-drift.sh not found next to bridge-deploy.sh — skipping parity check"
+fi
+
+# ============================================================================
+# Pre-flight: smoke COVERAGE (local, before any host is touched)
+# ============================================================================
+# phase_smoke_test's own comment has claimed since it was written that
+# "Endpoint coverage is enforced by bridge_smoke_coverage.py". It was not:
+# the validator existed, exited 1 for two uncovered routes, and was called
+# from nowhere. A documented gate that does not run is the same defect class
+# as the nginx capacity gate that never fired (d6066aa) and the dead
+# $target_dest map (9116da0) — configuration describing a mechanism that
+# isn't there. Three instances in one codebase makes it a habit, so this one
+# gets wired in rather than described.
+#
+# Local and BEFORE the hosts: this is static analysis of routes vs. probes, it
+# needs no server, and a coverage hole should stop the deploy before anything
+# has been pulled, built or recreated. Fail fast, cheaply.
+#
+# What it protects: a new /v1 route that is neither probed nor explicitly
+# excluded ships completely untested — which is exactly how /v1/document/convert
+# returned 415 on every PDF for weeks while /health stayed green.
+_coverage_script="$(dirname "${BASH_SOURCE[0]}")/bridge_smoke_coverage.py"
+if [[ -f "$_coverage_script" ]]; then
+    step "Pre-flight: smoke coverage"
+    if _coverage_out=$(python3 "$_coverage_script" 2>&1); then
+        while IFS= read -r line; do info "  coverage: ${line}"; done <<< "$_coverage_out"
+    else
+        while IFS= read -r line; do error_ "  coverage: ${line}"; done <<< "$_coverage_out"
+        error_ "ABORTED: every functional /v1 route must be probed by bridge_smoke.py or"
+        error_ "  listed in its EXCLUDED map with a reason. An unprobed route ships untested."
+        error_ "  Nothing was touched on any host."
+        exit 1
+    fi
+else
+    warn "bridge_smoke_coverage.py not found next to bridge-deploy.sh — coverage NOT enforced"
 fi
 
 case "$SERVER" in
