@@ -436,6 +436,48 @@ def _pool_state(ctx: Ctx) -> ProbeResult:
     return ProbeResult("metrics_account_pool", ep, True, f"{len(d.get('accounts', []))} accounts reported", r.status_code, ms)
 
 
+@probe("metrics_anonymization", "/v1/metrics/anonymization", {"hetzner"},
+       repro="curl $AI_BRIDGE_URL/v1/metrics/anonymization -H 'Authorization: Bearer $AI_BRIDGE_API_KEY' " + ATTRIBUTION_REPRO)
+def _metrics_anonymization(ctx: Ctx) -> ProbeResult:
+    """GDPR counters. Probed rather than EXCLUDED: it is a read-only GET, so
+    there is no reason to leave it uncovered — and `db:false` would mean the
+    pseudonymisation counters silently report nothing, which is exactly the kind
+    of blind instrument this suite exists to catch."""
+    ep = "/v1/metrics/anonymization"
+    r, ms = _timed(lambda: requests.get(f"{ctx.base_url}{ep}", headers=ctx.headers(), timeout=30))
+    if r.status_code != 200:
+        return ProbeResult("metrics_anonymization", ep, False, f"HTTP {r.status_code}: {r.text[:200]}", r.status_code, ms)
+    d = r.json()
+    missing = [k for k in ("db", "pseudonymized_total", "failed_total") if k not in d]
+    if missing:
+        return ProbeResult("metrics_anonymization", ep, False,
+                           f"missing key(s) {missing}: {str(d)[:150]}", r.status_code, ms)
+    if d.get("db") is not True:
+        return ProbeResult("metrics_anonymization", ep, False,
+                           "db=false — counters are not backed by the database, "
+                           "so anonymisation metrics report nothing", r.status_code, ms)
+    return ProbeResult("metrics_anonymization", ep, True,
+                       f"db=true, pseudonymized={d.get('pseudonymized_total')} failed={d.get('failed_total')}",
+                       r.status_code, ms)
+
+
+@probe("metrics_document_performance", "/v1/metrics/document-performance", {"hetzner"},
+       repro="curl $AI_BRIDGE_URL/v1/metrics/document-performance -H 'Authorization: Bearer $AI_BRIDGE_API_KEY' " + ATTRIBUTION_REPRO)
+def _metrics_document_performance(ctx: Ctx) -> ProbeResult:
+    ep = "/v1/metrics/document-performance"
+    r, ms = _timed(lambda: requests.get(f"{ctx.base_url}{ep}", headers=ctx.headers(), timeout=30))
+    if r.status_code != 200:
+        return ProbeResult("metrics_document_performance", ep, False, f"HTTP {r.status_code}: {r.text[:200]}", r.status_code, ms)
+    d = r.json()
+    if not isinstance(d.get("agents"), list):
+        return ProbeResult("metrics_document_performance", ep, False,
+                           f"no 'agents' list: {str(d)[:150]}", r.status_code, ms)
+    # Shape only, never counts: how many agents reported is STATE and would make
+    # this probe fail on a quiet bridge.
+    return ProbeResult("metrics_document_performance", ep, True,
+                       f"{len(d['agents'])} agent(s) reported", r.status_code, ms)
+
+
 # Endpoints covered by dedicated probes above but whose canonical route differs
 # from the probe endpoint are mapped here so the coverage validator sees them.
 COVERED_ALIASES = {
