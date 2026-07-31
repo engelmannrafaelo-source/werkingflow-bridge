@@ -128,6 +128,15 @@ services:
       # (subscription pool would silently bill the API otherwise).
       - RESEARCH_CLOUD_API_KEY=${ANTHROPIC_API_KEY:-}
       - RESEARCH_CLOUD_ENABLED=${RESEARCH_CLOUD_ENABLED:-}
+      # Research-Library (specs/research-library-tool): kuratierte private
+      # Bibliothek fuer den research_cloud-Pfad; default aus, Werte via
+      # sync-infisical-to-bridge -> docker/.env (dev) bzw. platform-Secrets (prod).
+      - RESEARCH_LIBRARY_ENABLED=${RESEARCH_LIBRARY_ENABLED:-}
+      - RESEARCH_LIBRARY_S3_ENDPOINT_URL=${RESEARCH_LIBRARY_S3_ENDPOINT_URL:-}
+      - RESEARCH_LIBRARY_S3_BUCKET=${RESEARCH_LIBRARY_S3_BUCKET:-}
+      - RESEARCH_LIBRARY_S3_ACCESS_KEY_ID=${RESEARCH_LIBRARY_S3_ACCESS_KEY_ID:-}
+      - RESEARCH_LIBRARY_S3_SECRET_ACCESS_KEY=${RESEARCH_LIBRARY_S3_SECRET_ACCESS_KEY:-}
+      - RESEARCH_LIBRARY_S3_REGION=${RESEARCH_LIBRARY_S3_REGION:-}
       - OPENAI_API_KEY=${OPENAI_API_KEY}
       # STT / Whisper EU data-residency (GDPR) — default openai (US, backward-compat).
       # EU route (Rafael 2026-07-06): STT_PROVIDER=aws-sagemaker + AWS_STT_SAGEMAKER_ENDPOINT
@@ -242,6 +251,15 @@ services:
       # (subscription pool would silently bill the API otherwise).
       - RESEARCH_CLOUD_API_KEY=${ANTHROPIC_API_KEY:-}
       - RESEARCH_CLOUD_ENABLED=${RESEARCH_CLOUD_ENABLED:-}
+      # Research-Library (specs/research-library-tool): kuratierte private
+      # Bibliothek fuer den research_cloud-Pfad; default aus, Werte via
+      # sync-infisical-to-bridge -> docker/.env (dev) bzw. platform-Secrets (prod).
+      - RESEARCH_LIBRARY_ENABLED=${RESEARCH_LIBRARY_ENABLED:-}
+      - RESEARCH_LIBRARY_S3_ENDPOINT_URL=${RESEARCH_LIBRARY_S3_ENDPOINT_URL:-}
+      - RESEARCH_LIBRARY_S3_BUCKET=${RESEARCH_LIBRARY_S3_BUCKET:-}
+      - RESEARCH_LIBRARY_S3_ACCESS_KEY_ID=${RESEARCH_LIBRARY_S3_ACCESS_KEY_ID:-}
+      - RESEARCH_LIBRARY_S3_SECRET_ACCESS_KEY=${RESEARCH_LIBRARY_S3_SECRET_ACCESS_KEY:-}
+      - RESEARCH_LIBRARY_S3_REGION=${RESEARCH_LIBRARY_S3_REGION:-}
       - OPENAI_API_KEY=${OPENAI_API_KEY}
       # STT / Whisper EU data-residency (GDPR) — default openai (US, backward-compat).
       # EU route (Rafael 2026-07-06): STT_PROVIDER=aws-sagemaker + AWS_STT_SAGEMAKER_ENDPOINT
@@ -356,6 +374,15 @@ services:
       # (subscription pool would silently bill the API otherwise).
       - RESEARCH_CLOUD_API_KEY=${ANTHROPIC_API_KEY:-}
       - RESEARCH_CLOUD_ENABLED=${RESEARCH_CLOUD_ENABLED:-}
+      # Research-Library (specs/research-library-tool): kuratierte private
+      # Bibliothek fuer den research_cloud-Pfad; default aus, Werte via
+      # sync-infisical-to-bridge -> docker/.env (dev) bzw. platform-Secrets (prod).
+      - RESEARCH_LIBRARY_ENABLED=${RESEARCH_LIBRARY_ENABLED:-}
+      - RESEARCH_LIBRARY_S3_ENDPOINT_URL=${RESEARCH_LIBRARY_S3_ENDPOINT_URL:-}
+      - RESEARCH_LIBRARY_S3_BUCKET=${RESEARCH_LIBRARY_S3_BUCKET:-}
+      - RESEARCH_LIBRARY_S3_ACCESS_KEY_ID=${RESEARCH_LIBRARY_S3_ACCESS_KEY_ID:-}
+      - RESEARCH_LIBRARY_S3_SECRET_ACCESS_KEY=${RESEARCH_LIBRARY_S3_SECRET_ACCESS_KEY:-}
+      - RESEARCH_LIBRARY_S3_REGION=${RESEARCH_LIBRARY_S3_REGION:-}
       - OPENAI_API_KEY=${OPENAI_API_KEY}
       # STT / Whisper EU data-residency (GDPR) — default openai (US, backward-compat).
       # EU route (Rafael 2026-07-06): STT_PROVIDER=aws-sagemaker + AWS_STT_SAGEMAKER_ENDPOINT
@@ -470,6 +497,15 @@ services:
       # (subscription pool would silently bill the API otherwise).
       - RESEARCH_CLOUD_API_KEY=${ANTHROPIC_API_KEY:-}
       - RESEARCH_CLOUD_ENABLED=${RESEARCH_CLOUD_ENABLED:-}
+      # Research-Library (specs/research-library-tool): kuratierte private
+      # Bibliothek fuer den research_cloud-Pfad; default aus, Werte via
+      # sync-infisical-to-bridge -> docker/.env (dev) bzw. platform-Secrets (prod).
+      - RESEARCH_LIBRARY_ENABLED=${RESEARCH_LIBRARY_ENABLED:-}
+      - RESEARCH_LIBRARY_S3_ENDPOINT_URL=${RESEARCH_LIBRARY_S3_ENDPOINT_URL:-}
+      - RESEARCH_LIBRARY_S3_BUCKET=${RESEARCH_LIBRARY_S3_BUCKET:-}
+      - RESEARCH_LIBRARY_S3_ACCESS_KEY_ID=${RESEARCH_LIBRARY_S3_ACCESS_KEY_ID:-}
+      - RESEARCH_LIBRARY_S3_SECRET_ACCESS_KEY=${RESEARCH_LIBRARY_S3_SECRET_ACCESS_KEY:-}
+      - RESEARCH_LIBRARY_S3_REGION=${RESEARCH_LIBRARY_S3_REGION:-}
       - OPENAI_API_KEY=${OPENAI_API_KEY}
       # STT / Whisper EU data-residency (GDPR) — default openai (US, backward-compat).
       # EU route (Rafael 2026-07-06): STT_PROVIDER=aws-sagemaker + AWS_STT_SAGEMAKER_ENDPOINT
