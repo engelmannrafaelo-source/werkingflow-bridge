@@ -1,13 +1,17 @@
 #!/usr/bin/env bash
 # bridge-deploy.sh — Atomic idempotent multi-server Bridge deployment
 #
-# Usage: bridge-deploy.sh <server> [<service>...] [--dry-run]
-#   server  = hetzner | server2 | both
-#   service = optional, default = all services for the server
+# Usage: bridge-deploy.sh <server> [<service>...] [--dry-run] [--ack-foreign]
+#   server        = hetzner | server2 | both
+#   service       = optional, default = all services for the server
+#   --ack-foreign = proceed although this deploy also ships commits authored by
+#                   other sessions (see phase_foreign_commit_gate). Without it,
+#                   such a deploy ABORTS before touching the target.
 #
 # EXIT CODES:
 #   0 = success (or dry-run completed)
-#   1 = deployment failure (rollback attempted and succeeded)
+#   1 = deployment failure (rollback attempted and succeeded), or the
+#       foreign-commit gate aborted BEFORE any change was made
 #   2 = critical failure (rollback itself failed — manual intervention required)
 set -euo pipefail
 
@@ -19,6 +23,9 @@ SERVER2_HOST="178.104.178.79"
 SSH_KEY="/root/.ssh/id_ed25519"
 SSH_BASE_OPTS="-i ${SSH_KEY} -o ConnectTimeout=10 -o StrictHostKeyChecking=no -o BatchMode=yes"
 REMOTE_REPO="/root/werkingflow-bridge"
+# SHA the running images were built from, written by a finished deploy. Untracked
+# on purpose (pre-flight allows untracked files) — it is host state, not source.
+DEPLOYED_SHA_FILE="${REMOTE_REPO}/.bridge-deployed-sha"
 HETZNER_COMPOSE="-f docker/docker-compose.yml -f docker/docker-compose-platform-overlay.yml"
 SERVER2_COMPOSE="-f docker/docker-compose-prod.yml -f docker/docker-compose-prod-platform.yml"
 # Worker init on a fresh container is much slower than expected: container
@@ -167,16 +174,24 @@ dry_rssh() {
 SERVER=""
 SERVICES_ARG=()
 
+# Acknowledge that this deploy also ships commits authored by someone else
+# (see phase_foreign_commit_gate). Deliberately NOT defaulting to true and
+# deliberately not remembered anywhere: the whole point is that the decision is
+# made per deploy, by someone who checked.
+ACK_FOREIGN=false
+
 for arg in "$@"; do
     case "$arg" in
         --dry-run) DRY_RUN=true ;;
+        --ack-foreign) ACK_FOREIGN=true ;;
         hetzner|server2|both) SERVER="$arg" ;;
         *) SERVICES_ARG+=("$arg") ;;
     esac
 done
 
 if [[ -z "$SERVER" ]]; then
-    echo "Usage: bridge-deploy.sh <hetzner|server2|both> [service...] [--dry-run]" >&2
+    echo "Usage: bridge-deploy.sh <hetzner|server2|both> [service...] [--dry-run] [--ack-foreign]" >&2
+    echo "  --ack-foreign  proceed even though the deploy ships commits by other authors" >&2
     exit 1
 fi
 
@@ -275,6 +290,110 @@ phase_preflight() {
 # ============================================================================
 # Phase 2: Code update — sets global ROLLBACK_SHA
 # ============================================================================
+# ============================================================================
+# Phase 2a: Foreign-commit gate — never ship someone else's work unnoticed
+# ============================================================================
+# `git pull --ff-only origin develop` deploys the TIP of develop, i.e. every
+# commit on it — not just the ones the person running the deploy wrote. Several
+# sessions push to this branch in parallel, so a deploy routinely carries other
+# people's commits to production, silently. Observed 2026-07-30: a deploy of
+# four logging/observability fixes would also have shipped another session's
+# billing-pricing and registration changes; it was noticed only because an
+# unfamiliar rollback SHA happened to catch the eye.
+#
+# Nothing here is git's fault — later commits build on earlier ones, so the
+# coupling is real and cherry-picking around it would put a state on production
+# that exists in no branch. The fix is not to decouple but to make the coupling
+# VISIBLE and require a decision: fail fast, list exactly whose commits ride
+# along, and continue only on an explicit --ack-foreign.
+#
+# Deployer identity = local `git config user.name` (the same identity that
+# authors commits here). Unknown identity or an unreadable log means we cannot
+# make the judgement — and then we ask rather than assume, because assuming
+# "all mine" is the failure mode this gate exists to prevent.
+phase_foreign_commit_gate() {
+    local host="$1" checkout_sha="$2" to_sha="$3"
+
+    # Compare against what is RUNNING, not against the checkout. Those differ
+    # whenever someone fast-forwards the checkout without deploying — which is
+    # not hypothetical: on server2 the checkout stood two commits ahead of the
+    # images, so a checkout-based gate reported "clear" while the very commits
+    # it exists to surface were about to be built in. Fall back to the checkout
+    # only when no marker exists yet, and say so.
+    # Resolve the marker through git rev-parse: SHAs must be compared as commits,
+    # not as strings. A short SHA in the marker (hand-seeded, or copied from a
+    # log line) would otherwise never equal the 40-char checkout HEAD and fake a
+    # permanent "checkout is ahead" warning — a guard that cries wolf gets
+    # ignored, which is the one failure mode it cannot afford.
+    local from_sha raw_marker
+    raw_marker="$(rssh "$host" "cat ${DEPLOYED_SHA_FILE} 2>/dev/null || true" | tr -d '[:space:]')"
+    from_sha=""
+    if [[ -n "$raw_marker" ]]; then
+        from_sha="$(rssh "$host" "cd ${REMOTE_REPO} && git rev-parse --verify '${raw_marker}^{commit}' 2>/dev/null || true" | tr -d '[:space:]')"
+        if [[ -z "$from_sha" ]]; then
+            error_ "Deployed-SHA marker on ${host} is '${raw_marker}', which is not a commit in ${REMOTE_REPO}."
+            error_ "  Refusing to guess what is running. Fix or delete ${DEPLOYED_SHA_FILE} and re-run."
+            return 1
+        fi
+    fi
+    if [[ -z "$from_sha" ]]; then
+        from_sha="$checkout_sha"
+        warn "Foreign-commit gate: no deployed-SHA marker on ${host} yet — falling back to the"
+        warn "  checkout HEAD (${checkout_sha:0:7}). If the checkout was moved without deploying,"
+        warn "  commits already in it are invisible here. The marker is written after this deploy."
+    elif [[ "$from_sha" != "$checkout_sha" ]]; then
+        warn "Foreign-commit gate: checkout (${checkout_sha:0:7}) is ahead of what is deployed"
+        warn "  (${from_sha:0:7}) — someone pulled without deploying. Comparing against the"
+        warn "  DEPLOYED state, so those commits are included below."
+    fi
+
+    local deployer
+    deployer="$(git config user.name 2>/dev/null || true)"
+
+    local log_out
+    if ! log_out=$(rssh "$host" "cd ${REMOTE_REPO} && git log --no-merges --format='%h|%an|%s' ${from_sha}..${to_sha}"); then
+        error_ "Cannot list commits ${from_sha}..${to_sha} on ${host} — refusing to deploy blind."
+        error_ "  A deploy that cannot say WHAT it ships is exactly what this gate prevents."
+        return 1
+    fi
+
+    local foreign=()
+    local own_count=0
+    while IFS='|' read -r sha author subject; do
+        [[ -z "$sha" ]] && continue
+        if [[ -n "$deployer" && "$author" == "$deployer" ]]; then
+            own_count=$((own_count + 1))
+        else
+            foreign+=("${sha}  ${author}  ${subject}")
+        fi
+    done <<< "$log_out"
+
+    if [[ ${#foreign[@]} -eq 0 ]]; then
+        info "Foreign-commit gate: ${own_count} commit(s), all authored by '${deployer:-<unset>}' — clear"
+        return 0
+    fi
+
+    warn "This deploy also ships ${#foreign[@]} commit(s) NOT authored by '${deployer:-<unset, cannot classify>}':"
+    local line
+    for line in "${foreign[@]}"; do
+        warn "    ${line}"
+    done
+    [[ ${own_count} -gt 0 ]] && warn "  (plus ${own_count} of your own)"
+
+    if [[ "$ACK_FOREIGN" == "true" ]]; then
+        warn "  --ack-foreign given → proceeding with the commits listed above."
+        return 0
+    fi
+
+    error_ "ABORTED: refusing to ship other sessions' commits without an explicit decision."
+    error_ "  These are not necessarily unfinished — but only a human knows whether they are"
+    error_ "  ready for THIS environment. Verify with their author, then re-run with:"
+    error_ "      $(basename "${BASH_SOURCE[0]}") <server> --ack-foreign"
+    error_ "  Nothing was changed on ${host}: no pull, no build, no container touched."
+    error_ "  Still deployed: ${from_sha:0:7}   (checkout sits at ${checkout_sha:0:7})"
+    return 1
+}
+
 phase_code_update() {
     local host="$1"
     step "Phase 2: Code update ($host)"
@@ -297,6 +416,9 @@ phase_code_update() {
     fi
 
     info "Code: ${ROLLBACK_SHA} → ${remote_sha}"
+
+    phase_foreign_commit_gate "$host" "${ROLLBACK_SHA}" "${remote_sha}" || return 1
+
     dry_rssh "$host" "cd ${REMOTE_REPO} && git pull --ff-only origin develop" || {
         error_ "git pull --ff-only failed — cannot fast-forward to origin/develop"
         return 1
@@ -1140,6 +1262,14 @@ deploy_server() {
         local current_sha
         current_sha=$(rssh "$host" "cd ${REMOTE_REPO} && git rev-parse HEAD")
         info "Current SHA       : ${current_sha}"
+        # Record what was actually BUILT INTO THE IMAGES. The checkout HEAD is
+        # not a usable stand-in: it can be fast-forwarded out-of-band without a
+        # deploy, and then it claims code is live that no container contains —
+        # observed on server2, where the checkout sat two commits ahead of the
+        # running images. The foreign-commit gate compares against this marker,
+        # so it must be written by the only thing that knows: a finished deploy.
+        rssh "$host" "printf '%s\n' '${current_sha}' > ${DEPLOYED_SHA_FILE}" \
+            || warn "could not record deployed SHA on ${host} — the foreign-commit gate will fall back to the checkout HEAD next time"
         info "Container states  :"
         for svc in "${DEPLOYED_SERVICES[@]}"; do
             local c
