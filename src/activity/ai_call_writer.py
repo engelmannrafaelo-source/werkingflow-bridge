@@ -116,12 +116,24 @@ async def _deduct_call_cost(
         from src.budget.plans import find_plan_for_app
         from src.budget.routes import apply_budget_deduction, BudgetDeductionDenied
 
+        # Both exits below are CORRECT skips, but they are on the budget path:
+        # no deduction means the pre-call gate has nothing to gate against, so
+        # the reason has to be findable. Same rule as persist_ai_call_activity —
+        # a skip that leaves no trace is indistinguishable from a broken writer.
         plan = find_plan_for_app(app_id)
         if plan is None:
+            logger.debug(
+                "post-call deduction: app=%s not in the plan catalog — "
+                "not budget-tracked, no deduction for this call", app_id,
+            )
             return  # app not in the plan catalog — not budget-tracked
         try:
             uid = _uuid.UUID(user_id)
         except (ValueError, AttributeError, TypeError):
+            logger.warning(
+                "post-call deduction: user=%r is not a UUID (app=%s plan=%s) — "
+                "call NOT metered against any budget", user_id, app_id, plan.id,
+            )
             return
 
         if plan.interval == "project":
