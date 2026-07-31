@@ -210,7 +210,10 @@ async def run_research_cloud(
     system: List[Dict[str, Any]] = [
         {"type": "text", "text": system_prompt, "cache_control": {"type": "ephemeral"}}
     ]
-    messages: List[Dict[str, Any]] = [{"role": "user", "content": query}]
+    # base_messages = all COMPLETED turns (user query + per client-tool-round
+    # assistant/tool_result pairs); messages = base + in-progress assistant echo.
+    base_messages: List[Dict[str, Any]] = [{"role": "user", "content": query}]
+    messages: List[Dict[str, Any]] = list(base_messages)
     usage = ResearchCloudUsage()
     searches = fetches = library_calls = 0
     container_id: Optional[str] = None
@@ -286,11 +289,17 @@ async def run_research_cloud(
                 for tool_block in tool_use_blocks:
                     tool_results.append(await _handle_library_tool_call(tool_block, library_cfg))
                     library_calls += 1
-                messages = [
-                    {"role": "user", "content": query},
+                # The client tool_result ends this assistant turn — fold it into
+                # the retained history. Completed turns MUST stay in the request:
+                # a later server_tool_use (web_fetch) may reference a source tool
+                # (web_search) from an EARLIER turn, and the API 400s with
+                # "source tool ... not found" if that turn was dropped
+                # (live-verified job_a2c433bd, 2026-07-31).
+                base_messages = base_messages + [
                     {"role": "assistant", "content": parsed.content},
                     {"role": "user", "content": tool_results},
                 ]
+                messages = list(base_messages)
                 continue
 
             if parsed.stop_reason != "pause_turn":
@@ -299,10 +308,10 @@ async def run_research_cloud(
             # Do NOT append a synthetic "Continue" user turn — the API
             # detects the trailing server_tool_use block and resumes
             # automatically (shared/tool-use-concepts.md: Stop reasons for
-            # server-side tools). Re-send the original user turn + the
-            # assistant echo of what just came back.
-            messages = [
-                {"role": "user", "content": query},
+            # server-side tools). parsed.content is CUMULATIVE within the
+            # current assistant turn, so the in-progress turn is replaced,
+            # while all completed turns (base_messages) are kept.
+            messages = base_messages + [
                 {"role": "assistant", "content": parsed.content},
             ]
         else:

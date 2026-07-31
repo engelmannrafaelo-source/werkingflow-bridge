@@ -147,7 +147,11 @@ async def test_pause_turn_continuation_replays_user_and_assistant_only():
     _, second_kwargs = client.post.call_args_list[1]
     sent_messages = second_kwargs["json"]["messages"]
     assert len(sent_messages) == 2
-    assert sent_messages[0] == {"role": "user", "content": "the query"}
+    # Turn-history retention keeps the SAME user-message dict across
+    # iterations; _mark_cache_control wraps its string content into the
+    # equivalent single text block on the first pass.
+    assert sent_messages[0]["role"] == "user"
+    assert sent_messages[0]["content"] == [{"type": "text", "text": "the query"}]
     assert sent_messages[1]["role"] == "assistant"
     # _mark_cache_control stamps the last block before the second call — the
     # echoed content is otherwise the untouched parsed.content from turn 1.
@@ -420,3 +424,48 @@ async def test_library_tools_absent_from_request_when_disabled():
     _, kwargs = client.post.call_args
     tool_names = {t["name"] for t in kwargs["json"]["tools"]}
     assert tool_names == {"web_search", "web_fetch"}
+
+
+@pytest.mark.asyncio
+async def test_completed_library_turn_stays_in_history_for_later_continuations():
+    """Regression (live 400 job_a2c433bd, 2026-07-31): after a client library
+    round, later requests must still carry the completed earlier turns — a
+    subsequent server_tool_use (web_fetch) may reference a source tool
+    (web_search) from that earlier turn, and the API rejects the request with
+    "source tool ... not found" when the turn was dropped."""
+    client = MagicMock()
+    client.post = AsyncMock(
+        side_effect=[
+            _tool_use_response("library_index", {}),
+            _response(
+                200,
+                {
+                    "model": "claude-sonnet-5",
+                    "stop_reason": "pause_turn",
+                    "usage": _usage(),
+                    "content": [{"type": "text", "text": "second turn partial"}],
+                },
+            ),
+            _end_turn_response("final"),
+        ]
+    )
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(
+            "src.research_cloud.executor.fetch_library_index",
+            AsyncMock(return_value=_INDEX),
+        )
+        result = await run_research_cloud(
+            "query", "system", api_key="sk-test", client=client, library_config=_LIBRARY_CFG
+        )
+
+    assert result.content == "final"
+
+    _, third_kwargs = client.post.call_args_list[2]
+    sent = third_kwargs["json"]["messages"]
+    # [user query, assistant turn-1 (library tool_use), user tool_results,
+    #  assistant turn-2 (pause_turn snapshot)] — turn 1 must NOT be dropped.
+    assert [m["role"] for m in sent] == ["user", "assistant", "user", "assistant"]
+    assert sent[1]["content"][0]["type"] == "tool_use"
+    assert sent[2]["content"][0]["type"] == "tool_result"
+    assert sent[3]["content"][0]["text"] == "second turn partial"
