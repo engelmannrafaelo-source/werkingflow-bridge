@@ -6,9 +6,19 @@ specs/research-cloud-overflow/eval-research.py:path_c() (cache_control on the
 trailing content block — eval-verified factor-5 cost difference; container-id
 echo on every pause_turn continuation; max_tokens 20000) as a clean async
 executor with typed models instead of the eval script's throwaway dict shape.
+
+Additionally handles the two client-side library tools (library_index,
+library_get — specs/research-library-tool/DESIGN.md), flag-gated via
+RESEARCH_LIBRARY_ENABLED. Research (bridge-research.py, 2026-07-31,
+platform.claude.com/docs/en/build-with-claude/handling-stop-reasons):
+a response with a pending *client* tool_use always has stop_reason
+"tool_use", never "pause_turn", even when server_tool_use blocks are also
+present in the same response — so the pause_turn continuation branch below
+is untouched, and library tool calls are a second, independent branch.
 """
 from __future__ import annotations
 
+import json
 import logging
 import os
 import time
@@ -16,6 +26,14 @@ from typing import Any, Dict, List, Optional
 
 import httpx
 
+from src.research_cloud.library import (
+    LibraryConfig,
+    LibraryFetchError,
+    fetch_library_document,
+    fetch_library_index,
+    library_enabled,
+    load_library_config,
+)
 from src.research_cloud.models import (
     AnthropicMessagesResponse,
     ResearchCloudConfig,
@@ -27,6 +45,28 @@ logger = logging.getLogger(__name__)
 
 ANTHROPIC_API_URL = "https://api.anthropic.com/v1/messages"
 ANTHROPIC_VERSION = "2023-06-01"
+
+_LIBRARY_TOOL_NAMES = frozenset({"library_index", "library_get"})
+
+_LIBRARY_INDEX_TOOL: Dict[str, Any] = {
+    "name": "library_index",
+    "description": (
+        "Zeigt das Verzeichnis einer kuratierten, privaten Dokumentbibliothek "
+        "(Volltexte ausgewählter Quellen). Nutze library_get, um ein einzelnes "
+        "Dokument daraus als Volltext zu laden."
+    ),
+    "input_schema": {"type": "object", "properties": {}},
+}
+
+_LIBRARY_GET_TOOL: Dict[str, Any] = {
+    "name": "library_get",
+    "description": "Lädt den Volltext eines Dokuments aus der kuratierten Bibliothek anhand seiner id (siehe library_index).",
+    "input_schema": {
+        "type": "object",
+        "properties": {"id": {"type": "string", "description": "Dokument-id aus library_index"}},
+        "required": ["id"],
+    },
+}
 
 
 class ResearchCloudExecutorError(Exception):
@@ -60,11 +100,65 @@ def _mark_cache_control(messages: List[Dict[str, Any]]) -> None:
             break
 
 
-def _build_tools(config: ResearchCloudConfig) -> List[Dict[str, Any]]:
-    return [
+def _build_tools(config: ResearchCloudConfig, library_cfg: LibraryConfig) -> List[Dict[str, Any]]:
+    tools = [
         {"type": "web_search_20260209", "name": "web_search", "max_uses": config.web_search_max_uses},
         {"type": "web_fetch_20260209", "name": "web_fetch", "max_uses": config.web_fetch_max_uses},
     ]
+    if library_enabled(library_cfg):
+        tools.append(_LIBRARY_INDEX_TOOL)
+        tools.append(_LIBRARY_GET_TOOL)
+    return tools
+
+
+async def _handle_library_tool_call(block: Dict[str, Any], library_cfg: LibraryConfig) -> Dict[str, Any]:
+    """Execute one client-side library tool_use block. Fail-soft: any
+    LibraryFetchError (bad S3 config, unknown id, network error) becomes a
+    tool_result with is_error=True — the model sees the failure and can
+    continue the research without that document, the run never aborts."""
+    name = block.get("name")
+    tool_use_id = block.get("id")
+    try:
+        if name == "library_index":
+            index = await fetch_library_index(library_cfg)
+            return {
+                "type": "tool_result",
+                "tool_use_id": tool_use_id,
+                "content": [{"type": "text", "text": json.dumps(index, ensure_ascii=False)}],
+            }
+        if name == "library_get":
+            doc_id = (block.get("input") or {}).get("id")
+            if not doc_id:
+                raise LibraryFetchError("library_get called without an 'id'")
+            doc = await fetch_library_document(doc_id, library_cfg)
+            entry = doc["entry"]
+            source = entry.get("source_url") or entry.get("publisher") or doc_id
+            title = entry.get("title") or doc_id
+            return {
+                "type": "tool_result",
+                "tool_use_id": tool_use_id,
+                # search_result content block (build-with-claude/search-results,
+                # "Method 1: from tool calls") — source/title carry the
+                # institution, not "the tool", into the model's citations.
+                "content": [
+                    {
+                        "type": "search_result",
+                        "source": source,
+                        "title": title,
+                        "content": [{"type": "text", "text": doc["text"]}],
+                        "citations": {"enabled": True},
+                    }
+                ],
+            }
+        raise LibraryFetchError(f"unknown library tool: {name!r}")
+    except LibraryFetchError as e:
+        logger.warning(f"research-cloud: library tool {name!r} failed (fail-soft): {e}")
+        return {
+            "type": "tool_result",
+            "tool_use_id": tool_use_id,
+            "content": [{"type": "text", "text": str(e)}],
+            "is_error": True,
+        }
 
 
 async def run_research_cloud(
@@ -74,6 +168,7 @@ async def run_research_cloud(
     config: Optional[ResearchCloudConfig] = None,
     api_key: Optional[str] = None,
     client: Optional[httpx.AsyncClient] = None,
+    library_config: Optional[LibraryConfig] = None,
 ) -> ResearchCloudResult:
     """Run one research-cloud job to completion (all pause_turn continuations).
 
@@ -110,13 +205,14 @@ async def run_research_cloud(
         "x-api-key": api_key,
         "anthropic-version": ANTHROPIC_VERSION,
     }
-    tools = _build_tools(config)
+    library_cfg = library_config or load_library_config()
+    tools = _build_tools(config, library_cfg)
     system: List[Dict[str, Any]] = [
         {"type": "text", "text": system_prompt, "cache_control": {"type": "ephemeral"}}
     ]
     messages: List[Dict[str, Any]] = [{"role": "user", "content": query}]
     usage = ResearchCloudUsage()
-    searches = fetches = 0
+    searches = fetches = library_calls = 0
     container_id: Optional[str] = None
     iteration = 0
     t0 = time.monotonic()
@@ -169,6 +265,34 @@ async def run_research_cloud(
                     elif block.get("name") == "web_fetch":
                         fetches += 1
 
+            if parsed.stop_reason == "tool_use":
+                # A pending client tool_use always yields stop_reason
+                # "tool_use", never "pause_turn" — even if server_tool_use
+                # blocks are also present in this same response (bridge-research
+                # 2026-07-31, platform.claude.com/docs/.../handling-stop-reasons).
+                # The only client tools this executor defines are the library
+                # ones; anything else is an unhandled tool the model was never
+                # given (fail loud, not a silent skip).
+                tool_use_blocks = [
+                    b for b in parsed.content
+                    if b.get("type") == "tool_use" and b.get("name") in _LIBRARY_TOOL_NAMES
+                ]
+                if not tool_use_blocks:
+                    raise ResearchCloudExecutorError(
+                        f"research-cloud executor got stop_reason=tool_use with no "
+                        f"recognized tool_use block in content: {parsed.content!r}"
+                    )
+                tool_results = []
+                for tool_block in tool_use_blocks:
+                    tool_results.append(await _handle_library_tool_call(tool_block, library_cfg))
+                    library_calls += 1
+                messages = [
+                    {"role": "user", "content": query},
+                    {"role": "assistant", "content": parsed.content},
+                    {"role": "user", "content": tool_results},
+                ]
+                continue
+
             if parsed.stop_reason != "pause_turn":
                 break
 
@@ -184,7 +308,7 @@ async def run_research_cloud(
         else:
             raise ResearchCloudExecutorError(
                 f"research-cloud executor exceeded max_continuations="
-                f"{config.max_continuations} without finishing (still pause_turn)"
+                f"{config.max_continuations} without finishing (still {parsed.stop_reason})"
             )
     finally:
         if owns_client:
@@ -201,6 +325,7 @@ async def run_research_cloud(
         usage=usage,
         searches=searches,
         fetches=fetches,
+        library_calls=library_calls,
         iterations=iteration + 1,
         stop_reason=parsed.stop_reason,
         duration_seconds=round(duration, 2),

@@ -4181,6 +4181,7 @@ async def _execute_research_cloud_impl(
     """
     from src.research_cloud.anonymize_gate import CloudAnonymizeError, anonymize_query_for_cloud
     from src.research_cloud.executor import ResearchCloudExecutorError, run_research_cloud
+    from src.research_cloud.library import library_enabled, load_library_config
     from src.research_cloud.models import ResearchCloudConfig
     from src.research_cloud.pricing_tiers import customer_price_eur
     from src.research_cloud.prompt import build_system_prompt, search_budget_for_depth
@@ -4215,12 +4216,13 @@ async def _execute_research_cloud_impl(
     except Exception as _oa_err:
         logger.warning(f"research-cloud: OA-Scholarly-Schicht übersprungen (fail-soft): {_oa_err}")
 
-    system_prompt = build_system_prompt(request_body.depth)
+    library_cfg = load_library_config()
+    system_prompt = build_system_prompt(request_body.depth, library_enabled=library_enabled(library_cfg))
     search_max_uses, fetch_max_uses = search_budget_for_depth(request_body.depth)
     config = ResearchCloudConfig(web_search_max_uses=search_max_uses, web_fetch_max_uses=fetch_max_uses)
 
     try:
-        result = await run_research_cloud(prompt, system_prompt, config=config)
+        result = await run_research_cloud(prompt, system_prompt, config=config, library_config=library_cfg)
     except ResearchCloudExecutorError as e:
         execution_time = time.time() - start_time
         logger.error(f"research-cloud: executor failed: {e}", exc_info=True)

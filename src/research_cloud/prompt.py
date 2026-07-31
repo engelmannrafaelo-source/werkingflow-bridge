@@ -22,6 +22,16 @@ Schreibe einen strukturierten Markdown-Report:
 
 Erfinde keine Zahlen, Quellen oder Fakten. Wenn eine Information nicht auffindbar ist, sag das offen."""
 
+# Generic, non-prescriptive mention (DESIGN.md Leitplanken: "1-2 generische
+# Sätze", keine Themen-Patterns/Keyword-Routing) — appended only when the
+# library tools are actually in the request's tool list, so the model is
+# never told about a tool it can't call.
+LIBRARY_NOTE = (
+    "\n\nZusätzlich steht dir eine kuratierte, private Dokumentbibliothek zur Verfügung "
+    "(Tools library_index/library_get) — sieh dir ihr Verzeichnis an und lade daraus, was für "
+    "die Anfrage relevant ist."
+)
+
 _DEPTH_INSTRUCTION = {
     "quick": "knapp und fokussiert (1-2 zentrale Quellen reichen)",
     "standard": "in üblicher Tiefe (mehrere Quellen, 2-3 Recherche-Hops)",
@@ -39,9 +49,12 @@ _FETCH_MAX_USES = {"quick": 3, "standard": 6, "deep": 10, "exhaustive": 15}
 _DEFAULT_DEPTH = "standard"
 
 
-def build_system_prompt(depth: Optional[str]) -> str:
+def build_system_prompt(depth: Optional[str], library_enabled: bool = False) -> str:
     depth_key = depth if depth in _DEPTH_INSTRUCTION else _DEFAULT_DEPTH
-    return SYSTEM_PROMPT_TEMPLATE.format(depth_instruction=_DEPTH_INSTRUCTION[depth_key])
+    prompt = SYSTEM_PROMPT_TEMPLATE.format(depth_instruction=_DEPTH_INSTRUCTION[depth_key])
+    if library_enabled:
+        prompt += LIBRARY_NOTE
+    return prompt
 
 
 def search_budget_for_depth(depth: Optional[str]) -> Tuple[int, int]:

@@ -36,6 +36,7 @@ class ResearchCloudResult(BaseModel):
     usage: ResearchCloudUsage = Field(default_factory=ResearchCloudUsage)
     searches: int = 0
     fetches: int = 0
+    library_calls: int = 0
     iterations: int = 0
     stop_reason: Optional[str] = None
     duration_seconds: float = 0.0
