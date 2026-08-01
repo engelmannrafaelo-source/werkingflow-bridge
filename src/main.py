@@ -4275,6 +4275,7 @@ async def _execute_research_cloud_impl(
             provider_meta={
                 "searches": result.searches,
                 "fetches": result.fetches,
+                "library_calls": result.library_calls,
                 "iterations": result.iterations,
                 "container_id": result.container_id,
                 "stop_reason": result.stop_reason,
@@ -4311,6 +4312,9 @@ async def _execute_research_cloud_impl(
         content=result.content,
         execution_time_seconds=result.duration_seconds,
         error=None,
+        web_searches=result.searches,
+        web_fetches=result.fetches,
+        library_calls=result.library_calls,
     )
 
 

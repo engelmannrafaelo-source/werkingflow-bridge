@@ -385,7 +385,7 @@ async def test_unrecognized_client_tool_use_fails_loud():
     client = MagicMock()
     client.post = AsyncMock(return_value=_tool_use_response("some_other_tool", {}))
 
-    with pytest.raises(ResearchCloudExecutorError, match="no recognized tool_use block"):
+    with pytest.raises(ResearchCloudExecutorError, match="cannot answer client tools"):
         await run_research_cloud(
             "query", "system", api_key="sk-test", client=client, library_config=_LIBRARY_CFG
         )
@@ -488,3 +488,76 @@ def test_build_tools_forces_direct_callers_when_library_enabled():
     tools_off = _build_tools(cfg, LibraryConfig())
     web_off = [t for t in tools_off if t.get("type", "").startswith("web_")]
     assert all("allowed_callers" not in t for t in web_off)
+
+
+@pytest.mark.asyncio
+async def test_foreign_client_tool_fails_loud_before_api_roundtrip():
+    """A client tool_use for a tool this executor never defined must raise
+    immediately (naming the tool) — answering only the library tools would
+    otherwise surface later as an opaque API 400 about missing tool_results."""
+    client = MagicMock()
+    client.post = AsyncMock(
+        return_value=_response(
+            200,
+            {
+                "model": "claude-sonnet-5",
+                "stop_reason": "tool_use",
+                "usage": _usage(),
+                "content": [
+                    {"type": "tool_use", "id": "tu1", "name": "library_index", "input": {}},
+                    {"type": "tool_use", "id": "tu2", "name": "run_command", "input": {"command": "ls"}},
+                ],
+            },
+        )
+    )
+
+    with pytest.raises(ResearchCloudExecutorError, match="run_command"):
+        await run_research_cloud(
+            "query", "system", api_key="sk-test", client=client, library_config=_LIBRARY_CFG
+        )
+    assert client.post.call_count == 1
+
+
+@pytest.mark.asyncio
+async def test_programmatic_caller_fails_loud():
+    """caller != direct means paused code in a server container whose id the
+    API does not expose in this flow — refusing beats an undebuggable 400
+    ('container_id is required...') two requests later."""
+    client = MagicMock()
+    client.post = AsyncMock(
+        return_value=_response(
+            200,
+            {
+                "model": "claude-sonnet-5",
+                "stop_reason": "tool_use",
+                "usage": _usage(),
+                "content": [
+                    {
+                        "type": "tool_use", "id": "tu1", "name": "library_get",
+                        "input": {"id": "doc"},
+                        "caller": {"type": "code_execution_20260120", "tool_id": "srv1"},
+                    },
+                ],
+            },
+        )
+    )
+
+    with pytest.raises(ResearchCloudExecutorError, match="non-direct"):
+        await run_research_cloud(
+            "query", "system", api_key="sk-test", client=client, library_config=_LIBRARY_CFG
+        )
+
+
+def test_build_tools_returns_copies_of_library_tool_dicts():
+    """Mutating a returned tool entry must never bleed into the module-level
+    templates (shared-global corruption across requests)."""
+    from src.research_cloud.executor import _LIBRARY_INDEX_TOOL
+
+    cfg = ResearchCloudConfig()
+    tools = _build_tools(cfg, _LIBRARY_CFG)
+    lib_index = next(t for t in tools if t.get("name") == "library_index")
+    lib_index["cache_control"] = {"type": "ephemeral"}
+    lib_index["input_schema"]["properties"]["injected"] = True
+
+    assert "cache_control" not in _LIBRARY_INDEX_TOOL
+    assert "injected" not in _LIBRARY_INDEX_TOOL["input_schema"]["properties"]

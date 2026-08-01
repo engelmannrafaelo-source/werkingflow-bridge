@@ -18,6 +18,7 @@ is untouched, and library tool calls are a second, independent branch.
 """
 from __future__ import annotations
 
+import copy
 import json
 import logging
 import os
@@ -69,6 +70,25 @@ _LIBRARY_GET_TOOL: Dict[str, Any] = {
 }
 
 
+def _log_library_call(block: Dict[str, Any], result: Dict[str, Any], seconds: float) -> None:
+    """One INFO line per library tool call — the only place tool usage is
+    observable outside the model transcript (the jobs projection carries the
+    aggregate counter, not the per-call detail)."""
+    name = block.get("name")
+    doc_id = (block.get("input") or {}).get("id", "")
+    is_error = bool(result.get("is_error"))
+    size = sum(
+        len(c.get("text", "")) if c.get("type") == "text"
+        else sum(len(cc.get("text", "")) for cc in c.get("content", []))
+        for c in result.get("content", [])
+        if isinstance(c, dict)
+    )
+    logger.info(
+        f"research-cloud library call: {name}({doc_id!r}) -> "
+        f"{'ERROR' if is_error else 'ok'}, {size} chars, {seconds*1000:.0f}ms"
+    )
+
+
 class ResearchCloudExecutorError(Exception):
     """Fail-loud: the cloud executor refuses to run, or the API call errors.
 
@@ -118,8 +138,11 @@ def _build_tools(config: ResearchCloudConfig, library_cfg: LibraryConfig) -> Lis
         # deterministic, and per docs also the ZDR-eligible configuration.
         for t in tools:
             t["allowed_callers"] = ["direct"]
-        tools.append(_LIBRARY_INDEX_TOOL)
-        tools.append(_LIBRARY_GET_TOOL)
+        # Copies, not the module-level dicts: anything downstream that mutates
+        # a tool entry (marker stamping, future per-request tweaks) must never
+        # bleed into other requests via shared globals.
+        tools.append(copy.deepcopy(_LIBRARY_INDEX_TOOL))
+        tools.append(copy.deepcopy(_LIBRARY_GET_TOOL))
     return tools
 
 
@@ -288,19 +311,43 @@ async def run_research_cloud(
                 # The only client tools this executor defines are the library
                 # ones; anything else is an unhandled tool the model was never
                 # given (fail loud, not a silent skip).
-                tool_use_blocks = [
-                    b for b in parsed.content
-                    if b.get("type") == "tool_use" and b.get("name") in _LIBRARY_TOOL_NAMES
-                ]
+                tool_use_blocks = [b for b in parsed.content if b.get("type") == "tool_use"]
                 if not tool_use_blocks:
                     raise ResearchCloudExecutorError(
-                        f"research-cloud executor got stop_reason=tool_use with no "
-                        f"recognized tool_use block in content: {parsed.content!r}"
+                        "research-cloud executor got stop_reason=tool_use with no "
+                        f"client tool_use block in content: {parsed.content!r}"
+                    )
+                # Fail fast on anything we cannot answer — an unanswered
+                # client tool_use would otherwise surface later as an opaque
+                # API 400 ("tool_use ids were found without tool_result").
+                foreign = [b.get("name") for b in tool_use_blocks if b.get("name") not in _LIBRARY_TOOL_NAMES]
+                if foreign:
+                    raise ResearchCloudExecutorError(
+                        f"research-cloud executor cannot answer client tools {foreign!r} — "
+                        f"only {sorted(_LIBRARY_TOOL_NAMES)} are defined on this request"
+                    )
+                # Programmatic tool calling (caller != direct) would mean the
+                # call comes from paused code in a server-side container whose
+                # id we would have to echo back — a flow this executor
+                # deliberately disables via allowed_callers=["direct"]. If it
+                # shows up anyway, the API contract changed: stop loudly.
+                ptc = [
+                    b.get("name") for b in tool_use_blocks
+                    if (b.get("caller") or {}).get("type") not in (None, "direct")
+                ]
+                if ptc:
+                    raise ResearchCloudExecutorError(
+                        f"research-cloud executor got programmatic (non-direct) tool calls "
+                        f"{ptc!r} despite allowed_callers=['direct'] — refusing to continue "
+                        f"a container flow whose id the API did not expose"
                     )
                 tool_results = []
                 for tool_block in tool_use_blocks:
-                    tool_results.append(await _handle_library_tool_call(tool_block, library_cfg))
+                    t_start = time.monotonic()
+                    tool_result = await _handle_library_tool_call(tool_block, library_cfg)
                     library_calls += 1
+                    _log_library_call(tool_block, tool_result, time.monotonic() - t_start)
+                    tool_results.append(tool_result)
                 # The client tool_result ends this assistant turn — fold it into
                 # the retained history. Completed turns MUST stay in the request:
                 # a later server_tool_use (web_fetch) may reference a source tool

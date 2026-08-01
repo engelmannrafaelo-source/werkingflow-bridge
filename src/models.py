@@ -495,6 +495,21 @@ class ResearchResponse(BaseModel):
         default=None,
         description="Async job ID (only set when async_mode=true). Use GET /v1/research/async/{request_id} to poll."
     )
+    # research-cloud-only Beobachtbarkeit (None auf dem Worker-Pool-Pfad):
+    # macht Tool-Nutzung pro Lauf pruefbar (Eval/Abnahme), statt sie aus dem
+    # Report-Text erraten zu muessen.
+    web_searches: Optional[int] = Field(
+        default=None,
+        description="research-cloud only: number of web_search tool calls in this run"
+    )
+    web_fetches: Optional[int] = Field(
+        default=None,
+        description="research-cloud only: number of web_fetch tool calls in this run"
+    )
+    library_calls: Optional[int] = Field(
+        default=None,
+        description="research-cloud only: number of curated-library tool calls (library_index/library_get)"
+    )
 
 
 class DocAgentFile(BaseModel):
