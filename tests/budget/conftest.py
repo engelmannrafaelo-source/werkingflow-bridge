@@ -23,8 +23,9 @@ def _seed_plans():
 
     PLANS is DB-backed (migration 020) and normally filled by reload_plans() at
     Bridge startup. Tests have no DB, so we seed the canonical plan set from
-    migration 020_plans_table.sql. Autouse so every budget test can call
-    get_plan()/find_trial_plan_for()/find_plan_for_app() without a live DB.
+    migration 020_plans_table.sql as amended by later plan migrations (045:
+    report-standard api_budget_eur 50 -> 100). Autouse so every budget test can
+    call get_plan()/find_trial_plan_for()/find_plan_for_app() without a live DB.
     """
     from src.budget.plans import PLANS, PlanConfig
 
@@ -34,7 +35,7 @@ def _seed_plans():
             interval="month", api_budget_eur=5, description="", trial=True),
         "report-standard": PlanConfig(
             id="report-standard", app_id="werking-report", name="Standard", price=250,
-            interval="month", api_budget_eur=50, description="", trial=False),
+            interval="month", api_budget_eur=100, description="", trial=False),
         "energy-project": PlanConfig(
             id="energy-project", app_id="werking-energy", name="Energy-Projekt", price=1000,
             interval="project", api_budget_eur=100, description="", trial=False),

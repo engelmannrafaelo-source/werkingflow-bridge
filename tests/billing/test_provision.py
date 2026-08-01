@@ -201,7 +201,7 @@ class TestProvisionSubscriptionService:
         entry_json_arg = conn.execute.call_args[0][2]
         entry = _json.loads(entry_json_arg)
         assert "report-standard" in entry
-        assert entry["report-standard"]["limitEur"] == 50.0  # from plans.py
+        assert entry["report-standard"]["limitEur"] == 100.0  # plans table (migration 045)
         assert entry["report-standard"]["usedEur"] == 0.0
 
 
