@@ -53,7 +53,22 @@ def _row_to_job(row) -> Dict[str, Any]:
         "heartbeat_at": row["heartbeat_at"],
         "created_at": row["created_at"],
         "updated_at": row["updated_at"],
+        # Dependency-deferral columns (migration 044). Read defensively ONLY for
+        # the rollout window in which the new image can be live for a moment
+        # before the migration has been applied: without this, every job read
+        # would KeyError. Absent column → "never deferred", which is exactly the
+        # pre-044 behaviour, so nothing silently changes semantics.
+        "deferred_until": _col(row, "deferred_until"),
+        "defer_count": _col(row, "defer_count", 0),
+        "defer_reason": _col(row, "defer_reason"),
     }
+
+
+def _col(row, name: str, default: Any = None) -> Any:
+    try:
+        return row[name]
+    except (KeyError, IndexError):
+        return default
 
 
 async def create_job(
@@ -171,6 +186,43 @@ async def cleanup_old(ttl_seconds: int) -> int:
 _STALE_SINCE = "COALESCE(heartbeat_at, created_at)"
 
 
+# A job waiting on a dependency must not be claimable until its wait expires.
+# Pre-existing rows have deferred_until IS NULL and are unaffected.
+_NOT_DEFERRED = "(deferred_until IS NULL OR deferred_until <= NOW())"
+
+# The crash-retry budget is evaluated on starts that were NOT dependency waits,
+# so waiting out a long outage never consumes it (see migration 044).
+_CRASH_ATTEMPTS = "(attempts - defer_count)"
+
+
+async def defer_job(job_id: str, delay_seconds: int, reason: str) -> None:
+    """Park a job until `delay_seconds` from now because a DEPENDENCY was
+    unreachable — not because the job or the worker failed.
+
+    Returns it to 'pending' so the existing watchdog picks it up again once
+    `deferred_until` passes. Bumps defer_count (which the retry cap subtracts
+    out) so an outage of any length cannot exhaust the crash budget, while a
+    bounded defer_count still guarantees eventual fail-loud.
+    """
+    pool = get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            UPDATE ai_jobs
+               SET status = 'pending',
+                   deferred_until = NOW() + ($2 || ' seconds')::interval,
+                   defer_count = defer_count + 1,
+                   defer_reason = $3,
+                   heartbeat_at = NOW(),
+                   updated_at = NOW()
+             WHERE job_id = $1
+            """,
+            job_id,
+            str(delay_seconds),
+            reason[:500],
+        )
+
+
 async def claim_stale_job(stale_seconds: int, max_attempts: int) -> Optional[Dict[str, Any]]:
     """Atomically claim ONE stale-but-retryable job for requeue and return it
     (now status='running', attempts bumped). Returns None when none are claimable.
@@ -179,7 +231,10 @@ async def claim_stale_job(stale_seconds: int, max_attempts: int) -> Optional[Dic
     workers run the watchdog at once, each claims a DIFFERENT row — never the same
     job twice (which would mean paying for the same call twice). Covers both
     'pending' (never started) and 'running' (worker died mid-run); the retry cap
-    is enforced here so an unrecoverable job is left for find_abandoned()."""
+    is enforced here so an unrecoverable job is left for find_abandoned().
+
+    Dependency-deferred jobs are skipped until their wait expires, and their
+    waits are subtracted from the retry cap (see migration 044)."""
     pool = get_pool()
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
@@ -191,7 +246,8 @@ async def claim_stale_job(stale_seconds: int, max_attempts: int) -> Optional[Dic
                  SELECT job_id FROM ai_jobs
                   WHERE status IN ('pending', 'running')
                     AND {_STALE_SINCE} < NOW() - ($1 || ' seconds')::interval
-                    AND attempts < $2
+                    AND {_CRASH_ATTEMPTS} < $2
+                    AND {_NOT_DEFERRED}
                   ORDER BY {_STALE_SINCE} ASC
                   FOR UPDATE SKIP LOCKED
                   LIMIT 1
@@ -206,7 +262,11 @@ async def claim_stale_job(stale_seconds: int, max_attempts: int) -> Optional[Dic
 
 async def find_abandoned(stale_seconds: int, max_attempts: int) -> List[Dict[str, Any]]:
     """Stale jobs (pending OR running) that have EXHAUSTED their retry budget —
-    the watchdog fails these loud ('error') so nothing sits non-terminal forever."""
+    the watchdog fails these loud ('error') so nothing sits non-terminal forever.
+
+    A job still inside its dependency wait is NOT abandoned — it is waiting on
+    purpose. Its own bound is defer_count (enforced by the runner), so excluding
+    it here cannot make it immortal."""
     pool = get_pool()
     async with pool.acquire() as conn:
         rows = await conn.fetch(
@@ -214,7 +274,8 @@ async def find_abandoned(stale_seconds: int, max_attempts: int) -> List[Dict[str
             SELECT * FROM ai_jobs
              WHERE status IN ('pending', 'running')
                AND {_STALE_SINCE} < NOW() - ($1 || ' seconds')::interval
-               AND attempts >= $2
+               AND {_CRASH_ATTEMPTS} >= $2
+               AND {_NOT_DEFERRED}
              LIMIT 50
             """,
             str(stale_seconds),

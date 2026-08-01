@@ -110,11 +110,20 @@ class _FakeTrackCall:
 
 
 def _privacy_client_ctx(response):
-    """Return a mock privacy_client whose _get_client() gives an async ctx manager."""
+    """Return a mock privacy_client that answers with `response`.
+
+    Endpoints call privacy_client.post()/.get() directly — that wrapper owns the
+    unreachable-policy (dev fallback / PrivacyServiceUnavailable), so it is the
+    seam to fake. _get_client() is still stubbed for any caller that reaches for
+    the raw httpx client.
+    """
     inner_client = AsyncMock()
+    inner_client.request = AsyncMock(return_value=response)
     inner_client.post = AsyncMock(return_value=response)
     pc = AsyncMock()
     pc._get_client = AsyncMock(return_value=inner_client)
+    pc.post = AsyncMock(return_value=response)
+    pc.get = AsyncMock(return_value=response)
     pc.track_call = MagicMock(return_value=_FakeTrackCall())
     return pc
 
@@ -155,6 +164,9 @@ class TestSmartAnonymizeTracking:
         mock_persist = AsyncMock()
         pc = AsyncMock()
         pc._get_client = AsyncMock(side_effect=RuntimeError("privacy-service down"))
+        # Endpoints call privacy_client.post(); inject there too, else the
+        # auto-Mock would "succeed" and this error test would pass vacuously.
+        pc.post = AsyncMock(side_effect=RuntimeError("privacy-service down"))
 
         with (
             patch("src.main.get_privacy_client", return_value=pc),
@@ -268,6 +280,9 @@ class TestConvertHtmlToPdfTracking:
         mock_persist = AsyncMock()
         pc = AsyncMock()
         pc._get_client = AsyncMock(side_effect=RuntimeError("chromium crashed"))
+        # Endpoints call privacy_client.post(); inject there too, else the
+        # auto-Mock would "succeed" and this error test would pass vacuously.
+        pc.post = AsyncMock(side_effect=RuntimeError("chromium crashed"))
 
         mock_request = AsyncMock()
         mock_request.json = AsyncMock(return_value={"html": "<p>hi</p>"})
@@ -354,6 +369,9 @@ class TestConvertHtmlToScreenshotTracking:
         mock_persist = AsyncMock()
         pc = AsyncMock()
         pc._get_client = AsyncMock(side_effect=RuntimeError("chromium timeout"))
+        # Endpoints call privacy_client.post(); inject there too, else the
+        # auto-Mock would "succeed" and this error test would pass vacuously.
+        pc.post = AsyncMock(side_effect=RuntimeError("chromium timeout"))
 
         mock_request = AsyncMock()
         mock_request.json = AsyncMock(return_value={"html": "<p>hi</p>"})

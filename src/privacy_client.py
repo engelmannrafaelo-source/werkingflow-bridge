@@ -63,6 +63,41 @@ def privacy_timeout(read_s: float = PRIVACY_DEFAULT_READ_TIMEOUT_S) -> httpx.Tim
     )
 
 
+# Optional SECOND privacy service, used ONLY when the primary cannot be
+# REACHED (transport-level). Unset = no fallback, which is the safe default
+# and the required setting in production.
+#
+# Policy (Rafael, 2026-08-01):
+#   dev  — set this to the local container (http://privacy-service:8100) so a
+#          GPU-host outage degrades instead of blocking development.
+#   prod — leave UNSET. Production has exactly one detector (the GPU host);
+#          if it is down the work is DEFERRED (durable job), never silently
+#          run through a different detector.
+#
+# Why prod must not fall back: the primary is a GPU-backed Flair/Presidio
+# stack and the local container is a CPU one. They do not detect identically,
+# so a silent failover would change WHICH PII gets pseudonymized — a GDPR
+# outcome change disguised as availability. Deferring keeps detection quality
+# fixed and only costs latency. In dev the inputs are test data, so the
+# trade-off flips and a loud degrade beats a hard block.
+PRIVACY_FALLBACK_URL = os.getenv("PRIVACY_SERVICE_FALLBACK_URL", "").strip()
+
+
+class PrivacyServiceUnavailable(RuntimeError):
+    """The privacy service could not be REACHED — no endpoint answered.
+
+    Deliberately distinct from "the service answered with an error": this is
+    the only condition where retrying later (or, in dev, retrying elsewhere)
+    can help, and the only one a durable job may be deferred on. Callers must
+    not collapse it into a generic 500 — that is precisely what turned the
+    2026-08-01 dependency outage into a phantom "bridge at capacity".
+    """
+
+    def __init__(self, message: str, *, tried: Optional[List[str]] = None):
+        super().__init__(message)
+        self.tried = tried or []
+
+
 class PrivacyServiceClient:
     """
     HTTP client for privacy-service. Handles anonymization via HTTP
@@ -71,9 +106,11 @@ class PrivacyServiceClient:
 
     def __init__(self):
         self.base_url = PRIVACY_SERVICE_URL
+        self.fallback_url = PRIVACY_FALLBACK_URL
         self.enabled = os.getenv("PRIVACY_ENABLED", "false").lower() in ("true", "1", "yes", "on")
         self.language = os.getenv("PRIVACY_LANGUAGE", "de")
         self._client: Optional[httpx.AsyncClient] = None
+        self._fallback_client: Optional[httpx.AsyncClient] = None
         # In-process concurrency gauge for calls into the (single-worker,
         # UVICORN_WORKERS=1) privacy-pdf-service container — the actual
         # capacity bottleneck of the document/anonymize pipeline. Scoped to
@@ -89,6 +126,70 @@ class PrivacyServiceClient:
                 timeout=privacy_timeout(),
             )
         return self._client
+
+    async def _get_fallback_client(self) -> Optional[httpx.AsyncClient]:
+        if not self.fallback_url:
+            return None
+        if self._fallback_client is None or self._fallback_client.is_closed:
+            self._fallback_client = httpx.AsyncClient(
+                base_url=self.fallback_url,
+                timeout=privacy_timeout(),
+            )
+        return self._fallback_client
+
+    async def request(self, method: str, path: str, **kwargs) -> httpx.Response:
+        """Call the privacy service, with the configured unreachable-policy.
+
+        Returns the raw httpx.Response so callers keep surfacing upstream
+        status codes 1:1 (415/413/... must stay visible).
+
+        ONLY transport failures (httpx.TransportError — connect refused,
+        unroutable host, connect timeout) trigger the fallback. An HTTP error
+        response means the service is alive and answering: that is its verdict
+        and it is returned unchanged, never second-guessed by a retry against
+        a different detector.
+
+        Raises PrivacyServiceUnavailable when no configured endpoint could be
+        reached, so callers can defer/queue instead of guessing from a 500.
+        """
+        tried: List[str] = []
+        try:
+            client = await self._get_client()
+            return await client.request(method, path, **kwargs)
+        except httpx.TransportError as primary_exc:
+            tried.append(self.base_url)
+            fallback = await self._get_fallback_client()
+            if fallback is None:
+                raise PrivacyServiceUnavailable(
+                    f"privacy service unreachable at {self.base_url}: {primary_exc}",
+                    tried=tried,
+                ) from primary_exc
+
+            # Loud on purpose: a fallback hop means PII is being processed by a
+            # different detector than the one this deployment is tuned for.
+            # It must be greppable after the fact, never a silent substitution.
+            logger.warning(
+                "⚠️ PRIVACY FALLBACK: primary %s unreachable (%s) — retrying %s %s "
+                "against fallback %s. Detection quality may differ; this must "
+                "never be configured in production.",
+                self.base_url, primary_exc, method, path, self.fallback_url,
+            )
+            try:
+                return await fallback.request(method, path, **kwargs)
+            except httpx.TransportError as fallback_exc:
+                tried.append(self.fallback_url)
+                raise PrivacyServiceUnavailable(
+                    f"privacy service unreachable at {self.base_url} "
+                    f"({primary_exc}) and fallback {self.fallback_url} "
+                    f"({fallback_exc})",
+                    tried=tried,
+                ) from fallback_exc
+
+    async def post(self, path: str, **kwargs) -> httpx.Response:
+        return await self.request("POST", path, **kwargs)
+
+    async def get(self, path: str, **kwargs) -> httpx.Response:
+        return await self.request("GET", path, **kwargs)
 
     @asynccontextmanager
     async def track_call(self) -> AsyncIterator[int]:

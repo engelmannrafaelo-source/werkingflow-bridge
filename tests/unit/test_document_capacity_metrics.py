@@ -188,7 +188,12 @@ class TestConvertPdfEndpointFeedsCapacityMetrics:
             return resp
 
         inner_client = AsyncMock()
-        inner_client.post = AsyncMock(side_effect=fake_post)
+        # Seam: endpoints call PrivacyServiceClient.post(), which dispatches via
+        # the httpx client's generic .request() so the unreachable-policy
+        # (fallback / PrivacyServiceUnavailable) lives in ONE place. Faking
+        # .post() here would leave .request() an auto-Mock, fake_post would never
+        # run, and this test would deadlock on first_call_started.
+        inner_client.request = AsyncMock(side_effect=fake_post)
         inner_client.is_closed = False  # else _get_client() sees a truthy Mock and swaps in a real httpx.AsyncClient
         real_privacy_client._client = inner_client
 

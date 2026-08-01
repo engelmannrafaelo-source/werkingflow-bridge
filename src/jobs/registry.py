@@ -48,6 +48,46 @@ HEARTBEAT_INTERVAL_S = 15
 # Safety cap on how many stale jobs one watchdog pass requeues (back-pressure).
 WATCHDOG_MAX_REQUEUE_PER_PASS = 50
 
+# ---------------------------------------------------------------------------
+# Dependency deferral
+# ---------------------------------------------------------------------------
+# 424 Failed Dependency is the bridge's answer when a required downstream (today:
+# the privacy service) could not be REACHED. Deliberately not 5xx: nginx's
+# proxy_next_upstream retries 500/502/503/504/429 across every worker, and every
+# worker shares the same downstream URL — so a 5xx here would burn all workers on
+# a hop that cannot succeed and then surface as the misleading "bridge at
+# capacity" envelope (exactly the 2026-08-01 misdiagnosis).
+DEPENDENCY_UNAVAILABLE_STATUS = 424
+
+# Backoff between dependency retries, and the total number of waits allowed.
+# 60s × 240 ≈ 4h of patience: long enough to sit out a real host outage
+# (2026-08-01 lasted ~23 min), bounded so a permanently dead dependency still
+# fails loud instead of parking work forever.
+DEPENDENCY_RETRY_DELAY_S = 60
+DEPENDENCY_MAX_DEFERS = 240
+
+
+async def _defer_for_dependency(job_id: str, kind: str, reason: str) -> bool:
+    """Park a job waiting on an unreachable dependency.
+
+    Returns True when the job was deferred (caller must stop), False when the
+    patience budget is spent and it should fail loud like any other error.
+    """
+    job = await store.get_job(job_id)
+    deferred_so_far = (job or {}).get("defer_count") or 0
+    if deferred_so_far >= DEPENDENCY_MAX_DEFERS:
+        logger.error(
+            f"💀 Async job {job_id} (kind={kind}) gave up after {deferred_so_far} "
+            f"dependency waits (~{deferred_so_far * DEPENDENCY_RETRY_DELAY_S // 60}min): {reason}"
+        )
+        return False
+    await store.defer_job(job_id, DEPENDENCY_RETRY_DELAY_S, reason)
+    logger.warning(
+        f"⏸️ Async job {job_id} (kind={kind}) deferred {DEPENDENCY_RETRY_DELAY_S}s "
+        f"(wait {deferred_so_far + 1}/{DEPENDENCY_MAX_DEFERS}) — dependency unreachable: {reason}"
+    )
+    return True
+
 
 def register_executor(kind: str, executor: Executor) -> None:
     """Idempotent-ish: last registration wins (startup runs once per worker)."""
@@ -123,6 +163,16 @@ async def _run_body(
         # Preserve the upstream HTTP status in the error code so clients can
         # restore retry semantics (a 400 must not read as a retryable 502).
         from src.jobs.executors import ExecutorHTTPError
+
+        # A DEPENDENCY that could not be reached is not a failed job — it is a
+        # job whose turn has not come. Park it and let the watchdog re-run it
+        # once the dependency is back, instead of burning it terminally (which
+        # is what made "defer the check until the GPU returns" impossible).
+        if isinstance(e, ExecutorHTTPError) and e.status_code == DEPENDENCY_UNAVAILABLE_STATUS:
+            deferred = await _defer_for_dependency(job_id, kind, str(e))
+            if deferred:
+                return
+
         code = (
             f"UPSTREAM_HTTP_{e.status_code}"
             if isinstance(e, ExecutorHTTPError) else "EXECUTOR_ERROR"

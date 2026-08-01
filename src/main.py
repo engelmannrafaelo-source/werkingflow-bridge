@@ -68,7 +68,12 @@ from src.routing.backend_router import resolve_backend_config, get_backend_info_
 from src.auth import verify_api_key, security, validate_claude_code_auth, get_claude_code_auth_info, bedrock_credential_manager
 # Generic async-job system (additive, flag-gated via BRIDGE_GENERIC_JOBS_ENABLED).
 from src.jobs.routes import router as jobs_router, set_attribution_extractor
-from src.jobs.registry import register_executor, run_watchdog_pass
+from src.jobs.registry import (
+    register_executor,
+    run_watchdog_pass,
+    DEPENDENCY_UNAVAILABLE_STATUS,
+    DEPENDENCY_RETRY_DELAY_S,
+)
 from src.jobs import store as jobs_store
 from src.jobs.executors import (
     ping_executor,
@@ -88,7 +93,11 @@ from src.model_registry import (
 from src.file_discovery import FileDiscoveryService
 from src.session_manager import session_manager
 # Privacy: Use lightweight HTTP client (no Presidio/spaCy in worker)
-from src.privacy_client import get_privacy_client, privacy_timeout
+from src.privacy_client import (
+    get_privacy_client,
+    privacy_timeout,
+    PrivacyServiceUnavailable,
+)
 from src.tenant import (
     TenantMiddleware,
     get_tenant_from_request,
@@ -5863,8 +5872,7 @@ async def get_privacy_status():
     """Get privacy service status. Proxies to privacy-pdf-service container."""
     privacy_client = get_privacy_client()
     try:
-        client = await privacy_client._get_client()
-        response = await client.get("/status")
+        response = await privacy_client.get("/status")
         response.raise_for_status()
         service_status = response.json()
     except Exception as e:
@@ -5913,9 +5921,8 @@ async def _smart_anonymize_core(
     privacy_client = get_privacy_client()
     _concurrent_before = None
     try:
-        client = await privacy_client._get_client()
         async with privacy_client.track_call() as _concurrent_before:
-            response = await client.post("/smart-anonymize", json={
+            response = await privacy_client.post("/smart-anonymize", json={
                 "text": text,
                 "language": language,
                 "context_hint": context_hint,
@@ -6037,6 +6044,11 @@ async def _smart_anonymize_core(
             concurrent_calls_at_start=_concurrent_before,
             error_code=type(e).__name__,
         )
+        # Unreachable dependency: metrics/activity above are recorded first
+        # (an outage must still show up in the error rates), then propagate
+        # so the central handler can answer 424 instead of a generic 500.
+        if isinstance(e, PrivacyServiceUnavailable):
+            raise
         return SmartAnonymizeResponse(
             status="error",
             error=_error_message
@@ -6095,11 +6107,9 @@ async def convert_pdf_endpoint(
         filename = getattr(file, "filename", "upload.pdf") or "upload.pdf"
         pdf_bytes = await file.read()
 
-        client = await privacy_client._get_client()
-
         # Forward as multipart to privacy-pdf-service
         async with privacy_client.track_call() as _concurrent_before:
-            response = await client.post(
+            response = await privacy_client.post(
                 "/convert-pdf",
                 files={"file": (filename, pdf_bytes, "application/pdf")},
                 timeout=privacy_timeout(300.0),  # PDF conversion can take a while
@@ -6120,6 +6130,11 @@ async def convert_pdf_endpoint(
             status="error", duration_ms=int((time.time() - _start) * 1000),
             concurrent_calls_at_start=_concurrent_before, error_code=type(e).__name__,
         )
+        # Unreachable dependency: metrics/activity above are recorded first
+        # (an outage must still show up in the error rates), then propagate
+        # so the central handler can answer 424 instead of a generic 500.
+        if isinstance(e, PrivacyServiceUnavailable):
+            raise
         return ConvertPdfResponse(
             status="error",
             error=f"PDF conversion failed: {str(e)}"
@@ -6149,11 +6164,9 @@ async def convert_pdf_to_semantic_html_endpoint(
         filename = getattr(file, "filename", "upload.pdf") or "upload.pdf"
         pdf_bytes = await file.read()
 
-        client = await privacy_client._get_client()
-
         # Forward as multipart to privacy-pdf-service
         async with privacy_client.track_call() as _concurrent_before:
-            response = await client.post(
+            response = await privacy_client.post(
                 "/convert-pdf-to-semantic-html",
                 files={"file": (filename, pdf_bytes, "application/pdf")},
                 timeout=privacy_timeout(600.0),  # ConvertAPI + AI conversion can take several minutes
@@ -6173,6 +6186,11 @@ async def convert_pdf_to_semantic_html_endpoint(
             status="error", duration_ms=int((time.time() - _start) * 1000),
             concurrent_calls_at_start=_concurrent_before, error_code=type(e).__name__,
         )
+        # Unreachable dependency: metrics/activity above are recorded first
+        # (an outage must still show up in the error rates), then propagate
+        # so the central handler can answer 424 instead of a generic 500.
+        if isinstance(e, PrivacyServiceUnavailable):
+            raise
         return JSONResponse(
             status_code=500,
             content={"status": "error", "error": f"PDF-to-semantic-HTML conversion failed: {str(e)}"}
@@ -6198,10 +6216,8 @@ async def convert_html_to_docx_endpoint(
                 content={"status": "error", "error": "Request body must be JSON with 'html' field."}
             )
 
-        client = await privacy_client._get_client()
-
         async with privacy_client.track_call() as _concurrent_before:
-            response = await client.post(
+            response = await privacy_client.post(
                 "/convert-html-to-docx",
                 json=body,
                 timeout=privacy_timeout(600.0),
@@ -6221,6 +6237,11 @@ async def convert_html_to_docx_endpoint(
             status="error", duration_ms=int((time.time() - _start) * 1000),
             concurrent_calls_at_start=_concurrent_before, error_code=type(e).__name__,
         )
+        # Unreachable dependency: metrics/activity above are recorded first
+        # (an outage must still show up in the error rates), then propagate
+        # so the central handler can answer 424 instead of a generic 500.
+        if isinstance(e, PrivacyServiceUnavailable):
+            raise
         return JSONResponse(
             status_code=500,
             content={"status": "error", "error": f"HTML-to-DOCX conversion failed: {str(e)}"}
@@ -6246,10 +6267,8 @@ async def convert_docx_to_html_endpoint(
                 content={"status": "error", "error": "Request body must be JSON with 'docx_base64' field."}
             )
 
-        client = await privacy_client._get_client()
-
         async with privacy_client.track_call() as _concurrent_before:
-            response = await client.post(
+            response = await privacy_client.post(
                 "/convert-docx-to-html",
                 json=body,
                 timeout=privacy_timeout(600.0),
@@ -6269,6 +6288,11 @@ async def convert_docx_to_html_endpoint(
             status="error", duration_ms=int((time.time() - _start) * 1000),
             concurrent_calls_at_start=_concurrent_before, error_code=type(e).__name__,
         )
+        # Unreachable dependency: metrics/activity above are recorded first
+        # (an outage must still show up in the error rates), then propagate
+        # so the central handler can answer 424 instead of a generic 500.
+        if isinstance(e, PrivacyServiceUnavailable):
+            raise
         return JSONResponse(
             status_code=500,
             content={"status": "error", "error": f"DOCX-to-HTML conversion failed: {str(e)}"}
@@ -6299,10 +6323,8 @@ async def convert_html_to_pdf_endpoint(
                 content={"status": "error", "error": "Request body must be JSON with 'html' field."}
             )
 
-        client = await privacy_client._get_client()
-
         async with privacy_client.track_call() as _concurrent_before:
-            response = await client.post(
+            response = await privacy_client.post(
                 "/convert-html-to-pdf",
                 json=body,
                 timeout=privacy_timeout(600.0),
@@ -6358,6 +6380,11 @@ async def convert_html_to_pdf_endpoint(
             status="error", duration_ms=_duration_ms,
             concurrent_calls_at_start=_concurrent_before, error_code=type(e).__name__,
         )
+        # Unreachable dependency: metrics/activity above are recorded first
+        # (an outage must still show up in the error rates), then propagate
+        # so the central handler can answer 424 instead of a generic 500.
+        if isinstance(e, PrivacyServiceUnavailable):
+            raise
         return JSONResponse(
             status_code=500,
             content={"status": "error", "error": f"HTML-to-PDF conversion failed: {str(e)}"}
@@ -6389,10 +6416,8 @@ async def convert_html_to_screenshot_endpoint(
                 content={"status": "error", "error": "Request body must be JSON with 'html' field."}
             )
 
-        client = await privacy_client._get_client()
-
         async with privacy_client.track_call() as _concurrent_before:
-            response = await client.post(
+            response = await privacy_client.post(
                 "/convert-html-to-screenshot",
                 json=body,
                 timeout=privacy_timeout(600.0),
@@ -6448,6 +6473,11 @@ async def convert_html_to_screenshot_endpoint(
             status="error", duration_ms=_duration_ms,
             concurrent_calls_at_start=_concurrent_before, error_code=type(e).__name__,
         )
+        # Unreachable dependency: metrics/activity above are recorded first
+        # (an outage must still show up in the error rates), then propagate
+        # so the central handler can answer 424 instead of a generic 500.
+        if isinstance(e, PrivacyServiceUnavailable):
+            raise
         return JSONResponse(
             status_code=500,
             content={"status": "error", "error": f"HTML-to-screenshot conversion failed: {str(e)}"}
@@ -6473,10 +6503,8 @@ async def convert_pdf_to_html_direct_endpoint(
                 content={"status": "error", "error": "Request body must be JSON with 'pdf_base64' field."}
             )
 
-        client = await privacy_client._get_client()
-
         async with privacy_client.track_call() as _concurrent_before:
-            response = await client.post(
+            response = await privacy_client.post(
                 "/convert-pdf-to-html-direct",
                 json=body,
                 timeout=privacy_timeout(600.0),
@@ -6496,6 +6524,11 @@ async def convert_pdf_to_html_direct_endpoint(
             status="error", duration_ms=int((time.time() - _start) * 1000),
             concurrent_calls_at_start=_concurrent_before, error_code=type(e).__name__,
         )
+        # Unreachable dependency: metrics/activity above are recorded first
+        # (an outage must still show up in the error rates), then propagate
+        # so the central handler can answer 424 instead of a generic 500.
+        if isinstance(e, PrivacyServiceUnavailable):
+            raise
         return JSONResponse(
             status_code=500,
             content={"status": "error", "error": f"PDF-to-HTML-direct conversion failed: {str(e)}"}
@@ -6547,10 +6580,8 @@ async def _proxy_document_endpoint(
             if isinstance(value, str):
                 extra_data[key] = value
 
-        client = await privacy_client._get_client()
-
         async with privacy_client.track_call() as _concurrent_before:
-            response = await client.post(
+            response = await privacy_client.post(
                 downstream_path,
                 files={"file": (filename, content, content_type)},
                 data=extra_data,
@@ -6619,6 +6650,11 @@ async def _proxy_document_endpoint(
             status="error", duration_ms=int((time.time() - _start) * 1000),
             concurrent_calls_at_start=_concurrent_before, error_code=type(e).__name__,
         )
+        # Unreachable dependency: metrics/activity above are recorded first
+        # (an outage must still show up in the error rates), then propagate
+        # so the central handler can answer 424 instead of a generic 500.
+        if isinstance(e, PrivacyServiceUnavailable):
+            raise
         return JSONResponse(
             status_code=500,
             content={"status": "error", "error": f"Document conversion failed: {str(e)}"},
@@ -7722,6 +7758,51 @@ async def get_queue_forecast(
             "the full bridge picture."
         ),
     }
+
+
+@app.exception_handler(PrivacyServiceUnavailable)
+async def privacy_unavailable_handler(request: Request, exc: PrivacyServiceUnavailable):
+    """The privacy service could not be REACHED — answer honestly, not as a 500.
+
+    Status 424 Failed Dependency, deliberately NOT a 5xx: nginx retries
+    500/502/503/504/429 across every worker via proxy_next_upstream, and all
+    workers share one PRIVACY_SERVICE_URL. A 5xx here would therefore burn every
+    worker on a hop that cannot succeed (~135s each) and then surface as the
+    unrelated "Bridge temporarily at capacity" envelope — the precise chain that
+    made the 2026-08-01 dependency outage look like a broken deploy. 424 has no
+    error_page mapping in nginx.conf, so it reaches the caller unchanged.
+
+    `retryable: true` says the work can succeed later without any change by the
+    caller. A caller that can wait should submit the same call as a durable job
+    (POST /v1/jobs), which now defers instead of failing while the dependency is
+    down and completes once it returns (src/jobs/registry.py).
+    """
+    worker_id = os.getenv("INSTANCE_NAME", "unknown")
+    logger.error(
+        f"Privacy service unreachable on {worker_id} for {request.method} "
+        f"{request.url.path} (tried: {', '.join(exc.tried) or 'n/a'}): {exc}"
+    )
+    return JSONResponse(
+        status_code=DEPENDENCY_UNAVAILABLE_STATUS,
+        content={
+            "error": {
+                "message": (
+                    "The privacy/document service is currently unreachable, so this "
+                    "request cannot be served. This is a dependency outage, not a "
+                    "rejection of the request — retry later, or submit it as a durable "
+                    "job (POST /v1/jobs) to have it run automatically once the service "
+                    "returns."
+                ),
+                "type": "dependency_error",
+                "code": "privacy_service_unavailable",
+                "source": "bridge_internal",
+                "bridge_type": "dependency_unavailable",
+                "retryable": True,
+                "retry_after_s": DEPENDENCY_RETRY_DELAY_S,
+                "detail": str(exc),
+            }
+        },
+    )
 
 
 @app.exception_handler(BridgeError)
