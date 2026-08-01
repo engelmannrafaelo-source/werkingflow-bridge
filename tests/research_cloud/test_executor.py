@@ -469,3 +469,22 @@ async def test_completed_library_turn_stays_in_history_for_later_continuations()
     assert sent[1]["content"][0]["type"] == "tool_use"
     assert sent[2]["content"][0]["type"] == "tool_result"
     assert sent[3]["content"][0]["text"] == "second turn partial"
+
+
+def test_build_tools_forces_direct_callers_when_library_enabled():
+    """With client library tools present, the web tools must run with
+    allowed_callers=["direct"]: their default dynamic-filtering path (code
+    execution under the hood) demands a container_id on continuations that
+    the mixed client/server flow never returns (live 400, 2026-08-01)."""
+    from src.research_cloud.executor import _build_tools
+    from src.research_cloud.models import ResearchCloudConfig
+
+    cfg = ResearchCloudConfig()
+    tools_on = _build_tools(cfg, _LIBRARY_CFG)
+    web = [t for t in tools_on if t.get("type", "").startswith("web_")]
+    assert all(t.get("allowed_callers") == ["direct"] for t in web)
+
+    from src.research_cloud.library import LibraryConfig
+    tools_off = _build_tools(cfg, LibraryConfig())
+    web_off = [t for t in tools_off if t.get("type", "").startswith("web_")]
+    assert all("allowed_callers" not in t for t in web_off)
