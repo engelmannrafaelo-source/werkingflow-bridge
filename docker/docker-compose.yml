@@ -158,6 +158,7 @@ services:
       - RATE_LIMIT_ENABLED=false
       - DEFAULT_PRIVACY_MODE=none
       - PRIVACY_SERVICE_URL=${PRIVACY_SERVICE_URL:-http://privacy-service:8100}
+      - PRIVACY_SERVICE_FALLBACK_URL=${PRIVACY_SERVICE_FALLBACK_URL:-}
       - AI_BRIDGE_URL_PROD_FALLBACK=${AI_BRIDGE_URL_PROD_FALLBACK:-}
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
@@ -283,6 +284,7 @@ services:
       - RATE_LIMIT_ENABLED=false
       - DEFAULT_PRIVACY_MODE=none
       - PRIVACY_SERVICE_URL=${PRIVACY_SERVICE_URL:-http://privacy-service:8100}
+      - PRIVACY_SERVICE_FALLBACK_URL=${PRIVACY_SERVICE_FALLBACK_URL:-}
       - AI_BRIDGE_URL_PROD_FALLBACK=${AI_BRIDGE_URL_PROD_FALLBACK:-}
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
@@ -408,6 +410,7 @@ services:
       - RATE_LIMIT_ENABLED=false
       - DEFAULT_PRIVACY_MODE=none
       - PRIVACY_SERVICE_URL=${PRIVACY_SERVICE_URL:-http://privacy-service:8100}
+      - PRIVACY_SERVICE_FALLBACK_URL=${PRIVACY_SERVICE_FALLBACK_URL:-}
       - AI_BRIDGE_URL_PROD_FALLBACK=${AI_BRIDGE_URL_PROD_FALLBACK:-}
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
@@ -533,6 +536,7 @@ services:
       - RATE_LIMIT_ENABLED=false
       - DEFAULT_PRIVACY_MODE=none
       - PRIVACY_SERVICE_URL=${PRIVACY_SERVICE_URL:-http://privacy-service:8100}
+      - PRIVACY_SERVICE_FALLBACK_URL=${PRIVACY_SERVICE_FALLBACK_URL:-}
       - AI_BRIDGE_URL_PROD_FALLBACK=${AI_BRIDGE_URL_PROD_FALLBACK:-}
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
