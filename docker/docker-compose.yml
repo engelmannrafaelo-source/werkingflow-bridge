@@ -6,6 +6,8 @@ services:
     build:
       context: ..
       dockerfile: docker/Dockerfile.nginx-lb
+      args:
+        GIT_COMMIT: ${GIT_COMMIT:-unknown}
     container_name: wt-wrapper-lb
     ports:
       - "8000:80"      # Primary API
@@ -50,6 +52,8 @@ services:
     build:
       context: ..
       dockerfile: docker/Dockerfile.worker
+      args:
+        GIT_COMMIT: ${GIT_COMMIT:-unknown}
     container_name: wt-wrapper-worker1
     expose:
       - "8000"
@@ -173,6 +177,8 @@ services:
     build:
       context: ..
       dockerfile: docker/Dockerfile.worker
+      args:
+        GIT_COMMIT: ${GIT_COMMIT:-unknown}
     container_name: wt-wrapper-worker2
     expose:
       - "8000"
@@ -296,6 +302,8 @@ services:
     build:
       context: ..
       dockerfile: docker/Dockerfile.worker
+      args:
+        GIT_COMMIT: ${GIT_COMMIT:-unknown}
     container_name: wt-wrapper-worker3
     expose:
       - "8000"
@@ -419,6 +427,8 @@ services:
     build:
       context: ..
       dockerfile: docker/Dockerfile.worker
+      args:
+        GIT_COMMIT: ${GIT_COMMIT:-unknown}
     container_name: wt-wrapper-worker4
     expose:
       - "8000"
@@ -542,6 +552,8 @@ services:
     build:
       context: ..
       dockerfile: docker/Dockerfile.privacy-pdf
+      args:
+        GIT_COMMIT: ${GIT_COMMIT:-unknown}
     container_name: wt-privacy-pdf-service
     expose:
       - "8100"
@@ -611,6 +623,8 @@ services:
     build:
       context: ..
       dockerfile: docker/Dockerfile.metrics-reader
+      args:
+        GIT_COMMIT: ${GIT_COMMIT:-unknown}
     container_name: wt-wrapper-metrics-reader
     expose:
       - "8000"

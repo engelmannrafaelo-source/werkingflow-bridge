@@ -67,6 +67,8 @@ services:
     build:
       context: ..
       dockerfile: docker/Dockerfile.platform
+      args:
+        GIT_COMMIT: ${GIT_COMMIT:-unknown}
     container_name: wt-prod-platform-api
     expose:
       - "8000"

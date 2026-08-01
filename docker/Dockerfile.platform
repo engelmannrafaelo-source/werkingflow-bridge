@@ -59,3 +59,10 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
 CMD ["uvicorn", "src.platform_main:app", \
      "--host", "0.0.0.0", "--port", "8000", \
      "--workers", "2"]
+
+# Build provenance: the commit this image was built from. bridge-deploy.sh resolves
+# it on the target host and passes it through docker compose; an ad-hoc local build
+# leaves "unknown". Deliberately the last layer: a value that changes every deploy
+# must not invalidate the cache of everything above it.
+ARG GIT_COMMIT=unknown
+LABEL bridge.git.commit=$GIT_COMMIT

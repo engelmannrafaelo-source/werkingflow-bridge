@@ -27,6 +27,8 @@ services:
     build:
       context: ..
       dockerfile: docker/Dockerfile.nginx-lb
+      args:
+        GIT_COMMIT: ${GIT_COMMIT:-unknown}
     container_name: wt-prod-lb
     ports:
       - "8000:80"
@@ -67,6 +69,8 @@ services:
     build:
       context: ..
       dockerfile: docker/Dockerfile.worker
+      args:
+        GIT_COMMIT: ${GIT_COMMIT:-unknown}
     container_name: wt-prod-worker-sahori
     expose:
       - "8000"
@@ -190,6 +194,8 @@ services:
     build:
       context: ..
       dockerfile: docker/Dockerfile.worker
+      args:
+        GIT_COMMIT: ${GIT_COMMIT:-unknown}
     container_name: wt-prod-worker-kurt
     expose:
       - "8000"
@@ -321,6 +327,8 @@ services:
     build:
       context: ..
       dockerfile: docker/Dockerfile.metrics-reader
+      args:
+        GIT_COMMIT: ${GIT_COMMIT:-unknown}
     container_name: wt-prod-metrics-reader
     expose:
       - "8000"

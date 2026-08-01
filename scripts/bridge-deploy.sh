@@ -285,6 +285,37 @@ phase_preflight() {
         return 1
     fi
     info "Git OK (branch=develop, clean)"
+
+    # Provenance: what code do the RUNNING containers actually contain?
+    # A checkout says what was pulled, not what was deployed — those drift apart the
+    # moment someone pulls without deploying, and until images carried a commit label
+    # the difference was only reconstructable from deploy logs and container age.
+    # (Observed 2026-07-31 on server2: checkout 2a25c64, containers still running
+    # 493dc59, unnoticed for days.) Reported, never fatal: images built before the
+    # label existed have none, and a genuinely drifted host is precisely what the
+    # deploy about to run is going to fix.
+    info "Image provenance check..."
+    local head_sha provenance
+    head_sha=$(rssh "$host" "cd ${REMOTE_REPO} && git rev-parse HEAD")
+    provenance=$(rssh "$host" 'docker inspect --format "{{.Name}} {{index .Config.Labels \"bridge.git.commit\"}}" $(docker ps --filter name=wt- -q) 2>/dev/null' || true)
+    local unlabelled=0 drifted=0
+    while read -r cname csha; do
+        [[ -z "$cname" ]] && continue
+        cname="${cname#/}"
+        if [[ -z "$csha" ]]; then
+            (( unlabelled++ ))
+        elif [[ "$csha" != "$head_sha" ]]; then
+            warn "  DRIFT: ${cname} runs ${csha:0:7}, checkout is ${head_sha:0:7}"
+            (( drifted++ ))
+        fi
+    done <<< "$provenance"
+    if (( drifted > 0 )); then
+        warn "Provenance: ${drifted} container(s) run code other than the checkout"
+    elif (( unlabelled > 0 )); then
+        info "Provenance: ${unlabelled} container(s) predate the commit label — unverifiable until rebuilt"
+    else
+        info "Provenance OK: all running containers match ${head_sha:0:7}"
+    fi
 }
 
 # ============================================================================
@@ -602,10 +633,15 @@ deploy_one_service() {
         fi
     fi
 
-    # Build if this service has a Dockerfile
+    # Build if this service has a Dockerfile.
+    # GIT_COMMIT is resolved ON THE HOST (escaped \$) at build time, not passed in from
+    # here: the checkout is already at the intended commit in both paths — after the pull
+    # in phase_code_update, and after the `git reset --hard` in phase_rollback. That makes
+    # the image label true by construction instead of by a variable someone must thread
+    # through correctly.
     if service_needs_build "$svc" "$build_list"; then
         info "Building ${svc}..."
-        dry_rssh "$host" "cd ${REMOTE_REPO} && docker compose ${compose} build --no-cache ${svc} 2>&1" || {
+        dry_rssh "$host" "cd ${REMOTE_REPO} && GIT_COMMIT=\$(git rev-parse HEAD) docker compose ${compose} build --no-cache ${svc} 2>&1" || {
             error_ "Build failed for ${svc} on ${host}"
             return 1
         }
@@ -1015,7 +1051,9 @@ phase_rollback() {
         warn "Rolling back ${svc} (${container})..."
 
         if service_needs_build "$svc" "$build_list"; then
-            rssh "$host" "cd ${REMOTE_REPO} && docker compose ${compose} build --no-cache ${svc} 2>&1" || {
+            # git reset --hard ran above, so HEAD on the host is the rollback SHA:
+            # the rebuilt image gets labelled with the code it actually contains.
+            rssh "$host" "cd ${REMOTE_REPO} && GIT_COMMIT=\$(git rev-parse HEAD) docker compose ${compose} build --no-cache ${svc} 2>&1" || {
                 error_ "CRITICAL: rollback build failed for ${svc}"
                 failed=true
                 continue
