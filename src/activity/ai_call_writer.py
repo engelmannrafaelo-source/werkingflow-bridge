@@ -29,6 +29,7 @@ import logging
 from collections import defaultdict
 from typing import Optional
 
+from src.activity.app_registry import normalize_app_id
 from src.db.client import get_pool
 from src.pricing import cost_eur, PRICING_VERSION
 
@@ -390,6 +391,12 @@ async def persist_ai_call_activity(
                 )
                 return
 
+            # app_id is an ENUM column — validate before the INSERT rather than
+            # letting Postgres reject it mid-transaction. An unknown value books
+            # as NULL (the honest "no app" case) and travels on as app_id_raw,
+            # so the call-site stays queryable without costing the row.
+            app_id_col, app_id_rejected = normalize_app_id(app_id)
+
             feature = agent_id or workflow_id or "call"
             event_type = (
                 f"ai-call-error:{feature}" if status != "success"
@@ -428,6 +435,11 @@ async def persist_ai_call_activity(
                 # Which call-site declared itself anonymous — the per-<grund>
                 # breakdown inside the anonymous bucket.
                 payload["anonymousReason"] = anon_reason
+            if app_id_rejected:
+                # The inbound label was not an app (e.g. a client-id segment
+                # like "bridge-jobs"). Keeping it here is the whole point: an
+                # unattributed call must stay findable, not merely absent.
+                payload["appIdRaw"] = app_id_rejected
 
             # actor_user_id is a uuid column — only set it when user_id parses.
             actor_uuid = None
@@ -439,22 +451,38 @@ async def persist_ai_call_activity(
 
             # Audit record — the activity row is the source of truth for the
             # audit trail (who called what, when, from which app/env).
-            await conn.execute(
-                """
-                INSERT INTO activities
-                  (id, timestamp, category, event_type, actor_user_id,
-                   target_user_id, tenant_id, app_id, ip, user_agent, payload,
-                   app_env)
-                VALUES (gen_random_uuid(), NOW(), 'workflow', $1, $2,
-                        NULL, $3, $4, NULL, NULL, $5::jsonb, $6::app_env)
-                """,
-                event_type,
-                actor_uuid,
-                tenant_id,
-                app_id,
-                json.dumps(payload),
-                app_env,
-            )
+            #
+            # Deliberately in its own try: the audit row and the ledger row are
+            # separate concerns and must not share a fate. They used to sit in
+            # one block, so a rejected audit INSERT silently took the BILLING
+            # row down with it (2026-08-01: app_id="bridge-jobs" vs the enum —
+            # every un-attributed research job booked nothing). Losing the audit
+            # trail for one call is bad; losing the money record is worse, so
+            # the ledger write below runs either way.
+            try:
+                await conn.execute(
+                    """
+                    INSERT INTO activities
+                      (id, timestamp, category, event_type, actor_user_id,
+                       target_user_id, tenant_id, app_id, ip, user_agent, payload,
+                       app_env)
+                    VALUES (gen_random_uuid(), NOW(), 'workflow', $1, $2,
+                            NULL, $3, $4, NULL, NULL, $5::jsonb, $6::app_env)
+                    """,
+                    event_type,
+                    actor_uuid,
+                    tenant_id,
+                    app_id_col,
+                    json.dumps(payload),
+                    app_env,
+                )
+            except Exception as _audit_err:  # noqa: BLE001 — ledger must still run
+                logger.error(
+                    "persist_ai_call_activity: AUDIT row failed (app=%s agent=%s "
+                    "model=%s): %s — the usage_events row below is still written, "
+                    "so the call stays metered; the audit trail has a gap here",
+                    app_id_col, agent_id, model, _audit_err,
+                )
 
             # Usage ledger — structured row with dedicated token/cost columns so
             # the Platform Admin can query across workflow + sandbox without JSONB
@@ -487,7 +515,12 @@ async def persist_ai_call_activity(
                 """,
                 actor_uuid,
                 tenant_id,
-                app_id,
+                # Same normalised value as the audit row. usage_events.app is
+                # plain text and would swallow anything, but a dimension that
+                # means one thing in one table and another thing next door is
+                # not a dimension — the raw label rides along in
+                # provider_metadata.app_id_raw instead.
+                app_id_col,
                 app_env,
                 model,
                 provider,
@@ -512,11 +545,23 @@ async def persist_ai_call_activity(
                     # provider_metadata->>'billing_account'.
                     **({"billing_account": billing_account} if billing_account else {}),
                     **({"anonymous_reason": anon_reason} if anon_reason is not None else {}),
+                    # Inbound app label that was not a real app — kept so the
+                    # call-site of an unattributed call is queryable:
+                    #   provider_metadata->>'app_id_raw'
+                    **({"app_id_raw": app_id_rejected} if app_id_rejected else {}),
                     **(provider_meta or {}),
                 }),
             )
     except Exception as e:  # noqa: BLE001 — tracking must never break the call
-        logger.warning("persist_ai_call_activity failed (non-blocking): %s", e)
+        # ERROR, not WARNING: reaching here means NO usage_events row for a call
+        # that really happened — spend nobody can see and nobody can reconcile.
+        # The call itself is deliberately left intact (the writer must never
+        # break a user-facing request), but the gap has to be alarm-worthy.
+        logger.error(
+            "persist_ai_call_activity: LEDGER WRITE FAILED (app=%s agent=%s "
+            "model=%s provider=%s) — this call is NOT metered: %s",
+            app_id, agent_id, model, provider, e,
+        )
 
     # Post-call budget deduction. Separate step from the activity write:
     # the activity row is the usage source of truth, the deduction is the

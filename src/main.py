@@ -580,6 +580,13 @@ async def lifespan(app: FastAPI):
     register_executor("proxy", proxy_executor)
     register_executor("convert-html-to-pdf", convert_html_to_pdf_executor)
     set_attribution_extractor(extract_attribution_context)
+
+    # Mirror the app_id enum into the app registry so the ledger writer can
+    # validate before INSERT instead of discovering an invalid label as a
+    # mid-transaction Postgres error (which used to cost the whole row).
+    from src.activity.app_registry import load_known_app_ids
+    await load_known_app_ids()
+
     if is_db_enabled():
         asyncio.create_task(_generic_jobs_maintenance_loop())
         logger.info("🧩 Generic async-job system wired (executors + watchdog loop)")
