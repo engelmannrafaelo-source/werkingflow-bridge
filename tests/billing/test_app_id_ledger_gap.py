@@ -28,7 +28,13 @@ os.environ.setdefault("BRIDGE_SERVICE_TOKEN", "test-service-token")
 import pytest
 
 from src.activity.ai_call_writer import persist_ai_call_activity
-from src.activity.app_registry import normalize_app_id, reset_registry_for_tests
+from src.activity.app_registry import (
+    _REJECTED_TRACKING_CAP,
+    _rejected_counts,
+    load_known_app_ids,
+    normalize_app_id,
+    reset_registry_for_tests,
+)
 
 # Die realen ENUM-Member (Stand 2026-08-01) — in den Tests explizit übergeben,
 # damit die Funktion pur bleibt und kein DB-Zustand mitspielt.
@@ -63,15 +69,74 @@ def test_absent_app_id_is_not_reported_as_rejected(raw):
     assert normalize_app_id(raw, known=KNOWN) == (None, None)
 
 
-def test_unloaded_registry_degrades_to_passthrough():
-    """Ohne geladenes ENUM kann nicht validiert werden — dann durchreichen
-    statt alles zu verwerfen (eine leere Registry darf nicht jede App killen)."""
+def test_unloaded_registry_passes_through():
+    """Ohne geladenes ENUM (= Instanz ohne DB) durchreichen statt alles zu
+    verwerfen. Kein Fallback für einen Worker MIT DB — dort bootet er gar nicht
+    erst, siehe test_load_fails_fast_*."""
     reset_registry_for_tests(None)
     try:
         assert normalize_app_id("werking-report") == ("werking-report", None)
         assert normalize_app_id("bridge-jobs") == ("bridge-jobs", None)
     finally:
         reset_registry_for_tests(None)
+
+
+def test_rejected_label_tracking_is_bounded():
+    """Der Zähler wird mit Header-Werten von aussen gefüttert — er darf nicht
+    unbegrenzt wachsen (langsames Speicherleck, von aussen steuerbar)."""
+    reset_registry_for_tests(KNOWN)
+    try:
+        for i in range(_REJECTED_TRACKING_CAP + 500):
+            app, rejected = normalize_app_id(f"junk-{i}", known=KNOWN)
+            # Verhalten bleibt korrekt, auch jenseits des Caps:
+            assert app is None and rejected == f"junk-{i}"
+        assert len(_rejected_counts) <= _REJECTED_TRACKING_CAP
+    finally:
+        reset_registry_for_tests(None)
+
+
+# ---------------------------------------------------------------------------
+# load_known_app_ids — Boot-Invariante (fail fast)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_load_returns_none_without_db():
+    """Instanz ohne DB: Validierung legitim aus, kein Boot-Fehler."""
+    with patch("src.db.client.is_db_enabled", return_value=False):
+        assert await load_known_app_ids() is None
+
+
+@pytest.mark.asyncio
+async def test_load_fails_fast_when_pool_missing():
+    """DIE Falle, die den ersten Wurf unbrauchbar machte: der Aufruf stand vor
+    init_pool(), get_pool() warf, ein except schluckte es — und die Validierung
+    war dauerhaft aus, während der Build 'erfolgreich' meldete. Jetzt bootet er
+    nicht."""
+    with patch("src.db.client.is_db_enabled", return_value=True), patch(
+        "src.db.client.get_pool", side_effect=RuntimeError("DB pool not initialized")
+    ):
+        with pytest.raises(RuntimeError, match="pool not initialized"):
+            await load_known_app_ids()
+
+
+@pytest.mark.asyncio
+async def test_load_fails_fast_on_empty_enum():
+    """Ein ENUM ohne Member würde die ganze Flotte als app=NULL buchen."""
+    conn = AsyncMock()
+    conn.fetch = AsyncMock(return_value=[])
+
+    @asynccontextmanager
+    async def _acquire():
+        yield conn
+
+    pool = MagicMock()
+    pool.acquire = _acquire
+
+    with patch("src.db.client.is_db_enabled", return_value=True), patch(
+        "src.db.client.get_pool", return_value=pool
+    ):
+        with pytest.raises(RuntimeError, match="ZERO members"):
+            await load_known_app_ids()
 
 
 # ---------------------------------------------------------------------------

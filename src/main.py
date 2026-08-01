@@ -580,13 +580,6 @@ async def lifespan(app: FastAPI):
     register_executor("proxy", proxy_executor)
     register_executor("convert-html-to-pdf", convert_html_to_pdf_executor)
     set_attribution_extractor(extract_attribution_context)
-
-    # Mirror the app_id enum into the app registry so the ledger writer can
-    # validate before INSERT instead of discovering an invalid label as a
-    # mid-transaction Postgres error (which used to cost the whole row).
-    from src.activity.app_registry import load_known_app_ids
-    await load_known_app_ids()
-
     if is_db_enabled():
         asyncio.create_task(_generic_jobs_maintenance_loop())
         logger.info("🧩 Generic async-job system wired (executors + watchdog loop)")
@@ -668,6 +661,23 @@ async def lifespan(app: FastAPI):
             logger.info(f"✅ Worker plan catalog loaded: {count} active plans (budget deduction)")
         except Exception as e:
             logger.error(f"❌ Worker plan catalog load failed: {e}")
+            raise
+
+        # app_id enum → app registry, so the ledger writer validates BEFORE the
+        # INSERT instead of meeting an invalid label as a mid-transaction
+        # Postgres error (which used to cost the whole billing row). Same
+        # fail-fast reasoning as the plan catalog above and as
+        # validate_billing_integrity(): a worker that cannot tell a real app
+        # from a call-site label must not serve traffic whose ledger rows can
+        # silently vanish. MUST run after init_pool() — get_pool() raises
+        # otherwise, and a swallowed failure here would leave validation off
+        # while looking healthy.
+        from src.activity.app_registry import load_known_app_ids
+        try:
+            apps = await load_known_app_ids()
+            logger.info(f"✅ Worker app registry loaded: {len(apps)} app_id enum members")
+        except Exception as e:
+            logger.error(f"❌ Worker app registry load failed: {e}")
             raise
 
     yield

@@ -48,65 +48,81 @@ _known_app_ids: Optional[FrozenSet[str]] = None
 
 # Distinct rejected values already reported — keeps a busy call-site from
 # flooding the log while still counting how often it happened.
+#
+# BOUNDED on purpose: the key is an inbound header value, i.e. attacker- and
+# bug-controlled. An unbounded dict here would be a slow memory leak driven by
+# whatever strings the outside world sends (one dead app looping a random
+# client-id is enough). Past the cap we stop tracking NEW labels and count them
+# in bulk instead — the diagnostic value is in the first few anyway.
+_REJECTED_TRACKING_CAP = 256
 _rejected_counts: dict = {}
+_rejected_overflow = 0
+
+# Set once the degraded "no registry loaded" path has been reported, so the
+# no-DB case says so exactly once instead of per call.
+_unloaded_reported = False
 
 
 async def load_known_app_ids() -> Optional[FrozenSet[str]]:
     """Read the app_id enum members from Postgres and cache them.
 
-    Called once during startup. Returns None when there is no database on this
-    instance (prod-bridge runs without one) — validation then stays off, which
-    is correct: with no DB there is no INSERT to protect.
+    Called once at worker startup, AFTER init_pool(). Returns None on an
+    instance with no database (prod-bridge runs without one) — validation then
+    stays off, which is correct rather than degraded: with no DB there is no
+    INSERT to protect.
 
-    A failure here is logged loudly rather than raised: the Bridge must still
-    boot without its ledger, and normalize_app_id() degrades to pass-through.
+    FAIL FAST when a DB *is* configured and the enum cannot be read. Same
+    invariant as validate_billing_integrity() and the plan catalog: a worker
+    that cannot tell a real app from a call-site label must not serve traffic
+    whose ledger rows can silently vanish — that is exactly the failure this
+    module exists to end, and swallowing it here would reinstate it while
+    looking healthy in the logs.
+
+    (Written after doing precisely that: the first cut of this call sat before
+    init_pool(), get_pool() raised, the except logged and moved on, and
+    validation was permanently off in a build that reported success.)
     """
     global _known_app_ids
 
-    from src.db.client import get_pool, is_db_enabled
+    from src.db.client import is_db_enabled
 
     if not is_db_enabled():
         logger.info(
             "app registry: no Bridge DB on this instance — app_id validation off"
         )
-        return None
-
-    try:
-        pool = get_pool()
-        async with pool.acquire() as conn:
-            rows = await conn.fetch(
-                """
-                SELECT e.enumlabel
-                FROM pg_enum e
-                JOIN pg_type t ON t.oid = e.enumtypid
-                WHERE t.typname = $1
-                """,
-                APP_ID_ENUM_TYPE,
-            )
-        _known_app_ids = frozenset(r["enumlabel"] for r in rows)
-        if not _known_app_ids:
-            logger.error(
-                "app registry: enum %r resolved to ZERO members — every app_id "
-                "would now be rejected as unknown. Validation stays OFF until "
-                "this is fixed.",
-                APP_ID_ENUM_TYPE,
-            )
-            _known_app_ids = None
-            return None
-        logger.info(
-            "app registry: %d app_id enum members loaded (%s)",
-            len(_known_app_ids),
-            ", ".join(sorted(_known_app_ids)),
-        )
-        return _known_app_ids
-    except Exception as e:  # noqa: BLE001 — boot must survive a ledger outage
-        logger.error(
-            "app registry: could not load the %r enum (%s) — app_id validation "
-            "is OFF, an invalid app_id will again cost the whole ledger row",
-            APP_ID_ENUM_TYPE, e,
-        )
         _known_app_ids = None
         return None
+
+    # No try/except: a failure here must reach the caller and stop the boot.
+    from src.db.client import get_pool
+
+    pool = get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT e.enumlabel
+            FROM pg_enum e
+            JOIN pg_type t ON t.oid = e.enumtypid
+            WHERE t.typname = $1
+            """,
+            APP_ID_ENUM_TYPE,
+        )
+
+    loaded = frozenset(r["enumlabel"] for r in rows)
+    if not loaded:
+        raise RuntimeError(
+            f"APP REGISTRY VIOLATION — enum {APP_ID_ENUM_TYPE!r} resolved to ZERO "
+            "members. Either the type is missing (migration not applied) or the "
+            "query is wrong. Booting on would validate every app_id as unknown "
+            "and book the whole fleet as app=NULL — kein Silent-Fail erlaubt."
+        )
+
+    _known_app_ids = loaded
+    logger.info(
+        "app registry: %d app_id enum members loaded (%s)",
+        len(loaded), ", ".join(sorted(loaded)),
+    )
+    return loaded
 
 
 def known_app_ids() -> Optional[FrozenSet[str]]:
@@ -116,9 +132,11 @@ def known_app_ids() -> Optional[FrozenSet[str]]:
 
 def reset_registry_for_tests(known: Optional[FrozenSet[str]] = None) -> None:
     """Set/clear the cached set. Tests only — production fills it at startup."""
-    global _known_app_ids
+    global _known_app_ids, _rejected_overflow, _unloaded_reported
     _known_app_ids = known
     _rejected_counts.clear()
+    _rejected_overflow = 0
+    _unloaded_reported = False
 
 
 def normalize_app_id(
@@ -132,30 +150,47 @@ def normalize_app_id(
     the second into metadata, so nothing is lost and nothing is invented.
 
     Pure when ``known`` is passed explicitly, which is how the tests drive it.
-    With no registry loaded it degrades to pass-through (cannot validate what we
-    cannot enumerate) — logged once so the degraded mode is visible.
+
+    An unloaded registry means "no DB on this instance" — startup fails loudly
+    otherwise (see load_known_app_ids), so this branch cannot be a silently
+    degraded worker that still writes rows. With no DB there is no INSERT, so
+    passing the value through is honest rather than a fallback.
     """
+    global _rejected_overflow, _unloaded_reported
+
     if raw is None or raw == "":
         return None, None
 
     valid = known if known is not None else _known_app_ids
     if valid is None:
-        if not _rejected_counts.get("__registry_unloaded__"):
-            logger.warning(
-                "app registry: app_id=%r passed through unvalidated — enum not "
-                "loaded on this instance",
+        if not _unloaded_reported:
+            _unloaded_reported = True
+            logger.info(
+                "app registry: app_id=%r not validated — no enum loaded (instance "
+                "without a Bridge DB, so nothing is written either)",
                 raw,
             )
-        _rejected_counts["__registry_unloaded__"] = (
-            _rejected_counts.get("__registry_unloaded__", 0) + 1
-        )
         return raw, None
 
     if raw in valid:
         return raw, None
 
-    seen = _rejected_counts.get(raw, 0) + 1
-    _rejected_counts[raw] = seen
+    known_label = raw in _rejected_counts
+    if known_label or len(_rejected_counts) < _REJECTED_TRACKING_CAP:
+        seen = _rejected_counts.get(raw, 0) + 1
+        _rejected_counts[raw] = seen
+    else:
+        # Cap reached — count in bulk instead of growing on inbound strings.
+        _rejected_overflow += 1
+        if _rejected_overflow % 1000 == 1:
+            logger.error(
+                "app registry: >%d distinct invalid app_id labels seen; %d further "
+                "rejects not tracked individually (latest %r). Something is "
+                "generating app labels — check X-Client-ID senders.",
+                _REJECTED_TRACKING_CAP, _rejected_overflow, raw,
+            )
+        return None, raw
+
     if seen == 1:
         logger.error(
             "app registry: app_id=%r is not one of the %d known apps (%s) — "
