@@ -708,6 +708,18 @@ phase_smoke_test() {
             warn "  Re-run the affected probes once the pool recovers — see the SMOKE_CAPACITY line above."
             return 0
         fi
+        # SMOKE_DEPENDENCY = exit 0, same contract as SMOKE_CAPACITY: the
+        # privacy-pdf-service these endpoints proxy to was proven unreachable,
+        # so they stayed UNVERIFIED. Deliberately not a rollback — the previous
+        # image proxies to the same PRIVACY_SERVICE_URL and fails identically,
+        # so rolling back only swaps a good image out during an unrelated
+        # outage (2026-08-01). It must never read as green either.
+        if grep -q '^SMOKE_DEPENDENCY:' <<< "$smoke_out"; then
+            warn "Smoke test PASSED for ${label} WITH UNVERIFIED ENDPOINTS (privacy-service unreachable)"
+            warn "  This is a DEPENDENCY outage, not a regression in this build. Fix the"
+            warn "  privacy service, then re-run the affected probes — see the SMOKE_DEPENDENCY line above."
+            return 0
+        fi
         info "Smoke test PASSED for ${label}"
         return 0
     fi

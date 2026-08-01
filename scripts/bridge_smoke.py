@@ -57,10 +57,18 @@ SMOKE_HEADERS = {
 }
 
 # The repro commands printed on failure MUST carry the same attribution headers
-# the probes send. /v1/research and /v1/chat/completions call
-# enforce_attribution() (src/main.py), so a repro without X-User-ID reproduces a
-# 400 missing_user_attribution instead of the failure being investigated —
-# sending the next operator after a phantom bug (hit 2026-07-29).
+# the probes send. AttributionEnforcementMiddleware (src/attribution.py) rejects
+# any POST to a path in ENFORCED_PATHS that has an Authorization header but no
+# X-User-ID, so a repro without it reproduces a 400 missing_user_attribution
+# instead of the failure being investigated — sending the next operator after a
+# phantom bug (hit 2026-07-29).
+#
+# ENFORCED_PATHS is NOT just the two LLM routes: it also covers
+# /v1/document/convert*, /v1/privacy/smart-anonymize and every /v1/convert-*
+# route. Relying on each probe to remember the headers had already failed for
+# all five of those (hit again 2026-08-01: the first thing the operator ran
+# returned a phantom 400), so the headers are no longer hand-appended per
+# probe — probe() injects them into any repro that lacks them, below.
 ATTRIBUTION_REPRO = " ".join(f"-H '{k}: {v}'" for k, v in SMOKE_HEADERS.items()) + " "
 
 # A short German PII string used to assert the anonymize *contract*.
@@ -84,6 +92,96 @@ class ProbeResult:
     # infrastructure STATE, not a verdict on the deployed code.
     capacity_reason: Optional[str] = None
     retry_after_s: Optional[int] = None
+    # Set ONLY by classify_dependency_failures(): the probe failed because the
+    # privacy-service dependency was itself unreachable, proven by an
+    # independent check. Same class as capacity_reason — infrastructure STATE,
+    # not a verdict on the deployed code.
+    dependency_reason: Optional[str] = None
+
+
+# ---------------------------------------------------------------------------
+# Dependency classification — "the thing we proxy TO is down" is STATE too
+# ---------------------------------------------------------------------------
+# Every probe below proxies to the privacy-pdf-service (PRIVACY_SERVICE_URL in
+# src/privacy_client.py). That service is a SEPARATE container/host from the
+# image being deployed, so when it is unreachable these probes fail for a
+# reason no rollback can fix — the previous image proxies to the exact same
+# address and fails identically.
+#
+# Observed 2026-08-01: PRIVACY_SERVICE_URL pointed at a Tailscale-remote host
+# that went unreachable for ~23 minutes. document_convert, smart_anonymize,
+# convert_html_to_pdf and convert_html_to_docx each failed with a worker-side
+# httpx.ConnectError ("All connection attempts failed"), nginx relabelled the
+# resulting 500 as a 503 "bridge at capacity", and the deploy rolled a good
+# image back. The endpoints recovered ~30s BEFORE the rollback even started,
+# on the same image the smoke had just condemned.
+#
+# Same discipline as the capacity gap: reported as an explicit UNVERIFIED gap,
+# never as a pass, and only when the dependency is PROVEN down (below).
+PRIVACY_DEPENDENT_PROBES = {
+    "document_convert",
+    "smart_anonymize",
+    "convert_html_to_pdf",
+    "convert_html_to_docx",
+    "convert_html_to_screenshot",
+    "document_convert_and_anonymize",
+}
+
+
+def privacy_dependency_down(ctx) -> Optional[str]:
+    """Return a reason string iff the privacy service is PROVEN unreachable.
+
+    Asks the bridge itself (GET /v1/privacy/status). Only the handler's own
+    except-branch (src/main.py) emits ``available: false`` TOGETHER WITH an
+    ``error`` string carrying the transport failure — a reachable service that
+    merely reports itself as not-ready has no ``error`` key. Requiring both
+    keeps this strictly about UNREACHABILITY, which is the only thing a
+    rollback provably cannot fix.
+
+    Deliberately conservative — anything else (endpoint missing, non-JSON,
+    service reporting itself available, no error detail, or the check itself
+    erroring) returns None, so failures stay HARD failures and the deploy
+    still blocks. An unreachable dependency must be positively proven before
+    it can excuse anything.
+    """
+    try:
+        r = requests.get(f"{ctx.base_url}/v1/privacy/status",
+                         headers=ctx.headers(), timeout=60)
+    except Exception:
+        # The check itself failing proves nothing about the dependency — it
+        # could be the bridge. Stay conservative: no excuse.
+        return None
+    if r.status_code != 200:
+        return None
+    try:
+        privacy = (r.json() or {}).get("privacy") or {}
+    except ValueError:
+        return None
+    if not isinstance(privacy, dict):
+        return None
+    err = privacy.get("error")
+    if privacy.get("available") is False and err:
+        return f"privacy-service unreachable ({str(err)[:120]})"
+    return None
+
+
+def classify_dependency_failures(results: list, ctx) -> None:
+    """Mark privacy-dependent failures as dependency gaps iff the privacy
+    service is independently proven unreachable. Mutates `results` in place.
+
+    Only runs when at least one privacy-dependent probe actually failed, so a
+    healthy deploy never pays for the extra call.
+    """
+    candidates = [r for r in results
+                  if not r.ok and not r.capacity_reason and r.name in PRIVACY_DEPENDENT_PROBES]
+    if not candidates:
+        return
+    reason = privacy_dependency_down(ctx)
+    if not reason:
+        return
+    for r in candidates:
+        r.dependency_reason = reason
+        r.detail += f" [dependency down: {reason}]"
 
 
 # ---------------------------------------------------------------------------
@@ -173,9 +271,22 @@ class Probe:
 PROBES: list = []
 
 
+def with_attribution(repro: str) -> str:
+    """Guarantee a printed repro carries the smoke's attribution headers.
+
+    Single choke point, so a new probe cannot reintroduce the phantom-400
+    repro by forgetting them (see ATTRIBUTION_REPRO above). Appending is safe:
+    curl accepts -H anywhere in the argument list.
+    """
+    if not repro or "X-User-ID" in repro:
+        return repro
+    return repro.rstrip() + " " + ATTRIBUTION_REPRO.rstrip()
+
+
 def probe(name, endpoint, profiles, repro=""):
     def deco(fn):
-        PROBES.append(Probe(name=name, endpoint=endpoint, profiles=set(profiles), fn=fn, repro=repro))
+        PROBES.append(Probe(name=name, endpoint=endpoint, profiles=set(profiles),
+                            fn=fn, repro=with_attribution(repro)))
         return fn
     return deco
 
@@ -535,31 +646,46 @@ def run(base_url: str, profile: str, only: Optional[str], extra_header: dict, at
                            if last.capacity_reason else 5)
         last.repro = p.repro  # attach for fix-session
         results.append(last)
+    # Done last, once: asks the bridge whether the privacy service these probes
+    # proxy to is itself reachable, so a dependency outage is not reported as a
+    # regression in the image under deploy.
+    classify_dependency_failures(results, ctx)
     return results
 
 
 def partition_results(results: list) -> tuple:
-    """Split into (passed, capacity_gaps, failures).
+    """Split into (passed, gaps, failures), where `gaps` are UNVERIFIED probes.
 
-    A capacity refusal is only excused as a gap when the pool path is PROVEN
-    healthy by another probe through the same gate (POOL_GATED_PROBES all share
-    nginx location ~ ^/v1/(chat/completions|research)). If no pool-gated probe
-    passed, nothing proves the deployed image can serve LLM traffic at all — a
-    fresh image that broke the adaptive limiter could plausibly starve the
-    router into all_unavail — so the refusals stay hard failures and the deploy
-    blocks. Excusing only what an independent green probe covers keeps the gate
-    honest in both directions.
+    Two kinds of refusal land in `gaps`, both infrastructure STATE rather than
+    a verdict on the deployed image:
+
+    * capacity — only excused when the pool path is PROVEN healthy by another
+      probe through the same gate (POOL_GATED_PROBES all share nginx location
+      ~ ^/v1/(chat/completions|research)). If no pool-gated probe passed,
+      nothing proves the deployed image can serve LLM traffic at all — a fresh
+      image that broke the adaptive limiter could plausibly starve the router
+      into all_unavail — so the refusals stay hard failures and the deploy
+      blocks.
+    * dependency — the privacy service the probe proxies to was proven
+      unreachable by an independent check (classify_dependency_failures).
+      Rolling back cannot fix an address the previous image also proxies to.
+
+    Excusing only what independent evidence covers keeps the gate honest in
+    both directions.
     """
     passed = [r for r in results if r.ok]
     refused = [r for r in results if not r.ok and r.capacity_reason]
-    failures = [r for r in results if not r.ok and not r.capacity_reason]
+    dependency = [r for r in results
+                  if not r.ok and not r.capacity_reason and r.dependency_reason]
+    failures = [r for r in results
+                if not r.ok and not r.capacity_reason and not r.dependency_reason]
 
     pool_proven_healthy = any(r.ok for r in results if r.name in POOL_GATED_PROBES)
     if refused and not pool_proven_healthy:
         for r in refused:
             r.detail += " [no pool-gated probe passed — cannot rule out the deployed image]"
-        return passed, [], failures + refused
-    return passed, refused, failures
+        return passed, dependency, failures + refused
+    return passed, refused + dependency, failures
 
 
 def main():
@@ -582,10 +708,13 @@ def main():
         print(f"SMOKE_FAIL: no probes selected for profile={args.profile} only={args.only}", file=sys.stderr)
         sys.exit(2)
 
-    passed, capacity_gaps, failures = partition_results(results)
-    gap_names = {r.name for r in capacity_gaps}
+    passed, gaps, failures = partition_results(results)
+    gap_names = {r.name for r in gaps}
+    dep_names = {r.name for r in gaps if r.dependency_reason}
     for r in results:
-        mark = "OK  " if r.ok else ("CAPA" if r.name in gap_names else "FAIL")
+        mark = ("OK  " if r.ok else
+                "DEP " if r.name in dep_names else
+                "CAPA" if r.name in gap_names else "FAIL")
         ms = f"{r.elapsed_ms}ms" if r.elapsed_ms is not None else "-"
         print(f"  [{mark}] {r.name:22s} {r.endpoint:34s} ({ms}) {r.detail}")
 
@@ -617,6 +746,32 @@ def main():
                 print(f"  repro[{r.name}]: {r.repro}", file=sys.stderr)
         sys.exit(1)
 
+    dependency_gaps = [r for r in gaps if r.dependency_reason]
+    capacity_gaps = [r for r in gaps if r.capacity_reason]
+    if dependency_gaps:
+        # NOT a pass and NOT a rollback: these endpoints proxy to the
+        # privacy-pdf-service, which an independent check found unreachable.
+        # The previous image proxies to the same address, so rolling back
+        # cannot fix it — it would only swap a good image out during an
+        # unrelated outage (which is exactly what happened 2026-08-01).
+        names = ", ".join(f"{r.name}" for r in dependency_gaps)
+        reason = dependency_gaps[0].dependency_reason
+        print(f"SMOKE_DEPENDENCY: {len(passed)}/{len(results)} probes passed, "
+              f"{len(dependency_gaps)} UNVERIFIED — {reason}: {names} "
+              f"(profile={args.profile})", file=sys.stderr)
+        print(
+            "  ⚠️  The privacy-pdf-service these endpoints proxy to is unreachable. That is "
+            "a DEPENDENCY outage, not a regression in this build: the previous image proxies "
+            "to the same PRIVACY_SERVICE_URL and fails identically, so this does NOT roll the "
+            "deploy back. It also does NOT prove these endpoints work. Check the dependency: "
+            "curl $AI_BRIDGE_URL/v1/privacy/status -H \"Authorization: Bearer $AI_BRIDGE_API_KEY\" "
+            "and verify PRIVACY_SERVICE_URL on the workers "
+            "(docker exec <worker> printenv PRIVACY_SERVICE_URL) is reachable from the host. "
+            "Re-run once it recovers: python3 scripts/bridge_smoke.py --base-url <url> "
+            "--profile <profile> --only <probe>.",
+            file=sys.stderr,
+        )
+
     if capacity_gaps:
         # NOT a pass and NOT a rollback: the endpoints below were never
         # exercised because no Anthropic account had headroom. Loud on stderr
@@ -637,6 +792,8 @@ def main():
             "(capacity_lock_remaining_s / weekly_percent per account).",
             file=sys.stderr,
         )
+
+    if gaps:
         sys.exit(0)
 
     print(f"SMOKE_OK: {len(results)}/{len(results)} probes passed (profile={args.profile})")

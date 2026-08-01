@@ -88,7 +88,7 @@ from src.model_registry import (
 from src.file_discovery import FileDiscoveryService
 from src.session_manager import session_manager
 # Privacy: Use lightweight HTTP client (no Presidio/spaCy in worker)
-from src.privacy_client import get_privacy_client
+from src.privacy_client import get_privacy_client, privacy_timeout
 from src.tenant import (
     TenantMiddleware,
     get_tenant_from_request,
@@ -5920,7 +5920,7 @@ async def _smart_anonymize_core(
                 "language": language,
                 "context_hint": context_hint,
                 "prefix": prefix,
-            }, timeout=1200.0)  # Local Flair NER inference on CPU takes ~8-11s per
+            }, timeout=privacy_timeout(1200.0))  # Local Flair NER inference on CPU takes ~8-11s per
             # 1K chars under load (measured 2026-07-03), so 20min covers documents
             # up to roughly 110K chars. Memory is bounded regardless of size
             # (flair_recognizer windowing). Callers (document-pipeline client,
@@ -6102,7 +6102,7 @@ async def convert_pdf_endpoint(
             response = await client.post(
                 "/convert-pdf",
                 files={"file": (filename, pdf_bytes, "application/pdf")},
-                timeout=300.0,  # PDF conversion can take a while
+                timeout=privacy_timeout(300.0),  # PDF conversion can take a while
             )
         response.raise_for_status()
         data = response.json()
@@ -6156,7 +6156,7 @@ async def convert_pdf_to_semantic_html_endpoint(
             response = await client.post(
                 "/convert-pdf-to-semantic-html",
                 files={"file": (filename, pdf_bytes, "application/pdf")},
-                timeout=600.0,  # ConvertAPI + AI conversion can take several minutes
+                timeout=privacy_timeout(600.0),  # ConvertAPI + AI conversion can take several minutes
             )
         response.raise_for_status()
         _record_document_call_metrics(
@@ -6204,7 +6204,7 @@ async def convert_html_to_docx_endpoint(
             response = await client.post(
                 "/convert-html-to-docx",
                 json=body,
-                timeout=600.0,
+                timeout=privacy_timeout(600.0),
             )
         response.raise_for_status()
         _record_document_call_metrics(
@@ -6252,7 +6252,7 @@ async def convert_docx_to_html_endpoint(
             response = await client.post(
                 "/convert-docx-to-html",
                 json=body,
-                timeout=600.0,
+                timeout=privacy_timeout(600.0),
             )
         response.raise_for_status()
         _record_document_call_metrics(
@@ -6305,7 +6305,7 @@ async def convert_html_to_pdf_endpoint(
             response = await client.post(
                 "/convert-html-to-pdf",
                 json=body,
-                timeout=600.0,
+                timeout=privacy_timeout(600.0),
             )
         response.raise_for_status()
         _duration_ms = int((time.time() - _start) * 1000)
@@ -6395,7 +6395,7 @@ async def convert_html_to_screenshot_endpoint(
             response = await client.post(
                 "/convert-html-to-screenshot",
                 json=body,
-                timeout=600.0,
+                timeout=privacy_timeout(600.0),
             )
         response.raise_for_status()
         _duration_ms = int((time.time() - _start) * 1000)
@@ -6479,7 +6479,7 @@ async def convert_pdf_to_html_direct_endpoint(
             response = await client.post(
                 "/convert-pdf-to-html-direct",
                 json=body,
-                timeout=600.0,
+                timeout=privacy_timeout(600.0),
             )
         response.raise_for_status()
         _record_document_call_metrics(
@@ -6554,7 +6554,7 @@ async def _proxy_document_endpoint(
                 downstream_path,
                 files={"file": (filename, content, content_type)},
                 data=extra_data,
-                timeout=timeout,
+                timeout=privacy_timeout(timeout),
             )
 
         # Surface upstream status codes 1:1 so callers see 415/413/etc.

@@ -21,6 +21,47 @@ logger = logging.getLogger(__name__)
 # Internal Docker service URL
 PRIVACY_SERVICE_URL = os.getenv("PRIVACY_SERVICE_URL", "http://privacy-service:8100")
 
+# How long to wait for the TCP connection to the privacy service to be
+# ESTABLISHED — deliberately separate from the (deliberately long) read
+# timeouts the callers pass in.
+#
+# Why this exists (2026-08-01 outage): every caller used to pass a scalar
+# `timeout=600.0`, and httpx applies a scalar to ALL four phases — connect,
+# read, write, pool. So an unreachable privacy service did not fail at "600s
+# of work", it fell through to the kernel: an unanswered SYN retries for
+# tcp_syn_retries=6 (~63s of backoff + a final ~64s wait) and only then
+# raises ConnectError — a measured 133.5-136.4s per request, every request.
+# During that window the request occupies a worker slot, nginx sees a 500 and
+# relabels it as "bridge at capacity", and a deploy smoke reads the whole
+# thing as a broken endpoint. The dependency being DOWN and the dependency
+# being SLOW are different failures and must fail on different clocks.
+#
+# 10s is far above any healthy path (the local container answers /health in
+# ~2ms, the Tailscale-remote GPU host in ~50ms) and far below the kernel's
+# ~127s, so an unreachable service now fails loud and fast while a genuinely
+# slow inference call keeps its full read budget.
+PRIVACY_CONNECT_TIMEOUT_S = float(os.getenv("PRIVACY_SERVICE_CONNECT_TIMEOUT_S", "10"))
+
+# Default read budget for short control calls (/status, /health).
+PRIVACY_DEFAULT_READ_TIMEOUT_S = 30.0
+
+
+def privacy_timeout(read_s: float = PRIVACY_DEFAULT_READ_TIMEOUT_S) -> httpx.Timeout:
+    """Timeout for a privacy-service call: short connect, caller-chosen read.
+
+    Pass this instead of a bare float wherever a long timeout is needed, so
+    the long budget applies to WAITING FOR AN ANSWER, never to finding the
+    server. `read_s` also covers write (large document uploads) and pool
+    (the privacy service is single-worker, so queueing for a free connection
+    is legitimate work, not a fault).
+    """
+    return httpx.Timeout(
+        connect=PRIVACY_CONNECT_TIMEOUT_S,
+        read=read_s,
+        write=read_s,
+        pool=read_s,
+    )
+
 
 class PrivacyServiceClient:
     """
@@ -45,7 +86,7 @@ class PrivacyServiceClient:
         if self._client is None or self._client.is_closed:
             self._client = httpx.AsyncClient(
                 base_url=self.base_url,
-                timeout=30.0,
+                timeout=privacy_timeout(),
             )
         return self._client
 
