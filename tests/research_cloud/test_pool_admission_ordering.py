@@ -33,7 +33,10 @@ for _mod_name in [
     if _mod_name not in sys.modules:
         sys.modules[_mod_name] = _MagicMock()
 
+import ast  # noqa: E402
+import inspect  # noqa: E402
 import json  # noqa: E402
+import textwrap  # noqa: E402
 from unittest.mock import MagicMock, patch  # noqa: E402
 
 import pytest  # noqa: E402
@@ -180,3 +183,66 @@ def test_research_route_uses_body_cache_dependency_not_the_admitting_one():
     deps = [d.call for d in route.dependant.dependencies]
     assert cache_request_body_dependency in deps
     assert adaptive_limit_dependency not in deps
+
+
+# ---------------------------------------------------------------------------
+# Structural: pool admission must stay INSIDE the pool-bound branch
+# ---------------------------------------------------------------------------
+def _admit_calls_within(node) -> list:
+    """Every _admit_research_to_pool() call reachable from `node`."""
+    return [
+        n for n in ast.walk(node)
+        if isinstance(n, ast.Call)
+        and isinstance(n.func, ast.Name)
+        and n.func.id == "_admit_research_to_pool"
+    ]
+
+
+def _guards_the_pool_branch(test) -> bool:
+    """True for exactly `not _use_research_cloud`."""
+    return (
+        isinstance(test, ast.UnaryOp)
+        and isinstance(test.op, ast.Not)
+        and isinstance(test.operand, ast.Name)
+        and test.operand.id == "_use_research_cloud"
+    )
+
+
+def test_pool_admission_is_only_reachable_on_the_pool_bound_branch():
+    """The cloud path must stay admissible while the pool is at its wall.
+
+    That is the entire point of the ordering: the research-cloud path runs on
+    the Anthropic 1P API, consumes zero pool capacity, and its overflow trigger
+    IS pool saturation. Admitting it against pool capacity makes the overflow
+    unreachable in exactly the state it exists for, and locks out cloud-PINNED
+    users outright.
+
+    The sibling cases above all pin the POOL branch; the route test above pins
+    the dependency. Neither notices if someone lifts the admission call out of
+    `if not _use_research_cloud:` inside the handler — the pool cases still
+    pass, and the damage shows up only as cloud users being refused during a
+    capacity window, which is precisely when nobody is looking for a routing
+    bug. Asserted structurally because a behavioural test would have to stand up
+    the whole 200-line handler and would mock away the very branch in question.
+    """
+    tree = ast.parse(textwrap.dedent(inspect.getsource(src.main.research)))
+
+    all_calls = _admit_calls_within(tree)
+    assert all_calls, (
+        "the research handler no longer calls _admit_research_to_pool — if the "
+        "gate moved, move this invariant with it rather than deleting it"
+    )
+
+    guarded = [
+        call
+        for node in ast.walk(tree)
+        if isinstance(node, ast.If) and _guards_the_pool_branch(node.test)
+        for stmt in node.body
+        for call in _admit_calls_within(stmt)
+    ]
+
+    assert len(guarded) == len(all_calls), (
+        f"{len(all_calls) - len(guarded)} of {len(all_calls)} "
+        "_admit_research_to_pool() call(s) sit outside `if not "
+        "_use_research_cloud:` — pool capacity would gate the cloud branch too"
+    )
