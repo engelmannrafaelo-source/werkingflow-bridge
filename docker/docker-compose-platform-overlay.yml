@@ -90,7 +90,38 @@ services:
       - bridge-net
       - bridge-prod-net
 
+  # ===========================================================================
+  # TLS-Terminator (Mollie-Webhook) — bridge.werking.tools
+  # Mollie ruft Webhooks NUR über HTTPS; BRIDGE_PUBLIC_URL zeigt seit der
+  # Billing-Einführung auf https://bridge.werking.tools, aber der Host hatte
+  # nie einen 443-Listener → Zahlungen wurden nie gutgeschrieben (02.08.2026).
+  # Caddy terminiert TLS (Zertifikate automatisch via Let's Encrypt, Retry bis
+  # der DNS-A-Record existiert) und reicht 1:1 an den OpenResty-LB weiter —
+  # additiv, keinerlei Änderung an dessen Routing-/Failover-Logik.
+  # ===========================================================================
+  caddy-tls:
+    image: caddy:2.8
+    container_name: wt-caddy-tls
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile.hetzner:/etc/caddy/Caddyfile:ro
+      - caddy-tls-data:/data
+      - caddy-tls-config:/config
+    networks:
+      - bridge-net
+    depends_on:
+      - nginx
+
 networks:
   bridge-prod-net:
     external: true
     name: docker_bridge-prod-net
+
+volumes:
+  caddy-tls-data:
+    driver: local
+  caddy-tls-config:
+    driver: local

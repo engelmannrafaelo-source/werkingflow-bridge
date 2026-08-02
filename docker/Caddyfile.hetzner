@@ -1,0 +1,16 @@
+# TLS-Terminator der DEV-Bridge (hetzner, 49.12.72.66) — Caddyfile.
+#
+# Zweck: BRIDGE_PUBLIC_URL=https://bridge.werking.tools erreichbar machen —
+# Mollie akzeptiert nur HTTPS-Webhooks (/v1/billing/mollie-webhook), und ohne
+# diesen Terminator gab es auf dem Host keinen 443-Listener: jede Zahlung
+# blieb bei Mollie "paid", das Guthaben kam nie an (Befund 02.08.2026).
+#
+# Caddy holt und erneuert die Let's-Encrypt-Zertifikate selbst (HTTP-01 über
+# :80) und wiederholt die Ausstellung automatisch, solange der DNS-Eintrag
+# noch fehlt — Deploy darf also VOR dem DNS-Eintrag passieren.
+#
+# Additiv vor dem bestehenden LB: reine Weiterleitung an den OpenResty-LB
+# (Compose-Service `nginx`), KEINE eigene Routing-/Failover-Logik hier.
+bridge.werking.tools {
+	reverse_proxy nginx:80
+}

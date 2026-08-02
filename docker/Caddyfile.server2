@@ -1,0 +1,17 @@
+# TLS-Terminator der PROD-Bridge (server2, 178.104.178.79) — Caddyfile.
+#
+# Zweck: BRIDGE_PUBLIC_URL=https://prod-bridge.werking.tools erreichbar machen —
+# Mollie akzeptiert nur HTTPS-Webhooks (/v1/billing/mollie-webhook, Live-Key!),
+# und ohne diesen Terminator gab es auf dem Host keinen 443-Listener: jede
+# Kundenzahlung bliebe bei Mollie "paid", ohne dass Guthaben ankommt
+# (Befund 02.08.2026 auf der Dev-Bridge; Prod hätte identisch versagt).
+#
+# Caddy holt und erneuert die Let's-Encrypt-Zertifikate selbst (HTTP-01 über
+# :80) und wiederholt die Ausstellung automatisch, solange der DNS-Eintrag
+# noch fehlt — Deploy darf also VOR dem DNS-Eintrag passieren.
+#
+# Additiv vor dem bestehenden LB: reine Weiterleitung an den OpenResty-LB
+# (Compose-Service `nginx`), KEINE eigene Routing-/Failover-Logik hier.
+prod-bridge.werking.tools {
+	reverse_proxy nginx:80
+}
