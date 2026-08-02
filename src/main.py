@@ -482,6 +482,15 @@ async def lifespan(app: FastAPI):
     validate_billing_integrity()
     logger.info("✅ Billing integrity OK — every servable model is priced")
 
+    # FAIL-FAST config invariant: a worker that declares DB-backed features must
+    # actually have the database. Guards against losing the platform overlay on a
+    # container recreate, which leaves the worker healthy-looking but hollow.
+    from src.config_invariants import assert_declared_db_features_have_a_database
+    assert_declared_db_features_have_a_database(
+        db_client_available=BRIDGE_DB_CLIENT_AVAILABLE
+    )
+    logger.info("✅ Config integrity OK — declared DB-backed features have a database")
+
     # Validate authentication first
     auth_valid, auth_info = validate_claude_code_auth()
     
