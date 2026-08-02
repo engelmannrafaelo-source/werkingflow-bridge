@@ -14,7 +14,12 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from src.jobs.executors import chat_executor, convert_html_to_pdf_executor, ping_executor
+from src.jobs.executors import (
+    chat_executor,
+    convert_html_to_pdf_executor,
+    ping_executor,
+    research_executor,
+)
 
 
 class _FakeResp:
@@ -205,6 +210,86 @@ async def test_chat_executor_4xx_carries_original_status():
             await chat_executor({"messages": []}, None, AsyncMock())
     assert ei.value.status_code == 400
     assert "ValidationException" in str(ei.value)
+
+
+# ---------------------------------------------------------------------------
+# research_executor — /v1/research self-call always answers HTTP 200
+# (ResearchResponse.status carries the outcome, never the wire status), so
+# the executor must inspect the body itself instead of trusting status<400.
+# ---------------------------------------------------------------------------
+
+async def test_research_executor_success_passes_result_through():
+    resp = _FakeResp(200, {"status": "success", "content": "# Report", "query": "q", "model": "m"})
+    fake = _FakeClient(resp)
+    with patch("httpx.AsyncClient", return_value=fake), \
+         patch("src.auth.auth_manager.get_api_key", return_value="k"):
+        out = await research_executor({"query": "q"}, {"app_id": "werking-report"}, AsyncMock())
+
+    assert out == resp._json
+    call = fake.calls[0]
+    assert call["url"].endswith("/v1/research")
+    assert call["json"]["async_mode"] is False  # forced blocking regardless of caller input
+
+
+async def test_research_executor_body_status_error_raises_not_marked_done():
+    """The defect this guards: a 200 response carrying status='error' was
+    previously returned as-is, so registry._run_body called store.mark_done()
+    on a FAILED research run — the job read back as 'done' with no content,
+    and the real error message (incl. any retryable marker) never reached
+    the job's error field at all."""
+    resp = _FakeResp(200, {
+        "status": "error",
+        "query": "q",
+        "model": "m",
+        "error": 'research-cloud exhausted same-path retries (bridge: HTTP 503, "retryable": true)',
+    })
+    fake = _FakeClient(resp)
+    with patch("httpx.AsyncClient", return_value=fake), \
+         patch("src.auth.auth_manager.get_api_key", return_value="k"):
+        with pytest.raises(RuntimeError) as ei:
+            await research_executor({"query": "q"}, None, AsyncMock())
+    assert "retryable" in str(ei.value)
+    assert "503" in str(ei.value)
+
+
+async def test_research_executor_http_error_still_fails_loud():
+    fake = _FakeClient(_FakeResp(503, text="Bridge at capacity"))
+    with patch("httpx.AsyncClient", return_value=fake), \
+         patch("src.auth.auth_manager.get_api_key", return_value="k"):
+        with pytest.raises(RuntimeError) as ei:
+            await research_executor({"query": "q"}, None, AsyncMock())
+    assert "503" in str(ei.value)
+
+
+async def test_research_executor_body_status_error_reaches_registry_as_job_error():
+    """End-to-end through registry._run_body: a status='error' self-call body
+    must land the job in status='error' (not 'done'), with the message
+    carrying the original error text — this is what lets a retryable marker
+    actually reach the polling app."""
+    from src.jobs import registry
+
+    resp = _FakeResp(200, {"status": "error", "query": "q", "model": "m", "error": "cap reached (HTTP 503)"})
+    fake = _FakeClient(resp)
+    recorded = {}
+
+    async def _mark_error(job_id, message, code=None):
+        recorded.update({"job_id": job_id, "message": message, "code": code})
+
+    async def _mark_done(job_id, result):
+        recorded["wrongly_marked_done"] = True
+
+    with patch("httpx.AsyncClient", return_value=fake), \
+         patch("src.auth.auth_manager.get_api_key", return_value="k"), \
+         patch.object(registry, "get_executor", return_value=research_executor), \
+         patch.object(registry.store, "mark_error", _mark_error), \
+         patch.object(registry.store, "mark_done", _mark_done), \
+         patch.object(registry.store, "heartbeat", AsyncMock()), \
+         patch.object(registry.store, "update_progress", AsyncMock()):
+        await registry._run_body("job-1", "research", {"query": "q"}, None)
+
+    assert "wrongly_marked_done" not in recorded
+    assert recorded["code"] == "EXECUTOR_ERROR"
+    assert "HTTP 503" in recorded["message"]
 
 
 async def test_registry_persists_upstream_status_code():

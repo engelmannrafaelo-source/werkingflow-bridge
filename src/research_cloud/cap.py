@@ -5,12 +5,13 @@ same shape, same fail-open contract, different ledger marker and different
 caller behavior on "over cap":
 
   - prepaid_vision_over_cap(): over_cap -> the vision call is REJECTED (429).
-  - research_cloud_over_cap(): over_cap -> the JOB IS NOT rejected. The
-    caller (the /v1/research routing decision, before execution starts)
-    falls back to the subscription-worker pool instead of booking the cloud
-    call. This is the one place a silent fallback is legitimate per
-    DESIGN.md — everywhere else in the research-cloud path a failure must be
-    a loud job error, never a silent reroute mid-run.
+  - research_cloud_over_cap(): over_cap -> the caller (the /v1/research
+    routing decision in src/research_cloud/routing.py, before execution
+    starts) raises ResearchCloudCapExceededError instead of booking the
+    cloud call. Until 2026-08-02 this fell back to the subscription-worker
+    pool instead — a silent replacement of provider/cost-model/privacy
+    posture. That fallback is gone: the caller now stops and defers, same as
+    every other failure in the research-cloud path.
 
 Env (Rafael-Go 2026-07-25, DESIGN.md "Entscheidungen" #2 — startwert 50 EUR/Tag):
 

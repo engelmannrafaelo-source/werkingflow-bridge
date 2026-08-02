@@ -94,7 +94,24 @@ class ResearchCloudExecutorError(Exception):
 
     Never caught-and-silently-rerouted mid-run — once the cloud path has
     started, a failure here is a job error (kein Silent-Fallback in den Pool).
+
+    `status_code` is set only when the failure came from a non-200 Messages
+    API response — it carries the upstream HTTP status so the caller can
+    decide retryability without parsing the message text (config/protocol
+    failures below leave it None).
     """
+
+    def __init__(self, message: str, *, status_code: Optional[int] = None):
+        super().__init__(message)
+        self.status_code = status_code
+
+
+# Anthropic Messages API statuses that mean "try again later, nothing is
+# wrong with the request itself" — 429 rate-limit and every 5xx (incl. 529
+# overloaded_error, which is not a documented HTTP code but observed live).
+# Anything else (400/401/403/404/...) is a rejected or malformed request;
+# retrying it changes nothing.
+TRANSIENT_HTTP_STATUSES = frozenset({429, 500, 502, 503, 504, 508, 509, 529})
 
 
 def _mark_cache_control(messages: List[Dict[str, Any]]) -> None:
@@ -282,7 +299,8 @@ async def run_research_cloud(
             if response.status_code != 200:
                 raise ResearchCloudExecutorError(
                     f"research-cloud Messages API call failed: HTTP {response.status_code}: "
-                    f"{response.text[:500]}"
+                    f"{response.text[:500]}",
+                    status_code=response.status_code,
                 )
             parsed = AnthropicMessagesResponse(**response.json())
 

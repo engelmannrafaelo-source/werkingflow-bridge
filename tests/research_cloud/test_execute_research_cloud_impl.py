@@ -136,6 +136,88 @@ async def test_executor_failure_returns_job_error_not_silent_fallback():
 
 
 @pytest.mark.asyncio
+async def test_transient_upstream_status_marks_error_retryable():
+    """A capacity-shaped upstream failure (429/5xx) must be recognizable as
+    retryable by the app-side classifier (werking-report
+    transient-infra-error.ts isTransientInfraError) — Rafael 2026-08-02: a
+    surfaced cloud error that isn't recognizable as retryable becomes a hard
+    failure instead of a deferred one, which is worse than today's silent
+    pool fallback it replaces."""
+    req = _make_req()
+    with (
+        patch(
+            "src.research_cloud.anonymize_gate.anonymize_query_for_cloud",
+            new=AsyncMock(return_value="ANON_ query"),
+        ),
+        patch(
+            "src.research_cloud.executor.run_research_cloud",
+            new=AsyncMock(side_effect=ResearchCloudExecutorError(
+                "research-cloud Messages API call failed: HTTP 529: overloaded_error",
+                status_code=529,
+            )),
+        ),
+        patch("src.activity.ai_call_writer.persist_ai_call_activity", new=AsyncMock()),
+        patch("src.scholarly.scholarly_enabled", return_value=False),
+    ):
+        result = await src.main._execute_research_cloud_impl(MagicMock(), req, attribution_ctx={})
+
+    assert result.status == "error"
+    # 529 itself is not in the app's regex — the Bridge must normalize to a
+    # marker the app DOES recognize (the literal digits survive job-layer
+    # JSON re-stringification, unlike a quoted "retryable": true substring).
+    import re
+    assert re.search(r"\b503\b", result.error)
+
+
+@pytest.mark.asyncio
+async def test_permanent_upstream_status_is_not_marked_retryable():
+    """A deterministic 400 (bad request / code bug) must stay a hard failure
+    — marking it retryable would mask a real bug behind a pointless 20h
+    app-side wait loop that will never succeed."""
+    req = _make_req()
+    with (
+        patch(
+            "src.research_cloud.anonymize_gate.anonymize_query_for_cloud",
+            new=AsyncMock(return_value="ANON_ query"),
+        ),
+        patch(
+            "src.research_cloud.executor.run_research_cloud",
+            new=AsyncMock(side_effect=ResearchCloudExecutorError(
+                "research-cloud Messages API call failed: HTTP 400: bad request",
+                status_code=400,
+            )),
+        ),
+        patch("src.activity.ai_call_writer.persist_ai_call_activity", new=AsyncMock()),
+        patch("src.scholarly.scholarly_enabled", return_value=False),
+    ):
+        result = await src.main._execute_research_cloud_impl(MagicMock(), req, attribution_ctx={})
+
+    assert result.status == "error"
+    assert "retryable" not in result.error
+    import re
+    assert not re.search(r"\b503\b", result.error)
+
+
+@pytest.mark.asyncio
+async def test_anonymize_gate_failure_is_not_marked_retryable():
+    """A compliance/config failure (e.g. privacy service refuses the
+    anonymize gate) has no status_code to classify as transient — it must
+    stay a hard failure, same as before this change."""
+    req = _make_req()
+    with (
+        patch(
+            "src.research_cloud.anonymize_gate.anonymize_query_for_cloud",
+            new=AsyncMock(side_effect=CloudAnonymizeError("privacy-service down")),
+        ),
+        patch("src.research_cloud.executor.run_research_cloud", AsyncMock()),
+    ):
+        result = await src.main._execute_research_cloud_impl(MagicMock(), req, attribution_ctx={})
+
+    assert result.status == "error"
+    assert "retryable" not in result.error
+
+
+@pytest.mark.asyncio
 async def test_output_path_is_written_by_bridge(tmp_path):
     out_path = tmp_path / "report.md"
     req = _make_req(output_path=str(out_path))

@@ -85,35 +85,6 @@ def test_pool_exhausted_marker_no_request_is_false():
 
 
 # ---------------------------------------------------------------------------
-# The pool-capacity signal — ONE definition, shared with the overflow trigger
-# ---------------------------------------------------------------------------
-def test_pool_availability_uses_the_same_signal_as_the_overflow_trigger():
-    """_pool_can_serve_research must agree with is_worker_pool_saturated: if the
-    two ever disagreed, research could pick the cloud path (pool saturated)
-    while still arming the pool fallback (pool 'available')."""
-    with patch("src.research_cloud.pool_signal.is_worker_pool_saturated", return_value=True):
-        assert src.main._pool_can_serve_research(_request({})) is False
-    with patch("src.research_cloud.pool_signal.is_worker_pool_saturated", return_value=False):
-        assert src.main._pool_can_serve_research(_request({})) is True
-
-
-def test_pool_availability_honours_the_nginx_marker_without_probing():
-    """The marker is authoritative for the WHOLE pool; this worker's own
-    saturation cannot override it."""
-    with patch("src.research_cloud.pool_signal.is_worker_pool_saturated",
-               return_value=False) as probe:
-        assert src.main._pool_can_serve_research(_request({"X-Pool-Exhausted": "1"})) is False
-        probe.assert_not_called()
-
-
-def test_pool_availability_probe_failure_assumes_usable():
-    """Unknown capacity must not silently disable the reliability fallback."""
-    with patch("src.research_cloud.pool_signal.is_worker_pool_saturated",
-               side_effect=RuntimeError("boom")):
-        assert src.main._pool_can_serve_research(_request({})) is True
-
-
-# ---------------------------------------------------------------------------
 # _admit_research_to_pool — the marker is the cheapest gate and short-circuits
 # ---------------------------------------------------------------------------
 @pytest.mark.asyncio
@@ -171,36 +142,23 @@ async def test_pool_bound_request_admitted_runs_the_adaptive_budget():
 
 
 # ---------------------------------------------------------------------------
-# The cloud branch: no pool fallback when the pool provably cannot serve it
+# The cloud branch: NEVER falls back to the pool, regardless of pool health
+# (Rafael 2026-08-02 — see tests/research_cloud/test_pool_fallback.py for the
+# same-path-retry behaviour this invariant now has instead).
 # ---------------------------------------------------------------------------
 @pytest.mark.asyncio
-async def test_cloud_failure_does_not_retry_on_an_exhausted_pool():
-    cloud = AsyncMock(return_value=_resp("error", error="cloud boom"))
-    pool = AsyncMock()
-    with patch.object(src.main, "_execute_research_cloud_impl", cloud), \
-         patch.object(src.main, "_execute_research_impl", pool):
-        out = await src.main._execute_research_cloud_with_pool_fallback(
-            _request({}), MagicMock(), pool_available=False
-        )
-
-    # The real cloud error is surfaced, not buried behind a doomed second call.
-    assert out.status == "error" and "cloud boom" in out.error
-    pool.assert_not_awaited()
-
-
-@pytest.mark.asyncio
-async def test_cloud_failure_still_retries_on_a_healthy_pool():
-    """Regression guard for the reliability fallback (Rafael 2026-07-27)."""
+async def test_cloud_failure_never_touches_the_pool_even_when_it_is_healthy():
     cloud = AsyncMock(return_value=_resp("error", error="cloud boom"))
     pool = AsyncMock(return_value=_resp("success", content="# Report"))
     with patch.object(src.main, "_execute_research_cloud_impl", cloud), \
          patch.object(src.main, "_execute_research_impl", pool):
         out = await src.main._execute_research_cloud_with_pool_fallback(
-            _request({}), MagicMock(), pool_available=True
+            _request({}), MagicMock()
         )
 
-    assert out.status == "success"
-    pool.assert_awaited_once()
+    # The real cloud error is surfaced, not buried behind a silent pool run.
+    assert out.status == "error" and "cloud boom" in out.error
+    pool.assert_not_awaited()
 
 
 # ---------------------------------------------------------------------------

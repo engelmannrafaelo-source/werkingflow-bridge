@@ -206,12 +206,27 @@ async def research_executor(
     """Run a /v1/research call as a durable job. Calls the existing endpoint in
     BLOCKING mode (async_mode forced off) so this executor receives the full result;
     durability/requeue comes from the job layer, NOT the legacy file-based research-
-    async path. Returns the research result dict. Fail loud on non-2xx."""
+    async path. Returns the research result dict. Fail loud on non-2xx.
+
+    /v1/research always answers 200 (ResearchResponse.status carries the
+    outcome, never the HTTP status), so a plain non-2xx check here would miss
+    every research failure — the job would be marked 'done' with an empty
+    result instead of 'error' (same defect convert_html_to_pdf_executor
+    already guards against for its own JSON contract). Checking
+    result["status"] here is what lets a caller's error message (e.g. a
+    research-cloud failure marked retryable, see src.main._mark_retryable)
+    actually reach the job's error field instead of being swallowed as a
+    false success."""
     # Force blocking: if the caller left async_mode=true we'd get a job-id back
     # instead of the result. The job layer is the durability mechanism here.
     body = {**payload, "async_mode": False}
     await report_progress({"phase": "research", "model": body.get("model")})
-    return await _self_post_json("/v1/research", body, attribution, RESEARCH_SELF_CALL_TIMEOUT_S)
+    result = await _self_post_json("/v1/research", body, attribution, RESEARCH_SELF_CALL_TIMEOUT_S)
+    if result.get("status") == "error":
+        raise RuntimeError(
+            f"research self-call returned status=error: {result.get('error') or 'no error message'}"
+        )
+    return result
 
 
 async def doc_agent_executor(

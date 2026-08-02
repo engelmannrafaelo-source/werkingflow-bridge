@@ -104,6 +104,23 @@ async def test_failed_routing_probe_keeps_the_veto():
         assert await _job_runs_off_pool(body, {"user_id": "u1"}) is False
 
 
+@pytest.mark.asyncio
+async def test_cap_exceeded_keeps_the_veto_instead_of_widening_admission():
+    """resolve_research_cloud_routing raises ResearchCloudCapExceededError
+    (Rafael 2026-08-02, no silent pool fallback) when cloud was the committed
+    answer but the daily cap is out — this job genuinely cannot run right
+    now on either path, so the existing conservative except-Exception here
+    correctly keeps the capacity veto (429) rather than admitting a job that
+    would immediately fail inside the research handler."""
+    from src.jobs.routes import JobCreateRequest, _job_runs_off_pool
+    from src.research_cloud.routing import ResearchCloudCapExceededError
+
+    body = JobCreateRequest(kind="research", payload={"cloud_overflow": True})
+    p, _ = _routing(raises=ResearchCloudCapExceededError(50.0, 50.0))
+    with p:
+        assert await _job_runs_off_pool(body, {"user_id": "u1"}) is False
+
+
 # ---------------------------------------------------------------------------
 # End-to-end through the endpoint, on a capacity-LOCKED worker
 # ---------------------------------------------------------------------------

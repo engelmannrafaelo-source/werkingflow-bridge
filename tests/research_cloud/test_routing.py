@@ -8,7 +8,10 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from src.research_cloud.routing import resolve_research_cloud_routing
+from src.research_cloud.routing import (
+    ResearchCloudCapExceededError,
+    resolve_research_cloud_routing,
+)
 
 
 def _patches(*, pinned=None, saturated=False, over_cap=False):
@@ -69,16 +72,23 @@ async def test_explicit_pin_routes_to_cloud_without_overflow_flag(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_daily_cap_overrides_explicit_pin(monkeypatch):
+async def test_daily_cap_defers_explicit_pin_instead_of_falling_back(monkeypatch):
+    """Over cap while pinned to cloud MUST raise, not silently return to the
+    pool (Rafael 2026-08-02: no silent provider swap) — the pin is a
+    compliance/preference commitment the pool cannot legitimately substitute."""
     monkeypatch.setenv("RESEARCH_CLOUD_ENABLED", "true")
     p1, p2, p3 = _patches(pinned="cloud", saturated=False, over_cap=True)
     with p1, p2, p3:
-        assert await resolve_research_cloud_routing("user-1", cloud_overflow=False) is False
+        with pytest.raises(ResearchCloudCapExceededError) as ei:
+            await resolve_research_cloud_routing("user-1", cloud_overflow=False)
+    assert ei.value.spent_eur == 0.0
+    assert ei.value.cap_eur == 50.0
 
 
 @pytest.mark.asyncio
-async def test_daily_cap_overrides_overflow_eligibility(monkeypatch):
+async def test_daily_cap_defers_overflow_eligibility_instead_of_falling_back(monkeypatch):
     monkeypatch.setenv("RESEARCH_CLOUD_ENABLED", "true")
     p1, p2, p3 = _patches(pinned=None, saturated=True, over_cap=True)
     with p1, p2, p3:
-        assert await resolve_research_cloud_routing("user-1", cloud_overflow=True) is False
+        with pytest.raises(ResearchCloudCapExceededError):
+            await resolve_research_cloud_routing("user-1", cloud_overflow=True)

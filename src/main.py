@@ -4189,6 +4189,22 @@ async def _execute_research_impl(
         )
 
 
+def _mark_retryable(message: str) -> str:
+    """Append the markers the app-side classifier (werking-report
+    transient-infra-error.ts isTransientInfraError) recognizes as
+    "wait, don't fail terminally": a literal 503 and a retryable:true pair.
+
+    The number is the one guaranteed to survive — a /v1/jobs error is
+    persisted as {"message", "code"} and re-JSON.stringify'd client-side
+    before the classifier ever sees it, which backslash-escapes an embedded
+    `"retryable": true` substring past the classifier's literal-quote regex.
+    Digits are untouched by that escaping, so HTTP 503 is what actually does
+    the work end-to-end; the quoted pair is kept for direct (non-jobs)
+    callers that read the raw response body text unstringified.
+    """
+    return f'{message} (bridge: HTTP 503, "retryable": true)'
+
+
 async def _execute_research_cloud_impl(
     request: Request,
     request_body: ResearchRequest,
@@ -4270,12 +4286,19 @@ async def _execute_research_cloud_impl(
             )
         except Exception as _track_err:
             logger.warning(f"research-cloud error activity tracking failed (non-fatal): {_track_err}")
+        from src.research_cloud.executor import TRANSIENT_HTTP_STATUSES
+        error_message = str(e)
+        if e.status_code in TRANSIENT_HTTP_STATUSES:
+            # A capacity/availability-shaped upstream failure (429/5xx) —
+            # mark it recognizable-retryable so the caller defers instead of
+            # treating it as a permanent break (see _mark_retryable).
+            error_message = _mark_retryable(error_message)
         return ResearchResponse(
             status="error",
             query=request_body.query,
             model=request_body.model,
             execution_time_seconds=round(execution_time, 2),
-            error=str(e),
+            error=error_message,
         )
 
     # Real-cost ledger booking — research-cloud always books real cost
@@ -4363,30 +4386,6 @@ def _pool_exhausted_marker(request: Optional[Request]) -> bool:
     return (request.headers.get(POOL_EXHAUSTED_HEADER) or "").strip() == "1"
 
 
-def _pool_can_serve_research(request: Optional[Request]) -> bool:
-    """False iff the subscription pool cannot serve this request.
-
-    ONE definition, combining the two signals that exist:
-      - nginx's marker      — the whole pool had no eligible account
-      - is_worker_pool_saturated — THIS worker's own capacity is spent
-
-    Deliberately the same function the overflow trigger reads
-    (src/research_cloud/pool_signal.py) rather than a second notion of "pool
-    full": if the two ever disagreed, research could take the cloud path
-    (saturated) while still arming the pool fallback ("available").
-    """
-    if _pool_exhausted_marker(request):
-        return False
-    try:
-        from src.research_cloud.pool_signal import is_worker_pool_saturated
-        return not is_worker_pool_saturated()
-    except Exception as exc:
-        # Unknown capacity must not silently disable the reliability fallback;
-        # assume the pool is usable and let the real gates speak.
-        logger.warning(f"pool saturation probe failed, assuming pool usable: {exc}")
-        return True
-
-
 async def _admit_research_to_pool(
     request: Request, worker_id: str
 ) -> Optional[JSONResponse]:
@@ -4443,45 +4442,49 @@ async def _admit_research_to_pool(
     return None
 
 
+# Same-path retries before a cloud failure is surfaced loud: 1 initial
+# attempt + 1 retry. Enough to absorb a one-off blip without burning minutes
+# on a doomed call — see _execute_research_cloud_with_pool_fallback.
+_RESEARCH_CLOUD_MAX_ATTEMPTS = 2
+
+
 async def _execute_research_cloud_with_pool_fallback(
     request: Optional[Request],
     request_body: ResearchRequest,
     attribution_ctx: Optional[Dict[str, Any]] = None,
-    pool_available: bool = True,
 ) -> ResearchResponse:
-    """Cloud first, subscription pool second — a production user never sees a
-    cloud-path failure (Rafael 2026-07-27: "automatisch im Hintergrund gelöst").
+    """Cloud only — retried on the SAME path, never replaced by the
+    subscription pool (Rafael 2026-08-02: "kein stiller Rückfall auf eine
+    andere Quelle" — production über Bedrock, Recherche direkt über
+    Anthropic).
 
-    The retry runs on the default pool backend (backend_config=None →
-    subscription OAuth env) — deliberately NOT the caller's original backend:
-    for Bedrock-pinned users that would be a web-search-less research. The
-    fallback is logged at ERROR so monitoring surfaces every occurrence —
-    automatic recovery is not the same as invisible recovery.
-
-    `pool_available=False` means the caller already established that the pool
-    cannot serve this request (see _pool_can_serve_research). Attempting
-    the fallback then would burn minutes on a call that can only end in
-    account_exhausted and would bury the real cloud error behind a second,
-    misleading one — so the cloud failure is surfaced as-is. Fail loud, once.
+    Until 2026-08-02 a cloud failure retried on the pool's default backend
+    (Rafael 2026-07-27: "automatisch im Hintergrund gelöst") — a different
+    provider, cost model and privacy posture, invisible to the caller. That
+    intent (a production user should not have to watch a transient cloud
+    hiccup kill their research) is still honored, just without swapping the
+    source: retry on cloud, and if that does not recover either, surface the
+    error marked retryable (_mark_retryable) so the caller defers instead of
+    failing terminally — the app-side wait strategy
+    (werking-report transient-infra-error.ts, up to 20h) already exists for
+    exactly this.
     """
-    result = await _execute_research_cloud_impl(
-        request, request_body, attribution_ctx=attribution_ctx
-    )
-    if result.status != "error":
-        return result
-    if not pool_available:
-        logger.error(
-            f"research-cloud run failed and the subscription pool is exhausted — "
-            f"no fallback available, surfacing the cloud error: {result.error}"
+    result: Optional[ResearchResponse] = None
+    for attempt in range(1, _RESEARCH_CLOUD_MAX_ATTEMPTS + 1):
+        result = await _execute_research_cloud_impl(
+            request, request_body, attribution_ctx=attribution_ctx
         )
-        return result
+        if result.status != "error":
+            return result
+        logger.error(
+            f"research-cloud run failed (attempt {attempt}/{_RESEARCH_CLOUD_MAX_ATTEMPTS}): "
+            f"{result.error}"
+        )
     logger.error(
-        f"research-cloud run failed — retrying on the subscription pool "
-        f"(reliability fallback): {result.error}"
+        "research-cloud exhausted same-path retries — surfacing the error "
+        "as-is instead of switching to the subscription pool"
     )
-    return await _execute_research_impl(
-        request_body, None, attribution_ctx=attribution_ctx
-    )
+    return result
 
 
 async def _run_async_research_job(
@@ -4491,7 +4494,6 @@ async def _run_async_research_job(
     attribution_ctx: Optional[Dict[str, Any]] = None,
     request: Optional[Request] = None,
     use_research_cloud: bool = False,
-    pool_available: bool = True,
 ) -> None:
     """Background runner that stores ResearchResponse as a JSON file in the
     shared async-jobs directory. Any worker can read it back.
@@ -4518,8 +4520,7 @@ async def _run_async_research_job(
     try:
         if use_research_cloud:
             result = await _execute_research_cloud_with_pool_fallback(
-                request, request_body, attribution_ctx=attribution_ctx,
-                pool_available=pool_available,
+                request, request_body, attribution_ctx=attribution_ctx
             )
         else:
             result = await _execute_research_impl(request_body, backend_config, attribution_ctx=attribution_ctx)
@@ -4743,11 +4744,28 @@ async def research(
         request_body.backend = BackendType.ANTHROPIC
         request_body.bedrock_region = None
         try:
-            from src.research_cloud.routing import resolve_research_cloud_routing
+            from src.research_cloud.routing import (
+                ResearchCloudCapExceededError,
+                resolve_research_cloud_routing,
+            )
             _use_research_cloud = await resolve_research_cloud_routing(
                 request.headers.get("X-User-ID"), True, implicit_pin=True
             )
+        except ResearchCloudCapExceededError as _rc_err:
+            # Cloud was the RIGHT answer (implicit Bedrock pin) and capacity
+            # ran out — that must defer, not quietly run on the pool (a
+            # different provider/cost-model/privacy posture). No fallback.
+            logger.error(f"research-cloud cap reached (bedrock research exception): {_rc_err}")
+            return ResearchResponse(
+                status="error",
+                query=request_body.query,
+                model=request_body.model,
+                error=_mark_retryable(str(_rc_err)),
+            )
         except Exception as _rc_err:
+            # Routing DECISION itself failed (e.g. DB blip probing capacity) —
+            # unlike a cap hit, no commitment to cloud was ever made, so the
+            # pool is the safe side (no cloud spend, no external send).
             logger.error(
                 f"research-cloud routing (bedrock research exception) failed — "
                 f"falling back to pool: {_rc_err}"
@@ -4755,7 +4773,10 @@ async def research(
             _use_research_cloud = False
     elif _research_pinned is None:
         try:
-            from src.research_cloud.routing import resolve_research_cloud_routing
+            from src.research_cloud.routing import (
+                ResearchCloudCapExceededError,
+                resolve_research_cloud_routing,
+            )
             from src.routing.research_provider_override import ResearchProviderOverrideError
             _use_research_cloud = await resolve_research_cloud_routing(
                 request.headers.get("X-User-ID"), bool(request_body.cloud_overflow)
@@ -4769,6 +4790,17 @@ async def research(
                 query=request_body.query,
                 model=request_body.model,
                 error=f"research provider pin unservable (no fallback by design): {_rc_err}",
+            )
+        except ResearchCloudCapExceededError as _rc_err:
+            # Same reasoning as the bedrock branch above: the pin/overflow
+            # decision already committed to cloud, so capacity being out must
+            # defer, not silently swap to the pool.
+            logger.error(f"research-cloud cap reached: {_rc_err}")
+            return ResearchResponse(
+                status="error",
+                query=request_body.query,
+                model=request_body.model,
+                error=_mark_retryable(str(_rc_err)),
             )
         except Exception as _rc_err:
             # Transient failure (e.g. DB blip during pin lookup): the pool is
@@ -4890,7 +4922,6 @@ async def research(
         asyncio.create_task(_run_async_research_job(
             request_body, backend_config, job_id, attribution_ctx=_research_attr,
             request=request, use_research_cloud=_use_research_cloud,
-            pool_available=_pool_can_serve_research(request),
         ))
         logger.info(f"📨 Async research job {job_id} dispatched (query: {request_body.query[:60]!r})")
         return ResearchResponse(
@@ -4907,8 +4938,7 @@ async def research(
     )
     if _use_research_cloud:
         return await _execute_research_cloud_with_pool_fallback(
-            request, request_body, attribution_ctx=_research_attr,
-            pool_available=_pool_can_serve_research(request),
+            request, request_body, attribution_ctx=_research_attr
         )
     return await _execute_research_impl(request_body, backend_config, attribution_ctx=_research_attr)
 

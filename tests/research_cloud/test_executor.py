@@ -9,6 +9,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from src.research_cloud.executor import (
+    TRANSIENT_HTTP_STATUSES,
     ResearchCloudExecutorError,
     _build_tools,
     _mark_cache_control,
@@ -191,15 +192,47 @@ async def test_http_error_raises_job_error_not_silent_fallback():
         return_value=_response(429, {}, text="rate limited upstream")
     )
 
-    with pytest.raises(ResearchCloudExecutorError, match="429"):
+    with pytest.raises(ResearchCloudExecutorError, match="429") as ei:
         await run_research_cloud("query", "system", api_key="sk-test", client=client)
+    # status_code lets the caller decide retryability without parsing text.
+    assert ei.value.status_code == 429
+
+
+@pytest.mark.asyncio
+async def test_http_500_carries_status_code_and_is_transient():
+    client = MagicMock()
+    client.post = AsyncMock(
+        return_value=_response(500, {}, text="internal server error")
+    )
+
+    with pytest.raises(ResearchCloudExecutorError) as ei:
+        await run_research_cloud("query", "system", api_key="sk-test", client=client)
+    assert ei.value.status_code == 500
+    assert ei.value.status_code in TRANSIENT_HTTP_STATUSES
+
+
+@pytest.mark.asyncio
+async def test_http_400_carries_status_code_and_is_not_transient():
+    """A deterministic client-error response must not be treated the same as
+    a capacity blip — retrying it changes nothing."""
+    client = MagicMock()
+    client.post = AsyncMock(
+        return_value=_response(400, {}, text="bad request")
+    )
+
+    with pytest.raises(ResearchCloudExecutorError) as ei:
+        await run_research_cloud("query", "system", api_key="sk-test", client=client)
+    assert ei.value.status_code == 400
+    assert ei.value.status_code not in TRANSIENT_HTTP_STATUSES
 
 
 @pytest.mark.asyncio
 async def test_missing_api_key_fails_loud(monkeypatch):
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
-    with pytest.raises(ResearchCloudExecutorError, match="ANTHROPIC_API_KEY"):
+    with pytest.raises(ResearchCloudExecutorError, match="ANTHROPIC_API_KEY") as ei:
         await run_research_cloud("query", "system", api_key=None, client=MagicMock())
+    # Config failure, not an upstream HTTP response — no status_code to carry.
+    assert ei.value.status_code is None
 
 
 def test_mark_cache_control_places_marker_on_last_block_only():
