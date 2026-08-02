@@ -76,6 +76,8 @@ SERVER2_NEEDS_BUILD="platform-api nginx worker-sahori worker-kurt metrics-reader
 # State (reset per server in deploy_server)
 ROLLBACK_SHA=""
 DEPLOYED_SERVICES=()
+# Phase 0 inspects THIS checkout, not a host — one verdict covers `both`.
+TOOLING_GATE_DONE="false"
 
 # ============================================================================
 # Logging
@@ -226,6 +228,34 @@ case "$SERVER" in
     server2) acquire_deploy_lock "server2" 211 ;;
     both)    acquire_deploy_lock "hetzner" 210; acquire_deploy_lock "server2" 211 ;;
 esac
+
+# ============================================================================
+# Phase 0: Tooling freshness (read-only, local — runs once per invocation)
+# ============================================================================
+# Phase 2 fast-forwards the HOST to origin/develop; Phase 5 judges the result
+# with the bridge_smoke.py sitting next to THIS file. Nothing kept those two in
+# step, so a stale checkout could fail a healthy Bridge and auto-roll-back good
+# commits. Delegated to check-tooling-freshness.sh, which is unit-tested in
+# tests/deploy/test_tooling_freshness.sh — see there for the exact policy
+# (behind = fatal, ahead/dirty = warning).
+phase_tooling_freshness_gate() {
+    [[ "$TOOLING_GATE_DONE" == "true" ]] && return 0
+    step "Phase 0: Tooling freshness (local checkout)"
+
+    local checker
+    checker="$(dirname "${BASH_SOURCE[0]}")/check-tooling-freshness.sh"
+    if [[ ! -x "$checker" ]]; then
+        error_ "ABORTED: freshness checker missing or not executable: ${checker}"
+        error_ "  It is the only thing standing between a stale smoke and an auto-rollback"
+        error_ "  of healthy code. Restore it rather than deploying unguarded."
+        return 1
+    fi
+
+    "$checker" || return 1
+
+    TOOLING_GATE_DONE="true"
+    return 0
+}
 
 # ============================================================================
 # Phase 1: Pre-flight checks (read-only)
@@ -1227,6 +1257,9 @@ deploy_server() {
     # Reset state
     ROLLBACK_SHA=""
     DEPLOYED_SERVICES=()
+
+    # === Phase 0 === (local, before anything reaches a host)
+    phase_tooling_freshness_gate || return 1
 
     # === Phase 1 ===
     phase_preflight "$host" || return 1
