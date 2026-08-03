@@ -18,6 +18,11 @@ Design (decided 2026-05-16, tightened 2026-05-28):
   • Fail-open on infrastructure errors: a DB hiccup in the budget check
     must NEVER take down the AI path. The error is logged loud; the call
     proceeds. Enforcement resumes as soon as the DB recovers.
+  • Fail-CLOSED on a malformed billing identity (2026-08-03). An infra
+    error and a caller sending garbage identity are different classes and
+    must not share a policy: the first is transient and outside the
+    caller's control, the second is a bug that silently costs money. Only
+    the first is fail-open. See MalformedUserIdentity in user_resolver.
   • Calls with no user_id or no app-plan are not gated (internal Bridge
     jobs, apps outside the plan catalog).
 
@@ -33,7 +38,11 @@ from fastapi import HTTPException
 
 from src.budget.plans import find_plan_for_app
 from src.budget.routes import evaluate_budget
-from src.identity.user_resolver import resolve_user_id
+from src.identity.user_resolver import (
+    MalformedUserIdentity,
+    UnresolvableUserIdentity,
+    resolve_user_id,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -76,11 +85,40 @@ async def enforce_budget(
 
     try:
         uid = await resolve_user_id(user_id)
-    except (ValueError, AttributeError, TypeError) as e:
-        # Unresolvable identity (malformed, or an email with no Bridge user) —
-        # can't evaluate, don't punish the call (gate stays fail-open by design).
-        # Email identities that DO resolve are now enforced like any UUID.
-        logger.warning("budget gate: unresolvable user_id %r (%s) — letting call through", user_id, e)
+    except MalformedUserIdentity as e:
+        # CALLER BUG — the identity is not even well-formed (a marker string,
+        # an empty value, garbage). No legitimate caller produces this, so it
+        # must fail CLOSED: letting it through means an unbudgeted call that
+        # nobody can attribute, bill or cap.
+        #
+        # This used to be fail-open together with the case below, which is how
+        # the public check funnel ran unmetered for months — it sent
+        # `anonymous:public-check-funnel`, hit this branch and was waved
+        # through (43,94 € in one morning, 2026-08-03).
+        #
+        # 400, not 402: the call is malformed, not out of money. A 402 would
+        # tell the user to top up, which would be a lie.
+        logger.error(
+            "budget gate: MALFORMED user_id %r for app=%s (%s) — rejecting. "
+            "The caller must send a resolvable billing identity.",
+            user_id, app_id, e,
+        )
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": "malformed_billing_identity",
+                "appId": app_id,
+                "message": (
+                    "Ungültige Abrechnungs-Identität. Der Aufrufer muss eine "
+                    "auflösbare Bridge-User-UUID (oder lizenzierte E-Mail) senden."
+                ),
+            },
+        ) from e
+    except UnresolvableUserIdentity as e:
+        # DATA condition — a well-formed email with no Bridge user behind it.
+        # Whether an unlicensed address should be blocked is a business call,
+        # not an architectural one, so the pre-existing fail-open policy stays.
+        logger.warning("budget gate: unknown user_id %r (%s) — letting call through", user_id, e)
         return
 
     if plan.interval == "project":
