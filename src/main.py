@@ -2325,13 +2325,59 @@ async def chat_completions(
                 }
             )
 
+        # APP-LEVEL PROVIDER POLICY: the Bridge — not the app or the user's
+        # individual pin state — decides which backend an APPLICATION's traffic
+        # runs on (Rafael, 2026-08-04: werking.tools' EU-data-residency promise
+        # is an app property, e.g. werking-report/-energy/-noise → Bedrock EU,
+        # engelmann → the flat-rate Anthropic pool). Runs only when the user
+        # carries no explicit pin — a per-user pin (e.g. the Kainer-AVV contract
+        # case) always wins over the app default. On a match this sets
+        # user_pinned_provider exactly like a user pin would: every downstream
+        # consumer that already refuses to re-route a "Bridge pinned this call"
+        # request (the Bedrock-pin gate, cross-provider fallback) protects an
+        # app-level pin the same way, with no separate wiring needed. A typo in
+        # the committed routing table (AppProviderPolicyError) is NOT swallowed
+        # — this is a compliance decision, unlike the cost-routing policy below.
+        if user_pinned_provider is None:
+            from src.routing.app_provider_policy import (
+                resolve_app_provider_policy, apply_app_provider_policy,
+                AppProviderPolicyError,
+            )
+            _app_rule, _app_rule_app_id = resolve_app_provider_policy(request)
+            if _app_rule is not None:
+                try:
+                    _app_applied = apply_app_provider_policy(request_body, _app_rule)
+                except AppProviderPolicyError as e:
+                    raise HTTPException(
+                        status_code=503,
+                        detail={
+                            "error": {
+                                "message": str(e),
+                                "type": "configuration_error",
+                                "code": "app_provider_policy_misconfigured",
+                                "hint": "APP_PROVIDER_RULES has an invalid entry for this app — fix src/routing/app_provider_policy.py.",
+                            }
+                        }
+                    )
+                if _app_applied:
+                    user_pinned_provider = _app_applied
+                    request.state.user_provider_pinned = _app_applied
+                    logger.info(
+                        "🏢 App-level provider policy: app=%s → provider=%s region=%s",
+                        _app_rule_app_id, _app_applied,
+                        getattr(request_body, "bedrock_region", None),
+                    )
+
         # APP-TIER ROUTING POLICY: the Bridge — not the app — decides that
         # certain (app, agent, env) routes must run on a specific tier. Concrete
         # case: werking-energy's large-input 'claims-generierung' overflows the
         # Claude-Code worker context (SDK compaction truncates the input) and
         # must use the direct Anthropic Messages API (claude-direct-notools).
-        # Runs ONLY when the user is not provider-pinned — a compliance pin
-        # (user_provider_override) always wins over cost routing. Gated by
+        # Runs ONLY when the user is not provider-pinned (user pin OR the
+        # app-level provider policy above) — a compliance/data-residency
+        # decision always wins over cost routing: forcing the no-tools direct
+        # Anthropic tier onto an app that the policy above just pinned to
+        # Bedrock would silently defeat the pin. Gated by
         # BRIDGE_APP_TIER_POLICY_ENABLED and fail-open: any error leaves routing
         # unchanged (a cost optimisation must never 5xx a live call).
         if user_pinned_provider is None:
@@ -4736,6 +4782,38 @@ async def research(
             model=request_body.model,
             error=f"user provider pin unservable (no fallback by design): {e}"
         )
+
+    # APP-LEVEL PROVIDER POLICY: same enforcement as chat completions — an
+    # app rule (e.g. werking-report/-energy/-noise → Bedrock EU, engelmann →
+    # Anthropic pool) applies whenever the user carries no explicit pin. This
+    # sets _research_pinned exactly like a user pin would, so it flows into
+    # the SAME "bedrock == research exception" branch immediately below —
+    # research cannot run on Bedrock at all (no WebSearch there), so an
+    # app-level Bedrock rule gets the identical anthropic+research-cloud
+    # exception a user-level Bedrock pin already gets, not a bypass of it.
+    if _research_pinned is None:
+        from src.routing.app_provider_policy import (
+            resolve_app_provider_policy, apply_app_provider_policy,
+            AppProviderPolicyError,
+        )
+        _app_rule, _app_rule_app_id = resolve_app_provider_policy(request)
+        if _app_rule is not None:
+            try:
+                _app_applied = apply_app_provider_policy(request_body, _app_rule)
+            except AppProviderPolicyError as e:
+                return ResearchResponse(
+                    status="error",
+                    query=request_body.query,
+                    model=request_body.model,
+                    error=f"app provider policy misconfigured (no fallback by design): {e}",
+                )
+            if _app_applied:
+                _research_pinned = _app_applied
+                request.state.user_provider_pinned = _app_applied
+                logger.info(
+                    "🏢 App-level provider policy (research): app=%s → provider=%s",
+                    _app_rule_app_id, _app_applied,
+                )
 
     # RESEARCH-CLOUD ROUTING: decide pool vs. cloud (Weg C) BEFORE backend
     # resolution — the cloud path is a different executor entirely (direct
