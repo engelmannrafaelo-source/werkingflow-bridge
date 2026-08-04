@@ -4119,7 +4119,12 @@ async def _execute_research_impl(
                 app_id=attribution_ctx.get("app_id") if attribution_ctx else None,
                 user_id=attribution_ctx.get("user_id") if attribution_ctx else None,
                 agent_id=f"research:{request_body.strategy or 'default'}",
-                workflow_id=None,
+                # workflow_id ist der project_id-Schlüssel der Apps (z. B. die
+                # checkId des Check-Trichters). None machte research:unified
+                # zum einzigen unzuordenbaren Posten eines Akts — gemessen
+                # 04.08.: 0,586 EUR (~12 % der Akt-Kosten), teuerster
+                # Einzelaufruf des Checks.
+                workflow_id=attribution_ctx.get("workflow_id") if attribution_ctx else None,
                 model=request_body.model,
                 input_tokens=_track_in or 0,
                 output_tokens=_track_out or 0,
@@ -4174,7 +4179,9 @@ async def _execute_research_impl(
                 app_id=attribution_ctx.get("app_id") if attribution_ctx else None,
                 user_id=attribution_ctx.get("user_id") if attribution_ctx else None,
                 agent_id=f"research:{request_body.strategy or 'default'}",
-                workflow_id=None,
+                # Gleicher Schlüssel wie im Erfolgspfad — auch ein gescheiterter
+                # Research gehört dem Akt zugerechnet, der ihn ausgelöst hat.
+                workflow_id=attribution_ctx.get("workflow_id") if attribution_ctx else None,
                 model=request_body.model,
                 input_tokens=_err_in or 0,
                 output_tokens=accumulated_output_tokens or 0,
@@ -4284,7 +4291,7 @@ async def _execute_research_cloud_impl(
                 app_id=attribution_ctx.get("app_id") if attribution_ctx else None,
                 user_id=attribution_ctx.get("user_id") if attribution_ctx else None,
                 agent_id=f"research-cloud:{request_body.strategy or 'default'}",
-                workflow_id=None,
+                workflow_id=attribution_ctx.get("workflow_id") if attribution_ctx else None,
                 model=config.model,
                 input_tokens=0,
                 output_tokens=0,
@@ -4320,7 +4327,7 @@ async def _execute_research_cloud_impl(
             app_id=attribution_ctx.get("app_id") if attribution_ctx else None,
             user_id=attribution_ctx.get("user_id") if attribution_ctx else None,
             agent_id=f"research-cloud:{request_body.strategy or 'default'}",
-            workflow_id=None,
+            workflow_id=attribution_ctx.get("workflow_id") if attribution_ctx else None,
             model=result.model,
             input_tokens=result.usage.input_tokens,
             output_tokens=result.usage.output_tokens,
@@ -5184,7 +5191,7 @@ async def _execute_doc_agent_impl(
                 app_id=attribution_ctx.get("app_id") if attribution_ctx else None,
                 user_id=attribution_ctx.get("user_id") if attribution_ctx else None,
                 agent_id="doc-agent",
-                workflow_id=None,
+                workflow_id=attribution_ctx.get("workflow_id") if attribution_ctx else None,
                 model=request_body.model,
                 input_tokens=_track_in or 0,
                 output_tokens=_track_out or 0,
@@ -5236,7 +5243,7 @@ async def _execute_doc_agent_impl(
                 app_id=attribution_ctx.get("app_id") if attribution_ctx else None,
                 user_id=attribution_ctx.get("user_id") if attribution_ctx else None,
                 agent_id="doc-agent",
-                workflow_id=None,
+                workflow_id=attribution_ctx.get("workflow_id") if attribution_ctx else None,
                 model=request_body.model,
                 input_tokens=accumulated_input_tokens or 0,
                 output_tokens=accumulated_output_tokens or 0,
