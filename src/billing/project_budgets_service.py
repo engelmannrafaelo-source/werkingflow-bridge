@@ -109,6 +109,54 @@ async def allocate_budget(
     return row is not None
 
 
+class AmbiguousProjectBudget(RuntimeError):
+    """One project carries allocated budgets under several plans.
+
+    Data-level counterpart to AmbiguousPlanCatalog: the allocation is the
+    evidence of which pot paid, so two allocations for one project destroy
+    that evidence. Never expected — allocation is keyed by the consumed slot.
+    """
+
+
+async def find_allocated_plan_id(
+    user_id: uuid.UUID, project_id: str
+) -> Optional[str]:
+    """
+    Which plan holds an allocated budget for this (user, project)?
+
+    This is THE discriminator between a paid per-project pot and the app's
+    monthly pot. An allocation exists only because a credit slot was consumed
+    for exactly this project, so its presence — not the mere presence of a
+    project_id — is what proves the call belongs to a project pot. Report
+    relies on that distinction: every ordinary report call also carries a
+    project_id, and must keep drawing from the monthly budget.
+
+    Returns None when nothing is allocated (the caller then falls back to the
+    monthly plan). Raises AmbiguousProjectBudget if several plans allocated
+    the same project — fail loud rather than pick one and mis-bill.
+    """
+    pool = get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT plan_id
+              FROM project_budgets
+             WHERE user_id = $1 AND project_id = $2
+            """,
+            user_id,
+            project_id,
+        )
+    if not rows:
+        return None
+    plan_ids = {r["plan_id"] for r in rows}
+    if len(plan_ids) > 1:
+        raise AmbiguousProjectBudget(
+            f"project_id={project_id!r} (user={user_id}) has allocated budgets under "
+            f"{sorted(plan_ids)}. A project belongs to exactly one paying plan."
+        )
+    return plan_ids.pop()
+
+
 async def get_budget(
     user_id: uuid.UUID, plan_id: str, project_id: str
 ) -> Optional[Dict[str, Any]]:

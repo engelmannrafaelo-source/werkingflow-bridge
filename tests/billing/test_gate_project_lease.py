@@ -28,7 +28,9 @@ _PROJECT_PLAN = PlanConfig(
 @pytest.mark.asyncio
 async def test_project_plan_without_project_id_is_let_through():
     """Sandbox lease (no project_id) on a project plan must NOT raise."""
-    with patch("src.budget.gate.find_plan_for_app", return_value=_PROJECT_PLAN), \
+    with patch("src.budget.gate.find_monthly_plan_for_app", return_value=None), \
+         patch("src.budget.gate.find_project_plans_for_app", return_value=(_PROJECT_PLAN,)), \
+         patch("src.budget.gate.resolve_billing_plan", AsyncMock(return_value=_PROJECT_PLAN)), \
          patch("src.budget.gate.resolve_user_id", AsyncMock(return_value=_UID)), \
          patch("src.budget.gate.evaluate_budget", AsyncMock(
              return_value={"allowed": False, "reason": "unlicensed",
@@ -43,7 +45,9 @@ async def test_project_plan_without_project_id_is_let_through():
 @pytest.mark.asyncio
 async def test_project_plan_with_exhausted_project_budget_still_blocks():
     """With a project_id and an exhausted per-project budget, the gate blocks."""
-    with patch("src.budget.gate.find_plan_for_app", return_value=_PROJECT_PLAN), \
+    with patch("src.budget.gate.find_monthly_plan_for_app", return_value=None), \
+         patch("src.budget.gate.find_project_plans_for_app", return_value=(_PROJECT_PLAN,)), \
+         patch("src.budget.gate.resolve_billing_plan", AsyncMock(return_value=_PROJECT_PLAN)), \
          patch("src.budget.gate.resolve_user_id", AsyncMock(return_value=_UID)), \
          patch("src.billing.project_budgets_service.evaluate", AsyncMock(
              return_value={"exists": True, "allowed": False, "remainingEur": 0.0,
@@ -61,7 +65,9 @@ async def test_project_plan_lets_call_through_when_topup_covers_exhausted_projec
     balance covers the call — project_budgets_service.evaluate() already
     folds the TopUp fallback into `allowed`; the gate must trust it and NOT
     raise 402 while TopUp money sits unused."""
-    with patch("src.budget.gate.find_plan_for_app", return_value=_PROJECT_PLAN), \
+    with patch("src.budget.gate.find_monthly_plan_for_app", return_value=None), \
+         patch("src.budget.gate.find_project_plans_for_app", return_value=(_PROJECT_PLAN,)), \
+         patch("src.budget.gate.resolve_billing_plan", AsyncMock(return_value=_PROJECT_PLAN)), \
          patch("src.budget.gate.resolve_user_id", AsyncMock(return_value=_UID)), \
          patch("src.billing.project_budgets_service.evaluate", AsyncMock(
              return_value={"exists": True, "allowed": True, "remainingEur": 0.0,

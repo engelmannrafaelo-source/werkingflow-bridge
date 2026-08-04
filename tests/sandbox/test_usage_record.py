@@ -310,7 +310,7 @@ class TestBudgetDeductionOnRecord:
             description="Test plan",
         )
 
-        with patch("src.budget.plans.find_plan_for_app", return_value=plan) as mock_plan, \
+        with patch("src.budget.plans.find_monthly_plan_for_app", return_value=plan) as mock_plan, \
              patch("src.budget.routes.apply_budget_deduction") as mock_deduct:
             mock_deduct.return_value = {
                 "fromMonthly": cost,
@@ -331,7 +331,7 @@ class TestBudgetDeductionOnRecord:
 
         user_id = uuid.UUID("ffffffff-ffff-ffff-ffff-ffffffffffff")
 
-        with patch("src.budget.plans.find_plan_for_app", return_value=None) as mock_plan, \
+        with patch("src.budget.plans.find_monthly_plan_for_app", return_value=None) as mock_plan, \
              patch("src.budget.routes.apply_budget_deduction") as mock_deduct:
             await _deduct_sandbox_budget(user_id, "unknown-app", 0.01)
 
@@ -349,7 +349,7 @@ class TestBudgetDeductionOnRecord:
             price=0.0, interval="month", api_budget_eur=10.0, description="",
         )
 
-        with patch("src.budget.plans.find_plan_for_app", return_value=plan), \
+        with patch("src.budget.plans.find_monthly_plan_for_app", return_value=plan), \
              patch("src.budget.routes.apply_budget_deduction",
                    side_effect=RuntimeError("DB connection lost")):
             # Must not raise — best-effort only

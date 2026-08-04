@@ -25,6 +25,12 @@ Design (decided 2026-05-16, tightened 2026-05-28):
     the first is fail-open. See MalformedUserIdentity in user_resolver.
   • Calls with no user_id or no app-plan are not gated (internal Bridge
     jobs, apps outside the plan catalog).
+  • The plan is resolved PER CALL from the entitlement that paid, not per app
+    (2026-08-04). An app may sell both a monthly plan and per-project credits;
+    asking for "the" plan of an app then silently charges the wrong pot. See
+    src/budget/plan_resolution.py. An unresolvable plan fails CLOSED for the
+    same reason a malformed identity does: a call nobody can bill is the
+    failure mode, not a transient one.
 
 See ADR 0007 lineage / token-tracking consolidation.
 """
@@ -36,7 +42,12 @@ from typing import Optional
 
 from fastapi import HTTPException
 
-from src.budget.plans import find_plan_for_app
+from src.budget.plan_resolution import PlanResolutionError, resolve_billing_plan
+from src.budget.plans import (
+    AmbiguousPlanCatalog,
+    find_monthly_plan_for_app,
+    find_project_plans_for_app,
+)
 from src.budget.routes import evaluate_budget
 from src.identity.user_resolver import (
     MalformedUserIdentity,
@@ -78,9 +89,11 @@ async def enforce_budget(
     if not user_id or not app_id:
         return
 
-    plan = find_plan_for_app(app_id)
-    if plan is None:
-        # App not in the plan catalog → not budget-gated.
+    # Cheap catalog check BEFORE resolving the identity: an app outside the
+    # plan catalog is not budget-gated at all, and it must stay that way even
+    # if its caller sends a shaky identity (the identity policy below would
+    # otherwise start rejecting calls that were never metered to begin with).
+    if find_monthly_plan_for_app(app_id) is None and not find_project_plans_for_app(app_id):
         return
 
     try:
@@ -119,6 +132,28 @@ async def enforce_budget(
         # Whether an unlicensed address should be blocked is a business call,
         # not an architectural one, so the pre-existing fail-open policy stays.
         logger.warning("budget gate: unknown user_id %r (%s) — letting call through", user_id, e)
+        return
+
+    try:
+        plan = await resolve_billing_plan(app_id, uid, project_id)
+    except (AmbiguousPlanCatalog, PlanResolutionError):
+        # CONFIGURATION / DATA bug, not infra. Same split as the malformed
+        # identity above: we cannot name the pot that pays, so we must not
+        # serve the call. Guessing is how a paid Akt got charged to a monthly
+        # trial pot in the first place. The boot invariant makes the catalog
+        # half of this unreachable in a healthy process.
+        logger.exception(
+            "budget gate: cannot resolve a billing plan for app=%s user=%s project=%s",
+            app_id, user_id, project_id,
+        )
+        raise
+    except Exception as e:  # noqa: BLE001 — fail-open: infra error must not kill the AI path
+        logger.error("budget gate: plan resolution failed (%s) — letting call through", e)
+        return
+
+    if plan is None:
+        # App left the plan catalog between the check above and here (hot
+        # reload). Not budget-gated.
         return
 
     if plan.interval == "project":

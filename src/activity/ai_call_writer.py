@@ -30,10 +30,16 @@ from collections import defaultdict
 from typing import Optional
 
 from src.activity.app_registry import normalize_app_id
+from src.budget.plan_resolution import PlanResolutionError
+from src.budget.plans import AmbiguousPlanCatalog
 from src.db.client import get_pool
 from src.pricing import cost_eur, PRICING_VERSION
 
 logger = logging.getLogger(__name__)
+
+# Incoherent billing configuration/data — distinct from transient infra errors,
+# and logged apart from them (see _deduct_call_cost).
+_PLAN_RESOLUTION_ERRORS = (AmbiguousPlanCatalog, PlanResolutionError)
 
 # Per-identifier skip counters — tracks how often each non-UUID/unresolvable
 # user_id is seen so warnings show frequency, not just isolated occurrences.
@@ -114,28 +120,32 @@ async def _deduct_call_cost(
     """
     try:
         import uuid as _uuid
-        from src.budget.plans import find_plan_for_app
+        from src.budget.plan_resolution import resolve_billing_plan
         from src.budget.routes import apply_budget_deduction, BudgetDeductionDenied
 
         # Both exits below are CORRECT skips, but they are on the budget path:
         # no deduction means the pre-call gate has nothing to gate against, so
         # the reason has to be findable. Same rule as persist_ai_call_activity —
         # a skip that leaves no trace is indistinguishable from a broken writer.
-        plan = find_plan_for_app(app_id)
+        try:
+            uid = _uuid.UUID(user_id)
+        except (ValueError, AttributeError, TypeError):
+            logger.warning(
+                "post-call deduction: user=%r is not a UUID (app=%s) — "
+                "call NOT metered against any budget", user_id, app_id,
+            )
+            return
+
+        # Resolved per call, from the entitlement that paid — the deduction has
+        # to land in the same pot the gate checked, or the gate guards a tally
+        # nobody writes to. See src/budget/plan_resolution.py.
+        plan = await resolve_billing_plan(app_id, uid, workflow_id)
         if plan is None:
             logger.debug(
                 "post-call deduction: app=%s not in the plan catalog — "
                 "not budget-tracked, no deduction for this call", app_id,
             )
             return  # app not in the plan catalog — not budget-tracked
-        try:
-            uid = _uuid.UUID(user_id)
-        except (ValueError, AttributeError, TypeError):
-            logger.warning(
-                "post-call deduction: user=%r is not a UUID (app=%s plan=%s) — "
-                "call NOT metered against any budget", user_id, app_id, plan.id,
-            )
-            return
 
         if plan.interval == "project":
             # Project plans are fully per-project; they never fall through to the
@@ -176,6 +186,16 @@ async def _deduct_call_cost(
                 "post-call deduction denied (%s) user=%s app=%s",
                 denied.reason, user_id, app_id,
             )
+    except _PLAN_RESOLUTION_ERRORS:
+        # The call already happened, so this cannot fail closed — but an
+        # incoherent catalog/allocation is a defect, not a transient miss, and
+        # it means this spend lands in NO pot. It must not be filed under the
+        # same warning as a DB hiccup.
+        logger.exception(
+            "post-call deduction: cannot resolve a billing plan for app=%s user=%s "
+            "project=%s — this call is NOT metered against any budget",
+            app_id, user_id, workflow_id,
+        )
     except Exception as e:  # noqa: BLE001 — deduction must never break the call
         logger.warning("post-call budget deduction failed (non-blocking): %s", e)
 

@@ -43,7 +43,9 @@ _MONTHLY_PLAN = PlanConfig(
 @pytest.mark.asyncio
 async def test_marker_identity_is_rejected_not_waved_through():
     """The exact string that opened the hole must now be refused."""
-    with patch("src.budget.gate.find_plan_for_app", return_value=_MONTHLY_PLAN), \
+    with patch("src.budget.gate.find_monthly_plan_for_app", return_value=_MONTHLY_PLAN), \
+         patch("src.budget.gate.find_project_plans_for_app", return_value=()), \
+         patch("src.budget.gate.resolve_billing_plan", AsyncMock(return_value=_MONTHLY_PLAN)), \
          patch("src.budget.gate.resolve_user_id",
                AsyncMock(side_effect=MalformedUserIdentity("neither uuid nor email"))), \
          patch("src.budget.gate.evaluate_budget", AsyncMock()) as mock_eval:
@@ -65,7 +67,9 @@ async def test_unknown_email_identity_still_fails_open():
     Blocking an unlicensed-but-well-formed address is a business decision,
     not an architectural one — this change must not quietly make it.
     """
-    with patch("src.budget.gate.find_plan_for_app", return_value=_MONTHLY_PLAN), \
+    with patch("src.budget.gate.find_monthly_plan_for_app", return_value=_MONTHLY_PLAN), \
+         patch("src.budget.gate.find_project_plans_for_app", return_value=()), \
+         patch("src.budget.gate.resolve_billing_plan", AsyncMock(return_value=_MONTHLY_PLAN)), \
          patch("src.budget.gate.resolve_user_id",
                AsyncMock(side_effect=UnknownUserIdentity("no Bridge user"))):
         # Must NOT raise.
@@ -75,7 +79,9 @@ async def test_unknown_email_identity_still_fails_open():
 @pytest.mark.asyncio
 async def test_resolvable_identity_is_unaffected():
     """The happy path stays exactly as it was."""
-    with patch("src.budget.gate.find_plan_for_app", return_value=_MONTHLY_PLAN), \
+    with patch("src.budget.gate.find_monthly_plan_for_app", return_value=_MONTHLY_PLAN), \
+         patch("src.budget.gate.find_project_plans_for_app", return_value=()), \
+         patch("src.budget.gate.resolve_billing_plan", AsyncMock(return_value=_MONTHLY_PLAN)), \
          patch("src.budget.gate.resolve_user_id", AsyncMock(return_value=_UID)), \
          patch("src.budget.gate.evaluate_budget",
                AsyncMock(return_value={"allowed": True})):

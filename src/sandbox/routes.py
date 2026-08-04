@@ -57,14 +57,17 @@ async def _deduct_sandbox_budget(
     degrades to 'no deduction' — it must never break the caller's response.
     """
     try:
-        from src.budget.plans import find_plan_for_app
+        from src.budget.plans import find_monthly_plan_for_app
         from src.budget.routes import apply_budget_deduction, BudgetDeductionDenied
         from src.sandbox.lease_service import base_app_id
 
         # Coach sub-products bill against their base app's plan (same subscriber).
-        plan = find_plan_for_app(base_app_id(app))
+        # Explicitly the MONTHLY plan: apply_budget_deduction below only serves
+        # the monthly pot (it raises for project-interval plans), and a sandbox
+        # session carries no project attribution to bill a per-project pot with.
+        plan = find_monthly_plan_for_app(base_app_id(app))
         if plan is None:
-            return  # app not in plan catalog — not budget-tracked
+            return  # app has no monthly plan — not budget-tracked here
         try:
             await apply_budget_deduction(user_id, plan.id, cost_eur)
         except BudgetDeductionDenied as denied:

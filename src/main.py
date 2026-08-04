@@ -659,11 +659,12 @@ async def lifespan(app: FastAPI):
         # (src/activity/ai_call_writer.py) runs in THIS worker process and maps
         # app_id → plan via the in-memory PLANS cache. Only platform-api's
         # lifespan called reload_plans() before, so the worker's cache stayed
-        # empty → find_plan_for_app() returned None → every deduction silently
+        # empty → plan resolution returned None → every deduction silently
         # no-opped (e.g. werking-energy usage bypassed its €100 project budget
         # entirely). Fail-fast on an empty/failed catalog: a worker that cannot
         # resolve plans must not silently serve un-metered traffic. reload_plans()
-        # itself raises on an empty plans table.
+        # itself raises on an empty plans table and on a catalog that cannot say
+        # which pot pays for a call (assert_catalog_is_unambiguous).
         from src.budget.plans import reload_plans
         try:
             count = await reload_plans()
