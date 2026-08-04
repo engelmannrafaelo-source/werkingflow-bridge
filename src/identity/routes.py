@@ -435,6 +435,11 @@ async def issue_token(
 _REGISTER_ALLOWED_APP_IDS = frozenset({
     "werking-report", "werking-energy", "werking-safety",
     "werking-noise", "engelmann",
+    # 'werking-check' (Migration 048, Rafael 2026-08-04): der WerkING Check ist
+    # abrechnungsmaessig ein eigenes Produkt. Werkkonto- und Check-Trichter-
+    # Registrierungen vergeben diese Lizenz; der im Report-Abo enthaltene
+    # Qualitaetscheck bleibt bei 'werking-report'.
+    "werking-check",
 })
 
 # Default plan_id assigned to the initial app_license at registration. 'trial'

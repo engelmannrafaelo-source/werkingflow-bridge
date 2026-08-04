@@ -1,0 +1,34 @@
+-- 048 — app_id enum: 'werking-check' als eigenes Produkt (Rafael, 2026-08-04)
+--
+-- Der WerkING Check ist abrechnungsmäßig ein EIGENES Produkt: er läuft
+-- technisch in der Report-App (report.werking.tools/check), hängt aber nicht
+-- an Report. Werkkonto-Registrierungen (werking.tools/registrieren) und
+-- Check-Trichter-Registrierungen (/api/check/[id]/register) vergeben ab
+-- jetzt eine werking-check-Lizenz statt einer werking-report-Lizenz — nur
+-- der im Report-Abo ENTHALTENE Qualitätscheck gehört weiter zu
+-- werking-report.
+--
+-- Diese Migration fügt NUR den Enum-Wert hinzu (Registrierungs-Allowlist
+-- _REGISTER_ALLOWED_APP_IDS zieht im selben Commit nach; sie spiegelt
+-- diesen Enum — siehe Kommentar dort).
+--
+-- BEWUSST NICHT hier: die Umattribuierung der Check-Credit-Pläne
+-- (plans.app_id 'werking-report' → 'werking-check'). Die ist mit der
+-- Call-Attribution gekoppelt: resolve_billing_plan (plan_resolution.py)
+-- wirft fail-loud PlanResolutionError, wenn ein allokierter Projekt-Plan
+-- zu einer anderen App gehört als die X-App-ID des Calls — die Report-App
+-- attribuiert Check-Korrektur-Calls heute als 'werking-report'. Beide
+-- Seiten müssen im selben Deploy wechseln (eigene, koordinierte Migration).
+--
+-- Env-Begleitschritt je Bridge-Host (secrets/platform.env, kein Schema):
+--   BRIDGE_AUTH_APP_IDS=werking-report,werking-energy,werking-check
+--   BRIDGE_WEBHOOK_URL_WERKING_CHECK=<selber token-issued-Receiver wie werking-report>
+--   BRIDGE_WEBHOOK_SECRET_WERKING_CHECK=<selbes Secret wie werking-report>
+-- (Der Check läuft im Report-Deployment; dessen Receiver verschickt die
+-- Verifizierungs-Mails — Link zeigt seit 04.08. auf werking.tools.)
+--
+-- ALTER TYPE ... ADD VALUE: der neue Wert darf nicht in derselben
+-- Transaktion verwendet werden — Verwendung folgt erst zur Laufzeit
+-- (Register-INSERTs), kein Seed nötig. Forward-only, idempotent.
+
+ALTER TYPE app_id ADD VALUE IF NOT EXISTS 'werking-check';
