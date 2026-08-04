@@ -123,14 +123,14 @@ def assert_catalog_is_unambiguous() -> None:
     charging the wrong pot.
     """
     for app_id in {p.app_id for p in PLANS.values()}:
-        monthly = find_monthly_plan_for_app(app_id)  # raises on two monthly pots
-        projects = find_project_plans_for_app(app_id)
-        if monthly is None and len(projects) > 1:
-            raise AmbiguousPlanCatalog(
-                f"[PlanManager] app_id={app_id!r} declares several per-project plans "
-                f"({[p.id for p in projects]}) and no monthly plan. A call without an "
-                f"allocated project budget could not be attributed to a pot."
-            )
+        find_monthly_plan_for_app(app_id)  # raises on two monthly pots
+        # Several per-project plans WITHOUT a monthly plan is a legal shape
+        # since migration 049: werking-check sells only credit packs (1/5/20)
+        # and has no monthly pot. The invariant "no call may be attributed by
+        # guessing" moved from boot to the call site — resolve_billing_plan
+        # raises PlanResolutionError for an UNALLOCATED call of such an app
+        # instead of picking a tier. Boot keeps failing only on shapes no
+        # resolution rule exists for (two monthly pots, via the line above).
 
 
 def find_trial_plan_for(plan_id: str) -> "PlanConfig | None":
