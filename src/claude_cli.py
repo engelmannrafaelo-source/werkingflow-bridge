@@ -1111,55 +1111,19 @@ class ClaudeCodeCLI:
             logger.info(f"🔍 Detected research command: {prompt[:60]}...")
             logger.info(f"   Transforming into direct execution protocol")
 
-            # Extract the research query from the slash command
-            # Format: /sc:research [flags] "query" or just /sc:research "query"
-            import re
+            # Depth-aware protocol (research_protocol.py) — honours the
+            # --depth flag instead of discarding it. Budget-SSoT shared
+            # with the cloud path. Fail-loud: a malformed research prompt
+            # is a bug in main.py's prompt construction, not something to
+            # paper over here.
+            from src.research_protocol import build_research_execution_prompt
 
-            # Try to extract query after the command
-            query_match = re.search(r'/(?:sc:)?research\s+(?:--depth\s+\w+\s+)?"?(.+?)"?\s*$', prompt, re.DOTALL)
-            research_query = query_match.group(1) if query_match else prompt.replace("/sc:research", "").replace("/research", "").strip()
-
-            logger.info(f"   Extracted research query: {research_query[:100]}...")
-
-            # Replace prompt with direct execution instructions
-            # CRITICAL: Keep concise to avoid context overflow
-            prompt = f"""Research this query and write output IMMEDIATELY:
-
-QUERY: {research_query}
-
-PROTOCOL (execute in order):
-1. Use WebSearch and WebFetch for 2-3 TARGETED searches only
-2. Extract ONLY key findings (keep summaries under 150 words each)
-3. Write report to claudedocs/research_output.md IMMEDIATELY after searches
-4. DO NOT conduct additional searches after writing file
-
-OUTPUT STRUCTURE:
-# Research Report
-
-## Summary
-[2-3 sentences maximum]
-
-## Key Findings
-- [Finding 1 with source]
-- [Finding 2 with source]
-- [Finding 3 with source]
-
-## Analysis
-[Brief analysis, max 200 words]
-
-## Sources
-[List URLs]
-
-CRITICAL: Write file EARLY to avoid context overflow. Use Write tool for claudedocs/research_output.md.
-"""
-
-            # Set reasonable max_turns - increased to 25 for complex research queries
-            if max_turns < 20:
-                max_turns = 20
-                logger.info(f"   Set max_turns to {max_turns} for research")
-            elif max_turns > 25:
-                max_turns = 25  # Cap at 25 to prevent overflow
-                logger.info(f"   Capped max_turns to {max_turns} to prevent context overflow")
+            prompt, max_turns, research_depth = build_research_execution_prompt(
+                prompt, max_turns
+            )
+            logger.info(
+                f"   Research depth: {research_depth}, max_turns: {max_turns}"
+            )
 
             # Enable file discovery for research output
             enable_file_discovery = True
