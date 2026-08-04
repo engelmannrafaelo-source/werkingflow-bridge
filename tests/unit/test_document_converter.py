@@ -28,6 +28,7 @@ import io  # noqa: E402
 from src.privacy_service import document_converter as dc  # noqa: E402
 from src.privacy_service.document_converter import (  # noqa: E402
     MAX_IMAGE_EDGE,
+    MOJIBAKE_MIN_OCCURRENCES,
     RENDER_PAGE_MAX_EDGE,
     UnsupportedFormatError,
     convert_document_sync,
@@ -37,6 +38,7 @@ from src.privacy_service.document_converter import (  # noqa: E402
     convert_pdf_bytes,
     convert_xlsx_bytes,
     detect_format,
+    repair_mojibake,
 )
 
 # Real large-format CAD plan (~4564pt long edge, 132-MP embedded rasters). This
@@ -484,3 +486,161 @@ class TestSplitPagedMarkdown:
             {"page_no": 1, "markdown": "Zeile A\n\nZeile B"},
             {"page_no": 2, "markdown": "Zeile C"},
         ]
+
+
+# ----------------------------------------------------------------------------
+# Mojibake repair (cp1252-decoded-as-UTF-8 recovery)
+# ----------------------------------------------------------------------------
+#
+# Real-world regression: pruefbericht_owa.pdf (a Check-Feature upload) had its
+# text baked into the PDF as UTF-8 bytes wrongly decoded as cp1252/Latin-1 —
+# confirmed with three independent extractors (Docling, poppler pdftotext,
+# PyMuPDF) all producing the identical "PrÃ¼fung"/"GebÃ¤ude"/"gemÃ¤ÃŸ" garble.
+
+
+class TestCp1252RoundtripRepair:
+    """Unit-level tests for the single-token round-trip primitive."""
+
+    def test_repairs_real_mojibake_token(self):
+        from src.privacy_service.document_converter import _cp1252_roundtrip_repair
+
+        assert _cp1252_roundtrip_repair("PrÃ¼fung") == "Prüfung"
+        assert _cp1252_roundtrip_repair("GebÃ¤udes") == "Gebäudes"
+        assert _cp1252_roundtrip_repair("gemÃ¤ÃŸ") == "gemäß"
+
+    def test_ascii_token_returns_none(self):
+        from src.privacy_service.document_converter import _cp1252_roundtrip_repair
+
+        assert _cp1252_roundtrip_repair("Pruefung") is None
+
+    def test_genuine_umlaut_token_returns_none(self):
+        """A correctly-encoded German word is not a valid UTF-8 continuation
+        sequence on its own — the round-trip fails closed, by construction."""
+        from src.privacy_service.document_converter import _cp1252_roundtrip_repair
+
+        for token in ("Prüfung", "Gebäude", "gemäß", "groß", "Übergabe", "Mängel"):
+            assert _cp1252_roundtrip_repair(token) is None, token
+
+    def test_token_outside_cp1252_range_returns_none(self):
+        from src.privacy_service.document_converter import _cp1252_roundtrip_repair
+
+        # CJK characters cannot even be encoded as cp1252 — must fail closed,
+        # not raise.
+        assert _cp1252_roundtrip_repair("文書") is None
+
+
+class TestRepairMojibake:
+    """Document-level tests: round-trip + minimum-occurrence gate together."""
+
+    # --- positive: the real regression pattern -----------------------------
+
+    def test_fixes_real_report_pattern(self):
+        text = (
+            "Bei der PrÃ¼fung des GebÃ¤udes wurde festgestellt, dass die "
+            "Massnahmen gemÃ¤ÃŸ Ã–NORM durchgefÃ¼hrt wurden. Die PrÃ¼fung "
+            "ergab keine MÃ¤ngel am GebÃ¤ude."
+        )
+        repaired = repair_mojibake(text)
+        assert "Prüfung" in repaired
+        assert "Gebäude" in repaired
+        assert "gemäß" in repaired
+        assert "ÖNORM" in repaired
+        assert "Mängel" in repaired
+        assert "Ã" not in repaired
+
+    def test_at_exactly_the_threshold_repairs(self):
+        word = "PrÃ¼fung "
+        text = word * MOJIBAKE_MIN_OCCURRENCES
+        repaired = repair_mojibake(text)
+        assert "Prüfung" in repaired
+        assert "Ã" not in repaired
+
+    def test_below_threshold_leaves_text_untouched(self):
+        word = "PrÃ¼fung "
+        text = word * (MOJIBAKE_MIN_OCCURRENCES - 1)
+        assert repair_mojibake(text) == text
+
+    # --- negative: must NOT be touched --------------------------------------
+
+    def test_single_legit_foreign_name_untouched(self):
+        """One real 'São Paulo' in an address — below the occurrence
+        threshold, and 'ã' (lowercase, U+00E3) doesn't even round-trip the
+        same way as the 'Ã'-led mojibake pattern."""
+        text = "Firmensitz: Rua Augusta 123, São Paulo, Brasilien."
+        assert repair_mojibake(text) == text
+
+    def test_clean_german_text_without_mojibake_untouched(self):
+        text = (
+            "Die Prüfung des Gebäudes ergab, dass alle Maßnahmen gemäß "
+            "ÖNORM durchgeführt wurden und keine Mängel während der "
+            "Prüfung festgestellt wurden. Straße, Übergabe, groß."
+        )
+        assert repair_mojibake(text) == text
+
+    def test_base64_string_untouched(self):
+        b64 = "TWFuIGlzIGRpc3Rpbmd1aXNoZWQsIGFsc28sIGJ5IHRoaXMgcGVjdWxpYXI=" * 3
+        assert repair_mojibake(b64) == b64
+
+    def test_hash_untouched(self):
+        sha256_hex = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b85" * 3
+        assert repair_mojibake(sha256_hex) == sha256_hex
+
+    def test_url_query_string_untouched(self):
+        # A single stray 'Ã' inside a query value — below the occurrence
+        # threshold, must not trigger a rewrite of the URL.
+        url = "https://example.com/search?name=CafÃ©&page=1&ref=abc123"
+        assert repair_mojibake(url) == url
+
+    def test_empty_and_pure_ascii_short_circuit(self):
+        assert repair_mojibake("") == ""
+        assert repair_mojibake("Plain ASCII text, nothing to see here.") == (
+            "Plain ASCII text, nothing to see here."
+        )
+
+
+class TestDispatcherAppliesMojibakeRepair:
+    """Wiring test: convert_document_sync repairs markdown AND page_markdowns
+    regardless of which adapter produced them — the dispatcher is the single
+    shared point every caller (npm package + direct HTTP callers) goes
+    through."""
+
+    def test_pdf_markdown_and_page_markdowns_repaired(self, monkeypatch):
+        mojibake_md = (
+            "PrÃ¼fung GebÃ¤ude gemÃ¤ÃŸ PrÃ¼fung GebÃ¤ude gemÃ¤ÃŸ PrÃ¼fung GebÃ¤ude"
+        )
+
+        def _fake_convert_pdf_bytes(pdf_bytes):
+            metadata = {
+                "pages": 2,
+                "docling_parsed": True,
+                "page_markdowns": [
+                    {"page_no": 1, "markdown": mojibake_md},
+                    {"page_no": 2, "markdown": "Clean page, nothing wrong here."},
+                ],
+            }
+            return mojibake_md, metadata, {}
+
+        monkeypatch.setattr(dc, "convert_pdf_bytes", _fake_convert_pdf_bytes)
+
+        result = convert_document_sync(b"%PDF-1.4 fake", "report.pdf")
+
+        assert "Prüfung" in result.markdown
+        assert "Gebäude" in result.markdown
+        assert "Ã" not in result.markdown
+        page1 = result.metadata["page_markdowns"][0]["markdown"]
+        assert "Prüfung" in page1 and "Ã" not in page1
+        # Untouched page stays byte-identical.
+        assert result.metadata["page_markdowns"][1]["markdown"] == (
+            "Clean page, nothing wrong here."
+        )
+
+    def test_dispatcher_leaves_clean_pdf_markdown_untouched(self, monkeypatch):
+        clean_md = "Der Bericht beschreibt die Prüfung des Gebäudes gemäß ÖNORM."
+
+        def _fake_convert_pdf_bytes(pdf_bytes):
+            return clean_md, {"pages": 1, "docling_parsed": True}, {}
+
+        monkeypatch.setattr(dc, "convert_pdf_bytes", _fake_convert_pdf_bytes)
+
+        result = convert_document_sync(b"%PDF-1.4 fake", "report.pdf")
+        assert result.markdown == clean_md

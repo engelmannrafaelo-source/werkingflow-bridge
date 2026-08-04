@@ -23,6 +23,7 @@ import base64
 import io
 import logging
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -884,6 +885,90 @@ def convert_image_bytes(content: bytes, suffix: str = ".png") -> Tuple[str, Dict
 
 
 # ----------------------------------------------------------------------------
+# Mojibake repair (UTF-8 bytes wrongly decoded as cp1252/Latin-1)
+# ----------------------------------------------------------------------------
+#
+# Some upstream PDF/Office generators write UTF-8 bytes into the document but
+# treat them as a single-byte codepage, so every non-ASCII character comes out
+# as a short run of Latin-1-ish characters: "Prüfung" becomes "PrÃ¼fung",
+# "Gebäude" becomes "GebÃ¤ude", "gemäß" becomes "gemÃ¤ÃŸ". Verified against a
+# real report (pruefbericht_owa.pdf) with three independent extractors
+# (Docling, poppler pdftotext, PyMuPDF) all producing the identical
+# corruption — the bad glyphs are baked into the source file, not an
+# extraction bug on our side.
+#
+# Repair works per whitespace-delimited token:
+#   1. Re-encode the token as cp1252, then decode the result as UTF-8, both
+#      strict. That is the exact inverse of the mistake that produced the
+#      mojibake, so it only succeeds when the token really is misdecoded
+#      UTF-8. Genuine single-byte Latin-1 text ("ü", "ä", "ß", accented
+#      names, …) is essentially never a valid UTF-8 continuation sequence on
+#      its own, so it fails the round-trip and is left untouched — this is
+#      what keeps something like "São Paulo" safe.
+#   2. Repairs are only applied to the document once at least
+#      MOJIBAKE_MIN_OCCURRENCES tokens independently round-trip. A single
+#      coincidental hit is left alone; systemic corruption (the actual
+#      failure mode here) clears this easily.
+#
+# This only touches NEW conversions going through this dispatcher — it is
+# deliberately not a backfill for documents already stored before this was
+# added (that is a separate, riskier undertaking).
+
+# Minimum number of independently-round-tripping tokens required before any
+# repair is applied to a text. Keeps a single unlucky token (rare, but not
+# provably impossible for the cp1252→UTF-8 round-trip) from rewriting a
+# document that isn't actually mojibake.
+MOJIBAKE_MIN_OCCURRENCES = 3
+
+_WHITESPACE_TOKEN_RE = re.compile(r"\S+")
+
+
+def _cp1252_roundtrip_repair(token: str) -> Optional[str]:
+    """Return the UTF-8-recovered token, or None if the repair doesn't apply.
+
+    Fails closed: any encode/decode error — including a token containing
+    characters outside cp1252's range — means "leave it alone", never a
+    partial repair.
+    """
+    if token.isascii():
+        return None
+    try:
+        candidate = token.encode("cp1252", errors="strict").decode("utf-8", errors="strict")
+    except (UnicodeEncodeError, UnicodeDecodeError):
+        return None
+    return candidate if candidate != token else None
+
+
+def repair_mojibake(text: str) -> str:
+    """Conservatively repair cp1252-decoded-as-UTF-8 mojibake in ``text``.
+
+    See the module section header above for the two guards (lossless
+    round-trip + minimum occurrence count). Returns ``text`` unchanged unless
+    both are satisfied.
+    """
+    if not text or text.isascii():
+        return text
+
+    repairs: Dict[Tuple[int, int], str] = {}
+    for m in _WHITESPACE_TOKEN_RE.finditer(text):
+        repaired = _cp1252_roundtrip_repair(m.group())
+        if repaired is not None:
+            repairs[(m.start(), m.end())] = repaired
+
+    if len(repairs) < MOJIBAKE_MIN_OCCURRENCES:
+        return text
+
+    out: List[str] = []
+    cursor = 0
+    for (start, end), repaired in repairs.items():
+        out.append(text[cursor:start])
+        out.append(repaired)
+        cursor = end
+    out.append(text[cursor:])
+    return "".join(out)
+
+
+# ----------------------------------------------------------------------------
 # Public dispatcher
 # ----------------------------------------------------------------------------
 
@@ -929,6 +1014,16 @@ def convert_document_sync(
     metadata = dict(metadata or {})
     metadata["original_size_bytes"] = len(content)
     metadata["filename"] = filename
+
+    # Every adapter's markdown funnels through here — the one place to catch
+    # UTF-8-decoded-as-cp1252 mojibake regardless of source format. See the
+    # "Mojibake repair" section above for the safety guards.
+    markdown = repair_mojibake(markdown)
+    page_markdowns = metadata.get("page_markdowns")
+    if page_markdowns:
+        for page in page_markdowns:
+            if isinstance(page, dict) and isinstance(page.get("markdown"), str):
+                page["markdown"] = repair_mojibake(page["markdown"])
 
     return ConversionResult(
         markdown=markdown,
