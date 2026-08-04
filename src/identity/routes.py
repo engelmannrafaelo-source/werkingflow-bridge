@@ -14,6 +14,7 @@ POST /v1/auth/resend-verification         {email} -> 204                        
 POST /v1/auth/verify-email                {token} -> 204                                                      PUBLIC
 """
 import hashlib
+import json
 import logging
 import os
 import secrets
@@ -441,6 +442,17 @@ _REGISTER_ALLOWED_APP_IDS = frozenset({
 # pre-commit the new user to a paid tier.
 _REGISTER_DEFAULT_PLAN_ID = "trial"
 
+# Bedrock-Pin für Online-Selbstregistrierung (Rafael, 2026-08-04): Datenresidenz
+# EU / eigenes AWS-Konto ab dem ersten Call nach Kontoerstellung. Shape wie
+# user_provider_override.py sie versteht; Region explizit, damit ein künftiger
+# anderer Default die Zusage nicht still verschiebt. Durchgesetzt wird der Pin
+# an der Backend-Auflösung (fail-closed, 503 statt Ausweichen) — hier wird er
+# nur GESETZT. Wichtig für die Einordnung: die Analyse-Phase eines Checks läuft
+# VOR der Registrierung (~4,3 EUR auf Abo-Konten); der Pin erfasst alles AB dem
+# Konto (korrigierte Fassung, künftige Checks). Eine EU-residente Gratis-Phase
+# bräuchte zusätzlich den Pin des Sammelkontos — offene Operator-Entscheidung.
+_SELF_REGISTER_PROVIDER_PIN = {"provider": "bedrock", "region": "eu-central-1"}
+
 
 class RegisterRequest(BaseModel):
     email: EmailStr
@@ -518,16 +530,33 @@ async def register(body: RegisterRequest) -> Dict[str, Any]:
                 # less than owner blocks them from buying plans / managing
                 # subscriptions in the customer portal (ADMIN_ROLES in
                 # packages/usage-billing-admin SubscriptionSection.tsx).
+                #
+                # provider_config: Bedrock-Pin ab Geburt (Rafael, 2026-08-04).
+                # Jeder ONLINE-selbstregistrierte Nutzer wird auf Bedrock
+                # (EU-Region) gepinnt — händisch angelegte Nutzer pinnt der
+                # Operator weiterhin selbst. Die einzige Selbstregistrierung
+                # der Flotte ist der Check-Trichter (werking-report). Der Pin
+                # ist fail-closed (user_provider_override.py): ist Bedrock
+                # nicht erreichbar, bekommt der Nutzer 503 statt eines stillen
+                # Ausweichens auf die Abo-Konten — das ist die Residenzzusage.
+                #
+                # registered_from_check_id: die Akt-Verknüpfung (047) — macht
+                # aus "dieser Akt kostete X EUR" ein "dieser Kunde kostete X
+                # EUR Akquise". Freiwillige Angabe durch die Registrierung,
+                # NULL außerhalb des Check-Trichters.
                 user_row = await conn.fetchrow(
                     """
-                    INSERT INTO users (email, name, tenant_id, role, password_hash, created_at, updated_at)
-                    VALUES ($1, $2, $3, 'owner', $4, $5, $5)
+                    INSERT INTO users (email, name, tenant_id, role, password_hash,
+                                       provider_config, registered_from_check_id, created_at, updated_at)
+                    VALUES ($1, $2, $3, 'owner', $4, $5::jsonb, $6, $7, $7)
                     RETURNING id, email, name, tenant_id, role, provider_config, created_at, updated_at
                     """,
                     body.email,
                     body.name,
                     tenant_id,
                     password_hash,
+                    json.dumps(_SELF_REGISTER_PROVIDER_PIN),
+                    body.checkId,
                     now,
                 )
 
