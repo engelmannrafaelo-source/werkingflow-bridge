@@ -8,6 +8,7 @@ Webhook-Handler: Mollie ruft /v1/billing/mollie-webhook auf, wir branchen nach p
 from __future__ import annotations
 
 import json
+import logging
 import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
@@ -21,6 +22,12 @@ from src.billing.invoice_numbering import (
     next_invoice_number,
     prefix_for_app,
 )
+# Als Modul importiert, nicht als Einzelfunktion: der Name `vat_id` ist in
+# diesem Modul mehrfach als lokale Variable belegt (Rechnungsadresse), ein
+# `from ... import has_confirmed_validation` waere dort leicht zu verwechseln.
+from src.billing import vat_id as vat_id_module
+
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -38,13 +45,26 @@ _EU_COUNTRIES_NON_AT: frozenset[str] = frozenset({
 
 def _determine_tax_rate(
     billing_address: Optional[Dict[str, Any]],
+    *,
+    vat_id_confirmed: bool,
 ) -> Tuple[float, Optional[str]]:
     """Return (tax_rate_percent, reverse_charge_note_or_None).
+
+    `vat_id_confirmed` ist ein PFLICHT-Keyword ohne Default: ob eine UID gegen
+    VIES bestaetigt wurde, ist eine Tatsache aus der Datenbank
+    (vat_id.has_confirmed_validation), keine Annahme. Ein Default waere die
+    Stelle, an der ein neuer Aufrufer versehentlich wieder 0 % auf eine
+    ungeprueste Nummer gibt — genau der Fehler, den Migration 055 behebt.
 
     Rules:
     - No address or no country → 20.0 AT domestic (safe default, explicit)
     - AT → 20.0 (domestic USt)
-    - EU (non-AT) + vatId present → 0.0, Reverse Charge (B2B)
+    - EU (non-AT) + VIES-BESTAETIGTE vatId → 0.0, Reverse Charge (B2B)
+    - EU (non-AT) + vatId vorhanden, aber nicht bestaetigt → 20.0 (safe default).
+      Bis 2026-08-05 genuegte hier ein beliebiger nicht-leerer Text. § 19 Abs 1
+      UStG verlagert die Steuerschuld aber nur bei einer GUELTIGEN UID; war sie
+      es nicht, schuldet der Aussteller die Steuer — rueckwirkend und erst bei
+      der Pruefung sichtbar.
     - EU (non-AT) without vatId → 20.0 AT (safe default)
       OPEN DECISION: EU B2C falls under the OSS-Verfahren; correct rate per
       destination country is a legal question not answered here.  We use 20%
@@ -54,9 +74,11 @@ def _determine_tax_rate(
       serving significant EU B2C volume.
     - Non-EU → 0.0 (export, no VAT)
 
-    VIES validation of the vatId is NOT performed here.  A non-empty vatId is
-    treated as a B2B signal; the issuer remains responsible for record-keeping
-    under § 18 UStG.
+    Die VIES-Abfrage selbst laeuft NICHT hier, sondern beim Speichern der
+    Rechnungsadresse (src/billing/vat_id.py). Diese Funktion schlaegt nur das
+    Ergebnis nach. Grund: VIES ist ein fremder Dienst mit Ausfaellen — haengt
+    die Rechnungserstellung daran, steht im Ausfall der Verkauf, oder jemand
+    baut einen Fallback ein, und genau der wird zur stillen Nullsteuer-Quelle.
     """
     if not billing_address:
         return 20.0, None
@@ -71,11 +93,16 @@ def _determine_tax_rate(
         return 20.0, None
 
     if country in _EU_COUNTRIES_NON_AT:
-        if vat_id:
+        if vat_id and vat_id_confirmed:
             return 0.0, (
                 "Steuerschuldnerschaft des Leistungsempfängers "
                 "gem. § 19 Abs. 1 UStG (Reverse Charge)"
             )
+        if vat_id:
+            # UID erfasst, aber nicht (mehr) bestaetigt: sicherer Default statt
+            # Nullsteuer. Die Adress-Route prueft beim Speichern; findet sich
+            # hier nichts, war die Pruefung negativ, zu alt oder VIES war aus.
+            return 20.0, None
         # EU B2C — OSS open decision, conservative AT default
         return 20.0, None
 
@@ -1588,7 +1615,25 @@ async def auto_create_invoice(
     except Exception:
         pass  # billing_address stays None — marked incomplete below
 
-    tax_rate, reverse_charge_note = _determine_tax_rate(billing_address)
+    # Wurde die erfasste UID gegen VIES bestaetigt? Nur dann darf Reverse
+    # Charge greifen. Ein Fehler beim Nachschlagen bedeutet "nicht bestaetigt",
+    # nie "schon in Ordnung" — die teure Richtung ist die Nullsteuer.
+    vat_id_confirmed = False
+    if tenant_id and billing_address and (billing_address.get("vatId") or "").strip():
+        try:
+            async with pool.acquire() as conn:
+                vat_id_confirmed = await vat_id_module.has_confirmed_validation(
+                    conn, tenant_id=str(tenant_id), vat_id=billing_address["vatId"],
+                )
+        except Exception as e:
+            logger.warning(
+                "[invoice] VIES confirmation lookup failed for tenant=%s: %s — "
+                "invoicing WITH VAT (safe default)", tenant_id, e,
+            )
+
+    tax_rate, reverse_charge_note = _determine_tax_rate(
+        billing_address, vat_id_confirmed=vat_id_confirmed,
+    )
 
     # Detect EU B2C (no vatId in EU non-AT country) — mark for operator review.
     if billing_address:

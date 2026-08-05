@@ -41,6 +41,7 @@ from pydantic import BaseModel, ConfigDict, EmailStr, Field
 
 from src.api_auth import require_admin, require_jwt_or_service, require_self_or_admin, AuthClaims, get_tenant_of_user
 from src.billing import billing_service
+from src.billing import vat_id as vat_id_module
 from src.db.client import get_pool
 
 logger = logging.getLogger(__name__)
@@ -1448,7 +1449,35 @@ async def update_tenant_billing_address(
         row = await conn.fetchrow(sql, *args)
     if not row:
         raise HTTPException(status_code=404, detail=f"Tenant '{tenant_id}' not found")
-    return _tenant_billing_address_row(row)
+
+    # UID gegen VIES pruefen, sobald eine erfasst ist. Das Ergebnis entscheidet
+    # spaeter ueber Reverse Charge (_determine_tax_rate) — ohne bestaetigte
+    # Pruefung wird mit 20 % USt fakturiert.
+    #
+    # Der Fehlschlag ist BEWUSST nicht fatal: die Adresse ist gespeichert, und
+    # ein VIES-Ausfall darf den Kunden nicht am Weiterkommen hindern. Er fuehrt
+    # lediglich dazu, dass keine Bestaetigung vorliegt — die teure Richtung
+    # (Nullsteuer auf eine ungepruefte Nummer) ist damit ausgeschlossen.
+    # Das Ergebnis geht an den Aufrufer zurueck, damit die Oberflaeche eine
+    # ungueltige Nummer sofort melden kann statt sie stumm zu schlucken.
+    result = _tenant_billing_address_row(row)
+    raw_vat = (row["billing_vat_id"] or "").strip()
+    if raw_vat:
+        try:
+            check = await vat_id_module.validate_and_store(
+                conn, tenant_id=tenant_id, vat_id=raw_vat,
+            )
+            result["vatIdValid"] = check["isValid"]
+            result["vatIdCheckedName"] = check["name"]
+        except vat_id_module.VatIdCheckUnavailable as e:
+            logger.warning("[billing-address] VIES unavailable for tenant=%s: %s", tenant_id, e)
+            result["vatIdValid"] = None  # nicht pruefbar — weder gueltig noch ungueltig
+        except ValueError as e:
+            # Kein fuehrendes Laenderkuerzel o. ae. — das ist ein Eingabefehler
+            # des Kunden und wird als "ungueltig" gemeldet, nicht als Ausfall.
+            logger.info("[billing-address] malformed vat id for tenant=%s: %s", tenant_id, e)
+            result["vatIdValid"] = False
+    return result
 
 
 # ---------------------------------------------------------------------------
