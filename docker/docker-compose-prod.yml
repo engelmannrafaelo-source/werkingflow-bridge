@@ -173,9 +173,12 @@ services:
       - SKIP_SDK_VERIFICATION=true
       - RATE_LIMIT_ENABLED=false
       - DEFAULT_PRIVACY_MODE=none
-      # Routed to the dev-bridge privacy service (Tailscale): the 7GB prod host
-      # cannot hold the ~13GB Flair model. dev host has 30GB. See dev compose.
-      - PRIVACY_SERVICE_URL=${PRIVACY_SERVICE_URL:-http://100.112.98.39:8100}
+      # Routed to the dedicated GPU privacy host gpu-privacy-1 (Tailscale): the
+      # 7GB prod host cannot hold the ~13GB Flair model. gpu-privacy-1 runs it
+      # on GPU (GEX44, RTX 4000 Ada). Rollback (previous CPU route on the
+      # dev-bridge, if gpu-privacy-1 becomes unreachable): set env
+      # PRIVACY_SERVICE_URL=http://100.112.98.39:8100 and redeploy.
+      - PRIVACY_SERVICE_URL=${PRIVACY_SERVICE_URL:-http://100.65.149.39:8100}
       - BRIDGE_ANONYMIZE_ENABLED=true
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
@@ -298,9 +301,12 @@ services:
       - SKIP_SDK_VERIFICATION=true
       - RATE_LIMIT_ENABLED=false
       - DEFAULT_PRIVACY_MODE=none
-      # Routed to the dev-bridge privacy service (Tailscale): the 7GB prod host
-      # cannot hold the ~13GB Flair model. dev host has 30GB. See dev compose.
-      - PRIVACY_SERVICE_URL=${PRIVACY_SERVICE_URL:-http://100.112.98.39:8100}
+      # Routed to the dedicated GPU privacy host gpu-privacy-1 (Tailscale): the
+      # 7GB prod host cannot hold the ~13GB Flair model. gpu-privacy-1 runs it
+      # on GPU (GEX44, RTX 4000 Ada). Rollback (previous CPU route on the
+      # dev-bridge, if gpu-privacy-1 becomes unreachable): set env
+      # PRIVACY_SERVICE_URL=http://100.112.98.39:8100 and redeploy.
+      - PRIVACY_SERVICE_URL=${PRIVACY_SERVICE_URL:-http://100.65.149.39:8100}
       - BRIDGE_ANONYMIZE_ENABLED=true
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
@@ -315,9 +321,10 @@ services:
   # ===========================================================================
   # Privacy + Docling Service — REMOVED from PROD (2026-06-26).
   # Flair ner-german-large needs ~13GB; this 7GB host OOM'd at the 5G limit.
-  # PROD now routes smart-anonymize to the DEV-bridge privacy service over
-  # Tailscale: see PRIVACY_SERVICE_URL=http://100.112.98.39:8100 on the workers.
-  # (dev compose publishes wt-privacy-pdf-service on the dev Tailscale IP.)
+  # PROD now routes smart-anonymize to the dedicated GPU privacy host
+  # gpu-privacy-1 over Tailscale: see PRIVACY_SERVICE_URL=http://100.65.149.39:8100
+  # on the workers (2026-08-05 cutover, was the dev-bridge CPU instance
+  # 100.112.98.39:8100 before — kept as rollback target, see workers above).
   # ===========================================================================
 
   # ===========================================================================
