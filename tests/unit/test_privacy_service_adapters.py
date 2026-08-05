@@ -169,3 +169,14 @@ def test_chain_prefers_deterministic_adapter_for_csv():
     result = chain.convert(b"a,b\n1,2\n", "table.csv", "text/csv")
     assert result.fmt == "csv"
     assert result.metadata["adapter"] == "csv"
+
+
+def test_chain_mime_hint_overrides_extension():
+    """A mismatched extension (``.bin``) is routed by the explicit MIME hint."""
+    pytest.importorskip("pandas")
+    pytest.importorskip("tabulate")
+
+    chain = build_default_chain()
+    result = chain.convert(b"a,b\n1,2\n", "upload.bin", mime_type_hint="text/csv")
+    assert result.fmt == "csv"
+    assert result.metadata["adapter"] == "csv"

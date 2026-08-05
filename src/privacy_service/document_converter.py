@@ -4,10 +4,15 @@ Universal Document Converter for the Privacy Service.
 Converts PDF / DOCX / PPTX / XLSX / XLS / CSV / HTML / MSG / EML / images into
 Markdown that can be fed into the Smart-Anonymize pipeline or returned directly.
 
-Each adapter is a synchronous function returning ``(markdown, metadata)``.
-The dispatcher ``convert_document_sync`` routes by file extension or explicit
-``mime_type_hint`` and is intended to be invoked from an async endpoint via
-``loop.run_in_executor``.
+Each adapter is a synchronous function returning ``(markdown, metadata, images)``.
+There is no shared dispatcher — three independent production entry points call
+these adapters directly: ``/convert-pdf`` calls ``convert_pdf_bytes`` itself;
+``/document/convert`` and ``/document/convert-and-anonymize`` go through
+``adapters.AdapterChain``, which also calls the ``convert_*_bytes`` functions
+directly; DOCX/PPTX route through LibreOffice → ``convert_pdf_bytes``. Anything
+that must hold for every real caller — like the mojibake repair below — is
+therefore wired directly onto the adapter functions via the
+``@_mojibake_repaired`` decorator, not onto a dispatcher some callers skip.
 
 Design constraints (per task brief):
 - Fail loud on unknown formats — never silently fall back to a different adapter.
@@ -20,6 +25,7 @@ Design constraints (per task brief):
 from __future__ import annotations
 
 import base64
+import functools
 import io
 import logging
 import os
@@ -126,6 +132,125 @@ class ConversionResult:
             out["images"] = self.images
             out["image_count"] = len(self.images)
         return out
+
+
+# ----------------------------------------------------------------------------
+# Mojibake repair (UTF-8 bytes wrongly decoded as cp1252/Latin-1)
+# ----------------------------------------------------------------------------
+#
+# Some upstream PDF/Office generators write UTF-8 bytes into the document but
+# treat them as a single-byte codepage, so every non-ASCII character comes out
+# as a short run of Latin-1-ish characters: "Prüfung" becomes "PrÃ¼fung",
+# "Gebäude" becomes "GebÃ¤ude", "gemäß" becomes "gemÃ¤ÃŸ". Verified against a
+# real report (pruefbericht_owa.pdf) with three independent extractors
+# (Docling, poppler pdftotext, PyMuPDF) all producing the identical
+# corruption — the bad glyphs are baked into the source file, not an
+# extraction bug on our side.
+#
+# Repair works per whitespace-delimited token:
+#   1. Re-encode the token as cp1252, then decode the result as UTF-8, both
+#      strict. That is the exact inverse of the mistake that produced the
+#      mojibake, so it only succeeds when the token really is misdecoded
+#      UTF-8. Genuine single-byte Latin-1 text ("ü", "ä", "ß", accented
+#      names, …) is essentially never a valid UTF-8 continuation sequence on
+#      its own, so it fails the round-trip and is left untouched — this is
+#      what keeps something like "São Paulo" safe.
+#   2. Repairs are only applied to the document once at least
+#      MOJIBAKE_MIN_OCCURRENCES tokens independently round-trip. A single
+#      coincidental hit is left alone; systemic corruption (the actual
+#      failure mode here) clears this easily.
+#
+# Applied via the ``@_mojibake_repaired`` decorator directly on every
+# ``convert_*_bytes`` adapter below — the real production entry points
+# (``/convert-pdf``, and the ``AdapterChain`` behind ``/document/convert`` and
+# ``/document/convert-and-anonymize``) all call these functions directly, so
+# decorating them guarantees the repair applies everywhere a document can
+# actually be converted. ``convert_docx_bytes``/``convert_pptx_bytes`` carry no
+# decorator of their own — they delegate to the (already decorated)
+# ``convert_pdf_bytes`` via LibreOffice → PDF → Docling, so they inherit the
+# repair for free.
+
+# Minimum number of independently-round-tripping tokens required before any
+# repair is applied to a text. Keeps a single unlucky token (rare, but not
+# provably impossible for the cp1252→UTF-8 round-trip) from rewriting a
+# document that isn't actually mojibake.
+MOJIBAKE_MIN_OCCURRENCES = 3
+
+_WHITESPACE_TOKEN_RE = re.compile(r"\S+")
+
+
+def _cp1252_roundtrip_repair(token: str) -> Optional[str]:
+    """Return the UTF-8-recovered token, or None if the repair doesn't apply.
+
+    Fails closed: any encode/decode error — including a token containing
+    characters outside cp1252's range — means "leave it alone", never a
+    partial repair.
+    """
+    if token.isascii():
+        return None
+    try:
+        candidate = token.encode("cp1252", errors="strict").decode("utf-8", errors="strict")
+    except (UnicodeEncodeError, UnicodeDecodeError):
+        return None
+    return candidate if candidate != token else None
+
+
+def repair_mojibake(text: str) -> str:
+    """Conservatively repair cp1252-decoded-as-UTF-8 mojibake in ``text``.
+
+    See the module section header above for the two guards (lossless
+    round-trip + minimum occurrence count). Returns ``text`` unchanged unless
+    both are satisfied.
+    """
+    if not text or text.isascii():
+        return text
+
+    repairs: Dict[Tuple[int, int], str] = {}
+    for m in _WHITESPACE_TOKEN_RE.finditer(text):
+        repaired = _cp1252_roundtrip_repair(m.group())
+        if repaired is not None:
+            repairs[(m.start(), m.end())] = repaired
+
+    if len(repairs) < MOJIBAKE_MIN_OCCURRENCES:
+        return text
+
+    out: List[str] = []
+    cursor = 0
+    for (start, end), repaired in repairs.items():
+        out.append(text[cursor:start])
+        out.append(repaired)
+        cursor = end
+    out.append(text[cursor:])
+    return "".join(out)
+
+
+def _mojibake_repaired(fn):
+    """Decorator: repair mojibake in a ``convert_*_bytes`` adapter's output.
+
+    Post-processes the returned ``(markdown, metadata, images)`` triple only —
+    repairs ``markdown`` and every ``metadata["page_markdowns"][i]["markdown"]``
+    entry (selective anonymization reads those per-page texts, not just the
+    flat markdown). Never wraps the conversion call itself in try/except: an
+    adapter failure propagates unchanged, so this can't turn a genuine
+    conversion error into a silent partial result.
+    """
+
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        markdown, metadata, images = fn(*args, **kwargs)
+        markdown = repair_mojibake(markdown)
+        metadata = dict(metadata or {})
+        page_markdowns = metadata.get("page_markdowns")
+        if page_markdowns:
+            metadata["page_markdowns"] = [
+                {**page, "markdown": repair_mojibake(page["markdown"])}
+                if isinstance(page, dict) and isinstance(page.get("markdown"), str)
+                else page
+                for page in page_markdowns
+            ]
+        return markdown, metadata, images
+
+    return wrapper
 
 
 # ----------------------------------------------------------------------------
@@ -447,6 +572,7 @@ def _render_only_markdown(rendered_pages: Dict[str, str]) -> str:
     return "\n".join(lines)
 
 
+@_mojibake_repaired
 def convert_pdf_bytes(pdf_bytes: bytes) -> Tuple[str, Dict[str, Any], Dict[str, str]]:
     """Convert PDF bytes → (markdown, metadata, images).
 
@@ -615,6 +741,7 @@ def _df_to_markdown(df, max_rows: Optional[int] = None) -> str:
     return df.to_markdown(index=False)
 
 
+@_mojibake_repaired
 def convert_xlsx_bytes(content: bytes, max_rows_per_sheet: int = 5000) -> Tuple[str, Dict[str, Any], Dict[str, str]]:
     """XLSX/XLS → Markdown (one ``## SheetName`` heading per sheet)."""
     import pandas as pd
@@ -644,6 +771,7 @@ def convert_xlsx_bytes(content: bytes, max_rows_per_sheet: int = 5000) -> Tuple[
     return markdown, {"sheets": sheets_meta, "sheet_count": len(sheets_meta)}, {}
 
 
+@_mojibake_repaired
 def convert_csv_bytes(content: bytes) -> Tuple[str, Dict[str, Any], Dict[str, str]]:
     """CSV → Markdown table. Auto-detects encoding (utf-8 → cp1252 fallback)."""
     import pandas as pd
@@ -673,6 +801,7 @@ def convert_csv_bytes(content: bytes) -> Tuple[str, Dict[str, Any], Dict[str, st
 # ----------------------------------------------------------------------------
 
 
+@_mojibake_repaired
 def convert_html_bytes(content: bytes) -> Tuple[str, Dict[str, Any], Dict[str, str]]:
     """HTML → Markdown via the ``markdownify`` library."""
     from markdownify import markdownify as html_to_md
@@ -718,6 +847,7 @@ def _format_email_markdown(
     return "\n".join(parts)
 
 
+@_mojibake_repaired
 def convert_msg_bytes(content: bytes) -> Tuple[str, Dict[str, Any], Dict[str, str]]:
     """Outlook .msg → Markdown."""
     import extract_msg
@@ -781,6 +911,7 @@ def convert_msg_bytes(content: bytes) -> Tuple[str, Dict[str, Any], Dict[str, st
         os.unlink(tmp_path)
 
 
+@_mojibake_repaired
 def convert_eml_bytes(content: bytes) -> Tuple[str, Dict[str, Any], Dict[str, str]]:
     """RFC822 .eml → Markdown using stdlib ``email`` (no extra dep)."""
     import email
@@ -856,6 +987,7 @@ def convert_eml_bytes(content: bytes) -> Tuple[str, Dict[str, Any], Dict[str, st
 # ----------------------------------------------------------------------------
 
 
+@_mojibake_repaired
 def convert_image_bytes(content: bytes, suffix: str = ".png") -> Tuple[str, Dict[str, Any], Dict[str, str]]:
     """Image → Markdown via Docling (best-effort).
 
@@ -882,152 +1014,3 @@ def convert_image_bytes(content: bytes, suffix: str = ".png") -> Tuple[str, Dict
         raise RuntimeError(f"Image OCR failed: {e}") from e
     finally:
         os.unlink(tmp_path)
-
-
-# ----------------------------------------------------------------------------
-# Mojibake repair (UTF-8 bytes wrongly decoded as cp1252/Latin-1)
-# ----------------------------------------------------------------------------
-#
-# Some upstream PDF/Office generators write UTF-8 bytes into the document but
-# treat them as a single-byte codepage, so every non-ASCII character comes out
-# as a short run of Latin-1-ish characters: "Prüfung" becomes "PrÃ¼fung",
-# "Gebäude" becomes "GebÃ¤ude", "gemäß" becomes "gemÃ¤ÃŸ". Verified against a
-# real report (pruefbericht_owa.pdf) with three independent extractors
-# (Docling, poppler pdftotext, PyMuPDF) all producing the identical
-# corruption — the bad glyphs are baked into the source file, not an
-# extraction bug on our side.
-#
-# Repair works per whitespace-delimited token:
-#   1. Re-encode the token as cp1252, then decode the result as UTF-8, both
-#      strict. That is the exact inverse of the mistake that produced the
-#      mojibake, so it only succeeds when the token really is misdecoded
-#      UTF-8. Genuine single-byte Latin-1 text ("ü", "ä", "ß", accented
-#      names, …) is essentially never a valid UTF-8 continuation sequence on
-#      its own, so it fails the round-trip and is left untouched — this is
-#      what keeps something like "São Paulo" safe.
-#   2. Repairs are only applied to the document once at least
-#      MOJIBAKE_MIN_OCCURRENCES tokens independently round-trip. A single
-#      coincidental hit is left alone; systemic corruption (the actual
-#      failure mode here) clears this easily.
-#
-# This only touches NEW conversions going through this dispatcher — it is
-# deliberately not a backfill for documents already stored before this was
-# added (that is a separate, riskier undertaking).
-
-# Minimum number of independently-round-tripping tokens required before any
-# repair is applied to a text. Keeps a single unlucky token (rare, but not
-# provably impossible for the cp1252→UTF-8 round-trip) from rewriting a
-# document that isn't actually mojibake.
-MOJIBAKE_MIN_OCCURRENCES = 3
-
-_WHITESPACE_TOKEN_RE = re.compile(r"\S+")
-
-
-def _cp1252_roundtrip_repair(token: str) -> Optional[str]:
-    """Return the UTF-8-recovered token, or None if the repair doesn't apply.
-
-    Fails closed: any encode/decode error — including a token containing
-    characters outside cp1252's range — means "leave it alone", never a
-    partial repair.
-    """
-    if token.isascii():
-        return None
-    try:
-        candidate = token.encode("cp1252", errors="strict").decode("utf-8", errors="strict")
-    except (UnicodeEncodeError, UnicodeDecodeError):
-        return None
-    return candidate if candidate != token else None
-
-
-def repair_mojibake(text: str) -> str:
-    """Conservatively repair cp1252-decoded-as-UTF-8 mojibake in ``text``.
-
-    See the module section header above for the two guards (lossless
-    round-trip + minimum occurrence count). Returns ``text`` unchanged unless
-    both are satisfied.
-    """
-    if not text or text.isascii():
-        return text
-
-    repairs: Dict[Tuple[int, int], str] = {}
-    for m in _WHITESPACE_TOKEN_RE.finditer(text):
-        repaired = _cp1252_roundtrip_repair(m.group())
-        if repaired is not None:
-            repairs[(m.start(), m.end())] = repaired
-
-    if len(repairs) < MOJIBAKE_MIN_OCCURRENCES:
-        return text
-
-    out: List[str] = []
-    cursor = 0
-    for (start, end), repaired in repairs.items():
-        out.append(text[cursor:start])
-        out.append(repaired)
-        cursor = end
-    out.append(text[cursor:])
-    return "".join(out)
-
-
-# ----------------------------------------------------------------------------
-# Public dispatcher
-# ----------------------------------------------------------------------------
-
-
-def convert_document_sync(
-    content: bytes,
-    filename: str,
-    mime_type_hint: Optional[str] = None,
-) -> ConversionResult:
-    """Route a document to the appropriate adapter and return a ``ConversionResult``.
-
-    Raises ``UnsupportedFormatError`` for unknown formats and ``RuntimeError``
-    for adapter failures (callers map these to HTTP 415 / 500).
-    """
-    if not content:
-        raise RuntimeError("Empty file.")
-
-    fmt = detect_format(filename, mime_type_hint)
-    logger.info(f"convert_document: filename={filename!r} format={fmt} size={len(content)}")
-
-    if fmt == "pdf":
-        markdown, metadata, images = convert_pdf_bytes(content)
-    elif fmt == "docx":
-        markdown, metadata, images = convert_docx_bytes(content)
-    elif fmt == "pptx":
-        markdown, metadata, images = convert_pptx_bytes(content)
-    elif fmt == "xlsx":
-        markdown, metadata, images = convert_xlsx_bytes(content)
-    elif fmt == "csv":
-        markdown, metadata, images = convert_csv_bytes(content)
-    elif fmt == "html":
-        markdown, metadata, images = convert_html_bytes(content)
-    elif fmt == "msg":
-        markdown, metadata, images = convert_msg_bytes(content)
-    elif fmt == "eml":
-        markdown, metadata, images = convert_eml_bytes(content)
-    elif fmt == "image":
-        ext = os.path.splitext(filename or "")[1].lower() or ".png"
-        markdown, metadata, images = convert_image_bytes(content, suffix=ext)
-    else:  # pragma: no cover — detect_format already validates this
-        raise UnsupportedFormatError(f"No adapter for format token {fmt!r}")
-
-    metadata = dict(metadata or {})
-    metadata["original_size_bytes"] = len(content)
-    metadata["filename"] = filename
-
-    # Every adapter's markdown funnels through here — the one place to catch
-    # UTF-8-decoded-as-cp1252 mojibake regardless of source format. See the
-    # "Mojibake repair" section above for the safety guards.
-    markdown = repair_mojibake(markdown)
-    page_markdowns = metadata.get("page_markdowns")
-    if page_markdowns:
-        for page in page_markdowns:
-            if isinstance(page, dict) and isinstance(page.get("markdown"), str):
-                page["markdown"] = repair_mojibake(page["markdown"])
-
-    return ConversionResult(
-        markdown=markdown,
-        fmt=fmt,
-        metadata=metadata,
-        images=images or None,
-    )

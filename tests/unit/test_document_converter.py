@@ -26,13 +26,14 @@ import base64  # noqa: E402
 import io  # noqa: E402
 
 from src.privacy_service import document_converter as dc  # noqa: E402
+from src.privacy_service.adapters import build_default_chain  # noqa: E402
 from src.privacy_service.document_converter import (  # noqa: E402
     MAX_IMAGE_EDGE,
     MOJIBAKE_MIN_OCCURRENCES,
     RENDER_PAGE_MAX_EDGE,
     UnsupportedFormatError,
-    convert_document_sync,
     convert_csv_bytes,
+    convert_docx_bytes,
     convert_eml_bytes,
     convert_html_bytes,
     convert_pdf_bytes,
@@ -245,45 +246,6 @@ def test_convert_xlsx_two_sheets():
     assert customers["rows"] == 2
     assert customers["columns"] == ["name", "city"]
     assert images == {}
-
-
-# ----------------------------------------------------------------------------
-# Dispatcher: end-to-end + edge cases
-# ----------------------------------------------------------------------------
-
-
-def test_dispatcher_routes_csv():
-    pytest.importorskip("pandas")
-    pytest.importorskip("tabulate")
-    result = convert_document_sync(b"a,b\n1,2\n", "tiny.csv")
-    assert result.fmt == "csv"
-    assert result.metadata["rows"] == 1
-    assert result.metadata["filename"] == "tiny.csv"
-    assert result.metadata["original_size_bytes"] == len(b"a,b\n1,2\n")
-
-
-def test_dispatcher_routes_eml():
-    result = convert_document_sync(SAMPLE_EML, "sample.eml")
-    assert result.fmt == "eml"
-    assert "Hello" in result.markdown
-
-
-def test_dispatcher_unknown_format_raises():
-    with pytest.raises(UnsupportedFormatError):
-        convert_document_sync(b"some bytes", "mystery.xyz")
-
-
-def test_dispatcher_empty_file_raises():
-    with pytest.raises(RuntimeError):
-        convert_document_sync(b"", "anything.csv")
-
-
-def test_dispatcher_mime_hint_overrides_extension():
-    pytest.importorskip("pandas")
-    pytest.importorskip("tabulate")
-    # ``.bin`` has no extension mapping; MIME hint forces CSV adapter.
-    result = convert_document_sync(b"a,b\n1,2\n", "tiny.bin", mime_type_hint="text/csv")
-    assert result.fmt == "csv"
 
 
 # ----------------------------------------------------------------------------
@@ -598,21 +560,18 @@ class TestRepairMojibake:
         )
 
 
-class TestDispatcherAppliesMojibakeRepair:
-    """Wiring test: convert_document_sync repairs markdown AND page_markdowns
-    regardless of which adapter produced them — the dispatcher is the single
-    shared point every caller (npm package + direct HTTP callers) goes
-    through."""
+class TestMojibakeRepairDecorator:
+    """Unit-level tests for ``@_mojibake_repaired`` itself, independent of any
+    particular adapter."""
 
-    def test_pdf_markdown_and_page_markdowns_repaired(self, monkeypatch):
+    def test_wrapper_repairs_markdown_and_page_markdowns(self):
         mojibake_md = (
             "PrÃ¼fung GebÃ¤ude gemÃ¤ÃŸ PrÃ¼fung GebÃ¤ude gemÃ¤ÃŸ PrÃ¼fung GebÃ¤ude"
         )
 
-        def _fake_convert_pdf_bytes(pdf_bytes):
+        @dc._mojibake_repaired
+        def _fake_adapter(content):
             metadata = {
-                "pages": 2,
-                "docling_parsed": True,
                 "page_markdowns": [
                     {"page_no": 1, "markdown": mojibake_md},
                     {"page_no": 2, "markdown": "Clean page, nothing wrong here."},
@@ -620,27 +579,142 @@ class TestDispatcherAppliesMojibakeRepair:
             }
             return mojibake_md, metadata, {}
 
-        monkeypatch.setattr(dc, "convert_pdf_bytes", _fake_convert_pdf_bytes)
+        markdown, metadata, images = _fake_adapter(b"whatever")
 
-        result = convert_document_sync(b"%PDF-1.4 fake", "report.pdf")
+        assert "Prüfung" in markdown and "Ã" not in markdown
+        page1 = metadata["page_markdowns"][0]["markdown"]
+        assert "Prüfung" in page1 and "Ã" not in page1
+        assert metadata["page_markdowns"][1]["markdown"] == (
+            "Clean page, nothing wrong here."
+        )
 
-        assert "Prüfung" in result.markdown
-        assert "Gebäude" in result.markdown
-        assert "Ã" not in result.markdown
+    def test_wrapper_leaves_clean_markdown_untouched(self):
+        clean_md = "Der Bericht beschreibt die Prüfung des Gebäudes gemäß ÖNORM."
+
+        @dc._mojibake_repaired
+        def _fake_adapter(content):
+            return clean_md, {"pages": 1}, {}
+
+        markdown, _, _ = _fake_adapter(b"whatever")
+        assert markdown == clean_md
+
+    def test_wrapper_propagates_adapter_exception_unchanged(self):
+        """The decorator must never swallow a genuine conversion failure —
+        only post-process a successful result."""
+
+        @dc._mojibake_repaired
+        def _fake_adapter(content):
+            raise RuntimeError("boom: real conversion failure")
+
+        with pytest.raises(RuntimeError, match="boom: real conversion failure"):
+            _fake_adapter(b"whatever")
+
+
+class TestMojibakeRepairWiredIntoProductionPaths:
+    """Wiring tests against the REAL production entry points — not a dead
+    dispatcher. ``convert_document_sync`` never handled live traffic (grep
+    confirmed only its own unit tests called it); the three actual callers
+    (/convert-pdf, and the AdapterChain behind /document/convert +
+    /document/convert-and-anonymize) call the ``convert_*_bytes`` functions
+    directly, so the repair must be proven against those, not a stand-in."""
+
+    def test_convert_pdf_bytes_repairs_docling_output(self, monkeypatch):
+        """/convert-pdf calls convert_pdf_bytes directly — this is that path."""
+        mojibake_md = (
+            "PrÃ¼fung GebÃ¤ude gemÃ¤ÃŸ PrÃ¼fung GebÃ¤ude gemÃ¤ÃŸ PrÃ¼fung GebÃ¤ude"
+        )
+        page_markdowns = [
+            {"page_no": 1, "markdown": mojibake_md},
+            {"page_no": 2, "markdown": "Clean page, nothing wrong here."},
+        ]
+
+        # No page qualifies for the render→Vision fallback, so pypdfium2/PIL
+        # are never touched — this test only needs the Docling text path.
+        monkeypatch.setattr(dc, "_pdf_page_geometry", lambda pdf_bytes: [(500, 800.0), (500, 800.0)])
+        monkeypatch.setattr(
+            dc, "_docling_convert_pdf", lambda pdf_bytes: (mojibake_md, 2, {}, page_markdowns)
+        )
+
+        markdown, metadata, images = convert_pdf_bytes(b"%PDF-1.4 fake")
+
+        assert "Prüfung" in markdown and "Gebäude" in markdown and "Ã" not in markdown
+        page1 = metadata["page_markdowns"][0]["markdown"]
+        assert "Prüfung" in page1 and "Ã" not in page1
+        assert metadata["page_markdowns"][1]["markdown"] == (
+            "Clean page, nothing wrong here."
+        )
+
+    def test_adapter_chain_repairs_pdf_markdown_and_page_markdowns(self, monkeypatch):
+        """/document/convert + /document/convert-and-anonymize go through
+        AdapterChain.convert() — this is that path, exercised end-to-end
+        (PdfAdapter -> _wrap_legacy -> convert_pdf_bytes)."""
+        mojibake_md = (
+            "PrÃ¼fung GebÃ¤ude gemÃ¤ÃŸ PrÃ¼fung GebÃ¤ude gemÃ¤ÃŸ PrÃ¼fung GebÃ¤ude"
+        )
+        page_markdowns = [
+            {"page_no": 1, "markdown": mojibake_md},
+            {"page_no": 2, "markdown": "Clean page, nothing wrong here."},
+        ]
+
+        monkeypatch.setattr(dc, "_pdf_page_geometry", lambda pdf_bytes: [(500, 800.0), (500, 800.0)])
+        monkeypatch.setattr(
+            dc, "_docling_convert_pdf", lambda pdf_bytes: (mojibake_md, 2, {}, page_markdowns)
+        )
+
+        chain = build_default_chain()
+        result = chain.convert(b"%PDF-1.4 fake", "report.pdf")
+
+        assert result.fmt == "pdf"
+        assert "Prüfung" in result.markdown and "Ã" not in result.markdown
         page1 = result.metadata["page_markdowns"][0]["markdown"]
         assert "Prüfung" in page1 and "Ã" not in page1
-        # Untouched page stays byte-identical.
         assert result.metadata["page_markdowns"][1]["markdown"] == (
             "Clean page, nothing wrong here."
         )
 
-    def test_dispatcher_leaves_clean_pdf_markdown_untouched(self, monkeypatch):
-        clean_md = "Der Bericht beschreibt die Prüfung des Gebäudes gemäß ÖNORM."
+    def test_adapter_chain_repairs_csv_markdown(self):
+        """Non-PDF adapters are wired too — CSV via the real AdapterChain,
+        no monkeypatching needed since the corruption lives in the cell text
+        itself (matches the real-world case: the source document already
+        carries the corrupted text, our decode of it succeeds cleanly)."""
+        pytest.importorskip("pandas")
+        pytest.importorskip("tabulate")
+        csv_bytes = (
+            "name,note\r\n"
+            "Alice,\"PrÃ¼fung GebÃ¤ude gemÃ¤ÃŸ\"\r\n"
+        ).encode("utf-8")
 
-        def _fake_convert_pdf_bytes(pdf_bytes):
-            return clean_md, {"pages": 1, "docling_parsed": True}, {}
+        chain = build_default_chain()
+        result = chain.convert(csv_bytes, "report.csv")
 
-        monkeypatch.setattr(dc, "convert_pdf_bytes", _fake_convert_pdf_bytes)
+        assert result.fmt == "csv"
+        assert "Prüfung" in result.markdown and "Ã" not in result.markdown
 
-        result = convert_document_sync(b"%PDF-1.4 fake", "report.pdf")
-        assert result.markdown == clean_md
+    def test_docx_inherits_repair_via_pdf_delegation(self, monkeypatch, tmp_path):
+        """DOCX/PPTX carry no @_mojibake_repaired of their own — they delegate
+        to convert_pdf_bytes via LibreOffice, so the repair must come along
+        for free. This is the reason those two functions stay undecorated."""
+        mojibake_md = (
+            "PrÃ¼fung GebÃ¤ude gemÃ¤ÃŸ PrÃ¼fung GebÃ¤ude gemÃ¤ÃŸ PrÃ¼fung GebÃ¤ude"
+        )
+        fake_pdf_path = tmp_path / "input.pdf"
+        fake_pdf_path.write_bytes(b"%PDF-1.4 fake")
+
+        monkeypatch.setattr(
+            dc, "_libreoffice_to_pdf",
+            lambda input_path, output_dir, timeout=300: str(fake_pdf_path),
+        )
+        monkeypatch.setattr(dc, "_pdf_page_geometry", lambda pdf_bytes: [(500, 800.0)])
+        monkeypatch.setattr(
+            dc, "_docling_convert_pdf", lambda pdf_bytes: (mojibake_md, 1, {}, None)
+        )
+
+        markdown, metadata, images = convert_docx_bytes(b"fake docx bytes")
+
+        assert "Prüfung" in markdown and "Gebäude" in markdown and "Ã" not in markdown
+
+    def test_dispatcher_helper_removed(self):
+        """convert_document_sync was dead code (only its own tests called it,
+        confirmed via repo-wide grep) and is intentionally gone — the real
+        entry points call the adapters directly, see tests above."""
+        assert not hasattr(dc, "convert_document_sync")
