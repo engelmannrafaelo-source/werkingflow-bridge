@@ -104,7 +104,25 @@ async def resolve_billing_plan(
     if monthly is not None:
         return monthly
 
-    # Project-only app (Energy). The boot invariant guarantees exactly one
-    # per-project plan here, so this is a resolution, not a pick: the project's
-    # first call has no allocation yet and the post-call deduction allocates it.
+    # Project-only app with SEVERAL per-project plans (werking-check sells
+    # 1/5/20 credit packs, migration 049): an unallocated call cannot be
+    # attributed — the tiers differ only in price, guessing one would silently
+    # charge the wrong pot. Such a call is also a caller bug by contract: the
+    # free check funnel attributes itself as werking-report (migration 046
+    # doctrine), only allocated (paid) work carries werking-check
+    # (check-attribution.ts in werking-report). Refuse loudly so the
+    # mis-attributed caller surfaces immediately.
+    if len(project_plans) > 1:
+        raise PlanResolutionError(
+            f"app_id={app_id!r} declares several per-project plans "
+            f"({[p.id for p in project_plans]}) and no monthly plan, and this call "
+            f"(user_id={user_id}, project_id={project_id!r}) has no allocated project "
+            f"budget. An unallocated call for such an app cannot be attributed to a "
+            f"pot — the caller must either run on an allocation (paid work) or "
+            f"attribute itself to the app that carries its free tier."
+        )
+
+    # Project-only app with exactly one plan (Energy). This is a resolution,
+    # not a pick: the project's first call has no allocation yet and the
+    # post-call deduction allocates it.
     return project_plans[0]
