@@ -391,8 +391,11 @@ def _issuer() -> Dict[str, str]:
         "city":     _os.environ.get("INVOICE_ISSUER_CITY",     "1080 Wien"),
         "country":  _os.environ.get("INVOICE_ISSUER_COUNTRY",  "Österreich"),
         "phone":    _os.environ.get("INVOICE_ISSUER_PHONE",    "+43 676 542 3883"),
-        "email":    _os.environ.get("INVOICE_ISSUER_EMAIL",    "office@data-energyneering.at"),
-        "web":      _os.environ.get("INVOICE_ISSUER_WEB",      "www.werkingflow.at"),
+        # Produkt-Auftritt werking.tools (Rafael, 05.08.): office@werking.tools
+        # ist das EINZIGE reale Postfach (CLAUDE.md E-Mail-Regeln) — keine
+        # erfundenen Adressen. Rechtstraeger (ZT e.U., UID, Steuer-Nr.) bleibt.
+        "email":    _os.environ.get("INVOICE_ISSUER_EMAIL",    "office@werking.tools"),
+        "web":      _os.environ.get("INVOICE_ISSUER_WEB",      "www.werking.tools"),
         "vatId":    _os.environ.get("INVOICE_ISSUER_VAT_ID",   "ATU78156638"),
         "taxNr":    _os.environ.get("INVOICE_ISSUER_TAX_NR",   "06 289/4969"),
         "regCourt": _os.environ.get("INVOICE_ISSUER_REG_COURT","Landesgericht Wien"),
@@ -401,6 +404,26 @@ def _issuer() -> Dict[str, str]:
         "bankName": _os.environ.get("INVOICE_ISSUER_BANK_NAME",""),
         "ownerName":_os.environ.get("INVOICE_ISSUER_OWNER",    "Dipl.-Ing. Dr. Rafael Engelmann"),
     }
+
+
+_STATUS_LABELS_DE = {
+    # Kundentext auf der Rechnung — der rohe Statuswert bleibt CSS-Klasse.
+    "draft": "Entwurf",
+    "issued": "Offen",
+    "paid": "Bezahlt",
+    "cancelled": "Storniert",
+    "overdue": "Überfällig",
+}
+
+
+def _eur_de(value: Any) -> str:
+    """EUR-Betrag in deutscher Notation (1.234,56) — Rechnung ist ein deutsches
+    Dokument, '9.00' liest sich dort als Fremdkoerper."""
+    try:
+        f = float(value)
+    except (TypeError, ValueError):
+        return str(value)
+    return f"{f:,.2f}".replace(",", "\u00a0X").replace(".", ",").replace("\u00a0X", ".")
 
 
 def _human_date(iso: Optional[str]) -> str:
@@ -534,7 +557,7 @@ _HTML_TEMPLATE = """<!doctype html>
   </div>
   <div>
     <h1>Rechnung</h1>
-    <div style="margin-bottom:10px;"><span class="status status-{status}">{status}</span></div>
+    <div style="margin-bottom:10px;"><span class="status status-{status}">{status_label}</span></div>
     <table class="meta-table">
       <tr><td class="k">Rechnungs-Nr.</td><td><strong>{invoice_number}</strong></td></tr>
       <tr><td class="k">Ausgestellt am</td><td>{issued_at_human}</td></tr>
@@ -621,8 +644,8 @@ def _render_html(inv: Dict[str, Any], fallback_recipient: Optional[Dict[str, Any
     rows_html = "".join(
         f"<tr><td class='desc'>{li.get('description','')}</td>"
         f"<td class='num'>{li.get('quantity','')}</td>"
-        f"<td class='num'>{float(li.get('unitPriceEur',0)):.2f}</td>"
-        f"<td class='num'>{float(li.get('totalEur',0)):.2f}</td></tr>"
+        f"<td class='num'>{_eur_de(li.get('unitPriceEur',0))}</td>"
+        f"<td class='num'>{_eur_de(li.get('totalEur',0))}</td></tr>"
         for li in (inv.get("lineItems") or [])
     ) or "<tr><td colspan='4' style='color:#9ca3af;text-align:center;padding:18px;'>Keine Positionen</td></tr>"
 
@@ -667,15 +690,16 @@ def _render_html(inv: Dict[str, Any], fallback_recipient: Optional[Dict[str, Any
     return _HTML_TEMPLATE.format(
         invoice_number=inv["invoiceNumber"],
         status=status,
+        status_label=_STATUS_LABELS_DE.get(status, status),
         issued_at_human=_human_date(inv.get("issuedAt")),
         due_at_human=_human_date(inv.get("dueAt")),
         paid_at_human=_human_date(inv.get("paidAt")),
         billing_address_block=addr_block,
         rows_html=rows_html,
-        subtotal_eur=inv["subtotalEur"],
-        tax_rate=inv["taxRate"],
-        tax_eur=inv["taxEur"],
-        total_eur=inv["totalEur"],
+        subtotal_eur=_eur_de(inv["subtotalEur"]),
+        tax_rate=_eur_de(inv["taxRate"]),
+        tax_eur=_eur_de(inv["taxEur"]),
+        total_eur=_eur_de(inv["totalEur"]),
         payment_block=payment_block,
         reverse_charge_block=reverse_charge_block,
         notes_block=notes_block,
