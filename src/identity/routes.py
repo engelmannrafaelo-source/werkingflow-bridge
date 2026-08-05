@@ -447,6 +447,15 @@ _REGISTER_ALLOWED_APP_IDS = frozenset({
 # pre-commit the new user to a paid tier.
 _REGISTER_DEFAULT_PLAN_ID = "trial"
 
+# Per-App-Ausnahmen vom Trial-Default (Rafael, 2026-08-05): Ein werking-check-
+# Konto ist ein REGULAERES Konto, kein Test von irgendetwas — es gibt kein
+# Abo, das man anschliessend kaufen muesste; man bekommt genau so viele Checks,
+# wie gebucht sind (plus das freie Kontingent der App). 'trial' als
+# Lizenz-Etikett waere im Portal ("Testphase", Ablaufdatum) und in jeder
+# Auswertung die falsche Aussage. Migration 050 fuegt den Enum-Wert hinzu,
+# 051 zieht Bestandszeilen nach.
+_REGISTER_LICENSE_PLAN_BY_APP = {"werking-check": "check-konto"}
+
 # Bedrock-Pin für Online-Selbstregistrierung (Rafael, 2026-08-04): Datenresidenz
 # EU / eigenes AWS-Konto ab dem ersten Call nach Kontoerstellung. Shape wie
 # user_provider_override.py sie versteht; Region explizit, damit ein künftiger
@@ -585,7 +594,7 @@ async def register(body: RegisterRequest) -> Dict[str, Any]:
                     """,
                     user_id,
                     body.appId,
-                    _REGISTER_DEFAULT_PLAN_ID,
+                    _REGISTER_LICENSE_PLAN_BY_APP.get(body.appId, _REGISTER_DEFAULT_PLAN_ID),
                     today,
                 )
 
@@ -601,16 +610,21 @@ async def register(body: RegisterRequest) -> Dict[str, Any]:
                 # list_subscriptions lazy-expires past-due rows. 7 days
                 # matches the registration stage in required-fields.yaml.
                 #
-                # AUSNAHME checkId (Rafael, Produktentscheidung 2026-07-30):
-                # WerkING Check ist nach außen ein EIGENES Produkt — ein
-                # Check-Käufer ist Check-Kunde, kein Report-Trial-Nutzer.
-                # Check-Registrierungen (checkId gesetzt) bekommen daher
-                # KEINE Trial-Subscription: ohne Subscription keine
-                # Entitlements, die App hält den Account sauber auf der
-                # Check-Fläche (Downloads/Credits/Rechnungen). Das entwertet
-                # zugleich die öffentliche Register-Route als Trial-Quelle
-                # am Warteliste-Gate vorbei für diesen Pfad.
-                if body.checkId is None:
+                # AUSNAHME werking-check (Rafael, 2026-07-30 checkId-Pfad,
+                # 2026-08-05 aufs PRODUKT generalisiert): WerkING Check ist
+                # ein EIGENES Produkt ohne Abo-Treppe — ein Check-Konto ist
+                # ein regulaeres Konto, kein Report-Trial-Nutzer. ALLE
+                # werking-check-Registrierungen (Werkkonto auf werking.tools
+                # ebenso wie der checkId-Trichter) bekommen daher KEINE
+                # Trial-Subscription: ohne Subscription keine Entitlements —
+                # das Portal zeigt keine "Testphase", und die Check-Quota
+                # bleibt beim freien Kontingent statt still auf die
+                # Trial-Plan-Quota zu springen (die Luecke traf am 04.08.
+                # die erste Werkkonto-E2E-Registrierung: checkId war None,
+                # der Report-Pfad legte eine 7-Tage-Trial-Subscription an).
+                # Das entwertet zugleich die oeffentliche Register-Route als
+                # Trial-Quelle am Warteliste-Gate vorbei fuer diesen Pfad.
+                if body.checkId is None and body.appId != "werking-check":
                     await conn.execute(
                         """
                         INSERT INTO subscriptions
