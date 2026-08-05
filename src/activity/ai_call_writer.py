@@ -30,6 +30,7 @@ from collections import defaultdict
 from typing import Optional
 
 from src.activity.app_registry import normalize_app_id
+from src.activity.providers import REAL_COST_PROVIDERS, normalize_ledger_provider
 from src.budget.plan_resolution import PlanResolutionError
 from src.budget.plans import AmbiguousPlanCatalog
 from src.db.client import get_pool
@@ -91,7 +92,7 @@ def resolve_ledger_cost(
     """
     if billing_mode_text == "pay_per_token":
         return "pay_per_token", call_cost_eur
-    return "flat_rate_estimated", call_cost_eur if provider in ("bedrock", "research-cloud") else 0.0
+    return "flat_rate_estimated", call_cost_eur if provider in REAL_COST_PROVIDERS else 0.0
 
 
 async def _deduct_call_cost(
@@ -214,7 +215,7 @@ async def persist_ai_call_activity(
     error_code: Optional[str] = None,
     error_message: Optional[str] = None,
     app_env: Optional[str] = None,
-    provider: str = "anthropic",
+    provider: str,
     provider_meta: Optional[dict] = None,
     region: Optional[str] = None,
     cache_read_tokens: int = 0,
@@ -234,9 +235,18 @@ async def persist_ai_call_activity(
         call came from, or None when the app sent no X-App-Env header. The
         caller normalises it (extract_attribution_context); we just persist
         it. Drives the Platform Admin "mode" filter.
-    provider: which backend served the call ('anthropic' | 'bedrock' | ...).
-        Drives usage_events.provider — the reconciliation against the
-        provider's own billing (e.g. CloudWatch token counts) keys on it.
+    provider: who physically received this call's data. REQUIRED — pass a
+        constant from src/activity/providers.py, never a string literal.
+        Drives usage_events.provider, which is both the reconciliation key
+        against the provider's own billing (e.g. CloudWatch token counts) AND
+        the evidence behind the customer-facing EU-residency assurance. It had
+        a 'anthropic' default until 2026-08-05; that default silently claimed
+        an Anthropic transmission for every caller who did not think about the
+        question, including local-only work (docling) and calls to other
+        companies (OpenAI Whisper). See providers.py for the full rationale.
+        Use ledger_provider_for_backend(backend_config.backend) where a
+        backend was resolved — and note that a None backend means the call was
+        rejected before routing, i.e. PROVIDER_UNROUTED, not "anthropic".
     provider_meta: extra provider facts merged into provider_metadata
         (e.g. bedrock_model_id, region, aws_request_id for call-level joins
         with AWS invocation logs).
@@ -248,6 +258,13 @@ async def persist_ai_call_activity(
         cloud only) — billed per-search on top of tokens, see src/pricing.py
         WEB_SEARCH_FEE_USD. Defaults to 0 (no-op for every other caller).
     """
+    # Validate before anything keys on it: provider drives both the cost
+    # branch below and the compliance readout. An unvocabulary value becomes
+    # 'unknown' + an ERROR log, never a plausible-looking default.
+    provider = normalize_ledger_provider(
+        provider, context=f"app={app_id} agent={agent_id} model={model}"
+    )
+
     # Cost from the pricing SSoT. Error calls cost nothing (0.0) — only a
     # successful completion consumes budget.
     call_cost_eur = (

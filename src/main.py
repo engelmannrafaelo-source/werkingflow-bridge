@@ -65,6 +65,13 @@ from src.vision_provider import VisionProvider, get_vision_provider
 from src.routing.vision_router import check_and_route_vision, prepare_messages_for_vision, has_vision_content
 from src.routing.prepaid_cap import prepaid_vision_over_cap
 from src.routing.backend_router import resolve_backend_config, get_backend_info_dict, BackendConfig
+from src.activity.providers import (
+    ledger_provider_for_backend,
+    PROVIDER_ANTHROPIC,
+    PROVIDER_LOCAL,
+    PROVIDER_OPENAI,
+    PROVIDER_SAGEMAKER,
+)
 from src.auth import verify_api_key, security, validate_claude_code_auth, get_claude_code_auth_info, bedrock_credential_manager
 # Generic async-job system (additive, flag-gated via BRIDGE_GENERIC_JOBS_ENABLED).
 from src.jobs.routes import router as jobs_router, set_attribution_extractor
@@ -1341,6 +1348,7 @@ async def generate_streaming_response(
                     )
                     from src.activity.ai_call_writer import persist_ai_call_activity
                     await persist_ai_call_activity(
+                        provider=PROVIDER_ANTHROPIC,
                         app_id=_vision_attr.get("app_id"),
                         user_id=_vision_attr.get("user_id"),
                         agent_id=_vision_attr.get("agent_id"),
@@ -1844,6 +1852,7 @@ async def generate_streaming_response(
                 # Bridge self-log: streaming success activity. See ADR 0007.
                 from src.activity.ai_call_writer import persist_ai_call_activity
                 await persist_ai_call_activity(
+                    provider=ledger_provider_for_backend(backend_config.backend) if backend_config else PROVIDER_ANTHROPIC,
                     app_id=attr.get("app_id"),
                     user_id=attr.get("user_id"),
                     agent_id=attr.get("agent_id"),
@@ -2123,6 +2132,14 @@ async def chat_completions(
     # documented instead of guessed at.
     user_pinned_provider = None
     tenant = None
+    # Same hoist, same reason, plus one of its own: the error handlers now read
+    # backend_config to label the ledger row's provider truthfully. Its real
+    # assignment is ~300 lines into the try (BACKEND ROUTING), well after the
+    # budget gate's 402 — so a gate rejection would have hit the identical
+    # UnboundLocalError. Staying None here is also the CORRECT answer for that
+    # case: no backend was resolved, nothing was transmitted, and the row books
+    # provider='unrouted' instead of inventing an Anthropic call.
+    backend_config = None
 
     try:
         request_id = f"chatcmpl-{os.urandom(8).hex()}"
@@ -2829,6 +2846,7 @@ async def chat_completions(
                         _vision_attr = extract_attribution_context(request)
                         from src.activity.ai_call_writer import persist_ai_call_activity
                         await persist_ai_call_activity(
+                            provider=PROVIDER_ANTHROPIC,
                             app_id=_vision_attr.get("app_id"),
                             user_id=_vision_attr.get("user_id"),
                             agent_id=_vision_attr.get("agent_id"),
@@ -3320,6 +3338,7 @@ async def chat_completions(
                 # itself — apps no longer POST /v1/activity/log. See ADR 0007.
                 from src.activity.ai_call_writer import persist_ai_call_activity
                 await persist_ai_call_activity(
+                    provider=ledger_provider_for_backend(backend_config.backend if backend_config else None),
                     app_id=attribution.get("app_id"),
                     user_id=attribution.get("user_id"),
                     agent_id=attribution.get("agent_id"),
@@ -3445,6 +3464,7 @@ async def chat_completions(
             if not getattr(request.state, "ai_call_error_persisted", False):
                 from src.activity.ai_call_writer import persist_ai_call_activity
                 await persist_ai_call_activity(
+                    provider=ledger_provider_for_backend(backend_config.backend if backend_config else None),
                     app_id=attribution.get("app_id"),
                     user_id=attribution.get("user_id"),
                     agent_id=attribution.get("agent_id"),
@@ -3503,6 +3523,7 @@ async def chat_completions(
             # Bridge self-log: 429 rate-limit error activity. See ADR 0007.
             from src.activity.ai_call_writer import persist_ai_call_activity
             await persist_ai_call_activity(
+                provider=ledger_provider_for_backend(backend_config.backend if backend_config else None),
                 app_id=attribution.get("app_id"),
                 user_id=attribution.get("user_id"),
                 agent_id=attribution.get("agent_id"),
@@ -4162,6 +4183,7 @@ async def _execute_research_impl(
                     _track_out = 0
             from src.activity.ai_call_writer import persist_ai_call_activity
             await persist_ai_call_activity(
+                provider=PROVIDER_ANTHROPIC,
                 app_id=attribution_ctx.get("app_id") if attribution_ctx else None,
                 user_id=attribution_ctx.get("user_id") if attribution_ctx else None,
                 agent_id=f"research:{request_body.strategy or 'default'}",
@@ -4222,6 +4244,7 @@ async def _execute_research_impl(
                 _err_in = MessageAdapter.estimate_tokens(research_prompt)
             from src.activity.ai_call_writer import persist_ai_call_activity
             await persist_ai_call_activity(
+                provider=PROVIDER_ANTHROPIC,
                 app_id=attribution_ctx.get("app_id") if attribution_ctx else None,
                 user_id=attribution_ctx.get("user_id") if attribution_ctx else None,
                 agent_id=f"research:{request_body.strategy or 'default'}",
@@ -5266,6 +5289,7 @@ async def _execute_doc_agent_impl(
                 _track_out = MessageAdapter.estimate_tokens(answer)
             from src.activity.ai_call_writer import persist_ai_call_activity
             await persist_ai_call_activity(
+                provider=PROVIDER_ANTHROPIC,
                 app_id=attribution_ctx.get("app_id") if attribution_ctx else None,
                 user_id=attribution_ctx.get("user_id") if attribution_ctx else None,
                 agent_id="doc-agent",
@@ -5318,6 +5342,7 @@ async def _execute_doc_agent_impl(
         try:
             from src.activity.ai_call_writer import persist_ai_call_activity
             await persist_ai_call_activity(
+                provider=PROVIDER_ANTHROPIC,
                 app_id=attribution_ctx.get("app_id") if attribution_ctx else None,
                 user_id=attribution_ctx.get("user_id") if attribution_ctx else None,
                 agent_id="doc-agent",
@@ -6082,6 +6107,7 @@ async def _smart_anonymize_core(
             _attr = extract_attribution_context(request)
             from src.activity.ai_call_writer import persist_ai_call_activity
             await persist_ai_call_activity(
+                provider=PROVIDER_LOCAL,
                 app_id=_attr.get("app_id"),
                 user_id=_attr.get("user_id"),
                 agent_id="anonymisierung",
@@ -6146,6 +6172,7 @@ async def _smart_anonymize_core(
             _attr = extract_attribution_context(request)
             from src.activity.ai_call_writer import persist_ai_call_activity
             await persist_ai_call_activity(
+                provider=PROVIDER_LOCAL,
                 app_id=_attr.get("app_id"),
                 user_id=_attr.get("user_id"),
                 agent_id="anonymisierung",
@@ -6477,6 +6504,7 @@ async def convert_html_to_pdf_endpoint(
             _attr = extract_attribution_context(request)
             from src.activity.ai_call_writer import persist_ai_call_activity
             await persist_ai_call_activity(
+                provider=PROVIDER_LOCAL,
                 app_id=_attr.get("app_id"),
                 user_id=_attr.get("user_id"),
                 agent_id="pdf-export",
@@ -6504,6 +6532,7 @@ async def convert_html_to_pdf_endpoint(
             _attr = extract_attribution_context(request)
             from src.activity.ai_call_writer import persist_ai_call_activity
             await persist_ai_call_activity(
+                provider=PROVIDER_LOCAL,
                 app_id=_attr.get("app_id"),
                 user_id=_attr.get("user_id"),
                 agent_id="pdf-export",
@@ -6570,6 +6599,7 @@ async def convert_html_to_screenshot_endpoint(
             _attr = extract_attribution_context(request)
             from src.activity.ai_call_writer import persist_ai_call_activity
             await persist_ai_call_activity(
+                provider=PROVIDER_LOCAL,
                 app_id=_attr.get("app_id"),
                 user_id=_attr.get("user_id"),
                 agent_id="screenshot",
@@ -6597,6 +6627,7 @@ async def convert_html_to_screenshot_endpoint(
             _attr = extract_attribution_context(request)
             from src.activity.ai_call_writer import persist_ai_call_activity
             await persist_ai_call_activity(
+                provider=PROVIDER_LOCAL,
                 app_id=_attr.get("app_id"),
                 user_id=_attr.get("user_id"),
                 agent_id="screenshot",
@@ -6819,6 +6850,7 @@ async def convert_document_endpoint(
         from src.activity.ai_call_writer import persist_ai_call_activity
         _status = "success" if result.status_code < 400 else "error"
         await persist_ai_call_activity(
+            provider=PROVIDER_LOCAL,
             app_id=_attr.get("app_id"),
             user_id=_attr.get("user_id"),
             agent_id="dokument-konvertierung",
@@ -7097,6 +7129,7 @@ async def audio_transcriptions(
             _attr = extract_attribution_context(request)
             from src.activity.ai_call_writer import persist_ai_call_activity
             await persist_ai_call_activity(
+                provider=PROVIDER_OPENAI if _stt_provider == "openai" else PROVIDER_SAGEMAKER,
                 app_id=_attr.get("app_id"),
                 user_id=_attr.get("user_id"),
                 agent_id="transkription",
@@ -7118,6 +7151,7 @@ async def audio_transcriptions(
             _attr = extract_attribution_context(request)
             from src.activity.ai_call_writer import persist_ai_call_activity
             await persist_ai_call_activity(
+                provider=PROVIDER_OPENAI if _stt_provider == "openai" else PROVIDER_SAGEMAKER,
                 app_id=_attr.get("app_id"),
                 user_id=_attr.get("user_id"),
                 agent_id="transkription",
@@ -7141,6 +7175,7 @@ async def audio_transcriptions(
             _attr = extract_attribution_context(request)
             from src.activity.ai_call_writer import persist_ai_call_activity
             await persist_ai_call_activity(
+                provider=PROVIDER_OPENAI if _stt_provider == "openai" else PROVIDER_SAGEMAKER,
                 app_id=_attr.get("app_id"),
                 user_id=_attr.get("user_id"),
                 agent_id="transkription",

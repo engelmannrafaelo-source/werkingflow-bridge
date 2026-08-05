@@ -31,6 +31,7 @@ _pricing_stub.cost_eur = MagicMock(return_value=0.01)
 _pricing_stub.PRICING_VERSION = "test-v1"
 
 import src.activity.ai_call_writer as writer  # noqa: E402
+from src.activity.providers import PROVIDER_ANTHROPIC
 
 
 # ---------------------------------------------------------------------------
@@ -93,6 +94,7 @@ def _email_row(user_id=VALID_UUID):
 
 async def _call_writer(user_id, app_id="test-app"):
     await writer.persist_ai_call_activity(
+        provider=PROVIDER_ANTHROPIC,
         app_id=app_id,
         user_id=user_id,
         agent_id=None,
@@ -248,6 +250,7 @@ async def test_cache_tokens_in_activity_payload():
         patch.object(writer, "_deduct_call_cost"),
     ):
         await writer.persist_ai_call_activity(
+            provider=PROVIDER_ANTHROPIC,
             app_id="werking-energy",
             user_id=VALID_UUID,
             agent_id="api/llm-client",
@@ -283,6 +286,7 @@ async def test_cache_tokens_in_activity_payload():
 async def _call_writer_anonymous(user_id):
     """Wie _call_writer, aber ohne app_id-Default-Verwirrung — expliziter Marker."""
     await writer.persist_ai_call_activity(
+        provider=PROVIDER_ANTHROPIC,
         app_id="werking-report",
         user_id=user_id,
         agent_id=None,
@@ -390,6 +394,7 @@ async def test_error_message_persisted_truncated():
         patch.object(writer, "_deduct_call_cost"),
     ):
         await writer.persist_ai_call_activity(
+            provider=PROVIDER_ANTHROPIC,
             app_id="werking-energy",
             user_id=VALID_UUID,
             agent_id="upload-verarbeitung",
