@@ -426,6 +426,18 @@ async def start_first_purchase_pack_checkout(
 
     user_uuid = uuid.UUID(user_id)
 
+    # Rechnungsdaten sind beim Kauf PFLICHT (Rafael, 2026-08-05) — ersetzt die
+    # Kleinbetrags-Lockerung aus dem Docstring oben ("keine Adresspflicht vor
+    # dem Mollie-Roundtrip"): jede Kundenrechnung soll vollstaendige
+    # Empfaengerdaten tragen, nicht nur das gesetzliche Minimum der
+    # Kleinbetragsrechnung. Gleiches Gate wie Abo-/Pack-Lane (§11 UStG:
+    # Name + vollstaendige Adresse; test/internal-Tenants ausgenommen).
+    # Fail-fast VOR Order- und Mollie-Anlage — der Fehlertext listet die
+    # fehlenden Felder fuer PATCH /v1/tenants/{tid}/billing-address.
+    pool = get_pool()
+    async with pool.acquire() as conn:
+        await _assert_complete_billing_address(conn, user_uuid, plan_id)
+
     # pending_order anlegen — Mollie-Lane, KEINE Mahn-Email (Auto-Release im Webhook).
     order = await pending_orders_service.create_pending_order(
         user_id, plan_id, quantity, send_email=False, payment_method="mollie",
