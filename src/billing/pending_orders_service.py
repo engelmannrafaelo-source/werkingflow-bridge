@@ -154,7 +154,12 @@ async def _create_order_invoice(
     total = (subtotal + tax).quantize(Decimal("0.01"))
 
     line_items = [{
-        "description": f"{plan_name} ({plan_id})" + (f" × {quantity}" if quantity > 1 else ""),
+        # Kundentext, kein Systemtext: der interne plan_id-Schluessel stand bis
+        # 2026-08-05 mit auf der Rechnung ("Check-Credit Einzelkauf
+        # (report-check-credit-1)"). Der Plan-NAME (plans-Tabelle, Migration 052
+        # brandet ihn kundenfaehig) ist die einzige Zeile, die ein Kunde sieht;
+        # plan_id bleibt in der Order-Zeile selbst nachvollziehbar.
+        "description": plan_name + (f" × {quantity}" if quantity > 1 else ""),
         "quantity": quantity,
         "unitPriceEur": unit_price_eur,
         "totalEur": float(subtotal),

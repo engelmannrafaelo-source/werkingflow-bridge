@@ -595,7 +595,7 @@ _HTML_TEMPLATE = """<!doctype html>
 </body></html>"""
 
 
-def _render_html(inv: Dict[str, Any]) -> str:
+def _render_html(inv: Dict[str, Any], fallback_recipient: Optional[Dict[str, Any]] = None) -> str:
     issuer = _issuer()
     addr = inv.get("billingAddress") or {}
     addr_lines = []
@@ -606,6 +606,16 @@ def _render_html(inv: Dict[str, Any]) -> str:
         if city_line:           addr_lines.append(city_line)
         if addr.get("country"): addr_lines.append(addr["country"])
         if addr.get("vatId"):   addr_lines.append(f"USt-ID: {addr['vatId']}")
+    # Ohne hinterlegte Rechnungsadresse (Kleinbetragsrechnung § 11 Abs 6 UStG:
+    # zulaessig, first-purchase-pack verlangt sie bewusst nicht) stand hier ein
+    # nacktes "—" — eine Kundenrechnung ohne jeden Empfaenger sieht kaputt aus
+    # (live 2026-08-05, INV-2026-00028). Fallback: Kontoname + E-Mail des
+    # Rechnungs-Users. "—" bleibt nur, wenn selbst das fehlt.
+    if not addr_lines and fallback_recipient:
+        if fallback_recipient.get("name"):
+            addr_lines.append(str(fallback_recipient["name"]))
+        if fallback_recipient.get("email"):
+            addr_lines.append(str(fallback_recipient["email"]))
     addr_block = "\n".join(addr_lines) if addr_lines else "—"
 
     rows_html = "".join(
@@ -691,11 +701,12 @@ async def render_invoice_html(
     pool = get_pool()
     async with pool.acquire() as conn:
         r = await conn.fetchrow("SELECT * FROM invoices WHERE id = $1", uuid.UUID(invoice_id))
+        u = r and await conn.fetchrow("SELECT name, email FROM users WHERE id = $1", r["user_id"])
     if not r:
         raise HTTPException(status_code=404, detail=f"Invoice {invoice_id} not found")
     if not claims.is_operator and str(r["user_id"]) != claims.effective_user_id:
         raise HTTPException(status_code=403, detail="Forbidden: not your invoice")
-    html = _render_html(_row(r))
+    html = _render_html(_row(r), fallback_recipient=dict(u) if u else None)
     return Response(content=html, media_type="text/html")
 
 
@@ -715,13 +726,14 @@ async def render_invoice_pdf(
     pool = get_pool()
     async with pool.acquire() as conn:
         r = await conn.fetchrow("SELECT * FROM invoices WHERE id = $1", uuid.UUID(invoice_id))
+        u = r and await conn.fetchrow("SELECT name, email FROM users WHERE id = $1", r["user_id"])
     if not r:
         raise HTTPException(status_code=404, detail=f"Invoice {invoice_id} not found")
     if not claims.is_operator and str(r["user_id"]) != claims.effective_user_id:
         raise HTTPException(status_code=403, detail="Forbidden: not your invoice")
 
     inv = _row(r)
-    html = _render_html(inv)
+    html = _render_html(inv, fallback_recipient=dict(u) if u else None)
     pdf_bytes = WeasyprintHTML(string=html).write_pdf()
 
     filename = f"invoice-{inv['invoiceNumber']}.pdf"
@@ -762,7 +774,10 @@ async def _dispatch_invoice_email(pool: Any, r: Any) -> Dict[str, Any]:
 
     invoice_id = str(r["id"])
     invoice_dict = _row(r)
-    html_body = _render_html(invoice_dict)
+    html_body = _render_html(
+        invoice_dict,
+        fallback_recipient={"name": r["user_name"] if "user_name" in r.keys() else None, "email": recipient},
+    )
     subject = f"Rechnung {invoice_dict['invoiceNumber']} — Werkingflow"
 
     async with _httpx.AsyncClient(timeout=10.0) as client:
