@@ -27,6 +27,10 @@ RUN pip install --no-cache-dir \
     "bcrypt>=4.2,<5" \
     "pyjwt>=2.9,<3" \
     "weasyprint>=62,<63" \
+    # pydyf MUSS zu weasyprint 62.x passen: pydyf 0.11 aenderte die
+    # Stream.transform-Signatur -> AttributeError beim Rechnungs-PDF
+    # (live 2026-08-05, INV-2026-00028). Erst mit weasyprint>=63 loesen.
+    "pydyf>=0.10,<0.11" \
     "mollie-api-python>=3.0,<4" \
     "psutil>=6.1,<7" \
     "python-multipart>=0.0.18,<1" \
