@@ -24,6 +24,13 @@ from src.api_auth import require_admin, require_jwt_or_service, require_self_or_
 from src.budget.plans import PLANS
 from src.db.client import get_pool
 
+# Kaufzustimmung ist an JEDER Selbstbedienungs-Bahn Pflicht (Migration 054):
+# ein Kauf ohne gespeicherte Zustimmung ist im Streitfall nicht belegbar.
+from src.billing.purchase_consent import (
+    PurchaseConsentIn,
+    LANE_SUBSCRIPTION, LANE_PROJECT_PACK, LANE_FIRST_PURCHASE_PACK, LANE_TOPUP,
+)
+
 router = APIRouter(prefix="/v1/billing", tags=["billing"])
 
 _ALLOWED_APP_IDS = {
@@ -388,6 +395,10 @@ async def _resolve_billing_identity(
 
 
 class SubscriptionCheckoutRequest(BaseModel):
+    # PFLICHT — kein Kauf ohne erteilte Zustimmung (AGB + Unternehmer-
+    # Erklaerung). Fehlt sie, weist Pydantic den Request ab; das ist die
+    # gewollte Wirkung, kein Bug.
+    consent: PurchaseConsentIn
     # planId + successRedirect are always required: only the client knows where
     # Mollie should redirect after payment, and which plan to purchase.
     planId: str
@@ -515,13 +526,17 @@ async def billing_sub_checkout(
     try:
         return await billing_service.start_subscription_checkout(
             user_id, body.planId, body.seats, body.successRedirect,
-            email, name,
+            email, name, consent=body.consent,
         )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
 
 class ProjectPackCheckoutRequest(BaseModel):
+    # PFLICHT — kein Kauf ohne erteilte Zustimmung (AGB + Unternehmer-
+    # Erklaerung). Fehlt sie, weist Pydantic den Request ab; das ist die
+    # gewollte Wirkung, kein Bug.
+    consent: PurchaseConsentIn
     planId: str
     quantity: int = 1
     successRedirect: str
@@ -548,13 +563,17 @@ async def billing_project_pack_checkout(
     try:
         return await billing_service.start_project_pack_checkout(
             user_id, body.planId, body.quantity, body.successRedirect,
-            email, name,
+            email, name, consent=body.consent,
         )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
 
 class FirstPurchasePackCheckoutRequest(BaseModel):
+    # PFLICHT — kein Kauf ohne erteilte Zustimmung (AGB + Unternehmer-
+    # Erklaerung). Fehlt sie, weist Pydantic den Request ab; das ist die
+    # gewollte Wirkung, kein Bug.
+    consent: PurchaseConsentIn
     planId: str
     quantity: int = Field(default=1, ge=1, le=100)
     successRedirect: str
@@ -589,13 +608,17 @@ async def billing_first_purchase_pack_checkout(
     try:
         return await billing_service.start_first_purchase_pack_checkout(
             user_id, body.planId, body.quantity, body.successRedirect,
-            email, name,
+            email, name, consent=body.consent,
         )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
 
 class TopUpCheckoutRequest(BaseModel):
+    # PFLICHT — kein Kauf ohne erteilte Zustimmung (AGB + Unternehmer-
+    # Erklaerung). Fehlt sie, weist Pydantic den Request ab; das ist die
+    # gewollte Wirkung, kein Bug.
+    consent: PurchaseConsentIn
     # Top-Up bounds are enforced again in billing_service.start_topup_checkout
     # (defence in depth) — these Pydantic bounds reject obviously bad requests
     # before they hit business logic.
@@ -620,7 +643,7 @@ async def billing_topup_checkout(
     try:
         return await billing_service.start_topup_checkout(
             user_id, body.amountEur, body.successRedirect,
-            email, name,
+            email, name, consent=body.consent,
         )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))

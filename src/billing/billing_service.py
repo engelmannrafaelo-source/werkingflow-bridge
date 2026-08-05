@@ -202,9 +202,12 @@ def _plan_price(plan_id: str) -> float:
     return float(get_plan(plan_id).price)
 
 
+from src.billing import purchase_consent
+
+
 async def start_subscription_checkout(
     user_id: str, plan_id: str, seats: int, success_redirect: str,
-    email: str, name: str,
+    email: str, name: str, *, consent: "purchase_consent.PurchaseConsentIn",
 ) -> Dict[str, str]:
     # Fail-fast: refuse the Mollie round-trip if the tenant's billing address
     # is incomplete. Without this gate, a user could complete payment on
@@ -217,6 +220,15 @@ async def start_subscription_checkout(
     pool = get_pool()
     async with pool.acquire() as conn:
         await _assert_complete_billing_address(conn, uuid.UUID(user_id), plan_id)
+
+    # Zustimmung festhalten, BEVOR die Zahlung entsteht (Migration 054).
+    # Diese Bahn erzeugt keine pending_order — order_id bleibt None, die Bahn
+    # steht am Beleg.
+    async with pool.acquire() as conn:
+        await purchase_consent.record_consent(
+            conn, consent=consent, user_id=user_id,
+            lane=purchase_consent.LANE_SUBSCRIPTION, plan_id=plan_id,
+        )
 
     customer = await get_or_create_customer(user_id, email, name)
     amount = _plan_price(plan_id) * seats
@@ -256,6 +268,8 @@ async def start_project_pack_checkout(
     success_redirect: str,
     email: str,
     name: str,
+    *,
+    consent: "purchase_consent.PurchaseConsentIn",
 ) -> Dict[str, str]:
     """
     Self-Service-Nachbestellung eines Projekt-Pakets via Mollie-Einmalzahlung.
@@ -306,6 +320,17 @@ async def start_project_pack_checkout(
     )
     order_id = str(order["id"])
     amount = round(float(plan.price) * quantity, 2)
+
+    # Zustimmung festhalten, BEVOR die Zahlung entsteht (Migration 054).
+    # Reihenfolge ist Absicht: schlaegt das Schreiben fehl, gibt es keine
+    # Zahlung. Andersherum haetten wir Geld eingenommen und den Beweis verloren.
+    async with get_pool().acquire() as _conn:
+        await purchase_consent.record_consent(
+            _conn, consent=consent, user_id=user_id,
+            lane=purchase_consent.LANE_PROJECT_PACK,
+            order_id=order_id, plan_id=plan_id, quantity=quantity,
+            amount_eur=amount,
+        )
 
     customer = await get_or_create_customer(user_id, email, name)
     mollie = get_mollie_adapter()
@@ -387,6 +412,8 @@ async def start_first_purchase_pack_checkout(
     success_redirect: str,
     email: str,
     name: str,
+    *,
+    consent: "purchase_consent.PurchaseConsentIn",
 ) -> Dict[str, str]:
     """
     Self-Service-ERSTKAUF eines Projekt-Pakets via Mollie-Einmalzahlung.
@@ -470,6 +497,17 @@ async def start_first_purchase_pack_checkout(
         user_id, plan_id, quantity, send_email=False, payment_method="mollie",
     )
     order_id = str(order["id"])
+
+    # Zustimmung festhalten, BEVOR die Zahlung entsteht (Migration 054).
+    # Reihenfolge ist Absicht: schlaegt das Schreiben fehl, gibt es keine
+    # Zahlung. Andersherum haetten wir Geld eingenommen und den Beweis verloren.
+    async with get_pool().acquire() as _conn:
+        await purchase_consent.record_consent(
+            _conn, consent=consent, user_id=user_id,
+            lane=purchase_consent.LANE_FIRST_PURCHASE_PACK,
+            order_id=order_id, plan_id=plan_id, quantity=quantity,
+            amount_eur=amount,
+        )
 
     customer = await get_or_create_customer(user_id, email, name)
     mollie = get_mollie_adapter()
@@ -823,10 +861,19 @@ async def cancel_subscription(user_id: str, subscription_id: str) -> None:
 
 async def start_topup_checkout(
     user_id: str, amount_eur: float, success_redirect: str,
-    email: str, name: str,
+    email: str, name: str, *, consent: "purchase_consent.PurchaseConsentIn",
 ) -> Dict[str, str]:
     if amount_eur < 50 or amount_eur > 1000:
         raise ValueError(f"Top-Up amount EUR {amount_eur} out of range [50, 1000]")
+
+    # Zustimmung festhalten, BEVOR die Zahlung entsteht (Migration 054).
+    # Diese Bahn erzeugt keine pending_order — order_id bleibt None, die Bahn
+    # steht am Beleg.
+    async with get_pool().acquire() as _conn:
+        await purchase_consent.record_consent(
+            _conn, consent=consent, user_id=user_id,
+            lane=purchase_consent.LANE_TOPUP, amount_eur=amount_eur,
+        )
 
     customer = await get_or_create_customer(user_id, email, name)
     mollie = get_mollie_adapter()
