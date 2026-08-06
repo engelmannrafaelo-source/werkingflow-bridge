@@ -54,9 +54,14 @@ class PurchaseConsentIn(BaseModel):
     termsVersion: str = Field(min_length=1, max_length=32)
     actingAsBusiness: bool
     professionallyQualified: bool
+    # § 18 Abs 1 Z 11 FAGG — Rueckfallebene, falls doch ein Verbraucher kauft:
+    # ausdrueckliches Verlangen nach sofortigem Beginn samt Kenntnisnahme des
+    # Verlusts eines allfaelligen Ruecktrittsrechts. Ohne diese Erklaerung
+    # bliebe das 14-taegige Recht trotz vollstaendiger Nutzung bestehen.
+    immediateStartRequested: bool
     acceptedAt: datetime
 
-    @field_validator("actingAsBusiness", "professionallyQualified")
+    @field_validator("actingAsBusiness", "professionallyQualified", "immediateStartRequested")
     @classmethod
     def _must_be_declared(cls, v: bool) -> bool:
         # Eine nicht erteilte Erklärung ist keine Zustimmung. Sie hier
@@ -64,9 +69,9 @@ class PurchaseConsentIn(BaseModel):
         # Grauzone, die dieses Modul beseitigen soll.
         if v is not True:
             raise ValueError(
-                "purchase consent incomplete: both declarations (actingAsBusiness, "
-                "professionallyQualified) must be explicitly true — an unchecked "
-                "declaration is not a consent"
+                "purchase consent incomplete: all declarations (actingAsBusiness, "
+                "professionallyQualified, immediateStartRequested) must be explicitly "
+                "true — an unchecked declaration is not a consent"
             )
         return v
 
@@ -113,9 +118,9 @@ async def record_consent(
             user_id, tenant_id, lane, order_id,
             plan_id, quantity, amount_eur,
             terms_version, acting_as_business, professionally_qualified,
-            accepted_at
+            immediate_start_requested, accepted_at
         )
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
         RETURNING id
         """,
         user_uuid,
@@ -128,6 +133,7 @@ async def record_consent(
         consent.termsVersion,
         consent.actingAsBusiness,
         consent.professionallyQualified,
+        consent.immediateStartRequested,
         consent.acceptedAt,
     )
     return str(row["id"])
