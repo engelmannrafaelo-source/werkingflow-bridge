@@ -10,6 +10,9 @@ PATCH  /v1/invoices/{id}               status / metadata updates (admin)
 POST   /v1/invoices/{id}/send          email invoice to customer (self-or-admin)
 """
 from __future__ import annotations
+import logging
+
+logger = logging.getLogger(__name__)
 
 import json
 import uuid
@@ -591,6 +594,8 @@ _HTML_TEMPLATE = """<!doctype html>
 
 {notes_block}
 
+{consent_block}
+
 <div class="footer">
   <div class="grid">
     <div>
@@ -618,7 +623,37 @@ _HTML_TEMPLATE = """<!doctype html>
 </body></html>"""
 
 
-def _render_html(inv: Dict[str, Any], fallback_recipient: Optional[Dict[str, Any]] = None) -> str:
+
+async def _consent_for_invoice(conn: Any, invoice_id: Any) -> Optional[Dict[str, Any]]:
+    """Die Kaufzustimmung zu einer Rechnung, falls es eine gibt.
+
+    Weg: invoices.id <- pending_orders.invoice_id <- purchase_consents.order_id.
+    Nur Paket-Kaeufe erzeugen eine Bestellung; Abo und Budget-Aufladung nicht —
+    dort gibt es (noch) keine Verknuepfung, und die Funktion liefert None.
+
+    Ein Fehler hier darf die Rechnung NICHT verhindern: sie ist das Dokument
+    ueber die Zahlung, die Erklaerungen sind eine Beilage. Deshalb faengt der
+    Aufrufer ab und rendert im Zweifel ohne Block.
+    """
+    return await conn.fetchrow(
+        """
+        SELECT pc.terms_version, pc.acting_as_business, pc.professionally_qualified,
+               pc.immediate_start_requested, pc.accepted_at
+          FROM purchase_consents pc
+          JOIN pending_orders po ON po.id = pc.order_id
+         WHERE po.invoice_id = $1
+         ORDER BY pc.accepted_at DESC
+         LIMIT 1
+        """,
+        invoice_id,
+    )
+
+
+def _render_html(
+    inv: Dict[str, Any],
+    fallback_recipient: Optional[Dict[str, Any]] = None,
+    consent: Optional[Dict[str, Any]] = None,
+) -> str:
     issuer = _issuer()
     addr = inv.get("billingAddress") or {}
     addr_lines = []
@@ -650,6 +685,41 @@ def _render_html(inv: Dict[str, Any], fallback_recipient: Optional[Dict[str, Any
     ) or "<tr><td colspan='4' style='color:#9ca3af;text-align:center;padding:18px;'>Keine Positionen</td></tr>"
 
     notes_block = f"<div class='notes'>{inv['notes']}</div>" if inv.get("notes") else ""
+
+    # Erklaerungen des Kaeufers auf der Rechnung wiedergeben.
+    #
+    # § 18 Abs 1 Z 11 FAGG verlangt DREI Dinge, damit das Ruecktrittsrecht bei
+    # digitalen Leistungen erlischt: das ausdrueckliche Verlangen nach
+    # sofortigem Beginn, die Kenntnisnahme des Rechtsverlusts — und eine
+    # BESTAETIGUNG AUF DAUERHAFTEM DATENTRAEGER. Die ersten beiden werden im
+    # Kaufweg eingeholt und gespeichert; ohne diesen Block fehlte das dritte,
+    # und die Erklaerungen waeren im Streitfall nur eine Datenbankzeile, die
+    # der Kunde nie zu Gesicht bekommen hat. Die Rechnung ist der Beleg, den
+    # er ohnehin bekommt und aufbewahrt.
+    #
+    # Fehlt die Zustimmung (Kaeufe von vor Migration 054), bleibt der Block
+    # LEER statt eine Erklaerung zu behaupten, die niemand abgegeben hat.
+    consent_block = ""
+    if consent:
+        stand = consent.get("terms_version") or "—"
+        zeit = consent.get("accepted_at")
+        zeit_txt = zeit.strftime("%d.%m.%Y %H:%M UTC") if hasattr(zeit, "strftime") else str(zeit or "")
+        zeilen = [
+            "Bestellung als Unternehmer im Sinne des § 1 Abs 1 Z 1 KSchG",
+            f"Annahme der AGB in der Fassung {stand}",
+        ]
+        if consent.get("immediate_start_requested"):
+            zeilen.append(
+                "Ausdrückliches Verlangen nach sofortigem Beginn der Leistung; "
+                "Kenntnisnahme, dass ein allfälliges Rücktrittsrecht mit "
+                "vollständiger Erbringung erlischt"
+            )
+        punkte = "".join(f"<li>{z}</li>" for z in zeilen)
+        consent_block = (
+            "<div class='notes'><strong>Ihre Erklärungen beim Kauf</strong>"
+            f"<ul style='margin:6px 0 0 18px;padding:0'>{punkte}</ul>"
+            f"<div style='margin-top:6px;color:#6b7280'>Erteilt am {zeit_txt}.</div></div>"
+        )
 
     rc_note = (inv.get("metadata") or {}).get("reverseChargeNote")
     reverse_charge_block = (
@@ -703,6 +773,7 @@ def _render_html(inv: Dict[str, Any], fallback_recipient: Optional[Dict[str, Any
         payment_block=payment_block,
         reverse_charge_block=reverse_charge_block,
         notes_block=notes_block,
+        consent_block=consent_block,
         issuer_name=issuer["name"],
         issuer_street=issuer["street"],
         issuer_city=issuer["city"],
@@ -726,11 +797,17 @@ async def render_invoice_html(
     async with pool.acquire() as conn:
         r = await conn.fetchrow("SELECT * FROM invoices WHERE id = $1", uuid.UUID(invoice_id))
         u = r and await conn.fetchrow("SELECT name, email FROM users WHERE id = $1", r["user_id"])
+        try:
+            consent = r and await _consent_for_invoice(conn, r["id"])
+        except Exception as exc:  # noqa: BLE001 — Beilage darf die Rechnung nicht verhindern
+            logger.warning("[invoice] consent lookup failed for %s: %s", invoice_id, exc)
+            consent = None
     if not r:
         raise HTTPException(status_code=404, detail=f"Invoice {invoice_id} not found")
     if not claims.is_operator and str(r["user_id"]) != claims.effective_user_id:
         raise HTTPException(status_code=403, detail="Forbidden: not your invoice")
-    html = _render_html(_row(r), fallback_recipient=dict(u) if u else None)
+    html = _render_html(_row(r), fallback_recipient=dict(u) if u else None,
+                        consent=dict(consent) if consent else None)
     return Response(content=html, media_type="text/html")
 
 
@@ -751,13 +828,19 @@ async def render_invoice_pdf(
     async with pool.acquire() as conn:
         r = await conn.fetchrow("SELECT * FROM invoices WHERE id = $1", uuid.UUID(invoice_id))
         u = r and await conn.fetchrow("SELECT name, email FROM users WHERE id = $1", r["user_id"])
+        try:
+            consent = r and await _consent_for_invoice(conn, r["id"])
+        except Exception as exc:  # noqa: BLE001 — Beilage darf die Rechnung nicht verhindern
+            logger.warning("[invoice] consent lookup failed for %s: %s", invoice_id, exc)
+            consent = None
     if not r:
         raise HTTPException(status_code=404, detail=f"Invoice {invoice_id} not found")
     if not claims.is_operator and str(r["user_id"]) != claims.effective_user_id:
         raise HTTPException(status_code=403, detail="Forbidden: not your invoice")
 
     inv = _row(r)
-    html = _render_html(inv, fallback_recipient=dict(u) if u else None)
+    html = _render_html(inv, fallback_recipient=dict(u) if u else None,
+                        consent=dict(consent) if consent else None)
     pdf_bytes = WeasyprintHTML(string=html).write_pdf()
 
     filename = f"invoice-{inv['invoiceNumber']}.pdf"
