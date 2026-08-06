@@ -1205,6 +1205,32 @@ async def handle_webhook(payment_id: str) -> Dict[str, Any]:
             released = await release_order(
                 order_id, operator_user_id=None, note="self-service Mollie payment",
             )
+            # Rechnung mit der Mollie-Zahlung verknuepfen. release_order legt sie
+            # an, wenn die Bestellung freigegeben wird — zu diesem Zeitpunkt gibt
+            # es noch keine Zahlungs-ID. Bekannt ist sie erst hier, und ohne
+            # diesen Nachtrag bleibt mollie_payment_id NULL: der Abgleich
+            # Zahlung<->Rechnung ist dann Handarbeit (beobachtet 06.08.: KEINE
+            # Rechnung der letzten Wochen trug eine Zahlungs-ID).
+            #
+            # COALESCE statt blindem Setzen: die Spalte ist UNIQUE, und ein
+            # Webhook-Retry darf eine bereits verknuepfte Rechnung nicht mit
+            # einer zweiten ID ueberschreiben. Fehler hier duerfen die schon
+            # freigegebene, bezahlte Bestellung nicht zurueckdrehen — Mollie
+            # wuerde sonst release_order erneut anstossen.
+            try:
+                pool = get_pool()
+                async with pool.acquire() as conn:
+                    await conn.execute(
+                        "UPDATE invoices SET mollie_payment_id = COALESCE(mollie_payment_id, $1), "
+                        "updated_at = NOW() WHERE id = $2",
+                        payment_id,
+                        uuid.UUID(released["invoiceId"]),
+                    )
+            except Exception as exc:  # noqa: BLE001 — Verknuepfung ist Buchhaltungs-Komfort, keine Kaufbedingung
+                logger.warning(
+                    "[webhook] could not link invoice %s to payment %s: %s",
+                    released.get("invoiceId"), payment_id, exc,
+                )
             if released["planId"] in AUTO_SEND_INVOICE_PLAN_IDS:
                 # Best-effort, mirrors create_pending_order's email-send guard:
                 # the order is already released and paid — a Resend hiccup must
