@@ -26,6 +26,7 @@ _APP_PREFIX: dict[str, str] = {
     "werking-report": "WR",
     "werking-energy": "WE",
     "werking-noise": "WN",
+    "werking-check": "WC",
     "engelmann": "EG",
 }
 

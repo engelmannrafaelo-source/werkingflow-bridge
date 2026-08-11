@@ -36,6 +36,7 @@ class _FakeConn:
 class TestPrefixForApp:
     def test_known_apps_map_to_own_prefix(self):
         assert prefix_for_app("werking-report") == "WR"
+        assert prefix_for_app("werking-check") == "WC"
         assert prefix_for_app("werking-energy") == "WE"
         assert prefix_for_app("werking-noise") == "WN"
         assert prefix_for_app("engelmann") == "EG"
@@ -56,6 +57,7 @@ class TestSeqName:
 
     def test_product_prefixes_get_own_sequence(self):
         assert _seq_name("WR", 2026) == "invoice_seq_wr_2026"
+        assert _seq_name("WC", 2026) == "invoice_seq_wc_2026"
         assert _seq_name("WE", 2026) == "invoice_seq_we_2026"
         assert _seq_name(TOPUP_PREFIX, 2026) == "invoice_seq_tu_2026"
 
