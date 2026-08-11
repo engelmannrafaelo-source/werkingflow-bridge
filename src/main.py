@@ -2327,8 +2327,17 @@ async def chat_completions(
             enforce_user_provider_override, UserProviderOverrideError,
         )
         user_pinned_provider = None
+        # The REAL operator pin from users.provider_config, kept separate from
+        # user_pinned_provider on purpose: the app-level policy below also
+        # writes user_pinned_provider (so downstream fallback refusal treats an
+        # app pin like a user pin), but ONLY this variable may satisfy the
+        # Bedrock gate. An app rule is a property of the caller — letting it
+        # mint the credential the gate checks is what funded the 2026-08-04
+        # runaway loop. See routing/app_provider_policy.py "Bedrock is pin-only".
+        operator_pinned_provider = None
         try:
             user_pinned_provider = await enforce_user_provider_override(request, request_body)
+            operator_pinned_provider = user_pinned_provider
         except UserProviderOverrideError as e:
             raise HTTPException(
                 status_code=503,
@@ -2454,10 +2463,17 @@ async def chat_completions(
         if backend_config:
             from src.routing.user_provider_override import (
                 assert_bedrock_is_pinned, BedrockPinRequiredError,
+                BedrockNonProdRefusedError,
                 assert_bedrock_attribution_complete, BedrockAttributionIncompleteError,
             )
+            # Resolved once, used by both Bedrock gates below.
+            _bedrock_attr = extract_attribution_context(request)
             try:
-                assert_bedrock_is_pinned(backend_config.backend, user_pinned_provider)
+                assert_bedrock_is_pinned(
+                    backend_config.backend,
+                    operator_pinned_provider,
+                    app_env=_bedrock_attr["app_env"],
+                )
             except BedrockPinRequiredError as e:
                 raise HTTPException(
                     status_code=403,
@@ -2470,11 +2486,22 @@ async def chat_completions(
                         }
                     }
                 )
+            except BedrockNonProdRefusedError as e:
+                raise HTTPException(
+                    status_code=403,
+                    detail={
+                        "error": {
+                            "message": str(e),
+                            "type": "permission_error",
+                            "code": "bedrock_requires_production_env",
+                            "hint": "Bedrock is production-only. Non-prod traffic runs on the internal Anthropic accounts.",
+                        }
+                    }
+                )
             # Real-money (Bedrock) calls must be FULLY attributed (app + env),
             # else real AWS spend records where no cost view can see it (the
             # €1.30 blind spot, 2026-07-09). Check the SAME resolved values the
             # ledger persists so the gate rejects exactly the un-attributable ones.
-            _bedrock_attr = extract_attribution_context(request)
             try:
                 assert_bedrock_attribution_complete(
                     backend_config.backend,
@@ -4793,11 +4820,19 @@ async def research(
     from src.routing.user_provider_override import (
         enforce_user_provider_override, UserProviderOverrideError,
         assert_bedrock_is_pinned, BedrockPinRequiredError,
+        BedrockNonProdRefusedError,
         assert_bedrock_attribution_complete, BedrockAttributionIncompleteError,
     )
     _research_pinned = None
+    # REAL operator pin (users.provider_config) — the only thing allowed to
+    # satisfy the Bedrock gate. Never overwritten by the app-level policy.
+    # NB: research drops a Bedrock pin further down by design (Bedrock has no
+    # WebSearch), so in practice this stays unused here — it exists so the gate
+    # cannot be weakened by a later refactor of that exception.
+    _research_operator_pinned = None
     try:
         _research_pinned = await enforce_user_provider_override(request, request_body)
+        _research_operator_pinned = _research_pinned
     except UserProviderOverrideError as e:
         return ResearchResponse(
             status="error",
@@ -4979,8 +5014,13 @@ async def research(
             )
 
         # BEDROCK-GATE: wie bei chat completions — Bedrock nur per Operator-Pin.
+        _research_bedrock_attr = extract_attribution_context(request)
         try:
-            assert_bedrock_is_pinned(backend_config.backend, _research_pinned)
+            assert_bedrock_is_pinned(
+                backend_config.backend,
+                _research_operator_pinned,
+                app_env=_research_bedrock_attr["app_env"],
+            )
         except BedrockPinRequiredError as e:
             return ResearchResponse(
                 status="error",
@@ -4988,10 +5028,16 @@ async def research(
                 model=request_body.model,
                 error=f"bedrock_requires_operator_pin: {e}"
             )
+        except BedrockNonProdRefusedError as e:
+            return ResearchResponse(
+                status="error",
+                query=request_body.query,
+                model=request_body.model,
+                error=f"bedrock_requires_production_env: {e}"
+            )
 
         # Real-money (Bedrock) research must be fully attributed (app + env), else
         # the spend is booked un-attributable in the cost dashboard (2026-07-09).
-        _research_bedrock_attr = extract_attribution_context(request)
         try:
             assert_bedrock_attribution_complete(
                 backend_config.backend,

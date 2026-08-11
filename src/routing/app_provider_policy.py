@@ -38,9 +38,34 @@ Precedence (highest first)
    principal or a principals-disabled deployment — because a wildcard
    principal or an absent principal cannot itself prove which app is
    calling; the header is attribution, not authentication, in that case.
-3. Global default — fail-safe Bedrock EU. An app that is neither ruled to
-   Anthropic nor recognised as Bridge-internal falls to the data-residency-
-   safe side, never silently to Anthropic US.
+3. Global default — internal Anthropic accounts. See "Bedrock is pin-only"
+   below: an app rule can no longer grant Bedrock at all.
+
+Bedrock is pin-only (Rafael, 2026-08-11)
+-----------------------------------------
+The 2026-08-04 version of this module pinned the Kunden-Apps to Bedrock by
+APP rule. Because callers apply the app rule into the SAME variable a user pin
+uses, the Bedrock gate (``assert_bedrock_is_pinned``) then verified a pin this
+module had just minted — a caller issuing its own permission. Consequence: any
+instance sending ``X-App-ID: werking-report`` booked real AWS money, including
+local, staging, partner and CI deployments. A stuck conversion loop on the
+Partner-CUI server did exactly that for six days (see the devops memo
+``project_bedrock_dokument_summary_minute_loop_20260811``).
+
+Rafael's rule now: **Bedrock is reachable only through an explicit per-user
+operator pin (``users.provider_config``), and only from production.**
+Everything else runs on the internal Anthropic accounts. This module can
+therefore pin ``anthropic`` only; ``apply_app_provider_policy`` raises on any
+other provider so the hole cannot be reopened by editing the table.
+
+KNOWN CONSEQUENCE, flagged for Rafael: this reverses gap (1) above. A customer
+who is not (yet) pinned no longer lands on Bedrock EU by default but on the
+internal Anthropic accounts — i.e. the provisioning gap between signup and
+pinning is a data-residency gap again. The pin is now the ONLY thing carrying
+the EU-residency promise, so per-user pinning has to be part of provisioning,
+not a follow-up step. If that trade is not wanted, the alternative is to refuse
+(fail loud) instead of routing unpinned customer-app traffic to Anthropic —
+one branch in ``apply_app_provider_policy``.
 
 Scope: Bridge-internal / ops channels (see ``NON_CUSTOMER_APP_IDS``) are
 deliberately excluded from the global fail-safe. They are not subject to the
@@ -94,15 +119,17 @@ APP_PROVIDER_RULES: dict[str, ProviderRule] = {
     # itself a DSGVO-pinned customer app — runs on the flat-rate Anthropic
     # account pool, never billed per-token against AWS.
     "engelmann": ProviderRule(provider="anthropic"),
-    # Kunden-Apps: werking.tools' EU-data-residency promise.
-    "werking-report": ProviderRule(provider="bedrock", region="eu-central-1"),
-    "werking-energy": ProviderRule(provider="bedrock", region="eu-central-1"),
-    "werking-noise": ProviderRule(provider="bedrock", region="eu-central-1"),
+    # Kunden-Apps: internal Anthropic accounts unless the individual USER
+    # carries an operator Bedrock pin (see module docstring, Rafael 2026-08-11).
+    "werking-report": ProviderRule(provider="anthropic"),
+    "werking-energy": ProviderRule(provider="anthropic"),
+    "werking-noise": ProviderRule(provider="anthropic"),
 }
 
-# Fail-safe: any app not explicitly ruled to Anthropic falls here, never
-# silently to Anthropic US.
-GLOBAL_DEFAULT_RULE = ProviderRule(provider="bedrock", region="eu-central-1")
+# Global default: internal Anthropic accounts. An app rule can no longer put
+# traffic on Bedrock at all — only a per-user operator pin can (Rafael,
+# 2026-08-11). See the "Bedrock is pin-only" section of the module docstring.
+GLOBAL_DEFAULT_RULE = ProviderRule(provider="anthropic")
 
 # Bridge-internal / ops callers — not a "Kunden-App" under the data-residency
 # promise. Excluded from the global fail-safe (see module docstring). Keep in
@@ -174,19 +201,43 @@ def apply_app_provider_policy(request_body: Any, rule: ProviderRule) -> Optional
     unsupported rule (a typo in APP_PROVIDER_RULES must fail loud, not
     silently leave a DSGVO app unrouted).
     """
-    if rule.provider not in ("anthropic", "bedrock"):
+    if rule.provider != "anthropic":
+        # Structural, not cosmetic: an app rule must never be able to hand out
+        # Bedrock. Bedrock is real AWS money and is reachable ONLY through an
+        # operator pin on a real user row (users.provider_config) — an app rule
+        # is a property of the CALLER, and a caller cannot issue its own
+        # permission. Re-adding provider="bedrock" to APP_PROVIDER_RULES must
+        # therefore fail loud here instead of quietly reopening the hole that
+        # funded the 2026-08-04..11 loop.
         raise AppProviderPolicyError(
-            f"APP_PROVIDER_RULES entry has unsupported provider={rule.provider!r} "
-            f"(supported: anthropic, bedrock)"
+            f"APP_PROVIDER_RULES entry has provider={rule.provider!r}; app-level "
+            f"rules may only pin 'anthropic'. Bedrock is granted exclusively by "
+            f"the per-user operator pin (users.provider_config) — see "
+            f"src/routing/user_provider_override.assert_bedrock_is_pinned."
         )
 
-    if rule.provider == "bedrock":
-        request_body.backend = BackendType.BEDROCK
-        if rule.region:
-            request_body.bedrock_region = rule.region
-        request_body.provider_tier = None
-        return "bedrock"
+    # Never silently re-route a call that explicitly asked for Bedrock: it
+    # requested a specific data residency and would otherwise get a different
+    # one behind its back. Leave the request untouched and let the Bedrock gate
+    # decide — it refuses without an operator pin, loudly (403).
+    if _requests_bedrock_explicitly(request_body):
+        return None
 
     request_body.backend = BackendType.ANTHROPIC
     request_body.provider_tier = None
     return "anthropic"
+
+
+def _requests_bedrock_explicitly(request_body: Any) -> bool:
+    """True if the client itself asked for Bedrock — directly via ``backend``
+    or indirectly via a ``provider_tier`` that the registry maps to Bedrock
+    (e.g. 'claude-dsgvo')."""
+    if getattr(request_body, "backend", None) == BackendType.BEDROCK:
+        return True
+    tier_id = getattr(request_body, "provider_tier", None)
+    if not tier_id:
+        return False
+    from src.providers.registry import PROVIDERS
+
+    tier = PROVIDERS.get(tier_id)
+    return tier is not None and tier.backend == BackendType.BEDROCK

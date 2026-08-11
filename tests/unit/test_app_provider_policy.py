@@ -101,8 +101,7 @@ class TestResolveWithoutPrincipal:
         req = _request(headers={"X-App-ID": "werking-report"})
         rule, app_id = resolve_app_provider_policy(req)
         assert app_id == "werking-report"
-        assert rule.provider == "bedrock"
-        assert rule.region == "eu-central-1"
+        assert rule.provider == "anthropic"
 
     def test_no_app_id_at_all_returns_none(self):
         req = _request()
@@ -111,16 +110,16 @@ class TestResolveWithoutPrincipal:
         assert app_id is None
 
 
-class TestGlobalFailSafeDefault:
-    """An app that is neither ruled to Anthropic nor Bridge-internal falls to
-    Bedrock EU — never silently to Anthropic US (Rafael's explicit gap #1)."""
+class TestGlobalDefault:
+    """Seit 2026-08-11: der Default sind die internen Anthropic-Accounts.
+    Bedrock vergibt ausschliesslich der User-Pin, nie eine App-Regel."""
 
-    def test_unknown_app_id_defaults_to_bedrock(self):
+    def test_unknown_app_id_defaults_to_internal_anthropic(self):
         req = _request(headers={"X-App-ID": "some-brand-new-app"})
         rule, app_id = resolve_app_provider_policy(req)
         assert app_id == "some-brand-new-app"
         assert rule is GLOBAL_DEFAULT_RULE
-        assert rule.provider == "bedrock"
+        assert rule.provider == "anthropic"
 
 
 class TestNonCustomerAppsExcluded:
@@ -138,44 +137,65 @@ class TestNonCustomerAppsExcluded:
 class TestAllFourNamedApps:
     """Directly pin down Rafael's 2026-08-04 decision for the four apps."""
 
-    def test_werking_report_is_bedrock_eu(self):
-        assert APP_PROVIDER_RULES["werking-report"] == ProviderRule(
-            provider="bedrock", region="eu-central-1"
-        )
+    def test_werking_report_is_anthropic_pool(self):
+        assert APP_PROVIDER_RULES["werking-report"] == ProviderRule(provider="anthropic")
 
-    def test_werking_energy_is_bedrock_eu(self):
-        assert APP_PROVIDER_RULES["werking-energy"] == ProviderRule(
-            provider="bedrock", region="eu-central-1"
-        )
+    def test_werking_energy_is_anthropic_pool(self):
+        assert APP_PROVIDER_RULES["werking-energy"] == ProviderRule(provider="anthropic")
 
-    def test_werking_noise_is_bedrock_eu(self):
-        assert APP_PROVIDER_RULES["werking-noise"] == ProviderRule(
-            provider="bedrock", region="eu-central-1"
-        )
+    def test_werking_noise_is_anthropic_pool(self):
+        assert APP_PROVIDER_RULES["werking-noise"] == ProviderRule(provider="anthropic")
+
+    def test_no_rule_may_grant_bedrock(self):
+        """DIE Invariante (Rafael 2026-08-11): eine App-Regel darf Bedrock nicht
+        vergeben — Bedrock kommt ausschliesslich vom User-Pin. Wer hier wieder
+        provider='bedrock' eintraegt, oeffnet das Leck, das den Loop vom
+        2026-08-04 bezahlt hat."""
+        for app_id, rule in APP_PROVIDER_RULES.items():
+            assert rule.provider == "anthropic", (
+                f"APP_PROVIDER_RULES[{app_id!r}] vergibt {rule.provider!r} — "
+                f"nur 'anthropic' ist erlaubt"
+            )
+        assert GLOBAL_DEFAULT_RULE.provider == "anthropic"
 
     def test_engelmann_is_anthropic_pool(self):
         assert APP_PROVIDER_RULES["engelmann"] == ProviderRule(provider="anthropic")
 
 
 class TestApplyPolicy:
-    def test_apply_bedrock_sets_backend_and_region(self):
+    def test_apply_bedrock_rule_fails_loud(self):
+        """Eine Bedrock-App-Regel ist strukturell verboten — nicht still
+        ignoriert, sondern lauter Fehler."""
         body = SimpleNamespace(backend=None, bedrock_region=None, provider_tier="claude-premium")
-        applied = apply_app_provider_policy(
-            body, ProviderRule(provider="bedrock", region="eu-central-1")
-        )
-        assert applied == "bedrock"
-        assert body.backend == BackendType.BEDROCK
-        assert body.bedrock_region == "eu-central-1"
-        assert body.provider_tier is None
+        with pytest.raises(AppProviderPolicyError, match="only pin 'anthropic'"):
+            apply_app_provider_policy(
+                body, ProviderRule(provider="bedrock", region="eu-central-1")
+            )
 
     def test_apply_anthropic_clears_provider_tier(self):
         """The app rule overrides any client-chosen tier — same as a user pin
         (apply_user_provider_override) already does."""
-        body = SimpleNamespace(backend=None, bedrock_region=None, provider_tier="claude-dsgvo")
+        body = SimpleNamespace(backend=None, bedrock_region=None, provider_tier="claude-premium")
         applied = apply_app_provider_policy(body, ProviderRule(provider="anthropic"))
         assert applied == "anthropic"
         assert body.backend == BackendType.ANTHROPIC
         assert body.provider_tier is None
+
+    def test_explicit_bedrock_backend_is_left_for_the_gate(self):
+        """Kein silent-redirect: wer explizit Bedrock verlangt, wird nicht
+        heimlich auf Anthropic umgebogen (andere Datenresidenz), sondern faellt
+        in das Bedrock-Gate und bekommt dort ein lautes 403."""
+        body = SimpleNamespace(
+            backend=BackendType.BEDROCK, bedrock_region="eu-central-1", provider_tier=None
+        )
+        assert apply_app_provider_policy(body, ProviderRule(provider="anthropic")) is None
+        assert body.backend == BackendType.BEDROCK
+
+    def test_explicit_bedrock_tier_is_left_for_the_gate(self):
+        """Gleiches ueber den provider_tier-Pfad ('claude-dsgvo' → Bedrock)."""
+        body = SimpleNamespace(backend=None, bedrock_region=None, provider_tier="claude-dsgvo")
+        assert apply_app_provider_policy(body, ProviderRule(provider="anthropic")) is None
+        assert body.provider_tier == "claude-dsgvo"
 
     def test_unsupported_provider_raises_loud(self):
         """A typo in APP_PROVIDER_RULES must not silently leave a DSGVO app

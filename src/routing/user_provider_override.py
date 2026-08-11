@@ -67,23 +67,64 @@ class BedrockPinRequiredError(RuntimeError):
     """
 
 
-def assert_bedrock_is_pinned(effective_backend: Any, pinned: Optional[str]) -> None:
+class BedrockNonProdRefusedError(RuntimeError):
+    """Bedrock reached from a non-production app environment — refused, 403.
+
+    Bedrock ist echtes AWS-Geld. Ein Pin sagt WER auf Bedrock darf, aber nicht
+    WOMIT: dieselben Credentials liegen auf beiden Bridges, und jede lokale,
+    Staging-, Partner- oder CI-Instanz kann sich als derselbe User anmelden.
+    Genau so wurde ein Konvertierungs-Loop einer Partner-Dev-Instanz 6 Tage
+    lang gegen das AWS-Konto gebucht (2026-08-04..11). Deshalb gilt: Bedrock
+    NUR aus ``app_env == 'prod'``. Non-Prod laeuft ueber die internen
+    Anthropic-Accounts (Flatrate, 0 EUR Grenzkosten).
+
+    Kein silent-redirect: der Call wollte explizit Bedrock-Datenresidenz und
+    bekaeme sonst still ein anderes Verhalten. Rafael, 2026-08-11.
+    """
+
+
+def assert_bedrock_is_pinned(
+    effective_backend: Any,
+    pinned: Optional[str],
+    *,
+    app_env: Optional[str] = None,
+) -> None:
     """Gate: der EFFEKTIVE Backend (nach tier-/backend-Auflösung) darf nur
-    dann Bedrock sein, wenn der Operator-Pin ihn gesetzt hat.
+    dann Bedrock sein, wenn (a) der Operator-Pin ihn gesetzt hat UND (b) der
+    Call aus der Produktionsumgebung kommt.
 
     Auf den aufgelösten Backend prüfen — nicht auf request_body.backend —
     damit auch provider_tier-Pfade (z.B. 'claude-dsgvo') erfasst sind.
+
+    ``pinned`` MUSS der ECHTE Operator-Pin aus ``users.provider_config`` sein
+    (das Ergebnis von ``enforce_user_provider_override``). Insbesondere darf
+    hier NICHT der von ``app_provider_policy`` synthetisierte Pin durchgereicht
+    werden: eine App-Regel ist kein User-Pin, und ein Gate, das den vom
+    Aufrufer selbst erzeugten Ausweis prueft, ist kein Gate (genau dieses Leck
+    hat den Loop vom 2026-08-04 bezahlt).
+
+    ``app_env`` ist der bereits normalisierte Bucket (prod|staging|local) aus
+    ``normalize_app_env``. None (Header fehlt/unbekannt) ist fail-closed: kein
+    nachweislicher Prod-Call, also kein Bedrock.
     """
     if effective_backend != BackendType.BEDROCK:
         return
-    if pinned == "bedrock":
-        return
-    raise BedrockPinRequiredError(
-        "Bedrock is only reachable via the operator-set per-user pin "
-        "(users.provider_config.provider='bedrock', Platform-Admin → Users). "
-        "Client-side backend/provider_tier opt-in is not permitted: every "
-        "Bedrock call must be attributable to a real user."
-    )
+    if pinned != "bedrock":
+        raise BedrockPinRequiredError(
+            "Bedrock is only reachable via the operator-set per-user pin "
+            "(users.provider_config.provider='bedrock', Platform-Admin → Users). "
+            "Client-side backend/provider_tier opt-in is not permitted: every "
+            "Bedrock call must be attributable to a real user."
+        )
+    if app_env != "prod":
+        raise BedrockNonProdRefusedError(
+            "Bedrock is restricted to production traffic, but this call reports "
+            f"app_env={app_env!r}. The per-user pin says WHO may use Bedrock, not "
+            "from WHICH environment — local, staging, partner and CI instances "
+            "authenticate as the same user and would book real AWS spend. Send "
+            "X-App-Env: production from a production deployment, or let the call "
+            "run on the internal Anthropic accounts."
+        )
 
 
 class BedrockAttributionIncompleteError(RuntimeError):
