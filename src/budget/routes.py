@@ -41,6 +41,7 @@ from src.api_auth import (
     AuthClaims,
 )
 from src.budget.calculator import (
+    rollover_monthly_if_due,
     UserBudget,
     MonthlyBudgetEntry,
     TopUpLot,
@@ -247,6 +248,24 @@ async def evaluate_budget(
                     await _provision_trial(conn, user_id, trial)
                     budget = await _load_user_budget(conn, user_id)
 
+    # Faelligen Monatstopf zuruecksetzen, BEVOR das Tor rechnet. Ohne das ist
+    # ein "Monatsbudget" ein Lebenszeit-Deckel (s. rollover_monthly_if_due).
+    # Nur Nicht-Trials: bei Trials ist reset_at das Ablaufdatum, nicht der
+    # Zyklusanker — ein Rollover machte den Trial unsterblich.
+    # Nur im Speicher: /check ist ein Vorab-Tor ohne Schreibrecht; persistiert
+    # wird der neue Anker im Abbuchungspfad, der ohnehin schreibt.
+    if not get_plan(effective_plan_id).trial:
+        entry = budget.monthly_budgets.get(effective_plan_id)
+        if entry is not None:
+            rolled, did_roll = rollover_monthly_if_due(entry)
+            if did_roll:
+                budget.monthly_budgets[effective_plan_id] = rolled
+                logger.info(
+                    "[BudgetCheck] Monatstopf zurueckgesetzt user=%s plan=%s "
+                    "verbraucht_vorher=%.4f neuer_anker=%s",
+                    user_id, effective_plan_id, entry.used_eur, rolled.reset_at,
+                )
+
     # Trial-expiry check (only for trial plans).
     if get_plan(effective_plan_id).trial:
         entry = budget.monthly_budgets.get(effective_plan_id)
@@ -396,6 +415,24 @@ async def apply_budget_deduction(
                             top_up_lots=old_lots,
                         )
 
+            # Faelligen Monatstopf zuruecksetzen (gleiche Regel wie im
+            # Pruefpfad) — hier MIT Persistenz des neuen Ankers, sonst waere
+            # der Reset bei jedem Aufruf neu faellig und der Topf effektiv
+            # unbegrenzt. Nur Nicht-Trials (reset_at = Ablauf bei Trials).
+            neuer_anker: str | None = None
+            if not get_plan(effective_plan_id).trial:
+                entry = budget.monthly_budgets.get(effective_plan_id)
+                if entry is not None:
+                    rolled, did_roll = rollover_monthly_if_due(entry)
+                    if did_roll:
+                        budget.monthly_budgets[effective_plan_id] = rolled
+                        neuer_anker = rolled.reset_at
+                        logger.info(
+                            "[BudgetDeduct] Monatstopf zurueckgesetzt user=%s plan=%s "
+                            "verbraucht_vorher=%.4f neuer_anker=%s",
+                            user_id, effective_plan_id, entry.used_eur, rolled.reset_at,
+                        )
+
             # Trial-expiry check (only for trial plans).
             if get_plan(effective_plan_id).trial:
                 entry = budget.monthly_budgets.get(effective_plan_id)
@@ -413,6 +450,8 @@ async def apply_budget_deduction(
                 **updated_raw[effective_plan_id],
                 "usedEur": result.new_monthly_used,
             }
+            if neuer_anker is not None:
+                updated_raw[effective_plan_id]["resetAt"] = neuer_anker
 
             await conn.execute(
                 """

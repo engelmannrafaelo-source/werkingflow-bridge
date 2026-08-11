@@ -16,7 +16,7 @@ Verbrauchs-Reihenfolge:
   2. TopUp-Lots (app-übergreifend, FIFO — ältester Kauf zuerst, Abgelaufenes übersprungen).
 """
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Tuple
 
 
@@ -36,6 +36,49 @@ class MonthlyBudgetEntry:
     limit_eur: float
     used_eur: float
     reset_at: str  # ISO datetime
+
+
+def rollover_monthly_if_due(
+    entry: MonthlyBudgetEntry,
+    now: "datetime | None" = None,
+    period_days: int = 30,
+) -> Tuple[MonthlyBudgetEntry, bool]:
+    """Faelligen Monatstopf zuruecksetzen: used_eur -> 0, reset_at weiterschieben.
+
+    Das Modul-Design nennt monthly_budgets "use-it-or-lose-it, Monatsreset" und
+    billing_service dokumentiert "Reset window: 30 days" — umgesetzt war der
+    Reset nie: `resetAt` wurde geschrieben, gelesen, serialisiert und
+    ausschliesslich fuer die TRIAL-Ablaufpruefung ausgewertet. `check_budget`
+    und `deduct_budget` rechnen bis heute nur `limit_eur - used_eur`. Ein
+    "Monatstopf" war damit faktisch ein Lebenszeit-Deckel: einmal aufgebraucht,
+    dauerhaft zu — ohne Fehler, ohne Log, ohne Ablauf.
+
+    NUR fuer Plaene mit trial=False aufrufen. Bei Trials bedeutet `reset_at`
+    das GEGENTEIL (Ablaufdatum, s. _is_trial_expired) — ein Rollover machte
+    jeden Trial unsterblich. Deshalb entscheidet der Aufrufer, der den Plan
+    kennt, und dieser Rechner bleibt rein.
+
+    Der Anker wird in period_days-Schritten weitergeschoben, nicht auf
+    `now + period_days` gesetzt: sonst wandert der Zyklus mit dem Zeitpunkt des
+    ersten Aufrufs nach einer Pause. Mehrere verpasste Perioden ergeben EINEN
+    Reset (ein Topf pro Periode, nicht rueckwirkend angesammelt).
+    """
+    now = now or datetime.now(timezone.utc)
+    reset_at = _parse_dt(entry.reset_at)
+    if reset_at > now:
+        return entry, False
+
+    while reset_at <= now:
+        reset_at = reset_at + timedelta(days=period_days)
+
+    return (
+        MonthlyBudgetEntry(
+            limit_eur=entry.limit_eur,
+            used_eur=0.0,
+            reset_at=reset_at.isoformat(),
+        ),
+        True,
+    )
 
 
 @dataclass
