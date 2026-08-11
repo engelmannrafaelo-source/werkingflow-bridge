@@ -629,6 +629,17 @@ async def lifespan(app: FastAPI):
     except Exception as _e:
         logger.error(f"Failed to start trial-warning loop: {_e}")
 
+    # Budget-Vorwarnung an den BETREIBER (nicht an Kunden) — taeglich 07:00 UTC.
+    # Meldet erreichte Schwellen des Monatsbudgets (Standard 50/80/100 %).
+    # Idempotent ueber budget_warnings mit dem Periodenanker im Schluessel:
+    # nach dem Monatsreset ist die Warnung automatisch wieder scharf.
+    try:
+        from src.billing.budget_warnings import start_budget_warning_loop
+        start_budget_warning_loop()
+        logger.info("📊 Budget-Vorwarnung eingeplant (taeglich 07:00 UTC)")
+    except Exception as _e:
+        logger.error(f"Failed to start budget-warning loop: {_e}")
+
     # Bedrock 1:1 billing reconciliation — periodic ledger-vs-CloudWatch check.
     # Self-disables (with an info log) when DB or AWS credentials are absent.
     try:
