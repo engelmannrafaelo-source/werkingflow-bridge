@@ -38,6 +38,35 @@ Es gibt **zwei** Bridge-Deployments, beide gebaut aus **diesem einen Repo** (`we
 | Privacy | **lokaler** Container (`wt-privacy-pdf-service`) | **remote** über Tailscale (`http://100.112.98.39:8100`), kein lokaler Container |
 | Compose-Files | `docker-compose.yml` + `docker-compose-platform-overlay.yml` | `docker-compose-prod.yml` + `docker-compose-prod-platform.yml` |
 | Repo-Pfad **am Host** | `/root/werkingflow-bridge` | `/root/werkingflow-bridge` |
+| Postgres-Container | `bridge-postgres-prod` | `bridge-postgres-prod` |
+| Postgres-Inhalt | eigene DB | eigene DB — **nicht dieselbe!** |
+| AWS-Bedrock-Credentials | gesetzt (`AWS_*_BEDROCK`) | gesetzt (`AWS_*_BEDROCK`) |
+
+### Falle: zwei getrennte Datenbanken mit demselben Containernamen
+
+Jede Bridge hat ihre **eigene** Postgres-Instanz. Der Container heisst auf **beiden** Hosts
+`bridge-postgres-prod` — der Name sagt also **nichts** darueber aus, welche DB man vor sich hat;
+allein der Host entscheidet. `users`, `usage_events`, `provider_config`-Pins, Tenants und
+Billing-Zeilen sind **pro Bridge verschieden**: derselbe Mensch kann auf der einen gepinnt und
+auf der anderen ungepinnt sein oder dort gar nicht existieren.
+
+**Regel: jede Aussage ueber User, Pins, Traffic oder Kosten IMMER auf beiden Hosts pruefen** und
+dazusagen, welche gemeint ist. Ein Befund von `49.12.72.66` ist kein Befund ueber Kunden — die
+zahlenden Kunden liegen auf `178.104.178.79`.
+
+```bash
+for h in 49.12.72.66 178.104.178.79; do echo "== $h"; \
+  ssh root@$h "docker exec -i bridge-postgres-prod psql -U bridge -d bridge" < query.sql; done
+```
+
+### Beide Bridges koennen Bedrock — die Trennung ist Policy, nicht Infrastruktur
+
+`AWS_*_BEDROCK` liegt in den Workern **beider** Bridges, es gibt also keine physische Sperre, die
+die Dev-Bridge vom AWS-Konto fernhaelt. Wer Bedrock erreicht, entscheidet allein der Code
+(`src/routing/user_provider_override.py` — Operator-Pin auf einem echten User-Row **und**
+`app_env='prod'`; `src/routing/app_provider_policy.py` darf Bedrock nicht vergeben). Wer eine
+harte Trennung will, muss die Credentials aus der Dev-Bridge entfernen — das ist eine
+Rafael-Entscheidung, kein Code-Change.
 
 **Das Prinzip:** dev und prod unterscheiden sich **nur** durch den generierten Upstreams-Include
 (= Worker-Set + Backup-Host). Alles andere ist per Konstruktion identisch:
