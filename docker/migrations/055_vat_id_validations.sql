@@ -30,7 +30,7 @@
 
 CREATE TABLE IF NOT EXISTS vat_id_validations (
     id              UUID PRIMARY KEY,
-    tenant_id       UUID NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+    tenant_id       VARCHAR(128) NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
 
     -- Normalisiert (ohne Leerzeichen/Punkte, Grossbuchstaben) — so, wie er
     -- abgefragt wurde. Der Rohwert des Kunden steht in tenants.billing_vat_id.
