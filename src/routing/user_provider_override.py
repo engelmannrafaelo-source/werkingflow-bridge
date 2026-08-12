@@ -78,8 +78,14 @@ class BedrockNonProdRefusedError(RuntimeError):
     NUR aus ``app_env == 'prod'``. Non-Prod laeuft ueber die internen
     Anthropic-Accounts (Flatrate, 0 EUR Grenzkosten).
 
-    Kein silent-redirect: der Call wollte explizit Bedrock-Datenresidenz und
-    bekaeme sonst still ein anderes Verhalten. Rafael, 2026-08-11.
+    SEIT 2026-08-12 ist dieser Fehler der SCHMALE Fall. Ein *positiv erkanntes*
+    Staging/Local stuft ``apply_user_provider_override`` von sich aus auf
+    Anthropic herunter (Rafael: „Bedrock-Pin wird ausserhalb prod ignoriert") —
+    dort kommt es also gar nicht mehr hierher. Uebrig bleibt der Fall
+    ``app_env is None``: eine Umgebung, die sich nicht ausweist. Die wird
+    weiterhin abgewiesen statt umgeleitet, denn ein Produktions-Deployment
+    ohne ``X-App-Env`` wuerde sonst still seine Datenresidenz wechseln — und
+    genau das darf nicht unbemerkt passieren.
     """
 
 
@@ -255,12 +261,38 @@ async def get_user_provider_config(raw_user_id: Any) -> Optional[dict]:
     return config
 
 
-def apply_user_provider_override(request_body: Any, config: dict) -> Optional[str]:
+#: Positiv erkannte Nicht-Produktions-Umgebungen (aus ``normalize_app_env``).
+#: ``None`` gehoert BEWUSST nicht dazu — siehe apply_user_provider_override.
+NON_PROD_APP_ENVS = frozenset({"staging", "local"})
+
+
+def apply_user_provider_override(
+    request_body: Any, config: dict, *, app_env: Optional[str] = None
+) -> Optional[str]:
     """Mutate the request to honour the user's pin.
 
     Returns the pinned provider name when an override was applied, None when
     the config carries no routing directive. Raises UserProviderOverrideError
     on an unsupported provider value.
+
+    ``app_env`` ist der normalisierte Bucket (prod|staging|local|None) des
+    Aufrufs. Ein BEDROCK-Pin gilt nur in ``prod`` (Rafael, 2026-08-12):
+
+    * ``prod``               → Pin wird angewendet.
+    * ``staging`` / ``local`` → Pin wird IGNORIERT, der Call laeuft auf den
+      internen Anthropic-Konten. Der Pin traegt die EU-Datenresidenz echter
+      Kundendaten — die liegen per Definition nicht auf einer Staging- oder
+      Entwicklungs-Instanz. Dort ist er nur noch eine Sperre gegen das eigene
+      Testen: die Dev-Bridge hat keine AWS-Zugangsdaten, der Bedrock-Backend
+      liess sich also gar nicht bauen, und der Aufruf starb mit einem
+      irrefuehrenden 503 ``user_provider_override_unavailable``, das nginx
+      obendrein als ``capacity_busy`` etikettierte.
+    * ``None`` (Header fehlt/unbekannt) → Pin wird ANGEWENDET, nicht
+      heruntergestuft. Das ist der Unterschied, auf den es ankommt: ein
+      Produktions-Deployment, das ``X-App-Env`` vergisst, wuerde sonst STILL
+      auf die Anthropic-Konten ausweichen — eine unbemerkte Aenderung der
+      Datenresidenz. Angewendet laeuft es stattdessen in
+      ``assert_bedrock_is_pinned`` und wird dort laut abgewiesen.
     """
     provider = (config or {}).get("provider")
     if provider is None:
@@ -282,6 +314,18 @@ def apply_user_provider_override(request_body: Any, config: dict) -> Optional[st
         )
 
     if provider == "bedrock":
+        if app_env in NON_PROD_APP_ENVS:
+            logger.warning(
+                "user_provider_override: Bedrock-Pin in app_env=%r ignoriert — "
+                "Call laeuft auf den internen Anthropic-Konten. Der Pin gilt nur "
+                "in prod (Rafael 2026-08-12); ausserhalb liegen keine echten "
+                "Kundendaten, fuer die er die EU-Residenz tragen muesste.",
+                app_env,
+            )
+            request_body.backend = BackendType.ANTHROPIC
+            request_body.provider_tier = None
+            return "anthropic"
+
         request_body.backend = BackendType.BEDROCK
         region = config.get("region")
         if region:
@@ -301,14 +345,29 @@ async def enforce_user_provider_override(request: Any, request_body: Any) -> Opt
 
     Sets ``request.state.user_provider_pinned`` so downstream error handling
     (cross-provider fallback) can refuse to reroute pinned traffic.
-    Returns the pinned provider name or None.
+    Returns the pinned provider name or None — bei einem in Nicht-Produktion
+    heruntergestuften Bedrock-Pin also ``"anthropic"``, nicht ``"bedrock"``.
+    Das ist gewollt: der zurueckgegebene Wert ist der TATSAECHLICH gesetzte
+    Backend, und genau darauf verlassen sich die Aufrufer (Fallback-Sperre,
+    Bedrock-Gate, Research-Ausnahme).
+
+    Die Umgebung wird hier aufgeloest statt vom Aufrufer verlangt: beide
+    Aufrufstellen (Chat, Research) haetten sie sonst einzeln nachreichen
+    muessen, und eine vergessene waere ein stiller Rueckfall auf das alte
+    Verhalten.
     """
     raw_uid = request.headers.get("X-User-ID")
     config = await get_user_provider_config(raw_uid)
     if not config:
         return None
 
-    pinned = apply_user_provider_override(request_body, config)
+    # Lokaler Import wie bei get_user_provider_config' DB-Zugriff: haelt das
+    # Routing-Modul frei von einer Modul-Ebenen-Abhaengigkeit auf src.tenant.
+    from src.tenant import get_app_env_from_request, normalize_app_env
+
+    app_env = normalize_app_env(get_app_env_from_request(request))
+
+    pinned = apply_user_provider_override(request_body, config, app_env=app_env)
     if pinned:
         request.state.user_provider_pinned = pinned
         logger.info(

@@ -16,15 +16,25 @@ os.environ.setdefault("BRIDGE_SERVICE_TOKEN", "test-service-token")
 
 import pytest
 
+from types import SimpleNamespace
+
 from src.models import BackendType
 from src.routing.user_provider_override import (
     BedrockAttributionIncompleteError,
     BedrockNonProdRefusedError,
     BedrockPinRequiredError,
     UserProviderOverrideError,
+    apply_user_provider_override,
     assert_bedrock_attribution_complete,
     assert_bedrock_is_pinned,
 )
+
+
+def _body():
+    return SimpleNamespace(backend=None, bedrock_region=None, provider_tier="claude-premium")
+
+
+BEDROCK_PIN = {"provider": "bedrock", "region": "eu-central-1"}
 
 
 class TestBedrockPinGate:
@@ -138,3 +148,61 @@ class TestBedrockAttributionComplete:
         """400 (fix your request) is a different class from 403 (pin) and 503."""
         assert not issubclass(BedrockAttributionIncompleteError, BedrockPinRequiredError)
         assert not issubclass(BedrockAttributionIncompleteError, UserProviderOverrideError)
+
+
+class TestBedrockPinIsIgnoredOutsideProd:
+    """Rafael 2026-08-12: „Bedrock-Pin wird ausserhalb prod ignoriert."
+
+    Der Pin traegt die EU-Datenresidenz ECHTER Kundendaten. Auf Staging und
+    lokal gibt es die nicht — dort war er nur noch eine Sperre gegen das eigene
+    Testen: die Dev-Bridge hat keine AWS-Zugangsdaten, also starb jeder Aufruf
+    eines gepinnten Users mit 503 ``user_provider_override_unavailable``, das
+    nginx als ``capacity_busy`` weiterreichte. Der gesamte Check-Trichter war
+    damit auf Staging nicht pruefbar.
+    """
+
+    @pytest.mark.parametrize("env", ["staging", "local"])
+    def test_bedrock_pin_downgrades_to_anthropic(self, env):
+        body = _body()
+        assert apply_user_provider_override(body, BEDROCK_PIN, app_env=env) == "anthropic"
+        assert body.backend == BackendType.ANTHROPIC
+        # Region gehoert zum Bedrock-Weg und darf nicht stehenbleiben.
+        assert body.bedrock_region is None
+        # Der Pin schlaegt weiterhin einen client-gewaehlten Tier — nur eben
+        # auf den Anthropic-Weg.
+        assert body.provider_tier is None
+
+    def test_bedrock_pin_applies_in_prod(self):
+        body = _body()
+        assert apply_user_provider_override(body, BEDROCK_PIN, app_env="prod") == "bedrock"
+        assert body.backend == BackendType.BEDROCK
+        assert body.bedrock_region == "eu-central-1"
+
+    def test_unknown_app_env_is_NOT_downgraded(self):
+        """Der Unterschied, auf den es ankommt.
+
+        Ein Produktions-Deployment, das X-App-Env vergisst, darf NICHT still
+        auf die Anthropic-Konten wechseln — das waere eine unbemerkte Aenderung
+        der Datenresidenz. Der Pin wird angewendet; abgewiesen wird er dann
+        laut im Gate (assert_bedrock_is_pinned), nicht heimlich hier.
+        """
+        body = _body()
+        assert apply_user_provider_override(body, BEDROCK_PIN, app_env=None) == "bedrock"
+        assert body.backend == BackendType.BEDROCK
+        with pytest.raises(BedrockNonProdRefusedError):
+            assert_bedrock_is_pinned(body.backend, "bedrock", app_env=None)
+
+    def test_downgraded_call_passes_the_gate(self):
+        """Die Herunterstufung muss das Gate auch wirklich passieren —
+        sonst haetten wir 503 nur gegen 403 getauscht."""
+        body = _body()
+        pinned = apply_user_provider_override(body, BEDROCK_PIN, app_env="staging")
+        assert_bedrock_is_pinned(body.backend, pinned, app_env="staging")
+
+    @pytest.mark.parametrize("env", ["staging", "local", "prod", None])
+    def test_anthropic_pin_is_unaffected(self, env):
+        """Nur der Bedrock-Zweig kennt die Umgebung — ein anthropic-Pin
+        verhaelt sich ueberall gleich."""
+        body = _body()
+        assert apply_user_provider_override(body, {"provider": "anthropic"}, app_env=env) == "anthropic"
+        assert body.backend == BackendType.ANTHROPIC
