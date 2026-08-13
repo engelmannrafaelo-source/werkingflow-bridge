@@ -2375,12 +2375,26 @@ async def chat_completions(
         # app-level pin the same way, with no separate wiring needed. A typo in
         # the committed routing table (AppProviderPolicyError) is NOT swallowed
         # — this is a compliance decision, unlike the cost-routing policy below.
-        if user_pinned_provider is None:
-            from src.routing.app_provider_policy import (
-                resolve_app_provider_policy, apply_app_provider_policy,
-                AppProviderPolicyError,
-            )
-            _app_rule, _app_rule_app_id = resolve_app_provider_policy(request)
+        # PRECEDENCE CORRECTION (Rafael, 2026-08-13): an app rule may override an
+        # EXISTING user pin, but ONLY when it moves traffic AWAY from Bedrock —
+        # never onto it. The per-user Bedrock pin exists to keep CUSTOMER-app
+        # traffic (report/energy/noise) EU-resident. The Engelmann AI Hub
+        # authenticates with those very same accounts, so the pin silently
+        # dragged Hub traffic onto Bedrock — precisely the failure this policy
+        # was written to end (see app_provider_policy docstring). Measured on
+        # 2026-08-13 before this change: seefoo@engelmann.at + X-App-ID=engelmann
+        # -> backend=bedrock. One-directional by design: an app rule can never
+        # force a user ONTO Bedrock against their pin, so every per-user EU
+        # commitment (e.g. the Kainer-AVV contract case) keeps winning.
+        from src.routing.app_provider_policy import (
+            resolve_app_provider_policy, apply_app_provider_policy,
+            AppProviderPolicyError,
+        )
+        _app_rule, _app_rule_app_id = resolve_app_provider_policy(request)
+        _app_rule_leaves_bedrock = (
+            _app_rule is not None and _app_rule.provider != "bedrock"
+        )
+        if user_pinned_provider is None or _app_rule_leaves_bedrock:
             if _app_rule is not None:
                 try:
                     _app_applied = apply_app_provider_policy(request_body, _app_rule)
@@ -4860,12 +4874,16 @@ async def research(
     # research cannot run on Bedrock at all (no WebSearch there), so an
     # app-level Bedrock rule gets the identical anthropic+research-cloud
     # exception a user-level Bedrock pin already gets, not a bypass of it.
-    if _research_pinned is None:
-        from src.routing.app_provider_policy import (
-            resolve_app_provider_policy, apply_app_provider_policy,
-            AppProviderPolicyError,
-        )
-        _app_rule, _app_rule_app_id = resolve_app_provider_policy(request)
+    # Same one-directional precedence as chat completions above — see there.
+    from src.routing.app_provider_policy import (
+        resolve_app_provider_policy, apply_app_provider_policy,
+        AppProviderPolicyError,
+    )
+    _app_rule, _app_rule_app_id = resolve_app_provider_policy(request)
+    _app_rule_leaves_bedrock = (
+        _app_rule is not None and _app_rule.provider != "bedrock"
+    )
+    if _research_pinned is None or _app_rule_leaves_bedrock:
         if _app_rule is not None:
             try:
                 _app_applied = apply_app_provider_policy(request_body, _app_rule)
