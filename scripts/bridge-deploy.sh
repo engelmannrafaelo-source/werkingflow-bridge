@@ -66,6 +66,16 @@ SERVER2_SVC_worker_kurt="wt-prod-worker-kurt"
 # routes smart-anonymize to the dev-bridge privacy service over Tailscale.
 SERVER2_SVC_metrics_reader_prod="wt-prod-metrics-reader"
 SERVER2_SVC_postgres_prod="bridge-postgres-prod"
+
+# Bookkeeping DB for the migration gate (Phase 3.7). Both hosts run a container
+# literally named "bridge-postgres-prod" — dev (hetzner) and prod (server2) are
+# DIFFERENT machines with the SAME container name, so the name alone proves
+# nothing about which database is being read. The gate is always addressed with
+# the host it belongs to.
+HETZNER_DB_CONTAINER="bridge-postgres-prod"
+SERVER2_DB_CONTAINER="bridge-postgres-prod"
+BRIDGE_DB_USER="bridge"
+BRIDGE_DB_NAME="bridge"
 SERVER2_SVC_platform_api="wt-prod-platform-api"
 # postgres-prod zuerst (DB vor platform-api), platform-api vor nginx (Upstream-Resolve).
 SERVER2_ALL="postgres-prod platform-api nginx worker-sahori worker-kurt metrics-reader-prod"
@@ -1210,9 +1220,95 @@ EOF
 # ============================================================================
 # Main: deploy one server
 # ============================================================================
+# Phase 3.7: migration gate.
+#
+# This script deliberately does NOT apply migrations — a schema change on a
+# production database stays a conscious, separate act. But deploying code that
+# expects a column the database does not have is exactly the failure this gate
+# exists to prevent, so the deploy stops instead of guessing.
+#
+# Compares docker/migrations/*.sql in the freshly updated remote checkout against
+# the schema_migrations bookkeeping table:
+#   MISSING — file present, never applied      -> abort
+#   DRIFT   — applied sha256 != current file   -> abort
+#   ORPHAN  — applied, file gone from the repo -> warn (history, not a blocker)
+#
+# Runs after code_update (new migration files are present) and before any
+# container is touched, so aborting here leaves the running system as it was.
+phase_migration_gate() {
+    local host="$1" db_container="$2"
+    step "Phase 3.7: Migration gate (${db_container} on ${host})"
+
+    if [[ "$DRY_RUN" == "true" ]]; then
+        info "DRY-RUN: migration gate skipped"
+        return 0
+    fi
+
+    local out rc
+    out=$(rssh_run "$host" <<REMOTE
+set -uo pipefail
+cd "${REMOTE_REPO}/docker/migrations" 2>/dev/null || { echo "GATE_ERROR no migrations directory"; exit 3; }
+
+if ! docker exec ${db_container} psql -U ${BRIDGE_DB_USER} -d ${BRIDGE_DB_NAME} -tAc \
+        "select to_regclass('public.schema_migrations')" 2>/dev/null | grep -q schema_migrations; then
+    echo "GATE_ERROR schema_migrations not readable in ${db_container}"
+    exit 3
+fi
+
+docker exec ${db_container} psql -U ${BRIDGE_DB_USER} -d ${BRIDGE_DB_NAME} -tAc \
+    "select filename || ' ' || sha256 from schema_migrations" 2>/dev/null | grep . | sort > /tmp/.mg_db
+for f in *.sql; do printf '%s %s\n' "\$f" "\$(sha256sum "\$f" | cut -d' ' -f1)"; done | sort > /tmp/.mg_files
+
+fail=0
+while read -r f s; do
+    db_line=\$(grep "^\$f " /tmp/.mg_db || true)
+    if [ -z "\$db_line" ]; then
+        echo "MISSING \$f"; fail=1
+    elif [ "\$(echo "\$db_line" | awk '{print \$2}')" != "\$s" ]; then
+        echo "DRIFT \$f"; fail=1
+    fi
+done < /tmp/.mg_files
+
+while read -r f s; do
+    [ -f "\$f" ] || echo "ORPHAN \$f"
+done < /tmp/.mg_db
+
+echo "CHECKED \$(wc -l < /tmp/.mg_files)"
+exit \$fail
+REMOTE
+)
+    rc=$?
+
+    if (( rc == 3 )); then
+        error_ "Migration gate could not run: $(echo "$out" | grep GATE_ERROR || echo "$out")"
+        error_ "Refusing to deploy without a verifiable schema state."
+        return 1
+    fi
+
+    echo "$out" | grep '^ORPHAN ' | while read -r _ f; do
+        warn "Applied migration no longer in repo: ${f} (history — not blocking)"
+    done
+
+    if (( rc != 0 )); then
+        error_ "Database schema does not match the code being deployed:"
+        echo "$out" | grep -E '^(MISSING|DRIFT) ' | while read -r kind f; do
+            case "$kind" in
+                MISSING) error_ "  not applied : ${f}" ;;
+                DRIFT)   error_ "  changed     : ${f} (applied version differs from the file)" ;;
+            esac
+        done
+        error_ "Apply them deliberately, then re-run the deploy:"
+        error_ "  ssh root@${host} 'docker exec -i ${db_container} psql -U ${BRIDGE_DB_USER} -d ${BRIDGE_DB_NAME}' < docker/migrations/<file>.sql"
+        return 1
+    fi
+
+    info "Migration gate OK — $(echo "$out" | awk '/^CHECKED/{print $2}') migrations match the database"
+    return 0
+}
+
 deploy_server() {
     local server_name="$1"
-    local host compose all_services build_list server_prefix
+    local host compose all_services build_list server_prefix db_container
 
     case "$server_name" in
         hetzner)
@@ -1221,6 +1317,7 @@ deploy_server() {
             all_services="$HETZNER_ALL"
             build_list="$HETZNER_NEEDS_BUILD"
             server_prefix="HETZNER"
+            db_container="${HETZNER_DB_CONTAINER}"
             ;;
         server2)
             host="$SERVER2_HOST"
@@ -1228,6 +1325,7 @@ deploy_server() {
             all_services="$SERVER2_ALL"
             build_list="$SERVER2_NEEDS_BUILD"
             server_prefix="SERVER2"
+            db_container="${SERVER2_DB_CONTAINER}"
             ;;
         *)
             error_ "Unknown server: ${server_name}"
@@ -1282,6 +1380,17 @@ deploy_server() {
     # deploy with no container touched; reset code to the pre-deploy SHA.
     phase_reconcile_worker_key "$host" || {
         error_ "Key reconcile failed — reverting code to ${ROLLBACK_SHA}"
+        if [[ "$DRY_RUN" == "false" ]]; then
+            rssh "$host" "cd ${REMOTE_REPO} && git reset --hard '${ROLLBACK_SHA}'" || true
+        fi
+        return 1
+    }
+
+    # === Phase 3.7: schema must match the code about to be deployed ===
+    # Last point at which no container has been touched. Failure resets the code
+    # to the pre-deploy SHA, exactly like Phase 3.5.
+    phase_migration_gate "$host" "$db_container" || {
+        error_ "Migration gate failed — reverting code to ${ROLLBACK_SHA}"
         if [[ "$DRY_RUN" == "false" ]]; then
             rssh "$host" "cd ${REMOTE_REPO} && git reset --hard '${ROLLBACK_SHA}'" || true
         fi
