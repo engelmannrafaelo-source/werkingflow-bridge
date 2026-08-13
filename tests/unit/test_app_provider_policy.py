@@ -22,9 +22,12 @@ from src.routing.app_provider_policy import (
     APP_PROVIDER_RULES,
     GLOBAL_DEFAULT_RULE,
     NON_CUSTOMER_APP_IDS,
+    PIN_OVERRIDING_APP_IDS,
     AppProviderPolicyError,
     ProviderRule,
+    app_rule_outranks_user_pin,
     apply_app_provider_policy,
+    client_requests_bedrock,
     resolve_app_provider_policy,
 )
 
@@ -203,3 +206,84 @@ class TestApplyPolicy:
         body = SimpleNamespace(backend=None, bedrock_region=None, provider_tier=None)
         with pytest.raises(AppProviderPolicyError, match="bogus"):
             apply_app_provider_policy(body, ProviderRule(provider="bogus"))
+
+
+class TestPinPrecedence:
+    """Which apps may override an EXISTING per-user operator pin.
+
+    The per-user pin is a customer's EU-residency commitment; only the Engelmann
+    Hub — which shares those very accounts but is not itself a DSGVO-scoped
+    customer app — is allowed to outrank it (Rafael, 2026-08-13).
+    """
+
+    def test_hub_may_override_a_user_pin(self):
+        assert app_rule_outranks_user_pin("engelmann") is True
+
+    @pytest.mark.parametrize("app_id", ["werking-report", "werking-energy", "werking-noise"])
+    def test_customer_apps_never_override_a_user_pin(self, app_id):
+        """The regression this guards: a blanket "app rule beats pin" would have
+        moved every Bedrock-pinned customer onto Anthropic on their next
+        Report/Energy/Noise call — silently breaking the AVV promise."""
+        assert app_rule_outranks_user_pin(app_id) is False
+
+    def test_unknown_and_unresolved_apps_never_override(self):
+        """Fail-closed: if the Bridge cannot prove which app is calling, the
+        user's pin stands."""
+        assert app_rule_outranks_user_pin(None) is False
+        assert app_rule_outranks_user_pin("some-new-app") is False
+
+    def test_every_pin_overriding_app_can_only_pin_anthropic(self):
+        """Structural guarantee: an override can only ever move traffic OFF
+        Bedrock. If someone adds an app here whose rule is Bedrock, this fails."""
+        for app_id in PIN_OVERRIDING_APP_IDS:
+            assert APP_PROVIDER_RULES[app_id].provider == "anthropic"
+
+    def test_no_customer_app_is_pin_overriding(self):
+        """Guards the set itself, not just today's members."""
+        customer_apps = set(APP_PROVIDER_RULES) - {"engelmann"} - NON_CUSTOMER_APP_IDS
+        assert customer_apps and not (customer_apps & PIN_OVERRIDING_APP_IDS)
+
+
+class TestClientIntentSnapshot:
+    """A pinned user's body already says backend=BEDROCK by the time the app
+    rule runs — the rule must read the CLIENT's intent, not the mutated body,
+    or the Hub override silently does nothing (the bug found on 2026-08-13)."""
+
+    def test_pin_written_bedrock_does_not_veto_the_override(self):
+        """Body looks like "Bedrock requested" because the PIN wrote it. With
+        the client's real intent passed in, the Hub rule applies."""
+        body = SimpleNamespace(
+            backend=BackendType.BEDROCK, bedrock_region="eu-central-1", provider_tier=None
+        )
+        applied = apply_app_provider_policy(
+            body, ProviderRule(provider="anthropic"), client_requested_bedrock=False
+        )
+        assert applied == "anthropic"
+        assert body.backend == BackendType.ANTHROPIC
+
+    def test_client_asked_for_bedrock_still_vetoes(self):
+        """The guard keeps its original purpose: a caller that really demanded
+        Bedrock is never silently re-routed to a different data residency."""
+        body = SimpleNamespace(
+            backend=BackendType.BEDROCK, bedrock_region="eu-central-1", provider_tier=None
+        )
+        assert apply_app_provider_policy(
+            body, ProviderRule(provider="anthropic"), client_requested_bedrock=True
+        ) is None
+        assert body.backend == BackendType.BEDROCK
+
+    def test_default_still_reads_the_body(self):
+        """Callers that only apply the rule to UNPINNED users pass nothing and
+        keep the original behaviour."""
+        body = SimpleNamespace(
+            backend=BackendType.BEDROCK, bedrock_region="eu-central-1", provider_tier=None
+        )
+        assert apply_app_provider_policy(body, ProviderRule(provider="anthropic")) is None
+
+    def test_snapshot_helper_reads_client_intent(self):
+        assert client_requests_bedrock(
+            SimpleNamespace(backend=BackendType.BEDROCK, provider_tier=None)
+        ) is True
+        assert client_requests_bedrock(
+            SimpleNamespace(backend=None, provider_tier=None)
+        ) is False

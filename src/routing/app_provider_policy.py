@@ -137,6 +137,40 @@ GLOBAL_DEFAULT_RULE = ProviderRule(provider="anthropic")
 # platform-*, dev-tooling) and the KNOWN_APP_IDS entries that are not apps.
 NON_CUSTOMER_APP_IDS = {"cui", "platform", "dev-tooling", "partner-platform"}
 
+# Apps whose rule OUTRANKS an existing per-user operator pin (Rafael,
+# 2026-08-13). The default precedence — user pin beats app rule — is correct
+# for every DSGVO-scoped Kunden-App: the pin IS that customer's EU-residency
+# commitment (e.g. the Kainer-AVV contract case) and an app rule must never
+# dissolve it. The Engelmann AI Hub is the one documented exception, and the
+# reason is stated in this module's own Background section: the Hub
+# authenticates with the SAME user accounts as Report/Energy, so a per-user
+# Bedrock pin silently dragged Hub traffic onto Bedrock — the exact failure
+# the app-keyed policy was written to end. Because the pin cannot distinguish
+# "Report call" from "Hub call by the same person", only the app identity can.
+#
+# Safe by construction, in both directions:
+#   * Membership here is per-APP, not per-user — a Kunden-App can never appear
+#     in this set without a reviewed change to this file, so no customer's pin
+#     is weakened by an admin action or a DB edit.
+#   * ``apply_app_provider_policy`` refuses any provider except "anthropic"
+#     (see "Bedrock is pin-only"), so an entry here can only ever move traffic
+#     OFF Bedrock onto the flat-rate pool — never a user ONTO Bedrock, and
+#     never onto per-token AWS spend the user did not opt into.
+PIN_OVERRIDING_APP_IDS = {"engelmann"}
+
+
+def app_rule_outranks_user_pin(app_id: Optional[str]) -> bool:
+    """Whether ``app_id``'s rule may override an EXISTING per-user pin.
+
+    False for everything not explicitly listed in ``PIN_OVERRIDING_APP_IDS``
+    — including an unresolved (``None``) app identity. Fail-closed on purpose:
+    if the Bridge cannot prove which app is calling, it must keep the user's
+    pin, because that pin may be a contractual data-residency promise.
+    """
+    if app_id is None:
+        return False
+    return app_id in PIN_OVERRIDING_APP_IDS
+
 
 class AppProviderPolicyError(RuntimeError):
     """An app-level provider rule names a provider this module doesn't know.
@@ -190,7 +224,12 @@ def resolve_app_provider_policy(request: Any) -> tuple[Optional[ProviderRule], O
     return GLOBAL_DEFAULT_RULE, app_id
 
 
-def apply_app_provider_policy(request_body: Any, rule: ProviderRule) -> Optional[str]:
+def apply_app_provider_policy(
+    request_body: Any,
+    rule: ProviderRule,
+    *,
+    client_requested_bedrock: Optional[bool] = None,
+) -> Optional[str]:
     """Mutate the request to honour the app rule. Mirrors
     ``user_provider_override.apply_user_provider_override`` exactly, so every
     downstream consumer that already understands "the Bridge pinned this
@@ -220,12 +259,38 @@ def apply_app_provider_policy(request_body: Any, rule: ProviderRule) -> Optional
     # requested a specific data residency and would otherwise get a different
     # one behind its back. Leave the request untouched and let the Bedrock gate
     # decide — it refuses without an operator pin, loudly (403).
-    if _requests_bedrock_explicitly(request_body):
+    #
+    # WHOSE intent is being read here matters (Rafael, 2026-08-13). By the time
+    # this runs, ``enforce_user_provider_override`` may ALREADY have written
+    # ``backend=BEDROCK`` into request_body for a pinned user — the body then
+    # looks identical to a client that asked for Bedrock itself, and this guard
+    # would veto a pin-overriding app rule that is supposed to win (the Hub
+    # case). Callers that override an existing pin therefore pass the CLIENT's
+    # intent, snapshotted before the pin mutated the body. The default (None =
+    # read the body) keeps the original behaviour for every caller that only
+    # applies the rule to unpinned users, where body and client intent agree.
+    _asked_for_bedrock = (
+        _requests_bedrock_explicitly(request_body)
+        if client_requested_bedrock is None
+        else client_requested_bedrock
+    )
+    if _asked_for_bedrock:
         return None
 
     request_body.backend = BackendType.ANTHROPIC
     request_body.provider_tier = None
     return "anthropic"
+
+
+def client_requests_bedrock(request_body: Any) -> bool:
+    """Public reading of "did the CLIENT ask for Bedrock?".
+
+    Call this BEFORE ``enforce_user_provider_override`` runs: the pin rewrites
+    ``request_body.backend``, after which the body no longer distinguishes the
+    client's own request from the Bridge's pin. The snapshot is what
+    ``apply_app_provider_policy(..., client_requested_bedrock=...)`` needs.
+    """
+    return _requests_bedrock_explicitly(request_body)
 
 
 def _requests_bedrock_explicitly(request_body: Any) -> bool:

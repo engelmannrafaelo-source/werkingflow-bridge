@@ -2346,6 +2346,12 @@ async def chat_completions(
         # mint the credential the gate checks is what funded the 2026-08-04
         # runaway loop. See routing/app_provider_policy.py "Bedrock is pin-only".
         operator_pinned_provider = None
+        # The CLIENT's own Bedrock intent, read BEFORE the pin below rewrites
+        # request_body.backend. A pin-overriding app rule (the Hub) must be able
+        # to tell "this caller demanded Bedrock" apart from "the Bridge's pin
+        # just wrote Bedrock here" — after the mutation the body cannot.
+        from src.routing.app_provider_policy import client_requests_bedrock
+        _client_asked_for_bedrock = client_requests_bedrock(request_body)
         try:
             user_pinned_provider = await enforce_user_provider_override(request, request_body)
             operator_pinned_provider = user_pinned_provider
@@ -2366,24 +2372,33 @@ async def chat_completions(
         # individual pin state — decides which backend an APPLICATION's traffic
         # runs on (Rafael, 2026-08-04: werking.tools' EU-data-residency promise
         # is an app property, e.g. werking-report/-energy/-noise → Bedrock EU,
-        # engelmann → the flat-rate Anthropic pool). Runs only when the user
-        # carries no explicit pin — a per-user pin (e.g. the Kainer-AVV contract
-        # case) always wins over the app default. On a match this sets
+        # engelmann → the flat-rate Anthropic pool). Runs when the user carries
+        # no explicit pin — a per-user pin (e.g. the Kainer-AVV contract case)
+        # wins over the app default for every DSGVO-scoped Kunden-App. The one
+        # exception is the Engelmann Hub (PIN_OVERRIDING_APP_IDS): it shares the
+        # customer accounts, so the pin dragged Hub traffic onto Bedrock — the
+        # failure this policy exists to end. Measured 2026-08-13: seefoo +
+        # X-App-ID=engelmann → backend=bedrock, because the pin outranked the
+        # rule. See app_provider_policy.PIN_OVERRIDING_APP_IDS for why this can
+        # only ever move traffic OFF Bedrock. On a match this sets
         # user_pinned_provider exactly like a user pin would: every downstream
         # consumer that already refuses to re-route a "Bridge pinned this call"
         # request (the Bedrock-pin gate, cross-provider fallback) protects an
         # app-level pin the same way, with no separate wiring needed. A typo in
         # the committed routing table (AppProviderPolicyError) is NOT swallowed
         # — this is a compliance decision, unlike the cost-routing policy below.
-        if user_pinned_provider is None:
-            from src.routing.app_provider_policy import (
-                resolve_app_provider_policy, apply_app_provider_policy,
-                AppProviderPolicyError,
-            )
-            _app_rule, _app_rule_app_id = resolve_app_provider_policy(request)
+        from src.routing.app_provider_policy import (
+            resolve_app_provider_policy, apply_app_provider_policy,
+            app_rule_outranks_user_pin, AppProviderPolicyError,
+        )
+        _app_rule, _app_rule_app_id = resolve_app_provider_policy(request)
+        if user_pinned_provider is None or app_rule_outranks_user_pin(_app_rule_app_id):
             if _app_rule is not None:
                 try:
-                    _app_applied = apply_app_provider_policy(request_body, _app_rule)
+                    _app_applied = apply_app_provider_policy(
+                        request_body, _app_rule,
+                        client_requested_bedrock=_client_asked_for_bedrock,
+                    )
                 except AppProviderPolicyError as e:
                     raise HTTPException(
                         status_code=503,
