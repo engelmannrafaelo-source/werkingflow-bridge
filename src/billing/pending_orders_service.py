@@ -24,6 +24,7 @@ from typing import Any, Dict, List, Optional
 import httpx
 
 from src.api_auth.tenant_resolver import resolve_tenant_for_user
+from src.billing import vat_id as vat_id_module
 from src.billing.billing_service import (
     _determine_tax_rate,
     _provision_plan_budget,
@@ -140,7 +141,27 @@ async def _create_order_invoice(
     except Exception:
         pass
 
-    tax_rate, reverse_charge_note = _determine_tax_rate(billing_address)
+    # Wurde die erfasste UID gegen VIES bestaetigt? Nur dann darf Reverse
+    # Charge greifen. Ein Fehler beim Nachschlagen bedeutet "nicht bestaetigt",
+    # nie "schon in Ordnung" — die teure Richtung ist die Nullsteuer.
+    # (Gleiches Muster wie auto_create_invoice in billing_service.py.)
+    vat_id_confirmed = False
+    if tenant_id and billing_address and (billing_address.get("vatId") or "").strip():
+        try:
+            async with pool.acquire() as conn:
+                vat_id_confirmed = await vat_id_module.has_confirmed_validation(
+                    conn, tenant_id=str(tenant_id), vat_id=billing_address["vatId"],
+                )
+        except Exception as e:
+            import logging
+            logging.getLogger(__name__).warning(
+                "[pending-order] VIES confirmation lookup failed for tenant=%s: %s — "
+                "invoicing WITH VAT (safe default)", tenant_id, e,
+            )
+
+    tax_rate, reverse_charge_note = _determine_tax_rate(
+        billing_address, vat_id_confirmed=vat_id_confirmed,
+    )
 
     from src.billing.billing_service import _EU_COUNTRIES_NON_AT
     if billing_address:
