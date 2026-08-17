@@ -4311,6 +4311,9 @@ async def _execute_research_impl(
                 duration_ms=int(execution_time * 1000),
                 error_code="research_error",
                 app_env=attribution_ctx.get("app_env") if attribution_ctx else None,
+                # Der error_code hier ist eine feste Kennung und erklaert nichts —
+                # ohne den Text bleibt offen, WARUM der Call scheiterte.
+                error_message=str(e),
             )
         except Exception as _track_err:
             logger.warning(f"⚠️ research error activity tracking failed (non-fatal): {_track_err}")
@@ -4422,6 +4425,9 @@ async def _execute_research_cloud_impl(
                 error_code="research_cloud_executor_error",
                 app_env=attribution_ctx.get("app_env") if attribution_ctx else None,
                 provider="research-cloud",
+                # Der error_code hier ist eine feste Kennung und erklaert nichts —
+                # ohne den Text bleibt offen, WARUM der Call scheiterte.
+                error_message=str(e),
             )
         except Exception as _track_err:
             logger.warning(f"research-cloud error activity tracking failed (non-fatal): {_track_err}")
@@ -5426,6 +5432,9 @@ async def _execute_doc_agent_impl(
                 duration_ms=int(execution_time * 1000),
                 error_code="doc_agent_error",
                 app_env=attribution_ctx.get("app_env") if attribution_ctx else None,
+                # Der error_code hier ist eine feste Kennung und erklaert nichts —
+                # ohne den Text bleibt offen, WARUM der Call scheiterte.
+                error_message=str(e),
             )
         except Exception as _track_err:
             logger.warning(f"⚠️ doc-agent error activity tracking failed (non-fatal): {_track_err}")
@@ -6255,6 +6264,13 @@ async def _smart_anonymize_core(
                 status="error",
                 duration_ms=_duration_ms,
                 app_env=_attr.get("app_env"),
+                # Ohne diese beiden ist die Fehlerzeile in activities leer:
+                # 9 gescheiterte pdf-exports (28.07.2026, je ~133 s) liessen sich
+                # nachtraeglich nicht mehr erklaeren, weil weder Code noch Text
+                # gespeichert waren. _record_document_call_metrics bekam den Typ
+                # schon, die Kundendaten-Zeile nicht.
+                error_code=type(e).__name__,
+                error_message=str(e),
             )
         except Exception as _te:
             logger.warning(f"anonymisierung error tracking failed (non-blocking): {_te}")
@@ -6615,6 +6631,13 @@ async def convert_html_to_pdf_endpoint(
                 status="error",
                 duration_ms=_duration_ms,
                 app_env=_attr.get("app_env"),
+                # Ohne diese beiden ist die Fehlerzeile in activities leer:
+                # 9 gescheiterte pdf-exports (28.07.2026, je ~133 s) liessen sich
+                # nachtraeglich nicht mehr erklaeren, weil weder Code noch Text
+                # gespeichert waren. _record_document_call_metrics bekam den Typ
+                # schon, die Kundendaten-Zeile nicht.
+                error_code=type(e).__name__,
+                error_message=str(e),
             )
         except Exception as _te:
             logger.warning(f"pdf-export error tracking failed (non-blocking): {_te}")
@@ -6710,6 +6733,13 @@ async def convert_html_to_screenshot_endpoint(
                 status="error",
                 duration_ms=_duration_ms,
                 app_env=_attr.get("app_env"),
+                # Ohne diese beiden ist die Fehlerzeile in activities leer:
+                # 9 gescheiterte pdf-exports (28.07.2026, je ~133 s) liessen sich
+                # nachtraeglich nicht mehr erklaeren, weil weder Code noch Text
+                # gespeichert waren. _record_document_call_metrics bekam den Typ
+                # schon, die Kundendaten-Zeile nicht.
+                error_code=type(e).__name__,
+                error_message=str(e),
             )
         except Exception as _te:
             logger.warning(f"screenshot error tracking failed (non-blocking): {_te}")
@@ -7235,6 +7265,9 @@ async def audio_transcriptions(
                 duration_ms=int((time.time() - _start) * 1000),
                 error_code=str(e.response.status_code),
                 app_env=_attr.get("app_env"),
+                # Der error_code hier ist eine feste Kennung und erklaert nichts —
+                # ohne den Text bleibt offen, WARUM der Call scheiterte.
+                error_message=str(e),
             )
         except Exception as _te:
             logger.warning(f"transkription error tracking failed (non-blocking): {_te}")
@@ -7259,6 +7292,9 @@ async def audio_transcriptions(
                 duration_ms=int((time.time() - _start) * 1000),
                 error_code="500",
                 app_env=_attr.get("app_env"),
+                # Der error_code hier ist eine feste Kennung und erklaert nichts —
+                # ohne den Text bleibt offen, WARUM der Call scheiterte.
+                error_message=str(e),
             )
         except Exception as _te:
             logger.warning(f"transkription error tracking failed (non-blocking): {_te}")
