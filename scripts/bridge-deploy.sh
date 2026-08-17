@@ -26,6 +26,11 @@ REMOTE_REPO="/root/werkingflow-bridge"
 # SHA the running images were built from, written by a finished deploy. Untracked
 # on purpose (pre-flight allows untracked files) — it is host state, not source.
 DEPLOYED_SHA_FILE="${REMOTE_REPO}/.bridge-deployed-sha"
+# Per-SERVICE release manifest (commit + image ID per container), written by a
+# finished deploy. Same "host state, not source" rule as DEPLOYED_SHA_FILE —
+# untracked, never captured back into the repo. See write_release_manifest()
+# for what it records and bridge-drift-check.sh for how it is used.
+RELEASE_MANIFEST_FILE="${REMOTE_REPO}/.bridge-release-manifest.json"
 HETZNER_COMPOSE="-f docker/docker-compose.yml -f docker/docker-compose-platform-overlay.yml"
 SERVER2_COMPOSE="-f docker/docker-compose-prod.yml -f docker/docker-compose-prod-platform.yml"
 # Worker init on a fresh container is much slower than expected: container
@@ -1306,6 +1311,122 @@ REMOTE
     return 0
 }
 
+# ============================================================================
+# Release manifest — records what SHOULD be running, per service, per host
+# ============================================================================
+# Complements DEPLOYED_SHA_FILE (one commit for the whole host) with a
+# per-SERVICE record: container name, image ID, commit, timestamp. A partial
+# deploy (`bridge-deploy.sh hetzner nginx`) only touches nginx's entry — the
+# other services keep their last-recorded state, because they are genuinely
+# still running what they last recorded.
+#
+# This is the "should be running" half of drift detection. The "is running"
+# half is a live `docker inspect` against the container; bridge-drift-check.sh
+# compares the two so an out-of-band change (manual restart onto a stale
+# image, hand-pulled image, host-level container recreate) is visible within
+# minutes via a cron, instead of only surfacing at the next deploy's Phase 1
+# provenance check (which only runs when someone deploys — see the 2026-07-31
+# server2 incident referenced there: checkout ahead of running images for
+# days, unnoticed).
+#
+# Host-local and gitignored on purpose — like DEPLOYED_SHA_FILE, this is
+# runtime STATE, not architecture, and must never be captured back into the
+# repo (the exact "edit on Hetzner → capture drift back" anti-pattern ADR-0006
+# exists to kill). Written best-effort: a failure here must never fail an
+# otherwise-successful deploy, matching the DEPLOYED_SHA_FILE write.
+write_release_manifest() {
+    local host="$1" server_name="$2" server_prefix="$3" current_sha="$4"
+    shift 4
+    local services=("$@")
+    [[ ${#services[@]} -eq 0 ]] && return 0
+
+    local pairs="" svc c
+    for svc in "${services[@]}"; do
+        c=$(container_for_svc "$server_prefix" "$svc")
+        pairs+="${svc} ${c}"$'\n'
+    done
+    # base64-transport: container/service names are safe today, but this
+    # avoids ever having to reason about heredoc-quoting edge cases as names
+    # change (same defensive move as phase_reconcile_worker_key's key_b64).
+    local pairs_b64
+    pairs_b64=$(printf '%s' "$pairs" | base64 -w0)
+
+    local result
+    result=$(rssh_run "$host" <<EOF
+MANIFEST_FILE="${RELEASE_MANIFEST_FILE}"
+DEPLOYED_SHA="${current_sha}"
+SVC_PAIRS_B64="${pairs_b64}"
+SERVER_NAME="${server_name}"
+python3 - "\$MANIFEST_FILE" "\$DEPLOYED_SHA" "\$SVC_PAIRS_B64" "\$SERVER_NAME" <<'PYEOF'
+import base64, datetime, json, os, subprocess, sys, tempfile
+
+manifest_file, commit, pairs_b64, server_name = sys.argv[1:5]
+pairs = base64.b64decode(pairs_b64).decode()
+now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+
+try:
+    with open(manifest_file) as f:
+        manifest = json.load(f)
+except Exception:
+    manifest = {}
+manifest["server_name"] = server_name
+services = manifest.setdefault("services", {})
+
+for line in pairs.splitlines():
+    line = line.strip()
+    if not line:
+        continue
+    svc, container = line.split(" ", 1)
+    try:
+        image_id = subprocess.run(
+            ["docker", "inspect", "--format", "{{.Image}}", container],
+            capture_output=True, text=True, timeout=15, check=True,
+        ).stdout.strip()
+    except Exception as e:
+        print(f"MANIFEST_WARN {svc}: docker inspect failed: {e}", file=sys.stderr)
+        continue
+    if not image_id:
+        print(f"MANIFEST_WARN {svc}: empty image id from docker inspect", file=sys.stderr)
+        continue
+    services[svc] = {
+        "container": container,
+        "image_id": image_id,
+        "deployed_commit": commit,
+        "deployed_at": now,
+    }
+
+manifest["updated_at"] = now
+
+d = os.path.dirname(manifest_file) or "."
+fd, tmp = tempfile.mkstemp(dir=d, prefix=".manifest.")
+try:
+    with os.fdopen(fd, "w") as f:
+        json.dump(manifest, f, indent=2, sort_keys=True)
+        f.write("\n")
+    os.replace(tmp, manifest_file)
+except Exception:
+    os.unlink(tmp)
+    raise
+print("MANIFEST_OK")
+PYEOF
+EOF
+    ) 2>&1
+    local rc=$?
+    while IFS= read -r line; do
+        [[ -z "$line" ]] && continue
+        case "$line" in
+            MANIFEST_OK) ;;
+            MANIFEST_WARN*) warn "  ${line#MANIFEST_WARN }" ;;
+            *) info "  manifest: ${line}" ;;
+        esac
+    done <<< "$result"
+    if [[ $rc -ne 0 ]] || ! echo "$result" | grep -q 'MANIFEST_OK'; then
+        warn "could not write release manifest on ${host} — drift detection may be stale until the next deploy"
+        return 1
+    fi
+    return 0
+}
+
 deploy_server() {
     local server_name="$1"
     local host compose all_services build_list server_prefix db_container
@@ -1464,6 +1585,7 @@ deploy_server() {
         # so it must be written by the only thing that knows: a finished deploy.
         rssh "$host" "printf '%s\n' '${current_sha}' > ${DEPLOYED_SHA_FILE}" \
             || warn "could not record deployed SHA on ${host} — the foreign-commit gate will fall back to the checkout HEAD next time"
+        write_release_manifest "$host" "$server_name" "$server_prefix" "$current_sha" "${DEPLOYED_SERVICES[@]}"
         info "Container states  :"
         for svc in "${DEPLOYED_SERVICES[@]}"; do
             local c

@@ -107,3 +107,8 @@ tests/integration/nginx-test.conf
 **/*.bak-pre-*
 docker/nginx.conf.bak.*
 backups/
+
+# Host-local deploy state written by bridge-deploy.sh — runtime STATE, not
+# source (ADR-0006). Never capture these back into the repo from a host.
+.bridge-deployed-sha
+.bridge-release-manifest.json

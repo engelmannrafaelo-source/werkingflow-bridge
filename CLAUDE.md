@@ -104,6 +104,30 @@ aber nie durch stillen Hand-Drift.
 
 **Prod-Cutover-Regel:** Prod nicht deployen, während eine Energy-Pipeline auf Prod läuft.
 
+### Deploy-Vollständigkeit: Zugangs-Matrix + Drift-Alarm (Rafael, 17.08.2026)
+
+Ein Bridge-Deploy kann technisch grün sein (Smoke, Distribution, Health) und trotzdem Apps am
+Entitlement aussperren — Bridge-Login 200 ist **kein** Beweis für Zugang (siehe globale CLAUDE.md
+„App-Zugaenge & Abos", Lehre vom 13.08.2026). Zwei ergänzende, read-only Mechanismen:
+
+1. **Zugangs-Matrix-Smoke** (`scripts/bridge-access-matrix-smoke.sh`): loggt einen Canary-User
+   (Infisical `<app>/prod` `SMOKE_LOGIN_EMAIL`/`SMOKE_LOGIN_PASSWORD` — dieselbe Konvention wie
+   `deploy-production`) je App (report/energy/noise) über den echten App-Login ein und verlangt
+   HTTP 200 auf der geschützten Seite (`/dashboard`, bei noise `/` — noise hat keine eigene
+   Dashboard-Route). Ein Bridge-Deploy gilt erst als **fertig geprüft**, wenn diese Matrix grün
+   ist — nicht wenn `bridge_smoke.py` grün ist (das prüft nur die Bridge selbst, niemanden
+   Bestimmtes). Fehlt ein Canary für eine App, bleibt sie `UNVERIFIED` (Exit 1) statt stillschweigend
+   als Pass zu zählen — Canary-Provisionierung ist ein kommerzieller Akt, gated auf Rafael.
+2. **Release-Manifest + Drift-Check**: jeder erfolgreiche Deploy schreibt
+   `${REMOTE_REPO}/.bridge-release-manifest.json` (host-lokal, wie `.bridge-deployed-sha` —
+   niemals ins Repo zurückgeholt) mit Commit + Image-ID je Service (`write_release_manifest()` in
+   `bridge-deploy.sh`, Phase 7). `scripts/bridge-drift-check.sh <hetzner|server2>` vergleicht das
+   gegen `docker inspect` auf dem Host — Out-of-band-Änderungen (manueller Restart auf ein
+   veraltetes Image, Hand-Pull, Host-Recreate) fallen so auf, bevor der nächste Deploy zufällig
+   draufstößt (Server2-Vorfall 31.07.2026: Checkout 2 Commits vor den laufenden Images, tagelang
+   unbemerkt). Läuft per Cron alle 5 Min (`orchestrator/bin/bridge-drift-watch.py`) → CUI-Inbox +
+   Mail bei Fund, derselbe Alarm-Kanal wie `kunden-fehler-watch.py`.
+
 ---
 
 ## Multi-Worker Architektur
@@ -260,7 +284,10 @@ ssh root@49.12.72.66 "docker system prune -a -f"   # bei Disk-Druck
 | `docker/docker-compose.yml` (+`-platform-overlay.yml`) | DEV-Stack |
 | `docker/docker-compose-prod.yml` (+`-prod-platform.yml`) | PROD-Stack |
 | `scripts/bridge-deploy.sh` | **einziger** Deploy-Pfad (gated, Rollback) |
-| `scripts/bridge-parity-check.sh` | Drift-/Currency-/Parity-Check |
+| `scripts/bridge-parity-check.sh` | Drift-/Currency-/Parity-Check (nginx/Config-Ebene) |
+| `scripts/bridge-access-matrix-smoke.sh` | Zugangs-Matrix: Canary-Login → echte App-Dashboard-Seite 200 |
+| `scripts/bridge-drift-check.sh` | Release-Manifest vs. laufende Container (Image-Ebene) |
+| `.bridge-deployed-sha`, `.bridge-release-manifest.json` | host-lokal, von `bridge-deploy.sh` geschrieben — nie ins Repo zurückholen |
 | `docs/adr/0006-*.md` | SSoT für das Single-Source-Modell |
 | `secrets/claude_token_*.txt` | Token-Dateien (host-lokal, nicht im Repo) |
 | `src/auth.py`, `src/claude_cli.py` | Auth + SDK-Integration |
