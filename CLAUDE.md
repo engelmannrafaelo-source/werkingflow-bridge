@@ -110,7 +110,9 @@ Ein Bridge-Deploy kann technisch grün sein (Smoke, Distribution, Health) und tr
 Entitlement aussperren — Bridge-Login 200 ist **kein** Beweis für Zugang (siehe globale CLAUDE.md
 „App-Zugaenge & Abos", Lehre vom 13.08.2026). Zwei ergänzende, read-only Mechanismen:
 
-1. **Zugangs-Matrix-Smoke** (`scripts/bridge-access-matrix-smoke.sh`): loggt einen Canary-User
+1. **Zugangs-Matrix-Smoke** (`scripts/access-matrix-smoke.sh <hetzner|server2> [--json]` — fester
+   Vertrag, verdrahtet von `orchestrator/bin/deploy-production`'s `bridge`-Pfad als Post-Deploy-
+   Nachkontrolle, nicht umbenennen ohne den Aufrufer anzupassen): loggt einen Canary-User
    (Infisical `<app>/prod` `SMOKE_LOGIN_EMAIL`/`SMOKE_LOGIN_PASSWORD` — dieselbe Konvention wie
    `deploy-production`) je App (report/energy/noise) über den echten App-Login ein und verlangt
    HTTP 200 auf der geschützten Seite (`/dashboard`, bei noise `/` — noise hat keine eigene
@@ -285,7 +287,7 @@ ssh root@49.12.72.66 "docker system prune -a -f"   # bei Disk-Druck
 | `docker/docker-compose-prod.yml` (+`-prod-platform.yml`) | PROD-Stack |
 | `scripts/bridge-deploy.sh` | **einziger** Deploy-Pfad (gated, Rollback) |
 | `scripts/bridge-parity-check.sh` | Drift-/Currency-/Parity-Check (nginx/Config-Ebene) |
-| `scripts/bridge-access-matrix-smoke.sh` | Zugangs-Matrix: Canary-Login → echte App-Dashboard-Seite 200 |
+| `scripts/access-matrix-smoke.sh` | Zugangs-Matrix: Canary-Login → echte App-Dashboard-Seite 200 |
 | `scripts/bridge-drift-check.sh` | Release-Manifest vs. laufende Container (Image-Ebene) |
 | `.bridge-deployed-sha`, `.bridge-release-manifest.json` | host-lokal, von `bridge-deploy.sh` geschrieben — nie ins Repo zurückholen |
 | `docs/adr/0006-*.md` | SSoT für das Single-Source-Modell |

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# bridge-access-matrix-smoke.sh — proves that a REAL customer could log in and
-# reach their app, not just that the Bridge answered 200.
+# access-matrix-smoke.sh — proves that a REAL customer could log in and reach
+# their app, not just that the Bridge answered 200.
 #
 # WHY THIS EXISTS (Rafael, 17.08.2026)
 # -------------------------------------------------------------------------
@@ -50,26 +50,47 @@
 # a missing canary is a decision for Rafael (see global CLAUDE.md), not this
 # script — it documents the gap and stops there.
 #
-# USAGE
-#   scripts/bridge-access-matrix-smoke.sh                # full matrix, human output
-#   scripts/bridge-access-matrix-smoke.sh --json          # machine-readable summary line
+# CALLING CONTRACT (fixed by orchestrator/bin/deploy-production's "bridge"
+# path, commits a204fd2+db817b0 — see memory deploy-production-bridge-gate;
+# do NOT rename this script or its argument shape without updating that
+# caller too):
+#   scripts/access-matrix-smoke.sh <hetzner|server2>            # human output
+#   scripts/access-matrix-smoke.sh <hetzner|server2> --json     # machine-readable
+#
+# The host argument identifies which bridge host was just deployed — it is
+# validated and logged, but does NOT change which apps get probed: report/
+# energy/noise each have exactly one production entitlement configuration
+# (whichever bridge their prod AI_BRIDGE_URL currently points to), so the
+# real login→dashboard chain already exercises whatever is actually serving
+# that app right now. There is no separate "hetzner-flavoured" or
+# "server2-flavoured" app entitlement to probe differently.
 #
 # EXIT CODES
 #   0 = every app has a canary AND its login→dashboard chain returned a real 200
 #   1 = at least one app FAILED (canary rejected, or entitled page not reachable)
 #       or is UNVERIFIED (no canary configured in Infisical)
-#   2 = the check itself could not run (Infisical unreachable, contract file
-#       missing/unparseable, curl/network plumbing broken) — distinct from "1"
-#       because it says nothing about whether access actually works
+#   2 = the check itself could not run (bad usage, Infisical unreachable,
+#       contract file missing/unparseable, curl/network plumbing broken) —
+#       distinct from "1" because it says nothing about whether access works
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ENV_CONTRACTS="/root/projekte/werkingflow-production/packages/config/env-contracts.json"
+
+HOST_ARG="${1:-}"
+case "$HOST_ARG" in
+    hetzner|server2) ;;
+    *)
+        echo "Usage: access-matrix-smoke.sh <hetzner|server2> [--json]" >&2
+        exit 2
+        ;;
+esac
+shift
 JSON_OUT=false
 [[ "${1:-}" == "--json" ]] && JSON_OUT=true
 
-log()  { [[ "$JSON_OUT" == "true" ]] || echo "[access-matrix] $*"; }
-fail() { [[ "$JSON_OUT" == "true" ]] || echo "[access-matrix] FAIL: $*" >&2; }
+log()  { [[ "$JSON_OUT" == "true" ]] || echo "[access-matrix:${HOST_ARG}] $*"; }
+fail() { [[ "$JSON_OUT" == "true" ]] || echo "[access-matrix:${HOST_ARG}] FAIL: $*" >&2; }
 
 if [[ ! -f "$ENV_CONTRACTS" ]]; then
     echo "[access-matrix] ABORT: contract file missing: ${ENV_CONTRACTS}" >&2
