@@ -37,6 +37,10 @@ services:
       # Per-topology worker set: worker-sahori/worker-kurt + dev-bridge backup
       # (Model-B). envsubst'd to /tmp/upstreams.conf in the command below.
       - ./upstreams-prod.conf:/etc/nginx/upstreams.conf:ro
+      # Worker name -> network target for the direct-worker debug route
+      # (ADR-0009). Empty/comment-only until a worker is actually moved off
+      # this host onto a worker-host — see docs/adr/0007-*.md.
+      - ./worker-map-prod.conf:/etc/nginx/worker-map.conf:ro
       - ./routes-metrics-reader.conf:/etc/nginx/routes-metrics-reader.conf:ro
       - ./routes-platform-api.conf:/etc/nginx/routes-platform-api.conf:ro
       - ../logs/nginx:/var/log/nginx
@@ -49,7 +53,7 @@ services:
       - BRIDGE_WORKERS=worker-sahori,worker-kurt,worker-coach,worker-erk
     # envsubst nginx.conf + the upstreams include (both need ${BRIDGE_BACKUP_HOST}),
     # then start openresty. Same mechanism as the primary compose.
-    command: ["/bin/sh", "-c", "envsubst '$$BRIDGE_BACKUP_HOST $$BRIDGE_ID' < /etc/nginx/nginx.conf > /tmp/nginx.conf && envsubst '$$BRIDGE_BACKUP_HOST' < /etc/nginx/upstreams.conf > /tmp/upstreams.conf && openresty -c /tmp/nginx.conf -g 'daemon off;'"]
+    command: ["/bin/sh", "-c", "envsubst '$$BRIDGE_BACKUP_HOST $$BRIDGE_ID' < /etc/nginx/nginx.conf > /tmp/nginx.conf && envsubst '$$BRIDGE_BACKUP_HOST' < /etc/nginx/upstreams.conf > /tmp/upstreams.conf && cp /etc/nginx/worker-map.conf /tmp/worker-map.conf && openresty -c /tmp/nginx.conf -g 'daemon off;'"]
     depends_on:
       - worker-sahori
       - worker-kurt
@@ -615,6 +619,13 @@ services:
       - LOG_LEVEL=INFO
       - TZ=Europe/Vienna
       - BRIDGE_WORKERS=worker-sahori,worker-kurt,worker-coach,worker-erk
+      # ADR-0009 (worker-host separation): optional "name=host:port,..."
+      # override for polling a worker that no longer lives on THIS host —
+      # empty here (all four workers still co-located) means every worker
+      # resolves via same-host DNS, exactly as before this variable existed.
+      # Populate at the gated cutover; keep in sync with
+      # generate-bridge-upstreams.sh's PROD_WORKER_TARGETS (nginx-side twin).
+      - BRIDGE_WORKER_TARGETS=${BRIDGE_WORKER_TARGETS:-}
     healthcheck:
       # Echten Aggregationspfad pruefen, nicht nur den uvicorn-Master (siehe
       # dev-Compose): 4 Worker-Polls x 3s Worst-Case → max-time 16s. War 8s

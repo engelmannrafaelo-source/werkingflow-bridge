@@ -26,12 +26,32 @@
 # Regenerate + commit when the worker set changes (rare). Do NOT hand-edit the
 # generated files — the header marks them, and bridge-parity-check.sh compares the
 # in-container copy against the repo copy to catch drift.
+#
+# --- Worker-host separation (ADR-0009) -------------------------------------
+# A worker name is a Docker Compose SERVICE NAME by default, resolved via the
+# embedded Docker DNS (127.0.0.11) to a container on the SAME host/network —
+# that is why `server ${w}:8000` has always been enough. ADR-0009 moves prod
+# workers onto a separate host (they no longer share a Docker network with
+# the LB), so some names need an explicit network TARGET instead of relying
+# on same-host DNS. PROD_WORKER_TARGETS is that override: empty by default
+# (= today's exact behaviour, byte-identical generated output), populated
+# per-worker only at the gated cutover described in ADR-0009. The worker's
+# NAME (billing/account identity, read live from account-pool-state's
+# `.worker` field — see pool_router.lua) never changes; only WHERE nginx
+# connects to reach it does. Do not repurpose this table for anything else.
 # =============================================================================
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 OUT_DIR="${ROOT}/docker"
+
+PRIMARY_WORKERS=(worker1 worker2 worker3 worker4)
+PROD_WORKERS=(worker-sahori worker-kurt worker-coach worker-erk)
+declare -A PRIMARY_WORKER_TARGETS=()
+declare -A PROD_WORKER_TARGETS=()
+# Example cutover entry (do not uncomment without ADR-0009's gated migration):
+#   PROD_WORKER_TARGETS[worker-sahori]="100.93.143.105:8001"
 
 # --- Topology table (single source of the per-bridge worker set) -------------
 # primary: default pool has NO cross-host backup (dev/prod isolation — a dev
@@ -40,22 +60,59 @@ OUT_DIR="${ROOT}/docker"
 # production: the default pool backs up to the dev bridge (Model-B resilience:
 #          both prod workers exhausted/down -> dev bridge serves). claude_production
 #          is the same pool (prod has no separate "production reserve" to route to).
-PRIMARY_WORKERS=(worker1 worker2 worker3 worker4)
-PROD_WORKERS=(worker-sahori worker-kurt worker-coach worker-erk)
+
+# $1 = worker name, $2 = NAME (string) of the associative targets array in
+# scope (e.g. "PROD_WORKER_TARGETS") -> "host:port", defaulting to the
+# same-host-DNS target. Reads the array via indirect expansion rather than a
+# nameref so nested callers (emit_upstream/emit_worker_map) never collide
+# names with this function's own local (bash namerefs referencing a nameref
+# of the same name in an enclosing scope raise "circular name reference").
+resolve_target() {
+    local worker="$1" arrname="$2" key
+    key="${arrname}[${worker}]"
+    if [[ -n "${!key+x}" ]]; then
+        echo "${!key}"
+    else
+        echo "${worker}:8000"
+    fi
+}
 
 emit_upstream() {
-    # $1 = upstream name, $2 = keepalive, $3 = "backup"|"nobackup", then worker names
-    local name="$1"; local keepalive="$2"; local backup="$3"; shift 3
+    # $1 = upstream name, $2 = keepalive, $3 = "backup"|"nobackup",
+    # $4 = targets-array NAME (string), then worker names
+    local name="$1"; local keepalive="$2"; local backup="$3"; local targets_name="$4"; shift 4
     echo "upstream ${name} {"
-    local w
+    local w target
     for w in "$@"; do
-        echo "    server ${w}:8000 weight=1 max_fails=0;"
+        target="$(resolve_target "$w" "$targets_name")"
+        echo "    server ${target} weight=1 max_fails=0;"
     done
     if [ "$backup" = "backup" ]; then
         echo "    server \${BRIDGE_BACKUP_HOST}:8000 backup max_fails=1 fail_timeout=10s;"
     fi
     echo "    keepalive ${keepalive};"
     echo "}"
+}
+
+# Emits the nginx `map` body (just the entries, caller wraps the map{} block)
+# resolving a worker NAME to its network TARGET for the direct-worker debug
+# route (docker/nginx.conf `location ~ ^/(worker[a-zA-Z0-9_-]+)/(.*)$`).
+# Only emits a line when the target differs from the same-host-DNS default —
+# an empty/no-override topology therefore emits a comment-only file, which is
+# valid nginx and preserves today's `default $direct_worker:8000;` behaviour.
+emit_worker_map() {
+    local targets_name="$1"; shift
+    local w target has_override=0
+    for w in "$@"; do
+        target="$(resolve_target "$w" "$targets_name")"
+        if [[ "$target" != "${w}:8000" ]]; then
+            echo "    ${w} ${target};"
+            has_override=1
+        fi
+    done
+    if [[ "$has_override" -eq 0 ]]; then
+        echo "    # no remote workers for this topology — default \$direct_worker:8000 applies"
+    fi
 }
 
 # NOTE (2026-07-30): the per-worker `map $target_worker $target_dest` that used
@@ -72,15 +129,17 @@ emit_upstream() {
 generate() {
     local id="$1"
     local -a workers
-    local default_backup
+    local default_backup targets_name
     case "$id" in
         primary)
             workers=("${PRIMARY_WORKERS[@]}")
             default_backup="nobackup"   # isolation: default pool must not spill to prod
+            targets_name="PRIMARY_WORKER_TARGETS"
             ;;
         production)
             workers=("${PROD_WORKERS[@]}")
             default_backup="backup"     # Model-B: default pool backs up to dev bridge
+            targets_name="PROD_WORKER_TARGETS"
             ;;
         *)
             echo "ERROR: unknown topology '$id' (primary|production)" >&2
@@ -104,22 +163,54 @@ generate() {
 HEADER
 
     echo "# Round-robin default pool (used by /health, Lua-routed /v1 SSE, default /)."
-    emit_upstream claude_workers 32 "$default_backup" "${workers[@]}"
+    emit_upstream claude_workers 32 "$default_backup" "$targets_name" "${workers[@]}"
     echo
 
     echo "# Production-priority pool (X-Priority: production). Backs up to"
     echo "# \${BRIDGE_BACKUP_HOST}: Server-2 on primary, the dev bridge on production."
-    emit_upstream claude_production 16 backup "${workers[@]}"
+    emit_upstream claude_production 16 backup "$targets_name" "${workers[@]}"
+}
+
+generate_worker_map() {
+    local id="$1"
+    local -a workers
+    local targets_name
+    case "$id" in
+        primary)    workers=("${PRIMARY_WORKERS[@]}"); targets_name="PRIMARY_WORKER_TARGETS" ;;
+        production) workers=("${PROD_WORKERS[@]}");    targets_name="PROD_WORKER_TARGETS" ;;
+        *) echo "ERROR: unknown topology '$id' (primary|production)" >&2; return 1 ;;
+    esac
+
+    cat <<HEADER
+# =============================================================================
+# AUTO-GENERATED by scripts/generate-bridge-upstreams.sh ${id} — DO NOT EDIT
+# =============================================================================
+# nginx \`map \$direct_worker \$worker_target\` body for the direct-worker debug
+# route (docker/nginx.conf). Resolves a worker NAME to its network TARGET when
+# that worker lives on a separate host (ADR-0009); same-host workers fall
+# through to the map's own \`default \$direct_worker:8000;\`, unchanged.
+#   topology : ${id}
+# =============================================================================
+HEADER
+    emit_worker_map "$targets_name" "${workers[@]}"
 }
 
 main() {
     local target="${1:-all}"
     case "$target" in
-        primary)    generate primary    > "${OUT_DIR}/upstreams-primary.conf"; echo "[gen] wrote docker/upstreams-primary.conf" ;;
-        production) generate production  > "${OUT_DIR}/upstreams-prod.conf";    echo "[gen] wrote docker/upstreams-prod.conf" ;;
+        primary)
+            generate primary > "${OUT_DIR}/upstreams-primary.conf"; echo "[gen] wrote docker/upstreams-primary.conf"
+            generate_worker_map primary > "${OUT_DIR}/worker-map-primary.conf"; echo "[gen] wrote docker/worker-map-primary.conf"
+            ;;
+        production)
+            generate production > "${OUT_DIR}/upstreams-prod.conf"; echo "[gen] wrote docker/upstreams-prod.conf"
+            generate_worker_map production > "${OUT_DIR}/worker-map-prod.conf"; echo "[gen] wrote docker/worker-map-prod.conf"
+            ;;
         all)
-            generate primary    > "${OUT_DIR}/upstreams-primary.conf"; echo "[gen] wrote docker/upstreams-primary.conf"
-            generate production  > "${OUT_DIR}/upstreams-prod.conf";    echo "[gen] wrote docker/upstreams-prod.conf"
+            generate primary > "${OUT_DIR}/upstreams-primary.conf"; echo "[gen] wrote docker/upstreams-primary.conf"
+            generate_worker_map primary > "${OUT_DIR}/worker-map-primary.conf"; echo "[gen] wrote docker/worker-map-primary.conf"
+            generate production > "${OUT_DIR}/upstreams-prod.conf"; echo "[gen] wrote docker/upstreams-prod.conf"
+            generate_worker_map production > "${OUT_DIR}/worker-map-prod.conf"; echo "[gen] wrote docker/worker-map-prod.conf"
             ;;
         *) echo "Usage: generate-bridge-upstreams.sh [primary|production|all]" >&2; exit 1 ;;
     esac

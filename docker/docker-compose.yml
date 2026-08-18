@@ -18,6 +18,10 @@ services:
       # Per-topology worker set (ADR-0006 B/C) — envsubst'd to /tmp/upstreams.conf
       # in the command below (resolves ${BRIDGE_BACKUP_HOST}), then included by nginx.conf.
       - ./upstreams-primary.conf:/etc/nginx/upstreams.conf:ro
+      # Worker name -> network target for the direct-worker debug route
+      # (ADR-0009). No env vars to resolve — copied to /tmp verbatim in the
+      # command below, same include path pattern as upstreams.conf.
+      - ./worker-map-primary.conf:/etc/nginx/worker-map.conf:ro
       - ./routes-metrics-reader.conf:/etc/nginx/routes-metrics-reader.conf:ro
       - ./routes-platform-api.conf:/etc/nginx/routes-platform-api.conf:ro
       - ../logs/nginx:/var/log/nginx
@@ -30,7 +34,7 @@ services:
       - BRIDGE_WORKERS=worker1,worker2,worker3,worker4
     # envsubst nginx.conf + the upstreams include (both need ${BRIDGE_BACKUP_HOST}),
     # then start openresty. nginx.conf does `include /tmp/upstreams.conf`.
-    command: ["/bin/sh", "-c", "envsubst '$$BRIDGE_BACKUP_HOST $$BRIDGE_ID' < /etc/nginx/nginx.conf > /tmp/nginx.conf && envsubst '$$BRIDGE_BACKUP_HOST' < /etc/nginx/upstreams.conf > /tmp/upstreams.conf && openresty -c /tmp/nginx.conf -g 'daemon off;'"]
+    command: ["/bin/sh", "-c", "envsubst '$$BRIDGE_BACKUP_HOST $$BRIDGE_ID' < /etc/nginx/nginx.conf > /tmp/nginx.conf && envsubst '$$BRIDGE_BACKUP_HOST' < /etc/nginx/upstreams.conf > /tmp/upstreams.conf && cp /etc/nginx/worker-map.conf /tmp/worker-map.conf && openresty -c /tmp/nginx.conf -g 'daemon off;'"]
     depends_on:
       - worker1
       - worker2

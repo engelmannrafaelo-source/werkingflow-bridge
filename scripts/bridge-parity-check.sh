@@ -32,11 +32,13 @@ case "$SERVER" in
         HOST="49.12.72.66"
         NGINX_CONTAINER="wt-wrapper-lb"
         UPSTREAMS_REPO="upstreams-primary.conf"
+        WORKER_MAP_REPO="worker-map-primary.conf"
         ;;
     server2)
         HOST="178.104.178.79"
         NGINX_CONTAINER="wt-prod-lb"
         UPSTREAMS_REPO="upstreams-prod.conf"
+        WORKER_MAP_REPO="worker-map-prod.conf"
         ;;
     *)
         echo "Usage: bridge-parity-check.sh <hetzner|server2>" >&2
@@ -133,7 +135,7 @@ done
 # from a DIFFERENT repo filename per bridge (upstreams-primary.conf vs
 # upstreams-prod.conf). Verify the mounted source (pre-envsubst) matches the repo
 # file, so a hand-edit of the worker set fails here, not in production.
-log "check 4/4: upstreams include (${UPSTREAMS_REPO}) == /etc/nginx/upstreams.conf"
+log "check 4/5: upstreams include (${UPSTREAMS_REPO}) == /etc/nginx/upstreams.conf"
 up_sums=$(rssh "
     repo_sum=\$(sha256sum ${REMOTE_REPO}/docker/${UPSTREAMS_REPO} 2>/dev/null | awk '{print \$1}')
     cont_sum=\$(docker exec ${NGINX_CONTAINER} sha256sum /etc/nginx/upstreams.conf 2>/dev/null | awk '{print \$1}')
@@ -149,6 +151,31 @@ if [ -n "${up_sums:-}" ]; then
         fail "${UPSTREAMS_REPO}: container copy != repo copy (repo ${up_repo:0:12} vs container ${up_cont:0:12})"
     else
         log "  OK  ${UPSTREAMS_REPO} (${up_repo:0:12})"
+    fi
+fi
+
+# --- Check 5: WORKER-MAP include (per-topology, ADR-0009) --------------------
+# Same drift class as check 4, for the worker name -> network target map the
+# direct-worker debug route uses. Mounted at /etc/nginx/worker-map.conf from a
+# per-bridge repo file (worker-map-primary.conf / worker-map-prod.conf). Empty
+# today (no worker has moved off-host yet); still checked so a future
+# hand-edit here fails the SAME way a hand-edited upstreams file would.
+log "check 5/5: worker-map include (${WORKER_MAP_REPO}) == /etc/nginx/worker-map.conf"
+wm_sums=$(rssh "
+    repo_sum=\$(sha256sum ${REMOTE_REPO}/docker/${WORKER_MAP_REPO} 2>/dev/null | awk '{print \$1}')
+    cont_sum=\$(docker exec ${NGINX_CONTAINER} sha256sum /etc/nginx/worker-map.conf 2>/dev/null | awk '{print \$1}')
+    echo \"\${repo_sum:-MISSING_REPO} \${cont_sum:-MISSING_CONTAINER}\"
+") || fail "cannot compare ${WORKER_MAP_REPO} on host"
+if [ -n "${wm_sums:-}" ]; then
+    wm_repo="${wm_sums%% *}"; wm_cont="${wm_sums##* }"
+    if [ "$wm_repo" = "MISSING_REPO" ]; then
+        fail "${WORKER_MAP_REPO}: not present in host repo (${REMOTE_REPO}/docker/${WORKER_MAP_REPO})"
+    elif [ "$wm_cont" = "MISSING_CONTAINER" ]; then
+        fail "worker-map.conf: not mounted in ${NGINX_CONTAINER} at /etc/nginx/worker-map.conf (host repo behind the ADR-0009 rollout?)"
+    elif [ "$wm_repo" != "$wm_cont" ]; then
+        fail "${WORKER_MAP_REPO}: container copy != repo copy (repo ${wm_repo:0:12} vs container ${wm_cont:0:12})"
+    else
+        log "  OK  ${WORKER_MAP_REPO} (${wm_repo:0:12})"
     fi
 fi
 

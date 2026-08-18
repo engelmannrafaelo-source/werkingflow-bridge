@@ -1,0 +1,219 @@
+# =============================================================================
+# Worker-Host Compose — ADR-0009 (bridge worker/DB separation)
+# =============================================================================
+# Runs ONLY the LLM worker containers, on a host that is NOT the customer-
+# facing production-barrier. No nginx-LB, no Postgres, no platform-api here —
+# those stay on production-barrier (178.104.178.79); this host is compute
+# capacity the production-barrier's nginx reaches over the network instead of
+# via same-host Docker DNS.
+#
+# Why this exists (see docs/adr/0009-bridge-worker-host-separation.md for the
+# full design): production-barrier is an 8GB host running Postgres (customer
+# data, billing, entitlements) AND four 4GB-limited worker containers side by
+# side (20GB of limits promised on 7.6GB real) — a worker OOM can pick the
+# database as its neighbour's victim. Moving workers off that host onto their
+# own machine removes that blast radius. The database and its callers
+# (platform-api, and — see the OPEN ITEM below — the workers' own direct
+# Postgres connection) stay put; only LLM compute moves.
+#
+# Usage (deploy machinery — see scripts/bridge-deploy.sh's `prod-workers`
+# server target, NOT invoked directly by a session against this file):
+#   docker compose -f docker-compose-worker-host.yml up -d --build
+#
+# =============================================================================
+# OPEN ITEM — do not `up` this file expecting a working worker without first
+# reading this (see the ADR for the full writeup):
+#
+#   Workers connect to Postgres DIRECTLY (BRIDGE_DB_URL in secrets/platform.env,
+#   hostname `postgres-prod`, durable /v1/jobs + budget/activity gate — see
+#   docker-compose-prod-platform.yml's comment on the worker `env_file:`
+#   overlay). That hostname only resolves inside production-barrier's
+#   `bridge-prod-net` Docker network. A worker-host worker needs platform.env
+#   rewritten to point BRIDGE_DB_URL at a network address that actually
+#   reaches production-barrier's Postgres — which today does not listen
+#   anywhere but `bridge-prod-net` (`expose: "5432"`, deliberately not
+#   published, "reduces attack surface" per its own compose comment). Opening
+#   that port (even Tailscale-only) is a decision about the customer database,
+#   not a script change — it is NOT made by this file and must not be made
+#   without Rafael's explicit sign-off in the deploying session, same bar as
+#   any other live-Bridge change.
+#
+#   Until that decision is made and executed, containers built from this file
+#   will start (LLM proxying itself has no DB dependency) but the durable
+#   /v1/jobs path and the budget/activity gate will fail for them — do not
+#   cut nginx traffic over before that path is verified end-to-end.
+# =============================================================================
+
+x-worker-env-common: &worker-env-common
+  TZ: Europe/Vienna
+  LOG_LEVEL: INFO
+  LOG_TO_FILE: "true"
+  FILTER_SENSITIVE_DATA: "true"
+  BRIDGE_GENERIC_JOBS_ENABLED: "true"
+  BRIDGE_SCHOLARLY_ENABLED: "true"
+  CORE_API_KEY: ${CORE_API_KEY:-}
+  BRIDGE_APP_TIER_POLICY_ENABLED: "true"
+  PREPAID_VISION_DAILY_CAP_ENABLED: "true"
+  PREPAID_VISION_DAILY_CAP_EUR: "90"
+  BRIDGE_CHAT_JOB_TIMEOUT_S: "2400"
+  ADAPTIVE_INITIAL_CAP_TOKENS: "1000000"
+  ADAPTIVE_FLOOR_TOKENS: "500000"
+  ADAPTIVE_CEILING_TOKENS: "4000000"
+  ADAPTIVE_GROW_TRIGGER_SEC: "300"
+  ADAPTIVE_GROW_FACTOR: "1.10"
+  ADAPTIVE_QUEUE_WAIT_SEC: "5"
+  ADAPTIVE_WEEKLY_PREDICTIVE_THROTTLE: "true"
+  CLAUDE_CWD: /app/instances
+  DISABLE_COACH_MCP: "true"
+  MAX_TIMEOUT: "2400000"
+  API_TIMEOUT_MS: "2400000"
+  CLAUDE_CODE_MAX_OUTPUT_TOKENS: "64000"
+  CLAUDE_PERMISSION_MODE: bypassPermissions
+  TAVILY_API_KEY: ${TAVILY_API_KEY}
+  ANTHROPIC_VISION_API_KEY: ${ANTHROPIC_API_KEY}
+  RESEARCH_CLOUD_API_KEY: ${ANTHROPIC_API_KEY:-}
+  RESEARCH_CLOUD_ENABLED: ${RESEARCH_CLOUD_ENABLED:-}
+  RESEARCH_LIBRARY_ENABLED: ${RESEARCH_LIBRARY_ENABLED:-}
+  RESEARCH_LIBRARY_S3_ENDPOINT_URL: ${RESEARCH_LIBRARY_S3_ENDPOINT_URL:-}
+  RESEARCH_LIBRARY_S3_BUCKET: ${RESEARCH_LIBRARY_S3_BUCKET:-}
+  RESEARCH_LIBRARY_S3_ACCESS_KEY_ID: ${RESEARCH_LIBRARY_S3_ACCESS_KEY_ID:-}
+  RESEARCH_LIBRARY_S3_SECRET_ACCESS_KEY: ${RESEARCH_LIBRARY_S3_SECRET_ACCESS_KEY:-}
+  RESEARCH_LIBRARY_S3_REGION: ${RESEARCH_LIBRARY_S3_REGION:-}
+  OPENAI_API_KEY: ${OPENAI_API_KEY}
+  STT_PROVIDER: ${STT_PROVIDER:-openai}
+  OPENAI_STT_BASE_URL: ${OPENAI_STT_BASE_URL:-}
+  OPENAI_STT_MODEL: ${OPENAI_STT_MODEL:-}
+  AWS_STT_SAGEMAKER_ENDPOINT: ${AWS_STT_SAGEMAKER_ENDPOINT:-}
+  AWS_STT_REGION: ${AWS_STT_REGION:-}
+  PRIVACY_ENABLED: "true"
+  PRIVACY_LANGUAGE: de
+  PRIVACY_LOG_DETECTIONS: "false"
+  SKIP_SDK_VERIFICATION: "true"
+  RATE_LIMIT_ENABLED: "false"
+  DEFAULT_PRIVACY_MODE: none
+  # Same GPU-privacy host as production-barrier's workers today — reachable
+  # over Tailscale from ANY host on the tailnet, this host included. No
+  # change needed here at cutover.
+  PRIVACY_SERVICE_URL: ${PRIVACY_SERVICE_URL:-http://100.65.149.39:8100}
+  BRIDGE_ANONYMIZE_ENABLED: "true"
+
+x-worker-common: &worker-common
+  build:
+    context: ..
+    dockerfile: docker/Dockerfile.worker
+    args:
+      GIT_COMMIT: ${GIT_COMMIT:-unknown}
+  # Published (not `expose:`) — this host does not share a Docker network
+  # with production-barrier's nginx, so the LB must reach each worker over
+  # the network. Bound to the Tailscale interface ONLY (default = this host's
+  # tailnet IP; override if it ever changes) — never the public IP. The
+  # Hetzner firewall (fw-prod-bridge) independently allows all-TCP only from
+  # 100.64.0.0/10 (Tailscale peers) on non-8000/80/443 ports, so this is
+  # defense in depth, not the only control.
+  deploy:
+    resources:
+      limits:
+        memory: 4G
+      reservations:
+        memory: 1G
+  volumes:
+    - worker-host-logs:/app/logs
+    - worker-host-instances:/app/instances
+    - ~/wt-research-output:/app/research_output
+  # Same convention as docker-compose-prod-platform.yml's worker overlay:
+  # platform.env carries AI_BRIDGE_API_KEY (reconciled by
+  # scripts/bridge-deploy.sh's phase_reconcile_worker_key, host-generic) and
+  # BRIDGE_DB_URL (durable jobs / budget gate — see the OPEN ITEM above,
+  # this file does not make BRIDGE_DB_URL reachable by itself).
+  env_file:
+    - ../secrets/platform.env
+  healthcheck:
+    test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+    interval: 30s
+    timeout: 10s
+    retries: 3
+    start_period: 240s
+  restart: unless-stopped
+  networks:
+    - bridge-worker-host-net
+
+services:
+  # ===========================================================================
+  # worker-sahori — same account/billing identity as on production-barrier
+  # today. INSTANCE_NAME is what account-pool-state / billing sees; moving
+  # the container to a new host does not change it. The token secret moves
+  # WITH the worker (provisioned on this host at cutover, same file-based
+  # convention as every other Bridge host — never captured into the repo).
+  # ===========================================================================
+  worker-sahori:
+    <<: *worker-common
+    container_name: wt-worker-host-sahori
+    ports:
+      - "${WORKER_HOST_BIND_IP:-100.93.143.105}:8001:8000"
+    secrets:
+      - claude_token_sahori
+    environment:
+      <<: *worker-env-common
+      CLAUDE_CODE_OAUTH_TOKEN_FILE: /run/secrets/claude_token_sahori
+      INSTANCE_NAME: worker-sahori
+
+  worker-kurt:
+    <<: *worker-common
+    container_name: wt-worker-host-kurt
+    ports:
+      - "${WORKER_HOST_BIND_IP:-100.93.143.105}:8002:8000"
+    secrets:
+      - claude_token_kurt
+    environment:
+      <<: *worker-env-common
+      CLAUDE_CODE_OAUTH_TOKEN_FILE: /run/secrets/claude_token_kurt
+      INSTANCE_NAME: worker-kurt
+
+  worker-coach:
+    <<: *worker-common
+    container_name: wt-worker-host-coach
+    ports:
+      - "${WORKER_HOST_BIND_IP:-100.93.143.105}:8003:8000"
+    secrets:
+      - claude_token_coach
+    environment:
+      <<: *worker-env-common
+      CLAUDE_CODE_OAUTH_TOKEN_FILE: /run/secrets/claude_token_coach
+      INSTANCE_NAME: worker-coach
+
+  worker-erk:
+    <<: *worker-common
+    container_name: wt-worker-host-erk
+    ports:
+      - "${WORKER_HOST_BIND_IP:-100.93.143.105}:8004:8000"
+    secrets:
+      - claude_token_erk
+    environment:
+      <<: *worker-env-common
+      CLAUDE_CODE_OAUTH_TOKEN_FILE: /run/secrets/claude_token_erk
+      INSTANCE_NAME: worker-erk
+
+networks:
+  bridge-worker-host-net:
+    driver: bridge
+
+volumes:
+  worker-host-logs:
+    driver: local
+  worker-host-instances:
+    driver: local
+
+# Same file-based token convention as every other Bridge host (CLAUDE.md
+# "Token-Architektur") — provisioned ON this host at cutover, never in git.
+# Reusing the SAME account tokens as production-barrier's workers would run
+# two containers against one Anthropic account simultaneously; the intended
+# cutover moves (stops old, starts new), not duplicates.
+secrets:
+  claude_token_sahori:
+    file: ../secrets/claude_token_sahori.txt
+  claude_token_kurt:
+    file: ../secrets/claude_token_kurt.txt
+  claude_token_coach:
+    file: ../secrets/claude_token_coach.txt
+  claude_token_erk:
+    file: ../secrets/claude_token_erk.txt

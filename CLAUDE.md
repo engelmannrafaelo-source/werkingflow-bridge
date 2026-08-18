@@ -298,6 +298,13 @@ ssh root@49.12.72.66 "docker system prune -a -f"   # bei Disk-Druck
 | `scripts/bridge-drift-check.sh` | Release-Manifest vs. laufende Container (Image-Ebene) |
 | `.bridge-deployed-sha`, `.bridge-release-manifest.json` | host-lokal, von `bridge-deploy.sh` geschrieben — nie ins Repo zurückholen |
 | `docs/adr/0006-*.md` | SSoT für das Single-Source-Modell |
+| `docs/adr/0009-*.md` | Worker/DB-Host-Trennung (dritter Deploy-Topology `prod-workers`, Mechanismus fertig, Cutover gated — offener Blocker: Worker→Postgres-Direktverbindung) |
+| `docker/docker-compose-worker-host.yml` | Compose für den Worker-Host (`prod-workers`-Topology, ADR-0009) — nur Worker-Container, kein nginx/DB/platform-api |
+
+**Worker-Host (`prod-workers-1`, ADR-0009):** vorbereiteter, noch nicht produktiv genutzter dritter
+Host für Prod-Worker (Ziel: Postgres bleibt allein auf production-barrier). Tailscale
+`100.93.143.105`, öffentliche IP `168.119.178.70`. Kein eigener Eintrag in der Zwei-Bridges-Tabelle
+oben — er ist kein drittes Bridge-Deployment, sondern potenzielle Worker-Kapazität für Server-2.
 | `secrets/claude_token_*.txt` | Token-Dateien (host-lokal, nicht im Repo) |
 | `src/auth.py`, `src/claude_cli.py` | Auth + SDK-Integration |
 

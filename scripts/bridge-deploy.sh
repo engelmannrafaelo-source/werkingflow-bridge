@@ -2,8 +2,14 @@
 # bridge-deploy.sh — Atomic idempotent multi-server Bridge deployment
 #
 # Usage: bridge-deploy.sh <server> [<service>...] [--dry-run] [--ack-foreign]
-#   server        = hetzner | server2 | both
+#   server        = hetzner | server2 | both | prod-workers
 #   service       = optional, default = all services for the server
+#
+#   prod-workers = the ADR-0009 worker-host (168.119.178.70): LLM worker
+#     containers only, no nginx-LB, no Postgres, no platform-api, no public
+#     smoke target (see docs/adr/0009-bridge-worker-host-separation.md).
+#     Deliberately NOT part of `both` — it never runs implicitly alongside a
+#     routine hetzner+server2 deploy.
 #   --ack-foreign = proceed although this deploy also ships commits authored by
 #                   other sessions (see phase_foreign_commit_gate). Without it,
 #                   such a deploy ABORTS before touching the target.
@@ -20,6 +26,9 @@ set -euo pipefail
 # ============================================================================
 HETZNER_HOST="49.12.72.66"
 SERVER2_HOST="178.104.178.79"
+# ADR-0009: worker-only host, addressed over Tailscale (tailnet hostname
+# prod-workers-1) — no public function, not a customer-facing bridge.
+WORKERHOST_HOST="100.93.143.105"
 SSH_KEY="/root/.ssh/id_ed25519"
 SSH_BASE_OPTS="-i ${SSH_KEY} -o ConnectTimeout=10 -o StrictHostKeyChecking=no -o BatchMode=yes"
 REMOTE_REPO="/root/werkingflow-bridge"
@@ -33,6 +42,7 @@ DEPLOYED_SHA_FILE="${REMOTE_REPO}/.bridge-deployed-sha"
 RELEASE_MANIFEST_FILE="${REMOTE_REPO}/.bridge-release-manifest.json"
 HETZNER_COMPOSE="-f docker/docker-compose.yml -f docker/docker-compose-platform-overlay.yml"
 SERVER2_COMPOSE="-f docker/docker-compose-prod.yml -f docker/docker-compose-prod-platform.yml"
+WORKERHOST_COMPOSE="-f docker/docker-compose-worker-host.yml"
 # Worker init on a fresh container is much slower than expected: container
 # bootstrap (~60s) + a ~80s blocking pause inside lifespan between
 # "Session cleanup task started" and "AdaptiveLoadLimiter tune loop started"
@@ -90,6 +100,18 @@ SERVER2_ALL="postgres-prod platform-api nginx worker-sahori worker-kurt worker-c
 # nginx now BUILDS from Dockerfile.nginx-lb (OpenResty+Lua) — the same image as
 # primary (ADR-0006 B/C). It was a pre-built nginx:alpine before the unification.
 SERVER2_NEEDS_BUILD="platform-api nginx worker-sahori worker-kurt worker-coach worker-erk metrics-reader-prod"
+
+# Worker-host (ADR-0009): service -> container name. Distinct container-name
+# prefix (wt-worker-host-*) from server2's wt-prod-worker-* on purpose — the
+# two are never the same container, even in logs/docker ps on different hosts,
+# so provenance is unambiguous during the (still local-worker) cutover window
+# when both may briefly exist.
+WORKERHOST_SVC_worker_sahori="wt-worker-host-sahori"
+WORKERHOST_SVC_worker_kurt="wt-worker-host-kurt"
+WORKERHOST_SVC_worker_coach="wt-worker-host-coach"
+WORKERHOST_SVC_worker_erk="wt-worker-host-erk"
+WORKERHOST_ALL="worker-sahori worker-kurt worker-coach worker-erk"
+WORKERHOST_NEEDS_BUILD="worker-sahori worker-kurt worker-coach worker-erk"
 
 # State (reset per server in deploy_server)
 ROLLBACK_SHA=""
@@ -204,13 +226,13 @@ for arg in "$@"; do
     case "$arg" in
         --dry-run) DRY_RUN=true ;;
         --ack-foreign) ACK_FOREIGN=true ;;
-        hetzner|server2|both) SERVER="$arg" ;;
+        hetzner|server2|both|prod-workers) SERVER="$arg" ;;
         *) SERVICES_ARG+=("$arg") ;;
     esac
 done
 
 if [[ -z "$SERVER" ]]; then
-    echo "Usage: bridge-deploy.sh <hetzner|server2|both> [service...] [--dry-run] [--ack-foreign]" >&2
+    echo "Usage: bridge-deploy.sh <hetzner|server2|both|prod-workers> [service...] [--dry-run] [--ack-foreign]" >&2
     echo "  --ack-foreign  proceed even though the deploy ships commits by other authors" >&2
     exit 1
 fi
@@ -242,9 +264,10 @@ acquire_deploy_lock() {
     printf 'pid=%s started=%s user=%s\n' "$$" "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$(whoami)" >&"$fd"
 }
 case "$SERVER" in
-    hetzner) acquire_deploy_lock "hetzner" 210 ;;
-    server2) acquire_deploy_lock "server2" 211 ;;
-    both)    acquire_deploy_lock "hetzner" 210; acquire_deploy_lock "server2" 211 ;;
+    hetzner)      acquire_deploy_lock "hetzner" 210 ;;
+    server2)      acquire_deploy_lock "server2" 211 ;;
+    both)         acquire_deploy_lock "hetzner" 210; acquire_deploy_lock "server2" 211 ;;
+    prod-workers) acquire_deploy_lock "prod-workers" 212 ;;
 esac
 
 # ============================================================================
@@ -523,6 +546,14 @@ phase_validate() {
     rssh "$host" "cd ${REMOTE_REPO} && docker compose ${compose} config --quiet" > /dev/null
     info "Compose OK"
 
+    # ADR-0009 worker-host: no nginx service in this compose at all (workers
+    # only) — the shared nginx.conf lives on hetzner/server2, not here. Compose
+    # syntax above is the whole of Phase 3 for this topology.
+    if [[ "$compose" == *"worker-host"* ]]; then
+        info "No nginx service on this host (worker-host topology) — nginx validation N/A"
+        return 0
+    fi
+
     # nginx config syntax: envsubst with EXACT same variable list as the container uses,
     # then nginx -t inside nginx:alpine with --add-host for all internal upstream hostnames
     # (needed because nginx -t resolves upstream hosts; they only exist inside the compose
@@ -534,13 +565,15 @@ phase_validate() {
     # actual root cause of three rolled-back server2 deploys on 12.05.2026.
     # SINGLE SOURCE (ADR-0006 B/C): BOTH bridges validate the shared docker/nginx.conf.
     # The only per-bridge input is the generated upstreams include.
-    local nginx_conf upstreams_conf envsubst_vars add_hosts
+    local nginx_conf upstreams_conf worker_map_conf envsubst_vars add_hosts
     nginx_conf="docker/nginx.conf"
     envsubst_vars='$BRIDGE_BACKUP_HOST $BRIDGE_ID'
     if [[ "$compose" == *"prod"* ]]; then
         upstreams_conf="docker/upstreams-prod.conf"
+        worker_map_conf="docker/worker-map-prod.conf"
     else
         upstreams_conf="docker/upstreams-primary.conf"
+        worker_map_conf="docker/worker-map-primary.conf"
     fi
     # Pull every top-level service from the compose file, drop the lb itself
     # (nginx is the test target, doesn't need to resolve itself), map each
@@ -615,6 +648,7 @@ if docker run --rm \
     --tmpfs /var/log/nginx \
     -v /tmp/bridge-nginx-check.conf:/etc/nginx/nginx.conf:ro \
     -v /tmp/bridge-upstreams-check.conf:/tmp/upstreams.conf:ro \
+    -v ${REMOTE_REPO}/${worker_map_conf}:/tmp/worker-map.conf:ro \
     -v ${REMOTE_REPO}/docker/routes-metrics-reader.conf:/etc/nginx/routes-metrics-reader.conf:ro \
     -v ${REMOTE_REPO}/docker/routes-platform-api.conf:/etc/nginx/routes-platform-api.conf:ro \
     -v ${REMOTE_REPO}/docker/lua:/etc/nginx/lua:ro \
@@ -1245,6 +1279,16 @@ EOF
 # container is touched, so aborting here leaves the running system as it was.
 phase_migration_gate() {
     local host="$1" db_container="$2"
+
+    # Hosts with no local Postgres (ADR-0009 worker-host) have nothing to
+    # gate — the schema this deploy's code expects is checked where the DB
+    # actually lives (server2). Not a skip of the check; there is no
+    # applicable target here.
+    if [[ -z "$db_container" ]]; then
+        step "Phase 3.7: Migration gate — N/A (${host} has no local database)"
+        return 0
+    fi
+
     step "Phase 3.7: Migration gate (${db_container} on ${host})"
 
     if [[ "$DRY_RUN" == "true" ]]; then
@@ -1451,6 +1495,14 @@ deploy_server() {
             server_prefix="SERVER2"
             db_container="${SERVER2_DB_CONTAINER}"
             ;;
+        prod-workers)
+            host="$WORKERHOST_HOST"
+            compose="$WORKERHOST_COMPOSE"
+            all_services="$WORKERHOST_ALL"
+            build_list="$WORKERHOST_NEEDS_BUILD"
+            server_prefix="WORKERHOST"
+            db_container=""   # no local DB — phase_migration_gate is a no-op
+            ;;
         *)
             error_ "Unknown server: ${server_name}"
             return 1
@@ -1560,7 +1612,7 @@ deploy_server() {
 
         phase_distribution_test "$host" "${hetzner_url}" "${HETZNER_SVC_nginx}" || \
             warn "Distribution test FAILED — optimization signal only, NOT rolling back (smoke test passed, deployment succeeded)"
-    else
+    elif [[ "$server_name" == "server2" ]]; then
         phase_smoke_test "server2" "http://${SERVER2_HOST}:8000" "X-Priority: production" || {
             error_ "Smoke test failed for server2 — rolling back"
             if [[ ${#DEPLOYED_SERVICES[@]} -gt 0 ]]; then
@@ -1570,6 +1622,17 @@ deploy_server() {
             fi
             return 1
         }
+    else
+        # prod-workers (ADR-0009): no nginx here, so no public /v1 endpoint to
+        # run bridge_smoke.py against — that suite exercises the FULL
+        # request path (nginx routing + Lua pool-router + a worker), which
+        # only exists once server2's nginx is cut over to point at this host
+        # (a separate, still-gated step; see the ADR). Per-container health
+        # was already proven in Phase 4 (deploy_one_service's health wait) —
+        # that is the applicable bar for this topology today.
+        step "Phase 5: Smoke test — N/A (${server_name} has no public endpoint yet)"
+        info "Per-worker health already verified in Phase 4 (${DEPLOYED_SERVICES[*]})."
+        info "Full request-path smoke only applies after the nginx cutover — see ADR-0009."
     fi
 
     # === Phase 7: Success report ===
@@ -1687,6 +1750,9 @@ case "$SERVER" in
     both)
         deploy_server "hetzner" || exit $?
         deploy_server "server2" || exit $?
+        ;;
+    prod-workers)
+        deploy_server "prod-workers"
         ;;
 esac
 

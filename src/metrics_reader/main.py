@@ -72,6 +72,41 @@ PROD_BRIDGE_URL = os.getenv("BRIDGE_PROD_URL", "").rstrip("/")
 # Dev-Bridge default: worker1..worker4.  Production: worker-prod.
 BRIDGE_WORKERS = [w.strip() for w in os.getenv("BRIDGE_WORKERS", "worker1,worker2,worker3,worker4").split(",") if w.strip()]
 
+# ADR-0009 (worker-host separation): a worker NAME is a Docker Compose service
+# name by default, resolved by the embedded Docker DNS to a container on THIS
+# host — that is why polling has always been plain f"http://{worker}:8000/...".
+# A worker moved to a separate host needs an explicit network target instead.
+# Optional override, format "name=host:port,name=host:port"; a worker absent
+# from the map keeps today's exact behaviour (same-host DNS, port 8000). Empty
+# by default -> _worker_target() is then a no-op and every call below is
+# byte-identical to before this existed. Same override syntax and intent as
+# scripts/generate-bridge-upstreams.sh's PROD_WORKER_TARGETS (the nginx-side
+# equivalent) — keep both in sync at cutover, they are independent inputs on
+# purpose (one drives nginx, one drives this reader; nothing shares state).
+def _parse_worker_targets(raw: str) -> dict[str, str]:
+    targets: dict[str, str] = {}
+    for entry in raw.split(","):
+        entry = entry.strip()
+        if not entry:
+            continue
+        if "=" not in entry:
+            logger.warning(f"BRIDGE_WORKER_TARGETS: ignoring malformed entry {entry!r} (expected name=host:port)")
+            continue
+        name, target = entry.split("=", 1)
+        name, target = name.strip(), target.strip()
+        if name and target:
+            targets[name] = target
+
+    return targets
+
+
+BRIDGE_WORKER_TARGETS = _parse_worker_targets(os.getenv("BRIDGE_WORKER_TARGETS", ""))
+
+
+def _worker_target(worker: str) -> str:
+    """host:port to reach `worker` — same-host DNS default, or its override."""
+    return BRIDGE_WORKER_TARGETS.get(worker, f"{worker}:8000")
+
 # Sandbox observed rate-limits. Bridge workers track 429s on their own
 # /v1/chat/completions calls via rate_limit_tracker. Sandbox containers go
 # through the passthrough proxy directly to api.anthropic.com — those 429s
@@ -867,7 +902,7 @@ def lb_status() -> JSONResponse:
     up_count = 0
 
     for w in workers:
-        url = f"http://{w}:8000/health"
+        url = f"http://{_worker_target(w)}/health"
         try:
             with urllib.request.urlopen(url, timeout=2) as resp:
                 ok = 200 <= resp.status < 300
@@ -949,7 +984,7 @@ def get_account_pool_state():
     errors: list = []
 
     for worker in BRIDGE_WORKERS:
-        url = f"http://{worker}:8000/v1/metrics/account-pool-state"
+        url = f"http://{_worker_target(worker)}/v1/metrics/account-pool-state"
         try:
             with urllib.request.urlopen(url, timeout=3) as resp:
                 data = _json.loads(resp.read())
