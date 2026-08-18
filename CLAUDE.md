@@ -157,7 +157,7 @@ live in `/v1/metrics/account-pool-state` / `/lb-status`.
 | Container | Funktion |
 |-----------|----------|
 | `wt-prod-lb` | nginx Load Balancer (OpenResty+Lua) |
-| `wt-prod-worker-sahori`, `wt-prod-worker-kurt` | 2 Worker |
+| `wt-prod-worker-{sahori,kurt,coach,erk}` | Worker-Pool (Satz: `docker/upstreams-prod.conf`) |
 | `wt-prod-metrics-reader` | Pool-State-Aggregator |
 | `wt-prod-platform-api` | Platform-API |
 | `bridge-postgres-prod` | Platform-/Identity-DB |
@@ -175,7 +175,7 @@ Sie liegen **host-lokal** und flach unter `secrets/claude_token_*.txt` (nicht im
 | Host | Token-Dateien |
 |------|---------------|
 | DEV `49.12.72.66` | `secrets/claude_token_account1..4.txt` (+ Namens-Symlinks engelmann/gmail/office/werking(flow)) |
-| PROD `178.104.178.79` | `secrets/claude_token_worker-sahori.txt`, `secrets/claude_token_worker-kurt.txt` |
+| PROD `178.104.178.79` | `secrets/claude_token_{prod,kurt,coach,erk}.txt` (sahori liegt historisch als `claude_token_prod.txt`; `claude_token_worker-*.txt` sind Symlinks darauf) |
 
 ### Neues Token setzen (nach Ablauf / Wechsel)
 
@@ -191,6 +191,13 @@ ssh root@178.104.178.79 "echo 'sk-ant-oat01-...' > /root/werkingflow-bridge/secr
 
 > Nur das Token-File ist host-lokal (Secret). Die Container-/nginx-Config kommt aus dem Repo —
 > nach Token-Änderung reicht ein Redeploy/Restart, **kein** Hand-Edit an Compose/nginx.
+
+> **Dateirechte sind tragend.** Der Worker startet per `gosu claude` (uid 1001), liest das
+> Secret also NICHT als root — `docker exec` zeigt trotzdem root, das täuscht. Die Datei muss
+> für diesen User lesbar sein; Muster der bestehenden Dateien ist `644 1002:1002`. Ein
+> vermeintlich sichereres `600 root:root` lässt den Container mit
+> `PermissionError: /run/secrets/claude_token_<name>` in den Crashloop laufen (passiert
+> 2026-08-18 beim coach/erk-Rollout, vom Health-Gate gefangen und zurückgerollt).
 
 ---
 

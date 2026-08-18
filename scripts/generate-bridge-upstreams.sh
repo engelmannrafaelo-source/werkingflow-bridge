@@ -20,7 +20,8 @@
 # The worker sets below are the VERIFIED host ground truth (ADR-0006 cutover
 # table, re-verified live 2026-07-01):
 #   primary    : worker1..4                 (metrics-reader BRIDGE_WORKERS default)
-#   production : worker-sahori, worker-kurt  (metrics-reader BRIDGE_WORKERS env)
+#   production : worker-sahori, worker-kurt, worker-coach, worker-erk
+#                (metrics-reader BRIDGE_WORKERS env; 2->4 am 2026-08-18)
 #
 # Regenerate + commit when the worker set changes (rare). Do NOT hand-edit the
 # generated files — the header marks them, and bridge-parity-check.sh compares the
@@ -40,7 +41,7 @@ OUT_DIR="${ROOT}/docker"
 #          both prod workers exhausted/down -> dev bridge serves). claude_production
 #          is the same pool (prod has no separate "production reserve" to route to).
 PRIMARY_WORKERS=(worker1 worker2 worker3 worker4)
-PROD_WORKERS=(worker-sahori worker-kurt)
+PROD_WORKERS=(worker-sahori worker-kurt worker-coach worker-erk)
 
 emit_upstream() {
     # $1 = upstream name, $2 = keepalive, $3 = "backup"|"nobackup", then worker names
