@@ -23,6 +23,12 @@ services:
   worker-kurt:
     env_file:
       - ../secrets/platform.env
+  worker-coach:
+    env_file:
+      - ../secrets/platform.env
+  worker-erk:
+    env_file:
+      - ../secrets/platform.env
 
   postgres-prod:
     image: postgres:16-alpine

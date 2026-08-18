@@ -67,6 +67,9 @@ SERVER2_SVC_nginx="wt-prod-lb"
 # two-account workers (sahori + kurt) for ~2x rate-limit capacity.
 SERVER2_SVC_worker_sahori="wt-prod-worker-sahori"
 SERVER2_SVC_worker_kurt="wt-prod-worker-kurt"
+# Pool-Erweiterung 2→4 (2026-08-18): die beiden restlichen Partner-Accounts.
+SERVER2_SVC_worker_coach="wt-prod-worker-coach"
+SERVER2_SVC_worker_erk="wt-prod-worker-erk"
 # privacy-prod REMOVED 2026-06-26: Flair (~13GB) OOM'd this 7GB host; prod now
 # routes smart-anonymize to the dev-bridge privacy service over Tailscale.
 SERVER2_SVC_metrics_reader_prod="wt-prod-metrics-reader"
@@ -83,10 +86,10 @@ BRIDGE_DB_USER="bridge"
 BRIDGE_DB_NAME="bridge"
 SERVER2_SVC_platform_api="wt-prod-platform-api"
 # postgres-prod zuerst (DB vor platform-api), platform-api vor nginx (Upstream-Resolve).
-SERVER2_ALL="postgres-prod platform-api nginx worker-sahori worker-kurt metrics-reader-prod"
+SERVER2_ALL="postgres-prod platform-api nginx worker-sahori worker-kurt worker-coach worker-erk metrics-reader-prod"
 # nginx now BUILDS from Dockerfile.nginx-lb (OpenResty+Lua) — the same image as
 # primary (ADR-0006 B/C). It was a pre-built nginx:alpine before the unification.
-SERVER2_NEEDS_BUILD="platform-api nginx worker-sahori worker-kurt metrics-reader-prod"
+SERVER2_NEEDS_BUILD="platform-api nginx worker-sahori worker-kurt worker-coach worker-erk metrics-reader-prod"
 
 # State (reset per server in deploy_server)
 ROLLBACK_SHA=""

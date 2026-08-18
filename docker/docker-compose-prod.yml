@@ -319,6 +319,264 @@ services:
       - bridge-prod-net
 
   # ===========================================================================
+  # Production Worker — Coach (Pool-Erweiterung 2→4, 2026-08-18).
+  # Identisch zu worker-sahori/worker-kurt bis auf Token + INSTANCE_NAME.
+  # ===========================================================================
+  worker-coach:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.worker
+      args:
+        GIT_COMMIT: ${GIT_COMMIT:-unknown}
+    container_name: wt-prod-worker-coach
+    expose:
+      - "8000"
+    deploy:
+      resources:
+        limits:
+          memory: 4G
+        reservations:
+          memory: 1G
+    volumes:
+      - prod-logs:/app/logs
+      - prod-instances:/app/instances
+      - ~/wt-research-output:/app/research_output
+    secrets:
+      - claude_token_coach
+    environment:
+      - CLAUDE_CODE_OAUTH_TOKEN_FILE=/run/secrets/claude_token_coach
+      - TZ=Europe/Vienna
+      - LOG_LEVEL=INFO
+      - LOG_TO_FILE=true
+      - FILTER_SENSITIVE_DATA=true
+      - INSTANCE_NAME=worker-coach
+      - BRIDGE_GENERIC_JOBS_ENABLED=true
+      # OA-Scholarly-Schicht: legale OA-Volltext-Injektion bei research_mode=academic
+      # (OpenAlex/CORE, fail-soft). Prod-Aktivierung Rafael-Go 2026-07-25.
+      - BRIDGE_SCHOLARLY_ENABLED=true
+      # CORE keyless works without this (lower rate-limit, fail-soft -> []). Empty default is
+      # safe/expected until the CORE_API_KEY registration (running in parallel) lands in Infisical.
+      - CORE_API_KEY=${CORE_API_KEY:-}
+      # Bridge-owned per-(app,agent) tier routing/billing policy (master switch).
+      # On here; actual per-route control is the app_tier_policies DB table
+      # (enabled column / add-remove rows). Fail-open: no matching row or an
+      # unusable target tier → normal routing, never a 5xx.
+      - BRIDGE_APP_TIER_POLICY_ENABLED=true
+      # Prepaid Anthropic vision-key daily spend cap (fail-open, read per-call).
+      # Guards the vision_prepaid lane — real prepaid money the ledger books as 0€.
+      # Kill switch: set ENABLED=false + recreate. See src/routing/prepaid_cap.py.
+      - PREPAID_VISION_DAILY_CAP_ENABLED=true
+      - PREPAID_VISION_DAILY_CAP_EUR=90
+      # Chat-job self-call timeout (claims/finalize). Default 600s cut long
+      # Energy claims calls (observed 728s); align with MAX_TIMEOUT (2400s).
+      - BRIDGE_CHAT_JOB_TIMEOUT_S=2400
+      # Adaptive-limiter caps — match hetzner so large prod requests (e.g. the
+      # Energy multi-file analysis) fit. Without these, prod workers used the code
+      # default floor (50k) and shrank to ~60k after Anthropic rate-limits, then
+      # fast-failed any single request > cap with a 429 (even at 0 in-flight, no
+      # failover). Floor 500k keeps caps large enough for big single requests.
+      - ADAPTIVE_INITIAL_CAP_TOKENS=1000000
+      - ADAPTIVE_FLOOR_TOKENS=500000
+      - ADAPTIVE_CEILING_TOKENS=4000000
+      - ADAPTIVE_GROW_TRIGGER_SEC=300
+      - ADAPTIVE_GROW_FACTOR=1.10
+      - ADAPTIVE_QUEUE_WAIT_SEC=5
+      - ADAPTIVE_WEEKLY_PREDICTIVE_THROTTLE=true
+      - CLAUDE_CWD=/app/instances
+      - DISABLE_COACH_MCP=true
+      - MAX_TIMEOUT=2400000
+      # Anthropic-client request timeout INSIDE the claude CLI subprocess.
+      # Unset, the CLI defaults to 600000ms (10 min) and aborts slow streams
+      # mid-generation -> partial content without result message (silent
+      # truncation upstream of MAX_TIMEOUT). Align with MAX_TIMEOUT so the
+      # bridge's own asyncio timeout is the single governing limit.
+      - API_TIMEOUT_MS=2400000
+      # Central output-token ceiling (target architecture 2026-06-12): app
+      # code sends NO max_tokens (the SDK path ignores it anyway) — this env
+      # on the CLI subprocess is the single limit. 64000 = Sonnet 4.5 /
+      # Haiku 4.5 ceiling (Opus 4.8 allows more). Without it the CLI default
+      # (32000) silently caps long structured outputs.
+      - CLAUDE_CODE_MAX_OUTPUT_TOKENS=64000
+      - CLAUDE_PERMISSION_MODE=bypassPermissions
+      - TAVILY_API_KEY=${TAVILY_API_KEY}
+      - ANTHROPIC_VISION_API_KEY=${ANTHROPIC_API_KEY}
+      # research-cloud (Weg C): executor-only key alias + feature flag.
+      # NEVER add plain ANTHROPIC_API_KEY here — claude_cli.py fatals on it
+      # (subscription pool would silently bill the API otherwise).
+      - RESEARCH_CLOUD_API_KEY=${ANTHROPIC_API_KEY:-}
+      - RESEARCH_CLOUD_ENABLED=${RESEARCH_CLOUD_ENABLED:-}
+      # Research-Library (specs/research-library-tool): kuratierte private
+      # Bibliothek fuer den research_cloud-Pfad; default aus, Werte via
+      # sync-infisical-to-bridge -> docker/.env (dev) bzw. platform-Secrets (prod).
+      - RESEARCH_LIBRARY_ENABLED=${RESEARCH_LIBRARY_ENABLED:-}
+      - RESEARCH_LIBRARY_S3_ENDPOINT_URL=${RESEARCH_LIBRARY_S3_ENDPOINT_URL:-}
+      - RESEARCH_LIBRARY_S3_BUCKET=${RESEARCH_LIBRARY_S3_BUCKET:-}
+      - RESEARCH_LIBRARY_S3_ACCESS_KEY_ID=${RESEARCH_LIBRARY_S3_ACCESS_KEY_ID:-}
+      - RESEARCH_LIBRARY_S3_SECRET_ACCESS_KEY=${RESEARCH_LIBRARY_S3_SECRET_ACCESS_KEY:-}
+      - RESEARCH_LIBRARY_S3_REGION=${RESEARCH_LIBRARY_S3_REGION:-}
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      # STT / Whisper EU data-residency (GDPR) — default openai (US, backward-compat).
+      # EU route (Rafael 2026-07-06): STT_PROVIDER=aws-sagemaker + AWS_STT_SAGEMAKER_ENDPOINT
+      # (self-hosted Whisper on SageMaker EU, reuses the Bedrock AWS creds from env_file);
+      # or OPENAI_STT_BASE_URL=https://eu.api.openai.com/v1 for OpenAI's own EU residency.
+      - STT_PROVIDER=${STT_PROVIDER:-openai}
+      - OPENAI_STT_BASE_URL=${OPENAI_STT_BASE_URL:-}
+      - OPENAI_STT_MODEL=${OPENAI_STT_MODEL:-}
+      - AWS_STT_SAGEMAKER_ENDPOINT=${AWS_STT_SAGEMAKER_ENDPOINT:-}
+      - AWS_STT_REGION=${AWS_STT_REGION:-}
+      - PRIVACY_ENABLED=true
+      - PRIVACY_LANGUAGE=de
+      - PRIVACY_LOG_DETECTIONS=false
+      - SKIP_SDK_VERIFICATION=true
+      - RATE_LIMIT_ENABLED=false
+      - DEFAULT_PRIVACY_MODE=none
+      # Routed to the dedicated GPU privacy host gpu-privacy-1 (Tailscale): the
+      # 7GB prod host cannot hold the ~13GB Flair model. gpu-privacy-1 runs it
+      # on GPU (GEX44, RTX 4000 Ada). Rollback (previous CPU route on the
+      # dev-bridge, if gpu-privacy-1 becomes unreachable): set env
+      # PRIVACY_SERVICE_URL=http://100.112.98.39:8100 and redeploy.
+      - PRIVACY_SERVICE_URL=${PRIVACY_SERVICE_URL:-http://100.65.149.39:8100}
+      - BRIDGE_ANONYMIZE_ENABLED=true
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 240s
+    restart: unless-stopped
+    networks:
+      - bridge-prod-net
+
+  # ===========================================================================
+  # Production Worker — Erk (Pool-Erweiterung 2→4, 2026-08-18).
+  # Identisch zu worker-sahori/worker-kurt bis auf Token + INSTANCE_NAME.
+  # ===========================================================================
+  worker-erk:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.worker
+      args:
+        GIT_COMMIT: ${GIT_COMMIT:-unknown}
+    container_name: wt-prod-worker-erk
+    expose:
+      - "8000"
+    deploy:
+      resources:
+        limits:
+          memory: 4G
+        reservations:
+          memory: 1G
+    volumes:
+      - prod-logs:/app/logs
+      - prod-instances:/app/instances
+      - ~/wt-research-output:/app/research_output
+    secrets:
+      - claude_token_erk
+    environment:
+      - CLAUDE_CODE_OAUTH_TOKEN_FILE=/run/secrets/claude_token_erk
+      - TZ=Europe/Vienna
+      - LOG_LEVEL=INFO
+      - LOG_TO_FILE=true
+      - FILTER_SENSITIVE_DATA=true
+      - INSTANCE_NAME=worker-erk
+      - BRIDGE_GENERIC_JOBS_ENABLED=true
+      # OA-Scholarly-Schicht: legale OA-Volltext-Injektion bei research_mode=academic
+      # (OpenAlex/CORE, fail-soft). Prod-Aktivierung Rafael-Go 2026-07-25.
+      - BRIDGE_SCHOLARLY_ENABLED=true
+      # CORE keyless works without this (lower rate-limit, fail-soft -> []). Empty default is
+      # safe/expected until the CORE_API_KEY registration (running in parallel) lands in Infisical.
+      - CORE_API_KEY=${CORE_API_KEY:-}
+      # Bridge-owned per-(app,agent) tier routing/billing policy (master switch).
+      # On here; actual per-route control is the app_tier_policies DB table
+      # (enabled column / add-remove rows). Fail-open: no matching row or an
+      # unusable target tier → normal routing, never a 5xx.
+      - BRIDGE_APP_TIER_POLICY_ENABLED=true
+      # Prepaid Anthropic vision-key daily spend cap (fail-open, read per-call).
+      # Guards the vision_prepaid lane — real prepaid money the ledger books as 0€.
+      # Kill switch: set ENABLED=false + recreate. See src/routing/prepaid_cap.py.
+      - PREPAID_VISION_DAILY_CAP_ENABLED=true
+      - PREPAID_VISION_DAILY_CAP_EUR=90
+      # Chat-job self-call timeout (claims/finalize). Default 600s cut long
+      # Energy claims calls (observed 728s); align with MAX_TIMEOUT (2400s).
+      - BRIDGE_CHAT_JOB_TIMEOUT_S=2400
+      # Adaptive-limiter caps — match hetzner so large prod requests (e.g. the
+      # Energy multi-file analysis) fit. Without these, prod workers used the code
+      # default floor (50k) and shrank to ~60k after Anthropic rate-limits, then
+      # fast-failed any single request > cap with a 429 (even at 0 in-flight, no
+      # failover). Floor 500k keeps caps large enough for big single requests.
+      - ADAPTIVE_INITIAL_CAP_TOKENS=1000000
+      - ADAPTIVE_FLOOR_TOKENS=500000
+      - ADAPTIVE_CEILING_TOKENS=4000000
+      - ADAPTIVE_GROW_TRIGGER_SEC=300
+      - ADAPTIVE_GROW_FACTOR=1.10
+      - ADAPTIVE_QUEUE_WAIT_SEC=5
+      - ADAPTIVE_WEEKLY_PREDICTIVE_THROTTLE=true
+      - CLAUDE_CWD=/app/instances
+      - DISABLE_COACH_MCP=true
+      - MAX_TIMEOUT=2400000
+      # Anthropic-client request timeout INSIDE the claude CLI subprocess.
+      # Unset, the CLI defaults to 600000ms (10 min) and aborts slow streams
+      # mid-generation -> partial content without result message (silent
+      # truncation upstream of MAX_TIMEOUT). Align with MAX_TIMEOUT so the
+      # bridge's own asyncio timeout is the single governing limit.
+      - API_TIMEOUT_MS=2400000
+      # Central output-token ceiling (target architecture 2026-06-12): app
+      # code sends NO max_tokens (the SDK path ignores it anyway) — this env
+      # on the CLI subprocess is the single limit. 64000 = Sonnet 4.5 /
+      # Haiku 4.5 ceiling (Opus 4.8 allows more). Without it the CLI default
+      # (32000) silently caps long structured outputs.
+      - CLAUDE_CODE_MAX_OUTPUT_TOKENS=64000
+      - CLAUDE_PERMISSION_MODE=bypassPermissions
+      - TAVILY_API_KEY=${TAVILY_API_KEY}
+      - ANTHROPIC_VISION_API_KEY=${ANTHROPIC_API_KEY}
+      # research-cloud (Weg C): executor-only key alias + feature flag.
+      # NEVER add plain ANTHROPIC_API_KEY here — claude_cli.py fatals on it
+      # (subscription pool would silently bill the API otherwise).
+      - RESEARCH_CLOUD_API_KEY=${ANTHROPIC_API_KEY:-}
+      - RESEARCH_CLOUD_ENABLED=${RESEARCH_CLOUD_ENABLED:-}
+      # Research-Library (specs/research-library-tool): kuratierte private
+      # Bibliothek fuer den research_cloud-Pfad; default aus, Werte via
+      # sync-infisical-to-bridge -> docker/.env (dev) bzw. platform-Secrets (prod).
+      - RESEARCH_LIBRARY_ENABLED=${RESEARCH_LIBRARY_ENABLED:-}
+      - RESEARCH_LIBRARY_S3_ENDPOINT_URL=${RESEARCH_LIBRARY_S3_ENDPOINT_URL:-}
+      - RESEARCH_LIBRARY_S3_BUCKET=${RESEARCH_LIBRARY_S3_BUCKET:-}
+      - RESEARCH_LIBRARY_S3_ACCESS_KEY_ID=${RESEARCH_LIBRARY_S3_ACCESS_KEY_ID:-}
+      - RESEARCH_LIBRARY_S3_SECRET_ACCESS_KEY=${RESEARCH_LIBRARY_S3_SECRET_ACCESS_KEY:-}
+      - RESEARCH_LIBRARY_S3_REGION=${RESEARCH_LIBRARY_S3_REGION:-}
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      # STT / Whisper EU data-residency (GDPR) — default openai (US, backward-compat).
+      # EU route (Rafael 2026-07-06): STT_PROVIDER=aws-sagemaker + AWS_STT_SAGEMAKER_ENDPOINT
+      # (self-hosted Whisper on SageMaker EU, reuses the Bedrock AWS creds from env_file);
+      # or OPENAI_STT_BASE_URL=https://eu.api.openai.com/v1 for OpenAI's own EU residency.
+      - STT_PROVIDER=${STT_PROVIDER:-openai}
+      - OPENAI_STT_BASE_URL=${OPENAI_STT_BASE_URL:-}
+      - OPENAI_STT_MODEL=${OPENAI_STT_MODEL:-}
+      - AWS_STT_SAGEMAKER_ENDPOINT=${AWS_STT_SAGEMAKER_ENDPOINT:-}
+      - AWS_STT_REGION=${AWS_STT_REGION:-}
+      - PRIVACY_ENABLED=true
+      - PRIVACY_LANGUAGE=de
+      - PRIVACY_LOG_DETECTIONS=false
+      - SKIP_SDK_VERIFICATION=true
+      - RATE_LIMIT_ENABLED=false
+      - DEFAULT_PRIVACY_MODE=none
+      # Routed to the dedicated GPU privacy host gpu-privacy-1 (Tailscale): the
+      # 7GB prod host cannot hold the ~13GB Flair model. gpu-privacy-1 runs it
+      # on GPU (GEX44, RTX 4000 Ada). Rollback (previous CPU route on the
+      # dev-bridge, if gpu-privacy-1 becomes unreachable): set env
+      # PRIVACY_SERVICE_URL=http://100.112.98.39:8100 and redeploy.
+      - PRIVACY_SERVICE_URL=${PRIVACY_SERVICE_URL:-http://100.65.149.39:8100}
+      - BRIDGE_ANONYMIZE_ENABLED=true
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 240s
+    restart: unless-stopped
+    networks:
+      - bridge-prod-net
+
+  # ===========================================================================
   # Privacy + Docling Service — REMOVED from PROD (2026-06-26).
   # Flair ner-german-large needs ~13GB; this 7GB host OOM'd at the 5G limit.
   # PROD now routes smart-anonymize to the dedicated GPU privacy host
@@ -391,3 +649,7 @@ secrets:
     file: ../secrets/claude_token_prod.txt
   claude_token_kurt:
     file: ../secrets/claude_token_kurt.txt
+  claude_token_coach:
+    file: ../secrets/claude_token_coach.txt
+  claude_token_erk:
+    file: ../secrets/claude_token_erk.txt
