@@ -5754,8 +5754,12 @@ async def reset_provider_health_endpoint(
 
 
 @app.get("/debug/tokens")
-async def debug_tokens(request: Request):
-    """Debug endpoint to check TokenRotator status."""
+async def debug_tokens(
+    request: Request,
+    _claims: AuthClaims = Depends(require_service_token),
+):
+    """Debug endpoint to check TokenRotator status. Service-token only —
+    previously public, leaked OAuth-token prefixes + secret file paths (Audit A2)."""
     from src.auth import token_rotator
     return {
         "total_tokens": len(token_rotator.tokens),
