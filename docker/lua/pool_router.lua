@@ -188,84 +188,15 @@ local function count_decision(worker)
 end
 
 -- ---------------------------------------------------------------------------
--- Best-account picker: three-stage selection to prevent single-worker monopoly.
+-- Account ranking
 --
--- Stage 1 — PRIMARY sort: headroom_percent (highest = most capacity)
--- Stage 2 — TIE-BREAKER within 5pp window: current_in_flight_tokens (lowest wins)
---   Accounts whose headroom_percent is within 5pp of the maximum are treated
---   as equal for stage-1, so the one with fewest in-flight tokens wins.
--- Stage 3 — TIE-BREAKER on total tie: decision_counter (least routes wins)
---   When stage 1+2 tie (typical at idle: all 4 workers report 85% headroom +
---   0 in-flight), fall through to the per-worker decision_counter so traffic
---   spreads automatically over time. Without stage 3, Lua's `pairs(accounts)`
---   hash-iteration order picks the same first account every request — the
---   live decision_counter we observed was 99.6% on worker1, 0.1% each on the
---   other three. Using the counter as final tie-breaker is deterministic
---   (no randomness), self-balancing (the laggards catch up automatically),
---   and reuses data we already collect for /internal/pool-router/state.
---
--- Returns best_name, best_pct, best_in_flight  (all nil/-1/nil when none eligible)
---
--- Eligible = available AND session_percent<95 AND cooldown=0 AND
---            headroom_tokens > est_tokens
+-- The policy (weighted-capacity pick, measured-before-unmeasured, weekly hard
+-- wall) lives in pool_pick.lua: pure Lua, no nginx dependency, therefore
+-- unit-testable with a plain luajit — see tests/nginx/test_pool_pick.lua.
+-- This module keeps the I/O, the shared state and the logging.
 -- ---------------------------------------------------------------------------
--- Weighted-capacity picker
---
--- Returns picked_name, picked_weight, total_weight (all nil/-1/-1 when none eligible).
--- Weight = effective_cap_tokens − current_in_flight_tokens (= live admit headroom).
--- Weighted-random pick distributes load proportional to remaining capacity per
--- account. As an account approaches its wall, its predictive_multiplier shrinks
--- effective_cap; as in_flight rises, the residual shrinks too — so heavy
--- accounts fade out automatically without explicit deprioritisation.
--- Hard wall — accounts above this weekly% are never eligible regardless
--- of effective_cap_tokens. Guards against weekly_pct flicker (e.g. 96 ↔ 97
--- across the Anthropic-side rolling window) where mult bounces between
--- 0.10 (eligible at ~127K capacity) and 0.0 (excluded). The flicker would
--- briefly route real traffic to a near-wall account and trigger Anthropic
--- 429s that the cross-worker retry then has to clean up.
-local WEEKLY_HARD_EXCLUDE_PCT = 96
-
-local function pick_weighted_account(accounts, est_tokens)
-    local eligible    = {}
-    local total       = 0
-    local min_required = est_tokens or 0
-
-    for name, info in pairs(accounts) do
-        local available  = info.available
-        local cooldown   = tonumber(info.cooldown_remaining_s) or 0
-        local eff_cap    = tonumber(info.effective_cap_tokens) or 0
-        local in_flight  = tonumber(info.current_in_flight_tokens) or 0
-        local weekly_pct = tonumber(info.weekly_percent) or 0
-        local capacity   = eff_cap - in_flight
-        if available
-                and cooldown == 0
-                and capacity > min_required
-                and weekly_pct < WEEKLY_HARD_EXCLUDE_PCT then
-            -- Carry the account's own worker upstream name (topology-agnostic:
-            -- no hardcoded account→worker map). Fall back to the account name
-            -- only if the state somehow omitted `.worker`.
-            eligible[#eligible + 1] = { name = name, weight = capacity, worker = info.worker or name }
-            total = total + capacity
-        end
-    end
-
-    if #eligible == 0 or total <= 0 then
-        return nil, nil, -1, -1
-    end
-
-    -- Weighted random: r ∈ [0, total) → cumulative-sum walk
-    local r   = math.random() * total
-    local acc = 0
-    for _, e in ipairs(eligible) do
-        acc = acc + e.weight
-        if r <= acc then
-            return e.name, e.worker, e.weight, total
-        end
-    end
-    -- Floating-point safety: fall through to last
-    local last = eligible[#eligible]
-    return last.name, last.worker, last.weight, total
-end
+local pool_pick = require "pool_pick"
+local pick_weighted_account = pool_pick.pick_weighted_account
 
 -- ---------------------------------------------------------------------------
 -- Public API
@@ -376,7 +307,17 @@ function M.choose(opts)
     local req_len    = tonumber(ngx.var.request_length) or 1000
     local est_tokens = math.max(500, math.floor(req_len / 4))
 
-    local picked, picked_worker, picked_weight, total_weight = pick_weighted_account(data.accounts, est_tokens)
+    local picked, picked_worker, picked_weight, total_weight, from_measured,
+          unmeasured_names = pick_weighted_account(data.accounts, est_tokens)
+
+    if picked and not from_measured then
+        -- Loud: the pool is routing on capacity numbers nobody has verified.
+        ngx.log(ngx.ERR, "pool_router: NO measured account eligible — routing on ",
+                #unmeasured_names, " account(s) with UNKNOWN usage (",
+                table.concat(unmeasured_names, ","), "). Their weekly/session % is ",
+                "not being delivered; check the cc-usage snapshot producer for ",
+                "this bridge.")
+    end
 
     if not picked then
         if overflow_capable then
@@ -423,10 +364,14 @@ function M.choose(opts)
     local worker = picked_worker or WORKER_NAMES[1]
     count_decision(worker)
     ngx.var.target_worker   = worker
-    ngx.var.x_pool_decision = "weighted_capacity"
+    -- Distinct decision label when the pick came from the unmeasured bucket, so
+    -- "we routed blind" is visible in the access log and in /internal/
+    -- pool-router/state instead of being indistinguishable from a normal pick.
+    ngx.var.x_pool_decision = from_measured and "weighted_capacity"
+                              or "weighted_capacity_unmeasured"
     local share_pct = (total_weight > 0) and (picked_weight * 100.0 / total_weight) or 0
     ngx.log(ngx.INFO, "pool_router.choose: routed_to=", worker,
-            " reason=weighted_capacity",
+            " reason=", (from_measured and "weighted_capacity" or "weighted_capacity_unmeasured"),
             " account=", picked,
             " weight=", picked_weight,
             " share_pct=", string.format("%.1f", share_pct),

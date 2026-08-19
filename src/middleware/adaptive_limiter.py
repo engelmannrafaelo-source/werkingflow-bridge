@@ -127,13 +127,66 @@ WEEKLY_THROTTLE_CEILING_PCT = float(os.getenv("ADAPTIVE_WEEKLY_CEILING_PCT", "95
 WEEKLY_THROTTLE_MIN_MULT    = float(os.getenv("ADAPTIVE_WEEKLY_MIN_MULT", "0.10"))
 WEEKLY_CACHE_TTL_SEC        = int(os.getenv("ADAPTIVE_WEEKLY_CACHE_TTL_SEC", "30"))
 
-# Account name → worker name (keep in sync with smart-worker-routing.sh)
-_WORKER_ACCOUNT_MAP = {
+# Maximum age of a usage sample before it stops counting as a measurement.
+# Anything older is "unknown", not "0" — see _refresh_account_usage().
+# 90 min covers the 5-minute dev cadence with a wide margin and still catches a
+# scraper that died hours ago. Producers that publish more slowly than this
+# must be sped up, not accommodated by widening the window: a stale number is
+# only marginally better than no number, and pretending otherwise is what let
+# a whole bridge report 0% for months.
+CC_USAGE_MAX_AGE_SEC = float(os.getenv("CC_USAGE_MAX_AGE_SEC", "5400"))
+
+# How often an unresolved "usage unknown" is re-logged, so a permanent outage
+# leaves a periodic trace without spamming a line every TTL.
+_UNKNOWN_RELOG_SEC = float(os.getenv("CC_USAGE_UNKNOWN_RELOG_SEC", "900"))
+
+# Which claude.ai account this worker's OAuth token belongs to.
+#
+# This is PER-HOST TOPOLOGY, exactly like INSTANCE_NAME and BRIDGE_WORKERS, and
+# therefore belongs in the compose file, not in shared code (ADR-0006). The map
+# below is the pre-ADR-0006 leftover: it only ever knew the dev worker names,
+# so on the production bridge (worker-sahori/-kurt/-coach/-erk) it resolved to
+# None — every prod worker then failed to find itself in the usage snapshot and
+# silently kept its initial 0.0. Set WORKER_ACCOUNT explicitly per service.
+_LEGACY_DEV_ACCOUNT_MAP = {
     "worker1": "engelmann",
     "worker2": "office",
     "worker3": "gmail",
     "worker4": "werking",
 }
+
+
+def _resolve_worker_account() -> Optional[str]:
+    """WORKER_ACCOUNT env wins; the legacy dev map is a named, logged default."""
+    explicit = (os.getenv("WORKER_ACCOUNT") or "").strip()
+    if explicit:
+        return explicit
+    legacy = _LEGACY_DEV_ACCOUNT_MAP.get(WORKER_NAME)
+    if legacy:
+        logger.warning(
+            f"WORKER_ACCOUNT unset for worker {WORKER_NAME!r}; using legacy dev "
+            f"default {legacy!r}. Set WORKER_ACCOUNT in the compose service."
+        )
+        return legacy
+    return None
+
+
+WORKER_ACCOUNT: Optional[str] = _resolve_worker_account()
+
+if WORKER_ACCOUNT is None:
+    # Loud, once, at import: without an account name this worker can never be
+    # matched against a usage snapshot. It stays usable (local in-flight cap
+    # still applies) but reports its account usage as UNKNOWN, which the pool
+    # router ranks behind every measured account.
+    logger.error(
+        f"WORKER_ACCOUNT is not set and worker {WORKER_NAME!r} is not in the "
+        f"legacy dev map — this worker's Anthropic account usage will report as "
+        f"UNKNOWN. Set WORKER_ACCOUNT=<claude.ai account id> on this service."
+    )
+
+# Backwards-compatible alias. Kept so existing imports keep working; new code
+# should use WORKER_ACCOUNT.
+_WORKER_ACCOUNT_MAP = _LEGACY_DEV_ACCOUNT_MAP
 
 
 def _weekly_budget_multiplier(weekly_pct: float, session_pct: float) -> float:
@@ -191,7 +244,9 @@ class TuneEvent:
     inflight_count: int = 0
     queued_count: int = 0
     effective_cap_tokens: int = 0
-    account_weekly_pct: float = 0.0
+    # None = the account's usage was not measured at this tick (no snapshot
+    # delivered / too old). Distinct from 0.0 = measured and genuinely idle.
+    account_weekly_pct: Optional[float] = None
 
 
 @dataclass
@@ -233,12 +288,30 @@ class AdaptiveLoadLimiter:
         # Cached view of own-account weekly + session usage (refreshed via
         # _refresh_account_usage every WEEKLY_CACHE_TTL_SEC). Keeps the hot
         # path O(1) — no file I/O on every request.
-        self._account_usage: Dict[str, float] = {
-            "weekly_pct": 0.0,
-            "session_pct": 0.0,
-            "ts": 0.0,
+        #
+        # THREE-STATE, deliberately: `known` separates "measured" from "never
+        # measured / measurement too old". Before this, both collapsed onto the
+        # float 0.0, and 0% reads everywhere downstream as *maximum free
+        # capacity* — so a bridge that had never once received a usage snapshot
+        # advertised itself as the freshest pool in the fleet.
+        self._account_usage: Dict[str, Any] = {
+            "known": False,
+            "weekly_pct": None,
+            "session_pct": None,
+            # Local admission stays permissive while usage is unknown (mult 1.0):
+            # the in-flight token cap still bounds this worker, and turning a
+            # missing measurement into a hard local reject would convert a
+            # monitoring gap into an outage. The pessimism belongs in the
+            # cross-account RANKING (pool router / sandbox picker), which can
+            # prefer a measured account without taking anyone offline.
             "budget_multiplier": 1.0,
+            "source_ts": None,
+            "ts": 0.0,
+            "reason": "not yet sampled",
         }
+        # Drives the "delivery just broke" WARNING and the periodic re-log.
+        self._usage_last_log_ts: float = 0.0
+        self._usage_last_log_reason: Optional[str] = None
 
         os.makedirs(METRICS_DIR, exist_ok=True)
         self.state = self._load_state()
@@ -305,44 +378,108 @@ class AdaptiveLoadLimiter:
             return get_rolling_metrics()._in_flight.get(self.worker, 0)  # noqa: SLF001
         except Exception:
             return 0
+    def _mark_usage_unknown(self, reason: str, now: float) -> None:
+        """
+        Drop to the UNKNOWN state and make sure somebody can find out why.
+
+        The previous version swallowed every failure into a debug line and kept
+        whatever number was in the cache (initially 0.0). That is the exact
+        error class this change is about: a broken delivery looked identical to
+        an idle account. Losing the measurement is now a state, and entering it
+        is a WARNING, not a debug crumb.
+        """
+        was_known = bool(self._account_usage.get("known"))
+        self._account_usage = {
+            "known": False,
+            "weekly_pct": None,
+            "session_pct": None,
+            "budget_multiplier": 1.0,  # see __init__: permissive locally, demoted in ranking
+            "source_ts": None,
+            "ts": now,
+            "reason": reason,
+        }
+        due = (now - self._usage_last_log_ts) >= _UNKNOWN_RELOG_SEC
+        if was_known:
+            logger.warning(
+                f"account usage for worker {self.worker!r} (account "
+                f"{WORKER_ACCOUNT!r}) went from MEASURED to UNKNOWN: {reason}. "
+                f"This worker is now ranked behind every measured account."
+            )
+        elif due or self._usage_last_log_reason != reason:
+            logger.warning(
+                f"account usage for worker {self.worker!r} (account "
+                f"{WORKER_ACCOUNT!r}) is UNKNOWN: {reason}"
+            )
+        else:
+            return
+        self._usage_last_log_ts = now
+        self._usage_last_log_reason = reason
 
     def _refresh_account_usage(self) -> None:
         """
-        Update the cached own-account weekly+session %. Reads the shared
-        cc_usage_snapshots store; cheap enough to call once per admission
-        decision thanks to the TTL check. Silent-on-error (keeps last value).
+        Update the cached own-account weekly + session %.
+
+        Reads the shared cc_usage_snapshots store; cheap enough to call once per
+        admission decision thanks to the TTL check. Every path that fails to
+        produce a fresh measurement lands in the explicit UNKNOWN state with a
+        reason — never in a plausible-looking 0.
         """
         now = time.time()
         last_ts = self._account_usage.get("ts", 0.0)
         if now - last_ts < WEEKLY_CACHE_TTL_SEC:
             return
+
+        if not WORKER_ACCOUNT:
+            self._mark_usage_unknown(
+                f"WORKER_ACCOUNT unset for worker {self.worker!r} — cannot match "
+                f"this worker against any usage snapshot", now
+            )
+            return
+
         try:
             from src.middleware.bridge_metrics_store import get_cc_usage_store
-            history = get_cc_usage_store().get_history(hours=1, limit=1)
-            snapshots = history.get("snapshots") or []
-            if not snapshots:
-                self._account_usage["ts"] = now  # mark attempted
-                return
-            target_account = _WORKER_ACCOUNT_MAP.get(self.worker)
-            for acc in snapshots[0].get("accounts", []):
-                if acc.get("account") != target_account:
-                    continue
-                weekly  = float(acc.get("weeklyAllModels", {}).get("percent", 0) or 0)
-                session = float(acc.get("currentSession", {}).get("percent", 0) or 0)
-                self._maybe_set_capacity_lock(acc)
-                mult = _weekly_budget_multiplier(weekly, session)
-                self._account_usage = {
-                    "weekly_pct": weekly,
-                    "session_pct": session,
-                    "budget_multiplier": mult,
-                    "ts": now,
-                }
-                return
-            # No entry for us in the snapshot — mark attempted, keep prior
-            self._account_usage["ts"] = now
+            acc, snap_ts, reason = get_cc_usage_store().latest_for_account(
+                WORKER_ACCOUNT, CC_USAGE_MAX_AGE_SEC
+            )
         except Exception as e:
-            logger.debug(f"_refresh_account_usage failed: {e}")
-            self._account_usage["ts"] = now  # back off until next TTL
+            # Loud on purpose: an unreadable usage store is an infrastructure
+            # fault, not a value of 0%.
+            self._mark_usage_unknown(f"usage store read failed: {e!r}", now)
+            return
+
+        if acc is None:
+            self._mark_usage_unknown(reason or "no usable snapshot", now)
+            return
+
+        weekly_raw = (acc.get("weeklyAllModels") or {}).get("percent")
+        session_raw = (acc.get("currentSession") or {}).get("percent")
+        if weekly_raw is None or session_raw is None:
+            self._mark_usage_unknown(
+                f"snapshot entry for {WORKER_ACCOUNT!r} is missing "
+                f"weeklyAllModels/currentSession percent", now
+            )
+            return
+
+        weekly = float(weekly_raw)
+        session = float(session_raw)
+        self._maybe_set_capacity_lock(acc)
+        if not self._account_usage.get("known"):
+            logger.info(
+                f"account usage for worker {self.worker!r} (account "
+                f"{WORKER_ACCOUNT!r}) is MEASURED again: weekly={weekly:.1f}% "
+                f"session={session:.1f}% (snapshot {int(now - (snap_ts or now))}s old)"
+            )
+            self._usage_last_log_reason = None
+        self._account_usage = {
+            "known": True,
+            "weekly_pct": weekly,
+            "session_pct": session,
+            "budget_multiplier": _weekly_budget_multiplier(weekly, session),
+            "source_ts": snap_ts,
+            "ts": now,
+            "reason": "",
+        }
+
 
     def _maybe_set_capacity_lock(self, acc: dict) -> None:
         """Lock this worker until Anthropic's reported reset time when at quota wall (≥95%)."""
@@ -397,8 +534,11 @@ class AdaptiveLoadLimiter:
             effective_cap = self._effective_cap()
             would_be = inflight_tokens + max(0, est_tokens)
             acct = self._account_usage
-            weekly_pct = float(acct.get("weekly_pct", 0.0))
-            session_pct = float(acct.get("session_pct", 0.0))
+            usage_known = bool(acct.get("known"))
+            weekly_raw = acct.get("weekly_pct")
+            session_raw = acct.get("session_pct")
+            weekly_pct = float(weekly_raw) if weekly_raw is not None else None
+            session_pct = float(session_raw) if session_raw is not None else None
             budget_mult = float(acct.get("budget_multiplier", 1.0))
             snapshot = {
                 "worker": self.worker,
@@ -411,8 +551,13 @@ class AdaptiveLoadLimiter:
                 "safety_margin_pct": SAFETY_MARGIN_PCT,
                 "utilization_pct": round(inflight_tokens * 100.0 / cap, 1) if cap > 0 else 0.0,
                 "hard_request_ceiling": HARD_REQUEST_CEILING,
+                # None when unmeasured — a consumer that treats these as
+                # numbers must decide explicitly what "no measurement" means
+                # instead of silently reading 0 as "account is fresh".
                 "account_weekly_pct": weekly_pct,
                 "account_session_pct": session_pct,
+                "account_usage_known": usage_known,
+                "account_usage_reason": acct.get("reason") or "",
                 "weekly_budget_multiplier": round(budget_mult, 3),
             }
             if inflight_count >= HARD_REQUEST_CEILING:
@@ -424,9 +569,14 @@ class AdaptiveLoadLimiter:
                 # If the weekly-budget multiplier has throttled us to near-zero,
                 # surface that as the primary reason (the cap_tokens number is
                 # irrelevant — the weekly limit is what's actually blocking).
-                if budget_mult < 0.5 and weekly_pct >= WEEKLY_THROTTLE_START_PCT:
+                if (
+                    budget_mult < 0.5
+                    and weekly_pct is not None
+                    and weekly_pct >= WEEKLY_THROTTLE_START_PCT
+                ):
                     reason = (
-                        f"Weekly budget {weekly_pct:.1f}% (session {session_pct:.1f}%) "
+                        f"Weekly budget {weekly_pct:.1f}% "
+                        f"(session {session_pct if session_pct is not None else float('nan'):.1f}%) "
                         f"triggered predictive throttle (mult={budget_mult:.2f}). "
                         f"Effective cap shrunk to {effective_cap:,} tokens; "
                         f"would_be={would_be:,}."
@@ -489,11 +639,11 @@ class AdaptiveLoadLimiter:
         effective_cap = snap.get("effective_cap_tokens", 0)
         if est_tokens > effective_cap:
             mult = snap.get("weekly_budget_multiplier", 1.0)
-            weekly = snap.get("account_weekly_pct", 0.0)
+            weekly = snap.get("account_weekly_pct")
             # When the weekly throttle has squeezed the cap to near-zero, the
             # real blocker is the account budget — say so explicitly so apps
             # can surface "account near limit" rather than "request too big".
-            if mult < 0.5 and weekly >= WEEKLY_THROTTLE_START_PCT:
+            if mult < 0.5 and weekly is not None and weekly >= WEEKLY_THROTTLE_START_PCT:
                 reason = (
                     f"Weekly budget {weekly:.1f}% has throttled effective cap "
                     f"to {effective_cap:,} tokens (mult={mult:.2f}); "
@@ -653,7 +803,8 @@ class AdaptiveLoadLimiter:
             # margin × weekly multiplier) so operators see the real ceiling,
             # not just the theoretical one.
             effective_cap_now = self._effective_cap()
-            weekly_pct_now = float(self._account_usage.get("weekly_pct", 0.0))
+            weekly_raw_now = self._account_usage.get("weekly_pct")
+            weekly_pct_now = float(weekly_raw_now) if weekly_raw_now is not None else None
 
             ev = TuneEvent(
                 ts=now,
@@ -668,7 +819,9 @@ class AdaptiveLoadLimiter:
                 inflight_count=self._current_inflight_count(),
                 queued_count=self._queued_count,
                 effective_cap_tokens=effective_cap_now,
-                account_weekly_pct=round(weekly_pct_now, 2),
+                account_weekly_pct=(
+                    round(weekly_pct_now, 2) if weekly_pct_now is not None else None
+                ),
             )
             self._save_state()
             self._append_event(ev)
@@ -727,8 +880,17 @@ class AdaptiveLoadLimiter:
             "last_shrink_ts": self.state.last_shrink_ts,
             "last_tune_ts": self.state.last_tune_ts,
             "hard_request_ceiling": HARD_REQUEST_CEILING,
-            "account_weekly_pct": round(float(acct.get("weekly_pct", 0.0)), 2),
-            "account_session_pct": round(float(acct.get("session_pct", 0.0)), 2),
+            "account_weekly_pct": (
+                round(float(acct["weekly_pct"]), 2)
+                if acct.get("weekly_pct") is not None else None
+            ),
+            "account_session_pct": (
+                round(float(acct["session_pct"]), 2)
+                if acct.get("session_pct") is not None else None
+            ),
+            "account_usage_known": bool(acct.get("known")),
+            "account_usage_source_ts": acct.get("source_ts"),
+            "account_usage_reason": acct.get("reason") or "",
             "weekly_budget_multiplier": round(float(acct.get("budget_multiplier", 1.0)), 3),
             "recent_events": recent_events,
             "config": {
@@ -886,7 +1048,7 @@ async def enforce_pool_admission(request: Request) -> None:
     cap = snap.get("cap_tokens", 0)
     inflight = snap.get("inflight_tokens", 0)
     mult = snap.get("weekly_budget_multiplier", 1.0)
-    weekly_pct = snap.get("account_weekly_pct", 0.0)
+    weekly_pct = snap.get("account_weekly_pct")
 
     # Predictive weekly-budget throttle (kept for opt-in use). With the new
     # "capacity egal, streaming window" policy this path is dormant because
@@ -895,6 +1057,7 @@ async def enforce_pool_admission(request: Request) -> None:
     if (
         WEEKLY_PREDICTIVE_THROTTLE_ENABLED
         and mult <= WEEKLY_THROTTLE_MIN_MULT
+        and weekly_pct is not None
         and weekly_pct >= WEEKLY_THROTTLE_START_PCT
     ):
         raise BridgeError(account_exhausted_error(retry_after_s=3600))

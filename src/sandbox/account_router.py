@@ -186,17 +186,42 @@ async def pick_account(
         accounts = _last_good_state[1]
 
     lease_counts = lease_counts or {}
-    eligible: list[tuple[str, float, int, int]] = []  # (acct_name, headroom, cooldown, lease_count)
+    # (acct_name, headroom, cooldown, lease_count)
+    measured: list[tuple[str, float, int, int]] = []
+    unmeasured: list[tuple[str, float, int, int]] = []
     exclusion_reasons: dict[str, str] = {}
     all_cooldowns: list[int] = []
 
     for acct_name, info in accounts.items():
         ok, reason, headroom, cooldown = _evaluate(acct_name, info)
         all_cooldowns.append(cooldown)
-        if ok:
-            eligible.append((acct_name, headroom, cooldown, lease_counts.get(acct_name, 0)))
-        else:
+        if not ok:
             exclusion_reasons[acct_name] = reason
+            continue
+        row = (acct_name, headroom, cooldown, lease_counts.get(acct_name, 0))
+        # Strictly `is True`: a missing field (worker on a pre-tri-state image)
+        # must count as unmeasured, never as measured.
+        if info.get("usage_known") is True:
+            measured.append(row)
+        else:
+            unmeasured.append(row)
+
+    # Measured accounts win outright. Ranking here is headroom-driven, and an
+    # unmeasured account reports the most attractive headroom there is (the
+    # in-flight ceiling alone, unreduced by any weekly/session consumption) —
+    # so without this split the picker systematically prefers exactly the
+    # accounts nobody can see. Same reasoning as pool_router.lua; unmeasured
+    # accounts are held back, not excluded, so a blind spot cannot become a
+    # capacity outage.
+    eligible = measured
+    if not eligible and unmeasured:
+        logger.error(
+            "pick_account: NO measured account eligible — falling back to %d "
+            "account(s) with UNKNOWN usage (%s). Their weekly/session %% is not "
+            "being delivered; check the cc-usage snapshot producer for this bridge.",
+            len(unmeasured), ", ".join(a[0] for a in unmeasured),
+        )
+        eligible = unmeasured
 
     if not eligible:
         # retry_after_s: shortest non-zero cooldown across pool, or 30s
@@ -217,6 +242,12 @@ async def pick_account(
                     f"cooldown_rem={cooldown}s lease_count={lc} (of {len(eligible)} eligible)"
                 )
                 return PickedAccount(account_id=acct_name, headroom_percent=headroom)
+
+    if unmeasured and eligible is measured:
+        logger.info(
+            "pick_account: %d account(s) held back as UNMEASURED (%s)",
+            len(unmeasured), ", ".join(a[0] for a in unmeasured),
+        )
 
     # Fair round-robin: rank by (lease_count ASC, -headroom ASC, cooldown ASC).
     # Least-used wins; ties broken by most-budget; final tiebreak shortest cooldown.

@@ -991,9 +991,23 @@ def get_account_pool_state():
             account = data.get("account", worker)
             accounts[account] = {
                 "worker": data.get("worker", worker),
-                "session_percent": data.get("session_percent", 0),
+                # null, not 0, when the worker could not measure its account —
+                # see usage_known. Defaulting these to 0 here would re-create
+                # the phantom-capacity bug one layer up.
+                "session_percent": data.get("session_percent"),
                 "session_reset_in_s": data.get("session_reset_in_s", 0),
-                "weekly_percent": data.get("weekly_percent", 0),
+                "weekly_percent": data.get("weekly_percent"),
+                # Default FALSE on purpose: a worker running an image that
+                # predates this field cannot have measured anything we can
+                # trust, so it must read as unmeasured, never as measured.
+                "usage_known": bool(data.get("usage_known", False)),
+                "usage_source_ts": data.get("usage_source_ts"),
+                "usage_age_s": data.get("usage_age_s"),
+                "usage_unknown_reason": data.get(
+                    "usage_unknown_reason",
+                    "" if data.get("usage_known") else
+                    "worker payload has no usage_known field (pre-tri-state image)",
+                ),
                 "adaptive_cap_tokens": data.get("adaptive_cap_tokens", 0),
                 "current_in_flight_tokens": data.get("current_in_flight_tokens", 0),
                 "headroom_tokens": data.get("headroom_tokens", 0),

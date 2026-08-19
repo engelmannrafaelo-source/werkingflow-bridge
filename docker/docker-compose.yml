@@ -88,6 +88,11 @@ services:
       - BRIDGE_SECRETS_DIR=/app/secrets
       - BRIDGE_ANONYMIZE_ENABLED=true
       - INSTANCE_NAME=worker1
+      # claude.ai account whose OAuth token this worker uses. Per-host
+      # topology (like INSTANCE_NAME), therefore config — NOT a map in
+      # shared code. Must match the `account` field the usage scraper
+      # publishes, otherwise this worker's usage reports as UNKNOWN.
+      - WORKER_ACCOUNT=engelmann
       - BRIDGE_GENERIC_JOBS_ENABLED=true
       # OA-Scholarly-Schicht (nur DEV/hetzner — diese Compose ist hetzner-only, PROD nutzt
       # docker-compose-prod.yml). Aktiviert die legale OA-Volltext-Injektion bei research_mode=academic.
@@ -214,6 +219,11 @@ services:
       - BRIDGE_SECRETS_DIR=/app/secrets
       - BRIDGE_ANONYMIZE_ENABLED=true
       - INSTANCE_NAME=worker2
+      # claude.ai account whose OAuth token this worker uses. Per-host
+      # topology (like INSTANCE_NAME), therefore config — NOT a map in
+      # shared code. Must match the `account` field the usage scraper
+      # publishes, otherwise this worker's usage reports as UNKNOWN.
+      - WORKER_ACCOUNT=office
       - BRIDGE_GENERIC_JOBS_ENABLED=true
       # OA-Scholarly-Schicht (nur DEV/hetzner — diese Compose ist hetzner-only, PROD nutzt
       # docker-compose-prod.yml). Aktiviert die legale OA-Volltext-Injektion bei research_mode=academic.
@@ -340,6 +350,11 @@ services:
       - BRIDGE_SECRETS_DIR=/app/secrets
       - BRIDGE_ANONYMIZE_ENABLED=true
       - INSTANCE_NAME=worker3
+      # claude.ai account whose OAuth token this worker uses. Per-host
+      # topology (like INSTANCE_NAME), therefore config — NOT a map in
+      # shared code. Must match the `account` field the usage scraper
+      # publishes, otherwise this worker's usage reports as UNKNOWN.
+      - WORKER_ACCOUNT=gmail
       - BRIDGE_GENERIC_JOBS_ENABLED=true
       # OA-Scholarly-Schicht (nur DEV/hetzner — diese Compose ist hetzner-only, PROD nutzt
       # docker-compose-prod.yml). Aktiviert die legale OA-Volltext-Injektion bei research_mode=academic.
@@ -466,6 +481,11 @@ services:
       - BRIDGE_SECRETS_DIR=/app/secrets
       - BRIDGE_ANONYMIZE_ENABLED=true
       - INSTANCE_NAME=worker4
+      # claude.ai account whose OAuth token this worker uses. Per-host
+      # topology (like INSTANCE_NAME), therefore config — NOT a map in
+      # shared code. Must match the `account` field the usage scraper
+      # publishes, otherwise this worker's usage reports as UNKNOWN.
+      - WORKER_ACCOUNT=werking
       - BRIDGE_GENERIC_JOBS_ENABLED=true
       # OA-Scholarly-Schicht (nur DEV/hetzner — diese Compose ist hetzner-only, PROD nutzt
       # docker-compose-prod.yml). Aktiviert die legale OA-Volltext-Injektion bei research_mode=academic.

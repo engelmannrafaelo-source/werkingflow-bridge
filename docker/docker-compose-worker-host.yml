@@ -156,6 +156,7 @@ services:
       <<: *worker-env-common
       CLAUDE_CODE_OAUTH_TOKEN_FILE: /run/secrets/claude_token_sahori
       INSTANCE_NAME: worker-sahori
+      WORKER_ACCOUNT: sahori
 
   worker-kurt:
     <<: *worker-common
@@ -168,6 +169,7 @@ services:
       <<: *worker-env-common
       CLAUDE_CODE_OAUTH_TOKEN_FILE: /run/secrets/claude_token_kurt
       INSTANCE_NAME: worker-kurt
+      WORKER_ACCOUNT: kurt
 
   worker-coach:
     <<: *worker-common
@@ -180,6 +182,7 @@ services:
       <<: *worker-env-common
       CLAUDE_CODE_OAUTH_TOKEN_FILE: /run/secrets/claude_token_coach
       INSTANCE_NAME: worker-coach
+      WORKER_ACCOUNT: coach
 
   worker-erk:
     <<: *worker-common
@@ -192,6 +195,7 @@ services:
       <<: *worker-env-common
       CLAUDE_CODE_OAUTH_TOKEN_FILE: /run/secrets/claude_token_erk
       INSTANCE_NAME: worker-erk
+      WORKER_ACCOUNT: erk
 
 networks:
   bridge-worker-host-net:

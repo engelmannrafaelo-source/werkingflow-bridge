@@ -99,6 +99,11 @@ services:
       - LOG_TO_FILE=true
       - FILTER_SENSITIVE_DATA=true
       - INSTANCE_NAME=worker-sahori
+      # claude.ai account whose OAuth token this worker uses. Per-host
+      # topology (like INSTANCE_NAME), therefore config — NOT a map in
+      # shared code. Must match the `account` field the usage scraper
+      # publishes, otherwise this worker's usage reports as UNKNOWN.
+      - WORKER_ACCOUNT=sahori
       - BRIDGE_GENERIC_JOBS_ENABLED=true
       # OA-Scholarly-Schicht: legale OA-Volltext-Injektion bei research_mode=academic
       # (OpenAlex/CORE, fail-soft). Prod-Aktivierung Rafael-Go 2026-07-25.
@@ -227,6 +232,11 @@ services:
       - LOG_TO_FILE=true
       - FILTER_SENSITIVE_DATA=true
       - INSTANCE_NAME=worker-kurt
+      # claude.ai account whose OAuth token this worker uses. Per-host
+      # topology (like INSTANCE_NAME), therefore config — NOT a map in
+      # shared code. Must match the `account` field the usage scraper
+      # publishes, otherwise this worker's usage reports as UNKNOWN.
+      - WORKER_ACCOUNT=kurt
       - BRIDGE_GENERIC_JOBS_ENABLED=true
       # OA-Scholarly-Schicht: legale OA-Volltext-Injektion bei research_mode=academic
       # (OpenAlex/CORE, fail-soft). Prod-Aktivierung Rafael-Go 2026-07-25.
@@ -356,6 +366,11 @@ services:
       - LOG_TO_FILE=true
       - FILTER_SENSITIVE_DATA=true
       - INSTANCE_NAME=worker-coach
+      # claude.ai account whose OAuth token this worker uses. Per-host
+      # topology (like INSTANCE_NAME), therefore config — NOT a map in
+      # shared code. Must match the `account` field the usage scraper
+      # publishes, otherwise this worker's usage reports as UNKNOWN.
+      - WORKER_ACCOUNT=coach
       - BRIDGE_GENERIC_JOBS_ENABLED=true
       # OA-Scholarly-Schicht: legale OA-Volltext-Injektion bei research_mode=academic
       # (OpenAlex/CORE, fail-soft). Prod-Aktivierung Rafael-Go 2026-07-25.
@@ -485,6 +500,11 @@ services:
       - LOG_TO_FILE=true
       - FILTER_SENSITIVE_DATA=true
       - INSTANCE_NAME=worker-erk
+      # claude.ai account whose OAuth token this worker uses. Per-host
+      # topology (like INSTANCE_NAME), therefore config — NOT a map in
+      # shared code. Must match the `account` field the usage scraper
+      # publishes, otherwise this worker's usage reports as UNKNOWN.
+      - WORKER_ACCOUNT=erk
       - BRIDGE_GENERIC_JOBS_ENABLED=true
       # OA-Scholarly-Schicht: legale OA-Volltext-Injektion bei research_mode=academic
       # (OpenAlex/CORE, fail-soft). Prod-Aktivierung Rafael-Go 2026-07-25.

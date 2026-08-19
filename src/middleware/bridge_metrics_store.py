@@ -337,6 +337,76 @@ class CCUsageStore:
         except OSError as e:
             logger.warning(f"Cannot write CC usage snapshot: {e}")
 
+    # Tail budget for latest_for_account(). The file grows ~5 MB/day at the
+    # 5-minute scrape cadence; 4 MB of tail therefore covers well over half a
+    # day of snapshots — far more than any sane freshness window. Bounded on
+    # purpose: this runs on the admission hot path (behind a TTL) and the file
+    # is tens of MB, so a full parse per worker per TTL is not acceptable.
+    _TAIL_SCAN_BYTES = int(os.getenv("CC_USAGE_TAIL_SCAN_BYTES", str(4 * 1024 * 1024)))
+
+    def latest_for_account(
+        self, account: str, max_age_s: float
+    ) -> tuple[Optional[dict], Optional[float], str]:
+        """
+        Newest snapshot entry for ONE account, scanning the file tail backwards.
+
+        Returns (account_entry, snapshot_ts, reason).
+        `account_entry` is None whenever no usable value exists; `reason` then
+        says WHY in a form fit for a log line and an operator alarm. It is
+        never "" on the None path — a caller must always be able to state the
+        cause, because "no data" silently rendered as 0 is exactly the failure
+        this method exists to make impossible.
+
+        Why per-account and not "the newest snapshot": several producers write
+        into this one file (the dev-server scraper posts the four dev accounts,
+        the partner-server scraper posts the partner accounts). Taking the last
+        line and looking for yourself in it means every foreign snapshot blanks
+        your own reading for one cadence. Scanning back to the newest snapshot
+        that actually CONTAINS this account is both correct and producer-count
+        agnostic.
+        """
+        if not os.path.exists(self.JSONL_PATH):
+            return None, None, f"snapshot file missing ({self.JSONL_PATH})"
+
+        cutoff = time.time() - max_age_s
+        try:
+            size = os.path.getsize(self.JSONL_PATH)
+            with open(self.JSONL_PATH, "rb") as f:
+                if size > self._TAIL_SCAN_BYTES:
+                    f.seek(size - self._TAIL_SCAN_BYTES)
+                    f.readline()  # discard the partial first line
+                chunk = f.read()
+        except OSError as e:
+            return None, None, f"snapshot file unreadable: {e}"
+
+        newest_ts_seen: Optional[float] = None
+        for raw in reversed(chunk.splitlines()):
+            raw = raw.strip()
+            if not raw:
+                continue
+            try:
+                entry = json.loads(raw)
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                continue
+            ts = float(entry.get("ts", 0) or 0)
+            if newest_ts_seen is None:
+                newest_ts_seen = ts
+            if ts < cutoff:
+                # Snapshots are append-ordered: everything further back is older
+                # still, so there is nothing left to find within the window.
+                break
+            for acc in entry.get("accounts", []) or []:
+                if acc.get("account") == account:
+                    return acc, ts, ""
+
+        if newest_ts_seen is None:
+            return None, None, "snapshot file contains no readable snapshot"
+        age = time.time() - newest_ts_seen
+        return None, None, (
+            f"no snapshot for account {account!r} within {int(max_age_s)}s "
+            f"(newest snapshot in file is {int(age)}s old)"
+        )
+
     def get_history(self, hours: int = 168, limit: int = 500) -> Dict[str, Any]:
         """
         Get CC usage snapshots for the given time window.

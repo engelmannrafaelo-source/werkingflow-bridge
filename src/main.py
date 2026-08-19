@@ -8294,11 +8294,11 @@ async def get_account_pool_state():
     """Exposes this worker's adaptive limiter state for the nginx pool-router."""
     import time as _time
     from src.middleware.adaptive_limiter import (
+        CC_USAGE_MAX_AGE_SEC,
         SAFETY_MARGIN_PCT,
         SHRINK_TRIGGER_SEC,
         WEEKLY_PREDICTIVE_THROTTLE_ENABLED,
-        _WORKER_ACCOUNT_MAP,
-        _weekly_budget_multiplier,
+        WORKER_ACCOUNT,
     )
     lim = get_adaptive_limiter()
     lim._refresh_account_usage()
@@ -8320,18 +8320,36 @@ async def get_account_pool_state():
     # alphabetically-first account (decision_counter showed 99.6% on worker1).
     # Using the true min lets the router rank workers by which Anthropic
     # account is actually freshest, even when the Bridge itself is idle.
-    session_pct = float(acct.get("session_pct", 0.0))
-    weekly_pct = float(acct.get("weekly_pct", 0.0))
+    # THREE-STATE (see adaptive_limiter._refresh_account_usage): usage_known
+    # separates "measured" from "never measured / measurement stale". They are
+    # NOT the same thing and must not both surface as 0.0 — a worker whose
+    # snapshot never arrived used to report weekly=0/session=0, which the two
+    # ceilings below turned into headroom_percent=100, i.e. the freshest
+    # account in the fleet. The whole production bridge sat in that state.
+    usage_known = bool(acct.get("known"))
+    session_pct = acct.get("session_pct")
+    weekly_pct = acct.get("weekly_pct")
+    session_pct = float(session_pct) if session_pct is not None else None
+    weekly_pct = float(weekly_pct) if weekly_pct is not None else None
+    usage_source_ts = acct.get("source_ts")
+    usage_age_s = (
+        int(_time.time() - usage_source_ts) if usage_source_ts else None
+    )
 
     inflight_headroom_pct = (
         max(0.0, (safety_cap - inflight) * 100.0 / safety_cap) if safety_cap > 0 else 0.0
     )
-    session_remaining_pct = max(0.0, 100.0 - session_pct)
-    weekly_remaining_pct = max(0.0, 100.0 - weekly_pct)
-    headroom_pct = round(
-        min(inflight_headroom_pct, session_remaining_pct, weekly_remaining_pct),
-        1,
-    )
+    # With no measurement, the in-flight ceiling is the ONLY ceiling we can
+    # honestly see, so that is what gets reported — no invented 100, and no
+    # invented 0 either (clamping to 0 would flip `available` to false and turn
+    # a monitoring gap into a pool outage). The correction for "we cannot see
+    # this account" happens where accounts are RANKED against each other
+    # (pool_router.lua, sandbox/account_router.py), keyed on usage_known.
+    ceilings = [inflight_headroom_pct]
+    if usage_known:
+        ceilings.append(max(0.0, 100.0 - session_pct))
+        ceilings.append(max(0.0, 100.0 - weekly_pct))
+    headroom_pct = round(min(ceilings), 1)
     headroom = int(safety_cap * headroom_pct / 100.0) if safety_cap > 0 else 0
 
     now = _time.time()
@@ -8379,17 +8397,26 @@ async def get_account_pool_state():
         if merged_last_rate_limit_ts is None or tracker_last_ts > merged_last_rate_limit_ts:
             merged_last_rate_limit_ts = tracker_last_ts
 
-    account_name = _WORKER_ACCOUNT_MAP.get(worker_id, worker_id)
+    account_name = WORKER_ACCOUNT or worker_id
 
-    budget_multiplier = _weekly_budget_multiplier(weekly_pct, session_pct)
+    # Reuse the limiter's own cached multiplier rather than recomputing it here:
+    # it already encodes the unknown case (1.0 — permissive locally, see above)
+    # and recomputing would need a numeric weekly/session that may not exist.
+    budget_multiplier = float(acct.get("budget_multiplier", 1.0))
     effective_cap_tokens = int(safety_cap * budget_multiplier)
 
     return {
         "ts": int(now),
         "worker": worker_id,
         "account": account_name,
-        "session_percent": round(session_pct, 1),
-        "weekly_percent": round(weekly_pct, 1),
+        # null (not 0) when unmeasured — see usage_known.
+        "session_percent": round(session_pct, 1) if session_pct is not None else None,
+        "weekly_percent": round(weekly_pct, 1) if weekly_pct is not None else None,
+        "usage_known": usage_known,
+        "usage_source_ts": usage_source_ts,
+        "usage_age_s": usage_age_s,
+        "usage_max_age_s": int(CC_USAGE_MAX_AGE_SEC),
+        "usage_unknown_reason": (acct.get("reason") or "") if not usage_known else "",
         "adaptive_cap_tokens": cap,
         "current_in_flight_tokens": inflight,
         "headroom_tokens": headroom,
@@ -8399,9 +8426,12 @@ async def get_account_pool_state():
         "effective_cap_tokens": effective_cap_tokens,
         "last_rate_limit_ts": merged_last_rate_limit_ts,
         "cooldown_remaining_s": cooldown_remaining_s,
+        # Unmeasured usage does NOT make a worker unavailable — see the
+        # headroom comment above. It makes it *last choice*, which the rankers
+        # enforce via usage_known.
         "available": (
             not cap_lock.is_locked(worker_id)
-            and session_pct < 95.0
+            and (session_pct is None or session_pct < 95.0)
             and headroom > 0
             and not tracker_is_limited
         ),
