@@ -150,3 +150,104 @@ async def test_json_body_is_sent_on_post():
     with _patched_client(handler):
         resp = await call_platform("POST", "/v1/internal/audit-events", json={"action": "test"})
     assert resp.status_code == 201
+
+
+# --- Retry contract (ADR-0009 Schritt 2, revidiert 2026-08-20) -------------
+#
+# The point of these: retrying is opt-in, bounded, and NEVER applied to a 5xx.
+# The 5xx case is the safety-critical one — platform-api was reached, so a
+# replay is a second attempt at an unknown state, not a retry.
+
+
+@pytest.mark.asyncio
+async def test_default_does_not_retry_a_timeout():
+    """Default retries=0 keeps the pre-2b behaviour: exactly one attempt.
+
+    This is what makes the opt-in safe for the existing non-idempotent call
+    site (POST /v1/internal/audit-events writes audit_log with no dedup key).
+    """
+    attempts = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        attempts.append(1)
+        raise httpx.ReadTimeout("simulated", request=request)
+
+    with _patched_client(handler):
+        with pytest.raises(PlatformUnavailable):
+            await call_platform("POST", "/v1/internal/audit-events", json={"a": 1})
+    assert len(attempts) == 1
+
+
+@pytest.mark.asyncio
+async def test_opt_in_retry_makes_exactly_the_requested_extra_attempts():
+    attempts = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        attempts.append(1)
+        raise httpx.ReadTimeout("simulated", request=request)
+
+    with _patched_client(handler):
+        with pytest.raises(PlatformUnavailable) as exc:
+            await call_platform(
+                "GET", "/v1/internal/budget/user-budget-state",
+                retries=1, retry_backoff_s=0,
+            )
+    assert len(attempts) == 2
+    assert "after 2 attempt(s)" in str(exc.value)
+
+
+@pytest.mark.asyncio
+async def test_retry_succeeds_on_the_second_attempt():
+    """The case the whole thing exists for: platform-api was restarting and is
+    back a moment later — the customer's call survives the blip."""
+    attempts = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        attempts.append(1)
+        if len(attempts) == 1:
+            raise httpx.ConnectError("simulated restart", request=request)
+        return httpx.Response(200, json={"allowed": True})
+
+    with _patched_client(handler):
+        resp = await call_platform(
+            "GET", "/v1/internal/budget/user-budget-state",
+            retries=1, retry_backoff_s=0,
+        )
+    assert len(attempts) == 2
+    assert resp.status_code == 200
+    assert resp.json == {"allowed": True}
+
+
+@pytest.mark.asyncio
+async def test_5xx_is_never_retried_even_when_retries_are_requested():
+    """Safety-critical: a 5xx is an ANSWER, not unreachability. platform-api
+    was reached and may have had a partial effect; replaying is not a retry."""
+    attempts = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        attempts.append(1)
+        return httpx.Response(503, text="upstream down")
+
+    with _patched_client(handler):
+        with pytest.raises(PlatformUnavailable):
+            await call_platform(
+                "POST", "/v1/internal/budget/ensure-trial",
+                json={"userId": "u"}, retries=2, retry_backoff_s=0,
+            )
+    assert len(attempts) == 1
+
+
+@pytest.mark.asyncio
+async def test_4xx_is_not_retried_and_stays_an_ordinary_response():
+    attempts = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        attempts.append(1)
+        return httpx.Response(404, json=None)
+
+    with _patched_client(handler):
+        resp = await call_platform(
+            "GET", "/v1/internal/users/lookup-by-email", retries=2, retry_backoff_s=0,
+        )
+    assert len(attempts) == 1
+    assert resp.status_code == 404
