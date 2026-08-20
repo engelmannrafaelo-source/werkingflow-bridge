@@ -1,4 +1,10 @@
-"""Tests for the server-side audit-log writer (pseudonymization attestation)."""
+"""Tests for the platform-api-side audit_log INSERT (ADR-0009 Schritt 2a, C4).
+
+This used to be src/audit/recorder.py's own DB write; that logic now lives in
+src/audit/db_writer.py (used by POST /v1/internal/audit-events, run on
+platform-api). recorder.py itself is now an HTTP client of that endpoint —
+see test_audit_recorder_http.py for its (very different) contract.
+"""
 
 from __future__ import annotations
 
@@ -10,7 +16,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from src.audit import recorder
+from src.audit import db_writer
 
 
 class _FakeConn:
@@ -42,24 +48,24 @@ class _FakePool:
 
 
 @pytest.mark.asyncio
-async def test_record_is_noop_when_db_disabled(monkeypatch):
-    monkeypatch.setattr(recorder, "is_db_enabled", lambda: False)
+async def test_insert_is_noop_when_db_disabled(monkeypatch):
+    monkeypatch.setattr(db_writer, "is_db_enabled", lambda: False)
 
     def _boom():
         raise AssertionError("get_pool must not be called when DB is disabled")
 
-    monkeypatch.setattr(recorder, "get_pool", _boom)
+    monkeypatch.setattr(db_writer, "get_pool", _boom)
     # Must not raise.
-    await recorder.record_audit_event("pii.pseudonymized")
+    await db_writer.insert_audit_event("pii.pseudonymized")
 
 
 @pytest.mark.asyncio
-async def test_record_inserts_value_free_attestation(monkeypatch):
+async def test_insert_writes_value_free_attestation(monkeypatch):
     sink: dict = {}
-    monkeypatch.setattr(recorder, "is_db_enabled", lambda: True)
-    monkeypatch.setattr(recorder, "get_pool", lambda: _FakePool(sink))
+    monkeypatch.setattr(db_writer, "is_db_enabled", lambda: True)
+    monkeypatch.setattr(db_writer, "get_pool", lambda: _FakePool(sink))
 
-    await recorder.record_audit_event(
+    await db_writer.insert_audit_event(
         "pii.pseudonymized",
         actor_user_id="11111111-1111-1111-1111-111111111111",
         actor_label="engelmann",
@@ -80,10 +86,10 @@ async def test_record_inserts_value_free_attestation(monkeypatch):
 @pytest.mark.asyncio
 async def test_non_uuid_actor_is_preserved_not_dropped(monkeypatch):
     sink: dict = {}
-    monkeypatch.setattr(recorder, "is_db_enabled", lambda: True)
-    monkeypatch.setattr(recorder, "get_pool", lambda: _FakePool(sink))
+    monkeypatch.setattr(db_writer, "is_db_enabled", lambda: True)
+    monkeypatch.setattr(db_writer, "get_pool", lambda: _FakePool(sink))
 
-    await recorder.record_audit_event(
+    await db_writer.insert_audit_event(
         "pii.pseudonymized",
         actor_user_id="david@engelmann.example",  # not a UUID
     )

@@ -15,16 +15,31 @@ move callers one at a time without a flag day.
 Fail-loud: a DB error during resolution is NOT swallowed into "no principal"
 (that would silently reopen the door). The caller (auth.py) decides how to fail
 based on the flag, but this module never turns an error into a permissive answer.
+
+Resolution path (ADR-0009 Schritt 2a, C2): a cache miss goes to platform-api
+first (GET /v1/internal/principals/{token_hash}, see src/internal_routes.py)
+instead of a direct Postgres query. If platform-api is unreachable, resolution
+falls back to the direct DB query IN THE SAME CALL (one logger.error, no
+silent pass-through) — that fallback stays available as long as this worker
+still has BRIDGE_DB_URL set (it does today; it will not once a worker actually
+moves off production-barrier, ADR-0009 Schritt 3/4). If NEITHER channel can
+answer, resolution raises rather than returning None — the "fail-loud" promise
+above must survive the platform-api hop, not just the direct-DB path it used
+to be.
 """
 from __future__ import annotations
 
 import hashlib
+import logging
 import os
 import time
 from dataclasses import dataclass, field
 from typing import List, Optional
 
 from src.db.client import get_pool, is_db_enabled
+from src.platform_client import PlatformUnavailable, call_platform
+
+logger = logging.getLogger(__name__)
 
 # Wildcard entry meaning "any" in allowed_apps / allowed_paths.
 WILDCARD = "*"
@@ -114,16 +129,24 @@ def _row_to_principal(row) -> Principal:
     )
 
 
-async def resolve_principal_by_token(token: str) -> Optional[Principal]:
-    """Resolve a cleartext token to an active Principal, or None if no active
-    principal has that token. Cached briefly. Raises on DB error (never masks a
-    failure as None)."""
-    if not is_db_enabled():
-        return None
-    token_hash = hash_token(token)
-    hit, cached = _cache_get(token_hash)
-    if hit:
-        return cached
+def _dict_to_principal(data: dict) -> Principal:
+    """Same shape as _row_to_principal, but from platform-api's JSON body
+    instead of an asyncpg row — both are the columns of one service_principals
+    row, so the field set matches exactly."""
+    return Principal(
+        id=str(data["id"]),
+        name=data["name"],
+        allowed_apps=list(data.get("allowed_apps") or []),
+        allowed_paths=list(data.get("allowed_paths") or [WILDCARD]),
+        monthly_cap_eur=float(data["monthly_cap_eur"]) if data.get("monthly_cap_eur") is not None else None,
+    )
+
+
+async def get_principal_row_by_hash(token_hash: str) -> Optional[dict]:
+    """Pure DB read by an already-hashed token — the one query both platform-api's
+    GET /v1/internal/principals/{token_hash} (src/internal_routes.py) and this
+    module's direct-DB fallback run. Returns None on no active match. Raises on
+    DB error (callers decide how to fail)."""
     pool = get_pool()
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
@@ -134,7 +157,69 @@ async def resolve_principal_by_token(token: str) -> Optional[Principal]:
             """,
             token_hash,
         )
-    principal = _row_to_principal(row) if row else None
+    if row is None:
+        return None
+    return {
+        "id": str(row["id"]),
+        "name": row["name"],
+        "allowed_apps": list(row["allowed_apps"] or []),
+        "allowed_paths": list(row["allowed_paths"] or [WILDCARD]),
+        "monthly_cap_eur": float(row["monthly_cap_eur"]) if row["monthly_cap_eur"] is not None else None,
+    }
+
+
+async def _resolve_via_direct_db(token_hash: str) -> Optional[Principal]:
+    """The pre-Schritt-2a path, now the fallback. Raises loud (not a silent
+    None) when there is no DB to fall back to — that means platform-api AND the
+    direct connection both failed, which is the case this module's fail-loud
+    contract exists for."""
+    if not is_db_enabled():
+        raise RuntimeError(
+            "principal resolution: platform-api was unreachable and no direct-DB "
+            "fallback is configured (BRIDGE_DB_URL unset). Cannot resolve. If this "
+            "worker has genuinely moved off production-barrier (ADR-0009 Schritt "
+            "3/4), the direct-DB fallback is expected to be gone and platform-api "
+            "reachability is now load-bearing — investigate why it failed."
+        )
+    row = await get_principal_row_by_hash(token_hash)
+    return _dict_to_principal(row) if row else None
+
+
+async def resolve_principal_by_token(token: str) -> Optional[Principal]:
+    """Resolve a cleartext token to an active Principal, or None if no active
+    principal has that token. Cached briefly.
+
+    ADR-0009 Schritt 2a: the cache miss goes to platform-api first; a direct-DB
+    read only runs when platform-api could not answer (see module docstring).
+    Raises on total failure (never masks it as None)."""
+    token_hash = hash_token(token)
+    hit, cached = _cache_get(token_hash)
+    if hit:
+        return cached
+
+    try:
+        resp = await call_platform("GET", f"/v1/internal/principals/{token_hash}")
+    except PlatformUnavailable as e:
+        logger.error(
+            "principal lookup via platform-api failed (%s) — falling back to direct DB", e
+        )
+        principal = await _resolve_via_direct_db(token_hash)
+    else:
+        if resp.status_code == 404:
+            principal = None
+        elif resp.status_code == 200 and isinstance(resp.json, dict):
+            principal = _dict_to_principal(resp.json)
+        else:
+            # An unexpected contract (wrong status, malformed body) is treated
+            # the same as unreachable: fall back rather than silently answer
+            # "no principal" for what might be a platform-api bug.
+            logger.error(
+                "principal lookup via platform-api returned unexpected "
+                "status=%s body=%r — falling back to direct DB",
+                resp.status_code, resp.json,
+            )
+            principal = await _resolve_via_direct_db(token_hash)
+
     _cache_put(token_hash, principal)
     return principal
 

@@ -24,6 +24,11 @@ Routing contract (enforced by nginx path-based split):
     /v1/app-licenses    app license checks
     /v1/db/health       DB connectivity probe
     /v1/sandbox/conversations/*  conversation persistence
+    /v1/internal/*      worker-only reads/writes (principals, prepaid-vision
+                         spend, audit events — ADR-0009 Schritt 2a). NOT in the
+                         nginx route split above: no public location block
+                         exists for it on purpose, workers reach it directly
+                         (Docker DNS / Tailscale, see src/platform_client.py).
 
   Workers handle:
     /v1/chat/completions, /v1/messages, /v1/research, /v1/document/convert
@@ -77,6 +82,7 @@ from src.impersonation.routes import router as impersonation_router  # noqa: E40
 from src.sandbox.routes import router as sandbox_router  # noqa: E402
 from src.sandbox.conversation_routes import router as sandbox_conversations_router  # noqa: E402
 from src.principals_routes import router as principals_router  # noqa: E402
+from src.internal_routes import router as internal_router  # noqa: E402
 
 from src.tenant import TenantMiddleware  # noqa: E402
 
@@ -172,6 +178,7 @@ app.include_router(impersonation_router)
 app.include_router(sandbox_router)
 app.include_router(sandbox_conversations_router)
 app.include_router(principals_router)
+app.include_router(internal_router)
 logger.info("✅ Platform routes mounted")
 
 # CORS — same policy as workers
