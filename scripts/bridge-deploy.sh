@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # bridge-deploy.sh — Atomic idempotent multi-server Bridge deployment
 #
-# Usage: bridge-deploy.sh <server> [<service>...] [--dry-run] [--ack-foreign]
+# Usage: bridge-deploy.sh <server> [<service>...] [--dry-run] [--ack-foreign] [--force-prod-ahead]
 #   server        = hetzner | server2 | both | prod-workers
 #   service       = optional, default = all services for the server
 #
@@ -222,18 +222,25 @@ SERVICES_ARG=()
 # made per deploy, by someone who checked.
 ACK_FOREIGN=false
 
+# Consciously override the dev-first order gate (phase_prod_order_gate).
+# Requires a typed confirmation at a TTY on top of the flag — a script or cron
+# can never take this path silently.
+FORCE_PROD_AHEAD=false
+
 for arg in "$@"; do
     case "$arg" in
         --dry-run) DRY_RUN=true ;;
         --ack-foreign) ACK_FOREIGN=true ;;
+        --force-prod-ahead) FORCE_PROD_AHEAD=true ;;
         hetzner|server2|both|prod-workers) SERVER="$arg" ;;
         *) SERVICES_ARG+=("$arg") ;;
     esac
 done
 
 if [[ -z "$SERVER" ]]; then
-    echo "Usage: bridge-deploy.sh <hetzner|server2|both|prod-workers> [service...] [--dry-run] [--ack-foreign]" >&2
-    echo "  --ack-foreign  proceed even though the deploy ships commits by other authors" >&2
+    echo "Usage: bridge-deploy.sh <hetzner|server2|both|prod-workers> [service...] [--dry-run] [--ack-foreign] [--force-prod-ahead]" >&2
+    echo "  --ack-foreign      proceed even though the deploy ships commits by other authors" >&2
+    echo "  --force-prod-ahead override the dev-first order gate (typed TTY confirmation required)" >&2
     exit 1
 fi
 
@@ -296,6 +303,84 @@ phase_tooling_freshness_gate() {
 
     TOOLING_GATE_DONE="true"
     return 0
+}
+
+# ============================================================================
+# Phase 0.5: Dev-first order gate — prod never runs ahead of dev
+# ============================================================================
+# Rafael (2026-08-20): the prod bridge was found running 5 commits AHEAD of the
+# dev bridge — code reached paying customers before it had ever run on dev.
+# This gate enforces the order: a deploy to a PROD target (server2,
+# prod-workers) is only allowed when the target ref (origin/develop) is already
+# RUNNING on the dev bridge. Proof is hetzner's .bridge-deployed-sha (written
+# only by a finished deploy) — NOT the checkout HEAD, which can be
+# fast-forwarded out-of-band without any container containing that code.
+# "both" passes naturally: the hetzner leg deploys first and writes the marker
+# the server2 leg then reads.
+#
+# Deliberately NO env-var bypass: the only exception path is --force-prod-ahead
+# plus a typed confirmation at a TTY. An emergency is a human decision made
+# consciously, not a flag a script sets.
+phase_prod_order_gate() {
+    local server_name="$1"
+    case "$server_name" in server2|prod-workers) ;; *) return 0 ;; esac
+    step "Phase 0.5: Dev-first order gate (${server_name})"
+
+    local repo_dir target_sha dev_sha_raw dev_sha
+    repo_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+    # Target = what Phase 2 will fast-forward the host to: origin/develop.
+    if ! git -C "$repo_dir" fetch --quiet origin develop; then
+        error_ "ABORTED: git fetch origin develop failed — cannot determine the target ref."
+        return 1
+    fi
+    target_sha="$(git -C "$repo_dir" rev-parse origin/develop)"
+
+    dev_sha_raw="$(rssh "$HETZNER_HOST" "cat ${DEPLOYED_SHA_FILE} 2>/dev/null" | tr -d '[:space:]' || true)"
+    if [[ ! "$dev_sha_raw" =~ ^[0-9a-f]{7,40}$ ]]; then
+        error_ "ABORTED: cannot read the dev bridge's deployed SHA (${HETZNER_HOST}:${DEPLOYED_SHA_FILE})."
+        error_ "  Without proof of what dev actually RUNS, this prod deploy is unverifiable."
+        error_ "  Deploy hetzner first (which writes the marker), then retry."
+        return 1
+    fi
+    dev_sha="$(git -C "$repo_dir" rev-parse --verify "${dev_sha_raw}^{commit}" 2>/dev/null || true)"
+    if [[ -z "$dev_sha" ]]; then
+        error_ "ABORTED: dev bridge's deployed SHA ${dev_sha_raw} is unknown to this repo (even after fetch)."
+        error_ "  That itself is a provenance problem — investigate before deploying prod."
+        return 1
+    fi
+
+    if git -C "$repo_dir" merge-base --is-ancestor "$target_sha" "$dev_sha"; then
+        info "OK: target ${target_sha:0:9} already runs on the dev bridge (deployed: ${dev_sha:0:9})."
+        return 0
+    fi
+
+    local behind
+    behind="$(git -C "$repo_dir" rev-list --count "${dev_sha}..${target_sha}" 2>/dev/null || echo '?')"
+    error_ "BLOCKED by the dev-first order gate: the target ref does NOT run on the dev bridge yet."
+    error_ "  Target (origin/develop) : ${target_sha}"
+    error_ "  Dev bridge runs         : ${dev_sha} (${behind} commit(s) behind the target)"
+    error_ "  The order is deliberate (Rafael, 2026-08-20): deploy hetzner first, verify,"
+    error_ "  THEN prod — or run 'bridge-deploy.sh both', which does exactly that."
+    if [[ "$DRY_RUN" == "true" ]]; then
+        warn "[DRY-RUN] A real run would ABORT here."
+        return 0
+    fi
+    if [[ "$FORCE_PROD_AHEAD" == "true" ]]; then
+        if [[ ! -t 0 ]]; then
+            error_ "--force-prod-ahead requires a TTY (typed confirmation) — no silent bypass."
+            return 1
+        fi
+        warn "--force-prod-ahead set: type exactly PROD-AHEAD to consciously override the gate."
+        local reply
+        read -r -p "Confirmation: " reply
+        if [[ "$reply" == "PROD-AHEAD" ]]; then
+            warn "Gate consciously overridden (--force-prod-ahead, confirmed at TTY)."
+            return 0
+        fi
+        error_ "Wrong confirmation — aborting."
+        return 1
+    fi
+    return 1
 }
 
 # ============================================================================
@@ -1534,6 +1619,11 @@ deploy_server() {
 
     # === Phase 0 === (local, before anything reaches a host)
     phase_tooling_freshness_gate || return 1
+
+    # === Phase 0.5 === dev-first order gate (prod targets only, local + one
+    # read-only SSH to hetzner) — evaluated PER deploy_server call so that
+    # "both" reads the marker AFTER its hetzner leg has finished.
+    phase_prod_order_gate "$server_name" || return 1
 
     # === Phase 1 ===
     phase_preflight "$host" || return 1
