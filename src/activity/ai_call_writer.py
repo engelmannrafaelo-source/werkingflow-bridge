@@ -110,15 +110,28 @@ async def _deduct_call_cost(
     cost_eur_amount: float,
     workflow_id: Optional[str] = None,
     tenant_id: Optional[str] = None,
+    call_ts: Optional[float] = None,
 ) -> None:
     """
     Post-call budget deduction — best-effort, never raises.
 
-    Runs after the activity row is written. The activity row is the
-    authoritative usage record; this deduction keeps the user's budget
-    `used_eur` as a running tally so the pre-call gate actually has
-    something to gate against. A failure here degrades to "no deduction"
-    (the prior behaviour) — it can never break the user-facing call.
+    Runs ONLY after the ledger row was created in this attempt (ADR-0009
+    Schritt 1). The ledger row is the authoritative usage record; this
+    deduction keeps the user's budget `used_eur` as a running tally so the
+    pre-call gate actually has something to gate against. A failure here
+    degrades to "no deduction" (the prior behaviour) — it can never break the
+    user-facing call.
+
+    Why it is bound to the row rather than running alongside it: this function
+    is NOT idempotent. `apply_budget_deduction` is a read-modify-write on
+    user_budgets plus a FIFO draw through the TopUp lots, with no dedup key,
+    and project_budgets_service.deduct is the same shape. Tied to "the INSERT
+    created the row", a replay can never charge twice — the second attempt
+    conflicts on idempotency_key, creates nothing, and deducts nothing.
+
+    call_ts: origin time of the call. Only used to make a deduction that
+    arrives in a different month than the call VISIBLE (see below) — a silent
+    one would make a later invoice dispute unresolvable.
 
     Routing by plan interval:
     - interval='project' (e.g. Energy): draw from a strictly per-project budget
@@ -185,6 +198,29 @@ async def _deduct_call_cost(
                     workflow_id, plan.id, user_id, tenant_id,
                 )
             return
+
+        # A deduction that arrives late (spool replay after an outage) draws
+        # from the pot that is current NOW, not the one that was current when
+        # the call happened. Rare and bounded by the spool's max age — but it
+        # must never be silent: the ledger row is recorded in the call's own
+        # period while the tally moved, and nobody can reconstruct that from
+        # the numbers alone afterwards.
+        if call_ts is not None:
+            from datetime import datetime as _dt, timezone as _tz
+
+            call_month = _dt.fromtimestamp(call_ts, tz=_tz.utc).strftime("%Y-%m")
+            now_month = _dt.now(tz=_tz.utc).strftime("%Y-%m")
+            if call_month != now_month:
+                logger.error(
+                    "post-call deduction CROSSES A MONTH BOUNDARY: call from %s "
+                    "is being deducted from the %s budget (user=%s app=%s plan=%s "
+                    "%.6f EUR). The usage_events row is recorded in %s — the "
+                    "ledger and the running tally disagree about the period for "
+                    "this one call. Cause: the row was written late (spool "
+                    "replay after a DB outage).",
+                    call_month, now_month, user_id, app_id, plan.id,
+                    cost_eur_amount, call_month,
+                )
 
         try:
             await apply_budget_deduction(uid, plan.id, cost_eur_amount)
@@ -727,21 +763,46 @@ async def persist_ai_call_activity(
             e,
         )
 
-    # Post-call budget deduction. Separate step from the activity write:
-    # the activity row is the usage source of truth, the deduction is the
-    # running budget tally. Best-effort — _deduct_call_cost never raises.
-    # Anonymous calls have no budget semantics (internal bucket, real_cost 0)
-    # — deducting would only produce noisy "no budget row" warnings.
+    # Post-call budget deduction — bound to the ledger row (ADR-0009 Schritt 1).
+    #
+    # The ledger row is the authoritative usage record; the deduction is a
+    # running tally derived from it, so the pre-call gate has something to gate
+    # against. `ledger_written` is the whole condition: deduct exactly when THIS
+    # attempt created the row.
+    #
+    # This replaces an ordering that was only ever asserted in comments. The
+    # deduction used to sit outside the try above and ran even when that try had
+    # fallen into its except — so a partial failure (a rejected INSERT on an
+    # otherwise healthy pool, as on 2026-08-01) deducted budget with no row to
+    # show for it: a charge nobody can reconstruct. And once a replay exists,
+    # an unbound deduction would charge a second time for the same call, because
+    # apply_budget_deduction has no dedup key.
+    #
+    # The deduction is therefore DEFERRED, not lost, when the write fails: the
+    # spool holds the call, and the deduction happens when the row lands.
+    #
+    # Anonymous calls have no budget semantics (internal bucket, real_cost 0).
     # billing_account set → an app-tier policy books this call to an internal
     # account; the customer's (project) budget must NOT be deducted. The usage
-    # row above already carries the billing_account marker + full attribution.
-    if billing_account:
+    # row already carries the billing_account marker + full attribution.
+    if not ledger_written:
+        if outcome == OUTCOME_FAILED and call_cost_eur > 0:
+            logger.warning(
+                "post-call deduction DEFERRED (app=%s user=%s %.6f EUR): the "
+                "ledger row is not written yet, so there is nothing to derive a "
+                "tally from. The call is held in the write-ahead spool; the "
+                "deduction happens when the row lands.",
+                app_id, user_id, call_cost_eur,
+            )
+    elif billing_account:
         logger.info(
             "app_tier_policy: cost booked to internal account %r (app=%s agent=%s) "
             "— customer deduction skipped (%.6f EUR)",
             billing_account, app_id, agent_id, call_cost_eur,
         )
     elif user_id and app_id and call_cost_eur > 0 and user_id != ANONYMOUS_USER_ID:
-        await _deduct_call_cost(user_id, app_id, call_cost_eur, workflow_id, tenant_id)
+        await _deduct_call_cost(
+            user_id, app_id, call_cost_eur, workflow_id, tenant_id, call_ts,
+        )
 
     return _settle(outcome)

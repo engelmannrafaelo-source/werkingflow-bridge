@@ -226,3 +226,125 @@ async def test_cancellation_mid_write_no_longer_loses_the_row(spool_dir):
     assert spool.spool_stats()["pending"] == 1, (
         "der abgebrochene Call muss geschuldet bleiben statt spurlos zu verschwinden"
     )
+
+
+# ---------------------------------------------------------------------------
+# Der Abzug haengt an der Zeile (ADR-0009 Schritt 1, letzter Baustein)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_no_deduction_without_a_ledger_row(spool_dir):
+    """Vorher konnte der Abzug die Zeile ueberleben: er stand hinter dem
+    grossen try und lief auch, wenn dieses in den except-Zweig gefallen war.
+    Ein Abzug ohne Beleg ist durch nichts nachrechenbar."""
+    outcome, deduct = await _persist(_conn(explode="usage_events"))
+    assert outcome == spool.OUTCOME_FAILED
+    deduct.assert_not_called()
+    # Verzoegert, nicht verloren: die Zeile ist geschuldet, der Abzug folgt ihr.
+    assert spool.spool_stats()["pending"] == 1
+
+
+@pytest.mark.asyncio
+async def test_deduction_follows_the_row_when_it_lands(spool_dir):
+    """Und beim Nachlauf wird dann abgezogen — genau einmal."""
+    await _persist(_conn(explode="usage_events"))
+
+    gesund = _conn()
+    with (
+        patch.object(writer, "get_pool", return_value=_pool(gesund)),
+        patch.object(writer, "_deduct_call_cost", new=AsyncMock()) as deduct,
+    ):
+        await spool.flush_once(writer.persist_ai_call_activity)
+
+    assert deduct.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_replay_of_an_existing_row_never_deducts_twice(spool_dir):
+    """Die harte Randbedingung des ganzen Entwurfs: apply_budget_deduction ist
+    ein read-modify-write ohne Dedup-Schluessel. Wuerde ein Nachlauf ihn
+    wiederholen, waere jeder Wiederholungsversuch eine zweite Belastung."""
+    zweiter = _conn(ledger_inserted=False)  # ON CONFLICT DO NOTHING
+    with (
+        patch.object(writer, "get_pool", return_value=_pool(zweiter)),
+        patch.object(writer, "_deduct_call_cost", new=AsyncMock()) as deduct,
+    ):
+        outcome = await writer.persist_ai_call_activity(
+            provider=PROVIDER_ANTHROPIC, app_id="werking-report", user_id=USER_ID,
+            agent_id=None, workflow_id=None, model="claude-sonnet-5",
+            input_tokens=1000, output_tokens=500, status="success",
+            duration_ms=800, app_env="prod",
+            _call_uid="schon-gebucht", _call_ts=1_700_000_000.0,
+        )
+
+    assert outcome == spool.OUTCOME_DUPLICATE
+    deduct.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_deduction_carries_the_calls_origin_time(spool_dir):
+    """Damit ein Abzug, der in einem anderen Monat landet als der Call, sich
+    ueberhaupt bemerken KANN."""
+    conn = _conn()
+    with (
+        patch.object(writer, "get_pool", return_value=_pool(conn)),
+        patch.object(writer, "_deduct_call_cost", new=AsyncMock()) as deduct,
+    ):
+        await writer.persist_ai_call_activity(
+            provider=PROVIDER_ANTHROPIC, app_id="werking-report", user_id=USER_ID,
+            agent_id=None, workflow_id=None, model="claude-sonnet-5",
+            input_tokens=10, output_tokens=5, status="success",
+            duration_ms=10, app_env="prod",
+            _call_uid="uid-2", _call_ts=1_700_000_000.0,
+        )
+
+    assert deduct.await_args.args[5] == 1_700_000_000.0
+
+
+@pytest.mark.asyncio
+async def test_cross_month_deduction_is_shouted_about(spool_dir, caplog):
+    """Ein nachgeholter Abzug zieht aus dem Topf, der JETZT aktuell ist — die
+    Zeile ist aber im Zeitraum des Calls verbucht. Selten und begrenzt, aber
+    nie still: aus den Zahlen allein laesst sich das hinterher nicht mehr
+    rekonstruieren, und genau daran scheitert dann eine Rechnungsdiskussion."""
+    import logging
+
+    plan = MagicMock()
+    plan.id = "report-standard"
+    plan.interval = "month"
+
+    with (
+        patch("src.budget.plan_resolution.resolve_billing_plan",
+              new=AsyncMock(return_value=plan)),
+        patch("src.budget.routes.apply_budget_deduction", new=AsyncMock()),
+        caplog.at_level(logging.ERROR, logger="src.activity.ai_call_writer"),
+    ):
+        await writer._deduct_call_cost(
+            USER_ID, "werking-report", 0.42, None, TENANT_ID,
+            call_ts=1_700_000_000.0,   # 2023-11 — sicher nicht der laufende Monat
+        )
+
+    assert any("CROSSES A MONTH BOUNDARY" in r.message for r in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_same_month_deduction_stays_quiet(spool_dir, caplog):
+    """Der Normalfall darf kein Rauschen erzeugen — sonst nutzt der Alarm nichts."""
+    import logging
+    import time as _time
+
+    plan = MagicMock()
+    plan.id = "report-standard"
+    plan.interval = "month"
+
+    with (
+        patch("src.budget.plan_resolution.resolve_billing_plan",
+              new=AsyncMock(return_value=plan)),
+        patch("src.budget.routes.apply_budget_deduction", new=AsyncMock()),
+        caplog.at_level(logging.ERROR, logger="src.activity.ai_call_writer"),
+    ):
+        await writer._deduct_call_cost(
+            USER_ID, "werking-report", 0.42, None, TENANT_ID, call_ts=_time.time(),
+        )
+
+    assert not any("CROSSES A MONTH BOUNDARY" in r.message for r in caplog.records)
