@@ -2,7 +2,8 @@
 
 **Status:** PARTIAL — mechanism built and validated (nginx routing, upstream
 generation, metrics-reader polling, a third deploy topology), new host
-prepared. The cutover itself (moving real traffic to the new host) is NOT
+prepared, **Schritt 1 des Umsetzungsplans (unverlierbare Abrechnungszeile)
+gebaut auf `develop`, nicht deployt** — siehe Umsetzungsplan unten. The cutover itself (moving real traffic to the new host) is NOT
 done and has an open blocker (see "Open blocker" below). Nothing in this ADR
 has touched the live production-barrier bridge.
 **Date:** 2026-08-18
@@ -235,6 +236,64 @@ Funktion (`persist_ai_call_activity`) und eine bereits vorhandene Trennung zwisc
 "never raises"). Nur die Zeile muss garantiert ankommen; der Abzug ist nachrechenbar.
 **Dieser Schritt lohnt sich eigenstaendig**: heute geht die Zeile bei einem
 DB-Aussetzer verloren, danach nicht mehr — auch ohne jeden Umzug.
+
+**Schritt 1 ist GEBAUT (2026-08-20), nicht deployt.** Commits `cf583e1`,
+`53f1dd2`, `14f410f`, `2158d7d`, `0a1bc45` auf `develop`. Was dabei
+herauskam, in der Reihenfolge, in der es zaehlt:
+
+*Die Annahme dieses Abschnitts traegt nicht so, wie sie oben formuliert ist.*
+Der Text sagt, der Code habe "eine bereits vorhandene Trennung zwischen
+authoritative Abrechnungszeile und best-effort Budget-Abzug". Nachgeprueft:
+getrennt waren die **Kommentare**, nicht der Kontrollfluss.
+
+- `_deduct_call_cost` stand HINTER dem grossen `try` von
+  `persist_ai_call_activity` und lief auch dann, wenn dieses in seinen
+  `except`-Zweig gefallen war. Bei einem TEILausfall — abgelehnter INSERT auf
+  einem sonst gesunden Pool, real passiert 2026-08-01 — war das Ergebnis:
+  **keine Geldzeile, aber ein Budget-Abzug.** Die Umkehrung der behaupteten
+  Ordnung.
+- `apply_budget_deduction` ist ein read-modify-write auf `user_budgets` plus
+  FIFO-Zug durch die TopUp-Lots, **ohne jeden Dedup-Schluessel**
+  (`project_budgets_service.deduct` genauso). Das ist die harte Randbedingung
+  des ganzen Entwurfs: ein Nachlauf darf den Abzug nie blind wiederholen.
+- `"never raises"` gilt nur fuer `Exception`. `asyncio.CancelledError` ist eine
+  `BaseException` — ein Client-Abbruch mitten im Nachher-Pfad nahm die Zeile
+  ohne jedes Log mit.
+- `usage_events.idempotency_key TEXT UNIQUE` existiert seit Migration 016 und
+  wurde auf diesem Pfad nie gesetzt; `src/sandbox/lease_service.py` benutzt ihn
+  bereits genau richtig. **Kein Schema-Change, keine Migration noetig.**
+
+Gebaut (`src/activity/ledger_spool.py` + Verdrahtung in `ai_call_writer.py`):
+write-ahead auf lokale Platte mit `fsync` VOR dem ersten DB-`await`;
+idempotenter INSERT (`ON CONFLICT (idempotency_key) DO NOTHING RETURNING id`);
+`recorded_at` aus der Ursprungszeit des Calls statt `NOW()`; Nachlaeufer, der
+Unquittiertes ueber denselben Writer einspielt und Waisen toter Prozesse
+uebernimmt (Besitz ueber gehaltene `flock`, nicht ueber die pid — pids werden
+im Container-Namensraum wiederverwendet); Audit-Zeile jetzt NACH der Geldzeile
+und nur bei tatsaechlich erzeugter Zeile (`activities` hat keinen
+Unique-Schluessel); Budget-Abzug an "dieser Versuch hat die Zeile erzeugt"
+gebunden — damit verzoegert statt verloren, und nie doppelt.
+
+Fail-loud statt stiller Selbstabschaltung: Boot-Gate `assert_spool_ready()` in
+`lifespan`, in der Form der bestehenden Worker-Invarianten. Ist der Puffer an,
+aber nicht arbeitsfaehig, bootet der Worker nicht. `BRIDGE_LEDGER_SPOOL_ENABLED`
+ist die Reissleine (Default an), kein Normalzustand.
+
+Benannte Ungenauigkeit, nicht versteckt: ein spaet nachgeholter Abzug zieht aus
+dem Topf, der DANN aktuell ist, waehrend die Zeile im Zeitraum des Calls
+verbucht ist. Begrenzt durch `MAX_AGE`, und mit einem ERROR sichtbar gemacht,
+das beide Monate nennt — still waere es fuer eine spaetere Rechnungsdiskussion
+unaufloesbar.
+
+Rueckstand steht informativ auf `/health` (`ledger_spool`), macht den Worker
+aber **nie** ungesund: `/health` steuert nginx-Routing und Container-Health, ein
+Durchfallen dort wuerde aus "die Ledger-Zeile wird wiederholt" einen echten
+Ausfall machen.
+
+Nicht getan, ausdruecklich: kein Deploy, kein Container-Neustart, keine
+Aenderung an production-barrier/prod-bridge, kein Postgres nach aussen, kein
+nginx, kein Umzug. Scharf wird der Puffer erst durch einen separaten,
+Rafael-freigegebenen Deploy.
 
 **Schritt 2 — Lesepfade ueber einen Eingang (ebenfalls noch lokal).**
 Auth/Tenant/Principal/Budget-Tor ueber die Innen-API statt fuenf DB-Verbindungen,
