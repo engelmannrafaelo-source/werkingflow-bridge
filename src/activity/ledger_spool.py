@@ -40,10 +40,15 @@ File layout — the established convention of this repo
 
   A worker container runs several uvicorn processes against the SAME volume.
   One file per process means appends never interleave and need no locking.
-  A file whose pid is gone (restart, crash, OOM) is adopted by a living
-  process's flush pass — that is what makes the spool survive a restart.
-  Adoption takes an flock on a sidecar `.lock` so two uvicorn processes cannot
-  adopt the same orphan.
+
+  Each process holds an flock on its own file's sidecar `.lock` for its whole
+  lifetime. A file nobody holds is an orphan — a process that restarted,
+  crashed or was OOM-killed — and a living process adopts it on its next flush
+  pass. That is what makes the spool survive a restart rather than merely a
+  hiccup. Ownership is NOT decided by the pid in the filename: a container has
+  its own pid namespace where numbers are small and recycled, so after a
+  recreate a live process can hold a dead worker's number. The kernel releases
+  an flock when its holder dies, OOM-kill included.
 
 What this module deliberately does NOT do:
   * It does not hold the audit row (`activities`). Losing an audit line is bad;
@@ -141,27 +146,67 @@ def _dead_path() -> str:
     return os.path.join(SPOOL_DIR, f"dead.{WORKER_NAME}.jsonl")
 
 
-def _pid_of(path: str) -> Optional[int]:
-    """pid embedded in `ledger.<worker>.<pid>.jsonl`, or None if unparsable."""
-    base = os.path.basename(path)
+# ── Ownership ───────────────────────────────────────────────────────────────
+# "Is the process that owns this file still alive?" is decided by an flock the
+# owner HOLDS for its whole lifetime, not by looking up its pid.
+#
+# The pid is only a readable label in the filename. It cannot answer the
+# question: each container has its own pid namespace and pids there are small
+# and recycled, so after a container recreate a *different* process can easily
+# hold the dead worker's number. A pid check would then read a real orphan as
+# "still alive" and strand its billing rows until MAX_AGE buried them — the
+# exact failure this module exists to prevent.
+#
+# An flock is released by the kernel when the holder dies, including on an
+# OOM-kill, which is the case that matters most here.
+_own_lock_fd: Optional[int] = None
+
+
+def _hold_own_file() -> None:
+    """Take the lifetime lock on this process's own spool file (idempotent)."""
+    global _own_lock_fd
+    if _own_lock_fd is not None:
+        return
     try:
-        return int(base.rsplit(".", 2)[-2])
-    except (ValueError, IndexError):
-        return None
+        fd = os.open(f"{_own_path()}.lock", os.O_CREAT | os.O_RDWR, 0o644)
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        _own_lock_fd = fd
+    except OSError as e:
+        # Not fatal: without the lock a sibling may adopt this file early. That
+        # costs a redundant, idempotent replay — never a row.
+        logger.warning(
+            "ledger spool: could not take the ownership lock (%s) — a sibling "
+            "process may replay this file's records redundantly", e,
+        )
 
 
-def _pid_alive(pid: int) -> bool:
-    """Whether the process that owns a spool file is still running.
+def _is_unowned(path: str) -> bool:
+    """True when no live process holds `path` — i.e. it is safe to adopt.
 
-    /proc is the truth here, not os.kill(pid, 0): inside a container the pid
-    namespace is our own, and a dead worker's pid is simply gone from /proc.
-    A pid we cannot decide about counts as ALIVE — refusing to adopt costs a
-    delayed replay, adopting a live process's file costs a concurrent rewrite.
+    Acquire-then-verify: another process could have adopted and unlinked the
+    lock file between our open() and our flock(), leaving us holding a lock on
+    an unlinked inode that guards nothing. Comparing the inode we locked with
+    the one the name resolves to now closes that window.
     """
+    lock_path = f"{path}.lock"
+    fd = None
     try:
-        return os.path.exists(f"/proc/{pid}")
-    except OSError:
+        fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o644)
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        try:
+            if os.stat(lock_path).st_ino != os.fstat(fd).st_ino:
+                return False  # someone else adopted it while we were opening
+        except FileNotFoundError:
+            return False
         return True
+    except OSError:
+        return False  # a live owner holds it
+    finally:
+        if fd is not None:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            finally:
+                os.close(fd)
 
 
 _dir_ready: Optional[bool] = None
@@ -174,6 +219,7 @@ def _ensure_dir() -> bool:
     try:
         os.makedirs(SPOOL_DIR, exist_ok=True)
         _dir_ready = True
+        _hold_own_file()
     except OSError as e:
         # Loud: without a spool directory the durability promise of this module
         # does not hold, and the caller must not believe it does.
@@ -425,24 +471,26 @@ async def _drain_file(
 
 
 def _orphan_files() -> List[str]:
-    """Spool files of processes that are gone — a restarted, crashed or
-    OOM-killed uvicorn worker. Adopting these is what makes the spool survive
-    a restart rather than merely a hiccup."""
+    """Spool files no live process owns — a restarted, crashed or OOM-killed
+    uvicorn worker. Adopting these is what makes the spool survive a restart
+    rather than merely a hiccup.
+
+    Only files of the SAME INSTANCE_NAME are considered: a worker's identity is
+    its billing identity, and replaying another worker's records would be a
+    different worker's usage.
+    """
     own = _own_path()
-    out = []
-    for path in glob.glob(os.path.join(SPOOL_DIR, f"ledger.{WORKER_NAME}.*.jsonl")):
-        if path == own:
-            continue
-        pid = _pid_of(path)
-        if pid is None or _pid_alive(pid):
-            continue
-        out.append(path)
-    return sorted(out)
+    return sorted(
+        path
+        for path in glob.glob(os.path.join(SPOOL_DIR, f"ledger.{WORKER_NAME}.*.jsonl"))
+        if path != own and _is_unowned(path)
+    )
 
 
 class _FileLock:
-    """flock on a sidecar, so two uvicorn processes never adopt the same orphan.
-    Non-blocking: the loser simply skips this pass."""
+    """Exclusive claim on an orphan for the duration of one drain pass, so two
+    uvicorn processes never rewrite the same file at once. Non-blocking: the
+    loser simply skips this pass."""
 
     def __init__(self, path: str):
         self._lock_path = f"{path}.lock"
@@ -452,6 +500,10 @@ class _FileLock:
         try:
             self._fd = os.open(self._lock_path, os.O_CREAT | os.O_RDWR, 0o644)
             fcntl.flock(self._fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            # Same acquire-then-verify as _is_unowned: a lock on an inode that
+            # the name no longer resolves to guards nothing.
+            if os.stat(self._lock_path).st_ino != os.fstat(self._fd).st_ino:
+                raise OSError(errno.EAGAIN, "lock file replaced")
             return True
         except OSError as e:
             if self._fd is not None:

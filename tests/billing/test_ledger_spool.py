@@ -39,6 +39,10 @@ def spool_dir(tmp_path, monkeypatch):
     monkeypatch.setattr(spool, "WORKER_NAME", "worker-test")
     monkeypatch.setattr(spool, "_dir_ready", None)
     monkeypatch.setattr(spool, "_undurable_calls", 0)
+    # Die Lebenszeit-Sperre haengt am vorigen SPOOL_DIR — je Test neu nehmen.
+    if spool._own_lock_fd is not None:
+        os.close(spool._own_lock_fd)
+    monkeypatch.setattr(spool, "_own_lock_fd", None)
     monkeypatch.setenv("BRIDGE_LEDGER_SPOOL_ENABLED", "true")
     return d
 
@@ -184,23 +188,48 @@ async def test_orphan_of_a_dead_process_is_adopted(spool_dir):
     assert not orphan.exists(), "geleerte Waisen-Datei wird aufgeraeumt"
 
 
-def test_live_siblings_file_is_left_alone(spool_dir):
-    """Die Datei eines LEBENDEN Geschwisterprozesses gehoert ihm — sie zu
-    uebernehmen hiesse, ihm die Datei unter den Haenden neu zu schreiben."""
+def test_a_held_file_is_left_alone_a_released_one_is_adopted(spool_dir):
+    """Besitz wird ueber eine gehaltene flock entschieden, nicht ueber die pid.
+
+    Der Grund ist konkret: jeder Container hat seinen eigenen pid-Namensraum,
+    die Nummern sind klein und werden wiederverwendet. Nach einem
+    Container-Recreate kann die pid eines toten Workers laengst einem anderen
+    Prozess gehoeren — eine pid-Pruefung wuerde die echte Waise dann fuer
+    lebendig halten und ihre Abrechnungszeilen liegen lassen, bis MAX_AGE sie
+    begraebt. Eine flock gibt der Kernel frei, wenn der Halter stirbt, auch
+    beim OOM-Kill.
+    """
+    import fcntl as _fcntl
+
     spool._ensure_dir()
-    lebend = spool_dir / f"ledger.worker-test.{os.getppid()}.jsonl"
-    lebend.write_text(
+    gehalten = spool_dir / "ledger.worker-test.4711.jsonl"
+    gehalten.write_text(
         json.dumps({"t": "c", "uid": "fremd", "ts": time.time(), "n": 0, "r": _rec()})
         + "\n"
     )
-    tot = spool_dir / "ledger.worker-test.999999.jsonl"
-    tot.write_text(
-        json.dumps({"t": "c", "uid": "waise", "ts": time.time(), "n": 0, "r": _rec()})
-        + "\n"
-    )
-    waisen = spool._orphan_files()
-    assert str(tot) in waisen
-    assert str(lebend) not in waisen
+    # Ein lebender "Fremdprozess": haelt die Sperre auf seiner eigenen Datei.
+    fd = os.open(f"{gehalten}.lock", os.O_CREAT | os.O_RDWR, 0o644)
+    _fcntl.flock(fd, _fcntl.LOCK_EX | _fcntl.LOCK_NB)
+    try:
+        freigegeben = spool_dir / "ledger.worker-test.4712.jsonl"
+        freigegeben.write_text(
+            json.dumps({"t": "c", "uid": "waise", "ts": time.time(), "n": 0, "r": _rec()})
+            + "\n"
+        )
+        waisen = spool._orphan_files()
+        assert str(freigegeben) in waisen, "eine unbesetzte Datei muss uebernommen werden"
+        assert str(gehalten) not in waisen, "eine gehaltene Datei gehoert ihrem Halter"
+    finally:
+        _fcntl.flock(fd, _fcntl.LOCK_UN)
+        os.close(fd)
+
+    # Halter weg -> jetzt adoptierbar. Genau das ist der Neustart-/OOM-Fall.
+    assert str(gehalten) in spool._orphan_files()
+
+
+def test_own_file_is_never_treated_as_an_orphan(spool_dir):
+    spool.append_call(spool.new_call_uid(), _rec())
+    assert spool._own_path() not in spool._orphan_files()
 
 
 def test_corrupt_tail_does_not_block_the_rest(spool_dir):
