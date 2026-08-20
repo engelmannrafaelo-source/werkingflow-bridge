@@ -32,7 +32,11 @@ logger = logging.getLogger("scholarly")
 
 MAILTO = os.getenv("SCHOLARLY_MAILTO", "office@werking.tools")
 UA = {"User-Agent": f"werkingflow-scholarly (mailto:{MAILTO})"}
-_HTTP_TIMEOUT = 15
+_HTTP_TIMEOUT = 15         # OpenAlex: kleine JSON-Antworten, 15s ist reichlich
+# CORE liefert `fullText` INLINE: gemessen 1.2-2.3 MB und 7-12s je Query (20.08.2026, 8x parallel
+# ab der dev-Bridge), Ausreisser bis 12s. Mit 15s lag der Abbruch mitten in der Normalverteilung —
+# jeder CORE-Ausschlag wurde zum ReadTimeout, ohne dass CORE defekt war. Bleibt im 90s-Gesamtbudget.
+_CORE_HTTP_TIMEOUT = 30
 _MAX_ENTRIES = 12          # so viele Quellen maximal in den Kontext-Block
 _EXCERPT_CHARS = 1600      # Zeichen je Quelle (CORE-Volltext gekürzt)
 
@@ -101,7 +105,7 @@ def _core(query: str, n: int) -> List[Dict[str, Any]]:
     headers = {"Authorization": f"Bearer {key}"} if key else {}
     try:
         r = _get("https://api.core.ac.uk/v3/search/works/", headers=headers,
-                 params={"q": query, "limit": n})
+                 params={"q": query, "limit": n}, timeout=_CORE_HTTP_TIMEOUT)
         if r.status_code != 200:
             if r.status_code == 429:
                 # Keyless-Rate-Limit: Schicht degradiert STILL auf OpenAlex-Abstracts —
@@ -122,9 +126,13 @@ def _core(query: str, n: int) -> List[Dict[str, Any]]:
             })
         return out
     except (requests.RequestException, ValueError) as e:
-        # Timeout/Verbindungsfehler/Malformed-JSON: darf nicht lautlos verschwinden — sonst
-        # degradiert die Recherche-Qualität unbemerkt (fail loud, kein silent fail).
-        logger.warning(f"research-cloud: CORE request failed ({type(e).__name__}: {e}) — Volltext-Anteil degradiert auf Abstracts")
+        # Ebene beachten: _core() laeuft EINMAL PRO GEPLANTER SUCHQUERY (8-14 parallel je Lauf).
+        # Eine ausgefallene Teil-Query heisst NICHT, dass der Lauf Volltexte verliert — die
+        # anderen Queries liefern weiter. Deshalb INFO und bewusst OHNE Alarm-Marker: gemeldet
+        # wird die Lauf-Ebene (siehe _retrieve_and_format), nicht jede einzelne Query. Sichtbar
+        # bleibt es trotzdem — nur eben nicht als Alarm (Messung 20.08.2026: 354 solcher Zeilen
+        # in 3 Wochen, davon fuehrten die wenigsten zu einem Lauf ohne Volltext).
+        logger.info(f"CORE-Teilquery ohne Ergebnis ({type(e).__name__}: {e}) — restliche Queries laufen weiter")
         return []
 
 
@@ -163,7 +171,13 @@ def _retrieve_and_format(queries: List[str], per_query: int) -> str:
     # Volltext (CORE) zuerst, dann Abstracts — nach Textlänge
     papers.sort(key=lambda p: (p["kind"] != "fulltext", -len(p.get("text", ""))))
     fulltext_n = sum(1 for p in papers[:_MAX_ENTRIES] if p["kind"] == "fulltext")
-    logger.info(f"OA-Kontext: {min(len(papers), _MAX_ENTRIES)} Quellen, davon {fulltext_n} Volltext")
+    _msg = f"OA-Kontext: {min(len(papers), _MAX_ENTRIES)} Quellen, davon {fulltext_n} Volltext"
+    if fulltext_n == 0:
+        # DAS ist die echte Degradierung: der Lauf stuetzt sich nur noch auf Abstracts.
+        # Genau diese Zeile ueberwacht research-cloud-monitor.py (Marker "davon 0 Volltext").
+        logger.warning(f"research-cloud: {_msg} — Recherche degradiert auf Abstracts")
+    else:
+        logger.info(_msg)
     blocks = []
     for p in papers[:_MAX_ENTRIES]:
         excerpt = re.sub(r"\s+", " ", p["text"]).strip()[:_EXCERPT_CHARS]
