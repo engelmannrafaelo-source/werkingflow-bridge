@@ -361,7 +361,8 @@ def _bury(records: List[Dict[str, Any]], why: str) -> None:
 async def _drain_file(
     path: str, writer: Callable, *, delete_if_empty: bool
 ) -> Dict[str, int]:
-    stats = {"replayed": 0, "written": 0, "still_owed": 0, "buried": 0}
+    stats = {"replayed": 0, "written": 0, "still_owed": 0, "buried": 0,
+             "oldest_ts": None}
     pending = _pending(path)
     if not pending:
         if delete_if_empty:
@@ -416,6 +417,9 @@ async def _drain_file(
         keep.append(rec)
     keep.sort(key=lambda r: r.get("ts", 0))
     stats["still_owed"] = len(keep)
+    # Comes from the records we just read — no second parse, which is what
+    # lets /health report a backlog without touching the disk.
+    stats["oldest_ts"] = float(keep[0].get("ts", 0)) if keep else None
     _rewrite(path, keep, delete_if_empty)
     return stats
 
@@ -475,18 +479,58 @@ async def flush_once(writer: Callable) -> Dict[str, int]:
     if not _ensure_dir():
         return {"replayed": 0, "written": 0, "still_owed": 0, "buried": 0}
     total = {"replayed": 0, "written": 0, "still_owed": 0, "buried": 0}
+    oldest: Optional[float] = None
 
-    for k, v in (await _drain_file(_own_path(), writer, delete_if_empty=False)).items():
-        total[k] += v
+    def _merge(part: Dict[str, Any]) -> None:
+        nonlocal oldest
+        for k in ("replayed", "written", "still_owed", "buried"):
+            total[k] += part[k]
+        ts = part.get("oldest_ts")
+        if ts is not None and (oldest is None or ts < oldest):
+            oldest = ts
+
+    _merge(await _drain_file(_own_path(), writer, delete_if_empty=False))
 
     for path in _orphan_files():
         with _FileLock(path) as got:
             if not got:
                 continue
             logger.info("ledger spool: adopting orphaned spool %s", path)
-            for k, v in (await _drain_file(path, writer, delete_if_empty=True)).items():
-                total[k] += v
+            _merge(await _drain_file(path, writer, delete_if_empty=True))
+
+    # Recorded here, where the numbers are already known, so /health can report
+    # a backlog without re-parsing anything (see spool_health).
+    _last_snapshot.update({
+        "pending": total["still_owed"],
+        "oldest_age_s": round(time.time() - oldest, 1) if oldest else 0.0,
+        "checked_at": round(time.time(), 1),
+    })
     return total
+
+
+# Last snapshot the drain loop computed. `/health` reads THIS rather than
+# calling spool_stats(): health is polled every few seconds by nginx and by
+# Docker, and re-parsing a backlog of files on every poll would make a billing
+# buffer into a latency problem on the request path.
+_last_snapshot: Dict[str, Any] = {"pending": 0, "oldest_age_s": 0.0, "checked_at": None}
+
+
+def spool_health() -> Dict[str, Any]:
+    """Cheap, allocation-only view for /health — no file I/O.
+
+    Deliberately informational: a backlog NEVER makes the worker unhealthy.
+    Health drives nginx routing and the container healthcheck; failing it over
+    a billing buffer would turn "the ledger write is retrying" into "the worker
+    is out of rotation", which is a real outage caused by a mechanism whose
+    entire job is to prevent a loss. Report it, act on the log.
+    """
+    return {
+        "enabled": spool_enabled(),
+        "pending": _last_snapshot.get("pending", 0),
+        "oldest_age_s": _last_snapshot.get("oldest_age_s", 0.0),
+        "undurable_calls": _undurable_calls,
+        "checked_at": _last_snapshot.get("checked_at"),
+    }
 
 
 def spool_stats() -> Dict[str, Any]:
@@ -621,8 +665,7 @@ async def flusher_loop() -> None:
                 )
             depth = stats["still_owed"]
             if depth:
-                st = spool_stats()
-                age = st.get("oldest_age_s", 0.0)
+                age = _last_snapshot.get("oldest_age_s", 0.0)
                 if depth >= ALERT_DEPTH or age >= ALERT_AGE_S:
                     # A filling spool is a database problem wearing a disguise.
                     # It must be visible BEFORE it turns into a billing gap.

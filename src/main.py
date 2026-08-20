@@ -5736,6 +5736,20 @@ async def health_check(request: Request):
     except ImportError:
         pass
 
+    # Write-ahead spool for the billing row (ADR-0009 Schritt 1). Cached
+    # snapshot from the drain loop — no file I/O on a poll path.
+    #
+    # Reported, never fatal: `status` stays "healthy" with a backlog. Health
+    # drives nginx routing and the container healthcheck, so failing it here
+    # would turn "the ledger write is retrying" into "the worker is out of
+    # rotation" — an outage caused by the very mechanism that exists to prevent
+    # a loss. The alarm lives in the drain loop's ERROR log.
+    try:
+        from src.activity.ledger_spool import spool_health
+        result["ledger_spool"] = spool_health()
+    except ImportError:
+        pass
+
     return result
 
 

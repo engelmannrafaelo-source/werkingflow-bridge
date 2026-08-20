@@ -243,3 +243,32 @@ def test_boot_gate_allows_an_explicit_no(spool_dir, monkeypatch):
     monkeypatch.setenv("BRIDGE_LEDGER_SPOOL_ENABLED", "false")
     monkeypatch.setattr(spool, "SPOOL_DIR", "/proc/dieses/geht/nicht")
     spool.assert_spool_ready()  # kein Boot-Abbruch
+
+
+# ---------------------------------------------------------------------------
+# Sichtbarkeit: ein volllaufender Puffer ist ein DB-Problem in Verkleidung
+# ---------------------------------------------------------------------------
+
+def test_health_view_does_no_file_io(spool_dir, monkeypatch):
+    """/health wird von nginx und vom Container-Healthcheck im Sekundentakt
+    abgefragt. Bei jedem Poll einen Rueckstand neu zu parsen, wuerde aus einem
+    Abrechnungspuffer ein Latenzproblem auf dem Anfragepfad machen."""
+    gerufen = {"n": 0}
+    monkeypatch.setattr(spool, "_pending", lambda p: gerufen.__setitem__("n", gerufen["n"] + 1) or [])
+    spool.spool_health()
+    assert gerufen["n"] == 0
+
+
+@pytest.mark.asyncio
+async def test_health_view_reflects_the_last_drain(spool_dir):
+    spool.append_call(spool.new_call_uid(), _rec())
+
+    async def failing_writer(**kwargs):
+        return spool.OUTCOME_FAILED
+
+    await spool.flush_once(failing_writer)
+    # flush_once schreibt den Schnappschuss selbst — dort, wo die Zahlen
+    # ohnehin bekannt sind.
+    gesundheit = spool.spool_health()
+    assert gesundheit["pending"] == 1
+    assert gesundheit["checked_at"] is not None
