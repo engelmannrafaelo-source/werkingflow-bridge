@@ -58,13 +58,16 @@ def test_principal_found_returns_200_with_row(client):
     with patch("src.principals.get_principal_row_by_hash", AsyncMock(return_value=row)):
         resp = client.get("/v1/internal/principals/somehash", headers=_headers())
     assert resp.status_code == 200
-    assert resp.json() == row
+    assert resp.json() == {"principal": row}
 
 
-def test_principal_not_found_returns_404(client):
+def test_principal_not_found_is_200_with_null_not_404(client):
+    """404 is reserved for "route does not exist". An undeployed platform-api
+    answers 404 too, and the caller must be able to tell the two apart."""
     with patch("src.principals.get_principal_row_by_hash", AsyncMock(return_value=None)):
         resp = client.get("/v1/internal/principals/unknownhash", headers=_headers())
-    assert resp.status_code == 404
+    assert resp.status_code == 200
+    assert resp.json() == {"principal": None}
 
 
 # ── C6: GET /v1/internal/prepaid-vision/spent-24h ──────────────────────────
@@ -131,12 +134,13 @@ def test_email_lookup_found_returns_id(client):
     assert resp.json() == {"id": str(uid)}
 
 
-def test_email_lookup_unknown_is_404_and_leaks_no_pii(client):
+def test_email_lookup_unknown_is_200_with_null_and_leaks_no_pii(client):
     with patch("src.identity.user_resolver.lookup_user_id_by_email",
                new=AsyncMock(return_value=None)):
         resp = client.post("/v1/internal/users/lookup-by-email",
                            json={"email": "nobody@example.tld"}, headers=_headers())
-    assert resp.status_code == 404
+    assert resp.status_code == 200
+    assert resp.json() == {"id": None}
     assert "nobody@example.tld" not in resp.text
 
 

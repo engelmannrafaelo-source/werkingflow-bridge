@@ -175,10 +175,9 @@ async def _resolve_email_identity(email: str) -> Optional[uuid.UUID]:
         )
         uid = await lookup_user_id_by_email(email)
     else:
-        if resp.status_code == 404:
-            uid = None
-        elif resp.status_code == 200 and isinstance(resp.json, dict) and resp.json.get("id"):
-            uid = uuid.UUID(str(resp.json["id"]))
+        if resp.status_code == 200 and isinstance(resp.json, dict) and "id" in resp.json:
+            raw = resp.json["id"]
+            uid = uuid.UUID(str(raw)) if raw else None
         else:
             # Unexpected contract (wrong status, malformed body) is treated like
             # unreachable rather than like "no such user": answering "unknown

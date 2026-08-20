@@ -52,7 +52,7 @@ class _FakeRow(dict):
 
 @pytest.mark.asyncio
 async def test_resolves_via_platform_api_on_200():
-    mock_call = AsyncMock(return_value=PlatformResponse(status_code=200, json=PRINCIPAL_JSON))
+    mock_call = AsyncMock(return_value=PlatformResponse(status_code=200, json={"principal": PRINCIPAL_JSON}))
     with patch.object(principals, "call_platform", mock_call):
         result = await principals.resolve_principal_by_token(TOKEN)
 
@@ -64,8 +64,8 @@ async def test_resolves_via_platform_api_on_200():
 
 
 @pytest.mark.asyncio
-async def test_404_resolves_to_none_and_is_cached():
-    mock_call = AsyncMock(return_value=PlatformResponse(status_code=404, json={"detail": "not found"}))
+async def test_null_principal_resolves_to_none_and_is_cached():
+    mock_call = AsyncMock(return_value=PlatformResponse(status_code=200, json={"principal": None}))
     with patch.object(principals, "call_platform", mock_call):
         first = await principals.resolve_principal_by_token(TOKEN)
         second = await principals.resolve_principal_by_token(TOKEN)
@@ -157,3 +157,19 @@ async def test_get_principal_row_by_hash_returns_none_on_no_row():
         result = await principals.get_principal_row_by_hash("unknown-hash")
 
     assert result is None
+
+
+@pytest.mark.asyncio
+async def test_404_is_a_missing_route_and_falls_back_to_the_db():
+    """REGRESSION (2026-08-20, auf der dev-Bridge gemessen): ein noch nicht
+    deploytes platform-api antwortet auf /v1/internal/* mit 404. Da 404 eine
+    gewoehnliche Antwort ist und KEIN PlatformUnavailable, wuerde "kein
+    Principal" daraus jeden Aufrufer abweisen — und die Abweisung auch noch
+    cachen — statt auf die DB zurueckzufallen."""
+    mock_call = AsyncMock(return_value=PlatformResponse(status_code=404, json={"detail": "Not Found"}))
+    with patch.object(principals, "call_platform", mock_call), \
+         patch.object(principals, "_resolve_via_direct_db",
+                      new=AsyncMock(return_value="SENTINEL")) as direct:
+        result = await principals.resolve_principal_by_token(TOKEN)
+    assert result == "SENTINEL"
+    direct.assert_awaited_once()

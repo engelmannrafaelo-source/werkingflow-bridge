@@ -54,9 +54,11 @@ async def get_principal_by_hash(
     from src.principals import get_principal_row_by_hash
 
     row = await get_principal_row_by_hash(token_hash)
-    if row is None:
-        raise HTTPException(status_code=404, detail="no active principal with that token hash")
-    return row
+    # Wrapped + 200/null instead of a bare row + 404, for the same reason as
+    # lookup-by-email above: an undeployed route also answers 404, and the
+    # caller must be able to tell "no such principal" (authoritative, cacheable)
+    # from "platform-api does not know this route" (fall back to the DB).
+    return {"principal": row}
 
 
 # ── C6: prepaid vision cap ───────────────────────────────────────────────
@@ -126,10 +128,13 @@ async def post_lookup_user_by_email(
     from src.identity.user_resolver import lookup_user_id_by_email
 
     uid = await lookup_user_id_by_email(body.email)
-    if uid is None:
-        # No PII in the message — same rule as the worker-side path.
-        raise HTTPException(status_code=404, detail="no Bridge user for the given email identity")
-    return {"id": str(uid)}
+    # 200 with id=null, NOT 404, for "no such user". 404 is reserved for "this
+    # route does not exist" — which is exactly what a platform-api that has not
+    # been deployed yet answers (measured on dev-bridge, 2026-08-20). Overloading
+    # 404 would make a missing deployment indistinguishable from a missing user,
+    # and since 404 is an ordinary response it would NOT trigger the caller's
+    # fallback: every Engelmann identity would silently become "unknown".
+    return {"id": str(uid) if uid is not None else None}
 
 
 # ── 2b/C2: which plan holds an allocated budget for this project? ────────

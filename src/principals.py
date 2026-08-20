@@ -205,10 +205,9 @@ async def resolve_principal_by_token(token: str) -> Optional[Principal]:
         )
         principal = await _resolve_via_direct_db(token_hash)
     else:
-        if resp.status_code == 404:
-            principal = None
-        elif resp.status_code == 200 and isinstance(resp.json, dict):
-            principal = _dict_to_principal(resp.json)
+        if resp.status_code == 200 and isinstance(resp.json, dict) and "principal" in resp.json:
+            raw = resp.json["principal"]
+            principal = _dict_to_principal(raw) if raw else None
         else:
             # An unexpected contract (wrong status, malformed body) is treated
             # the same as unreachable: fall back rather than silently answer
