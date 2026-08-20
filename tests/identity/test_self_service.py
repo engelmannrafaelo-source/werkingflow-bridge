@@ -3,6 +3,7 @@ Tests for GDPR self-service endpoints.
 
 POST   /v1/users/{user_id}/change-password
 DELETE /v1/users/{user_id}
+POST   /v1/users/{user_id}/anonymize
 GET    /v1/users/{user_id}/export
 
 Coverage:
@@ -16,6 +17,11 @@ Coverage:
 - close_account: idempotent on already-anonymized account
 - close_account: require_self rejects different user → 403
 - close_account: unknown user → 404
+- anonymize (operator route): closes a user hard-delete would 409 on
+- anonymize (operator route): idempotent on already-anonymized account
+- anonymize (operator route): non-operator caller rejected → 403
+- anonymize (operator route): unknown user → 404
+- anonymize (operator route): DELETE never falls back to it (still 409)
 - export: returns all data sections
 - export: require_self rejects different user → 403
 - export: unknown user → 404
@@ -29,9 +35,24 @@ from decimal import Decimal
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import os
+import sys
 os.environ.setdefault("BRIDGE_JWT_SECRET", "test-secret-for-unit-tests")
 os.environ.setdefault("BRIDGE_SERVICE_TOKEN", "test-service-token")
 
+# admin_routes imports asyncpg unconditionally (for ForeignKeyViolationError on
+# hard-delete); stub it if the C extension isn't built in this environment,
+# mirroring tests/identity/test_role_support.py.
+try:
+    import asyncpg  # noqa: F401
+except ImportError:
+    _asyncpg_stub = MagicMock()
+    _asyncpg_stub.UniqueViolationError = type("UniqueViolationError", (Exception,), {})
+    _asyncpg_stub.ForeignKeyViolationError = type("ForeignKeyViolationError", (Exception,), {})
+    _asyncpg_stub.PostgresError = type("PostgresError", (Exception,), {})
+    _asyncpg_stub.Connection = MagicMock
+    sys.modules["asyncpg"] = _asyncpg_stub
+
+import asyncpg
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
@@ -428,6 +449,133 @@ class TestCloseAccount:
 
         assert resp.status_code == 200
         assert resp.json()["alreadyAnonymized"] is True
+
+
+# ---------------------------------------------------------------------------
+# POST /v1/users/{user_id}/anonymize — operator-only escape valve
+# ---------------------------------------------------------------------------
+
+class TestOperatorAnonymize:
+
+    def test_operator_can_anonymize_user_with_billing_history(self, client: TestClient):
+        """
+        Exactly the scenario that left the four e2e test accounts stuck:
+        operator DELETE 409s on retained subscriptions/credit_purchases, and
+        until this route existed there was no other way to close the account.
+        """
+        uid = uuid.uuid4()
+        user_row = {"id": uid, "anonymized_at": None}
+        # fetchval side_effect: invoices=0, subscriptions=2, credit_purchases=1, billing_events=0
+        pool, conn = _mock_pool_multi(
+            user_row,
+            fetchval_side_effect=[0, 2, 1, 0],
+        )
+
+        with patch("src.identity.self_service.get_pool", return_value=pool):
+            resp = client.post(
+                f"/v1/users/{uid}/anonymize",
+                headers=_SERVICE_HEADER,
+            )
+
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["userId"] == str(uid)
+        assert body["retained"]["subscriptions"] == 2
+        assert body["retained"]["creditPurchases"] == 1
+        assert body.get("alreadyAnonymized") is None
+
+        update_calls = [c for c in conn.execute.call_args_list if "UPDATE users" in c[0][0]]
+        assert len(update_calls) == 1
+
+    def test_idempotent_on_already_anonymized(self, client: TestClient):
+        uid = uuid.uuid4()
+        ts = datetime.now(timezone.utc)
+        pool, conn = _mock_pool(fetchrow_result={"id": uid, "anonymized_at": ts})
+
+        with patch("src.identity.self_service.get_pool", return_value=pool):
+            resp = client.post(
+                f"/v1/users/{uid}/anonymize",
+                headers=_SERVICE_HEADER,
+            )
+
+        assert resp.status_code == 200
+        assert resp.json()["alreadyAnonymized"] is True
+        conn.execute.assert_not_awaited()
+
+    def test_non_operator_user_jwt_rejected(self, client: TestClient):
+        """A plain user JWT (not is_admin) has no path to this operator route."""
+        uid = uuid.uuid4()
+        pool, _ = _mock_pool()
+
+        with patch("src.identity.self_service.get_pool", return_value=pool):
+            resp = client.post(
+                f"/v1/users/{uid}/anonymize",
+                headers={"Authorization": f"Bearer {_jwt(uid)}"},
+            )
+
+        assert resp.status_code == 403
+
+    def test_scoped_service_token_rejected(self, client: TestClient):
+        """
+        Service token WITH X-User-ID is a customer proxy, not an operator —
+        it must not reach the operator-only anonymize route either (it already
+        has its own path to the same effect via DELETE, scoped to itself).
+        """
+        uid = uuid.uuid4()
+        pool, _ = _mock_pool()
+
+        with patch("src.identity.self_service.get_pool", return_value=pool):
+            resp = client.post(
+                f"/v1/users/{uid}/anonymize",
+                headers={**_SERVICE_HEADER, "X-User-ID": str(uid)},
+            )
+
+        assert resp.status_code == 403
+
+    def test_unknown_user_returns_404(self, client: TestClient):
+        uid = uuid.uuid4()
+        pool, _ = _mock_pool(fetchrow_result=None)
+
+        with patch("src.identity.self_service.get_pool", return_value=pool):
+            resp = client.post(
+                f"/v1/users/{uid}/anonymize",
+                headers=_SERVICE_HEADER,
+            )
+
+        assert resp.status_code == 404
+
+    def test_delete_never_falls_back_to_anonymize(self, client: TestClient):
+        """
+        Operator hard-DELETE on a user with billing history must still 409 —
+        this route existing must not become an implicit fallback inside
+        delete_user. The 409 detail should point the caller at the explicit
+        anonymize endpoint instead of just saying "cancel/refund first" (which
+        does not actually unblock hard-delete, since RESTRICT fires on row
+        existence, not subscription status).
+        """
+        uid = uuid.uuid4()
+        conn = AsyncMock()
+        conn.execute = AsyncMock(
+            side_effect=asyncpg.ForeignKeyViolationError(
+                "update or delete on table \"users\" violates foreign key constraint"
+            )
+        )
+        acquire_cm = MagicMock()
+        acquire_cm.__aenter__ = AsyncMock(return_value=conn)
+        acquire_cm.__aexit__ = AsyncMock(return_value=False)
+        pool = MagicMock()
+        pool.acquire = MagicMock(return_value=acquire_cm)
+
+        with patch("src.db.admin_routes.get_pool", return_value=pool):
+            resp = client.delete(
+                f"/v1/users/{uid}",
+                headers=_SERVICE_HEADER,
+            )
+
+        assert resp.status_code == 409
+        detail = resp.json()["detail"]
+        assert "billing" in detail.lower()
+        assert f"/v1/users/{uid}/anonymize" in detail
 
 
 # ---------------------------------------------------------------------------

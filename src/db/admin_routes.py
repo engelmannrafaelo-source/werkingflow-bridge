@@ -9,6 +9,9 @@ Auth model:
   GET    /v1/users/{user_id}                                 — require_self_or_admin
   PATCH  /v1/users/{user_id}                                 — require_self_or_admin (name; role/password operator-only)
   DELETE /v1/users/{user_id}                                 — admin only (hard delete, refuses on billing-record FK)
+  POST   /v1/users/{user_id}/anonymize                       — admin only (GDPR Art. 17 anonymize-with-retention; the
+                                                                 explicit escape valve when hard-delete 409s on retained
+                                                                 billing rows — never triggered implicitly by DELETE)
   GET    /v1/users/{user_id}/stammdaten                      — require_self_or_admin
   PATCH  /v1/users/{user_id}/stammdaten                      — require_self_or_admin
   POST   /v1/users/{user_id}/app-licenses                    — admin only (grant/update license with explicit dates)
@@ -507,7 +510,13 @@ async def delete_user(
     for audit reasons:
       subscriptions      → ON DELETE RESTRICT
       credit_purchases   → ON DELETE RESTRICT
-    Cancel / refund those first, then retry.
+    This is BY DESIGN and permanent — cancelling a subscription changes its
+    status but not its existence, so the row (and the RESTRICT) survives even
+    after every subscription is cancelled/refunded. There is no hard-delete
+    path around it. An operator who needs to close such an account (disposable
+    test account, or a real customer's Art. 17 request filed via support) must
+    use POST /v1/users/{user_id}/anonymize instead — a distinct, explicitly
+    called endpoint. DELETE never falls back to it on its own.
 
     Returns 204 on success, 404 if the user does not exist.
     """
@@ -534,7 +543,11 @@ async def delete_user(
             status_code=409,
             detail=(
                 f"User '{user_id}' has billing records (subscriptions or "
-                f"credit_purchases) that block deletion. Cancel/refund first."
+                f"credit_purchases) that block deletion — retained permanently "
+                f"for audit/tax reasons, cancelling/refunding them does not "
+                f"remove the row. Hard-delete is refused by design; use "
+                f"POST /v1/users/{user_id}/anonymize (operator GDPR Art. 17 "
+                f"anonymize-with-retention) instead."
             ),
         )
 
@@ -542,6 +555,53 @@ async def delete_user(
     if not result.endswith(" 1"):
         raise HTTPException(status_code=404, detail=f"User '{user_id}' not found")
     return Response(status_code=204)
+
+
+# ---------------------------------------------------------------------------
+# POST /v1/users/{user_id}/anonymize — operator-only GDPR anonymize-with-retention
+#
+# The escape valve delete_user's 409 above points to. Hard-delete stays a dead
+# end (by design) for any user with billing history; before this route existed
+# an operator had no way at all to close such an account — not a disposable
+# e2e test account, not a real customer's Art. 17 erasure request filed via
+# support instead of the self-service portal. This is a SEPARATE, explicitly
+# called endpoint on purpose: DELETE /v1/users/{user_id} never falls back to
+# it, and calling it requires a deliberate second API call — no silent
+# downgrade from "delete" to "anonymize" ever happens.
+#
+# Reuses identity.self_service.close_account verbatim rather than
+# reimplementing anonymization — same PII-clearing, session-revocation,
+# and billing-retention semantics as the customer DSGVO path. close_account
+# carries no self-vs-operator assumption: it only ever reads `user_id`, never
+# `claims` (the customer-scoping in delete_user's delegation happens one layer
+# up, in the require_self_or_admin() call made before delegating). Swapping
+# that outer gate for require_admin is therefore sufficient to generalize it
+# to the operator case — no change to close_account itself was needed.
+# ---------------------------------------------------------------------------
+
+@router.post("/v1/users/{user_id}/anonymize")
+async def anonymize_user(
+    user_id: str,
+    claims: AuthClaims = Depends(require_admin),
+) -> Dict[str, Any]:
+    """
+    Operator-only: GDPR Art. 17 anonymize-with-retention.
+
+    Identical effect to the customer self-service DELETE /v1/users/{user_id}
+    path — see identity.self_service.close_account for exactly what gets
+    cleared (PII, sessions, developer tokens, tenant ownership) versus
+    retained (invoices, subscriptions, credit_purchases, billing_events).
+
+    Idempotent: calling it again on an already-anonymized user returns the
+    existing anonymizedAt with `alreadyAnonymized: true`, no error.
+
+    Status mapping:
+      200 → anonymized now, or already anonymized (idempotent)
+      403 → caller is not an operator credential
+      404 → user_id does not exist
+    """
+    from src.identity.self_service import close_account
+    return await close_account(user_id, claims)
 
 
 # ---------------------------------------------------------------------------

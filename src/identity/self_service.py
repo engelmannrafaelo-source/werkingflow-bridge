@@ -84,10 +84,20 @@ async def change_password(
 # ---------------------------------------------------------------------------
 # close_account — GDPR Art. 17 anonymization-with-retention
 #
-# NOT a route. Reached via DELETE /v1/users/{user_id} in db/admin_routes
-# (delete_user), which delegates every non-operator caller here after its
-# require_self_or_admin check. It used to carry its own @router.delete on the
-# identical path — permanently shadowed (admin_db_router registers before
+# NOT a route. Two callers, both in db/admin_routes:
+#   - delete_user (DELETE /v1/users/{user_id}) delegates every non-operator
+#     caller here after its own require_self_or_admin check — the customer
+#     self-service path.
+#   - anonymize_user (POST /v1/users/{user_id}/anonymize, admin-only) calls
+#     it directly for an operator-initiated close — the escape valve for
+#     accounts hard-delete refuses on retained billing rows.
+# Deliberately claims-agnostic: this function reads only `user_id`, never
+# `claims`, so the self-vs-operator distinction lives entirely in which outer
+# authz dependency (require_self_or_admin vs require_admin) gated the call —
+# not in here. Do not add a self/operator branch inside this function.
+#
+# close_account used to carry its own @router.delete on the identical DELETE
+# path — permanently shadowed (admin_db_router registers before
 # self_service_router in platform_main), i.e. dead code that four green
 # isolation tests "covered" while every real portal call 403'd in the shadow
 # handler. One path, one handler: decorator removed 2026-07-03;
