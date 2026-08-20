@@ -233,20 +233,23 @@ async def evaluate_budget(
     """
     _require_month_interval(plan_id)  # raises on unknown / project / unsupported interval
 
-    pool = get_pool()
     effective_plan_id = plan_id
 
-    async with pool.acquire() as conn:
-        budget = await _load_user_budget(conn, user_id)
+    # ADR-0009 Schritt 2b/C4: the read and the (conditional) trial write now
+    # go through platform-api, each with a direct-DB fallback. They are no
+    # longer wrapped in ONE pool connection — see _ensure_trial_via_platform:
+    # provisioning and the re-read happen inside a single endpoint call, so
+    # the atomicity that mattered here (provision, then observe the result)
+    # is preserved on whichever side actually answers.
+    budget = await _load_budget_via_platform(user_id)
 
-        # Auto-provision trial when user is unlicensed and a trial sibling exists.
-        if budget.monthly_budgets.get(plan_id) is None:
-            trial = find_trial_plan_for(plan_id)
-            if trial is not None:
-                effective_plan_id = trial.id
-                if budget.monthly_budgets.get(trial.id) is None:
-                    await _provision_trial(conn, user_id, trial)
-                    budget = await _load_user_budget(conn, user_id)
+    # Auto-provision trial when user is unlicensed and a trial sibling exists.
+    if budget.monthly_budgets.get(plan_id) is None:
+        trial = find_trial_plan_for(plan_id)
+        if trial is not None:
+            effective_plan_id = trial.id
+            if budget.monthly_budgets.get(trial.id) is None:
+                budget = await _ensure_trial_via_platform(user_id, plan_id, trial)
 
     # Faelligen Monatstopf zuruecksetzen, BEVOR das Tor rechnet. Ohne das ist
     # ein "Monatsbudget" ein Lebenszeit-Deckel (s. rollover_monthly_if_due).
@@ -742,3 +745,135 @@ async def ensure_trial_provisioned(
             "topUpLots": _serialize_topup_lots(budget.top_up_lots),
         },
     }
+
+
+# ── ADR-0009 Schritt 2b/C4: monthly path via platform-api ──────────────────
+
+
+def _deserialize_user_budget(payload: Dict[str, Any]) -> UserBudget:
+    """Inverse of load_user_budget_state's wire shape.
+
+    Kept next to the serializers on purpose: if one side gains a field, the
+    other is one screen away. A missing/renamed key raises here rather than
+    yielding a silently empty budget — an empty budget would read as
+    "unlicensed" and block a paying customer.
+    """
+    monthly: Dict[str, MonthlyBudgetEntry] = {
+        plan_id: MonthlyBudgetEntry(
+            limit_eur=float(entry["limitEur"]),
+            used_eur=float(entry["usedEur"]),
+            reset_at=entry["resetAt"],
+        )
+        for plan_id, entry in (payload["monthlyBudgets"] or {}).items()
+    }
+    lots: List[TopUpLot] = [
+        TopUpLot(
+            id=str(lot["id"]),
+            amount_eur=float(lot["amountEur"]),
+            purchased_at=lot["purchasedAt"],
+            expires_at=lot["expiresAt"],
+        )
+        for lot in (payload.get("topUpLots") or [])
+    ]
+    return UserBudget(
+        user_id=str(payload["userId"]), monthly_budgets=monthly, top_up_lots=lots
+    )
+
+
+def _reraise_legacy_topup(resp_json: Any) -> None:
+    """Turn a 409 legacy-top-up answer back into the identical exception the
+    direct path would have raised. Never falls back to the DB: a 409 is a
+    definitive answer, and retrying it locally would only hit the same row."""
+    detail = (resp_json or {}).get("detail") or {}
+    raise LegacyTopUpBalanceError(
+        uuid.UUID(detail["userId"]), float(detail["balanceEur"])
+    )
+
+
+async def _load_user_budget_direct(user_id: uuid.UUID) -> UserBudget:
+    pool = get_pool()
+    async with pool.acquire() as conn:
+        return await _load_user_budget(conn, user_id)
+
+
+async def _load_budget_via_platform(user_id: uuid.UUID) -> UserBudget:
+    """platform-api → direct-DB fallback for the monthly read half.
+
+    No cache, deliberately (see project_budgets_service's 2b wrappers): this is
+    live money state, and caching it would widen the already-accepted advisory
+    gap between the gate's read and the post-call deduction by the whole TTL.
+
+    Opts into one retry — a pure read.
+    """
+    from src.platform_client import PlatformUnavailable, call_platform
+
+    try:
+        resp = await call_platform(
+            "POST", "/v1/internal/budget/user-budget-state",
+            json={"user_id": str(user_id)}, retries=1,
+        )
+    except PlatformUnavailable as e:
+        logger.error(
+            "user budget state via platform-api failed (%s) — falling back to direct DB", e
+        )
+        return await _load_user_budget_direct(user_id)
+
+    if resp.status_code == 409:
+        _reraise_legacy_topup(resp.json)
+    if resp.status_code == 200 and isinstance(resp.json, dict) and "monthlyBudgets" in resp.json:
+        return _deserialize_user_budget(resp.json)
+
+    logger.error(
+        "user budget state via platform-api returned unexpected status=%s body=%r "
+        "— falling back to direct DB",
+        resp.status_code, resp.json,
+    )
+    return await _load_user_budget_direct(user_id)
+
+
+async def _ensure_trial_via_platform(
+    user_id: uuid.UUID, plan_id: str, trial_plan: PlanConfig
+) -> UserBudget:
+    """platform-api → direct-DB fallback for trial provisioning (D2).
+
+    The only write in the gate chain. Opts into one retry, which is safe because
+    _provision_trial is INSERT … ON CONFLICT … WHERE the trial key IS NULL: a
+    replay after a lost answer cannot double-provision or reset a running trial.
+
+    Returns the REFRESHED budget, exactly as the in-process path did (provision,
+    then re-load), so the caller keeps its single-round-trip shape.
+    """
+    from src.platform_client import PlatformUnavailable, call_platform
+
+    try:
+        resp = await call_platform(
+            "POST", "/v1/internal/budget/ensure-trial",
+            json={"user_id": str(user_id), "plan_id": plan_id}, retries=1,
+        )
+    except PlatformUnavailable as e:
+        logger.error(
+            "trial provisioning via platform-api failed (%s) — falling back to direct DB", e
+        )
+        pool = get_pool()
+        async with pool.acquire() as conn:
+            await _provision_trial(conn, user_id, trial_plan)
+            return await _load_user_budget(conn, user_id)
+
+    if resp.status_code == 409:
+        _reraise_legacy_topup(resp.json)
+    if (
+        resp.status_code == 200
+        and isinstance(resp.json, dict)
+        and isinstance(resp.json.get("state"), dict)
+    ):
+        return _deserialize_user_budget(resp.json["state"])
+
+    logger.error(
+        "trial provisioning via platform-api returned unexpected status=%s body=%r "
+        "— falling back to direct DB",
+        resp.status_code, resp.json,
+    )
+    pool = get_pool()
+    async with pool.acquire() as conn:
+        await _provision_trial(conn, user_id, trial_plan)
+        return await _load_user_budget(conn, user_id)

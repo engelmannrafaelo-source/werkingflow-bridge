@@ -176,7 +176,10 @@ async def enforce_budget(
             )
             return
 
-        from src.billing.project_budgets_service import evaluate as _eval_project
+        # ADR-0009 Schritt 2b/C3: platform-api first, direct DB as fallback.
+        from src.billing.project_budgets_service import (
+            evaluate_via_platform as _eval_project,
+        )
 
         try:
             pr = await _eval_project(uid, plan.id, project_id, estimated_cost_eur)

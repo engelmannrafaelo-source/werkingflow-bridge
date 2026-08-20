@@ -81,11 +81,15 @@ async def resolve_billing_plan(
         # catalog layer must not depend on.
         from src.billing.project_budgets_service import (
             AmbiguousProjectBudget,
-            find_allocated_plan_id,
+            resolve_allocated_plan_id,
         )
 
         try:
-            allocated_id = await find_allocated_plan_id(user_id, project_id)
+            # ADR-0009 Schritt 2b/C2: platform-api first, direct DB as fallback.
+            # AmbiguousProjectBudget still arrives as an exception (409 over the
+            # hop), so the fail-CLOSED handling below is unchanged — that mapping
+            # is load-bearing, see resolve_allocated_plan_id's docstring.
+            allocated_id = await resolve_allocated_plan_id(user_id, project_id)
         except AmbiguousProjectBudget as e:
             raise PlanResolutionError(str(e)) from e
         if allocated_id:

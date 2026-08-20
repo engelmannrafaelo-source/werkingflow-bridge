@@ -80,6 +80,7 @@ async def call_platform(
     path: str,
     *,
     json: Optional[dict[str, Any]] = None,
+    params: Optional[dict[str, Any]] = None,
     timeout_s: float = 2.0,
     retries: int = 0,
     retry_backoff_s: float = DEFAULT_RETRY_BACKOFF_S,
@@ -125,7 +126,9 @@ async def call_platform(
     for attempt in range(1, attempts + 1):
         try:
             async with httpx.AsyncClient(timeout=timeout_s) as client:
-                resp = await client.request(method, url, json=json, headers=headers)
+                resp = await client.request(
+                    method, url, json=json, params=params, headers=headers
+                )
             break
         except (httpx.TimeoutException, httpx.TransportError) as e:
             kind = "timeout" if isinstance(e, httpx.TimeoutException) else "unreachable"

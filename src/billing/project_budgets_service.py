@@ -495,3 +495,107 @@ async def reset_budget(
     )
     # asyncpg execute() returns a tag like "UPDATE 1" / "UPDATE 0".
     return not str(result).endswith(" 0")
+
+
+# ── ADR-0009 Schritt 2b: platform-api-first wrappers (C2, C3) ───────────────
+#
+# The worker calls these; platform-api's /v1/internal endpoints keep calling the
+# DIRECT functions above. The names must stay distinct — if an endpoint ever
+# imported a wrapper instead, platform-api would call itself in a loop.
+#
+# No cache on either, unlike the identity leaf (C1) and principals (2a). An
+# allocation and a project pot are LIVE MONEY STATE, not configuration: caching
+# them would widen the already-accepted advisory gap between the gate's read and
+# the post-call deduction by the whole TTL. That gap does not exist today and
+# this step must not introduce it.
+
+
+async def resolve_allocated_plan_id(
+    user_id: uuid.UUID, project_id: str
+) -> Optional[str]:
+    """platform-api → direct-DB fallback for find_allocated_plan_id (C2).
+
+    AmbiguousProjectBudget survives the hop as a 409 and is re-raised here. That
+    matters more than it looks: the caller turns it into PlanResolutionError,
+    which the gate treats as fail-CLOSED. Had it arrived as a 5xx it would have
+    become PlatformUnavailable, the gate's catch-all would have waved the call
+    through, and "two plans claim this project" — the guard against billing the
+    wrong pot — would have become a silent pass. Hence the explicit 409 branch
+    rather than a generic error path.
+
+    Opts into one retry: a pure read, safe to replay.
+    """
+    from src.platform_client import PlatformUnavailable, call_platform
+
+    try:
+        resp = await call_platform(
+            "GET", "/v1/internal/project-budgets/allocated-plan-id",
+            params={"user_id": str(user_id), "project_id": project_id},
+            retries=1,
+        )
+    except PlatformUnavailable as e:
+        logger.error(
+            "allocated-plan lookup via platform-api failed (%s) — falling back to direct DB", e
+        )
+        return await find_allocated_plan_id(user_id, project_id)
+
+    if resp.status_code == 409:
+        detail = (resp.json or {}).get("detail") or {}
+        raise AmbiguousProjectBudget(
+            detail.get("message")
+            or f"several plans allocated project {project_id!r} (reported by platform-api)"
+        )
+    if resp.status_code == 200 and isinstance(resp.json, dict) and "planId" in resp.json:
+        return resp.json["planId"]
+
+    logger.error(
+        "allocated-plan lookup via platform-api returned unexpected status=%s body=%r "
+        "— falling back to direct DB",
+        resp.status_code, resp.json,
+    )
+    return await find_allocated_plan_id(user_id, project_id)
+
+
+async def evaluate_via_platform(
+    user_id: uuid.UUID,
+    plan_id: str,
+    project_id: str,
+    estimated_cost_eur: float,
+) -> Dict[str, Any]:
+    """platform-api → direct-DB fallback for evaluate() (C3).
+
+    Returns the same {exists, allowed, remainingEur, topUpRemainingEur} shape.
+    A malformed answer falls back rather than being interpreted: a missing
+    `exists` key would otherwise read as "no allocated budget" and silently
+    reroute a paid project call onto the monthly pot.
+
+    Opts into one retry: evaluate() is a pure read (get_budget + topup lots).
+    """
+    from src.platform_client import PlatformUnavailable, call_platform
+
+    try:
+        resp = await call_platform(
+            "POST", "/v1/internal/project-budgets/state",
+            json={
+                "user_id": str(user_id),
+                "plan_id": plan_id,
+                "project_id": project_id,
+                "estimated_cost_eur": estimated_cost_eur,
+            },
+            retries=1,
+        )
+    except PlatformUnavailable as e:
+        logger.error(
+            "project budget state via platform-api failed (%s) — falling back to direct DB", e
+        )
+        return await evaluate(user_id, plan_id, project_id, estimated_cost_eur)
+
+    if resp.status_code == 200 and isinstance(resp.json, dict) and "exists" in resp.json:
+        return resp.json
+
+    logger.error(
+        "project budget state via platform-api returned unexpected status=%s body=%r "
+        "— falling back to direct DB",
+        resp.status_code, resp.json,
+    )
+    return await evaluate(user_id, plan_id, project_id, estimated_cost_eur)

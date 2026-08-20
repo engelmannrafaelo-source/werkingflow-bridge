@@ -229,7 +229,12 @@ async def post_user_budget_state(
     except LegacyTopUpBalanceError as e:
         raise HTTPException(
             status_code=409,
-            detail={"error": "legacy_topup_balance", "message": str(e)},
+            detail={
+                "error": "legacy_topup_balance",
+                "message": str(e),
+                "userId": str(e.user_id),
+                "balanceEur": e.balance_eur,
+            },
         ) from e
 
 
@@ -266,5 +271,10 @@ async def post_ensure_trial(
     except LegacyTopUpBalanceError as e:
         raise HTTPException(
             status_code=409,
-            detail={"error": "legacy_topup_balance", "message": str(e)},
+            detail={
+                "error": "legacy_topup_balance",
+                "message": str(e),
+                "userId": str(e.user_id),
+                "balanceEur": e.balance_eur,
+            },
         ) from e

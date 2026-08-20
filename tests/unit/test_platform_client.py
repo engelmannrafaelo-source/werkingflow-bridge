@@ -251,3 +251,22 @@ async def test_4xx_is_not_retried_and_stays_an_ordinary_response():
         )
     assert len(attempts) == 1
     assert resp.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_query_params_are_sent():
+    """GET leaves (e.g. allocated-plan-id) pass their keys as query params —
+    without this they would silently be dropped from the request."""
+    seen = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.update(dict(request.url.params))
+        return httpx.Response(200, json={"planId": None})
+
+    with _patched_client(handler):
+        resp = await call_platform(
+            "GET", "/v1/internal/project-budgets/allocated-plan-id",
+            params={"user_id": "u-1", "project_id": "p-1"},
+        )
+    assert seen == {"user_id": "u-1", "project_id": "p-1"}
+    assert resp.json == {"planId": None}

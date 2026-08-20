@@ -38,6 +38,11 @@ class LegacyTopUpBalanceError(RuntimeError):
     silent runtime fixup.
     """
     def __init__(self, user_id: uuid.UUID, balance_eur: float):
+        # Kept as attributes so the same failure can be reconstructed faithfully
+        # on the other side of the worker→platform-api hop (ADR-0009 Schritt 2b):
+        # same type, same message, whichever channel answered.
+        self.user_id = user_id
+        self.balance_eur = balance_eur
         super().__init__(
             f"[Budget] user {user_id} has legacy scalar top-up balance "
             f"{balance_eur:.4f} EUR in user_topup_balances but the model now uses "
