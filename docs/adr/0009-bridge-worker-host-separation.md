@@ -191,7 +191,35 @@ reachable means either:
   point instead of five), but a real code change to how `/v1/jobs` and the
   budget gate work, not a deploy-topology change.
 
-**This ADR does not choose (a) or (b).** `docker-compose-worker-host.yml`
+**ENTSCHIEDEN am 2026-08-20 durch Rafael: Weg (b).** Ein Eingang zur Datenbank
+statt fuenf. Begruendung in seinen Worten: die Prod-Bridge traegt eine zu kritische
+Aufgabe (Kundendaten, Abos, Berechtigungen), sie darf nicht durch Worker-Last
+gefaehrdet werden — die Entkopplung ist der Zweck der Uebung, und sie soll
+langfristig sauber sein, nicht schnell. Weg (a) ist damit VERWORFEN: er haette die
+Angriffsflaeche genau des Containers vergroessert, den die Trennung schuetzen soll.
+
+**Nachgemessener Umfang (2026-08-20) — groesser als dieser ADR-Abschnitt annahm.**
+Der Text nennt `/v1/jobs` und das Budget-Gate. Tatsaechlich greifen im Worker-Pfad
+sechs Module direkt auf die DB zu (~10 Aufrufstellen):
+
+| Modul | Stellen | Zweck |
+|---|---|---|
+| `src/jobs/routes.py` | 2 | dauerhafter Job-Speicher |
+| `src/routing/prepaid_cap.py` | 1 | Prepaid-/Budget-Deckel |
+| `src/api_auth/tenant_resolver.py` | 2 | **Tenant-Aufloesung — im Auth-Pfad JEDER Anfrage** |
+| `src/principals.py` | 2 | Principal-Aufloesung, ebenfalls Anfragepfad |
+| `src/audit/recorder.py` | 1 | Audit-Log (Schreibpfad) |
+| `src/platform_config.py` | 2 | Plattform-Konfiguration |
+
+Zwei davon (`tenant_resolver`, `principals`) liegen im **heissen Pfad**. Ein naiv
+gebauter Innen-API-Aufruf pro Anfrage wuerde die Kopplung nicht aufloesen, sondern
+nur verschieben: statt DB-Last auf der Bridge haette jede Anfrage einen zusaetzlichen
+Netz-Hop dorthin. Der Entwurf muss diese Lesepfade deshalb mit kurzlebigem Cache und
+ausdruecklichem Fehlerverhalten behandeln (kein stiller Fallback), waehrend Audit und
+Jobs als Schreibpfade anders zu loesen sind. Das ist der eigentliche Entwurfskern,
+nicht das Umbiegen der Verbindung.
+
+**Unveraendert gueltig:** `docker-compose-worker-host.yml`
 documents the blocker inline (see its header) and will start workers that
 proxy LLM calls but fail durable-jobs/budget-gate calls until one of the two
 is implemented — do not cut nginx traffic over before that path is verified
