@@ -290,6 +290,24 @@ aber **nie** ungesund: `/health` steuert nginx-Routing und Container-Health, ein
 Durchfallen dort wuerde aus "die Ledger-Zeile wird wiederholt" einen echten
 Ausfall machen.
 
+**Was Schritt 1 NICHT abdeckt — ein verbleibender Verlustkanal, gemessen nicht
+vermutet (2026-08-20).** Der Puffer beginnt in `persist_ai_call_activity`. Er
+kann nur retten, was ihm uebergeben wird. Bei den **Streaming-Aufrufstellen**
+steht der Persist-Aufruf HINTER der `async for`-Schleife eines Async-Generators
+(z.B. `_tracked_bedrock_stream` in `src/main.py`). Bricht der Client mitten im
+Stream ab, schliesst Starlette den Generator, und die Zeile hinter der Schleife
+wird nie erreicht — die Funktion wird also gar nicht erst aufgerufen.
+
+Nachgemessen mit einem Minimalbeispiel (Generator abbrechen + `aclose()`):
+Code nach der Schleife laeuft nicht; bei vollstaendig gelesenem Stream laeuft
+er. Der Verlust ist damit heute schon da und von Schritt 1 unberuehrt.
+
+Bewusst NICHT hier mitgefixt: die saubere Loesung (Persist ueber `BackgroundTask`
+der `StreamingResponse` oder als abgeschirmte Aufgabe) ist eine Aenderung am
+Antwortpfad selbst, nicht an der Nahtstelle — anderes Risiko, andere
+Testflaeche, und der Geldpfad ist der schlechteste Kandidat fuer eine
+Nebenbei-Aenderung. Gehoert als eigenes Stueck geplant.
+
 Nicht getan, ausdruecklich: kein Deploy, kein Container-Neustart, keine
 Aenderung an production-barrier/prod-bridge, kein Postgres nach aussen, kein
 nginx, kein Umzug. Scharf wird der Puffer erst durch einen separaten,
