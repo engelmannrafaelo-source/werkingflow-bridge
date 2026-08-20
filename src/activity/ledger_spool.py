@@ -500,9 +500,13 @@ def spool_stats() -> Dict[str, Any]:
         }
     pending = 0
     oldest = None
-    for path in [_own_path()] + glob.glob(
-        os.path.join(SPOOL_DIR, f"ledger.{WORKER_NAME}.*.jsonl")
-    ):
+    # dict.fromkeys, not a list: the glob already contains this process's own
+    # file, and counting it twice would report a backlog that is not there.
+    paths = dict.fromkeys(
+        [_own_path()]
+        + sorted(glob.glob(os.path.join(SPOOL_DIR, f"ledger.{WORKER_NAME}.*.jsonl")))
+    )
+    for path in paths:
         for rec in _pending(path):
             pending += 1
             ts = float(rec.get("ts", 0))

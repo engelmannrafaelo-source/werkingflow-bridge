@@ -42,18 +42,28 @@ VALID_UUID = str(uuid.uuid4())
 TENANT_UUID = str(uuid.uuid4())
 
 
-def _make_mock_conn(*, tenant_row=None, email_row=None):
+def _make_mock_conn(*, tenant_row=None, email_row=None, ledger_inserted=True):
     """
-    Build a mock asyncpg connection whose fetchrow returns different
-    values depending on the query (tenant lookup vs email lookup).
+    Build a mock asyncpg connection whose fetchrow answers by query shape.
+
+    Three shapes reach fetchrow now (the ledger INSERT joined them in
+    ADR-0009 Schritt 1, because `ON CONFLICT DO NOTHING RETURNING id` needs a
+    return value to tell "I created this row" from "it was already there"):
+      * SELECT ... users WHERE email  → email_row
+      * SELECT u.tenant_id ...        → tenant_row
+      * INSERT INTO usage_events ...  → a row when ledger_inserted, else None
+
+    `conn.ledger_calls` collects the ledger INSERT's arguments so tests can
+    assert on the money row directly; `conn.execute` now only ever carries the
+    audit row.
     """
     conn = AsyncMock()
-    call_count = {"n": 0}
+    conn.ledger_calls = []
 
     async def _fetchrow(query, *args):
-        call_count["n"] += 1
-        # First call might be email lookup (SELECT id FROM users WHERE email)
-        # Subsequent call is tenant lookup (SELECT u.tenant_id ...)
+        if "usage_events" in query:
+            conn.ledger_calls.append(args)
+            return MagicMock() if ledger_inserted else None
         if "email" in query.lower():
             return email_row
         return tenant_row
@@ -285,7 +295,7 @@ async def test_cache_tokens_in_activity_payload():
 
 async def _call_writer_anonymous(user_id):
     """Wie _call_writer, aber ohne app_id-Default-Verwirrung — expliziter Marker."""
-    await writer.persist_ai_call_activity(
+    return await writer.persist_ai_call_activity(
         provider=PROVIDER_ANTHROPIC,
         app_id="werking-report",
         user_id=user_id,
@@ -354,8 +364,11 @@ async def test_legacy_underscore_anonymous_alias_books_too():
 
 
 @pytest.mark.asyncio
-async def test_anonymous_without_identity_row_skips_loudly():
-    """Fehlt die Migration-032-Identität, wird geskippt + laut gewarnt (kein FK-Crash)."""
+async def test_anonymous_without_identity_row_is_held_not_dropped():
+    """Fehlt die Migration-032-Identität, wird NICHT geschrieben (kein FK-Crash)
+    und NICHT stillgelegt: der Ausgang ist "failed", die Zeile bleibt geschuldet
+    und wird nach der Migration nachgeholt. Ton ist ERROR, nicht WARNING —
+    die Nutzung ist bis dahin nicht abgerechnet."""
     writer._skip_counts.clear()
     writer._anonymous_identity_verified = False
 
@@ -364,12 +377,13 @@ async def test_anonymous_without_identity_row_skips_loudly():
 
     with (
         patch.object(writer, "get_pool", return_value=pool),
-        patch.object(writer.logger, "warning") as mock_warn,
+        patch.object(writer.logger, "error") as mock_err,
     ):
-        await _call_writer_anonymous("anonymous:funnel")
+        outcome = await _call_writer_anonymous("anonymous:funnel")
 
-    assert any("migration 032" in str(c) for c in mock_warn.call_args_list)
+    assert any("migration 032" in str(c) for c in mock_err.call_args_list)
     conn.execute.assert_not_called()
+    assert outcome == writer.OUTCOME_FAILED
 
 
 # ---------------------------------------------------------------------------
@@ -410,9 +424,12 @@ async def test_error_message_persisted_truncated():
         )
 
     import json as _json
-    assert conn.execute.call_count == 2
+    # Ledger row via fetchrow (idempotent INSERT ... RETURNING id), audit row
+    # via execute — and the audit row only because the ledger row was created.
+    assert len(conn.ledger_calls) == 1
+    assert conn.execute.call_count == 1
     activities_payload = _json.loads(conn.execute.call_args_list[0].args[5])
-    usage_metadata = _json.loads(conn.execute.call_args_list[1].args[16])
+    usage_metadata = _json.loads(conn.ledger_calls[0][15])
 
     assert activities_payload["errorCode"] == "400"
     assert activities_payload["errorMessage"] == long_msg[:500]
@@ -440,7 +457,7 @@ async def test_success_rows_carry_no_error_fields():
 
     import json as _json
     activities_payload = _json.loads(conn.execute.call_args_list[0].args[5])
-    usage_metadata = _json.loads(conn.execute.call_args_list[1].args[16])
+    usage_metadata = _json.loads(conn.ledger_calls[0][15])
     assert "errorMessage" not in activities_payload
     assert "error_message" not in usage_metadata
     assert "error_code" not in usage_metadata

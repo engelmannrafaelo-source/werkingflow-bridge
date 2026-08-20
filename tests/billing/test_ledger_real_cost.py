@@ -118,11 +118,19 @@ def _mock_pool():
 
 
 def _usage_insert_args(conn):
-    """Extrahiert die Args des usage_events-INSERTs aus allen execute-Calls."""
-    for call in conn.execute.call_args_list:
-        sql = call.args[0]
-        if "INSERT INTO usage_events" in sql:
-            return sql, call.args[1:]
+    """Extrahiert die Args des usage_events-INSERTs.
+
+    Seit ADR-0009 Schritt 1 laeuft die Geldzeile ueber fetchrow statt execute
+    (`ON CONFLICT (idempotency_key) DO NOTHING RETURNING id` braucht einen
+    Rueckgabewert, um "ich habe die Zeile erzeugt" von "war schon da" zu
+    unterscheiden). Beide Kanaele werden durchsucht, damit dieser Test die
+    Kostenbindung prueft und nicht den Aufruf-Mechanismus.
+    """
+    for mock in (conn.fetchrow, conn.execute):
+        for call in getattr(mock, "call_args_list", []):
+            sql = call.args[0]
+            if "INSERT INTO usage_events" in sql:
+                return sql, call.args[1:]
     raise AssertionError("no usage_events INSERT executed")
 
 

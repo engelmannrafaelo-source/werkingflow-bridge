@@ -170,10 +170,20 @@ def _mock_pool(fail_on: str | None = None):
     return pool, conn
 
 
+# Positionsindex des provider_metadata-Arguments im usage_events-INSERT.
+# Nicht args[-1] verwenden: seit ADR-0009 Schritt 1 haengen recorded_at und
+# idempotency_key HINTER der Metadata ($17/$18), damit die bestehende
+# Positionsbindung $1..$16 unveraendert bleibt.
+USAGE_METADATA_ARG = 15
+
+
 def _insert_args(conn, table: str):
-    for call in conn.execute.call_args_list:
-        if f"INSERT INTO {table}" in call.args[0]:
-            return call.args[1:]
+    """Args des INSERTs — die Geldzeile laeuft seit ADR-0009 Schritt 1 ueber
+    fetchrow (RETURNING id), die Audit-Zeile weiter ueber execute."""
+    for mock in (conn.fetchrow, conn.execute):
+        for call in getattr(mock, "call_args_list", []):
+            if f"INSERT INTO {table}" in call.args[0]:
+                return call.args[1:]
     return None
 
 
@@ -219,7 +229,7 @@ async def test_rejected_label_survives_in_provider_metadata():
     conn = await _run("bridge-jobs")
 
     args = _insert_args(conn, "usage_events")
-    meta = json.loads(args[-1])
+    meta = json.loads(args[USAGE_METADATA_ARG])
     assert meta.get("app_id_raw") == "bridge-jobs"
 
 
@@ -240,4 +250,4 @@ async def test_real_app_is_unchanged():
 
     args = _insert_args(conn, "usage_events")
     assert args[2] == "werking-report"
-    assert "app_id_raw" not in json.loads(args[-1])
+    assert "app_id_raw" not in json.loads(args[USAGE_METADATA_ARG])

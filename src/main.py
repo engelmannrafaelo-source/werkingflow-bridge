@@ -708,6 +708,22 @@ async def lifespan(app: FastAPI):
             logger.error(f"❌ Worker app registry load failed: {e}")
             raise
 
+        # Write-ahead durability for the billing row (ADR-0009 Schritt 1).
+        # FAIL-FAST, deliberately NOT wrapped in a swallowing try: if the spool
+        # is switched on but cannot work (volume missing, disk full), the worker
+        # must not serve traffic while looking healthy — it would be making a
+        # durability promise it silently does not keep. Same bar as the plan
+        # catalog and app registry above. Switching it off is a decision and
+        # boots fine (BRIDGE_LEDGER_SPOOL_ENABLED=false, logged as a warning).
+        from src.activity import ledger_spool
+        ledger_spool.assert_spool_ready()
+
+        # Drain loop: replays every billing row the inline write did not get
+        # in, including those spooled by a process that has since died.
+        if ledger_spool.spool_enabled():
+            asyncio.create_task(ledger_spool.flusher_loop())
+            logger.info("🧾 Ledger spool flusher started")
+
     yield
 
     # Cleanup on shutdown

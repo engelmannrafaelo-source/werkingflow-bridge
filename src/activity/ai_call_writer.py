@@ -26,9 +26,18 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 from collections import defaultdict
+from datetime import datetime, timezone
 from typing import Optional
 
+from src.activity import ledger_spool
+from src.activity.ledger_spool import (
+    OUTCOME_DUPLICATE,
+    OUTCOME_FAILED,
+    OUTCOME_SKIPPED,
+    OUTCOME_WRITTEN,
+)
 from src.activity.app_registry import normalize_app_id
 from src.activity.providers import REAL_COST_PROVIDERS, normalize_ledger_provider
 from src.budget.plan_resolution import PlanResolutionError
@@ -221,9 +230,35 @@ async def persist_ai_call_activity(
     cache_read_tokens: int = 0,
     cache_creation_tokens: int = 0,
     search_count: int = 0,
-) -> None:
+    _call_uid: Optional[str] = None,
+    _call_ts: Optional[float] = None,
+) -> str:
     """
-    Write one ai-call activity row. Never raises — tracking is best-effort.
+    Write one ai-call activity row. Never raises for an `Exception` — tracking
+    must not break a user-facing call.
+
+    Durability (ADR-0009 Schritt 1). The call's facts are written to a local
+    write-ahead spool and fsync'd BEFORE the first database await, and the
+    ledger INSERT carries `usage_events.idempotency_key`. Together that means:
+    every path out of this function that is not a definitive answer leaves the
+    row OWED on disk, and a later replay produces the SAME row rather than a
+    second one. What used to be "DB hiccup → ERROR log → unbilled usage" is now
+    "DB hiccup → the row arrives late".
+
+    This also closes a loss that had no log at all: `asyncio.CancelledError` is
+    a BaseException, so a client disconnect mid-write escaped the `except
+    Exception` below and took the row with it, silently. It still propagates
+    (swallowing cancellation is its own bug) — but the row is already on disk
+    by then, so the flusher writes it.
+
+    Returns one of the ledger_spool outcomes ("written" / "duplicate" /
+    "skipped:<reason>" / "failed"). Callers in the request path ignore it; the
+    spool flusher uses it to tell "still owed" from "settled".
+
+    _call_uid / _call_ts: set ONLY by the spool flusher when replaying. Their
+    presence means "this call is already on disk, do not spool it again", and
+    _call_ts carries the ORIGIN time of the call — not the replay time — so a
+    replayed row is recorded in the period it belongs to.
 
     status: "success" | "error"
     error_message: human-readable provider/bridge error detail (e.g. the
@@ -258,6 +293,36 @@ async def persist_ai_call_activity(
         cloud only) — billed per-search on top of tokens, see src/pricing.py
         WEB_SEARCH_FEE_USD. Defaults to 0 (no-op for every other caller).
     """
+    # ── Write-ahead: make the row survivable BEFORE touching the database ──
+    # Deliberately the very first thing, and deliberately synchronous: a sync
+    # write is not a cancellation point, so nothing after this line — including
+    # a cancelled request task or an OOM-kill — can lose the fact that this
+    # call happened.
+    replaying = _call_uid is not None
+    call_uid = _call_uid or ledger_spool.new_call_uid()
+    call_ts = _call_ts if _call_ts is not None else time.time()
+    spooled = False
+    if not replaying and ledger_spool.spool_enabled():
+        spooled = ledger_spool.append_call(call_uid, {
+            "app_id": app_id, "user_id": user_id, "agent_id": agent_id,
+            "workflow_id": workflow_id, "model": model,
+            "input_tokens": input_tokens, "output_tokens": output_tokens,
+            "status": status, "duration_ms": duration_ms,
+            "error_code": error_code, "error_message": error_message,
+            "app_env": app_env, "provider": provider,
+            "provider_meta": provider_meta, "region": region,
+            "cache_read_tokens": cache_read_tokens,
+            "cache_creation_tokens": cache_creation_tokens,
+            "search_count": search_count,
+        })
+
+    def _settle(outcome: str) -> str:
+        """Single exit. A definitive answer releases the spooled record; any
+        other outcome leaves it owed, which is what makes the retry happen."""
+        if spooled and ledger_spool.is_definitive(outcome):
+            ledger_spool.ack(call_uid, outcome)
+        return outcome
+
     # Validate before anything keys on it: provider drives both the cost
     # branch below and the compliance readout. An unvocabulary value becomes
     # 'unknown' + an ERROR log, never a plausible-looking default.
@@ -318,6 +383,13 @@ async def persist_ai_call_activity(
     # alias '_anonymous') → book to the dedicated anonymous identity. Resolved
     # BEFORE the UUID check below, which would otherwise skip these as
     # "non-UUID string" (the pre-032 behaviour = tracking gap).
+    # Default "still owed": every path that does not reach the INSERT and does
+    # not name a definitive skip leaves the spooled record for a retry. The
+    # bias on a billing path is toward writing the row twice-and-deduplicated,
+    # never toward dropping it.
+    outcome = OUTCOME_FAILED
+    ledger_written = False
+
     from src.attribution import anonymous_reason
     anon_reason = anonymous_reason(user_id)
     if anon_reason is not None:
@@ -326,15 +398,27 @@ async def persist_ai_call_activity(
                 user_id = ANONYMOUS_USER_ID
                 agent_id = agent_id or "anonymous"
             else:
-                logger.warning(
+                # NOT a skip: the row is owed and stays owed. Running
+                # migration 032 makes the spooled record writable, so leaving
+                # it unsettled is what turns "we lost those calls" into "they
+                # arrive once the migration lands".
+                logger.error(
                     "persist_ai_call_activity: anonymous call (reason=%s app=%s) but "
-                    "anonymous identity %s is missing — run migration 032. Activity skipped.",
+                    "anonymous identity %s is missing — run migration 032. The "
+                    "billing row is held in the spool until it exists.",
                     anon_reason, app_id, ANONYMOUS_USER_ID,
                 )
-                return
+                return _settle(OUTCOME_FAILED)
         except Exception as e:  # noqa: BLE001 — tracking must never break the call
-            logger.warning("persist_ai_call_activity: anonymous identity check failed: %s", e)
-            return
+            # This exit used to be the quietest hole on the ledger path: a DB
+            # blip during the identity probe dropped an anonymous call on the
+            # WARNING channel, never reaching the ERROR that is supposed to be
+            # the alarm. It is now a transient outcome — the row stays owed.
+            logger.error(
+                "persist_ai_call_activity: anonymous identity check failed (%s) "
+                "— billing row held in the spool for retry", e,
+            )
+            return _settle(OUTCOME_FAILED)
 
     try:
         if not user_id:
@@ -352,7 +436,7 @@ async def persist_ai_call_activity(
                 "— NO usage_events row written for this call",
                 app_id, agent_id, model,
             )
-            return
+            return _settle(f"{OUTCOME_SKIPPED}:no_user")
 
         import uuid as _uuid
 
@@ -381,7 +465,7 @@ async def persist_ai_call_activity(
                         "Fix: caller should send user UUID, not email.",
                         _skip_counts[user_id], user_id, app_id,
                     )
-                    return
+                    return _settle(f"{OUTCOME_SKIPPED}:email_unknown")
             else:
                 # 'system', 'internal', or other non-user strings — semantically
                 # not a real user; nothing to persist in the tenant-scoped table.
@@ -392,7 +476,7 @@ async def persist_ai_call_activity(
                     "Fix: send user UUID or omit X-User-ID for system calls.",
                     user_id, app_id, _skip_counts[user_id],
                 )
-                return
+                return _settle(f"{OUTCOME_SKIPPED}:not_a_user")
 
         pool = get_pool()
         async with pool.acquire() as conn:
@@ -426,7 +510,7 @@ async def persist_ai_call_activity(
                     "NOT metered",
                     user_id, app_id, agent_id, model, _skip_counts[user_id],
                 )
-                return
+                return _settle(f"{OUTCOME_SKIPPED}:no_tenant")
 
             # app_id is an ENUM column — validate before the INSERT rather than
             # letting Postgres reject it mid-transaction. An unknown value books
@@ -463,6 +547,9 @@ async def persist_ai_call_activity(
                 "costEur": call_cost_eur,  # priced via src/pricing.py (SSoT)
                 "latencyMs": duration_ms,
                 "loggedBy": "bridge",  # distinguishes self-log from legacy app POSTs
+                # Same value as usage_events.idempotency_key — the join between
+                # the audit trail and the money row for one call.
+                "callUid": call_uid,
             }
             if error_code:
                 payload["errorCode"] = error_code
@@ -486,41 +573,6 @@ async def persist_ai_call_activity(
             except (ValueError, AttributeError, TypeError):
                 actor_uuid = None
 
-            # Audit record — the activity row is the source of truth for the
-            # audit trail (who called what, when, from which app/env).
-            #
-            # Deliberately in its own try: the audit row and the ledger row are
-            # separate concerns and must not share a fate. They used to sit in
-            # one block, so a rejected audit INSERT silently took the BILLING
-            # row down with it (2026-08-01: app_id="bridge-jobs" vs the enum —
-            # every un-attributed research job booked nothing). Losing the audit
-            # trail for one call is bad; losing the money record is worse, so
-            # the ledger write below runs either way.
-            try:
-                await conn.execute(
-                    """
-                    INSERT INTO activities
-                      (id, timestamp, category, event_type, actor_user_id,
-                       target_user_id, tenant_id, app_id, ip, user_agent, payload,
-                       app_env)
-                    VALUES (gen_random_uuid(), NOW(), 'workflow', $1, $2,
-                            NULL, $3, $4, NULL, NULL, $5::jsonb, $6::app_env)
-                    """,
-                    event_type,
-                    actor_uuid,
-                    tenant_id,
-                    app_id_col,
-                    json.dumps(payload),
-                    app_env,
-                )
-            except Exception as _audit_err:  # noqa: BLE001 — ledger must still run
-                logger.error(
-                    "persist_ai_call_activity: AUDIT row failed (app=%s agent=%s "
-                    "model=%s): %s — the usage_events row below is still written, "
-                    "so the call stays metered; the audit trail has a gap here",
-                    app_id_col, agent_id, model, _audit_err,
-                )
-
             # Usage ledger — structured row with dedicated token/cost columns so
             # the Platform Admin can query across workflow + sandbox without JSONB
             # extraction.  billing_mode/real_cost mapping lives in
@@ -530,10 +582,26 @@ async def persist_ai_call_activity(
                 billing_mode_text, provider, call_cost_eur
             )
 
-            await conn.execute(
+            # Idempotent by construction (ADR-0009 Schritt 1). Two things make
+            # a replay safe rather than a second charge:
+            #
+            #  • idempotency_key — generated where the CALL happened, not where
+            #    the row is written, so a retry an hour later is recognisably
+            #    the same call. The column (UNIQUE, migration 016) already
+            #    existed and was already used exactly this way by the sandbox
+            #    path; the chat/research path simply never set it.
+            #  • recorded_at from the call's ORIGIN timestamp, not NOW(). A row
+            #    replayed after an outage must be recorded in the period it
+            #    belongs to — otherwise a call from the last minute of a month
+            #    lands in the next one and the invoice quietly moves.
+            #
+            # RETURNING id answers the only question the rest of this function
+            # needs: did *this* attempt create the row? (Same shape as
+            # sandbox/lease_service.py.)
+            _inserted_row = await conn.fetchrow(
                 """
                 INSERT INTO usage_events (
-                    source,
+                    source, recorded_at, idempotency_key,
                     user_id, tenant_id,
                     app, app_env, model, provider, region,
                     input_tokens, output_tokens,
@@ -541,7 +609,7 @@ async def persist_ai_call_activity(
                     billing_mode, real_cost_eur, hypothetical_cost_eur, pricing_version,
                     provider_metadata
                 ) VALUES (
-                    'workflow',
+                    'workflow', $17, $18,
                     $1, $2,
                     $3, $4::app_env, $5, $6, $7,
                     $8, $9,
@@ -549,6 +617,8 @@ async def persist_ai_call_activity(
                     $12::billing_mode_enum, $13, $14, $15,
                     $16::jsonb
                 )
+                ON CONFLICT (idempotency_key) DO NOTHING
+                RETURNING id
                 """,
                 actor_uuid,
                 tenant_id,
@@ -588,7 +658,61 @@ async def persist_ai_call_activity(
                     **({"app_id_raw": app_id_rejected} if app_id_rejected else {}),
                     **(provider_meta or {}),
                 }),
+                datetime.fromtimestamp(call_ts, tz=timezone.utc),
+                call_uid,
             )
+            ledger_written = _inserted_row is not None
+            outcome = OUTCOME_WRITTEN if ledger_written else OUTCOME_DUPLICATE
+            if not ledger_written:
+                # A replay caught up with a row that had already landed — the
+                # spooled record simply outlived its ack. Nothing to repair;
+                # logged so a drained backlog is legible afterwards.
+                logger.info(
+                    "persist_ai_call_activity: usage_events row for call %s was "
+                    "already present — replay settled, no second row, no second "
+                    "deduction", call_uid,
+                )
+
+            # Audit record — who called what, when, from which app/env.
+            #
+            # Deliberately in its own try: the audit row and the ledger row are
+            # separate concerns and must not share a fate. They used to sit in
+            # one block, so a rejected audit INSERT silently took the BILLING
+            # row down with it (2026-08-01: app_id="bridge-jobs" vs the enum —
+            # every un-attributed research job booked nothing).
+            #
+            # It now runs AFTER the ledger row and only when that row was
+            # created in this attempt. Two reasons, both from the durability
+            # work: money goes first when a connection may die between two
+            # statements, and `activities` has no unique key — replaying it
+            # unconditionally would duplicate the audit trail every time the
+            # spool retried a call whose ledger row had already landed.
+            if ledger_written:
+                try:
+                    await conn.execute(
+                        """
+                        INSERT INTO activities
+                          (id, timestamp, category, event_type, actor_user_id,
+                           target_user_id, tenant_id, app_id, ip, user_agent, payload,
+                           app_env)
+                        VALUES (gen_random_uuid(), $7, 'workflow', $1, $2,
+                                NULL, $3, $4, NULL, NULL, $5::jsonb, $6::app_env)
+                        """,
+                        event_type,
+                        actor_uuid,
+                        tenant_id,
+                        app_id_col,
+                        json.dumps(payload),
+                        app_env,
+                        datetime.fromtimestamp(call_ts, tz=timezone.utc),
+                    )
+                except Exception as _audit_err:  # noqa: BLE001 — ledger already landed
+                    logger.error(
+                        "persist_ai_call_activity: AUDIT row failed (app=%s agent=%s "
+                        "model=%s): %s — the usage_events row IS written, so the "
+                        "call stays metered; the audit trail has a gap here",
+                        app_id_col, agent_id, model, _audit_err,
+                    )
     except Exception as e:  # noqa: BLE001 — tracking must never break the call
         # ERROR, not WARNING: reaching here means NO usage_events row for a call
         # that really happened — spend nobody can see and nobody can reconcile.
@@ -596,8 +720,11 @@ async def persist_ai_call_activity(
         # break a user-facing request), but the gap has to be alarm-worthy.
         logger.error(
             "persist_ai_call_activity: LEDGER WRITE FAILED (app=%s agent=%s "
-            "model=%s provider=%s) — this call is NOT metered: %s",
-            app_id, agent_id, model, provider, e,
+            "model=%s provider=%s) — this call is NOT metered yet%s: %s",
+            app_id, agent_id, model, provider,
+            " (held in the write-ahead spool, will be retried)" if spooled else
+            " AND NOT SPOOLED — this row is lost",
+            e,
         )
 
     # Post-call budget deduction. Separate step from the activity write:
@@ -616,3 +743,5 @@ async def persist_ai_call_activity(
         )
     elif user_id and app_id and call_cost_eur > 0 and user_id != ANONYMOUS_USER_ID:
         await _deduct_call_cost(user_id, app_id, call_cost_eur, workflow_id, tenant_id)
+
+    return _settle(outcome)
