@@ -1681,13 +1681,13 @@ async def patch_tenant_stammdaten(
 
         if firma_json is not None:
             args.append(firma_json)
-            sets.append(f"firma = COALESCE(firma, '{{}}'::jsonb) || ${len(args)}::jsonb")
+            sets.append(f"firma = COALESCE(tenant_stammdaten.firma, '{{}}'::jsonb) || ${len(args)}::jsonb")
         if body.logo is not None:
             args.append(body.logo)
             sets.append(f"logo = ${len(args)}")
         if style_json is not None:
             args.append(style_json)
-            sets.append(f"style_settings = COALESCE(style_settings, '{{}}'::jsonb) || ${len(args)}::jsonb")
+            sets.append(f"style_settings = COALESCE(tenant_stammdaten.style_settings, '{{}}'::jsonb) || ${len(args)}::jsonb")
 
         args.append(tenant_id)
         tenant_pos = len(args)
