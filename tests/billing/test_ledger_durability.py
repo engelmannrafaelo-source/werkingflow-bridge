@@ -36,12 +36,14 @@ TENANT_ID = str(uuid.uuid4())
 @pytest.fixture
 def spool_dir(tmp_path, monkeypatch):
     d = tmp_path / "bridge-billing-spool"
+    spool.release_own_file()
     monkeypatch.setattr(spool, "SPOOL_DIR", str(d))
     monkeypatch.setattr(spool, "WORKER_NAME", "worker-test")
     monkeypatch.setattr(spool, "_dir_ready", None)
     monkeypatch.setenv("BRIDGE_LEDGER_SPOOL_ENABLED", "true")
     writer._skip_counts.clear()
-    return d
+    yield d
+    spool.release_own_file()
 
 
 def _conn(*, ledger_inserted=True, explode=None):

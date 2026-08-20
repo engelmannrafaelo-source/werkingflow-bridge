@@ -739,6 +739,15 @@ async def lifespan(app: FastAPI):
             logger.info("✅ Worker DB pool closed")
         except Exception:
             pass
+        # Hand the spool file over immediately. The kernel would release the
+        # lock at process exit anyway; doing it here means a sibling uvicorn
+        # process can adopt any still-owed billing rows right away instead of
+        # waiting for the fd to be reaped.
+        try:
+            from src.activity.ledger_spool import release_own_file
+            release_own_file()
+        except Exception:
+            pass
 
 
 # ── Generic async-job system: built-in executor + maintenance loop ──────────

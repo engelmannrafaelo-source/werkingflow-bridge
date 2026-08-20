@@ -32,19 +32,23 @@ from src.activity import ledger_spool as spool  # noqa: E402
 
 @pytest.fixture
 def spool_dir(tmp_path, monkeypatch):
-    """Isolierter Spool je Test. SPOOL_DIR wird zur Laufzeit gelesen, der
-    Cache-Merker `_dir_ready` muss mit zurueckgesetzt werden."""
+    """Isolierter Spool je Test.
+
+    SPOOL_DIR wird zur Laufzeit gelesen; der Cache-Merker `_dir_ready` und die
+    Lebenszeit-Sperre haengen am vorigen Verzeichnis und muessen mit. Die
+    Sperre wird ueber release_own_file() abgegeben statt ueber monkeypatch —
+    monkeypatch wuerde beim Teardown den ALTEN (dann geschlossenen) fd
+    zuruecksetzen, und der naechste Test schloesse ihn ein zweites Mal.
+    """
     d = tmp_path / "bridge-billing-spool"
+    spool.release_own_file()
     monkeypatch.setattr(spool, "SPOOL_DIR", str(d))
     monkeypatch.setattr(spool, "WORKER_NAME", "worker-test")
     monkeypatch.setattr(spool, "_dir_ready", None)
     monkeypatch.setattr(spool, "_undurable_calls", 0)
-    # Die Lebenszeit-Sperre haengt am vorigen SPOOL_DIR — je Test neu nehmen.
-    if spool._own_lock_fd is not None:
-        os.close(spool._own_lock_fd)
-    monkeypatch.setattr(spool, "_own_lock_fd", None)
     monkeypatch.setenv("BRIDGE_LEDGER_SPOOL_ENABLED", "true")
-    return d
+    yield d
+    spool.release_own_file()
 
 
 def _rec(model="claude-sonnet-5"):

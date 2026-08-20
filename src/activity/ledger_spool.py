@@ -180,6 +180,24 @@ def _hold_own_file() -> None:
         )
 
 
+def release_own_file() -> None:
+    """Drop the lifetime lock. The kernel does this on process exit anyway —
+    this exists so a shutdown (or a test) can hand the file over immediately
+    instead of leaving it un-adoptable until the fd is reaped."""
+    global _own_lock_fd
+    fd, _own_lock_fd = _own_lock_fd, None
+    if fd is None:
+        return
+    try:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+    except OSError:
+        pass
+    try:
+        os.close(fd)
+    except OSError:
+        pass
+
+
 def _is_unowned(path: str) -> bool:
     """True when no live process holds `path` — i.e. it is safe to adopt.
 
