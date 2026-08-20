@@ -219,6 +219,42 @@ ausdruecklichem Fehlerverhalten behandeln (kein stiller Fallback), waehrend Audi
 Jobs als Schreibpfade anders zu loesen sind. Das ist der eigentliche Entwurfskern,
 nicht das Umbiegen der Verbindung.
 
+### Umsetzungsplan (entschieden 2026-08-20 mit Rafael)
+
+Kernidee: **die beiden schwierigen Pakete werden auf der BESTEHENDEN Bridge gebaut
+und bewiesen — ohne dass irgendetwas umzieht.** Danach ist der Umzug keine Wette
+mehr, sondern eine Adressaenderung.
+
+**Schritt 1 — Abrechnungszeile unverlierbar machen (auf der bestehenden Bridge).**
+Der Nachher-Pfad ist der einzige mit Geld-Semantik. Heute schreibt derselbe Prozess,
+der den LLM-Aufruf gemacht hat, direkt in die DB; ueber Netz waere ein verlorener
+Schreibvorgang nicht abgerechnete Nutzung. Loesung: dauerhafter lokaler Ausgangspuffer
+im Worker + idempotentes Eintragen. Der Code hat die Nahtstelle schon — genau eine
+Funktion (`persist_ai_call_activity`) und eine bereits vorhandene Trennung zwischen
+*authoritative* Abrechnungszeile und *best-effort* Budget-Abzug (`_deduct_call_cost`,
+"never raises"). Nur die Zeile muss garantiert ankommen; der Abzug ist nachrechenbar.
+**Dieser Schritt lohnt sich eigenstaendig**: heute geht die Zeile bei einem
+DB-Aussetzer verloren, danach nicht mehr — auch ohne jeden Umzug.
+
+**Schritt 2 — Lesepfade ueber einen Eingang (ebenfalls noch lokal).**
+Auth/Tenant/Principal/Budget-Tor ueber die Innen-API statt fuenf DB-Verbindungen,
+mit kurzlebigem Cache und ausdruecklichem Fehlerverhalten. Alter Weg bleibt als
+sofortiger Rueckfall, Validierung im Echtbetrieb ohne Ortswechsel.
+
+**Schritt 3 — EIN Worker von vieren zieht um.** nginx behaelt drei lokal. Ein Fehler
+zeigt sich an einem Viertel des Verkehrs. Rueckweg = nginx-Ziel zurueckstellen, gleiche
+auto-rollback-gesicherte Route wie jeder nginx-Deploy.
+
+**Schritt 4 — restliche drei**, danach `/v1/jobs` und die Log-Volume-Abhaengigkeit
+des metrics-readers.
+
+**Dringlichkeit, ehrlich gemessen (2026-08-20):** die Prod-Bridge laeuft bei 4 Kernen
+mit Last 0,14, 14 % RAM, 14 % Platte — von Ueberlastung keine Spur. Das Argument ist
+NICHT Kapazitaet, sondern Schadensradius: Worker und Kundendatenbank teilen Maschine
+und Schicksal. Praezedenzfall existiert (Dev-Bridge: Platte voll -> Postgres tot ->
+alles 500). Deshalb bewusst OHNE Zeitdruck bauen — der Geldpfad ist der schlechteste
+Kandidat fuer Hektik.
+
 **Unveraendert gueltig:** `docker-compose-worker-host.yml`
 documents the blocker inline (see its header) and will start workers that
 proxy LLM calls but fail durable-jobs/budget-gate calls until one of the two
