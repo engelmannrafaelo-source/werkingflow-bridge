@@ -20,7 +20,7 @@ fail-open try/except — the resolver itself never silently invents an identity.
 from __future__ import annotations
 
 import uuid
-from typing import Any
+from typing import Any, Optional
 
 from src.db.client import get_pool
 
@@ -79,13 +79,32 @@ async def resolve_user_id(raw: Any) -> uuid.UUID:
 
     # Email identity (Engelmann) — resolve via users.email.
     if "@" in s:
-        pool = get_pool()
-        async with pool.acquire() as conn:
-            row = await conn.fetchrow("SELECT id FROM users WHERE email = $1", s)
-        if row is None:
+        uid = await lookup_user_id_by_email(s)
+        if uid is None:
             # No PII in the message — the email is the lookup key, not for logs.
             raise UnknownUserIdentity("no Bridge user for the given email identity")
-        uid = row["id"]
-        return uid if isinstance(uid, uuid.UUID) else uuid.UUID(str(uid))
+        return uid
 
     raise MalformedUserIdentity("identity is neither a UUID nor an email")
+
+
+async def lookup_user_id_by_email(email: str) -> Optional[uuid.UUID]:
+    """The single DB leaf of resolve_user_id: users.email → users.id.
+
+    Split out so platform-api can expose exactly this one query as an internal
+    endpoint (ADR-0009 Schritt 2b, C1) and the worker's own direct-DB path can
+    keep calling the identical function — the query lives in ONE place, not two.
+
+    Returns None for "no such user". That is a real answer, not an error: the
+    caller (resolve_user_id) turns it into UnknownUserIdentity, and the HTTP
+    endpoint turns it into a 404. Everything else about identity handling —
+    UUID parsing, the malformed-vs-unknown distinction — stays in the caller,
+    because none of it touches the database.
+    """
+    pool = get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow("SELECT id FROM users WHERE email = $1", email)
+    if row is None:
+        return None
+    uid = row["id"]
+    return uid if isinstance(uid, uuid.UUID) else uuid.UUID(str(uid))

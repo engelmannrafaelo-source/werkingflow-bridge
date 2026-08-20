@@ -668,3 +668,77 @@ async def get_budget(
         "sandboxTokensUsed": tokens_by_source.get("sandbox", 0),
         "workflowTokensUsed": tokens_by_source.get("workflow", 0),
     }
+
+
+# ── ADR-0009 Schritt 2b: named DB leaves for the worker↔platform-api split ──
+#
+# These two exist so platform-api's /v1/internal endpoints can call exactly the
+# same functions the worker used to call in-process (same pattern as Schritt
+# 2a's principals.get_principal_row_by_hash). The query and the provisioning
+# SQL stay in ONE place; only the caller's location changes.
+
+
+async def load_user_budget_state(user_id: uuid.UUID) -> Dict[str, Any]:
+    """The read half of evaluate_budget's monthly path, as a serializable dict.
+
+    Deliberately returns DATA, not a verdict. Everything the gate decides on
+    top of this — rollover_monthly_if_due, check_budget, trial-expiry handling —
+    is stateless pure computation (src/budget/calculator.py) and stays in the
+    worker process, where it already is. Moving the verdict here instead would
+    mean a second copy of gate.py's branching logic living on the platform-api
+    side, which is exactly the duplication Schritt 2b is designed to avoid.
+
+    Raises LegacyTopUpBalanceError (via _load_topup_lots) for a non-migrated
+    legacy scalar balance. That is a deliberate fail-loud safeguard, NOT an
+    outage — the HTTP layer must surface it as a 4xx, never a 5xx, or the
+    worker's client would turn it into PlatformUnavailable and the gate's
+    fail-open catch-all would silently swallow a data-integrity alarm.
+    """
+    pool = get_pool()
+    async with pool.acquire() as conn:
+        budget = await _load_user_budget(conn, user_id)
+    return {
+        "userId": budget.user_id,
+        "monthlyBudgets": _serialize_monthly_budgets(budget.monthly_budgets),
+        "topUpLots": _serialize_topup_lots(budget.top_up_lots),
+    }
+
+
+async def ensure_trial_provisioned(
+    user_id: uuid.UUID, plan_id: str
+) -> Dict[str, Any]:
+    """Idempotently provision the trial sibling of `plan_id`, then return the
+    refreshed budget state (ADR-0009 Schritt 2b, D2).
+
+    Returns the state as well as the outcome so the caller needs ONE round trip,
+    mirroring what evaluate_budget does in-process today (provision, then
+    re-load). `provisioned` reports whether this call was the one that created
+    the entry — informational only; callers must not branch billing on it,
+    because a concurrent caller legitimately wins that race.
+
+    Safe to retry: _provision_trial is INSERT … ON CONFLICT DO UPDATE … WHERE
+    the trial key IS NULL, so a replay cannot double-provision or reset an
+    existing trial window. That property is what lets the worker-side call site
+    opt into platform_client's bounded retry.
+    """
+    trial = find_trial_plan_for(plan_id)
+    if trial is None:
+        return {"provisioned": False, "trialPlanId": None, "state": None}
+
+    pool = get_pool()
+    async with pool.acquire() as conn:
+        before = await _load_user_budget(conn, user_id)
+        already = before.monthly_budgets.get(trial.id) is not None
+        if not already:
+            await _provision_trial(conn, user_id, trial)
+        budget = await _load_user_budget(conn, user_id)
+
+    return {
+        "provisioned": not already,
+        "trialPlanId": trial.id,
+        "state": {
+            "userId": budget.user_id,
+            "monthlyBudgets": _serialize_monthly_budgets(budget.monthly_budgets),
+            "topUpLots": _serialize_topup_lots(budget.top_up_lots),
+        },
+    }
