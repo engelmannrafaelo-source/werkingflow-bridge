@@ -19,10 +19,46 @@ fail-open try/except — the resolver itself never silently invents an identity.
 
 from __future__ import annotations
 
+import logging
+import os
+import time
 import uuid
 from typing import Any, Optional
 
 from src.db.client import get_pool
+from src.platform_client import PlatformUnavailable, call_platform
+
+logger = logging.getLogger(__name__)
+
+# ── Email-identity resolution cache (ADR-0009 Schritt 2b, C1) ───────────────
+# Same shape and reasoning as src/principals.py's cache: an email→id mapping is
+# configuration-like, not live money state, so a short TTL is safe and keeps a
+# burst of Engelmann calls from becoming one lookup per call. Misses are cached
+# too, so a flood of unknown identities cannot amplify into a lookup storm.
+_EMAIL_CACHE_TTL_S = float(os.getenv("BRIDGE_EMAIL_IDENTITY_CACHE_TTL_S", "20"))
+_email_cache: dict[str, tuple[float, Optional[uuid.UUID]]] = {}
+
+
+def _email_cache_get(email: str) -> tuple[bool, Optional[uuid.UUID]]:
+    entry = _email_cache.get(email)
+    if entry is None:
+        return False, None
+    ts, uid = entry
+    if (time.monotonic() - ts) > _EMAIL_CACHE_TTL_S:
+        _email_cache.pop(email, None)
+        return False, None
+    return True, uid
+
+
+def _email_cache_put(email: str, uid: Optional[uuid.UUID]) -> None:
+    _email_cache[email] = (time.monotonic(), uid)
+
+
+def invalidate_email_cache() -> None:
+    """Drop all cached email→id resolutions. No production caller today; exists
+    so a future user-management change can take effect without waiting out the
+    TTL, mirroring principals.invalidate_cache."""
+    _email_cache.clear()
 
 
 class UnresolvableUserIdentity(ValueError):
@@ -77,9 +113,9 @@ async def resolve_user_id(raw: Any) -> uuid.UUID:
     except (ValueError, AttributeError, TypeError):
         pass
 
-    # Email identity (Engelmann) — resolve via users.email.
+    # Email identity (Engelmann) — resolve via platform-api, then direct DB.
     if "@" in s:
-        uid = await lookup_user_id_by_email(s)
+        uid = await _resolve_email_identity(s)
         if uid is None:
             # No PII in the message — the email is the lookup key, not for logs.
             raise UnknownUserIdentity("no Bridge user for the given email identity")
@@ -108,3 +144,53 @@ async def lookup_user_id_by_email(email: str) -> Optional[uuid.UUID]:
         return None
     uid = row["id"]
     return uid if isinstance(uid, uuid.UUID) else uuid.UUID(str(uid))
+
+
+async def _resolve_email_identity(email: str) -> Optional[uuid.UUID]:
+    """Cache → platform-api → direct-DB fallback, in that order.
+
+    Same three-stage shape as principals.resolve_principal_by_token (ADR-0009
+    Schritt 2a): platform-api answers a cache miss; if it cannot answer at all,
+    the old direct query runs IN THE SAME CALL so nothing silently degrades.
+    That fallback exists as long as this worker still has BRIDGE_DB_URL — it
+    goes away when a worker actually moves off production-barrier (Schritt 3),
+    which is the point at which the bounded retry below becomes the only
+    protection against a brief platform-api restart.
+
+    Opts into ONE retry: this is a pure read, so replaying it is safe. See
+    platform_client.call_platform for why retrying is opt-in and not a default.
+    """
+    hit, cached = _email_cache_get(email)
+    if hit:
+        return cached
+
+    try:
+        resp = await call_platform(
+            "POST", "/v1/internal/users/lookup-by-email",
+            json={"email": email}, retries=1,
+        )
+    except PlatformUnavailable as e:
+        logger.error(
+            "email identity lookup via platform-api failed (%s) — falling back to direct DB", e
+        )
+        uid = await lookup_user_id_by_email(email)
+    else:
+        if resp.status_code == 404:
+            uid = None
+        elif resp.status_code == 200 and isinstance(resp.json, dict) and resp.json.get("id"):
+            uid = uuid.UUID(str(resp.json["id"]))
+        else:
+            # Unexpected contract (wrong status, malformed body) is treated like
+            # unreachable rather than like "no such user": answering "unknown
+            # identity" for what may be a platform-api bug would reject a
+            # legitimate caller, and on this path that means refusing a paying
+            # customer's call.
+            logger.error(
+                "email identity lookup via platform-api returned unexpected "
+                "status=%s body=%r — falling back to direct DB",
+                resp.status_code, resp.json,
+            )
+            uid = await lookup_user_id_by_email(email)
+
+    _email_cache_put(email, uid)
+    return uid
