@@ -174,12 +174,18 @@ app.include_router(sandbox_conversations_router)
 app.include_router(principals_router)
 logger.info("✅ Platform routes mounted")
 
-# CORS — same policy as workers
+# CORS — same policy as workers. allow_credentials=False is deliberate: every
+# caller (app frontends, the browser ai-bridge-client) authenticates via a
+# Bearer JWT / X-Bridge-Service-Token header, never a cookie — see the
+# allow_credentials comment in src/main.py for the full rationale (wildcard
+# origin + credentials=True makes Starlette reflect the Origin header,
+# trusting any origin for cookie-bearing requests — see
+# security-audit-live-findings-20260818.md L10c/B.4).
 cors_origins = json.loads(os.getenv("CORS_ORIGINS", '["*"]'))
 app.add_middleware(
     CORSMiddleware,
     allow_origins=cors_origins,
-    allow_credentials=True,
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )

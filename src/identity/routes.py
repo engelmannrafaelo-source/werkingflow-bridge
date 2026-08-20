@@ -31,6 +31,7 @@ from pydantic import BaseModel, EmailStr, Field
 
 from src.api_auth import require_jwt, require_service_token, AuthClaims
 from src.db.client import get_pool
+from src.identity import login_throttle
 from src.identity.password import hash_password, verify_password
 from src.identity.jwt_utils import sign_jwt, verify_jwt
 from src.identity.webhook_config import BRIDGE_AUTH_APP_IDS, get_webhook_config
@@ -141,6 +142,21 @@ _DUMMY_PASSWORD_HASH = hash_password("no-such-user-constant-time-dummy")
 
 @router.post("/login")
 async def login(body: LoginRequest) -> Dict[str, Any]:
+    # Brute-force guard: too many recent failures against THIS email blocks
+    # further attempts, independent of caller IP (see login_throttle
+    # docstring for why IP-based limiting is unsafe here — every app calls
+    # this endpoint server-side from a shared Vercel egress IP). Checked
+    # before the DB round-trip so a lockout doesn't even cost a query.
+    if login_throttle.is_locked_out(body.email):
+        raise HTTPException(
+            status_code=429,
+            detail={
+                "message": "Zu viele fehlgeschlagene Anmeldeversuche. Bitte später erneut versuchen.",
+                "code": "too_many_attempts",
+            },
+            headers={"Retry-After": str(int(login_throttle.lockout_window_s()))},
+        )
+
     pool = get_pool()
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
@@ -154,7 +170,13 @@ async def login(body: LoginRequest) -> Dict[str, Any]:
     stored_hash = row["password_hash"] if row else None
     password_ok = verify_password(body.password, stored_hash or _DUMMY_PASSWORD_HASH)
     if stored_hash is None or not password_ok:
+        login_throttle.record_failure(body.email)
         raise HTTPException(status_code=401, detail="Invalid credentials")
+
+    # Credentials were correct — clear any prior failure count regardless of
+    # what happens next (e.g. the email-not-verified gate below is not a
+    # brute-force signal; the caller just proved they own this password).
+    login_throttle.record_success(body.email)
 
     if not row["email_verified"]:
         raise HTTPException(

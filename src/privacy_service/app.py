@@ -1356,6 +1356,11 @@ async def convert_html_to_pdf_endpoint(request: Request):
             )
             try:
                 page = await browser.new_page()
+                # SSRF guard: the HTML is caller-controlled and this container
+                # sits on the internal Tailnet — block every resource fetch
+                # that doesn't resolve to a public IP (see ssrf_guard docstring).
+                from src.privacy_service.ssrf_guard import make_route_handler
+                await page.route("**/*", make_route_handler())
                 # networkidle: auf @font-face/@import-Fonts + Bilder warten, sonst
                 # druckt der erste Versuch mit Fallback-Font.
                 await page.set_content(html, wait_until="networkidle")
@@ -1458,6 +1463,9 @@ async def convert_html_to_screenshot_endpoint(request: Request):
                 # Screen-Viewport: der Report rendert mit seiner Bildschirm-Breite.
                 # height=900 ist nur initial — full_page erfasst die gesamte Höhe.
                 page = await browser.new_page(viewport={"width": width, "height": 900})
+                # SSRF guard: same reasoning as /convert-html-to-pdf above.
+                from src.privacy_service.ssrf_guard import make_route_handler
+                await page.route("**/*", make_route_handler())
                 # networkidle: auf @font-face/@import-Fonts + Bilder warten, sonst
                 # screenshot mit Fallback-Font / fehlenden Bildern.
                 await page.set_content(html, wait_until="networkidle")

@@ -769,12 +769,23 @@ app.include_router(jobs_router)
 # Workers serve ONLY LLM routing: /v1/chat/completions, /v1/messages,
 # /v1/research, /v1/document/convert. nginx routes by path prefix.
 
-# Configure CORS
+# Configure CORS. allow_credentials=False is deliberate: every caller
+# (app frontends AND the browser ai-bridge-client) authenticates via a
+# Bearer token / X-Bridge-Service-Token header — never a cookie — so no
+# legitimate cross-origin request needs credentialed mode (see
+# security-audit-live-findings-20260818.md L10c/B.4). With
+# allow_credentials=True + a wildcard origin, Starlette cannot literally send
+# back "*" per the CORS spec, so it reflects the request's Origin header
+# instead — i.e. it trusts ANY origin as if it were explicitly allowlisted
+# for cookie-bearing requests. Turning credentials off removes that
+# reflection entirely while keeping the wildcard origin (still required —
+# CORS_ORIGINS is not configured to an allowlist today) for the Bearer-token
+# callers that do exist.
 cors_origins = json.loads(os.getenv("CORS_ORIGINS", '["*"]'))
 app.add_middleware(
     CORSMiddleware,
     allow_origins=cors_origins,
-    allow_credentials=True,
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -4121,11 +4132,14 @@ async def _execute_research_impl(
 
         if discovered_files:
             container_file = str(discovered_files[0])
-            if request_body.output_path:
-                output_file = request_body.output_path
-            else:
-                filename = discovered_files[0].name
-                output_file = f"/tmp/{filename}"
+            # SSRF/arbitrary-write guard: output_path is caller-controlled and
+            # this endpoint is network-reachable — contain the write to the
+            # allowed research-output directory (default /tmp, same default
+            # as before). An unsafe path silently falls back to the same
+            # /tmp/<filename> default used when output_path is omitted.
+            from src.research_output_safety import safe_output_path, default_output_path
+            filename = discovered_files[0].name
+            output_file = str(safe_output_path(request_body.output_path) or default_output_path(filename))
 
             try:
                 in_docker = Path("/.dockerenv").exists()
@@ -4485,17 +4499,24 @@ async def _execute_research_cloud_impl(
     # No filesystem/session-id discovery on this path (no CLI subprocess) —
     # but output_path is still honored: the Bridge writes the report itself
     # (DESIGN.md: "output_path optional weiterhin bedienen (Bridge schreibt
-    # Datei selbst)").
+    # Datei selbst)"). output_path is caller-controlled and this endpoint is
+    # network-reachable, so the write is contained to the allowed research-
+    # output directory (see research_output_safety) — an unsafe path is
+    # rejected (logged loud) and simply not written; the content is still
+    # returned in the response body either way.
     output_file = None
     file_size_bytes = None
     if request_body.output_path and result.content:
-        try:
-            with open(request_body.output_path, "w", encoding="utf-8") as f:
-                f.write(result.content)
-            output_file = request_body.output_path
-            file_size_bytes = len(result.content.encode("utf-8"))
-        except OSError as e:
-            logger.warning(f"research-cloud: could not write output_path {request_body.output_path!r}: {e}")
+        from src.research_output_safety import safe_output_path
+        safe_path = safe_output_path(request_body.output_path)
+        if safe_path is not None:
+            try:
+                with open(safe_path, "w", encoding="utf-8") as f:
+                    f.write(result.content)
+                output_file = str(safe_path)
+                file_size_bytes = len(result.content.encode("utf-8"))
+            except OSError as e:
+                logger.warning(f"research-cloud: could not write output_path {safe_path!r}: {e}")
 
     return ResearchResponse(
         status="success",
