@@ -203,7 +203,14 @@ async def _create_order_invoice(
         "metadata": {},
     }]
 
-    metadata: Dict[str, Any] = {"manualBilling": True, "pendingOrder": True}
+    # Lane-korrekt (21.08.): manualBilling stand vorher auch auf Mollie-
+    # Rechnungen — faktisch falsch. Kein Code liest das Flag (nur Writer),
+    # aber Metadaten sind Audit-Spur und muessen die Wahrheit tragen.
+    metadata: Dict[str, Any] = {"pendingOrder": True}
+    if payment_method == "mollie":
+        metadata["selfService"] = True
+    else:
+        metadata["manualBilling"] = True
     if billing_address is None:
         metadata["incomplete"] = True
         metadata["missingBillingAddress"] = True
@@ -613,3 +620,108 @@ async def release_order(
     )
 
     return _serialize_order(released_row)
+
+
+async def expire_order_for_failed_payment(
+    order_id: str,
+    payment_id: str,
+    mollie_status: str,
+) -> Dict[str, Any]:
+    """
+    Schliesst den Lebenszyklus einer Mollie-Order bei terminalem Zahlungs-
+    fehlschlag (failed/expired/canceled): Order → 'expired', zugehoerige
+    Rechnung → 'cancelled' (Rafael, 21.08.: ein gescheiterter Kauf darf keine
+    offene Order und keinen versendbaren Rechnungs-Entwurf hinterlassen — der
+    Entwurf stand sonst dauerhaft im Operator-Freigabefilter approval=pending).
+
+    Zustandsmaschine (fail fast, idempotent nur wo Webhook-Retries es
+    verlangen):
+      awaiting_payment → expired  (der eine legitime Uebergang)
+      expired/cancelled → No-op   (Webhook-Retry, idempotent ok)
+      released          → RuntimeError (Zahlung terminal gescheitert, Order
+                          aber freigegeben = Geld-/Zustandsanomalie — laut
+                          scheitern, manuell klaeren; NIEMALS still zurueckdrehen)
+
+    Rechnung: nur 'draft'/'issued' werden storniert ('cancelled' = voided
+    before payment, s. invoice_status-Enum). Eine 'paid'-Rechnung an einer
+    expirenden Order ist dieselbe Anomalie wie oben → RuntimeError.
+    """
+    pool = get_pool()
+    order_uuid = uuid.UUID(order_id)
+
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            order = await conn.fetchrow(
+                "SELECT * FROM pending_orders WHERE id = $1 FOR UPDATE",
+                order_uuid,
+            )
+            if not order:
+                raise LookupError(
+                    f"expire_order_for_failed_payment: order {order_id} not found "
+                    f"(payment {payment_id}, status {mollie_status}) — Mollie-"
+                    "Metadata verweist auf eine unbekannte Order"
+                )
+            if order["status"] in ("expired", "cancelled"):
+                # Webhook-Retry nach bereits erfolgtem Expire → idempotent ok.
+                return _serialize_order(order)
+            if order["status"] == "released":
+                raise RuntimeError(
+                    f"expire_order_for_failed_payment: payment {payment_id} is "
+                    f"terminal '{mollie_status}' but order {order_id} is already "
+                    "released — money/state anomaly, manual investigation required"
+                )
+
+            invoice = await conn.fetchrow(
+                "SELECT id, status FROM invoices WHERE id = $1 FOR UPDATE",
+                order["invoice_id"],
+            )
+            if not invoice:
+                raise RuntimeError(
+                    f"expire_order_for_failed_payment: order {order_id} references "
+                    f"missing invoice {order['invoice_id']} — FK-Anomalie"
+                )
+            if invoice["status"] == "paid":
+                raise RuntimeError(
+                    f"expire_order_for_failed_payment: invoice {invoice['id']} is "
+                    f"'paid' but payment {payment_id} reports terminal "
+                    f"'{mollie_status}' for order {order_id} — manual investigation required"
+                )
+            if invoice["status"] in ("draft", "issued"):
+                await conn.execute(
+                    """
+                    UPDATE invoices
+                       SET status = 'cancelled',
+                           cancelled_at = COALESCE(cancelled_at, NOW()),
+                           updated_at = NOW()
+                     WHERE id = $1
+                    """,
+                    invoice["id"],
+                )
+
+            expired_row = await conn.fetchrow(
+                """
+                UPDATE pending_orders
+                   SET status = 'expired',
+                       release_note = $2
+                 WHERE id = $1
+                RETURNING *
+                """,
+                order_uuid,
+                f"mollie payment {payment_id} terminal: {mollie_status}",
+            )
+
+    await log_billing_event(
+        "order.expired",
+        user_id=str(order["user_id"]),
+        invoice_id=str(order["invoice_id"]),
+        amount_eur=float(order["total_price_eur"]),
+        source="mollie-webhook",
+        payload={
+            "orderId": order_id,
+            "planId": order["plan_id"],
+            "paymentId": payment_id,
+            "mollieStatus": mollie_status,
+        },
+    )
+
+    return _serialize_order(expired_row)

@@ -1160,6 +1160,29 @@ async def handle_webhook(payment_id: str) -> Dict[str, Any]:
             mollie_sub_id = payment.get("subscription_id")
             if mollie_sub_id:
                 await _suspend_subscription_by_mollie_id(mollie_sub_id, payment_id, status)
+            # Self-Service-Pakete (project_pack): terminaler Fehlschlag muss
+            # den Order-Lebenszyklus SCHLIESSEN — Order 'expired', Rechnungs-
+            # Entwurf 'cancelled' (Rafael, 21.08.). Ohne das blieben Order
+            # ewig 'awaiting_payment' und der Entwurf dauerhaft im Operator-
+            # Freigabefilter (approval=pending) — versendbar fuer einen Kauf,
+            # der nie zustande kam. Fehlende orderId in project_pack-Metadata
+            # ist dieselbe Anomalie wie im Paid-Pfad → fail loud (Mollie
+            # retried, der Fehler bleibt sichtbar statt still zu versanden).
+            if payment.get("metadata", {}).get("type") == "project_pack":
+                order_id = payment.get("metadata", {}).get("orderId")
+                if not order_id:
+                    raise RuntimeError(
+                        f"project_pack webhook ({status}): orderId missing "
+                        f"from payment {payment_id} metadata"
+                    )
+                from src.billing.pending_orders_service import expire_order_for_failed_payment
+                expired = await expire_order_for_failed_payment(order_id, payment_id, status)
+                return {
+                    "handled": True,
+                    "type": "project_pack",
+                    "order": expired,
+                    "reason": f"status={status}",
+                }
         return {"handled": False, "reason": f"status={status}"}
 
     pool = get_pool()
