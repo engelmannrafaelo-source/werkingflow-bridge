@@ -264,6 +264,14 @@ async def list_invoices(
         if userId and userId != claims.effective_user_id:
             raise HTTPException(status_code=403, detail="Forbidden")
         userId = claims.effective_user_id
+        # Drafts sind interne Vor-Stufen (u.a. Mollie-Lane: Rechnung entsteht
+        # erst mit bestaetigter Zahlung, s. pending_orders_service). Ein Kunde
+        # darf nie eine noch-nicht-ausgestellte Rechnung sehen — ein
+        # abgebrochener Checkout saehe sonst wie eine offene Forderung aus.
+        if status == "draft":
+            raise HTTPException(
+                status_code=403, detail="Forbidden: drafts are operator-only",
+            )
 
     if account_type and account_type not in ("customer", "test", "internal"):
         raise HTTPException(
@@ -283,6 +291,10 @@ async def list_invoices(
 
     if userId:    add("user_id = $$", uuid.UUID(userId))
     if tenantId:  add("tenant_id = $$", tenantId)
+    if not claims.is_operator:
+        # Kundensicht: Drafts hart ausblenden (s. Guard oben) — auch ohne
+        # expliziten status-Filter.
+        where.append("status <> 'draft'")
     if status:
         if status not in _ALLOWED_STATUS:
             raise HTTPException(status_code=400, detail=f"Unknown status: {status}")
@@ -327,6 +339,10 @@ async def get_invoice(
         raise HTTPException(status_code=404, detail=f"Invoice {invoice_id} not found")
     if not claims.is_operator and str(r["user_id"]) != claims.effective_user_id:
         raise HTTPException(status_code=403, detail="Forbidden: not your invoice")
+    if not claims.is_operator and r["status"] == "draft":
+        # Drafts existieren fuer Kunden nicht (s. list_invoices-Filter) —
+        # 404 statt 403, um die Existenz nicht zu verraten.
+        raise HTTPException(status_code=404, detail=f"Invoice {invoice_id} not found")
     return _row(r)
 
 
@@ -806,6 +822,9 @@ async def render_invoice_html(
         raise HTTPException(status_code=404, detail=f"Invoice {invoice_id} not found")
     if not claims.is_operator and str(r["user_id"]) != claims.effective_user_id:
         raise HTTPException(status_code=403, detail="Forbidden: not your invoice")
+    if not claims.is_operator and r["status"] == "draft":
+        # Drafts existieren fuer Kunden nicht (s. list_invoices-Filter).
+        raise HTTPException(status_code=404, detail=f"Invoice {invoice_id} not found")
     html = _render_html(_row(r), fallback_recipient=dict(u) if u else None,
                         consent=dict(consent) if consent else None)
     return Response(content=html, media_type="text/html")
@@ -837,6 +856,9 @@ async def render_invoice_pdf(
         raise HTTPException(status_code=404, detail=f"Invoice {invoice_id} not found")
     if not claims.is_operator and str(r["user_id"]) != claims.effective_user_id:
         raise HTTPException(status_code=403, detail="Forbidden: not your invoice")
+    if not claims.is_operator and r["status"] == "draft":
+        # Drafts existieren fuer Kunden nicht (s. list_invoices-Filter).
+        raise HTTPException(status_code=404, detail=f"Invoice {invoice_id} not found")
 
     inv = _row(r)
     html = _render_html(inv, fallback_recipient=dict(u) if u else None,

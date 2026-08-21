@@ -101,13 +101,29 @@ async def _create_order_invoice(
     quantity: int,
     unit_price_eur: float,
     total_eur: float,
+    *,
+    payment_method: str = "manual",
 ) -> str:
     """
-    Erstellt eine Invoice mit status='issued' für eine Pending-Order.
+    Erstellt die Invoice für eine Pending-Order — Status haengt an der Lane:
 
-    Verwendet dieselbe Billing-Address-Auflösung wie auto_create_invoice,
-    aber status='issued' (nicht 'paid') — Zahlung noch ausstehend.
-    due_at = 14 Tage ab Ausstellungsdatum (DACH B2B Standard Vorkasse).
+    'manual' (Rechnungs-Lane): status='issued', due_at = +14 Tage (DACH B2B
+    Standard Vorkasse). Die Rechnung IST hier der Zahlungsausloeser — sie muss
+    vor der Zahlung existieren und sichtbar sein.
+
+    'mollie' (Self-Service-Lane): status='draft', issued_at/due_at = NULL
+    (Rafael, 21.08.): Der Kunde zahlt sofort via Mollie — solange die Zahlung
+    nicht durch ist, DARF keine ausgestellte Rechnung existieren (ein
+    abgebrochener Checkout hinterliesse sonst eine offene Forderung, die nie
+    entstanden ist). Ausgestellt (issued_at) + bezahlt wird atomar erst in
+    release_order, wenn der Mollie-Webhook die Zahlung bestaetigt. Drafts sind
+    fuer Kunden unsichtbar (list_invoices filtert sie fuer Nicht-Operatoren).
+    Die Rechnungsnummer wird trotzdem schon hier gezogen — bewusste bestehende
+    Policy "Einmaligkeit vor Lueckenlosigkeit" (invoice_numbering.py); ein
+    abgebrochener Kauf hinterlaesst eine dokumentierbare Luecke, nie ein
+    Nummern-Duplikat.
+
+    Verwendet dieselbe Billing-Address-Auflösung wie auto_create_invoice.
     """
     pool = get_pool()
 
@@ -197,7 +213,11 @@ async def _create_order_invoice(
         metadata["taxNote"] = "EU_B2C_OSS_OPEN"
 
     now = datetime.now(timezone.utc)
-    due_at = now + timedelta(days=14)
+    # Mollie-Lane: Zahlung ist sofort — kein Zahlungsziel, keine Ausstellung
+    # vor Zahlungseingang (s. Docstring). Manual-Lane: Rechnung mit 14-Tage-Ziel.
+    is_mollie = payment_method == "mollie"
+    invoice_status = "draft" if is_mollie else "issued"
+    due_at = None if is_mollie else now + timedelta(days=14)
 
     async with pool.acquire() as conn:
         async with conn.transaction():
@@ -208,14 +228,17 @@ async def _create_order_invoice(
                   (invoice_number, user_id, tenant_id, status,
                    subtotal_eur, tax_rate, tax_eur, total_eur, currency,
                    line_items, billing_address, issued_at, due_at, metadata)
-                VALUES ($1, $2, $3, 'issued',
-                        $4, $5, $6, $7, 'EUR',
-                        $8::jsonb, $9::jsonb, NOW(), $10, $11::jsonb)
+                VALUES ($1, $2, $3, $4::invoice_status,
+                        $5, $6, $7, $8, 'EUR',
+                        $9::jsonb, $10::jsonb,
+                        CASE WHEN $4 = 'issued' THEN NOW() ELSE NULL END,
+                        $11, $12::jsonb)
                 RETURNING id
                 """,
                 invoice_number,
                 uuid.UUID(user_id),
                 tenant_id,
+                invoice_status,
                 subtotal, tax_rate, tax, total,
                 json.dumps(line_items),
                 json.dumps(billing_address) if billing_address else None,
@@ -225,7 +248,7 @@ async def _create_order_invoice(
 
     invoice_id = str(row["id"])
     await log_billing_event(
-        "invoice.issued",
+        "invoice.drafted" if is_mollie else "invoice.issued",
         user_id=user_id,
         tenant_id=tenant_id,
         invoice_id=invoice_id,
@@ -335,6 +358,7 @@ async def create_pending_order(
         quantity=quantity,
         unit_price_eur=float(plan.price),
         total_eur=total_eur,
+        payment_method=payment_method,
     )
 
     pool = get_pool()
@@ -539,11 +563,18 @@ async def release_order(
                     "cannot release order"
                 )
 
-            # Mark invoice as paid
+            # Mark invoice as paid. issued_at via COALESCE: die Mollie-Lane legt
+            # die Rechnung als 'draft' OHNE Ausstellungsdatum an (keine Rechnung
+            # vor Zahlungseingang) — ausgestellt wird sie genau JETZT, mit der
+            # bestaetigten Zahlung. Manual-Lane-Rechnungen sind laengst issued,
+            # dort ist das COALESCE ein No-op.
             await conn.execute(
                 """
                 UPDATE invoices
-                   SET status = 'paid', paid_at = COALESCE(paid_at, NOW()), updated_at = NOW()
+                   SET status = 'paid',
+                       issued_at = COALESCE(issued_at, NOW()),
+                       paid_at = COALESCE(paid_at, NOW()),
+                       updated_at = NOW()
                  WHERE id = $1
                 """,
                 order["invoice_id"],
