@@ -318,6 +318,67 @@ Auth/Tenant/Principal/Budget-Tor ueber die Innen-API statt fuenf DB-Verbindungen
 mit kurzlebigem Cache und ausdruecklichem Fehlerverhalten. Alter Weg bleibt als
 sofortiger Rueckfall, Validierung im Echtbetrieb ohne Ortswechsel.
 
+**Schritt 2c — der Schreibpfad des Geldes (gebaut 2026-08-21, nicht deployt).**
+Branch `feat/worker-dbfree-moneypath`, nicht auf `develop` gemerged. Schritt 2
+hat die LESEpfade verlegt; die Abrechnungszeile selbst schrieb der Worker
+weiterhin direkt in Postgres. Damit war das Ziel "ein Worker ohne
+`BRIDGE_DB_URL`" fuer den einzigen Pfad mit Geld-Semantik nicht erreicht.
+
+`persist_ai_call_activity` haelt jetzt keine Verbindung mehr. Es entscheidet
+weiterhin alles — Preis, Provider-Vokabular, `resolve_ledger_cost`, jeden
+Skip-Zweig — und stellt das Ergebnis per HTTP fest. Dieselbe Regel wie in 2b:
+**Daten, keine Urteile**; die reinen, unit-getesteten Funktionen bleiben im
+Worker, nur die Statements mit Verbindungsbedarf ziehen um
+(`src/activity/ledger_db.py`, Gegenstueck `src/activity/ledger_client.py`).
+
+Die harte Randbedingung ist unveraendert erhalten: der Puffer schreibt
+fsync-fest auf Platte VOR dem ersten Netzaufruf, und der Abzug haengt weiter an
+"dieser Versuch hat die Zeile erzeugt". Ueber HTTP ist das dieselbe Aussage wie
+vorher ueber die DB — die Antwort `written` gibt es pro `idempotency_key`
+hoechstens einmal, ein Nachlauf hoert `duplicate` und zieht nichts ab.
+
+Bestehende Endpunkte geprueft statt hineingezwaengt:
+`POST /v1/budget/deduct` passt exakt (gleiche Argumente, gleiche Rueckgabe,
+402/400 bilden die zwei Ausnahmen ab) und wird wiederverwendet.
+`POST /v1/activity/log` passt **nicht**: es schreibt nur `activities`, kennt
+keine `usage_events`-Spalten, stempelt `NOW()` statt der Ursprungszeit des Calls
+und lehnt eine app_id ausserhalb seiner Allowlist mit 400 ab, wo dieser Pfad
+bewusst NULL + `app_id_raw` bucht. Es ist das Gegenstueck der Audit-Haelfte,
+nicht der Geldzeile — daher `POST /v1/internal/usage/ai-call`, das beide Zeilen
+in der bestehenden Reihenfolge schreibt (Geld zuerst, Audit nur bei tatsaechlich
+erzeugter Zeile, weil `activities` keinen Unique-Schluessel hat).
+
+Kein Retry auf den nicht idempotenten Abzuegen und **kein Direct-DB-Fallback**
+auf dem Schreibpfad — anders als bei den Lesepfaden aus 2a/2b. Ein Fallback nach
+verlorener ANTWORT waere genau der zweite Versuch, den ein read-modify-write
+ohne Dedup-Schluessel nicht vertraegt; und der Puffer ist als Wiederholmechanismus
+ohnehin der bessere (asynchron, begrenzt, auf `/health` sichtbar).
+
+Zwei Dinge lagen auf demselben Pfad und waeren nach dem Umzug still falsch
+geworden — beide mitgezogen, weil sie nicht laut, sondern leise gescheitert
+waeren:
+- `app_tier_policy` las `app_tier_policies` direkt. Ohne DB lieferte das
+  lautlos "keine Policy" — was hier nicht "keine Policy" heisst, sondern "die
+  Kosten gehen an den Kunden statt an das interne `billing_account`". Fail-open
+  bleibt (eine Kostenoptimierung darf keinen Call 503en), aber die Nicht-Antwort
+  ist jetzt WARNING statt DEBUG.
+- `app_registry.load_known_app_ids` begruendete sein Verhalten mit "keine DB ⇒
+  kein INSERT, also nichts zu validieren". Genau diese Praemisse hebt 2c auf.
+  Alt belassen haette jeden DB-freien Worker in die Luecke laufen lassen, gegen
+  die das Modul gebaut wurde (2026-08-01, `bridge-jobs` gegen das ENUM).
+
+Abnahme ist als Test formuliert, nicht als Behauptung:
+`tests/billing/test_worker_needs_no_database.py` laesst den echten Writer mit
+verbogenem `get_pool` laufen — jeder Griff zum Pool sprengt den Test.
+
+**Offen, bewusst nicht hier mitgefixt:** die Direct-DB-Rueckfaelle aus 2a/2b
+(E-Mail-Identitaet, `find_allocated_plan_id`) bestehen weiter und greifen, wenn
+platform-api nicht antwortet. Auf einem Worker OHNE `BRIDGE_DB_URL` wirft
+`get_pool()` dort — der Ausgang ist korrekt (Zeile bleibt geschuldet bzw. Abzug
+unterbleibt mit Log), der Weg dorthin ist eine RuntimeError-Kaskade statt eines
+benannten Fehlers. Aufraeumen gehoert zu Schritt 3, wo die Rueckfaelle laut
+dieser ADR ohnehin entfallen.
+
 **Schritt 3 — EIN Worker von vieren zieht um.** nginx behaelt drei lokal. Ein Fehler
 zeigt sich an einem Viertel des Verkehrs. Rueckweg = nginx-Ziel zurueckstellen, gleiche
 auto-rollback-gesicherte Route wie jeder nginx-Deploy.
