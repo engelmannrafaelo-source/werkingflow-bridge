@@ -514,3 +514,26 @@ async def get_app_tier_policy(
             "billing_account": policy.billing_account,
         }
     }
+
+
+# ── 2c/C6: the app_id enum (so a DB-free worker can still validate) ──────
+
+@router.get("/app-id-enum")
+async def get_app_id_enum(
+    _claims: AuthClaims = Depends(require_service_token),
+) -> Dict[str, Any]:
+    """Mirrors src.activity.app_registry.read_app_id_enum_from_db.
+
+    Read once at worker startup. A worker without its own database still writes
+    ledger rows (through POST /v1/internal/usage/ai-call), so it still has to be
+    able to tell a real app from a call-site label like "bridge-jobs" BEFORE the
+    value reaches an ENUM column — see load_known_app_ids for why validation
+    going dark there is not the harmless no-op it used to be.
+
+    A failure propagates as a 5xx and the worker refuses to boot. That is the
+    intended severity: booting without the list books the whole fleet as
+    app=NULL.
+    """
+    from src.activity.app_registry import read_app_id_enum_from_db
+
+    return {"members": sorted(await read_app_id_enum_from_db())}

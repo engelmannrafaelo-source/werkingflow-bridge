@@ -42,7 +42,7 @@ from __future__ import annotations
 import logging
 from typing import Any, Dict, Optional
 
-from src.platform_client import PlatformResponse, PlatformUnavailable, call_platform
+from src.platform_client import PlatformResponse, call_platform
 
 logger = logging.getLogger(__name__)
 
