@@ -21,19 +21,40 @@ Semantics:
 - Unknown ``provider`` value → error. A typo in an admin-set config must not
   silently route a DSGVO-pinned user to the default backend.
 
-The DB lookup is TTL-cached per billing identity so steady-state per-request
+The lookup is TTL-cached per billing identity so steady-state per-request
 cost is a dict lookup, not a round-trip. A pin change via the admin panel
 takes effect within the TTL.
+
+Resolution path (ADR-0009 Schritt 2, worker-DB-free reads): a cache miss asks
+platform-api (GET /v1/internal/users/{id}/provider-config, see
+src/internal_routes.py) instead of querying Postgres directly, with the direct
+query kept as an in-call fallback for as long as this process still has
+BRIDGE_DB_URL. Same three-stage shape as principals.py and
+identity/user_resolver.py.
+
+FAIL-CLOSED, deliberately, and this is the decision that matters here: if
+NEITHER channel can answer, this module RAISES. It never degrades to "no pin".
+A pin is an operator's compliance decision (EU data residency via Bedrock);
+answering "no pin" because a lookup failed would route exactly the user whose
+data must stay in the EU onto the default backend — silently, with a 200 and a
+normal-looking response. A 503 is recoverable and visible; a wrong-region call
+is neither. The one case that is NOT a failure is a process with no configured
+channel to the user pool at all (no BRIDGE_DB_URL and no BRIDGE_SERVICE_TOKEN):
+that instance has no users, hence no pins — a static deployment fact, which is
+what the old `is_db_enabled()` guard expressed back when the direct connection
+was the only channel.
 """
 
 from __future__ import annotations
 
 import json
 import logging
+import os
 import time
 from typing import Any, Optional
 
 from src.models import BackendType
+from src.platform_client import PlatformUnavailable, call_platform
 
 logger = logging.getLogger(__name__)
 
@@ -198,6 +219,112 @@ def invalidate_cache(user_key: Optional[str] = None) -> None:
         _cache.pop(str(user_key).strip(), None)
 
 
+async def fetch_provider_config_from_db(user_id: Any) -> Optional[dict]:
+    """The one DB leaf: users.provider_config for an ALREADY-RESOLVED Bridge
+    user id.
+
+    Split out so platform-api can expose exactly this query as an internal
+    endpoint (GET /v1/internal/users/{user_id}/provider-config) while this
+    module's own direct-DB fallback calls the identical function — the query
+    lives in ONE place, not two (same split as
+    identity.user_resolver.lookup_user_id_by_email).
+
+    Returns None both for "no such user" and for "user has no pin": to every
+    caller those mean the same thing, namely that there is nothing to enforce.
+    Raises on a DB error — deciding what an unanswerable lookup means is the
+    caller's job, not this leaf's.
+    """
+    from src.db.client import get_pool
+
+    pool = get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT provider_config FROM users WHERE id = $1", user_id
+        )
+    if row is None or not row["provider_config"]:
+        return None
+    raw = row["provider_config"]
+    return json.loads(raw) if isinstance(raw, str) else dict(raw)
+
+
+def _user_pool_channel_configured() -> bool:
+    """Does this process have ANY configured route to the user pool?
+
+    Two exist after ADR-0009 Schritt 2: platform-api (which platform_client
+    refuses to call without BRIDGE_SERVICE_TOKEN) and the legacy direct
+    connection (BRIDGE_DB_URL). Neither configured means this instance runs
+    without a user pool at all — no users, therefore no pins. That is a static
+    deployment fact, exactly what the pre-Schritt-2 `is_db_enabled()` guard
+    said when the direct connection was the only channel.
+
+    Read this predicate strictly: CONFIGURED-BUT-FAILING is never this case. It
+    raises. "Nobody can be pinned here" and "I could not find out whether this
+    user is pinned" are different answers and must not share a code path.
+    """
+    from src.db.client import is_db_enabled
+
+    return is_db_enabled() or bool(os.getenv("BRIDGE_SERVICE_TOKEN"))
+
+
+async def _fetch_via_direct_db(uid: Any) -> Optional[dict]:
+    """Direct-DB fallback, used only when platform-api could not answer.
+
+    Raises instead of returning None when there is no DB to fall back to: at
+    that point BOTH channels to the user pool have failed, and this module's
+    fail-closed promise has to survive the platform-api hop, not just the
+    direct query it used to be.
+    """
+    from src.db.client import is_db_enabled
+
+    if not is_db_enabled():
+        raise UserProviderOverrideError(
+            "provider_config lookup: platform-api could not answer and this "
+            "process has no direct-DB fallback (BRIDGE_DB_URL unset). Refusing "
+            "to assume 'not pinned' — that would route a possibly Bedrock/"
+            "EU-pinned user onto the default backend and silently change its "
+            "data residency. If this worker has moved off production-barrier "
+            "(ADR-0009 Schritt 3/4), platform-api reachability is now "
+            "load-bearing — investigate why it failed."
+        )
+    return await fetch_provider_config_from_db(uid)
+
+
+async def _lookup_provider_config(uid: Any) -> Optional[dict]:
+    """Cache-miss resolution: platform-api first, direct DB second.
+
+    Opts into ONE retry: this is a pure read, so replaying it cannot
+    double-write (see platform_client.call_platform for why retrying is
+    opt-in). The retry earns its keep precisely because this path is
+    fail-closed — without it a platform-api restart of a few hundred
+    milliseconds would 503 every pinned user's call.
+    """
+    try:
+        resp = await call_platform(
+            "GET", f"/v1/internal/users/{uid}/provider-config", retries=1,
+        )
+    except PlatformUnavailable as e:
+        logger.error(
+            "provider_config lookup via platform-api failed (%s) — "
+            "falling back to direct DB", e,
+        )
+        return await _fetch_via_direct_db(uid)
+
+    if resp.status_code == 200 and isinstance(resp.json, dict) and "providerConfig" in resp.json:
+        raw = resp.json["providerConfig"]
+        return dict(raw) if raw else None
+
+    # An unexpected contract (wrong status, malformed body) is treated like
+    # unreachable, NOT like "no pin". A platform-api that has not been deployed
+    # yet answers 404 on this route, and reading that as "user is not pinned"
+    # would turn a missing deployment into a silent data-residency change.
+    logger.error(
+        "provider_config lookup via platform-api returned unexpected "
+        "status=%s body=%r — falling back to direct DB",
+        resp.status_code, resp.json,
+    )
+    return await _fetch_via_direct_db(uid)
+
+
 async def get_user_provider_config(raw_user_id: Any) -> Optional[dict]:
     """Fetch provider_config for the inbound billing identity, TTL-cached.
 
@@ -205,9 +332,10 @@ async def get_user_provider_config(raw_user_id: Any) -> Optional[dict]:
     that doesn't resolve to a Bridge user simply has no override — attribution
     and billing warn about unresolvable identities separately.
 
-    Raises UserProviderOverrideError when the users table exists but the
-    lookup FAILS (DB error): we then cannot know whether a compliance pin
-    exists, and guessing "no pin" would silently break it.
+    Raises UserProviderOverrideError when a user pool is reachable in principle
+    but the lookup FAILS (platform-api down AND no usable direct connection, or
+    a DB error): we then cannot know whether a compliance pin exists, and
+    guessing "no pin" would silently break it.
     """
     if raw_user_id is None:
         return None
@@ -220,10 +348,8 @@ async def get_user_provider_config(raw_user_id: Any) -> Optional[dict]:
     if hit is not None and hit[0] > now:
         return hit[1]
 
-    from src.db.client import is_db_enabled, get_pool
-
-    # No bridge DB on this instance → no user pool → no overrides can exist.
-    if not is_db_enabled():
+    # No channel to a user pool at all → no users → no overrides can exist.
+    if not _user_pool_channel_configured():
         return None
 
     config: Optional[dict] = None
@@ -239,14 +365,11 @@ async def get_user_provider_config(raw_user_id: Any) -> Optional[dict]:
             uid = None  # anonymous / non-user identity → no override
 
         if uid is not None:
-            pool = get_pool()
-            async with pool.acquire() as conn:
-                row = await conn.fetchrow(
-                    "SELECT provider_config FROM users WHERE id = $1", uid
-                )
-            if row is not None and row["provider_config"]:
-                raw = row["provider_config"]
-                config = json.loads(raw) if isinstance(raw, str) else dict(raw)
+            config = await _lookup_provider_config(uid)
+    except UserProviderOverrideError:
+        # Already classified (and already logged) by the fallback path — re-wrapping
+        # it would only bury the specific message under a generic one.
+        raise
     except Exception as e:  # noqa: BLE001 — classified below, never swallowed
         logger.error(
             "user_provider_override: provider_config lookup failed "
