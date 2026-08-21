@@ -2,8 +2,9 @@
 
 **Status:** PARTIAL — mechanism built and validated (nginx routing, upstream
 generation, metrics-reader polling, a third deploy topology), new host
-prepared, **Schritt 1 des Umsetzungsplans (unverlierbare Abrechnungszeile)
-gebaut auf `develop`, nicht deployt** — siehe Umsetzungsplan unten. The cutover itself (moving real traffic to the new host) is NOT
+prepared, **Schritte 1, 2, 2b und 2c des Umsetzungsplans auf `develop` und auf
+der DEV-Bridge (`hetzner`) im Echtbetrieb; auf Prod (`server2`) ist davon nichts
+deployt** — siehe Umsetzungsplan unten. The cutover itself (moving real traffic to the new host) is NOT
 done and has an open blocker (see "Open blocker" below). Nothing in this ADR
 has touched the live production-barrier bridge.
 **Date:** 2026-08-18
@@ -237,8 +238,12 @@ Funktion (`persist_ai_call_activity`) und eine bereits vorhandene Trennung zwisc
 **Dieser Schritt lohnt sich eigenstaendig**: heute geht die Zeile bei einem
 DB-Aussetzer verloren, danach nicht mehr — auch ohne jeden Umzug.
 
-**Schritt 1 ist GEBAUT (2026-08-20), nicht deployt.** Commits `cf583e1`,
-`53f1dd2`, `14f410f`, `2158d7d`, `0a1bc45` auf `develop`. Was dabei
+**Schritt 1 ist GEBAUT (2026-08-20) und laeuft auf der Dev-Bridge.** Commits
+`cf583e1`, `53f1dd2`, `14f410f`, `2158d7d`, `0a1bc45` auf `develop`, alle fuenf
+Vorfahren des Dev-Stands (geprueft mit `git merge-base --is-ancestor`). Auf Prod
+(`server2`) nicht deployt. Der Satz "nicht deployt" stand hier bis 2026-08-21
+und war da schon ueberholt — Deploy-Zustand ist Zustand, nicht Architektur, und
+veraltet in einem ADR still. Was dabei
 herauskam, in der Reihenfolge, in der es zaehlt:
 
 *Die Annahme dieses Abschnitts traegt nicht so, wie sie oben formuliert ist.*
@@ -318,8 +323,13 @@ Auth/Tenant/Principal/Budget-Tor ueber die Innen-API statt fuenf DB-Verbindungen
 mit kurzlebigem Cache und ausdruecklichem Fehlerverhalten. Alter Weg bleibt als
 sofortiger Rueckfall, Validierung im Echtbetrieb ohne Ortswechsel.
 
-**Schritt 2c — der Schreibpfad des Geldes (gebaut 2026-08-21, nicht deployt).**
-Branch `feat/worker-dbfree-moneypath`, nicht auf `develop` gemerged. Schritt 2
+**Schritt 2c — der Schreibpfad des Geldes (gebaut 2026-08-21, auf der
+Dev-Bridge deployt, Prod unberuehrt).** Branch `feat/worker-dbfree-moneypath`,
+gemerged nach `develop` (`0e4e00b`) zusammen mit dem Lesepfad-Rest
+(`feat/worker-dbfree-reads`, `5e64734`); `bridge-deploy.sh hetzner` hat beides
+am 2026-08-21 auf die Dev-Bridge gebracht (`55d98c3` -> `0e4e00b`, Smoke 11/11).
+`server2` (Prod) steht unveraendert auf dem Stand davor — der Dev-First-Gate
+verlangt genau diese Reihenfolge. Schritt 2
 hat die LESEpfade verlegt; die Abrechnungszeile selbst schrieb der Worker
 weiterhin direkt in Postgres. Damit war das Ziel "ein Worker ohne
 `BRIDGE_DB_URL`" fuer den einzigen Pfad mit Geld-Semantik nicht erreicht.
@@ -370,6 +380,21 @@ waeren:
 Abnahme ist als Test formuliert, nicht als Behauptung:
 `tests/billing/test_worker_needs_no_database.py` laesst den echten Writer mit
 verbogenem `get_pool` laufen — jeder Griff zum Pool sprengt den Test.
+
+Im Echtbetrieb nachgemessen statt behauptet (Dev-Bridge, 2026-08-21, ~25 min
+nach dem Deploy): 33 Abrechnungszeilen ueber `/v1/internal/usage/ai-call`, 12
+Abzuege ueber `/v1/budget/deduct`, kein Fehler auf dem Pfad. Die Zeilen sind
+strukturgleich zu denen des alten DB-Pfads derselben Sitzung — gleicher
+`billing_mode`, `idempotency_key` auf 100 %, gleiche Verteilung der
+Kostenfelder. Der Vergleich ist der Punkt: eine blosse 200-Antwort haette auch
+eine halb befuellte Zeile gedeckt. Nachpruefbar mit
+
+```sql
+select case when recorded_at > <deploy-ts> then 'nach' else 'vor' end, billing_mode,
+       count(*), count(*) filter (where hypothetical_cost_eur > 0),
+       count(*) filter (where idempotency_key is not null)
+from usage_events where recorded_at > now() - interval '6 hours' group by 1,2;
+```
 
 **Offen, bewusst nicht hier mitgefixt:** die Direct-DB-Rueckfaelle aus 2a/2b
 (E-Mail-Identitaet, `find_allocated_plan_id`) bestehen weiter und greifen, wenn
