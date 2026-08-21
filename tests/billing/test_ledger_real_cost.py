@@ -9,16 +9,19 @@ AWS-Rechnung wächst. Genau dieser Bug hat bis 2026-07-05 existiert
 Coverage:
 - resolve_ledger_cost: alle 4 (billing_mode × provider)-Quadranten
 - Invariante: bedrock trägt real cost für JEDEN billing_mode-Text
-- persist_ai_call_activity: INSERT-Row eines bedrock-Calls trägt
+- persist_ai_call_activity: die Geldzeile eines bedrock-Calls trägt
   real_cost > 0 und aws_request_id in provider_metadata (subscription-
-  Tenant!), anthropic-Row desselben Tenants trägt 0
+  Tenant!), anthropic-Row desselben Tenants trägt 0.
+  Geprüft wird, was der Worker an platform-api zu schreiben verlangt —
+  seit ADR-0009 Schritt 2c hält er selbst keine DB-Verbindung mehr.
+  Die Kostenbindung ist dabei absichtlich WORKER-seitig geblieben
+  (resolve_ledger_cost): platform-api protokolliert die Entscheidung,
+  es trifft sie nicht.
 """
 from __future__ import annotations
 
-import json
 import uuid
-from contextlib import asynccontextmanager
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, patch
 
 import os
 os.environ.setdefault("BRIDGE_JWT_SECRET", "test-secret-for-unit-tests")
@@ -92,53 +95,16 @@ def test_subscription_anthropic_stays_free():
 
 
 # ---------------------------------------------------------------------------
-# persist_ai_call_activity — der echte Write-Pfad (DB gemockt)
+# persist_ai_call_activity — der echte Write-Pfad (Naht zu platform-api gemockt)
 # ---------------------------------------------------------------------------
 
 USER_ID = str(uuid.uuid4())
 TENANT_ID = str(uuid.uuid4())
 
 
-def _mock_pool():
-    """Pool-Mock nach dem Muster von test_project_credits: fetchrow liefert
-    den tenant-lookup (subscription!), execute fängt die INSERTs."""
-    conn = AsyncMock()
-    conn.execute = AsyncMock(return_value=None)
-    conn.fetchrow = AsyncMock(
-        return_value={"tenant_id": TENANT_ID, "billing_mode": "subscription"}
-    )
-
-    @asynccontextmanager
-    async def _acquire():
-        yield conn
-
-    pool = MagicMock()
-    pool.acquire = _acquire
-    return pool, conn
-
-
-def _usage_insert_args(conn):
-    """Extrahiert die Args des usage_events-INSERTs.
-
-    Seit ADR-0009 Schritt 1 laeuft die Geldzeile ueber fetchrow statt execute
-    (`ON CONFLICT (idempotency_key) DO NOTHING RETURNING id` braucht einen
-    Rueckgabewert, um "ich habe die Zeile erzeugt" von "war schon da" zu
-    unterscheiden). Beide Kanaele werden durchsucht, damit dieser Test die
-    Kostenbindung prueft und nicht den Aufruf-Mechanismus.
-    """
-    for mock in (conn.fetchrow, conn.execute):
-        for call in getattr(mock, "call_args_list", []):
-            sql = call.args[0]
-            if "INSERT INTO usage_events" in sql:
-                return sql, call.args[1:]
-    raise AssertionError("no usage_events INSERT executed")
-
-
-async def _run_persist(provider: str, provider_meta=None, search_count: int = 0):
-    pool, conn = _mock_pool()
-    with patch("src.activity.ai_call_writer.get_pool", return_value=pool), patch(
-        "src.activity.ai_call_writer._deduct_call_cost", new=AsyncMock()
-    ):
+async def _run_persist(seam, provider: str, provider_meta=None, search_count: int = 0):
+    seam.context = {"tenantId": TENANT_ID, "billingMode": "subscription"}
+    with patch("src.activity.ai_call_writer._deduct_call_cost", new=AsyncMock()):
         await persist_ai_call_activity(
             app_id="werking-report",
             user_id=USER_ID,
@@ -155,13 +121,14 @@ async def _run_persist(provider: str, provider_meta=None, search_count: int = 0)
             region="eu-central-1" if provider == "bedrock" else None,
             search_count=search_count,
         )
-    return conn
+    return seam.row
 
 
 @pytest.mark.asyncio
-async def test_bedrock_row_carries_real_cost_for_subscription_tenant():
+async def test_bedrock_row_carries_real_cost_for_subscription_tenant(ledger_seam):
     aws_request_id = str(uuid.uuid4())
-    conn = await _run_persist(
+    row = await _run_persist(
+        ledger_seam,
         "bedrock",
         provider_meta={
             "bedrock_model_id": "eu.anthropic.claude-haiku-4-5-20251001-v1:0",
@@ -169,62 +136,51 @@ async def test_bedrock_row_carries_real_cost_for_subscription_tenant():
             "aws_request_id": aws_request_id,
         },
     )
-    sql, args = _usage_insert_args(conn)
 
-    # Positionsbindung siehe INSERT in ai_call_writer:
-    # $6=provider, $12=billing_mode, $13=real_cost, $14=hypothetical, $16=metadata
-    provider = args[5]
-    bm_enum = args[11]
-    real_cost = args[12]
-    hypothetical = args[13]
-    metadata = json.loads(args[15])
-
-    assert provider == "bedrock"
-    assert bm_enum == "flat_rate_estimated"  # Kundenvertrag bleibt Abo …
-    assert real_cost > 0, "bedrock row wrote €0 real cost — 1:1 audit is blind"
-    assert real_cost == hypothetical  # … aber unsere AWS-Kosten sind voll da
-    assert metadata["aws_request_id"] == aws_request_id, (
+    assert row["provider"] == "bedrock"
+    assert row["billing_mode"] == "flat_rate_estimated"  # Kundenvertrag bleibt Abo …
+    assert row["real_cost_eur"] > 0, "bedrock row wrote €0 real cost — 1:1 audit is blind"
+    # … aber unsere AWS-Kosten sind voll da
+    assert row["real_cost_eur"] == row["hypothetical_cost_eur"]
+    assert row["provider_metadata"]["aws_request_id"] == aws_request_id, (
         "aws_request_id missing — call-level join with AWS invocation logs broken"
     )
 
 
 @pytest.mark.asyncio
-async def test_research_cloud_row_carries_real_cost_for_subscription_tenant():
-    conn = await _run_persist(
+async def test_research_cloud_row_carries_real_cost_for_subscription_tenant(ledger_seam):
+    row = await _run_persist(
+        ledger_seam,
         "research-cloud",
         provider_meta={"searches": 12, "fetches": 3, "container_id": "container-abc"},
     )
-    sql, args = _usage_insert_args(conn)
 
-    provider = args[5]
-    bm_enum = args[11]
-    real_cost = args[12]
-    hypothetical = args[13]
-    metadata = json.loads(args[15])
-
-    assert provider == "research-cloud"
-    assert bm_enum == "flat_rate_estimated"  # Kundenvertrag bleibt Abo …
-    assert real_cost > 0, "research-cloud row wrote €0 real cost — 1:1 audit is blind"
-    assert real_cost == hypothetical  # … aber die Anthropic-API-Kosten sind voll da
-    assert metadata["searches"] == 12
+    assert row["provider"] == "research-cloud"
+    assert row["billing_mode"] == "flat_rate_estimated"  # Kundenvertrag bleibt Abo …
+    assert row["real_cost_eur"] > 0, (
+        "research-cloud row wrote €0 real cost — 1:1 audit is blind"
+    )
+    # … aber die Anthropic-API-Kosten sind voll da
+    assert row["real_cost_eur"] == row["hypothetical_cost_eur"]
+    assert row["provider_metadata"]["searches"] == 12
 
 
 @pytest.mark.asyncio
-async def test_search_count_adds_to_real_cost():
+async def test_search_count_adds_to_real_cost(ledger_seam):
     """web_search fees must show up in the booked cost, not just tokens."""
-    conn_without = await _run_persist("research-cloud", search_count=0)
-    conn_with = await _run_persist("research-cloud", search_count=15)
-    _, args_without = _usage_insert_args(conn_without)
-    _, args_with = _usage_insert_args(conn_with)
-    assert args_with[12] > args_without[12], (
+    ohne = await _run_persist(ledger_seam, "research-cloud", search_count=0)
+    real_ohne = ohne["real_cost_eur"]
+    ledger_seam.ledger_calls.clear()
+    mit = await _run_persist(ledger_seam, "research-cloud", search_count=15)
+
+    assert mit["real_cost_eur"] > real_ohne, (
         "15 web_search calls did not increase real_cost_eur — search fee not billed"
     )
 
 
 @pytest.mark.asyncio
-async def test_anthropic_row_stays_free_for_subscription_tenant():
-    conn = await _run_persist("anthropic")
-    _, args = _usage_insert_args(conn)
-    assert args[5] == "anthropic"
-    assert args[12] == 0.0  # real_cost
-    assert args[13] > 0  # hypothetical bleibt bepreist
+async def test_anthropic_row_stays_free_for_subscription_tenant(ledger_seam):
+    row = await _run_persist(ledger_seam, "anthropic")
+    assert row["provider"] == "anthropic"
+    assert row["real_cost_eur"] == 0.0
+    assert row["hypothetical_cost_eur"] > 0  # hypothetical bleibt bepreist

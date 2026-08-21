@@ -12,11 +12,12 @@ Die drei Invarianten, die das hier festnagelt:
 1. Ein app_id, das keine echte App ist, wird VOR dem INSERT zu NULL normalisiert
    — der Rohwert geht nicht verloren, sondern nach provider_metadata.app_id_raw.
 2. Ein fehlgeschlagener Audit-INSERT darf die Abrechnungszeile NICHT kosten.
+   Seit ADR-0009 Schritt 2c liegen beide INSERTs auf der platform-api-Seite;
+   diese Invariante wird deshalb dort festgenagelt — test_ledger_db_rows.py.
 3. Echte Apps bleiben unverändert (keine Regression für den Normalfall).
 """
 from __future__ import annotations
 
-import json
 import uuid
 from contextlib import asynccontextmanager
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -100,10 +101,55 @@ def test_rejected_label_tracking_is_bounded():
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
-async def test_load_returns_none_without_db():
-    """Instanz ohne DB: Validierung legitim aus, kein Boot-Fehler."""
-    with patch("src.db.client.is_db_enabled", return_value=False):
+async def test_load_returns_none_without_db_and_without_platform_api():
+    """Instanz ohne DB UND ohne Zugang zu platform-api: kein Schreibpfad für
+    Ledger-Zeilen, also legitim keine Validierung und kein Boot-Fehler."""
+    with (
+        patch("src.db.client.is_db_enabled", return_value=False),
+        patch.dict(os.environ, {"BRIDGE_SERVICE_TOKEN": ""}, clear=False),
+    ):
         assert await load_known_app_ids() is None
+
+
+@pytest.mark.asyncio
+async def test_load_uses_platform_api_when_there_is_no_db():
+    """Seit ADR-0009 Schritt 2c schreibt ein Worker OHNE eigene DB trotzdem
+    Ledger-Zeilen — über platform-api. Die Prämisse "keine DB ⇒ kein INSERT,
+    also nichts zu validieren" gilt damit nicht mehr: die Liste muss über die
+    Innen-API kommen, sonst segelt ein Label wie "bridge-jobs" ungeprüft in
+    eine ENUM-Spalte und die Zeile wird auf der Gegenseite abgelehnt."""
+    from src.platform_client import PlatformResponse
+
+    with (
+        patch("src.db.client.is_db_enabled", return_value=False),
+        patch(
+            "src.platform_client.call_platform",
+            new=AsyncMock(
+                return_value=PlatformResponse(200, {"members": sorted(KNOWN)})
+            ),
+        ),
+    ):
+        try:
+            assert await load_known_app_ids() == KNOWN
+        finally:
+            reset_registry_for_tests(None)
+
+
+@pytest.mark.asyncio
+async def test_load_fails_fast_when_platform_api_cannot_answer():
+    """Fail fast statt still: ein Worker, der eine echte App nicht von einem
+    Aufruf-Label unterscheiden kann, darf keinen Verkehr bedienen."""
+    from src.platform_client import PlatformResponse
+
+    with (
+        patch("src.db.client.is_db_enabled", return_value=False),
+        patch(
+            "src.platform_client.call_platform",
+            new=AsyncMock(return_value=PlatformResponse(404, None)),
+        ),
+    ):
+        with pytest.raises(RuntimeError, match="APP REGISTRY VIOLATION"):
+            await load_known_app_ids()
 
 
 @pytest.mark.asyncio
@@ -140,60 +186,18 @@ async def test_load_fails_fast_on_empty_enum():
 
 
 # ---------------------------------------------------------------------------
-# persist_ai_call_activity — der echte Write-Pfad (DB gemockt)
+# persist_ai_call_activity — der echte Write-Pfad (Naht zu platform-api gemockt)
 # ---------------------------------------------------------------------------
 
 USER_ID = str(uuid.uuid4())
 TENANT_ID = str(uuid.uuid4())
 
 
-def _mock_pool(fail_on: str | None = None):
-    """fail_on: SQL-Fragment, bei dem execute() wirft (simuliert den ENUM-Reject)."""
-    conn = AsyncMock()
-
-    async def _execute(sql, *args):
-        if fail_on and fail_on in sql:
-            raise RuntimeError('invalid input value for enum app_id: "bridge-jobs"')
-        return None
-
-    conn.execute = AsyncMock(side_effect=_execute)
-    conn.fetchrow = AsyncMock(
-        return_value={"tenant_id": TENANT_ID, "billing_mode": "subscription"}
-    )
-
-    @asynccontextmanager
-    async def _acquire():
-        yield conn
-
-    pool = MagicMock()
-    pool.acquire = _acquire
-    return pool, conn
-
-
-# Positionsindex des provider_metadata-Arguments im usage_events-INSERT.
-# Nicht args[-1] verwenden: seit ADR-0009 Schritt 1 haengen recorded_at und
-# idempotency_key HINTER der Metadata ($17/$18), damit die bestehende
-# Positionsbindung $1..$16 unveraendert bleibt.
-USAGE_METADATA_ARG = 15
-
-
-def _insert_args(conn, table: str):
-    """Args des INSERTs — die Geldzeile laeuft seit ADR-0009 Schritt 1 ueber
-    fetchrow (RETURNING id), die Audit-Zeile weiter ueber execute."""
-    for mock in (conn.fetchrow, conn.execute):
-        for call in getattr(mock, "call_args_list", []):
-            if f"INSERT INTO {table}" in call.args[0]:
-                return call.args[1:]
-    return None
-
-
-async def _run(app_id: str | None, fail_on: str | None = None):
-    pool, conn = _mock_pool(fail_on=fail_on)
+async def _run(ledger_seam, app_id: str | None):
+    ledger_seam.context = {"tenantId": TENANT_ID, "billingMode": "subscription"}
     reset_registry_for_tests(KNOWN)
     try:
-        with patch("src.activity.ai_call_writer.get_pool", return_value=pool), patch(
-            "src.activity.ai_call_writer._deduct_call_cost", new=AsyncMock()
-        ):
+        with patch("src.activity.ai_call_writer._deduct_call_cost", new=AsyncMock()):
             await persist_ai_call_activity(
                 app_id=app_id,
                 user_id=USER_ID,
@@ -209,45 +213,30 @@ async def _run(app_id: str | None, fail_on: str | None = None):
             )
     finally:
         reset_registry_for_tests(None)
-    return conn
+    return ledger_seam
 
 
 @pytest.mark.asyncio
-async def test_unknown_app_id_still_produces_a_ledger_row():
+async def test_unknown_app_id_still_produces_a_ledger_row(ledger_seam):
     """Kern-Regression: der Job bucht, obwohl sein Label keine App ist."""
-    conn = await _run("bridge-jobs")
+    seam = await _run(ledger_seam, "bridge-jobs")
 
-    args = _insert_args(conn, "usage_events")
-    assert args is not None, "usage_events INSERT fehlt — genau der Bug von 2026-08-01"
-    # Reihenfolge: actor_uuid, tenant_id, app, app_env, ...
-    assert args[2] is None, "ungültiges app_id muss als NULL gebucht werden"
+    assert seam.ledger_calls, "keine Geldzeile — genau der Bug von 2026-08-01"
+    assert seam.row["app"] is None, "ungültiges app_id muss als NULL gebucht werden"
 
 
 @pytest.mark.asyncio
-async def test_rejected_label_survives_in_provider_metadata():
+async def test_rejected_label_survives_in_provider_metadata(ledger_seam):
     """Der Rohwert darf nicht verschwinden — sonst ist der Aufrufer unauffindbar."""
-    conn = await _run("bridge-jobs")
+    seam = await _run(ledger_seam, "bridge-jobs")
 
-    args = _insert_args(conn, "usage_events")
-    meta = json.loads(args[USAGE_METADATA_ARG])
-    assert meta.get("app_id_raw") == "bridge-jobs"
+    assert seam.row["provider_metadata"].get("app_id_raw") == "bridge-jobs"
 
 
 @pytest.mark.asyncio
-async def test_audit_failure_does_not_cost_the_ledger_row():
-    """Invariante 2: Audit und Abrechnung teilen kein Schicksal mehr."""
-    conn = await _run("werking-report", fail_on="INSERT INTO activities")
-
-    assert _insert_args(conn, "usage_events") is not None, (
-        "ein gescheiterter Audit-INSERT darf die Abrechnungszeile nicht mitreißen"
-    )
-
-
-@pytest.mark.asyncio
-async def test_real_app_is_unchanged():
+async def test_real_app_is_unchanged(ledger_seam):
     """Kein Kollateralschaden für den Normalfall."""
-    conn = await _run("werking-report")
+    seam = await _run(ledger_seam, "werking-report")
 
-    args = _insert_args(conn, "usage_events")
-    assert args[2] == "werking-report"
-    assert "app_id_raw" not in json.loads(args[USAGE_METADATA_ARG])
+    assert seam.row["app"] == "werking-report"
+    assert "app_id_raw" not in seam.row["provider_metadata"]

@@ -34,6 +34,7 @@ Design:
 from __future__ import annotations
 
 import logging
+import os
 from typing import FrozenSet, Optional, Tuple
 
 logger = logging.getLogger(__name__)
@@ -63,37 +64,13 @@ _rejected_overflow = 0
 _unloaded_reported = False
 
 
-async def load_known_app_ids() -> Optional[FrozenSet[str]]:
-    """Read the app_id enum members from Postgres and cache them.
+async def read_app_id_enum_from_db() -> FrozenSet[str]:
+    """The enum members, straight from pg_enum. Requires a DB pool.
 
-    Called once at worker startup, AFTER init_pool(). Returns None on an
-    instance with no database (prod-bridge runs without one) — validation then
-    stays off, which is correct rather than degraded: with no DB there is no
-    INSERT to protect.
-
-    FAIL FAST when a DB *is* configured and the enum cannot be read. Same
-    invariant as validate_billing_integrity() and the plan catalog: a worker
-    that cannot tell a real app from a call-site label must not serve traffic
-    whose ledger rows can silently vanish — that is exactly the failure this
-    module exists to end, and swallowing it here would reinstate it while
-    looking healthy in the logs.
-
-    (Written after doing precisely that: the first cut of this call sat before
-    init_pool(), get_pool() raised, the except logged and moved on, and
-    validation was permanently off in a build that reported success.)
+    Split out so platform-api can serve exactly this (GET
+    /v1/internal/app-id-enum) to a worker that has no database of its own —
+    the query lives in ONE place, not two.
     """
-    global _known_app_ids
-
-    from src.db.client import is_db_enabled
-
-    if not is_db_enabled():
-        logger.info(
-            "app registry: no Bridge DB on this instance — app_id validation off"
-        )
-        _known_app_ids = None
-        return None
-
-    # No try/except: a failure here must reach the caller and stop the boot.
     from src.db.client import get_pool
 
     pool = get_pool()
@@ -107,8 +84,77 @@ async def load_known_app_ids() -> Optional[FrozenSet[str]]:
             """,
             APP_ID_ENUM_TYPE,
         )
+    return frozenset(r["enumlabel"] for r in rows)
 
-    loaded = frozenset(r["enumlabel"] for r in rows)
+
+async def _read_app_id_enum_via_platform() -> FrozenSet[str]:
+    """The same list, over the internal API. Raises when it cannot be had —
+    the caller turns that into a failed boot, deliberately (see below)."""
+    from src.platform_client import call_platform
+
+    # A pure read at startup: retrying is safe, and one retry absorbs a
+    # platform-api that is still coming up alongside this worker.
+    resp = await call_platform("GET", "/v1/internal/app-id-enum", retries=2)
+    if resp.status_code != 200 or not isinstance(resp.json, dict) or "members" not in resp.json:
+        raise RuntimeError(
+            f"APP REGISTRY VIOLATION — GET /v1/internal/app-id-enum answered "
+            f"status={resp.status_code} body={resp.json!r}. This worker writes its "
+            "ledger rows through platform-api and cannot validate app_id without "
+            "this list."
+        )
+    return frozenset(resp.json["members"])
+
+
+async def load_known_app_ids() -> Optional[FrozenSet[str]]:
+    """Read the app_id enum members and cache them.
+
+    Called once at worker startup, AFTER init_pool().
+
+    Two sources, one meaning. A worker WITH a database reads pg_enum directly.
+    A worker without one asks platform-api — because since ADR-0009 Schritt 2c
+    it still writes ledger rows, just over HTTP.
+
+    That second branch is new and it corrects a premise this docstring used to
+    state: "with no DB there is no INSERT to protect". That was true while the
+    writer held the connection itself. It is not true any more, and leaving the
+    old behaviour in place would have turned every DB-free worker into exactly
+    the failure this module exists to end — an un-attributed label like
+    "bridge-jobs" would sail through unvalidated into an ENUM column and the
+    row would be rejected on the far side.
+
+    FAIL FAST when the enum cannot be read from whichever source applies. Same
+    invariant as validate_billing_integrity() and the plan catalog: a worker
+    that cannot tell a real app from a call-site label must not serve traffic
+    whose ledger rows can silently vanish, and swallowing that here would
+    reinstate it while looking healthy in the logs.
+
+    (Written after doing precisely that: the first cut of this call sat before
+    init_pool(), get_pool() raised, the except logged and moved on, and
+    validation was permanently off in a build that reported success.)
+
+    Validation legitimately stays OFF only for an instance with neither a
+    database nor a way to reach platform-api — it has no ledger write path at
+    all, so there is nothing to protect. BRIDGE_SERVICE_TOKEN is the marker for
+    "can talk to platform-api"; platform_client refuses to authenticate without
+    it, so its absence really does mean no write path.
+    """
+    global _known_app_ids
+
+    from src.db.client import is_db_enabled
+
+    if is_db_enabled():
+        # No try/except: a failure here must reach the caller and stop the boot.
+        loaded = await read_app_id_enum_from_db()
+    elif os.getenv("BRIDGE_SERVICE_TOKEN"):
+        loaded = await _read_app_id_enum_via_platform()
+    else:
+        logger.info(
+            "app registry: no Bridge DB and no platform-api credentials on this "
+            "instance — no ledger write path, app_id validation off"
+        )
+        _known_app_ids = None
+        return None
+
     if not loaded:
         raise RuntimeError(
             f"APP REGISTRY VIOLATION — enum {APP_ID_ENUM_TYPE!r} resolved to ZERO "

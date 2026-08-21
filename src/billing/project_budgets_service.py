@@ -599,3 +599,57 @@ async def evaluate_via_platform(
         resp.status_code, resp.json,
     )
     return await evaluate(user_id, plan_id, project_id, estimated_cost_eur)
+
+
+async def deduct_via_platform(
+    user_id: uuid.UUID,
+    plan_id: str,
+    project_id: str,
+    cost_eur: float,
+    *,
+    allocate_limit_eur: Optional[float] = None,
+    tenant_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    """platform-api path for deduct() (ADR-0009 Schritt 2c) — the project half of
+    the post-call deduction, mirroring what POST /v1/budget/deduct already does
+    for monthly plans.
+
+    Same {exists, deductedEur, fromProjectEur, fromTopUpEur, usedEur,
+    remainingEur} shape as deduct().
+
+    NO retry and, unlike resolve_allocated_plan_id/evaluate_via_platform above,
+    NO direct-DB fallback. Those two are pure reads, where replaying costs
+    nothing. This one is a read-modify-write on project_budgets plus a FIFO draw
+    through the TopUp lots with no dedup key — replaying it after a lost answer
+    charges the project twice, and a "fallback" to the local query on a timeout
+    is precisely such a replay. An unanswerable deduction therefore stays
+    unapplied: the post-call tally is best-effort by construction (the
+    usage_events row is the authoritative record), so the caller logs the gap
+    rather than risking a double charge.
+    """
+    from src.platform_client import call_platform
+
+    resp = await call_platform(
+        "POST", "/v1/internal/project-budgets/deduct",
+        json={
+            "user_id": str(user_id),
+            "plan_id": plan_id,
+            "project_id": project_id,
+            "cost_eur": cost_eur,
+            "allocate_limit_eur": allocate_limit_eur,
+            "tenant_id": tenant_id,
+        },
+        retries=0,  # not idempotent — see above
+    )
+
+    if resp.status_code == 200 and isinstance(resp.json, dict) and "exists" in resp.json:
+        return resp.json
+
+    # No lenient reading: a malformed answer must not be turned into
+    # {"exists": False}. That is a real outcome here ("no budget row, nothing
+    # allocated") which the caller merely warns about — a mis-deployed route
+    # would then look like a benign accounting gap instead of a broken seam.
+    raise RuntimeError(
+        f"POST /v1/internal/project-budgets/deduct answered status={resp.status_code} "
+        f"body={resp.json!r} — project deduction not applied"
+    )

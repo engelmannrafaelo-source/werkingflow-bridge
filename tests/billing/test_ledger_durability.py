@@ -9,10 +9,8 @@ kein nginx und keine Aenderung an der laufenden Bridge, um zu zaehlen.
 """
 from __future__ import annotations
 
-import json
 import sys
 import uuid
-from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -46,35 +44,17 @@ def spool_dir(tmp_path, monkeypatch):
     spool.release_own_file()
 
 
-def _conn(*, ledger_inserted=True, explode=None):
-    """explode: Query-Fragment, bei dem die DB wirft (simulierter Aussetzer)."""
-    conn = AsyncMock()
-    conn.ledger_calls = []
-
-    async def _fetchrow(query, *args):
-        if explode and explode in query:
-            raise RuntimeError("connection reset by peer")
-        if "usage_events" in query:
-            conn.ledger_calls.append(args)
-            return MagicMock() if ledger_inserted else None
-        return {"tenant_id": TENANT_ID, "billing_mode": "subscription"}
-
-    conn.fetchrow = _fetchrow
-    conn.execute = AsyncMock(return_value=None)
-    return conn
+@pytest.fixture
+def seam(ledger_seam):
+    """Der Geldpfad spricht seit ADR-0009 Schritt 2c per HTTP mit platform-api
+    statt selbst mit Postgres. Ein Ausfall ist damit kein DB-Fehler mehr,
+    sondern eine unbeantwortbare Anfrage — fuer diese Tests derselbe Fall:
+    keine definitive Antwort, also bleibt die Zeile geschuldet."""
+    ledger_seam.context = {"tenantId": TENANT_ID, "billingMode": "subscription"}
+    return ledger_seam
 
 
-def _pool(conn):
-    @asynccontextmanager
-    async def _acquire():
-        yield conn
-
-    pool = MagicMock()
-    pool.acquire = _acquire
-    return pool
-
-
-async def _persist(conn, **over):
+async def _persist(seam, **over):
     args = dict(
         provider=PROVIDER_ANTHROPIC,
         app_id="werking-report",
@@ -89,10 +69,7 @@ async def _persist(conn, **over):
         app_env="prod",
     )
     args.update(over)
-    with (
-        patch.object(writer, "get_pool", return_value=_pool(conn)),
-        patch.object(writer, "_deduct_call_cost", new=AsyncMock()) as deduct,
-    ):
+    with patch.object(writer, "_deduct_call_cost", new=AsyncMock()) as deduct:
         outcome = await writer.persist_ai_call_activity(**args)
     return outcome, deduct
 
@@ -100,48 +77,47 @@ async def _persist(conn, **over):
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
-async def test_db_outage_no_longer_loses_the_billing_row(spool_dir):
-    """DER Test. Die DB faellt beim Tenant-Lookup aus — vorher war die Zeile
-    damit weg (ERROR-Log, nicht abgerechnete Nutzung). Jetzt liegt sie auf
-    Platte und wird nachgeholt, sobald die DB wieder antwortet."""
-    outcome, _ = await _persist(_conn(explode="tenants"))
+async def test_db_outage_no_longer_loses_the_billing_row(spool_dir, seam):
+    """DER Test. Die Gegenseite faellt beim Tenant-Lookup aus — vorher war die
+    Zeile damit weg (ERROR-Log, nicht abgerechnete Nutzung). Jetzt liegt sie
+    auf Platte und wird nachgeholt, sobald wieder jemand antwortet."""
+    seam.explode_on = "context"
+    outcome, _ = await _persist(seam)
     assert outcome == spool.OUTCOME_FAILED
     assert spool.spool_stats()["pending"] == 1, "die Zeile muss geschuldet bleiben"
 
-    # DB ist zurueck — der Nachlaeufer holt nach, ohne dass jemand eingreift.
-    gesund = _conn()
-    with (
-        patch.object(writer, "get_pool", return_value=_pool(gesund)),
-        patch.object(writer, "_deduct_call_cost", new=AsyncMock()),
-    ):
+    # platform-api ist zurueck — der Nachlaeufer holt nach, ohne Eingriff.
+    seam.explode_on = None
+    with patch.object(writer, "_deduct_call_cost", new=AsyncMock()):
         stats = await spool.flush_once(writer.persist_ai_call_activity)
 
     assert stats["written"] == 1
     assert spool.spool_stats()["pending"] == 0
-    assert len(gesund.ledger_calls) == 1, "genau eine Abrechnungszeile, nicht zwei"
+    assert len(seam.ledger_calls) == 1, "genau eine Abrechnungszeile, nicht zwei"
 
 
 @pytest.mark.asyncio
-async def test_successful_write_leaves_nothing_owed(spool_dir):
+async def test_successful_write_leaves_nothing_owed(spool_dir, seam):
     """Der Normalfall darf keinen Rueckstand erzeugen."""
-    outcome, _ = await _persist(_conn())
+    outcome, _ = await _persist(seam)
     assert outcome == spool.OUTCOME_WRITTEN
     assert spool.spool_stats()["pending"] == 0
 
 
 @pytest.mark.asyncio
-async def test_replay_writes_the_same_row_not_a_second_one(spool_dir):
+async def test_replay_writes_the_same_row_not_a_second_one(spool_dir, seam):
     """Idempotenz ist das, was Nachholen ueberhaupt erlaubt: derselbe Call
-    traegt beim Nachlauf denselben Schluessel."""
-    erster = _conn()
-    await _persist(erster)
-    schluessel = erster.ledger_calls[0][17]   # $18 = idempotency_key
+    traegt beim Nachlauf denselben Schluessel — und die Gegenseite antwortet
+    darauf 'duplicate' statt eine zweite Zeile anzulegen.
 
-    zweiter = _conn(ledger_inserted=False)    # ON CONFLICT DO NOTHING → keine Zeile
-    with (
-        patch.object(writer, "get_pool", return_value=_pool(zweiter)),
-        patch.object(writer, "_deduct_call_cost", new=AsyncMock()),
-    ):
+    Dass auf 'duplicate' auch keine zweite AUDIT-Zeile entsteht, haengt jetzt
+    an der Gegenseite (`activities` hat keinen Unique-Schluessel) und wird dort
+    festgenagelt: tests/billing/test_ledger_db_rows.py."""
+    await _persist(seam)
+    schluessel = seam.row["idempotency_key"]
+
+    seam.outcome = "duplicate"
+    with patch.object(writer, "_deduct_call_cost", new=AsyncMock()):
         outcome = await writer.persist_ai_call_activity(
             provider=PROVIDER_ANTHROPIC, app_id="werking-report", user_id=USER_ID,
             agent_id=None, workflow_id=None, model="claude-sonnet-5",
@@ -151,24 +127,16 @@ async def test_replay_writes_the_same_row_not_a_second_one(spool_dir):
         )
 
     assert outcome == spool.OUTCOME_DUPLICATE
-    assert zweiter.ledger_calls[0][17] == schluessel
-    # Und die Audit-Zeile wird nicht doppelt geschrieben: `activities` hat
-    # keinen Unique-Schluessel, ein bedingungsloser Nachlauf wuerde den
-    # Audit-Trail bei jedem Wiederholungsversuch verdoppeln.
-    zweiter.execute.assert_not_called()
+    assert seam.ledger_calls[1]["idempotency_key"] == schluessel
 
 
 @pytest.mark.asyncio
-async def test_replayed_row_is_recorded_in_the_period_it_belongs_to(spool_dir):
+async def test_replayed_row_is_recorded_in_the_period_it_belongs_to(spool_dir, seam):
     """recorded_at kommt aus der URSPRUNGSZEIT des Calls, nicht aus der Zeit
     des Nachlaufs. Sonst wandert ein Call vom Monatsletzten still in den
     naechsten Monat — und mit ihm ein Teil der Rechnung."""
     ursprung = 1_700_000_000.0  # 2023-11-14T22:13:20Z
-    conn = _conn()
-    with (
-        patch.object(writer, "get_pool", return_value=_pool(conn)),
-        patch.object(writer, "_deduct_call_cost", new=AsyncMock()),
-    ):
+    with patch.object(writer, "_deduct_call_cost", new=AsyncMock()):
         await writer.persist_ai_call_activity(
             provider=PROVIDER_ANTHROPIC, app_id="werking-report", user_id=USER_ID,
             agent_id=None, workflow_id=None, model="claude-sonnet-5",
@@ -177,44 +145,51 @@ async def test_replayed_row_is_recorded_in_the_period_it_belongs_to(spool_dir):
             _call_uid="uid-1", _call_ts=ursprung,
         )
 
-    recorded_at = conn.ledger_calls[0][16]    # $17 = recorded_at
-    assert recorded_at == datetime.fromtimestamp(ursprung, tz=timezone.utc)
-    # Die Audit-Zeile traegt denselben Zeitpunkt, sonst driften die beiden
-    # Sichten auf denselben Call auseinander.
-    assert conn.execute.call_args_list[0].args[7] == recorded_at
+    assert seam.row["recorded_at"] == datetime.fromtimestamp(
+        ursprung, tz=timezone.utc
+    ).isoformat()
 
 
 @pytest.mark.asyncio
-async def test_correct_skip_is_not_kept_owed(spool_dir):
+async def test_correct_skip_is_not_kept_owed(spool_dir, seam):
     """Ein Call ohne aufloesbaren Tenant SOLL keine Zeile haben. Er darf den
     Puffer nicht dauerhaft belegen — sonst verdeckt Rauschen den echten
     Rueckstand."""
-    conn = AsyncMock()
-    conn.fetchrow = AsyncMock(return_value=None)   # kein users+tenants-Treffer
-    conn.execute = AsyncMock(return_value=None)
+    seam.context = None   # kein users+tenants-Treffer
 
-    outcome, _ = await _persist(conn)
+    outcome, _ = await _persist(seam)
     assert outcome.startswith(spool.OUTCOME_SKIPPED)
     assert spool.spool_stats()["pending"] == 0
 
 
 @pytest.mark.asyncio
-async def test_cancellation_mid_write_no_longer_loses_the_row(spool_dir):
+async def test_unanswerable_lookup_is_not_mistaken_for_a_skip(spool_dir, seam):
+    """Die Kehrseite des Tests darueber, und der Grund, warum
+    load_billing_context bei einer unerwarteten Antwort wirft statt None zu
+    liefern: 'kein Tenant' ist ein endgueltiger Skip, der die Zeile aus dem
+    Puffer entlaesst. Eine nicht erreichbare (oder nicht ausgerollte)
+    Gegenseite darf nie so aussehen — sonst wird eine echte Geldzeile als
+    'korrekt nicht abgerechnet' abgelegt."""
+    seam.explode_on = "context"
+
+    outcome, _ = await _persist(seam)
+    assert outcome == spool.OUTCOME_FAILED
+    assert spool.spool_stats()["pending"] == 1
+
+
+@pytest.mark.asyncio
+async def test_cancellation_mid_write_no_longer_loses_the_row(spool_dir, seam):
     """asyncio.CancelledError ist eine BaseException und entkam dem
     `except Exception` — ein Client-Abbruch mitten im Schreiben nahm die Zeile
     lautlos mit. Der Abbruch propagiert weiterhin (Cancellation zu schlucken
     waere der naechste Fehler), aber die Zeile liegt da schon auf Platte."""
-    conn = AsyncMock()
-
-    async def _fetchrow(query, *args):
-        raise __import__("asyncio").CancelledError()
-
-    conn.fetchrow = _fetchrow
-    conn.execute = AsyncMock(return_value=None)
-
     import asyncio as _asyncio
+
+    async def _cancelled(_payload):
+        raise _asyncio.CancelledError()
+
     with (
-        patch.object(writer, "get_pool", return_value=_pool(conn)),
+        patch.object(writer.ledger_client, "write_ai_call", new=_cancelled),
         patch.object(writer, "_deduct_call_cost", new=AsyncMock()),
     ):
         with pytest.raises(_asyncio.CancelledError):
@@ -235,11 +210,12 @@ async def test_cancellation_mid_write_no_longer_loses_the_row(spool_dir):
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
-async def test_no_deduction_without_a_ledger_row(spool_dir):
+async def test_no_deduction_without_a_ledger_row(spool_dir, seam):
     """Vorher konnte der Abzug die Zeile ueberleben: er stand hinter dem
     grossen try und lief auch, wenn dieses in den except-Zweig gefallen war.
     Ein Abzug ohne Beleg ist durch nichts nachrechenbar."""
-    outcome, deduct = await _persist(_conn(explode="usage_events"))
+    seam.explode_on = "ledger"
+    outcome, deduct = await _persist(seam)
     assert outcome == spool.OUTCOME_FAILED
     deduct.assert_not_called()
     # Verzoegert, nicht verloren: die Zeile ist geschuldet, der Abzug folgt ihr.
@@ -247,30 +223,28 @@ async def test_no_deduction_without_a_ledger_row(spool_dir):
 
 
 @pytest.mark.asyncio
-async def test_deduction_follows_the_row_when_it_lands(spool_dir):
+async def test_deduction_follows_the_row_when_it_lands(spool_dir, seam):
     """Und beim Nachlauf wird dann abgezogen — genau einmal."""
-    await _persist(_conn(explode="usage_events"))
+    seam.explode_on = "ledger"
+    await _persist(seam)
 
-    gesund = _conn()
-    with (
-        patch.object(writer, "get_pool", return_value=_pool(gesund)),
-        patch.object(writer, "_deduct_call_cost", new=AsyncMock()) as deduct,
-    ):
+    seam.explode_on = None
+    with patch.object(writer, "_deduct_call_cost", new=AsyncMock()) as deduct:
         await spool.flush_once(writer.persist_ai_call_activity)
 
     assert deduct.await_count == 1
 
 
 @pytest.mark.asyncio
-async def test_replay_of_an_existing_row_never_deducts_twice(spool_dir):
+async def test_replay_of_an_existing_row_never_deducts_twice(spool_dir, seam):
     """Die harte Randbedingung des ganzen Entwurfs: apply_budget_deduction ist
     ein read-modify-write ohne Dedup-Schluessel. Wuerde ein Nachlauf ihn
-    wiederholen, waere jeder Wiederholungsversuch eine zweite Belastung."""
-    zweiter = _conn(ledger_inserted=False)  # ON CONFLICT DO NOTHING
-    with (
-        patch.object(writer, "get_pool", return_value=_pool(zweiter)),
-        patch.object(writer, "_deduct_call_cost", new=AsyncMock()) as deduct,
-    ):
+    wiederholen, waere jeder Wiederholungsversuch eine zweite Belastung.
+
+    Ueber HTTP ist die Bindung dieselbe wie vorher ueber die DB: 'written' gibt
+    es pro idempotency_key hoechstens einmal."""
+    seam.outcome = "duplicate"
+    with patch.object(writer, "_deduct_call_cost", new=AsyncMock()) as deduct:
         outcome = await writer.persist_ai_call_activity(
             provider=PROVIDER_ANTHROPIC, app_id="werking-report", user_id=USER_ID,
             agent_id=None, workflow_id=None, model="claude-sonnet-5",
@@ -284,14 +258,10 @@ async def test_replay_of_an_existing_row_never_deducts_twice(spool_dir):
 
 
 @pytest.mark.asyncio
-async def test_deduction_carries_the_calls_origin_time(spool_dir):
+async def test_deduction_carries_the_calls_origin_time(spool_dir, seam):
     """Damit ein Abzug, der in einem anderen Monat landet als der Call, sich
     ueberhaupt bemerken KANN."""
-    conn = _conn()
-    with (
-        patch.object(writer, "get_pool", return_value=_pool(conn)),
-        patch.object(writer, "_deduct_call_cost", new=AsyncMock()) as deduct,
-    ):
+    with patch.object(writer, "_deduct_call_cost", new=AsyncMock()) as deduct:
         await writer.persist_ai_call_activity(
             provider=PROVIDER_ANTHROPIC, app_id="werking-report", user_id=USER_ID,
             agent_id=None, workflow_id=None, model="claude-sonnet-5",
@@ -318,7 +288,7 @@ async def test_cross_month_deduction_is_shouted_about(spool_dir, caplog):
     with (
         patch("src.budget.plan_resolution.resolve_billing_plan",
               new=AsyncMock(return_value=plan)),
-        patch("src.budget.routes.apply_budget_deduction", new=AsyncMock()),
+        patch("src.budget.routes.apply_budget_deduction_via_platform", new=AsyncMock()),
         caplog.at_level(logging.ERROR, logger="src.activity.ai_call_writer"),
     ):
         await writer._deduct_call_cost(
@@ -342,7 +312,7 @@ async def test_same_month_deduction_stays_quiet(spool_dir, caplog):
     with (
         patch("src.budget.plan_resolution.resolve_billing_plan",
               new=AsyncMock(return_value=plan)),
-        patch("src.budget.routes.apply_budget_deduction", new=AsyncMock()),
+        patch("src.budget.routes.apply_budget_deduction_via_platform", new=AsyncMock()),
         caplog.at_level(logging.ERROR, logger="src.activity.ai_call_writer"),
     ):
         await writer._deduct_call_cost(
