@@ -77,48 +77,107 @@ def invalidate_cache() -> None:
     _cache.clear()
 
 
-async def _lookup_policy(
+async def lookup_policy_from_db(
     app_id: str, agent_id: Optional[str], app_env: Optional[str]
 ) -> Optional[AppTierPolicy]:
-    """Most-specific enabled row for (app, agent, env), or None.
+    """Most-specific enabled row for (app, agent, env), or None. The DB leaf.
 
     A row's ``agent_id``/``app_env`` may be NULL = "applies to every agent /
     every env of this app". More specific rows win (non-NULL before NULL).
-    Never raises — any failure means "no policy" (fail-open).
+
+    Runs on platform-api (ADR-0009 Schritt 2c), which holds the pool — exposed
+    as GET /v1/internal/app-tier-policy. Split out of the caller so the query
+    lives in ONE place: the worker reaches it over HTTP, nothing duplicates it.
+
+    Raises on a DB failure. The fail-open policy belongs to the CALLER, not to
+    this leaf — an endpoint that answered "no policy" for a broken query would
+    make an outage indistinguishable from a deliberate absence.
     """
     from src.db.client import is_db_enabled, get_pool
 
     if not is_db_enabled():
         return None
 
-    try:
-        pool = get_pool()
-        async with pool.acquire() as conn:
-            row = await conn.fetchrow(
-                """
-                SELECT target_tier, billing_account
-                FROM app_tier_policies
-                WHERE enabled = TRUE
-                  AND app_id = $1
-                  AND (agent_id = $2 OR agent_id IS NULL)
-                  AND (app_env  = $3 OR app_env  IS NULL)
-                ORDER BY (agent_id IS NOT NULL) DESC,
-                         (app_env  IS NOT NULL) DESC
-                LIMIT 1
-                """,
-                app_id, agent_id, app_env,
-            )
-    except Exception as e:  # noqa: BLE001 — cost policy fails OPEN, never breaks a call
-        # Table may not exist yet (code deployed before migration), or a
-        # transient DB error. Either way: no policy, normal routing.
-        logger.debug("app_tier_policy: lookup failed (fail-open, no policy): %s", e)
-        return None
+    pool = get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            SELECT target_tier, billing_account
+            FROM app_tier_policies
+            WHERE enabled = TRUE
+              AND app_id = $1
+              AND (agent_id = $2 OR agent_id IS NULL)
+              AND (app_env  = $3 OR app_env  IS NULL)
+            ORDER BY (agent_id IS NOT NULL) DESC,
+                     (app_env  IS NOT NULL) DESC
+            LIMIT 1
+            """,
+            app_id, agent_id, app_env,
+        )
 
     if row is None or not row["target_tier"]:
         return None
     return AppTierPolicy(
         target_tier=row["target_tier"],
         billing_account=row["billing_account"],
+    )
+
+
+async def _lookup_policy(
+    app_id: str, agent_id: Optional[str], app_env: Optional[str]
+) -> Optional[AppTierPolicy]:
+    """Ask platform-api for the policy. Never raises — fail-open (see module
+    docstring): any failure means "no policy", i.e. normal routing.
+
+    Opts into one retry: a pure read, safe to replay.
+
+    No direct-DB fallback, and this module is the reason the worker's money path
+    no longer needs one at all — it was the last reader of a table the writer
+    itself never touched (ADR-0009 Schritt 2c). Before the seam existed, a
+    worker without BRIDGE_DB_URL returned None here *silently*, which on this
+    particular lookup does not mean "no policy": it means the call's cost is
+    booked to the CUSTOMER instead of the internal ``billing_account`` the
+    policy names. Fail-open is still the right trade for a cost/operational
+    optimisation — but it has to be findable, hence WARNING rather than the
+    previous DEBUG when the question could not be asked. A genuine "no row"
+    stays quiet.
+    """
+    from src.platform_client import PlatformUnavailable, call_platform
+
+    try:
+        resp = await call_platform(
+            "GET", "/v1/internal/app-tier-policy",
+            params={
+                "app_id": app_id,
+                **({"agent_id": agent_id} if agent_id else {}),
+                **({"app_env": app_env} if app_env else {}),
+            },
+            retries=1,
+        )
+    except PlatformUnavailable as e:
+        logger.warning(
+            "app_tier_policy: lookup via platform-api failed (%s) — fail-open, no "
+            "policy for app=%s agent=%s env=%s. If a policy exists for this "
+            "call-site, its cost is being booked to the customer, not to its "
+            "billing_account.",
+            e, app_id, agent_id, app_env,
+        )
+        return None
+
+    if resp.status_code != 200 or not isinstance(resp.json, dict) or "policy" not in resp.json:
+        logger.warning(
+            "app_tier_policy: lookup via platform-api answered status=%s body=%r "
+            "— fail-open, no policy for app=%s agent=%s env=%s",
+            resp.status_code, resp.json, app_id, agent_id, app_env,
+        )
+        return None
+
+    raw = resp.json["policy"]
+    if not raw or not raw.get("target_tier"):
+        return None
+    return AppTierPolicy(
+        target_tier=raw.get("target_tier"),
+        billing_account=raw.get("billing_account"),
     )
 
 

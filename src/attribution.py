@@ -45,6 +45,14 @@ logger = logging.getLogger(__name__)
 
 ANONYMOUS_PREFIX = "anonymous:"
 
+# The synthetic identity every EXPLICITLY anonymous call books to (fixed UUID,
+# migration 032) — the accounting bucket this module's contract promises above.
+# It lives here, next to the marker semantics, rather than with either side of
+# the ledger seam: the worker needs it to rewrite the identity and platform-api
+# needs it to answer whether the row exists, and neither of those modules may
+# depend on the other (ADR-0009 Schritt 2c — the worker holds no DB import).
+ANONYMOUS_USER_ID = "00000000-0000-4000-a000-000000000001"
+
 # Legacy spellings that MUST behave like an anonymous marker during the
 # transition (werking-report public funnel). Remove once report sends
 # 'anonymous:<grund>' natively.

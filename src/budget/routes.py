@@ -478,6 +478,65 @@ async def apply_budget_deduction(
     }
 
 
+async def apply_budget_deduction_via_platform(
+    user_id: uuid.UUID,
+    plan_id: str,
+    actual_cost_eur: float,
+) -> Dict[str, Any]:
+    """The worker's way to apply_budget_deduction, over POST /v1/budget/deduct
+    (ADR-0009 Schritt 2c).
+
+    The endpoint already existed and fits this call exactly: same three
+    arguments, same return shape, and its two error answers map back onto the
+    two exceptions the in-process caller already handles — 402 → the reason
+    carried by BudgetDeductionDenied, 400 → ValueError. Nothing had to be
+    reshaped to make it fit, which is the test for reusing an endpoint rather
+    than inventing one. It covers ONLY monthly plans (`_require_month_interval`);
+    the project half needed a new leaf — project_budgets_service.deduct_via_platform.
+
+    NO retry and NO direct-DB fallback, and here the two are the same rule.
+    apply_budget_deduction is a read-modify-write on user_budgets plus a FIFO
+    draw through the TopUp lots, with no dedup key: a second attempt after a
+    lost ANSWER is indistinguishable from a first attempt and would charge the
+    customer twice. Falling back to the local query on a timeout would be
+    exactly that second attempt, only disguised as a fallback. So an
+    unanswerable deduction stays unapplied, which is the pre-existing
+    best-effort contract of this path (the ledger row, not the tally, is the
+    authoritative record) — the caller logs it and moves on.
+
+    Raises PlatformUnavailable when platform-api could not answer. The caller's
+    existing catch-all treats that identically to the DB error it replaces.
+    """
+    from src.platform_client import call_platform
+
+    resp = await call_platform(
+        "POST", "/v1/budget/deduct",
+        json={
+            "userId": str(user_id),
+            "planId": plan_id,
+            "actualCostEur": actual_cost_eur,
+        },
+        retries=0,  # not idempotent — see above
+    )
+
+    if resp.status_code == 200 and isinstance(resp.json, dict):
+        return resp.json
+    if resp.status_code == 402:
+        detail = (resp.json or {}).get("detail")
+        raise BudgetDeductionDenied(str(detail) if detail else "denied")
+    if resp.status_code == 400:
+        raise ValueError(str((resp.json or {}).get("detail") or "invalid deduction"))
+
+    # Anything else is not an answer we can act on. Raising (rather than
+    # returning something empty) keeps a mis-deployed route from reading as a
+    # successful deduction, which would understate every customer's usage
+    # silently.
+    raise RuntimeError(
+        f"POST /v1/budget/deduct answered status={resp.status_code} "
+        f"body={resp.json!r} — deduction not applied"
+    )
+
+
 @router.post("/deduct")
 async def budget_deduct(
     body: DeductRequest,

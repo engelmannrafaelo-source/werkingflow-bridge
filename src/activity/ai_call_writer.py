@@ -12,6 +12,20 @@ Why this exists (ADR 0007 / token-tracking consolidation):
   no longer log anything — they only send attribution headers (X-App-ID,
   X-User-ID), which a Layer-0 validator enforces.
 
+Where the rows are written (ADR-0009 Schritt 2c):
+  This module holds NO database connection. It decides everything about the
+  call — cost, provider vocabulary, billing mode, which pot pays, every skip
+  branch — and then states the result over HTTP to platform-api
+  (src/activity/ledger_client.py → src/activity/ledger_db.py). The split is
+  "data, not verdicts": the pure, unit-tested functions stayed here, only the
+  statements that need a connection moved.
+
+  That is what lets a worker run without BRIDGE_DB_URL and therefore live on a
+  different host than the customer database. It costs nothing in durability,
+  because the write-ahead spool below already covers a write that does not
+  arrive — and a lost HTTP answer is the same thing as a lost DB answer, with
+  the same remedy: the row stays owed and is replayed.
+
 Contract:
   • Fire-and-forget. A tracking failure must NEVER break the user-facing
     call — every error is swallowed with a warning.
@@ -24,14 +38,13 @@ Contract:
 """
 from __future__ import annotations
 
-import json
 import logging
 import time
 from collections import defaultdict
 from datetime import datetime, timezone
 from typing import Optional
 
-from src.activity import ledger_spool
+from src.activity import ledger_client, ledger_spool
 from src.activity.ledger_spool import (
     OUTCOME_DUPLICATE,
     OUTCOME_FAILED,
@@ -40,9 +53,9 @@ from src.activity.ledger_spool import (
 )
 from src.activity.app_registry import normalize_app_id
 from src.activity.providers import REAL_COST_PROVIDERS, normalize_ledger_provider
+from src.attribution import ANONYMOUS_USER_ID
 from src.budget.plan_resolution import PlanResolutionError
 from src.budget.plans import AmbiguousPlanCatalog
-from src.db.client import get_pool
 from src.pricing import cost_eur, PRICING_VERSION
 
 logger = logging.getLogger(__name__)
@@ -55,30 +68,14 @@ _PLAN_RESOLUTION_ERRORS = (AmbiguousPlanCatalog, PlanResolutionError)
 # user_id is seen so warnings show frequency, not just isolated occurrences.
 _skip_counts: dict = defaultdict(int)
 
-# Synthetic identity every EXPLICITLY anonymous call books to (fixed UUID,
-# migration 032). Anonymous ≠ missing: 'anonymous:<grund>' is a deliberate
-# app statement ("this call-site has no logged-in user by design") and gets
-# its own accounting bucket; a missing X-User-ID is a leak (counted in
-# src/attribution.py metrics, rejected once BRIDGE_ATTRIBUTION_ENFORCE=true).
-ANONYMOUS_USER_ID = "00000000-0000-4000-a000-000000000001"
-# Set once the identity row is confirmed present — avoids re-querying per call.
-_anonymous_identity_verified = False
-
-
-async def _anonymous_identity_present() -> bool:
-    """Check (once, then cached) that the migration-032 identity exists.
-    Without it an anonymous booking would FK-fail — warn loudly instead of
-    producing a silent tracking gap."""
-    global _anonymous_identity_verified
-    if _anonymous_identity_verified:
-        return True
-    pool = get_pool()
-    async with pool.acquire() as conn:
-        row = await conn.fetchrow("SELECT 1 FROM users WHERE id = $1", ANONYMOUS_USER_ID)
-    if row:
-        _anonymous_identity_verified = True
-        return True
-    return False
+# ANONYMOUS_USER_ID (imported above) is the synthetic identity every EXPLICITLY
+# anonymous call books to (fixed UUID, migration 032). Anonymous ≠ missing:
+# 'anonymous:<grund>' is a deliberate app statement ("this call-site has no
+# logged-in user by design") and gets its own accounting bucket; a missing
+# X-User-ID is a leak (counted in src/attribution.py metrics, rejected once
+# BRIDGE_ATTRIBUTION_ENFORCE=true). The constant lives in src/attribution.py,
+# next to the marker semantics it belongs to, and is re-exported here because
+# this is where callers expect to find it.
 
 
 def resolve_ledger_cost(
@@ -144,7 +141,10 @@ async def _deduct_call_cost(
     try:
         import uuid as _uuid
         from src.budget.plan_resolution import resolve_billing_plan
-        from src.budget.routes import apply_budget_deduction, BudgetDeductionDenied
+        from src.budget.routes import (
+            apply_budget_deduction_via_platform,
+            BudgetDeductionDenied,
+        )
 
         # Both exits below are CORRECT skips, but they are on the budget path:
         # no deduction means the pre-call gate has nothing to gate against, so
@@ -180,7 +180,9 @@ async def _deduct_call_cost(
                     plan.id, user_id,
                 )
                 return
-            from src.billing.project_budgets_service import deduct as _deduct_project
+            from src.billing.project_budgets_service import (
+                deduct_via_platform as _deduct_project,
+            )
 
             result = await _deduct_project(
                 uid,
@@ -223,7 +225,7 @@ async def _deduct_call_cost(
                 )
 
         try:
-            await apply_budget_deduction(uid, plan.id, cost_eur_amount)
+            await apply_budget_deduction_via_platform(uid, plan.id, cost_eur_amount)
         except BudgetDeductionDenied as denied:
             # The call already happened (the gate ran pre-call). A denial
             # here only means the running tally could not fully absorb the
@@ -430,7 +432,7 @@ async def persist_ai_call_activity(
     anon_reason = anonymous_reason(user_id)
     if anon_reason is not None:
         try:
-            if await _anonymous_identity_present():
+            if await ledger_client.anonymous_identity_present():
                 user_id = ANONYMOUS_USER_ID
                 agent_id = agent_id or "anonymous"
             else:
@@ -476,24 +478,33 @@ async def persist_ai_call_activity(
 
         import uuid as _uuid
 
-        # Validate user_id is a UUID before hitting the DB. PostgreSQL
-        # rejects non-UUID values on uuid-typed columns. Apps (or CUI) may
-        # send emails or system strings — resolve emails via users.email;
-        # skip non-user strings with a loud warning (Defensive Programming:
-        # tracking gaps must never be silent).
+        # Validate user_id is a UUID before anything keys on it. usage_events
+        # rejects non-UUID values on its uuid-typed column. Apps (or CUI) may
+        # send emails or system strings — resolve emails through the shared
+        # identity resolver; skip non-user strings with a loud warning
+        # (Defensive Programming: tracking gaps must never be silent).
         try:
             _uuid.UUID(user_id)
         except (ValueError, AttributeError, TypeError):
             if "@" in str(user_id):
-                # Email address → look up the corresponding UUID
-                _pool = get_pool()
-                async with _pool.acquire() as _conn:
-                    _row = await _conn.fetchrow(
-                        "SELECT id FROM users WHERE email = $1", user_id
-                    )
-                if _row:
-                    user_id = str(_row["id"])
-                else:
+                # Email identity (Engelmann). Resolved via the SHARED resolver
+                # rather than this module's own query: src/identity/user_resolver
+                # exists exactly to stop this writer from diverging from the
+                # budget gate and the lease path on what an identity means, and
+                # it already speaks to platform-api (with its own short cache).
+                #
+                # UnknownUserIdentity is the "no such user" answer — a
+                # definitive skip. Anything else (platform-api unreachable) is
+                # NOT an answer and must not be turned into one: it propagates
+                # to the handler below, where it leaves the row owed.
+                from src.identity.user_resolver import (
+                    UnknownUserIdentity,
+                    resolve_user_id,
+                )
+
+                try:
+                    user_id = str(await resolve_user_id(user_id))
+                except UnknownUserIdentity:
                     _skip_counts[user_id] += 1
                     logger.warning(
                         "persist_ai_call_activity: email not found in users "
@@ -514,241 +525,188 @@ async def persist_ai_call_activity(
                 )
                 return _settle(f"{OUTCOME_SKIPPED}:not_a_user")
 
-        pool = get_pool()
-        async with pool.acquire() as conn:
-            trow = await conn.fetchrow(
-                """
-                SELECT u.tenant_id, t.billing_mode
-                FROM users u
-                JOIN tenants t ON t.id = u.tenant_id
-                WHERE u.id = $1
-                """,
-                user_id,
+        # users ⋈ tenants, via platform-api. `None` is the definitive "no
+        # tenant" answer; an UNANSWERABLE lookup raises out of here into the
+        # handler below, which is the difference that matters — see
+        # ledger_client.load_billing_context.
+        _ctx = await ledger_client.load_billing_context(user_id)
+        tenant_id = _ctx["tenantId"] if _ctx else None
+        billing_mode_text = _ctx["billingMode"] if _ctx else "subscription"
+        if not tenant_id:
+            # Skip is correct — a usage_events row is tenant-scoped and there
+            # is no tenant to scope it to. But say so: this was the last
+            # silent exit on the ledger path, and a silently missing row on a
+            # BILLING path is the worst kind of quiet failure — spend that
+            # nobody can see and nobody can reconcile.
+            #
+            # The JOIN is inner, so a missing row means EITHER the user id
+            # does not exist in `users` OR its tenant_id points nowhere. The
+            # old comment lumped both together; the distinction is what tells
+            # an operator whether to look at the user or at the tenant.
+            _skip_counts[user_id] += 1
+            logger.warning(
+                "persist_ai_call_activity: no users+tenants row for user=%s "
+                "(app=%s agent=%s model=%s, seen %dx) — user missing or its "
+                "tenant_id dangling; NO usage_events row written, this call is "
+                "NOT metered",
+                user_id, app_id, agent_id, model, _skip_counts[user_id],
             )
-            tenant_id = trow["tenant_id"] if trow else None
-            billing_mode_text = trow["billing_mode"] if trow else "subscription"
-            if not tenant_id:
-                # Skip is correct — a usage_events row is tenant-scoped and there
-                # is no tenant to scope it to. But say so: this was the last
-                # silent exit on the ledger path, and a silently missing row on a
-                # BILLING path is the worst kind of quiet failure — spend that
-                # nobody can see and nobody can reconcile.
-                #
-                # The JOIN is inner, so a missing row means EITHER the user id
-                # does not exist in `users` OR its tenant_id points nowhere. The
-                # old comment lumped both together; the distinction is what tells
-                # an operator whether to look at the user or at the tenant.
-                _skip_counts[user_id] += 1
-                logger.warning(
-                    "persist_ai_call_activity: no users+tenants row for user=%s "
-                    "(app=%s agent=%s model=%s, seen %dx) — user missing or its "
-                    "tenant_id dangling; NO usage_events row written, this call is "
-                    "NOT metered",
-                    user_id, app_id, agent_id, model, _skip_counts[user_id],
-                )
-                return _settle(f"{OUTCOME_SKIPPED}:no_tenant")
+            return _settle(f"{OUTCOME_SKIPPED}:no_tenant")
 
-            # app_id is an ENUM column — validate before the INSERT rather than
-            # letting Postgres reject it mid-transaction. An unknown value books
-            # as NULL (the honest "no app" case) and travels on as app_id_raw,
-            # so the call-site stays queryable without costing the row.
-            app_id_col, app_id_rejected = normalize_app_id(app_id)
+        # app_id is an ENUM column — normalise before the write rather than
+        # letting Postgres reject it mid-transaction. An unknown value books
+        # as NULL (the honest "no app" case) and travels on as app_id_raw,
+        # so the call-site stays queryable without costing the row.
+        app_id_col, app_id_rejected = normalize_app_id(app_id)
 
-            feature = agent_id or workflow_id or "call"
-            event_type = (
-                f"ai-call-error:{feature}" if status != "success"
-                else f"ai-call:{feature}"
-            )
-            payload = {
-                "feature": feature,
-                "model": model,
-                # promptTokens = UNCACHED input only (Anthropic usage semantics).
-                # Cache traffic is reported separately so the UI can show the
-                # physical input — without them a cached agent call displays
-                # "10 input tokens" while the priced input is 100k+.
-                "promptTokens": input_tokens,
-                "completionTokens": output_tokens,
-                "cacheReadTokens": cache_read_tokens or 0,
-                "cacheCreationTokens": cache_creation_tokens or 0,
-                # totalTokens = every token the call physically processed
-                # (uncached input + cache reads/writes + output) — matches what
-                # costEur prices. Legacy rows (pre cache fields) carry only
-                # input+output here.
-                "totalTokens": (
-                    (input_tokens or 0)
-                    + (cache_read_tokens or 0)
-                    + (cache_creation_tokens or 0)
-                    + (output_tokens or 0)
-                ),
-                "costEur": call_cost_eur,  # priced via src/pricing.py (SSoT)
-                "latencyMs": duration_ms,
-                "loggedBy": "bridge",  # distinguishes self-log from legacy app POSTs
-                # Same value as usage_events.idempotency_key — the join between
-                # the audit trail and the money row for one call.
-                "callUid": call_uid,
-            }
-            if error_code:
-                payload["errorCode"] = error_code
-            if error_message:
-                payload["errorMessage"] = str(error_message)[:500]
-            if anon_reason is not None:
-                # Which call-site declared itself anonymous — the per-<grund>
-                # breakdown inside the anonymous bucket.
-                payload["anonymousReason"] = anon_reason
-            if app_id_rejected:
-                # The inbound label was not an app (e.g. a client-id segment
-                # like "bridge-jobs"). Keeping it here is the whole point: an
-                # unattributed call must stay findable, not merely absent.
-                payload["appIdRaw"] = app_id_rejected
+        feature = agent_id or workflow_id or "call"
+        event_type = (
+            f"ai-call-error:{feature}" if status != "success"
+            else f"ai-call:{feature}"
+        )
+        payload = {
+            "feature": feature,
+            "model": model,
+            # promptTokens = UNCACHED input only (Anthropic usage semantics).
+            # Cache traffic is reported separately so the UI can show the
+            # physical input — without them a cached agent call displays
+            # "10 input tokens" while the priced input is 100k+.
+            "promptTokens": input_tokens,
+            "completionTokens": output_tokens,
+            "cacheReadTokens": cache_read_tokens or 0,
+            "cacheCreationTokens": cache_creation_tokens or 0,
+            # totalTokens = every token the call physically processed
+            # (uncached input + cache reads/writes + output) — matches what
+            # costEur prices. Legacy rows (pre cache fields) carry only
+            # input+output here.
+            "totalTokens": (
+                (input_tokens or 0)
+                + (cache_read_tokens or 0)
+                + (cache_creation_tokens or 0)
+                + (output_tokens or 0)
+            ),
+            "costEur": call_cost_eur,  # priced via src/pricing.py (SSoT)
+            "latencyMs": duration_ms,
+            "loggedBy": "bridge",  # distinguishes self-log from legacy app POSTs
+            # Same value as usage_events.idempotency_key — the join between
+            # the audit trail and the money row for one call.
+            "callUid": call_uid,
+        }
+        if error_code:
+            payload["errorCode"] = error_code
+        if error_message:
+            payload["errorMessage"] = str(error_message)[:500]
+        if anon_reason is not None:
+            # Which call-site declared itself anonymous — the per-<grund>
+            # breakdown inside the anonymous bucket.
+            payload["anonymousReason"] = anon_reason
+        if app_id_rejected:
+            # The inbound label was not an app (e.g. a client-id segment
+            # like "bridge-jobs"). Keeping it here is the whole point: an
+            # unattributed call must stay findable, not merely absent.
+            payload["appIdRaw"] = app_id_rejected
 
-            # actor_user_id is a uuid column — only set it when user_id parses.
+        # actor_user_id is a uuid column — only set it when user_id parses.
+        actor_uuid = None
+        try:
+            import uuid as _uuid
+            actor_uuid = str(_uuid.UUID(user_id))
+        except (ValueError, AttributeError, TypeError):
             actor_uuid = None
-            try:
-                import uuid as _uuid
-                actor_uuid = _uuid.UUID(user_id)
-            except (ValueError, AttributeError, TypeError):
-                actor_uuid = None
 
-            # Usage ledger — structured row with dedicated token/cost columns so
-            # the Platform Admin can query across workflow + sandbox without JSONB
-            # extraction.  billing_mode/real_cost mapping lives in
-            # resolve_ledger_cost (pure, unit-tested) — Bedrock always
-            # carries real AWS cost, subscription-served Anthropic is 0.
-            bm_enum, real_cost = resolve_ledger_cost(
-                billing_mode_text, provider, call_cost_eur
+        # Usage ledger — structured row with dedicated token/cost columns so
+        # the Platform Admin can query across workflow + sandbox without JSONB
+        # extraction.  billing_mode/real_cost mapping lives in
+        # resolve_ledger_cost (pure, unit-tested) — Bedrock always
+        # carries real AWS cost, subscription-served Anthropic is 0. It stays
+        # HERE, on the worker: platform-api records the decision, it does not
+        # make it.
+        bm_enum, real_cost = resolve_ledger_cost(
+            billing_mode_text, provider, call_cost_eur
+        )
+
+        # Idempotent by construction (ADR-0009 Schritt 1, now over HTTP).
+        # Two things make a replay safe rather than a second charge:
+        #
+        #  • idempotency_key — generated where the CALL happened, not where
+        #    the row is written, so a retry an hour later is recognisably
+        #    the same call. The column (UNIQUE, migration 016) already
+        #    existed and was already used exactly this way by the sandbox
+        #    path; the chat/research path simply never set it.
+        #  • recorded_at from the call's ORIGIN timestamp, not NOW(). A row
+        #    replayed after an outage must be recorded in the period it
+        #    belongs to — otherwise a call from the last minute of a month
+        #    lands in the next one and the invoice quietly moves.
+        #
+        # The answer ("written" vs "duplicate") is what the rest of this
+        # function needs: did *this* attempt create the row? Moving the write
+        # onto HTTP changes nothing about that contract — an unheard answer is
+        # simply not an answer, and leaves the call owed in the spool.
+        #
+        # The audit row is written by the same endpoint, after the money row
+        # and only if it was created there. It deliberately does NOT get its
+        # own round trip: `activities` has no unique key, so replaying it
+        # independently would duplicate the audit trail, and the two rows must
+        # not share a fate (2026-08-01: a rejected audit INSERT silently took
+        # the billing row down with it).
+        _outcome = await ledger_client.write_ai_call({
+            "idempotency_key": call_uid,
+            "recorded_at": datetime.fromtimestamp(
+                call_ts, tz=timezone.utc
+            ).isoformat(),
+            "actor_user_id": actor_uuid,
+            "tenant_id": tenant_id,
+            # Same normalised value as the audit row. usage_events.app is
+            # plain text and would swallow anything, but a dimension that
+            # means one thing in one table and another thing next door is
+            # not a dimension — the raw label rides along in
+            # provider_metadata.app_id_raw instead.
+            "app": app_id_col,
+            "app_env": app_env,
+            "model": model,
+            "provider": provider,
+            "region": region,
+            "input_tokens": input_tokens or 0,
+            "output_tokens": output_tokens or 0,
+            "cache_read_tokens": cache_read_tokens or 0,
+            "cache_creation_tokens": cache_creation_tokens or 0,
+            "billing_mode": bm_enum,
+            "real_cost_eur": real_cost,
+            # hypothetical = priced at pay-per-token rates
+            "hypothetical_cost_eur": call_cost_eur,
+            "pricing_version": PRICING_VERSION,
+            "provider_metadata": {
+                "feature": feature,
+                "agent_id": agent_id,
+                "workflow_id": workflow_id,
+                "status": status,
+                **({"error_code": error_code} if error_code else {}),
+                **({"error_message": str(error_message)[:500]} if error_message else {}),
+                # App-tier policy booked this call's cost to an internal
+                # account (customer budget NOT charged). Queryable via
+                # provider_metadata->>'billing_account'.
+                **({"billing_account": billing_account} if billing_account else {}),
+                **({"anonymous_reason": anon_reason} if anon_reason is not None else {}),
+                # Inbound app label that was not a real app — kept so the
+                # call-site of an unattributed call is queryable:
+                #   provider_metadata->>'app_id_raw'
+                **({"app_id_raw": app_id_rejected} if app_id_rejected else {}),
+                **(provider_meta or {}),
+            },
+            "audit_event_type": event_type,
+            "audit_payload": payload,
+        })
+        ledger_written = _outcome == OUTCOME_WRITTEN
+        outcome = OUTCOME_WRITTEN if ledger_written else OUTCOME_DUPLICATE
+        if not ledger_written:
+            # A replay caught up with a row that had already landed — the
+            # spooled record simply outlived its ack. Nothing to repair;
+            # logged so a drained backlog is legible afterwards.
+            logger.info(
+                "persist_ai_call_activity: usage_events row for call %s was "
+                "already present — replay settled, no second row, no second "
+                "deduction", call_uid,
             )
-
-            # Idempotent by construction (ADR-0009 Schritt 1). Two things make
-            # a replay safe rather than a second charge:
-            #
-            #  • idempotency_key — generated where the CALL happened, not where
-            #    the row is written, so a retry an hour later is recognisably
-            #    the same call. The column (UNIQUE, migration 016) already
-            #    existed and was already used exactly this way by the sandbox
-            #    path; the chat/research path simply never set it.
-            #  • recorded_at from the call's ORIGIN timestamp, not NOW(). A row
-            #    replayed after an outage must be recorded in the period it
-            #    belongs to — otherwise a call from the last minute of a month
-            #    lands in the next one and the invoice quietly moves.
-            #
-            # RETURNING id answers the only question the rest of this function
-            # needs: did *this* attempt create the row? (Same shape as
-            # sandbox/lease_service.py.)
-            _inserted_row = await conn.fetchrow(
-                """
-                INSERT INTO usage_events (
-                    source, recorded_at, idempotency_key,
-                    user_id, tenant_id,
-                    app, app_env, model, provider, region,
-                    input_tokens, output_tokens,
-                    cache_read_tokens, cache_creation_tokens,
-                    billing_mode, real_cost_eur, hypothetical_cost_eur, pricing_version,
-                    provider_metadata
-                ) VALUES (
-                    'workflow', $17, $18,
-                    $1, $2,
-                    $3, $4::app_env, $5, $6, $7,
-                    $8, $9,
-                    $10, $11,
-                    $12::billing_mode_enum, $13, $14, $15,
-                    $16::jsonb
-                )
-                ON CONFLICT (idempotency_key) DO NOTHING
-                RETURNING id
-                """,
-                actor_uuid,
-                tenant_id,
-                # Same normalised value as the audit row. usage_events.app is
-                # plain text and would swallow anything, but a dimension that
-                # means one thing in one table and another thing next door is
-                # not a dimension — the raw label rides along in
-                # provider_metadata.app_id_raw instead.
-                app_id_col,
-                app_env,
-                model,
-                provider,
-                region,
-                input_tokens or 0,
-                output_tokens or 0,
-                cache_read_tokens or 0,
-                cache_creation_tokens or 0,
-                bm_enum,
-                real_cost,
-                call_cost_eur,  # hypothetical = priced at pay-per-token rates
-                PRICING_VERSION,
-                json.dumps({
-                    "feature": feature,
-                    "agent_id": agent_id,
-                    "workflow_id": workflow_id,
-                    "status": status,
-                    **({"error_code": error_code} if error_code else {}),
-                    **({"error_message": str(error_message)[:500]} if error_message else {}),
-                    # App-tier policy booked this call's cost to an internal
-                    # account (customer budget NOT charged). Queryable via
-                    # provider_metadata->>'billing_account'.
-                    **({"billing_account": billing_account} if billing_account else {}),
-                    **({"anonymous_reason": anon_reason} if anon_reason is not None else {}),
-                    # Inbound app label that was not a real app — kept so the
-                    # call-site of an unattributed call is queryable:
-                    #   provider_metadata->>'app_id_raw'
-                    **({"app_id_raw": app_id_rejected} if app_id_rejected else {}),
-                    **(provider_meta or {}),
-                }),
-                datetime.fromtimestamp(call_ts, tz=timezone.utc),
-                call_uid,
-            )
-            ledger_written = _inserted_row is not None
-            outcome = OUTCOME_WRITTEN if ledger_written else OUTCOME_DUPLICATE
-            if not ledger_written:
-                # A replay caught up with a row that had already landed — the
-                # spooled record simply outlived its ack. Nothing to repair;
-                # logged so a drained backlog is legible afterwards.
-                logger.info(
-                    "persist_ai_call_activity: usage_events row for call %s was "
-                    "already present — replay settled, no second row, no second "
-                    "deduction", call_uid,
-                )
-
-            # Audit record — who called what, when, from which app/env.
-            #
-            # Deliberately in its own try: the audit row and the ledger row are
-            # separate concerns and must not share a fate. They used to sit in
-            # one block, so a rejected audit INSERT silently took the BILLING
-            # row down with it (2026-08-01: app_id="bridge-jobs" vs the enum —
-            # every un-attributed research job booked nothing).
-            #
-            # It now runs AFTER the ledger row and only when that row was
-            # created in this attempt. Two reasons, both from the durability
-            # work: money goes first when a connection may die between two
-            # statements, and `activities` has no unique key — replaying it
-            # unconditionally would duplicate the audit trail every time the
-            # spool retried a call whose ledger row had already landed.
-            if ledger_written:
-                try:
-                    await conn.execute(
-                        """
-                        INSERT INTO activities
-                          (id, timestamp, category, event_type, actor_user_id,
-                           target_user_id, tenant_id, app_id, ip, user_agent, payload,
-                           app_env)
-                        VALUES (gen_random_uuid(), $7, 'workflow', $1, $2,
-                                NULL, $3, $4, NULL, NULL, $5::jsonb, $6::app_env)
-                        """,
-                        event_type,
-                        actor_uuid,
-                        tenant_id,
-                        app_id_col,
-                        json.dumps(payload),
-                        app_env,
-                        datetime.fromtimestamp(call_ts, tz=timezone.utc),
-                    )
-                except Exception as _audit_err:  # noqa: BLE001 — ledger already landed
-                    logger.error(
-                        "persist_ai_call_activity: AUDIT row failed (app=%s agent=%s "
-                        "model=%s): %s — the usage_events row IS written, so the "
-                        "call stays metered; the audit trail has a gap here",
-                        app_id_col, agent_id, model, _audit_err,
-                    )
     except Exception as e:  # noqa: BLE001 — tracking must never break the call
         # ERROR, not WARNING: reaching here means NO usage_events row for a call
         # that really happened — spend nobody can see and nobody can reconcile.

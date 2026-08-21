@@ -283,3 +283,234 @@ async def post_ensure_trial(
                 "balanceEur": e.balance_eur,
             },
         ) from e
+
+
+# ── 2c/C1: anonymous identity probe ──────────────────────────────────────
+
+@router.get("/identity/anonymous")
+async def get_anonymous_identity(
+    _claims: AuthClaims = Depends(require_service_token),
+) -> Dict[str, Any]:
+    """Mirrors src.activity.ledger_db.anonymous_identity_present.
+
+    200 {"present": false} is a real answer ("migration 032 has not run"), not
+    an error — the caller holds the call in its write-ahead spool until it
+    becomes true, rather than dropping an anonymous booking. A DB failure here
+    must NOT be flattened into present=false: it becomes a 5xx, the caller
+    hears PlatformUnavailable, and the row likewise stays owed.
+    """
+    from src.activity.ledger_db import anonymous_identity_present
+
+    return {"present": await anonymous_identity_present()}
+
+
+# ── 2c/C2: billing context (users ⋈ tenants) ─────────────────────────────
+
+@router.get("/users/{user_id}/billing-context")
+async def get_billing_context(
+    user_id: str,
+    _claims: AuthClaims = Depends(require_service_token),
+) -> Dict[str, Any]:
+    """Mirrors src.activity.ledger_db.load_billing_context — DATA, not a verdict.
+
+    The billing_mode → (billing_mode enum, real_cost_eur) mapping stays in the
+    worker (`resolve_ledger_cost`, pure and unit-tested); this leaf only reports
+    what the two tables say.
+
+    200 with context=null for "no such user / dangling tenant", NOT 404 — same
+    reasoning as users/lookup-by-email: an undeployed platform-api also answers
+    404, and overloading it would make a missing deployment indistinguishable
+    from a missing tenant. Here that would be worse than on a read path: the
+    caller would file a real, billable call as the definitive skip
+    "skipped:no_tenant" and release it from the spool.
+    """
+    import uuid as _uuid
+
+    from src.activity.ledger_db import load_billing_context
+
+    try:
+        _uuid.UUID(user_id)
+    except (ValueError, AttributeError, TypeError):
+        raise HTTPException(status_code=400, detail=f"Invalid user id: {user_id!r}")
+
+    return {"context": await load_billing_context(user_id)}
+
+
+# ── 2c/C3: the authoritative billing row (+ its audit row) ───────────────
+
+class AiCallLedgerRequest(BaseModel):
+    # Idempotency is the whole contract of this endpoint: the key is generated
+    # where the CALL happened, so a replay an hour later is recognisably the
+    # same call and returns outcome="duplicate" instead of a second row.
+    idempotency_key: str = Field(..., min_length=1)
+    # ISO-8601, the call's ORIGIN time — never the arrival time here.
+    recorded_at: str = Field(..., min_length=1)
+    actor_user_id: Optional[str] = None
+    tenant_id: str = Field(..., min_length=1)
+    app: Optional[str] = None
+    app_env: Optional[str] = None
+    model: str
+    provider: str
+    region: Optional[str] = None
+    input_tokens: int = 0
+    output_tokens: int = 0
+    cache_read_tokens: int = 0
+    cache_creation_tokens: int = 0
+    billing_mode: str
+    real_cost_eur: float
+    hypothetical_cost_eur: float
+    pricing_version: str
+    provider_metadata: Dict[str, Any] = Field(default_factory=dict)
+    audit_event_type: str
+    audit_payload: Dict[str, Any] = Field(default_factory=dict)
+
+
+@router.post("/usage/ai-call")
+async def post_ai_call_ledger(
+    body: AiCallLedgerRequest,
+    _claims: AuthClaims = Depends(require_service_token),
+) -> Dict[str, Any]:
+    """The one write the worker's money path cannot do without: one usage_events
+    row plus, only if that row was created here, its `activities` audit row.
+
+    Mirrors src.activity.ledger_db.insert_ai_call. Returns
+    {"outcome": "written"|"duplicate", "auditWritten": bool}.
+
+    Why this endpoint exists instead of reusing POST /v1/activity/log: that
+    route writes `activities` ONLY — it has no usage_events columns at all
+    (tokens, provider, billing_mode, real_cost, idempotency_key), stamps
+    timestamp = NOW() rather than the call's origin time, and 400s on an app id
+    outside its allowlist where this path deliberately books NULL + app_id_raw.
+    It is the counterpart of the audit half, not of the money row.
+
+    ERROR MAPPING IS LOAD-BEARING (see module docstring), with the opposite
+    polarity to the budget chain: a failure here MUST reach the caller as a
+    non-2xx. The caller then treats the call as still owed and its write-ahead
+    spool replays it. A failure dressed up as a 200 would ack the spool record
+    and turn a retryable miss into unbilled usage — the exact loss Schritt 1
+    was built to close.
+    """
+    from datetime import datetime as _dt, timezone as _tz
+
+    from src.activity.ledger_db import insert_ai_call
+
+    try:
+        recorded_at = _dt.fromisoformat(body.recorded_at.replace("Z", "+00:00"))
+    except (ValueError, TypeError):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid recorded_at: {body.recorded_at!r} (expected ISO-8601)",
+        )
+    if recorded_at.tzinfo is None:
+        recorded_at = recorded_at.replace(tzinfo=_tz.utc)
+
+    try:
+        result = await insert_ai_call(
+            idempotency_key=body.idempotency_key,
+            recorded_at=recorded_at,
+            actor_user_id=body.actor_user_id,
+            tenant_id=body.tenant_id,
+            app=body.app,
+            app_env=body.app_env,
+            model=body.model,
+            provider=body.provider,
+            region=body.region,
+            input_tokens=body.input_tokens,
+            output_tokens=body.output_tokens,
+            cache_read_tokens=body.cache_read_tokens,
+            cache_creation_tokens=body.cache_creation_tokens,
+            billing_mode=body.billing_mode,
+            real_cost_eur=body.real_cost_eur,
+            hypothetical_cost_eur=body.hypothetical_cost_eur,
+            pricing_version=body.pricing_version,
+            provider_metadata=body.provider_metadata,
+            audit_event_type=body.audit_event_type,
+            audit_payload=body.audit_payload,
+        )
+    except Exception as e:  # noqa: BLE001 — must surface as 5xx, never as a 200
+        logger.error(
+            "internal/usage/ai-call: LEDGER WRITE FAILED (call=%s app=%s model=%s "
+            "provider=%s): %s — answering 503 so the worker keeps the row in its "
+            "write-ahead spool",
+            body.idempotency_key, body.app, body.model, body.provider, e,
+        )
+        raise HTTPException(status_code=503, detail=f"ledger write failed: {e}") from e
+
+    return {
+        "outcome": "written" if result.created else "duplicate",
+        "auditWritten": result.audit_written,
+    }
+
+
+# ── 2c/C4: post-call deduction, project-plan half ────────────────────────
+
+class ProjectBudgetDeductRequest(BaseModel):
+    user_id: str
+    plan_id: str
+    project_id: str
+    cost_eur: float
+    allocate_limit_eur: Optional[float] = None
+    tenant_id: Optional[str] = None
+
+
+@router.post("/project-budgets/deduct")
+async def post_project_budget_deduct(
+    body: ProjectBudgetDeductRequest,
+    _claims: AuthClaims = Depends(require_service_token),
+) -> Dict[str, Any]:
+    """Mirrors src.billing.project_budgets_service.deduct — the project-plan
+    counterpart of the pre-existing POST /v1/budget/deduct, which covers only
+    monthly plans (`_require_month_interval`).
+
+    NOT IDEMPOTENT, like its monthly sibling: a read-modify-write on
+    project_budgets plus a FIFO draw through the TopUp lots, with no dedup key.
+    The caller must never retry it and never replay it — the deduction is bound
+    to "the ledger INSERT created the row in THIS attempt", which happens at
+    most once per call.
+    """
+    import uuid as _uuid
+
+    from src.billing.project_budgets_service import deduct
+
+    try:
+        uid = _uuid.UUID(body.user_id)
+    except (ValueError, AttributeError, TypeError):
+        raise HTTPException(status_code=400, detail=f"Invalid user id: {body.user_id!r}")
+
+    return await deduct(
+        uid,
+        body.plan_id,
+        body.project_id,
+        body.cost_eur,
+        allocate_limit_eur=body.allocate_limit_eur,
+        tenant_id=body.tenant_id,
+    )
+
+
+# ── 2c/C5: app-tier policy (who pays for this call-site) ─────────────────
+
+@router.get("/app-tier-policy")
+async def get_app_tier_policy(
+    app_id: str,
+    agent_id: Optional[str] = None,
+    app_env: Optional[str] = None,
+    _claims: AuthClaims = Depends(require_service_token),
+) -> Dict[str, Any]:
+    """Mirrors src.routing.app_tier_policy.lookup_policy_from_db.
+
+    200 {"policy": null} means "no matching row" — the normal case, and a real
+    answer. A DB failure must NOT be flattened into that: it propagates and
+    becomes a 5xx, so the caller can tell "no policy" from "could not ask" and
+    log the latter. The caller still fails open either way (this is a cost
+    optimisation, never a reason to 503 a live call), but only one of the two
+    is worth a warning — see _lookup_policy.
+    """
+    from src.routing.app_tier_policy import lookup_policy_from_db
+
+    policy = await lookup_policy_from_db(app_id, agent_id, app_env)
+    return {
+        "policy": None if policy is None else {
+            "target_tier": policy.target_tier,
+            "billing_account": policy.billing_account,
+        }
+    }
