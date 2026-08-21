@@ -13,8 +13,10 @@ platform-api directly. Nothing here is meant to be reachable from the public
 load balancer at all.
 
 Scope: principals (2a/C2), prepaid vision cap (2a/C6), the audit-event write
-path (2a/C4), and — added in Schritt 2b — the budget-gate chain: four read
-leaves plus idempotent trial provisioning.
+path (2a/C4), the budget-gate chain added in Schritt 2b (four read leaves plus
+idempotent trial provisioning), and two further per-user read leaves: the
+operator provider pin (users.provider_config) and the user's tenant
+(users.tenant_id).
 
 ERROR MAPPING IS LOAD-BEARING HERE. The budget chain has two deliberate
 fail-loud safeguards (AmbiguousProjectBudget, LegacyTopUpBalanceError). Both
@@ -135,6 +137,72 @@ async def post_lookup_user_by_email(
     # and since 404 is an ordinary response it would NOT trigger the caller's
     # fallback: every Engelmann identity would silently become "unknown".
     return {"id": str(uid) if uid is not None else None}
+
+
+# ── worker-DB-free reads: per-user provider pin ──────────────────────────
+
+@router.get("/users/{user_id}/provider-config")
+async def get_user_provider_config_route(
+    user_id: str,
+    _claims: AuthClaims = Depends(require_service_token),
+) -> Dict[str, Any]:
+    """Mirrors src.routing.user_provider_override.fetch_provider_config_from_db
+    — the operator-set backend pin (users.provider_config).
+
+    200 with providerConfig=null for "no such user / no pin", NOT 404: an
+    undeployed platform-api also answers 404, and the caller must be able to
+    tell "this user is not pinned" (authoritative) from "this route does not
+    exist" (fall back to the DB). Getting that wrong here is worse than on the
+    other read leaves — the caller is fail-CLOSED precisely because reading a
+    pin as absent would silently move a customer's traffic to another
+    jurisdiction.
+
+    A DB failure stays a 5xx on purpose. platform_client turns that into
+    PlatformUnavailable, which is exactly what the caller must hear: it then
+    falls back to its own direct connection or refuses the call. Flattening it
+    into providerConfig=null would be the silent mis-route.
+    """
+    import uuid as _uuid
+
+    from src.routing.user_provider_override import fetch_provider_config_from_db
+
+    try:
+        uid = _uuid.UUID(user_id)
+    except (ValueError, AttributeError, TypeError):
+        raise HTTPException(status_code=400, detail=f"Invalid user id: {user_id!r}")
+
+    return {"providerConfig": await fetch_provider_config_from_db(uid)}
+
+
+# ── worker-DB-free reads: user → tenant ──────────────────────────────────
+
+@router.get("/users/{user_id}/tenant")
+async def get_user_tenant_route(
+    user_id: str,
+    _claims: AuthClaims = Depends(require_service_token),
+) -> Dict[str, Any]:
+    """Mirrors src.api_auth.tenant_resolver.fetch_user_tenant_row.
+
+    Returns {found, tenantId} rather than a bare tenant id, because the caller
+    genuinely branches on the difference: resolve_tenant_for_user answers
+    "Unknown user" for found=false and "user has no tenant_id" for
+    found=true/tenantId=null, and those are two different 400s an operator
+    reads differently. Collapsing both into null would erase that.
+
+    200 in every one of those cases, not 404 — same reason as the pin route
+    above: 404 is reserved for "this route is not deployed".
+    """
+    import uuid as _uuid
+
+    from src.api_auth.tenant_resolver import fetch_user_tenant_row
+
+    try:
+        uid = _uuid.UUID(user_id)
+    except (ValueError, AttributeError, TypeError):
+        raise HTTPException(status_code=400, detail=f"Invalid user id: {user_id!r}")
+
+    row = await fetch_user_tenant_row(uid)
+    return {"found": row is not None, "tenantId": row["tenantId"] if row else None}
 
 
 # ── 2b/C2: which plan holds an allocated budget for this project? ────────

@@ -475,6 +475,14 @@ async def update_user(
         invalidate_cache(str(row["id"]))
         invalidate_cache(row["email"])
 
+    # Same reasoning for the tenant cache (ADR-0009 Schritt 2): moving a user
+    # between tenants must not keep writing to the old one for a whole TTL.
+    # This clears platform-api's own cache, which is where tenant resolution
+    # actually happens today; anything else converges via the TTL.
+    if body.tenant_id is not None:
+        from src.api_auth.tenant_resolver import invalidate_tenant_cache
+        invalidate_tenant_cache(str(row["id"]))
+
     return _user_row_to_dict(row)
 
 
