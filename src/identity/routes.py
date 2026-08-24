@@ -465,7 +465,28 @@ _REGISTER_LICENSE_PLAN_BY_APP = {"werking-check": "check-konto"}
 # VOR der Registrierung (~4,3 EUR auf Abo-Konten); der Pin erfasst alles AB dem
 # Konto (korrigierte Fassung, künftige Checks). Eine EU-residente Gratis-Phase
 # bräuchte zusätzlich den Pin des Sammelkontos — offene Operator-Entscheidung.
+#
+# Nur noch hinter explizitem Schalter (Rafael, 2026-08-24): der Geburts-Pin gilt
+# NUR auf der Prod-Bridge (SELF_REGISTER_BEDROCK_PIN_ENABLED=true in
+# docker-compose-prod-platform.yml). Auf Dev/Staging registriert sich der Nutzer
+# ohne Pin und läuft über die Abo-Konten — die Geburts-Regel hatte dort Test-,
+# Probe- und Durchlauf-Accounts auf Bedrock gepinnt und echtes AWS-Geld für
+# Testläufe verbrannt. Bewusst KEIN Host-Autodetect: der Schalter ist die
+# Zusage, nicht ein abgeleiteter Zustand.
 _SELF_REGISTER_PROVIDER_PIN = {"provider": "bedrock", "region": "eu-central-1"}
+
+
+def _self_register_provider_pin() -> Optional[Dict[str, str]]:
+    """Pin nur, wenn der Betreiber es für diese Bridge explizit zugesagt hat."""
+    enabled = os.getenv("SELF_REGISTER_BEDROCK_PIN_ENABLED", "").strip().lower() in (
+        "1", "true", "yes", "on",
+    )
+    if not enabled:
+        # Sichtbar lassen, dass hier bewusst ohne Residenz-Pin registriert wird —
+        # auf der Prod-Bridge wäre diese Zeile ein Konfigurationsfehler.
+        logger.info("self-register: Bedrock-Geburts-Pin AUS — Nutzer wird ohne provider_config angelegt")
+        return None
+    return _SELF_REGISTER_PROVIDER_PIN
 
 
 class RegisterRequest(BaseModel):
@@ -558,6 +579,7 @@ async def register(body: RegisterRequest) -> Dict[str, Any]:
                 # aus "dieser Akt kostete X EUR" ein "dieser Kunde kostete X
                 # EUR Akquise". Freiwillige Angabe durch die Registrierung,
                 # NULL außerhalb des Check-Trichters.
+                provider_pin = _self_register_provider_pin()
                 user_row = await conn.fetchrow(
                     """
                     INSERT INTO users (email, name, tenant_id, role, password_hash,
@@ -569,7 +591,7 @@ async def register(body: RegisterRequest) -> Dict[str, Any]:
                     body.name,
                     tenant_id,
                     password_hash,
-                    json.dumps(_SELF_REGISTER_PROVIDER_PIN),
+                    json.dumps(provider_pin) if provider_pin is not None else None,
                     body.checkId,
                     now,
                 )

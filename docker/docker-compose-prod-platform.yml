@@ -91,6 +91,10 @@ services:
       - FILTER_SENSITIVE_DATA=true
       - CORS_ORIGINS=["*"]
       - BRIDGE_SECRETS_DIR=/app/secrets
+      # Bedrock-Geburts-Pin fuer Selbstregistrierung (Residenzzusage) gilt NUR
+      # hier auf der Prod-Bridge (Rafael, 2026-08-24). Dev/Staging registriert
+      # ohne Pin — siehe src/identity/routes.py::_self_register_provider_pin.
+      - SELF_REGISTER_BEDROCK_PIN_ENABLED=true
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://localhost:8000/health"]
       interval: 30s
