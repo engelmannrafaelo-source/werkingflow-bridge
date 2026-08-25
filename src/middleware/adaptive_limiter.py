@@ -980,7 +980,13 @@ def estimate_request_tokens(body_dict: Dict[str, Any]) -> int:
 async def cache_request_body_dependency(request: Request) -> None:
     """
     FastAPI dependency: read+cache the body and estimate its token cost.
-    Performs NO capacity admission.
+    Performs NO capacity admission (that stays enforce_pool_admission()'s job
+    below). It DOES apply the central Bridge-wide input-SIZE gate (see
+    observe_input_limit() in input_limit_policy.py) — a different concern
+    from capacity: a single oversized request is rejected regardless of
+    current load. That gate is observe-only by default and only raises once
+    BRIDGE_INPUT_LIMIT_ENFORCE=true is set, so this stays a no-op in
+    practice until that flag flips.
 
     For endpoints whose execution path is not yet known at dependency time —
     /v1/research resolves subscription-pool vs. research-cloud only after an
@@ -1008,6 +1014,12 @@ async def cache_request_body_dependency(request: Request) -> None:
         return
 
     request.state.adaptive_est_tokens = estimate_request_tokens(body_dict)
+
+    # Central Bridge-wide input-size gate (observe-only by default — see
+    # src/middleware/input_limit_policy.py for the two-stage rollout).
+    # Reuses the estimate just computed above instead of re-measuring.
+    from src.middleware.input_limit_policy import observe_input_limit
+    observe_input_limit(request)
 
 
 async def enforce_pool_admission(request: Request) -> None:

@@ -53,6 +53,24 @@ async def test_cache_dependency_leaves_no_estimate_when_body_unreadable():
 
 
 @pytest.mark.asyncio
+async def test_cache_dependency_invokes_the_input_limit_gate(monkeypatch):
+    """cache_request_body_dependency() must run the Bridge-wide input-size
+    gate (input_limit_policy.observe_input_limit) right after it computes the
+    estimate — that reused estimate is the gate's only signal. Enforce is
+    on here so a huge body proves the wiring end-to-end without depending on
+    log output."""
+    from src.middleware.bridge_error import BridgeError
+
+    monkeypatch.setenv("BRIDGE_INPUT_LIMIT_ENFORCE", "true")
+    monkeypatch.setenv("BRIDGE_MAX_INPUT_TOKENS", "10")
+    req = _request({"messages": [{"role": "user", "content": "x" * 1000}]})
+    limiter = MagicMock()
+    with patch("src.middleware.adaptive_limiter.get_adaptive_limiter", return_value=limiter):
+        with pytest.raises(BridgeError):
+            await cache_request_body_dependency(req)
+
+
+@pytest.mark.asyncio
 async def test_admission_without_an_estimate_passes_through_loudly(caplog):
     """Pre-existing behaviour for an unreadable body — but it must be visible,
     not silent: an unmeasured request skipping admission is worth seeing."""

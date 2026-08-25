@@ -60,6 +60,7 @@ TYPE_UPSTREAM_ERROR = "upstream_error"
 TYPE_UPSTREAM_TIMEOUT = "upstream_timeout"
 TYPE_INTERNAL = "internal"
 TYPE_CONFIG = "configuration"
+TYPE_INPUT_TOO_LARGE = "input_too_large"
 
 # Reason codes — narrow, stable identifiers for why a 429 (or 500) was emitted.
 # These go into `error.reason` and drive panel aggregation / alerting.
@@ -80,6 +81,10 @@ REASON_INVALID_REQUEST = "upstream_invalid_request"
 # 500-class (contract violation — must be investigated)
 REASON_INTERNAL = "worker_internal_error"
 REASON_MISCONFIGURED = "worker_misconfigured"
+# Bridge-wide input-size gate (src/middleware/input_limit_policy.py). Dormant
+# until BRIDGE_INPUT_LIMIT_ENFORCE=true — see that module's docstring for the
+# two-stage rollout this reason code belongs to.
+REASON_INPUT_LIMIT_EXCEEDED = "bridge_input_limit_exceeded"
 
 
 def bridge_error(
@@ -213,6 +218,34 @@ def queue_timeout_error(
             "cap_tokens": cap_tokens,
             "inflight_tokens": inflight_tokens,
             "waited_s": round(waited_s, 2),
+        },
+    )
+
+
+def input_limit_exceeded_error(est_tokens: int, limit_tokens: int) -> JSONResponse:
+    """Request's estimated input exceeds the central Bridge-wide input limit.
+
+    Non-retryable (400): the identical request fails again — the caller must
+    shrink its input (less context, shorter documents) before retrying, a
+    backoff does not help. Currently only reachable when
+    BRIDGE_INPUT_LIMIT_ENFORCE=true (see src/middleware/input_limit_policy.py);
+    the default observe-only stage logs this situation but never builds this
+    response.
+    """
+    return bridge_error(
+        source=SOURCE_BRIDGE_INTERNAL,
+        error_type=TYPE_INPUT_TOO_LARGE,
+        reason=REASON_INPUT_LIMIT_EXCEEDED,
+        message=(
+            f"Input too large: ~{est_tokens:,} estimated tokens exceeds the "
+            f"Bridge-wide limit of {limit_tokens:,}. Reduce the request's "
+            f"input size (fewer/shorter context documents) before retrying."
+        ),
+        status_code=400,
+        retryable_override=False,
+        extra={
+            "est_tokens": est_tokens,
+            "limit_tokens": limit_tokens,
         },
     )
 
