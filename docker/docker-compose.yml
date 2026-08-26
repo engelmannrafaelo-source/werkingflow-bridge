@@ -166,7 +166,7 @@ services:
       - SKIP_SDK_VERIFICATION=true
       - RATE_LIMIT_ENABLED=false
       - DEFAULT_PRIVACY_MODE=none
-      - PRIVACY_SERVICE_URL=${PRIVACY_SERVICE_URL:-http://privacy-service:8100}
+      - PRIVACY_SERVICE_URL=${PRIVACY_SERVICE_URL:-http://100.65.149.39:8100}
       - PRIVACY_SERVICE_FALLBACK_URL=${PRIVACY_SERVICE_FALLBACK_URL:-}
       - AI_BRIDGE_URL_PROD_FALLBACK=${AI_BRIDGE_URL_PROD_FALLBACK:-}
     healthcheck:
@@ -297,7 +297,7 @@ services:
       - SKIP_SDK_VERIFICATION=true
       - RATE_LIMIT_ENABLED=false
       - DEFAULT_PRIVACY_MODE=none
-      - PRIVACY_SERVICE_URL=${PRIVACY_SERVICE_URL:-http://privacy-service:8100}
+      - PRIVACY_SERVICE_URL=${PRIVACY_SERVICE_URL:-http://100.65.149.39:8100}
       - PRIVACY_SERVICE_FALLBACK_URL=${PRIVACY_SERVICE_FALLBACK_URL:-}
       - AI_BRIDGE_URL_PROD_FALLBACK=${AI_BRIDGE_URL_PROD_FALLBACK:-}
     healthcheck:
@@ -428,7 +428,7 @@ services:
       - SKIP_SDK_VERIFICATION=true
       - RATE_LIMIT_ENABLED=false
       - DEFAULT_PRIVACY_MODE=none
-      - PRIVACY_SERVICE_URL=${PRIVACY_SERVICE_URL:-http://privacy-service:8100}
+      - PRIVACY_SERVICE_URL=${PRIVACY_SERVICE_URL:-http://100.65.149.39:8100}
       - PRIVACY_SERVICE_FALLBACK_URL=${PRIVACY_SERVICE_FALLBACK_URL:-}
       - AI_BRIDGE_URL_PROD_FALLBACK=${AI_BRIDGE_URL_PROD_FALLBACK:-}
     healthcheck:
@@ -559,7 +559,7 @@ services:
       - SKIP_SDK_VERIFICATION=true
       - RATE_LIMIT_ENABLED=false
       - DEFAULT_PRIVACY_MODE=none
-      - PRIVACY_SERVICE_URL=${PRIVACY_SERVICE_URL:-http://privacy-service:8100}
+      - PRIVACY_SERVICE_URL=${PRIVACY_SERVICE_URL:-http://100.65.149.39:8100}
       - PRIVACY_SERVICE_FALLBACK_URL=${PRIVACY_SERVICE_FALLBACK_URL:-}
       - AI_BRIDGE_URL_PROD_FALLBACK=${AI_BRIDGE_URL_PROD_FALLBACK:-}
     healthcheck:
@@ -576,71 +576,6 @@ services:
   # =============================================================================
   # Privacy + PDF Service (HEAVY — single instance, Presidio + spaCy + Docling)
   # =============================================================================
-  privacy-service:
-    build:
-      context: ..
-      dockerfile: docker/Dockerfile.privacy-pdf
-      args:
-        GIT_COMMIT: ${GIT_COMMIT:-unknown}
-    container_name: wt-privacy-pdf-service
-    expose:
-      - "8100"
-    # Tailscale-only host publish so the PROD bridge (server2, 7GB host can't run
-    # the ~13GB Flair model) can route smart-anonymize here. Bound to the dev
-    # Tailscale IP — NOT 0.0.0.0 — so it stays inside the private mesh.
-    ports:
-      - "100.112.98.39:8100:8100"
-    deploy:
-      resources:
-        limits:
-          memory: 16G
-        reservations:
-          memory: 4G
-    environment:
-      - TZ=Europe/Vienna
-      - LOG_LEVEL=INFO
-      - PRIVACY_ENABLED=true
-      - PRIVACY_LANGUAGE=de
-      - PRIVACY_LOG_DETECTIONS=false
-      # GPU rollout (2026-07-28): Flair NER can run on CUDA instead of CPU —
-      # see src/privacy/flair_recognizer.py. Unset here on purpose: this
-      # compose file builds Dockerfile.privacy-pdf with the default
-      # TORCH_VARIANT=cpu (no GPU on this host), so PRIVACY_DEVICE defaults
-      # to "auto" -> CPU, i.e. unchanged behaviour. A GPU host builds the
-      # image with --build-arg TORCH_VARIANT=cuda, sets PRIVACY_DEVICE=cuda
-      # (fails loud instead of silently running on CPU if no GPU is visible
-      # there), and raises SMART_ANONYMIZE_MAX_CONCURRENT together with
-      # SMART_ANONYMIZE_EXECUTOR_WORKERS (both default to today's CPU-era
-      # value of 2 if unset) — via its own env/compose override, not here.
-      # ONE worker process: each uvicorn worker holds its own copy of the Flair
-      # XLM-R-large stack (~5.5-7GB warm, growing). With 2 workers the combined
-      # baseline (~12.6GB observed) left so little of the 16G cgroup that one
-      # large smart-anonymize request (>10GB peak RSS) got OOM-killed
-      # mid-request (dmesg 2026-07-03 09:39:48Z; 15 worker deaths on 2026-07-02
-      # alone) — callers saw "Server disconnected". Concurrency inside the
-      # process stays: Presidio thread pool + DOCLING_THREADS release the GIL.
-      - UVICORN_WORKERS=1
-      - DOCLING_THREADS=4
-      # Used by the PDF-conversion adapter (markdown prompt self-call via nginx)
-      - BRIDGE_SELF_URL=http://nginx:80/v1/chat/completions
-      - API_KEY=${API_KEY:-}
-      - CONVERTAPI_SECRET=${CONVERTAPI_SECRET}
-      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
-      # Image/Vision descriptions (describe_images) require a DIRECT Anthropic
-      # API key — VisionProvider reads ONLY this var (never ANTHROPIC_API_KEY).
-      # Same aliasing the worker services use; without it every describe_images
-      # call raised ValueError, surfaced misleadingly as a 503 "at capacity".
-      - ANTHROPIC_VISION_API_KEY=${ANTHROPIC_API_KEY:-}
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8100/health"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 240s
-    restart: unless-stopped
-    networks:
-      - bridge-net
-
   # =============================================================================
   # Metrics Reader — decoupled read-only historical metrics service
   # =============================================================================
