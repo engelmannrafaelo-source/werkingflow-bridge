@@ -552,8 +552,19 @@ async def _activate_subscription(
     existing row and returns it untouched. Mollie's create_subscription
     call is only made on the first webhook firing — after the row exists,
     we return the persisted state.
+
+    Provisions the plan's monthly budget pot alongside the row (see
+    _ensure_monthly_budget_pot) — this is the real paid-checkout path, so a
+    subscription activated here without a pot is the exact "Kein KI-Guthaben
+    despite active paid plan" bug the helper exists to prevent.
     """
     pool = get_pool()
+
+    # Map plan -> app (mirrors plans.py PLANS[*].app_id but kept local for
+    # speed; should diverge only when a plan_id intentionally serves multiple
+    # apps, which the schema does not currently allow).
+    from src.budget.plans import get_plan
+    app_id = get_plan(plan_id).app_id
 
     # Idempotency probe FIRST. If we already activated this payment, return
     # the existing row without calling Mollie a second time.
@@ -567,6 +578,9 @@ async def _activate_subscription(
             first_payment_id,
         )
         if existing:
+            # Self-heal: a payment activated before the pot became mandatory
+            # on this path never got one.
+            await _ensure_monthly_budget_pot(conn, uuid.UUID(user_id), plan_id)
             return _serialize_subscription(existing)
 
     # First-time activation. Call Mollie to create the recurring subscription.
@@ -580,12 +594,6 @@ async def _activate_subscription(
         webhook_url=config.mollie_webhook_url,
         metadata={"userId": user_id, "planId": plan_id},
     )
-
-    # Map plan -> app (mirrors plans.py PLANS[*].app_id but kept local for
-    # speed; should diverge only when a plan_id intentionally serves multiple
-    # apps, which the schema does not currently allow).
-    from src.budget.plans import get_plan
-    app_id = get_plan(plan_id).app_id
 
     sub_uuid = uuid.uuid4()
     async with pool.acquire() as conn:
@@ -604,6 +612,7 @@ async def _activate_subscription(
             customer_id, sub_resp["subscriptionId"], first_payment_id, seats,
         )
         if row:
+            await _ensure_monthly_budget_pot(conn, uuid.UUID(user_id), plan_id)
             await log_billing_event(
                 "subscription.activated",
                 user_id=user_id,
@@ -691,32 +700,45 @@ async def list_subscriptions(user_id: str) -> List[Dict[str, Any]]:
 ADMIN_GRANT_TRIAL_DAYS = 7
 
 
-def _budget_plan_for_grant(plan_id: str) -> Any:
-    """Which plan's monthly pot must an admin grant provision? None = correctly none.
+async def _ensure_monthly_budget_pot(conn: Any, user_uuid: uuid.UUID, plan_id: str) -> None:
+    """Provision plan_id's monthly budget pot if this plan requires one — idempotent.
 
-    Returns None for the two cases where the absence of a monthly pot is the
-    right state rather than a missing one:
-      * interval != 'month' (today energy-project): those pots are per-project
-        and live in project_budgets_service, keyed by project_id. A monthly lane
-        would sit there unread — see budget/routes.py:_require_month_interval.
-      * trial plans: their reset_at doubles as the expiry date, so provisioning
-        one here with a 30-day anchor would stretch the trial. evaluate_budget
-        provisions them via _provision_trial.
+    The single gate every subscription creation/activation path calls once a
+    row is written (or found) with status='active' — an active subscription
+    without a budget pot is access on paper only: the app renders "Kein
+    KI-Guthaben" and every AI call is refused, while login and /dashboard stay
+    green (the failure hides one layer below every check an operator runs).
+    Until 2026-08-26 only the seeding path (provision_subscription) provisioned
+    the pot on its insert branch — grant_subscription, provision_subscription's
+    idempotent-return branch, and the real Mollie activation path
+    (_activate_subscription) all produced that silent dud.
 
-    An unknown plan_id propagates get_plan's ValueError. The plans catalog is the
-    SSoT for what can be sold; a plan we cannot price is one we cannot budget, and
-    the resulting subscription could never serve an AI call (evaluate_budget would
-    raise on it too). Failing at grant time makes that visible immediately instead
-    of at the customer's first prompt. Note the admin route's enum allowlist is
-    wider than the catalog (it still carries safety-project for historical rows) —
-    granting such a plan now fails loudly by design.
+    No-ops for two cases where the absence of a pot is the right state:
+      * trial plans — their reset_at doubles as the expiry date, so writing a
+        30-day anchor here would silently stretch the trial. They provision
+        themselves in evaluate_budget via _provision_trial.
+      * interval != 'month' (today energy-project) — those pots are per-project
+        and live in project_budgets_service, keyed by project_id. A monthly
+        lane would sit there unread — see budget/routes.py:_require_month_interval.
+
+    _provision_plan_budget only inserts when the lane is absent, so calling
+    this against an already-active subscription safely repairs a missing pot
+    without ever resetting a live one — that's what makes it safe to call on
+    every idempotent "subscription already exists" return path, not just on
+    fresh inserts.
+
+    An unknown plan_id propagates get_plan's ValueError. The plans catalog is
+    the SSoT for what can be sold; a plan we cannot price is one we cannot
+    budget, and the resulting subscription could never serve an AI call
+    (evaluate_budget would raise on it too) — failing here surfaces that at
+    grant/activation time instead of at the customer's first prompt.
     """
     from src.budget.plans import get_plan
 
     plan = get_plan(plan_id)  # raises ValueError for unknown plan
     if plan.trial or plan.interval != "month":
-        return None
-    return plan
+        return
+    await _provision_plan_budget(conn, user_uuid, plan)
 
 
 async def grant_subscription(
@@ -757,8 +779,8 @@ async def grant_subscription(
         the constraint, the metadata says WHY the row exists.
       * the plan's monthly budget pot is provisioned with the row, and a
         'subscription.granted' event is appended to the audit trail. Both were
-        missing until 2026-08-26 — see _budget_plan_for_grant and the call
-        sites below for which plans get a pot and why the others must not.
+        missing until 2026-08-26 — see _ensure_monthly_budget_pot for which
+        plans get a pot and why the others must not.
 
     Returns (serialized_subscription, created).
     Raises ValueError on a malformed user_id (caller maps to 400).
@@ -796,11 +818,8 @@ async def grant_subscription(
                 # Self-heal, mirroring provision_subscription's license repair:
                 # a re-grant tops up a pot that is missing on an already-active
                 # subscription (every grant issued before 2026-08-26 left one
-                # behind). _provision_plan_budget only inserts when the lane is
-                # absent, so an in-use pot is never reset by this.
-                plan = _budget_plan_for_grant(existing["plan_id"])
-                if plan is not None:
-                    await _provision_plan_budget(conn, uid, plan)
+                # behind).
+                await _ensure_monthly_budget_pot(conn, uid, existing["plan_id"])
                 return _serialize_subscription(existing), False
 
             row = await conn.fetchrow(
@@ -839,9 +858,7 @@ async def grant_subscription(
             #
             # Same connection as the INSERT: pot and subscription commit together
             # or not at all.
-            plan = _budget_plan_for_grant(plan_id)
-            if plan is not None:
-                await _provision_plan_budget(conn, uid, plan)
+            await _ensure_monthly_budget_pot(conn, uid, plan_id)
 
     # After COMMIT, never inside it: log_billing_event writes on a second pooled
     # connection and its FK to subscriptions(id) cannot see an uncommitted row.
@@ -1651,6 +1668,11 @@ async def provision_subscription(
             user_uuid, plan_id,
         )
         if existing:
+            # Self-heal: an active sub provisioned before the pot became
+            # mandatory on this path (or via a caller that skipped it) never
+            # got one. _ensure_monthly_budget_pot only inserts when the lane
+            # is absent, so an in-use pot is never touched.
+            await _ensure_monthly_budget_pot(conn, user_uuid, plan_id)
             return _serialize_subscription(existing)
 
         # No active subscription yet. Insert with synthetic Mollie identifiers.
@@ -1678,7 +1700,7 @@ async def provision_subscription(
         )
 
         if row:
-            await _provision_plan_budget(conn, user_uuid, plan)
+            await _ensure_monthly_budget_pot(conn, user_uuid, plan_id)
             sub_dict = _serialize_subscription(row)
             sub_id = sub_dict["id"]
         else:

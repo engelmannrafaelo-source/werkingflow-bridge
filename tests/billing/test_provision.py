@@ -3,10 +3,13 @@ Tests for POST /v1/billing/subscription/provision and provision_subscription().
 
 Coverage:
 - provision_subscription: happy path — inserts sub + budget, logs event
-- provision_subscription: idempotent — existing active sub returned as-is
+- provision_subscription: idempotent — existing active sub returned as-is,
+  budget pot self-healed
 - provision_subscription: ON CONFLICT race resolution — returns winner's row
 - provision_subscription: trial plan rejected with ValueError
 - provision_subscription: unknown plan rejected with ValueError
+- provision_subscription: project-interval plan (energy-project) gets NO
+  monthly pot (project_budgets_service owns it)
 - POST /v1/billing/subscription/provision: 201 happy path
 - POST /v1/billing/subscription/provision: 409 idempotent (existing active sub)
 - POST /v1/billing/subscription/provision: 400 trial plan
@@ -32,6 +35,30 @@ from fastapi.testclient import TestClient
 from src.config import config
 from src.billing.billing_service import provision_subscription
 from src.billing.routes import router
+from src.budget.plans import PLANS, PlanConfig
+
+
+# The catalog is a runtime cache filled from the plans table at Bridge startup;
+# unit tests seed it directly so they need no database. Mirrors the relevant
+# rows of migration 020_plans_table.sql / 045_report_budget_100.sql.
+_TEST_PLANS = {
+    "trial": PlanConfig("trial", "werking-report", "7-Tage-Test", 0, "month", 5,
+                        "", trial=True),
+    "report-standard": PlanConfig("report-standard", "werking-report", "Standard",
+                                  250, "month", 100, ""),
+    "energy-project": PlanConfig("energy-project", "werking-energy", "Energy-Projekt",
+                                 1000, "project", 100, ""),
+}
+
+
+@pytest.fixture(autouse=True)
+def _seeded_plan_catalog():
+    original = dict(PLANS)
+    PLANS.clear()
+    PLANS.update(_TEST_PLANS)
+    yield
+    PLANS.clear()
+    PLANS.update(original)
 
 
 # ---------------------------------------------------------------------------
@@ -104,6 +131,22 @@ def _sub_row(**overrides):
     return row
 
 
+def _billing_precheck_row(account_type="test"):
+    """Mock row for _assert_complete_billing_address's tenant lookup — the
+    first fetchrow provision_subscription issues, before it ever looks at
+    subscriptions. account_type='test' sits in the gate-exemption set, so no
+    billing_* field needs to be non-empty for the precheck to pass."""
+    defaults = {
+        "tenant_id": uuid.uuid4(),
+        "account_type": account_type,
+        "billing_name": None, "billing_street": None, "billing_city": None,
+        "billing_postcode": None, "billing_country": None,
+    }
+    row = MagicMock()
+    row.__getitem__ = lambda self, k: defaults[k]
+    return row
+
+
 # ---------------------------------------------------------------------------
 # provision_subscription — service-layer unit tests
 # ---------------------------------------------------------------------------
@@ -111,22 +154,29 @@ def _sub_row(**overrides):
 class TestProvisionSubscriptionService:
     async def test_returns_existing_active_sub_idempotent(self):
         """Existing active sub → returned as-is, no new subscription INSERT. But the
-        app_license IS still ensured (idempotent UPSERT) so a user with a sub but a
-        missing license gets repaired."""
+        app_license IS still ensured (idempotent UPSERT), and the budget pot is
+        self-healed (see _ensure_monthly_budget_pot) — a sub provisioned before
+        the pot became mandatory on this path, or via a caller that skipped it
+        (e.g. grant_subscription before 2026-08-26), never got one. Both writes
+        are idempotent UPSERTs, so a user with an already-complete state is
+        left untouched in practice — this test only proves the calls happen."""
         uid = str(uuid.uuid4())
         existing = _sub_row(plan_id="report-standard")
 
-        pool, conn = _mock_pool(existing)  # fetchrow[0] = existing active sub
+        # fetchrow[0] = billing-address precheck, fetchrow[1] = existing active sub
+        pool, conn = _mock_pool(_billing_precheck_row(), existing)
         with patch("src.billing.billing_service.get_pool", return_value=pool), \
              patch("src.billing.billing_service.log_billing_event", new_callable=AsyncMock) as mock_log:
             result = await provision_subscription(uid, "report-standard", 1)
 
         assert result["status"] == "active"
         assert result["planId"] == "report-standard"
-        # Only the app_license UPSERT runs on the idempotent path — no subscription
-        # INSERT, no budget provision.
-        assert conn.execute.call_count == 1
-        assert "app_licenses" in conn.execute.call_args_list[0][0][0]
+        # No subscription INSERT on the idempotent path — but app_license UPSERT
+        # AND budget-pot self-heal both run.
+        assert conn.execute.call_count == 2
+        executed_sql = [c[0][0] for c in conn.execute.call_args_list]
+        assert any("app_licenses" in s for s in executed_sql)
+        assert any("user_budgets" in s for s in executed_sql)
         # No billing event logged for idempotent return
         mock_log.assert_not_called()
 
@@ -135,9 +185,9 @@ class TestProvisionSubscriptionService:
         uid = str(uuid.uuid4())
         new_sub = _sub_row(plan_id="report-standard")
 
-        # fetchrow[0] = None (no existing active sub)
-        # fetchrow[1] = new_sub (INSERT RETURNING)
-        pool, conn = _mock_pool(None, new_sub)
+        # fetchrow[0] = billing-address precheck, fetchrow[1] = None (no existing
+        # active sub), fetchrow[2] = new_sub (INSERT RETURNING)
+        pool, conn = _mock_pool(_billing_precheck_row(), None, new_sub)
         with patch("src.billing.billing_service.get_pool", return_value=pool), \
              patch("src.billing.billing_service.log_billing_event", new_callable=AsyncMock) as mock_log:
             result = await provision_subscription(uid, "report-standard", 1)
@@ -161,10 +211,11 @@ class TestProvisionSubscriptionService:
         uid = str(uuid.uuid4())
         winner = _sub_row(plan_id="report-standard")
 
-        # fetchrow[0] = None (pre-check: no active sub)
-        # fetchrow[1] = None (INSERT returns nothing — ON CONFLICT DO NOTHING)
-        # fetchrow[2] = winner (fallback SELECT)
-        pool, conn = _mock_pool(None, None, winner)
+        # fetchrow[0] = billing-address precheck
+        # fetchrow[1] = None (pre-check: no active sub)
+        # fetchrow[2] = None (INSERT returns nothing — ON CONFLICT DO NOTHING)
+        # fetchrow[3] = winner (fallback SELECT)
+        pool, conn = _mock_pool(_billing_precheck_row(), None, None, winner)
         with patch("src.billing.billing_service.get_pool", return_value=pool), \
              patch("src.billing.billing_service.log_billing_event", new_callable=AsyncMock) as mock_log:
             result = await provision_subscription(uid, "report-standard", 1)
@@ -192,7 +243,7 @@ class TestProvisionSubscriptionService:
         uid = str(uuid.uuid4())
         new_sub = _sub_row(plan_id="report-standard")
 
-        pool, conn = _mock_pool(None, new_sub)
+        pool, conn = _mock_pool(_billing_precheck_row(), None, new_sub)
         with patch("src.billing.billing_service.get_pool", return_value=pool), \
              patch("src.billing.billing_service.log_billing_event", new_callable=AsyncMock):
             await provision_subscription(uid, "report-standard", 1)
@@ -204,6 +255,24 @@ class TestProvisionSubscriptionService:
         assert entry["report-standard"]["limitEur"] == 100.0  # plans table (migration 045)
         assert entry["report-standard"]["usedEur"] == 0.0
 
+    async def test_project_interval_plan_gets_no_monthly_pot(self):
+        """A project-interval plan's budget lives in project_budgets_service, not
+        user_budgets — before _ensure_monthly_budget_pot this path called
+        _provision_plan_budget unconditionally for any non-trial plan, silently
+        writing an unreadable phantom monthly entry for energy-project too."""
+        uid = str(uuid.uuid4())
+        new_sub = _sub_row(app_id="werking-energy", plan_id="energy-project")
+
+        pool, conn = _mock_pool(_billing_precheck_row(), None, new_sub)
+        with patch("src.billing.billing_service.get_pool", return_value=pool), \
+             patch("src.billing.billing_service.log_billing_event", new_callable=AsyncMock):
+            result = await provision_subscription(uid, "energy-project", 1)
+
+        assert result["status"] == "active"
+        # Only the app_license UPSERT runs — no user_budgets write.
+        assert conn.execute.call_count == 1
+        assert "app_licenses" in conn.execute.call_args_list[0][0][0]
+
 
 # ---------------------------------------------------------------------------
 # POST /v1/billing/subscription/provision — HTTP endpoint tests
@@ -214,8 +283,8 @@ class TestProvisionEndpoint:
         uid = str(uuid.uuid4())
         sub = _sub_row(plan_id="report-standard")
 
-        # fetchrow[0]=None (no existing), fetchrow[1]=sub (INSERT)
-        pool, _ = _mock_pool(None, sub)
+        # fetchrow[0]=billing precheck, fetchrow[1]=None (no existing), fetchrow[2]=sub (INSERT)
+        pool, _ = _mock_pool(_billing_precheck_row(), None, sub)
         with patch("src.billing.billing_service.get_pool", return_value=pool), \
              patch("src.billing.billing_service.log_billing_event", new_callable=AsyncMock):
             resp = client.post(
@@ -234,7 +303,7 @@ class TestProvisionEndpoint:
         uid = str(uuid.uuid4())
         existing = _sub_row(plan_id="report-standard")
 
-        pool, _ = _mock_pool(existing)
+        pool, _ = _mock_pool(_billing_precheck_row(), existing)
         with patch("src.billing.billing_service.get_pool", return_value=pool), \
              patch("src.billing.billing_service.log_billing_event", new_callable=AsyncMock):
             resp = client.post(

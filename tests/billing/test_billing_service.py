@@ -34,6 +34,7 @@ from src.billing.billing_service import (
     change_subscription,
 )
 from src.billing.mollie_adapter import FakeMollieAdapter, reset_mollie_adapter
+from src.budget.plans import PLANS, PlanConfig
 
 
 # ---------------------------------------------------------------------------
@@ -349,8 +350,31 @@ class TestHandleWebhook:
 # ---------------------------------------------------------------------------
 
 class TestActivateSubscription:
+    # _activate_subscription resolves the plan (app_id, and — since 2026-08-26 —
+    # the monthly budget pot) via the PLANS runtime cache, which is normally
+    # filled from the plans table at Bridge startup. Unit tests seed it
+    # directly so they need no database. Mirrors the report-standard row of
+    # migration 020_plans_table.sql / 045_report_budget_100.sql.
+    @pytest.fixture(autouse=True)
+    def _seeded_plan_catalog(self):
+        original = dict(PLANS)
+        PLANS.clear()
+        PLANS.update({
+            "report-standard": PlanConfig(
+                "report-standard", "werking-report", "Standard", 250, "month", 100, "",
+            ),
+        })
+        yield
+        PLANS.clear()
+        PLANS.update(original)
+
     async def test_idempotent_on_duplicate_webhook(self):
-        """Second call with same first_payment_id must return existing row, no Mollie call."""
+        """Second call with same first_payment_id must return existing row, no Mollie call.
+
+        Also self-heals a missing budget pot on the found row (see
+        _ensure_monthly_budget_pot) — a real-Mollie subscription activated
+        before that helper existed would otherwise stay pot-less forever,
+        since a retried webhook is the only thing that ever revisits it."""
         existing_row = _sub_row(status="active", plan_id="report-standard")
         pool, conn = _mock_pool(existing_row)
 
@@ -367,9 +391,13 @@ class TestActivateSubscription:
         assert result["status"] == "active"
         # Mollie.create_subscription must NOT have been called (idempotency path)
         assert len(fake_mollie._subscriptions) == 0
+        budget_sql = [c[0][0] for c in conn.execute.call_args_list if "user_budgets" in c[0][0]]
+        assert len(budget_sql) == 1
 
     async def test_activates_new_subscription(self):
-        """First-time activation: creates Mollie subscription, inserts row, logs event."""
+        """First-time activation: creates Mollie subscription, inserts row, logs
+        event, and provisions the plan's monthly budget pot (the real-checkout
+        twin of grant_subscription's fix — see _ensure_monthly_budget_pot)."""
         new_row = _sub_row(status="active", plan_id="report-standard",
                            mollie_subscription_id="sub_new_123")
         # probe returns None (no existing row), insert returns the new row
@@ -396,6 +424,9 @@ class TestActivateSubscription:
         mock_log.assert_called_once()
         assert mock_log.call_args[0][0] == "subscription.activated"
         mock_inv.assert_called_once()
+        # The monthly budget pot was provisioned alongside the new row.
+        budget_sql = [c[0][0] for c in conn.execute.call_args_list if "user_budgets" in c[0][0]]
+        assert len(budget_sql) == 1
 
 
 # ---------------------------------------------------------------------------
