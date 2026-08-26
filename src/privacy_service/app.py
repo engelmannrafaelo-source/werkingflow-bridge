@@ -34,6 +34,19 @@ from src.privacy_service.image_describer import (
     append_descriptions_to_markdown,
 )
 from src.privacy_service.image_triage import plan_image_descriptions
+from src.vision_provider import vision_available
+
+# Eine Meldung, drei Verwender (Pre-Flight in beiden Convert-Endpoints +
+# Startup-Log): describe_images ist eine Zusage, keine Option mit Fallback.
+# Am 26.08.2026 stand auf gpu-privacy-1 ein LEERER Key (Compose-Default
+# ``${ANTHROPIC_API_KEY:-}`` bei fehlendem Host-Wert) — jede bildhaltige
+# Konvertierung starb erst NACH der Docling-Arbeit als unhandled ValueError,
+# 500 ohne Aussage, drei Kundenanlaeufe lang unerkannt.
+_VISION_KEY_MISSING_MSG = (
+    "ANTHROPIC_VISION_API_KEY ist auf dieser Privacy-Instanz nicht gesetzt oder leer — "
+    "describe_images=true kann nicht bedient werden. Host-.env pruefen (ANTHROPIC_API_KEY) "
+    "und den Container neu erstellen; Konvertierung OHNE Bildbeschreibung ist davon nicht betroffen."
+)
 
 
 def _truthy(value: Any) -> bool:
@@ -42,6 +55,13 @@ def _truthy(value: Any) -> bool:
 
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 logger = logging.getLogger("privacy-service")
+
+# Sichtbarkeit ab Sekunde 1 statt beim ersten Kundenfehler: ein leerer Key ist
+# ein Deploy-Fehler, kein Laufzeit-Pech. Bewusst KEIN Startup-Abbruch — die
+# Text-/Tabellen-Konvertierung ohne Vision bleibt voll funktionsfaehig, und ein
+# harter Exit naehme sie mit in den Ausfall.
+if not vision_available():
+    logger.critical(_VISION_KEY_MISSING_MSG)
 
 # Docling conversions are CPU/memory-heavy and ran fully unbounded on the default
 # executor — several large multi-image PDFs converting at once has repeatedly
@@ -261,6 +281,16 @@ async def convert_pdf_service_endpoint(request: Request):
         file = form.get("file")
         want_descriptions = _truthy(form.get("describe_images"))
         describe_prompt = form.get("describe_prompt") or ""
+        # Pre-Flight VOR der Docling-Arbeit (s. _VISION_KEY_MISSING_MSG):
+        # JSONResponse statt raise, weil dieser Legacy-Endpoint komplett im
+        # breiten try/except haengt und ein raise dort als generischer 500
+        # ohne die Meldung enden wuerde.
+        if want_descriptions and not vision_available():
+            logger.error(f"convert-pdf abgelehnt: {_VISION_KEY_MISSING_MSG}")
+            return JSONResponse(
+                status_code=500,
+                content={"status": "error", "error": _VISION_KEY_MISSING_MSG},
+            )
         if not file:
             return JSONResponse(
                 status_code=400,
@@ -423,6 +453,14 @@ async def document_convert_endpoint(request: Request):
     want_descriptions = _truthy(extras.get("describe_images"))
     describe_prompt = extras.get("describe_prompt") or ""
 
+    # Pre-Flight VOR der Docling-Arbeit (s. _VISION_KEY_MISSING_MSG): der
+    # Aufrufer hat Beschreibungen bestellt — ohne Key ist das ein Deploy-
+    # Fehler, der sofort und mit Ansage scheitern muss, nicht nach Sekunden
+    # Konvertierungsarbeit als ValueError ohne Response-Body.
+    if want_descriptions and not vision_available():
+        logger.error(f"document/convert abgelehnt: {_VISION_KEY_MISSING_MSG}")
+        raise HTTPException(status_code=500, detail=_VISION_KEY_MISSING_MSG)
+
     t_start = _time.time()
     loop = asyncio.get_event_loop()
     chain = _get_chain()
@@ -458,9 +496,17 @@ async def document_convert_endpoint(request: Request):
         to_describe, skipped_labels, triage_meta = await plan_image_descriptions(
             result.images, triage_prompt=triage_prompt
         )
-        descriptions = await describe_images(
-            to_describe, context=filename, describe_prompt=describe_prompt
-        )
+        try:
+            descriptions = await describe_images(
+                to_describe, context=filename, describe_prompt=describe_prompt
+            )
+        except ValueError as e:
+            # Konfigurationsfehler aus dem Vision-Provider (der Pre-Flight oben
+            # faengt den leeren Key; hier landet, was der Provider sonst noch
+            # als Misskonfiguration meldet). Nie wieder als unhandled 500 ohne
+            # Response-Body — der Aufrufer braucht die Meldung.
+            logger.error(f"document/convert vision misconfiguration: {e}", exc_info=True)
+            raise HTTPException(status_code=500, detail=str(e))
         # Keep triaged-out figures present in the document (fail-loud, no drop).
         for name, label in skipped_labels.items():
             descriptions[name] = f"_[nicht detailliert analysiert — {label}]_"

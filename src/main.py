@@ -6990,6 +6990,21 @@ async def convert_document_endpoint(
         _attr = extract_attribution_context(request)
         from src.activity.ai_call_writer import persist_ai_call_activity
         _status = "success" if result.status_code < 400 else "error"
+        # Fehler-TEXT mitschreiben, nicht nur den Statuscode: der
+        # Kundenaktivitaets-Alarm zeigte am 26.08.2026 "3x Code 500, KEINE
+        # Meldung gespeichert" — der eigentliche Befund (leerer Vision-Key auf
+        # gpu-privacy-1) stand nur im Response-Body und musste per Log-Forensik
+        # rekonstruiert werden. Der Body ist hier eine fertige JSONResponse;
+        # ihr gerendertes .body traegt {"error": ...} bzw. FastAPIs {"detail": ...}.
+        _err_msg = None
+        if _status == "error":
+            try:
+                _body = json.loads(result.body)
+                _raw = _body.get("error") or _body.get("detail")
+                if _raw:
+                    _err_msg = str(_raw)[:500]
+            except Exception:
+                _err_msg = None  # silent-ok: kaputter Body aendert nichts daran, dass Code+Status persistiert werden
         await persist_ai_call_activity(
             provider=PROVIDER_LOCAL,
             app_id=_attr.get("app_id"),
@@ -7002,6 +7017,7 @@ async def convert_document_endpoint(
             status=_status,
             duration_ms=int((time.time() - _start) * 1000),
             error_code=str(result.status_code) if _status == "error" else None,
+            error_message=_err_msg,
             app_env=_attr.get("app_env"),
         )
     except Exception as _te:

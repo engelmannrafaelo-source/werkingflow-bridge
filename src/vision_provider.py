@@ -446,3 +446,16 @@ def get_vision_provider() -> VisionProvider:
     if _vision_provider is None:
         _vision_provider = VisionProvider()
     return _vision_provider
+
+
+def vision_available() -> bool:
+    """True genau dann, wenn ein NICHT-LEERER ANTHROPIC_VISION_API_KEY gesetzt ist.
+
+    Bewusst gegen os.getenv statt gegen das Provider-Singleton geprueft: die
+    Compose-Zeile ``ANTHROPIC_VISION_API_KEY=${ANTHROPIC_API_KEY:-}`` liefert
+    bei fehlendem Host-Wert einen LEEREN String — die Variable existiert dann,
+    traegt aber nichts. Genau dieser Zustand liess am 26.08.2026 auf
+    gpu-privacy-1 jede describe_images-Anfrage erst NACH der Docling-Arbeit an
+    einem unhandled ValueError sterben (Kunde: werking-energy, 3x 500).
+    """
+    return bool(os.getenv("ANTHROPIC_VISION_API_KEY"))

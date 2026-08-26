@@ -133,3 +133,71 @@ def test_convert_and_anonymize_basic_mode_no_pii(client):
     assert "anonymized_markdown" in body
     assert "mapping" in body
     assert body["privacy_mode"] == "basic"
+
+
+# ─── Vision-Key Pre-Flight (26.08.2026) ─────────────────────────────────────
+#
+# Der Vorfall, fuer den diese Tests existieren: auf gpu-privacy-1 stand ein
+# LEERER ANTHROPIC_VISION_API_KEY (Compose-Default ``${ANTHROPIC_API_KEY:-}``
+# ohne Host-Wert). Jede describe_images-Anfrage lief erst durch die komplette
+# Docling-Konvertierung und starb dann als unhandled ValueError — 500 ohne
+# Response-Body, drei Kundenanlaeufe (werking-energy) lang unerkannt.
+# Der Pre-Flight lehnt SOFORT und MIT Ansage ab.
+
+
+def test_document_convert_describe_images_without_vision_key(client, monkeypatch):
+    monkeypatch.delenv("ANTHROPIC_VISION_API_KEY", raising=False)
+    resp = client.post(
+        "/document/convert",
+        files={"file": ("table.csv", b"a,b\n1,2\n", "text/csv")},
+        data={"describe_images": "true"},
+    )
+    assert resp.status_code == 500
+    assert "ANTHROPIC_VISION_API_KEY" in resp.json()["detail"]
+
+
+def test_document_convert_describe_images_with_EMPTY_vision_key(client, monkeypatch):
+    """Leerer String ist der reale Fehlerzustand (Compose-Default) — nicht nur unset."""
+    monkeypatch.setenv("ANTHROPIC_VISION_API_KEY", "")
+    resp = client.post(
+        "/document/convert",
+        files={"file": ("table.csv", b"a,b\n1,2\n", "text/csv")},
+        data={"describe_images": "true"},
+    )
+    assert resp.status_code == 500
+    assert "ANTHROPIC_VISION_API_KEY" in resp.json()["detail"]
+
+
+def test_document_convert_without_descriptions_needs_no_vision_key(client, monkeypatch):
+    """Text-/Tabellen-Konvertierung ohne describe_images bleibt vom Key unabhaengig."""
+    monkeypatch.delenv("ANTHROPIC_VISION_API_KEY", raising=False)
+    resp = client.post(
+        "/document/convert",
+        files={"file": ("table.csv", b"a,b\n1,2\n", "text/csv")},
+    )
+    assert resp.status_code == 200, resp.text
+
+
+def test_document_convert_describe_images_with_key_and_imageless_doc(client, monkeypatch):
+    """Key gesetzt + Dokument ohne Bilder: Pre-Flight laesst durch, Vision wird nie gerufen."""
+    monkeypatch.setenv("ANTHROPIC_VISION_API_KEY", "sk-ant-test-nicht-echt")
+    resp = client.post(
+        "/document/convert",
+        files={"file": ("table.csv", b"a,b\n1,2\n", "text/csv")},
+        data={"describe_images": "true"},
+    )
+    assert resp.status_code == 200, resp.text
+
+
+def test_legacy_convert_pdf_describe_images_without_vision_key(client, monkeypatch):
+    """Der Legacy-Endpoint antwortet im JSONResponse-Stil, gleiche Meldung."""
+    monkeypatch.delenv("ANTHROPIC_VISION_API_KEY", raising=False)
+    resp = client.post(
+        "/convert-pdf",
+        files={"file": ("doc.pdf", b"%PDF-1.4 fake", "application/pdf")},
+        data={"describe_images": "true"},
+    )
+    assert resp.status_code == 500
+    body = resp.json()
+    assert body["status"] == "error"
+    assert "ANTHROPIC_VISION_API_KEY" in body["error"]

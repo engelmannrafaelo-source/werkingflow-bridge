@@ -35,7 +35,7 @@ Es gibt **zwei** Bridge-Deployments, beide gebaut aus **diesem einen Repo** (`we
 | Zweck | interne Dev/Test-Last, CUI-Sessions, Tester | zahlende Kunden |
 | Worker-Set | `worker1..4` | `worker-sahori`, `worker-kurt` |
 | nginx-LB Container | `wt-wrapper-lb` | `wt-prod-lb` |
-| Privacy | **lokaler** Container (`wt-privacy-pdf-service`) | **remote** über Tailscale (`http://100.112.98.39:8100`), kein lokaler Container |
+| Privacy | **remote**: GPU-Host `gpu-privacy-1` über Tailscale (`http://100.65.149.39:8100`), kein lokaler Container (seit 2e273bf) | **remote**: derselbe GPU-Host `gpu-privacy-1` (`http://100.65.149.39:8100`), kein lokaler Container |
 | Compose-Files | `docker-compose.yml` + `docker-compose-platform-overlay.yml` | `docker-compose-prod.yml` + `docker-compose-prod-platform.yml` |
 | Repo-Pfad **am Host** | `/root/werkingflow-bridge` | `/root/werkingflow-bridge` |
 | Postgres-Container | `bridge-postgres-prod` | `bridge-postgres-prod` |
@@ -150,7 +150,7 @@ live in `/v1/metrics/account-pool-state` / `/lb-status`.
 | `wt-wrapper-metrics-reader` | Pool-State-Aggregator |
 | `wt-platform-api` | Platform-API (usage/timeseries/auth/users/…) |
 | `bridge-postgres-prod` | Platform-/Identity-DB |
-| `wt-privacy-pdf-service` | lokale Presidio/Docling-Anonymisierung |
+| _(kein lokaler Privacy-Container mehr)_ | Presidio/Docling laeuft auf `gpu-privacy-1` (Tailscale `100.65.149.39:8100`, Container `gpu-privacy-pdf-service`, host-lokales `/root/docker-compose.privacy-gpu.yml`) — seit 2e273bf auch fuer die Dev-Bridge. Pruefen: `docker exec <worker> env \| grep PRIVACY_SERVICE_URL` |
 
 **PROD (`178.104.178.79`):**
 
@@ -161,7 +161,7 @@ live in `/v1/metrics/account-pool-state` / `/lb-status`.
 | `wt-prod-metrics-reader` | Pool-State-Aggregator |
 | `wt-prod-platform-api` | Platform-API |
 | `bridge-postgres-prod` | Platform-/Identity-DB |
-| _(kein lokaler Privacy-Container)_ | nutzt Remote-Privacy der Dev-Bridge über Tailscale |
+| _(kein lokaler Privacy-Container)_ | nutzt Remote-Privacy auf `gpu-privacy-1` über Tailscale (`100.65.149.39:8100`) |
 
 ---
 
