@@ -62,14 +62,20 @@ HETZNER_SVC_worker1="wt-wrapper-worker1"
 HETZNER_SVC_worker2="wt-wrapper-worker2"
 HETZNER_SVC_worker3="wt-wrapper-worker3"
 HETZNER_SVC_worker4="wt-wrapper-worker4"
-HETZNER_SVC_privacy_service="wt-privacy-pdf-service"
 HETZNER_SVC_metrics_reader="wt-wrapper-metrics-reader"
 HETZNER_SVC_platform_api="wt-platform-api"
 # platform-api is deployed BEFORE nginx so the upstream resolves when nginx
 # restarts. nginx is last so the new routing is live only after platform-api
 # is healthy.
-HETZNER_ALL="platform-api nginx worker1 worker2 worker3 worker4 privacy-service metrics-reader"
-HETZNER_NEEDS_BUILD="platform-api nginx worker1 worker2 worker3 worker4 privacy-service metrics-reader"
+# privacy-service REMOVED here 2026-08-27: commit 2e273bf dropped the
+# wt-privacy-pdf-service container from docker-compose.yml (dev now routes
+# smart-anonymize/document-convert to the GPU instance, ~40x faster), but left
+# it in these lists. `docker compose build privacy-service` then died with
+# "no such service" in Phase 4 and auto-rolled-back every healthy service
+# ahead of it — a deploy that could never succeed. The smoke profile is
+# unaffected: it probes PRIVACY_SERVICE_URL, not this container.
+HETZNER_ALL="platform-api nginx worker1 worker2 worker3 worker4 metrics-reader"
+HETZNER_NEEDS_BUILD="platform-api nginx worker1 worker2 worker3 worker4 metrics-reader"
 
 # Server-2: service → container name (use _ not - for var names)
 SERVER2_SVC_nginx="wt-prod-lb"
