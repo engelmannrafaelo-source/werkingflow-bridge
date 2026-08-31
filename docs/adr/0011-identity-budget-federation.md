@@ -157,6 +157,41 @@ Repo-Root), `secrets/platform.env` `BRIDGE_ORIGIN_ID` + `FEDERATION_PEERS`
 + `FEDERATION_TOKEN_TEST`. Der `test`-Peer bleibt als dauerhafte
 Regressions-Sonde bestehen (dev-only, zeigt auf die eigene platform-api).
 
+## Stufe B: Messprotokoll (2026-08-31, beide Bridges, Session 7f122be0)
+
+Freigabe: Rafael direkt in der Session (~09:3x, „ja sufe b freigegben").
+Deploy `bridge-deploy.sh both` (Dev-first-Gate hatte den direkten
+server2-Lauf korrekt geblockt): hetzner SUCCESS 09:53Z, server2 SUCCESS
+10:07Z, Smoke je PASSED, Manifeste vom Deploy geschrieben. Host-Konfig
+vorher: Tailscale-Bindings (`100.126.91.53:8300` prod / `100.112.98.39:8300`
+dev), `BRIDGE_ORIGIN_ID` beidseitig, wechselseitiger Service-Token-Tausch
+Host-zu-Host.
+
+- **Richtung A (Reaktivierungs-Fall) — dev-Origin, Prod führt aus:**
+  Chat-Call auf `wt-prod-worker-erk` mit Origin `dev`, Dev-User `e127c1bd`
+  → 200; Prod-Log federated die komplette 5-Call-Kette „to home bridge
+  'dev'"; DEV-Ledger-Zeile 10:08:18Z (0.014528 EUR), DEV-Budget
+  26.793669 → 26.808197 (Delta exakt = Zeile); Prod-Schattenbestand
+  unverändert. ✓
+- **Richtung B (Overflow-Fall) — prod-Origin, Dev führt aus:**
+  Chat-Call auf `wt-wrapper-worker1` mit Origin `prod`, Prod-User `be44fb61`
+  (interactive@, report-standard) → 200; Dev-Log federated die Kette „to
+  home bridge 'prod'"; PROD-Ledger-Zeile 10:08:48Z (0.014549 EUR),
+  PROD-Budget 0.774450 → 0.788999 (Delta exakt); Dev-Schattenbestand
+  unverändert (16 Alt-Schatten, 0 neue am 31.08. — der Spiegel des
+  Prod-Befunds: Prod-UUIDs, die VOR der Föderation auf Dev provisioniert
+  wurden, neuester 26.08.). ✓
+- **Fail-closed-Gegenprobe auf Prod:** Origin `test` (dort nicht
+  konfiguriert) → 503 + Gate-Log „failing closed". ✓
+
+Damit ist die Reaktivierungs-Bedingung („je ein gemessener förderierter Lauf
+in BEIDE Richtungen") erfüllt; ausstehend nur noch Rafaels Go für den
+Ein-Zeilen-Revert (Runbook Schritt 5).
+
+Schattenbestand gesamt (Stichtag 31.08., beide read-only erhoben):
+prod 11 (6 werking-report + 5 werking-energy), dev 16 — alle vor dem
+Föderations-Go-Live entstanden; Bereinigung bleibt Rafael-gated.
+
 ## Rollout
 
 - **Stufe A (dev, frei):** Code + Unit-Tests; Dev-Deploy; Beweis der
