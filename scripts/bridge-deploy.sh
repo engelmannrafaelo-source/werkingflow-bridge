@@ -740,18 +740,20 @@ EOF
     local nginx_output nginx_rc
     nginx_output=$(rssh_run "$host" <<EOF
 cd ${REMOTE_REPO}
-BRIDGE_BACKUP_HOST=127.0.0.1 BRIDGE_ID=validate-probe \
+BRIDGE_BACKUP_HOST=127.0.0.1 BRIDGE_ID=validate-probe METRICS_READER_TARGET=metrics-reader:8000 \
     envsubst '${envsubst_vars}' \
     < ${nginx_conf} > /tmp/bridge-nginx-check.conf 2>&1
 # Render the per-topology upstreams include (nginx.conf does include /tmp/upstreams.conf).
 BRIDGE_BACKUP_HOST=127.0.0.1 \
     envsubst '\$BRIDGE_BACKUP_HOST' \
     < ${upstreams_conf} > /tmp/bridge-upstreams-check.conf 2>&1
-# --add-host metrics-reader: since 2026-08-31 the metrics routes use variable
-# proxy_pass ($metrics_reader) — parse-time no longer needs the name to
-# resolve, so this mapping is functionally redundant. Kept as a harmless
-# belt-and-braces for the config test only; the derived add_hosts list carries
-# just service names (metrics-reader-prod), not prod's `metrics-reader` alias.
+# --add-host metrics-reader: since 2026-08-31 the metrics routes use a
+# variable proxy_pass (nginx var "metrics_reader") — parse-time no longer
+# needs the name to resolve, so this mapping is functionally redundant. Kept
+# as a harmless belt-and-braces for the config test only. NOTE: this comment
+# lives inside an UNQUOTED heredoc — never write a bare dollar sign here, the
+# remote bash expands it under set -u (bitten 2026-08-31: a dollar-prefixed
+# var name in this very comment aborted every deploy with unbound variable).
 if docker run --rm \
     ${add_hosts} --add-host=metrics-reader:127.0.0.1 \
     --tmpfs /var/log/nginx \
