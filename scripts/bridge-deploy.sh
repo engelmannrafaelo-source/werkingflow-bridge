@@ -74,7 +74,11 @@ HETZNER_SVC_platform_api="wt-platform-api"
 # "no such service" in Phase 4 and auto-rolled-back every healthy service
 # ahead of it — a deploy that could never succeed. The smoke profile is
 # unaffected: it probes PRIVACY_SERVICE_URL, not this container.
-HETZNER_ALL="platform-api nginx worker1 worker2 worker3 worker4 metrics-reader"
+# metrics-reader BEFORE nginx (same invariant as platform-api): nginx's
+# metrics routes re-resolve per request with `resolver valid=30s`, so a
+# reader recreated AFTER nginx leaves a <=30s stale-IP window — exactly when
+# the smoke probe runs (bitten 2026-08-31, metrics_account_pool 502).
+HETZNER_ALL="platform-api metrics-reader nginx worker1 worker2 worker3 worker4"
 HETZNER_NEEDS_BUILD="platform-api nginx worker1 worker2 worker3 worker4 metrics-reader"
 
 # Server-2: service → container name (use _ not - for var names)
@@ -109,7 +113,7 @@ SERVER2_SVC_platform_api="wt-prod-platform-api"
 # (two container sets against the same Anthropic accounts). Their compose
 # definition and token files stay on server2 as a documented emergency
 # reserve only; bringing them back is a conscious act, not a side effect.
-SERVER2_ALL="postgres-prod platform-api nginx metrics-reader-prod"
+SERVER2_ALL="postgres-prod platform-api metrics-reader-prod nginx"
 # nginx now BUILDS from Dockerfile.nginx-lb (OpenResty+Lua) — the same image as
 # primary (ADR-0006 B/C). It was a pre-built nginx:alpine before the unification.
 SERVER2_NEEDS_BUILD="platform-api nginx metrics-reader-prod"
@@ -738,9 +742,11 @@ BRIDGE_BACKUP_HOST=127.0.0.1 BRIDGE_ID=validate-probe \
 BRIDGE_BACKUP_HOST=127.0.0.1 \
     envsubst '\$BRIDGE_BACKUP_HOST' \
     < ${upstreams_conf} > /tmp/bridge-upstreams-check.conf 2>&1
-# --add-host metrics-reader: nginx.conf's metrics_reader upstream hardcodes the
-# name `metrics-reader` (resolves live via prod's compose alias); the derived
-# add_hosts list only carries service names (metrics-reader-prod), so add it here.
+# --add-host metrics-reader: since 2026-08-31 the metrics routes use variable
+# proxy_pass ($metrics_reader) — parse-time no longer needs the name to
+# resolve, so this mapping is functionally redundant. Kept as a harmless
+# belt-and-braces for the config test only; the derived add_hosts list carries
+# just service names (metrics-reader-prod), not prod's `metrics-reader` alias.
 if docker run --rm \
     ${add_hosts} --add-host=metrics-reader:127.0.0.1 \
     --tmpfs /var/log/nginx \
