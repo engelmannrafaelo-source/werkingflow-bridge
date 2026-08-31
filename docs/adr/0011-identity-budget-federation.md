@@ -99,9 +99,16 @@ origin-bewusste ZIELWAHL an genau dieser einen Stelle:
    liegt daheim, die Kappe liest lokal). Diese Lanes sind per-Bridge-Keys und
    nicht Teil des Level-1/2-Poolings; dokumentierte Einschränkung, kein
    Blocker. Nicht doppelt schreiben — ein Ledger, der Heimat-Ledger.
-2. **Principals bleiben lokal aufgelöst.** Ein Principal-Token existiert nur
-   in der Heimat-DB; principal-authentifizierter Cross-Bridge-Verkehr ist vor
-   der Reaktivierung der Default-Stufe zu verifizieren (heute unbewiesen).
+2. **Principals bleiben lokal aufgelöst — GEKLÄRT (gemessen 31.08., ~09:1xZ):**
+   der Shared-API-Key ist auf beiden Bridges identisch (sha256-Vergleich der
+   Worker-Env), Principals-Enforcement ist beidseitig AN, und alle 17 aktiven
+   Principals sind byte-gleich (md5 der `token_hash`-Spalte beider DBs; einzige
+   Abweichung ein INAKTIVER Dev-Test-Eintrag `report-vercel-test`).
+   Cross-Bridge-Auth funktioniert damit heute für beide Credential-Arten.
+   **Betriebsbedingung statt Code-Änderung:** der Principal-Sync muss gehalten
+   werden — bei Rotation auf nur einer Seite entstehen Cross-Bridge-401s
+   (forensisches Log in `verify_api_key` weist darauf hin;
+   `scripts/check-principal-drift.sh` prüft es, gehört in den Stufe-B-Pre-Check).
 3. **Nutzungsauswertung pro Nutzer wird EINFACHER:** die Ledger-Zeilen landen
    wieder vollständig daheim; die ADR-0010-Konsequenz „beide Ledger lesen"
    entfällt für neuen Verkehr ab Föderations-Go-Live.
