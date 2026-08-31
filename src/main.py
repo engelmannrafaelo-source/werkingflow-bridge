@@ -81,7 +81,7 @@ from src.jobs.registry import (
     DEPENDENCY_UNAVAILABLE_STATUS,
     DEPENDENCY_RETRY_DELAY_S,
 )
-from src.jobs import store as jobs_store
+from src.jobs import store_client as jobs_store_client
 from src.jobs.executors import (
     ping_executor,
     chat_executor,
@@ -586,9 +586,10 @@ async def lifespan(app: FastAPI):
 
     # Wire the generic async-job system (additive). Register built-in executors,
     # inject the canonical attribution extractor (so /v1/jobs bills like every
-    # other endpoint), and start the watchdog/cleanup loop. The Postgres store is
-    # required; without BRIDGE_DB_URL the endpoints return 503 and the loop is
-    # skipped. The endpoints themselves stay inert unless BRIDGE_GENERIC_JOBS_ENABLED.
+    # other endpoint), and start the watchdog/cleanup loop. A reachable job store
+    # is required — platform-api (ADR-0009 Weg b) or direct BRIDGE_DB_URL; with
+    # neither the endpoints return 503 and the loop is skipped. The endpoints
+    # themselves stay inert unless BRIDGE_GENERIC_JOBS_ENABLED.
     register_executor("ping", ping_executor)
     register_executor("chat", chat_executor)
     register_executor("research", research_executor)
@@ -596,11 +597,14 @@ async def lifespan(app: FastAPI):
     register_executor("proxy", proxy_executor)
     register_executor("convert-html-to-pdf", convert_html_to_pdf_executor)
     set_attribution_extractor(extract_attribution_context)
-    if is_db_enabled():
+    if jobs_store_client.is_store_available():
         asyncio.create_task(_generic_jobs_maintenance_loop())
         logger.info("🧩 Generic async-job system wired (executors + watchdog loop)")
     else:
-        logger.info("🧩 Generic async-job executors registered (DB disabled → watchdog loop skipped)")
+        logger.info(
+            "🧩 Generic async-job executors registered (no job store reachable — "
+            "neither platform-api nor BRIDGE_DB_URL → watchdog loop skipped)"
+        )
 
     # Start Gemini daily rate limit reset task
     async def _gemini_daily_reset():
@@ -620,33 +624,12 @@ async def lifespan(app: FastAPI):
     asyncio.create_task(_gemini_daily_reset())
     logger.info("🔄 Gemini daily rate limit reset task scheduled (midnight UTC)")
 
-    # Trial-expiry warning emails — daily sweep at 08:00 UTC.
-    # Sends 3-day and 1-day warnings, idempotent via per-row stamps.
-    try:
-        from src.billing.trial_warnings import start_trial_warning_loop
-        start_trial_warning_loop()
-        logger.info("📧 Trial-expiry warning sweep scheduled (daily 08:00 UTC)")
-    except Exception as _e:
-        logger.error(f"Failed to start trial-warning loop: {_e}")
-
-    # Budget-Vorwarnung an den BETREIBER (nicht an Kunden) — taeglich 07:00 UTC.
-    # Meldet erreichte Schwellen des Monatsbudgets (Standard 50/80/100 %).
-    # Idempotent ueber budget_warnings mit dem Periodenanker im Schluessel:
-    # nach dem Monatsreset ist die Warnung automatisch wieder scharf.
-    try:
-        from src.billing.budget_warnings import start_budget_warning_loop
-        start_budget_warning_loop()
-        logger.info("📊 Budget-Vorwarnung eingeplant (taeglich 07:00 UTC)")
-    except Exception as _e:
-        logger.error(f"Failed to start budget-warning loop: {_e}")
-
-    # Bedrock 1:1 billing reconciliation — periodic ledger-vs-CloudWatch check.
-    # Self-disables (with an info log) when DB or AWS credentials are absent.
-    try:
-        from src.reconciliation import bedrock_reconciliation_loop
-        asyncio.create_task(bedrock_reconciliation_loop())
-    except Exception as _e:
-        logger.error(f"Failed to start bedrock reconciliation loop: {_e}")
+    # Die taeglichen DB-Sweeps (Trial-Warnung, Budget-Vorwarnung) und die
+    # Bedrock-Reconciliation laufen seit ADR-0009 Schritt 2d in platform-api
+    # (src/platform_main.py) — dem Prozess, der den Pool haelt. Vorher startete
+    # JEDER Worker alle drei Loops: vierfach redundant (nur durch DB-Stempel
+    # idempotent) und auf einem Worker ohne BRIDGE_DB_URL ein taeglicher
+    # Fehlerlog statt eines Sweeps.
 
     # Initialize adaptive token-budget limiter and start its background tune loop.
     # The limiter persists its cap across restarts, so we don't reset state here —
@@ -767,7 +750,7 @@ async def _generic_jobs_maintenance_loop():
         await asyncio.sleep(GENERIC_JOB_MAINTENANCE_INTERVAL_S)
         try:
             counts = await run_watchdog_pass(GENERIC_JOB_STALE_SECONDS, GENERIC_JOB_MAX_ATTEMPTS)
-            pruned = await jobs_store.cleanup_old(GENERIC_JOB_TTL_SECONDS)
+            pruned = await jobs_store_client.cleanup_old(GENERIC_JOB_TTL_SECONDS)
             if counts["requeued"] or counts["failed"] or pruned:
                 logger.info(
                     f"🧩 jobs maintenance: requeued={counts['requeued']} "
@@ -7638,55 +7621,43 @@ async def get_anonymization_metrics(
     anonymization runs that did NOT complete (action pii.anonymization_failed),
     so a silent gap in the DSGVO gate becomes a visible, alertable number.
     ``last_failure_ts`` gives the cron idempotency (alert only on a newer
-    failure). ``pseudonymized_total`` is the success baseline. Reads the same
-    audit_log the attestation writer populates.
+    failure). ``pseudonymized_total`` is the success baseline.
+
+    ADR-0009 Schritt 2d: the data lives in audit_log, i.e. with platform-api —
+    resolved via GET /v1/internal/audit/anonymization-metrics first, direct DB
+    as fallback. When NEITHER can answer this returns 503 instead of the old
+    "db": False all-zeros body: pseudonym-monitor treats unreachable as an
+    alert, and a monitoring feed that fabricates zeros is a blinded alarm, not
+    a degraded one.
     """
     await verify_api_key(request, credentials)
-    from src.db.client import get_pool, is_db_enabled
+    from src.audit.anonymization_metrics import query_anonymization_metrics_from_db
+    from src.db.client import is_db_enabled
+    from src.platform_client import PlatformUnavailable, call_platform
 
     hours = max(1, hours)
-    if not is_db_enabled():
-        return {
-            "db": False, "window_hours": hours, "failed_total": 0,
-            "pseudonymized_total": 0, "failed_by_app": {}, "last_failure_ts": None,
-        }
-
-    pool = get_pool()
-    async with pool.acquire() as conn:
-        rows = await conn.fetch(
-            """
-            SELECT action, actor_label, COUNT(*) AS n
-              FROM audit_log
-             WHERE action IN ('pii.pseudonymized', 'pii.anonymization_failed')
-               AND timestamp >= now() - make_interval(hours => $1)
-             GROUP BY action, actor_label
-            """,
-            hours,
+    try:
+        resp = await call_platform(
+            "GET", "/v1/internal/audit/anonymization-metrics", params={"hours": hours}
         )
-        last_failure = await conn.fetchval(
-            "SELECT max(timestamp) FROM audit_log WHERE action = 'pii.anonymization_failed'"
+        if resp.status_code == 200 and isinstance(resp.json, dict) and "failed_total" in resp.json:
+            return {"db": True, **resp.json}
+        raise PlatformUnavailable(
+            f"unexpected answer status={resp.status_code} body={str(resp.json)[:200]}"
         )
-
-    failed_total = 0
-    pseudonymized_total = 0
-    failed_by_app: Dict[str, int] = {}
-    for r in rows:
-        n = int(r["n"])
-        if r["action"] == "pii.anonymization_failed":
-            failed_total += n
-            label = r["actor_label"] or "unknown"
-            failed_by_app[label] = failed_by_app.get(label, 0) + n
-        else:
-            pseudonymized_total += n
-
-    return {
-        "db": True,
-        "window_hours": hours,
-        "failed_total": failed_total,
-        "pseudonymized_total": pseudonymized_total,
-        "failed_by_app": failed_by_app,
-        "last_failure_ts": last_failure.isoformat() if last_failure else None,
-    }
+    except PlatformUnavailable as e:
+        if not is_db_enabled():
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    f"anonymization metrics unavailable: platform-api failed ({e}) "
+                    f"and this process has no direct-DB fallback (BRIDGE_DB_URL unset)"
+                ),
+            )
+        logger.error(
+            "anonymization metrics via platform-api failed (%s) — falling back to direct DB", e
+        )
+        return {"db": True, **await query_anonymization_metrics_from_db(hours)}
 
 
 # ============================================================================

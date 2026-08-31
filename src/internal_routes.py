@@ -77,6 +77,36 @@ async def get_prepaid_vision_spent_24h(
     return {"spent_eur": spent}
 
 
+# ── Schritt 2d: research-cloud daily cap (same shape as prepaid vision) ──
+
+@router.get("/research-cloud/spent-24h")
+async def get_research_cloud_spent_24h(
+    _claims: AuthClaims = Depends(require_service_token),
+) -> Dict[str, Any]:
+    """Mirrors src.research_cloud.cap's direct query — rolling-24h research-cloud
+    real spend in EUR. No 404 case: absence of spend is 0.0, not "not found"."""
+    from src.research_cloud.cap import query_spent_last_24h_from_db
+
+    spent = await query_spent_last_24h_from_db()
+    return {"spent_eur": spent}
+
+
+# ── Schritt 2d: anonymization accountability counters ────────────────────
+
+@router.get("/audit/anonymization-metrics")
+async def get_anonymization_metrics_internal(
+    hours: int = 24,
+    _claims: AuthClaims = Depends(require_service_token),
+) -> Dict[str, Any]:
+    """Mirrors the worker's public GET /v1/metrics/anonymization (minus the
+    "db" envelope key, which describes the WORKER's resolution stage). A DB
+    failure propagates as 5xx — never an all-zeros body, see
+    src.audit.anonymization_metrics."""
+    from src.audit.anonymization_metrics import query_anonymization_metrics_from_db
+
+    return await query_anonymization_metrics_from_db(hours)
+
+
 # ── C4: audit-event write path ───────────────────────────────────────────
 
 class AuditEventRequest(BaseModel):
@@ -605,3 +635,211 @@ async def get_app_id_enum(
     from src.activity.app_registry import read_app_id_enum_from_db
 
     return {"members": sorted(await read_app_id_enum_from_db())}
+
+
+# ── Schritt 2d: the durable job store (ADR-0009 Weg b, /v1/jobs) ─────────
+#
+# Mirrors src.jobs.store 1:1 — platform-api is the process that holds the
+# pool, so the SQL stays in store.py and these routes are thin, explicit
+# wrappers. The worker side is src.jobs.store_client (same function names,
+# platform-first with direct-DB fallback while workers still carry
+# BRIDGE_DB_URL).
+#
+# Scope note ("Worker duerfen nicht mehr koennen als vorher"): with a direct
+# BRIDGE_DB_URL a worker could run arbitrary SQL against the customer
+# database. Through these routes it can exactly create/read/advance jobs —
+# a strict reduction. Everything stays require_service_token-gated and off
+# the public nginx path like the rest of this module.
+#
+# claim-stale is the one operation that MUST live here: its FOR UPDATE SKIP
+# LOCKED atomicity only exists inside a single SQL statement. Over HTTP it
+# stays exactly as atomic — the statement runs here, in one piece.
+
+
+class InternalJobCreate(BaseModel):
+    job_id: str
+    kind: str
+    payload: Optional[Dict[str, Any]] = None
+    attribution: Optional[Dict[str, Any]] = None
+
+
+class InternalJobProgress(BaseModel):
+    progress: Dict[str, Any]
+
+
+class InternalJobDone(BaseModel):
+    result: Optional[Dict[str, Any]] = None
+
+
+class InternalJobError(BaseModel):
+    message: str
+    code: Optional[str] = None
+
+
+class InternalJobDefer(BaseModel):
+    delay_seconds: int = Field(ge=1, le=24 * 3600)
+    reason: str
+
+
+class InternalJobClaimStale(BaseModel):
+    stale_seconds: int = Field(ge=1)
+    max_attempts: int = Field(ge=1)
+
+
+class InternalJobCleanup(BaseModel):
+    ttl_seconds: int = Field(ge=60)
+
+
+@router.post("/jobs", status_code=204)
+async def internal_create_job(
+    body: InternalJobCreate,
+    _claims: AuthClaims = Depends(require_service_token),
+) -> Response:
+    """Insert a fresh 'pending' job. Idempotent on job_id (ON CONFLICT DO
+    NOTHING) — a client retry after a lost answer cannot create a second row."""
+    from src.jobs import store
+
+    await store.create_job(body.job_id, body.kind, body.payload, body.attribution)
+    return Response(status_code=204)
+
+
+@router.get("/jobs")
+async def internal_list_jobs(
+    app_id: Optional[str] = None,
+    user_id: Optional[str] = None,
+    status: Optional[str] = None,
+    limit: int = 50,
+    _claims: AuthClaims = Depends(require_service_token),
+) -> Dict[str, Any]:
+    """List projection, scoped. ValueError from the store (missing scope, bad
+    status/limit) is a caller mistake → 400, never a 5xx (a 5xx would read as
+    "platform-api down" to platform_client and trigger the worker's fallback)."""
+    from src.jobs import store
+
+    try:
+        jobs = await store.list_jobs(app_id=app_id, user_id=user_id, status=status, limit=limit)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return {"jobs": jobs}
+
+
+@router.get("/jobs/{job_id}")
+async def internal_get_job(
+    job_id: str,
+    _claims: AuthClaims = Depends(require_service_token),
+) -> Dict[str, Any]:
+    """Full job row. 404 = unknown id — a real, interpretable answer (the
+    public GET /v1/jobs/{id} turns it into its own 404), not an outage."""
+    from src.jobs import store
+
+    job = await store.get_job(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail=f"job not found: {job_id}")
+    return {"job": job}
+
+
+@router.post("/jobs/{job_id}/mark-running", status_code=204)
+async def internal_mark_running(
+    job_id: str,
+    _claims: AuthClaims = Depends(require_service_token),
+) -> Response:
+    from src.jobs import store
+
+    await store.mark_running(job_id)
+    return Response(status_code=204)
+
+
+@router.post("/jobs/{job_id}/heartbeat", status_code=204)
+async def internal_heartbeat(
+    job_id: str,
+    _claims: AuthClaims = Depends(require_service_token),
+) -> Response:
+    from src.jobs import store
+
+    await store.heartbeat(job_id)
+    return Response(status_code=204)
+
+
+@router.post("/jobs/{job_id}/progress", status_code=204)
+async def internal_update_progress(
+    job_id: str,
+    body: InternalJobProgress,
+    _claims: AuthClaims = Depends(require_service_token),
+) -> Response:
+    from src.jobs import store
+
+    await store.update_progress(job_id, body.progress)
+    return Response(status_code=204)
+
+
+@router.post("/jobs/{job_id}/done", status_code=204)
+async def internal_mark_done(
+    job_id: str,
+    body: InternalJobDone,
+    _claims: AuthClaims = Depends(require_service_token),
+) -> Response:
+    from src.jobs import store
+
+    await store.mark_done(job_id, body.result)
+    return Response(status_code=204)
+
+
+@router.post("/jobs/{job_id}/error", status_code=204)
+async def internal_mark_error(
+    job_id: str,
+    body: InternalJobError,
+    _claims: AuthClaims = Depends(require_service_token),
+) -> Response:
+    from src.jobs import store
+
+    await store.mark_error(job_id, body.message, code=body.code)
+    return Response(status_code=204)
+
+
+@router.post("/jobs/{job_id}/defer", status_code=204)
+async def internal_defer_job(
+    job_id: str,
+    body: InternalJobDefer,
+    _claims: AuthClaims = Depends(require_service_token),
+) -> Response:
+    from src.jobs import store
+
+    await store.defer_job(job_id, body.delay_seconds, body.reason)
+    return Response(status_code=204)
+
+
+@router.post("/jobs-maintenance/claim-stale")
+async def internal_claim_stale_job(
+    body: InternalJobClaimStale,
+    _claims: AuthClaims = Depends(require_service_token),
+) -> Dict[str, Any]:
+    """Atomically claim ONE stale-but-retryable job (FOR UPDATE SKIP LOCKED —
+    concurrent callers each get a DIFFERENT row or none). {"job": null} means
+    "nothing claimable", a normal answer, not an error."""
+    from src.jobs import store
+
+    job = await store.claim_stale_job(body.stale_seconds, body.max_attempts)
+    return {"job": job}
+
+
+@router.get("/jobs-maintenance/abandoned")
+async def internal_find_abandoned(
+    stale_seconds: int,
+    max_attempts: int,
+    _claims: AuthClaims = Depends(require_service_token),
+) -> Dict[str, Any]:
+    from src.jobs import store
+
+    jobs = await store.find_abandoned(stale_seconds, max_attempts)
+    return {"jobs": jobs}
+
+
+@router.post("/jobs-maintenance/cleanup")
+async def internal_cleanup_old(
+    body: InternalJobCleanup,
+    _claims: AuthClaims = Depends(require_service_token),
+) -> Dict[str, Any]:
+    from src.jobs import store
+
+    removed = await store.cleanup_old(body.ttl_seconds)
+    return {"removed": removed}

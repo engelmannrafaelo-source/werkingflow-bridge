@@ -42,7 +42,7 @@ def _auth_patch():
 def _enabled_patches():
     return (
         patch("src.jobs.routes._generic_jobs_enabled", return_value=True),
-        patch("src.jobs.routes.is_db_enabled", return_value=True),
+        patch("src.jobs.store_client.is_store_available", return_value=True),
     )
 
 
@@ -68,7 +68,7 @@ def test_locked_worker_rejects_429_without_persist_or_dispatch(client):
         patch("src.jobs.routes.get_executor", return_value=lambda: None),
         patch("src.middleware.capacity_lock.get_capacity_lock",
               return_value=_locked_cap_lock(remaining=900)),
-        patch.object(__import__("src.jobs.store", fromlist=["create_job"]),
+        patch.object(__import__("src.jobs.store_client", fromlist=["create_job"]),
                      "create_job", create),
         patch("src.jobs.routes.spawn") as spawn,
     ):
@@ -105,7 +105,7 @@ def test_unlocked_worker_accepts_and_dispatches(client):
         patch("src.jobs.routes.get_executor", return_value=lambda: None),
         patch("src.middleware.capacity_lock.get_capacity_lock",
               return_value=_open_cap_lock()),
-        patch("src.jobs.store.create_job", create),
+        patch("src.jobs.store_client.create_job", create),
         patch("src.jobs.routes.spawn") as spawn,
     ):
         resp = client.post("/v1/jobs", json={"kind": "k", "payload": {"n": 1}})

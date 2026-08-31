@@ -15,7 +15,7 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from src.jobs import registry, store
+from src.jobs import registry, store, store_client
 
 
 # ── Digest ──────────────────────────────────────────────────────────────────
@@ -53,7 +53,7 @@ async def test_run_generic_job_done_path():
 
     registry.register_executor("good", good)
     with patch.multiple(
-        store,
+        store_client,
         mark_running=AsyncMock(),
         heartbeat=AsyncMock(),
         update_progress=AsyncMock(),
@@ -61,10 +61,10 @@ async def test_run_generic_job_done_path():
         mark_error=AsyncMock(),
     ):
         await registry.run_generic_job("job_1", "good", {"n": 21}, {"app_id": "x"})
-        store.mark_running.assert_awaited_once_with("job_1")
-        store.mark_done.assert_awaited_once_with("job_1", {"result": 42})
-        store.update_progress.assert_awaited()  # report_progress flowed through
-        store.mark_error.assert_not_awaited()
+        store_client.mark_running.assert_awaited_once_with("job_1")
+        store_client.mark_done.assert_awaited_once_with("job_1", {"result": 42})
+        store_client.update_progress.assert_awaited()  # report_progress flowed through
+        store_client.mark_error.assert_not_awaited()
 
 
 async def test_run_generic_job_error_path():
@@ -73,22 +73,22 @@ async def test_run_generic_job_error_path():
 
     registry.register_executor("boom", boom)
     with patch.multiple(
-        store, mark_running=AsyncMock(), heartbeat=AsyncMock(),
+        store_client, mark_running=AsyncMock(), heartbeat=AsyncMock(),
         update_progress=AsyncMock(), mark_done=AsyncMock(), mark_error=AsyncMock(),
     ):
         await registry.run_generic_job("job_2", "boom", {}, None)
-        store.mark_error.assert_awaited_once()
-        args = store.mark_error.await_args
+        store_client.mark_error.assert_awaited_once()
+        args = store_client.mark_error.await_args
         assert args.args[0] == "job_2"
         assert "kaboom" in args.args[1]
-        store.mark_done.assert_not_awaited()
+        store_client.mark_done.assert_not_awaited()
 
 
 async def test_run_generic_job_unknown_kind_fails_loud():
-    with patch.multiple(store, mark_running=AsyncMock(), mark_error=AsyncMock()):
+    with patch.multiple(store_client, mark_running=AsyncMock(), mark_error=AsyncMock()):
         await registry.run_generic_job("job_3", "no-such-kind", {}, None)
-        store.mark_error.assert_awaited_once()
-        assert store.mark_error.await_args.kwargs.get("code") == "NO_EXECUTOR"
+        store_client.mark_error.assert_awaited_once()
+        assert store_client.mark_error.await_args.kwargs.get("code") == "NO_EXECUTOR"
 
 
 # ── Watchdog ────────────────────────────────────────────────────────────────
@@ -101,7 +101,7 @@ async def test_watchdog_requeues_stale_and_fails_exhausted():
 
     # claim returns the stale job once (already bumped to running), then None.
     with patch.multiple(
-        store,
+        store_client,
         claim_stale_job=AsyncMock(side_effect=[stale_job, None]),
         find_abandoned=AsyncMock(return_value=[dead_job]),
         mark_error=AsyncMock(),
@@ -112,8 +112,8 @@ async def test_watchdog_requeues_stale_and_fails_exhausted():
         await asyncio.sleep(0)
         run_body.assert_awaited_once()
         assert run_body.await_args.args[0] == "j_stale"  # NO re-mark_running (already claimed)
-        store.mark_error.assert_awaited_once()
-        assert store.mark_error.await_args.kwargs.get("code") == "REQUEUE_EXHAUSTED"
+        store_client.mark_error.assert_awaited_once()
+        assert store_client.mark_error.await_args.kwargs.get("code") == "REQUEUE_EXHAUSTED"
 
 
 # ── Flag gating ─────────────────────────────────────────────────────────────

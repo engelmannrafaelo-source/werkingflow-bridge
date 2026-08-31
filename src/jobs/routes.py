@@ -3,9 +3,10 @@
     POST /v1/jobs           → { job_id, status:'pending', kind }   (returns in <1s)
     GET  /v1/jobs/{job_id}   → { status, elapsed_seconds, progress, result?, error? }
 
-Inert unless BRIDGE_GENERIC_JOBS_ENABLED=true (503 otherwise) AND BRIDGE_DB_URL is
-set (the Postgres store is required). Existing endpoints (incl. /v1/research async)
-are untouched — this is purely additive so the live Bridge cannot regress.
+Inert unless BRIDGE_GENERIC_JOBS_ENABLED=true (503 otherwise) AND a job store is
+reachable — platform-api (BRIDGE_SERVICE_TOKEN, ADR-0009 Weg b) or the direct
+Postgres connection (BRIDGE_DB_URL); see src.jobs.store_client for the staging.
+Existing endpoints (incl. /v1/research async) are untouched.
 
 main.py wires this router (include_router), registers executors (register_executor),
 and injects its canonical attribution extractor (set_attribution_extractor) so we
@@ -23,8 +24,7 @@ from fastapi.security import HTTPAuthorizationCredentials
 from pydantic import BaseModel
 
 from src.auth import security, verify_api_key
-from src.db.client import is_db_enabled
-from src.jobs import store
+from src.jobs import store, store_client
 from src.jobs.registry import get_executor, registered_kinds, run_generic_job, spawn
 
 logger = logging.getLogger(__name__)
@@ -49,10 +49,14 @@ def _require_enabled() -> None:
             status_code=503,
             detail="Generic async jobs disabled (set BRIDGE_GENERIC_JOBS_ENABLED=true)",
         )
-    if not is_db_enabled():
+    if not store_client.is_store_available():
         raise HTTPException(
             status_code=503,
-            detail="Generic async jobs require BRIDGE_DB_URL (Postgres store)",
+            detail=(
+                "Generic async jobs require a reachable job store — neither "
+                "platform-api (BRIDGE_SERVICE_TOKEN) nor a direct Postgres "
+                "connection (BRIDGE_DB_URL) is configured"
+            ),
         )
 
 
@@ -159,7 +163,7 @@ async def create_job_endpoint(
     # Persist FIRST (durable 'pending'), then dispatch. If this worker dies before
     # the task runs, the row survives at 'pending' and the watchdog requeues it
     # from any worker — the dispatch is never a silent fire-and-forget loss.
-    await store.create_job(job_id, body.kind, body.payload, attribution)
+    await store_client.create_job(job_id, body.kind, body.payload, attribution)
     spawn(run_generic_job(job_id, body.kind, body.payload, attribution))
     logger.info(f"📨 Async job {job_id} dispatched (kind={body.kind})")
 
@@ -227,7 +231,7 @@ async def list_jobs_endpoint(
                 ),
             )
 
-    jobs = await store.list_jobs(app_id=app_id, user_id=user_id, status=status, limit=limit)
+    jobs = await store_client.list_jobs(app_id=app_id, user_id=user_id, status=status, limit=limit)
     return {"jobs": jobs}
 
 
@@ -242,7 +246,7 @@ async def get_job_endpoint(
     await verify_api_key(request, credentials)
     _require_enabled()
 
-    job = await store.get_job(job_id)
+    job = await store_client.get_job(job_id)
     if not job:
         raise HTTPException(
             status_code=404,

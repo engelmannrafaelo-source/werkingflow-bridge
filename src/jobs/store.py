@@ -1,9 +1,14 @@
 """Postgres-backed durable store for generic async jobs (table: ai_jobs).
 
+Since ADR-0009 Schritt 2d this is platform-api's module: workers reach it
+through /v1/internal/jobs* (src/internal_routes.py) via src.jobs.store_client,
+and only fall back to calling these functions directly while they still carry
+BRIDGE_DB_URL. The status constants below are shared by both stages.
+
 No dependency on main.py / app — pure data access, so it is unit-testable and
 import-safe. All functions assume the asyncpg pool is initialized
-(src.db.client.init_pool, called in main.py's lifespan when BRIDGE_DB_URL is set);
-callers gate on is_db_enabled() before reaching here.
+(src.db.client.init_pool, called in the process lifespan when BRIDGE_DB_URL is
+set); callers gate before reaching here (store_client.is_store_available).
 
 JSONB columns are written with an explicit ::jsonb cast on a json.dumps string
 and read back with _loads (asyncpg returns jsonb as text by default).

@@ -134,6 +134,36 @@ async def lifespan(app: FastAPI):
     app.state.webhook_dispatcher = dispatcher
     logger.info("✅ Webhook dispatcher started")
 
+    # Taegliche DB-Sweeps — hierher gezogen aus der Worker-Lifespan (ADR-0009
+    # Schritt 2d): der Prozess, der den Pool haelt, faehrt die Sweeps. Vorher
+    # lief jede Loop auf JEDEM Worker (nur ueber DB-Stempel idempotent) und
+    # waere auf einem Worker ohne BRIDGE_DB_URL ein taeglicher Fehlerlog
+    # geworden. RESEND_API_KEY kommt aus derselben platform.env wie bei den
+    # Workern (live geprueft 2026-08-31, wt-platform-api).
+    try:
+        from src.billing.trial_warnings import start_trial_warning_loop
+        start_trial_warning_loop()
+        logger.info("📧 Trial-expiry warning sweep scheduled (daily 08:00 UTC)")
+    except Exception as _e:
+        logger.error(f"Failed to start trial-warning loop: {_e}")
+
+    try:
+        from src.billing.budget_warnings import start_budget_warning_loop
+        start_budget_warning_loop()
+        logger.info("📊 Budget-Vorwarnung eingeplant (taeglich 07:00 UTC)")
+    except Exception as _e:
+        logger.error(f"Failed to start budget-warning loop: {_e}")
+
+    # Bedrock 1:1 billing reconciliation — periodic ledger-vs-CloudWatch check.
+    # Self-disables (with an info log) when DB or AWS credentials are absent.
+    try:
+        import asyncio
+
+        from src.reconciliation import bedrock_reconciliation_loop
+        asyncio.create_task(bedrock_reconciliation_loop())
+    except Exception as _e:
+        logger.error(f"Failed to start bedrock reconciliation loop: {_e}")
+
     yield
 
     try:

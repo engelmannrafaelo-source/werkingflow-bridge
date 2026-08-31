@@ -43,13 +43,11 @@ def _cap_eur() -> float:
         return 50.0
 
 
-async def _spent_last_24h() -> float:
-    """Rolling-24h research-cloud real spend in EUR, cached ~60s. Raises on
-    infra error (caller fail-opens)."""
-    now = time.time()
-    if now - _cache["at"] < _CACHE_TTL_S:
-        return _cache["spent"]
-
+async def query_spent_last_24h_from_db() -> float:
+    """Raw DB query — used directly by platform-api (src/internal_routes.py,
+    GET /v1/internal/research-cloud/spent-24h) since platform-api holds the
+    pool, and by this module's own direct-DB fallback below. Raises on infra
+    error; callers decide what to do about it."""
     from src.db.client import get_pool, is_db_enabled
 
     if not is_db_enabled():
@@ -65,7 +63,42 @@ async def _spent_last_24h() -> float:
               AND recorded_at > now() - interval '24 hours'
             """
         )
-    spent = float(val or 0.0)
+    return float(val or 0.0)
+
+
+async def _spent_last_24h() -> float:
+    """Rolling-24h research-cloud real spend in EUR, cached ~60s. Raises on
+    infra error (caller fail-opens).
+
+    ADR-0009 Schritt 2d: resolves via platform-api first (same cache/fallback
+    shape as prepaid_cap's C6), falling back to the direct DB query in the
+    same call when platform-api is unreachable.
+    """
+    now = time.time()
+    if now - _cache["at"] < _CACHE_TTL_S:
+        return _cache["spent"]
+
+    from src.platform_client import PlatformUnavailable, call_platform
+
+    try:
+        resp = await call_platform("GET", "/v1/internal/research-cloud/spent-24h")
+    except PlatformUnavailable as e:
+        logger.error(
+            "research-cloud spend lookup via platform-api failed (%s) — "
+            "falling back to direct DB", e,
+        )
+        spent = await query_spent_last_24h_from_db()
+    else:
+        if resp.status_code == 200 and isinstance(resp.json, dict) and "spent_eur" in resp.json:
+            spent = float(resp.json["spent_eur"])
+        else:
+            logger.error(
+                "research-cloud spend lookup via platform-api returned "
+                "unexpected status=%s body=%r — falling back to direct DB",
+                resp.status_code, resp.json,
+            )
+            spent = await query_spent_last_24h_from_db()
+
     _cache["at"] = now
     _cache["spent"] = spent
     return spent

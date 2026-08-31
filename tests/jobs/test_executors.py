@@ -281,10 +281,10 @@ async def test_research_executor_body_status_error_reaches_registry_as_job_error
     with patch("httpx.AsyncClient", return_value=fake), \
          patch("src.auth.auth_manager.get_api_key", return_value="k"), \
          patch.object(registry, "get_executor", return_value=research_executor), \
-         patch.object(registry.store, "mark_error", _mark_error), \
-         patch.object(registry.store, "mark_done", _mark_done), \
-         patch.object(registry.store, "heartbeat", AsyncMock()), \
-         patch.object(registry.store, "update_progress", AsyncMock()):
+         patch.object(registry.store_client, "mark_error", _mark_error), \
+         patch.object(registry.store_client, "mark_done", _mark_done), \
+         patch.object(registry.store_client, "heartbeat", AsyncMock()), \
+         patch.object(registry.store_client, "update_progress", AsyncMock()):
         await registry._run_body("job-1", "research", {"query": "q"}, None)
 
     assert "wrongly_marked_done" not in recorded
@@ -307,9 +307,9 @@ async def test_registry_persists_upstream_status_code():
         recorded.update({"job_id": job_id, "message": message, "code": code})
 
     with patch.object(registry, "get_executor", return_value=_failing_executor), \
-         patch.object(registry.store, "mark_error", _mark_error), \
-         patch.object(registry.store, "heartbeat", AsyncMock()), \
-         patch.object(registry.store, "update_progress", AsyncMock()):
+         patch.object(registry.store_client, "mark_error", _mark_error), \
+         patch.object(registry.store_client, "heartbeat", AsyncMock()), \
+         patch.object(registry.store_client, "update_progress", AsyncMock()):
         await registry._run_body("job-1", "chat", {}, None)
 
     assert recorded["code"] == "UPSTREAM_HTTP_400"

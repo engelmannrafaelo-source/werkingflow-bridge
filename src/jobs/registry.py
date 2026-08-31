@@ -14,7 +14,7 @@ Durability model
 ----------------
 - A FRESH job (route) is dispatched via run_generic_job → mark_running → _run_body.
 - A STALE job (dispatching worker died at 'pending', or worker died mid-'running')
-  is recovered by the watchdog: store.claim_stale_job atomically claims it
+  is recovered by the watchdog: store_client.claim_stale_job atomically claims it
   (FOR UPDATE SKIP LOCKED → multi-worker safe, each worker claims a different row)
   and we run _run_body directly — NO second mark_running, so attempts is bumped
   exactly once per (re)start.
@@ -28,7 +28,7 @@ import asyncio
 import logging
 from typing import Any, Awaitable, Callable, Dict, List, Optional
 
-from src.jobs import store
+from src.jobs import store_client
 
 logger = logging.getLogger(__name__)
 
@@ -73,7 +73,7 @@ async def _defer_for_dependency(job_id: str, kind: str, reason: str) -> bool:
     Returns True when the job was deferred (caller must stop), False when the
     patience budget is spent and it should fail loud like any other error.
     """
-    job = await store.get_job(job_id)
+    job = await store_client.get_job(job_id)
     deferred_so_far = (job or {}).get("defer_count") or 0
     if deferred_so_far >= DEPENDENCY_MAX_DEFERS:
         logger.error(
@@ -81,7 +81,7 @@ async def _defer_for_dependency(job_id: str, kind: str, reason: str) -> bool:
             f"dependency waits (~{deferred_so_far * DEPENDENCY_RETRY_DELAY_S // 60}min): {reason}"
         )
         return False
-    await store.defer_job(job_id, DEPENDENCY_RETRY_DELAY_S, reason)
+    await store_client.defer_job(job_id, DEPENDENCY_RETRY_DELAY_S, reason)
     logger.warning(
         f"⏸️ Async job {job_id} (kind={kind}) deferred {DEPENDENCY_RETRY_DELAY_S}s "
         f"(wait {deferred_so_far + 1}/{DEPENDENCY_MAX_DEFERS}) — dependency unreachable: {reason}"
@@ -119,7 +119,7 @@ async def run_generic_job(
 ) -> None:
     """Entry point for a FRESH job (status 'pending'): claim it for this worker
     (pending → running, attempts 0 → 1), then run the body."""
-    await store.mark_running(job_id)
+    await store_client.mark_running(job_id)
     await _run_body(job_id, kind, payload, attribution)
 
 
@@ -134,7 +134,7 @@ async def _run_body(
     (fail loud, queryable) so the job never sits non-terminal."""
     executor = get_executor(kind)
     if executor is None:
-        await store.mark_error(job_id, f"No executor registered for kind '{kind}'", code="NO_EXECUTOR")
+        await store_client.mark_error(job_id, f"No executor registered for kind '{kind}'", code="NO_EXECUTOR")
         logger.error(f"❌ Async job {job_id}: no executor for kind={kind!r}")
         return
 
@@ -146,18 +146,18 @@ async def _run_body(
                 await asyncio.wait_for(stop.wait(), timeout=HEARTBEAT_INTERVAL_S)
             except asyncio.TimeoutError:
                 try:
-                    await store.heartbeat(job_id)
+                    await store_client.heartbeat(job_id)
                 except Exception as e:  # heartbeat failure must not kill the job
                     logger.warning(f"⚠️ Heartbeat failed for job {job_id}: {e}")
 
     hb_task = asyncio.create_task(_heartbeat_loop())
 
     async def report_progress(progress: Dict[str, Any]) -> None:
-        await store.update_progress(job_id, progress)
+        await store_client.update_progress(job_id, progress)
 
     try:
         result = await executor(payload, attribution, report_progress)
-        await store.mark_done(job_id, result)
+        await store_client.mark_done(job_id, result)
         logger.info(f"📦 Async job {job_id} (kind={kind}) finished: done")
     except Exception as e:
         # Preserve the upstream HTTP status in the error code so clients can
@@ -177,7 +177,7 @@ async def _run_body(
             f"UPSTREAM_HTTP_{e.status_code}"
             if isinstance(e, ExecutorHTTPError) else "EXECUTOR_ERROR"
         )
-        await store.mark_error(job_id, str(e), code=code)
+        await store_client.mark_error(job_id, str(e), code=code)
         logger.error(f"❌ Async job {job_id} (kind={kind}) crashed: {e}", exc_info=True)
     finally:
         stop.set()
@@ -194,7 +194,7 @@ async def run_watchdog_pass(stale_seconds: int, max_attempts: int) -> Dict[str, 
     Returns counts. Safe to run concurrently on every worker (atomic claim)."""
     requeued = 0
     while requeued < WATCHDOG_MAX_REQUEUE_PER_PASS:
-        job = await store.claim_stale_job(stale_seconds, max_attempts)
+        job = await store_client.claim_stale_job(stale_seconds, max_attempts)
         if job is None:
             break
         # Already claimed (status=running, attempts bumped) → run the body only.
@@ -203,8 +203,8 @@ async def run_watchdog_pass(stale_seconds: int, max_attempts: int) -> Dict[str, 
         logger.warning(f"♻️ Watchdog requeued stale job {job['job_id']} (attempt {job['attempts']})")
 
     failed = 0
-    for job in await store.find_abandoned(stale_seconds, max_attempts):
-        await store.mark_error(
+    for job in await store_client.find_abandoned(stale_seconds, max_attempts):
+        await store_client.mark_error(
             job["job_id"],
             f"Job lost after {job['attempts']} attempts (worker death, retries exhausted)",
             code="REQUEUE_EXHAUSTED",

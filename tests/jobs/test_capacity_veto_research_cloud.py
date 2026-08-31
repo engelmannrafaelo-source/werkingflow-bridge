@@ -43,7 +43,7 @@ def _auth_patch():
 def _enabled_patches():
     return (
         patch("src.jobs.routes._generic_jobs_enabled", return_value=True),
-        patch("src.jobs.routes.is_db_enabled", return_value=True),
+        patch("src.jobs.store_client.is_store_available", return_value=True),
     )
 
 
@@ -133,7 +133,7 @@ def test_locked_worker_accepts_a_cloud_bound_research_job(client):
         patch("src.jobs.routes.get_executor", return_value=lambda: None),
         patch("src.middleware.capacity_lock.get_capacity_lock",
               return_value=_locked_cap_lock()),
-        patch("src.jobs.store.create_job", create),
+        patch("src.jobs.store_client.create_job", create),
         patch("src.jobs.routes.spawn") as spawn,
     ):
         resp = client.post("/v1/jobs",
@@ -154,7 +154,7 @@ def test_locked_worker_still_rejects_a_pool_bound_research_job(client):
         patch("src.jobs.routes.get_executor", return_value=lambda: None),
         patch("src.middleware.capacity_lock.get_capacity_lock",
               return_value=_locked_cap_lock()),
-        patch("src.jobs.store.create_job", create),
+        patch("src.jobs.store_client.create_job", create),
         patch("src.jobs.routes.spawn") as spawn,
     ):
         resp = client.post("/v1/jobs", json={"kind": "research", "payload": {}})

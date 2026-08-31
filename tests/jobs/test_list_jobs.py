@@ -160,7 +160,7 @@ def test_list_400_no_scope(client):
     with (
         _auth_patch(),
         patch("src.jobs.routes._generic_jobs_enabled", return_value=True),
-        patch("src.jobs.routes.is_db_enabled", return_value=True),
+        patch("src.jobs.store_client.is_store_available", return_value=True),
     ):
         resp = client.get("/v1/jobs")
     assert resp.status_code == 400
@@ -171,7 +171,7 @@ def test_list_400_invalid_status(client):
     with (
         _auth_patch(),
         patch("src.jobs.routes._generic_jobs_enabled", return_value=True),
-        patch("src.jobs.routes.is_db_enabled", return_value=True),
+        patch("src.jobs.store_client.is_store_available", return_value=True),
     ):
         resp = client.get("/v1/jobs?app_id=myapp&status=invalid")
     assert resp.status_code == 400
@@ -191,7 +191,7 @@ def test_list_503_db_disabled(client):
     with (
         _auth_patch(),
         patch("src.jobs.routes._generic_jobs_enabled", return_value=True),
-        patch("src.jobs.routes.is_db_enabled", return_value=False),
+        patch("src.jobs.store_client.is_store_available", return_value=False),
     ):
         resp = client.get("/v1/jobs?app_id=myapp")
     assert resp.status_code == 503
@@ -207,7 +207,7 @@ def test_list_403_cross_app_scope(client):
     with (
         _auth_patch(),
         patch("src.jobs.routes._generic_jobs_enabled", return_value=True),
-        patch("src.jobs.routes.is_db_enabled", return_value=True),
+        patch("src.jobs.store_client.is_store_available", return_value=True),
         patch.object(routes, "_attribution_extractor", fake_extractor),
     ):
         resp = client.get("/v1/jobs?app_id=other-app", headers={"X-App-ID": "real-app"})
@@ -225,7 +225,7 @@ def test_list_403_cross_user_scope(client):
     with (
         _auth_patch(),
         patch("src.jobs.routes._generic_jobs_enabled", return_value=True),
-        patch("src.jobs.routes.is_db_enabled", return_value=True),
+        patch("src.jobs.store_client.is_store_available", return_value=True),
         patch.object(routes, "_attribution_extractor", fake_extractor),
     ):
         resp = client.get("/v1/jobs?user_id=other-user", headers={"X-User-ID": "real-user"})
@@ -245,9 +245,9 @@ def test_list_happy_path_returns_jobs(client):
     with (
         _auth_patch(),
         patch("src.jobs.routes._generic_jobs_enabled", return_value=True),
-        patch("src.jobs.routes.is_db_enabled", return_value=True),
+        patch("src.jobs.store_client.is_store_available", return_value=True),
         patch.object(routes, "_attribution_extractor", fake_extractor),
-        patch.object(routes.store, "list_jobs", AsyncMock(return_value=expected)),
+        patch.object(routes.store_client, "list_jobs", AsyncMock(return_value=expected)),
     ):
         resp = client.get("/v1/jobs?app_id=myapp&user_id=u1&limit=10")
 
@@ -273,9 +273,9 @@ def test_list_no_attribution_headers_passes_scope(client):
     with (
         _auth_patch(),
         patch("src.jobs.routes._generic_jobs_enabled", return_value=True),
-        patch("src.jobs.routes.is_db_enabled", return_value=True),
+        patch("src.jobs.store_client.is_store_available", return_value=True),
         patch.object(routes, "_attribution_extractor", fake_extractor),
-        patch.object(routes.store, "list_jobs", AsyncMock(return_value=expected)),
+        patch.object(routes.store_client, "list_jobs", AsyncMock(return_value=expected)),
     ):
         resp = client.get("/v1/jobs?app_id=any-app")
 
@@ -294,9 +294,9 @@ def test_list_passes_correct_params_to_store(client):
     with (
         _auth_patch(),
         patch("src.jobs.routes._generic_jobs_enabled", return_value=True),
-        patch("src.jobs.routes.is_db_enabled", return_value=True),
+        patch("src.jobs.store_client.is_store_available", return_value=True),
         patch.object(routes, "_attribution_extractor", fake_extractor),
-        patch.object(routes.store, "list_jobs", mock_list),
+        patch.object(routes.store_client, "list_jobs", mock_list),
     ):
         resp = client.get("/v1/jobs?app_id=myapp&status=done&limit=25")
 
