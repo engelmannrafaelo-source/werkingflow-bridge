@@ -78,10 +78,15 @@ origin-bewusste ZIELWAHL an genau dieser einen Stelle:
 
 6. **JIT-Sperre für Fremde (Gürtel + Hosenträger).** Primär verhindert die
    Zielwahl jede lokale Schattenanlage (User-Domain-Calls laufen daheim, wo
-   die Identität existiert). Zusätzlich verweigern die lokalen
-   JIT-/Selbstprovisionierungs-Pfade (`sandbox/lease_service`,
-   Trial-Provisionierung) die Anlage, wenn der Request-Origin fremd ist —
-   loud, mit Origin im Fehlertext.
+   die Identität existiert). Der Hosenträger sind die **Fallback-Sperren**:
+   jeder Direkt-DB-Fallback der geflippten Call-Sites (inkl. der
+   Trial-Selbstprovisionierung — der wörtliche Schattennutzer-Pfad) wirft
+   bei fremdem Origin statt lokal zu lesen/schreiben, loud mit Origin im
+   Fehlertext. `sandbox/lease_service` (der zweite JIT-Pfad) braucht keinen
+   eigenen Guard: `/v1/sandbox/*` gehört nicht zu den cross-bridge
+   geforwardeten Pfaden (nginx forwarded nur chat/research/jobs) — eine App,
+   die direkt die falsche Bridge anspricht, ist App-Fehlkonfiguration und
+   war es auch vor dieser ADR.
 
 7. **Async Jobs.** Der Origin wird bei `POST /v1/jobs` in die persistierte
    `attribution` geschrieben (`bridge_origin`) und vom Executor beim Lauf in
@@ -102,6 +107,48 @@ origin-bewusste ZIELWAHL an genau dieser einen Stelle:
    entfällt für neuen Verkehr ab Föderations-Go-Live.
 4. Die 6 Bestands-Schattennutzer auf Prod bleiben bis zur Merge-Entscheidung
    unangetastet (Rafael-gated, Kundendatenbank).
+
+## Stufe A: Messprotokoll (2026-08-31, Dev-Bridge, Session 7f122be0)
+
+Deploy `bd07585c` um 08:40:18Z (Anlaeufe 1–3 scheiterten an
+raw.githubusercontent.com-Flakiness im --no-cache-Build → lua-resty-http
+seitdem gevendort). Beweise, jeweils mit Erzeuger-Kommando:
+
+1. **Origin-Stempel + Spoof-Reset:** externer Request mit
+   `X-Bridge-Origin: prod` an `49.12.72.66:8000/health` → access.jsonl
+   `"origin":"dev"` (Reset, untrusted Sender). ✓
+2. **Fail-closed:** Chat-Call mit Origin `prod` (kein Peer konfiguriert),
+   User e127c1bd, app werking-report → HTTP 503, Gate-Log „federation
+   misconfigured — failing closed", KEIN LLM-Call, keine Zeile in der
+   lokalen DB. (nginx verpackt den 503-Body als generisches
+   `capacity_busy` — Status stimmt, Detail nur im Worker-Log; bekannter
+   Kosmetik-Punkt. `proxy_next_upstream http_503` probiert zudem alle
+   4 Worker durch — harmlos, da vor dem LLM abgewiesen.) ✓
+3. **Voller foederierter Roundtrip** (synthetischer Peer `test` →
+   platform-api via Docker-DNS, eigener Token-Env): Chat-Call Origin `test`
+   → HTTP 200; worker1-Log zeigt die KOMPLETTE Kette foederiert
+   (provider-config, user-budget-state, billing-context, usage/ai-call,
+   budget/deduct — je „federated to home bridge 'test'"); usage_events-Zeile
+   08:46:02Z (haiku, 0.0145 EUR) + Deduct auf report-standard gelandet. ✓
+4. **Netz-Beine fuer Stufe B einzeln gemessen:**
+   Worker-Container → REMOTE-Tailnet-IP (prod-LB): 200/15ms ✓;
+   remoter Tailnet-Node → Tailscale-gebundenes `:8300`: 200/14ms ✓.
+   **Hairpin Container → EIGENE Host-Tailscale-IP geht NICHT** (ts-input
+   akzeptiert Docker-Quellen nicht) — betrifft nur den synthetischen
+   Selbst-Peer, nicht die echte Cross-Host-Topologie; deshalb zeigt der
+   Test-Peer auf die Docker-DNS-URL.
+5. **Transiente Peer-Fehler live beobachtet** (waehrend der Peer noch auf
+   der unerreichbaren Hairpin-URL stand): Gate fail-open mit lautem Log,
+   Provider-Pin-Check fail-closed nach seinem eigenen Vertrag, keine
+   lokalen DB-Schreiber. Error-Zeilen (cost 0) eines dauerhaft
+   fehlkonfigurierten Peers koennen nach MAX_ATTEMPTS im Spool beerdigt
+   werden — laut, im Log sichtbar, kein Geldverlust.
+
+Host-Konfig Dev (persistiert): `docker/.env` `PLATFORM_FEDERATION_BIND`
+(Achtung: compose liest `.env` aus dem Compose-Datei-Verzeichnis, NICHT dem
+Repo-Root), `secrets/platform.env` `BRIDGE_ORIGIN_ID` + `FEDERATION_PEERS`
++ `FEDERATION_TOKEN_TEST`. Der `test`-Peer bleibt als dauerhafte
+Regressions-Sonde bestehen (dev-only, zeigt auf die eigene platform-api).
 
 ## Rollout
 
