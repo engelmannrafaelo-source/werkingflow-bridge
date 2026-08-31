@@ -56,10 +56,19 @@ declare -A PROD_WORKER_TARGETS=()
 # --- Topology table (single source of the per-bridge worker set) -------------
 # primary: default pool has NO cross-host backup (dev/prod isolation — a dev
 #          request must fail-fast, never spill onto the customer bridge). The
-#          production-priority pool (claude_production) DOES back up to Server-2.
+#          production-priority pool (claude_production) targets the PROD
+#          BRIDGE FIRST, local dev workers are the overflow/backup path
+#          (Rafael, 2026-08-31: his own dev-time usage saturates the dev
+#          workers more than all partners combined; X-Priority:production
+#          traffic — e.g. Energy/Safety in Railway production env — must
+#          prefer the dedicated production capacity, not compete with that
+#          load, and only spill onto the dev bridge if the prod bridge is
+#          itself unreachable/exhausted). Reversed from the original
+#          "dev-first, prod-backup" order.
 # production: the default pool backs up to the dev bridge (Model-B resilience:
 #          both prod workers exhausted/down -> dev bridge serves). claude_production
-#          is the same pool (prod has no separate "production reserve" to route to).
+#          already targets the local prod workers first with the dev bridge as
+#          backup — unchanged, this was already the wanted order.
 
 # $1 = worker name, $2 = NAME (string) of the associative targets array in
 # scope (e.g. "PROD_WORKER_TARGETS") -> "host:port", defaulting to the
@@ -78,18 +87,44 @@ resolve_target() {
 }
 
 emit_upstream() {
-    # $1 = upstream name, $2 = keepalive, $3 = "backup"|"nobackup",
+    # $1 = upstream name, $2 = keepalive,
+    # $3 = "nobackup" | "local-first" | "remote-first"
+    #        nobackup     -> local workers only, no cross-host entry at all
+    #        local-first  -> local workers as regular servers, ${BRIDGE_BACKUP_HOST}
+    #                        as nginx `backup` (only used once ALL locals fail)
+    #        remote-first -> ${BRIDGE_BACKUP_HOST} as the regular server, local
+    #                        workers marked `backup` (overflow only once the
+    #                        remote bridge itself is down/exhausted)
     # $4 = targets-array NAME (string), then worker names
-    local name="$1"; local keepalive="$2"; local backup="$3"; local targets_name="$4"; shift 4
+    local name="$1"; local keepalive="$2"; local mode="$3"; local targets_name="$4"; shift 4
     echo "upstream ${name} {"
     local w target
-    for w in "$@"; do
-        target="$(resolve_target "$w" "$targets_name")"
-        echo "    server ${target} weight=1 max_fails=0;"
-    done
-    if [ "$backup" = "backup" ]; then
-        echo "    server \${BRIDGE_BACKUP_HOST}:8000 backup max_fails=1 fail_timeout=10s;"
-    fi
+    case "$mode" in
+        remote-first)
+            echo "    server \${BRIDGE_BACKUP_HOST}:8000 weight=1 max_fails=1 fail_timeout=10s;"
+            for w in "$@"; do
+                target="$(resolve_target "$w" "$targets_name")"
+                echo "    server ${target} backup max_fails=0;"
+            done
+            ;;
+        local-first)
+            for w in "$@"; do
+                target="$(resolve_target "$w" "$targets_name")"
+                echo "    server ${target} weight=1 max_fails=0;"
+            done
+            echo "    server \${BRIDGE_BACKUP_HOST}:8000 backup max_fails=1 fail_timeout=10s;"
+            ;;
+        nobackup)
+            for w in "$@"; do
+                target="$(resolve_target "$w" "$targets_name")"
+                echo "    server ${target} weight=1 max_fails=0;"
+            done
+            ;;
+        *)
+            echo "ERROR: emit_upstream: unknown mode '$mode'" >&2
+            return 1
+            ;;
+    esac
     echo "    keepalive ${keepalive};"
     echo "}"
 }
@@ -138,7 +173,7 @@ generate() {
             ;;
         production)
             workers=("${PROD_WORKERS[@]}")
-            default_backup="backup"     # Model-B: default pool backs up to dev bridge
+            default_backup="local-first"   # Model-B: default pool backs up to dev bridge
             targets_name="PROD_WORKER_TARGETS"
             ;;
         *)
@@ -166,9 +201,18 @@ HEADER
     emit_upstream claude_workers 32 "$default_backup" "$targets_name" "${workers[@]}"
     echo
 
-    echo "# Production-priority pool (X-Priority: production). Backs up to"
-    echo "# \${BRIDGE_BACKUP_HOST}: Server-2 on primary, the dev bridge on production."
-    emit_upstream claude_production 16 backup "$targets_name" "${workers[@]}"
+    echo "# Production-priority pool (X-Priority: production)."
+    if [ "$id" = "primary" ]; then
+        echo "# Targets the PROD bridge (\${BRIDGE_BACKUP_HOST}) FIRST — local dev"
+        echo "# workers are the overflow path, used only if the prod bridge itself"
+        echo "# is unreachable/exhausted (Rafael, 2026-08-31: production-priority"
+        echo "# traffic must not compete with dev-time load for dev-worker capacity)."
+        emit_upstream claude_production 16 remote-first "$targets_name" "${workers[@]}"
+    else
+        echo "# Local prod workers first, \${BRIDGE_BACKUP_HOST} (the dev bridge) is the"
+        echo "# overflow path — already the wanted order, unchanged."
+        emit_upstream claude_production 16 local-first "$targets_name" "${workers[@]}"
+    fi
 }
 
 generate_worker_map() {
