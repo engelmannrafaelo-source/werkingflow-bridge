@@ -2,9 +2,13 @@
 
 **Status:** PARTIAL — mechanism built and validated (nginx routing, upstream
 generation, metrics-reader polling, a third deploy topology), new host
-prepared, **Schritte 1, 2, 2b und 2c des Umsetzungsplans auf `develop` und auf
-der DEV-Bridge (`hetzner`) im Echtbetrieb; auf Prod (`server2`) ist davon nichts
-deployt** — siehe Umsetzungsplan unten. The cutover itself (moving real traffic to the new host) is NOT
+prepared, **Schritte 1, 2, 2b, 2c und 2d des Umsetzungsplans auf `develop` und
+auf der DEV-Bridge (`hetzner`) im Echtbetrieb; auf Prod (`server2`) ist davon
+nichts deployt** — siehe Umsetzungsplan unten. Mit 2d ist Weg (b) vollstaendig:
+der Worker-Pfad braucht keine eigene DB-Verbindung mehr, der alte
+Postgres-Reachability-Blocker (Item 4) ist aufgeloest; zum Cutover fehlen noch
+die drei Punkte im Header von `docker/docker-compose-worker-host.yml`
+(PLATFORM_API_URL via Tailscale-Publish von platform-api — Rafael-gated). The cutover itself (moving real traffic to the new host) is NOT
 done and has an open blocker (see "Open blocker" below). Nothing in this ADR
 has touched the live production-barrier bridge.
 **Date:** 2026-08-18
@@ -441,6 +445,18 @@ und entfallen physisch erst mit dem Umzug); der Streaming-Verlustkanal aus
 Schritt 1 (eigenes Stueck); Item 5 (metrics-reader Log-Volume) — unveraendert
 offen. Abnahme als Test: `tests/jobs/test_store_client_needs_no_database.py`
 (gleiche Bauart wie 2c — jeder Pool-Griff sprengt den Test).
+
+Im Echtbetrieb nachgemessen (Dev-Bridge, 2026-08-31, Deploy `932f090`,
+Smoke 11/11): ein voller Job-Lebenszyklus (create → mark-running → progress →
+done) als `POST /v1/internal/jobs*` in den platform-api-Logs, dazu ein
+organischer Fremd-Job mit Heartbeats ueber denselben Pfad; alle vier Worker
+fahren claim-stale/abandoned/cleanup alle 30s gegen platform-api; 0 Treffer
+fuer "falling back to direct DB" in allen Worker-Logs; Sweeps starten in
+platform-api (Worker-Logs sweep-frei); `/v1/internal/audit/
+anonymization-metrics` beantwortet die pseudonym-monitor-Abfragen mit 200.
+Bedrock-Reconciliation auf dev "AWS credentials not configured — disabled":
+kein Regress, die Worker hatten den Key auf dev auch nie; auf prod liegt er in
+der von platform-api MITgenutzten `platform.env` (live geprueft, read-only).
 
 **Schritt 3 — EIN Worker von vieren zieht um.** nginx behaelt drei lokal. Ein Fehler
 zeigt sich an einem Viertel des Verkehrs. Rueckweg = nginx-Ziel zurueckstellen, gleiche
