@@ -147,7 +147,10 @@ async def call_platform(
         target = resolve_user_domain_target()  # raises FederationMisconfigured
         if target is not None:
             base, token = target.base_url, target.token
-            logger.debug(
+            # INFO deliberately: federated calls only happen for cross-bridge
+            # execution — low volume, and this line IS the operational
+            # evidence that billing went home (ADR-0011 Stage-A/B proof).
+            logger.info(
                 "platform call federated to home bridge %r: %s %s",
                 target.origin, method, path,
             )
