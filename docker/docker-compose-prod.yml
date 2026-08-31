@@ -51,9 +51,16 @@ services:
       - BRIDGE_ID=${BRIDGE_ID:-prod}
       # Worker set for docker/lua/pool_router.lua (env BRIDGE_WORKERS in nginx.conf).
       - BRIDGE_WORKERS=worker-sahori,worker-kurt,worker-coach,worker-erk
+      # Per-topology metrics-reader target (nginx.conf `set $metrics_reader`).
+      # Since the ADR-0009 cutover the prod reader lives on the WORKER-HOST
+      # next to the workers' logs volume (its data ownership moved with the
+      # workers) — docker/.env on this host sets the Tailscale target
+      # (100.93.143.105:8005). The same-host default only serves a rollback
+      # where workers AND reader both run here again.
+      - METRICS_READER_TARGET=${METRICS_READER_TARGET:-metrics-reader:8000}
     # envsubst nginx.conf + the upstreams include (both need ${BRIDGE_BACKUP_HOST}),
     # then start openresty. Same mechanism as the primary compose.
-    command: ["/bin/sh", "-c", "envsubst '$$BRIDGE_BACKUP_HOST $$BRIDGE_ID' < /etc/nginx/nginx.conf > /tmp/nginx.conf && envsubst '$$BRIDGE_BACKUP_HOST' < /etc/nginx/upstreams.conf > /tmp/upstreams.conf && cp /etc/nginx/worker-map.conf /tmp/worker-map.conf && openresty -c /tmp/nginx.conf -g 'daemon off;'"]
+    command: ["/bin/sh", "-c", "envsubst '$$BRIDGE_BACKUP_HOST $$BRIDGE_ID $$METRICS_READER_TARGET' < /etc/nginx/nginx.conf > /tmp/nginx.conf && envsubst '$$BRIDGE_BACKUP_HOST' < /etc/nginx/upstreams.conf > /tmp/upstreams.conf && cp /etc/nginx/worker-map.conf /tmp/worker-map.conf && openresty -c /tmp/nginx.conf -g 'daemon off;'"]
     depends_on:
       - worker-sahori
       - worker-kurt

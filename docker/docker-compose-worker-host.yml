@@ -202,6 +202,52 @@ services:
       INSTANCE_NAME: worker-erk
       WORKER_ACCOUNT: erk
 
+  # ===========================================================================
+  # Metrics Reader — moved here WITH the workers (2026-08-31, same cutover):
+  # it aggregates the workers' JSONL files (request_log.*, prompt metrics,
+  # limiter_events.*, cc_usage_snapshots) from the shared logs volume, so its
+  # data ownership travels with them. Served from production-barrier after the
+  # worker cutover, every file-based metrics endpoint froze at the cutover
+  # minute (found via the stale CUI account badges). production-barrier's
+  # nginx reaches it over Tailscale (METRICS_READER_TARGET in its .env);
+  # lb-status/account-pool-state polls resolve the workers via same-host
+  # Docker DNS here — no BRIDGE_WORKER_TARGETS needed, exactly like before
+  # the separation, just on this host.
+  # ===========================================================================
+  metrics-reader:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.metrics-reader
+      args:
+        GIT_COMMIT: ${GIT_COMMIT:-unknown}
+    container_name: wt-worker-host-metrics-reader
+    ports:
+      - "${WORKER_HOST_BIND_IP:-100.93.143.105}:8005:8000"
+    deploy:
+      resources:
+        limits:
+          # Same headroom reasoning as the prod-barrier reader it replaces
+          # (docker-compose-prod.yml, OOM incident 22.07.).
+          memory: 1024M
+        reservations:
+          memory: 128M
+    volumes:
+      - worker-host-logs:/app/logs:ro
+    environment:
+      - METRICS_DIR=/app/logs
+      - LOG_LEVEL=INFO
+      - TZ=Europe/Vienna
+      - BRIDGE_WORKERS=worker-sahori,worker-kurt,worker-coach,worker-erk
+    networks:
+      - bridge-worker-host-net
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8000/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
 networks:
   bridge-worker-host-net:
     driver: bridge

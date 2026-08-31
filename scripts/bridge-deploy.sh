@@ -107,16 +107,18 @@ BRIDGE_DB_NAME="bridge"
 SERVER2_SVC_platform_api="wt-prod-platform-api"
 # postgres-prod zuerst (DB vor platform-api), platform-api vor nginx (Upstream-Resolve).
 # ADR-0009 cutover executed 2026-08-31 (Rafael-Direktfreigabe, Session
-# 7f122be0): the four prod workers now live on the worker-host and deploy
-# via the `prod-workers` target — deliberately REMOVED from SERVER2_ALL so a
-# routine server2 deploy can never resurrect them next to the customer DB
-# (two container sets against the same Anthropic accounts). Their compose
-# definition and token files stay on server2 as a documented emergency
-# reserve only; bringing them back is a conscious act, not a side effect.
-SERVER2_ALL="postgres-prod platform-api metrics-reader-prod nginx"
+# 7f122be0): the four prod workers AND the metrics-reader (it aggregates
+# their JSONL files — data ownership moved with them) now live on the
+# worker-host and deploy via the `prod-workers` target — deliberately
+# REMOVED from SERVER2_ALL so a routine server2 deploy can never resurrect
+# them next to the customer DB (two container sets against the same
+# Anthropic accounts; a barrier-side reader would serve frozen files).
+# Compose definitions and token files stay on server2 as a documented
+# emergency reserve only; bringing them back is a conscious act.
+SERVER2_ALL="postgres-prod platform-api nginx"
 # nginx now BUILDS from Dockerfile.nginx-lb (OpenResty+Lua) — the same image as
 # primary (ADR-0006 B/C). It was a pre-built nginx:alpine before the unification.
-SERVER2_NEEDS_BUILD="platform-api nginx metrics-reader-prod"
+SERVER2_NEEDS_BUILD="platform-api nginx"
 
 # Worker-host (ADR-0009): service -> container name. Distinct container-name
 # prefix (wt-worker-host-*) from server2's wt-prod-worker-* on purpose — the
@@ -127,8 +129,11 @@ WORKERHOST_SVC_worker_sahori="wt-worker-host-sahori"
 WORKERHOST_SVC_worker_kurt="wt-worker-host-kurt"
 WORKERHOST_SVC_worker_coach="wt-worker-host-coach"
 WORKERHOST_SVC_worker_erk="wt-worker-host-erk"
-WORKERHOST_ALL="worker-sahori worker-kurt worker-coach worker-erk"
-WORKERHOST_NEEDS_BUILD="worker-sahori worker-kurt worker-coach worker-erk"
+# metrics-reader moved here WITH the workers (2026-08-31) — it aggregates
+# their JSONL files from the shared logs volume; see the compose header.
+WORKERHOST_SVC_metrics_reader="wt-worker-host-metrics-reader"
+WORKERHOST_ALL="metrics-reader worker-sahori worker-kurt worker-coach worker-erk"
+WORKERHOST_NEEDS_BUILD="metrics-reader worker-sahori worker-kurt worker-coach worker-erk"
 
 # State (reset per server in deploy_server)
 ROLLBACK_SHA=""
@@ -669,7 +674,7 @@ phase_validate() {
     # The only per-bridge input is the generated upstreams include.
     local nginx_conf upstreams_conf worker_map_conf envsubst_vars add_hosts
     nginx_conf="docker/nginx.conf"
-    envsubst_vars='$BRIDGE_BACKUP_HOST $BRIDGE_ID'
+    envsubst_vars='$BRIDGE_BACKUP_HOST $BRIDGE_ID $METRICS_READER_TARGET'
     if [[ "$compose" == *"prod"* ]]; then
         upstreams_conf="docker/upstreams-prod.conf"
         worker_map_conf="docker/worker-map-prod.conf"
