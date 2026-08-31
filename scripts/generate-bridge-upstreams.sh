@@ -50,8 +50,14 @@ PRIMARY_WORKERS=(worker1 worker2 worker3 worker4)
 PROD_WORKERS=(worker-sahori worker-kurt worker-coach worker-erk)
 declare -A PRIMARY_WORKER_TARGETS=()
 declare -A PROD_WORKER_TARGETS=()
-# Example cutover entry (do not uncomment without ADR-0009's gated migration):
-#   PROD_WORKER_TARGETS[worker-sahori]="100.93.143.105:8001"
+# ADR-0009 CUTOVER EXECUTED 2026-08-31 (Rafael-Direktfreigabe in Session
+# 7f122be0, "mach bitte endlich den umzug"): the four prod workers live on
+# the dedicated worker host (tailnet prod-workers-1), NOT on the
+# production-barrier anymore. Ports = docker-compose-worker-host.yml.
+PROD_WORKER_TARGETS[worker-sahori]="100.93.143.105:8001"
+PROD_WORKER_TARGETS[worker-kurt]="100.93.143.105:8002"
+PROD_WORKER_TARGETS[worker-coach]="100.93.143.105:8003"
+PROD_WORKER_TARGETS[worker-erk]="100.93.143.105:8004"
 
 # --- Topology table (single source of the per-bridge worker set) -------------
 # ADR-0010 (Rafael, 2026-08-31): ONE 8-worker pool in two tiers. Level 1 = the
