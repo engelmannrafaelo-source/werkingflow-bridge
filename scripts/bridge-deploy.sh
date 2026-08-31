@@ -102,10 +102,17 @@ BRIDGE_DB_USER="bridge"
 BRIDGE_DB_NAME="bridge"
 SERVER2_SVC_platform_api="wt-prod-platform-api"
 # postgres-prod zuerst (DB vor platform-api), platform-api vor nginx (Upstream-Resolve).
-SERVER2_ALL="postgres-prod platform-api nginx worker-sahori worker-kurt worker-coach worker-erk metrics-reader-prod"
+# ADR-0009 cutover executed 2026-08-31 (Rafael-Direktfreigabe, Session
+# 7f122be0): the four prod workers now live on the worker-host and deploy
+# via the `prod-workers` target — deliberately REMOVED from SERVER2_ALL so a
+# routine server2 deploy can never resurrect them next to the customer DB
+# (two container sets against the same Anthropic accounts). Their compose
+# definition and token files stay on server2 as a documented emergency
+# reserve only; bringing them back is a conscious act, not a side effect.
+SERVER2_ALL="postgres-prod platform-api nginx metrics-reader-prod"
 # nginx now BUILDS from Dockerfile.nginx-lb (OpenResty+Lua) — the same image as
 # primary (ADR-0006 B/C). It was a pre-built nginx:alpine before the unification.
-SERVER2_NEEDS_BUILD="platform-api nginx worker-sahori worker-kurt worker-coach worker-erk metrics-reader-prod"
+SERVER2_NEEDS_BUILD="platform-api nginx metrics-reader-prod"
 
 # Worker-host (ADR-0009): service -> container name. Distinct container-name
 # prefix (wt-worker-host-*) from server2's wt-prod-worker-* on purpose — the
