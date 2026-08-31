@@ -94,6 +94,10 @@ _ATTRIBUTION_HEADERS = {
     "user_id": "X-User-ID",
     "app_env": "X-App-Env",
     "job_id": "X-Job-ID",
+    # ADR-0011: the self-call must keep the job's HOME bridge — nginx trusts
+    # this header from the docker-internal subnet (see $bridge_origin_out),
+    # so the inner request bills against the same budget domain as the job.
+    "bridge_origin": "X-Bridge-Origin",
 }
 
 # Last-resort caller identity for self-calls whose triggering job carried NO

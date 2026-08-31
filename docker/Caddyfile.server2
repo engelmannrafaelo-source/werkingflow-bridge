@@ -13,5 +13,9 @@
 # Additiv vor dem bestehenden LB: reine Weiterleitung an den OpenResty-LB
 # (Compose-Service `nginx`), KEINE eigene Routing-/Failover-Logik hier.
 prod-bridge.werking.tools {
-	reverse_proxy nginx:80
+	# ADR-0011: Origin-Header von aussen strippen — Begruendung siehe
+	# Caddyfile.hetzner (identischer Fall).
+	reverse_proxy nginx:80 {
+		header_up -X-Bridge-Origin
+	}
 }

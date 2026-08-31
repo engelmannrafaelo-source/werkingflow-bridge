@@ -805,6 +805,12 @@ from src.middleware.event_logger import EventLogger
 # Re-enabled: Pure ASGI implementation, not affected by BaseHTTPMiddleware bug
 app.add_middleware(PerformanceMonitorMiddleware)
 
+# ADR-0011: request-scoped HOME-bridge origin (X-Bridge-Origin, LB-stamped).
+# Added LAST → outermost, so the origin is in context before ANY other layer
+# (tenant, attribution, endpoints) touches identity/budget/ledger paths.
+from src.federation import OriginMiddleware
+app.add_middleware(OriginMiddleware)
+
 # Concurrency limiter — only memory-threshold safety net.
 # Adaptive cap_tokens does the real throttling per worker; hardcoded
 # concurrency caps would override that learning. Default is effectively

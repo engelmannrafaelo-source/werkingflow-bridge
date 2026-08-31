@@ -531,9 +531,14 @@ async def resolve_allocated_plan_id(
         resp = await call_platform(
             "GET", "/v1/internal/project-budgets/allocated-plan-id",
             params={"user_id": str(user_id), "project_id": project_id},
-            retries=1,
+            retries=1, domain="user",
         )
     except PlatformUnavailable as e:
+        from src.federation import is_foreign_origin
+        if is_foreign_origin():
+            # ADR-0011: local project_budgets is the wrong domain for a
+            # foreign-origin request — no local fallback.
+            raise
         logger.error(
             "allocated-plan lookup via platform-api failed (%s) — falling back to direct DB", e
         )
@@ -548,6 +553,13 @@ async def resolve_allocated_plan_id(
     if resp.status_code == 200 and isinstance(resp.json, dict) and "planId" in resp.json:
         return resp.json["planId"]
 
+    from src.federation import is_foreign_origin
+    if is_foreign_origin():
+        raise PlatformUnavailable(
+            f"home-bridge allocated-plan lookup returned unexpected "
+            f"status={resp.status_code} — refusing the local-DB fallback for a "
+            f"foreign-origin request (ADR-0011)"
+        )
     logger.error(
         "allocated-plan lookup via platform-api returned unexpected status=%s body=%r "
         "— falling back to direct DB",
@@ -582,9 +594,13 @@ async def evaluate_via_platform(
                 "project_id": project_id,
                 "estimated_cost_eur": estimated_cost_eur,
             },
-            retries=1,
+            retries=1, domain="user",
         )
     except PlatformUnavailable as e:
+        from src.federation import is_foreign_origin
+        if is_foreign_origin():
+            # ADR-0011: no local-DB fallback for a foreign-origin request.
+            raise
         logger.error(
             "project budget state via platform-api failed (%s) — falling back to direct DB", e
         )
@@ -593,6 +609,13 @@ async def evaluate_via_platform(
     if resp.status_code == 200 and isinstance(resp.json, dict) and "exists" in resp.json:
         return resp.json
 
+    from src.federation import is_foreign_origin
+    if is_foreign_origin():
+        raise PlatformUnavailable(
+            f"home-bridge project budget state returned unexpected "
+            f"status={resp.status_code} — refusing the local-DB fallback for a "
+            f"foreign-origin request (ADR-0011)"
+        )
     logger.error(
         "project budget state via platform-api returned unexpected status=%s body=%r "
         "— falling back to direct DB",
@@ -640,6 +663,7 @@ async def deduct_via_platform(
             "tenant_id": tenant_id,
         },
         retries=0,  # not idempotent — see above
+        domain="user",  # ADR-0011: the project budget lives on the user's HOME bridge
     )
 
     if resp.status_code == 200 and isinstance(resp.json, dict) and "exists" in resp.json:

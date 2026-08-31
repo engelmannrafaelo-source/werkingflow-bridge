@@ -517,6 +517,7 @@ async def apply_budget_deduction_via_platform(
             "actualCostEur": actual_cost_eur,
         },
         retries=0,  # not idempotent — see above
+        domain="user",  # ADR-0011: the deduction belongs to the user's HOME budget
     )
 
     if resp.status_code == 200 and isinstance(resp.json, dict):
@@ -869,9 +870,15 @@ async def _load_budget_via_platform(user_id: uuid.UUID) -> UserBudget:
     try:
         resp = await call_platform(
             "POST", "/v1/internal/budget/user-budget-state",
-            json={"user_id": str(user_id)}, retries=1,
+            json={"user_id": str(user_id)}, retries=1, domain="user",
         )
     except PlatformUnavailable as e:
+        from src.federation import is_foreign_origin
+        if is_foreign_origin():
+            # ADR-0011: the LOCAL user_budgets table is the wrong domain for a
+            # foreign-origin request — reading it would gate against a shadow
+            # trial instead of the user's real home budget.
+            raise
         logger.error(
             "user budget state via platform-api failed (%s) — falling back to direct DB", e
         )
@@ -882,6 +889,12 @@ async def _load_budget_via_platform(user_id: uuid.UUID) -> UserBudget:
     if resp.status_code == 200 and isinstance(resp.json, dict) and "monthlyBudgets" in resp.json:
         return _deserialize_user_budget(resp.json)
 
+    from src.federation import is_foreign_origin
+    if is_foreign_origin():
+        raise PlatformUnavailable(
+            f"home-bridge budget state returned unexpected status={resp.status_code} "
+            f"— refusing the local-DB fallback for a foreign-origin request (ADR-0011)"
+        )
     logger.error(
         "user budget state via platform-api returned unexpected status=%s body=%r "
         "— falling back to direct DB",
@@ -908,8 +921,15 @@ async def _ensure_trial_via_platform(
         resp = await call_platform(
             "POST", "/v1/internal/budget/ensure-trial",
             json={"user_id": str(user_id), "plan_id": plan_id}, retries=1,
+            domain="user",
         )
     except PlatformUnavailable as e:
+        from src.federation import is_foreign_origin
+        if is_foreign_origin():
+            # ADR-0011: provisioning a trial in the LOCAL db for a foreign
+            # user IS the shadow-user bug (jit-*@…local, trial silently
+            # consumed on the wrong bridge). Never fall back here.
+            raise
         logger.error(
             "trial provisioning via platform-api failed (%s) — falling back to direct DB", e
         )
@@ -927,6 +947,13 @@ async def _ensure_trial_via_platform(
     ):
         return _deserialize_user_budget(resp.json["state"])
 
+    from src.federation import is_foreign_origin
+    if is_foreign_origin():
+        raise PlatformUnavailable(
+            f"home-bridge trial provisioning returned unexpected "
+            f"status={resp.status_code} — refusing the local-DB fallback for a "
+            f"foreign-origin request (ADR-0011)"
+        )
     logger.error(
         "trial provisioning via platform-api returned unexpected status=%s body=%r "
         "— falling back to direct DB",

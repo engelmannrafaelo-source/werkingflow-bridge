@@ -132,6 +132,14 @@ async def _run_body(
     """Execute one job that is ALREADY marked 'running'. Heartbeats for the whole
     run; records done/error. Never raises — a crash is persisted as status='error'
     (fail loud, queryable) so the job never sits non-terminal."""
+    # ADR-0011: restore the job's HOME-bridge origin into this task's context.
+    # The job body runs OUTSIDE the original request (spawned task, or a
+    # reclaim after restart) — without this, every budget/ledger call during
+    # execution would resolve to the LOCAL platform-api regardless of where
+    # the job's user lives.
+    from src.federation import set_request_origin
+    set_request_origin((attribution or {}).get("bridge_origin"))
+
     executor = get_executor(kind)
     if executor is None:
         await store_client.mark_error(job_id, f"No executor registered for kind '{kind}'", code="NO_EXECUTOR")

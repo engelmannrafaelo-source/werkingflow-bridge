@@ -58,7 +58,10 @@ LEDGER_WRITE_TIMEOUT_S = 5.0
 # has run cannot un-run, so this is cached for the process lifetime. Only a
 # POSITIVE answer is cached: a negative one must keep being asked, or running
 # migration 032 would not take effect until the worker restarts.
-_anonymous_identity_verified = False
+# Keyed by federation cache scope (ADR-0011): "" = own platform-api, else the
+# peer's — the two databases run their migrations independently, so "present
+# here" says nothing about "present there".
+_anonymous_identity_verified: set = set()
 
 
 class LedgerWriteRejected(Exception):
@@ -80,14 +83,18 @@ async def anonymous_identity_present() -> bool:
     be answered — the caller must not read that as "absent", because absent is a
     definitive skip and unanswerable is not.
     """
-    global _anonymous_identity_verified
-    if _anonymous_identity_verified:
+    from src.federation import cache_scope
+
+    scope = cache_scope()
+    if scope in _anonymous_identity_verified:
         return True
 
-    resp = await call_platform("GET", "/v1/internal/identity/anonymous", retries=1)
+    resp = await call_platform(
+        "GET", "/v1/internal/identity/anonymous", retries=1, domain="user"
+    )
     present = _require_field(resp, "present", "/v1/internal/identity/anonymous")
     if present:
-        _anonymous_identity_verified = True
+        _anonymous_identity_verified.add(scope)
     return bool(present)
 
 
@@ -101,7 +108,8 @@ async def load_billing_context(user_id: str) -> Optional[Dict[str, Any]]:
     spool and file the call as correctly-not-metered.
     """
     resp = await call_platform(
-        "GET", f"/v1/internal/users/{user_id}/billing-context", retries=1
+        "GET", f"/v1/internal/users/{user_id}/billing-context", retries=1,
+        domain="user",
     )
     return _require_field(
         resp, "context", f"/v1/internal/users/{user_id}/billing-context"
@@ -127,6 +135,7 @@ async def write_ai_call(payload: Dict[str, Any]) -> str:
         json=payload,
         timeout_s=LEDGER_WRITE_TIMEOUT_S,
         retries=0,  # the spool is this call's retry — see module docstring
+        domain="user",  # ADR-0011: the usage row belongs to the user's HOME ledger
     )
     outcome = _require_field(resp, "outcome", "/v1/internal/usage/ai-call")
     if outcome not in ("written", "duplicate"):

@@ -78,6 +78,10 @@ services:
     container_name: wt-prod-platform-api
     expose:
       - "8000"
+    # ADR-0011 Föderation — Begründung siehe docker-compose-platform-overlay.yml
+    # (identischer Fall; Wert = Tailscale-IP dieses Hosts, Default bleibt zu).
+    ports:
+      - "${PLATFORM_FEDERATION_BIND:-127.0.0.1}:8300:8000"
     # Sandbox lease (/v1/sandbox/lease-token) liest OAuth-Token aus
     # BRIDGE_SECRETS_DIR/claude_token_<account>.txt — gleiche Konvention wie Worker.
     volumes:

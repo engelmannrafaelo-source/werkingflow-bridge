@@ -136,21 +136,23 @@ async def test_anonymous_absence_is_an_answer_but_is_not_cached():
     """Eine fehlende Migration-032-Identitaet darf nicht bis zum Neustart
     haengenbleiben: sonst wuerde das Ausfuehren der Migration erst nach einem
     Worker-Restart wirken, waehrend die Zeilen weiter geschuldet auflaufen."""
-    ledger_client._anonymous_identity_verified = False
+    # Seit ADR-0011 ein per-Origin-Scope-Set ("" = eigene platform-api) —
+    # die Vertragsaussage bleibt: Abwesenheit wird NIE gecacht, Anwesenheit schon.
+    ledger_client._anonymous_identity_verified = set()
     with _answers(200, {"present": False}):
         assert await ledger_client.anonymous_identity_present() is False
-    assert ledger_client._anonymous_identity_verified is False
+    assert ledger_client._anonymous_identity_verified == set()
 
     with _answers(200, {"present": True}):
         assert await ledger_client.anonymous_identity_present() is True
-    assert ledger_client._anonymous_identity_verified is True
-    ledger_client._anonymous_identity_verified = False
+    assert "" in ledger_client._anonymous_identity_verified
+    ledger_client._anonymous_identity_verified = set()
 
 
 @pytest.mark.asyncio
 async def test_unanswerable_anonymous_probe_raises():
     """…statt "nicht vorhanden" zu melden, was den Call verwerfen wuerde."""
-    ledger_client._anonymous_identity_verified = False
+    ledger_client._anonymous_identity_verified = set()
     with _answers(503, None):
         with pytest.raises(LedgerWriteRejected):
             await ledger_client.anonymous_identity_present()

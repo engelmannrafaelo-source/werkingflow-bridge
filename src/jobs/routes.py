@@ -134,6 +134,18 @@ async def create_job_endpoint(
     if attribution is None and _attribution_extractor is not None:
         attribution = _attribution_extractor(request)
 
+    # ADR-0011: the job's HOME bridge comes from the LB-stamped request
+    # context, NEVER from the body — a body-supplied bridge_origin would let a
+    # caller redirect whose budget pays. Persisted with the job so a reclaim
+    # after restart (and the executor's self-call) keeps billing at home.
+    from src.federation import get_request_origin
+    _origin = get_request_origin()
+    if _origin:
+        attribution = dict(attribution or {})
+        attribution["bridge_origin"] = _origin
+    elif attribution and "bridge_origin" in attribution:
+        attribution = {k: v for k, v in attribution.items() if k != "bridge_origin"}
+
     # Placement veto (Autobahn): the job EXECUTES on THIS worker (spawn below),
     # and the executor's chat self-call pins to localhost — the LLM work can
     # only ever use THIS worker's account. If that account is capacity-locked

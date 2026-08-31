@@ -42,6 +42,11 @@ from typing import Optional
 
 from fastapi import HTTPException
 
+from src.federation import (
+    FederationMisconfigured,
+    is_foreign_origin,
+    resolve_user_domain_target,
+)
 from src.budget.plan_resolution import PlanResolutionError, resolve_billing_plan
 from src.budget.plans import (
     AmbiguousPlanCatalog,
@@ -95,6 +100,31 @@ async def enforce_budget(
     # otherwise start rejecting calls that were never metered to begin with).
     if find_monthly_plan_for_app(app_id) is None and not find_project_plans_for_app(app_id):
         return
+
+    # ADR-0011 pre-flight: a FOREIGN-origin request whose home bridge is not
+    # configured as a federation peer must fail CLOSED — this is a deploy
+    # error, not a transient one, and the fail-open policy below is reserved
+    # for transient infrastructure faults. Letting it through would mean an
+    # unbudgeted call evaluated against (and JIT-provisioned into) the WRONG
+    # database — the exact defect this ADR removes. Checked once up front so
+    # the catch-alls below can stay what they are.
+    if is_foreign_origin():
+        try:
+            resolve_user_domain_target()
+        except FederationMisconfigured as e:
+            logger.error("budget gate: federation misconfigured — failing closed: %s", e)
+            raise HTTPException(
+                status_code=503,
+                detail={
+                    "error": "federation_unconfigured",
+                    "appId": app_id,
+                    "message": (
+                        "Diese Bridge kann die Heimat-Bridge des Requests nicht "
+                        "erreichen (Föderations-Konfiguration fehlt). Der Call "
+                        "wird nicht lokal bewertet."
+                    ),
+                },
+            ) from e
 
     try:
         uid = await resolve_user_id(user_id)

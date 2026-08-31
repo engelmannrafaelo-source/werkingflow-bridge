@@ -59,6 +59,14 @@ services:
     container_name: wt-platform-api
     expose:
       - "8000"
+    # ADR-0011 Föderation: die platform-api der Heimat-Bridge muss für die
+    # Worker der PEER-Bridge erreichbar sein — ausschliesslich übers Tailnet.
+    # PLATFORM_FEDERATION_BIND = Tailscale-IP DIESES Hosts (host-Env/.env);
+    # Default 127.0.0.1 hält den Port geschlossen, bis der Host ihn bewusst
+    # öffnet. NIE 0.0.0.0 — interne Endpoints gehören nicht an die Edge
+    # (platform_client.py, ADR-0009).
+    ports:
+      - "${PLATFORM_FEDERATION_BIND:-127.0.0.1}:8300:8000"
     deploy:
       resources:
         limits:

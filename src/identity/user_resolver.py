@@ -26,6 +26,7 @@ import uuid
 from typing import Any, Optional
 
 from src.db.client import get_pool
+from src.federation import cache_scope, is_foreign_origin
 from src.platform_client import PlatformUnavailable, call_platform
 
 logger = logging.getLogger(__name__)
@@ -160,16 +161,25 @@ async def _resolve_email_identity(email: str) -> Optional[uuid.UUID]:
     Opts into ONE retry: this is a pure read, so replaying it is safe. See
     platform_client.call_platform for why retrying is opt-in and not a default.
     """
-    hit, cached = _email_cache_get(email)
+    # ADR-0011: the email→UUID mapping is a fact of the request's HOME bridge
+    # (the same email has DIFFERENT UUIDs per bridge), so the cache key carries
+    # the origin scope and the lookup goes domain="user".
+    cache_key = f"{cache_scope()}:{email}" if cache_scope() else email
+    hit, cached = _email_cache_get(cache_key)
     if hit:
         return cached
 
     try:
         resp = await call_platform(
             "POST", "/v1/internal/users/lookup-by-email",
-            json={"email": email}, retries=1,
+            json={"email": email}, retries=1, domain="user",
         )
     except PlatformUnavailable as e:
+        if is_foreign_origin():
+            # The LOCAL users table is the WRONG identity domain for a foreign
+            # request — a fallback there is not degradation, it is the
+            # shadow-user bug (ADR-0011). Unreachable home stays unreachable.
+            raise
         logger.error(
             "email identity lookup via platform-api failed (%s) — falling back to direct DB", e
         )
@@ -184,6 +194,12 @@ async def _resolve_email_identity(email: str) -> Optional[uuid.UUID]:
             # identity" for what may be a platform-api bug would reject a
             # legitimate caller, and on this path that means refusing a paying
             # customer's call.
+            if is_foreign_origin():
+                raise PlatformUnavailable(
+                    f"home-bridge identity lookup returned unexpected "
+                    f"status={resp.status_code} — refusing the local-DB fallback "
+                    f"for a foreign-origin request (ADR-0011)"
+                )
             logger.error(
                 "email identity lookup via platform-api returned unexpected "
                 "status=%s body=%r — falling back to direct DB",
@@ -191,5 +207,5 @@ async def _resolve_email_identity(email: str) -> Optional[uuid.UUID]:
             )
             uid = await lookup_user_id_by_email(email)
 
-    _email_cache_put(email, uid)
+    _email_cache_put(cache_key, uid)
     return uid

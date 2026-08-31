@@ -131,7 +131,12 @@ async def _lookup_user_tenant(user_id: Any) -> tuple[bool, Optional[str]]:
     Opts into ONE retry: a pure read, so a replay cannot double-write (see
     platform_client.call_platform for why retrying is opt-in).
     """
-    key = str(user_id)
+    from src.federation import cache_scope, is_foreign_origin
+
+    # ADR-0011: user→tenant is a fact of the request's HOME bridge; the cache
+    # key carries the origin scope so the same UUID cannot cross domains.
+    uid_key = str(user_id)
+    key = f"{cache_scope()}:{uid_key}" if cache_scope() else uid_key
     entry = _tenant_cache.get(key)
     if entry is not None:
         ts, tenant_id = entry
@@ -140,8 +145,14 @@ async def _lookup_user_tenant(user_id: Any) -> tuple[bool, Optional[str]]:
         _tenant_cache.pop(key, None)
 
     try:
-        resp = await call_platform("GET", f"/v1/internal/users/{key}/tenant", retries=1)
+        resp = await call_platform(
+            "GET", f"/v1/internal/users/{uid_key}/tenant", retries=1, domain="user"
+        )
     except PlatformUnavailable as e:
+        if is_foreign_origin():
+            # ADR-0011: never answer a foreign identity from the LOCAL users
+            # table — the same UUID means a different person (or nobody) here.
+            raise
         logger.error(
             "tenant lookup via platform-api failed (%s) — falling back to direct DB", e
         )
@@ -154,6 +165,12 @@ async def _lookup_user_tenant(user_id: Any) -> tuple[bool, Optional[str]]:
             # unreachable rather than like "unknown user": an undeployed
             # platform-api answers 404 on this route, and reading that as "no
             # such user" would reject legitimate tenant-scoped writes.
+            if is_foreign_origin():
+                raise PlatformUnavailable(
+                    f"home-bridge tenant lookup returned unexpected "
+                    f"status={resp.status_code} — refusing the local-DB fallback "
+                    f"for a foreign-origin request (ADR-0011)"
+                )
             logger.error(
                 "tenant lookup via platform-api returned unexpected status=%s "
                 "body=%r — falling back to direct DB",

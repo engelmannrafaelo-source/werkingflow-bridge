@@ -12,5 +12,12 @@
 # Additiv vor dem bestehenden LB: reine Weiterleitung an den OpenResty-LB
 # (Compose-Service `nginx`), KEINE eigene Routing-/Failover-Logik hier.
 bridge.werking.tools {
-	reverse_proxy nginx:80
+	# ADR-0011: Caddy wohnt im Docker-Netz — sein remote_addr faellt beim LB
+	# in den vertrauten Bereich. Ohne diesen Strip koennte JEDER externe
+	# HTTPS-Client einen X-Bridge-Origin faelschen und damit umleiten,
+	# wessen Budget zahlt. X-Bridge-Hop bleibt bewusst durchgelassen
+	# (Faelschung = nur Selbstbeschraenkung, ADR-0010).
+	reverse_proxy nginx:80 {
+		header_up -X-Bridge-Origin
+	}
 }

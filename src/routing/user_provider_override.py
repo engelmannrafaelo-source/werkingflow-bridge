@@ -298,11 +298,18 @@ async def _lookup_provider_config(uid: Any) -> Optional[dict]:
     fail-closed — without it a platform-api restart of a few hundred
     milliseconds would 503 every pinned user's call.
     """
+    from src.federation import is_foreign_origin
+
     try:
         resp = await call_platform(
             "GET", f"/v1/internal/users/{uid}/provider-config", retries=1,
+            domain="user",
         )
     except PlatformUnavailable as e:
+        if is_foreign_origin():
+            # ADR-0011: the pin lives in the HOME users table; the local row
+            # for this UUID is a different person or nobody.
+            raise
         logger.error(
             "provider_config lookup via platform-api failed (%s) — "
             "falling back to direct DB", e,
@@ -317,6 +324,12 @@ async def _lookup_provider_config(uid: Any) -> Optional[dict]:
     # unreachable, NOT like "no pin". A platform-api that has not been deployed
     # yet answers 404 on this route, and reading that as "user is not pinned"
     # would turn a missing deployment into a silent data-residency change.
+    if is_foreign_origin():
+        raise PlatformUnavailable(
+            f"home-bridge provider_config lookup returned unexpected "
+            f"status={resp.status_code} — refusing the local-DB fallback for a "
+            f"foreign-origin request (ADR-0011)"
+        )
     logger.error(
         "provider_config lookup via platform-api returned unexpected "
         "status=%s body=%r — falling back to direct DB",
@@ -343,8 +356,14 @@ async def get_user_provider_config(raw_user_id: Any) -> Optional[dict]:
     if not key:
         return None
 
+    # ADR-0011: the pin is a fact of the request's HOME bridge — scope the
+    # CACHE key (key itself stays the raw identity for resolve_user_id below)
+    # so the same identity string cannot cross budget domains.
+    from src.federation import cache_scope
+    cache_key = f"{cache_scope()}:{key}" if cache_scope() else key
+
     now = time.monotonic()
-    hit = _cache.get(key)
+    hit = _cache.get(cache_key)
     if hit is not None and hit[0] > now:
         return hit[1]
 
@@ -380,7 +399,7 @@ async def get_user_provider_config(raw_user_id: Any) -> Optional[dict]:
             "is pinned to a specific backend"
         ) from e
 
-    _cache[key] = (now + _CACHE_TTL_SECONDS, config)
+    _cache[cache_key] = (now + _CACHE_TTL_SECONDS, config)
     return config
 
 

@@ -268,6 +268,7 @@ async def persist_ai_call_activity(
     cache_read_tokens: int = 0,
     cache_creation_tokens: int = 0,
     search_count: int = 0,
+    bridge_origin: Optional[str] = None,
     _call_uid: Optional[str] = None,
     _call_ts: Optional[float] = None,
 ) -> str:
@@ -339,10 +340,25 @@ async def persist_ai_call_activity(
     replaying = _call_uid is not None
     call_uid = _call_uid or ledger_spool.new_call_uid()
     call_ts = _call_ts if _call_ts is not None else time.time()
+
+    # ADR-0011: the row belongs to the ledger of the request's HOME bridge.
+    # Live path: capture the middleware-set origin so it travels INTO the
+    # spool record. Replay path: the flusher runs outside any request, so the
+    # recorded origin is restored into the context — every platform call
+    # below (ledger write, billing context, deduction) resolves its target
+    # through it. Without this, a spooled foreign row would replay into the
+    # LOCAL ledger.
+    from src.federation import get_request_origin, set_request_origin
+    if replaying:
+        set_request_origin(bridge_origin)
+    else:
+        bridge_origin = bridge_origin or get_request_origin()
+
     spooled = False
     if not replaying and ledger_spool.spool_enabled():
         spooled = ledger_spool.append_call(call_uid, {
             "app_id": app_id, "user_id": user_id, "agent_id": agent_id,
+            "bridge_origin": bridge_origin,
             "workflow_id": workflow_id, "model": model,
             "input_tokens": input_tokens, "output_tokens": output_tokens,
             "status": status, "duration_ms": duration_ms,

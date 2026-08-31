@@ -84,8 +84,23 @@ async def call_platform(
     timeout_s: float = 2.0,
     retries: int = 0,
     retry_backoff_s: float = DEFAULT_RETRY_BACKOFF_S,
+    domain: str = "local",
 ) -> PlatformResponse:
     """POST/GET against platform-api, X-Bridge-Service-Token authenticated.
+
+    domain (ADR-0011): which bridge's platform-api answers.
+      "local" (default) — always this bridge's platform-api. For everything
+        the EXECUTING bridge owns: job store, account caps, tier policy,
+        app registry, audit, metrics.
+      "user" — the platform-api of the request's HOME bridge. For everything
+        that lives in the USER's domain: identity resolution, budget
+        evaluate/deduct, plans, project budgets, the usage ledger. When the
+        current request's origin is this bridge (or unknown), "user" IS
+        local — behaviour byte-for-byte unchanged. Only a foreign-origin
+        request (two-tier pool execution, ADR-0010) redirects to the peer.
+        Foreign origin without a configured peer raises
+        federation.FederationMisconfigured — callers in the budget gate must
+        map that to fail-CLOSED, not their transient-infra fail-open.
 
     Raises PlatformUnavailable on timeout, connection error, or a 5xx from
     platform-api itself — i.e. whenever platform-api could not actually
@@ -119,8 +134,26 @@ async def call_platform(
     inside it failed, possibly after a partial effect. Replaying that blindly
     is not a retry, it is a second attempt at an unknown state.
     """
-    url = f"{_base_url()}{path if path.startswith('/') else '/' + path}"
-    headers = {"X-Bridge-Service-Token": _service_token()}
+    if domain not in ("local", "user"):
+        raise ValueError(f"call_platform: unknown domain {domain!r} (use 'local' or 'user')")
+
+    base, token = _base_url(), None
+    if domain == "user":
+        # Late import: federation imports nothing from here, but keeping the
+        # dependency one-directional at import time spares every non-worker
+        # user of this module (scripts, tests) the starlette import.
+        from src.federation import resolve_user_domain_target
+
+        target = resolve_user_domain_target()  # raises FederationMisconfigured
+        if target is not None:
+            base, token = target.base_url, target.token
+            logger.debug(
+                "platform call federated to home bridge %r: %s %s",
+                target.origin, method, path,
+            )
+
+    url = f"{base}{path if path.startswith('/') else '/' + path}"
+    headers = {"X-Bridge-Service-Token": token if token is not None else _service_token()}
 
     attempts = retries + 1
     for attempt in range(1, attempts + 1):
