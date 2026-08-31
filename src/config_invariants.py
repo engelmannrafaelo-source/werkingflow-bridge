@@ -10,10 +10,22 @@ Companion to the fail-fast checks already in the lifespan (billing integrity,
 plan catalog, app registry). Same doctrine: a worker that cannot do its job
 correctly must refuse to start rather than serve traffic that looks healthy.
 """
+import os
+
 from src.db.client import is_db_enabled
 # One parser for the flag, shared with the endpoints it gates. Two readings
 # would be two truths, and they must never disagree about what is declared.
 from src.jobs.routes import _generic_jobs_enabled
+
+
+def _platform_stage_configured() -> bool:
+    """ADR-0009 Weg b: BRIDGE_SERVICE_TOKEN is the signal for the platform-api
+    stage of the job store — PLATFORM_API_URL always has a default, the token
+    does not. MUST stay in lockstep with store_client.is_store_available()
+    (pinned by a test); not imported from there because these boot invariants
+    are deliberately dependency-light and store_client pulls in the HTTP
+    client stack."""
+    return bool(os.getenv("BRIDGE_SERVICE_TOKEN"))
 
 
 def assert_declared_db_features_have_a_database(*, db_client_available: bool) -> None:
@@ -52,22 +64,45 @@ def assert_declared_db_features_have_a_database(*, db_client_available: bool) ->
     if not _generic_jobs_enabled():
         return
 
+    # A worker that DECLARES the direct-DB stage (BRIDGE_DB_URL set) but whose
+    # DB client cannot import would silently lose its declared fallback —
+    # hollow either way, so this stays fatal even when the platform stage is
+    # configured. Without a declared DB the missing driver only matters if the
+    # platform stage is absent too (then there is no store at all).
+    if is_db_enabled():
+        if not db_client_available:
+            raise RuntimeError(
+                "BRIDGE_GENERIC_JOBS_ENABLED=true and BRIDGE_DB_URL is set, but "
+                "the Bridge DB client failed to import (asyncpg missing from the "
+                "image?). The declared direct-DB store stage would be silently "
+                "dead. Fix the image, or remove BRIDGE_DB_URL to run "
+                "platform-api-only (ADR-0009 Weg b)."
+            )
+        return
+
+    # ADR-0009 Weg b end state (the worker-host): no database at all, every
+    # store resolves via platform-api. Fully job-capable — must boot.
+    if _platform_stage_configured():
+        return
+
     if not db_client_available:
         raise RuntimeError(
             "BRIDGE_GENERIC_JOBS_ENABLED=true but the Bridge DB client failed to "
-            "import (asyncpg missing from the image?). /v1/jobs, the budget gate "
-            "and activity tracking all require Postgres. Fix the image, or unset "
-            "BRIDGE_GENERIC_JOBS_ENABLED if this worker is meant to run without a DB."
+            "import (asyncpg missing from the image?) and no platform-api stage "
+            "is configured (BRIDGE_SERVICE_TOKEN unset). /v1/jobs, the budget "
+            "gate and activity tracking have no store to talk to. Fix the image "
+            "or configure one of the two stages."
         )
 
-    if not is_db_enabled():
-        raise RuntimeError(
-            "BRIDGE_GENERIC_JOBS_ENABLED=true but BRIDGE_DB_URL is not set — the "
-            "platform overlay is missing from this container. Recreate it with BOTH "
-            "compose files, e.g.:\n"
-            "    docker compose -f docker/docker-compose-prod.yml \\\n"
-            "                   -f docker/docker-compose-prod-platform.yml \\\n"
-            "                   up -d --no-deps <worker>\n"
-            "Refusing to start: this worker would report healthy while /v1/jobs "
-            "returns 503 and every budget and activity hook is silently skipped."
-        )
+    raise RuntimeError(
+        "BRIDGE_GENERIC_JOBS_ENABLED=true but neither store stage is "
+        "configured: BRIDGE_DB_URL is not set (direct-DB stage) and "
+        "BRIDGE_SERVICE_TOKEN is not set (platform-api stage, ADR-0009 Weg b) "
+        "— the platform overlay is missing from this container. Recreate it "
+        "with BOTH compose files, e.g.:\n"
+        "    docker compose -f docker/docker-compose-prod.yml \\\n"
+        "                   -f docker/docker-compose-prod-platform.yml \\\n"
+        "                   up -d --no-deps <worker>\n"
+        "Refusing to start: this worker would report healthy while /v1/jobs "
+        "returns 503 and every budget and activity hook is silently skipped."
+    )

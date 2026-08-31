@@ -20,9 +20,12 @@ import pytest
 
 @pytest.fixture(autouse=True)
 def _clean_env(monkeypatch):
-    """Neither variable leaks in from the developer's shell or a prior case."""
+    """No variable leaks in from the developer's shell or a prior case.
+    BRIDGE_SERVICE_TOKEN matters since ADR-0009 Weg b: it configures the
+    platform-api store stage and legitimately satisfies the invariant."""
     monkeypatch.delenv("BRIDGE_GENERIC_JOBS_ENABLED", raising=False)
     monkeypatch.delenv("BRIDGE_DB_URL", raising=False)
+    monkeypatch.delenv("BRIDGE_SERVICE_TOKEN", raising=False)
 
 
 def _load_pristine(rel_path, name):
@@ -135,3 +138,66 @@ def test_undeclared_with_db_boots(check, monkeypatch):
 def test_falsy_spellings_do_not_demand_a_database(check, monkeypatch, falsy):
     monkeypatch.setenv("BRIDGE_GENERIC_JOBS_ENABLED", falsy)
     check(db_client_available=True)  # must not raise
+
+
+# --- ADR-0009 Weg b: platform-api-only workers (the worker-host) -------------
+# The 2026-08-31 cutover failed exactly here: the invariant predates Weg b and
+# refused a correctly configured DB-free worker (BRIDGE_SERVICE_TOKEN set, no
+# BRIDGE_DB_URL) — the designed end state of the worker-host.
+
+def test_platform_stage_only_boots(check, monkeypatch):
+    monkeypatch.setenv("BRIDGE_GENERIC_JOBS_ENABLED", "true")
+    monkeypatch.setenv("BRIDGE_SERVICE_TOKEN", "svc-token")
+    check(db_client_available=True)  # must not raise
+
+
+def test_platform_stage_only_needs_no_db_driver(check, monkeypatch):
+    """platform-api-only never touches asyncpg — a missing driver must not
+    block the boot when no direct-DB stage is declared."""
+    monkeypatch.setenv("BRIDGE_GENERIC_JOBS_ENABLED", "true")
+    monkeypatch.setenv("BRIDGE_SERVICE_TOKEN", "svc-token")
+    check(db_client_available=False)  # must not raise
+
+
+def test_declared_db_with_broken_driver_refuses_even_with_platform_stage(
+    check, monkeypatch
+):
+    """A DECLARED direct-DB stage whose driver cannot import is hollow — the
+    platform stage does not excuse it (the declared fallback would be dead)."""
+    monkeypatch.setenv("BRIDGE_GENERIC_JOBS_ENABLED", "true")
+    monkeypatch.setenv("BRIDGE_DB_URL", DSN)
+    monkeypatch.setenv("BRIDGE_SERVICE_TOKEN", "svc-token")
+    with pytest.raises(RuntimeError) as exc:
+        check(db_client_available=False)
+    assert "asyncpg" in str(exc.value)
+
+
+def test_refusal_message_names_both_stages(check, monkeypatch):
+    """The log line is the only thing an operator sees — it must name BOTH
+    ways out (overlay/DB and service token), not just the pre-Weg-b one."""
+    monkeypatch.setenv("BRIDGE_GENERIC_JOBS_ENABLED", "true")
+    with pytest.raises(RuntimeError) as exc:
+        check(db_client_available=True)
+    msg = str(exc.value)
+    assert "BRIDGE_DB_URL" in msg and "BRIDGE_SERVICE_TOKEN" in msg
+
+
+def test_platform_stage_signal_matches_store_client(monkeypatch):
+    """Lockstep pin: the invariant's platform-stage signal and
+    store_client.is_store_available() must key off the same variable. If
+    store_client ever changes its signal, this must fail loudly."""
+    import src.config_invariants as invariants
+
+    monkeypatch.delenv("BRIDGE_SERVICE_TOKEN", raising=False)
+    assert invariants._platform_stage_configured() is False
+    monkeypatch.setenv("BRIDGE_SERVICE_TOKEN", "svc-token")
+    assert invariants._platform_stage_configured() is True
+
+    store_client_src = (
+        pathlib.Path(__file__).resolve().parents[2] / "src/jobs/store_client.py"
+    ).read_text()
+    assert 'os.getenv("BRIDGE_SERVICE_TOKEN")' in store_client_src, (
+        "store_client.is_store_available() no longer keys the platform stage "
+        "off BRIDGE_SERVICE_TOKEN — update _platform_stage_configured() in "
+        "src/config_invariants.py to match, then this pin."
+    )
