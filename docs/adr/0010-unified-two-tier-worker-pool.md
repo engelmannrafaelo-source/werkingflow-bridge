@@ -1,7 +1,12 @@
 # ADR-0010: Ein Worker-Pool, zwei Schichten (Level 1 = Prod-Konten zuerst, fuer ALLE)
 
-**Status:** ACCEPTED (Entscheidung Rafael), Umsetzung Dev-Bridge-seitig gebaut;
-Prod-Bridge-Deploy der geteilten nginx.conf-Aenderungen separat gated.
+**Status:** LIVE auf BEIDEN Bridges (Dev 06:09Z, Prod 06:34Z am 2026-08-31;
+Prod-Deploy nach Rafael-Freigabe, verifiziert per Audit-Log
+`/api/audit/inputs`: 06:28:34Z "ja dnan mach da auch ueberall die jas" +
+06:31:04Z Delegation der Zustellung, Session 44f02655). Prod-seitig
+nachgemessen: X-Priority weiter lokal Level 1, gehoppter Request lokal
+(Guard aktiv, `hopped=1` im Log), Cross-Bridge-Job-Roundtrip dev->prod->dev
+200/done mit beiden Bridges auf der neuen Conf.
 **Date:** 2026-08-31
 **Decider:** Rafael (31.08.2026 mittags, via Koordinations-Session; sinngemaesser
 Wortlaut unten). **Author:** prod-ops-Session.
