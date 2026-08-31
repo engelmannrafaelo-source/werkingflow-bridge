@@ -20,6 +20,10 @@ class VisionResult:
     content: str
     model: str
     usage: Dict[str, int]
+    # Echter Anthropic stop_reason — Pflichtfeld ohne Default: ein Konstruktions-
+    # pfad, der ihn vergisst, soll beim Bauen scheitern, nicht erst beim
+    # finish_reason-Mapping in main.py (genau so entstand der 500 vom 31.08.).
+    stop_reason: str
 
 
 def serialize_message_content(content) -> Any:
@@ -93,7 +97,8 @@ async def route_to_vision(
     return VisionResult(
         content=vision_response.content,
         model=vision_response.model,
-        usage=vision_response.usage
+        usage=vision_response.usage,
+        stop_reason=vision_response.stop_reason
     )
 
 

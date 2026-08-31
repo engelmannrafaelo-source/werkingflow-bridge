@@ -63,3 +63,30 @@ def test_empty_with_other_stop_reason_is_502_retryable():
     body = _body(exc.value)["error"]
     assert body["reason"] == REASON_VISION_EMPTY_RESPONSE
     assert body["retryable"] is True
+
+
+# ── VisionResult-Wrapper (Regressionspin fuer den 500 vom 31.08.) ───────────
+# Der erste Deploy des Fixes scheiterte NICHT im Provider, sondern an der Naht:
+# vision_router.VisionResult verpackte die Provider-Antwort um und liess
+# stop_reason fallen -> AttributeError in main.py -> 500 -> nginx "at capacity".
+
+def test_visionresult_requires_stop_reason():
+    from src.routing.vision_router import VisionResult
+    with pytest.raises(TypeError):  # Pflichtfeld: Vergessen scheitert beim Bauen
+        VisionResult(content="x", model="m", usage={})
+
+
+@pytest.mark.asyncio
+async def test_route_to_vision_carries_stop_reason(monkeypatch):
+    import src.routing.vision_router as vr
+    from src.vision_provider import VisionResponse
+
+    class FakeProvider:
+        async def analyze(self, **kwargs):
+            return VisionResponse(content="Rot", model="m",
+                                  usage={"input_tokens": 1, "output_tokens": 1},
+                                  stop_reason="max_tokens")
+
+    monkeypatch.setattr(vr, "get_vision_provider", lambda: FakeProvider())
+    result = await vr.route_to_vision(messages=[], model="m")
+    assert result.stop_reason == "max_tokens"
