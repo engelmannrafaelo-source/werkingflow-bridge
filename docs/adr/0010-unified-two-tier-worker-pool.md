@@ -31,6 +31,10 @@ ausfuehrenden Bridge fragt fuer fremde Identitaeten die Heimat-Bridge) oder
 Reaktivierung der Default-Stufe ein Ein-Zeilen-Revert im Generator
 (`$llm_backend_pool`-Map, primary).
 
+**Update 31.08. mittags: Rafael hat (a) entschieden — umgesetzt als ADR-0011**
+(`0011-identity-budget-federation.md`); Reaktivierungs-Bedingungen stehen dort
+im Rollout-Abschnitt.
+
 Aufraeum-Punkt daneben: die bestehenden `jit-*@werking-report.local`-Schatten-
 nutzer auf Prod (mit Usage-Historie, DELETE wird 409en) gehoeren gesichtet.
 **Date:** 2026-08-31
