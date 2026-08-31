@@ -225,18 +225,18 @@ HEADER
     echo "# bridge once (X-Bridge-Hop); hopped traffic is ALWAYS served from the"
     echo "# local tier — that is the one-hop loop guard."
     if [ "$id" = "primary" ]; then
-        echo "# primary: ADR-0010's default-pool tiering is PAUSED (2026-08-31,"
-        echo "# ~1h nach Go-Live zurueckgenommen): Ausfuehrung auf Level 1 heisst"
-        echo "# Budget-Gate auf der PROD-DB — Dev-Identitaeten existieren dort"
-        echo "# nicht und werden als JIT-Schatten-Trials angelegt; gemessen als"
-        echo "# UPSTREAM_HTTP_402 trial_expired fuer einen gesunden Dev-User"
-        echo "# (DevOps-Session a0d8b084). Bis die Budget-Domaene vereinheitlicht"
-        echo "# ist (ADR-0010 'Voraussetzung'), reitet nur X-Priority den"
-        echo "# Level-1-Pool — deren Nutzer SIND Prod-Nutzer."
+        echo "# primary: every non-hopped request rides the Level-1-first pool,"
+        echo "# with or without X-Priority (ADR-0010: one pool, two tiers)."
+        echo "# REAKTIVIERT 2026-08-31 (Rafael-Direktfreigabe, Session 7f122be0),"
+        echo "# nachdem die Pausen-Ursache behoben ist: das Budget-Gate der"
+        echo "# ausfuehrenden Bridge bewertet fremde Identitaeten seit ADR-0011"
+        echo "# (Budget-Foederation, Stufe A+B beidseitig bewiesen) auf ihrer"
+        echo "# HEIMAT-Bridge — der 402/JIT-Schattenuser-Bruch (DevOps a0d8b084)"
+        echo "# kann so nicht mehr entstehen. Runbook: adr-0011-stage-b.md §5."
         cat <<'MAP'
-map "$bridge_hopped:$http_x_priority" $llm_backend_pool {
-    "0:production"  claude_production;
-    default         claude_workers;
+map $bridge_hopped $llm_backend_pool {
+    default claude_production;
+    1       claude_workers;
 }
 MAP
     else
