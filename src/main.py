@@ -2860,14 +2860,22 @@ async def chat_completions(
                         if hasattr(msg, 'has_images') and msg.has_images()
                     )
 
-                    # Build OpenAI-compatible response from vision result
+                    # Build OpenAI-compatible response from vision result.
+                    # finish_reason kommt seit 2026-08-31 aus dem echten
+                    # stop_reason — das pauschale "stop" machte eine per
+                    # max_tokens abgeschnittene Antwort vom Erfolg
+                    # ununterscheidbar (werking-energy schema_analysis).
+                    from src.vision_provider import (
+                        ensure_usable_vision_content,
+                        finish_reason_for,
+                    )
                     response = ChatCompletionResponse(
                         id=request_id,
                         model=vision_result.model,
                         choices=[Choice(
                             index=0,
                             message=Message(role="assistant", content=vision_result.content),
-                            finish_reason="stop"
+                            finish_reason=finish_reason_for(vision_result.stop_reason)
                         )],
                         usage=Usage(
                             prompt_tokens=vision_result.usage["prompt_tokens"],
@@ -2929,12 +2937,23 @@ async def chat_completions(
                                 "endpoint": "vision",
                                 "api_key_lane": "vision_prepaid",
                                 "image_count": image_count,
+                                "stop_reason": vision_result.stop_reason,
+                                "empty_response": not vision_result.content,
                             },
                         )
                     except Exception as _vision_track_err:
                         logger.warning(
                             f"⚠️ Vision usage tracking failed (non-fatal): {_vision_track_err}"
                         )
+
+                    # FAIL-LOUD fuer leeren Content — BEWUSST erst NACH dem
+                    # Ledger-Persist: der Prepaid-Spend ist real und speist
+                    # die Tageskappe; ein frueheres Raise machte ihn
+                    # unsichtbar. Wirft BridgeError (422 bei max_tokens,
+                    # sonst 502) statt still 200-leer zu liefern.
+                    ensure_usable_vision_content(
+                        vision_result.content, vision_result.stop_reason
+                    )
 
                     return response
 

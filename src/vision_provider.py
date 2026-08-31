@@ -415,10 +415,16 @@ class VisionProvider:
 
         usage = data.get("usage", {})
 
-        logger.info(
-            f"Vision response: {len(response_text)} chars",
+        log = logger.warning if not response_text else logger.info
+        log(
+            f"Vision response: {len(response_text)} chars"
+            + ("" if response_text else
+               f" — EMPTY (stop_reason={data.get('stop_reason')!r}, "
+               f"output_tokens={usage.get('output_tokens', 0)}; vermutlich "
+               f"Thinking hat max_tokens aufgebraucht)"),
             extra={
                 "response_length": len(response_text),
+                "stop_reason": data.get("stop_reason"),
                 "input_tokens": usage.get("input_tokens", 0),
                 "output_tokens": usage.get("output_tokens", 0)
             }
@@ -434,6 +440,54 @@ class VisionProvider:
             },
             stop_reason=data.get("stop_reason", "end_turn")
         )
+
+
+# ── Antwort-Politik (ADR-0011-Nachlese, 2026-08-31) ─────────────────────────
+# Pure Helfer, damit der Endpoint-Code in main.py testbar bleibt.
+
+# Anthropic stop_reason → OpenAI finish_reason. Bis 2026-08-31 log der
+# Vision-Pfad hier pauschal "stop" — eine per max_tokens abgeschnittene
+# Antwort war vom Erfolg nicht unterscheidbar.
+_FINISH_REASON_MAP = {
+    "end_turn": "stop",
+    "stop_sequence": "stop",
+    "max_tokens": "length",
+    "tool_use": "tool_calls",
+}
+
+
+def finish_reason_for(stop_reason: Optional[str]) -> str:
+    """OpenAI-kompatibler finish_reason fuer einen Anthropic stop_reason.
+    Unbekannte Werte werden durchgereicht statt beschoenigt."""
+    if not stop_reason:
+        return "stop"
+    return _FINISH_REASON_MAP.get(stop_reason, stop_reason)
+
+
+def ensure_usable_vision_content(content: str, stop_reason: Optional[str]) -> None:
+    """FAIL-LOUD fuer die leere Vision-Antwort (Befund 2026-08-31, werking-energy
+    schema_analysis): claude-sonnet-5 verbraucht bei dichten Schema-Bildern das
+    gesamte Output-Budget in Thinking-Bloecken; die Antwort enthaelt dann NULL
+    Text-Bloecke und ging bis zu diesem Fix als 200 mit content="" raus — der
+    Client sah "Bridge returned empty content", retryte blind und verbrannte
+    pro Versuch ~15k Prepaid-Tokens.
+
+    MUSS NACH dem Ledger-Persist aufgerufen werden, nie davor: der Upstream-Call
+    hat real Geld gekostet (vision_prepaid), und die Tageskappe summiert
+    Ledger-Zeilen — ein Raise vor dem Persist macht genau diesen Spend fuer die
+    Kappe unsichtbar (die 2026-07-18-Runaway-Klasse).
+
+    Wirft BridgeError mit vorklassifiziertem Envelope — bewusst KEINE nackte
+    HTTPException: die wuerde vom Vision-Branch-Handler durch
+    classify_exception zu internal_error/500 zerdrueckt, nginx retryte 500
+    ueber alle Worker und verkleidete den Befund als "at capacity" (dieselbe
+    Pathologie wie bei client_request_error dokumentiert).
+    """
+    if content:
+        return
+    from src.middleware.bridge_error import BridgeError, vision_empty_response_error
+
+    raise BridgeError(vision_empty_response_error(stop_reason))
 
 
 # Singleton instance

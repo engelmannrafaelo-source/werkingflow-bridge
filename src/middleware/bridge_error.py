@@ -73,6 +73,7 @@ REASON_UPSTREAM_ANTHROPIC_ERROR = "claude_upstream_error"
 REASON_UPSTREAM_ANTHROPIC_TIMEOUT = "claude_upstream_timeout"
 # Vision API direct-key billing exhausted (Anthropic-side, not retryable)
 REASON_VISION_BILLING_EXHAUSTED = "vision_billing_exhausted"
+REASON_VISION_EMPTY_RESPONSE = "vision_empty_response"
 # Anthropic 4xx invalid_request_error — the CALLER's request is malformed
 # (bad temperature/top_p, unknown model, oversized payload). Non-retryable:
 # retrying the identical request fails forever. Must NOT collapse to 500
@@ -310,6 +311,43 @@ def vision_billing_error(detail: str) -> JSONResponse:
         message=f"Vision API credit balance exhausted: {detail}",
         status_code=402,
         retryable_override=False,
+    )
+
+
+def vision_empty_response_error(stop_reason: Optional[str]) -> JSONResponse:
+    """Die Vision-Antwort (direkter Anthropic-Key) enthielt NULL Text-Bloecke.
+
+    Befund 2026-08-31 (werking-energy schema_analysis): claude-sonnet-5
+    verbraucht bei dichten Schema-Bildern das gesamte Output-Budget in
+    Thinking-Bloecken; stop_reason ist dann "max_tokens" und die Antwort
+    bestand bis zu diesem Fix aus einem stillen 200 mit content="" — der
+    Client retryte blind und verbrannte pro Versuch ~15k Prepaid-Tokens.
+
+    422 + non-retryable bei max_tokens: ein unveraenderter Retry kann nie Text
+    liefern — der Aufrufer muss max_tokens erhoehen oder das Thinking-Budget
+    begrenzen. 502 + retryable sonst (unerwartet leere Upstream-Antwort,
+    transient moeglich). In beiden Faellen ist der Aufruf zu diesem Zeitpunkt
+    bereits im Ledger verbucht (Kappen-Grundlage) — siehe
+    vision_provider.ensure_usable_vision_content, das NACH dem Persist laeuft.
+    """
+    exhausted = stop_reason == "max_tokens"
+    return bridge_error(
+        source=SOURCE_UPSTREAM_ANTHROPIC,
+        error_type=TYPE_UPSTREAM_ERROR,
+        reason=REASON_VISION_EMPTY_RESPONSE,
+        message=(
+            "Vision-Antwort enthielt keinen Text: das Output-Budget (max_tokens) "
+            "wurde vollstaendig von Thinking-Bloecken verbraucht. max_tokens "
+            "erhoehen oder Thinking begrenzen — ein unveraenderter Retry kann "
+            "nicht gelingen."
+            if exhausted else
+            "Vision-Antwort enthielt keinen Text (unerwartete Upstream-Antwort "
+            f"mit stop_reason={stop_reason!r}). Der Aufruf wurde abgerechnet; "
+            "Retry moeglich."
+        ),
+        status_code=422 if exhausted else 502,
+        retryable_override=not exhausted,
+        extra={"stop_reason": stop_reason},
     )
 
 
