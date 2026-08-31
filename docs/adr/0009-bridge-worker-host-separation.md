@@ -3,8 +3,12 @@
 **Status:** PARTIAL — mechanism built and validated (nginx routing, upstream
 generation, metrics-reader polling, a third deploy topology), new host
 prepared, **Schritte 1, 2, 2b, 2c und 2d des Umsetzungsplans auf `develop` und
-auf der DEV-Bridge (`hetzner`) im Echtbetrieb; auf Prod (`server2`) ist davon
-nichts deployt** — siehe Umsetzungsplan unten. Mit 2d ist Weg (b) vollstaendig:
+auf BEIDEN Bridges im Echtbetrieb** (Dev seit 2026-08-31 frueh; Prod seit dem
+Rafael-freigegebenen `both`-Deploy 2026-08-31 ~05:48Z, Smoke 11/11 + 3/3,
+Watchdog/Cleanup aller vier Prod-Worker laeuft nachgemessen ueber
+`/v1/internal/jobs*`, 0 Direct-DB-Fallbacks; Anmerkung: die aeltere Fassung
+dieser Zeile "auf Prod nichts deployt" war schon vor 2d ueberholt — 2a-2c
+liefen dort seit ~28.08.). Mit 2d ist Weg (b) vollstaendig:
 der Worker-Pfad braucht keine eigene DB-Verbindung mehr, der alte
 Postgres-Reachability-Blocker (Item 4) ist aufgeloest; zum Cutover fehlen noch
 die drei Punkte im Header von `docker/docker-compose-worker-host.yml`

@@ -54,21 +54,25 @@ declare -A PROD_WORKER_TARGETS=()
 #   PROD_WORKER_TARGETS[worker-sahori]="100.93.143.105:8001"
 
 # --- Topology table (single source of the per-bridge worker set) -------------
-# primary: default pool has NO cross-host backup (dev/prod isolation — a dev
-#          request must fail-fast, never spill onto the customer bridge). The
-#          production-priority pool (claude_production) targets the PROD
-#          BRIDGE FIRST, local dev workers are the overflow/backup path
-#          (Rafael, 2026-08-31: his own dev-time usage saturates the dev
-#          workers more than all partners combined; X-Priority:production
-#          traffic — e.g. Energy/Safety in Railway production env — must
-#          prefer the dedicated production capacity, not compete with that
-#          load, and only spill onto the dev bridge if the prod bridge is
-#          itself unreachable/exhausted). Reversed from the original
-#          "dev-first, prod-backup" order.
-# production: the default pool backs up to the dev bridge (Model-B resilience:
-#          both prod workers exhausted/down -> dev bridge serves). claude_production
-#          already targets the local prod workers first with the dev bridge as
-#          backup — unchanged, this was already the wanted order.
+# ADR-0010 (Rafael, 2026-08-31): ONE 8-worker pool in two tiers. Level 1 = the
+# four prod-account workers (erk/coach/kurt/sahori) serve FIRST, for BOTH
+# bridges and ALL LLM pools including default (his own adhoc traffic too);
+# Level 2 = the four dev-account workers (office/gmail/werking/engelmann) are
+# pure overflow. The former isolation principle ("a dev request must
+# fail-fast, never spill onto the customer bridge") is DELIBERATELY revoked
+# by that decision — dev load now competes with customer load for Level 1.
+#
+# How the tiers map onto the emitted config:
+# primary: claude_workers stays LOCAL-ONLY — it serves exactly the traffic
+#          that already crossed a bridge once (X-Bridge-Hop guard in
+#          nginx.conf), i.e. the Level-2 overflow lane, with full local Lua
+#          account gating. All NON-hopped LLM traffic is steered into
+#          claude_production by the $llm_backend_pool map emitted below:
+#          PROD bridge first, local dev workers as nginx `backup`.
+# production: unchanged pools — local prod workers first, dev bridge as
+#          `backup` in both pools. This already IS Level1-first; only
+#          X-Priority:production picks the claude_production pool (identical
+#          order), everything else rides claude_workers.
 
 # $1 = worker name, $2 = NAME (string) of the associative targets array in
 # scope (e.g. "PROD_WORKER_TARGETS") -> "host:port", defaulting to the
@@ -212,6 +216,32 @@ HEADER
         echo "# Local prod workers first, \${BRIDGE_BACKUP_HOST} (the dev bridge) is the"
         echo "# overflow path — already the wanted order, unchanged."
         emit_upstream claude_production 16 local-first "$targets_name" "${workers[@]}"
+    fi
+    echo
+
+    echo "# LLM-pool selection for the account-consuming paths (chat/research +"
+    echo "# POST /v1/jobs) — consumed by the shared nginx.conf (ADR-0010)."
+    echo "# \$bridge_hopped (nginx.conf) is 1 when the request already crossed a"
+    echo "# bridge once (X-Bridge-Hop); hopped traffic is ALWAYS served from the"
+    echo "# local tier — that is the one-hop loop guard."
+    if [ "$id" = "primary" ]; then
+        echo "# primary: every non-hopped request rides the Level-1-first pool,"
+        echo "# with or without X-Priority (ADR-0010: one pool, two tiers)."
+        cat <<'MAP'
+map $bridge_hopped $llm_backend_pool {
+    default claude_production;
+    1       claude_workers;
+}
+MAP
+    else
+        echo "# production: local workers ARE Level 1 — only the explicit"
+        echo "# X-Priority pool split remains, hopped traffic stays local."
+        cat <<'MAP'
+map "$bridge_hopped:$http_x_priority" $llm_backend_pool {
+    "0:production"  claude_production;
+    default         claude_workers;
+}
+MAP
     fi
 }
 
