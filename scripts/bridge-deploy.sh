@@ -1493,8 +1493,15 @@ REMOTE
 # exists to kill). Written best-effort: a failure here must never fail an
 # otherwise-successful deploy, matching the DEPLOYED_SHA_FILE write.
 write_release_manifest() {
-    local host="$1" server_name="$2" server_prefix="$3" current_sha="$4"
-    shift 4
+    # owned_services = the host's FULL service list (SERVER2_ALL etc.), not the
+    # subset just deployed. The manifest means "what SHOULD run on this host", so
+    # entries for services that no longer belong here have to go. Without that, a
+    # service that MOVED hosts (ADR-0009 cutover, 2026-08-31) stays in the old
+    # host's manifest forever and bridge-drift-check reports it MISSING every ten
+    # minutes; merging alone can never clear it, because a server2 deploy only
+    # touches server2's own services and leaves the foreign entries untouched.
+    local host="$1" server_name="$2" server_prefix="$3" current_sha="$4" owned_services="$5"
+    shift 5
     local services=("$@")
     [[ ${#services[@]} -eq 0 ]] && return 0
 
@@ -1506,8 +1513,9 @@ write_release_manifest() {
     # base64-transport: container/service names are safe today, but this
     # avoids ever having to reason about heredoc-quoting edge cases as names
     # change (same defensive move as phase_reconcile_worker_key's key_b64).
-    local pairs_b64
+    local pairs_b64 owned_b64
     pairs_b64=$(printf '%s' "$pairs" | base64 -w0)
+    owned_b64=$(printf '%s' "$owned_services" | base64 -w0)
 
     local result
     result=$(rssh_run "$host" <<EOF
@@ -1515,11 +1523,13 @@ MANIFEST_FILE="${RELEASE_MANIFEST_FILE}"
 DEPLOYED_SHA="${current_sha}"
 SVC_PAIRS_B64="${pairs_b64}"
 SERVER_NAME="${server_name}"
-python3 - "\$MANIFEST_FILE" "\$DEPLOYED_SHA" "\$SVC_PAIRS_B64" "\$SERVER_NAME" <<'PYEOF'
+OWNED_SVCS_B64="${owned_b64}"
+python3 - "\$MANIFEST_FILE" "\$DEPLOYED_SHA" "\$SVC_PAIRS_B64" "\$SERVER_NAME" "\$OWNED_SVCS_B64" <<'PYEOF'
 import base64, datetime, json, os, subprocess, sys, tempfile
 
-manifest_file, commit, pairs_b64, server_name = sys.argv[1:5]
+manifest_file, commit, pairs_b64, server_name, owned_b64 = sys.argv[1:6]
 pairs = base64.b64decode(pairs_b64).decode()
+owned = set(base64.b64decode(owned_b64).decode().split())
 now = datetime.datetime.now(datetime.timezone.utc).isoformat()
 
 try:
@@ -1553,6 +1563,15 @@ for line in pairs.splitlines():
         "deployed_at": now,
     }
 
+# Drop entries this host does not own any more (service moved to another host,
+# or was retired). Guarded on "owned is non-empty": an empty list would mean the
+# caller lost its service list, and wiping every entry on that basis would blind
+# drift detection instead of correcting it.
+if owned:
+    for svc in [s for s in services if s not in owned]:
+        del services[svc]
+        print(f"MANIFEST_PRUNED {svc}: not owned by {server_name} any more")
+
 manifest["updated_at"] = now
 
 d = os.path.dirname(manifest_file) or "."
@@ -1575,6 +1594,7 @@ EOF
         case "$line" in
             MANIFEST_OK) ;;
             MANIFEST_WARN*) warn "  ${line#MANIFEST_WARN }" ;;
+            MANIFEST_PRUNED*) info "  manifest pruned: ${line#MANIFEST_PRUNED }" ;;
             *) info "  manifest: ${line}" ;;
         esac
     done <<< "$result"
@@ -1767,7 +1787,7 @@ deploy_server() {
         # so it must be written by the only thing that knows: a finished deploy.
         rssh "$host" "printf '%s\n' '${current_sha}' > ${DEPLOYED_SHA_FILE}" \
             || warn "could not record deployed SHA on ${host} — the foreign-commit gate will fall back to the checkout HEAD next time"
-        write_release_manifest "$host" "$server_name" "$server_prefix" "$current_sha" "${DEPLOYED_SERVICES[@]}"
+        write_release_manifest "$host" "$server_name" "$server_prefix" "$current_sha" "$all_services" "${DEPLOYED_SERVICES[@]}"
         info "Container states  :"
         for svc in "${DEPLOYED_SERVICES[@]}"; do
             local c

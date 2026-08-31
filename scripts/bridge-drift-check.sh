@@ -20,7 +20,7 @@
 # `docker inspect --format '{{.Image}}' <container>` on the host, read here,
 # read-only, nothing is ever written to the bridge hosts by this script.
 #
-# Usage: bridge-drift-check.sh <hetzner|server2>
+# Usage: bridge-drift-check.sh <hetzner|server2|prod-workers>
 #
 # EXIT CODES
 #   0 = every manifest entry's image matches the live container (or the
@@ -34,8 +34,15 @@ SERVER="${1:-}"
 case "$SERVER" in
     hetzner) HOST="49.12.72.66" ;;
     server2) HOST="178.104.178.79" ;;
+    # ADR-0009 worker-host. Added 2026-08-31: the four prod workers and the
+    # metrics-reader moved here off server2, and until this case existed they
+    # ran unwatched — server2's manifest still listed them, so the only signal
+    # was a permanent MISSING alarm, which says exactly as much when a worker
+    # is healthy as when it is dead. Tailnet address, same as WORKERHOST_HOST
+    # in bridge-deploy.sh; the host has no public function.
+    prod-workers) HOST="100.93.143.105" ;;
     *)
-        echo "Usage: bridge-drift-check.sh <hetzner|server2>" >&2
+        echo "Usage: bridge-drift-check.sh <hetzner|server2|prod-workers>" >&2
         exit 2
         ;;
 esac
