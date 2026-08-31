@@ -1,0 +1,22 @@
+-- 058 — app_id enum: 'bridge-deploy' fuer die Deploy-Smoke-/Dist-Test-Calls
+--
+-- Befund 2026-08-31 (ADR-0009-Cutover-Tag, prod-ops 7f122be0): jeder
+-- bridge-deploy.sh-Lauf feuert Smoke-/Distribution-Testcalls mit
+-- X-App-ID: bridge-deploy. Die usage_events-Zeile landet (Spalte ist TEXT,
+-- die Calls SIND real und kosten Geld — sie gehoeren gemessen), aber der
+-- begleitende activities-Audit-INSERT scheiterte bei jedem Deploy mit
+--   invalid input value for enum app_id: "bridge-deploy"
+-- -> ledger_db faengt das ab (Geldzeile bleibt), loggt aber pro Call einen
+-- ERROR und die Audit-Spur hat ein Loch. Kein Kunden-Traffic betroffen;
+-- trotzdem ist "metered aber nicht auditierbar" genau der Zustand, den die
+-- Audit-Spur verhindern soll — und das ERROR-Rauschen verdeckt echte Fehler.
+--
+-- Loesung: der Deploy-Smoke ist ein realer, eigenstaendiger Verursacher und
+-- bekommt seinen eigenen Enum-Wert (ehrlicher als die Testcalls unter einer
+-- Produkt-App zu verstecken). Vorbild 048 (werking-check).
+--
+-- ALTER TYPE ... ADD VALUE: der neue Wert darf nicht in derselben
+-- Transaktion verwendet werden — Verwendung folgt erst zur Laufzeit
+-- (naechster Deploy-Smoke), kein Seed noetig. Forward-only, idempotent.
+
+ALTER TYPE app_id ADD VALUE IF NOT EXISTS 'bridge-deploy';
