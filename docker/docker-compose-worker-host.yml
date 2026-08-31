@@ -12,36 +12,41 @@
 # data, billing, entitlements) AND four 4GB-limited worker containers side by
 # side (20GB of limits promised on 7.6GB real) — a worker OOM can pick the
 # database as its neighbour's victim. Moving workers off that host onto their
-# own machine removes that blast radius. The database and its callers
-# (platform-api, and — see the OPEN ITEM below — the workers' own direct
-# Postgres connection) stay put; only LLM compute moves.
+# own machine removes that blast radius. The database and platform-api (its
+# single ingress since ADR-0009 Weg b — see CUTOVER REQUIREMENTS below) stay
+# put; only LLM compute moves.
 #
 # Usage (deploy machinery — see scripts/bridge-deploy.sh's `prod-workers`
 # server target, NOT invoked directly by a session against this file):
 #   docker compose -f docker-compose-worker-host.yml up -d --build
 #
 # =============================================================================
-# OPEN ITEM — do not `up` this file expecting a working worker without first
-# reading this (see the ADR for the full writeup):
+# CUTOVER REQUIREMENTS — the old Postgres-reachability blocker is RESOLVED in
+# code (ADR-0009 Weg b, entschieden von Rafael 2026-08-20, gebaut Schritte
+# 2a-2d): workers no longer need a database at all. Every store the worker
+# path touches (auth/tenant/principals, budget gate, money ledger, audit,
+# job store, cost caps, anonymization metrics) resolves via platform-api
+# (X-Bridge-Service-Token; src/platform_client.py). Postgres stays exactly as
+# unexposed as it is today — that was the point of Weg b.
 #
-#   Workers connect to Postgres DIRECTLY (BRIDGE_DB_URL in secrets/platform.env,
-#   hostname `postgres-prod`, durable /v1/jobs + budget/activity gate — see
-#   docker-compose-prod-platform.yml's comment on the worker `env_file:`
-#   overlay). That hostname only resolves inside production-barrier's
-#   `bridge-prod-net` Docker network. A worker-host worker needs platform.env
-#   rewritten to point BRIDGE_DB_URL at a network address that actually
-#   reaches production-barrier's Postgres — which today does not listen
-#   anywhere but `bridge-prod-net` (`expose: "5432"`, deliberately not
-#   published, "reduces attack surface" per its own compose comment). Opening
-#   that port (even Tailscale-only) is a decision about the customer database,
-#   not a script change — it is NOT made by this file and must not be made
-#   without Rafael's explicit sign-off in the deploying session, same bar as
-#   any other live-Bridge change.
+# What a worker on THIS host still needs in its platform.env copy:
 #
-#   Until that decision is made and executed, containers built from this file
-#   will start (LLM proxying itself has no DB dependency) but the durable
-#   /v1/jobs path and the budget/activity gate will fail for them — do not
-#   cut nginx traffic over before that path is verified end-to-end.
+#   - BRIDGE_SERVICE_TOKEN  — unchanged, same value as on production-barrier.
+#   - PLATFORM_API_URL      — MUST point at an address that reaches
+#     production-barrier's platform-api from this host. The default
+#     (http://platform-api:8000) only resolves inside bridge-prod-net.
+#     wt-prod-platform-api publishes no host port today (`expose: "8000"`),
+#     so the cutover has to publish it on production-barrier's TAILSCALE
+#     interface first (an authenticated service API — a categorically smaller
+#     surface than the raw Postgres port Weg (a) would have opened, which is
+#     why (a) was rejected). That publish is a live production-barrier change:
+#     Rafael's explicit sign-off in the deploying session, like every other.
+#   - BRIDGE_DB_URL         — REMOVE it here. The hostname cannot resolve on
+#     this host; a worker without it runs platform-api-only, which is the
+#     designed end state (store_client falls back only where the var exists).
+#
+# Do not cut nginx traffic over before the /v1/jobs path and the budget gate
+# have been verified end-to-end from this host against platform-api.
 # =============================================================================
 
 x-worker-env-common: &worker-env-common

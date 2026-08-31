@@ -404,12 +404,50 @@ unterbleibt mit Log), der Weg dorthin ist eine RuntimeError-Kaskade statt eines
 benannten Fehlers. Aufraeumen gehoert zu Schritt 3, wo die Rueckfaelle laut
 dieser ADR ohnehin entfallen.
 
+**Schritt 2d — der Rest des Worker-Pfads (gebaut 2026-08-31, Commit `1061b11`).**
+Die Tabelle oben (Messung 2026-08-20) war nach 2a-2c ueberholt; neu gemessen ueber
+die transitive Import-Huelle von `src.main` blieben vier Stuecke wirklich Direct-DB:
+
+- **Der Job-Store komplett** (`src/jobs/store.py`, 14 Funktionen — /v1/jobs-Routes,
+  Runner, Watchdog, TTL-Cleanup). Das SQL bleibt in store.py, das damit
+  platform-api-Modul ist (`/v1/internal/jobs*`); Worker gehen ueber
+  `src/jobs/store_client.py` — gleiche Signaturen, Drei-Stufen-Muster der
+  Lesepfade. `claim_stale_job` MUSS auf der Plattform-Seite bleiben: seine
+  `FOR UPDATE SKIP LOCKED`-Atomizitaet existiert nur innerhalb eines einzelnen
+  Statements — ueber HTTP ist sie exakt so atomar wie vorher, das Statement
+  laeuft dort in einem Stueck. Die nicht idempotenten Zaehler-Operationen
+  (mark-running/defer/claim: attempts/defer_count) sind im Client-Docstring als
+  begrenzt-doppelbar benannt statt mit einer Dedup-Mechanik ueberbaut, die die
+  Tabelle bewusst nicht hat — Folgen sind geldfrei und selbstheilend (Watchdog).
+- **`research_cloud/cap.py`** — bekam dasselbe C6-Muster wie prepaid_cap
+  (`/v1/internal/research-cloud/spent-24h`). Vorher waere der Tages-Deckel auf
+  einem DB-freien Worker bei JEDER Pruefung still fail-open ins Leere gelaufen.
+- **`GET /v1/metrics/anonymization`** (Worker-Endpoint, liest `audit_log`) —
+  Drei-Stufen via `/v1/internal/audit/anonymization-metrics`; ohne beide Stufen
+  jetzt 503 statt der alten `"db": false`-Null-Zeilen. pseudonym-monitor
+  behandelt "unerreichbar" als Alarm — erfundene Nullen haetten den
+  Anonymisierungs-Fehleralarm nach dem Umzug bei jeder Abfrage still geblendet.
+- **Die taeglichen Sweeps** (Trial-Warnung, Budget-Vorwarnung,
+  Bedrock-Reconciliation) starten jetzt in `platform_main` statt in JEDEM
+  Worker: der Pool-Halter faehrt die Sweeps. Vorher vierfach redundant (nur
+  durch DB-Stempel idempotent); auf einem DB-freien Worker waeren sie ein
+  taeglicher Fehlerlog geworden. RESEND_API_KEY ist in `wt-platform-api` aus
+  derselben `platform.env` vorhanden (live geprueft 2026-08-31).
+
+Bewusst NICHT angefasst: `platform_config.py` (kein Worker-Aufrufer, laeuft nur
+in platform-api — dort IST der Pool richtig); die Direct-DB-Rueckfaelle aus
+2a/2b (sie sind der sofortige Rueckweg, solange Worker BRIDGE_DB_URL behalten,
+und entfallen physisch erst mit dem Umzug); der Streaming-Verlustkanal aus
+Schritt 1 (eigenes Stueck); Item 5 (metrics-reader Log-Volume) — unveraendert
+offen. Abnahme als Test: `tests/jobs/test_store_client_needs_no_database.py`
+(gleiche Bauart wie 2c — jeder Pool-Griff sprengt den Test).
+
 **Schritt 3 — EIN Worker von vieren zieht um.** nginx behaelt drei lokal. Ein Fehler
 zeigt sich an einem Viertel des Verkehrs. Rueckweg = nginx-Ziel zurueckstellen, gleiche
 auto-rollback-gesicherte Route wie jeder nginx-Deploy.
 
-**Schritt 4 — restliche drei**, danach `/v1/jobs` und die Log-Volume-Abhaengigkeit
-des metrics-readers.
+**Schritt 4 — restliche drei**, danach die Log-Volume-Abhaengigkeit des
+metrics-readers (`/v1/jobs` ist seit Schritt 2d erledigt).
 
 **Dringlichkeit, ehrlich gemessen (2026-08-20):** die Prod-Bridge laeuft bei 4 Kernen
 mit Last 0,14, 14 % RAM, 14 % Platte — von Ueberlastung keine Spur. Das Argument ist
