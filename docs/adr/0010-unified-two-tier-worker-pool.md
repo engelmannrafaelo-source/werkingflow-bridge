@@ -1,12 +1,38 @@
 # ADR-0010: Ein Worker-Pool, zwei Schichten (Level 1 = Prod-Konten zuerst, fuer ALLE)
 
-**Status:** LIVE auf BEIDEN Bridges (Dev 06:09Z, Prod 06:34Z am 2026-08-31;
-Prod-Deploy nach Rafael-Freigabe, verifiziert per Audit-Log
-`/api/audit/inputs`: 06:28:34Z "ja dnan mach da auch ueberall die jas" +
-06:31:04Z Delegation der Zustellung, Session 44f02655). Prod-seitig
-nachgemessen: X-Priority weiter lokal Level 1, gehoppter Request lokal
-(Guard aktiv, `hopped=1` im Log), Cross-Bridge-Job-Roundtrip dev->prod->dev
-200/done mit beiden Bridges auf der neuen Conf.
+**Status:** Entscheidung ACCEPTED; Umsetzung der Default-Pool-Stufe **PAUSIERT
+auf X-Priority-only** (2026-08-31, ~1h nach Go-Live zurueckgenommen) wegen einer
+beim Live-Betrieb gemessenen, im Entwurf unterschaetzten Voraussetzung — siehe
+"Voraussetzung: EINE Budget-Domaene" unten. Der Rest (Hop-Guard auf beiden
+Bridges, Reads folgen dem POST-Pool, hopped/llm_pool-Sichtbarkeit, X-Priority
+Level-1-first) bleibt LIVE (Dev 06:09Z, Prod 06:34Z; Prod-Freigabe verifiziert
+per Audit-Log `/api/audit/inputs`: 06:28:34Z "ja dnan mach da auch ueberall die
+jas" + 06:31:04Z Delegation, Session 44f02655).
+
+## Voraussetzung: EINE Budget-Domaene (gemessen 2026-08-31, DevOps a0d8b084)
+
+"Ein Pool, zwei Schichten" setzt stillschweigend "EIN Identitaets-/Budget-Raum"
+voraus — den gibt es (noch) nicht: jede Bridge fuehrt eigene users/budgets.
+Ein Dev-Request, der auf Level 1 ausgefuehrt wird, laeuft durch das Budget-Gate
+der PROD-DB. Gemessen: Dev-User `e127c1bd` (interactive@werkingflow.com, auf
+Dev kerngesund: report-standard 22/100) bekam auf einem Level-1-Job
+`UPSTREAM_HTTP_402 trial_expired` — weil auf Prod nur ein JIT-Schattennutzer
+(`jit-e127c1bd-...@werking-report.local`, Trial 25.0 aufgebraucht) existiert.
+Zwei Folgen, beide inakzeptabel: gesunde Dev-Nutzer werden nichtdeterministisch
+402t (nur wessen Schatten-Trial leer ist), und Dev-UUIDs provisionieren STILL
+Schattennutzer in der Kundendatenbank (aeltester 27.07. — der Mechanismus
+bestand fuer X-Priority-Fehlkonfigurationen schon vorher). X-Priority selbst
+ist davon NICHT betroffen: dessen Nutzer (Energy/Safety prod) SIND Prod-Nutzer.
+
+Der Weg zum Zielbild braucht daher zuerst eines von beiden, als eigenes,
+geplantes Stueck: (a) Budget-/Identitaets-Foederation (das Gate der
+ausfuehrenden Bridge fragt fuer fremde Identitaeten die Heimat-Bridge) oder
+(b) eine gemeinsame Identitaets-/Budget-DB fuer beide Bridges. Danach ist die
+Reaktivierung der Default-Stufe ein Ein-Zeilen-Revert im Generator
+(`$llm_backend_pool`-Map, primary).
+
+Aufraeum-Punkt daneben: die bestehenden `jit-*@werking-report.local`-Schatten-
+nutzer auf Prod (mit Usage-Historie, DELETE wird 409en) gehoeren gesichtet.
 **Date:** 2026-08-31
 **Decider:** Rafael (31.08.2026 mittags, via Koordinations-Session; sinngemaesser
 Wortlaut unten). **Author:** prod-ops-Session.
