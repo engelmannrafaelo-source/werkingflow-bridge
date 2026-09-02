@@ -25,15 +25,16 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-# Stub heavy deps before any src.* import
-for _mod in ["src.db.client", "src.pricing"]:
+# Stub heavy deps before any src.* import. src.pricing is deliberately NOT
+# stubbed here (unlike src.db.client) — it is a lightweight, pure-function
+# module (json/os/re only at import time, no DB/heavy imports), and replacing
+# it wholesale in sys.modules corrupted every OTHER test file's `from
+# src.pricing import cost_eur` for the rest of the pytest process whenever
+# this file collected first (see the writer.cost_eur stub below for the fix
+# history). Import the real module and only rebind ai_call_writer's own name.
+for _mod in ["src.db.client"]:
     if _mod not in sys.modules:
         sys.modules[_mod] = MagicMock()
-
-# Stub pricing constants used by the module
-import src.pricing as _pricing_stub  # noqa: E402
-_pricing_stub.cost_eur = MagicMock(return_value=0.01)
-_pricing_stub.PRICING_VERSION = "test-v1"
 
 import src.activity.ai_call_writer as writer  # noqa: E402
 from src.activity.providers import PROVIDER_ANTHROPIC  # noqa: E402
@@ -45,6 +46,28 @@ from src.activity.providers import PROVIDER_ANTHROPIC  # noqa: E402
 
 VALID_UUID = str(uuid.uuid4())
 TENANT_UUID = str(uuid.uuid4())
+
+
+@pytest.fixture(autouse=True)
+def _pricing_stub():
+    """Stub ai_call_writer's OWN `from src.pricing import cost_eur,
+    PRICING_VERSION` names for the duration of each test in this file —
+    NOT `src.pricing.cost_eur` itself, and NOT a permanent module-level
+    rebind either. Both of those were tried and both leaked: a permanent
+    `src.pricing.cost_eur = MagicMock(...)` corrupted every OTHER test
+    file's real pricing for the rest of the pytest process whenever this
+    file collected first, and a permanent (module-level, no teardown)
+    `writer.cost_eur = MagicMock(...)` did the same to any OTHER file that
+    imports `src.activity.ai_call_writer` and relies on its real cost_eur
+    (e.g. tests/billing/test_ledger_real_cost.py). Confirmed 2026-09-02 both
+    ways: `pytest tests/` reported unrelated pricing assertion failures with
+    "Obtained: 0.01" purely from collection order. patch.object with
+    teardown is the only version that does not leak."""
+    with (
+        patch.object(writer, "cost_eur", MagicMock(return_value=0.01)),
+        patch.object(writer, "PRICING_VERSION", "test-v1"),
+    ):
+        yield
 
 
 @pytest.fixture
