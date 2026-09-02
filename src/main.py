@@ -5801,14 +5801,38 @@ async def reset_provider_health_endpoint(
 
 
 @app.get("/debug/tokens")
-async def debug_tokens(request: Request):
-    """Debug endpoint to check TokenRotator status."""
+async def debug_tokens(
+    request: Request,
+    _claims: AuthClaims = Depends(require_service_token),
+):
+    """TokenRotator-Zustand — service-token-only, ohne Schluesselmaterial.
+
+    Bis 2026-09-02 war diese Route unauthentifiziert UND gab
+    `token_previews` = die ersten 25 Zeichen jedes OAuth-Tokens zurueck. Ueber
+    nginx war sie damit aus dem Internet abrufbar (live gemessen 02.09.2026:
+    HTTP 200 auf https://bridge.werking.tools/debug/tokens, fuenf
+    'sk-ant-...'-Vorschauen plus die Pfade der Token-Dateien). Zwei Fehler in
+    einem: fehlende Autorisierung und die Ausgabe von Schluesselmaterial.
+
+    Beides behoben, und zwar getrennt — die Autorisierung allein reicht nicht:
+    ein Endpunkt, der Geheimnisse zurueckgibt, ist auch fuer Berechtigte der
+    falsche Weg, an sie zu kommen (dafuer gibt es die Token-Dateien am Host).
+    Der diagnostische Zweck der Vorschau war "liegt das richtige/ein frisches
+    Token?" — das beantwortet ein Fingerabdruck genauso, ohne etwas preiszugeben,
+    das man wiederverwenden kann.
+    """
+    import hashlib
+
     from src.auth import token_rotator
     return {
         "total_tokens": len(token_rotator.tokens),
         "current_index": token_rotator.current_index,
         "token_files": [str(f) for f in token_rotator.token_files],
-        "token_previews": [t[:25] + "..." for t in token_rotator.tokens] if token_rotator.tokens else [],
+        # sha256-Praefix statt Klartext-Vorschau: vergleichbar (Rotation
+        # nachweisbar), aber nicht verwendbar.
+        "token_fingerprints": [
+            hashlib.sha256(t.encode()).hexdigest()[:8] for t in token_rotator.tokens
+        ],
         "status": "ok" if len(token_rotator.tokens) > 1 else "warning_single_token"
     }
 
@@ -5906,14 +5930,24 @@ async def worker_capacity(request: Request):
 
 
 @app.get("/license-health")
-async def license_health_check(request: Request):
+async def license_health_check(
+    request: Request,
+    _claims: AuthClaims = Depends(require_service_token),
+):
     """
     Test this worker's Claude license/token by making a minimal API call.
+
+    Service-token only, aus zwei Gruenden (Befund 02.09.2026, zusammen mit
+    /debug/tokens gefunden — beide gaben dieselbe Token-Vorschau aus):
+      1. Die Antwort beschrieb das Schluesselmaterial (erste 25 Zeichen).
+      2. Jeder Aufruf loest einen ECHTEN Modell-Call aus. Unauthentifiziert war
+         das ein Weg, auf fremde Rechnung Anfragen zu erzeugen — der Leak war
+         der auffaellige Teil, der bezahlte Aufruf der teurere.
 
     Returns:
     - status: "healthy" | "rate_limited" | "error"
     - worker_id: which worker this is
-    - token_preview: first 25 chars of token
+    - token_fingerprint: sha256-Praefix des Tokens (vergleichbar, nicht verwendbar)
     - reset_time: when rate limit resets (if rate_limited)
     - test_response: the actual response from Claude (if healthy)
 
@@ -5921,18 +5955,23 @@ async def license_health_check(request: Request):
 
     Example aggregation script:
     ```bash
-    # Check all workers
+    # Check all workers (X-Bridge-Service-Token ist Pflicht)
     for worker in "worker1:8000" "worker2:8000" "host:8001" "host:8002"; do
-      curl -s "http://$worker/license-health" | jq -c '{worker: .worker_id, status: .status}'
+      curl -s -H "X-Bridge-Service-Token: $BRIDGE_SERVICE_TOKEN" \
+        "http://$worker/license-health" | jq -c '{worker: .worker_id, status: .status}'
     done
     ```
     """
+    import hashlib
     import time
     from datetime import datetime
 
     worker_id = os.getenv("INSTANCE_NAME", "unknown")
     from src.auth import token_rotator
-    token_preview = token_rotator.tokens[0][:25] + "..." if token_rotator.tokens else "NO_TOKEN"
+    token_fingerprint = (
+        hashlib.sha256(token_rotator.tokens[0].encode()).hexdigest()[:8]
+        if token_rotator.tokens else "NO_TOKEN"
+    )
 
     # Check if already known to be rate-limited
     if rate_limit_tracker.is_rate_limited(worker_id):
@@ -5942,7 +5981,7 @@ async def license_health_check(request: Request):
         return {
             "status": "rate_limited",
             "worker_id": worker_id,
-            "token_preview": token_preview,
+            "token_fingerprint": token_fingerprint,
             "reset_time": reset_time.isoformat() if reset_time else None,
             "retry_after_seconds": retry_after,
             "message": f"Token rate-limited until {reset_time}"
@@ -5975,7 +6014,7 @@ async def license_health_check(request: Request):
                             return {
                                 "status": "rate_limited",
                                 "worker_id": worker_id,
-                                "token_preview": token_preview,
+                                "token_fingerprint": token_fingerprint,
                                 "reset_time": None,
                                 "message": block.text[:100]
                             }
@@ -5985,7 +6024,7 @@ async def license_health_check(request: Request):
         return {
             "status": "healthy",
             "worker_id": worker_id,
-            "token_preview": token_preview,
+            "token_fingerprint": token_fingerprint,
             "test_response": response_text[:50] if response_text else "NO_RESPONSE",
             "test_duration_seconds": round(duration, 2),
             "message": "License is active and working"
@@ -5997,7 +6036,7 @@ async def license_health_check(request: Request):
         return {
             "status": "rate_limited",
             "worker_id": worker_id,
-            "token_preview": token_preview,
+            "token_fingerprint": token_fingerprint,
             "error": str(e)[:100],
             "message": "Token appears to be rate-limited"
         }
@@ -6007,7 +6046,7 @@ async def license_health_check(request: Request):
         return {
             "status": "error",
             "worker_id": worker_id,
-            "token_preview": token_preview,
+            "token_fingerprint": token_fingerprint,
             "error": str(e)[:100],
             "message": "Unexpected error during license check"
         }
@@ -6051,8 +6090,19 @@ def redact_sensitive_headers(headers) -> dict:
 
 @app.post("/v1/debug/request")
 @rate_limit_endpoint("debug")
-async def debug_request_validation(request: Request):
-    """Debug endpoint to test request validation and see what's being sent."""
+async def debug_request_validation(
+    request: Request,
+    _claims: AuthClaims = Depends(require_service_token),
+):
+    """Debug endpoint to test request validation and see what's being sent.
+
+    Service-token only (02.09.2026). Der Endpunkt spiegelt Body und Header
+    zurueck; Anmeldedaten schwaerzt `redact_sensitive_headers` zwar seit
+    laengerem, aber ein oeffentlicher Spiegel bleibt ein Werkzeug zum Abtasten
+    des Servers, und er teilte die Ursache mit /debug/tokens und
+    /license-health: Autorisierung ist hier pro Route Opt-in, es gibt keine
+    Middleware, die sie erzwingt — diese Route war schlicht vergessen worden.
+    """
     try:
         # Get the raw request body
         body = await request.body()
