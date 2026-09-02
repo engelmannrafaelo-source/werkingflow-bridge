@@ -2199,7 +2199,50 @@ async def chat_completions(
                 estimated_cost_eur=_gate_cost,
                 project_id=_gate_attr.get("workflow_id"),
             )
-        except HTTPException:
+        except HTTPException as _budget_402:
+            # A 402 (budget exhausted) rejects the call before any usage_events
+            # row would ever be written — persist_ai_call_activity is only
+            # reached further down, after the gate. Without this, "budget
+            # exhausted" leaves NO ledger trace at all, so monitoring/customer-
+            # activity views cannot tell a blocked user from an idle one
+            # (Befund DevOps 01.09.: "Erschöpfung sieht aus wie Stille").
+            # Only the genuine "out of money" case (402) is logged here — the
+            # gate's other HTTPExceptions (400 malformed identity, 503
+            # federation) are different failure classes with no billable
+            # identity to attribute a row to, and are not what was reported.
+            # Best-effort and isolated: persist_ai_call_activity already never
+            # raises for tracking failures, but this extra try/except keeps a
+            # future change in there from ever turning a blocked call into a
+            # 500 instead of the 402 the caller is supposed to see.
+            if _budget_402.status_code == 402:
+                try:
+                    from src.activity.ai_call_writer import persist_ai_call_activity
+                    from src.activity.providers import PROVIDER_UNROUTED
+                    _detail = _budget_402.detail if isinstance(_budget_402.detail, dict) else {}
+                    await persist_ai_call_activity(
+                        app_id=_gate_attr.get("app_id"),
+                        user_id=_gate_attr.get("user_id"),
+                        agent_id=_gate_attr.get("agent_id"),
+                        workflow_id=_gate_attr.get("workflow_id"),
+                        model=getattr(request_body, "model", None) or "unknown",
+                        input_tokens=0,
+                        output_tokens=0,
+                        status="error",
+                        duration_ms=0,
+                        error_code="402",
+                        error_message=str(
+                            _detail.get("message") or _detail.get("reason")
+                            or _detail.get("error") or "budget_exhausted"
+                        )[:500],
+                        app_env=_gate_attr.get("app_env"),
+                        provider=PROVIDER_UNROUTED,
+                    )
+                except Exception as _log_e:  # noqa: BLE001 — never let ledger logging affect the 402 response
+                    logger.error(
+                        "budget gate: failed to log the 402 rejection to usage_events "
+                        "(app=%s user=%s): %s", _gate_attr.get("app_id"),
+                        _gate_attr.get("user_id"), _log_e,
+                    )
             raise  # 402 — propagate to the client
         except Exception as _ge:  # noqa: BLE001 — gate must never crash the path
             logger.error(f"budget gate unexpected error (letting call through): {_ge}")
