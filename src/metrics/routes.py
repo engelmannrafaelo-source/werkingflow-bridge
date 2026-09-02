@@ -158,9 +158,9 @@ async def usage_metrics(
             u.input_tokens, u.output_tokens,
             u.cache_read_tokens, u.cache_creation_tokens,
             u.real_cost_eur, u.hypothetical_cost_eur,
-            COALESCE((u.provider_metadata->>'status') = 'error', false) AS is_error,
+            (u.status = 'error')                             AS is_error,
             u.recorded_at,
-            u.provider_metadata->>'error_code'              AS error_code,
+            u.error_code                                      AS error_code,
             left(u.provider_metadata->>'error_message', 200) AS error_message
         FROM usage_events u
         WHERE {where_sql}
@@ -393,7 +393,7 @@ async def usage_timeseries(
             u.app, u.model,
             u.input_tokens, u.output_tokens,
             u.real_cost_eur, u.hypothetical_cost_eur,
-            COALESCE((u.provider_metadata->>'status') = 'error', false) AS is_error
+            (u.status = 'error')                             AS is_error
         FROM usage_events u
         WHERE {where_sql}
         ORDER BY bucket_ts ASC

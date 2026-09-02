@@ -141,6 +141,15 @@ async def insert_ai_call(
         # is not a UUID would be rejected by the uuid column mid-INSERT.
         actor_uuid = uuid.UUID(str(actor_user_id))
 
+    # status/error_code are promoted out of provider_metadata into dedicated,
+    # indexed columns (migration 059) — ai_call_writer.py already puts both
+    # into provider_metadata for every call, so this is a pure extraction, not
+    # a new writer contract. provider_metadata keeps carrying them too (no
+    # second source of truth to keep in sync, no reader breaks).
+    status = str((provider_metadata or {}).get("status") or "success")
+    error_code_val = (provider_metadata or {}).get("error_code")
+    error_code = str(error_code_val) if error_code_val is not None else None
+
     pool = get_pool()
     async with pool.acquire() as conn:
         inserted = await conn.fetchrow(
@@ -152,7 +161,7 @@ async def insert_ai_call(
                 input_tokens, output_tokens,
                 cache_read_tokens, cache_creation_tokens,
                 billing_mode, real_cost_eur, hypothetical_cost_eur, pricing_version,
-                provider_metadata
+                provider_metadata, status, error_code
             ) VALUES (
                 'workflow', $17, $18,
                 $1, $2,
@@ -160,7 +169,7 @@ async def insert_ai_call(
                 $8, $9,
                 $10, $11,
                 $12::billing_mode_enum, $13, $14, $15,
-                $16::jsonb
+                $16::jsonb, $19, $20
             )
             ON CONFLICT (idempotency_key) DO NOTHING
             RETURNING id
@@ -183,6 +192,8 @@ async def insert_ai_call(
             json.dumps(provider_metadata or {}),
             recorded_at,
             idempotency_key,
+            status,
+            error_code,
         )
         created = inserted is not None
         if not created:

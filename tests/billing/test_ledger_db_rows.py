@@ -34,9 +34,12 @@ TENANT_ID = str(uuid.uuid4())
 
 # Positionsbindung des usage_events-INSERTs (siehe ledger_db.insert_ai_call):
 # $17 = recorded_at, $18 = idempotency_key — sie haengen bewusst HINTER der
-# Metadata, damit $1..$16 unveraendert bleiben.
+# Metadata, damit $1..$16 unveraendert bleiben. $19/$20 = status/error_code
+# (Migration 059) haengen aus demselben Grund GANZ HINTEN an.
 USAGE_RECORDED_AT = 16
 USAGE_IDEMPOTENCY_KEY = 17
+USAGE_STATUS = 18
+USAGE_ERROR_CODE = 19
 AUDIT_RECORDED_AT = 6
 
 
@@ -151,6 +154,41 @@ async def test_idempotency_key_and_metadata_reach_the_row():
     usage_args = conn.fetchrow.call_args_list[0].args[1:]
     assert usage_args[USAGE_IDEMPOTENCY_KEY] == "call-uid-1"
     assert json.loads(usage_args[15])["app_id_raw"] == "bridge-jobs"
+
+
+@pytest.mark.asyncio
+async def test_status_and_error_code_extracted_from_provider_metadata_into_columns():
+    """Migration 059 — status/error_code become dedicated, indexed columns
+    instead of living only inside provider_metadata JSONB. ai_call_writer.py
+    already puts both into provider_metadata for every call; insert_ai_call
+    must extract them so a 429 mid-call error is queryable via a real column,
+    not just via ->>'status' extraction."""
+    pool, conn = _pool(created=True)
+    await _insert(
+        pool,
+        provider_metadata={
+            "status": "error",
+            "error_code": "429",
+            "error_message": "rate limited",
+        },
+    )
+
+    usage_args = conn.fetchrow.call_args_list[0].args[1:]
+    assert usage_args[USAGE_STATUS] == "error"
+    assert usage_args[USAGE_ERROR_CODE] == "429"
+
+
+@pytest.mark.asyncio
+async def test_missing_status_in_metadata_defaults_to_success():
+    """provider_metadata without a 'status' key (legacy callers, or a call
+    site that never sets it) must not leave the column NULL — the ledger
+    only ever records completed calls unless told otherwise."""
+    pool, conn = _pool(created=True)
+    await _insert(pool, provider_metadata={"feature": "call"})
+
+    usage_args = conn.fetchrow.call_args_list[0].args[1:]
+    assert usage_args[USAGE_STATUS] == "success"
+    assert usage_args[USAGE_ERROR_CODE] is None
 
 
 @pytest.mark.asyncio
