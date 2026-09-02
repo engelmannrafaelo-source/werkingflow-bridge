@@ -8,7 +8,8 @@ Auth model:
   POST   /v1/users                                           — admin only (creates accounts)
   GET    /v1/users/{user_id}                                 — require_self_or_admin
   PATCH  /v1/users/{user_id}                                 — require_self_or_admin (name; role/password operator-only)
-  DELETE /v1/users/{user_id}                                 — admin only (hard delete, refuses on billing-record FK)
+  DELETE /v1/users/{user_id}                                 — admin only (hard delete, refuses on billing-record FK;
+                                                                 räumt einen dadurch leeren, datenlosen Mandanten mit auf)
   POST   /v1/users/{user_id}/anonymize                       — admin only (GDPR Art. 17 anonymize-with-retention; the
                                                                  explicit escape valve when hard-delete 409s on retained
                                                                  billing rows — never triggered implicitly by DELETE)
@@ -19,6 +20,8 @@ Auth model:
   GET    /v1/tenants                                         — admin only
   POST   /v1/tenants                                         — admin only
   PATCH  /v1/tenants/{tenant_id}                             — admin only
+  GET    /v1/tenants/orphaned                                — admin only (Mandanten ohne Nutzer + was sie festhält)
+  DELETE /v1/tenants/{tenant_id}                             — admin only (nur leer + datenlos, sonst 409)
   GET    /v1/tenants/{tenant_id}/billing-address             — self (own tenant) or admin
   PATCH  /v1/tenants/{tenant_id}/billing-address             — self (own tenant) or admin
   GET    /v1/tenants/{tenant_id}/stammdaten                  — own-tenant member or admin
@@ -37,6 +40,13 @@ from typing import Optional, List, Any, Dict
 import asyncpg
 from src.identity.password import hash_password
 from src.identity.jwt_utils import VALID_ROLES
+from src.identity.tenant_lifecycle import (
+    TenantCleanupError,
+    drop_tenant_if_orphaned,
+    tenant_blocking_tables,
+    tenant_member_count,
+    tenant_scoped_tables,
+)
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from fastapi.responses import JSONResponse
@@ -225,38 +235,49 @@ async def create_user(
     # Auto-create tenant if not supplied
     tenant_id = body.tenant_id or str(uuid.uuid4())
 
+    # Vor der Transaktion: bcrypt ist rechenintensiv und hat in einer offenen
+    # Transaktion nichts zu suchen.
+    pw_hash = hash_password(body.password) if body.password else None
+
     async with pool.acquire() as conn:
-        # Ensure tenant exists
-        existing_tenant = await conn.fetchrow("SELECT id FROM tenants WHERE id = $1", tenant_id)
-        if not existing_tenant:
-            await conn.execute(
-                "INSERT INTO tenants (id, name, created_at) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING",
-                tenant_id,
-                f"Auto-tenant for {body.email}",
-                now,
-            )
-
-        pw_hash = hash_password(body.password) if body.password else None
-
+        # Mandant und Nutzer entstehen gemeinsam oder gar nicht. Ohne diese
+        # Klammer hinterliess jeder 409 auf eine schon vergebene Adresse einen
+        # frischen "Auto-tenant for <mail>" ohne Nutzer — die zweite Quelle der
+        # verwaisten Mandanten (Prod-Befund 02.09.2026), und sie erzeugte den
+        # Namens-Doppel sogar ohne dass je ein Konto gelöscht wurde.
+        #
         # We catch UniqueViolationError explicitly and translate to 409. Any
         # other DB error is a server bug — log it server-side with full detail,
         # return a generic 500 to the caller to avoid leaking schema details
         # (table/constraint names, PG error codes) to internet-facing clients.
         try:
-            row = await conn.fetchrow(
-                """
-                INSERT INTO users (email, name, tenant_id, role, password_hash, created_at, updated_at)
-                VALUES ($1, $2, $3, $4, $5, $6, $7)
-                RETURNING id, email, name, tenant_id, role, provider_config, created_at, updated_at
-                """,
-                body.email,
-                body.name,
-                tenant_id,
-                role,
-                pw_hash,
-                now,
-                now,
-            )
+            async with conn.transaction():
+                # Ensure tenant exists
+                existing_tenant = await conn.fetchrow(
+                    "SELECT id FROM tenants WHERE id = $1", tenant_id
+                )
+                if not existing_tenant:
+                    await conn.execute(
+                        "INSERT INTO tenants (id, name, created_at) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING",
+                        tenant_id,
+                        f"Auto-tenant for {body.email}",
+                        now,
+                    )
+
+                row = await conn.fetchrow(
+                    """
+                    INSERT INTO users (email, name, tenant_id, role, password_hash, created_at, updated_at)
+                    VALUES ($1, $2, $3, $4, $5, $6, $7)
+                    RETURNING id, email, name, tenant_id, role, provider_config, created_at, updated_at
+                    """,
+                    body.email,
+                    body.name,
+                    tenant_id,
+                    role,
+                    pw_hash,
+                    now,
+                    now,
+                )
         except asyncpg.UniqueViolationError:
             raise HTTPException(
                 status_code=409,
@@ -514,6 +535,17 @@ async def delete_user(
       user_topup_balances → ON DELETE CASCADE.
       tenants.owner_user_id → ON DELETE SET NULL.
 
+    Mandanten-Bereinigung (seit 2026-09-02, Rafael-Entscheid):
+      Das Schema räumt den Mandanten NICHT mit auf — owner_user_id wird nur
+      genullt. Genau daraus entstanden die verwaisten Mandanten und die
+      doppelten Namen ("Personal tenant for <mail>" mehrfach), weil jede
+      Registrierung einen neuen anlegt. Deshalb wird nach dem Löschen in
+      derselben Transaktion geprüft, ob der Mandant leer UND datenlos ist —
+      dann fällt er mit. Team-Mandanten mit weiteren Mitgliedern und Mandanten
+      mit Bestand (Budgets, Zustimmungen, Stammdaten, …) bleiben unangetastet;
+      welche Tabellen das sind, entscheidet der Katalog, nicht eine gepflegte
+      Liste (src/identity/tenant_lifecycle.py).
+
     Refuses with 409 when the user still owns billing records that must survive
     for audit reasons:
       subscriptions      → ON DELETE RESTRICT
@@ -545,7 +577,31 @@ async def delete_user(
     pool = get_pool()
     try:
         async with pool.acquire() as conn:
-            result = await conn.execute("DELETE FROM users WHERE id = $1", uid)
+            # Löschung des Nutzers UND das Aufräumen seines Mandanten gehören in
+            # dieselbe Transaktion. Sonst gibt es genau das Fenster, aus dem die
+            # verwaisten Mandanten stammen: Nutzer weg, Hülle bleibt.
+            async with conn.transaction():
+                owner_row = await conn.fetchrow(
+                    "SELECT tenant_id FROM users WHERE id = $1", uid
+                )
+                if owner_row is None:
+                    raise HTTPException(
+                        status_code=404, detail=f"User '{user_id}' not found"
+                    )
+
+                result = await conn.execute("DELETE FROM users WHERE id = $1", uid)
+
+                # asyncpg returns 'DELETE N' — N=0 means the row was not there.
+                if not result.endswith(" 1"):
+                    raise HTTPException(
+                        status_code=404, detail=f"User '{user_id}' not found"
+                    )
+
+                cleanup = await drop_tenant_if_orphaned(
+                    conn,
+                    owner_row["tenant_id"],
+                    reason=f"hard-delete user {user_id}",
+                )
     except asyncpg.ForeignKeyViolationError:
         raise HTTPException(
             status_code=409,
@@ -558,10 +614,20 @@ async def delete_user(
                 f"anonymize-with-retention) instead."
             ),
         )
+    except TenantCleanupError as exc:
+        # Der Mandant liess sich nicht einordnen — die ganze Transaktion ist
+        # zurückgerollt, der Nutzer also NICHT geloescht. Das ist Absicht: lieber
+        # gar nichts als ein halber Vorgang, dessen Rest niemand sieht.
+        logger.error("delete_user: Mandanten-Bereinigung abgebrochen: %s", exc)
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                f"User '{user_id}' was NOT deleted: tenant cleanup could not "
+                f"classify the tenant — {exc}"
+            ),
+        )
 
-    # asyncpg returns 'DELETE N' — N=0 means the row was not there.
-    if not result.endswith(" 1"):
-        raise HTTPException(status_code=404, detail=f"User '{user_id}' not found")
+    logger.info("delete_user %s → tenant cleanup: %s", user_id, cleanup.as_dict())
     return Response(status_code=204)
 
 
@@ -1320,6 +1386,126 @@ async def update_tenant(
         "billing_type": row["billing_type"],
         "created_at": row["created_at"].isoformat(),
     }
+
+
+# ---------------------------------------------------------------------------
+# Verwaiste Mandanten — Inventur + geführte Löschung.
+#
+# Die Ursache (Mandant überlebt seinen letzten Nutzer) ist in delete_user
+# behoben; diese beiden Routen sind der Betriebs-Gegenpart dazu: sichtbar
+# machen, was noch liegt, und es auf demselben geprüften Weg entfernen, den
+# delete_user geht — statt per Hand am SQL-Prompt, wo niemand sieht, ob an dem
+# Mandanten noch Budgets oder Zustimmungen hängen.
+# ---------------------------------------------------------------------------
+
+@router.get("/v1/tenants/orphaned")
+async def list_orphaned_tenants(
+    limit: int = Query(200, ge=1, le=1000),
+    _claims: AuthClaims = Depends(require_admin),
+) -> Dict[str, Any]:
+    """
+    Mandanten ohne einen einzigen Nutzer — je Zeile, was ihre Löschung festhält.
+
+    `deletable=true` heißt: leer UND datenlos, DELETE /v1/tenants/{id} würde ihn
+    entfernen. `blockedBy` nennt die Tabellen, die noch Zeilen führen; solche
+    Mandanten bleiben mit Absicht liegen.
+    """
+    pool = get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT t.id, t.name, t.account_type::text AS account_type, t.created_at
+              FROM tenants t
+             WHERE NOT EXISTS (SELECT 1 FROM users u WHERE u.tenant_id = t.id)
+             ORDER BY t.created_at
+             LIMIT $1
+            """,
+            limit,
+        )
+        tables = await tenant_scoped_tables(conn)
+        out = []
+        for r in rows:
+            blocking = await tenant_blocking_tables(conn, r["id"], tables)
+            out.append({
+                "id": r["id"],
+                "name": r["name"],
+                "account_type": r["account_type"],
+                "created_at": r["created_at"].isoformat(),
+                "deletable": not blocking,
+                "blockedBy": blocking,
+            })
+
+    return {
+        "count": len(out),
+        "deletable": sum(1 for t in out if t["deletable"]),
+        "tenants": out,
+    }
+
+
+@router.delete("/v1/tenants/{tenant_id}", status_code=204, response_class=Response)
+async def delete_tenant(
+    tenant_id: str,
+    _claims: AuthClaims = Depends(require_admin),
+) -> Response:
+    """
+    Operator-Löschung eines Mandanten — nur wenn leer und datenlos.
+
+      204 → gelöscht
+      404 → Mandant existiert nicht
+      409 → hat noch Mitglieder oder Bestand (Details im detail-Text)
+
+    Bewusst KEIN Kaskadieren und kein `force`: ein Mandant mit Bestand wird nicht
+    gelöscht, sondern erklärt. Wer ihn wirklich los werden will, muss den Bestand
+    einzeln verantworten.
+    """
+    pool = get_pool()
+    async with pool.acquire() as conn:
+        exists = await conn.fetchval("SELECT 1 FROM tenants WHERE id = $1", tenant_id)
+        if not exists:
+            raise HTTPException(status_code=404, detail=f"Tenant '{tenant_id}' not found")
+
+        members = await tenant_member_count(conn, tenant_id)
+        if members > 0:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"Tenant '{tenant_id}' still has {members} user(s). Delete or "
+                    f"anonymize them first — a tenant is never removed out from "
+                    f"under its members."
+                ),
+            )
+
+        blocking = await tenant_blocking_tables(conn, tenant_id)
+        if blocking:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"Tenant '{tenant_id}' still holds data in: "
+                    f"{', '.join(blocking)}. Refused by design — deleting it would "
+                    f"cascade or detach those rows silently."
+                ),
+            )
+
+        try:
+            async with conn.transaction():
+                result = await drop_tenant_if_orphaned(
+                    conn, tenant_id, reason="operator DELETE /v1/tenants",
+                )
+        except TenantCleanupError as exc:
+            logger.error("delete_tenant %s abgebrochen: %s", tenant_id, exc)
+            raise HTTPException(status_code=500, detail=str(exc))
+
+    if not result.deleted:
+        # Zwischen Prüfung und Löschung hat sich etwas geändert (Rennen mit einer
+        # frischen Registrierung). Nicht durchdrücken — melden.
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"Tenant '{tenant_id}' changed while deleting: "
+                f"{result.as_dict()}"
+            ),
+        )
+    return Response(status_code=204)
 
 
 # ---------------------------------------------------------------------------

@@ -14,6 +14,8 @@ Coverage:
 - change-password: anonymized account → 410
 - change-password: SSO-only user (no password_hash) → 409
 - close_account: anonymizes PII, retains billing data
+- close_account: tenant survives, but its name loses the email address
+- hard-delete: an emptied, dataless tenant is removed with its last user
 - close_account: idempotent on already-anonymized account
 - close_account: require_self rejects different user → 403
 - close_account: unknown user → 404
@@ -62,6 +64,7 @@ from src.db.admin_routes import router as admin_db_router
 from src.identity.self_service import router
 from src.identity.password import hash_password
 from src.identity.jwt_utils import sign_jwt
+from tests.identity.tenant_mocks import mock_hard_delete_pool
 
 
 # ---------------------------------------------------------------------------
@@ -316,7 +319,12 @@ class TestCloseAccount:
 
     def test_anonymizes_pii_and_retains_billing(self, client: TestClient):
         uid = uuid.uuid4()
-        user_row = {"id": uid, "anonymized_at": None}
+        user_row = {
+            "id": uid,
+            "email": "user@example.com",
+            "tenant_id": "tenant-1",
+            "anonymized_at": None,
+        }
         # fetchval side_effect: invoices=2, subscriptions=1, credit_purchases=0, billing_events=3
         pool, conn = _mock_pool_multi(
             user_row,
@@ -414,13 +422,7 @@ class TestCloseAccount:
         # never in production. Composition semantics: operator → hard-delete
         # (204/404/409), non-operator → GDPR anonymize via delegation.
         uid = uuid.uuid4()
-        conn = AsyncMock()
-        conn.execute = AsyncMock(return_value="DELETE 1")
-        acquire_cm = MagicMock()
-        acquire_cm.__aenter__ = AsyncMock(return_value=conn)
-        acquire_cm.__aexit__ = AsyncMock(return_value=False)
-        pool = MagicMock()
-        pool.acquire = MagicMock(return_value=acquire_cm)
+        pool, conn = mock_hard_delete_pool()
 
         with patch("src.db.admin_routes.get_pool", return_value=pool):
             resp = client.delete(
@@ -464,7 +466,12 @@ class TestOperatorAnonymize:
         until this route existed there was no other way to close the account.
         """
         uid = uuid.uuid4()
-        user_row = {"id": uid, "anonymized_at": None}
+        user_row = {
+            "id": uid,
+            "email": "user@example.com",
+            "tenant_id": "tenant-1",
+            "anonymized_at": None,
+        }
         # fetchval side_effect: invoices=0, subscriptions=2, credit_purchases=1, billing_events=0
         pool, conn = _mock_pool_multi(
             user_row,
@@ -486,6 +493,39 @@ class TestOperatorAnonymize:
 
         update_calls = [c for c in conn.execute.call_args_list if "UPDATE users" in c[0][0]]
         assert len(update_calls) == 1
+
+    def test_tenant_name_loses_the_email_address(self, client: TestClient):
+        """
+        Der Mandant bleibt (die Stub-Zeile wohnt darin), sein Name darf die
+        Adresse aber nicht überleben: "Personal tenant for user@example.com"
+        war personenbezogen trotz Art.-17-Löschung — und die zweite Quelle
+        doppelter Mandantennamen, sobald sich dieselbe Adresse neu registriert.
+        """
+        uid = uuid.uuid4()
+        user_row = {
+            "id": uid,
+            "email": "user@example.com",
+            "tenant_id": "tenant-1",
+            "anonymized_at": None,
+        }
+        pool, conn = _mock_pool_multi(user_row, fetchval_side_effect=[0, 0, 0, 0])
+
+        with patch("src.identity.self_service.get_pool", return_value=pool):
+            resp = client.post(
+                f"/v1/users/{uid}/anonymize",
+                headers=_SERVICE_HEADER,
+            )
+
+        assert resp.status_code == 200
+        rename_calls = [
+            c for c in conn.execute.call_args_list
+            if "UPDATE tenants" in c[0][0] and "replace(name" in c[0][0]
+        ]
+        assert len(rename_calls) == 1
+        args = rename_calls[0][0][1:]
+        assert args[0] == "tenant-1"
+        assert args[1] == "user@example.com"
+        assert args[2] == f"deleted+{uid}@werkingflow.invalid"
 
     def test_idempotent_on_already_anonymized(self, client: TestClient):
         uid = uuid.uuid4()
@@ -554,17 +594,11 @@ class TestOperatorAnonymize:
         existence, not subscription status).
         """
         uid = uuid.uuid4()
-        conn = AsyncMock()
-        conn.execute = AsyncMock(
-            side_effect=asyncpg.ForeignKeyViolationError(
+        pool, conn = mock_hard_delete_pool(
+            delete_user_raises=asyncpg.ForeignKeyViolationError(
                 "update or delete on table \"users\" violates foreign key constraint"
             )
         )
-        acquire_cm = MagicMock()
-        acquire_cm.__aenter__ = AsyncMock(return_value=conn)
-        acquire_cm.__aexit__ = AsyncMock(return_value=False)
-        pool = MagicMock()
-        pool.acquire = MagicMock(return_value=acquire_cm)
 
         with patch("src.db.admin_routes.get_pool", return_value=pool):
             resp = client.delete(

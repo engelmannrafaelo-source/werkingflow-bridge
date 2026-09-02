@@ -18,6 +18,7 @@ from pydantic import BaseModel, Field
 from src.api_auth import require_self_or_admin, AuthClaims
 from src.db.client import get_pool
 from src.identity.password import hash_password, verify_password
+from src.identity.tenant_lifecycle import strip_email_from_tenant_name
 
 router = APIRouter(tags=["self-service"])
 
@@ -124,6 +125,8 @@ async def close_account(
     longer by personal data.
 
     tenants.owner_user_id is set to NULL if this user was the tenant owner.
+    Der Mandant selbst bleibt bestehen (die anonymisierte Nutzerzeile wohnt
+    weiter darin), sein Name wird aber von der E-Mail-Adresse befreit.
 
     Idempotent: a second call returns the existing anonymized_at without error.
     """
@@ -132,7 +135,7 @@ async def close_account(
 
     async with pool.acquire() as conn:
         user_row = await conn.fetchrow(
-            "SELECT id, anonymized_at FROM users WHERE id = $1", uid
+            "SELECT id, email, tenant_id, anonymized_at FROM users WHERE id = $1", uid
         )
 
     if not user_row:
@@ -203,6 +206,18 @@ async def close_account(
             # Clear tenant ownership — the tenant itself is retained.
             await conn.execute(
                 "UPDATE tenants SET owner_user_id = NULL WHERE owner_user_id = $1", uid
+            )
+
+            # Der Mandant bleibt (die Nutzerzeile bleibt als Stub, er ist also
+            # bewohnt) — sein NAME darf die Adresse aber nicht überleben. Bis
+            # 2026-09-02 stand dort weiter "Personal tenant for max@firma.at":
+            # personenbezogen trotz Art.-17-Löschung, und zugleich die zweite
+            # Quelle doppelter Mandantennamen — registriert sich dieselbe
+            # Adresse neu, entsteht der Name ein zweites Mal.
+            # Ersetzt wird nur das Vorkommen der Adresse; ein Team-Mandant
+            # namens "Muster GmbH" enthält sie nicht und bleibt unberührt.
+            await strip_email_from_tenant_name(
+                conn, user_row["tenant_id"], user_row["email"], placeholder_email,
             )
 
     return {

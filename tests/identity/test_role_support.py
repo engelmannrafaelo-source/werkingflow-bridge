@@ -50,6 +50,7 @@ from src.identity.jwt_utils import sign_jwt, verify_jwt, VALID_ROLES
 from src.identity.routes import router as identity_router
 from src.identity.password import hash_password
 from src.api_auth.deps import AuthClaims
+from tests.identity.tenant_mocks import mock_hard_delete_pool
 
 
 # ---------------------------------------------------------------------------
@@ -238,6 +239,14 @@ def _user_claims(user_id: str) -> AuthClaims:
     )
 
 
+def _fake_transaction():
+    """asyncpg-Transaktions-Ersatz für Mocks (create_user klammert seit 02.09.2026)."""
+    @asynccontextmanager
+    async def _tx():
+        yield None
+    return _tx()
+
+
 def _db_row(role: str = "user", name: str = "Name") -> dict:
     now = datetime.now(timezone.utc)
     return {
@@ -246,6 +255,7 @@ def _db_row(role: str = "user", name: str = "Name") -> dict:
         "name": name,
         "tenant_id": "t-1",
         "role": role,
+        "provider_config": None,
         "created_at": now,
         "updated_at": now,
     }
@@ -292,6 +302,7 @@ class TestAdminCreateUserRole:
         conn = AsyncMock()
         conn.fetchrow = AsyncMock(side_effect=[None, row])  # tenant check → None, insert → row
         conn.execute = AsyncMock()
+        conn.transaction = _fake_transaction
 
         @asynccontextmanager
         async def _acquire():
@@ -318,6 +329,7 @@ class TestAdminCreateUserRole:
         conn = AsyncMock()
         conn.fetchrow = AsyncMock(side_effect=[None, row])
         conn.execute = AsyncMock()
+        conn.transaction = _fake_transaction
 
         @asynccontextmanager
         async def _acquire():
@@ -496,20 +508,19 @@ class TestAdminUpdateUserPassword:
 # ---------------------------------------------------------------------------
 
 def _delete_pool(execute_return: str = "DELETE 1", execute_raises=None):
-    """Pool whose conn.execute either returns a 'DELETE N' string or raises."""
-    conn = AsyncMock()
-    if execute_raises is not None:
-        conn.execute = AsyncMock(side_effect=execute_raises)
-    else:
-        conn.execute = AsyncMock(return_value=execute_return)
+    """
+    Pool für den Hartlöschpfad.
 
-    @asynccontextmanager
-    async def _acquire():
-        yield conn
-
-    pool = MagicMock()
-    pool.acquire = _acquire
-    return pool, conn
+    Seit der Mandanten-Bereinigung (2026-09-02) stellt dieser Pfad mehrere
+    Fragen an dieselbe Verbindung und braucht eine Transaktion — der frühere
+    "conn.execute gibt immer denselben String"-Mock passte nicht mehr auf einen
+    Vorgang, der Nutzer UND Mandant zusammen behandelt. Gemeinsames Double:
+    tests/identity/tenant_mocks.py.
+    """
+    return mock_hard_delete_pool(
+        delete_user_result=execute_return,
+        delete_user_raises=execute_raises,
+    )
 
 
 class TestAdminDeleteUser:
@@ -524,8 +535,10 @@ class TestAdminDeleteUser:
             resp = client.delete(f"/v1/users/{uid}")
 
         assert resp.status_code == 204
-        sql = conn.execute.call_args[0][0]
-        assert "DELETE FROM users" in sql
+        assert len(conn.executed("DELETE FROM users")) == 1
+        # Der geleerte, datenlose Mandant faellt mit — die Ursache der
+        # verwaisten Mandanten auf der Prod-Bridge (Befund 02.09.2026).
+        assert len(conn.executed("DELETE FROM tenants")) == 1
 
     def test_unknown_user_returns_404(self):
         uid = str(uuid.uuid4())
