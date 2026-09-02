@@ -24,25 +24,49 @@ import re
 #                  cache pricing introduced (write 1.25x in, read 0.1x in).
 # v3 (2026-07-05): opus-4-5 + opus-4-1 ergaenzt (4-5 fehlte trotz
 #                  Registry-Eintrag -> unknown-model warning; 4-1 = 15/75-Tier).
-PRICING_VERSION = "v4"
+# v4 (unbekannt): PRICING_VERSION wurde ohne Changelog-Eintrag auf v4 bumpt —
+#                  bestehende Luecke, hier nicht rekonstruiert.
+# v5 (2026-09-02): sonnet-5 korrigiert 3/15 -> 2/10 — der Kommentar erwartete
+#                  einen Preisanstieg am 2026-09-01, den Anthropic explizit
+#                  gecancelt hat (Footnote claude-sonnet-5-introductory-pricing
+#                  auf platform.claude.com/docs/en/about-claude/pricing, per
+#                  AI-Bridge-Research verifiziert 2026-09-02: "$2/$10 ... is
+#                  now the standard price. The previously scheduled increase
+#                  to $3/$15 ... will not occur."). sonnet-5 ist seit
+#                  2026-06-01 Default-Modell (model_registry.py) — der alte
+#                  Wert ueberbepreiste JEDEN Default-Call um 50%.
+#                  opus-5 + fable-5-1 ergaenzt (beide GA, dieselbe Quelle) —
+#                  noch NICHT in model_registry.MODELS registriert (separate
+#                  Entscheidung: Default-Wechsel + Bedrock-Profile-IDs), also
+#                  aktuell unbenutzt aber bereit.
+PRICING_VERSION = "v5"
 
 # USD per 1M tokens. {model_id: {"in": input_price, "out": output_price}}
+# Quelle je Zeile: Anthropic "Model pricing"-Tabelle,
+# https://platform.claude.com/docs/en/about-claude/pricing (Datum = letzte
+# Verifikation dieser Zeile; keine Autoinvalidierung -> bei Preisaenderungen
+# manuell nachziehen + PRICING_VERSION bumpen).
 MODEL_PRICING: dict[str, dict[str, float]] = {
-    "claude-sonnet-5":            {"in": 3.00,  "out": 15.00},  # Liste; Intro $2/$10 bis 2026-08-31 ggf. via MODEL_PRICING_JSON
-    "claude-sonnet-4-5":          {"in": 3.00,  "out": 15.00},
-    "claude-sonnet-4-5-20250929": {"in": 3.00,  "out": 15.00},
-    "claude-sonnet-4-6":          {"in": 3.00,  "out": 15.00},
-    "claude-opus-4":              {"in": 15.00, "out": 75.00},
-    "claude-opus-4-1":            {"in": 15.00, "out": 75.00},
-    "claude-opus-4-5":            {"in": 5.00,  "out": 25.00},
-    "claude-opus-4-5-20251101":   {"in": 5.00,  "out": 25.00},
-    "claude-opus-4-6":            {"in": 5.00,  "out": 25.00},
-    "claude-opus-4-7":            {"in": 5.00,  "out": 25.00},
-    "claude-opus-4-8":            {"in": 5.00,  "out": 25.00},
-    "claude-haiku-4-5":           {"in": 1.00,  "out": 5.00},
-    "claude-haiku-4-5-20251001":  {"in": 1.00,  "out": 5.00},
-    "gpt-5":                      {"in": 5.00,  "out": 15.00},
-    "gpt-5-mini":                 {"in": 0.30,  "out": 1.20},
+    # 2026-09-02: $2/$10 ist der PERMANENTE Preis (Intro-Label entfernt, s.
+    # PRICING_VERSION-Changelog oben) — NICHT den zuvor angekuendigten,
+    # inzwischen gecancelten $3/$15-Anstieg eintragen.
+    "claude-sonnet-5":            {"in": 2.00,  "out": 10.00},
+    "claude-sonnet-4-5":          {"in": 3.00,  "out": 15.00},  # 2026-07-05
+    "claude-sonnet-4-5-20250929": {"in": 3.00,  "out": 15.00},  # 2026-07-05
+    "claude-sonnet-4-6":          {"in": 3.00,  "out": 15.00},  # 2026-07-05
+    "claude-opus-4":              {"in": 15.00, "out": 75.00},  # 2026-09-02 (retired auf Claude API, Preis nur noch fuer Bedrock/GCP-Serving relevant)
+    "claude-opus-4-1":            {"in": 15.00, "out": 75.00},  # 2026-09-02 (retired auf Claude API, Preis nur noch fuer Bedrock/GCP-Serving relevant)
+    "claude-opus-4-5":            {"in": 5.00,  "out": 25.00},  # 2026-07-05
+    "claude-opus-4-5-20251101":   {"in": 5.00,  "out": 25.00},  # 2026-07-05
+    "claude-opus-4-6":            {"in": 5.00,  "out": 25.00},  # 2026-07-05
+    "claude-opus-4-7":            {"in": 5.00,  "out": 25.00},  # 2026-07-03
+    "claude-opus-4-8":            {"in": 5.00,  "out": 25.00},  # 2026-07-03
+    "claude-opus-5":              {"in": 5.00,  "out": 25.00},  # 2026-09-02 — GA, noch nicht in model_registry.MODELS registriert
+    "claude-fable-5-1":           {"in": 10.00, "out": 50.00},  # 2026-09-02 — GA, noch nicht in model_registry.MODELS registriert
+    "claude-haiku-4-5":           {"in": 1.00,  "out": 5.00},   # 2026-07-03
+    "claude-haiku-4-5-20251001":  {"in": 1.00,  "out": 5.00},   # 2026-07-03
+    "gpt-5":                      {"in": 5.00,  "out": 15.00},  # unverifiziert diese Nacht — bei naechster GPT-Aenderung gegenpruefen
+    "gpt-5-mini":                 {"in": 0.30,  "out": 1.20},   # unverifiziert diese Nacht — bei naechster GPT-Aenderung gegenpruefen
 }
 
 # Prompt-cache token pricing, as a multiple of the model's input price.
