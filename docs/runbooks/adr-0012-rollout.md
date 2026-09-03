@@ -39,6 +39,16 @@ done
 Fehlt sie irgendwo: **stopp**, das ist eine Host-Änderung (Rafael-gated), nicht
 Teil dieses Deploys.
 
+**Gemessen 2026-09-03 ~17:5xZ (Momentaufnahme, vor dem Deploy neu lesen):** auf
+allen drei Hosts gesetzt und richtig gepaart — `49.12.72.66` → `dev`,
+`178.104.178.79` → `prod`, `100.93.143.105` (prod-workers-1) → `prod`. Auch zur
+LAUFZEIT bestätigt, nicht nur in der Datei: `docker exec wt-wrapper-worker1
+printenv BRIDGE_ORIGIN_ID` → `dev`, `docker exec wt-worker-host-erk printenv
+BRIDGE_ORIGIN_ID` → `prod`. Damit ist der einzige Kandidat für eine
+Rafael-gated Host-Änderung in dieser Kette zum Messzeitpunkt AUSGERÄUMT — die
+Datei zu lesen genügt aber nicht auf Dauer, ein Container, der vor einer
+Änderung startete, trägt den alten Wert (Code-Präsenz ≠ Laufzeit).
+
 ## Reihenfolge: App zuerst, LB danach
 
 Beide Richtungen sind gebaut-sicher (der `default`-Zweig macht die LB-Hälfte
