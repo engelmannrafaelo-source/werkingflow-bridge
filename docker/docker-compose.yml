@@ -148,6 +148,18 @@ services:
       # Unterauftragsverarbeiter ist (avv.md §5.4). Der fehlende Key dort IST
       # die tragende Schicht der Sperre — siehe gemini_vision_gate.py.
       #
+      # VORBEDINGUNG — das Google-Projekt MUSS auf PAID TIER stehen.
+      #   Auf dem Free Tier gilt laut ai.google.dev/gemini-api/terms (geprueft
+      #   2026-09-03): "Google uses the content you submit ... to provide,
+      #   improve, and develop Google products and services", und "human
+      #   reviewers may read, annotate, and process your API input and output".
+      #   Auf dem Paid Tier ausdruecklich NICHT ("Google doesn't use your
+      #   prompts ... or responses to improve our products").
+      #   Das ist kein Kontingent-Detail: auf dem Free Tier waeren unsere
+      #   Staging-Plaene Trainingsmaterial und von Menschen einsehbar. Rafael
+      #   hat freigegeben, dass Gemini die Staging-Inhalte ANALYSIERT — nicht,
+      #   dass Google sie behaelt und mitlernt. Das ist eine andere Zusage.
+      #
       # REIHENFOLGE BEIM SCHARFSCHALTEN (wichtig, sonst steht Staging still):
       #   1. GEMINI_VISION_API_KEY hinterlegen
       #   2. BRIDGE_GEMINI_VISION_ENABLED=true
@@ -306,6 +318,18 @@ services:
       # auf prod bleibt Gemini unerreichbar, weil Google kein gelisteter
       # Unterauftragsverarbeiter ist (avv.md §5.4). Der fehlende Key dort IST
       # die tragende Schicht der Sperre — siehe gemini_vision_gate.py.
+      #
+      # VORBEDINGUNG — das Google-Projekt MUSS auf PAID TIER stehen.
+      #   Auf dem Free Tier gilt laut ai.google.dev/gemini-api/terms (geprueft
+      #   2026-09-03): "Google uses the content you submit ... to provide,
+      #   improve, and develop Google products and services", und "human
+      #   reviewers may read, annotate, and process your API input and output".
+      #   Auf dem Paid Tier ausdruecklich NICHT ("Google doesn't use your
+      #   prompts ... or responses to improve our products").
+      #   Das ist kein Kontingent-Detail: auf dem Free Tier waeren unsere
+      #   Staging-Plaene Trainingsmaterial und von Menschen einsehbar. Rafael
+      #   hat freigegeben, dass Gemini die Staging-Inhalte ANALYSIERT — nicht,
+      #   dass Google sie behaelt und mitlernt. Das ist eine andere Zusage.
       #
       # REIHENFOLGE BEIM SCHARFSCHALTEN (wichtig, sonst steht Staging still):
       #   1. GEMINI_VISION_API_KEY hinterlegen
@@ -466,6 +490,18 @@ services:
       # Unterauftragsverarbeiter ist (avv.md §5.4). Der fehlende Key dort IST
       # die tragende Schicht der Sperre — siehe gemini_vision_gate.py.
       #
+      # VORBEDINGUNG — das Google-Projekt MUSS auf PAID TIER stehen.
+      #   Auf dem Free Tier gilt laut ai.google.dev/gemini-api/terms (geprueft
+      #   2026-09-03): "Google uses the content you submit ... to provide,
+      #   improve, and develop Google products and services", und "human
+      #   reviewers may read, annotate, and process your API input and output".
+      #   Auf dem Paid Tier ausdruecklich NICHT ("Google doesn't use your
+      #   prompts ... or responses to improve our products").
+      #   Das ist kein Kontingent-Detail: auf dem Free Tier waeren unsere
+      #   Staging-Plaene Trainingsmaterial und von Menschen einsehbar. Rafael
+      #   hat freigegeben, dass Gemini die Staging-Inhalte ANALYSIERT — nicht,
+      #   dass Google sie behaelt und mitlernt. Das ist eine andere Zusage.
+      #
       # REIHENFOLGE BEIM SCHARFSCHALTEN (wichtig, sonst steht Staging still):
       #   1. GEMINI_VISION_API_KEY hinterlegen
       #   2. BRIDGE_GEMINI_VISION_ENABLED=true
@@ -624,6 +660,18 @@ services:
       # auf prod bleibt Gemini unerreichbar, weil Google kein gelisteter
       # Unterauftragsverarbeiter ist (avv.md §5.4). Der fehlende Key dort IST
       # die tragende Schicht der Sperre — siehe gemini_vision_gate.py.
+      #
+      # VORBEDINGUNG — das Google-Projekt MUSS auf PAID TIER stehen.
+      #   Auf dem Free Tier gilt laut ai.google.dev/gemini-api/terms (geprueft
+      #   2026-09-03): "Google uses the content you submit ... to provide,
+      #   improve, and develop Google products and services", und "human
+      #   reviewers may read, annotate, and process your API input and output".
+      #   Auf dem Paid Tier ausdruecklich NICHT ("Google doesn't use your
+      #   prompts ... or responses to improve our products").
+      #   Das ist kein Kontingent-Detail: auf dem Free Tier waeren unsere
+      #   Staging-Plaene Trainingsmaterial und von Menschen einsehbar. Rafael
+      #   hat freigegeben, dass Gemini die Staging-Inhalte ANALYSIERT — nicht,
+      #   dass Google sie behaelt und mitlernt. Das ist eine andere Zusage.
       #
       # REIHENFOLGE BEIM SCHARFSCHALTEN (wichtig, sonst steht Staging still):
       #   1. GEMINI_VISION_API_KEY hinterlegen
