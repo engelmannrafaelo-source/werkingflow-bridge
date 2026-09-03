@@ -66,27 +66,77 @@ DEPENDENCY_UNAVAILABLE_STATUS = 424
 DEPENDENCY_RETRY_DELAY_S = 60
 DEPENDENCY_MAX_DEFERS = 240
 
+# ---------------------------------------------------------------------------
+# Capacity deferral (429 from the executor's self-call)
+# ---------------------------------------------------------------------------
+# A job's LLM work runs as a self-call pinned to THIS worker (executors.py
+# SELF_BASE_URL = localhost, on purpose: the landing worker's account does the
+# work). That pin means the self-call has NO nginx failover — if this worker's
+# account hits a limit window AFTER the job was admitted, the inner call 429s
+# and there is no next worker to try, so the job used to die terminally
+# (UPSTREAM_HTTP_429) while seven other worker accounts sat idle. Observed
+# 2026-09-03 in the video pipeline: three takes killed by
+# "[Bridge worker-kurt] Worker rate-limited (soft)", surfacing at the app as an
+# unhandled error.
+#
+# A 429 is not a failed job. It is a job whose turn has not come — exactly the
+# shape the dependency-deferral above already handles, so it uses the same
+# mechanism: park the row back to 'pending' with a wait, and let the watchdog
+# re-claim it. The re-claim is the failover the self-call cannot have: any
+# worker on this bridge may claim a stale row (claim_stale_job, FOR UPDATE SKIP
+# LOCKED), so the retry lands on a DIFFERENT account.
+CAPACITY_RETRY_STATUS = 429
+# Floor/ceiling around the upstream's own Retry-After. The floor keeps a
+# 0-second hint from becoming a hot loop; the ceiling keeps a "come back in
+# 4 hours" hint from parking a job past the point where a human would rather
+# see it fail. Between them we trust what the upstream said.
+CAPACITY_RETRY_MIN_DELAY_S = 30
+CAPACITY_RETRY_MAX_DELAY_S = 900
+CAPACITY_RETRY_DEFAULT_DELAY_S = 120
 
-async def _defer_for_dependency(job_id: str, kind: str, reason: str) -> bool:
-    """Park a job waiting on an unreachable dependency.
+
+async def _defer_job(
+    job_id: str, kind: str, reason: str, delay_s: int, what: str
+) -> bool:
+    """Park a job that must WAIT (dependency down, or no account capacity).
 
     Returns True when the job was deferred (caller must stop), False when the
     patience budget is spent and it should fail loud like any other error.
+
+    Both wait kinds share `defer_count` deliberately: it counts "waits that
+    were not the job's fault", which is exactly what the retry cap subtracts
+    out (migration 044). One bound, one column, one eventual fail-loud.
     """
     job = await store_client.get_job(job_id)
     deferred_so_far = (job or {}).get("defer_count") or 0
     if deferred_so_far >= DEPENDENCY_MAX_DEFERS:
         logger.error(
             f"💀 Async job {job_id} (kind={kind}) gave up after {deferred_so_far} "
-            f"dependency waits (~{deferred_so_far * DEPENDENCY_RETRY_DELAY_S // 60}min): {reason}"
+            f"waits: {reason}"
         )
         return False
-    await store_client.defer_job(job_id, DEPENDENCY_RETRY_DELAY_S, reason)
+    await store_client.defer_job(job_id, delay_s, reason)
     logger.warning(
-        f"⏸️ Async job {job_id} (kind={kind}) deferred {DEPENDENCY_RETRY_DELAY_S}s "
-        f"(wait {deferred_so_far + 1}/{DEPENDENCY_MAX_DEFERS}) — dependency unreachable: {reason}"
+        f"⏸️ Async job {job_id} (kind={kind}) deferred {delay_s}s "
+        f"(wait {deferred_so_far + 1}/{DEPENDENCY_MAX_DEFERS}) — {what}: {reason}"
     )
     return True
+
+
+def _capacity_retry_delay(exc: "Exception") -> int:
+    """Seconds to wait before re-running a job the pool refused with 429.
+
+    Uses the upstream's own Retry-After when it gave one (it knows when its
+    window resets); clamped, never guessed silently."""
+    hint = getattr(exc, "retry_after_s", None)
+    if hint is None:
+        return CAPACITY_RETRY_DEFAULT_DELAY_S
+    try:
+        seconds = int(float(hint))
+    except (TypeError, ValueError):
+        logger.warning(f"unparseable Retry-After {hint!r} on a job self-call 429")
+        return CAPACITY_RETRY_DEFAULT_DELAY_S
+    return max(CAPACITY_RETRY_MIN_DELAY_S, min(CAPACITY_RETRY_MAX_DELAY_S, seconds))
 
 
 def register_executor(kind: str, executor: Executor) -> None:
@@ -177,7 +227,21 @@ async def _run_body(
         # once the dependency is back, instead of burning it terminally (which
         # is what made "defer the check until the GPU returns" impossible).
         if isinstance(e, ExecutorHTTPError) and e.status_code == DEPENDENCY_UNAVAILABLE_STATUS:
-            deferred = await _defer_for_dependency(job_id, kind, str(e))
+            deferred = await _defer_job(
+                job_id, kind, str(e), DEPENDENCY_RETRY_DELAY_S, "dependency unreachable"
+            )
+            if deferred:
+                return
+
+        # Same shape, different cause: the pool had no capacity for the inner
+        # self-call. The self-call is pinned to this worker and therefore has no
+        # nginx failover, so the ONLY way onto another account is to be
+        # re-claimed by the watchdog — park it instead of burning it (see the
+        # CAPACITY_RETRY_* block above).
+        if isinstance(e, ExecutorHTTPError) and e.status_code == CAPACITY_RETRY_STATUS:
+            deferred = await _defer_job(
+                job_id, kind, str(e), _capacity_retry_delay(e), "no account capacity"
+            )
             if deferred:
                 return
 

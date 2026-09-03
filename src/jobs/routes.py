@@ -15,16 +15,28 @@ cycle (main.py imports this module, not the other way around).
 """
 import logging
 import os
-import uuid
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from fastapi.responses import JSONResponse
 from fastapi.security import HTTPAuthorizationCredentials
 from pydantic import BaseModel
 
 from src.auth import security, verify_api_key
+from src.middleware.bridge_error import (
+    job_home_unconfigured_error,
+    job_id_malformed_error,
+    job_misdirected_error,
+)
 from src.jobs import store, store_client
+from src.jobs.job_id import (
+    JobHomeUnconfigured,
+    JobIdMalformed,
+    home_bridge_id,
+    new_job_id,
+    parse_home,
+)
 from src.jobs.registry import get_executor, registered_kinds, run_generic_job, spawn
 
 logger = logging.getLogger(__name__)
@@ -165,13 +177,31 @@ async def create_job_endpoint(
     _cap_lock = get_capacity_lock()
     if _cap_lock.is_locked(_worker_id) and not await _job_runs_off_pool(body, attribution):
         retry_after = max(60, _cap_lock.remaining_s(_worker_id))
+        # Name the window that actually ran out (session vs weekly). The lock
+        # recorded it when it was set; passing it on is what keeps the 429 from
+        # telling the caller to wait days for a weekly reset when the real wait
+        # is minutes (see bridge_error.account_exhausted_error).
+        _lock_info = _cap_lock.get_lock_info(_worker_id) or {}
         logger.warning(
             f"🔒 job submission rejected: worker {_worker_id} capacity-locked "
-            f"({retry_after}s remaining) — nginx retries on next worker"
+            f"({retry_after}s remaining, reason={_lock_info.get('reason') or 'unknown'}) "
+            f"— nginx retries on next worker"
         )
-        return account_exhausted_error(retry_after_s=retry_after)
+        return account_exhausted_error(
+            retry_after_s=retry_after, limit_window=_lock_info.get("reason")
+        )
 
-    job_id = "job_" + uuid.uuid4().hex
+    # ADR-0012: the id names the bridge whose store will hold this row, so the
+    # later GET can be routed to it without anybody keeping state. Fail CLOSED
+    # when this bridge cannot name itself — an untagged id would be accepted
+    # here and then be unfindable from the peer bridge, which is the exact
+    # silent failure this replaces.
+    try:
+        job_id = new_job_id()
+    except JobHomeUnconfigured as e:
+        logger.error("job submission refused — job home unconfigured: %s", e)
+        return job_home_unconfigured_error(str(e))
+
     # Persist FIRST (durable 'pending'), then dispatch. If this worker dies before
     # the task runs, the row survives at 'pending' and the watchdog requeues it
     # from any worker — the dispatch is never a silent fire-and-forget loss.
@@ -247,6 +277,63 @@ async def list_jobs_endpoint(
     return {"jobs": jobs}
 
 
+def _reject_foreign_or_malformed(job_id: str) -> Optional[JSONResponse]:
+    """Guard for every single-job lookup (ADR-0012).
+
+    Returns the response to send, or None when this bridge may answer.
+
+    Three outcomes, all of them loud where today there was one silent 404:
+
+      * malformed id            → 400, non-retryable. Not a job we lost — not
+                                  a job id at all.
+      * id names another bridge → 421 misdirected. The job is very likely
+                                  alive over there; the LB was supposed to
+                                  route this poll to it. Reaching here means it
+                                  did not (LB not yet deployed, an id naming a
+                                  bridge that does not exist, or the one-hop
+                                  loop guard stopping a second forward).
+      * this bridge cannot name itself → 503, deploy error, fail closed.
+
+    TRANSITION (bounded, and the only tolerated softness here): an id from
+    before ADR-0012 carries no marker at all, so it cannot be routed by
+    anything. It keeps the pre-ADR behaviour — answered locally — with a
+    warning per lookup. That window closes on its own: the store's TTL cleanup
+    removes every pre-deploy row within ~an hour, after which such an id can
+    only come from a stale client. Do NOT turn this into a permanent fallback;
+    an unmarked id in a week's logs is a finding, not noise.
+    """
+    try:
+        job_home = parse_home(job_id)
+    except JobIdMalformed as e:
+        logger.warning("job poll rejected — %s", e)
+        return job_id_malformed_error(job_id, str(e))
+
+    if job_home is None:
+        logger.warning(
+            "job poll for LEGACY (unmarked) id %s — answering from the local "
+            "store like before ADR-0012. Expected only during the rollout "
+            "window; the store TTL removes pre-deploy rows within ~1h.",
+            job_id,
+        )
+        return None
+
+    try:
+        own = home_bridge_id()
+    except JobHomeUnconfigured as e:
+        logger.error("job poll cannot be answered — job home unconfigured: %s", e)
+        return job_home_unconfigured_error(str(e))
+
+    if job_home != own:
+        logger.error(
+            "job poll MISDIRECTED: %s belongs to bridge %r, this is %r — the "
+            "load balancer did not route by the id marker (ADR-0012)",
+            job_id, job_home, own,
+        )
+        return job_misdirected_error(job_id, job_home, own)
+
+    return None
+
+
 @router.get("/v1/jobs/{job_id}")
 async def get_job_endpoint(
     job_id: str,
@@ -254,9 +341,18 @@ async def get_job_endpoint(
     credentials: Optional[HTTPAuthorizationCredentials] = Depends(security),
 ):
     """Poll a job. 404 = unknown id or expired (TTL cleanup). Terminal states carry
-    `result` (done) or `error` (error)."""
+    `result` (done) or `error` (error).
+
+    ADR-0012 — before that 404 may be used, the id has to be established as one
+    this bridge could possibly hold. 404 means "gone"; a job on the other
+    bridge is not gone, and a typo is not a job at all. Both get their own
+    loud answer (400 / 421); only a genuine miss on OUR store keeps the 404."""
     await verify_api_key(request, credentials)
     _require_enabled()
+
+    guard = _reject_foreign_or_malformed(job_id)
+    if guard is not None:
+        return guard
 
     job = await store_client.get_job(job_id)
     if not job:

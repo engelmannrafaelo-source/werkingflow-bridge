@@ -547,6 +547,41 @@ def _pool_state(ctx: Ctx) -> ProbeResult:
     return ProbeResult("metrics_account_pool", ep, True, f"{len(d.get('accounts', []))} accounts reported", r.status_code, ms)
 
 
+@probe("jobs_home_marker", "/health", {"hetzner", "server2"},
+       repro="curl $AI_BRIDGE_URL/health")
+def _jobs_home_marker(ctx: Ctx) -> ProbeResult:
+    """ADR-0012: does this worker know which job store it writes to?
+
+    The one thing a deploy MUST establish before the load balancer starts
+    routing polls by the id marker. A worker without BRIDGE_ORIGIN_ID refuses
+    to mint ids (fail-closed, on purpose) — but that refusal is only visible
+    once somebody submits a job, i.e. to a customer rather than to the deploy.
+    Reading it off /health makes it a pre-deploy fact instead, and lets
+    bridge-deploy.sh roll back on it like any other smoke failure.
+
+    Deliberately read-only: submitting a real job here would write a row and
+    consume account capacity on every deploy."""
+    ep = "/health"
+    r, ms = _timed(lambda: requests.get(f"{ctx.base_url}{ep}", headers=ctx.headers(), timeout=15))
+    if r.status_code != 200:
+        return ProbeResult("jobs_home_marker", ep, False, f"HTTP {r.status_code}", r.status_code, ms)
+    d = r.json()
+    if "job_home" not in d:
+        return ProbeResult("jobs_home_marker", ep, False,
+                           "no 'job_home' key — this worker predates ADR-0012; do NOT "
+                           "arm the marker routing in the load balancer against it",
+                           r.status_code, ms)
+    if not d.get("job_home"):
+        return ProbeResult("jobs_home_marker", ep, False,
+                           f"job_home is null — BRIDGE_ORIGIN_ID is missing on this "
+                           f"worker, so async job submission is refused: "
+                           f"{str(d.get('job_home_error'))[:200]}",
+                           r.status_code, ms)
+    return ProbeResult("jobs_home_marker", ep, True,
+                       f"job_home={d['job_home']} (worker {d.get('worker_instance')})",
+                       r.status_code, ms)
+
+
 @probe("metrics_anonymization", "/v1/metrics/anonymization", {"hetzner"},
        repro="curl $AI_BRIDGE_URL/v1/metrics/anonymization -H 'Authorization: Bearer $AI_BRIDGE_API_KEY' " + ATTRIBUTION_REPRO)
 def _metrics_anonymization(ctx: Ctx) -> ProbeResult:

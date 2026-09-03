@@ -744,8 +744,8 @@ BRIDGE_BACKUP_HOST=127.0.0.1 BRIDGE_ID=validate-probe METRICS_READER_TARGET=metr
     envsubst '${envsubst_vars}' \
     < ${nginx_conf} > /tmp/bridge-nginx-check.conf 2>&1
 # Render the per-topology upstreams include (nginx.conf does include /tmp/upstreams.conf).
-BRIDGE_BACKUP_HOST=127.0.0.1 \
-    envsubst '\$BRIDGE_BACKUP_HOST' \
+BRIDGE_BACKUP_HOST=127.0.0.1 BRIDGE_ID=validate-probe \
+    envsubst '\$BRIDGE_BACKUP_HOST \$BRIDGE_ID' \
     < ${upstreams_conf} > /tmp/bridge-upstreams-check.conf 2>&1
 # --add-host metrics-reader: since 2026-08-31 the metrics routes use a
 # variable proxy_pass (nginx var "metrics_reader") — parse-time no longer

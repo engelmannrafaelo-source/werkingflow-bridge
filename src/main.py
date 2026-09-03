@@ -5787,6 +5787,23 @@ async def health_check(request: Request):
         "worker_instance": worker_instance,
     }
 
+    # ADR-0012: which job store this worker writes to — the marker it stamps
+    # into every job_id, and the one the load balancer routes polls by. Exposed
+    # because it is the ONE thing a deploy must verify before the LB starts
+    # routing on markers: a worker whose BRIDGE_ORIGIN_ID never arrived mints
+    # unroutable ids (it refuses to, loudly — but the refusal is only visible
+    # once someone submits a job). null here = async jobs are down on this
+    # worker; scripts/bridge_smoke.py asserts it is not null.
+    try:
+        from src.jobs.job_id import JobHomeUnconfigured, home_bridge_id
+        try:
+            result["job_home"] = home_bridge_id()
+        except JobHomeUnconfigured as e:
+            result["job_home"] = None
+            result["job_home_error"] = str(e)
+    except ImportError:
+        pass
+
     # Include provider fallback health if available
     try:
         from src.providers.fallback import get_all_provider_health

@@ -61,6 +61,8 @@ TYPE_UPSTREAM_TIMEOUT = "upstream_timeout"
 TYPE_INTERNAL = "internal"
 TYPE_CONFIG = "configuration"
 TYPE_INPUT_TOO_LARGE = "input_too_large"
+# ADR-0012: the poll reached a bridge that is not the job's home store.
+TYPE_JOB_MISDIRECTED = "job_misdirected"
 
 # Reason codes — narrow, stable identifiers for why a 429 (or 500) was emitted.
 # These go into `error.reason` and drive panel aggregation / alerting.
@@ -68,6 +70,10 @@ TYPE_INPUT_TOO_LARGE = "input_too_large"
 # 500-class reasons are contract violations — they should page, not be expected.
 REASON_TOKEN_BUDGET_FULL = "worker_token_budget_full"
 REASON_QUEUE_EXHAUSTED = "worker_queue_exhausted"
+# Historical name, deliberately UNCHANGED (panels/alerting aggregate on this
+# string). It means "an account limit window is exhausted" — which window is
+# now carried honestly in extra.limit_window, because it is very often the
+# 5-hour SESSION window and not the weekly one. See account_exhausted_error.
 REASON_ACCOUNT_WEEKLY_EXHAUSTED = "worker_account_weekly_exhausted"
 REASON_UPSTREAM_ANTHROPIC_ERROR = "claude_upstream_error"
 REASON_UPSTREAM_ANTHROPIC_TIMEOUT = "claude_upstream_timeout"
@@ -86,6 +92,11 @@ REASON_MISCONFIGURED = "worker_misconfigured"
 # until BRIDGE_INPUT_LIMIT_ENFORCE=true — see that module's docstring for the
 # two-stage rollout this reason code belongs to.
 REASON_INPUT_LIMIT_EXCEEDED = "bridge_input_limit_exceeded"
+# ADR-0012 — async-job identity/routing. All three are LOUD by design; none of
+# them may collapse into the 404 that means "unknown id, or expired".
+REASON_JOB_ID_MALFORMED = "job_id_malformed"
+REASON_JOB_HOME_MISMATCH = "job_home_bridge_mismatch"
+REASON_JOB_HOME_UNCONFIGURED = "job_home_unconfigured"
 
 
 def bridge_error(
@@ -251,18 +262,117 @@ def input_limit_exceeded_error(est_tokens: int, limit_tokens: int) -> JSONRespon
     )
 
 
-def account_exhausted_error(retry_after_s: int = 3600) -> JSONResponse:
-    """All worker accounts at weekly limit. Long backoff."""
+# Which Anthropic limit window a capacity lock refers to → the words the client
+# sees. Keys are src.middleware.capacity_lock.WorkerLock.reason values.
+_LIMIT_WINDOW_PHRASE = {
+    "session_window": "their 5-hour Anthropic session limit",
+    "weekly_window": "their weekly Anthropic limit",
+    "anthropic_explicit": "an Anthropic rate limit",
+}
+# What we say when nobody could tell us WHICH limit was hit. Saying "weekly"
+# anyway is the bug this vocabulary exists to fix (see account_exhausted_error).
+_LIMIT_WINDOW_UNKNOWN = "an Anthropic usage limit (which window is unknown here)"
+
+
+def account_exhausted_error(
+    retry_after_s: int = 3600,
+    limit_window: Optional[str] = None,
+) -> JSONResponse:
+    """No routable worker account: a limit window is exhausted. Long backoff.
+
+    `limit_window` names WHICH window, from the capacity lock that caused the
+    rejection ("session_window" / "weekly_window" / "anthropic_explicit").
+    Pass it whenever the call site knows; omit it only when nothing knows.
+
+    Why this parameter exists: the message used to read "All worker accounts
+    have reached their weekly Anthropic limit" unconditionally. On 2026-09-03
+    every prod worker emitted exactly that while the accounts sat at 30 % of
+    the WEEK and 100 % of the 5-hour session window, nine minutes from reset.
+    Two sessions spent the afternoon looking for an architecture defect that
+    a truthful sentence — "session limit, resets in 9 minutes" — would have
+    turned into "wait". A wrong limit name is not cosmetics; it is a wrong
+    instruction about what to do next.
+
+    Unknown stays unknown. There is no default back to "weekly": the caller
+    that cannot name the window says so, and the retry hint still carries the
+    actionable part.
+    """
+    phrase = _LIMIT_WINDOW_PHRASE.get(limit_window or "", _LIMIT_WINDOW_UNKNOWN)
+    minutes = max(1, retry_after_s // 60)
     return bridge_error(
         source=SOURCE_BRIDGE_ACCOUNT,
         error_type=TYPE_ACCOUNT_EXHAUSTED,
         reason=REASON_ACCOUNT_WEEKLY_EXHAUSTED,
         message=(
-            "All worker accounts have reached their weekly Anthropic limit. "
-            f"Retry in ~{retry_after_s // 60} minutes."
+            f"All worker accounts have reached {phrase}. "
+            f"Retry in ~{minutes} minutes."
         ),
         status_code=429,
         retry_after_s=retry_after_s,
+        extra={"limit_window": limit_window or "unknown"},
+    )
+
+
+def job_id_malformed_error(job_id: str, detail: str) -> JSONResponse:
+    """The polled id is not a job id at all (ADR-0012). 400, non-retryable.
+
+    Deliberately NOT the 404 "unknown id, or expired": that answer tells a
+    caller its job vanished, when in truth it never sent a job id. Retrying
+    the identical malformed id can only fail again."""
+    return bridge_error(
+        source=SOURCE_BRIDGE_INTERNAL,
+        error_type=TYPE_JOB_MISDIRECTED,
+        reason=REASON_JOB_ID_MALFORMED,
+        message=f"Malformed async job id: {detail}",
+        status_code=400,
+        retryable_override=False,
+        extra={"job_id": job_id[:120]},
+    )
+
+
+def job_misdirected_error(job_id: str, job_home: str, this_bridge: str) -> JSONResponse:
+    """This bridge is not the job's home store and could not forward the poll.
+
+    421 Misdirected Request, by its definition: the request reached a server
+    that cannot produce a response for it. The job may well be alive and
+    running — on the OTHER bridge — so answering 404 would report a healthy job
+    as gone, which is precisely the failure ADR-0012 removes.
+
+    Reaching this means the load balancer did not route by the id's marker: an
+    un-deployed / older LB, a poll that already hopped once (the loop guard
+    stops it here on purpose), or an id naming a bridge that does not exist.
+    All three are configuration facts worth seeing, not transient conditions,
+    hence non-retryable."""
+    return bridge_error(
+        source=SOURCE_BRIDGE_CONFIG,
+        error_type=TYPE_JOB_MISDIRECTED,
+        reason=REASON_JOB_HOME_MISMATCH,
+        message=(
+            f"Async job {job_id} lives on bridge {job_home!r}; this is bridge "
+            f"{this_bridge!r} and it holds a different job store (ADR-0009). "
+            f"The poll must reach {job_home!r} — the load balancer routes it "
+            f"there by the id's marker (ADR-0012); it did not."
+        ),
+        status_code=421,
+        retryable_override=False,
+        extra={"job_id": job_id, "job_home": job_home, "this_bridge": this_bridge},
+    )
+
+
+def job_home_unconfigured_error(detail: str) -> JSONResponse:
+    """This worker cannot name its own bridge, so it can neither mint a
+    routable job id nor decide whether an incoming one is its own.
+
+    503 + fail-closed, the ADR-0011 point-5 polarity: an unset federation
+    identity is a DEPLOY error. Minting untagged ids instead would look
+    healthy and quietly restore the cross-bridge 404s."""
+    return bridge_error(
+        source=SOURCE_BRIDGE_CONFIG,
+        error_type=TYPE_CONFIG,
+        reason=REASON_JOB_HOME_UNCONFIGURED,
+        message=f"Async jobs are not deployable on this worker: {detail}",
+        status_code=503,
+        retryable_override=False,
     )
 
 
@@ -440,8 +550,10 @@ def raise_queue_timeout(
     raise BridgeError(queue_timeout_error(cap_tokens, inflight_tokens, waited_s, retry_after_s))
 
 
-def raise_account_exhausted(retry_after_s: int = 3600) -> None:
-    raise BridgeError(account_exhausted_error(retry_after_s))
+def raise_account_exhausted(
+    retry_after_s: int = 3600, limit_window: Optional[str] = None
+) -> None:
+    raise BridgeError(account_exhausted_error(retry_after_s, limit_window=limit_window))
 
 
 def raise_upstream_error(detail: str, status_code: int = 502, retry_after_s: int = 30) -> None:
@@ -556,7 +668,11 @@ def classify_exception(exc: Exception) -> JSONResponse:
         from src.claude_cli import RateLimitError as _RLE
         if isinstance(exc, _RLE):
             retry_after = getattr(exc, "retry_after_seconds", None) or 3600
-            return account_exhausted_error(retry_after_s=int(retry_after))
+            # Anthropic named the retry time itself; it does not say which of
+            # its windows ran out, so we don't claim to know either.
+            return account_exhausted_error(
+                retry_after_s=int(retry_after), limit_window="anthropic_explicit"
+            )
     except ImportError:
         pass
 

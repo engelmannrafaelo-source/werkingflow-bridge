@@ -23,10 +23,14 @@ from src.jobs.executors import (
 
 
 class _FakeResp:
-    def __init__(self, status, json_data=None, text=""):
+    def __init__(self, status, json_data=None, text="", headers=None):
         self.status_code = status
         self._json = json_data or {}
         self.text = text
+        # A real httpx.Response always has headers; the executor reads
+        # Retry-After off an error response to schedule a capacity retry
+        # (ADR-0012). A fake without them is not standing in for anything.
+        self.headers = headers or {}
 
     def json(self):
         return self._json

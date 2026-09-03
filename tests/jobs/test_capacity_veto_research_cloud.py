@@ -15,6 +15,11 @@ import os
 
 os.environ.setdefault("BRIDGE_JWT_SECRET", "test-secret-for-unit-tests")
 os.environ.setdefault("BRIDGE_SERVICE_TOKEN", "test-service-token")
+# ADR-0012: POST /v1/jobs mints an id carrying this bridge's marker and fails
+# CLOSED without one — a job whose id cannot be routed is a job the peer bridge
+# can never find. These tests are about the capacity veto, so they give the
+# worker an identity and leave the id logic to tests/jobs/test_job_id_home.py.
+os.environ.setdefault("BRIDGE_ORIGIN_ID", "test-bridge")
 
 from unittest.mock import AsyncMock, MagicMock, patch  # noqa: E402
 
@@ -51,6 +56,14 @@ def _locked_cap_lock(remaining: int = 900):
     lock = MagicMock()
     lock.is_locked.return_value = True
     lock.remaining_s.return_value = remaining
+    # Matches the real CapacityLock: a lock knows which window closed, and the
+    # veto forwards that into the 429 (ADR-0012 / account_exhausted_error).
+    lock.get_lock_info.return_value = {
+        "worker": "test-worker",
+        "locked_until_ts": 0.0,
+        "reason": "session_window",
+        "set_at_ts": 0.0,
+    }
     return lock
 
 

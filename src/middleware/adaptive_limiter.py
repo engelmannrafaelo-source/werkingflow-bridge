@@ -1072,7 +1072,11 @@ async def enforce_pool_admission(request: Request) -> None:
         and weekly_pct is not None
         and weekly_pct >= WEEKLY_THROTTLE_START_PCT
     ):
-        raise BridgeError(account_exhausted_error(retry_after_s=3600))
+        # This branch fires on the WEEKLY predictive throttle only (the
+        # multiplier it reads is derived from weekly_pct) — so it may name it.
+        raise BridgeError(
+            account_exhausted_error(retry_after_s=3600, limit_window="weekly_window")
+        )
 
     if waited_s >= max(1.0, QUEUE_WAIT_TIMEOUT_SEC * 0.5):
         raise BridgeError(queue_timeout_error(cap, inflight, waited_s))

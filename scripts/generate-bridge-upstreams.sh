@@ -139,6 +139,75 @@ emit_upstream() {
     echo "}"
 }
 
+# --- ADR-0012: job polls follow the job, not the pool ------------------------
+# A job row lives in the store of the bridge that ACCEPTED the POST — and under
+# the two-tier overflow pool that can be the peer bridge (proxy_next_upstream
+# walks the local workers on 429 and then the backup upstream, which IS the
+# other bridge). The poll used to ride $llm_backend_pool and therefore hit
+# whichever bridge that pool names FIRST, independent of where the row is;
+# every mismatch surfaced as "404 Async job not found" for a job that was
+# alive and finishing elsewhere.
+#
+# Since ADR-0012 the id carries its home bridge (job_<home>_<hex>, minted in
+# src/jobs/job_id.py), so the poll can be routed statelessly on the marker.
+# This emits the two dedicated pools plus the map that picks between them.
+#
+# $1 = peer marker (the OTHER bridge's ${BRIDGE_ID}: prod for primary, dev for
+#      production), $2 = targets-array NAME, then worker names.
+emit_job_poll_routing() {
+    local peer="$1"; local targets_name="$2"; shift 2
+    local w target
+
+    echo "# Job polls whose marker names THIS bridge: local workers only."
+    echo "# Deliberately NOT claude_workers — that pool carries the cross-bridge"
+    echo "# backup on production, and a poll that failed over to the peer would"
+    echo "# ask the wrong store again, i.e. re-create the bug from the other side."
+    echo "upstream claude_jobs_home {"
+    for w in "$@"; do
+        target="$(resolve_target "$w" "$targets_name")"
+        echo "    server ${target} weight=1 max_fails=0;"
+    done
+    echo "    keepalive 16;"
+    echo "}"
+    echo
+    echo "# Job polls whose marker names the PEER bridge: forward there, once."
+    echo "upstream claude_jobs_peer {"
+    echo "    server \${BRIDGE_BACKUP_HOST}:8000 weight=1 max_fails=1 fail_timeout=10s;"
+    echo "    keepalive 8;"
+    echo "}"
+    echo
+    cat <<MAPHEAD
+# Poll routing. \$job_home_marker (docker/nginx.conf) is the marker parsed out
+# of the request URI, "" when the id carries none.
+#
+#   default            -> \$llm_backend_pool = EXACTLY today's behaviour. This is
+#                         the transition rule and the reason the LB half can be
+#                         deployed in either order relative to the app half:
+#                         unmarked ids (minted before the app rollout) keep
+#                         routing as they always did instead of being rejected,
+#                         which would kill every job in flight at cutover. It
+#                         also covers a marker naming neither bridge — nginx
+#                         must not invent a destination; the worker answers and
+#                         fails loud with 421 (jobs/routes.py).
+#   hopped:<peer>      -> home, NOT peer: a poll that already crossed once must
+#                         never be forwarded again (the ADR-0010 one-hop loop
+#                         guard). The local worker then answers 421 — loud, and
+#                         provably terminating.
+#
+# The own-side keys use \${BRIDGE_ID} verbatim, so they cannot drift from the
+# id the workers stamp. If this include were ever mounted on a host whose
+# BRIDGE_ID equals the peer marker below, the two keys would collide and nginx
+# would refuse to start — a wrong pairing fails at load, not in production.
+map "\$bridge_hopped:\$job_home_marker" \$job_poll_pool {
+    default              \$llm_backend_pool;
+    "0:\${BRIDGE_ID}"     claude_jobs_home;
+    "1:\${BRIDGE_ID}"     claude_jobs_home;
+    "0:${peer}"           claude_jobs_peer;
+    "1:${peer}"           claude_jobs_home;
+}
+MAPHEAD
+}
+
 # Emits the nginx `map` body (just the entries, caller wraps the map{} block)
 # resolving a worker NAME to its network TARGET for the direct-worker debug
 # route (docker/nginx.conf `location ~ ^/(worker[a-zA-Z0-9_-]+)/(.*)$`).
@@ -174,17 +243,19 @@ emit_worker_map() {
 generate() {
     local id="$1"
     local -a workers
-    local default_backup targets_name
+    local default_backup targets_name peer_marker
     case "$id" in
         primary)
             workers=("${PRIMARY_WORKERS[@]}")
             default_backup="nobackup"   # isolation: default pool must not spill to prod
             targets_name="PRIMARY_WORKER_TARGETS"
+            peer_marker="prod"          # ADR-0012, see emit_job_poll_routing
             ;;
         production)
             workers=("${PROD_WORKERS[@]}")
             default_backup="local-first"   # Model-B: default pool backs up to dev bridge
             targets_name="PROD_WORKER_TARGETS"
+            peer_marker="dev"           # ADR-0012, see emit_job_poll_routing
             ;;
         *)
             echo "ERROR: unknown topology '$id' (primary|production)" >&2
@@ -255,6 +326,10 @@ map "$bridge_hopped:$http_x_priority" $llm_backend_pool {
 }
 MAP
     fi
+    echo
+
+    echo "# Job-poll routing by home-bridge marker (ADR-0012)."
+    emit_job_poll_routing "$peer_marker" "$targets_name" "${workers[@]}"
 }
 
 generate_worker_map() {

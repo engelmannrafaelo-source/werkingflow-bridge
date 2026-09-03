@@ -139,6 +139,9 @@ class TestProdNoFallback:
 # Durable-job deferral
 # ---------------------------------------------------------------------------
 import src.jobs.registry as registry  # noqa: E402
+# NOTE: the runner reaches the store through store_client (ADR-0009 Schritt
+# 2d) — patching registry.store would patch a module the runner no longer
+# calls, and the test would pass while measuring nothing.
 from src.jobs.executors import ExecutorHTTPError  # noqa: E402
 
 
@@ -146,25 +149,31 @@ class TestDependencyDeferral:
     async def test_424_defers_instead_of_failing(self, monkeypatch):
         """The whole point: the check must survive the outage and run later."""
         deferred, errored = [], []
-        monkeypatch.setattr(registry.store, "get_job",
+        monkeypatch.setattr(registry.store_client, "get_job",
                             AsyncMock(return_value={"defer_count": 0}))
-        monkeypatch.setattr(registry.store, "defer_job",
+        monkeypatch.setattr(registry.store_client, "defer_job",
                             AsyncMock(side_effect=lambda *a, **k: deferred.append(a)))
-        monkeypatch.setattr(registry.store, "mark_error",
+        monkeypatch.setattr(registry.store_client, "mark_error",
                             AsyncMock(side_effect=lambda *a, **k: errored.append(a)))
 
-        ok = await registry._defer_for_dependency("job1", "proxy", "privacy unreachable")
+        ok = await registry._defer_job(
+            "job1", "proxy", "privacy unreachable",
+            registry.DEPENDENCY_RETRY_DELAY_S, "dependency unreachable",
+        )
         assert ok is True
         assert deferred and not errored
 
     async def test_defer_budget_is_bounded(self, monkeypatch):
         """A permanently dead dependency must still fail loud eventually."""
-        monkeypatch.setattr(registry.store, "get_job", AsyncMock(
+        monkeypatch.setattr(registry.store_client, "get_job", AsyncMock(
             return_value={"defer_count": registry.DEPENDENCY_MAX_DEFERS}))
-        monkeypatch.setattr(registry.store, "defer_job",
+        monkeypatch.setattr(registry.store_client, "defer_job",
                             AsyncMock(side_effect=lambda *a, **k: pytest.fail("must not defer")))
 
-        assert await registry._defer_for_dependency("job1", "proxy", "still down") is False
+        assert await registry._defer_job(
+            "job1", "proxy", "still down",
+            registry.DEPENDENCY_RETRY_DELAY_S, "dependency unreachable",
+        ) is False
 
     async def test_patience_outlasts_a_real_outage(self):
         """2026-08-01 lasted ~23 min; the budget must comfortably exceed that."""
@@ -180,13 +189,13 @@ class TestDependencyDeferral:
     async def test_non_dependency_error_still_fails_terminally(self, monkeypatch):
         """Deferral must not swallow real bugs: a 400 stays terminal."""
         errored = []
-        monkeypatch.setattr(registry.store, "mark_running", AsyncMock())
-        monkeypatch.setattr(registry.store, "mark_done", AsyncMock())
-        monkeypatch.setattr(registry.store, "heartbeat", AsyncMock())
-        monkeypatch.setattr(registry.store, "update_progress", AsyncMock())
-        monkeypatch.setattr(registry.store, "mark_error",
+        monkeypatch.setattr(registry.store_client, "mark_running", AsyncMock())
+        monkeypatch.setattr(registry.store_client, "mark_done", AsyncMock())
+        monkeypatch.setattr(registry.store_client, "heartbeat", AsyncMock())
+        monkeypatch.setattr(registry.store_client, "update_progress", AsyncMock())
+        monkeypatch.setattr(registry.store_client, "mark_error",
                             AsyncMock(side_effect=lambda *a, **k: errored.append(k.get("code"))))
-        monkeypatch.setattr(registry.store, "defer_job",
+        monkeypatch.setattr(registry.store_client, "defer_job",
                             AsyncMock(side_effect=lambda *a, **k: pytest.fail("400 must not defer")))
 
         async def _bad(payload, attribution, report_progress):

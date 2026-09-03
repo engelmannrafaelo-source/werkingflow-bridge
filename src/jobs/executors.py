@@ -33,9 +33,17 @@ class ExecutorHTTPError(RuntimeError):
     2026-07-20. The registry persists the status as UPSTREAM_HTTP_<status>
     so clients can restore proper retry semantics."""
 
-    def __init__(self, status_code: int, message: str):
+    def __init__(
+        self, status_code: int, message: str, retry_after_s: Optional[float] = None
+    ):
         super().__init__(message)
         self.status_code = status_code
+        # The upstream's own Retry-After, when it sent one. The job runner uses
+        # it to schedule a capacity retry (registry._capacity_retry_delay)
+        # instead of guessing — the bridge knows when its limit window resets,
+        # so throwing that number away and picking our own would be worse than
+        # what the caller was told.
+        self.retry_after_s = retry_after_s
 
 # The worker serves its own FastAPI app here (bypasses the nginx LB + its capacity
 # gate — the self-call hits this worker directly). Overridable for tests/other binds.
@@ -111,6 +119,20 @@ _ATTRIBUTION_HEADERS = {
 _SELFCALL_CLIENT_ID = "bridge-jobs/selfcall"
 
 
+def _retry_after_s(response) -> Optional[float]:
+    """Parse a Retry-After header (delta-seconds form) — None when absent or
+    not a number. The HTTP-date form is not produced by any bridge path and is
+    deliberately not guessed at."""
+    raw = response.headers.get("Retry-After")
+    if raw is None:
+        return None
+    try:
+        return float(raw.strip())
+    except (AttributeError, ValueError):
+        logger.warning(f"self-call sent an unparseable Retry-After: {raw!r}")
+        return None
+
+
 async def ping_executor(
     payload: Dict[str, Any],
     attribution: Optional[Dict[str, Any]],
@@ -169,6 +191,7 @@ async def chat_executor(
         raise ExecutorHTTPError(
             response.status_code,
             f"chat self-call failed HTTP {response.status_code}: {detail}",
+            retry_after_s=_retry_after_s(response),
         )
 
     return response.json()
@@ -194,6 +217,7 @@ async def _self_post_json(
         raise ExecutorHTTPError(
             response.status_code,
             f"self-call {path} failed HTTP {response.status_code}: {response.text[:500]}",
+            retry_after_s=_retry_after_s(response),
         )
     try:
         return response.json()

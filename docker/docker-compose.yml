@@ -35,9 +35,12 @@ services:
       # Per-topology metrics-reader target (nginx.conf `set $metrics_reader`).
       # On primary the reader is same-host next to the workers' logs volume.
       - METRICS_READER_TARGET=${METRICS_READER_TARGET:-metrics-reader:8000}
-    # envsubst nginx.conf + the upstreams include (both need ${BRIDGE_BACKUP_HOST}),
+    # envsubst nginx.conf + the upstreams include. Both need ${BRIDGE_BACKUP_HOST};
+    # the include ALSO needs ${BRIDGE_ID} since ADR-0012 — its job-poll map keys
+    # this bridge's own marker off it, so the id the workers stamp and the id
+    # the router matches come from one value.
     # then start openresty. nginx.conf does `include /tmp/upstreams.conf`.
-    command: ["/bin/sh", "-c", "envsubst '$$BRIDGE_BACKUP_HOST $$BRIDGE_ID $$METRICS_READER_TARGET' < /etc/nginx/nginx.conf > /tmp/nginx.conf && envsubst '$$BRIDGE_BACKUP_HOST' < /etc/nginx/upstreams.conf > /tmp/upstreams.conf && cp /etc/nginx/worker-map.conf /tmp/worker-map.conf && openresty -c /tmp/nginx.conf -g 'daemon off;'"]
+    command: ["/bin/sh", "-c", "envsubst '$$BRIDGE_BACKUP_HOST $$BRIDGE_ID $$METRICS_READER_TARGET' < /etc/nginx/nginx.conf > /tmp/nginx.conf && envsubst '$$BRIDGE_BACKUP_HOST $$BRIDGE_ID' < /etc/nginx/upstreams.conf > /tmp/upstreams.conf && cp /etc/nginx/worker-map.conf /tmp/worker-map.conf && openresty -c /tmp/nginx.conf -g 'daemon off;'"]
     depends_on:
       - worker1
       - worker2
