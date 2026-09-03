@@ -164,9 +164,9 @@ def test_lanes_are_separate():
     """Die Anthropic-Tageskappe summiert 'vision_prepaid'. Traegt der
     Gemini-Weg dieselbe Fahrspur, zaehlt er gegen ein Guthaben, das er gar
     nicht belastet — die Kappe waere ab dem ersten Testlauf falsch."""
-    from src.routing.vision_router import LANE_ANTHROPIC_PREPAID, LANE_GEMINI_TEST
+    from src.routing.vision_router import LANE_ANTHROPIC_PREPAID, LANE_GEMINI
 
-    assert LANE_ANTHROPIC_PREPAID != LANE_GEMINI_TEST
+    assert LANE_ANTHROPIC_PREPAID != LANE_GEMINI
 
 
 # ── Provider ────────────────────────────────────────────────────────────────
@@ -351,7 +351,7 @@ async def test_route_to_vision_labels_the_gemini_lane(monkeypatch):
     monkeypatch.setattr(gv.httpx, "AsyncClient", _FakeClient)
 
     from src.routing.vision_router import (
-        LANE_GEMINI_TEST, VISION_TARGET_GEMINI, route_to_vision,
+        LANE_GEMINI, VISION_TARGET_GEMINI, route_to_vision,
     )
     from src.activity.providers import PROVIDER_GEMINI
 
@@ -361,7 +361,7 @@ async def test_route_to_vision_labels_the_gemini_lane(monkeypatch):
         target=VISION_TARGET_GEMINI,
     )
     assert res.ledger_provider == PROVIDER_GEMINI
-    assert res.api_key_lane == LANE_GEMINI_TEST
+    assert res.api_key_lane == LANE_GEMINI
     assert res.model in gv.GEMINI_VISION_MODELS
 
 
@@ -573,3 +573,59 @@ def test_anthropic_thinking_params_are_still_refused():
     sonst waere die Grenze zwischen 'eingestellt' und 'geraten' weg."""
     with pytest.raises(gate.GeminiVisionRefused):
         gate.assert_no_anthropic_only_params(output_config={"effort": "low"})
+
+
+# ── Denk-Budget pro Request (E3s Messanforderung) ───────────────────────────
+# Als reine Env-Einstellung braeuchte "mit/ohne Denken" zwei Laeufe mit
+# Umstellung dazwischen — andere Bridge-Last, anderer Kontostand, andere
+# Bilder. Das waeren zwei Messungen, kein Vergleich.
+
+@pytest.mark.asyncio
+async def test_request_budget_beats_the_deployment_default(monkeypatch):
+    monkeypatch.setenv("GEMINI_VISION_API_KEY", "test-key")
+    monkeypatch.setenv("GEMINI_VISION_THINKING_BUDGET", "512")
+    monkeypatch.setattr(gv.httpx, "AsyncClient", _FakeClient)
+
+    await gv.GeminiVisionProvider().analyze(messages=_image_messages(), thinking_budget=0)
+    assert _FakeClient.captured["body"]["generationConfig"]["thinkingConfig"] == {
+        "thinkingBudget": 0
+    }, "Der ausdrueckliche Wunsch des Aufrufers muss die Env-Zeile schlagen"
+
+    await gv.GeminiVisionProvider().analyze(messages=_image_messages())
+    assert _FakeClient.captured["body"]["generationConfig"]["thinkingConfig"] == {
+        "thinkingBudget": 512
+    }, "Ohne Request-Wert gilt die Deployment-Einstellung"
+
+
+@pytest.mark.asyncio
+async def test_ledger_records_what_actually_happened(monkeypatch):
+    """E3 liest die Einstellung aus dem Ledger, nicht aus der Anfrage — dieselbe
+    Regel wie beim Modell. Also muss sie dort auch ankommen, zusammen mit den
+    echten Denk-Tokens."""
+    monkeypatch.setenv("GEMINI_VISION_API_KEY", "test-key")
+    monkeypatch.delenv("GEMINI_VISION_THINKING_BUDGET", raising=False)
+    monkeypatch.setattr(gv.httpx, "AsyncClient", _FakeClient)
+
+    from src.routing.vision_router import VISION_TARGET_GEMINI, route_to_vision
+
+    res = await route_to_vision(
+        messages=_image_messages(), model="claude-sonnet-5",
+        target=VISION_TARGET_GEMINI, gemini_thinking_budget=0,
+    )
+    assert res.extra_meta["thinking_budget"] == 0
+    # _OK_PAYLOAD traegt thoughtsTokenCount=900 — der Wert kommt aus der
+    # ANTWORT, nicht aus einer Annahme ueber das Modell.
+    assert res.extra_meta["thoughts_tokens"] == 900
+
+
+def test_budget_field_is_validated_by_the_request_model():
+    """Negative Werte gar nicht erst annehmen — Pydantic ist hier die erste
+    Instanz, damit ein Tippfehler nicht bis zu Google reist."""
+    import pydantic
+    from src.models import ChatCompletionRequest
+
+    ok = ChatCompletionRequest(model="claude-sonnet-5", messages=[], gemini_thinking_budget=0)
+    assert ok.gemini_thinking_budget == 0
+    assert ChatCompletionRequest(model="claude-sonnet-5", messages=[]).gemini_thinking_budget is None
+    with pytest.raises(pydantic.ValidationError):
+        ChatCompletionRequest(model="claude-sonnet-5", messages=[], gemini_thinking_budget=-1)
