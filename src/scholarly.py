@@ -1,15 +1,21 @@
 """OA-Scholarly-Schicht für /v1/research (Weg A: deterministische Pre-Retrieval-Injektion).
 
-Holt LEGALE Open-Access-Fachinhalte (OpenAlex-Abstracts + CORE-Volltext) zur Recherche-Query und
-formatiert sie als Kontext-Block, der VOR den SuperClaude-Research-Prompt gehängt wird. Damit stützt
-sich der Agent auf peer-reviewte Primärliteratur (inkl. der darin zitierten Normwerte VDI/DIN/ÖNORM/EN)
-statt nur auf Snippets/Shop-Seiten. Kein Sci-Hub, kein Paywall-Bypass.
+Holt LEGALE Open-Access-Fachinhalte (OpenAlex-Abstracts + Volltext aus CORE UND der
+OpenAlex-Content-API) zur Recherche-Query und formatiert sie als Kontext-Block, der VOR den
+SuperClaude-Research-Prompt gehängt wird. Damit stützt sich der Agent auf peer-reviewte
+Primärliteratur (inkl. der darin zitierten Normwerte VDI/DIN/ÖNORM/EN) statt nur auf
+Snippets/Shop-Seiten. Kein Sci-Hub, kein Paywall-Bypass.
 
 Design (bewusst dependency-frei + schnell, für die geteilte Bridge):
-  - OpenAlex: Discovery + `abstract_inverted_index` → rekonstruierter Abstract (immer da, schnell)
+  - OpenAlex Search: Discovery + `abstract_inverted_index` → rekonstruierter Abstract (immer da, schnell)
+  - OpenAlex Content-API (`src/openalex_content.py`): GROBID-XML-Volltext für die relevantesten
+    Abstract-only-Treffer, hart credit-gedeckelt (siehe dortiger Modul-Docstring), fremdsprachige
+    Volltexte werden erkannt und NICHT verwendet (Rückfall auf den Abstract)
   - CORE:     `fullText` direkt aus dem JSON (57M Repository-/Dissertations-Volltexte), best-effort
-              (keyless rate-limitet → 429 wird fail-soft übersprungen)
-  - KEINE PDF-Downloads/-Extraktion (Worker haben keine PDF-Lib; Downloads waren der Timeout-Treiber)
+              (keyless rate-limitet → 429 wird fail-soft übersprungen); der Sentinel-Platzhalter
+              "Not available for public API users." zählt NICHT als Volltext (siehe `_core()`)
+  - KEIN PDF-Download/-Extraktion für CORE (Worker haben keine PDF-Lib; Downloads waren der
+    Timeout-Treiber) — die Content-API liefert stattdessen bereits geparstes XML, kein PDF nötig
   - Alle Netz-Calls parallel + hart budgetiert; komplett fail-soft → bei jedem Fehler leerer String,
     Research läuft unverändert weiter.
 
@@ -27,6 +33,8 @@ from typing import Any, Dict, List, Optional
 from urllib.parse import quote
 
 import requests
+
+from src import openalex_content
 
 logger = logging.getLogger("scholarly")
 
@@ -155,7 +163,9 @@ def _openalex(query: str, n: int) -> List[Dict[str, Any]]:
               # Rechtsraum eine Arbeit stammt. Ein Laenderfilter waere der falsche Weg — gemessen
               # 03.09.2026 zerstoert institutions.country_code:at|de|ch die Relevanz komplett
               # (Top-Treffer wurde eine Arbeit ueber Fettgewebe bei Adipositas). Anzeigen statt filtern.
-              "select": "title,publication_year,doi,open_access,abstract_inverted_index,language,authorships"}
+              # "id" kostet nichts extra (derselbe Such-Call) und ist der Schlüssel für die
+              # Content-API-Anreicherung unten (_enrich_openalex_fulltext) — ohne ihn keine Volltextabfrage.
+              "select": "id,title,publication_year,doi,open_access,abstract_inverted_index,language,authorships"}
     oa_key = os.getenv("OPENALEX_API_KEY")
     if oa_key:
         params["api_key"] = oa_key
@@ -181,6 +191,7 @@ def _openalex(query: str, n: int) -> List[Dict[str, Any]]:
                 if cc and cc not in laender:
                     laender.append(cc)
         out.append({
+            "id": w.get("id"),
             "title": (w.get("title") or "")[:200],
             "laender": laender[:4],
             "sprache": w.get("language"),
@@ -253,6 +264,33 @@ def _core(query: str, n: int) -> List[Dict[str, Any]]:
         return []
 
 
+def _enrich_openalex_fulltext(candidates: List[Dict[str, Any]]) -> None:
+    """Reichert die aussichtsreichsten Abstract-only-OpenAlex-Treffer mit echtem Volltext an
+    (src/openalex_content.py, GROBID-XML). Mutiert die Paper-Dicts in `candidates` in place.
+
+    Absichtlich AUF EINER VORSORTIERTEN TEILMENGE aufgerufen (siehe Aufrufer): der geteilte
+    OPENALEX_API_KEY hat nur ~100 Content-Abrufe/Tag (100 Credits/Abruf, 10000 Credits/Tag —
+    siehe Modul-Docstring), ein einzelner Research-Lauf darf das Tagesbudget nicht mit einem
+    Abruf pro Treffer leerräumen. `openalex_content.fetch_fulltexts` erzwingt den Deckel.
+
+    Läuft NUR für Treffer, die noch keinen Volltext haben (kind=="abstract") — hat CORE für ein
+    Werk bereits Volltext geliefert, sind hier keine Credits nötig. Bewusst sequenziell (der
+    Deckel lässt ohnehin nur wenige Abrufe zu, ein Thread-Pool für 2-3 Calls wäre Overhead ohne
+    messbaren Zeitgewinn innerhalb des 90s-Gesamtbudgets von `build_oa_context`)."""
+    key = os.getenv("OPENALEX_API_KEY")
+    if not key:
+        return
+    by_id = {p["id"]: p for p in candidates
+             if p.get("source") == "OpenAlex" and p.get("kind") == "abstract" and p.get("id")}
+    if not by_id:
+        return
+    results = openalex_content.fetch_fulltexts(list(by_id.keys()), key)
+    for work_id, res in results.items():
+        paper = by_id[work_id]
+        paper["text"] = res["text"]
+        paper["kind"] = res["kind"]
+
+
 def _retrieve_and_format(queries: List[str], per_query: int) -> str:
     """Parallel je Query OpenAlex+CORE, dedupe, Kontext-Block bauen. Keine PDF-Downloads."""
     papers: List[Dict[str, Any]] = []
@@ -284,6 +322,13 @@ def _retrieve_and_format(queries: List[str], per_query: int) -> str:
     if not papers:
         logger.warning("OA-Retrieval ohne verwertbare Quellen (0 Treffer mit Text) — Kontext-Block entfällt")
         return ""
+
+    # Vorläufig nur nach Relevanz sortieren (noch ohne Textlänge/Volltext-Bonus, den die
+    # Content-API-Anreicherung gleich selbst verändert) — legt fest, welche Abstract-only-
+    # OpenAlex-Treffer die knappen Content-API-Credits bekommen: die relevantesten zuerst,
+    # begrenzt auf das, was ohnehin im finalen Kontext-Block landen würde (_MAX_ENTRIES).
+    papers.sort(key=lambda p: (p["kind"] != "fulltext", p.get("rang", 999)))
+    _enrich_openalex_fulltext(papers[:_MAX_ENTRIES])
 
     # Volltext zuerst, danach nach RELEVANZ (Rang in der Trefferliste der jeweiligen Query),
     # erst zuletzt nach Textlänge. Vorher wurde ausschliesslich nach Laenge sortiert — damit
