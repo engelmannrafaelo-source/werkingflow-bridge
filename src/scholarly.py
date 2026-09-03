@@ -53,10 +53,18 @@ _PLANNER_SYS = (
     "keine Fragen/Sätze). Regeln: (a) mische ENGLISCH (internationale Journals) und DEUTSCH "
     "(Dissertationen/Forschungsberichte, wo ÖNORM/VDI/OIB zitiert werden); "
     "(b) NATIONALE Regelwerke (ÖNORM, TRVB, OIB-Richtlinie, DIN) sind KEINE Fachliteratur und in "
-    "OpenAlex/CORE nicht indexiert — suche NIEMALS nach ihrer Bezeichnung. Frage stattdessen nach "
-    "der PHYSIKALISCHEN GRÖSSE oder dem technischen Verfahren, das die Norm regelt, und ergänze die "
-    "internationale EN/ISO-Entsprechung, falls es eine gibt. Beispiel: statt \'TRVB 112 "
-    "Druckbelüftungsanlage\' → \'stairwell pressurization differential pressure door opening force\'; "
+    "OpenAlex/CORE nicht indexiert — suche NIEMALS nach ihrer Bezeichnung. Nimm stattdessen die "
+    "EUROPÄISCHE Entsprechung (EN/ISO) als EIGENE, KURZE Query; sie ist der staerkste Treffer-Anker. "
+    "Ergänze getrennt davon eine Query auf die PHYSIKALISCHE GRÖSSE bzw. das Verfahren. "
+    "(b1) HALTE QUERIES KURZ, zwei bis fünf Begriffe. Mehr Begriffe stapeln heisst NICHT genauer: "
+    "gemessen 03.09.2026 lieferte \'EN 12101 smoke control\' 247 thematisch exakte Treffer, waehrend "
+    "das ueberladene \'EN 12101-6 pressure differential system\' als Top-Treffer eine Arbeit ueber "
+    "Bisphenol A und das Nervensystem zurueckgab. "
+    "(b2) Frage NICHT auf Deutsch nach Fachbegriffen — \'Druckbelüftung Sicherheitstreppenraum\' und "
+    "\'Druckbelüftungsanlage Treppenraum\' ergaben beide 0 Treffer. Deutsch lohnt nur fuer "
+    "Dissertations-/Berichtstitel, nicht fuer Anlagentechnik. "
+    "Beispiel fuer TRVB 112 (Druckbelüftung): \'EN 12101 smoke control\' UND "
+    "\'stairwell pressurization door opening force\' als ZWEI getrennte kurze Queries; "
     "(c) für jedes technische Thema eine Konzept-Query. "
     "Antworte AUSSCHLIESSLICH als JSON-Array von Strings (8-14 Queries), nichts sonst."
 )
@@ -142,7 +150,12 @@ def _openalex(query: str, n: int) -> List[Dict[str, Any]]:
     # User-Agent belegt. Fehlt er, laeuft alles unveraendert weiter — nur eben auf dem
     # Zehntel-Budget, und der 429-Zweig unten macht das sichtbar.
     params = {"search": query, "per-page": n, "mailto": MAILTO,
-              "select": "title,publication_year,doi,open_access,abstract_inverted_index"}
+              # `language` und `authorships` kosten nichts extra (derselbe Such-Call), liefern aber
+              # die Herkunft: der Brandschutz-Ingenieur muss einordnen koennen, aus welchem
+              # Rechtsraum eine Arbeit stammt. Ein Laenderfilter waere der falsche Weg — gemessen
+              # 03.09.2026 zerstoert institutions.country_code:at|de|ch die Relevanz komplett
+              # (Top-Treffer wurde eine Arbeit ueber Fettgewebe bei Adipositas). Anzeigen statt filtern.
+              "select": "title,publication_year,doi,open_access,abstract_inverted_index,language,authorships"}
     oa_key = os.getenv("OPENALEX_API_KEY")
     if oa_key:
         params["api_key"] = oa_key
@@ -161,8 +174,16 @@ def _openalex(query: str, n: int) -> List[Dict[str, Any]]:
     for rang, w in enumerate(r.json().get("results", [])):
         oa = w.get("open_access") or {}
         abstract = _reconstruct_abstract(w.get("abstract_inverted_index"))
+        laender = []
+        for a in (w.get("authorships") or []):
+            for inst in (a.get("institutions") or []):
+                cc = inst.get("country_code")
+                if cc and cc not in laender:
+                    laender.append(cc)
         out.append({
             "title": (w.get("title") or "")[:200],
+            "laender": laender[:4],
+            "sprache": w.get("language"),
             "year": w.get("publication_year"),
             "doi": (w.get("doi") or "").replace("https://doi.org/", "") or None,
             "url": oa.get("oa_url"),
@@ -285,12 +306,25 @@ def _retrieve_and_format(queries: List[str], per_query: int) -> str:
         doi = f" · doi:{p['doi']}" if p.get("doi") else ""
         url = f"\nURL: {p['url']}" if p.get("url") else ""
         tag = "Volltext" if p["kind"] == "fulltext" else "Abstract"
-        blocks.append(f"### {p['title']} ({p.get('year')}){doi}\nQuelle ({p['source']}, {tag}):{url}\n\n{excerpt}")
+        herkunft = ""
+        if p.get("laender"):
+            herkunft += ", Institutionen: " + "/".join(p["laender"])
+        if p.get("sprache"):
+            herkunft += f", Sprache: {p['sprache']}"
+        blocks.append(f"### {p['title']} ({p.get('year')}){doi}\nQuelle ({p['source']}, {tag}{herkunft}):{url}\n\n{excerpt}")
 
     header = (
         "## VERIFIZIERTE OA-LITERATUR (legal via OpenAlex/CORE)\n"
-        "Nutze diese peer-reviewten Open-Access-Auszüge als PRIMÄRE, zitierbare Quellen (mit URL/DOI). "
-        "Darin zitierte Normwerte (VDI/DIN/ÖNORM/EN) dürfen mit Quellenangabe übernommen werden. "
+        "Nutze diese peer-reviewten Open-Access-Auszüge für physikalische Zusammenhänge, Verfahren, "
+        "Messmethoden und Normkontext — mit Quellenangabe (URL/DOI).\n"
+        "**KEINE GRENZWERTE AUS AUFSÄTZEN.** Ein Zahlenwert aus einer wissenschaftlichen Arbeit ist ein "
+        "Messergebnis oder eine Empfehlung, NIE eine geltende Anforderung. Verbindliche Grenzwerte "
+        "(Druckdifferenzen, Kräfte, U-Werte, Fristen) stammen ausschließlich aus dem einschlägigen "
+        "Regelwerk selbst — TRVB, OIB-Richtlinie, ÖNORM, EN/ISO. Steht ein Grenzwert nur in einem "
+        "Aufsatz, gib ihn als Literaturangabe mit Quelle aus und kennzeichne ausdrücklich, dass die "
+        "verbindliche Fundstelle im Regelwerk noch zu prüfen ist.\n"
+        "Die Herkunft (Land der Institutionen, Jahr, Sprache) steht bei jeder Quelle — sie entscheidet "
+        "mit, ob eine Arbeit auf den österreichischen Rechtsraum übertragbar ist.\n"
         "Ergänze offene Web-Suche nur für Herstellerdaten/Tarife/Förderungen, die hier fehlen.\n"
     )
     return header + "\n\n".join(blocks)
