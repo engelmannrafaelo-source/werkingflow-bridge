@@ -228,11 +228,11 @@ def resolve_app_provider_policy(request: Any) -> tuple[Optional[ProviderRule], O
 #: ``apply_app_provider_policy``. Bewusst eine Einzelnennung und keine
 #: Kategorie: jede weitere Ausnahme soll eine sichtbare Aenderung an dieser
 #: Zeile kosten.
-GEMINI_VISION_TEST_TIER = "gemini-vision-test"
+GEMINI_VISION_TEST_TIER = "gemini-vision"
 
 
 def client_requests_gemini_vision(request_body: Any) -> bool:
-    """Hat der CLIENT selbst den Gemini-Bild-Testweg angefragt?
+    """Hat der CLIENT selbst den Gemini-Bildweg angefragt?
 
     Wie ``client_requests_bedrock`` VOR ``enforce_user_provider_override``
     aufzurufen: der Pin raeumt ``provider_tier`` ab, danach ist die Absicht des
@@ -296,16 +296,16 @@ def apply_app_provider_policy(
         return None
 
     # Zweite Ausnahme, aus demselben Grund wie die erste und mit engerem
-    # Umfang: der Gemini-Bild-Testweg (Rafael, 2026-09-03). Diese Regel raeumt
+    # Umfang: der Gemini-Bildweg (Rafael, 2026-09-03). Diese Regel raeumt
     # ``provider_tier`` ab, um eine Client-Wahl des Backends zu unterbinden —
     # gemeint war damit der Weg auf Bedrock bzw. auf einen fremden Gateway.
-    # Auf den Gemini-Testweg angewandt taete sie etwas anderes und Schlimmeres:
+    # Auf den Gemini-Bildweg angewandt taete sie etwas anderes und Schlimmeres:
     # sie liesse den Aufruf STILL von Anthropic beantworten, waehrend der
     # Aufrufer glaubt, er messe Gemini — also ein falsches Messergebnis PLUS
     # unerwarteter Verbrauch auf dem Anthropic-Prepaid-Schluessel. Genau die
     # Klasse von stillem Umrouten, gegen die dieses Modul geschrieben wurde.
     #
-    # Sicher, weil der Testweg seine EIGENE, striktere Sperre mitbringt
+    # Sicher, weil der Gemini-Weg seine EIGENE Umgebungssperre mitbringt
     # (src/routing/gemini_vision_gate.py: Master-Flag + Key + nachgewiesenes
     # Nicht-Prod + ausdrueckliche Erklaerung). Auf einem Produktions-Worker
     # scheitert er gleich dreifach — die Ausnahme kann dort also nichts

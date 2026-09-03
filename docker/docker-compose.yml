@@ -142,15 +142,22 @@ services:
       - CLAUDE_CODE_MAX_OUTPUT_TOKENS=64000
       - CLAUDE_PERMISSION_MODE=bypassPermissions
       - ANTHROPIC_VISION_API_KEY=${ANTHROPIC_API_KEY}
-      # Gemini-Bildweg (TESTWEG, synthetische Plaene — Rafael 2026-09-03).
-      # Bewusst NUR auf der dev-Bridge verdrahtet: Google ist kein gelisteter
-      # Unterauftragsverarbeiter (avv.md §5.4), echte Kundenplaene duerfen dort
-      # nicht landen. Der fehlende Key auf prod IST die aeusserste Schicht der
-      # Sperre — siehe src/routing/gemini_vision_gate.py.
-      # Alle drei duerfen leer bleiben: der Weg ist dann inert und weist laut ab.
+      # Gemini-Bildweg (Rafael 2026-09-03: auf DIESER Bridge der Standard fuer
+      # die Bildanalyse, Modell gemini-2.5-flash). Bewusst NUR hier verdrahtet:
+      # auf prod bleibt Gemini unerreichbar, weil Google kein gelisteter
+      # Unterauftragsverarbeiter ist (avv.md §5.4). Der fehlende Key dort IST
+      # die tragende Schicht der Sperre — siehe gemini_vision_gate.py.
+      #
+      # REIHENFOLGE BEIM SCHARFSCHALTEN (wichtig, sonst steht Staging still):
+      #   1. GEMINI_VISION_API_KEY hinterlegen
+      #   2. BRIDGE_GEMINI_VISION_ENABLED=true
+      #   3. ERST DANN BRIDGE_VISION_DEFAULT_PROVIDER=gemini
+      # Umgekehrt liefe jeder Bildaufruf auf Staging in eine 403-Absage: die
+      # Sperre weist fail-loud ab und faellt bewusst NICHT auf Anthropic zurueck.
       - GEMINI_VISION_API_KEY=${GEMINI_VISION_API_KEY:-}
       - BRIDGE_GEMINI_VISION_ENABLED=${BRIDGE_GEMINI_VISION_ENABLED:-false}
       - GEMINI_VISION_MODEL=${GEMINI_VISION_MODEL:-}
+      - BRIDGE_VISION_DEFAULT_PROVIDER=${BRIDGE_VISION_DEFAULT_PROVIDER:-}
       # research-cloud (Weg C): executor-only key alias + feature flag.
       # NEVER add plain ANTHROPIC_API_KEY here — claude_cli.py fatals on it
       # (subscription pool would silently bill the API otherwise).
@@ -285,15 +292,22 @@ services:
       - CLAUDE_CODE_MAX_OUTPUT_TOKENS=64000
       - CLAUDE_PERMISSION_MODE=bypassPermissions
       - ANTHROPIC_VISION_API_KEY=${ANTHROPIC_API_KEY}
-      # Gemini-Bildweg (TESTWEG, synthetische Plaene — Rafael 2026-09-03).
-      # Bewusst NUR auf der dev-Bridge verdrahtet: Google ist kein gelisteter
-      # Unterauftragsverarbeiter (avv.md §5.4), echte Kundenplaene duerfen dort
-      # nicht landen. Der fehlende Key auf prod IST die aeusserste Schicht der
-      # Sperre — siehe src/routing/gemini_vision_gate.py.
-      # Alle drei duerfen leer bleiben: der Weg ist dann inert und weist laut ab.
+      # Gemini-Bildweg (Rafael 2026-09-03: auf DIESER Bridge der Standard fuer
+      # die Bildanalyse, Modell gemini-2.5-flash). Bewusst NUR hier verdrahtet:
+      # auf prod bleibt Gemini unerreichbar, weil Google kein gelisteter
+      # Unterauftragsverarbeiter ist (avv.md §5.4). Der fehlende Key dort IST
+      # die tragende Schicht der Sperre — siehe gemini_vision_gate.py.
+      #
+      # REIHENFOLGE BEIM SCHARFSCHALTEN (wichtig, sonst steht Staging still):
+      #   1. GEMINI_VISION_API_KEY hinterlegen
+      #   2. BRIDGE_GEMINI_VISION_ENABLED=true
+      #   3. ERST DANN BRIDGE_VISION_DEFAULT_PROVIDER=gemini
+      # Umgekehrt liefe jeder Bildaufruf auf Staging in eine 403-Absage: die
+      # Sperre weist fail-loud ab und faellt bewusst NICHT auf Anthropic zurueck.
       - GEMINI_VISION_API_KEY=${GEMINI_VISION_API_KEY:-}
       - BRIDGE_GEMINI_VISION_ENABLED=${BRIDGE_GEMINI_VISION_ENABLED:-false}
       - GEMINI_VISION_MODEL=${GEMINI_VISION_MODEL:-}
+      - BRIDGE_VISION_DEFAULT_PROVIDER=${BRIDGE_VISION_DEFAULT_PROVIDER:-}
       # research-cloud (Weg C): executor-only key alias + feature flag.
       # NEVER add plain ANTHROPIC_API_KEY here — claude_cli.py fatals on it
       # (subscription pool would silently bill the API otherwise).
@@ -428,15 +442,22 @@ services:
       - CLAUDE_CODE_MAX_OUTPUT_TOKENS=64000
       - CLAUDE_PERMISSION_MODE=bypassPermissions
       - ANTHROPIC_VISION_API_KEY=${ANTHROPIC_API_KEY}
-      # Gemini-Bildweg (TESTWEG, synthetische Plaene — Rafael 2026-09-03).
-      # Bewusst NUR auf der dev-Bridge verdrahtet: Google ist kein gelisteter
-      # Unterauftragsverarbeiter (avv.md §5.4), echte Kundenplaene duerfen dort
-      # nicht landen. Der fehlende Key auf prod IST die aeusserste Schicht der
-      # Sperre — siehe src/routing/gemini_vision_gate.py.
-      # Alle drei duerfen leer bleiben: der Weg ist dann inert und weist laut ab.
+      # Gemini-Bildweg (Rafael 2026-09-03: auf DIESER Bridge der Standard fuer
+      # die Bildanalyse, Modell gemini-2.5-flash). Bewusst NUR hier verdrahtet:
+      # auf prod bleibt Gemini unerreichbar, weil Google kein gelisteter
+      # Unterauftragsverarbeiter ist (avv.md §5.4). Der fehlende Key dort IST
+      # die tragende Schicht der Sperre — siehe gemini_vision_gate.py.
+      #
+      # REIHENFOLGE BEIM SCHARFSCHALTEN (wichtig, sonst steht Staging still):
+      #   1. GEMINI_VISION_API_KEY hinterlegen
+      #   2. BRIDGE_GEMINI_VISION_ENABLED=true
+      #   3. ERST DANN BRIDGE_VISION_DEFAULT_PROVIDER=gemini
+      # Umgekehrt liefe jeder Bildaufruf auf Staging in eine 403-Absage: die
+      # Sperre weist fail-loud ab und faellt bewusst NICHT auf Anthropic zurueck.
       - GEMINI_VISION_API_KEY=${GEMINI_VISION_API_KEY:-}
       - BRIDGE_GEMINI_VISION_ENABLED=${BRIDGE_GEMINI_VISION_ENABLED:-false}
       - GEMINI_VISION_MODEL=${GEMINI_VISION_MODEL:-}
+      - BRIDGE_VISION_DEFAULT_PROVIDER=${BRIDGE_VISION_DEFAULT_PROVIDER:-}
       # research-cloud (Weg C): executor-only key alias + feature flag.
       # NEVER add plain ANTHROPIC_API_KEY here — claude_cli.py fatals on it
       # (subscription pool would silently bill the API otherwise).
@@ -571,15 +592,22 @@ services:
       - CLAUDE_CODE_MAX_OUTPUT_TOKENS=64000
       - CLAUDE_PERMISSION_MODE=bypassPermissions
       - ANTHROPIC_VISION_API_KEY=${ANTHROPIC_API_KEY}
-      # Gemini-Bildweg (TESTWEG, synthetische Plaene — Rafael 2026-09-03).
-      # Bewusst NUR auf der dev-Bridge verdrahtet: Google ist kein gelisteter
-      # Unterauftragsverarbeiter (avv.md §5.4), echte Kundenplaene duerfen dort
-      # nicht landen. Der fehlende Key auf prod IST die aeusserste Schicht der
-      # Sperre — siehe src/routing/gemini_vision_gate.py.
-      # Alle drei duerfen leer bleiben: der Weg ist dann inert und weist laut ab.
+      # Gemini-Bildweg (Rafael 2026-09-03: auf DIESER Bridge der Standard fuer
+      # die Bildanalyse, Modell gemini-2.5-flash). Bewusst NUR hier verdrahtet:
+      # auf prod bleibt Gemini unerreichbar, weil Google kein gelisteter
+      # Unterauftragsverarbeiter ist (avv.md §5.4). Der fehlende Key dort IST
+      # die tragende Schicht der Sperre — siehe gemini_vision_gate.py.
+      #
+      # REIHENFOLGE BEIM SCHARFSCHALTEN (wichtig, sonst steht Staging still):
+      #   1. GEMINI_VISION_API_KEY hinterlegen
+      #   2. BRIDGE_GEMINI_VISION_ENABLED=true
+      #   3. ERST DANN BRIDGE_VISION_DEFAULT_PROVIDER=gemini
+      # Umgekehrt liefe jeder Bildaufruf auf Staging in eine 403-Absage: die
+      # Sperre weist fail-loud ab und faellt bewusst NICHT auf Anthropic zurueck.
       - GEMINI_VISION_API_KEY=${GEMINI_VISION_API_KEY:-}
       - BRIDGE_GEMINI_VISION_ENABLED=${BRIDGE_GEMINI_VISION_ENABLED:-false}
       - GEMINI_VISION_MODEL=${GEMINI_VISION_MODEL:-}
+      - BRIDGE_VISION_DEFAULT_PROVIDER=${BRIDGE_VISION_DEFAULT_PROVIDER:-}
       # research-cloud (Weg C): executor-only key alias + feature flag.
       # NEVER add plain ANTHROPIC_API_KEY here — claude_cli.py fatals on it
       # (subscription pool would silently bill the API otherwise).

@@ -67,7 +67,7 @@ from src.routing.vision_router import (
     resolve_vision_target, VISION_TARGET_GEMINI,
 )
 from src.routing.gemini_vision_gate import (
-    assert_gemini_vision_allowed, declares_synthetic_test_mode, GeminiVisionRefused,
+    assert_gemini_vision_allowed, GeminiVisionRefused,
 )
 from src.routing.prepaid_cap import prepaid_vision_over_cap
 from src.routing.backend_router import resolve_backend_config, get_backend_info_dict, BackendConfig
@@ -1323,7 +1323,6 @@ async def generate_streaming_response(
                         app_env=normalize_app_env(get_app_env_from_request(fastapi_request))
                         if fastapi_request else None,
                         has_images=True,
-                        declares_synthetic=declares_synthetic_test_mode(fastapi_request),
                     )
                 except GeminiVisionRefused as refusal:
                     logger.warning(f"⛔ Gemini-Bildweg abgewiesen (stream): {refusal}")
@@ -1434,7 +1433,6 @@ async def generate_streaming_response(
                             "endpoint": "vision",
                             "api_key_lane": vision_result.api_key_lane,
                             "image_count": _vision_images,
-                            "synthetic_declared": _vision_target == VISION_TARGET_GEMINI,
                         },
                     )
                 except Exception as _vision_track_err:
@@ -2883,8 +2881,8 @@ async def chat_completions(
         # =======================================================================
         # GEMINI API (Bildweg, Testlane): nur MIT Bild sinnvoll
         # =======================================================================
-        # Der Tier 'gemini-vision-test' existiert ausschliesslich fuer die
-        # Bildanalyse; bedient wird er weiter unten an der Vision-Weiche. Ein
+        # Der Tier 'gemini-vision' bedient ausschliesslich Bildanalysen;
+        # bedient wird er weiter unten an der Vision-Weiche. Ein
         # Aufruf OHNE Bild faende dort nichts und fiele stillschweigend in den
         # Claude-SDK-Zweig darunter — der Aufrufer bekaeme ein anderes Modell
         # als angefragt und saehe es nirgends. Deshalb hier laut abweisen,
@@ -2906,7 +2904,7 @@ async def chat_completions(
         )
         if _gemini_tier_was_overridden:
             logger.warning(
-                "⛔ provider_tier='gemini-vision-test' wurde durch einen Pin/eine "
+                "⛔ provider_tier='gemini-vision' wurde durch einen Pin/eine "
                 "Regel ueberschrieben (pinned=%r) — Aufruf abgewiesen statt still "
                 "von Anthropic beantwortet.", operator_pinned_provider,
             )
@@ -2914,14 +2912,14 @@ async def chat_completions(
                 status_code=409,
                 content={"error": {
                     "message": (
-                        "provider_tier='gemini-vision-test' wurde von einer "
+                        "provider_tier='gemini-vision' wurde von einer "
                         "hoeherrangigen Provider-Entscheidung ueberschrieben "
                         f"(Operator-Pin: {operator_pinned_provider!r}). Der Aufruf "
                         "wird NICHT stillschweigend von Anthropic beantwortet — das "
                         "waere ein falsches Messergebnis auf einem anderen "
                         "Schluessel. Ein Nutzer mit Operator-Pin traegt eine "
-                        "vertragliche Datenresidenz-Zusage; fuer den Gemini-Testweg "
-                        "einen ungepinnten Testnutzer verwenden."
+                        "vertragliche Datenresidenz-Zusage; fuer den Gemini-Weg "
+                        "einen ungepinnten Nutzer verwenden."
                     ),
                     "type": "provider_tier_overridden",
                     "code": "gemini_vision_tier_overridden",
@@ -2934,7 +2932,7 @@ async def chat_completions(
                     status_code=400,
                     content={"error": {
                         "message": (
-                            "provider_tier='gemini-vision-test' ist ein reiner "
+                            "provider_tier='gemini-vision' ist ein reiner "
                             "Bildanalyse-Weg, dieser Aufruf enthaelt aber kein Bild. "
                             "Ohne Tier laeuft der Aufruf normal ueber Claude."
                         ),
@@ -2995,14 +2993,14 @@ async def chat_completions(
                 vision_result = None
                 if not _vision_is_bedrock and has_vision_content(prepare_messages_for_vision(request_body.messages)):
                     if _vision_target == VISION_TARGET_GEMINI:
-                        # Datenschutz-Sperre VOR dem Upstream-Call: Google ist
-                        # kein gelisteter Unterauftragsverarbeiter, also darf
-                        # hier nur ein ausdruecklich erklaerter Testlauf aus
-                        # einer nachweislichen Nicht-Prod-Umgebung durch.
+                        # Umgebungssperre VOR dem Upstream-Call: Gemini ist auf
+                        # Staging der Standard, auf Produktion nicht erreichbar
+                        # (avv.md §5.4 — Google ist kein gelisteter
+                        # Unterauftragsverarbeiter, produktive Kundendaten
+                        # bleiben EU-resident).
                         assert_gemini_vision_allowed(
                             app_env=normalize_app_env(get_app_env_from_request(request)),
                             has_images=True,
-                            declares_synthetic=declares_synthetic_test_mode(request),
                         )
                     # Prepaid vision-key daily cap (fail-open, flag-gated). Only a
                     # confirmed vision call reaches here, so a non-vision call is
@@ -3123,12 +3121,6 @@ async def chat_completions(
                                 "image_count": image_count,
                                 "stop_reason": vision_result.stop_reason,
                                 "empty_response": not vision_result.content,
-                                # Die Testmodus-Erklaerung des Aufrufers wird
-                                # mitgeschrieben: die Bridge kann einem Bild
-                                # nicht ansehen, ob es synthetisch ist, also
-                                # gehoert die Behauptung in den Datensatz, wo
-                                # sie pruefbar ist statt nur behauptet.
-                                "synthetic_declared": _vision_target == VISION_TARGET_GEMINI,
                             },
                         )
                     except Exception as _vision_track_err:

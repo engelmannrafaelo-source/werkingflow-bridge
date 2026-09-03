@@ -6,6 +6,7 @@ between streaming and non-streaming endpoints.
 """
 
 import logging
+import os
 from typing import Optional, List, Dict, Any
 from dataclasses import dataclass
 
@@ -17,11 +18,11 @@ logger = logging.getLogger(__name__)
 # usage_events.provider_metadata->>'api_key_lane' — WELCHER Schluessel bezahlt
 # hat. Getrennt gehalten, weil beide echtes Geld auf verschiedenen Konten sind:
 # die Anthropic-Tageskappe (src/routing/prepaid_cap.py) summiert ausschliesslich
-# 'vision_prepaid'. Wuerde der Gemini-Testweg dieselbe Fahrspur beschriften,
+# 'vision_prepaid'. Wuerde der Gemini-Weg dieselbe Fahrspur beschriften,
 # zaehlte er gegen ein Guthaben, das er gar nicht belastet — und die Kappe waere
-# ab dem ersten Testlauf falsch.
+# ab dem ersten Gemini-Aufruf falsch.
 LANE_ANTHROPIC_PREPAID = "vision_prepaid"
-LANE_GEMINI_TEST = "vision_gemini_test"
+LANE_GEMINI_TEST = "vision_gemini"
 
 
 # Ziele der Vision-Weiche. Kein Enum, weil die Werte roh in Log- und
@@ -50,20 +51,68 @@ class VisionResult:
     api_key_lane: str
 
 
+def default_vision_target() -> str:
+    """Der Bild-Anbieter dieser Bridge, wenn der Aufrufer keinen nennt.
+
+    Rafael, 2026-09-03: auf der DEV-Bridge soll die Bildanalyse
+    **standardmaessig** ueber Gemini laufen — fuer alle Apps, ohne dass jede
+    App einen provider_tier mitschicken muss. Das ist genau der Sinn dieses
+    Schalters: der Anbieterwechsel ist eine Eigenschaft des Deployments, keine
+    Aenderung an vier Aufrufstellen in jeder App.
+
+    Default ist ``anthropic``, also das bisherige Verhalten. Der Schalter wird
+    auf der dev-Bridge GEMEINSAM mit dem API-Key gesetzt und nicht davor: ohne
+    Key wuerde er jeden Bildaufruf auf Staging in eine 403-Absage laufen
+    lassen (die Sperre weist fail-loud ab, sie faellt bewusst nicht auf
+    Anthropic zurueck). Reihenfolge also: Key hinterlegen, Flag einschalten,
+    dann diesen Schalter umlegen.
+
+    Ein unbekannter Wert faellt NICHT still auf den Default zurueck — ein
+    Tippfehler in der Compose-Zeile soll auffallen, nicht monatelang so
+    aussehen, als liefe alles ueber Gemini.
+    """
+    raw = (os.getenv("BRIDGE_VISION_DEFAULT_PROVIDER") or "").strip().lower()
+    if not raw:
+        return VISION_TARGET_ANTHROPIC
+    if raw not in (VISION_TARGET_ANTHROPIC, VISION_TARGET_GEMINI):
+        raise ValueError(
+            f"BRIDGE_VISION_DEFAULT_PROVIDER={raw!r} ist unbekannt. Erlaubt: "
+            f"{VISION_TARGET_ANTHROPIC!r}, {VISION_TARGET_GEMINI!r}."
+        )
+    return raw
+
+
 def resolve_vision_target(backend_config: Any) -> str:
     """Welcher Anbieter soll dieses Bild sehen?
 
-    Entscheidet allein am aufgeloesten Backend, nicht am Modellnamen: der
-    provider_tier-Weg ist der einzige, der GEMINI_API ueberhaupt setzen kann,
-    und damit ist die Weiche an dieselbe Stelle gebunden, an der auch der
-    Bedrock-Pin haengt. Ein Aufruf ohne Tier bleibt unveraendert auf dem
-    Anthropic-Bildweg — dieser Bau aendert fuer bestehende Aufrufer nichts.
+    Zwei Wege fuehren zu Gemini, und beide muessen dieselbe Sperre passieren
+    (``gemini_vision_gate``):
+
+    * Der Aufrufer waehlt ihn ausdruecklich per ``provider_tier`` — die
+      normale Bridge-Provider-Mechanik, kein Sonderpfad. Diese Wahl gewinnt
+      immer, damit eine Messung gezielt ein Modell ansprechen kann.
+    * Oder das Deployment hat ihn als Standard gesetzt
+      (``BRIDGE_VISION_DEFAULT_PROVIDER``, s.o.).
+
+    Ein BEDROCK-Backend fasst diese Funktion nicht an: dort werden Bilder
+    ohnehin nativ verarbeitet, und der Aufrufer laeuft gar nicht erst in den
+    Vision-Zweig (main.py prueft das getrennt). Der Standard-Schalter darf
+    einen Bedrock-Pin also nie ueberstimmen — das waere ein stiller Wechsel der
+    Datenresidenz.
     """
     from src.models import BackendType
 
-    if backend_config is not None and getattr(backend_config, "backend", None) == BackendType.GEMINI_API:
+    backend = getattr(backend_config, "backend", None) if backend_config is not None else None
+
+    if backend == BackendType.GEMINI_API:
         return VISION_TARGET_GEMINI
-    return VISION_TARGET_ANTHROPIC
+    if backend == BackendType.BEDROCK:
+        return VISION_TARGET_ANTHROPIC
+    if backend_config is not None and getattr(backend_config, "provider_tier", None):
+        # Der Aufrufer hat ausdruecklich einen anderen Tier gewaehlt (z.B.
+        # claude-direct-notools). Den ueberstimmt der Bridge-Standard nicht.
+        return VISION_TARGET_ANTHROPIC
+    return default_vision_target()
 
 
 def serialize_message_content(content) -> Any:
@@ -131,7 +180,7 @@ async def route_to_vision(
         # Anthropic-eigene Regler duerfen hier nicht stillschweigend verfallen.
         assert_no_anthropic_only_params(thinking=thinking, output_config=output_config)
 
-        logger.info("🖼️ Routing to Vision API (Gemini, Testweg)")
+        logger.info("🖼️ Routing to Vision API (Gemini)")
         gemini_response = await get_gemini_vision_provider().analyze(
             messages=messages,
             model=resolve_gemini_vision_model(),

@@ -1,4 +1,4 @@
-"""Google Gemini vision provider — API-key path with image input (TEST LANE).
+"""Google Gemini vision provider — API-Key-Weg mit Bildeingabe.
 
 WHY THIS EXISTS
 ---------------
@@ -44,17 +44,29 @@ geschlossen).
 
 MODELLWAHL (Preise geprueft 2026-09-03, ai.google.dev/gemini-api/docs/pricing)
 ------------------------------------------------------------------------------
-Neuer ist hier NICHT guenstiger — deshalb ist 2.5 Flash-Lite der Default und
-nicht die juengste Variante:
+Neuer ist hier NICHT guenstiger — innerhalb beider Familien ist die 2.5er die
+guenstigste, deshalb steht sie vorne:
 
-    gemini-2.5-flash-lite    0,10 / 0,40 USD je 1M   <- Default
+    gemini-2.5-flash         0,30 / 2,50 USD je 1M   <- Default
+    gemini-3.5-flash         1,50 / 9,00 USD
+    gemini-2.5-flash-lite    0,10 / 0,40 USD
     gemini-3.1-flash-lite    0,25 / 1,50 USD
     gemini-3.5-flash-lite    0,30 / 2,50 USD
 
-Alle drei sind "stable", alle drei nehmen Bildeingabe, Bilder werden zum
-Token-Preis abgerechnet. Fuer 2.5 Flash-Lite ist kein Retirement-Datum
-dokumentiert. ``gemini-3.1-flash-lite-image`` gehoert NICHT in diese Liste: das
-ist ein Modell zur Bild-ERZEUGUNG (Text -> Bild), nicht zum Bildverstehen.
+Zum Vergleich, weil es die Entscheidung traegt: claude-sonnet-5 liegt bei
+2,00 / 10,00 USD. Gemini 2.5 Flash ist also input rund 6,7x und output 4x
+guenstiger.
+
+Alle nehmen Bildeingabe, Bilder werden zum Token-Preis abgerechnet (kein
+getrennter Bildposten). ``gemini-3.1-flash-lite-image`` gehoert NICHT in diese
+Liste: das ist ein Modell zur Bild-ERZEUGUNG (Text -> Bild), nicht zum
+Bildverstehen.
+
+Ein weiteres Modell aufzunehmen ist bewusst ein kleiner, sichtbarer Schritt und
+kein Sonderpfad: Zeile in ``GEMINI_VISION_MODELS`` plus Preiszeile in
+``src/pricing.py``. Die Allowlist ist keine Gaengelung, sondern die Kopplung an
+die Preis-SSoT — ein unbepreistes Modell wuerde 0,00 EUR ins Ledger schreiben,
+obwohl der Key echtes Geld kostet.
 """
 
 from __future__ import annotations
@@ -77,12 +89,19 @@ logger = logging.getLogger(__name__)
 # Silent-Gratis-Klasse, die die Preis-SSoT ausdruecklich verbietet). Der
 # Startup-Invariant test_gemini_vision_models_are_priced haelt das fest.
 GEMINI_VISION_MODELS = frozenset({
+    "gemini-2.5-flash",       # Default (Rafael 2026-09-03)
+    "gemini-3.5-flash",
     "gemini-2.5-flash-lite",
     "gemini-3.1-flash-lite",
     "gemini-3.5-flash-lite",
 })
 
-DEFAULT_GEMINI_VISION_MODEL = "gemini-2.5-flash-lite"
+# Rafael, 2026-09-03: der Vision-Standard auf der DEV-Bridge ist Gemini 2.5
+# FLASH, nicht Flash-Lite. Flash-Lite waere dreimal guenstiger (0,10/0,40 gegen
+# 0,30/2,50), aber hier geht es um die Qualitaet der Analyseberichte — und die
+# ist der Grund, warum ueberhaupt gemessen wird. Flash-Lite bleibt bepreist und
+# per Env waehlbar, falls die Messung zeigt, dass es reicht.
+DEFAULT_GEMINI_VISION_MODEL = "gemini-2.5-flash"
 DEFAULT_GEMINI_VISION_BASE_URL = "https://generativelanguage.googleapis.com/v1beta"
 
 API_KEY_ENV = "GEMINI_VISION_API_KEY"

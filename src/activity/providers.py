@@ -39,13 +39,13 @@ labeling decisions, and bundling them into a compliance fix would hide them:
   - STT (openai / aws-sagemaker) is pay-per-use but books 0.00 EUR real cost.
   - ANTHROPIC_DIRECT (prepaid vision key) is real money on a prepaid key and
     also books 0.00 EUR.
-  - GEMINI_API (der Bild-Testweg, 2026-09-03) ist ebenfalls echtes Geld auf
+  - GEMINI_API (der Bildweg, 2026-09-03) ist ebenfalls echtes Geld auf
     einem eigenen API-Key und bucht ebenfalls 0.00 EUR real_cost. Diese Luecke
     wird hier BEWUSST nicht geschlossen: ``REAL_COST_PROVIDERS`` ist
     provider-, nicht backend-koernig, und ``gemini`` traegt zugleich den
     CLI-OAuth-Weg (Kontingent, keine Grenzkosten) — ein Eintrag hier wuerde
-    dessen Zeilen falsch als Echtgeld buchen. Der Testweg bleibt trotzdem
-    auffindbar: ``provider_metadata->>'api_key_lane' = 'vision_gemini_test'``,
+    dessen Zeilen falsch als Echtgeld buchen. Der Weg bleibt trotzdem
+    auffindbar: ``provider_metadata->>'api_key_lane' = 'vision_gemini'``,
     und ``hypothetical_cost_eur`` traegt den echten Listenpreis (Preise in
     src/pricing.py). Sauber loesen liesse sich das mit einer eigenen
     Ledger-Vokabel + Migration am CHECK-Constraint aus 053 — eine

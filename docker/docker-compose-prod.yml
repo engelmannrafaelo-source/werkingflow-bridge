@@ -162,11 +162,13 @@ services:
       - TAVILY_API_KEY=${TAVILY_API_KEY}
       - ANTHROPIC_VISION_API_KEY=${ANTHROPIC_API_KEY}
       # KEIN GEMINI_VISION_API_KEY auf prod — und das ist Absicht, keine Luecke.
-      # Der Gemini-Bildweg ist ein Testweg fuer synthetische Plaene; Google ist
-      # in avv.md §5.4 nicht als Unterauftragsverarbeiter gelistet, echte
-      # Kundenplaene duerfen nicht dorthin. Bitte NICHT "der Vollstaendigkeit
-      # halber" nachtragen: der fehlende Key ist die einzige Schicht der Sperre,
-      # die auch dann haelt, wenn der Code Fehler hat.
+      # Auf der DEV-Bridge ist Gemini seit 2026-09-03 der Standard fuer die
+      # Bildanalyse; auf PRODUKTION bleibt es beim bisherigen Weg. Google ist in
+      # avv.md §5.4 nicht als Unterauftragsverarbeiter gelistet, und fuer
+      # produktive Kundendaten ist EU-Residenz zugesagt. Bitte NICHT "der
+      # Vollstaendigkeit halber" nachtragen: der fehlende Key ist die einzige
+      # Schicht der Sperre, die auch dann haelt, wenn der Code Fehler hat.
+      # Aus demselben Grund steht hier auch kein BRIDGE_VISION_DEFAULT_PROVIDER.
       # research-cloud (Weg C): executor-only key alias + feature flag.
       # NEVER add plain ANTHROPIC_API_KEY here — claude_cli.py fatals on it
       # (subscription pool would silently bill the API otherwise).
@@ -301,11 +303,13 @@ services:
       - TAVILY_API_KEY=${TAVILY_API_KEY}
       - ANTHROPIC_VISION_API_KEY=${ANTHROPIC_API_KEY}
       # KEIN GEMINI_VISION_API_KEY auf prod — und das ist Absicht, keine Luecke.
-      # Der Gemini-Bildweg ist ein Testweg fuer synthetische Plaene; Google ist
-      # in avv.md §5.4 nicht als Unterauftragsverarbeiter gelistet, echte
-      # Kundenplaene duerfen nicht dorthin. Bitte NICHT "der Vollstaendigkeit
-      # halber" nachtragen: der fehlende Key ist die einzige Schicht der Sperre,
-      # die auch dann haelt, wenn der Code Fehler hat.
+      # Auf der DEV-Bridge ist Gemini seit 2026-09-03 der Standard fuer die
+      # Bildanalyse; auf PRODUKTION bleibt es beim bisherigen Weg. Google ist in
+      # avv.md §5.4 nicht als Unterauftragsverarbeiter gelistet, und fuer
+      # produktive Kundendaten ist EU-Residenz zugesagt. Bitte NICHT "der
+      # Vollstaendigkeit halber" nachtragen: der fehlende Key ist die einzige
+      # Schicht der Sperre, die auch dann haelt, wenn der Code Fehler hat.
+      # Aus demselben Grund steht hier auch kein BRIDGE_VISION_DEFAULT_PROVIDER.
       # research-cloud (Weg C): executor-only key alias + feature flag.
       # NEVER add plain ANTHROPIC_API_KEY here — claude_cli.py fatals on it
       # (subscription pool would silently bill the API otherwise).
@@ -441,11 +445,13 @@ services:
       - TAVILY_API_KEY=${TAVILY_API_KEY}
       - ANTHROPIC_VISION_API_KEY=${ANTHROPIC_API_KEY}
       # KEIN GEMINI_VISION_API_KEY auf prod — und das ist Absicht, keine Luecke.
-      # Der Gemini-Bildweg ist ein Testweg fuer synthetische Plaene; Google ist
-      # in avv.md §5.4 nicht als Unterauftragsverarbeiter gelistet, echte
-      # Kundenplaene duerfen nicht dorthin. Bitte NICHT "der Vollstaendigkeit
-      # halber" nachtragen: der fehlende Key ist die einzige Schicht der Sperre,
-      # die auch dann haelt, wenn der Code Fehler hat.
+      # Auf der DEV-Bridge ist Gemini seit 2026-09-03 der Standard fuer die
+      # Bildanalyse; auf PRODUKTION bleibt es beim bisherigen Weg. Google ist in
+      # avv.md §5.4 nicht als Unterauftragsverarbeiter gelistet, und fuer
+      # produktive Kundendaten ist EU-Residenz zugesagt. Bitte NICHT "der
+      # Vollstaendigkeit halber" nachtragen: der fehlende Key ist die einzige
+      # Schicht der Sperre, die auch dann haelt, wenn der Code Fehler hat.
+      # Aus demselben Grund steht hier auch kein BRIDGE_VISION_DEFAULT_PROVIDER.
       # research-cloud (Weg C): executor-only key alias + feature flag.
       # NEVER add plain ANTHROPIC_API_KEY here — claude_cli.py fatals on it
       # (subscription pool would silently bill the API otherwise).
@@ -581,11 +587,13 @@ services:
       - TAVILY_API_KEY=${TAVILY_API_KEY}
       - ANTHROPIC_VISION_API_KEY=${ANTHROPIC_API_KEY}
       # KEIN GEMINI_VISION_API_KEY auf prod — und das ist Absicht, keine Luecke.
-      # Der Gemini-Bildweg ist ein Testweg fuer synthetische Plaene; Google ist
-      # in avv.md §5.4 nicht als Unterauftragsverarbeiter gelistet, echte
-      # Kundenplaene duerfen nicht dorthin. Bitte NICHT "der Vollstaendigkeit
-      # halber" nachtragen: der fehlende Key ist die einzige Schicht der Sperre,
-      # die auch dann haelt, wenn der Code Fehler hat.
+      # Auf der DEV-Bridge ist Gemini seit 2026-09-03 der Standard fuer die
+      # Bildanalyse; auf PRODUKTION bleibt es beim bisherigen Weg. Google ist in
+      # avv.md §5.4 nicht als Unterauftragsverarbeiter gelistet, und fuer
+      # produktive Kundendaten ist EU-Residenz zugesagt. Bitte NICHT "der
+      # Vollstaendigkeit halber" nachtragen: der fehlende Key ist die einzige
+      # Schicht der Sperre, die auch dann haelt, wenn der Code Fehler hat.
+      # Aus demselben Grund steht hier auch kein BRIDGE_VISION_DEFAULT_PROVIDER.
       # research-cloud (Weg C): executor-only key alias + feature flag.
       # NEVER add plain ANTHROPIC_API_KEY here — claude_cli.py fatals on it
       # (subscription pool would silently bill the API otherwise).

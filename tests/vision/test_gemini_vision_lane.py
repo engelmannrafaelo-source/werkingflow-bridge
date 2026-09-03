@@ -28,21 +28,36 @@ def test_every_allowed_model_is_priced():
     )
 
 
-def test_default_model_is_the_cheapest_of_the_family():
-    """Regressionspin gegen den Reflex 'nimm die neueste Version'.
+def test_default_is_25_flash_and_the_cheapest_of_its_generation():
+    """Zwei Festlegungen in einem Test.
 
-    Bei Flash-Lite ist neuer NICHT guenstiger (2.5: 0,10/0,40 · 3.1: 0,25/1,50 ·
-    3.5: 0,30/2,50, geprueft 2026-09-03). Wer den Default auf eine neuere
-    Variante hebt, soll das bewusst tun und diesen Test mit anfassen.
+    (1) Der Default ist 2.5 FLASH — Rafaels Entscheidung vom 2026-09-03. Nicht
+        Flash-Lite (waere 3x guenstiger, aber es geht um die Qualitaet der
+        Analyseberichte) und nicht eine neuere Generation.
+    (2) Innerhalb der Flash-Familie ist 2.5 die guenstigste — neuer ist hier
+        NICHT billiger (3.5 Flash: 1,50/9,00 gegen 0,30/2,50). Wer den Default
+        hebt, soll das bewusst tun und diesen Test mit anfassen.
     """
     from src.pricing import price_entry
 
-    def total(model):
-        p = price_entry(model)
+    assert gv.DEFAULT_GEMINI_VISION_MODEL == "gemini-2.5-flash"
+
+    def total(m):
+        p = price_entry(m)
         return p["in"] + p["out"]
 
-    cheapest = min(gv.GEMINI_VISION_MODELS, key=total)
-    assert gv.DEFAULT_GEMINI_VISION_MODEL == cheapest
+    flash = [m for m in gv.GEMINI_VISION_MODELS if "flash-lite" not in m]
+    assert gv.DEFAULT_GEMINI_VISION_MODEL == min(flash, key=total)
+
+
+def test_gemini_is_much_cheaper_than_the_sonnet_it_replaces():
+    """Der Grund fuer den ganzen Bau, als Zahl festgehalten."""
+    from src.pricing import price_entry
+
+    g = price_entry("gemini-2.5-flash")
+    s = price_entry("claude-sonnet-5")
+    assert g["in"] < s["in"] / 5      # 0,30 gegen 2,00
+    assert g["out"] < s["out"] / 3    # 2,50 gegen 10,00
 
 
 def test_unknown_model_env_fails_loud(monkeypatch):
@@ -62,7 +77,7 @@ def armed(monkeypatch):
 
 
 def _allow(**over):
-    kwargs = {"app_env": "staging", "has_images": True, "declares_synthetic": True}
+    kwargs = {"app_env": "staging", "has_images": True}
     kwargs.update(over)
     return gate.assert_gemini_vision_allowed(**kwargs)
 
@@ -105,11 +120,6 @@ def test_unknown_environment_is_refused(armed):
         _allow(app_env=None)
 
 
-def test_missing_synthetic_declaration_is_refused(armed):
-    with pytest.raises(gate.GeminiVisionRefused):
-        _allow(declares_synthetic=False)
-
-
 def test_without_image_is_refused(armed):
     with pytest.raises(gate.GeminiVisionRefused):
         _allow(has_images=False)
@@ -129,23 +139,6 @@ def test_anthropic_only_params_are_refused_not_dropped():
     with pytest.raises(gate.GeminiVisionRefused):
         gate.assert_no_anthropic_only_params(output_config={"effort": "low"})
     gate.assert_no_anthropic_only_params()  # nichts gesetzt -> still
-
-
-class _Headers(dict):
-    pass
-
-
-class _Req:
-    def __init__(self, headers):
-        self.headers = _Headers(headers)
-
-
-def test_declaration_is_read_from_the_header():
-    assert gate.declares_synthetic_test_mode(_Req({"X-Vision-Test-Mode": "synthetic"}))
-    assert not gate.declares_synthetic_test_mode(_Req({"X-Vision-Test-Mode": "echt"}))
-    assert not gate.declares_synthetic_test_mode(_Req({}))
-    # Fehlender HTTP-Kontext ist KEINE Erklaerung.
-    assert not gate.declares_synthetic_test_mode(None)
 
 
 # ── Weiche ──────────────────────────────────────────────────────────────────
@@ -417,7 +410,7 @@ def test_a_gemini_model_name_in_the_model_field_is_rejected():
 # Ohne diese Ausnahme haette werking-energy — genau die App, die messen will —
 # den Tier verloren und still Sonnet gemessen. Auf dem Anthropic-Prepaid-Key.
 
-def _energy_request(tier="gemini-vision-test"):
+def _energy_request(tier="gemini-vision"):
     from src.models import BackendType
 
     class _Body:
@@ -439,7 +432,7 @@ def test_app_rule_does_not_silently_strip_the_gemini_tier():
     # Die Regel laesst den Aufruf unangetastet (wie beim ausdruecklich
     # angefragten Bedrock), statt den Tier abzuraeumen.
     assert applied is None
-    assert body.provider_tier == "gemini-vision-test", (
+    assert body.provider_tier == "gemini-vision", (
         "Der Gemini-Testtier wurde von der App-Regel abgeraeumt — der Aufruf "
         "waere still von Anthropic beantwortet worden, waehrend der Aufrufer "
         "glaubt, er misst Gemini."
@@ -458,3 +451,77 @@ def test_app_rule_still_strips_every_other_tier():
     assert applied == "anthropic"
     assert body.provider_tier is None
     assert body.backend == BackendType.ANTHROPIC
+
+
+# ── Bridge-weiter Standard-Anbieter (Rafael 2026-09-03) ─────────────────────
+
+class _Cfg:
+    def __init__(self, backend=None, provider_tier=None):
+        from src.models import BackendType
+        self.backend = backend if backend is not None else BackendType.ANTHROPIC
+        self.provider_tier = provider_tier
+
+
+def test_default_provider_is_anthropic_unless_switched(monkeypatch):
+    """Ohne Schalter aendert sich nichts — der Bau ist auf jeder Bridge inert,
+    die ihn nicht ausdruecklich einschaltet."""
+    from src.routing.vision_router import (
+        VISION_TARGET_ANTHROPIC, default_vision_target, resolve_vision_target,
+    )
+
+    monkeypatch.delenv("BRIDGE_VISION_DEFAULT_PROVIDER", raising=False)
+    assert default_vision_target() == VISION_TARGET_ANTHROPIC
+    assert resolve_vision_target(None) == VISION_TARGET_ANTHROPIC
+    assert resolve_vision_target(_Cfg()) == VISION_TARGET_ANTHROPIC
+
+
+def test_switch_makes_gemini_the_default_without_any_app_change(monkeypatch):
+    """Der Sinn des Schalters: der Anbieterwechsel ist eine Eigenschaft des
+    Deployments, nicht eine Aenderung an vier Aufrufstellen je App."""
+    from src.routing.vision_router import VISION_TARGET_GEMINI, resolve_vision_target
+
+    monkeypatch.setenv("BRIDGE_VISION_DEFAULT_PROVIDER", "gemini")
+    assert resolve_vision_target(None) == VISION_TARGET_GEMINI
+    assert resolve_vision_target(_Cfg()) == VISION_TARGET_GEMINI
+
+
+def test_switch_never_overrides_a_bedrock_pin(monkeypatch):
+    """Die wichtigste Nicht-Wirkung: ein Bedrock-Pin traegt die vertragliche
+    EU-Datenresidenz eines echten Kunden. Ein Bridge-weiter Standard darf ihn
+    unter keinen Umstaenden nach Google umbiegen."""
+    from src.models import BackendType
+    from src.routing.vision_router import VISION_TARGET_ANTHROPIC, resolve_vision_target
+
+    monkeypatch.setenv("BRIDGE_VISION_DEFAULT_PROVIDER", "gemini")
+    assert resolve_vision_target(_Cfg(backend=BackendType.BEDROCK)) == VISION_TARGET_ANTHROPIC
+
+
+def test_switch_never_overrides_an_explicitly_chosen_tier(monkeypatch):
+    """Wer ausdruecklich einen anderen Tier gewaehlt hat (z.B.
+    claude-direct-notools), bekommt ihn — der Standard fuellt nur eine Luecke."""
+    from src.routing.vision_router import VISION_TARGET_ANTHROPIC, resolve_vision_target
+
+    monkeypatch.setenv("BRIDGE_VISION_DEFAULT_PROVIDER", "gemini")
+    assert resolve_vision_target(
+        _Cfg(provider_tier="claude-direct-notools")
+    ) == VISION_TARGET_ANTHROPIC
+
+
+def test_typo_in_the_switch_fails_loud(monkeypatch):
+    """Ein Tippfehler darf nicht monatelang so aussehen, als liefe alles ueber
+    Gemini."""
+    from src.routing.vision_router import default_vision_target
+
+    monkeypatch.setenv("BRIDGE_VISION_DEFAULT_PROVIDER", "gemeni")
+    with pytest.raises(ValueError):
+        default_vision_target()
+
+
+def test_gate_still_blocks_production_even_when_gemini_is_the_default(monkeypatch):
+    """Der Schalter ist eine Standardwahl, KEINE Erlaubnis. Auf prod bleibt der
+    Weg zu — dort liegt ohnehin kein Key, aber auch mit Key waere Schluss."""
+    monkeypatch.setenv("BRIDGE_VISION_DEFAULT_PROVIDER", "gemini")
+    monkeypatch.setenv("BRIDGE_GEMINI_VISION_ENABLED", "true")
+    monkeypatch.setenv("GEMINI_VISION_API_KEY", "test-key")
+    with pytest.raises(gate.GeminiVisionRefused):
+        gate.assert_gemini_vision_allowed(app_env="prod", has_images=True)
