@@ -84,9 +84,19 @@ def _reconstruct_abstract(inv: Optional[Dict[str, List[int]]]) -> str:
 
 
 def _openalex(query: str, n: int) -> List[Dict[str, Any]]:
-    r = _get("https://api.openalex.org/works",
-             params={"search": query, "per-page": n, "mailto": MAILTO,
-                     "select": "title,publication_year,doi,open_access,abstract_inverted_index"})
+    # OpenAlex ist seit 2026 budgetiert (search = 1 USD je 1.000 Calls). OHNE Schluessel gibt es
+    # 0,10 USD/Tag = 100 Calls; ein Recherche-Lauf verbraucht 8-14 davon, das Kontingent ist also
+    # nach rund zehn Laeufen leer. Ein KOSTENLOSER Account-Key verzehnfacht es auf 1 USD/Tag und
+    # schaltet zusaetzlich das Volltext-Archiv frei. Der Key darf als Query-Parameter oder als
+    # Bearer-Header mitgehen; wir nehmen den Parameter, weil `_get` die Header fuer den
+    # User-Agent belegt. Fehlt er, laeuft alles unveraendert weiter — nur eben auf dem
+    # Zehntel-Budget, und der 429-Zweig unten macht das sichtbar.
+    params = {"search": query, "per-page": n, "mailto": MAILTO,
+              "select": "title,publication_year,doi,open_access,abstract_inverted_index"}
+    oa_key = os.getenv("OPENALEX_API_KEY")
+    if oa_key:
+        params["api_key"] = oa_key
+    r = _get("https://api.openalex.org/works", params=params)
     if r.status_code != 200:
         # War bisher stumm — und verdeckte damit den Budget-Ausfall: OpenAlex ist seit 2026
         # kostenpflichtig (search = 1 USD je 1.000 Calls) und antwortet bei erschoepftem
