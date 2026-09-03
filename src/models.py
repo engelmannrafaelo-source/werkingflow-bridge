@@ -24,6 +24,10 @@ class BackendType(str, Enum):
                                            # no CLI subprocess/tool support) — fallback-only tier for
                                            # requests that already run with enable_tools=false, see
                                            # src/providers/anthropic_direct.py
+    GEMINI_API = "gemini_api"          # Google Gemini generateContent per API key, MIT Bildeingabe
+                                       # (GEMINI_VISION_API_KEY). Testweg fuer synthetische Plaene,
+                                       # gesperrt durch src/routing/gemini_vision_gate.py — nicht zu
+                                       # verwechseln mit GEMINI_CLI (OAuth-Subprozess, ohne Bild).
 
 
 class PrivacyMode(str, Enum):

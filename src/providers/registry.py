@@ -59,6 +59,26 @@ class ProviderConfig:
 _DEFAULT_SONNET = get_default_model("sonnet").id
 
 
+def _gemini_vision_model_for_display() -> str:
+    """Modellname fuer den Registry-Eintrag des Gemini-Bildwegs.
+
+    Nur Anzeige/Preis-Metadaten: der tatsaechlich gesendete Name wird bei JEDEM
+    Aufruf frisch aus der Env gelesen (gemini_vision.resolve_gemini_vision_model),
+    damit eine Modellumstellung ohne Rebuild wirkt. Hier faellt ein ungueltiger
+    Env-Wert bewusst NICHT hart aus — der Registry-Import darf keinen Worker am
+    Booten hindern; der Aufruf selbst weist ihn dann laut ab.
+    """
+    from src.providers.gemini_vision import (
+        DEFAULT_GEMINI_VISION_MODEL,
+        GeminiVisionError,
+        resolve_gemini_vision_model,
+    )
+    try:
+        return resolve_gemini_vision_model()
+    except GeminiVisionError:
+        return DEFAULT_GEMINI_VISION_MODEL
+
+
 def _tier_pricing(model: str) -> dict:
     """Tier list-price for display, derived from the pricing SSoT (pricing.py) —
     no price numbers duplicated here. Strips OpenRouter's 'anthropic/' routing
@@ -130,6 +150,38 @@ PROVIDERS: dict[str, ProviderConfig] = {
     ),
 
     # =========================================================================
+    # Google Gemini — API-Key MIT Bildeingabe (TESTWEG, synthetische Plaene)
+    #
+    # NICHT verwechseln mit 'gemini-flash' darueber: das ist der CLI-Subprozess
+    # per OAuth und kann KEINE Bilder. Dieser Tier ist der Bildweg fuer die
+    # Kostenmessung der Energy-Plananalyse (Rafael, 2026-09-03).
+    #
+    # Erreichbar NUR im Testmodus: src/routing/gemini_vision_gate.py verlangt
+    # Master-Flag + Key + positiv erkanntes Nicht-Prod + ausdrueckliche
+    # Testmodus-Erklaerung des Aufrufers. Ohne all das wird der Aufruf laut
+    # abgewiesen — nie still auf Anthropic umgeleitet. Grund: Google ist kein
+    # gelisteter Unterauftragsverarbeiter (avv.md §5.4), echte Kundenplaene
+    # duerfen dort nicht landen.
+    #
+    # Das konkrete Modell kommt aus GEMINI_VISION_MODEL (Default 2.5 Flash-Lite,
+    # das guenstigste der Familie) — ein Modellwechsel ist Konfiguration.
+    # =========================================================================
+    "gemini-vision-test": ProviderConfig(
+        tier_id="gemini-vision-test",
+        name="Gemini Flash-Lite Vision (Testweg, synthetische Plaene)",
+        backend=BackendType.GEMINI_API,
+        model=_gemini_vision_model_for_display(),
+        api_key_env="GEMINI_VISION_API_KEY",
+        dsgvo_compliant=False,
+        supports_tools=False,
+        description=(
+            "Guenstige Bildanalyse ueber Google Gemini Flash-Lite. NUR Testmodus "
+            "mit synthetischen Plaenen, nicht fuer Kundendaten — Google ist kein "
+            "gelisteter Unterauftragsverarbeiter."
+        ),
+    ),
+
+    # =========================================================================
     # OpenRouter — LLM Gateway (Fallback wenn Anthropic down)
     # 1 Key, 400+ Modelle, 5.5% Credit-Kauf-Fee, Provider-Preise 1:1
     # =========================================================================
@@ -169,8 +221,10 @@ def is_tier_usable(tier_id: str) -> bool:
     """Check if a provider tier is usable (all required config present).
 
     For OPENAI_COMPATIBLE tiers, requires both base_url and api_key to be set.
-    For ANTHROPIC_DIRECT, requires the api_key to be set (no base_url — fixed
-    Anthropic Messages API endpoint, see src/providers/anthropic_direct.py).
+    For ANTHROPIC_DIRECT and GEMINI_API, requires the api_key to be set (no
+    base_url — fixed provider endpoint, see src/providers/anthropic_direct.py
+    bzw. src/providers/gemini_vision.py). Fuer GEMINI_API ist "kein Key" auf
+    Produktions-Workern der ERWUENSCHTE Zustand, nicht ein Konfigurationsfehler.
     Returns False (and logs a warning) if the tier is not usable — no crash.
     """
     config = PROVIDERS.get(tier_id)
@@ -183,7 +237,7 @@ def is_tier_usable(tier_id: str) -> bool:
         if config.api_key_env and not os.getenv(config.api_key_env):
             logger.warning(f"⚠️ Provider tier '{tier_id}' skipped: {config.api_key_env} not set")
             return False
-    if config.backend == BackendType.ANTHROPIC_DIRECT:
+    if config.backend in (BackendType.ANTHROPIC_DIRECT, BackendType.GEMINI_API):
         if config.api_key_env and not os.getenv(config.api_key_env):
             logger.warning(f"⚠️ Provider tier '{tier_id}' skipped: {config.api_key_env} not set")
             return False

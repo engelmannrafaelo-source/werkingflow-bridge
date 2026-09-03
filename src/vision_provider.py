@@ -104,7 +104,8 @@ class VisionProvider:
 
         return False
 
-    def _extract_images_from_content(self, content: Any) -> Tuple[List[Dict], str]:
+    @staticmethod
+    def _extract_images_from_content(content: Any) -> Tuple[List[Dict], str]:
         """
         Extract images and text from message content.
 
@@ -219,8 +220,8 @@ class VisionProvider:
         combined_text = "\n".join(text_parts).strip()
         return images, combined_text
 
+    @staticmethod
     def _convert_to_anthropic_messages(
-        self,
         messages: List[Dict[str, Any]]
     ) -> Tuple[List[Dict], Optional[str]]:
         """
@@ -250,7 +251,7 @@ class VisionProvider:
                 continue
 
             # Process user messages (may contain images)
-            images, text = self._extract_images_from_content(content)
+            images, text = VisionProvider._extract_images_from_content(content)
 
             if images:
                 # Build multimodal content array

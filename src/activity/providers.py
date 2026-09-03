@@ -39,8 +39,20 @@ labeling decisions, and bundling them into a compliance fix would hide them:
   - STT (openai / aws-sagemaker) is pay-per-use but books 0.00 EUR real cost.
   - ANTHROPIC_DIRECT (prepaid vision key) is real money on a prepaid key and
     also books 0.00 EUR.
-Both are now at least *visible* as their own provider values instead of being
-indistinguishable from subscription-covered pool traffic.
+  - GEMINI_API (der Bild-Testweg, 2026-09-03) ist ebenfalls echtes Geld auf
+    einem eigenen API-Key und bucht ebenfalls 0.00 EUR real_cost. Diese Luecke
+    wird hier BEWUSST nicht geschlossen: ``REAL_COST_PROVIDERS`` ist
+    provider-, nicht backend-koernig, und ``gemini`` traegt zugleich den
+    CLI-OAuth-Weg (Kontingent, keine Grenzkosten) — ein Eintrag hier wuerde
+    dessen Zeilen falsch als Echtgeld buchen. Der Testweg bleibt trotzdem
+    auffindbar: ``provider_metadata->>'api_key_lane' = 'vision_gemini_test'``,
+    und ``hypothetical_cost_eur`` traegt den echten Listenpreis (Preise in
+    src/pricing.py). Sauber loesen liesse sich das mit einer eigenen
+    Ledger-Vokabel + Migration am CHECK-Constraint aus 053 — eine
+    Abrechnungsentscheidung, keine Beschriftungsfrage, und deshalb hier nicht
+    mitentschieden.
+All three are at least *visible* as their own provider values / lanes instead
+of being indistinguishable from subscription-covered pool traffic.
 """
 from __future__ import annotations
 
@@ -55,7 +67,7 @@ PROVIDER_RESEARCH_CLOUD = "research-cloud"  # direct Anthropic API key (Weg C, s
 PROVIDER_OPENAI = "openai"                  # OpenAI (Whisper STT)
 PROVIDER_SAGEMAKER = "aws-sagemaker"        # self-hosted STT model on AWS SageMaker
 PROVIDER_OPENAI_COMPATIBLE = "openai-compatible"  # OpenRouter et al. (BackendType.OPENAI_COMPATIBLE)
-PROVIDER_GEMINI = "gemini"                  # Google Gemini CLI
+PROVIDER_GEMINI = "gemini"                  # Google Gemini (CLI-OAuth ODER API-Key-Bildweg)
 
 # --- Non-external: nothing was transmitted to a third party ----------------
 PROVIDER_LOCAL = "local"
@@ -106,6 +118,13 @@ _BACKEND_TO_PROVIDER = {
     BackendType.BEDROCK: PROVIDER_BEDROCK,
     BackendType.OPENAI_COMPATIBLE: PROVIDER_OPENAI_COMPATIBLE,
     BackendType.GEMINI_CLI: PROVIDER_GEMINI,
+    # Derselbe Empfaenger (Google), anderer Zugangsweg: GEMINI_API ist der
+    # API-Key-Pfad mit Bildeingabe. Fuer die Compliance-Frage, die diese Spalte
+    # beantwortet — WER hat die Daten physisch bekommen — sind beide identisch,
+    # deshalb bewusst derselbe Wert und keine neue Vokabel (die brauchte eine
+    # Migration am CHECK-Constraint aus 053 und liesse jede bestehende
+    # Datenschutz-Auswertung auf provider='gemini' still danebengreifen).
+    BackendType.GEMINI_API: PROVIDER_GEMINI,
 }
 
 

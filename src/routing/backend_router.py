@@ -167,6 +167,36 @@ def _resolve_provider_tier(
             provider_model=config.model,
         )
 
+    elif config.backend == BackendType.GEMINI_API:
+        # Tier maps to Google Gemini generateContent per API key, MIT Bildeingabe
+        # ('gemini-vision-test'). Der Key wird hier nur auf Anwesenheit geprueft;
+        # ob dieser Aufruf ueberhaupt an Google gehen DARF, entscheidet
+        # src/routing/gemini_vision_gate.py an der Vision-Weiche — die Frage
+        # braucht app_env und die Testmodus-Erklaerung, die es hier nicht gibt.
+        api_key = get_provider_api_key(config)
+        if not api_key:
+            raise RuntimeError(
+                f"Provider '{tier_id}' not configured: {config.api_key_env} env var missing"
+            )
+
+        logger.info(f"🔀 Provider tier: {tier_id} → {config.name} (model={config.model})")
+
+        return BackendConfig(
+            backend=BackendType.GEMINI_API,
+            region=None,
+            model_id=config.model,
+            bedrock_model_id=None,
+            # Presidio-Anonymisierung greift auf Bildern ohnehin nicht — und der
+            # Weg ist auf synthetische Plaene beschraenkt, in denen es nichts zu
+            # anonymisieren gibt. Bewusst aus, damit hier keine Wirksamkeit
+            # behauptet wird, die es nicht gibt.
+            privacy_enabled=False,
+            env_vars={},
+            provider_tier=tier_id,
+            provider_api_key=api_key,
+            provider_model=config.model,
+        )
+
     elif config.backend == BackendType.BEDROCK:
         # Tier maps to Bedrock (e.g. 'claude-dsgvo')
         return resolve_backend_config(
