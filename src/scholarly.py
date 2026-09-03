@@ -40,6 +40,13 @@ _CORE_HTTP_TIMEOUT = 30
 _MAX_ENTRIES = 12          # so viele Quellen maximal in den Kontext-Block
 _EXCERPT_CHARS = 1600      # Zeichen je Quelle (CORE-Volltext gekürzt)
 
+# CORE liefert das Feld `fullText` AUCH ohne Lizenz — gefüllt, aber wertlos: es enthält dann
+# woertlich diesen Satz. Gemessen 03.09.2026 an 100 von 100 keyless-Treffern (Median-Textlaenge
+# 35 Zeichen). Wer nur `if ft:` prueft, stempelt den Platzhalter als Volltext, meldet
+# "12 Quellen, davon 12 Volltext" und schiebt 12 nutzlose Schnipsel in den Prompt — ein still
+# gefaelschter Erfolg, der schlimmer ist als der sichtbare Ausfall.
+_CORE_NO_LICENCE_SENTINEL = "Not available for public API users."
+
 _PLANNER_SYS = (
     "Du bist ein Recherche-Query-Planner für die wissenschaftliche Literatur-API OpenAlex. "
     "Aus einem Energie-Ingenieur-Research-Prompt erzeugst du kurze SUCHBEGRIFFE (Keyword-Phrasen, "
@@ -81,6 +88,14 @@ def _openalex(query: str, n: int) -> List[Dict[str, Any]]:
              params={"search": query, "per-page": n, "mailto": MAILTO,
                      "select": "title,publication_year,doi,open_access,abstract_inverted_index"})
     if r.status_code != 200:
+        # War bisher stumm — und verdeckte damit den Budget-Ausfall: OpenAlex ist seit 2026
+        # kostenpflichtig (search = 1 USD je 1.000 Calls) und antwortet bei erschoepftem
+        # Tagesguthaben 429 mit "Insufficient budget". Ohne diese Zeile sieht der Betrieb nur
+        # leere Ergebnisse. 429 ist deshalb ein Betriebszustand, kein Zufall.
+        logger.warning(
+            f"research-cloud: OpenAlex antwortet {r.status_code} — Abstract-Schicht liefert nichts "
+            f"({(r.text or '')[:160]})"
+        )
         return []
     out = []
     for w in r.json().get("results", []):
@@ -111,10 +126,22 @@ def _core(query: str, n: int) -> List[Dict[str, Any]]:
                 # Keyless-Rate-Limit: Schicht degradiert STILL auf OpenAlex-Abstracts —
                 # unter Last sichtbar machen (CORE_API_KEY hebt das Limit).
                 logger.warning("research-cloud: CORE rate-limited (429, keyless) — Volltext-Anteil degradiert auf Abstracts")
+            else:
+                # JEDER andere Fehler war bisher komplett stumm. Genau daran ist der Ausfall vom
+                # August/September 2026 wochenlang unbemerkt geblieben: die abgelaufene Trial-Lizenz
+                # antwortete 401, `_core` gab still [] zurueck, und niemand sah es.
+                logger.warning(
+                    f"research-cloud: CORE antwortet {r.status_code} — Volltext-Schicht liefert nichts "
+                    f"({(r.text or '')[:160]})"
+                )
             return []
         out = []
+        placeholders = 0
         for w in r.json().get("results", []):
             ft = w.get("fullText") or ""
+            if ft.strip() == _CORE_NO_LICENCE_SENTINEL:
+                ft = ""          # Platzhalter ist KEIN Volltext
+                placeholders += 1
             out.append({
                 "title": (w.get("title") or "")[:200],
                 "year": w.get("yearPublished"),
@@ -124,6 +151,13 @@ def _core(query: str, n: int) -> List[Dict[str, Any]]:
                 "kind": "fulltext" if ft else "meta",
                 "source": "CORE",
             })
+        if placeholders:
+            # Sichtbar machen, dass CORE unlizenziert laeuft — sonst sieht der Betrieb nur
+            # "weniger Volltext" und sucht die Ursache an der falschen Stelle.
+            logger.warning(
+                f"research-cloud: CORE ohne gueltige Lizenz — {placeholders}/{len(out)} Treffer "
+                f"lieferten statt Volltext nur den Platzhalter; Volltext-Schicht ist wirkungslos"
+            )
         return out
     except (requests.RequestException, ValueError) as e:
         # Ebene beachten: _core() laeuft EINMAL PRO GEPLANTER SUCHQUERY (8-14 parallel je Lauf).
