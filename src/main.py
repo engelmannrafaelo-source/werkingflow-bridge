@@ -1368,6 +1368,7 @@ async def generate_streaming_response(
                     thinking=request.thinking,
                     output_config=request.output_config,
                     target=_vision_target,
+                    gemini_thinking_budget=request.gemini_thinking_budget,
                 )
 
                 # Stream vision response as SSE chunks.
@@ -1433,6 +1434,7 @@ async def generate_streaming_response(
                             "endpoint": "vision",
                             "api_key_lane": vision_result.api_key_lane,
                             "image_count": _vision_images,
+                            **vision_result.extra_meta,
                         },
                     )
                 except Exception as _vision_track_err:
@@ -2926,6 +2928,27 @@ async def chat_completions(
                 }},
             )
 
+        # gemini_thinking_budget ist Gemini-EIGENE Semantik. Auf einem anderen
+        # Weg taete es nichts — und ein Feld, das je nach Backend still
+        # wirkungslos ist, ist schlimmer als kein Feld: der Aufrufer glaubt, er
+        # habe das Denken gesteuert, und misst dann etwas anderes als gedacht.
+        if request_body.gemini_thinking_budget is not None and _vision_target != VISION_TARGET_GEMINI:
+            return JSONResponse(
+                status_code=400,
+                content={"error": {
+                    "message": (
+                        "gemini_thinking_budget gilt nur fuer den Gemini-Bildweg. "
+                        "Entweder provider_tier='gemini-vision' setzen (bzw. eine "
+                        "Bridge mit BRIDGE_VISION_DEFAULT_PROVIDER=gemini "
+                        "verwenden), oder das Feld weglassen — es wird NICHT "
+                        "stillschweigend ignoriert."
+                    ),
+                    "type": "invalid_request_error",
+                    "param": "gemini_thinking_budget",
+                    "code": "gemini_thinking_budget_not_applicable",
+                }},
+            )
+
         if backend_config and backend_config.backend == BackendType.GEMINI_API:
             if not has_vision_content(prepare_messages_for_vision(request_body.messages)):
                 return JSONResponse(
@@ -3033,6 +3056,7 @@ async def chat_completions(
                         thinking=request_body.thinking,
                         output_config=request_body.output_config,
                         target=_vision_target,
+                        gemini_thinking_budget=request_body.gemini_thinking_budget,
                     )
 
                 if vision_result:
@@ -3121,6 +3145,12 @@ async def chat_completions(
                                 "image_count": image_count,
                                 "stop_reason": vision_result.stop_reason,
                                 "empty_response": not vision_result.content,
+                                # Was der Anbieter ueber SEINEN Aufruf zu sagen
+                                # hat (Gemini: gesetztes Denk-Budget + echte
+                                # Denk-Tokens). E3 liest die Einstellung aus dem
+                                # Ledger statt aus der Anfrage — die Anfrage sagt
+                                # nur, was gewollt war, nicht was passiert ist.
+                                **vision_result.extra_meta,
                             },
                         )
                     except Exception as _vision_track_err:

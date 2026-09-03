@@ -8,7 +8,7 @@ between streaming and non-streaming endpoints.
 import logging
 import os
 from typing import Optional, List, Dict, Any
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from src.activity.providers import PROVIDER_ANTHROPIC, PROVIDER_GEMINI
 from src.vision_provider import VisionProvider, get_vision_provider
@@ -22,7 +22,7 @@ logger = logging.getLogger(__name__)
 # zaehlte er gegen ein Guthaben, das er gar nicht belastet — und die Kappe waere
 # ab dem ersten Gemini-Aufruf falsch.
 LANE_ANTHROPIC_PREPAID = "vision_prepaid"
-LANE_GEMINI_TEST = "vision_gemini"
+LANE_GEMINI = "vision_gemini"
 
 
 # Ziele der Vision-Weiche. Kein Enum, weil die Werte roh in Log- und
@@ -49,6 +49,10 @@ class VisionResult:
     # die src/activity/providers.py beseitigt hat.
     ledger_provider: str
     api_key_lane: str
+    #: Zusaetzliche, anbieterspezifische Felder fuers Ledger. Ein generisches
+    #: Feld statt N benannter: was ein Anbieter ueber seinen Aufruf zu sagen hat,
+    #: unterscheidet sich, und der Router soll das nicht vorher wissen muessen.
+    extra_meta: Dict[str, Any] = field(default_factory=dict)
 
 
 def default_vision_target() -> str:
@@ -148,6 +152,7 @@ async def route_to_vision(
     thinking: Optional[Dict[str, Any]] = None,
     output_config: Optional[Dict[str, Any]] = None,
     target: str = VISION_TARGET_ANTHROPIC,
+    gemini_thinking_budget: Optional[int] = None,
 ) -> VisionResult:
     """
     Route request to Vision API
@@ -189,6 +194,7 @@ async def route_to_vision(
             max_tokens=max_tokens,
             temperature=temperature,
             timeout=timeout,
+            thinking_budget=gemini_thinking_budget,
         )
         return VisionResult(
             content=gemini_response.content,
@@ -196,7 +202,11 @@ async def route_to_vision(
             usage=gemini_response.usage,
             stop_reason=gemini_response.stop_reason,
             ledger_provider=PROVIDER_GEMINI,
-            api_key_lane=LANE_GEMINI_TEST,
+            api_key_lane=LANE_GEMINI,
+            extra_meta={
+                "thinking_budget": gemini_response.thinking_budget_applied,
+                "thoughts_tokens": gemini_response.thoughts_tokens,
+            },
         )
 
     logger.info("🖼️ Routing to Vision API (direct Anthropic)")
@@ -233,6 +243,7 @@ async def check_and_route_vision(
     thinking: Optional[Dict[str, Any]] = None,
     output_config: Optional[Dict[str, Any]] = None,
     target: str = VISION_TARGET_ANTHROPIC,
+    gemini_thinking_budget: Optional[int] = None,
 ) -> Optional[VisionResult]:
     """
     Check if messages need vision routing, and route if needed
@@ -271,4 +282,5 @@ async def check_and_route_vision(
         thinking=thinking,
         output_config=output_config,
         target=target,
+        gemini_thinking_budget=gemini_thinking_budget,
     )

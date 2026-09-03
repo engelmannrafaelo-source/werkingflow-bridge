@@ -161,6 +161,31 @@ class ChatCompletionRequest(BaseModel):
         description="Provider tier for multi-provider routing (e.g. 'claude-premium', 'dsgvo-deutschland', 'eu-standard'). Overrides backend selection."
     )
 
+    # Gemini-EIGENE Denk-Einstellung (2026-09-03). Bewusst KEINE Uebersetzung
+    # von Anthropics `thinking`/`output_config` — die bleiben auf dem
+    # Gemini-Weg abgewiesen, weil eine Abbildung geraten waere. Dies hier ist
+    # Geminis eigenes `thinkingConfig.thinkingBudget`, unter seinem eigenen
+    # Namen durchgereicht.
+    #
+    # Warum pro Request und nicht nur als Deployment-Env: E3 misst "mit Denken"
+    # gegen "ohne Denken". Als reine Env-Einstellung braeuchte das zwei Laeufe
+    # mit Umstellung dazwischen — verschiedene Bridge-Last, verschiedener
+    # Kontostand, verschiedene Bilder. Das waere kein Vergleich, sondern zwei
+    # Messungen. Pro Request laufen alle Varianten im selben Fenster.
+    #
+    # 0 = Denken aus, positive Zahl = Obergrenze, None = Env-Default bzw.
+    # Googles Verhalten. NUR zusammen mit dem Gemini-Bildweg zulaessig; sonst
+    # 400 (siehe main.py) — ein Feld, das je nach Backend still nichts tut,
+    # ist schlimmer als kein Feld.
+    gemini_thinking_budget: Optional[int] = Field(
+        default=None, ge=0,
+        description=(
+            "Gemini thinkingConfig.thinkingBudget: 0 disables thinking, a positive "
+            "value caps it, omitted uses the Bridge/Google default. Only valid "
+            "together with the Gemini vision path — rejected with 400 otherwise."
+        ),
+    )
+
     # Extended-thinking passthrough (2026-07-24). Forwarded VERBATIM to the raw
     # Anthropic-Messages-API-format backends only: Bedrock (bedrock_service.py)
     # and the direct-Anthropic fallback/vision path (vision_provider.py via

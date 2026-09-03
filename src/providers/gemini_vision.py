@@ -128,6 +128,13 @@ class GeminiVisionResponse:
     model: str
     usage: Dict[str, int]
     stop_reason: str
+    #: Was tatsaechlich gesendet wurde (None = Googles Default), und wie viele
+    #: Denk-Tokens es gekostet hat. Beides gehoert ins Ledger: E3 liest die
+    #: Einstellung aus der ANTWORT, nicht aus der Anfrage — dieselbe Regel wie
+    #: beim Modell, und aus demselben Grund (die Anfrage sagt nur, was gewollt
+    #: war, nicht was passiert ist).
+    thinking_budget_applied: Optional[int] = None
+    thoughts_tokens: int = 0
 
 
 class GeminiVisionError(RuntimeError):
@@ -342,6 +349,7 @@ class GeminiVisionProvider:
         temperature: Optional[float] = None,
         system_prompt: Optional[str] = None,
         timeout: float = 300.0,
+        thinking_budget: Optional[int] = None,
     ) -> GeminiVisionResponse:
         """Bildanalyse ueber Gemini.
 
@@ -398,13 +406,19 @@ class GeminiVisionProvider:
             generation_config["temperature"] = temperature
         if max_tokens is not None:
             generation_config["maxOutputTokens"] = max_tokens
-        thinking_budget = gemini_vision_thinking_budget()
-        if thinking_budget is not None:
+        # Pro-Request-Wert schlaegt die Deployment-Einstellung. Umgekehrt waere
+        # es eine stille Bevormundung: der Aufrufer hat ausdruecklich etwas
+        # verlangt, und eine Env-Zeile soll das nicht ueberstimmen.
+        effective_budget = (
+            thinking_budget if thinking_budget is not None
+            else gemini_vision_thinking_budget()
+        )
+        if effective_budget is not None:
             # Gemini-EIGENE Einstellung, ausdruecklich konfiguriert — NICHT die
             # uebersetzte Anthropic-Semantik von `thinking`/`output_config`, die
             # dieser Weg weiterhin laut abweist. Der Unterschied ist der Punkt:
             # eine Uebersetzung waere geraten, das hier ist eingestellt.
-            generation_config["thinkingConfig"] = {"thinkingBudget": thinking_budget}
+            generation_config["thinkingConfig"] = {"thinkingBudget": effective_budget}
         if generation_config:
             body["generationConfig"] = generation_config
 
@@ -489,6 +503,8 @@ class GeminiVisionProvider:
             model=resolved_model,
             usage=usage,
             stop_reason=stop_reason,
+            thinking_budget_applied=effective_budget,
+            thoughts_tokens=int((data.get("usageMetadata") or {}).get("thoughtsTokenCount") or 0),
         )
 
 
