@@ -21,8 +21,9 @@ Endpunkt antwortet", nicht "der Weg traegt echte Arbeit". Genau diese
 Verwechslung hat am 2026-09-03 an anderer Stelle eine Minimal-Probe gruen
 melden lassen, waehrend echte Last in ein Kontingent-402 lief. Deshalb erzeugt
 dieses Skript ein planaehnliches Bild in realistischer Groesse (1600x1100) und
-prueft die Token-Zahl gegen eine Untergrenze: wer nur 258 Input-Tokens sieht,
-hat ein Icon geschickt, keinen Plan.
+prueft die Token-Zahl gegen eine Untergrenze (siehe MIN_PROMPT_TOKENS: der Wert
+ist gemessen, nicht geschaetzt — der erste Schaetzwert war zu hoch und haette
+einen gesunden Aufruf rot gemeldet).
 
 Das Bild ist synthetisch (hier erzeugt, keine Kundendaten) — passend, weil
 diese Probe auch auf einer frisch aufgesetzten Umgebung laufen koennen soll.
@@ -46,11 +47,17 @@ import sys
 import urllib.error
 import urllib.request
 
-# Untergrenze fuer die Input-Tokens. Ein einzelnes 768x768-Kachelbild kostet
-# 258 Tokens; ein Plan in der Groesse, die dieses Skript schickt, muss deutlich
-# darueber liegen. Der Wert prueft "es wurde ein echtes Bild verarbeitet", nicht
-# eine exakte Kachelrechnung — die ist Googles Sache und darf sich aendern.
-MIN_PROMPT_TOKENS = 400
+# Untergrenze fuer die Input-Tokens: unterscheidet "ein Bild wurde verarbeitet"
+# von "es kam nur Text an".
+#
+# GEMESSEN, nicht gerechnet (2026-09-03, gemini-2.5-flash, das Bild unten):
+# 291 prompt tokens fuer 1600x1100 — Google skaliert das Bild herunter und
+# berechnet es als EINE 258-Token-Kachel, plus ~33 Tokens Text. Die urspruengliche
+# Annahme "grosses Bild = viele Kacheln = deutlich mehr Tokens" war falsch und
+# haette diese Pruefung bei einem voellig gesunden Aufruf rot gemeldet.
+# Deshalb liegt die Schwelle knapp unter der Ein-Kachel-Kosten: ein Aufruf ohne
+# Bild landet bei ~30 Tokens, der Abstand ist gross genug.
+MIN_PROMPT_TOKENS = 200
 
 
 def build_planlike_png() -> bytes:
