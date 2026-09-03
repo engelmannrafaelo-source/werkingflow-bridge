@@ -51,8 +51,13 @@ _PLANNER_SYS = (
     "Du bist ein Recherche-Query-Planner für die wissenschaftliche Literatur-API OpenAlex. "
     "Aus einem Energie-Ingenieur-Research-Prompt erzeugst du kurze SUCHBEGRIFFE (Keyword-Phrasen, "
     "keine Fragen/Sätze). Regeln: (a) mische ENGLISCH (internationale Journals) und DEUTSCH "
-    "(Dissertationen/Forschungsberichte, wo ÖNORM/VDI/OIB zitiert werden); (b) für jede im Prompt "
-    "genannte Norm eine eigene norm-verankerte Query; (c) für jedes technische Thema eine Konzept-Query. "
+    "(Dissertationen/Forschungsberichte, wo ÖNORM/VDI/OIB zitiert werden); "
+    "(b) NATIONALE Regelwerke (ÖNORM, TRVB, OIB-Richtlinie, DIN) sind KEINE Fachliteratur und in "
+    "OpenAlex/CORE nicht indexiert — suche NIEMALS nach ihrer Bezeichnung. Frage stattdessen nach "
+    "der PHYSIKALISCHEN GRÖSSE oder dem technischen Verfahren, das die Norm regelt, und ergänze die "
+    "internationale EN/ISO-Entsprechung, falls es eine gibt. Beispiel: statt \'TRVB 112 "
+    "Druckbelüftungsanlage\' → \'stairwell pressurization differential pressure door opening force\'; "
+    "(c) für jedes technische Thema eine Konzept-Query. "
     "Antworte AUSSCHLIESSLICH als JSON-Array von Strings (8-14 Queries), nichts sonst."
 )
 
