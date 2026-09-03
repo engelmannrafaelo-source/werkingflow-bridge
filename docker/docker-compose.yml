@@ -181,6 +181,12 @@ services:
       - GEMINI_VISION_API_KEY=${GEMINI_VISION_API_KEY:-}
       - BRIDGE_GEMINI_VISION_ENABLED=${BRIDGE_GEMINI_VISION_ENABLED:-false}
       - GEMINI_VISION_MODEL=${GEMINI_VISION_MODEL:-}
+      # Denk-Budget — der groesste Kostenhebel dieses Wegs. Gemessen am
+      # selben Bild: Flash mit Denken 3,1x guenstiger als Sonnet, OHNE
+      # Denken 23x. Leer = Googles Default, 0 = aus, Zahl = Obergrenze.
+      # Bewusst leer voreingestellt: Denken abzuschalten ist eine
+      # Qualitaetsentscheidung, die E3s Vergleichslauf beantwortet.
+      - GEMINI_VISION_THINKING_BUDGET=${GEMINI_VISION_THINKING_BUDGET:-}
       - BRIDGE_VISION_DEFAULT_PROVIDER=${BRIDGE_VISION_DEFAULT_PROVIDER:-}
       # research-cloud (Weg C): executor-only key alias + feature flag.
       # NEVER add plain ANTHROPIC_API_KEY here — claude_cli.py fatals on it
@@ -362,6 +368,12 @@ services:
       - GEMINI_VISION_API_KEY=${GEMINI_VISION_API_KEY:-}
       - BRIDGE_GEMINI_VISION_ENABLED=${BRIDGE_GEMINI_VISION_ENABLED:-false}
       - GEMINI_VISION_MODEL=${GEMINI_VISION_MODEL:-}
+      # Denk-Budget — der groesste Kostenhebel dieses Wegs. Gemessen am
+      # selben Bild: Flash mit Denken 3,1x guenstiger als Sonnet, OHNE
+      # Denken 23x. Leer = Googles Default, 0 = aus, Zahl = Obergrenze.
+      # Bewusst leer voreingestellt: Denken abzuschalten ist eine
+      # Qualitaetsentscheidung, die E3s Vergleichslauf beantwortet.
+      - GEMINI_VISION_THINKING_BUDGET=${GEMINI_VISION_THINKING_BUDGET:-}
       - BRIDGE_VISION_DEFAULT_PROVIDER=${BRIDGE_VISION_DEFAULT_PROVIDER:-}
       # research-cloud (Weg C): executor-only key alias + feature flag.
       # NEVER add plain ANTHROPIC_API_KEY here — claude_cli.py fatals on it
@@ -543,6 +555,12 @@ services:
       - GEMINI_VISION_API_KEY=${GEMINI_VISION_API_KEY:-}
       - BRIDGE_GEMINI_VISION_ENABLED=${BRIDGE_GEMINI_VISION_ENABLED:-false}
       - GEMINI_VISION_MODEL=${GEMINI_VISION_MODEL:-}
+      # Denk-Budget — der groesste Kostenhebel dieses Wegs. Gemessen am
+      # selben Bild: Flash mit Denken 3,1x guenstiger als Sonnet, OHNE
+      # Denken 23x. Leer = Googles Default, 0 = aus, Zahl = Obergrenze.
+      # Bewusst leer voreingestellt: Denken abzuschalten ist eine
+      # Qualitaetsentscheidung, die E3s Vergleichslauf beantwortet.
+      - GEMINI_VISION_THINKING_BUDGET=${GEMINI_VISION_THINKING_BUDGET:-}
       - BRIDGE_VISION_DEFAULT_PROVIDER=${BRIDGE_VISION_DEFAULT_PROVIDER:-}
       # research-cloud (Weg C): executor-only key alias + feature flag.
       # NEVER add plain ANTHROPIC_API_KEY here — claude_cli.py fatals on it
@@ -724,6 +742,12 @@ services:
       - GEMINI_VISION_API_KEY=${GEMINI_VISION_API_KEY:-}
       - BRIDGE_GEMINI_VISION_ENABLED=${BRIDGE_GEMINI_VISION_ENABLED:-false}
       - GEMINI_VISION_MODEL=${GEMINI_VISION_MODEL:-}
+      # Denk-Budget — der groesste Kostenhebel dieses Wegs. Gemessen am
+      # selben Bild: Flash mit Denken 3,1x guenstiger als Sonnet, OHNE
+      # Denken 23x. Leer = Googles Default, 0 = aus, Zahl = Obergrenze.
+      # Bewusst leer voreingestellt: Denken abzuschalten ist eine
+      # Qualitaetsentscheidung, die E3s Vergleichslauf beantwortet.
+      - GEMINI_VISION_THINKING_BUDGET=${GEMINI_VISION_THINKING_BUDGET:-}
       - BRIDGE_VISION_DEFAULT_PROVIDER=${BRIDGE_VISION_DEFAULT_PROVIDER:-}
       # research-cloud (Weg C): executor-only key alias + feature flag.
       # NEVER add plain ANTHROPIC_API_KEY here — claude_cli.py fatals on it

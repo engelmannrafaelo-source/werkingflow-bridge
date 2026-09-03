@@ -525,3 +525,51 @@ def test_gate_still_blocks_production_even_when_gemini_is_the_default(monkeypatc
     monkeypatch.setenv("GEMINI_VISION_API_KEY", "test-key")
     with pytest.raises(gate.GeminiVisionRefused):
         gate.assert_gemini_vision_allowed(app_env="prod", has_images=True)
+
+
+# ── Denk-Budget: der groesste Kostenhebel des Wegs ──────────────────────────
+# Gemessen 2026-09-03 am selben Bild: Flash mit Denken 3,1x guenstiger als
+# Sonnet, ohne Denken 23x. Der Unterschied steckt allein in diesem Schalter.
+
+def test_thinking_budget_defaults_to_googles_behaviour(monkeypatch):
+    monkeypatch.delenv("GEMINI_VISION_THINKING_BUDGET", raising=False)
+    assert gv.gemini_vision_thinking_budget() is None
+
+
+@pytest.mark.parametrize("raw,expected", [("0", 0), ("512", 512)])
+def test_thinking_budget_is_read_from_env(monkeypatch, raw, expected):
+    monkeypatch.setenv("GEMINI_VISION_THINKING_BUDGET", raw)
+    assert gv.gemini_vision_thinking_budget() == expected
+
+
+@pytest.mark.parametrize("raw", ["aus", "-1", "1.5"])
+def test_broken_thinking_budget_fails_loud(monkeypatch, raw):
+    """Ein Tippfehler darf nicht still zu Googles Default werden — sonst denkt
+    das Modell weiter und niemand versteht, warum die Rechnung nicht faellt."""
+    monkeypatch.setenv("GEMINI_VISION_THINKING_BUDGET", raw)
+    with pytest.raises(gv.GeminiVisionError):
+        gv.gemini_vision_thinking_budget()
+
+
+@pytest.mark.asyncio
+async def test_thinking_config_is_only_sent_when_configured(monkeypatch):
+    monkeypatch.setenv("GEMINI_VISION_API_KEY", "test-key")
+    monkeypatch.setattr(gv.httpx, "AsyncClient", _FakeClient)
+
+    monkeypatch.delenv("GEMINI_VISION_THINKING_BUDGET", raising=False)
+    await gv.GeminiVisionProvider().analyze(messages=_image_messages())
+    assert "thinkingConfig" not in _FakeClient.captured["body"].get("generationConfig", {})
+
+    monkeypatch.setenv("GEMINI_VISION_THINKING_BUDGET", "0")
+    await gv.GeminiVisionProvider().analyze(messages=_image_messages())
+    assert _FakeClient.captured["body"]["generationConfig"]["thinkingConfig"] == {
+        "thinkingBudget": 0
+    }
+
+
+def test_anthropic_thinking_params_are_still_refused():
+    """Der Env-Schalter ist eine Gemini-EIGENE Einstellung. Er macht die
+    Anthropic-Parameter nicht plötzlich uebersetzbar — die bleiben abgewiesen,
+    sonst waere die Grenze zwischen 'eingestellt' und 'geraten' weg."""
+    with pytest.raises(gate.GeminiVisionRefused):
+        gate.assert_no_anthropic_only_params(output_config={"effort": "low"})

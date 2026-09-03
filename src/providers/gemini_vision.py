@@ -164,6 +164,53 @@ def resolve_gemini_vision_model() -> str:
     return raw
 
 
+def gemini_vision_thinking_budget() -> Optional[int]:
+    """Denk-Budget fuer Gemini, oder None (= Googles Voreinstellung).
+
+    DER GROESSTE KOSTENHEBEL AUF DIESEM WEG, gemessen 2026-09-03 an einem
+    synthetischen Grundriss, gleiche Frage, gleiches Bild:
+
+        claude-sonnet-5                        2392 in / 154 out   0,006324 USD
+        gemini-2.5-flash, Denken an (Standard)  291 in / 786 out   0,002052 USD  (3,1x)
+        gemini-2.5-flash, Denken AUS            291 in /  75 out   0,000275 USD (23,0x)
+        gemini-2.5-flash-lite, Denken an        291 in /  88 out   0,000064 USD (98,4x)
+
+    Gemini ist pro Token deutlich billiger als Sonnet, verbraucht aber ein
+    Vielfaches an Output-Tokens, weil es ausgiebig nachdenkt — und Denk-Tokens
+    kosten den Output-Preis. Der Anbieterwechsel allein bringt daher nur gut das
+    Dreifache; erst dieser Schalter macht daraus das Zwanzigfache.
+
+    BEWUSST NICHT VOREINGESTELLT: der Default ist ``None``, also Googles
+    Verhalten. Denken abzuschalten ist eine QUALITAETSENTSCHEIDUNG, keine
+    Aufraeumarbeit — auf dem einfachen Testbild waren alle Varianten inhaltlich
+    richtig, aber ein dichtes Anlagenschema ist etwas anderes. Genau das misst
+    E3s Vergleichslauf. Bis dahin entscheidet die Konfiguration, nicht dieses
+    Modul.
+
+    Werte: nicht gesetzt = Googles Default · ``0`` = aus · positive Zahl =
+    Obergrenze. (Fuer die hier erlaubten Flash-/Flash-Lite-Modelle ist ``0``
+    zulaessig; die Pro-Modelle koennen Denken nicht abschalten — die stehen
+    nicht in GEMINI_VISION_MODELS.)
+    """
+    raw = (os.getenv("GEMINI_VISION_THINKING_BUDGET") or "").strip()
+    if not raw:
+        return None
+    try:
+        value = int(raw)
+    except ValueError:
+        raise GeminiVisionError(
+            f"GEMINI_VISION_THINKING_BUDGET={raw!r} ist keine ganze Zahl. "
+            "Erlaubt: nicht gesetzt (Googles Default), 0 (Denken aus) oder eine "
+            "positive Obergrenze."
+        ) from None
+    if value < 0:
+        raise GeminiVisionError(
+            f"GEMINI_VISION_THINKING_BUDGET={value} ist negativ. 0 schaltet das "
+            "Denken ab, groessere Werte begrenzen es."
+        )
+    return value
+
+
 def gemini_vision_base_url() -> str:
     """Basis-URL der Gemini-API ohne Schluss-Slash (siehe Modul-Docstring)."""
     return (os.getenv("GEMINI_VISION_BASE_URL") or DEFAULT_GEMINI_VISION_BASE_URL).rstrip("/")
@@ -351,6 +398,13 @@ class GeminiVisionProvider:
             generation_config["temperature"] = temperature
         if max_tokens is not None:
             generation_config["maxOutputTokens"] = max_tokens
+        thinking_budget = gemini_vision_thinking_budget()
+        if thinking_budget is not None:
+            # Gemini-EIGENE Einstellung, ausdruecklich konfiguriert — NICHT die
+            # uebersetzte Anthropic-Semantik von `thinking`/`output_config`, die
+            # dieser Weg weiterhin laut abweist. Der Unterschied ist der Punkt:
+            # eine Uebersetzung waere geraten, das hier ist eingestellt.
+            generation_config["thinkingConfig"] = {"thinkingBudget": thinking_budget}
         if generation_config:
             body["generationConfig"] = generation_config
 
