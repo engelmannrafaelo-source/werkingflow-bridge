@@ -62,12 +62,57 @@ _PLANNER_SYS = (
 )
 
 
+def scholarly_profile() -> str:
+    """'full' oder 'light' — entscheidet, ob diese Umgebung die externen Kontingente anfassen darf.
+
+    Hintergrund: OpenAlex und CORE sind budgetiert bzw. lizenzpflichtig, und das Kontingent ist
+    klein (OpenAlex: 1 USD/Tag mit kostenlosem Key, rund 100 Laeufe). Gemessen am 03.09.2026 wurde
+    es ueberwiegend von automatischen Testlaeufen verbraucht: von den Recherchen auf den
+    Prod-Workern entfielen 212 von 256 auf werking-report, der haeufigste Anlass war 126x der
+    naechtliche Massentest mit absichtlich eingebauten Fehlern, und ALLE Aufrufe stammten von
+    Identitaeten mit Heimat-Bridge 'dev' (12.332 Foederierungen, keine einzige nach 'prod').
+    Der letzte erfolgreiche Abruf des Tages fiel um 01:02Z — mitten ins Testfenster. Bis tagsueber
+    ein Mensch recherchierte, war das Guthaben weg. Ein groesseres Budget allein loest das nicht,
+    weil dieselben Testlaeufe auch das neue aufbrauchen.
+
+    Deshalb: NUR Umgebungen, die sich ausdruecklich als 'full' deklarieren, duerfen die echten
+    Kontingente ziehen. Staging und lokale Entwicklung laufen light, also ohne jede externe
+    Abfrage. Der Default ist bewusst 'light' — die teure Betriebsart muss man einschalten, nicht
+    ausschalten. Ist die Schicht aktiv, aber kein Profil gesetzt, wird das einmalig als Warnung
+    gemeldet, damit es nicht STILL degradiert; das ist genau der Fehler, den diese Datei sonst
+    ueberall behebt.
+    """
+    raw = (os.getenv("BRIDGE_SCHOLARLY_PROFILE") or "").strip().lower()
+    if raw in ("full", "light"):
+        return raw
+    if raw:
+        logger.warning(
+            f"research-cloud: BRIDGE_SCHOLARLY_PROFILE={raw!r} ist unbekannt (erlaubt: full|light) "
+            f"— behandle die Umgebung als 'light', OA-Schicht bleibt aus"
+        )
+    return "light"
+
+
+_profile_warned = False
+
+
 def scholarly_enabled(research_mode: Optional[str]) -> bool:
-    """Master-Kill-Switch (env) UND per-call opt-in. Default: aus."""
-    return (
-        os.getenv("BRIDGE_SCHOLARLY_ENABLED", "false").lower() == "true"
-        and (research_mode or "standard") == "academic"
-    )
+    """Master-Kill-Switch (env) UND per-call opt-in UND Umgebungs-Profil. Default: aus."""
+    global _profile_warned
+    if os.getenv("BRIDGE_SCHOLARLY_ENABLED", "false").lower() != "true":
+        return False
+    if (research_mode or "standard") != "academic":
+        return False
+    if scholarly_profile() != "full":
+        if not _profile_warned:
+            _profile_warned = True
+            logger.warning(
+                "research-cloud: OA-Schicht ist aktiviert, aber diese Umgebung laeuft im "
+                "Light-Profil — es werden KEINE externen Literatur-Kontingente verbraucht. "
+                "Fuer den Produktivbetrieb BRIDGE_SCHOLARLY_PROFILE=full setzen."
+            )
+        return False
+    return True
 
 
 def _get(url: str, **kw) -> requests.Response:
