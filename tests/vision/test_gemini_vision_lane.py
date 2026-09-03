@@ -629,3 +629,40 @@ def test_budget_field_is_validated_by_the_request_model():
     assert ChatCompletionRequest(model="claude-sonnet-5", messages=[]).gemini_thinking_budget is None
     with pytest.raises(pydantic.ValidationError):
         ChatCompletionRequest(model="claude-sonnet-5", messages=[], gemini_thinking_budget=-1)
+
+
+# ── Den Bild-Standard pro Aufruf ueberstimmen (E3s Vergleichslauf) ──────────
+
+def test_explicit_anthropic_tier_beats_the_gemini_default(monkeypatch):
+    """Ohne das waere die Sonnet-Variante nicht mehr messbar, sobald der
+    Bridge-Standard auf Gemini steht — also genau die Vergleichsgroesse weg,
+    fuer die der Standard eingefuehrt wurde."""
+    from src.models import BackendType
+    from src.routing.vision_router import VISION_TARGET_ANTHROPIC, resolve_vision_target
+
+    monkeypatch.setenv("BRIDGE_VISION_DEFAULT_PROVIDER", "gemini")
+
+    class _Cfg:
+        backend = BackendType.ANTHROPIC_DIRECT
+        provider_tier = "anthropic-vision"
+
+    assert resolve_vision_target(_Cfg()) == VISION_TARGET_ANTHROPIC
+
+
+def test_anthropic_vision_tier_is_registered_and_uses_the_vision_key():
+    from src.models import BackendType
+    from src.providers.registry import PROVIDERS
+
+    t = PROVIDERS["anthropic-vision"]
+    assert t.backend == BackendType.ANTHROPIC_DIRECT
+    assert t.api_key_env == "ANTHROPIC_VISION_API_KEY"
+
+
+def test_new_tiers_join_no_fallback_chain():
+    """Ein neuer Tier darf nicht unbemerkt in eine Fallback-Kette geraten —
+    sonst beantwortet er irgendwann Aufrufe, die ihn nie gewaehlt haben."""
+    from src.providers.fallback import FALLBACK_CHAINS
+
+    for chain in FALLBACK_CHAINS.values():
+        assert "gemini-vision" not in chain
+        assert "anthropic-vision" not in chain

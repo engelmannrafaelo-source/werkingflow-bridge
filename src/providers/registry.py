@@ -150,6 +150,40 @@ PROVIDERS: dict[str, ProviderConfig] = {
     ),
 
     # =========================================================================
+    # Anthropic-Bildweg, AUSDRUECKLICH angefordert
+    #
+    # Braucht man erst, seit es einen Bridge-weiten Bild-Standard gibt
+    # (BRIDGE_VISION_DEFAULT_PROVIDER): steht der auf gemini, bedeutet "kein
+    # provider_tier" eben NICHT mehr Anthropic — und damit liesse sich die
+    # Sonnet-Variante im selben Deployment gar nicht mehr messen (Befund E3,
+    # 2026-09-03). Ein Standard, den man nicht pro Aufruf ueberstimmen kann,
+    # macht den Vergleich unmoeglich, fuer den er eingefuehrt wurde.
+    #
+    # Bedient denselben Weg wie bisher (VisionProvider, ANTHROPIC_VISION_API_KEY,
+    # Ledger-Fahrspur vision_prepaid) mit dem Modell aus dem Request — dieser
+    # Tier waehlt den ANBIETER, nicht das Modell.
+    #
+    # Absichtlich ein eigener Tier statt 'claude-direct-notools' mitzubenutzen:
+    # der existiert fuer haengende CLI-Aufrufe, und einen Namen fuer etwas
+    # anderes zu verwenden, verwirrt beim naechsten Lesen mehr, als die zwoelf
+    # Zeilen hier kosten.
+    # =========================================================================
+    "anthropic-vision": ProviderConfig(
+        tier_id="anthropic-vision",
+        name="Claude Vision (ausdruecklich, ueberstimmt den Bild-Standard)",
+        backend=BackendType.ANTHROPIC_DIRECT,
+        model=_DEFAULT_SONNET,
+        api_key_env="ANTHROPIC_VISION_API_KEY",
+        dsgvo_compliant=False,
+        supports_tools=False,
+        description=(
+            "Bildanalyse ausdruecklich ueber Anthropic, auch wenn das Deployment "
+            "Gemini als Bild-Standard gesetzt hat. Fuer Vergleichsmessungen im "
+            "selben Lauf."
+        ),
+    ),
+
+    # =========================================================================
     # Google Gemini — API-Key MIT Bildeingabe
     #
     # NICHT verwechseln mit 'gemini-flash' darueber: das ist der CLI-Subprozess
