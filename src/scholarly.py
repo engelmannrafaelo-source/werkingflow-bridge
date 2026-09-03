@@ -214,6 +214,19 @@ def _core(query: str, n: int) -> List[Dict[str, Any]]:
     try:
         r = _get("https://api.core.ac.uk/v3/search/works/", headers=headers,
                  params={"q": query, "limit": n}, timeout=_CORE_HTTP_TIMEOUT)
+        if r.status_code == 401 and key:
+            # Ein ABGELAUFENER Schluessel ist schlechter als gar keiner: CORE antwortet dann 401
+            # und liefert NICHTS, waehrend derselbe Request ohne Authorization-Header 200 und
+            # Treffer bringt (gemessen 03.09.2026: 0 vs. 3 Treffer, Query "TRVB Brandszenarien
+            # Rauchabzug"). Deshalb einmal keyless nachfassen — das rettet die ENTDECKUNG
+            # (welche Arbeiten existieren), nicht den Volltext. Volltext braucht die Lizenz.
+            logger.error(
+                "research-cloud: CORE_API_KEY ist ungueltig/abgelaufen (401) — fasse keyless nach. "
+                "Discovery laeuft weiter, VOLLTEXTE FEHLEN bis eine gueltige Lizenz hinterlegt ist. "
+                f"CORE-Antwort: {(r.text or '')[:160]}"
+            )
+            r = _get("https://api.core.ac.uk/v3/search/works/", headers={},
+                     params={"q": query, "limit": n}, timeout=_CORE_HTTP_TIMEOUT)
         if r.status_code != 200:
             if r.status_code == 429:
                 # Keyless-Rate-Limit: Schicht degradiert STILL auf OpenAlex-Abstracts —
@@ -362,12 +375,15 @@ def _retrieve_and_format(queries: List[str], per_query: int) -> str:
         "## VERIFIZIERTE OA-LITERATUR (legal via OpenAlex/CORE)\n"
         "Nutze diese peer-reviewten Open-Access-Auszüge für physikalische Zusammenhänge, Verfahren, "
         "Messmethoden und Normkontext — mit Quellenangabe (URL/DOI).\n"
-        "**KEINE GRENZWERTE AUS AUFSÄTZEN.** Ein Zahlenwert aus einer wissenschaftlichen Arbeit ist ein "
-        "Messergebnis oder eine Empfehlung, NIE eine geltende Anforderung. Verbindliche Grenzwerte "
-        "(Druckdifferenzen, Kräfte, U-Werte, Fristen) stammen ausschließlich aus dem einschlägigen "
-        "Regelwerk selbst — TRVB, OIB-Richtlinie, ÖNORM, EN/ISO. Steht ein Grenzwert nur in einem "
-        "Aufsatz, gib ihn als Literaturangabe mit Quelle aus und kennzeichne ausdrücklich, dass die "
-        "verbindliche Fundstelle im Regelwerk noch zu prüfen ist.\n"
+        "**GRENZWERTE AUS DIESER LITERATUR HERAUSARBEITEN — das ist der Zweck dieser Schicht.** Die "
+        "Regelwerke selbst (TRVB, OIB, ÖNORM) sind kostenpflichtig und liegen hier nicht vor; die "
+        "Sekundärliteratur ist der vorgesehene Weg, um die einschlägigen Zahlenwerte (Druckdifferenzen, "
+        "Kräfte, U-Werte, Fristen, Bemessungsansätze) zu ermitteln. Gib sie aus, mit Quelle (URL/DOI).\n"
+        "**Dabei IMMER dazuschreiben, auf welches Regelwerk und welches Land sich ein Wert bezieht.** "
+        "Grenzwerte unterscheiden sich je Rechtsraum — eine koreanische Arbeit nennt für dieselbe "
+        "Türöffnungskraft 110 N (NFSC 501A), während im österreichischen Raum TRVB/EN 12101-6 mit 100 N "
+        "gelten. Ein Wert ohne Regelwerks- und Länderbezug ist unbrauchbar; ein Wert MIT diesem Bezug "
+        "ist verwertbar, auch wenn er aus Sekundärliteratur stammt.\n"
         "Die Herkunft (Land der Institutionen, Jahr, Sprache) steht bei jeder Quelle — sie entscheidet "
         "mit, ob eine Arbeit auf den österreichischen Rechtsraum übertragbar ist.\n"
         "Ergänze offene Web-Suche nur für Herstellerdaten/Tarife/Förderungen, die hier fehlen.\n"
