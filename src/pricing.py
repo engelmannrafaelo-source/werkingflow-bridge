@@ -39,7 +39,15 @@ import re
 #                  noch NICHT in model_registry.MODELS registriert (separate
 #                  Entscheidung: Default-Wechsel + Bedrock-Profile-IDs), also
 #                  aktuell unbenutzt aber bereit.
-PRICING_VERSION = "v5"
+# v6 (2026-09-03): Gemini Flash-Lite ergaenzt (2.5 / 3.1 / 3.5) fuer den
+#                  Bild-Testweg (src/providers/gemini_vision.py). Ohne
+#                  Preiszeile buchte dieser Weg 0,00 EUR fuer echtes Geld auf
+#                  einem eigenen API-Key. Quelle: ai.google.dev/gemini-api/docs/
+#                  pricing, Paid-Tier, geprueft 2026-09-03. Bemerkenswert und
+#                  der Grund, warum 2.5 der Default bleibt: neuer ist hier NICHT
+#                  guenstiger — 3.1 kostet output das 3,75-fache, 3.5 das
+#                  6,25-fache von 2.5.
+PRICING_VERSION = "v6"
 
 # USD per 1M tokens. {model_id: {"in": input_price, "out": output_price}}
 # Quelle je Zeile: Anthropic "Model pricing"-Tabelle,
@@ -65,6 +73,14 @@ MODEL_PRICING: dict[str, dict[str, float]] = {
     "claude-fable-5-1":           {"in": 10.00, "out": 50.00},  # 2026-09-02 — GA, noch nicht in model_registry.MODELS registriert
     "claude-haiku-4-5":           {"in": 1.00,  "out": 5.00},   # 2026-07-03
     "claude-haiku-4-5-20251001":  {"in": 1.00,  "out": 5.00},   # 2026-07-03
+    # Google Gemini Flash-Lite — Bild-Testweg (nur Nicht-Prod erreichbar, siehe
+    # src/routing/gemini_vision_gate.py). Bildeingabe wird zum Token-Preis
+    # abgerechnet, es gibt also keinen getrennten Bildposten. Geprueft
+    # 2026-09-03 gegen ai.google.dev/gemini-api/docs/pricing (Paid Tier); die
+    # audio-Sondersaetze sind hier weggelassen, dieser Weg schickt kein Audio.
+    "gemini-2.5-flash-lite":      {"in": 0.10,  "out": 0.40},
+    "gemini-3.1-flash-lite":      {"in": 0.25,  "out": 1.50},
+    "gemini-3.5-flash-lite":      {"in": 0.30,  "out": 2.50},
     "gpt-5":                      {"in": 5.00,  "out": 15.00},  # unverifiziert diese Nacht — bei naechster GPT-Aenderung gegenpruefen
     "gpt-5-mini":                 {"in": 0.30,  "out": 1.20},   # unverifiziert diese Nacht — bei naechster GPT-Aenderung gegenpruefen
 }

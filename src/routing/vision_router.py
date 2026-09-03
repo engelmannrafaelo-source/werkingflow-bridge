@@ -9,9 +9,25 @@ import logging
 from typing import Optional, List, Dict, Any
 from dataclasses import dataclass
 
+from src.activity.providers import PROVIDER_ANTHROPIC, PROVIDER_GEMINI
 from src.vision_provider import VisionProvider, get_vision_provider
 
 logger = logging.getLogger(__name__)
+
+# usage_events.provider_metadata->>'api_key_lane' — WELCHER Schluessel bezahlt
+# hat. Getrennt gehalten, weil beide echtes Geld auf verschiedenen Konten sind:
+# die Anthropic-Tageskappe (src/routing/prepaid_cap.py) summiert ausschliesslich
+# 'vision_prepaid'. Wuerde der Gemini-Testweg dieselbe Fahrspur beschriften,
+# zaehlte er gegen ein Guthaben, das er gar nicht belastet — und die Kappe waere
+# ab dem ersten Testlauf falsch.
+LANE_ANTHROPIC_PREPAID = "vision_prepaid"
+LANE_GEMINI_TEST = "vision_gemini_test"
+
+
+# Ziele der Vision-Weiche. Kein Enum, weil die Werte roh in Log- und
+# Ledger-Zeilen landen und dort lesbar bleiben sollen.
+VISION_TARGET_ANTHROPIC = "anthropic"
+VISION_TARGET_GEMINI = "gemini"
 
 
 @dataclass
@@ -24,6 +40,30 @@ class VisionResult:
     # pfad, der ihn vergisst, soll beim Bauen scheitern, nicht erst beim
     # finish_reason-Mapping in main.py (genau so entstand der 500 vom 31.08.).
     stop_reason: str
+    # Wer die Daten physisch bekommen hat + welcher Schluessel bezahlt hat.
+    # Ebenfalls Pflichtfelder ohne Default, aus demselben Grund wie stop_reason
+    # und aus einem zweiten: usage_events.provider ist der Nachweis fuer die
+    # Datenresidenz-Zusage. Ein Default haette bedeutet, dass ein neuer
+    # Vision-Anbieter still das Etikett des alten erbt — genau die Fehlerklasse,
+    # die src/activity/providers.py beseitigt hat.
+    ledger_provider: str
+    api_key_lane: str
+
+
+def resolve_vision_target(backend_config: Any) -> str:
+    """Welcher Anbieter soll dieses Bild sehen?
+
+    Entscheidet allein am aufgeloesten Backend, nicht am Modellnamen: der
+    provider_tier-Weg ist der einzige, der GEMINI_API ueberhaupt setzen kann,
+    und damit ist die Weiche an dieselbe Stelle gebunden, an der auch der
+    Bedrock-Pin haengt. Ein Aufruf ohne Tier bleibt unveraendert auf dem
+    Anthropic-Bildweg — dieser Bau aendert fuer bestehende Aufrufer nichts.
+    """
+    from src.models import BackendType
+
+    if backend_config is not None and getattr(backend_config, "backend", None) == BackendType.GEMINI_API:
+        return VISION_TARGET_GEMINI
+    return VISION_TARGET_ANTHROPIC
 
 
 def serialize_message_content(content) -> Any:
@@ -53,11 +93,12 @@ def has_vision_content(messages: List[Dict[str, Any]]) -> bool:
 async def route_to_vision(
     messages: List[Dict[str, Any]],
     model: str,
-    max_tokens: int = 4096,
+    max_tokens: Optional[int] = None,
     temperature: float = 0.7,
     timeout: float = 300.0,
     thinking: Optional[Dict[str, Any]] = None,
-    output_config: Optional[Dict[str, Any]] = None
+    output_config: Optional[Dict[str, Any]] = None,
+    target: str = VISION_TARGET_ANTHROPIC,
 ) -> VisionResult:
     """
     Route request to Vision API
@@ -80,6 +121,35 @@ async def route_to_vision(
     Raises:
         Exception: If vision analysis fails
     """
+    if target == VISION_TARGET_GEMINI:
+        from src.providers.gemini_vision import (
+            get_gemini_vision_provider,
+            resolve_gemini_vision_model,
+        )
+        from src.routing.gemini_vision_gate import assert_no_anthropic_only_params
+
+        # Anthropic-eigene Regler duerfen hier nicht stillschweigend verfallen.
+        assert_no_anthropic_only_params(thinking=thinking, output_config=output_config)
+
+        logger.info("🖼️ Routing to Vision API (Gemini, Testweg)")
+        gemini_response = await get_gemini_vision_provider().analyze(
+            messages=messages,
+            model=resolve_gemini_vision_model(),
+            # BEWUSST durchgereicht statt auf 4096 defaultet: die Bridge
+            # erfindet auf diesem Weg keinen Ausgabendeckel (Rafael 2026-09-03).
+            max_tokens=max_tokens,
+            temperature=temperature,
+            timeout=timeout,
+        )
+        return VisionResult(
+            content=gemini_response.content,
+            model=gemini_response.model,
+            usage=gemini_response.usage,
+            stop_reason=gemini_response.stop_reason,
+            ledger_provider=PROVIDER_GEMINI,
+            api_key_lane=LANE_GEMINI_TEST,
+        )
+
     logger.info("🖼️ Routing to Vision API (direct Anthropic)")
 
     vision_provider = get_vision_provider()
@@ -87,7 +157,9 @@ async def route_to_vision(
     vision_response = await vision_provider.analyze(
         messages=messages,
         model=model,
-        max_tokens=max_tokens,
+        # Der Anthropic-Weg BRAUCHT max_tokens (Pflichtfeld der Messages API),
+        # deshalb bleibt der bisherige Default genau hier stehen — und nur hier.
+        max_tokens=max_tokens if max_tokens is not None else 4096,
         temperature=temperature,
         timeout=timeout,
         thinking=thinking,
@@ -98,7 +170,9 @@ async def route_to_vision(
         content=vision_response.content,
         model=vision_response.model,
         usage=vision_response.usage,
-        stop_reason=vision_response.stop_reason
+        stop_reason=vision_response.stop_reason,
+        ledger_provider=PROVIDER_ANTHROPIC,
+        api_key_lane=LANE_ANTHROPIC_PREPAID,
     )
 
 
@@ -108,7 +182,8 @@ async def check_and_route_vision(
     max_tokens: Optional[int] = None,
     temperature: Optional[float] = None,
     thinking: Optional[Dict[str, Any]] = None,
-    output_config: Optional[Dict[str, Any]] = None
+    output_config: Optional[Dict[str, Any]] = None,
+    target: str = VISION_TARGET_ANTHROPIC,
 ) -> Optional[VisionResult]:
     """
     Check if messages need vision routing, and route if needed
@@ -139,8 +214,12 @@ async def check_and_route_vision(
     return await route_to_vision(
         messages=messages_for_vision,
         model=model,
-        max_tokens=max_tokens or 4096,
+        # Kein "or 4096" mehr: der Anthropic-Zweig setzt seinen Pflicht-Default
+        # selbst, und der Gemini-Zweig soll ohne Deckel laufen, wenn der
+        # Aufrufer keinen genannt hat.
+        max_tokens=max_tokens,
         temperature=temperature or 0.7,
         thinking=thinking,
-        output_config=output_config
+        output_config=output_config,
+        target=target,
     )

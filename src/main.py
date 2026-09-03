@@ -62,7 +62,13 @@ from src.middleware.bridge_error import SDKDisconnectError
 from src.message_adapter import MessageAdapter
 from src.tool_leak_detector import hardened_system_prompt, looks_like_tool_leak
 from src.vision_provider import VisionProvider, get_vision_provider
-from src.routing.vision_router import check_and_route_vision, prepare_messages_for_vision, has_vision_content
+from src.routing.vision_router import (
+    check_and_route_vision, prepare_messages_for_vision, has_vision_content,
+    resolve_vision_target, VISION_TARGET_GEMINI,
+)
+from src.routing.gemini_vision_gate import (
+    assert_gemini_vision_allowed, declares_synthetic_test_mode, GeminiVisionRefused,
+)
 from src.routing.prepaid_cap import prepaid_vision_over_cap
 from src.routing.backend_router import resolve_backend_config, get_backend_info_dict, BackendConfig
 from src.activity.providers import (
@@ -1304,11 +1310,41 @@ async def generate_streaming_response(
         _vision_is_bedrock = bool(
             backend_config and backend_config.backend == BackendType.BEDROCK
         )
+        _vision_target = resolve_vision_target(backend_config)
 
         if has_vision_content(messages_for_vision) and not _vision_is_bedrock:
+            if _vision_target == VISION_TARGET_GEMINI:
+                # Dieselbe Sperre wie im nicht-streamenden Zweig. Sie steht hier
+                # ein zweites Mal, weil beide Zweige denselben Upstream-Call
+                # ausloesen — eine Sperre, die nur einen der beiden schuetzt,
+                # ist keine.
+                try:
+                    assert_gemini_vision_allowed(
+                        app_env=normalize_app_env(get_app_env_from_request(fastapi_request))
+                        if fastapi_request else None,
+                        has_images=True,
+                        declares_synthetic=declares_synthetic_test_mode(fastapi_request),
+                    )
+                except GeminiVisionRefused as refusal:
+                    logger.warning(f"⛔ Gemini-Bildweg abgewiesen (stream): {refusal}")
+                    _refusal_err = {"error": {
+                        "message": str(refusal),
+                        "type": "gemini_vision_refused",
+                        "code": "gemini_vision_refused",
+                    }}
+                    yield f"data: {json.dumps(_refusal_err)}\n\n"
+                    yield "data: [DONE]\n\n"
+                    return
+
             # Prepaid vision-key daily cap (fail-open, flag-gated). Streaming path
             # can't return a status code mid-stream, so emit an error SSE + [DONE].
-            _cap_over, _cap_spent, _cap_max = await prepaid_vision_over_cap()
+            # Nur der Anthropic-Schluessel hat diese Kappe — siehe den
+            # nicht-streamenden Zweig.
+            _cap_over, _cap_spent, _cap_max = (
+                (False, 0.0, 0.0)
+                if _vision_target == VISION_TARGET_GEMINI
+                else await prepaid_vision_over_cap()
+            )
             if _cap_over:
                 logger.error(
                     f"🛑 Prepaid vision daily cap reached ({_cap_spent:.2f} of {_cap_max:.2f} EUR) — rejecting vision stream"
@@ -1331,7 +1367,8 @@ async def generate_streaming_response(
                     max_tokens=request.max_tokens,
                     temperature=request.temperature,
                     thinking=request.thinking,
-                    output_config=request.output_config
+                    output_config=request.output_config,
+                    target=_vision_target,
                 )
 
                 # Stream vision response as SSE chunks
@@ -1373,7 +1410,7 @@ async def generate_streaming_response(
                     )
                     from src.activity.ai_call_writer import persist_ai_call_activity
                     await persist_ai_call_activity(
-                        provider=PROVIDER_ANTHROPIC,
+                        provider=vision_result.ledger_provider,
                         app_id=_vision_attr.get("app_id"),
                         user_id=_vision_attr.get("user_id"),
                         agent_id=_vision_attr.get("agent_id"),
@@ -1387,8 +1424,9 @@ async def generate_streaming_response(
                         provider_meta={
                             "usage_source": "api",
                             "endpoint": "vision",
-                            "api_key_lane": "vision_prepaid",
+                            "api_key_lane": vision_result.api_key_lane,
                             "image_count": _vision_images,
+                            "synthetic_declared": _vision_target == VISION_TARGET_GEMINI,
                         },
                     )
                 except Exception as _vision_track_err:
@@ -2826,6 +2864,31 @@ async def chat_completions(
             return response_data
 
         # =======================================================================
+        # GEMINI API (Bildweg, Testlane): nur MIT Bild sinnvoll
+        # =======================================================================
+        # Der Tier 'gemini-vision-test' existiert ausschliesslich fuer die
+        # Bildanalyse; bedient wird er weiter unten an der Vision-Weiche. Ein
+        # Aufruf OHNE Bild faende dort nichts und fiele stillschweigend in den
+        # Claude-SDK-Zweig darunter — der Aufrufer bekaeme ein anderes Modell
+        # als angefragt und saehe es nirgends. Deshalb hier laut abweisen,
+        # bevor das passieren kann.
+        if backend_config and backend_config.backend == BackendType.GEMINI_API:
+            if not has_vision_content(prepare_messages_for_vision(request_body.messages)):
+                return JSONResponse(
+                    status_code=400,
+                    content={"error": {
+                        "message": (
+                            "provider_tier='gemini-vision-test' ist ein reiner "
+                            "Bildanalyse-Weg, dieser Aufruf enthaelt aber kein Bild. "
+                            "Ohne Tier laeuft der Aufruf normal ueber Claude."
+                        ),
+                        "type": "invalid_request_error",
+                        "param": "provider_tier",
+                        "code": "gemini_vision_requires_image",
+                    }},
+                )
+
+        # =======================================================================
         # ANTHROPIC ROUTING: Continue with Claude Code SDK (default)
         # =======================================================================
 
@@ -2868,13 +2931,34 @@ async def chat_completions(
             _vision_is_bedrock = bool(
                 backend_config and backend_config.backend == BackendType.BEDROCK
             )
+            # Welcher Anbieter das Bild sehen soll. Ohne Gemini-Tier ist das
+            # unveraendert der Anthropic-Bildweg — bestehende Aufrufer merken
+            # von diesem Bau nichts.
+            _vision_target = resolve_vision_target(backend_config)
             try:
                 vision_result = None
                 if not _vision_is_bedrock and has_vision_content(prepare_messages_for_vision(request_body.messages)):
+                    if _vision_target == VISION_TARGET_GEMINI:
+                        # Datenschutz-Sperre VOR dem Upstream-Call: Google ist
+                        # kein gelisteter Unterauftragsverarbeiter, also darf
+                        # hier nur ein ausdruecklich erklaerter Testlauf aus
+                        # einer nachweislichen Nicht-Prod-Umgebung durch.
+                        assert_gemini_vision_allowed(
+                            app_env=normalize_app_env(get_app_env_from_request(request)),
+                            has_images=True,
+                            declares_synthetic=declares_synthetic_test_mode(request),
+                        )
                     # Prepaid vision-key daily cap (fail-open, flag-gated). Only a
                     # confirmed vision call reaches here, so a non-vision call is
-                    # never blocked.
-                    _cap_over, _cap_spent, _cap_max = await prepaid_vision_over_cap()
+                    # never blocked. NUR fuer den Anthropic-Schluessel: die Kappe
+                    # summiert dessen Fahrspur, ein Gemini-Aufruf belastet ihn
+                    # nicht und darf ihn deshalb weder fuellen noch von ihm
+                    # blockiert werden.
+                    _cap_over, _cap_spent, _cap_max = (
+                        (False, 0.0, 0.0)
+                        if _vision_target == VISION_TARGET_GEMINI
+                        else await prepaid_vision_over_cap()
+                    )
                     if _cap_over:
                         logger.error(
                             f"🛑 Prepaid vision daily cap reached ({_cap_spent:.2f} of {_cap_max:.2f} EUR) — rejecting vision call"
@@ -2893,7 +2977,8 @@ async def chat_completions(
                         max_tokens=request_body.max_tokens,
                         temperature=request_body.temperature,
                         thinking=request_body.thinking,
-                        output_config=request_body.output_config
+                        output_config=request_body.output_config,
+                        target=_vision_target,
                     )
 
                 if vision_result:
@@ -2964,7 +3049,7 @@ async def chat_completions(
                         _vision_attr = extract_attribution_context(request)
                         from src.activity.ai_call_writer import persist_ai_call_activity
                         await persist_ai_call_activity(
-                            provider=PROVIDER_ANTHROPIC,
+                            provider=vision_result.ledger_provider,
                             app_id=_vision_attr.get("app_id"),
                             user_id=_vision_attr.get("user_id"),
                             agent_id=_vision_attr.get("agent_id"),
@@ -2978,10 +3063,16 @@ async def chat_completions(
                             provider_meta={
                                 "usage_source": "api",
                                 "endpoint": "vision",
-                                "api_key_lane": "vision_prepaid",
+                                "api_key_lane": vision_result.api_key_lane,
                                 "image_count": image_count,
                                 "stop_reason": vision_result.stop_reason,
                                 "empty_response": not vision_result.content,
+                                # Die Testmodus-Erklaerung des Aufrufers wird
+                                # mitgeschrieben: die Bridge kann einem Bild
+                                # nicht ansehen, ob es synthetisch ist, also
+                                # gehoert die Behauptung in den Datensatz, wo
+                                # sie pruefbar ist statt nur behauptet.
+                                "synthetic_declared": _vision_target == VISION_TARGET_GEMINI,
                             },
                         )
                     except Exception as _vision_track_err:
@@ -3000,6 +3091,20 @@ async def chat_completions(
 
                     return response
 
+            except GeminiVisionRefused as refusal:
+                # Kein 500 und vor allem KEIN stiller Wechsel auf Anthropic: der
+                # Aufrufer hat Gemini angefragt und bekommt die Absage samt
+                # Grund. 403, weil es eine Berechtigungsfrage ist (Umgebung /
+                # Erklaerung / Schaltung), keine Infrastrukturstoerung.
+                logger.warning(f"⛔ Gemini-Bildweg abgewiesen: {refusal}")
+                return JSONResponse(
+                    status_code=403,
+                    content={"error": {
+                        "message": str(refusal),
+                        "type": "gemini_vision_refused",
+                        "code": "gemini_vision_refused",
+                    }},
+                )
             except Exception as e:
                 logger.error(f"❌ Vision request failed: {e}", exc_info=True)
                 # Vision provider errors are upstream — tag accordingly
