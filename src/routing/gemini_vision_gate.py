@@ -20,6 +20,26 @@ wuerde daran nichts aendern: er beseitigt den Drittlandtransfer, macht Google
 aber trotzdem zum NEUEN Unterauftragsverarbeiter, also AVV-Aenderung plus
 Information der Bestandskunden. Diese Entscheidung steht bei Rafael, nicht hier.
 
+VORBEDINGUNG, DIE KEIN CODE PRUEFEN KANN: PAID TIER
+---------------------------------------------------
+Der Google-Tarif entscheidet mit ueber die Datenschutz-Lage, und die Bridge kann
+ihn einem API-Key nicht ansehen. Laut ai.google.dev/gemini-api/terms (geprueft
+2026-09-03) nutzt Google auf dem **Free Tier** die eingereichten Inhalte und die
+Antworten, um eigene Produkte zu verbessern und weiterzuentwickeln, und
+menschliche Pruefer duerfen sie lesen. Auf dem **Paid Tier** ist beides
+ausdruecklich ausgeschlossen.
+
+Der Unterschied ist die Rolle: auf dem Free Tier verarbeitet Google nicht nur
+FUER UNS, sondern auch FUER SICH — das ist keine Auftragsverarbeitung mehr.
+Rafaels Freigabe vom 2026-09-03 betrifft, dass Gemini die Staging-Inhalte
+ANALYSIERT; dass Google sie behaelt und mitlernt, ist davon nicht gedeckt.
+
+Deshalb: dieser Weg wird erst scharfgeschaltet, wenn das Google-Projekt auf Paid
+Tier steht. Das laesst sich hier nicht erzwingen — es steht in der
+Umschalt-Anleitung (docker/docker-compose.yml) an der Stelle, an der jemand die
+Schalter umlegt, und es ist bewusst KEIN weiteres Flag: ein Haekchen, das sich
+selbst bestaetigt, waere Theater und keine Sicherung.
+
 WAS DIE SPERRE NOCH IST — und was davon wirklich traegt
 --------------------------------------------------------
 Nach dem Wegfall der Synthetik-Erklaerung bleiben drei Schichten. Sie sind
