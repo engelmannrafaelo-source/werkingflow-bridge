@@ -307,6 +307,8 @@ Host für Prod-Worker (Ziel: Postgres bleibt allein auf production-barrier). Tai
 oben — er ist kein drittes Bridge-Deployment, sondern potenzielle Worker-Kapazität für Server-2.
 | `secrets/claude_token_*.txt` | Token-Dateien (host-lokal, nicht im Repo) |
 | `src/auth.py`, `src/claude_cli.py` | Auth + SDK-Integration |
+| `src/providers/gemini_vision.py` | Gemini-Bildweg per API-Key (**Testweg**, synthetische Plaene) |
+| `src/routing/gemini_vision_gate.py` | dessen Sperre — Google ist kein gelisteter Unterauftragsverarbeiter (avv.md §5.4), echte Kundenplaene duerfen nicht dorthin. Kein `GEMINI_VISION_API_KEY` auf prod, und das ist Absicht |
 
 ---
 
