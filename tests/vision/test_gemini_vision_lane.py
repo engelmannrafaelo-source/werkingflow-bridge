@@ -411,3 +411,50 @@ def test_a_gemini_model_name_in_the_model_field_is_rejected():
         resolved, msg = resolve_model(name)
         assert resolved is None, f"{name} sollte nicht aufloesen"
     assert resolve_model("claude-sonnet-5")[0] == "claude-sonnet-5"
+
+
+# ── Kollision mit der App-Provider-Regel ────────────────────────────────────
+# Ohne diese Ausnahme haette werking-energy — genau die App, die messen will —
+# den Tier verloren und still Sonnet gemessen. Auf dem Anthropic-Prepaid-Key.
+
+def _energy_request(tier="gemini-vision-test"):
+    from src.models import BackendType
+
+    class _Body:
+        def __init__(self):
+            self.backend = BackendType.ANTHROPIC
+            self.provider_tier = tier
+    return _Body()
+
+
+def test_app_rule_does_not_silently_strip_the_gemini_tier():
+    from src.routing.app_provider_policy import (
+        APP_PROVIDER_RULES, apply_app_provider_policy, client_requests_gemini_vision,
+    )
+
+    body = _energy_request()
+    assert client_requests_gemini_vision(body)
+    applied = apply_app_provider_policy(body, APP_PROVIDER_RULES["werking-energy"])
+
+    # Die Regel laesst den Aufruf unangetastet (wie beim ausdruecklich
+    # angefragten Bedrock), statt den Tier abzuraeumen.
+    assert applied is None
+    assert body.provider_tier == "gemini-vision-test", (
+        "Der Gemini-Testtier wurde von der App-Regel abgeraeumt — der Aufruf "
+        "waere still von Anthropic beantwortet worden, waehrend der Aufrufer "
+        "glaubt, er misst Gemini."
+    )
+
+
+def test_app_rule_still_strips_every_other_tier():
+    """Die Ausnahme ist eine Einzelnennung, keine Kategorie: jeder andere Tier
+    wird weiterhin abgeraeumt. Sonst waere aus der Ausnahme ein Loch geworden,
+    durch das eine App sich ihr Backend selbst aussuchen kann."""
+    from src.models import BackendType
+    from src.routing.app_provider_policy import APP_PROVIDER_RULES, apply_app_provider_policy
+
+    body = _energy_request(tier="openrouter-claude")
+    applied = apply_app_provider_policy(body, APP_PROVIDER_RULES["werking-energy"])
+    assert applied == "anthropic"
+    assert body.provider_tier is None
+    assert body.backend == BackendType.ANTHROPIC
