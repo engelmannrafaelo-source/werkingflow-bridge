@@ -1371,24 +1371,32 @@ async def generate_streaming_response(
                     target=_vision_target,
                 )
 
-                # Stream vision response as SSE chunks
+                # Stream vision response as SSE chunks.
+                # model = das TATSAECHLICH bedienende Modell, nicht das
+                # angefragte (der nicht-streamende Zweig macht das laengst so).
+                # Bis 2026-09-03 stand hier request.model — auf dem Anthropic-Weg
+                # war das folgenlos, weil angefragt und bedient dasselbe ist. Mit
+                # dem Gemini-Testweg wird daraus eine Falschauskunft: der Client
+                # bekaeme "claude-sonnet-5" gemeldet, obwohl Gemini geantwortet
+                # hat — und genau diese Zuordnung ist das, was der Kostenvergleich
+                # messen soll.
                 initial_chunk = ChatCompletionStreamResponse(
                     id=request_id,
-                    model=request.model,
+                    model=vision_result.model,
                     choices=[StreamChoice(index=0, delta={"role": "assistant", "content": ""}, finish_reason=None)]
                 )
                 yield f"data: {initial_chunk.model_dump_json()}\n\n"
 
                 content_chunk = ChatCompletionStreamResponse(
                     id=request_id,
-                    model=request.model,
+                    model=vision_result.model,
                     choices=[StreamChoice(index=0, delta={"content": vision_result.content}, finish_reason=None)]
                 )
                 yield f"data: {content_chunk.model_dump_json()}\n\n"
 
                 final_chunk = ChatCompletionStreamResponse(
                     id=request_id,
-                    model=request.model,
+                    model=vision_result.model,
                     choices=[StreamChoice(index=0, delta={}, finish_reason="stop")]
                 )
                 yield f"data: {final_chunk.model_dump_json()}\n\n"

@@ -394,3 +394,20 @@ def test_anthropic_converter_still_works_as_a_static_helper():
         _image_messages()
     )
     assert msgs2 == msgs
+
+
+def test_a_gemini_model_name_in_the_model_field_is_rejected():
+    """E3 wollte model='gemini-flash-lite' als Marker senden. Das geht NICHT:
+    resolve_model laeuft in main.py lange VOR der Vision-Weiche und kennt nur
+    Claude-Modelle — der Aufruf staerbe mit 400 model_not_found, bevor der Tier
+    ueberhaupt betrachtet wird. Der Marker gehoert in provider_tier; welches
+    Modell tatsaechlich bedient hat, schreibt die Bridge selbst ins Ledger.
+    Dieser Test haelt die Absage fest, damit sie nicht als Bug missverstanden
+    und 'behoben' wird, indem jemand Gemini in die Claude-Modellregistry haengt.
+    """
+    from src.model_registry import resolve_model
+
+    for name in ("gemini-flash-lite", "gemini-2.5-flash-lite"):
+        resolved, msg = resolve_model(name)
+        assert resolved is None, f"{name} sollte nicht aufloesen"
+    assert resolve_model("claude-sonnet-5")[0] == "claude-sonnet-5"
