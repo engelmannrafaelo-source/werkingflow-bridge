@@ -25,9 +25,10 @@ class BackendType(str, Enum):
                                            # requests that already run with enable_tools=false, see
                                            # src/providers/anthropic_direct.py
     GEMINI_API = "gemini_api"          # Google Gemini generateContent per API key, MIT Bildeingabe
-                                       # (GEMINI_VISION_API_KEY). Testweg fuer synthetische Plaene,
-                                       # gesperrt durch src/routing/gemini_vision_gate.py — nicht zu
-                                       # verwechseln mit GEMINI_CLI (OAuth-Subprozess, ohne Bild).
+                                       # (GEMINI_VISION_API_KEY). Auf der dev-Bridge der Standard fuer
+                                       # die Bildanalyse, auf prod gesperrt — siehe
+                                       # src/routing/gemini_vision_gate.py. Nicht zu verwechseln mit
+                                       # GEMINI_CLI (OAuth-Subprozess, ohne Bildeingabe).
 
 
 class PrivacyMode(str, Enum):

@@ -150,34 +150,38 @@ PROVIDERS: dict[str, ProviderConfig] = {
     ),
 
     # =========================================================================
-    # Google Gemini — API-Key MIT Bildeingabe (TESTWEG, synthetische Plaene)
+    # Google Gemini — API-Key MIT Bildeingabe
     #
     # NICHT verwechseln mit 'gemini-flash' darueber: das ist der CLI-Subprozess
-    # per OAuth und kann KEINE Bilder. Dieser Tier ist der Bildweg fuer die
-    # Kostenmessung der Energy-Plananalyse (Rafael, 2026-09-03).
+    # per OAuth und kann KEINE Bilder.
     #
-    # Erreichbar NUR im Testmodus: src/routing/gemini_vision_gate.py verlangt
-    # Master-Flag + Key + positiv erkanntes Nicht-Prod + ausdrueckliche
-    # Testmodus-Erklaerung des Aufrufers. Ohne all das wird der Aufruf laut
-    # abgewiesen — nie still auf Anthropic umgeleitet. Grund: Google ist kein
-    # gelisteter Unterauftragsverarbeiter (avv.md §5.4), echte Kundenplaene
-    # duerfen dort nicht landen.
+    # Auf der DEV-Bridge ist dieser Weg seit 2026-09-03 der STANDARD fuer die
+    # Bildanalyse (Rafael) — dafuer braucht es diesen Tier gar nicht, das
+    # erledigt BRIDGE_VISION_DEFAULT_PROVIDER. Der Tier bleibt der Weg, ihn
+    # AUSDRUECKLICH pro Aufruf zu waehlen (Vergleichsmessungen, gezielte
+    # Modellwahl) — normale Provider-Mechanik, kein Sonderpfad.
     #
-    # Das konkrete Modell kommt aus GEMINI_VISION_MODEL (Default 2.5 Flash-Lite,
-    # das guenstigste der Familie) — ein Modellwechsel ist Konfiguration.
+    # Auf PRODUKTION ist er unerreichbar: src/routing/gemini_vision_gate.py
+    # verlangt Master-Flag + Key + positiv erkanntes Nicht-Prod, und der Key
+    # liegt dort bewusst nicht. Ohne das wird der Aufruf laut abgewiesen — nie
+    # still auf Anthropic umgeleitet. Grund: Google ist kein gelisteter
+    # Unterauftragsverarbeiter (avv.md §5.4).
+    #
+    # Das konkrete Modell kommt aus GEMINI_VISION_MODEL (Default
+    # gemini-2.5-flash) — ein Modellwechsel ist Konfiguration.
     # =========================================================================
-    "gemini-vision-test": ProviderConfig(
-        tier_id="gemini-vision-test",
-        name="Gemini Flash-Lite Vision (Testweg, synthetische Plaene)",
+    "gemini-vision": ProviderConfig(
+        tier_id="gemini-vision",
+        name="Gemini Vision (Bildanalyse, nur Nicht-Produktion)",
         backend=BackendType.GEMINI_API,
         model=_gemini_vision_model_for_display(),
         api_key_env="GEMINI_VISION_API_KEY",
         dsgvo_compliant=False,
         supports_tools=False,
         description=(
-            "Guenstige Bildanalyse ueber Google Gemini Flash-Lite. NUR Testmodus "
-            "mit synthetischen Plaenen, nicht fuer Kundendaten — Google ist kein "
-            "gelisteter Unterauftragsverarbeiter."
+            "Guenstige Bildanalyse ueber Google Gemini. Auf der dev-Bridge der "
+            "Standard, auf Produktion gesperrt — Google ist kein gelisteter "
+            "Unterauftragsverarbeiter (avv.md §5.4)."
         ),
     ),
 

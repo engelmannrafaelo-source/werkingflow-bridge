@@ -172,7 +172,7 @@ def _resolve_provider_tier(
         # ('gemini-vision-test'). Der Key wird hier nur auf Anwesenheit geprueft;
         # ob dieser Aufruf ueberhaupt an Google gehen DARF, entscheidet
         # src/routing/gemini_vision_gate.py an der Vision-Weiche — die Frage
-        # braucht app_env und die Testmodus-Erklaerung, die es hier nicht gibt.
+        # braucht die Umgebung (app_env), die es hier nicht gibt.
         api_key = get_provider_api_key(config)
         if not api_key:
             raise RuntimeError(
@@ -186,10 +186,10 @@ def _resolve_provider_tier(
             region=None,
             model_id=config.model,
             bedrock_model_id=None,
-            # Presidio-Anonymisierung greift auf Bildern ohnehin nicht — und der
-            # Weg ist auf synthetische Plaene beschraenkt, in denen es nichts zu
-            # anonymisieren gibt. Bewusst aus, damit hier keine Wirksamkeit
-            # behauptet wird, die es nicht gibt.
+            # Presidio-Anonymisierung greift auf Bildern ohnehin nicht (sie
+            # arbeitet auf Text). Bewusst aus, damit hier keine Wirksamkeit
+            # behauptet wird, die es nicht gibt — der Schutz dieses Wegs ist die
+            # Umgebungssperre, nicht eine Anonymisierung.
             privacy_enabled=False,
             env_vars={},
             provider_tier=tier_id,
