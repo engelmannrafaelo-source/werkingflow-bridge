@@ -2453,8 +2453,16 @@ async def chat_completions(
         # request_body.backend. A pin-overriding app rule (the Hub) must be able
         # to tell "this caller demanded Bedrock" apart from "the Bridge's pin
         # just wrote Bedrock here" — after the mutation the body cannot.
-        from src.routing.app_provider_policy import client_requests_bedrock
+        from src.routing.app_provider_policy import (
+            client_requests_bedrock, client_requests_gemini_vision,
+        )
         _client_asked_for_bedrock = client_requests_bedrock(request_body)
+        # Gleiche Momentaufnahme, gleicher Grund: sowohl der User-Pin als auch
+        # die App-Regel raeumen provider_tier ab. Danach ist nicht mehr
+        # feststellbar, dass der Aufrufer den Gemini-Bildweg wollte — und ein
+        # still von Anthropic beantworteter "Gemini-Testlauf" waere ein
+        # falsches Messergebnis auf dem falschen Schluessel.
+        _client_asked_for_gemini_vision = client_requests_gemini_vision(request_body)
         try:
             user_pinned_provider = await enforce_user_provider_override(request, request_body)
             operator_pinned_provider = user_pinned_provider
@@ -2501,6 +2509,7 @@ async def chat_completions(
                     _app_applied = apply_app_provider_policy(
                         request_body, _app_rule,
                         client_requested_bedrock=_client_asked_for_bedrock,
+                        client_requested_gemini_vision=_client_asked_for_gemini_vision,
                     )
                 except AppProviderPolicyError as e:
                     raise HTTPException(
@@ -2880,6 +2889,45 @@ async def chat_completions(
         # Claude-SDK-Zweig darunter — der Aufrufer bekaeme ein anderes Modell
         # als angefragt und saehe es nirgends. Deshalb hier laut abweisen,
         # bevor das passieren kann.
+        # Der Aufrufer wollte Gemini, bekommt aber etwas anderes? Dann NICHT
+        # stillschweigend etwas anderes liefern.
+        #
+        # Zwei Stellen raeumen provider_tier ab: die App-Regel (dort jetzt mit
+        # ausdruecklicher Ausnahme fuer diesen Tier) und der Operator-Pin aus
+        # users.provider_config. Der Pin bleibt bewusst unangetastet — er traegt
+        # die vertragliche EU-Datenresidenz eines echten Kunden, und dessen
+        # Daten gehoeren erst recht nicht zu Google. Nur darf das Ergebnis dann
+        # nicht "Anthropic antwortet, der Aufrufer glaubt er misst Gemini"
+        # sein: das waere ein falsches Messergebnis auf dem falschen
+        # Schluessel. Also laut abweisen und den Grund nennen.
+        _gemini_tier_was_overridden = (
+            _client_asked_for_gemini_vision
+            and not (backend_config and backend_config.backend == BackendType.GEMINI_API)
+        )
+        if _gemini_tier_was_overridden:
+            logger.warning(
+                "⛔ provider_tier='gemini-vision-test' wurde durch einen Pin/eine "
+                "Regel ueberschrieben (pinned=%r) — Aufruf abgewiesen statt still "
+                "von Anthropic beantwortet.", operator_pinned_provider,
+            )
+            return JSONResponse(
+                status_code=409,
+                content={"error": {
+                    "message": (
+                        "provider_tier='gemini-vision-test' wurde von einer "
+                        "hoeherrangigen Provider-Entscheidung ueberschrieben "
+                        f"(Operator-Pin: {operator_pinned_provider!r}). Der Aufruf "
+                        "wird NICHT stillschweigend von Anthropic beantwortet — das "
+                        "waere ein falsches Messergebnis auf einem anderen "
+                        "Schluessel. Ein Nutzer mit Operator-Pin traegt eine "
+                        "vertragliche Datenresidenz-Zusage; fuer den Gemini-Testweg "
+                        "einen ungepinnten Testnutzer verwenden."
+                    ),
+                    "type": "provider_tier_overridden",
+                    "code": "gemini_vision_tier_overridden",
+                }},
+            )
+
         if backend_config and backend_config.backend == BackendType.GEMINI_API:
             if not has_vision_content(prepare_messages_for_vision(request_body.messages)):
                 return JSONResponse(
