@@ -103,6 +103,9 @@ services:
       # CORE keyless works without this (lower rate-limit, fail-soft -> []). Empty default is
       # safe/expected until the CORE_API_KEY registration (running in parallel) lands in Infisical.
       - CORE_API_KEY=${CORE_API_KEY:-}
+      # OpenAlex-Content-API (echter GROBID-Volltext, src/openalex_content.py). Ohne Key: 401,
+      # Schicht degradiert fail-soft auf CORE/Abstracts (siehe Modul-Docstring, kein Crash).
+      - OPENALEX_API_KEY=${OPENALEX_API_KEY:-}
       # Bridge-owned per-(app,agent) tier routing/billing policy (master switch).
       # Per-route control is the app_tier_policies DB table (enabled column).
       # Fail-open: no matching row / unusable target tier → normal routing.
@@ -234,6 +237,9 @@ services:
       # CORE keyless works without this (lower rate-limit, fail-soft -> []). Empty default is
       # safe/expected until the CORE_API_KEY registration (running in parallel) lands in Infisical.
       - CORE_API_KEY=${CORE_API_KEY:-}
+      # OpenAlex-Content-API (echter GROBID-Volltext, src/openalex_content.py). Ohne Key: 401,
+      # Schicht degradiert fail-soft auf CORE/Abstracts (siehe Modul-Docstring, kein Crash).
+      - OPENALEX_API_KEY=${OPENALEX_API_KEY:-}
       # Bridge-owned per-(app,agent) tier routing/billing policy (master switch).
       # Per-route control is the app_tier_policies DB table (enabled column).
       # Fail-open: no matching row / unusable target tier → normal routing.
@@ -365,6 +371,9 @@ services:
       # CORE keyless works without this (lower rate-limit, fail-soft -> []). Empty default is
       # safe/expected until the CORE_API_KEY registration (running in parallel) lands in Infisical.
       - CORE_API_KEY=${CORE_API_KEY:-}
+      # OpenAlex-Content-API (echter GROBID-Volltext, src/openalex_content.py). Ohne Key: 401,
+      # Schicht degradiert fail-soft auf CORE/Abstracts (siehe Modul-Docstring, kein Crash).
+      - OPENALEX_API_KEY=${OPENALEX_API_KEY:-}
       # Bridge-owned per-(app,agent) tier routing/billing policy (master switch).
       # Per-route control is the app_tier_policies DB table (enabled column).
       # Fail-open: no matching row / unusable target tier → normal routing.
@@ -496,6 +505,9 @@ services:
       # CORE keyless works without this (lower rate-limit, fail-soft -> []). Empty default is
       # safe/expected until the CORE_API_KEY registration (running in parallel) lands in Infisical.
       - CORE_API_KEY=${CORE_API_KEY:-}
+      # OpenAlex-Content-API (echter GROBID-Volltext, src/openalex_content.py). Ohne Key: 401,
+      # Schicht degradiert fail-soft auf CORE/Abstracts (siehe Modul-Docstring, kein Crash).
+      - OPENALEX_API_KEY=${OPENALEX_API_KEY:-}
       # Bridge-owned per-(app,agent) tier routing/billing policy (master switch).
       # Per-route control is the app_tier_policies DB table (enabled column).
       # Fail-open: no matching row / unusable target tier → normal routing.

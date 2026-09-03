@@ -57,6 +57,9 @@ x-worker-env-common: &worker-env-common
   BRIDGE_GENERIC_JOBS_ENABLED: "true"
   BRIDGE_SCHOLARLY_ENABLED: "true"
   CORE_API_KEY: ${CORE_API_KEY:-}
+  # OpenAlex-Content-API (echter GROBID-Volltext, src/openalex_content.py). Ohne Key: 401,
+  # Schicht degradiert fail-soft auf CORE/Abstracts (siehe Modul-Docstring, kein Crash).
+  OPENALEX_API_KEY: ${OPENALEX_API_KEY:-}
   BRIDGE_APP_TIER_POLICY_ENABLED: "true"
   PREPAID_VISION_DAILY_CAP_ENABLED: "true"
   PREPAID_VISION_DAILY_CAP_EUR: "90"
