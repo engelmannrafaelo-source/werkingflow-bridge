@@ -154,6 +154,15 @@ services:
       #   3. ERST DANN BRIDGE_VISION_DEFAULT_PROVIDER=gemini
       # Umgekehrt liefe jeder Bildaufruf auf Staging in eine 403-Absage: die
       # Sperre weist fail-loud ab und faellt bewusst NICHT auf Anthropic zurueck.
+      #
+      #   4. APP-SEITIGE CACHES MITZIEHEN (E3, 2026-09-03). Dieser Schalter ist
+      #      fuer die Apps unsichtbar: ein Ergebnis-Cache, der nur am
+      #      Dokument-Hash haengt, liefert nach der Umstellung weiter die ALTE
+      #      Sonnet-Antwort — und die zaehlt dann faelschlich als Gemini-Treffer,
+      #      also als Messergebnis, das nie gemessen wurde. werking-energy hat
+      #      dafuer SCHEMA_PIPELINE_CACHE_SCOPE; wer hier umstellt, setzt ihn
+      #      mit (z.B. gemini-flash-2026-09). Gilt sinngemaess fuer jeden
+      #      weiteren Cache ueber Bildanalyse-Ergebnisse.
       - GEMINI_VISION_API_KEY=${GEMINI_VISION_API_KEY:-}
       - BRIDGE_GEMINI_VISION_ENABLED=${BRIDGE_GEMINI_VISION_ENABLED:-false}
       - GEMINI_VISION_MODEL=${GEMINI_VISION_MODEL:-}
@@ -304,6 +313,15 @@ services:
       #   3. ERST DANN BRIDGE_VISION_DEFAULT_PROVIDER=gemini
       # Umgekehrt liefe jeder Bildaufruf auf Staging in eine 403-Absage: die
       # Sperre weist fail-loud ab und faellt bewusst NICHT auf Anthropic zurueck.
+      #
+      #   4. APP-SEITIGE CACHES MITZIEHEN (E3, 2026-09-03). Dieser Schalter ist
+      #      fuer die Apps unsichtbar: ein Ergebnis-Cache, der nur am
+      #      Dokument-Hash haengt, liefert nach der Umstellung weiter die ALTE
+      #      Sonnet-Antwort — und die zaehlt dann faelschlich als Gemini-Treffer,
+      #      also als Messergebnis, das nie gemessen wurde. werking-energy hat
+      #      dafuer SCHEMA_PIPELINE_CACHE_SCOPE; wer hier umstellt, setzt ihn
+      #      mit (z.B. gemini-flash-2026-09). Gilt sinngemaess fuer jeden
+      #      weiteren Cache ueber Bildanalyse-Ergebnisse.
       - GEMINI_VISION_API_KEY=${GEMINI_VISION_API_KEY:-}
       - BRIDGE_GEMINI_VISION_ENABLED=${BRIDGE_GEMINI_VISION_ENABLED:-false}
       - GEMINI_VISION_MODEL=${GEMINI_VISION_MODEL:-}
@@ -454,6 +472,15 @@ services:
       #   3. ERST DANN BRIDGE_VISION_DEFAULT_PROVIDER=gemini
       # Umgekehrt liefe jeder Bildaufruf auf Staging in eine 403-Absage: die
       # Sperre weist fail-loud ab und faellt bewusst NICHT auf Anthropic zurueck.
+      #
+      #   4. APP-SEITIGE CACHES MITZIEHEN (E3, 2026-09-03). Dieser Schalter ist
+      #      fuer die Apps unsichtbar: ein Ergebnis-Cache, der nur am
+      #      Dokument-Hash haengt, liefert nach der Umstellung weiter die ALTE
+      #      Sonnet-Antwort — und die zaehlt dann faelschlich als Gemini-Treffer,
+      #      also als Messergebnis, das nie gemessen wurde. werking-energy hat
+      #      dafuer SCHEMA_PIPELINE_CACHE_SCOPE; wer hier umstellt, setzt ihn
+      #      mit (z.B. gemini-flash-2026-09). Gilt sinngemaess fuer jeden
+      #      weiteren Cache ueber Bildanalyse-Ergebnisse.
       - GEMINI_VISION_API_KEY=${GEMINI_VISION_API_KEY:-}
       - BRIDGE_GEMINI_VISION_ENABLED=${BRIDGE_GEMINI_VISION_ENABLED:-false}
       - GEMINI_VISION_MODEL=${GEMINI_VISION_MODEL:-}
@@ -604,6 +631,15 @@ services:
       #   3. ERST DANN BRIDGE_VISION_DEFAULT_PROVIDER=gemini
       # Umgekehrt liefe jeder Bildaufruf auf Staging in eine 403-Absage: die
       # Sperre weist fail-loud ab und faellt bewusst NICHT auf Anthropic zurueck.
+      #
+      #   4. APP-SEITIGE CACHES MITZIEHEN (E3, 2026-09-03). Dieser Schalter ist
+      #      fuer die Apps unsichtbar: ein Ergebnis-Cache, der nur am
+      #      Dokument-Hash haengt, liefert nach der Umstellung weiter die ALTE
+      #      Sonnet-Antwort — und die zaehlt dann faelschlich als Gemini-Treffer,
+      #      also als Messergebnis, das nie gemessen wurde. werking-energy hat
+      #      dafuer SCHEMA_PIPELINE_CACHE_SCOPE; wer hier umstellt, setzt ihn
+      #      mit (z.B. gemini-flash-2026-09). Gilt sinngemaess fuer jeden
+      #      weiteren Cache ueber Bildanalyse-Ergebnisse.
       - GEMINI_VISION_API_KEY=${GEMINI_VISION_API_KEY:-}
       - BRIDGE_GEMINI_VISION_ENABLED=${BRIDGE_GEMINI_VISION_ENABLED:-false}
       - GEMINI_VISION_MODEL=${GEMINI_VISION_MODEL:-}
