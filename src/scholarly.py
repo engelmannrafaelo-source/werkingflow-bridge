@@ -158,7 +158,7 @@ def _openalex(query: str, n: int) -> List[Dict[str, Any]]:
         )
         return []
     out = []
-    for w in r.json().get("results", []):
+    for rang, w in enumerate(r.json().get("results", [])):
         oa = w.get("open_access") or {}
         abstract = _reconstruct_abstract(w.get("abstract_inverted_index"))
         out.append({
@@ -169,6 +169,7 @@ def _openalex(query: str, n: int) -> List[Dict[str, Any]]:
             "text": abstract,
             "kind": "abstract",
             "source": "OpenAlex",
+            "rang": rang,
         })
     return out
 
@@ -197,7 +198,7 @@ def _core(query: str, n: int) -> List[Dict[str, Any]]:
             return []
         out = []
         placeholders = 0
-        for w in r.json().get("results", []):
+        for rang, w in enumerate(r.json().get("results", [])):
             ft = w.get("fullText") or ""
             if ft.strip() == _CORE_NO_LICENCE_SENTINEL:
                 ft = ""          # Platzhalter ist KEIN Volltext
@@ -210,6 +211,7 @@ def _core(query: str, n: int) -> List[Dict[str, Any]]:
                 "text": ft,
                 "kind": "fulltext" if ft else "meta",
                 "source": "CORE",
+                "rang": rang,
             })
         if placeholders:
             # Sichtbar machen, dass CORE unlizenziert laeuft — sonst sieht der Betrieb nur
@@ -262,8 +264,13 @@ def _retrieve_and_format(queries: List[str], per_query: int) -> str:
         logger.warning("OA-Retrieval ohne verwertbare Quellen (0 Treffer mit Text) — Kontext-Block entfällt")
         return ""
 
-    # Volltext (CORE) zuerst, dann Abstracts — nach Textlänge
-    papers.sort(key=lambda p: (p["kind"] != "fulltext", -len(p.get("text", ""))))
+    # Volltext zuerst, danach nach RELEVANZ (Rang in der Trefferliste der jeweiligen Query),
+    # erst zuletzt nach Textlänge. Vorher wurde ausschliesslich nach Laenge sortiert — damit
+    # gewann der laengste Abstract unabhaengig davon, ob er zum Thema gehoert. Messung
+    # 03.09.2026 an der Druckbelueftungs-Frage: auf Platz zwei stand ein Aufsatz ueber
+    # Insektizid-Formulierungen, nur weil dessen Abstract laenger war. Beide Quellen liefern
+    # relevanzsortiert, dieser Rang war bisher weggeworfen worden.
+    papers.sort(key=lambda p: (p["kind"] != "fulltext", p.get("rang", 999), -len(p.get("text", ""))))
     fulltext_n = sum(1 for p in papers[:_MAX_ENTRIES] if p["kind"] == "fulltext")
     _msg = f"OA-Kontext: {min(len(papers), _MAX_ENTRIES)} Quellen, davon {fulltext_n} Volltext"
     if fulltext_n == 0:
