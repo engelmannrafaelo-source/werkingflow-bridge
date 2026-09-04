@@ -886,6 +886,73 @@ deploy_one_service() {
 # ============================================================================
 # Phase 5: End-to-End Smoke Test
 # ============================================================================
+# Phase 6 — per-worker configuration self-test.
+#
+# Ein Worker kann gesund sein und trotzdem falsch konfiguriert: Docker friert
+# die Umgebung beim ERZEUGEN des Containers ein, und die Recherche-Bibliothek
+# schaltet sich still ab, wenn auch nur einer ihrer sechs Werte fehlt
+# (library_enabled(), src/research_cloud/library.py:60-64). _build_tools()
+# haengt die Bibliotheks-Werkzeuge dann kommentarlos nicht an — kein Fehler,
+# kein Alarm, nur duennere Antworten. Genau so lief die Produktions-Bridge von
+# Ende Juli bis 04.09.2026: die Worker waren gruen, die Recherche antwortete,
+# aber ohne die kuratierten OIB-Richtlinien und Bauordnungen. Beim Worker-Umzug
+# (ADR-0009, 30./31.08.) waren die Variablennamen mitgekommen, die Werte nicht.
+#
+# Die Pruefung ist an RESEARCH_CLOUD_ENABLED gekoppelt: wo die Cloud-Recherche
+# aus ist, ist die Bibliothek gegenstandslos und wird uebersprungen. Wo sie an
+# ist, ist die Bibliothek Teil der zugesagten Qualitaet — fehlt sie, faellt der
+# Deploy laut aus, statt still schlechtere Recherchen auszuliefern.
+phase_worker_config_selftest() {
+    local host="$1"; shift
+    local containers=("$@")
+
+    [[ ${#containers[@]} -eq 0 ]] && return 0
+    step "Phase 6: worker config self-test (${#containers[@]} worker)"
+
+    if [[ "$DRY_RUN" == "true" ]]; then
+        info "[DRY-RUN] Would verify library_enabled() in: ${containers[*]}"
+        return 0
+    fi
+
+    local failed=0 c out
+    for c in "${containers[@]}"; do
+        out=$(rssh "$host" "docker exec -w /app -e PYTHONPATH=/app '${c}' poetry run python -c \"
+import os
+from src.research_cloud.library import library_enabled, load_library_config
+if os.getenv('RESEARCH_CLOUD_ENABLED', '').lower() != 'true':
+    print('SKIP research cloud disabled')
+elif library_enabled(load_library_config()):
+    print('OK')
+else:
+    keys = ['RESEARCH_LIBRARY_ENABLED', 'RESEARCH_LIBRARY_S3_BUCKET',
+            'RESEARCH_LIBRARY_S3_ENDPOINT_URL', 'RESEARCH_LIBRARY_S3_ACCESS_KEY_ID',
+            'RESEARCH_LIBRARY_S3_SECRET_ACCESS_KEY', 'RESEARCH_LIBRARY_S3_REGION']
+    print('MISSING ' + ','.join(k for k in keys if not os.getenv(k)))
+\" 2>&1 | tr -d '\r' | tail -1" || echo "EXEC_FAILED")
+
+        case "$out" in
+            OK)      info "  ${c}: Recherche-Bibliothek aktiv" ;;
+            SKIP*)   info "  ${c}: ${out#SKIP } — Bibliotheks-Pruefung entfaellt" ;;
+            MISSING*)
+                error_ "  ${c}: Cloud-Recherche ist AN, aber die Bibliothek ist abgeschaltet."
+                error_ "        Leer im Container: ${out#MISSING }"
+                failed=1 ;;
+            *)
+                error_ "  ${c}: Selbsttest nicht auswertbar: ${out}"
+                failed=1 ;;
+        esac
+    done
+
+    if (( failed )); then
+        error_ "Worker-Config-Selbsttest fehlgeschlagen — die Recherche liefe ohne Bibliothek."
+        error_ "  Werte kommen aus Infisical (dev-server/dev, RESEARCH_LIBRARY_*), nicht von Hand:"
+        error_ "    BRIDGE_HOST=${host} /root/projekte/orchestrator/bin/sync-infisical-to-bridge"
+        error_ "  Ein Container-RESTART reicht nicht — die Env wird beim Erzeugen eingefroren."
+        return 1
+    fi
+    return 0
+}
+
 phase_smoke_test() {
     local label="$1"
     local url="$2"
@@ -1769,6 +1836,23 @@ deploy_server() {
         step "Phase 5: Smoke test — N/A (${server_name} has no public endpoint yet)"
         info "Per-worker health already verified in Phase 4 (${DEPLOYED_SERVICES[*]})."
         info "Full request-path smoke only applies after the nginx cutover — see ADR-0009."
+    fi
+
+    # === Phase 6: worker config self-test ===
+    # Laeuft fuer JEDE Topologie, auch fuer prod-workers ohne oeffentlichen
+    # Endpunkt: die Pruefung geht in den Container, nicht ueber nginx.
+    local selftest_containers=()
+    for svc in "${DEPLOYED_SERVICES[@]}"; do
+        [[ "$svc" == *worker* ]] || continue
+        selftest_containers+=("$(container_for_svc "$server_prefix" "$svc")")
+    done
+    if (( ${#selftest_containers[@]} > 0 )); then
+        phase_worker_config_selftest "$host" "${selftest_containers[@]}" || {
+            error_ "Deploy gestoppt: der Code liegt auf dem Host und die Worker sind gesund —"
+            error_ "  aber sie sind falsch konfiguriert. KEIN Rollback: der Code ist nicht die"
+            error_ "  Ursache, ein Zuruecksetzen wuerde nichts heilen. Env korrigieren, dann erneut."
+            return 1
+        }
     fi
 
     # === Phase 7: Success report ===
