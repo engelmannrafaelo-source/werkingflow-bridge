@@ -4280,6 +4280,46 @@ async def _execute_research_impl(
             )
 
         if not content and parsed_assistant_text:
+            # The fallback is for "the agent answered inline instead of writing a
+            # file" — not for "the agent said what it was about to do and then
+            # stopped". Measured 2026-09-04 (A/B-Lauf, Frage Fluchtweglänge): the
+            # whole deliverable was 100 characters, "I'll research the maximum
+            # escape route length…", returned as HTTP 200 status=success after 93
+            # seconds. A caller has no way to tell that apart from a report.
+            #
+            # So: an inline answer that produced no report file AND stays under
+            # the floor below is treated as the unfinished run it is. The floor is
+            # calibrated, not guessed — real inline reports in that same run were
+            # 4.191 / 7.332 / 7.809 characters, and the system prompt requires an
+            # executive summary, detail findings AND a source list, which does not
+            # fit into 500. Anything written to a file passes regardless of length.
+            #
+            # This DETECTS, it does not cure: the likely upstream cause is the one
+            # the sibling guard above already names (a rate_limit_event whose
+            # internal retry never recovered). Raising here makes the caller defer
+            # and retry instead of storing an announcement as a research result.
+            if len(parsed_assistant_text.strip()) < RESEARCH_MIN_INLINE_REPORT_CHARS:
+                logger.error(
+                    f"❌ Research produced no report: no output file and only "
+                    f"{len(parsed_assistant_text.strip())} chars of inline text "
+                    f"(session_id={session_id}, chunks={len(all_chunks)}): "
+                    f"{parsed_assistant_text.strip()[:200]!r}"
+                )
+                raise HTTPException(
+                    status_code=500,
+                    detail={
+                        "message": "Research SDK completed but produced no usable report",
+                        "inline_chars": len(parsed_assistant_text.strip()),
+                        "chunks_received": len(all_chunks),
+                        "session_id": session_id,
+                        "execution_time_seconds": round(execution_time, 2),
+                        "hint": (
+                            "The run returned only an opening statement, no report. "
+                            "Same likely cause as an empty run: a rate_limit_event "
+                            "whose internal retry never recovered. Retryable."
+                        ),
+                    },
+                )
             logger.warning(
                 f"⚠️  Research: file content unavailable but parsed_text exists "
                 f"({len(parsed_assistant_text)} chars) -- using parsed_text as content fallback"
@@ -4441,7 +4481,7 @@ async def _execute_research_cloud_impl(
     """
     from src.research_cloud.anonymize_gate import CloudAnonymizeError, anonymize_query_for_cloud
     from src.research_cloud.executor import ResearchCloudExecutorError, run_research_cloud
-    from src.research_cloud.library import library_enabled, load_library_config
+    from src.research_cloud.library import LibraryUnavailableError, load_library_config, load_library_for_run
     from src.research_cloud.models import ResearchCloudConfig
     from src.research_cloud.pricing_tiers import customer_price_eur
     from src.research_cloud.prompt import build_system_prompt, search_budget_for_depth
@@ -4477,12 +4517,38 @@ async def _execute_research_cloud_impl(
         logger.warning(f"research-cloud: OA-Scholarly-Schicht übersprungen (fail-soft): {_oa_err}")
 
     library_cfg = load_library_config()
-    system_prompt = build_system_prompt(request_body.depth, library_enabled=library_enabled(library_cfg))
+    # Resolve the library BEFORE the first token is spent: this both loads the
+    # catalogue that goes into the system prompt and is the one moment where a
+    # library that is switched on but broken can still fail cheaply and loudly.
+    # Before 2026-09-05 neither existed — a half-configured library just dropped
+    # its tools, and stale credentials produced a "successful" research that had
+    # silently answered from the open web (prod, ADR-0009 worker move → 04.09.).
+    try:
+        library_index = await load_library_for_run(library_cfg)
+    except LibraryUnavailableError as e:
+        logger.error(f"research-cloud: research library unusable, refusing the run: {e}")
+        return ResearchResponse(
+            status="error",
+            query=request_body.query,
+            model=request_body.model,
+            execution_time_seconds=round(time.time() - start_time, 2),
+            error=(
+                "Die kuratierte Recherche-Bibliothek ist eingeschaltet, aber nicht "
+                f"benutzbar — die Recherche wurde nicht gestartet: {e}"
+            ),
+        )
+    system_prompt = build_system_prompt(request_body.depth, library_index=library_index)
     search_max_uses, fetch_max_uses = search_budget_for_depth(request_body.depth)
     config = ResearchCloudConfig(web_search_max_uses=search_max_uses, web_fetch_max_uses=fetch_max_uses)
 
     try:
-        result = await run_research_cloud(prompt, system_prompt, config=config, library_config=library_cfg)
+        result = await run_research_cloud(
+            prompt,
+            system_prompt,
+            config=config,
+            library_config=library_cfg,
+            library_index=library_index,
+        )
     except ResearchCloudExecutorError as e:
         execution_time = time.time() - start_time
         logger.error(f"research-cloud: executor failed: {e}", exc_info=True)
@@ -4661,6 +4727,11 @@ async def _admit_research_to_pool(
     # cache_request_body_dependency deliberately left out.
     await enforce_pool_admission(request)
     return None
+
+
+# Floor for an inline research answer that never produced a report file. See
+# the guard in _execute_research_impl for the calibration.
+RESEARCH_MIN_INLINE_REPORT_CHARS = 500
 
 
 # Same-path retries before a cloud failure is surfaced loud: 1 initial

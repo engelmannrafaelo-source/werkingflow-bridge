@@ -326,14 +326,9 @@ async def test_library_index_tool_call_continues_loop_and_sends_tool_result():
         ]
     )
 
-    with pytest.MonkeyPatch.context() as mp:
-        mp.setattr(
-            "src.research_cloud.executor.fetch_library_index",
-            AsyncMock(return_value=_INDEX),
-        )
-        result = await run_research_cloud(
-            "query", "system", api_key="sk-test", client=client, library_config=_LIBRARY_CFG
-        )
+    result = await run_research_cloud(
+        "query", "system", api_key="sk-test", client=client, library_config=_LIBRARY_CFG, library_index=_INDEX
+    )
 
     assert result.content == "done after library_index"
     assert result.iterations == 2
@@ -366,7 +361,7 @@ async def test_library_get_tool_call_returns_search_result_block_with_citations(
             AsyncMock(return_value=doc),
         )
         result = await run_research_cloud(
-            "query", "system", api_key="sk-test", client=client, library_config=_LIBRARY_CFG
+            "query", "system", api_key="sk-test", client=client, library_config=_LIBRARY_CFG, library_index=_INDEX
         )
 
     assert result.content == "done after library_get"
@@ -401,7 +396,7 @@ async def test_library_tool_fetch_error_is_fail_soft_not_raised():
             AsyncMock(side_effect=LibraryFetchError("unknown library document id: 'missing-doc'")),
         )
         result = await run_research_cloud(
-            "query", "system", api_key="sk-test", client=client, library_config=_LIBRARY_CFG
+            "query", "system", api_key="sk-test", client=client, library_config=_LIBRARY_CFG, library_index=_INDEX
         )
 
     assert result.status == "success"
@@ -420,7 +415,7 @@ async def test_unrecognized_client_tool_use_fails_loud():
 
     with pytest.raises(ResearchCloudExecutorError, match="cannot answer client tools"):
         await run_research_cloud(
-            "query", "system", api_key="sk-test", client=client, library_config=_LIBRARY_CFG
+            "query", "system", api_key="sk-test", client=client, library_config=_LIBRARY_CFG, library_index=_INDEX
         )
 
 
@@ -430,16 +425,11 @@ async def test_exhausting_max_continuations_during_tool_use_reports_stop_reason(
     client.post = AsyncMock(return_value=_tool_use_response("library_index", {}))
     config = ResearchCloudConfig(max_continuations=1)
 
-    with pytest.MonkeyPatch.context() as mp:
-        mp.setattr(
-            "src.research_cloud.executor.fetch_library_index",
-            AsyncMock(return_value=_INDEX),
+    with pytest.raises(ResearchCloudExecutorError, match="still tool_use"):
+        await run_research_cloud(
+            "query", "system", config=config, api_key="sk-test",
+            client=client, library_config=_LIBRARY_CFG, library_index=_INDEX,
         )
-        with pytest.raises(ResearchCloudExecutorError, match="still tool_use"):
-            await run_research_cloud(
-                "query", "system", config=config, api_key="sk-test",
-                client=client, library_config=_LIBRARY_CFG,
-            )
 
 
 @pytest.mark.asyncio
@@ -483,14 +473,9 @@ async def test_completed_library_turn_stays_in_history_for_later_continuations()
         ]
     )
 
-    with pytest.MonkeyPatch.context() as mp:
-        mp.setattr(
-            "src.research_cloud.executor.fetch_library_index",
-            AsyncMock(return_value=_INDEX),
-        )
-        result = await run_research_cloud(
-            "query", "system", api_key="sk-test", client=client, library_config=_LIBRARY_CFG
-        )
+    result = await run_research_cloud(
+        "query", "system", api_key="sk-test", client=client, library_config=_LIBRARY_CFG, library_index=_INDEX
+    )
 
     assert result.content == "final"
 
@@ -546,7 +531,7 @@ async def test_foreign_client_tool_fails_loud_before_api_roundtrip():
 
     with pytest.raises(ResearchCloudExecutorError, match="run_command"):
         await run_research_cloud(
-            "query", "system", api_key="sk-test", client=client, library_config=_LIBRARY_CFG
+            "query", "system", api_key="sk-test", client=client, library_config=_LIBRARY_CFG, library_index=_INDEX
         )
     assert client.post.call_count == 1
 
@@ -577,7 +562,7 @@ async def test_programmatic_caller_fails_loud():
 
     with pytest.raises(ResearchCloudExecutorError, match="non-direct"):
         await run_research_cloud(
-            "query", "system", api_key="sk-test", client=client, library_config=_LIBRARY_CFG
+            "query", "system", api_key="sk-test", client=client, library_config=_LIBRARY_CFG, library_index=_INDEX
         )
 
 
@@ -594,3 +579,24 @@ def test_build_tools_returns_copies_of_library_tool_dicts():
 
     assert "cache_control" not in _LIBRARY_INDEX_TOOL
     assert "injected" not in _LIBRARY_INDEX_TOOL["input_schema"]["properties"]
+
+
+@pytest.mark.asyncio
+async def test_truncated_report_fails_loud_instead_of_passing_as_finished():
+    """stop_reason=max_tokens used to fall through the pause_turn check and
+    return status="success" with a report cut off mid-sentence — measured
+    2026-09-05, source list truncated mid-entry."""
+    client = MagicMock()
+    client.post = AsyncMock(
+        return_value=_response(
+            200,
+            {
+                "model": "claude-sonnet-5",
+                "stop_reason": "max_tokens",
+                "usage": _usage(),
+                "content": [{"type": "text", "text": "# Report\n\nHalber Satz, dann"}],
+            },
+        )
+    )
+    with pytest.raises(ResearchCloudExecutorError, match="truncated"):
+        await run_research_cloud("query", "system", api_key="sk-test", client=client)

@@ -23,6 +23,39 @@ class LibraryFetchError(Exception):
     boundary and turned into a fail-soft tool_result, never raised further."""
 
 
+class LibraryUnavailableError(Exception):
+    """The library was switched ON but cannot be used — missing config, or an
+    index that does not load.
+
+    Deliberately NOT a LibraryFetchError: that one is the fail-soft, per-call
+    kind ("this one document did not load, carry on"). This one is the loud
+    kind and aborts the run BEFORE any model tokens are spent.
+
+    Why loud: presence-only gating used to make the two indistinguishable.
+    RESEARCH_LIBRARY_ENABLED=true with empty values silently dropped the tools
+    from the request (library_enabled() checks presence, not validity), and
+    stale credentials advertised tools whose every call failed fail-soft — the
+    run still reported success. Production ran that way from the ADR-0009
+    worker move until 2026-09-04 without a single error (library_calls = 0 for
+    two weeks). A library that is configured-on and does not work must say so,
+    never quietly answer from the open web instead (Rafael 2026-09-05).
+    """
+
+
+# Curator convention in index.json: an ``ext-`` id is a catalogue pointer to an
+# external portal, NOT a stored full text — there is no docs/<id>.md behind it.
+# Every one of these entries also spells it out in its ``note`` ("KATALOG-EINTRAG
+# OHNE VOLLTEXT"), but prose in one of eight fields is not something a caller can
+# branch on, so the prefix is the machine-readable contract.
+EXTERNAL_ENTRY_ID_PREFIX = "ext-"
+
+
+def entry_has_fulltext(entry: Dict[str, Any]) -> bool:
+    """True iff ``library_get`` can actually return a stored full text for this
+    index entry."""
+    return not str(entry.get("id", "")).startswith(EXTERNAL_ENTRY_ID_PREFIX)
+
+
 class LibraryConfig(BaseModel):
     """Snapshot of RESEARCH_LIBRARY_* env vars. Loaded once per research run
     (load_library_config) so the tool-availability check (library_enabled)
@@ -112,16 +145,83 @@ def _find_index_entry(index: Dict[str, Any], doc_id: str) -> Dict[str, Any]:
     return entry
 
 
-async def fetch_library_document(doc_id: str, config: LibraryConfig) -> Dict[str, Any]:
+async def fetch_library_document(
+    doc_id: str, config: LibraryConfig, *, index: Optional[Dict[str, Any]] = None
+) -> Dict[str, Any]:
     """Fetch one document's full text plus its index metadata (for the
     source/title attribution on the resulting search_result block).
 
     The id is validated against index.json first — only ids the curated
     index actually lists are ever used to build an S3 key, so a
     model-supplied id cannot address arbitrary bucket keys.
+
+    ``index``, if given, is the already-loaded index for this run (the
+    executor holds one) — saves a second S3 GET per document and keeps the
+    catalogue the model was shown and the lookup that answers it identical.
     """
-    index = await fetch_library_index(config)
+    if index is None:
+        index = await fetch_library_index(config)
     entry = _find_index_entry(index, doc_id)
+    if not entry_has_fulltext(entry):
+        # Answering this with a bare S3 404 would tell the model "the library
+        # is broken" when the truth is "this entry never had a full text".
+        # Name the alternative instead, so the run continues on the open web
+        # for exactly this source.
+        raise LibraryFetchError(
+            f"{doc_id!r} is a catalogue entry without a stored full text — "
+            f"there is nothing to load. Use its source instead: "
+            f"{entry.get('source_url') or entry.get('publisher') or 'no source_url in the index'}"
+        )
     key = f"{config.prefix}docs/{doc_id}.md"
     text = await asyncio.to_thread(_get_object_sync, config, key)
     return {"entry": entry, "text": text}
+
+
+async def load_library_for_run(config: LibraryConfig) -> Optional[Dict[str, Any]]:
+    """Resolve the library once per research run, before any model tokens are
+    spent. Returns the loaded index, or None when the library is switched off.
+
+    Three outcomes, deliberately distinct:
+
+    * flag off            -> None. The library is not part of this run; the
+                             executor offers no library tools. Legitimate.
+    * flag on, unusable   -> LibraryUnavailableError. Missing config values, or
+                             an index that will not load (typically credentials
+                             that were rotated without a re-sync). Loud, and
+                             cheap: it happens before the first API call.
+    * flag on, usable     -> the parsed index, which the run then both shows to
+                             the model (prompt catalogue) and serves its
+                             library_index calls from.
+
+    The middle case is the one this function exists for. Everything else in
+    this module is fail-soft by design; a library that was switched on and does
+    not work is a configuration fault, not a degraded document.
+    """
+    if not config.enabled:
+        return None
+    if not config.configured:
+        missing = [
+            name
+            for name, value in (
+                ("RESEARCH_LIBRARY_S3_ENDPOINT_URL", config.endpoint_url),
+                ("RESEARCH_LIBRARY_S3_BUCKET", config.bucket),
+                ("RESEARCH_LIBRARY_S3_ACCESS_KEY_ID", config.access_key_id),
+                ("RESEARCH_LIBRARY_S3_SECRET_ACCESS_KEY", config.secret_access_key),
+            )
+            if not value
+        ]
+        raise LibraryUnavailableError(
+            "RESEARCH_LIBRARY_ENABLED is on, but the library is not configured — "
+            f"empty or missing: {', '.join(missing)}"
+        )
+    try:
+        index = await fetch_library_index(config)
+    except LibraryFetchError as e:
+        raise LibraryUnavailableError(
+            f"RESEARCH_LIBRARY_ENABLED is on, but the library index does not load: {e}"
+        ) from e
+    if not index.get("documents"):
+        raise LibraryUnavailableError(
+            "RESEARCH_LIBRARY_ENABLED is on, but the library index lists no documents"
+        )
+    return index

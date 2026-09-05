@@ -51,7 +51,15 @@ class ResearchCloudConfig(BaseModel):
     request-controllable (a caller cannot raise its own cost ceiling)."""
 
     model: str = "claude-sonnet-5"
-    max_tokens: int = 20000
+    # Raised from 20000 on 2026-09-05. Adaptive thinking bills its tokens against
+    # this ceiling too, so a report backed by library full texts reaches it far
+    # sooner than the visible answer suggests: the first catalogue-enabled run
+    # (OIB-RL 2.1 Brandabschnittsflächen, depth=quick) stopped at max_tokens with
+    # only 6.438 characters of visible report — the source list was cut off
+    # mid-entry. Sonnet 5 permits up to 128K here; 32000 is chosen to leave real
+    # headroom while staying comfortably inside the non-streaming HTTP timeout
+    # below (this executor posts without streaming).
+    max_tokens: int = 32000
     max_continuations: int = 8
     http_timeout_seconds: float = 900.0
     web_search_max_uses: int = 15

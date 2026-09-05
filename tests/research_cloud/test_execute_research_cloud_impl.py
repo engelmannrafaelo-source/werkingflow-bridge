@@ -238,3 +238,67 @@ async def test_output_path_is_written_by_bridge(tmp_path):
     assert result.output_file == str(out_path)
     assert out_path.read_text() == "written content"
     assert result.file_size_bytes == len("written content".encode("utf-8"))
+
+
+# ---------------------------------------------------------------------------
+# Library resolution happens BEFORE the executor runs (2026-09-05): a library
+# that is switched on and unusable stops the research instead of quietly
+# producing a web-only answer that reports success.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_unusable_library_aborts_before_any_model_call():
+    from src.research_cloud.library import LibraryUnavailableError
+
+    req = _make_req()
+    executor_mock = AsyncMock()
+    with (
+        patch(
+            "src.research_cloud.anonymize_gate.anonymize_query_for_cloud",
+            new=AsyncMock(return_value="ANON_ query"),
+        ),
+        patch(
+            "src.research_cloud.library.load_library_for_run",
+            new=AsyncMock(
+                side_effect=LibraryUnavailableError(
+                    "RESEARCH_LIBRARY_ENABLED is on, but the library is not configured — "
+                    "empty or missing: RESEARCH_LIBRARY_S3_SECRET_ACCESS_KEY"
+                )
+            ),
+        ),
+        patch("src.research_cloud.executor.run_research_cloud", executor_mock),
+        patch("src.scholarly.scholarly_enabled", return_value=False),
+    ):
+        result = await src.main._execute_research_cloud_impl(MagicMock(), req, attribution_ctx={})
+
+    assert result.status == "error"
+    assert "Bibliothek" in result.error
+    assert "RESEARCH_LIBRARY_S3_SECRET_ACCESS_KEY" in result.error
+    # The point of doing this first: nothing was spent.
+    executor_mock.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_loaded_catalogue_reaches_both_the_prompt_and_the_executor():
+    """The catalogue in the prompt and the index answering library_index must
+    be the same object — a prompt that advertises documents the tool cannot
+    serve would be a new silent failure, not a fix for the old one."""
+    index = {"documents": [{"id": "doc-a", "title": "Doc A", "jurisdiction": "AT"}]}
+    req = _make_req()
+    executor_mock = AsyncMock(return_value=_cloud_result())
+    with (
+        patch(
+            "src.research_cloud.anonymize_gate.anonymize_query_for_cloud",
+            new=AsyncMock(return_value="ANON_ query"),
+        ),
+        patch("src.research_cloud.library.load_library_for_run", new=AsyncMock(return_value=index)),
+        patch("src.research_cloud.executor.run_research_cloud", executor_mock),
+        patch("src.activity.ai_call_writer.persist_ai_call_activity", new=AsyncMock()),
+        patch("src.scholarly.scholarly_enabled", return_value=False),
+    ):
+        await src.main._execute_research_cloud_impl(MagicMock(), req, attribution_ctx={})
+
+    args, kwargs = executor_mock.await_args
+    assert kwargs["library_index"] is index
+    assert "`doc-a`" in args[1]  # system prompt carries the catalogue

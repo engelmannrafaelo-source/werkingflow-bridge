@@ -10,10 +10,13 @@ import pytest
 from src.research_cloud.library import (
     LibraryConfig,
     LibraryFetchError,
+    LibraryUnavailableError,
+    entry_has_fulltext,
     fetch_library_document,
     fetch_library_index,
     library_enabled,
     load_library_config,
+    load_library_for_run,
 )
 
 _CONFIGURED = LibraryConfig(
@@ -151,3 +154,80 @@ async def test_fetch_library_document_s3_error_raises_library_fetch_error(monkey
     )
     with pytest.raises(LibraryFetchError, match="S3 GetObject failed"):
         await fetch_library_document("doc-a", _CONFIGURED)
+
+
+# ---------------------------------------------------------------------------
+# load_library_for_run — the once-per-run resolution that decides whether the
+# run may start at all (2026-09-05). Three outcomes, and the middle one is the
+# reason it exists: a library switched ON that does not work used to be
+# indistinguishable from one switched off.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_load_library_for_run_returns_none_when_flag_is_off():
+    assert await load_library_for_run(LibraryConfig()) is None
+
+
+@pytest.mark.asyncio
+async def test_load_library_for_run_names_the_empty_variables():
+    """The prod failure mode from the ADR-0009 worker move: variable names
+    moved with the containers, values did not. Presence-only gating swallowed
+    it for two weeks — now it names which of the six are empty."""
+    half = LibraryConfig(enabled=True, endpoint_url="https://fsn1.example.com", bucket="b")
+    with pytest.raises(LibraryUnavailableError) as excinfo:
+        await load_library_for_run(half)
+    assert "RESEARCH_LIBRARY_S3_ACCESS_KEY_ID" in str(excinfo.value)
+    assert "RESEARCH_LIBRARY_S3_SECRET_ACCESS_KEY" in str(excinfo.value)
+
+
+@pytest.mark.asyncio
+async def test_load_library_for_run_raises_when_index_does_not_load(monkeypatch):
+    """Stale credentials — the harder state: presence is fine, every fetch
+    fails. Fail-soft would report a successful research that quietly answered
+    from the open web."""
+    monkeypatch.setattr(
+        "src.research_cloud.library._get_s3_client",
+        lambda config: _fake_s3_client({}),  # index.json missing -> SignatureDoesNotMatch-alike
+    )
+    with pytest.raises(LibraryUnavailableError, match="index does not load"):
+        await load_library_for_run(_CONFIGURED)
+
+
+@pytest.mark.asyncio
+async def test_load_library_for_run_returns_index_when_usable(monkeypatch):
+    monkeypatch.setattr(
+        "src.research_cloud.library._get_s3_client",
+        lambda config: _fake_s3_client({"research-library/index.json": json.dumps(_INDEX)}),
+    )
+    index = await load_library_for_run(_CONFIGURED)
+    assert index["documents"] == _INDEX["documents"]
+
+
+@pytest.mark.asyncio
+async def test_catalogue_only_entry_is_refused_with_its_source(monkeypatch):
+    """The 20 ``ext-`` entries have no docs/<id>.md. Before, library_get built
+    the key anyway and returned an opaque S3 error that reads like a broken
+    library; now it says what the entry is and where to go instead."""
+    index = {
+        "documents": [
+            {
+                "id": "ext-portal",
+                "title": "Externes Portal",
+                "source_url": "https://example.org/portal",
+            }
+        ]
+    }
+    monkeypatch.setattr(
+        "src.research_cloud.library._get_s3_client",
+        lambda config: _fake_s3_client({"research-library/index.json": json.dumps(index)}),
+    )
+    with pytest.raises(LibraryFetchError) as excinfo:
+        await fetch_library_document("ext-portal", _CONFIGURED)
+    assert "without a stored full text" in str(excinfo.value)
+    assert "https://example.org/portal" in str(excinfo.value)
+
+
+def test_entry_has_fulltext_keys_off_the_ext_prefix():
+    assert entry_has_fulltext({"id": "at-tirol-tbv2026-anlage1"}) is True
+    assert entry_has_fulltext({"id": "ext-klimaaktiv-publikationen"}) is False

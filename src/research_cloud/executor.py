@@ -30,10 +30,11 @@ import httpx
 from src.research_cloud.library import (
     LibraryConfig,
     LibraryFetchError,
+    LibraryUnavailableError,
     fetch_library_document,
-    fetch_library_index,
     library_enabled,
     load_library_config,
+    load_library_for_run,
 )
 from src.research_cloud.models import (
     AnthropicMessagesResponse,
@@ -163,16 +164,23 @@ def _build_tools(config: ResearchCloudConfig, library_cfg: LibraryConfig) -> Lis
     return tools
 
 
-async def _handle_library_tool_call(block: Dict[str, Any], library_cfg: LibraryConfig) -> Dict[str, Any]:
-    """Execute one client-side library tool_use block. Fail-soft: any
-    LibraryFetchError (bad S3 config, unknown id, network error) becomes a
-    tool_result with is_error=True — the model sees the failure and can
-    continue the research without that document, the run never aborts."""
+async def _handle_library_tool_call(
+    block: Dict[str, Any], library_cfg: LibraryConfig, index: Dict[str, Any]
+) -> Dict[str, Any]:
+    """Execute one client-side library tool_use block against ``index``, the
+    index loaded once at the start of this run.
+
+    Fail-soft: any LibraryFetchError (unknown id, catalogue-only entry, network
+    error on a single document) becomes a tool_result with is_error=True — the
+    model sees the failure and can continue the research without that document.
+    The other kind of failure, "the library as a whole does not work", is not
+    handled here at all: it aborts the run before it starts
+    (library.load_library_for_run).
+    """
     name = block.get("name")
     tool_use_id = block.get("id")
     try:
         if name == "library_index":
-            index = await fetch_library_index(library_cfg)
             return {
                 "type": "tool_result",
                 "tool_use_id": tool_use_id,
@@ -182,7 +190,7 @@ async def _handle_library_tool_call(block: Dict[str, Any], library_cfg: LibraryC
             doc_id = (block.get("input") or {}).get("id")
             if not doc_id:
                 raise LibraryFetchError("library_get called without an 'id'")
-            doc = await fetch_library_document(doc_id, library_cfg)
+            doc = await fetch_library_document(doc_id, library_cfg, index=index)
             entry = doc["entry"]
             source = entry.get("source_url") or entry.get("publisher") or doc_id
             title = entry.get("title") or doc_id
@@ -221,6 +229,7 @@ async def run_research_cloud(
     api_key: Optional[str] = None,
     client: Optional[httpx.AsyncClient] = None,
     library_config: Optional[LibraryConfig] = None,
+    library_index: Optional[Dict[str, Any]] = None,
 ) -> ResearchCloudResult:
     """Run one research-cloud job to completion (all pause_turn continuations).
 
@@ -258,6 +267,21 @@ async def run_research_cloud(
         "anthropic-version": ANTHROPIC_VERSION,
     }
     library_cfg = library_config or load_library_config()
+    # The caller normally resolves the library first (it needs the index for the
+    # prompt catalogue) and hands it in. When it did not, resolve it here — the
+    # executor must never run with the library merely *assumed* to work.
+    if library_index is None:
+        try:
+            library_index = await load_library_for_run(library_cfg)
+        except LibraryUnavailableError as e:
+            raise ResearchCloudExecutorError(str(e)) from e
+    if library_index is None and library_enabled(library_cfg):
+        # Only reachable when a caller passes library_index=None explicitly for
+        # a library that IS on. Refuse rather than run a "library-less" research
+        # under a config that promises one.
+        raise ResearchCloudExecutorError(
+            "research library is enabled but no index was loaded for this run"
+        )
     tools = _build_tools(config, library_cfg)
     system: List[Dict[str, Any]] = [
         {"type": "text", "text": system_prompt, "cache_control": {"type": "ephemeral"}}
@@ -362,7 +386,9 @@ async def run_research_cloud(
                 tool_results = []
                 for tool_block in tool_use_blocks:
                     t_start = time.monotonic()
-                    tool_result = await _handle_library_tool_call(tool_block, library_cfg)
+                    tool_result = await _handle_library_tool_call(
+                        tool_block, library_cfg, library_index or {}
+                    )
                     library_calls += 1
                     _log_library_call(tool_block, tool_result, time.monotonic() - t_start)
                     tool_results.append(tool_result)
@@ -378,6 +404,21 @@ async def run_research_cloud(
                 ]
                 messages = list(base_messages)
                 continue
+
+            if parsed.stop_reason == "max_tokens":
+                # A report cut off at the token ceiling is not a report, and it
+                # cannot be continued: assistant prefill is removed on Sonnet 5
+                # (400), so there is no way to resume a truncated turn. Returning
+                # it as status="success" is the same silent-degradation class as
+                # the library that quietly switched itself off — worse here,
+                # because the missing part is typically the tail: the source list
+                # and the caveats. Measured 2026-09-05 on the first
+                # catalogue-enabled run, whose source list ended mid-entry.
+                raise ResearchCloudExecutorError(
+                    f"research-cloud run hit max_tokens={config.max_tokens} — the report "
+                    f"is truncated and cannot be resumed (no assistant prefill on "
+                    f"{config.model}). Refusing to return a partial report as a finished one."
+                )
 
             if parsed.stop_reason != "pause_turn":
                 break
