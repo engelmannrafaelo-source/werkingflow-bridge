@@ -546,11 +546,20 @@ async def delete_user(
       welche Tabellen das sind, entscheidet der Katalog, nicht eine gepflegte
       Liste (src/identity/tenant_lifecycle.py).
 
-    Refuses with 409 when the user still owns billing records that must survive
-    for audit reasons:
-      subscriptions      → ON DELETE RESTRICT
-      credit_purchases   → ON DELETE RESTRICT
-    This is BY DESIGN and permanent — cancelling a subscription changes its
+    Refuses with 409 when ANY foreign key still points at the user. The
+    audit-permanent ones (subscriptions, credit_purchases → ON DELETE RESTRICT)
+    are why the endpoint refuses at all — but they are far from the only ones,
+    and a fixed list here would drift the moment someone adds a table. Which
+    relations block is a property of the schema; ask it:
+
+      SELECT c.conrelid::regclass, c.confdeltype FROM pg_constraint c
+       WHERE c.contype='f' AND c.confrelid='users'::regclass;   -- 'r'/'a' block
+
+    (Measured 05.09.2026 on the dev bridge: 10 of 28 such constraints block,
+    across nine tables — usage_events among them, so a single answered call is
+    enough.) The 409 therefore names the table that ACTUALLY blocked, read out
+    of the Postgres error, instead of asserting a billing history the account
+    may not have. This is BY DESIGN and permanent — cancelling a subscription changes its
     status but not its existence, so the row (and the RESTRICT) survives even
     after every subscription is cancelled/refunded. There is no hard-delete
     path around it. An operator who needs to close such an account (disposable
@@ -602,16 +611,29 @@ async def delete_user(
                     owner_row["tenant_id"],
                     reason=f"hard-delete user {user_id}",
                 )
-    except asyncpg.ForeignKeyViolationError:
+    except asyncpg.ForeignKeyViolationError as fk_err:
+        # Der Grund wird AUS DEM FEHLER gelesen, nicht geraten. Bis 05.09.2026
+        # nannte diese Meldung fest "subscriptions oder credit_purchases" —
+        # ausgeloest wird sie aber von JEDEM Fremdschluessel auf users. Ein
+        # Testkonto, das einen einzigen Call gemacht hatte, war damit
+        # unloeschbar und bekam als Begruendung eine Abrechnungshistorie
+        # genannt, die es nicht gab (gemessen 05.09.: 0 subscriptions,
+        # 0 credit_purchases, je 1 Zeile in usage_events und activities).
+        # Wer die falsche Tabelle sucht, raeumt nicht auf — und die Regel
+        # "wer ein Testkonto anlegt, entfernt es" wird unerfuellbar.
+        blocking_table = getattr(fk_err, "table_name", None) or "unknown"
+        constraint = getattr(fk_err, "constraint_name", None) or "unknown"
         raise HTTPException(
             status_code=409,
             detail=(
-                f"User '{user_id}' has billing records (subscriptions or "
-                f"credit_purchases) that block deletion — retained permanently "
-                f"for audit/tax reasons, cancelling/refunding them does not "
-                f"remove the row. Hard-delete is refused by design; use "
-                f"POST /v1/users/{user_id}/anonymize (operator GDPR Art. 17 "
-                f"anonymize-with-retention) instead."
+                f"User '{user_id}' cannot be hard-deleted: rows in "
+                f"'{blocking_table}' still reference it (constraint "
+                f"{constraint}). Billing records (subscriptions, "
+                f"credit_purchases) are retained permanently for audit/tax "
+                f"reasons — cancelling or refunding them does not remove the "
+                f"row — but they are not the only blocking relation, so go by "
+                f"the table named above. Use POST /v1/users/{user_id}/anonymize "
+                f"(operator GDPR Art. 17 anonymize-with-retention) instead."
             ),
         )
     except TenantCleanupError as exc:

@@ -32,12 +32,30 @@
 -- die neuen Zeilen ab; sie gehen nicht verloren (Write-Ahead-Spool), bleiben
 -- aber offen, bis die Migration nachgezogen ist.
 --
+-- Sperrverhalten (gemessen 05.09.2026: dev-Bridge 119.604 Zeilen / 112 MB, und
+-- die Migration laeuft auf einer LAUFENDEN Bridge, waehrend Pipelines schreiben):
+-- ADD CONSTRAINT nimmt ACCESS EXCLUSIVE auf usage_events. Der Pruef-Scan selbst
+-- ist bei dieser Groesse Millisekunden — das Risiko ist das WARTEN auf die
+-- Sperre: steht eine lange Transaktion im Weg, reiht sich die Migration ein und
+-- jeder Ledger-Schreibvorgang staut sich hinter ihr auf. lock_timeout laesst sie
+-- deshalb lieber LAUT scheitern; ein Nachziehen ist gefahrlos, weil die erlaubte
+-- Menge nur ERWEITERT wird und jede Bestandszeile die neue Regel bereits erfuellt.
+--
+-- Bewusst NICHT die uebliche Entschaerfung NOT VALID + VALIDATE CONSTRAINT: der
+-- Runner faehrt jede Datei mit psql --single-transaction (bin/bridge-migrate.sh),
+-- die harte Sperre des ADD haelt also ohnehin bis COMMIT. Die Aufteilung wuerde
+-- hier nichts entspannen und nur so aussehen, als tue sie es.
+--
 -- Vorwaerts-only und idempotent (mehrfach ausfuehrbar).
+
+SET lock_timeout = '5s';
 
 ALTER TABLE usage_events DROP CONSTRAINT IF EXISTS usage_events_status_vocabulary;
 ALTER TABLE usage_events ADD CONSTRAINT usage_events_status_vocabulary CHECK (
     status IN ('success', 'error', 'undelivered')
 );
+
+RESET lock_timeout;
 
 COMMENT ON COLUMN usage_events.status IS
     'success|error|undelivered — Ergebnis DES CALLS, der eine Zeile geschrieben '

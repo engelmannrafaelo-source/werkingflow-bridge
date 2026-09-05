@@ -562,11 +562,16 @@ class TestAdminDeleteUser:
         assert "UUID" in resp.json()["detail"]
 
     def test_fk_restrict_returns_409(self):
-        """User with subscriptions / credit_purchases must not be deletable."""
+        """Ein Nutzer, auf den noch ein blockierender Fremdschluessel zeigt,
+        darf nicht hart geloescht werden — und die 409 nennt die Tabelle, die
+        tatsaechlich blockiert hat (05.09.2026: sie behauptete stattdessen
+        unbedingt eine Abrechnungshistorie, auch wenn es gar keine gab)."""
         uid = str(uuid.uuid4())
         fk_err = asyncpg.ForeignKeyViolationError(
             "update or delete on table \"users\" violates foreign key constraint"
         )
+        fk_err.table_name = "usage_events"
+        fk_err.constraint_name = "usage_events_user_id_fkey"
         pool, _ = _delete_pool(execute_raises=fk_err)
 
         app = _make_admin_app("require_jwt_or_service", _operator_claims())
@@ -576,4 +581,7 @@ class TestAdminDeleteUser:
             resp = client.delete(f"/v1/users/{uid}")
 
         assert resp.status_code == 409
-        assert "billing" in resp.json()["detail"].lower()
+        detail = resp.json()["detail"]
+        assert "usage_events" in detail, "die blockierende Tabelle fehlt"
+        assert "usage_events_user_id_fkey" in detail, "der Constraint fehlt"
+        assert "billing" in detail.lower(), "der Hinweis auf aufbewahrungspflichtige Zeilen fehlt"
