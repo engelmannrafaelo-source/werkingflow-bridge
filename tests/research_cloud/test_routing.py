@@ -166,3 +166,36 @@ def test_an_unknown_pin_does_not_silently_defer():
     """Ein dritter Provider darf nicht durch Zufall in den Cloud-Pfad
     rutschen — der Handler meldet ihn stattdessen laut."""
     assert global_pin_defers_to_research_pin("some-future-provider") is False
+
+
+# ---------------------------------------------------------------------------
+# Modul-uebergreifende Invariante: was die App-Regel setzt, muss die
+# Cloud-Entscheidung noch zulassen (Befund 05.09.2026)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("app_id", ["werking-report", "werking-energy", "werking-noise",
+                                    "engelmann", "eine-app-ohne-eigene-regel"])
+def test_every_customer_app_still_reaches_the_cloud_decision(app_id):
+    """Der eigentliche Umfang des Befunds.
+
+    resolve_app_provider_policy gibt fuer JEDE Kunden-App eine Regel zurueck —
+    entweder die eigene oder GLOBAL_DEFAULT_RULE — und die lautet immer
+    'anthropic' (Bedrock ist seit 11.08.2026 pin-only). Der Research-Handler
+    schreibt dieses Ergebnis nach _research_pinned. Solange dort nur `is None`
+    abgefragt wurde, war die Recherche-Cloud damit fuer den gesamten
+    Kundenverkehr unerreichbar: research_provider-Pin, Tagescap UND das
+    Overflow-Opt-in wurden stumm uebersprungen. Erreichbar blieb sie nur fuer
+    bedrock-gepinnte Nutzer (eigener Zweig) und fuer interne Aufrufer ohne
+    App-Kennung.
+
+    Diese Zusicherung bindet die beiden Module aneinander: wer der App-Regel
+    einen neuen Provider-Wert gibt, muss hier vorbeikommen.
+    """
+    from src.routing.app_provider_policy import APP_PROVIDER_RULES, GLOBAL_DEFAULT_RULE
+
+    rule = APP_PROVIDER_RULES.get(app_id, GLOBAL_DEFAULT_RULE)
+    assert global_pin_defers_to_research_pin(rule.provider), (
+        f"App-Regel fuer {app_id!r} setzt {rule.provider!r} — damit faellt jeder "
+        f"Nutzer dieser App wieder stumm an der Recherche-Cloud vorbei"
+    )

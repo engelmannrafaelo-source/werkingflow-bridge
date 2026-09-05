@@ -5179,10 +5179,19 @@ async def research(
     elif global_pin_defers_to_research_pin(_research_pinned):
         # NICHT nur `is None`: "anthropic" ist der zweite Wert, den der globale
         # Pin annehmen kann, und er sagt ueber Pool-vs-Cloud nichts aus (die
-        # Recherche-Cloud ist selbst Anthropic). Er entsteht regulaer durch
-        # einen ausserhalb prod heruntergestuften Bedrock-Pin oder eine
-        # App-Regel — und liess bis 05.09.2026 jeden so gepinnten Aufrufer
-        # stumm am research_provider='cloud'-Pin vorbeilaufen.
+        # Recherche-Cloud ist selbst Anthropic).
+        #
+        # Umfang, gemessen am 05.09.2026 — das war KEIN Randfall: die
+        # App-Regel oben setzt _research_pinned fuer JEDE Kunden-App auf
+        # "anthropic" (APP_PROVIDER_RULES, und fuer nicht gelistete App-Ids
+        # GLOBAL_DEFAULT_RULE; Bedrock ist seit 11.08. pin-only). Solange hier
+        # nur `is None` stand, war die Recherche-Cloud damit fuer den gesamten
+        # Kundenverkehr unerreichbar — research_provider-Pin, Tagescap UND das
+        # Overflow-Opt-in wurden stumm uebersprungen. Erreichbar blieb sie nur
+        # fuer bedrock-gepinnte Nutzer (Zweig oben) und fuer interne Aufrufer
+        # ohne App-Kennung, was den Eindruck erzeugte, die Lane funktioniere.
+        # Die Bindung der beiden Module haelt jetzt ein Test
+        # (tests/research_cloud/test_routing.py).
         try:
             from src.research_cloud.routing import (
                 ResearchCloudCapExceededError,
