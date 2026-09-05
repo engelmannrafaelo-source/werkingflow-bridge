@@ -148,7 +148,17 @@ services:
       # research-cloud (Weg C): executor-only key alias + feature flag.
       # NEVER add plain ANTHROPIC_API_KEY here — claude_cli.py fatals on it
       # (subscription pool would silently bill the API otherwise).
-      - RESEARCH_CLOUD_API_KEY=${ANTHROPIC_API_KEY:-}
+      #
+      # RESEARCH_CLOUD_ANTHROPIC_KEY ist der EIGENE Schluessel der Recherche
+      # (Rafael, 04.09.2026). Solange er nicht in docker/.env steht, faellt die
+      # Lane auf den geteilten ANTHROPIC_API_KEY zurueck — denselben Schluessel,
+      # aus dem auch die Bildanalyse zahlt (gemessen 04.09.: sha256 identisch).
+      # Der Rueckfall ist NICHT still: der Executor vergleicht beim ersten Lauf
+      # gegen ANTHROPIC_VISION_API_KEY und meldet den geteilten Topf als
+      # WARNING (src/research_cloud/executor.py). Ohne den Rueckfall waere die
+      # Recherche in dem Moment tot, in dem dieser Deploy vor Rafaels Eintrag
+      # landet.
+      - RESEARCH_CLOUD_API_KEY=${RESEARCH_CLOUD_ANTHROPIC_KEY:-${ANTHROPIC_API_KEY:-}}
       - RESEARCH_CLOUD_ENABLED=${RESEARCH_CLOUD_ENABLED:-}
       # Research-Library (specs/research-library-tool): kuratierte private
       # Bibliothek fuer den research_cloud-Pfad; default aus, Werte via
@@ -282,7 +292,17 @@ services:
       # research-cloud (Weg C): executor-only key alias + feature flag.
       # NEVER add plain ANTHROPIC_API_KEY here — claude_cli.py fatals on it
       # (subscription pool would silently bill the API otherwise).
-      - RESEARCH_CLOUD_API_KEY=${ANTHROPIC_API_KEY:-}
+      #
+      # RESEARCH_CLOUD_ANTHROPIC_KEY ist der EIGENE Schluessel der Recherche
+      # (Rafael, 04.09.2026). Solange er nicht in docker/.env steht, faellt die
+      # Lane auf den geteilten ANTHROPIC_API_KEY zurueck — denselben Schluessel,
+      # aus dem auch die Bildanalyse zahlt (gemessen 04.09.: sha256 identisch).
+      # Der Rueckfall ist NICHT still: der Executor vergleicht beim ersten Lauf
+      # gegen ANTHROPIC_VISION_API_KEY und meldet den geteilten Topf als
+      # WARNING (src/research_cloud/executor.py). Ohne den Rueckfall waere die
+      # Recherche in dem Moment tot, in dem dieser Deploy vor Rafaels Eintrag
+      # landet.
+      - RESEARCH_CLOUD_API_KEY=${RESEARCH_CLOUD_ANTHROPIC_KEY:-${ANTHROPIC_API_KEY:-}}
       - RESEARCH_CLOUD_ENABLED=${RESEARCH_CLOUD_ENABLED:-}
       # Research-Library (specs/research-library-tool): kuratierte private
       # Bibliothek fuer den research_cloud-Pfad; default aus, Werte via
@@ -416,7 +436,17 @@ services:
       # research-cloud (Weg C): executor-only key alias + feature flag.
       # NEVER add plain ANTHROPIC_API_KEY here — claude_cli.py fatals on it
       # (subscription pool would silently bill the API otherwise).
-      - RESEARCH_CLOUD_API_KEY=${ANTHROPIC_API_KEY:-}
+      #
+      # RESEARCH_CLOUD_ANTHROPIC_KEY ist der EIGENE Schluessel der Recherche
+      # (Rafael, 04.09.2026). Solange er nicht in docker/.env steht, faellt die
+      # Lane auf den geteilten ANTHROPIC_API_KEY zurueck — denselben Schluessel,
+      # aus dem auch die Bildanalyse zahlt (gemessen 04.09.: sha256 identisch).
+      # Der Rueckfall ist NICHT still: der Executor vergleicht beim ersten Lauf
+      # gegen ANTHROPIC_VISION_API_KEY und meldet den geteilten Topf als
+      # WARNING (src/research_cloud/executor.py). Ohne den Rueckfall waere die
+      # Recherche in dem Moment tot, in dem dieser Deploy vor Rafaels Eintrag
+      # landet.
+      - RESEARCH_CLOUD_API_KEY=${RESEARCH_CLOUD_ANTHROPIC_KEY:-${ANTHROPIC_API_KEY:-}}
       - RESEARCH_CLOUD_ENABLED=${RESEARCH_CLOUD_ENABLED:-}
       # Research-Library (specs/research-library-tool): kuratierte private
       # Bibliothek fuer den research_cloud-Pfad; default aus, Werte via
@@ -550,7 +580,17 @@ services:
       # research-cloud (Weg C): executor-only key alias + feature flag.
       # NEVER add plain ANTHROPIC_API_KEY here — claude_cli.py fatals on it
       # (subscription pool would silently bill the API otherwise).
-      - RESEARCH_CLOUD_API_KEY=${ANTHROPIC_API_KEY:-}
+      #
+      # RESEARCH_CLOUD_ANTHROPIC_KEY ist der EIGENE Schluessel der Recherche
+      # (Rafael, 04.09.2026). Solange er nicht in docker/.env steht, faellt die
+      # Lane auf den geteilten ANTHROPIC_API_KEY zurueck — denselben Schluessel,
+      # aus dem auch die Bildanalyse zahlt (gemessen 04.09.: sha256 identisch).
+      # Der Rueckfall ist NICHT still: der Executor vergleicht beim ersten Lauf
+      # gegen ANTHROPIC_VISION_API_KEY und meldet den geteilten Topf als
+      # WARNING (src/research_cloud/executor.py). Ohne den Rueckfall waere die
+      # Recherche in dem Moment tot, in dem dieser Deploy vor Rafaels Eintrag
+      # landet.
+      - RESEARCH_CLOUD_API_KEY=${RESEARCH_CLOUD_ANTHROPIC_KEY:-${ANTHROPIC_API_KEY:-}}
       - RESEARCH_CLOUD_ENABLED=${RESEARCH_CLOUD_ENABLED:-}
       # Research-Library (specs/research-library-tool): kuratierte private
       # Bibliothek fuer den research_cloud-Pfad; default aus, Werte via

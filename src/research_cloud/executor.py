@@ -45,6 +45,38 @@ from src.research_cloud.models import (
 
 logger = logging.getLogger(__name__)
 
+# Once per process — the answer cannot change without a container restart.
+_key_lane_logged = False
+
+
+def _log_key_lane_once(api_key: str) -> None:
+    """Say out loud whether the research lane pays from its own key.
+
+    Measured, not assumed: the worker holds BOTH keys, so it can compare them
+    instead of trusting a variable name. On 04.09.2026 the two were the same
+    key under two names (sha256 identical in all four dev workers), which is
+    why a single research run could empty the image lane without warning while
+    the budget guard still showed headroom. RESEARCH_CLOUD_ANTHROPIC_KEY exists
+    to end that; this line is how anyone can tell whether it took effect —
+    without printing a secret.
+    """
+    global _key_lane_logged
+    if _key_lane_logged:
+        return
+    _key_lane_logged = True
+    vision_key = os.environ.get("ANTHROPIC_VISION_API_KEY")
+    if vision_key and vision_key == api_key:
+        logger.warning(
+            "research-cloud key lane: SHARED with the image lane — one key pays "
+            "for both (ANTHROPIC_VISION_API_KEY == RESEARCH_CLOUD_API_KEY). A "
+            "single research run can empty the image lane. Set "
+            "RESEARCH_CLOUD_ANTHROPIC_KEY in docker/.env to separate them."
+        )
+    else:
+        logger.info(
+            "research-cloud key lane: dedicated (separate from the image lane)"
+        )
+
 ANTHROPIC_API_URL = "https://api.anthropic.com/v1/messages"
 ANTHROPIC_VERSION = "2023-06-01"
 
@@ -237,8 +269,12 @@ async def run_research_cloud(
     or the Messages API returns a non-200, or the loop exhausts
     max_continuations without a terminal stop_reason. Never falls back to the
     worker pool mid-run — a failed cloud call is a job error, not a silent
-    reroute (see src/research_cloud — silent fallback is only legitimate
-    *before* execution starts, at the cap/routing check).
+    reroute. Nor before the run: the routing check refuses a cloud-pinned
+    caller when the lane is capped or switched off, instead of quietly serving
+    them from the pool (src/research_cloud/routing.py). Pool fallback survives
+    only where the pool is genuinely the caller's home lane — overflow that
+    was merely opportunistic, and a routing probe that failed before any
+    commitment to the cloud was made.
 
     ``client``, if given, is used as-is (caller owns its lifecycle) — this is
     the seam tests use to inject a mocked httpx.AsyncClient.
@@ -260,6 +296,7 @@ async def run_research_cloud(
             "RESEARCH_CLOUD_API_KEY (or ANTHROPIC_API_KEY) not set — refusing "
             "to run the research-cloud executor"
         )
+    _log_key_lane_once(api_key)
 
     headers = {
         "Content-Type": "application/json",

@@ -2,8 +2,10 @@
 
 Entry point: resolve_research_cloud_routing(). Default OFF
 (RESEARCH_CLOUD_ENABLED env flag) — existing callers/paths are unaffected
-unless the flag is explicitly on. Even then, a request only reaches the cloud
-path if EITHER:
+unless the flag is explicitly on, with ONE deliberate exception: a user
+explicitly pinned to the cloud lane is refused (ResearchCloudDisabledError)
+rather than served from the pool while the lane is off. Even with the flag on,
+a request only reaches the cloud path if EITHER:
 
   - the user has a research-scoped compliance/preference pin
     (users.provider_config.research_provider == "cloud"), OR
@@ -47,6 +49,36 @@ class ResearchCloudCapExceededError(Exception):
         )
 
 
+class ResearchCloudDisabledError(Exception):
+    """The research-cloud lane is switched off (RESEARCH_CLOUD_ENABLED) while
+    the caller is explicitly pinned to it.
+
+    Decided 05.09.2026: "Recherche deaktiviert" means a hard failure with a
+    clear message, never a quiet switch to the subscription worker pool.
+
+    Same reasoning as ResearchCloudCapExceededError, one step earlier: a user
+    carrying ``provider_config.research_provider = "cloud"`` was deliberately
+    put on a different provider, cost model and privacy posture. Serving that
+    user from the pool because an operator flipped a flag would honour the
+    flag and break the pin — silently, and precisely for the callers whose
+    routing someone cared enough about to write down.
+
+    Not raised for overflow-eligible callers (``cloud_overflow=true`` on a
+    saturated pool): the pool IS their home lane. Overflow asks "use the cloud
+    if it is there"; a full pool answering slowly or with a 429 is an honest
+    answer, not a substituted assurance.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(
+            "research-cloud is disabled (RESEARCH_CLOUD_ENABLED is off) but "
+            "this user is pinned to it (provider_config.research_provider="
+            "'cloud') — refusing to run the research on the subscription "
+            "worker pool instead. Either re-enable the research-cloud lane or "
+            "remove the pin; there is no silent substitute."
+        )
+
+
 def research_cloud_enabled() -> bool:
     return os.getenv("RESEARCH_CLOUD_ENABLED", "").strip().lower() in ("1", "true", "yes", "on")
 
@@ -69,12 +101,30 @@ async def resolve_research_cloud_routing(
     either reason a caller ends up here (a compliance/preference pin, or the
     pool already being saturated), so this must stop and defer, not reroute.
     """
-    if not research_cloud_enabled():
-        return False
-
     from src.research_cloud.cap import research_cloud_over_cap
     from src.research_cloud.pool_signal import is_worker_pool_saturated
     from src.routing.research_provider_override import get_user_research_pin
+
+    if not research_cloud_enabled():
+        # The pin is read even with the lane off — precisely BECAUSE it is off.
+        # Returning False here without looking would route an explicitly
+        # cloud-pinned user onto the pool without a word, which is the silent
+        # substitution ruled out for the cap path (2026-08-02) and for the
+        # switch-off itself (05.09.2026). The lookup is the same cached
+        # provider_config read the enabled path does, so this costs nothing new.
+        #
+        # implicit_pin (globally Bedrock-pinned user, research exception) is
+        # deliberately NOT treated as a pin here: that flag says "Bedrock
+        # cannot serve research at all, take the cloud if it exists" — the pool
+        # is its documented answer when the cloud does not, and always was.
+        if not implicit_pin and await get_user_research_pin(raw_user_id) == "cloud":
+            logger.error(
+                "research-cloud is disabled while user=%s is pinned to it — "
+                "refusing to substitute the worker pool",
+                raw_user_id,
+            )
+            raise ResearchCloudDisabledError()
+        return False
 
     pinned = "cloud" if implicit_pin else await get_user_research_pin(raw_user_id)
     wants_overflow = bool(cloud_overflow)

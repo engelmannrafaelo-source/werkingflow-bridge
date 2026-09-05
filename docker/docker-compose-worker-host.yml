@@ -79,7 +79,10 @@ x-worker-env-common: &worker-env-common
   CLAUDE_PERMISSION_MODE: bypassPermissions
   TAVILY_API_KEY: ${TAVILY_API_KEY}
   ANTHROPIC_VISION_API_KEY: ${ANTHROPIC_API_KEY}
-  RESEARCH_CLOUD_API_KEY: ${ANTHROPIC_API_KEY:-}
+  # Eigener Recherche-Schluessel, sonst der geteilte (siehe docker-compose.yml,
+  # gleicher Kommentar): der Rueckfall ist gewollt und wird vom Executor
+  # beim ersten Lauf als geteilter Topf gemeldet, nicht verschwiegen.
+  RESEARCH_CLOUD_API_KEY: ${RESEARCH_CLOUD_ANTHROPIC_KEY:-${ANTHROPIC_API_KEY:-}}
   RESEARCH_CLOUD_ENABLED: ${RESEARCH_CLOUD_ENABLED:-}
   RESEARCH_LIBRARY_ENABLED: ${RESEARCH_LIBRARY_ENABLED:-}
   RESEARCH_LIBRARY_S3_ENDPOINT_URL: ${RESEARCH_LIBRARY_S3_ENDPOINT_URL:-}

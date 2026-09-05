@@ -5178,11 +5178,25 @@ async def research(
         try:
             from src.research_cloud.routing import (
                 ResearchCloudCapExceededError,
+                ResearchCloudDisabledError,
                 resolve_research_cloud_routing,
             )
             from src.routing.research_provider_override import ResearchProviderOverrideError
             _use_research_cloud = await resolve_research_cloud_routing(
                 request.headers.get("X-User-ID"), bool(request_body.cloud_overflow)
+            )
+        except ResearchCloudDisabledError as _rc_err:
+            # The lane is switched off while this user is pinned to it
+            # (Rafael 05.09.2026: "Recherche deaktiviert" = harter Fehler mit
+            # klarer Meldung). NOT marked retryable: waiting does not turn a
+            # flag back on — an operator has to. A retry marker would send the
+            # app into its 20h wait loop for a state that only a human ends.
+            logger.error(str(_rc_err))
+            return ResearchResponse(
+                status="error",
+                query=request_body.query,
+                model=request_body.model,
+                error=str(_rc_err),
             )
         except ResearchProviderOverrideError as _rc_err:
             # A malformed admin-set research pin is a config error, not a

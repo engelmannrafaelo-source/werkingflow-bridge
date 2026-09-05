@@ -101,7 +101,11 @@ async def _job_runs_off_pool(
     regression.
 
     Inert while RESEARCH_CLOUD_ENABLED is off: resolve_research_cloud_routing
-    short-circuits to False, so the veto behaves exactly as before.
+    returns False, so the veto behaves exactly as before. The one exception is
+    a user explicitly pinned to the cloud lane while it is switched off — that
+    raises (ResearchCloudDisabledError) rather than routing them to the pool,
+    and is caught below like any other probe failure: the veto stays, and the
+    caller meets the same refusal again inside the job, where it belongs.
     """
     if body.kind != "research":
         return False

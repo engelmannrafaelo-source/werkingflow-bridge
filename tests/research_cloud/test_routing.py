@@ -1,8 +1,9 @@
 """Tests for the pool-vs-cloud routing decision (src/research_cloud/routing.py).
 
 Covers: feature flag off, unpinned+no-overflow, overflow-without-saturation,
-overflow-with-saturation, explicit pin, and the daily cap overriding both a
-pin and an overflow-eligible request.
+overflow-with-saturation, explicit pin, the daily cap overriding both a pin
+and an overflow-eligible request, and — since 05.09.2026 — the switched-off
+lane refusing a pinned caller instead of serving them from the pool.
 """
 from unittest.mock import AsyncMock, patch
 
@@ -10,6 +11,7 @@ import pytest
 
 from src.research_cloud.routing import (
     ResearchCloudCapExceededError,
+    ResearchCloudDisabledError,
     resolve_research_cloud_routing,
 )
 
@@ -33,10 +35,48 @@ def _patches(*, pinned=None, saturated=False, over_cap=False):
 
 @pytest.mark.asyncio
 async def test_feature_disabled_never_routes_to_cloud(monkeypatch):
+    """Lane aus, kein Pin: der Pool ist die Heimat des Aufrufers, kein Ersatz."""
+    monkeypatch.delenv("RESEARCH_CLOUD_ENABLED", raising=False)
+    p1, p2, p3 = _patches(pinned=None, saturated=True, over_cap=False)
+    with p1, p2, p3:
+        assert await resolve_research_cloud_routing("user-1", cloud_overflow=True) is False
+
+
+@pytest.mark.asyncio
+async def test_feature_disabled_refuses_a_pinned_caller(monkeypatch):
+    """Rafael 05.09.2026: "Recherche deaktiviert" ist ein harter Fehler mit
+    klarer Meldung — kein stilles Ausweichen auf die normalen Worker.
+
+    Bis dahin gab der Flag-Check ein stummes False zurueck, BEVOR der Pin
+    ueberhaupt gelesen wurde: ein Nutzer mit
+    provider_config.research_provider='cloud' lief einfach auf dem
+    Abo-Worker-Pool weiter — anderer Anbieter, anderes Kostenmodell, andere
+    Datenschutzlage, kein Wort im Log. Genau die Ersetzung, die fuer den
+    Cap-Pfad am 02.08.2026 schon abgeschafft wurde."""
     monkeypatch.delenv("RESEARCH_CLOUD_ENABLED", raising=False)
     p1, p2, p3 = _patches(pinned="cloud", saturated=True, over_cap=False)
     with p1, p2, p3:
-        assert await resolve_research_cloud_routing("user-1", cloud_overflow=True) is False
+        with pytest.raises(ResearchCloudDisabledError) as exc:
+            await resolve_research_cloud_routing("user-1", cloud_overflow=True)
+
+    text = str(exc.value)
+    assert "RESEARCH_CLOUD_ENABLED" in text, "die Meldung nennt den Schalter nicht"
+    assert "pinned" in text, "die Meldung nennt den Grund nicht"
+
+
+@pytest.mark.asyncio
+async def test_feature_disabled_still_serves_a_bedrock_pinned_user_from_the_pool(monkeypatch):
+    """Gegenprobe: implicit_pin ist KEIN Cloud-Pin. Er heisst "Bedrock kann
+    Recherche gar nicht, nimm die Cloud wenn es sie gibt" — der Pool war schon
+    immer die dokumentierte Antwort, wenn es sie nicht gibt. Aus dieser Gruppe
+    einen harten Fehler zu machen wuerde Produktions-Nutzern die Recherche
+    abdrehen, sobald jemand den Schalter umlegt."""
+    monkeypatch.delenv("RESEARCH_CLOUD_ENABLED", raising=False)
+    p1, p2, p3 = _patches(pinned=None, saturated=True, over_cap=False)
+    with p1, p2, p3:
+        assert await resolve_research_cloud_routing(
+            "user-1", cloud_overflow=True, implicit_pin=True
+        ) is False
 
 
 @pytest.mark.asyncio
