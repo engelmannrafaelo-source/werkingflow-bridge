@@ -3019,6 +3019,51 @@ async def chat_completions(
 
             except Exception as e:
                 logger.error(f"❌ Vision request failed: {e}", exc_info=True)
+                # Erschoepfung des Prepaid-Bildschluessels hinterliess bisher
+                # GAR KEINE Ledger-Zeile: Anthropic lehnt den Call ab, der
+                # Erfolgspfad unten wird nie erreicht, und im usage_events
+                # sieht ein leerer Topf danach aus wie eine Arbeitspause
+                # ("Erschoepfung sieht aus wie Stille", DevOps 01.09.2026).
+                # Genau deshalb muss ein Waechter heute alle paar Stunden einen
+                # echten Bild-Aufruf gegen die Prod-Bridge schicken, um eine
+                # Stille als Erschoepfung zu BESTAETIGEN. Diese Zeile ist die
+                # Tatsache, die es dort zu erraten gab. Kosten 0 — Anthropic hat
+                # den Call abgewiesen, gerechnet wurde nichts.
+                from src.middleware.bridge_error import is_vision_billing_exhausted
+                if is_vision_billing_exhausted(str(e)):
+                    try:
+                        from src.activity.ai_call_writer import persist_ai_call_activity
+                        from src.middleware.bridge_error import (
+                            REASON_VISION_BILLING_EXHAUSTED,
+                        )
+                        _vx_attr = extract_attribution_context(request)
+                        await persist_ai_call_activity(
+                            provider=PROVIDER_ANTHROPIC,
+                            app_id=_vx_attr.get("app_id"),
+                            user_id=_vx_attr.get("user_id"),
+                            agent_id=_vx_attr.get("agent_id"),
+                            workflow_id=_vx_attr.get("workflow_id"),
+                            model=request_body.model,
+                            input_tokens=0,
+                            output_tokens=0,
+                            status="error",
+                            duration_ms=int((time.time() - start_time) * 1000),
+                            error_code=REASON_VISION_BILLING_EXHAUSTED,
+                            error_message=str(e)[:500],
+                            app_env=_vx_attr.get("app_env"),
+                            provider_meta={
+                                # Gleiche Lane-Kennung wie der Erfolgspfad, damit
+                                # der Waechter Erfolg und Erschoepfung mit EINER
+                                # Abfrage nebeneinander sieht.
+                                "api_key_lane": "vision_prepaid",
+                                "endpoint": "vision",
+                            },
+                        )
+                    except Exception as _vx_log_e:  # noqa: BLE001 — never shadow the 402
+                        logger.error(
+                            "vision billing exhaustion: failed to write the ledger "
+                            "row (the 402 still reaches the caller): %s", _vx_log_e,
+                        )
                 # Vision provider errors are upstream — tag accordingly
                 raise BridgeError(classify_exception(e))
 

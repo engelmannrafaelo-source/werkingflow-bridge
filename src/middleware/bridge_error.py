@@ -403,6 +403,25 @@ def upstream_error(
     )
 
 
+# Anthropic's exact strings for "the prepaid credit is gone", observed in
+# production. Kept as ONE list with the predicate below because two readers
+# need this answer: the error classifier (what to return to the caller) and
+# the ledger write-path (this call must leave a findable trace instead of
+# looking like silence — see src/main.py, vision branch).
+VISION_BILLING_EXHAUSTED_MARKERS = (
+    "credit balance is too low",
+    "purchase credits",
+    "insufficient_credit",
+)
+
+
+def is_vision_billing_exhausted(message: str) -> bool:
+    """True if this upstream error text means the vision prepaid key is out of
+    credit."""
+    lower = (message or "").lower()
+    return any(m in lower for m in VISION_BILLING_EXHAUSTED_MARKERS)
+
+
 def vision_billing_error(detail: str) -> JSONResponse:
     """Vision API (direct Anthropic key) returned 400 credit-balance-too-low.
 
@@ -699,11 +718,7 @@ def classify_exception(exc: Exception) -> JSONResponse:
     # transient upstream errors. Anthropic exact strings observed in production:
     #   "Your credit balance is too low to access the Anthropic API."
     #   "Please go to Plans & Billing to upgrade or purchase credits."
-    if any(m in lower for m in (
-        "credit balance is too low",
-        "purchase credits",
-        "insufficient_credit",
-    )):
+    if is_vision_billing_exhausted(msg):
         return vision_billing_error(detail=msg[:200])
 
     # 3c. Anthropic 400 invalid_request_error — malformed CALLER request (bad
