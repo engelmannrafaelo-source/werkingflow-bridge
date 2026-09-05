@@ -811,6 +811,13 @@ app.add_middleware(PerformanceMonitorMiddleware)
 from src.federation import OriginMiddleware
 app.add_middleware(OriginMiddleware)
 
+# Delivery probe — lets the ledger writer tell "the model ran" from "the caller
+# got the answer". Added after OriginMiddleware → outermost of all, so the probe
+# holds the ASGI receive/send closest to the socket, which is where a gateway
+# timeout or a client abort actually shows up. Pure ASGI, streaming-safe.
+from src.activity.delivery import DeliveryProbeMiddleware
+app.add_middleware(DeliveryProbeMiddleware)
+
 # Concurrency limiter — only memory-threshold safety net.
 # Adaptive cap_tokens does the real throttling per worker; hardcoded
 # concurrency caps would override that learning. Default is effectively
@@ -1535,9 +1542,19 @@ async def generate_streaming_response(
                     logger.warning("⚠️ Disconnect monitor: Streaming started but no CLI session found")
                     return
 
-                # NOW we can safely monitor for disconnects
+                # NOW we can safely monitor for disconnects.
+                #
+                # Through the SHARED probe, not fastapi_request.is_disconnected():
+                # both read the same ASGI receive channel, and the
+                # ``http.disconnect`` message arrives exactly once. Two
+                # independent readers means whoever asks first eats it and the
+                # other one concludes "caller still there" — which would have
+                # made the ledger book a streamed answer as delivered while
+                # this monitor was busy cancelling the session for the very
+                # same disconnect. One probe, one latched answer, both readers.
+                from src.activity.delivery import caller_gone as _caller_gone
                 while True:
-                    if await fastapi_request.is_disconnected():
+                    if await _caller_gone():
                         logger.warning(f"🔌 Client disconnected! Auto-cancelling CLI session {cli_session_for_disconnect['cli_session_id']}")
                         from src.cli_session_manager import cli_session_manager
                         cli_session_manager.cancel_session(cli_session_for_disconnect['cli_session_id'])
@@ -4796,6 +4813,15 @@ async def _run_async_research_job(
     error_kind='orphaned' — instead of leaving it 'running' forever.
     Load→mutate→save in the heartbeat has no await in between, so it cannot
     interleave with the terminal writes below (single event loop)."""
+    # This task outlives the request that spawned it (the caller already has
+    # its 202 + request_id and polls for the result). asyncio.create_task
+    # copied that request's delivery probe into this context; asking it later
+    # whether "the caller is still connected" would answer a question about a
+    # finished exchange. The result of THIS job is delivered through the job
+    # file, not through that response.
+    from src.activity.delivery import detach as _detach_delivery_probe
+    _detach_delivery_probe()
+
     prior = _load_research_job(job_id) or {}
     started_at = prior.get("started_at") or time.time()
 

@@ -155,7 +155,18 @@ def registered_kinds() -> List[str]:
 
 def spawn(coro: Awaitable[None]) -> "asyncio.Task":
     """Fire a background task and keep a strong reference until it completes."""
-    task = asyncio.create_task(coro)
+
+    async def _detached() -> None:
+        # The job outlives the request that submitted it (that request already
+        # answered with the job id). asyncio.create_task copies the submitting
+        # context, delivery probe included — dropped HERE, inside the new task,
+        # so the submitting request keeps its own probe intact. Without this,
+        # the job's ledger row would be judged against a long-finished exchange.
+        from src.activity.delivery import detach as _detach_delivery_probe
+        _detach_delivery_probe()
+        await coro
+
+    task = asyncio.create_task(_detached())
     _BACKGROUND_TASKS.add(task)
     task.add_done_callback(_BACKGROUND_TASKS.discard)
     return task

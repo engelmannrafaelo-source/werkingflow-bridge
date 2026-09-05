@@ -52,6 +52,13 @@ from src.activity.ledger_spool import (
     OUTCOME_WRITTEN,
 )
 from src.activity.app_registry import normalize_app_id
+from src.activity.delivery import (
+    ERROR_CODE_CALLER_GONE,
+    STATUS_UNDELIVERED,
+    UNDELIVERED_MESSAGE,
+    caller_gone,
+    get_delivery_probe,
+)
 from src.activity.providers import REAL_COST_PROVIDERS, normalize_ledger_provider
 from src.attribution import ANONYMOUS_USER_ID
 from src.budget.plan_resolution import PlanResolutionError
@@ -63,6 +70,13 @@ logger = logging.getLogger(__name__)
 # Incoherent billing configuration/data — distinct from transient infra errors,
 # and logged apart from them (see _deduct_call_cost).
 _PLAN_RESOLUTION_ERRORS = (AmbiguousPlanCatalog, PlanResolutionError)
+
+# Statuses that cost money: the model ran and produced output, so we owe the
+# provider. 'undelivered' belongs here and 'error' does not — an error call
+# never got that far. Getting this wrong in either direction falsifies every
+# cost readout: charging for a call that never ran, or losing the spend of a
+# call whose answer went missing on the way out.
+COST_BEARING_STATUSES = frozenset({"success", STATUS_UNDELIVERED})
 
 # Per-identifier skip counters — tracks how often each non-UUID/unresolvable
 # user_id is seen so warnings show frequency, not just isolated occurrences.
@@ -299,7 +313,10 @@ async def persist_ai_call_activity(
     _call_ts carries the ORIGIN time of the call — not the replay time — so a
     replayed row is recorded in the period it belongs to.
 
-    status: "success" | "error"
+    status: "success" | "error". A "success" passed in here is a claim about
+        the MODEL RUN; whether the answer reached the caller is decided in this
+        function (see the delivery block below), which may downgrade it to
+        "undelivered". Call sites never pass "undelivered" themselves.
     error_message: human-readable provider/bridge error detail (e.g. the
         Bedrock ValidationException text). Persisted TRUNCATED alongside
         error_code — a bare "400" is undiagnosable once the container logs
@@ -377,6 +394,36 @@ async def persist_ai_call_activity(
             ledger_spool.ack(call_uid, outcome)
         return outcome
 
+    # ── Delivery: 'success' is a claim about the CALLER, not about the model ──
+    # A gateway error after the model run used to leave no trace at all — the
+    # caller got a 504, the ledger got a success row (Befund 03.09.2026, 2,16
+    # USD). Asked here rather than at ~12 call sites so no future booking site
+    # can forget it, and so the answer is derived from one probe instead of
+    # twelve slightly different ones (src/activity/delivery.py).
+    #
+    # Deliberately AFTER the write-ahead record: the spool's guarantee is that
+    # nothing between "the call happened" and the fsync can lose it, and an
+    # await in front of that fsync would reopen exactly that window. The price
+    # is that a spooled record replayed after a worker crash carries the
+    # provisional 'success' — a double fault (DB down AND process gone), and
+    # still strictly better than today's unconditional success.
+    if not replaying and status == "success":
+        if await caller_gone():
+            status = STATUS_UNDELIVERED
+            error_code = error_code or ERROR_CODE_CALLER_GONE
+            error_message = error_message or UNDELIVERED_MESSAGE
+            logger.warning(
+                "ledger: booking call %s as '%s' (app=%s agent=%s model=%s) — "
+                "the model run is billed, but the caller was already gone when "
+                "the answer was ready. No delivered answer for this spend.",
+                call_uid, STATUS_UNDELIVERED, app_id, agent_id, model,
+            )
+    _probe = get_delivery_probe()
+    if _probe is not None:
+        # Lets DeliveryProbeMiddleware name the affected rows if the response
+        # still fails to leave the socket after this point.
+        _probe.note_booked(call_uid)
+
     # Validate before anything keys on it: provider drives both the cost
     # branch below and the compliance readout. An unvocabulary value becomes
     # 'unknown' + an ERROR log, never a plausible-looking default.
@@ -384,8 +431,9 @@ async def persist_ai_call_activity(
         provider, context=f"app={app_id} agent={agent_id} model={model}"
     )
 
-    # Cost from the pricing SSoT. Error calls cost nothing (0.0) — only a
-    # successful completion consumes budget.
+    # Cost from the pricing SSoT. Error calls cost nothing (0.0) — the model
+    # never produced anything. An UNDELIVERED call does cost: the model ran,
+    # the provider bills us, only the answer went missing on the way out.
     call_cost_eur = (
         cost_eur(
             model,
@@ -395,7 +443,7 @@ async def persist_ai_call_activity(
             cache_creation_tokens=cache_creation_tokens,
             search_count=search_count,
         )
-        if status == "success" else 0.0
+        if status in COST_BEARING_STATUSES else 0.0
     )
 
     # Resolved from the user row inside the DB block below; initialised here so
@@ -576,10 +624,16 @@ async def persist_ai_call_activity(
         app_id_col, app_id_rejected = normalize_app_id(app_id)
 
         feature = agent_id or workflow_id or "call"
-        event_type = (
-            f"ai-call-error:{feature}" if status != "success"
-            else f"ai-call:{feature}"
-        )
+        # The audit trail keeps the three cases apart: a delivered call, a
+        # call that failed, and a call that was billed but never arrived.
+        # Folding the last into ai-call-error would make it look like a failed
+        # model run — which is exactly the confusion this change is about.
+        if status == STATUS_UNDELIVERED:
+            event_type = f"ai-call-undelivered:{feature}"
+        elif status != "success":
+            event_type = f"ai-call-error:{feature}"
+        else:
+            event_type = f"ai-call:{feature}"
         payload = {
             "feature": feature,
             "model": model,

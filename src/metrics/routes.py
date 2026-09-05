@@ -158,7 +158,11 @@ async def usage_metrics(
             u.input_tokens, u.output_tokens,
             u.cache_read_tokens, u.cache_creation_tokens,
             u.real_cost_eur, u.hypothetical_cost_eur,
-            (u.status = 'error')                             AS is_error,
+            -- Nicht nur 'error': seit Migration 060 gibt es 'undelivered'
+            -- (abgerechnet, aber nie beim Aufrufer angekommen). Ein solcher
+            -- Call ist kein geglueckter Call — die Kostensummen unten
+            -- zaehlen ihn unabhaengig von is_error weiterhin mit.
+            (u.status <> 'success')                          AS is_error,
             u.recorded_at,
             u.error_code                                      AS error_code,
             left(u.provider_metadata->>'error_message', 200) AS error_message
@@ -393,7 +397,11 @@ async def usage_timeseries(
             u.app, u.model,
             u.input_tokens, u.output_tokens,
             u.real_cost_eur, u.hypothetical_cost_eur,
-            (u.status = 'error')                             AS is_error
+            -- Nicht nur 'error': seit Migration 060 gibt es 'undelivered'
+            -- (abgerechnet, aber nie beim Aufrufer angekommen). Ein solcher
+            -- Call ist kein geglueckter Call — die Kostensummen unten
+            -- zaehlen ihn unabhaengig von is_error weiterhin mit.
+            (u.status <> 'success')                          AS is_error
         FROM usage_events u
         WHERE {where_sql}
         ORDER BY bucket_ts ASC
