@@ -190,12 +190,45 @@ def is_tier_usable(tier_id: str) -> bool:
     return True
 
 
+class UnknownProviderTierError(RuntimeError):
+    """A caller asked for a provider tier this bridge does not have.
+
+    Deliberately an error and not a fallback: ``provider_tier`` is an explicit
+    override. A caller that sets it has decided the default is NOT what it
+    wants — silently serving the default anyway answers a different question
+    than the one asked, with HTTP 200 and no way for the caller to notice.
+
+    Measured 2026-09-05: werking-energy sent ``provider_tier="gemini-vision"``
+    to switch image analysis to Gemini. The tier does not exist on the deployed
+    bridge (the lane sits on an unmerged branch), so every call fell back to
+    claude-sonnet-5 and returned 200. The app could only tell by comparing the
+    ``model`` field of the RESPONSE against what it had asked for — which it
+    then had to build itself. That client-side check is the workaround; this is
+    the fix.
+
+    Base class is RuntimeError on purpose, not ValueError: both /v1/chat/completions
+    (main.py:2541) and the research handler (main.py:5302) already catch RuntimeError
+    from backend resolution and map it to HTTP 400 (503 for a user-pinned provider).
+    Inheriting from ValueError would bypass those handlers and surface as a 500 —
+    loud, but as "the bridge is broken" instead of "you asked for something that
+    does not exist here".
+    """
+
+
 def get_provider(tier_id: Optional[str]) -> ProviderConfig:
-    """Get provider config by tier ID. Falls back to default."""
-    if not tier_id or tier_id not in PROVIDERS:
-        if tier_id:
-            logger.warning(f"Unknown provider tier '{tier_id}', falling back to '{DEFAULT_TIER}'")
+    """Get provider config by tier ID.
+
+    No tier -> the default. An UNKNOWN tier -> UnknownProviderTierError, never
+    the default (see the exception's docstring for why).
+    """
+    if not tier_id:
         return PROVIDERS[DEFAULT_TIER]
+    if tier_id not in PROVIDERS:
+        raise UnknownProviderTierError(
+            f"unknown provider_tier {tier_id!r} — this bridge serves "
+            f"{sorted(PROVIDERS)}. Refusing to silently serve "
+            f"{DEFAULT_TIER!r} instead of what was asked for."
+        )
     return PROVIDERS[tier_id]
 
 
