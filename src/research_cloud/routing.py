@@ -79,6 +79,32 @@ class ResearchCloudDisabledError(Exception):
         )
 
 
+# Der globale Provider-Pin kennt genau zwei Werte (user_provider_override.
+# SUPPORTED_PROVIDERS). Nur "bedrock" ist eine Aussage UEBER die Recherche —
+# Bedrock kann sie gar nicht (kein WebSearch), deshalb die eigene Ausnahme im
+# Handler. "anthropic" ist keine: die Recherche-Cloud IST Anthropic (1P-API),
+# der Pin beantwortet also eine andere Frage (welches Backend) als der
+# research-gescopte Pin (Pool oder Cloud).
+_PIN_DEFERS_TO_RESEARCH_PIN = (None, "anthropic")
+
+
+def global_pin_defers_to_research_pin(global_pin) -> bool:
+    """Darf bei diesem globalen Pin ueberhaupt ueber die Recherche-Cloud
+    entschieden werden?
+
+    Bis 05.09.2026 fragte der Handler die Cloud-Routing-Entscheidung nur bei
+    global_pin IS NONE. Ein auf "anthropic" stehender Pin fiel damit stumm
+    durch — und "anthropic" entsteht auf zwei ganz normalen Wegen:
+    ein Bedrock-Pin ausserhalb prod wird auf "anthropic" heruntergestuft
+    (user_provider_override.apply_user_provider_override), und eine
+    App-Regel kann "anthropic" direkt setzen. Fuer diese Aufrufer war der
+    research_provider='cloud'-Pin damit wirkungslos, ohne eine Zeile im Log:
+    genau die stille Ersetzung, die fuer Cap (02.08.) und Abschaltung
+    (05.09.) schon abgeschafft ist, nur eine Schicht frueher.
+    """
+    return global_pin in _PIN_DEFERS_TO_RESEARCH_PIN
+
+
 def research_cloud_enabled() -> bool:
     return os.getenv("RESEARCH_CLOUD_ENABLED", "").strip().lower() in ("1", "true", "yes", "on")
 

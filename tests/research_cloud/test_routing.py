@@ -12,6 +12,7 @@ import pytest
 from src.research_cloud.routing import (
     ResearchCloudCapExceededError,
     ResearchCloudDisabledError,
+    global_pin_defers_to_research_pin,
     resolve_research_cloud_routing,
 )
 
@@ -132,3 +133,36 @@ async def test_daily_cap_defers_overflow_eligibility_instead_of_falling_back(mon
     with p1, p2, p3:
         with pytest.raises(ResearchCloudCapExceededError):
             await resolve_research_cloud_routing("user-1", cloud_overflow=True)
+
+
+# ---------------------------------------------------------------------------
+# Erreichbarkeit: bei welchem globalen Pin wird ueber die Cloud ueberhaupt
+# entschieden (Befund 05.09.2026)
+# ---------------------------------------------------------------------------
+
+
+def test_no_global_pin_defers_to_the_research_pin():
+    assert global_pin_defers_to_research_pin(None) is True
+
+
+def test_anthropic_pin_defers_to_the_research_pin():
+    """Der Kern des Befunds: der Handler fragte die Cloud-Entscheidung nur bei
+    global_pin IS NONE. "anthropic" entsteht aber regulaer — ein Bedrock-Pin
+    ausserhalb prod wird darauf heruntergestuft, und eine App-Regel kann ihn
+    direkt setzen. Diese Aufrufer liefen stumm am research_provider='cloud'-Pin
+    vorbei. "anthropic" sagt ueber Pool-vs-Cloud auch gar nichts: die
+    Recherche-Cloud IST Anthropic."""
+    assert global_pin_defers_to_research_pin("anthropic") is True
+
+
+def test_bedrock_pin_does_not_defer():
+    """Bedrock hat seinen eigenen Zweig im Handler (Recherche kann dort gar
+    nicht laufen — kein WebSearch). Wuerde er hier mitlaufen, gaebe es zwei
+    Stellen, die dieselbe Entscheidung treffen."""
+    assert global_pin_defers_to_research_pin("bedrock") is False
+
+
+def test_an_unknown_pin_does_not_silently_defer():
+    """Ein dritter Provider darf nicht durch Zufall in den Cloud-Pfad
+    rutschen — der Handler meldet ihn stattdessen laut."""
+    assert global_pin_defers_to_research_pin("some-future-provider") is False

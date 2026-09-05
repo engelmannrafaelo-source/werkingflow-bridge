@@ -5132,6 +5132,8 @@ async def research(
     # Bedrock pin gets the research exception below (Bedrock cannot serve
     # research at all); for every other endpoint the compliance pin is
     # untouched.
+    from src.research_cloud.routing import global_pin_defers_to_research_pin
+
     _use_research_cloud = False
     if _research_pinned == "bedrock":
         # RESEARCH EXCEPTION TO THE GLOBAL BEDROCK PIN (Rafael 2026-07-27):
@@ -5174,7 +5176,13 @@ async def research(
                 f"falling back to pool: {_rc_err}"
             )
             _use_research_cloud = False
-    elif _research_pinned is None:
+    elif global_pin_defers_to_research_pin(_research_pinned):
+        # NICHT nur `is None`: "anthropic" ist der zweite Wert, den der globale
+        # Pin annehmen kann, und er sagt ueber Pool-vs-Cloud nichts aus (die
+        # Recherche-Cloud ist selbst Anthropic). Er entsteht regulaer durch
+        # einen ausserhalb prod heruntergestuften Bedrock-Pin oder eine
+        # App-Regel — und liess bis 05.09.2026 jeden so gepinnten Aufrufer
+        # stumm am research_provider='cloud'-Pin vorbeilaufen.
         try:
             from src.research_cloud.routing import (
                 ResearchCloudCapExceededError,
@@ -5225,6 +5233,19 @@ async def research(
             # ERROR so this can never become an invisible permanent state.
             logger.error(f"research-cloud routing decision failed — falling back to pool: {_rc_err}")
             _use_research_cloud = False
+    else:
+        # Unerwarteter Pin-Wert. Heute unerreichbar (SUPPORTED_PROVIDERS kennt
+        # nur anthropic/bedrock, und bedrock hat den Zweig oben), aber genau so
+        # war der anthropic-Fall auch gemeint: als "kann nicht vorkommen". Wer
+        # einen dritten Provider einfuehrt, soll das hier LESEN und nicht
+        # dadurch merken, dass die Recherche-Cloud fuer dessen Nutzer stumm
+        # verschwindet.
+        logger.error(
+            "research routing: unbekannter globaler Pin %r — Recherche-Cloud "
+            "wurde fuer diesen Aufruf NICHT befragt, der Call laeuft auf dem "
+            "Abo-Pool. Ein research_provider-Pin dieses Nutzers wirkt nicht.",
+            _research_pinned,
+        )
 
     # Observability for the pool-vs-cloud decision. Added 2026-07-30 because the
     # decision was UNOBSERVABLE: resolve_research_cloud_routing() returns True
