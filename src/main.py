@@ -2897,6 +2897,16 @@ async def chat_completions(
 
             return response_data
 
+        # Welcher Anbieter das Bild sehen soll. Steht HIER und nicht erst im
+        # Vision-Zweig weiter unten, weil der Waechter fuer
+        # gemini_thinking_budget (ein paar Zeilen tiefer) den Wert braucht.
+        # Weiter unten zugewiesen war der Name in der ganzen Funktion lokal —
+        # der Waechter lief in einen UnboundLocalError, also in einen 500 statt
+        # in seinen 400; betroffen war genau der Aufruf, fuer den das Feld
+        # gebaut wurde. backend_config steht seit der Backend-Aufloesung fest
+        # und aendert sich bis dorthin nicht, der Wert ist also derselbe.
+        _vision_target = resolve_vision_target(backend_config)
+
         # =======================================================================
         # GEMINI API (Bildweg, Testlane): nur MIT Bild sinnvoll
         # =======================================================================
@@ -3025,10 +3035,9 @@ async def chat_completions(
             _vision_is_bedrock = bool(
                 backend_config and backend_config.backend == BackendType.BEDROCK
             )
-            # Welcher Anbieter das Bild sehen soll. Ohne Gemini-Tier ist das
-            # unveraendert der Anthropic-Bildweg — bestehende Aufrufer merken
-            # von diesem Bau nichts.
-            _vision_target = resolve_vision_target(backend_config)
+            # _vision_target ist oben schon aufgeloest (siehe dort). Ohne
+            # Gemini-Tier ist es unveraendert der Anthropic-Bildweg —
+            # bestehende Aufrufer merken von diesem Bau nichts.
             try:
                 vision_result = None
                 if not _vision_is_bedrock and has_vision_content(prepare_messages_for_vision(request_body.messages)):
