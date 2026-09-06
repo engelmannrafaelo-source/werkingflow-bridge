@@ -310,10 +310,28 @@ HEADER
         echo "# (Budget-Foederation, Stufe A+B beidseitig bewiesen) auf ihrer"
         echo "# HEIMAT-Bridge — der 402/JIT-Schattenuser-Bruch (DevOps a0d8b084)"
         echo "# kann so nicht mehr entstehen. Runbook: adr-0011-stage-b.md §5."
+        echo "#"
+        echo "# ZWEITE DIMENSION: der Gemini-Bildweg (X-Vision-Provider: gemini)."
+        echo "# Er existiert NUR auf dieser Bridge — auf der Prod-Bridge liegt"
+        echo "# absichtlich kein GEMINI_VISION_API_KEY (avv.md 5.4, Google ist kein"
+        echo "# gelisteter Unterauftragsverarbeiter). Ein solcher Aufruf, der nach"
+        echo "# drueben weitergereicht wird, kann dort also gar nicht bedient"
+        echo "# werden: er endet mit 403 der Umgebungssperre — und auf einem"
+        echo "# Prod-Stand ohne den Fail-loud-Fix sogar still mit Sonnet, also mit"
+        echo "# einem Messergebnis, das nie gemessen wurde. Gemessen am"
+        echo "# 06.09.2026: jeder nicht-gehopte Bildaufruf an diese Bridge lief"
+        echo "# ueber 178.104.178.79 und wurde von claude-sonnet-5 beantwortet,"
+        echo "# obwohl provider_tier=gemini-vision angefragt war."
+        echo "# Die Regel ist bewusst ENG benannt: sie ist keine allgemeine"
+        echo "# \"bleib lokal\"-Klappe, sondern sagt, warum GENAU dieser Weg nicht"
+        echo "# weitergereicht werden darf. Mehr Rechte gibt sie ohnehin nicht —"
+        echo "# X-Bridge-Hop kann jeder Aufrufer schon heute selbst setzen"
+        echo "# (nginx.conf: selbstbegrenzend, erzwingt nur die lokale Stufe)."
         cat <<'MAP'
-map $bridge_hopped $llm_backend_pool {
-    default claude_production;
-    1       claude_workers;
+map "$bridge_hopped:$http_x_vision_provider" $llm_backend_pool {
+    default         claude_production;
+    "~^1:"          claude_workers;
+    "~*^0:gemini$"  claude_workers;
 }
 MAP
     else
