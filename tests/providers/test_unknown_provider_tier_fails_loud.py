@@ -21,14 +21,29 @@ def test_known_tier_is_returned_unchanged():
     assert get_provider(tier).tier_id == tier
 
 
+#: Ein Tier, den es hier absichtlich NICHT gibt. Frueher stand hier
+#: "gemini-vision" — der gemessene Fall vom 05.09.2026, als werking-energy
+#: genau diesen Tier schickte und still claude-sonnet-5 bekam. Seit dem Merge
+#: des Gemini-Bildwegs EXISTIERT dieser Tier, und der Test haette ab da das
+#: Gegenteil dessen geprueft, was er behauptet (er wurde gruen, weil der Tier
+#: bekannt ist — nicht, weil die Absage funktioniert). Der Beispielname muss
+#: deshalb einer bleiben, den diese Bridge nie ausliefert; die Zusicherung
+#: unten haelt das nach.
+NONEXISTENT_TIER = "kein-solcher-tier-2026-09"
+
+
 def test_unknown_tier_raises_instead_of_serving_the_default():
-    """Der gemessene Fall: werking-energy schickte 'gemini-vision', die Lane
-    existiert auf dieser Bridge nicht — und jeder Aufruf bekam claude-sonnet-5
+    """Der gemessene Fall (05.09.2026): werking-energy schickte einen Tier, den
+    die ausgerollte Bridge nicht kannte — und jeder Aufruf bekam claude-sonnet-5
     mit HTTP 200 zurueck."""
+    assert NONEXISTENT_TIER not in PROVIDERS, (
+        "Der Beispiel-Tier dieses Tests ist real geworden. Dann prueft der Test "
+        "nichts mehr — neuen, nicht existierenden Namen waehlen."
+    )
     with pytest.raises(RuntimeError) as excinfo:
-        get_provider("gemini-vision")
+        get_provider(NONEXISTENT_TIER)
     msg = str(excinfo.value)
-    assert "gemini-vision" in msg
+    assert NONEXISTENT_TIER in msg
     assert DEFAULT_TIER in msg  # nennt, was es NICHT stillschweigend getan hat
     assert type(excinfo.value).__name__ == "UnknownProviderTierError"
 
