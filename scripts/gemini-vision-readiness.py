@@ -112,6 +112,29 @@ def probe(base_url: str, api_key: str, app_env: str) -> dict:
             "Authorization": f"Bearer {api_key}",
             "X-App-ID": "dev-tooling",
             "X-App-Env": app_env,
+            # Pflicht seit der Attributions-Sperre: ohne X-User-ID antwortet
+            # /v1/chat/completions mit 400 missing_user_attribution, und dieses
+            # Skript haette nie eine Aussage ueber Gemini treffen koennen — es
+            # scheiterte eine Schicht davor. Der anonymous-Marker ist der
+            # vorgesehene Weg fuer Aufrufe ohne Person dahinter: diese Probe ist
+            # synthetisch, sie soll auf niemandes Budget laufen und in der
+            # Auswertung als das erkennbar sein, was sie ist.
+            "X-User-ID": "anonymous:gemini-vision-readiness",
+            # DIE PROBE MUSS AUF DER BRIDGE BLEIBEN, DIE SIE PRUEFT.
+            # Seit ADR-0010 (reaktiviert 31.08.2026) schickt der LB der
+            # dev-Bridge JEDEN nicht-gehopten Aufruf an /v1/chat/completions
+            # zuerst zur PROD-Bridge ($llm_backend_pool = claude_production,
+            # Level-1-first); die lokalen Worker sind nur der Ueberlauf. Ohne
+            # diesen Header beantwortet also die Prod-Bridge die Frage "traegt
+            # der Gemini-Weg auf DIESER Bridge?" — und zwar mit nein, weil dort
+            # absichtlich kein Gemini-Schluessel liegt. Gemessen 06.09.2026:
+            # LB-Zugriffslog "upstream: 178.104.178.79:8000", Antwort
+            # claude-sonnet-5, kein Eintrag in den dev-Worker-Logs.
+            # X-Bridge-Hop ist der dafuer vorgesehene Weg: nginx.conf
+            # beschreibt ihn ausdruecklich als selbstbegrenzend — wer ihn
+            # setzt, zwingt sich selbst auf die lokale Stufe und kann damit
+            # nichts anderes erreichen.
+            "X-Bridge-Hop": "1",
         },
         method="POST",
     )
