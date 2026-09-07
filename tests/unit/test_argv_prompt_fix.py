@@ -28,6 +28,7 @@ import src.claude_cli as _cli_module
 from src.claude_cli import (
     ClaudeCodeCLI,
     LARGE_ARG_THRESHOLD_BYTES,
+    _current_append_sys_prompt_tempfile,
     _current_sys_prompt_tempfile,
     _open_process_patch_applied,
 )
@@ -421,3 +422,67 @@ class TestAnyioOpenProcessInterception:
         assert "--system-prompt-file" not in captured["command"], (
             "Patch must only touch the claude binary, never unrelated subprocesses"
         )
+
+
+class TestAppendSystemPrompt:
+    """append_system_prompt (Bibliothekskatalog auf dem Pool-Weg) muss denselben
+    argv-Schutz haben wie system_prompt — der Katalog waechst mit der Bibliothek."""
+
+    @pytest.mark.asyncio
+    async def test_small_append_prompt_uses_options(self, cli, mock_session_mgr):
+        block = "## Katalog\n- `doc-a` — Doc A"
+        received = {}
+
+        async def fake_query(prompt, options):
+            received["append"] = getattr(options, "append_system_prompt", None)
+            received["system"] = getattr(options, "system_prompt", None)
+            return
+            yield
+
+        with patch("src.claude_cli.query", side_effect=fake_query):
+            async for _ in cli.run_completion(prompt="hi", append_system_prompt=block):
+                pass
+
+        assert received.get("append") == block
+        # Der Claude-Code-Systemprompt bleibt stehen — genau der Unterschied
+        # zwischen --append-system-prompt und --system-prompt.
+        assert received.get("system") is None
+
+    @pytest.mark.asyncio
+    async def test_large_append_prompt_goes_via_temp_file(self, cli, mock_session_mgr):
+        block = "K" * (LARGE_ARG_THRESHOLD_BYTES + 10_000)
+        seen = {}
+
+        async def fake_query(prompt, options):
+            seen["append_option"] = getattr(options, "append_system_prompt", None)
+            seen["contextvar"] = _current_append_sys_prompt_tempfile.get()
+            return
+            yield
+
+        with patch("src.claude_cli.query", side_effect=fake_query):
+            async for _ in cli.run_completion(prompt="hi", append_system_prompt=block):
+                pass
+
+        assert seen["append_option"] is None, "Grosser Block darf nicht nach argv"
+        assert seen["contextvar"] is not None
+        # Nach dem Lauf aufgeraeumt: weder Datei noch ContextVar bleiben zurueck.
+        assert not Path(seen["contextvar"]).exists()
+        assert _current_append_sys_prompt_tempfile.get() is None
+
+    @pytest.mark.asyncio
+    async def test_both_prompts_can_be_set_at_once(self, cli, mock_session_mgr):
+        received = {}
+
+        async def fake_query(prompt, options):
+            received["system"] = getattr(options, "system_prompt", None)
+            received["append"] = getattr(options, "append_system_prompt", None)
+            return
+            yield
+
+        with patch("src.claude_cli.query", side_effect=fake_query):
+            async for _ in cli.run_completion(
+                prompt="hi", system_prompt="Rolle.", append_system_prompt="Katalog."
+            ):
+                pass
+
+        assert received == {"system": "Rolle.", "append": "Katalog."}

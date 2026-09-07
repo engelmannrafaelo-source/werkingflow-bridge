@@ -128,6 +128,14 @@ _current_sys_prompt_tempfile: ContextVar[Optional[str]] = ContextVar(
     "_bridge_sys_prompt_tempfile", default=None
 )
 
+# Dasselbe fuer append_system_prompt (--append-system-prompt). Getrennte
+# ContextVar, weil ein Request BEIDE setzen kann: der Dokument-Agent ersetzt
+# den Systemprompt, der Recherche-Pool-Weg haengt nur den Bibliothekskatalog
+# an. Ein gemeinsames Feld wuerde eines von beiden still verschlucken.
+_current_append_sys_prompt_tempfile: ContextVar[Optional[str]] = ContextVar(
+    "_bridge_append_sys_prompt_tempfile", default=None
+)
+
 _open_process_patch_applied: bool = False
 
 
@@ -157,20 +165,30 @@ def _apply_open_process_patch() -> None:
     _original_open_process = anyio.open_process
 
     async def _intercepted_open_process(command, *args, **kwargs):
-        tempfile_path = _current_sys_prompt_tempfile.get()
-        if (
-            tempfile_path
-            and isinstance(command, (list, tuple))
+        is_claude_cmd = (
+            isinstance(command, (list, tuple))
             and command
             and str(command[0]).endswith("claude")
-        ):
-            # options.system_prompt was intentionally NOT set for this request
-            # (so the SDK did not add --system-prompt <big>). Inject the file
-            # variant instead, which the claude CLI reads off-argv.
-            command = list(command) + ["--system-prompt-file", tempfile_path]
-            logger.debug(
-                f"🔧 open_process patch: injected --system-prompt-file {tempfile_path!r}"
-            )
+        )
+        if is_claude_cmd:
+            tempfile_path = _current_sys_prompt_tempfile.get()
+            if tempfile_path:
+                # options.system_prompt was intentionally NOT set for this request
+                # (so the SDK did not add --system-prompt <big>). Inject the file
+                # variant instead, which the claude CLI reads off-argv.
+                command = list(command) + ["--system-prompt-file", tempfile_path]
+                logger.debug(
+                    f"🔧 open_process patch: injected --system-prompt-file {tempfile_path!r}"
+                )
+            append_tempfile_path = _current_append_sys_prompt_tempfile.get()
+            if append_tempfile_path:
+                command = list(command) + [
+                    "--append-system-prompt-file", append_tempfile_path
+                ]
+                logger.debug(
+                    f"🔧 open_process patch: injected --append-system-prompt-file "
+                    f"{append_tempfile_path!r}"
+                )
         return await _original_open_process(command, *args, **kwargs)
 
     anyio.open_process = _intercepted_open_process  # type: ignore[assignment]
@@ -1050,6 +1068,7 @@ class ClaudeCodeCLI:
         self,
         prompt: str,
         system_prompt: Optional[str] = None,
+        append_system_prompt: Optional[str] = None,
         model: Optional[str] = None,
         stream: bool = True,
         max_turns: int = 10,
@@ -1059,13 +1078,21 @@ class ClaudeCodeCLI:
         continue_session: bool = False,
         enable_file_discovery: bool = False,
         backend_env_vars: Optional[Dict[str, str]] = None,
-        seed_files: Optional[Dict[str, str]] = None
+        seed_files: Optional[Dict[str, str]] = None,
+        seed_links: Optional[Dict[str, Dict[str, str]]] = None
     ) -> AsyncGenerator[Dict[str, Any], None]:
         """Run Claude Code using the Python SDK and yield response chunks.
 
         Args:
             prompt: The user prompt to send to Claude
-            system_prompt: Optional system prompt
+            system_prompt: Optional system prompt. REPLACES the Claude Code
+                           system prompt (CLI --system-prompt) — for agents
+                           that define their own role end-to-end (doc-agent).
+            append_system_prompt: Optional block APPENDED to the Claude Code
+                           system prompt (CLI --append-system-prompt), so the
+                           default prompt and its cached prefix stay intact.
+                           This is the right one for adding context to an
+                           otherwise normal run (research library catalogue).
             model: Model ID to use
             stream: Whether to stream responses
             max_turns: Maximum conversation turns
@@ -1081,6 +1108,15 @@ class ClaudeCodeCLI:
                         `<session_dir>/unterlagen/` BEFORE the SDK starts, so the
                         agent can navigate them with Read/Grep/Glob (doc-agent).
                         Names are sanitized to basenames — no path traversal.
+            seed_links: Optional {subdir: {filename: absolute_source_path}}
+                        hardlinked into `<session_dir>/<subdir>/` before the
+                        SDK starts. Same purpose as seed_files, but for
+                        content that already lies on this host and would be
+                        wasteful to copy per run (research-library mirror):
+                        a hardlink costs an inode, not the bytes. Falls back
+                        to a copy across filesystem boundaries; fails loud
+                        when neither works, since a silently missing document
+                        makes the agent conclude "not in the library".
         """
 
         # Register CLI session for tracking and cancellation
@@ -1257,6 +1293,38 @@ class ClaudeCodeCLI:
                         extra={"unterlagen_dir": str(unterlagen_dir)}
                     )
 
+                # Hardlink caller-provided directories into the workdir
+                # (research-library mirror). Fail loud for the same reason as
+                # seed_files above: a document that is silently absent turns
+                # into a wrong "the library does not have this" conclusion.
+                if seed_links:
+                    for raw_subdir, entries in seed_links.items():
+                        subdir = _sanitize_seed_filename(raw_subdir)
+                        target_dir = research_dir / subdir
+                        target_dir.mkdir(parents=True, exist_ok=True)
+                        for raw_name, source_path in entries.items():
+                            safe_name = _sanitize_seed_filename(raw_name)
+                            target = target_dir / safe_name
+                            if target.exists():
+                                continue
+                            try:
+                                os.link(source_path, target)
+                            except OSError:
+                                # Different filesystem (or a source the link
+                                # syscall refuses) — copying still delivers the
+                                # document, it just costs the bytes.
+                                try:
+                                    shutil.copy2(source_path, target)
+                                except OSError as e:
+                                    raise RuntimeError(
+                                        f"Failed to link workdir file '{subdir}/{safe_name}' "
+                                        f"from {source_path!r}: {e}"
+                                    ) from e
+                        logger.info(
+                            f"🔗 Linked {len(entries)} file(s) into workdir/{subdir}",
+                            extra={"target_dir": str(target_dir)}
+                        )
+
                 # Create comprehensive metadata.json with ALL SDK options
                 metadata = {
                     "cli_session_id": cli_session.cli_session_id,
@@ -1271,6 +1339,11 @@ class ClaudeCodeCLI:
                         "cwd": str(research_dir),
                         "permission_mode": os.getenv("CLAUDE_PERMISSION_MODE"),
                         "system_prompt": system_prompt if system_prompt else None,
+                        # Nur die Laenge: der angehaengte Block ist auf dem
+                        # Recherche-Weg der Bibliothekskatalog und wuerde die
+                        # metadata.json jeder Sitzung um 17 KB aufblaehen. Die
+                        # Zahl genuegt, um im Nachhinein zu sehen, ob er ankam.
+                        "append_system_prompt_chars": len(append_system_prompt) if append_system_prompt else None,
                         "allowed_tools": allowed_tools if allowed_tools else None,
                         "disallowed_tools": disallowed_tools if disallowed_tools else None,
                         "continue_session": continue_session,
@@ -1342,6 +1415,7 @@ class ClaudeCodeCLI:
                 chunks_received = 0
                 chunks_buffer = []
                 _sys_prompt_tempfile_path: Optional[str] = None  # cleanup target for large system_prompt
+                _append_sys_prompt_tempfile_path: Optional[str] = None  # ditto, appended block
 
                 # Build SDK options
                 options = ClaudeCodeOptions(
@@ -1394,6 +1468,37 @@ class ClaudeCodeCLI:
                         )
                     else:
                         options.system_prompt = system_prompt
+
+                # Same argv-size reasoning for the appended block (the research
+                # library catalogue grows with the library — ~17 KB at 94
+                # entries, but nothing caps it at 100 KB except this branch).
+                if append_system_prompt:
+                    if len(append_system_prompt.encode("utf-8")) > LARGE_ARG_THRESHOLD_BYTES:
+                        if not _open_process_patch_applied:
+                            raise RuntimeError(
+                                f"Large append_system_prompt ({len(append_system_prompt):,} chars) "
+                                f"cannot be passed as argv (exceeds ARG_MAX) and the "
+                                f"anyio.open_process patch was NOT applied at startup. "
+                                f"Cannot proceed safely. Check bridge startup logs."
+                            )
+                        _atf = tempfile.NamedTemporaryFile(
+                            mode="w", suffix=".txt",
+                            prefix="bridge_append_sysprompt_",
+                            delete=False, encoding="utf-8"
+                        )
+                        _atf.write(append_system_prompt)
+                        _atf.close()
+                        _append_sys_prompt_tempfile_path = _atf.name
+                        _current_append_sys_prompt_tempfile.set(_atf.name)
+                        logger.info(
+                            f"📁 Large append_system_prompt ({len(append_system_prompt):,} chars) "
+                            f"written to temp file for argv-safe delivery: {_atf.name}"
+                        )
+                    else:
+                        options.append_system_prompt = append_system_prompt
+                        logger.info(
+                            f"📎 append_system_prompt set ({len(append_system_prompt):,} chars)"
+                        )
                 # === END SYSTEM PROMPT HANDLING ===
 
                 # Set tool restrictions
@@ -2006,6 +2111,21 @@ class ClaudeCodeCLI:
                         logger.warning(f"system_prompt temp file cleanup failed: {sp_cleanup_err}")
                     finally:
                         _current_sys_prompt_tempfile.set(None)  # Clear ContextVar for this task
+
+                # Same for the appended block's temp file
+                if _append_sys_prompt_tempfile_path:
+                    try:
+                        os.unlink(_append_sys_prompt_tempfile_path)
+                        logger.debug(
+                            f"🗑️  append_system_prompt temp file cleaned up: "
+                            f"{_append_sys_prompt_tempfile_path}"
+                        )
+                    except Exception as asp_cleanup_err:
+                        logger.warning(
+                            f"append_system_prompt temp file cleanup failed: {asp_cleanup_err}"
+                        )
+                    finally:
+                        _current_append_sys_prompt_tempfile.set(None)
 
                 # Restore original environment (if we changed anything)
                 if original_env:

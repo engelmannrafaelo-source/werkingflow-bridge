@@ -4367,6 +4367,70 @@ async def _execute_research_impl(
         except Exception as _oa_err:  # Research darf NIE an dieser Zusatzschicht scheitern
             logger.warning(f"⚠️ OA-Scholarly-Schicht übersprungen (fail-soft): {_oa_err}")
 
+        # Kuratierte Normenbibliothek auf dem Abo-Pool-Weg (Karte k20, Rafael
+        # 07.09.2026, Weg a). Der Cloud-Executor reicht sie dem Modell als
+        # Werkzeuge; hier gibt es keinen Werkzeug-Loop, also bekommt der Lauf
+        # das Verzeichnis im angehängten Systemblock (der gecachte Teil) und
+        # die Volltexte als Dateien im Arbeitsverzeichnis.
+        #
+        # Anders als die OA-Schicht darüber ist das NICHT fail-soft: eine
+        # eingeschaltete, aber unbrauchbare Bibliothek bricht den Lauf ab,
+        # bevor ein Token fließt — genau wie auf dem Cloud-Weg. Der Pool-Weg
+        # hat still verschlechterte Läufe als Erfolg gemeldet (Befund 04.09.);
+        # eine Antwort, die heimlich aus dem offenen Netz kommt, ist von einer
+        # belegten nicht zu unterscheiden.
+        from src.research_cloud.library import (
+            LibraryUnavailableError,
+            load_library_config,
+            load_library_for_run,
+        )
+        from src.research_cloud.prompt import build_pool_library_catalogue
+        from src.research_library_pool import (
+            LIBRARY_WORKDIR_NAME,
+            link_sources,
+            sync_library_mirror,
+        )
+
+        library_append_prompt: Optional[str] = None
+        library_seed_links: Optional[Dict[str, Dict[str, str]]] = None
+        library_active = False
+        try:
+            _library_cfg = load_library_config()
+            _library_index = await load_library_for_run(_library_cfg)
+            if _library_index is not None:
+                _mirror = await sync_library_mirror(_library_cfg, _library_index)
+                library_append_prompt = build_pool_library_catalogue(
+                    _library_index,
+                    dir_name=LIBRARY_WORKDIR_NAME,
+                    unavailable_ids=set(_mirror.missing_ids),
+                )
+                if not library_append_prompt:
+                    raise LibraryUnavailableError(
+                        "Der Bibliotheks-Index ließ sich laden, ergibt aber kein Verzeichnis "
+                        "für den Prompt — ohne Katalog sieht das Modell den Bestand nicht"
+                    )
+                library_seed_links = {LIBRARY_WORKDIR_NAME: link_sources(_mirror)}
+                library_active = True
+                logger.info(
+                    "📚 Bibliothek für diesen Pool-Lauf bereit",
+                    extra={
+                        "documents": len(_mirror.available_ids),
+                        "catalogue_chars": len(library_append_prompt),
+                    },
+                )
+        except LibraryUnavailableError as _lib_err:
+            logger.error(f"research: Bibliothek unbrauchbar, Lauf wird nicht gestartet: {_lib_err}")
+            return ResearchResponse(
+                status="error",
+                query=request_body.query,
+                model=request_body.model,
+                execution_time_seconds=round(time.time() - start_time, 2),
+                error=(
+                    "Die kuratierte Recherche-Bibliothek ist eingeschaltet, aber nicht "
+                    f"benutzbar — die Recherche wurde nicht gestartet: {_lib_err}"
+                ),
+            )
+
         logger.info("🚀 Starting research execution...")
 
         all_chunks = []
@@ -4374,12 +4438,14 @@ async def _execute_research_impl(
 
         async for chunk in claude_cli.run_completion(
             prompt=research_prompt,
+            append_system_prompt=library_append_prompt,
             model=request_body.model,
             max_turns=request_body.max_turns,
             allowed_tools=None,
             stream=True,
             enable_file_discovery=True,
-            backend_env_vars=backend_config.env_vars if backend_config else None
+            backend_env_vars=backend_config.env_vars if backend_config else None,
+            seed_links=library_seed_links
         ):
             all_chunks.append(chunk)
             if "session_id" in chunk:
@@ -4412,6 +4478,21 @@ async def _execute_research_impl(
             raise ValueError("No response received from Claude Code execution")
 
         execution_time = time.time() - start_time
+
+        # Bibliotheksaufrufe zählbar machen — das Gegenstück zu library_calls
+        # des Cloud-Executors. Ohne diese Zahl ist "die Bibliothek wurde
+        # benutzt" eine Behauptung, und die Messung vom 05.09. (Katalog spart
+        # die Websuche) auf diesem Weg nicht wiederholbar.
+        library_calls = 0
+        library_docs: List[str] = []
+        if library_active:
+            from src.research_library_pool import count_library_reads
+            library_calls, library_docs = count_library_reads(all_chunks)
+            logger.info(
+                "📚 research library (pool): %d Zugriff(e), Dokumente: %s",
+                library_calls,
+                ", ".join(library_docs) or "keine",
+            )
 
         logger.info(
             f"✅ Research completed",
@@ -4626,6 +4707,14 @@ async def _execute_research_impl(
                 app_env=attribution_ctx.get("app_env") if attribution_ctx else None,
                 provider_meta={
                     "usage_source": "api" if accumulated_input_tokens is not None else "estimated",
+                    # Nur wenn die Bibliothek für diesen Lauf wirklich stand —
+                    # ein 0 bei ausgeschalteter Bibliothek würde später als
+                    # "das Modell hat sie ignoriert" gelesen.
+                    **(
+                        {"library_calls": library_calls, "library_docs": library_docs}
+                        if library_active
+                        else {}
+                    ),
                 },
             )
         except Exception as _track_err:
@@ -4641,7 +4730,8 @@ async def _execute_research_impl(
             file_size_bytes=file_size_bytes,
             content=content,
             error=None,
-            session_id=session_id
+            session_id=session_id,
+            library_calls=library_calls if library_active else None
         )
 
     except WorkerUnavailableError:

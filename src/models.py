@@ -525,9 +525,17 @@ class ResearchResponse(BaseModel):
         default=None,
         description="Async job ID (only set when async_mode=true). Use GET /v1/research/async/{request_id} to poll."
     )
-    # research-cloud-only Beobachtbarkeit (None auf dem Worker-Pool-Pfad):
-    # macht Tool-Nutzung pro Lauf pruefbar (Eval/Abnahme), statt sie aus dem
-    # Report-Text erraten zu muessen.
+    # Beobachtbarkeit pro Lauf: macht Tool-Nutzung pruefbar (Eval/Abnahme),
+    # statt sie aus dem Report-Text erraten zu muessen.
+    #
+    # web_searches/web_fetches zaehlt nur der Cloud-Executor — auf dem
+    # Worker-Pool-Pfad fuehrt die CLI die Suche selbst und meldet keine
+    # Aufrufzahl zurueck, dort bleiben sie None.
+    # library_calls fuellen BEIDE Wege (seit 07.09.2026, Karte k20): der Cloud-
+    # Weg zaehlt library_index/library_get, der Pool-Weg die Read/Grep/Glob-
+    # Zugriffe auf den Bibliotheksordner im Arbeitsverzeichnis. None heisst
+    # "Bibliothek war fuer diesen Lauf nicht eingeschaltet" und ist damit etwas
+    # anderes als 0 ("stand bereit, wurde nicht gebraucht").
     web_searches: Optional[int] = Field(
         default=None,
         description="research-cloud only: number of web_search tool calls in this run"
@@ -538,7 +546,11 @@ class ResearchResponse(BaseModel):
     )
     library_calls: Optional[int] = Field(
         default=None,
-        description="research-cloud only: number of curated-library tool calls (library_index/library_get)"
+        description=(
+            "number of curated-library accesses in this run — library_index/library_get "
+            "on the research-cloud path, file reads under the library workdir on the "
+            "worker-pool path; None when the library was off"
+        )
     )
 
 

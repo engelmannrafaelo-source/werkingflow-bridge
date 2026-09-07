@@ -8,7 +8,7 @@ since there's no CLI ``--depth`` flag to hand this to.
 """
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from src.research_cloud.library import entry_has_fulltext
 
@@ -82,28 +82,94 @@ Quell-URL, Anmerkungen). Rufe es nur, wenn du diese Zusatzangaben brauchst.
 """
 
 
-def build_library_catalogue(index: Optional[Dict[str, Any]]) -> str:
-    """Render the library index as the prompt section above.
+# Der Weg ueber den Worker-Pool (Claude-Code-CLI, ~9 von 10 Produktions-
+# recherchen) hat keinen Werkzeug-Loop, in dem library_get beantwortet werden
+# koennte. Dort liegen die Volltexte stattdessen als Dateien im Arbeits-
+# verzeichnis (src/research_library_pool.py), und das Verzeichnis sagt, wie
+# man sie oeffnet. Inhaltlich dieselbe Rangfolge wie oben — nur die
+# Zugriffsart unterscheidet sich (Rafael-Entscheidung 07.09.2026, Karte k20).
+_POOL_LIBRARY_HEADER = """
 
-    One line per entry: id, title and jurisdiction — the three fields a model
+## Kuratierte Dokumentbibliothek (Volltexte als Dateien)
+
+Für diese Recherche steht dir eine kuratierte, private Bibliothek mit Volltexten zur Verfügung.
+Ihre Dokumente liegen als Markdown-Dateien in deinem Arbeitsverzeichnis unter `{dir_name}/`;
+die Datei zu einem Eintrag heißt `{dir_name}/<id>.md`. Ihr vollständiges Verzeichnis steht unten
+— du musst es nicht erst suchen.
+
+Rangfolge der Quellen: Deckt ein Eintrag der Bibliothek die Frage ab, ist sein Volltext die
+maßgebliche Quelle — lies ihn mit `Read` und zitiere daraus, statt dich auf Zusammenfassungen
+Dritter aus der Websuche zu stützen. Mit `Grep` kannst du über alle Dateien in `{dir_name}/`
+nach Begriffen, Grenzwerten oder Fassungsangaben suchen. Die Websuche ergänzt: Aktualität,
+Fassungsstände und alles, was die Bibliothek nicht führt.
+
+Einträge, die unten mit KEIN VOLLTEXT gekennzeichnet sind, sind reine Katalogverweise; zu ihnen
+gibt es keine Datei — nutze dort die genannte Quelle über die Websuche.
+
+Zitiere aus einem Bibliotheksdokument mit Herausgeber und Fassung, wie sie im Dokument stehen,
+nicht mit dem Dateinamen.
+
+### Verzeichnis ({count} Einträge)
+
+"""
+
+
+def _catalogue_lines(
+    documents: List[Dict[str, Any]], unavailable_ids: Optional[Set[str]] = None
+) -> List[str]:
+    """One line per entry: id, title and jurisdiction — the three fields a model
     needs to decide "is this my question's legal space and subject". Publisher,
     edition and notes stay behind library_index; putting all eight fields here
     would triple the size for information that does not drive the choice.
+
+    ``unavailable_ids`` marks entries the *caller* cannot serve even though the
+    index claims a full text (pool path: no file in the mirror). They stay in
+    the catalogue — the holdings list is never trimmed — but must not be
+    advertised as loadable.
+    """
+    lines: List[str] = []
+    for entry in documents:
+        doc_id = entry.get("id", "")
+        title = (entry.get("title") or "").strip()
+        jurisdiction = (entry.get("jurisdiction") or "").strip()
+        has_text = entry_has_fulltext(entry) and not (
+            unavailable_ids and doc_id in unavailable_ids
+        )
+        suffix = "" if has_text else " — KEIN VOLLTEXT"
+        place = f" [{jurisdiction}]" if jurisdiction else ""
+        lines.append(f"- `{doc_id}` — {title}{place}{suffix}")
+    return lines
+
+
+def build_library_catalogue(index: Optional[Dict[str, Any]]) -> str:
+    """Render the library index as the prompt section above (cloud path)."""
+    if not index:
+        return ""
+    documents: List[Dict[str, Any]] = index.get("documents") or []
+    if not documents:
+        return ""
+    return _LIBRARY_HEADER.format(count=len(documents)) + "\n".join(_catalogue_lines(documents))
+
+
+def build_pool_library_catalogue(
+    index: Optional[Dict[str, Any]],
+    *,
+    dir_name: str,
+    unavailable_ids: Optional[Set[str]] = None,
+) -> str:
+    """Same holdings, addressed as files — the block appended to the Claude
+    Code system prompt on the worker-pool path.
+
+    Returns "" when there is nothing to show; the caller must then run without
+    a library block rather than with an empty heading.
     """
     if not index:
         return ""
     documents: List[Dict[str, Any]] = index.get("documents") or []
     if not documents:
         return ""
-    lines: List[str] = []
-    for entry in documents:
-        doc_id = entry.get("id", "")
-        title = (entry.get("title") or "").strip()
-        jurisdiction = (entry.get("jurisdiction") or "").strip()
-        suffix = "" if entry_has_fulltext(entry) else " — KEIN VOLLTEXT"
-        place = f" [{jurisdiction}]" if jurisdiction else ""
-        lines.append(f"- `{doc_id}` — {title}{place}{suffix}")
-    return _LIBRARY_HEADER.format(count=len(documents)) + "\n".join(lines)
+    header = _POOL_LIBRARY_HEADER.format(count=len(documents), dir_name=dir_name)
+    return header + "\n".join(_catalogue_lines(documents, unavailable_ids))
 
 
 _DEPTH_INSTRUCTION = {

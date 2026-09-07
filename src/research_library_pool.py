@@ -76,8 +76,7 @@ class LibraryMirror(BaseModel):
     reused: int = 0
     bytes_downloaded: int = 0
 
-    class Config:
-        arbitrary_types_allowed = True
+    model_config = {"arbitrary_types_allowed": True}
 
 
 def mirror_root(config: LibraryConfig) -> Path:

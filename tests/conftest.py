@@ -84,3 +84,30 @@ def ledger_seam():
         ):
             stack.enter_context(patch.object(ledger_client, name, getattr(seam, name)))
         yield seam
+
+
+@pytest.fixture(autouse=True)
+def _no_ambient_research_library(monkeypatch):
+    """Kein Test spricht mit dem echten Bibliotheks-Bucket.
+
+    Die Recherche-Pfade loesen die kuratierte Bibliothek aus RESEARCH_LIBRARY_*
+    auf. Auf einer Entwickler-Shell sind diese Variablen geladen (Infisical),
+    also wuerde ein Unit-Test ueber _execute_research_impl echte S3-Aufrufe
+    machen und je nach Maschine anders ausgehen — genau die Sorte
+    Umgebungsabhaengigkeit, die einen gruenen Lauf wertlos macht.
+
+    Tests, die die Bibliothek brauchen, setzen sie ausdruecklich selbst
+    (tests/research_cloud/test_library_pool.py uebergibt ihre LibraryConfig
+    direkt und mockt die S3-Naht).
+    """
+    for var in (
+        "RESEARCH_LIBRARY_ENABLED",
+        "RESEARCH_LIBRARY_S3_ENDPOINT_URL",
+        "RESEARCH_LIBRARY_S3_BUCKET",
+        "RESEARCH_LIBRARY_S3_ACCESS_KEY_ID",
+        "RESEARCH_LIBRARY_S3_SECRET_ACCESS_KEY",
+        "RESEARCH_LIBRARY_S3_REGION",
+        "RESEARCH_LIBRARY_S3_PREFIX",
+        "RESEARCH_LIBRARY_MIRROR_DIR",
+    ):
+        monkeypatch.delenv(var, raising=False)
