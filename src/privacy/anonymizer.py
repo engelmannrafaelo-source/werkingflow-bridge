@@ -39,6 +39,47 @@ SEED_ALLOWLIST = [
     "OIB-Richtlinie",
     "Österreichische Energieagentur",
     "Österreichischen Energieagentur",
+    # Countries and states (AT/DE) for the "Rechtsraum: <Staat>, Bundesland
+    # <Bundesland>." research-query prefix (2026-09-07, Guide-Karte
+    # k17-bundesland-rechtsraum-recherche). A state/country name alone does
+    # not identify a person — unlike address/PLZ/street/city, which stay
+    # anonymized. Exact string, no inflected forms (matches presidio's exact
+    # span match; genitive "-s" forms etc. are not covered).
+    #
+    # KNOWN TRADEOFF: "Wien", "Salzburg", "Bremen", "Hamburg", "Berlin" are
+    # simultaneously Bundesland AND city/Gemeinde names in AT/DE. Allow-listing
+    # them for the Bundesland use case also un-masks them when they occur as a
+    # city reference elsewhere in the same text. Accepted deliberately (Rafael,
+    # 2026-09-07) — a city name alone is not PII either — but it means the
+    # "Städte bleiben maskiert" guarantee has this named exception.
+    "Österreich",
+    "Deutschland",
+    "Schweiz",
+    "Wien",
+    "Niederösterreich",
+    "Oberösterreich",
+    "Salzburg",
+    "Tirol",
+    "Vorarlberg",
+    "Burgenland",
+    "Steiermark",
+    "Kärnten",
+    "Baden-Württemberg",
+    "Bayern",
+    "Berlin",
+    "Brandenburg",
+    "Bremen",
+    "Hamburg",
+    "Hessen",
+    "Mecklenburg-Vorpommern",
+    "Niedersachsen",
+    "Nordrhein-Westfalen",
+    "Rheinland-Pfalz",
+    "Saarland",
+    "Sachsen",
+    "Sachsen-Anhalt",
+    "Schleswig-Holstein",
+    "Thüringen",
 ]
 
 # Lazy load Presidio to avoid import errors when disabled
