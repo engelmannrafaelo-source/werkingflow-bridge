@@ -95,6 +95,15 @@ services:
       - FILTER_SENSITIVE_DATA=true
       - CORS_ORIGINS=["*"]
       - BRIDGE_SECRETS_DIR=/app/secrets
+      # Zaehldienst: DIESELBE Quelle wie der Verteiler (nginx.conf setzt
+      # $metrics_reader aus METRICS_READER_TARGET). Beim Worker-Umzug am
+      # 03.09.2026 wurde nur der Verteiler nachgezogen; die API fiel auf ihren
+      # Code-Default http://metrics-reader:8000 zurueck, der im eigenen Netz
+      # nicht mehr aufloest — jeder Sandbox-Lease endete mit 503 und der
+      # Report-Assistent war vier Tage tot, ohne dass es jemand sah. Eine
+      # Adresse, eine Quelle: der naechste Umzug kann sie nicht mehr halb
+      # nachziehen. (Rafael 08.09.2026, Karte k-bridge-metrics-reader-prod.)
+      - BRIDGE_METRICS_READER_URL=http://${METRICS_READER_TARGET:?METRICS_READER_TARGET fehlt in docker/.env}
       # Bedrock-Geburts-Pin fuer Selbstregistrierung (Residenzzusage) gilt NUR
       # hier auf der Prod-Bridge (Rafael, 2026-08-24). Dev/Staging registriert
       # ohne Pin — siehe src/identity/routes.py::_self_register_provider_pin.
