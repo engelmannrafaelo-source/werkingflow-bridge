@@ -201,7 +201,7 @@ services:
       # WARNING (src/research_cloud/executor.py). Ohne den Rueckfall waere die
       # Recherche in dem Moment tot, in dem dieser Deploy vor Rafaels Eintrag
       # landet.
-      - RESEARCH_CLOUD_API_KEY=${RESEARCH_CLOUD_ANTHROPIC_KEY:-${ANTHROPIC_API_KEY:-}}
+      - RESEARCH_CLOUD_API_KEY=${RESEARCH_CLOUD_ANTHROPIC_KEY:-}
       - RESEARCH_CLOUD_ENABLED=${RESEARCH_CLOUD_ENABLED:-}
       # Research-Library (specs/research-library-tool): kuratierte private
       # Bibliothek fuer den research_cloud-Pfad; default aus, Werte via
@@ -388,7 +388,7 @@ services:
       # WARNING (src/research_cloud/executor.py). Ohne den Rueckfall waere die
       # Recherche in dem Moment tot, in dem dieser Deploy vor Rafaels Eintrag
       # landet.
-      - RESEARCH_CLOUD_API_KEY=${RESEARCH_CLOUD_ANTHROPIC_KEY:-${ANTHROPIC_API_KEY:-}}
+      - RESEARCH_CLOUD_API_KEY=${RESEARCH_CLOUD_ANTHROPIC_KEY:-}
       - RESEARCH_CLOUD_ENABLED=${RESEARCH_CLOUD_ENABLED:-}
       # Research-Library (specs/research-library-tool): kuratierte private
       # Bibliothek fuer den research_cloud-Pfad; default aus, Werte via
@@ -575,7 +575,7 @@ services:
       # WARNING (src/research_cloud/executor.py). Ohne den Rueckfall waere die
       # Recherche in dem Moment tot, in dem dieser Deploy vor Rafaels Eintrag
       # landet.
-      - RESEARCH_CLOUD_API_KEY=${RESEARCH_CLOUD_ANTHROPIC_KEY:-${ANTHROPIC_API_KEY:-}}
+      - RESEARCH_CLOUD_API_KEY=${RESEARCH_CLOUD_ANTHROPIC_KEY:-}
       - RESEARCH_CLOUD_ENABLED=${RESEARCH_CLOUD_ENABLED:-}
       # Research-Library (specs/research-library-tool): kuratierte private
       # Bibliothek fuer den research_cloud-Pfad; default aus, Werte via
@@ -762,7 +762,7 @@ services:
       # WARNING (src/research_cloud/executor.py). Ohne den Rueckfall waere die
       # Recherche in dem Moment tot, in dem dieser Deploy vor Rafaels Eintrag
       # landet.
-      - RESEARCH_CLOUD_API_KEY=${RESEARCH_CLOUD_ANTHROPIC_KEY:-${ANTHROPIC_API_KEY:-}}
+      - RESEARCH_CLOUD_API_KEY=${RESEARCH_CLOUD_ANTHROPIC_KEY:-}
       - RESEARCH_CLOUD_ENABLED=${RESEARCH_CLOUD_ENABLED:-}
       # Research-Library (specs/research-library-tool): kuratierte private
       # Bibliothek fuer den research_cloud-Pfad; default aus, Werte via

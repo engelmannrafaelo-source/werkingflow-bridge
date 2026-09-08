@@ -229,10 +229,31 @@ async def test_http_400_carries_status_code_and_is_not_transient():
 @pytest.mark.asyncio
 async def test_missing_api_key_fails_loud(monkeypatch):
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
-    with pytest.raises(ResearchCloudExecutorError, match="ANTHROPIC_API_KEY") as ei:
+    monkeypatch.delenv("RESEARCH_CLOUD_API_KEY", raising=False)
+    with pytest.raises(ResearchCloudExecutorError, match="RESEARCH_CLOUD_API_KEY") as ei:
         await run_research_cloud("query", "system", api_key=None, client=MagicMock())
     # Config failure, not an upstream HTTP response — no status_code to carry.
     assert ei.value.status_code is None
+
+
+@pytest.mark.asyncio
+async def test_does_not_fall_back_to_the_image_lane_key(monkeypatch):
+    """Rafael, 08.09.2026: die Recherche laeuft ueber ihren EIGENEN Schluessel
+    oder gar nicht — nie ueber den Bild-Schluessel.
+
+    Frueher hat der Executor auf ANTHROPIC_API_KEY zurueckgegriffen. Damit
+    konnte ein einziger Recherche-Lauf die Kasse der Kunden-Bildanalyse leeren,
+    und im Ledger sah es aus wie ein Bildanalyse-Problem. Ein gesetzter
+    ANTHROPIC_API_KEY darf den fehlenden eigenen Schluessel deshalb NICHT
+    ersetzen — auch dann nicht, wenn er greifbar im Prozess steht.
+    """
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-bild-lane")
+    monkeypatch.delenv("RESEARCH_CLOUD_API_KEY", raising=False)
+    client = MagicMock()
+    client.post = AsyncMock()
+    with pytest.raises(ResearchCloudExecutorError, match="RESEARCH_CLOUD_API_KEY"):
+        await run_research_cloud("query", "system", api_key=None, client=client)
+    client.post.assert_not_called()  # kein Aufruf auf fremde Kosten
 
 
 def test_mark_cache_control_places_marker_on_last_block_only():

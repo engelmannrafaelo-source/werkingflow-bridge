@@ -282,19 +282,24 @@ async def run_research_cloud(
     config = config or ResearchCloudConfig()
     # Workers deliberately never carry ANTHROPIC_API_KEY — claude_cli.py
     # fatals on it, because the CLI would otherwise silently bill the API
-    # instead of the subscription pool. The executor therefore reads its own
-    # RESEARCH_CLOUD_API_KEY (mapped in docker-compose from the host's
-    # ANTHROPIC_API_KEY). The plain ANTHROPIC_API_KEY fallback exists for
-    # local/dev runs outside a worker container.
-    api_key = (
-        api_key
-        or os.environ.get("RESEARCH_CLOUD_API_KEY")
-        or os.environ.get("ANTHROPIC_API_KEY")
-    )
+    # instead of the subscription pool. The executor reads its own
+    # RESEARCH_CLOUD_API_KEY (docker-compose maps it from
+    # RESEARCH_CLOUD_ANTHROPIC_KEY in docker/.env).
+    #
+    # KEIN Rueckfall auf ANTHROPIC_API_KEY mehr (Rafael, 08.09.2026): "wenn dann
+    # soll sie nur ueber ihren eigenen schluessel laufen aber nicht ueber den
+    # vision schluessel". Der Rueckfall war genau der Weg, auf dem ein einziger
+    # Recherche-Lauf die Bildanalyse-Kasse leeren konnte, ohne dass es jemand
+    # sah — der Wert stand unter zwei Namen im selben Container. Fehlt der
+    # eigene Schluessel, ist das jetzt ein lauter Konfigurationsfehler und kein
+    # stilles Umbuchen auf die Kunden-Bildanalyse.
+    api_key = api_key or os.environ.get("RESEARCH_CLOUD_API_KEY")
     if not api_key:
         raise ResearchCloudExecutorError(
-            "RESEARCH_CLOUD_API_KEY (or ANTHROPIC_API_KEY) not set — refusing "
-            "to run the research-cloud executor"
+            "RESEARCH_CLOUD_API_KEY not set — refusing to run the "
+            "research-cloud executor. Set RESEARCH_CLOUD_ANTHROPIC_KEY in "
+            "docker/.env (the research lane pays from its OWN key; falling "
+            "back to the image lane's key is no longer allowed)."
         )
     _log_key_lane_once(api_key)
 
