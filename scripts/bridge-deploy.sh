@@ -1037,6 +1037,54 @@ phase_smoke_test() {
 
 # ============================================================================
 # Phase 5b: Distribution Test — validates pool-router spreads load across workers
+# ============================================================================
+# Phase 5c: Zugangs-Kanarienvogel (access_canary.py)
+# ============================================================================
+# Der Smoke prueft die Bridge, nicht das Anmelden — /login steht ausdruecklich
+# auf seiner Ausschlussliste ("would need a throwaway credential"). Damit war
+# nach jedem Deploy ungeprueft, ob ein zahlender Kunde noch in seine App kommt;
+# genau der Fall vom 13.08.2026, bei dem jede Pruefung gruen aussah, weil sie
+# eine Schicht zu frueh lag (Identitaet statt Berechtigung).
+#
+# Der Kanarienvogel meldet, er blockiert NICHT (Rafael, 08.09.2026): rot kann er
+# auch aus Gruenden werden, die mit dem Deploy nichts zu tun haben (abgelaufenes
+# Abo, gedriftetes Passwort). Ein Rollback dafuer waere teurer als der Befund.
+phase_access_canary() {
+    local label="$1"
+
+    step "Phase 5c: Zugangs-Kanarienvogel (${label})"
+
+    if [[ "$DRY_RUN" == "true" ]]; then
+        info "[DRY-RUN] Would run: access_canary.py"
+        return 0
+    fi
+
+    local canary_script
+    canary_script="$(dirname "${BASH_SOURCE[0]}")/access_canary.py"
+    if [[ ! -f "$canary_script" ]]; then
+        warn "access_canary.py nicht gefunden — Zugang bleibt UNGEPRUEFT"
+        return 0
+    fi
+
+    # Passwort kommt aus Infisical dev-server/dev (CANARY_PASSWORD); das Skript
+    # holt es sich selbst, wenn es nicht schon im Env steht.
+    # shellcheck source=/root/.infisical/infisical-api.sh
+    source /root/.infisical/infisical-api.sh 2>/dev/null || true
+
+    local canary_out
+    canary_out=$(python3 "$canary_script" 2>&1) || true
+    while IFS= read -r line; do info "  canary: ${line}"; done <<< "$canary_out"
+
+    if grep -q '^CANARY_FAIL:' <<< "$canary_out"; then
+        warn "ZUGANG ZU: mindestens eine App laesst ihren Nutzer nicht mehr hinein"
+        warn "  $(grep '^CANARY_FAIL:' <<< "$canary_out")"
+        warn "  Kein Rollback — pruefen, ob es der Deploy war (Abo/Passwort sind die anderen Ursachen)."
+    elif ! grep -q '^CANARY_OK:' <<< "$canary_out"; then
+        warn "Kanarienvogel ohne Urteil — Zugang bleibt UNGEPRUEFT"
+    fi
+    return 0
+}
+
 # Runs 8 sequential /v1/chat/completions calls; checks X-Target-Worker header
 # distribution and the /internal/pool-router/state endpoint via docker exec.
 # ============================================================================
@@ -1815,6 +1863,8 @@ deploy_server() {
 
         phase_distribution_test "$host" "${hetzner_url}" "${HETZNER_SVC_nginx}" || \
             warn "Distribution test FAILED — optimization signal only, NOT rolling back (smoke test passed, deployment succeeded)"
+
+        phase_access_canary "hetzner"
     elif [[ "$server_name" == "server2" ]]; then
         phase_smoke_test "server2" "http://${SERVER2_HOST}:8000" "X-Priority: production" || {
             error_ "Smoke test failed for server2 — rolling back"

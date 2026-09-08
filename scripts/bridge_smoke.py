@@ -302,7 +302,7 @@ EXCLUDED = {
     "/issue": "mutating license issuance",
     # --- identity / auth mutations ---
     "/register": "creates a real user",
-    "/login": "auth flow, would need a throwaway credential + creates a session",
+    "/login": "auth flow, creates a session — hier bewusst nicht geprobt. Der\n    #           Zugang wird stattdessen dort geprueft, wo er zaehlt: scripts/\n    #           access_canary.py meldet sich seit 08.09.2026 nach dem Deploy mit\n    #           eigenen Kanarienvogel-Konten in den ECHTEN Apps an und holt eine\n    #           Seite hinter dem Abo-Tor. Ein Bridge-Login mit 200 waere kein\n    #           Nachweis: er ist bei kaputter Berechtigung ebenfalls gruen.",
     "/logout": "session mutation",
     "/forgot-password": "sends a real reset email",
     "/resend-verification": "sends a real email",
