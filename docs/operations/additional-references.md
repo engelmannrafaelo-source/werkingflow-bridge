@@ -2,9 +2,9 @@
 
 Nur bei einem konkreten Auftrag zur Bridge-Implementierung oder zum Betrieb lesen.
 
-Historische Betriebsnotizen aus den Dev-Workspaces liegen auf dem primaeren
-Bridge-Host unter `/root/bridge-operations/reference-archive/dev/`.
-Die Host-Zuordnung anhand der aktuellen Infrastruktur-SSoT beziehungsweise der
+Historische Betriebsnotizen aus den Dev- und Partner-Workspaces liegen auf dem primaeren
+Bridge-Host unter `/root/bridge-operations/reference-archive/<quelle>/`.
+`<quelle>` ist `dev` oder `partner`. Die Host-Zuordnung anhand der aktuellen Infrastruktur-SSoT beziehungsweise der
 Architektur-Entscheidungen pruefen; keine Host-Adresse aus alten Notizen uebernehmen.
 
 `manifest.json` ordnet jede Referenz-ID ihrer urspruenglichen Datei und einem
