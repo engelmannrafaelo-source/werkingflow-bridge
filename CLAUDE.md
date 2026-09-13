@@ -16,7 +16,7 @@ API-Vertrag; die interne Bereitstellung gehoert nicht zum Standardkontext.
 
 ## Arbeit an der Bridge selbst
 
-Nur bei einem konkreten Bridge-Auftrag die [Betriebsreferenz](docs/operations/session-context.md)
+Nur bei einem konkreten Bridge-Auftrag die [Wartungseinstieg](docs/maintenance.md)
 und aufgabenbezogene Architektur-Entscheidungen unter `docs/adr/` nachladen.
 Vor Implementierungs- oder Betriebsarbeiten ist diese Referenz Pflicht;
 sie gehoert nicht zur Pflichtlektuere fuer reine API-Nutzung oder Recherche.
