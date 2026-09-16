@@ -2793,6 +2793,168 @@ async def chat_completions(
                 return response
 
         # =======================================================================
+        # ANTHROPIC-DIRECT ROUTING (primary): prepaid Messages-API key, no CLI
+        # subprocess, no tools. Reached via provider_tier='claude-direct-notools'
+        # — either requested by the client or set by the per-user pin
+        # provider_config.provider='anthropic_direct' (Rafael 2026-09-16: TB
+        # Kainer's users run here while the AWS account is Bedrock-locked).
+        # Before this branch existed the tier was fallback-only: as a PRIMARY
+        # request it fell through to the Claude-CLI pool, i.e. the pin would
+        # have been a silent no-op — measured on the dev bridge 2026-09-16
+        # (x_backend_info.backend='anthropic').
+        # =======================================================================
+        if backend_config and backend_config.backend == BackendType.ANTHROPIC_DIRECT:
+            from src.providers.anthropic_direct import call_anthropic_direct
+            from src.activity.ai_call_writer import persist_ai_call_activity
+            from src.routing.prepaid_cap import prepaid_vision_over_cap
+            direct_tier = backend_config.provider_tier or "claude-direct-notools"
+            if request_body.enable_tools:
+                raise HTTPException(
+                    status_code=400,
+                    detail={
+                        "error": {
+                            "message": (
+                                f"provider_tier='{direct_tier}' has no tool support "
+                                "(direct Anthropic Messages API, no CLI subprocess) — "
+                                "send the request with enable_tools=false."
+                            ),
+                            "type": "invalid_request_error",
+                            "code": "tools_unsupported_on_direct_tier",
+                            "param": "enable_tools",
+                        }
+                    },
+                )
+            # Same prepaid key as the vision lane → same rolling-24h cost ceiling
+            # (fail-open, flag-gated; see src/routing/prepaid_cap.py). The ledger
+            # rows below carry api_key_lane='vision_prepaid' so this call is
+            # counted by that ceiling and findable in the audit.
+            _cap_over, _cap_spent, _cap_max = await prepaid_vision_over_cap()
+            if _cap_over:
+                logger.error(
+                    f"🛑 Prepaid key daily cap reached ({_cap_spent:.2f} of {_cap_max:.2f} EUR) — rejecting direct call (tier={direct_tier})"
+                )
+                return JSONResponse(
+                    status_code=429,
+                    content={
+                        "error": {
+                            "message": (
+                                f"Prepaid Anthropic key daily cap reached "
+                                f"({_cap_spent:.2f} of {_cap_max:.2f} EUR in the last 24h)."
+                            ),
+                            "type": "rate_limit_error",
+                            "code": "prepaid_daily_cap",
+                            "retryable": True,
+                        }
+                    },
+                )
+            logger.info(f"🔀 Routing to direct Anthropic Messages API (tier={direct_tier})")
+            direct_attribution = extract_attribution_context(request)
+
+            async def _persist_direct_usage(
+                *, input_tokens: int, output_tokens: int, status: str,
+                duration_ms: int, error_code: Optional[str] = None,
+                error_message: Optional[str] = None,
+                cache_read_tokens: int = 0, cache_creation_tokens: int = 0,
+            ) -> None:
+                if status != "success":
+                    request.state.ai_call_error_persisted = True
+                await persist_ai_call_activity(
+                    provider=ledger_provider_for_backend(BackendType.ANTHROPIC_DIRECT),
+                    app_id=direct_attribution.get("app_id"),
+                    user_id=direct_attribution.get("user_id"),
+                    agent_id=direct_attribution.get("agent_id"),
+                    workflow_id=direct_attribution.get("workflow_id"),
+                    model=backend_config.provider_model or resolved_model,
+                    input_tokens=input_tokens,
+                    output_tokens=output_tokens,
+                    cache_read_tokens=cache_read_tokens,
+                    cache_creation_tokens=cache_creation_tokens,
+                    status=status,
+                    duration_ms=duration_ms,
+                    error_code=error_code,
+                    error_message=error_message,
+                    app_env=direct_attribution.get("app_env"),
+                    provider_meta={
+                        "api_key_lane": "vision_prepaid",
+                        "provider_tier": direct_tier,
+                        "usage_source": "anthropic_messages_api",
+                        "user_pinned": bool(user_pinned_provider),
+                    },
+                )
+
+            try:
+                response_data = await call_anthropic_direct(request_body, backend_config)
+            except Exception as direct_err:
+                await _persist_direct_usage(
+                    input_tokens=0, output_tokens=0, status="error",
+                    duration_ms=int((time.time() - start_time) * 1000),
+                    error_code=type(direct_err).__name__,
+                    error_message=str(direct_err)[:500],
+                )
+                raise
+            duration = time.time() - start_time
+            usage = response_data.get("usage") or {}
+            logger.info(f"✅ Direct Anthropic request completed in {duration:.2f}s (tier={direct_tier})")
+            await _persist_direct_usage(
+                input_tokens=usage.get("prompt_tokens", 0) or 0,
+                output_tokens=usage.get("completion_tokens", 0) or 0,
+                cache_read_tokens=usage.get("cache_read_input_tokens", 0) or 0,
+                cache_creation_tokens=usage.get("cache_creation_input_tokens", 0) or 0,
+                status="success",
+                duration_ms=int(duration * 1000),
+            )
+            if tenant and usage:
+                from src.tenant import track_request_usage
+                await track_request_usage(
+                    tenant=tenant,
+                    model=backend_config.provider_model or resolved_model,
+                    input_tokens=usage.get("prompt_tokens", 0),
+                    output_tokens=usage.get("completion_tokens", 0),
+                    endpoint="/v1/chat/completions",
+                    latency_ms=int(duration * 1000),
+                    status="success",
+                    **direct_attribution
+                )
+            response_data["x_backend_info"] = get_backend_info_dict(backend_config)
+            if request_body.stream:
+                # The direct path is request/response; expose it as a minimal
+                # SSE stream (one content delta, one finish chunk, [DONE]) so
+                # streaming clients of a pinned user keep working instead of
+                # silently landing on the pool.
+                import json as _json
+                _sid = response_data.get("id")
+                _created = response_data.get("created")
+                _model = response_data.get("model")
+                _content = (response_data.get("choices") or [{}])[0].get("message", {}).get("content", "")
+
+                async def _direct_as_sse():
+                    yield "data: " + _json.dumps({
+                        "id": _sid, "object": "chat.completion.chunk", "created": _created,
+                        "model": _model,
+                        "choices": [{"index": 0, "delta": {"role": "assistant", "content": _content}, "finish_reason": None}],
+                    }) + "\n\n"
+                    yield "data: " + _json.dumps({
+                        "id": _sid, "object": "chat.completion.chunk", "created": _created,
+                        "model": _model,
+                        "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+                        "usage": usage,
+                        "x_backend_info": response_data["x_backend_info"],
+                    }) + "\n\n"
+                    yield "data: [DONE]\n\n"
+
+                return StreamingResponse(
+                    _direct_as_sse(),
+                    media_type="text/event-stream",
+                    headers={
+                        "Cache-Control": "no-cache",
+                        "Connection": "keep-alive",
+                        "X-Backend": "anthropic_direct",
+                        "X-Provider-Tier": direct_tier,
+                    },
+                )
+            return response_data
+
+        # =======================================================================
         # OPENAI-COMPATIBLE ROUTING: Generic httpx call (IONOS, Mistral, etc.)
         # =======================================================================
         if backend_config and backend_config.backend == BackendType.OPENAI_COMPATIBLE:

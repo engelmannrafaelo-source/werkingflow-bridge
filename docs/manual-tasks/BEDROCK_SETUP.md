@@ -32,6 +32,27 @@ implementiert und deployt sich mit dem normalen Bridge-Deploy:
 
 Was NUR Rafael machen kann (AWS-Konsole), steht unten.
 
+### Ausweich-Pin `anthropic_direct` (seit 16.09.2026)
+
+Ist Bedrock nicht erreichbar (z.B. kontoweite AWS-Sperre), lassen sich einzelne
+User statt auf den Bedrock-Pin auf den **aufgeladenen Anthropic-API-Key**
+(`ANTHROPIC_VISION_API_KEY`, Tier `claude-direct-notools`) legen — dann laufen
+sie nicht auf den internen Flatrate-Konten:
+
+```bash
+# setzen / entfernen (Service-Token, Prod-Bridge):
+PATCH /v1/users/<id>  {"provider_config":{"provider":"anthropic_direct"}}
+PATCH /v1/users/<id>  {"provider_config":{}}
+# Beweis: x_backend_info.backend == "anthropic_direct", provider_tier == "claude-direct-notools"
+```
+
+Eigenschaften: gilt nur in prod (staging/local → Pool, wie beim Bedrock-Pin);
+kein Tool-Support (Aufruf mit `enable_tools=true` → 503 Pin-Fehler statt
+stillem Pool-Rueckfall); Streaming wird als Ein-Chunk-SSE geliefert; Ledger-Zeilen
+tragen `api_key_lane='vision_prepaid'`, damit die Prepaid-Tageskappe
+(`PREPAID_VISION_DAILY_CAP_*`) sie mitzaehlt. Keine EU-Datenresidenz.
+
+
 ---
 
 ## 1. AWS Bedrock Model Access aktivieren

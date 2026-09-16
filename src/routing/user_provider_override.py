@@ -13,6 +13,8 @@ Supported shape (all keys optional except ``provider``)::
 
 Semantics:
 
+- ``{"provider": "anthropic_direct"}`` → prepaid Anthropic API key
+  (tier ``claude-direct-notools``), prod only, no tools; see DIRECT_PIN_TIER.
 - ``NULL`` / no ``provider`` key → inherit: the request decides (default
   anthropic), nothing changes.
 - ``provider=bedrock`` → force ``backend=bedrock`` (+ region if set). The
@@ -62,7 +64,12 @@ _CACHE_TTL_SECONDS = 60.0
 # billing-identity string → (expires_at_monotonic, provider_config-or-None)
 _cache: dict[str, tuple[float, Optional[dict]]] = {}
 
-SUPPORTED_PROVIDERS = {"anthropic", "bedrock"}
+#: ``anthropic_direct`` = the prepaid Anthropic Messages-API key
+#: (ANTHROPIC_VISION_API_KEY, provider tier ``claude-direct-notools``), NOT the
+#: subscription pool. Rafael 2026-09-16: while the AWS account is Bedrock-locked,
+#: TB Kainer's users run on this key instead of the internal flat-rate accounts.
+SUPPORTED_PROVIDERS = {"anthropic", "bedrock", "anthropic_direct"}
+DIRECT_PIN_TIER = "claude-direct-notools"
 
 
 class UserProviderOverrideError(RuntimeError):
@@ -477,6 +484,30 @@ def apply_user_provider_override(
         return "bedrock"
 
     # provider == "anthropic": explicit pin to the default backend.
+    if provider == "anthropic_direct":
+        if app_env in NON_PROD_APP_ENVS:
+            logger.warning(
+                "user_provider_override: anthropic_direct-Pin in app_env=%r "
+                "ignoriert — Call laeuft auf den internen Anthropic-Konten. "
+                "Der Pin traegt eine Kostenlinie fuer echte Kundendaten und "
+                "gilt wie der Bedrock-Pin nur in prod.",
+                app_env,
+            )
+            request_body.backend = BackendType.ANTHROPIC
+            request_body.provider_tier = None
+            return "anthropic"
+        if getattr(request_body, "enable_tools", False):
+            # The direct Messages-API path has no CLI subprocess and therefore
+            # no tools. Rerouting a tool call to the pool would silently move
+            # the user off the lane the operator pinned — refuse instead.
+            raise UserProviderOverrideError(
+                "provider_config.provider='anthropic_direct' cannot serve a "
+                "request with enable_tools=true (direct Messages API has no "
+                "tool support). Send the request without tools or remove the pin."
+            )
+        request_body.backend = BackendType.ANTHROPIC
+        request_body.provider_tier = DIRECT_PIN_TIER
+        return "anthropic_direct"
     request_body.backend = BackendType.ANTHROPIC
     request_body.provider_tier = None
     return "anthropic"
