@@ -2806,7 +2806,6 @@ async def chat_completions(
         if backend_config and backend_config.backend == BackendType.ANTHROPIC_DIRECT:
             from src.providers.anthropic_direct import call_anthropic_direct
             from src.activity.ai_call_writer import persist_ai_call_activity
-            from src.routing.prepaid_cap import prepaid_vision_over_cap
             direct_tier = backend_config.provider_tier or "claude-direct-notools"
             if request_body.enable_tools:
                 raise HTTPException(
