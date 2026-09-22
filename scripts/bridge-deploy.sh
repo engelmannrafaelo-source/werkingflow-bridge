@@ -943,6 +943,65 @@ else:
         esac
     done
 
+    # ------------------------------------------------------------------
+    # OA-Literaturschicht — dieselbe Fehlerklasse, zweiter Fall.
+    #
+    # Gemessen 22.09.2026: BRIDGE_SCHOLARLY_PROFILE war nirgends gesetzt. Der
+    # Vorgabewert ist 'light', und light heisst: keine einzige externe Abfrage.
+    # Commit a4db2a7 (03.09.) hatte die Voraussetzung selbst in Versalien in die
+    # Commit-Nachricht geschrieben ("sonst tauscht man einen sichtbaren Ausfall
+    # gegen einen leisen") — gesetzt hat sie niemand. 19 Tage lang lief jede
+    # academic-Recherche ohne Literatur. Laut wurde nur eine einzige Logzeile,
+    # einmal je Prozess (_profile_warned in src/scholarly.py).
+    #
+    # Warum das hier geprueft wird und nicht im Code: der Code KANN es nicht
+    # merken. Aus seiner Sicht ist light ein gueltiger Zustand — auf der
+    # Dev-Bridge ist es sogar der gewollte (Rafael 22.09. 06:04Z, Option a:
+    # nur Produktions-Worker ziehen die echten Kontingente). Erst der Deploy
+    # weiss, WELCHE Umgebung er gerade anfasst. Deshalb steht die Erwartung
+    # hier und nicht dort.
+    local erwarte_voll=0
+    case "$SERVER" in
+        prod-workers|server2) erwarte_voll=1 ;;
+    esac
+
+    local sfailed=0
+    for c in "${containers[@]}"; do
+        out=$(rssh "$host" "docker exec -w /app -e PYTHONPATH=/app '${c}' poetry run python -c \"
+import os
+from src.scholarly import scholarly_profile
+an = os.getenv('BRIDGE_SCHOLARLY_ENABLED', 'false').lower() == 'true'
+print(('AN' if an else 'AUS') + ' ' + scholarly_profile())
+\" 2>&1 | tr -d '\r' | tail -1" || echo "EXEC_FAILED")
+
+        case "$out" in
+            "AN full")
+                info "  ${c}: OA-Literaturschicht LIVE (an, Profil full)" ;;
+            "AUS "*)
+                info "  ${c}: OA-Literaturschicht bewusst aus — Pruefung entfaellt" ;;
+            "AN "*)
+                if (( erwarte_voll )); then
+                    error_ "  ${c}: BRIDGE_SCHOLARLY_ENABLED=true, aber Profil '${out#AN }' — die Schicht feuert NICHT."
+                    error_ "        Genau dieser Zustand lief vom 03.09. bis 22.09.2026 unbemerkt in Produktion."
+                    sfailed=1
+                else
+                    info "  ${c}: an, Profil ${out#AN } — auf dieser Umgebung gewollt (Dev/Staging bleibt light)"
+                fi ;;
+            *)
+                error_ "  ${c}: OA-Selbsttest nicht auswertbar: ${out}"
+                sfailed=1 ;;
+        esac
+    done
+
+    if (( sfailed )); then
+        error_ "OA-Selbsttest fehlgeschlagen — die Recherche liefe ohne Literatur."
+        error_ "  BRIDGE_SCHOLARLY_PROFILE=full gehoert in die Compose-Datei DIESES Hosts."
+        error_ "  Achtung: die vier Worker laufen aus docker-compose-worker-host.yml (ADR-0009),"
+        error_ "  NICHT aus docker-compose-prod.yml — ein Schalter dort bleibt wirkungslos."
+        error_ "  Ein Container-RESTART reicht nicht — die Env wird beim Erzeugen eingefroren."
+        return 1
+    fi
+
     if (( failed )); then
         error_ "Worker-Config-Selbsttest fehlgeschlagen — die Recherche liefe ohne Bibliothek."
         error_ "  Werte kommen aus Infisical (dev-server/dev, RESEARCH_LIBRARY_*), nicht von Hand:"
