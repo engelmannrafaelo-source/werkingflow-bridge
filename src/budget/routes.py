@@ -143,6 +143,34 @@ def _serialize_monthly_budgets(monthly_budgets: Dict[str, MonthlyBudgetEntry]) -
     }
 
 
+def _monatstoepfe_zum_lesen(
+    monthly_budgets: Dict[str, MonthlyBudgetEntry], user_id: str
+) -> Dict[str, MonthlyBudgetEntry]:
+    """Faellige Monatstoepfe fuer die ANZEIGE zuruecksetzen — gleiche Regel wie /check.
+
+    Ohne das zeigten GET /{user_id} und die Admin-Liste bei einem Konto ohne
+    Abbuchung seit dem Anker den alten Verbrauch mit einem resetAt in der
+    Vergangenheit, obwohl das naechste /check denselben Topf als leer behandelt.
+    Nur im Speicher: Lesen schreibt nicht, der neue Anker wird im
+    Abbuchungspfad persistiert. Nur Nicht-Trials (reset_at = Ablauf bei Trials).
+    Ist der Plan nicht aufloesbar, ist nicht entscheidbar, ob reset_at Anker
+    oder Ablauf ist: dann roh zeigen und laut loggen, nicht raten.
+    """
+    out: Dict[str, MonthlyBudgetEntry] = {}
+    for plan_id, entry in monthly_budgets.items():
+        try:
+            trial = get_plan(plan_id).trial
+        except (ValueError, RuntimeError) as exc:
+            logger.warning(
+                "[BudgetRead] Monatstopf nicht gerollt, Plan nicht aufloesbar "
+                "user=%s plan=%s: %s", user_id, plan_id, exc,
+            )
+            out[plan_id] = entry
+            continue
+        out[plan_id] = entry if trial else rollover_monthly_if_due(entry)[0]
+    return out
+
+
 def _serialize_topup_lots(lots: List[TopUpLot]) -> List[dict]:
     """Wire shape for the TS TopUpLotSchema (camelCase). purchased_at/expires_at
     are already ISO strings (see _load_topup_lots). The client derives the visible
@@ -677,20 +705,20 @@ async def list_budgets(
         raw = row["monthly_budgets"]
         if isinstance(raw, str):
             raw = json.loads(raw)
-        raw_monthly = raw or {}
+        toepfe = _monatstoepfe_zum_lesen(
+            _build_monthly_budgets(raw or {}), str(row["user_id"])
+        )
 
         used_eur = 0.0
         limit_eur = 0.0
         monthly: Dict[str, Any] = {}
-        for plan_id, entry in raw_monthly.items():
-            e_used = float(entry["usedEur"])
-            e_limit = float(entry["limitEur"])
-            used_eur += e_used
-            limit_eur += e_limit
+        for plan_id, entry in toepfe.items():
+            used_eur += entry.used_eur
+            limit_eur += entry.limit_eur
             monthly[plan_id] = {
-                "limitEur": e_limit,
-                "usedEur": e_used,
-                "resetAt": entry["resetAt"],
+                "limitEur": entry.limit_eur,
+                "usedEur": entry.used_eur,
+                "resetAt": entry.reset_at,
             }
 
         topup = float(row["topup_balance"]) if row["topup_balance"] is not None else 0.0
@@ -755,7 +783,9 @@ async def get_budget(
 
     return {
         "userId": budget.user_id,
-        "monthlyBudgets": _serialize_monthly_budgets(budget.monthly_budgets),
+        "monthlyBudgets": _serialize_monthly_budgets(
+            _monatstoepfe_zum_lesen(budget.monthly_budgets, budget.user_id)
+        ),
         # projectBudgets kommt vom separaten project-budgets-Endpoint; hier leer,
         # aber vom TS UserBudgetSchema als Feld verlangt (z.record akzeptiert {}).
         "projectBudgets": {},
