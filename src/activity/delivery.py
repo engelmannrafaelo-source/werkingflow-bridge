@@ -43,6 +43,16 @@ from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 logger = logging.getLogger(__name__)
 
+# What the ledger priced this request's calls at (sum over call_uids, EUR, 6
+# decimals). Set on the response start of every request that booked at least
+# one call BEFORE the response began — non-streaming requests, which is every
+# job self-call (src/jobs/executors.py forces stream=False). A streaming
+# response starts before its call is booked and therefore carries no header:
+# absent means "not known here", never "free".
+COST_HEADER = "x-bridge-cost-eur"
+COST_CALLS_HEADER = "x-bridge-cost-calls"
+PRICING_VERSION_HEADER = "x-bridge-pricing-version"
+
 # usage_events.status vocabulary (docker/migrations/060). Distinct from
 # 'error' on purpose: an 'error' call cost nothing (the model never produced
 # anything), an 'undelivered' call cost the full amount and produced an answer
@@ -70,7 +80,7 @@ class DeliveryProbe:
 
     __slots__ = (
         "_receive", "_gone", "_booked_call_uids", "_send_failure",
-        "_response_completed",
+        "_response_completed", "_costs", "_pricing_version",
     )
 
     def __init__(self, receive: Receive) -> None:
@@ -79,6 +89,8 @@ class DeliveryProbe:
         self._booked_call_uids: list = []
         self._send_failure: Optional[str] = None
         self._response_completed = False
+        self._costs: dict = {}
+        self._pricing_version: Optional[str] = None
 
     def mark_response_completed(self) -> None:
         self._response_completed = True
@@ -120,6 +132,31 @@ class DeliveryProbe:
         """Remember which ledger rows this request booked, so a send failure
         after the fact can name them instead of reporting an anonymous loss."""
         self._booked_call_uids.append(call_uid)
+
+    def note_cost(self, call_uid: str, cost_eur: float, pricing_version: str) -> None:
+        """Remember what the ledger priced each call of this request at. Keyed
+        by call_uid, so a replayed booking inside the same request is counted
+        once."""
+        self._costs[call_uid] = float(cost_eur)
+        self._pricing_version = pricing_version
+
+    @property
+    def booked_cost_eur(self) -> Optional[float]:
+        """Sum of the ledger prices of this request's calls, or None when the
+        request booked no call at all (then nothing is known — not "free")."""
+        if not self._costs:
+            return None
+        return round(sum(self._costs.values()), 6)
+
+    def cost_headers(self) -> list:
+        cost = self.booked_cost_eur
+        if cost is None:
+            return []
+        return [
+            (COST_HEADER.encode(), f"{cost:.6f}".encode()),
+            (COST_CALLS_HEADER.encode(), str(len(self._costs)).encode()),
+            (PRICING_VERSION_HEADER.encode(), str(self._pricing_version or "").encode()),
+        ]
 
     def mark_send_failure(self, reason: str) -> None:
         self._send_failure = reason
@@ -188,6 +225,10 @@ class DeliveryProbeMiddleware:
         _probe.set(probe)
 
         async def watched_send(message: Message) -> None:
+            if message["type"] == "http.response.start":
+                extra = probe.cost_headers()
+                if extra:
+                    message = {**message, "headers": [*message.get("headers", []), *extra]}
             try:
                 await send(message)
             except Exception as e:  # noqa: BLE001 — re-raised below, just observed

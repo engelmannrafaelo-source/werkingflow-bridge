@@ -46,6 +46,7 @@ from typing import Optional
 
 from src.activity import ledger_client, ledger_spool
 from src.activity.ledger_spool import (
+    OUTCOME_DEDUCTION_OWED,
     OUTCOME_DUPLICATE,
     OUTCOME_FAILED,
     OUTCOME_SKIPPED,
@@ -122,9 +123,22 @@ async def _deduct_call_cost(
     workflow_id: Optional[str] = None,
     tenant_id: Optional[str] = None,
     call_ts: Optional[float] = None,
-) -> None:
+    call_uid: Optional[str] = None,
+) -> bool:
     """
-    Post-call budget deduction — best-effort, never raises.
+    Post-call budget deduction — never raises.
+
+    Returns True when the deduction is settled (applied, refused, or correctly
+    skipped) and False when it is still OWED: platform-api could not answer
+    even after the keyed retries. The caller keeps the spooled call open in
+    that case, so the flusher replays it — the ledger write comes back as
+    duplicate and the deduction is sent again under the same key.
+
+    call_uid (migration 061): the call's own id, also usage_events.idempotency_key.
+    It travels as the deduction's idempotency key, which is what makes a second
+    attempt — a retried request, a spool replay — land at most once. Before the
+    key existed the rule below had to be "exactly one unretried attempt", and
+    every lost answer lost the deduction silently.
 
     Runs ONLY after the ledger row was created in this attempt (ADR-0009
     Schritt 1). The ledger row is the authoritative usage record; this
@@ -133,8 +147,8 @@ async def _deduct_call_cost(
     degrades to "no deduction" (the prior behaviour) — it can never break the
     user-facing call.
 
-    Why it is bound to the row rather than running alongside it: this function
-    is NOT idempotent. `apply_budget_deduction` is a read-modify-write on
+    Historical (before migration 061) — why it was bound to the row rather than
+    running alongside it: this function was NOT idempotent. `apply_budget_deduction` is a read-modify-write on
     user_budgets plus a FIFO draw through the TopUp lots, with no dedup key,
     and project_budgets_service.deduct is the same shape. Tied to "the INSERT
     created the row", a replay can never charge twice — the second attempt
@@ -171,7 +185,7 @@ async def _deduct_call_cost(
                 "post-call deduction: user=%r is not a UUID (app=%s) — "
                 "call NOT metered against any budget", user_id, app_id,
             )
-            return
+            return True
 
         # Resolved per call, from the entitlement that paid — the deduction has
         # to land in the same pot the gate checked, or the gate guards a tally
@@ -182,7 +196,7 @@ async def _deduct_call_cost(
                 "post-call deduction: app=%s not in the plan catalog — "
                 "not budget-tracked, no deduction for this call", app_id,
             )
-            return  # app not in the plan catalog — not budget-tracked
+            return True  # app not in the plan catalog — not budget-tracked
 
         if plan.interval == "project":
             # Project plans are fully per-project; they never fall through to the
@@ -193,7 +207,7 @@ async def _deduct_call_cost(
                     "for user=%s — cannot attribute to a project budget, skipping",
                     plan.id, user_id,
                 )
-                return
+                return True
             from src.billing.project_budgets_service import (
                 deduct_via_platform as _deduct_project,
             )
@@ -205,6 +219,7 @@ async def _deduct_call_cost(
                 cost_eur_amount,
                 allocate_limit_eur=float(plan.api_budget_eur),
                 tenant_id=tenant_id,
+                idempotency_key=call_uid,
             )
             if not result.get("exists"):
                 logger.warning(
@@ -213,7 +228,7 @@ async def _deduct_call_cost(
                     "NOT metered against any budget",
                     workflow_id, plan.id, user_id, tenant_id,
                 )
-            return
+            return True
 
         # A deduction that arrives late (spool replay after an outage) draws
         # from the pot that is current NOW, not the one that was current when
@@ -239,7 +254,9 @@ async def _deduct_call_cost(
                 )
 
         try:
-            await apply_budget_deduction_via_platform(uid, plan.id, cost_eur_amount)
+            await apply_budget_deduction_via_platform(
+                uid, plan.id, cost_eur_amount, idempotency_key=call_uid,
+            )
         except BudgetDeductionDenied as denied:
             # The call already happened (the gate ran pre-call). A denial
             # here only means the running tally could not fully absorb the
@@ -248,6 +265,7 @@ async def _deduct_call_cost(
                 "post-call deduction denied (%s) user=%s app=%s",
                 denied.reason, user_id, app_id,
             )
+        return True
     except _PLAN_RESOLUTION_ERRORS:
         # The call already happened, so this cannot fail closed — but an
         # incoherent catalog/allocation is a defect, not a transient miss, and
@@ -258,8 +276,23 @@ async def _deduct_call_cost(
             "project=%s — this call is NOT metered against any budget",
             app_id, user_id, workflow_id,
         )
+        return True
     except Exception as e:  # noqa: BLE001 — deduction must never break the call
+        from src.platform_client import PlatformUnavailable
+
+        if isinstance(e, PlatformUnavailable) and call_uid:
+            # Keyed, so a later attempt cannot charge twice: keep it OWED
+            # instead of dropping it (the pre-061 fate of every such call).
+            logger.warning(
+                "post-call deduction OWED (app=%s user=%s %.6f EUR, call %s): "
+                "platform-api did not answer after the keyed retries — the "
+                "spool replays the call and the deduction goes out again under "
+                "the same key: %s",
+                app_id, user_id, cost_eur_amount, call_uid, e,
+            )
+            return False
         logger.warning("post-call budget deduction failed (non-blocking): %s", e)
+        return True
 
 
 async def persist_ai_call_activity(
@@ -445,6 +478,12 @@ async def persist_ai_call_activity(
         )
         if status in COST_BEARING_STATUSES else 0.0
     )
+    if _probe is not None:
+        # The ledger's own price for this call, handed to the response (header
+        # X-Bridge-Cost-Eur, see DeliveryProbeMiddleware). A job reads it from
+        # there — re-pricing from the OpenAI `usage` block would be wrong:
+        # its prompt_tokens include cache traffic that is priced separately.
+        _probe.note_cost(call_uid, call_cost_eur, PRICING_VERSION)
 
     # Resolved from the user row inside the DB block below; initialised here so
     # the post-call deduction (which runs after that block, even if it failed)
@@ -774,8 +813,8 @@ async def persist_ai_call_activity(
             # logged so a drained backlog is legible afterwards.
             logger.info(
                 "persist_ai_call_activity: usage_events row for call %s was "
-                "already present — replay settled, no second row, no second "
-                "deduction", call_uid,
+                "already present — replay settled, no second row; the "
+                "deduction is re-sent under the call's key (at most once)", call_uid,
             )
     except Exception as e:  # noqa: BLE001 — tracking must never break the call
         # ERROR, not WARNING: reaching here means NO usage_events row for a call
@@ -813,7 +852,12 @@ async def persist_ai_call_activity(
     # billing_account set → an app-tier policy books this call to an internal
     # account; the customer's (project) budget must NOT be deducted. The usage
     # row already carries the billing_account marker + full attribution.
-    if not ledger_written:
+    # Since migration 061 the deduction carries the call's key, so it also runs
+    # when a replay finds the row already there (duplicate): that is exactly the
+    # case whose inline answer was lost — the row landed, the deduction never
+    # went out. Under the key a second deduction for the same call is a no-op.
+    ledger_present = outcome in (OUTCOME_WRITTEN, OUTCOME_DUPLICATE)
+    if not ledger_present:
         if outcome == OUTCOME_FAILED and call_cost_eur > 0:
             logger.warning(
                 "post-call deduction DEFERRED (app=%s user=%s %.6f EUR): the "
@@ -829,8 +873,19 @@ async def persist_ai_call_activity(
             billing_account, app_id, agent_id, call_cost_eur,
         )
     elif user_id and app_id and call_cost_eur > 0 and user_id != ANONYMOUS_USER_ID:
-        await _deduct_call_cost(
+        settled = await _deduct_call_cost(
             user_id, app_id, call_cost_eur, workflow_id, tenant_id, call_ts,
+            call_uid=call_uid,
         )
+        if not settled:
+            if spooled or replaying:
+                outcome = OUTCOME_DEDUCTION_OWED
+            else:
+                logger.error(
+                    "post-call deduction LOST (app=%s user=%s %.6f EUR, call %s): "
+                    "platform-api did not answer and this call is not in the "
+                    "write-ahead spool (spool off or unwritable) — nobody will "
+                    "send it again", app_id, user_id, call_cost_eur, call_uid,
+                )
 
     return _settle(outcome)

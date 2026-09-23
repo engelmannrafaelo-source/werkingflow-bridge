@@ -269,6 +269,7 @@ async def test_deduct_no_budget_row_is_noop():
     assert r == {
         "exists": False, "deductedEur": 0.0, "fromProjectEur": 0.0,
         "fromTopUpEur": 0.0, "usedEur": 0.0, "remainingEur": 0.0,
+        "duplicate": False,  # Migration 061: jede Antwort sagt, ob sie eine Wiederholung war
     }
 
 
@@ -326,6 +327,7 @@ async def test_deduct_no_lazy_alloc_without_tenant():
     assert r == {
         "exists": False, "deductedEur": 0.0, "fromProjectEur": 0.0,
         "fromTopUpEur": 0.0, "usedEur": 0.0, "remainingEur": 0.0,
+        "duplicate": False,  # Migration 061: jede Antwort sagt, ob sie eine Wiederholung war
     }
 
 

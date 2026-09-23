@@ -549,6 +549,9 @@ class ProjectBudgetDeductRequest(BaseModel):
     cost_eur: float
     allocate_limit_eur: Optional[float] = None
     tenant_id: Optional[str] = None
+    # Migration 061: one key per AI call (the worker's call_uid). Same key twice
+    # → drawn once. Optional; keyless keeps the old non-idempotent contract.
+    idempotency_key: Optional[str] = Field(default=None, min_length=8, max_length=200)
 
 
 @router.post("/project-budgets/deduct")
@@ -560,7 +563,10 @@ async def post_project_budget_deduct(
     counterpart of the pre-existing POST /v1/budget/deduct, which covers only
     monthly plans (`_require_month_interval`).
 
-    NOT IDEMPOTENT, like its monthly sibling: a read-modify-write on
+    With idempotency_key it is idempotent per key (migration 061,
+    src.budget.deduction_keys). Keyless it keeps the old contract below.
+
+    Keyless: NOT IDEMPOTENT, like its monthly sibling: a read-modify-write on
     project_budgets plus a FIFO draw through the TopUp lots, with no dedup key.
     The caller must never retry it and never replay it — the deduction is bound
     to "the ledger INSERT created the row in THIS attempt", which happens at
@@ -575,14 +581,20 @@ async def post_project_budget_deduct(
     except (ValueError, AttributeError, TypeError):
         raise HTTPException(status_code=400, detail=f"Invalid user id: {body.user_id!r}")
 
-    return await deduct(
-        uid,
-        body.plan_id,
-        body.project_id,
-        body.cost_eur,
-        allocate_limit_eur=body.allocate_limit_eur,
-        tenant_id=body.tenant_id,
-    )
+    from src.budget.deduction_keys import DeductionKeyConflict
+
+    try:
+        return await deduct(
+            uid,
+            body.plan_id,
+            body.project_id,
+            body.cost_eur,
+            allocate_limit_eur=body.allocate_limit_eur,
+            tenant_id=body.tenant_id,
+            idempotency_key=body.idempotency_key,
+        )
+    except DeductionKeyConflict as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
 
 # ── 2c/C5: app-tier policy (who pays for this call-site) ─────────────────

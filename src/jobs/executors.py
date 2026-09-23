@@ -194,7 +194,46 @@ async def chat_executor(
             retry_after_s=_retry_after_s(response),
         )
 
-    return response.json()
+    return attach_ledger_cost(response.json(), response.headers)
+
+
+def attach_ledger_cost(result: Any, headers: Any) -> Any:
+    """Put the ledger's price of this job's call(s) into ``result.usage``.
+
+    The job result used to carry tokens only, so no caller could say what an
+    order cost (Befund 23.09.2026, werking-report). The number comes from the
+    ledger (X-Bridge-Cost-Eur, set by DeliveryProbeMiddleware from the same
+    call_cost_eur that is booked and deducted) — NOT re-priced from ``usage``:
+    OpenAI-style prompt_tokens include cache traffic that the ledger prices at
+    its own rates, so a second calculation here would be a second, wrong truth.
+
+    Header absent → ``cost_eur: None`` with ``cost_source: "unbekannt"``.
+    Explicitly unknown, never 0.0: "no price reached us" is not "free".
+    """
+    if not isinstance(result, dict):
+        return result
+    usage = result.get("usage")
+    if not isinstance(usage, dict):
+        usage = {}
+        result["usage"] = usage
+    raw = headers.get("x-bridge-cost-eur") if headers is not None else None
+    if raw is None:
+        usage["cost_eur"] = None
+        usage["cost_source"] = "unbekannt"
+        return result
+    try:
+        usage["cost_eur"] = float(raw)
+    except (TypeError, ValueError):
+        # Never fail the job over this: the call is paid and its result is
+        # here. Say "unknown" out loud instead.
+        logger.error("job result: X-Bridge-Cost-Eur is not a number (%r) — cost_eur left unknown", raw)
+        usage["cost_eur"] = None
+        usage["cost_source"] = "unbekannt"
+        return result
+    usage["cost_source"] = "ledger"
+    usage["cost_calls"] = int(headers.get("x-bridge-cost-calls") or 0)
+    usage["pricing_version"] = headers.get("x-bridge-pricing-version") or None
+    return result
 
 
 async def _self_post_json(

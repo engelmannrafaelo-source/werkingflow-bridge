@@ -82,6 +82,10 @@ OUTCOME_WRITTEN = "written"      # the INSERT created the row in this attempt
 OUTCOME_DUPLICATE = "duplicate"  # the row was already there (a replay caught up)
 OUTCOME_SKIPPED = "skipped"      # correctly no row (no user / no tenant / not a user)
 OUTCOME_FAILED = "failed"        # transient — the row is still owed
+# The row is there, but its budget deduction could not be delivered (platform-api
+# unreachable after the keyed retries). NOT definitive: the replay re-sends the
+# deduction under the call's idempotency key (migration 061), so it lands once.
+OUTCOME_DEDUCTION_OWED = "deduction_owed"
 
 _DEFINITIVE = (OUTCOME_WRITTEN, OUTCOME_DUPLICATE, OUTCOME_SKIPPED)
 

@@ -326,6 +326,7 @@ async def deduct(
     *,
     allocate_limit_eur: Optional[float] = None,
     tenant_id: Optional[str] = None,
+    idempotency_key: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Atomically draw `cost_eur` from a project's budget, falling back to the
     user's TopUp lots for any shortfall (see module docstring — TopUp is the
@@ -347,7 +348,13 @@ async def deduct(
     self-provisions on its first LLM call — keyed by project_id (== attribution
     workflow_id) — since the slot that entitles the project was already consumed
     by the app.
+
+    idempotency_key (migration 061): claimed in the same transaction before the
+    project row is touched; a key that already deducted returns the stored
+    answer with duplicate=True and draws nothing. See src.budget.deduction_keys.
     """
+    from src.budget import deduction_keys as _dedup
+
     amount = _eur(cost_eur)
     if amount <= 0:
         # Nothing to do; still report current state for observability.
@@ -356,12 +363,27 @@ async def deduct(
             return {
                 "exists": False, "deductedEur": 0.0, "fromProjectEur": 0.0,
                 "fromTopUpEur": 0.0, "usedEur": 0.0, "remainingEur": 0.0,
+                "duplicate": False,
             }
-        return {"exists": True, "deductedEur": 0.0, "fromProjectEur": 0.0, "fromTopUpEur": 0.0, **existing}
+        return {"exists": True, "deductedEur": 0.0, "fromProjectEur": 0.0, "fromTopUpEur": 0.0,
+                **existing, "duplicate": False}
 
     pool = get_pool()
     async with pool.acquire() as conn:
         async with conn.transaction():
+            if idempotency_key is not None:
+                stored = await _dedup.claim(
+                    conn, idempotency_key, scope="project", user_id=user_id,
+                    plan_id=plan_id, project_id=project_id, amount_eur=float(amount),
+                )
+                if stored is not None:
+                    logger.info(
+                        "project_budgets_service.deduct: key=%s already applied — "
+                        "no second deduction (user=%s plan=%s project=%s %.6f EUR)",
+                        idempotency_key, user_id, plan_id, project_id, float(amount),
+                    )
+                    return stored
+
             row = await conn.fetchrow(
                 """
                 SELECT limit_eur, used_eur
@@ -402,10 +424,13 @@ async def deduct(
                     project_id,
                 )
             if row is None:
-                return {
+                nothing = {
                     "exists": False, "deductedEur": 0.0, "fromProjectEur": 0.0,
                     "fromTopUpEur": 0.0, "usedEur": 0.0, "remainingEur": 0.0,
                 }
+                if idempotency_key is not None:
+                    await _dedup.record(conn, idempotency_key, nothing)
+                return {**nothing, "duplicate": False}
 
             limit = Decimal(row["limit_eur"])
             used = Decimal(row["used_eur"])
@@ -438,6 +463,17 @@ async def deduct(
                 from_top_up = _eur(consumed)
                 await persist_topup_lots(conn, old_lots, new_lots)
 
+            answer = {
+                "exists": True,
+                "deductedEur": float(from_project + from_top_up),
+                "fromProjectEur": float(from_project),
+                "fromTopUpEur": float(from_top_up),
+                "usedEur": float(new_used),
+                "remainingEur": float(max(Decimal("0"), limit - new_used)),
+            }
+            if idempotency_key is not None:
+                await _dedup.record(conn, idempotency_key, answer)
+
     total_deducted = from_project + from_top_up
     if total_deducted < amount:
         logger.warning(
@@ -448,14 +484,7 @@ async def deduct(
             float(from_project), float(from_top_up),
         )
 
-    return {
-        "exists": True,
-        "deductedEur": float(total_deducted),
-        "fromProjectEur": float(from_project),
-        "fromTopUpEur": float(from_top_up),
-        "usedEur": float(new_used),
-        "remainingEur": float(max(Decimal("0"), limit - new_used)),
-    }
+    return {**answer, "duplicate": False}
 
 
 async def reset_budget(
@@ -632,6 +661,7 @@ async def deduct_via_platform(
     *,
     allocate_limit_eur: Optional[float] = None,
     tenant_id: Optional[str] = None,
+    idempotency_key: Optional[str] = None,
 ) -> Dict[str, Any]:
     """platform-api path for deduct() (ADR-0009 Schritt 2c) — the project half of
     the post-call deduction, mirroring what POST /v1/budget/deduct already does
@@ -649,8 +679,14 @@ async def deduct_via_platform(
     unapplied: the post-call tally is best-effort by construction (the
     usage_events row is the authoritative record), so the caller logs the gap
     rather than risking a double charge.
+
+    That was the keyless contract. With idempotency_key (migration 061, the
+    worker passes the call's call_uid) a transport failure is retried: the key
+    turns a replay after a lost answer into duplicate=True instead of a second
+    charge.
     """
     from src.platform_client import call_platform
+    from src.budget.deduction_keys import DEDUCT_RETRIES_WITH_KEY
 
     resp = await call_platform(
         "POST", "/v1/internal/project-budgets/deduct",
@@ -661,8 +697,10 @@ async def deduct_via_platform(
             "cost_eur": cost_eur,
             "allocate_limit_eur": allocate_limit_eur,
             "tenant_id": tenant_id,
+            **({"idempotency_key": idempotency_key} if idempotency_key else {}),
         },
-        retries=0,  # not idempotent — see above
+        # Keyed: safe to retry a lost answer (see above). Keyless: never.
+        retries=DEDUCT_RETRIES_WITH_KEY if idempotency_key else 0,
         domain="user",  # ADR-0011: the project budget lives on the user's HOME bridge
     )
 

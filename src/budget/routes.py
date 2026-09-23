@@ -27,7 +27,7 @@ import json
 import logging
 import uuid
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
@@ -51,6 +51,7 @@ from src.budget.calculator import (
     next_topup_expiry,
 )
 from src.budget.plans import PlanConfig, get_plan, find_trial_plan_for
+from src.budget import deduction_keys as _dedup
 from src.budget.topup_store import (
     LegacyTopUpBalanceError,
     plus_12_months as _plus_12_months,
@@ -332,6 +333,13 @@ class DeductRequest(BaseModel):
     # *inflate* the user's remaining budget. The Pydantic Field(gt=0) is the
     # primary guard; deduct_budget's internal arithmetic also assumes positive.
     actualCostEur: float = Field(gt=0)
+    # One key per AI call (the worker sends the call's call_uid, which is also
+    # usage_events.idempotency_key). Same key twice → deducted once, the second
+    # answer is the first one with duplicate=true. Optional for the existing
+    # callers; without it the endpoint keeps its old, non-idempotent contract.
+    idempotencyKey: Optional[str] = Field(
+        default=None, min_length=_dedup.MIN_KEY_LENGTH, max_length=_dedup.MAX_KEY_LENGTH,
+    )
 
 
 def _parse_raw_monthly(budget_row: Any) -> dict:
@@ -365,9 +373,15 @@ async def apply_budget_deduction(
     user_id: uuid.UUID,
     plan_id: str,
     actual_cost_eur: float,
+    idempotency_key: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Atomically deduct actual_cost_eur from the user's MONTHLY budget + TopUp lots.
+
+    idempotency_key (migration 061): claimed in the same transaction before any
+    budget row is touched. A key that already deducted returns the stored
+    answer with duplicate=True and deducts nothing. A refused deduction rolls
+    the claim back with everything else, so the key stays free.
 
     Monthly-interval plans only — project plans are per-project (routed by the
     caller to project_budgets_service). Raises ValueError on unknown/non-monthly
@@ -383,6 +397,19 @@ async def apply_budget_deduction(
 
     async with pool.acquire() as conn:
         async with conn.transaction():
+            if idempotency_key is not None:
+                stored = await _dedup.claim(
+                    conn, idempotency_key, scope="month", user_id=user_id,
+                    plan_id=plan_id, amount_eur=actual_cost_eur,
+                )
+                if stored is not None:
+                    logger.info(
+                        "[BudgetDeduct] key=%s already applied — no second deduction "
+                        "(user=%s plan=%s %.6f EUR)",
+                        idempotency_key, user_id, plan_id, actual_cost_eur,
+                    )
+                    return stored
+
             # Lock monthly + lot rows for the duration of the transaction.
             budget_row = await conn.fetchrow(
                 "SELECT monthly_budgets FROM user_budgets WHERE user_id = $1 FOR UPDATE",
@@ -469,19 +496,24 @@ async def apply_budget_deduction(
             # Persist FIFO-reduced TopUp lots (only the changed ones).
             await _persist_topup_lots(conn, old_lots, result.new_top_up_lots)
 
-    return {
-        "fromMonthly": result.from_monthly,
-        "fromTopUp": result.from_top_up,
-        "newMonthlyUsed": result.new_monthly_used,
-        "newTopUpBalance": result.new_top_up_balance_eur,
-        "effectivePlanId": effective_plan_id,
-    }
+            answer = {
+                "fromMonthly": result.from_monthly,
+                "fromTopUp": result.from_top_up,
+                "newMonthlyUsed": result.new_monthly_used,
+                "newTopUpBalance": result.new_top_up_balance_eur,
+                "effectivePlanId": effective_plan_id,
+            }
+            if idempotency_key is not None:
+                await _dedup.record(conn, idempotency_key, answer)
+
+    return {**answer, "duplicate": False}
 
 
 async def apply_budget_deduction_via_platform(
     user_id: uuid.UUID,
     plan_id: str,
     actual_cost_eur: float,
+    idempotency_key: Optional[str] = None,
 ) -> Dict[str, Any]:
     """The worker's way to apply_budget_deduction, over POST /v1/budget/deduct
     (ADR-0009 Schritt 2c).
@@ -494,7 +526,12 @@ async def apply_budget_deduction_via_platform(
     than inventing one. It covers ONLY monthly plans (`_require_month_interval`);
     the project half needed a new leaf — project_budgets_service.deduct_via_platform.
 
-    NO retry and NO direct-DB fallback, and here the two are the same rule.
+    With idempotency_key (migration 061, the worker passes the call's call_uid)
+    a transport failure IS retried: the key makes a second attempt after a lost
+    answer come back as duplicate instead of charging twice. The rest of this
+    paragraph describes the keyless call, which keeps its old contract.
+
+    Keyless: NO retry and NO direct-DB fallback, and here the two are the same rule.
     apply_budget_deduction is a read-modify-write on user_budgets plus a FIFO
     draw through the TopUp lots, with no dedup key: a second attempt after a
     lost ANSWER is indistinguishable from a first attempt and would charge the
@@ -515,8 +552,10 @@ async def apply_budget_deduction_via_platform(
             "userId": str(user_id),
             "planId": plan_id,
             "actualCostEur": actual_cost_eur,
+            **({"idempotencyKey": idempotency_key} if idempotency_key else {}),
         },
-        retries=0,  # not idempotent — see above
+        # Keyed: safe to retry a lost answer (see above). Keyless: never.
+        retries=_dedup.DEDUCT_RETRIES_WITH_KEY if idempotency_key else 0,
         domain="user",  # ADR-0011: the deduction belongs to the user's HOME budget
     )
 
@@ -545,7 +584,9 @@ async def budget_deduct(
 ) -> Dict[str, Any]:
     user_id = _parse_user_id(body.userId)
     try:
-        return await apply_budget_deduction(user_id, body.planId, body.actualCostEur)
+        return await apply_budget_deduction(
+            user_id, body.planId, body.actualCostEur, body.idempotencyKey,
+        )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except BudgetDeductionDenied as e:

@@ -236,15 +236,18 @@ async def test_deduction_follows_the_row_when_it_lands(spool_dir, seam):
 
 
 @pytest.mark.asyncio
-async def test_replay_of_an_existing_row_never_deducts_twice(spool_dir, seam):
-    """Die harte Randbedingung des ganzen Entwurfs: apply_budget_deduction ist
-    ein read-modify-write ohne Dedup-Schluessel. Wuerde ein Nachlauf ihn
-    wiederholen, waere jeder Wiederholungsversuch eine zweite Belastung.
+async def test_replay_of_an_existing_row_sends_the_deduction_under_the_calls_key(spool_dir, seam):
+    """Bis Migration 061 galt hier "nach 'duplicate' nie abbuchen", weil der
+    Abzug keinen Dedup-Schluessel hatte. Genau das verlor Geld still: ging die
+    Antwort auf den Ledger-Schreibaufruf verloren, schrieb der Spool die Zeile
+    spaeter als 'duplicate' nach — und der Abzug ging nie raus.
 
-    Ueber HTTP ist die Bindung dieselbe wie vorher ueber die DB: 'written' gibt
-    es pro idempotency_key hoechstens einmal."""
+    Jetzt traegt der Abzug die call_uid als Schluessel; ein zweiter Abzug fuer
+    denselben Call ist auf der Plattform ein No-op (tests/budget/
+    test_abbuchung_idempotent.py). Also wird nach 'duplicate' abgebucht — mit
+    genau diesem Schluessel."""
     seam.outcome = "duplicate"
-    with patch.object(writer, "_deduct_call_cost", new=AsyncMock()) as deduct:
+    with patch.object(writer, "_deduct_call_cost", new=AsyncMock(return_value=True)) as deduct:
         outcome = await writer.persist_ai_call_activity(
             provider=PROVIDER_ANTHROPIC, app_id="werking-report", user_id=USER_ID,
             agent_id=None, workflow_id=None, model="claude-sonnet-5",
@@ -254,7 +257,88 @@ async def test_replay_of_an_existing_row_never_deducts_twice(spool_dir, seam):
         )
 
     assert outcome == spool.OUTCOME_DUPLICATE
-    deduct.assert_not_called()
+    assert deduct.await_count == 1
+    assert deduct.await_args.kwargs["call_uid"] == "schon-gebucht"
+
+
+@pytest.mark.asyncio
+async def test_deduction_goes_out_with_the_call_uid_as_key(spool_dir, seam):
+    """Der echte _deduct_call_cost bis an die Plattform-Naht: die call_uid des
+    Aufrufs (== usage_events.idempotency_key) ist der Schluessel des Abzugs."""
+    from src.budget.plans import PlanConfig
+
+    plan = PlanConfig(id="report-standard", app_id="werking-report", name="S", price=0,
+                      interval="month", api_budget_eur=100, description="", trial=False)
+    with (
+        patch("src.budget.plan_resolution.resolve_billing_plan", new=AsyncMock(return_value=plan)),
+        patch("src.budget.routes.apply_budget_deduction_via_platform", new=AsyncMock()) as via,
+    ):
+        outcome = await writer.persist_ai_call_activity(
+            provider=PROVIDER_ANTHROPIC, app_id="werking-report", user_id=USER_ID,
+            agent_id=None, workflow_id=None, model="claude-sonnet-5",
+            input_tokens=1000, output_tokens=500, status="success",
+            duration_ms=800, app_env="prod",
+        )
+
+    assert outcome == spool.OUTCOME_WRITTEN
+    assert via.await_count == 1
+    key = via.await_args.kwargs["idempotency_key"]
+    assert key and key == seam.ledger_calls[-1]["idempotency_key"]
+
+
+@pytest.mark.asyncio
+async def test_unanswered_deduction_stays_owed_and_lands_on_replay(spool_dir, seam):
+    """Vorher: platform-api antwortet nicht → WARNING, Abzug weg, Zeile
+    'written', Spool quittiert. Jetzt bleibt der Call geschuldet; der Nachlauf
+    findet die Zeile ('duplicate') und schickt den Abzug unter demselben
+    Schluessel noch einmal."""
+    from src.budget.plans import PlanConfig
+    from src.platform_client import PlatformUnavailable
+
+    plan = PlanConfig(id="report-standard", app_id="werking-report", name="S", price=0,
+                      interval="month", api_budget_eur=100, description="", trial=False)
+    via = AsyncMock(side_effect=PlatformUnavailable("timeout"))
+    with (
+        patch("src.budget.plan_resolution.resolve_billing_plan", new=AsyncMock(return_value=plan)),
+        patch("src.budget.routes.apply_budget_deduction_via_platform", new=via),
+    ):
+        outcome = await writer.persist_ai_call_activity(
+            provider=PROVIDER_ANTHROPIC, app_id="werking-report", user_id=USER_ID,
+            agent_id=None, workflow_id=None, model="claude-sonnet-5",
+            input_tokens=1000, output_tokens=500, status="success",
+            duration_ms=800, app_env="prod",
+        )
+        assert outcome == spool.OUTCOME_DEDUCTION_OWED
+        assert spool.spool_stats()["pending"] == 1
+
+        first_key = via.await_args.kwargs["idempotency_key"]
+        via.side_effect = None
+        seam.outcome = "duplicate"
+        await spool.flush_once(writer.persist_ai_call_activity)
+
+    assert via.await_count == 2
+    assert via.await_args.kwargs["idempotency_key"] == first_key
+    assert spool.spool_stats()["pending"] == 0
+
+
+@pytest.mark.asyncio
+async def test_ledger_price_reaches_the_requests_probe(spool_dir, seam):
+    """Kosten je Auftrag: der Preis, den das Ledger fuer diesen Call bucht
+    (hypothetical_cost_eur der Zeile), geht an die Request-Sonde — von dort als
+    X-Bridge-Cost-Eur in die Antwort und ins Job-Ergebnis."""
+    from src.activity import delivery
+
+    probe = delivery.DeliveryProbe(AsyncMock())
+    token = delivery._probe.set(probe)
+    try:
+        outcome, _ = await _persist(seam)
+    finally:
+        delivery._probe.reset(token)
+
+    assert outcome == spool.OUTCOME_WRITTEN
+    booked = seam.ledger_calls[-1]["hypothetical_cost_eur"]
+    assert booked > 0
+    assert probe.booked_cost_eur == pytest.approx(booked)
 
 
 @pytest.mark.asyncio
