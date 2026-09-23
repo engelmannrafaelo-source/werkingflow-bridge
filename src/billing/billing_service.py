@@ -1028,11 +1028,19 @@ async def _credit_topup(user_id: str, amount_eur: float, mollie_payment_id: str)
             # TopUp als datiertes Lot (Budget-Modell): purchased_at = realer
             # Kaufzeitpunkt (credit_purchases.paid_at), expires_at = +12 Monate.
             # Kein erfundenes Datum — beides aus dem Kauf abgeleitet.
+            #
+            # `$3::timestamptz` ist Pflicht: ohne Typ leitet Postgres aus
+            # `$3 + INTERVAL` fuer $3 den Typ interval ab und aus der Spalte
+            # purchased_at timestamptz → AmbiguousParameterError, die
+            # Transaktion rollt zurueck, der Webhook antwortet 500. So ist
+            # seit e993d0e (05.07.) JEDE Aufladung verloren gegangen (gemessen
+            # 23.09. an tr_bDcNDGUB3ax8Atso6kBXJ, dev-Bridge). Die Tests mit
+            # nachgebautem Pool konnten das nicht sehen.
             await conn.execute(
                 """
                 INSERT INTO user_topup_lots
                     (user_id, amount_eur, purchased_at, expires_at, credit_purchase_id)
-                VALUES ($1, $2, $3, $3 + INTERVAL '12 months', $4)
+                VALUES ($1, $2, $3::timestamptz, $3::timestamptz + INTERVAL '12 months', $4)
                 """,
                 user_uuid, amount_eur, paid_at, purchase_id,
             )
