@@ -662,6 +662,9 @@ async def lifespan(app: FastAPI):
             logger.error(f"❌ Worker DB pool init failed: {e}")
             raise
 
+    # HTTP-backed workers still meter calls and must load the same catalog,
+    # validate app IDs and drain their durable spool without a local DB pool.
+    if (BRIDGE_DB_CLIENT_AVAILABLE and is_db_enabled()) or os.getenv("BRIDGE_SERVICE_TOKEN"):
         # Plan catalog for the post-call budget deduction. _deduct_call_cost
         # (src/activity/ai_call_writer.py) runs in THIS worker process and maps
         # app_id → plan via the in-memory PLANS cache. Only platform-api's
@@ -728,15 +731,15 @@ async def lifespan(app: FastAPI):
             logger.info("✅ Worker DB pool closed")
         except Exception:
             pass
-        # Hand the spool file over immediately. The kernel would release the
-        # lock at process exit anyway; doing it here means a sibling uvicorn
-        # process can adopt any still-owed billing rows right away instead of
-        # waiting for the fd to be reaped.
-        try:
-            from src.activity.ledger_spool import release_own_file
-            release_own_file()
-        except Exception:
-            pass
+    # Hand the spool file over immediately. The kernel would release the
+    # lock at process exit anyway; doing it here means a sibling uvicorn
+    # process can adopt any still-owed billing rows right away instead of
+    # waiting for the fd to be reaped.
+    try:
+        from src.activity.ledger_spool import release_own_file
+        release_own_file()
+    except Exception:
+        pass
 
 
 # ── Generic async-job system: built-in executor + maintenance loop ──────────

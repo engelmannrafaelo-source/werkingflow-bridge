@@ -41,8 +41,12 @@ async def reload_plans() -> int:
     """
     # Local import to avoid a startup-time circular dependency: plan_repo
     # imports PlanConfig from this module.
-    from src.budget.plan_repo import load_plans_from_db
-    new_plans = await load_plans_from_db()
+    from src.db.client import is_db_enabled
+    if is_db_enabled():
+        from src.budget.plan_repo import load_plans_from_db
+        new_plans = await load_plans_from_db()
+    else:
+        new_plans = await _load_plans_via_platform()
     PLANS.clear()
     PLANS.update(new_plans)
     # Validate the cache we are about to serve from, not the one we replaced.
@@ -50,6 +54,41 @@ async def reload_plans() -> int:
     # (or at hot-reload), not as a mis-billed call hours later.
     assert_catalog_is_unambiguous()
     return len(PLANS)
+
+
+class PlanCatalogUnavailable(RuntimeError):
+    """An unloaded catalog is an infrastructure failure, never an unbilled app."""
+
+
+async def _load_plans_via_platform() -> dict[str, PlanConfig]:
+    from src.platform_client import call_platform
+
+    response = await call_platform("GET", "/v1/billing/plans", retries=2)
+    if response.status_code != 200 or not isinstance(response.json, dict):
+        raise PlanCatalogUnavailable(f"Plan catalog unavailable: HTTP {response.status_code}")
+    rows = response.json.get("plans")
+    if not isinstance(rows, list) or not rows:
+        raise PlanCatalogUnavailable("Platform returned an empty or invalid plan catalog")
+    result = {}
+    try:
+        for row in rows:
+            plan = PlanConfig(
+                id=row["id"], app_id=row["appId"], name=row["name"],
+                price=float(row["priceEur"]), interval=row["interval"],
+                api_budget_eur=float(row["apiBudgetEur"]),
+                description=row["description"], trial=row["trial"],
+            )
+            if not plan.id or not plan.app_id or not isinstance(plan.trial, bool) or plan.id in result:
+                raise ValueError("invalid or duplicate plan")
+            result[plan.id] = plan
+    except (KeyError, TypeError, ValueError) as exc:
+        raise PlanCatalogUnavailable("Platform returned a malformed plan catalog") from exc
+    return result
+
+
+def _require_loaded_catalog() -> None:
+    if not PLANS:
+        raise PlanCatalogUnavailable("Plan catalog is empty — budget metering is unavailable")
 
 
 def get_plan(plan_id: str) -> PlanConfig:
@@ -85,6 +124,7 @@ def find_monthly_plan_for_app(app_id: str) -> "PlanConfig | None":
     flip, and a coin flip that mis-bills is exactly what this function
     exists to prevent.
     """
+    _require_loaded_catalog()
     monthly = [p for p in PLANS.values() if p.app_id == app_id and not p.trial and p.interval == "month"]
     if len(monthly) > 1:
         raise AmbiguousPlanCatalog(
@@ -104,6 +144,7 @@ def find_project_plans_for_app(app_id: str) -> "tuple[PlanConfig, ...]":
     allocated project budget, not by this catalog — see
     src.budget.plan_resolution.resolve_billing_plan.
     """
+    _require_loaded_catalog()
     return tuple(
         sorted(
             (p for p in PLANS.values() if p.app_id == app_id and not p.trial and p.interval == "project"),

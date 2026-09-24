@@ -127,9 +127,9 @@ def test_two_monthly_plans_for_one_app_fail_loud():
         del PLANS["report-second-monthly"]
 
 
-def test_boot_invariant_rejects_an_unattributable_catalog():
-    """A project-only app with several project plans could not attribute a call
-    that has no allocation yet — the boot invariant must refuse that catalog."""
+@pytest.mark.asyncio
+async def test_project_tiers_are_valid_but_unallocated_calls_are_rejected():
+    """Credit tiers are legal; attribution without an allocation is not."""
     from src.budget.plans import assert_catalog_is_unambiguous
 
     assert_catalog_is_unambiguous()  # the seeded catalog is coherent
@@ -138,7 +138,8 @@ def test_boot_invariant_rejects_an_unattributable_catalog():
         price=2000, interval="project", api_budget_eur=200, description="", trial=False,
     )
     try:
-        with pytest.raises(AmbiguousPlanCatalog):
-            assert_catalog_is_unambiguous()
+        assert_catalog_is_unambiguous()
+        with pytest.raises(PlanResolutionError):
+            await resolve_billing_plan("werking-energy", uuid.uuid4(), None)
     finally:
         del PLANS["energy-project-xl"]

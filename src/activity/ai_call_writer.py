@@ -63,7 +63,7 @@ from src.activity.delivery import (
 from src.activity.providers import REAL_COST_PROVIDERS, normalize_ledger_provider
 from src.attribution import ANONYMOUS_USER_ID
 from src.budget.plan_resolution import PlanResolutionError
-from src.budget.plans import AmbiguousPlanCatalog
+from src.budget.plans import AmbiguousPlanCatalog, PlanCatalogUnavailable
 from src.pricing import cost_eur, PRICING_VERSION
 
 logger = logging.getLogger(__name__)
@@ -192,7 +192,7 @@ async def _deduct_call_cost(
         # nobody writes to. See src/budget/plan_resolution.py.
         plan = await resolve_billing_plan(app_id, uid, workflow_id)
         if plan is None:
-            logger.debug(
+            logger.warning(
                 "post-call deduction: app=%s not in the plan catalog — "
                 "not budget-tracked, no deduction for this call", app_id,
             )
@@ -280,7 +280,7 @@ async def _deduct_call_cost(
     except Exception as e:  # noqa: BLE001 — deduction must never break the call
         from src.platform_client import PlatformUnavailable
 
-        if isinstance(e, PlatformUnavailable) and call_uid:
+        if isinstance(e, (PlatformUnavailable, PlanCatalogUnavailable)) and call_uid:
             # Keyed, so a later attempt cannot charge twice: keep it OWED
             # instead of dropping it (the pre-061 fate of every such call).
             logger.warning(
