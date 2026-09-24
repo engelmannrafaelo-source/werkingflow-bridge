@@ -220,7 +220,10 @@ runtime_api_key = None
 # (ToolSearch, Workflow, Task*, ...) that the old 16-entry list did not cover;
 # during the 2026-07-06 energy phase-4 incident the model called ToolSearch on
 # a tools-disabled request. When bumping the CLI image, diff this list against
-# the 'tools' array in the SDK init message (logged per instance).
+# the 'tools' array in the SDK init message (logged per instance), or run
+# `claude -p hi --max-turns 1 --output-format stream-json --verbose` in the
+# worker and diff its init 'tools' — tests/unit/test_tools_disabled_denylist.py
+# pins the CLI 2.1.280 set.
 TOOLS_DISABLED_DENYLIST = [
     # Classic tool set
     'Task', 'Bash', 'Glob', 'Grep', 'LS', 'exit_plan_mode',
@@ -232,6 +235,10 @@ TOOLS_DISABLED_DENYLIST = [
     'CronCreate', 'CronDelete', 'CronList', 'Monitor', 'ScheduleWakeup',
     'DesignSync', 'EnterWorktree', 'ExitWorktree', 'PushNotification',
     'RemoteTrigger', 'ReportFindings',
+    # New built-in in CLI 2.1.280 (b87a6a6). Missing it made the model call
+    # ListAgents on tools-disabled chats -> error_max_turns -> CLI exit 1 ->
+    # sdk_disconnect (prod incident 2026-09-24, ~1/3 of Sonnet chats).
+    'ListAgents',
 ]
 
 def generate_secure_token(length: int = 32) -> str:
