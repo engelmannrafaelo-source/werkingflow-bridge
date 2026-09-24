@@ -38,8 +38,8 @@ from src.model_registry import (
 
 class TestFamilyDefaults:
     def test_deliberate_defaults_hold(self):
-        assert _DEFAULT_BY_FAMILY["sonnet"].id == "claude-sonnet-4-5-20250929"
-        assert _DEFAULT_BY_FAMILY["opus"].id == "claude-opus-4-7"
+        assert _DEFAULT_BY_FAMILY["sonnet"].id == "claude-sonnet-5"
+        assert _DEFAULT_BY_FAMILY["opus"].id == "claude-opus-5-5"
         assert _DEFAULT_BY_FAMILY["haiku"].id == "claude-haiku-4-5-20251001"
 
     def test_default_carries_flag(self):
@@ -60,19 +60,18 @@ class TestResolveModel:
     @pytest.mark.parametrize(
         "requested,expected",
         [
-            # Default exakt bedient
-            ("claude-sonnet-4-5-20250929", "claude-sonnet-4-5-20250929"),
-            ("claude-opus-4-7", "claude-opus-4-7"),
-            # Neuer als Default = bewusstes Opt-in, exakt bedient
-            ("claude-sonnet-4-6", "claude-sonnet-4-6"),
-            ("claude-opus-4-8", "claude-opus-4-8"),
-            # Aelter als Default = Force-Upgrade (always-latest fuer Altbestand)
-            ("claude-sonnet-4-20250514", "claude-sonnet-4-5-20250929"),
-            ("claude-opus-4-20250514", "claude-opus-4-7"),
+            ("claude-sonnet-5", "claude-sonnet-5"),
+            ("claude-opus-5-5", "claude-opus-5-5"),
+            ("claude-sonnet-4-5-20250929", "claude-sonnet-5"),
+            ("claude-sonnet-4-6", "claude-sonnet-5"),
+            ("claude-opus-4-8", "claude-opus-5-5"),
+            ("claude-opus-4-7", "claude-opus-5-5"),
+            ("claude-opus-4-20250514", "claude-opus-5-5"),
             ("claude-3-5-haiku-20241022", "claude-haiku-4-5-20251001"),
-            # Fuzzy-Familiennamen -> Default
-            ("sonnet", "claude-sonnet-4-5-20250929"),
-            ("opus", "claude-opus-4-7"),
+            ("sonnet", "claude-sonnet-5"),
+            ("opus", "claude-opus-5-5"),
+            ("opus-4", "claude-opus-5-5"),
+            ("claude-opus-5", "claude-opus-5-5"),
             ("haiku", "claude-haiku-4-5-20251001"),
         ],
     )
@@ -83,7 +82,7 @@ class TestResolveModel:
     def test_explicit_newer_is_not_downgraded(self):
         """Der Kern der Regression: ein explizites Opt-in in ein neueres
         Modell darf weder auf den Default 'aufgeräumt' noch umgeleitet werden."""
-        for opt_in in ("claude-opus-4-8", "claude-sonnet-4-6"):
+        for opt_in in ("claude-opus-5-5", "claude-sonnet-5"):
             got, warning = resolve_model(opt_in)
             assert got == opt_in
             assert warning is None
@@ -109,6 +108,7 @@ class TestBedrockMapping:
             ("claude-opus-4-6", "eu.anthropic.claude-opus-4-6-v1"),
             ("claude-opus-4-7", "eu.anthropic.claude-opus-4-7"),
             ("claude-opus-4-8", "eu.anthropic.claude-opus-4-8"),
+            ("claude-opus-5-5", "eu.anthropic.claude-opus-5-5"),
         ],
     )
     def test_profile_ids_and_roundtrip(self, model, profile):
@@ -163,3 +163,17 @@ class TestSupportsTemperature:
     def test_unknown_model_fails_open(self):
         # Fail-open (nie still einen validen Param für ein unbekanntes Modell strippen).
         assert model_supports_temperature("totally-unknown-xyz") is True
+
+
+@pytest.mark.parametrize("model", ["claude-opus-6", "claude-opus-5-6", "opus-6", "CLAUDE-OPUS-6"])
+def test_unknown_opus_version_never_downgrades(model):
+    resolved, error = resolve_model(model)
+    assert resolved is None
+    assert "not supported" in error
+
+
+def test_opus_55_pricing_and_cache():
+    from src.pricing import cost_usd, validate_billing_integrity
+    validate_billing_integrity()
+    assert cost_usd("claude-opus-5-5", 1000000, 1000000, 1000000, 1000000) == pytest.approx(29.2)
+    assert cost_usd("eu.anthropic.claude-opus-5-5", 0, 0, 1000000) == pytest.approx(0.2)

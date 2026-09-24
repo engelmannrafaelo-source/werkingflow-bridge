@@ -230,3 +230,53 @@ class TestLogUnsupportedParameters:
             "thinking" in record.message or "output_config" in record.message
             for record in caplog.records
         )
+
+
+class TestOpus55Migration(TestBedrockPassthrough):
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("stream", [False, True])
+    @pytest.mark.parametrize("thinking,effort", [
+        (None, "medium"), ({"type": "disabled"}, "low"),
+        ({"type": "enabled", "budget_tokens": 2048}, "high"),
+        ({"type": "adaptive"}, "medium"),
+    ])
+    async def test_bedrock_opus_upgrade_body(self, monkeypatch, stream, thinking, effort):
+        boto = self._patch_client(monkeypatch, {
+            "content": [{"type": "thinking", "thinking": ""}, {"type": "text", "text": "ok"}],
+            "usage": {"input_tokens": 1, "output_tokens": 1}, "stop_reason": "end_turn",
+        })
+        boto.invoke_model_with_response_stream.return_value = {"body": []}
+        req = _make_request(model="opus", thinking=thinking, temperature=0.7, top_p=0.8)
+        if stream:
+            async for _ in bedrock_service.stream_bedrock(req):
+                pass
+            sent = boto.invoke_model_with_response_stream.call_args.kwargs
+        else:
+            result = await bedrock_service.call_bedrock(req)
+            assert result.model == "claude-opus-5-5"
+            assert result.choices[0].message.content == "ok"
+            sent = boto.invoke_model.call_args.kwargs
+        assert sent["modelId"] == "eu.anthropic.claude-opus-5-5"
+        body = json.loads(sent["body"])
+        assert "temperature" not in body and "top_p" not in body
+        assert body["output_config"]["effort"] == effort
+        if thinking:
+            assert body["thinking"] == {"type": "adaptive"}
+
+    @pytest.mark.asyncio
+    async def test_direct_opus_thinking_and_explicit_effort(self):
+        mock_client = _mock_httpx_client(200, {
+            "content": [{"type": "thinking", "thinking": ""}, {"type": "text", "text": "ok"}],
+            "model": "claude-opus-5-5", "usage": {"input_tokens": 1, "output_tokens": 1},
+            "stop_reason": "end_turn",
+        })
+        with patch("httpx.AsyncClient", return_value=mock_client):
+            result = await VisionProvider().analyze(
+                SAMPLE_MESSAGES, model="claude-opus-5-5",
+                thinking={"type": "disabled"}, output_config={"effort": "max"},
+            )
+        body = mock_client.post.call_args.kwargs["json"]
+        assert body["thinking"] == {"type": "adaptive"}
+        assert body["output_config"] == {"effort": "max"}
+        assert "temperature" not in body
+        assert result.content == "ok"

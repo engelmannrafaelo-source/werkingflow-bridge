@@ -7,6 +7,7 @@ Stellt sicher dass:
 3. Saubere Fehlermeldungen bei unbekannten Modellen
 """
 
+import re
 from typing import Optional, List, Dict
 from dataclasses import dataclass
 from datetime import date
@@ -131,17 +132,22 @@ MODELS: List[ModelInfo] = [
         description="Haiku 3.5 - Legacy"
     ),
 
-    # Opus Familie
-    # Opus 4.8 = Opus-Default seit 2026-07-16 (bewusste Entscheidung Rafael):
-    # aktuellstes Opus, gleiche Request-Surface wie 4.7 (kein Breaking-Change).
-    # 4.7 bleibt per model="claude-opus-4-7" explizit anforderbar (Fallback).
+    # Opus 5.5 default, approved 2026-09-24; older Opus IDs follow
+    # the existing always-latest policy. Unknown future versions fail closed.
+    ModelInfo(
+        id="claude-opus-5-5",
+        family="opus",
+        version="5.5",
+        release_date=date(2026, 9, 22),
+        description="Opus 5.5 - Default, 1M context, adaptive thinking",
+        is_default=True
+    ),
     ModelInfo(
         id="claude-opus-4-8",
         family="opus",
         version="4.8",
         release_date=date(2026, 6, 1),
-        description="Opus 4.8 - Default, aktuellstes Opus, 1M context",
-        is_default=True
+        description="Opus 4.8 - previous default"
     ),
     ModelInfo(
         id="claude-opus-4-7",
@@ -299,6 +305,12 @@ def resolve_model(model_input: str) -> tuple[str, Optional[str]]:
             if default is None or info.release_date >= default.release_date:
                 return (model_id, f"Resolved '{model_input}' to '{model_id}' (case corrected)")
             return (default.id, f"Force-upgraded '{model_input}' to '{default.id}' (always-latest policy, case corrected)")
+
+    # Reject future Opus versions before fuzzy matching. Older shorthand
+    # IDs retain the existing always-latest upgrade behavior.
+    version_match = re.search(r"(?:^|-)opus[- ]?(\d+)(?:[-.](\d+))?", model_lower)
+    if version_match and tuple(int(v or 0) for v in version_match.groups()) > (5, 5):
+        return (None, f"Model '{model_input}' not supported. Use opus or a registered exact ID.")
 
     # 3. Fuzzy match by family name
     family_keywords = {
@@ -462,6 +474,7 @@ _BEDROCK_PROFILE_BASE_IDS: Dict[str, str] = {
     "claude-opus-4-6":            "anthropic.claude-opus-4-6-v1",
     "claude-opus-4-7":            "anthropic.claude-opus-4-7",
     "claude-opus-4-8":            "anthropic.claude-opus-4-8",
+    "claude-opus-5-5":            "anthropic.claude-opus-5-5",
     "claude-sonnet-5":            "anthropic.claude-sonnet-5",
 }
 

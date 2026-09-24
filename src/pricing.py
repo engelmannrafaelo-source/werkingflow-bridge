@@ -51,7 +51,8 @@ import re
 #                  der Grund, warum 2.5 der Default bleibt: neuer ist hier NICHT
 #                  guenstiger — 3.1 kostet output das 3,75-fache, 3.5 das
 #                  6,25-fache von 2.5.
-PRICING_VERSION = "v7"
+# v8 (2026-09-24): Opus 5.5 $4/$20, cache read $0.20 per MTok.
+PRICING_VERSION = "v8"
 
 # USD per 1M tokens. {model_id: {"in": input_price, "out": output_price}}
 # Quelle je Zeile: Anthropic "Model pricing"-Tabelle,
@@ -73,6 +74,7 @@ MODEL_PRICING: dict[str, dict[str, float]] = {
     "claude-opus-4-6":            {"in": 5.00,  "out": 25.00},  # 2026-07-05
     "claude-opus-4-7":            {"in": 5.00,  "out": 25.00},  # 2026-07-03
     "claude-opus-4-8":            {"in": 5.00,  "out": 25.00},  # 2026-07-03
+    "claude-opus-5-5":            {"in": 4.00, "out": 20.00, "cache_read_mult": 0.05},
     "claude-opus-5":              {"in": 5.00,  "out": 25.00},  # 2026-09-02 — GA, noch nicht in model_registry.MODELS registriert
     "claude-fable-5-1":           {"in": 10.00, "out": 50.00},  # 2026-09-02 — GA, noch nicht in model_registry.MODELS registriert
     "claude-haiku-4-5":           {"in": 1.00,  "out": 5.00},   # 2026-07-03
@@ -218,7 +220,7 @@ def cost_usd(
     return (
         (input_tokens or 0) / 1_000_000.0 * p["in"]
         + (cache_creation_tokens or 0) / 1_000_000.0 * p["in"] * CACHE_WRITE_MULT
-        + (cache_read_tokens or 0) / 1_000_000.0 * p["in"] * CACHE_READ_MULT
+        + (cache_read_tokens or 0) / 1_000_000.0 * p["in"] * p.get("cache_read_mult", CACHE_READ_MULT)
         + (output_tokens or 0) / 1_000_000.0 * p["out"]
         + (search_count or 0) * WEB_SEARCH_FEE_USD
     )

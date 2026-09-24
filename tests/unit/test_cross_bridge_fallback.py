@@ -245,7 +245,7 @@ class TestClaudeDirectNotoolsTier:
             )
             assert config.backend == BackendType.ANTHROPIC_DIRECT
             assert config.provider_api_key == "test-vision-key"
-            assert config.provider_model == "claude-sonnet-4-5-20250929"
+            assert config.provider_model == "claude-sonnet-5"
 
 
 # =============================================================================

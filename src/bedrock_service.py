@@ -21,6 +21,7 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 from config.logging_config import get_logger
+from src.model_request import adapt_opus_request
 from src.models import (
     ChatCompletionRequest, ChatCompletionResponse, Choice, Message, Usage,
     BackendInfo, BackendType, PrivacyMode,
@@ -267,6 +268,8 @@ async def call_bedrock(
     if request.output_config is not None:
         body["output_config"] = request.output_config
 
+    adapt_opus_request(resolved_model, body)
+
     logger.info(f"Calling Bedrock: model={bedrock_model_id}, region={actual_region}")
 
     try:
@@ -424,6 +427,8 @@ async def stream_bedrock(
 
     if request.output_config is not None:
         body["output_config"] = request.output_config
+
+    adapt_opus_request(resolved_model, body)
 
     logger.info(f"Streaming from Bedrock: model={bedrock_model_id}, region={actual_region}")
 
