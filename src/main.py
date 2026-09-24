@@ -2424,7 +2424,7 @@ async def chat_completions(
                         "type": "invalid_request_error",
                         "param": "model",
                         "code": "model_not_found",
-                        "hint": f"Use 'sonnet', 'haiku', 'opus' for latest, or exact IDs: {', '.join(get_all_model_ids())}"
+                        "hint": f"Use 'sonnet', 'haiku', 'opus', 'fable' for latest, or exact IDs: {', '.join(get_all_model_ids())}"
                     }
                 }
             )
@@ -5491,7 +5491,7 @@ async def research(
             status="error",
             query=request_body.query,
             model=original_model,
-            error=f"Model '{original_model}' not supported. Use 'sonnet', 'haiku', 'opus' for latest, or exact IDs: {', '.join(get_all_model_ids())}"
+            error=f"Model '{original_model}' not supported. Use 'sonnet', 'haiku', 'opus', 'fable' for latest, or exact IDs: {', '.join(get_all_model_ids())}"
         )
 
     if resolved_model != original_model:

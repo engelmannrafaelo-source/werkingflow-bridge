@@ -21,7 +21,7 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 from config.logging_config import get_logger
-from src.model_request import adapt_opus_request
+from src.model_request import adapt_model_request
 from src.models import (
     ChatCompletionRequest, ChatCompletionResponse, Choice, Message, Usage,
     BackendInfo, BackendType, PrivacyMode,
@@ -80,6 +80,7 @@ def _map_bedrock_stop_reason(bedrock_reason: Optional[str]) -> str:
         "max_tokens": "length",
         "stop_sequence": "stop",
         "content_filtered": "content_filter",
+        "refusal": "content_filter",
     }
     return mapping.get(bedrock_reason, "stop")
 
@@ -222,7 +223,10 @@ async def call_bedrock(
 
     # Determine region first (needed for model ID)
     actual_region = region or request.bedrock_region or client.default_region
-    bedrock_model_id = to_bedrock_model_id(resolved_model, actual_region)
+    try:
+        bedrock_model_id = to_bedrock_model_id(resolved_model, actual_region)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     # Convert messages
     system_prompt, messages = convert_messages_to_anthropic(request.messages)
@@ -268,7 +272,7 @@ async def call_bedrock(
     if request.output_config is not None:
         body["output_config"] = request.output_config
 
-    adapt_opus_request(resolved_model, body)
+    adapt_model_request(resolved_model, body)
 
     logger.info(f"Calling Bedrock: model={bedrock_model_id}, region={actual_region}")
 
@@ -383,7 +387,10 @@ async def stream_bedrock(
 
     # Determine region first (needed for model ID)
     actual_region = region or request.bedrock_region or client.default_region
-    bedrock_model_id = to_bedrock_model_id(resolved_model, actual_region)
+    try:
+        bedrock_model_id = to_bedrock_model_id(resolved_model, actual_region)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     usage_sink["bedrock_model_id"] = bedrock_model_id
     usage_sink["region"] = actual_region
 
@@ -428,7 +435,7 @@ async def stream_bedrock(
     if request.output_config is not None:
         body["output_config"] = request.output_config
 
-    adapt_opus_request(resolved_model, body)
+    adapt_model_request(resolved_model, body)
 
     logger.info(f"Streaming from Bedrock: model={bedrock_model_id}, region={actual_region}")
 

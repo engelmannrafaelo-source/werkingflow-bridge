@@ -52,7 +52,8 @@ import re
 #                  guenstiger — 3.1 kostet output das 3,75-fache, 3.5 das
 #                  6,25-fache von 2.5.
 # v8 (2026-09-24): Opus 5.5 $4/$20, cache read $0.20 per MTok.
-PRICING_VERSION = "v8"
+# v9 (2026-09-24): Fable 5.1 enabled; cache read $0.25 per MTok.
+PRICING_VERSION = "v9"
 
 # USD per 1M tokens. {model_id: {"in": input_price, "out": output_price}}
 # Quelle je Zeile: Anthropic "Model pricing"-Tabelle,
@@ -76,7 +77,7 @@ MODEL_PRICING: dict[str, dict[str, float]] = {
     "claude-opus-4-8":            {"in": 5.00,  "out": 25.00},  # 2026-07-03
     "claude-opus-5-5":            {"in": 4.00, "out": 20.00, "cache_read_mult": 0.05},
     "claude-opus-5":              {"in": 5.00,  "out": 25.00},  # 2026-09-02 — GA, noch nicht in model_registry.MODELS registriert
-    "claude-fable-5-1":           {"in": 10.00, "out": 50.00},  # 2026-09-02 — GA, noch nicht in model_registry.MODELS registriert
+    "claude-fable-5-1":           {"in": 10.00, "out": 50.00, "cache_read_mult": 0.025},
     "claude-haiku-4-5":           {"in": 1.00,  "out": 5.00},   # 2026-07-03
     "claude-haiku-4-5-20251001":  {"in": 1.00,  "out": 5.00},   # 2026-07-03
     # Google Gemini — Bildweg (nur Nicht-Prod erreichbar, siehe
@@ -184,7 +185,7 @@ def validate_billing_integrity() -> None:
     from src.model_registry import resolve_model, get_all_model_ids
     unpriced: list[str] = []
     # Every fuzzy alias + every registered model must resolve to a priced model.
-    candidates = set(get_all_model_ids()) | {"sonnet", "opus", "haiku"}
+    candidates = set(get_all_model_ids()) | {"sonnet", "opus", "haiku", "fable"}
     for c in candidates:
         try:
             resolved, _ = resolve_model(c)

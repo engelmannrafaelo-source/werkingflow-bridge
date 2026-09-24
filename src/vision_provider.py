@@ -18,7 +18,7 @@ from typing import List, Dict, Any, Optional, Tuple
 from dataclasses import dataclass
 from fastapi import HTTPException
 from config.logging_config import get_logger
-from src.model_request import adapt_opus_request
+from src.model_request import adapt_model_request
 from src.model_registry import get_default_model, model_supports_temperature
 
 logger = get_logger(__name__)
@@ -376,7 +376,7 @@ class VisionProvider:
         if output_config is not None:
             request_body["output_config"] = output_config
 
-        adapt_opus_request(model, request_body)
+        adapt_model_request(model, request_body)
 
         # Make API request
         async with httpx.AsyncClient(timeout=timeout) as client:

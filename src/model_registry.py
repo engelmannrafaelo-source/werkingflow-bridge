@@ -132,6 +132,16 @@ MODELS: List[ModelInfo] = [
         description="Haiku 3.5 - Legacy"
     ),
 
+    # Fable family — explicit opt-in via fable or the full model ID.
+    ModelInfo(
+        id="claude-fable-5-1",
+        family="fable",
+        version="5.1",
+        release_date=date(2026, 9, 1),
+        description="Fable 5.1 - Default, 1M context, adaptive thinking",
+        is_default=True
+    ),
+
     # Opus 5.5 default, approved 2026-09-24; older Opus IDs follow
     # the existing always-latest policy. Unknown future versions fail closed.
     ModelInfo(
@@ -306,17 +316,23 @@ def resolve_model(model_input: str) -> tuple[str, Optional[str]]:
                 return (model_id, f"Resolved '{model_input}' to '{model_id}' (case corrected)")
             return (default.id, f"Force-upgraded '{model_input}' to '{default.id}' (always-latest policy, case corrected)")
 
-    # Reject future Opus versions before fuzzy matching. Older shorthand
-    # IDs retain the existing always-latest upgrade behavior.
-    version_match = re.search(r"(?:^|-)opus[- ]?(\d+)(?:[-.](\d+))?", model_lower)
-    if version_match and tuple(int(v or 0) for v in version_match.groups()) > (5, 5):
-        return (None, f"Model '{model_input}' not supported. Use opus or a registered exact ID.")
+    # Reject future versioned requests before fuzzy matching. Otherwise an
+    # explicit newer model can silently become an older family default.
+    # Keep legacy shorthand upgrades; Sonnet/Haiku matching stays unchanged.
+    version_match = re.search(r"(?:^|-)(opus|fable)[- ]?(\d+)(?:[-.](\d+))?", model_lower)
+    if version_match:
+        family, major, minor = version_match.groups()
+        requested_version = (int(major), int(minor or 0))
+        default_version = tuple(int(v) for v in _DEFAULT_BY_FAMILY[family].version.split("."))
+        if requested_version > default_version:
+            return (None, f"Model '{model_input}' not supported. Use {family} or a registered exact ID.")
 
     # 3. Fuzzy match by family name
     family_keywords = {
         "sonnet": ["sonnet", "son", "sonne"],
         "haiku": ["haiku", "hai", "haku", "heiko"],  # Include common typos
         "opus": ["opus", "op"],
+        "fable": ["fable"],
     }
 
     for family, keywords in family_keywords.items():
@@ -339,7 +355,7 @@ def resolve_model(model_input: str) -> tuple[str, Optional[str]]:
     available = ", ".join(get_all_model_ids())
     error_msg = (
         f"Model '{model_input}' not supported. "
-        f"Use one of: sonnet, haiku, opus (for latest) or exact IDs: {available}"
+        f"Use one of: sonnet, haiku, opus, fable (for latest) or exact IDs: {available}"
     )
     logger.warning(error_msg)
     return (None, error_msg)
@@ -365,7 +381,7 @@ class ModelResolutionError(Exception):
         self.available_models = available_models
         super().__init__(
             f"Model '{model_input}' not supported. "
-            f"Available: sonnet, haiku, opus (for latest) or: {', '.join(available_models)}"
+            f"Available: sonnet, haiku, opus, fable (for latest) or: {', '.join(available_models)}"
         )
 
 
@@ -446,6 +462,10 @@ def to_bedrock_model_id(anthropic_model_id: str, region: str = "eu-central-1") -
             f"Model must start with 'claude-'"
         )
 
+    if anthropic_model_id == "claude-fable-5-1":
+        if region.startswith("us-") and not region.startswith("us-gov-"):
+            return "us.anthropic.claude-fable-5-1"
+        raise ValueError("Fable 5.1 has no Bedrock EU/APAC geo profile; use the Anthropic backend. No global fallback is performed.")
     prefix = _get_bedrock_region_prefix(region)
     base = _BEDROCK_PROFILE_BASE_IDS.get(anthropic_model_id)
     if base is None:

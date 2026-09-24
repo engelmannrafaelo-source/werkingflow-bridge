@@ -177,3 +177,34 @@ def test_opus_55_pricing_and_cache():
     validate_billing_integrity()
     assert cost_usd("claude-opus-5-5", 1000000, 1000000, 1000000, 1000000) == pytest.approx(29.2)
     assert cost_usd("eu.anthropic.claude-opus-5-5", 0, 0, 1000000) == pytest.approx(0.2)
+
+
+@pytest.mark.parametrize("name", ["fable", "claude-fable-5", "claude-fable-5-1", "FABLE"])
+def test_fable_default(name):
+    assert resolve_model(name)[0] == "claude-fable-5-1"
+
+
+def test_fable_future_version_rejected():
+    assert resolve_model("claude-fable-5-2")[0] is None
+
+
+def test_fable_cache_price():
+    from src.pricing import cost_usd
+    assert cost_usd("claude-fable-5-1", 1000000, 1000000, 1000000, 1000000) == pytest.approx(72.75)
+
+
+def test_fable_bedrock_never_silently_leaves_eu():
+    with pytest.raises(ValueError, match="no Bedrock EU"):
+        to_bedrock_model_id("claude-fable-5-1", "eu-central-1")
+    assert to_bedrock_model_id("claude-fable-5-1", "us-east-1") == "us.anthropic.claude-fable-5-1"
+
+
+@pytest.mark.parametrize("thinking,effort", [(None,"high"), ({"type":"disabled"},"low"), ({"type":"enabled","budget_tokens":2048},"high")])
+def test_fable_request_adaptation(thinking, effort):
+    from src.model_request import adapt_model_request
+    body = {"thinking": thinking, "temperature": 0.7, "top_p": 0.8}
+    adapt_model_request("claude-fable-5-1", body)
+    assert body["output_config"]["effort"] == effort
+    assert "temperature" not in body and "top_p" not in body
+    if thinking:
+        assert body["thinking"] == {"type":"adaptive"}

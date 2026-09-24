@@ -11,6 +11,7 @@ selection and are resolved via the provider registry.
 """
 
 import logging
+from fastapi import HTTPException
 from typing import Optional, Dict, Any
 from dataclasses import dataclass, field
 
@@ -84,7 +85,10 @@ def resolve_backend_config(
         env_vars = bedrock_credential_manager.get_bedrock_env_vars(region)
 
         # Convert model ID to Bedrock format
-        bedrock_model_id = to_bedrock_model_id(model)
+        try:
+            bedrock_model_id = to_bedrock_model_id(model, region)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
 
         logger.info(f"🔀 Backend routing: bedrock (region={region}, model={bedrock_model_id})")
     else:
