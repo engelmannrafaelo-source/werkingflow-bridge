@@ -1638,6 +1638,7 @@ async def generate_streaming_response(
                 disallowed_tools=claude_options.get('disallowed_tools'),
                 stream=True,
                 enable_file_discovery=claude_options.get('enable_file_discovery', False),
+                max_thinking_tokens=claude_options.get('max_thinking_tokens'),
                 backend_env_vars=backend_config.env_vars if backend_config else None
             ):
                 # Capture metadata chunk (don't stream it in SSE)
@@ -3518,6 +3519,7 @@ async def chat_completions(
                 disallowed_tools=claude_options.get('disallowed_tools'),
                 stream=False,
                 enable_file_discovery=claude_options.get('enable_file_discovery', False),
+                max_thinking_tokens=claude_options.get('max_thinking_tokens'),
                 backend_env_vars=backend_config.env_vars if backend_config else None
             ):
                 # Capture metadata chunk separately
@@ -3735,6 +3737,7 @@ async def chat_completions(
                     disallowed_tools=retry_options.get('disallowed_tools'),
                     stream=False,
                     enable_file_discovery=retry_options.get('enable_file_discovery', False),
+                    max_thinking_tokens=retry_options.get('max_thinking_tokens'),
                     backend_env_vars=backend_config.env_vars if backend_config else None
                 ):
                     if isinstance(chunk, dict) and chunk.get("type") == "x_claude_metadata":

@@ -200,7 +200,7 @@ class ChatCompletionRequest(BaseModel):
     # so existing callers get byte-identical requests.
     thinking: Optional[Dict[str, Any]] = Field(
         default=None,
-        description="Passthrough for the Anthropic Messages API 'thinking' param, e.g. {'type': 'adaptive'}, {'type': 'enabled', 'budget_tokens': N}, or {'type': 'disabled'}. Only applied on backend='bedrock' or a provider_tier that resolves to anthropic_direct — the default Claude Code SDK backend does not support it (see log_unsupported_parameters). Omit for unchanged default behavior."
+        description="Passthrough for the Anthropic Messages API 'thinking' param, e.g. {'type': 'adaptive'}, {'type': 'enabled', 'budget_tokens': N}, or {'type': 'disabled'}. Forwarded verbatim on backend='bedrock' or a provider_tier that resolves to anthropic_direct. On the default Claude Code SDK backend, {'type': 'disabled'} and {'type': 'enabled', 'budget_tokens': N} set the CLI thinking budget (MAX_THINKING_TOKENS); other shapes are not applied there (see log_unsupported_parameters). Omit for unchanged default behavior."
     )
     output_config: Optional[Dict[str, Any]] = Field(
         default=None,
@@ -239,8 +239,12 @@ class ChatCompletionRequest(BaseModel):
         if self.stop:
             warnings.append(f"stop sequences are not supported by Claude Code SDK and will be ignored")
 
-        if self.thinking is not None:
-            warnings.append(f"thinking={self.thinking} is not supported by the Claude Code SDK backend (only backend='bedrock' or an anthropic_direct provider_tier forward it) and will be ignored")
+        # thinking {"type":"disabled"} / {"type":"enabled","budget_tokens":N} IS
+        # applied on the SDK path (as the CLI's MAX_THINKING_TOKENS, see
+        # sdk_max_thinking_tokens). Only shapes without a CLI equivalent
+        # (e.g. "adaptive") stay unapplied — and say so.
+        if self.thinking is not None and self.sdk_max_thinking_tokens() is None:
+            warnings.append(f"thinking={self.thinking} has no Claude Code SDK equivalent (only {{'type':'disabled'}} and {{'type':'enabled','budget_tokens':N}} map to MAX_THINKING_TOKENS; everything else needs backend='bedrock' or an anthropic_direct provider_tier) and will be ignored on the SDK backend")
 
         if self.output_config is not None:
             warnings.append(f"output_config={self.output_config} is not supported by the Claude Code SDK backend (only backend='bedrock' or an anthropic_direct provider_tier forward it) and will be ignored")
@@ -248,6 +252,23 @@ class ChatCompletionRequest(BaseModel):
         for warning in warnings:
             logger.warning(f"OpenAI API compatibility: {warning}")
     
+    def sdk_max_thinking_tokens(self) -> Optional[int]:
+        """Map the Anthropic `thinking` param onto the Claude Code CLI's thinking
+        budget (env MAX_THINKING_TOKENS). The CLI thinks BY DEFAULT: without this,
+        max_tokens is ignored on the SDK path and a one-word answer was measured
+        with 7018 completion tokens (2026-09-24, report help-agent, 3.8 cent).
+        Returns None when the shape has no CLI equivalent (CLI default applies)."""
+        if not isinstance(self.thinking, dict):
+            return None
+        kind = self.thinking.get("type")
+        if kind == "disabled":
+            return 0
+        if kind == "enabled":
+            budget = self.thinking.get("budget_tokens")
+            if isinstance(budget, int) and not isinstance(budget, bool) and budget >= 0:
+                return budget
+        return None
+
     def to_claude_options(self) -> Dict[str, Any]:
         """Convert OpenAI request parameters to Claude Code SDK options."""
         # Log warnings for unsupported parameters
@@ -258,6 +279,12 @@ class ChatCompletionRequest(BaseModel):
         # Direct mappings
         if self.model:
             options['model'] = self.model
+
+        # Thinking budget for the CLI subprocess. An X-Claude-Max-Thinking-Tokens
+        # header (merged later by the caller) overrides this.
+        _thinking_budget = self.sdk_max_thinking_tokens()
+        if _thinking_budget is not None:
+            options['max_thinking_tokens'] = _thinking_budget
             
         # Use user field for session identification if provided
         if self.user:

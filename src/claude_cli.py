@@ -722,6 +722,20 @@ def find_truncation_marker(chunks: list) -> Optional[dict]:
     return None
 
 
+def apply_thinking_budget(options: "ClaudeCodeOptions", max_thinking_tokens: Optional[int]) -> None:
+    """Set the CLI thinking budget on the SUBPROCESS env of this run only.
+
+    The Claude Code CLI thinks by default and the SDK path has no max_tokens;
+    without a budget a one-word answer cost 7018 completion tokens (2026-09-24).
+    options.env, not os.environ: concurrent requests on this worker must not
+    see each other's budget. None leaves the CLI default untouched."""
+    if max_thinking_tokens is None:
+        return
+    budget = int(max_thinking_tokens)
+    options.env = {**(options.env or {}), "MAX_THINKING_TOKENS": str(budget)}
+    logger.info(f"🧠 MAX_THINKING_TOKENS={budget} for this CLI run")
+
+
 def _sanitize_seed_filename(raw_name: str) -> str:
     """
     Sanitize a caller-provided seed filename to a safe basename.
@@ -1079,7 +1093,8 @@ class ClaudeCodeCLI:
         enable_file_discovery: bool = False,
         backend_env_vars: Optional[Dict[str, str]] = None,
         seed_files: Optional[Dict[str, str]] = None,
-        seed_links: Optional[Dict[str, Dict[str, str]]] = None
+        seed_links: Optional[Dict[str, Dict[str, str]]] = None,
+        max_thinking_tokens: Optional[int] = None
     ) -> AsyncGenerator[Dict[str, Any], None]:
         """Run Claude Code using the Python SDK and yield response chunks.
 
@@ -1423,6 +1438,12 @@ class ClaudeCodeCLI:
                     cwd=research_cwd
                 )
                 options.mcp_servers = {}
+
+                # Thinking budget: the CLI thinks by default and ignores the
+                # request's max_tokens. Set it on the SUBPROCESS env (options.env),
+                # not os.environ — concurrent requests on this worker must not
+                # see each other's budget.
+                apply_thinking_budget(options, max_thinking_tokens)
 
                 # Set permission mode if specified via environment variable
                 permission_mode = os.getenv("CLAUDE_PERMISSION_MODE")
