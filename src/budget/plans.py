@@ -52,6 +52,55 @@ async def reload_plans() -> int:
     return len(PLANS)
 
 
+
+async def reload_plans_from_platform() -> int:
+    """
+    Load the plan catalog over platform-api — for a worker WITHOUT BRIDGE_DB_URL.
+
+    Befund 24.09.2026 (prod): the four prod workers run without BRIDGE_DB_URL,
+    main.lifespan loaded the catalog only in its DB branch, PLANS stayed empty,
+    and _deduct_call_cost ended EVERY call with "app not in the plan catalog"
+    — no POST /v1/budget/deduct ever left a worker, for any app.
+
+    Source is GET /v1/billing/plans on platform-api (served from ITS PLANS,
+    loaded from the plans table, is_active rows only). Same fail-loud contract
+    as reload_plans(): an empty or malformed answer raises and leaves PLANS
+    untouched — a worker that cannot meter must not start serving.
+    """
+    from src.platform_client import call_platform
+
+    resp = await call_platform("GET", "/v1/billing/plans", retries=3, timeout_s=5.0)
+    rows = resp.json.get("plans") if isinstance(resp.json, dict) else None
+    if resp.status_code != 200 or not isinstance(rows, list):
+        raise RuntimeError(
+            f"[PlanManager] plan catalog via platform-api unusable: "
+            f"status={resp.status_code} body={str(resp.json)[:200]!r}"
+        )
+    new_plans: dict[str, PlanConfig] = {}
+    for row in rows:
+        try:
+            new_plans[row["id"]] = PlanConfig(
+                id=row["id"],
+                app_id=row["appId"],
+                name=row["name"],
+                price=float(row["priceEur"]),
+                interval=row["interval"],
+                api_budget_eur=float(row["apiBudgetEur"]),
+                description=row.get("description") or "",
+                trial=bool(row.get("trial", False)),
+            )
+        except (KeyError, TypeError, ValueError) as e:
+            raise RuntimeError(f"[PlanManager] malformed plan row from platform-api: {row!r}: {e}") from e
+    if not new_plans:
+        raise RuntimeError(
+            "[PlanManager] platform-api returned an EMPTY plan catalog — refusing to "
+            "serve un-metered traffic."
+        )
+    PLANS.clear()
+    PLANS.update(new_plans)
+    assert_catalog_is_unambiguous()
+    return len(PLANS)
+
 def get_plan(plan_id: str) -> PlanConfig:
     plan = PLANS.get(plan_id)
     if not plan:

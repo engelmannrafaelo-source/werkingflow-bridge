@@ -46,8 +46,16 @@ def _warnungen(caplog) -> list:
 
 @pytest.mark.asyncio
 async def test_kein_plan_im_katalog_ist_eine_warnung(caplog):
+    # Katalog GELADEN, nur diese App fehlt darin → WARNING "no_plan".
+    # (Leerer Katalog ist ein kaputter Worker → ERROR "catalog_empty",
+    # siehe tests/budget/test_katalog_ohne_db.py.)
+    from src.budget import plans
+
     caplog.set_level(logging.DEBUG)
-    with patch("src.budget.plan_resolution.resolve_billing_plan", new=AsyncMock(return_value=None)):
+    with (
+        patch.dict(plans.PLANS, {"andere": _monatsplan()}, clear=True),
+        patch("src.budget.plan_resolution.resolve_billing_plan", new=AsyncMock(return_value=None)),
+    ):
         erledigt = await _writer()._deduct_call_cost(
             USER, "werking-report", 0.037633, call_uid="call-ohne-plan")
 

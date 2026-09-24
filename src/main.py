@@ -713,6 +713,20 @@ async def lifespan(app: FastAPI):
             asyncio.create_task(ledger_spool.flusher_loop())
             logger.info("🧾 Ledger spool flusher started")
 
+    # No BRIDGE_DB_URL (the prod workers since ADR-0009): the catalog comes
+    # from platform-api. Befund 24.09.2026: this branch did not exist, PLANS
+    # stayed empty and every post-call deduction ended silently as "not in the
+    # plan catalog" — for every app on the prod workers. Same fail-fast rule
+    # as the DB branch: a worker that cannot meter must not serve.
+    if not (BRIDGE_DB_CLIENT_AVAILABLE and is_db_enabled()):
+        from src.budget.plans import reload_plans_from_platform
+        try:
+            count = await reload_plans_from_platform()
+            logger.info(f"✅ Worker plan catalog loaded via platform-api: {count} active plans (budget deduction)")
+        except Exception as e:
+            logger.error(f"❌ Worker plan catalog load via platform-api failed — refusing to start: {e}")
+            raise
+
     yield
 
     # Cleanup on shutdown

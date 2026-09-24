@@ -126,6 +126,7 @@ def _abzug_nicht_gebucht(
     workflow_id: Optional[str] = None,
     tenant_id: Optional[str] = None,
     call_uid: Optional[str] = None,
+    level: int = logging.WARNING,
 ) -> None:
     """Every exit of _deduct_call_cost that leaves a PAID call unbooked goes
     through here — one WARNING, one fixed prefix, all fields.
@@ -136,7 +137,8 @@ def _abzug_nicht_gebucht(
     invisible in a production log. A call that ran and was paid for by nobody
     must be findable with one grep: "post-call deduction NOT APPLIED".
     """
-    logger.warning(
+    logger.log(
+        level,
         "post-call deduction NOT APPLIED reason=%s app=%s user=%s plan=%s "
         "amount_eur=%.6f workflow=%s tenant=%s call=%s — this call is NOT "
         "metered against any budget",
@@ -222,11 +224,15 @@ async def _deduct_call_cost(
         # nobody writes to. See src/budget/plan_resolution.py.
         plan = await resolve_billing_plan(app_id, uid, workflow_id)
         if plan is None:
-            # Was DEBUG — invisible in a prod log (Befund 24.09.2026).
+            # Was DEBUG — invisible in a prod log (Befund 24.09.2026). An EMPTY
+            # catalog is not "this app is not billed" but a broken worker: every
+            # call of every app goes unbilled → ERROR, not WARNING.
+            from src.budget.plans import PLANS as _PLANS
             _abzug_nicht_gebucht(
-                "no_plan", user_id=user_id, app_id=app_id,
+                "no_plan" if _PLANS else "catalog_empty", user_id=user_id, app_id=app_id,
                 cost_eur_amount=cost_eur_amount, workflow_id=workflow_id,
                 tenant_id=tenant_id, call_uid=call_uid,
+                level=logging.WARNING if _PLANS else logging.ERROR,
             )
             return True  # app not in the plan catalog — not budget-tracked
 
