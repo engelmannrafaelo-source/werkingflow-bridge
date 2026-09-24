@@ -1,11 +1,18 @@
+FROM node:24.21.0-bookworm-slim AS node-runtime
 FROM python:3.12-slim
 
-# System deps: Node.js + gosu + WeasyPrint Cairo/Pango stack (NO libgl1/libglib for Docling).
+# Claude Code 2.1.280 requires Node >=22. Pin the current LTS runtime
+# instead of Debian's older nodejs package.
+COPY --from=node-runtime /usr/local/bin/node /usr/local/bin/node
+COPY --from=node-runtime /usr/local/lib/node_modules /usr/local/lib/node_modules
+RUN ln -s ../lib/node_modules/npm/bin/npm-cli.js /usr/local/bin/npm && \
+    ln -s ../lib/node_modules/npm/bin/npx-cli.js /usr/local/bin/npx
+
+# System deps: gosu + WeasyPrint Cairo/Pango stack (NO libgl1/libglib for Docling).
 # WeasyPrint (invoice PDF) is a non-optional dep — worker serves invoice endpoints too.
 RUN apt-get update && apt-get install -y \
     curl \
-    nodejs \
-    npm \
+    libstdc++6 \
     gosu \
     libpango-1.0-0 \
     libpangoft2-1.0-0 \
