@@ -116,6 +116,35 @@ def resolve_ledger_cost(
     return "flat_rate_estimated", call_cost_eur if provider in REAL_COST_PROVIDERS else 0.0
 
 
+def _abzug_nicht_gebucht(
+    grund: str,
+    *,
+    user_id: str,
+    app_id: str,
+    cost_eur_amount: float,
+    plan_id: Optional[str] = None,
+    workflow_id: Optional[str] = None,
+    tenant_id: Optional[str] = None,
+    call_uid: Optional[str] = None,
+) -> None:
+    """Every exit of _deduct_call_cost that leaves a PAID call unbooked goes
+    through here — one WARNING, one fixed prefix, all fields.
+
+    Befund 24.09.2026: werking-report calls on prod left 0 rows in
+    budget_deductions, and it was not determinable which exit had fired —
+    "not in the plan catalog" logged at DEBUG and "denied" at INFO, both
+    invisible in a production log. A call that ran and was paid for by nobody
+    must be findable with one grep: "post-call deduction NOT APPLIED".
+    """
+    logger.warning(
+        "post-call deduction NOT APPLIED reason=%s app=%s user=%s plan=%s "
+        "amount_eur=%.6f workflow=%s tenant=%s call=%s — this call is NOT "
+        "metered against any budget",
+        grund, app_id, user_id, plan_id, cost_eur_amount, workflow_id,
+        tenant_id, call_uid,
+    )
+
+
 async def _deduct_call_cost(
     user_id: str,
     app_id: str,
@@ -181,9 +210,10 @@ async def _deduct_call_cost(
         try:
             uid = _uuid.UUID(user_id)
         except (ValueError, AttributeError, TypeError):
-            logger.warning(
-                "post-call deduction: user=%r is not a UUID (app=%s) — "
-                "call NOT metered against any budget", user_id, app_id,
+            _abzug_nicht_gebucht(
+                "user_not_uuid", user_id=repr(user_id), app_id=app_id,
+                cost_eur_amount=cost_eur_amount, workflow_id=workflow_id,
+                tenant_id=tenant_id, call_uid=call_uid,
             )
             return True
 
@@ -192,9 +222,11 @@ async def _deduct_call_cost(
         # nobody writes to. See src/budget/plan_resolution.py.
         plan = await resolve_billing_plan(app_id, uid, workflow_id)
         if plan is None:
-            logger.debug(
-                "post-call deduction: app=%s not in the plan catalog — "
-                "not budget-tracked, no deduction for this call", app_id,
+            # Was DEBUG — invisible in a prod log (Befund 24.09.2026).
+            _abzug_nicht_gebucht(
+                "no_plan", user_id=user_id, app_id=app_id,
+                cost_eur_amount=cost_eur_amount, workflow_id=workflow_id,
+                tenant_id=tenant_id, call_uid=call_uid,
             )
             return True  # app not in the plan catalog — not budget-tracked
 
@@ -202,10 +234,10 @@ async def _deduct_call_cost(
             # Project plans are fully per-project; they never fall through to the
             # monthly budget (a real project customer may have no monthly budget).
             if not workflow_id:
-                logger.warning(
-                    "post-call deduction: project plan %s call without workflow_id "
-                    "for user=%s — cannot attribute to a project budget, skipping",
-                    plan.id, user_id,
+                _abzug_nicht_gebucht(
+                    "project_without_workflow_id", user_id=user_id, app_id=app_id,
+                    cost_eur_amount=cost_eur_amount, plan_id=plan.id,
+                    tenant_id=tenant_id, call_uid=call_uid,
                 )
                 return True
             from src.billing.project_budgets_service import (
@@ -222,11 +254,10 @@ async def _deduct_call_cost(
                 idempotency_key=call_uid,
             )
             if not result.get("exists"):
-                logger.warning(
-                    "post-call deduction: could not resolve/allocate per-project "
-                    "budget for project=%s plan=%s user=%s (tenant_id=%r) — call "
-                    "NOT metered against any budget",
-                    workflow_id, plan.id, user_id, tenant_id,
+                _abzug_nicht_gebucht(
+                    "project_budget_unresolved", user_id=user_id, app_id=app_id,
+                    cost_eur_amount=cost_eur_amount, plan_id=plan.id,
+                    workflow_id=workflow_id, tenant_id=tenant_id, call_uid=call_uid,
                 )
             return True
 
@@ -261,9 +292,11 @@ async def _deduct_call_cost(
             # The call already happened (the gate ran pre-call). A denial
             # here only means the running tally could not fully absorb the
             # cost — the activity row remains the authoritative usage record.
-            logger.info(
-                "post-call deduction denied (%s) user=%s app=%s",
-                denied.reason, user_id, app_id,
+            # Was INFO — invisible in a prod log (Befund 24.09.2026).
+            _abzug_nicht_gebucht(
+                f"denied:{denied.reason}", user_id=user_id, app_id=app_id,
+                cost_eur_amount=cost_eur_amount, plan_id=plan.id,
+                workflow_id=workflow_id, tenant_id=tenant_id, call_uid=call_uid,
             )
         return True
     except _PLAN_RESOLUTION_ERRORS:
