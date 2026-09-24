@@ -123,3 +123,57 @@ async def test_abzug_bei_leerem_katalog_ist_ein_error(leerer_katalog, caplog):
               if r.levelno >= logging.ERROR and "post-call deduction NOT APPLIED" in r.getMessage()]
     assert len(fehler) == 1, [(r.levelname, r.getMessage()) for r in caplog.records]
     assert "catalog_empty" in fehler[0].getMessage()
+
+
+# ── (b) Gegenpruefung Haus Dev 24.09.: Mapping gegen die ECHTEN Felder ─────────
+
+# Live gelesen 24.09.2026 von GET /v1/billing/plans (Dev-Bridge), eine Zeile
+# unveraendert: camelCase, KEIN is_active (die Route liefert nur aktive Plaene,
+# weil platform-api PLANS nur aus is_active=TRUE-Zeilen fuellt).
+LIVE_ZEILE = {"id": "report-standard", "appId": "werking-report", "name": "Standard",
+              "priceEur": 300.0, "interval": "month", "apiBudgetEur": 100.0,
+              "description": "Voller Funktionsumfang ohne Einschränkungen. KI-Budget inklusive, "
+                             "weitere Sitze zum selben Preis.", "trial": False}
+
+
+@pytest.mark.asyncio
+async def test_live_zeile_wird_feldgenau_uebernommen(leerer_katalog):
+    from src.budget.plans import PlanConfig
+    from src.platform_client import PlatformResponse
+
+    with patch("src.platform_client.call_platform",
+               new=AsyncMock(return_value=PlatformResponse(status_code=200, json={"plans": [LIVE_ZEILE]}))):
+        await leerer_katalog.reload_plans_from_platform()
+
+    assert leerer_katalog.PLANS == {"report-standard": PlanConfig(
+        id="report-standard", app_id="werking-report", name="Standard", price=300.0,
+        interval="month", api_budget_eur=100.0, description=LIVE_ZEILE["description"], trial=False)}
+
+
+@pytest.mark.asyncio
+async def test_rundlauf_list_plans_zu_reload_ist_verlustfrei(leerer_katalog):
+    """Der Serialisierer der Route (billing.routes.list_plans) und der Parser des
+    Workers duerfen nicht auseinanderlaufen: jeder Plan kommt feldgleich zurueck."""
+    from src.billing.routes import list_plans
+    from src.budget.plans import PlanConfig
+    from src.platform_client import PlatformResponse
+
+    original = {
+        "trial": PlanConfig(id="trial", app_id="werking-report", name="Trial", price=0.0,
+                            interval="month", api_budget_eur=5.0, description="t", trial=True),
+        "report-standard": PlanConfig(id="report-standard", app_id="werking-report", name="S",
+                                      price=300.0, interval="month", api_budget_eur=100.0,
+                                      description="s", trial=False),
+        "energy-project": PlanConfig(id="energy-project", app_id="werking-energy", name="P",
+                                     price=290.0, interval="project", api_budget_eur=100.0,
+                                     description="", trial=False),
+    }
+    leerer_katalog.PLANS.update(original)
+    antwort = await list_plans()          # was platform-api wirklich sendet
+    leerer_katalog.PLANS.clear()
+
+    with patch("src.platform_client.call_platform",
+               new=AsyncMock(return_value=PlatformResponse(status_code=200, json=antwort))):
+        await leerer_katalog.reload_plans_from_platform()
+
+    assert leerer_katalog.PLANS == original

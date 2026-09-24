@@ -727,6 +727,22 @@ async def lifespan(app: FastAPI):
             logger.error(f"❌ Worker plan catalog load via platform-api failed — refusing to start: {e}")
             raise
 
+        # Same block, same gap (Gegenpruefung Haus Dev 24.09.): the app_id
+        # registry was only loaded in the DB branch, so on the prod workers
+        # app_id validation was silently OFF ("Worker app registry loaded"
+        # never appeared). load_known_app_ids already knows the DB-free
+        # source (platform-api) and raises on failure — it just never ran.
+        from src.activity.app_registry import load_known_app_ids
+        try:
+            apps = await load_known_app_ids()
+            logger.info(
+                f"✅ Worker app registry loaded via platform-api: "
+                f"{len(apps) if apps is not None else 0} app_id enum members"
+            )
+        except Exception as e:
+            logger.error(f"❌ Worker app registry load via platform-api failed — refusing to start: {e}")
+            raise
+
     yield
 
     # Cleanup on shutdown
