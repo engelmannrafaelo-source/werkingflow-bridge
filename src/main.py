@@ -3,7 +3,6 @@ import json
 import asyncio
 import secrets
 import string
-import re
 import time
 import uuid
 import subprocess
@@ -302,14 +301,16 @@ claude_cli = ClaudeCodeCLI(
 
 async def cleanup_old_sessions():
     """
-    Background task to cleanup sessions older than 24h
+    Background task: delete per-session directories (prompt.txt, messages.jsonl,
+    final_response.json, metadata.json) older than 24h.
 
-    This task runs indefinitely and never crashes the app.
-    All errors are logged but don't propagate.
-
-    Scans all instance directories for temp/sessions folders.
+    Never crashes the app; errors are logged. The scan itself lives in
+    src/session_cleanup.py (covers the actual layout INSTANCES_DIR/<session>
+    that the previous inline version missed, so nothing was ever deleted).
+    SESSION_CLEANUP_DISABLED=true turns every cycle into a loud no-op.
     """
-    # Use environment variable with Docker-friendly default
+    from src.session_cleanup import cleanup_disabled, sweep_expired_sessions
+
     INSTANCES_DIR = Path(os.getenv("INSTANCES_DIR", "/app/instances"))
     RETENTION_HOURS = 24
     CHECK_INTERVAL_SECONDS = 3600  # 1 hour
@@ -319,154 +320,20 @@ async def cleanup_old_sessions():
 
     while True:
         try:
-            cutoff = datetime.now() - timedelta(hours=RETENTION_HOURS)
-            total_cleaned = 0
-            total_failed = 0
-
-            # Scan all instance directories
-            if not INSTANCES_DIR.exists():
-                logger.warning(f"⚠️  Instances directory not found: {INSTANCES_DIR}")
-                await asyncio.sleep(CHECK_INTERVAL_SECONDS)
-                continue
-
-            try:
-                instance_dirs = [d for d in INSTANCES_DIR.iterdir() if d.is_dir()]
-            except OSError as e:
-                logger.error(f"❌ Failed to list instances directory: {INSTANCES_DIR}",
-                             exc_info=True,
-                             extra={"path": str(INSTANCES_DIR)})
-                await asyncio.sleep(CHECK_INTERVAL_SECONDS)
-                continue
-
-            # Check each instance's temp/sessions directory AND research_dir directories
-            for instance_dir in instance_dirs:
-                cleaned = 0
-                failed = 0
-
-                # Strategy 1: Cleanup temp/sessions (legacy progress tracking)
-                sessions_dir = instance_dir / "temp" / "sessions"
-                session_dirs = []
-
-                if sessions_dir.exists():
-                    try:
-                        session_dirs.extend(list(sessions_dir.iterdir()))
-                    except OSError as e:
-                        logger.error(f"❌ Failed to list temp/sessions in instance {instance_dir.name}",
-                                     exc_info=True,
-                                     extra={"path": str(sessions_dir)})
-
-                # Strategy 2: Cleanup research_dir directories (YYYY-MM-DD-HHMM_{uuid})
-                # Pattern: 2025-10-31-1706_fd2862f5-502b-4318-871c-9ea28ccf3456
-                research_dir_pattern = re.compile(r'^\d{4}-\d{2}-\d{2}-\d{4}_[a-f0-9-]{36}$')
-
-                try:
-                    for item in instance_dir.iterdir():
-                        if item.is_dir() and research_dir_pattern.match(item.name):
-                            session_dirs.append(item)
-                except OSError as e:
-                    logger.error(f"❌ Failed to list research_dirs in instance {instance_dir.name}",
-                                 exc_info=True,
-                                 extra={"path": str(instance_dir)})
-
-                if len(session_dirs) == 0:
-                    logger.debug(f"🔍 No sessions to cleanup in instance: {instance_dir.name}")
-                    continue
-
-                # Iterate all session directories in this instance (both temp/sessions and research_dir)
-
-                for session_dir in session_dirs:
-                    if not session_dir.is_dir():
-                        continue
-
-                    metadata_file = session_dir / "metadata.json"
-                    if not metadata_file.exists():
-                        logger.debug(f"🔍 No metadata in session: {session_dir.name}")
-                        continue
-
-                    try:
-                        # Read and parse metadata
-                        metadata_text = metadata_file.read_text()
-                        metadata = json.loads(metadata_text)
-
-                        # Determine session timestamp (prefer completed_at, fallback to created_at)
-                        timestamp_str = metadata.get('completed_at') or metadata.get('created_at')
-                        if not timestamp_str:
-                            logger.warning(f"⚠️  No timestamp in metadata: {session_dir.name}",
-                                           extra={"session_id": session_dir.name})
-                            continue
-
-                        # Parse timestamp and check age
-                        timestamp = datetime.fromisoformat(timestamp_str)
-                        age = datetime.now() - timestamp
-
-                        if timestamp < cutoff:
-                            # Session is old enough to delete
-                            # Security: Validate path is actually under INSTANCES_DIR (no symlink escape)
-                            real_session_path = Path(os.path.realpath(session_dir))
-                            real_instances_path = Path(os.path.realpath(INSTANCES_DIR))
-
-                            if not str(real_session_path).startswith(str(real_instances_path)):
-                                logger.error(f"❌ Security: Session path escapes instances dir (symlink?): {session_dir}",
-                                             extra={"session_dir": str(session_dir), "real_path": str(real_session_path)})
-                                continue
-
-                            try:
-                                shutil.rmtree(session_dir)
-                                cleaned += 1
-                                total_cleaned += 1
-                                logger.info(f"🧹 Cleaned up session: {session_dir.name} [{instance_dir.name}]",
-                                            extra={
-                                                "session_id": session_dir.name,
-                                                "instance": instance_dir.name,
-                                                "age_hours": age.total_seconds() / 3600
-                                            })
-                            except OSError as e:
-                                failed += 1
-                                total_failed += 1
-                                logger.error(f"❌ Failed to delete session directory: {session_dir.name}",
-                                             exc_info=True,
-                                             extra={
-                                                 "session_id": session_dir.name,
-                                                 "instance": instance_dir.name,
-                                                 "path": str(session_dir)
-                                             })
-
-                    except json.JSONDecodeError as e:
-                        logger.error(f"❌ Invalid JSON in metadata: {metadata_file}",
-                                     exc_info=True,
-                                     extra={"session_id": session_dir.name, "instance": instance_dir.name, "filepath": str(metadata_file)})
-                        continue
-
-                    except (ValueError, TypeError) as e:
-                        logger.error(f"❌ Invalid timestamp in metadata: {session_dir.name}",
-                                     exc_info=True,
-                                     extra={"session_id": session_dir.name, "instance": instance_dir.name, "timestamp": timestamp_str})
-                        continue
-
-                    except OSError as e:
-                        logger.error(f"❌ Failed to read metadata: {metadata_file}",
-                                     exc_info=True,
-                                     extra={"session_id": session_dir.name, "instance": instance_dir.name, "filepath": str(metadata_file)})
-                        continue
-
-                # Log cleanup summary for this instance
-                if cleaned > 0 or failed > 0:
-                    logger.info(f"✅ Cleanup cycle for {instance_dir.name}",
+            if cleanup_disabled():
+                logger.warning("⚠️  Session cleanup DISABLED (SESSION_CLEANUP_DISABLED) — "
+                               f"session directories under {INSTANCES_DIR} are kept indefinitely")
+            else:
+                cutoff = datetime.now() - timedelta(hours=RETENTION_HOURS)
+                result = await asyncio.to_thread(sweep_expired_sessions, INSTANCES_DIR, cutoff)
+                if result.cleaned or result.failed:
+                    logger.info("✅ Session cleanup cycle complete",
                                 extra={
-                                    "instance": instance_dir.name,
-                                    "cleaned": cleaned,
-                                    "failed": failed
+                                    "total_cleaned": result.cleaned,
+                                    "total_failed": result.failed,
+                                    "skipped": result.skipped,
+                                    "retention_hours": RETENTION_HOURS,
                                 })
-
-            # Log total cleanup summary
-            if total_cleaned > 0 or total_failed > 0:
-                logger.info(f"✅ Total cleanup cycle complete",
-                            extra={
-                                "total_cleaned": total_cleaned,
-                                "total_failed": total_failed,
-                                "retention_hours": RETENTION_HOURS
-                            })
-
         except Exception as e:
             # Catch-all for unexpected errors - log but never crash
             logger.error(f"❌ Unexpected error in cleanup task",
