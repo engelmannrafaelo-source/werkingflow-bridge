@@ -57,6 +57,7 @@ from src.claude_cli import (
     RateLimitError,
     rate_limit_tracker,
     extract_result_usage,
+    warn_if_continuation_leak,
 )
 from src.middleware.bridge_error import SDKDisconnectError
 from src.message_adapter import MessageAdapter
@@ -1559,6 +1560,20 @@ async def generate_streaming_response(
         # Handle X-Claude-File-Discovery header (opt-in file discovery)
         handle_file_discovery_header(request_headers, prompt, claude_options)
 
+        # Fail loud (never silent) if the CLI's continuation instruction shows
+        # up in content we are about to stream — see claude_cli.is_user_turn.
+        _leak_attr = extract_attribution_context(fastapi_request) if fastapi_request else {}
+
+        def _warn_continuation_leak_streaming(text):
+            warn_if_continuation_leak(
+                text,
+                where="chat_stream",
+                request_id=request_id,
+                app=_leak_attr.get("app_id"),
+                job=_leak_attr.get("job_id"),
+                agent=_leak_attr.get("agent_id"),
+            )
+
         # Run Claude Code
         chunks_buffer = []
         role_sent = False  # Track if we've sent the initial role chunk
@@ -1710,6 +1725,7 @@ async def generate_streaming_response(
                             
                             # Filter out tool usage and thinking blocks
                             filtered_text = MessageAdapter.filter_content(raw_text)
+                            _warn_continuation_leak_streaming(filtered_text)
 
                             # Privacy: De-anonymize chunk with buffering (handles split placeholders)
                             if anonymization_mapping and filtered_text:
@@ -1735,6 +1751,7 @@ async def generate_streaming_response(
                     elif isinstance(content, str):
                         # Filter out tool usage and thinking blocks
                         filtered_content = MessageAdapter.filter_content(content)
+                        _warn_continuation_leak_streaming(filtered_content)
 
                         # Privacy: De-anonymize chunk with buffering (handles split placeholders)
                         if anonymization_mapping and filtered_content:
@@ -3717,6 +3734,15 @@ async def chat_completions(
             
             # Filter out tool usage and thinking blocks
             assistant_content = MessageAdapter.filter_content(raw_assistant_content)
+            _ns_attr = extract_attribution_context(request)
+            warn_if_continuation_leak(
+                assistant_content,
+                where="chat_nonstream",
+                request_id=request_id,
+                app=_ns_attr.get("app_id"),
+                job=_ns_attr.get("job_id"),
+                agent=_ns_attr.get("agent_id"),
+            )
 
             # Tool-leak guard: when tools are disallowed and max_turns=1, Claude can
             # emit a pre-tool-use intro ("I'll write…") whose subsequent tool call is

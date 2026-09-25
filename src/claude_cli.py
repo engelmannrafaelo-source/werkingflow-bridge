@@ -624,6 +624,68 @@ def _handle_rate_limit_event(message, worker_id):
     return None
 
 
+# =============================================================================
+# ONLY ASSISTANT TURNS ARE CONTENT
+#
+# Claude Code recovers from a max_output_tokens stop on its own: it appends a
+# META user turn ("Output token limit hit. Resume directly — no apology, no
+# recap …", CLI 2.1.28x) and lets the model continue. In stream-json that turn
+# arrives as {"type": "user"} → SDK UserMessage(content=[TextBlock(...)]).
+# run_completion used to turn every SDK dataclass into an attribute dict
+# WITHOUT its type, so a UserMessage became {"content": [TextBlock]} — the
+# exact shape every consumer (streaming delta, parse_claude_message, doc-agent,
+# research) reads as assistant text. Result: the CLI's instruction landed in a
+# customer report (werking-energy, Mühl, 24.09.2026). Tool results are
+# UserMessages too; they only stayed invisible because ToolResultBlock has no
+# `.text`.
+#
+# Rule: user/meta turns are never yielded to callers. If the continuation
+# sentence still shows up in assistant text, that is logged as WARNING
+# (warn_if_continuation_leak) — never silently passed or rewritten.
+# =============================================================================
+
+CLI_CONTINUATION_SENTENCE = "Output token limit hit. Resume directly"
+
+
+def is_user_turn(message: Any) -> bool:
+    """True for SDK user/meta turns (UserMessage dataclass or its dict form)."""
+    if message is None:
+        return False
+    if type(message).__name__ == "UserMessage":
+        return True
+    return isinstance(message, dict) and message.get("type") == "user"
+
+
+def _message_text(message: Any) -> str:
+    """All text blocks of a message (dataclass or dict shape), joined."""
+    content = message.get("content") if isinstance(message, dict) else getattr(message, "content", None)
+    if isinstance(content, str):
+        return content
+    parts = []
+    for block in content or []:
+        text = block.get("text") if isinstance(block, dict) else getattr(block, "text", None)
+        if isinstance(text, str):
+            parts.append(text)
+    return "\n".join(parts)
+
+
+def warn_if_continuation_leak(text: Optional[str], *, where: str, **context: Any) -> bool:
+    """Fail loud if the CLI's continuation instruction is in assistant output.
+
+    Returns True when found. Does NOT alter the text — the caller's content is
+    not ours to rewrite; the WARNING is the alarm (with app/job for triage).
+    """
+    if not text or CLI_CONTINUATION_SENTENCE not in text:
+        return False
+    ctx = " ".join(f"{k}={v}" for k, v in context.items())
+    logger.warning(
+        f"⚠️ CLI continuation instruction found in assistant content ({where}) {ctx} — "
+        f"'{CLI_CONTINUATION_SENTENCE}…' must never reach a client",
+        extra={"continuation_leak": True, "where": where, **context},
+    )
+    return True
+
+
 def chunks_have_tool_use(chunks: list) -> bool:
     """True if any chunk contains a tool_use content block.
 
@@ -1719,6 +1781,28 @@ class ClaudeCodeCLI:
                                     # Track tool usage
                                     if progress['type'] == 'tool_use':
                                         tools_used.add(progress['data']['tool'])
+
+                            # User/meta turns (tool results, the CLI's own
+                            # max_output_tokens continuation instruction) are
+                            # NOT content. Withhold them BEFORE the dict
+                            # conversion below erases their type — afterwards
+                            # every consumer reads {"content": [...]} as
+                            # assistant text. Still counted + in messages.jsonl.
+                            if is_user_turn(message):
+                                if CLI_CONTINUATION_SENTENCE in _message_text(message):
+                                    logger.info(
+                                        f"🧩 CLI auto-continuation (max_output_tokens) in session "
+                                        f"{cli_session_id} — meta user turn withheld from content stream",
+                                        extra={"cli_session_id": cli_session_id},
+                                    )
+                                continue
+
+                            if type(message).__name__ == 'AssistantMessage':
+                                warn_if_continuation_leak(
+                                    _message_text(message),
+                                    where="run_completion",
+                                    cli_session_id=cli_session_id,
+                                )
 
                             # Convert message object to dict if needed
                             if hasattr(message, '__dict__') and not isinstance(message, dict):
