@@ -62,7 +62,20 @@ try:
     def _resilient_parse_message(data):
         """Wrapper that handles unknown message types instead of crashing."""
         try:
-            return _original_parse_message(data)
+            parsed = _original_parse_message(data)
+            # Carry the CLI's structured assistant error (e.g.
+            # "oauth_org_not_allowed") that the SDK dataclass drops.
+            if (
+                parsed is not None
+                and isinstance(data, dict)
+                and data.get("type") == "assistant"
+                and data.get("error")
+            ):
+                try:
+                    setattr(parsed, "_bridge_cli_error", data.get("error"))
+                except Exception as attr_err:
+                    logger.error(f"could not tag assistant message with CLI error: {attr_err}")
+            return parsed
         except MessageParseError as e:
             error_msg = str(e).lower()
             if "unknown message type" in error_msg:
@@ -294,6 +307,135 @@ def detect_quota_exhaustion(content_text: str) -> bool:
     rather than API errors (e.g. weekly-cap reached, context exhausted).
     """
     return bool(_QUOTA_EXHAUSTION_RE.search(content_text))
+
+
+# =============================================================================
+# ORGANIZATION DISABLED CLAUDE SUBSCRIPTION ACCESS — fail loud, take worker out
+#
+# Measured 2026-09-28 on worker-sahori (prod): the account's organization had
+# disabled subscription access for Claude Code. The CLI does not fail — it
+# emits a synthetic assistant turn "Your organization has disabled Claude
+# subscription access for Claude Code · Use an Anthropic API key instead ..."
+# plus a result chunk, and the bridge passed that sentence on as a normal
+# HTTP 200 completion. /health stayed green, the pool router kept sending ~1/4
+# of the traffic there, and nginx never retried (a 200 is not an error).
+#
+# Structured signal (preferred): CLI 2.1.28x tags the synthetic assistant
+# message with top-level `"error": "oauth_org_not_allowed"` in stream-json.
+# claude-code-sdk 0.0.2x drops unknown fields when it builds AssistantMessage,
+# so _resilient_parse_message copies it onto the dataclass as
+# `_bridge_cli_error`. Text match is the second net (older/newer CLIs, dict
+# chunks) — restricted to SHORT texts like detect_in_text, so a model writing
+# ABOUT this error in a long answer does not park the worker.
+# =============================================================================
+ORG_DISABLED_CLI_ERROR = "oauth_org_not_allowed"
+ORG_DISABLED_LOCK_REASON = "org_subscription_disabled"
+ORG_DISABLED_ERROR_CODE = "account_org_disabled"
+ORG_DISABLED_PHRASE = "organization has disabled claude subscription access"
+ORG_DISABLED_TEXT_MAX_LEN = 1500
+
+
+def _parse_org_disabled_lock_seconds() -> int:
+    """BRIDGE_ORG_DISABLED_LOCK_S (default 3600). Invalid value = startup error,
+    never a silent default: a typo here would otherwise quietly change how long
+    a dead account stays out of the pool."""
+    raw = os.environ.get("BRIDGE_ORG_DISABLED_LOCK_S", "").strip()
+    if not raw:
+        return 3600
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise ValueError(
+            f"BRIDGE_ORG_DISABLED_LOCK_S must be a positive integer (seconds), got {raw!r}"
+        ) from exc
+    if value <= 0:
+        raise ValueError(
+            f"BRIDGE_ORG_DISABLED_LOCK_S must be > 0 seconds, got {value}"
+        )
+    return value
+
+
+ORG_DISABLED_LOCK_SECONDS = _parse_org_disabled_lock_seconds()
+
+
+class OrgSubscriptionDisabledError(WorkerUnavailableError):
+    """This worker's account cannot serve ANY request: its organization
+    disabled Claude subscription access for Claude Code.
+
+    Subclass of WorkerUnavailableError on purpose — every existing
+    `except WorkerUnavailableError: raise` in the route handlers then
+    propagates it instead of folding it into a generic 500/streaming_error.
+    main.py registers a dedicated handler (503 + code account_org_disabled),
+    which Starlette picks over the parent's 429 handler (MRO lookup).
+    """
+
+    def __init__(self, worker_id: str, signal: str, lock_seconds: int):
+        super().__init__(
+            f"[{worker_id}] organization disabled Claude subscription access "
+            f"for Claude Code (signal={signal}) — worker locked {lock_seconds}s"
+        )
+        self.worker_id = worker_id
+        self.signal = signal
+        self.lock_seconds = lock_seconds
+
+
+def detect_org_subscription_disabled(message: Any) -> Optional[str]:
+    """Return which signal flagged `message` as the org-disabled error, else None.
+
+    Signals, strongest first:
+      - "cli_error:oauth_org_not_allowed": structured `error` field of the
+        CLI's assistant message (dataclass attr `_bridge_cli_error` or dict key)
+      - "assistant_text": short assistant text containing the CLI sentence
+      - "result_text": result chunk with is_error and the sentence in `result`
+    User turns are never checked (they carry the caller's own prompt).
+    """
+    if message is None or is_user_turn(message):
+        return None
+
+    if isinstance(message, dict):
+        cli_error = message.get("error")
+    else:
+        cli_error = getattr(message, "_bridge_cli_error", None)
+    if cli_error == ORG_DISABLED_CLI_ERROR:
+        return f"cli_error:{ORG_DISABLED_CLI_ERROR}"
+
+    def _short_hit(text: Any) -> bool:
+        return (
+            isinstance(text, str)
+            and 0 < len(text) <= ORG_DISABLED_TEXT_MAX_LEN
+            and ORG_DISABLED_PHRASE in text.lower()
+        )
+
+    if _short_hit(_message_text(message)):
+        return "assistant_text"
+
+    is_error = message.get("is_error") if isinstance(message, dict) else getattr(message, "is_error", None)
+    result = message.get("result") if isinstance(message, dict) else getattr(message, "result", None)
+    if is_error and _short_hit(result):
+        return "result_text"
+    return None
+
+
+def handle_org_subscription_disabled(worker_id: str, signal: str) -> None:
+    """Log loudly, (re-)arm the capacity lock, raise OrgSubscriptionDisabledError.
+
+    The lock makes account-pool-state report available:false, so the Lua pool
+    router stops choosing this worker; the raise turns the request into a 503
+    that nginx retries on another worker. Re-armed on every hit, so the lock
+    lasts as long as the account keeps answering with the block.
+    """
+    lock_seconds = ORG_DISABLED_LOCK_SECONDS
+    logger.error(
+        f"🛑 ORG SUBSCRIPTION DISABLED on worker {worker_id}: the account's "
+        f"organization disabled Claude subscription access for Claude Code "
+        f"(signal={signal}). Locking worker for {lock_seconds}s and answering "
+        f"503 so nginx retries elsewhere. Operator action required: re-enable "
+        f"access for this account or replace its token.",
+        extra={"org_subscription_disabled": True, "worker_id": worker_id, "signal": signal},
+    )
+    from src.middleware.capacity_lock import get_capacity_lock as _get_cap_lock
+    _get_cap_lock().lock_until(worker_id, time.time() + lock_seconds, ORG_DISABLED_LOCK_REASON)
+    raise OrgSubscriptionDisabledError(worker_id, signal, lock_seconds)
 
 
 class RateLimitTracker:
@@ -1722,6 +1864,15 @@ class ClaudeCodeCLI:
                                 _handle_rate_limit_event(message, worker_id)
                                 continue
 
+                            # Org disabled subscription access: the CLI answers
+                            # with a normal-looking assistant turn. Never yield
+                            # it — lock the worker and raise (503 → nginx retry).
+                            _org_signal = detect_org_subscription_disabled(message)
+                            if _org_signal:
+                                handle_org_subscription_disabled(
+                                    os.environ.get("INSTANCE_NAME", "unknown"), _org_signal
+                                )
+
                             # Completion-marker detection MUST happen on the
                             # dataclass, BEFORE the attribute->dict conversion
                             # below: ResultMessage has no `.type` attribute, so
@@ -2259,6 +2410,13 @@ class ClaudeCodeCLI:
             # Client disconnected or session cancelled
             cli_session_manager.complete_session(cli_session_id, status="cancelled")
             logger.info(f"🚫 CLI session cancelled: {cli_session_id}")
+            raise
+
+        except OrgSubscriptionDisabledError:
+            # Already logged + locked in handle_org_subscription_disabled. Must
+            # bypass the generic classifier/cache-recovery below, which would
+            # otherwise re-yield the cached block sentence as content.
+            cli_session_manager.complete_session(cli_session_id, status="failed")
             raise
 
         except Exception as e:
