@@ -26,6 +26,7 @@ cannot let them be garbage-collected mid-flight (CPython asyncio gotcha).
 """
 import asyncio
 import logging
+import os
 from typing import Any, Awaitable, Callable, Dict, List, Optional
 
 from src.jobs import store_client
@@ -82,9 +83,14 @@ DEPENDENCY_MAX_DEFERS = 240
 # A 429 is not a failed job. It is a job whose turn has not come — exactly the
 # shape the dependency-deferral above already handles, so it uses the same
 # mechanism: park the row back to 'pending' with a wait, and let the watchdog
-# re-claim it. The re-claim is the failover the self-call cannot have: any
-# worker on this bridge may claim a stale row (claim_stale_job, FOR UPDATE SKIP
-# LOCKED), so the retry lands on a DIFFERENT account.
+# re-claim it once the wait is over (claim_stale_job claims a due deferred row
+# immediately — it does not also wait out the stale window).
+#
+# Since 29.09.2026 the park is the SECOND line: the executor first re-dispatches
+# the refused self-call once through this bridge's own LB (executors.
+# _post_with_capacity_redispatch, X-Bridge-Hop: 1 = local tier only), where
+# proxy_next_upstream finds a free sibling account within the same request.
+# Only when every local account refused does the 429 reach this runner.
 CAPACITY_RETRY_STATUS = 429
 # Floor/ceiling around the upstream's own Retry-After. The floor keeps a
 # 0-second hint from becoming a hot loop; the ceiling keeps a "come back in
@@ -96,7 +102,8 @@ CAPACITY_RETRY_DEFAULT_DELAY_S = 120
 
 
 async def _defer_job(
-    job_id: str, kind: str, reason: str, delay_s: int, what: str
+    job_id: str, kind: str, reason: str, delay_s: int, what: str,
+    rejected_by: Optional[str] = None,
 ) -> bool:
     """Park a job that must WAIT (dependency down, or no account capacity).
 
@@ -116,9 +123,13 @@ async def _defer_job(
         )
         return False
     await store_client.defer_job(job_id, delay_s, reason)
+    # ONE line per defer that names who refused (worker + account + reason)
+    # — "why did this 3 s job take 90 s" must be answerable from the log alone.
+    who = rejected_by or f"worker={os.getenv('INSTANCE_NAME', 'unknown')}"
     logger.warning(
         f"⏸️ Async job {job_id} (kind={kind}) deferred {delay_s}s "
-        f"(wait {deferred_so_far + 1}/{DEPENDENCY_MAX_DEFERS}) — {what}: {reason}"
+        f"(wait {deferred_so_far + 1}/{DEPENDENCY_MAX_DEFERS}) — {what} — "
+        f"rejected by: {who} — {reason[:200]}"
     )
     return True
 
@@ -244,14 +255,14 @@ async def _run_body(
             if deferred:
                 return
 
-        # Same shape, different cause: the pool had no capacity for the inner
-        # self-call. The self-call is pinned to this worker and therefore has no
-        # nginx failover, so the ONLY way onto another account is to be
-        # re-claimed by the watchdog — park it instead of burning it (see the
+        # Same shape, different cause: no account had capacity for the inner
+        # self-call — the executor already tried the local LB re-dispatch, so
+        # every local account refused. Park it instead of burning it (see the
         # CAPACITY_RETRY_* block above).
         if isinstance(e, ExecutorHTTPError) and e.status_code == CAPACITY_RETRY_STATUS:
             deferred = await _defer_job(
-                job_id, kind, str(e), _capacity_retry_delay(e), "no account capacity"
+                job_id, kind, str(e), _capacity_retry_delay(e), "no account capacity",
+                rejected_by=getattr(e, "rejection", None),
             )
             if deferred:
                 return
@@ -275,15 +286,7 @@ async def run_watchdog_pass(stale_seconds: int, max_attempts: int) -> Dict[str, 
       - atomically claim & requeue stale-but-retryable jobs (pending or running),
       - fail-loud the ones that exhausted their retry budget.
     Returns counts. Safe to run concurrently on every worker (atomic claim)."""
-    requeued = 0
-    while requeued < WATCHDOG_MAX_REQUEUE_PER_PASS:
-        job = await store_client.claim_stale_job(stale_seconds, max_attempts)
-        if job is None:
-            break
-        # Already claimed (status=running, attempts bumped) → run the body only.
-        spawn(_run_body(job["job_id"], job["kind"], job.get("payload") or {}, job.get("attribution")))
-        requeued += 1
-        logger.warning(f"♻️ Watchdog requeued stale job {job['job_id']} (attempt {job['attempts']})")
+    requeued = await run_claim_pass(stale_seconds, max_attempts)
 
     failed = 0
     for job in await store_client.find_abandoned(stale_seconds, max_attempts):
@@ -296,3 +299,28 @@ async def run_watchdog_pass(stale_seconds: int, max_attempts: int) -> Dict[str, 
         logger.error(f"💀 Watchdog failed-loud job {job['job_id']} (retries exhausted)")
 
     return {"requeued": requeued, "failed": failed}
+
+
+async def run_claim_pass(stale_seconds: int, max_attempts: int) -> int:
+    """Claim and start every claimable job: stale ones (dead worker) AND parked
+    ones whose deferred_until has passed (store.claim_stale_job decides which).
+    Returns how many were started. This is the cheap half of the watchdog —
+    main.py runs it on a short tick so a parked job restarts within seconds of
+    its wait ending, not only once the 90 s stale window has also passed."""
+    requeued = 0
+    while requeued < WATCHDOG_MAX_REQUEUE_PER_PASS:
+        job = await store_client.claim_stale_job(stale_seconds, max_attempts)
+        if job is None:
+            break
+        # Already claimed (status=running, attempts bumped) → run the body only.
+        spawn(_run_body(job["job_id"], job["kind"], job.get("payload") or {}, job.get("attribution")))
+        requeued += 1
+        why = (
+            f"deferred wait over ({job.get('defer_reason') or '?'})"
+            if job.get("defer_count") else "stale"
+        )
+        logger.warning(
+            f"♻️ Watchdog claimed job {job['job_id']} on "
+            f"{os.getenv('INSTANCE_NAME', 'unknown')} — {why} (attempt {job['attempts']})"
+        )
+    return requeued
