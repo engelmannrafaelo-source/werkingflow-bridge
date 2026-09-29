@@ -78,6 +78,37 @@ def _resolve_device(torch_module):
     return device
 
 
+def _resolve_precision(torch_module, device):
+    """Resolve the inference precision for Flair NER.
+
+    Controlled by PRIVACY_INFERENCE_PRECISION:
+      - unset / "fp32" (default): full precision, unchanged behaviour.
+      - "fp16": run predict() under torch.autocast(cuda, float16). Measured
+        2026-09-29 on gpu-privacy-1 (RTX 4000 SFF Ada), 32 real documents /
+        586 KB: 242 s -> 59 s (4.1x). Above the 0.35 service threshold, 1175
+        fp32 findings -> 0 new, 3 lost, all borderline non-PII
+        ("Ingenieurbüros", "ESSZIMMER", "ERSTELLT"); max score delta 0.03.
+        bf16 was measured too and rejected: 16 lost incl. "Handelsgericht Wien".
+    fp16 needs CUDA: demanding it on a CPU device fails loud instead of
+    silently running fp32 (same contract as PRIVACY_DEVICE=cuda).
+    Returns the autocast dtype, or None for full precision.
+    """
+    requested = os.getenv("PRIVACY_INFERENCE_PRECISION", "fp32").strip().lower() or "fp32"
+    if requested == "fp32":
+        return None
+    if requested == "fp16":
+        if getattr(device, "type", str(device)) != "cuda":
+            raise RuntimeError(
+                "PRIVACY_INFERENCE_PRECISION=fp16 requires a CUDA device, but Flair "
+                f"resolved to {device!r}. Refusing to silently run fp32 — unset the "
+                "variable (or set fp32), or fix PRIVACY_DEVICE / the GPU setup."
+            )
+        return torch_module.float16
+    raise RuntimeError(
+        f"Unknown PRIVACY_INFERENCE_PRECISION={requested!r} — expected 'fp32' or 'fp16'."
+    )
+
+
 class FlairRecognizer(EntityRecognizer):
     ENTITIES = ["PERSON", "LOCATION", "ORGANIZATION"]
 
@@ -93,6 +124,8 @@ class FlairRecognizer(EntityRecognizer):
     # Class-level singleton so the heavy SequenceTagger loads once per process,
     # even if the recognizer is re-instantiated.
     _shared_model = None
+    # Autocast dtype resolved once at model load (see _resolve_precision).
+    _autocast_dtype = None
 
     def __init__(
         self,
@@ -130,6 +163,11 @@ class FlairRecognizer(EntityRecognizer):
             logger.info("Loading Flair model %s on %s ...", self.model_path, device)
             FlairRecognizer._shared_model = SequenceTagger.load(self.model_path)
             FlairRecognizer._shared_model.to(device)
+            FlairRecognizer._autocast_dtype = _resolve_precision(torch, device)
+            logger.info(
+                "Flair NER precision: %s (PRIVACY_INFERENCE_PRECISION)",
+                FlairRecognizer._autocast_dtype or "fp32",
+            )
             logger.info("Flair model loaded")
         return FlairRecognizer._shared_model
 
@@ -191,7 +229,12 @@ class FlairRecognizer(EntityRecognizer):
             sentences = splitter.split(window_text)
             if not sentences:
                 continue
-            model.predict(sentences, mini_batch_size=self.MINI_BATCH)
+            if FlairRecognizer._autocast_dtype is None:
+                model.predict(sentences, mini_batch_size=self.MINI_BATCH)
+            else:
+                import torch
+                with torch.autocast("cuda", dtype=FlairRecognizer._autocast_dtype):
+                    model.predict(sentences, mini_batch_size=self.MINI_BATCH)
 
             for sentence in sentences:
                 # char offset of this sentence in `text` = window offset + offset in window

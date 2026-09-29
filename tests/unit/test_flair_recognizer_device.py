@@ -25,7 +25,7 @@ pytest.importorskip("presidio_analyzer")
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from src.privacy.flair_recognizer import _resolve_device  # noqa: E402
+from src.privacy.flair_recognizer import _resolve_device, _resolve_precision  # noqa: E402
 
 
 def _fake_torch(cuda_available: bool):
@@ -70,3 +70,31 @@ class TestResolveDevice:
         monkeypatch.setenv("PRIVACY_DEVICE", "tpu")
         with pytest.raises(RuntimeError, match="Unknown PRIVACY_DEVICE"):
             _resolve_device(_fake_torch(True))
+
+
+class TestResolvePrecision:
+    """PRIVACY_INFERENCE_PRECISION — fp16 only on CUDA, never a silent fallback."""
+
+    _torch = SimpleNamespace(float16="float16")
+
+    def test_default_is_full_precision(self, monkeypatch):
+        monkeypatch.delenv("PRIVACY_INFERENCE_PRECISION", raising=False)
+        assert _resolve_precision(self._torch, SimpleNamespace(type="cuda")) is None
+
+    def test_explicit_fp32(self, monkeypatch):
+        monkeypatch.setenv("PRIVACY_INFERENCE_PRECISION", "fp32")
+        assert _resolve_precision(self._torch, SimpleNamespace(type="cuda")) is None
+
+    def test_fp16_on_cuda(self, monkeypatch):
+        monkeypatch.setenv("PRIVACY_INFERENCE_PRECISION", "FP16")
+        assert _resolve_precision(self._torch, SimpleNamespace(type="cuda")) == "float16"
+
+    def test_fp16_on_cpu_fails_loud(self, monkeypatch):
+        monkeypatch.setenv("PRIVACY_INFERENCE_PRECISION", "fp16")
+        with pytest.raises(RuntimeError, match="requires a CUDA device"):
+            _resolve_precision(self._torch, SimpleNamespace(type="cpu"))
+
+    def test_unknown_value_fails_loud(self, monkeypatch):
+        monkeypatch.setenv("PRIVACY_INFERENCE_PRECISION", "bf16")
+        with pytest.raises(RuntimeError, match="Unknown PRIVACY_INFERENCE_PRECISION"):
+            _resolve_precision(self._torch, SimpleNamespace(type="cuda"))
