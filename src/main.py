@@ -54,6 +54,8 @@ from src.models import (
 from src.claude_cli import (
     ClaudeCodeCLI,
     WorkerUnavailableError,
+    OrgSubscriptionDisabledError,
+    ORG_DISABLED_LOCK_REASON,
     RateLimitError,
     rate_limit_tracker,
     extract_result_usage,
@@ -926,6 +928,37 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
 # =============================================================================
 # Worker Unavailable Exception Handler - Enables Nginx Failover
 # =============================================================================
+@app.exception_handler(OrgSubscriptionDisabledError)
+async def org_subscription_disabled_handler(request: Request, exc: OrgSubscriptionDisabledError):
+    """The account's organization disabled Claude subscription access.
+
+    503, not the parent's 429: nginx's proxy_next_upstream retries it on the
+    next worker, and the capacity lock set in claude_cli already took this
+    worker out of the pool router's choice. Registered for the subclass, so
+    Starlette's MRO lookup picks it over worker_unavailable_handler.
+    """
+    from src.middleware.bridge_error import account_org_disabled_error
+    return account_org_disabled_error(retry_after_s=exc.lock_seconds, signal=exc.signal)
+
+
+def _org_disabled_precheck(worker_id: str) -> Optional[JSONResponse]:
+    """503 without spawning the CLI while this worker is locked for
+    org_subscription_disabled. Traffic can still arrive (nginx retry of another
+    worker's failure, pinned/direct calls); spending a CLI run to relearn the
+    block would only add latency before the same 503."""
+    from src.middleware.capacity_lock import get_capacity_lock as _get_cap_lock
+    info = _get_cap_lock().get_lock_info(worker_id)
+    if not info or info.get("reason") != ORG_DISABLED_LOCK_REASON:
+        return None
+    from src.middleware.bridge_error import account_org_disabled_error
+    remaining = max(1, int(info["locked_until_ts"] - time.time()))
+    logger.error(
+        f"🛑 {worker_id}: request rejected — account org disabled Claude "
+        f"subscription access (lock {remaining}s left)"
+    )
+    return account_org_disabled_error(retry_after_s=remaining, signal="capacity_lock")
+
+
 @app.exception_handler(WorkerUnavailableError)
 async def worker_unavailable_handler(request: Request, exc: WorkerUnavailableError):
     """
@@ -1988,6 +2021,26 @@ async def generate_streaming_response(
         except Exception as track_err:
             logger.warning(f"⚠️ Streaming usage tracking failed (non-fatal): {track_err}")
 
+    except OrgSubscriptionDisabledError as org_err:
+        # The 200 + SSE headers are already on the wire (uvicorn writes them at
+        # http.response.start, before the first CLI chunk), so nginx cannot
+        # retry this one. Say it explicitly instead of letting the connection
+        # drop: the next request avoids this worker via the capacity lock.
+        error_chunk = {
+            "error": {
+                "message": f"[Bridge {org_err.worker_id}] {org_err}",
+                "type": "api_error",
+                "code": "account_org_disabled",
+                "source": "bridge_account",
+                "reason": "account_org_disabled",
+                "retryable": True,
+                "retry_after_s": org_err.lock_seconds,
+                "bridge_worker": org_err.worker_id,
+            }
+        }
+        yield f"data: {json.dumps(error_chunk)}\n\n"
+        yield "data: [DONE]\n\n"
+
     except WorkerUnavailableError:
         # Re-raise to trigger HTTP 503 and Nginx failover
         raise
@@ -2355,6 +2408,9 @@ async def chat_completions(
         # =======================================================================
         worker_id = os.getenv("INSTANCE_NAME", "unknown")
         _self_worker = worker_id  # defined once; all error branches below use this
+        _org_block = _org_disabled_precheck(worker_id)
+        if _org_block is not None:
+            return _org_block
         from src.claude_cli import rate_limit_tracker
         if rate_limit_tracker.should_reject_new_request(worker_id):
             retry_after = rate_limit_tracker.get_retry_after(worker_id) or 0
@@ -4098,7 +4154,7 @@ async def chat_completions(
                 model=request_body.model,
                 input_tokens=est_input,
                 output_tokens=0,
-                error_code="429",
+                error_code="503" if isinstance(wue, OrgSubscriptionDisabledError) else "429",
                 user_id=attribution.get("user_id"),
                 session_id=attribution.get("session_id"),
                 job_id=attribution.get("job_id"),
@@ -4116,7 +4172,7 @@ async def chat_completions(
                 output_tokens=0,
                 status="error",
                 duration_ms=int(duration * 1000),
-                error_code="429",
+                error_code="503" if isinstance(wue, OrgSubscriptionDisabledError) else "429",
                 error_message=str(wue),
                 app_env=attribution.get("app_env"),
             )
@@ -4134,8 +4190,17 @@ async def chat_completions(
         # ends in `bridge-prod-emergency` (Sahori on production). The primary
         # tier call never happened, so this path is defence-in-depth without
         # cost: fallback chain only runs when our own workers are exhausted.
+        #
+        # Org-disabled account: nginx retries the 503 on a healthy worker of
+        # THIS bridge; the cross-bridge chain (ending at the prod bridge — the
+        # very host where this was measured) is not the answer to one dead
+        # account.
         # =====================================================================
-        if not request_body.stream and not user_pinned_provider:
+        if (
+            not request_body.stream
+            and not user_pinned_provider
+            and not isinstance(wue, OrgSubscriptionDisabledError)
+        ):
             try:
                 from src.providers.fallback import (
                     record_failure as _fb_fail, record_success as _fb_ok,
@@ -5244,6 +5309,9 @@ async def _admit_research_to_pool(
         )
         return account_exhausted_error(retry_after_s=60)
 
+    _org_block = _org_disabled_precheck(worker_id)
+    if _org_block is not None:
+        return _org_block
     from src.claude_cli import rate_limit_tracker as _research_rlt
     if _research_rlt.should_reject_new_request(worker_id):
         retry_after = _research_rlt.get_retry_after(worker_id)
@@ -6213,6 +6281,9 @@ async def doc_agent(
 
     # Rate limit pre-check: soft routing (same logic as research endpoint)
     worker_id = os.getenv("INSTANCE_NAME", "unknown")
+    _org_block = _org_disabled_precheck(worker_id)
+    if _org_block is not None:
+        return _org_block
     from src.claude_cli import rate_limit_tracker as _da_rlt
     if _da_rlt.should_reject_new_request(worker_id):
         retry_after = _da_rlt.get_retry_after(worker_id)
@@ -6494,6 +6565,25 @@ async def health_check(request: Request):
         result["ledger_spool"] = spool_health()
     except ImportError:
         pass
+
+    # Account blocked by its organization (claude_cli.handle_org_subscription_disabled).
+    # Reported as a FIELD, `status` stays "healthy": the container healthcheck
+    # (curl -f) and bridge-deploy's wait only need liveness, and the
+    # metrics-reader /lb-status reads status != "healthy" as "prod bridge
+    # down". Taking the worker out of routing is the capacity lock's job
+    # (account-pool-state available:false), not the health endpoint's.
+    from src.middleware.capacity_lock import get_capacity_lock as _get_cap_lock
+    _lock_info = _get_cap_lock().get_lock_info(worker_instance)
+    result["org_disabled"] = bool(
+        _lock_info and _lock_info.get("reason") == ORG_DISABLED_LOCK_REASON
+    )
+    result["capacity_lock"] = (
+        {
+            "reason": _lock_info["reason"],
+            "remaining_s": max(0, int(_lock_info["locked_until_ts"] - time.time())),
+        }
+        if _lock_info else None
+    )
 
     return result
 

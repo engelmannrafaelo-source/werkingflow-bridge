@@ -75,6 +75,9 @@ REASON_QUEUE_EXHAUSTED = "worker_queue_exhausted"
 # now carried honestly in extra.limit_window, because it is very often the
 # 5-hour SESSION window and not the weekly one. See account_exhausted_error.
 REASON_ACCOUNT_WEEKLY_EXHAUSTED = "worker_account_weekly_exhausted"
+# The account's organization disabled Claude subscription access for Claude
+# Code — not a window that resets, an account that cannot serve at all.
+REASON_ACCOUNT_ORG_DISABLED = "account_org_disabled"
 REASON_UPSTREAM_ANTHROPIC_ERROR = "claude_upstream_error"
 REASON_UPSTREAM_ANTHROPIC_TIMEOUT = "claude_upstream_timeout"
 # Vision API direct-key billing exhausted (Anthropic-side, not retryable)
@@ -268,6 +271,9 @@ _LIMIT_WINDOW_PHRASE = {
     "session_window": "their 5-hour Anthropic session limit",
     "weekly_window": "their weekly Anthropic limit",
     "anthropic_explicit": "an Anthropic rate limit",
+    # Not a usage window: the organization blocked subscription access. Named
+    # anyway so a capacity-locked job rejection says what actually happened.
+    "org_subscription_disabled": "a hard stop (their organization disabled Claude subscription access for Claude Code)",
 }
 # What we say when nobody could tell us WHICH limit was hit. Saying "weekly"
 # anyway is the bug this vocabulary exists to fix (see account_exhausted_error).
@@ -310,6 +316,33 @@ def account_exhausted_error(
         status_code=429,
         retry_after_s=retry_after_s,
         extra={"limit_window": limit_window or "unknown"},
+    )
+
+
+def account_org_disabled_error(retry_after_s: int, signal: str) -> JSONResponse:
+    """This worker's account is blocked: its organization disabled Claude
+    subscription access for Claude Code. 503 so nginx's proxy_next_upstream
+    retries the request on another worker; when every worker is blocked the
+    caller sees this body with the explicit code instead of a fake 200.
+
+    `code` is the semantic "account_org_disabled" (not the status string like
+    the other constructors) — the caller asked for an unmistakable code, and
+    the status is on the response anyway.
+    """
+    return bridge_error(
+        source=SOURCE_BRIDGE_ACCOUNT,
+        error_type=TYPE_ACCOUNT_EXHAUSTED,
+        reason=REASON_ACCOUNT_ORG_DISABLED,
+        message=(
+            "This worker's Claude account is blocked: its organization disabled "
+            "Claude subscription access for Claude Code. Retry on another worker."
+        ),
+        status_code=503,
+        retry_after_s=retry_after_s,
+        extra={
+            "code": REASON_ACCOUNT_ORG_DISABLED,
+            "org_disabled_signal": signal,
+        },
     )
 
 
