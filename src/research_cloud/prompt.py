@@ -66,10 +66,15 @@ _LIBRARY_HEADER = """
 Für diese Recherche steht dir eine kuratierte, private Bibliothek mit Volltexten zur Verfügung.
 Ihr vollständiges Verzeichnis steht unten — du musst es nicht erst abrufen.
 
-Rangfolge der Quellen: Deckt ein Eintrag der Bibliothek die Frage ab, ist sein Volltext die
-maßgebliche Quelle — lade ihn mit `library_get` (Parameter `id`) und zitiere daraus, statt dich
-auf Zusammenfassungen Dritter aus der Websuche zu stützen. Die Websuche ergänzt: Aktualität,
-Fassungsstände und alles, was die Bibliothek nicht führt.
+Rangfolge der Quellen — immer in dieser Reihenfolge:
+1. Zuerst die Bibliothek: Gleiche die Frage mit dem Verzeichnis unten ab (Begriffe, Normnummern,
+   Rechtsraum) und lade alle passenden Einträge mit `library_get` (Parameter `id`). Ihr Volltext
+   ist die maßgebliche Quelle — zitiere daraus, statt dich auf Zusammenfassungen Dritter aus der
+   Websuche zu stützen.
+2. Websuche nur für das, was dort fehlt, und für Aktualität/Fassungsstand.
+
+Quellenliste getrennt nach Herkunft, je Quelle eine Zeile: „Bibliothek: <id>“ bzw. „Web: <URL>“.
+Gib bei jeder Zahl an, woher sie stammt (Bibliothek: <id> oder Web: <URL>).
 
 Einträge, die unten mit KEIN VOLLTEXT gekennzeichnet sind, sind reine Katalogverweise; für sie
 schlägt `library_get` fehl — nutze dort die genannte Quelle über die Websuche.
@@ -88,6 +93,14 @@ Quell-URL, Anmerkungen). Rufe es nur, wenn du diese Zusatzangaben brauchst.
 # verzeichnis (src/research_library_pool.py), und das Verzeichnis sagt, wie
 # man sie oeffnet. Inhaltlich dieselbe Rangfolge wie oben — nur die
 # Zugriffsart unterscheidet sich (Rafael-Entscheidung 07.09.2026, Karte k20).
+#
+# Rangfolge seit 29.09.2026 UNBEDINGT (Befund c76ab7fb): vorher hiess es
+# "Deckt ein Eintrag der Bibliothek die Frage ab, ...", d. h. das Modell
+# entschied anhand von Titelzeilen, ob die Bibliothek zaehlt — gemessen
+# 1.499 Websuchen gegen 352 gelesene Bibliotheksdokumente. Jetzt: erst
+# Bibliothek, dann Web nur fuer Luecken und Aktualitaet; Quellenliste nach
+# Herkunft getrennt. Dieselbe Reihenfolge steht im CLI-Protokoll
+# (src/research_protocol.py) und im Cloud-Block oben.
 _POOL_LIBRARY_HEADER = """
 
 ## Kuratierte Dokumentbibliothek (Volltexte als Dateien)
@@ -97,11 +110,14 @@ Ihre Dokumente liegen als Markdown-Dateien in deinem Arbeitsverzeichnis unter `{
 die Datei zu einem Eintrag heißt `{dir_name}/<id>.md`. Ihr vollständiges Verzeichnis steht unten
 — du musst es nicht erst suchen.
 
-Rangfolge der Quellen: Deckt ein Eintrag der Bibliothek die Frage ab, ist sein Volltext die
-maßgebliche Quelle — lies ihn mit `Read` und zitiere daraus, statt dich auf Zusammenfassungen
-Dritter aus der Websuche zu stützen. Mit `Grep` kannst du über alle Dateien in `{dir_name}/`
-nach Begriffen, Grenzwerten oder Fassungsangaben suchen. Die Websuche ergänzt: Aktualität,
-Fassungsstände und alles, was die Bibliothek nicht führt.
+Rangfolge der Quellen — immer in dieser Reihenfolge:
+1. Zuerst die Bibliothek: Durchsuche `{dir_name}/` (Grep nach Begriffen, Normnummern, Werten) und
+   lies alle passenden Dokumente mit `Read`. Ihr Volltext ist die maßgebliche Quelle — zitiere
+   daraus, statt dich auf Zusammenfassungen Dritter aus der Websuche zu stützen.
+2. WebSearch/WebFetch nur für das, was dort fehlt, und für Aktualität/Fassungsstand.
+
+Quellenliste getrennt nach Herkunft, je Quelle eine Zeile: „Bibliothek: <id>“ bzw. „Web: <URL>“.
+Gib bei jeder Zahl an, woher sie stammt (Bibliothek: <id> oder Web: <URL>).
 
 Einträge, die unten mit KEIN VOLLTEXT gekennzeichnet sind, sind reine Katalogverweise; zu ihnen
 gibt es keine Datei — nutze dort die genannte Quelle über die Websuche.

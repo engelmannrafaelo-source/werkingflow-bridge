@@ -15,7 +15,7 @@ categories dropped — declared honestly by the agent, caught loudly by nobody.
 from __future__ import annotations
 
 import re
-from typing import Tuple
+from typing import Optional, Tuple
 
 from src.research_cloud.prompt import search_budget_for_depth
 
@@ -56,12 +56,20 @@ def parse_depth(prompt: str) -> str:
 
 
 def build_research_execution_prompt(
-    prompt: str, max_turns: int
+    prompt: str, max_turns: int, library_dir: Optional[str] = None
 ) -> Tuple[str, int, str]:
     """Transform a ``/sc:research "…" --flags`` prompt into the direct
     execution protocol, honouring the requested depth.
 
     Returns ``(execution_prompt, max_turns, depth)``.
+
+    ``library_dir`` names the workdir folder that holds the curated library
+    (``research_library_pool.LIBRARY_WORKDIR_NAME``) when this run has one.
+    Then the protocol reads the library FIRST and the web only for gaps and
+    currency (Rafael, 29.09.2026 — Befund c76ab7fb: 17 WebSearch / 7 WebFetch
+    against 2 library reads with 204 documents in the folder, because step 1
+    of this protocol named only the web). Without a library the protocol is
+    byte-identical to the pre-change text (snapshot-tested).
 
     Everything that isn't the command token or a known flag stays part of
     the query — including an injected OA literature block, which must reach
@@ -84,6 +92,15 @@ def build_research_execution_prompt(
 
     turn_cap = _TURN_CAP[depth]
     effective_turns = max(min(max_turns, turn_cap), _TURN_FLOOR)
+
+    if library_dir:
+        return (
+            _library_first_protocol(
+                research_query, depth, search_budget, fetch_budget, library_dir
+            ),
+            effective_turns,
+            depth,
+        )
 
     execution_prompt = f"""Research this query and write output IMMEDIATELY:
 
@@ -117,3 +134,53 @@ OUTPUT STRUCTURE:
 CRITICAL: The file claudedocs/research_output.md MUST exist when you finish. Use the Write tool.
 """
     return execution_prompt, effective_turns, depth
+
+
+def _library_first_protocol(
+    research_query: str,
+    depth: str,
+    search_budget: int,
+    fetch_budget: int,
+    library_dir: str,
+) -> str:
+    """Protocol for a run with a curated library in the workdir.
+
+    The order is unconditional — library first, web second — and not left to
+    the model's reading of catalogue titles ("covers an entry the question?").
+    Same order and same source split as the appended catalogue block
+    (``research_cloud.prompt._POOL_LIBRARY_HEADER``) and the cloud path.
+    """
+    return f"""Research this query and write output IMMEDIATELY:
+
+QUERY: {research_query}
+
+PROTOCOL (depth: {depth} — budgets are ceilings, not targets):
+1. Durchsuche {library_dir}/ (Grep nach Begriffen, Normnummern, Werten) und lies alle passenden Dokumente.
+2. WebSearch/WebFetch nur für das, was dort fehlt, und für Aktualität/Fassungsstand (up to {search_budget} searches and up to {fetch_budget} page fetches — targeted, no filler queries)
+3. Address EVERY question/category the query contains. If the budget cannot cover all of them in depth, reduce per-item depth instead of dropping items, and list anything you could not source under an explicit "Offene Lücken / Open gaps" heading — never drop a sub-question silently
+4. Extract key findings with sources (keep each finding under {_FINDING_WORDS[depth]} words). Every number states its origin: (Bibliothek: <id>) or (Web: <URL>)
+5. Write the report to claudedocs/research_output.md IMMEDIATELY after your research is done
+6. DO NOT conduct additional searches after writing the file
+
+OUTPUT STRUCTURE:
+# Research Report
+
+## Summary
+[2-4 sentences]
+
+## Key Findings
+- [Finding with source, one bullet per finding — every number marked (Bibliothek: <id>) or (Web: <URL>)]
+
+## Analysis
+[Max {_ANALYSIS_WORDS[depth]} words]
+
+## Offene Lücken
+[Only if something asked in the query could not be covered or sourced — name it explicitly. Omit the section if there are none.]
+
+## Sources
+[Split by origin, one line per source:
+Bibliothek: <id>
+Web: <URL>]
+
+CRITICAL: The file claudedocs/research_output.md MUST exist when you finish. Use the Write tool.
+"""
