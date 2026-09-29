@@ -1372,12 +1372,24 @@ class ClaudeCodeCLI:
             # is a bug in main.py's prompt construction, not something to
             # paper over here.
             from src.research_protocol import build_research_execution_prompt
+            from src.research_library_pool import LIBRARY_WORKDIR_NAME
 
+            # Library first (Befund c76ab7fb, 29.09.2026): the library lands
+            # in the workdir via seed_links below; if this run seeds at least
+            # one library document, the protocol itself must send the model
+            # there before the web. No documents -> no folder worth naming ->
+            # unchanged protocol.
+            research_library_dir = (
+                LIBRARY_WORKDIR_NAME
+                if seed_links and seed_links.get(LIBRARY_WORKDIR_NAME)
+                else None
+            )
             prompt, max_turns, research_depth = build_research_execution_prompt(
-                prompt, max_turns
+                prompt, max_turns, library_dir=research_library_dir
             )
             logger.info(
-                f"   Research depth: {research_depth}, max_turns: {max_turns}"
+                f"   Research depth: {research_depth}, max_turns: {max_turns}, "
+                f"library_first: {bool(research_library_dir)}"
             )
 
             # Enable file discovery for research output

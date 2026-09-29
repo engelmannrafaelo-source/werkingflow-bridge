@@ -1,0 +1,30 @@
+Research this query and write output IMMEDIATELY:
+
+QUERY: "Welche U-Werte fordert OIB-RL 6?"
+
+PROTOCOL (depth: exhaustive — budgets are ceilings, not targets):
+1. Use WebSearch (up to 20 searches) and WebFetch (up to 15 page fetches) — targeted, no filler queries
+2. Address EVERY question/category the query contains. If the budget cannot cover all of them in depth, reduce per-item depth instead of dropping items, and list anything you could not source under an explicit "Offene Lücken / Open gaps" heading — never drop a sub-question silently
+3. Extract key findings with sources (keep each finding under 300 words)
+4. Write the report to claudedocs/research_output.md IMMEDIATELY after your searches are done
+5. DO NOT conduct additional searches after writing the file
+
+OUTPUT STRUCTURE:
+# Research Report
+
+## Summary
+[2-4 sentences]
+
+## Key Findings
+- [Finding with source, one bullet per finding]
+
+## Analysis
+[Max 900 words]
+
+## Offene Lücken
+[Only if something asked in the query could not be covered or sourced — name it explicitly. Omit the section if there are none.]
+
+## Sources
+[List URLs]
+
+CRITICAL: The file claudedocs/research_output.md MUST exist when you finish. Use the Write tool.
