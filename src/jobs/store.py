@@ -195,6 +195,20 @@ _STALE_SINCE = "COALESCE(heartbeat_at, created_at)"
 # Pre-existing rows have deferred_until IS NULL and are unaffected.
 _NOT_DEFERRED = "(deferred_until IS NULL OR deferred_until <= NOW())"
 
+# A parked job whose wait is OVER is claimable at once — it must not also sit
+# out the stale window. defer_job stamps heartbeat_at=NOW(), so under the stale
+# rule alone a 30 s capacity wait became 90 s + one watchdog tick (measured
+# 29.09.2026: 3-5 s jobs finishing after 90-130 s). Only 'pending' qualifies:
+# a claimed row is 'running' again and falls back under the stale rule, so a
+# worker that dies mid-run is still detected by its frozen heartbeat.
+_DEFER_DUE = "(status = 'pending' AND deferred_until IS NOT NULL AND deferred_until <= NOW())"
+
+# Claimable = (stale, i.e. dead worker / never started) OR (parked and due).
+# $1 = stale_seconds.
+_CLAIMABLE = (
+    f"({_STALE_SINCE} < NOW() - ($1 || ' seconds')::interval OR {_DEFER_DUE})"
+)
+
 # The crash-retry budget is evaluated on starts that were NOT dependency waits,
 # so waiting out a long outage never consumes it (see migration 044).
 _CRASH_ATTEMPTS = "(attempts - defer_count)"
@@ -239,7 +253,9 @@ async def claim_stale_job(stale_seconds: int, max_attempts: int) -> Optional[Dic
     is enforced here so an unrecoverable job is left for find_abandoned().
 
     Dependency-deferred jobs are skipped until their wait expires, and their
-    waits are subtracted from the retry cap (see migration 044)."""
+    waits are subtracted from the retry cap (see migration 044). Once the wait
+    HAS expired a parked 'pending' job is claimable immediately (_DEFER_DUE),
+    without additionally waiting out `stale_seconds`."""
     pool = get_pool()
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
@@ -250,7 +266,7 @@ async def claim_stale_job(stale_seconds: int, max_attempts: int) -> Optional[Dic
              WHERE job_id = (
                  SELECT job_id FROM ai_jobs
                   WHERE status IN ('pending', 'running')
-                    AND {_STALE_SINCE} < NOW() - ($1 || ' seconds')::interval
+                    AND {_CLAIMABLE}
                     AND {_CRASH_ATTEMPTS} < $2
                     AND {_NOT_DEFERRED}
                   ORDER BY {_STALE_SINCE} ASC

@@ -34,7 +34,11 @@ class ExecutorHTTPError(RuntimeError):
     so clients can restore proper retry semantics."""
 
     def __init__(
-        self, status_code: int, message: str, retry_after_s: Optional[float] = None
+        self,
+        status_code: int,
+        message: str,
+        retry_after_s: Optional[float] = None,
+        rejection: Optional[str] = None,
     ):
         super().__init__(message)
         self.status_code = status_code
@@ -44,10 +48,134 @@ class ExecutorHTTPError(RuntimeError):
         # so throwing that number away and picking our own would be worse than
         # what the caller was told.
         self.retry_after_s = retry_after_s
+        # One-line, secret-free account of WHO refused and why (worker,
+        # account, reason, and what the LB re-dispatch saw). Set only on
+        # capacity refusals; the runner logs it on the defer line.
+        self.rejection = rejection
+
 
 # The worker serves its own FastAPI app here (bypasses the nginx LB + its capacity
 # gate — the self-call hits this worker directly). Overridable for tests/other binds.
 SELF_BASE_URL = os.getenv("BRIDGE_SELF_URL", "http://localhost:8000")
+
+# ---------------------------------------------------------------------------
+# Capacity re-dispatch through this bridge's own LB
+# ---------------------------------------------------------------------------
+# The self-call above is pinned to THIS worker, so when this worker's account
+# is in a (soft) penalty the inner call 429s ("rejecting (NGINX failover)")
+# although three sibling accounts are free — and a pinned call has no nginx to
+# fail over. Parking the job and waiting for a watchdog re-claim cost 90-130 s
+# on a 3-5 s job (measured 29.09.2026, dev bridge, ~30 % of small jobs).
+#
+# So on a capacity 429 the SAME request is sent once more, this time through
+# the bridge's own LB. There proxy_next_upstream + the Lua pool router pick a
+# free worker — the failover the sync path always had. Two guarantees:
+#
+#   * X-Bridge-Hop: 1 — the LB treats the request as already hopped and serves
+#     it ONLY from the local tier (nginx.conf `$bridge_hopped`, ADR-0010 loop
+#     guard). A dev job therefore never spills onto the prod bridge through
+#     this path (and vice versa); it stays in the bridge that holds its row.
+#   * Bounded: JOB_CAPACITY_REDISPATCH_ATTEMPTS LB calls per executor run, each
+#     of which nginx itself bounds to one pass over the local pool. If that
+#     is exhausted too, the original 429 surfaces and the runner parks the job
+#     exactly as before (registry._defer_job).
+#
+# Only the account-consuming paths nginx's chat/research location serves are
+# re-dispatched; everything else keeps the plain self-call. The LB service is
+# named `nginx` in both compose topologies (dev + prod); a worker-host without
+# a local LB can set BRIDGE_JOB_REDISPATCH_URL="" to switch this off — an
+# unreachable LB is logged loudly and falls back to the park.
+JOB_REDISPATCH_BASE_URL = os.getenv("BRIDGE_JOB_REDISPATCH_URL", "http://nginx:80").strip()
+JOB_CAPACITY_REDISPATCH_ATTEMPTS = 1
+JOB_REDISPATCH_PATHS = frozenset({"/v1/chat/completions", "/v1/research"})
+# Diagnostic marker on the re-dispatched request (which worker handed it on).
+REDISPATCH_HEADER = "X-Bridge-Job-Redispatch"
+CAPACITY_STATUS = 429
+# LB statuses that mean "no local worker could take it" (@bridge_full /
+# @pool_exhausted_response envelope) — not a verdict on the request itself.
+# The job keeps its original 429 and is parked; a deterministic error from a
+# worker that DID take it (400, 402, ...) passes through unchanged.
+_LB_NO_CAPACITY_STATUSES = frozenset({CAPACITY_STATUS, 503})
+
+
+def _self_identity() -> str:
+    """worker/account of THIS process, for the rejection line (no secrets)."""
+    worker = os.getenv("INSTANCE_NAME", "unknown")
+    account = (os.getenv("WORKER_ACCOUNT") or "").strip() or "?"
+    return f"worker={worker} account={account}"
+
+
+def _describe_rejection(response, fallback_worker: Optional[str] = None) -> str:
+    """Who refused and why, from the bridge's own error envelope. Never the
+    body verbatim (could echo user content) — only the named envelope fields."""
+    err: Dict[str, Any] = {}
+    try:
+        data = response.json()
+        if isinstance(data, dict):
+            candidate = data.get("error", data)
+            if isinstance(candidate, dict):
+                err = candidate
+    except Exception:
+        err = {}
+    worker = err.get("bridge_worker") or fallback_worker or "?"
+    reason = err.get("reason") or err.get("bridge_type") or "?"
+    msg = str(err.get("message") or "")[:120]
+    return f"worker={worker} reason={reason} status={response.status_code} msg={msg!r}"
+
+
+async def _post_with_capacity_redispatch(
+    client, path: str, body: Dict[str, Any], headers: Dict[str, str]
+):
+    """POST to this worker (self-call); on a capacity 429 re-dispatch the SAME
+    request through the local LB (see the block above). Returns
+    ``(response, rejection)`` — ``rejection`` is the one-line account of who
+    refused, set whenever the FINAL answer is still a capacity 429."""
+    response = await client.post(f"{SELF_BASE_URL}{path}", json=body, headers=headers)
+    if response.status_code != CAPACITY_STATUS:
+        return response, None
+
+    own = _self_identity()
+    first = f"self-call refused ({own}; {_describe_rejection(response)})"
+    if path not in JOB_REDISPATCH_PATHS or not JOB_REDISPATCH_BASE_URL:
+        why = "path not re-dispatchable" if path not in JOB_REDISPATCH_PATHS else "BRIDGE_JOB_REDISPATCH_URL empty"
+        return response, f"{first}; no LB re-dispatch ({why})"
+
+    hop_headers = {
+        **headers,
+        # ADR-0010 loop guard: the LB serves a hopped request from the LOCAL
+        # tier only, never cross-bridge — dev stays dev, prod stays prod.
+        "X-Bridge-Hop": "1",
+        REDISPATCH_HEADER: os.getenv("INSTANCE_NAME", "unknown"),
+    }
+    lb_notes = []
+    for attempt in range(1, JOB_CAPACITY_REDISPATCH_ATTEMPTS + 1):
+        logger.warning(
+            f"🔀 job self-call {path}: {first} — re-dispatching via LB "
+            f"{JOB_REDISPATCH_BASE_URL} (attempt {attempt}/{JOB_CAPACITY_REDISPATCH_ATTEMPTS})"
+        )
+        try:
+            lb_response = await client.post(
+                f"{JOB_REDISPATCH_BASE_URL}{path}", json=body, headers=hop_headers
+            )
+        except Exception as e:  # LB unreachable → keep the 429, the runner parks the job
+            logger.error(
+                f"❌ job LB re-dispatch {path} unreachable ({type(e).__name__}: {e}) — "
+                f"job will be parked instead"
+            )
+            lb_notes.append(f"LB#{attempt} unreachable: {type(e).__name__}")
+            break
+        if lb_response.status_code not in _LB_NO_CAPACITY_STATUSES:
+            # A sibling worker took it (2xx), or gave a real verdict on the
+            # request — either way that is the job's answer now.
+            logger.info(
+                f"✅ job LB re-dispatch {path} answered HTTP {lb_response.status_code} "
+                f"(upstream {lb_response.headers.get('X-Upstream-Server', '?')})"
+            )
+            return lb_response, None
+        lb_notes.append(f"LB#{attempt} {_describe_rejection(lb_response, fallback_worker='pool')}")
+    # Every local worker refused too. Keep the ORIGINAL self-call 429 (its
+    # Retry-After is this worker's own window) so the runner parks the job.
+    return response, f"{first}; " + "; ".join(lb_notes)
 
 # Generous: a chat completion can run minutes; the job's heartbeat keeps the row
 # alive meanwhile, and the watchdog only requeues a genuinely dead worker.
@@ -179,10 +307,8 @@ async def chat_executor(
     await report_progress({"phase": "llm", "model": body.get("model")})
 
     async with httpx.AsyncClient(timeout=CHAT_SELF_CALL_TIMEOUT_S) as client:
-        response = await client.post(
-            f"{SELF_BASE_URL}/v1/chat/completions",
-            json=body,
-            headers=headers,
+        response, rejection = await _post_with_capacity_redispatch(
+            client, "/v1/chat/completions", body, headers
         )
 
     if response.status_code >= 400:
@@ -192,6 +318,7 @@ async def chat_executor(
             response.status_code,
             f"chat self-call failed HTTP {response.status_code}: {detail}",
             retry_after_s=_retry_after_s(response),
+            rejection=rejection,
         )
 
     return attach_ledger_cost(response.json(), response.headers)
@@ -250,13 +377,14 @@ async def _self_post_json(
 
     headers = _build_headers(attribution)
     async with httpx.AsyncClient(timeout=timeout_s) as client:
-        response = await client.post(f"{SELF_BASE_URL}{path}", json=body, headers=headers)
+        response, rejection = await _post_with_capacity_redispatch(client, path, body, headers)
 
     if response.status_code >= 400:
         raise ExecutorHTTPError(
             response.status_code,
             f"self-call {path} failed HTTP {response.status_code}: {response.text[:500]}",
             retry_after_s=_retry_after_s(response),
+            rejection=rejection,
         )
     try:
         return response.json()

@@ -86,6 +86,7 @@ from src.auth import verify_api_key, security, validate_claude_code_auth, get_cl
 from src.jobs.routes import router as jobs_router, set_attribution_extractor
 from src.jobs.registry import (
     register_executor,
+    run_claim_pass,
     run_watchdog_pass,
     DEPENDENCY_UNAVAILABLE_STATUS,
     DEPENDENCY_RETRY_DELAY_S,
@@ -615,7 +616,8 @@ async def lifespan(app: FastAPI):
     set_attribution_extractor(extract_attribution_context)
     if jobs_store_client.is_store_available():
         asyncio.create_task(_generic_jobs_maintenance_loop())
-        logger.info("🧩 Generic async-job system wired (executors + watchdog loop)")
+        asyncio.create_task(_generic_jobs_claim_loop())
+        logger.info("🧩 Generic async-job system wired (executors + watchdog + claim loop)")
     else:
         logger.info(
             "🧩 Generic async-job executors registered (no job store reachable — "
@@ -760,6 +762,12 @@ GENERIC_JOB_TTL_SECONDS = 2 * 60 * 60          # 2h, mirrors research jobs
 GENERIC_JOB_STALE_SECONDS = 90                 # ~6 missed heartbeats
 GENERIC_JOB_MAX_ATTEMPTS = 3
 GENERIC_JOB_MAINTENANCE_INTERVAL_S = 30
+# Short tick for the CLAIM half only (one atomic UPDATE per worker per tick,
+# a no-op when nothing is due): a parked job must restart within seconds of
+# its deferred_until, not after the next 30 s maintenance pass. Measured
+# 29.09.2026: 28-38 % of 3-5 s jobs took 90-130 s under the old 30 s tick +
+# 90 s stale window.
+GENERIC_JOB_CLAIM_INTERVAL_S = 5
 
 
 async def _generic_jobs_maintenance_loop():
@@ -777,6 +785,29 @@ async def _generic_jobs_maintenance_loop():
                 )
         except Exception as e:
             logger.warning(f"⚠️ generic-jobs maintenance pass failed: {e}")
+
+
+async def _generic_jobs_claim_loop():
+    """Fast claim tick: start parked jobs whose wait is over (and stale ones —
+    same atomic claim as the watchdog, FOR UPDATE SKIP LOCKED, so running it
+    on every worker never double-starts a job). Abandon-detection and TTL
+    cleanup stay on the slower maintenance loop above."""
+    consecutive_failures = 0
+    while True:
+        await asyncio.sleep(GENERIC_JOB_CLAIM_INTERVAL_S)
+        try:
+            await run_claim_pass(GENERIC_JOB_STALE_SECONDS, GENERIC_JOB_MAX_ATTEMPTS)
+            if consecutive_failures:
+                logger.info(f"✅ generic-jobs claim pass recovered after {consecutive_failures} failures")
+            consecutive_failures = 0
+        except Exception as e:
+            consecutive_failures += 1
+            # Loud on the first failure, then once a minute — a down job store
+            # must be visible without flooding the log every 5 s.
+            if consecutive_failures == 1 or consecutive_failures % 12 == 0:
+                logger.warning(
+                    f"⚠️ generic-jobs claim pass failed ({consecutive_failures}x in a row): {e}"
+                )
 
 
 # Create FastAPI app
