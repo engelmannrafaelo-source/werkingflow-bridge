@@ -368,13 +368,20 @@ def _timed(fn):
 # ---------------------------------------------------------------------------
 # Probes — each asserts a CORRECTNESS property, not just HTTP 200
 # ---------------------------------------------------------------------------
+# A real web-research task: "smoke test" can legitimately return library-only
+# evidence without URLs, which is not a failure of the research endpoint.
+RESEARCH_SMOKE_QUERY = (
+    "Find the official Anthropic Claude API documentation. "
+    "Include at least one https:// link to the official documentation in your answer."
+)
+
 @probe("research", "/v1/research", {"hetzner", "server2"},
-       repro="curl -XPOST $AI_BRIDGE_URL/v1/research -H 'Authorization: Bearer $AI_BRIDGE_API_KEY' -H 'Content-Type: application/json' " + ATTRIBUTION_REPRO + "-d '{\"query\":\"smoke test\",\"depth\":\"quick\",\"max_turns\":5}'")
+       repro="curl -XPOST $AI_BRIDGE_URL/v1/research -H 'Authorization: Bearer $AI_BRIDGE_API_KEY' -H 'Content-Type: application/json' " + ATTRIBUTION_REPRO + "-d '" + json.dumps({"query": RESEARCH_SMOKE_QUERY, "depth": "quick", "max_turns": 5}) + "'")
 def _research(ctx: Ctx) -> ProbeResult:
     ep = "/v1/research"
     r, ms = _timed(lambda: requests.post(
         f"{ctx.base_url}{ep}", headers=ctx.headers({"Content-Type": "application/json"}),
-        json={"query": "smoke test", "depth": "quick", "max_turns": 5}, timeout=ctx.timeout))
+        json={"query": RESEARCH_SMOKE_QUERY, "depth": "quick", "max_turns": 5}, timeout=ctx.timeout))
     if r.status_code != 200:
         return capacity_result("research", ep, r, ms) or \
             ProbeResult("research", ep, False, f"HTTP {r.status_code}: {r.text[:200]}", r.status_code, ms)
