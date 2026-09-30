@@ -53,7 +53,8 @@ import re
 #                  6,25-fache von 2.5.
 # v8 (2026-09-24): Opus 5.5 $4/$20, cache read $0.20 per MTok.
 # v9 (2026-09-24): Fable 5.1 enabled; cache read $0.25 per MTok.
-PRICING_VERSION = "v9"
+# v10 (2026-09-30): Sonnet 5.5, $2/$10; cache read $0.20, 5m write $2.50.
+PRICING_VERSION = "v10"
 
 # USD per 1M tokens. {model_id: {"in": input_price, "out": output_price}}
 # Quelle je Zeile: Anthropic "Model pricing"-Tabelle,
@@ -64,6 +65,7 @@ MODEL_PRICING: dict[str, dict[str, float]] = {
     # 2026-09-02: $2/$10 ist der PERMANENTE Preis (Intro-Label entfernt, s.
     # PRICING_VERSION-Changelog oben) — NICHT den zuvor angekuendigten,
     # inzwischen gecancelten $3/$15-Anstieg eintragen.
+    "claude-sonnet-5-5":          {"in": 2.00,  "out": 10.00},
     "claude-sonnet-5":            {"in": 2.00,  "out": 10.00},
     "claude-sonnet-4-5":          {"in": 3.00,  "out": 15.00},  # 2026-07-05
     "claude-sonnet-4-5-20250929": {"in": 3.00,  "out": 15.00},  # 2026-07-05

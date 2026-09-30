@@ -38,7 +38,7 @@ from src.model_registry import (
 
 class TestFamilyDefaults:
     def test_deliberate_defaults_hold(self):
-        assert _DEFAULT_BY_FAMILY["sonnet"].id == "claude-sonnet-5"
+        assert _DEFAULT_BY_FAMILY["sonnet"].id == "claude-sonnet-5-5"
         assert _DEFAULT_BY_FAMILY["opus"].id == "claude-opus-5-5"
         assert _DEFAULT_BY_FAMILY["haiku"].id == "claude-haiku-4-5-20251001"
 
@@ -60,15 +60,15 @@ class TestResolveModel:
     @pytest.mark.parametrize(
         "requested,expected",
         [
-            ("claude-sonnet-5", "claude-sonnet-5"),
+            ("claude-sonnet-5", "claude-sonnet-5-5"),
             ("claude-opus-5-5", "claude-opus-5-5"),
-            ("claude-sonnet-4-5-20250929", "claude-sonnet-5"),
-            ("claude-sonnet-4-6", "claude-sonnet-5"),
+            ("claude-sonnet-4-5-20250929", "claude-sonnet-5-5"),
+            ("claude-sonnet-4-6", "claude-sonnet-5-5"),
             ("claude-opus-4-8", "claude-opus-5-5"),
             ("claude-opus-4-7", "claude-opus-5-5"),
             ("claude-opus-4-20250514", "claude-opus-5-5"),
             ("claude-3-5-haiku-20241022", "claude-haiku-4-5-20251001"),
-            ("sonnet", "claude-sonnet-5"),
+            ("sonnet", "claude-sonnet-5-5"),
             ("opus", "claude-opus-5-5"),
             ("opus-4", "claude-opus-5-5"),
             ("claude-opus-5", "claude-opus-5-5"),
@@ -82,7 +82,7 @@ class TestResolveModel:
     def test_explicit_newer_is_not_downgraded(self):
         """Der Kern der Regression: ein explizites Opt-in in ein neueres
         Modell darf weder auf den Default 'aufgeräumt' noch umgeleitet werden."""
-        for opt_in in ("claude-opus-5-5", "claude-sonnet-5"):
+        for opt_in in ("claude-opus-5-5", "claude-sonnet-5-5"):
             got, warning = resolve_model(opt_in)
             assert got == opt_in
             assert warning is None
@@ -208,3 +208,33 @@ def test_fable_request_adaptation(thinking, effort):
     assert "temperature" not in body and "top_p" not in body
     if thinking:
         assert body["thinking"] == {"type":"adaptive"}
+
+
+@pytest.mark.parametrize("model", ["claude-sonnet-6", "sonnet-5-6", "SONNET-6", "haiku-5"])
+def test_future_versions_never_silently_downgrade(model):
+    assert resolve_model(model)[0] is None
+
+
+def test_sonnet_55_bedrock_and_prices():
+    from src.pricing import cost_usd, validate_billing_integrity
+    validate_billing_integrity()
+    profile = to_bedrock_model_id("claude-sonnet-5-5", "eu-central-1")
+    assert profile == "eu.anthropic.claude-sonnet-5-5"
+    assert from_bedrock_model_id(profile) == "claude-sonnet-5-5"
+    assert cost_usd("claude-sonnet-5-5", 1000000, 1000000, 1000000, 1000000) == pytest.approx(14.7)
+
+
+@pytest.mark.parametrize("thinking,expected", [
+    ({"type": "disabled"}, {"type": "between_tools"}),
+    ({"type": "enabled", "budget_tokens": 2048}, {"type": "adaptive"}),
+    ({"type": "adaptive", "display": "summarized"}, {"type": "adaptive", "display": "summarized"}),
+    ({"type": "between_tools"}, {"type": "between_tools"}),
+])
+def test_sonnet_55_legacy_request_controls(thinking, expected):
+    from src.model_request import adapt_model_request
+    body = {"thinking": thinking, "temperature": 0.2, "top_p": 0.9, "top_k": 20,
+            "output_config": {"effort": "medium", "format": {"type": "json_schema"}}}
+    adapt_model_request("claude-sonnet-5-5", body)
+    assert body["thinking"] == expected
+    assert body["output_config"] == {"effort": "medium", "format": {"type": "json_schema"}}
+    assert not ({"temperature", "top_p", "top_k"} & body.keys())

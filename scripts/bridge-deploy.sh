@@ -843,6 +843,23 @@ deploy_one_service() {
         info "${svc} uses pre-built image — skipping build"
     fi
 
+    # Avoid recreating a worker while it is still generating a response.
+    # Check after the build, immediately before recreation.
+    if [[ "$DRY_RUN" == "false" && "$svc" == worker* ]]; then
+        local idle_deadline=$(( $(date +%s) + 900 ))
+        local idle="false"
+        while (( $(date +%s) < idle_deadline )); do
+            idle=$(rssh "$host" "docker exec '$container' python -c 'import json,urllib.request; print(str(json.load(urllib.request.urlopen(\"http://127.0.0.1:8000/ready\", timeout=5)).get(\"ready_for_shutdown\", False)).lower())'" 2>/dev/null) || idle="false"
+            [[ "$idle" == "true" ]] && break
+            info "$container still serving requests; waiting before recreation..."
+            sleep 5
+        done
+        if [[ "$idle" != "true" ]]; then
+            error_ "$container did not become idle within 900s; refusing recreation"
+            return 1
+        fi
+    fi
+
     # Recreate — NEVER --remove-orphans
     info "Recreating ${svc}..."
     dry_rssh "$host" "cd ${REMOTE_REPO} && docker compose ${compose} up -d --no-deps --force-recreate ${svc} 2>&1" || {

@@ -54,22 +54,21 @@ class ModelInfo:
 # =============================================================================
 
 MODELS: List[ModelInfo] = [
-    # Sonnet Familie
-    # Sonnet 5 (Sonnet-Default seit 2026-07-16, bewusste Entscheidung Rafael):
-    # neuer Tokenizer (~30% statt 4.6's ~4.8x Token-Inflation) — der stabile
-    # 4.6-Nachfolger. Umgestellt weg vom konservativen 4.5-Default, um das
-    # Grosse-Prompt-Verhalten auf DIESER Bridge im echten Betrieb zu validieren.
-    # Beobachten: der 4.6-Failure (claude_code_sdk-Worker-Compaction liefert
-    # Summary statt Output, #46935) darf NICHT wiederkehren — bei Reproduktion
-    # is_default zurueck auf Sonnet 4.5 (unten). 4.5 bleibt per model="..."
-    # explizit anforderbar (Fallback).
+    # Sonnet 5.5 rollout approved 2026-09-30; aliases upgrade to this default.
+    ModelInfo(
+        id="claude-sonnet-5-5",
+        family="sonnet",
+        version="5.5",
+        release_date=date(2026, 9, 28),
+        description="Sonnet 5.5 - Default (1M context, adaptive thinking)",
+        is_default=True
+    ),
     ModelInfo(
         id="claude-sonnet-5",
         family="sonnet",
         version="5",
         release_date=date(2026, 6, 1),
-        description="Sonnet 5 - Default (neuer Tokenizer, stabiler 4.6-Nachfolger)",
-        is_default=True
+        description="Sonnet 5 - previous default"
     ),
     # Sonnet 4.6 (2026-02-17 release) ist hier bewusst NICHT registriert:
     # dokumentierte Regression bei instruction-following + ~4.8x Token-Verbrauch
@@ -318,8 +317,8 @@ def resolve_model(model_input: str) -> tuple[str, Optional[str]]:
 
     # Reject future versioned requests before fuzzy matching. Otherwise an
     # explicit newer model can silently become an older family default.
-    # Keep legacy shorthand upgrades; Sonnet/Haiku matching stays unchanged.
-    version_match = re.search(r"(?:^|-)(opus|fable)[- ]?(\d+)(?:[-.](\d+))?", model_lower)
+    # Keep legacy shorthand upgrades across every family.
+    version_match = re.search(r"(?:^|-)(opus|fable|sonnet|haiku)[- ]?(\d+)(?:[-.](\d+))?", model_lower)
     if version_match:
         family, major, minor = version_match.groups()
         requested_version = (int(major), int(minor or 0))
@@ -495,6 +494,7 @@ _BEDROCK_PROFILE_BASE_IDS: Dict[str, str] = {
     "claude-opus-4-7":            "anthropic.claude-opus-4-7",
     "claude-opus-4-8":            "anthropic.claude-opus-4-8",
     "claude-opus-5-5":            "anthropic.claude-opus-5-5",
+    "claude-sonnet-5-5":          "anthropic.claude-sonnet-5-5",
     "claude-sonnet-5":            "anthropic.claude-sonnet-5",
 }
 

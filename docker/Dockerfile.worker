@@ -1,7 +1,7 @@
 FROM node:24.21.0-bookworm-slim AS node-runtime
 FROM python:3.12-slim
 
-# Claude Code 2.1.280 requires Node >=22. Pin the current LTS runtime
+# Claude Code 2.1.285 requires Node >=22. Pin the current LTS runtime
 # instead of Debian's older nodejs package.
 COPY --from=node-runtime /usr/local/bin/node /usr/local/bin/node
 COPY --from=node-runtime /usr/local/lib/node_modules /usr/local/lib/node_modules
@@ -39,7 +39,7 @@ ENV PATH="/usr/local/bin:${PATH}"
 # (see commit e898c7c). Bump this version DELIBERATELY: change it here, deploy
 # to the dev bridge first, run the smoke + an energy phase-4 style
 # tools-disabled call, then roll to prod.
-RUN npm install -g @anthropic-ai/claude-code@2.1.280
+RUN npm install -g @anthropic-ai/claude-code@2.1.285
 
 # Copy the app code
 COPY . /app
