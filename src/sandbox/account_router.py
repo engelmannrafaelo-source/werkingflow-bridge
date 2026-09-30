@@ -109,6 +109,11 @@ def _evaluate(acct_name: str, info: dict[str, Any]) -> tuple[bool, str, float, i
             parts.append(f"session={session_pct}%")
         if headroom <= 0:
             parts.append("headroom_zero")
+        # Der Pool-State liefert kein soft_penalty_remaining_s; eine
+        # Tracker-Strafe steht nur in cooldown_remaining_s. Ohne diese Zeile
+        # hiess sie im NO_CAPACITY-Log "unknown".
+        if not parts and cooldown > 0:
+            parts.append(f"rate_limit_penalty={cooldown}s")
         reason = "not available (" + (", ".join(parts) if parts else "unknown") + ")"
         return False, reason, headroom, cooldown
 

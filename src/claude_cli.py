@@ -679,6 +679,27 @@ class RateLimitTracker:
 rate_limit_tracker = RateLimitTracker()
 
 
+# Ab dieser Auslastung (hoechstes Fenster) sperrt eine allowed_warning das
+# Konto kurz. Gleiche Grenze wie der harte session_pct-Filter (95 %).
+WARNING_PENALTY_MIN_UTILIZATION = 0.95
+
+
+def _warning_peak_utilization(rli: dict) -> Optional[float]:
+    """Hoechste gemeldete Auslastung ueber `utilization` und alle
+    `unifiedWindows`. None, wenn keine Zahl mitkam."""
+    values = []
+    top = rli.get("utilization")
+    if isinstance(top, (int, float)):
+        values.append(float(top))
+    windows = rli.get("unifiedWindows")
+    if isinstance(windows, dict):
+        for w in windows.values():
+            u = w.get("utilization") if isinstance(w, dict) else None
+            if isinstance(u, (int, float)):
+                values.append(float(u))
+    return max(values) if values else None
+
+
 def _handle_rate_limit_event(message, worker_id):
     """Process a rate_limit_event from the SDK.
 
@@ -717,11 +738,26 @@ def _handle_rate_limit_event(message, worker_id):
         return None
 
     if is_warning:
+        # allowed_warning heisst: diese Anfrage wurde ERLAUBT. Anthropic
+        # schickt die Warnung bei jeder Antwort, sobald eine Schwelle
+        # ueberschritten ist — gemessen 30.09.2026 schon bei 48 % Woche.
+        # Frueher gab jede Warnung 60 s Strafe: ein Konto mit Verkehr stand
+        # damit fast dauernd auf available=false, und der Sandbox-Pool meldete
+        # no_capacity bei 52 % Headroom. Gesperrt wird nur noch, wenn ein
+        # Fenster wirklich am Rand steht; ohne Auslastungsangabe wie bisher.
         util = rli.get("utilization")
         surpassed = rli.get("surpassedThreshold")
+        peak = _warning_peak_utilization(rli)
+        if peak is not None and peak < WARNING_PENALTY_MIN_UTILIZATION:
+            logger.info(
+                f"⏳ Worker {worker_id} {rl_type} warning "
+                f"(util={util}, peak={peak:.2f}, surpassed={surpassed}) — "
+                f"below {WARNING_PENALTY_MIN_UTILIZATION:.2f}, no penalty"
+            )
+            return None
         logger.info(
             f"⏳ Worker {worker_id} approaching {rl_type} limit "
-            f"(status={rl_status}, util={util}, "
+            f"(status={rl_status}, util={util}, peak={peak}, "
             f"surpassed={surpassed}) — soft penalty"
         )
         rate_limit_tracker.mark_soft_penalty(worker_id, 60)

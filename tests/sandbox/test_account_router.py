@@ -138,6 +138,18 @@ async def test_no_capacity_carries_per_account_reasons(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_tracker_penalty_reason_is_named_not_unknown(monkeypatch):
+    """30.09.2026: gmail/werking standen im NO_CAPACITY-Log als 'unknown',
+    obwohl nur eine Tracker-Strafe (cooldown_remaining_s) sie sperrte."""
+    _patch_pool_state(monkeypatch, {
+        "gmail": _mk_account(available=False, headroom_percent=52.0, cooldown_remaining_s=56),
+    })
+    with pytest.raises(NoCapacityError) as exc_info:
+        await pick_account()
+    assert exc_info.value.reasons["gmail"] == "not available (rate_limit_penalty=56s)"
+
+
+@pytest.mark.asyncio
 async def test_low_headroom_excluded_with_reason(monkeypatch):
     _patch_pool_state(monkeypatch, {
         "office": _mk_account(available=True, headroom_percent=5.0, cooldown_remaining_s=0),

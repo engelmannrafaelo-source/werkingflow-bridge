@@ -66,12 +66,43 @@ class TestHeartbeat:
 class TestWarning:
     """allowed_warning = approaching limit, soft penalty only, no raise."""
 
-    def test_allowed_warning_soft_penalty_no_raise(self):
-        ev = make_event(status="allowed_warning", utilization=0.92,
+    def test_allowed_warning_near_limit_soft_penalty_no_raise(self):
+        ev = make_event(status="allowed_warning", utilization=0.96,
                         surpassedThreshold=0.90)
         with patch.object(rate_limit_tracker, "mark_soft_penalty") as m:
             assert _handle_rate_limit_event(ev, "worker1") is None
             m.assert_called_once_with("worker1", 60)
+
+    def test_allowed_warning_far_from_limit_no_penalty(self):
+        """30.09.2026: gmail bekam bei 48 % Woche / 49 % 5 h jede Minute eine
+        allowed_warning und war damit dauernd gesperrt -> Sandbox no_capacity."""
+        ev = make_event(status="allowed_warning", utilization=0.48,
+                        rl_type="seven_day")
+        ev.raw["rate_limit_info"]["unifiedWindows"] = {
+            "five_hour": {"utilization": 0.49, "resetsAt": 1790740800},
+            "seven_day": {"utilization": 0.48, "resetsAt": 1791259200},
+        }
+        with patch.object(rate_limit_tracker, "mark_soft_penalty") as m:
+            assert _handle_rate_limit_event(ev, "worker3") is None
+            m.assert_not_called()
+
+    def test_allowed_warning_other_window_near_limit_penalizes(self):
+        """Top-level utilization niedrig, aber das 5-h-Fenster steht am Rand."""
+        ev = make_event(status="allowed_warning", utilization=0.40,
+                        rl_type="seven_day")
+        ev.raw["rate_limit_info"]["unifiedWindows"] = {
+            "five_hour": {"utilization": 0.97},
+            "seven_day": {"utilization": 0.40},
+        }
+        with patch.object(rate_limit_tracker, "mark_soft_penalty") as m:
+            assert _handle_rate_limit_event(ev, "worker4") is None
+            m.assert_called_once_with("worker4", 60)
+
+    def test_allowed_warning_without_utilization_keeps_penalty(self):
+        ev = make_event(status="allowed_warning")
+        with patch.object(rate_limit_tracker, "mark_soft_penalty") as m:
+            assert _handle_rate_limit_event(ev, "worker2") is None
+            m.assert_called_once_with("worker2", 60)
 
 
 class TestHit:
