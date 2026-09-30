@@ -158,6 +158,7 @@ async def _claim_and_load_one(conn: Any) -> Optional[Dict[str, Any]]:
                d.kind            AS kind,
                d.attempts        AS attempts,
                d.token_cleartext AS token_cleartext,
+               d.origin_app_id   AS origin_app_id,
                t.expires_at      AS expires_at,
                t.user_id         AS user_id,
                u.email           AS email,
@@ -179,7 +180,13 @@ def _build_payload(row: Dict[str, Any]) -> Dict[str, Any]:
     """
     Build the JSON payload sent to the app, per ADR cross-app/0002:
 
-        { token, kind, email, expiresAt, userId }
+        { token, kind, email, expiresAt, userId, appId? }
+
+    `appId` is the X-App-ID of the request that issued the token (migration
+    062). It differs from the receiving app when an app without its own
+    receiver delegates its mail (routes._MAIL_DELEGATE_APP_IDS), so the
+    receiver can link back to where the reset was requested. Omitted for
+    rows enqueued before 062 — receivers treat a missing appId as "self".
 
     `token` is the cleartext loaded from auth_token_webhook_deliveries
     (see migration 021 for the cleartext-lifecycle invariant). The row is
@@ -200,13 +207,17 @@ def _build_payload(row: Dict[str, Any]) -> Dict[str, Any]:
             f"cleartext — chk_cleartext_lifecycle constraint violated."
         )
     expires_at = row["expires_at"]
-    return {
+    payload: Dict[str, Any] = {
         "token": cleartext,
         "kind": row["kind"],
         "email": row["email"],
         "expiresAt": expires_at.isoformat() if expires_at else None,
         "userId": str(row["user_id"]),
     }
+    origin_app_id = row.get("origin_app_id")
+    if origin_app_id:
+        payload["appId"] = origin_app_id
+    return payload
 
 
 async def _http_post_with_signature(

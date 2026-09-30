@@ -726,7 +726,8 @@ async def register(body: RegisterRequest) -> Dict[str, Any]:
                 if issued:
                     cleartext, token_id = issued
                     await _enqueue_webhook_delivery(
-                        vc, token_id, body.appId, _TOKEN_TYPE_TO_KIND_VERIFY, cleartext
+                        vc, token_id, body.appId, _TOKEN_TYPE_TO_KIND_VERIFY, cleartext,
+                        body.appId,
                     )
         except Exception as exc:
             logger.warning(
@@ -880,6 +881,7 @@ async def _enqueue_webhook_delivery(
     app_id: str,
     kind: str,
     cleartext: str,
+    origin_app_id: str,
 ) -> None:
     """
     INSERT a pending row that the background dispatcher will pick up.
@@ -891,17 +893,25 @@ async def _enqueue_webhook_delivery(
     `cleartext` is the user-facing token string. It is required while
     the row is pending so the dispatcher can put it in the webhook
     payload (see migration 021 for the cleartext-lifecycle invariant).
+
+    `app_id` is the RECEIVER (whose webhook gets the POST); `origin_app_id`
+    is the X-App-ID of the request that issued the token. They differ for
+    apps that deliver their mail through another app's receiver (see
+    _MAIL_DELEGATE_APP_IDS); the dispatcher sends the origin as `appId` so
+    the receiver can point the link back to where it was requested
+    (migration 062).
     """
     await conn.execute(
         """
         INSERT INTO auth_token_webhook_deliveries
-               (token_id, app_id, kind, status, attempts, token_cleartext)
-        VALUES ($1, $2::app_id, $3, 'pending', 0, $4)
+               (token_id, app_id, kind, status, attempts, token_cleartext, origin_app_id)
+        VALUES ($1, $2::app_id, $3, 'pending', 0, $4, $5)
         """,
         token_id,
         app_id,
         kind,
         cleartext,
+        origin_app_id,
     )
 
 
@@ -951,6 +961,32 @@ def _require_app_id_header(x_app_id: Optional[str]) -> str:
     return x_app_id
 
 
+# Apps that share the Bridge account but have no webhook receiver of their own:
+# their password-reset mail is delivered through another app's receiver, which
+# builds the link from the `appId` in the payload (Rafael, 30.09.2026,
+# e-reset-link-ziel-20260930: a customer resets a forgotten password where he
+# requested it). Only forgot-password uses this — verification mails keep the
+# strict one-app-one-receiver rule of _require_app_id_header.
+_MAIL_DELEGATE_APP_IDS: Dict[str, str] = {
+    "werking-tools": "werking-report",
+}
+
+
+def _resolve_reset_mail_route(x_app_id: Optional[str]) -> Tuple[str, str]:
+    """
+    Return (origin_app_id, receiver_app_id) for forgot-password.
+
+    Same upfront, pre-lookup validation as _require_app_id_header (no user
+    existence oracle). A delegating app is accepted only if its receiver is a
+    wired-up Bridge-Auth app; otherwise the same 400/503 as for the receiver.
+    """
+    if x_app_id and x_app_id in _MAIL_DELEGATE_APP_IDS:
+        receiver = _require_app_id_header(_MAIL_DELEGATE_APP_IDS[x_app_id])
+        return x_app_id, receiver
+    app_id = _require_app_id_header(x_app_id)
+    return app_id, app_id
+
+
 # ---------------------------------------------------------------------------
 # POST /v1/auth/forgot-password
 # ---------------------------------------------------------------------------
@@ -978,7 +1014,7 @@ async def forgot_password(
     X-App-ID is validated UPFRONT (before the email lookup) so a missing
     header cannot double as an oracle for user existence.
     """
-    app_id = _require_app_id_header(x_app_id)
+    origin_app_id, app_id = _resolve_reset_mail_route(x_app_id)
 
     pool = get_pool()
     async with pool.acquire() as conn:
@@ -990,11 +1026,12 @@ async def forgot_password(
         # Anti-enumeration: unknown user / closed account => 204 silent.
         if not row or row["anonymized_at"] is not None:
             logger.info(
-                "identity.forgot_password: silent-skip email=%s known=%s anonymized=%s app_id=%s",
+                "identity.forgot_password: silent-skip email=%s known=%s anonymized=%s app_id=%s origin_app_id=%s",
                 body.email,
                 bool(row),
                 bool(row and row["anonymized_at"]),
                 app_id,
+                origin_app_id,
             )
             return Response(status_code=204)
 
@@ -1015,6 +1052,7 @@ async def forgot_password(
         async with conn.transaction():
             await _enqueue_webhook_delivery(
                 conn, token_id, app_id, _TOKEN_TYPE_TO_KIND_RESET, cleartext,
+                origin_app_id,
             )
 
     logger.debug(
@@ -1025,10 +1063,11 @@ async def forgot_password(
         cleartext,
     )
     logger.info(
-        "identity.forgot_password: token enqueued email=%s user_id=%s app_id=%s token_id=%s",
+        "identity.forgot_password: token enqueued email=%s user_id=%s app_id=%s origin_app_id=%s token_id=%s",
         body.email,
         row["id"],
         app_id,
+        origin_app_id,
         token_id,
     )
     return Response(status_code=204)
@@ -1163,6 +1202,7 @@ async def resend_verification(
         async with conn.transaction():
             await _enqueue_webhook_delivery(
                 conn, token_id, app_id, _TOKEN_TYPE_TO_KIND_RESEND, cleartext,
+                app_id,
             )
 
     logger.debug(

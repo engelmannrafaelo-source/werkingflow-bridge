@@ -188,6 +188,22 @@ class TestBuildPayload:
         assert payload["userId"] == str(row["user_id"])
         assert isinstance(payload["expiresAt"], str)
 
+    def test_payload_carries_origin_app_id(self):
+        """Migration 062: the requesting app travels as `appId` so the
+        receiver links back to where the reset was requested."""
+        row = _make_row(kind="reset", cleartext="t0k3n")
+        row["origin_app_id"] = "werking-tools"
+        assert wd._build_payload(row)["appId"] == "werking-tools"
+
+    def test_payload_omits_app_id_for_legacy_rows(self):
+        """Rows enqueued before 062 have no origin — no `appId` key at all,
+        receivers keep their pre-062 behaviour."""
+        row = _make_row(kind="reset", cleartext="t0k3n")
+        row["origin_app_id"] = None
+        assert "appId" not in wd._build_payload(row)
+        del row["origin_app_id"]
+        assert "appId" not in wd._build_payload(row)
+
     def test_missing_cleartext_raises(self):
         """The CHECK constraint should make this unreachable; still defensive."""
         row = _make_row(cleartext="")

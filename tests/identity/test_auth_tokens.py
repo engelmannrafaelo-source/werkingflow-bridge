@@ -802,13 +802,54 @@ class TestWebhookDeliveryEnqueue:
             None,
         )
         assert delivery_call is not None
-        # Args: (sql, token_id, app_id, kind, cleartext)
+        # Args: (sql, token_id, app_id, kind, cleartext, origin_app_id)
         assert delivery_call.args[2] == "werking-energy"
         assert delivery_call.args[3] == "reset"
+        assert delivery_call.args[5] == "werking-energy"
         # Cleartext is the 64-char hex token
         cleartext = delivery_call.args[4]
         assert isinstance(cleartext, str) and len(cleartext) == 64
         int(cleartext, 16)  # parseable as hex
+
+    def test_forgot_password_from_tools_goes_through_report_receiver(self, client: TestClient):
+        """werking-tools has no receiver of its own (Rafael 30.09.2026,
+        e-reset-link-ziel-20260930): the reset is accepted, delivered via the
+        werking-report webhook, and the origin is kept for the link."""
+        pool, conn = _mock_pool(
+            fetchrow_results=[_user_lookup_row()],
+            fetchval_results=[0],
+        )
+
+        with patch("src.identity.routes.get_pool", return_value=pool):
+            resp = client.post(
+                "/v1/auth/forgot-password",
+                json={"email": "alice@example.com"},
+                headers={"X-App-ID": "werking-tools"},
+            )
+
+        assert resp.status_code == 204
+        delivery_call = next(
+            (c for c in conn.execute.await_args_list
+             if "INSERT INTO auth_token_webhook_deliveries" in c.args[0]),
+            None,
+        )
+        assert delivery_call is not None
+        assert delivery_call.args[2] == "werking-report"
+        assert delivery_call.args[3] == "reset"
+        assert delivery_call.args[5] == "werking-tools"
+
+    def test_resend_verification_from_tools_stays_rejected(self, client: TestClient):
+        """Delegation is for the reset mail only — verification keeps the
+        strict one-app-one-receiver rule, checked before any lookup."""
+        pool, conn = _mock_pool()
+        with patch("src.identity.routes.get_pool", return_value=pool):
+            resp = client.post(
+                "/v1/auth/resend-verification",
+                json={"email": "alice@example.com"},
+                headers={"X-App-ID": "werking-tools"},
+            )
+        assert resp.status_code == 400
+        conn.fetchrow.assert_not_awaited()
 
     def test_resend_verification_enqueues_with_kind_resend(self, client: TestClient):
         pool, conn = _mock_pool(
