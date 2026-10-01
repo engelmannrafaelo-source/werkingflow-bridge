@@ -1022,6 +1022,17 @@ async def cache_request_body_dependency(request: Request) -> None:
     observe_input_limit(request)
 
 
+def is_gemini_vision_request(request: Request) -> bool:
+    """True for the explicit Gemini image lane (X-Vision-Provider: gemini or
+    provider_tier=gemini-vision). That lane consumes no Claude account, so the
+    pool/worker gates must not reject it (nginx side: pool_router.choose,
+    gemini_vision_bypass). Narrow on purpose: no default-provider switch."""
+    if (request.headers.get("X-Vision-Provider") or "").strip().lower() == "gemini":
+        return True
+    body = getattr(request.state, "cached_body_dict", None)
+    return isinstance(body, dict) and body.get("provider_tier") == "gemini-vision"
+
+
 async def enforce_pool_admission(request: Request) -> None:
     """
     Enforce the adaptive token budget for a POOL-BOUND request — queueing if
@@ -1093,4 +1104,6 @@ async def adaptive_limit_dependency(request: Request) -> None:
     their pool-bound branch — see /v1/research.
     """
     await cache_request_body_dependency(request)
+    if is_gemini_vision_request(request):
+        return  # Gemini lane: no Claude account, nothing to admit against
     await enforce_pool_admission(request)

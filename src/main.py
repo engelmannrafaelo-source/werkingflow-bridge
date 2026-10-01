@@ -167,6 +167,7 @@ from src.middleware.adaptive_limiter import (
     adaptive_limit_dependency,
     cache_request_body_dependency,
     enforce_pool_admission,
+    is_gemini_vision_request,
     get_adaptive_limiter,
     estimate_request_tokens,
 )
@@ -2328,7 +2329,13 @@ async def chat_completions(
         worker_id = os.getenv("INSTANCE_NAME", "unknown")
         _self_worker = worker_id  # defined once; all error branches below use this
         from src.claude_cli import rate_limit_tracker
-        if rate_limit_tracker.should_reject_new_request(worker_id):
+        # Gemini-Bildweg braucht kein Claude-Konto: die Konto-Sperre dieses
+        # Workers (Anthropic-Ratelimit) darf ihn nicht abweisen. Zweite Haelfte
+        # des nginx-Bypasses (pool_router.choose, 1f88e64) — ohne sie meldete
+        # nginx fuer den Worker-429 "anthropic_rate_limit". Eng: nur der
+        # ausdrueckliche Header bzw. provider_tier, nicht der Default-Schalter.
+        _gemini_vision_request = is_gemini_vision_request(request)
+        if not _gemini_vision_request and rate_limit_tracker.should_reject_new_request(worker_id):
             retry_after = rate_limit_tracker.get_retry_after(worker_id) or 0
             limit_type = "HARD" if rate_limit_tracker.is_hard_limited(worker_id) else "soft"
 
