@@ -255,6 +255,9 @@ echo "=== Scenario: pool EXHAUSTED (no eligible account) ==="
 start_stack exhausted
 # The regression this file exists for: before the access-phase fix this was 200.
 assert "chat: hard reject (no alternative path)"        /v1/chat/completions 429 n/a
+# Gemini-Bildweg braucht kein Claude-Konto: leerer Pool darf ihn nicht abweisen.
+assert "chat: gemini vision bypasses the gate"          /v1/chat/completions 200 absent "X-Vision-Provider: gemini"
+assert "chat: other X-Vision-Provider still rejected"   /v1/chat/completions 429 n/a "X-Vision-Provider: claude"
 # Carve-out: research/jobs must still reach a worker, marked, so the app can
 # choose the research-cloud path — whose trigger IS pool saturation.
 assert "research: routed + marked (overflow-capable)"   /v1/research         200 1

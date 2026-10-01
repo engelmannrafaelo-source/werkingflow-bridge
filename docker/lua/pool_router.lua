@@ -254,6 +254,21 @@ end
 --   endpoint-agnostic.
 function M.choose(opts)
     local overflow_capable = (opts and opts.overflow_capable) or false
+
+    -- Gemini-Bildweg (X-Vision-Provider: gemini): braucht KEIN Claude-Konto,
+    -- also darf ihn weder das Wochenfenster noch ein leerer Pool abweisen
+    -- (Rafael 01.10.2026). Er laeuft bewusst lokal (upstreams-primary.conf:
+    -- auf Prod liegt kein Gemini-Key). Kein Kontopick: Round-Robin genuegt;
+    -- die App erzwingt Flag/Key/Nachweis selbst (gemini_vision_gate).
+    -- Eng: nur dieser eine Header-Wert, keine allgemeine Umgehung.
+    local vp = ngx.var.http_x_vision_provider
+    if vp and vp:lower() == "gemini" then
+        local pick = round_robin_worker()
+        count_decision(pick)
+        ngx.var.target_worker   = pick
+        ngx.var.x_pool_decision = "gemini_vision_bypass"
+        return
+    end
     local state_str      = shared:get("state")
     local state_ts       = tonumber(shared:get("ts")) or 0
     local age            = ngx.now() - state_ts
