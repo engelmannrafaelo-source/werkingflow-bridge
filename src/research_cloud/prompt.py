@@ -205,8 +205,27 @@ _FETCH_MAX_USES = {"quick": 3, "standard": 6, "deep": 10, "exhaustive": 15}
 _DEFAULT_DEPTH = "standard"
 
 
+# perplexity_search (RESEARCH_PERPLEXITY_ENABLED, Rafael 02.10.2026). The tool
+# description carries the same rules; the prompt states the ORDER, because the
+# order is what the library block above already defines and Perplexity must
+# slot in behind it, not in front of it.
+_PERPLEXITY_SECTION = """
+
+## Perplexity-Recherche (`perplexity_search`)
+
+Mit `perplexity_search` stellst du eine konkrete Frage an eine Web-Recherche, die viele Quellen auswertet
+und eine nummerierte Quellenliste zurückgibt. Nutze sie, um die einschlägigen Primärquellen schnell zu finden
+(Normausgaben, Gesetzesstellen, Hersteller-Datenblätter, Behördenseiten) — die Bibliothek bleibt die erste Quelle.
+
+Eine Perplexity-Antwort ist kein Beleg. Jede Zahl oder Vorgabe, die der Bericht trägt, liest du mit `web_fetch`
+an der Originalquelle nach und zitierst diese Originalquelle. Was du nicht an der Quelle prüfen konntest,
+kennzeichnest du als „nicht verifiziert (nur Perplexity)“."""
+
+
 def build_system_prompt(
-    depth: Optional[str], library_index: Optional[Dict[str, Any]] = None
+    depth: Optional[str],
+    library_index: Optional[Dict[str, Any]] = None,
+    perplexity: bool = False,
 ) -> str:
     """Build the research system prompt.
 
@@ -218,6 +237,8 @@ def build_system_prompt(
     depth_key = depth if depth in _DEPTH_INSTRUCTION else _DEFAULT_DEPTH
     prompt = SYSTEM_PROMPT_TEMPLATE.format(depth_instruction=_DEPTH_INSTRUCTION[depth_key])
     prompt += build_library_catalogue(library_index)
+    if perplexity:
+        prompt += _PERPLEXITY_SECTION
     return prompt
 
 

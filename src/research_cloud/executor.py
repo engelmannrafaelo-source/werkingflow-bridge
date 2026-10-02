@@ -15,6 +15,11 @@ a response with a pending *client* tool_use always has stop_reason
 "tool_use", never "pause_turn", even when server_tool_use blocks are also
 present in the same response — so the pause_turn continuation branch below
 is untouched, and library tool calls are a second, independent branch.
+
+A third client tool, perplexity_search (perplexity.py), is flag-gated via
+RESEARCH_PERPLEXITY_ENABLED (Rafael 2026-10-02). Its query goes to a third
+party and therefore passes the caller-supplied anonymizer first — the same
+fail-closed gate as the research prompt; if that gate fails, the run aborts.
 """
 from __future__ import annotations
 
@@ -23,7 +28,7 @@ import json
 import logging
 import os
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Awaitable, Callable, Dict, List, Optional
 
 import httpx
 
@@ -35,6 +40,18 @@ from src.research_cloud.library import (
     library_enabled,
     load_library_config,
     load_library_for_run,
+)
+from src.research_cloud.perplexity import (
+    PERPLEXITY_TOOL,
+    PERPLEXITY_TOOL_NAME,
+    PerplexityCallError,
+    PerplexityConfig,
+    PerplexityUnavailableError,
+    ask_perplexity,
+    check_perplexity_usable,
+    format_tool_result_text,
+    load_perplexity_config,
+    perplexity_enabled,
 )
 from src.research_cloud.models import (
     AnthropicMessagesResponse,
@@ -79,8 +96,6 @@ def _log_key_lane_once(api_key: str) -> None:
 
 ANTHROPIC_API_URL = "https://api.anthropic.com/v1/messages"
 ANTHROPIC_VERSION = "2023-06-01"
-
-_LIBRARY_TOOL_NAMES = frozenset({"library_index", "library_get"})
 
 _LIBRARY_INDEX_TOOL: Dict[str, Any] = {
     "name": "library_index",
@@ -170,12 +185,18 @@ def _mark_cache_control(messages: List[Dict[str, Any]]) -> None:
             break
 
 
-def _build_tools(config: ResearchCloudConfig, library_cfg: LibraryConfig) -> List[Dict[str, Any]]:
+def _build_tools(
+    config: ResearchCloudConfig,
+    library_cfg: LibraryConfig,
+    perplexity_cfg: Optional[PerplexityConfig] = None,
+) -> List[Dict[str, Any]]:
     tools = [
         {"type": "web_search_20260209", "name": "web_search", "max_uses": config.web_search_max_uses},
         {"type": "web_fetch_20260209", "name": "web_fetch", "max_uses": config.web_fetch_max_uses},
     ]
-    if library_enabled(library_cfg):
+    with_library = library_enabled(library_cfg)
+    with_perplexity = perplexity_cfg is not None and perplexity_enabled(perplexity_cfg)
+    if with_library or with_perplexity:
         # With client tools in the mix, the web tools' dynamic filtering
         # (code execution under the hood) breaks the turn structure: once a
         # client tool_use interleaves with code-exec-backed server tools, a
@@ -186,14 +207,74 @@ def _build_tools(config: ResearchCloudConfig, library_cfg: LibraryConfig) -> Lis
         # server-tools.md § Mixing server tools and client tools). Forcing
         # direct invocation disables the internal code execution entirely —
         # deterministic, and per docs also the ZDR-eligible configuration.
+        # This holds for ANY client tool, not just the library — Perplexity
+        # alone triggers the same interleaving.
         for t in tools:
             t["allowed_callers"] = ["direct"]
-        # Copies, not the module-level dicts: anything downstream that mutates
-        # a tool entry (marker stamping, future per-request tweaks) must never
-        # bleed into other requests via shared globals.
+    # Copies, not the module-level dicts: anything downstream that mutates
+    # a tool entry (marker stamping, future per-request tweaks) must never
+    # bleed into other requests via shared globals.
+    if with_library:
         tools.append(copy.deepcopy(_LIBRARY_INDEX_TOOL))
         tools.append(copy.deepcopy(_LIBRARY_GET_TOOL))
+    if with_perplexity:
+        tools.append(copy.deepcopy(PERPLEXITY_TOOL))
     return tools
+
+
+def _client_tool_names(tools: List[Dict[str, Any]]) -> frozenset:
+    """Names of the client tools actually offered on this request — the only
+    ones the loop may answer."""
+    return frozenset(t["name"] for t in tools if "type" not in t)
+
+
+async def _handle_perplexity_tool_call(
+    block: Dict[str, Any],
+    perplexity_cfg: PerplexityConfig,
+    anonymize: Callable[[str], Awaitable[str]],
+    client: httpx.AsyncClient,
+) -> tuple:
+    """Execute one perplexity_search tool_use. Returns (tool_result, answer|None).
+
+    Anonymization failure is NOT fail-soft: it raises ResearchCloudExecutorError
+    and aborts the run — the query is never sent in clear text, and a gate that
+    silently let the model continue would hide a broken privacy path. Everything
+    after the gate (HTTP, incomplete answer) is fail-soft like library_get.
+    """
+    tool_use_id = block.get("id")
+    frage = ((block.get("input") or {}).get("frage") or "").strip()
+    if not frage:
+        return (
+            {"type": "tool_result", "tool_use_id": tool_use_id, "is_error": True,
+             "content": [{"type": "text", "text": "perplexity_search braucht den Parameter 'frage'."}]},
+            None,
+        )
+    try:
+        anonymized = await anonymize(frage)
+    except Exception as e:
+        raise ResearchCloudExecutorError(
+            f"perplexity_search: anonymize gate failed — refusing to send the query to Perplexity: {e}"
+        ) from e
+    if not anonymized or not anonymized.strip():
+        raise ResearchCloudExecutorError(
+            "perplexity_search: anonymize gate returned empty text — refusing to send the query"
+        )
+    try:
+        answer = await ask_perplexity(anonymized, perplexity_cfg, client)
+    except PerplexityCallError as e:
+        logger.warning(f"research-cloud: perplexity_search failed (fail-soft): {e}")
+        return (
+            {"type": "tool_result", "tool_use_id": tool_use_id, "is_error": True,
+             "content": [{"type": "text", "text": f"Perplexity nicht erreichbar: {e}. Weiter mit web_search."}]},
+            None,
+        )
+    for w in answer.warnungen:
+        logger.warning(f"research-cloud: perplexity_search: {w}")
+    return (
+        {"type": "tool_result", "tool_use_id": tool_use_id,
+         "content": [{"type": "text", "text": format_tool_result_text(answer)}]},
+        answer,
+    )
 
 
 async def _handle_library_tool_call(
@@ -262,6 +343,9 @@ async def run_research_cloud(
     client: Optional[httpx.AsyncClient] = None,
     library_config: Optional[LibraryConfig] = None,
     library_index: Optional[Dict[str, Any]] = None,
+    perplexity_config: Optional[PerplexityConfig] = None,
+    anonymize: Optional[Callable[[str], Awaitable[str]]] = None,
+    perplexity_client: Optional[httpx.AsyncClient] = None,
 ) -> ResearchCloudResult:
     """Run one research-cloud job to completion (all pause_turn continuations).
 
@@ -324,7 +408,19 @@ async def run_research_cloud(
         raise ResearchCloudExecutorError(
             "research library is enabled but no index was loaded for this run"
         )
-    tools = _build_tools(config, library_cfg)
+    perplexity_cfg = perplexity_config or load_perplexity_config()
+    try:
+        check_perplexity_usable(perplexity_cfg)
+    except PerplexityUnavailableError as e:
+        raise ResearchCloudExecutorError(str(e)) from e
+    if perplexity_enabled(perplexity_cfg) and anonymize is None:
+        # No anonymizer, no third-party tool — never "send it raw this once".
+        raise ResearchCloudExecutorError(
+            "perplexity_search is enabled but no anonymizer was handed to the executor — "
+            "refusing to offer a tool whose queries would leave unanonymized"
+        )
+    tools = _build_tools(config, library_cfg, perplexity_cfg)
+    client_tools = _client_tool_names(tools)
     system: List[Dict[str, Any]] = [
         {"type": "text", "text": system_prompt, "cache_control": {"type": "ephemeral"}}
     ]
@@ -333,7 +429,9 @@ async def run_research_cloud(
     base_messages: List[Dict[str, Any]] = [{"role": "user", "content": query}]
     messages: List[Dict[str, Any]] = list(base_messages)
     usage = ResearchCloudUsage()
-    searches = fetches = library_calls = 0
+    searches = fetches = library_calls = perplexity_calls = 0
+    perplexity_cost_usd = 0.0
+    perplexity_cost_missing = 0
     container_id: Optional[str] = None
     iteration = 0
     t0 = time.monotonic()
@@ -341,6 +439,8 @@ async def run_research_cloud(
 
     owns_client = client is None
     http_client = client or httpx.AsyncClient(timeout=config.http_timeout_seconds)
+    owns_pplx_client = perplexity_client is None and perplexity_enabled(perplexity_cfg)
+    pplx_client = perplexity_client or (httpx.AsyncClient() if owns_pplx_client else None)
     try:
         for iteration in range(config.max_continuations):
             _mark_cache_control(messages)
@@ -392,9 +492,9 @@ async def run_research_cloud(
                 # "tool_use", never "pause_turn" — even if server_tool_use
                 # blocks are also present in this same response (bridge-research
                 # 2026-07-31, platform.claude.com/docs/.../handling-stop-reasons).
-                # The only client tools this executor defines are the library
-                # ones; anything else is an unhandled tool the model was never
-                # given (fail loud, not a silent skip).
+                # Only the client tools offered on THIS request are answerable;
+                # anything else is a tool the model was never given (fail
+                # loud, not a silent skip).
                 tool_use_blocks = [b for b in parsed.content if b.get("type") == "tool_use"]
                 if not tool_use_blocks:
                     raise ResearchCloudExecutorError(
@@ -404,11 +504,11 @@ async def run_research_cloud(
                 # Fail fast on anything we cannot answer — an unanswered
                 # client tool_use would otherwise surface later as an opaque
                 # API 400 ("tool_use ids were found without tool_result").
-                foreign = [b.get("name") for b in tool_use_blocks if b.get("name") not in _LIBRARY_TOOL_NAMES]
+                foreign = [b.get("name") for b in tool_use_blocks if b.get("name") not in client_tools]
                 if foreign:
                     raise ResearchCloudExecutorError(
                         f"research-cloud executor cannot answer client tools {foreign!r} — "
-                        f"only {sorted(_LIBRARY_TOOL_NAMES)} are defined on this request"
+                        f"only {sorted(client_tools)} are defined on this request"
                     )
                 # Programmatic tool calling (caller != direct) would mean the
                 # call comes from paused code in a server-side container whose
@@ -428,6 +528,38 @@ async def run_research_cloud(
                 tool_results = []
                 for tool_block in tool_use_blocks:
                     t_start = time.monotonic()
+                    if tool_block.get("name") == PERPLEXITY_TOOL_NAME:
+                        if perplexity_calls >= config.perplexity_max_uses:
+                            tool_results.append({
+                                "type": "tool_result", "tool_use_id": tool_block.get("id"), "is_error": True,
+                                "content": [{"type": "text", "text": (
+                                    f"perplexity_search: Budget dieser Recherche erschöpft "
+                                    f"({config.perplexity_max_uses} Aufrufe). Weiter mit web_search/web_fetch."
+                                )}],
+                            })
+                            continue
+                        perplexity_calls += 1
+                        tool_result, answer = await _handle_perplexity_tool_call(
+                            tool_block, perplexity_cfg, anonymize, pplx_client
+                        )
+                        if answer is not None:
+                            if answer.kosten_usd is None:
+                                perplexity_cost_missing += 1
+                                logger.error(
+                                    "research-cloud: perplexity answer carries no usage.cost.total_cost — "
+                                    "this call is NOT in the booked cost"
+                                )
+                            else:
+                                perplexity_cost_usd += answer.kosten_usd
+                        logger.info(
+                            f"research-cloud perplexity call -> "
+                            f"{'ERROR' if tool_result.get('is_error') else 'ok'}, "
+                            f"{len(answer.quellen) if answer else 0} sources, "
+                            f"cost_usd={answer.kosten_usd if answer else None}, "
+                            f"{(time.monotonic() - t_start) * 1000:.0f}ms"
+                        )
+                        tool_results.append(tool_result)
+                        continue
                     tool_result = await _handle_library_tool_call(
                         tool_block, library_cfg, library_index or {}
                     )
@@ -482,6 +614,8 @@ async def run_research_cloud(
     finally:
         if owns_client:
             await http_client.aclose()
+        if owns_pplx_client and pplx_client is not None:
+            await pplx_client.aclose()
 
     duration = time.monotonic() - t0
     text = "\n\n".join(
@@ -495,6 +629,9 @@ async def run_research_cloud(
         searches=searches,
         fetches=fetches,
         library_calls=library_calls,
+        perplexity_calls=perplexity_calls,
+        perplexity_cost_usd=round(perplexity_cost_usd, 6),
+        perplexity_cost_missing=perplexity_cost_missing,
         iterations=iteration + 1,
         stop_reason=parsed.stop_reason,
         duration_seconds=round(duration, 2),

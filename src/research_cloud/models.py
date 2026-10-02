@@ -37,6 +37,12 @@ class ResearchCloudResult(BaseModel):
     searches: int = 0
     fetches: int = 0
     library_calls: int = 0
+    # perplexity_search (RESEARCH_PERPLEXITY_ENABLED): calls that went out,
+    # their summed cost as reported by Perplexity (USD), and how many answers
+    # carried no cost — those are paid but NOT in perplexity_cost_usd.
+    perplexity_calls: int = 0
+    perplexity_cost_usd: float = 0.0
+    perplexity_cost_missing: int = 0
     iterations: int = 0
     stop_reason: Optional[str] = None
     duration_seconds: float = 0.0
@@ -64,6 +70,9 @@ class ResearchCloudConfig(BaseModel):
     http_timeout_seconds: float = 900.0
     web_search_max_uses: int = 15
     web_fetch_max_uses: int = 10
+    # Ceiling for perplexity_search per run (Auftrag 02.10.2026: Vorschlag 8).
+    # ~0.05 USD per medium call measured on the Mühl questions -> <= ~0.40 USD.
+    perplexity_max_uses: int = 8
     # Live-verified 2026-07-27: our org's API only accepts 'global'|'us' for
     # inference_geo — the spec's "eu" intent 400s on every request. Default to
     # None (omit the param); the env override RESEARCH_CLOUD_INFERENCE_GEO

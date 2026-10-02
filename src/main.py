@@ -5177,7 +5177,13 @@ async def _execute_research_cloud_impl(
                 f"benutzbar — die Recherche wurde nicht gestartet: {e}"
             ),
         )
-    system_prompt = build_system_prompt(request_body.depth, library_index=library_index)
+    from src.research_cloud.perplexity import load_perplexity_config, perplexity_enabled
+    perplexity_cfg = load_perplexity_config()
+    system_prompt = build_system_prompt(
+        request_body.depth,
+        library_index=library_index,
+        perplexity=perplexity_enabled(perplexity_cfg),
+    )
     search_max_uses, fetch_max_uses = search_budget_for_depth(request_body.depth)
     config = ResearchCloudConfig(web_search_max_uses=search_max_uses, web_fetch_max_uses=fetch_max_uses)
 
@@ -5188,6 +5194,10 @@ async def _execute_research_cloud_impl(
             config=config,
             library_config=library_cfg,
             library_index=library_index,
+            perplexity_config=perplexity_cfg,
+            # Every perplexity_search query passes the SAME fail-closed gate as
+            # the prompt above before it leaves for the third party.
+            anonymize=lambda text: anonymize_query_for_cloud(request, text),
         )
     except ResearchCloudExecutorError as e:
         execution_time = time.time() - start_time
@@ -5244,6 +5254,9 @@ async def _execute_research_cloud_impl(
             cache_read_tokens=result.usage.cache_read_input_tokens,
             cache_creation_tokens=result.usage.cache_creation_input_tokens,
             search_count=result.searches,
+            # Perplexity bills per call outside the Anthropic tokens; the
+            # amount is what Perplexity itself reported (usage.cost.total_cost).
+            extra_cost_usd=result.perplexity_cost_usd,
             status="success",
             duration_ms=int(result.duration_seconds * 1000),
             app_env=attribution_ctx.get("app_env") if attribution_ctx else None,
@@ -5252,6 +5265,9 @@ async def _execute_research_cloud_impl(
                 "searches": result.searches,
                 "fetches": result.fetches,
                 "library_calls": result.library_calls,
+                "perplexity_calls": result.perplexity_calls,
+                "perplexity_cost_usd": result.perplexity_cost_usd,
+                "perplexity_cost_missing": result.perplexity_cost_missing,
                 "iterations": result.iterations,
                 "container_id": result.container_id,
                 "stop_reason": result.stop_reason,

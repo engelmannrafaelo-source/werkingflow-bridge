@@ -211,6 +211,7 @@ def cost_usd(
     cache_read_tokens: int = 0,
     cache_creation_tokens: int = 0,
     search_count: int = 0,
+    extra_cost_usd: float = 0.0,
 ) -> float:
     """USD cost of one LLM call — the pricing SSoT (uncached input + cache
     write/read + output, per Anthropic/Bedrock usage semantics, plus
@@ -226,6 +227,9 @@ def cost_usd(
         + (cache_read_tokens or 0) / 1_000_000.0 * p["in"] * p.get("cache_read_mult", CACHE_READ_MULT)
         + (output_tokens or 0) / 1_000_000.0 * p["out"]
         + (search_count or 0) * WEB_SEARCH_FEE_USD
+        # Tool fees a third party reports per call (research-cloud
+        # perplexity_search: usage.cost.total_cost) — already in USD.
+        + (extra_cost_usd or 0.0)
     )
 
 
@@ -236,6 +240,7 @@ def cost_eur(
     cache_read_tokens: int = 0,
     cache_creation_tokens: int = 0,
     search_count: int = 0,
+    extra_cost_usd: float = 0.0,
 ) -> float:
     """
     EUR cost of one LLM call (cost_usd × fixed EUR rate). Unknown / missing
@@ -247,7 +252,7 @@ def cost_eur(
     try:
         usd = cost_usd(
             model, input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens,
-            search_count=search_count,
+            search_count=search_count, extra_cost_usd=extra_cost_usd,
         )
     except KeyError:
         # Unreachable in normal flow: the is_priced() admission gate + boot

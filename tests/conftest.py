@@ -109,5 +109,10 @@ def _no_ambient_research_library(monkeypatch):
         "RESEARCH_LIBRARY_S3_REGION",
         "RESEARCH_LIBRARY_S3_PREFIX",
         "RESEARCH_LIBRARY_MIRROR_DIR",
+        # Same reason for Perplexity: a worker env with the flag on would arm
+        # the tool in every unrelated executor test.
+        "RESEARCH_PERPLEXITY_ENABLED",
+        "RESEARCH_PERPLEXITY_PRESET",
+        "PERPLEXITY_API_KEY",
     ):
         monkeypatch.delenv(var, raising=False)

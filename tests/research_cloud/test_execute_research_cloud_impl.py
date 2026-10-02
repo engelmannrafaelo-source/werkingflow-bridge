@@ -302,3 +302,35 @@ async def test_loaded_catalogue_reaches_both_the_prompt_and_the_executor():
     args, kwargs = executor_mock.await_args
     assert kwargs["library_index"] is index
     assert "`doc-a`" in args[1]  # system prompt carries the catalogue
+
+
+@pytest.mark.asyncio
+async def test_perplexity_wiring_gate_prompt_and_cost(monkeypatch):
+    """With RESEARCH_PERPLEXITY_ENABLED the executor gets the SAME anonymize
+    gate as the prompt (bound to this request), the prompt names the tool, and
+    the Perplexity cost reaches the ledger booking — while the public response
+    keeps its field surface (/v1/research contract unchanged)."""
+    monkeypatch.setenv("RESEARCH_PERPLEXITY_ENABLED", "true")
+    monkeypatch.setenv("PERPLEXITY_API_KEY", "pplx-test")
+    req = _make_req()
+    request = MagicMock()
+    gate = AsyncMock(return_value="ANON_ text")
+    executor_mock = AsyncMock(return_value=_cloud_result(perplexity_calls=3, perplexity_cost_usd=0.15))
+    persist = AsyncMock()
+    with (
+        patch("src.research_cloud.anonymize_gate.anonymize_query_for_cloud", new=gate),
+        patch("src.research_cloud.executor.run_research_cloud", executor_mock),
+        patch("src.activity.ai_call_writer.persist_ai_call_activity", new=persist),
+        patch("src.scholarly.scholarly_enabled", return_value=False),
+    ):
+        result = await src.main._execute_research_cloud_impl(request, req, attribution_ctx={})
+        args, kwargs = executor_mock.await_args
+        assert kwargs["perplexity_config"].enabled is True
+        assert "perplexity_search" in args[1]
+        assert await kwargs["anonymize"]("Firma X") == "ANON_ text"
+        gate.assert_awaited_with(request, "Firma X")
+
+    booked = persist.await_args.kwargs
+    assert booked["extra_cost_usd"] == 0.15
+    assert booked["provider_meta"]["perplexity_calls"] == 3
+    assert set(result.model_dump().keys()) == set(ResearchResponse.model_fields.keys())

@@ -364,6 +364,7 @@ async def persist_ai_call_activity(
     cache_read_tokens: int = 0,
     cache_creation_tokens: int = 0,
     search_count: int = 0,
+    extra_cost_usd: float = 0.0,
     bridge_origin: Optional[str] = None,
     _call_uid: Optional[str] = None,
     _call_ts: Optional[float] = None,
@@ -430,6 +431,9 @@ async def persist_ai_call_activity(
     search_count: server-side web_search invocations this call made (research-
         cloud only) — billed per-search on top of tokens, see src/pricing.py
         WEB_SEARCH_FEE_USD. Defaults to 0 (no-op for every other caller).
+    extra_cost_usd: third-party tool fees of this call in USD, as reported by
+        that provider (research-cloud perplexity_search). Added to the cost
+        on top of tokens and search fees. Defaults to 0.
     """
     # ── Write-ahead: make the row survivable BEFORE touching the database ──
     # Deliberately the very first thing, and deliberately synchronous: a sync
@@ -467,6 +471,9 @@ async def persist_ai_call_activity(
             "cache_read_tokens": cache_read_tokens,
             "cache_creation_tokens": cache_creation_tokens,
             "search_count": search_count,
+            # Only when set: a spooled record must stay replayable by a
+            # writer that predates this parameter (rollback window).
+            **({"extra_cost_usd": extra_cost_usd} if extra_cost_usd else {}),
         })
 
     def _settle(outcome: str) -> str:
@@ -524,6 +531,7 @@ async def persist_ai_call_activity(
             cache_read_tokens=cache_read_tokens,
             cache_creation_tokens=cache_creation_tokens,
             search_count=search_count,
+            extra_cost_usd=extra_cost_usd,
         )
         if status in COST_BEARING_STATUSES else 0.0
     )
