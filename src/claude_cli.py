@@ -1334,7 +1334,8 @@ class ClaudeCodeCLI:
         backend_env_vars: Optional[Dict[str, str]] = None,
         seed_files: Optional[Dict[str, str]] = None,
         seed_links: Optional[Dict[str, Dict[str, str]]] = None,
-        max_thinking_tokens: Optional[int] = None
+        max_thinking_tokens: Optional[int] = None,
+        sdk_mcp_servers: Optional[Dict[str, Any]] = None,
     ) -> AsyncGenerator[Dict[str, Any], None]:
         """Run Claude Code using the Python SDK and yield response chunks.
 
@@ -1690,6 +1691,12 @@ class ClaudeCodeCLI:
                     cwd=research_cwd
                 )
                 options.mcp_servers = {}
+                if sdk_mcp_servers:
+                    # In-process SDK MCP servers (type "sdk") — e.g. the pool
+                    # research's perplexity_search (src/research_pool_perplexity.py).
+                    # Their handlers run in THIS worker process; the CLI only
+                    # sees the tool. Requires streaming mode, see prompt_source.
+                    options.mcp_servers = dict(sdk_mcp_servers)
 
                 # Thinking budget: the CLI thinks by default and ignores the
                 # request's max_tokens. Set it on the SUBPROCESS env (options.env),
@@ -1786,6 +1793,13 @@ class ClaudeCodeCLI:
                 disable_coach = os.getenv("DISABLE_COACH_MCP", "false").lower() in ("true", "1", "yes")
                 disable_all_mcps = os.getenv("DISABLE_MCPS", "false").lower() in ("true", "1", "yes")
 
+                if disable_all_mcps and sdk_mcp_servers:
+                    # The caller asked for a tool that DISABLE_MCPS would
+                    # silently remove — refuse instead of running without it.
+                    raise RuntimeError(
+                        f"DISABLE_MCPS=true, but this run needs SDK MCP servers "
+                        f"{sorted(sdk_mcp_servers)} — refusing to run without them"
+                    )
                 if disable_all_mcps:
                     # Disable ALL MCPs
                     mcp_pattern = "mcp__*"
@@ -1883,7 +1897,25 @@ class ClaudeCodeCLI:
                         "message": {"role": "user", "content": prompt_text}
                     }
 
-                if len(prompt.encode("utf-8")) > LARGE_ARG_THRESHOLD_BYTES:
+                # SDK MCP servers need the control protocol, i.e. streaming
+                # mode — and stdin must stay OPEN until the result: SDK 0.0.22's
+                # stream_input closes it right after the last prompt message,
+                # after which the CLI can no longer receive the answers to its
+                # tool calls. So the stream holds until a ResultMessage arrives
+                # (set in the message loop below). On any abort (timeout, error)
+                # the SDK's task group cancels the held stream with the query.
+                _sdk_result_seen = asyncio.Event()
+
+                async def _prompt_stream_held_open(prompt_text: str):
+                    yield {
+                        "type": "user",
+                        "message": {"role": "user", "content": prompt_text}
+                    }
+                    await _sdk_result_seen.wait()
+
+                if sdk_mcp_servers:
+                    prompt_source = _prompt_stream_held_open(prompt)
+                elif len(prompt.encode("utf-8")) > LARGE_ARG_THRESHOLD_BYTES:
                     logger.info(
                         f"🔄 Large user prompt ({len(prompt):,} chars) → streaming mode (stdin) "
                         f"to bypass ARG_MAX"
@@ -1931,6 +1963,7 @@ class ClaudeCodeCLI:
                             # truncation guard (find_truncation_marker) trusted
                             # it and rejected healthy responses.
                             if type(message).__name__ == 'ResultMessage':
+                                _sdk_result_seen.set()
                                 _result_subtype = getattr(message, 'subtype', None)
                                 if _result_subtype in ('complete', 'success'):
                                     response_complete = True

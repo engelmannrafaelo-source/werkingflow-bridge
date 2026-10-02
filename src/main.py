@@ -4598,6 +4598,7 @@ async def _execute_research_impl(
     request_body: ResearchRequest,
     backend_config: Optional[BackendConfig],
     attribution_ctx: Optional[Dict[str, Any]] = None,
+    request: Optional[Request] = None,
 ) -> ResearchResponse:
     """Core research execution. Caller handles auth, rate-limit, and model resolution.
 
@@ -4727,6 +4728,55 @@ async def _execute_research_impl(
                 ),
             )
 
+        # perplexity_search auf dem Pool-Weg (Rafael 02.10.2026, gleiche Flagge
+        # wie der Cloud-Weg). In-Prozess-MCP-Server im Worker: Schluessel bleibt
+        # hier, die Anfrage geht durch DIESELBE Anonymisierungssperre wie auf dem
+        # Cloud-Weg (src/research_pool_perplexity.py). Eingeschaltet, aber nicht
+        # benutzbar -> Lauf wird nicht gestartet, wie bei der Bibliothek.
+        from src.research_cloud.perplexity import (
+            PerplexityUnavailableError,
+            check_perplexity_usable,
+            load_perplexity_config,
+            perplexity_enabled,
+        )
+        pool_pplx = None
+        pool_sdk_mcp_servers = None
+        _pplx_cfg = load_perplexity_config()
+        if perplexity_enabled(_pplx_cfg):
+            try:
+                check_perplexity_usable(_pplx_cfg)
+                if request is None:
+                    raise PerplexityUnavailableError(
+                        "no request to bind the anonymize gate to — refusing to offer the tool"
+                    )
+            except PerplexityUnavailableError as _pplx_err:
+                logger.error(f"research: Perplexity unbrauchbar, Lauf wird nicht gestartet: {_pplx_err}")
+                return ResearchResponse(
+                    status="error",
+                    query=request_body.query,
+                    model=request_body.model,
+                    execution_time_seconds=round(time.time() - start_time, 2),
+                    error=(
+                        "Perplexity ist für die Recherche eingeschaltet, aber nicht benutzbar — "
+                        f"die Recherche wurde nicht gestartet: {_pplx_err}"
+                    ),
+                )
+            from src.research_cloud.anonymize_gate import anonymize_query_for_cloud
+            from src.research_cloud.models import ResearchCloudConfig
+            from src.research_pool_perplexity import (
+                MCP_SERVER_NAME,
+                POOL_PROMPT_SECTION,
+                PoolPerplexityTool,
+            )
+            pool_pplx = PoolPerplexityTool(
+                _pplx_cfg,
+                lambda text: anonymize_query_for_cloud(request, text),
+                None,
+                ResearchCloudConfig().perplexity_max_uses,
+            )
+            pool_sdk_mcp_servers = {MCP_SERVER_NAME: pool_pplx.server()}
+            library_append_prompt = (library_append_prompt or "") + POOL_PROMPT_SECTION
+
         logger.info("🚀 Starting research execution...")
 
         all_chunks = []
@@ -4741,7 +4791,8 @@ async def _execute_research_impl(
             stream=True,
             enable_file_discovery=True,
             backend_env_vars=backend_config.env_vars if backend_config else None,
-            seed_links=library_seed_links
+            seed_links=library_seed_links,
+            sdk_mcp_servers=pool_sdk_mcp_servers,
         ):
             all_chunks.append(chunk)
             if "session_id" in chunk:
@@ -4957,6 +5008,14 @@ async def _execute_research_impl(
             )
             content = parsed_assistant_text
 
+        if pool_pplx is not None and pool_pplx.gate_error:
+            # Nothing was sent (the handler refused), but a report written while
+            # the privacy path was broken is not one to hand out as a success.
+            raise RuntimeError(
+                "perplexity_search: Anonymisierungssperre fehlgeschlagen "
+                f"({pool_pplx.gate_error}) — Lauf als Fehler beendet, die Anfrage wurde nicht gesendet"
+            )
+
         # R1: Persist activity — resolve token counts (SDK-provided preferred, estimate fallback)
         try:
             _track_in = accumulated_input_tokens
@@ -4998,11 +5057,25 @@ async def _execute_research_impl(
                 output_tokens=_track_out or 0,
                 cache_read_tokens=accumulated_cache_read or 0,
                 cache_creation_tokens=accumulated_cache_creation or 0,
+                # Perplexity-Gebuehren des Laufs (USD, von Perplexity gemeldet).
+                # Offener Punkt: provider=anthropic -> bei Flat-Rate-Mandanten
+                # traegt real_cost_eur sie NICHT; eine eigene Ledger-Zeile
+                # 'perplexity' braucht eine Migration am CHECK-Constraint (053).
+                extra_cost_usd=pool_pplx.cost_usd if pool_pplx is not None else 0.0,
                 status="success",
                 duration_ms=int(execution_time * 1000),
                 app_env=attribution_ctx.get("app_env") if attribution_ctx else None,
                 provider_meta={
                     "usage_source": "api" if accumulated_input_tokens is not None else "estimated",
+                    **(
+                        {
+                            "perplexity_calls": pool_pplx.calls,
+                            "perplexity_cost_usd": round(pool_pplx.cost_usd, 6),
+                            "perplexity_cost_missing": pool_pplx.cost_missing,
+                        }
+                        if pool_pplx is not None
+                        else {}
+                    ),
                     # Nur wenn die Bibliothek für diesen Lauf wirklich stand —
                     # ein 0 bei ausgeschalteter Bibliothek würde später als
                     # "das Modell hat sie ignoriert" gelesen.
@@ -5483,7 +5556,9 @@ async def _run_async_research_job(
                 request, request_body, attribution_ctx=attribution_ctx
             )
         else:
-            result = await _execute_research_impl(request_body, backend_config, attribution_ctx=attribution_ctx)
+            result = await _execute_research_impl(
+                request_body, backend_config, attribution_ctx=attribution_ctx, request=request
+            )
         _save_research_job(job_id, {
             "status": "done" if result.status == "success" else "error",
             "started_at": started_at,
@@ -5995,7 +6070,9 @@ async def research(
         return await _execute_research_cloud_with_pool_fallback(
             request, request_body, attribution_ctx=_research_attr
         )
-    return await _execute_research_impl(request_body, backend_config, attribution_ctx=_research_attr)
+    return await _execute_research_impl(
+        request_body, backend_config, attribution_ctx=_research_attr, request=request
+    )
 
 
 @app.get("/v1/research/async/{request_id}", response_model=AsyncResearchStatus)
