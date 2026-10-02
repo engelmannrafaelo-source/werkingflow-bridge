@@ -6,6 +6,7 @@ They raise HTTPException on not-found/conflict conditions and RuntimeError
 on unexpected failures (fail-loud, no silent fallback).
 """
 import logging
+import re
 import os
 import uuid
 from datetime import datetime, timezone
@@ -79,14 +80,21 @@ def read_oauth_token(account_id: str) -> str:
     return token
 
 
+_ACCOUNT_ID_RE = re.compile(r"[a-z0-9][a-z0-9_-]{0,63}")
+
+
 def has_oauth_token(account_id: str) -> bool:
     """True if a non-empty token file exists for the account. Never returns or
     logs the value — used by the account router to exclude accounts whose
     token is not provisioned on this host (prod-worker tier)."""
+    # account_id comes from a remote pool state — never let it shape a path.
+    if not _ACCOUNT_ID_RE.fullmatch(account_id):
+        logger.error("refusing token lookup for malformed account id %r", account_id)
+        return False
     token_path = _SECRETS_DIR / f"claude_token_{account_id}.txt"
     try:
-        return token_path.is_file() and token_path.stat().st_size > 0 and bool(token_path.read_text().strip())
-    except OSError as exc:
+        return token_path.is_file() and bool(token_path.read_text().strip())
+    except (OSError, ValueError) as exc:
         logger.error("token file for account %r unreadable: %s", account_id, exc)
         return False
 

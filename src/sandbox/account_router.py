@@ -40,6 +40,7 @@ import os
 import time
 from dataclasses import dataclass
 from typing import Any, Callable, Optional
+from urllib.parse import urlparse
 
 import httpx
 
@@ -58,6 +59,13 @@ _STALE_MAX_S = float(os.getenv("SANDBOX_POOL_STATE_STALE_MAX_S", "60"))
 # dieses Hosts (lease_service.read_oauth_token); ein Prod-Konto ohne Token
 # wird mit Grund ausgeschlossen und laut geloggt.
 _PROD_POOL_STATE_URL = os.getenv("SANDBOX_PROD_POOL_STATE_URL", "").rstrip("/")
+# Compose baut die URL aus BRIDGE_PROD_HOST; fehlt der, steht hier "http://:8000".
+if _PROD_POOL_STATE_URL and not urlparse(_PROD_POOL_STATE_URL).hostname:
+    logger.error(
+        "SANDBOX_PROD_POOL_STATE_URL=%r has no host (BRIDGE_PROD_HOST unset?) — "
+        "prod-worker tier DISABLED", _PROD_POOL_STATE_URL,
+    )
+    _PROD_POOL_STATE_URL = ""
 
 TIER_PROD = "prod"
 TIER_DEV = "dev"
@@ -152,8 +160,12 @@ async def _fetch_pool_state(base_url: str) -> dict[str, dict[str, Any]]:
             f"account-pool-state returned HTTP {resp.status_code} from {url}"
         )
 
-    data = resp.json()
-    accounts: dict[str, dict[str, Any]] = data.get("accounts", {})
+    try:
+        accounts = resp.json().get("accounts", {})
+        if not isinstance(accounts, dict) or not all(isinstance(v, dict) for v in accounts.values()):
+            raise ValueError("'accounts' is not a dict of account rows")
+    except (ValueError, TypeError, AttributeError) as exc:
+        raise RuntimeError(f"account-pool-state from {url} is malformed: {exc}") from exc
 
     if not accounts:
         raise RuntimeError(f"account-pool-state returned empty accounts dict from {url}")
@@ -203,10 +215,13 @@ async def _fetch_observed_penalties() -> dict[str, int]:
         raise RuntimeError(f"sandbox penalties unreachable ({url}): {exc}") from exc
     if resp.status_code != 200:
         raise RuntimeError(f"sandbox penalties returned HTTP {resp.status_code} from {url}")
-    penalties = resp.json().get("penalties")
-    if not isinstance(penalties, dict):
-        raise RuntimeError(f"sandbox penalties response from {url} has no 'penalties' dict")
-    return {str(k): int(v) for k, v in penalties.items()}
+    try:
+        penalties = resp.json().get("penalties")
+        if not isinstance(penalties, dict):
+            raise ValueError("no 'penalties' dict")
+        return {str(k): int(v) for k, v in penalties.items()}
+    except (ValueError, TypeError, AttributeError) as exc:
+        raise RuntimeError(f"sandbox penalties response from {url} is malformed: {exc}") from exc
 
 
 def _overlay_penalties(
@@ -347,7 +362,8 @@ async def pick_account(
             )
         except RuntimeError as exc:
             logger.error(f"pick_account: prod-worker pool state unavailable — falling to dev tier: {exc}")
-            exclusion_reasons["prod"] = f"pool state unavailable: {exc}"
+            # Detail (URL/host) only in the log — reasons go back to the client.
+            exclusion_reasons["prod"] = "pool state unavailable (see bridge log)"
         else:
             prod_names = set(prod_accounts)
             prod_measured, prod_unmeasured = _split(
@@ -355,6 +371,11 @@ async def pick_account(
                 TIER_PROD, has_token,
             )
             if prod_measured:
+                if preferred_account_id and preferred_account_id not in {r[0] for r in prod_measured}:
+                    logger.info(
+                        "pick_account: preferred=%s not an eligible prod account — "
+                        "prod tier wins (Kontovergabe Prod zuerst)", preferred_account_id,
+                    )
                 return _choose(prod_measured, preferred_account_id, TIER_PROD, exclusion_reasons)
             logger.warning(
                 "pick_account: no measured prod-worker account eligible — trying dev tier. "
@@ -366,7 +387,9 @@ async def pick_account(
     clash = prod_names & set(dev_accounts)
     if clash:
         # lease_counts, usage rows and token files are keyed by bare account
-        # id — a shared name would mix two accounts' books.
+        # id — a shared name would mix two accounts' books. Only checked when
+        # both states are loaded (prod tier had nothing eligible); a prod win
+        # does not read the dev state at all.
         raise RuntimeError(
             f"account id(s) {sorted(clash)} exist in BOTH prod-worker and dev pool state"
         )

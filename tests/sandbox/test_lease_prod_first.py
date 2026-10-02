@@ -246,3 +246,36 @@ def test_metrics_reader_exposes_penalties_of_foreign_accounts(tmp_path, monkeypa
     out = mr.get_observed_rate_limits()
     assert set(out["penalties"]) == {"coach"}
     assert 100 < out["penalties"]["coach"] <= 120
+
+
+async def test_malformed_json_is_a_runtime_error_not_a_500(monkeypatch):
+    """A 200 with HTML (or any non-JSON) must surface as RuntimeError — the
+    route maps that to 503, and the prod tier then falls to dev."""
+    import httpx
+
+    class _Resp:
+        status_code = 200
+
+        def json(self):
+            raise ValueError("Expecting value: line 1 column 1")
+
+    class _Client:
+        def __init__(self, *a, **k): ...
+        async def __aenter__(self): return self
+        async def __aexit__(self, *a): return False
+        async def get(self, url): return _Resp()
+
+    monkeypatch.setattr(httpx, "AsyncClient", _Client)
+    with pytest.raises(RuntimeError, match="malformed"):
+        await ar._fetch_pool_state(PROD_URL)
+    with pytest.raises(RuntimeError, match="malformed"):
+        await ar._fetch_observed_penalties()
+
+
+def test_has_oauth_token_rejects_path_like_ids(tmp_path, monkeypatch):
+    from src.sandbox import lease_service as ls
+
+    monkeypatch.setattr(ls, "_SECRETS_DIR", tmp_path / "s")
+    (tmp_path / "claude_token_x.txt").write_text("secret")
+    assert ls.has_oauth_token("../claude_token_x") is False
+    assert ls.has_oauth_token("") is False
