@@ -87,6 +87,11 @@ services:
       - FILTER_SENSITIVE_DATA=true
       - CORS_ORIGINS=["*"]
       - BRIDGE_SECRETS_DIR=/app/secrets
+      # Sandbox-Kontovergabe: Prod-Worker-Konten zuerst (Rafael 02.10.2026).
+      # Pool-State der Prod-Bridge; deren Login-Token muessen als
+      # claude_token_<konto>.txt im Secrets-Verzeichnis oben liegen, sonst wird
+      # das Konto laut ausgeschlossen und Dev vergeben. Leer = Stufe aus.
+      - SANDBOX_PROD_POOL_STATE_URL=http://${BRIDGE_PROD_HOST:?BRIDGE_PROD_HOST must be set}:8000
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://localhost:8000/health"]
       interval: 30s

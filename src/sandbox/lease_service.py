@@ -79,6 +79,18 @@ def read_oauth_token(account_id: str) -> str:
     return token
 
 
+def has_oauth_token(account_id: str) -> bool:
+    """True if a non-empty token file exists for the account. Never returns or
+    logs the value — used by the account router to exclude accounts whose
+    token is not provisioned on this host (prod-worker tier)."""
+    token_path = _SECRETS_DIR / f"claude_token_{account_id}.txt"
+    try:
+        return token_path.is_file() and token_path.stat().st_size > 0 and bool(token_path.read_text().strip())
+    except OSError as exc:
+        logger.error("token file for account %r unreadable: %s", account_id, exc)
+        return False
+
+
 # ---------------------------------------------------------------------------
 # Tenant lookup
 # ---------------------------------------------------------------------------

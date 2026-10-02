@@ -32,9 +32,9 @@ from src.sandbox.account_router import (
 def _reset_last_good_state():
     """Der Last-known-good-Cache ist modulweit — zwischen Tests zuruecksetzen,
     sonst faellt ein Fail-fast-Test still auf den Snapshot des Vortests zurueck."""
-    account_router._last_good_state = None
+    account_router._last_good_state = {}
     yield
-    account_router._last_good_state = None
+    account_router._last_good_state = {}
 
 
 def _mk_account(
@@ -131,10 +131,10 @@ async def test_no_capacity_carries_per_account_reasons(monkeypatch):
     # retry_after_s should be smallest non-zero cooldown
     assert err.retry_after_s == 120
     # All three accounts should appear in reasons
-    assert set(err.reasons.keys()) == {"office", "gmail", "engelmann"}
-    assert "capacity_lock" in err.reasons["office"]
-    assert "hard_limited" in err.reasons["gmail"]
-    assert "headroom" in err.reasons["engelmann"]
+    assert set(err.reasons.keys()) == {"dev:office", "dev:gmail", "dev:engelmann", "prod"}
+    assert "capacity_lock" in err.reasons["dev:office"]
+    assert "hard_limited" in err.reasons["dev:gmail"]
+    assert "headroom" in err.reasons["dev:engelmann"]
 
 
 @pytest.mark.asyncio
@@ -146,7 +146,7 @@ async def test_tracker_penalty_reason_is_named_not_unknown(monkeypatch):
     })
     with pytest.raises(NoCapacityError) as exc_info:
         await pick_account()
-    assert exc_info.value.reasons["gmail"] == "not available (rate_limit_penalty=56s)"
+    assert exc_info.value.reasons["dev:gmail"] == "not available (rate_limit_penalty=56s)"
 
 
 @pytest.mark.asyncio
@@ -156,7 +156,7 @@ async def test_low_headroom_excluded_with_reason(monkeypatch):
     })
     with pytest.raises(NoCapacityError) as exc_info:
         await pick_account()
-    assert "headroom" in exc_info.value.reasons["office"]
+    assert "headroom" in exc_info.value.reasons["dev:office"]
 
 
 @pytest.mark.asyncio
@@ -343,8 +343,10 @@ async def test_unreachable_with_stale_cache_raises(monkeypatch):
     })
     await pick_account()
     # Snapshot kuenstlich altern lassen (weit ueber die Deckelung hinaus).
-    ts, accounts = account_router._last_good_state
-    account_router._last_good_state = (ts - account_router._STALE_MAX_S - 10, accounts)
+    ts, accounts = account_router._last_good_state[account_router._METRICS_READER_URL]
+    account_router._last_good_state = {
+        account_router._METRICS_READER_URL: (ts - account_router._STALE_MAX_S - 10, accounts)
+    }
 
     _patch_pool_state_unreachable(monkeypatch)
     with pytest.raises(RuntimeError, match="last-known-good"):

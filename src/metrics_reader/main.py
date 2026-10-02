@@ -1089,6 +1089,26 @@ def post_observed_rate_limit(payload: dict):
     return {"ok": True, "account_id": account_id, "penalty_until_ts": int(until_ts)}
 
 
+@app.get("/v1/metrics/sandbox-observed-rate-limits")
+def get_observed_rate_limits():
+    """
+    Active sandbox-observed penalties for ALL reported accounts, including
+    accounts this bridge does not run itself. The account-pool-state overlay
+    above only touches this bridge's own accounts; the sandbox lease router
+    also hands out the prod-worker accounts (Stufe 1, 02.10.2026) and applies
+    their penalties from here — otherwise a 429 the daemon reported for e.g.
+    "coach" would be ignored and the same account leased again at once.
+
+    Response: {"ts": <epoch>, "penalties": {"<account>": <remaining_s>}}
+    """
+    import time as _time
+    now = _time.time()
+    active = {
+        k: int(until - now) for k, until in _read_penalties().items() if until - now > 0
+    }
+    return {"ts": int(now), "penalties": active}
+
+
 # ============================================================================
 # Catch-all for misrouted requests — loud fail, not silent
 # ============================================================================

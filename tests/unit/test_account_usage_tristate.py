@@ -278,7 +278,7 @@ async def test_sandbox_picker_prefers_a_measured_account_over_an_unseen_one(monk
     """
     from src.sandbox import account_router as ar
 
-    async def fake_state():
+    async def fake_state(*_):
         return {
             "gmail": _row(50.0, known=True),
             "sahori": _row(100.0, known=False),
@@ -298,7 +298,7 @@ async def test_sandbox_picker_still_serves_when_nothing_is_measured(monkeypatch)
     """
     from src.sandbox import account_router as ar
 
-    async def fake_state():
+    async def fake_state(*_):
         return {"sahori": _row(90.0, known=False), "kurt": _row(80.0, known=False)}
 
     monkeypatch.setattr(ar, "_fetch_pool_state", fake_state)
@@ -314,7 +314,7 @@ async def test_sandbox_picker_treats_a_missing_flag_as_unmeasured(monkeypatch):
     old = _row(100.0, known=True)
     del old["usage_known"]
 
-    async def fake_state():
+    async def fake_state(*_):
         return {"legacy": old, "gmail": _row(20.0, known=True)}
 
     monkeypatch.setattr(ar, "_fetch_pool_state", fake_state)

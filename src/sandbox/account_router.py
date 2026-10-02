@@ -39,7 +39,7 @@ import logging
 import os
 import time
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 import httpx
 
@@ -49,8 +49,21 @@ _METRICS_READER_URL = os.getenv("BRIDGE_METRICS_READER_URL", "http://metrics-rea
 _HEADROOM_THRESHOLD = float(os.getenv("SANDBOX_HEADROOM_THRESHOLD", "10"))
 _STALE_MAX_S = float(os.getenv("SANDBOX_POOL_STATE_STALE_MAX_S", "60"))
 
-# Last-known-good Pool-State: (monotonic-Zeitstempel, accounts-Dict).
-_last_good_state: Optional[tuple[float, dict[str, dict[str, Any]]]] = None
+# Stufe 1 (Rafael 02.10.2026, e-tester-agent-bridge-20261002: "Kontovergabe
+# nimmt zuerst die vier Worker, dann Dev"): Basis-URL der Bridge, deren
+# account-pool-state die Prod-Worker-Konten (coach/erk/kurt/sahori) meldet.
+# Leer = Stufe 1 aus, die Vergabe bleibt Dev-only — das wird bei JEDER Vergabe
+# als Warnung geloggt, nicht still hingenommen. Die Login-Token dieser Konten
+# liegen nach derselben Konvention wie die Dev-Token im Secrets-Verzeichnis
+# dieses Hosts (lease_service.read_oauth_token); ein Prod-Konto ohne Token
+# wird mit Grund ausgeschlossen und laut geloggt.
+_PROD_POOL_STATE_URL = os.getenv("SANDBOX_PROD_POOL_STATE_URL", "").rstrip("/")
+
+TIER_PROD = "prod"
+TIER_DEV = "dev"
+
+# Last-known-good Pool-State je Quelle: url -> (monotonic-Zeitstempel, accounts-Dict).
+_last_good_state: dict[str, tuple[float, dict[str, dict[str, Any]]]] = {}
 
 
 class NoCapacityError(Exception):
@@ -68,6 +81,7 @@ class NoCapacityError(Exception):
 class PickedAccount:
     account_id: str
     headroom_percent: float
+    tier: str = TIER_DEV
 
 
 def _require(info: dict[str, Any], key: str, acct_name: str) -> Any:
@@ -123,10 +137,10 @@ def _evaluate(acct_name: str, info: dict[str, Any]) -> tuple[bool, str, float, i
     return True, "", headroom, cooldown
 
 
-async def _fetch_pool_state() -> dict[str, dict[str, Any]]:
-    """Frischen Pool-State vom metrics-reader holen. RuntimeError bei
+async def _fetch_pool_state(base_url: str) -> dict[str, dict[str, Any]]:
+    """Frischen Pool-State von base_url holen. RuntimeError bei
     unreachable / non-200 / leerem accounts-Dict — Bewertung passiert im Caller."""
-    url = f"{_METRICS_READER_URL}/v1/metrics/account-pool-state"
+    url = f"{base_url}/v1/metrics/account-pool-state"
     try:
         async with httpx.AsyncClient(timeout=5.0) as client:
             resp = await client.get(url)
@@ -146,62 +160,101 @@ async def _fetch_pool_state() -> dict[str, dict[str, Any]]:
     return accounts
 
 
-async def pick_account(
-    preferred_account_id: Optional[str] = None,
-    lease_counts: Optional[dict[str, int]] = None,
-) -> PickedAccount:
-    """
-    Query the metrics reader and return the best account for a new lease.
+async def _load_state(base_url: str) -> dict[str, dict[str, Any]]:
+    """Pool-State einer Quelle, mit hart gedeckeltem Last-known-good-Rueckgriff.
 
-    Args:
-        preferred_account_id: caller hint; wins if eligible (e.g. resume).
-        lease_counts: optional {account_id: recent_lease_count} for fairness
-            ranking (typically leases-issued-in-last-24h from sandbox_leases).
-            Missing accounts default to 0. Without this arg, ranking degrades
-            to headroom-only (backward-compatible).
-
-    Raises:
-        RuntimeError: metrics reader unreachable / malformed / empty state
-            und kein Last-known-good-Snapshot juenger als _STALE_MAX_S.
-        NoCapacityError: no account passes the available+headroom filter;
-            carries per-account exclusion reasons for diagnostics.
+    Kurzer Reader-Aussetzer (uvicorn-Child-Restart nach OOM, Deploy) soll
+    einen Sandbox-Start nicht sofort killen. Rueckgriff auf den letzten guten
+    Snapshot ist hart gedeckelt und wird LAUT mit Alter geloggt — kein Silent
+    Fallback. Restrisiko: eine in der Zwischenzeit gesetzte Account-Sperre ist
+    bis zu _STALE_MAX_S lang nicht sichtbar.
     """
-    global _last_good_state
     try:
-        accounts = await _fetch_pool_state()
-        _last_good_state = (time.monotonic(), accounts)
+        accounts = await _fetch_pool_state(base_url)
+        _last_good_state[base_url] = (time.monotonic(), accounts)
+        return accounts
     except RuntimeError as exc:
-        # Kurzer Reader-Aussetzer (uvicorn-Child-Restart nach OOM, Deploy) soll
-        # einen Sandbox-Start nicht sofort killen. Rueckgriff auf den letzten
-        # guten Snapshot ist hart gedeckelt und wird LAUT mit Alter geloggt —
-        # kein Silent Fallback. Restrisiko: eine in der Zwischenzeit gesetzte
-        # Account-Sperre ist bis zu _STALE_MAX_S lang nicht sichtbar.
-        if _last_good_state is None:
+        snap = _last_good_state.get(base_url)
+        if snap is None:
             raise
-        age = time.monotonic() - _last_good_state[0]
+        age = time.monotonic() - snap[0]
         if age > _STALE_MAX_S:
             raise RuntimeError(
-                f"metrics-reader unavailable and last-known-good pool state is "
+                f"pool state {base_url} unavailable and last-known-good snapshot is "
                 f"{age:.0f}s old (max {_STALE_MAX_S:.0f}s): {exc}"
             ) from exc
         logger.warning(
-            f"pick_account: metrics-reader unavailable ({exc}) — using "
-            f"last-known-good pool state, age={age:.1f}s (max {_STALE_MAX_S:.0f}s)"
+            f"pick_account: pool state {base_url} unavailable ({exc}) — using "
+            f"last-known-good snapshot, age={age:.1f}s (max {_STALE_MAX_S:.0f}s)"
         )
-        accounts = _last_good_state[1]
+        return snap[1]
 
-    lease_counts = lease_counts or {}
-    # (acct_name, headroom, cooldown, lease_count)
-    measured: list[tuple[str, float, int, int]] = []
-    unmeasured: list[tuple[str, float, int, int]] = []
-    exclusion_reasons: dict[str, str] = {}
-    all_cooldowns: list[int] = []
 
+async def _fetch_observed_penalties() -> dict[str, int]:
+    """Sandbox-observed 429 penalties ({account: remaining_s}) from THIS
+    bridge's metrics-reader. The daemon reports every sandbox 429 there, also
+    for prod-worker accounts; the prod bridge never sees them. RuntimeError on
+    any failure — the caller must not lease prod accounts blind."""
+    url = f"{_METRICS_READER_URL}/v1/metrics/sandbox-observed-rate-limits"
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            resp = await client.get(url)
+    except httpx.RequestError as exc:
+        raise RuntimeError(f"sandbox penalties unreachable ({url}): {exc}") from exc
+    if resp.status_code != 200:
+        raise RuntimeError(f"sandbox penalties returned HTTP {resp.status_code} from {url}")
+    penalties = resp.json().get("penalties")
+    if not isinstance(penalties, dict):
+        raise RuntimeError(f"sandbox penalties response from {url} has no 'penalties' dict")
+    return {str(k): int(v) for k, v in penalties.items()}
+
+
+def _overlay_penalties(
+    accounts: dict[str, dict[str, Any]], penalties: dict[str, int]
+) -> dict[str, dict[str, Any]]:
+    """Copy of accounts with sandbox-observed penalties applied — same effect
+    as the metrics-reader overlay for its own accounts."""
+    out: dict[str, dict[str, Any]] = {}
+    for acct_name, info in accounts.items():
+        remaining = penalties.get(acct_name, 0)
+        if remaining > 0:
+            info = dict(info)
+            info["available"] = False
+            info["soft_penalty_remaining_s"] = max(int(info.get("soft_penalty_remaining_s") or 0), remaining)
+            info["cooldown_remaining_s"] = max(int(info.get("cooldown_remaining_s") or 0), remaining)
+        out[acct_name] = info
+    return out
+
+
+# (acct_name, headroom, cooldown, lease_count)
+_Row = tuple[str, float, int, int]
+
+
+def _split(
+    accounts: dict[str, dict[str, Any]],
+    lease_counts: dict[str, int],
+    exclusion_reasons: dict[str, str],
+    all_cooldowns: list[int],
+    reason_prefix: str,
+    has_token: Optional[Callable[[str], bool]] = None,
+) -> tuple[list[_Row], list[_Row]]:
+    """Bewertet eine Quelle; liefert (measured, unmeasured) der zulaessigen Konten.
+    Ausschluesse landen mit Quellen-Praefix in exclusion_reasons."""
+    measured: list[_Row] = []
+    unmeasured: list[_Row] = []
     for acct_name, info in accounts.items():
         ok, reason, headroom, cooldown = _evaluate(acct_name, info)
         all_cooldowns.append(cooldown)
+        if ok and has_token is not None and not has_token(acct_name):
+            ok = False
+            reason = "no oauth token file on this host"
+            logger.error(
+                "pick_account: %s account %r is eligible but has NO token file on "
+                "this host — excluded. Provision claude_token_%s.txt.",
+                reason_prefix, acct_name, acct_name,
+            )
         if not ok:
-            exclusion_reasons[acct_name] = reason
+            exclusion_reasons[f"{reason_prefix}:{acct_name}"] = reason
             continue
         row = (acct_name, headroom, cooldown, lease_counts.get(acct_name, 0))
         # Strictly `is True`: a missing field (worker on a pre-tri-state image)
@@ -210,6 +263,128 @@ async def pick_account(
             measured.append(row)
         else:
             unmeasured.append(row)
+    return measured, unmeasured
+
+
+def _choose(
+    eligible: list[_Row],
+    preferred_account_id: Optional[str],
+    tier: str,
+    exclusion_reasons: dict[str, str],
+) -> PickedAccount:
+    # Honour preferred if eligible in the tier being served — a resume hint
+    # never pulls a lease down a tier.
+    if preferred_account_id:
+        for acct_name, headroom, cooldown, lc in eligible:
+            if acct_name == preferred_account_id:
+                logger.info(
+                    f"pick_account: tier={tier} preferred={acct_name} headroom={headroom:.1f}% "
+                    f"cooldown_rem={cooldown}s lease_count={lc} (of {len(eligible)} eligible)"
+                )
+                return PickedAccount(account_id=acct_name, headroom_percent=headroom, tier=tier)
+
+    # Fair round-robin: rank by (lease_count ASC, -headroom ASC, cooldown ASC).
+    # Least-used wins; ties broken by most-budget; final tiebreak shortest cooldown.
+    ranked = sorted(eligible, key=lambda x: (x[3], -x[1], x[2]))
+    picked_name, picked_headroom, picked_cooldown, picked_lc = ranked[0]
+    logger.info(
+        f"pick_account: tier={tier} picked={picked_name} headroom={picked_headroom:.1f}% "
+        f"cooldown_rem={picked_cooldown}s lease_count={picked_lc} "
+        f"(of {len(eligible)} eligible, excluded={list(exclusion_reasons.keys())})"
+    )
+    return PickedAccount(account_id=picked_name, headroom_percent=picked_headroom, tier=tier)
+
+
+async def pick_account(
+    preferred_account_id: Optional[str] = None,
+    lease_counts: Optional[dict[str, int]] = None,
+    has_token: Optional[Callable[[str], bool]] = None,
+) -> PickedAccount:
+    """
+    Return the best account for a new lease — Prod-Worker-Konten zuerst
+    (Stufe 1), Dev-Konten als Ersatz (Stufe 2).
+
+    Reihenfolge: gemessene Prod-Konten -> gemessene Dev-Konten -> ungemessene
+    Prod-Konten -> ungemessene Dev-Konten (beides laut geloggt). Jeder Wechsel
+    auf eine niedrigere Stufe wird mit Grund geloggt.
+
+    Args:
+        preferred_account_id: caller hint; wins if eligible in the served tier.
+        lease_counts: optional {account_id: recent_lease_count} for fairness
+            ranking (typically leases-issued-in-last-24h from sandbox_leases).
+            Missing accounts default to 0.
+        has_token: Pruefung "liegt fuer dieses Konto ein Login-Token auf
+            diesem Host?" — gilt fuer Prod-Konten (deren Token kommen nicht
+            mit dem Host). Ohne Pruefung ist Stufe 1 aus (laut geloggt).
+
+    Raises:
+        RuntimeError: kein Prod-Konto zulaessig UND Dev-Pool-State nicht
+            lesbar (unreachable / malformed / empty, kein frischer Snapshot);
+            ausserdem bei Namensgleichheit eines Prod- und eines Dev-Kontos.
+        NoCapacityError: no account in either tier passes the filters;
+            carries per-account exclusion reasons (prefixed prod:/dev:).
+    """
+    lease_counts = lease_counts or {}
+    exclusion_reasons: dict[str, str] = {}
+    all_cooldowns: list[int] = []
+    prod_measured: list[_Row] = []
+    prod_unmeasured: list[_Row] = []
+    prod_names: set[str] = set()
+
+    if not _PROD_POOL_STATE_URL:
+        logger.warning(
+            "pick_account: SANDBOX_PROD_POOL_STATE_URL not set — prod-worker tier "
+            "DISABLED, leasing dev accounts only"
+        )
+        exclusion_reasons["prod"] = "tier disabled (SANDBOX_PROD_POOL_STATE_URL not set)"
+    elif has_token is None:
+        logger.error("pick_account: no token check supplied — prod-worker tier DISABLED")
+        exclusion_reasons["prod"] = "tier disabled (no token check)"
+    else:
+        try:
+            prod_accounts = _overlay_penalties(
+                await _load_state(_PROD_POOL_STATE_URL), await _fetch_observed_penalties()
+            )
+        except RuntimeError as exc:
+            logger.error(f"pick_account: prod-worker pool state unavailable — falling to dev tier: {exc}")
+            exclusion_reasons["prod"] = f"pool state unavailable: {exc}"
+        else:
+            prod_names = set(prod_accounts)
+            prod_measured, prod_unmeasured = _split(
+                prod_accounts, lease_counts, exclusion_reasons, all_cooldowns,
+                TIER_PROD, has_token,
+            )
+            if prod_measured:
+                return _choose(prod_measured, preferred_account_id, TIER_PROD, exclusion_reasons)
+            logger.warning(
+                "pick_account: no measured prod-worker account eligible — trying dev tier. "
+                "prod exclusions: %s",
+                {k: v for k, v in exclusion_reasons.items() if k.startswith("prod")},
+            )
+
+    dev_accounts = await _load_state(_METRICS_READER_URL)
+    clash = prod_names & set(dev_accounts)
+    if clash:
+        # lease_counts, usage rows and token files are keyed by bare account
+        # id — a shared name would mix two accounts' books.
+        raise RuntimeError(
+            f"account id(s) {sorted(clash)} exist in BOTH prod-worker and dev pool state"
+        )
+    dev_measured, dev_unmeasured = _split(
+        dev_accounts, lease_counts, exclusion_reasons, all_cooldowns, TIER_DEV,
+    )
+    if dev_measured:
+        if prod_unmeasured:
+            logger.info(
+                "pick_account: %d prod account(s) held back as UNMEASURED (%s)",
+                len(prod_unmeasured), ", ".join(a[0] for a in prod_unmeasured),
+            )
+        if dev_unmeasured:
+            logger.info(
+                "pick_account: %d dev account(s) held back as UNMEASURED (%s)",
+                len(dev_unmeasured), ", ".join(a[0] for a in dev_unmeasured),
+            )
+        return _choose(dev_measured, preferred_account_id, TIER_DEV, exclusion_reasons)
 
     # Measured accounts win outright. Ranking here is headroom-driven, and an
     # unmeasured account reports the most attractive headroom there is (the
@@ -218,49 +393,21 @@ async def pick_account(
     # accounts nobody can see. Same reasoning as pool_router.lua; unmeasured
     # accounts are held back, not excluded, so a blind spot cannot become a
     # capacity outage.
-    eligible = measured
-    if not eligible and unmeasured:
-        logger.error(
-            "pick_account: NO measured account eligible — falling back to %d "
-            "account(s) with UNKNOWN usage (%s). Their weekly/session %% is not "
-            "being delivered; check the cc-usage snapshot producer for this bridge.",
-            len(unmeasured), ", ".join(a[0] for a in unmeasured),
-        )
-        eligible = unmeasured
+    for tier, unmeasured in ((TIER_PROD, prod_unmeasured), (TIER_DEV, dev_unmeasured)):
+        if unmeasured:
+            logger.error(
+                "pick_account: NO measured account eligible — falling back to %d %s "
+                "account(s) with UNKNOWN usage (%s). Their weekly/session %% is not "
+                "being delivered; check the cc-usage snapshot producer for that bridge.",
+                len(unmeasured), tier, ", ".join(a[0] for a in unmeasured),
+            )
+            return _choose(unmeasured, preferred_account_id, tier, exclusion_reasons)
 
-    if not eligible:
-        # retry_after_s: shortest non-zero cooldown across pool, or 30s
-        # baseline if no cooldowns set (e.g. capacity_lock-only scenarios).
-        non_zero = [c for c in all_cooldowns if c > 0]
-        retry_after = min(non_zero) if non_zero else 30
-        logger.warning(
-            f"pick_account NO_CAPACITY: retry_after={retry_after}s reasons={exclusion_reasons}"
-        )
-        raise NoCapacityError(retry_after_s=retry_after, reasons=exclusion_reasons)
-
-    # Honour preferred if eligible
-    if preferred_account_id:
-        for acct_name, headroom, cooldown, lc in eligible:
-            if acct_name == preferred_account_id:
-                logger.info(
-                    f"pick_account: preferred={acct_name} headroom={headroom:.1f}% "
-                    f"cooldown_rem={cooldown}s lease_count={lc} (of {len(eligible)} eligible)"
-                )
-                return PickedAccount(account_id=acct_name, headroom_percent=headroom)
-
-    if unmeasured and eligible is measured:
-        logger.info(
-            "pick_account: %d account(s) held back as UNMEASURED (%s)",
-            len(unmeasured), ", ".join(a[0] for a in unmeasured),
-        )
-
-    # Fair round-robin: rank by (lease_count ASC, -headroom ASC, cooldown ASC).
-    # Least-used wins; ties broken by most-budget; final tiebreak shortest cooldown.
-    eligible.sort(key=lambda x: (x[3], -x[1], x[2]))
-    picked_name, picked_headroom, picked_cooldown, picked_lc = eligible[0]
-    logger.info(
-        f"pick_account: picked={picked_name} headroom={picked_headroom:.1f}% "
-        f"cooldown_rem={picked_cooldown}s lease_count={picked_lc} "
-        f"(of {len(eligible)} eligible, excluded={list(exclusion_reasons.keys())})"
+    # retry_after_s: shortest non-zero cooldown across both pools, or 30s
+    # baseline if no cooldowns set (e.g. capacity_lock-only scenarios).
+    non_zero = [c for c in all_cooldowns if c > 0]
+    retry_after = min(non_zero) if non_zero else 30
+    logger.warning(
+        f"pick_account NO_CAPACITY: retry_after={retry_after}s reasons={exclusion_reasons}"
     )
-    return PickedAccount(account_id=picked_name, headroom_percent=picked_headroom)
+    raise NoCapacityError(retry_after_s=retry_after, reasons=exclusion_reasons)

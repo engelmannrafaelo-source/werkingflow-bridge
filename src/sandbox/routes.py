@@ -190,7 +190,11 @@ async def lease_token(
         # short enough to forgive a once-busy account that has since gone idle.
         lease_counts = await _ls.get_recent_lease_counts(conn, window_hours=24)
         try:
-            picked = await _ar.pick_account(body.preferredAccountId, lease_counts=lease_counts)
+            picked = await _ar.pick_account(
+                body.preferredAccountId,
+                lease_counts=lease_counts,
+                has_token=_ls.has_oauth_token,
+            )
         except _ar.NoCapacityError as exc:
             raise HTTPException(
                 status_code=503,
@@ -224,7 +228,7 @@ async def lease_token(
 
     logger.info(
         f"Lease issued: lease={lease_id} user={uid} account={picked.account_id} "
-        f"app={body.app} expires={expires_at.isoformat()}"
+        f"tier={picked.tier} app={body.app} expires={expires_at.isoformat()}"
     )
 
     return LeaseTokenResponse(

@@ -27,9 +27,9 @@ def _reset_account_router_cache():
     zuruecksetzen, damit Fail-fast-Tests (unreachable → RuntimeError) nicht
     still auf den Snapshot eines Vortests zurueckfallen."""
     import src.sandbox.account_router as account_router
-    account_router._last_good_state = None
+    account_router._last_good_state = {}
     yield
-    account_router._last_good_state = None
+    account_router._last_good_state = {}
 
 
 # ---------------------------------------------------------------------------
