@@ -152,6 +152,7 @@ def persist():
 
 @pytest.fixture
 def pplx_on(monkeypatch):
+    monkeypatch.setenv("BRIDGE_ANONYMIZE_ENABLED", "true")
     monkeypatch.setenv("RESEARCH_PERPLEXITY_ENABLED", "true")
     monkeypatch.setenv("PERPLEXITY_API_KEY", "pplx-test")
 
@@ -232,3 +233,12 @@ async def test_cost_of_the_run_reaches_the_ledger_row(spy_cli, persist, pplx_on)
     booked = persist.await_args.kwargs
     assert booked["extra_cost_usd"] == 0.15
     assert booked["provider_meta"]["perplexity_calls"] == 3
+
+
+@pytest.mark.asyncio
+async def test_flag_on_without_anonymizer_service_refuses(spy_cli, persist, pplx_on, monkeypatch):
+    monkeypatch.setenv("BRIDGE_ANONYMIZE_ENABLED", "false")
+    spy, _, _ = spy_cli
+    result = await src.main._execute_research_impl(_make_req(), None, request=MagicMock())
+    assert result.status == "error" and "BRIDGE_ANONYMIZE_ENABLED" in result.error
+    spy.assert_not_called()

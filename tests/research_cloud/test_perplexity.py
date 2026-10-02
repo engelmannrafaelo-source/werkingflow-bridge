@@ -22,6 +22,12 @@ from src.research_cloud.perplexity import (
 )
 from src.research_cloud.prompt import build_system_prompt
 
+@pytest.fixture(autouse=True)
+def _anonymizer_service_on(monkeypatch):
+    # Perplexity refuses to arm without the anonymize service (check_perplexity_usable).
+    monkeypatch.setenv("BRIDGE_ANONYMIZE_ENABLED", "true")
+
+
 _ON = PerplexityConfig(enabled=True, api_key="pplx-test", max_retries=2)
 _OFF = PerplexityConfig()
 _NO_LIBRARY = LibraryConfig()
@@ -103,6 +109,19 @@ def test_load_config_reads_flag_and_key(monkeypatch):
     monkeypatch.setenv("PERPLEXITY_API_KEY", "k")
     cfg = load_perplexity_config()
     assert cfg.enabled and cfg.api_key == "k" and cfg.preset == "medium"
+
+
+@pytest.mark.asyncio
+async def test_enabled_without_anonymizer_service_refuses(monkeypatch):
+    monkeypatch.setenv("BRIDGE_ANONYMIZE_ENABLED", "false")
+    client = MagicMock()
+    client.post = AsyncMock()
+    with pytest.raises(ResearchCloudExecutorError, match="BRIDGE_ANONYMIZE_ENABLED"):
+        await run_research_cloud(
+            "q", "s", api_key="sk", client=client, library_config=_NO_LIBRARY, library_index={},
+            perplexity_config=_ON, anonymize=AsyncMock(),
+        )
+    client.post.assert_not_called()
 
 
 # --- HTTP client ----------------------------------------------------------

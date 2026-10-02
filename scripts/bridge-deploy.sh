@@ -931,7 +931,7 @@ phase_worker_config_selftest() {
         return 0
     fi
 
-    local failed=0 c out
+    local failed=0 pplx_failed=0 c out
     for c in "${containers[@]}"; do
         out=$(rssh "$host" "docker exec -w /app -e PYTHONPATH=/app '${c}' poetry run python -c \"
 import os
@@ -958,7 +958,40 @@ else:
                 error_ "  ${c}: Selbsttest nicht auswertbar: ${out}"
                 failed=1 ;;
         esac
+
+        # perplexity_search (RESEARCH_PERPLEXITY_ENABLED): an, aber ohne
+        # Schluessel oder ohne Anonymisierung -> jeder Recherchelauf wuerde
+        # verweigert. Lieber hier den Deploy anhalten.
+        out=$(rssh "$host" "docker exec -w /app -e PYTHONPATH=/app '${c}' poetry run python -c \"
+from src.research_cloud.perplexity import check_perplexity_usable, load_perplexity_config, perplexity_enabled
+cfg = load_perplexity_config()
+if not perplexity_enabled(cfg):
+    print('SKIP')
+else:
+    try:
+        check_perplexity_usable(cfg)
+        print('OK')
+    except Exception as e:
+        print('BROKEN ' + str(e))
+\" 2>&1 | tr -d '\r' | tail -1" || echo "EXEC_FAILED")
+        case "$out" in
+            OK)      info "  ${c}: perplexity_search aktiv" ;;
+            SKIP)    : ;;
+            BROKEN*)
+                error_ "  ${c}: perplexity_search ist AN, aber nicht benutzbar: ${out#BROKEN }"
+                pplx_failed=1 ;;
+            *)
+                error_ "  ${c}: Perplexity-Selbsttest nicht auswertbar: ${out}"
+                pplx_failed=1 ;;
+        esac
     done
+
+    if (( pplx_failed )); then
+        error_ "Worker-Config-Selbsttest fehlgeschlagen — jede Recherche wuerde verweigert (Perplexity)."
+        error_ "  Werte aus Infisical (dev-server/dev, PERPLEXITY_API_KEY / RESEARCH_PERPLEXITY_ENABLED):"
+        error_ "    BRIDGE_HOST=${host} /root/projekte/orchestrator/bin/sync-infisical-to-bridge"
+        return 1
+    fi
 
     if (( failed )); then
         error_ "Worker-Config-Selbsttest fehlgeschlagen — die Recherche liefe ohne Bibliothek."

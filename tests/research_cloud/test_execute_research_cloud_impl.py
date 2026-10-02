@@ -312,6 +312,7 @@ async def test_perplexity_wiring_gate_prompt_and_cost(monkeypatch):
     keeps its field surface (/v1/research contract unchanged)."""
     monkeypatch.setenv("RESEARCH_PERPLEXITY_ENABLED", "true")
     monkeypatch.setenv("PERPLEXITY_API_KEY", "pplx-test")
+    monkeypatch.setenv("BRIDGE_ANONYMIZE_ENABLED", "true")
     req = _make_req()
     request = MagicMock()
     gate = AsyncMock(return_value="ANON_ text")

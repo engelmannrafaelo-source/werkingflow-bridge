@@ -108,6 +108,14 @@ def check_perplexity_usable(config: PerplexityConfig) -> None:
             "RESEARCH_PERPLEXITY_ENABLED is on, but PERPLEXITY_API_KEY is not set — "
             "values come from Infisical (dev-server/dev) via sync-infisical-to-bridge"
         )
+    if environ.get("BRIDGE_ANONYMIZE_ENABLED", "").lower() != "true":
+        # Every query passes the anonymize gate, which refuses while the
+        # detector is off. Without this check each run would start, call the
+        # tool once and only then fail — loud at the start instead.
+        raise PerplexityUnavailableError(
+            "RESEARCH_PERPLEXITY_ENABLED is on, but BRIDGE_ANONYMIZE_ENABLED is not 'true' — "
+            "no query may leave for Perplexity without the anonymize gate"
+        )
     if config.preset not in PRESETS:
         raise PerplexityUnavailableError(
             f"RESEARCH_PERPLEXITY_PRESET={config.preset!r} is not one of {PRESETS}"
