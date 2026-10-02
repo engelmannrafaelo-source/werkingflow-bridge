@@ -41,9 +41,11 @@ PERPLEXITY_TOOL: Dict[str, Any] = {
     "name": PERPLEXITY_TOOL_NAME,
     "description": (
         "Web-Recherche über Perplexity: beantwortet eine präzise Frage aus vielen Webquellen "
-        "und liefert die Antwort mit nummerierter Quellenliste (nr, titel, url). Gut, um "
-        "schnell die einschlägigen Primärquellen zu finden (Normen, Gesetze, Hersteller-"
-        "Datenblätter, Behördenseiten) und den Stand einer Frage zu überblicken.\n"
+        "und liefert die Antwort mit nummerierter Quellenliste (nr, titel, url). Erste Wahl für "
+        "Hersteller-Datenblätter, Produktkennwerte und die aktuell gültige Ausgabe einer Norm "
+        "oder Vorschrift — hier ZUERST fragen (eine Frage je Produkt bzw. Regelwerk, mit "
+        "Typbezeichnung bzw. Normnummer), web_search nur als Rückfall. Ebenso gut, um "
+        "Gesetzesstellen und Behördenseiten zu finden und den Stand einer Frage zu überblicken.\n"
         "Die Antwort ist eine Zusammenfassung Dritter und allein KEIN Beleg: Jede Zahl oder "
         "Vorgabe, die der Bericht tragen soll, liest du mit web_fetch an der Originalquelle "
         "nach (Norm, Gesetz, Hersteller-PDF) und zitierst die Originalquelle, nicht Perplexity.\n"

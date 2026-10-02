@@ -169,6 +169,25 @@ def test_build_tools_perplexity_alone_forces_direct_callers():
     assert "web_fetch" in next(t for t in tools if t["name"] == "perplexity_search")["description"]
 
 
+def test_build_tools_offers_perplexity_directly_not_deferred():
+    # Cloud path: a plain client tool in `tools` — no defer_loading, and no
+    # tool-search tool that could hide it (the pool path had exactly that
+    # problem, 02.10.2026).
+    tools = _build_tools(ResearchCloudConfig(), _NO_LIBRARY, _ON)
+    pplx = next(t for t in tools if t["name"] == "perplexity_search")
+    assert "type" not in pplx and "defer_loading" not in pplx
+    assert not any("tool_search" in (t.get("type") or "") + t["name"] for t in tools)
+
+
+def test_perplexity_first_for_datasheets_and_norm_editions():
+    desc = next(t for t in _build_tools(ResearchCloudConfig(), _NO_LIBRARY, _ON)
+                if t["name"] == "perplexity_search")["description"]
+    prompt = build_system_prompt("standard", perplexity=True)
+    for text in (desc, prompt):
+        assert "Hersteller-Datenblätter" in text and "ZUERST" in text and "Norm" in text
+    assert "web_fetch" in prompt.split("ZUERST", 1)[1]
+
+
 def test_build_tools_without_perplexity_unchanged():
     tools = _build_tools(ResearchCloudConfig(), _NO_LIBRARY, _OFF)
     assert {t["name"] for t in tools} == {"web_search", "web_fetch"}

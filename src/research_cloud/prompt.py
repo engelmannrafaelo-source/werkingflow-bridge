@@ -214,12 +214,18 @@ _PERPLEXITY_SECTION = """
 ## Perplexity-Recherche (`perplexity_search`)
 
 Mit `perplexity_search` stellst du eine konkrete Frage an eine Web-Recherche, die viele Quellen auswertet
-und eine nummerierte Quellenliste zurückgibt. Nutze sie, um die einschlägigen Primärquellen schnell zu finden
-(Normausgaben, Gesetzesstellen, Hersteller-Datenblätter, Behördenseiten) — die Bibliothek bleibt die erste Quelle.
+und eine nummerierte Quellenliste zurückgibt. Die Bibliothek bleibt die erste Quelle.
 
-Eine Perplexity-Antwort ist kein Beleg. Jede Zahl oder Vorgabe, die der Bericht trägt, liest du mit `web_fetch`
-an der Originalquelle nach und zitierst diese Originalquelle. Was du nicht an der Quelle prüfen konntest,
-kennzeichnest du als „nicht verifiziert (nur Perplexity)“."""
+Reihenfolge für alles, was im Netz steht:
+1. Hersteller-Datenblätter, Produktkennwerte (Leistung, Schalldruck, Maße, Zulassungen) und die aktuell
+   gültige Ausgabe einer Norm, Richtlinie oder Verordnung suchst du ZUERST mit `perplexity_search` — eine
+   Frage je Produkt bzw. je Regelwerk, mit Typbezeichnung bzw. Normnummer. `web_search` ist der Rückfall,
+   wenn Perplexity nichts Brauchbares liefert oder das Budget erschöpft ist.
+2. Danach liest du jede Zahl oder Vorgabe, die der Bericht trägt, mit `web_fetch` an der Originalquelle nach
+   (Hersteller-PDF, Normtext oder Normenverlag, Gesetzesstelle) und zitierst diese Originalquelle.
+
+Eine Perplexity-Antwort ist kein Beleg. Was du nicht an der Quelle prüfen konntest, kennzeichnest du als
+„nicht verifiziert (nur Perplexity)“."""
 
 
 def build_system_prompt(

@@ -107,6 +107,31 @@ async def test_missing_cost_is_counted():
     assert t.cost_missing == 1 and t.cost_usd == 0.0
 
 
+# --- server config: offered directly, not deferred behind ToolSearch -------
+
+def test_server_config_is_always_loaded(monkeypatch):
+    # The CLI defers MCP tools behind ToolSearch unless the server config says
+    # alwaysLoad (Mühl run 02.10.2026: 0 Perplexity calls while deferred).
+    sdk = sys.modules["claude_code_sdk"]
+    instance = object()
+    monkeypatch.setattr(sdk, "create_sdk_mcp_server",
+                        MagicMock(return_value={"type": "sdk", "name": "perplexity", "instance": instance}),
+                        raising=False)
+    monkeypatch.setattr(sdk, "tool", MagicMock(return_value=lambda fn: fn), raising=False)
+    cfg = _tool().server()
+    assert cfg == {"type": "sdk", "name": "perplexity", "instance": instance, "alwaysLoad": True}
+    sdk.create_sdk_mcp_server.assert_called_once()
+    assert sdk.create_sdk_mcp_server.call_args.kwargs["name"] == rpp.MCP_SERVER_NAME
+
+
+def test_pool_prompt_puts_perplexity_first_then_webfetch():
+    s = rpp.POOL_PROMPT_SECTION
+    assert rpp.MCP_TOOL_NAME in s and "direkt zur Verfügung" in s
+    first, after = s.split("ZUERST", 1)
+    assert "Hersteller-Datenblätter" in first and "Norm" in first
+    assert "WebFetch" in after and "Originalquelle" in after
+
+
 # --- wiring into _execute_research_impl ------------------------------------
 
 def _make_req():

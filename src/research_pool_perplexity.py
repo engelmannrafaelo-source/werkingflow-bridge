@@ -49,13 +49,20 @@ POOL_PROMPT_SECTION = f"""
 ## Perplexity-Recherche (`{MCP_TOOL_NAME}`)
 
 Mit dem Werkzeug `{MCP_TOOL_NAME}` (Parameter `frage`) stellst du eine konkrete Frage an eine Web-Recherche,
-die viele Quellen auswertet und eine nummerierte Quellenliste zurückgibt. Nutze es, um die einschlägigen
-Primärquellen schnell zu finden (Normausgaben, Gesetzesstellen, Hersteller-Datenblätter, Behördenseiten) —
-eine kuratierte Bibliothek, falls vorhanden, bleibt die erste Quelle.
+die viele Quellen auswertet und eine nummerierte Quellenliste zurückgibt.
+Das Werkzeug steht dir direkt zur Verfügung — du musst es nicht erst suchen oder laden.
+Eine kuratierte Bibliothek, falls vorhanden, bleibt die erste Quelle.
 
-Eine Perplexity-Antwort ist kein Beleg. Jede Zahl oder Vorgabe, die der Bericht trägt, liest du mit WebFetch
-an der Originalquelle nach und zitierst diese Originalquelle. Was du nicht an der Quelle prüfen konntest,
-kennzeichnest du als „nicht verifiziert (nur Perplexity)“."""
+Reihenfolge für alles, was im Netz steht:
+1. Hersteller-Datenblätter, Produktkennwerte (Leistung, Schalldruck, Maße, Zulassungen) und die aktuell
+   gültige Ausgabe einer Norm, Richtlinie oder Verordnung suchst du ZUERST mit `{MCP_TOOL_NAME}` — eine
+   Frage je Produkt bzw. je Regelwerk, mit Typbezeichnung bzw. Normnummer. WebSearch ist der Rückfall, wenn
+   Perplexity nichts Brauchbares liefert oder das Budget erschöpft ist.
+2. Danach liest du jede Zahl oder Vorgabe, die der Bericht trägt, mit WebFetch an der Originalquelle nach
+   (Hersteller-PDF, Normtext oder Normenverlag, Gesetzesstelle) und zitierst diese Originalquelle.
+
+Eine Perplexity-Antwort ist kein Beleg. Was du nicht an der Quelle prüfen konntest, kennzeichnest du als
+„nicht verifiziert (nur Perplexity)“."""
 
 
 class PoolToolError(Exception):
@@ -143,4 +150,16 @@ class PoolPerplexityTool:
             PERPLEXITY_TOOL["description"].replace("web_fetch", "WebFetch").replace("web_search", "WebSearch"),
             PERPLEXITY_TOOL["input_schema"],
         )(self.handle)
-        return create_sdk_mcp_server(name=MCP_SERVER_NAME, tools=[sdk_tool])
+        config = dict(create_sdk_mcp_server(name=MCP_SERVER_NAME, tools=[sdk_tool]))
+        # The CLI defers every MCP tool behind ToolSearch: the model sees only
+        # the name and must load the schema first. Measured 02.10.2026 (Mühl,
+        # Dev worker1): with POOL_PROMPT_SECTION in the prompt the model loaded
+        # only WebSearch/WebFetch and called Perplexity 0 times. ``alwaysLoad``
+        # on the server config (CLI >= 2.1.220, schema of type "sdk"; the SDK
+        # passes every key except ``instance`` into --mcp-config) offers the
+        # tool directly. Live probe CLI 2.1.220 + SDK 0.0.22: without the key
+        # the model reports the tool as deferred, with it as directly callable.
+        # A per-tool ``_meta["anthropic/alwaysLoad"]`` would not survive —
+        # SDK 0.0.22 rebuilds tools/list from name/description/inputSchema only.
+        config["alwaysLoad"] = True
+        return config
