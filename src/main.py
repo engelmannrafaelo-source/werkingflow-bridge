@@ -10,7 +10,7 @@ import subprocess
 from pathlib import Path
 from datetime import datetime, timedelta
 import shutil
-from typing import Optional, AsyncGenerator, Dict, Any
+from typing import Optional, AsyncGenerator, Dict, Any, List, Tuple
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException, Request, Depends
@@ -4594,6 +4594,162 @@ def _load_research_job(job_id: str) -> Optional[Dict[str, Any]]:
         return None
 
 
+# Bookkeeping-free tools are off for the gap checker: it reads two texts and
+# answers in JSON, nothing else (a tool call would end its single turn).
+_LUECKEN_PRUEFER_OHNE_WERKZEUGE = [
+    "Bash", "Read", "Write", "Edit", "MultiEdit", "Glob", "Grep", "WebSearch", "WebFetch",
+    "Task", "TodoWrite", "NotebookEdit", "mcp__*",
+]
+
+
+def _pool_luecken_pruefer(backend_config: Optional[BackendConfig]):
+    """Gap checker for the pool path: one CLI turn of the cheap model."""
+    from src.research_cloud.luecken import PRUEF_MODELL, pool_pruefer
+
+    async def lauf(system: str, anfrage: str):
+        chunks: List[Dict[str, Any]] = []
+        async for chunk in claude_cli.run_completion(
+            prompt=anfrage,
+            system_prompt=system,
+            model=PRUEF_MODELL,
+            max_turns=1,
+            stream=True,
+            disallowed_tools=list(_LUECKEN_PRUEFER_OHNE_WERKZEUGE),
+            backend_env_vars=backend_config.env_vars if backend_config else None,
+        ):
+            chunks.append(chunk)
+        ein = aus = 0
+        for chunk in chunks:
+            u = extract_result_usage(chunk)
+            if u:
+                ein += u["input_tokens"] + u["cache_read_tokens"] + u["cache_creation_tokens"]
+                aus += u["output_tokens"]
+        return claude_cli.parse_claude_message(chunks) or "", ein, aus
+
+    return pool_pruefer(lauf)
+
+
+def _research_workdir(file_metadata: Optional[Dict[str, Any]], container_file: Optional[str]) -> Optional[Path]:
+    """The session directory of a finished pool research run."""
+    if file_metadata:
+        roh = (file_metadata.get("session_tracking") or {}).get("research_dir") or file_metadata.get("research_dir")
+        if roh and Path(roh).is_dir():
+            return Path(roh)
+    if container_file and Path(container_file).parent.name == "claudedocs":
+        return Path(container_file).parent.parent
+    return None
+
+
+async def _pool_luecken_rueckrunde(
+    *,
+    nachkontrolle,
+    offene,
+    bericht: str,
+    erste_chunks: List[Any],
+    cli_resume_id: Optional[str],
+    workdir: Optional[Path],
+    report_file: Optional[str],
+    output_file: Optional[str],
+    pool_pplx,
+    pool_doc,
+    sdk_mcp_servers: Optional[Dict[str, Any]],
+    append_system_prompt: Optional[str],
+    request_body: ResearchRequest,
+    backend_config: Optional[BackendConfig],
+) -> Tuple[str, Optional[Dict[str, int]]]:
+    """The ONE return round on the pool path: resume the same CLI session in its
+    own directory, with the same tool instances (budgets continue), and take the
+    revised report. Any failure keeps the report from before and is named in
+    ``rueckrunde_fehler`` — a finished report is never lost to the check.
+
+    Returns (report, usage of the return round or None).
+    """
+    from src.research_cloud.executor import RUECKRUNDE_MIN_ANTEIL
+    from src.research_cloud.luecken import baue_rueckrunden_auftrag, protokoll_aus_pool_chunks
+    from src.research_pool_perplexity import DOC_TOOL_NAME, MCP_TOOL_NAME
+
+    def scheitern(grund: str) -> Tuple[str, Optional[Dict[str, int]]]:
+        nachkontrolle.rueckrunde_fehler = grund[:500]
+        logger.error(f"research Lücken-Nachkontrolle: Rückrunde gescheitert, Bericht von vorher bleibt: {grund}")
+        return bericht, rr_usage
+
+    rr_usage: Optional[Dict[str, int]] = None
+    if not cli_resume_id or workdir is None:
+        return scheitern(
+            f"keine fortsetzbare Sitzung (cli_session={cli_resume_id!r}, workdir={workdir})"
+        )
+    datei = Path(report_file) if report_file and Path(report_file).is_relative_to(workdir) else None
+    if datei is not None:
+        ziel = (
+            f"Schreibe danach den VOLLSTÄNDIGEN ergänzten Bericht mit dem Write-Werkzeug in die Datei `{datei}` "
+            "(ganze Datei ersetzen — den ganzen Bericht mit den Ergänzungen, nicht nur die geänderten Stellen)."
+        )
+    else:
+        ziel = (
+            "Gib danach den VOLLSTÄNDIGEN Bericht als Antwort aus — den ganzen Bericht mit den Ergänzungen, "
+            "nicht nur die geänderten Stellen."
+        )
+    auftrag = baue_rueckrunden_auftrag(
+        offene,
+        perplexity_werkzeug=MCP_TOOL_NAME,
+        dokument_werkzeug=DOC_TOOL_NAME,
+        perplexity_rest=pool_pplx.max_uses - pool_pplx.calls,
+        dokument_rest=max(pool_doc.counters.max_uses - pool_doc.counters.calls, 0) if pool_doc else 0,
+        ziel=ziel,
+    )
+    chunks: List[Dict[str, Any]] = []
+    try:
+        async for chunk in claude_cli.run_completion(
+            prompt=auftrag,
+            append_system_prompt=append_system_prompt,
+            model=request_body.model,
+            # Per gap: one search, one read, one edit — plus the rewrite.
+            max_turns=min(4 * len(offene) + 6, 40),
+            stream=True,
+            backend_env_vars=backend_config.env_vars if backend_config else None,
+            sdk_mcp_servers=sdk_mcp_servers,
+            session_id=cli_resume_id,
+            resume_workdir=workdir,
+        ):
+            chunks.append(chunk)
+    except Exception as e:
+        return scheitern(f"{type(e).__name__}: {e}")
+    for chunk in chunks:
+        u = extract_result_usage(chunk)
+        if u:
+            rr_usage = rr_usage or {"input_tokens": 0, "output_tokens": 0, "cache_read_tokens": 0, "cache_creation_tokens": 0}
+            for k in rr_usage:
+                rr_usage[k] += u[k]
+    nachkontrolle.rueckrunde_usage = dict(rr_usage or {}, usage_source="api" if rr_usage else "missing")
+    if pool_pplx.gate_error:
+        # Same rule as the first round: a report written while the privacy
+        # gate was broken is not handed out — the caller raises on gate_error.
+        return scheitern(f"Anonymisierungssperre in der Rückrunde: {pool_pplx.gate_error}")
+
+    if datei is not None:
+        try:
+            neu = datei.read_text(encoding="utf-8")
+        except OSError as e:
+            return scheitern(f"Berichtsdatei nach der Rückrunde nicht lesbar: {e}")
+    else:
+        neu = claude_cli.parse_claude_message(chunks) or ""
+    if len(neu.strip()) < len(bericht.strip()) * RUECKRUNDE_MIN_ANTEIL:
+        if datei is not None:
+            # The model overwrote the file with a fragment — put the report back.
+            datei.write_text(bericht, encoding="utf-8")
+        return scheitern(
+            f"Rückrunde lieferte keinen vollständigen Bericht ({len(neu.strip())} von vorher "
+            f"{len(bericht.strip())} Zeichen)"
+        )
+    if output_file and datei is not None and Path(output_file) != datei:
+        try:
+            Path(output_file).write_text(neu, encoding="utf-8")
+        except OSError as e:
+            logger.error(f"research Lücken-Nachkontrolle: output_file nicht aktualisiert: {e}")
+    await nachkontrolle.nachmessen(neu, protokoll_aus_pool_chunks(list(erste_chunks) + chunks))
+    return neu, rr_usage
+
+
 async def _execute_research_impl(
     request_body: ResearchRequest,
     backend_config: Optional[BackendConfig],
@@ -4787,10 +4943,26 @@ async def _execute_research_impl(
             }
             library_append_prompt = (library_append_prompt or "") + POOL_PROMPT_SECTION
 
+        # Lücken-Nachkontrolle (Rafael 03.10.2026): eigene Flagge, Vorgabe wie
+        # Perplexity. Falsch gesetzt -> Lauf wird nicht gestartet.
+        from src.research_cloud.luecken import LueckenKonfigFehler, nachkontrolle_aktiv
+        try:
+            luecken_an = nachkontrolle_aktiv(perplexity_enabled(_pplx_cfg))
+        except LueckenKonfigFehler as _lk_err:
+            logger.error(f"research: Lücken-Nachkontrolle falsch konfiguriert, Lauf wird nicht gestartet: {_lk_err}")
+            return ResearchResponse(
+                status="error",
+                query=request_body.query,
+                model=request_body.model,
+                execution_time_seconds=round(time.time() - start_time, 2),
+                error=f"Die Recherche wurde nicht gestartet: {_lk_err}",
+            )
+
         logger.info("🚀 Starting research execution...")
 
         all_chunks = []
         file_metadata = None
+        cli_resume_id: Optional[str] = None
 
         async for chunk in claude_cli.run_completion(
             prompt=research_prompt,
@@ -4807,6 +4979,8 @@ async def _execute_research_impl(
             all_chunks.append(chunk)
             if "session_id" in chunk:
                 session_id = chunk["session_id"]
+                if chunk.get("type") != "x_claude_metadata":
+                    cli_resume_id = chunk["session_id"]
             if chunk.get("type") == "x_claude_metadata":
                 file_metadata = chunk
                 logger.info(f"📦 Found file metadata: {len(chunk.get('files_created', []))} files")
@@ -5026,6 +5200,43 @@ async def _execute_research_impl(
                 f"({pool_pplx.gate_error}) — Lauf als Fehler beendet, die Anfrage wurde nicht gesendet"
             )
 
+        nachkontrolle = None
+        if luecken_an and pool_pplx is not None:
+            from src.research_cloud.luecken import Nachkontrolle, protokoll_aus_pool_chunks
+            nachkontrolle = Nachkontrolle(pruefer=_pool_luecken_pruefer(backend_config))
+            offene = await nachkontrolle.entscheide(
+                content or "",
+                protokoll_aus_pool_chunks(all_chunks),
+                perplexity_rest=pool_pplx.max_uses - pool_pplx.calls,
+            )
+            if offene:
+                content, rr_usage = await _pool_luecken_rueckrunde(
+                    nachkontrolle=nachkontrolle,
+                    offene=offene,
+                    bericht=content or "",
+                    erste_chunks=all_chunks,
+                    cli_resume_id=cli_resume_id,
+                    workdir=_research_workdir(file_metadata, container_file),
+                    # The model's own file in its workdir — content_file may
+                    # be the caller's output_path copy, which it cannot edit.
+                    report_file=container_file,
+                    output_file=output_file,
+                    pool_pplx=pool_pplx,
+                    pool_doc=pool_doc,
+                    sdk_mcp_servers=pool_sdk_mcp_servers,
+                    append_system_prompt=library_append_prompt,
+                    request_body=request_body,
+                    backend_config=backend_config,
+                )
+                # Ledger: the return round is part of this run's cost.
+                if rr_usage:
+                    accumulated_input_tokens = (accumulated_input_tokens or 0) + rr_usage["input_tokens"]
+                    accumulated_output_tokens = (accumulated_output_tokens or 0) + rr_usage["output_tokens"]
+                    accumulated_cache_read += rr_usage["cache_read_tokens"]
+                    accumulated_cache_creation += rr_usage["cache_creation_tokens"]
+                if content_file and Path(content_file).exists():
+                    file_size_bytes = Path(content_file).stat().st_size
+
         # R1: Persist activity — resolve token counts (SDK-provided preferred, estimate fallback)
         try:
             _track_in = accumulated_input_tokens
@@ -5087,6 +5298,7 @@ async def _execute_research_impl(
                         else {}
                     ),
                     **(pool_doc.counters.as_meta() if pool_doc is not None else {}),
+                    **(nachkontrolle.as_meta() if nachkontrolle is not None else {}),
                     # Nur wenn die Bibliothek für diesen Lauf wirklich stand —
                     # ein 0 bei ausgeschalteter Bibliothek würde später als
                     # "das Modell hat sie ignoriert" gelesen.
@@ -5271,6 +5483,32 @@ async def _execute_research_cloud_impl(
     search_max_uses, fetch_max_uses = search_budget_for_depth(request_body.depth)
     config = ResearchCloudConfig(web_search_max_uses=search_max_uses, web_fetch_max_uses=fetch_max_uses)
 
+    # Lücken-Nachkontrolle (Rafael 03.10.2026): same switch semantics as the
+    # pool path; the checker is a forced tool call on the research lane's key.
+    from src.research_cloud.luecken import (
+        LueckenKonfigFehler,
+        Nachkontrolle,
+        messages_api_pruefer,
+        nachkontrolle_aktiv,
+    )
+    nachkontrolle = None
+    try:
+        if nachkontrolle_aktiv(perplexity_enabled(perplexity_cfg)):
+            # Same key as the executor; without it the executor itself refuses
+            # the run before the checker could ever be asked.
+            nachkontrolle = Nachkontrolle(
+                pruefer=messages_api_pruefer(os.environ.get("RESEARCH_CLOUD_API_KEY"))
+            )
+    except LueckenKonfigFehler as e:
+        logger.error(f"research-cloud: Lücken-Nachkontrolle falsch konfiguriert, Lauf wird nicht gestartet: {e}")
+        return ResearchResponse(
+            status="error",
+            query=request_body.query,
+            model=request_body.model,
+            execution_time_seconds=round(time.time() - start_time, 2),
+            error=f"Die Recherche wurde nicht gestartet: {e}",
+        )
+
     try:
         result = await run_research_cloud(
             prompt,
@@ -5282,6 +5520,7 @@ async def _execute_research_cloud_impl(
             # Every perplexity_search query passes the SAME fail-closed gate as
             # the prompt above before it leaves for the third party.
             anonymize=lambda text: anonymize_query_for_cloud(request, text),
+            nachkontrolle=nachkontrolle,
         )
     except ResearchCloudExecutorError as e:
         execution_time = time.time() - start_time
@@ -5340,7 +5579,9 @@ async def _execute_research_cloud_impl(
             search_count=result.searches,
             # Perplexity bills per call outside the Anthropic tokens; the
             # amount is what Perplexity itself reported (usage.cost.total_cost).
-            extra_cost_usd=result.perplexity_cost_usd,
+            # plus the gap checker's own calls (cheap model, same key).
+            extra_cost_usd=result.perplexity_cost_usd
+            + (nachkontrolle.pruef_kosten_usd if nachkontrolle is not None else 0.0),
             status="success",
             duration_ms=int(result.duration_seconds * 1000),
             app_env=attribution_ctx.get("app_env") if attribution_ctx else None,
@@ -5361,6 +5602,7 @@ async def _execute_research_cloud_impl(
                 # Observability only — NOT wired into the deduction path yet,
                 # see src/research_cloud/pricing_tiers.py docstring.
                 "customer_price_eur": customer_price_eur(request_body.depth),
+                **(nachkontrolle.as_meta() if nachkontrolle is not None else {}),
             },
         )
     except Exception as _track_err:

@@ -210,6 +210,7 @@ services:
       # perplexity_search im Cloud-Weg (Rafael 02.10.2026). Schluessel aus Infisical
       # dev-server/dev via sync-infisical-to-bridge; Flagge leer = aus.
       - RESEARCH_PERPLEXITY_ENABLED=${RESEARCH_PERPLEXITY_ENABLED:-}
+      - RESEARCH_LUECKEN_NACHKONTROLLE=${RESEARCH_LUECKEN_NACHKONTROLLE:-}
       - PERPLEXITY_API_KEY=${PERPLEXITY_API_KEY:-}
       - RESEARCH_LIBRARY_S3_ENDPOINT_URL=${RESEARCH_LIBRARY_S3_ENDPOINT_URL:-}
       - RESEARCH_LIBRARY_S3_BUCKET=${RESEARCH_LIBRARY_S3_BUCKET:-}
@@ -401,6 +402,7 @@ services:
       # perplexity_search im Cloud-Weg (Rafael 02.10.2026). Schluessel aus Infisical
       # dev-server/dev via sync-infisical-to-bridge; Flagge leer = aus.
       - RESEARCH_PERPLEXITY_ENABLED=${RESEARCH_PERPLEXITY_ENABLED:-}
+      - RESEARCH_LUECKEN_NACHKONTROLLE=${RESEARCH_LUECKEN_NACHKONTROLLE:-}
       - PERPLEXITY_API_KEY=${PERPLEXITY_API_KEY:-}
       - RESEARCH_LIBRARY_S3_ENDPOINT_URL=${RESEARCH_LIBRARY_S3_ENDPOINT_URL:-}
       - RESEARCH_LIBRARY_S3_BUCKET=${RESEARCH_LIBRARY_S3_BUCKET:-}
@@ -592,6 +594,7 @@ services:
       # perplexity_search im Cloud-Weg (Rafael 02.10.2026). Schluessel aus Infisical
       # dev-server/dev via sync-infisical-to-bridge; Flagge leer = aus.
       - RESEARCH_PERPLEXITY_ENABLED=${RESEARCH_PERPLEXITY_ENABLED:-}
+      - RESEARCH_LUECKEN_NACHKONTROLLE=${RESEARCH_LUECKEN_NACHKONTROLLE:-}
       - PERPLEXITY_API_KEY=${PERPLEXITY_API_KEY:-}
       - RESEARCH_LIBRARY_S3_ENDPOINT_URL=${RESEARCH_LIBRARY_S3_ENDPOINT_URL:-}
       - RESEARCH_LIBRARY_S3_BUCKET=${RESEARCH_LIBRARY_S3_BUCKET:-}
@@ -783,6 +786,7 @@ services:
       # perplexity_search im Cloud-Weg (Rafael 02.10.2026). Schluessel aus Infisical
       # dev-server/dev via sync-infisical-to-bridge; Flagge leer = aus.
       - RESEARCH_PERPLEXITY_ENABLED=${RESEARCH_PERPLEXITY_ENABLED:-}
+      - RESEARCH_LUECKEN_NACHKONTROLLE=${RESEARCH_LUECKEN_NACHKONTROLLE:-}
       - PERPLEXITY_API_KEY=${PERPLEXITY_API_KEY:-}
       - RESEARCH_LIBRARY_S3_ENDPOINT_URL=${RESEARCH_LIBRARY_S3_ENDPOINT_URL:-}
       - RESEARCH_LIBRARY_S3_BUCKET=${RESEARCH_LIBRARY_S3_BUCKET:-}

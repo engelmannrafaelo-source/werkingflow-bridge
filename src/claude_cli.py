@@ -1336,6 +1336,7 @@ class ClaudeCodeCLI:
         seed_links: Optional[Dict[str, Dict[str, str]]] = None,
         max_thinking_tokens: Optional[int] = None,
         sdk_mcp_servers: Optional[Dict[str, Any]] = None,
+        resume_workdir: Optional[Path] = None,
     ) -> AsyncGenerator[Dict[str, Any], None]:
         """Run Claude Code using the Python SDK and yield response chunks.
 
@@ -1373,7 +1374,23 @@ class ClaudeCodeCLI:
                         to a copy across filesystem boundaries; fails loud
                         when neither works, since a silently missing document
                         makes the agent conclude "not in the library".
+            resume_workdir: Continue a FINISHED run in its own session
+                        directory instead of creating a new one (research
+                        Lücken-Nachkontrolle, one return round). Requires
+                        ``session_id`` (the CLI's session id): the CLI finds a
+                        session only under the cwd it was started in. Nothing
+                        is seeded again, and the bookkeeping files get a
+                        ``.fortsetzung`` suffix so the first run's prompt.txt /
+                        metadata.json stay as they were.
         """
+        if resume_workdir is not None:
+            if not session_id or continue_session:
+                raise ValueError("resume_workdir needs session_id (and no continue_session)")
+            if not Path(resume_workdir).is_dir():
+                raise RuntimeError(f"resume_workdir does not exist: {resume_workdir}")
+            if seed_files or seed_links:
+                raise ValueError("resume_workdir must not seed again — the directory already holds its files")
+        _datei_tag = ".fortsetzung" if resume_workdir is not None else ""
 
         # Register CLI session for tracking and cancellation
         from src.cli_session_manager import cli_session_manager
@@ -1494,10 +1511,10 @@ class ClaudeCodeCLI:
                     raise RuntimeError(error_msg)
 
                 # Create session directory
-                research_dir = self.cwd / session_dir_name
+                research_dir = Path(resume_workdir) if resume_workdir is not None else self.cwd / session_dir_name
 
                 try:
-                    research_dir.mkdir(parents=True, exist_ok=False)
+                    research_dir.mkdir(parents=True, exist_ok=resume_workdir is not None)
                     logger.info(
                         "✅ Session directory created",
                         extra={
@@ -1621,7 +1638,7 @@ class ClaudeCodeCLI:
                     }
                 }
 
-                metadata_file = research_dir / "metadata.json"
+                metadata_file = research_dir / f"metadata{_datei_tag}.json"
                 try:
                     import json
                     with open(metadata_file, 'w', encoding='utf-8') as f:
@@ -1826,7 +1843,7 @@ class ClaudeCodeCLI:
                     options.resume = session_id
 
                 # === Save exact prompt BEFORE sending to Claude SDK ===
-                prompt_file = research_dir / "prompt.txt"
+                prompt_file = research_dir / f"prompt{_datei_tag}.txt"
                 try:
                     with open(prompt_file, 'w', encoding='utf-8') as f:
                         # Save system prompt if exists
@@ -1874,9 +1891,9 @@ class ClaudeCodeCLI:
                 first_chunk_logged = False
 
                 # Progress tracking setup - use research_dir for all tracking
-                progress_file = research_dir / "progress.jsonl"
-                messages_file = research_dir / "messages.jsonl"
-                final_file = research_dir / "final_response.json"
+                progress_file = research_dir / f"progress{_datei_tag}.jsonl"
+                messages_file = research_dir / f"messages{_datei_tag}.jsonl"
+                final_file = research_dir / f"final_response{_datei_tag}.json"
                 progress_tracking_enabled = True
 
                 # Tracking variables for final response
@@ -2366,6 +2383,12 @@ class ClaudeCodeCLI:
                         metadata_chunk = {
                             "type": "x_claude_metadata",
                             "files_created": [],
+                            # Top-level, not under session_tracking: the
+                            # research handler reads session_tracking as "the
+                            # files' session" and would re-key its response.
+                            # Needed to continue an inline-only report in
+                            # its own directory (Lücken-Nachkontrolle).
+                            "research_dir": str(research_dir) if research_dir else None,
                             "discovery_status": "no_files_found",
                             "discovery_details": {
                                 "sdk_parsing_attempted": True,
@@ -2419,7 +2442,7 @@ class ClaudeCodeCLI:
                         # Don't raise - session completed even if final write failed
 
                     # Update metadata status
-                    metadata_file = research_dir / "metadata.json"
+                    metadata_file = research_dir / f"metadata{_datei_tag}.json"
                     try:
                         metadata = json.loads(metadata_file.read_text())
                         metadata['status'] = 'completed'
