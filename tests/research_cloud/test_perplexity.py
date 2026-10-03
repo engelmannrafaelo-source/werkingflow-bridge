@@ -162,7 +162,8 @@ async def test_ask_does_not_retry_401():
 
 def test_build_tools_perplexity_alone_forces_direct_callers():
     tools = _build_tools(ResearchCloudConfig(), _NO_LIBRARY, _ON)
-    assert {t["name"] for t in tools} == {"web_search", "web_fetch", "perplexity_search"}
+    # fetch_document comes with Perplexity (Perplexity finds, it reads).
+    assert {t["name"] for t in tools} == {"web_search", "web_fetch", "perplexity_search", "fetch_document"}
     for t in tools:
         if "type" in t:
             assert t["allowed_callers"] == ["direct"]

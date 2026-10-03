@@ -4740,6 +4740,7 @@ async def _execute_research_impl(
             perplexity_enabled,
         )
         pool_pplx = None
+        pool_doc = None
         pool_sdk_mcp_servers = None
         _pplx_cfg = load_perplexity_config()
         if perplexity_enabled(_pplx_cfg):
@@ -4764,8 +4765,10 @@ async def _execute_research_impl(
             from src.research_cloud.anonymize_gate import anonymize_query_for_cloud
             from src.research_cloud.models import ResearchCloudConfig
             from src.research_pool_perplexity import (
+                DOC_MCP_SERVER_NAME,
                 MCP_SERVER_NAME,
                 POOL_PROMPT_SECTION,
+                PoolDocumentTool,
                 PoolPerplexityTool,
             )
             pool_pplx = PoolPerplexityTool(
@@ -4774,7 +4777,14 @@ async def _execute_research_impl(
                 None,
                 ResearchCloudConfig().perplexity_max_uses,
             )
-            pool_sdk_mcp_servers = {MCP_SERVER_NAME: pool_pplx.server()}
+            # fetch_document kommt mit Perplexity: Perplexity findet das
+            # Datenblatt, fetch_document liest es (WebFetch lieferte aus einem
+            # PDF mit Textebene nichts Lesbares, Dev 02.10.2026).
+            pool_doc = PoolDocumentTool(ResearchCloudConfig().fetch_document_max_uses)
+            pool_sdk_mcp_servers = {
+                MCP_SERVER_NAME: pool_pplx.server(),
+                DOC_MCP_SERVER_NAME: pool_doc.server(),
+            }
             library_append_prompt = (library_append_prompt or "") + POOL_PROMPT_SECTION
 
         logger.info("🚀 Starting research execution...")
@@ -5076,6 +5086,7 @@ async def _execute_research_impl(
                         if pool_pplx is not None
                         else {}
                     ),
+                    **(pool_doc.counters.as_meta() if pool_doc is not None else {}),
                     # Nur wenn die Bibliothek für diesen Lauf wirklich stand —
                     # ein 0 bei ausgeschalteter Bibliothek würde später als
                     # "das Modell hat sie ignoriert" gelesen.
@@ -5341,6 +5352,8 @@ async def _execute_research_cloud_impl(
                 "perplexity_calls": result.perplexity_calls,
                 "perplexity_cost_usd": result.perplexity_cost_usd,
                 "perplexity_cost_missing": result.perplexity_cost_missing,
+                "fetch_document_calls": result.fetch_document_calls,
+                "fetch_document_errors": result.fetch_document_errors,
                 "iterations": result.iterations,
                 "container_id": result.container_id,
                 "stop_reason": result.stop_reason,

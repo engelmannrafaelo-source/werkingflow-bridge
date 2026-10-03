@@ -30,6 +30,13 @@ from typing import Any, Awaitable, Callable, Dict, Optional
 
 import httpx
 
+from src.research_cloud.fetch_document import (
+    FETCH_DOCUMENT_TOOL,
+    FETCH_DOCUMENT_TOOL_NAME,
+    DocumentCounters,
+    DocumentFetchError,
+    fetch_document,
+)
 from src.research_cloud.perplexity import (
     PERPLEXITY_TOOL,
     PERPLEXITY_TOOL_NAME,
@@ -43,6 +50,10 @@ logger = logging.getLogger(__name__)
 
 MCP_SERVER_NAME = "perplexity"
 MCP_TOOL_NAME = f"mcp__{MCP_SERVER_NAME}__{PERPLEXITY_TOOL_NAME}"
+# fetch_document runs in its own in-process server: the CLI shows the server
+# name in the tool name, and "perplexity" would mislabel a document download.
+DOC_MCP_SERVER_NAME = "dokument"
+DOC_TOOL_NAME = f"mcp__{DOC_MCP_SERVER_NAME}__{FETCH_DOCUMENT_TOOL_NAME}"
 
 POOL_PROMPT_SECTION = f"""
 
@@ -58,11 +69,22 @@ Reihenfolge für alles, was im Netz steht:
    gültige Ausgabe einer Norm, Richtlinie oder Verordnung suchst du ZUERST mit `{MCP_TOOL_NAME}` — eine
    Frage je Produkt bzw. je Regelwerk, mit Typbezeichnung bzw. Normnummer. WebSearch ist der Rückfall, wenn
    Perplexity nichts Brauchbares liefert oder das Budget erschöpft ist.
-2. Danach liest du jede Zahl oder Vorgabe, die der Bericht trägt, mit WebFetch an der Originalquelle nach
-   (Hersteller-PDF, Normtext oder Normenverlag, Gesetzesstelle) und zitierst diese Originalquelle.
+2. Danach liest du jede Zahl oder Vorgabe, die der Bericht trägt, an der Originalquelle nach und zitierst
+   diese Originalquelle: Dokumente (PDF-Datenblatt, Broschüre, Katalog, Merkblatt) mit `{DOC_TOOL_NAME}` —
+   mit Seitenzahl —, Webseiten (Normenverlag, Gesetzesstelle, Herstellerseite) mit WebFetch.
 
 Eine Perplexity-Antwort ist kein Beleg. Was du nicht an der Quelle prüfen konntest, kennzeichnest du als
-„nicht verifiziert (nur Perplexity)“."""
+„nicht verifiziert (nur Perplexity)“.
+
+Zweite Fundstelle statt Abbruch: Liefert eine Quelle keinen lesbaren Inhalt (Fehler, leerer Text, gesuchter
+Typ fehlt), suchst du eine zweite Fundstelle derselben Angabe — Herstellerseite, andere Händler- oder
+Katalogfassung, über `{MCP_TOOL_NAME}` oder WebSearch —, bevor ein Kennwert als „nicht bestätigt“ gilt.
+Im Bericht nennst du dann beide versuchten Quellen.
+
+Normlücken zuerst über Perplexity: Fehlt eine im Auftrag genannte Norm, Richtlinie oder Verordnung in der
+Bibliothek, fragst du `{MCP_TOOL_NAME}` nach aktueller Ausgabe, Ausgabedatum und Anwendungsbereich, bevor
+du sie als Lücke meldest. Die Lücke bleibt erlaubt, wenn auch das nichts Belegbares liefert — dann mit
+dem Vermerk, dass gesucht wurde."""
 
 
 class PoolToolError(Exception):
@@ -162,4 +184,45 @@ class PoolPerplexityTool:
         # A per-tool ``_meta["anthropic/alwaysLoad"]`` would not survive —
         # SDK 0.0.22 rebuilds tools/list from name/description/inputSchema only.
         config["alwaysLoad"] = True
+        return config
+
+
+def _cli_tool_names(text: str) -> str:
+    """Cloud tool texts name the server tools; the CLI calls them differently."""
+    return (
+        text.replace("web_fetch", "WebFetch")
+        .replace("web_search", "WebSearch")
+        .replace(PERPLEXITY_TOOL_NAME, MCP_TOOL_NAME)
+    )
+
+
+class PoolDocumentTool:
+    """fetch_document on the pool path: one instance per research run.
+
+    Same shape as PoolPerplexityTool — the handler runs in this worker and
+    raises PoolToolError for every refusal, so the CLI sees an error result
+    that carries the named reason (src/research_cloud/fetch_document.py).
+    """
+
+    def __init__(self, max_uses: int, **fetch_kwargs: Any) -> None:
+        self.counters = DocumentCounters(max_uses=max_uses)
+        self._fetch_kwargs = fetch_kwargs
+
+    async def handle(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        try:
+            text = await fetch_document(args, self.counters, **self._fetch_kwargs)
+        except DocumentFetchError as e:
+            raise PoolToolError(f"fetch_document: {e}") from e
+        return {"content": [{"type": "text", "text": text}]}
+
+    def server(self) -> Dict[str, Any]:
+        from claude_code_sdk import create_sdk_mcp_server, tool
+
+        sdk_tool = tool(
+            FETCH_DOCUMENT_TOOL_NAME,
+            _cli_tool_names(FETCH_DOCUMENT_TOOL["description"]),
+            FETCH_DOCUMENT_TOOL["input_schema"],
+        )(self.handle)
+        config = dict(create_sdk_mcp_server(name=DOC_MCP_SERVER_NAME, tools=[sdk_tool]))
+        config["alwaysLoad"] = True  # same reason as PoolPerplexityTool.server()
         return config

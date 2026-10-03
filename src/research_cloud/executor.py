@@ -41,6 +41,13 @@ from src.research_cloud.library import (
     load_library_config,
     load_library_for_run,
 )
+from src.research_cloud.fetch_document import (
+    FETCH_DOCUMENT_TOOL,
+    FETCH_DOCUMENT_TOOL_NAME,
+    DocumentCounters,
+    DocumentFetchError,
+    fetch_document,
+)
 from src.research_cloud.perplexity import (
     PERPLEXITY_TOOL,
     PERPLEXITY_TOOL_NAME,
@@ -219,6 +226,9 @@ def _build_tools(
         tools.append(copy.deepcopy(_LIBRARY_GET_TOOL))
     if with_perplexity:
         tools.append(copy.deepcopy(PERPLEXITY_TOOL))
+        # Perplexity finds the datasheet, fetch_document reads it: web_fetch
+        # returned nothing readable from a text-layer PDF (Dev, 02.10.2026).
+        tools.append(copy.deepcopy(FETCH_DOCUMENT_TOOL))
     return tools
 
 
@@ -346,6 +356,7 @@ async def run_research_cloud(
     perplexity_config: Optional[PerplexityConfig] = None,
     anonymize: Optional[Callable[[str], Awaitable[str]]] = None,
     perplexity_client: Optional[httpx.AsyncClient] = None,
+    fetch_document_kwargs: Optional[Dict[str, Any]] = None,
 ) -> ResearchCloudResult:
     """Run one research-cloud job to completion (all pause_turn continuations).
 
@@ -432,6 +443,7 @@ async def run_research_cloud(
     searches = fetches = library_calls = perplexity_calls = 0
     perplexity_cost_usd = 0.0
     perplexity_cost_missing = 0
+    doc_counters = DocumentCounters(max_uses=config.fetch_document_max_uses)
     container_id: Optional[str] = None
     iteration = 0
     t0 = time.monotonic()
@@ -560,6 +572,21 @@ async def run_research_cloud(
                         )
                         tool_results.append(tool_result)
                         continue
+                    if tool_block.get("name") == FETCH_DOCUMENT_TOOL_NAME:
+                        try:
+                            text = await fetch_document(
+                                tool_block.get("input") or {}, doc_counters, **(fetch_document_kwargs or {})
+                            )
+                            tool_results.append({
+                                "type": "tool_result", "tool_use_id": tool_block.get("id"),
+                                "content": [{"type": "text", "text": text}],
+                            })
+                        except DocumentFetchError as e:
+                            tool_results.append({
+                                "type": "tool_result", "tool_use_id": tool_block.get("id"), "is_error": True,
+                                "content": [{"type": "text", "text": f"fetch_document: {e}"}],
+                            })
+                        continue
                     tool_result = await _handle_library_tool_call(
                         tool_block, library_cfg, library_index or {}
                     )
@@ -632,6 +659,8 @@ async def run_research_cloud(
         perplexity_calls=perplexity_calls,
         perplexity_cost_usd=round(perplexity_cost_usd, 6),
         perplexity_cost_missing=perplexity_cost_missing,
+        fetch_document_calls=doc_counters.calls,
+        fetch_document_errors=doc_counters.errors,
         iterations=iteration + 1,
         stop_reason=parsed.stop_reason,
         duration_seconds=round(duration, 2),

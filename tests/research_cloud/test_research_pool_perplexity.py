@@ -197,11 +197,14 @@ async def test_flag_on_hands_the_server_and_prompt_to_the_cli(spy_cli, persist, 
     _, captured, _ = spy_cli
     result = await src.main._execute_research_impl(_make_req(), None, request=MagicMock())
     assert result.status == "success"
-    assert set(captured["sdk_mcp_servers"]) == {rpp.MCP_SERVER_NAME}
+    assert set(captured["sdk_mcp_servers"]) == {rpp.MCP_SERVER_NAME, rpp.DOC_MCP_SERVER_NAME}
     assert rpp.MCP_TOOL_NAME in captured["append_system_prompt"]
+    assert rpp.DOC_TOOL_NAME in captured["append_system_prompt"]
     booked = persist.await_args.kwargs
     assert booked["extra_cost_usd"] == 0.0
     assert booked["provider_meta"]["perplexity_calls"] == 0
+    assert booked["provider_meta"]["fetch_document_calls"] == 0
+    assert booked["provider_meta"]["fetch_document_errors"] == 0
 
 
 @pytest.mark.asyncio

@@ -221,11 +221,22 @@ Reihenfolge für alles, was im Netz steht:
    gültige Ausgabe einer Norm, Richtlinie oder Verordnung suchst du ZUERST mit `perplexity_search` — eine
    Frage je Produkt bzw. je Regelwerk, mit Typbezeichnung bzw. Normnummer. `web_search` ist der Rückfall,
    wenn Perplexity nichts Brauchbares liefert oder das Budget erschöpft ist.
-2. Danach liest du jede Zahl oder Vorgabe, die der Bericht trägt, mit `web_fetch` an der Originalquelle nach
-   (Hersteller-PDF, Normtext oder Normenverlag, Gesetzesstelle) und zitierst diese Originalquelle.
+2. Danach liest du jede Zahl oder Vorgabe, die der Bericht trägt, an der Originalquelle nach und zitierst
+   diese Originalquelle: Dokumente (PDF-Datenblatt, Broschüre, Katalog, Merkblatt) mit `fetch_document` —
+   mit Seitenzahl —, Webseiten (Normenverlag, Gesetzesstelle, Herstellerseite) mit `web_fetch`.
 
 Eine Perplexity-Antwort ist kein Beleg. Was du nicht an der Quelle prüfen konntest, kennzeichnest du als
-„nicht verifiziert (nur Perplexity)“."""
+„nicht verifiziert (nur Perplexity)“.
+
+Zweite Fundstelle statt Abbruch: Liefert eine Quelle keinen lesbaren Inhalt (Fehler, leerer Text, gesuchter
+Typ fehlt), suchst du eine zweite Fundstelle derselben Angabe — Herstellerseite, andere Händler- oder
+Katalogfassung, über `perplexity_search` oder `web_search` —, bevor ein Kennwert als „nicht bestätigt“ gilt.
+Im Bericht nennst du dann beide versuchten Quellen.
+
+Normlücken zuerst über Perplexity: Fehlt eine im Auftrag genannte Norm, Richtlinie oder Verordnung in der
+Bibliothek, fragst du `perplexity_search` nach aktueller Ausgabe, Ausgabedatum und Anwendungsbereich, bevor
+du sie als Lücke meldest. Die Lücke bleibt erlaubt, wenn auch das nichts Belegbares liefert — dann mit
+dem Vermerk, dass gesucht wurde."""
 
 
 def build_system_prompt(

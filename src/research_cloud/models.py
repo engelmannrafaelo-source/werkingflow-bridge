@@ -43,6 +43,10 @@ class ResearchCloudResult(BaseModel):
     perplexity_calls: int = 0
     perplexity_cost_usd: float = 0.0
     perplexity_cost_missing: int = 0
+    # fetch_document (offered with perplexity_search): calls and how many of
+    # them ended with a named refusal instead of text.
+    fetch_document_calls: int = 0
+    fetch_document_errors: int = 0
     iterations: int = 0
     stop_reason: Optional[str] = None
     duration_seconds: float = 0.0
@@ -73,6 +77,10 @@ class ResearchCloudConfig(BaseModel):
     # Ceiling for perplexity_search per run (Auftrag 02.10.2026: Vorschlag 8).
     # ~0.05 USD per medium call measured on the Mühl questions -> <= ~0.40 USD.
     perplexity_max_uses: int = 8
+    # Ceiling for fetch_document per run. Same order as web_fetch on a deep
+    # run (10): one call per datasheet/brochure, plus a second source each.
+    # No per-call fee (conversion runs on the bridge's own privacy service).
+    fetch_document_max_uses: int = 10
     # Live-verified 2026-07-27: our org's API only accepts 'global'|'us' for
     # inference_geo — the spec's "eu" intent 400s on every request. Default to
     # None (omit the param); the env override RESEARCH_CLOUD_INFERENCE_GEO
