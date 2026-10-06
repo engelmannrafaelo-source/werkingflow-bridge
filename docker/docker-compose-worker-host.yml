@@ -111,6 +111,9 @@ x-worker-env-common: &worker-env-common
   # change needed here at cutover.
   PRIVACY_SERVICE_URL: ${PRIVACY_SERVICE_URL:-http://100.65.149.39:8100}
   BRIDGE_ANONYMIZE_ENABLED: "true"
+  # Pseudonymisierungs-Paket 06.10.2026 — gleich wie docker-compose-prod.yml
+  BRIDGE_PSEUDONYM_POSTPROCESS: "true"
+  BRIDGE_PDF_ACTUALTEXT_REPAIR: "true"
 
 x-worker-common: &worker-common
   build:

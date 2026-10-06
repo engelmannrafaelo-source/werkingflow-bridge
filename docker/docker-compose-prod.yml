@@ -225,6 +225,10 @@ services:
       # PRIVACY_SERVICE_URL=http://100.112.98.39:8100 and redeploy.
       - PRIVACY_SERVICE_URL=${PRIVACY_SERVICE_URL:-http://100.65.149.39:8100}
       - BRIDGE_ANONYMIZE_ENABLED=true
+      # Pseudonymisierungs-Paket 06.10.2026 (src/privacy_postprocess) + Vorzeichen-Reparatur vor Docling.
+      # Rollout nur mit Rafaels Freigabe; Rollback: beide Zeilen entfernen und neu deployen.
+      - BRIDGE_PSEUDONYM_POSTPROCESS=true
+      - BRIDGE_PDF_ACTUALTEXT_REPAIR=true
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
       interval: 30s
@@ -382,6 +386,10 @@ services:
       # PRIVACY_SERVICE_URL=http://100.112.98.39:8100 and redeploy.
       - PRIVACY_SERVICE_URL=${PRIVACY_SERVICE_URL:-http://100.65.149.39:8100}
       - BRIDGE_ANONYMIZE_ENABLED=true
+      # Pseudonymisierungs-Paket 06.10.2026 (src/privacy_postprocess) + Vorzeichen-Reparatur vor Docling.
+      # Rollout nur mit Rafaels Freigabe; Rollback: beide Zeilen entfernen und neu deployen.
+      - BRIDGE_PSEUDONYM_POSTPROCESS=true
+      - BRIDGE_PDF_ACTUALTEXT_REPAIR=true
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
       interval: 30s
@@ -540,6 +548,10 @@ services:
       # PRIVACY_SERVICE_URL=http://100.112.98.39:8100 and redeploy.
       - PRIVACY_SERVICE_URL=${PRIVACY_SERVICE_URL:-http://100.65.149.39:8100}
       - BRIDGE_ANONYMIZE_ENABLED=true
+      # Pseudonymisierungs-Paket 06.10.2026 (src/privacy_postprocess) + Vorzeichen-Reparatur vor Docling.
+      # Rollout nur mit Rafaels Freigabe; Rollback: beide Zeilen entfernen und neu deployen.
+      - BRIDGE_PSEUDONYM_POSTPROCESS=true
+      - BRIDGE_PDF_ACTUALTEXT_REPAIR=true
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
       interval: 30s
@@ -698,6 +710,10 @@ services:
       # PRIVACY_SERVICE_URL=http://100.112.98.39:8100 and redeploy.
       - PRIVACY_SERVICE_URL=${PRIVACY_SERVICE_URL:-http://100.65.149.39:8100}
       - BRIDGE_ANONYMIZE_ENABLED=true
+      # Pseudonymisierungs-Paket 06.10.2026 (src/privacy_postprocess) + Vorzeichen-Reparatur vor Docling.
+      # Rollout nur mit Rafaels Freigabe; Rollback: beide Zeilen entfernen und neu deployen.
+      - BRIDGE_PSEUDONYM_POSTPROCESS=true
+      - BRIDGE_PDF_ACTUALTEXT_REPAIR=true
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
       interval: 30s
