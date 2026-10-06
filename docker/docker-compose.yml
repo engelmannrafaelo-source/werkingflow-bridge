@@ -93,6 +93,8 @@ services:
       - FILTER_SENSITIVE_DATA=true
       - BRIDGE_SECRETS_DIR=/app/secrets
       - BRIDGE_ANONYMIZE_ENABLED=true
+      # Vorzeichen-Befund 06.10.2026: ActualText-Glyphen vor Docling reparieren (nur dev)
+      - BRIDGE_PDF_ACTUALTEXT_REPAIR=true
       - INSTANCE_NAME=worker1
       # claude.ai account whose OAuth token this worker uses. Per-host
       # topology (like INSTANCE_NAME), therefore config — NOT a map in
@@ -285,6 +287,8 @@ services:
       - FILTER_SENSITIVE_DATA=true
       - BRIDGE_SECRETS_DIR=/app/secrets
       - BRIDGE_ANONYMIZE_ENABLED=true
+      # Vorzeichen-Befund 06.10.2026: ActualText-Glyphen vor Docling reparieren (nur dev)
+      - BRIDGE_PDF_ACTUALTEXT_REPAIR=true
       - INSTANCE_NAME=worker2
       # claude.ai account whose OAuth token this worker uses. Per-host
       # topology (like INSTANCE_NAME), therefore config — NOT a map in
@@ -477,6 +481,8 @@ services:
       - FILTER_SENSITIVE_DATA=true
       - BRIDGE_SECRETS_DIR=/app/secrets
       - BRIDGE_ANONYMIZE_ENABLED=true
+      # Vorzeichen-Befund 06.10.2026: ActualText-Glyphen vor Docling reparieren (nur dev)
+      - BRIDGE_PDF_ACTUALTEXT_REPAIR=true
       - INSTANCE_NAME=worker3
       # claude.ai account whose OAuth token this worker uses. Per-host
       # topology (like INSTANCE_NAME), therefore config — NOT a map in
@@ -669,6 +675,8 @@ services:
       - FILTER_SENSITIVE_DATA=true
       - BRIDGE_SECRETS_DIR=/app/secrets
       - BRIDGE_ANONYMIZE_ENABLED=true
+      # Vorzeichen-Befund 06.10.2026: ActualText-Glyphen vor Docling reparieren (nur dev)
+      - BRIDGE_PDF_ACTUALTEXT_REPAIR=true
       - INSTANCE_NAME=worker4
       # claude.ai account whose OAuth token this worker uses. Per-host
       # topology (like INSTANCE_NAME), therefore config — NOT a map in
