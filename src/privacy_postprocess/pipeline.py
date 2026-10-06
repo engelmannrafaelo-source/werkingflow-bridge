@@ -13,7 +13,10 @@ Ablauf je Aufruf (deterministisch, kein Modell, kein Netz):
   4. Regel-Erkenner fuer Kennungen + Geburtsdatum (recognizers.py)
   5. Bekannte Entitaeten des Akts nachziehen (optional ``known_entities``)
   6. Ueberlappungen aufloesen, gleiche Werte im Dokument nachziehen
-  7. Ein Platzhalter je Wert; Schreibvarianten (nur Nachname, Firmenkern) auf die Vollform
+  7. Ein Platzhalter je Wert; Schreibvarianten (nur Nachname, Firmenkern) auf die Vollform.
+     Steht die Vollform an der Fundstelle woertlich, wird die Fundstelle auf sie erweitert;
+     steht nur ein Teil davon daneben (Rueckweg wuerde ihn verdoppeln) oder ist die
+     Fundstelle eine Produktnennung, wird an dieser Stelle nicht gefaltet.
   8. Text + Mapping neu ausgeben, Invarianten pruefen (fail loud)
 """
 
@@ -31,7 +34,7 @@ from .spans import PRIO_BEKANNT, PRIO_DETEKTOR, Span, ausgeben, spans_aus_antwor
 
 logger = logging.getLogger(__name__)
 
-VERSION = "2026-10-06.1"
+VERSION = "2026-10-06.2"
 
 # Hartes PII: der Originalwert darf nie im Ausgabetext stehen bleiben (Lecktest).
 HARTE_TYPEN = frozenset({
@@ -257,10 +260,11 @@ def _varianten_falten(werte: Dict[str, str], bekannt_werte: Dict[str, str]) -> D
     return falten
 
 
-def _platzhalter_vergeben(
-    text: str, spans: List[Span], prefix: str, bekannt: Dict[str, str]
-) -> Tuple[List[Span], Dict[str, str], Dict[str, int]]:
-    # Wert -> Typ (Mehrheit, bei Gleichstand PERSON > ORG > LOC > Rest)
+def _typen_und_falten(
+    text: str, spans: List[Span], bekannt: Dict[str, str]
+) -> Tuple[Dict[str, str], Dict[str, str], Dict[str, str], Dict[str, str]]:
+    """Wert -> Typ (Mehrheit, bei Gleichstand PERSON > ORG > LOC > Rest), bekannte Werte und
+    die Faltungstabelle Schreibvariante -> Vollform."""
     typen: Dict[str, Counter] = defaultdict(Counter)
     for s in spans:
         if s.platzhalter is None:
@@ -275,7 +279,87 @@ def _platzhalter_vergeben(
         if isinstance(w, str):
             bekannt_werte.setdefault(w, _bekannt_typ(ph))
             ph_je_bekanntem_wert.setdefault(w, ph)
-    falten = _varianten_falten(typ_je_wert, bekannt_werte)
+    return typ_je_wert, bekannt_werte, ph_je_bekanntem_wert, _varianten_falten(typ_je_wert, bekannt_werte)
+
+
+def _angeklebt(text: str, s: Span) -> bool:
+    """Fundstelle mitten in einem Wort/Dateinamen ("Podhagskygasse 57_Angebot.pdf")."""
+    return (s.start > 0 and (text[s.start - 1].isalnum() or text[s.start - 1] == "_")) or (
+        s.end < len(text) and (text[s.end].isalnum() or text[s.end] == "_"))
+
+
+def _vollform_einschliessen(text: str, spans: List[Span], bekannt: Dict[str, str]) -> List[Span]:
+    """Steht die Vollform einer Schreibvariante an der Fundstelle woertlich im Text
+    ("Technisches Büro Grabmayr-Esterl GmbH", erkannt nur "Grabmayr-Esterl GmbH"), wird die
+    Fundstelle auf die Vollform erweitert. Dann ist der Platzhalterwert genau der Text der
+    Stelle: einheitlich UND schreibtreu — statt "Technisches Büro <Vollform>" im Rueckweg."""
+    _, _, _, falten = _typen_und_falten(text, spans, bekannt)
+    out: List[Span] = []
+    for s in spans:
+        wert = s.kanon or s.wert(text)
+        voll = falten.get(wert)
+        if s.platzhalter is None and voll and not _angeklebt(text, s):
+            von = max(0, s.start - len(voll))
+            for m in _wortgrenzen_muster(voll).finditer(text, von, min(len(text), s.end + len(voll))):
+                if m.start() <= s.start and m.end() >= s.end:
+                    s = Span(m.start(), m.end(), s.type, s.quelle, s.prio, s.confidence,
+                             meta={**s.meta, "erweitert": "vollform"})
+                    break
+        out.append(s)
+    return out
+
+
+def _nachbarn(text: str, s: Span, n: int = 3) -> Tuple[List[str], List[str]]:
+    """Bis zu n Woerter vor und nach der Fundstelle, nur innerhalb derselben Zeile."""
+    zeile_start = text.rfind("\n", 0, s.start) + 1
+    zeile_ende = text.find("\n", s.end)
+    if zeile_ende < 0:
+        zeile_ende = len(text)
+    return text[zeile_start:s.start].split()[-n:], text[s.end:zeile_ende].split()[:n]
+
+
+def _ohne_fundstellen(text: str, spans: List[Span]) -> str:
+    """Text mit allen Fundstellen durch Leerzeichen ersetzt (Laenge bleibt). Was neben einer
+    Fundstelle in einer ANDEREN Fundstelle steht, wird ohnehin ersetzt — nur Klartext daneben
+    kann im Rueckweg doppelt erscheinen ("VELMARO und Velmaro Fenstersysteme GmbH" ist kein Fall)."""
+    zeichen = list(text)
+    for s in spans:
+        for i in range(s.start, s.end):
+            if zeichen[i] != "\n":
+                zeichen[i] = " "
+    return "".join(zeichen)
+
+
+def _wortmenge(woerter: List[str]) -> set:
+    return {w.casefold().strip(".,;:!?()[]|\"'„“/") for w in woerter} - {""}
+
+
+def faltung_gesperrt(text: str, s: Span, wert: str, voll: str, typ: str) -> Optional[str]:
+    """Grund, an dieser Fundstelle NICHT auf die Vollform zu falten, sonst None.
+
+    ueberlappt:      ein Teil der Vollform, der der Fundstelle fehlt, steht direkt daneben
+                     ("Podhagskygasse 57 in 1220 Wien" -> Vollform "…, 1220 Wien"): der
+                     Rueckweg setzte ihn ein zweites Mal ein.
+    produktnennung:  Firmenname ohne Rechtsform direkt vor einer Typ-/Modellbezeichnung
+                     ("Thermo-Tec Black-WW"): das ist ein Produkt, nicht die Firma.
+    """
+    vor, nach = _nachbarn(text, s)  # ``text``: andere Fundstellen ausgeblendet (siehe _ohne_fundstellen)
+    fehlt = _wortmenge(_tokens(voll)) - _wortmenge(_tokens(wert))
+    if fehlt & _wortmenge(vor + nach):
+        return "ueberlappt"
+    if typ == "ORGANIZATION" and nach and s.end < len(text) and text[s.end] == " ":
+        ohne_rechtsform = all(t.casefold() not in _RECHTSFORM for t in _tokens(wert))
+        folgewort = nach[0]
+        if ohne_rechtsform and (folgewort[0].isupper() or folgewort[0].isdigit()) and folgewort.casefold() not in _RECHTSFORM:
+            return "produktnennung"
+    return None
+
+
+def _platzhalter_vergeben(
+    text: str, spans: List[Span], prefix: str, bekannt: Dict[str, str]
+) -> Tuple[List[Span], Dict[str, str], Dict[str, int]]:
+    typ_je_wert, bekannt_werte, ph_je_bekanntem_wert, falten = _typen_und_falten(text, spans, bekannt)
+    klartext = _ohne_fundstellen(text, spans)
 
     belegt_nr: Dict[str, int] = defaultdict(int)
     for ph in bekannt:
@@ -294,11 +378,14 @@ def _platzhalter_vergeben(
         wert = s.kanon or s.wert(text)
         # Fundstelle mitten in einem Wort/Dateinamen ("Podhagskygasse 57_Angebot.pdf"): nie
         # auf eine Vollform falten, sonst aendert der Rueckweg den Dateinamen.
-        angeklebt = (s.start > 0 and (text[s.start - 1].isalnum() or text[s.start - 1] == "_")) or (
-            s.end < len(text) and (text[s.end].isalnum() or text[s.end] == "_"))
-        voll = wert if angeklebt else falten.get(wert, wert)
+        voll = wert if _angeklebt(text, s) else falten.get(wert, wert)
         if voll != wert:
-            stat["varianten_gefaltet"] += 1
+            grund = faltung_gesperrt(klartext, s, wert, voll, typ_je_wert.get(wert) or s.type)
+            if grund:
+                stat[f"faltung_gesperrt_{grund}"] += 1
+                voll = wert
+            else:
+                stat["varianten_gefaltet"] += 1
         if voll in vergeben:
             ph = vergeben[voll]
         elif voll in ph_je_bekanntem_wert:
@@ -380,6 +467,7 @@ def postprocess_smart_anonymize(
     bekannte = _bekannte_nachziehen(original, bekannt)
     spans = _aufloesen(behalten + regel + bekannte, original)
     spans = _aufloesen(_gleiche_werte_nachziehen(original, spans), original)
+    spans = _aufloesen(_vollform_einschliessen(original, spans, bekannt), original)
     spans, mapping, stat = _platzhalter_vergeben(original, spans, prefix, bekannt)
     text_aus = ausgeben(original, spans)
     _invarianten(text_aus, mapping, spans, original)

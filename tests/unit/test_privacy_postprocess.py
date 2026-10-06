@@ -440,6 +440,39 @@ class TestVereinheitlichung:
         for frei in ("WP1", "COP 4,1", "VDI 4650", "geb.", "SV-Nr.", "FN "):
             assert frei in t
 
+    # Rueckweg-Verdopplung (CHECK-PFAD-DIAGNOSE.md Abschnitt 6, 06.10.2026)
+    def test_vollform_steht_daneben_fundstelle_wird_erweitert(self):
+        # Weidenhof: erkannt nur "Grabmayr-Esterl GmbH", davor steht "Technisches Büro"
+        text = ("## Technisches Büro Grabmayr-Esterl GmbH\n\nDI Rupert Esterl, Technisches Büro Grabmayr-Esterl GmbH\n"
+                "| Auftraggeber | Technisches Büro Grabmayr-Esterl GmbH |")
+        r = lauf(text, [("Technisches Büro Grabmayr-Esterl GmbH", "ORGANIZATION"), ("Grabmayr-Esterl GmbH", "ORGANIZATION"),
+                        ("Rupert Esterl", "PERSON")])
+        assert rueck(r) == text
+        assert "Technisches Büro SN_" not in r["smart_anonymized_text"]
+        assert [w for w in r["mapping"].values() if "Grabmayr" in w] == ["Technisches Büro Grabmayr-Esterl GmbH"]
+
+    def test_teil_der_vollform_daneben_wird_nicht_verdoppelt(self):
+        # Muehl: "Podhagskygasse 57 in 1220 Wien" neben der Vollform "Podhagskygasse 57, 1220 Wien"
+        text = "Objekt Podhagskygasse 57, 1220 Wien.\nDie Wohnhausanlage Podhagskygasse 57 in 1220 Wien hat 233 Wohnungen."
+        r = lauf(text, [("Podhagskygasse", "LOCATION")])
+        assert rueck(r) == text
+        assert "Podhagskygasse" not in r["smart_anonymized_text"]
+        assert r["postprocessing"].get("faltung_gesperrt_ueberlappt", 0) >= 1
+
+    def test_produktnennung_wird_nicht_zur_firma(self):
+        # Muehl: "Thermo-Tec Black-WW" ist ein Produkt, nicht "THERMO-TEC Klimageräte GmbH"
+        text = ("Hersteller THERMO-TEC Klimageräte GmbH.\nHerstellerangaben (Viessmann Vitotrans 353, Thermo-Tec Black-WW, Grundfos)")
+        r = lauf(text, [("THERMO-TEC Klimageräte GmbH", "ORGANIZATION"), ("Thermo-Tec", "ORGANIZATION")])
+        assert rueck(r) == text
+        assert r["postprocessing"].get("faltung_gesperrt_produktnennung", 0) == 1
+
+    def test_faltung_ohne_ueberlappung_bleibt(self):
+        # Konsistenz fuers Pruefmodell bleibt: "Herr Esterl" -> derselbe Platzhalter wie "Rupert Esterl"
+        text = "DI Rupert Esterl prüft.\nSehr geehrter Herr Esterl,"
+        r = lauf(text, [("Rupert Esterl", "PERSON"), ("Esterl", "PERSON")])
+        assert r["mapping"] == {"SN_PERSON_001": "Rupert Esterl"}
+        assert r["smart_anonymized_text"].count("SN_PERSON_001") == 2
+
     def test_deterministisch(self):
         text = "Herr Klaus Reiter, Almweg 17, 8045 Graz, geb. 01.02.1960"
         a = lauf(text, [("Klaus Reiter", "PERSON"), ("Almweg", "LOCATION")])
