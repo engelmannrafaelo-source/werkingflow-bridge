@@ -664,6 +664,15 @@ class SmartAnonymizeRequest(BaseModel):
         default=None,
         description="Document-scoped prefix for placeholders (e.g. 'Da1b2c3'). Default: 'ANON'"
     )
+    known_entities: Optional[Dict[str, str]] = Field(
+        default=None,
+        description=(
+            "Optional: Platzhalter -> Original aus frueheren Dokumenten desselben Akts. "
+            "Gleiche Werte (und eindeutige Schreibvarianten) bekommen denselben Platzhalter "
+            "und werden auch dort maskiert, wo der Detektor sie in diesem Dokument nicht fand. "
+            "Wirkt nur mit BRIDGE_PSEUDONYM_POSTPROCESS=true."
+        ),
+    )
 
 
 class SmartAnonymizeResponse(BaseModel):
@@ -716,6 +725,10 @@ class SmartAnonymizeResponse(BaseModel):
     detected_entities: Optional[List[Dict[str, Any]]] = Field(
         default=None,
         description="All detected entities with AI decisions"
+    )
+    postprocessing: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description="Wertfreie Statistik der Worker-Nachbearbeitung (src/privacy_postprocess), sonst leer"
     )
 
     # Meta

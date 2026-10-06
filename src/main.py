@@ -7431,6 +7431,7 @@ async def _smart_anonymize_core(
     language: str = "de",
     context_hint: Optional[str] = None,
     prefix: Optional[str] = None,
+    known_entities: Optional[Dict[str, str]] = None,
 ) -> SmartAnonymizeResponse:
     """Core smart-pseudonymization logic: proxy to privacy-pdf-service, persist
     activity + a value-free DSGVO attestation, feed prompt-metrics. Shared by
@@ -7476,7 +7477,25 @@ async def _smart_anonymize_core(
             # 21min) must stay ABOVE this value so the privacy service's own error
             # surfaces before the app cuts the call. nginx allows 2500s.
         response.raise_for_status()
-        result = SmartAnonymizeResponse(**response.json())
+        _payload = response.json()
+        # Nachbearbeitung im Worker (src/privacy_postprocess): Plausibilitaetsfilter,
+        # Fach-Freiliste, Kennungs-/Geburtsdatums-Erkenner, Adressbereich, ein Platzhalter
+        # je Wert. Laeuft HIER und nicht im Privacy-Dienst, weil der Dienst von Dev- und
+        # Prod-Bridge geteilt wird; geschaltet je Bridge ueber BRIDGE_PSEUDONYM_POSTPROCESS.
+        # Ein Fehler darin ist ein Fehler des Aufrufs (fail loud) — nie die ungefilterte
+        # Antwort als gefiltert ausgeben.
+        from src import privacy_postprocess as _pp
+        if _pp.ist_aktiv():
+            _payload = _pp.postprocess_smart_anonymize(
+                text, _payload, prefix=prefix, known_entities=known_entities,
+            )
+        elif known_entities:
+            logger.warning(
+                "smart-anonymize: known_entities uebergeben, aber BRIDGE_PSEUDONYM_POSTPROCESS ist aus — "
+                "Akt-Vereinheitlichung entfaellt fuer diesen Aufruf"
+            )
+            _payload = {**_payload, "postprocessing": {"active": False, "known_entities_ignored": len(known_entities)}}
+        result = SmartAnonymizeResponse(**_payload)
         _duration_ms = int((time.time() - _start) * 1000)
         try:
             _attr = extract_attribution_context(request)
@@ -7628,6 +7647,7 @@ async def smart_anonymize_endpoint(
         language=request_body.language or "de",
         context_hint=request_body.context_hint,
         prefix=request_body.prefix,
+        known_entities=request_body.known_entities,
     )
 
 
