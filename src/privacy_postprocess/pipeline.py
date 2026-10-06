@@ -188,6 +188,19 @@ def _gleiche_werte_nachziehen(text: str, spans: List[Span]) -> List[Span]:
     return spans + neu
 
 
+_ADRESS_KOPF = re.compile(r"^\s*(.+?)[ \t]+(\d{1,4}[a-zA-Z]?)(?![\d.,]\d)")
+
+
+def adress_schluessel(wert: str) -> Optional[Tuple[str, str]]:
+    """Strasse + erste Hausnummer, schreibweisen-unabhaengig ("Sonnenhofstraße 12-16" ==
+    "SONNENHOFSTRASSE 12–16"). None, wenn der Wert keine Adresse mit Hausnummer ist."""
+    m = _ADRESS_KOPF.match(wert)
+    if not m or not re.search(r"[^\W\d_]", m.group(1)):
+        return None
+    strasse = " ".join(m.group(1).casefold().replace("str.", "straße".casefold()).split())
+    return strasse, m.group(2).casefold()
+
+
 def _varianten_falten(werte: Dict[str, str], bekannt_werte: Dict[str, str]) -> Dict[str, str]:
     """Wert -> Vollform fuer eindeutige Schreibvarianten (Typ je Wert in ``werte``).
 
@@ -200,7 +213,25 @@ def _varianten_falten(werte: Dict[str, str], bekannt_werte: Dict[str, str]) -> D
     falten: Dict[str, str] = {}
     personen = [w for w, t in alle.items() if t == "PERSON" and len(_personen_kern(w)) >= 2]
     firmen = [w for w, t in alle.items() if t == "ORGANIZATION" and _firmen_kern(w)]
+    # LOCATION: dieselbe Adresse (Strasse + Hausnummer) in mehreren Schreibweisen ->
+    # die ausfuehrlichste Fassung (nie auf eine kuerzere falten: Tuer/PLZ gingen verloren).
+    adressen: Dict[Tuple[str, str], List[str]] = defaultdict(list)
+    for w, t in alle.items():
+        k = adress_schluessel(w) if t == "LOCATION" else None
+        if k:
+            adressen[k].append(w)
     for w, t in werte.items():
+        if t == "LOCATION":
+            k = adress_schluessel(w)
+            if k and len(adressen[k]) > 1:
+                # ausfuehrlichste Fassung; bei gleichem Umfang die nicht durchgehend grosse
+                # (Briefkopf/Ueberschrift "SONNENHOFSTRASSE ... WIEN" ist nicht die Normalform)
+                def umfang(x: str) -> int:
+                    return len(" ".join(x.casefold().split()))
+                voll = max(adressen[k], key=lambda x: (umfang(x), not x.isupper(), x))
+                if voll != w and umfang(voll) >= umfang(w):
+                    falten[w] = voll
+            continue
         if t == "PERSON":
             kern = _personen_kern(w)
             if len(kern) != 1 or len(kern[0]) < 3:
@@ -261,7 +292,11 @@ def _platzhalter_vergeben(
             mapping[s.platzhalter] = s.kanon if s.kanon is not None else s.wert(text)
             continue
         wert = s.kanon or s.wert(text)
-        voll = falten.get(wert, wert)
+        # Fundstelle mitten in einem Wort/Dateinamen ("Podhagskygasse 57_Angebot.pdf"): nie
+        # auf eine Vollform falten, sonst aendert der Rueckweg den Dateinamen.
+        angeklebt = (s.start > 0 and (text[s.start - 1].isalnum() or text[s.start - 1] == "_")) or (
+            s.end < len(text) and (text[s.end].isalnum() or text[s.end] == "_"))
+        voll = wert if angeklebt else falten.get(wert, wert)
         if voll != wert:
             stat["varianten_gefaltet"] += 1
         if voll in vergeben:

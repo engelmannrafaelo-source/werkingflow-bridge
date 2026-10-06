@@ -383,6 +383,23 @@ class TestVereinheitlichung:
         assert werte == ["Hochbau Steiner GmbH", "Velmaro Fenstersysteme GmbH"]
         assert r["smart_anonymized_text"].startswith("AN SN_ORGANIZATION_001.")
 
+    def test_dieselbe_adresse_in_mehreren_schreibweisen_ein_platzhalter(self):
+        text = ("Wohnung Almweg 17, Stiege 2, Top 11, 8045 Graz. Mietobjekt: Almweg 17/2/11, 8045 Graz. "
+                "Objekt Sonnenhofstraße 12-16, 1120 Wien und SONNENHOFSTRASSE 12–16. Anderes: Almweg 19, 8045 Graz")
+        r = lauf(text, [("Almweg", "LOCATION"), ("Sonnenhofstraße", "LOCATION"), ("SONNENHOFSTRASSE", "LOCATION")])
+        werte = sorted(r["mapping"].values())
+        assert werte == ["Almweg 17, Stiege 2, Top 11, 8045 Graz", "Almweg 19, 8045 Graz", "Sonnenhofstraße 12-16, 1120 Wien"]
+
+    def test_adresse_im_dateinamen_wird_nicht_gefaltet(self):
+        text = "Objekt Podhagskygasse 57, 1220 Wien. Datei Podhagskygasse 57_Angebot.pdf"
+        r = lauf(text, [("Podhagskygasse", "LOCATION")])
+        assert rueck(r) == text
+
+    def test_grossgeschriebene_adresse_ist_nicht_die_normalform(self):
+        text = "SONNENHOFSTRASSE 12-16, 1120 WIEN\nObjekt Sonnenhofstraße 12-16, 1120 Wien"
+        r = lauf(text, [("SONNENHOFSTRASSE", "LOCATION"), ("Sonnenhofstraße", "LOCATION")])
+        assert list(r["mapping"].values()) == ["Sonnenhofstraße 12-16, 1120 Wien"]
+
     def test_halbwidl_rechtsform_allein_zieht_namen_mit(self):
         # Audit L1: nur "ZT GmbH" erkannt, "Halbwidl" blieb Klartext
         text = "- Brandschutzkonzept BSK 17-042, Rev. C, Brandschutzplanung Halbwidl ZT GmbH"
