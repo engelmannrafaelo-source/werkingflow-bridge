@@ -316,7 +316,7 @@ class TestFreiliste:
         ("https://www.statistik.at/statistiken/energie", "URL"), ("wohnfonds.wien.at", "URL"),
         ("Stiegenhaus", "LOCATION"), ("KENNGRÖSSE", "ORGANIZATION"), ("ZEITRAUM", "ORGANIZATION"),
         ("BEH008", "ORGANIZATION"), ("TU Braunschweig", "ORGANIZATION"), ("PVGIS Wien", "LOCATION"),
-        ("oa-montero-2022-w4285014502", "ORGANIZATION"),
+        ("oa-montero-2022-w4285014502", "ORGANIZATION"), ("SONDENFELD", "LOCATION"), ("SONDENFELD 2", "LOCATION"),
     ])
     def test_frei(self, wert, typ):
         assert lade_freiliste().ist_frei(wert, typ), (wert, typ)
@@ -325,7 +325,7 @@ class TestFreiliste:
         ("Hochbau Steiner GmbH", "ORGANIZATION"), ("Kamstrup", "ORGANIZATION"), ("Graz", "LOCATION"),
         ("Andreas Muster", "PERSON"), ("Velmaro Fenstersysteme GmbH", "ORGANIZATION"),
         ("https://www.ib-muster.at/team", "URL"), ("WP Huber", "PERSON"), ("COP", "EMAIL_ADDRESS"),
-        ("Musterbau GmbH", "ORGANIZATION"), ("Podhagskygasse", "LOCATION"),
+        ("Musterbau GmbH", "ORGANIZATION"), ("Podhagskygasse", "LOCATION"), ("Cop", "PERSON"),
     ])
     def test_nicht_frei(self, wert, typ):
         assert not lade_freiliste().ist_frei(wert, typ), (wert, typ)

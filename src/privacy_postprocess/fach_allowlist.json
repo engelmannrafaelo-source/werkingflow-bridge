@@ -159,7 +159,9 @@
   "Steiermark",
   "Kärnten",
   "NÖ",
-  "OÖ"
+  "OÖ",
+  "DHW",
+  "WKO"
  ],
  "phrasen": [
   "Austrian Standards",
@@ -226,7 +228,9 @@
   "Landesenergieverein Steiermark",
   "LEV",
   "Austrian Institute of Technology",
-  "AIT"
+  "AIT",
+  "Wirtschaftskammer",
+  "Wirtschaftskammer Österreich"
  ],
  "muster": [
   "(?:WP|SH|WT|PU|P|V|T|TF|TV|TR|FB|HK|LK|KK|WMZ|MP|BWP|LWP|SWP|WWP|EWS|AHU|LA|ZL|AL|FL|ABL|ZUL)\\d{1,3}[a-z]?",

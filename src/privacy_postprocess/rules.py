@@ -114,6 +114,7 @@ def in_url(text: str, span: Span) -> bool:
 @dataclass(frozen=True)
 class Freiliste:
     woerter: FrozenSet[str]
+    woerter_gross: FrozenSet[str]  # Grossschreibung der Woerter (Tabellenkopf „SONDENFELD")
     phrasen: FrozenSet[str]  # casefold
     muster: Tuple[Pattern[str], ...]
     url_domains: Tuple[str, ...]
@@ -125,7 +126,7 @@ class Freiliste:
         w = " ".join(wert.split())
         if typ == "URL":
             return "freiliste-url" if self._url_frei(w) else None
-        if w.casefold() in self.phrasen or w in self.woerter:
+        if w.casefold() in self.phrasen or self._wort_frei(w):
             return "freiliste-begriff"
         if any(m.fullmatch(w) for m in self.muster):
             return "freiliste-muster"
@@ -135,8 +136,12 @@ class Freiliste:
             return "freiliste-bestandteile"
         return None
 
+    def _wort_frei(self, t: str) -> bool:
+        # Exakt, oder als reine Grossschreibung eines gelisteten Worts (Ueberschrift).
+        return t in self.woerter or (t.isupper() and t in self.woerter_gross)
+
     def _teil_frei(self, t: str) -> bool:
-        if t in self.woerter or t.casefold() in self.phrasen:
+        if self._wort_frei(t) or t.casefold() in self.phrasen:
             return True
         if not re.search(r"[^\W\d_]", t):  # Zahl, Strich, Satzzeichen
             return True
@@ -163,6 +168,7 @@ def lade_freiliste(pfad: Optional[str] = None) -> Freiliste:
             raise ValueError(f"Freiliste {p}: Schluessel {schluessel!r} fehlt oder ist keine Liste")
     return Freiliste(
         woerter=frozenset(daten["woerter"]),
+        woerter_gross=frozenset(w.upper() for w in daten["woerter"]),
         phrasen=frozenset(x.casefold() for x in daten["phrasen"]),
         muster=tuple(re.compile(m) for m in daten["muster"]),
         url_domains=tuple(d.lower() for d in daten["url_domains"]),
