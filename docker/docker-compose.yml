@@ -96,6 +96,8 @@ services:
       # Pseudonymisierungs-Nachbearbeitung im Worker (src/privacy_postprocess) — nur Dev-Bridge.
       # Prod (docker-compose-prod.yml, worker-host) bleibt aus, bis Rafael den Rollout freigibt.
       - BRIDGE_PSEUDONYM_POSTPROCESS=true
+      # Vorzeichen-Befund 06.10.2026: ActualText-Glyphen vor Docling reparieren (nur dev)
+      - BRIDGE_PDF_ACTUALTEXT_REPAIR=true
       - INSTANCE_NAME=worker1
       # claude.ai account whose OAuth token this worker uses. Per-host
       # topology (like INSTANCE_NAME), therefore config — NOT a map in
@@ -291,6 +293,8 @@ services:
       # Pseudonymisierungs-Nachbearbeitung im Worker (src/privacy_postprocess) — nur Dev-Bridge.
       # Prod (docker-compose-prod.yml, worker-host) bleibt aus, bis Rafael den Rollout freigibt.
       - BRIDGE_PSEUDONYM_POSTPROCESS=true
+      # Vorzeichen-Befund 06.10.2026: ActualText-Glyphen vor Docling reparieren (nur dev)
+      - BRIDGE_PDF_ACTUALTEXT_REPAIR=true
       - INSTANCE_NAME=worker2
       # claude.ai account whose OAuth token this worker uses. Per-host
       # topology (like INSTANCE_NAME), therefore config — NOT a map in
@@ -486,6 +490,8 @@ services:
       # Pseudonymisierungs-Nachbearbeitung im Worker (src/privacy_postprocess) — nur Dev-Bridge.
       # Prod (docker-compose-prod.yml, worker-host) bleibt aus, bis Rafael den Rollout freigibt.
       - BRIDGE_PSEUDONYM_POSTPROCESS=true
+      # Vorzeichen-Befund 06.10.2026: ActualText-Glyphen vor Docling reparieren (nur dev)
+      - BRIDGE_PDF_ACTUALTEXT_REPAIR=true
       - INSTANCE_NAME=worker3
       # claude.ai account whose OAuth token this worker uses. Per-host
       # topology (like INSTANCE_NAME), therefore config — NOT a map in
@@ -681,6 +687,8 @@ services:
       # Pseudonymisierungs-Nachbearbeitung im Worker (src/privacy_postprocess) — nur Dev-Bridge.
       # Prod (docker-compose-prod.yml, worker-host) bleibt aus, bis Rafael den Rollout freigibt.
       - BRIDGE_PSEUDONYM_POSTPROCESS=true
+      # Vorzeichen-Befund 06.10.2026: ActualText-Glyphen vor Docling reparieren (nur dev)
+      - BRIDGE_PDF_ACTUALTEXT_REPAIR=true
       - INSTANCE_NAME=worker4
       # claude.ai account whose OAuth token this worker uses. Per-host
       # topology (like INSTANCE_NAME), therefore config — NOT a map in

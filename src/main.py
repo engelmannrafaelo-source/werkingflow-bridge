@@ -8131,6 +8131,60 @@ async def convert_pdf_to_html_direct_endpoint(
 # ============================================================================
 
 
+def _pdf_actualtext_repair_enabled() -> bool:
+    """Schalter BRIDGE_PDF_ACTUALTEXT_REPAIR (nur exakt "true" schaltet ein).
+
+    Zur Aufrufzeit gelesen, damit Tests und Compose-Aenderungen ohne Re-Import wirken.
+    """
+    return os.getenv("BRIDGE_PDF_ACTUALTEXT_REPAIR", "").strip().lower() == "true"
+
+
+def _looks_like_pdf(content: bytes, filename: str, content_type: str, mime_hint: str = "") -> bool:
+    if content[:5] == b"%PDF-" or content[:4] == b"%PDF":
+        return True
+    if "pdf" in (content_type or "").lower() or "pdf" in (mime_hint or "").lower():
+        return True
+    return (filename or "").lower().endswith(".pdf")
+
+
+async def _maybe_repair_pdf_actualtext(
+    content: bytes, filename: str, content_type: str, mime_hint: str = "",
+) -> bytes:
+    """ActualText-Glyphen reparieren, bevor ein PDF zu Docling geht.
+
+    Hintergrund (Vorzeichen-Befund 06.10.2026): Chromium-PDFs mit Inter als
+    Type3-Variable-Font tragen Minus/Halbgeviertstrich/Klammern nur im
+    /ActualText, im ToUnicode steht <0000>. Docling liest nur ToUnicode und
+    verliert die Zeichen ("-0,87" -> "0,87"). Port der werking-report-Reparatur:
+    src/privacy/pdf_actualtext_repair.py.
+
+    Nur mit BRIDGE_PDF_ACTUALTEXT_REPAIR=true und nur fuer PDFs. Die Reparatur
+    wirft nie; ein ``hint`` (nicht reparierbar / gescheitert) wird laut als
+    WARNING geloggt und das Original geht weiter. Nie den Dateinamen loggen
+    (er kann einen Personennamen enthalten).
+    """
+    if not _pdf_actualtext_repair_enabled():
+        return content
+    if not _looks_like_pdf(content, filename, content_type, mime_hint):
+        return content
+    from src.privacy.pdf_actualtext_repair import repair_actualtext_glyphs
+
+    _t0 = time.time()
+    result = await asyncio.to_thread(repair_actualtext_glyphs, content)
+    _ms = int((time.time() - _t0) * 1000)
+    if result.hint:
+        logger.warning(
+            f"PDF ActualText-Reparatur: {result.repaired_glyphs} Glyphen repariert, "
+            f"Hinweis: {result.hint} (bytes={len(content)}, {_ms} ms)"
+        )
+    elif result.repaired_glyphs > 0:
+        logger.info(
+            f"PDF ActualText-Reparatur: {result.repaired_glyphs} Glyphen repariert "
+            f"(bytes {len(content)} -> {len(result.pdf)}, {_ms} ms)"
+        )
+    return result.pdf
+
+
 async def _proxy_document_endpoint(
     request: Request, downstream_path: str, timeout: float,
     *, agent_id: str, model: str = "docling",
@@ -8168,6 +8222,10 @@ async def _proxy_document_endpoint(
                 continue
             if isinstance(value, str):
                 extra_data[key] = value
+
+        content = await _maybe_repair_pdf_actualtext(
+            content, filename, content_type, extra_data.get("mime_type_hint", ""),
+        )
 
         async with privacy_client.track_call() as _concurrent_before:
             response = await privacy_client.post(
