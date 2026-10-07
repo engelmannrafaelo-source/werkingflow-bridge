@@ -47,7 +47,9 @@ def resilient_parse_message(
     except MessageParseError as error:
         if "unknown message type" not in str(error).lower():
             raise
-        message_type = data.get("type", "unknown") if isinstance(data, dict) else "unknown"
+        message_type = (
+            data.get("type", "unknown") if isinstance(data, dict) else "unknown"
+        )
         if message_type == "rate_limit_event":
             LOG.info("Skipping informational SDK message type: rate_limit_event")
             return RateLimitEvent(data)
