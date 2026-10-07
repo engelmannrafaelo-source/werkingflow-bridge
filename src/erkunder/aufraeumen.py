@@ -5,6 +5,7 @@ import os
 import shutil
 import signal
 import stat
+import threading
 from pathlib import Path
 
 
@@ -81,6 +82,18 @@ async def reap_children() -> None:
     raise RuntimeError("Platz hat nach SIGKILL noch nicht erntbare Kinder")
 
 
+def require_proc_children(proc: Path = Path("/proc")) -> None:
+    """Check the calling task before the place can report readiness."""
+    children = proc / "self" / "task" / str(threading.get_native_id()) / "children"
+    try:
+        children.read_text()
+    except OSError as error:
+        raise RuntimeError(
+            f"Platz nicht bereit: {children} nicht lesbar; "
+            "Linux CONFIG_PROC_CHILDREN und zugaengliches procfs erforderlich"
+        ) from error
+
+
 def reap_adopted_children(watched_pid: int, proc: Path = Path("/proc")) -> None:
     """Drain PID 1's adoptees without consuming asyncio's child's status.
 
@@ -94,8 +107,15 @@ def reap_adopted_children(watched_pid: int, proc: Path = Path("/proc")) -> None:
     for task in (proc / "self" / "task").iterdir():
         try:
             children = (task / "children").read_text().split()
-        except FileNotFoundError:
-            continue  # A server thread exited during enumeration.
+        except FileNotFoundError as error:
+            try:
+                task.stat()
+            except FileNotFoundError:
+                continue  # A server thread exited during enumeration.
+            raise RuntimeError(
+                f"Platz-Ernte fehlgeschlagen: {task / 'children'} fehlt; "
+                "Linux CONFIG_PROC_CHILDREN erforderlich"
+            ) from error
         for child in children:
             pid = int(child)
             if pid == watched_pid:

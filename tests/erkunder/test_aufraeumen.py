@@ -77,3 +77,39 @@ def test_running_reap_fails_loud(monkeypatch, pid_one, tmp_path):
     monkeypatch.setattr(aufraeumen.os, "waitpid", Mock(side_effect=PermissionError()))
     with pytest.raises(PermissionError):
         aufraeumen.reap_adopted_children(41, tmp_path)
+
+
+@pytest.mark.parametrize("missing", [False, True])
+def test_startup_requires_readable_children(monkeypatch, tmp_path, missing):
+    monkeypatch.setattr(aufraeumen.threading, "get_native_id", lambda: 17)
+    task = tmp_path / "self/task/17"
+    task.mkdir(parents=True)
+    if missing:
+        with pytest.raises(
+            RuntimeError, match="Platz nicht bereit.*CONFIG_PROC_CHILDREN"
+        ):
+            aufraeumen.require_proc_children(tmp_path)
+    else:
+        (task / "children").write_text("")
+        aufraeumen.require_proc_children(tmp_path)
+
+
+def test_running_reap_missing_children_fails_loud(pid_one, tmp_path):
+    (tmp_path / "self/task/1").mkdir(parents=True)
+    with pytest.raises(RuntimeError, match="Platz-Ernte.*CONFIG_PROC_CHILDREN"):
+        aufraeumen.reap_adopted_children(41, tmp_path)
+
+
+def test_running_reap_tolerates_exited_thread(monkeypatch, pid_one, tmp_path):
+    tasks = tmp_path / "self/task"
+    tasks.mkdir(parents=True)
+    path_type = type(tmp_path)
+    original = path_type.iterdir
+    monkeypatch.setattr(
+        path_type, "iterdir",
+        lambda path: iter([tasks / "9"]) if path == tasks else original(path),
+    )
+    wait = Mock(side_effect=AssertionError("exited thread has no children"))
+    monkeypatch.setattr(aufraeumen.os, "waitpid", wait)
+    aufraeumen.reap_adopted_children(41, tmp_path)
+    wait.assert_not_called()

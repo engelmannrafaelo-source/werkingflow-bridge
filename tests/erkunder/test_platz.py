@@ -474,3 +474,19 @@ async def test_cancel_during_communication_await(run_space, monkeypatch, double_
         assert not service.cleanup_failed
         assert service.states[("bericht-123", "erkunder-1")]["zustand"] == "abbruch"
         assert not (folder / ".home").exists()
+
+
+async def test_missing_proc_children_prevents_readiness(monkeypatch):
+    original = Path.read_text
+
+    def read(path, *args, **kwargs):
+        if path.name == "children":
+            raise FileNotFoundError(str(path))
+        return original(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", read)
+    monkeypatch.setenv("ERKUNDER_INTERNAL_TOKEN", "synthetic-token")
+    app = create_app()
+    with pytest.raises(RuntimeError, match="Platz nicht bereit.*CONFIG_PROC_CHILDREN"):
+        async with app.router.lifespan_context(app):
+            pytest.fail("Platz meldet ohne proc children bereit")

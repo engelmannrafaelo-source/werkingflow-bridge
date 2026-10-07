@@ -25,6 +25,7 @@ from src.erkunder.aufraeumen import (
     clear_owned_tmp,
     reap_adopted_children,
     reap_children,
+    require_proc_children,
     stop_uid_processes,
 )
 from src.erkunder.dateien import read_bytes, read_text
@@ -327,6 +328,7 @@ def create_app(platz: Platz | None = None) -> FastAPI:
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         nonlocal internal_token
+        require_proc_children()
         protect_process()
         internal_token = os.environ.pop("ERKUNDER_INTERNAL_TOKEN", "")
         if not internal_token:
