@@ -845,3 +845,57 @@ async def test_reattach_deadline_releases_allocation_but_retains_report(tmp_path
         assert (await finish(resumed, body("bericht-456")))["zustand"] == "fertig"
     finally:
         await resumed.shutdown()
+
+
+async def test_startup_http_timeout_stays_alive_and_cleanup_recovers(
+    tmp_path, monkeypatch,
+):
+    root = tmp_path / "arbeit"
+    (root / "old-report").mkdir(parents=True)
+    (root / "another-report").mkdir()
+    available = False
+
+    async def place(request):
+        if not available:
+            await asyncio.sleep(10)
+        return httpx.Response(200)
+
+    service = Coordinator(
+        root, client=httpx.AsyncClient(transport=httpx.MockTransport(place)),
+        startup_wait_s=0.02,
+    )
+    monkeypatch.setenv("ERKUNDER_INTERNAL_TOKEN", "synthetic")
+    app = create_app(service)
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app), base_url="http://test",
+            headers={"X-Erkunder-Intern": "synthetic"},
+        ) as api:
+            assert (await api.get("/bereitschaft")).status_code == 503
+            response = await api.post(
+                "/start", json=body().model_dump(mode="json", by_alias=True)
+            )
+            assert response.status_code == 503
+            available = True
+            response = await api.post("/aufraeumen/old-report")
+            assert response.status_code == 200
+            assert (await api.get("/bereitschaft")).json() == {"bereit": True}
+            assert not (root / "old-report").exists()
+
+
+async def test_result_http_integrity_error_is_explicit(tmp_path, monkeypatch):
+    service, _, _ = await setup(tmp_path)
+    monkeypatch.setenv("ERKUNDER_INTERNAL_TOKEN", "synthetic")
+    try:
+        assert (await finish(service))["zustand"] == "fertig"
+        path = service.directory("bericht-123") / "harmonisierung/ergebnis.md"
+        path.write_text("changed")
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(create_app(service)), base_url="http://test",
+            headers={"X-Erkunder-Intern": "synthetic"},
+        ) as api:
+            response = await api.get("/ergebnis/bericht-123")
+            assert response.status_code == 409
+            assert "Integritaet" in response.json()["detail"]
+    finally:
+        await service.shutdown()

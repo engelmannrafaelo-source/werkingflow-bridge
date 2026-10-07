@@ -73,6 +73,8 @@ async def main():
                         "bis": "2026-02-01",
                         "heute": "2026-10-07",
                     },
+                    "vorwissen_md": "synthetic",
+                    "vertiefung_md": None,
                     "dateien": [],
                     "korrekturkreis": 1,
                 },
