@@ -60,6 +60,8 @@ class Coordinator:
         chown: Callable[[Path, int, int], Any] = os.chown,
         poll_s: float = 2,
         retention_hours: float = 6,
+        startup_wait_s: float = 120,
+        reattach_wait_s: float = 300,
     ):
         self.root = root
         self.client = client or httpx.AsyncClient(timeout=60, follow_redirects=False)
@@ -67,11 +69,15 @@ class Coordinator:
         self.chown = chown
         self.poll_s = poll_s
         self.retention = retention_hours * 3600
+        self.startup_wait_s = startup_wait_s
+        self.reattach_wait_s = reattach_wait_s
+        self.ready = False
         self.states: dict[str, dict[str, Any]] = {}
         self.tokens: dict[str, str] = {}
         self.token_ready: dict[str, asyncio.Event] = {}
         self.tasks: dict[str, asyncio.Task[None]] = {}
         self.lock = asyncio.Lock()
+        self.startup_lock = asyncio.Lock()
         self.housekeeper: asyncio.Task[None] | None = None
 
     def directory(self, ident: str) -> Path:
@@ -127,6 +133,11 @@ class Coordinator:
                 ) from error
 
     async def startup(self) -> None:
+        async with self.startup_lock:
+            if not self.ready:
+                await self.initialize()
+
+    async def initialize(self) -> None:
         # This lifecycle runs only in the standalone Leitstand, never in a worker.
         # HTTPX INFO and HTTPCore DEBUG expose signed download URLs.
         logging.getLogger("httpx").setLevel(logging.WARNING)
@@ -134,9 +145,27 @@ class Coordinator:
         self.root.mkdir(parents=True, exist_ok=True, mode=0o711)
         self.root.chmod(0o711)
         # Seal first, even orphan directories and legacy six-hour retention.
-        # A failed seal/abort fails startup; no new report can be accepted.
+        # Compose starts places after this container. Wait without granting work.
+        # On expiry stay alive but unavailable, rather than entering a restart loop.
+        self.ready = False
         if self.seal_reports():
-            await self.stop_places()
+            deadline = time.monotonic() + self.startup_wait_s
+            while True:
+                try:
+                    async with asyncio.timeout(max(0.001, deadline - time.monotonic())):
+                        await self.stop_places()
+                    break
+                except (HTTPException, TimeoutError):
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        LOG.error(
+                            "Leitstand gesperrt: Plaetze nach %.1fs nicht bereit; "
+                            "POST /aufraeumen/<id> zum Bereinigen und Wiederholen",
+                            self.startup_wait_s,
+                        )
+                        return
+                    LOG.warning("Leitstand wartet auf Plaetze; Vergabe gesperrt")
+                    await asyncio.sleep(min(2, remaining))
         for path in self.root.iterdir():
             if not ID.fullmatch(path.name):
                 continue
@@ -156,6 +185,7 @@ class Coordinator:
                 self.save(ident)
                 self.tasks[ident] = asyncio.create_task(self.run(ident))
         self.housekeeper = asyncio.create_task(self.housekeeping())
+        self.ready = True
 
     async def shutdown(self) -> None:
         tasks = list(self.tasks.values())
@@ -211,6 +241,8 @@ class Coordinator:
     async def start(self, body: Start) -> dict[str, bool]:
         ident = body.auftrag.bericht_id
         async with self.lock:
+            if not self.ready:
+                raise HTTPException(503, "Leitstand wartet auf bereinigte Plaetze")
             if ident in self.states:
                 self.tokens[ident] = body.claude_token
                 self.states[ident]["worker"] = body.worker
@@ -292,7 +324,18 @@ class Coordinator:
     def output(self, ident: str, name: str) -> str:
         filename = "pruefung.md" if name.startswith("pruefung") else "ergebnis.md"
         try:
-            return read_text(self.directory(ident) / name / filename)
+            text = read_text(self.directory(ident) / name / filename)
+            records = [
+                item for item in self.states[ident]["schritte"]
+                if item["name"] == name and item["status"] == "ok"
+            ]
+            if records and records[-1].get("sha256") != hashlib.sha256(
+                text.encode("utf-8")
+            ).hexdigest():
+                raise StepFailed(
+                    name, "Ergebnis-Integritaet: Text veraendert oder Hash fehlt"
+                )
+            return text
         except (OSError, ValueError) as error:
             raise StepFailed(name, "cli_fehler: ergebnis-pfad oder groesse") from error
 
@@ -398,8 +441,10 @@ class Coordinator:
             }
             if record["status"] == "ok":
                 try:
-                    if not self.output(ident, name).strip():
+                    text = self.output(ident, name)
+                    if not text.strip():
                         raise ValueError("empty")
+                    record["sha256"] = hashlib.sha256(text.encode("utf-8")).hexdigest()
                 except (OSError, ValueError, StepFailed):
                     record.update(
                         status="abbruch", abbruch_grund="cli_fehler: kein ergebnis"
@@ -421,7 +466,17 @@ class Coordinator:
         order = Auftrag.model_validate(state["auftrag"])
         try:
             if state.pop("wiederaufnahme", False):
-                await self.token_ready[ident].wait()
+                LOG.warning(
+                    "bericht_id=%s wartet maximal %.1fs auf frischen Token; "
+                    "Ausweg POST /aufraeumen/%s", ident, self.reattach_wait_s, ident,
+                )
+                try:
+                    async with asyncio.timeout(self.reattach_wait_s):
+                        await self.token_ready[ident].wait()
+                except TimeoutError as error:
+                    raise StepFailed(
+                        "wiederaufnahme", "Wiederanhaengen: Zeitgrenze erreicht"
+                    ) from error
                 self.directory(ident).chmod(0o711)
             if not state["eingang_fertig"]:
                 await self.download(ident, order)
@@ -484,13 +539,21 @@ class Coordinator:
                     pruefung_prompt(order),
                     {"gutachten.md": self.output(ident, "harmonisierung-korrektur")},
                 )
+            # Validate again after the reviewer (same UID as harmonization).
+            # result() validates the exact bytes it returns as well.
+            for item in state["schritte"]:
+                if item["status"] == "ok":
+                    self.output(ident, item["name"])
             state["zustand"] = "fertig"
             state["meta"] = {
                 "schema": "erkunder-ergebnis/1",
                 "bericht_id": ident,
                 "prompt_version": PROMPT_VERSION,
                 "modell": "claude-sonnet-5-5",
-                "schritte": state["schritte"],
+                "schritte": [
+                    {k: v for k, v in item.items() if k != "sha256"}
+                    for item in state["schritte"]
+                ],
                 "erkunder_ausgefallen": failed,
                 "korrekturkreis_gelaufen": state["korrekturkreis_gelaufen"],
             }
@@ -696,6 +759,12 @@ def create_app(coordinator: Coordinator | None = None) -> FastAPI:
     async def invalid_request(request, error):
         return JSONResponse(status_code=400, content={"detail": "Ungültiger Auftrag"})
 
+    @app.get("/bereitschaft")
+    async def readiness():
+        if not service.ready:
+            raise HTTPException(503, "Leitstand wartet auf bereinigte Plaetze")
+        return {"bereit": True}
+
     @app.post("/start")
     async def start(body: Start):
         try:
@@ -711,11 +780,18 @@ def create_app(coordinator: Coordinator | None = None) -> FastAPI:
 
     @app.get("/ergebnis/{ident}")
     async def result(ident: str):
-        return service.result(ident)
+        try:
+            return service.result(ident)
+        except StepFailed as error:
+            LOG.error("bericht_id=%s ergebnis=%s", ident, error.reason)
+            raise HTTPException(409, error.reason) from error
 
     @app.post("/aufraeumen/{ident}")
     async def cleanup(ident: str):
-        return await service.cleanup(ident)
+        result = await service.cleanup(ident)
+        if not service.ready:
+            await service.startup()
+        return result
 
     return app
 

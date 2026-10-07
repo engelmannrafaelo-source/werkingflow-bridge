@@ -35,6 +35,7 @@ def isolated_process_and_tmp_inventory(tmp_path, monkeypatch):
     monkeypatch.setattr(
         platz, "clear_owned_tmp", lambda: aufraeumen.clear_owned_tmp(shared_tmp)
     )
+    monkeypatch.setattr(platz, "clear_owned_ipc", lambda: None)
     return shared_tmp
 
 
@@ -490,3 +491,23 @@ async def test_missing_proc_children_prevents_readiness(monkeypatch):
     with pytest.raises(RuntimeError, match="Platz nicht bereit.*CONFIG_PROC_CHILDREN"):
         async with app.router.lifespan_context(app):
             pytest.fail("Platz meldet ohne proc children bereit")
+
+
+async def test_ipc_cleanup_failure_blocks_next_report(run_space, monkeypatch):
+    folder, cgroup = run_space
+
+    def fail():
+        raise PermissionError("synthetic IPC cleanup failure")
+
+    monkeypatch.setattr(platz, "clear_owned_ipc", fail)
+    service = Platz(root=folder.parent.parent, cgroup=cgroup,
+                    command=[sys.executable, "-c", "print('{}')"])
+    await service.start(request(folder))
+    await service.task
+    assert service.cleanup_failed
+    assert service.states[("bericht-123", "erkunder-1")]["fehler"] == (
+        "cli_fehler: Platz-Aufraeumen"
+    )
+    with pytest.raises(platz.HTTPException) as error:
+        await service.start(request(folder))
+    assert error.value.status_code == 503

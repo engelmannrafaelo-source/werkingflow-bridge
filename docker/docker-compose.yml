@@ -931,6 +931,7 @@ services:
     memswap_limit: 3g
     pids_limit: 512
     read_only: true
+    ipc: private  # IPC belongs to this place; finally removes each step's objects.
     tmpfs: ["/tmp:size=512m"]
     cap_drop: [ALL]
     security_opt: ["no-new-privileges:true"]
@@ -955,6 +956,7 @@ services:
     memswap_limit: 3g
     pids_limit: 512
     read_only: true
+    ipc: private  # IPC belongs to this place; finally removes each step's objects.
     tmpfs: ["/tmp:size=512m"]
     cap_drop: [ALL]
     security_opt: ["no-new-privileges:true"]
@@ -979,6 +981,7 @@ services:
     memswap_limit: 3g
     pids_limit: 512
     read_only: true
+    ipc: private  # IPC belongs to this place; finally removes each step's objects.
     tmpfs: ["/tmp:size=512m"]
     cap_drop: [ALL]
     security_opt: ["no-new-privileges:true"]

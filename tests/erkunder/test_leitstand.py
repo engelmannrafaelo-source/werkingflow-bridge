@@ -701,11 +701,15 @@ async def test_startup_seals_legacy_and_orphan_before_abort_failure(tmp_path):
         return httpx.Response(503)
 
     service = Coordinator(
-        root, client=httpx.AsyncClient(transport=httpx.MockTransport(offline))
+        root, client=httpx.AsyncClient(transport=httpx.MockTransport(offline)),
+        startup_wait_s=0,
     )
     try:
-        with pytest.raises(HTTPException):
-            await service.startup()
+        await service.startup()
+        assert not service.ready
+        with pytest.raises(HTTPException) as error:
+            await service.start(body())
+        assert error.value.status_code == 503
         assert not service.tasks
     finally:
         await service.shutdown()
@@ -747,3 +751,97 @@ async def test_cancelled_running_task_revokes_report(tmp_path):
         assert stat.S_IMODE(service.directory("bericht-123").stat().st_mode) == 0o700
     finally:
         await service.shutdown()
+
+
+@pytest.mark.parametrize("review", ["trägt", "trägt teilweise"])
+async def test_result_detects_mutation_after_review_and_restart(tmp_path, review):
+    from src.erkunder.leitstand import StepFailed
+
+    service, _, _ = await setup(tmp_path, review=review)
+    assert (await finish(service))["zustand"] == "fertig"
+    name = "harmonisierung-korrektur" if "teilweise" in review else "harmonisierung"
+    path = service.directory("bericht-123") / name / "ergebnis.md"
+    path.write_text("nach Pruefung manipuliert")
+    with pytest.raises(StepFailed, match="Integritaet"):
+        service.result("bericht-123")
+    await service.shutdown()
+    resumed = Coordinator(
+        service.root,
+        client=httpx.AsyncClient(transport=httpx.MockTransport(Places())),
+        chown=lambda *args: None,
+    )
+    await resumed.startup()
+    try:
+        with pytest.raises(StepFailed, match="Integritaet"):
+            resumed.result("bericht-123")
+    finally:
+        await resumed.shutdown()
+
+
+async def test_reviewer_mutation_fails_before_completion(tmp_path):
+    service, places, _ = await setup(tmp_path)
+
+    async def malicious(request):
+        response = await places(request)
+        if request.method == "GET" and request.url.path.endswith("/pruefung"):
+            path = service.directory("bericht-123") / "harmonisierung/ergebnis.md"
+            path.write_text("manipuliert")
+        return response
+
+    await service.client.aclose()
+    service.client = httpx.AsyncClient(transport=httpx.MockTransport(malicious))
+    try:
+        state = await finish(service)
+        assert state["zustand"] == "abbruch"
+        assert "Integritaet" in state["fehler"]
+    finally:
+        await service.shutdown()
+
+
+async def test_compose_order_waits_for_places_without_restarting(tmp_path, caplog):
+    root = tmp_path / "arbeit"
+    (root / "old-report").mkdir(parents=True)
+    available = asyncio.Event()
+    calls = []
+
+    async def place(request):
+        calls.append(request.url.host)
+        assert stat.S_IMODE((root / "old-report").stat().st_mode) == 0o700
+        return httpx.Response(200 if available.is_set() else 503)
+
+    service = Coordinator(
+        root, client=httpx.AsyncClient(transport=httpx.MockTransport(place)),
+        startup_wait_s=5,
+    )
+    task = asyncio.create_task(service.startup())
+    await asyncio.sleep(0.02)
+    assert not task.done() and not service.ready
+    with pytest.raises(HTTPException) as error:
+        await service.start(body())
+    assert error.value.status_code == 503
+    available.set()
+    await task
+    assert service.ready and len(set(calls)) == 3
+    assert "wartet auf Plaetze" in caplog.text
+    await service.shutdown()
+
+
+async def test_reattach_deadline_releases_allocation_but_retains_report(tmp_path):
+    service, _, _ = await setup(tmp_path, hold=True)
+    await service.start(body())
+    await asyncio.sleep(0.01)
+    await service.shutdown()
+    resumed = Coordinator(
+        service.root, client=httpx.AsyncClient(transport=httpx.MockTransport(Places())),
+        chown=lambda *args: None, poll_s=0, reattach_wait_s=0.01,
+    )
+    await resumed.startup()
+    try:
+        await resumed.tasks["bericht-123"]
+        state = resumed.status("bericht-123")
+        assert state["zustand"] == "abbruch"
+        assert "Zeitgrenze" in state["fehler"]
+        assert resumed.directory("bericht-123").exists()
+        assert (await finish(resumed, body("bericht-456")))["zustand"] == "fertig"
+    finally:
+        await resumed.shutdown()

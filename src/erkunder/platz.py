@@ -29,6 +29,7 @@ from src.erkunder.aufraeumen import (
     stop_uid_processes,
 )
 from src.erkunder.dateien import read_bytes, read_text
+from src.erkunder.ipc import clear_owned_ipc
 from src.erkunder.prozessschutz import protect_process
 
 LOG = logging.getLogger(__name__)
@@ -279,6 +280,7 @@ class Platz:
                     await self.process.wait()
                 await reap_children()
                 clear_owned_tmp()
+                clear_owned_ipc()
                 home = Path(body.ordner) / ".home"
                 if home.is_symlink():
                     home.unlink()
