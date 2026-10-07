@@ -10,6 +10,7 @@ import logging
 import os
 import re
 import shutil
+import stat
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -93,6 +94,38 @@ class Coordinator:
             os.fsync(stream.fileno())
         os.replace(tmp, path)
 
+    def seal(self, ident: str) -> None:
+        """Retain results for root, revoke every place's traversal permission."""
+        directory = self.directory(ident)
+        info = directory.lstat()
+        if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.geteuid():
+            raise RuntimeError("Berichtordner gehört nicht dem Leitstand")
+        directory.chmod(0o700)
+
+    def seal_reports(self) -> bool:
+        found = False
+        for path in self.root.iterdir():
+            if ID.fullmatch(path.name):
+                self.seal(path.name)
+                found = True
+        return found
+
+    async def stop_places(self) -> None:
+        # Also covers processes whose /schritt response or state write was lost.
+        # A retained cwd/file descriptor bypasses ancestor chmod: require the
+        # place's process cleanup acknowledgement before any UID is reused.
+        for slot, place in enumerate(self.places):
+            try:
+                response = await self.client.post(
+                    place + "/abbrechen", headers=self.headers()
+                )
+                response.raise_for_status()
+            except httpx.HTTPError as error:
+                LOG.error("platz=%s bericht_trennung=fehlgeschlagen", slot)
+                raise HTTPException(
+                    503, "Bericht-Trennung: Platz nicht bereinigt"
+                ) from error
+
     async def startup(self) -> None:
         # This lifecycle runs only in the standalone Leitstand, never in a worker.
         # HTTPX INFO and HTTPCore DEBUG expose signed download URLs.
@@ -100,6 +133,10 @@ class Coordinator:
         logging.getLogger("httpcore").setLevel(logging.WARNING)
         self.root.mkdir(parents=True, exist_ok=True, mode=0o711)
         self.root.chmod(0o711)
+        # Seal first, even orphan directories and legacy six-hour retention.
+        # A failed seal/abort fails startup; no new report can be accepted.
+        if self.seal_reports():
+            await self.stop_places()
         for path in self.root.iterdir():
             if not ID.fullmatch(path.name):
                 continue
@@ -111,6 +148,12 @@ class Coordinator:
         await self.reap()
         for ident, state in list(self.states.items()):
             if state["zustand"] == "laeuft":
+                # Old processes were stopped. Recreate interrupted steps only
+                # after the worker reattaches with a fresh in-memory token.
+                state["active"] = {}
+                state["unsichere_plaetze"] = []
+                state["wiederaufnahme"] = True
+                self.save(ident)
                 self.tasks[ident] = asyncio.create_task(self.run(ident))
         self.housekeeper = asyncio.create_task(self.housekeeping())
 
@@ -121,7 +164,14 @@ class Coordinator:
         for task in tasks:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
-        await self.client.aclose()
+        try:
+            for ident in self.states:
+                if self.directory(ident).exists():
+                    self.seal(ident)
+            if any(s["zustand"] == "laeuft" for s in self.states.values()):
+                await self.stop_places()
+        finally:
+            await self.client.aclose()
 
     async def housekeeping(self) -> None:
         while True:
@@ -169,6 +219,10 @@ class Coordinator:
             for other, state in self.states.items():
                 if state["zustand"] == "laeuft":
                     raise HTTPException(409, {"belegt": other})
+            # Gate every new report, including after cleanup removed its state.
+            # Errors propagate; neither a task nor a writable report is created.
+            self.seal_reports()
+            await self.stop_places()
             directory = self.directory(ident)
             directory.mkdir(mode=0o711)
             directory.chmod(0o711)
@@ -366,6 +420,9 @@ class Coordinator:
         state = self.states[ident]
         order = Auftrag.model_validate(state["auftrag"])
         try:
+            if state.pop("wiederaufnahme", False):
+                await self.token_ready[ident].wait()
+                self.directory(ident).chmod(0o711)
             if not state["eingang_fertig"]:
                 await self.download(ident, order)
             results = await asyncio.gather(
@@ -455,6 +512,21 @@ class Coordinator:
                 state["schritt"],
                 state["fehler"],
             )
+        finally:
+            # No await between completion and revocation. The entire retained
+            # report is now root-only, including inputs, scripts and results.
+            try:
+                self.seal(ident)
+            except Exception as error:
+                state["zustand"] = "abbruch"
+                state["fehler"] = "Bericht-Trennung: Rechteentzug fehlgeschlagen"
+                self.save(ident)
+                LOG.error(
+                    "bericht_id=%s rechteentzug=fehlgeschlagen fehler=%s",
+                    ident,
+                    type(error).__name__,
+                )
+                raise
         self.save(ident)
 
     def status(self, ident: str) -> dict[str, Any]:
@@ -523,6 +595,8 @@ class Coordinator:
         async with self.lock:
             path = self.directory(ident)
             state = self.states.get(ident)
+            if path.exists():
+                self.seal(ident)
             abort_errors: list[dict[str, Any]] = []
             task = self.tasks.pop(ident, None)
             if task:

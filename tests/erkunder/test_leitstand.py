@@ -228,10 +228,13 @@ async def test_resume_running_places(tmp_path):
     )
     await resumed.startup()
     try:
+        assert stat.S_IMODE(resumed.directory("bericht-123").stat().st_mode) == 0o700
+        await asyncio.sleep(0)
+        assert len(places.calls) == 3
         assert await resumed.start(body(token="fresh")) == {"angehaengt": True}
         await resumed.tasks["bericht-123"]
         assert resumed.status("bericht-123")["zustand"] == "fertig"
-        assert len(places.calls) == 5
+        assert len(places.calls) == 8
         assert places.calls[-1]["claude_token"] == "fresh"
     finally:
         await resumed.shutdown()
@@ -576,7 +579,10 @@ async def test_housekeeper_survives_round_error(tmp_path, monkeypatch, caplog):
 async def test_orphans_removed_by_age(tmp_path, at_startup):
     import os
 
-    service = Coordinator(tmp_path / "arbeit")
+    service = Coordinator(
+        tmp_path / "arbeit",
+        client=httpx.AsyncClient(transport=httpx.MockTransport(Places())),
+    )
     service.root.mkdir()
     old = service.root / "bericht-old"
     fresh = service.root / "bericht-new"
@@ -609,5 +615,135 @@ async def test_missing_internal_token_refuses_start(tmp_path, monkeypatch, token
             async with app.router.lifespan_context(app):
                 pytest.fail("started without token")
         assert not service.root.exists()
+    finally:
+        await service.shutdown()
+
+
+@pytest.mark.parametrize("failures", [{}, {"erkunder-1": 2, "erkunder-2": 2}])
+async def test_finished_report_sealed_before_same_slots_reused(tmp_path, failures):
+    service, places, _ = await setup(tmp_path, failures=failures)
+    try:
+        await finish(service)
+        old = service.directory("bericht-123")
+        assert stat.S_IMODE(old.stat().st_mode) == 0o700
+        places.failures = {}
+        assert (await finish(service, body("bericht-456")))["zustand"] == "fertig"
+        assert stat.S_IMODE(old.stat().st_mode) == 0o700
+        assert service.result("bericht-456")["gutachten_final"] == "harmonisierung"
+    finally:
+        await service.shutdown()
+
+
+async def test_cancel_before_task_started_seals_report(tmp_path):
+    service, _, _ = await setup(tmp_path)
+    await service.start(body())
+    await service.shutdown()
+    assert stat.S_IMODE(service.directory("bericht-123").stat().st_mode) == 0o700
+
+
+async def test_revocation_failure_blocks_new_report(tmp_path, monkeypatch):
+    service, places, _ = await setup(tmp_path)
+    try:
+        await finish(service)
+        original = Path.chmod
+
+        def fail(path, mode, *args, **kwargs):
+            if path == service.directory("bericht-123"):
+                raise PermissionError("synthetic")
+            return original(path, mode, *args, **kwargs)
+
+        with monkeypatch.context() as patch:
+            patch.setattr(Path, "chmod", fail)
+            with pytest.raises(PermissionError):
+                await service.start(body("bericht-456"))
+        assert not service.directory("bericht-456").exists()
+        assert len(places.calls) == 5
+    finally:
+        await service.shutdown()
+
+
+@pytest.mark.parametrize("failure", ["503", "offline"])
+async def test_abort_failure_blocks_new_report_even_after_old_state_deleted(
+    tmp_path, failure
+):
+    service, places, _ = await setup(tmp_path)
+    try:
+        await finish(service)
+        await service.cleanup("bericht-123")
+
+        async def unavailable(request):
+            if failure == "offline":
+                raise httpx.ConnectError("offline", request=request)
+            return httpx.Response(503)
+
+        await service.client.aclose()
+        service.client = httpx.AsyncClient(transport=httpx.MockTransport(unavailable))
+        with pytest.raises(HTTPException) as error:
+            await service.start(body("bericht-456"))
+        assert error.value.status_code == 503
+        assert not service.directory("bericht-456").exists()
+        assert len(places.calls) == 5
+    finally:
+        await service.shutdown()
+
+
+async def test_startup_seals_legacy_and_orphan_before_abort_failure(tmp_path):
+    root = tmp_path / "arbeit"
+    root.mkdir()
+    for ident in ("bericht-legacy", "bericht-orphan"):
+        path = root / ident
+        path.mkdir(mode=0o711)
+        (path / "data").write_text("synthetic")
+
+    async def offline(request):
+        # Revocation must precede the very first network await.
+        assert all(stat.S_IMODE(p.stat().st_mode) == 0o700 for p in root.iterdir())
+        return httpx.Response(503)
+
+    service = Coordinator(
+        root, client=httpx.AsyncClient(transport=httpx.MockTransport(offline))
+    )
+    try:
+        with pytest.raises(HTTPException):
+            await service.startup()
+        assert not service.tasks
+    finally:
+        await service.shutdown()
+
+
+async def test_terminal_revocation_failure_is_visible_and_blocks_reuse(
+    tmp_path, monkeypatch
+):
+    service, _, _ = await setup(tmp_path)
+    try:
+        await service.start(body())
+        with monkeypatch.context() as patch:
+
+            def fail(_):
+                raise PermissionError("synthetic private error")
+
+            patch.setattr(service, "seal", fail)
+            with pytest.raises(PermissionError):
+                await service.tasks["bericht-123"]
+            status = service.status("bericht-123")
+            assert status["zustand"] == "abbruch"
+            assert status["fehler"] == "Bericht-Trennung: Rechteentzug fehlgeschlagen"
+            with pytest.raises(PermissionError):
+                await service.start(body("bericht-456"))
+            assert not service.directory("bericht-456").exists()
+    finally:
+        await service.shutdown()
+
+
+async def test_cancelled_running_task_revokes_report(tmp_path):
+    service, places, _ = await setup(tmp_path, hold=True)
+    try:
+        await service.start(body())
+        while len(places.calls) < 3:
+            await asyncio.sleep(0)
+        service.tasks["bericht-123"].cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await service.tasks["bericht-123"]
+        assert stat.S_IMODE(service.directory("bericht-123").stat().st_mode) == 0o700
     finally:
         await service.shutdown()
