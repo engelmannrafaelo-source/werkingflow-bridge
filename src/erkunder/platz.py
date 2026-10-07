@@ -16,6 +16,8 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field, SecretStr
 
+from src.erkunder.prozessschutz import protect_process
+
 
 class Schritt(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -232,19 +234,27 @@ class Platz:
 
 def create_app(platz: Platz | None = None) -> FastAPI:
     service = platz or Platz()
+    internal_token = ""
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-        yield
-        await service.abort()
+        nonlocal internal_token
+        protect_process()
+        internal_token = os.environ.pop("ERKUNDER_INTERNAL_TOKEN", "")
+        if not internal_token:
+            raise RuntimeError("ERKUNDER_INTERNAL_TOKEN fehlt")
+        try:
+            yield
+        finally:
+            await service.abort()
+            internal_token = ""
 
     app = FastAPI(lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None)
 
     @app.middleware("http")
     async def authenticate(request, call_next):
-        expected = os.environ.get("ERKUNDER_INTERNAL_TOKEN", "")
         supplied = request.headers.get("X-Erkunder-Intern", "")
-        if not expected or not hmac.compare_digest(expected, supplied):
+        if not internal_token or not hmac.compare_digest(internal_token, supplied):
             return JSONResponse(
                 status_code=403, content={"detail": "nicht freigegeben"}
             )

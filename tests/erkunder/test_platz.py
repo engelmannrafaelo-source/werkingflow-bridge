@@ -141,8 +141,9 @@ async def test_routes_auth_busy_cancel(run_space, monkeypatch):
     script.write_text("import time; time.sleep(60)")
     service = Platz(folder.parent.parent, cgroup, [sys.executable, str(script)], 0.02)
     monkeypatch.setenv("ERKUNDER_INTERNAL_TOKEN", "internal-test")
-    async with httpx.AsyncClient(
-        transport=httpx.ASGITransport(app=create_app(service)), base_url="http://test"
+    app = create_app(service)
+    async with app.router.lifespan_context(app), httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
     ) as client:
         assert (await client.post("/abbrechen")).status_code == 403
         assert (await client.get("/openapi.json")).status_code == 403
