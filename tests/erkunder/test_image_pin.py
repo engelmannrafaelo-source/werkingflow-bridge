@@ -1,6 +1,9 @@
 """Static deployment contract; no daemon, image build or credentials required."""
 
 import re
+import signal
+import subprocess
+import time
 from pathlib import Path
 
 import pytest
@@ -116,10 +119,81 @@ def test_proxy_is_default_deny_with_single_host_and_connect_port():
     proxy_entrypoint = (DOCKER / "erkunder/erkunder-proxy").read_text()
     assert 'log=/tmp/tinyproxy.log' in proxy_entrypoint
     assert 'chown nobody:nogroup "$log"' in proxy_entrypoint
-    assert "max_log_bytes=1048576" in proxy_entrypoint
-    assert "ulimit -f 2048" in proxy_entrypoint
+    max_log_bytes = int(
+        re.search(r"^max_log_bytes=(\d+)$", proxy_entrypoint, re.MULTILINE).group(1)
+    )
+    file_limit_blocks = int(
+        re.search(r"^file_limit_blocks=(\d+)$", proxy_entrypoint, re.MULTILINE).group(1)
+    )
+    tmpfs_mebibytes = int(re.search(r"size=(\d+)m", proxy["tmpfs"][0]).group(1))
+    tmpfs_bytes = tmpfs_mebibytes * 1024 * 1024
+    assert file_limit_blocks * 512 > max_log_bytes
+    assert file_limit_blocks * 512 < tmpfs_bytes
+    assert "inotifywait -q -m -e modify,close_write" in proxy_entrypoint
     assert 'tail -n 0 -F "$log" &' in proxy_entrypoint
     assert 'proxy_pid=$!' in proxy_entrypoint
     assert 'kill -0 "$mirror_pid"' in proxy_entrypoint
     assert ': > "$log"' in proxy_entrypoint
     assert (DOCKER / "erkunder/erkunder-proxy").stat().st_mode & 0o111
+
+
+def test_proxy_truncates_a_busy_log_under_dash_without_killing_proxy(tmp_path):
+    """A write-driven trimmer keeps a 4 MiB-limited proxy alive past 1 MiB."""
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    log = tmp_path / "tinyproxy.log"
+    writes = tmp_path / "writes"
+    script = (DOCKER / "erkunder/erkunder-proxy").read_text().replace(
+        "log=/tmp/tinyproxy.log", f"log={log}"
+    )
+    script = script.replace(
+        "event_pipe=/tmp/erkunder-proxy-events.$$", f"event_pipe={tmp_path}/events.$$"
+    )
+    entrypoint = tmp_path / "erkunder-proxy"
+    entrypoint.write_text(script)
+    entrypoint.chmod(0o755)
+    (fake_bin / "chown").write_text("#!/bin/sh\nexit 0\n")
+    (fake_bin / "tinyproxy").write_text(
+        "#!/bin/sh\n"
+        "set -eu\n"
+        "trap 'exit 0' INT TERM\n"
+        "payload=$(dd if=/dev/zero bs=65536 count=1 2>/dev/null | tr '\\000' x)\n"
+        "while :; do\n"
+        "  printf '%s\\n' \"$payload\" >> \"$FAKE_PROXY_LOG\"\n"
+        "  printf '.' >> \"$FAKE_PROXY_WRITES\"\n"
+        "  sleep 0.02\n"
+        "done\n"
+    )
+    for command in fake_bin.iterdir():
+        command.chmod(0o755)
+
+    process = subprocess.Popen(
+        ["/bin/dash", str(entrypoint)],
+        env={
+            "PATH": f"{fake_bin}:{Path('/usr/bin')}:{Path('/bin')}",
+            "FAKE_PROXY_LOG": str(log),
+            "FAKE_PROXY_WRITES": str(writes),
+        },
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        deadline = time.monotonic() + 10
+        while (
+            (not writes.exists() or writes.stat().st_size < 24)
+            and time.monotonic() < deadline
+        ):
+            assert process.poll() is None
+            time.sleep(0.05)
+
+        assert writes.exists() and writes.stat().st_size >= 24
+        assert process.poll() is None
+        # 24 writes are >1 MiB. Without truncation this would exceed 1.5 MiB.
+        assert log.stat().st_size <= 1048576 + 65537
+    finally:
+        if process.poll() is None:
+            process.terminate()
+        process.wait(timeout=5)
+
+    assert process.returncode == -signal.SIGTERM

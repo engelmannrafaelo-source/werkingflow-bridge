@@ -7,7 +7,7 @@ COPY --from=node-runtime /usr/local/lib/node_modules /usr/local/lib/node_modules
 RUN ln -s ../lib/node_modules/npm/bin/npm-cli.js /usr/local/bin/npm && \
     ln -s ../lib/node_modules/npm/bin/npx-cli.js /usr/local/bin/npx
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    ca-certificates bash curl libstdc++6 tinyproxy && rm -rf /var/lib/apt/lists/*
+    ca-certificates bash curl inotify-tools libstdc++6 tinyproxy && rm -rf /var/lib/apt/lists/*
 RUN npm install -g @anthropic-ai/claude-code@2.1.285
 
 # No worker entrypoint, worker home, MCP configuration or secrets in this image.

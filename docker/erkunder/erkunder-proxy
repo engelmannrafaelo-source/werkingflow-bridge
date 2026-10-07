@@ -6,39 +6,66 @@ set -eu
 # and denied CONNECTs in the container log.
 log=/tmp/tinyproxy.log
 max_log_bytes=1048576
+# dash measures RLIMIT_FSIZE in 512-byte blocks: 8192 blocks are 4 MiB.  Keep
+# this hard backstop above the 1 MiB truncation point and below the 16 MiB tmpfs.
+file_limit_blocks=8192
+event_pipe=/tmp/erkunder-proxy-events.$$
 : > "$log"
 chown nobody:nogroup "$log"
 chmod 0644 "$log"
 tail -n 0 -F "$log" &
 mirror_pid=$!
 
-# A file-size limit is the hard backstop for the 16 MiB tmpfs. The loop below
-# normally truncates before that limit, so the proxy keeps logging indefinitely.
+truncate_log() {
+    if [ "$(wc -c < "$log")" -gt "$max_log_bytes" ]; then
+        : > "$log"
+    fi
+}
+
+# Polling leaves an unbounded traffic window between checks. Watch modifications
+# instead, so each tinyproxy write can trigger truncation before the 4 MiB cap.
+mkfifo "$event_pipe"
+inotifywait -q -m -e modify,close_write --format '%e' "$log" > "$event_pipe" &
+watcher_pid=$!
 (
-    ulimit -f 2048
+    while IFS= read -r _event; do
+        truncate_log
+    done < "$event_pipe"
+) &
+trimmer_pid=$!
+
+# A file-size limit is the hard backstop for the 16 MiB tmpfs. Event-driven
+# truncation normally runs at 1 MiB, so the proxy keeps logging indefinitely.
+(
+    ulimit -f "$file_limit_blocks"
     exec tinyproxy -d -c /etc/erkunder/tinyproxy.conf
 ) &
 proxy_pid=$!
 
 stop_children() {
-    kill "$mirror_pid" "$proxy_pid" 2>/dev/null || true
+    kill "$mirror_pid" "$proxy_pid" "$watcher_pid" "$trimmer_pid" 2>/dev/null || true
     wait "$mirror_pid" 2>/dev/null || true
     wait "$proxy_pid" 2>/dev/null || true
+    wait "$watcher_pid" 2>/dev/null || true
+    wait "$trimmer_pid" 2>/dev/null || true
+    rm -f "$event_pipe"
 }
 
-trap 'stop_children; exit 1' INT TERM
+stop_from_signal() {
+    signal=$1
+    stop_children
+    trap - "$signal"
+    kill -s "$signal" "$$"
+}
 
-while kill -0 "$mirror_pid" 2>/dev/null && kill -0 "$proxy_pid" 2>/dev/null; do
-    if [ "$(wc -c < "$log")" -gt "$max_log_bytes" ]; then
-        : > "$log"
-    fi
+trap 'stop_from_signal TERM' TERM
+trap 'stop_from_signal INT' INT
+
+while kill -0 "$mirror_pid" 2>/dev/null && kill -0 "$proxy_pid" 2>/dev/null && \
+    kill -0 "$watcher_pid" 2>/dev/null && kill -0 "$trimmer_pid" 2>/dev/null; do
     sleep 1
 done
 
-if ! kill -0 "$mirror_pid" 2>/dev/null; then
-    echo "tinyproxy log mirror exited; stopping proxy" >&2
-else
-    echo "tinyproxy exited; stopping log mirror" >&2
-fi
+echo "erkunder proxy child exited; stopping remaining children" >&2
 stop_children
 exit 1
