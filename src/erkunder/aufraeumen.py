@@ -57,3 +57,25 @@ def clear_owned_tmp(directory: Path = Path("/tmp")) -> None:
             shutil.rmtree(entry)
         else:
             entry.unlink()
+
+
+async def reap_children() -> None:
+    """Reap adopted descendants in PID 1, after the subprocess owner has waited.
+
+    Keep SIGCHLD unchanged: a handler calling waitpid(-1) or SIG_IGN would
+    steal the direct child's exit status from asyncio's child watcher.
+    Outside the dedicated PID namespace, unrelated children are not ours.
+    """
+    if os.getpid() != 1:
+        return
+    for _ in range(100):
+        while True:
+            try:
+                pid, _ = os.waitpid(-1, os.WNOHANG)
+            except ChildProcessError:
+                return
+            if pid == 0:
+                break
+        # SIGKILL/reparenting can still be in flight after the /proc scan.
+        await asyncio.sleep(0.01)
+    raise RuntimeError("Platz hat nach SIGKILL noch nicht erntbare Kinder")

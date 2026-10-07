@@ -360,3 +360,55 @@ async def test_cancelled_task_cleans_and_reports_abort(run_space):
     assert service.states[("bericht-123", "erkunder-1")]["zustand"] == "abbruch"
     assert service.process.returncode == -signal.SIGKILL
     assert not (folder / ".home/tmp/private").exists()
+
+
+@pytest.mark.parametrize("end", ["success", "timeout", "error", "cancel"])
+async def test_reaping_follows_subprocess_communication(run_space, monkeypatch, end):
+    folder, cgroup = run_space
+    script = folder.parent / "reap-order.py"
+    script.write_text(
+        "import json,os,sys,time\nfrom pathlib import Path\n"
+        'p=Path(json.load(sys.stdin)["ordner"])\n'
+        '(p/"ready.pid").write_text(str(os.getpid()))\n'
+        '(p/"ergebnis.md").write_text("valid")\n'
+        + {
+            "success": 'print("{}")\n',
+            "error": "sys.exit(7)\n",
+            "timeout": "time.sleep(60)\n",
+            "cancel": "time.sleep(60)\n",
+        }[end]
+    )
+    service = Platz(folder.parent.parent, cgroup, [sys.executable, str(script)], 0.02)
+    communicated = False
+    original = asyncio.subprocess.Process.communicate
+
+    async def communicate(process, *args):
+        nonlocal communicated
+        result = await original(process, *args)
+        communicated = True
+        return result
+
+    reaped = False
+
+    async def reap():
+        nonlocal reaped
+        assert communicated
+        assert service.process.returncode == {
+            "success": 0, "error": 7, "timeout": -9, "cancel": -9
+        }[end]
+        reaped = True
+
+    monkeypatch.setattr(asyncio.subprocess.Process, "communicate", communicate)
+    monkeypatch.setattr(platz, "reap_children", reap)
+    await service.start(request(folder, timeout_s=0.3))
+    if end == "cancel":
+        async with asyncio.timeout(3):
+            while not (folder / "ready.pid").exists():
+                await asyncio.sleep(0.01)
+        service.task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await service.task
+    else:
+        await service.task
+    assert reaped
+    assert not service.cleanup_failed

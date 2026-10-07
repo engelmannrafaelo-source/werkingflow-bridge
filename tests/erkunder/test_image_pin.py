@@ -45,7 +45,8 @@ def test_compose_yaml_and_internal_network():
 def test_places_are_isolated(number):
     service = compose()["services"][f"erkunder-platz-{number}"]
     assert service["user"] == f"110{number}:1100"
-    assert service["init"] is True
+    assert not service.get("init", False)
+    assert service["command"] == ["python", "-m", "src.erkunder.platz"]
     assert service["mem_limit"] == service["memswap_limit"] == "3g"
     assert service["pids_limit"] == 512
     assert service["read_only"] is True

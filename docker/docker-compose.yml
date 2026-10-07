@@ -924,9 +924,8 @@ services:
   erkunder-platz-1:
     image: bridge-erkunder:${GIT_COMMIT:-dev}
     command: ["python", "-m", "src.erkunder.platz"]
-    # Tini reaps terminated step descendants so their zombies cannot exhaust
-    # the per-place process limit while the long-lived place server stays up.
-    init: true
+    # The protected server must be PID 1: an init would expose its environment.
+    # It reaps step descendants after subprocess communication has settled.
     user: "1101:1100"
     mem_limit: 3g
     memswap_limit: 3g
@@ -950,8 +949,7 @@ services:
   erkunder-platz-2:
     image: bridge-erkunder:${GIT_COMMIT:-dev}
     command: ["python", "-m", "src.erkunder.platz"]
-    # See erkunder-platz-1: each isolated place needs its own reaper.
-    init: true
+    # See erkunder-platz-1: the protected server is also the orphan reaper.
     user: "1102:1100"
     mem_limit: 3g
     memswap_limit: 3g
@@ -975,8 +973,7 @@ services:
   erkunder-platz-3:
     image: bridge-erkunder:${GIT_COMMIT:-dev}
     command: ["python", "-m", "src.erkunder.platz"]
-    # See erkunder-platz-1: each isolated place needs its own reaper.
-    init: true
+    # See erkunder-platz-1: the protected server is also the orphan reaper.
     user: "1103:1100"
     mem_limit: 3g
     memswap_limit: 3g

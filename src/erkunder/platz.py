@@ -21,7 +21,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field, SecretStr
 
-from src.erkunder.aufraeumen import clear_owned_tmp, stop_uid_processes
+from src.erkunder.aufraeumen import clear_owned_tmp, reap_children, stop_uid_processes
 from src.erkunder.dateien import read_bytes, read_text
 from src.erkunder.prozessschutz import protect_process
 
@@ -255,6 +255,17 @@ class Platz:
             try:
                 self.kill()
                 await stop_uid_processes()
+                # Only one step owns subprocesses. Settle its watcher before
+                # PID 1 waits for any adopted child, including on cancellation.
+                if communication:
+                    settled = await asyncio.gather(
+                        communication, return_exceptions=True
+                    )
+                    if isinstance(settled[0], BaseException):
+                        reason = reason or "cli_fehler: Kindkommunikation"
+                if self.process:
+                    await self.process.wait()
+                await reap_children()
                 clear_owned_tmp()
                 home = Path(body.ordner) / ".home"
                 if home.is_symlink():
@@ -270,14 +281,9 @@ class Platz:
                     body.schritt,
                     type(error).__name__,
                 )
-            if communication:
-                if self.cleanup_failed:
-                    communication.cancel()
-                settled = await asyncio.gather(communication, return_exceptions=True)
-                if isinstance(settled[0], BaseException):
-                    reason = reason or "cli_fehler: Kindkommunikation"
-            elif self.process:
-                await self.process.wait()
+            if self.cleanup_failed and communication:
+                communication.cancel()
+                await asyncio.gather(communication, return_exceptions=True)
             meta = {
                 "name": body.schritt,
                 "versuch": 1,
