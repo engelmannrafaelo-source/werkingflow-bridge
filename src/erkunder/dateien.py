@@ -10,11 +10,12 @@ MAX_FILE_BYTES = 5_000_000
 def read_bytes(path: Path, *, limit: int = MAX_FILE_BYTES) -> bytes:
     """Reject links in every component, special files and oversized/growing files."""
     path = path.absolute()
-    directory = os.open(path.anchor, os.O_RDONLY | os.O_DIRECTORY)
+    # Parents need search permission only (root-owned 0711 in a place).
+    directory = os.open(path.anchor, os.O_PATH | os.O_DIRECTORY | os.O_NOFOLLOW)
     try:
         for part in path.parts[1:-1]:
             child = os.open(
-                part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=directory
+                part, os.O_PATH | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=directory
             )
             os.close(directory)
             directory = child

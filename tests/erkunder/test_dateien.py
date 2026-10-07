@@ -58,3 +58,32 @@ def test_growth_after_fstat_is_bounded(tmp_path, monkeypatch):
     monkeypatch.setattr(os, "fstat", grow)
     with pytest.raises(ValueError, match="zu gross"):
         read_bytes(path)
+
+
+def test_search_only_parents_in_unprivileged_process(tmp_path):
+    # A subprocess makes the permission boundary real, rather than mocking open.
+    import subprocess
+    import sys
+
+    if os.geteuid() == 0:
+        pytest.skip("Root bypasses DAC; use the container probe for root-owned 0711")
+    directory = tmp_path / "arbeit" / "bericht"
+    directory.mkdir(parents=True)
+    path = directory / "ergebnis.md"
+    path.write_text("synthetic result")
+    directory.chmod(0o111)
+    directory.parent.chmod(0o111)
+    try:
+        result = subprocess.run(
+            [sys.executable, "-c", (
+                "from pathlib import Path; import os, sys; "
+                "from src.erkunder.dateien import read_text; "
+                "assert os.geteuid() != 0; "
+                "assert read_text(Path(sys.argv[1])) == 'synthetic result'"
+            ), str(path)],
+            capture_output=True, text=True, timeout=10,
+        )
+        assert result.returncode == 0, result.stderr
+    finally:
+        directory.parent.chmod(0o700)
+        directory.chmod(0o700)
