@@ -92,6 +92,7 @@ from src.jobs.registry import (
     DEPENDENCY_RETRY_DELAY_S,
 )
 from src.jobs import store_client as jobs_store_client
+from src.erkunder.routes import router as erkunder_router  # noqa: E402
 from src.jobs.executors import (
     ping_executor,
     chat_executor,
@@ -99,6 +100,7 @@ from src.jobs.executors import (
     proxy_executor,
     convert_html_to_pdf_executor,
     doc_agent_executor,
+    erkunder_executor,
 )
 from src.parameter_validator import ParameterValidator, CompatibilityReporter
 from src.model_registry import (
@@ -611,6 +613,7 @@ async def lifespan(app: FastAPI):
     register_executor("chat", chat_executor)
     register_executor("research", research_executor)
     register_executor("doc-agent", doc_agent_executor)
+    register_executor("erkunder", erkunder_executor)
     register_executor("proxy", proxy_executor)
     register_executor("convert-html-to-pdf", convert_html_to_pdf_executor)
     set_attribution_extractor(extract_attribution_context)
@@ -821,6 +824,7 @@ app = FastAPI(
 # Generic async-job endpoints (POST /v1/jobs, GET /v1/jobs/{id}) — additive,
 # inert unless BRIDGE_GENERIC_JOBS_ENABLED=true.
 app.include_router(jobs_router)
+app.include_router(erkunder_router)
 
 # Platform routes (/v1/auth/*, /v1/users*, /v1/billing/*, etc.) are served
 # by the dedicated platform-api container (src/platform_main.py).

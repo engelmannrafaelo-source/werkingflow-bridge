@@ -1,0 +1,72 @@
+#!/usr/bin/env python3
+"""Claude PreToolUse path boundary; input data remain read-only."""
+
+import glob
+import json
+import sys
+from pathlib import Path
+
+
+def within(path, root):
+    return path == root or root in path.parents
+
+
+def allowed(event, work_root=Path("/arbeit")):
+    cwd = Path(event["cwd"]).resolve()
+    # A run is exactly /arbeit/<bericht>/<schritt>.
+    if cwd.parent.parent != work_root:
+        return False
+    entrance = cwd.parent / "eingang"
+    write = event["tool_name"] in {"Write", "Edit"}
+    tool_input = event.get("tool_input", {})
+    raw = tool_input.get("file_path", tool_input.get("path", "."))
+    if not isinstance(raw, str):
+        return False
+    path = Path(raw)
+    if not path.is_absolute():
+        path = cwd / path
+    paths = [path]
+    if event["tool_name"] == "Glob":
+        pattern = tool_input.get("pattern", "*")
+        if not isinstance(pattern, str):
+            return False
+        pattern_path = Path(pattern)
+        pattern_path = (
+            pattern_path if pattern_path.is_absolute() else path / pattern_path
+        )
+        paths.append(pattern_path)
+    for candidate in paths:
+        resolved = candidate.resolve()
+        if not within(resolved, cwd) and not (not write and within(resolved, entrance)):
+            return False
+    if event["tool_name"] == "Glob":
+        for match in glob.iglob(str(pattern_path), recursive=True):
+            resolved = Path(match).resolve()
+            if not within(resolved, cwd) and not within(resolved, entrance):
+                return False
+    return True
+
+
+def main():
+    try:
+        accepted = allowed(json.load(sys.stdin))
+    except Exception:
+        accepted = False
+    if not accepted:
+        print(
+            json.dumps(
+                {
+                    "hookSpecificOutput": {
+                        "hookEventName": "PreToolUse",
+                        "permissionDecision": "deny",
+                        "permissionDecisionReason": (
+                            "Pfad liegt außerhalb deines Arbeitsordners"
+                        ),
+                    }
+                }
+            )
+        )
+
+
+if __name__ == "__main__":
+    main()

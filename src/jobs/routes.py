@@ -138,6 +138,17 @@ async def create_job_endpoint(
     """Dispatch a job and return immediately. The work runs off-request (here on
     the Bridge), so the caller never holds a long connection — poll GET /v1/jobs/{id}."""
     await verify_api_key(request, credentials)
+    if body.kind == "erkunder":
+        from pydantic import ValidationError
+
+        from src.erkunder.models import Auftrag
+        from src.erkunder.zugang import erkunder_schluessel_erlaubt
+
+        erkunder_schluessel_erlaubt(request, credentials)
+        try:
+            Auftrag.model_validate(body.payload)
+        except ValidationError:
+            raise HTTPException(400, "ungueltiger Erkunder-Auftrag") from None
     _require_enabled()
 
     if get_executor(body.kind) is None:

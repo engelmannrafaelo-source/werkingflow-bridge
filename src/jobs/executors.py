@@ -487,3 +487,114 @@ async def proxy_executor(
     await report_progress({"phase": "proxy", "path": path})
     timeout_s = PROXY_PATH_TIMEOUTS_S.get(path, PROXY_SELF_CALL_TIMEOUT_S)
     return await _self_post_json(path, body, attribution, timeout_s)
+
+
+async def erkunder_executor(
+    payload: dict,
+    attribution: Optional[dict],
+    report_progress: Callable[[dict], Awaitable[None]],
+) -> dict:
+    """Transfer this worker's account to the isolated, idempotent coordinator."""
+    import asyncio
+    from pathlib import Path
+
+    import httpx
+    from pydantic import ValidationError
+
+    from src.erkunder.models import Auftrag, Ergebnis
+    from src.erkunder.zugang import intern_config
+
+    try:
+        auftrag = Auftrag.model_validate(payload)
+    except ValidationError:
+        raise ExecutorHTTPError(400, "ungueltiger Erkunder-Auftrag") from None
+    token_path = os.environ.get("CLAUDE_CODE_OAUTH_TOKEN_FILE")
+    if not token_path:
+        raise RuntimeError("Erkunder: CLAUDE_CODE_OAUTH_TOKEN_FILE fehlt")
+    try:
+        token = Path(token_path).read_text().strip()
+    except OSError:
+        raise RuntimeError("Erkunder: Tokendatei nicht lesbar") from None
+    if not token:
+        raise RuntimeError("Erkunder: Tokendatei leer")
+    url, headers = intern_config()
+
+    async def run() -> dict:
+        async with httpx.AsyncClient(timeout=60) as client:
+            response = await client.post(
+                f"{url}/start",
+                headers=headers,
+                json={
+                    "worker": os.environ.get("INSTANCE_NAME", "unknown"),
+                    "claude_token": token,
+                    "auftrag": auftrag.model_dump(mode="json", by_alias=True),
+                },
+            )
+            if response.status_code == 409:
+                raise ExecutorHTTPError(429, "Erkunder belegt", retry_after_s=120)
+            if response.status_code != 200:
+                raise RuntimeError(f"Erkunder start HTTP {response.status_code}")
+            while True:
+                response = await client.get(
+                    f"{url}/status/{auftrag.bericht_id}", headers=headers
+                )
+                if response.status_code != 200:
+                    raise RuntimeError(f"Erkunder status HTTP {response.status_code}")
+                state = response.json()
+                await report_progress(
+                    {key: state[key] for key in ("schritt", "fertig", "gesamt")}
+                )
+                if state["zustand"] == "fertig":
+                    return Ergebnis.model_validate(state["meta"]).model_dump(
+                        by_alias=True
+                    )
+                if state["zustand"] == "abbruch":
+                    error = state.get("fehler", {})
+                    reason = (
+                        error.get("grund", "unbekannt")
+                        if isinstance(error, dict)
+                        else error
+                    )
+                    step = state["schritt"]
+                    # Never echo an upstream body/token into the generic job log.
+                    known = str(reason).split(":", 1)[0]
+                    if known not in {
+                        "zeit",
+                        "speicher",
+                        "cli_fehler",
+                        "geheimnis_im_ergebnis",
+                        "platz_neustart",
+                        "konto",
+                        "unbekannt",
+                    }:
+                        known = "unbekannt"
+                    safe_step = (
+                        step
+                        if step
+                        in {
+                            "daten",
+                            "erkunder-1",
+                            "erkunder-2",
+                            "erkunder-3",
+                            "harmonisierung",
+                            "pruefung",
+                            "harmonisierung-korrektur",
+                            "pruefung-korrektur",
+                        }
+                        else "unbekannt"
+                    )
+                    raise RuntimeError(f"erkunder abbruch: {safe_step}: {known}")
+                if state["zustand"] != "laeuft":
+                    raise RuntimeError("Erkunder: ungueltiger Zustand")
+                await asyncio.sleep(15)
+
+    try:
+        return await asyncio.wait_for(
+            run(), float(os.getenv("ERKUNDER_JOB_TIMEOUT_S", "6600"))
+        )
+    except asyncio.TimeoutError:
+        raise RuntimeError("Erkunder: Gesamtfrist abgelaufen") from None
+    except (httpx.HTTPError, ValidationError, ValueError, KeyError):
+        raise RuntimeError(
+            "Erkunder: Leitstand-Antwort ungueltig oder nicht erreichbar"
+        ) from None

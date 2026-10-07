@@ -1,0 +1,10 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Read|Write|Edit|Glob|Grep|LS",
+        "hooks": [{"type": "command", "command": "/usr/local/bin/erkunder-hook"}]
+      }
+    ]
+  }
+}

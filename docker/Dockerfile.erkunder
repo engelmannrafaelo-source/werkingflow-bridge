@@ -1,0 +1,39 @@
+FROM node:24.21.0-bookworm-slim AS node-runtime
+FROM python:3.12-slim
+
+# Runtime and CLI pins deliberately match Dockerfile.worker.
+COPY --from=node-runtime /usr/local/bin/node /usr/local/bin/node
+COPY --from=node-runtime /usr/local/lib/node_modules /usr/local/lib/node_modules
+RUN ln -s ../lib/node_modules/npm/bin/npm-cli.js /usr/local/bin/npm && \
+    ln -s ../lib/node_modules/npm/bin/npx-cli.js /usr/local/bin/npx
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates bash curl libstdc++6 tinyproxy && rm -rf /var/lib/apt/lists/*
+RUN npm install -g @anthropic-ai/claude-code@2.1.285
+
+# No worker entrypoint, worker home, MCP configuration or secrets in this image.
+RUN groupadd --gid 1100 plaetze && \
+    useradd --uid 1101 --gid 1100 --no-create-home --shell /bin/bash platz1 && \
+    useradd --uid 1102 --gid 1100 --no-create-home --shell /bin/bash platz2 && \
+    useradd --uid 1103 --gid 1100 --no-create-home --shell /bin/bash platz3 && \
+    install -d -m 0711 /arbeit
+WORKDIR /app
+COPY pyproject.toml poetry.lock /app/
+RUN pip install --no-cache-dir poetry==2.1.3 && \
+    poetry config virtualenvs.in-project true && poetry install --only main --no-root
+RUN python -m venv /opt/rechnen && /opt/rechnen/bin/pip install --no-cache-dir \
+    pandas==2.2.3 pyarrow==19.0.1 numpy==2.2.6 scipy==1.15.3 \
+    matplotlib==3.10.3 openpyxl==3.1.5
+COPY src /app/src
+COPY --chown=root:root docker/erkunder/erkunder-hook /usr/local/bin/erkunder-hook
+COPY --chown=root:root docker/erkunder/settings.json /etc/erkunder/settings.json
+COPY --chown=root:root docker/erkunder/tinyproxy.conf /etc/erkunder/tinyproxy.conf
+RUN chmod 0755 /usr/local/bin/erkunder-hook && \
+    chmod 0644 /etc/erkunder/settings.json /etc/erkunder/tinyproxy.conf && \
+    printf '%s\n' '^api\.anthropic\.com$' > /etc/erkunder/tinyproxy.filter && \
+    chmod 0644 /etc/erkunder/tinyproxy.filter
+ENV PATH="/app/.venv/bin:/usr/local/bin:/usr/bin:/bin" \
+    PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
+EXPOSE 8100 8200
+CMD ["python", "-m", "src.erkunder.leitstand"]
+ARG GIT_COMMIT=unknown
+LABEL bridge.git.commit=$GIT_COMMIT

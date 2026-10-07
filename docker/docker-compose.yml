@@ -99,6 +99,8 @@ services:
       # Vorzeichen-Befund 06.10.2026: ActualText-Glyphen vor Docling reparieren (nur dev)
       - BRIDGE_PDF_ACTUALTEXT_REPAIR=true
       - INSTANCE_NAME=worker1
+      - ERKUNDER_URL=http://erkunder:8100
+      # ERKUNDER_INTERNAL_TOKEN and ERKUNDER_ALLOWED_KEY_SHA256: env_file above.
       # claude.ai account whose OAuth token this worker uses. Per-host
       # topology (like INSTANCE_NAME), therefore config — NOT a map in
       # shared code. Must match the `account` field the usage scraper
@@ -296,6 +298,8 @@ services:
       # Vorzeichen-Befund 06.10.2026: ActualText-Glyphen vor Docling reparieren (nur dev)
       - BRIDGE_PDF_ACTUALTEXT_REPAIR=true
       - INSTANCE_NAME=worker2
+      - ERKUNDER_URL=http://erkunder:8100
+      # ERKUNDER_INTERNAL_TOKEN and ERKUNDER_ALLOWED_KEY_SHA256: env_file above.
       # claude.ai account whose OAuth token this worker uses. Per-host
       # topology (like INSTANCE_NAME), therefore config — NOT a map in
       # shared code. Must match the `account` field the usage scraper
@@ -493,6 +497,8 @@ services:
       # Vorzeichen-Befund 06.10.2026: ActualText-Glyphen vor Docling reparieren (nur dev)
       - BRIDGE_PDF_ACTUALTEXT_REPAIR=true
       - INSTANCE_NAME=worker3
+      - ERKUNDER_URL=http://erkunder:8100
+      # ERKUNDER_INTERNAL_TOKEN and ERKUNDER_ALLOWED_KEY_SHA256: env_file above.
       # claude.ai account whose OAuth token this worker uses. Per-host
       # topology (like INSTANCE_NAME), therefore config — NOT a map in
       # shared code. Must match the `account` field the usage scraper
@@ -690,6 +696,8 @@ services:
       # Vorzeichen-Befund 06.10.2026: ActualText-Glyphen vor Docling reparieren (nur dev)
       - BRIDGE_PDF_ACTUALTEXT_REPAIR=true
       - INSTANCE_NAME=worker4
+      - ERKUNDER_URL=http://erkunder:8100
+      # ERKUNDER_INTERNAL_TOKEN and ERKUNDER_ALLOWED_KEY_SHA256: env_file above.
       # claude.ai account whose OAuth token this worker uses. Per-host
       # topology (like INSTANCE_NAME), therefore config — NOT a map in
       # shared code. Must match the `account` field the usage scraper
@@ -894,7 +902,104 @@ services:
     networks:
       - bridge-net
 
+  # Internal token interpolation must use the provisioned platform.env as a
+  # Compose --env-file. Never mount/load that complete secret file in these services.
+  erkunder:
+    image: bridge-erkunder:${GIT_COMMIT:-dev}
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.erkunder
+      args:
+        GIT_COMMIT: ${GIT_COMMIT:-unknown}
+    command: ["python", "-m", "src.erkunder.leitstand"]
+    environment:
+      ERKUNDER_INTERNAL_TOKEN: ${ERKUNDER_INTERNAL_TOKEN:?ERKUNDER_INTERNAL_TOKEN fehlt}
+    volumes:
+      - erkunder-arbeit:/arbeit
+    networks: [bridge-net, erkunder-intern]
+    restart: unless-stopped
+
+  erkunder-platz-1:
+    image: bridge-erkunder:${GIT_COMMIT:-dev}
+    command: ["python", "-m", "src.erkunder.platz"]
+    user: "1101:1100"
+    mem_limit: 3g
+    memswap_limit: 3g
+    pids_limit: 512
+    read_only: true
+    tmpfs: ["/tmp:size=512m"]
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    environment:
+      HTTPS_PROXY: http://erkunder-ausgang:8888
+      HTTP_PROXY: http://erkunder-ausgang:8888
+      NO_PROXY: erkunder
+      CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1"
+      ERKUNDER_INTERNAL_TOKEN: ${ERKUNDER_INTERNAL_TOKEN:?ERKUNDER_INTERNAL_TOKEN fehlt}
+    volumes:
+      - erkunder-arbeit:/arbeit
+    networks: [erkunder-intern]
+    depends_on: [erkunder, erkunder-ausgang]
+    restart: unless-stopped
+
+  erkunder-platz-2:
+    image: bridge-erkunder:${GIT_COMMIT:-dev}
+    command: ["python", "-m", "src.erkunder.platz"]
+    user: "1102:1100"
+    mem_limit: 3g
+    memswap_limit: 3g
+    pids_limit: 512
+    read_only: true
+    tmpfs: ["/tmp:size=512m"]
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    environment:
+      HTTPS_PROXY: http://erkunder-ausgang:8888
+      HTTP_PROXY: http://erkunder-ausgang:8888
+      NO_PROXY: erkunder
+      CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1"
+      ERKUNDER_INTERNAL_TOKEN: ${ERKUNDER_INTERNAL_TOKEN:?ERKUNDER_INTERNAL_TOKEN fehlt}
+    volumes:
+      - erkunder-arbeit:/arbeit
+    networks: [erkunder-intern]
+    depends_on: [erkunder, erkunder-ausgang]
+    restart: unless-stopped
+
+  erkunder-platz-3:
+    image: bridge-erkunder:${GIT_COMMIT:-dev}
+    command: ["python", "-m", "src.erkunder.platz"]
+    user: "1103:1100"
+    mem_limit: 3g
+    memswap_limit: 3g
+    pids_limit: 512
+    read_only: true
+    tmpfs: ["/tmp:size=512m"]
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    environment:
+      HTTPS_PROXY: http://erkunder-ausgang:8888
+      HTTP_PROXY: http://erkunder-ausgang:8888
+      NO_PROXY: erkunder
+      CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1"
+      ERKUNDER_INTERNAL_TOKEN: ${ERKUNDER_INTERNAL_TOKEN:?ERKUNDER_INTERNAL_TOKEN fehlt}
+    volumes:
+      - erkunder-arbeit:/arbeit
+    networks: [erkunder-intern]
+    depends_on: [erkunder, erkunder-ausgang]
+    restart: unless-stopped
+
+  erkunder-ausgang:
+    image: bridge-erkunder:${GIT_COMMIT:-dev}
+    command: ["tinyproxy", "-d", "-c", "/etc/erkunder/tinyproxy.conf"]
+    networks: [erkunder-intern, bridge-net]
+    read_only: true
+    tmpfs: ["/tmp:size=16m"]
+    security_opt: ["no-new-privileges:true"]
+    restart: unless-stopped
+
 networks:
+  erkunder-intern:
+    internal: true
   bridge-net:
     driver: bridge
   bridge-prod-net:
@@ -902,6 +1007,8 @@ networks:
     name: docker_bridge-prod-net
 
 volumes:
+  erkunder-arbeit:
+    driver: local
   # Fixed volume names — independent of the compose project name. Without an
   # explicit `name:` field, docker prefixes the volume with the current
   # project (basename of cwd), so running compose from /root/werkingflow-bridge/
