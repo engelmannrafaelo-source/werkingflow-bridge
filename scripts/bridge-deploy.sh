@@ -64,6 +64,12 @@ HETZNER_SVC_worker3="wt-wrapper-worker3"
 HETZNER_SVC_worker4="wt-wrapper-worker4"
 HETZNER_SVC_metrics_reader="wt-wrapper-metrics-reader"
 HETZNER_SVC_platform_api="wt-platform-api"
+HETZNER_SVC_erkunder="docker-erkunder-1"
+HETZNER_SVC_erkunder_platz_1="docker-erkunder-platz-1-1"
+HETZNER_SVC_erkunder_platz_2="docker-erkunder-platz-2-1"
+HETZNER_SVC_erkunder_platz_3="docker-erkunder-platz-3-1"
+HETZNER_SVC_erkunder_ausgang="docker-erkunder-ausgang-1"
+source "$(dirname "${BASH_SOURCE[0]}")/erkunder-deploy.sh"
 # platform-api is deployed BEFORE nginx so the upstream resolves when nginx
 # restarts. nginx is last so the new routing is live only after platform-api
 # is healthy.
@@ -78,8 +84,8 @@ HETZNER_SVC_platform_api="wt-platform-api"
 # metrics routes re-resolve per request with `resolver valid=30s`, so a
 # reader recreated AFTER nginx leaves a <=30s stale-IP window — exactly when
 # the smoke probe runs (bitten 2026-08-31, metrics_account_pool 502).
-HETZNER_ALL="platform-api metrics-reader nginx worker1 worker2 worker3 worker4"
-HETZNER_NEEDS_BUILD="platform-api nginx worker1 worker2 worker3 worker4 metrics-reader"
+HETZNER_ALL="platform-api metrics-reader nginx worker1 worker2 worker3 worker4 ${ERKUNDER_SERVICES}"
+HETZNER_NEEDS_BUILD="platform-api nginx worker1 worker2 worker3 worker4 metrics-reader erkunder"
 
 # Server-2: service → container name (use _ not - for var names)
 SERVER2_SVC_nginx="wt-prod-lb"
@@ -805,6 +811,13 @@ deploy_one_service() {
     local build_list="$5"
 
     step "Phase 4: Deploy ${svc} (${container}) on ${host}"
+    if [[ "$svc" == erkunder-ausgang ]]; then
+        # Stop admission before replacing places; restart Leitstand last.
+        dry_rssh "$host" "cd ${REMOTE_REPO} && docker compose ${compose} stop erkunder" || {
+            error_ "Could not stop Erkunder admission before replacing places"
+            return 1
+        }
+    fi
 
     # One-time cleanup for the 2026-05 eco-* → wt-* container rename:
     # if a container with the legacy name still exists it will block the new
@@ -832,7 +845,7 @@ deploy_one_service() {
     # in phase_code_update, and after the `git reset --hard` in phase_rollback. That makes
     # the image label true by construction instead of by a variable someone must thread
     # through correctly.
-    if service_needs_build "$svc" "$build_list"; then
+    if [[ "$svc" != erkunder ]] && service_needs_build "$svc" "$build_list"; then
         info "Building ${svc}..."
         dry_rssh "$host" "cd ${REMOTE_REPO} && GIT_COMMIT=\$(git rev-parse HEAD) docker compose ${compose} build --no-cache ${svc} 2>&1" || {
             error_ "Build failed for ${svc} on ${host}"
@@ -862,7 +875,7 @@ deploy_one_service() {
 
     # Recreate — NEVER --remove-orphans
     info "Recreating ${svc}..."
-    dry_rssh "$host" "cd ${REMOTE_REPO} && docker compose ${compose} up -d --no-deps --force-recreate ${svc} 2>&1" || {
+    dry_rssh "$host" "cd ${REMOTE_REPO} && GIT_COMMIT=\$(git rev-parse HEAD) docker compose ${compose} up -d --no-deps --force-recreate ${svc} 2>&1" || {
         error_ "docker compose up failed for ${svc} on ${host}"
         return 1
     }
@@ -1398,6 +1411,16 @@ phase_rollback() {
     warn "Code reset to ${sha}"
 
     local failed=false
+    if [[ " ${services[*]} " == *" erkunder"* ]]; then
+        rssh "$host" "cd ${REMOTE_REPO} && docker compose ${compose} stop erkunder" || {
+            error_ "CRITICAL: cannot stop Erkunder admission for rollback"
+            return 2
+        }
+        rssh "$host" "cd ${REMOTE_REPO} && GIT_COMMIT=\$(git rev-parse HEAD) docker compose ${compose} build erkunder" || {
+            error_ "CRITICAL: rollback build failed for shared Erkunder image"
+            return 2
+        }
+    fi
     for svc in "${services[@]}"; do
         local container
         if [[ "$host" == "$HETZNER_HOST" ]]; then
@@ -1408,7 +1431,7 @@ phase_rollback() {
 
         warn "Rolling back ${svc} (${container})..."
 
-        if service_needs_build "$svc" "$build_list"; then
+        if [[ "$svc" != erkunder ]] && service_needs_build "$svc" "$build_list"; then
             # git reset --hard ran above, so HEAD on the host is the rollback SHA:
             # the rebuilt image gets labelled with the code it actually contains.
             rssh "$host" "cd ${REMOTE_REPO} && GIT_COMMIT=\$(git rev-parse HEAD) docker compose ${compose} build --no-cache ${svc} 2>&1" || {
@@ -1418,7 +1441,7 @@ phase_rollback() {
             }
         fi
 
-        rssh "$host" "cd ${REMOTE_REPO} && docker compose ${compose} up -d --no-deps --force-recreate ${svc} 2>&1" || {
+        rssh "$host" "cd ${REMOTE_REPO} && GIT_COMMIT=\$(git rev-parse HEAD) docker compose ${compose} up -d --no-deps --force-recreate ${svc} 2>&1" || {
             error_ "CRITICAL: rollback recreate failed for ${svc}"
             failed=true
             continue
@@ -1432,6 +1455,9 @@ phase_rollback() {
         while (( $(date +%s) < deadline )); do
             status=$(rssh "$host" \
                 "docker inspect --format '{{.State.Health.Status}}' '${container}' 2>/dev/null || echo 'none'")
+            if [[ "$svc" == erkunder* && "$status" == none ]]; then
+                status=$(erkunder_legacy_health "$host" "$svc" "$container")
+            fi
             [[ "$status" == "healthy" ]] && break
             sleep 5
         done
@@ -1874,13 +1900,30 @@ deploy_server() {
         return 1
     }
 
+    # Shared image is built once; routine unchanged Erkunder releases are skipped.
+    prepare_erkunder_deploy "$host" "$compose" || {
+        error_ "Erkunder preparation failed — reverting code to ${ROLLBACK_SHA}"
+        if [[ "$DRY_RUN" == false ]]; then
+            rssh "$host" "cd ${REMOTE_REPO} && git reset --hard '${ROLLBACK_SHA}'" || return 2
+        fi
+        return 1
+    }
+
     # === Phase 4: per-service deploy ===
     for svc in "${services_to_deploy[@]}"; do
         local container
         container=$(container_for_svc "$server_prefix" "$svc")
 
-        if deploy_one_service "$host" "$compose" "$svc" "$container" "$build_list"; then
+        # Include a failed recreation/healthcheck in rollback, too.
+        if [[ "$svc" == erkunder-ausgang ]]; then
+            local group=()
+            read -ra group <<< "$ERKUNDER_SERVICES"
+            DEPLOYED_SERVICES+=("${group[@]}")
+        elif [[ "$svc" != erkunder* ]]; then
             DEPLOYED_SERVICES+=("$svc")
+        fi
+        if deploy_one_service "$host" "$compose" "$svc" "$container" "$build_list"; then
+            :
         else
             error_ "Deploy failed for ${svc} — initiating rollback"
             if [[ ${#DEPLOYED_SERVICES[@]} -gt 0 ]]; then

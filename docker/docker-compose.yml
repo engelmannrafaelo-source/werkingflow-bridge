@@ -911,6 +911,12 @@ services:
       dockerfile: docker/Dockerfile.erkunder
       args:
         GIT_COMMIT: ${GIT_COMMIT:-unknown}
+    healthcheck:
+      test: ["CMD", "python", "-m", "src.erkunder.gesundheit", "leitstand"]
+      interval: 5s
+      timeout: 4s
+      retries: 3
+      start_period: 10s
     command: ["python", "-m", "src.erkunder.leitstand"]
     mem_limit: 1g
     memswap_limit: 1g
@@ -923,6 +929,12 @@ services:
 
   erkunder-platz-1:
     image: bridge-erkunder:${GIT_COMMIT:-dev}
+    healthcheck:
+      test: ["CMD", "python", "-m", "src.erkunder.gesundheit", "platz"]
+      interval: 5s
+      timeout: 4s
+      retries: 3
+      start_period: 10s
     command: ["python", "-m", "src.erkunder.platz"]
     # The protected server must be PID 1: an init would expose its environment.
     # It reaps step descendants after subprocess communication has settled.
@@ -949,6 +961,12 @@ services:
 
   erkunder-platz-2:
     image: bridge-erkunder:${GIT_COMMIT:-dev}
+    healthcheck:
+      test: ["CMD", "python", "-m", "src.erkunder.gesundheit", "platz"]
+      interval: 5s
+      timeout: 4s
+      retries: 3
+      start_period: 10s
     command: ["python", "-m", "src.erkunder.platz"]
     # See erkunder-platz-1: the protected server is also the orphan reaper.
     user: "1102:1100"
@@ -974,6 +992,12 @@ services:
 
   erkunder-platz-3:
     image: bridge-erkunder:${GIT_COMMIT:-dev}
+    healthcheck:
+      test: ["CMD", "python", "-m", "src.erkunder.gesundheit", "platz"]
+      interval: 5s
+      timeout: 4s
+      retries: 3
+      start_period: 10s
     command: ["python", "-m", "src.erkunder.platz"]
     # See erkunder-platz-1: the protected server is also the orphan reaper.
     user: "1103:1100"
@@ -999,6 +1023,12 @@ services:
 
   erkunder-ausgang:
     image: bridge-erkunder:${GIT_COMMIT:-dev}
+    healthcheck:
+      test: ["CMD", "python", "-m", "src.erkunder.gesundheit", "proxy"]
+      interval: 5s
+      timeout: 4s
+      retries: 3
+      start_period: 10s
     command: ["/usr/local/bin/erkunder-proxy"]
     networks: [erkunder-intern, bridge-net]
     read_only: true
