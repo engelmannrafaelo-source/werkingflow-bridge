@@ -872,6 +872,7 @@ async def test_startup_http_timeout_stays_alive_and_cleanup_recovers(
             headers={"X-Erkunder-Intern": "synthetic"},
         ) as api:
             assert (await api.get("/bereitschaft")).status_code == 503
+            assert (await api.get("/__bereitschaft__")).status_code == 503
             response = await api.post(
                 "/start", json=body().model_dump(mode="json", by_alias=True)
             )
@@ -880,6 +881,7 @@ async def test_startup_http_timeout_stays_alive_and_cleanup_recovers(
             response = await api.post("/aufraeumen/old-report")
             assert response.status_code == 200
             assert (await api.get("/bereitschaft")).json() == {"bereit": True}
+            assert (await api.get("/__bereitschaft__")).status_code == 404
             assert not (root / "old-report").exists()
 
 

@@ -32,7 +32,10 @@ Beim Start sperrt der Leitstand zuerst alle Altberichte. Er wartet dann insgesam
 höchstens 120 Sekunden auf bestätigte Bereinigung aller Plätze. Die Frist umfasst
 auch HTTP-Wartezeit; sie erlaubt verzögertes Compose-Starten, ohne unbegrenzt zu
 hängen. Danach bleibt der Prozess erreichbar, aber Vergaben und die authentisierte
-`GET /bereitschaft` liefern 503. Er stürzt dafür nicht ab und erzeugt keine
+`GET /bereitschaft` liefern 503. Während dieser Sperre antworten auch alle
+anderen authentisierten Wege außer Aufräumen mit 503; eine Probe über einen
+unbekannten Pfad kann damit nicht fälschlich Bereitschaft melden.
+Er stürzt dafür nicht ab und erzeugt keine
 Neustartschleife. Eine erfolgreiche Anfrage an `POST /aufraeumen/<id>` entfernt
 den angegebenen Altbericht und versucht die Initialisierung erneut, falls der
 Leitstand noch gesperrt ist. HTTP-Authentisierung: `X-Erkunder-Intern` aus der

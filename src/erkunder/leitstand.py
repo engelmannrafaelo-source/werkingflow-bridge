@@ -753,6 +753,14 @@ def create_app(coordinator: Coordinator | None = None) -> FastAPI:
             return JSONResponse(
                 status_code=error.status_code, content={"detail": error.detail}
             )
+        if not service.ready and not (
+            request.method == "POST" and request.url.path.startswith("/aufraeumen/")
+        ):
+            # Also keep authenticated missing-route probes (B1n) unhealthy.
+            return JSONResponse(
+                status_code=503,
+                content={"detail": "Leitstand wartet auf bereinigte Plaetze"},
+            )
         return await call_next(request)
 
     @app.exception_handler(RequestValidationError)
