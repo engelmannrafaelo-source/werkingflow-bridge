@@ -51,11 +51,45 @@ Freigeben der Annahme (`DELETE /deploy/pruefen`) bleiben laut; ein abgerissener
 Deploy nach erfolgreicher Sperre verlangt eine bewusste Freigabe oder Neustart.
 Alle Deploy-Routen verlangen den internen Schluessel.
 
-Ein Altimage ohne dieses Deploy-Protokoll wird bewusst abgewiesen: reine
-Dateizaehlung koennte einen neuen Bericht zwischen Pruefung und Stop uebersehen.
-Die erstmalige Einfuehrung des Protokolls braucht daher eine separat geplante,
-freigegebene Umstellung bei gesperrten Auftraggebern; dieser Deploy-Pfad hat
-keinen unsicheren Altimage-Bypass.
+### Einmalige Einfuehrung auf einem Altimage
+
+Fehlt das Protokoll nachweislich (`POST /deploy/pruefen` antwortet authentifiziert
+mit HTTP 404), verweigert der normale Deploy den Stop und nennt
+`ERKUNDER_DEPLOY_EINFUEHRUNG=1`. Die Probe wird samt Port aus der lokalen
+Wartungsfassung uebertragen und braucht kein neues Python-Modul im Altimage.
+Timeout, Transportfehler, andere HTTP-Status und ungueltige Antworten erlauben
+auch mit dem Schalter keine Einfuehrung.
+
+Die freigegebene Erstumstellung erfolgt in einem ruhigen Zeitfenster bei
+pausierten Auftraggebern und vollstaendig leerem `/arbeit`:
+
+```bash
+ERKUNDER_DEPLOY_EINFUEHRUNG=1 scripts/bridge-deploy.sh hetzner erkunder --dry-run
+# Erst nach Freigabe des echten Deploys, aus dem committeten Stand:
+ERKUNDER_DEPLOY_EINFUEHRUNG=1 scripts/bridge-deploy.sh hetzner erkunder
+```
+
+Der Schalter gilt nur fuer diesen Aufruf. Er funktioniert auch beim Gesamtdeploy
+und wird bei vorhandenem neuen Protokoll ignoriert: Dann gilt weiterhin die
+normale atomare Annahmesperre. Eine Dienstliste ohne Erkunder bleibt unberuehrt.
+
+Der Einfuehrungsweg prueft `/arbeit` vor dem Stop im alten Leitstand. Jeder
+Eintrag, auch ein abgeschlossener Bericht oder eine unbekannte/versteckte Datei,
+verhindert den Stop. Es wird nichts geloescht; vorhandene Berichte sind zuvor
+ueber den bestehenden Aufraeumweg zu behandeln. Nach erfolgreicher Vorpruefung
+stoppt das Werkzeug nur den Leitstand und prueft dasselbe Volume nochmals in
+einem netzlosen Hilfscontainer mit dem exakten alten Image und nur lesbaren
+Mounts. Erst bei erneut bestaetigtem Leerlauf folgt der normale Gruppen-Deploy.
+
+Scheitert der Stop oder die Nachpruefung (etwa durch einen inzwischen gestarteten
+Bericht), wird der alte Leitstand wieder gestartet und der Deploy laut
+abgebrochen. Auch ein fehlgeschlagener Wiederanlauf bleibt CRITICAL; es gibt
+keinen Gruppen-Rollout. Der Pfad protokolliert `ERKUNDER-EINFUEHRUNG`, den
+404-Grund und beide Leerlaufpruefungen. Er ersetzt keine atomare Annahmesperre:
+Auftraggeber waehrend der Umstellung pausiert halten. Bei einem Verbindungsabbruch
+nach dem Stop muss der Betriebszustand vor einem weiteren Versuch geprueft werden.
+Nach einem Rollback auf ein Altimage ist fuer einen erneuten Wechsel wieder
+dieser ausdrueckliche Einfuehrungsschritt erforderlich.
 
 Der Job-Executor parkt Transportfehler und HTTP 502/503/504 ueber den bestehenden
 Registry-Vertrag `DEPENDENCY_UNAVAILABLE_STATUS` (424). Der Watchdog uebernimmt
