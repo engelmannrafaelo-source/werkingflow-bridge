@@ -259,7 +259,12 @@ class Platz:
         except asyncio.CancelledError:
             reason = "cli_fehler: abgebrochen"
             raise
-        except Exception:
+        except Exception as error:
+            # Exception text/tracebacks can contain the request's OAuth token.
+            LOG.error(
+                "bericht_id=%s schritt=%s ausfuehrung=fehlgeschlagen fehler=%s",
+                body.bericht_id, body.schritt, type(error).__name__,
+            )
             reason = reason or "cli_fehler: Platz-Ausfuehrung"
         finally:
             # Fail closed even if another cancellation interrupts this finally.

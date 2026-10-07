@@ -107,10 +107,12 @@ def reap_adopted_children(watched_pid: int, proc: Path = Path("/proc")) -> None:
     for task in (proc / "self" / "task").iterdir():
         try:
             children = (task / "children").read_text().split()
+        except ProcessLookupError:
+            continue  # procfs reports ESRCH when the enumerated thread has exited.
         except FileNotFoundError as error:
             try:
                 task.stat()
-            except FileNotFoundError:
+            except (FileNotFoundError, ProcessLookupError):
                 continue  # A server thread exited during enumeration.
             raise RuntimeError(
                 f"Platz-Ernte fehlgeschlagen: {task / 'children'} fehlt; "

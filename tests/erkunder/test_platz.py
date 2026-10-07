@@ -462,6 +462,11 @@ async def test_cancel_during_communication_await(run_space, monkeypatch, double_
         with pytest.raises(asyncio.CancelledError):
             await service.task
     assert communication_task.cancelled()
+    # Double cancellation intentionally interrupts cleanup before process.wait().
+    # SIGKILL delivery and asyncio's child-watcher callback are asynchronous;
+    # cancellation of communicate() does not imply a settled returncode.
+    async with asyncio.timeout(3):
+        await service.process.wait()
     assert service.process.returncode == -signal.SIGKILL
     if double_cancel:
         assert service.cleanup_failed
@@ -511,3 +516,19 @@ async def test_ipc_cleanup_failure_blocks_next_report(run_space, monkeypatch):
     with pytest.raises(platz.HTTPException) as error:
         await service.start(request(folder))
     assert error.value.status_code == 503
+
+
+async def test_execution_error_logged_without_secret(run_space, caplog, monkeypatch):
+    folder, cgroup = run_space
+    service = Platz(folder.parent.parent, cgroup)
+
+    def broken_memory():
+        raise PermissionError("test-secret must not appear in logs")
+
+    monkeypatch.setattr(service, "memory", broken_memory)
+    await service.start(request(folder))
+    await service.task
+    assert "bericht_id=bericht-123 schritt=erkunder-1" in caplog.text
+    assert "ausfuehrung=fehlgeschlagen fehler=PermissionError" in caplog.text
+    assert "test-secret" not in caplog.text
+    assert service.states[("bericht-123", "erkunder-1")]["zustand"] == "abbruch"

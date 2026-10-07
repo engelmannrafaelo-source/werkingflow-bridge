@@ -113,3 +113,15 @@ def test_running_reap_tolerates_exited_thread(monkeypatch, pid_one, tmp_path):
     monkeypatch.setattr(aufraeumen.os, "waitpid", wait)
     aufraeumen.reap_adopted_children(41, tmp_path)
     wait.assert_not_called()
+
+
+@pytest.mark.parametrize("error", [ProcessLookupError, PermissionError, OSError])
+def test_running_reap_read_error(monkeypatch, pid_one, tmp_path, error):
+    task = tmp_path / "self/task/1"
+    task.mkdir(parents=True)
+    monkeypatch.setattr(type(tmp_path), "read_text", Mock(side_effect=error()))
+    if error is ProcessLookupError:
+        aufraeumen.reap_adopted_children(41, tmp_path)
+    else:
+        with pytest.raises(error):
+            aufraeumen.reap_adopted_children(41, tmp_path)
