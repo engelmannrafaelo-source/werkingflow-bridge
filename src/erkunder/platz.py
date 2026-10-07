@@ -68,6 +68,20 @@ def contains_secret(path: Path, token: bytes) -> bool:
     return any(value and value in data for value in variants)
 
 
+def child_failure_reason(output: bytes) -> str:
+    """Use the child's sanitized failure reason; never expose its raw stderr."""
+    try:
+        message = json.loads(output)
+    except (TypeError, ValueError):
+        return "cli_fehler: Kindprozess"
+    reason = message.get("fehler") if isinstance(message, dict) else None
+    if isinstance(reason, str) and re.fullmatch(
+        r"cli_fehler: SDK-Lauf: [A-Za-z][A-Za-z0-9_]*", reason
+    ):
+        return reason
+    return "cli_fehler: Kindprozess"
+
+
 class Platz:
     def __init__(
         self,
@@ -194,15 +208,15 @@ class Platz:
                 if done:
                     current, oom = self.memory()
                     peak = max(peak, current)
+                    stdout, _ = communication.result()
                     if oom > initial_oom:
                         reason = "speicher"
                     elif self.process.returncode != 0:
-                        reason = "cli_fehler: Kindprozess"
+                        reason = child_failure_reason(stdout)
                     else:
-                        stdout, _ = communication.result()
                         metrics = json.loads(stdout)
                         if metrics.get("fehler"):
-                            reason = "cli_fehler: SDK-Lauf"
+                            reason = child_failure_reason(stdout)
                     break
             self.kill()
             await stop_uid_processes()

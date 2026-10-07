@@ -114,6 +114,16 @@ async def test_missing_result(run_space):
 
 
 @pytest.mark.asyncio
+async def test_child_failure_reason_is_reported_in_step_status(run_space):
+    _, state = await execute(
+        run_space,
+        'print(json.dumps({"fehler": "cli_fehler: SDK-Lauf: MessageParseError"}))\n'
+        "sys.exit(1)\n",
+    )
+    assert state["meta"]["abbruch_grund"] == "cli_fehler: SDK-Lauf: MessageParseError"
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("name", ["ergebnis.md", "skripte/a.py"])
 async def test_secret_deleted(run_space, name):
     folder, _ = run_space

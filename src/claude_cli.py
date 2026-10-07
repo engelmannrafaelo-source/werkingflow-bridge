@@ -19,6 +19,7 @@ import shutil
 
 # File discovery for /sc:research
 from src.file_discovery import FileDiscoveryService, FileMetadata, SDKMessageParsingError, DirectoryScanError
+from src.sdk_parser import RateLimitEvent, install_resilient_parser
 
 logger = get_logger(__name__)
 
@@ -40,73 +41,8 @@ logger = get_logger(__name__)
 # 3. Only abort if the overall timeout is exceeded
 # =============================================================================
 
-# Sentinel class for rate_limit_event messages (SDK doesn't have a type for these)
-class RateLimitEvent:
-    """Parsed rate_limit_event from Claude Code CLI. Not an error — CLI is retrying."""
-    def __init__(self, data: dict):
-        self.type = "rate_limit_event"
-        self.retry_after = data.get("retry_after", None)
-        self.reset_at = data.get("reset_at", None)
-        self.message = data.get("message", "")
-        self.raw = data
-
-    def __repr__(self):
-        return f"RateLimitEvent(retry_after={self.retry_after}, message={self.message[:80]})"
-
 try:
-    import claude_code_sdk._internal.client as _sdk_client
-    from claude_code_sdk._internal.message_parser import parse_message as _original_parse_message
-
-    _SKIPPED_TYPES_LOG = set()  # Track which types we've logged (avoid spam)
-
-    def _resilient_parse_message(data):
-        """Wrapper that handles unknown message types instead of crashing."""
-        try:
-            parsed = _original_parse_message(data)
-            # Carry the CLI's structured assistant error (e.g.
-            # "oauth_org_not_allowed") that the SDK dataclass drops.
-            if (
-                parsed is not None
-                and isinstance(data, dict)
-                and data.get("type") == "assistant"
-                and data.get("error")
-            ):
-                try:
-                    setattr(parsed, "_bridge_cli_error", data.get("error"))
-                except Exception as attr_err:
-                    logger.error(f"could not tag assistant message with CLI error: {attr_err}")
-            return parsed
-        except MessageParseError as e:
-            error_msg = str(e).lower()
-            if "unknown message type" in error_msg:
-                msg_type = data.get("type", "unknown") if isinstance(data, dict) else "unknown"
-
-                # SPECIAL HANDLING: rate_limit_event — parse it, don't skip
-                if msg_type == "rate_limit_event":
-                    # Diagnostic: dump raw payload so we can verify whether
-                    # Anthropic is sending real throttle info (retry_after,
-                    # message, reset_at) or whether these are SDK-internal
-                    # heartbeats with empty payload.
-                    try:
-                        _keys = list(data.keys()) if isinstance(data, dict) else "non-dict"
-                        _raw_str = str(data)[:500]
-                        logger.info(
-                            f"⏳ rate_limit_event received — keys={_keys} raw={_raw_str}"
-                        )
-                    except Exception as _log_err:
-                        logger.info(
-                            f"⏳ rate_limit_event received (failed to dump raw: {_log_err})"
-                        )
-                    return RateLimitEvent(data)
-
-                # All other unknown types: skip silently
-                if msg_type not in _SKIPPED_TYPES_LOG:
-                    logger.info(f"ℹ️ Skipping unrecognized SDK message type: {msg_type}")
-                    _SKIPPED_TYPES_LOG.add(msg_type)
-                return None  # Skip this message, continue stream
-            raise  # Re-raise genuine parse errors
-
-    _sdk_client.parse_message = _resilient_parse_message
+    _resilient_parse_message = install_resilient_parser()
     logger.info("✅ SDK message parser patched (rate_limit_event aware)")
 except Exception as patch_err:
     logger.warning(f"⚠️ Could not patch SDK message parser: {patch_err}")

@@ -6,6 +6,8 @@ import sys
 from pathlib import Path
 from typing import Any
 
+from src.sdk_parser import install_resilient_parser
+
 ALLOWED_TOOLS = ["Bash", "Read", "Write", "Edit", "Glob", "Grep", "LS"]
 DISALLOWED_TOOLS = [
     "Task",
@@ -71,6 +73,7 @@ def sdk_options(body: dict[str, Any]) -> Any:
 async def run(body: dict[str, Any]) -> dict[str, Any]:
     from claude_code_sdk import ResultMessage, query
 
+    install_resilient_parser()
     result = None
     async for message in query(prompt=body["prompt"], options=sdk_options(body)):
         if isinstance(message, ResultMessage):
@@ -89,11 +92,16 @@ async def run(body: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def failure_reason(error: Exception) -> str:
+    """Return a status-safe reason without serializing SDK payloads or prompts."""
+    return f"cli_fehler: SDK-Lauf: {type(error).__name__}"
+
+
 if __name__ == "__main__":
     try:
         output = asyncio.run(run(json.load(sys.stdin)))
-    except Exception:
+    except Exception as error:
         # SDK exceptions can contain credentials/prompts: never serialize them.
-        print(json.dumps({"fehler": "cli_fehler: SDK-Lauf gescheitert"}))
+        print(json.dumps({"fehler": failure_reason(error)}))
         sys.exit(1)
     print(json.dumps(output))
