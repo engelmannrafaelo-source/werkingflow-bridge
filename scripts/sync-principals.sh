@@ -31,6 +31,12 @@ HOSTS=("49.12.72.66" "178.104.178.79")
 PG_CONTAINER="bridge-postgres-prod"
 SSH_OPTS="-o StrictHostKeyChecking=no -o ConnectTimeout=15"
 DRY_RUN="${DRY_RUN:-false}"
+# Dev-only principals: never copied off the dev host, see principals-dev-only.txt.
+DEV_HOST="49.12.72.66"
+DEV_ONLY_FILE="${DEV_ONLY_FILE:-$(dirname "${BASH_SOURCE[0]}")/principals-dev-only.txt}"
+[[ -f "$DEV_ONLY_FILE" ]] || { echo "ERROR: dev-only list missing: $DEV_ONLY_FILE" >&2; exit 2; }
+DEV_ONLY=$(sed -e 's/#.*//' -e 's/[[:space:]]//g' "$DEV_ONLY_FILE" | grep -v '^$' || true)
+is_dev_only() { grep -qxF "$1" <<< "$DEV_ONLY"; }
 
 psql_on() { # host, sql-on-stdin
   sudo -n ssh $SSH_OPTS "root@${1}" \
@@ -78,7 +84,15 @@ for h in "${HOSTS[@]}"; do
   stmt="BEGIN;"
   n=0
   for name in "${!UNION[@]}"; do
+    if [[ "$h" != "$DEV_HOST" ]] && is_dev_only "$name" && grep -qxF "$name" <<< "${ALLNAMES[$h]}"; then
+      echo "❌ dev-only principal '${name}' EXISTS on ${h} — must not exist off the dev bridge (principals-dev-only.txt; e-pva-erkunder-prodort). Deactivate it there deliberately." >&2
+      continue
+    fi
     grep -qxF "$name" <<< "${ALLNAMES[$h]}" && continue
+    if [[ "$h" != "$DEV_HOST" ]] && is_dev_only "$name"; then
+      echo "⚠️  SKIPPED dev-only principal '${name}' for ${h}: not copied off the dev bridge (principals-dev-only.txt; Prod-Ort offen bei Rafael, e-pva-erkunder-prodort)." >&2
+      continue
+    fi
     IFS=$'\t' read -r _ hash prefix apps paths cap <<< "${UNION[$name]}"
     stmt+="
 INSERT INTO service_principals (name, token_hash, token_prefix, allowed_apps, allowed_paths, monthly_cap_eur, active)

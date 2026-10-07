@@ -2001,7 +2001,10 @@ sync_principals="$(dirname "${BASH_SOURCE[0]}")/sync-principals.sh"
 if [[ -f "$sync_principals" ]]; then
     step "Phase 3.6: principal union sync"
     if sync_out=$(DRY_RUN="$DRY_RUN" bash "$sync_principals" 2>&1); then
-        while IFS= read -r line; do info "$line"; done <<< "$sync_out"
+        # Dev-only skips (principals-dev-only.txt) are a standing exception — WARN, not INFO.
+        while IFS= read -r line; do
+            if [[ "$line" == *"SKIPPED dev-only"* || "$line" == *"dev-only principal"*EXISTS* ]]; then warn "$line"; else info "$line"; fi
+        done <<< "$sync_out"
     else
         warn "Principal sync did not converge (conflict or query error) — reconcile deliberately:"
         while IFS= read -r line; do warn "  ${line}"; done <<< "$sync_out"
@@ -2012,7 +2015,9 @@ fi
 drift_check="$(dirname "${BASH_SOURCE[0]}")/check-principal-drift.sh"
 if [[ -x "$drift_check" || -f "$drift_check" ]]; then
     if drift_out=$(bash "$drift_check" 2>&1); then
-        info "Principal parity: ${drift_out}"
+        while IFS= read -r line; do
+            if [[ "$line" == NOTE:\ dev-only* ]]; then warn "$line"; else info "Principal parity: ${line}"; fi
+        done <<< "$drift_out"
     else
         warn "════════════════════════════════════════════════════════════════"
         warn "SERVICE-PRINCIPAL DRIFT between bridge hosts (see below)."

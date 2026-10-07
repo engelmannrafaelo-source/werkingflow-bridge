@@ -1,0 +1,17 @@
+# principals-dev-only.txt — service principals that live ONLY on the dev bridge
+# (hetzner, 49.12.72.66) and must never be copied to any other bridge host.
+#
+# Read by sync-principals.sh (bridge-deploy.sh Phase 3.6) and by
+# check-principal-drift.sh. The union rule (Rafael 2026-07-07: every host
+# recognizes every principal) deliberately does NOT apply to these names:
+# sync skips them for every non-dev host and says so loudly on every run; the
+# drift check leaves them out of the comparison and names them instead.
+#
+# One name per line; text after '#' is a comment. Remove a name only together
+# with the decision that lifts the reason given next to it.
+
+# Energy-Erkunder (Bridge-Erkunder, HM-B5 07.10.2026). Its key may start
+# erkunder jobs; only the dev bridge runs the erkunder containers. Where the
+# erkunder run in production is Rafael's open question e-pva-erkunder-prodort
+# (Bauplan Erkunder v2, R12). Until he decides, the key stays off prod.
+energy-erkunder-dev
