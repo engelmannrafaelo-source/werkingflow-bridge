@@ -475,6 +475,7 @@ class Coordinator:
         texts: dict[str, str] = {}
         scripts: dict[str, dict[str, str]] = {}
         shortened: list[str] = []
+        skipped: list[str] = []
         for item in state["schritte"]:
             name = item["name"]
             if item["status"] != "ok":
@@ -489,7 +490,15 @@ class Coordinator:
                 try:
                     data = read_bytes(file, limit=budget)
                 except (OSError, ValueError) as error:
-                    raise HTTPException(409, "Ungueltige Skriptdatei") from error
+                    relative = str(file.relative_to(directory))
+                    skipped.append(relative)
+                    LOG.warning(
+                        "bericht_id=%s schritt=%s skript=uebersprungen fehler=%s",
+                        ident,
+                        name,
+                        type(error).__name__,
+                    )
+                    continue
                 if len(data) > budget:
                     if name not in shortened:
                         shortened.append(name)
@@ -505,6 +514,7 @@ class Coordinator:
             "texte": texts,
             "skripte": scripts,
             "skripte_gekuerzt": shortened,
+            "skripte_uebersprungen": skipped,
             "gutachten_final": texts["harmonisierung" + suffix],
             "pruefung_final": texts["pruefung" + suffix],
         }
@@ -513,6 +523,7 @@ class Coordinator:
         async with self.lock:
             path = self.directory(ident)
             state = self.states.get(ident)
+            abort_errors: list[dict[str, Any]] = []
             task = self.tasks.pop(ident, None)
             if task:
                 task.cancel()
@@ -521,11 +532,22 @@ class Coordinator:
                 slots = {a["slot"] for a in state["active"].values()}
                 slots.update(state.get("unsichere_plaetze", []))
                 for slot in slots:
-                    response = await self.client.post(
-                        self.places[slot] + "/abbrechen",
-                        headers=self.headers(),
-                    )
-                    response.raise_for_status()
+                    try:
+                        response = await self.client.post(
+                            self.places[slot] + "/abbrechen",
+                            headers=self.headers(),
+                        )
+                        response.raise_for_status()
+                    except httpx.HTTPError as error:
+                        abort_errors.append(
+                            {"platz": slot, "fehler": type(error).__name__}
+                        )
+                        LOG.error(
+                            "bericht_id=%s platz=%s abbrechen=fehlgeschlagen fehler=%s",
+                            ident,
+                            slot,
+                            type(error).__name__,
+                        )
             size = None
             try:
                 size = (
@@ -549,7 +571,11 @@ class Coordinator:
             self.tokens.pop(ident, None)
             self.token_ready.pop(ident, None)
             LOG.info("bericht_id=%s geloescht_bytes=%s", ident, size)
-            return {"bericht_id": ident, "geloescht_bytes": size}
+            return {
+                "bericht_id": ident,
+                "geloescht_bytes": size,
+                "platz_abbruch_fehler": abort_errors,
+            }
 
 
 def create_app(coordinator: Coordinator | None = None) -> FastAPI:

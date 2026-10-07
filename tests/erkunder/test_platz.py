@@ -270,10 +270,12 @@ async def test_cleanup_failure_blocks_reuse(run_space, monkeypatch, caplog):
     assert state["fehler"] == "cli_fehler: Platz-Aufraeumen"
     assert "OSError" in caplog.text
     assert "customer data" not in caplog.text
-    with pytest.raises(platz.HTTPException):
+    with pytest.raises(platz.HTTPException) as start_error:
         await service.start(request(run_space[0]))
-    with pytest.raises(platz.HTTPException):
+    assert start_error.value.status_code == 503
+    with pytest.raises(platz.HTTPException) as abort_error:
         await service.abort()
+    assert abort_error.value.status_code == 503
 
 
 @pytest.mark.parametrize("kind", ["fifo", "large"])

@@ -367,7 +367,7 @@ async def test_lost_place_stopped_before_retry(tmp_path):
         await service.shutdown()
 
 
-async def test_reaper_retries_unreachable_place(tmp_path):
+async def test_reaper_deletes_report_after_unreachable_place(tmp_path, caplog):
     service, _, _ = await setup(tmp_path)
     try:
         await finish(service)
@@ -386,9 +386,9 @@ async def test_reaper_retries_unreachable_place(tmp_path):
         await service.client.aclose()
         service.client = httpx.AsyncClient(transport=httpx.MockTransport(transport))
         await service.reap()
-        assert "bericht-123" in service.states
-        await service.reap()
         assert "bericht-123" not in service.states
+        assert calls == 1
+        assert "abbrechen=fehlgeschlagen fehler=ConnectError" in caplog.text
     finally:
         await service.shutdown()
 
@@ -420,8 +420,7 @@ async def test_signed_download_url_not_logged(tmp_path, caplog):
 
 
 @pytest.mark.parametrize("kind", ["symlink", "fifo", "large"])
-@pytest.mark.parametrize("target", ["ergebnis.md", "skripte/a.py"])
-async def test_result_rejects_untrusted_files(tmp_path, kind, target):
+async def test_result_rejects_untrusted_result_files(tmp_path, kind):
     import os
 
     from src.erkunder.dateien import MAX_FILE_BYTES
@@ -430,8 +429,7 @@ async def test_result_rejects_untrusted_files(tmp_path, kind, target):
     service, _, _ = await setup(tmp_path)
     try:
         await finish(service)
-        path = service.directory("bericht-123") / "erkunder-1" / target
-        path.parent.mkdir(exist_ok=True)
+        path = service.directory("bericht-123") / "erkunder-1" / "ergebnis.md"
         path.unlink(missing_ok=True)
         outside = tmp_path / "other-report"
         outside.write_text("private")
@@ -445,6 +443,63 @@ async def test_result_rejects_untrusted_files(tmp_path, kind, target):
         with pytest.raises((StepFailed, HTTPException)):
             service.result("bericht-123")
         assert outside.read_text() == "private"
+    finally:
+        await service.shutdown()
+
+
+@pytest.mark.parametrize("kind", ["directory", "fifo"])
+async def test_result_skips_untrusted_script_files(tmp_path, kind, caplog):
+    import os
+
+    service, _, _ = await setup(tmp_path)
+    try:
+        await finish(service)
+        path = service.directory("bericht-123") / "erkunder-1" / "skripte" / "x.py"
+        path.parent.mkdir(exist_ok=True)
+        if kind == "directory":
+            path.mkdir()
+        else:
+            os.mkfifo(path)
+
+        result = service.result("bericht-123")
+
+        assert result["skripte_uebersprungen"] == ["skripte/x.py"]
+        assert "skript=uebersprungen fehler=" in caplog.text
+    finally:
+        await service.shutdown()
+
+
+@pytest.mark.parametrize("failure", ["503", "unreachable", "timeout"])
+async def test_cleanup_deletes_report_after_place_abort_failure(
+    tmp_path, failure, caplog
+):
+    service, places, _ = await setup(tmp_path)
+    try:
+        await finish(service)
+        service.states["bericht-123"]["unsichere_plaetze"] = [0]
+
+        async def abort_failure(request):
+            if request.url.path == "/abbrechen":
+                if failure == "503":
+                    return httpx.Response(503, json={"detail": "cleanup failed"})
+                if failure == "unreachable":
+                    raise httpx.ConnectError("offline", request=request)
+                raise httpx.ReadTimeout("timed out", request=request)
+            return await places(request)
+
+        await service.client.aclose()
+        service.client = httpx.AsyncClient(transport=httpx.MockTransport(abort_failure))
+        result = await service.cleanup("bericht-123")
+
+        assert result["bericht_id"] == "bericht-123"
+        assert not service.directory("bericht-123").exists()
+        expected = {
+            "503": "HTTPStatusError",
+            "unreachable": "ConnectError",
+            "timeout": "ReadTimeout",
+        }[failure]
+        assert result["platz_abbruch_fehler"] == [{"platz": 0, "fehler": expected}]
+        assert f"abbrechen=fehlgeschlagen fehler={expected}" in caplog.text
     finally:
         await service.shutdown()
 
