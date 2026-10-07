@@ -21,7 +21,12 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field, SecretStr
 
-from src.erkunder.aufraeumen import clear_owned_tmp, reap_children, stop_uid_processes
+from src.erkunder.aufraeumen import (
+    clear_owned_tmp,
+    reap_adopted_children,
+    reap_children,
+    stop_uid_processes,
+)
 from src.erkunder.dateien import read_bytes, read_text
 from src.erkunder.prozessschutz import protect_process
 
@@ -190,6 +195,7 @@ class Platz:
                 self.process.communicate(json.dumps(payload).encode())
             )
             while True:
+                reap_adopted_children(self.process.pid)
                 current, oom = self.memory()
                 peak = max(peak, current)
                 if oom > initial_oom:
@@ -203,7 +209,9 @@ class Platz:
                     reason = "zeit"
                     break
                 done, _ = await asyncio.wait(
-                    [communication], timeout=min(self.sample_s, remaining)
+                    [communication],
+                    # Reap during long steps, before the PID budget is exhausted.
+                    timeout=min(self.sample_s, remaining, 0.01),
                 )
                 if done:
                     current, oom = self.memory()
@@ -252,6 +260,9 @@ class Platz:
         except Exception:
             reason = reason or "cli_fehler: Platz-Ausfuehrung"
         finally:
+            # Fail closed even if another cancellation interrupts this finally.
+            self.cleanup_failed = True
+            cleanup_cancelled = False
             try:
                 self.kill()
                 await stop_uid_processes()
@@ -272,7 +283,9 @@ class Platz:
                     home.unlink()
                 elif home.exists():
                     shutil.rmtree(home)
-            except Exception as error:
+                self.cleanup_failed = False
+            except (Exception, asyncio.CancelledError) as error:
+                cleanup_cancelled = isinstance(error, asyncio.CancelledError)
                 self.cleanup_failed = True
                 reason = "cli_fehler: Platz-Aufraeumen"
                 LOG.error(
@@ -303,6 +316,8 @@ class Platz:
                 "meta": meta,
                 "fehler": reason,
             }
+            if cleanup_cancelled:
+                raise asyncio.CancelledError
 
 
 def create_app(platz: Platz | None = None) -> FastAPI:

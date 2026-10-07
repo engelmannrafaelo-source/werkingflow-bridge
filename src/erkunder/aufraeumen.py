@@ -79,3 +79,28 @@ async def reap_children() -> None:
         # SIGKILL/reparenting can still be in flight after the /proc scan.
         await asyncio.sleep(0.01)
     raise RuntimeError("Platz hat nach SIGKILL noch nicht erntbare Kinder")
+
+
+def reap_adopted_children(watched_pid: int, proc: Path = Path("/proc")) -> None:
+    """Drain PID 1's adoptees without consuming asyncio's child's status.
+
+    Platz starts exactly one watched subprocess at a time. Its PID is excluded
+    even after exit; only specific other direct children are waited for. No
+    global wait/SIGCHLD handler races the PidfdChildWatcher. Enumerate every
+    server thread because Linux exposes children per task, not per process.
+    """
+    if os.getpid() != 1:
+        return
+    for task in (proc / "self" / "task").iterdir():
+        try:
+            children = (task / "children").read_text().split()
+        except FileNotFoundError:
+            continue  # A server thread exited during enumeration.
+        for child in children:
+            pid = int(child)
+            if pid == watched_pid:
+                continue
+            try:
+                os.waitpid(pid, os.WNOHANG)
+            except ChildProcessError:
+                continue  # No longer our child; never wait for a replacement.

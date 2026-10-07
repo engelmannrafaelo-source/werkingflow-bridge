@@ -45,3 +45,35 @@ async def test_reap_unexpected_os_error_is_not_hidden(monkeypatch, pid_one):
     monkeypatch.setattr(aufraeumen.os, "waitpid", Mock(side_effect=PermissionError()))
     with pytest.raises(PermissionError):
         await aufraeumen.reap_children()
+
+
+def test_running_reap_excludes_watcher_and_drains_thread_adoptees(
+    monkeypatch, pid_one, tmp_path
+):
+    tasks = tmp_path / "self/task"
+    for tid, children in [("1", "41 42"), ("9", "43 44")]:
+        thread = tasks / tid
+        thread.mkdir(parents=True)
+        (thread / "children").write_text(children)
+    wait = Mock(side_effect=[(42, 0), (0, 0), ChildProcessError()])
+    monkeypatch.setattr(aufraeumen.os, "waitpid", wait)
+    aufraeumen.reap_adopted_children(41, tmp_path)
+    assert {call.args[0] for call in wait.call_args_list} == {42, 43, 44}
+    assert all(call.args[1] == aufraeumen.os.WNOHANG for call in wait.call_args_list)
+
+
+def test_running_reap_is_disabled_on_host(monkeypatch, tmp_path):
+    monkeypatch.setattr(aufraeumen.os, "getpid", lambda: 100)
+    wait = Mock(side_effect=AssertionError("unrelated child"))
+    monkeypatch.setattr(aufraeumen.os, "waitpid", wait)
+    aufraeumen.reap_adopted_children(41, tmp_path)
+    wait.assert_not_called()
+
+
+def test_running_reap_fails_loud(monkeypatch, pid_one, tmp_path):
+    task = tmp_path / "self/task/1"
+    task.mkdir(parents=True)
+    (task / "children").write_text("42")
+    monkeypatch.setattr(aufraeumen.os, "waitpid", Mock(side_effect=PermissionError()))
+    with pytest.raises(PermissionError):
+        aufraeumen.reap_adopted_children(41, tmp_path)

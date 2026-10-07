@@ -412,3 +412,65 @@ async def test_reaping_follows_subprocess_communication(run_space, monkeypatch, 
         await service.task
     assert reaped
     assert not service.cleanup_failed
+
+
+@pytest.mark.parametrize("double_cancel", [False, True])
+async def test_cancel_during_communication_await(run_space, monkeypatch, double_cancel):
+    folder, cgroup = run_space
+    service = Platz(
+        folder.parent.parent, cgroup,
+        [sys.executable, "-c", "import sys,time; sys.stdin.read(); time.sleep(60)"],
+        0.01,
+    )
+    communication_task = None
+    original_communicate = asyncio.subprocess.Process.communicate
+    original_stop = platz.stop_uid_processes
+    cleanup_entered = asyncio.Event()
+    stopped = asyncio.Event()
+    calls = 0
+
+    async def communicate(process, *args):
+        nonlocal communication_task
+        communication_task = asyncio.current_task()
+        result = await original_communicate(process, *args)
+        await asyncio.Event().wait()  # Hold pipe completion beyond timeout cleanup.
+        return result
+
+    async def stop():
+        nonlocal calls
+        calls += 1
+        await original_stop()
+        if calls == 1:
+            stopped.set()
+        elif double_cancel:
+            cleanup_entered.set()
+            await asyncio.Event().wait()
+
+    monkeypatch.setattr(asyncio.subprocess.Process, "communicate", communicate)
+    monkeypatch.setattr(platz, "stop_uid_processes", stop)
+    await service.start(request(folder, timeout_s=0.1))
+    async with asyncio.timeout(3):
+        await stopped.wait()
+        # Specifically await communication, not asyncio.wait's monitoring future.
+        while service.task._fut_waiter is not communication_task:
+            await asyncio.sleep(0)
+        service.task.cancel()
+        if double_cancel:
+            await cleanup_entered.wait()
+            service.task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await service.task
+    assert communication_task.cancelled()
+    assert service.process.returncode == -signal.SIGKILL
+    if double_cancel:
+        assert service.cleanup_failed
+        state = service.states[("bericht-123", "erkunder-1")]
+        assert state["zustand"] == "abbruch"
+        assert state["fehler"] == "cli_fehler: Platz-Aufraeumen"
+        with pytest.raises(platz.HTTPException) as error:
+            await service.start(request(folder))
+        assert error.value.status_code == 503
+    else:
+        assert not service.cleanup_failed
+        assert service.states[("bericht-123", "erkunder-1")]["zustand"] == "abbruch"
+        assert not (folder / ".home").exists()
