@@ -33,7 +33,8 @@ def test_compose_yaml_and_internal_network():
     assert config["networks"]["erkunder-intern"]["internal"] is True
     assert "erkunder-arbeit" in config["volumes"]
     assert config["services"]["erkunder"]["networks"] == [
-        "bridge-net", "erkunder-intern"
+        "bridge-net",
+        "erkunder-intern",
     ]
 
 
@@ -56,10 +57,14 @@ def test_places_are_isolated(number):
     assert environment["HTTPS_PROXY"] == "http://erkunder-ausgang:8888"
     assert environment["HTTP_PROXY"] == environment["HTTPS_PROXY"]
     assert environment["NO_PROXY"] == "erkunder"
+    assert environment["ERKUNDER_INTERNAL_TOKEN"] == "${ERKUNDER_INTERNAL_TOKEN:-}"
     assert environment["CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"] == "1"
     assert set(environment) == {
-        "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY",
-        "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "ERKUNDER_INTERNAL_TOKEN",
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "NO_PROXY",
+        "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC",
+        "ERKUNDER_INTERNAL_TOKEN",
     }
 
 
@@ -70,7 +75,11 @@ def test_controller_receives_only_internal_secret():
     assert "ports" not in service
     assert service["volumes"] == ["erkunder-arbeit:/arbeit"]
     assert set(service["environment"]) == {"ERKUNDER_INTERNAL_TOKEN"}
-    assert ":?" in service["environment"]["ERKUNDER_INTERNAL_TOKEN"]
+    assert (
+        service["environment"]["ERKUNDER_INTERNAL_TOKEN"]
+        == "${ERKUNDER_INTERNAL_TOKEN:-}"
+    )
+    assert service["mem_limit"] == service["memswap_limit"] == "1g"
 
 
 @pytest.mark.parametrize("number", [1, 2, 3, 4])

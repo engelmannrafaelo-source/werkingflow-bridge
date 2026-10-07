@@ -1,9 +1,13 @@
 """One isolated child process at a time, with process-group and cgroup supervision."""
 
 import asyncio
+import base64
 import hmac
 import json
+import logging
 import os
+import re
+import shutil
 import signal
 import sys
 import time
@@ -11,12 +15,17 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote_from_bytes
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field, SecretStr
 
+from src.erkunder.aufraeumen import clear_owned_tmp, stop_uid_processes
+from src.erkunder.dateien import read_bytes, read_text
 from src.erkunder.prozessschutz import protect_process
+
+LOG = logging.getLogger(__name__)
 
 
 class Schritt(BaseModel):
@@ -36,22 +45,27 @@ class Schritt(BaseModel):
 
 
 def has_content(path: Path) -> bool:
-    with path.open(encoding="utf-8") as source:
-        while chunk := source.read(64 * 1024):
-            if chunk.strip():
-                return True
-    return False
+    return bool(read_text(path).strip())
 
 
 def contains_secret(path: Path, token: bytes) -> bool:
-    overlap = b""
-    with path.open("rb") as source:
-        while chunk := source.read(64 * 1024):
-            data = overlap + chunk
-            if token in data:
-                return True
-            overlap = data[-(len(token) - 1) :] if len(token) > 1 else b""
-    return False
+    variants = {token, token[::-1], token.hex().encode(), token.hex().upper().encode()}
+    quoted = quote_from_bytes(token, safe="").encode()
+    variants.update((quoted, re.sub(rb"%[0-9A-F]{2}", lambda m: m[0].lower(), quoted)))
+    variants.update(
+        "".join(f"%{byte:02{case}}" for byte in token).encode() for case in ("x", "X")
+    )
+    # Whole-token base64 also embedded in a longer encoded value: all alignments.
+    for offset in range(3):
+        for encode in (base64.b64encode, base64.urlsafe_b64encode):
+            encoded = encode(b"\0" * offset + token)
+            variants.add(
+                encoded[(offset * 8 + 5) // 6 : (offset + len(token)) * 8 // 6]
+            )
+    # Recognize substantial fragments without relying on the common token prefix.
+    variants.update(token[i : i + 16] for i in range(max(0, len(token) - 15)))
+    data = read_bytes(path)
+    return any(value and value in data for value in variants)
 
 
 class Platz:
@@ -71,6 +85,7 @@ class Platz:
         self.states: dict[tuple[str, str], dict[str, Any]] = {}
         self.lock = asyncio.Lock()
         self.cancelled = False
+        self.cleanup_failed = False
 
     def memory(self) -> tuple[int, int]:
         current = int((self.cgroup / "memory.current").read_text())
@@ -96,6 +111,8 @@ class Platz:
                 raise HTTPException(400, "ungueltiger Schrittordner")
             if expected.resolve() != expected:
                 raise HTTPException(400, "Schrittordner ist ein Symlink")
+            if self.cleanup_failed:
+                raise HTTPException(503, "Platz-Aufraeumen fehlgeschlagen")
             self.cancelled = False
             self.states[(body.bericht_id, body.schritt)] = {"zustand": "laeuft"}
             self.task = asyncio.create_task(self.run(body))
@@ -108,6 +125,8 @@ class Platz:
             self.kill()
             assert self.task is not None
             await self.task
+        if self.cleanup_failed:
+            raise HTTPException(503, "Platz-Aufraeumen fehlgeschlagen")
         return {"abgebrochen": active}
 
     async def run(self, body: Schritt) -> None:
@@ -121,6 +140,8 @@ class Platz:
             peak, initial_oom = self.memory()
             if self.cancelled:
                 raise RuntimeError("abgebrochen")
+            temporary = Path(body.ordner) / ".home" / "tmp"
+            temporary.mkdir(parents=True, exist_ok=True)
             self.process = await asyncio.create_subprocess_exec(
                 *self.command,
                 stdin=asyncio.subprocess.PIPE,
@@ -128,22 +149,25 @@ class Platz:
                 stderr=asyncio.subprocess.DEVNULL,
                 start_new_session=True,
                 env={
-                    key: value
-                    for key, value in os.environ.items()
-                    if key
-                    in {
-                        "PATH",
-                        "LANG",
-                        "LC_ALL",
-                        "PYTHONPATH",
-                        "HTTPS_PROXY",
-                        "HTTP_PROXY",
-                        "NO_PROXY",
-                        "https_proxy",
-                        "http_proxy",
-                        "no_proxy",
-                        "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC",
-                    }
+                    "TMPDIR": str(temporary),
+                    **{
+                        key: value
+                        for key, value in os.environ.items()
+                        if key
+                        in {
+                            "PATH",
+                            "LANG",
+                            "LC_ALL",
+                            "PYTHONPATH",
+                            "HTTPS_PROXY",
+                            "HTTP_PROXY",
+                            "NO_PROXY",
+                            "https_proxy",
+                            "http_proxy",
+                            "no_proxy",
+                            "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC",
+                        }
+                    },
                 },
             )
             payload = body.model_dump()
@@ -181,6 +205,7 @@ class Platz:
                             reason = "cli_fehler: SDK-Lauf"
                     break
             self.kill()
+            await stop_uid_processes()
             await communication
             folder = Path(body.ordner)
             result = folder / (
@@ -198,17 +223,45 @@ class Platz:
                 if candidate.is_symlink():
                     candidate.unlink()
                     reason = "cli_fehler: Ergebnis-Symlink"
-                elif candidate.is_file() and contains_secret(candidate, token):
-                    candidate.unlink()
-                    reason = "geheimnis_im_ergebnis"
+                elif candidate.exists():
+                    try:
+                        if contains_secret(candidate, token):
+                            candidate.unlink()
+                            reason = "geheimnis_im_ergebnis"
+                    except (OSError, ValueError):
+                        reason = reason or "cli_fehler: ergebnis-pfad oder groesse"
             if reason is None and (not result.is_file() or not has_content(result)):
                 reason = "cli_fehler: kein ergebnis"
+        except asyncio.CancelledError:
+            reason = "cli_fehler: abgebrochen"
+            raise
         except Exception:
             reason = reason or "cli_fehler: Platz-Ausfuehrung"
         finally:
-            self.kill()
+            try:
+                self.kill()
+                await stop_uid_processes()
+                clear_owned_tmp()
+                home = Path(body.ordner) / ".home"
+                if home.is_symlink():
+                    home.unlink()
+                elif home.exists():
+                    shutil.rmtree(home)
+            except Exception as error:
+                self.cleanup_failed = True
+                reason = "cli_fehler: Platz-Aufraeumen"
+                LOG.error(
+                    "bericht_id=%s schritt=%s aufraeumen=fehlgeschlagen fehler=%s",
+                    body.bericht_id,
+                    body.schritt,
+                    type(error).__name__,
+                )
             if communication:
-                await communication
+                if self.cleanup_failed:
+                    communication.cancel()
+                settled = await asyncio.gather(communication, return_exceptions=True)
+                if isinstance(settled[0], BaseException):
+                    reason = reason or "cli_fehler: Kindkommunikation"
             elif self.process:
                 await self.process.wait()
             meta = {

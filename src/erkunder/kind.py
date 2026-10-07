@@ -48,6 +48,7 @@ def sdk_options(body: dict[str, Any]) -> Any:
 
     home = str(Path(body["ordner"]) / ".home")
     Path(home, "mpl").mkdir(parents=True, exist_ok=True)
+    Path(home, "tmp").mkdir(parents=True, exist_ok=True)
     return ClaudeCodeOptions(
         model="claude-sonnet-5-5",
         cwd=body["ordner"],
@@ -59,6 +60,7 @@ def sdk_options(body: dict[str, Any]) -> Any:
         extra_args={"settings": "/etc/erkunder/settings.json"},
         env={
             "HOME": home,
+            "TMPDIR": f"{home}/tmp",
             "CLAUDE_CODE_OAUTH_TOKEN": body["claude_token"],
             "MPLCONFIGDIR": f"{home}/mpl",
             "PATH": "/opt/rechnen/bin:/usr/local/bin:/usr/bin:/bin",

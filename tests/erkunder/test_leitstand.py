@@ -417,3 +417,142 @@ async def test_signed_download_url_not_logged(tmp_path, caplog):
         assert "download.test" not in caplog.text
     finally:
         await service.shutdown()
+
+
+@pytest.mark.parametrize("kind", ["symlink", "fifo", "large"])
+@pytest.mark.parametrize("target", ["ergebnis.md", "skripte/a.py"])
+async def test_result_rejects_untrusted_files(tmp_path, kind, target):
+    import os
+
+    from src.erkunder.dateien import MAX_FILE_BYTES
+    from src.erkunder.leitstand import StepFailed
+
+    service, _, _ = await setup(tmp_path)
+    try:
+        await finish(service)
+        path = service.directory("bericht-123") / "erkunder-1" / target
+        path.parent.mkdir(exist_ok=True)
+        path.unlink(missing_ok=True)
+        outside = tmp_path / "other-report"
+        outside.write_text("private")
+        if kind == "symlink":
+            path.symlink_to(outside)
+        elif kind == "fifo":
+            os.mkfifo(path)
+        else:
+            with path.open("wb") as stream:
+                stream.truncate(MAX_FILE_BYTES + 1)
+        with pytest.raises((StepFailed, HTTPException)):
+            service.result("bericht-123")
+        assert outside.read_text() == "private"
+    finally:
+        await service.shutdown()
+
+
+async def test_size_failure_does_not_prevent_deletion(tmp_path, monkeypatch, caplog):
+    service, _, _ = await setup(tmp_path)
+    try:
+        await finish(service)
+
+        def fail(*args):
+            raise OSError("private contents")
+
+        monkeypatch.setattr(Path, "rglob", fail)
+        result = await service.cleanup("bericht-123")
+        assert result["geloescht_bytes"] is None
+        assert not service.directory("bericht-123").exists()
+        assert "groesse=unbekannt fehler=OSError" in caplog.text
+        assert "private contents" not in caplog.text
+    finally:
+        await service.shutdown()
+
+
+async def test_reaper_continues_after_report_error(tmp_path, monkeypatch, caplog):
+    service, _, _ = await setup(tmp_path)
+    try:
+        for ident in ("bericht-123", "bericht-456"):
+            await finish(service, body(ident))
+            service.states[ident]["aktivitaet"] = time.time() - 7 * 3600
+        cleanup = service.cleanup
+
+        async def fail_first(ident):
+            if ident == "bericht-123":
+                raise RuntimeError("private contents")
+            return await cleanup(ident)
+
+        monkeypatch.setattr(service, "cleanup", fail_first)
+        await service.reap()
+        assert "bericht-123" in service.states
+        assert "bericht-456" not in service.states
+        assert "RuntimeError" in caplog.text
+        assert "private contents" not in caplog.text
+    finally:
+        await service.shutdown()
+
+
+async def test_housekeeper_survives_round_error(tmp_path, monkeypatch, caplog):
+    service = Coordinator(tmp_path)
+    sleep = asyncio.sleep
+    rounds = 0
+
+    async def tick(_):
+        await sleep(0)
+
+    async def reap():
+        nonlocal rounds
+        rounds += 1
+        if rounds == 1:
+            raise OSError("private contents")
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(asyncio, "sleep", tick)
+    monkeypatch.setattr(service, "reap", reap)
+    try:
+        with pytest.raises(asyncio.CancelledError):
+            await service.housekeeping()
+        assert rounds == 2
+        assert "hausmeister_runde fehler=OSError" in caplog.text
+        assert "private contents" not in caplog.text
+    finally:
+        await service.shutdown()
+
+
+@pytest.mark.parametrize("at_startup", [True, False])
+async def test_orphans_removed_by_age(tmp_path, at_startup):
+    import os
+
+    service = Coordinator(tmp_path / "arbeit")
+    service.root.mkdir()
+    old = service.root / "bericht-old"
+    fresh = service.root / "bericht-new"
+    for directory in (old, fresh):
+        directory.mkdir()
+        (directory / "eingang").mkdir()
+        (directory / "eingang/private").write_text("synthetic customer data")
+    os.utime(old, (time.time() - 7 * 3600,) * 2)
+    try:
+        if at_startup:
+            await service.startup()
+        else:
+            await service.reap()
+        assert not old.exists()
+        assert fresh.exists()
+    finally:
+        await service.shutdown()
+
+
+@pytest.mark.parametrize("token", [None, ""])
+async def test_missing_internal_token_refuses_start(tmp_path, monkeypatch, token):
+    if token is None:
+        monkeypatch.delenv("ERKUNDER_INTERNAL_TOKEN", raising=False)
+    else:
+        monkeypatch.setenv("ERKUNDER_INTERNAL_TOKEN", token)
+    service = Coordinator(tmp_path / "arbeit")
+    app = create_app(service)
+    try:
+        with pytest.raises(RuntimeError, match="ERKUNDER_INTERNAL_TOKEN fehlt"):
+            async with app.router.lifespan_context(app):
+                pytest.fail("started without token")
+        assert not service.root.exists()
+    finally:
+        await service.shutdown()

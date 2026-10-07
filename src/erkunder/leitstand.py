@@ -21,6 +21,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict
 
+from .dateien import read_bytes, read_text
 from .models import Auftrag
 from .prompts import (
     PROMPT_VERSION,
@@ -105,7 +106,7 @@ class Coordinator:
             directory = self.directory(path.name)
             file = directory / ".lauf.json"
             if file.exists():
-                self.states[path.name] = json.loads(file.read_text())
+                self.states[path.name] = json.loads(read_text(file))
                 self.token_ready[path.name] = asyncio.Event()
         await self.reap()
         for ident, state in list(self.states.items()):
@@ -125,18 +126,37 @@ class Coordinator:
     async def housekeeping(self) -> None:
         while True:
             await asyncio.sleep(600)
-            await self.reap()
+            try:
+                await self.reap()
+            except Exception as error:
+                LOG.error("hausmeister_runde fehler=%s", type(error).__name__)
 
     async def reap(self) -> None:
         for ident, state in list(self.states.items()):
-            if time.time() - state["aktivitaet"] > self.retention:
-                try:
+            try:
+                if time.time() - state["aktivitaet"] > self.retention:
                     await self.cleanup(ident)
-                except httpx.HTTPError:
-                    LOG.error(
-                        "bericht_id=%s grund=platz_neustart aufraeumen=verschoben",
-                        ident,
-                    )
+            except Exception as error:
+                LOG.error(
+                    "bericht_id=%s aufraeumen=verschoben fehler=%s",
+                    ident,
+                    type(error).__name__,
+                )
+        for path in self.root.iterdir():
+            if not ID.fullmatch(path.name) or path.name in self.states:
+                continue
+            try:
+                directory = self.directory(path.name)
+                if (directory / ".lauf.json").exists():
+                    continue
+                if time.time() - directory.stat().st_mtime > self.retention:
+                    await self.cleanup(path.name)
+            except Exception as error:
+                LOG.error(
+                    "bericht_id=%s verwaist=verschoben fehler=%s",
+                    path.name,
+                    type(error).__name__,
+                )
 
     async def start(self, body: Start) -> dict[str, bool]:
         ident = body.auftrag.bericht_id
@@ -215,12 +235,12 @@ class Coordinator:
             for s in self.states[ident]["schritte"]
         )
 
-    def output(self, ident: str, name: str) -> Path:
+    def output(self, ident: str, name: str) -> str:
         filename = "pruefung.md" if name.startswith("pruefung") else "ergebnis.md"
-        path = self.directory(ident) / name / filename
-        if path.is_symlink() or path.resolve().parent != path.parent.resolve():
-            raise StepFailed(name, "cli_fehler: ergebnis-pfad")
-        return path
+        try:
+            return read_text(self.directory(ident) / name / filename)
+        except (OSError, ValueError) as error:
+            raise StepFailed(name, "cli_fehler: ergebnis-pfad oder groesse") from error
 
     async def step(
         self,
@@ -324,7 +344,7 @@ class Coordinator:
             }
             if record["status"] == "ok":
                 try:
-                    if not self.output(ident, name).read_text().strip():
+                    if not self.output(ident, name).strip():
                         raise ValueError("empty")
                 except (OSError, ValueError, StepFailed):
                     record.update(
@@ -369,7 +389,7 @@ class Coordinator:
                     failed[-1]["schritt"], "unbekannt: weniger als zwei Gutachten"
                 )
             reports = {
-                f"gutachten-{i}.md": self.output(ident, f"erkunder-{i}").read_text()
+                f"gutachten-{i}.md": self.output(ident, f"erkunder-{i}")
                 for i in range(1, 4)
                 if self.successful(ident, f"erkunder-{i}")
             }
@@ -380,7 +400,7 @@ class Coordinator:
                 harmonisierung_prompt(order, failed),
                 reports,
             )
-            harmonized = self.output(ident, "harmonisierung").read_text()
+            harmonized = self.output(ident, "harmonisierung")
             await self.step(
                 ident,
                 "pruefung",
@@ -388,7 +408,7 @@ class Coordinator:
                 pruefung_prompt(order),
                 {"gutachten.md": harmonized},
             )
-            review = self.output(ident, "pruefung").read_text()
+            review = self.output(ident, "pruefung")
             if re.search(r"tr(?:ä|ae)gt\s+(?:nicht|teilweise)", review, re.IGNORECASE):
                 state["korrekturkreis_gelaufen"] = True
                 state["gesamt"] = 7
@@ -405,11 +425,7 @@ class Coordinator:
                     "pruefung-korrektur",
                     0,
                     pruefung_prompt(order),
-                    {
-                        "gutachten.md": self.output(
-                            ident, "harmonisierung-korrektur"
-                        ).read_text()
-                    },
+                    {"gutachten.md": self.output(ident, "harmonisierung-korrektur")},
                 )
             state["zustand"] = "fertig"
             state["meta"] = {
@@ -463,19 +479,17 @@ class Coordinator:
             name = item["name"]
             if item["status"] != "ok":
                 continue
-            texts[name] = self.output(ident, name).read_text()
+            texts[name] = self.output(ident, name)
             scripts[name] = {}
             budget = 200 * 1024
             directory = self.directory(ident) / name
             for file in sorted((directory / "skripte").rglob("*")):
-                if file.suffix not in (".py", ".sh") or not file.is_file():
+                if file.suffix not in (".py", ".sh"):
                     continue
-                if file.is_symlink() or not file.resolve().is_relative_to(
-                    directory.resolve()
-                ):
-                    raise HTTPException(409, "Skriptpfad außerhalb Schrittordner")
-                with file.open("rb") as stream:
-                    data = stream.read(budget + 1)
+                try:
+                    data = read_bytes(file, limit=budget)
+                except (OSError, ValueError) as error:
+                    raise HTTPException(409, "Ungueltige Skriptdatei") from error
                 if len(data) > budget:
                     if name not in shortened:
                         shortened.append(name)
@@ -512,21 +526,29 @@ class Coordinator:
                         headers=self.headers(),
                     )
                     response.raise_for_status()
-            size = (
-                sum(
-                    f.stat().st_size
-                    for f in path.rglob("*")
-                    if f.is_file() and not f.is_symlink()
+            size = None
+            try:
+                size = (
+                    sum(
+                        f.lstat().st_size
+                        for f in path.rglob("*")
+                        if f.is_file() and not f.is_symlink()
+                    )
+                    if path.exists()
+                    else 0
                 )
-                if path.exists()
-                else 0
-            )
+            except Exception as error:
+                LOG.error(
+                    "bericht_id=%s groesse=unbekannt fehler=%s",
+                    ident,
+                    type(error).__name__,
+                )
             if path.exists():
                 shutil.rmtree(path)
             self.states.pop(ident, None)
             self.tokens.pop(ident, None)
             self.token_ready.pop(ident, None)
-            LOG.info("bericht_id=%s geloescht_bytes=%d", ident, size)
+            LOG.info("bericht_id=%s geloescht_bytes=%s", ident, size)
             return {"bericht_id": ident, "geloescht_bytes": size}
 
 
@@ -546,6 +568,8 @@ def create_app(coordinator: Coordinator | None = None) -> FastAPI:
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
+        if not os.environ.get("ERKUNDER_INTERNAL_TOKEN"):
+            raise RuntimeError("ERKUNDER_INTERNAL_TOKEN fehlt")
         await service.startup()
         yield
         await service.shutdown()
