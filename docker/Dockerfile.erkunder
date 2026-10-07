@@ -25,9 +25,10 @@ RUN python -m venv /opt/rechnen && /opt/rechnen/bin/pip install --no-cache-dir \
     matplotlib==3.10.3 openpyxl==3.1.5
 COPY src /app/src
 COPY --chown=root:root docker/erkunder/erkunder-hook /usr/local/bin/erkunder-hook
+COPY --chown=root:root docker/erkunder/erkunder-proxy /usr/local/bin/erkunder-proxy
 COPY --chown=root:root docker/erkunder/settings.json /etc/erkunder/settings.json
 COPY --chown=root:root docker/erkunder/tinyproxy.conf /etc/erkunder/tinyproxy.conf
-RUN chmod 0755 /usr/local/bin/erkunder-hook && \
+RUN chmod 0755 /usr/local/bin/erkunder-hook /usr/local/bin/erkunder-proxy && \
     chmod 0644 /etc/erkunder/settings.json /etc/erkunder/tinyproxy.conf && \
     printf '%s\n' '^api\.anthropic\.com$' > /etc/erkunder/tinyproxy.filter && \
     chmod 0644 /etc/erkunder/tinyproxy.filter

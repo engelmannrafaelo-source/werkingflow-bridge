@@ -1,0 +1,12 @@
+#!/bin/sh
+set -eu
+
+# tinyproxy opens LogFile after dropping to nobody:nogroup. Keep the actual
+# file on the writable tmpfs and mirror it to stdout so Docker retains every
+# allowed or denied CONNECT in the container log.
+log=/tmp/tinyproxy.log
+: > "$log"
+chown nobody:nogroup "$log"
+chmod 0644 "$log"
+tail -n 0 -F "$log" &
+exec tinyproxy -d -c /etc/erkunder/tinyproxy.conf

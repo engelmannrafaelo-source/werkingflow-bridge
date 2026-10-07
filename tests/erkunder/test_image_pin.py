@@ -20,8 +20,8 @@ def test_cli_and_base_image_pins_match_worker():
     pattern = r"RUN npm install -g @anthropic-ai/claude-code@([^\s]+)"
     assert re.findall(pattern, erkunder) == re.findall(pattern, worker)
     assert len(re.findall(pattern, erkunder)) == 1
-    assert re.findall(r"^FROM .+$", erkunder, re.M) == re.findall(
-        r"^FROM .+$", worker, re.M
+    assert re.findall(r"^FROM .+$", erkunder, re.MULTILINE) == re.findall(
+        r"^FROM .+$", worker, re.MULTILINE
     )
     assert "bubblewrap" not in erkunder
     for package in ("pandas", "pyarrow", "numpy", "scipy", "matplotlib", "openpyxl"):
@@ -42,6 +42,7 @@ def test_compose_yaml_and_internal_network():
 def test_places_are_isolated(number):
     service = compose()["services"][f"erkunder-platz-{number}"]
     assert service["user"] == f"110{number}:1100"
+    assert service["init"] is True
     assert service["mem_limit"] == service["memswap_limit"] == "3g"
     assert service["pids_limit"] == 512
     assert service["read_only"] is True
@@ -97,7 +98,9 @@ def test_worker_inherits_authorization_from_platform_env(number):
 
 def test_proxy_is_default_deny_with_single_host_and_connect_port():
     config = (DOCKER / "erkunder/tinyproxy.conf").read_text()
-    assert re.findall(r"^ConnectPort (\d+)$", config, re.M) == ["443"]
+    assert 'LogFile "/tmp/tinyproxy.log"' in config
+    assert "/dev/stdout" not in config
+    assert re.findall(r"^ConnectPort (\d+)$", config, re.MULTILINE) == ["443"]
     assert "FilterDefaultDeny Yes" in config
     assert "FilterURLs Off" in config
     assert "FilterType ere" in config
@@ -105,7 +108,13 @@ def test_proxy_is_default_deny_with_single_host_and_connect_port():
     image = (DOCKER / "Dockerfile.erkunder").read_text()
     assert "'^api\\.anthropic\\.com$' > /etc/erkunder/tinyproxy.filter" in image
     proxy = compose()["services"]["erkunder-ausgang"]
+    assert proxy["command"] == ["/usr/local/bin/erkunder-proxy"]
     assert set(proxy["networks"]) == {"erkunder-intern", "bridge-net"}
     assert "ports" not in proxy
     assert "secrets" not in proxy
     assert "env_file" not in proxy
+    proxy_entrypoint = (DOCKER / "erkunder/erkunder-proxy").read_text()
+    assert 'log=/tmp/tinyproxy.log' in proxy_entrypoint
+    assert 'chown nobody:nogroup "$log"' in proxy_entrypoint
+    assert 'tail -n 0 -F "$log" &' in proxy_entrypoint
+    assert 'exec tinyproxy -d -c /etc/erkunder/tinyproxy.conf' in proxy_entrypoint
