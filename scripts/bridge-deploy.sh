@@ -1411,7 +1411,7 @@ phase_rollback() {
         local running
         running=$(rssh "$host" "docker inspect --format '{{.State.Running}}' docker-erkunder-1") || return 2
         case "$running" in
-            true) erkunder_wait_idle "$host" || return 2 ;;
+            true) erkunder_wait_idle "$host" "$compose" || return 2 ;;
             false) : ;;
             *) error_ "CRITICAL: unknown Erkunder state before rollback"; return 2 ;;
         esac

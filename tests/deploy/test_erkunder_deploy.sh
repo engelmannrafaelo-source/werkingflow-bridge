@@ -135,3 +135,106 @@ if phase_rollback fake compose synthetic-sha '' $ERKUNDER_SERVICES; then
 fi
 ! grep -Eq 'reset --hard| stop | up |restart' "$commands"
 echo 'PASS rollback: busy report stops rollback before reset or container stop'
+
+# Execute the real introduction shell, with Docker/SSH replaced by local probes.
+source scripts/erkunder-deploy.sh
+REMOTE_REPO=$PWD
+rssh() { echo "protocol-probe" >> "$commands"; return "${protocol_rc:-3}"; }
+rssh_run() { bash -euo pipefail -s; }
+docker() {
+    echo "$*" >> "$commands"
+    case "$1" in
+        inspect) echo synthetic-old-image ;;
+        exec) cat >/dev/null; return "${pre_rc:-0}" ;;
+        run) cat >/dev/null; return "${post_rc:-0}" ;;
+        compose)
+            if [[ "$*" == *' stop erkunder' ]]; then return "${stop_rc:-0}"; fi
+            if [[ "$*" == *' start erkunder' ]]; then return "${start_rc:-0}"; fi
+            ;;
+        *) return 99 ;;
+    esac
+}
+export -f docker
+export commands pre_rc=0 post_rc=0 stop_rc=0 start_rc=0
+export ERKUNDER_DEPLOY_EINFUEHRUNG=1
+DRY_RUN=false protocol_rc=3
+: > "$commands"
+erkunder_wait_idle fake compose
+[[ $(grep -c 'stop erkunder' "$commands") == 1 ]]
+grep -q -- '--network none --volumes-from docker-erkunder-1:ro --entrypoint python synthetic-old-image' "$commands"
+! grep -q 'start erkunder' "$commands"
+echo 'PASS legacy + idle + switch: pre-check, stop, read-only post-check'
+
+pre_rc=1
+: > "$commands"
+if erkunder_wait_idle fake compose; then echo 'FAIL busy legacy'; exit 1; fi
+! grep -Eq 'stop erkunder|start erkunder|^run ' "$commands"
+echo 'PASS legacy busy: nothing stopped'
+
+pre_rc=0 post_rc=1
+: > "$commands"
+if erkunder_wait_idle fake compose; then echo 'FAIL post-stop race'; exit 1; fi
+grep -q 'stop erkunder' "$commands"
+grep -q 'start erkunder' "$commands"
+! grep -q ' up ' "$commands"
+echo 'PASS post-stop race/probe failure: old Leitstand restarted, no rollout'
+
+post_rc=0 stop_rc=1
+: > "$commands"
+if erkunder_wait_idle fake compose; then echo 'FAIL ambiguous stop'; exit 1; fi
+grep -q 'start erkunder' "$commands"
+! grep -q '^run ' "$commands"
+echo 'PASS ambiguous stop: recovery attempted'
+
+stop_rc=0 post_rc=1 start_rc=1
+: > "$commands"
+if erkunder_wait_idle fake compose; then echo 'FAIL recovery failure'; exit 1; else rc=$?; fi
+[[ "$rc" == 2 ]]
+echo 'PASS recovery failure remains CRITICAL'
+post_rc=0 start_rc=0
+
+protocol_rc=0
+: > "$commands"
+erkunder_wait_idle fake compose
+[[ $(wc -l < "$commands") == 1 ]]
+echo 'PASS new protocol + switch: normal gate, no introduction'
+
+protocol_rc=3 ERKUNDER_DEPLOY_EINFUEHRUNG=0
+: > "$commands"
+if output=$(erkunder_wait_idle fake compose 2>&1); then echo 'FAIL legacy without switch'; exit 1; fi
+[[ "$output" == *'ERKUNDER_DEPLOY_EINFUEHRUNG=1'* ]]
+[[ $(wc -l < "$commands") == 1 ]]
+echo 'PASS legacy without switch: FAIL with actionable hint'
+
+protocol_rc=1 ERKUNDER_DEPLOY_EINFUEHRUNG=1
+: > "$commands"
+if erkunder_wait_idle fake compose; then echo 'FAIL transport/auth/protocol failure bypass'; exit 1; fi
+[[ $(wc -l < "$commands") == 1 ]]
+echo 'PASS other protocol failures never introduce'
+
+SERVICES_ARG=(worker1 nginx)
+services_to_deploy=(worker1 nginx)
+: > "$commands"
+prepare_erkunder_deploy fake compose
+[[ "${services_to_deploy[*]}" == 'worker1 nginx' && ! -s "$commands" ]]
+echo 'PASS explicit non-Erkunder list unaffected, no probe or build'
+
+# Finish a full non-Erkunder deploy with synthetic side effects. Suppress only
+# the unrelated local Infisical source; every external phase is stubbed.
+source() { [[ "$1" == /root/.infisical/infisical-api.sh ]] || builtin source "$@"; }
+HETZNER_ALL="worker1 nginx $ERKUNDER_SERVICES"
+HETZNER_SVC_worker1=synthetic-worker HETZNER_SVC_nginx=synthetic-nginx
+DEPLOYED_SHA_FILE=/synthetic/deployed-sha
+phase_smoke_test() { :; }
+phase_distribution_test() { :; }
+phase_access_canary() { :; }
+phase_worker_config_selftest() { :; }
+write_release_manifest() { :; }
+deploy_one_service() { echo "deploy $3" >> "$commands"; }
+rssh() { echo "remote $*" >> "$commands"; echo synthetic; }
+: > "$commands"
+deploy_server hetzner
+[[ "${DEPLOYED_SERVICES[*]}" == 'worker1 nginx' ]]
+[[ $(grep -c '^deploy ' "$commands") == 2 ]]
+! grep -Eq 'protocol-probe|stop erkunder|build erkunder|--legacy-idle' "$commands"
+echo 'PASS full Bridge deploy with explicit non-Erkunder list reaches SUCCESS'

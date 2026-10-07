@@ -7,6 +7,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import pytest
 
 from src.erkunder import deploy
+from src.erkunder.gesundheit import PORTS
 
 
 @pytest.fixture
@@ -34,7 +35,7 @@ def gate_server(monkeypatch):
             pass
 
     server = ThreadingHTTPServer(("localhost", 0), Handler)
-    monkeypatch.setitem(deploy.PORTS, "leitstand", server.server_port)
+    monkeypatch.setitem(PORTS, "leitstand", server.server_port)
     monkeypatch.setenv("ERKUNDER_INTERNAL_TOKEN", "synthetic")
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
@@ -74,10 +75,55 @@ def test_idle_needs_no_wait(gate_server):
     assert requests == ["POST"]
 
 
-@pytest.mark.parametrize("state", [404, 503, {"bereit": True, "berichte": ["x"]}])
+@pytest.mark.parametrize("state", [403, 503, {"bereit": True, "berichte": ["x"]}])
 def test_unavailable_legacy_or_invalid_response_fails(gate_server, state):
     states, requests = gate_server
     states.append(state)
     with pytest.raises((deploy.urllib.error.HTTPError, ValueError)):
         deploy.wait_until_idle(0)
     assert requests == ["POST", "DELETE"]
+
+
+def test_legacy_404_has_distinct_exit_without_release(gate_server):
+    states, requests = gate_server
+    states.append(404)
+    with pytest.raises(
+        deploy.LegacyProtocolMissing, match="ERKUNDER_DEPLOY_EINFUEHRUNG=1"
+    ):
+        deploy.wait_until_idle(0)
+    assert requests == ["POST"]
+
+
+def test_legacy_idle_requires_existing_empty_directory(tmp_path):
+    deploy.assert_legacy_idle(tmp_path)
+    (tmp_path / "report").mkdir()
+    with pytest.raises(RuntimeError, match="not empty"):
+        deploy.assert_legacy_idle(tmp_path)
+    with pytest.raises(FileNotFoundError):
+        deploy.assert_legacy_idle(tmp_path / "missing")
+
+
+@pytest.mark.parametrize(
+    "state, exit_code",
+    [(404, 3), (403, 1), (503, 1), ({"bereit": True, "berichte": []}, 0)],
+)
+def test_stdin_probe_works_without_new_modules(gate_server, tmp_path, state, exit_code):
+    import os
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    states, _ = gate_server
+    states.append(state)
+    result = subprocess.run(
+        [sys.executable, "-", "0", str(PORTS["leitstand"])],
+        input=Path(deploy.__file__).read_text(),
+        text=True,
+        capture_output=True,
+        cwd=tmp_path,
+        env={**os.environ, "PYTHONPATH": ""},
+        timeout=10,
+    )
+    assert result.returncode == exit_code, result.stderr
+    if exit_code == 3:
+        assert "ERKUNDER_DEPLOY_EINFUEHRUNG=1" in result.stderr
