@@ -2,11 +2,43 @@
 set -eu
 
 # tinyproxy opens LogFile after dropping to nobody:nogroup. Keep the actual
-# file on the writable tmpfs and mirror it to stdout so Docker retains every
-# allowed or denied CONNECT in the container log.
+# file on the writable tmpfs and mirror it to stdout so Docker retains allowed
+# and denied CONNECTs in the container log.
 log=/tmp/tinyproxy.log
+max_log_bytes=1048576
 : > "$log"
 chown nobody:nogroup "$log"
 chmod 0644 "$log"
 tail -n 0 -F "$log" &
-exec tinyproxy -d -c /etc/erkunder/tinyproxy.conf
+mirror_pid=$!
+
+# A file-size limit is the hard backstop for the 16 MiB tmpfs. The loop below
+# normally truncates before that limit, so the proxy keeps logging indefinitely.
+(
+    ulimit -f 2048
+    exec tinyproxy -d -c /etc/erkunder/tinyproxy.conf
+) &
+proxy_pid=$!
+
+stop_children() {
+    kill "$mirror_pid" "$proxy_pid" 2>/dev/null || true
+    wait "$mirror_pid" 2>/dev/null || true
+    wait "$proxy_pid" 2>/dev/null || true
+}
+
+trap 'stop_children; exit 1' INT TERM
+
+while kill -0 "$mirror_pid" 2>/dev/null && kill -0 "$proxy_pid" 2>/dev/null; do
+    if [ "$(wc -c < "$log")" -gt "$max_log_bytes" ]; then
+        : > "$log"
+    fi
+    sleep 1
+done
+
+if ! kill -0 "$mirror_pid" 2>/dev/null; then
+    echo "tinyproxy log mirror exited; stopping proxy" >&2
+else
+    echo "tinyproxy exited; stopping log mirror" >&2
+fi
+stop_children
+exit 1

@@ -116,5 +116,10 @@ def test_proxy_is_default_deny_with_single_host_and_connect_port():
     proxy_entrypoint = (DOCKER / "erkunder/erkunder-proxy").read_text()
     assert 'log=/tmp/tinyproxy.log' in proxy_entrypoint
     assert 'chown nobody:nogroup "$log"' in proxy_entrypoint
+    assert "max_log_bytes=1048576" in proxy_entrypoint
+    assert "ulimit -f 2048" in proxy_entrypoint
     assert 'tail -n 0 -F "$log" &' in proxy_entrypoint
-    assert 'exec tinyproxy -d -c /etc/erkunder/tinyproxy.conf' in proxy_entrypoint
+    assert 'proxy_pid=$!' in proxy_entrypoint
+    assert 'kill -0 "$mirror_pid"' in proxy_entrypoint
+    assert ': > "$log"' in proxy_entrypoint
+    assert (DOCKER / "erkunder/erkunder-proxy").stat().st_mode & 0o111

@@ -1,12 +1,21 @@
 import sys
 import types
 
+import conftest
 import pytest
-from claude_code_sdk._errors import MessageParseError
 
+from src import sdk_parser
 from src.erkunder import kind
 from src.erkunder.platz import child_failure_reason
 from src.sdk_parser import RateLimitEvent, resilient_parse_message
+
+MessageParseError = conftest.real_sdk._errors.MessageParseError
+
+
+@pytest.fixture(autouse=True)
+def use_real_message_parse_error(monkeypatch):
+    """Keep parser tests independent from suite-wide Claude SDK stubs."""
+    monkeypatch.setattr(sdk_parser, "MessageParseError", MessageParseError)
 
 
 def unknown_message(_: object):
