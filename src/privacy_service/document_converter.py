@@ -431,10 +431,91 @@ def _downscale_b64_png(b64: str, max_edge: int = MAX_IMAGE_EDGE) -> str:
         return b64
 
 
+# Caption search window below a figure, in PDF points (top-left origin). A caption
+# may start slightly INSIDE the picture box (Docling's crop includes a margin), so
+# the gap may be a little negative.
+FIGURE_CAPTION_MAX_GAP_PT = 40.0
+FIGURE_CAPTION_MIN_GAP_PT = -12.0
+# The positional fallback only takes short caption-like blocks: a heading or a
+# body paragraph that happens to follow a logo is not that picture's caption
+# (Muehl-Bericht 07.10.2026: logo -> "Inhaltsverzeichnis").
+FIGURE_CAPTION_MAX_CHARS = 160
+FIGURE_CAPTION_LABELS = {"caption", "text", "paragraph"}
+
+
+def _figure_meta(document: Any) -> List[Dict[str, Any]]:
+    """Page and caption for every picture, in the order of the exported names.
+
+    The markdown export numbers pictures ``image_{i:06d}_<hash>`` in
+    ``iterate_items`` order; this walks the same order, so entry ``i`` belongs to
+    the figure whose name starts with ``image_{i:06d}_``.
+
+    Why not the text after ``![Image](…)`` in the markdown: on a two-column photo
+    page Docling's reading order interleaves captions and pictures (Weidenhof-Akt
+    07.10.2026: "Foto 04" stood after the 6th picture, "Foto 05" nowhere), so the
+    check numbered photos "Bild 1..16" and the report blamed the wrong photo.
+    Order: a caption Docling linked to the picture; else a caption-labelled child
+    of the picture; else the text block directly below it on the same page.
+    ``caption`` is None when none is found — the caller must not guess.
+    """
+    from docling_core.types.doc import PictureItem, TextItem
+
+    pictures: List[Any] = []
+    texts: List[Any] = []
+    for item, _level in document.iterate_items():
+        if isinstance(item, PictureItem):
+            pictures.append(item)
+        elif isinstance(item, TextItem) and item.prov:
+            texts.append(item)
+
+    def box(prov: Any) -> Any:
+        page = document.pages.get(prov.page_no)
+        if page is None or page.size is None:
+            return None
+        return prov.bbox.to_top_left_origin(page.size.height)
+
+    meta: List[Dict[str, Any]] = []
+    for pic in pictures:
+        prov = pic.prov[0] if pic.prov else None
+        page_no = prov.page_no if prov else None
+        caption = (pic.caption_text(document) or "").strip()
+        if not caption:
+            for child in pic.children or []:
+                item = child.resolve(document)
+                if getattr(item, "label", None) == "caption" and getattr(item, "text", "").strip():
+                    caption = item.text.strip()
+                    break
+        if not caption and prov is not None:
+            pbox = box(prov)
+            best = None
+            for text in texts:
+                if text.prov[0].page_no != page_no or not text.text.strip():
+                    continue
+                if str(getattr(text.label, "value", text.label)) not in FIGURE_CAPTION_LABELS:
+                    continue
+                if len(text.text.strip()) > FIGURE_CAPTION_MAX_CHARS:
+                    continue
+                tbox = box(text.prov[0])
+                if pbox is None or tbox is None:
+                    continue
+                overlap = min(pbox.r, tbox.r) - max(pbox.l, tbox.l)
+                if overlap < 0.5 * min(pbox.r - pbox.l, tbox.r - tbox.l):
+                    continue
+                gap = tbox.t - pbox.b
+                if FIGURE_CAPTION_MIN_GAP_PT <= gap <= FIGURE_CAPTION_MAX_GAP_PT and (
+                    best is None or abs(gap) < best[0]
+                ):
+                    best = (abs(gap), text.text.strip())
+            if best:
+                caption = best[1]
+        meta.append({"index": len(meta), "page": page_no, "caption": caption or None})
+    return meta
+
+
 def _docling_convert_pdf(
     pdf_bytes: bytes,
-) -> Tuple[str, Optional[int], Dict[str, str], Optional[List[Dict[str, Any]]]]:
-    """Run Docling over a PDF → (markdown, page_count, figures, page_markdowns).
+) -> Tuple[str, Optional[int], Dict[str, str], Optional[List[Dict[str, Any]]], Optional[List[Dict[str, Any]]]]:
+    """Run Docling over a PDF → (markdown, page_count, figures, page_markdowns, figure_meta).
 
     This is the text/table extraction half of the cascade. Raises on any Docling
     failure so the caller can fall back to a full page render.
@@ -550,7 +631,35 @@ def _docling_convert_pdf(
                 page_markdowns = None
                 logger.warning(f"[pdf] page_markdowns omitted (paged export failed): {e}")
 
-            return markdown, page_count, figures, page_markdowns
+            # Page + caption per figure (see _figure_meta). Enrichment only: a
+            # failure, or a count that does not match the exported figures,
+            # yields None — never a caption on the wrong photo.
+            figure_meta: Optional[List[Dict[str, Any]]] = None
+            try:
+                raw_meta = _figure_meta(result.document)
+                by_index = {
+                    int(name[len("image_"):len("image_") + 6]): name
+                    for name in figures
+                    if re.match(r"^image_\d{6}_", name)
+                }
+                if len(raw_meta) == len(figures) == len(by_index):
+                    figure_meta = [
+                        {"name": by_index[m["index"]], "page": m["page"], "caption": m["caption"]}
+                        for m in raw_meta
+                        if m["index"] in by_index
+                    ]
+                    if len(figure_meta) != len(raw_meta):
+                        figure_meta = None
+                if figure_meta is None:
+                    logger.warning(
+                        f"[pdf] figure_meta omitted: {len(raw_meta)} pictures vs "
+                        f"{len(figures)} exported figures"
+                    )
+            except Exception as e:  # noqa: BLE001 — enrichment only, never fatal
+                figure_meta = None
+                logger.warning(f"[pdf] figure_meta omitted: {e}")
+
+            return markdown, page_count, figures, page_markdowns, figure_meta
     finally:
         os.unlink(tmp_pdf_path)
 
@@ -619,9 +728,10 @@ def convert_pdf_bytes(pdf_bytes: bytes) -> Tuple[str, Dict[str, Any], Dict[str, 
     docling_page_count: Optional[int] = None
     figures: Dict[str, str] = {}
     page_markdowns: Optional[List[Dict[str, Any]]] = None
+    figure_meta: Optional[List[Dict[str, Any]]] = None
     docling_ok = False
     try:
-        docling_markdown, docling_page_count, figures, page_markdowns = _docling_convert_pdf(pdf_bytes)
+        docling_markdown, docling_page_count, figures, page_markdowns, figure_meta = _docling_convert_pdf(pdf_bytes)
         docling_ok = True
     except Exception as e:  # noqa: BLE001 — fall back to full page render
         logger.warning(
@@ -672,6 +782,10 @@ def convert_pdf_bytes(pdf_bytes: bytes) -> Tuple[str, Dict[str, Any], Dict[str, 
     # handling. Named page_markdowns because `pages` (the count) is taken.
     if docling_ok and page_markdowns:
         metadata["page_markdowns"] = page_markdowns
+    # [{name, page, caption}] per Docling figure (rendered whole pages are not
+    # figures and have no entry). Absent when the mapping is not provably right.
+    if docling_ok and figure_meta:
+        metadata["figures"] = figure_meta
     return markdown, metadata, images
 
 

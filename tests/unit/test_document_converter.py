@@ -358,7 +358,7 @@ def test_convert_pdf_oversized_plan_renders_pages(monkeypatch):
     giant_figure = _png_b64(12000, 11000)
 
     def _fake_docling(pdf_bytes):
-        return "# Plan text\n\nSTAHLBETON …", 2, {"figure-1.png": giant_figure}
+        return "# Plan text\n\nSTAHLBETON …", 2, {"figure-1.png": giant_figure}, None, None
 
     monkeypatch.setattr(dc, "_docling_convert_pdf", _fake_docling)
 
@@ -632,7 +632,7 @@ class TestMojibakeRepairWiredIntoProductionPaths:
         # are never touched — this test only needs the Docling text path.
         monkeypatch.setattr(dc, "_pdf_page_geometry", lambda pdf_bytes: [(500, 800.0), (500, 800.0)])
         monkeypatch.setattr(
-            dc, "_docling_convert_pdf", lambda pdf_bytes: (mojibake_md, 2, {}, page_markdowns)
+            dc, "_docling_convert_pdf", lambda pdf_bytes: (mojibake_md, 2, {}, page_markdowns, None)
         )
 
         markdown, metadata, images = convert_pdf_bytes(b"%PDF-1.4 fake")
@@ -658,7 +658,7 @@ class TestMojibakeRepairWiredIntoProductionPaths:
 
         monkeypatch.setattr(dc, "_pdf_page_geometry", lambda pdf_bytes: [(500, 800.0), (500, 800.0)])
         monkeypatch.setattr(
-            dc, "_docling_convert_pdf", lambda pdf_bytes: (mojibake_md, 2, {}, page_markdowns)
+            dc, "_docling_convert_pdf", lambda pdf_bytes: (mojibake_md, 2, {}, page_markdowns, None)
         )
 
         chain = build_default_chain()
@@ -706,7 +706,7 @@ class TestMojibakeRepairWiredIntoProductionPaths:
         )
         monkeypatch.setattr(dc, "_pdf_page_geometry", lambda pdf_bytes: [(500, 800.0)])
         monkeypatch.setattr(
-            dc, "_docling_convert_pdf", lambda pdf_bytes: (mojibake_md, 1, {}, None)
+            dc, "_docling_convert_pdf", lambda pdf_bytes: (mojibake_md, 1, {}, None, None)
         )
 
         markdown, metadata, images = convert_docx_bytes(b"fake docx bytes")
