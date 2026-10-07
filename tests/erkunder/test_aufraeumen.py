@@ -125,3 +125,23 @@ def test_running_reap_read_error(monkeypatch, pid_one, tmp_path, error):
     else:
         with pytest.raises(error):
             aufraeumen.reap_adopted_children(41, tmp_path)
+
+
+def test_cleanup_locked_nested_dirs_and_links(tmp_path):
+    target = tmp_path / "outside"
+    target.mkdir(mode=0o755)
+    secret = target / "keep"
+    secret.write_text("untouched")
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
+    nested = scratch / "locked" / "nested"
+    nested.mkdir(parents=True)
+    (nested / "link").symlink_to(target, target_is_directory=True)
+    (nested / "dangling").symlink_to(tmp_path / "missing")
+    (nested / "file").write_text("remove")
+    nested.chmod(0)
+    nested.parent.chmod(0)
+    aufraeumen.clear_owned_tmp(scratch)
+    assert list(scratch.iterdir()) == []
+    assert secret.read_text() == "untouched"
+    assert target.stat().st_mode & 0o777 == 0o755

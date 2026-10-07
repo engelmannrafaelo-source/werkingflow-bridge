@@ -1,3 +1,4 @@
+import io
 import urllib.error
 from unittest.mock import Mock
 
@@ -7,7 +8,7 @@ from src.erkunder.gesundheit import probe
 
 
 @pytest.mark.parametrize("role", ["leitstand", "platz"])
-@pytest.mark.parametrize("code", [200, 403, 404, 500])
+@pytest.mark.parametrize("code", [200, 403, 404, 500, 503])
 def test_http_readiness_requires_authenticated_missing_route(monkeypatch, role, code):
     monkeypatch.setenv("ERKUNDER_INTERNAL_TOKEN", "synthetic-token")
     opener = Mock()
@@ -31,3 +32,15 @@ def test_http_readiness_connection_failure_is_loud(monkeypatch):
     )
     with pytest.raises(ConnectionRefusedError):
         probe("leitstand")
+
+
+def test_cleanup_reason_reaches_healthcheck(monkeypatch):
+    monkeypatch.setenv("ERKUNDER_INTERNAL_TOKEN", "synthetic-token")
+    error = urllib.error.HTTPError("", 503, "", {}, io.BytesIO(
+        b'{"detail": "Platz-Aufraeumen fehlgeschlagen"}'
+    ))
+    monkeypatch.setattr("urllib.request.build_opener", Mock(return_value=Mock(
+        open=Mock(side_effect=error)
+    )))
+    with pytest.raises(RuntimeError, match="HTTP 503: Platz-Aufraeumen fehlgeschlagen"):
+        probe("platz")

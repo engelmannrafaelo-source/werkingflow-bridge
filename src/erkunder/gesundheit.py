@@ -1,5 +1,6 @@
 """Container readiness probes; no model calls, report writes or external traffic."""
 
+import json
 import os
 import socket
 import sys
@@ -33,7 +34,16 @@ def probe(role: str) -> None:
         # Authenticated missing route: middleware and completed lifespan work.
         if error.code == 404:
             return
-        raise RuntimeError(f"Erkunder-{role}: HTTP {error.code}") from None
+        detail = ""
+        if error.code == 503 and role == "platz":
+            # Only known service reasons, never arbitrary response text/secrets.
+            try:
+                body = json.loads(error.read(1024))
+                if body.get("detail") == "Platz-Aufraeumen fehlgeschlagen":
+                    detail = ": Platz-Aufraeumen fehlgeschlagen"
+            except (ValueError, AttributeError):
+                pass  # HTTP status remains a loud failure even without JSON.
+        raise RuntimeError(f"Erkunder-{role}: HTTP {error.code}{detail}") from None
     raise RuntimeError(f"Erkunder-{role}: unerwartete Bereitschaftsantwort")
 
 

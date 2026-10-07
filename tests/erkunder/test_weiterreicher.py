@@ -75,7 +75,13 @@ async def test_busy(monkeypatch, setup, auftrag):
     assert err.value.status_code == 429 and err.value.retry_after_s == 120
 
 
-async def test_abort(monkeypatch, setup, auftrag, caplog):
+@pytest.mark.parametrize("step,reason,expected", [
+    ("erkunder-2", "zeit", "zeit"),
+    ("pruefung", "Ergebnis-Integritaet", "Ergebnis-Integritaet"),
+    ("wiederaufnahme", "Wiederanhaengen", "Wiederanhaengen"),
+    ("erkunder-2", "synthetic-secret-never-log", "unbekannt"),
+])
+async def test_abort(monkeypatch, setup, auftrag, caplog, step, reason, expected):
     mock_http(
         monkeypatch,
         lambda req: httpx.Response(
@@ -85,16 +91,19 @@ async def test_abort(monkeypatch, setup, auftrag, caplog):
                 if req.url.path == "/start"
                 else {
                     "zustand": "abbruch",
-                    "schritt": "erkunder-2",
+                    "schritt": step,
                     "fertig": 0,
                     "gesamt": 5,
-                    "fehler": {"grund": "zeit: synthetic-secret-never-log"},
+                    "fehler": {"grund": reason + ": synthetic-secret-never-log"},
                 }
             ),
         ),
     )
-    with pytest.raises(RuntimeError, match="erkunder abbruch: erkunder-2: zeit"):
+    with pytest.raises(
+        RuntimeError, match=f"erkunder abbruch: {step}: {expected}"
+    ) as err:
         await erkunder_executor(auftrag, None, AsyncMock())
+    assert "synthetic-secret-never-log" not in str(err.value)
     assert "synthetic-secret-never-log" not in caplog.text
 
 

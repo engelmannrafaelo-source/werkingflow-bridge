@@ -2,7 +2,6 @@
 
 import asyncio
 import os
-import shutil
 import signal
 import stat
 import threading
@@ -49,15 +48,41 @@ async def stop_uid_processes(proc: Path = Path("/proc")) -> None:
     raise RuntimeError("Platz-uid hat nach SIGKILL noch aktive Prozesse")
 
 
+def remove_tree(path: str | Path, *, dir_fd: int | None = None) -> None:
+    """Remove a reaped step's tree, including mode-000 dirs, without following links.
+
+    O_PATH can pin an unreadable inode. chmod via its proc fd changes exactly
+    that directory (never a symlink target), then all descent stays fd-relative.
+    No privilege escalation: the place owns its directories. Call only after
+    killing/reaping every step process, so no producer can race removal.
+    """
+    pinned = os.open(path, os.O_PATH | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=dir_fd)
+    try:
+        if not stat.S_ISDIR(os.fstat(pinned).st_mode):
+            os.unlink(path, dir_fd=dir_fd)
+            return
+        os.chmod(f"/proc/self/fd/{pinned}", 0o700)
+        readable = os.open(".", os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC,
+                           dir_fd=pinned)
+        try:
+            for name in os.listdir(readable):
+                remove_tree(name, dir_fd=readable)
+        finally:
+            os.close(readable)
+        os.rmdir(path, dir_fd=dir_fd)
+    finally:
+        os.close(pinned)
+
+
 def clear_owned_tmp(directory: Path = Path("/tmp")) -> None:
-    for entry in directory.iterdir():
-        info = entry.lstat()
-        if info.st_uid != os.getuid():
-            continue
-        if stat.S_ISDIR(info.st_mode):
-            shutil.rmtree(entry)
-        else:
-            entry.unlink()
+    parent = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        for name in os.listdir(parent):
+            info = os.stat(name, dir_fd=parent, follow_symlinks=False)
+            if info.st_uid == os.getuid():
+                remove_tree(name, dir_fd=parent)
+    finally:
+        os.close(parent)
 
 
 async def reap_children() -> None:

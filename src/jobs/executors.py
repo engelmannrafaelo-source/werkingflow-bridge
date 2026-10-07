@@ -608,6 +608,8 @@ async def erkunder_executor(
                         "cli_fehler",
                         "geheimnis_im_ergebnis",
                         "platz_neustart",
+                        "Ergebnis-Integritaet",
+                        "Wiederanhaengen",
                         "konto",
                         "unbekannt",
                     }:
@@ -617,6 +619,7 @@ async def erkunder_executor(
                         if step
                         in {
                             "daten",
+                            "wiederaufnahme",
                             "erkunder-1",
                             "erkunder-2",
                             "erkunder-3",

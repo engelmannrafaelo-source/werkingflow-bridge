@@ -47,6 +47,7 @@ rssh_run() { bash -euo pipefail -s; }
 REMOTE_REPO=$PWD
 docker() {
     [[ ${missing:-false} == false ]] || return 1
+    if [[ "$1" == exec ]]; then return "${probe_rc:-0}"; fi
     echo "true ${health:-healthy} ${label:-$(git rev-parse HEAD)}"
 }
 export -f docker
@@ -54,6 +55,10 @@ health=healthy missing=false label=$(git rev-parse HEAD)
 export health missing label
 erkunder_unchanged fake
 echo 'PASS actual image label + unchanged git trees'
+export probe_rc=1
+if erkunder_unchanged fake; then echo 'FAIL cached health accepted'; exit 1; fi
+export probe_rc=0
+echo 'PASS live place probe failure overrides cached Docker healthy'
 health=unhealthy
 if erkunder_unchanged fake; then exit 1; fi
 health=healthy label=unknown

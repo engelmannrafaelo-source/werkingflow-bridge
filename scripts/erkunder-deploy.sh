@@ -10,7 +10,18 @@ cd '${REMOTE_REPO}'
 for svc in ${ERKUNDER_SERVICES}; do
     state=\$(docker inspect --format '{{.State.Running}} {{if .State.Health}}{{.State.Health.Status}}{{end}} {{index .Config.Labels "bridge.git.commit"}}' "docker-\${svc}-1") || exit 1
     read -r running health commit <<< "\$state"
-    [[ "\$running" == true && "\$health" == healthy && "\$commit" =~ ^[0-9a-f]{40}$ ]] || exit 1
+    if [[ "\$running" != true || "\$health" != healthy ]]; then
+        echo "Erkunder \$svc unhealthy: running=\$running health=\$health; group must not be skipped" >&2
+        exit 1
+    fi
+    [[ "\$commit" =~ ^[0-9a-f]{40}$ ]] || exit 1
+    # Docker health is cached. Recheck the place before skipping a release.
+    if [[ "\$svc" == erkunder-platz-* ]]; then
+        docker exec "docker-\${svc}-1" python -m src.erkunder.gesundheit platz || {
+            echo "Erkunder \$svc unhealthy: live readiness failed; group must not be skipped" >&2
+            exit 1
+        }
+    fi
     git cat-file -e "\$commit^{commit}" || exit 1
     git diff --quiet "\$commit" HEAD -- src/erkunder src/sdk_parser.py src/__init__.py pyproject.toml poetry.lock .dockerignore docker/Dockerfile.erkunder docker/erkunder docker/docker-compose.yml docker/docker-compose-platform-overlay.yml scripts/erkunder-deploy.sh || exit 1
 done

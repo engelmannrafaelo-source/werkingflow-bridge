@@ -287,6 +287,21 @@ async def test_cleanup_failure_blocks_reuse(run_space, monkeypatch, caplog):
     with pytest.raises(platz.HTTPException) as abort_error:
         await service.abort()
     assert abort_error.value.status_code == 503
+    monkeypatch.setenv("ERKUNDER_INTERNAL_TOKEN", "synthetic")
+    app = create_app(service)
+    # Shutdown also remains red: no silent healing of a failed cleanup.
+    with pytest.raises(platz.HTTPException):
+        async with app.router.lifespan_context(app), httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            assert (await client.get("/__bereitschaft__")).status_code == 403
+            client.headers["X-Erkunder-Intern"] = "synthetic"
+            response = await client.get("/__bereitschaft__")
+            assert response.status_code == 503
+            assert response.json() == {"detail": "Platz-Aufraeumen fehlgeschlagen"}
+            response = await client.get("/schritt/bericht-123/erkunder-1")
+            assert response.status_code == 200
+            assert response.json()["zustand"] == "abbruch"
 
 
 @pytest.mark.parametrize("kind", ["fifo", "large"])

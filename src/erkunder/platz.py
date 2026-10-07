@@ -7,7 +7,6 @@ import json
 import logging
 import os
 import re
-import shutil
 import signal
 import sys
 import time
@@ -25,6 +24,7 @@ from src.erkunder.aufraeumen import (
     clear_owned_tmp,
     reap_adopted_children,
     reap_children,
+    remove_tree,
     require_proc_children,
     stop_uid_processes,
 )
@@ -290,7 +290,7 @@ class Platz:
                 if home.is_symlink():
                     home.unlink()
                 elif home.exists():
-                    shutil.rmtree(home)
+                    remove_tree(home)
                 self.cleanup_failed = False
             except (Exception, asyncio.CancelledError) as error:
                 cleanup_cancelled = isinstance(error, asyncio.CancelledError)
@@ -354,6 +354,10 @@ def create_app(platz: Platz | None = None) -> FastAPI:
         if not internal_token or not hmac.compare_digest(internal_token, supplied):
             return JSONResponse(
                 status_code=403, content={"detail": "nicht freigegeben"}
+            )
+        if request.url.path == "/__bereitschaft__" and service.cleanup_failed:
+            return JSONResponse(
+                status_code=503, content={"detail": "Platz-Aufraeumen fehlgeschlagen"}
             )
         return await call_next(request)
 
