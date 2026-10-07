@@ -286,6 +286,8 @@ async def test_auth_every_endpoint(tmp_path, monkeypatch):
         ) as client:
             for method, path in [
                 ("POST", "/start"),
+                ("POST", "/deploy/pruefen"),
+                ("DELETE", "/deploy/pruefen"),
                 ("GET", "/status/bericht-123"),
                 ("GET", "/ergebnis/bericht-123"),
                 ("POST", "/aufraeumen/bericht-123"),
@@ -899,5 +901,27 @@ async def test_result_http_integrity_error_is_explicit(tmp_path, monkeypatch):
             response = await api.get("/ergebnis/bericht-123")
             assert response.status_code == 409
             assert "Integritaet" in response.json()["detail"]
+    finally:
+        await service.shutdown()
+
+
+async def test_deploy_gate_waits_then_atomically_blocks_new_reports(tmp_path):
+    service, places, _ = await setup(tmp_path, hold=True)
+    try:
+        await service.start(body())
+        assert await service.prepare_deploy() == {
+            "bereit": False, "berichte": ["bericht-123"]
+        }
+        assert not service.deploy_pending
+        # Reattachment remains available to the running report.
+        assert await service.start(body(token="fresh")) == {"angehaengt": True}
+        places.hold = False
+        await service.tasks["bericht-123"]
+        assert await service.prepare_deploy() == {"bereit": True, "berichte": []}
+        with pytest.raises(HTTPException) as error:
+            await service.start(body("bericht-456"))
+        assert error.value.status_code == 503
+        await service.cancel_deploy()
+        assert (await finish(service, body("bericht-456")))["zustand"] == "fertig"
     finally:
         await service.shutdown()

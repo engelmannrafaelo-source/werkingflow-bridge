@@ -78,6 +78,7 @@ class Coordinator:
         self.tasks: dict[str, asyncio.Task[None]] = {}
         self.lock = asyncio.Lock()
         self.startup_lock = asyncio.Lock()
+        self.deploy_pending = False
         self.housekeeper: asyncio.Task[None] | None = None
 
     def directory(self, ident: str) -> Path:
@@ -238,6 +239,22 @@ class Coordinator:
                     type(error).__name__,
                 )
 
+    async def prepare_deploy(self) -> dict:
+        """Check idle and close admission under the same lock as /start."""
+        async with self.lock:
+            running = sorted(
+                ident for ident, state in self.states.items()
+                if state["zustand"] == "laeuft"
+            )
+            if not running:
+                self.deploy_pending = True
+            return {"bereit": not running, "berichte": running}
+
+    async def cancel_deploy(self) -> dict:
+        async with self.lock:
+            self.deploy_pending = False
+            return {"freigegeben": True}
+
     async def start(self, body: Start) -> dict[str, bool]:
         ident = body.auftrag.bericht_id
         async with self.lock:
@@ -248,6 +265,8 @@ class Coordinator:
                 self.states[ident]["worker"] = body.worker
                 self.token_ready[ident].set()
                 return {"angehaengt": True}
+            if self.deploy_pending:
+                raise HTTPException(503, "Leitstand wird ausgerollt")
             for other, state in self.states.items():
                 if state["zustand"] == "laeuft":
                     raise HTTPException(409, {"belegt": other})
@@ -781,6 +800,14 @@ def create_app(coordinator: Coordinator | None = None) -> FastAPI:
             if error.status_code == 409:
                 return JSONResponse(status_code=409, content=error.detail)
             raise
+
+    @app.post("/deploy/pruefen")
+    async def prepare_deploy():
+        return await service.prepare_deploy()
+
+    @app.delete("/deploy/pruefen")
+    async def cancel_deploy():
+        return await service.cancel_deploy()
 
     @app.get("/status/{ident}")
     async def status(ident: str):

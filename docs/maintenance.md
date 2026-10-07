@@ -36,9 +36,36 @@ Auf dem Dev-Ziel gehoeren Ausgang, drei Plaetze und Leitstand zu einer
 Release-Gruppe. Auch eine explizite Auswahl eines einzelnen Erkunder-Dienstes
 rollt diese Gruppe aus. Das gemeinsame Image wird einmal mit `GIT_COMMIT`
 gebaut; derselbe SHA wird bei `compose up` fuer den Image-Tag verwendet.
-Der Leitstand stoppt die Annahme vor den Platz-Neustarts und startet zuletzt,
-nach den Gesundheitspruefungen. Laufende Berichte koennen dabei unterbrochen
-werden; dieser Ablauf ist kein unterbrechungsfreier Erkunder-Deploy.
+Vor jedem Container-Eingriff wartet der Deploy am Leitstand auf Leerlauf:
+`ERKUNDER_DEPLOY_WAIT_S` setzt die Frist in Sekunden (Default 900, 0 prueft
+sofort). Laufende Bericht-IDs erscheinen im Log. Bei Fristablauf, nicht
+pruefbarem Zustand oder unerreichbarem Leitstand scheitert der Deploy laut;
+kein Container wird gestoppt, nur der Checkout wird zurueckgesetzt.
+
+`POST /deploy/pruefen` prueft laufende Berichte unter derselben Sperre wie
+`/start` und schliesst die Annahme neuer Berichte erst bei Leerlauf. Dadurch
+kann zwischen Pruefung und Stop kein neuer Bericht hineinrutschen. Die
+Erkunder-Gruppe kommt danach zuerst, der Leitstand startet nach den Plaetzen.
+Auch Rollback prueft einen noch laufenden Leitstand vor dem Stop. Fehler beim
+Freigeben der Annahme (`DELETE /deploy/pruefen`) bleiben laut; ein abgerissener
+Deploy nach erfolgreicher Sperre verlangt eine bewusste Freigabe oder Neustart.
+Alle Deploy-Routen verlangen den internen Schluessel.
+
+Ein Altimage ohne dieses Deploy-Protokoll wird bewusst abgewiesen: reine
+Dateizaehlung koennte einen neuen Bericht zwischen Pruefung und Stop uebersehen.
+Die erstmalige Einfuehrung des Protokolls braucht daher eine separat geplante,
+freigegebene Umstellung bei gesperrten Auftraggebern; dieser Deploy-Pfad hat
+keinen unsicheren Altimage-Bypass.
+
+Der Job-Executor parkt Transportfehler und HTTP 502/503/504 ueber den bestehenden
+Registry-Vertrag `DEPENDENCY_UNAVAILABLE_STATUS` (424). Der Watchdog uebernimmt
+den gleichen Job nach 60 Sekunden erneut, hoechstens 240-mal. `/start` mit
+derselben Bericht-ID uebergibt einen frischen Token an B1m: Beim Neustart werden
+alte Platzprozesse beendet, abgeschlossene Schritte bleiben erhalten und nur
+unterbrochene Schritte laufen erneut. Auch zwischen normalen Statusabfragen
+haengt sich der Executor idempotent an, damit ein kurzer, unbemerkter Neustart
+nicht auf den Token warten bleibt. Fachliche Abbrueche, ungueltige Antworten
+und die Gesamtfrist bleiben endgueltige Fehler.
 
 Ein normaler Gesamtdeploy ueberspringt die Gruppe, wenn alle fuenf Container
 gesund sind und ihre tatsaechlichen Image-Commits fuer die Erkunder-Eingaben

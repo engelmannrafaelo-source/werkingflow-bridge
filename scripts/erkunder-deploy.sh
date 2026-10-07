@@ -36,12 +36,13 @@ prepare_erkunder_deploy() {
     # are not safe. Places must be ready before Leitstand startup (B1m).
     local group=()
     read -ra group <<< "$ERKUNDER_SERVICES"
-    services_to_deploy=("${rest[@]}" "${group[@]}")
+    services_to_deploy=("${group[@]}" "${rest[@]}")
     info "Building shared Erkunder image once (GIT_COMMIT = host HEAD)"
     dry_rssh "$host" "cd ${REMOTE_REPO} && GIT_COMMIT=\$(git rev-parse HEAD) docker compose ${compose} build erkunder" || {
         error_ "Erkunder build failed; no Erkunder container changed"
         return 1
     }
+    erkunder_wait_idle "$host"
 }
 
 # The previous release may predate Docker healthchecks. Use the same read-only
@@ -55,5 +56,24 @@ erkunder_legacy_health() {
         echo healthy
     else
         echo starting
+    fi
+}
+
+# Run before ANY container recreation. The coordinator atomically closes new
+# admission only once idle; missing/old API, bad response and timeout all FAIL.
+erkunder_wait_idle() {
+    local host="$1" timeout="${ERKUNDER_DEPLOY_WAIT_S:-900}" code
+    if [[ ! "$timeout" =~ ^[0-9]+$ || ${#timeout} -gt 6 ]]; then
+        error_ "ERKUNDER_DEPLOY_WAIT_S must be an integer (0..999999 seconds)"
+        return 1
+    fi
+    if [[ "$DRY_RUN" == true ]]; then
+        info "[DRY-RUN] Wait up to ${timeout}s for Erkunder reports; atomically close admission; FAIL without stopping on timeout/unreachable/old API"
+        return 0
+    fi
+    code=$(base64 -w0 "$(dirname "${BASH_SOURCE[0]}")/../src/erkunder/deploy.py") || return 1
+    if ! rssh "$host" "printf '%s' '$code' | base64 -d | docker exec -i docker-erkunder-1 python - '$timeout'"; then
+        error_ "Erkunder deploy gate FAIL — no container may be stopped; inspect admission if release failed"
+        return 1
     fi
 }

@@ -16,6 +16,7 @@ the job layer adds none. Trade-off: one in-process HTTP hop. A future refinement
 to extract a core chat function and call it directly (removing the hop); until then
 this wrapper is the low-risk way to make any chat call a durable job.
 """
+
 import logging
 import os
 from typing import Any, Awaitable, Callable, Dict, Optional
@@ -85,7 +86,9 @@ SELF_BASE_URL = os.getenv("BRIDGE_SELF_URL", "http://localhost:8000")
 # named `nginx` in both compose topologies (dev + prod); a worker-host without
 # a local LB can set BRIDGE_JOB_REDISPATCH_URL="" to switch this off — an
 # unreachable LB is logged loudly and falls back to the park.
-JOB_REDISPATCH_BASE_URL = os.getenv("BRIDGE_JOB_REDISPATCH_URL", "http://nginx:80").strip()
+JOB_REDISPATCH_BASE_URL = os.getenv(
+    "BRIDGE_JOB_REDISPATCH_URL", "http://nginx:80"
+).strip()
 JOB_CAPACITY_REDISPATCH_ATTEMPTS = 1
 JOB_REDISPATCH_PATHS = frozenset({"/v1/chat/completions", "/v1/research"})
 # Diagnostic marker on the re-dispatched request (which worker handed it on).
@@ -137,7 +140,11 @@ async def _post_with_capacity_redispatch(
     own = _self_identity()
     first = f"self-call refused ({own}; {_describe_rejection(response)})"
     if path not in JOB_REDISPATCH_PATHS or not JOB_REDISPATCH_BASE_URL:
-        why = "path not re-dispatchable" if path not in JOB_REDISPATCH_PATHS else "BRIDGE_JOB_REDISPATCH_URL empty"
+        why = (
+            "path not re-dispatchable"
+            if path not in JOB_REDISPATCH_PATHS
+            else "BRIDGE_JOB_REDISPATCH_URL empty"
+        )
         return response, f"{first}; no LB re-dispatch ({why})"
 
     hop_headers = {
@@ -151,13 +158,15 @@ async def _post_with_capacity_redispatch(
     for attempt in range(1, JOB_CAPACITY_REDISPATCH_ATTEMPTS + 1):
         logger.warning(
             f"🔀 job self-call {path}: {first} — re-dispatching via LB "
-            f"{JOB_REDISPATCH_BASE_URL} (attempt {attempt}/{JOB_CAPACITY_REDISPATCH_ATTEMPTS})"
+            f"{JOB_REDISPATCH_BASE_URL} "
+            f"(attempt {attempt}/{JOB_CAPACITY_REDISPATCH_ATTEMPTS})"
         )
         try:
             lb_response = await client.post(
                 f"{JOB_REDISPATCH_BASE_URL}{path}", json=body, headers=hop_headers
             )
-        except Exception as e:  # LB unreachable → keep the 429, the runner parks the job
+        except Exception as e:
+            # LB unreachable: keep the 429; the runner parks the job.
             logger.error(
                 f"❌ job LB re-dispatch {path} unreachable ({type(e).__name__}: {e}) — "
                 f"job will be parked instead"
@@ -172,10 +181,13 @@ async def _post_with_capacity_redispatch(
                 f"(upstream {lb_response.headers.get('X-Upstream-Server', '?')})"
             )
             return lb_response, None
-        lb_notes.append(f"LB#{attempt} {_describe_rejection(lb_response, fallback_worker='pool')}")
+        lb_notes.append(
+            f"LB#{attempt} {_describe_rejection(lb_response, fallback_worker='pool')}"
+        )
     # Every local worker refused too. Keep the ORIGINAL self-call 429 (its
     # Retry-After is this worker's own window) so the runner parks the job.
     return response, f"{first}; " + "; ".join(lb_notes)
+
 
 # Generous: a chat completion can run minutes; the job's heartbeat keeps the row
 # alive meanwhile, and the watchdog only requeues a genuinely dead worker.
@@ -190,7 +202,9 @@ PROXY_SELF_CALL_TIMEOUT_S = float(os.getenv("BRIDGE_PROXY_JOB_TIMEOUT_S", "300")
 
 # Doc-agent navigates a seeded workdir with file tools — multi-turn, can take
 # several minutes over many documents.
-DOC_AGENT_SELF_CALL_TIMEOUT_S = float(os.getenv("BRIDGE_DOC_AGENT_JOB_TIMEOUT_S", "1800"))
+DOC_AGENT_SELF_CALL_TIMEOUT_S = float(
+    os.getenv("BRIDGE_DOC_AGENT_JOB_TIMEOUT_S", "1800")
+)
 
 # Per-path overrides where the target endpoint's own internal budget exceeds the
 # generic default. Timeout-chain invariant: the executor's self-call must sit
@@ -199,7 +213,9 @@ DOC_AGENT_SELF_CALL_TIMEOUT_S = float(os.getenv("BRIDGE_DOC_AGENT_JOB_TIMEOUT_S"
 # anonymize grants the privacy service 1200s (main.py) → 1260s here; nginx
 # allows 2500s above both.
 PROXY_PATH_TIMEOUTS_S: Dict[str, float] = {
-    "/v1/privacy/smart-anonymize": float(os.getenv("BRIDGE_ANONYMIZE_JOB_TIMEOUT_S", "1260")),
+    "/v1/privacy/smart-anonymize": float(
+        os.getenv("BRIDGE_ANONYMIZE_JOB_TIMEOUT_S", "1260")
+    ),
 }
 
 # HTML→PDF render self-call timeout — matches the 600s the sync
@@ -353,7 +369,11 @@ def attach_ledger_cost(result: Any, headers: Any) -> Any:
     except (TypeError, ValueError):
         # Never fail the job over this: the call is paid and its result is
         # here. Say "unknown" out loud instead.
-        logger.error("job result: X-Bridge-Cost-Eur is not a number (%r) — cost_eur left unknown", raw)
+        logger.error(
+            "job result: X-Bridge-Cost-Eur is not a number (%r) "
+            "— cost_eur left unknown",
+            raw,
+        )
         usage["cost_eur"] = None
         usage["cost_source"] = "unbekannt"
         return result
@@ -377,12 +397,15 @@ async def _self_post_json(
 
     headers = _build_headers(attribution)
     async with httpx.AsyncClient(timeout=timeout_s) as client:
-        response, rejection = await _post_with_capacity_redispatch(client, path, body, headers)
+        response, rejection = await _post_with_capacity_redispatch(
+            client, path, body, headers
+        )
 
     if response.status_code >= 400:
         raise ExecutorHTTPError(
             response.status_code,
-            f"self-call {path} failed HTTP {response.status_code}: {response.text[:500]}",
+            f"self-call {path} failed HTTP {response.status_code}: "
+            f"{response.text[:500]}",
             retry_after_s=_retry_after_s(response),
             rejection=rejection,
         )
@@ -390,7 +413,9 @@ async def _self_post_json(
         return response.json()
     except Exception as e:
         ctype = response.headers.get("content-type", "?")
-        raise RuntimeError(f"self-call {path} returned non-JSON (content-type={ctype}): {e}")
+        raise RuntimeError(
+            f"self-call {path} returned non-JSON (content-type={ctype}): {e}"
+        )
 
 
 async def research_executor(
@@ -416,10 +441,13 @@ async def research_executor(
     # instead of the result. The job layer is the durability mechanism here.
     body = {**payload, "async_mode": False}
     await report_progress({"phase": "research", "model": body.get("model")})
-    result = await _self_post_json("/v1/research", body, attribution, RESEARCH_SELF_CALL_TIMEOUT_S)
+    result = await _self_post_json(
+        "/v1/research", body, attribution, RESEARCH_SELF_CALL_TIMEOUT_S
+    )
     if result.get("status") == "error":
         raise RuntimeError(
-            f"research self-call returned status=error: {result.get('error') or 'no error message'}"
+            "research self-call returned status=error: "
+            f"{result.get('error') or 'no error message'}"
         )
     return result
 
@@ -433,7 +461,9 @@ async def doc_agent_executor(
     durable job. Same self-call pattern as research: the endpoint owns auth,
     budget gate and billing; the job layer owns durability/requeue."""
     await report_progress({"phase": "doc-agent", "model": payload.get("model")})
-    return await _self_post_json("/v1/doc-agent", payload, attribution, DOC_AGENT_SELF_CALL_TIMEOUT_S)
+    return await _self_post_json(
+        "/v1/doc-agent", payload, attribution, DOC_AGENT_SELF_CALL_TIMEOUT_S
+    )
 
 
 async def convert_html_to_pdf_executor(
@@ -451,7 +481,9 @@ async def convert_html_to_pdf_executor(
     result cannot be turned into a PDF)."""
     html = payload.get("html")
     if not isinstance(html, str) or not html.strip():
-        raise RuntimeError("convert-html-to-pdf payload requires a non-empty 'html' string")
+        raise RuntimeError(
+            "convert-html-to-pdf payload requires a non-empty 'html' string"
+        )
     await report_progress({"phase": "render-pdf"})
     result = await _self_post_json(
         "/v1/convert-html-to-pdf", payload, attribution, PDF_SELF_CALL_TIMEOUT_S
@@ -503,6 +535,7 @@ async def erkunder_executor(
 
     from src.erkunder.models import Auftrag, Ergebnis
     from src.erkunder.zugang import intern_config
+    from src.jobs.registry import DEPENDENCY_UNAVAILABLE_STATUS
 
     try:
         auftrag = Auftrag.model_validate(payload)
@@ -521,23 +554,34 @@ async def erkunder_executor(
 
     async def run() -> dict:
         async with httpx.AsyncClient(timeout=60) as client:
-            response = await client.post(
-                f"{url}/start",
-                headers=headers,
-                json={
-                    "worker": os.environ.get("INSTANCE_NAME", "unknown"),
-                    "claude_token": token,
-                    "auftrag": auftrag.model_dump(mode="json", by_alias=True),
-                },
-            )
-            if response.status_code == 409:
-                raise ExecutorHTTPError(429, "Erkunder belegt", retry_after_s=120)
-            if response.status_code != 200:
-                raise RuntimeError(f"Erkunder start HTTP {response.status_code}")
             while True:
+                # Reattach even if a fast restart happened between two polls.
+                response = await client.post(
+                    f"{url}/start",
+                    headers=headers,
+                    json={
+                        "worker": os.environ.get("INSTANCE_NAME", "unknown"),
+                        "claude_token": token,
+                        "auftrag": auftrag.model_dump(mode="json", by_alias=True),
+                    },
+                )
+                if response.status_code in {502, 503, 504}:
+                    raise ExecutorHTTPError(
+                        DEPENDENCY_UNAVAILABLE_STATUS,
+                        "Erkunder: Leitstand nicht bereit",
+                    )
+                if response.status_code == 409:
+                    raise ExecutorHTTPError(429, "Erkunder belegt", retry_after_s=120)
+                if response.status_code != 200:
+                    raise RuntimeError(f"Erkunder start HTTP {response.status_code}")
                 response = await client.get(
                     f"{url}/status/{auftrag.bericht_id}", headers=headers
                 )
+                if response.status_code in {502, 503, 504}:
+                    raise ExecutorHTTPError(
+                        DEPENDENCY_UNAVAILABLE_STATUS,
+                        "Erkunder: Leitstand nicht bereit",
+                    )
                 if response.status_code != 200:
                     raise RuntimeError(f"Erkunder status HTTP {response.status_code}")
                 state = response.json()
@@ -594,6 +638,12 @@ async def erkunder_executor(
         )
     except asyncio.TimeoutError:
         raise RuntimeError("Erkunder: Gesamtfrist abgelaufen") from None
+    except httpx.TransportError:
+        # The watchdog retries /start with the same report ID and fresh token.
+        # B1m then resumes interrupted steps; completed steps remain intact.
+        raise ExecutorHTTPError(
+            DEPENDENCY_UNAVAILABLE_STATUS, "Erkunder: Leitstand nicht erreichbar"
+        ) from None
     except (httpx.HTTPError, ValidationError, ValueError, KeyError):
         raise RuntimeError(
             "Erkunder: Leitstand-Antwort ungueltig oder nicht erreichbar"

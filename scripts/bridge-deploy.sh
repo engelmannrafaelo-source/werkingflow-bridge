@@ -1404,6 +1404,19 @@ phase_rollback() {
 
     warn "=== ROLLBACK: ${host} → ${sha} ==="
 
+    # A restarted Leitstand may already have accepted work before smoke failed.
+    # If it is running, rollback must drain too; otherwise the earlier gate's
+    # closed admission still applies. Inspect errors must never imply idle.
+    if [[ " ${services[*]} " == *" erkunder"* ]]; then
+        local running
+        running=$(rssh "$host" "docker inspect --format '{{.State.Running}}' docker-erkunder-1") || return 2
+        case "$running" in
+            true) erkunder_wait_idle "$host" || return 2 ;;
+            false) : ;;
+            *) error_ "CRITICAL: unknown Erkunder state before rollback"; return 2 ;;
+        esac
+    fi
+
     rssh "$host" "cd ${REMOTE_REPO} && git reset --hard '${sha}'" || {
         error_ "CRITICAL: git reset --hard failed on ${host} — manual intervention required"
         return 2
