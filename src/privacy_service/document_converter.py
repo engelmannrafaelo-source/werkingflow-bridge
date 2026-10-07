@@ -285,6 +285,28 @@ RENDER_PAGE_MAX_EDGE = 1600
 # this is the guard against the 132-MP figure that previously timed out.
 MAX_IMAGE_EDGE = 2000
 
+# Render scale for Docling's figure crops (see _docling_convert_pdf). Default 1.0
+# keeps the historic output byte-identical; the GPU host opts in via env, so the
+# switch (and its rollback) is one compose line on the one host both bridges share.
+DOCLING_IMAGES_SCALE_DEFAULT = 1.0
+DOCLING_IMAGES_SCALE_MAX = 4.0
+
+
+def _docling_images_scale() -> float:
+    """``DOCLING_IMAGES_SCALE`` as float; fail loud on anything unusable."""
+    raw = os.getenv("DOCLING_IMAGES_SCALE", "").strip()
+    if not raw:
+        return DOCLING_IMAGES_SCALE_DEFAULT
+    try:
+        value = float(raw)
+    except ValueError as e:
+        raise ValueError(f"DOCLING_IMAGES_SCALE={raw!r} ist keine Zahl") from e
+    if not (1.0 <= value <= DOCLING_IMAGES_SCALE_MAX):
+        raise ValueError(
+            f"DOCLING_IMAGES_SCALE={value} liegt ausserhalb 1.0..{DOCLING_IMAGES_SCALE_MAX}"
+        )
+    return value
+
 # A page with fewer than this many native (non-OCR) text-layer characters is
 # treated as image/scan-only and rendered whole for Vision.
 MIN_PAGE_TEXT_CHARS = 40
@@ -428,6 +450,12 @@ def _docling_convert_pdf(
 
     pipeline_options = PdfPipelineOptions()
     pipeline_options.generate_picture_images = True
+    # Docling crops figures from a page raster rendered at ``images_scale``
+    # (1.0 = 72 DPI). At the default a photo printed 8 cm wide comes out
+    # ~230 px — too small for Vision to read a gauge or a nameplate, so it
+    # guesses (Weidenhof-Akt 05.10.2026: 0/4 photo findings, invented devices).
+    # MAX_IMAGE_EDGE still caps every figure afterwards.
+    pipeline_options.images_scale = _docling_images_scale()
     pipeline_options.generate_table_images = False
     pipeline_options.do_ocr = True
     # Device folgt PRIVACY_DEVICE (gleiche Semantik wie Flair, siehe

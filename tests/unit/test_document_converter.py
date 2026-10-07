@@ -718,3 +718,25 @@ class TestMojibakeRepairWiredIntoProductionPaths:
         confirmed via repo-wide grep) and is intentionally gone — the real
         entry points call the adapters directly, see tests above."""
         assert not hasattr(dc, "convert_document_sync")
+
+
+# ── DOCLING_IMAGES_SCALE (Foto-Aufloesung, 07.10.2026) ──────────────────────
+
+def test_docling_images_scale_default_is_unchanged(monkeypatch):
+    from src.privacy_service import document_converter as dc
+    monkeypatch.delenv("DOCLING_IMAGES_SCALE", raising=False)
+    assert dc._docling_images_scale() == 1.0
+
+
+def test_docling_images_scale_reads_env(monkeypatch):
+    from src.privacy_service import document_converter as dc
+    monkeypatch.setenv("DOCLING_IMAGES_SCALE", "3")
+    assert dc._docling_images_scale() == 3.0
+
+
+@pytest.mark.parametrize("raw", ["abc", "0.5", "9"])
+def test_docling_images_scale_fails_loud(monkeypatch, raw):
+    from src.privacy_service import document_converter as dc
+    monkeypatch.setenv("DOCLING_IMAGES_SCALE", raw)
+    with pytest.raises(ValueError):
+        dc._docling_images_scale()
