@@ -1466,27 +1466,35 @@ async def generate_streaming_response(
                 # bekaeme "claude-sonnet-5" gemeldet, obwohl Gemini geantwortet
                 # hat — und genau diese Zuordnung ist das, was der Kostenvergleich
                 # messen soll.
-                initial_chunk = ChatCompletionStreamResponse(
-                    id=request_id,
-                    model=vision_result.model,
-                    choices=[StreamChoice(index=0, delta={"role": "assistant", "content": ""}, finish_reason=None)]
-                )
-                yield f"data: {initial_chunk.model_dump_json()}\n\n"
+                # Gleiche Antwort-Politik wie der Weg ohne Streaming: echter
+                # Abbruchgrund (max_tokens -> "length") und FAIL-LOUD bei leerem
+                # Content. Bei leerem Content geht NICHTS als Erfolg raus (kein
+                # Final-Chunk, kein [DONE]); der Fehler folgt nach dem
+                # Ledger-Persist (der Prepaid-Spend ist real).
+                from src.vision_provider import finish_reason_for as _finish_reason_for
+                _vision_empty = not vision_result.content
+                if not _vision_empty:
+                    initial_chunk = ChatCompletionStreamResponse(
+                        id=request_id,
+                        model=vision_result.model,
+                        choices=[StreamChoice(index=0, delta={"role": "assistant", "content": ""}, finish_reason=None)]
+                    )
+                    yield f"data: {initial_chunk.model_dump_json()}\n\n"
 
-                content_chunk = ChatCompletionStreamResponse(
-                    id=request_id,
-                    model=vision_result.model,
-                    choices=[StreamChoice(index=0, delta={"content": vision_result.content}, finish_reason=None)]
-                )
-                yield f"data: {content_chunk.model_dump_json()}\n\n"
+                    content_chunk = ChatCompletionStreamResponse(
+                        id=request_id,
+                        model=vision_result.model,
+                        choices=[StreamChoice(index=0, delta={"content": vision_result.content}, finish_reason=None)]
+                    )
+                    yield f"data: {content_chunk.model_dump_json()}\n\n"
 
-                final_chunk = ChatCompletionStreamResponse(
-                    id=request_id,
-                    model=vision_result.model,
-                    choices=[StreamChoice(index=0, delta={}, finish_reason="stop")]
-                )
-                yield f"data: {final_chunk.model_dump_json()}\n\n"
-                yield "data: [DONE]\n\n"
+                    final_chunk = ChatCompletionStreamResponse(
+                        id=request_id,
+                        model=vision_result.model,
+                        choices=[StreamChoice(index=0, delta={}, finish_reason=_finish_reason_for(vision_result.stop_reason))]
+                    )
+                    yield f"data: {final_chunk.model_dump_json()}\n\n"
+                    yield "data: [DONE]\n\n"
 
                 logger.info("✅ Vision streaming completed")
 
@@ -1527,6 +1535,11 @@ async def generate_streaming_response(
                     logger.warning(
                         f"⚠️ Vision streaming usage tracking failed (non-fatal): {_vision_track_err}"
                     )
+                if _vision_empty:
+                    from src.middleware.bridge_error import vision_empty_response_error
+                    _empty_env = json.loads(vision_empty_response_error(vision_result.stop_reason).body)
+                    yield f"event: error\ndata: {json.dumps(_empty_env)}\n\n"
+                    yield "data: [DONE]\n\n"
                 return
 
             except Exception as e:
@@ -3044,6 +3057,7 @@ async def chat_completions(
                 _created = response_data.get("created")
                 _model = response_data.get("model")
                 _content = (response_data.get("choices") or [{}])[0].get("message", {}).get("content", "")
+                _finish = (response_data.get("choices") or [{}])[0].get("finish_reason") or "unknown"
 
                 async def _direct_as_sse():
                     yield "data: " + _json.dumps({
@@ -3054,7 +3068,7 @@ async def chat_completions(
                     yield "data: " + _json.dumps({
                         "id": _sid, "object": "chat.completion.chunk", "created": _created,
                         "model": _model,
-                        "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+                        "choices": [{"index": 0, "delta": {}, "finish_reason": _finish}],
                         "usage": usage,
                         "x_backend_info": response_data["x_backend_info"],
                     }) + "\n\n"

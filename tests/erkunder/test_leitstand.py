@@ -501,6 +501,27 @@ async def test_result_skips_untrusted_script_files(tmp_path, kind, caplog):
         await service.shutdown()
 
 
+async def test_result_reports_scripts_beyond_budget_instead_of_empty_string(tmp_path):
+    """Kein stilles Kappen: ist das 200-KB-Budget aufgebraucht, kommt die
+    naechste Datei NICHT als leerer String, sondern gemeldet."""
+    service, _, _ = await setup(tmp_path)
+    try:
+        await finish(service)
+        folder = service.directory("bericht-123") / "erkunder-1" / "skripte"
+        folder.mkdir(exist_ok=True)
+        (folder / "a.py").write_text("x" * (200 * 1024))
+        (folder / "b.py").write_text("print(1)")
+
+        result = service.result("bericht-123")
+
+        assert "erkunder-1" in result["skripte_gekuerzt"]
+        assert "skripte/b.py" in result["skripte_uebersprungen"]
+        assert "skripte/b.py" not in result["skripte"]["erkunder-1"]
+        assert "" not in result["skripte"]["erkunder-1"].values()
+    finally:
+        await service.shutdown()
+
+
 @pytest.mark.parametrize("failure", ["503", "unreachable", "timeout"])
 async def test_cleanup_deletes_report_after_place_abort_failure(
     tmp_path, failure, caplog

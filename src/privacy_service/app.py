@@ -825,7 +825,19 @@ async def _call_ai_for_conversion(html_chunk: str, max_retries: int = 4) -> str:
 
             if response.status_code == 200:
                 result = response.json()
-                content = result.get("content", [{}])[0].get("text", "")
+                # Alle Textbloecke zusammenfuehren (nicht nur content[0]).
+                content = "".join(
+                    b.get("text", "") for b in (result.get("content") or [])
+                    if b.get("type", "text") == "text"
+                )
+                if result.get("stop_reason") == "max_tokens":
+                    # Abgeschnittenes HTML waere ein stilles Dokumentloch. Ein
+                    # Retry mit gleichem Budget liefert dasselbe -> sofort laut.
+                    raise RuntimeError(
+                        "Semantische HTML-Umwandlung bei max_tokens="
+                        f"{request_body['max_tokens']} abgeschnitten (stop_reason=max_tokens); "
+                        "Seitenbuendel kleiner teilen"
+                    )
                 return _strip_markdown_fences(content)
 
             if response.status_code == 429:

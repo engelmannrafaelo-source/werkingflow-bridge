@@ -66,6 +66,25 @@ _BEDROCK_THROTTLE_ERROR_CODES = frozenset({
 })
 
 
+def _effective_max_tokens(request) -> int:
+    """Aufrufer-Wert durchreichen; die Vorgabe 4096 gilt nur ohne Angabe und
+    wird dann laut geloggt (nie still)."""
+    if request.max_tokens:
+        return request.max_tokens
+    logger.warning("Bedrock: kein max_tokens im Request — Vorgabe 4096 wird gesetzt")
+    return 4096
+
+
+def _stream_finish_reason(stop_reason: Optional[str]) -> str:
+    """finish_reason fuer das Streaming-Ende. Fehlt der stop_reason komplett
+    (kein message_delta gesehen), wird NICHT "stop" erfunden, sondern
+    "unknown" gemeldet — der Aufrufer sieht, dass der Abbruchgrund fehlt."""
+    if not stop_reason:
+        logger.error("Bedrock-Stream ohne stop_reason beendet — melde finish_reason 'unknown'")
+        return "unknown"
+    return _map_bedrock_stop_reason(stop_reason)
+
+
 def _map_bedrock_stop_reason(bedrock_reason: Optional[str]) -> str:
     """Map Bedrock stop_reason to OpenAI finish_reason.
 
@@ -82,7 +101,10 @@ def _map_bedrock_stop_reason(bedrock_reason: Optional[str]) -> str:
         "content_filtered": "content_filter",
         "refusal": "content_filter",
     }
-    return mapping.get(bedrock_reason, "stop")
+    if not bedrock_reason:
+        return "stop"
+    # Unbekannte Werte (z.B. tool_use) durchreichen statt zu "stop" zu beschoenigen.
+    return mapping.get(bedrock_reason, bedrock_reason)
 
 
 # FastAPI app for Bedrock-only service
@@ -235,7 +257,7 @@ async def call_bedrock(
     body = {
         "anthropic_version": "bedrock-2023-05-31",
         "messages": messages,
-        "max_tokens": request.max_tokens or 4096,
+        "max_tokens": _effective_max_tokens(request),
     }
 
     if system_prompt:
@@ -401,7 +423,7 @@ async def stream_bedrock(
     body = {
         "anthropic_version": "bedrock-2023-05-31",
         "messages": messages,
-        "max_tokens": request.max_tokens or 4096,
+        "max_tokens": _effective_max_tokens(request),
     }
 
     if system_prompt:
@@ -459,6 +481,7 @@ async def stream_bedrock(
 
         _events = iter(response["body"])
         _stream_end = object()
+        _stream_stop_reason = None
         while True:
             event = await asyncio.to_thread(next, _events, _stream_end)
             if event is _stream_end:
@@ -476,6 +499,10 @@ async def stream_bedrock(
                 _delta_usage = chunk.get("usage") or {}
                 if "output_tokens" in _delta_usage:
                     usage_sink["output_tokens"] = _delta_usage["output_tokens"]
+                # Abbruchgrund steht NUR hier (message_delta), nicht in message_stop.
+                _delta_stop = (chunk.get("delta") or {}).get("stop_reason")
+                if _delta_stop:
+                    _stream_stop_reason = _delta_stop
 
             if chunk.get("type") == "content_block_delta":
                 delta_text = chunk.get("delta", {}).get("text", "")
@@ -502,7 +529,7 @@ async def stream_bedrock(
                         StreamChoice(
                             index=0,
                             delta={},
-                            finish_reason="stop"
+                            finish_reason=_stream_finish_reason(_stream_stop_reason)
                         )
                     ]
                 )

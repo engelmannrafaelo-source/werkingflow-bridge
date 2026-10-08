@@ -701,6 +701,15 @@ class Coordinator:
             for file in sorted((directory / "skripte").rglob("*")):
                 if file.suffix not in (".py", ".sh"):
                     continue
+                if budget <= 0:
+                    # Budget aufgebraucht: die Datei kommt NICHT als leerer
+                    # String (sah wie ein leeres Skript aus), sondern ist
+                    # gemeldet: Schritt in skripte_gekuerzt, Datei in
+                    # skripte_uebersprungen.
+                    if name not in shortened:
+                        shortened.append(name)
+                    skipped.append(str(file.relative_to(directory)))
+                    continue
                 try:
                     data = read_bytes(file, limit=budget)
                 except (OSError, ValueError) as error:

@@ -442,8 +442,18 @@ class VisionProvider:
                 "completion_tokens": usage.get("output_tokens", 0),
                 "total_tokens": usage.get("input_tokens", 0) + usage.get("output_tokens", 0)
             },
-            stop_reason=data.get("stop_reason", "end_turn")
+            stop_reason=_stop_reason_or_unknown(data.get("stop_reason"))
         )
+
+
+def _stop_reason_or_unknown(stop_reason: Optional[str]) -> str:
+    """Fehlender stop_reason ist kein Erfolg: bis 2026-10 wurde er zu "end_turn"
+    (-> finish_reason "stop") erfunden. Jetzt "unknown" — wird von
+    finish_reason_for durchgereicht, der Aufrufer sieht es, und es wird geloggt."""
+    if stop_reason:
+        return stop_reason
+    logger.error("Vision-Antwort ohne stop_reason — Abbruchgrund unbekannt, melde 'unknown'")
+    return "unknown"
 
 
 # ── Antwort-Politik (ADR-0011-Nachlese, 2026-08-31) ─────────────────────────

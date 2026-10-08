@@ -102,6 +102,12 @@ class Texte(Vertrag):
     bericht_id: BerichtId
     texte: dict[SchrittName, str]
     skripte: dict[SchrittName, dict[str, str]]
+    # VERTRAG (kein stilles Kappen): Skripte werden je Schritt mit einem Budget
+    # von 200 KB ausgeliefert. Wird gekuerzt, steht der Schritt in
+    # `skripte_gekuerzt` (die letzte passende Datei ist dann abgeschnitten) und
+    # jede Datei, die das Budget gar nicht mehr erreicht hat, in
+    # `skripte_uebersprungen` (nie als leerer String in `skripte`). Der Aufrufer
+    # (Energy) MUSS beide Felder auswerten und laut melden, wenn eines nicht leer ist.
     skripte_gekuerzt: list[SchrittName]
     skripte_uebersprungen: list[str] = Field(default_factory=list)
     gutachten_final: str

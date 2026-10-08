@@ -16,6 +16,7 @@ CLI path. Rafael 2026-07-11: route calls that keep failing on the CLI path
 through this direct path instead, once they're not tool-capable anyway.
 """
 
+import logging
 import time
 import uuid
 from typing import Any, Dict
@@ -23,11 +24,18 @@ from typing import Any, Dict
 from src.models import ChatCompletionRequest
 from src.routing.backend_router import BackendConfig
 from src.routing.vision_router import prepare_messages_for_vision, route_to_vision
+from src.vision_provider import finish_reason_for
+
+logger = logging.getLogger(__name__)
 
 # The CLI path's own session-level ceiling (claude_cli.py MAX_TIMEOUT default)
 # — give the direct path at least as much room, since it exists specifically
 # to rescue calls that would otherwise hit that ceiling.
 DEFAULT_TIMEOUT_S = 2400.0
+
+#: Nur wenn der Aufrufer kein max_tokens schickt. Wird geloggt und im Antwortkopf
+#: (x_bridge_max_tokens_defaulted) gemeldet.
+DEFAULT_MAX_TOKENS = 4096
 
 
 async def call_anthropic_direct(
@@ -59,10 +67,20 @@ async def call_anthropic_direct(
     """
     messages = prepare_messages_for_vision(request.messages)
 
+    # max_tokens: Aufrufer-Wert wird durchgereicht. Nur wenn keiner kommt, gilt
+    # die Vorgabe — und die ist sichtbar (Log + x_bridge_max_tokens_defaulted),
+    # nie still.
+    max_tokens_defaulted = not request.max_tokens
+    if max_tokens_defaulted:
+        logger.warning(
+            "claude-direct: kein max_tokens im Request — Vorgabe %d wird gesetzt",
+            DEFAULT_MAX_TOKENS,
+        )
+
     result = await route_to_vision(
         messages=messages,
         model=config.provider_model or request.model,
-        max_tokens=request.max_tokens or 4096,
+        max_tokens=request.max_tokens or DEFAULT_MAX_TOKENS,
         temperature=request.temperature if request.temperature is not None else 0.7,
         timeout=timeout,
         thinking=request.thinking,
@@ -78,8 +96,11 @@ async def call_anthropic_direct(
             {
                 "index": 0,
                 "message": {"role": "assistant", "content": result.content},
-                "finish_reason": "stop",
+                # Echter Abbruchgrund: max_tokens -> "length", nie pauschal "stop".
+                "finish_reason": finish_reason_for(result.stop_reason),
             }
         ],
         "usage": result.usage,
+        "x_bridge_max_tokens": request.max_tokens or DEFAULT_MAX_TOKENS,
+        "x_bridge_max_tokens_defaulted": max_tokens_defaulted,
     }

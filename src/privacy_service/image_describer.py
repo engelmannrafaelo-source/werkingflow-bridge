@@ -78,7 +78,13 @@ async def _describe_one(
         temperature=0.1,
         system_prompt=system_prompt,
     )
-    return (resp.content or "").strip()
+    text = (resp.content or "").strip()
+    if getattr(resp, "stop_reason", None) == "max_tokens":
+        # Abgeschnittene Beschreibung geht als Text in den KI-Kontext des
+        # Aufrufers — sichtbar markieren, nicht still liefern.
+        logger.error("[image_describer] Bildbeschreibung bei max_tokens abgeschnitten")
+        text += "\n\n_[Bildbeschreibung unvollständig: bei max_tokens abgeschnitten]_"
+    return text
 
 
 async def describe_images(
