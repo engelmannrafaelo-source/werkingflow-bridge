@@ -101,7 +101,8 @@ async def test_bedrock_stream_meldet_stop_reason(monkeypatch, stop_reason, expec
 
 
 def test_bedrock_unbekannter_grund_wird_durchgereicht():
-    assert bedrock_service._map_bedrock_stop_reason("tool_use") == "tool_use"
+    assert bedrock_service._map_bedrock_stop_reason("tool_use") == "tool_calls"
+    assert bedrock_service._map_bedrock_stop_reason("pause_turn") == "pause_turn"
     assert bedrock_service._map_bedrock_stop_reason("max_tokens") == "length"
 
 
@@ -113,3 +114,10 @@ def test_fehlender_stop_reason_wird_nicht_zu_end_turn():
     assert _stop_reason_or_unknown(None) == "unknown"
     assert finish_reason_for(_stop_reason_or_unknown(None)) == "unknown"
     assert _stop_reason_or_unknown("max_tokens") == "max_tokens"
+
+
+def test_unbekannter_finish_reason_bricht_das_antwortmodell_nicht():
+    from src.models import Choice, StreamChoice
+
+    Choice(index=0, message=Message(role="assistant", content="x"), finish_reason="refusal")
+    StreamChoice(index=0, delta={}, finish_reason="model_context_window_exceeded")

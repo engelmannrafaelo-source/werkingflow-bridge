@@ -100,6 +100,7 @@ def _map_bedrock_stop_reason(bedrock_reason: Optional[str]) -> str:
         "stop_sequence": "stop",
         "content_filtered": "content_filter",
         "refusal": "content_filter",
+        "tool_use": "tool_calls",
     }
     if not bedrock_reason:
         return "stop"
@@ -398,7 +399,7 @@ async def stream_bedrock(
     try:
         client = get_bedrock_client()
     except RuntimeError as e:
-        yield f"data: {{\"error\": \"{str(e)}\"}}\n\n"
+        yield f"event: error\ndata: {json.dumps({'error': str(e)})}\n\n"
         return
 
     # Resolve model
@@ -543,7 +544,7 @@ async def stream_bedrock(
         # Surface the provider error to the usage tracker (sink outlives the
         # generator) — status stays 'error' from the setdefault above.
         usage_sink["error_message"] = str(e)
-        yield f"data: {{\"error\": \"{str(e)}\"}}\n\n"
+        yield f"event: error\ndata: {json.dumps({'error': str(e)})}\n\n"
 
 
 @app.post("/v1/chat/completions")
