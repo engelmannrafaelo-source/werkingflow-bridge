@@ -100,3 +100,26 @@ async def test_worker_routes_forbidden(app, method, action):
             headers={"Authorization": "Bearer synthetic-key"},
         )
     assert r.status_code == 403
+
+
+@pytest.mark.parametrize("allowed", [False, True])
+async def test_library_is_authenticated_and_hashes_fulltext(app, monkeypatch, allowed):
+    from src.research_cloud import library
+
+    key = hashlib.sha256(b"synthetic-key").hexdigest() if allowed else ""
+    monkeypatch.setenv("ERKUNDER_ALLOWED_KEY_SHA256", key)
+    monkeypatch.setattr(library, "load_library_config", Mock())
+    fetch = AsyncMock(return_value={"documents": [
+        {"id": "kw-stoerung-pumpen", "title": "Pumpen"}, {"id": "unrelated", "title": "Andere"},
+    ]})
+    monkeypatch.setattr(library, "fetch_library_index", fetch)
+    monkeypatch.setattr(library, "fetch_library_document", AsyncMock(return_value={"text": "Prüfwissen"}))
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app), base_url="http://test") as c:
+        response = await c.get("/v1/erkunder/bibliothek", headers={"Authorization": "Bearer synthetic-key"})
+    assert response.status_code == (200 if allowed else 403)
+    if allowed:
+        documents = response.json()["dokumente"]
+        assert len(documents) == 1
+        assert documents[0]["sha256"] == hashlib.sha256("Prüfwissen".encode()).hexdigest()
+    else:
+        fetch.assert_not_awaited()

@@ -22,7 +22,7 @@ def test_prompts(auftrag):
         assert "vertiefung.md" not in prompt
         assert "zusätzlich fragt" not in prompt
         assert "{gegenstand}" not in prompt
-    assert PROMPT_VERSION == "erkunder-prompts/1"
+    assert PROMPT_VERSION == "erkunder-prompts/2"
     assert "ausgefallen" not in harmonisierung_prompt(a, [])
     assert "trägt / trägt teilweise / trägt nicht" in pruefung_prompt(a)
     assert "Ersatzgröße" in pruefung_prompt(a)

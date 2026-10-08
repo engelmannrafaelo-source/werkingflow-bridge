@@ -609,6 +609,7 @@ async def erkunder_executor(
                         "geheimnis_im_ergebnis",
                         "platz_neustart",
                         "Ergebnis-Integritaet",
+                        "Nachweis-Integritaet",
                         "Wiederanhaengen",
                         "konto",
                         "unbekannt",
@@ -627,6 +628,8 @@ async def erkunder_executor(
                             "pruefung",
                             "harmonisierung-korrektur",
                             "pruefung-korrektur",
+                            *(f"{kind}-korrektur-{n}" for kind in ("harmonisierung", "pruefung")
+                              for n in range(2, 6)),
                         }
                         else "unbekannt"
                     )

@@ -31,6 +31,15 @@ from .prompts import (
     korrektur_prompt,
     pruefung_prompt,
 )
+from .pruefkreis import (
+    artifact_hashes,
+    manifest_text,
+    migriere_altauftrag,
+    prueferzahlen,
+    pruefumfang,
+    pruefurteil,
+    zahlenbelege,
+)
 
 LOG = logging.getLogger(__name__)
 ID = re.compile(r"^[a-z0-9-]{8,80}$")
@@ -173,7 +182,7 @@ class Coordinator:
             directory = self.directory(path.name)
             file = directory / ".lauf.json"
             if file.exists():
-                self.states[path.name] = json.loads(read_text(file))
+                self.states[path.name] = migriere_altauftrag(json.loads(read_text(file)))
                 self.token_ready[path.name] = asyncio.Event()
         await self.reap()
         for ident, state in list(self.states.items()):
@@ -331,6 +340,8 @@ class Coordinator:
             target.chmod(0o644)
             if size != file.bytes or digest.hexdigest().lower() != file.sha256.lower():
                 raise StepFailed("daten", "unbekannt: sha256 oder bytes")
+        (entry / "quellen.md").write_text(manifest_text(order))
+        (entry / "quellen.md").chmod(0o644)
         self.states[ident]["eingang_fertig"] = True
         self.save(ident)
 
@@ -531,33 +542,7 @@ class Coordinator:
                 harmonisierung_prompt(order, failed),
                 reports,
             )
-            harmonized = self.output(ident, "harmonisierung")
-            await self.step(
-                ident,
-                "pruefung",
-                0,
-                pruefung_prompt(order),
-                {"gutachten.md": harmonized},
-            )
-            review = self.output(ident, "pruefung")
-            if re.search(r"tr(?:ä|ae)gt\s+(?:nicht|teilweise)", review, re.IGNORECASE):
-                state["korrekturkreis_gelaufen"] = True
-                state["gesamt"] = 7
-                self.save(ident)
-                await self.step(
-                    ident,
-                    "harmonisierung-korrektur",
-                    0,
-                    korrektur_prompt(order),
-                    {"gutachten.md": harmonized, "pruefung.md": review},
-                )
-                await self.step(
-                    ident,
-                    "pruefung-korrektur",
-                    0,
-                    pruefung_prompt(order),
-                    {"gutachten.md": self.output(ident, "harmonisierung-korrektur")},
-                )
+            await self.review_loop(ident, order)
             # Validate again after the reviewer (same UID as harmonization).
             # result() validates the exact bytes it returns as well.
             for item in state["schritte"]:
@@ -575,6 +560,9 @@ class Coordinator:
                 ],
                 "erkunder_ausgefallen": failed,
                 "korrekturkreis_gelaufen": state["korrekturkreis_gelaufen"],
+                "offene_befunde_anzahl": len(state["offene_befunde"]),
+                "pruefstatus": "offen" if state["offene_befunde"] else "widerspruchsfrei",
+                "korrekturrunden": state["korrekturrunden"],
             }
         except asyncio.CancelledError:
             raise
@@ -610,6 +598,61 @@ class Coordinator:
                 )
                 raise
         self.save(ident)
+
+    def report_evidence(self, ident: str, name: str, report: str, order: Auftrag) -> list[str]:
+        state = self.states[ident]
+        machine, artifacts = zahlenbelege(
+            self.directory(ident) / name, report, {f.ziel for f in order.dateien},
+        )
+        previous = state.get("nachweis_hashes", {}).get(name)
+        if previous is not None and previous != artifact_hashes(artifacts):
+            raise StepFailed(name, "Nachweis-Integritaet: Skript/Ergebnis nachträglich verändert")
+        machine.extend(pruefumfang(report, order.pruefliste))
+        state.setdefault("nachweise", {})[name] = artifacts
+        state.setdefault("nachweis_hashes", {})[name] = artifact_hashes(artifacts)
+        self.save(ident)
+        return machine
+
+    async def review_loop(self, ident: str, order: Auftrag) -> None:
+        """Resume numbered steps; a fresh review owns every corrected version."""
+        state = self.states[ident]
+        report_name = "harmonisierung"
+        for round_no in range(order.korrekturkreis + 1):
+            suffix = "" if round_no == 0 else "-korrektur" + (f"-{round_no}" if round_no > 1 else "")
+            review_name = "pruefung" + suffix
+            report = self.output(ident, report_name)
+            machine = self.report_evidence(ident, report_name, report, order)
+            await self.step(ident, review_name, 0, pruefung_prompt(order), {
+                "gutachten.md": report,
+                "maschinenbefunde.json": json.dumps(machine, ensure_ascii=False),
+            })
+            try:
+                findings = pruefurteil(self.output(ident, review_name))
+            except ValueError as error:
+                findings = [f"Prüfurteil unvollständig: {error}"]
+            self.report_evidence(ident, report_name, report, order)
+            machine.extend(prueferzahlen(
+                self.directory(ident) / report_name, report, self.output(ident, review_name),
+                {f.ziel for f in order.dateien},
+            ))
+            state.update(
+                offene_befunde=list(dict.fromkeys(machine + findings)),
+                gutachten_schritt=report_name, pruefung_schritt=review_name,
+                korrekturrunden=round_no,
+            )
+            self.save(ident)
+            if not state["offene_befunde"] or round_no == order.korrekturkreis:
+                return
+            next_no = round_no + 1
+            report_name = "harmonisierung-korrektur" + (f"-{next_no}" if next_no > 1 else "")
+            state["korrekturkreis_gelaufen"] = True
+            state["gesamt"] = 5 + 2 * next_no
+            self.save(ident)
+            await self.step(ident, report_name, 0, korrektur_prompt(order), {
+                "gutachten.md": report,
+                "pruefung.md": self.output(ident, review_name),
+                "maschinenbefunde.json": json.dumps(state["offene_befunde"], ensure_ascii=False),
+            })
 
     def status(self, ident: str) -> dict[str, Any]:
         self.directory(ident)
@@ -661,7 +704,7 @@ class Coordinator:
                     "utf-8", errors="ignore"
                 )
                 budget -= len(data)
-        suffix = "-korrektur" if state["korrekturkreis_gelaufen"] else ""
+        final = self.final_report(state, texts, scripts)
         return {
             "schema": "erkunder-texte/1",
             "bericht_id": ident,
@@ -669,9 +712,25 @@ class Coordinator:
             "skripte": scripts,
             "skripte_gekuerzt": shortened,
             "skripte_uebersprungen": skipped,
-            "gutachten_final": texts["harmonisierung" + suffix],
-            "pruefung_final": texts["pruefung" + suffix],
+            "gutachten_final": final,
+            "pruefung_final": texts[state["pruefung_schritt"]],
         }
+
+    @staticmethod
+    def final_report(state: dict, texts: dict, scripts: dict) -> str:
+        if state.get("altauftrag_ungeprueft"):
+            return str(texts[state["gutachten_schritt"]])
+        for name, artifacts in state.get("nachweise", {}).items():
+            if artifact_hashes(artifacts) != state["nachweis_hashes"][name]:
+                raise StepFailed(name, "Nachweis-Integritaet: gespeicherte Belege verändert")
+            scripts[name].update(artifacts)
+        final = texts[state["gutachten_schritt"]]
+        if state["offene_befunde"]:
+            final += "\n\n## Offene Befunde nach Korrekturgrenze\n\n" + "\n".join(
+                "- " + finding for finding in state["offene_befunde"]
+            )
+        final += "\n\n" + manifest_text(Auftrag.model_validate(state["auftrag"]))
+        return final
 
     async def cleanup(self, ident: str) -> dict[str, Any]:
         async with self.lock:

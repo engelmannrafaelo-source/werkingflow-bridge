@@ -41,7 +41,7 @@ class Schritt(BaseModel):
     schritt: str = Field(
         pattern=(
             r"^(erkunder-[123]|harmonisierung|pruefung|"
-            r"harmonisierung-korrektur|pruefung-korrektur)$"
+            r"(?:harmonisierung|pruefung)-korrektur(?:-[2-5])?)$"
         )
     )
     ordner: str

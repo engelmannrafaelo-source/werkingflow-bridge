@@ -30,7 +30,10 @@ def body(ident="bericht-123", files=None, token="secret"):
                 "zweck": "Prüfung",
                 "vorwissen_md": "Vorwissen",
                 "vertiefung_md": None,
-                "dateien": files or [],
+                "dateien": files if files is not None else [{
+                    "ziel": "messdaten/test.parquet", "url": "https://download.test/data",
+                    "sha256": hashlib.sha256(b"data").hexdigest(), "bytes": 4,
+                }],
                 "korrekturkreis": 1,
             },
         }
@@ -68,9 +71,27 @@ class Places:
         failed = self.attempts[name] <= self.failures.get(name, 0)
         if not failed:
             filename = "pruefung.md" if name.startswith("pruefung") else "ergebnis.md"
-            Path(data["ordner"], filename).write_text(
-                self.review if name.startswith("pruefung") else name
-            )
+            directory = Path(data["ordner"])
+            if name.startswith("pruefung"):
+                findings = [] if self.review == "trägt" else [self.review]
+                content = "```erkunder-pruefung\n" + json.dumps({"befunde": findings}) + "\n```"
+                content += "\n```erkunder-zahlenpruefung\n" + json.dumps({
+                    "vollstaendig": True, "zahlen": [{"zitat": "[14](zahl:n)", "zahl": "14", "id": "n"}],
+                }) + "\n```"
+            else:
+                (directory / "skripte").mkdir(exist_ok=True)
+                (directory / "skripte/rechnung.py").write_text("# synthetic calculation")
+                (directory / "skripte/zahlen.json").write_text(json.dumps({"n": {
+                    "wert": 14, "einheit": "Starts", "quelle": "messdaten/test.parquet",
+                    "kanaele": ["p"], "raster": "1 min", "auswahl": "alle steigenden Flanken",
+                }}))
+                content = name + " [14](zahl:n)\n```erkunder-nachweis\n" + json.dumps({
+                    "kanaele": {"p": "pump"}, "ergebnisdateien": [{
+                        "skript": "skripte/rechnung.py", "ergebnis": "skripte/zahlen.json",
+                    }],
+                }) + "\n```"
+                content += "\n```erkunder-pruefumfang\n[]\n```"
+            (directory / filename).write_text(content)
         return httpx.Response(
             200,
             json={
@@ -159,7 +180,7 @@ async def test_permissions_and_success(tmp_path):
         assert stat.S_IMODE((directory / "erkunder-1").stat().st_mode) == 0o700
         assert stat.S_IMODE((directory / ".lauf.json").stat().st_mode) == 0o600
         assert {o[1] for o in owners} == {1101, 1102, 1103}
-        assert service.result("bericht-123")["gutachten_final"] == "harmonisierung"
+        assert service.result("bericht-123")["gutachten_final"].startswith("harmonisierung [14]")
     finally:
         await service.shutdown()
 
@@ -205,10 +226,10 @@ async def test_correction_once(tmp_path, review, corrected):
         assert (await finish(service))["zustand"] == "fertig"
         assert len(places.calls) == (7 if corrected else 5)
         result = service.result("bericht-123")
-        assert result["gutachten_final"] == (
+        assert result["gutachten_final"].startswith(
             "harmonisierung-korrektur" if corrected else "harmonisierung"
         )
-        assert result["pruefung_final"] == review
+        assert json.loads(result["pruefung_final"].split("\n")[1])["befunde"] == ([] if review == "trägt" else [review])
     finally:
         await service.shutdown()
 
@@ -631,7 +652,7 @@ async def test_finished_report_sealed_before_same_slots_reused(tmp_path, failure
         places.failures = {}
         assert (await finish(service, body("bericht-456")))["zustand"] == "fertig"
         assert stat.S_IMODE(old.stat().st_mode) == 0o700
-        assert service.result("bericht-456")["gutachten_final"] == "harmonisierung"
+        assert service.result("bericht-456")["gutachten_final"].startswith("harmonisierung [14]")
     finally:
         await service.shutdown()
 

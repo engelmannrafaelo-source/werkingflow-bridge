@@ -6,15 +6,10 @@ from typing import Annotated, Literal
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 BerichtId = Annotated[str, Field(pattern=r"^[a-z0-9-]{8,80}$")]
-SchrittName = Literal[
-    "erkunder-1",
-    "erkunder-2",
-    "erkunder-3",
-    "harmonisierung",
-    "pruefung",
-    "harmonisierung-korrektur",
-    "pruefung-korrektur",
-]
+SchrittName = Annotated[str, Field(pattern=(
+    r"^(erkunder-[123]|harmonisierung|pruefung|"
+    r"(?:harmonisierung|pruefung)-korrektur(?:-[2-5])?)$"
+))]
 
 
 class Vertrag(BaseModel):
@@ -41,6 +36,13 @@ class Datei(Vertrag):
         return value
 
 
+class Pruefpunkt(Vertrag):
+    anlage: str = Field(min_length=1)
+    dokument_id: str = Field(min_length=1)
+    fehlerbild_id: str = Field(min_length=1)
+    fehlende_kanaele: list[str]
+
+
 class Auftrag(Vertrag):
     schema_: Literal["erkunder-auftrag/1"] = Field(alias="schema")
     bericht_id: BerichtId
@@ -51,14 +53,8 @@ class Auftrag(Vertrag):
     vorwissen_md: str
     vertiefung_md: str | None
     dateien: list[Datei]
-    korrekturkreis: Literal[1]
-
-    @field_validator("korrekturkreis", mode="before")
-    @classmethod
-    def exact_one(cls, value: object) -> object:
-        if type(value) is not int or value != 1:
-            raise ValueError("korrekturkreis muss 1 sein")
-        return value
+    korrekturkreis: int = Field(ge=1, le=5, strict=True)
+    pruefliste: list[Pruefpunkt] = Field(default_factory=list)
 
 
 class Tokens(Vertrag):
@@ -91,11 +87,14 @@ class Ausfall(Vertrag):
 class Ergebnis(Vertrag):
     schema_: Literal["erkunder-ergebnis/1"] = Field(alias="schema")
     bericht_id: BerichtId
-    prompt_version: Literal["erkunder-prompts/1"]
+    prompt_version: Literal["erkunder-prompts/1", "erkunder-prompts/2"]
     modell: Literal["claude-sonnet-5-5"]
     schritte: list[Schritt]
     erkunder_ausgefallen: list[Ausfall]
     korrekturkreis_gelaufen: bool
+    offene_befunde_anzahl: int | None = Field(ge=0)
+    pruefstatus: Literal["offen", "widerspruchsfrei", "altauftrag_ungeprueft"]
+    korrekturrunden: int | None = Field(ge=0, le=5)
 
 
 class Texte(Vertrag):
@@ -104,5 +103,17 @@ class Texte(Vertrag):
     texte: dict[SchrittName, str]
     skripte: dict[SchrittName, dict[str, str]]
     skripte_gekuerzt: list[SchrittName]
+    skripte_uebersprungen: list[str] = Field(default_factory=list)
     gutachten_final: str
     pruefung_final: str
+
+
+class Urteil(Vertrag):
+    anlage: str
+    fehlerbild_id: str
+    dokument_id: str
+    status: Literal["bestaetigt", "widerlegt", "teilweise", "nicht_pruefbar"]
+    fehlende_kanaele: list[str]
+    befund_verweis: str | None
+    sicherheit: float = Field(ge=0, le=1, allow_inf_nan=False)
+    begruendung: str = Field(min_length=1)

@@ -7,7 +7,7 @@ from src.erkunder.models import Auftrag
 def test_valid(auftrag):
     assert (
         Auftrag.model_validate(auftrag).model_dump(mode="json", by_alias=True)
-        == auftrag
+        == {**auftrag, "pruefliste": []}
     )
 
 
@@ -20,7 +20,7 @@ def test_valid(auftrag):
         ("bericht_id", "abcdefgh/"),
         ("schema", "erkunder-auftrag/2"),
         ("korrekturkreis", 0),
-        ("korrekturkreis", 2),
+        ("korrekturkreis", 6),
         ("korrekturkreis", True),
         ("unknown", "x"),
     ],

@@ -2,7 +2,7 @@
 
 from src.erkunder.models import Auftrag
 
-PROMPT_VERSION = "erkunder-prompts/1"
+PROMPT_VERSION = "erkunder-prompts/2"
 
 
 def _eingang(a: Auftrag) -> str:
@@ -45,7 +45,7 @@ def erkunder_prompt(a: Auftrag) -> str:
         "`/opt/rechnen`), "
         "lege deine Skripte in `skripte/` ab und schreibe das Ergebnis als "
         "`ergebnis.md` "
-        "in diesen Ordner." + _vertiefung(a)
+        "in diesen Ordner." + NACHWEIS + _vertiefung(a)
     )
 
 
@@ -68,7 +68,7 @@ def harmonisierung_prompt(a: Auftrag, ausgefallen: list[dict]) -> str:
             f" Einer der drei Erkunder ist ausgefallen ({ausgefallen[0]['grund']}); "
             "dir liegen zwei Gutachten vor. Vermerke das im Gutachten."
         )
-    return text + _vertiefung(a)
+    return text + NACHWEIS + _vertiefung(a)
 
 
 def pruefung_prompt(a: Auftrag) -> str:
@@ -87,7 +87,7 @@ def pruefung_prompt(a: Auftrag) -> str:
         "Schreibe das Ergebnis als `pruefung.md` in diesen Ordner. "
         f"Steht in `{_eingang(a)}vorwissen.md` ein Zähler, den das Gutachten zugunsten "
         "einer Ersatzgröße übergeht, dann gehört das Urteil darüber zu deiner Prüfung."
-        + _vertiefung(a)
+        + PRUEFURTEIL + _vertiefung(a)
     )
 
 
@@ -100,5 +100,50 @@ def korrektur_prompt(a: Auftrag) -> str:
         + _kontext(a)
         + "Dein Gutachten liegt in `gutachten.md`, die Prüfung in "
         "`pruefung.md`. Lege deine Skripte in `skripte/` ab und schreibe die neue "
-        "Fassung als `ergebnis.md` in diesen Ordner." + _vertiefung(a)
+        "Fassung als `ergebnis.md` in diesen Ordner. Die Datei `maschinenbefunde.json` "
+        "enthält ebenfalls zu klärende Befunde." + NACHWEIS + _vertiefung(a)
     )
+
+
+NACHWEIS = """
+Das Gutachten ist anhand seiner Quellen nachrechenbar. Das Verzeichnis
+`eingang/quellen.md` nennt die vom Leitstand geprüften Dateipfade und SHA-256.
+Beschreibe im Gutachten die verwendeten Quellen und ihr Raster. Ein Kanalverzeichnis
+ordnet deine Kurznamen den vollständigen Messkanälen zu.
+Deine Rechenskripte schreiben ihre Ergebnisse zusätzlich als JSON unter `skripte/`:
+Schlüssel ist eine eindeutige Zahlen-ID; der Wert enthält `wert` (Zahl), `einheit`,
+`quelle` (Pfad aus dem Quellenverzeichnis), `kanaele` (Kurznamen), `raster` und
+`auswahl` (Zeitraum, Filter, Schwellen, Aggregation der tatsächlich ausgeführten Rechnung).
+Berechnete Zahlen im Fließtext und Tabellen tragen Markdown-Verweise der Form
+`[ZAHL](zahl:ID)`. Der maschinelle Vergleich rundet auf die angezeigten Dezimalstellen.
+Ein JSON-Block mit dem Zaunnamen `erkunder-nachweis` enthält `kanaele` (Kurznamen
+auf vollständige Kanalnamen) und `ergebnisdateien` (Liste mit `skript` und `ergebnis`,
+jeweils relative Pfade unter skripte/). Skripte und Ergebnisdateien gehören zur
+aktuellen Gutachtenfassung und werden vom Leitstand zusammen gesichert.
+Im Vorwissen ausgewählte Bibliotheks-Punkte beantwortest du vollständig. Ein
+JSON-Block `erkunder-pruefumfang` enthält eine Liste: `anlage`, `fehlerbild_id`,
+`dokument_id`, `status` (bestaetigt/widerlegt/teilweise/nicht_pruefbar),
+`fehlende_kanaele`, `befund_verweis` (bei bestaetigt Verweis auf den eigenen Befund),
+`sicherheit` (0 bis 1) und `begruendung`. Nicht prüfbare Punkte benennen die fehlende
+Messung. Auch ein leerer Prüfumfang steht als leere Liste in diesem Block.
+Die Bibliothek ist fachlicher Kontext; über das Ergebnis urteilst du
+anhand der Anlage und Daten.
+"""
+
+PRUEFURTEIL = """
+Die Prüfung endet mit genau einem JSON-Block `erkunder-pruefung` mit `befunde`:
+einer Liste konkreter offener Fehler und Widersprüche der vorliegenden Fassung.
+Eine leere Liste bedeutet, dass diese Fassung trägt. Auch fehlende Zahlenbelege,
+unbelegte Auswahlkriterien, Zahlen ohne Skript-Verknüpfung und fehlende oder
+widersprüchliche Bibliotheksurteile sind Befunde. Dokumentierte Grenzen einer
+korrekten Aussage sind keine Fehler. `maschinenbefunde.json` enthält ergänzende
+rechnerische Befunde des Leitstands, die mitzuprüfen sind.
+In einem zusätzlichen JSON-Block `erkunder-zahlenpruefung` steht `vollstaendig`
+(true, sobald jede berechnete Zahl im Gutachten gegen einen Skriptbeleg zugeordnet
+ist) und `zahlen`: alle berechneten Zahlen einschließlich Zahlen ohne Markdown-
+Verknüpfung, jeweils mit `zitat` (wörtlicher Textausschnitt), `zahl` (exakte
+Zahlenschreibweise im Zitat) und `id` (Schlüssel im Skript-JSON). Der Leitstand
+vergleicht auch diese unabhängig erfassten Textzahlen maschinell. Zahlen ohne
+Beleg erzeugen einen Befund; Datumsangaben, Gliederungsnummern und Kanalnamen
+sind Quellen-/Strukturangaben und keine berechneten Zahlen.
+"""

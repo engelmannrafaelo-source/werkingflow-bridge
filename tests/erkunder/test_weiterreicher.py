@@ -50,6 +50,7 @@ async def test_normal(monkeypatch, setup, auftrag, caplog):
                     "schritte": [],
                     "erkunder_ausgefallen": [],
                     "korrekturkreis_gelaufen": False,
+                    "offene_befunde_anzahl": 0, "pruefstatus": "widerspruchsfrei", "korrekturrunden": 0,
                 },
             )
         return httpx.Response(200, json=state)
@@ -120,7 +121,7 @@ async def test_missing_file(setup, auftrag):
 
 
 async def test_invalid_payload(auftrag):
-    auftrag["korrekturkreis"] = 2
+    auftrag["korrekturkreis"] = 6
     with pytest.raises(ExecutorHTTPError) as err:
         await erkunder_executor(auftrag, None, AsyncMock())
     assert err.value.status_code == 400
@@ -186,6 +187,7 @@ async def test_outage_parks_and_same_job_resumes(
                     "schritte": [],
                     "erkunder_ausgefallen": [],
                     "korrekturkreis_gelaufen": False,
+                    "offene_befunde_anzahl": 0, "pruefstatus": "widerspruchsfrei", "korrekturrunden": 0,
                 },
             },
         )
@@ -244,6 +246,7 @@ async def test_restart_between_polls_reattaches_even_without_transport_error(
                     "schritte": [],
                     "erkunder_ausgefallen": [],
                     "korrekturkreis_gelaufen": False,
+                    "offene_befunde_anzahl": 0, "pruefstatus": "widerspruchsfrei", "korrekturrunden": 0,
                 },
             )
         return httpx.Response(200, json=state)
