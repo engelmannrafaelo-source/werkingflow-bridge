@@ -19,13 +19,13 @@ def evidence(tmp_path, shown="11", value=14, source="messdaten/test.parquet"):
         "kanaele": {"p": "pump_signal"}, "ergebnisdateien": [{
             "skript": "skripte/calculate.py", "ergebnis": "skripte/values.json",
         }],
-    }) + "\n```"
+    }) + "\n```\n"
 
 
 def test_number_mismatch_and_rounding(tmp_path):
     text = evidence(tmp_path)
     findings, artifacts = zahlenbelege(tmp_path, text, {"messdaten/test.parquet": ["pump_signal"]})
-    assert "Text 11, Skript 14" in findings[0]
+    assert "Text '11', Skript 14" in findings[0]
     assert "skripte/values.json" in artifacts
     sources = {"messdaten/test.parquet": ["pump_signal"]}
     assert zahlenbelege(tmp_path, evidence(tmp_path, "0,0034", 0.00343), sources)[0] == []
@@ -91,7 +91,7 @@ def test_unlinked_number_identified_by_independent_reviewer_is_compared(tmp_path
         {"zitat": "Außerdem gab es 11 Starts.", "zahl": "11", "id": "starts"},
     ]}) + "\n```"
     findings = prueferzahlen(tmp_path, report, review, {"messdaten/test.parquet": ["pump_signal"]})
-    assert "Text 11, Skript 14" in findings[0]
+    assert "Text '11', Skript 14" in findings[0]
 
 
 async def test_reviewer_cannot_change_calculation_evidence(tmp_path):

@@ -143,8 +143,12 @@ In einem zusätzlichen JSON-Block `erkunder-zahlenpruefung` steht `vollstaendig`
 (true, sobald jede berechnete Zahl im Gutachten gegen einen Skriptbeleg zugeordnet
 ist) und `zahlen`: alle berechneten Zahlen einschließlich Zahlen ohne Markdown-
 Verknüpfung, jeweils mit `zitat` (wörtlicher Textausschnitt), `zahl` (exakte
-Zahlenschreibweise im Zitat) und `id` (Schlüssel im Skript-JSON). Der Leitstand
-gleicht die Liste mit allen verknüpften Zahlen nach Schreibweise und ID ab und
+Zahlenschreibweise im Zitat) und `id` (Schlüssel im Skript-JSON). Jeder ausdrücklich
+gesetzte `zahl:`-Link wird unabhängig von seiner Zahlenschreibweise erfasst, auch
+Referenzlinks. Die Liste enthält je Auftreten einen Eintrag mit dem lesbaren
+Linktext (ohne Markdown-Hervorhebung) und der Zahlen-ID. Unlesbarer Linktext oder
+ein fehlender Skriptwert erscheint als konkreter Befund mit beiden Seiten.
+Der Leitstand gleicht die Liste mit allen Verweisen nach Linktext und ID ab und
 vergleicht auch die unabhängig erfassten Textzahlen maschinell. Zahlen ohne
 Beleg erzeugen einen Befund; Datumsangaben, Gliederungsnummern und Kanalnamen
 sind Quellen-/Strukturangaben und keine berechneten Zahlen.

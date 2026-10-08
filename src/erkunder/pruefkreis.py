@@ -4,14 +4,14 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+from collections import Counter
 from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
 
 from .dateien import read_text
 from .models import Urteil
-
-ZAHL = re.compile(r"\[([-+]?\d+(?:[.,]\d+)?)\]\(zahl:([a-zA-Z0-9_-]+)\)")
+from .zahlenverweise import zahl_im_zitat, zahlenverweise
 
 
 def block(text: str, name: str) -> Any:
@@ -73,9 +73,10 @@ def zahlenbelege(directory: Path, text: str, sources: dict[str, list[str]]) -> t
     """Compare cited report values to script JSON, preserving the actual artifacts."""
     try:
         channels, values, artifacts = _zahlendaten(directory, text, sources)
-        findings = [finding for shown, ident in ZAHL.findall(text)
+        links = zahlenverweise(text)
+        findings = [finding for shown, ident in links
                     if (finding := _vergleich(shown, ident, values, channels, sources))]
-        if not ZAHL.search(text):
+        if not links:
             findings.append("Gutachten enthält keine mit Skript-Ergebnissen verknüpften Zahlen")
         return findings, artifacts
     except (OSError, ValueError, KeyError, TypeError) as error:
@@ -91,12 +92,18 @@ def prueferzahlen(directory: Path, report: str, review: str, sources: dict[str, 
         channels, values, _ = _zahlendaten(directory, report, sources)
         findings = [finding for item in data["zahlen"]
                 if (finding := _prueferzahl(item, report, values, channels, sources))]
-        reviewed = {(item["zahl"], item["id"]) for item in data["zahlen"]}
-        findings.extend(f"Zahlenprüfung: verknüpfte Textzahl {shown} (zahl:{ident}) fehlt im Zahlenabgleich"
-                        for shown, ident in sorted(set(ZAHL.findall(report)) - reviewed))
+        findings.extend(_fehlende_verweise(report, data["zahlen"], values))
         return findings
     except (OSError, ValueError, KeyError, TypeError) as error:
         return [f"Zahlenprüfung unvollständig: {error}"]
+
+
+def _fehlende_verweise(report: str, reviewed: list[dict], values: dict) -> list[str]:
+    expected = Counter(zahlenverweise(report))
+    actual = Counter((item["zahl"], item["id"]) for item in reviewed)
+    return [f"Zahlenprüfung: verknüpfte Textzahl {shown} (zahl:{ident}) fehlt im Zahlenabgleich"
+            f" ({count} Vorkommen); {_zahlkontext(shown, ident, values)}"
+            for (shown, ident), count in sorted((expected - actual).items())]
 
 
 def _prueferzahl(item: dict, report: str, values: dict, channels: dict,
@@ -104,14 +111,17 @@ def _prueferzahl(item: dict, report: str, values: dict, channels: dict,
     quote, shown = item["zitat"], item["zahl"]
     if not all(isinstance(item[key], str) and item[key].strip() for key in ("zitat", "zahl", "id")):
         raise ValueError("Zahlenprüfung: Zitat, Zahl und ID müssen nichtleere Texte sein")
-    if not quote or quote not in report or shown not in quote:
+    if quote not in report or not zahl_im_zitat(shown, quote):
         return "Zahlenprüfung: Zahlenzitat nicht im Gutachten"
     return _vergleich(shown, item["id"], values, channels, sources)
 
 
 def _vergleich(shown: str, ident: str, values: dict, channels: dict,
                sources: dict[str, list[str]]) -> str | None:
+    context = _zahlkontext(shown, ident, values)
     try:
+        if not ident.strip():
+            raise ValueError("Verweis ohne Zahlen-ID")
         result = values[ident]
         _belegform(result, channels, sources)
         value = Decimal(str(result["wert"]))
@@ -123,10 +133,16 @@ def _vergleich(shown: str, ident: str, values: dict, channels: dict,
             raise ValueError("nicht endliche Textzahl")
         expected = value.quantize(Decimal(1).scaleb(exponent), rounding=ROUND_HALF_UP)
         if expected != printed:
-            return f"Zahl {ident}: Text {shown}, Skript {value}; Auswahl: {result['auswahl']}"
+            return f"{context}; Auswahl: {result['auswahl']}"
     except (KeyError, TypeError, ValueError, InvalidOperation) as error:
-        return f"Zahl {ident}: Beleg fehlt/ungültig ({error})"
+        return f"{context}; Beleg fehlt/ungültig ({error})"
     return None
+
+
+def _zahlkontext(shown: str, ident: str, values: dict) -> str:
+    result = values.get(ident)
+    value = result.get("wert", "<fehlt>") if isinstance(result, dict) else "<fehlt>"
+    return f"Zahl {ident}: Text {shown!r}, Skript {value!r}"
 
 
 
