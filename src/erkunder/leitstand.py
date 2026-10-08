@@ -495,41 +495,8 @@ class Coordinator:
         state = self.states[ident]
         order = Auftrag.model_validate(state["auftrag"])
         try:
-            if state.pop("wiederaufnahme", False):
-                LOG.warning(
-                    "bericht_id=%s wartet maximal %.1fs auf frischen Token; "
-                    "Ausweg POST /aufraeumen/%s", ident, self.reattach_wait_s, ident,
-                )
-                try:
-                    async with asyncio.timeout(self.reattach_wait_s):
-                        await self.token_ready[ident].wait()
-                except TimeoutError as error:
-                    raise StepFailed(
-                        "wiederaufnahme", "Wiederanhaengen: Zeitgrenze erreicht"
-                    ) from error
-                self.directory(ident).chmod(0o711)
-            if not state["eingang_fertig"]:
-                await self.download(ident, order)
-            results = await asyncio.gather(
-                *(
-                    self.step(ident, f"erkunder-{i + 1}", i, erkunder_prompt(order))
-                    for i in range(3)
-                ),
-                return_exceptions=True,
-            )
-            failed = []
-            for index, result in enumerate(results):
-                if isinstance(result, BaseException):
-                    if not isinstance(result, StepFailed):
-                        raise result
-                    failed.append(
-                        {"schritt": f"erkunder-{index + 1}", "grund": result.reason}
-                    )
-            state["erkunder_ausgefallen"] = failed
-            if len(failed) > 1:
-                raise StepFailed(
-                    failed[-1]["schritt"], "unbekannt: weniger als zwei Gutachten"
-                )
+            await self.prepare_run(ident, order)
+            failed = await self.explore(ident, order)
             reports = {
                 f"gutachten-{i}.md": self.output(ident, f"erkunder-{i}")
                 for i in range(1, 4)
@@ -543,27 +510,7 @@ class Coordinator:
                 reports,
             )
             await self.review_loop(ident, order)
-            # Validate again after the reviewer (same UID as harmonization).
-            # result() validates the exact bytes it returns as well.
-            for item in state["schritte"]:
-                if item["status"] == "ok":
-                    self.output(ident, item["name"])
-            state["zustand"] = "fertig"
-            state["meta"] = {
-                "schema": "erkunder-ergebnis/1",
-                "bericht_id": ident,
-                "prompt_version": PROMPT_VERSION,
-                "modell": "claude-sonnet-5-5",
-                "schritte": [
-                    {k: v for k, v in item.items() if k != "sha256"}
-                    for item in state["schritte"]
-                ],
-                "erkunder_ausgefallen": failed,
-                "korrekturkreis_gelaufen": state["korrekturkreis_gelaufen"],
-                "offene_befunde_anzahl": len(state["offene_befunde"]),
-                "pruefstatus": "offen" if state["offene_befunde"] else "widerspruchsfrei",
-                "korrekturrunden": state["korrekturrunden"],
-            }
+            self.complete(ident, failed)
         except asyncio.CancelledError:
             raise
         except Exception as error:
@@ -598,6 +545,72 @@ class Coordinator:
                 )
                 raise
         self.save(ident)
+
+    async def prepare_run(self, ident: str, order: Auftrag) -> None:
+        state = self.states[ident]
+        if state.pop("wiederaufnahme", False):
+            LOG.warning(
+                "bericht_id=%s wartet maximal %.1fs auf frischen Token; "
+                "Ausweg POST /aufraeumen/%s", ident, self.reattach_wait_s, ident,
+            )
+            try:
+                async with asyncio.timeout(self.reattach_wait_s):
+                    await self.token_ready[ident].wait()
+            except TimeoutError as error:
+                raise StepFailed(
+                    "wiederaufnahme", "Wiederanhaengen: Zeitgrenze erreicht"
+                ) from error
+            self.directory(ident).chmod(0o711)
+        if not state["eingang_fertig"]:
+            await self.download(ident, order)
+
+    async def explore(self, ident: str, order: Auftrag) -> list[dict]:
+        state = self.states[ident]
+        results = await asyncio.gather(
+            *(
+                self.step(ident, f"erkunder-{i + 1}", i, erkunder_prompt(order))
+                for i in range(3)
+            ),
+            return_exceptions=True,
+        )
+        failed = []
+        for index, result in enumerate(results):
+            if isinstance(result, BaseException):
+                if not isinstance(result, StepFailed):
+                    raise result
+                failed.append(
+                    {"schritt": f"erkunder-{index + 1}", "grund": result.reason}
+                )
+        state["erkunder_ausgefallen"] = failed
+        if len(failed) > 1:
+            raise StepFailed(
+                failed[-1]["schritt"], "unbekannt: weniger als zwei Gutachten"
+            )
+        return failed
+
+    def complete(self, ident: str, failed: list[dict]) -> None:
+        state = self.states[ident]
+        # Validate again after the reviewer (same UID as harmonization).
+        # result() validates the exact bytes it returns as well.
+        for item in state["schritte"]:
+            if item["status"] == "ok":
+                self.output(ident, item["name"])
+        state["zustand"] = "fertig"
+        state["meta"] = {
+            "schema": "erkunder-ergebnis/1",
+            "bericht_id": ident,
+            "prompt_version": PROMPT_VERSION,
+            "modell": "claude-sonnet-5-5",
+            "schritte": [
+                {k: v for k, v in item.items() if k != "sha256"}
+                for item in state["schritte"]
+            ],
+            "erkunder_ausgefallen": failed,
+            "korrekturkreis_gelaufen": state["korrekturkreis_gelaufen"],
+            "offene_befunde_anzahl": len(state["offene_befunde"]),
+            "pruefstatus": "offen" if state["offene_befunde"] else "widerspruchsfrei",
+            "korrekturrunden": state["korrekturrunden"],
+        }
 
     def report_evidence(self, ident: str, name: str, report: str, order: Auftrag) -> list[str]:
         state = self.states[ident]
