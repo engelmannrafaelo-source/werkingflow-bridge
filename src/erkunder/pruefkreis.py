@@ -38,11 +38,12 @@ def _artifact(directory: Path, relative: str) -> str:
     return read_text(path)
 
 
-def _zahlendaten(directory: Path, text: str) -> tuple[dict, dict, dict[str, str]]:
+def _zahlendaten(directory: Path, text: str, sources: dict[str, list[str]]) -> tuple[dict, dict, dict[str, str]]:
     evidence = block(text, "erkunder-nachweis")
     channels = evidence["kanaele"]
     if not isinstance(channels, dict) or not channels:
         raise ValueError("Kanal-Kurznamen-Verzeichnis fehlt")
+    _kanalverzeichnis(channels, sources)
     results = evidence["ergebnisdateien"]
     if not isinstance(results, list) or not results:
         raise ValueError("Skript-Ergebnisdateien fehlen")
@@ -59,10 +60,19 @@ def _zahlendaten(directory: Path, text: str) -> tuple[dict, dict, dict[str, str]
     return channels, values, artifacts
 
 
-def zahlenbelege(directory: Path, text: str, sources: set[str] | None = None) -> tuple[list[str], dict[str, str]]:
+def _kanalverzeichnis(channels: dict, sources: dict[str, list[str]]) -> None:
+    known = {channel for names in sources.values() for channel in names}
+    for alias, channel in channels.items():
+        if not isinstance(alias, str) or not alias.strip():
+            raise ValueError("Ungültiger Kanal-Kurzname")
+        if not isinstance(channel, str) or channel not in known:
+            raise ValueError(f"Kanal {alias}: kein echter Messkanal im Quellenmanifest ({channel!r})")
+
+
+def zahlenbelege(directory: Path, text: str, sources: dict[str, list[str]]) -> tuple[list[str], dict[str, str]]:
     """Compare cited report values to script JSON, preserving the actual artifacts."""
     try:
-        channels, values, artifacts = _zahlendaten(directory, text)
+        channels, values, artifacts = _zahlendaten(directory, text, sources)
         findings = [finding for shown, ident in ZAHL.findall(text)
                     if (finding := _vergleich(shown, ident, values, channels, sources))]
         if not ZAHL.search(text):
@@ -72,27 +82,35 @@ def zahlenbelege(directory: Path, text: str, sources: set[str] | None = None) ->
         return [f"Quellnachweis unvollständig: {error}"], {}
 
 
-def prueferzahlen(directory: Path, report: str, review: str, sources: set[str]) -> list[str]:
+def prueferzahlen(directory: Path, report: str, review: str, sources: dict[str, list[str]]) -> list[str]:
     """The independent reviewer also identifies unlinked numerical statements."""
     try:
         data = block(review, "erkunder-zahlenpruefung")
         if data["vollstaendig"] is not True or not isinstance(data["zahlen"], list):
             raise ValueError("Vollständige Zahlenprüfung nicht bestätigt")
-        channels, values, _ = _zahlendaten(directory, report)
-        return [finding for item in data["zahlen"]
+        channels, values, _ = _zahlendaten(directory, report, sources)
+        findings = [finding for item in data["zahlen"]
                 if (finding := _prueferzahl(item, report, values, channels, sources))]
+        reviewed = {(item["zahl"], item["id"]) for item in data["zahlen"]}
+        findings.extend(f"Zahlenprüfung: verknüpfte Textzahl {shown} (zahl:{ident}) fehlt im Zahlenabgleich"
+                        for shown, ident in sorted(set(ZAHL.findall(report)) - reviewed))
+        return findings
     except (OSError, ValueError, KeyError, TypeError) as error:
         return [f"Zahlenprüfung unvollständig: {error}"]
 
 
-def _prueferzahl(item: dict, report: str, values: dict, channels: dict, sources: set[str]) -> str | None:
+def _prueferzahl(item: dict, report: str, values: dict, channels: dict,
+                 sources: dict[str, list[str]]) -> str | None:
     quote, shown = item["zitat"], item["zahl"]
+    if not all(isinstance(item[key], str) and item[key].strip() for key in ("zitat", "zahl", "id")):
+        raise ValueError("Zahlenprüfung: Zitat, Zahl und ID müssen nichtleere Texte sein")
     if not quote or quote not in report or shown not in quote:
         return "Zahlenprüfung: Zahlenzitat nicht im Gutachten"
     return _vergleich(shown, item["id"], values, channels, sources)
 
 
-def _vergleich(shown: str, ident: str, values: dict, channels: dict, sources: set[str] | None) -> str | None:
+def _vergleich(shown: str, ident: str, values: dict, channels: dict,
+               sources: dict[str, list[str]]) -> str | None:
     try:
         result = values[ident]
         _belegform(result, channels, sources)
@@ -112,14 +130,24 @@ def _vergleich(shown: str, ident: str, values: dict, channels: dict, sources: se
 
 
 
-def _belegform(result: dict, channels: dict, sources: set[str] | None) -> None:
+def _belegform(result: dict, channels: dict, sources: dict[str, list[str]]) -> None:
     for key in ("auswahl", "raster", "einheit", "quelle"):
         if not isinstance(result[key], str) or not result[key].strip():
             raise ValueError(f"{key} fehlt")
-    if not result["kanaele"] or any(c not in channels for c in result["kanaele"]):
+    if not isinstance(result["kanaele"], list) or not result["kanaele"]:
         raise ValueError("Kanalzuordnung fehlt")
-    if sources is not None and result["quelle"].removeprefix("eingang/") not in sources:
+    source = result["quelle"].removeprefix("eingang/")
+    if source not in sources:
         raise ValueError("Quelldatei nicht im geprüften Eingangsmanifest")
+    _quellkanaele(result["kanaele"], channels, source, sources[source])
+
+
+def _quellkanaele(aliases: list, channels: dict, source: str, known: list[str]) -> None:
+    for alias in aliases:
+        if not isinstance(alias, str) or alias not in channels:
+            raise ValueError("Kanalzuordnung fehlt")
+        if channels[alias] not in known:
+            raise ValueError(f"Kanal {alias} nicht in Quelldatei {source}")
 
 
 def manifest_text(order: Any) -> str:

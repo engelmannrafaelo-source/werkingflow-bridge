@@ -109,7 +109,8 @@ NACHWEIS = """
 Das Gutachten ist anhand seiner Quellen nachrechenbar. Das Verzeichnis
 `eingang/quellen.md` nennt die vom Leitstand geprüften Dateipfade und SHA-256.
 Beschreibe im Gutachten die verwendeten Quellen und ihr Raster. Ein Kanalverzeichnis
-ordnet deine Kurznamen den vollständigen Messkanälen zu.
+ordnet deine Kurznamen den vollständigen Messkanälen aus diesem Quellenverzeichnis zu.
+Die zu jeder Zahl benannte Quelldatei enthält die angegebenen Messkanäle.
 Deine Rechenskripte schreiben ihre Ergebnisse zusätzlich als JSON unter `skripte/`:
 Schlüssel ist eine eindeutige Zahlen-ID; der Wert enthält `wert` (Zahl), `einheit`,
 `quelle` (Pfad aus dem Quellenverzeichnis), `kanaele` (Kurznamen), `raster` und
@@ -143,7 +144,8 @@ In einem zusätzlichen JSON-Block `erkunder-zahlenpruefung` steht `vollstaendig`
 ist) und `zahlen`: alle berechneten Zahlen einschließlich Zahlen ohne Markdown-
 Verknüpfung, jeweils mit `zitat` (wörtlicher Textausschnitt), `zahl` (exakte
 Zahlenschreibweise im Zitat) und `id` (Schlüssel im Skript-JSON). Der Leitstand
-vergleicht auch diese unabhängig erfassten Textzahlen maschinell. Zahlen ohne
+gleicht die Liste mit allen verknüpften Zahlen nach Schreibweise und ID ab und
+vergleicht auch die unabhängig erfassten Textzahlen maschinell. Zahlen ohne
 Beleg erzeugen einen Befund; Datumsangaben, Gliederungsnummern und Kanalnamen
 sind Quellen-/Strukturangaben und keine berechneten Zahlen.
 """

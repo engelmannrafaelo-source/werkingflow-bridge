@@ -6,10 +6,16 @@ import time
 from pathlib import Path
 
 import httpx
+import pyarrow as pa
+import pyarrow.parquet as pq
 import pytest
 from fastapi import HTTPException
 
 from src.erkunder.leitstand import Coordinator, Start, create_app
+
+_buffer = pa.BufferOutputStream()
+pq.write_table(pa.table({"sensor_id": ["pump"], "timestamp": [0], "value": [1.0]}), _buffer)
+MEASUREMENT_BYTES = _buffer.getvalue().to_pybytes()
 
 
 def body(ident="bericht-123", files=None, token="secret"):
@@ -32,7 +38,7 @@ def body(ident="bericht-123", files=None, token="secret"):
                 "vertiefung_md": None,
                 "dateien": files if files is not None else [{
                     "ziel": "messdaten/test.parquet", "url": "https://download.test/data",
-                    "sha256": hashlib.sha256(b"data").hexdigest(), "bytes": 4,
+                    "sha256": hashlib.sha256(MEASUREMENT_BYTES).hexdigest(), "bytes": len(MEASUREMENT_BYTES),
                 }],
                 "korrekturkreis": 1,
             },
@@ -51,7 +57,7 @@ class Places:
 
     async def __call__(self, request):
         if request.url.host == "download.test":
-            return httpx.Response(200, content=b"data")
+            return httpx.Response(200, content=MEASUREMENT_BYTES)
         if request.url.path == "/abbrechen":
             return httpx.Response(200, json={"abgebrochen": True})
         if request.method == "POST":
@@ -432,8 +438,8 @@ async def test_signed_download_url_not_logged(tmp_path, caplog):
                     {
                         "ziel": "messdaten/x.parquet",
                         "url": "https://download.test/file?signature=private-signature",
-                        "sha256": hashlib.sha256(b"data").hexdigest(),
-                        "bytes": 4,
+                        "sha256": hashlib.sha256(MEASUREMENT_BYTES).hexdigest(),
+                        "bytes": len(MEASUREMENT_BYTES),
                     }
                 ]
             ),

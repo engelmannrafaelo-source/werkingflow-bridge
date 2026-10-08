@@ -40,6 +40,7 @@ from .pruefkreis import (
     pruefurteil,
     zahlenbelege,
 )
+from .quellen import kanalmanifest
 
 LOG = logging.getLogger(__name__)
 ID = re.compile(r"^[a-z0-9-]{8,80}$")
@@ -340,7 +341,9 @@ class Coordinator:
             target.chmod(0o644)
             if size != file.bytes or digest.hexdigest().lower() != file.sha256.lower():
                 raise StepFailed("daten", "unbekannt: sha256 oder bytes")
-        (entry / "quellen.md").write_text(manifest_text(order))
+        self.states[ident]["quellkanaele"] = kanalmanifest(entry, order)
+        (entry / "quellen.md").write_text(manifest_text(order) + "\n\n## Messkanäle je Quelle\n\n"
+                                            + json.dumps(self.states[ident]["quellkanaele"], ensure_ascii=False))
         (entry / "quellen.md").chmod(0o644)
         self.states[ident]["eingang_fertig"] = True
         self.save(ident)
@@ -615,7 +618,7 @@ class Coordinator:
     def report_evidence(self, ident: str, name: str, report: str, order: Auftrag) -> list[str]:
         state = self.states[ident]
         machine, artifacts = zahlenbelege(
-            self.directory(ident) / name, report, {f.ziel for f in order.dateien},
+            self.directory(ident) / name, report, state["quellkanaele"],
         )
         previous = state.get("nachweis_hashes", {}).get(name)
         if previous is not None and previous != artifact_hashes(artifacts):
@@ -629,6 +632,7 @@ class Coordinator:
     async def review_loop(self, ident: str, order: Auftrag) -> None:
         """Resume numbered steps; a fresh review owns every corrected version."""
         state = self.states[ident]
+        state["quellkanaele"] = kanalmanifest(self.directory(ident) / "eingang", order)
         report_name = "harmonisierung"
         for round_no in range(order.korrekturkreis + 1):
             suffix = "" if round_no == 0 else "-korrektur" + (f"-{round_no}" if round_no > 1 else "")
@@ -646,7 +650,7 @@ class Coordinator:
             self.report_evidence(ident, report_name, report, order)
             machine.extend(prueferzahlen(
                 self.directory(ident) / report_name, report, self.output(ident, review_name),
-                {f.ziel for f in order.dateien},
+                state["quellkanaele"],
             ))
             state.update(
                 offene_befunde=list(dict.fromkeys(machine + findings)),

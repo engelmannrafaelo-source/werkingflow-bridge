@@ -24,17 +24,18 @@ def evidence(tmp_path, shown="11", value=14, source="messdaten/test.parquet"):
 
 def test_number_mismatch_and_rounding(tmp_path):
     text = evidence(tmp_path)
-    findings, artifacts = zahlenbelege(tmp_path, text, {"messdaten/test.parquet"})
+    findings, artifacts = zahlenbelege(tmp_path, text, {"messdaten/test.parquet": ["pump_signal"]})
     assert "Text 11, Skript 14" in findings[0]
     assert "skripte/values.json" in artifacts
-    assert zahlenbelege(tmp_path, evidence(tmp_path, "0,0034", 0.00343))[0] == []
-    assert zahlenbelege(tmp_path, evidence(tmp_path, "0,0014", 0.00343))[0]
+    sources = {"messdaten/test.parquet": ["pump_signal"]}
+    assert zahlenbelege(tmp_path, evidence(tmp_path, "0,0034", 0.00343), sources)[0] == []
+    assert zahlenbelege(tmp_path, evidence(tmp_path, "0,0014", 0.00343), {"messdaten/test.parquet": ["pump_signal"]})[0]
 
 
 def test_wrong_source_and_missing_selection(tmp_path):
     text = evidence(tmp_path, "14", source="messdaten/foreign.parquet")
-    assert "Eingangsmanifest" in zahlenbelege(tmp_path, text, {"messdaten/test.parquet"})[0][0]
-    assert zahlenbelege(tmp_path, "No evidence")[0]
+    assert "Eingangsmanifest" in zahlenbelege(tmp_path, text, {"messdaten/test.parquet": ["pump_signal"]})[0][0]
+    assert zahlenbelege(tmp_path, "No evidence", {})[0]
 
 
 def test_explicit_review_no_word_matching():
@@ -89,7 +90,8 @@ def test_unlinked_number_identified_by_independent_reviewer_is_compared(tmp_path
     review = "```erkunder-zahlenpruefung\n" + json.dumps({"vollstaendig": True, "zahlen": [
         {"zitat": "Außerdem gab es 11 Starts.", "zahl": "11", "id": "starts"},
     ]}) + "\n```"
-    assert "Text 11, Skript 14" in prueferzahlen(tmp_path, report, review, {"messdaten/test.parquet"})[0]
+    findings = prueferzahlen(tmp_path, report, review, {"messdaten/test.parquet": ["pump_signal"]})
+    assert "Text 11, Skript 14" in findings[0]
 
 
 async def test_reviewer_cannot_change_calculation_evidence(tmp_path):
@@ -169,3 +171,74 @@ async def test_legacy_completed_report_survives_restart_without_false_clearance(
         assert metadata.offene_befunde_anzahl is None
     finally:
         await resumed.shutdown()
+
+
+@pytest.mark.parametrize("channel", [None, "", "invented", 42, ["pump_signal"], {}])
+def test_alias_requires_real_manifest_channel(tmp_path, channel):
+    report = evidence(tmp_path, "14").replace('"pump_signal"', json.dumps(channel))
+    findings, _ = zahlenbelege(tmp_path, report, {"messdaten/test.parquet": ["pump_signal"]})
+    assert findings and "Messkanal im Quellenmanifest" in findings[0]
+
+
+def test_real_channel_in_wrong_source_is_rejected(tmp_path):
+    report = evidence(tmp_path, "14")
+    sources = {"messdaten/test.parquet": ["other"], "messdaten/second.parquet": ["pump_signal"]}
+    assert "nicht in Quelldatei" in zahlenbelege(tmp_path, report, sources)[0][0]
+
+
+def test_empty_reviewer_list_cannot_approve_linked_numbers(tmp_path):
+    from src.erkunder.pruefkreis import prueferzahlen
+
+    report = evidence(tmp_path, "14") + " Weitere Zuschaltungen: 11."
+    review = '```erkunder-zahlenpruefung\n{"vollstaendig":true,"zahlen":[]}\n```'
+    findings = prueferzahlen(tmp_path, report, review, {"messdaten/test.parquet": ["pump_signal"]})
+    assert any("verknüpfte Textzahl 14 (zahl:starts) fehlt" in finding for finding in findings)
+
+
+@pytest.mark.parametrize("missing", [True, False])
+def test_every_linked_spelling_is_checked(tmp_path, missing):
+    from src.erkunder.pruefkreis import prueferzahlen
+
+    report = evidence(tmp_path, "14") + " Tabelle: [14,0](zahl:starts)."
+    items = [{"zitat": "[14](zahl:starts)", "zahl": "14", "id": "starts"}]
+    if not missing:
+        items.append({"zitat": "[14,0](zahl:starts)", "zahl": "14,0", "id": "starts"})
+    review = '```erkunder-zahlenpruefung\n' + json.dumps({"vollstaendig": True, "zahlen": items}) + '\n```'
+    findings = prueferzahlen(tmp_path, report, review, {"messdaten/test.parquet": ["pump_signal"]})
+    assert bool(findings) is missing
+
+
+@pytest.mark.parametrize("defect", ["channel", "empty_review"])
+async def test_machine_evidence_reaches_correction_loop(tmp_path, defect):
+    service, places, _ = await setup(tmp_path)
+    original = places.__class__.__call__
+    # Modify the generated first report/review before Coordinator hashes it.
+    async def transport(request):
+        response = await original(places, request)
+        if request.method == 'GET' and request.url.host != 'download.test':
+            name = request.url.path.split('/')[-1]
+            data = places.running.get(name)
+            if data and name == ('harmonisierung' if defect == 'channel' else 'pruefung'):
+                from pathlib import Path
+                path = Path(data['ordner']) / ('ergebnis.md' if defect == 'channel' else 'pruefung.md')
+                text = path.read_text()
+                if defect == 'channel':
+                    text = text.replace('"p": "pump"', '"p": null')
+                else:
+                    text = text.replace('[{"zitat": "[14](zahl:n)", "zahl": "14", "id": "n"}]', '[]')
+                path.write_text(text)
+        return response
+
+    import httpx
+    await service.client.aclose()
+    service.client = httpx.AsyncClient(transport=httpx.MockTransport(transport))
+    try:
+        status = await finish(service)
+        assert status['zustand'] == 'fertig'
+        assert status['meta']['korrekturrunden'] == 1
+        assert status['meta']['offene_befunde_anzahl'] == 0
+        path = service.directory('bericht-123') / 'harmonisierung-korrektur/maschinenbefunde.json'
+        findings = json.loads(path.read_text())
+        assert any(('Messkanal' if defect == 'channel' else 'Zahlenabgleich') in text for text in findings)
+    finally:
+        await service.shutdown()
