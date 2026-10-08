@@ -123,6 +123,17 @@ MODELS: List[ModelInfo] = [
         description="Haiku 4.5 - Neuestes und schnellstes Haiku, ideal fuer Vision",
         is_default=True
     ),
+    # Haiku 5.5 (Ankuendigung 2026-10-07) ist registriert, aber NICHT Familien-Default:
+    # der Alias "haiku" zeigt weiter auf 4.5, weil Report/Energy/Partner-Stellen
+    # "haiku" fest verwenden und sonst still umgestellt wuerden. Umstellung des
+    # Alias erst nach Messung und bewusster Entscheidung (is_default=True).
+    ModelInfo(
+        id="claude-haiku-5-5",
+        family="haiku",
+        version="5.5",
+        release_date=date(2026, 10, 7),
+        description="Haiku 5.5 - 1M context, 128k output; explizit anforderbar, nicht Alias-Default"
+    ),
     ModelInfo(
         id="claude-3-5-haiku-20241022",
         family="haiku",

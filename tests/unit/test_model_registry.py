@@ -36,6 +36,31 @@ from src.model_registry import (
 # Familien-Defaults — bewusste Entscheidungen, nicht "neuestes Datum"
 # ============================================================================
 
+class TestHaiku55Registration:
+    """Haiku 5.5 ist registriert, aber NICHT Alias-Default: Report/Energy nutzen 'haiku'."""
+
+    def test_exact_id_served_as_is(self):
+        assert resolve_model("claude-haiku-5-5") == ("claude-haiku-5-5", None)
+
+    def test_alias_haiku_stays_on_4_5(self):
+        assert _DEFAULT_BY_FAMILY["haiku"].id == "claude-haiku-4-5-20251001"
+        assert resolve_model("haiku")[0] == "claude-haiku-4-5-20251001"
+
+    def test_haiku_4_5_not_force_upgraded(self):
+        assert resolve_model("claude-haiku-4-5-20251001") == ("claude-haiku-4-5-20251001", None)
+
+    def test_temperature_not_supported_on_5_5(self):
+        assert model_supports_temperature("claude-haiku-5-5") is False
+
+    def test_at_most_one_default_per_family(self):
+        """Ein spaeterer Alias-Umschalter muss den alten Default entfernen —
+        sonst entscheidet still das neuere Datum."""
+        from src.model_registry import MODELS
+        for family in {m.family for m in MODELS}:
+            defaults = [m.id for m in MODELS if m.family == family and m.is_default]
+            assert len(defaults) <= 1, f"family '{family}' has several defaults: {defaults}"
+
+
 class TestFamilyDefaults:
     def test_deliberate_defaults_hold(self):
         assert _DEFAULT_BY_FAMILY["sonnet"].id == "claude-sonnet-5-5"

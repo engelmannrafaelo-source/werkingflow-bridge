@@ -54,7 +54,8 @@ import re
 # v8 (2026-09-24): Opus 5.5 $4/$20, cache read $0.20 per MTok.
 # v9 (2026-09-24): Fable 5.1 enabled; cache read $0.25 per MTok.
 # v10 (2026-09-30): Sonnet 5.5, $2/$10; cache read $0.20, 5m write $2.50.
-PRICING_VERSION = "v10"
+# v11 (2026-10-08): claude-haiku-5-5 registriert, konservativ mit der hohen Stufe 0,50/2,50.
+PRICING_VERSION = "v11"
 
 # USD per 1M tokens. {model_id: {"in": input_price, "out": output_price}}
 # Quelle je Zeile: Anthropic "Model pricing"-Tabelle,
@@ -82,6 +83,11 @@ MODEL_PRICING: dict[str, dict[str, float]] = {
     "claude-fable-5-1":           {"in": 10.00, "out": 50.00, "cache_read_mult": 0.025},
     "claude-haiku-4-5":           {"in": 1.00,  "out": 5.00},   # 2026-07-03
     "claude-haiku-4-5-20251001":  {"in": 1.00,  "out": 5.00},   # 2026-07-03
+    # Haiku 5.5: Ankuendigung 2026-10-07 nennt 0,10/0,50 bis 100k Prompt und
+    # 0,50/2,50 darueber; Cache-Lesen 0,01. Die Preisseite listete es am
+    # 2026-10-08 noch nicht. Konservativ mit der HOHEN Stufe eingetragen
+    # (nie unterberechnen); Cache-Lesen 0,01 = 0,02 x 0,50. Nachmessen am Ledger.
+    "claude-haiku-5-5":           {"in": 0.50,  "out": 2.50, "cache_read_mult": 0.02},
     # Google Gemini — Bildweg (nur Nicht-Prod erreichbar, siehe
     # src/routing/gemini_vision_gate.py). Bildeingabe wird zum Token-Preis
     # abgerechnet, es gibt also keinen getrennten Bildposten. Geprueft
