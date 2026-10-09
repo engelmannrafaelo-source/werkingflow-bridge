@@ -60,6 +60,7 @@ from src.claude_cli import (
     rate_limit_tracker,
     extract_result_usage,
     warn_if_continuation_leak,
+    StreamEndedWithoutCompletion,
 )
 from src.middleware.bridge_error import SDKDisconnectError
 from src.message_adapter import MessageAdapter
@@ -1893,19 +1894,27 @@ async def generate_streaming_response(
             yield f"data: {initial_chunk.model_dump_json()}\n\n"
             role_sent = True
         
-        # If we sent role but no content, send a minimal response
-        if role_sent and not content_sent:
-            fallback_chunk = ChatCompletionStreamResponse(
-                id=request_id,
-                model=request.model,
-                choices=[StreamChoice(
-                    index=0,
-                    delta={"content": "I'm unable to provide a response at the moment."},
-                    finish_reason=None
-                )]
-            )
-            yield f"data: {fallback_chunk.model_dump_json()}\n\n"
-        
+        # Kein Endesignal = kein Erfolg (ZB3D). Dieselben zwei Pruefungen wie
+        # auf dem Weg ohne Streaming (dort 503): run_completion meldet einen
+        # Strom ohne Result-Nachricht der CLI ausdruecklich als
+        # Abschneide-Marker, und ein Lauf ohne Text und ohne Werkzeugaufruf hat
+        # nichts geliefert. Frueher endeten beide mit finish_reason "stop" +
+        # [DONE] — im zweiten Fall sogar mit einem erfundenen Ersatzsatz.
+        if sdk_stream_error is None:
+            from src.claude_cli import chunks_have_tool_use, find_truncation_marker
+            _truncation_marker = find_truncation_marker(chunks_buffer)
+            if _truncation_marker is not None:
+                sdk_stream_error = StreamEndedWithoutCompletion(
+                    f"stream ended without completion marker "
+                    f"({_truncation_marker.get('subtype')}) — response is truncated"
+                )
+            elif not content_sent and not chunks_have_tool_use(chunks_buffer):
+                sdk_stream_error = StreamEndedWithoutCompletion(
+                    f"stream ended without content ({len(chunks_buffer)} chunks)"
+                )
+            if sdk_stream_error is not None:
+                logger.error(f"❌ Streaming: {sdk_stream_error}")
+
         # Extract assistant response from all chunks for session storage
         if actual_session_id and chunks_buffer:
             assistant_content = claude_cli.parse_claude_message(chunks_buffer)
@@ -1931,11 +1940,12 @@ async def generate_streaming_response(
         else:
             err_type = type(sdk_stream_error).__name__
             err_msg  = str(sdk_stream_error)[:300]
+            _incomplete = isinstance(sdk_stream_error, StreamEndedWithoutCompletion)
             error_payload = {
                 "error": {
                     "message": f"[Bridge] SDK stream interrupted: {err_type}: {err_msg}",
-                    "type": "sdk_stream_failure",
-                    "code": "sdk_crash",
+                    "type": "incomplete_response" if _incomplete else "sdk_stream_failure",
+                    "code": "stream_incomplete" if _incomplete else "sdk_crash",
                     "source": "bridge_internal",
                     "retryable": True,
                 }
@@ -1985,6 +1995,8 @@ async def generate_streaming_response(
         # =====================================================================
         try:
             stream_duration = time.time() - stream_start_time
+            # Ein abgebrochener Strom wird verbucht, aber nicht als Erfolg.
+            _stream_status = "success" if sdk_stream_error is None else "error"
 
             stream_result_usage = None
             for _buffered in chunks_buffer:
@@ -2025,7 +2037,7 @@ async def generate_streaming_response(
                     output_tokens=est_completion_tokens,
                     endpoint="/v1/chat/completions/stream",
                     latency_ms=int(stream_duration * 1000),
-                    status="success",
+                    status=_stream_status,
                     **attribution
                 )
                 logger.info(f"📊 Streaming usage tracked: {est_prompt_tokens}+{est_completion_tokens} tokens")
@@ -2042,7 +2054,7 @@ async def generate_streaming_response(
                     input_tokens=est_prompt_tokens,
                     output_tokens=est_completion_tokens,
                     duration_ms=int(stream_duration * 1000),
-                    status="success",
+                    status=_stream_status,
                     user_id=attr.get("user_id"),
                     session_id=attr.get("session_id"),
                 )
@@ -2061,7 +2073,7 @@ async def generate_streaming_response(
                     output_tokens=est_completion_tokens or 0,
                     cache_read_tokens=est_cache_read or 0,
                     cache_creation_tokens=est_cache_creation or 0,
-                    status="success",
+                    status=_stream_status,
                     duration_ms=int(stream_duration * 1000),
                     app_env=attr.get("app_env"),
                     provider_meta={"usage_source": stream_usage_source},

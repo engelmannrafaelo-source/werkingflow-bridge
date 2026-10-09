@@ -871,6 +871,11 @@ def is_incomplete_response(
 TRUNCATION_MARKER_SUBTYPES = ("no_completion_marker", "timeout_incomplete")
 
 
+class StreamEndedWithoutCompletion(RuntimeError):
+    """Streaming-Antwort endete ohne Endesignal der CLI oder ohne Inhalt —
+    der Aufrufer bekommt einen Fehler statt eines Erfolgs (ZB3D)."""
+
+
 def find_truncation_marker(chunks: list) -> Optional[dict]:
     """
     Find the explicit truncation marker run_completion yields when the SDK

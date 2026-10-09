@@ -12,6 +12,7 @@ Architecture:
 """
 
 import asyncio
+import json
 import random
 import time
 import logging
@@ -119,6 +120,7 @@ async def call_openai_compatible(
     logger.info(f"🌐 OpenAI-compatible call: {url} (model: {body['model']})")
 
     last_error: Optional[Exception] = None
+    stream_started = False
     async with httpx.AsyncClient(timeout=TIMEOUT) as client:
         for attempt in range(_MAX_RETRIES + 1):
             try:
@@ -181,6 +183,32 @@ async def call_openai_compatible(
     )
 
 
+def _has_finish_reason(payload: str) -> bool:
+    """True, wenn ein SSE-data-Chunk einen finish_reason traegt."""
+    try:
+        obj = json.loads(payload)
+    except ValueError:
+        return False
+    if not isinstance(obj, dict):
+        return False
+    return any(
+        isinstance(choice, dict) and choice.get("finish_reason")
+        for choice in obj.get("choices") or []
+    )
+
+
+def _incomplete_stream_event(base_url: str, reason: str) -> str:
+    """Fehler-SSE fuer einen Strom ohne Endesignal — der bis dahin gelieferte
+    Text ist abgeschnitten und darf nicht als fertige Antwort gelten."""
+    logger.error(f"❌ OpenAI-compatible stream from {base_url} incomplete: {reason}")
+    payload = {"error": {
+        "message": f"Upstream stream incomplete — response is truncated: {reason}",
+        "type": "incomplete_response",
+        "code": "stream_incomplete",
+    }}
+    return f"event: error\ndata: {json.dumps(payload)}\n\n"
+
+
 async def stream_openai_compatible(
     request: ChatCompletionRequest,
     base_url: str,
@@ -215,6 +243,7 @@ async def stream_openai_compatible(
     # has already received partial output; re-running would duplicate content
     # and double-bill tokens).
     last_error: Optional[Exception] = None
+    stream_started = False
     async with httpx.AsyncClient(timeout=TIMEOUT) as client:
         for attempt in range(_MAX_RETRIES + 1):
             try:
@@ -237,16 +266,31 @@ async def stream_openai_compatible(
                             continue
                         raise ProviderError(response.status_code, error_text)
 
-                    # Success — stream through. Any error past this point must
-                    # bubble as-is (can't safely restart a partially-delivered stream).
+                    # Success — stream through. Kein Neustart nach dem ersten
+                    # Chunk (doppelter Inhalt, doppelte Kosten); endet der Strom
+                    # ohne Endesignal, bekommt der Aufrufer einen Fehler (ZB3D).
+                    stream_started = True
+                    saw_finish = False
                     async for line in response.aiter_lines():
-                        if line.startswith("data: "):
-                            yield f"{line}\n\n"
-                        elif line == "data: [DONE]":
+                        if line == "data: [DONE]":
+                            if not saw_finish:
+                                yield _incomplete_stream_event(
+                                    base_url, "upstream sent [DONE] without finish_reason"
+                                )
+                                return
                             yield "data: [DONE]\n\n"
-                            break
+                            return
+                        if line.startswith("data: "):
+                            saw_finish = saw_finish or _has_finish_reason(line[6:])
+                            yield f"{line}\n\n"
+                    yield _incomplete_stream_event(base_url, "upstream stream ended without [DONE]")
                     return
             except Exception as net_exc:
+                if stream_started:
+                    yield _incomplete_stream_event(
+                        base_url, f"upstream stream broke: {type(net_exc).__name__}: {str(net_exc)[:200]}"
+                    )
+                    return
                 if _is_transient_httpx_exc(net_exc) and attempt < _MAX_RETRIES:
                     delay = _backoff_delay(attempt)
                     logger.warning(
