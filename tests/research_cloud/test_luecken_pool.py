@@ -233,3 +233,61 @@ async def test_resume_workdir_needs_session_id_and_existing_dir(tmp_path):
         await src.main.claude_cli.run_completion(
             prompt="x", session_id="s", resume_workdir=tmp_path, seed_files={"a.md": "x"}
         ).__anext__()
+
+
+# ── ZB3D: abgeschnittener CLI-Strom ist kein Ergebnis ──────────────────────
+
+_ABGESCHNITTEN = {"type": "result", "subtype": "no_completion_marker", "is_error": True,
+                  "error_message": "Response may be incomplete - no completion marker received"}
+
+
+class _AbgeschnittenCli(FakeCli):
+    """Wie FakeCli, aber die genannte Rolle endet ohne Result-Nachricht der CLI."""
+
+    def __init__(self, workdir, rolle, **kw):
+        super().__init__(workdir, **kw)
+        self.rolle = rolle
+
+    def __call__(self, **kw):
+        rolle = ("rueckrunde" if kw.get("resume_workdir") is not None
+                 else "pruefer" if kw.get("model") == PRUEF_MODELL else "research")
+        stream = super().__call__(**kw)
+        if rolle != self.rolle:
+            return stream
+
+        async def abgeschnitten():
+            async for c in stream:
+                if isinstance(c, dict) and c.get("subtype") == "success":
+                    c = _ABGESCHNITTEN
+                yield c
+        return abgeschnitten()
+
+
+@pytest.mark.asyncio
+async def test_abgeschnittener_research_lauf_ist_fehler(tmp_path, persist, pplx_on):
+    result = await _run(_AbgeschnittenCli(tmp_path, "research"))
+    assert result.status == "error"
+    assert "no_completion_marker" in result.error
+
+
+@pytest.mark.asyncio
+async def test_abgeschnittene_rueckrunde_stellt_bericht_wieder_her(tmp_path, persist, pplx_on):
+    work = tmp_path / "work"
+    work.mkdir()
+    fake = _AbgeschnittenCli(work, "rueckrunde", mit_datei=True)
+    result = await _run(fake)
+    assert result.status == "success" and result.content == ALT
+    assert fake.datei.read_text(encoding="utf-8") == ALT
+    meta = persist.await_args.kwargs["provider_meta"]
+    assert "abgeschnitten" in meta["rueckrunde_fehler"]
+
+
+@pytest.mark.asyncio
+async def test_abgeschnittener_pruefer_meldet_keine_luecken_freiheit(tmp_path, persist, pplx_on):
+    fake = _AbgeschnittenCli(tmp_path, "pruefer")
+    result = await _run(fake)
+    assert fake.calls["rueckrunde"] == []
+    meta = persist.await_args.kwargs["provider_meta"]
+    assert meta.get("luecken_gemeldet") is None
+    assert "abgeschnitten" in json.dumps(meta, ensure_ascii=False)
+    assert result.status == "success"

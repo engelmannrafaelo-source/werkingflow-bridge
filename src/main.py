@@ -1997,6 +1997,11 @@ async def generate_streaming_response(
             stream_duration = time.time() - stream_start_time
             # Ein abgebrochener Strom wird verbucht, aber nicht als Erfolg.
             _stream_status = "success" if sdk_stream_error is None else "error"
+            _stream_error_code = (
+                None if sdk_stream_error is None
+                else "stream_incomplete" if isinstance(sdk_stream_error, StreamEndedWithoutCompletion)
+                else "sdk_crash"
+            )
 
             stream_result_usage = None
             for _buffered in chunks_buffer:
@@ -2076,6 +2081,11 @@ async def generate_streaming_response(
                     status=_stream_status,
                     duration_ms=int(stream_duration * 1000),
                     app_env=attr.get("app_env"),
+                    error_code=_stream_error_code,
+                    error_message=(
+                        f"{type(sdk_stream_error).__name__}: {str(sdk_stream_error)[:300]}"
+                        if sdk_stream_error is not None else None
+                    ),
                     provider_meta={"usage_source": stream_usage_source},
                 )
         except Exception as track_err:
@@ -4648,6 +4658,13 @@ def _pool_luecken_pruefer(backend_config: Optional[BackendConfig]):
             backend_env_vars=backend_config.env_vars if backend_config else None,
         ):
             chunks.append(chunk)
+        from src.claude_cli import find_truncation_marker
+        _marker = find_truncation_marker(chunks)
+        if _marker is not None:
+            from src.research_cloud.luecken import LueckenPruefFehler
+            raise LueckenPruefFehler(
+                f"Prüflauf im Pool abgeschnitten ({_marker.get('subtype')}) — kein Ergebnis"
+            )
         ein = aus = 0
         for chunk in chunks:
             u = extract_result_usage(chunk)
@@ -4751,6 +4768,14 @@ async def _pool_luecken_rueckrunde(
             for k in rr_usage:
                 rr_usage[k] += u[k]
     nachkontrolle.rueckrunde_usage = dict(rr_usage or {}, usage_source="api" if rr_usage else "missing")
+    from src.claude_cli import find_truncation_marker
+    _rr_marker = find_truncation_marker(chunks)
+    if _rr_marker is not None:
+        # Abgebrochene Rueckrunde (ZB3D): eine halb ueberarbeitete Datei geht
+        # nicht raus — der Bericht von vorher kommt zurueck an seinen Platz.
+        if datei is not None:
+            datei.write_text(bericht, encoding="utf-8")
+        return scheitern(f"Rückrunde abgeschnitten ({_rr_marker.get('subtype')})")
     if pool_pplx.gate_error:
         # Same rule as the first round: a report written while the privacy
         # gate was broken is not handed out — the caller raises on gate_error.
@@ -5037,6 +5062,25 @@ async def _execute_research_impl(
 
         if not all_chunks:
             raise ValueError("No response received from Claude Code execution")
+
+        # Strom ohne Result-Nachricht der CLI = abgebrochener Lauf (ZB3D): ein
+        # bis dahin geschriebener Bericht ist womoeglich abgeschnitten.
+        from src.claude_cli import find_truncation_marker
+        _research_truncation = find_truncation_marker(all_chunks)
+        if _research_truncation is not None:
+            raise HTTPException(
+                status_code=503,
+                detail={
+                    "message": (
+                        "Research stream ended without completion marker "
+                        f"({_research_truncation.get('subtype')}) — report may be truncated. Retry."
+                    ),
+                    "reason": _research_truncation.get("subtype"),
+                    "retryable": True,
+                    "chunks_received": len(all_chunks),
+                    "session_id": session_id,
+                },
+            )
 
         execution_time = time.time() - start_time
 
@@ -6558,6 +6602,24 @@ async def _execute_doc_agent_impl(
 
         if not all_chunks:
             raise ValueError("No response received from Claude Code execution")
+
+        # Strom ohne Result-Nachricht der CLI = abgeschnittene Antwort (ZB3D).
+        from src.claude_cli import find_truncation_marker
+        _doc_truncation = find_truncation_marker(all_chunks)
+        if _doc_truncation is not None:
+            raise HTTPException(
+                status_code=503,
+                detail={
+                    "message": (
+                        "Doc-agent stream ended without completion marker "
+                        f"({_doc_truncation.get('subtype')}) — answer is truncated. Retry."
+                    ),
+                    "reason": _doc_truncation.get("subtype"),
+                    "retryable": True,
+                    "chunks_received": len(all_chunks),
+                    "session_id": session_id,
+                },
+            )
 
         execution_time = time.time() - start_time
         answer = _doc_agent_extract_last_assistant_text(all_chunks)

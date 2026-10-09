@@ -157,3 +157,82 @@ async def test_nur_werkzeugaufruf_ist_kein_abbruch(monkeypatch):
     assert _finish_reasons(out) == ["stop"]
     assert out[-1] == "data: [DONE]\n\n"
     assert "unable to provide" not in _content(out)
+
+
+async def _stream_mit_buchung(monkeypatch, chunks):
+    """Wie _stream, aber mit Anfrageobjekt, damit die Ledger-Buchung laeuft."""
+    booked = []
+
+    async def fake_persist(**kw):
+        booked.append(kw)
+
+    import src.activity.ai_call_writer as writer
+    import src.middleware.prompt_metrics as pm
+    monkeypatch.setattr(writer, "persist_ai_call_activity", fake_persist)
+    monkeypatch.setattr(pm, "get_prompt_metrics", lambda: type("M", (), {"record": lambda self, **kw: None})())
+    monkeypatch.setattr(main, "extract_attribution_context", lambda req: {})
+    monkeypatch.setattr(main, "get_tenant_from_request", lambda req: None)
+
+    async def fake_run_completion(**kw):
+        for c in chunks:
+            yield c
+    monkeypatch.setattr(main.claude_cli, "run_completion", fake_run_completion)
+
+    from types import SimpleNamespace
+
+    class _Req:
+        state = SimpleNamespace()
+        headers: dict = {}
+
+        async def is_disconnected(self):
+            return False
+
+    out = [c async for c in main.generate_streaming_response(_request(), "req-1", fastapi_request=_Req())]
+    return out, booked
+
+
+async def test_abgebrochener_strom_wird_mit_grund_als_fehler_gebucht(monkeypatch):
+    out, booked = await _stream_mit_buchung(monkeypatch, [_text("abgeschnitt"), _MARKER])
+    assert len(booked) == 1
+    assert booked[0]["status"] == "error"
+    assert booked[0]["error_code"] == "stream_incomplete"
+    assert "no_completion_marker" in booked[0]["error_message"]
+
+
+async def test_vollstaendiger_strom_wird_als_erfolg_gebucht(monkeypatch):
+    out, booked = await _stream_mit_buchung(monkeypatch, [_text("Antwort"), _RESULT_OK])
+    assert len(booked) == 1
+    assert booked[0]["status"] == "success"
+    assert booked[0]["error_code"] is None
+
+
+# ── /v1/doc-agent sammelt denselben CLI-Strom intern ────────────────────────
+
+async def _doc_agent(monkeypatch, chunks):
+    from src.models import DocAgentFile, DocAgentRequest
+
+    async def fake_run_completion(**kw):
+        for c in chunks:
+            yield c
+
+    async def fake_persist(**kw):
+        return None
+
+    import src.activity.ai_call_writer as writer
+    monkeypatch.setattr(writer, "persist_ai_call_activity", fake_persist)
+    monkeypatch.setattr(main.claude_cli, "run_completion", fake_run_completion)
+    req = DocAgentRequest(question="Was steht drin?", files=[DocAgentFile(name="a.txt", content="x")])
+    return await main._execute_doc_agent_impl(req)
+
+
+async def test_doc_agent_abgeschnitten_ist_fehler(monkeypatch):
+    res = await _doc_agent(monkeypatch, [_text("halbe Antw"), _MARKER])
+    assert res.status == "error"
+    assert "no_completion_marker" in res.error
+    assert not res.answer
+
+
+async def test_doc_agent_vollstaendig_ist_erfolg(monkeypatch):
+    res = await _doc_agent(monkeypatch, [_text("Antwort"), _RESULT_OK])
+    assert res.status == "success"
+    assert res.answer == "Antwort"
