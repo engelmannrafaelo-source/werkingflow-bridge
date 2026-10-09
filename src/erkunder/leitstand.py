@@ -23,7 +23,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict
 
 from .dateien import read_bytes, read_text
-from .models import Auftrag
+from .models import VORGABE_MODELL, Auftrag
 from .prompts import (
     PROMPT_VERSION,
     erkunder_prompt,
@@ -432,6 +432,7 @@ class Coordinator:
                             "timeout_s": 1200,
                             "max_turns": 100,
                             "claude_token": self.tokens[ident],
+                            "modell": state["auftrag"].get("modell", VORGABE_MODELL),
                         },
                     )
                     response.raise_for_status()
@@ -603,7 +604,7 @@ class Coordinator:
             "schema": "erkunder-ergebnis/1",
             "bericht_id": ident,
             "prompt_version": PROMPT_VERSION,
-            "modell": "claude-sonnet-5-5",
+            "modell": state["auftrag"].get("modell", VORGABE_MODELL),
             "schritte": [
                 {k: v for k, v in item.items() if k != "sha256"}
                 for item in state["schritte"]

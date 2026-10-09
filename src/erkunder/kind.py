@@ -52,7 +52,7 @@ def sdk_options(body: dict[str, Any]) -> Any:
     Path(home, "mpl").mkdir(parents=True, exist_ok=True)
     Path(home, "tmp").mkdir(parents=True, exist_ok=True)
     return ClaudeCodeOptions(
-        model="claude-sonnet-5-5",
+        model=body.get("modell", "claude-sonnet-5-5"),
         cwd=body["ordner"],
         max_turns=body["max_turns"],
         allowed_tools=ALLOWED_TOOLS,

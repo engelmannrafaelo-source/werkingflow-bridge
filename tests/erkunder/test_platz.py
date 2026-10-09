@@ -547,3 +547,11 @@ async def test_execution_error_logged_without_secret(run_space, caplog, monkeypa
     assert "ausfuehrung=fehlgeschlagen fehler=PermissionError" in caplog.text
     assert "test-secret" not in caplog.text
     assert service.states[("bericht-123", "erkunder-1")]["zustand"] == "abbruch"
+
+
+def test_sdk_options_haiku(run_space):
+    folder, _ = run_space
+    body = request(folder).model_dump()
+    body["claude_token"] = "test-secret"
+    body["modell"] = "claude-haiku-5-5"
+    assert sdk_options(body).model == "claude-haiku-5-5"

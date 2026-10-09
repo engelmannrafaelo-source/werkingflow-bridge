@@ -64,3 +64,18 @@ def test_invalid_file(auftrag, field, value):
     auftrag["dateien"] = [file]
     with pytest.raises(ValidationError):
         Auftrag.model_validate(auftrag)
+
+
+def test_modell_vorgabe_ist_sonnet(auftrag):
+    assert Auftrag.model_validate(auftrag).modell == "claude-sonnet-5-5"
+
+
+def test_modell_haiku_zugelassen(auftrag):
+    auftrag["modell"] = "claude-haiku-5-5"
+    assert Auftrag.model_validate(auftrag).modell == "claude-haiku-5-5"
+
+
+def test_modell_unbekannt_abgewiesen(auftrag):
+    auftrag["modell"] = "claude-opus-5-5"
+    with pytest.raises(ValidationError):
+        Auftrag.model_validate(auftrag)

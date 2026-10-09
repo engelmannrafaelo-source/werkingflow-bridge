@@ -43,6 +43,10 @@ class Pruefpunkt(Vertrag):
     fehlende_kanaele: list[str]
 
 
+ModellName = Literal["claude-sonnet-5-5", "claude-haiku-5-5"]
+VORGABE_MODELL: ModellName = "claude-sonnet-5-5"
+
+
 class Auftrag(Vertrag):
     schema_: Literal["erkunder-auftrag/1"] = Field(alias="schema")
     bericht_id: BerichtId
@@ -55,6 +59,7 @@ class Auftrag(Vertrag):
     dateien: list[Datei]
     korrekturkreis: int = Field(ge=1, le=5, strict=True)
     pruefliste: list[Pruefpunkt] = Field(default_factory=list)
+    modell: ModellName = VORGABE_MODELL
 
 
 class Tokens(Vertrag):
@@ -88,7 +93,7 @@ class Ergebnis(Vertrag):
     schema_: Literal["erkunder-ergebnis/1"] = Field(alias="schema")
     bericht_id: BerichtId
     prompt_version: Literal["erkunder-prompts/1", "erkunder-prompts/2"]
-    modell: Literal["claude-sonnet-5-5"]
+    modell: ModellName
     schritte: list[Schritt]
     erkunder_ausgefallen: list[Ausfall]
     korrekturkreis_gelaufen: bool

@@ -30,6 +30,7 @@ from src.erkunder.aufraeumen import (
 )
 from src.erkunder.dateien import read_bytes, read_text
 from src.erkunder.ipc import clear_owned_ipc
+from src.erkunder.models import VORGABE_MODELL, ModellName
 from src.erkunder.prozessschutz import protect_process
 
 LOG = logging.getLogger(__name__)
@@ -49,6 +50,7 @@ class Schritt(BaseModel):
     timeout_s: float = Field(gt=0)
     max_turns: int = Field(gt=0)
     claude_token: SecretStr = Field(min_length=1)
+    modell: ModellName = VORGABE_MODELL
 
 
 def has_content(path: Path) -> bool:
