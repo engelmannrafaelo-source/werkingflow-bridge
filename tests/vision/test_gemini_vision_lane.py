@@ -312,6 +312,23 @@ async def test_finish_reason_is_translated(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_missing_finish_reason_is_not_stop(monkeypatch):
+    """Fehlt finishReason, ist das Ende nicht belegt — kein erfundenes "stop" (ZB3D)."""
+    monkeypatch.setenv("GEMINI_VISION_API_KEY", "test-key")
+    payload = dict(_OK_PAYLOAD)
+    payload["candidates"] = [{"content": {"parts": [{"text": "teil"}]}}]
+    monkeypatch.setattr(
+        gv.httpx, "AsyncClient", lambda **kw: _FakeClient(payload=payload)
+    )
+
+    res = await gv.GeminiVisionProvider().analyze(messages=_image_messages())
+    assert res.stop_reason == "unknown"
+
+    from src.vision_provider import finish_reason_for
+    assert finish_reason_for(res.stop_reason) == "unknown"
+
+
+@pytest.mark.asyncio
 async def test_blocked_prompt_is_a_clear_error_not_an_indexerror(monkeypatch):
     monkeypatch.setenv("GEMINI_VISION_API_KEY", "test-key")
     payload = {"candidates": [], "promptFeedback": {"blockReason": "SAFETY"}}

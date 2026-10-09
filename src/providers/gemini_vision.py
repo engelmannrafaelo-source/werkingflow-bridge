@@ -466,7 +466,12 @@ class GeminiVisionProvider:
             )
 
         candidate = candidates[0]
-        raw_finish = candidate.get("finishReason") or "STOP"
+        # Fehlender finishReason ist kein Erfolg: "unknown" wie auf dem
+        # Anthropic-Bildweg (vision_provider._stop_reason_or_unknown), nicht "STOP".
+        raw_finish = candidate.get("finishReason")
+        if not raw_finish:
+            logger.error("Gemini-Kandidat ohne finishReason — melde stop_reason 'unknown'")
+            raw_finish = "unknown"
         stop_reason = _GEMINI_FINISH_REASON_MAP.get(raw_finish, raw_finish.lower())
         response_text = _extract_text(candidate)
         usage = _usage_from(data)
