@@ -75,13 +75,19 @@ def _effective_max_tokens(request) -> int:
     return 4096
 
 
-def _stream_finish_reason(stop_reason: Optional[str]) -> str:
-    """finish_reason fuer das Streaming-Ende. Fehlt der stop_reason komplett
-    (kein message_delta gesehen), wird NICHT "stop" erfunden, sondern
-    "unknown" gemeldet — der Aufrufer sieht, dass der Abbruchgrund fehlt."""
+class BedrockStreamAborted(RuntimeError):
+    """Bedrock-Antwort endete ohne Endesignal oder mit Fehlerereignis."""
+
+
+def _required_finish_reason(stop_reason: Optional[str], weg: str) -> str:
+    """finish_reason fuer das Antwortende. Fehlt der stop_reason, ist das Ende
+    der Antwort nicht belegt — dann wird weder "stop" noch "unknown" gemeldet,
+    sondern laut abgebrochen: der Aufrufer darf keinen womoeglich
+    abgeschnittenen Text als fertige Antwort bekommen."""
     if not stop_reason:
-        logger.error("Bedrock-Stream ohne stop_reason beendet — melde finish_reason 'unknown'")
-        return "unknown"
+        raise BedrockStreamAborted(
+            f"Bedrock {weg} ended without stop_reason — end of response not confirmed"
+        )
     return _map_bedrock_stop_reason(stop_reason)
 
 
@@ -103,7 +109,7 @@ def _map_bedrock_stop_reason(bedrock_reason: Optional[str]) -> str:
         "tool_use": "tool_calls",
     }
     if not bedrock_reason:
-        return "stop"
+        raise BedrockStreamAborted("Bedrock response without stop_reason")
     # Unbekannte Werte (z.B. tool_use) durchreichen statt zu "stop" zu beschoenigen.
     return mapping.get(bedrock_reason, bedrock_reason)
 
@@ -331,7 +337,11 @@ async def call_bedrock(
                     content += block.get("text", "")
 
         # Build OpenAI-compatible response
-        finish_reason = _map_bedrock_stop_reason(response_body.get("stop_reason"))
+        try:
+            finish_reason = _required_finish_reason(response_body.get("stop_reason"), "response")
+        except BedrockStreamAborted as exc:
+            logger.error(str(exc))
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
         return ChatCompletionResponse(
             id=f"chatcmpl-{uuid.uuid4().hex[:16]}",
             model=resolved_model,
@@ -374,6 +384,8 @@ async def call_bedrock(
         if code in _BEDROCK_THROTTLE_ERROR_CODES:
             raise HTTPException(status_code=429, detail=detail)
         raise HTTPException(status_code=500, detail=detail)
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Bedrock API error: {e}")
         raise HTTPException(status_code=500, detail=f"Bedrock API error: {str(e)}")
@@ -483,11 +495,19 @@ async def stream_bedrock(
         _events = iter(response["body"])
         _stream_end = object()
         _stream_stop_reason = None
+        _final_sent = False
         while True:
             event = await asyncio.to_thread(next, _events, _stream_end)
             if event is _stream_end:
                 break
+            if "chunk" not in event:
+                # Bedrock meldet Abbrueche mitten im Strom als eigenes Ereignis
+                # (modelStreamErrorException, throttlingException, ...) statt als chunk.
+                raise BedrockStreamAborted(f"Bedrock stream error event: {json.dumps(event, default=str)[:300]}")
             chunk = json.loads(event["chunk"]["bytes"])
+
+            if chunk.get("type") == "error":
+                raise BedrockStreamAborted(f"Bedrock stream error chunk: {json.dumps(chunk.get('error'), default=str)[:300]}")
 
             if chunk.get("type") == "message_start":
                 # Input tokens are only reported here.
@@ -530,11 +550,19 @@ async def stream_bedrock(
                         StreamChoice(
                             index=0,
                             delta={},
-                            finish_reason=_stream_finish_reason(_stream_stop_reason)
+                            finish_reason=_required_finish_reason(_stream_stop_reason, "stream")
                         )
                     ]
                 )
                 yield f"data: {stream_response.model_dump_json()}\n\n"
+                _final_sent = True
+
+        if not _final_sent:
+            # Strom endete ohne message_stop (Verbindung abgerissen): der Text ist
+            # abgeschnitten. Kein Final-Chunk, kein [DONE], Status bleibt 'error'.
+            raise BedrockStreamAborted(
+                "Bedrock stream ended without message_stop — response is truncated"
+            )
 
         usage_sink["status"] = "success"
         yield "data: [DONE]\n\n"

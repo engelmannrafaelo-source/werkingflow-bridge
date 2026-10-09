@@ -84,7 +84,7 @@ class _FakeBoto:
 
 
 @pytest.mark.parametrize("stop_reason,expected", [
-    ("end_turn", "stop"), ("max_tokens", "length"), (None, "unknown"),
+    ("end_turn", "stop"), ("max_tokens", "length"),
 ])
 async def test_bedrock_stream_meldet_stop_reason(monkeypatch, stop_reason, expected):
     fake_client = SimpleNamespace(
