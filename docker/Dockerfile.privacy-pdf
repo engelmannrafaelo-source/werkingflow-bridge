@@ -34,7 +34,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN useradd -m -u 1001 -s /bin/bash claude
 
 # Install Poetry
-RUN curl -sSL https://install.python-poetry.org | POETRY_HOME=/usr/local POETRY_VERSION=2.4.1 python3 -
+RUN curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 -o /tmp/install-poetry.py https://install.python-poetry.org \
+    && POETRY_HOME=/usr/local POETRY_VERSION=2.4.1 python3 /tmp/install-poetry.py \
+    && rm -f /tmp/install-poetry.py \
+    && /usr/local/bin/poetry --version
 
 ENV PATH="/usr/local/bin:${PATH}"
 

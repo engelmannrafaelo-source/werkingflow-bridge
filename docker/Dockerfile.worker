@@ -27,7 +27,10 @@ RUN apt-get update && apt-get install -y \
 RUN useradd -m -u 1001 -s /bin/bash claude
 
 # Install Poetry globally
-RUN curl -sSL https://install.python-poetry.org | POETRY_HOME=/usr/local python3 -
+RUN curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 -o /tmp/install-poetry.py https://install.python-poetry.org \
+    && POETRY_HOME=/usr/local python3 /tmp/install-poetry.py \
+    && rm -f /tmp/install-poetry.py \
+    && /usr/local/bin/poetry --version
 
 ENV PATH="/usr/local/bin:${PATH}"
 

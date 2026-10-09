@@ -23,7 +23,10 @@ RUN apt-get update && apt-get install -y \
 RUN useradd -m -u 1001 -s /bin/bash claude
 
 # Install Poetry globally as root, but make it accessible system-wide
-RUN curl -sSL https://install.python-poetry.org | POETRY_HOME=/usr/local python3 -
+RUN curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 -o /tmp/install-poetry.py https://install.python-poetry.org \
+    && POETRY_HOME=/usr/local python3 /tmp/install-poetry.py \
+    && rm -f /tmp/install-poetry.py \
+    && /usr/local/bin/poetry --version
 
 # Add Poetry to PATH
 ENV PATH="/usr/local/bin:${PATH}"

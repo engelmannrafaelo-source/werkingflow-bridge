@@ -1436,8 +1436,13 @@ phase_rollback() {
     fi
     for svc in "${services[@]}"; do
         local container
+        # Same host->prefix mapping as deploy_server; the worker-host runs
+        # wt-worker-host-* containers, so SERVER2 names would never turn healthy
+        # there and every rollback would be reported as a partial failure.
         if [[ "$host" == "$HETZNER_HOST" ]]; then
             container=$(container_for_svc "HETZNER" "$svc")
+        elif [[ "$host" == "$WORKERHOST_HOST" ]]; then
+            container=$(container_for_svc "WORKERHOST" "$svc")
         else
             container=$(container_for_svc "SERVER2" "$svc")
         fi
