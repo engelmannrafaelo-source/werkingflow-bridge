@@ -12,69 +12,19 @@ import json
 import sys
 
 
-# ── claude_code_sdk stub (not installed locally; runs inside Docker on bridge) ──
-# Register a minimal stub so src.claude_cli can be imported without the real SDK.
-if "claude_code_sdk" not in sys.modules:
-    import types
-    _sdk_stub = types.ModuleType("claude_code_sdk")
+# claude_code_sdk lebt nur im Worker-Image. Gleicher MagicMock-Ersatz wie in
+# tests/research_cloud — ein schmalerer Stub auf Modulebene braeche dort
+# Tests, die nach dieser Datei laufen (create_sdk_mcp_server fehlte).
+from unittest.mock import MagicMock as _MagicMock  # noqa: E402
 
-    class _ClaudeCodeOptions:
-        def __init__(self, **kwargs):
-            for k, v in kwargs.items():
-                setattr(self, k, v)
-
-    class _Message:
-        pass
-
-    async def _query_stub(*args, **kwargs):
-        return
-        yield  # make it an async generator
-
-    _sdk_stub.query = _query_stub
-    _sdk_stub.ClaudeCodeOptions = _ClaudeCodeOptions
-    _sdk_stub.Message = _Message
-
-    # Minimal type stubs used in claude_cli
-    _types_stub = types.ModuleType("claude_code_sdk.types")
-
-    class _TextBlock:
-        def __init__(self, text=""):
-            self.type = "text"
-            self.text = text
-
-    class _ToolUseBlock:
-        def __init__(self, id="", name="", input=None):
-            self.type = "tool_use"
-            self.id = id
-            self.name = name
-            self.input = input or {}
-
-    _types_stub.TextBlock = _TextBlock
-    _types_stub.ToolUseBlock = _ToolUseBlock
-
-    class _AssistantMessage:
-        def __init__(self, content=None, model=""):
-            self.content = content or []
-            self.model = model
-
-    class _SystemMessage:
-        def __init__(self, subtype="", data=None):
-            self.subtype = subtype
-            self.data = data or {}
-
-    _sdk_stub.AssistantMessage = _AssistantMessage
-    _sdk_stub.SystemMessage = _SystemMessage
-
-    _errors_stub = types.ModuleType("claude_code_sdk._errors")
-
-    class _MessageParseError(Exception):
-        pass
-
-    _errors_stub.MessageParseError = _MessageParseError
-
-    sys.modules["claude_code_sdk"] = _sdk_stub
-    sys.modules["claude_code_sdk.types"] = _types_stub
-    sys.modules["claude_code_sdk._errors"] = _errors_stub
+for _mod_name in [
+    "claude_code_sdk",
+    "claude_code_sdk._errors",
+    "claude_code_sdk._internal",
+    "claude_code_sdk._internal.client",
+]:
+    if _mod_name not in sys.modules:
+        sys.modules[_mod_name] = _MagicMock()
 
 import src.main as main  # noqa: E402
 from src.models import ChatCompletionRequest, Message

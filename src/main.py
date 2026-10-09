@@ -4760,6 +4760,10 @@ async def _pool_luecken_rueckrunde(
         ):
             chunks.append(chunk)
     except Exception as e:
+        # Hat das Modell die Datei vor dem Abbruch schon ueberschrieben, kommt
+        # der Bericht von vorher an seinen Platz — Datei und Antwort gleich.
+        if datei is not None:
+            datei.write_text(bericht, encoding="utf-8")
         return scheitern(f"{type(e).__name__}: {e}")
     for chunk in chunks:
         u = extract_result_usage(chunk)
