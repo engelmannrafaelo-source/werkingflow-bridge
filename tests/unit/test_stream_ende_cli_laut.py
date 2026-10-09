@@ -10,13 +10,11 @@ from __future__ import annotations
 
 import json
 import sys
-
+from unittest.mock import MagicMock as _MagicMock
 
 # claude_code_sdk lebt nur im Worker-Image. Gleicher MagicMock-Ersatz wie in
 # tests/research_cloud — ein schmalerer Stub auf Modulebene braeche dort
 # Tests, die nach dieser Datei laufen (create_sdk_mcp_server fehlte).
-from unittest.mock import MagicMock as _MagicMock  # noqa: E402
-
 for _mod_name in [
     "claude_code_sdk",
     "claude_code_sdk._errors",
@@ -27,7 +25,7 @@ for _mod_name in [
         sys.modules[_mod_name] = _MagicMock()
 
 import src.main as main  # noqa: E402
-from src.models import ChatCompletionRequest, Message
+from src.models import ChatCompletionRequest, Message  # noqa: E402
 
 
 def _request():
