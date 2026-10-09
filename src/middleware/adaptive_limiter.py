@@ -1022,6 +1022,24 @@ async def cache_request_body_dependency(request: Request) -> None:
     observe_input_limit(request)
 
 
+def is_gemini_vision_request(request: Request) -> bool:
+    """True when the client chose the Gemini image lane
+    (``provider_tier == "gemini-vision"`` in the cached body).
+
+    That lane consumes no Claude account, so neither the subscription-pool
+    admission nor a worker's Anthropic account lock may reject it (nginx side:
+    ``pool_router.choose`` -> ``gemini_vision_bypass``). Keyed on the BODY,
+    not on the ``X-Vision-Provider`` header: the body field is what makes the
+    worker take the Gemini path (main.py fails loud with
+    ``gemini_vision_tier_overridden`` if a pin removes it), so a header-only
+    call stays on the Claude path and keeps every Claude gate.
+    """
+    from src.routing.app_provider_policy import GEMINI_VISION_TEST_TIER
+
+    body = getattr(request.state, "cached_body_dict", None)
+    return isinstance(body, dict) and body.get("provider_tier") == GEMINI_VISION_TEST_TIER
+
+
 async def enforce_pool_admission(request: Request) -> None:
     """
     Enforce the adaptive token budget for a POOL-BOUND request — queueing if
@@ -1093,4 +1111,8 @@ async def adaptive_limit_dependency(request: Request) -> None:
     their pool-bound branch — see /v1/research.
     """
     await cache_request_body_dependency(request)
+    if is_gemini_vision_request(request):
+        # Gemini image lane: no Claude account behind it, nothing to admit
+        # against the subscription pool.
+        return
     await enforce_pool_admission(request)

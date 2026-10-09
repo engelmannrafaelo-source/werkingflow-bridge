@@ -2478,11 +2478,25 @@ async def chat_completions(
         # =======================================================================
         worker_id = os.getenv("INSTANCE_NAME", "unknown")
         _self_worker = worker_id  # defined once; all error branches below use this
-        _org_block = _org_disabled_precheck(worker_id)
+        # Gemini-Bildweg (provider_tier="gemini-vision") braucht kein
+        # Claude-Konto: weder die Org-Sperre noch die Anthropic-Ratelimit-Sperre
+        # DIESES Workers darf ihn abweisen. Sonst wird der Worker-429 in nginx
+        # @bridge_full zu "Anthropic rate limit on selected worker", obwohl
+        # nichts an Anthropic ginge (BR1, 09.10.2026). Faellt der Tier spaeter
+        # einem Pin zum Opfer, scheitert der Aufruf laut
+        # (gemini_vision_tier_overridden) — er rutscht nie still auf Claude.
+        from src.middleware.adaptive_limiter import is_gemini_vision_request
+        _gemini_vision_lane = is_gemini_vision_request(request)
+        if _gemini_vision_lane:
+            logger.info(
+                f"🖼️ {worker_id}: Gemini-Bildweg — Claude-Kontosperren "
+                f"(Org/Ratelimit) dieses Workers gelten nicht"
+            )
+        _org_block = None if _gemini_vision_lane else _org_disabled_precheck(worker_id)
         if _org_block is not None:
             return _org_block
         from src.claude_cli import rate_limit_tracker
-        if rate_limit_tracker.should_reject_new_request(worker_id):
+        if not _gemini_vision_lane and rate_limit_tracker.should_reject_new_request(worker_id):
             retry_after = rate_limit_tracker.get_retry_after(worker_id) or 0
             limit_type = "HARD" if rate_limit_tracker.is_hard_limited(worker_id) else "soft"
 
