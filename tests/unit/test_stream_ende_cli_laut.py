@@ -11,7 +11,6 @@ from __future__ import annotations
 import json
 import sys
 
-import pytest
 
 # ── claude_code_sdk stub (not installed locally; runs inside Docker on bridge) ──
 # Register a minimal stub so src.claude_cli can be imported without the real SDK.

@@ -120,7 +120,6 @@ async def call_openai_compatible(
     logger.info(f"🌐 OpenAI-compatible call: {url} (model: {body['model']})")
 
     last_error: Optional[Exception] = None
-    stream_started = False
     async with httpx.AsyncClient(timeout=TIMEOUT) as client:
         for attempt in range(_MAX_RETRIES + 1):
             try:
