@@ -374,6 +374,66 @@ def handle_org_subscription_disabled(worker_id: str, signal: str) -> None:
     raise OrgSubscriptionDisabledError(worker_id, signal, lock_seconds)
 
 
+# =============================================================================
+# ACCOUNT LIMIT IN THE CLI'S OWN ANSWER — recognised by its form, not its words
+#
+# When the API refuses a request for this account (429, usage/weekly cap,
+# credits required), the CLI does not fail: it writes its explanation as a
+# synthetic assistant turn ("You've hit your limit · resets 3pm", "Anthropic
+# seven_day limit hit", ...) and tags it with the structured field
+# `"error": "rate_limit"` or `"error": "billing_error"` (SDKAssistantMessage
+# schema, CLI 2.1.2xx). claude-code-sdk drops that field; the resilient parser
+# keeps it as `_bridge_cli_error` (same carrier as oauth_org_not_allowed).
+#
+# The former phrase check in run_completion tested `AssistantMessage` AFTER the
+# dict conversion and never ran — the sentence went out as HTTP 200 content and
+# the exhausted worker stayed in the pool. The field is the signal; the wording
+# changes with every CLI release, the field does not.
+#
+# A rate_limit_event with status "rejected" is the other structured signal and
+# is handled by _handle_rate_limit_event. Both end on the same path:
+# RateLimitError (account_exhausted, retryable) and the worker out of routing.
+# =============================================================================
+ACCOUNT_LIMIT_CLI_ERRORS = ("rate_limit", "billing_error")
+
+
+def detect_account_limit(message: Any) -> Optional[str]:
+    """Return "cli_error:<value>" if `message` is the CLI's own limit answer,
+    else None. Only the structured error field of an assistant turn counts —
+    never the text, never a user turn."""
+    if message is None or is_user_turn(message):
+        return None
+    if isinstance(message, dict):
+        cli_error = message.get("error") if message.get("type") == "assistant" else None
+    else:
+        cli_error = getattr(message, "_bridge_cli_error", None)
+    if cli_error in ACCOUNT_LIMIT_CLI_ERRORS:
+        return f"cli_error:{cli_error}"
+    return None
+
+
+def handle_account_limit(worker_id: str, signal: str, message: Any) -> None:
+    """Take the worker out of routing and raise RateLimitError.
+
+    Same path a detected limit text always meant to take: HARD mark on the
+    tracker (account-pool-state reports the cooldown, the pre-check answers new
+    requests with 503), then RateLimitError — classify_exception makes it
+    account_exhausted (retryable), the HTTP handler retries on another worker.
+    The CLI's sentence is only logged and used for the reset time."""
+    text = _message_text(message)
+    rate_limit_tracker.mark_rate_limited(worker_id, text)
+    retry_after = rate_limit_tracker.get_retry_after(worker_id) or rate_limit_tracker.MAX_COOLDOWN_SECONDS
+    logger.warning(
+        f"🚫 Account limit on worker {worker_id} ({signal}) — worker HARD-limited, "
+        f"answer withheld, raising RateLimitError. CLI text: {text[:150]!r}",
+        extra={"account_limit": True, "worker_id": worker_id, "signal": signal},
+    )
+    raise RateLimitError(
+        f"[{worker_id}] Anthropic account limit ({signal})",
+        retry_after_seconds=retry_after,
+    )
+
+
 class RateLimitTracker:
     """Tracks rate limit status per worker instance with soft routing.
 
@@ -401,9 +461,10 @@ class RateLimitTracker:
     # only protection for *new* request routing. Long lock created cascades
     # where Pool-Router shut down all 4 accounts on phantom heartbeat events.
 
-    # Anthropic account-level exhaustion phrasings. Single source of truth —
-    # the streaming and non-streaming response paths both read this list via
-    # detect_in_text() so a new wording only has to be added here. Wider is
+    # Anthropic account-level exhaustion phrasings — the SECOND net, read by
+    # the sync chat path via detect_in_text(). The first is the CLI's own
+    # error field (detect_account_limit in run_completion), which needs no
+    # wording at all. Wider is
     # safer than narrower: a false positive parks the worker for 10min (capped
     # by MAX_COOLDOWN_SECONDS) while a false negative leaks the rate-limit
     # text to the client AND keeps the dead worker in the routing pool, so the
@@ -523,11 +584,11 @@ class RateLimitTracker:
         """Scan a SHORT assistant text for an Anthropic rate-limit phrasing
         and, on hit, mark the worker HARD-limited.
 
-        Single entry point for both response paths — streaming and the
-        non-streaming SDK extractor. Without this the streaming loop saw the
-        phrase and parked the worker, but a non-streaming sync request
-        returned the same phrase as response content with the worker still
-        marked available. The pool-router then kept routing every new
+        Second net behind detect_account_limit (the CLI's structured error
+        field, checked in run_completion for every path): catches a limit
+        sentence that arrives WITHOUT the field. Without any net a sync
+        request returned the phrase as response content with the worker
+        still marked available, and the pool-router kept routing every new
         request to the same exhausted worker.
 
         Length guard (DETECT_MAX_TEXT_LEN): a real Anthropic rate-limit
@@ -1987,6 +2048,15 @@ class ClaudeCodeCLI:
                                     os.environ.get("INSTANCE_NAME", "unknown"), _org_signal
                                 )
 
+                            # Account limit (429, usage cap, credits): the CLI
+                            # answers with a tagged assistant turn. Never yield
+                            # it — take the worker out and raise RateLimitError.
+                            _limit_signal = detect_account_limit(message)
+                            if _limit_signal:
+                                handle_account_limit(
+                                    os.environ.get("INSTANCE_NAME", "unknown"), _limit_signal, message
+                                )
+
                             # Completion-marker detection MUST happen on the
                             # dataclass, BEFORE the attribute->dict conversion
                             # below: ResultMessage has no `.type` attribute, so
@@ -2140,29 +2210,6 @@ class ClaudeCodeCLI:
                                                     accumulated_text_parts.append(block['text'])
                                 except (AttributeError, TypeError, KeyError) as e:
                                     logger.debug(f"🔍 Could not extract text from message: {e}")
-
-                            # =================================================================
-                            # RATE LIMIT TEXT DETECTION (track only, DON'T abort)
-                            #
-                            # The CLI handles rate limits internally — it waits and retries.
-                            # We track the state so NEW requests get routed to other workers,
-                            # but we do NOT abort this in-progress task.
-                            #
-                            # Detection logic + pattern list lives on RateLimitTracker so the
-                            # non-streaming response extractor uses the same rules.
-                            # =================================================================
-                            if type(message).__name__ == 'AssistantMessage':
-                                if hasattr(message, 'content') and message.content:
-                                    skip_yield = False
-                                    for block in message.content:
-                                        if hasattr(block, 'text') and block.text:
-                                            worker_id = os.environ.get("INSTANCE_NAME", "unknown")
-                                            if rate_limit_tracker.detect_in_text(block.text, worker_id):
-                                                skip_yield = True
-                                                break
-                                    if skip_yield:
-                                        # Don't yield this rate-limit text to the client
-                                        continue
 
                             # Yield chunk immediately (no in-memory accumulation)
                             yield message
@@ -2516,6 +2563,15 @@ class ClaudeCodeCLI:
             # Already logged + locked in handle_org_subscription_disabled. Must
             # bypass the generic classifier/cache-recovery below, which would
             # otherwise re-yield the cached block sentence as content.
+            cli_session_manager.complete_session(cli_session_id, status="failed")
+            raise
+
+        except RateLimitError:
+            # Raised on purpose above (rate_limit_event "rejected" or the CLI's
+            # tagged limit answer), worker already marked. The generic branch
+            # below matched none of its indicators on "... limit hit" and turned
+            # it into an error_during_execution chunk or re-yielded the cache —
+            # the limit never reached the caller as a limit.
             cli_session_manager.complete_session(cli_session_id, status="failed")
             raise
 

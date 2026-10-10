@@ -1938,6 +1938,29 @@ async def generate_streaming_response(
                 )]
             )
             yield f"data: {final_chunk.model_dump_json()}\n\n"
+        elif isinstance(sdk_stream_error, RateLimitError):
+            # Account limit (rate_limit_event "rejected" or the CLI's tagged
+            # limit answer): run_completion withheld the CLI's sentence and
+            # took the worker out. The 200 is already on the wire, so the
+            # caller gets the same account_exhausted verdict a sync call gets
+            # as 429 — retryable, with the wait — never the sentence as text.
+            _rl_worker = os.getenv("INSTANCE_NAME", "unknown")
+            from src.middleware.rolling_metrics import get_rolling_metrics
+            get_rolling_metrics().record_rate_limit(_rl_worker)
+            error_payload = {
+                "error": {
+                    "message": f"[Bridge {_rl_worker}] {str(sdk_stream_error)[:300]}",
+                    "type": "rate_limit_exceeded",
+                    "code": "429",
+                    "source": "bridge_account",
+                    "bridge_type": "account_exhausted",
+                    "reason": "worker_account_rate_limited",
+                    "retryable": True,
+                    "retry_after_s": sdk_stream_error.retry_after_seconds,
+                    "bridge_worker": _rl_worker,
+                }
+            }
+            yield f"event: error\ndata: {json.dumps(error_payload)}\n\n"
         else:
             err_type = type(sdk_stream_error).__name__
             err_msg  = str(sdk_stream_error)[:300]
@@ -2001,6 +2024,7 @@ async def generate_streaming_response(
             _stream_error_code = (
                 None if sdk_stream_error is None
                 else "stream_incomplete" if isinstance(sdk_stream_error, StreamEndedWithoutCompletion)
+                else "account_rate_limited" if isinstance(sdk_stream_error, RateLimitError)
                 else "sdk_crash"
             )
 
@@ -3813,12 +3837,12 @@ async def chat_completions(
                 )
 
             # Rate-limit phrasing in the assistant text (non-streaming path).
-            # The streaming loop in claude_cli already calls detect_in_text per
-            # block, but a sync chat completion comes back as a single message
-            # — without this check the rate-limit phrase would be returned to
-            # the caller as response content while the worker stayed marked
-            # available, so the pool router would route the next request to
-            # the same exhausted account.
+            # Second net only: the CLI's own limit answer is recognised by its
+            # error field in run_completion (detect_account_limit) and never
+            # reaches this point. Without this check a phrase the CLI does not
+            # tag would be returned to the caller as response content while the
+            # worker stayed marked available, so the pool router would route
+            # the next request to the same exhausted account.
             if raw_assistant_content:
                 from src.claude_cli import rate_limit_tracker as _rl_tracker
                 _rl_match = _rl_tracker.detect_in_text(raw_assistant_content, _self_worker)
@@ -5596,8 +5620,10 @@ async def _execute_research_impl(
             library_calls=library_calls if library_active else None
         )
 
-    except WorkerUnavailableError:
-        # Re-raise to trigger HTTP 503 and Nginx failover to another worker
+    except (WorkerUnavailableError, RateLimitError):
+        # Re-raise to trigger HTTP 503 and Nginx failover to another worker.
+        # RateLimitError: account limit — rate_limit_handler retries on another
+        # worker, else 429 with Retry-After; never a 200 status=error.
         raise
 
     except Exception as e:
@@ -6886,7 +6912,9 @@ async def _execute_doc_agent_impl(
             session_id=session_id,
         )
 
-    except WorkerUnavailableError:
+    except (WorkerUnavailableError, RateLimitError):
+        # RateLimitError: account limit — rate_limit_handler answers 429 with
+        # Retry-After (jobs park/re-dispatch on it), not a 200 status=error.
         raise
 
     except Exception as e:
