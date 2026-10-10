@@ -2492,9 +2492,12 @@ async def chat_completions(
         # Claude-Konto: weder die Org-Sperre noch die Anthropic-Ratelimit-Sperre
         # DIESES Workers darf ihn abweisen. Sonst wird der Worker-429 in nginx
         # @bridge_full zu "Anthropic rate limit on selected worker", obwohl
-        # nichts an Anthropic ginge (BR1, 09.10.2026). Faellt der Tier spaeter
-        # einem Pin zum Opfer, scheitert der Aufruf laut
-        # (gemini_vision_tier_overridden) — er rutscht nie still auf Claude.
+        # nichts an Anthropic ginge (BR1, 09.10.2026). Die Freigabe haengt hier
+        # nur am Body; dass der Aufruf wirklich zu Gemini geht, prueft die
+        # Weiche direkt hinter resolve_backend_config: loest er auf etwas
+        # anderes als GEMINI_API auf (Pin, App-Tier-Regel), endet er dort mit
+        # 409 gemini_vision_tier_overridden, bevor ein Claude-Zweig erreichbar
+        # ist.
         if _gemini_vision_lane:
             logger.info(
                 f"🖼️ {worker_id}: Gemini-Bildweg — Claude-Kontosperren "
@@ -2790,6 +2793,70 @@ async def chat_completions(
                         "hint": "Contact server administrator to configure the requested provider"
                     }
                 }
+            )
+
+        # =======================================================================
+        # GEMINI-BILDWEG: geht der Aufruf wirklich zu Gemini?
+        # =======================================================================
+        # Ein gemini-vision-Body hat oben Pool-Zulassung, Org-Sperre und
+        # Ratelimit dieses Workers uebersprungen — das ist nur richtig, wenn
+        # ihn am Ende auch Gemini beantwortet. Ein Operator-Pin (anthropic,
+        # anthropic_direct, bedrock), die App-Tier-Regel oder jede kuenftige
+        # Stelle, die provider_tier umschreibt, kann ihn auf einen Claude-Weg
+        # lenken. Deshalb hier, direkt am aufgeloesten Backend und VOR jedem
+        # Backend-Zweig, eine einzige Pruefung statt Einzelfaelle: alles, was
+        # nicht auf GEMINI_API aufloest, endet laut (409). Still von Anthropic
+        # oder Bedrock beantwortet waere es ein Claude-Aufruf ohne Sperren und
+        # zugleich ein falsches Messergebnis auf dem falschen Schluessel (BR1R2
+        # M3, 10.10.2026). Der Pin selbst bleibt unangetastet: er traegt die
+        # vertragliche EU-Datenresidenz eines echten Kunden, dessen Daten
+        # gehoeren erst recht nicht zu Google.
+        _gemini_vision_wanted = _gemini_vision_lane or _client_asked_for_gemini_vision
+        _resolves_to_gemini = bool(
+            backend_config and backend_config.backend == BackendType.GEMINI_API
+        )
+        if _gemini_vision_wanted and not _resolves_to_gemini:
+            logger.warning(
+                "⛔ provider_tier='gemini-vision' loest auf backend=%r auf "
+                "(pinned=%r) — Aufruf abgewiesen statt still von Claude beantwortet.",
+                backend_config.backend if backend_config else None,
+                operator_pinned_provider,
+            )
+            return JSONResponse(
+                status_code=409,
+                content={"error": {
+                    "message": (
+                        "provider_tier='gemini-vision' wurde von einer "
+                        "hoeherrangigen Provider-Entscheidung ueberschrieben "
+                        f"(Operator-Pin: {operator_pinned_provider!r}). Der Aufruf "
+                        "wird NICHT stillschweigend von Anthropic beantwortet — das "
+                        "waere ein falsches Messergebnis auf einem anderen "
+                        "Schluessel. Ein Nutzer mit Operator-Pin traegt eine "
+                        "vertragliche Datenresidenz-Zusage; fuer den Gemini-Weg "
+                        "einen ungepinnten Nutzer verwenden."
+                    ),
+                    "type": "provider_tier_overridden",
+                    "code": "gemini_vision_tier_overridden",
+                }},
+            )
+        # Der Tier bedient ausschliesslich Bildanalysen (Vision-Weiche weiter
+        # unten). Ohne Bild faende er dort nichts und fiele in den Claude-SDK-
+        # Zweig — also auch hier laut abweisen, bevor das passieren kann.
+        if _resolves_to_gemini and not has_vision_content(
+            prepare_messages_for_vision(request_body.messages)
+        ):
+            return JSONResponse(
+                status_code=400,
+                content={"error": {
+                    "message": (
+                        "provider_tier='gemini-vision' ist ein reiner "
+                        "Bildanalyse-Weg, dieser Aufruf enthaelt aber kein Bild. "
+                        "Ohne Tier laeuft der Aufruf normal ueber Claude."
+                    ),
+                    "type": "invalid_request_error",
+                    "param": "provider_tier",
+                    "code": "gemini_vision_requires_image",
+                }},
             )
 
         # BEDROCK-GATE: effektiver Backend darf nur per Operator-Pin Bedrock
@@ -3249,54 +3316,6 @@ async def chat_completions(
         # und aendert sich bis dorthin nicht, der Wert ist also derselbe.
         _vision_target = resolve_vision_target(backend_config)
 
-        # =======================================================================
-        # GEMINI API (Bildweg, Testlane): nur MIT Bild sinnvoll
-        # =======================================================================
-        # Der Tier 'gemini-vision' bedient ausschliesslich Bildanalysen;
-        # bedient wird er weiter unten an der Vision-Weiche. Ein
-        # Aufruf OHNE Bild faende dort nichts und fiele stillschweigend in den
-        # Claude-SDK-Zweig darunter — der Aufrufer bekaeme ein anderes Modell
-        # als angefragt und saehe es nirgends. Deshalb hier laut abweisen,
-        # bevor das passieren kann.
-        # Der Aufrufer wollte Gemini, bekommt aber etwas anderes? Dann NICHT
-        # stillschweigend etwas anderes liefern.
-        #
-        # Zwei Stellen raeumen provider_tier ab: die App-Regel (dort jetzt mit
-        # ausdruecklicher Ausnahme fuer diesen Tier) und der Operator-Pin aus
-        # users.provider_config. Der Pin bleibt bewusst unangetastet — er traegt
-        # die vertragliche EU-Datenresidenz eines echten Kunden, und dessen
-        # Daten gehoeren erst recht nicht zu Google. Nur darf das Ergebnis dann
-        # nicht "Anthropic antwortet, der Aufrufer glaubt er misst Gemini"
-        # sein: das waere ein falsches Messergebnis auf dem falschen
-        # Schluessel. Also laut abweisen und den Grund nennen.
-        _gemini_tier_was_overridden = (
-            _client_asked_for_gemini_vision
-            and not (backend_config and backend_config.backend == BackendType.GEMINI_API)
-        )
-        if _gemini_tier_was_overridden:
-            logger.warning(
-                "⛔ provider_tier='gemini-vision' wurde durch einen Pin/eine "
-                "Regel ueberschrieben (pinned=%r) — Aufruf abgewiesen statt still "
-                "von Anthropic beantwortet.", operator_pinned_provider,
-            )
-            return JSONResponse(
-                status_code=409,
-                content={"error": {
-                    "message": (
-                        "provider_tier='gemini-vision' wurde von einer "
-                        "hoeherrangigen Provider-Entscheidung ueberschrieben "
-                        f"(Operator-Pin: {operator_pinned_provider!r}). Der Aufruf "
-                        "wird NICHT stillschweigend von Anthropic beantwortet — das "
-                        "waere ein falsches Messergebnis auf einem anderen "
-                        "Schluessel. Ein Nutzer mit Operator-Pin traegt eine "
-                        "vertragliche Datenresidenz-Zusage; fuer den Gemini-Weg "
-                        "einen ungepinnten Nutzer verwenden."
-                    ),
-                    "type": "provider_tier_overridden",
-                    "code": "gemini_vision_tier_overridden",
-                }},
-            )
-
         # gemini_thinking_budget ist Gemini-EIGENE Semantik. Auf einem anderen
         # Weg taete es nichts — und ein Feld, das je nach Backend still
         # wirkungslos ist, ist schlimmer als kein Feld: der Aufrufer glaubt, er
@@ -3317,22 +3336,6 @@ async def chat_completions(
                     "code": "gemini_thinking_budget_not_applicable",
                 }},
             )
-
-        if backend_config and backend_config.backend == BackendType.GEMINI_API:
-            if not has_vision_content(prepare_messages_for_vision(request_body.messages)):
-                return JSONResponse(
-                    status_code=400,
-                    content={"error": {
-                        "message": (
-                            "provider_tier='gemini-vision' ist ein reiner "
-                            "Bildanalyse-Weg, dieser Aufruf enthaelt aber kein Bild. "
-                            "Ohne Tier laeuft der Aufruf normal ueber Claude."
-                        ),
-                        "type": "invalid_request_error",
-                        "param": "provider_tier",
-                        "code": "gemini_vision_requires_image",
-                    }},
-                )
 
         # =======================================================================
         # ANTHROPIC ROUTING: Continue with Claude Code SDK (default)

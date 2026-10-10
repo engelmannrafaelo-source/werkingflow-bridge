@@ -189,66 +189,167 @@ async def test_locked_worker_still_rejects_claude_call():
 
 
 # ---------------------------------------------------------------------------
-# The safety net the exemption relies on (BR1 review M2): on a LOCKED worker a
-# released gemini-vision call ends in a loud 4xx and never reaches Claude.
+# The safety net the exemption relies on (BR1 review M2, BR1R2 M3): on a LOCKED
+# worker a released gemini-vision call either really goes to Gemini or ends in
+# a loud 4xx — it never reaches a Claude path. Every way the resolved backend
+# can end up non-Gemini (operator pin anthropic / anthropic_direct / bedrock,
+# the app-tier rule) runs through the REAL routing code; only the outside world
+# is stubbed. The Claude callables are patched at their MODULE SOURCE: the
+# handler imports call_anthropic_direct / call_bedrock locally, so a patch on
+# src.main would never be hit (BR1R2 M4).
 # ---------------------------------------------------------------------------
-_PIN = "src.routing.user_provider_override.enforce_user_provider_override"
+_PIN_CONFIG = "src.routing.user_provider_override.get_user_provider_config"
+_TIER_POLICY = "src.routing.app_tier_policy.resolve_app_tier_policy"
+_BEDROCK_CREDS = "src.routing.backend_router.bedrock_credential_manager"
+_PNG = (
+    "data:image/png;base64,"
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGNgYGD4DwABBAEAwS2O"
+    "UAAAAABJRU5ErkJggg=="
+)
+GEMINI_IMAGE_BODY = {
+    "model": "claude-sonnet-5",
+    "provider_tier": "gemini-vision",
+    "messages": [{"role": "user", "content": [
+        {"type": "text", "text": "describe"},
+        {"type": "image_url", "image_url": {"url": _PNG}},
+    ]}],
+}
 
 
 class _ClaudeReached(BaseException):
-    """Any Claude/Anthropic execution path was entered."""
+    """Any Claude/Anthropic/Bedrock execution path was entered."""
 
 
-async def _run_chat_to_end(body: dict, *, pin=None):
-    """Run the real handler past the pre-check on a locked worker. Only the
-    outside world is stubbed; every Claude execution path raises."""
-    req = _request(body)
+class _GeminiReached(BaseException):
+    """The Gemini vision call was entered (the one legitimate destination)."""
+
+
+def _bedrock_creds():
+    creds = MagicMock()
+    creds.validate.return_value = (True, {"errors": []})
+    creds.default_region = "eu-central-1"
+    creds.get_bedrock_env_vars.return_value = {}
+    return creds
+
+
+async def _run_chat_to_end(body: dict, *, pin_config=None, tier_policy=None,
+                           app_env="production"):
+    """Run the real handler past the pre-check on a locked worker. Returns
+    (response, claude_mock, vision_mock); Claude reached = AssertionError."""
+    req = _request(body, {
+        "X-User-ID": "user-br1",
+        "X-App-ID": "br1-gate-test",
+        "X-App-Env": app_env,
+    })
     req.state.cached_body_dict = body
     req.state.adaptive_est_tokens = 10
 
-    async def _pin(_request, request_body):
-        if pin is None:
-            return None
-        # What a real operator pin does to the tier (user_provider_override).
-        request_body.provider_tier = None
-        return pin
-
     claude = MagicMock(side_effect=_ClaudeReached)
+    claude_async = AsyncMock(side_effect=_ClaudeReached)
+    vision = AsyncMock(side_effect=_GeminiReached)
     locked = _locked_tracker(True)
     no_org_block = MagicMock(return_value=None)
+    admission = AsyncMock()
     handler = inspect.unwrap(src.main.chat_completions)
     with patch.object(src.main, "verify_api_key", AsyncMock()), \
-         patch.object(src.main, "enforce_pool_admission", AsyncMock()), \
+         patch.object(src.main, "enforce_pool_admission", admission), \
          patch("src.budget.gate.enforce_budget", AsyncMock()), \
          patch("src.claude_cli.rate_limit_tracker", locked), \
-         patch.object(src.main, "rate_limit_tracker", locked, create=True), \
          patch.object(src.main, "_org_disabled_precheck", no_org_block), \
-         patch(_PIN, _pin), \
+         patch(_PIN_CONFIG, AsyncMock(return_value=pin_config)), \
+         patch(_TIER_POLICY, AsyncMock(return_value=tier_policy)), \
+         patch(_BEDROCK_CREDS, _bedrock_creds()), \
          patch.object(src.main.claude_cli, "run_completion", claude), \
-         patch.object(src.main, "call_anthropic_direct", claude, create=True), \
-         patch.object(src.main, "call_bedrock", claude, create=True):
-        resp = await handler(ChatCompletionRequest(**body), req, None, None)
+         patch("src.providers.anthropic_direct.call_anthropic_direct", claude_async), \
+         patch("src.bedrock_service.call_bedrock", claude_async), \
+         patch("src.bedrock_service.stream_bedrock", claude), \
+         patch.object(src.main, "check_and_route_vision", vision):
+        try:
+            resp = await handler(ChatCompletionRequest(**body), req, None, None)
+        except _ClaudeReached:
+            raise AssertionError(
+                "gemini-vision body reached a Claude path with the worker locks "
+                "skipped"
+            ) from None
+        except _GeminiReached:
+            resp = "gemini"
+    # The lane really was released — otherwise these tests prove nothing.
+    admission.assert_not_called()
+    no_org_block.assert_not_called()
+    locked.should_reject_new_request.assert_not_called()
     claude.assert_not_called()
-    return resp
+    claude_async.assert_not_called()
+    return resp, vision
 
 
 @pytest.fixture
 def gemini_armed(monkeypatch):
     monkeypatch.setenv("BRIDGE_GEMINI_VISION_ENABLED", "true")
     monkeypatch.setenv("GEMINI_VISION_API_KEY", "test-key")
+    # claude-direct-notools is servable here, so the pin / app-tier rule
+    # really resolve to ANTHROPIC_DIRECT instead of failing on a missing key.
+    monkeypatch.setenv("ANTHROPIC_VISION_API_KEY", "test-key")
+
+
+def _assert_overridden_409(resp):
+    assert resp != "gemini"
+    assert resp.status_code == 409
+    code = json.loads(bytes(resp.body))["error"]["code"]
+    assert code == "gemini_vision_tier_overridden"
 
 
 @pytest.mark.asyncio
 async def test_locked_worker_gemini_without_image_is_400(gemini_armed):
-    resp = await _run_chat_to_end(GEMINI_BODY)
+    resp, vision = await _run_chat_to_end(GEMINI_BODY, app_env="preview")
     assert resp.status_code == 400
     code = json.loads(bytes(resp.body))["error"]["code"]
     assert code == "gemini_vision_requires_image"
+    vision.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_locked_worker_gemini_with_image_goes_to_gemini(gemini_armed):
+    """The legitimate case: the released call ends at the Gemini vision call."""
+    resp, vision = await _run_chat_to_end(GEMINI_IMAGE_BODY, app_env="preview")
+    assert resp == "gemini"
+    vision.assert_awaited_once()
+    assert vision.await_args.kwargs["target"] == src.main.VISION_TARGET_GEMINI
 
 
 @pytest.mark.asyncio
 async def test_locked_worker_gemini_tier_removed_by_pin_is_409(gemini_armed):
-    resp = await _run_chat_to_end(GEMINI_BODY, pin="anthropic")
-    assert resp.status_code == 409
-    code = json.loads(bytes(resp.body))["error"]["code"]
-    assert code == "gemini_vision_tier_overridden"
+    resp, _ = await _run_chat_to_end(
+        GEMINI_IMAGE_BODY, pin_config={"provider": "anthropic"}
+    )
+    _assert_overridden_409(resp)
+
+
+@pytest.mark.asyncio
+async def test_locked_worker_gemini_tier_pin_anthropic_direct_is_409(gemini_armed):
+    """Pin anthropic_direct (prod) rewrites the tier to claude-direct-notools.
+    Red on 3ee2e95: call_anthropic_direct was reached, the 409 came too late."""
+    resp, _ = await _run_chat_to_end(
+        GEMINI_IMAGE_BODY, pin_config={"provider": "anthropic_direct"}
+    )
+    _assert_overridden_409(resp)
+
+
+@pytest.mark.asyncio
+async def test_locked_worker_gemini_tier_pin_bedrock_is_409(gemini_armed):
+    """Pin bedrock (prod) sets backend=BEDROCK. Red on 3ee2e95: call_bedrock
+    was reached, the 409 came too late."""
+    resp, _ = await _run_chat_to_end(
+        GEMINI_IMAGE_BODY, pin_config={"provider": "bedrock", "region": "eu-central-1"}
+    )
+    _assert_overridden_409(resp)
+
+
+@pytest.mark.asyncio
+async def test_locked_worker_gemini_tier_app_tier_rule_is_409(gemini_armed):
+    """App-tier rule (no pin) forces claude-direct-notools. Red on 3ee2e95:
+    call_anthropic_direct was reached."""
+    from src.routing.app_tier_policy import AppTierPolicy
+
+    policy = AppTierPolicy(target_tier="claude-direct-notools", billing_account=None)
+    resp, _ = await _run_chat_to_end(GEMINI_IMAGE_BODY, tier_policy=policy)
+    _assert_overridden_409(resp)
