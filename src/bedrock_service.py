@@ -30,6 +30,7 @@ from src.models import (
 )
 from src.model_registry import resolve_model, to_bedrock_model_id, model_supports_temperature
 from src.routing.backend_router import _resolve_privacy_mode
+from src.activity.delivery import DeliveryProbeMiddleware
 from src.stream_start import error_event, event_stream_response
 
 logger = get_logger(__name__)
@@ -192,6 +193,10 @@ app = FastAPI(
     description="Lightweight DSGVO-compliant Bedrock backend",
     version="1.0.0"
 )
+# The shared delivery probe (BR9e): without it event_stream_response counts
+# the caller as always present, and a caller who leaves during the thinking
+# phase leaves the Bedrock call running — the main app has had it since BR9d.
+app.add_middleware(DeliveryProbeMiddleware)
 
 
 class BedrockClient:

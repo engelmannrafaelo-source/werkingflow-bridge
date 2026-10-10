@@ -219,6 +219,25 @@ setup_logging(
 # Get module logger
 logger = get_logger(__name__)
 
+# Ledger bookings that must outlive a cancelled stream (BR9e): asyncio keeps
+# only weak references to tasks, a shielded booking needs a strong one.
+_BACKGROUND_BOOKINGS: set = set()
+
+# How a stream ends from outside: cancelled (caller gone, route cancelled) or
+# closed. Module-level on purpose: chat_completions imports asyncio locally
+# further down, so inside its closures the name `asyncio` is unbound.
+_STREAM_CUT_OFF = (asyncio.CancelledError, GeneratorExit)
+
+
+async def _shielded_booking(booking_coro) -> None:
+    """Run a ledger booking to its end even if the awaiting stream is being
+    cancelled — Starlette's disconnect cancel (anyio scope) hits every further
+    await of a cancelled stream, the booking must still land."""
+    booking = asyncio.ensure_future(booking_coro)
+    _BACKGROUND_BOOKINGS.add(booking)
+    booking.add_done_callback(_BACKGROUND_BOOKINGS.discard)
+    await asyncio.shield(booking)
+
 # Global variable to store runtime-generated API key
 runtime_api_key = None
 
@@ -1559,9 +1578,10 @@ async def generate_streaming_response(
 
             except Exception as e:
                 logger.error(f"❌ Vision streaming failed: {e}", exc_info=True)
-                from src.error_contract import UNCLASSIFIED_RETRYABLE, fields as _verdict
-                yield f"data: {json.dumps({'error': {'message': f'Vision analysis failed: {str(e)}', 'type': 'vision_error', **_verdict(UNCLASSIFIED_RETRYABLE)}})}\n\n"
-                return
+                # Same verdict as the non-streaming branch. Before the first
+                # chunk event_stream_response lets it leave the route as that
+                # HTTP status; after it the stream ends as event: error (BR9e).
+                raise BridgeError(classify_exception(e)) from e
 
         # Process messages with session management
         all_messages, actual_session_id = session_manager.process_messages(
@@ -2131,31 +2151,13 @@ async def generate_streaming_response(
         except Exception as track_err:
             logger.warning(f"⚠️ Streaming usage tracking failed (non-fatal): {track_err}")
 
-    except OrgSubscriptionDisabledError as org_err:
-        # The 200 + SSE headers are already on the wire (uvicorn writes them at
-        # http.response.start, before the first CLI chunk), so nginx cannot
-        # retry this one. Say it explicitly instead of letting the connection
-        # drop: the next request avoids this worker via the capacity lock.
-        error_chunk = {
-            "error": {
-                "message": f"[Bridge {org_err.worker_id}] {org_err}",
-                "type": "api_error",
-                "code": "account_org_disabled",
-                "source": "bridge_account",
-                "reason": "account_org_disabled",
-                "retryable": True,
-                "retry_after_s": org_err.lock_seconds,
-                "bridge_worker": org_err.worker_id,
-            }
-        }
-        yield f"data: {json.dumps(error_chunk)}\n\n"
-        yield "data: [DONE]\n\n"
-
-    except WorkerUnavailableError:
+    except (WorkerUnavailableError, BridgeError):
         # Before the first chunk event_stream_response lets this leave the
-        # route: worker_unavailable_handler answers 429 and nginx fails over.
-        # After it, event_stream_response ends the stream as event: error
-        # (retryable) — a started 200 cannot fail over (BR9c).
+        # route: worker_unavailable_handler answers 429 and nginx fails over,
+        # OrgSubscriptionDisabledError (a subclass) gets its 503 with code
+        # account_org_disabled, a BridgeError its own status. After it,
+        # event_stream_response ends the stream as event: error with the same
+        # verdict — a started 200 cannot fail over (BR9c, BR9e).
         raise
 
     except Exception as e:
@@ -3041,25 +3043,60 @@ async def chat_completions(
                 bedrock_usage_sink: Dict[str, Any] = {}
 
                 async def _tracked_bedrock_stream():
-                    async for chunk in stream_bedrock(
-                        request_body, backend_config.region, usage_sink=bedrock_usage_sink
-                    ):
-                        yield chunk
-                    # Stream drained — persist whatever usage the sink caught.
+                    cut_off = False
+                    try:
+                        async for chunk in stream_bedrock(
+                            request_body, backend_config.region, usage_sink=bedrock_usage_sink
+                        ):
+                            yield chunk
+                    except _STREAM_CUT_OFF:
+                        cut_off = True
+                        raise
+                    finally:
+                        # Booked in `finally`, exactly once (BR9e): a stream
+                        # cut off by a caller who left — before its first chunk
+                        # the route cancels it, after it Starlette does — used
+                        # to leave NO ledger row, although AWS bills the input
+                        # and every token generated up to the cut.
+                        await _shielded_booking(_book_bedrock_stream(cut_off))
+
+                async def _book_bedrock_stream(cut_off: bool) -> None:
+                    from src.activity.delivery import (
+                        ERROR_CODE_CALLER_GONE,
+                        STATUS_UNDELIVERED,
+                        caller_gone,
+                    )
+                    sink = bedrock_usage_sink
+                    status = sink.get("status", "error")
                     # A stream that died before message_delta bills 0 output
                     # tokens with status=error (visible in the ledger, and the
                     # reconciliation flags any AWS-side count we missed).
+                    error_code = None if status == "success" else "stream_aborted"
+                    error_message = sink.get("error_message")
+                    if cut_off and status != "success":
+                        # Ended from outside, not by Bedrock. Whatever the sink
+                        # counted was generated and is owed: 'undelivered' is
+                        # the cost-bearing status for an answer nobody got.
+                        if sink.get("input_tokens") or sink.get("output_tokens"):
+                            status = STATUS_UNDELIVERED
+                        gone = await caller_gone()
+                        error_code = ERROR_CODE_CALLER_GONE if gone else "stream_cancelled"
+                        error_message = error_message or (
+                            "Bedrock-Strom abgebrochen, "
+                            + ("der Aufrufer war weg" if gone else "die Anfrage wurde abgesagt")
+                            + " — gebucht ist der Verbrauch bis zum Abbruch."
+                        )
                     await _persist_bedrock_usage(
-                        input_tokens=bedrock_usage_sink.get("input_tokens", 0),
-                        output_tokens=bedrock_usage_sink.get("output_tokens", 0),
-                        status=bedrock_usage_sink.get("status", "error"),
+                        input_tokens=sink.get("input_tokens", 0),
+                        output_tokens=sink.get("output_tokens", 0),
+                        status=status,
                         duration_ms=int((time.time() - start_time) * 1000),
-                        error_code=None if bedrock_usage_sink.get("status") == "success" else "stream_aborted",
-                        error_message=bedrock_usage_sink.get("error_message"),
+                        error_code=error_code,
+                        error_message=error_message,
                         provider_meta={
-                            "bedrock_model_id": bedrock_usage_sink.get("bedrock_model_id"),
-                            "region": bedrock_usage_sink.get("region"),
-                            "aws_request_id": bedrock_usage_sink.get("aws_request_id"),
+                            "bedrock_model_id": sink.get("bedrock_model_id"),
+                            "region": sink.get("region"),
+                            "aws_request_id": sink.get("aws_request_id"),
                         },
                     )
 

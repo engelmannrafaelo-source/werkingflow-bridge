@@ -313,6 +313,22 @@ def _producers():
     async def openai_compatible_truncated(mp):
         return openai_compatible._incomplete_stream_event("http://provider.test", "no [DONE]")
 
+    async def _after_first_chunk(exc):
+        async def gen():
+            yield "data: x\n\n"
+            raise exc
+        resp = await stream_start.event_stream_response(gen())
+        return [c async for c in resp.body_iterator][-1]
+
+    async def vision_after_first_chunk(mp):
+        # BR9e: the vision branch raises what the sync branch raises.
+        from src.middleware.bridge_error import BridgeError, classify_exception
+        return await _after_first_chunk(BridgeError(classify_exception(RuntimeError("vision boom"))))
+
+    async def account_org_disabled_after_first_chunk(mp):
+        from src.claude_cli import OrgSubscriptionDisabledError
+        return await _after_first_chunk(OrgSubscriptionDisabledError("w", "assistant_text", 60))
+
     return [
         pytest.param(bedrock_client_error, id="bedrock-client-error"),
         pytest.param(bedrock_unclassified, id="bedrock-unclassified"),
@@ -321,6 +337,8 @@ def _producers():
         pytest.param(bedrock_unknown_model, id="bedrock-unknown-model"),
         pytest.param(after_first_chunk, id="stream_start-after-first-chunk"),
         pytest.param(openai_compatible_truncated, id="openai-compatible-truncated"),
+        pytest.param(vision_after_first_chunk, id="vision-after-first-chunk"),
+        pytest.param(account_org_disabled_after_first_chunk, id="account-org-disabled-after-first-chunk"),
     ]
 
 

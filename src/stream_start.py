@@ -64,7 +64,7 @@ def provider_retryable(status_code: int) -> bool:
 
 def stream_error_verdict(exc: BaseException) -> Dict[str, Any]:
     """retryable / retry_after_s for an exception that ends a stream."""
-    from src.claude_cli import WorkerUnavailableError
+    from src.claude_cli import OrgSubscriptionDisabledError, WorkerUnavailableError
     from src.middleware.bridge_error import BridgeError
     from src.providers.openai_compatible import ProviderError
 
@@ -74,6 +74,9 @@ def stream_error_verdict(exc: BaseException) -> Dict[str, Any]:
         return fields(own, getattr(exc, "retry_after_s", None))
     if isinstance(exc, ProviderError):
         return fields(provider_retryable(exc.status_code))
+    if isinstance(exc, OrgSubscriptionDisabledError):
+        # This worker is locked; the lock says when it may serve again.
+        return fields(True, exc.lock_seconds)
     if isinstance(exc, WorkerUnavailableError):
         # Another worker can serve it; before the first chunk this is nginx's
         # 429 failover, after it the caller has to ask again.
@@ -89,20 +92,64 @@ def stream_error_verdict(exc: BaseException) -> Dict[str, Any]:
     return fields(UNCLASSIFIED_RETRYABLE)
 
 
-def error_event(message: str, error_type: str, code: str, verdict: Mapping[str, Any]) -> str:
+def error_event(
+    message: str, error_type: str, code: str, verdict: Mapping[str, Any], **extra: Any,
+) -> str:
     """The one wire form of a stream error (BR9d): ``event: error`` with
     ``{"error": {message, type, code, retryable, retry_after_s}}`` — nested,
     like the sync envelope. PC1 (ai-bridge-client core/sse.ts) reads
-    retryable only there; a flat ``{"error": "<text>"}`` reads as no verdict."""
-    payload = {"error": {"message": message, "type": error_type, "code": code, **verdict}}
+    retryable only there; a flat ``{"error": "<text>"}`` reads as no verdict.
+    ``extra`` adds envelope fields (source, reason, ...) next to them."""
+    payload = {"error": {"message": message, "type": error_type, "code": code, **extra, **verdict}}
     return f"event: error\ndata: {json.dumps(payload)}\n\n"
 
 
 def stream_error_event(exc: BaseException) -> str:
     """``event: error`` that ends a stream after its first chunk."""
+    from src.claude_cli import OrgSubscriptionDisabledError
+    from src.middleware.bridge_error import (
+        REASON_ACCOUNT_ORG_DISABLED,
+        SOURCE_BRIDGE_ACCOUNT,
+        TYPE_ACCOUNT_EXHAUSTED,
+    )
+
+    if isinstance(exc, OrgSubscriptionDisabledError):
+        # Same code and reason as its 503 before the first chunk (BR9e).
+        return error_event(
+            f"[Bridge {exc.worker_id}] {exc}", "api_error",
+            REASON_ACCOUNT_ORG_DISABLED, stream_error_verdict(exc),
+            source=SOURCE_BRIDGE_ACCOUNT, bridge_type=TYPE_ACCOUNT_EXHAUSTED,
+            reason=REASON_ACCOUNT_ORG_DISABLED, bridge_worker=exc.worker_id,
+        )
+    envelope = _bridge_error_envelope(exc)
+    if envelope is not None:
+        # A BridgeError (e.g. the vision branch, BR9e) already says what went
+        # wrong — keep its message, type, code and reason instead of
+        # "bridge_error" / "BridgeError".
+        rest = {k: v for k, v in envelope.items()
+                if k not in ("message", "type", "code", "retryable", "retry_after_s")}
+        return error_event(
+            envelope["message"], str(envelope.get("type") or "streaming_error"),
+            str(envelope.get("code") or type(exc).__name__), stream_error_verdict(exc), **rest,
+        )
     detail = getattr(exc, "detail", None)
     message = detail if isinstance(detail, str) else str(exc) or type(exc).__name__
     return error_event(message, "streaming_error", type(exc).__name__, stream_error_verdict(exc))
+
+
+def _bridge_error_envelope(exc: BaseException) -> Optional[Dict[str, Any]]:
+    """The ``error`` object of a BridgeError's response body, if it has one."""
+    from src.middleware.bridge_error import BridgeError
+
+    if not isinstance(exc, BridgeError):
+        return None
+    try:
+        err = json.loads(exc.response.body).get("error")
+    except (AttributeError, TypeError, ValueError):
+        return None
+    if isinstance(err, dict) and isinstance(err.get("message"), str) and err["message"]:
+        return err
+    return None
 
 
 def provider_start_error(exc: Any) -> Exception:
@@ -189,26 +236,42 @@ async def _first_chunk_while_caller_present(gen: AsyncIterator[str]) -> str:
     context) the caller counts as present."""
     from src.activity import delivery
 
-    async def first() -> str:
-        return await gen.__anext__()
+    # BR9e (BR9dR MUSS): ``__anext__`` stays in THIS task. A generator that
+    # enters ``asyncio.timeout`` before its first yield (the CLI path's
+    # MAX_TIMEOUT around run_completion) binds that timeout to the task that
+    # runs this step. Pulled in a helper task, the timeout later cancelled a
+    # task that had already finished — and never fired. So the watcher runs
+    # beside the route and cancels the route itself when the caller is gone.
+    me = asyncio.current_task()
+    gone = False
 
-    pending = asyncio.ensure_future(first())
+    async def watch() -> None:
+        nonlocal gone
+        while not await delivery.caller_gone():
+            await asyncio.sleep(_DISCONNECT_POLL_S)
+        gone = True
+        me.cancel()
+
+    watcher = asyncio.ensure_future(watch())
     try:
-        while True:
-            done, _ = await asyncio.wait({pending}, timeout=_DISCONNECT_POLL_S)
-            if done:
-                return pending.result()
-            if await delivery.caller_gone():
-                break
-    except BaseException:
-        # The route itself was cancelled: take the provider call with it.
-        pending.cancel()
-        raise
-    pending.cancel()
-    await asyncio.wait({pending})
-    await gen.aclose()
-    logger.warning("Caller disconnected before the first chunk: stream generator closed")
-    raise _CallerGone()
+        chunk = await gen.__anext__()
+    except asyncio.CancelledError:
+        # Ours only if nobody else cancelled the route as well; otherwise the
+        # route's own cancellation goes on (the provider call is gone either way).
+        if not (gone and me.uncancel() == 0):
+            raise
+        await gen.aclose()
+        logger.warning("Caller disconnected before the first chunk: stream generator closed")
+        raise _CallerGone()
+    finally:
+        watcher.cancel()
+    if gone:
+        # The generator swallowed the cancel and produced a chunk anyway.
+        me.uncancel()
+        await gen.aclose()
+        logger.warning("Caller disconnected before the first chunk: stream generator closed")
+        raise _CallerGone()
+    return chunk
 
 
 async def event_stream_response(
