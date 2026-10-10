@@ -8,6 +8,7 @@ ohne Bibliothek genau so, wie er vorher war?
 from __future__ import annotations
 
 import sys
+import tempfile
 from unittest.mock import MagicMock as _MagicMock
 
 for _mod_name in [
@@ -30,7 +31,7 @@ import src.main  # noqa: E402
 from src.research_cloud.library import LibraryConfig, LibraryUnavailableError  # noqa: E402
 from src.research_library_pool import LIBRARY_WORKDIR_NAME, LibraryMirror  # noqa: E402
 
-_REPORT = "Executive Summary. " * 40  # ueber RESEARCH_MIN_INLINE_REPORT_CHARS
+_REPORT = "Executive Summary. " * 40
 
 _INDEX = {
     "documents": [
@@ -70,10 +71,18 @@ async def _stream(*chunks):
 
 
 def _assistant_chunks(*extra_blocks):
+    # Like a real run: the report is the file the run wrote (BR2 — chat text
+    # is not handed out as a report).
+    workdir = Path(tempfile.mkdtemp())
+    report = workdir / "claudedocs" / "output.md"
+    report.parent.mkdir()
+    report.write_text(_REPORT, encoding="utf-8")
     return [
-        {"type": "assistant", "content": [{"type": "text", "text": _REPORT}, *extra_blocks]},
+        {"type": "assistant", "content": [{"type": "text", "text": "Bericht geschrieben."}, *extra_blocks]},
         {"type": "result", "subtype": "success",
          "usage": {"input_tokens": 100, "output_tokens": 200}},
+        {"type": "x_claude_metadata", "files_created": [{"path": str(report)}],
+         "session_tracking": {"cli_session_id": "s", "research_dir": str(workdir)}},
     ]
 
 

@@ -760,6 +760,11 @@ def _handle_rate_limit_event(message, worker_id):
 
 CLI_CONTINUATION_SENTENCE = "Output token limit hit. Resume directly"
 
+# The file the bridge names to the model as OUTPUT_FILE_PATH (inside the run's
+# claudedocs/). The research handler reads THIS file first — it is the one
+# place the bridge told the model its result goes.
+RESEARCH_OUTPUT_FILENAME = "output.md"
+
 
 def is_user_turn(message: Any) -> bool:
     """True for SDK user/meta turns (UserMessage dataclass or its dict form)."""
@@ -1628,7 +1633,7 @@ class ClaudeCodeCLI:
                     )
                     enable_file_discovery = False
                 elif enable_file_discovery:
-                    output_file = claudedocs_dir / "output.md"
+                    output_file = claudedocs_dir / RESEARCH_OUTPUT_FILENAME
                     prompt = inject_output_path_for_file_discovery(
                         prompt=prompt,
                         output_file=output_file,
@@ -2715,8 +2720,25 @@ def inject_output_path_for_file_discovery(
     Returns:
         Modified prompt with path injection
     """
-    path_instruction_header = f"\n**CRITICAL: You MUST use the Write tool to complete this task.*\nWrite your complete analysis to OUTPUT_FILE_PATH:\n{output_file}\n\n"
-    path_instruction_footer = f"\n\nDo NOT reply in chat! Use Write tool to WRITE your reply to OUTPUT_FILE_PATH.\nOUTPUT_FILE_PATH: {output_file}"
+    # Descriptive, not a list of prohibitions (KI first, Rafael 04.10.2026):
+    # the model is told who reads its result and in which form, so it can
+    # judge the edge cases itself. Measured 10.10.2026 (Energy-Nachtlauf z2b):
+    # with a large selection the model answered with a Python script that
+    # "writes" the report into this file — nobody runs chat code, so the
+    # file never existed and the script became the delivered research result.
+    path_instruction_header = (
+        f"\n**Where your result goes:** whoever ordered this task receives exactly the "
+        f"contents of the file at OUTPUT_FILE_PATH, and nothing else. Your chat replies "
+        f"are not passed on, and code in a chat reply is never run — a script that would "
+        f"write the file does not create it. So write the complete result itself (not a "
+        f"program that produces it) into this file with the Write tool. A very long result "
+        f"can be written in parts: the first part with Write, the rest added with Edit.\n"
+        f"OUTPUT_FILE_PATH: {output_file}\n\n"
+    )
+    path_instruction_footer = (
+        f"\n\nOUTPUT_FILE_PATH: {output_file} — the finished result belongs in this file; "
+        f"it is the only thing the reader gets."
+    )
 
     lines = prompt.split('\n', 1)
     first_line = lines[0].strip()
