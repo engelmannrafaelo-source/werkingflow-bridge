@@ -874,20 +874,6 @@ deploy_one_service() {
         fi
     fi
 
-    # Do not recreate a platform-api while jobs depend on it, including jobs on
-    # the PEER bridge's workers whose budget home is this bridge (ADR-0011,
-    # BR7/BR8). Return 3 = refused before any change: the caller must not
-    # roll this service back (a rollback recreates it, which is the gap this
-    # gate avoids).
-    if [[ "$svc" == platform-api ]]; then
-        local gate_prefix=""
-        case "$host" in
-            "$HETZNER_HOST") gate_prefix="HETZNER" ;;
-            "$SERVER2_HOST") gate_prefix="SERVER2" ;;
-        esac
-        platform_api_job_gate "$gate_prefix" || return 3
-    fi
-
     # Recreate — NEVER --remove-orphans
     info "Recreating ${svc}..."
     dry_rssh "$host" "cd ${REMOTE_REPO} && GIT_COMMIT=\$(git rev-parse HEAD) docker compose ${compose} up -d --no-deps --force-recreate ${svc} 2>&1" || {
@@ -2036,6 +2022,22 @@ deploy_server() {
         return 1
     }
 
+    # === Phase 4 gate: no platform-api gap while jobs depend on it ===
+    # Runs ONCE before the first recreation, not in front of platform-api
+    # itself: on server2 postgres-prod (the platform-api's database) is
+    # recreated first, and a refusal after that would leave one DB gap and
+    # the rollback would add a second one (BR8R M1). Refused = nothing was
+    # recreated, nothing is rolled back, only the code is reset.
+    if platform_api_job_gate_needed "$server_prefix" "${services_to_deploy[@]}"; then
+        platform_api_job_gate "$server_prefix" || {
+            error_ "Deploy refused before any container was recreated — reverting code to ${ROLLBACK_SHA}"
+            if [[ "$DRY_RUN" == "false" ]]; then
+                rssh "$host" "cd ${REMOTE_REPO} && git reset --hard '${ROLLBACK_SHA}'" || return 2
+            fi
+            return 1
+        }
+    fi
+
     # === Phase 4: per-service deploy ===
     for svc in "${services_to_deploy[@]}"; do
         local container
@@ -2049,15 +2051,9 @@ deploy_server() {
         elif [[ "$svc" != erkunder* ]]; then
             DEPLOYED_SERVICES+=("$svc")
         fi
-        local svc_rc=0
-        deploy_one_service "$host" "$compose" "$svc" "$container" "$build_list" || svc_rc=$?
-        if (( svc_rc != 0 )); then
-            if (( svc_rc == 3 )); then
-                # Refused before recreation (platform-api job gate): this
-                # service was not touched, so it is not part of the rollback.
-                unset 'DEPLOYED_SERVICES[${#DEPLOYED_SERVICES[@]}-1]'
-                error_ "Deploy refused for ${svc} before any change to it"
-            fi
+        if deploy_one_service "$host" "$compose" "$svc" "$container" "$build_list"; then
+            :
+        else
             error_ "Deploy failed for ${svc} — initiating rollback"
             if [[ ${#DEPLOYED_SERVICES[@]} -gt 0 ]]; then
                 phase_rollback "$host" "$compose" "$ROLLBACK_SHA" "$build_list" "${DEPLOYED_SERVICES[@]}"

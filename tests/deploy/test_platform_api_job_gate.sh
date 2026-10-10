@@ -12,6 +12,8 @@ info() { :; }
 warn() { echo "WARN $*" >> "$commands"; }
 error_() { echo "ERROR $*" >> "$commands"; }
 sleep() { echo "sleep $*" >> "$commands"; }
+# `! grep` never trips set -e, so absence is asserted explicitly.
+absent() { if grep -q "$1" "$commands"; then echo "FAIL unexpected: $1"; exit 1; fi; }
 source scripts/platform-api-job-gate.sh
 HETZNER_HOST=hz SERVER2_HOST=s2 WORKERHOST_HOST=wh
 HETZNER_SVC_worker1=w1 HETZNER_SVC_worker2=w2 HETZNER_SVC_worker3=w3 HETZNER_SVC_worker4=w4
@@ -131,8 +133,60 @@ platform_api_job_gate() { echo "GATE $*" >> "$commands"; return 3; }
 : > "$commands"
 if deploy_server hetzner; then echo 'FAIL refused gate allowed deploy'; exit 1; fi
 grep -q '^GATE HETZNER$' "$commands"
-! grep -q 'up -d' "$commands"
-! grep -q '^ROLLBACK' "$commands"
+absent 'up -d'
+absent '^ROLLBACK'
 grep -q "git reset --hard 'synthetic-sha'" "$commands"
 [[ ${#DEPLOYED_SERVICES[@]} == 0 ]]
 echo 'PASS full deploy: refused gate recreates nothing, rolls nothing back, resets code'
+
+# --- server2 (BR8R M1): postgres-prod is the platform-api's database and is
+# recreated FIRST. The gate must run before it, otherwise a refusal leaves one
+# DB gap and the rollback recreates postgres-prod a second time. ---
+SERVER2_COMPOSE=compose2 SERVER2_ALL="postgres-prod platform-api nginx"
+SERVER2_NEEDS_BUILD="platform-api nginx" SERVER2_DB_CONTAINER=db2
+SERVER2_SVC_postgres_prod=bridge-postgres-prod SERVER2_SVC_platform_api=bridge-platform-api
+SERVER2_SVC_nginx=bridge-nginx
+: > "$commands"
+if deploy_server server2; then echo 'FAIL refused gate allowed server2 deploy'; exit 1; fi
+grep -q '^GATE SERVER2$' "$commands"
+absent 'up -d'
+absent '^ROLLBACK'
+grep -q "git reset --hard 'synthetic-sha'" "$commands"
+echo 'PASS server2 full deploy: refused gate recreates neither postgres-prod nor platform-api, rolls nothing back'
+
+# Gate passes: it runs exactly once, before the first recreation.
+platform_api_job_gate() { echo "GATE $*" >> "$commands"; return 0; }
+rssh() {
+    echo "rssh $*" >> "$commands"
+    [[ "$*" == *'.State.Health.Status'* ]] && echo healthy
+    return 0
+}
+deployed_bridge_id() { :; }
+phase_smoke_test() { :; }
+phase_distribution_test() { :; }
+phase_access_canary() { :; }
+phase_worker_config_selftest() { :; }
+check_pool_router_state() { :; }
+write_release_manifest() { :; }
+: > "$commands"
+deploy_server server2 > /dev/null 2>&1 || true
+[[ $(grep -c '^GATE' "$commands") == 1 ]]
+first_gate=$(grep -n '^GATE SERVER2$' "$commands" | cut -d: -f1)
+first_up=$(grep -n 'up -d' "$commands" | head -n1 | cut -d: -f1)
+[[ -n "$first_up" && $first_gate -lt $first_up ]]
+grep 'up -d' "$commands" | head -n1 | grep -q 'postgres-prod'
+echo 'PASS server2 gate passes: asked once, before postgres-prod is recreated'
+
+# Only the database on server2 also needs the gate; nginx alone does not.
+platform_api_job_gate() { echo "GATE $*" >> "$commands"; return 3; }
+SERVICES_ARG=(postgres-prod)
+: > "$commands"
+if deploy_server server2 > /dev/null 2>&1; then echo 'FAIL db-only deploy passed a refused gate'; exit 1; fi
+grep -q '^GATE SERVER2$' "$commands"
+absent 'up -d'
+SERVICES_ARG=(nginx)
+: > "$commands"
+deploy_server server2 > /dev/null 2>&1 || true
+absent '^GATE'
+SERVICES_ARG=()
+echo 'PASS server2: postgres-prod alone is gated, nginx alone is not'

@@ -50,8 +50,14 @@ Zwei Stellen sorgen dafuer, dass daraus kein endgueltig gescheiterter Job wird.
   mit `UPSTREAM_HTTP_424`. Echte Antworten bleiben sofort endgueltig, also
   401/403/404 der Heimat-Bridge, ein unbekannter Anbieter oder ein fehlender
   Peer.
-- **Im Deploy.** Vor dem Neuanlegen von `platform-api` laeuft
-  `scripts/platform-api-job-gate.sh`. Die Probe
+- **Im Deploy.** Enthaelt ein Deploy `platform-api` (auf server2 auch
+  `postgres-prod`, die Datenbank der platform-api), laeuft
+  `scripts/platform-api-job-gate.sh` einmal vor Phase 4, also vor dem ersten
+  Neuanlegen ueberhaupt. Laege der Gate direkt vor `platform-api`, waere auf
+  server2 die Datenbank schon neu angelegt; eine Ablehnung haette eine
+  DB-Luecke hinterlassen und der Rueckbau eine zweite (BR8R M1). Der Preis:
+  Zwischen Gate und Neuanlegen liegt der Bau des Images. Ein Job, der in
+  diesem Fenster startet, faellt notfalls in die Ueberbrueckung im Code. Die Probe
   (`scripts/platform_api_job_gate.py`, nur Standardbibliothek) wird per stdin
   in einen laufenden Worker der betroffenen Bridge gereicht. Sie fragt
   lesend `GET /v1/internal/jobs-maintenance/active`, und zwar beim lokalen
@@ -59,8 +65,9 @@ Zwei Stellen sorgen dafuer, dass daraus kein endgueltig gescheiterter Job wird.
   nach den Jobs mit dieser Bridge als Herkunft. Solange Jobs aktiv sind,
   wartet der Deploy, hoechstens `PLATFORM_API_JOBGATE_WAIT_S` Sekunden
   (Default 900, 0 = nur pruefen). Sind danach noch Jobs aktiv oder ist der
-  Zustand nicht pruefbar, lehnt er ab. Die platform-api wird dabei nicht
-  angefasst und auch nicht zurueckgerollt.
+  Zustand nicht pruefbar, lehnt er ab. Dann ist kein Container neu angelegt,
+  nichts wird zurueckgerollt, nur der Checkout wird zurueckgesetzt. Auch das
+  Image ist dann noch nicht neu gebaut.
 - **Einfuehrung.** Hat ein Ziel den Endpunkt noch nicht (HTTP 404, Image vor
   BR8), lehnt der Deploy ab und nennt `PLATFORM_API_JOBGATE_EINFUEHRUNG=1`.
   Der Schalter gilt nur fuer den einen Aufruf und nur fuer 404, nie fuer

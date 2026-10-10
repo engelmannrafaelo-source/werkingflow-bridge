@@ -10,7 +10,8 @@
 # idle wait in deploy_one_service cannot see this: it only counts the workers
 # of the bridge being deployed.
 #
-# What: before recreating platform-api, ask (read-only, from inside a worker of
+# What: before the first recreation of a deploy that touches platform-api (or,
+# on server2, its database postgres-prod), ask (read-only, from inside a worker of
 # the bridge being deployed, see scripts/platform_api_job_gate.py) both the
 # local store (all active jobs) and every peer store (active jobs whose budget
 # home is this bridge). Wait while any are active, at most
@@ -30,6 +31,21 @@
 # proxy in front. The gap stays about 3 s; the gate decides WHEN it happens.
 
 PLATFORM_API_JOBGATE_POLL_S="${PLATFORM_API_JOBGATE_POLL_S:-10}"
+
+# Services whose recreation leaves the platform-api without an answer: the
+# platform-api itself and, where it runs next to it, its database.
+#   $1 = server prefix (HETZNER | SERVER2 | WORKERHOST), rest = services
+# Returns 0 when the gate must run before Phase 4.
+platform_api_job_gate_needed() {
+    local prefix="$1"; shift
+    local svc
+    for svc in "$@"; do
+        case "${prefix}:${svc}" in
+            HETZNER:platform-api|SERVER2:platform-api|SERVER2:postgres-prod) return 0 ;;
+        esac
+    done
+    return 1
+}
 
 # Where to run the probe: a worker of the bridge whose platform-api is about to
 # be recreated (it has that bridge's origin, token and peer list).
