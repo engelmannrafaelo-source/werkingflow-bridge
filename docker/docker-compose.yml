@@ -32,7 +32,8 @@ services:
       - BRIDGE_ID=${BRIDGE_ID:-dev}
       # Worker set for docker/lua/pool_router.lua (env BRIDGE_WORKERS in nginx.conf).
       - BRIDGE_WORKERS=worker1,worker2,worker3,worker4
-      # Per-topology metrics-reader target (nginx.conf `set $metrics_reader`).
+      # Per-topology metrics-reader target (nginx.conf `set $metrics_reader`
+      # AND docker/lua/pool_router.lua via `env METRICS_READER_TARGET`).
       # On primary the reader is same-host next to the workers' logs volume.
       - METRICS_READER_TARGET=${METRICS_READER_TARGET:-metrics-reader:8000}
     # envsubst nginx.conf + the upstreams include. Both need ${BRIDGE_BACKUP_HOST};

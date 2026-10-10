@@ -39,7 +39,7 @@ cleanup() {
     docker rm -f pg-nginx pg-echo pg-metrics >/dev/null 2>&1
     docker network rm $NET >/dev/null 2>&1
 }
-trap 'cleanup; rm -rf "$WORK"' EXIT
+[ -n "${KEEP:-}" ] || trap 'cleanup; rm -rf "$WORK"' EXIT
 
 # ---------------------------------------------------------------------------
 # Step 0 — static phase-order lint (no docker; the class-level guard)
@@ -198,25 +198,37 @@ echo "Building $IMG from docker/Dockerfile.nginx-lb ..."
 docker build -q -f "$D/Dockerfile.nginx-lb" -t $IMG "$REPO" >/dev/null || {
     echo "FAIL: image build"; exit 1; }
 
-start_stack() { # $1 = exhausted|healthy
+# The stub reader deliberately does NOT answer to the name "metrics-reader":
+# on prod the reader lives on another host (ADR-0009), and a router that only
+# works under the compose name is exactly the defect found 2026-10-10 (BR5).
+METRICS_TARGET="metrics-elsewhere:8000"
+
+start_stack() { # $1 = exhausted|healthy  $2 = METRICS_READER_TARGET for nginx ("" = unset)
+    local target="${2-$METRICS_TARGET}"
     cleanup
     docker network create $NET >/dev/null
     # Same envsubst the compose performs before nginx loads the config.
-    sed 's/${BRIDGE_ID}/test/g; s/${BRIDGE_BACKUP_HOST}/backup-host/g' "$D/nginx.conf" > "$WORK/nginx.conf"
-    sed 's/${BRIDGE_BACKUP_HOST}/backup-host/g' "$D/upstreams-primary.conf" > "$WORK/upstreams.conf"
-    cp "$D/routes-metrics-reader.conf" "$D/routes-platform-api.conf" "$WORK/"
+    # nginx.conf uses the backup host in a geo{} block, which needs an address
+    # (TEST-NET-1, never routed); the upstreams keep the resolvable stub alias.
+    sed "s/\${BRIDGE_ID}/test/g; s/\${BRIDGE_BACKUP_HOST}/192.0.2.10/g; s/\${METRICS_READER_TARGET}/${target:-unset-target}/g" \
+        "$D/nginx.conf" > "$WORK/nginx.conf"
+    sed 's/${BRIDGE_BACKUP_HOST}/backup-host/g; s/${BRIDGE_ID}/test/g' "$D/upstreams-primary.conf" > "$WORK/upstreams.conf"
+    cp "$D/routes-metrics-reader.conf" "$D/routes-platform-api.conf" "$D/worker-map-primary.conf" "$WORK/"
+    local env_target=()
+    [ -n "$target" ] && env_target=(-e METRICS_READER_TARGET="$target")
 
     docker run -d --name pg-echo --network $NET \
         --network-alias worker1 --network-alias worker2 --network-alias worker3 \
         --network-alias worker4 --network-alias backup-host \
         --network-alias platform-api --network-alias privacy-pdf \
         -v "$WORK/echo.py:/echo.py:ro" $PY python /echo.py >/dev/null
-    docker run -d --name pg-metrics --network $NET --network-alias metrics-reader \
+    docker run -d --name pg-metrics --network $NET --network-alias "${METRICS_TARGET%%:*}" \
         -e MODE="$1" -v "$WORK/metrics.py:/metrics.py:ro" $PY python /metrics.py >/dev/null
     docker run -d --name pg-nginx --network $NET -p 18080:80 --tmpfs /var/log/nginx \
-        -e BRIDGE_WORKERS="worker1,worker2,worker3,worker4" \
+        -e BRIDGE_WORKERS="worker1,worker2,worker3,worker4" "${env_target[@]}" \
         -v "$WORK/nginx.conf:/usr/local/openresty/nginx/conf/nginx.conf:ro" \
         -v "$WORK/upstreams.conf:/tmp/upstreams.conf:ro" \
+        -v "$WORK/worker-map-primary.conf:/tmp/worker-map.conf:ro" \
         -v "$WORK/routes-metrics-reader.conf:/etc/nginx/routes-metrics-reader.conf:ro" \
         -v "$WORK/routes-platform-api.conf:/etc/nginx/routes-platform-api.conf:ro" \
         $IMG >/dev/null
@@ -230,10 +242,15 @@ start_stack() { # $1 = exhausted|healthy
 assert() {
     local label="$1" path="$2" want_code="$3" want_marker="$4" hdr="${5:-}"
     local out code body marker
+    # X-Bridge-Hop: 1 = the LOCAL tier. Without it the default pool is
+    # claude_production (ADR-0010: Level 1 = the peer bridge first), whose
+    # location has no pool gate — every assertion would then measure the
+    # backup stub instead of the gate (that is how this harness read green
+    # until 2026-10-10 while testing nothing).
     if [ -n "$hdr" ]; then
-        out=$(curl -s -w '\n%{http_code}' -XPOST "http://127.0.0.1:18080$path" -H "$hdr" -d '{"q":1}')
+        out=$(curl -s -w '\n%{http_code}' -XPOST "http://127.0.0.1:18080$path" -H "X-Bridge-Hop: 1" -H "$hdr" -d '{"q":1}')
     else
-        out=$(curl -s -w '\n%{http_code}' -XPOST "http://127.0.0.1:18080$path" -d '{"q":1}')
+        out=$(curl -s -w '\n%{http_code}' -XPOST "http://127.0.0.1:18080$path" -H "X-Bridge-Hop: 1" -d '{"q":1}')
     fi
     code=$(printf '%s' "$out" | tail -1)
     body=$(printf '%s' "$out" | sed '$d')
@@ -263,7 +280,7 @@ assert "chat: other X-Vision-Provider still rejected"   /v1/chat/completions 429
 assert "research: routed + marked (overflow-capable)"   /v1/research         200 1
 assert "jobs: routed + marked (overflow-capable)"       /v1/jobs             200 1
 # The reject must be the canonical envelope, not a generic 5xx.
-env_body=$(curl -s -XPOST http://127.0.0.1:18080/v1/chat/completions -d '{"q":1}')
+env_body=$(curl -s -XPOST http://127.0.0.1:18080/v1/chat/completions -H "X-Bridge-Hop: 1" -d '{"q":1}')
 if printf '%s' "$env_body" | grep -q '"bridge_type":"pool_exhausted"' \
    && printf '%s' "$env_body" | grep -q '"reason":"all_pool_exhausted"'; then
     echo "  PASS  chat reject uses the @pool_exhausted_response envelope"
@@ -280,6 +297,44 @@ assert "jobs: served, NOT marked"                       /v1/jobs             200
 # X-Pool-Exhausted is infrastructure-only: a client copy must never reach a worker.
 assert "forged marker stripped (research)"              /v1/research         200 absent "X-Pool-Exhausted: 1"
 assert "forged marker stripped (chat)"                  /v1/chat/completions 200 absent "X-Pool-Exhausted: 1"
+
+# assert_state <label> <python-expr over d (state JSON)>
+assert_state() {
+    local label="$1" expr="$2" raw
+    raw=$(docker exec pg-nginx curl -s http://127.0.0.1/internal/pool-router/state)
+    if STATE="$raw" python3 -c "
+import json, os, sys
+d = json.loads(os.environ['STATE'])
+sys.exit(0 if ($expr) else 1)" 2>/dev/null; then
+        printf '  PASS  %s\n' "$label"
+    else
+        printf '  FAIL  %s — state: %s\n' "$label" "${raw:0:300}"
+        FAILURES=$((FAILURES + 1))
+    fi
+}
+
+# The router must load state from METRICS_READER_TARGET, not from a fixed name.
+assert_state "router state loaded from METRICS_READER_TARGET" \
+    "d['last_refresh_status'] == 'ok' and d['metrics_url'] == 'http://$METRICS_TARGET' and d['state_age_s'] < 10"
+
+echo
+echo "=== Scenario: METRICS_READER_TARGET unset (router blind) ==="
+start_stack healthy ""
+assert_state "blind router reports the missing variable" \
+    "d['last_refresh_status'] == 'error' and 'METRICS_READER_TARGET' in d['last_refresh_err'] and d['metrics_url'] is None and d['consecutive_failures'] >= 1"
+if docker exec pg-nginx cat /var/log/nginx/error.log 2>&1 | grep -q '\[error\].*pool_router: BLIND'; then
+    echo "  PASS  blind router logs at ERR level"
+else
+    echo "  FAIL  no [error] 'pool_router: BLIND' line in the nginx log"; FAILURES=$((FAILURES + 1))
+fi
+# Blind still routes (round-robin) — the gate is off, the service is not.
+assert "chat: still served round-robin while blind"     /v1/chat/completions 200 absent
+
+echo
+echo "=== Scenario: METRICS_READER_TARGET points nowhere (reader unreachable) ==="
+start_stack healthy "metrics-nowhere:8000"
+assert_state "unreachable reader reported with its address" \
+    "d['last_refresh_status'] == 'error' and d['metrics_url'] == 'http://metrics-nowhere:8000'"
 
 echo
 if [ "$FAILURES" -eq 0 ]; then

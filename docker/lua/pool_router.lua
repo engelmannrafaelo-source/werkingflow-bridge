@@ -40,9 +40,40 @@ local http  = require "resty.http"
 
 local shared = ngx.shared.pool_state
 
-local METRICS_URL        = "http://metrics-reader:8000"
 local REFRESH_INTERVAL_S = 2
 local STALE_THRESHOLD_S  = 10
+-- A blind router keeps routing (round-robin, below) — it must not stay quiet
+-- about it. First failure and then one line per interval go out at ERR level.
+local FAIL_LOG_INTERVAL_S = 60
+
+-- Metrics-reader address — read from METRICS_READER_TARGET, the SAME value
+-- nginx.conf envsubsts into $metrics_reader for the /v1/metrics routes and
+-- /lb-status. Requires `env METRICS_READER_TARGET;` in the nginx main context.
+--
+-- WHY NOT A FIXED NAME: until 2026-10-10 this was "http://metrics-reader:8000".
+-- Since the ADR-0009 cutover (2026-08-31) the prod reader lives on the
+-- worker-host; the name no longer resolves on the prod LB, every refresh
+-- failed ("metrics-reader could not be resolved"), the state was never
+-- loaded, and prod routed round-robin with the account gate switched off for
+-- six weeks — logged only as WARN (~150k lines). One address for the routes
+-- and the router means they can no longer disagree about where the reader is.
+--
+-- NO DEFAULT: an unset target is a deployment error. The router then reports
+-- it at ERR level and in /internal/pool-router/state instead of guessing a
+-- name that only exists on one of the two bridges.
+local function read_metrics_url()
+    local raw = os.getenv("METRICS_READER_TARGET") or ""
+    raw = raw:match("^%s*(.-)%s*$")
+    if raw == "" then
+        return nil
+    end
+    if raw:find("^https?://") then
+        return raw
+    end
+    return "http://" .. raw
+end
+
+local METRICS_URL = read_metrics_url()
 
 -- Worker upstream names — the SINGLE per-topology parameter, read from the
 -- BRIDGE_WORKERS env var (the SAME SSoT the metrics-reader uses:
@@ -119,7 +150,31 @@ end
 -- ---------------------------------------------------------------------------
 -- Pool state refresh (runs in background timer every REFRESH_INTERVAL_S)
 -- ---------------------------------------------------------------------------
+-- Every refresh failure goes through here: status for the state endpoint,
+-- and an ERR line on the first failure after a success (or after start) and
+-- then once per FAIL_LOG_INTERVAL_S with the running count. Per-call WARN
+-- lines were what let the outage above run unnoticed: loud in volume, but at
+-- a level nobody alerts on.
+local function refresh_failed(msg)
+    shared:set("last_refresh_status", "error")
+    shared:set("last_refresh_err", msg)
+    local fails = shared:incr("consecutive_failures", 1, 0)
+    local now = ngx.now()
+    local last_logged = tonumber(shared:get("fail_logged_at")) or 0
+    if fails == 1 or (now - last_logged) >= FAIL_LOG_INTERVAL_S then
+        shared:set("fail_logged_at", now)
+        ngx.log(ngx.ERR, "pool_router: BLIND — account gate OFF, routing round-robin. ",
+                "metrics-reader ", tostring(METRICS_URL or "<METRICS_READER_TARGET unset>"),
+                ": ", msg, " (", fails, " consecutive failures)")
+    end
+end
+
 local function refresh_pool_state()
+    if not METRICS_URL then
+        refresh_failed("METRICS_READER_TARGET unset on the nginx service — "
+                       .. "set it in compose/.env (same value as for $metrics_reader)")
+        return
+    end
     local httpc = http.new()
     httpc:set_timeout(5000)  -- 5s — robust against slow metrics-reader restarts
     local res, err = httpc:request_uri(METRICS_URL .. "/v1/metrics/account-pool-state", {
@@ -131,31 +186,23 @@ local function refresh_pool_state()
     httpc:close()
 
     if not res then
-        shared:set("last_refresh_status", "error")
-        shared:set("last_refresh_err", tostring(err or "connection failed"))
-        ngx.log(ngx.WARN, "pool_router: metrics-reader unreachable: ", tostring(err or "unknown"))
+        refresh_failed("unreachable: " .. tostring(err or "connection failed"))
         return
     end
     if res.status ~= 200 then
-        shared:set("last_refresh_status", "error")
-        shared:set("last_refresh_err", "HTTP " .. tostring(res.status))
-        ngx.log(ngx.WARN, "pool_router: metrics-reader HTTP ", res.status)
+        refresh_failed("HTTP " .. tostring(res.status))
         return
     end
 
     local ok, data = pcall(cjson.decode, res.body)
     if not ok or type(data) ~= "table" or type(data.accounts) ~= "table" then
-        shared:set("last_refresh_status", "error")
-        shared:set("last_refresh_err", "invalid JSON from metrics-reader")
-        ngx.log(ngx.WARN, "pool_router: invalid JSON from metrics-reader")
+        refresh_failed("invalid JSON from metrics-reader")
         return
     end
 
     local ok2, encoded = pcall(cjson.encode, data)
     if not ok2 then
-        shared:set("last_refresh_status", "error")
-        shared:set("last_refresh_err", "cjson encode failed")
-        ngx.log(ngx.ERR, "pool_router: cjson encode failed")
+        refresh_failed("cjson encode failed")
         return
     end
 
@@ -163,6 +210,13 @@ local function refresh_pool_state()
     shared:set("ts", ngx.now())   -- ONLY set ts on success
     shared:set("last_refresh_status", "ok")
     shared:set("last_refresh_err", "")
+    local fails = tonumber(shared:get("consecutive_failures")) or 0
+    if fails > 0 then
+        shared:set("consecutive_failures", 0)
+        shared:set("fail_logged_at", 0)
+        ngx.log(ngx.WARN, "pool_router: recovered — account gate ON again after ",
+                fails, " failed refreshes (", METRICS_URL, ")")
+    end
 end
 
 -- ---------------------------------------------------------------------------
@@ -225,7 +279,13 @@ function M.init()
     end)
     if not ok3 then ngx.log(ngx.ERR, "pool_router: failed to start timer: ", err3) end
 
-    ngx.log(ngx.INFO, "pool_router: initialized (refresh=",
+    if not METRICS_URL then
+        ngx.log(ngx.ERR, "pool_router: METRICS_READER_TARGET unset — the account ",
+                "gate cannot load pool state; every request routes round-robin.")
+    end
+
+    ngx.log(ngx.INFO, "pool_router: initialized (metrics=",
+            tostring(METRICS_URL), ", refresh=",
             REFRESH_INTERVAL_S, "s, stale_threshold=", STALE_THRESHOLD_S, "s)")
 end
 
@@ -423,16 +483,21 @@ function M.state_handler()
         if ok_e then state_snapshot = enc end
     end
 
-    -- Escape any quotes in refresh_err to keep JSON valid
-    local safe_err = (refresh_err or ""):gsub('\\', '\\\\'):gsub('"', '\\"')
+    -- String fields go through cjson so quotes/backslashes stay valid JSON
+    local function jstr(v)
+        local ok_j, enc = pcall(cjson.encode, v)
+        return ok_j and enc or '""'
+    end
 
     ngx.header["Content-Type"] = "application/json"
     ngx.status = 200
     ngx.say(string.format(
-        '{"ts":%.3f,"state_age_s":%.1f,"last_refresh_status":"%s",' ..
-        '"last_refresh_err":"%s","decision_counter_per_worker":%s,' ..
-        '"last_state_snapshot":%s}',
-        state_ts, state_age_s, refresh_status, safe_err,
+        '{"ts":%.3f,"state_age_s":%.1f,"last_refresh_status":%s,' ..
+        '"last_refresh_err":%s,"metrics_url":%s,"consecutive_failures":%d,' ..
+        '"decision_counter_per_worker":%s,"last_state_snapshot":%s}',
+        state_ts, state_age_s, jstr(refresh_status), jstr(refresh_err or ""),
+        METRICS_URL and jstr(METRICS_URL) or "null",
+        tonumber(shared:get("consecutive_failures")) or 0,
         counters_enc, state_snapshot
     ))
 end

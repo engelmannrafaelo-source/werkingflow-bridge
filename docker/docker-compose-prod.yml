@@ -51,7 +51,8 @@ services:
       - BRIDGE_ID=${BRIDGE_ID:-prod}
       # Worker set for docker/lua/pool_router.lua (env BRIDGE_WORKERS in nginx.conf).
       - BRIDGE_WORKERS=worker-sahori,worker-kurt,worker-coach,worker-erk
-      # Per-topology metrics-reader target (nginx.conf `set $metrics_reader`).
+      # Per-topology metrics-reader target (nginx.conf `set $metrics_reader`
+      # AND docker/lua/pool_router.lua via `env METRICS_READER_TARGET`).
       # Since the ADR-0009 cutover the prod reader lives on the WORKER-HOST
       # next to the workers' logs volume (its data ownership moved with the
       # workers) — docker/.env on this host sets the Tailscale target
@@ -783,9 +784,9 @@ services:
     restart: unless-stopped
     networks:
       bridge-prod-net:
-        # Canonical DNS name the consumers hard-code: account_router.py
-        # (BRIDGE_METRICS_READER_URL default) + docker/lua/pool_router.lua +
-        # nginx.conf all resolve `http://metrics-reader:8000`. The dev compose
+        # Canonical DNS name for consumers that default to it: account_router.py
+        # (BRIDGE_METRICS_READER_URL default). nginx.conf and
+        # docker/lua/pool_router.lua read METRICS_READER_TARGET instead. The dev compose
         # names the service `metrics-reader`; prod named it `metrics-reader-prod`,
         # so that hostname did NOT resolve in bridge-prod-net → every sandbox
         # lease failed `pool_state_unavailable` (503) → app showed "start 500".
