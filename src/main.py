@@ -10437,11 +10437,41 @@ async def get_auth_status(request: Request):
     }
 
 
+async def _verify_operator_key(
+    request: Request, credentials: Optional[HTTPAuthorizationCredentials]
+):
+    """Auth for the session-management routes below (BR13): the shared bridge key only.
+
+    These routes are an operator view across ALL callers — the CLI-session list
+    carries the first 200 characters of every prompt since container start, and
+    DELETE aborts a running call that someone else is paying for. Until
+    2026-10-10 they had no auth at all and were reachable through
+    bridge.werking.tools / prod-bridge.werking.tools (nginx `location /` and the
+    `/worker<NAME>/` passthrough). A per-app service principal
+    (BRIDGE_PRINCIPALS_ENABLED) must not see or cancel other apps' runs, so a
+    resolved non-legacy principal is refused with 403. The legitimate callers
+    (CUI Bridge-Monitor via /api/bridge-proxy, partner-platform team chat
+    history) send the shared AI_BRIDGE_API_KEY.
+    """
+    await verify_api_key(request, credentials)
+    principal = getattr(request.state, "principal", None)
+    if principal is not None and not principal.is_legacy:
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                f"principal '{principal.name}' may not use the "
+                "session-management routes"
+            ),
+        )
+
+
 @app.get("/v1/sessions/stats")
 async def get_session_stats(
+    request: Request,
     credentials: Optional[HTTPAuthorizationCredentials] = Depends(security)
 ):
     """Get session manager statistics."""
+    await _verify_operator_key(request, credentials)
     stats = session_manager.get_stats()
     return {
         "session_stats": stats,
@@ -10452,19 +10482,23 @@ async def get_session_stats(
 
 @app.get("/v1/sessions")
 async def list_sessions(
+    request: Request,
     credentials: Optional[HTTPAuthorizationCredentials] = Depends(security)
 ):
     """List all active sessions."""
+    await _verify_operator_key(request, credentials)
     sessions = session_manager.list_sessions()
     return SessionListResponse(sessions=sessions, total=len(sessions))
 
 
 @app.get("/v1/sessions/{session_id}")
 async def get_session(
+    request: Request,
     session_id: str,
     credentials: Optional[HTTPAuthorizationCredentials] = Depends(security)
 ):
     """Get information about a specific session."""
+    await _verify_operator_key(request, credentials)
     session = session_manager.get_session(session_id)
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
@@ -10474,10 +10508,12 @@ async def get_session(
 
 @app.delete("/v1/sessions/{session_id}")
 async def delete_session(
+    request: Request,
     session_id: str,
     credentials: Optional[HTTPAuthorizationCredentials] = Depends(security)
 ):
     """Delete a specific session."""
+    await _verify_operator_key(request, credentials)
     deleted = session_manager.delete_session(session_id)
     if not deleted:
         raise HTTPException(status_code=404, detail="Session not found")
@@ -10491,6 +10527,7 @@ async def delete_session(
 
 @app.get("/v1/cli-sessions")
 async def list_cli_sessions(
+    request: Request,
     status: Optional[str] = None,
     credentials: Optional[HTTPAuthorizationCredentials] = Depends(security)
 ):
@@ -10499,6 +10536,7 @@ async def list_cli_sessions(
     Args:
         status: Optional filter by status (running, completed, cancelled, failed)
     """
+    await _verify_operator_key(request, credentials)
     from src.cli_session_manager import cli_session_manager
 
     logger.debug(f"CLI session list requested (status_filter={status})")
@@ -10520,9 +10558,11 @@ async def list_cli_sessions(
 
 @app.get("/v1/cli-sessions/stats")
 async def get_cli_session_stats(
+    request: Request,
     credentials: Optional[HTTPAuthorizationCredentials] = Depends(security)
 ):
     """Get CLI session statistics."""
+    await _verify_operator_key(request, credentials)
     from src.cli_session_manager import cli_session_manager
 
     stats = cli_session_manager.get_stats()
@@ -10531,10 +10571,12 @@ async def get_cli_session_stats(
 
 @app.get("/v1/cli-sessions/{cli_session_id}")
 async def get_cli_session(
+    request: Request,
     cli_session_id: str,
     credentials: Optional[HTTPAuthorizationCredentials] = Depends(security)
 ):
     """Get information about a specific CLI session."""
+    await _verify_operator_key(request, credentials)
     from src.cli_session_manager import cli_session_manager
 
     session = cli_session_manager.get_session(cli_session_id)
@@ -10546,10 +10588,12 @@ async def get_cli_session(
 
 @app.delete("/v1/cli-sessions/{cli_session_id}")
 async def cancel_cli_session(
+    request: Request,
     cli_session_id: str,
     credentials: Optional[HTTPAuthorizationCredentials] = Depends(security)
 ):
     """Cancel a running CLI session (stops the Claude CLI call)."""
+    await _verify_operator_key(request, credentials)
     from src.cli_session_manager import cli_session_manager
 
     logger.info(f"CLI session cancellation requested: {cli_session_id}")
@@ -10592,6 +10636,7 @@ async def cancel_cli_session(
 
 @app.delete("/v1/cli-sessions")
 async def cleanup_old_cli_sessions(
+    request: Request,
     max_age_hours: int = 24,
     credentials: Optional[HTTPAuthorizationCredentials] = Depends(security)
 ):
@@ -10600,6 +10645,7 @@ async def cleanup_old_cli_sessions(
     Args:
         max_age_hours: Remove sessions older than this (default: 24 hours)
     """
+    await _verify_operator_key(request, credentials)
     from src.cli_session_manager import cli_session_manager
 
     logger.info(f"CLI session cleanup requested (max_age_hours={max_age_hours})")
