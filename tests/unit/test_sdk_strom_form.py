@@ -11,7 +11,9 @@ from __future__ import annotations
 
 import dataclasses
 import importlib.machinery
+import importlib.metadata
 import importlib.util
+import re
 import sys
 from pathlib import Path
 from unittest.mock import MagicMock as _MagicMock
@@ -32,7 +34,19 @@ from tests import sdk_strom  # noqa: E402
 KLASSEN = ("TextBlock", "AssistantMessage", "SystemMessage", "ResultMessage")
 
 
+def _gelockte_sdk_version() -> str:
+    lock = (Path(__file__).resolve().parents[2] / "poetry.lock").read_text()
+    treffer = re.search(
+        r'name = "claude-code-sdk"\nversion = "([^"]+)"', lock)
+    assert treffer, "claude-code-sdk not found in poetry.lock"
+    return treffer.group(1)
+
+
 def test_stand_ins_haben_die_felder_des_sdk():
+    """Against the locked version (the one the worker image runs) the fields
+    must be identical. Another installed version may only ADD fields with a
+    default (0.0.25: AssistantMessage.parent_tool_use_id) — the stand-ins
+    then still build what that SDK builds, minus keys the bridge never reads."""
     paket = importlib.machinery.PathFinder.find_spec("claude_code_sdk")
     if paket is None:
         pytest.skip("claude_code_sdk not installed here (worker image only)")
@@ -44,9 +58,21 @@ def test_stand_ins_haben_die_felder_des_sdk():
         spec.loader.exec_module(echt)
     finally:
         del sys.modules[spec.name]
+    installiert = importlib.metadata.version("claude-code-sdk")
+    gelockt = _gelockte_sdk_version()
     for k in KLASSEN:
-        assert ([f.name for f in dataclasses.fields(getattr(sdk_strom, k))]
-                == [f.name for f in dataclasses.fields(getattr(echt, k))]), k
+        stand_in = [f.name for f in dataclasses.fields(getattr(sdk_strom, k))]
+        felder = dataclasses.fields(getattr(echt, k))
+        if installiert == gelockt:
+            assert stand_in == [f.name for f in felder], (k, gelockt)
+            continue
+        assert stand_in == [f.name for f in felder][:len(stand_in)], (
+            k, installiert, gelockt)
+        zusaetzlich = felder[len(stand_in):]
+        ohne_default = [f.name for f in zusaetzlich
+                        if f.default is dataclasses.MISSING
+                        and f.default_factory is dataclasses.MISSING]
+        assert not ohne_default, (k, installiert, gelockt, ohne_default)
 
 
 def test_umgewandelte_formen():

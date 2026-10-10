@@ -4816,14 +4816,15 @@ async def _pool_berichtsdatei_nachholen(
             usage = usage or {"input_tokens": 0, "output_tokens": 0, "cache_read_tokens": 0, "cache_creation_tokens": 0}
             for k in usage:
                 usage[k] += u[k]
-    from src.claude_cli import find_unfinished_result
+    from src.claude_cli import describe_unfinished_result, find_unfinished_result
     unfertig = find_unfinished_result(chunks)
     if unfertig is not None:
         # error_max_turns too: written with Write and then Edit, the file
         # exists after the first part and looks like a finished report.
         raise ResearchReportMissing(
-            f"The round to write the report file ended with {unfertig.get('subtype')} instead of "
-            f"success — a partly written {datei.name} is not handed out.",
+            f"The round to write the report file ended with "
+            f"{describe_unfinished_result(unfertig)} instead of a clean success — "
+            f"a partly written {datei.name} is not handed out.",
             usage,
         )
     if not datei.is_file():
@@ -4920,7 +4921,7 @@ async def _pool_luecken_rueckrunde(
             for k in rr_usage:
                 rr_usage[k] += u[k]
     nachkontrolle.rueckrunde_usage = dict(rr_usage or {}, usage_source="api" if rr_usage else "missing")
-    from src.claude_cli import find_unfinished_result
+    from src.claude_cli import describe_unfinished_result, find_unfinished_result
     _rr_unfertig = find_unfinished_result(chunks)
     if _rr_unfertig is not None:
         # Rueckrunde nicht mit success beendet (abgeschnitten ZB3D, oder
@@ -4928,7 +4929,8 @@ async def _pool_luecken_rueckrunde(
         # Datei geht nicht raus — der Bericht von vorher kommt zurueck an seinen Platz.
         if datei is not None:
             datei.write_text(bericht, encoding="utf-8")
-        return scheitern(f"Rückrunde abgeschnitten ({_rr_unfertig.get('subtype')})")
+        return scheitern(
+            f"Rückrunde abgeschnitten ({describe_unfinished_result(_rr_unfertig)})")
     if pool_pplx.gate_error:
         # Same rule as the first round: a report written while the privacy
         # gate was broken is not handed out — the caller raises on gate_error.
@@ -5356,12 +5358,13 @@ async def _execute_research_impl(
         # exists after its first part — a cut-off report that reads like a
         # finished one. After the quota check, so an exhausted account stays
         # a retryable RateLimitError, and after the empty-run check with its hint.
-        from src.claude_cli import find_unfinished_result
+        from src.claude_cli import describe_unfinished_result, find_unfinished_result
         _research_unfertig = find_unfinished_result(all_chunks)
         if _research_unfertig is not None:
             raise ResearchReportMissing(
-                f"Research run ended with {_research_unfertig.get('subtype')} instead of success "
-                f"(session_id={session_id}) — "
+                f"Research run ended with "
+                f"{describe_unfinished_result(_research_unfertig)} instead of a clean "
+                f"success (session_id={session_id}) — "
                 + (f"the report file {container_file} may be partly written and is not handed out."
                    if container_file else "no report file was written; the chat text is not a report.")
             )

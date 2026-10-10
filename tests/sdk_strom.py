@@ -1,8 +1,10 @@
 """The stream shape run_completion really hands on, for test fakes.
 
 claude_code_sdk only lives in the worker image, so these are stand-ins with the
-SDK's class NAMES and fields (claude_code_sdk 0.0.25 types.py; 0.0.22 has the
-same shape). tests/unit/test_sdk_strom_form.py compares them with the real
+SDK's class NAMES and fields of the version poetry.lock pins and the worker
+image runs (claude_code_sdk 0.0.22 types.py). Newer SDKs add optional fields
+(0.0.25: AssistantMessage.parent_tool_use_id); System- and ResultMessage are
+the same in both. tests/unit/test_sdk_strom_form.py compares them with the real
 dataclasses wherever the SDK is installed.
 
 `chunk()` runs a message through the same conversion as run_completion
@@ -28,7 +30,6 @@ class TextBlock:
 class AssistantMessage:
     content: list
     model: str
-    parent_tool_use_id: Optional[str] = None
 
 
 @dataclass

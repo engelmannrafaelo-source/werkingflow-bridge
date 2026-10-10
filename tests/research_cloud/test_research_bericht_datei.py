@@ -303,6 +303,7 @@ async def test_success_mit_is_error_ist_kein_erfolg(tmp_path, persist):
     fake = FakeCli(tmp_path, files={"output.md": BERICHT}, chat="fertig", research_ende={"is_error": True})
     result = await _run(fake)
     assert result.status == "error"
+    assert "success flagged is_error instead of a clean success" in result.error
 
 
 def test_find_unfinished_result_formen():

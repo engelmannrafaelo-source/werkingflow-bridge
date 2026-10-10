@@ -970,6 +970,15 @@ def find_unfinished_result(chunks: list) -> Optional[dict]:
     return None
 
 
+def describe_unfinished_result(chunk: dict) -> str:
+    """How find_unfinished_result's chunk ended, for error messages: the
+    subtype, plus is_error where the subtype alone would read like a success."""
+    subtype = chunk.get("subtype")
+    if chunk.get("is_error") and subtype in RESULT_SUCCESS_SUBTYPES:
+        return f"{subtype} flagged is_error"
+    return str(subtype)
+
+
 def apply_thinking_budget(options: "ClaudeCodeOptions", max_thinking_tokens: Optional[int]) -> None:
     """Set the CLI thinking budget on the SUBPROCESS env of this run only.
 
