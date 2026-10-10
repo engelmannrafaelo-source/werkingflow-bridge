@@ -759,10 +759,30 @@ async def internal_mark_running(
     job_id: str,
     _claims: AuthClaims = Depends(require_service_token),
 ) -> Response:
+    """204 = claimed (pending → running). 409 = the row was not 'pending' any
+    more — cancelled by its owner (BR10) or already claimed — and the worker
+    must not run it. 409, not 5xx: a 5xx reads as "platform-api down" to
+    platform_client and would send the worker to its direct-DB fallback."""
     from src.jobs import store
 
-    await store.mark_running(job_id)
+    if not await store.mark_running(job_id):
+        return Response(status_code=409)
     return Response(status_code=204)
+
+
+@router.post("/jobs/{job_id}/cancel")
+async def internal_cancel_job(
+    job_id: str,
+    _claims: AuthClaims = Depends(require_service_token),
+) -> Dict[str, Any]:
+    """Withdraw a not-yet-started job (BR10, store.cancel_job). Always 200:
+    ``{"job": null}`` for an unknown id, else
+    ``{"job": {"status", "changed", "cancel_requested"}}``.
+    No 404 here on purpose — the worker must be able to tell "no such job" from
+    "this platform-api predates the cancel route" (which FastAPI answers 404/405)."""
+    from src.jobs import store
+
+    return {"job": await store.cancel_job(job_id)}
 
 
 @router.post("/jobs/{job_id}/heartbeat", status_code=204)

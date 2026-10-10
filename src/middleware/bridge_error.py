@@ -75,6 +75,8 @@ TYPE_CONFIG = "configuration"
 TYPE_INPUT_TOO_LARGE = "input_too_large"
 # ADR-0012: the poll reached a bridge that is not the job's home store.
 TYPE_JOB_MISDIRECTED = "job_misdirected"
+# BR10: DELETE /v1/jobs/{id} refused because of the job's state (or absence).
+TYPE_JOB_STATE = "job_state"
 
 # Reason codes — narrow, stable identifiers for why a 429 (or 500) was emitted.
 # These go into `error.reason` and drive panel aggregation / alerting.
@@ -122,6 +124,10 @@ REASON_INPUT_LIMIT_EXCEEDED = "bridge_input_limit_exceeded"
 REASON_JOB_ID_MALFORMED = "job_id_malformed"
 REASON_JOB_HOME_MISMATCH = "job_home_bridge_mismatch"
 REASON_JOB_HOME_UNCONFIGURED = "job_home_unconfigured"
+# BR10 — DELETE /v1/jobs/{id}. Also carried in error.code (see job_cancel_error).
+REASON_JOB_NOT_FOUND = "job_not_found"
+REASON_JOB_ALREADY_RUNNING = "job_already_running"
+REASON_JOB_TERMINAL = "job_terminal"
 
 
 def bridge_error(
@@ -895,3 +901,39 @@ def classify_exception(exc: Exception) -> JSONResponse:
 def raise_classified(exc: Exception) -> None:
     """Convenience: classify + raise in one call."""
     raise BridgeError(classify_exception(exc))
+
+
+def job_cancel_error(
+    job_id: str, reason: str, status_code: int, message: str,
+    job_status: Optional[str] = None,
+    cancel_requested: Optional[bool] = None,
+) -> JSONResponse:
+    """A DELETE /v1/jobs/{id} that did not cancel (BR10). Never retryable: the
+    job's state will not turn back into 'pending', and an unknown id stays
+    unknown.
+
+    ``error.code`` carries the stable identifier (= ``error.reason``) instead
+    of the HTTP status string the envelope puts there by default: callers
+    branch on ``error.code`` (energy's job_abbrechen_bei_fristende reads it),
+    and "409" alone cannot tell "already running" from "already finished".
+
+    For ``job_not_found`` the body depends on nothing but the id the caller
+    sent — a job owned by someone else gets this exact answer, so the response
+    reveals nothing about whether the id exists.
+
+    ``cancel_requested`` (only on ``job_already_running``, BR10b): whether the
+    bridge recorded the wish, so the run is not resumed should it pause."""
+    extra: Dict[str, Any] = {"code": reason, "job_id": job_id[:120]}
+    if job_status is not None:
+        extra["status"] = job_status
+    if cancel_requested is not None:
+        extra["cancel_requested"] = cancel_requested
+    return bridge_error(
+        source=SOURCE_BRIDGE_INTERNAL,
+        error_type=TYPE_JOB_STATE,
+        reason=reason,
+        message=message,
+        status_code=status_code,
+        retryable_override=False,
+        extra=extra,
+    )

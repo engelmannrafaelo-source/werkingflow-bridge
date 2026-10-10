@@ -20,11 +20,20 @@ from typing import Any, Dict, List, Optional
 
 from src.db.client import get_pool
 
-# Terminal vs in-flight. Polling clients stop on done/error.
+# Terminal vs in-flight. Polling clients stop on done/error/cancelled.
 JOB_STATUS_PENDING = "pending"
 JOB_STATUS_RUNNING = "running"
 JOB_STATUS_DONE = "done"
 JOB_STATUS_ERROR = "error"
+# BR10: the owner withdrew the job before any worker started it. Reached from
+# 'pending' (cancel_job), and — BR10b — from a run its owner asked to cancel
+# while it was 'running' (cancel_requested_at) once that run parks itself
+# (defer_job) or its worker dies (claim_stale_job). Nothing leaves it: every
+# claim path selects 'pending'/'running' only, so a cancelled row is never
+# started again and never billed again. The TTL cleanup removes it like any
+# other row.
+JOB_STATUS_CANCELLED = "cancelled"
+JOB_TERMINAL_STATUSES = (JOB_STATUS_DONE, JOB_STATUS_ERROR, JOB_STATUS_CANCELLED)
 
 
 def payload_digest(payload: Optional[Dict[str, Any]]) -> str:
@@ -106,19 +115,86 @@ async def get_job(job_id: str) -> Optional[Dict[str, Any]]:
     return _row_to_job(row) if row else None
 
 
-async def mark_running(job_id: str) -> None:
-    """Transition to running, bump attempts, stamp heartbeat. Called by the runner."""
+async def mark_running(job_id: str) -> bool:
+    """Claim a FRESH job for the dispatching worker: pending → running, bump
+    attempts, stamp heartbeat. Called by the runner.
+
+    Returns False when the row was not 'pending' any more — cancelled by its
+    owner in the window between submit and dispatch (BR10), or already claimed
+    by the watchdog. The caller must then NOT run the job. The status condition
+    is what makes cancel_job and this claim mutually exclusive: both write the
+    same row, Postgres serialises them on its row lock, and whichever commits
+    second finds the status it requires gone."""
     pool = get_pool()
     async with pool.acquire() as conn:
-        await conn.execute(
+        result = await conn.execute(
             """
             UPDATE ai_jobs
                SET status = 'running', attempts = attempts + 1,
                    heartbeat_at = NOW(), updated_at = NOW()
-             WHERE job_id = $1
+             WHERE job_id = $1 AND status = 'pending'
             """,
             job_id,
         )
+    return _affected(result) == 1
+
+
+def _affected(result: Any) -> int:
+    """Row count from an asyncpg command tag ("UPDATE 1"). A tag that does not
+    parse is a driver contract break — raise, never read it as 0 rows."""
+    try:
+        return int(str(result).split()[-1])
+    except (ValueError, IndexError):
+        raise RuntimeError(f"unparseable command tag from Postgres: {result!r}") from None
+
+
+async def cancel_job(job_id: str) -> Optional[Dict[str, Any]]:
+    """Withdraw a job that no worker has started (BR10). Atomic.
+
+    Returns None for an unknown id, else ``{"status", "changed",
+    "cancel_requested"}``: the status the row has after this call, whether
+    THIS call moved it, and whether a cancel wish is now recorded on a
+    running row. Only 'pending' (fresh or deferred — deferral keeps the status
+    'pending') becomes 'cancelled'; every other status is returned unchanged
+    for the caller to classify. ``FOR UPDATE`` holds the row lock across the
+    read and the write, so a concurrent claim (mark_running, claim_stale_job)
+    either committed before — and we see 'running' — or runs after and finds
+    no 'pending' row.
+
+    A 'running' row is not stopped (the work is already being done and paid
+    for), but the wish is recorded (BR10b, cancel_requested_at, idempotent):
+    should this run park itself (defer_job) or lose its worker, it ends as
+    'cancelled' instead of being started again. A run that completes ends
+    done/error as usual. Ownership is the caller's check (routes.py); the
+    store does not know who is asking."""
+    pool = get_pool()
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            status = await conn.fetchval(
+                "SELECT status FROM ai_jobs WHERE job_id = $1 FOR UPDATE", job_id
+            )
+            if status is None:
+                return None
+            if status == JOB_STATUS_RUNNING:
+                await conn.execute(
+                    """
+                    UPDATE ai_jobs
+                       SET cancel_requested_at = COALESCE(cancel_requested_at, NOW())
+                     WHERE job_id = $1
+                    """,
+                    job_id,
+                )
+                return {"status": status, "changed": False, "cancel_requested": True}
+            if status != JOB_STATUS_PENDING:
+                return {"status": status, "changed": False, "cancel_requested": False}
+            await conn.execute(
+                """
+                UPDATE ai_jobs SET status = 'cancelled', updated_at = NOW()
+                 WHERE job_id = $1
+                """,
+                job_id,
+            )
+    return {"status": JOB_STATUS_CANCELLED, "changed": True, "cancel_requested": False}
 
 
 async def heartbeat(job_id: str) -> None:
@@ -235,13 +311,20 @@ async def defer_job(job_id: str, delay_seconds: int, reason: str) -> None:
     `deferred_until` passes. Bumps defer_count (which the retry cap subtracts
     out) so an outage of any length cannot exhaust the crash budget, while a
     bounded defer_count still guarantees eventual fail-loud.
+
+    A job whose owner asked to cancel it while it ran (BR10b,
+    cancel_requested_at) is NOT parked: it becomes 'cancelled' in the same
+    statement, so no watchdog can ever start it again. The caller learns the
+    outcome from the row (registry._defer_job reads it for its log line); the
+    platform seam stays 204-without-body so a pre-BR10b worker keeps working.
     """
     pool = get_pool()
     async with pool.acquire() as conn:
         await conn.execute(
             """
             UPDATE ai_jobs
-               SET status = 'pending',
+               SET status = CASE WHEN cancel_requested_at IS NULL
+                                 THEN 'pending' ELSE 'cancelled' END,
                    deferred_until = NOW() + ($2 || ' seconds')::interval,
                    defer_count = defer_count + 1,
                    defer_reason = $3,
@@ -268,9 +351,27 @@ async def claim_stale_job(stale_seconds: int, max_attempts: int) -> Optional[Dic
     Dependency-deferred jobs are skipped until their wait expires, and their
     waits are subtracted from the retry cap (see migration 044). Once the wait
     HAS expired a parked 'pending' job is claimable immediately (_DEFER_DUE),
-    without additionally waiting out `stale_seconds`."""
+    without additionally waiting out `stale_seconds`.
+
+    A row its owner asked to cancel while it ran (BR10b, cancel_requested_at)
+    is never claimed: a 'pending' one (parked by a pre-BR10b worker's
+    defer_job) is closed as 'cancelled' at once, a 'running' one as soon as its
+    heartbeat is stale (dead worker) — in the same call, before the claim, so
+    the watchdog neither re-runs it nor leaves it non-terminal. A live run
+    with a fresh heartbeat is left alone."""
     pool = get_pool()
     async with pool.acquire() as conn:
+        await conn.execute(
+            f"""
+            UPDATE ai_jobs
+               SET status = 'cancelled', updated_at = NOW()
+             WHERE cancel_requested_at IS NOT NULL
+               AND (status = 'pending'
+                    OR (status = 'running'
+                        AND {_STALE_SINCE} < NOW() - ($1 || ' seconds')::interval))
+            """,
+            str(stale_seconds),
+        )
         row = await conn.fetchrow(
             f"""
             UPDATE ai_jobs
@@ -279,6 +380,7 @@ async def claim_stale_job(stale_seconds: int, max_attempts: int) -> Optional[Dic
              WHERE job_id = (
                  SELECT job_id FROM ai_jobs
                   WHERE status IN ('pending', 'running')
+                    AND cancel_requested_at IS NULL
                     AND {_CLAIMABLE}
                     AND {_CRASH_ATTEMPTS} < $2
                     AND {_NOT_DEFERRED}
@@ -300,13 +402,16 @@ async def find_abandoned(stale_seconds: int, max_attempts: int) -> List[Dict[str
 
     A job still inside its dependency wait is NOT abandoned — it is waiting on
     purpose. Its own bound is defer_count (enforced by the runner), so excluding
-    it here cannot make it immortal."""
+    it here cannot make it immortal. A row with a cancel wish (BR10b) is not
+    failed here either: claim_stale_job, which the watchdog runs first, closes
+    it as 'cancelled'."""
     pool = get_pool()
     async with pool.acquire() as conn:
         rows = await conn.fetch(
             f"""
             SELECT * FROM ai_jobs
              WHERE status IN ('pending', 'running')
+               AND cancel_requested_at IS NULL
                AND {_STALE_SINCE} < NOW() - ($1 || ' seconds')::interval
                AND {_CRASH_ATTEMPTS} >= $2
                AND {_NOT_DEFERRED}
@@ -378,7 +483,10 @@ async def find_active(origin: Optional[str] = None, limit: int = 50) -> Dict[str
 
 
 # Valid status values for the list-filter guard (fail loud on unknown status).
-_VALID_STATUSES = frozenset([JOB_STATUS_PENDING, JOB_STATUS_RUNNING, JOB_STATUS_DONE, JOB_STATUS_ERROR])
+_VALID_STATUSES = frozenset([
+    JOB_STATUS_PENDING, JOB_STATUS_RUNNING, JOB_STATUS_DONE, JOB_STATUS_ERROR,
+    JOB_STATUS_CANCELLED,
+])
 
 
 async def list_jobs(
@@ -460,7 +568,7 @@ def _row_to_list_item(row) -> Dict[str, Any]:
     updated = row["updated_at"]
     elapsed: Optional[float] = None
     if isinstance(created, datetime) and isinstance(updated, datetime):
-        terminal = status in (JOB_STATUS_DONE, JOB_STATUS_ERROR)
+        terminal = status in JOB_TERMINAL_STATUSES
         end = updated if terminal else datetime.now(timezone.utc)
         if end.tzinfo is None:
             end = end.replace(tzinfo=timezone.utc)

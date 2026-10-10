@@ -2,6 +2,7 @@
 
     POST /v1/jobs           → { job_id, status:'pending', kind }   (returns in <1s)
     GET  /v1/jobs/{job_id}   → { status, elapsed_seconds, progress, result?, error? }
+    DELETE /v1/jobs/{job_id} → withdraw a job no worker has started yet (BR10)
 
 Inert unless BRIDGE_GENERIC_JOBS_ENABLED=true (503 otherwise) AND a job store is
 reachable — platform-api (BRIDGE_SERVICE_TOKEN, ADR-0009 Weg b) or the direct
@@ -26,6 +27,10 @@ from pydantic import BaseModel
 from src.auth import security, verify_api_key
 from src.error_contract import job_error_view
 from src.middleware.bridge_error import (
+    REASON_JOB_ALREADY_RUNNING,
+    REASON_JOB_NOT_FOUND,
+    REASON_JOB_TERMINAL,
+    job_cancel_error,
     job_home_unconfigured_error,
     job_id_malformed_error,
     job_misdirected_error,
@@ -260,10 +265,14 @@ async def list_jobs_endpoint(
         store.JOB_STATUS_RUNNING,
         store.JOB_STATUS_DONE,
         store.JOB_STATUS_ERROR,
+        store.JOB_STATUS_CANCELLED,
     ):
         raise HTTPException(
             status_code=400,
-            detail=f"Invalid status filter '{status}'. Valid: done, error, pending, running",
+            detail=(
+                f"Invalid status filter '{status}'. "
+                f"Valid: cancelled, done, error, pending, running"
+            ),
         )
 
     # Attribution scope guard: if the caller sends attribution headers, the
@@ -380,7 +389,7 @@ async def get_job_endpoint(
     elapsed = None
     created = job.get("created_at")
     if isinstance(created, datetime):
-        terminal = job["status"] in (store.JOB_STATUS_DONE, store.JOB_STATUS_ERROR)
+        terminal = job["status"] in store.JOB_TERMINAL_STATUSES
         end = job.get("updated_at") if terminal else datetime.now(timezone.utc)
         if isinstance(end, datetime):
             elapsed = round((end - created).total_seconds(), 2)
@@ -399,6 +408,143 @@ async def get_job_endpoint(
         ),
         **_deferral_view(job),
     }
+
+
+# The two attribution dimensions that say whose job it is. The rest (agent,
+# session, workflow, bridge_origin) describe the call, not the owner, and may
+# legitimately differ between the submit and the cancel.
+_OWNER_KEYS = ("app_id", "user_id")
+
+
+def _caller_owns(job: Dict[str, Any], request: Request) -> bool:
+    """Does the caller of this request own `job`? (BR10)
+
+    Owner = the job's stored attribution (app_id, user_id), which the submit
+    took from the caller's X-* headers unless the body named it explicitly.
+    The caller is read with the SAME extractor, so a client that cancels with
+    the headers it submitted with matches by construction; an absent value
+    matches only an absent value. The job id itself is not proof of
+    ownership — GET treats it as a capability, a write must not.
+
+    What this protects, honestly: it is hygiene, not authentication. The
+    compared values are headers the caller asserts itself (X-App-ID,
+    X-User-ID, X-Client-ID), and every holder of the shared bridge API key
+    can send any of them — with principals off (BRIDGE_PRINCIPALS_ENABLED,
+    default off) nothing binds them to the key. It stops a caller from
+    cancelling someone else's job by mistake (wrong id, another app's id in a
+    log); it does not stop a key holder who forges the owner's headers, which
+    GET /v1/jobs even lists alongside the ids. Real protection needs the
+    owner bound to the authenticated principal at submit time.
+
+    No extractor wired (main.py always wires one) would make everybody an
+    owner of nothing or of everything — fail closed and loud instead."""
+    if _attribution_extractor is None:
+        raise RuntimeError(
+            "DELETE /v1/jobs/{id}: no attribution extractor wired "
+            "(main.py set_attribution_extractor) — cannot establish the owner"
+        )
+    caller = _attribution_extractor(request) or {}
+    owner = job.get("attribution") or {}
+    return all((caller.get(k) or None) == (owner.get(k) or None) for k in _OWNER_KEYS)
+
+
+def _job_not_found(job_id: str) -> JSONResponse:
+    """The one answer for "unknown, expired, or not yours" — built from the
+    request's id alone, so a foreign job cannot be told from a missing one."""
+    return job_cancel_error(
+        job_id, REASON_JOB_NOT_FOUND, 404,
+        f"Async job not found (unknown id, or expired): {job_id}",
+    )
+
+
+@router.delete("/v1/jobs/{job_id}")
+async def cancel_job_endpoint(
+    job_id: str,
+    request: Request,
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(security),
+):
+    """Withdraw a job that no worker has started yet (BR10).
+
+    Its owner gives up waiting (a caller's deadline) — without this, a job
+    still 'pending' (fresh, or parked with deferred_until) would be started
+    later anyway and billed for a result nobody reads.
+
+      200 {job_id, status:'cancelled'}  pending/deferred → cancelled, or it
+                                        already was cancelled (idempotent)
+      409 job_already_running           a worker has it (also when it won the
+                                        race against this call by a hair).
+                                        The run is not stopped, but the wish
+                                        is recorded (error.cancel_requested
+                                        = true, BR10b): if the run parks
+                                        itself (429 / dependency wait) or
+                                        its worker dies, the job ends
+                                        'cancelled' and is never started
+                                        again. A run that completes ends
+                                        done/error and is billed — a later
+                                        GET shows which. One DELETE is
+                                        enough; repeating it is harmless.
+      409 job_terminal                  done/error; error.status names which
+      404 job_not_found                 unknown, expired, or someone else's
+      400/421/503                       the same id guard as GET (ADR-0012)
+
+    Exactly one store read precedes every 404, owned or not, so the timing
+    carries no existence signal either. The cancel itself is one atomic store
+    call (store.cancel_job, row lock) — the route never writes on a status it
+    read earlier."""
+    await verify_api_key(request, credentials)
+    _require_enabled()
+
+    guard = _reject_foreign_or_malformed(job_id)
+    if guard is not None:
+        return guard
+
+    job = await store_client.get_job(job_id)
+    if not job:
+        return _job_not_found(job_id)
+    if not _caller_owns(job, request):
+        # Server-side only: the wire answer is the plain not-found above.
+        logger.warning(
+            "job cancel refused — caller is not the owner of %s (answered 404)", job_id
+        )
+        return _job_not_found(job_id)
+
+    outcome = await store_client.cancel_job(job_id)
+    if outcome is None:
+        # Removed between the read and the cancel (TTL cleanup) — it is gone.
+        return _job_not_found(job_id)
+
+    status = outcome["status"]
+    if status == store.JOB_STATUS_CANCELLED:
+        if outcome["changed"]:
+            logger.info(
+                f"🛑 Async job {job_id} (kind={job.get('kind')}) cancelled by its owner"
+            )
+        return {"job_id": job_id, "status": store.JOB_STATUS_CANCELLED}
+    if status == store.JOB_STATUS_RUNNING:
+        # False only behind a platform-api from before BR10b, which records
+        # no wish — the body then says so instead of promising it.
+        requested = bool(outcome.get("cancel_requested"))
+        if requested:
+            logger.info(
+                f"🛑 Async job {job_id} (kind={job.get('kind')}) running — "
+                f"cancel wish recorded, it will not be resumed"
+            )
+        return job_cancel_error(
+            job_id, REASON_JOB_ALREADY_RUNNING, 409,
+            f"Async job {job_id} is already running and cannot be cancelled"
+            + ("; it will not be resumed if it pauses" if requested else ""),
+            job_status=status,
+            cancel_requested=requested,
+        )
+    if status in store.JOB_TERMINAL_STATUSES:
+        return job_cancel_error(
+            job_id, REASON_JOB_TERMINAL, 409,
+            f"Async job {job_id} has already finished ({status}) "
+            f"and cannot be cancelled",
+            job_status=status,
+        )
+    # A status this code does not know is a contract break, not a datum.
+    raise RuntimeError(f"job cancel {job_id}: store returned unknown status {status!r}")
 
 
 def _deferral_view(job: Dict[str, Any]) -> Dict[str, Any]:

@@ -22,6 +22,11 @@ double-bumped attempts counter spends retry budget early, a doubly-claimed job
 is re-run by the watchdog after the stale window (same self-healing that
 already covers a worker dying right after a claim). Documented here instead of
 "fixed" with a dedup mechanism the job table deliberately doesn't need.
+Since BR10 mark_running is a conditional claim (pending only): a double-apply
+there means the platform call claimed the row, the fallback finds it no longer
+'pending' and reports "not claimed", so the worker does not run it — the row
+sits at 'running' with a frozen heartbeat until the watchdog re-claims it after
+the stale window. Same bounded self-healing, no double run.
 
 Datetimes: store.* returns datetime objects (asyncpg); over HTTP they arrive
 as ISO strings. _revive_job parses them back so callers (elapsed computation
@@ -140,7 +145,15 @@ async def get_job(job_id: str) -> Optional[Dict[str, Any]]:
     raise _unexpected("get_job", resp.status_code, resp.json)
 
 
-async def mark_running(job_id: str) -> None:
+async def mark_running(job_id: str) -> bool:
+    """True = this worker claimed the fresh job; False = it was not 'pending'
+    any more (cancelled by its owner, or already claimed) and must not run.
+
+    204 = claimed, 409 = not claimed. A platform-api from before BR10 answers
+    204 unconditionally — correct there, because that platform-api has no
+    cancel route either, so a row cannot have been cancelled. A pre-BR10
+    worker against a BR10 platform-api reads the 409 as an unexpected status
+    and raises before running the job, which is the right outcome too."""
     try:
         resp = await call_platform(
             "POST", f"/v1/internal/jobs/{job_id}/mark-running", timeout_s=_WRITE_TIMEOUT_S
@@ -148,8 +161,35 @@ async def mark_running(job_id: str) -> None:
     except PlatformUnavailable as e:
         _fallback_or_raise("mark_running", e)
         return await store.mark_running(job_id)
-    if resp.status_code != 204:
-        raise _unexpected("mark_running", resp.status_code, resp.json)
+    if resp.status_code == 204:
+        return True
+    if resp.status_code == 409:
+        return False
+    raise _unexpected("mark_running", resp.status_code, resp.json)
+
+
+async def cancel_job(job_id: str) -> Optional[Dict[str, Any]]:
+    """store.cancel_job over the platform seam (BR10). None = unknown id.
+
+    The route answers 200 for every known outcome, including "not found"
+    (``{"job": null}``), so that a 404/405 can only mean "this platform-api has
+    no cancel route" (deployed before BR10) — loud, never read as "no such
+    job". ``cancel_requested`` (BR10b) is absent from a platform-api that
+    predates it; the route reads absent as "no wish recorded"."""
+    try:
+        resp = await call_platform(
+            "POST", f"/v1/internal/jobs/{job_id}/cancel", timeout_s=_WRITE_TIMEOUT_S
+        )
+    except PlatformUnavailable as e:
+        _fallback_or_raise("cancel_job", e)
+        return await store.cancel_job(job_id)
+    if resp.status_code == 200 and isinstance(resp.json, dict) and "job" in resp.json:
+        job = resp.json["job"]
+        if job is None:
+            return None
+        if isinstance(job, dict) and "status" in job and "changed" in job:
+            return job
+    raise _unexpected("cancel_job", resp.status_code, resp.json)
 
 
 async def heartbeat(job_id: str) -> None:
