@@ -426,6 +426,16 @@ def _caller_owns(job: Dict[str, Any], request: Request) -> bool:
     matches only an absent value. The job id itself is not proof of
     ownership — GET treats it as a capability, a write must not.
 
+    What this protects, honestly: it is hygiene, not authentication. The
+    compared values are headers the caller asserts itself (X-App-ID,
+    X-User-ID, X-Client-ID), and every holder of the shared bridge API key
+    can send any of them — with principals off (BRIDGE_PRINCIPALS_ENABLED,
+    default off) nothing binds them to the key. It stops a caller from
+    cancelling someone else's job by mistake (wrong id, another app's id in a
+    log); it does not stop a key holder who forges the owner's headers, which
+    GET /v1/jobs even lists alongside the ids. Real protection needs the
+    owner bound to the authenticated principal at submit time.
+
     No extractor wired (main.py always wires one) would make everybody an
     owner of nothing or of everything — fail closed and loud instead."""
     if _attribution_extractor is None:

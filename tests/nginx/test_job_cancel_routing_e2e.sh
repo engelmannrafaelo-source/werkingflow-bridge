@@ -8,10 +8,16 @@
 #      (ADR-0012): own marker → this bridge's workers (claude_jobs_home), the
 #      peer's marker → the peer (claude_jobs_peer), and a request that already
 #      hopped (X-Bridge-Hop: 1) is never forwarded again.
-#   2. No repetition. The poll location inherits the server-level
+#   2. No repetition of an ANSWER. The poll location inherits the server-level
 #      `proxy_next_upstream error timeout http_5xx http_429`, and nginx counts
-#      DELETE as idempotent — so a cancel that fails on one worker would be
-#      re-sent to the next one. @jobs_cancel switches that off.
+#      DELETE as idempotent — so a cancel a worker answered with 5xx would be
+#      re-sent to the next one. @jobs_cancel retries only `error timeout`.
+#   3. The worker's answer arrives as sent (BR10b): status AND its JSON body,
+#      not nginx's HTML page (proxy_intercept_errors off).
+#   4. Unreachable is skipped, fast (BR10b): a dead home worker costs the
+#      2 s connect timeout and the next home worker answers — no 60 s 504.
+#      Nothing reachable at all (every home worker, or the peer's nginx —
+#      S4 "Peer tot") → a JSON job_home_unreachable answer within seconds.
 #
 # Every worker is its own stub container and counts the requests it got, so
 # "how many workers saw this DELETE" is measured, not inferred. The same
@@ -46,11 +52,13 @@ cleanup() {
 }
 [ -n "${KEEP:-}" ] || trap 'cleanup; rm -rf "$WORK"' EXIT
 
-# --- stub worker: counts every request; FAIL=1 answers 502 ------------------
+# --- stub worker: counts every request; FAIL=1 answers an error with a JSON
+# body — 502, or the status named by ?code= (500/503 …) ----------------------
 cat > "$WORK/stub.py" <<'PYEOF'
 import json
 import os
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from urllib.parse import parse_qs, urlparse
 
 NAME = os.environ["NAME"]
 FAIL = os.getenv("FAIL") == "1"
@@ -65,8 +73,13 @@ class H(BaseHTTPRequestHandler):
         else:
             HITS.append({"method": self.command, "path": self.path,
                          "hop": self.headers.get("X-Bridge-Hop")})
-            body = json.dumps({"worker": NAME, "method": self.command}).encode()
-            self.send_response(502 if FAIL else 200)
+            code = 200
+            if FAIL:
+                q = parse_qs(urlparse(self.path).query)
+                code = int(q.get("code", ["502"])[0])
+            body = json.dumps({"worker": NAME, "method": self.command,
+                               "error": {"code": "stub_%d" % code}}).encode()
+            self.send_response(code)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
@@ -148,6 +161,27 @@ check() { # <label> <actual> <op> <expected>
     fi
 }
 
+# timed <outfile> <curl args...> → prints "<http_code> <seconds>", body to outfile
+timed() {
+    local out="$1"; shift
+    curl -s -m 90 -o "$out" -D "$out.h" -w '%{http_code} %{time_total}' "$@"
+}
+
+# json_field <file> <dotted.path> → value, or MISSING / NOT_JSON
+json_field() {
+    python3 -c "
+import json, sys
+try:
+    v = json.load(open('$1'))
+except Exception:
+    print('NOT_JSON'); sys.exit()
+for k in '$2'.split('.'):
+    v = v.get(k) if isinstance(v, dict) else None
+print('MISSING' if v is None else v)"
+}
+
+lt() { python3 -c "import sys; sys.exit(0 if float('$1') < float('$2') else 1)"; }
+
 LOCAL="worker1 worker2 worker3 worker4"
 OWN="job_dev_0123456789abcdef0123456789abcdef"
 OWN2="job_dev_fedcba9876543210fedcba9876543210"
@@ -171,6 +205,15 @@ else
     check "failed DELETE sent to exactly one home worker" "$n_del" -eq 1
     # The worker's own answer, passed through: one attempt, nothing rewritten.
     check "failed DELETE: caller gets that worker's status" "$code" = 502
+    for c in 500 502 503; do
+        id="job_dev_${c}00000000000000000000000000000"
+        read -r got _t < <(timed "$WORK/b$c" -X DELETE \
+            "http://127.0.0.1:$PORT/v1/jobs/$id?code=$c" -H "X-Bridge-Hop: 1")
+        check "worker $c: status passed through" "$got" = "$c"
+        check "worker $c: JSON body of the worker (not nginx HTML)" \
+            "$(json_field "$WORK/b$c" error.code)" = "stub_$c"
+        check "worker $c: sent to exactly one home worker" "$(hits DELETE "$id" $LOCAL)" -eq 1
+    done
 fi
 
 if [ $EXPECT_REPEAT = 0 ]; then
@@ -193,6 +236,57 @@ if [ $EXPECT_REPEAT = 0 ]; then
     # GET is untouched by the DELETE branch.
     curl -s -o /dev/null "http://127.0.0.1:$PORT/v1/jobs/$OWN2" -H "X-Bridge-Hop: 1"
     check "GET poll still served by the home workers" "$(hits GET "$OWN2" $LOCAL)" -eq 1
+
+    echo
+    echo "=== Scenario: one home worker DEAD (stopped) — skipped, fast ==="
+    # A stopped container's address stays in nginx's upstream and answers
+    # nothing: the connect hangs (measured BR10R: 60 s → 504 HTML).
+    docker stop -t0 "jc-worker1-$SUFFIX" >/dev/null
+    ALIVE="worker2 worker3 worker4"
+    ok=0; slowest=0
+    for i in 1 2 3 4 5 6 7 8; do
+        id="job_dev_dead${i}000000000000000000000000000"
+        read -r got t < <(timed "$WORK/d$i" -X DELETE "http://127.0.0.1:$PORT/v1/jobs/$id" \
+            -H "X-Bridge-Hop: 1")
+        [ "$got" = 200 ] && [ "$(hits DELETE "$id" $ALIVE)" -eq 1 ] && ok=$((ok + 1))
+        lt "$slowest" "$t" && slowest=$t
+    done
+    check "8 DELETEs, each answered 200 by exactly one live home worker" "$ok" -eq 8
+    echo "  info  slowest of the 8: ${slowest} s"
+    if lt "$slowest" 4; then fast=yes; else fast="no ($slowest s)"; fi
+    check "slowest of them under 4 s (dead worker costs the connect timeout)" "$fast" = yes
+
+    echo
+    echo "=== Scenario: EVERY home worker dead — JSON, within seconds ==="
+    for s in worker2 worker3 worker4; do docker stop -t0 "jc-$s-$SUFFIX" >/dev/null; done
+    read -r got t < <(timed "$WORK/all" -X DELETE "http://127.0.0.1:$PORT/v1/jobs/$OWN" \
+        -H "X-Bridge-Hop: 1")
+    check "all home workers dead: 502/504" "$( [ "$got" = 502 ] || [ "$got" = 504 ] && echo 5xx || echo "$got")" = 5xx
+    check "all home workers dead: JSON job_home_unreachable" \
+        "$(json_field "$WORK/all" error.code)" = job_home_unreachable
+    echo "  info  every home worker dead: HTTP $got after ${t} s, $(head -c 160 "$WORK/all")"
+    if lt "$t" 8; then fast=yes; else fast="no ($t s)"; fi
+    check "all home workers dead: answered under 8 s" "$fast" = yes
+    # Control: the poll keeps its own failure answer (@bridge_full).
+    read -r got _t < <(timed "$WORK/allget" "http://127.0.0.1:$PORT/v1/jobs/$OWN2" \
+        -H "X-Bridge-Hop: 1")
+    check "control: GET with all workers dead stays @bridge_full JSON" \
+        "$(json_field "$WORK/allget" error.bridge_type)" = capacity_busy
+
+    echo
+    echo "=== Scenario: PEER dead (S4) — JSON, within seconds, nothing local ==="
+    start_stack 0
+    docker stop -t0 "jc-backup-host-$SUFFIX" >/dev/null
+    read -r got t < <(timed "$WORK/peer" -X DELETE "http://127.0.0.1:$PORT/v1/jobs/$PEER")
+    check "peer dead: 502/504" "$( [ "$got" = 502 ] || [ "$got" = 504 ] && echo 5xx || echo "$got")" = 5xx
+    check "peer dead: JSON job_home_unreachable" \
+        "$(json_field "$WORK/peer" error.code)" = job_home_unreachable
+    check "peer dead: X-Job-Home names the peer" \
+        "$(grep -i '^x-job-home:' "$WORK/peer.h" | tr -d '\r' | awk '{print $2}')" = prod
+    echo "  info  peer dead: HTTP $got after ${t} s, $(head -c 160 "$WORK/peer")"
+    if lt "$t" 5; then fast=yes; else fast="no ($t s)"; fi
+    check "peer dead: answered under 5 s" "$fast" = yes
+    check "peer dead: never answered by a home worker instead" "$(hits DELETE "$PEER" $LOCAL)" -eq 0
 fi
 
 echo
