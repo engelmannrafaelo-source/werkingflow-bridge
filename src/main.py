@@ -2720,6 +2720,9 @@ async def chat_completions(
                 headers={DEPENDENCY_UNAVAILABLE_HEADER: PROVIDER_CONFIG_DEPENDENCY},
             )
         except UserProviderOverrideError as e:
+            # Final, not transient: an unknown provider, a 401/403/404 from the
+            # home bridge, a missing peer. 503 stays (existing callers), the
+            # verdict says it (BR8R §5c, BR9).
             raise HTTPException(
                 status_code=503,
                 detail={
@@ -2727,6 +2730,7 @@ async def chat_completions(
                         "message": str(e),
                         "type": "configuration_error",
                         "code": "user_provider_override_unavailable",
+                        "retryable": False,
                         "hint": "The user is pinned to a specific provider that is currently not servable. No fallback is attempted by design.",
                     }
                 }
@@ -5723,6 +5727,18 @@ def _mark_retryable(message: str) -> str:
     return f'{message} (bridge: HTTP 503, "retryable": true)'
 
 
+def _transient_error(message: str, retry_after_s: Optional[int] = None) -> Dict[str, Any]:
+    """ResearchResponse/DocAgentResponse fields for a transient error: the
+    structured verdict (what callers read, src/error_contract.py) and the text
+    marker (what older text classifiers read), set together so they cannot
+    disagree."""
+    return {
+        "error": _mark_retryable(message),
+        "retryable": True,
+        "retry_after_s": retry_after_s,
+    }
+
+
 async def _execute_research_cloud_impl(
     request: Request,
     request_body: ResearchRequest,
@@ -5876,13 +5892,15 @@ async def _execute_research_cloud_impl(
             # A capacity/availability-shaped upstream failure (429/5xx) —
             # mark it recognizable-retryable so the caller defers instead of
             # treating it as a permanent break (see _mark_retryable).
-            error_message = _mark_retryable(error_message)
+            error_fields = _transient_error(error_message)
+        else:
+            error_fields = {"error": error_message}
         return ResearchResponse(
             status="error",
             query=request_body.query,
             model=request_body.model,
             execution_time_seconds=round(execution_time, 2),
-            error=error_message,
+            **error_fields,
         )
 
     # Real-cost ledger booking — research-cloud always books real cost
@@ -6346,7 +6364,7 @@ async def research(
                 status="error",
                 query=request_body.query,
                 model=request_body.model,
-                error=_mark_retryable(
+                **_transient_error(
                     f"user provider pin not verifiable right now (no fallback by design): {e}"
                 ),
             ).model_dump(),
@@ -6434,7 +6452,7 @@ async def research(
                 status="error",
                 query=request_body.query,
                 model=request_body.model,
-                error=_mark_retryable(str(_rc_err)),
+                **_transient_error(str(_rc_err)),
             )
         except Exception as _rc_err:
             # Routing DECISION itself failed (e.g. DB blip probing capacity) —
@@ -6503,7 +6521,7 @@ async def research(
                 status="error",
                 query=request_body.query,
                 model=request_body.model,
-                error=_mark_retryable(str(_rc_err)),
+                **_transient_error(str(_rc_err)),
             )
         except Exception as _rc_err:
             # Transient failure (e.g. DB blip during pin lookup): the pool is
@@ -7105,7 +7123,7 @@ async def doc_agent(
                 status="error",
                 question=request_body.question,
                 model=request_body.model,
-                error=_mark_retryable(
+                **_transient_error(
                     f"user provider pin not verifiable right now (no fallback by design): {e}"
                 ),
             ).model_dump(),
@@ -10074,13 +10092,23 @@ async def http_exception_handler(request: Request, exc: StarletteHTTPException):
     elif isinstance(detail, dict):
         message = detail.get("message") or detail.get("error") or str(detail)
         extra = {k: v for k, v in detail.items() if k not in ("message", "error")}
+        # The raiser's own verdict wins over the status (src/error_contract.py
+        # rule 1), flat or nested as {"error": {...}}. Before BR9 a permanent
+        # pin error raised as 503 went out as retryable:true.
+        from src.error_contract import envelope_fields
+        verdict = envelope_fields(detail)
+        nested = detail.get("error") if isinstance(detail.get("error"), dict) else {}
         response = bridge_error(
             source=SOURCE_BRIDGE_INTERNAL,
             error_type=TYPE_INTERNAL,
             message=str(message),
             status_code=exc.status_code,
-            retry_after_s=detail.get("retry_after_seconds") or detail.get("retry_after_s"),
+            retry_after_s=(
+                detail.get("retry_after_seconds") or detail.get("retry_after_s")
+                or nested.get("retry_after_s")
+            ),
             extra=extra,
+            retryable_override=verdict.get("retryable"),
         )
     # Plain string detail
     else:

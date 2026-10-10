@@ -42,6 +42,8 @@ import logging
 from typing import Optional, Dict, Any
 from fastapi.responses import JSONResponse
 
+from src.error_contract import is_retryable_status
+
 logger = logging.getLogger(__name__)
 
 WORKER_NAME = os.getenv("INSTANCE_NAME", "unknown")
@@ -129,10 +131,12 @@ def bridge_error(
     Returns:
         JSONResponse with the structured body.
     """
+    # The verdict rules live in src/error_contract.py (BR9): explicit wins,
+    # otherwise the status decides.
     if retryable_override is not None:
         retryable = retryable_override
     else:
-        retryable = status_code in (408, 425, 429, 500, 502, 503, 504)
+        retryable = is_retryable_status(status_code)
     full_message = f"[Bridge {WORKER_NAME}] {message}"
     # Envelope combines OpenAI-compatible fields (message, type, code) with
     # bridge-specific metadata so callers can ALSO discriminate by `source`

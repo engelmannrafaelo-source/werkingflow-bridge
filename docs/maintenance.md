@@ -79,6 +79,40 @@ Zwei Stellen sorgen dafuer, dass daraus kein endgueltig gescheiterter Job wird.
   Proxy koennen zwei Instanzen nicht nebeneinander laufen. Die Luecke bleibt
   also, der Gate bestimmt nur, wann sie entsteht.
 
+## Fehlervertrag: retryable und retry_after_s
+
+Jeder Fehler, den die Bridge nach aussen gibt, traegt zwei Felder:
+`retryable` (dieselbe Anfrage kann spaeter unveraendert gelingen) und
+`retry_after_s` (Wartezeit, wenn die Bridge sie kennt, sonst `null`).
+Die Regeln stehen an einer Stelle, in `src/error_contract.py`:
+
+1. Wer es weiss, setzt das Urteil ausdruecklich, zum Beispiel die
+   Pin-Abfrage, die research-cloud-Kappe oder der Job-Runner. Es wird
+   danach nicht neu abgeleitet, auch nicht aus dem Text.
+2. Ohne ausdrueckliches Urteil entscheidet der HTTP-Status
+   (408, 425, 429, 5xx = wiederholbar), wie schon immer in `bridge_error()`.
+3. Ein Job-Fehler, den niemand eingeordnet hat, gilt nicht als
+   wiederholbar. Eine Wiederholung kostet einen ganzen Lauf.
+
+Wo es landet:
+
+- **Direkter Aufruf** (Chat sync, Fehler-Events im Stream): im
+  Fehler-Envelope. Ein `HTTPException` mit eigenem `retryable` behaelt es,
+  statt den Statuswert zu erben.
+- **Research und Doc-Agent** antworten mit HTTP 200 und `status="error"`:
+  Die Felder stehen im Antwortkoerper. Ein Fehler ohne Urteil ist
+  `retryable: false`. Der Textmarker von `_mark_retryable` bleibt fuer
+  aeltere Textleser stehen und wird von derselben Stelle gesetzt.
+- **Jobs**: im Fehlerobjekt von `GET /v1/jobs/{id}`. Der Worker bestimmt das
+  Urteil, die platform-api der Job-Heimat speichert es. Zeilen ohne
+  gespeichertes Urteil, also aeltere oder von einer platform-api vor BR9
+  geschriebene, bekommen es beim Abruf aus dem `code`.
+  `UPSTREAM_HTTP_424` und `_429` sind endgueltig, weil die Bridge vorher
+  schon selbst gewartet hat.
+- **Geparkte Jobs** bleiben `pending`. `deferred_until` in der Zukunft heisst:
+  Die Bridge wartet absichtlich und startet den Job dann selbst neu.
+  Dazu kommen `defer_count` und `defer_reason`.
+
 ## Erkunder im Deploy
 
 Auf dem Dev-Ziel gehoeren Ausgang, drei Plaetze und Leitstand zu einer

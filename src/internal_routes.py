@@ -686,6 +686,10 @@ class InternalJobDone(BaseModel):
 class InternalJobError(BaseModel):
     message: str
     code: Optional[str] = None
+    # src/error_contract.py verdict (BR9). Optional: workers from before BR9
+    # send neither.
+    retryable: Optional[bool] = None
+    retry_after_s: Optional[int] = Field(default=None, ge=0)
 
 
 class InternalJobDefer(BaseModel):
@@ -804,7 +808,10 @@ async def internal_mark_error(
 ) -> Response:
     from src.jobs import store
 
-    await store.mark_error(job_id, body.message, code=body.code)
+    await store.mark_error(
+        job_id, body.message, code=body.code,
+        retryable=body.retryable, retry_after_s=body.retry_after_s,
+    )
     return Response(status_code=204)
 
 

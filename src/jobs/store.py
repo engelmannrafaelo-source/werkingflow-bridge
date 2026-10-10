@@ -156,7 +156,20 @@ async def mark_done(job_id: str, result: Optional[Dict[str, Any]]) -> None:
         )
 
 
-async def mark_error(job_id: str, message: str, code: Optional[str] = None) -> None:
+async def mark_error(
+    job_id: str,
+    message: str,
+    code: Optional[str] = None,
+    retryable: Optional[bool] = None,
+    retry_after_s: Optional[int] = None,
+) -> None:
+    """Terminal error. `retryable`/`retry_after_s` are the verdict of
+    src/error_contract.py; when a caller has none (a writer from before BR9),
+    the row keeps {message, code} and GET derives the verdict from the code."""
+    error: Dict[str, Any] = {"message": message, "code": code}
+    if retryable is not None:
+        error["retryable"] = bool(retryable)
+        error["retry_after_s"] = retry_after_s
     pool = get_pool()
     async with pool.acquire() as conn:
         await conn.execute(
@@ -165,7 +178,7 @@ async def mark_error(job_id: str, message: str, code: Optional[str] = None) -> N
              WHERE job_id = $1
             """,
             job_id,
-            json.dumps({"message": message, "code": code}, default=str),
+            json.dumps(error, default=str),
         )
 
 

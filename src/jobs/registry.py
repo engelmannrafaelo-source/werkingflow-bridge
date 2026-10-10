@@ -29,6 +29,7 @@ import logging
 import os
 from typing import Any, Awaitable, Callable, Dict, List, Optional
 
+from src.error_contract import job_code_fields, job_error_fields
 from src.jobs import store_client
 
 logger = logging.getLogger(__name__)
@@ -169,6 +170,11 @@ def _capacity_retry_delay(exc: "Exception") -> int:
     return max(CAPACITY_RETRY_MIN_DELAY_S, min(CAPACITY_RETRY_MAX_DELAY_S, seconds))
 
 
+def job_code_fields_for(code: str) -> Dict[str, Any]:
+    """mark_error kwargs for an error that is fully described by its code."""
+    return {"code": code, **job_code_fields(code)}
+
+
 def register_executor(kind: str, executor: Executor) -> None:
     """Idempotent-ish: last registration wins (startup runs once per worker)."""
     _EXECUTORS[kind] = executor
@@ -233,7 +239,10 @@ async def _run_body(
 
     executor = get_executor(kind)
     if executor is None:
-        await store_client.mark_error(job_id, f"No executor registered for kind '{kind}'", code="NO_EXECUTOR")
+        await store_client.mark_error(
+            job_id, f"No executor registered for kind '{kind}'",
+            **job_code_fields_for("NO_EXECUTOR"),
+        )
         logger.error(f"❌ Async job {job_id}: no executor for kind={kind!r}")
         return
 
@@ -293,11 +302,9 @@ async def _run_body(
             if deferred:
                 return
 
-        code = (
-            f"UPSTREAM_HTTP_{e.status_code}"
-            if isinstance(e, ExecutorHTTPError) else "EXECUTOR_ERROR"
-        )
-        await store_client.mark_error(job_id, str(e), code=code)
+        # Code and verdict (retryable / retry_after_s) from ONE place,
+        # src/error_contract.py — never re-derived from the message text.
+        await store_client.mark_error(job_id, str(e), **job_error_fields(e))
         logger.error(f"❌ Async job {job_id} (kind={kind}) crashed: {e}", exc_info=True)
     finally:
         stop.set()
@@ -319,7 +326,7 @@ async def run_watchdog_pass(stale_seconds: int, max_attempts: int) -> Dict[str, 
         await store_client.mark_error(
             job["job_id"],
             f"Job lost after {job['attempts']} attempts (worker death, retries exhausted)",
-            code="REQUEUE_EXHAUSTED",
+            **job_code_fields_for("REQUEUE_EXHAUSTED"),
         )
         failed += 1
         logger.error(f"💀 Watchdog failed-loud job {job['job_id']} (retries exhausted)")
