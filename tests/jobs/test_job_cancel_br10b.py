@@ -16,7 +16,7 @@ cannot catch that. The contract now:
   … then the run completes     → done/error as usual (the work was done)
 
 The SQL runs against a real Postgres (BRIDGE_TEST_PG_URL) with the real
-migrations including 063 — the row lock and the CASE in defer_job cannot be
+migrations including 064 — the row lock and the CASE in defer_job cannot be
 shown with a mock.
 """
 

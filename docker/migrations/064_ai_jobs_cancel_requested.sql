@@ -1,4 +1,4 @@
--- 063 — Abbruchwunsch fuer laufende Jobs (BR10b S1, Haus Dev, 2026-10-10)
+-- 064 — Abbruchwunsch fuer laufende Jobs (BR10b S1, Haus Dev, 2026-10-10)
 --
 -- DELETE /v1/jobs/{id} bricht nur 'pending' ab; ein 'running' Job bekommt 409.
 -- Stellt sich dieser Job danach selbst zurueck (defer_job: running -> pending,

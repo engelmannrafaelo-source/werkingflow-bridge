@@ -533,7 +533,7 @@ async def test_internal_routes_cancel_and_conditional_claim(monkeypatch):
 _JOBS_DDL = [
     REPO / "docker" / "migrations" / "031_ai_jobs.sql",
     REPO / "docker" / "migrations" / "044_ai_jobs_dependency_deferral.sql",
-    REPO / "docker" / "migrations" / "063_ai_jobs_cancel_requested.sql",
+    REPO / "docker" / "migrations" / "064_ai_jobs_cancel_requested.sql",
 ]
 
 
