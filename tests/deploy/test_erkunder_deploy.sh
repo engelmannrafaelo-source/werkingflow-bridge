@@ -239,6 +239,8 @@ phase_distribution_test() { :; }
 phase_access_canary() { :; }
 phase_worker_config_selftest() { :; }
 write_release_manifest() { :; }
+measure_pool_before_deploy() { :; }
+record_deploy_proof() { echo "proof $2 $3" >> "$commands"; }
 deploy_one_service() { echo "deploy $3" >> "$commands"; }
 rssh() { echo "remote $*" >> "$commands"; echo synthetic; }
 : > "$commands"
@@ -246,4 +248,5 @@ deploy_server hetzner
 [[ "${DEPLOYED_SERVICES[*]}" == 'worker1 nginx' ]]
 [[ $(grep -c '^deploy ' "$commands") == 2 ]]
 ! grep -Eq 'protocol-probe|stop erkunder|build erkunder|--legacy-idle' "$commands"
+grep -q '^proof hetzner synthetic' "$commands"
 echo 'PASS full Bridge deploy with explicit non-Erkunder list reaches SUCCESS'

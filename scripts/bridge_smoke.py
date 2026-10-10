@@ -92,6 +92,12 @@ class ProbeResult:
     # infrastructure STATE, not a verdict on the deployed code.
     capacity_reason: Optional[str] = None
     retry_after_s: Optional[int] = None
+    # Who wrote the refusal (envelope `source`/`bridge_type`). Only
+    # bridge_nginx/pool_exhausted is the LB's pool router refusing BEFORE the
+    # request reached the image; bridge_account comes from a worker, i.e. from
+    # the image under test itself (BR6SR MUSS 1).
+    capacity_source: Optional[str] = None
+    capacity_bridge_type: Optional[str] = None
     # Set ONLY by classify_dependency_failures(): the probe failed because the
     # privacy-service dependency was itself unreachable, proven by an
     # independent check. Same class as capacity_reason — infrastructure STATE,
@@ -315,9 +321,12 @@ def capacity_result(name: str, ep: str, r, ms: Optional[int]) -> Optional[ProbeR
     if not cap:
         return None
     reason, retry_after = cap
+    err = (r.json() or {}).get("error") or {}  # capacity_envelope proved it is JSON
     return ProbeResult(name, ep, False,
                        f"pool capacity unavailable ({reason}) — endpoint not exercised",
-                       r.status_code, ms, capacity_reason=reason, retry_after_s=retry_after)
+                       r.status_code, ms, capacity_reason=reason, retry_after_s=retry_after,
+                       capacity_source=err.get("source"),
+                       capacity_bridge_type=err.get("bridge_type"))
 
 
 @dataclass
@@ -735,7 +744,7 @@ def run(base_url: str, profile: str, only: Optional[str], extra_header: dict, at
         expect_bridge: str = "", served_by_required: bool = True) -> list:
     ctx = Ctx(base_url=base_url.rstrip("/"), api_key=resolve_api_key(), extra_header=extra_header,
               expect_bridge=expect_bridge, served_by_required=served_by_required)
-    selected = [p for p in PROBES if (profile in p.profiles) and (only is None or p.name == only)]
+    selected = [p for p in PROBES if (profile in p.profiles) and (only is None or p.name in only.split(","))]
     results = []
     for p in selected:
         last = None
@@ -808,7 +817,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--base-url", required=True)
     ap.add_argument("--profile", default="hetzner", choices=["hetzner", "server2"])
-    ap.add_argument("--only", default=None, help="run a single probe by name")
+    ap.add_argument("--only", default=None, help="run only these probes (comma-separated names)")
     ap.add_argument("--extra-header", action="append", default=[],
                     help="repeatable, e.g. 'X-Priority: production' or 'X-Bridge-Hop: 1'")
     ap.add_argument("--expect-bridge", default="",
@@ -875,9 +884,14 @@ def main():
                 print(f"  repro[{r.name}]: {r.repro}", file=sys.stderr)
         # Still exit 1 — this script cannot tell an empty pool from an image
         # that starves its own router. The marker only says the failure set
-        # consists of nothing but pool-gate refusals; bridge-deploy.sh then
-        # measures the pool in the router's own state and decides (BR6S).
-        if all(r.capacity_reason and r.name in POOL_GATED_PROBES for r in failures):
+        # consists of nothing but the LB pool router's own refusals
+        # (bridge_nginx/pool_exhausted, written before the request reaches the
+        # image); bridge-deploy.sh then compares the pool before and after the
+        # deploy and decides (BR6S, BR6Sb). A worker's refusal (bridge_account)
+        # is the image under test speaking — no marker.
+        if all(r.capacity_reason and r.name in POOL_GATED_PROBES
+               and r.capacity_source == "bridge_nginx"
+               and r.capacity_bridge_type == "pool_exhausted" for r in failures):
             names = ", ".join(f"{r.name}({r.capacity_reason})" for r in failures)
             print(f"SMOKE_POOL_REFUSED_ONLY: {names}", file=sys.stderr)
         sys.exit(1)
