@@ -130,7 +130,10 @@ async def test_pin_read_opts_into_the_bounded_retry():
     call = AsyncMock(return_value=_resp(200, {"providerConfig": None}))
     with patch.object(upo, "call_platform", new=call):
         await upo.get_user_provider_config(uid)
-    assert call.await_args.kwargs["retries"] == 1
+    # Bounded, and long enough for one platform-api restart (BR8, 10.10.2026).
+    from src.platform_client import RESTART_BRIDGING_BACKOFFS_S
+    assert call.await_args.kwargs["retries"] == len(RESTART_BRIDGING_BACKOFFS_S)
+    assert call.await_args.kwargs["retry_backoff_s"] == RESTART_BRIDGING_BACKOFFS_S
 
 
 @pytest.mark.asyncio

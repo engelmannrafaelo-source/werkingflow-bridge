@@ -40,9 +40,14 @@ class ExecutorHTTPError(RuntimeError):
         message: str,
         retry_after_s: Optional[float] = None,
         rejection: Optional[str] = None,
+        dependency: Optional[str] = None,
     ):
         super().__init__(message)
         self.status_code = status_code
+        # Which dependency could not answer (424 only), as named by the
+        # endpoint in DEPENDENCY_UNAVAILABLE_HEADER. The runner picks its
+        # patience by it (registry.DEPENDENCY_PATIENCE).
+        self.dependency = dependency
         # The upstream's own Retry-After, when it sent one. The job runner uses
         # it to schedule a capacity retry (registry._capacity_retry_delay)
         # instead of guessing — the bridge knows when its limit window resets,
@@ -53,6 +58,28 @@ class ExecutorHTTPError(RuntimeError):
         # account, reason, and what the LB re-dispatch saw). Set only on
         # capacity refusals; the runner logs it on the defer line.
         self.rejection = rejection
+
+
+def _raise_if_dependency_unavailable(response: Any, path: str) -> None:
+    """The endpoint said: "a dependency did not answer, nothing was decided".
+    Raise that as a 424, whatever the HTTP status: research answers it with
+    200 and chat with 503. The job runner parks a 424 and runs the job again
+    later (registry, dependency deferral) instead of failing it for good.
+
+    Before 10.10.2026 a dev-origin research job on a prod worker died for good
+    because the dev platform-api was being recreated by a deploy for about 3 s
+    (BR7)."""
+    from src.platform_client import DEPENDENCY_UNAVAILABLE_HEADER
+
+    dependency = response.headers.get(DEPENDENCY_UNAVAILABLE_HEADER)
+    if not dependency:
+        return
+    raise ExecutorHTTPError(
+        424,
+        f"self-call {path}: dependency {dependency!r} temporarily unavailable "
+        f"(HTTP {response.status_code}): {response.text[:300]}",
+        dependency=dependency,
+    )
 
 
 # The worker serves its own FastAPI app here (bypasses the nginx LB + its capacity
@@ -327,6 +354,7 @@ async def chat_executor(
             client, "/v1/chat/completions", body, headers
         )
 
+    _raise_if_dependency_unavailable(response, "/v1/chat/completions")
     if response.status_code >= 400:
         # Surface the upstream status + a trimmed body so the job error is actionable.
         detail = response.text[:500]
@@ -401,6 +429,7 @@ async def _self_post_json(
             client, path, body, headers
         )
 
+    _raise_if_dependency_unavailable(response, path)
     if response.status_code >= 400:
         raise ExecutorHTTPError(
             response.status_code,

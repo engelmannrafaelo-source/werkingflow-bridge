@@ -2673,7 +2673,9 @@ async def chat_completions(
         # BEFORE backend resolution; a pin failure is 503, never a fallback.
         from src.routing.user_provider_override import (
             enforce_user_provider_override, UserProviderOverrideError,
+            ProviderConfigTemporarilyUnavailable, PROVIDER_CONFIG_DEPENDENCY,
         )
+        from src.platform_client import DEPENDENCY_UNAVAILABLE_HEADER
         user_pinned_provider = None
         # The REAL operator pin from users.provider_config, kept separate from
         # user_pinned_provider on purpose: the app-level policy below also
@@ -2700,6 +2702,23 @@ async def chat_completions(
         try:
             user_pinned_provider = await enforce_user_provider_override(request, request_body)
             operator_pinned_provider = user_pinned_provider
+        except ProviderConfigTemporarilyUnavailable as e:
+            # Same refusal, but retryable: the pin is unknown because platform-api
+            # did not answer (a restart, BR7 10.10.2026), not because it forbids
+            # anything. The header lets a chat job park instead of dying.
+            raise HTTPException(
+                status_code=503,
+                detail={
+                    "error": {
+                        "message": _mark_retryable(str(e)),
+                        "type": "configuration_error",
+                        "code": "user_provider_override_unavailable",
+                        "retryable": True,
+                        "hint": "The user's provider pin could not be looked up right now (platform-api temporarily unavailable). Nothing was guessed; retry later.",
+                    }
+                },
+                headers={DEPENDENCY_UNAVAILABLE_HEADER: PROVIDER_CONFIG_DEPENDENCY},
+            )
         except UserProviderOverrideError as e:
             raise HTTPException(
                 status_code=503,
@@ -6301,6 +6320,7 @@ async def research(
     # a Bedrock-pinned user's research runs through the SDK-Bedrock env path.
     from src.routing.user_provider_override import (
         enforce_user_provider_override, UserProviderOverrideError,
+        ProviderConfigTemporarilyUnavailable, PROVIDER_CONFIG_DEPENDENCY,
         assert_bedrock_is_pinned, BedrockPinRequiredError,
         BedrockNonProdRefusedError,
         assert_bedrock_attribution_complete, BedrockAttributionIncompleteError,
@@ -6315,6 +6335,23 @@ async def research(
     try:
         _research_pinned = await enforce_user_provider_override(request, request_body)
         _research_operator_pinned = _research_pinned
+    except ProviderConfigTemporarilyUnavailable as e:
+        # Retryable, unlike the branch below: platform-api did not answer, so
+        # the pin is unknown, not forbidding. Marked for direct callers
+        # (_mark_retryable) and for the job executor (header → 424 → parked).
+        # Before 10.10.2026 this was a terminal EXECUTOR_ERROR (BR7).
+        from src.platform_client import DEPENDENCY_UNAVAILABLE_HEADER
+        return JSONResponse(
+            content=ResearchResponse(
+                status="error",
+                query=request_body.query,
+                model=request_body.model,
+                error=_mark_retryable(
+                    f"user provider pin not verifiable right now (no fallback by design): {e}"
+                ),
+            ).model_dump(),
+            headers={DEPENDENCY_UNAVAILABLE_HEADER: PROVIDER_CONFIG_DEPENDENCY},
+        )
     except UserProviderOverrideError as e:
         return ResearchResponse(
             status="error",
@@ -7054,8 +7091,26 @@ async def doc_agent(
     # Per-user provider pin: doc-agent has no Bedrock env path yet — a pinned
     # user gets an EXPLICIT error instead of silently running on Anthropic
     # (503-statt-Fallback, same invariant as chat/research).
-    from src.routing.user_provider_override import get_user_provider_config
-    _pin_config = await get_user_provider_config(request.headers.get("X-User-ID"))
+    from src.routing.user_provider_override import (
+        get_user_provider_config, ProviderConfigTemporarilyUnavailable,
+        PROVIDER_CONFIG_DEPENDENCY,
+    )
+    try:
+        _pin_config = await get_user_provider_config(request.headers.get("X-User-ID"))
+    except ProviderConfigTemporarilyUnavailable as e:
+        # Retryable: same contract as research (header → job parked).
+        from src.platform_client import DEPENDENCY_UNAVAILABLE_HEADER
+        return JSONResponse(
+            content=DocAgentResponse(
+                status="error",
+                question=request_body.question,
+                model=request_body.model,
+                error=_mark_retryable(
+                    f"user provider pin not verifiable right now (no fallback by design): {e}"
+                ),
+            ).model_dump(),
+            headers={DEPENDENCY_UNAVAILABLE_HEADER: PROVIDER_CONFIG_DEPENDENCY},
+        )
     if _pin_config:
         return DocAgentResponse(
             status="error",
@@ -10014,12 +10069,12 @@ async def http_exception_handler(request: Request, exc: StarletteHTTPException):
     detail = exc.detail
     # If detail is already a dict with our envelope shape, pass through.
     if isinstance(detail, dict) and "source" in detail:
-        return JSONResponse(status_code=exc.status_code, content={"error": detail})
+        response = JSONResponse(status_code=exc.status_code, content={"error": detail})
     # If detail is a dict with arbitrary fields, preserve them as extra.
-    if isinstance(detail, dict):
+    elif isinstance(detail, dict):
         message = detail.get("message") or detail.get("error") or str(detail)
         extra = {k: v for k, v in detail.items() if k not in ("message", "error")}
-        return bridge_error(
+        response = bridge_error(
             source=SOURCE_BRIDGE_INTERNAL,
             error_type=TYPE_INTERNAL,
             message=str(message),
@@ -10028,12 +10083,20 @@ async def http_exception_handler(request: Request, exc: StarletteHTTPException):
             extra=extra,
         )
     # Plain string detail
-    return bridge_error(
-        source=SOURCE_BRIDGE_INTERNAL,
-        error_type=TYPE_INTERNAL,
-        message=str(detail),
-        status_code=exc.status_code,
-    )
+    else:
+        response = bridge_error(
+            source=SOURCE_BRIDGE_INTERNAL,
+            error_type=TYPE_INTERNAL,
+            message=str(detail),
+            status_code=exc.status_code,
+        )
+    # Headers the raiser set (e.g. X-Bridge-Dependency-Unavailable, which turns
+    # a chat job's 503 into a parked job). Starlette's own handler keeps them; this
+    # one used to drop them. Headers the envelope already set win.
+    for name, value in (getattr(exc, "headers", None) or {}).items():
+        if name not in response.headers:
+            response.headers[name] = value
+    return response
 
 
 @app.exception_handler(Exception)

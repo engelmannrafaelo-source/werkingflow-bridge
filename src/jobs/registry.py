@@ -67,6 +67,24 @@ DEPENDENCY_UNAVAILABLE_STATUS = 424
 DEPENDENCY_RETRY_DELAY_S = 60
 DEPENDENCY_MAX_DEFERS = 240
 
+# Patience per named dependency (ExecutorHTTPError.dependency, set from the
+# endpoint's X-Bridge-Dependency-Unavailable header): (delay_s, max total waits).
+# Unnamed dependencies keep the defaults above.
+#
+# "provider-config": the user's provider pin, asked at the HOME bridge's
+# platform-api (ADR-0011). The request already retried for about 7.5 s
+# (platform_client.RESTART_BRIDGING_BACKOFFS_S), which covers a normal
+# platform-api restart (about 3 s, measured 10.10.2026, BR7). Arriving here means the home
+# platform-api has been gone for longer, e.g. a whole home bridge being
+# deployed (BR2D took about 10 min) or rebooted. 30 waits of 30 s: about 15 min of
+# patience, then the job fails loud (UPSTREAM_HTTP_424 with the reason). That is
+# not 4 h, because a customer run polling for this job wants an answer, and a
+# home bridge that is gone for more than a quarter hour is an outage someone has
+# to see.
+DEPENDENCY_PATIENCE: Dict[str, tuple] = {
+    "provider-config": (30, 30),
+}
+
 # ---------------------------------------------------------------------------
 # Capacity deferral (429 from the executor's self-call)
 # ---------------------------------------------------------------------------
@@ -104,6 +122,7 @@ CAPACITY_RETRY_DEFAULT_DELAY_S = 120
 async def _defer_job(
     job_id: str, kind: str, reason: str, delay_s: int, what: str,
     rejected_by: Optional[str] = None,
+    max_defers: int = DEPENDENCY_MAX_DEFERS,
 ) -> bool:
     """Park a job that must WAIT (dependency down, or no account capacity).
 
@@ -116,7 +135,7 @@ async def _defer_job(
     """
     job = await store_client.get_job(job_id)
     deferred_so_far = (job or {}).get("defer_count") or 0
-    if deferred_so_far >= DEPENDENCY_MAX_DEFERS:
+    if deferred_so_far >= max_defers:
         logger.error(
             f"💀 Async job {job_id} (kind={kind}) gave up after {deferred_so_far} "
             f"waits: {reason}"
@@ -128,7 +147,7 @@ async def _defer_job(
     who = rejected_by or f"worker={os.getenv('INSTANCE_NAME', 'unknown')}"
     logger.warning(
         f"⏸️ Async job {job_id} (kind={kind}) deferred {delay_s}s "
-        f"(wait {deferred_so_far + 1}/{DEPENDENCY_MAX_DEFERS}) — {what} — "
+        f"(wait {deferred_so_far + 1}/{max_defers}) — {what} — "
         f"rejected by: {who} — {reason[:200]}"
     )
     return True
@@ -249,8 +268,15 @@ async def _run_body(
         # once the dependency is back, instead of burning it terminally (which
         # is what made "defer the check until the GPU returns" impossible).
         if isinstance(e, ExecutorHTTPError) and e.status_code == DEPENDENCY_UNAVAILABLE_STATUS:
+            dependency = getattr(e, "dependency", None)
+            delay_s, max_defers = DEPENDENCY_PATIENCE.get(
+                dependency or "", (DEPENDENCY_RETRY_DELAY_S, DEPENDENCY_MAX_DEFERS)
+            )
             deferred = await _defer_job(
-                job_id, kind, str(e), DEPENDENCY_RETRY_DELAY_S, "dependency unreachable"
+                job_id, kind, str(e), delay_s,
+                f"dependency unreachable ({dependency})" if dependency
+                else "dependency unreachable",
+                max_defers=max_defers,
             )
             if deferred:
                 return
