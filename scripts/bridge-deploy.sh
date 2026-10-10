@@ -2,7 +2,12 @@
 # bridge-deploy.sh — Atomic idempotent multi-server Bridge deployment
 #
 # Usage: bridge-deploy.sh <server> [<service>...] [--dry-run] [--ack-foreign] [--force-prod-ahead]
+#        bridge-deploy.sh smoke-nachholen [--dry-run]
 #   server        = hetzner | server2 | both | prod-workers
+#   smoke-nachholen = deploys NOTHING: re-runs only the pool-gated probes an
+#     UNPROVEN hetzner deploy left open (.bridge-smoke-unproven) against the
+#     running dev build; green = the marker is lifted and .bridge-deployed-sha
+#     records the build as proven (catch_up_unproven_smoke).
 #   service       = optional, default = all services for the server
 #
 #   prod-workers = the ADR-0009 worker-host (168.119.178.70): LLM worker
@@ -19,6 +24,16 @@
 #   1 = deployment failure (rollback attempted and succeeded), or the
 #       foreign-commit gate aborted BEFORE any change was made
 #   2 = critical failure (rollback itself failed — manual intervention required)
+#   3 = DEPLOYED and standing, but UNPROVEN: the dev pool was measurably empty
+#       BEFORE and AFTER the worker swap, so the pool-gated smoke probes
+#       (research/chat) could not run against the new image. Everything else
+#       passed. Not a rollback, never a green (BR6S/BR6Sb, 2026-10-10):
+#       - .bridge-deployed-sha is NOT advanced (it is the dev-first proof that
+#         phase_prod_order_gate and deploy-production read); instead
+#         .bridge-smoke-unproven names SHA, open probes and reason.
+#       - `both` stops after hetzner — server2 never runs on an UNPROVEN dev.
+#       - `smoke-nachholen` re-runs the open probes later (0 = proven now,
+#         3 = still UNPROVEN, 1 = the probes are RED on the running build).
 set -euo pipefail
 
 # ============================================================================
@@ -35,6 +50,11 @@ REMOTE_REPO="/root/werkingflow-bridge"
 # SHA the running images were built from, written by a finished deploy. Untracked
 # on purpose (pre-flight allows untracked files) — it is host state, not source.
 DEPLOYED_SHA_FILE="${REMOTE_REPO}/.bridge-deployed-sha"
+# Written INSTEAD of advancing DEPLOYED_SHA_FILE when a hetzner deploy stays
+# UNPROVEN (exit 3): sha=, seit=, probes=, grund=. Removed by the next clean
+# deploy or a green `smoke-nachholen`. Its presence = dev runs a build whose
+# pool-gated probes never passed; the prod gates treat that as no proof.
+SMOKE_UNPROVEN_FILE="${REMOTE_REPO}/.bridge-smoke-unproven"
 # Per-SERVICE release manifest (commit + image ID per container), written by a
 # finished deploy. Same "host state, not source" rule as DEPLOYED_SHA_FILE —
 # untracked, never captured back into the repo. See write_release_manifest()
@@ -145,6 +165,19 @@ WORKERHOST_NEEDS_BUILD="metrics-reader worker-sahori worker-kurt worker-coach wo
 # State (reset per server in deploy_server)
 ROLLBACK_SHA=""
 DEPLOYED_SERVICES=()
+# Per run, NOT reset per server: one line per smoke that stayed UNPROVEN because
+# the pool was empty. Non-empty = exit 3 at the end (see EXIT CODES).
+SMOKE_UNPROVEN=()
+# Probe names (csv) that stayed UNPROVEN on hetzner — written into
+# SMOKE_UNPROVEN_FILE, re-run by smoke-nachholen.
+SMOKE_UNPROVEN_PROBES=""
+# Pool state measured with the OLD image, before Phase 4 swaps the workers
+# (measure_pool_before_deploy). An empty pool afterwards only excuses refusals
+# if it was already empty before: the post-deploy state comes from the new
+# image's own metrics and cannot vouch for that image (BR6SR MUSS 1).
+POOL_PRE_DEPLOY_STATE="UNKNOWN"   # EXHAUSTED | AVAILABLE | UNKNOWN
+POOL_PRE_DEPLOY_LINE="not measured"
+POOL_PRE_DEPLOY_JSON=""
 # Phase 0 inspects THIS checkout, not a host — one verdict covers `both`.
 TOOLING_GATE_DONE="false"
 
@@ -261,13 +294,14 @@ for arg in "$@"; do
         --dry-run) DRY_RUN=true ;;
         --ack-foreign) ACK_FOREIGN=true ;;
         --force-prod-ahead) FORCE_PROD_AHEAD=true ;;
-        hetzner|server2|both|prod-workers) SERVER="$arg" ;;
+        hetzner|server2|both|prod-workers|smoke-nachholen) SERVER="$arg" ;;
         *) SERVICES_ARG+=("$arg") ;;
     esac
 done
 
 if [[ -z "$SERVER" ]]; then
     echo "Usage: bridge-deploy.sh <hetzner|server2|both|prod-workers> [service...] [--dry-run] [--ack-foreign] [--force-prod-ahead]" >&2
+    echo "       bridge-deploy.sh smoke-nachholen [--dry-run]   (re-run the probes an UNPROVEN hetzner deploy left open)" >&2
     echo "  --ack-foreign      proceed even though the deploy ships commits by other authors" >&2
     echo "  --force-prod-ahead override the dev-first order gate (typed TTY confirmation required)" >&2
     exit 1
@@ -300,7 +334,7 @@ acquire_deploy_lock() {
     printf 'pid=%s started=%s user=%s\n' "$$" "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$(whoami)" >&"$fd"
 }
 case "$SERVER" in
-    hetzner)      acquire_deploy_lock "hetzner" 210 ;;
+    hetzner|smoke-nachholen) acquire_deploy_lock "hetzner" 210 ;;
     server2)      acquire_deploy_lock "server2" 211 ;;
     both)         acquire_deploy_lock "hetzner" 210; acquire_deploy_lock "server2" 211 ;;
     prod-workers) acquire_deploy_lock "prod-workers" 212 ;;
@@ -378,8 +412,17 @@ phase_prod_order_gate() {
         return 1
     fi
 
-    if git -C "$repo_dir" merge-base --is-ancestor "$target_sha" "$dev_sha"; then
+    # An UNPROVEN hetzner deploy does not advance DEPLOYED_SHA_FILE, so dev_sha
+    # is still the last PROVEN build. The marker only sharpens the message — and
+    # catches a DEPLOYED_SHA_FILE that names the unproven build itself.
+    local unproven unproven_sha
+    unproven="$(rssh "$HETZNER_HOST" "cat ${SMOKE_UNPROVEN_FILE} 2>/dev/null" || true)"
+    unproven_sha="$(sed -n 's/^sha=//p' <<< "$unproven" | head -1 | tr -d '[:space:]')"
+    if [[ -n "$unproven" && -n "$unproven_sha" && "$dev_sha" == "$unproven_sha"* ]]; then
+        error_ "Dev bridge's deployed-SHA marker names ${dev_sha:0:9}, which ${SMOKE_UNPROVEN_FILE} lists as UNPROVEN."
+    elif git -C "$repo_dir" merge-base --is-ancestor "$target_sha" "$dev_sha"; then
         info "OK: target ${target_sha:0:9} already runs on the dev bridge (deployed: ${dev_sha:0:9})."
+        [[ -n "$unproven" ]] && warn "  Note: dev currently runs a newer UNPROVEN build (${unproven_sha:0:9}); the target is covered by the proven ${dev_sha:0:9}."
         return 0
     fi
 
@@ -388,6 +431,12 @@ phase_prod_order_gate() {
     error_ "BLOCKED by the dev-first order gate: the target ref does NOT run on the dev bridge yet."
     error_ "  Target (origin/develop) : ${target_sha}"
     error_ "  Dev bridge runs         : ${dev_sha} (${behind} commit(s) behind the target)"
+    if [[ -n "$unproven" ]]; then
+        error_ "  NO STAGING PROOF: dev runs ${unproven_sha:0:9}, but its pool-gated smoke"
+        error_ "  probes never passed (UNPROVEN, ${SMOKE_UNPROVEN_FILE}):"
+        while IFS= read -r line; do error_ "    ${line}"; done <<< "$unproven"
+        error_ "  Prove it first: 'bridge-deploy.sh smoke-nachholen' once the dev pool has capacity."
+    fi
     error_ "  The order is deliberate (Rafael, 2026-08-20): deploy hetzner first, verify,"
     error_ "  THEN prod — or run 'bridge-deploy.sh both', which does exactly that."
     if [[ "$DRY_RUN" == "true" ]]; then
@@ -1035,18 +1084,22 @@ deployed_bridge_id() {
     echo "$id"
 }
 
-# phase_smoke_test <label> <url> <expect-bridge> <required|optional> [header...]
+# phase_smoke_test <label> <url> <expect-bridge> <required|optional> <pool-host> <pool-lb> [header...]
 #   expect-bridge  bridge id that must answer research/chat (X-Bridge-Served-By)
 #   required       a missing stamp FAILS (the answering workers were deployed in
 #                  this run); optional = reported UNPROVEN, no rollback (server2:
 #                  its prod workers deploy separately via prod-workers)
+#   pool-host/-lb  host + LB container whose pool router judges the pool-gated
+#                  probes; "-" "-" = no empty-pool exception (smoke_pool_unproven)
 #   header         extra request headers, e.g. "X-Bridge-Hop: 1"
 phase_smoke_test() {
     local label="$1"
     local url="$2"
     local expect_bridge="$3"
     local served_by="$4"
-    shift 4
+    local pool_host="$5"
+    local pool_lb="$6"
+    shift 6
     local headers=("$@")
 
     step "Phase 5: Smoke test (${label} @ ${url}, must be answered by bridge '${expect_bridge}')"
@@ -1127,6 +1180,32 @@ phase_smoke_test() {
         return 0
     fi
 
+    # Nothing but the LB pool router's own refusals: the smoke alone cannot
+    # tell "pool empty" from "this image starves its router". Measured, not
+    # guessed — see smoke_pool_unproven: the pool must have been empty BEFORE
+    # the worker swap and still be empty, the router's view complete, and every
+    # deployed worker green and stamped on the unpooled path. Everything else
+    # falls through to FAIL.
+    if [[ "$pool_host" != "-" ]] && grep -q '^SMOKE_POOL_REFUSED_ONLY:' <<< "$smoke_out"; then
+        while IFS= read -r line; do warn "  smoke: ${line}"; done <<< "$smoke_out"
+        if smoke_pool_unproven "$pool_host" "$pool_lb" "$url" "$expect_bridge"; then
+            local refused
+            refused=$(grep '^SMOKE_POOL_REFUSED_ONLY:' <<< "$smoke_out" | head -1)
+            refused="${refused#SMOKE_POOL_REFUSED_ONLY: }"
+            SMOKE_UNPROVEN+=("${label}: pool-gated probes UNPROVEN — ${refused}; ${POOL_VERDICT}")
+            SMOKE_UNPROVEN_PROBES=$(grep -oE '[a-z_]+\(' <<< "$refused" | tr -d '(' | paste -sd, -)
+            warn "SMOKE_POOL_UNPROVEN: ${label} — the pool-gated probes (${refused}) were refused"
+            warn "  because the pool is EMPTY, before and after the deploy (${POOL_VERDICT})."
+            warn "  NOT a pass, NOT a rollback: health, served_by stamp and routing to bridge"
+            warn "  '${expect_bridge}' are green and every other probe passed, but nothing proves"
+            warn "  this image can serve research/chat. Deploy stays; run exits 3; the dev-first"
+            warn "  proof (.bridge-deployed-sha) is NOT advanced."
+            warn "  Catch up once the pool recovers: scripts/bridge-deploy.sh smoke-nachholen"
+            return 0
+        fi
+        error_ "  Pool refusals are NOT excused (${POOL_VERDICT}) — treating as a code failure"
+    fi
+
     while IFS= read -r line; do error_ "  smoke: ${line}"; done <<< "$smoke_out"
     error_ "Smoke test FAILED for ${label}"
 
@@ -1192,6 +1271,212 @@ phase_access_canary() {
     return 0
 }
 
+# fetch_pool_router_state <host> <lb-container>
+# The router's OWN view: the pool snapshot choose() decides on, plus whether it
+# is fresh. Raw JSON on stdout; non-zero (reason on stdout) if unreachable.
+fetch_pool_router_state() {
+    local host="$1" lb_container="$2" raw rc=0
+    raw=$(rssh "$host" "docker exec '${lb_container}' curl -sf http://127.0.0.1/internal/pool-router/state" 2>&1) || rc=$?
+    if [[ $rc -ne 0 || -z "$raw" ]]; then
+        echo "rc=${rc}: ${raw}"
+        return 1
+    fi
+    printf '%s\n' "$raw"
+}
+
+# pool_router_exhaustion — reads STATE_JSON (fetch_pool_router_state output),
+# optionally PRE_STATE_JSON (the same, measured before the deploy).
+#   exit 0  POOL_EXHAUSTED: the router has a fresh, COMPLETE view and no account
+#           in it is eligible — exactly the state in which choose() refuses
+#   exit 1  POOL_AVAILABLE: at least one account eligible, or no accounts at all
+#           (choose() then round-robins and never refuses)
+#   exit 2  POOL_UNKNOWN: unparseable, blind, stale, or incomplete — a worker
+#           missing from the snapshot (`errors`) or an account set that differs
+#           from PRE_STATE_JSON is a partial outage, not an empty pool
+# Eligibility mirrors pick_weighted_account() in docker/lua/pool_pick.lua
+# (available, cooldown 0, headroom > est_tokens, weekly hard wall only on a real
+# reading). est_tokens = 500: the floor of choose()'s max(500, len/4), which the
+# smoke's small research/chat bodies sit at. Freshness mirrors
+# STALE_THRESHOLD_S = 10 in docker/lua/pool_router.lua: beyond it the router
+# round-robins and never refuses. Change both together.
+pool_router_exhaustion() {
+    STATE_JSON="${STATE_JSON:-}" PRE_STATE_JSON="${PRE_STATE_JSON:-}" python3 - <<'PYEOF'
+import json, os, sys
+WALL, EST, STALE_S = 96, 500, 10
+try:
+    d = json.loads(os.environ.get("STATE_JSON", ""))
+    if not isinstance(d, dict):
+        raise ValueError(f"top level is {type(d).__name__}")
+except Exception as e:
+    print(f"POOL_UNKNOWN: router state is not a JSON object: {e}"); sys.exit(2)
+status = d.get("last_refresh_status", "unknown")
+try:
+    age = float(d.get("state_age_s"))
+except (TypeError, ValueError):
+    print(f"POOL_UNKNOWN: router state has no usable state_age_s ({d.get('state_age_s')!r})"); sys.exit(2)
+if status != "ok" or age >= STALE_S:
+    print(f"POOL_UNKNOWN: router blind or stale (last_refresh_status={status!r}, "
+          f"state_age_s={age:.1f} >= {STALE_S}?, err={d.get('last_refresh_err', '')!r})"); sys.exit(2)
+snap = d.get("last_state_snapshot") or {}
+errors = snap.get("errors")
+if errors:
+    print(f"POOL_UNKNOWN: snapshot is incomplete — workers missing from it (errors): {errors!r}")
+    sys.exit(2)
+accounts = snap.get("accounts")
+if not isinstance(accounts, dict) or not accounts:
+    print("POOL_AVAILABLE: router state lists no accounts — choose() round-robins, it never refuses")
+    sys.exit(1)
+pre_raw = os.environ.get("PRE_STATE_JSON", "")
+if pre_raw:
+    try:
+        pre = set(((json.loads(pre_raw).get("last_state_snapshot") or {}).get("accounts") or {}))
+    except Exception as e:
+        print(f"POOL_UNKNOWN: pre-deploy state unreadable: {e}"); sys.exit(2)
+    if pre != set(accounts):
+        print(f"POOL_UNKNOWN: account set changed across the deploy "
+              f"(before: {sorted(pre)}, after: {sorted(accounts)})"); sys.exit(2)
+eligible, why = [], []
+for name, a in sorted(accounts.items()):
+    a = a or {}
+    cooldown = float(a.get("cooldown_remaining_s") or 0)
+    headroom = float(a.get("effective_cap_tokens") or 0) - float(a.get("current_in_flight_tokens") or 0)
+    wk = a.get("weekly_percent")
+    past_wall = a.get("usage_known") is True and wk is not None and float(wk) >= WALL
+    if a.get("available") and cooldown == 0 and headroom > EST and not past_wall:
+        eligible.append(name)
+    else:
+        why.append(f"{name}: " + ("unavailable" if not a.get("available") else
+                                  f"cooldown {cooldown:.0f}s" if cooldown else
+                                  f"weekly {wk}%>={WALL}" if past_wall else
+                                  f"headroom {headroom:.0f}<={EST}"))
+if eligible:
+    print(f"POOL_AVAILABLE: {len(eligible)}/{len(accounts)} account(s) eligible: {', '.join(eligible)}")
+    sys.exit(1)
+print(f"POOL_EXHAUSTED: 0/{len(accounts)} accounts eligible (state_age_s={age:.1f}) — {'; '.join(why)}")
+sys.exit(0)
+PYEOF
+}
+
+# probe_unpooled_stamp <url> <expect-bridge> [worker...]
+# The worker path WITHOUT the pool gate: /health goes to the local worker pool
+# (claude_workers), not through pool_router.choose(). 200 + X-Bridge-Served-By
+# of the expected bridge = the new workers are up, stamp, and the LB routes to
+# them — the three things that stay provable while the pool is empty.
+# claude_workers round-robins, so one call proves ONE worker: with a worker
+# list, /health is asked until every listed worker has answered green with the
+# right stamp (at most 4 calls per worker). Any red answer ends it at once.
+probe_unpooled_stamp() {
+    local url="$1" expect_bridge="$2"
+    shift 2
+    local want=("$@") seen=() hdrs rc code served part w tries=0 max_tries
+    max_tries=$(( ${#want[@]} > 0 ? 4 * ${#want[@]} : 1 ))
+    while (( tries < max_tries )); do
+        tries=$((tries + 1))
+        rc=0
+        hdrs=$(curl -sS -o /dev/null -D - --max-time 20 -H "X-Bridge-Hop: 1" "${url}/health" 2>&1) || rc=$?
+        if [[ $rc -ne 0 ]]; then
+            POOL_VERDICT="health probe failed (curl rc=${rc}): ${hdrs//$'\n'/ }"
+            return 1
+        fi
+        code=$(awk 'toupper($1) ~ /^HTTP\// {c=$2} END {print c}' <<< "$hdrs")
+        served=$(awk 'tolower($1) == "x-bridge-served-by:" {v=$2} END {print v}' <<< "${hdrs//$'\r'/}")
+        if [[ "$code" != "200" ]]; then
+            POOL_VERDICT="health HTTP ${code:-none} (expected 200)"
+            return 1
+        fi
+        if [[ -z "$served" ]]; then
+            POOL_VERDICT="health answered without X-Bridge-Served-By — cannot prove bridge '${expect_bridge}' answered"
+            return 1
+        fi
+        for part in ${served//,/ }; do
+            if [[ "${part%%/*}" != "$expect_bridge" ]]; then
+                POOL_VERDICT="health answered by '${served}', expected bridge '${expect_bridge}'"
+                return 1
+            fi
+            [[ " ${seen[*]} " == *" ${part#*/} "* ]] || seen+=("${part#*/}")
+        done
+        local missing=()
+        for w in "${want[@]}"; do
+            [[ " ${seen[*]} " == *" ${w} "* ]] || missing+=("$w")
+        done
+        if (( ${#missing[@]} == 0 )); then
+            POOL_VERDICT="health 200 served_by ${expect_bridge}/{$(IFS=,; echo "${seen[*]}")} (${tries} call(s))"
+            return 0
+        fi
+    done
+    POOL_VERDICT="health green, but deployed worker(s) ${missing[*]} never answered in ${tries} call(s) (seen: ${seen[*]}) — not proven up and routed"
+    return 1
+}
+
+# measure_pool_before_deploy <host> <lb-container>
+# Runs BEFORE Phase 4, while the OLD image still serves the pool state. Sets
+# POOL_PRE_DEPLOY_{STATE,LINE,JSON}. Never fails the deploy: an unmeasurable
+# pool only means an empty pool after the deploy will NOT be excused.
+measure_pool_before_deploy() {
+    local host="$1" lb_container="$2" raw out rc=0
+    POOL_PRE_DEPLOY_STATE="UNKNOWN"
+    POOL_PRE_DEPLOY_JSON=""
+    if [[ "$DRY_RUN" == "true" ]]; then
+        POOL_PRE_DEPLOY_LINE="not measured (dry-run)"
+        info "[DRY-RUN] Would measure the pool before the worker swap (${lb_container} on ${host})"
+        return 0
+    fi
+    if ! raw=$(fetch_pool_router_state "$host" "$lb_container"); then
+        POOL_PRE_DEPLOY_LINE="POOL_UNKNOWN: pre-deploy state unreadable (${raw})"
+    else
+        out=$(STATE_JSON="$raw" pool_router_exhaustion 2>&1) || rc=$?
+        POOL_PRE_DEPLOY_LINE=$(grep -E '^POOL_(EXHAUSTED|AVAILABLE|UNKNOWN):' <<< "$out" | head -1)
+        POOL_PRE_DEPLOY_LINE="${POOL_PRE_DEPLOY_LINE:-POOL_UNKNOWN: ${out}}"
+        case $rc in
+            0) POOL_PRE_DEPLOY_STATE="EXHAUSTED"; POOL_PRE_DEPLOY_JSON="$raw" ;;
+            1) POOL_PRE_DEPLOY_STATE="AVAILABLE" ;;
+        esac
+    fi
+    info "Pool before the worker swap: ${POOL_PRE_DEPLOY_LINE}"
+    return 0
+}
+
+# smoke_pool_unproven <host> <lb-container> <url> <expect-bridge>
+# 0 = the pool was measurably empty BEFORE the worker swap (old image's view,
+#     measure_pool_before_deploy) AND is still empty now with a complete,
+#     fresh router view of the same accounts, AND every deployed worker answers
+#     the unpooled path green and stamped: the smoke's pool refusals are STATE,
+#     not a verdict on the image (UNPROVEN, no rollback)
+# 1 = anything else — the refusals stand as a failure (rollback as before).
+#     In particular "empty only after the deploy" is the new image's own
+#     metrics speaking and can be that image starving its router.
+# Reason for the log in POOL_VERDICT either way.
+smoke_pool_unproven() {
+    local host="$1" lb_container="$2" url="$3" expect_bridge="$4"
+    local state_raw pool_out pool_rc=0 pool_line svc workers=()
+    POOL_VERDICT=""
+    info "  pool before the deploy: ${POOL_PRE_DEPLOY_LINE}"
+    if [[ "$POOL_PRE_DEPLOY_STATE" != "EXHAUSTED" ]]; then
+        POOL_VERDICT="pool was NOT proven empty before the deploy (${POOL_PRE_DEPLOY_LINE}) — an empty pool only after the worker swap is the new image's own report and cannot excuse it"
+        return 1
+    fi
+    if ! state_raw=$(fetch_pool_router_state "$host" "$lb_container"); then
+        POOL_VERDICT="pool state unreadable (${state_raw}) — empty pool not proven"
+        return 1
+    fi
+    pool_out=$(STATE_JSON="$state_raw" PRE_STATE_JSON="$POOL_PRE_DEPLOY_JSON" pool_router_exhaustion 2>&1) || pool_rc=$?
+    pool_line=$(grep -E '^POOL_(EXHAUSTED|AVAILABLE|UNKNOWN):' <<< "$pool_out" | head -1)
+    info "  pool after the deploy:  ${pool_line:-${pool_out}}"
+    if [[ $pool_rc -ne 0 ]]; then
+        POOL_VERDICT="${pool_line:-pool check failed: ${pool_out}}"
+        return 1
+    fi
+    for svc in "${DEPLOYED_SERVICES[@]}"; do
+        [[ "$svc" == worker* ]] && workers+=("$svc")
+    done
+    if ! probe_unpooled_stamp "$url" "$expect_bridge" "${workers[@]}"; then
+        POOL_VERDICT="pool empty, but ${POOL_VERDICT}"
+        return 1
+    fi
+    POOL_VERDICT="${pool_line#POOL_EXHAUSTED: }; before the deploy too; ${POOL_VERDICT}"
+    return 0
+}
+
 # check_pool_router_state <host> <lb-container>
 # The account gate (ADR-0010's customer protection) only works while the Lua
 # router can load the pool state from the metrics-reader. A blind router still
@@ -1206,12 +1491,10 @@ check_pool_router_state() {
     fi
     info "Checking /internal/pool-router/state on ${host} (via docker exec ${lb_container})..."
     local state_raw
-    state_raw=$(rssh "$host" "docker exec '${lb_container}' curl -sf http://127.0.0.1/internal/pool-router/state" 2>&1)
-    local rc_state=$?
-    if [[ $rc_state -ne 0 ]] || [[ -z "$state_raw" ]]; then
-        error_ "Failed to reach /internal/pool-router/state via docker exec (rc=${rc_state}): ${state_raw}"
+    state_raw=$(fetch_pool_router_state "$host" "$lb_container") || {
+        error_ "Failed to reach /internal/pool-router/state via docker exec: ${state_raw}"
         return 1
-    fi
+    }
 
     info "  raw state: ${state_raw}"
 
@@ -1273,6 +1556,30 @@ phase_distribution_test() {
         info "[DRY-RUN] Would send 8 chat/completions calls and check /internal/pool-router/state"
         return 0
     fi
+
+    # Two independent checks. The router-state check used to sit behind the
+    # distribution verdict, so a red distribution (or the SKIP hatch) silently
+    # skipped it — a blind router went unreported exactly when the spread
+    # looked wrong (BR6R SOLLTE b). Both run; either red = red.
+    local rc_dist_test=0 rc_state=0
+    distribution_assertion "$url" "$expect_bridge" || rc_dist_test=$?
+    check_pool_router_state "$host" "$lb_container" || rc_state=$?
+
+    if [[ $rc_dist_test -ne 0 || $rc_state -ne 0 ]]; then
+        error_ "Distribution + State test FAILED (distribution rc=${rc_dist_test}, router state rc=${rc_state})"
+        return 1
+    fi
+    info "Distribution + State test PASSED"
+    return 0
+}
+
+# distribution_assertion <url> <expect-bridge>
+# 8 sequential chat/completions calls through the pool router; >=2 distinct
+# workers of <expect-bridge> = the router spreads load. 0 also for SKIP_DIST_TEST
+# and DIST_SKIP (both reported loudly).
+distribution_assertion() {
+    local url="$1"
+    local expect_bridge="$2"
 
     if [[ "$SKIP_DIST_TEST" == "true" ]]; then
         warn "SKIP_DIST_TEST=true — skipping distribution test (escape hatch active)"
@@ -1478,10 +1785,6 @@ PYEOF
         error_ "Distribution test FAILED — pool router not spreading load across workers"
         return 1
     fi
-
-    check_pool_router_state "$host" "$lb_container" || return 1
-
-    info "Distribution + State test PASSED"
     return 0
 }
 
@@ -1909,6 +2212,102 @@ EOF
     return 0
 }
 
+# record_deploy_proof <host> <server-name> <sha> — Phase 7's host markers.
+# UNPROVEN (exit 3) is NOT proof: DEPLOYED_SHA_FILE is also the dev-first
+# evidence phase_prod_order_gate and deploy-production read. It keeps naming
+# the last PROVEN build; SMOKE_UNPROVEN_FILE says what runs instead and what is
+# missing. A clean deploy writes DEPLOYED_SHA_FILE and clears that file.
+record_deploy_proof() {
+    local host="$1" server_name="$2" sha="$3"
+    if [[ "$server_name" == "hetzner" && -n "$SMOKE_UNPROVEN_PROBES" ]]; then
+        write_smoke_unproven_marker "$host" "$sha" \
+            || error_ "could not write ${SMOKE_UNPROVEN_FILE} on ${host} — the prod gates still see no proof (${DEPLOYED_SHA_FILE} was not advanced)"
+        warn "NOT recorded as proven: ${DEPLOYED_SHA_FILE} stays at the last proven build; ${SMOKE_UNPROVEN_FILE} names ${sha:0:9}"
+        return 0
+    fi
+    rssh "$host" "printf '%s\n' '${sha}' > ${DEPLOYED_SHA_FILE} && rm -f ${SMOKE_UNPROVEN_FILE}" \
+        || warn "could not record deployed SHA on ${host} — the foreign-commit gate will fall back to the checkout HEAD next time"
+}
+
+# write_smoke_unproven_marker <host> <sha>
+# SMOKE_UNPROVEN_FILE: what runs unproven, which probes are open and why.
+# Shipped base64-encoded: the reason carries quotes and parentheses.
+write_smoke_unproven_marker() {
+    local host="$1" sha="$2" reason="" u body b64
+    for u in "${SMOKE_UNPROVEN[@]}"; do [[ "$u" == hetzner:* ]] && reason="${u#hetzner: }"; done
+    body=$(printf 'sha=%s\nseit=%s\nprobes=%s\ngrund=%s\nnachholen=scripts/bridge-deploy.sh smoke-nachholen\n' \
+        "$sha" "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$SMOKE_UNPROVEN_PROBES" "${reason//$'\n'/ }")
+    b64=$(printf '%s\n' "$body" | base64 -w0)
+    rssh "$host" "echo '${b64}' | base64 -d > ${SMOKE_UNPROVEN_FILE}"
+}
+
+# catch_up_unproven_smoke — `bridge-deploy.sh smoke-nachholen`. Deploys and
+# rolls back NOTHING. Re-runs only the probes SMOKE_UNPROVEN_FILE lists against
+# the running dev build, with the same target/stamp rules as Phase 5.
+#   0 = all green (or nothing open): the build is recorded as proven
+#       (DEPLOYED_SHA_FILE = its SHA) and the marker is removed
+#   3 = still UNPROVEN (pool refused again, or only partly proven) — marker stays
+#   1 = the probes are RED on the running build, or the marker no longer
+#       describes what runs — marker stays; the decision (rollback/redeploy)
+#       is a human one, this command never touches a container
+catch_up_unproven_smoke() {
+    local host="$HETZNER_HOST" raw sha probes head bridge url smoke_out rc=0
+    step "Smoke nachholen (hetzner): pool-gated probes of an UNPROVEN deploy"
+    phase_tooling_freshness_gate || return 1
+    if ! raw=$(rssh "$host" "if [ -f ${SMOKE_UNPROVEN_FILE} ]; then cat ${SMOKE_UNPROVEN_FILE}; else echo __NONE__; fi"); then
+        error_ "Cannot read ${SMOKE_UNPROVEN_FILE} on ${host}: ${raw}"
+        return 1
+    fi
+    if [[ "$raw" == "__NONE__" ]]; then
+        info "No UNPROVEN marker on hetzner — nothing to catch up."
+        return 0
+    fi
+    while IFS= read -r line; do warn "  marker: ${line}"; done <<< "$raw"
+    sha=$(sed -n 's/^sha=//p' <<< "$raw" | head -1 | tr -d '[:space:]')
+    probes=$(sed -n 's/^probes=//p' <<< "$raw" | head -1 | tr -d '[:space:]')
+    if [[ ! "$sha" =~ ^[0-9a-f]{7,40}$ || ! "$probes" =~ ^[a-z_]+(,[a-z_]+)*$ ]]; then
+        error_ "Marker ${SMOKE_UNPROVEN_FILE} is malformed (sha='${sha}', probes='${probes}') — refusing to guess."
+        return 1
+    fi
+    head=$(rssh "$host" "cd ${REMOTE_REPO} && git rev-parse HEAD" | tr -d '[:space:]')
+    if [[ "$head" != "$sha"* ]]; then
+        error_ "Dev checkout is ${head:-unreadable}, the marker is for ${sha} — it no longer describes what runs."
+        error_ "  Redeploy hetzner (a clean deploy clears the marker) instead of proving a build that is gone."
+        return 1
+    fi
+    bridge=$(deployed_bridge_id "$host" "${HETZNER_SVC_nginx}") || return 1
+    source /root/.infisical/infisical-api.sh 2>/dev/null || true
+    url="${AI_BRIDGE_URL:-http://${HETZNER_HOST}:8000}"
+    if [[ "$DRY_RUN" == "true" ]]; then
+        info "[DRY-RUN] Would run: bridge_smoke.py --base-url ${url} --profile hetzner --only ${probes} --expect-bridge ${bridge} --extra-header 'X-Bridge-Hop: 1'"
+        return 0
+    fi
+    smoke_out=$(python3 "$(dirname "${BASH_SOURCE[0]}")/bridge_smoke.py" --base-url "$url" --profile hetzner \
+        --attempts 3 --only "$probes" --expect-bridge "$bridge" --extra-header "X-Bridge-Hop: 1" 2>&1) || rc=$?
+    if [[ $rc -eq 0 ]] && ! grep -qE '^SMOKE_(CAPACITY|DEPENDENCY|TARGET):' <<< "$smoke_out"; then
+        while IFS= read -r line; do info "  smoke: ${line}"; done <<< "$smoke_out"
+        rssh "$host" "printf '%s\n' '${head}' > ${DEPLOYED_SHA_FILE} && rm -f ${SMOKE_UNPROVEN_FILE}" || {
+            error_ "Probes green, but recording the proof on ${host} failed — the marker may still stand."
+            return 1
+        }
+        info "PROVEN: ${probes} green on ${head:0:9} (bridge '${bridge}'); ${DEPLOYED_SHA_FILE} = ${head:0:9}, marker removed."
+        return 0
+    fi
+    if [[ $rc -eq 0 ]] || grep -q '^SMOKE_POOL_REFUSED_ONLY:' <<< "$smoke_out"; then
+        while IFS= read -r line; do warn "  smoke: ${line}"; done <<< "$smoke_out"
+        warn "STILL UNPROVEN: ${probes} not (all) proven on ${head:0:9} — the pool still refuses. Marker stays; retry later."
+        return 3
+    fi
+    while IFS= read -r line; do error_ "  smoke: ${line}"; done <<< "$smoke_out"
+    if [[ $rc -ne 1 ]]; then
+        error_ "The smoke could not run (bridge_smoke.py exit ${rc}, see above) — nothing proven, nothing judged. Marker stays."
+        return 1
+    fi
+    error_ "RED: the pool-gated probes FAIL on the running dev build ${head:0:9}. Marker stays."
+    error_ "  This command rolls nothing back — decide deliberately: redeploy a fixed build, or roll hetzner back."
+    return 1
+}
+
 deploy_server() {
     local server_name="$1"
     local host compose all_services build_list server_prefix db_container
@@ -2038,6 +2437,15 @@ deploy_server() {
         }
     fi
 
+    # === Phase 4 prelude: pool state with the OLD image (hetzner only) ===
+    # The only pool reading the new image cannot have written. An empty pool
+    # after the deploy excuses refusals only if this one was empty too
+    # (smoke_pool_unproven, BR6SR MUSS 1).
+    POOL_PRE_DEPLOY_STATE="UNKNOWN"; POOL_PRE_DEPLOY_LINE="not measured"; POOL_PRE_DEPLOY_JSON=""
+    if [[ "$server_name" == "hetzner" ]]; then
+        measure_pool_before_deploy "$host" "${HETZNER_SVC_nginx}"
+    fi
+
     # === Phase 4: per-service deploy ===
     for svc in "${services_to_deploy[@]}"; do
         local container
@@ -2080,7 +2488,7 @@ deploy_server() {
         # smoke would judge prod instead of the build just deployed (BR2D §7).
         # The workers were deployed in this run, so their stamp is required.
         [[ -n "$hetzner_bridge" ]] && phase_smoke_test "hetzner" "${hetzner_url}" "${hetzner_bridge}" required \
-            "X-Bridge-Hop: 1" || {
+            "$host" "${HETZNER_SVC_nginx}" "X-Bridge-Hop: 1" || {
             error_ "Smoke test failed for hetzner — rolling back"
             if [[ ${#DEPLOYED_SERVICES[@]} -gt 0 ]]; then
                 phase_rollback "$host" "$compose" "$ROLLBACK_SHA" "$build_list" "${DEPLOYED_SERVICES[@]}"
@@ -2090,8 +2498,16 @@ deploy_server() {
             return 1
         }
 
-        phase_distribution_test "$host" "${hetzner_url}" "${HETZNER_SVC_nginx}" "${hetzner_bridge}" || \
-            warn "Distribution test FAILED — optimization signal only, NOT rolling back (smoke test passed, deployment succeeded)"
+        if ! phase_distribution_test "$host" "${hetzner_url}" "${HETZNER_SVC_nginx}" "${hetzner_bridge}"; then
+            if [[ -n "$SMOKE_UNPROVEN_PROBES" ]]; then
+                # The smoke did NOT pass: its pool-gated probes are UNPROVEN, and
+                # with the pool empty the 8 distribution chats get the same 429.
+                warn "Distribution test FAILED — expected while the pool is empty; NOT rolling back,"
+                warn "  but nothing here is proven either: the smoke is UNPROVEN (exit 3, smoke-nachholen)"
+            else
+                warn "Distribution test FAILED — optimization signal only, NOT rolling back (smoke test passed, deployment succeeded)"
+            fi
+        fi
 
         phase_access_canary "hetzner"
     elif [[ "$server_name" == "server2" ]]; then
@@ -2103,7 +2519,7 @@ deploy_server() {
         # missing stamp is UNPROVEN, not a failure — a server2 deploy must not
         # depend on a worker rollout.
         [[ -n "$server2_bridge" ]] && phase_smoke_test "server2" "http://${SERVER2_HOST}:8000" "${server2_bridge}" optional \
-            "X-Priority: production" || {
+            - - "X-Priority: production" || {
             error_ "Smoke test failed for server2 — rolling back"
             if [[ ${#DEPLOYED_SERVICES[@]} -gt 0 ]]; then
                 phase_rollback "$host" "$compose" "$ROLLBACK_SHA" "$build_list" "${DEPLOYED_SERVICES[@]}"
@@ -2157,6 +2573,10 @@ deploy_server() {
 
     # === Phase 7: Success report ===
     step "SUCCESS: ${server_name}"
+    local _u
+    for _u in "${SMOKE_UNPROVEN[@]}"; do
+        [[ "$_u" == "${server_name}:"* ]] && warn "NOT a clean success — UNPROVEN ${_u}"
+    done
     info "Deployed services : ${DEPLOYED_SERVICES[*]}"
     info "Pre-deploy SHA    : ${ROLLBACK_SHA}"
     if [[ "$DRY_RUN" == "false" ]]; then
@@ -2169,8 +2589,7 @@ deploy_server() {
         # observed on server2, where the checkout sat two commits ahead of the
         # running images. The foreign-commit gate compares against this marker,
         # so it must be written by the only thing that knows: a finished deploy.
-        rssh "$host" "printf '%s\n' '${current_sha}' > ${DEPLOYED_SHA_FILE}" \
-            || warn "could not record deployed SHA on ${host} — the foreign-commit gate will fall back to the checkout HEAD next time"
+        record_deploy_proof "$host" "$server_name" "$current_sha"
         write_release_manifest "$host" "$server_name" "$server_prefix" "$current_sha" "$all_services" "${DEPLOYED_SERVICES[@]}"
         info "Container states  :"
         for svc in "${DEPLOYED_SERVICES[@]}"; do
@@ -2187,6 +2606,13 @@ deploy_server() {
 # ============================================================================
 # Entry point
 # ============================================================================
+
+# smoke-nachholen deploys nothing: no principal sync, no coverage pre-flight.
+if [[ "$SERVER" == "smoke-nachholen" ]]; then
+    _rc=0
+    catch_up_unproven_smoke || _rc=$?
+    exit "$_rc"
+fi
 
 # Phase 3.6 — principal union sync + drift verification (once per run).
 # The bridge hosts form ONE failover fabric (nginx claude_production cascades
@@ -2274,6 +2700,13 @@ case "$SERVER" in
         ;;
     both)
         deploy_server "hetzner" || exit $?
+        # An UNPROVEN dev is no proof for prod: stop before server2 runs.
+        if (( ${#SMOKE_UNPROVEN[@]} > 0 )); then
+            for _u in "${SMOKE_UNPROVEN[@]}"; do warn "UNPROVEN ${_u}"; done
+            error_ "=== both: STOPPED after hetzner — dev is UNPROVEN, server2 (prod) NOT deployed (exit 3) ==="
+            error_ "  Catch up with 'bridge-deploy.sh smoke-nachholen', then deploy server2."
+            exit 3
+        fi
         deploy_server "server2" || exit $?
         ;;
     prod-workers)
@@ -2281,5 +2714,10 @@ case "$SERVER" in
         ;;
 esac
 
+if (( ${#SMOKE_UNPROVEN[@]} > 0 )); then
+    for _u in "${SMOKE_UNPROVEN[@]}"; do warn "UNPROVEN ${_u}"; done
+    warn "=== bridge-deploy.sh finished: DEPLOYED, NOT rolled back — but UNPROVEN (exit 3) ==="
+    exit 3
+fi
 info "=== bridge-deploy.sh finished successfully ==="
 exit 0
