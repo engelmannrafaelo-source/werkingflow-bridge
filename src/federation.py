@@ -168,3 +168,52 @@ class OriginMiddleware:
                     break
             set_request_origin(origin)
         await self.app(scope, receive, send)
+
+
+SERVED_BY_HEADER = "X-Bridge-Served-By"
+
+
+def served_by_value() -> str:
+    """`<bridge>/<worker>` of THIS process, e.g. `dev/worker2`, `prod/worker-kurt`.
+
+    Missing parts stay visible as `unset` instead of being guessed: a caller
+    checking "did my request reach the bridge I meant" must be able to tell
+    "wrong bridge" from "worker without identity"."""
+    bridge = self_origin_id().lower() or "unset"
+    worker = os.getenv("INSTANCE_NAME", "").strip() or "unset"
+    return f"{bridge}/{worker}"
+
+
+class ServedByMiddleware:
+    """Pure-ASGI middleware: stamp X-Bridge-Served-By on every HTTP response.
+
+    WHY: with the two-tier pool (ADR-0010) a request to the dev URL is served
+    by the PROD workers unless it carries X-Bridge-Hop. Nothing in a response
+    said which worker had answered, so the deploy smoke "proved" new dev code
+    with answers from prod (measured 2026-10-10, BR2D §7 / BR5 §5). The LB
+    headers cannot say it: they describe the entry LB's choice, and across a
+    hop both LBs add theirs. Only the answering worker knows who it is.
+
+    Set (not appended): a response relayed from another worker by this one
+    carries this worker's identity — the one the caller's request reached."""
+
+    _NAME = SERVED_BY_HEADER.lower().encode("latin-1")
+
+    def __init__(self, app: ASGIApp):
+        self.app = app
+        self._value = served_by_value().encode("latin-1")
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        async def stamped_send(message):
+            if message["type"] == "http.response.start":
+                headers = [(k, v) for k, v in message.get("headers", [])
+                           if k.lower() != self._NAME]
+                headers.append((self._NAME, self._value))
+                message = {**message, "headers": headers}
+            await send(message)
+
+        await self.app(scope, receive, stamped_send)

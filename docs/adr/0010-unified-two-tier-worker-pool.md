@@ -1,7 +1,15 @@
 # ADR-0010: Ein Worker-Pool, zwei Schichten (Level 1 = Prod-Konten zuerst, fuer ALLE)
 
-**Status:** Entscheidung ACCEPTED; Umsetzung der Default-Pool-Stufe **PAUSIERT
-auf X-Priority-only** (2026-08-31, ~1h nach Go-Live zurueckgenommen) wegen einer
+**Status:** ACCEPTED und LIVE, einschliesslich der Default-Pool-Stufe: nach
+ADR-0011 (Budget-Foederation) am 2026-08-31 11:43Z mit Rafaels Direktfreigabe
+reaktiviert (Commit `e5e0533`), von Rafael in ADR-0012 (03.09.) bestaetigt.
+Folge fuer Pruefungen: chat/research/`POST /v1/jobs` ueber die Dev-URL landen
+OHNE `X-Bridge-Hop: 1` auf den Prod-Workern — der Deploy-Smoke sendet den
+Header deshalb und prueft per `X-Bridge-Served-By`, welche Bridge geantwortet
+hat (BR6, 2026-10-10).
+
+**Historischer Status (bis 2026-08-31 11:43Z):** Umsetzung der Default-Pool-Stufe
+**PAUSIERT auf X-Priority-only** (2026-08-31, ~1h nach Go-Live zurueckgenommen) wegen einer
 beim Live-Betrieb gemessenen, im Entwurf unterschaetzten Voraussetzung — siehe
 "Voraussetzung: EINE Budget-Domaene" unten. Der Rest (Hop-Guard auf beiden
 Bridges, Reads folgen dem POST-Pool, hopped/llm_pool-Sichtbarkeit, X-Priority

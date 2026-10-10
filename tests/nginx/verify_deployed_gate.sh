@@ -80,10 +80,27 @@ fi
 echo
 echo "=== functional smoke ($PROFILE) ==="
 cd /root/projekte/werkingflow-bridge || exit 1
-smoke=$(python3 scripts/bridge_smoke.py --base-url "http://$HOST:8000" --profile "$PROFILE" --attempts 3 2>&1)
+# The smoke must be answered by THIS host's bridge (BR6): dev chat/research
+# only stays local with X-Bridge-Hop (ADR-0010); prod is probed on the customer
+# path. The id comes from the live LB, the answer's X-Bridge-Served-By is
+# checked against it.
+bridge_id=$(rs "docker exec $LB printenv BRIDGE_ID" | tr -d '[:space:]')
+if [ -z "$bridge_id" ]; then
+    bad "cannot read BRIDGE_ID from $LB — smoke target unknown"
+fi
+if [ "$PROFILE" = "server2" ]; then
+    target_args=(--extra-header "X-Priority: production" --served-by-optional)
+else
+    target_args=(--extra-header "X-Bridge-Hop: 1")
+fi
+smoke=$(python3 scripts/bridge_smoke.py --base-url "http://$HOST:8000" --profile "$PROFILE" --attempts 3 \
+    --expect-bridge "$bridge_id" "${target_args[@]}" 2>&1)
 printf '%s\n' "$smoke" | sed 's/^/  /'
-if printf '%s' "$smoke" | grep -qE '^SMOKE_OK|^SMOKE_CAPACITY'; then
-    ok "smoke acceptable"
+if printf '%s' "$smoke" | grep -qE '^SMOKE_FAIL'; then
+    bad "smoke failed"
+elif printf '%s' "$smoke" | grep -qE '^SMOKE_OK|^SMOKE_CAPACITY|^SMOKE_TARGET'; then
+    ok "smoke acceptable (bridge $bridge_id)"
+    printf '%s' "$smoke" | grep -q '^SMOKE_TARGET' && echo "  WARN  answering bridge UNPROVEN (workers without X-Bridge-Served-By)"
 else
     bad "smoke failed"
 fi

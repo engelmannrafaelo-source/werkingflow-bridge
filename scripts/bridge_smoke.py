@@ -97,6 +97,12 @@ class ProbeResult:
     # independent check. Same class as capacity_reason — infrastructure STATE,
     # not a verdict on the deployed code.
     dependency_reason: Optional[str] = None
+    # Set ONLY by check_target(): the endpoint worked, but the answer carried
+    # no X-Bridge-Served-By, so it is unproven WHICH bridge served it. Used
+    # where the answering workers are deployed separately (server2 → prod
+    # workers on the worker-host) and may predate the header.
+    target_reason: Optional[str] = None
+    served_by: Optional[str] = None
 
 
 # ---------------------------------------------------------------------------
@@ -218,6 +224,61 @@ CAPACITY_BACKOFF_MAX_S = 30  # cap the honored Retry-After so a deploy cannot st
 # ~ ^/v1/(chat/completions|research) → pool_router.choose()). They share ONE
 # gate, so a pass on any of them proves the gate + routing are healthy.
 POOL_GATED_PROBES = {"research", "chat_completions"}
+
+
+# ---------------------------------------------------------------------------
+# Target check — did the DEPLOYED bridge answer? (BR6 E1, 2026-10-10)
+# ---------------------------------------------------------------------------
+# ADR-0010: chat/research/jobs sent to the dev URL are served by the PROD
+# workers first; only X-Bridge-Hop keeps them local. Until 2026-10-10 the
+# hetzner smoke sent no hop header, so its research and chat probes — and the
+# distribution test — "proved" each new dev build with answers from prod
+# (BR2D §7: not one smoke call in any dev worker log). A green probe that hit
+# another bridge says nothing about the build under deploy.
+#
+# The answering worker stamps X-Bridge-Served-By: <bridge>/<worker>
+# (src/federation.py ServedByMiddleware). The LB headers cannot carry this:
+# they describe the ENTRY LB's choice, and across a hop both LBs add theirs.
+SERVED_BY_HEADER = "X-Bridge-Served-By"
+# Shown next to the verdict, so the log also says which pool the LB chose.
+ROUTE_DIAG_HEADERS = ("X-Backend-Pool", "X-Target-Worker", "X-Pool-Decision")
+
+
+def route_diag(r) -> str:
+    parts = [f"{h}={r.headers.get(h)}" for h in ROUTE_DIAG_HEADERS if r.headers.get(h)]
+    return ", ".join(parts) or "no LB routing headers"
+
+
+def check_target(ctx: "Ctx", res: ProbeResult, r) -> ProbeResult:
+    """Turn a functional pass into a target verdict.
+
+    Only applied to probes that passed: a failure keeps its own reason. The
+    bridge that answered must be ctx.expect_bridge. A response WITHOUT the
+    stamp fails when ctx.served_by_required (the workers were deployed in this
+    run, so they must carry it), otherwise it is reported UNPROVEN — never green.
+    """
+    if not res.ok or not ctx.expect_bridge:
+        return res
+    served = r.headers.get(SERVED_BY_HEADER)
+    diag = route_diag(r)
+    if not served:
+        msg = (f"no {SERVED_BY_HEADER} on the answer — cannot prove that bridge "
+               f"{ctx.expect_bridge!r} served it ({diag})")
+        if ctx.served_by_required:
+            return ProbeResult(res.name, res.endpoint, False, msg, res.http_status, res.elapsed_ms)
+        res.ok = False
+        res.target_reason = msg
+        return res
+    bridges = {part.strip().split("/", 1)[0] for part in served.split(",") if part.strip()}
+    if bridges != {ctx.expect_bridge}:
+        return ProbeResult(
+            res.name, res.endpoint, False,
+            f"answered by {served!r}, expected bridge {ctx.expect_bridge!r} — the request "
+            f"did not reach the deployed bridge, so this probe proves nothing about it ({diag})",
+            res.http_status, res.elapsed_ms, served_by=served)
+    res.served_by = served
+    res.detail += f", served_by={served} ({diag})"
+    return res
 
 
 def capacity_envelope(r) -> Optional[tuple]:
@@ -349,6 +410,10 @@ class Ctx:
     api_key: str
     extra_header: dict = field(default_factory=dict)
     timeout: int = 120
+    # Bridge id ("dev"/"prod") that must answer the pool-routed probes; empty
+    # = no target check (manual runs). bridge-deploy.sh always sets it.
+    expect_bridge: str = ""
+    served_by_required: bool = True
 
     def headers(self, extra=None):
         h = dict(SMOKE_HEADERS)
@@ -390,7 +455,7 @@ def _research(ctx: Ctx) -> ProbeResult:
         return ProbeResult("research", ep, False, f"status={d.get('status')!r} expected success", r.status_code, ms)
     if d.get("content", "").count("https://") < 1:
         return ProbeResult("research", ep, False, "content has 0 https:// URLs (research returned nothing)", r.status_code, ms)
-    return ProbeResult("research", ep, True, f"status=success, exec={d.get('execution_time_seconds','?')}s", r.status_code, ms)
+    return check_target(ctx, ProbeResult("research", ep, True, f"status=success, exec={d.get('execution_time_seconds','?')}s", r.status_code, ms), r)
 
 
 @probe("chat_completions", "/v1/chat/completions", {"hetzner", "server2"},
@@ -409,7 +474,7 @@ def _chat(ctx: Ctx) -> ProbeResult:
     choices = d.get("choices") or []
     if not choices:
         return ProbeResult("chat_completions", ep, False, f"no choices in response: {str(d)[:200]}", r.status_code, ms)
-    return ProbeResult("chat_completions", ep, True, "completion returned", r.status_code, ms)
+    return check_target(ctx, ProbeResult("chat_completions", ep, True, "completion returned", r.status_code, ms), r)
 
 
 @probe("document_convert", "/v1/document/convert", {"hetzner"},
@@ -666,8 +731,10 @@ def resolve_api_key() -> str:
     return key
 
 
-def run(base_url: str, profile: str, only: Optional[str], extra_header: dict, attempts: int) -> list:
-    ctx = Ctx(base_url=base_url.rstrip("/"), api_key=resolve_api_key(), extra_header=extra_header)
+def run(base_url: str, profile: str, only: Optional[str], extra_header: dict, attempts: int,
+        expect_bridge: str = "", served_by_required: bool = True) -> list:
+    ctx = Ctx(base_url=base_url.rstrip("/"), api_key=resolve_api_key(), extra_header=extra_header,
+              expect_bridge=expect_bridge, served_by_required=served_by_required)
     selected = [p for p in PROBES if (profile in p.profiles) and (only is None or p.name == only)]
     results = []
     for p in selected:
@@ -719,15 +786,22 @@ def partition_results(results: list) -> tuple:
     refused = [r for r in results if not r.ok and r.capacity_reason]
     dependency = [r for r in results
                   if not r.ok and not r.capacity_reason and r.dependency_reason]
+    unproven = [r for r in results
+                if not r.ok and not r.capacity_reason and not r.dependency_reason
+                and r.target_reason]
     failures = [r for r in results
-                if not r.ok and not r.capacity_reason and not r.dependency_reason]
+                if not r.ok and not r.capacity_reason and not r.dependency_reason
+                and not r.target_reason]
 
-    pool_proven_healthy = any(r.ok for r in results if r.name in POOL_GATED_PROBES)
+    # A target-unproven probe DID pass through the gate — it only cannot say
+    # which bridge answered.
+    pool_proven_healthy = any(r.ok or r.target_reason
+                              for r in results if r.name in POOL_GATED_PROBES)
     if refused and not pool_proven_healthy:
         for r in refused:
             r.detail += " [no pool-gated probe passed — cannot rule out the deployed image]"
-        return passed, dependency, failures + refused
-    return passed, refused + dependency, failures
+        return passed, dependency + unproven, failures + refused
+    return passed, refused + dependency + unproven, failures
 
 
 def main():
@@ -735,17 +809,28 @@ def main():
     ap.add_argument("--base-url", required=True)
     ap.add_argument("--profile", default="hetzner", choices=["hetzner", "server2"])
     ap.add_argument("--only", default=None, help="run a single probe by name")
-    ap.add_argument("--extra-header", default="", help="e.g. 'X-Priority: production'")
+    ap.add_argument("--extra-header", action="append", default=[],
+                    help="repeatable, e.g. 'X-Priority: production' or 'X-Bridge-Hop: 1'")
+    ap.add_argument("--expect-bridge", default="",
+                    help="bridge id (dev/prod) that must answer research/chat — "
+                         "checked via the X-Bridge-Served-By header the worker stamps")
+    ap.add_argument("--served-by-optional", action="store_true",
+                    help="a missing X-Bridge-Served-By is UNPROVEN (reported, no rollback) "
+                         "instead of a failure — for hosts whose workers deploy separately")
     ap.add_argument("--attempts", type=int, default=2, help="per-probe retries for transient flakiness")
     ap.add_argument("--json", action="store_true", help="emit machine-readable JSON block")
     args = ap.parse_args()
 
     extra = {}
-    if args.extra_header:
-        k, v = args.extra_header.split(":", 1)
+    for raw in args.extra_header:
+        if not raw:
+            continue
+        k, v = raw.split(":", 1)
         extra[k.strip()] = v.strip()
 
-    results = run(args.base_url, args.profile, args.only, extra, args.attempts)
+    results = run(args.base_url, args.profile, args.only, extra, args.attempts,
+                  expect_bridge=args.expect_bridge.strip().lower(),
+                  served_by_required=not args.served_by_optional)
     if not results:
         print(f"SMOKE_FAIL: no probes selected for profile={args.profile} only={args.only}", file=sys.stderr)
         sys.exit(2)
@@ -753,9 +838,11 @@ def main():
     passed, gaps, failures = partition_results(results)
     gap_names = {r.name for r in gaps}
     dep_names = {r.name for r in gaps if r.dependency_reason}
+    trg_names = {r.name for r in gaps if r.target_reason}
     for r in results:
         mark = ("OK  " if r.ok else
                 "DEP " if r.name in dep_names else
+                "TRGT" if r.name in trg_names else
                 "CAPA" if r.name in gap_names else "FAIL")
         ms = f"{r.elapsed_ms}ms" if r.elapsed_ms is not None else "-"
         print(f"  [{mark}] {r.name:22s} {r.endpoint:34s} ({ms}) {r.detail}")
@@ -835,10 +922,29 @@ def main():
             file=sys.stderr,
         )
 
+    target_gaps = [r for r in gaps if r.target_reason]
+    if target_gaps:
+        # NOT a pass and NOT a rollback: the endpoints work, but the answers
+        # carried no X-Bridge-Served-By, so WHICH bridge served them is
+        # unproven. Expected only while the answering workers predate the
+        # header (server2: the prod workers deploy separately via prod-workers).
+        names = ", ".join(r.name for r in target_gaps)
+        print(f"SMOKE_TARGET: {len(passed)}/{len(results)} probes passed, "
+              f"{len(target_gaps)} UNPROVEN — no {SERVED_BY_HEADER}, expected bridge "
+              f"{args.expect_bridge!r}: {names} (profile={args.profile})", file=sys.stderr)
+        print(
+            "  ⚠️  These endpoints answered, but nothing proves the deployed bridge did. "
+            "Deploy the answering workers with the ServedByMiddleware (bridge-deploy.sh "
+            "prod-workers), then re-run: python3 scripts/bridge_smoke.py --base-url <url> "
+            "--profile <profile> --expect-bridge <id> --only <probe>.",
+            file=sys.stderr,
+        )
+
     if gaps:
         sys.exit(0)
 
-    print(f"SMOKE_OK: {len(results)}/{len(results)} probes passed (profile={args.profile})")
+    target_note = f", answered by bridge {args.expect_bridge!r}" if args.expect_bridge else ""
+    print(f"SMOKE_OK: {len(results)}/{len(results)} probes passed (profile={args.profile}{target_note})")
     sys.exit(0)
 
 

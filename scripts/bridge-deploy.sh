@@ -1016,12 +1016,39 @@ else:
     return 0
 }
 
+# deployed_bridge_id <host> <lb-container>: the BRIDGE_ID the LB on <host>
+# runs with ("dev"/"prod") — the id its workers stamp into X-Bridge-Served-By.
+# Read from the live container instead of mapped from the server name, so the
+# smoke checks against what was deployed, not against what this script assumes.
+deployed_bridge_id() {
+    local host="$1" lb="$2" id
+    if [[ "$DRY_RUN" == "true" ]]; then
+        echo "dry-run"
+        return 0
+    fi
+    id=$(rssh "$host" "docker exec '${lb}' printenv BRIDGE_ID" 2>/dev/null | tr -d '[:space:]')
+    if [[ -z "$id" ]]; then
+        error_ "Cannot read BRIDGE_ID from ${lb} on ${host} — the smoke cannot tell which bridge must answer"
+        return 1
+    fi
+    echo "$id"
+}
+
+# phase_smoke_test <label> <url> <expect-bridge> <required|optional> [header...]
+#   expect-bridge  bridge id that must answer research/chat (X-Bridge-Served-By)
+#   required       a missing stamp FAILS (the answering workers were deployed in
+#                  this run); optional = reported UNPROVEN, no rollback (server2:
+#                  its prod workers deploy separately via prod-workers)
+#   header         extra request headers, e.g. "X-Bridge-Hop: 1"
 phase_smoke_test() {
     local label="$1"
     local url="$2"
-    local extra_header="${3:-}"  # e.g. "X-Priority: production"
+    local expect_bridge="$3"
+    local served_by="$4"
+    shift 4
+    local headers=("$@")
 
-    step "Phase 5: Smoke test (${label} @ ${url})"
+    step "Phase 5: Smoke test (${label} @ ${url}, must be answered by bridge '${expect_bridge}')"
 
     # Functional per-endpoint smoke (bridge_smoke.py): exercises document/convert,
     # smart-anonymize, the convert family, chat, research and metrics with REAL
@@ -1040,8 +1067,15 @@ phase_smoke_test() {
     local profile="hetzner"
     [[ "$label" == "server2" ]] && profile="server2"
 
+    local extra_args=(--expect-bridge "$expect_bridge")
+    [[ "$served_by" == "optional" ]] && extra_args+=(--served-by-optional)
+    local h
+    for h in "${headers[@]}"; do
+        extra_args+=(--extra-header "$h")
+    done
+
     if [[ "$DRY_RUN" == "true" ]]; then
-        info "[DRY-RUN] Would run: bridge_smoke.py --base-url ${url} --profile ${profile}"
+        info "[DRY-RUN] Would run: bridge_smoke.py --base-url ${url} --profile ${profile} ${extra_args[*]}"
         return 0
     fi
 
@@ -1050,13 +1084,18 @@ phase_smoke_test() {
     # shellcheck source=/root/.infisical/infisical-api.sh
     source /root/.infisical/infisical-api.sh 2>/dev/null || true
 
-    local extra_args=()
-    [[ -n "$extra_header" ]] && extra_args+=(--extra-header "$extra_header")
-
     local smoke_out
     if smoke_out=$(python3 "$smoke_script" --base-url "$url" --profile "$profile" \
             --attempts 3 "${extra_args[@]}" 2>&1); then
         while IFS= read -r line; do info "  smoke: ${line}"; done <<< "$smoke_out"
+        # SMOKE_TARGET = exit 0, NOT a clean pass: the endpoints answered, but
+        # without X-Bridge-Served-By, so which bridge served them is unproven.
+        # Only possible with served_by=optional. Reported before the other
+        # gap markers so it is never hidden behind them.
+        if grep -q '^SMOKE_TARGET:' <<< "$smoke_out"; then
+            warn "Smoke for ${label}: research/chat answered, but NOT PROVEN to come from bridge '${expect_bridge}'"
+            warn "  Deploy the answering workers (prod-workers), then re-run — see the SMOKE_TARGET line above."
+        fi
         # SMOKE_CAPACITY = exit 0, but NOT a clean pass: one or more endpoints
         # were refused by the account-capacity gate before reaching the
         # deployed code, so they stayed UNVERIFIED. Deliberately not a
@@ -1079,7 +1118,11 @@ phase_smoke_test() {
             warn "  privacy service, then re-run the affected probes — see the SMOKE_DEPENDENCY line above."
             return 0
         fi
-        info "Smoke test PASSED for ${label}"
+        if grep -q '^SMOKE_TARGET:' <<< "$smoke_out"; then
+            warn "Smoke test PASSED for ${label} WITH UNPROVEN TARGET (see above)"
+            return 0
+        fi
+        info "Smoke test PASSED for ${label} (research/chat answered by bridge '${expect_bridge}')"
         return 0
     fi
 
@@ -1148,6 +1191,72 @@ phase_access_canary() {
     return 0
 }
 
+# check_pool_router_state <host> <lb-container>
+# The account gate (ADR-0010's customer protection) only works while the Lua
+# router can load the pool state from the metrics-reader. A blind router still
+# routes — round-robin — so nothing else in a deploy turns red when it is
+# blind: on prod it was, for six weeks, until 2026-10-10 (BR5).
+check_pool_router_state() {
+    local host="$1"
+    local lb_container="$2"
+    if [[ "$DRY_RUN" == "true" ]]; then
+        info "[DRY-RUN] Would check /internal/pool-router/state in ${lb_container} on ${host}"
+        return 0
+    fi
+    info "Checking /internal/pool-router/state on ${host} (via docker exec ${lb_container})..."
+    local state_raw
+    state_raw=$(rssh "$host" "docker exec '${lb_container}' curl -sf http://127.0.0.1/internal/pool-router/state" 2>&1)
+    local rc_state=$?
+    if [[ $rc_state -ne 0 ]] || [[ -z "$state_raw" ]]; then
+        error_ "Failed to reach /internal/pool-router/state via docker exec (rc=${rc_state}): ${state_raw}"
+        return 1
+    fi
+
+    info "  raw state: ${state_raw}"
+
+    # Pass JSON via env var — avoids pipe+heredoc stdin conflict with python3 -
+    # 2>&1: STATE_FAIL goes to stderr and must land in the deploy log too.
+    local state_check rc_sc
+    state_check=$(STATE_JSON="${state_raw}" python3 - 2>&1 <<'PYEOF'
+import os, sys, json
+raw = os.environ.get("STATE_JSON", "")
+try:
+    d = json.loads(raw)
+except Exception as e:
+    print(f"STATE_FAIL: response is not valid JSON: {e}", file=sys.stderr)
+    sys.exit(1)
+
+status    = d.get("last_refresh_status", "unknown")
+age_s     = float(d.get("state_age_s", 9999))
+last_err  = d.get("last_refresh_err", "")
+# metrics_url since 2026-10-10 (BR6); an older router does not report it.
+murl      = d.get("metrics_url", "<not reported — router predates BR6>")
+
+if status != "ok":
+    print(f"STATE_FAIL: last_refresh_status={status!r} (expected 'ok'); err={last_err!r}; "
+          f"metrics_url={murl!r} — router BLIND, account gate OFF, routing round-robin",
+          file=sys.stderr)
+    sys.exit(1)
+if age_s >= 30:
+    print(f"STATE_FAIL: state_age_s={age_s:.1f}s >= 30s — metrics-reader refresh not working", file=sys.stderr)
+    sys.exit(1)
+
+counters = d.get("decision_counter_per_worker", {})
+print(f"STATE_OK: status={status}, age={age_s:.1f}s, metrics_url={murl}, counters={counters}")
+PYEOF
+    )
+    rc_sc=$?
+
+    while IFS= read -r line; do info "  state: ${line}"; done <<< "$state_check"
+
+    if [[ $rc_sc -ne 0 ]] || ! echo "$state_check" | grep -q 'STATE_OK:'; then
+        error_ "Pool-router state check FAILED"
+        return 1
+    fi
+
+    return 0
+}
+
 # Runs 8 sequential /v1/chat/completions calls; checks X-Target-Worker header
 # distribution and the /internal/pool-router/state endpoint via docker exec.
 # ============================================================================
@@ -1155,8 +1264,9 @@ phase_distribution_test() {
     local host="$1"
     local url="$2"
     local lb_container="$3"  # e.g. wt-wrapper-lb
+    local expect_bridge="$4"  # bridge id whose workers must answer (X-Bridge-Served-By)
 
-    step "Phase 5b: Distribution + State Test (${label:-dist} @ ${url})"
+    step "Phase 5b: Distribution + State Test (${label:-dist} @ ${url}, bridge '${expect_bridge}')"
 
     if [[ "$DRY_RUN" == "true" ]]; then
         info "[DRY-RUN] Would send 8 chat/completions calls and check /internal/pool-router/state"
@@ -1181,12 +1291,13 @@ phase_distribution_test() {
     # 8 sequential chat/completions calls; parse X-Target-Worker header
     info "Sending 8 chat/completions calls to ${url} to validate worker distribution..."
     local dist_out
-    dist_out=$(DIST_URL="${url}" DIST_API_KEY="${api_key}" python3 - <<'PYEOF'
+    dist_out=$(DIST_URL="${url}" DIST_API_KEY="${api_key}" DIST_BRIDGE="${expect_bridge}" python3 - <<'PYEOF'
 import os, sys, json, requests
 from collections import Counter
 
 url     = os.environ["DIST_URL"]
 api_key = os.environ["DIST_API_KEY"]
+bridge  = os.environ["DIST_BRIDGE"]
 
 headers = {
     "Authorization": f"Bearer {api_key}",
@@ -1195,6 +1306,10 @@ headers = {
     # Same contract as the smoke test: deploy probes book anonymous, not
     # unattributed (the dist test fires 8 chat calls per rollout).
     "X-User-ID": "anonymous:bridge-deploy-dist-test",
+    # LOCAL tier. Without it ADR-0010 sends dev chat to the prod workers
+    # first: until 2026-10-10 this test reported "DIST_OK 4/4" for the four
+    # PROD workers on every dev deploy (BR2D §7) and said nothing about dev.
+    "X-Bridge-Hop": "1",
 }
 
 def is_pool_exhausted(resp) -> bool:
@@ -1237,6 +1352,8 @@ def eligible_account_count() -> int:
 
 workers_hit = []
 refused = 0
+foreign = []   # answers stamped by another bridge — the test then measures nothing
+unstamped = 0  # 200 without X-Bridge-Served-By — workers predate the stamp
 for i in range(8):
     try:
         r = requests.post(
@@ -1259,21 +1376,43 @@ for i in range(8):
         print(f"DIST_FAIL: call {i+1}/8 unexpected HTTP {r.status_code}: {r.text[:300]}", file=sys.stderr)
         sys.exit(1)
 
-    worker = r.headers.get("X-Target-Worker", "unknown")
+    # Who answered: the worker's own stamp (<bridge>/<worker>). A 429 is
+    # written by nginx (error_page), so it carries none — for those the LB's
+    # routing decision (X-Target-Worker) is all there is.
+    served = r.headers.get("X-Bridge-Served-By", "")
+    lb_pick = r.headers.get("X-Target-Worker", "unknown")
+    worker = None
     if is_pool_exhausted(r):
         refused += 1
         note = " (router refused: pool exhausted — no worker reached)"
     elif r.status_code == 429:
-        note = " (429 worker rate-limited — counts as hit)"
+        note = " (429 worker rate-limited — counts as hit via LB pick)"
+        worker = lb_pick if lb_pick != "unknown" else None
+    elif not served:
+        unstamped += 1
+        note = " (NO X-Bridge-Served-By — answering bridge unknown)"
+    elif served.split("/", 1)[0] != bridge:
+        foreign.append(served)
+        note = f" (FOREIGN: expected bridge {bridge!r})"
     else:
         note = ""
-    print(f"  call {i+1}/8: worker={worker} HTTP {r.status_code}{note}")
-    if worker and worker != "unknown":
+        worker = served
+    print(f"  call {i+1}/8: served_by={served or '-'} lb_pick={lb_pick} HTTP {r.status_code}{note}")
+    if worker:
         workers_hit.append(worker)
+
+if foreign or unstamped:
+    print(
+        f"DIST_FAIL: {len(foreign)} answer(s) from another bridge {sorted(set(foreign))}, "
+        f"{unstamped} without X-Bridge-Served-By — the calls did not provably reach "
+        f"bridge {bridge!r}, so their spread says nothing about its pool router.",
+        file=sys.stderr,
+    )
+    sys.exit(1)
 
 unique_workers = set(workers_hit)
 distribution   = dict(Counter(workers_hit))
-print(f"Distribution: {len(unique_workers)}/4 unique workers — {distribution}"
+print(f"Distribution on bridge {bridge!r}: {len(unique_workers)}/4 unique workers — {distribution}"
       + (f", {refused} refused (pool exhausted)" if refused else ""))
 
 if len(unique_workers) >= 2:
@@ -1339,52 +1478,7 @@ PYEOF
         return 1
     fi
 
-    # Check /internal/pool-router/state via docker exec inside the lb container
-    info "Checking /internal/pool-router/state on ${host} (via docker exec ${lb_container})..."
-    local state_raw
-    state_raw=$(rssh "$host" "docker exec '${lb_container}' curl -sf http://127.0.0.1/internal/pool-router/state" 2>&1)
-    local rc_state=$?
-    if [[ $rc_state -ne 0 ]] || [[ -z "$state_raw" ]]; then
-        error_ "Failed to reach /internal/pool-router/state via docker exec (rc=${rc_state}): ${state_raw}"
-        return 1
-    fi
-
-    info "  raw state: ${state_raw}"
-
-    # Pass JSON via env var — avoids pipe+heredoc stdin conflict with python3 -
-    local state_check
-    state_check=$(STATE_JSON="${state_raw}" python3 - <<'PYEOF'
-import os, sys, json
-raw = os.environ.get("STATE_JSON", "")
-try:
-    d = json.loads(raw)
-except Exception as e:
-    print(f"STATE_FAIL: response is not valid JSON: {e}", file=sys.stderr)
-    sys.exit(1)
-
-status    = d.get("last_refresh_status", "unknown")
-age_s     = float(d.get("state_age_s", 9999))
-last_err  = d.get("last_refresh_err", "")
-
-if status != "ok":
-    print(f"STATE_FAIL: last_refresh_status={status!r} (expected 'ok'); err={last_err!r}", file=sys.stderr)
-    sys.exit(1)
-if age_s >= 30:
-    print(f"STATE_FAIL: state_age_s={age_s:.1f}s >= 30s — metrics-reader refresh not working", file=sys.stderr)
-    sys.exit(1)
-
-counters = d.get("decision_counter_per_worker", {})
-print(f"STATE_OK: status={status}, age={age_s:.1f}s, counters={counters}")
-PYEOF
-    )
-    rc_sc=$?
-
-    while IFS= read -r line; do info "  state: ${line}"; done <<< "$state_check"
-
-    if [[ $rc_sc -ne 0 ]] || ! echo "$state_check" | grep -q 'STATE_OK:'; then
-        error_ "Pool-router state check FAILED"
-        return 1
-    fi
+    check_pool_router_state "$host" "$lb_container" || return 1
 
     info "Distribution + State test PASSED"
     return 0
@@ -1961,8 +2055,15 @@ deploy_server() {
         # Source env to get AI_BRIDGE_URL
         source /root/.infisical/infisical-api.sh 2>/dev/null || true
         local hetzner_url="${AI_BRIDGE_URL:-http://${HETZNER_HOST}:8000}"
+        local hetzner_bridge
+        hetzner_bridge=$(deployed_bridge_id "$host" "${HETZNER_SVC_nginx}") || hetzner_bridge=""
 
-        phase_smoke_test "hetzner" "${hetzner_url}" "" || {
+        # X-Bridge-Hop: 1 keeps chat/research/jobs on THIS bridge's workers.
+        # Without it ADR-0010 serves them from the prod workers first, and the
+        # smoke would judge prod instead of the build just deployed (BR2D §7).
+        # The workers were deployed in this run, so their stamp is required.
+        [[ -n "$hetzner_bridge" ]] && phase_smoke_test "hetzner" "${hetzner_url}" "${hetzner_bridge}" required \
+            "X-Bridge-Hop: 1" || {
             error_ "Smoke test failed for hetzner — rolling back"
             if [[ ${#DEPLOYED_SERVICES[@]} -gt 0 ]]; then
                 phase_rollback "$host" "$compose" "$ROLLBACK_SHA" "$build_list" "${DEPLOYED_SERVICES[@]}"
@@ -1972,18 +2073,39 @@ deploy_server() {
             return 1
         }
 
-        phase_distribution_test "$host" "${hetzner_url}" "${HETZNER_SVC_nginx}" || \
+        phase_distribution_test "$host" "${hetzner_url}" "${HETZNER_SVC_nginx}" "${hetzner_bridge}" || \
             warn "Distribution test FAILED — optimization signal only, NOT rolling back (smoke test passed, deployment succeeded)"
 
         phase_access_canary "hetzner"
     elif [[ "$server_name" == "server2" ]]; then
-        phase_smoke_test "server2" "http://${SERVER2_HOST}:8000" "X-Priority: production" || {
+        local server2_bridge
+        server2_bridge=$(deployed_bridge_id "$host" "${SERVER2_SVC_nginx}") || server2_bridge=""
+        # X-Priority: production = the customer path (prod workers first, the
+        # dev bridge only as backup). A backup answer is FOREIGN and fails the
+        # smoke. The prod workers deploy separately (prod-workers), so a
+        # missing stamp is UNPROVEN, not a failure — a server2 deploy must not
+        # depend on a worker rollout.
+        [[ -n "$server2_bridge" ]] && phase_smoke_test "server2" "http://${SERVER2_HOST}:8000" "${server2_bridge}" optional \
+            "X-Priority: production" || {
             error_ "Smoke test failed for server2 — rolling back"
             if [[ ${#DEPLOYED_SERVICES[@]} -gt 0 ]]; then
                 phase_rollback "$host" "$compose" "$ROLLBACK_SHA" "$build_list" "${DEPLOYED_SERVICES[@]}"
                 local rc=$?
                 (( rc == 2 )) && return 2
             fi
+            return 1
+        }
+
+        # Prod has no distribution test (it would spend customer-account
+        # capacity), so the router's eyes are checked directly. Blind = the
+        # account gate is off for every customer request. No rollback: the
+        # cause is the reader address/reachability (METRICS_READER_TARGET in
+        # docker/.env, worker-host reader), which the previous image shares.
+        check_pool_router_state "$host" "${SERVER2_SVC_nginx}" || {
+            error_ "Deploy gestoppt: der Prod-LB laeuft, aber sein pool_router ist BLIND —"
+            error_ "  Konten-Gating AUS, Verteilung reihum. KEIN Rollback (die Ursache ist die"
+            error_ "  Reader-Adresse/-Erreichbarkeit, nicht dieses Image). METRICS_READER_TARGET"
+            error_ "  in docker/.env und den Reader auf dem Worker-Host pruefen."
             return 1
         }
     else
