@@ -259,11 +259,14 @@ async def _run_body(
 
     executor = get_executor(kind)
     if executor is None:
-        await store_client.mark_error(
-            job_id, f"No executor registered for kind '{kind}'",
-            **job_code_fields_for("NO_EXECUTOR"),
-        )
         logger.error(f"❌ Async job {job_id}: no executor for kind={kind!r}")
+        try:
+            await store_client.mark_error(
+                job_id, f"No executor registered for kind '{kind}'",
+                **job_code_fields_for("NO_EXECUTOR"),
+            )
+        except store_client.JobRowMissing:
+            pass  # counted and logged by store_client; nothing left to tell
         return
 
     stop = asyncio.Event()
@@ -275,6 +278,10 @@ async def _run_body(
             except asyncio.TimeoutError:
                 try:
                     await store_client.heartbeat(job_id)
+                except store_client.JobRowMissing:
+                    # Counted and logged (error) by store_client. Beating on a
+                    # missing row is pointless; the run's end reports it again.
+                    return
                 except Exception as e:  # heartbeat failure must not kill the job
                     logger.warning(f"⚠️ Heartbeat failed for job {job_id}: {e}")
 
@@ -287,6 +294,11 @@ async def _run_body(
         result = await executor(payload, attribution, report_progress)
         await store_client.mark_done(job_id, result)
         logger.info(f"📦 Async job {job_id} (kind={kind}) finished: done")
+    except store_client.JobRowMissing:
+        # The row vanished under a run (mark_done or a progress write). Counted
+        # and logged by store_client; marking an error on the same missing row
+        # would only say it twice.
+        pass
     except Exception as e:
         # Preserve the upstream HTTP status in the error code so clients can
         # restore retry semantics (a 400 must not read as a retryable 502).
@@ -324,8 +336,11 @@ async def _run_body(
 
         # Code and verdict (retryable / retry_after_s) from ONE place,
         # src/error_contract.py — never re-derived from the message text.
-        await store_client.mark_error(job_id, str(e), **job_error_fields(e))
         logger.error(f"❌ Async job {job_id} (kind={kind}) crashed: {e}", exc_info=True)
+        try:
+            await store_client.mark_error(job_id, str(e), **job_error_fields(e))
+        except store_client.JobRowMissing:
+            pass  # counted and logged by store_client
     finally:
         stop.set()
         try:
@@ -343,11 +358,14 @@ async def run_watchdog_pass(stale_seconds: int, max_attempts: int) -> Dict[str, 
 
     failed = 0
     for job in await store_client.find_abandoned(stale_seconds, max_attempts):
-        await store_client.mark_error(
-            job["job_id"],
-            f"Job lost after {job['attempts']} attempts (worker death, retries exhausted)",
-            **job_code_fields_for("REQUEUE_EXHAUSTED"),
-        )
+        try:
+            await store_client.mark_error(
+                job["job_id"],
+                f"Job lost after {job['attempts']} attempts (worker death, retries exhausted)",
+                **job_code_fields_for("REQUEUE_EXHAUSTED"),
+            )
+        except store_client.JobRowMissing:
+            continue  # counted and logged by store_client; the next one still matters
         failed += 1
         logger.error(f"💀 Watchdog failed-loud job {job['job_id']} (retries exhausted)")
 

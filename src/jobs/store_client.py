@@ -36,6 +36,9 @@ both stages.
 from __future__ import annotations
 
 import logging
+import threading
+import time
+from collections import defaultdict
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
@@ -50,7 +53,77 @@ logger = logging.getLogger(__name__)
 _WRITE_TIMEOUT_S = 10.0
 _READ_TIMEOUT_S = 5.0
 
-_DATETIME_FIELDS = ("created_at", "updated_at", "heartbeat_at", "deferred_until")
+_DATETIME_FIELDS = (
+    "created_at", "updated_at", "heartbeat_at", "deferred_until", "finished_at",
+)
+
+# Re-exported so callers (registry.py) need only this module.
+JobRowMissing = store.JobRowMissing
+
+
+# ── Retention / lost-row counters (BR11) ─────────────────────────────────────
+# In-memory per worker since start, same shape as src/attribution.py; read via
+# GET /v1/metrics/jobs-retention. Every increment also has its own log line —
+# the counter is for "how often", the log for "which job".
+_STARTED_AT = time.time()
+_lock = threading.Lock()
+_row_missing: Dict[str, int] = defaultdict(int)
+_retention: Dict[str, int] = defaultdict(int)
+
+
+def _count(bucket: Dict[str, int], key: str, n: int = 1) -> None:
+    with _lock:
+        bucket[key] += n
+
+
+def retention_snapshot() -> Dict[str, Any]:
+    with _lock:
+        return {
+            "since_epoch": _STARTED_AT,
+            "row_missing_by_op": dict(_row_missing),
+            "retention": dict(_retention),
+        }
+
+
+def record_retention(key: str, n: int = 1) -> None:
+    """Counter hook for the maintenance loop (main.py)."""
+    _count(_retention, key, n)
+
+
+class RetentionRouteMissing(RuntimeError):
+    """platform-api does not know POST /v1/internal/jobs-maintenance/prune —
+    it predates BR11. Its only retention route is the old /cleanup, which
+    deletes by created_at whatever the status; this worker refuses to call it.
+    Consequence: nothing is deleted until platform-api is updated (rows grow,
+    nothing is lost). Loud, never a silent no-op."""
+
+
+def _row_missing_error(
+    op: str, job_id: str, cause: "BaseException | None" = None
+) -> JobRowMissing:
+    _count(_row_missing, op)
+    logger.error(
+        "💀 job store %s: row of job %s is GONE — %s",
+        op, job_id,
+        "the result of finished work is lost" if op in ("mark_done", "mark_error")
+        else "the job can no longer report progress or finish",
+    )
+    err = JobRowMissing(op, job_id)
+    if cause is not None:
+        err.__cause__ = cause
+    return err
+
+
+def _is_row_missing(resp: Any) -> bool:
+    """404 with reason job_row_missing — the BR11 contract of the write routes.
+    A bare 404 (no such reason) is something else and stays _unexpected."""
+    body = resp.json if isinstance(resp.json, dict) else {}
+    detail = body.get("detail")
+    return (
+        resp.status_code == 404
+        and isinstance(detail, dict)
+        and detail.get("reason") == "job_row_missing"
+    )
 
 
 class JobStoreUnavailable(RuntimeError):
@@ -193,13 +266,19 @@ async def cancel_job(job_id: str) -> Optional[Dict[str, Any]]:
 
 
 async def heartbeat(job_id: str) -> None:
+    """Raises JobRowMissing (counted, logged) when the row is gone."""
     try:
         resp = await call_platform(
             "POST", f"/v1/internal/jobs/{job_id}/heartbeat", timeout_s=_READ_TIMEOUT_S
         )
     except PlatformUnavailable as e:
         _fallback_or_raise("heartbeat", e)
-        return await store.heartbeat(job_id)
+        try:
+            return await store.heartbeat(job_id)
+        except store.JobRowMissing as missing:
+            raise _row_missing_error("heartbeat", job_id, missing)
+    if _is_row_missing(resp):
+        raise _row_missing_error("heartbeat", job_id)
     if resp.status_code != 204:
         raise _unexpected("heartbeat", resp.status_code, resp.json)
 
@@ -218,6 +297,9 @@ async def update_progress(job_id: str, progress: Dict[str, Any]) -> None:
 
 
 async def mark_done(job_id: str, result: Optional[Dict[str, Any]]) -> None:
+    """Raises JobRowMissing (counted, logged) when the row is gone. A
+    platform-api from before BR11 answers 204 either way — degraded to the old
+    silence, not worse."""
     try:
         resp = await call_platform(
             "POST", f"/v1/internal/jobs/{job_id}/done",
@@ -225,7 +307,12 @@ async def mark_done(job_id: str, result: Optional[Dict[str, Any]]) -> None:
         )
     except PlatformUnavailable as e:
         _fallback_or_raise("mark_done", e)
-        return await store.mark_done(job_id, result)
+        try:
+            return await store.mark_done(job_id, result)
+        except store.JobRowMissing as missing:
+            raise _row_missing_error("mark_done", job_id, missing)
+    if _is_row_missing(resp):
+        raise _row_missing_error("mark_done", job_id)
     if resp.status_code != 204:
         raise _unexpected("mark_done", resp.status_code, resp.json)
 
@@ -250,10 +337,15 @@ async def mark_error(
         )
     except PlatformUnavailable as e:
         _fallback_or_raise("mark_error", e)
-        return await store.mark_error(
-            job_id, message, code=code,
-            retryable=retryable, retry_after_s=retry_after_s,
-        )
+        try:
+            return await store.mark_error(
+                job_id, message, code=code,
+                retryable=retryable, retry_after_s=retry_after_s,
+            )
+        except store.JobRowMissing as missing:
+            raise _row_missing_error("mark_error", job_id, missing)
+    if _is_row_missing(resp):
+        raise _row_missing_error("mark_error", job_id)
     if resp.status_code != 204:
         raise _unexpected("mark_error", resp.status_code, resp.json)
 
@@ -302,18 +394,38 @@ async def find_abandoned(stale_seconds: int, max_attempts: int) -> List[Dict[str
     raise _unexpected("find_abandoned", resp.status_code, resp.json)
 
 
-async def cleanup_old(ttl_seconds: int) -> int:
+async def prune_jobs(terminal_ttl_seconds: int, max_age_seconds: int) -> Dict[str, Any]:
+    """Retention pass (store.prune_jobs). There is deliberately no worker-side
+    cleanup_old any more: its route on a platform-api from before BR11 deletes
+    running and parked jobs (BR10R M-B). 404/405 here = that old platform-api
+    → RetentionRouteMissing, and nothing is deleted."""
     try:
         resp = await call_platform(
-            "POST", "/v1/internal/jobs-maintenance/cleanup",
-            json={"ttl_seconds": ttl_seconds}, timeout_s=_WRITE_TIMEOUT_S,
+            "POST", "/v1/internal/jobs-maintenance/prune",
+            json={
+                "terminal_ttl_seconds": terminal_ttl_seconds,
+                "max_age_seconds": max_age_seconds,
+            },
+            timeout_s=_WRITE_TIMEOUT_S,
         )
     except PlatformUnavailable as e:
-        _fallback_or_raise("cleanup_old", e)
-        return await store.cleanup_old(ttl_seconds)
-    if resp.status_code == 200 and isinstance(resp.json, dict) and "removed" in resp.json:
-        return int(resp.json["removed"])
-    raise _unexpected("cleanup_old", resp.status_code, resp.json)
+        _fallback_or_raise("prune_jobs", e)
+        return await store.prune_jobs(terminal_ttl_seconds, max_age_seconds)
+    if resp.status_code in (404, 405):
+        _count(_retention, "prune_route_missing")
+        raise RetentionRouteMissing(
+            f"platform-api has no POST /v1/internal/jobs-maintenance/prune "
+            f"(status {resp.status_code}) — it predates BR11; no job is deleted "
+            f"until it is updated"
+        )
+    if (
+        resp.status_code == 200 and isinstance(resp.json, dict)
+        and isinstance(resp.json.get("removed"), int)
+        and isinstance(resp.json.get("expired"), list)
+        and isinstance(resp.json.get("running_over_max_age"), int)
+    ):
+        return resp.json
+    raise _unexpected("prune_jobs", resp.status_code, resp.json)
 
 
 async def list_jobs(

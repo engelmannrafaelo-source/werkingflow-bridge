@@ -764,7 +764,16 @@ async def lifespan(app: FastAPI):
 # Tuning for the watchdog/cleanup loop (see src/jobs/). Stale window = several
 # missed heartbeats (HEARTBEAT_INTERVAL_S=15) → a 'running' job whose heartbeat
 # froze is presumed worker-dead and requeued (capped by attempts).
-GENERIC_JOB_TTL_SECONDS = 2 * 60 * 60          # 2h, mirrors research jobs
+# Retention (BR11): a TERMINAL job stays readable this long after it became
+# terminal (finished_at), not after submit. Rows still pending/running are
+# never deleted by age — see store.prune_jobs.
+GENERIC_JOB_TTL_SECONDS = 2 * 60 * 60          # 2h after done/error/cancelled
+# Backstop for parked work: a job still 'pending' this long after submit is
+# ended as error JOB_MAX_AGE_EXCEEDED (loud: log + /v1/metrics/jobs-retention).
+# Far above every designed wait: dependency patience 60 s x 240 = 4 h
+# (jobs/registry.py DEPENDENCY_*); capacity waits share the same 240-wait
+# budget at <= 900 s each, so only a pathological capacity drought reaches it.
+GENERIC_JOB_MAX_AGE_SECONDS = 24 * 60 * 60
 GENERIC_JOB_STALE_SECONDS = 90                 # ~6 missed heartbeats
 GENERIC_JOB_MAX_ATTEMPTS = 3
 GENERIC_JOB_MAINTENANCE_INTERVAL_S = 30
@@ -776,21 +785,68 @@ GENERIC_JOB_MAINTENANCE_INTERVAL_S = 30
 GENERIC_JOB_CLAIM_INTERVAL_S = 5
 
 
+async def _generic_jobs_retention_pass(route_missing_streak: int) -> int:
+    """One retention pass (BR11). Returns the new streak of passes refused by a
+    platform-api that predates BR11 (logged on the first and then every 10 min,
+    counted every time)."""
+    try:
+        r = await jobs_store_client.prune_jobs(
+            GENERIC_JOB_TTL_SECONDS, GENERIC_JOB_MAX_AGE_SECONDS
+        )
+    except jobs_store_client.RetentionRouteMissing as e:
+        route_missing_streak += 1
+        if route_missing_streak == 1 or route_missing_streak % 20 == 0:
+            logger.error(
+                f"🛑 jobs retention skipped ({route_missing_streak}x in a row): {e}"
+            )
+        return route_missing_streak
+    if r["removed"]:
+        jobs_store_client.record_retention("removed_terminal", r["removed"])
+    hours = GENERIC_JOB_MAX_AGE_SECONDS // 3600
+    if r["expired"]:
+        jobs_store_client.record_retention("expired_max_age", len(r["expired"]))
+        for job_id in r["expired"]:
+            logger.error(
+                f"💀 Async job {job_id} still pending {hours} h "
+                f"after submit — ended as JOB_MAX_AGE_EXCEEDED"
+            )
+    running_over = r["running_over_max_age"]
+    if running_over:
+        jobs_store_client.record_retention("running_over_max_age_seen", running_over)
+        logger.error(
+            f"⚠️ {running_over} async job(s) running longer than {hours} h "
+            f"after submit — left to runner/watchdog"
+        )
+    if r["removed"]:
+        logger.info(f"🧩 jobs retention: removed={r['removed']} terminal row(s)")
+    return 0
+
+
 async def _generic_jobs_maintenance_loop():
-    """Periodic watchdog (requeue dead-worker jobs / fail-loud exhausted) + TTL
-    cleanup. No-op cheap when there are no jobs."""
+    """Periodic watchdog (requeue dead-worker jobs / fail-loud exhausted) +
+    retention. No-op cheap when there are no jobs. Watchdog and retention fail
+    independently: a platform-api without the retention route must not stop
+    dead-worker recovery."""
+    route_missing_streak = 0
     while True:
         await asyncio.sleep(GENERIC_JOB_MAINTENANCE_INTERVAL_S)
         try:
-            counts = await run_watchdog_pass(GENERIC_JOB_STALE_SECONDS, GENERIC_JOB_MAX_ATTEMPTS)
-            pruned = await jobs_store_client.cleanup_old(GENERIC_JOB_TTL_SECONDS)
-            if counts["requeued"] or counts["failed"] or pruned:
+            counts = await run_watchdog_pass(
+                GENERIC_JOB_STALE_SECONDS, GENERIC_JOB_MAX_ATTEMPTS
+            )
+            if counts["requeued"] or counts["failed"]:
                 logger.info(
                     f"🧩 jobs maintenance: requeued={counts['requeued']} "
-                    f"failed={counts['failed']} pruned={pruned}"
+                    f"failed={counts['failed']}"
                 )
         except Exception as e:
             logger.warning(f"⚠️ generic-jobs maintenance pass failed: {e}")
+        try:
+            route_missing_streak = await _generic_jobs_retention_pass(
+                route_missing_streak
+            )
+        except Exception as e:
+            logger.error(f"⚠️ generic-jobs retention pass failed: {e}")
 
 
 async def _generic_jobs_claim_loop():
@@ -9436,6 +9492,19 @@ async def get_attribution_metrics(
     """
     from src.attribution import snapshot
     return snapshot()
+
+
+@app.get("/v1/metrics/jobs-retention")
+async def get_jobs_retention_metrics(
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(security)
+):
+    """Async-job retention and lost-row counters (per worker, in-memory since
+    start, BR11). `row_missing_by_op`: writes that found their job row gone
+    (mark_done/mark_error = a finished result lost) — must stay empty.
+    `retention`: removed_terminal, expired_max_age (pending past the 24 h
+    backstop), running_over_max_age_seen, prune_route_missing (platform-api
+    predates BR11, nothing deleted). See src/jobs/store_client.py."""
+    return jobs_store_client.retention_snapshot()
 
 
 @app.get("/v1/metrics/anonymization")
