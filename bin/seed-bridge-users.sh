@@ -108,7 +108,10 @@ phase_header 2 "SEED TENANTS"
 python3 - <<PYEOF
 import json, sys, requests
 
-creds = json.load(open('${CREDENTIALS_JSON}'))
+import sys as _sys
+_sys.path.insert(0, '${APPS_ROOT}/../packages/testkonten')
+import testkonten as _testkonten  # passwordRef -> Infisical; fehlt ein Wert: laut (Exit != 0)
+creds = _testkonten.lade_datei('${CREDENTIALS_JSON}')
 users = creds.get('users', {})
 headers = {
     'Content-Type': 'application/json',
@@ -196,7 +199,10 @@ phase_header "2b" "SEED TENANT BILLING ADDRESS"
 python3 - <<PYEOF
 import json, sys, requests
 
-creds = json.load(open('${CREDENTIALS_JSON}'))
+import sys as _sys
+_sys.path.insert(0, '${APPS_ROOT}/../packages/testkonten')
+import testkonten as _testkonten  # passwordRef -> Infisical; fehlt ein Wert: laut (Exit != 0)
+creds = _testkonten.lade_datei('${CREDENTIALS_JSON}')
 users = creds.get('users', {})
 headers = {
     'Content-Type': 'application/json',
@@ -266,7 +272,10 @@ python3 - <<PYEOF
 import json, sys, requests
 from pathlib import Path
 
-creds = json.load(open('${CREDENTIALS_JSON}'))
+import sys as _sys
+_sys.path.insert(0, '${APPS_ROOT}/../packages/testkonten')
+import testkonten as _testkonten  # passwordRef -> Infisical; fehlt ein Wert: laut (Exit != 0)
+creds = _testkonten.lade_datei('${CREDENTIALS_JSON}')
 users = creds.get('users', {})
 if not users:
     print("  [FAIL]  No users defined in test-credentials.json", file=sys.stderr)
@@ -493,7 +502,10 @@ phase_header 4 "VERIFICATION"
 python3 - <<PYEOF
 import json, sys, requests
 
-creds = json.load(open('${CREDENTIALS_JSON}'))
+import sys as _sys
+_sys.path.insert(0, '${APPS_ROOT}/../packages/testkonten')
+import testkonten as _testkonten  # passwordRef -> Infisical; fehlt ein Wert: laut (Exit != 0)
+creds = _testkonten.lade_datei('${CREDENTIALS_JSON}')
 expected_emails = {u['email'] for u in creds.get('users', {}).values()}
 
 headers = {'X-Bridge-Service-Token': '${BRIDGE_SERVICE_TOKEN}'}
@@ -561,7 +573,10 @@ phase_header 5 "BILLING PROVISION"
 python3 - <<PYEOF
 import json, sys, requests
 
-creds = json.load(open('${CREDENTIALS_JSON}'))
+import sys as _sys
+_sys.path.insert(0, '${APPS_ROOT}/../packages/testkonten')
+import testkonten as _testkonten  # passwordRef -> Infisical; fehlt ein Wert: laut (Exit != 0)
+creds = _testkonten.lade_datei('${CREDENTIALS_JSON}')
 users = creds.get('users', {})
 
 headers = {
@@ -794,7 +809,10 @@ phase_header 6 "APP LICENSE GRANT"
 python3 - <<PYEOF
 import json, sys, requests
 
-creds = json.load(open('${CREDENTIALS_JSON}'))
+import sys as _sys
+_sys.path.insert(0, '${APPS_ROOT}/../packages/testkonten')
+import testkonten as _testkonten  # passwordRef -> Infisical; fehlt ein Wert: laut (Exit != 0)
+creds = _testkonten.lade_datei('${CREDENTIALS_JSON}')
 users = creds.get('users', {})
 
 headers = {
