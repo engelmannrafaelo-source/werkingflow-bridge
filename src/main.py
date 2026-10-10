@@ -4816,12 +4816,14 @@ async def _pool_berichtsdatei_nachholen(
             usage = usage or {"input_tokens": 0, "output_tokens": 0, "cache_read_tokens": 0, "cache_creation_tokens": 0}
             for k in usage:
                 usage[k] += u[k]
-    from src.claude_cli import find_truncation_marker
-    marker = find_truncation_marker(chunks)
-    if marker is not None:
+    from src.claude_cli import find_unfinished_result
+    unfertig = find_unfinished_result(chunks)
+    if unfertig is not None:
+        # error_max_turns too: written with Write and then Edit, the file
+        # exists after the first part and looks like a finished report.
         raise ResearchReportMissing(
-            f"The round to write the report file was cut off ({marker.get('subtype')}) — "
-            f"a partly written {datei.name} is not handed out.",
+            f"The round to write the report file ended with {unfertig.get('subtype')} instead of "
+            f"success — a partly written {datei.name} is not handed out.",
             usage,
         )
     if not datei.is_file():
@@ -4918,14 +4920,15 @@ async def _pool_luecken_rueckrunde(
             for k in rr_usage:
                 rr_usage[k] += u[k]
     nachkontrolle.rueckrunde_usage = dict(rr_usage or {}, usage_source="api" if rr_usage else "missing")
-    from src.claude_cli import find_truncation_marker
-    _rr_marker = find_truncation_marker(chunks)
-    if _rr_marker is not None:
-        # Abgebrochene Rueckrunde (ZB3D): eine halb ueberarbeitete Datei geht
-        # nicht raus — der Bericht von vorher kommt zurueck an seinen Platz.
+    from src.claude_cli import find_unfinished_result
+    _rr_unfertig = find_unfinished_result(chunks)
+    if _rr_unfertig is not None:
+        # Rueckrunde nicht mit success beendet (abgeschnitten ZB3D, oder
+        # error_max_turns mitten im Ueberarbeiten): eine halb ueberarbeitete
+        # Datei geht nicht raus — der Bericht von vorher kommt zurueck an seinen Platz.
         if datei is not None:
             datei.write_text(bericht, encoding="utf-8")
-        return scheitern(f"Rückrunde abgeschnitten ({_rr_marker.get('subtype')})")
+        return scheitern(f"Rückrunde abgeschnitten ({_rr_unfertig.get('subtype')})")
     if pool_pplx.gate_error:
         # Same rule as the first round: a report written while the privacy
         # gate was broken is not handed out — the caller raises on gate_error.
@@ -5345,6 +5348,22 @@ async def _execute_research_impl(
                         "Check worker logs for rate_limit_event around session start."
                     ),
                 },
+            )
+
+        # The run itself must have ended with success. error_max_turns is not
+        # caught by the truncation check above (run_completion counts it as
+        # complete), yet a report written with Write and then Edit already
+        # exists after its first part — a cut-off report that reads like a
+        # finished one. After the quota check, so an exhausted account stays
+        # a retryable RateLimitError, and after the empty-run check with its hint.
+        from src.claude_cli import find_unfinished_result
+        _research_unfertig = find_unfinished_result(all_chunks)
+        if _research_unfertig is not None:
+            raise ResearchReportMissing(
+                f"Research run ended with {_research_unfertig.get('subtype')} instead of success "
+                f"(session_id={session_id}) — "
+                + (f"the report file {container_file} may be partly written and is not handed out."
+                   if container_file else "no report file was written; the chat text is not a report.")
             )
 
         if not content and parsed_assistant_text:

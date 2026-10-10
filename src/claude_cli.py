@@ -908,6 +908,37 @@ def find_truncation_marker(chunks: list) -> Optional[dict]:
     return None
 
 
+RESULT_SUCCESS_SUBTYPES = ("success", "complete")
+
+
+def find_unfinished_result(chunks: list) -> Optional[dict]:
+    """
+    The run's result chunk if the run did NOT end with success, else None.
+
+    Wider than find_truncation_marker: also error_max_turns (run_completion
+    counts it as "complete", so no truncation marker follows), any other
+    error subtype, and a success subtype flagged is_error. For callers whose
+    output is a file the run writes in parts (Write, then Edit): a run that
+    stopped at the turn limit leaves a partly written file that looks like a
+    finished one. A stream without any result chunk counts as unfinished —
+    the real CLI path always yields one (result or explicit marker).
+
+    Both result shapes count: CLI JSON / synthetic markers (type='result')
+    and the converted SDK ResultMessage (no 'type' key, has 'subtype').
+    """
+    result = None
+    for chunk in chunks:
+        if not isinstance(chunk, dict):
+            continue
+        if chunk.get("type") == "result" or ("type" not in chunk and "subtype" in chunk):
+            if chunk.get("is_error") or chunk.get("subtype") not in RESULT_SUCCESS_SUBTYPES:
+                return chunk
+            result = chunk
+    if result is None:
+        return {"type": "result", "subtype": "no_result", "is_error": True}
+    return None
+
+
 def apply_thinking_budget(options: "ClaudeCodeOptions", max_thinking_tokens: Optional[int]) -> None:
     """Set the CLI thinking budget on the SUBPROCESS env of this run only.
 

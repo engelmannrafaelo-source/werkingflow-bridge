@@ -257,9 +257,10 @@ _ABGESCHNITTEN = {"type": "result", "subtype": "no_completion_marker", "is_error
 class _AbgeschnittenCli(FakeCli):
     """Wie FakeCli, aber die genannte Rolle endet ohne Result-Nachricht der CLI."""
 
-    def __init__(self, workdir, rolle, **kw):
+    def __init__(self, workdir, rolle, ende=_ABGESCHNITTEN, **kw):
         super().__init__(workdir, **kw)
         self.rolle = rolle
+        self.ende = ende
 
     def __call__(self, **kw):
         rolle = ("rueckrunde" if kw.get("resume_workdir") is not None
@@ -271,7 +272,7 @@ class _AbgeschnittenCli(FakeCli):
         async def abgeschnitten():
             async for c in stream:
                 if isinstance(c, dict) and c.get("subtype") == "success":
-                    c = _ABGESCHNITTEN
+                    c = self.ende
                 yield c
         return abgeschnitten()
 
@@ -293,6 +294,22 @@ async def test_abgeschnittene_rueckrunde_stellt_bericht_wieder_her(tmp_path, per
     assert fake.datei.read_text(encoding="utf-8") == ALT
     meta = persist.await_args.kwargs["provider_meta"]
     assert "abgeschnitten" in meta["rueckrunde_fehler"]
+
+
+@pytest.mark.asyncio
+async def test_rueckrunde_an_max_turns_stellt_bericht_wieder_her(tmp_path, persist, pplx_on):
+    """BR2R M1, same place: error_max_turns mid-rewrite is no finished round
+    (run_completion counts it as complete, so no truncation marker follows)."""
+    work = tmp_path / "work"
+    work.mkdir()
+    ende = {"type": "result", "subtype": "error_max_turns", "is_error": True,
+            "usage": {"input_tokens": 30, "output_tokens": 40}}
+    fake = _AbgeschnittenCli(work, "rueckrunde", ende=ende, mit_datei=True)
+    result = await _run(fake)
+    assert result.status == "success" and result.content == ALT
+    assert fake.datei.read_text(encoding="utf-8") == ALT
+    meta = persist.await_args.kwargs["provider_meta"]
+    assert "error_max_turns" in meta["rueckrunde_fehler"]
 
 
 @pytest.mark.asyncio

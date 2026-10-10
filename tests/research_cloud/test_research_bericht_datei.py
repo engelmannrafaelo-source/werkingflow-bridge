@@ -77,8 +77,13 @@ class FakeCli:
     """Research run that answers in chat (a script) and writes `files`; the
     repair round (resume_workdir set) writes the report if `repariert`."""
 
-    def __init__(self, workdir: Path, *, files=None, chat=SKRIPT, repariert=True, session_id="cli-sess-1"):
+    def __init__(self, workdir: Path, *, files=None, chat=SKRIPT, repariert=True, session_id="cli-sess-1",
+                 research_ende=None, nachhol_ende=None, nachhol_text=BERICHT):
         self.workdir = workdir
+        # Result chunk a round ends with; None = success. M1: error_max_turns.
+        self.research_ende = research_ende
+        self.nachhol_ende = nachhol_ende
+        self.nachhol_text = nachhol_text
         self.files = files or {}
         self.chat = chat
         self.repariert = repariert
@@ -90,11 +95,13 @@ class FakeCli:
         if kw.get("resume_workdir") is not None:
             self.calls["nachhol"].append(kw)
             if self.repariert:
-                self.datei.write_text(BERICHT, encoding="utf-8")
+                self.datei.write_text(self.nachhol_text, encoding="utf-8")
+            result = {"type": "result", "subtype": "success", "session_id": self.session_id,
+                      "usage": {"input_tokens": 20, "output_tokens": 900}}
+            result.update(self.nachhol_ende or {})
             return _stream(
                 {"content": [{"type": "text", "text": "Bericht in die Datei geschrieben."}]},
-                {"type": "result", "subtype": "success", "session_id": self.session_id,
-                 "usage": {"input_tokens": 20, "output_tokens": 900}},
+                result,
             )
         self.calls["research"].append(kw)
         (self.workdir / "claudedocs").mkdir(parents=True, exist_ok=True)
@@ -111,6 +118,7 @@ class FakeCli:
         result = {"type": "result", "subtype": "success", "usage": {"input_tokens": 100, "output_tokens": 200}}
         if self.session_id:
             result["session_id"] = self.session_id
+        result.update(self.research_ende or {})
         return _stream({"content": [{"type": "text", "text": self.chat}]}, result, meta)
 
 
@@ -213,6 +221,85 @@ async def test_kopie_an_output_path(tmp_path, persist):
     result = await _run(fake, _make_req(output_path=str(ziel)))
     assert result.output_file == str(ziel)
     assert ziel.read_text(encoding="utf-8") == BERICHT
+
+
+# --- M1: a round that does not end with success is no report ---------------
+
+MAX_TURNS = {"subtype": "error_max_turns", "is_error": True}
+TEILBERICHT = "# Research Report\n\n## Summary\n" + "Erster Teil, per Write geschrieben. " * 20
+
+
+@pytest.mark.asyncio
+async def test_nachholrunde_an_max_turns_gibt_keinen_teilbericht_aus(tmp_path, persist):
+    """BR2R M1: the repair round writes the first part with Write, hits its
+    turn limit during the Edits. output.md exists — and is half a report."""
+    fake = FakeCli(tmp_path, nachhol_ende=MAX_TURNS, nachhol_text=TEILBERICHT)
+    result = await _run(fake)
+    assert fake.datei.read_text(encoding="utf-8") == TEILBERICHT
+    assert result.status == "error"
+    assert result.content is None
+    assert "error_max_turns" in result.error and "not handed out" in result.error
+    booked = persist.await_args.kwargs
+    assert booked["status"] == "error"
+    assert booked["input_tokens"] == 120 and booked["output_tokens"] == 1100
+
+
+@pytest.mark.asyncio
+async def test_hauptlauf_an_max_turns_gibt_keinen_teilbericht_aus(tmp_path, persist):
+    """Same gap in the run itself: report file partly written, run stopped at
+    max_turns. No repair round either — the run did not finish."""
+    fake = FakeCli(tmp_path, files={"output.md": TEILBERICHT}, chat="weiter mit Abschnitt 3",
+                   research_ende=MAX_TURNS)
+    result = await _run(fake)
+    assert result.status == "error"
+    assert result.content is None
+    assert "error_max_turns" in result.error and str(fake.datei) in result.error
+    assert fake.calls["nachhol"] == []
+
+
+@pytest.mark.asyncio
+async def test_hauptlauf_an_max_turns_ohne_datei_keine_nachholrunde(tmp_path, persist):
+    fake = FakeCli(tmp_path, research_ende=MAX_TURNS)
+    result = await _run(fake)
+    assert result.status == "error" and "error_max_turns" in result.error
+    assert "write_text" not in (result.content or "")
+    assert fake.calls["nachhol"] == []
+
+
+@pytest.mark.asyncio
+async def test_hauptlauf_sdk_resultmessage_an_max_turns(tmp_path, persist):
+    """The converted SDK ResultMessage has no 'type' key — it counts too."""
+    fake = FakeCli(tmp_path, files={"output.md": TEILBERICHT}, chat="fertig",
+                   research_ende={"type": None, **MAX_TURNS})
+
+    def ohne_type(**kw):
+        async def strom():
+            async for c in fake(**kw):
+                if isinstance(c, dict) and "type" in c and c["type"] is None:
+                    c = {k: v for k, v in c.items() if k != "type"}
+                yield c
+        return strom()
+
+    result = await _run(ohne_type)
+    assert result.status == "error" and "error_max_turns" in result.error
+
+
+@pytest.mark.asyncio
+async def test_success_mit_is_error_ist_kein_erfolg(tmp_path, persist):
+    fake = FakeCli(tmp_path, files={"output.md": BERICHT}, chat="fertig", research_ende={"is_error": True})
+    result = await _run(fake)
+    assert result.status == "error"
+
+
+def test_find_unfinished_result_formen():
+    from src.claude_cli import find_unfinished_result
+    ok = {"type": "result", "subtype": "success"}
+    assert find_unfinished_result([{"content": []}, ok]) is None
+    assert find_unfinished_result([{"subtype": "success", "usage": {}}]) is None
+    assert find_unfinished_result([{"subtype": "error_max_turns"}])["subtype"] == "error_max_turns"
+    assert find_unfinished_result([ok, {"type": "result", "subtype": "no_completion_marker", "is_error": True}])
+    assert find_unfinished_result([{"content": []}])["subtype"] == "no_result"
+    assert find_unfinished_result([{"type": "x_claude_metadata", "files_created": []}, ok]) is None
 
 
 # --- prompt -----------------------------------------------------------------
