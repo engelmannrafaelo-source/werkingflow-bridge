@@ -215,8 +215,17 @@ async def run_generic_job(
     attribution: Optional[Dict[str, Any]],
 ) -> None:
     """Entry point for a FRESH job (status 'pending'): claim it for this worker
-    (pending → running, attempts 0 → 1), then run the body."""
-    await store_client.mark_running(job_id)
+    (pending → running, attempts 0 → 1), then run the body.
+
+    The claim is conditional (BR10): a job its owner cancelled between submit
+    and this dispatch — or one the watchdog already took — is not 'pending'
+    any more, and running it anyway would do (and bill) work nobody wants."""
+    if not await store_client.mark_running(job_id):
+        logger.warning(
+            f"⏭️ Async job {job_id} (kind={kind}) not started: no longer pending "
+            f"at dispatch (cancelled by its owner, or already claimed)"
+        )
+        return
     await _run_body(job_id, kind, payload, attribution)
 
 
