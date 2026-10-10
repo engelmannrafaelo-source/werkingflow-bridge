@@ -128,8 +128,9 @@ def test_nutzerzug_und_fremde_dicts_zaehlen_nie():
 
 
 def test_parser_traegt_das_feld_ueber_die_sdk():
-    """claude-code-sdk builds AssistantMessage(content, model, parent_tool_use_id)
-    and drops `error`; the resilient parser must keep it."""
+    """claude-code-sdk 0.0.22 (poetry.lock, worker image) builds
+    AssistantMessage(content, model) — 0.0.25 adds parent_tool_use_id — and
+    both drop `error`; the resilient parser must keep it."""
     roh = {
         "type": "assistant",
         "message": {"content": [{"type": "text", "text": LIMIT_TEXT}], "model": "<synthetic>"},
@@ -139,7 +140,7 @@ def test_parser_traegt_das_feld_ueber_die_sdk():
     def sdk_parse(data):
         return sdk.AssistantMessage(
             content=[sdk.TextBlock(text=b["text"]) for b in data["message"]["content"]],
-            model=data["message"]["model"], parent_tool_use_id=data.get("parent_tool_use_id"),
+            model=data["message"]["model"],
         )
 
     parsed = resilient_parse_message(roh, sdk_parse)
