@@ -846,6 +846,23 @@ async def internal_find_abandoned(
     return {"jobs": jobs}
 
 
+@router.get("/jobs-maintenance/active")
+async def internal_find_active(
+    origin: Optional[str] = None,
+    limit: int = 50,
+    _claims: AuthClaims = Depends(require_service_token),
+) -> Dict[str, Any]:
+    """Counts the jobs that depend on a platform-api right now, for the deploy
+    gate in front of a platform-api recreation (BR8). ``origin`` limits the
+    count to jobs whose budget home is that bridge (ADR-0011). Read-only."""
+    from src.jobs import store
+
+    try:
+        return await store.find_active(origin=origin, limit=limit)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
 @router.post("/jobs-maintenance/cleanup")
 async def internal_cleanup_old(
     body: InternalJobCleanup,

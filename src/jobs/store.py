@@ -305,6 +305,65 @@ async def find_abandoned(stale_seconds: int, max_attempts: int) -> List[Dict[str
     return [_row_to_job(r) for r in rows]
 
 
+async def find_active(origin: Optional[str] = None, limit: int = 50) -> Dict[str, Any]:
+    """Jobs that are using, or are about to use, a platform-api right now.
+    Used by the deploy gate that runs before platform-api is recreated
+    (scripts/platform-api-job-gate.py).
+
+    ``active``: running, or pending and due (no wait, or wait over). These are
+    being executed or will be claimed at once. ``waiting``: parked with a wait
+    still running. Counted separately, because a parked job does not call
+    anyone until its wait ends. ``origin`` limits the result to jobs whose
+    budget home (attribution.bridge_origin, ADR-0011) is that bridge. Those are
+    the jobs on THIS store's workers that ask the home bridge's platform-api for
+    pin, identity and budget.
+    """
+    if not (1 <= limit <= 200):
+        raise ValueError(f"limit must be 1–200, got {limit}")
+    params: List[Any] = []
+    origin_clause = ""
+    if origin is not None:
+        params.append(origin.strip().lower())
+        origin_clause = f"AND attribution->>'bridge_origin' = ${len(params)}"
+    # Counted in full (the gate needs the true number); only the listing is
+    # capped at ``limit``. Non-terminal rows are few: the TTL cleanup keeps the
+    # table to the last hour or so.
+    pool = get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            f"""
+            SELECT job_id, kind, status, attribution->>'bridge_origin' AS origin,
+                   updated_at, deferred_until,
+                   (status = 'running' OR {_NOT_DEFERRED}) AS is_active
+              FROM ai_jobs
+             WHERE status IN ('pending', 'running')
+               {origin_clause}
+             ORDER BY updated_at DESC
+            """,
+            *params,
+        )
+    active = [r for r in rows if r["is_active"]]
+    waiting = [r for r in rows if not r["is_active"]]
+
+    def _item(r) -> Dict[str, Any]:
+        return {
+            "job_id": r["job_id"],
+            "kind": r["kind"],
+            "status": r["status"],
+            "origin": r["origin"],
+            "updated_at": r["updated_at"].isoformat() if r["updated_at"] else None,
+            "deferred_until": (
+                r["deferred_until"].isoformat() if r["deferred_until"] else None
+            ),
+        }
+
+    return {
+        "active": len(active),
+        "waiting": len(waiting),
+        "jobs": [_item(r) for r in (active + waiting)[:limit]],
+    }
+
+
 # Valid status values for the list-filter guard (fail loud on unknown status).
 _VALID_STATUSES = frozenset([JOB_STATUS_PENDING, JOB_STATUS_RUNNING, JOB_STATUS_DONE, JOB_STATUS_ERROR])
 

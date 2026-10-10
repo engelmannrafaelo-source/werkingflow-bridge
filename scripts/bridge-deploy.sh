@@ -70,6 +70,7 @@ HETZNER_SVC_erkunder_platz_2="docker-erkunder-platz-2-1"
 HETZNER_SVC_erkunder_platz_3="docker-erkunder-platz-3-1"
 HETZNER_SVC_erkunder_ausgang="docker-erkunder-ausgang-1"
 source "$(dirname "${BASH_SOURCE[0]}")/erkunder-deploy.sh"
+source "$(dirname "${BASH_SOURCE[0]}")/platform-api-job-gate.sh"
 # platform-api is deployed BEFORE nginx so the upstream resolves when nginx
 # restarts. nginx is last so the new routing is live only after platform-api
 # is healthy.
@@ -871,6 +872,20 @@ deploy_one_service() {
             error_ "$container did not become idle within 900s; refusing recreation"
             return 1
         fi
+    fi
+
+    # Do not recreate a platform-api while jobs depend on it, including jobs on
+    # the PEER bridge's workers whose budget home is this bridge (ADR-0011,
+    # BR7/BR8). Return 3 = refused before any change: the caller must not
+    # roll this service back (a rollback recreates it, which is the gap this
+    # gate avoids).
+    if [[ "$svc" == platform-api ]]; then
+        local gate_prefix=""
+        case "$host" in
+            "$HETZNER_HOST") gate_prefix="HETZNER" ;;
+            "$SERVER2_HOST") gate_prefix="SERVER2" ;;
+        esac
+        platform_api_job_gate "$gate_prefix" || return 3
     fi
 
     # Recreate — NEVER --remove-orphans
@@ -2034,9 +2049,15 @@ deploy_server() {
         elif [[ "$svc" != erkunder* ]]; then
             DEPLOYED_SERVICES+=("$svc")
         fi
-        if deploy_one_service "$host" "$compose" "$svc" "$container" "$build_list"; then
-            :
-        else
+        local svc_rc=0
+        deploy_one_service "$host" "$compose" "$svc" "$container" "$build_list" || svc_rc=$?
+        if (( svc_rc != 0 )); then
+            if (( svc_rc == 3 )); then
+                # Refused before recreation (platform-api job gate): this
+                # service was not touched, so it is not part of the rollback.
+                unset 'DEPLOYED_SERVICES[${#DEPLOYED_SERVICES[@]}-1]'
+                error_ "Deploy refused for ${svc} before any change to it"
+            fi
             error_ "Deploy failed for ${svc} — initiating rollback"
             if [[ ${#DEPLOYED_SERVICES[@]} -gt 0 ]]; then
                 phase_rollback "$host" "$compose" "$ROLLBACK_SHA" "$build_list" "${DEPLOYED_SERVICES[@]}"

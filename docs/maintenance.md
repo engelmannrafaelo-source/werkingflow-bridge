@@ -30,6 +30,48 @@ Vor dem Commit `git var GIT_AUTHOR_IDENT` und
 Bereits veroeffentlichte Commits werden wegen einer falschen Identitaet nicht
 umgeschrieben; die Herkunftsberichtigung gehoert in den zugehoerigen Befund.
 
+## platform-api im Deploy
+
+Seit ADR-0011 haengen an einer platform-api auch Jobs, die auf den Workern
+der ANDEREN Bridge laufen: Ein Job mit Herkunft dev auf einem Prod-Worker
+fragt Pin, Identitaet und Budget bei der Dev-platform-api ab. Das Neuanlegen
+der platform-api laesst rund 3 s ohne Antwort (gemessen 10.10.2026, BR7).
+Zwei Stellen sorgen dafuer, dass daraus kein endgueltig gescheiterter Job wird.
+
+- **Im Code.** Die Pin-Abfrage und die Identitaetsaufloesung davor
+  wiederholen sich nach `RESTART_BRIDGING_BACKOFFS_S`
+  (`src/platform_client.py`), insgesamt etwa 7,5 s, mit fester Obergrenze.
+  Antwortet die platform-api auch dann nicht, bleibt die Abfrage fail-closed:
+  Es wird nichts geraten. Die Ablehnung ist dann aber wiederholbar
+  (`ProviderConfigTemporarilyUnavailable`). Der Endpunkt setzt dazu
+  `X-Bridge-Dependency-Unavailable: provider-config`, der Job-Executor macht
+  daraus 424, und der Runner stellt den Job zurueck. Die Frist steht in
+  `registry.DEPENDENCY_PATIENCE`: etwa 15 min, danach scheitert der Job laut
+  mit `UPSTREAM_HTTP_424`. Echte Antworten bleiben sofort endgueltig, also
+  401/403/404 der Heimat-Bridge, ein unbekannter Anbieter oder ein fehlender
+  Peer.
+- **Im Deploy.** Vor dem Neuanlegen von `platform-api` laeuft
+  `scripts/platform-api-job-gate.sh`. Die Probe
+  (`scripts/platform_api_job_gate.py`, nur Standardbibliothek) wird per stdin
+  in einen laufenden Worker der betroffenen Bridge gereicht. Sie fragt
+  lesend `GET /v1/internal/jobs-maintenance/active`, und zwar beim lokalen
+  Store nach allen aktiven Jobs und bei jedem Peer aus `FEDERATION_PEERS`
+  nach den Jobs mit dieser Bridge als Herkunft. Solange Jobs aktiv sind,
+  wartet der Deploy, hoechstens `PLATFORM_API_JOBGATE_WAIT_S` Sekunden
+  (Default 900, 0 = nur pruefen). Sind danach noch Jobs aktiv oder ist der
+  Zustand nicht pruefbar, lehnt er ab. Die platform-api wird dabei nicht
+  angefasst und auch nicht zurueckgerollt.
+- **Einfuehrung.** Hat ein Ziel den Endpunkt noch nicht (HTTP 404, Image vor
+  BR8), lehnt der Deploy ab und nennt `PLATFORM_API_JOBGATE_EINFUEHRUNG=1`.
+  Der Schalter gilt nur fuer den einen Aufruf und nur fuer 404, nie fuer
+  Timeouts oder andere Fehler. Er gehoert in ein ruhiges Zeitfenster.
+  Solange eine Bridge die alte Fassung faehrt, sieht der Gate deren Jobs
+  nicht.
+- **Kein rollender Ersatz.** Die platform-api hat einen festen
+  Containernamen und einen festen Tailnet-Port (8300). Ohne vorgeschalteten
+  Proxy koennen zwei Instanzen nicht nebeneinander laufen. Die Luecke bleibt
+  also, der Gate bestimmt nur, wann sie entsteht.
+
 ## Erkunder im Deploy
 
 Auf dem Dev-Ziel gehoeren Ausgang, drei Plaetze und Leitstand zu einer
