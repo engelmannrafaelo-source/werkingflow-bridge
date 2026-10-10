@@ -15,9 +15,9 @@ from typing import List, Dict, Any, Optional, AsyncGenerator
 
 import boto3
 from botocore.config import Config
-from botocore.exceptions import ClientError
+from botocore.exceptions import ClientError, HTTPClientError
+from botocore.exceptions import ConnectionError as BotocoreConnectionError
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 from config.logging_config import get_logger
@@ -30,6 +30,7 @@ from src.models import (
 )
 from src.model_registry import resolve_model, to_bedrock_model_id, model_supports_temperature
 from src.routing.backend_router import _resolve_privacy_mode
+from src.stream_start import event_stream_response
 
 logger = get_logger(__name__)
 
@@ -97,6 +98,20 @@ def _client_error_status(code: str) -> int:
     return 500
 
 
+def _unclassified_verdict(exc: BaseException) -> bool:
+    """Urteil fuer eine Ausnahme, die weder ClientError noch BedrockStreamAborted
+    ist — dieselbe Regel fuer den synchronen Weg und den Strom (BR9R).
+
+    botocore-Transportfehler (Verbindung, Endpoint, Connect-/Read-Timeout,
+    geschlossene Verbindung) koennen beim naechsten Mal gelingen: true. Alles
+    andere (ParamValidationError, fehlende Zugangsdaten, ein KeyError beim
+    Lesen einer schon bezahlten Antwort) ist nicht eingeordnet und wird nicht
+    als wiederholbar versprochen (src/error_contract.py Regel 3)."""
+    if isinstance(exc, (HTTPClientError, BotocoreConnectionError)):
+        return True
+    return UNCLASSIFIED_RETRYABLE
+
+
 def _stream_error_event(exc: BaseException) -> str:
     """``event: error`` eines Bedrock-Stroms, mit Urteil (src/error_contract.py).
 
@@ -109,7 +124,7 @@ def _stream_error_event(exc: BaseException) -> str:
         code = (exc.response.get("Error") or {}).get("Code", "")
         verdict = fields(is_retryable_status(_client_error_status(code)))
     else:
-        verdict = fields(UNCLASSIFIED_RETRYABLE)
+        verdict = fields(_unclassified_verdict(exc))
     return f"event: error\ndata: {json.dumps({'error': str(exc), **verdict})}\n\n"
 
 
@@ -437,7 +452,12 @@ async def call_bedrock(
         raise
     except Exception as e:
         logger.error(f"Bedrock API error: {e}")
-        raise HTTPException(status_code=500, detail=f"Bedrock API error: {str(e)}")
+        # Status bleibt der Sammelstatus 500, das Urteil ist ausdruecklich
+        # (Regel 1): sonst leitete der Handler aus 500 "wiederholbar" ab.
+        raise HTTPException(status_code=500, detail={
+            "message": f"Bedrock API error: {str(e)}",
+            **fields(_unclassified_verdict(e)),
+        })
 
 
 async def stream_bedrock(
@@ -639,10 +659,7 @@ async def chat_completions(request: ChatCompletionRequest):
     """OpenAI-compatible chat completions via Bedrock."""
 
     if request.stream:
-        return StreamingResponse(
-            stream_bedrock(request),
-            media_type="text/event-stream"
-        )
+        return await event_stream_response(stream_bedrock(request))
 
     return await call_bedrock(request)
 

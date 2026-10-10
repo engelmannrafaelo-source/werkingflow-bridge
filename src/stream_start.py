@@ -1,0 +1,180 @@
+"""stream_start — the ONE place where a streamed answer begins (BR9c, 10.10.2026).
+
+A streamed answer is a StreamingResponse over an async generator. Starlette
+sends status line and headers before the generator runs, so before BR9c
+every failure up to the first chunk — OpenAI-compatible upstream != 200 or
+network gone after retries, Bedrock model/region mismatch, CLI
+WorkerUnavailableError — reached the client as "200, no event: error, no
+[DONE]": indistinguishable from a dropped connection, and without a verdict.
+
+event_stream_response() pulls the first chunk inside the route handler:
+
+  * Failure before the first chunk: nothing is sent yet, so the exception
+    leaves the route exactly like on the non-streaming path and the app's
+    exception handlers answer with a real HTTP status and the error_contract
+    fields (WorkerUnavailableError → 429 failover to the next worker,
+    HTTPException → bridge_error, anything else → classify_exception).
+    ProviderError is the one exception that carries an upstream status no
+    handler knows; it is translated here (provider_start_error).
+  * Failure after the first chunk: the 200 is out. The stream ends with
+    ``event: error`` carrying retryable / retry_after_s (stream_error_event);
+    no [DONE] follows.
+
+Headers go out with the first chunk, not before it. A caller waits for the
+headers as long as it waits for the first token — never longer than the
+non-streaming path waits for the whole answer.
+"""
+import json
+import logging
+from typing import Any, AsyncIterator, Dict, Mapping, Optional
+
+from fastapi.responses import StreamingResponse
+from starlette.exceptions import HTTPException as StarletteHTTPException
+
+from src.error_contract import (
+    UNCLASSIFIED_RETRYABLE,
+    envelope_fields,
+    fields,
+    is_retryable_status,
+)
+
+logger = logging.getLogger(__name__)
+
+# Wire status for a provider that rejected the bridge's own credentials: the
+# caller's request is fine, the bridge's dependency is not (like Bedrock's
+# AccessDenied → 424). Passing 401/403 through would read as "your key".
+_PROVIDER_REJECTED_STATUS = 424
+
+
+def provider_retryable(status_code: int) -> bool:
+    """Verdict for an OpenAI-compatible provider status (rule 2), including
+    the network failure after retries, which has no HTTP status of its own."""
+    from src.providers.openai_compatible import NETWORK_ERROR_STATUS
+
+    return status_code == NETWORK_ERROR_STATUS or is_retryable_status(status_code)
+
+
+def stream_error_verdict(exc: BaseException) -> Dict[str, Any]:
+    """retryable / retry_after_s for an exception that ends a stream."""
+    from src.claude_cli import WorkerUnavailableError
+    from src.middleware.bridge_error import BridgeError
+    from src.providers.openai_compatible import ProviderError
+
+    # Rule 1: the raiser's own verdict (BedrockStreamAborted, JobFailure, ...).
+    own = getattr(exc, "retryable", None)
+    if isinstance(own, bool):
+        return fields(own, getattr(exc, "retry_after_s", None))
+    if isinstance(exc, ProviderError):
+        return fields(provider_retryable(exc.status_code))
+    if isinstance(exc, WorkerUnavailableError):
+        # Another worker can serve it; before the first chunk this is nginx's
+        # 429 failover, after it the caller has to ask again.
+        return fields(True)
+    if isinstance(exc, BridgeError):
+        try:
+            body = json.loads(exc.response.body)
+        except (AttributeError, TypeError, ValueError):
+            body = None
+        return envelope_fields(body) or fields(UNCLASSIFIED_RETRYABLE)
+    if isinstance(exc, StarletteHTTPException):
+        return envelope_fields(exc.detail) or fields(is_retryable_status(exc.status_code))
+    return fields(UNCLASSIFIED_RETRYABLE)
+
+
+def stream_error_event(exc: BaseException) -> str:
+    """``event: error`` that ends a stream after its first chunk."""
+    detail = getattr(exc, "detail", None)
+    message = detail if isinstance(detail, str) else str(exc) or type(exc).__name__
+    payload = {"error": {
+        "message": message,
+        "type": "streaming_error",
+        "code": type(exc).__name__,
+        **stream_error_verdict(exc),
+    }}
+    return f"event: error\ndata: {json.dumps(payload)}\n\n"
+
+
+def provider_start_error(exc: Any) -> Exception:
+    """BridgeError for a ProviderError raised before the first chunk.
+
+    Transient (429/5xx, network after retries) → 429 with Retry-After, the
+    worker contract for "come back later". Rejected credentials → 424.
+    Any other rejection keeps its 4xx; the rest is 424. All non-transient
+    ones say retryable:false explicitly (a provider 501 is not a bridge 500).
+    """
+    from src.middleware.bridge_error import (
+        SOURCE_UPSTREAM_NETWORK,
+        SOURCE_UPSTREAM_PROVIDER,
+        TYPE_UPSTREAM_ERROR,
+        TYPE_UPSTREAM_TIMEOUT,
+        BridgeError,
+        bridge_error,
+    )
+    from src.providers.openai_compatible import NETWORK_ERROR_STATUS
+
+    status = exc.status_code
+    message = f"OpenAI-compatible provider failed before the first chunk: {exc}"
+    if provider_retryable(status):
+        network = status == NETWORK_ERROR_STATUS
+        return BridgeError(bridge_error(
+            source=SOURCE_UPSTREAM_NETWORK if network else SOURCE_UPSTREAM_PROVIDER,
+            error_type=TYPE_UPSTREAM_TIMEOUT if network else TYPE_UPSTREAM_ERROR,
+            reason="provider_upstream_network" if network else "provider_upstream_error",
+            message=message,
+            status_code=429,
+            retry_after_s=15,
+            retryable_override=True,
+            extra={"upstream_status": None if network else status},
+        ))
+    if status in (401, 403):
+        wire = _PROVIDER_REJECTED_STATUS
+    elif 400 <= status < 500:
+        wire = status
+    else:
+        wire = _PROVIDER_REJECTED_STATUS
+    return BridgeError(bridge_error(
+        source=SOURCE_UPSTREAM_PROVIDER,
+        error_type=TYPE_UPSTREAM_ERROR,
+        reason="provider_upstream_rejected",
+        message=message,
+        status_code=wire,
+        retryable_override=False,
+        extra={"upstream_status": status},
+    ))
+
+
+async def _rest(first: Optional[str], gen: AsyncIterator[str]) -> AsyncIterator[str]:
+    try:
+        if first is None:
+            return
+        yield first
+        async for chunk in gen:
+            yield chunk
+    except Exception as exc:  # the 200 is out: end as event: error
+        logger.error(f"Stream failed after its first chunk: {type(exc).__name__}: {exc}")
+        yield stream_error_event(exc)
+    finally:
+        await gen.aclose()
+
+
+async def event_stream_response(
+    gen: AsyncIterator[str],
+    *,
+    headers: Optional[Mapping[str, str]] = None,
+    media_type: str = "text/event-stream",
+) -> StreamingResponse:
+    """StreamingResponse that starts only once ``gen`` produced its first
+    chunk. A failure before that leaves the route as an exception (HTTP error
+    with verdict); a failure after it ends the stream as ``event: error``."""
+    from src.providers.openai_compatible import ProviderError
+
+    try:
+        first: Optional[str] = await gen.__anext__()
+    except StopAsyncIteration:
+        first = None
+    except ProviderError as exc:
+        raise provider_start_error(exc) from exc
+    return StreamingResponse(
+        _rest(first, gen), media_type=media_type,
+        headers=dict(headers) if headers else None,
+    )

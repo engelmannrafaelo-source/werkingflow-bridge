@@ -59,6 +59,11 @@ def _backoff_delay(attempt: int) -> float:
     return random.uniform(0, capped)
 
 
+# Status a ProviderError carries for a network failure that outlived the
+# retries: there is no upstream HTTP status. Transient (stream_start).
+NETWORK_ERROR_STATUS = 599
+
+
 class ProviderError(RuntimeError):
     """Error from an OpenAI-compatible provider, carrying the HTTP status code."""
 
@@ -178,7 +183,7 @@ async def call_openai_compatible(
     if isinstance(last_error, ProviderError):
         raise last_error
     raise ProviderError(
-        status_code=599,
+        status_code=NETWORK_ERROR_STATUS,
         message=f"Transient network error after retries: {last_error}",
     )
 
@@ -314,6 +319,6 @@ async def stream_openai_compatible(
     if isinstance(last_error, ProviderError):
         raise last_error
     raise ProviderError(
-        status_code=599,
+        status_code=NETWORK_ERROR_STATUS,
         message=f"Transient network error after retries: {last_error}",
     )

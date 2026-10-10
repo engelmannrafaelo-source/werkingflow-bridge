@@ -16,7 +16,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, Request, Depends
 from fastapi.security import HTTPAuthorizationCredentials
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse, JSONResponse, Response
+from fastapi.responses import JSONResponse, Response
 from fastapi.exceptions import RequestValidationError
 from pydantic import ValidationError
 from dotenv import load_dotenv
@@ -104,6 +104,7 @@ from src.jobs.executors import (
     doc_agent_executor,
     erkunder_executor,
 )
+from src.stream_start import event_stream_response  # noqa: E402
 from src.parameter_validator import ParameterValidator, CompatibilityReporter
 from src.model_registry import (
     get_models_for_api,
@@ -2151,7 +2152,10 @@ async def generate_streaming_response(
         yield "data: [DONE]\n\n"
 
     except WorkerUnavailableError:
-        # Re-raise to trigger HTTP 503 and Nginx failover
+        # Before the first chunk event_stream_response lets this leave the
+        # route: worker_unavailable_handler answers 429 and nginx fails over.
+        # After it, event_stream_response ends the stream as event: error
+        # (retryable) — a started 200 cannot fail over (BR9c).
         raise
 
     except Exception as e:
@@ -3059,9 +3063,8 @@ async def chat_completions(
                         },
                     )
 
-                return StreamingResponse(
+                return await event_stream_response(
                     _tracked_bedrock_stream(),
-                    media_type="text/event-stream",
                     headers={
                         "Cache-Control": "no-cache",
                         "Connection": "keep-alive",
@@ -3077,7 +3080,10 @@ async def chat_completions(
                         input_tokens=0, output_tokens=0, status="error",
                         duration_ms=int((time.time() - start_time) * 1000),
                         error_code=str(bedrock_err.status_code),
-                        error_message=str(bedrock_err.detail),
+                        error_message=str(
+                            bedrock_err.detail.get("message", bedrock_err.detail)
+                            if isinstance(bedrock_err.detail, dict) else bedrock_err.detail
+                        ),
                         provider_meta={
                             "bedrock_model_id": backend_config.bedrock_model_id,
                             "region": backend_config.region,
@@ -3255,9 +3261,8 @@ async def chat_completions(
                     }) + "\n\n"
                     yield "data: [DONE]\n\n"
 
-                return StreamingResponse(
+                return await event_stream_response(
                     _direct_as_sse(),
-                    media_type="text/event-stream",
                     headers={
                         "Cache-Control": "no-cache",
                         "Connection": "keep-alive",
@@ -3276,14 +3281,13 @@ async def chat_completions(
             logger.info(f"🔀 Routing to OpenAI-compatible provider (tier={tier})")
 
             if request_body.stream:
-                return StreamingResponse(
+                return await event_stream_response(
                     stream_openai_compatible(
                         request_body,
                         backend_config.provider_base_url,
                         backend_config.provider_api_key,
                         model_override=backend_config.provider_model,
                     ),
-                    media_type="text/event-stream",
                     headers={
                         "Cache-Control": "no-cache",
                         "Connection": "keep-alive",
@@ -3420,13 +3424,12 @@ async def chat_completions(
             worker_instance = os.getenv("INSTANCE_NAME", "unknown")
 
             # Return streaming response with worker info header
-            return StreamingResponse(
+            return await event_stream_response(
                 generate_streaming_response(
                     request_body, request_id, claude_headers,
                     fastapi_request=request,
                     backend_config=backend_config
                 ),
-                media_type="text/event-stream",
                 headers={
                     "Cache-Control": "no-cache",
                     "Connection": "keep-alive",
