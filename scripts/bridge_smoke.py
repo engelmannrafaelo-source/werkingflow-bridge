@@ -873,6 +873,13 @@ def main():
         for r in failures:
             if r.repro:
                 print(f"  repro[{r.name}]: {r.repro}", file=sys.stderr)
+        # Still exit 1 — this script cannot tell an empty pool from an image
+        # that starves its own router. The marker only says the failure set
+        # consists of nothing but pool-gate refusals; bridge-deploy.sh then
+        # measures the pool in the router's own state and decides (BR6S).
+        if all(r.capacity_reason and r.name in POOL_GATED_PROBES for r in failures):
+            names = ", ".join(f"{r.name}({r.capacity_reason})" for r in failures)
+            print(f"SMOKE_POOL_REFUSED_ONLY: {names}", file=sys.stderr)
         sys.exit(1)
 
     dependency_gaps = [r for r in gaps if r.dependency_reason]

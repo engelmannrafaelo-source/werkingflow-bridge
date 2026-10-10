@@ -19,6 +19,10 @@
 #   1 = deployment failure (rollback attempted and succeeded), or the
 #       foreign-commit gate aborted BEFORE any change was made
 #   2 = critical failure (rollback itself failed — manual intervention required)
+#   3 = DEPLOYED and standing, but UNPROVEN: the dev pool was measurably empty,
+#       so the pool-gated smoke probes (research/chat) could not run against
+#       the new image. Everything else passed. Not a rollback, never a green —
+#       re-run the probes once the pool recovers (BR6S, 2026-10-10).
 set -euo pipefail
 
 # ============================================================================
@@ -144,6 +148,9 @@ WORKERHOST_NEEDS_BUILD="metrics-reader worker-sahori worker-kurt worker-coach wo
 # State (reset per server in deploy_server)
 ROLLBACK_SHA=""
 DEPLOYED_SERVICES=()
+# Per run, NOT reset per server: one line per smoke that stayed UNPROVEN because
+# the pool was empty. Non-empty = exit 3 at the end (see EXIT CODES).
+SMOKE_UNPROVEN=()
 # Phase 0 inspects THIS checkout, not a host — one verdict covers `both`.
 TOOLING_GATE_DONE="false"
 
@@ -1034,18 +1041,22 @@ deployed_bridge_id() {
     echo "$id"
 }
 
-# phase_smoke_test <label> <url> <expect-bridge> <required|optional> [header...]
+# phase_smoke_test <label> <url> <expect-bridge> <required|optional> <pool-host> <pool-lb> [header...]
 #   expect-bridge  bridge id that must answer research/chat (X-Bridge-Served-By)
 #   required       a missing stamp FAILS (the answering workers were deployed in
 #                  this run); optional = reported UNPROVEN, no rollback (server2:
 #                  its prod workers deploy separately via prod-workers)
+#   pool-host/-lb  host + LB container whose pool router judges the pool-gated
+#                  probes; "-" "-" = no empty-pool exception (smoke_pool_unproven)
 #   header         extra request headers, e.g. "X-Bridge-Hop: 1"
 phase_smoke_test() {
     local label="$1"
     local url="$2"
     local expect_bridge="$3"
     local served_by="$4"
-    shift 4
+    local pool_host="$5"
+    local pool_lb="$6"
+    shift 6
     local headers=("$@")
 
     step "Phase 5: Smoke test (${label} @ ${url}, must be answered by bridge '${expect_bridge}')"
@@ -1126,6 +1137,29 @@ phase_smoke_test() {
         return 0
     fi
 
+    # Nothing but pool-gate refusals: the smoke alone cannot tell "pool empty"
+    # from "this image starves its router". Measured, not guessed — see
+    # smoke_pool_unproven. Only an empty pool with a green, stamped, locally
+    # routed worker path is excused; everything else falls through to FAIL.
+    if [[ "$pool_host" != "-" ]] && grep -q '^SMOKE_POOL_REFUSED_ONLY:' <<< "$smoke_out"; then
+        while IFS= read -r line; do warn "  smoke: ${line}"; done <<< "$smoke_out"
+        if smoke_pool_unproven "$pool_host" "$pool_lb" "$url" "$expect_bridge"; then
+            local refused
+            refused=$(grep '^SMOKE_POOL_REFUSED_ONLY:' <<< "$smoke_out" | head -1)
+            refused="${refused#SMOKE_POOL_REFUSED_ONLY: }"
+            SMOKE_UNPROVEN+=("${label}: pool-gated probes UNPROVEN — ${refused}; ${POOL_VERDICT}")
+            warn "SMOKE_POOL_UNPROVEN: ${label} — the pool-gated probes (${refused}) were refused"
+            warn "  because the pool is EMPTY (${POOL_VERDICT})."
+            warn "  NOT a pass, NOT a rollback: health, served_by stamp and routing to bridge"
+            warn "  '${expect_bridge}' are green and every other probe passed, but nothing proves"
+            warn "  this image can serve research/chat. Deploy stays; run exits 3."
+            warn "  Re-run once the pool recovers: python3 scripts/bridge_smoke.py --base-url ${url}"
+            warn "  --profile hetzner --expect-bridge ${expect_bridge} --extra-header 'X-Bridge-Hop: 1' --only chat_completions"
+            return 0
+        fi
+        error_ "  Pool refusals are NOT excused (${POOL_VERDICT}) — treating as a code failure"
+    fi
+
     while IFS= read -r line; do error_ "  smoke: ${line}"; done <<< "$smoke_out"
     error_ "Smoke test FAILED for ${label}"
 
@@ -1191,6 +1225,129 @@ phase_access_canary() {
     return 0
 }
 
+# fetch_pool_router_state <host> <lb-container>
+# The router's OWN view: the pool snapshot choose() decides on, plus whether it
+# is fresh. Raw JSON on stdout; non-zero (reason on stdout) if unreachable.
+fetch_pool_router_state() {
+    local host="$1" lb_container="$2" raw rc=0
+    raw=$(rssh "$host" "docker exec '${lb_container}' curl -sf http://127.0.0.1/internal/pool-router/state" 2>&1) || rc=$?
+    if [[ $rc -ne 0 || -z "$raw" ]]; then
+        echo "rc=${rc}: ${raw}"
+        return 1
+    fi
+    printf '%s\n' "$raw"
+}
+
+# pool_router_exhaustion — reads STATE_JSON (fetch_pool_router_state output).
+#   exit 0  POOL_EXHAUSTED: the router has a fresh view and no account in it is
+#           eligible — exactly the state in which choose() refuses (all_unavail)
+#   exit 1  POOL_AVAILABLE: at least one account eligible, or no accounts at all
+#           (choose() then round-robins and never refuses)
+#   exit 2  POOL_UNKNOWN: unparseable, blind or stale — a blind router routes
+#           round-robin, so nothing proves the pool is empty
+# Eligibility mirrors pick_weighted_account() in docker/lua/pool_pick.lua
+# (available, cooldown 0, headroom > est_tokens, weekly hard wall only on a real
+# reading). est_tokens = 500: the floor of choose()'s max(500, len/4), which the
+# smoke's small research/chat bodies sit at. Change both together.
+pool_router_exhaustion() {
+    STATE_JSON="${STATE_JSON:-}" python3 - <<'PYEOF'
+import json, os, sys
+WALL, EST = 96, 500
+try:
+    d = json.loads(os.environ.get("STATE_JSON", ""))
+except Exception as e:
+    print(f"POOL_UNKNOWN: router state is not JSON: {e}"); sys.exit(2)
+status = d.get("last_refresh_status", "unknown")
+age = float(d.get("state_age_s", 9999))
+if status != "ok" or age >= 30:
+    print(f"POOL_UNKNOWN: router blind or stale (last_refresh_status={status!r}, "
+          f"state_age_s={age:.1f}, err={d.get('last_refresh_err', '')!r})"); sys.exit(2)
+accounts = (d.get("last_state_snapshot") or {}).get("accounts")
+if not isinstance(accounts, dict) or not accounts:
+    print("POOL_AVAILABLE: router state lists no accounts — choose() round-robins, it never refuses")
+    sys.exit(1)
+eligible, why = [], []
+for name, a in sorted(accounts.items()):
+    a = a or {}
+    cooldown = float(a.get("cooldown_remaining_s") or 0)
+    headroom = float(a.get("effective_cap_tokens") or 0) - float(a.get("current_in_flight_tokens") or 0)
+    wk = a.get("weekly_percent")
+    past_wall = a.get("usage_known") is True and wk is not None and float(wk) >= WALL
+    if a.get("available") and cooldown == 0 and headroom > EST and not past_wall:
+        eligible.append(name)
+    else:
+        why.append(f"{name}: " + ("unavailable" if not a.get("available") else
+                                  f"cooldown {cooldown:.0f}s" if cooldown else
+                                  f"weekly {wk}%>={WALL}" if past_wall else
+                                  f"headroom {headroom:.0f}<={EST}"))
+if eligible:
+    print(f"POOL_AVAILABLE: {len(eligible)}/{len(accounts)} account(s) eligible: {', '.join(eligible)}")
+    sys.exit(1)
+print(f"POOL_EXHAUSTED: 0/{len(accounts)} accounts eligible (state_age_s={age:.1f}) — {'; '.join(why)}")
+sys.exit(0)
+PYEOF
+}
+
+# probe_unpooled_stamp <url> <expect-bridge>
+# The worker path WITHOUT the pool gate: /health goes to the local worker pool
+# (claude_workers), not through pool_router.choose(). 200 + X-Bridge-Served-By
+# of the expected bridge = the new workers are up, stamp, and the LB routes to
+# them — the three things that stay provable while the pool is empty.
+probe_unpooled_stamp() {
+    local url="$1" expect_bridge="$2" hdrs rc=0 code served part
+    hdrs=$(curl -sS -o /dev/null -D - --max-time 20 -H "X-Bridge-Hop: 1" "${url}/health" 2>&1) || rc=$?
+    if [[ $rc -ne 0 ]]; then
+        POOL_VERDICT="health probe failed (curl rc=${rc}): ${hdrs//$'\n'/ }"
+        return 1
+    fi
+    code=$(awk 'toupper($1) ~ /^HTTP\// {c=$2} END {print c}' <<< "$hdrs")
+    served=$(awk 'tolower($1) == "x-bridge-served-by:" {v=$2} END {print v}' <<< "${hdrs//$'\r'/}")
+    if [[ "$code" != "200" ]]; then
+        POOL_VERDICT="health HTTP ${code:-none} (expected 200)"
+        return 1
+    fi
+    if [[ -z "$served" ]]; then
+        POOL_VERDICT="health answered without X-Bridge-Served-By — cannot prove bridge '${expect_bridge}' answered"
+        return 1
+    fi
+    for part in ${served//,/ }; do
+        if [[ "${part%%/*}" != "$expect_bridge" ]]; then
+            POOL_VERDICT="health answered by '${served}', expected bridge '${expect_bridge}'"
+            return 1
+        fi
+    done
+    POOL_VERDICT="health 200 served_by=${served}"
+    return 0
+}
+
+# smoke_pool_unproven <host> <lb-container> <url> <expect-bridge>
+# 0 = the pool is measurably empty AND the unpooled path is green: the smoke's
+#     pool refusals are STATE, not a verdict on the image (UNPROVEN, no rollback)
+# 1 = anything else — the refusals stand as a failure (rollback as before)
+# Reason for the log in POOL_VERDICT either way.
+smoke_pool_unproven() {
+    local host="$1" lb_container="$2" url="$3" expect_bridge="$4"
+    local state_raw pool_out pool_rc=0 pool_line
+    POOL_VERDICT=""
+    if ! state_raw=$(fetch_pool_router_state "$host" "$lb_container"); then
+        POOL_VERDICT="pool state unreadable (${state_raw}) — empty pool not proven"
+        return 1
+    fi
+    pool_out=$(STATE_JSON="$state_raw" pool_router_exhaustion 2>&1) || pool_rc=$?
+    pool_line=$(grep -E '^POOL_(EXHAUSTED|AVAILABLE|UNKNOWN):' <<< "$pool_out" | head -1)
+    info "  pool: ${pool_line:-${pool_out}}"
+    if [[ $pool_rc -ne 0 ]]; then
+        POOL_VERDICT="${pool_line:-pool check failed: ${pool_out}}"
+        return 1
+    fi
+    if ! probe_unpooled_stamp "$url" "$expect_bridge"; then
+        POOL_VERDICT="pool empty, but ${POOL_VERDICT}"
+        return 1
+    fi
+    POOL_VERDICT="${pool_line#POOL_EXHAUSTED: }; ${POOL_VERDICT}"
+    return 0
+}
+
 # check_pool_router_state <host> <lb-container>
 # The account gate (ADR-0010's customer protection) only works while the Lua
 # router can load the pool state from the metrics-reader. A blind router still
@@ -1205,12 +1362,10 @@ check_pool_router_state() {
     fi
     info "Checking /internal/pool-router/state on ${host} (via docker exec ${lb_container})..."
     local state_raw
-    state_raw=$(rssh "$host" "docker exec '${lb_container}' curl -sf http://127.0.0.1/internal/pool-router/state" 2>&1)
-    local rc_state=$?
-    if [[ $rc_state -ne 0 ]] || [[ -z "$state_raw" ]]; then
-        error_ "Failed to reach /internal/pool-router/state via docker exec (rc=${rc_state}): ${state_raw}"
+    state_raw=$(fetch_pool_router_state "$host" "$lb_container") || {
+        error_ "Failed to reach /internal/pool-router/state via docker exec: ${state_raw}"
         return 1
-    fi
+    }
 
     info "  raw state: ${state_raw}"
 
@@ -1272,6 +1427,30 @@ phase_distribution_test() {
         info "[DRY-RUN] Would send 8 chat/completions calls and check /internal/pool-router/state"
         return 0
     fi
+
+    # Two independent checks. The router-state check used to sit behind the
+    # distribution verdict, so a red distribution (or the SKIP hatch) silently
+    # skipped it — a blind router went unreported exactly when the spread
+    # looked wrong (BR6R SOLLTE b). Both run; either red = red.
+    local rc_dist_test=0 rc_state=0
+    distribution_assertion "$url" "$expect_bridge" || rc_dist_test=$?
+    check_pool_router_state "$host" "$lb_container" || rc_state=$?
+
+    if [[ $rc_dist_test -ne 0 || $rc_state -ne 0 ]]; then
+        error_ "Distribution + State test FAILED (distribution rc=${rc_dist_test}, router state rc=${rc_state})"
+        return 1
+    fi
+    info "Distribution + State test PASSED"
+    return 0
+}
+
+# distribution_assertion <url> <expect-bridge>
+# 8 sequential chat/completions calls through the pool router; >=2 distinct
+# workers of <expect-bridge> = the router spreads load. 0 also for SKIP_DIST_TEST
+# and DIST_SKIP (both reported loudly).
+distribution_assertion() {
+    local url="$1"
+    local expect_bridge="$2"
 
     if [[ "$SKIP_DIST_TEST" == "true" ]]; then
         warn "SKIP_DIST_TEST=true — skipping distribution test (escape hatch active)"
@@ -1477,10 +1656,6 @@ PYEOF
         error_ "Distribution test FAILED — pool router not spreading load across workers"
         return 1
     fi
-
-    check_pool_router_state "$host" "$lb_container" || return 1
-
-    info "Distribution + State test PASSED"
     return 0
 }
 
@@ -2063,7 +2238,7 @@ deploy_server() {
         # smoke would judge prod instead of the build just deployed (BR2D §7).
         # The workers were deployed in this run, so their stamp is required.
         [[ -n "$hetzner_bridge" ]] && phase_smoke_test "hetzner" "${hetzner_url}" "${hetzner_bridge}" required \
-            "X-Bridge-Hop: 1" || {
+            "$host" "${HETZNER_SVC_nginx}" "X-Bridge-Hop: 1" || {
             error_ "Smoke test failed for hetzner — rolling back"
             if [[ ${#DEPLOYED_SERVICES[@]} -gt 0 ]]; then
                 phase_rollback "$host" "$compose" "$ROLLBACK_SHA" "$build_list" "${DEPLOYED_SERVICES[@]}"
@@ -2086,7 +2261,7 @@ deploy_server() {
         # missing stamp is UNPROVEN, not a failure — a server2 deploy must not
         # depend on a worker rollout.
         [[ -n "$server2_bridge" ]] && phase_smoke_test "server2" "http://${SERVER2_HOST}:8000" "${server2_bridge}" optional \
-            "X-Priority: production" || {
+            - - "X-Priority: production" || {
             error_ "Smoke test failed for server2 — rolling back"
             if [[ ${#DEPLOYED_SERVICES[@]} -gt 0 ]]; then
                 phase_rollback "$host" "$compose" "$ROLLBACK_SHA" "$build_list" "${DEPLOYED_SERVICES[@]}"
@@ -2140,6 +2315,10 @@ deploy_server() {
 
     # === Phase 7: Success report ===
     step "SUCCESS: ${server_name}"
+    local _u
+    for _u in "${SMOKE_UNPROVEN[@]}"; do
+        [[ "$_u" == "${server_name}:"* ]] && warn "NOT a clean success — UNPROVEN ${_u}"
+    done
     info "Deployed services : ${DEPLOYED_SERVICES[*]}"
     info "Pre-deploy SHA    : ${ROLLBACK_SHA}"
     if [[ "$DRY_RUN" == "false" ]]; then
@@ -2264,5 +2443,10 @@ case "$SERVER" in
         ;;
 esac
 
+if (( ${#SMOKE_UNPROVEN[@]} > 0 )); then
+    for _u in "${SMOKE_UNPROVEN[@]}"; do warn "UNPROVEN ${_u}"; done
+    warn "=== bridge-deploy.sh finished: DEPLOYED, NOT rolled back — but UNPROVEN (exit 3) ==="
+    exit 3
+fi
 info "=== bridge-deploy.sh finished successfully ==="
 exit 0
