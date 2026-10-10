@@ -6761,6 +6761,9 @@ async def doc_agent(
     return await _execute_doc_agent_impl(request_body, attribution_ctx=_da_attr)
 
 
+_RESEARCH_SESSION_ID_RE = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
+
+
 @app.get("/v1/research/{session_id}/content")
 async def get_research_content(
     session_id: str,
@@ -6772,6 +6775,18 @@ async def get_research_content(
     Returns the markdown output file or final_response.json as fallback.
     """
     await verify_api_key(request, credentials)
+
+    # The id goes into a glob below: anything but a session uuid (e.g. "*",
+    # "[0-7]*", prefixes) would enumerate and serve other callers' sessions.
+    if not _RESEARCH_SESSION_ID_RE.fullmatch(session_id):
+        logger.warning(f"Malformed research session id refused: {session_id!r}")
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "message": f"Malformed research session id {session_id!r}: expected a uuid.",
+                "reason": "research_session_id_malformed",
+            },
+        )
 
     wrapper_root = Path(os.environ.get("INSTANCES_DIR", "/app/instances"))
 
