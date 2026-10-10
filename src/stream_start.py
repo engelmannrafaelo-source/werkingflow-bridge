@@ -24,11 +24,12 @@ Headers go out with the first chunk, not before it. A caller waits for the
 headers as long as it waits for the first token — never longer than the
 non-streaming path waits for the whole answer.
 """
+import asyncio
 import json
 import logging
 from typing import Any, AsyncIterator, Dict, Mapping, Optional
 
-from fastapi.responses import StreamingResponse
+from fastapi.responses import Response, StreamingResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from src.error_contract import (
@@ -44,6 +45,13 @@ logger = logging.getLogger(__name__)
 # caller's request is fine, the bridge's dependency is not (like Bedrock's
 # AccessDenied → 424). Passing 401/403 through would read as "your key".
 _PROVIDER_REJECTED_STATUS = 424
+
+# How often the wait for the first chunk asks whether the caller is still
+# there (same cadence as the CLI path's disconnect monitor).
+_DISCONNECT_POLL_S = 0.5
+
+# nginx's "client closed request". Nobody reads it; it marks the access log.
+_CLIENT_CLOSED_STATUS = 499
 
 
 def provider_retryable(status_code: int) -> bool:
@@ -81,17 +89,20 @@ def stream_error_verdict(exc: BaseException) -> Dict[str, Any]:
     return fields(UNCLASSIFIED_RETRYABLE)
 
 
+def error_event(message: str, error_type: str, code: str, verdict: Mapping[str, Any]) -> str:
+    """The one wire form of a stream error (BR9d): ``event: error`` with
+    ``{"error": {message, type, code, retryable, retry_after_s}}`` — nested,
+    like the sync envelope. PC1 (ai-bridge-client core/sse.ts) reads
+    retryable only there; a flat ``{"error": "<text>"}`` reads as no verdict."""
+    payload = {"error": {"message": message, "type": error_type, "code": code, **verdict}}
+    return f"event: error\ndata: {json.dumps(payload)}\n\n"
+
+
 def stream_error_event(exc: BaseException) -> str:
     """``event: error`` that ends a stream after its first chunk."""
     detail = getattr(exc, "detail", None)
     message = detail if isinstance(detail, str) else str(exc) or type(exc).__name__
-    payload = {"error": {
-        "message": message,
-        "type": "streaming_error",
-        "code": type(exc).__name__,
-        **stream_error_verdict(exc),
-    }}
-    return f"event: error\ndata: {json.dumps(payload)}\n\n"
+    return error_event(message, "streaming_error", type(exc).__name__, stream_error_verdict(exc))
 
 
 def provider_start_error(exc: Any) -> Exception:
@@ -157,6 +168,49 @@ async def _rest(first: Optional[str], gen: AsyncIterator[str]) -> AsyncIterator[
         await gen.aclose()
 
 
+class _CallerGone(Exception):
+    """The caller left while the route waited for the first chunk."""
+
+
+async def _first_chunk_while_caller_present(gen: AsyncIterator[str]) -> str:
+    """``gen.__anext__()``, abandoned as soon as the caller is gone (BR9d).
+
+    Before BR9c Starlette's listen_for_disconnect cancelled the generator the
+    moment the caller left. Since the first chunk is pulled inside the route,
+    nobody listens until it exists — an OpenAI-compatible or Bedrock call
+    (with ``thinking``: the whole paid thinking phase) ran on for a caller
+    who was no longer there. So the wait for the first chunk asks the
+    request's shared delivery probe; on disconnect the pending ``__anext__``
+    is cancelled (the provider call inside it with it) and ``gen`` closed.
+
+    The SHARED probe, not Request.is_disconnected(): ``http.disconnect``
+    arrives once, and the ledger asks the same probe whether the answer was
+    delivered (src/activity/delivery.py). Without a probe (no request
+    context) the caller counts as present."""
+    from src.activity import delivery
+
+    async def first() -> str:
+        return await gen.__anext__()
+
+    pending = asyncio.ensure_future(first())
+    try:
+        while True:
+            done, _ = await asyncio.wait({pending}, timeout=_DISCONNECT_POLL_S)
+            if done:
+                return pending.result()
+            if await delivery.caller_gone():
+                break
+    except BaseException:
+        # The route itself was cancelled: take the provider call with it.
+        pending.cancel()
+        raise
+    pending.cancel()
+    await asyncio.wait({pending})
+    await gen.aclose()
+    logger.warning("Caller disconnected before the first chunk: stream generator closed")
+    raise _CallerGone()
+
+
 async def event_stream_response(
     gen: AsyncIterator[str],
     *,
@@ -165,11 +219,14 @@ async def event_stream_response(
 ) -> StreamingResponse:
     """StreamingResponse that starts only once ``gen`` produced its first
     chunk. A failure before that leaves the route as an exception (HTTP error
-    with verdict); a failure after it ends the stream as ``event: error``."""
+    with verdict); a failure after it ends the stream as ``event: error``.
+    A caller who leaves before the first chunk gets the generator closed."""
     from src.providers.openai_compatible import ProviderError
 
     try:
-        first: Optional[str] = await gen.__anext__()
+        first: Optional[str] = await _first_chunk_while_caller_present(gen)
+    except _CallerGone:
+        return Response(status_code=_CLIENT_CLOSED_STATUS)
     except StopAsyncIteration:
         first = None
     except ProviderError as exc:

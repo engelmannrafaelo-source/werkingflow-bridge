@@ -295,7 +295,7 @@ _FINAL = [
 async def test_bedrock_transport_error_is_retryable_in_the_stream(monkeypatch, exc):
     _raising_client(monkeypatch, exc)
     out = [c async for c in bedrock_service.stream_bedrock(_request(), usage_sink={})]
-    err = json.loads(out[-1].split("data: ", 1)[1])
+    err = json.loads(out[-1].split("data: ", 1)[1])["error"]
     assert out[-1].startswith("event: error\n")
     assert err["retryable"] is True
 
@@ -304,7 +304,7 @@ async def test_bedrock_transport_error_is_retryable_in_the_stream(monkeypatch, e
 async def test_bedrock_unclassified_is_final_in_the_stream(monkeypatch, exc):
     _raising_client(monkeypatch, exc)
     out = [c async for c in bedrock_service.stream_bedrock(_request(), usage_sink={})]
-    assert json.loads(out[-1].split("data: ", 1)[1])["retryable"] is False
+    assert json.loads(out[-1].split("data: ", 1)[1])["error"]["retryable"] is False
 
 
 async def _sync_detail(monkeypatch, exc) -> dict:

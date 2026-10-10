@@ -93,7 +93,7 @@ def _client_error(code):
                  False, id="chunk-invalid-request"),
 ])
 async def test_bedrock_stream_abort_carries_its_verdict(monkeypatch, events, want):
-    err = _last_error(await _bedrock(monkeypatch, events=events))
+    err = _last_error(await _bedrock(monkeypatch, events=events))["error"]
     assert err["retryable"] is want
     assert "retry_after_s" in err
 
@@ -105,27 +105,27 @@ async def test_bedrock_stream_abort_carries_its_verdict(monkeypatch, events, wan
     ("AccessDeniedException", False),  # sync: 424
 ])
 async def test_bedrock_client_error_follows_the_sync_status(monkeypatch, code, want):
-    err = _last_error(await _bedrock(monkeypatch, raises=_client_error(code)))
+    err = _last_error(await _bedrock(monkeypatch, raises=_client_error(code)))["error"]
     assert err["retryable"] is want
 
 
 async def test_bedrock_unclassified_and_config_errors_are_final(monkeypatch):
-    err = _last_error(await _bedrock(monkeypatch, raises=KeyError("boom")))
+    err = _last_error(await _bedrock(monkeypatch, raises=KeyError("boom")))["error"]
     assert err["retryable"] is False
 
     def no_creds():
         raise RuntimeError("no Bedrock credentials on this worker")
     monkeypatch.setattr(bedrock_service, "get_bedrock_client", no_creds)
     out = [c async for c in bedrock_service.stream_bedrock(_request(), usage_sink={})]
-    assert _last_error(out)["retryable"] is False
+    assert _last_error(out)["error"]["retryable"] is False
 
 
 async def test_bedrock_unknown_model_is_final(monkeypatch):
     monkeypatch.setattr(bedrock_service, "get_bedrock_client", lambda: _client(events=[]))
     monkeypatch.setattr(bedrock_service, "resolve_model", lambda m: (None, None))
     out = [c async for c in bedrock_service.stream_bedrock(_request(), usage_sink={})]
-    err = _last_error(out)
-    assert err["retryable"] is False and "Unknown model" in err["error"]
+    err = _last_error(out)["error"]
+    assert err["retryable"] is False and "Unknown model" in err["message"]
 
 
 # --- OpenAI-compatible ---------------------------------------------------------

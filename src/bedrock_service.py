@@ -30,7 +30,7 @@ from src.models import (
 )
 from src.model_registry import resolve_model, to_bedrock_model_id, model_supports_temperature
 from src.routing.backend_router import _resolve_privacy_mode
-from src.stream_start import event_stream_response
+from src.stream_start import error_event, event_stream_response
 
 logger = get_logger(__name__)
 
@@ -118,14 +118,16 @@ def _stream_error_event(exc: BaseException) -> str:
     Ein ClientError bekommt das Urteil des Status, den der synchrone Weg fuer
     denselben Fehler sendet; ein BedrockStreamAborted sein eigenes; alles
     andere ist nicht eingeordnet und wird nicht als wiederholbar versprochen."""
+    code = type(exc).__name__
     if isinstance(exc, BedrockStreamAborted):
         verdict = fields(exc.retryable)
     elif isinstance(exc, ClientError):
-        code = (exc.response.get("Error") or {}).get("Code", "")
+        code = (exc.response.get("Error") or {}).get("Code", "") or code
         verdict = fields(is_retryable_status(_client_error_status(code)))
     else:
         verdict = fields(_unclassified_verdict(exc))
-    return f"event: error\ndata: {json.dumps({'error': str(exc), **verdict})}\n\n"
+    # Verschachtelt wie stream_error_event (BR9d): flach las PC1 kein Urteil.
+    return error_event(str(exc) or code, "bedrock_stream_error", code, verdict)
 
 
 def _effective_max_tokens(request) -> int:
@@ -487,7 +489,8 @@ async def stream_bedrock(
     # Resolve model
     resolved_model, _ = resolve_model(request.model)
     if not resolved_model:
-        yield f"data: {json.dumps({'error': f'Unknown model: {request.model}', **fields(False)})}\n\n"
+        yield error_event(f"Unknown model: {request.model}", "invalid_request_error",
+                          "unknown_model", fields(False))
         return
 
     # Determine region first (needed for model ID)
