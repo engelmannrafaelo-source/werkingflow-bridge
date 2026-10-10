@@ -94,9 +94,16 @@ def job_code_fields(code: Optional[str]) -> Dict[str, Any]:
             return fields(False)
         return fields(is_retryable_status(status))
     if code == JOB_CODE_REQUEUE_EXHAUSTED:
-        # The worker running it died (deploy, OOM, host) on every attempt;
-        # the job itself was never refused.
-        return fields(True)
+        # The worker running it died on every attempt, and the watchdog has
+        # already restarted it itself (max_attempts). Same reasoning as
+        # JOB_PATIENCE_SPENT_STATUSES: a client retry would be attempt n+1 of
+        # what the bridge already retried. And a job that kills its worker
+        # every time (OOM, a crash the input triggers) is a poison job, not a
+        # gap; each new submit may run, and be paid for, until it kills the
+        # worker again. A worker death from a deploy is bridged by the
+        # watchdog's own requeue; it does not repeat on every attempt.
+        # (BR9b, BR8R2 SOLL; was True in BR9.)
+        return fields(False)
     return fields(UNCLASSIFIED_RETRYABLE)
 
 

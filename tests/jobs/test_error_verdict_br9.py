@@ -177,7 +177,9 @@ async def test_no_executor_and_requeue_exhausted_carry_a_verdict():
                       AsyncMock(return_value=[{"job_id": "j", "attempts": 3}])), \
          patch.object(store_client, "mark_error", seam.mark_error):
         await registry.run_watchdog_pass(90, 3)
-    assert seam.verdict()[:2] == ("REQUEUE_EXHAUSTED", True)
+    # The bridge already retried it max_attempts times; a poison job must not be
+    # resubmitted by the client (BR9b).
+    assert seam.verdict()[:2] == ("REQUEUE_EXHAUSTED", False)
 
 
 # --- the verdict is stored, and the platform-api accepts it ---------------------
@@ -276,7 +278,7 @@ async def test_poll_error_always_carries_the_verdict(monkeypatch):
     # A row written before BR9 (or by a platform-api that drops the fields):
     # the verdict comes from the code, the same rules.
     for code, want in (("UPSTREAM_HTTP_503", True), ("UPSTREAM_HTTP_400", False),
-                       ("UPSTREAM_HTTP_424", False), ("REQUEUE_EXHAUSTED", True),
+                       ("UPSTREAM_HTTP_424", False), ("REQUEUE_EXHAUSTED", False),
                        ("EXECUTOR_ERROR", False)):
         out = await _poll(_job(status="error", error={"message": "m", "code": code}),
                           monkeypatch)
