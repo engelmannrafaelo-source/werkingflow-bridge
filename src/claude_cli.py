@@ -760,6 +760,11 @@ def _handle_rate_limit_event(message, worker_id):
 
 CLI_CONTINUATION_SENTENCE = "Output token limit hit. Resume directly"
 
+# The file the bridge names to the model as OUTPUT_FILE_PATH (inside the run's
+# claudedocs/). The research handler reads THIS file first — it is the one
+# place the bridge told the model its result goes.
+RESEARCH_OUTPUT_FILENAME = "output.md"
+
 
 def is_user_turn(message: Any) -> bool:
     """True for SDK user/meta turns (UserMessage dataclass or its dict form)."""
@@ -901,6 +906,77 @@ def find_truncation_marker(chunks: list) -> Optional[dict]:
         ):
             return chunk
     return None
+
+
+RESULT_SUCCESS_SUBTYPES = ("success", "complete")
+
+
+def sdk_message_to_dict(message: Any) -> Any:
+    """The dict run_completion hands on for an SDK message object.
+
+    Every public non-callable attribute of the dataclass, nothing else — so the
+    class name is gone: SystemMessage becomes {'subtype', 'data'}, ResultMessage
+    {'subtype', 'is_error', 'num_turns', ...}, neither with a 'type' key.
+    Dicts and other non-objects pass through unchanged."""
+    if not hasattr(message, '__dict__') or isinstance(message, dict):
+        return message
+    message_dict = {}
+    for attr_name in dir(message):
+        if not attr_name.startswith('_'):  # Skip private attributes
+            try:
+                attr_value = getattr(message, attr_name)
+                if not callable(attr_value):  # Skip methods
+                    message_dict[attr_name] = attr_value
+            except (AttributeError, TypeError) as e:
+                # Expected for properties that raise or computed attributes
+                logger.debug(f"Could not get attribute '{attr_name}': {e}")
+    return message_dict
+
+
+def is_result_chunk(chunk: Any) -> bool:
+    """True for the chunk that ends a run, in both shapes run_completion yields:
+    type='result' (CLI JSON, the bridge's own markers) and the converted SDK
+    ResultMessage, recognised by its own fields is_error and num_turns. A
+    'subtype' alone says nothing — the converted SystemMessage (init,
+    compact_boundary, status, ...) carries one too."""
+    if not isinstance(chunk, dict):
+        return False
+    if chunk.get("type") == "result":
+        return True
+    return "type" not in chunk and "is_error" in chunk and "num_turns" in chunk
+
+
+def find_unfinished_result(chunks: list) -> Optional[dict]:
+    """
+    The run's result chunk if the run did NOT end with success, else None.
+
+    Wider than find_truncation_marker: also error_max_turns (run_completion
+    counts it as "complete", so no truncation marker follows), any other
+    error subtype, and a success subtype flagged is_error. For callers whose
+    output is a file the run writes in parts (Write, then Edit): a run that
+    stopped at the turn limit leaves a partly written file that looks like a
+    finished one. A stream without any result chunk counts as unfinished —
+    the real CLI path always yields one (result or explicit marker).
+    Only result chunks count (is_result_chunk); system chunks never do.
+    """
+    result = None
+    for chunk in chunks:
+        if is_result_chunk(chunk):
+            if chunk.get("is_error") or chunk.get("subtype") not in RESULT_SUCCESS_SUBTYPES:
+                return chunk
+            result = chunk
+    if result is None:
+        return {"type": "result", "subtype": "no_result", "is_error": True}
+    return None
+
+
+def describe_unfinished_result(chunk: dict) -> str:
+    """How find_unfinished_result's chunk ended, for error messages: the
+    subtype, plus is_error where the subtype alone would read like a success."""
+    subtype = chunk.get("subtype")
+    if chunk.get("is_error") and subtype in RESULT_SUCCESS_SUBTYPES:
+        return f"{subtype} flagged is_error"
+    return str(subtype)
 
 
 def apply_thinking_budget(options: "ClaudeCodeOptions", max_thinking_tokens: Optional[int]) -> None:
@@ -1628,7 +1704,7 @@ class ClaudeCodeCLI:
                     )
                     enable_file_discovery = False
                 elif enable_file_discovery:
-                    output_file = claudedocs_dir / "output.md"
+                    output_file = claudedocs_dir / RESEARCH_OUTPUT_FILENAME
                     prompt = inject_output_path_for_file_discovery(
                         prompt=prompt,
                         output_file=output_file,
@@ -1994,24 +2070,12 @@ class ClaudeCodeCLI:
                                     cli_session_id=cli_session_id,
                                 )
 
-                            # Convert message object to dict if needed
-                            if hasattr(message, '__dict__') and not isinstance(message, dict):
-                                # Convert object to dict for consistent handling
-                                message_dict = {}
-
-                                # Get all attributes from the object
-                                for attr_name in dir(message):
-                                    if not attr_name.startswith('_'):  # Skip private attributes
-                                        try:
-                                            attr_value = getattr(message, attr_name)
-                                            if not callable(attr_value):  # Skip methods
-                                                message_dict[attr_name] = attr_value
-                                        except (AttributeError, TypeError) as e:
-                                            # Expected for properties that raise or computed attributes
-                                            logger.debug(f"Could not get attribute '{attr_name}': {e}")
-
-                                logger.debug(f"Converted message dict: {message_dict}")
-                                message = message_dict
+                            # Convert message object to dict for consistent handling.
+                            # SystemMessage chunks (init, ...) are passed on like
+                            # any other: they are not content and never a result
+                            # (is_result_chunk).
+                            message = sdk_message_to_dict(message)
+                            logger.debug(f"Converted message dict: {message}")
 
                             # Cache chunk to file for crash recovery (with error handling)
                             if cache_enabled:
@@ -2099,15 +2163,6 @@ class ClaudeCodeCLI:
                                     if skip_yield:
                                         # Don't yield this rate-limit text to the client
                                         continue
-
-                            # =================================================================
-                            # SKIP SYSTEMMESSAGE - Don't yield to client
-                            # SystemMessage contains only internal metadata (init, session_id, tools)
-                            # NOT yielding it allows Nginx failover if SDK crashes afterward
-                            # =================================================================
-                            if type(message).__name__ == 'SystemMessage':
-                                logger.debug(f"⏭️  Skipping SystemMessage (internal only, not for client)")
-                                continue
 
                             # Yield chunk immediately (no in-memory accumulation)
                             yield message
@@ -2715,8 +2770,25 @@ def inject_output_path_for_file_discovery(
     Returns:
         Modified prompt with path injection
     """
-    path_instruction_header = f"\n**CRITICAL: You MUST use the Write tool to complete this task.*\nWrite your complete analysis to OUTPUT_FILE_PATH:\n{output_file}\n\n"
-    path_instruction_footer = f"\n\nDo NOT reply in chat! Use Write tool to WRITE your reply to OUTPUT_FILE_PATH.\nOUTPUT_FILE_PATH: {output_file}"
+    # Descriptive, not a list of prohibitions (KI first, Rafael 04.10.2026):
+    # the model is told who reads its result and in which form, so it can
+    # judge the edge cases itself. Measured 10.10.2026 (Energy-Nachtlauf z2b):
+    # with a large selection the model answered with a Python script that
+    # "writes" the report into this file — nobody runs chat code, so the
+    # file never existed and the script became the delivered research result.
+    path_instruction_header = (
+        f"\n**Where your result goes:** whoever ordered this task receives exactly the "
+        f"contents of the file at OUTPUT_FILE_PATH, and nothing else. Your chat replies "
+        f"are not passed on, and code in a chat reply is never run — a script that would "
+        f"write the file does not create it. So write the complete result itself (not a "
+        f"program that produces it) into this file with the Write tool. A very long result "
+        f"can be written in parts: the first part with Write, the rest added with Edit.\n"
+        f"OUTPUT_FILE_PATH: {output_file}\n\n"
+    )
+    path_instruction_footer = (
+        f"\n\nOUTPUT_FILE_PATH: {output_file} — the finished result belongs in this file; "
+        f"it is the only thing the reader gets."
+    )
 
     lines = prompt.split('\n', 1)
     first_line = lines[0].strip()

@@ -110,7 +110,7 @@ PROTOCOL (depth: {depth} — budgets are ceilings, not targets):
 1. Use WebSearch (up to {search_budget} searches) and WebFetch (up to {fetch_budget} page fetches) — targeted, no filler queries
 2. Address EVERY question/category the query contains. If the budget cannot cover all of them in depth, reduce per-item depth instead of dropping items, and list anything you could not source under an explicit "Offene Lücken / Open gaps" heading — never drop a sub-question silently
 3. Extract key findings with sources (keep each finding under {_FINDING_WORDS[depth]} words)
-4. Write the report to claudedocs/research_output.md IMMEDIATELY after your searches are done
+4. Write the report into the file named under OUTPUT_FILE_PATH IMMEDIATELY after your searches are done
 5. DO NOT conduct additional searches after writing the file
 
 OUTPUT STRUCTURE:
@@ -131,7 +131,7 @@ OUTPUT STRUCTURE:
 ## Sources
 [List URLs]
 
-CRITICAL: The file claudedocs/research_output.md MUST exist when you finish. Use the Write tool.
+The report file is the result of this research: whoever ordered it reads that file and nothing else.
 """
     return execution_prompt, effective_turns, depth
 
@@ -159,7 +159,7 @@ PROTOCOL (depth: {depth} — budgets are ceilings, not targets):
 2. WebSearch/WebFetch nur für das, was dort fehlt, und für Aktualität/Fassungsstand (up to {search_budget} searches and up to {fetch_budget} page fetches — targeted, no filler queries)
 3. Address EVERY question/category the query contains. If the budget cannot cover all of them in depth, reduce per-item depth instead of dropping items, and list anything you could not source under an explicit "Offene Lücken / Open gaps" heading — never drop a sub-question silently
 4. Extract key findings with sources (keep each finding under {_FINDING_WORDS[depth]} words). Every number states its origin: (Bibliothek: <id>) or (Web: <URL>)
-5. Write the report to claudedocs/research_output.md IMMEDIATELY after your research is done
+5. Write the report into the file named under OUTPUT_FILE_PATH IMMEDIATELY after your research is done
 6. DO NOT conduct additional searches after writing the file
 
 OUTPUT STRUCTURE:
@@ -182,5 +182,5 @@ OUTPUT STRUCTURE:
 Bibliothek: <id>
 Web: <URL>]
 
-CRITICAL: The file claudedocs/research_output.md MUST exist when you finish. Use the Write tool.
+The report file is the result of this research: whoever ordered it reads that file and nothing else.
 """

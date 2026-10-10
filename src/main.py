@@ -61,6 +61,7 @@ from src.claude_cli import (
     extract_result_usage,
     warn_if_continuation_leak,
     StreamEndedWithoutCompletion,
+    RESEARCH_OUTPUT_FILENAME,
 )
 from src.middleware.bridge_error import SDKDisconnectError
 from src.message_adapter import MessageAdapter
@@ -4716,6 +4717,125 @@ def _research_workdir(file_metadata: Optional[Dict[str, Any]], container_file: O
     return None
 
 
+class ResearchReportMissing(RuntimeError):
+    """A research run ended without a report file the bridge can hand out.
+
+    Raised instead of returning the run's chat text as the report: that text
+    can be anything — an announcement, or a script that would write the file
+    (Energy z2b, 10.10.2026). The research handler turns it into
+    status="error" with this message. ``usage`` carries the tokens of a
+    repair round that ran before the failure, so the ledger still sees them.
+    """
+
+    def __init__(self, message: str, usage: Optional[Dict[str, int]] = None):
+        super().__init__(message)
+        self.usage = usage
+
+
+def _research_report_file(discovered_files: List[Path], ordered_file: Optional[Path]) -> Optional[Path]:
+    """The run's report: the file the bridge named as OUTPUT_FILE_PATH if it
+    exists, otherwise the first discovered file that exists."""
+    if ordered_file is not None and ordered_file.is_file():
+        return ordered_file
+    for path in discovered_files:
+        if path.is_file():
+            return path
+    return None
+
+
+def _read_research_report(path: Path) -> str:
+    """Read the report file. A report that exists but cannot be read is a
+    failed run, not a run without content."""
+    try:
+        text = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as e:
+        raise ResearchReportMissing(f"Report file {path} exists but cannot be read: {e}") from e
+    logger.info(f"📄 Read content: {len(text)} chars from {path}")
+    return text
+
+
+# Turns for the repair round: write the report (in parts, if long). The
+# research itself is done; this round only puts its result where it is read.
+BERICHTSDATEI_NACHHOLEN_MAX_TURNS = 6
+
+
+async def _pool_berichtsdatei_nachholen(
+    *,
+    cli_resume_id: Optional[str],
+    datei: Optional[Path],
+    chat_chars: int,
+    request_body: ResearchRequest,
+    backend_config: Optional[BackendConfig],
+    append_system_prompt: Optional[str],
+    sdk_mcp_servers: Optional[Dict[str, Any]],
+) -> Tuple[str, Optional[Dict[str, int]]]:
+    """The run answered in chat instead of writing its report file. Resume
+    the same CLI session in its own directory and let the model write the
+    report there — it has the findings in context, it only put them in the
+    wrong place. KI first: the model is told where its result goes and why
+    the chat answer does not arrive, no rewriting of its text by the bridge.
+
+    Returns (report, usage of the round or None). Raises ResearchReportMissing
+    when the file still does not exist — never falls back to the chat text.
+    """
+    if not cli_resume_id or datei is None:
+        raise ResearchReportMissing(
+            f"Research ended with {chat_chars} chars of chat text but no report file, and the "
+            f"session cannot be resumed to write it (cli_session={cli_resume_id!r}, file={datei}). "
+            "The chat text is not returned as the report."
+        )
+    auftrag = (
+        f"The research is finished, but the report file {datei} does not exist. Whoever ordered "
+        f"this research receives exactly the contents of that file and nothing else: your chat "
+        f"replies are not passed on, and code in a chat reply is never run, so a script that would "
+        f"write the file has not created it. Write the finished report itself now — in Markdown, "
+        f"with all findings and sources you have — into {datei} with the Write tool. If it is very "
+        f"long, write the first part with Write and add the rest with Edit."
+    )
+    logger.warning(
+        f"research: {chat_chars} chars of chat text but no report file — resuming session "
+        f"{cli_resume_id} once to write {datei}"
+    )
+    chunks: List[Dict[str, Any]] = []
+    async for chunk in claude_cli.run_completion(
+        prompt=auftrag,
+        append_system_prompt=append_system_prompt,
+        model=request_body.model,
+        max_turns=BERICHTSDATEI_NACHHOLEN_MAX_TURNS,
+        stream=True,
+        backend_env_vars=backend_config.env_vars if backend_config else None,
+        sdk_mcp_servers=sdk_mcp_servers,
+        session_id=cli_resume_id,
+        resume_workdir=datei.parent.parent,
+    ):
+        chunks.append(chunk)
+    usage: Optional[Dict[str, int]] = None
+    for chunk in chunks:
+        u = extract_result_usage(chunk)
+        if u:
+            usage = usage or {"input_tokens": 0, "output_tokens": 0, "cache_read_tokens": 0, "cache_creation_tokens": 0}
+            for k in usage:
+                usage[k] += u[k]
+    from src.claude_cli import describe_unfinished_result, find_unfinished_result
+    unfertig = find_unfinished_result(chunks)
+    if unfertig is not None:
+        # error_max_turns too: written with Write and then Edit, the file
+        # exists after the first part and looks like a finished report.
+        raise ResearchReportMissing(
+            f"The round to write the report file ended with "
+            f"{describe_unfinished_result(unfertig)} instead of a clean success — "
+            f"a partly written {datei.name} is not handed out.",
+            usage,
+        )
+    if not datei.is_file():
+        raise ResearchReportMissing(
+            f"Research ended with {chat_chars} chars of chat text but no report file; resuming the "
+            f"session to write {datei} did not produce it either. The chat text is not returned as the report.",
+            usage,
+        )
+    return _read_research_report(datei), usage
+
+
 async def _pool_luecken_rueckrunde(
     *,
     nachkontrolle,
@@ -4801,14 +4921,16 @@ async def _pool_luecken_rueckrunde(
             for k in rr_usage:
                 rr_usage[k] += u[k]
     nachkontrolle.rueckrunde_usage = dict(rr_usage or {}, usage_source="api" if rr_usage else "missing")
-    from src.claude_cli import find_truncation_marker
-    _rr_marker = find_truncation_marker(chunks)
-    if _rr_marker is not None:
-        # Abgebrochene Rueckrunde (ZB3D): eine halb ueberarbeitete Datei geht
-        # nicht raus — der Bericht von vorher kommt zurueck an seinen Platz.
+    from src.claude_cli import describe_unfinished_result, find_unfinished_result
+    _rr_unfertig = find_unfinished_result(chunks)
+    if _rr_unfertig is not None:
+        # Rueckrunde nicht mit success beendet (abgeschnitten ZB3D, oder
+        # error_max_turns mitten im Ueberarbeiten): eine halb ueberarbeitete
+        # Datei geht nicht raus — der Bericht von vorher kommt zurueck an seinen Platz.
         if datei is not None:
             datei.write_text(bericht, encoding="utf-8")
-        return scheitern(f"Rückrunde abgeschnitten ({_rr_marker.get('subtype')})")
+        return scheitern(
+            f"Rückrunde abgeschnitten ({describe_unfinished_result(_rr_unfertig)})")
     if pool_pplx.gate_error:
         # Same rule as the first round: a report written while the privacy
         # gate was broken is not handed out — the caller raises on gate_error.
@@ -5168,48 +5290,26 @@ async def _execute_research_impl(
             except Exception as e:
                 logger.warning(f"⚠️  File discovery failed (non-critical): {e}", exc_info=True)
 
-        if discovered_files:
-            container_file = str(discovered_files[0])
-            if request_body.output_path:
-                output_file = request_body.output_path
-            else:
-                filename = discovered_files[0].name
-                output_file = f"/tmp/{filename}"
+        # The report is the file the run wrote — first of all the one the
+        # bridge itself named to the model as OUTPUT_FILE_PATH.
+        # discovered_files[0] is only "the first file any Write call touched"
+        # (a notes file, a source list) and stays the fallback for a report
+        # written elsewhere.
+        workdir = _research_workdir(file_metadata, str(discovered_files[0]) if discovered_files else None)
+        ordered_file = workdir / "claudedocs" / RESEARCH_OUTPUT_FILENAME if workdir is not None else None
+        report_path = _research_report_file(discovered_files, ordered_file)
 
-            try:
-                in_docker = Path("/.dockerenv").exists()
-                if in_docker:
-                    logger.info(f"🐳 Docker environment detected")
-                    if container_file and output_file:
-                        shutil.copy2(container_file, output_file)
-                        logger.info(f"📋 Copied: {container_file} → {output_file}")
-                else:
-                    if container_file and output_file:
-                        shutil.copy2(container_file, output_file)
-                        logger.info(f"📋 Copied: {container_file} → {output_file}")
-            except Exception as e:
-                logger.error(
-                    f"❌ File copy failed: {e}",
-                    exc_info=True,
-                    extra={"container_file": container_file, "output_file": output_file}
-                )
-
+        # Content comes from the run's OWN file, never from a copy: the old
+        # default copy target was /tmp/<name> — /tmp/output.md for every run
+        # in the container — and the content was read back from there, i.e.
+        # from a path other runs write too.
         file_size_bytes = None
         content = None
         content_file = None
-        if output_file and Path(output_file).exists():
-            content_file = output_file
-        elif container_file and Path(container_file).exists():
-            content_file = container_file
-
-        if content_file:
-            file_size_bytes = Path(content_file).stat().st_size
-            try:
-                with open(content_file, 'r', encoding='utf-8') as f:
-                    content = f.read()
-                logger.info(f"📄 Read content: {len(content)} chars from {content_file}")
-            except Exception as e:
-                logger.warning(f"⚠️ Could not read content: {e}")
+        if report_path is not None:
+            container_file = content_file = str(report_path)
+            content = _read_research_report(report_path)
+            file_size_bytes = report_path.stat().st_size
 
         # Defensive checks (parse, quota exhaustion, empty output, parsed-text fallback)
         from src.claude_cli import detect_quota_exhaustion as _dqe
@@ -5250,6 +5350,23 @@ async def _execute_research_impl(
                         "Check worker logs for rate_limit_event around session start."
                     ),
                 },
+            )
+
+        # The run itself must have ended with success. error_max_turns is not
+        # caught by the truncation check above (run_completion counts it as
+        # complete), yet a report written with Write and then Edit already
+        # exists after its first part — a cut-off report that reads like a
+        # finished one. After the quota check, so an exhausted account stays
+        # a retryable RateLimitError, and after the empty-run check with its hint.
+        from src.claude_cli import describe_unfinished_result, find_unfinished_result
+        _research_unfertig = find_unfinished_result(all_chunks)
+        if _research_unfertig is not None:
+            raise ResearchReportMissing(
+                f"Research run ended with "
+                f"{describe_unfinished_result(_research_unfertig)} instead of a clean "
+                f"success (session_id={session_id}) — "
+                + (f"the report file {container_file} may be partly written and is not handed out."
+                   if container_file else "no report file was written; the chat text is not a report.")
             )
 
         if not content and parsed_assistant_text:
@@ -5293,11 +5410,57 @@ async def _execute_research_impl(
                         ),
                     },
                 )
-            logger.warning(
-                f"⚠️  Research: file content unavailable but parsed_text exists "
-                f"({len(parsed_assistant_text)} chars) -- using parsed_text as content fallback"
+            # Substantial chat text, but no report file. Handing the chat text
+            # out as the report is how a Python script that would "write"
+            # output.md became Energy's research result (z2b, 10.10.2026):
+            # nobody runs chat code, the file never existed. The run's own
+            # model repairs it — same session, same directory, told where its
+            # result goes. If that cannot produce the file, the run fails loud.
+            try:
+                content, nachhol_usage = await _pool_berichtsdatei_nachholen(
+                    cli_resume_id=cli_resume_id,
+                    datei=ordered_file,
+                    chat_chars=len(parsed_assistant_text.strip()),
+                    request_body=request_body,
+                    backend_config=backend_config,
+                    append_system_prompt=library_append_prompt,
+                    sdk_mcp_servers=pool_sdk_mcp_servers,
+                )
+            except ResearchReportMissing as e:
+                if e.usage:  # the error ledger row carries the repair round too
+                    accumulated_input_tokens = (accumulated_input_tokens or 0) + e.usage["input_tokens"]
+                    accumulated_output_tokens = (accumulated_output_tokens or 0) + e.usage["output_tokens"]
+                raise
+            if nachhol_usage:
+                accumulated_input_tokens = (accumulated_input_tokens or 0) + nachhol_usage["input_tokens"]
+                accumulated_output_tokens = (accumulated_output_tokens or 0) + nachhol_usage["output_tokens"]
+                accumulated_cache_read += nachhol_usage["cache_read_tokens"]
+                accumulated_cache_creation += nachhol_usage["cache_creation_tokens"]
+            container_file = content_file = str(ordered_file)
+            file_size_bytes = ordered_file.stat().st_size
+
+        if not content or not content.strip():
+            raise ResearchReportMissing(
+                "Research finished without a report: "
+                + (f"the report file {container_file} is empty" if container_file
+                   else "no report file was written")
+                + f" (session_id={session_id}). The run's chat text is not a report and is not returned as one."
             )
-            content = parsed_assistant_text
+
+        # The caller's copy target, if it named one. Written from the report
+        # that is returned — a failed copy is logged, the content is intact.
+        output_file = container_file
+        if request_body.output_path:
+            try:
+                shutil.copy2(container_file, request_body.output_path)
+                output_file = request_body.output_path
+                logger.info(f"📋 Copied: {container_file} → {output_file}")
+            except Exception as e:
+                logger.error(
+                    f"❌ File copy failed: {e}",
+                    exc_info=True,
+                    extra={"container_file": container_file, "output_file": request_body.output_path}
+                )
 
         if pool_pplx is not None and pool_pplx.gate_error:
             # Nothing was sent (the handler refused), but a report written while
@@ -6882,7 +7045,43 @@ async def doc_agent(
     return await _execute_doc_agent_impl(request_body, attribution_ctx=_da_attr)
 
 
+# A research session id is the uuid of the run's directory under
+# INSTANCES_DIR. Anything else is refused before it reaches glob(): the id is
+# spliced into a glob pattern, and "*" would match — and serve — the first
+# session of any caller. Always checked with fullmatch: "$" alone lets a
+# trailing newline through.
 _RESEARCH_SESSION_ID_RE = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
+
+
+def _research_content_not_here(session_id: str) -> HTTPException:
+    """404 that says WHY: a research session lives only in the instances
+    volume of the host that ran it. Under the two-bridge overflow (ADR-0010,
+    ADR-0012) a job submitted to one bridge can run — and store its session —
+    on the other, and a bridge with workers on two hosts has two volumes.
+    This route does not follow the job home the way GET /v1/jobs/{id} does;
+    the report itself travels in the job result."""
+    try:
+        from src.jobs.job_id import home_bridge_id
+        bridge = home_bridge_id()
+    except Exception as e:  # unconfigured identity: still answer, but say so
+        bridge = f"unknown ({type(e).__name__})"
+    host = os.environ.get("INSTANCE_NAME", "unknown")
+    return HTTPException(
+        status_code=404,
+        detail={
+            "message": (
+                f"Research session {session_id} is not stored on this host (bridge {bridge}, "
+                f"worker {host}). A research session is kept only on the host that ran it; a job "
+                f"placed on the other bridge or another worker host is not visible here. "
+                f"The full report is in the job result: GET /v1/jobs/<job_id> -> result.content "
+                f"(that route follows the job's home bridge)."
+            ),
+            "reason": "research_session_not_on_this_host",
+            "bridge": bridge,
+            "worker": host,
+            "session_id": session_id,
+        },
+    )
 
 
 @app.get("/v1/research/{session_id}/content")
@@ -6891,11 +7090,32 @@ async def get_research_content(
     request: Request,
     credentials: Optional[HTTPAuthorizationCredentials] = Depends(security)
 ):
-    """Download research output content by session ID.
+    """Download the report file of a research session by session id.
 
-    Returns the markdown output file or final_response.json as fallback.
+    Serves the report the run wrote (claudedocs/, the bridge-named
+    OUTPUT_FILE_PATH first). A session without a report file has no content
+    to serve — its chat text is not a report and is not returned as one.
     """
     await verify_api_key(request, credentials)
+
+    from src.jobs.job_id import JobIdMalformed, parse_home
+    if session_id.startswith("job_"):
+        try:
+            job_home = parse_home(session_id)
+        except JobIdMalformed as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "message": (
+                    f"{session_id} is a job id, not a research session id. The report of a research "
+                    f"job is in GET /v1/jobs/{session_id} -> result.content"
+                    + (f" (job home bridge: {job_home})" if job_home else "")
+                    + "; result.session_id names the session."
+                ),
+                "reason": "job_id_is_not_a_research_session",
+            },
+        )
 
     # The id goes into a glob below: anything but a session uuid (e.g. "*",
     # "[0-7]*", prefixes) would enumerate and serve other callers' sessions.
@@ -6914,36 +7134,33 @@ async def get_research_content(
     # Find session directory (pattern: YYYY-MM-DD-HHMM_{session_id})
     matching_dirs = list(wrapper_root.glob(f"*_{session_id}"))
     if not matching_dirs:
-        logger.warning(f"Session not found: {session_id}", extra={"session_id": session_id})
-        raise HTTPException(status_code=404, detail=f"Session not found: {session_id}")
+        logger.warning(f"Research session not on this host: {session_id}", extra={"session_id": session_id})
+        raise _research_content_not_here(session_id)
 
     session_dir = matching_dirs[0]
     claudedocs_dir = session_dir / "claudedocs"
-
-    # Find markdown output
-    md_files = list(claudedocs_dir.glob("*.md")) if claudedocs_dir.exists() else []
-
-    if md_files:
-        output_file = md_files[0]
-        logger.info(f"📄 Returning research output: {output_file.name}", extra={"session_id": session_id})
-        return Response(
-            content=output_file.read_text(encoding='utf-8'),
-            media_type="text/markdown",
-            headers={"Content-Disposition": f'attachment; filename="{output_file.name}"'}
+    md_files = sorted(claudedocs_dir.glob("*.md")) if claudedocs_dir.exists() else []
+    output_file = _research_report_file(md_files, claudedocs_dir / RESEARCH_OUTPUT_FILENAME)
+    if output_file is None:
+        logger.warning(f"Research session has no report file: {session_id}", extra={"session_id": session_id})
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "message": (
+                    f"Research session {session_id} has no report file. The run ended without "
+                    f"writing its report; its chat text is not a report and is not served as one."
+                ),
+                "reason": "research_session_without_report",
+                "session_id": session_id,
+            },
         )
 
-    # Fallback: return final_response.json if no .md file
-    final_response_file = session_dir / "final_response.json"
-    if final_response_file.exists():
-        logger.info(f"📄 Returning final_response.json (no .md found)", extra={"session_id": session_id})
-        return Response(
-            content=final_response_file.read_text(encoding='utf-8'),
-            media_type="application/json",
-            headers={"Content-Disposition": f'attachment; filename="final_response.json"'}
-        )
-
-    logger.warning(f"No output file found for session: {session_id}", extra={"session_id": session_id})
-    raise HTTPException(status_code=404, detail=f"No output file found for session: {session_id}")
+    logger.info(f"📄 Returning research output: {output_file.name}", extra={"session_id": session_id})
+    return Response(
+        content=_read_research_report(output_file),
+        media_type="text/markdown",
+        headers={"Content-Disposition": f'attachment; filename="{output_file.name}"'}
+    )
 
 
 @app.get("/v1/models")

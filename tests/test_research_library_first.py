@@ -10,7 +10,8 @@ Guards:
     list split "Bibliothek: <id>" / "Web: <URL>", origin per number;
   * without a library: output byte-identical to develop before this change
     (snapshots in tests/fixtures/research_prompt_snapshots/, captured from
-    origin/develop 95ea470).
+    origin/develop 95ea470; the two output-file lines changed deliberately in
+    BR2, 10.10.2026 — one output file, named under OUTPUT_FILE_PATH).
 """
 from __future__ import annotations
 
@@ -109,7 +110,7 @@ def test_cli_mit_bibliothek_behaelt_querytext_und_pflichtdatei():
     out = _cli_lib()
     assert f"QUERY: \"{_QUERY}\"" in out
     assert "--depth" not in out
-    assert "claudedocs/research_output.md MUST exist" in out
+    assert "The report file is the result of this research" in out
     assert "Offene Lücken" in out
 
 

@@ -152,7 +152,7 @@ async def _stream(*chunks):
 
 
 @pytest.fixture
-def spy_cli():
+def spy_cli(tmp_path):
     captured = {}
     on_run = []
 
@@ -160,9 +160,15 @@ def spy_cli():
         captured.update(kwargs)
         for f in on_run:
             f()
+        # Like a real run: the report is the file the run wrote (BR2).
+        report = tmp_path / "claudedocs" / "output.md"
+        report.parent.mkdir(exist_ok=True)
+        report.write_text(_REPORT, encoding="utf-8")
         return _stream(
-            {"type": "assistant", "content": [{"type": "text", "text": _REPORT}]},
+            {"type": "assistant", "content": [{"type": "text", "text": "Bericht geschrieben."}]},
             {"type": "result", "subtype": "success", "usage": {"input_tokens": 100, "output_tokens": 200}},
+            {"type": "x_claude_metadata", "files_created": [{"path": str(report)}],
+             "session_tracking": {"cli_session_id": "s", "research_dir": str(tmp_path)}},
         )
 
     with patch.object(src.main.claude_cli, "run_completion", side_effect=_run) as spy:

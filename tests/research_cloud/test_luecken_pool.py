@@ -26,6 +26,7 @@ import pytest  # noqa: E402
 import src.main  # noqa: E402
 import src.research_pool_perplexity as rpp  # noqa: E402
 from src.research_cloud.luecken import FLAG, PRUEF_MODELL  # noqa: E402
+from tests import sdk_strom as sdk  # noqa: E402
 
 ALT = "# Bericht\n" + "Befund. " * 60 + "\nTyp X-100, Schallleistung: nicht bestätigt."
 NEU = "# Bericht\n" + "Befund. " * 60 + "\nTyp X-100, Schallleistung 52 dB(A) (Datenblatt https://h.example/x.pdf, S. 3)."
@@ -44,8 +45,10 @@ def _make_req(output_path=None):
     return ns
 
 
-async def _stream(*chunks):
-    for c in chunks:
+async def _stream(*body):
+    """The real stream shape: system init first, a system message mid-run,
+    results as converted SDK ResultMessage (sdk_strom)."""
+    for c in sdk.stream_chunks(*body):
         yield c
 
 
@@ -58,13 +61,22 @@ class FakeCli:
         self.gaps = list(gaps)
         self.rueckrunde_text = rueckrunde_text
         self.session_id = session_id
-        self.calls = {"research": [], "pruefer": [], "rueckrunde": []}
+        self.calls = {"research": [], "pruefer": [], "rueckrunde": [], "nachhol": []}
         self.datei = workdir / "claudedocs" / "output.md"
 
     def __call__(self, **kw):
+        if kw.get("resume_workdir") is not None and "does not exist" in kw["prompt"]:
+            # BR2: the run answered in chat — the repair round writes its file.
+            self.calls["nachhol"].append(kw)
+            self.datei.parent.mkdir(parents=True, exist_ok=True)
+            self.datei.write_text(ALT, encoding="utf-8")
+            return _stream(
+                {"content": [{"type": "text", "text": "Bericht in die Datei geschrieben."}]},
+                sdk.result(session_id=self.session_id or "", usage={"input_tokens": 20, "output_tokens": 10}),
+            )
         if kw.get("resume_workdir") is not None:
             self.calls["rueckrunde"].append(kw)
-            if self.mit_datei:
+            if self.mit_datei or self.datei.exists():
                 self.datei.write_text(self.rueckrunde_text, encoding="utf-8")
                 text = "Datei aktualisiert."
             else:
@@ -72,14 +84,13 @@ class FakeCli:
             return _stream(
                 {"content": [SimpleNamespace(name=rpp.MCP_TOOL_NAME, input={"frage": "Datenblatt X-100"})]},
                 {"content": [{"type": "text", "text": text}]},
-                {"type": "result", "subtype": "success", "session_id": self.session_id,
-                 "usage": {"input_tokens": 30, "output_tokens": 40}},
+                sdk.result(session_id=self.session_id or "", usage={"input_tokens": 30, "output_tokens": 40}),
             )
         if kw.get("model") == PRUEF_MODELL:
             self.calls["pruefer"].append(kw)
             return _stream(
                 {"content": [{"type": "text", "text": json.dumps({"luecken": self.gaps.pop(0)})}]},
-                {"type": "result", "subtype": "success", "usage": {"input_tokens": 7, "output_tokens": 3}},
+                sdk.result(session_id="pruefer-sess", usage={"input_tokens": 7, "output_tokens": 3}),
             )
         self.calls["research"].append(kw)
         chunks = []
@@ -93,10 +104,8 @@ class FakeCli:
             meta = {"type": "x_claude_metadata", "files_created": [], "research_dir": str(self.workdir)}
             text = ALT
         chunks.append({"content": [{"type": "text", "text": text}]})
-        result = {"type": "result", "subtype": "success", "usage": {"input_tokens": 100, "output_tokens": 200}}
-        if self.session_id:
-            result["session_id"] = self.session_id
-        chunks.append(result)
+        # session_id=None: a result without a resumable session id ("").
+        chunks.append(sdk.result(session_id=self.session_id or "", usage={"input_tokens": 100, "output_tokens": 200}))
         chunks.append(meta)
         return _stream(*chunks)
 
@@ -130,9 +139,12 @@ async def _run(fake, req=None):
 
 @pytest.mark.asyncio
 async def test_inline_report_gets_one_round_in_the_same_session(tmp_path, persist, pplx_on):
+    # BR2: the inline answer is first written into the report file by the
+    # repair round; the gap round then works on that file.
     fake = FakeCli(tmp_path)
     result = await _run(fake)
     assert result.status == "success" and result.content == NEU
+    assert len(fake.calls["nachhol"]) == 1
     assert len(fake.calls["rueckrunde"]) == 1 and len(fake.calls["pruefer"]) == 2
     rr = fake.calls["rueckrunde"][0]
     assert rr["session_id"] == "cli-sess-1" and rr["resume_workdir"] == tmp_path
@@ -146,8 +158,8 @@ async def test_inline_report_gets_one_round_in_the_same_session(tmp_path, persis
     assert meta["rueckrunde"] is True and meta["luecken_ohne_suche"] == 1
     assert meta["luecken_nach_rueckrunde"] == 0
     assert meta["rueckrunde_usage"]["input_tokens"] == 30
-    # Ledger: the round's tokens are part of the run.
-    assert booked["input_tokens"] == 130 and booked["output_tokens"] == 240
+    # Ledger: both rounds' tokens are part of the run.
+    assert booked["input_tokens"] == 150 and booked["output_tokens"] == 250
     assert meta["luecken_pruef_input_tokens"] == 14
 
 
@@ -179,7 +191,7 @@ async def test_fragment_overwrite_is_undone(tmp_path, persist, pplx_on):
 
 @pytest.mark.asyncio
 async def test_no_resumable_session_keeps_report_and_names_it(tmp_path, persist, pplx_on):
-    fake = FakeCli(tmp_path, session_id=None)
+    fake = FakeCli(tmp_path, mit_datei=True, session_id=None)
     result = await _run(fake)
     assert result.content == ALT and fake.calls["rueckrunde"] == []
     assert "keine fortsetzbare Sitzung" in persist.await_args.kwargs["provider_meta"]["rueckrunde_fehler"]
@@ -187,7 +199,7 @@ async def test_no_resumable_session_keeps_report_and_names_it(tmp_path, persist,
 
 @pytest.mark.asyncio
 async def test_no_gaps_no_round(tmp_path, persist, pplx_on):
-    fake = FakeCli(tmp_path, gaps=([],))
+    fake = FakeCli(tmp_path, mit_datei=True, gaps=([],))
     result = await _run(fake)
     assert result.content == ALT and fake.calls["rueckrunde"] == []
     assert persist.await_args.kwargs["provider_meta"]["rueckrunde"] is False
@@ -196,7 +208,7 @@ async def test_no_gaps_no_round(tmp_path, persist, pplx_on):
 @pytest.mark.asyncio
 async def test_flag_off_no_checker(tmp_path, persist, pplx_on, monkeypatch):
     monkeypatch.setenv(FLAG, "off")
-    fake = FakeCli(tmp_path)
+    fake = FakeCli(tmp_path, mit_datei=True)
     result = await _run(fake)
     assert result.content == ALT and fake.calls["pruefer"] == []
     assert "rueckrunde" not in persist.await_args.kwargs["provider_meta"]
@@ -216,7 +228,7 @@ async def test_flag_on_without_perplexity_refuses_before_the_cli(tmp_path, persi
 async def test_perplexity_off_no_checker_at_all(tmp_path, persist, monkeypatch):
     monkeypatch.delenv("RESEARCH_PERPLEXITY_ENABLED", raising=False)
     monkeypatch.delenv(FLAG, raising=False)
-    fake = FakeCli(tmp_path)
+    fake = FakeCli(tmp_path, mit_datei=True)
     result = await _run(fake)
     assert result.content == ALT and fake.calls["pruefer"] == []
 
@@ -244,9 +256,10 @@ _ABGESCHNITTEN = {"type": "result", "subtype": "no_completion_marker", "is_error
 class _AbgeschnittenCli(FakeCli):
     """Wie FakeCli, aber die genannte Rolle endet ohne Result-Nachricht der CLI."""
 
-    def __init__(self, workdir, rolle, **kw):
+    def __init__(self, workdir, rolle, ende=_ABGESCHNITTEN, **kw):
         super().__init__(workdir, **kw)
         self.rolle = rolle
+        self.ende = ende
 
     def __call__(self, **kw):
         rolle = ("rueckrunde" if kw.get("resume_workdir") is not None
@@ -258,7 +271,7 @@ class _AbgeschnittenCli(FakeCli):
         async def abgeschnitten():
             async for c in stream:
                 if isinstance(c, dict) and c.get("subtype") == "success":
-                    c = _ABGESCHNITTEN
+                    c = self.ende
                 yield c
         return abgeschnitten()
 
@@ -283,8 +296,24 @@ async def test_abgeschnittene_rueckrunde_stellt_bericht_wieder_her(tmp_path, per
 
 
 @pytest.mark.asyncio
+async def test_rueckrunde_an_max_turns_stellt_bericht_wieder_her(tmp_path, persist, pplx_on):
+    """BR2R M1, same place: error_max_turns mid-rewrite is no finished round
+    (run_completion counts it as complete, so no truncation marker follows)."""
+    work = tmp_path / "work"
+    work.mkdir()
+    ende = {"type": "result", "subtype": "error_max_turns", "is_error": True,
+            "usage": {"input_tokens": 30, "output_tokens": 40}}
+    fake = _AbgeschnittenCli(work, "rueckrunde", ende=ende, mit_datei=True)
+    result = await _run(fake)
+    assert result.status == "success" and result.content == ALT
+    assert fake.datei.read_text(encoding="utf-8") == ALT
+    meta = persist.await_args.kwargs["provider_meta"]
+    assert "error_max_turns" in meta["rueckrunde_fehler"]
+
+
+@pytest.mark.asyncio
 async def test_abgeschnittener_pruefer_meldet_keine_luecken_freiheit(tmp_path, persist, pplx_on):
-    fake = _AbgeschnittenCli(tmp_path, "pruefer")
+    fake = _AbgeschnittenCli(tmp_path, "pruefer", mit_datei=True)
     result = await _run(fake)
     assert fake.calls["rueckrunde"] == []
     meta = persist.await_args.kwargs["provider_meta"]
