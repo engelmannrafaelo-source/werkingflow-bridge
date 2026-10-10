@@ -555,3 +555,27 @@ def test_sdk_options_haiku(run_space):
     body["claude_token"] = "test-secret"
     body["modell"] = "claude-haiku-5-5"
     assert sdk_options(body).model == "claude-haiku-5-5"
+
+
+@pytest.mark.asyncio
+async def test_lesezugriffe_werden_durchgereicht(run_space):
+    _, state = await execute(
+        run_space,
+        '(p/"ergebnis.md").write_text("Ergebnis")\n'
+        'print(json.dumps({"zuege": 1, "lesezugriffe": ['
+        '{"werkzeug": "read", "pfad": "pruefwissen/kw-thema-a.md"}]}))\n',
+    )
+    assert state["meta"]["lesezugriffe"] == [
+        {"werkzeug": "read", "pfad": "pruefwissen/kw-thema-a.md"}
+    ]
+
+
+@pytest.mark.asyncio
+async def test_ohne_erhebung_kein_lesezugriffe_feld(run_space):
+    """Ein Kind ohne Erhebung liefert kein Feld; der Platz erfindet keine []."""
+    _, state = await execute(
+        run_space,
+        '(p/"ergebnis.md").write_text("Ergebnis")\nprint(json.dumps({"zuege": 1}))\n',
+    )
+    assert state["zustand"] == "fertig"
+    assert "lesezugriffe" not in state["meta"]

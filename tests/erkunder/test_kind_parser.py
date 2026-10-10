@@ -62,6 +62,8 @@ async def test_step_continues_after_harmless_sdk_messages(monkeypatch, tmp_path)
         sys.modules,
         "claude_code_sdk",
         types.SimpleNamespace(
+            AssistantMessage=conftest.real_sdk.AssistantMessage,
+            ToolUseBlock=conftest.real_sdk.ToolUseBlock,
             ClaudeCodeOptions=ClaudeCodeOptions,
             ResultMessage=ResultMessage,
             query=query,
@@ -76,6 +78,7 @@ async def test_step_continues_after_harmless_sdk_messages(monkeypatch, tmp_path)
         }
     )
     assert output["zuege"] == 1
+    assert output["lesezugriffe"] == []
 
 
 def test_real_parse_error_reason_reaches_step_status():

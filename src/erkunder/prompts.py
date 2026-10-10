@@ -2,7 +2,7 @@
 
 from src.erkunder.models import Auftrag
 
-PROMPT_VERSION = "erkunder-prompts/2"
+PROMPT_VERSION = "erkunder-prompts/3"
 
 
 def _eingang(a: Auftrag) -> str:
@@ -21,7 +21,21 @@ def _kontext(a: Auftrag) -> str:
     )
     if a.auftrag:
         text += f"; zusätzlich fragt er: {a.auftrag}"
-    return text + f". Der Bericht dient {a.zweck}. "
+    return text + f". Der Bericht dient {a.zweck}. " + _pruefwissen(a)
+
+
+def _pruefwissen(a: Auftrag) -> str:
+    if not any(d.ziel.startswith("pruefwissen/") for d in a.dateien):
+        return ""
+    return (
+        "In `pruefwissen/` liegen ausgewählte Fachdokumente aus der Prüfbibliothek, "
+        "je Datei ein Dokument, oben mit Kennung und Titel. Sie sind das Fachwissen "
+        "hinter den Prüfpunkten im Vorwissen: Fehlerbilder, ihre Ursachen und wie man "
+        "sie in Messdaten erkennt. Die Bibliotheks-Punkte im Vorwissen nennen die "
+        "Kennung ihres Dokuments; lies gezielt die Dokumente, die du für einen "
+        "Prüfpunkt oder einen eigenen Befund brauchst, und such darin mit Grep "
+        "nach dem, was du nachschlagen willst. "
+    )
 
 
 def _vertiefung(a: Auftrag) -> str:

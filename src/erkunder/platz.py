@@ -321,6 +321,8 @@ class Platz:
                 "ram_spitze_mb": peak / 1024 / 1024,
                 "worker": os.environ.get("INSTANCE_NAME", "erkunder-platz"),
             }
+            if "lesezugriffe" in metrics:
+                meta["lesezugriffe"] = metrics["lesezugriffe"]
             self.states[(body.bericht_id, body.schritt)] = {
                 "zustand": "abbruch" if reason else "fertig",
                 "meta": meta,

@@ -23,7 +23,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict
 
 from .dateien import read_bytes, read_text
-from .models import VORGABE_MODELL, Auftrag
+from .models import EINGANGSORDNER, VORGABE_MODELL, Auftrag
 from .prompts import (
     PROMPT_VERSION,
     erkunder_prompt,
@@ -314,7 +314,7 @@ class Coordinator:
         entry = self.directory(ident) / "eingang"
         entry.mkdir(exist_ok=True, mode=0o755)
         entry.chmod(0o755)
-        for name in ("messdaten", "unterlagen", "plan"):
+        for name in EINGANGSORDNER:
             (entry / name).mkdir(exist_ok=True, mode=0o755)
             (entry / name).chmod(0o755)
         for name, content in (
@@ -473,6 +473,8 @@ class Coordinator:
                 "ram_spitze_mb": meta.get("ram_spitze_mb", 0),
                 "worker": state["active"].get(name, {}).get("worker", state["worker"]),
             }
+            if "lesezugriffe" in meta:
+                record["lesezugriffe"] = meta["lesezugriffe"]
             if record["status"] == "ok":
                 try:
                     text = self.output(ident, name)

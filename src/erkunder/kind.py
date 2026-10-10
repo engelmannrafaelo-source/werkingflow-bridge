@@ -2,6 +2,8 @@
 
 import asyncio
 import json
+import posixpath
+import re
 import sys
 from pathlib import Path
 from typing import Any
@@ -45,6 +47,46 @@ DISALLOWED_TOOLS = [
 ]
 
 
+LESEWERKZEUGE = {"Read": "read", "Grep": "grep", "Glob": "glob"}
+# Pfadwoerter in einem Shell-Befehl, die eingang/ beruehren (ohne Befehlstext).
+_SHELL_PFAD = re.compile(r"""[^\s'"`;|&<>()]*eingang(?:/[^\s'"`;|&<>()]*)?""")
+
+
+def _unter_eingang(raw: str, cwd: str, eingang: str) -> str | None:
+    """Pfad relativ zu eingang/ ("." fuer den Ordner selbst), sonst None."""
+    pfad = posixpath.normpath(posixpath.join(cwd, raw))
+    if pfad == eingang:
+        return "."
+    if pfad.startswith(eingang + "/"):
+        return pfad[len(eingang) + 1 :]
+    return None
+
+
+def lesezugriff(name: str, eingabe: Any, cwd: str) -> list[dict[str, str]]:
+    """Read/Grep/Glob auf eingang/ und eingang-Pfade in Bash-Befehlen."""
+    if not isinstance(eingabe, dict):
+        return []
+    cwd = posixpath.normpath(cwd)
+    eingang = posixpath.join(posixpath.dirname(cwd), "eingang")
+    if name in LESEWERKZEUGE:
+        raw = eingabe.get("file_path", eingabe.get("path", "."))
+        if not isinstance(raw, str):
+            return []
+        if name == "Glob" and isinstance(eingabe.get("pattern"), str):
+            raw = posixpath.join(raw, eingabe["pattern"])
+        pfad = _unter_eingang(raw, cwd, eingang)
+        return [{"werkzeug": LESEWERKZEUGE[name], "pfad": pfad}] if pfad else []
+    if name == "Bash" and isinstance(eingabe.get("command"), str):
+        gefunden = []
+        for wort in _SHELL_PFAD.findall(eingabe["command"]):
+            pfad = _unter_eingang(wort, cwd, eingang)
+            eintrag = {"werkzeug": "bash", "pfad": pfad}
+            if pfad and eintrag not in gefunden:
+                gefunden.append(eintrag)
+        return gefunden
+    return []
+
+
 def sdk_options(body: dict[str, Any]) -> Any:
     from claude_code_sdk import ClaudeCodeOptions
 
@@ -71,11 +113,16 @@ def sdk_options(body: dict[str, Any]) -> Any:
 
 
 async def run(body: dict[str, Any]) -> dict[str, Any]:
-    from claude_code_sdk import ResultMessage, query
+    from claude_code_sdk import AssistantMessage, ResultMessage, ToolUseBlock, query
 
     install_resilient_parser()
     result = None
+    zugriffe: list[dict[str, str]] = []
     async for message in query(prompt=body["prompt"], options=sdk_options(body)):
+        if isinstance(message, AssistantMessage):
+            for block in message.content:
+                if isinstance(block, ToolUseBlock):
+                    zugriffe += lesezugriff(block.name, block.input, body["ordner"])
         if isinstance(message, ResultMessage):
             result = message
     if result is None or result.is_error:
@@ -89,6 +136,7 @@ async def run(body: dict[str, Any]) -> dict[str, Any]:
             "cache_read": usage.get("cache_read_input_tokens", 0),
             "cache_creation": usage.get("cache_creation_input_tokens", 0),
         },
+        "lesezugriffe": zugriffe,
     }
 
 

@@ -973,3 +973,64 @@ async def test_deploy_gate_waits_then_atomically_blocks_new_reports(tmp_path):
         assert (await finish(service, body("bericht-456")))["zustand"] == "fertig"
     finally:
         await service.shutdown()
+
+
+class PlacesMitLesezugriffen(Places):
+    """Nur erkunder-1 meldet Zugriffe; die anderen Schritte stehen fuer alte Plaetze."""
+
+    async def __call__(self, request):
+        response = await super().__call__(request)
+        if request.method == "GET" and request.url.path.endswith("/erkunder-1"):
+            data = response.json()
+            if data["zustand"] == "fertig":
+                data["meta"]["lesezugriffe"] = [
+                    {"werkzeug": "read", "pfad": "pruefwissen/kw-thema-a.md"},
+                    {"werkzeug": "grep", "pfad": "pruefwissen"},
+                ]
+                return httpx.Response(200, json=data)
+        if request.method == "GET" and request.url.path.endswith("/erkunder-2"):
+            data = response.json()
+            if data["zustand"] == "fertig":
+                data["meta"]["lesezugriffe"] = []
+                return httpx.Response(200, json=data)
+        return response
+
+
+async def test_lesezugriffe_je_schritt_und_pruefwissen_eingang(tmp_path):
+    from src.erkunder.models import Ergebnis
+
+    places = PlacesMitLesezugriffen()
+    service = Coordinator(
+        tmp_path / "arbeit",
+        client=httpx.AsyncClient(transport=httpx.MockTransport(places)),
+        chown=lambda *args: None,
+        poll_s=0,
+    )
+    await service.startup()
+    digest = hashlib.sha256(MEASUREMENT_BYTES).hexdigest()
+    files = [
+        {"ziel": "messdaten/test.parquet", "url": "https://download.test/data",
+         "sha256": digest, "bytes": len(MEASUREMENT_BYTES)},
+        {"ziel": "pruefwissen/kw-thema-a.md", "url": "https://download.test/kw",
+         "sha256": digest, "bytes": len(MEASUREMENT_BYTES)},
+    ]
+    try:
+        status = await finish(service, body(files=files))
+        assert status["zustand"] == "fertig"
+        entry = service.root / "bericht-123/eingang"
+        assert stat.S_IMODE((entry / "pruefwissen").stat().st_mode) == 0o755
+        assert (entry / "pruefwissen/kw-thema-a.md").read_bytes() == MEASUREMENT_BYTES
+        assert "eingang/pruefwissen/kw-thema-a.md" in (entry / "quellen.md").read_text()
+        assert "pruefwissen/" in places.calls[0]["prompt"]
+        # Der Weg, den der Worker-Executor nimmt: validieren, dann ausliefern.
+        geliefert = Ergebnis.model_validate(status["meta"]).model_dump(by_alias=True)
+        schritte = {s["name"]: s for s in geliefert["schritte"]}
+        assert schritte["erkunder-1"]["lesezugriffe"] == [
+            {"werkzeug": "read", "pfad": "pruefwissen/kw-thema-a.md"},
+            {"werkzeug": "grep", "pfad": "pruefwissen"},
+        ]
+        assert schritte["erkunder-2"]["lesezugriffe"] == []
+        assert "lesezugriffe" not in schritte["erkunder-3"]
+        assert "lesezugriffe" not in schritte["harmonisierung"]
+    finally:
+        await service.shutdown()

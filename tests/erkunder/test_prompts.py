@@ -22,7 +22,7 @@ def test_prompts(auftrag):
         assert "vertiefung.md" not in prompt
         assert "zusätzlich fragt" not in prompt
         assert "{gegenstand}" not in prompt
-    assert PROMPT_VERSION == "erkunder-prompts/2"
+    assert PROMPT_VERSION == "erkunder-prompts/3"
     assert "ausgefallen" not in harmonisierung_prompt(a, [])
     assert "trägt / trägt teilweise / trägt nicht" in pruefung_prompt(a)
     assert "Ersatzgröße" in pruefung_prompt(a)
@@ -37,3 +37,16 @@ def test_optional_context(auftrag):
         "Einer der drei Erkunder ist ausgefallen (zeit); dir liegen zwei Gutachten vor."
         in (harmonisierung_prompt(a, [{"schritt": "erkunder-3", "grund": "zeit"}]))
     )
+
+
+def test_pruefwissen_satz_nur_mit_pruefwissen(auftrag):
+    ohne = Auftrag.model_validate(auftrag)
+    assert "pruefwissen/" not in erkunder_prompt(ohne)
+    auftrag["dateien"] = [{
+        "ziel": "pruefwissen/kw-thema-a.md", "url": "https://example.test/x",
+        "sha256": "a" * 64, "bytes": 1,
+    }]
+    a = Auftrag.model_validate(auftrag)
+    for prompt in [erkunder_prompt(a), harmonisierung_prompt(a, []), pruefung_prompt(a),
+                   korrektur_prompt(a)]:
+        assert "In `pruefwissen/` liegen ausgewählte Fachdokumente" in prompt

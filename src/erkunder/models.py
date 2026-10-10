@@ -3,7 +3,14 @@
 from datetime import date
 from typing import Annotated, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    SerializerFunctionWrapHandler,
+    field_validator,
+    model_serializer,
+)
 
 BerichtId = Annotated[str, Field(pattern=r"^[a-z0-9-]{8,80}$")]
 SchrittName = Annotated[str, Field(pattern=(
@@ -22,8 +29,13 @@ class Datenstand(Vertrag):
     heute: date
 
 
+# Eingangsordner unter eingang/. `pruefwissen/` traegt ausgewaehlte Fachdokumente
+# der Pruefbibliothek (je Datei ein Dokument), getrennt von den Kundenunterlagen.
+EINGANGSORDNER = ("messdaten", "unterlagen", "plan", "pruefwissen")
+
+
 class Datei(Vertrag):
-    ziel: str = Field(pattern=r"^(messdaten|unterlagen|plan)/[^/]{1,200}$")
+    ziel: str = Field(pattern=rf"^({'|'.join(EINGANGSORDNER)})/[^/]{{1,200}}$")
     url: str = Field(pattern=r"^https://")
     sha256: str = Field(pattern=r"^[a-fA-F0-9]{64}$")
     bytes: int = Field(ge=0, strict=True)
@@ -31,7 +43,8 @@ class Datei(Vertrag):
     @field_validator("ziel")
     @classmethod
     def safe_target(cls, value: str) -> str:
-        if ".." in value or "\x00" in value or "\\" in value:
+        steuerzeichen = any(ord(c) < 32 or ord(c) == 127 for c in value)
+        if ".." in value or "\\" in value or steuerzeichen:
             raise ValueError("ungueltiger Dateipfad")
         return value
 
@@ -69,6 +82,17 @@ class Tokens(Vertrag):
     cache_creation: int = Field(ge=0)
 
 
+class Lesezugriff(Vertrag):
+    """Ein Werkzeugaufruf des Modells auf einen Pfad unter eingang/ (kein Inhalt).
+
+    `bash` heisst: der Pfad steht in einem Shell-Befehl. Das ist ein Hinweis,
+    kein Lesebeweis; Lesen aus Python-Skripten bleibt unsichtbar.
+    """
+
+    werkzeug: Literal["read", "grep", "glob", "bash"]
+    pfad: str = Field(min_length=1)
+
+
 class Schritt(Vertrag):
     name: SchrittName
     versuch: int = Field(ge=1, le=2)
@@ -82,6 +106,16 @@ class Schritt(Vertrag):
     tokens: Tokens
     ram_spitze_mb: float = Field(ge=0)
     worker: str
+    # Nur vorhanden, wenn der Platz die Zugriffe erhoben hat. Ein Platz ohne
+    # Erhebung (alter Stand) liefert das Feld nicht, nie als leere Liste.
+    lesezugriffe: list[Lesezugriff] | None = None
+
+    @model_serializer(mode="wrap")
+    def _ohne_unerhobene(self, handler: SerializerFunctionWrapHandler) -> dict:
+        data = handler(self)
+        if self.lesezugriffe is None:
+            data.pop("lesezugriffe", None)
+        return data
 
 
 class Ausfall(Vertrag):
@@ -92,7 +126,9 @@ class Ausfall(Vertrag):
 class Ergebnis(Vertrag):
     schema_: Literal["erkunder-ergebnis/1"] = Field(alias="schema")
     bericht_id: BerichtId
-    prompt_version: Literal["erkunder-prompts/1", "erkunder-prompts/2"]
+    prompt_version: Literal[
+        "erkunder-prompts/1", "erkunder-prompts/2", "erkunder-prompts/3"
+    ]
     modell: ModellName
     schritte: list[Schritt]
     erkunder_ausgefallen: list[Ausfall]
