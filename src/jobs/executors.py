@@ -40,9 +40,18 @@ class ExecutorHTTPError(RuntimeError):
         message: str,
         retry_after_s: Optional[float] = None,
         rejection: Optional[str] = None,
+        dependency: Optional[str] = None,
+        retryable: Optional[bool] = None,
     ):
         super().__init__(message)
         self.status_code = status_code
+        # The endpoint's own verdict from its error envelope, when it gave one
+        # (src/error_contract.py rule 1). None = derive from the status.
+        self.retryable = retryable
+        # Which dependency could not answer (424 only), as named by the
+        # endpoint in DEPENDENCY_UNAVAILABLE_HEADER. The runner picks its
+        # patience by it (registry.DEPENDENCY_PATIENCE).
+        self.dependency = dependency
         # The upstream's own Retry-After, when it sent one. The job runner uses
         # it to schedule a capacity retry (registry._capacity_retry_delay)
         # instead of guessing — the bridge knows when its limit window resets,
@@ -53,6 +62,78 @@ class ExecutorHTTPError(RuntimeError):
         # account, reason, and what the LB re-dispatch saw). Set only on
         # capacity refusals; the runner logs it on the defer line.
         self.rejection = rejection
+
+
+def _http_error(response: Any, message: str, rejection: Optional[str]) -> "ExecutorHTTPError":
+    """A self-call's non-2xx answer as a job error that keeps the endpoint's
+    own verdict (retryable / retry_after_s from its envelope)."""
+    from src.error_contract import envelope_fields
+
+    try:
+        verdict = envelope_fields(response.json())
+    except Exception:
+        verdict = {}
+    retry_after = verdict.get("retry_after_s")
+    if retry_after is None:
+        retry_after = _retry_after_s(response)
+    return ExecutorHTTPError(
+        response.status_code,
+        message,
+        retry_after_s=retry_after,
+        rejection=rejection,
+        retryable=verdict.get("retryable"),
+    )
+
+
+async def _post_self(client, path: str, body: Dict[str, Any], headers: Dict[str, str]):
+    """_post_with_capacity_redispatch, with transport failures reported with
+    their verdict instead of as an anonymous crash:
+
+      * connection refused/reset, server gone mid-answer → transient (the
+        request never arrived, or the worker restarted under it);
+      * read/write timeout → NOT promised as transient: the self-call timeout
+        sits above the endpoint's own budget (see the timeouts below), so the
+        endpoint ran past it — a retry would most likely run past it again,
+        at the price of a full run."""
+    import httpx
+
+    from src.error_contract import JobFailure
+
+    try:
+        return await _post_with_capacity_redispatch(client, path, body, headers)
+    except (httpx.ReadTimeout, httpx.WriteTimeout) as e:
+        raise JobFailure(
+            f"self-call {path}: no answer within the self-call timeout "
+            f"({type(e).__name__})",
+            retryable=False,
+        ) from e
+    except httpx.TransportError as e:
+        raise JobFailure(
+            f"self-call {path}: connection failed ({type(e).__name__}: {e})",
+            retryable=True,
+        ) from e
+
+
+def _raise_if_dependency_unavailable(response: Any, path: str) -> None:
+    """The endpoint said: "a dependency did not answer, nothing was decided".
+    Raise that as a 424, whatever the HTTP status: research answers it with
+    200 and chat with 503. The job runner parks a 424 and runs the job again
+    later (registry, dependency deferral) instead of failing it for good.
+
+    Before 10.10.2026 a dev-origin research job on a prod worker died for good
+    because the dev platform-api was being recreated by a deploy for about 3 s
+    (BR7)."""
+    from src.platform_client import DEPENDENCY_UNAVAILABLE_HEADER
+
+    dependency = response.headers.get(DEPENDENCY_UNAVAILABLE_HEADER)
+    if not dependency:
+        return
+    raise ExecutorHTTPError(
+        424,
+        f"self-call {path}: dependency {dependency!r} temporarily unavailable "
+        f"(HTTP {response.status_code}): {response.text[:300]}",
+        dependency=dependency,
+    )
 
 
 # The worker serves its own FastAPI app here (bypasses the nginx LB + its capacity
@@ -323,18 +404,18 @@ async def chat_executor(
     await report_progress({"phase": "llm", "model": body.get("model")})
 
     async with httpx.AsyncClient(timeout=CHAT_SELF_CALL_TIMEOUT_S) as client:
-        response, rejection = await _post_with_capacity_redispatch(
+        response, rejection = await _post_self(
             client, "/v1/chat/completions", body, headers
         )
 
+    _raise_if_dependency_unavailable(response, "/v1/chat/completions")
     if response.status_code >= 400:
         # Surface the upstream status + a trimmed body so the job error is actionable.
         detail = response.text[:500]
-        raise ExecutorHTTPError(
-            response.status_code,
+        raise _http_error(
+            response,
             f"chat self-call failed HTTP {response.status_code}: {detail}",
-            retry_after_s=_retry_after_s(response),
-            rejection=rejection,
+            rejection,
         )
 
     return attach_ledger_cost(response.json(), response.headers)
@@ -397,17 +478,15 @@ async def _self_post_json(
 
     headers = _build_headers(attribution)
     async with httpx.AsyncClient(timeout=timeout_s) as client:
-        response, rejection = await _post_with_capacity_redispatch(
-            client, path, body, headers
-        )
+        response, rejection = await _post_self(client, path, body, headers)
 
+    _raise_if_dependency_unavailable(response, path)
     if response.status_code >= 400:
-        raise ExecutorHTTPError(
-            response.status_code,
+        raise _http_error(
+            response,
             f"self-call {path} failed HTTP {response.status_code}: "
             f"{response.text[:500]}",
-            retry_after_s=_retry_after_s(response),
-            rejection=rejection,
+            rejection,
         )
     try:
         return response.json()
@@ -445,9 +524,16 @@ async def research_executor(
         "/v1/research", body, attribution, RESEARCH_SELF_CALL_TIMEOUT_S
     )
     if result.get("status") == "error":
-        raise RuntimeError(
+        # The endpoint's verdict (ResearchResponse.retryable, set together
+        # with the text marker) becomes the job's verdict.
+        from src.error_contract import JobFailure, envelope_fields
+
+        verdict = envelope_fields(result)
+        raise JobFailure(
             "research self-call returned status=error: "
-            f"{result.get('error') or 'no error message'}"
+            f"{result.get('error') or 'no error message'}",
+            retryable=verdict.get("retryable", False),
+            retry_after_s=verdict.get("retry_after_s"),
         )
     return result
 

@@ -511,7 +511,29 @@ class ResearchRequest(BaseModel):
     )
 
 
-class ResearchResponse(BaseModel):
+class ErrorVerdictFields(BaseModel):
+    """retryable / retry_after_s on endpoints that answer errors with HTTP 200
+    and status="error" (research, doc-agent). Rules: src/error_contract.py.
+    An error nobody marked transient is final (retryable=False), never absent,
+    so callers can read the field without guessing."""
+    retryable: Optional[bool] = Field(
+        default=None,
+        description="status='error' only: True = the same request can succeed later unchanged",
+    )
+    retry_after_s: Optional[int] = Field(
+        default=None,
+        description="status='error' only: seconds to wait, when the bridge knows",
+    )
+
+    @model_validator(mode="after")
+    def _error_has_verdict(self):
+        if getattr(self, "status", None) == "error" and self.retryable is None:
+            from src.error_contract import UNCLASSIFIED_RETRYABLE
+            self.retryable = UNCLASSIFIED_RETRYABLE
+        return self
+
+
+class ResearchResponse(ErrorVerdictFields):
     """
     Response model for research endpoint.
 
@@ -610,7 +632,7 @@ class DocAgentRequest(BaseModel):
     )
 
 
-class DocAgentResponse(BaseModel):
+class DocAgentResponse(ErrorVerdictFields):
     """Response model for /v1/doc-agent."""
     status: Literal["success", "error"]
     question: str

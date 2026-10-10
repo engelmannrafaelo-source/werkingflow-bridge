@@ -276,8 +276,8 @@ async def test_research_executor_body_status_error_reaches_registry_as_job_error
     fake = _FakeClient(resp)
     recorded = {}
 
-    async def _mark_error(job_id, message, code=None):
-        recorded.update({"job_id": job_id, "message": message, "code": code})
+    async def _mark_error(job_id, message, code=None, **verdict):
+        recorded.update({"job_id": job_id, "message": message, "code": code, **verdict})
 
     async def _mark_done(job_id, result):
         recorded["wrongly_marked_done"] = True
@@ -294,6 +294,9 @@ async def test_research_executor_body_status_error_reaches_registry_as_job_error
     assert "wrongly_marked_done" not in recorded
     assert recorded["code"] == "EXECUTOR_ERROR"
     assert "HTTP 503" in recorded["message"]
+    # BR9: a body without its own verdict is not promised as transient — the
+    # text "HTTP 503" no longer decides anything.
+    assert recorded["retryable"] is False
 
 
 async def test_registry_persists_upstream_status_code():
@@ -307,8 +310,8 @@ async def test_registry_persists_upstream_status_code():
 
     recorded = {}
 
-    async def _mark_error(job_id, message, code=None):
-        recorded.update({"job_id": job_id, "message": message, "code": code})
+    async def _mark_error(job_id, message, code=None, **verdict):
+        recorded.update({"job_id": job_id, "message": message, "code": code, **verdict})
 
     with patch.object(registry, "get_executor", return_value=_failing_executor), \
          patch.object(registry.store_client, "mark_error", _mark_error), \

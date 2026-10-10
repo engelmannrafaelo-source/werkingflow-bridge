@@ -27,7 +27,11 @@ from typing import Any, Optional
 
 from src.db.client import get_pool
 from src.federation import cache_scope, is_foreign_origin
-from src.platform_client import PlatformUnavailable, call_platform
+from src.platform_client import (
+    RESTART_BRIDGING_BACKOFFS_S,
+    PlatformUnavailable,
+    call_platform,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -158,8 +162,11 @@ async def _resolve_email_identity(email: str) -> Optional[uuid.UUID]:
     which is the point at which the bounded retry below becomes the only
     protection against a brief platform-api restart.
 
-    Opts into ONE retry: this is a pure read, so replaying it is safe. See
+    Opts into retries: this is a pure read, so replaying it is safe. See
     platform_client.call_platform for why retrying is opt-in and not a default.
+    The schedule outlasts one platform-api restart (RESTART_BRIDGING_BACKOFFS_S):
+    the provider pin lookup resolves the identity here first, and both are
+    fail-closed for a foreign-origin request.
     """
     # ADR-0011: the email→UUID mapping is a fact of the request's HOME bridge
     # (the same email has DIFFERENT UUIDs per bridge), so the cache key carries
@@ -172,7 +179,10 @@ async def _resolve_email_identity(email: str) -> Optional[uuid.UUID]:
     try:
         resp = await call_platform(
             "POST", "/v1/internal/users/lookup-by-email",
-            json={"email": email}, retries=1, domain="user",
+            json={"email": email},
+            retries=len(RESTART_BRIDGING_BACKOFFS_S),
+            retry_backoff_s=RESTART_BRIDGING_BACKOFFS_S,
+            domain="user",
         )
     except PlatformUnavailable as e:
         if is_foreign_origin():

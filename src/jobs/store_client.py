@@ -190,15 +190,30 @@ async def mark_done(job_id: str, result: Optional[Dict[str, Any]]) -> None:
         raise _unexpected("mark_done", resp.status_code, resp.json)
 
 
-async def mark_error(job_id: str, message: str, code: Optional[str] = None) -> None:
+async def mark_error(
+    job_id: str,
+    message: str,
+    code: Optional[str] = None,
+    retryable: Optional[bool] = None,
+    retry_after_s: Optional[int] = None,
+) -> None:
+    # A platform-api from before BR9 ignores retryable/retry_after_s (pydantic
+    # drops unknown fields) and stores {message, code}; GET then derives the
+    # verdict from the code (error_contract.job_code_fields). Degraded, not wrong
+    # for any code except a research/transport failure, which reads as final.
     try:
         resp = await call_platform(
             "POST", f"/v1/internal/jobs/{job_id}/error",
-            json={"message": message, "code": code}, timeout_s=_WRITE_TIMEOUT_S,
+            json={"message": message, "code": code,
+                  "retryable": retryable, "retry_after_s": retry_after_s},
+            timeout_s=_WRITE_TIMEOUT_S,
         )
     except PlatformUnavailable as e:
         _fallback_or_raise("mark_error", e)
-        return await store.mark_error(job_id, message, code=code)
+        return await store.mark_error(
+            job_id, message, code=code,
+            retryable=retryable, retry_after_s=retry_after_s,
+        )
     if resp.status_code != 204:
         raise _unexpected("mark_error", resp.status_code, resp.json)
 

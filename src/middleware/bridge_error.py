@@ -14,6 +14,7 @@ Sources (error.source):
     bridge_config       → bridge is misconfigured (missing env, bad creds)
     upstream_anthropic  → Anthropic API returned an error (after our retries)
     upstream_network    → network timeout / connection reset (after our retries)
+    upstream_provider   → OpenAI-compatible provider error before a stream began
 
 Types (error.bridge_type, within source):
     throttle            → token-budget cap reached, would-have-blocked
@@ -42,6 +43,8 @@ import logging
 from typing import Optional, Dict, Any
 from fastapi.responses import JSONResponse
 
+from src.error_contract import is_retryable_status
+
 logger = logging.getLogger(__name__)
 
 WORKER_NAME = os.getenv("INSTANCE_NAME", "unknown")
@@ -52,6 +55,9 @@ SOURCE_BRIDGE_ACCOUNT = "bridge_account"
 SOURCE_BRIDGE_CONFIG = "bridge_config"
 SOURCE_UPSTREAM_ANTHROPIC = "upstream_anthropic"
 SOURCE_UPSTREAM_NETWORK = "upstream_network"
+# An OpenAI-compatible provider (IONOS, Mistral, OpenRouter, ...) answered with
+# an error before a stream began (src/stream_start.py, BR9c).
+SOURCE_UPSTREAM_PROVIDER = "upstream_provider"
 
 TYPE_THROTTLE = "throttle"
 TYPE_QUEUE_TIMEOUT = "queue_timeout"
@@ -129,10 +135,12 @@ def bridge_error(
     Returns:
         JSONResponse with the structured body.
     """
+    # The verdict rules live in src/error_contract.py (BR9): explicit wins,
+    # otherwise the status decides.
     if retryable_override is not None:
         retryable = retryable_override
     else:
-        retryable = status_code in (408, 425, 429, 500, 502, 503, 504)
+        retryable = is_retryable_status(status_code)
     full_message = f"[Bridge {WORKER_NAME}] {message}"
     # Envelope combines OpenAI-compatible fields (message, type, code) with
     # bridge-specific metadata so callers can ALSO discriminate by `source`

@@ -25,7 +25,7 @@ import asyncio
 import logging
 import os
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Any, Optional, Sequence, Union
 
 import httpx
 
@@ -37,6 +37,20 @@ DEFAULT_PLATFORM_API_URL = "http://platform-api:8000"
 # ~4s total budget this is meant to fit into (2 attempts x 2s + one pause).
 DEFAULT_RETRY_BACKOFF_S = 0.25
 
+# Pause schedule for pure reads that a FAIL-CLOSED path depends on (the
+# provider pin and the identity behind it). It has to outlast one platform-api
+# restart, because a deploy of the HOME bridge recreates its platform-api while
+# foreign workers keep asking it (ADR-0011). Measured on the dev bridge on
+# 10.10.2026 (BR7): container created 04:09:18.28Z, port bound 04:09:19.53Z,
+# application ready 04:09:21.03Z, so roughly 3 s without an answer, plus the stop
+# of the old container. Two attempts 0.25 s apart covered 0.3 s of that, and a
+# research job died terminally in the gap. Retries start at 0, 0.5, 1.5, 3.5
+# and 7.5 s, which is about 2.5x the measured window. The bound is fixed: five
+# attempts of at most timeout_s each. Anything longer is an outage, and the job
+# layer parks the job for it (jobs.registry, dependency deferral) instead of
+# holding one request open.
+RESTART_BRIDGING_BACKOFFS_S: tuple[float, ...] = (0.5, 1.0, 2.0, 4.0)
+
 logger = logging.getLogger(__name__)
 
 
@@ -46,13 +60,34 @@ class PlatformUnavailable(Exception):
     those come back as a PlatformResponse for the caller to interpret, because
     e.g. 404 on a lookup is a real, cacheable answer ("no such row"), not an
     outage. The caller decides fail-open vs. fail-closed on this exception;
-    this module never decides that for them."""
+    this module never decides that for them.
+
+    Raised as THIS base class only for a configuration gap (no service token):
+    retrying that cannot help. A platform-api that could not answer right now
+    raises the subclass PlatformTemporarilyUnavailable."""
+
+
+class PlatformTemporarilyUnavailable(PlatformUnavailable):
+    """platform-api did not answer this time: timeout, connection refused, or a
+    5xx from platform-api itself. Usually a restart or a deploy. Asking again
+    later can succeed; the answer that was asked for is still unknown, so a
+    fail-closed caller must not guess it. It should hand the failure back as
+    "try again" instead (see routing.user_provider_override)."""
 
 
 @dataclass(frozen=True)
 class PlatformResponse:
     status_code: int
     json: Optional[dict[str, Any]]
+
+
+#: Response header with which an endpoint tells the job executor: "a dependency
+#: could not answer, nothing was decided, run this job again later". The value
+#: names the dependency. The executor turns it into a 424, and the job runner
+#: parks the job (jobs.registry) instead of failing it. A header and not the
+#: body, because chat (503 envelope), research (always 200) and doc-agent each
+#: have their own body shape.
+DEPENDENCY_UNAVAILABLE_HEADER = "X-Bridge-Dependency-Unavailable"
 
 
 def _base_url() -> str:
@@ -83,7 +118,7 @@ async def call_platform(
     params: Optional[dict[str, Any]] = None,
     timeout_s: float = 2.0,
     retries: int = 0,
-    retry_backoff_s: float = DEFAULT_RETRY_BACKOFF_S,
+    retry_backoff_s: Union[float, Sequence[float]] = DEFAULT_RETRY_BACKOFF_S,
     domain: str = "local",
 ) -> PlatformResponse:
     """POST/GET against platform-api, X-Bridge-Service-Token authenticated.
@@ -102,13 +137,17 @@ async def call_platform(
         federation.FederationMisconfigured — callers in the budget gate must
         map that to fail-CLOSED, not their transient-infra fail-open.
 
-    Raises PlatformUnavailable on timeout, connection error, or a 5xx from
-    platform-api itself — i.e. whenever platform-api could not actually
+    Raises PlatformTemporarilyUnavailable (a PlatformUnavailable) on timeout,
+    connection error, or a 5xx from platform-api itself — i.e. whenever platform-api could not actually
     answer. Any other status (2xx, 4xx) comes back as a PlatformResponse; the
     caller reads .status_code to distinguish e.g. "found" from "not found".
 
     retries: how many EXTRA attempts to make after a transport failure.
     Default 0 — retrying is opt-in per call site, never a client-wide default.
+
+    retry_backoff_s: one pause for every retry, or a schedule (pause before
+    retry 1, 2, ...). The last pause in the schedule repeats if retries is
+    longer. Example: RESTART_BRIDGING_BACKOFFS_S.
 
     Why opt-in and not a default (ADR-0009, decided at implementation time —
     the Schritt-2 design doc originally specified the opposite polarity, a
@@ -158,6 +197,13 @@ async def call_platform(
     url = f"{base}{path if path.startswith('/') else '/' + path}"
     headers = {"X-Bridge-Service-Token": token if token is not None else _service_token()}
 
+    if isinstance(retry_backoff_s, (int, float)):
+        pauses: tuple[float, ...] = (float(retry_backoff_s),)
+    else:
+        pauses = tuple(float(p) for p in retry_backoff_s)
+        if not pauses:
+            raise ValueError("call_platform: retry_backoff_s schedule is empty")
+
     attempts = retries + 1
     for attempt in range(1, attempts + 1):
         try:
@@ -169,18 +215,19 @@ async def call_platform(
         except (httpx.TimeoutException, httpx.TransportError) as e:
             kind = "timeout" if isinstance(e, httpx.TimeoutException) else "unreachable"
             if attempt >= attempts:
-                raise PlatformUnavailable(
+                raise PlatformTemporarilyUnavailable(
                     f"platform-api {kind} on {method} {path} "
                     f"after {attempt} attempt(s): {e}"
                 ) from e
+            pause = pauses[min(attempt - 1, len(pauses) - 1)]
             logger.warning(
                 "platform-api %s on %s %s (attempt %d/%d) — retrying in %.2fs",
-                kind, method, path, attempt, attempts, retry_backoff_s,
+                kind, method, path, attempt, attempts, pause,
             )
-            await asyncio.sleep(retry_backoff_s)
+            await asyncio.sleep(pause)
 
     if resp.status_code >= 500:
-        raise PlatformUnavailable(
+        raise PlatformTemporarilyUnavailable(
             f"platform-api {resp.status_code} on {method} {path}: {resp.text[:200]}"
         )
 

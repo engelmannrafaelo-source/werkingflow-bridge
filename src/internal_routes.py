@@ -686,6 +686,10 @@ class InternalJobDone(BaseModel):
 class InternalJobError(BaseModel):
     message: str
     code: Optional[str] = None
+    # src/error_contract.py verdict (BR9). Optional: workers from before BR9
+    # send neither.
+    retryable: Optional[bool] = None
+    retry_after_s: Optional[int] = Field(default=None, ge=0)
 
 
 class InternalJobDefer(BaseModel):
@@ -804,7 +808,10 @@ async def internal_mark_error(
 ) -> Response:
     from src.jobs import store
 
-    await store.mark_error(job_id, body.message, code=body.code)
+    await store.mark_error(
+        job_id, body.message, code=body.code,
+        retryable=body.retryable, retry_after_s=body.retry_after_s,
+    )
     return Response(status_code=204)
 
 
@@ -844,6 +851,23 @@ async def internal_find_abandoned(
 
     jobs = await store.find_abandoned(stale_seconds, max_attempts)
     return {"jobs": jobs}
+
+
+@router.get("/jobs-maintenance/active")
+async def internal_find_active(
+    origin: Optional[str] = None,
+    limit: int = 50,
+    _claims: AuthClaims = Depends(require_service_token),
+) -> Dict[str, Any]:
+    """Counts the jobs that depend on a platform-api right now, for the deploy
+    gate in front of a platform-api recreation (BR8). ``origin`` limits the
+    count to jobs whose budget home is that bridge (ADR-0011). Read-only."""
+    from src.jobs import store
+
+    try:
+        return await store.find_active(origin=origin, limit=limit)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
 
 @router.post("/jobs-maintenance/cleanup")
