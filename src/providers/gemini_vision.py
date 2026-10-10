@@ -79,6 +79,17 @@ from typing import Any, Dict, List, Optional
 import httpx
 from fastapi import HTTPException
 
+from src.middleware.bridge_error import (
+    REASON_VISION_RESPONSE_REJECTED,
+    SOURCE_BRIDGE_INTERNAL,
+    TYPE_INTERNAL,
+    UNREADABLE_RESPONSE_ERRORS,
+    ClassifiedError,
+    UpstreamResponseUnreadable,
+    bridge_error,
+    config_error,
+    vision_response_unusable_error,
+)
 from src.vision_provider import VisionProvider
 
 logger = logging.getLogger(__name__)
@@ -145,7 +156,47 @@ class GeminiVisionError(RuntimeError):
     Testlauf soll messen, was Gemini liefert, und ein heimlich von Anthropic
     beantworteter Aufruf haette genau diese Messung verfaelscht (und dazu
     Kundendaten-Routing verschleiert, siehe Modul-Docstring).
+
+    Geworfen werden nur die drei Unterklassen; jede traegt ihr Urteil selbst
+    (BR9f, error_contract Regel 1). Vorher fiel jede GeminiVisionError durch
+    classify_exception als 500 wiederholbar — nginx wiederholte sie auf allen
+    Workern. Transportfehler sind KEINE GeminiVisionError: httpx-Fehler und
+    Gemini-5xx bleiben wiederholbar wie bisher.
     """
+
+
+class GeminiVisionConfigError(GeminiVisionError, ClassifiedError):
+    """Der Gemini-Weg ist auf diesem Worker falsch eingestellt (Schluessel,
+    Modell, Denk-Budget). Nicht wiederholbar — wie config_error."""
+
+    def envelope(self):
+        return config_error(detail=str(self)[:300])
+
+
+class GeminiVisionRequestError(GeminiVisionError, ClassifiedError):
+    """Die Anfrage laesst sich nicht an Gemini schicken (Bildquelle nicht
+    base64, leerer Inhalt). 400, nicht wiederholbar: dieselbe Anfrage
+    scheitert wieder, bevor Gemini sie sieht."""
+
+    def envelope(self):
+        return bridge_error(
+            source=SOURCE_BRIDGE_INTERNAL,
+            error_type=TYPE_INTERNAL,
+            reason="vision_request_unsupported",
+            message=f"Gemini-Bildweg: {self}",
+            status_code=400,
+            retryable_override=False,
+        )
+
+
+class GeminiVisionRejectedError(GeminiVisionError, ClassifiedError):
+    """Gemini hat mit 200 geantwortet und abgewiesen (blockReason, kein
+    Kandidat). 422, nicht wiederholbar: dieselbe Anfrage wird wieder
+    abgewiesen, und jeder Versuch kann bezahlt sein."""
+
+    def envelope(self):
+        return vision_response_unusable_error(
+            REASON_VISION_RESPONSE_REJECTED, "gemini", str(self)[:300])
 
 
 def resolve_gemini_vision_model() -> str:
@@ -162,7 +213,7 @@ def resolve_gemini_vision_model() -> str:
     if not raw:
         return DEFAULT_GEMINI_VISION_MODEL
     if raw not in GEMINI_VISION_MODELS:
-        raise GeminiVisionError(
+        raise GeminiVisionConfigError(
             f"GEMINI_VISION_MODEL={raw!r} ist kein bekanntes Gemini-Bildmodell. "
             f"Erlaubt (und in src/pricing.py bepreist): {sorted(GEMINI_VISION_MODELS)}. "
             "Ein unbepreistes Modell wuerde 0,00 EUR ins Ledger schreiben, obwohl "
@@ -205,13 +256,13 @@ def gemini_vision_thinking_budget() -> Optional[int]:
     try:
         value = int(raw)
     except ValueError:
-        raise GeminiVisionError(
+        raise GeminiVisionConfigError(
             f"GEMINI_VISION_THINKING_BUDGET={raw!r} ist keine ganze Zahl. "
             "Erlaubt: nicht gesetzt (Googles Default), 0 (Denken aus) oder eine "
             "positive Obergrenze."
         ) from None
     if value < 0:
-        raise GeminiVisionError(
+        raise GeminiVisionConfigError(
             f"GEMINI_VISION_THINKING_BUDGET={value} ist negativ. 0 schaltet das "
             "Denken ab, groessere Werte begrenzen es."
         )
@@ -268,7 +319,7 @@ def _to_gemini_contents(
                 elif block.get("type") == "image":
                     source = block.get("source", {})
                     if source.get("type") != "base64":
-                        raise GeminiVisionError(
+                        raise GeminiVisionRequestError(
                             f"Bildquelle {source.get('type')!r} wird auf dem "
                             "Gemini-Weg nicht unterstuetzt — erwartet wird "
                             "base64 (VisionProvider laedt externe URLs bereits "
@@ -324,13 +375,77 @@ def _usage_from(data: Dict[str, Any]) -> Dict[str, int]:
     }
 
 
+def _gemini_response_from(
+    data: Dict[str, Any], resolved_model: str, effective_budget: Optional[int],
+) -> GeminiVisionResponse:
+    """Die 200-Antwort von ``generateContent`` -> GeminiVisionResponse."""
+    candidates = data.get("candidates") or []
+    if not candidates:
+        # Prompt-seitige Blockade (Safety) liefert gar keinen Kandidaten.
+        # Ohne diesen Zweig waere das ein IndexError statt einer Aussage.
+        block = (data.get("promptFeedback") or {}).get("blockReason")
+        raise GeminiVisionRejectedError(
+            "Gemini lieferte keinen Kandidaten"
+            + (f" (blockReason={block!r})" if block else "")
+            + " — die Anfrage wurde upstream abgewiesen."
+        )
+
+    candidate = candidates[0]
+    # Fehlender finishReason ist kein Erfolg: "unknown" wie auf dem
+    # Anthropic-Bildweg (vision_provider._stop_reason_or_unknown), nicht "STOP".
+    raw_finish = candidate.get("finishReason")
+    if not raw_finish:
+        logger.error("Gemini-Kandidat ohne finishReason — melde stop_reason 'unknown'")
+        raw_finish = "unknown"
+    stop_reason = _GEMINI_FINISH_REASON_MAP.get(raw_finish, raw_finish.lower())
+    response_text = _extract_text(candidate)
+    usage = _usage_from(data)
+
+    log = logger.warning if not response_text else logger.info
+    log(
+        "Gemini-Vision-Antwort: %d Zeichen%s",
+        len(response_text),
+        "" if response_text else f" — LEER (finishReason={raw_finish!r})",
+        extra={
+            "response_length": len(response_text),
+            "stop_reason": stop_reason,
+            "input_tokens": usage["prompt_tokens"],
+            "output_tokens": usage["completion_tokens"],
+        },
+    )
+
+    served = data.get("modelVersion")
+    if served and served != resolved_model:
+        # Nur protokollieren, NICHT ins Ledger uebernehmen: Google haengt an
+        # ``modelVersion`` gern eine Punktfassung an (…-001). Die stuende in
+        # keiner Preiszeile, und ``price_entry`` kuerzt nur ein
+        # Datums-Suffix — die Zeile buchte dann still 0,00 EUR. Bepreist und
+        # deterministisch ist der ANGEFRAGTE Name, und der ist es auch, den
+        # eine Auswertung wiederfinden koennen muss.
+        logger.info(
+            "Gemini bediente modelVersion=%r (angefragt: %r) — im Ledger "
+            "steht der angefragte Name, weil nur der bepreist ist.",
+            served, resolved_model,
+        )
+
+    return GeminiVisionResponse(
+        content=response_text,
+        model=resolved_model,
+        usage=usage,
+        stop_reason=stop_reason,
+        thinking_budget_applied=effective_budget,
+        thoughts_tokens=int((data.get("usageMetadata") or {}).get("thoughtsTokenCount") or 0),
+    )
+
+
 class GeminiVisionProvider:
     """Gemini ``generateContent`` mit Bildeingabe, per API-Key.
 
     Spiegelt ``VisionProvider`` in Vertrag und Fehlerverhalten: 4xx (ausser
     429) werden zur ``HTTPException`` mit durchgereichtem Upstream-Text, alles
-    andere zu ``RuntimeError`` — so greift die vorhandene Klassifikation in
-    ``main.py`` (``classify_exception``) unveraendert.
+    andere zu ``RuntimeError``. ``classify_exception`` liest den Status der
+    ``HTTPException`` (4xx ausser 408/425/429: nicht wiederholbar, BR9f); die
+    GeminiVisionError-Unterklassen tragen ihr Urteil selbst.
     """
 
     def __init__(self) -> None:
@@ -365,7 +480,7 @@ class GeminiVisionProvider:
         ``gemini_vision_gate.assert_no_anthropic_only_params``.
         """
         if not self.api_key:
-            raise GeminiVisionError(
+            raise GeminiVisionConfigError(
                 f"{API_KEY_ENV} ist nicht gesetzt. Der Gemini-Bildweg ist damit "
                 "nicht benutzbar — es gibt bewusst keinen stillen Rueckfall auf "
                 "das Anthropic-Bildmodell."
@@ -373,7 +488,7 @@ class GeminiVisionProvider:
 
         resolved_model = model or resolve_gemini_vision_model()
         if resolved_model not in GEMINI_VISION_MODELS:
-            raise GeminiVisionError(
+            raise GeminiVisionConfigError(
                 f"Modell {resolved_model!r} ist fuer den Gemini-Bildweg nicht "
                 f"freigegeben. Erlaubt: {sorted(GEMINI_VISION_MODELS)}."
             )
@@ -385,7 +500,7 @@ class GeminiVisionProvider:
         contents = _to_gemini_contents(anthropic_messages)
 
         if not contents:
-            raise GeminiVisionError(
+            raise GeminiVisionRequestError(
                 "Nach der Konvertierung blieb kein Inhalt uebrig — der Aufruf "
                 "haette ein leeres contents-Array an Gemini geschickt."
             )
@@ -453,64 +568,13 @@ class GeminiVisionProvider:
                 f"Gemini API error ({response.status_code}): {error_body[:200]}"
             )
 
-        data = response.json()
-        candidates = data.get("candidates") or []
-        if not candidates:
-            # Prompt-seitige Blockade (Safety) liefert gar keinen Kandidaten.
-            # Ohne diesen Zweig waere das ein IndexError statt einer Aussage.
-            block = (data.get("promptFeedback") or {}).get("blockReason")
-            raise GeminiVisionError(
-                "Gemini lieferte keinen Kandidaten"
-                + (f" (blockReason={block!r})" if block else "")
-                + " — die Anfrage wurde upstream abgewiesen."
-            )
-
-        candidate = candidates[0]
-        # Fehlender finishReason ist kein Erfolg: "unknown" wie auf dem
-        # Anthropic-Bildweg (vision_provider._stop_reason_or_unknown), nicht "STOP".
-        raw_finish = candidate.get("finishReason")
-        if not raw_finish:
-            logger.error("Gemini-Kandidat ohne finishReason — melde stop_reason 'unknown'")
-            raw_finish = "unknown"
-        stop_reason = _GEMINI_FINISH_REASON_MAP.get(raw_finish, raw_finish.lower())
-        response_text = _extract_text(candidate)
-        usage = _usage_from(data)
-
-        log = logger.warning if not response_text else logger.info
-        log(
-            "Gemini-Vision-Antwort: %d Zeichen%s",
-            len(response_text),
-            "" if response_text else f" — LEER (finishReason={raw_finish!r})",
-            extra={
-                "response_length": len(response_text),
-                "stop_reason": stop_reason,
-                "input_tokens": usage["prompt_tokens"],
-                "output_tokens": usage["completion_tokens"],
-            },
-        )
-
-        served = data.get("modelVersion")
-        if served and served != resolved_model:
-            # Nur protokollieren, NICHT ins Ledger uebernehmen: Google haengt an
-            # ``modelVersion`` gern eine Punktfassung an (…-001). Die stuende in
-            # keiner Preiszeile, und ``price_entry`` kuerzt nur ein
-            # Datums-Suffix — die Zeile buchte dann still 0,00 EUR. Bepreist und
-            # deterministisch ist der ANGEFRAGTE Name, und der ist es auch, den
-            # eine Auswertung wiederfinden koennen muss.
-            logger.info(
-                "Gemini bediente modelVersion=%r (angefragt: %r) — im Ledger "
-                "steht der angefragte Name, weil nur der bepreist ist.",
-                served, resolved_model,
-            )
-
-        return GeminiVisionResponse(
-            content=response_text,
-            model=resolved_model,
-            usage=usage,
-            stop_reason=stop_reason,
-            thinking_budget_applied=effective_budget,
-            thoughts_tokens=int((data.get("usageMetadata") or {}).get("thoughtsTokenCount") or 0),
-        )
+        # Alles nach der 200 liest eine bezahlte Antwort. Laesst sie sich nicht
+        # lesen, ist das kein Bridge-Bug zum Wiederholen, sondern eine Antwort,
+        # die beim naechsten Versuch genauso aussieht (BR9f).
+        try:
+            return _gemini_response_from(response.json(), resolved_model, effective_budget)
+        except UNREADABLE_RESPONSE_ERRORS as exc:
+            raise UpstreamResponseUnreadable("gemini", exc) from exc
 
 
 _provider: Optional[GeminiVisionProvider] = None

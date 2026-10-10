@@ -408,42 +408,55 @@ class VisionProvider:
                 f"Anthropic API error ({response.status_code}): {error_body[:200]}"
             )
 
-        data = response.json()
-
-        # Extract response content
-        content_blocks = data.get("content", [])
-        response_text = ""
-        for block in content_blocks:
-            if block.get("type") == "text":
-                response_text += block.get("text", "")
-
-        usage = data.get("usage", {})
-
-        log = logger.warning if not response_text else logger.info
-        log(
-            f"Vision response: {len(response_text)} chars"
-            + ("" if response_text else
-               f" — EMPTY (stop_reason={data.get('stop_reason')!r}, "
-               f"output_tokens={usage.get('output_tokens', 0)}; vermutlich "
-               f"Thinking hat max_tokens aufgebraucht)"),
-            extra={
-                "response_length": len(response_text),
-                "stop_reason": data.get("stop_reason"),
-                "input_tokens": usage.get("input_tokens", 0),
-                "output_tokens": usage.get("output_tokens", 0)
-            }
+        # Alles nach der 200 liest eine bezahlte Antwort. Laesst sie sich nicht
+        # lesen, sieht sie beim naechsten Versuch genauso aus: nicht
+        # wiederholbar statt 500 (BR9f).
+        from src.middleware.bridge_error import (
+            UNREADABLE_RESPONSE_ERRORS,
+            UpstreamResponseUnreadable,
         )
+        try:
+            return _vision_response_from(response.json(), model)
+        except UNREADABLE_RESPONSE_ERRORS as exc:
+            raise UpstreamResponseUnreadable("anthropic", exc) from exc
 
-        return VisionResponse(
-            content=response_text,
-            model=data.get("model", model),
-            usage={
-                "prompt_tokens": usage.get("input_tokens", 0),
-                "completion_tokens": usage.get("output_tokens", 0),
-                "total_tokens": usage.get("input_tokens", 0) + usage.get("output_tokens", 0)
-            },
-            stop_reason=_stop_reason_or_unknown(data.get("stop_reason"))
-        )
+
+def _vision_response_from(data: Dict[str, Any], model: str) -> VisionResponse:
+    """Die 200-Antwort der Anthropic Messages API -> VisionResponse."""
+    # Extract response content
+    content_blocks = data.get("content", [])
+    response_text = ""
+    for block in content_blocks:
+        if block.get("type") == "text":
+            response_text += block.get("text", "")
+
+    usage = data.get("usage", {})
+
+    log = logger.warning if not response_text else logger.info
+    log(
+        f"Vision response: {len(response_text)} chars"
+        + ("" if response_text else
+           f" — EMPTY (stop_reason={data.get('stop_reason')!r}, "
+           f"output_tokens={usage.get('output_tokens', 0)}; vermutlich "
+           f"Thinking hat max_tokens aufgebraucht)"),
+        extra={
+            "response_length": len(response_text),
+            "stop_reason": data.get("stop_reason"),
+            "input_tokens": usage.get("input_tokens", 0),
+            "output_tokens": usage.get("output_tokens", 0)
+        }
+    )
+
+    return VisionResponse(
+        content=response_text,
+        model=data.get("model", model),
+        usage={
+            "prompt_tokens": usage.get("input_tokens", 0),
+            "completion_tokens": usage.get("output_tokens", 0),
+            "total_tokens": usage.get("input_tokens", 0) + usage.get("output_tokens", 0)
+        },
+        stop_reason=_stop_reason_or_unknown(data.get("stop_reason"))
+    )
 
 
 def _stop_reason_or_unknown(stop_reason: Optional[str]) -> str:

@@ -325,6 +325,22 @@ def _producers():
         from src.middleware.bridge_error import BridgeError, classify_exception
         return await _after_first_chunk(BridgeError(classify_exception(RuntimeError("vision boom"))))
 
+    async def vision_4xx_after_first_chunk(mp):
+        # BR9f: an upstream 4xx is final, same form.
+        from fastapi import HTTPException as _HE
+
+        from src.middleware.bridge_error import BridgeError, classify_exception
+        return await _after_first_chunk(BridgeError(classify_exception(_HE(413, "too large"))))
+
+    async def vision_rejected_after_200_after_first_chunk(mp):
+        from src.middleware.bridge_error import (
+            BridgeError,
+            UpstreamResponseUnreadable,
+            classify_exception,
+        )
+        return await _after_first_chunk(BridgeError(classify_exception(
+            UpstreamResponseUnreadable("anthropic", KeyError("content")))))
+
     async def account_org_disabled_after_first_chunk(mp):
         from src.claude_cli import OrgSubscriptionDisabledError
         return await _after_first_chunk(OrgSubscriptionDisabledError("w", "assistant_text", 60))
@@ -339,6 +355,8 @@ def _producers():
         pytest.param(openai_compatible_truncated, id="openai-compatible-truncated"),
         pytest.param(vision_after_first_chunk, id="vision-after-first-chunk"),
         pytest.param(account_org_disabled_after_first_chunk, id="account-org-disabled-after-first-chunk"),
+        pytest.param(vision_4xx_after_first_chunk, id="vision-4xx-after-first-chunk"),
+        pytest.param(vision_rejected_after_200_after_first_chunk, id="vision-unreadable-after-first-chunk"),
     ]
 
 

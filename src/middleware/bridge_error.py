@@ -33,6 +33,9 @@ Reasons (error.reason) — narrow stable identifiers for panel aggregation:
     claude_upstream_timeout          → upstream network/read timeout      (429)
     worker_internal_error            → bug / unclassified exception       (500)
     worker_misconfigured             → missing env, bad credential        (500)
+    upstream_request_rejected        → upstream 4xx, request not servable (4xx)
+    vision_response_rejected         → 200, but the answer was a refusal  (422)
+    vision_response_unreadable       → 200, but the answer can't be read  (422)
 
 Every response includes a `Retry-After` header when retryable.
 """
@@ -42,6 +45,7 @@ import time
 import logging
 from typing import Optional, Dict, Any
 from fastapi.responses import JSONResponse
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from src.error_contract import is_retryable_status
 
@@ -56,7 +60,9 @@ SOURCE_BRIDGE_CONFIG = "bridge_config"
 SOURCE_UPSTREAM_ANTHROPIC = "upstream_anthropic"
 SOURCE_UPSTREAM_NETWORK = "upstream_network"
 # An OpenAI-compatible provider (IONOS, Mistral, OpenRouter, ...) answered with
-# an error before a stream began (src/stream_start.py, BR9c).
+# an error before a stream began (src/stream_start.py, BR9c); also a vision
+# provider (Anthropic direct key, Gemini) that rejected or garbled a call
+# (BR9f) — classify_exception cannot tell which provider raised.
 SOURCE_UPSTREAM_PROVIDER = "upstream_provider"
 
 TYPE_THROTTLE = "throttle"
@@ -94,6 +100,16 @@ REASON_VISION_EMPTY_RESPONSE = "vision_empty_response"
 # retrying the identical request fails forever. Must NOT collapse to 500
 # (→ nginx exhausts workers → bogus "at capacity") nor 429 (→ client retry-loop).
 REASON_INVALID_REQUEST = "upstream_invalid_request"
+# Any other upstream 4xx the provider raised as HTTPException (401/403 bad
+# bridge key, 404 unknown model, 413 too large, Gemini 400 INVALID_ARGUMENT).
+# Non-retryable WITH a 4xx status: nginx decides on the status alone, not on
+# `retryable` in the body (BR9f).
+REASON_UPSTREAM_REJECTED = "upstream_request_rejected"
+# The provider answered 200 and the answer is unusable: a refusal (Gemini
+# blockReason, no candidate) or a body the bridge cannot read. The call is
+# paid; the identical request gets the same answer again (BR9f).
+REASON_VISION_RESPONSE_REJECTED = "vision_response_rejected"
+REASON_VISION_RESPONSE_UNREADABLE = "vision_response_unreadable"
 # 500-class (contract violation — must be investigated)
 REASON_INTERNAL = "worker_internal_error"
 REASON_MISCONFIGURED = "worker_misconfigured"
@@ -548,6 +564,51 @@ def client_request_error(detail: str) -> JSONResponse:
     )
 
 
+def upstream_rejected_error(upstream_status: int, detail: str) -> JSONResponse:
+    """An upstream provider rejected the request with a 4xx (not 408/425/429).
+
+    Non-retryable, and the wire status stays 4xx (BR9f): before this the
+    HTTPException fell through classify_exception to internal_error (500,
+    retryable) — nginx retried http_500 on every worker, PC1 retried the
+    rewritten 502 twice more, up to 15 identical uploads of the same image for
+    a rejection that cannot change.
+
+    401/403 go out as 424 Failed Dependency: it is the BRIDGE's key the
+    provider refused, the caller's credentials are fine — a 401 from the
+    bridge would say the opposite (see the authentication_error note in
+    bridge_error). Every other status passes through; the original is in
+    `upstream_status`.
+    """
+    status = 424 if upstream_status in (401, 403) else upstream_status
+    return bridge_error(
+        source=SOURCE_UPSTREAM_PROVIDER,
+        error_type=TYPE_UPSTREAM_ERROR,
+        reason=REASON_UPSTREAM_REJECTED,
+        message=(
+            f"Upstream provider rejected the request with HTTP {upstream_status} "
+            f"(not retryable): {detail}"
+        ),
+        status_code=status,
+        retryable_override=False,
+        extra={"upstream_status": upstream_status},
+    )
+
+
+def vision_response_unusable_error(reason: str, provider: str, detail: str) -> JSONResponse:
+    """The vision provider answered 200, and the answer is a refusal or
+    unreadable. 422 + non-retryable: the call is paid, and the identical
+    request yields the same answer — a retry pays again for nothing (BR9f)."""
+    return bridge_error(
+        source=SOURCE_UPSTREAM_PROVIDER,
+        error_type=TYPE_UPSTREAM_ERROR,
+        reason=reason,
+        message=f"Vision provider {provider} answered, but the answer is unusable: {detail}",
+        status_code=422,
+        retryable_override=False,
+        extra={"provider": provider},
+    )
+
+
 def upstream_timeout_error(
     waited_s: float,
     retry_after_s: int = 30,
@@ -582,6 +643,35 @@ class BridgeError(Exception):
     def __init__(self, response: JSONResponse) -> None:
         super().__init__("bridge_error")
         self.response = response
+
+
+class ClassifiedError(Exception):
+    """An exception that carries its own envelope — error_contract rule 1:
+    the code that knows sets the verdict, classify_exception does not guess it
+    from the message text. Subclasses implement ``envelope()``."""
+
+    def envelope(self) -> JSONResponse:
+        raise NotImplementedError(type(self).__name__)
+
+
+# What parsing a provider's 200 body raises when it is not what we expect:
+# not JSON (JSONDecodeError is a ValueError), a list instead of a dict, a
+# missing key, a non-numeric token count.
+UNREADABLE_RESPONSE_ERRORS = (ValueError, KeyError, TypeError, AttributeError, IndexError)
+
+
+class UpstreamResponseUnreadable(ClassifiedError):
+    """The provider answered 200 and the body could not be parsed (not JSON,
+    unexpected shape). Raised by the vision providers around their parsing;
+    before BR9f the bare KeyError/ValueError became a retryable 500."""
+
+    def __init__(self, provider: str, cause: BaseException) -> None:
+        super().__init__(f"{type(cause).__name__}: {cause}")
+        self.provider = provider
+
+    def envelope(self) -> JSONResponse:
+        return vision_response_unusable_error(
+            REASON_VISION_RESPONSE_UNREADABLE, self.provider, str(self)[:300])
 
 
 class SDKDisconnectError(Exception):
@@ -697,6 +787,9 @@ def classify_exception(exc: Exception) -> JSONResponse:
     Map an arbitrary Exception to the most specific bridge error envelope.
 
     Preference order:
+      0. Own verdict: BridgeError, ClassifiedError, RateLimitError
+         Upstream 4xx HTTPException (not 408/425/429)
+                                  → its 4xx, non-retryable (BR9f)
       1. Config markers           → config_error     (source=bridge_config, 500, non-retryable)
       2. Network/timeout markers  → upstream_timeout (source=upstream_network, 429)
       3. Upstream HTTP markers    → upstream_error   (source=upstream_anthropic, 429)
@@ -735,6 +828,27 @@ def classify_exception(exc: Exception) -> JSONResponse:
             )
     except ImportError:
         pass
+
+    # 0c. The raiser's own verdict (error_contract rule 1): typed provider
+    # errors such as GeminiVisionRejectedError or UpstreamResponseUnreadable.
+    if isinstance(exc, ClassifiedError):
+        return exc.envelope()
+
+    # 0d. A 4xx HTTPException is an upstream rejection with a status (the
+    # vision providers raise it for every 4xx but 429). The status decides,
+    # not the text: before BR9f e.g. Anthropic 401 or Gemini 400 matched no
+    # marker and became internal_error 500 — retryable, and nginx retries
+    # http_500 on every worker. 408/425/429 are transient (is_retryable_status)
+    # and keep the marker path below, unchanged. 5xx never arrive here as
+    # HTTPException from the providers; they keep the marker path too.
+    if isinstance(exc, StarletteHTTPException) and 400 <= exc.status_code < 500 \
+            and not is_retryable_status(exc.status_code):
+        detail = exc.detail if isinstance(exc.detail, str) else str(exc.detail)
+        if is_vision_billing_exhausted(detail):
+            return vision_billing_error(detail=detail[:200])
+        if "invalid_request_error" in detail.lower():
+            return client_request_error(detail=detail[:300])
+        return upstream_rejected_error(exc.status_code, detail[:300])
 
     # 1. Configuration errors — surface loud and clear; not retryable.
     if any(marker in lower for marker in _CONFIG_MARKERS):

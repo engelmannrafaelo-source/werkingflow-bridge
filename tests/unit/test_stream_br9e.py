@@ -170,7 +170,7 @@ def _config(backend: BackendType) -> BackendConfig:
     )
 
 
-async def _run_route(monkeypatch, backend, *, disconnect_when=None, extra=()):
+async def _run_route(monkeypatch, backend, *, disconnect_when=None, extra=(), stream=True):
     """Drive main.app like uvicorn (spec 2.3): once the caller is gone, every
     receive() says http.disconnect. Returns the sent ASGI messages."""
     from src.middleware.adaptive_limiter import adaptive_limit_dependency
@@ -181,7 +181,7 @@ async def _run_route(monkeypatch, backend, *, disconnect_when=None, extra=()):
     async def _kein_limiter():
         return None
 
-    body = json.dumps({"model": "claude-sonnet-4-5", "stream": True,
+    body = json.dumps({"model": "claude-sonnet-4-5", "stream": stream,
                        "messages": [{"role": "user", "content": "ping"}]}).encode()
     messages = [{"type": "http.request", "body": body, "more_body": False}]
     sent: list = []
@@ -325,8 +325,23 @@ _BEDROCK_GATES = (
 )
 
 
+class _Ledger:
+    """A ledger write that really suspends, like the DB/HTTP write it stands
+    for (BR9f, BR9eR SOLL). An AsyncMock returns without ever yielding, so the
+    cancel aimed at the booking never lands: with asyncio.shield removed from
+    main._shielded_booking these tests stayed green. Here a row counts only
+    once the write has come back from its await."""
+
+    def __init__(self):
+        self.calls: list = []
+
+    async def __call__(self, **kw):
+        await asyncio.sleep(0.05)
+        self.calls.append(kw)
+
+
 def _bedrock(stream):
-    persist = AsyncMock()
+    persist = _Ledger()
     return persist, (
         *_BEDROCK_GATES,
         patch("src.bedrock_service.stream_bedrock", new=stream),
@@ -356,8 +371,8 @@ async def test_bedrock_cut_off_in_the_thinking_phase_is_booked(monkeypatch):
 
     assert provider.aborted
     assert not any(b"data:" in m.get("body", b"") for m in sent)
-    assert persist.await_count == 1, persist.await_args_list
-    kw = persist.await_args.kwargs
+    assert len(persist.calls) == 1, persist.calls
+    kw = persist.calls[0]
     assert kw["provider"] == "bedrock"
     assert kw["input_tokens"] == 1200
     assert (kw["status"], kw["error_code"]) == (
@@ -383,8 +398,8 @@ async def test_bedrock_cut_off_after_the_first_chunk_is_booked(monkeypatch):
     await _run_route(monkeypatch, BackendType.BEDROCK, disconnect_when=when, extra=extra)
 
     assert provider.aborted
-    assert persist.await_count == 1, persist.await_args_list
-    kw = persist.await_args.kwargs
+    assert len(persist.calls) == 1, persist.calls
+    kw = persist.calls[0]
     assert (kw["input_tokens"], kw["output_tokens"]) == (1200, 40)
     assert kw["status"] == delivery.STATUS_UNDELIVERED
     assert kw["error_code"] == delivery.ERROR_CODE_CALLER_GONE
@@ -403,8 +418,8 @@ async def test_bedrock_drained_stream_is_booked_once_as_before(monkeypatch):
     sent = await _run_route(monkeypatch, BackendType.BEDROCK, extra=extra)
 
     assert _status(sent) == 200
-    assert persist.await_count == 1
-    kw = persist.await_args.kwargs
+    assert len(persist.calls) == 1, persist.calls
+    kw = persist.calls[0]
     assert (kw["status"], kw["error_code"], kw["output_tokens"]) == ("success", None, 9)
 
 
@@ -420,8 +435,8 @@ async def test_bedrock_stream_ended_by_bedrock_is_booked_as_error_as_before(monk
     persist, extra = _bedrock(aborted)
     await _run_route(monkeypatch, BackendType.BEDROCK, extra=extra)
 
-    assert persist.await_count == 1
-    kw = persist.await_args.kwargs
+    assert len(persist.calls) == 1, persist.calls
+    kw = persist.calls[0]
     assert (kw["status"], kw["error_code"], kw["error_message"]) == ("error", "stream_aborted", "cut")
 
 
