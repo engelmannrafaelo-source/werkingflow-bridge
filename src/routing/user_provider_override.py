@@ -311,7 +311,9 @@ async def _fetch_via_direct_db(
     fail-closed promise has to survive the platform-api hop, not just the
     direct query it used to be. If platform-api only failed temporarily
     (``platform_error`` is a PlatformTemporarilyUnavailable), the refusal is
-    retryable as well.
+    retryable as well. So is a direct-DB query that fails because the database
+    cannot be reached (src.db.client.is_db_unreachable); any other DB error
+    is re-raised for the caller's final refusal.
     """
     from src.db.client import is_db_enabled
 
@@ -330,7 +332,29 @@ async def _fetch_via_direct_db(
             "(ADR-0009 Schritt 3/4), platform-api reachability is now "
             "load-bearing — investigate why it failed."
         ) from platform_error
-    return await fetch_provider_config_from_db(uid)
+    try:
+        return await fetch_provider_config_from_db(uid)
+    except Exception as db_error:
+        # Both channels failed. If the DB could not be REACHED, the question
+        # is still unanswered, not answered "forbidden" — the same gap as a
+        # platform-api restart, and exactly what a postgres-prod recreate
+        # looks like from here: platform-api answers 5xx because ITS database
+        # is gone, and this fallback hits the same missing database (BR8R2
+        # MUSS 1). Any other DB error stays with the caller's final refusal.
+        from src.db.client import is_db_unreachable
+
+        if not is_db_unreachable(db_error):
+            raise
+        logger.error(
+            "provider_config lookup: direct-DB fallback could not reach the "
+            "database either (%s: %s) — refused as retryable",
+            type(db_error).__name__, db_error,
+        )
+        raise ProviderConfigTemporarilyUnavailable(
+            "provider_config lookup failed: neither platform-api nor the "
+            "database could be reached — cannot verify whether this user is "
+            "pinned to a specific backend; retry later"
+        ) from db_error
 
 
 async def _lookup_provider_config(uid: Any) -> Optional[dict]:
@@ -397,9 +421,10 @@ async def get_user_provider_config(raw_user_id: Any) -> Optional[dict]:
     but the lookup FAILS (platform-api down AND no usable direct connection, or
     a DB error): we then cannot know whether a compliance pin exists, and
     guessing "no pin" would silently break it. If the platform-api only failed
-    temporarily (timeout, refused connection, 5xx), the error is the retryable
-    subclass ProviderConfigTemporarilyUnavailable. That covers the pin itself and
-    the identity resolution in front of it.
+    temporarily (timeout, refused connection, 5xx), or the direct-DB fallback
+    could not reach the database, the error is the retryable subclass
+    ProviderConfigTemporarilyUnavailable. That covers the pin itself and the
+    identity resolution in front of it.
     """
     if raw_user_id is None:
         return None
@@ -454,6 +479,22 @@ async def get_user_provider_config(raw_user_id: Any) -> Optional[dict]:
             "retry later"
         ) from e
     except Exception as e:  # noqa: BLE001 — classified below, never swallowed
+        from src.db.client import is_db_unreachable
+
+        if is_db_unreachable(e):
+            # The identity resolution's own direct-DB fallback
+            # (user_resolver._resolve_email_identity) could not reach the
+            # database: same gap as above, same verdict (BR8R2 MUSS 1).
+            logger.error(
+                "user_provider_override: provider_config lookup failed, database "
+                "unreachable — refused as retryable (identity_len=%d): %s: %s",
+                len(key), type(e).__name__, e,
+            )
+            raise ProviderConfigTemporarilyUnavailable(
+                "provider_config lookup failed: database unreachable — cannot "
+                "verify whether this user is pinned to a specific backend; "
+                "retry later"
+            ) from e
         logger.error(
             "user_provider_override: provider_config lookup failed "
             "(identity_len=%d): %s", len(key), e,
