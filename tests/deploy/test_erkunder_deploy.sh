@@ -76,13 +76,17 @@ from pathlib import Path
 source = Path('scripts/bridge-deploy.sh').read_text()
 names = ['log', 'info', 'warn', 'error_', 'step', 'dry_rssh',
          'service_needs_build', 'deploy_one_service', 'container_for_svc',
-         'svc_to_varname', 'phase_rollback', 'deploy_server']
+         'svc_to_varname', 'phase_rollback', 'deployed_bridge_id',
+         'deploy_server']
 Path(sys.argv[1]).write_text('\n'.join(
     re.search(r'^' + name + r'\(\) *\{(?:[^\n]*\}|.*?^\})', source, re.M | re.S)[0]
     for name in names
 ))
 PY
 source "$functions"
+# deploy_server asks platform_api_job_gate_needed before Phase 4 (BR8b). The
+# real helper decides; the explicit lists here contain no platform-api.
+source scripts/platform-api-job-gate.sh
 rssh() {
     echo "$*" >> "$commands"
     if [[ "$*" == *'.State.Running'* ]]; then
