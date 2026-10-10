@@ -533,6 +533,7 @@ async def test_internal_routes_cancel_and_conditional_claim(monkeypatch):
 _JOBS_DDL = [
     REPO / "docker" / "migrations" / "031_ai_jobs.sql",
     REPO / "docker" / "migrations" / "044_ai_jobs_dependency_deferral.sql",
+    REPO / "docker" / "migrations" / "063_ai_jobs_finished_at.sql",
     REPO / "docker" / "migrations" / "064_ai_jobs_cancel_requested.sql",
 ]
 
@@ -736,7 +737,16 @@ async def test_sql_cancelled_is_listed_and_expires_like_any_job(pg_store):
     assert [j["job_id"] for j in listed] == ["j_list"]
     assert listed[0]["status"] == "cancelled"
     assert listed[0]["elapsed_seconds"] is not None
-    # TTL counts from created_at, whatever the status: 200 s old, TTL 100 s.
+    # BR11: retention counts from the terminal transition (finished_at, stamped
+    # by cancel_job), not from created_at — submitted 200 s ago, cancelled just
+    # now, TTL 100 s: still readable.
+    assert (await store.get_job("j_list"))["finished_at"] is not None
+    assert await store.cleanup_old(100) == 0
+    async with pg_store.acquire() as conn:
+        await conn.execute(
+            "UPDATE ai_jobs SET finished_at = NOW() - interval '200 seconds' "
+            "WHERE job_id = 'j_list'"
+        )
     assert await store.cleanup_old(100) == 1
     assert await store.get_job("j_list") is None
 

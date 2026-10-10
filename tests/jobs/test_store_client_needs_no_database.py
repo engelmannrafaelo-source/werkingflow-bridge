@@ -88,8 +88,10 @@ class _PlatformApi:
             return PlatformResponse(200, {"job": None})
         if path == "/v1/internal/jobs-maintenance/abandoned":
             return PlatformResponse(200, {"jobs": []})
-        if path == "/v1/internal/jobs-maintenance/cleanup":
-            return PlatformResponse(200, {"removed": 3})
+        if path == "/v1/internal/jobs-maintenance/prune":
+            return PlatformResponse(
+                200, {"removed": 3, "expired": [], "running_over_max_age": 0}
+            )
         raise AssertionError(f"unerwarteter Innen-API-Aufruf: {method} {path}")
 
 
@@ -110,7 +112,7 @@ async def test_every_store_operation_runs_without_a_database(monkeypatch):
         await store_client.defer_job("job_x", 60, "dependency down")
         assert await store_client.claim_stale_job(90, 3) is None
         assert await store_client.find_abandoned(90, 3) == []
-        assert await store_client.cleanup_old(7200) == 3
+        assert (await store_client.prune_jobs(7200, 86400))["removed"] == 3
         jobs = await store_client.list_jobs(app_id="werking-energy")
 
     # Die Datetime-Felder kommen als ISO-Strings über den Draht und MÜSSEN als

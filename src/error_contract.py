@@ -40,6 +40,8 @@ JOB_CODE_EXECUTOR_ERROR = "EXECUTOR_ERROR"
 JOB_CODE_NO_EXECUTOR = "NO_EXECUTOR"
 JOB_CODE_REQUEUE_EXHAUSTED = "REQUEUE_EXHAUSTED"
 JOB_CODE_UPSTREAM_PREFIX = "UPSTREAM_HTTP_"
+# A parked job still waiting at the retention backstop (store.prune_jobs, BR11).
+JOB_CODE_MAX_AGE_EXCEEDED = "JOB_MAX_AGE_EXCEEDED"
 
 # A job reaches UPSTREAM_HTTP_424 / _429 only after the runner has already
 # waited out its own patience for that cause (registry.DEPENDENCY_PATIENCE,
@@ -103,6 +105,10 @@ def job_code_fields(code: Optional[str]) -> Dict[str, Any]:
         # worker again. A worker death from a deploy is bridged by the
         # watchdog's own requeue; it does not repeat on every attempt.
         # (BR9b, BR8R2 SOLL; was True in BR9.)
+        return fields(False)
+    if code == JOB_CODE_MAX_AGE_EXCEEDED:
+        # It already waited a day for capacity or a dependency; a client retry
+        # would start the same wait again. An outage to look at, not a gap.
         return fields(False)
     return fields(UNCLASSIFIED_RETRYABLE)
 

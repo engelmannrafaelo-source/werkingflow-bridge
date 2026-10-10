@@ -706,6 +706,23 @@ class InternalJobCleanup(BaseModel):
     ttl_seconds: int = Field(ge=60)
 
 
+class InternalJobPrune(BaseModel):
+    terminal_ttl_seconds: int = Field(ge=60)
+    # The backstop must sit far above every legitimate wait (registry.py:
+    # dependency patience ~4 h), so anything under 6 h is a caller bug.
+    max_age_seconds: int = Field(ge=6 * 3600)
+
+
+def _job_row_missing(e: Any) -> HTTPException:
+    """404 for a write whose row is gone (store.JobRowMissing, BR11). A distinct
+    reason, so the worker side can tell it from "route unknown" (a platform-api
+    from before BR11 would answer 204 here and never 404)."""
+    return HTTPException(
+        status_code=404,
+        detail={"reason": "job_row_missing", "op": e.op, "job_id": e.job_id},
+    )
+
+
 @router.post("/jobs", status_code=204)
 async def internal_create_job(
     body: InternalJobCreate,
@@ -792,7 +809,10 @@ async def internal_heartbeat(
 ) -> Response:
     from src.jobs import store
 
-    await store.heartbeat(job_id)
+    try:
+        await store.heartbeat(job_id)
+    except store.JobRowMissing as e:
+        raise _job_row_missing(e)
     return Response(status_code=204)
 
 
@@ -816,7 +836,10 @@ async def internal_mark_done(
 ) -> Response:
     from src.jobs import store
 
-    await store.mark_done(job_id, body.result)
+    try:
+        await store.mark_done(job_id, body.result)
+    except store.JobRowMissing as e:
+        raise _job_row_missing(e)
     return Response(status_code=204)
 
 
@@ -828,10 +851,13 @@ async def internal_mark_error(
 ) -> Response:
     from src.jobs import store
 
-    await store.mark_error(
-        job_id, body.message, code=body.code,
-        retryable=body.retryable, retry_after_s=body.retry_after_s,
-    )
+    try:
+        await store.mark_error(
+            job_id, body.message, code=body.code,
+            retryable=body.retryable, retry_after_s=body.retry_after_s,
+        )
+    except store.JobRowMissing as e:
+        raise _job_row_missing(e)
     return Response(status_code=204)
 
 
@@ -899,3 +925,17 @@ async def internal_cleanup_old(
 
     removed = await store.cleanup_old(body.ttl_seconds)
     return {"removed": removed}
+
+
+@router.post("/jobs-maintenance/prune")
+async def internal_prune_jobs(
+    body: InternalJobPrune,
+    _claims: AuthClaims = Depends(require_service_token),
+) -> Dict[str, Any]:
+    """Retention pass of BR11 (store.prune_jobs). A new route on purpose: a
+    worker from BR11 on calls only this one, so against a platform-api from
+    before BR11 it gets 404 and deletes nothing — instead of reaching the old
+    /cleanup body, which deleted running and parked jobs by created_at."""
+    from src.jobs import store
+
+    return await store.prune_jobs(body.terminal_ttl_seconds, body.max_age_seconds)

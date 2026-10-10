@@ -30,10 +30,33 @@ JOB_STATUS_ERROR = "error"
 # while it was 'running' (cancel_requested_at) once that run parks itself
 # (defer_job) or its worker dies (claim_stale_job). Nothing leaves it: every
 # claim path selects 'pending'/'running' only, so a cancelled row is never
-# started again and never billed again. The TTL cleanup removes it like any
-# other row.
+# started again and never billed again. Every transition into it stamps
+# finished_at, and retention removes it like any other terminal row.
 JOB_STATUS_CANCELLED = "cancelled"
 JOB_TERMINAL_STATUSES = (JOB_STATUS_DONE, JOB_STATUS_ERROR, JOB_STATUS_CANCELLED)
+
+# Retention (BR11). Only terminal rows may be deleted by age, and their age
+# counts from the terminal transition (finished_at, migration 063), never from
+# created_at. A row that is still pending or running is never deleted by
+# retention: its bounds are find_abandoned (crash budget) and defer_count (wait
+# budget), plus the loud max-age backstop in prune_jobs.
+_TERMINAL_SQL = "('done', 'error', 'cancelled')"
+_RETENTION_CLOCK = "COALESCE(finished_at, updated_at)"
+
+
+class JobRowMissing(LookupError):
+    """A write that must land on an existing job row found none.
+
+    Before BR11 mark_done/mark_error/heartbeat were plain UPDATEs whose row
+    count nobody looked at: when the row had been deleted underneath a running
+    job (the old created_at retention did exactly that), the result was
+    written into nothing and the call returned None. The work was done and
+    paid for, the result was gone, and nobody was told. Raised instead."""
+
+    def __init__(self, op: str, job_id: str):
+        super().__init__(f"job store {op}: no row for job {job_id} (deleted or never created)")
+        self.op = op
+        self.job_id = job_id
 
 
 def payload_digest(payload: Optional[Dict[str, Any]]) -> str:
@@ -75,6 +98,8 @@ def _row_to_job(row) -> Dict[str, Any]:
         "deferred_until": _col(row, "deferred_until"),
         "defer_count": _col(row, "defer_count", 0),
         "defer_reason": _col(row, "defer_reason"),
+        # Migration 063 — same rollout-window reasoning as above.
+        "finished_at": _col(row, "finished_at"),
     }
 
 
@@ -189,7 +214,8 @@ async def cancel_job(job_id: str) -> Optional[Dict[str, Any]]:
                 return {"status": status, "changed": False, "cancel_requested": False}
             await conn.execute(
                 """
-                UPDATE ai_jobs SET status = 'cancelled', updated_at = NOW()
+                UPDATE ai_jobs SET status = 'cancelled', updated_at = NOW(),
+                                   finished_at = NOW()
                  WHERE job_id = $1
                 """,
                 job_id,
@@ -198,12 +224,15 @@ async def cancel_job(job_id: str) -> Optional[Dict[str, Any]]:
 
 
 async def heartbeat(job_id: str) -> None:
+    """Raises JobRowMissing when the row is gone (see there)."""
     pool = get_pool()
     async with pool.acquire() as conn:
-        await conn.execute(
+        result = await conn.execute(
             "UPDATE ai_jobs SET heartbeat_at = NOW(), updated_at = NOW() WHERE job_id = $1",
             job_id,
         )
+    if _affected(result) == 0:
+        raise JobRowMissing("heartbeat", job_id)
 
 
 async def update_progress(job_id: str, progress: Dict[str, Any]) -> None:
@@ -220,16 +249,20 @@ async def update_progress(job_id: str, progress: Dict[str, Any]) -> None:
 
 
 async def mark_done(job_id: str, result: Optional[Dict[str, Any]]) -> None:
+    """Raises JobRowMissing when the row is gone — the result would be lost."""
     pool = get_pool()
     async with pool.acquire() as conn:
-        await conn.execute(
+        tag = await conn.execute(
             """
-            UPDATE ai_jobs SET status = 'done', result = $2::jsonb, updated_at = NOW()
+            UPDATE ai_jobs SET status = 'done', result = $2::jsonb,
+                               updated_at = NOW(), finished_at = NOW()
              WHERE job_id = $1
             """,
             job_id,
             json.dumps(result, default=str) if result is not None else None,
         )
+    if _affected(tag) == 0:
+        raise JobRowMissing("mark_done", job_id)
 
 
 async def mark_error(
@@ -241,36 +274,112 @@ async def mark_error(
 ) -> None:
     """Terminal error. `retryable`/`retry_after_s` are the verdict of
     src/error_contract.py; when a caller has none (a writer from before BR9),
-    the row keeps {message, code} and GET derives the verdict from the code."""
+    the row keeps {message, code} and GET derives the verdict from the code.
+
+    Raises JobRowMissing when the row is gone."""
     error: Dict[str, Any] = {"message": message, "code": code}
     if retryable is not None:
         error["retryable"] = bool(retryable)
         error["retry_after_s"] = retry_after_s
     pool = get_pool()
     async with pool.acquire() as conn:
-        await conn.execute(
+        tag = await conn.execute(
             """
-            UPDATE ai_jobs SET status = 'error', error = $2::jsonb, updated_at = NOW()
+            UPDATE ai_jobs SET status = 'error', error = $2::jsonb,
+                               updated_at = NOW(), finished_at = NOW()
              WHERE job_id = $1
             """,
             job_id,
             json.dumps(error, default=str),
         )
+    if _affected(tag) == 0:
+        raise JobRowMissing("mark_error", job_id)
 
 
 async def cleanup_old(ttl_seconds: int) -> int:
-    """Delete jobs older than ttl_seconds. Returns rows removed."""
+    """Delete TERMINAL jobs whose terminal state is older than ttl_seconds.
+    Returns rows removed.
+
+    Kept under its old name because workers from before BR11 still call it
+    through POST /v1/internal/jobs-maintenance/cleanup. Its old body deleted by
+    created_at whatever the status (BR10R M-B); a platform-api with this body
+    makes that route safe for old callers too. New callers use prune_jobs."""
     pool = get_pool()
     async with pool.acquire() as conn:
         result = await conn.execute(
-            "DELETE FROM ai_jobs WHERE created_at < NOW() - ($1 || ' seconds')::interval",
+            f"""
+            DELETE FROM ai_jobs
+             WHERE status IN {_TERMINAL_SQL}
+               AND {_RETENTION_CLOCK} < NOW() - ($1 || ' seconds')::interval
+            """,
             str(ttl_seconds),
         )
-    # asyncpg returns e.g. "DELETE 7"
-    try:
-        return int(result.split()[-1])
-    except (ValueError, IndexError):
-        return 0
+    return _affected(result)
+
+
+async def prune_jobs(terminal_ttl_seconds: int, max_age_seconds: int) -> Dict[str, Any]:
+    """One retention pass (BR11). Three parts, each bounded to its own rows:
+
+    1. Delete terminal rows (done/error/cancelled) whose terminal state is
+       older than terminal_ttl_seconds. Nothing else is ever deleted.
+    2. Backstop for parked work: a 'pending' row older than max_age_seconds
+       (counted from submit) is turned into a terminal error
+       JOB_MAX_AGE_EXCEEDED — not deleted, so the poller gets a truthful
+       answer, and from then on it ages out like any terminal row. The UPDATE
+       re-checks status='pending' under the row lock, so a job claimed in the
+       same instant stays with its runner.
+    3. 'running' rows older than max_age_seconds are only counted. A running
+       job belongs to its runner (heartbeat) or to the watchdog (stale) —
+       retention does not take it away from either.
+
+    Returns {"removed": n, "expired": [job_id, ...], "running_over_max_age": n}.
+    """
+    from src.error_contract import JOB_CODE_MAX_AGE_EXCEEDED, job_code_fields
+
+    error = {
+        "message": (
+            f"Job was still waiting {max_age_seconds // 3600} h after submit "
+            f"(capacity or dependency never became available) and was ended by "
+            f"the retention backstop."
+        ),
+        "code": JOB_CODE_MAX_AGE_EXCEEDED,
+        **job_code_fields(JOB_CODE_MAX_AGE_EXCEEDED),
+    }
+    pool = get_pool()
+    async with pool.acquire() as conn:
+        removed = _affected(await conn.execute(
+            f"""
+            DELETE FROM ai_jobs
+             WHERE status IN {_TERMINAL_SQL}
+               AND {_RETENTION_CLOCK} < NOW() - ($1 || ' seconds')::interval
+            """,
+            str(terminal_ttl_seconds),
+        ))
+        expired_rows = await conn.fetch(
+            """
+            UPDATE ai_jobs
+               SET status = 'error', error = $2::jsonb,
+                   updated_at = NOW(), finished_at = NOW()
+             WHERE status = 'pending'
+               AND created_at < NOW() - ($1 || ' seconds')::interval
+            RETURNING job_id
+            """,
+            str(max_age_seconds),
+            json.dumps(error, default=str),
+        )
+        running_over = await conn.fetchval(
+            """
+            SELECT COUNT(*) FROM ai_jobs
+             WHERE status = 'running'
+               AND created_at < NOW() - ($1 || ' seconds')::interval
+            """,
+            str(max_age_seconds),
+        )
+    return {
+        "removed": removed,
+        "expired": [r["job_id"] for r in expired_rows],
+        "running_over_max_age": int(running_over or 0),
+    }
 
 
 # "Stale" is measured from the last sign of life: heartbeat_at while running, or
@@ -325,6 +434,10 @@ async def defer_job(job_id: str, delay_seconds: int, reason: str) -> None:
             UPDATE ai_jobs
                SET status = CASE WHEN cancel_requested_at IS NULL
                                  THEN 'pending' ELSE 'cancelled' END,
+                   -- BR11: the 'cancelled' branch is terminal; its retention
+                   -- clock starts here.
+                   finished_at = CASE WHEN cancel_requested_at IS NULL
+                                      THEN finished_at ELSE NOW() END,
                    deferred_until = NOW() + ($2 || ' seconds')::interval,
                    defer_count = defer_count + 1,
                    defer_reason = $3,
@@ -364,7 +477,7 @@ async def claim_stale_job(stale_seconds: int, max_attempts: int) -> Optional[Dic
         await conn.execute(
             f"""
             UPDATE ai_jobs
-               SET status = 'cancelled', updated_at = NOW()
+               SET status = 'cancelled', updated_at = NOW(), finished_at = NOW()
              WHERE cancel_requested_at IS NOT NULL
                AND (status = 'pending'
                     OR (status = 'running'

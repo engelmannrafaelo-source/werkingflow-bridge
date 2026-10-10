@@ -202,6 +202,8 @@ async def test_store_writes_the_verdict_into_the_error_row():
     from src.jobs import store
 
     conn = AsyncMock()
+    # asyncpg's command tag; since BR11 mark_error reads the row count from it.
+    conn.execute.return_value = "UPDATE 1"
 
     class _Pool:
         def acquire(self):
