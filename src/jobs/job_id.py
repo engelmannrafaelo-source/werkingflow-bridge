@@ -35,10 +35,14 @@ Ids minted before this ADR carry no marker. They cannot be routed — there is
 nothing in them to route on — so they keep exactly the pre-ADR behaviour:
 answered by whichever bridge the poll reaches, with a WARNING per lookup.
 This exists for one bounded window: the rollout, in which jobs submitted
-before the deploy are still being polled after it. It expires by itself,
-because the store's TTL cleanup (`cleanup_old`, dev 45 min / prod ~75 min)
-removes every pre-deploy row within about an hour — after that a legacy id
-can only be a stale client, and the warning says so.
+before the deploy are still being polled after it. It expires by itself, but
+not within the hour it once did: since BR11 retention (`prune_jobs`) deletes a
+row only 2 h after it reached done/error/cancelled, never while it is pending
+or running. A pre-deploy job that is still parked 24 h after submit is ended
+by the retention backstop (error JOB_MAX_AGE_EXCEEDED) and then ages out like
+any terminal row. So the window is "until every pre-deploy job has ended,
+plus 2 h" — typically a few hours, bounded by about 26 h for parked work.
+After that a legacy id can only be a stale client, and the warning says so.
 
 Anything that is NEITHER form is a broken id, not a missing one: it raises
 JobIdMalformed and the route answers 400, never a 404 that reads like
