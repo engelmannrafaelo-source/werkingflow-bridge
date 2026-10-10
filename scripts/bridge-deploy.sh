@@ -70,6 +70,7 @@ HETZNER_SVC_erkunder_platz_2="docker-erkunder-platz-2-1"
 HETZNER_SVC_erkunder_platz_3="docker-erkunder-platz-3-1"
 HETZNER_SVC_erkunder_ausgang="docker-erkunder-ausgang-1"
 source "$(dirname "${BASH_SOURCE[0]}")/erkunder-deploy.sh"
+source "$(dirname "${BASH_SOURCE[0]}")/platform-api-job-gate.sh"
 # platform-api is deployed BEFORE nginx so the upstream resolves when nginx
 # restarts. nginx is last so the new routing is live only after platform-api
 # is healthy.
@@ -2020,6 +2021,22 @@ deploy_server() {
         fi
         return 1
     }
+
+    # === Phase 4 gate: no platform-api gap while jobs depend on it ===
+    # Runs ONCE before the first recreation, not in front of platform-api
+    # itself: on server2 postgres-prod (the platform-api's database) is
+    # recreated first, and a refusal after that would leave one DB gap and
+    # the rollback would add a second one (BR8R M1). Refused = nothing was
+    # recreated, nothing is rolled back, only the code is reset.
+    if platform_api_job_gate_needed "$server_prefix" "${services_to_deploy[@]}"; then
+        platform_api_job_gate "$server_prefix" || {
+            error_ "Deploy refused before any container was recreated — reverting code to ${ROLLBACK_SHA}"
+            if [[ "$DRY_RUN" == "false" ]]; then
+                rssh "$host" "cd ${REMOTE_REPO} && git reset --hard '${ROLLBACK_SHA}'" || return 2
+            fi
+            return 1
+        }
+    fi
 
     # === Phase 4: per-service deploy ===
     for svc in "${services_to_deploy[@]}"; do

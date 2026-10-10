@@ -48,13 +48,16 @@ async def test_email_resolved_via_platform_api():
 
 
 @pytest.mark.asyncio
-async def test_email_lookup_opts_into_one_retry():
-    """Pure read → safe to replay. Guards the opt-in from being dropped."""
+async def test_email_lookup_opts_into_the_restart_bridging_retries():
+    """Pure read → safe to replay. Guards the opt-in from being dropped, and
+    its length: it has to outlast one platform-api restart (BR8)."""
     uid = uuid.uuid4()
     resp = PlatformResponse(status_code=200, json={"id": str(uid)})
     with patch.object(ur, "call_platform", new=AsyncMock(return_value=resp)) as called:
         await resolve_user_id("kunde@example.tld")
-    assert called.await_args.kwargs["retries"] == 1
+    from src.platform_client import RESTART_BRIDGING_BACKOFFS_S
+    assert called.await_args.kwargs["retries"] == len(RESTART_BRIDGING_BACKOFFS_S)
+    assert called.await_args.kwargs["retry_backoff_s"] == RESTART_BRIDGING_BACKOFFS_S
 
 
 @pytest.mark.asyncio

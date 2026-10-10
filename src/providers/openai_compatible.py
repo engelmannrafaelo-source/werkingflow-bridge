@@ -20,6 +20,7 @@ from typing import Optional, AsyncGenerator
 
 import httpx
 
+from src.error_contract import fields
 from src.models import ChatCompletionRequest
 
 logger = logging.getLogger(__name__)
@@ -56,6 +57,11 @@ def _backoff_delay(attempt: int) -> float:
     capped = min(raw, _MAX_BACKOFF_S)
     # Full jitter keeps colliding retries from synchronizing under sustained 5xx.
     return random.uniform(0, capped)
+
+
+# Status a ProviderError carries for a network failure that outlived the
+# retries: there is no upstream HTTP status. Transient (stream_start).
+NETWORK_ERROR_STATUS = 599
 
 
 class ProviderError(RuntimeError):
@@ -177,7 +183,7 @@ async def call_openai_compatible(
     if isinstance(last_error, ProviderError):
         raise last_error
     raise ProviderError(
-        status_code=599,
+        status_code=NETWORK_ERROR_STATUS,
         message=f"Transient network error after retries: {last_error}",
     )
 
@@ -204,6 +210,9 @@ def _incomplete_stream_event(base_url: str, reason: str) -> str:
         "message": f"Upstream stream incomplete — response is truncated: {reason}",
         "type": "incomplete_response",
         "code": "stream_incomplete",
+        # Abgerissener Strom: dieselbe Anfrage kann beim naechsten Mal
+        # vollstaendig ankommen (wie stream_incomplete in main, BR9b).
+        **fields(True),
     }}
     return f"event: error\ndata: {json.dumps(payload)}\n\n"
 
@@ -310,6 +319,6 @@ async def stream_openai_compatible(
     if isinstance(last_error, ProviderError):
         raise last_error
     raise ProviderError(
-        status_code=599,
+        status_code=NETWORK_ERROR_STATUS,
         message=f"Transient network error after retries: {last_error}",
     )

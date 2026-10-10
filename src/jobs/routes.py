@@ -24,6 +24,7 @@ from fastapi.security import HTTPAuthorizationCredentials
 from pydantic import BaseModel
 
 from src.auth import security, verify_api_key
+from src.error_contract import job_error_view
 from src.middleware.bridge_error import (
     job_home_unconfigured_error,
     job_id_malformed_error,
@@ -391,5 +392,31 @@ async def get_job_endpoint(
         "elapsed_seconds": elapsed,
         "progress": job.get("progress"),
         "result": job.get("result") if job["status"] == store.JOB_STATUS_DONE else None,
-        "error": job.get("error") if job["status"] == store.JOB_STATUS_ERROR else None,
+        # Always carries retryable/retry_after_s (src/error_contract.py).
+        "error": (
+            job_error_view(job.get("error"))
+            if job["status"] == store.JOB_STATUS_ERROR else None
+        ),
+        **_deferral_view(job),
+    }
+
+
+def _deferral_view(job: Dict[str, Any]) -> Dict[str, Any]:
+    """Why a 'pending' job is not running (BR9). `deferred_until` in the
+    future = the bridge parked it on purpose (a dependency or no account
+    capacity) and restarts it by itself then; a pending job without it that
+    has been pending for long is one that nobody has picked up. Status stays
+    'pending' so existing pollers keep working."""
+    count = job.get("defer_count") or 0
+    if job["status"] != store.JOB_STATUS_PENDING:
+        # The columns keep the last wait after the job was claimed again;
+        # only the count (how often it waited) is still true then.
+        return {"deferred_until": None, "defer_count": count, "defer_reason": None}
+    until = job.get("deferred_until")
+    if isinstance(until, datetime):
+        until = until.isoformat()
+    return {
+        "deferred_until": until,
+        "defer_count": count,
+        "defer_reason": job.get("defer_reason") if until else None,
     }

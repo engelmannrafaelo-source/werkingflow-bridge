@@ -16,7 +16,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, Request, Depends
 from fastapi.security import HTTPAuthorizationCredentials
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse, JSONResponse, Response
+from fastapi.responses import JSONResponse, Response
 from fastapi.exceptions import RequestValidationError
 from pydantic import ValidationError
 from dotenv import load_dotenv
@@ -104,6 +104,7 @@ from src.jobs.executors import (
     doc_agent_executor,
     erkunder_executor,
 )
+from src.stream_start import event_stream_response  # noqa: E402
 from src.parameter_validator import ParameterValidator, CompatibilityReporter
 from src.model_registry import (
     get_models_for_api,
@@ -1393,6 +1394,10 @@ async def generate_streaming_response(
     cli_session_for_disconnect = None  # Track CLI session for disconnect detection
     streaming_started = asyncio.Event()  # Signal when streaming starts (prevents race condition)
     stream_start_time = time.time()
+    # Bound before the try: an exception before the monitor starts (privacy,
+    # session handling) would otherwise end in UnboundLocalError in `finally`,
+    # after the error event (BR9b).
+    monitor_task = None
 
     try:
         # VISION ROUTING follows the Bedrock pin (Rafael, 2026-07-10): a
@@ -1554,7 +1559,8 @@ async def generate_streaming_response(
 
             except Exception as e:
                 logger.error(f"❌ Vision streaming failed: {e}", exc_info=True)
-                yield f"data: {json.dumps({'error': {'message': f'Vision analysis failed: {str(e)}', 'type': 'vision_error'}})}\n\n"
+                from src.error_contract import UNCLASSIFIED_RETRYABLE, fields as _verdict
+                yield f"data: {json.dumps({'error': {'message': f'Vision analysis failed: {str(e)}', 'type': 'vision_error', **_verdict(UNCLASSIFIED_RETRYABLE)}})}\n\n"
                 return
 
         # Process messages with session management
@@ -2146,15 +2152,22 @@ async def generate_streaming_response(
         yield "data: [DONE]\n\n"
 
     except WorkerUnavailableError:
-        # Re-raise to trigger HTTP 503 and Nginx failover
+        # Before the first chunk event_stream_response lets this leave the
+        # route: worker_unavailable_handler answers 429 and nginx fails over.
+        # After it, event_stream_response ends the stream as event: error
+        # (retryable) — a started 200 cannot fail over (BR9c).
         raise
 
     except Exception as e:
         logger.error(f"Streaming error: {e}")
+        # Nicht eingeordnet: wird nicht als wiederholbar versprochen
+        # (src/error_contract.py Regel 3, BR9b).
+        from src.error_contract import UNCLASSIFIED_RETRYABLE, fields as _verdict
         error_chunk = {
             "error": {
                 "message": str(e),
-                "type": "streaming_error"
+                "type": "streaming_error",
+                **_verdict(UNCLASSIFIED_RETRYABLE),
             }
         }
         yield f"data: {json.dumps(error_chunk)}\n\n"
@@ -2673,7 +2686,9 @@ async def chat_completions(
         # BEFORE backend resolution; a pin failure is 503, never a fallback.
         from src.routing.user_provider_override import (
             enforce_user_provider_override, UserProviderOverrideError,
+            ProviderConfigTemporarilyUnavailable, PROVIDER_CONFIG_DEPENDENCY,
         )
+        from src.platform_client import DEPENDENCY_UNAVAILABLE_HEADER
         user_pinned_provider = None
         # The REAL operator pin from users.provider_config, kept separate from
         # user_pinned_provider on purpose: the app-level policy below also
@@ -2700,7 +2715,27 @@ async def chat_completions(
         try:
             user_pinned_provider = await enforce_user_provider_override(request, request_body)
             operator_pinned_provider = user_pinned_provider
+        except ProviderConfigTemporarilyUnavailable as e:
+            # Same refusal, but retryable: the pin is unknown because platform-api
+            # did not answer (a restart, BR7 10.10.2026), not because it forbids
+            # anything. The header lets a chat job park instead of dying.
+            raise HTTPException(
+                status_code=503,
+                detail={
+                    "error": {
+                        "message": _mark_retryable(str(e)),
+                        "type": "configuration_error",
+                        "code": "user_provider_override_unavailable",
+                        "retryable": True,
+                        "hint": "The user's provider pin could not be looked up right now (platform-api temporarily unavailable). Nothing was guessed; retry later.",
+                    }
+                },
+                headers={DEPENDENCY_UNAVAILABLE_HEADER: PROVIDER_CONFIG_DEPENDENCY},
+            )
         except UserProviderOverrideError as e:
+            # Final, not transient: an unknown provider, a 401/403/404 from the
+            # home bridge, a missing peer. 503 stays (existing callers), the
+            # verdict says it (BR8R §5c, BR9).
             raise HTTPException(
                 status_code=503,
                 detail={
@@ -2708,6 +2743,7 @@ async def chat_completions(
                         "message": str(e),
                         "type": "configuration_error",
                         "code": "user_provider_override_unavailable",
+                        "retryable": False,
                         "hint": "The user is pinned to a specific provider that is currently not servable. No fallback is attempted by design.",
                     }
                 }
@@ -3027,9 +3063,8 @@ async def chat_completions(
                         },
                     )
 
-                return StreamingResponse(
+                return await event_stream_response(
                     _tracked_bedrock_stream(),
-                    media_type="text/event-stream",
                     headers={
                         "Cache-Control": "no-cache",
                         "Connection": "keep-alive",
@@ -3045,7 +3080,10 @@ async def chat_completions(
                         input_tokens=0, output_tokens=0, status="error",
                         duration_ms=int((time.time() - start_time) * 1000),
                         error_code=str(bedrock_err.status_code),
-                        error_message=str(bedrock_err.detail),
+                        error_message=str(
+                            bedrock_err.detail.get("message", bedrock_err.detail)
+                            if isinstance(bedrock_err.detail, dict) else bedrock_err.detail
+                        ),
                         provider_meta={
                             "bedrock_model_id": backend_config.bedrock_model_id,
                             "region": backend_config.region,
@@ -3223,9 +3261,8 @@ async def chat_completions(
                     }) + "\n\n"
                     yield "data: [DONE]\n\n"
 
-                return StreamingResponse(
+                return await event_stream_response(
                     _direct_as_sse(),
-                    media_type="text/event-stream",
                     headers={
                         "Cache-Control": "no-cache",
                         "Connection": "keep-alive",
@@ -3244,14 +3281,13 @@ async def chat_completions(
             logger.info(f"🔀 Routing to OpenAI-compatible provider (tier={tier})")
 
             if request_body.stream:
-                return StreamingResponse(
+                return await event_stream_response(
                     stream_openai_compatible(
                         request_body,
                         backend_config.provider_base_url,
                         backend_config.provider_api_key,
                         model_override=backend_config.provider_model,
                     ),
-                    media_type="text/event-stream",
                     headers={
                         "Cache-Control": "no-cache",
                         "Connection": "keep-alive",
@@ -3388,13 +3424,12 @@ async def chat_completions(
             worker_instance = os.getenv("INSTANCE_NAME", "unknown")
 
             # Return streaming response with worker info header
-            return StreamingResponse(
+            return await event_stream_response(
                 generate_streaming_response(
                     request_body, request_id, claude_headers,
                     fastapi_request=request,
                     backend_config=backend_config
                 ),
-                media_type="text/event-stream",
                 headers={
                     "Cache-Control": "no-cache",
                     "Connection": "keep-alive",
@@ -5704,6 +5739,18 @@ def _mark_retryable(message: str) -> str:
     return f'{message} (bridge: HTTP 503, "retryable": true)'
 
 
+def _transient_error(message: str, retry_after_s: Optional[int] = None) -> Dict[str, Any]:
+    """ResearchResponse/DocAgentResponse fields for a transient error: the
+    structured verdict (what callers read, src/error_contract.py) and the text
+    marker (what older text classifiers read), set together so they cannot
+    disagree."""
+    return {
+        "error": _mark_retryable(message),
+        "retryable": True,
+        "retry_after_s": retry_after_s,
+    }
+
+
 async def _execute_research_cloud_impl(
     request: Request,
     request_body: ResearchRequest,
@@ -5857,13 +5904,15 @@ async def _execute_research_cloud_impl(
             # A capacity/availability-shaped upstream failure (429/5xx) —
             # mark it recognizable-retryable so the caller defers instead of
             # treating it as a permanent break (see _mark_retryable).
-            error_message = _mark_retryable(error_message)
+            error_fields = _transient_error(error_message)
+        else:
+            error_fields = {"error": error_message}
         return ResearchResponse(
             status="error",
             query=request_body.query,
             model=request_body.model,
             execution_time_seconds=round(execution_time, 2),
-            error=error_message,
+            **error_fields,
         )
 
     # Real-cost ledger booking — research-cloud always books real cost
@@ -6301,6 +6350,7 @@ async def research(
     # a Bedrock-pinned user's research runs through the SDK-Bedrock env path.
     from src.routing.user_provider_override import (
         enforce_user_provider_override, UserProviderOverrideError,
+        ProviderConfigTemporarilyUnavailable, PROVIDER_CONFIG_DEPENDENCY,
         assert_bedrock_is_pinned, BedrockPinRequiredError,
         BedrockNonProdRefusedError,
         assert_bedrock_attribution_complete, BedrockAttributionIncompleteError,
@@ -6315,6 +6365,23 @@ async def research(
     try:
         _research_pinned = await enforce_user_provider_override(request, request_body)
         _research_operator_pinned = _research_pinned
+    except ProviderConfigTemporarilyUnavailable as e:
+        # Retryable, unlike the branch below: platform-api did not answer, so
+        # the pin is unknown, not forbidding. Marked for direct callers
+        # (_mark_retryable) and for the job executor (header → 424 → parked).
+        # Before 10.10.2026 this was a terminal EXECUTOR_ERROR (BR7).
+        from src.platform_client import DEPENDENCY_UNAVAILABLE_HEADER
+        return JSONResponse(
+            content=ResearchResponse(
+                status="error",
+                query=request_body.query,
+                model=request_body.model,
+                **_transient_error(
+                    f"user provider pin not verifiable right now (no fallback by design): {e}"
+                ),
+            ).model_dump(),
+            headers={DEPENDENCY_UNAVAILABLE_HEADER: PROVIDER_CONFIG_DEPENDENCY},
+        )
     except UserProviderOverrideError as e:
         return ResearchResponse(
             status="error",
@@ -6397,7 +6464,7 @@ async def research(
                 status="error",
                 query=request_body.query,
                 model=request_body.model,
-                error=_mark_retryable(str(_rc_err)),
+                **_transient_error(str(_rc_err)),
             )
         except Exception as _rc_err:
             # Routing DECISION itself failed (e.g. DB blip probing capacity) —
@@ -6466,7 +6533,7 @@ async def research(
                 status="error",
                 query=request_body.query,
                 model=request_body.model,
-                error=_mark_retryable(str(_rc_err)),
+                **_transient_error(str(_rc_err)),
             )
         except Exception as _rc_err:
             # Transient failure (e.g. DB blip during pin lookup): the pool is
@@ -7054,8 +7121,26 @@ async def doc_agent(
     # Per-user provider pin: doc-agent has no Bedrock env path yet — a pinned
     # user gets an EXPLICIT error instead of silently running on Anthropic
     # (503-statt-Fallback, same invariant as chat/research).
-    from src.routing.user_provider_override import get_user_provider_config
-    _pin_config = await get_user_provider_config(request.headers.get("X-User-ID"))
+    from src.routing.user_provider_override import (
+        get_user_provider_config, ProviderConfigTemporarilyUnavailable,
+        PROVIDER_CONFIG_DEPENDENCY,
+    )
+    try:
+        _pin_config = await get_user_provider_config(request.headers.get("X-User-ID"))
+    except ProviderConfigTemporarilyUnavailable as e:
+        # Retryable: same contract as research (header → job parked).
+        from src.platform_client import DEPENDENCY_UNAVAILABLE_HEADER
+        return JSONResponse(
+            content=DocAgentResponse(
+                status="error",
+                question=request_body.question,
+                model=request_body.model,
+                **_transient_error(
+                    f"user provider pin not verifiable right now (no fallback by design): {e}"
+                ),
+            ).model_dump(),
+            headers={DEPENDENCY_UNAVAILABLE_HEADER: PROVIDER_CONFIG_DEPENDENCY},
+        )
     if _pin_config:
         return DocAgentResponse(
             status="error",
@@ -10014,26 +10099,44 @@ async def http_exception_handler(request: Request, exc: StarletteHTTPException):
     detail = exc.detail
     # If detail is already a dict with our envelope shape, pass through.
     if isinstance(detail, dict) and "source" in detail:
-        return JSONResponse(status_code=exc.status_code, content={"error": detail})
+        response = JSONResponse(status_code=exc.status_code, content={"error": detail})
     # If detail is a dict with arbitrary fields, preserve them as extra.
-    if isinstance(detail, dict):
+    elif isinstance(detail, dict):
         message = detail.get("message") or detail.get("error") or str(detail)
         extra = {k: v for k, v in detail.items() if k not in ("message", "error")}
-        return bridge_error(
+        # The raiser's own verdict wins over the status (src/error_contract.py
+        # rule 1), flat or nested as {"error": {...}}. Before BR9 a permanent
+        # pin error raised as 503 went out as retryable:true.
+        from src.error_contract import envelope_fields
+        verdict = envelope_fields(detail)
+        nested = detail.get("error") if isinstance(detail.get("error"), dict) else {}
+        response = bridge_error(
             source=SOURCE_BRIDGE_INTERNAL,
             error_type=TYPE_INTERNAL,
             message=str(message),
             status_code=exc.status_code,
-            retry_after_s=detail.get("retry_after_seconds") or detail.get("retry_after_s"),
+            retry_after_s=(
+                detail.get("retry_after_seconds") or detail.get("retry_after_s")
+                or nested.get("retry_after_s")
+            ),
             extra=extra,
+            retryable_override=verdict.get("retryable"),
         )
     # Plain string detail
-    return bridge_error(
-        source=SOURCE_BRIDGE_INTERNAL,
-        error_type=TYPE_INTERNAL,
-        message=str(detail),
-        status_code=exc.status_code,
-    )
+    else:
+        response = bridge_error(
+            source=SOURCE_BRIDGE_INTERNAL,
+            error_type=TYPE_INTERNAL,
+            message=str(detail),
+            status_code=exc.status_code,
+        )
+    # Headers the raiser set (e.g. X-Bridge-Dependency-Unavailable, which turns
+    # a chat job's 503 into a parked job). Starlette's own handler keeps them; this
+    # one used to drop them. Headers the envelope already set win.
+    for name, value in (getattr(exc, "headers", None) or {}).items():
+        if name not in response.headers:
+            response.headers[name] = value
+    return response
 
 
 @app.exception_handler(Exception)
