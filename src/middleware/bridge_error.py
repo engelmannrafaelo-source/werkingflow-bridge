@@ -792,6 +792,7 @@ def raise_classified(exc: Exception) -> None:
 def job_cancel_error(
     job_id: str, reason: str, status_code: int, message: str,
     job_status: Optional[str] = None,
+    cancel_requested: Optional[bool] = None,
 ) -> JSONResponse:
     """A DELETE /v1/jobs/{id} that did not cancel (BR10). Never retryable: the
     job's state will not turn back into 'pending', and an unknown id stays
@@ -804,10 +805,15 @@ def job_cancel_error(
 
     For ``job_not_found`` the body depends on nothing but the id the caller
     sent — a job owned by someone else gets this exact answer, so the response
-    reveals nothing about whether the id exists."""
+    reveals nothing about whether the id exists.
+
+    ``cancel_requested`` (only on ``job_already_running``, BR10b): whether the
+    bridge recorded the wish, so the run is not resumed should it pause."""
     extra: Dict[str, Any] = {"code": reason, "job_id": job_id[:120]}
     if job_status is not None:
         extra["status"] = job_status
+    if cancel_requested is not None:
+        extra["cancel_requested"] = cancel_requested
     return bridge_error(
         source=SOURCE_BRIDGE_INTERNAL,
         error_type=TYPE_JOB_STATE,

@@ -533,6 +533,7 @@ async def test_internal_routes_cancel_and_conditional_claim(monkeypatch):
 _JOBS_DDL = [
     REPO / "docker" / "migrations" / "031_ai_jobs.sql",
     REPO / "docker" / "migrations" / "044_ai_jobs_dependency_deferral.sql",
+    REPO / "docker" / "migrations" / "063_ai_jobs_cancel_requested.sql",
 ]
 
 
@@ -610,14 +611,38 @@ async def test_sql_cancel_by_status(pg_store):
     }
     for jid, (st, d) in cases.items():
         await _insert(pg_store, jid, st, deferred_in_s=d)
-    assert await store.cancel_job("j_pend") == {"status": "cancelled", "changed": True}
-    assert await store.cancel_job("j_def") == {"status": "cancelled", "changed": True}
-    assert await store.cancel_job("j_run") == {"status": "running", "changed": False}
-    assert await store.cancel_job("j_done") == {"status": "done", "changed": False}
-    assert await store.cancel_job("j_err") == {"status": "error", "changed": False}
+    assert await store.cancel_job("j_pend") == {
+        "status": "cancelled",
+        "changed": True,
+        "cancel_requested": False,
+    }
+    assert await store.cancel_job("j_def") == {
+        "status": "cancelled",
+        "changed": True,
+        "cancel_requested": False,
+    }
+    assert await store.cancel_job("j_run") == {
+        "status": "running",
+        "changed": False,
+        "cancel_requested": True,
+    }
+    assert await store.cancel_job("j_done") == {
+        "status": "done",
+        "changed": False,
+        "cancel_requested": False,
+    }
+    assert await store.cancel_job("j_err") == {
+        "status": "error",
+        "changed": False,
+        "cancel_requested": False,
+    }
     assert await store.cancel_job("j_none") is None
     # Idempotent: the second cancel reports the state, it does not move it.
-    assert await store.cancel_job("j_pend") == {"status": "cancelled", "changed": False}
+    assert await store.cancel_job("j_pend") == {
+        "status": "cancelled",
+        "changed": False,
+        "cancel_requested": False,
+    }
     assert [await _status(pg_store, j) for j in cases] == [
         "cancelled",
         "cancelled",
@@ -677,6 +702,7 @@ async def test_sql_race_worker_claim_commits_first(pg_store):
         assert await asyncio.wait_for(cancel, 5) == {
             "status": "running",
             "changed": False,
+            "cancel_requested": True,
         }
     assert await _status(pg_store, "j_race") == "running"
 

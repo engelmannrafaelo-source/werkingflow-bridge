@@ -274,6 +274,7 @@ async def test_run_claim_pass_starts_every_claimed_job():
 _JOBS_DDL = [
     REPO / "docker/migrations/031_ai_jobs.sql",
     REPO / "docker/migrations/044_ai_jobs_dependency_deferral.sql",
+    REPO / "docker/migrations/063_ai_jobs_cancel_requested.sql",
 ]
 
 

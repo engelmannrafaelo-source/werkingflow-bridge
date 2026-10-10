@@ -462,7 +462,17 @@ async def cancel_job_endpoint(
       200 {job_id, status:'cancelled'}  pending/deferred → cancelled, or it
                                         already was cancelled (idempotent)
       409 job_already_running           a worker has it (also when it won the
-                                        race against this call by a hair)
+                                        race against this call by a hair).
+                                        The run is not stopped, but the wish
+                                        is recorded (error.cancel_requested
+                                        = true, BR10b): if the run parks
+                                        itself (429 / dependency wait) or
+                                        its worker dies, the job ends
+                                        'cancelled' and is never started
+                                        again. A run that completes ends
+                                        done/error and is billed — a later
+                                        GET shows which. One DELETE is
+                                        enough; repeating it is harmless.
       409 job_terminal                  done/error; error.status names which
       404 job_not_found                 unknown, expired, or someone else's
       400/421/503                       the same id guard as GET (ADR-0012)
@@ -501,10 +511,20 @@ async def cancel_job_endpoint(
             )
         return {"job_id": job_id, "status": store.JOB_STATUS_CANCELLED}
     if status == store.JOB_STATUS_RUNNING:
+        # False only behind a platform-api from before BR10b, which records
+        # no wish — the body then says so instead of promising it.
+        requested = bool(outcome.get("cancel_requested"))
+        if requested:
+            logger.info(
+                f"🛑 Async job {job_id} (kind={job.get('kind')}) running — "
+                f"cancel wish recorded, it will not be resumed"
+            )
         return job_cancel_error(
             job_id, REASON_JOB_ALREADY_RUNNING, 409,
-            f"Async job {job_id} is already running and cannot be cancelled",
+            f"Async job {job_id} is already running and cannot be cancelled"
+            + ("; it will not be resumed if it pauses" if requested else ""),
             job_status=status,
+            cancel_requested=requested,
         )
     if status in store.JOB_TERMINAL_STATUSES:
         return job_cancel_error(

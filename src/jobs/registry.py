@@ -31,6 +31,7 @@ from typing import Any, Awaitable, Callable, Dict, List, Optional
 
 from src.error_contract import job_code_fields, job_error_fields
 from src.jobs import store_client
+from src.jobs.store import JOB_STATUS_CANCELLED
 
 logger = logging.getLogger(__name__)
 
@@ -143,6 +144,16 @@ async def _defer_job(
         )
         return False
     await store_client.defer_job(job_id, delay_s, reason)
+    # BR10b: its owner asked to cancel it while it ran — defer_job closed it as
+    # 'cancelled' instead of parking it. Still "stop" for the caller; the log
+    # must not claim a wait that will never be resumed.
+    after = await store_client.get_job(job_id)
+    if (after or {}).get("status") == JOB_STATUS_CANCELLED:
+        logger.warning(
+            f"🛑 Async job {job_id} (kind={kind}) cancelled instead of deferred "
+            f"— its owner asked to cancel it while it ran ({what})"
+        )
+        return True
     # ONE line per defer that names who refused (worker + account + reason)
     # — "why did this 3 s job take 90 s" must be answerable from the log alone.
     who = rejected_by or f"worker={os.getenv('INSTANCE_NAME', 'unknown')}"

@@ -776,7 +776,8 @@ async def internal_cancel_job(
     _claims: AuthClaims = Depends(require_service_token),
 ) -> Dict[str, Any]:
     """Withdraw a not-yet-started job (BR10, store.cancel_job). Always 200:
-    ``{"job": null}`` for an unknown id, else ``{"job": {"status", "changed"}}``.
+    ``{"job": null}`` for an unknown id, else
+    ``{"job": {"status", "changed", "cancel_requested"}}``.
     No 404 here on purpose — the worker must be able to tell "no such job" from
     "this platform-api predates the cancel route" (which FastAPI answers 404/405)."""
     from src.jobs import store

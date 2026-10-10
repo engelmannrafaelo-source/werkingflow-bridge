@@ -174,7 +174,8 @@ async def cancel_job(job_id: str) -> Optional[Dict[str, Any]]:
     The route answers 200 for every known outcome, including "not found"
     (``{"job": null}``), so that a 404/405 can only mean "this platform-api has
     no cancel route" (deployed before BR10) — loud, never read as "no such
-    job"."""
+    job". ``cancel_requested`` (BR10b) is absent from a platform-api that
+    predates it; the route reads absent as "no wish recorded"."""
     try:
         resp = await call_platform(
             "POST", f"/v1/internal/jobs/{job_id}/cancel", timeout_s=_WRITE_TIMEOUT_S
