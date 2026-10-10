@@ -1032,12 +1032,20 @@ def is_gemini_vision_request(request: Request) -> bool:
     not on the ``X-Vision-Provider`` header: the body field is what makes the
     worker take the Gemini path (main.py fails loud with
     ``gemini_vision_tier_overridden`` if a pin removes it), so a header-only
-    call stays on the Claude path and keeps every Claude gate.
+    call stays on the Claude path and keeps every Claude gate. nginx keys on
+    the header, the worker on the body — on purpose; do not "align" them: a
+    header-only call that lands on a locked worker gets a loud 429.
+
+    Only meaningful for /v1/chat/completions, the one endpoint whose body field
+    actually selects the Gemini path. Other endpoints must not consult it.
     """
     from src.routing.app_provider_policy import GEMINI_VISION_TEST_TIER
 
     body = getattr(request.state, "cached_body_dict", None)
-    return isinstance(body, dict) and body.get("provider_tier") == GEMINI_VISION_TEST_TIER
+    return (
+        isinstance(body, dict)
+        and body.get("provider_tier") == GEMINI_VISION_TEST_TIER
+    )
 
 
 async def enforce_pool_admission(request: Request) -> None:
@@ -1105,14 +1113,14 @@ async def enforce_pool_admission(request: Request) -> None:
 async def adaptive_limit_dependency(request: Request) -> None:
     """
     FastAPI dependency for endpoints that ALWAYS consume the subscription pool
-    (chat-completions and friends): cache the body, then admit against the
-    adaptive budget. Endpoints with a non-pool execution path must instead use
+    (e.g. /v1/doc-agent): cache the body, then admit against the adaptive
+    budget. Endpoints with a non-pool execution path must instead use
     cache_request_body_dependency() + an explicit enforce_pool_admission() on
-    their pool-bound branch — see /v1/research.
+    their pool-bound branch — see /v1/research and /v1/chat/completions (the
+    Gemini image lane). Never add a body-keyed exemption HERE: this dependency
+    does not know which endpoint it serves, and a model that ignores unknown
+    fields (DocAgentRequest) would inherit the exemption without ever taking
+    the non-pool path (BR1 review, 10.10.2026).
     """
     await cache_request_body_dependency(request)
-    if is_gemini_vision_request(request):
-        # Gemini image lane: no Claude account behind it, nothing to admit
-        # against the subscription pool.
-        return
     await enforce_pool_admission(request)

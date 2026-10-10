@@ -144,6 +144,8 @@ class TestRecordWorkerCrashNotNameError:
         with (
             patch("src.main.validate_claude_code_auth", return_value=(True, {"method": "test"})),
             patch("src.main.verify_api_key", new_callable=AsyncMock),
+            # chat admits itself (no longer via adaptive_limit_dependency)
+            patch("src.main.enforce_pool_admission", new_callable=AsyncMock),
             patch("src.main.rate_limit_tracker", mock_rl),
             patch.object(main_module.claude_cli, "run_completion", side_effect=_empty_generator),
             patch.object(main_module.claude_cli, "parse_claude_message", return_value=None),
@@ -183,6 +185,8 @@ class TestRecordWorkerCrashNotNameError:
         with (
             patch("src.main.validate_claude_code_auth", return_value=(True, {"method": "test"})),
             patch("src.main.verify_api_key", new_callable=AsyncMock),
+            # chat admits itself (no longer via adaptive_limit_dependency)
+            patch("src.main.enforce_pool_admission", new_callable=AsyncMock),
             patch("src.main.rate_limit_tracker", mock_rl),
             patch.object(main_module.claude_cli, "run_completion", side_effect=_one_chunk_generator),
             patch.object(main_module.claude_cli, "parse_claude_message", return_value="Hello!"),

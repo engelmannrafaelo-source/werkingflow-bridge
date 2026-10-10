@@ -2305,12 +2305,22 @@ async def chat_completions(
     request_body: ChatCompletionRequest,
     request: Request,
     credentials: Optional[HTTPAuthorizationCredentials] = Depends(security),
-    _adaptive=Depends(adaptive_limit_dependency)
+    # Body only — the pool admission follows below, except for the Gemini
+    # image lane (no Claude account behind it). The exemption lives HERE and
+    # not in adaptive_limit_dependency, which other Claude endpoints share.
+    _adaptive=Depends(cache_request_body_dependency)
 ):
     """OpenAI-compatible chat completions endpoint."""
     import time
     from fastapi.responses import JSONResponse
+    from src.middleware.adaptive_limiter import is_gemini_vision_request
     start_time = time.time()
+
+    # Gemini-Bildweg (provider_tier="gemini-vision"): keine Pool-Zulassung
+    # gegen das Claude-Abo; jeder andere Aufruf wird wie bisher zugelassen.
+    _gemini_vision_lane = is_gemini_vision_request(request)
+    if not _gemini_vision_lane:
+        await enforce_pool_admission(request)
 
     # Force tools-policy: tools are research-only (X-Claude-Allowed-Tools header).
     # Drop accidental enable_tools=true from any client unless they signal research.
@@ -2485,18 +2495,20 @@ async def chat_completions(
         # nichts an Anthropic ginge (BR1, 09.10.2026). Faellt der Tier spaeter
         # einem Pin zum Opfer, scheitert der Aufruf laut
         # (gemini_vision_tier_overridden) — er rutscht nie still auf Claude.
-        from src.middleware.adaptive_limiter import is_gemini_vision_request
-        _gemini_vision_lane = is_gemini_vision_request(request)
         if _gemini_vision_lane:
             logger.info(
                 f"🖼️ {worker_id}: Gemini-Bildweg — Claude-Kontosperren "
                 f"(Org/Ratelimit) dieses Workers gelten nicht"
             )
-        _org_block = None if _gemini_vision_lane else _org_disabled_precheck(worker_id)
+        _org_block = (
+            None if _gemini_vision_lane else _org_disabled_precheck(worker_id)
+        )
         if _org_block is not None:
             return _org_block
         from src.claude_cli import rate_limit_tracker
-        if not _gemini_vision_lane and rate_limit_tracker.should_reject_new_request(worker_id):
+        if not _gemini_vision_lane and rate_limit_tracker.should_reject_new_request(
+            worker_id
+        ):
             retry_after = rate_limit_tracker.get_retry_after(worker_id) or 0
             limit_type = "HARD" if rate_limit_tracker.is_hard_limited(worker_id) else "soft"
 
