@@ -20,6 +20,7 @@ from typing import Optional, AsyncGenerator
 
 import httpx
 
+from src.error_contract import fields
 from src.models import ChatCompletionRequest
 
 logger = logging.getLogger(__name__)
@@ -204,6 +205,9 @@ def _incomplete_stream_event(base_url: str, reason: str) -> str:
         "message": f"Upstream stream incomplete — response is truncated: {reason}",
         "type": "incomplete_response",
         "code": "stream_incomplete",
+        # Abgerissener Strom: dieselbe Anfrage kann beim naechsten Mal
+        # vollstaendig ankommen (wie stream_incomplete in main, BR9b).
+        **fields(True),
     }}
     return f"event: error\ndata: {json.dumps(payload)}\n\n"
 

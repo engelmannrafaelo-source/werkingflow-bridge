@@ -1393,6 +1393,10 @@ async def generate_streaming_response(
     cli_session_for_disconnect = None  # Track CLI session for disconnect detection
     streaming_started = asyncio.Event()  # Signal when streaming starts (prevents race condition)
     stream_start_time = time.time()
+    # Bound before the try: an exception before the monitor starts (privacy,
+    # session handling) would otherwise end in UnboundLocalError in `finally`,
+    # after the error event (BR9b).
+    monitor_task = None
 
     try:
         # VISION ROUTING follows the Bedrock pin (Rafael, 2026-07-10): a
@@ -1554,7 +1558,8 @@ async def generate_streaming_response(
 
             except Exception as e:
                 logger.error(f"❌ Vision streaming failed: {e}", exc_info=True)
-                yield f"data: {json.dumps({'error': {'message': f'Vision analysis failed: {str(e)}', 'type': 'vision_error'}})}\n\n"
+                from src.error_contract import UNCLASSIFIED_RETRYABLE, fields as _verdict
+                yield f"data: {json.dumps({'error': {'message': f'Vision analysis failed: {str(e)}', 'type': 'vision_error', **_verdict(UNCLASSIFIED_RETRYABLE)}})}\n\n"
                 return
 
         # Process messages with session management
@@ -2151,10 +2156,14 @@ async def generate_streaming_response(
 
     except Exception as e:
         logger.error(f"Streaming error: {e}")
+        # Nicht eingeordnet: wird nicht als wiederholbar versprochen
+        # (src/error_contract.py Regel 3, BR9b).
+        from src.error_contract import UNCLASSIFIED_RETRYABLE, fields as _verdict
         error_chunk = {
             "error": {
                 "message": str(e),
-                "type": "streaming_error"
+                "type": "streaming_error",
+                **_verdict(UNCLASSIFIED_RETRYABLE),
             }
         }
         yield f"data: {json.dumps(error_chunk)}\n\n"

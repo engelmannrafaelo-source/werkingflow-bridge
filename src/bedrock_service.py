@@ -21,6 +21,7 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 from config.logging_config import get_logger
+from src.error_contract import UNCLASSIFIED_RETRYABLE, fields, is_retryable_status
 from src.model_request import adapt_model_request
 from src.models import (
     ChatCompletionRequest, ChatCompletionResponse, Choice, Message, Usage,
@@ -66,6 +67,52 @@ _BEDROCK_THROTTLE_ERROR_CODES = frozenset({
 })
 
 
+# Bedrock-Fehler mitten im Strom kommen als eigenes Ereignis (statt chunk) oder
+# als chunk vom Typ "error". Wiederholbar sind Ueberlastung und Aussetzer auf
+# AWS-/Modellseite; alles andere (validationException, invalid_request_error,
+# Unbekanntes) nicht (BR9b).
+_BEDROCK_TRANSIENT_STREAM_EVENTS = frozenset({
+    "throttlingException",
+    "modelStreamErrorException",
+    "modelTimeoutException",
+    "internalServerException",
+    "serviceUnavailableException",
+})
+_BEDROCK_TRANSIENT_ERROR_TYPES = frozenset({
+    "overloaded_error",
+    "rate_limit_error",
+    "api_error",
+})
+
+
+def _client_error_status(code: str) -> int:
+    """HTTP-Status fuer einen Bedrock-ClientError — dieselbe Zuordnung fuer den
+    synchronen Weg (als HTTPException) und fuer das Urteil im Strom."""
+    if code in _BEDROCK_CONFIG_ERROR_CODES:
+        return 424
+    if code == "ValidationException":
+        return 400
+    if code in _BEDROCK_THROTTLE_ERROR_CODES:
+        return 429
+    return 500
+
+
+def _stream_error_event(exc: BaseException) -> str:
+    """``event: error`` eines Bedrock-Stroms, mit Urteil (src/error_contract.py).
+
+    Ein ClientError bekommt das Urteil des Status, den der synchrone Weg fuer
+    denselben Fehler sendet; ein BedrockStreamAborted sein eigenes; alles
+    andere ist nicht eingeordnet und wird nicht als wiederholbar versprochen."""
+    if isinstance(exc, BedrockStreamAborted):
+        verdict = fields(exc.retryable)
+    elif isinstance(exc, ClientError):
+        code = (exc.response.get("Error") or {}).get("Code", "")
+        verdict = fields(is_retryable_status(_client_error_status(code)))
+    else:
+        verdict = fields(UNCLASSIFIED_RETRYABLE)
+    return f"event: error\ndata: {json.dumps({'error': str(exc), **verdict})}\n\n"
+
+
 def _effective_max_tokens(request) -> int:
     """Aufrufer-Wert durchreichen; die Vorgabe 4096 gilt nur ohne Angabe und
     wird dann laut geloggt (nie still)."""
@@ -76,7 +123,15 @@ def _effective_max_tokens(request) -> int:
 
 
 class BedrockStreamAborted(RuntimeError):
-    """Bedrock-Antwort endete ohne Endesignal oder mit Fehlerereignis."""
+    """Bedrock-Antwort endete ohne Endesignal oder mit Fehlerereignis.
+
+    ``retryable`` ist das Urteil der Stelle, die den Abbruch erkennt (BR9 Regel
+    1): ein abgerissener Strom oder eine Ueberlastung kann beim naechsten Mal
+    gelingen, eine fehlende Endangabe oder ein Validierungsfehler nicht."""
+
+    def __init__(self, message: str, *, retryable: bool = UNCLASSIFIED_RETRYABLE):
+        super().__init__(message)
+        self.retryable = retryable
 
 
 def _required_finish_reason(stop_reason: Optional[str], weg: str) -> str:
@@ -377,13 +432,7 @@ async def call_bedrock(
         code = (e.response.get("Error") or {}).get("Code", "")
         detail = f"Bedrock API error ({code or 'unknown'}): {e}"
         logger.error(detail)
-        if code in _BEDROCK_CONFIG_ERROR_CODES:
-            raise HTTPException(status_code=424, detail=detail)
-        if code == "ValidationException":
-            raise HTTPException(status_code=400, detail=detail)
-        if code in _BEDROCK_THROTTLE_ERROR_CODES:
-            raise HTTPException(status_code=429, detail=detail)
-        raise HTTPException(status_code=500, detail=detail)
+        raise HTTPException(status_code=_client_error_status(code), detail=detail)
     except HTTPException:
         raise
     except Exception as e:
@@ -411,13 +460,14 @@ async def stream_bedrock(
     try:
         client = get_bedrock_client()
     except RuntimeError as e:
-        yield f"event: error\ndata: {json.dumps({'error': str(e)})}\n\n"
+        # Keine Bedrock-Zugangsdaten auf diesem Worker: Konfiguration, kein Aussetzer.
+        yield _stream_error_event(e)
         return
 
     # Resolve model
     resolved_model, _ = resolve_model(request.model)
     if not resolved_model:
-        yield f"data: {{\"error\": \"Unknown model: {request.model}\"}}\n\n"
+        yield f"data: {json.dumps({'error': f'Unknown model: {request.model}', **fields(False)})}\n\n"
         return
 
     # Determine region first (needed for model ID)
@@ -503,11 +553,19 @@ async def stream_bedrock(
             if "chunk" not in event:
                 # Bedrock meldet Abbrueche mitten im Strom als eigenes Ereignis
                 # (modelStreamErrorException, throttlingException, ...) statt als chunk.
-                raise BedrockStreamAborted(f"Bedrock stream error event: {json.dumps(event, default=str)[:300]}")
+                raise BedrockStreamAborted(
+                    f"Bedrock stream error event: {json.dumps(event, default=str)[:300]}",
+                    retryable=any(k in _BEDROCK_TRANSIENT_STREAM_EVENTS for k in event),
+                )
             chunk = json.loads(event["chunk"]["bytes"])
 
             if chunk.get("type") == "error":
-                raise BedrockStreamAborted(f"Bedrock stream error chunk: {json.dumps(chunk.get('error'), default=str)[:300]}")
+                _err = chunk.get("error")
+                raise BedrockStreamAborted(
+                    f"Bedrock stream error chunk: {json.dumps(_err, default=str)[:300]}",
+                    retryable=isinstance(_err, dict)
+                    and _err.get("type") in _BEDROCK_TRANSIENT_ERROR_TYPES,
+                )
 
             if chunk.get("type") == "message_start":
                 # Input tokens are only reported here.
@@ -561,7 +619,8 @@ async def stream_bedrock(
             # Strom endete ohne message_stop (Verbindung abgerissen): der Text ist
             # abgeschnitten. Kein Final-Chunk, kein [DONE], Status bleibt 'error'.
             raise BedrockStreamAborted(
-                "Bedrock stream ended without message_stop — response is truncated"
+                "Bedrock stream ended without message_stop — response is truncated",
+                retryable=True,
             )
 
         usage_sink["status"] = "success"
@@ -572,7 +631,7 @@ async def stream_bedrock(
         # Surface the provider error to the usage tracker (sink outlives the
         # generator) — status stays 'error' from the setdefault above.
         usage_sink["error_message"] = str(e)
-        yield f"event: error\ndata: {json.dumps({'error': str(e)})}\n\n"
+        yield _stream_error_event(e)
 
 
 @app.post("/v1/chat/completions")
