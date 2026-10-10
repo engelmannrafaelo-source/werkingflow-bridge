@@ -306,3 +306,62 @@ def test_sync_chat_antwortet_429_statt_200(monkeypatch, tmp_path, text):
     err = resp.json()["error"]
     assert err["bridge_type"] == "account_exhausted" and err["retryable"] is True
     assert rate_limit_tracker.is_hard_limited(WORKER)
+
+
+# ── BR4R S1: a rejected rate_limit_event counts once in the adaptive limiter ─
+
+def _rejected_event() -> RateLimitEvent:
+    return RateLimitEvent({
+        "type": "rate_limit_event", "uuid": "u", "session_id": "s",
+        "rate_limit_info": {"status": "rejected", "rateLimitType": "seven_day"},
+    })
+
+
+async def test_streaming_zaehlt_abgelehntes_ereignis_einmal(monkeypatch, tmp_path):
+    from src.models import ChatCompletionRequest, Message
+
+    _echter_cli(monkeypatch, tmp_path, sdk.init(), _rejected_event())
+    metrics = MagicMock()
+    monkeypatch.setattr("src.middleware.rolling_metrics.get_rolling_metrics", lambda: metrics)
+    req = ChatCompletionRequest(model="claude-sonnet-5",
+                                messages=[Message(role="user", content="hi")], stream=True)
+    out = [c async for c in main.generate_streaming_response(req, "req-br4-s1")]
+
+    errs = [c for c in out if c.startswith("event: error\n")]
+    assert len(errs) == 1
+    assert json.loads(errs[0].split("data: ", 1)[1])["error"]["bridge_type"] == "account_exhausted"
+    metrics.record_rate_limit.assert_called_once_with(WORKER)
+
+
+@pytest.mark.parametrize("schon_gezaehlt, erwartet", [(True, 0), (False, 1)])
+async def test_429_handler_zaehlt_nur_ungezaehlte(monkeypatch, schon_gezaehlt, erwartet):
+    from starlette.requests import Request
+
+    metrics = MagicMock()
+    monkeypatch.setattr("src.middleware.rolling_metrics.get_rolling_metrics", lambda: metrics)
+    exc = RateLimitError("[w] Anthropic seven_day limit hit", retry_after_seconds=30)
+    exc.metrics_recorded = schon_gezaehlt
+    request = Request({"type": "http", "method": "POST", "path": "/v1/doc-agent",
+                       "headers": [], "query_string": b"", "server": ("t", 80),
+                       "scheme": "http", "root_path": ""})
+    resp = await main.rate_limit_handler(request, exc)
+
+    assert resp.status_code == 429
+    assert metrics.record_rate_limit.call_count == erwartet
+
+
+# ── BR4R S2: transient 429 / model block costs at most MAX_COOLDOWN_SECONDS ──
+
+async def test_transienter_429_sperrt_hart_aber_hoechstens_60s(monkeypatch, tmp_path):
+    """The CLI tags a transient 429 ("temporary capacity issue") with the same
+    error:"rate_limit" field as an exhausted account. Accepted: the request has
+    failed anyway; the HARD mark is capped and sets no capacity lock."""
+    from datetime import datetime, timedelta
+
+    text = "API Error: Request rejected (429) · temporary capacity issue, please retry"
+    _, err = await _run(monkeypatch, tmp_path, sdk.init(), _limit_turn(text), _result_limit(text))
+
+    assert rate_limit_tracker.is_hard_limited(WORKER)
+    assert 0 < err.retry_after_seconds <= rate_limit_tracker.MAX_COOLDOWN_SECONDS == 60
+    assert rate_limit_tracker._rate_limits[WORKER] <= datetime.now() + timedelta(seconds=60)
+    assert not capacity_lock_mod.get_capacity_lock().is_locked(WORKER)

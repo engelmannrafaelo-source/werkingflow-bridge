@@ -1224,9 +1224,12 @@ async def rate_limit_handler(request: Request, exc: RateLimitError):
         }
     )
 
-    from src.middleware.rolling_metrics import get_rolling_metrics
-    get_rolling_metrics().record_rate_limit(worker_id)
-    logger.info(f"📊 Recorded 429 for adaptive limiter feedback (worker={worker_id})")
+    # A rate_limit_event "rejected" is already counted where it was seen
+    # (_handle_rate_limit_event); count every 429 exactly once (BR4R S1).
+    if not getattr(exc, "metrics_recorded", False):
+        from src.middleware.rolling_metrics import get_rolling_metrics
+        get_rolling_metrics().record_rate_limit(worker_id)
+        logger.info(f"📊 Recorded 429 for adaptive limiter feedback (worker={worker_id})")
 
     # Try cross-worker retry on /v1/chat/completions AND /v1/research sync
     # requests before surfacing the 429 to the client. Research uses the same
@@ -1945,8 +1948,9 @@ async def generate_streaming_response(
             # caller gets the same account_exhausted verdict a sync call gets
             # as 429 — retryable, with the wait — never the sentence as text.
             _rl_worker = os.getenv("INSTANCE_NAME", "unknown")
-            from src.middleware.rolling_metrics import get_rolling_metrics
-            get_rolling_metrics().record_rate_limit(_rl_worker)
+            if not getattr(sdk_stream_error, "metrics_recorded", False):
+                from src.middleware.rolling_metrics import get_rolling_metrics
+                get_rolling_metrics().record_rate_limit(_rl_worker)
             error_payload = {
                 "error": {
                     "message": f"[Bridge {_rl_worker}] {str(sdk_stream_error)[:300]}",

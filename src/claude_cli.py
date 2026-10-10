@@ -218,6 +218,9 @@ class RateLimitError(Exception):
         super().__init__(message)
         self.reset_time = reset_time
         self.retry_after_seconds = retry_after_seconds or self._calculate_retry_after()
+        # True once the 429 is in the adaptive limiter (rolling_metrics), so the
+        # HTTP layer does not count the same rejection a second time.
+        self.metrics_recorded = False
 
     def _calculate_retry_after(self) -> int:
         """Calculate seconds until reset, default 3600 (1 hour) if unknown"""
@@ -393,6 +396,14 @@ def handle_org_subscription_disabled(worker_id: str, signal: str) -> None:
 # A rate_limit_event with status "rejected" is the other structured signal and
 # is handled by _handle_rate_limit_event. Both end on the same path:
 # RateLimitError (account_exhausted, retryable) and the worker out of routing.
+#
+# What the signal means (BR4R S2): "the API rejects this account right now",
+# not always "the account is exhausted". The CLI also sets error:"rate_limit"
+# on its final answer after a transient 429 ("Request rejected (429) ·
+# temporary capacity issue" — apiErrorIsTransient does not survive the SDK)
+# and on a per-model block without fallback model. Those requests have failed
+# anyway; the worker is HARD-limited too, but without capacity lock and capped
+# to MAX_COOLDOWN_SECONDS (60 s), so a transient rejection costs one minute.
 # =============================================================================
 ACCOUNT_LIMIT_CLI_ERRORS = ("rate_limit", "billing_error")
 
@@ -782,15 +793,19 @@ def _handle_rate_limit_event(message, worker_id):
         try:
             from src.middleware.rolling_metrics import get_rolling_metrics
             get_rolling_metrics().record_rate_limit(worker_id)
+            recorded = True
         except Exception as exc:
+            recorded = False
             logger.debug(f"rolling_metrics.record_rate_limit failed: {exc}")
 
         reset_dt = datetime.fromtimestamp(reset_target) if reset_target else None
-        raise RateLimitError(
+        err = RateLimitError(
             f"[{worker_id}] Anthropic {rl_type} limit hit",
             reset_time=reset_dt,
             retry_after_seconds=message.retry_after,
         )
+        err.metrics_recorded = recorded
+        raise err
 
     logger.info(
         f"rate_limit_event unknown status for {worker_id} "
