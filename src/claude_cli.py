@@ -911,6 +911,41 @@ def find_truncation_marker(chunks: list) -> Optional[dict]:
 RESULT_SUCCESS_SUBTYPES = ("success", "complete")
 
 
+def sdk_message_to_dict(message: Any) -> Any:
+    """The dict run_completion hands on for an SDK message object.
+
+    Every public non-callable attribute of the dataclass, nothing else — so the
+    class name is gone: SystemMessage becomes {'subtype', 'data'}, ResultMessage
+    {'subtype', 'is_error', 'num_turns', ...}, neither with a 'type' key.
+    Dicts and other non-objects pass through unchanged."""
+    if not hasattr(message, '__dict__') or isinstance(message, dict):
+        return message
+    message_dict = {}
+    for attr_name in dir(message):
+        if not attr_name.startswith('_'):  # Skip private attributes
+            try:
+                attr_value = getattr(message, attr_name)
+                if not callable(attr_value):  # Skip methods
+                    message_dict[attr_name] = attr_value
+            except (AttributeError, TypeError) as e:
+                # Expected for properties that raise or computed attributes
+                logger.debug(f"Could not get attribute '{attr_name}': {e}")
+    return message_dict
+
+
+def is_result_chunk(chunk: Any) -> bool:
+    """True for the chunk that ends a run, in both shapes run_completion yields:
+    type='result' (CLI JSON, the bridge's own markers) and the converted SDK
+    ResultMessage, recognised by its own fields is_error and num_turns. A
+    'subtype' alone says nothing — the converted SystemMessage (init,
+    compact_boundary, status, ...) carries one too."""
+    if not isinstance(chunk, dict):
+        return False
+    if chunk.get("type") == "result":
+        return True
+    return "type" not in chunk and "is_error" in chunk and "num_turns" in chunk
+
+
 def find_unfinished_result(chunks: list) -> Optional[dict]:
     """
     The run's result chunk if the run did NOT end with success, else None.
@@ -922,15 +957,11 @@ def find_unfinished_result(chunks: list) -> Optional[dict]:
     stopped at the turn limit leaves a partly written file that looks like a
     finished one. A stream without any result chunk counts as unfinished —
     the real CLI path always yields one (result or explicit marker).
-
-    Both result shapes count: CLI JSON / synthetic markers (type='result')
-    and the converted SDK ResultMessage (no 'type' key, has 'subtype').
+    Only result chunks count (is_result_chunk); system chunks never do.
     """
     result = None
     for chunk in chunks:
-        if not isinstance(chunk, dict):
-            continue
-        if chunk.get("type") == "result" or ("type" not in chunk and "subtype" in chunk):
+        if is_result_chunk(chunk):
             if chunk.get("is_error") or chunk.get("subtype") not in RESULT_SUCCESS_SUBTYPES:
                 return chunk
             result = chunk
@@ -2030,24 +2061,12 @@ class ClaudeCodeCLI:
                                     cli_session_id=cli_session_id,
                                 )
 
-                            # Convert message object to dict if needed
-                            if hasattr(message, '__dict__') and not isinstance(message, dict):
-                                # Convert object to dict for consistent handling
-                                message_dict = {}
-
-                                # Get all attributes from the object
-                                for attr_name in dir(message):
-                                    if not attr_name.startswith('_'):  # Skip private attributes
-                                        try:
-                                            attr_value = getattr(message, attr_name)
-                                            if not callable(attr_value):  # Skip methods
-                                                message_dict[attr_name] = attr_value
-                                        except (AttributeError, TypeError) as e:
-                                            # Expected for properties that raise or computed attributes
-                                            logger.debug(f"Could not get attribute '{attr_name}': {e}")
-
-                                logger.debug(f"Converted message dict: {message_dict}")
-                                message = message_dict
+                            # Convert message object to dict for consistent handling.
+                            # SystemMessage chunks (init, ...) are passed on like
+                            # any other: they are not content and never a result
+                            # (is_result_chunk).
+                            message = sdk_message_to_dict(message)
+                            logger.debug(f"Converted message dict: {message}")
 
                             # Cache chunk to file for crash recovery (with error handling)
                             if cache_enabled:
@@ -2135,15 +2154,6 @@ class ClaudeCodeCLI:
                                     if skip_yield:
                                         # Don't yield this rate-limit text to the client
                                         continue
-
-                            # =================================================================
-                            # SKIP SYSTEMMESSAGE - Don't yield to client
-                            # SystemMessage contains only internal metadata (init, session_id, tools)
-                            # NOT yielding it allows Nginx failover if SDK crashes afterward
-                            # =================================================================
-                            if type(message).__name__ == 'SystemMessage':
-                                logger.debug(f"⏭️  Skipping SystemMessage (internal only, not for client)")
-                                continue
 
                             # Yield chunk immediately (no in-memory accumulation)
                             yield message

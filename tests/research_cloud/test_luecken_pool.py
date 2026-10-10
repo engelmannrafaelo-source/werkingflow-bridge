@@ -26,6 +26,7 @@ import pytest  # noqa: E402
 import src.main  # noqa: E402
 import src.research_pool_perplexity as rpp  # noqa: E402
 from src.research_cloud.luecken import FLAG, PRUEF_MODELL  # noqa: E402
+from tests import sdk_strom as sdk  # noqa: E402
 
 ALT = "# Bericht\n" + "Befund. " * 60 + "\nTyp X-100, Schallleistung: nicht bestätigt."
 NEU = "# Bericht\n" + "Befund. " * 60 + "\nTyp X-100, Schallleistung 52 dB(A) (Datenblatt https://h.example/x.pdf, S. 3)."
@@ -44,8 +45,10 @@ def _make_req(output_path=None):
     return ns
 
 
-async def _stream(*chunks):
-    for c in chunks:
+async def _stream(*body):
+    """The real stream shape: system init first, a system message mid-run,
+    results as converted SDK ResultMessage (sdk_strom)."""
+    for c in sdk.stream_chunks(*body):
         yield c
 
 
@@ -69,8 +72,7 @@ class FakeCli:
             self.datei.write_text(ALT, encoding="utf-8")
             return _stream(
                 {"content": [{"type": "text", "text": "Bericht in die Datei geschrieben."}]},
-                {"type": "result", "subtype": "success", "session_id": self.session_id,
-                 "usage": {"input_tokens": 20, "output_tokens": 10}},
+                sdk.result(session_id=self.session_id or "", usage={"input_tokens": 20, "output_tokens": 10}),
             )
         if kw.get("resume_workdir") is not None:
             self.calls["rueckrunde"].append(kw)
@@ -82,14 +84,13 @@ class FakeCli:
             return _stream(
                 {"content": [SimpleNamespace(name=rpp.MCP_TOOL_NAME, input={"frage": "Datenblatt X-100"})]},
                 {"content": [{"type": "text", "text": text}]},
-                {"type": "result", "subtype": "success", "session_id": self.session_id,
-                 "usage": {"input_tokens": 30, "output_tokens": 40}},
+                sdk.result(session_id=self.session_id or "", usage={"input_tokens": 30, "output_tokens": 40}),
             )
         if kw.get("model") == PRUEF_MODELL:
             self.calls["pruefer"].append(kw)
             return _stream(
                 {"content": [{"type": "text", "text": json.dumps({"luecken": self.gaps.pop(0)})}]},
-                {"type": "result", "subtype": "success", "usage": {"input_tokens": 7, "output_tokens": 3}},
+                sdk.result(session_id="pruefer-sess", usage={"input_tokens": 7, "output_tokens": 3}),
             )
         self.calls["research"].append(kw)
         chunks = []
@@ -103,10 +104,8 @@ class FakeCli:
             meta = {"type": "x_claude_metadata", "files_created": [], "research_dir": str(self.workdir)}
             text = ALT
         chunks.append({"content": [{"type": "text", "text": text}]})
-        result = {"type": "result", "subtype": "success", "usage": {"input_tokens": 100, "output_tokens": 200}}
-        if self.session_id:
-            result["session_id"] = self.session_id
-        chunks.append(result)
+        # session_id=None: a result without a resumable session id ("").
+        chunks.append(sdk.result(session_id=self.session_id or "", usage={"input_tokens": 100, "output_tokens": 200}))
         chunks.append(meta)
         return _stream(*chunks)
 

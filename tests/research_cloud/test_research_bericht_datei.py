@@ -39,6 +39,7 @@ from fastapi import HTTPException  # noqa: E402
 import src.main  # noqa: E402
 from src.claude_cli import inject_output_path_for_file_discovery  # noqa: E402
 from src.research_cloud.luecken import FLAG  # noqa: E402
+from tests import sdk_strom as sdk  # noqa: E402
 
 BERICHT = "# Research Report\n\n## Summary\n" + "Befund mit Quelle. " * 40
 SKRIPT = (
@@ -61,8 +62,10 @@ def _make_req(output_path=None):
     return ns
 
 
-async def _stream(*chunks):
-    for c in chunks:
+async def _stream(*body):
+    """The real stream shape: system init first, a system message mid-run,
+    the result as converted SDK ResultMessage (sdk_strom)."""
+    for c in sdk.stream_chunks(*body):
         yield c
 
 
@@ -96,9 +99,9 @@ class FakeCli:
             self.calls["nachhol"].append(kw)
             if self.repariert:
                 self.datei.write_text(self.nachhol_text, encoding="utf-8")
-            result = {"type": "result", "subtype": "success", "session_id": self.session_id,
-                      "usage": {"input_tokens": 20, "output_tokens": 900}}
-            result.update(self.nachhol_ende or {})
+            result = sdk.result(**{"session_id": self.session_id or "",
+                                   "usage": {"input_tokens": 20, "output_tokens": 900},
+                                   **(self.nachhol_ende or {})})
             return _stream(
                 {"content": [{"type": "text", "text": "Bericht in die Datei geschrieben."}]},
                 result,
@@ -115,10 +118,10 @@ class FakeCli:
                     "session_tracking": {"cli_session_id": "bridge-1", "research_dir": str(self.workdir)}}
         else:
             meta = {"type": "x_claude_metadata", "files_created": [], "research_dir": str(self.workdir)}
-        result = {"type": "result", "subtype": "success", "usage": {"input_tokens": 100, "output_tokens": 200}}
-        if self.session_id:
-            result["session_id"] = self.session_id
-        result.update(self.research_ende or {})
+        # session_id=None: a result without a resumable session id ("").
+        result = sdk.result(**{"session_id": self.session_id or "",
+                               "usage": {"input_tokens": 100, "output_tokens": 200},
+                               **(self.research_ende or {})})
         return _stream({"content": [{"type": "text", "text": self.chat}]}, result, meta)
 
 
@@ -267,21 +270,32 @@ async def test_hauptlauf_an_max_turns_ohne_datei_keine_nachholrunde(tmp_path, pe
 
 
 @pytest.mark.asyncio
-async def test_hauptlauf_sdk_resultmessage_an_max_turns(tmp_path, persist):
-    """The converted SDK ResultMessage has no 'type' key — it counts too."""
-    fake = FakeCli(tmp_path, files={"output.md": TEILBERICHT}, chat="fertig",
-                   research_ende={"type": None, **MAX_TURNS})
+async def test_hauptlauf_cli_json_result_an_max_turns(tmp_path, persist):
+    """The fakes yield the converted SDK ResultMessage (no 'type' key); the
+    CLI-JSON shape type='result' counts the same."""
+    fake = FakeCli(tmp_path, files={"output.md": TEILBERICHT}, chat="fertig", research_ende=MAX_TURNS)
 
-    def ohne_type(**kw):
+    def cli_json(**kw):
         async def strom():
             async for c in fake(**kw):
-                if isinstance(c, dict) and "type" in c and c["type"] is None:
-                    c = {k: v for k, v in c.items() if k != "type"}
+                if isinstance(c, dict) and "num_turns" in c:
+                    c = {"type": "result", **c}
                 yield c
         return strom()
 
-    result = await _run(ohne_type)
+    result = await _run(cli_json)
     assert result.status == "error" and "error_max_turns" in result.error
+
+
+@pytest.mark.asyncio
+async def test_gesunder_lauf_mit_system_chunks_ist_erfolg(tmp_path, persist):
+    """BR2R2 M1': the real stream starts with the SystemMessage init — after
+    the dict conversion {'subtype': 'init', 'data': ...}, no 'type'. It is no
+    result; a healthy run stays success."""
+    fake = FakeCli(tmp_path, files={"output.md": BERICHT}, chat="fertig")
+    result = await _run(fake)
+    assert result.status == "success" and result.content == BERICHT
+    assert fake.calls["nachhol"] == []
 
 
 @pytest.mark.asyncio
@@ -294,11 +308,17 @@ async def test_success_mit_is_error_ist_kein_erfolg(tmp_path, persist):
 def test_find_unfinished_result_formen():
     from src.claude_cli import find_unfinished_result
     ok = {"type": "result", "subtype": "success"}
+    init = sdk.chunk(sdk.init())
+    assert init == {"subtype": "init", "data": init["data"]}  # the converted shape, no 'type'
     assert find_unfinished_result([{"content": []}, ok]) is None
-    assert find_unfinished_result([{"subtype": "success", "usage": {}}]) is None
-    assert find_unfinished_result([{"subtype": "error_max_turns"}])["subtype"] == "error_max_turns"
+    assert find_unfinished_result([init, {"content": []}, sdk.chunk(sdk.compact_boundary()),
+                                   sdk.chunk(sdk.result())]) is None
+    assert find_unfinished_result([init, sdk.chunk(sdk.result("error_max_turns", is_error=True))])[
+        "subtype"] == "error_max_turns"
+    assert find_unfinished_result([sdk.chunk(sdk.result(is_error=True))])["subtype"] == "success"
     assert find_unfinished_result([ok, {"type": "result", "subtype": "no_completion_marker", "is_error": True}])
-    assert find_unfinished_result([{"content": []}])["subtype"] == "no_result"
+    assert find_unfinished_result([init, {"content": []}])["subtype"] == "no_result"
+    assert find_unfinished_result([{"subtype": "status", "data": {}}])["subtype"] == "no_result"
     assert find_unfinished_result([{"type": "x_claude_metadata", "files_created": []}, ok]) is None
 
 
@@ -379,3 +399,47 @@ async def test_content_glob_zeichen_werden_abgewiesen(tmp_path, monkeypatch):
         await _content("*", tmp_path, monkeypatch)
     assert e.value.status_code == 400
     assert e.value.detail["reason"] == "research_session_id_malformed"
+
+
+# --- the real run_completion with SDK-shaped messages (BR2R2 M1') ------------
+
+
+def _sdk_query(ende):
+    """Stand-in for claude_code_sdk.query: writes the report to the path the
+    prompt names, then streams what the SDK yields — SystemMessage init,
+    assistant text, a mid-run SystemMessage, ResultMessage."""
+    import re
+
+    async def query(prompt, options):
+        pfad = Path(re.search(r"OUTPUT_FILE_PATH: (\S+)", prompt).group(1))
+        pfad.parent.mkdir(parents=True, exist_ok=True)
+        pfad.write_text(BERICHT, encoding="utf-8")
+        yield sdk.init("cli-echt-1")
+        yield sdk.AssistantMessage(content=[sdk.TextBlock(text="Bericht geschrieben.")], model="m")
+        yield sdk.compact_boundary("cli-echt-1")
+        yield ende
+    return query
+
+
+async def _run_echt(monkeypatch, tmp_path, ende):
+    import src.claude_cli as cc
+    monkeypatch.setattr(cc, "query", _sdk_query(ende))
+    monkeypatch.setattr(src.main.claude_cli, "cwd", tmp_path)
+    monkeypatch.setattr(src.main.claude_cli, "cache_dir", tmp_path / "cache")
+    (tmp_path / "cache").mkdir()
+    with patch.object(src.main.claude_cli, "parse_claude_message", side_effect=_parse):
+        return await src.main._execute_research_impl(_make_req(), None, request=MagicMock())
+
+
+@pytest.mark.asyncio
+async def test_echter_run_completion_gesunder_lauf_ist_erfolg(monkeypatch, tmp_path, persist):
+    result = await _run_echt(monkeypatch, tmp_path, sdk.result(session_id="cli-echt-1"))
+    assert result.status == "success", result.error
+    assert result.content == BERICHT
+
+
+@pytest.mark.asyncio
+async def test_echter_run_completion_max_turns_ist_fehler(monkeypatch, tmp_path, persist):
+    result = await _run_echt(monkeypatch, tmp_path,
+                             sdk.result("error_max_turns", is_error=True, session_id="cli-echt-1"))
+    assert result.status == "error" and "error_max_turns" in result.error
