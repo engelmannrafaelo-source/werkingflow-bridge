@@ -121,3 +121,55 @@ def test_pool_tools_offer_neutral_documentation():
     descriptions = " ".join(call.args[1] for call in tool.call_args_list)
     assert "Hersteller" not in descriptions and "Norm" not in descriptions
     assert "page" in descriptions and "source" in descriptions
+
+
+def test_request_docstring_reaches_openapi_schema():
+    from src.models import ResearchRequest
+    assert "Request model for dedicated /v1/research endpoint" in ResearchRequest.__doc__
+    assert "Request model for dedicated /v1/research endpoint" in ResearchRequest.model_json_schema()["description"]
+
+
+def test_new_protocol_works_without_compat(tmp_path):
+    import os
+    import subprocess
+    import sys
+    code = """
+import sys
+class NoCompat:
+    def find_spec(self, fullname, *args):
+        if fullname == 'src.compat' or fullname.startswith('src.compat.'):
+            raise AssertionError('new protocol imported compat: ' + fullname)
+sys.meta_path.insert(0, NoCompat())
+from src.research_protocol import build_research_execution_prompt
+prompt, turns, depth = build_research_execution_prompt('/sc:research music --depth deep', 80, research_instructions='JSON')
+assert depth == 'deep' and turns == 45 and 'music' in prompt
+"""
+    subprocess.run([sys.executable, "-c", code], check=True, timeout=15, env=os.environ.copy())
+
+
+def test_privacy_policy_defaults_and_job_roundtrip():
+    from src.models import ResearchRequest
+    from src.research_instructions import research_privacy_options
+    legacy = ResearchRequest(query="music")
+    assert research_privacy_options(legacy) == {}
+    new = ResearchRequest(query="music", research_instructions=POLICY)
+    assert research_privacy_options(new) == {"privacy_allowlist": []}
+    request = ResearchRequest(query="music", research_instructions=POLICY, privacy_allowlist=["Oboe"])
+    assert research_privacy_options(ResearchRequest.model_validate(request.model_dump())) == {"privacy_allowlist": ["Oboe"]}
+
+
+def test_caller_allowlist_does_not_read_legacy(monkeypatch):
+    from unittest.mock import patch
+    from src.privacy_postprocess.rules import caller_freiliste
+    monkeypatch.setenv("BRIDGE_PSEUDONYM_ALLOWLIST_PATH", "/nonexistent")
+    with patch("src.privacy_postprocess.rules.lade_freiliste", side_effect=AssertionError("legacy")):
+        assert caller_freiliste([]).ist_frei("COP", "ORGANIZATION") is None
+        assert caller_freiliste(["COP"]).ist_frei("COP", "ORGANIZATION")
+        assert caller_freiliste(["COP"]).ist_frei("COP", "EMAIL_ADDRESS") is None
+
+
+@pytest.mark.parametrize("invalid", [[""], ["   "], [4], "COP"])
+def test_invalid_allowlist_fails_before_dispatch(invalid):
+    from src.models import ResearchRequest
+    with pytest.raises(ValueError):
+        ResearchRequest(query="music", privacy_allowlist=invalid)

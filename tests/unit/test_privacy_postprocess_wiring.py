@@ -107,3 +107,22 @@ async def test_widerspruechliche_dienst_antwort_wird_fehler(monkeypatch):
     r = await _aufruf(monkeypatch, "true", payload=kaputt)
     assert r.status == "error"
     assert r.smart_anonymized_text is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("terms", [[], ["WP1"]])
+async def test_caller_allowlist_replaces_legacy_on_core(monkeypatch, terms):
+    with patch("src.privacy_postprocess.pipeline.lade_freiliste", side_effect=AssertionError("legacy loaded")):
+        r = await _aufruf(monkeypatch, "true", privacy_allowlist=terms)
+    assert r.status == "success"
+    if terms:
+        assert "WP1" in r.smart_anonymized_text
+    else:
+        assert "WP1" in r.mapping.values()
+
+
+@pytest.mark.asyncio
+async def test_caller_allowlist_disabled_is_loud(monkeypatch):
+    r = await _aufruf(monkeypatch, None, privacy_allowlist=["WP1"])
+    assert r.status == "error"
+    assert "privacy_allowlist" in r.error

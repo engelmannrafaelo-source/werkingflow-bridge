@@ -14,46 +14,18 @@ categories dropped — declared honestly by the agent, caught loudly by nobody.
 """
 from __future__ import annotations
 
-import re
 from typing import Optional, Tuple
 
 from src.research_cloud.prompt import search_budget_for_depth
 
-_VALID_DEPTHS = ("quick", "standard", "deep", "exhaustive")
-_DEFAULT_DEPTH = "standard"
-
-# max_turns per depth — hard regulator on the CLI side. Sized as
-# search budget + fetch budget + headroom for planning/writing turns.
-_TURN_CAP = {"quick": 20, "standard": 30, "deep": 45, "exhaustive": 60}
-_TURN_FLOOR = 20  # below this even a quick pass can't reliably finish + write
+from src.research_protocol import (
+    _COMMAND_RE, _FLAG_RE, _TURN_CAP, _TURN_FLOOR, parse_depth,
+)
 
 # Output sizing per depth (words). Scales the report with the budget so a
 # deep pass isn't forced back into quick-sized summaries.
 _FINDING_WORDS = {"quick": 100, "standard": 150, "deep": 250, "exhaustive": 300}
 _ANALYSIS_WORDS = {"quick": 150, "standard": 300, "deep": 600, "exhaustive": 900}
-
-# Flags main.py appends after the quoted query — stripped from the query
-# text; their information either lands elsewhere (--depth) or is SuperClaude
-# vocabulary the direct protocol replaces (--strategy, --max-hops, ...).
-_FLAG_RE = re.compile(
-    r"\s*--(?:depth|strategy|max-hops|confidence|parallel|sources)\s+\S+"
-)
-
-_COMMAND_RE = re.compile(r"^/(?:sc:)?research\s+", re.DOTALL)
-
-_DEPTH_RE = re.compile(r"--depth\s+(quick|standard|deep|exhaustive)\b")
-
-
-def parse_depth(prompt: str) -> str:
-    """Extract the requested depth from a ``/sc:research`` prompt.
-
-    Missing flag -> default depth (mirrors ResearchRequest.depth default).
-    An unknown depth value can't reach us: the API layer validates the
-    Literal before the prompt is built.
-    """
-    match = _DEPTH_RE.search(prompt)
-    return match.group(1) if match else _DEFAULT_DEPTH
-
 
 def build_research_execution_prompt(
     prompt: str,

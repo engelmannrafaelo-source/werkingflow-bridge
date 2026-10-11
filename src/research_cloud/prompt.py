@@ -140,11 +140,9 @@ from src.compat.research_content import _DEPTH_INSTRUCTION  # compatibility only
 # als Kostenregler pro Tier"). Deliberately mirrors the depth timing bands
 # already documented on ResearchRequest.depth (quick 1-2min/1 hop ...
 # exhaustive 8-15min/5 hops) as a search-count proxy, not a literal hop count.
-_SEARCH_MAX_USES = {"quick": 5, "standard": 10, "deep": 15, "exhaustive": 20}
-_FETCH_MAX_USES = {"quick": 3, "standard": 6, "deep": 10, "exhaustive": 15}
-
-_DEFAULT_DEPTH = "standard"
-
+from src.research_budgets import (
+    _DEFAULT_DEPTH, search_budget_for_depth,
+)
 
 # perplexity_search (RESEARCH_PERPLEXITY_ENABLED, Rafael 02.10.2026). The tool
 # description carries the same rules; the prompt states the ORDER, because the
@@ -176,9 +174,3 @@ def build_system_prompt(
     if perplexity:
         prompt += _PERPLEXITY_SECTION
     return prompt
-
-
-def search_budget_for_depth(depth: Optional[str]) -> Tuple[int, int]:
-    """Return (web_search_max_uses, web_fetch_max_uses) for a research depth."""
-    depth_key = depth if depth in _SEARCH_MAX_USES else _DEFAULT_DEPTH
-    return _SEARCH_MAX_USES[depth_key], _FETCH_MAX_USES[depth_key]

@@ -94,3 +94,12 @@ async def test_underlying_exception_is_wrapped_and_aborts():
     ):
         with pytest.raises(CloudAnonymizeError, match="refusing research-cloud call"):
             await anonymize_query_for_cloud(_fake_request(), "query text")
+
+
+@pytest.mark.asyncio
+async def test_caller_allowlist_reaches_core():
+    from types import SimpleNamespace
+    safe = SimpleNamespace(status="success", anonymization_performed=True, smart_anonymized_text="COP", error=None)
+    with patch("src.main._smart_anonymize_core", new=AsyncMock(return_value=safe)) as core:
+        assert await anonymize_query_for_cloud(_fake_request(), "COP", privacy_allowlist=["COP"]) == "COP"
+    assert core.await_args.kwargs["privacy_allowlist"] == ["COP"]

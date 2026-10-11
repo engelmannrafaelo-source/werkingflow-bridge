@@ -155,7 +155,7 @@ class Freiliste:
         return bool(host) and any(host == d or host.endswith("." + d) for d in self.url_domains)
 
 
-_STANDARD_PFAD = Path(__file__).with_name("fach_allowlist.json")
+_STANDARD_PFAD = Path(__file__).parents[1] / "compat" / "fach_allowlist.json"
 
 
 @lru_cache(maxsize=4)
@@ -190,3 +190,14 @@ def verwerfen(text: str, span: Span, freiliste: Freiliste) -> Optional[str]:
 
 
 __all__: List[str] = ["plausibilitaet", "in_url", "Freiliste", "lade_freiliste", "verwerfen"]
+
+
+def caller_freiliste(terms: List[str]) -> Freiliste:
+    """Exact caller terms; never consult the legacy file or environment override."""
+    if any(not isinstance(term, str) or not term.strip() for term in terms):
+        raise ValueError("privacy_allowlist must contain nonblank strings")
+    return Freiliste(
+        woerter=frozenset(terms), woerter_gross=frozenset(t.upper() for t in terms),
+        phrasen=frozenset(t.casefold() for t in terms), muster=(), url_domains=(),
+        quelle="caller",
+    )

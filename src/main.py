@@ -106,7 +106,7 @@ from src.jobs.executors import (
     erkunder_executor,
 )
 from src.stream_start import event_stream_response  # noqa: E402
-from src.research_instructions import caller_instructions
+from src.research_instructions import caller_instructions, research_privacy_options
 from src.parameter_validator import ParameterValidator, CompatibilityReporter
 from src.model_registry import (
     get_models_for_api,
@@ -5003,11 +5003,12 @@ async def _pool_berichtsdatei_nachholen(
             f"session cannot be resumed to write it (cli_session={cli_resume_id!r}, file={datei}). "
             "The chat text is not returned as the report."
         )
+    report_format = "in Markdown" if caller_instructions(request_body) is None else "in the requested format"
     auftrag = (
         f"The research is finished, but the report file {datei} does not exist. Whoever ordered "
         f"this research receives exactly the contents of that file and nothing else: your chat "
         f"replies are not passed on, and code in a chat reply is never run, so a script that would "
-        f"write the file has not created it. Write the finished report itself now — in the requested format, "
+        f"write the file has not created it. Write the finished report itself now — {report_format}, "
         f"with all findings and sources you have — into {datei} with the Write tool. If it is very "
         f"long, write the first part with Write and add the rest with Edit."
     )
@@ -5368,7 +5369,7 @@ async def _execute_research_impl(
             )
             pool_pplx = PoolPerplexityTool(
                 _pplx_cfg,
-                lambda text: anonymize_query_for_cloud(request, text),
+                lambda text: anonymize_query_for_cloud(request, text, **research_privacy_options(request_body)),
                 None,
                 ResearchCloudConfig().perplexity_max_uses,
                 research_instructions=caller_instructions(request_body),
@@ -6015,10 +6016,12 @@ async def _execute_research_cloud_impl(
     start_time = time.time()
 
     try:
-        anonymized_query = await anonymize_query_for_cloud(request, request_body.query)
         instructions = caller_instructions(request_body)
+        anonymized_query = await anonymize_query_for_cloud(
+            request, request_body.query, **research_privacy_options(request_body)
+        )
         anonymized_instructions = (
-            await anonymize_query_for_cloud(request, instructions)
+            await anonymize_query_for_cloud(request, instructions, **research_privacy_options(request_body))
             if instructions is not None else None
         )
     except CloudAnonymizeError as e:
@@ -6115,7 +6118,7 @@ async def _execute_research_cloud_impl(
             perplexity_config=perplexity_cfg,
             # Every perplexity_search query passes the SAME fail-closed gate as
             # the prompt above before it leaves for the third party.
-            anonymize=lambda text: anonymize_query_for_cloud(request, text),
+            anonymize=lambda text: anonymize_query_for_cloud(request, text, **research_privacy_options(request_body)),
             nachkontrolle=nachkontrolle,
             research_instructions=anonymized_instructions,
         )
@@ -8158,6 +8161,7 @@ async def _smart_anonymize_core(
     context_hint: Optional[str] = None,
     prefix: Optional[str] = None,
     known_entities: Optional[Dict[str, str]] = None,
+    privacy_allowlist: Optional[List[str]] = None,
 ) -> SmartAnonymizeResponse:
     """Core smart-pseudonymization logic: proxy to privacy-pdf-service, persist
     activity + a value-free DSGVO attestation, feed prompt-metrics. Shared by
@@ -8211,9 +8215,13 @@ async def _smart_anonymize_core(
         # Ein Fehler darin ist ein Fehler des Aufrufs (fail loud) — nie die ungefilterte
         # Antwort als gefiltert ausgeben.
         from src import privacy_postprocess as _pp
+        if privacy_allowlist and not _pp.ist_aktiv():
+            raise ValueError("privacy_allowlist requires BRIDGE_PSEUDONYM_POSTPROCESS")
         if _pp.ist_aktiv():
+            from src.privacy_postprocess.rules import caller_freiliste
             _payload = _pp.postprocess_smart_anonymize(
                 text, _payload, prefix=prefix, known_entities=known_entities,
+                freiliste=caller_freiliste(privacy_allowlist) if privacy_allowlist is not None else None,
             )
         elif known_entities:
             logger.warning(

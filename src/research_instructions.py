@@ -17,3 +17,13 @@ def caller_instructions(request) -> Optional[str]:
     if not value.strip():
         raise ValueError("research_instructions must not be blank")
     return value
+
+
+def research_privacy_options(request) -> dict:
+    """Only the legacy request may use the frozen app exceptions."""
+    terms = vars(request).get("privacy_allowlist")
+    if terms is not None:
+        if not isinstance(terms, list) or any(not isinstance(t, str) or not t.strip() for t in terms):
+            raise ValueError("privacy_allowlist must contain nonblank strings")
+        return {"privacy_allowlist": terms}
+    return {"privacy_allowlist": []} if caller_instructions(request) is not None else {}
