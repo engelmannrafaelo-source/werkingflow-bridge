@@ -23,6 +23,7 @@ from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, patch
 
 import httpx
+import pytest
 
 from src.jobs import executors, registry, store_client
 
@@ -491,7 +492,6 @@ async def test_store_writes_details_flat_into_the_error_row():
 
 
 async def test_internal_route_takes_details_and_refuses_unknown_keys():
-    import pytest
     from pydantic import ValidationError
 
     from src import internal_routes
@@ -519,3 +519,130 @@ async def test_poll_shows_the_details(monkeypatch):
     out = await _poll(_job(status="error", error=stored), monkeypatch)
     assert out["error"]["antwort_ende"] == "max_tokens"
     assert out["error"]["fehler_code"] == "antwort_abgeschnitten"
+
+
+# --- JOBENDE Runde 2: every error answer form (Codex JOBENDER) --------------------
+# Runde 1 kept the fields only for HTTP 200 + status=error. A non-2xx answer went
+# through _http_error, which read the verdict and dropped the rest, and a
+# {"error": {...}} envelope was not opened.
+
+@pytest.mark.parametrize("nested", [False, True])
+async def test_http_error_details_are_preserved(nested):
+    body = {"message": "cut", "retryable": False, **CUT}
+    if nested:
+        body = {"error": body}
+    seam = _Seam()
+    await _run("research", seam, answer=httpx.Response(422, json=body))
+    assert seam.verdict() == ("UPSTREAM_HTTP_422", False, None)
+    assert seam.mark_error.await_args.kwargs.get("details") == CUT
+
+
+@pytest.mark.parametrize("body", [
+    {"error": {"message": "bad", "code": "400", "retryable": False}},
+    {"detail": "nope"},
+    None,
+])
+async def test_http_error_without_details_has_none(body):
+    answer = (httpx.Response(400, text="plain") if body is None
+              else httpx.Response(400, json=body))
+    seam = _Seam()
+    await _run("research", seam, answer=answer)
+    assert seam.verdict()[:2] == ("UPSTREAM_HTTP_400", False)
+    assert "details" not in seam.mark_error.await_args.kwargs
+
+
+async def test_flat_field_wins_over_the_envelope_and_envelope_fills_the_rest():
+    body = {"fehler_code": "flach", "error": {"fehler_code": "innen",
+                                              "antwort_ende": "max_tokens"}}
+    seam = _Seam()
+    await _run("chat", seam, answer=httpx.Response(500, json=body))
+    assert seam.mark_error.await_args.kwargs["details"] == {
+        "fehler_code": "flach", "antwort_ende": "max_tokens"}
+
+
+async def test_status_error_answer_with_envelope_keeps_its_details():
+    seam = _Seam()
+    answer = httpx.Response(200, json={"status": "error", "retryable": False,
+                                       "error": {"message": "x", **CUT}})
+    await _run("research", seam, answer=answer)
+    assert seam.mark_error.await_args.kwargs["details"] == CUT
+
+
+async def test_dependency_patience_spent_keeps_the_details():
+    seam = _Seam(defer_count=registry.DEPENDENCY_PATIENCE["provider-config"][1])
+    answer = httpx.Response(
+        503, json={"error": {"message": "gap", "retryable": True,
+                             "session_id": "sess-1"}},
+        headers={"X-Bridge-Dependency-Unavailable": "provider-config"},
+    )
+    await _run("chat", seam, answer=answer)
+    assert seam.verdict()[:2] == ("UPSTREAM_HTTP_424", False)
+    assert seam.mark_error.await_args.kwargs["details"] == {"session_id": "sess-1"}
+
+
+def _platform_app():
+    from fastapi import FastAPI
+
+    from src import internal_routes
+    from src.api_auth import require_service_token
+
+    app = FastAPI()
+    app.include_router(internal_routes.router)
+    app.dependency_overrides[require_service_token] = lambda: None
+    return app
+
+
+@pytest.mark.parametrize("kind", ["research", "doc-agent"])
+@pytest.mark.parametrize("details", [CUT, {}])
+async def test_entire_chain_into_the_row_and_out_of_the_poll(kind, details,
+                                                             monkeypatch):
+    """Executor → runner → store_client → platform-api route (ASGI) → store row
+    → GET /v1/jobs; and the same without fields leaves the row as before."""
+    from contextlib import asynccontextmanager
+    from types import SimpleNamespace
+
+    from src.jobs import store
+
+    app = _platform_app()
+    conn = AsyncMock()
+    conn.execute.return_value = "UPDATE 1"
+
+    class _Pool:
+        @asynccontextmanager
+        async def acquire(self):
+            yield conn
+
+    async def call(method, path, json=None, timeout_s=None):
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
+            r = await c.request(method, path, json=json)
+        return SimpleNamespace(status_code=r.status_code,
+                               json=r.json() if r.content else None)
+
+    seam = _Seam()
+    # The real store_client.mark_error, taken before _run patches it.
+    seam.mark_error.side_effect = store_client.mark_error
+    answer = httpx.Response(200, json={"status": "error", "error": "original",
+                                       "retryable": True, "retry_after_s": 17,
+                                       **details})
+    with patch.object(store_client, "call_platform", call), \
+         patch.object(store, "get_pool", return_value=_Pool()):
+        await _run(kind, seam, answer=answer,
+                   executor=(executors.doc_agent_executor
+                             if kind == "doc-agent" else None))
+    row = json.loads(conn.execute.await_args.args[2])
+    expected = {"message": f"{kind} self-call returned status=error: original",
+                "code": "EXECUTOR_ERROR", "retryable": True, "retry_after_s": 17,
+                **details}
+    assert row == expected
+    out = await _poll(_job(status="error", error=row), monkeypatch)
+    assert out["error"] == expected
+
+
+@pytest.mark.parametrize("key", ["message", "code", "retryable", "retry_after_s"])
+async def test_platform_route_refuses_to_overwrite_the_base_fields(key):
+    transport = httpx.ASGITransport(app=_platform_app())
+    async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
+        r = await c.post("/v1/internal/jobs/j/error",
+                         json={"message": "m", "details": {key: "overwrite"}})
+    assert r.status_code == 422

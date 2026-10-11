@@ -124,23 +124,30 @@ def job_code_fields(code: Optional[str]) -> Dict[str, Any]:
 
 
 def job_error_details(source: Any) -> Dict[str, str]:
-    """JOB_ERROR_DETAIL_KEYS that are set, from a mapping (an endpoint's error
-    answer) or from an exception — its own attributes (e.g. fehler_code /
-    antwort_ende on a research truncation), then its `details` mapping.
-    {} when none is set; values as text."""
+    """JOB_ERROR_DETAIL_KEYS that are set, from any error answer or exception.
+
+    An answer (mapping) carries them flat ({"fehler_code": ...}) or inside the
+    bridge error envelope ({"error": {...}}); flat wins, the envelope fills
+    what is missing. An exception carries them as its own attributes (e.g.
+    fehler_code / antwort_ende on a research truncation) or in its `details`,
+    which is read like an answer. {} when none is set; values as text."""
     if source is None:
         return {}
     found: Dict[str, Any] = {}
     if isinstance(source, dict):
-        found.update(source)
+        layers = [source]
+        if isinstance(source.get("error"), dict):
+            layers.append(source["error"])
     else:
-        for key in JOB_ERROR_DETAIL_KEYS:
-            found[key] = getattr(source, key, None)
+        layers = [{key: getattr(source, key, None) for key in JOB_ERROR_DETAIL_KEYS}]
         own = getattr(source, "details", None)
         if isinstance(own, dict):
-            found.update({k: v for k, v in own.items() if v is not None})
-    return {key: str(found[key]) for key in JOB_ERROR_DETAIL_KEYS
-            if found.get(key) not in (None, "")}
+            layers.append(job_error_details(own))
+    for layer in layers:
+        for key in JOB_ERROR_DETAIL_KEYS:
+            if found.get(key) in (None, "") and layer.get(key) not in (None, ""):
+                found[key] = layer[key]
+    return {key: str(value) for key, value in found.items()}
 
 
 def job_error_fields(exc: BaseException) -> Dict[str, Any]:

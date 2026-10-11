@@ -42,9 +42,13 @@ class ExecutorHTTPError(RuntimeError):
         rejection: Optional[str] = None,
         dependency: Optional[str] = None,
         retryable: Optional[bool] = None,
+        details: Optional[Dict[str, Any]] = None,
     ):
         super().__init__(message)
         self.status_code = status_code
+        # fehler_code / antwort_ende / session_id of the endpoint's error
+        # answer (error_contract.JOB_ERROR_DETAIL_KEYS, JOBENDE).
+        self.details = details or {}
         # The endpoint's own verdict from its error envelope, when it gave one
         # (src/error_contract.py rule 1). None = derive from the status.
         self.retryable = retryable
@@ -64,9 +68,21 @@ class ExecutorHTTPError(RuntimeError):
         self.rejection = rejection
 
 
+def _response_details(response: Any) -> Dict[str, str]:
+    """JOB_ERROR_DETAIL_KEYS of a self-call's error answer, flat or in its
+    envelope; {} for a body that is no JSON."""
+    from src.error_contract import job_error_details
+
+    try:
+        return job_error_details(response.json())
+    except Exception:
+        return {}
+
+
 def _http_error(response: Any, message: str, rejection: Optional[str]) -> "ExecutorHTTPError":
     """A self-call's non-2xx answer as a job error that keeps the endpoint's
-    own verdict (retryable / retry_after_s from its envelope)."""
+    own verdict (retryable / retry_after_s from its envelope) and what it says
+    about the run (fehler_code / antwort_ende / session_id)."""
     from src.error_contract import envelope_fields
 
     try:
@@ -82,6 +98,7 @@ def _http_error(response: Any, message: str, rejection: Optional[str]) -> "Execu
         retry_after_s=retry_after,
         rejection=rejection,
         retryable=verdict.get("retryable"),
+        details=_response_details(response),
     )
 
 
@@ -133,6 +150,7 @@ def _raise_if_dependency_unavailable(response: Any, path: str) -> None:
         f"self-call {path}: dependency {dependency!r} temporarily unavailable "
         f"(HTTP {response.status_code}): {response.text[:300]}",
         dependency=dependency,
+        details=_response_details(response),
     )
 
 
