@@ -94,3 +94,51 @@ class TestCliInterface:
         content = got["stream"][0]["message"]["content"] if "stream" in got else got["argv"]
         assert isinstance(content, str)
         assert "running WITHOUT cache boundary" in caplog.text
+
+
+# --- CACHEFIX: one ttl for the whole request --------------------------------
+
+async def _sdk_options(cli, **kw):
+    got = {}
+
+    async def fake_query(prompt, options):
+        got["env"] = dict(options.env or {})
+        if not isinstance(prompt, str):
+            got["stream"] = [m async for m in prompt]
+        return
+        yield
+
+    with patch("src.claude_cli.query", side_effect=fake_query):
+        async for _ in cli.run_completion(**kw):
+            pass
+    return got
+
+
+class TestTtlPin:
+    """The API rejects a ttl='1h' cache_control block after a ttl='5m' one.
+    CLI 2.1.285 picks its own ttl per call (subscriber within limits: 1h,
+    overage/API key: 5m; env/settings override), so a fixed ttl on our block
+    clashes with one of the two. FORCE_PROMPT_CACHING_5M is the CLI's first
+    rule and wins over every other source: with it, every mark is 5m —
+    the same as our block without ttl."""
+
+    @pytest.mark.asyncio
+    async def test_boundary_pins_cli_to_5m(self, cli, mock_session_mgr):
+        prompt, at, status, system = _chain(_req(_marked_blocks()).messages)
+        got = await _sdk_options(cli, prompt=prompt, system_prompt=system,
+                                 cache_boundary=at)
+        assert got["env"].get("FORCE_PROMPT_CACHING_5M") == "1"
+        block = got["stream"][0]["message"]["content"][0]
+        # 5m, like every CLI mark
+        assert block["cache_control"] == {"type": "ephemeral"}
+
+    @pytest.mark.asyncio
+    async def test_without_boundary_cli_env_untouched(self, cli, mock_session_mgr):
+        got = await _sdk_options(cli, prompt="Human: hallo")
+        assert "FORCE_PROMPT_CACHING_5M" not in got["env"]
+
+    @pytest.mark.asyncio
+    async def test_dropped_boundary_does_not_pin(self, cli, mock_session_mgr):
+        got = await _sdk_options(cli, prompt="Human: " + STABIL, cache_boundary=10,
+                                 enable_file_discovery=True, allowed_tools=["Write"])
+        assert "FORCE_PROMPT_CACHING_5M" not in got["env"]

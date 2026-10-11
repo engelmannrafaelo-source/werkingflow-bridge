@@ -32,6 +32,27 @@ und im Antwortkopf ``X-Cache-Boundary`` — nicht still.
 
 Ohne mitgeschickte Grenze aendert sich nichts: kein Marker, ``cache_boundary=None``,
 die CLI bekommt denselben String wie bisher.
+
+EINE TTL FUER DIE GANZE ANFRAGE (CACHEFIX, 11.10.2026)
+------------------------------------------------------
+Die API verarbeitet tools, system, messages in dieser Reihenfolge und weist eine
+Anfrage mit 400 ab, wenn ein Block mit ``ttl='1h'`` nach einem mit ``ttl='5m'``
+kommt (ohne ttl = 5m). Die CLI 2.1.285 waehlt ihre ttl je Aufruf selbst
+(``H0t``/``XLt`` im Binary): ``FORCE_PROMPT_CACHING_5M`` → 5m; sonst
+``CLAUDE_CODE_PROMPT_CACHE_TTL``, Einstellung ``promptCacheTtl``,
+``ENABLE_PROMPT_CACHING_1H``; sonst Abo-Konto innerhalb der Limits mit Quelle
+``sdk`` → 1h, Overage oder API-Key → 5m. Auf den Workern (Abo) setzte sie also 1h
+an System und Umgebungsblock, unser Block ohne ttl stand als 5m davor — DBD2,
+"API Error: 400 ... ttl='1h' ... must not come after a ttl='5m'". Eine feste
+1h an unserem Block waere bei Overage/API-Key (System 5m davor) genauso falsch;
+die Bridge kennt den Overage-Zustand nicht.
+
+Darum legt die Bridge die ttl der CLI fest, nur fuer Laeufe mit Grenze:
+``FORCE_PROMPT_CACHING_5M=1`` im Prozess-Env dieses Laufs. Das ist die erste Regel
+der CLI und schlaegt jede andere Quelle (gemessen gegen eine Attrappe der
+Messages-API, auch gegen ``ENABLE_PROMPT_CACHING_1H=1`` und
+``CLAUDE_CODE_PROMPT_CACHE_TTL=1h``): alle Marken 5m, wie unser Block ohne ttl.
+Ohne Grenze bleibt das Env unberuehrt.
 """
 
 from __future__ import annotations
@@ -175,3 +196,18 @@ def cli_user_content(prompt: str, boundary: Optional[int]) -> Union[str, List[di
     if rest:
         blocks.append({"type": "text", "text": rest})
     return blocks
+
+
+# Env der CLI fuer Laeufe mit Grenze (siehe oben "EINE TTL FUER DIE GANZE ANFRAGE").
+CLI_TTL_PIN_ENV = {"FORCE_PROMPT_CACHING_5M": "1"}
+
+
+def pin_cli_cache_ttl(options: Any) -> None:
+    """Setzt die ttl aller CLI-Marken dieses Laufs auf 5m — dieselbe wie der Block
+    aus ``cli_user_content``. ``options.env`` statt ``os.environ``: parallele
+    Anfragen auf diesem Worker ohne Grenze bleiben unberuehrt."""
+    options.env = {**(getattr(options, "env", None) or {}), **CLI_TTL_PIN_ENV}
+    logger.info(
+        "cache_boundary: CLI-Cache-ttl fuer diesen Lauf auf 5m festgelegt "
+        "(FORCE_PROMPT_CACHING_5M)"
+    )

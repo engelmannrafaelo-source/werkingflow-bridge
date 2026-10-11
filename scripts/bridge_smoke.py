@@ -229,7 +229,7 @@ CAPACITY_BACKOFF_MAX_S = 30  # cap the honored Retry-After so a deploy cannot st
 # Probes that must pass through the account-capacity gate (nginx location
 # ~ ^/v1/(chat/completions|research) → pool_router.choose()). They share ONE
 # gate, so a pass on any of them proves the gate + routing are healthy.
-POOL_GATED_PROBES = {"research", "chat_completions"}
+POOL_GATED_PROBES = {"research", "chat_completions", "chat_cache_boundary"}
 
 
 # ---------------------------------------------------------------------------
@@ -484,6 +484,63 @@ def _chat(ctx: Ctx) -> ProbeResult:
     if not choices:
         return ProbeResult("chat_completions", ep, False, f"no choices in response: {str(d)[:200]}", r.status_code, ms)
     return check_target(ctx, ProbeResult("chat_completions", ep, True, "completion returned", r.status_code, ms), r)
+
+
+# CACHEFIX (11.10.2026): a chat call WITH a cache boundary (cache_control on a
+# content block). DBD2 shipped a build where every such call failed inside the
+# CLI (Messages API 400, cache_control ttl order) while chat_completions without
+# a boundary stayed green. Asserted: HTTP 200, the boundary reached the CLI
+# (X-Cache-Boundary: applied) and the answer carries real input tokens — an
+# API error inside the CLI has no usage, so a regression of the 200-with-error-
+# text path fails here too.
+CACHE_BOUNDARY_SMOKE_BODY = {
+    "model": "claude-haiku-4-5-20251001", "max_tokens": 8,
+    "messages": [{"role": "user", "content": [
+        {"type": "text", "text": "Bridge deploy smoke, stable prefix. " * 20,
+         "cache_control": {"type": "ephemeral"}},
+        {"type": "text", "text": "Reply with the single word OK."},
+    ]}],
+}
+
+
+_CACHE_BOUNDARY_REPRO = (
+    "curl -XPOST $AI_BRIDGE_URL/v1/chat/completions "
+    "-H 'Authorization: Bearer $AI_BRIDGE_API_KEY' -H 'Content-Type: application/json' "
+    + ATTRIBUTION_REPRO + "-d '" + json.dumps(CACHE_BOUNDARY_SMOKE_BODY) + "'"
+)
+
+
+@probe("chat_cache_boundary", "/v1/chat/completions", {"hetzner", "server2"},
+       repro=_CACHE_BOUNDARY_REPRO)
+def _chat_cache_boundary(ctx: Ctx) -> ProbeResult:
+    ep = "/v1/chat/completions"
+    name = "chat_cache_boundary"
+    r, ms = _timed(lambda: requests.post(
+        f"{ctx.base_url}{ep}",
+        headers=ctx.headers({"Content-Type": "application/json"}),
+        json=CACHE_BOUNDARY_SMOKE_BODY, timeout=ctx.timeout))
+
+    def fail(detail: str) -> ProbeResult:
+        return ProbeResult(name, ep, False, detail, r.status_code, ms)
+
+    if r.status_code != 200:
+        return capacity_result(name, ep, r, ms) or \
+            fail(f"HTTP {r.status_code}: {r.text[:300]}")
+    boundary = r.headers.get("X-Cache-Boundary")
+    if boundary != "applied":
+        return fail(f"X-Cache-Boundary={boundary!r}, expected 'applied'")
+    d = r.json()
+    choices = d.get("choices") or []
+    if not choices:
+        return fail(f"no choices in response: {str(d)[:200]}")
+    prompt_tokens = (d.get("usage") or {}).get("prompt_tokens") or 0
+    if prompt_tokens <= 0:
+        content = str(choices[0].get("message", {}).get("content"))[:200]
+        return fail(f"usage.prompt_tokens={prompt_tokens} — no real API answer "
+                    f"behind the 200 (content: {content!r})")
+    ok = ProbeResult(name, ep, True, f"boundary applied, prompt_tokens={prompt_tokens}",
+                     r.status_code, ms)
+    return check_target(ctx, ok, r)
 
 
 @probe("document_convert", "/v1/document/convert", {"hetzner"},

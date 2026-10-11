@@ -63,7 +63,7 @@ from src.claude_cli import (
     StreamEndedWithoutCompletion,
     RESEARCH_OUTPUT_FILENAME,
 )
-from src.middleware.bridge_error import SDKDisconnectError
+from src.middleware.bridge_error import CliApiError, SDKDisconnectError
 from src.message_adapter import MessageAdapter
 from src import cache_boundary
 from src.tool_leak_detector import hardened_system_prompt, looks_like_tool_leak
@@ -1958,6 +1958,13 @@ async def generate_streaming_response(
                         
                             yield f"data: {stream_chunk.model_dump_json()}\n\n"
                             content_sent = True
+        except CliApiError as e:
+            # API error inside the CLI (CACHEFIX): nothing sent yet → the route
+            # answers with the error's own status (event_stream_response);
+            # after the first chunk → event: error with status and cause.
+            if not role_sent:
+                raise BridgeError(e.envelope()) from e
+            sdk_stream_error = BridgeError(e.envelope())
         except Exception as e:
             sdk_stream_error = e
             logger.error(
@@ -2064,6 +2071,9 @@ async def generate_streaming_response(
                 }
             }
             yield f"event: error\ndata: {json.dumps(error_payload)}\n\n"
+        elif isinstance(sdk_stream_error, BridgeError):
+            from src.stream_start import stream_error_event
+            yield stream_error_event(sdk_stream_error)
         else:
             err_type = type(sdk_stream_error).__name__
             err_msg  = str(sdk_stream_error)[:300]
@@ -5948,6 +5958,10 @@ async def _execute_research_impl(
             session_id=session_id,
             antwort_ende=research_antwort_ende,
             fehler_code=getattr(e, "fehler_code", None),
+            # The raiser's own verdict (error_contract rule 1), e.g. CliApiError:
+            # a 400 from the API stays final, a 529 may be asked again.
+            retryable=(e.retryable
+                       if isinstance(getattr(e, "retryable", None), bool) else None),
         )
 
 

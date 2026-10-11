@@ -231,6 +231,7 @@ class RateLimitError(Exception):
 
 
 from src.middleware.bridge_error import SDKDisconnectError  # noqa: F401 (re-exported)
+from src.middleware.bridge_error import CliApiError
 
 import re as _re
 _QUOTA_EXHAUSTION_RE = _re.compile(
@@ -421,6 +422,69 @@ def detect_account_limit(message: Any) -> Optional[str]:
     if cli_error in ACCOUNT_LIMIT_CLI_ERRORS:
         return f"cli_error:{cli_error}"
     return None
+
+
+# =============================================================================
+# API ERROR IN THE CLI'S OWN ANSWER (CACHEFIX, 11.10.2026)
+#
+# Any other error the Messages API answers (400 invalid request, 5xx, 529, no
+# response) ends the CLI run the same way as a limit: a synthetic assistant
+# turn "API Error: <status> <message>" flagged `is_api_error_message`, then a
+# "success" result flagged `is_error` with `api_error_status` and
+# terminal_reason "api_error" (CLI 2.1.285 against a Messages-API stand-in).
+# Before this the bridge passed the sentence on as a 200 answer (DBD2).
+# The flags are the signal, never the text. Limits and org-disabled keep their
+# own paths (checked first); the output limit (`max_output_tokens`) keeps the
+# antwort_ende path (BRTRUNC).
+# =============================================================================
+
+
+def detect_cli_api_error(message: Any) -> Optional[Dict[str, Any]]:
+    """{status, cli_error, text} if `message` is the CLI's API-error turn or
+    its API-error result, else None."""
+    if message is None or is_user_turn(message):
+        return None
+    if isinstance(message, dict):
+        def get(key):
+            return message.get(key)
+        is_result = is_result_chunk(message)
+        is_turn = (message.get("type") == "assistant"
+                   and get("is_api_error_message") is True)
+        cli_error = get("error") if is_turn else get("cli_error")
+        text = get("result") if is_result else _message_text(message)
+    else:
+        def get(key):
+            return getattr(message, f"_bridge_{key}", None)
+        is_result = type(message).__name__ == "ResultMessage"
+        is_turn = not is_result and get("is_api_error_message") is True
+        cli_error = get("cli_error")
+        text = getattr(message, "result", None) if is_result else _message_text(message)
+    if CLI_OUTPUT_LIMIT_ERROR in (cli_error, get("api_error")):
+        return None
+    if is_turn:
+        return {"status": None, "cli_error": cli_error, "text": text or ""}
+    if is_result:
+        status = get("api_error_status")
+        if isinstance(status, int) or get("terminal_reason") == "api_error":
+            return {"status": status if isinstance(status, int) else None,
+                    "cli_error": None, "text": text or ""}
+    return None
+
+
+def raise_cli_api_error(worker_id: str, turn: Optional[Dict[str, Any]],
+                        result: Optional[Dict[str, Any]]) -> None:
+    """Log loudly and raise CliApiError from the withheld turn and/or result."""
+    status = (result or {}).get("status")
+    cli_error = (turn or {}).get("cli_error")
+    text = (turn or {}).get("text") or (result or {}).get("text") or ""
+    logger.error(
+        f"🛑 API error inside the CLI on worker {worker_id}: status={status} "
+        f"cli_error={cli_error} — answer withheld, raising CliApiError. "
+        f"CLI text: {text[:300]!r}",
+        extra={"cli_api_error": True, "worker_id": worker_id,
+               "upstream_status": status},
+    )
+    raise CliApiError(status, cli_error, text, worker_id)
 
 
 def handle_account_limit(worker_id: str, signal: str, message: Any) -> None:
@@ -1018,6 +1082,9 @@ _CLI_END_CARRIERS = (
     ("_bridge_cli_error", "cli_error"),
     ("_bridge_stop_reason", "stop_reason"),
     ("_bridge_api_error", "api_error"),
+    ("_bridge_is_api_error_message", "is_api_error_message"),
+    ("_bridge_api_error_status", "api_error_status"),
+    ("_bridge_terminal_reason", "terminal_reason"),
 )
 
 
@@ -2113,8 +2180,10 @@ class ClaudeCodeCLI:
                     cache_boundary = None
                 # CACHE2: mit Grenze zwei Textbloecke (Praefix mit cache_control),
                 # sonst der unveraenderte String — src/cache_boundary.py.
-                from src.cache_boundary import cli_user_content
+                from src.cache_boundary import cli_user_content, pin_cli_cache_ttl
                 _user_content = cli_user_content(prompt, cache_boundary)
+                if cache_boundary is not None:
+                    pin_cli_cache_ttl(options)
 
                 async def _prompt_to_stream(prompt_text: str):
                     """Convert string prompt to AsyncIterable for streaming mode (stdin)."""
@@ -2160,6 +2229,7 @@ class ClaudeCodeCLI:
                 # === END LARGE USER PROMPT HANDLING ===
 
                 fortsetzung_ausstehend = False
+                _api_error_turn: Optional[Dict[str, Any]] = None
                 try:
                     async with asyncio.timeout(self.timeout):
                         async for message in query(prompt=prompt_source, options=options):
@@ -2196,6 +2266,21 @@ class ClaudeCodeCLI:
                                 handle_account_limit(
                                     os.environ.get("INSTANCE_NAME", "unknown"), _limit_signal, message
                                 )
+
+                            # Any other API error: the CLI answers with a
+                            # flagged turn, then a result carrying the status.
+                            # Never yield the turn — raise at the result (or
+                            # at the end of the stream, see below).
+                            _api_error = detect_cli_api_error(message)
+                            if _api_error is not None:
+                                if (type(message).__name__ == 'ResultMessage'
+                                        or is_result_chunk(message)):
+                                    raise_cli_api_error(
+                                        os.environ.get("INSTANCE_NAME", "unknown"),
+                                        _api_error_turn, _api_error,
+                                    )
+                                _api_error_turn = _api_error
+                                continue
 
                             # Completion-marker detection MUST happen on the
                             # dataclass, BEFORE the attribute->dict conversion
@@ -2401,6 +2486,13 @@ class ClaudeCodeCLI:
                         # Continue to post-processing below (file discovery, completion check, etc.)
                     else:
                         raise  # Re-raise genuine parse errors to outer handler
+
+                if _api_error_turn is not None:
+                    # Flagged turn, but the stream ended without a result.
+                    raise_cli_api_error(
+                        os.environ.get("INSTANCE_NAME", "unknown"),
+                        _api_error_turn, None,
+                    )
 
                 # Post-streaming validation: Check for completion marker
                 if not response_complete and chunks_received > 0:
@@ -2710,6 +2802,12 @@ class ClaudeCodeCLI:
             # Already logged + locked in handle_org_subscription_disabled. Must
             # bypass the generic classifier/cache-recovery below, which would
             # otherwise re-yield the cached block sentence as content.
+            cli_session_manager.complete_session(cli_session_id, status="failed")
+            raise
+
+        except CliApiError:
+            # Raised on purpose above (API error inside the CLI). The generic
+            # branch below would re-yield the cache or turn it into a chunk.
             cli_session_manager.complete_session(cli_session_id, status="failed")
             raise
 

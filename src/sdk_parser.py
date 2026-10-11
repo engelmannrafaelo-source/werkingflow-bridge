@@ -41,6 +41,10 @@ def _retain_cli_end_fields(parsed: Any, data: dict[str, Any]) -> None:
     if data.get("type") == "assistant":
         if data.get("error"):
             kept["_bridge_cli_error"] = data["error"]
+        # CACHEFIX: the CLI's flag for a turn that wraps an API error
+        # (internal AssistantMessage.isApiErrorMessage, CLI 2.1.285).
+        if data.get("is_api_error_message") is True:
+            kept["_bridge_is_api_error_message"] = True
         message = data.get("message")
         if isinstance(message, dict) and "stop_reason" in message:
             kept["_bridge_stop_reason"] = message["stop_reason"]
@@ -49,6 +53,10 @@ def _retain_cli_end_fields(parsed: Any, data: dict[str, Any]) -> None:
             kept["_bridge_stop_reason"] = data["stop_reason"]
         if data.get("api_error"):
             kept["_bridge_api_error"] = data["api_error"]
+        if isinstance(data.get("api_error_status"), int):
+            kept["_bridge_api_error_status"] = data["api_error_status"]
+        if data.get("terminal_reason"):
+            kept["_bridge_terminal_reason"] = data["terminal_reason"]
     for name, value in kept.items():
         try:
             setattr(parsed, name, value)

@@ -680,6 +680,64 @@ class UpstreamResponseUnreadable(ClassifiedError):
             REASON_VISION_RESPONSE_UNREADABLE, self.provider, str(self)[:300])
 
 
+class CliApiError(ClassifiedError):
+    """The Messages API answered the CLI with an error (CACHEFIX, 11.10.2026).
+
+    The CLI does not fail on it: it writes "API Error: <status> <message>" as
+    a synthetic assistant turn flagged ``is_api_error_message`` and ends the
+    run with a "success" result flagged ``is_error`` + ``api_error_status``
+    (CLI 2.1.285, measured against a Messages-API stand-in). Before this the
+    bridge passed that sentence on as a 200 answer (DBD2: a cache_control ttl
+    400 arrived as content). Raised by run_completion; the status decides:
+
+      * 401/403  → 424: the API refused the bridge's credentials, not the caller's.
+      * transient (408/425/429/5xx/529) or no status (no response) → 429
+        retryable, the worker contract for "come back later".
+      * any other 4xx → that status, not retryable: the identical request
+        fails again, and nginx must not try it on every worker.
+    """
+
+    def __init__(self, status: Optional[int], cli_error: Optional[str], text: str,
+                 worker_id: str) -> None:
+        super().__init__(f"API error {status if status is not None else '(no status)'} "
+                         f"from the Messages API inside the CLI: {text}")
+        self.status = status
+        self.cli_error = cli_error
+        self.text = text
+        self.worker_id = worker_id
+        self.retryable = self._transient()
+
+    def _transient(self) -> bool:
+        s = self.status
+        return s is None or s >= 500 or is_retryable_status(s)
+
+    def envelope(self) -> JSONResponse:
+        extra = {"upstream_status": self.status, "cli_error": self.cli_error}
+        detail = f"HTTP {self.status}: {self.text[:300]}"
+        if self.status in (401, 403):
+            return bridge_error(
+                source=SOURCE_UPSTREAM_ANTHROPIC, error_type=TYPE_UPSTREAM_ERROR,
+                reason=REASON_UPSTREAM_REJECTED,
+                message=("Anthropic rejected the worker's credentials "
+                         f"(not retryable): {detail}"),
+                status_code=424, retryable_override=False, extra=extra,
+            )
+        if self._transient():
+            return bridge_error(
+                source=SOURCE_UPSTREAM_ANTHROPIC, error_type=TYPE_UPSTREAM_ERROR,
+                reason=REASON_UPSTREAM_ANTHROPIC_ERROR,
+                message=f"Upstream Anthropic error inside the CLI: {detail}",
+                status_code=429, retry_after_s=30, retryable_override=True, extra=extra,
+            )
+        return bridge_error(
+            source=SOURCE_UPSTREAM_ANTHROPIC, error_type=TYPE_UPSTREAM_ERROR,
+            reason=(REASON_INVALID_REQUEST if self.status == 400
+                    else REASON_UPSTREAM_REJECTED),
+            message=f"Anthropic rejected the request (not retryable): {detail}",
+            status_code=self.status, retryable_override=False, extra=extra,
+        )
+
+
 class SDKDisconnectError(Exception):
     """
     Raised when claude_code_sdk exits with 0 chunks (CLI died before producing
