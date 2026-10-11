@@ -450,6 +450,13 @@ class SessionListResponse(BaseModel):
 # ============================================================================
 
 class ResearchRequest(BaseModel):
+    research_instructions: Optional[str] = Field(
+        default=None, min_length=1, pattern=r"\S", strict=True,
+        description=("Complete caller-owned research policy, format and source rules. "
+                     "Replaces legacy editorial prompts and disables Bridge editorial review. "
+                     "The app owns review and follow-up calls. Omit for legacy compatibility."),
+    )
+
     """
     Request model for dedicated /v1/research endpoint.
 

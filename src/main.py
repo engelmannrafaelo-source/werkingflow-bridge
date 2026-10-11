@@ -106,6 +106,7 @@ from src.jobs.executors import (
     erkunder_executor,
 )
 from src.stream_start import event_stream_response  # noqa: E402
+from src.research_instructions import caller_instructions
 from src.parameter_validator import ParameterValidator, CompatibilityReporter
 from src.model_registry import (
     get_models_for_api,
@@ -5247,7 +5248,7 @@ async def _execute_research_impl(
         # Default aus → bestehende Caller unverändert.
         try:
             from src.scholarly import scholarly_enabled, build_oa_context
-            if scholarly_enabled(getattr(request_body, "research_mode", None)):
+            if caller_instructions(request_body) is None and scholarly_enabled(getattr(request_body, "research_mode", None)):
                 oa_block = await build_oa_context(
                     request_body.query, attribution=attribution_ctx, model=request_body.model
                 )
@@ -5292,6 +5293,7 @@ async def _execute_research_impl(
                 library_append_prompt = build_pool_library_catalogue(
                     _library_index,
                     dir_name=LIBRARY_WORKDIR_NAME,
+                    research_instructions=caller_instructions(request_body),
                     unavailable_ids=set(_mirror.missing_ids),
                 )
                 if not library_append_prompt:
@@ -5369,22 +5371,28 @@ async def _execute_research_impl(
                 lambda text: anonymize_query_for_cloud(request, text),
                 None,
                 ResearchCloudConfig().perplexity_max_uses,
+                research_instructions=caller_instructions(request_body),
             )
             # fetch_document kommt mit Perplexity: Perplexity findet das
             # Datenblatt, fetch_document liest es (WebFetch lieferte aus einem
             # PDF mit Textebene nichts Lesbares, Dev 02.10.2026).
-            pool_doc = PoolDocumentTool(ResearchCloudConfig().fetch_document_max_uses)
+            pool_doc = PoolDocumentTool(
+                ResearchCloudConfig().fetch_document_max_uses,
+                research_instructions=caller_instructions(request_body),
+            )
             pool_sdk_mcp_servers = {
                 MCP_SERVER_NAME: pool_pplx.server(),
                 DOC_MCP_SERVER_NAME: pool_doc.server(),
             }
-            library_append_prompt = (library_append_prompt or "") + POOL_PROMPT_SECTION
+            if caller_instructions(request_body) is None:
+                library_append_prompt = (library_append_prompt or "") + POOL_PROMPT_SECTION
 
         # Lücken-Nachkontrolle (Rafael 03.10.2026): eigene Flagge, Vorgabe wie
         # Perplexity. Falsch gesetzt -> Lauf wird nicht gestartet.
         from src.research_cloud.luecken import LueckenKonfigFehler, nachkontrolle_aktiv
         try:
-            luecken_an = nachkontrolle_aktiv(perplexity_enabled(_pplx_cfg))
+            luecken_an = (caller_instructions(request_body) is None
+                          and nachkontrolle_aktiv(perplexity_enabled(_pplx_cfg)))
         except LueckenKonfigFehler as _lk_err:
             logger.error(f"research: Lücken-Nachkontrolle falsch konfiguriert, Lauf wird nicht gestartet: {_lk_err}")
             return ResearchResponse(
@@ -5411,6 +5419,7 @@ async def _execute_research_impl(
             allowed_tools=None,
             disallowed_tools=list(RESEARCH_TEXT_CONTRACT_DISALLOWED_TOOLS) if antwort_im_text else None,
             antwort_im_text=antwort_im_text,
+            research_instructions=caller_instructions(request_body),
             stream=True,
             enable_file_discovery=True,
             backend_env_vars=backend_config.env_vars if backend_config else None,
@@ -6006,6 +6015,11 @@ async def _execute_research_cloud_impl(
 
     try:
         anonymized_query = await anonymize_query_for_cloud(request, request_body.query)
+        instructions = caller_instructions(request_body)
+        anonymized_instructions = (
+            await anonymize_query_for_cloud(request, instructions)
+            if instructions is not None else None
+        )
     except CloudAnonymizeError as e:
         logger.error(f"research-cloud: anonymize gate refused the call: {e}")
         return ResearchResponse(
@@ -6023,7 +6037,7 @@ async def _execute_research_cloud_impl(
     prompt = anonymized_query
     try:
         from src.scholarly import scholarly_enabled, build_oa_context
-        if scholarly_enabled(getattr(request_body, "research_mode", None)):
+        if caller_instructions(request_body) is None and scholarly_enabled(getattr(request_body, "research_mode", None)):
             oa_block = await build_oa_context(
                 anonymized_query, attribution=attribution_ctx, model=request_body.model
             )
@@ -6059,6 +6073,7 @@ async def _execute_research_cloud_impl(
         request_body.depth,
         library_index=library_index,
         perplexity=perplexity_enabled(perplexity_cfg),
+        research_instructions=anonymized_instructions,
     )
     search_max_uses, fetch_max_uses = search_budget_for_depth(request_body.depth)
     config = ResearchCloudConfig(web_search_max_uses=search_max_uses, web_fetch_max_uses=fetch_max_uses)
@@ -6073,7 +6088,7 @@ async def _execute_research_cloud_impl(
     )
     nachkontrolle = None
     try:
-        if nachkontrolle_aktiv(perplexity_enabled(perplexity_cfg)):
+        if caller_instructions(request_body) is None and nachkontrolle_aktiv(perplexity_enabled(perplexity_cfg)):
             # Same key as the executor; without it the executor itself refuses
             # the run before the checker could ever be asked.
             nachkontrolle = Nachkontrolle(
@@ -6101,6 +6116,7 @@ async def _execute_research_cloud_impl(
             # the prompt above before it leaves for the third party.
             anonymize=lambda text: anonymize_query_for_cloud(request, text),
             nachkontrolle=nachkontrolle,
+            research_instructions=anonymized_instructions,
         )
     except ResearchCloudExecutorError as e:
         execution_time = time.time() - start_time

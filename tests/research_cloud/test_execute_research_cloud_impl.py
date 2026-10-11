@@ -335,3 +335,39 @@ async def test_perplexity_wiring_gate_prompt_and_cost(monkeypatch):
     assert booked["extra_cost_usd"] == 0.15
     assert booked["provider_meta"]["perplexity_calls"] == 3
     assert set(result.model_dump().keys()) == set(ResearchResponse.model_fields.keys())
+
+
+@pytest.mark.asyncio
+async def test_caller_policy_replaces_legacy_and_passes_privacy_gate():
+    req = _make_req(research_instructions="App instruction", research_mode="academic")
+    with (
+        patch("src.research_cloud.anonymize_gate.anonymize_query_for_cloud",
+              new=AsyncMock(side_effect=["safe query", "safe instruction"])) as gate,
+        patch("src.research_cloud.executor.run_research_cloud",
+              new=AsyncMock(return_value=_cloud_result())) as executor,
+        patch("src.activity.ai_call_writer.persist_ai_call_activity", new=AsyncMock()),
+        patch("src.research_cloud.library.load_library_for_run", new=AsyncMock(return_value=None)),
+        patch("src.research_cloud.luecken.nachkontrolle_aktiv",
+              side_effect=AssertionError("legacy review entered")),
+        patch("src.scholarly.build_oa_context", new=AsyncMock()) as scholarly,
+    ):
+        result = await src.main._execute_research_cloud_impl(MagicMock(), req, attribution_ctx={})
+    assert result.status == "success"
+    assert gate.await_count == 2
+    assert executor.await_args.args == ("safe query", "safe instruction")
+    assert executor.await_args.kwargs["nachkontrolle"] is None
+    assert executor.await_args.kwargs["research_instructions"] == "safe instruction"
+    scholarly.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_caller_policy_privacy_failure_prevents_executor():
+    req = _make_req(research_instructions="App instruction")
+    with (
+        patch("src.research_cloud.anonymize_gate.anonymize_query_for_cloud",
+              new=AsyncMock(side_effect=["safe query", CloudAnonymizeError("refused")])),
+        patch("src.research_cloud.executor.run_research_cloud", new=AsyncMock()) as executor,
+    ):
+        result = await src.main._execute_research_cloud_impl(MagicMock(), req, attribution_ctx={})
+    assert result.status == "error"
+    executor.assert_not_awaited()

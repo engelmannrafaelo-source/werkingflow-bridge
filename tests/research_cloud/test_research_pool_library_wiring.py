@@ -193,3 +193,20 @@ async def test_kaputter_index_startet_den_lauf_gar_nicht(spy_cli, no_persist):
 
     assert result.status == "error"
     spy.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_caller_policy_reaches_pool_and_skips_legacy_review(spy_cli, no_persist):
+    _, captured = spy_cli
+    req = _make_req(research_instructions="Only the caller format", research_mode="academic")
+    with (
+        patch("src.research_cloud.library.load_library_for_run", new=AsyncMock(return_value=None)),
+        patch("src.research_cloud.luecken.nachkontrolle_aktiv",
+              side_effect=AssertionError("legacy review entered")),
+        patch("src.scholarly.build_oa_context", new=AsyncMock()) as scholarly,
+    ):
+        result = await src.main._execute_research_impl(req, None)
+    assert result.status == "success"
+    assert captured["research_instructions"] == "Only the caller format"
+    assert captured["append_system_prompt"] is None
+    scholarly.assert_not_awaited()

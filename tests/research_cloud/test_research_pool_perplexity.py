@@ -276,3 +276,16 @@ async def test_flag_on_without_anonymizer_service_refuses(spy_cli, persist, pplx
     result = await src.main._execute_research_impl(_make_req(), None, request=MagicMock())
     assert result.status == "error" and "BRIDGE_ANONYMIZE_ENABLED" in result.error
     spy.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_caller_policy_with_tools_has_no_legacy_appendix(spy_cli, persist, pplx_on):
+    _, captured, _ = spy_cli
+    req = _make_req(research_instructions="Caller rules")
+    with patch("src.research_cloud.luecken.nachkontrolle_aktiv",
+               side_effect=AssertionError("legacy review entered")):
+        result = await src.main._execute_research_impl(req, None, request=MagicMock())
+    assert result.status == "success"
+    assert captured["research_instructions"] == "Caller rules"
+    assert captured["sdk_mcp_servers"]
+    assert not captured["append_system_prompt"]
