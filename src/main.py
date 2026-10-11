@@ -540,6 +540,11 @@ async def lifespan(app: FastAPI):
     )
     logger.info("✅ Config integrity OK — declared DB-backed features have a database")
 
+    # Agentic run (CX0): composed only from the server's own configuration;
+    # without it the mode answers 422 faehigkeit_nicht_verfuegbar.
+    from src.agentischer_lauf.zulassung import verdrahte_aus_konfiguration
+    verdrahte_aus_konfiguration()
+
     # Validate authentication first
     auth_valid, auth_info = validate_claude_code_auth()
     
