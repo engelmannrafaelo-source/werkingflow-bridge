@@ -281,7 +281,8 @@ async def test_flag_on_without_anonymizer_service_refuses(spy_cli, persist, pplx
 @pytest.mark.asyncio
 async def test_caller_policy_with_tools_has_no_legacy_appendix(spy_cli, persist, pplx_on):
     _, captured, _ = spy_cli
-    req = _make_req(research_instructions="Caller rules")
+    req = _make_req()
+    req.research_instructions = "Caller rules"
     with patch("src.research_cloud.luecken.nachkontrolle_aktiv",
                side_effect=AssertionError("legacy review entered")):
         result = await src.main._execute_research_impl(req, None, request=MagicMock())
