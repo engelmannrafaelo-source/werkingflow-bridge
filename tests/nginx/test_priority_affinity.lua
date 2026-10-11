@@ -19,14 +19,18 @@ local function check(cond, msg)
     end
 end
 
-package.loaded["cjson.safe"] = { decode = function() return nil end, encode = function() return "{}" end }
+local STATE
+package.loaded["cjson.safe"] = { decode = function() return STATE end, encode = function() return "{}" end }
 package.loaded["resty.http"] = {}
 
 local logs, store, resp_headers
 
--- var: request variables; returns the router module with a fresh stub ngx
-local function router(var)
+-- var: request variables; state: pool state (optional); stale: state too old
+-- returns the router module with a fresh stub ngx
+local function router(var, state, stale)
     logs, store, resp_headers = {}, {}, {}
+    STATE = state
+    if state then store.state = "x"; store.ts = stale and "-100" or "0" end
     ngx = {
         now = function() return 0 end, INFO = 0, WARN = 1, ERR = 2,
         log = function(lvl, ...) logs[#logs + 1] = { lvl, table.concat({ ... }) } end,
@@ -128,6 +132,104 @@ do
     local M = router(var)
     M.priority_pool_header_filter("peer")
     check(resp_headers["X-Cache-Affinity"] == nil and #logs == 0, "peer without key → nothing")
+end
+
+-- ---------------------------------------------------------------------------
+-- Mode "affinity" (CACHE2N B1b, prepared; generator PRIORITY_AFFINITY=1)
+-- ---------------------------------------------------------------------------
+print("priority_pool: mode affinity (prepared, production only)")
+local pp = require("pool_pick")
+local function acct(worker, opts)
+    opts = opts or {}
+    return { worker = worker, available = (opts.available ~= false), cooldown_remaining_s = 0,
+             effective_cap_tokens = opts.cap or 400000, current_in_flight_tokens = 0,
+             weekly_percent = opts.weekly or 20, usage_known = true }
+end
+local function pool(over)
+    local a = { engelmann = acct("worker1"), office = acct("worker2"),
+                gmail = acct("worker3"), werking = acct("worker4") }
+    for k, v in pairs(over or {}) do a[k] = v end
+    return a
+end
+local function key_for(accounts, want)
+    for i = 1, 10000 do
+        local k = "job-" .. i
+        if (pp.preferred_account(accounts, k)) == want then return k end
+    end
+    error("no key for " .. want)
+end
+local function pvar(key)
+    return { http_x_cache_affinity_key = key, x_cache_affinity = "",
+             affinity_upstream = "claude_production", request_length = "100" }
+end
+
+do
+    local st = { accounts = pool() }
+    local var = pvar(key_for(st.accounts, "werking"))
+    local M = router(var, st)
+    M.priority_pool("affinity")
+    check(var.affinity_upstream == "claude_workers_affin_worker4",
+          "hit → preferred worker's group, got " .. tostring(var.affinity_upstream))
+    check(var.x_cache_affinity == "hit" and store.affinity_hit == 1, "hit → header hit, counted")
+    check(var.target_worker == nil, "priority pool sets no target_worker (no gate)")
+end
+
+do
+    local st = { accounts = pool({ werking = acct("worker4", { cap = 100 }) }) }
+    local var = pvar(key_for(st.accounts, "werking"))
+    local M = router(var, st)
+    M.priority_pool("affinity")
+    check(var.affinity_upstream == "claude_production", "no capacity → claude_production unchanged")
+    check(var.x_cache_affinity == "fallback:no_capacity", "no capacity → header carries the reason")
+    check(logged(1, "AFFINITY LOST") and logged(1, "priority pool"), "fallback logged at WARN")
+end
+
+do  -- weekly wall and unavailable are guards too, never overridden by the key
+    for _, case in ipairs({ { { weekly = 97 }, "fallback:weekly_wall" },
+                            { { available = false }, "fallback:unavailable" } }) do
+        local st = { accounts = pool({ werking = acct("worker4", case[1]) }) }
+        local var = pvar(key_for(st.accounts, "werking"))
+        local M = router(var, st)
+        M.priority_pool("affinity")
+        check(var.affinity_upstream == "claude_production" and var.x_cache_affinity == case[2],
+              "guard " .. case[2] .. " → old pool, got " .. tostring(var.x_cache_affinity))
+    end
+end
+
+do  -- whole pool exhausted: the priority pool must NOT start rejecting
+    local st = { accounts = pool({ engelmann = acct("worker1", { available = false }),
+                                   office = acct("worker2", { available = false }),
+                                   gmail = acct("worker3", { available = false }),
+                                   werking = acct("worker4", { available = false }) }) }
+    local var = pvar("job-1")
+    local M = router(var, st)
+    M.priority_pool("affinity")
+    check(var.affinity_upstream == "claude_production" and var.target_worker == nil,
+          "exhausted pool → claude_production with its dev-bridge overflow, no reject")
+end
+
+do
+    local var = pvar("job-1")
+    local M = router(var, { accounts = pool() }, true)
+    M.priority_pool("affinity")
+    check(var.x_cache_affinity == "fallback:state_stale" and var.affinity_upstream == "claude_production",
+          "stale state → fallback:state_stale, old pool")
+end
+
+do
+    local var = pvar(nil)
+    local M = router(var, { accounts = pool() })
+    M.priority_pool("affinity")
+    check(var.x_cache_affinity == "" and var.affinity_upstream == "claude_production" and #logs == 0,
+          "no key → nothing changes, nothing logged")
+end
+
+do
+    local var = pvar(string.rep("k", 300))
+    local M = router(var, { accounts = pool() })
+    M.priority_pool("affinity")
+    check(var.x_cache_affinity == "fallback:key_too_long" and var.affinity_upstream == "claude_production",
+          "overlong key → fallback, old pool")
 end
 
 print(string.format("priority_affinity: %d checks, %d failures", checks, failures))

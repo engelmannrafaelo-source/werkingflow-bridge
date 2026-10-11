@@ -335,6 +335,15 @@ local M = {}
 --   bypass (production) claude_production is the LOCAL prod workers, plain
 --                       round-robin, no Lua pick → the key cannot take effect.
 --                       That is stated: bypass:priority_pool + WARN + counter.
+--   affinity (production, PREPARED — only with PRIORITY_AFFINITY=1 in the
+--                       generator, Rafael decides): the preferred account of the
+--                       key, if it passes the unchanged account_rejection guards,
+--                       gets the request via claude_workers_affin_<worker> (on
+--                       production the same servers as claude_production, other
+--                       workers + dev bridge as backup). Everything else keeps
+--                       claude_production exactly as before — this mode never
+--                       rejects, never 429s, never removes the dev-bridge
+--                       overflow; the priority pool stays ungated.
 -- Without the header nothing changes on either path.
 -- ---------------------------------------------------------------------------
 local BYPASS_PRIORITY_POOL = "bypass:priority_pool"
@@ -573,13 +582,53 @@ function M.choose(opts)
             " state_age_s=", string.format("%.1f", age))
 end
 
--- Access phase of @production_streaming / @production_jobs. Never rejects and
--- never changes the upstream: the priority pool keeps its own capacity and
--- overflow rules (no Lua gate, dev bridge as backup on production).
+-- Mode "affinity": the preferred account of the key, or the reason it is not
+-- taken. Reads the same cached pool state as choose(); never decides
+-- availability of the pool itself (no "unavailable", no gate).
+-- Returns status ("hit" | "fallback:<reason>"), worker (on hit), preferred account.
+local function priority_affinity_pick(key)
+    local vp = ngx.var.http_x_vision_provider
+    if vp and vp:lower() == "gemini" then return "fallback:gemini_vision_bypass" end
+    local state_str = shared:get("state")
+    local age       = ngx.now() - (tonumber(shared:get("ts")) or 0)
+    if not state_str or age > STALE_THRESHOLD_S then return "fallback:state_stale" end
+    local ok_d, data = pcall(cjson.decode, state_str)
+    if not ok_d or type(data) ~= "table" or type(data.accounts) ~= "table" then
+        return "fallback:state_invalid"
+    end
+    if next(data.accounts) == nil then return "fallback:no_accounts" end
+    local req_len    = tonumber(ngx.var.request_length) or 1000
+    local est_tokens = math.max(500, math.floor(req_len / 4))
+    local _, worker, _, _, _, _, affinity, preferred =
+        pool_pick.pick_with_affinity(data.accounts, est_tokens, key, nil, worker_ok)
+    if affinity == "hit" and worker then return "hit", worker, preferred end
+    return affinity or "fallback:no_eligible", nil, preferred
+end
+
+-- Access phase of @production_streaming / @production_jobs. Never rejects: the
+-- priority pool keeps its own capacity and overflow rules (no Lua gate, dev
+-- bridge as backup on production). Only mode "affinity" changes the upstream,
+-- and only on a hit.
 function M.priority_pool(mode)
     local key, problem = read_affinity_key()
     if key == nil and problem == nil then return end
     if mode == "peer" then return end          -- decided by the peer; see header filter
+    if mode == "affinity" then
+        if problem then
+            affinity_fallback(nil, problem, "(priority pool)")
+            return
+        end
+        local status, worker, preferred = priority_affinity_pick(key)
+        if status == "hit" and set_affinity_vars("hit", AFFINITY_UPSTREAM_PREFIX .. worker) then
+            shared:incr("affinity_hit", 1, 0)
+            ngx.log(ngx.INFO, "pool_router.priority_pool: affinity hit worker=", worker,
+                    " account=", tostring(preferred))
+            return
+        end
+        if status == "hit" then status = "fallback:vars_undeclared" end
+        affinity_fallback(key, status, "preferred=" .. tostring(preferred) .. " (priority pool)")
+        return
+    end
     if mode ~= "bypass" then
         ngx.log(ngx.ERR, "pool_router.priority_pool: unknown $priority_pool_affinity '",
                 tostring(mode), "' — treating as bypass. Regenerate the upstreams include.")

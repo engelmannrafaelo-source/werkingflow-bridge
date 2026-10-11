@@ -44,7 +44,9 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-OUT_DIR="${ROOT}/docker"
+# UPSTREAMS_OUT_DIR: tests render a variant elsewhere (test_cache_affinity_e2e.sh);
+# the committed files are always generated into docker/.
+OUT_DIR="${UPSTREAMS_OUT_DIR:-${ROOT}/docker}"
 
 PRIMARY_WORKERS=(worker1 worker2 worker3 worker4)
 PROD_WORKERS=(worker-sahori worker-kurt worker-coach worker-erk)
@@ -190,12 +192,30 @@ emit_affinity_upstreams() {
 #                         the account pick: the key cannot take effect; every
 #                         such request answers X-Cache-Affinity:
 #                         bypass:priority_pool and logs a WARN.
+#   production -> affinity  PREPARED, NOT ACTIVE: only with PRIORITY_AFFINITY=1.
+#                         The key then takes effect on the priority pool too
+#                         (pool_router.priority_pool, no gate, no reject). It
+#                         changes how customer traffic is spread over the prod
+#                         accounts — switching it on is Rafael's call and means:
+#                         PRIORITY_AFFINITY=1 scripts/generate-bridge-upstreams.sh
+#                         production, commit docker/upstreams-prod.conf, deploy
+#                         the prod LB. On primary the flag has no effect (peer).
+#                         It reuses claude_workers_affin_<worker>: on production
+#                         those groups hold exactly the servers of
+#                         claude_production (both local-first, see generate()).
 # $1 = topology id
 emit_priority_pool_affinity() {
     local mode
     case "$1" in
         primary)    mode="peer" ;;
-        production) mode="bypass" ;;
+        production)
+            mode="bypass"
+            case "${PRIORITY_AFFINITY:-0}" in
+                1) mode="affinity" ;;
+                0) ;;
+                *) echo "ERROR: PRIORITY_AFFINITY must be 0 or 1, got '${PRIORITY_AFFINITY}'" >&2; return 1 ;;
+            esac
+            ;;
         *) echo "ERROR: emit_priority_pool_affinity: unknown topology '$1'" >&2; return 1 ;;
     esac
     echo "# Account affinity on the X-Priority pool (CACHE2N) — see"

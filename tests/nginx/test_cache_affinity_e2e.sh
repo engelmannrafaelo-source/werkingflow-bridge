@@ -70,8 +70,8 @@ for n, w in zip(["engelmann", "office", "gmail", "werking"], WORKERS):
     ACC[n] = {"worker": w, "available": True, "cooldown_remaining_s": 0,
               "effective_cap_tokens": 400000, "current_in_flight_tokens": 0,
               "weekly_percent": 20.0, "usage_known": True}
-if TIGHT:
-    ACC[TIGHT]["effective_cap_tokens"] = 100
+for t in (list(ACC) if TIGHT == "all" else [TIGHT] if TIGHT else []):
+    ACC[t]["effective_cap_tokens"] = 100
 class H(BaseHTTPRequestHandler):
     def do_GET(self):
         body = json.dumps({"ts": 0, "accounts": ACC}).encode()
@@ -89,13 +89,20 @@ docker build -q -f "$D/Dockerfile.nginx-lb" -t $IMG "$REPO" >/dev/null || { echo
 
 PROD_WORKERS="worker-sahori,worker-kurt,worker-coach,worker-erk"
 
-render() { # $1 = primary (default) | prod
+render() { # $1 = primary (default) | prod | prod-affinity
     sed "s/\${BRIDGE_ID}/test/g; s/\${BRIDGE_BACKUP_HOST}/192.0.2.10/g; s/\${METRICS_READER_TARGET}/metrics-elsewhere:8000/g" \
         "$D/nginx.conf" > "$WORK/nginx.conf"
-    if [ "${1:-primary}" = prod ]; then
-        # the prod include, with its worker-host targets pointed at the stub workers
+    if [ "${1:-primary}" = prod ] || [ "${1:-primary}" = prod-affinity ]; then
+        # the prod include, with its worker-host targets pointed at the stub workers;
+        # prod-affinity = the PREPARED switch, generated exactly as an activation would
+        local src="$D/upstreams-prod.conf"
+        if [ "$1" = prod-affinity ]; then
+            mkdir -p "$WORK/gen"
+            PRIORITY_AFFINITY=1 UPSTREAMS_OUT_DIR="$WORK/gen" "$REPO/scripts/generate-bridge-upstreams.sh" production >/dev/null
+            src="$WORK/gen/upstreams-prod.conf"
+        fi
         sed 's/${BRIDGE_BACKUP_HOST}/backup-host/g; s/${BRIDGE_ID}/test/g; s/100\.93\.143\.105:800\([1-4]\)/worker\1:8000/g' \
-            "$D/upstreams-prod.conf" > "$WORK/upstreams.conf"
+            "$src" > "$WORK/upstreams.conf"
     else
         sed 's/${BRIDGE_BACKUP_HOST}/backup-host/g; s/${BRIDGE_ID}/test/g' "$D/upstreams-primary.conf" > "$WORK/upstreams.conf"
     fi
@@ -107,7 +114,7 @@ start_stack() { # $1 = failing worker (e.g. worker4) or ""   $2 = TIGHT account 
     cleanup
     docker network create $NET >/dev/null
     local topo="${3:-primary}" workers="worker1,worker2,worker3,worker4"
-    [ "$topo" = prod ] && workers="$PROD_WORKERS"
+    case "$topo" in prod|prod-affinity) workers="$PROD_WORKERS" ;; esac
     render "$topo"
     local i
     for i in 1 2 3 4; do
@@ -306,6 +313,62 @@ STATE="$st" python3 -c "import json,os,sys; d=json.loads(os.environ['STATE']); a
 set -- $(req /v1/chat/completions job-affinity-1)
 [ "$1" = 200 ] && [ "$4" = hit ] && pass "prod LB, hopped: affinity hit as before ($3)" \
     || fail "prod LB, hopped: $*"
+
+echo
+echo "=== Prepared (B1b): committed prod include keeps the priority pool in mode bypass ==="
+grep -q 'default bypass;' "$D/upstreams-prod.conf" && ! grep -q 'default affinity;' "$D/upstreams-prod.conf" \
+    && pass "docker/upstreams-prod.conf: \$priority_pool_affinity = bypass (affinity NOT active)" \
+    || fail "docker/upstreams-prod.conf does not say bypass"
+# the affinity groups the prepared mode routes to must hold exactly the servers of
+# claude_production on production (same targets, dev bridge only as backup)
+python3 - "$D/upstreams-prod.conf" <<'PYEOF' && pass "prod: claude_workers_affin_* hold exactly the servers of claude_production" || fail "prod: affinity groups differ from claude_production"
+import re, sys
+txt = open(sys.argv[1]).read()
+def servers(name):
+    body = re.search(r"upstream %s \{(.*?)\}" % re.escape(name), txt, re.S).group(1)
+    return sorted(re.findall(r"server (\S+)", body))
+prod = servers("claude_production")
+groups = re.findall(r"upstream (claude_workers_affin_\S+) \{", txt)
+sys.exit(0 if groups and all(servers(g) == prod for g in groups) else 1)
+PYEOF
+
+echo
+echo "=== Scenario (B1b, switched on for the test): affinity on the priority pool ==="
+start_stack "" "" prod-affinity
+first=$(preq /v1/chat/completions job-affinity-1); set -- $first; pw=$2
+ok=1
+for path in /v1/chat/completions /v1/chat/completions /v1/chat/completions /v1/jobs /v1/jobs; do
+    set -- $(preq $path job-affinity-1)
+    if [ "$1" != 200 ] || [ "$2" != "$pw" ] || [ "$3" != hit ]; then ok=0; echo "    $path got: $*"; fi
+done
+[ $ok = 1 ] && [ "$pw" != misc ] && pass "priority pool + affinity: same key → always $pw (chat + jobs), header hit" \
+            || fail "priority pool + affinity: key did not stay on one worker"
+seen=""; hdr_ok=1
+for _ in $(seq 8); do set -- $(preq /v1/chat/completions); seen="$seen $2"; [ "$3" = none ] || hdr_ok=0; done
+distinct=$(printf '%s\n' $seen | sort -u | wc -l)
+[ "$distinct" -eq 4 ] && [ $hdr_ok = 1 ] && pass "priority pool + affinity, no key: round-robin over 4 as before" \
+    || fail "priority pool + affinity, no key: $distinct workers, header_absent=$hdr_ok"
+# find which stub index the preferred worker is, then make it fail
+idx=$(printf '%s' "$PROD_WORKERS" | tr , '\n' | grep -n "^$pw$" | cut -d: -f1)
+start_stack "worker$idx" "" prod-affinity
+ok=1
+for _ in $(seq 4); do
+    set -- $(preq /v1/chat/completions job-affinity-1)
+    if [ "$1" != 200 ] || [ "$2" = "$pw" ] || [ "$2" = misc ] || [ "$3" != hit ]; then ok=0; echo "    got: $*"; fi
+done
+[ $ok = 1 ] && pass "priority pool + affinity: preferred $pw 503 → retried on another prod worker, 200" \
+            || fail "priority pool + affinity: retry broken"
+start_stack "" all prod-affinity
+ok=1
+for _ in $(seq 4); do
+    set -- $(preq /v1/chat/completions job-affinity-1)
+    if [ "$1" != 200 ] || [ "$3" != "fallback:no_capacity" ]; then ok=0; echo "    got: $*"; fi
+done
+[ $ok = 1 ] && pass "priority pool + affinity, whole pool without capacity: still 200 (no gate), fallback:no_capacity" \
+            || fail "priority pool + affinity must not start rejecting"
+code=$(curl -s -o /dev/null -w '%{http_code}' -XPOST "http://127.0.0.1:$PORT/v1/chat/completions" -H "X-Bridge-Hop: 1" -d '{"q":1}')
+[ "$code" = 429 ] && pass "contrast: hopped path in the same state is gated (429), unchanged" \
+                  || fail "contrast: hopped path gave $code, want 429"
 
 echo
 echo "=== Scenario: primary topology, X-Priority pool forwards to the peer bridge ==="
