@@ -492,6 +492,9 @@ class ResearchRequest(BaseModel):
         description="Host filesystem path where research report should be saved. If not provided, saves to /tmp/"
     )
 
+    agentischer_lauf: Optional[AgentischerLauf] = None
+    _agentischer_vertrag = model_validator(mode="before")(validate_request)
+
     # SuperClaude Research Depth
     depth: Optional[Literal["quick", "standard", "deep", "exhaustive"]] = Field(
         default="standard",

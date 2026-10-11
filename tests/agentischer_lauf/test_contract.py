@@ -64,7 +64,6 @@ def test_new_mode_not_silently_dropped():
         ("source_filter", None),
         ("output_path", None),
         ("cloud_overflow", False),
-        ("agentischer_lauf", None),
     ],
 )
 def test_invalid_request(field, value):
