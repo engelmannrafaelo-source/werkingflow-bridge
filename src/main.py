@@ -903,6 +903,9 @@ app = FastAPI(
 
 # Generic async-job endpoints (POST /v1/jobs, GET /v1/jobs/{id}) — additive,
 # inert unless BRIDGE_GENERIC_JOBS_ENABLED=true.
+from src.version import router as version_router
+
+app.include_router(version_router)
 app.include_router(jobs_router)
 app.include_router(erkunder_router)
 

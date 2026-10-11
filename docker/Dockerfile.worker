@@ -89,3 +89,8 @@ CMD ["poetry", "run", "uvicorn", "src.main:app", "--host", "0.0.0.0", "--port", 
 # must not invalidate the cache of everything above it.
 ARG GIT_COMMIT=unknown
 LABEL bridge.git.commit=$GIT_COMMIT
+
+
+# Immutable metadata baked with the same commit used by the image label.
+# An unversioned ad-hoc image reports 503 instead of inventing provenance.
+RUN python -c 'import json, os; from datetime import datetime, timezone; from pathlib import Path; Path("/app/src/build-metadata.json").write_text(json.dumps({"git_sha": os.environ["GIT_COMMIT"], "built_at": datetime.now(timezone.utc).isoformat()}))'

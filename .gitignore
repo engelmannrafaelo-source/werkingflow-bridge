@@ -112,3 +112,5 @@ backups/
 # source (ADR-0006). Never capture these back into the repo from a host.
 .bridge-deployed-sha
 .bridge-release-manifest.json
+
+/src/build-metadata.json

@@ -51,6 +51,7 @@ AUTH_DEPENDENCIES = {"require_service_token", "HTTPBearer"}
 # und ihr Handler kein Schluesselmaterial und keine Kundendaten herausgibt
 # (fuer diese elf am 02.09.2026 einzeln im Handler nachgesehen).
 PUBLIC_ROUTES = {
+    "/v1/version": "Public build SHA, build time and contract revision only.",
     "/health": "Lebendigkeitspruefung des Lastverteilers — muss ohne Anmeldung gehen.",
     "/ready": "Bereitschaftspruefung des Lastverteilers — muss ohne Anmeldung gehen.",
     "/stats": "Aggregierte Zaehler ohne Kundenbezug; von Betriebs-Dashboards gelesen.",
