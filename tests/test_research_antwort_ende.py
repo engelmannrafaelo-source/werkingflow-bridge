@@ -1,4 +1,6 @@
-"""/v1/research: how the final answer ended — antwort_ende + fehler_code (BRTRUNC, 11.10.2026).
+"""/v1/research: how the final answer ended (BRTRUNC, 11.10.2026).
+
+Fields antwort_ende and fehler_code.
 
 Energy P4-AUSWAHL (B4) asked whether /v1/research says when the answer was cut
 off. It did not: a run whose final message stopped at the output limit while the
@@ -25,10 +27,10 @@ Guards:
     retryable=false — distinct from "no answer" and from error_max_turns;
   * file contract: the same field as information, the report file stays the answer.
 """
+
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import Any, Optional
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -39,12 +41,12 @@ import src.main as main_module
 from src.claude_cli import antwort_ende, sdk_message_to_dict
 
 _CUT_TEXT = (
-    "API Error: Claude's response exceeded the 64000 output token maximum. To configure "
-    "this behavior, set the CLAUDE_CODE_MAX_OUTPUT_TOKENS environment variable."
+    "API Error: Claude's response exceeded the 64000 output token maximum. "
+    "To configure this behavior, set the CLAUDE_CODE_MAX_OUTPUT_TOKENS environment variable."
 )
 _META_TURN = (
-    "Output token limit hit. Resume directly — no apology, no recap of what you were "
-    "doing. Pick up mid-thought if that is where the cut happened. Break remaining work "
+    "Output token limit hit. Resume directly — no apology, no recap of what "
+    "you were doing. Pick up mid-thought if that is where the cut happened. Break remaining work "
     "into smaller pieces."
 )
 _BLOCK_START = '```pruefwissen-auswahl\n{"dokument_ids": ["kw-1", "kw-2", '
@@ -59,8 +61,14 @@ def _tool(name="Read"):
 
 
 def _result(subtype="success", **extra):
-    return {"type": "result", "subtype": subtype, "is_error": False, "num_turns": 3,
-            "usage": {"input_tokens": 10, "output_tokens": 20}, **extra}
+    return {
+        "type": "result",
+        "subtype": subtype,
+        "is_error": False,
+        "num_turns": 3,
+        "usage": {"input_tokens": 10, "output_tokens": 20},
+        **extra,
+    }
 
 
 # --- SDK parser keeps the end fields --------------------------------------------
@@ -74,8 +82,11 @@ def test_parser_behaelt_cli_endfelder():
         {
             "type": "assistant",
             "error": "max_output_tokens",
-            "message": {"model": "m", "content": [{"type": "text", "text": _CUT_TEXT}],
-                        "stop_reason": "max_tokens"},
+            "message": {
+                "model": "m",
+                "content": [{"type": "text", "text": _CUT_TEXT}],
+                "stop_reason": "max_tokens",
+            },
             "parent_tool_use_id": None,
             "session_id": "s",
         },
@@ -87,9 +98,16 @@ def test_parser_behaelt_cli_endfelder():
 
     result = resilient_parse_message(
         {
-            "type": "result", "subtype": "success", "is_error": True, "num_turns": 4,
-            "duration_ms": 1, "duration_api_ms": 1, "session_id": "s", "result": _CUT_TEXT,
-            "stop_reason": "max_tokens", "api_error": "max_output_tokens",
+            "type": "result",
+            "subtype": "success",
+            "is_error": True,
+            "num_turns": 4,
+            "duration_ms": 1,
+            "duration_api_ms": 1,
+            "session_id": "s",
+            "result": _CUT_TEXT,
+            "stop_reason": "max_tokens",
+            "api_error": "max_output_tokens",
         },
         sdk.parse_message,
     )
@@ -104,7 +122,11 @@ def test_parser_ohne_endfelder_fuegt_nichts_hinzu():
     from src.sdk_parser import resilient_parse_message
 
     msg = resilient_parse_message(
-        {"type": "assistant", "message": {"model": "m", "content": []}, "session_id": "s"},
+        {
+            "type": "assistant",
+            "message": {"model": "m", "content": []},
+            "session_id": "s",
+        },
         sdk.parse_message,
     )
     d = sdk_message_to_dict(msg)
@@ -150,11 +172,21 @@ class ResultMessage:
 async def test_run_completion_markiert_fortsetzung(monkeypatch, tmp_path):
     async def fake_query(prompt, options):
         for m in (
-            AssistantMessage(content=[TextBlock(text="Hier die Auswahl:\n" + _BLOCK_START)], model="m"),
+            AssistantMessage(
+                content=[TextBlock(text="Hier die Auswahl:\n" + _BLOCK_START)],
+                model="m",
+            ),
             UserMessage(content=[TextBlock(text=_META_TURN)]),
             AssistantMessage(content=[TextBlock(text='"kw-3"]}\n```')], model="m"),
-            ResultMessage(subtype="success", duration_ms=1, duration_api_ms=1, is_error=False,
-                          num_turns=2, session_id="s", usage={"input_tokens": 1, "output_tokens": 1}),
+            ResultMessage(
+                subtype="success",
+                duration_ms=1,
+                duration_api_ms=1,
+                is_error=False,
+                num_turns=2,
+                session_id="s",
+                usage={"input_tokens": 1, "output_tokens": 1},
+            ),
         ):
             yield m
 
@@ -168,7 +200,9 @@ async def test_run_completion_markiert_fortsetzung(monkeypatch, tmp_path):
     cli.file_discovery = MagicMock()
     chunks = [c async for c in cli.run_completion(prompt="x", model="claude-sonnet-5")]
 
-    assistants = [c for c in chunks if isinstance(c, dict) and isinstance(c.get("content"), list)]
+    assistants = [
+        c for c in chunks if isinstance(c, dict) and isinstance(c.get("content"), list)
+    ]
     assert len(assistants) == 2
     assert not assistants[0].get(claude_cli.FORTSETZUNG_KEY)
     assert assistants[1][claude_cli.FORTSETZUNG_KEY] is True
@@ -179,7 +213,10 @@ async def test_run_completion_markiert_fortsetzung(monkeypatch, tmp_path):
 
 
 def test_antwort_ende_normal():
-    assert antwort_ende([_assistant("fertig"), _result(stop_reason="end_turn")]) == "end_turn"
+    assert (
+        antwort_ende([_assistant("fertig"), _result(stop_reason="end_turn")])
+        == "end_turn"
+    )
 
 
 def test_antwort_ende_ohne_angabe_ist_none():
@@ -187,19 +224,29 @@ def test_antwort_ende_ohne_angabe_ist_none():
 
 
 def test_antwort_ende_cli_fehler_an_der_schlussnachricht():
-    chunks = [_assistant("Hier:\n" + _BLOCK_START), _assistant(_CUT_TEXT, cli_error="max_output_tokens"),
-              _result(is_error=True)]
+    chunks = [
+        _assistant("Hier:\n" + _BLOCK_START),
+        _assistant(_CUT_TEXT, cli_error="max_output_tokens"),
+        _result(is_error=True),
+    ]
     assert antwort_ende(chunks) == "max_tokens"
 
 
 def test_antwort_ende_result_api_error():
-    assert antwort_ende([_assistant("x"), _result(api_error="max_output_tokens")]) == "max_tokens"
+    assert (
+        antwort_ende([_assistant("x"), _result(api_error="max_output_tokens")])
+        == "max_tokens"
+    )
 
 
 def test_fortsetzung_vor_letztem_werkzeug_zaehlt_nicht():
     """A continuation in an early working turn says nothing about the final answer."""
-    chunks = [_assistant("Plan …", **{claude_cli.FORTSETZUNG_KEY: True}), _tool(),
-              _assistant("Antwort"), _result(stop_reason="end_turn")]
+    chunks = [
+        _assistant("Plan …", **{claude_cli.FORTSETZUNG_KEY: True}),
+        _tool(),
+        _assistant("Antwort"),
+        _result(stop_reason="end_turn"),
+    ]
     assert antwort_ende(chunks) == "end_turn"
 
 
@@ -208,10 +255,21 @@ def test_fortsetzung_vor_letztem_werkzeug_zaehlt_nicht():
 
 def _req(**kw):
     d = dict(
-        query="Wähle Prüfwissen aus.", model="claude-sonnet-4-5", depth="deep",
-        strategy="planning", max_turns=45, max_hops=None, confidence_threshold=0.7,
-        parallel_searches=5, source_filter=None, output_path=None, async_mode=False,
-        backend=None, privacy=None, bedrock_region=None, research_mode=None,
+        query="Wähle Prüfwissen aus.",
+        model="claude-sonnet-4-5",
+        depth="deep",
+        strategy="planning",
+        max_turns=45,
+        max_hops=None,
+        confidence_threshold=0.7,
+        parallel_searches=5,
+        source_filter=None,
+        output_path=None,
+        async_mode=False,
+        backend=None,
+        privacy=None,
+        bedrock_region=None,
+        research_mode=None,
         antwort_im_text=True,
     )
     d.update(kw)
@@ -243,8 +301,11 @@ def _metadata(tmp_path, name, text):
     d = tmp_path / "claudedocs"
     d.mkdir(exist_ok=True)
     (d / name).write_text(text, encoding="utf-8")
-    return {"type": "x_claude_metadata", "files_created": [{"path": str(d / name)}],
-            "session_tracking": {"research_dir": str(tmp_path)}}
+    return {
+        "type": "x_claude_metadata",
+        "files_created": [{"path": str(d / name)}],
+        "session_tracking": {"research_dir": str(tmp_path)},
+    }
 
 
 @pytest.mark.asyncio
@@ -281,7 +342,9 @@ async def test_textvertrag_fortgesetzte_antwort_ist_nur_der_rest():
 
 @pytest.mark.asyncio
 async def test_textvertrag_normales_ende_traegt_antwort_ende():
-    res = await _run([_assistant("Hier:\n```x\n{}\n```"), _result(stop_reason="end_turn")], _req())
+    res = await _run(
+        [_assistant("Hier:\n```x\n{}\n```"), _result(stop_reason="end_turn")], _req()
+    )
     assert res.status == "success", res.error
     assert res.antwort_quelle == "text"
     assert res.antwort_ende == "end_turn"
@@ -290,7 +353,9 @@ async def test_textvertrag_normales_ende_traegt_antwort_ende():
 
 @pytest.mark.asyncio
 async def test_max_turns_ist_nicht_abgeschnitten():
-    res = await _run([_assistant("Ich rechne noch …"), _result("error_max_turns")], _req())
+    res = await _run(
+        [_assistant("Ich rechne noch …"), _result("error_max_turns")], _req()
+    )
     assert res.status == "error"
     assert res.fehler_code is None
 
