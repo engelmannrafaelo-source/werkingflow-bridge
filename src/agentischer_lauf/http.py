@@ -42,10 +42,14 @@ def require_runtime():
 
 async def authorized(request, credentials):
     from src.auth import verify_api_key
-    from src.main import enforce_attribution
+    from src.main import enforce_attribution, extract_attribution_context
+
+    from .bedrock import ATTRIBUTION
 
     await verify_api_key(request, credentials)
     enforce_attribution(request)
+    # The ledger booking of each bounded model call carries this caller.
+    ATTRIBUTION.set(extract_attribution_context(request))
 
 
 def research_dispatch(legacy):

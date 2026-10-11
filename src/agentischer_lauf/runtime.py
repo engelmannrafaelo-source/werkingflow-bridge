@@ -137,6 +137,18 @@ class Runtime:
                 "cache": {"hit": False, "ursprung_lauf_id": None},
             },
             "usage": unknown_usage(),
+            # Shared by main run and review: every model call was reserved as
+            # counted input + max_tokens against the remaining total before it
+            # was sent (see adapter.BoundedModel).
+            "grenze": {
+                "tokens_gesamt": run.grenzen.tokens_gesamt,
+                "zeit_s": run.grenzen.zeit_s,
+                "durchsetzung": "vorab_reserviert",
+                "tokens_verbraucht": 0,
+                "tokens_reserviert_max": 0,
+                "modellaufrufe": 0,
+                "ursache": None,
+            },
             "werkzeugaufrufe": {"vollstaendig": False, "eintraege": [], "protokoll_ref": None},
             "artefakte": [],
             "pruefung": None,
@@ -272,6 +284,15 @@ class Runtime:
                             {"content": result["content"], "artefakte": result["artefakte"]},
                         )
                         result["usage"] = aggregate([result["usage"], check["usage"]])
+                        for key in ("tokens_verbraucht", "modellaufrufe"):
+                            result["grenze"][key] += check["grenze"][key]
+                        result["grenze"]["tokens_reserviert_max"] = max(
+                            result["grenze"]["tokens_reserviert_max"],
+                            check["grenze"]["tokens_reserviert_max"],
+                        )
+                        result["grenze"]["ursache"] = (
+                            result["grenze"]["ursache"] or check["grenze"]["ursache"]
+                        )
                         if check["status"] != "success":
                             result.update(
                                 status="error",
@@ -302,6 +323,8 @@ class Runtime:
             retryable=exc.retryable,
             retry_after_s=exc.retry_after_s,
         )
+        if exc.ursache:
+            result["grenze"]["ursache"] = exc.ursache
 
     async def phase(
         self,
@@ -357,16 +380,27 @@ class Runtime:
                     raise RunError("faehigkeit_nicht_verfuegbar")
                 cap = min(max_tokens, budget[0] - bound)
                 if cap <= 0:
-                    raise RunError("grenze_tokens")
+                    raise RunError("grenze_tokens", ursache="restbudget_erschoepft")
+                grenze = result["grenze"]
+                grenze["tokens_reserviert_max"] = max(grenze["tokens_reserviert_max"], bound + cap)
+                grenze["modellaufrufe"] += 1
                 # No model invocation occurs without a prior reservation.
                 reply = await provider.complete(
                     model=model, messages=copy.deepcopy(messages), tools=specs, max_tokens=cap
                 )
                 counters = [reply.usage.get(k) for k in TOKEN_KEYS]
                 if any(type(v) is not int or v < 0 for v in counters):
-                    raise RunError("grenze_tokens")
-                if counters[1] > cap or sum(counters) - counters[1] > bound:
-                    raise RunError("grenze_tokens")
+                    # Unknown consumption: the whole reservation counts as used.
+                    budget[0] -= bound + cap
+                    grenze["tokens_verbraucht"] += bound + cap
+                    raise RunError("grenze_tokens", ursache="nutzung_unbekannt")
+                grenze["tokens_verbraucht"] += sum(counters)
+                if counters[1] > cap:
+                    budget[0] -= sum(counters)
+                    raise RunError("grenze_tokens", ursache="ausgabe_ueber_reservierung")
+                if sum(counters) - counters[1] > bound:
+                    budget[0] -= sum(counters)
+                    raise RunError("grenze_tokens", ursache="eingabe_ueber_reservierung")
                 cost = reply.usage.get("cost_eur")
                 if cost is not None and (
                     type(cost) not in (int, float) or not math.isfinite(cost) or cost < 0

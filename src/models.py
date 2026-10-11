@@ -635,6 +635,7 @@ class ResearchResponse(ErrorVerdictFields):
     """
     herkunft: Optional[Dict[str, Any]] = None
     usage: Optional[Dict[str, Any]] = None
+    grenze: Optional[Dict[str, Any]] = None
     werkzeugaufrufe: Optional[Dict[str, Any]] = None
     artefakte: List[Dict[str, Any]] = Field(default_factory=list)
     pruefung: Optional[Dict[str, Any]] = None

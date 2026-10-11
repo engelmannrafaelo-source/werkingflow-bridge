@@ -19,11 +19,13 @@ TOKEN_KEYS = (
 
 
 class RunError(Exception):
-    def __init__(self, code, *, retryable=False, retry_after_s=None):
+    def __init__(self, code, *, retryable=False, retry_after_s=None, ursache=None):
         super().__init__(code)
         self.code = code
         self.retryable = retryable
         self.retry_after_s = retry_after_s
+        # Which limit check fired; reported in result["grenze"]["ursache"].
+        self.ursache = ursache
 
 
 @dataclass
