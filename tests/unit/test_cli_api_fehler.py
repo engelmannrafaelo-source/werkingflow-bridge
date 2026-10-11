@@ -390,3 +390,58 @@ async def test_research_meldet_fehler(monkeypatch, tmp_path):
     assert res.status == "error"
     assert "cache_control.ttl" in res.error and "400" in res.error
     assert res.fehler_code is None and res.retryable is False
+
+
+# ── CACHEFIX2: the doc-agent job ends as an error with the chat verdict ─────
+
+
+@pytest.mark.parametrize(
+    "status,retryable,after", [(400, False, None), (529, True, 30)]
+)
+async def test_doc_agent_job_endet_als_fehler_mit_urteil(
+    monkeypatch, tmp_path, status, retryable, after
+):
+    """Real doc-agent answer → real executor → real job runner: mark_error
+    with the CliApiError verdict (as /v1/chat/completions answers it), never
+    mark_done."""
+    from src.jobs import registry
+    from src.jobs.executors import doc_agent_executor
+    from src.models import DocAgentFile, DocAgentRequest
+
+    _echter_cli(
+        monkeypatch,
+        tmp_path,
+        sdk.init(),
+        _api_error_turn(f"API Error: {status} cache_control.ttl"),
+        _api_error_result(status, f"API Error: {status} cache_control.ttl"),
+    )
+    monkeypatch.setattr(
+        "src.activity.ai_call_writer.persist_ai_call_activity", AsyncMock()
+    )
+    req = DocAgentRequest(
+        question="Was steht drin?", files=[DocAgentFile(name="a.txt", content="x")]
+    )
+    body = (await main._execute_doc_agent_impl(req)).model_dump()
+    chat = json.loads(
+        classify_exception(CliApiError(status, "unknown", "x", WORKER)).body
+    )["error"]
+    assert (body["retryable"], body["retry_after_s"]) == (
+        chat["retryable"],
+        chat["retry_after_s"],
+    )
+
+    done, error = AsyncMock(), AsyncMock()
+    with (
+        patch("src.jobs.executors._self_post_json", AsyncMock(return_value=body)),
+        patch.object(registry, "get_executor", return_value=doc_agent_executor),
+        patch.object(registry.store_client, "mark_done", done),
+        patch.object(registry.store_client, "mark_error", error),
+        patch.object(registry.store_client, "heartbeat", AsyncMock()),
+        patch.object(registry.store_client, "update_progress", AsyncMock()),
+    ):
+        await registry._run_body("job-cachefix2", "doc-agent", {}, None)
+    assert not done.called
+    (job_id, msg), kw = error.call_args
+    assert job_id == "job-cachefix2"
+    assert f"API Error: {status} cache_control.ttl" in msg
+    assert kw["retryable"] is retryable and kw["retry_after_s"] == after

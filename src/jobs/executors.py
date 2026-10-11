@@ -523,19 +523,26 @@ async def research_executor(
     result = await _self_post_json(
         "/v1/research", body, attribution, RESEARCH_SELF_CALL_TIMEOUT_S
     )
-    if result.get("status") == "error":
-        # The endpoint's verdict (ResearchResponse.retryable, set together
-        # with the text marker) becomes the job's verdict.
-        from src.error_contract import JobFailure, envelope_fields
-
-        verdict = envelope_fields(result)
-        raise JobFailure(
-            "research self-call returned status=error: "
-            f"{result.get('error') or 'no error message'}",
-            retryable=verdict.get("retryable", False),
-            retry_after_s=verdict.get("retry_after_s"),
-        )
+    _raise_on_status_error("research", result)
     return result
+
+
+def _raise_on_status_error(kind: str, result: Dict[str, Any]) -> None:
+    """A 200 body with status=error ends the job as an error. The endpoint's
+    verdict (ErrorVerdictFields.retryable / retry_after_s, e.g. from
+    CliApiError, a research-cloud failure marked retryable) becomes the job's
+    verdict, the error text its message."""
+    if result.get("status") != "error":
+        return
+    from src.error_contract import JobFailure, envelope_fields
+
+    verdict = envelope_fields(result)
+    raise JobFailure(
+        f"{kind} self-call returned status=error: "
+        f"{result.get('error') or 'no error message'}",
+        retryable=verdict.get("retryable", False),
+        retry_after_s=verdict.get("retry_after_s"),
+    )
 
 
 async def doc_agent_executor(
@@ -547,9 +554,14 @@ async def doc_agent_executor(
     durable job. Same self-call pattern as research: the endpoint owns auth,
     budget gate and billing; the job layer owns durability/requeue."""
     await report_progress({"phase": "doc-agent", "model": payload.get("model")})
-    return await _self_post_json(
+    result = await _self_post_json(
         "/v1/doc-agent", payload, attribution, DOC_AGENT_SELF_CALL_TIMEOUT_S
     )
+    # Like research: /v1/doc-agent answers errors as 200 + status=error, so
+    # the HTTP check in _self_post_json passes them. Before CACHEFIX2 the job
+    # was marked done with the error as its result.
+    _raise_on_status_error("doc-agent", result)
+    return result
 
 
 async def convert_html_to_pdf_executor(

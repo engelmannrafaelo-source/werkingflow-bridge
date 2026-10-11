@@ -706,6 +706,8 @@ class CliApiError(ClassifiedError):
         self.text = text
         self.worker_id = worker_id
         self.retryable = self._transient()
+        # Same Retry-After as the 429 envelope below; None when final.
+        self.retry_after_s = 30 if self.retryable else None
 
     def _transient(self) -> bool:
         s = self.status
@@ -727,7 +729,8 @@ class CliApiError(ClassifiedError):
                 source=SOURCE_UPSTREAM_ANTHROPIC, error_type=TYPE_UPSTREAM_ERROR,
                 reason=REASON_UPSTREAM_ANTHROPIC_ERROR,
                 message=f"Upstream Anthropic error inside the CLI: {detail}",
-                status_code=429, retry_after_s=30, retryable_override=True, extra=extra,
+                status_code=429, retry_after_s=self.retry_after_s,
+                retryable_override=True, extra=extra,
             )
         return bridge_error(
             source=SOURCE_UPSTREAM_ANTHROPIC, error_type=TYPE_UPSTREAM_ERROR,

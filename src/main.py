@@ -4943,6 +4943,41 @@ class ResearchAnswerTruncated(ResearchReportMissing):
     fehler_code = "antwort_abgeschnitten"
 
 
+async def _research_strom(strom, antwort_im_text: bool):
+    """run_completion for research, with the end of the answer on an API error.
+
+    run_completion raises CliApiError when the CLI's run ended in an API error
+    (CACHEFIX). Research also needs to know how far the answer got: the CLI
+    may already have continued a cut answer (antwort_ende *_fortgesetzt), and
+    the API error only ended the last continuation — measured with CLI 2.1.285,
+    an exhausted continuation ends in "API Error: Connection lost
+    mid-response" flagged is_api_error_message / server_error (BRTRUNC2
+    fixture abbruch_immer). Then the answer is cut off: under antwort_im_text
+    the truncation verdict holds (fehler_code, not retryable — the same
+    request breaks the same way), the API error stays its cause. Otherwise
+    the CliApiError goes on, carrying antwort_ende for the error response."""
+    from src.claude_cli import antwort_abgeschnitten, antwort_ende
+
+    seen: List[Dict[str, Any]] = []
+    try:
+        async for chunk in strom:
+            seen.append(chunk)
+            yield chunk
+    except CliApiError as e:
+        ende = antwort_ende(seen)
+        e.antwort_ende = ende
+        if antwort_im_text and antwort_abgeschnitten(ende):
+            truncated = ResearchAnswerTruncated(
+                f"Research answer cut off (antwort_ende={ende}): the CLI continued "
+                f"a cut answer and the continuation ended in an API error ({e}). "
+                f"antwort_im_text was set and the run's final message is not the "
+                f"complete answer."
+            )
+            truncated.antwort_ende = ende
+            raise truncated from e
+        raise
+
+
 # A report is text the reader can read. discovered_files holds EVERY file a
 # Write call touched — measured 11.10.2026 (Energy DS2, Phase 4): with no
 # output.md the fallback handed out the run's helper scripts (4.355 and
@@ -5413,7 +5448,7 @@ async def _execute_research_impl(
         file_metadata = None
         cli_resume_id: Optional[str] = None
 
-        async for chunk in claude_cli.run_completion(
+        async for chunk in _research_strom(claude_cli.run_completion(
             prompt=research_prompt,
             append_system_prompt=library_append_prompt,
             model=request_body.model,
@@ -5426,7 +5461,7 @@ async def _execute_research_impl(
             backend_env_vars=backend_config.env_vars if backend_config else None,
             seed_links=library_seed_links,
             sdk_mcp_servers=pool_sdk_mcp_servers,
-        ):
+        ), antwort_im_text):
             all_chunks.append(chunk)
             if "session_id" in chunk:
                 session_id = chunk["session_id"]
@@ -5956,13 +5991,26 @@ async def _execute_research_impl(
             file_size_bytes=None,
             error=str(e),
             session_id=session_id,
-            antwort_ende=research_antwort_ende,
+            # Set after the stream; a run that failed inside it (CliApiError)
+            # carries the end of what it had streamed until then.
+            antwort_ende=research_antwort_ende or getattr(e, "antwort_ende", None),
             fehler_code=getattr(e, "fehler_code", None),
             # The raiser's own verdict (error_contract rule 1), e.g. CliApiError:
             # a 400 from the API stays final, a 529 may be asked again.
-            retryable=(e.retryable
-                       if isinstance(getattr(e, "retryable", None), bool) else None),
+            **_eigenes_urteil(e),
         )
+
+
+def _eigenes_urteil(e: BaseException) -> Dict[str, Any]:
+    """retryable / retry_after_s of an exception that carries its own verdict
+    (error_contract rule 1, e.g. CliApiError: a 400 from the API stays final,
+    a 529 may be asked again after 30 s). {} = the response model decides."""
+    retryable = getattr(e, "retryable", None)
+    if not isinstance(retryable, bool):
+        return {}
+    after = getattr(e, "retry_after_s", None)
+    return {"retryable": retryable,
+            "retry_after_s": after if isinstance(after, int) else None}
 
 
 def _mark_retryable(message: str) -> str:
@@ -7273,6 +7321,7 @@ async def _execute_doc_agent_impl(
             execution_time_seconds=round(execution_time, 2),
             session_id=session_id,
             error=str(e),
+            **_eigenes_urteil(e),
         )
 
 

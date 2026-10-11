@@ -1704,6 +1704,10 @@ class ClaudeCodeCLI:
             # Enable file discovery for research output
             enable_file_discovery = True
 
+        # The CLI's flagged API-error turn, held back until its result. Set
+        # before the outer try: every later way out (result, end of stream,
+        # timeout, SDK crash) must still end in CliApiError (CACHEFIX2).
+        _api_error_turn: Optional[Dict[str, Any]] = None
         try:
             # CRITICAL: Verify ANTHROPIC_API_KEY is NOT in environment
             # If present, the SDK silently falls back to paid API when OAuth fails.
@@ -2229,7 +2233,7 @@ class ClaudeCodeCLI:
                 # === END LARGE USER PROMPT HANDLING ===
 
                 fortsetzung_ausstehend = False
-                _api_error_turn: Optional[Dict[str, Any]] = None
+                _api_error_turn = None
                 try:
                     async with asyncio.timeout(self.timeout):
                         async for message in query(prompt=prompt_source, options=options):
@@ -2447,6 +2451,13 @@ class ClaudeCodeCLI:
                             yield message
 
                 except asyncio.TimeoutError:
+                    if _api_error_turn is not None:
+                        # The API already refused this run; the timeout is
+                        # only how its stream ended.
+                        raise_cli_api_error(
+                            os.environ.get("INSTANCE_NAME", "unknown"),
+                            _api_error_turn, None,
+                        )
                     logger.error(f"⏱️ TIMEOUT: SDK query timed out after {self.timeout}s")
                     logger.error(f"   Timeout Type: Claude Code SDK Query (Inner Loop)")
                     logger.error(f"   Timeout Duration: {self.timeout}s ({self.timeout/60:.1f} minutes)")
@@ -2821,6 +2832,18 @@ class ClaudeCodeCLI:
             raise
 
         except Exception as e:
+            if _api_error_turn is not None:
+                # An API error was already seen; the crash after it is how the
+                # stream ended. Recovery below would hand out the chunks
+                # before it (or a generic error) and lose the cause.
+                cli_session_manager.complete_session(cli_session_id, status="failed")
+                logger.error(
+                    f"SDK ended with {type(e).__name__} after the CLI's API-error "
+                    f"turn: {e} — raising the API error"
+                )
+                raise_cli_api_error(
+                    os.environ.get("INSTANCE_NAME", "unknown"), _api_error_turn, None,
+                )
             logger.error(f"Claude Code SDK error: {e}")
 
             # Classify error type to apply the right cooldown strategy:
