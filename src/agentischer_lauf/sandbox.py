@@ -1,7 +1,7 @@
-"""Mediated file sandbox. No host paths, processes, network or credentials.
+"""Mediated files and explicitly provisioned isolated computation.
 
-Materials are immutable bytes; only explicit output paths are writable. Bash
-and external tools require a separately isolated adapter and are unavailable.
+Materials are immutable bytes; only explicit output paths are published. Bash
+requires a server-owned isolated computation place and an explicit tool grant.
 """
 
 import hashlib
@@ -21,7 +21,8 @@ def canonical(value) -> bytes:
 
 
 class Sandbox:
-    def __init__(self, material, tools, outputs, max_bytes):
+    def __init__(self, material, tools, outputs, max_bytes, *, bash=None):
+        self.bash = bash
         self.material = dict(material)
         self.files = {}
         self.tools = {t.name: t for t in tools}
@@ -34,7 +35,7 @@ class Sandbox:
         if len({t.name for t in tools}) != len(tools):
             raise RunError("auftrag_ungueltig")
         for tool in tools:
-            if tool.name not in ("Read", "Write", "List") or tool.parameter != {}:
+            if tool.name not in ("Read", "Write", "List", "Bash") or tool.parameter != {}:
                 raise RunError("faehigkeit_nicht_verfuegbar")
 
     def read(self, path):
@@ -48,6 +49,8 @@ class Sandbox:
     def call(self, name, args):
         if name not in self.tools or not isinstance(args, dict):
             raise RunError("werkzeug_fehler")
+        if name == "Bash":
+            raise RunError("werkzeug_fehler")  # use the cancellable async entry
         if name == "List":
             if args:
                 raise RunError("werkzeug_fehler")
@@ -73,6 +76,39 @@ class Sandbox:
             raise RunError("werkzeug_fehler")
         self.files[path] = data
         return {"path": path, "sha256": sha(data), "bytes": len(data)}
+
+    async def acall(self, name, args):
+        if name != "Bash":
+            return self.call(name, args)
+        if name not in self.tools or not isinstance(args, dict) or set(args) != {"command"}:
+            raise RunError("werkzeug_fehler")
+        if self.bash is None:
+            raise RunError("faehigkeit_nicht_verfuegbar")
+        result = await self.bash.run(
+            command=args["command"],
+            material=self.material,
+            files=self.files,
+            outputs=self.outputs,
+            max_bytes=self.max_bytes,
+        )
+        # Revalidate the whole returned snapshot at the mediated boundary. Bash
+        # permission includes calculation files, but never undeclared artifacts.
+        import base64
+
+        candidate = Sandbox(self.material, [], self.outputs, self.max_bytes)
+        for path, encoded in result["files"].items():
+            data = base64.b64decode(encoded, validate=True)
+            safe_path(path)
+            if (
+                path in self.material
+                or any(path.startswith(p + "/") or p.startswith(path + "/") for p in self.material)
+                or not any(path == p or path.startswith(p + "/") for p in self.outputs)
+                or sum(map(len, candidate.files.values())) + len(data) > self.max_bytes
+            ):
+                raise RunError("artefakt_integritaet")
+            candidate.files[path] = data
+        self.files = candidate.files
+        return {key: result[key] for key in ("exit_code", "stdout", "stderr")}
 
     def artifacts(self, targets):
         selected = {}
