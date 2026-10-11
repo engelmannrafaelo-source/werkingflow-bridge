@@ -449,6 +449,9 @@ class SessionListResponse(BaseModel):
 # Research Endpoint Models
 # ============================================================================
 
+from src.agentischer_lauf.models import Run as AgentischerLauf, validate_request
+
+
 class ResearchRequest(BaseModel):
     """
     Request model for dedicated /v1/research endpoint.
@@ -643,7 +646,13 @@ class ResearchResponse(ErrorVerdictFields):
 
     Returns both container and host file paths, plus execution metadata.
     """
+    herkunft: Optional[Dict[str, Any]] = None
+    usage: Optional[Dict[str, Any]] = None
     grenze: Optional[Dict[str, Any]] = None
+    werkzeugaufrufe: Optional[Dict[str, Any]] = None
+    artefakte: List[Dict[str, Any]] = Field(default_factory=list)
+    pruefung: Optional[Dict[str, Any]] = None
+    diagnose_ref: Optional[str] = None
     status: Literal["success", "error"]
     query: str
     model: str
@@ -727,7 +736,7 @@ class ResearchResponse(ErrorVerdictFields):
             "run reported no end."
         ),
     )
-    fehler_code: Optional[Literal["antwort_abgeschnitten"]] = Field(
+    fehler_code: Optional[str] = Field(
         default=None,
         description=(
             "status='error' only, when the bridge knows the cause: 'antwort_abgeschnitten' = "

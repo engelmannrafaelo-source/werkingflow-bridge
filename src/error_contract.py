@@ -70,7 +70,7 @@ def fields(retryable: bool, retry_after_s: Optional[float] = None) -> Dict[str, 
 # them, so a /v1/jobs caller reads the same contract as a direct caller
 # (/v1/research fehler_code / antwort_ende / teilantwort) instead of matching
 # the message text.
-JOB_ERROR_DETAIL_FIELDS = ("fehler_code", "antwort_ende", "teilantwort")
+JOB_ERROR_DETAIL_FIELDS = ("fehler_code", "antwort_ende", "teilantwort", "usage", "diagnose_ref")
 # Key of platform-api's answer to POST /v1/internal/jobs/{id}/error that names
 # the cause fields it stored (BRTRUNC2N). Missing (204) = a platform-api from
 # before BRTRUNC2, which drops them; store_client.mark_error says so loudly.

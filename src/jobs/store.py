@@ -275,6 +275,8 @@ async def mark_error(
     fehler_code: Optional[str] = None,
     antwort_ende: Optional[str] = None,
     teilantwort: Optional[str] = None,
+    usage: Optional[Dict[str, Any]] = None,
+    diagnose_ref: Optional[str] = None,
 ) -> List[str]:
     """Terminal error. `retryable`/`retry_after_s` are the verdict of
     src/error_contract.py; when a caller has none (a writer from before BR9),
@@ -289,7 +291,7 @@ async def mark_error(
         error["retryable"] = bool(retryable)
         error["retry_after_s"] = retry_after_s
     for name, value in (("fehler_code", fehler_code), ("antwort_ende", antwort_ende),
-                        ("teilantwort", teilantwort)):
+                        ("teilantwort", teilantwort), ("usage", usage), ("diagnose_ref", diagnose_ref)):
         if value is not None:
             error[name] = value
     pool = get_pool()

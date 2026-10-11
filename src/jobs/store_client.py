@@ -330,6 +330,8 @@ async def mark_error(
     fehler_code: Optional[str] = None,
     antwort_ende: Optional[str] = None,
     teilantwort: Optional[str] = None,
+    usage: Optional[Dict[str, Any]] = None,
+    diagnose_ref: Optional[str] = None,
 ) -> None:
     # A platform-api from before BR9 ignores retryable/retry_after_s (pydantic
     # drops unknown fields) and stores {message, code}; GET then derives the
@@ -342,7 +344,7 @@ async def mark_error(
     # that loud (BRTRUNC2N).
     cause = {name: value for name, value in (
         ("fehler_code", fehler_code), ("antwort_ende", antwort_ende),
-        ("teilantwort", teilantwort)) if value is not None}
+        ("teilantwort", teilantwort), ("usage", usage), ("diagnose_ref", diagnose_ref)) if value is not None}
     body.update(cause)
     try:
         resp = await call_platform(
@@ -357,7 +359,7 @@ async def mark_error(
                 job_id, message, code=code,
                 retryable=retryable, retry_after_s=retry_after_s,
                 fehler_code=fehler_code, antwort_ende=antwort_ende,
-                teilantwort=teilantwort,
+                teilantwort=teilantwort, usage=usage, diagnose_ref=diagnose_ref,
             )
         except store.JobRowMissing as missing:
             raise _row_missing_error("mark_error", job_id, missing)
