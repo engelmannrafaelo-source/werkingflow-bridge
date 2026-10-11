@@ -472,9 +472,6 @@ class ResearchRequest(BaseModel):
                     "New research policy defaults to no exemptions; omitted legacy requests retain compatibility.",
     )
 
-    agentischer_lauf: Optional[AgentischerLauf] = None
-    _agentischer_vertrag = model_validator(mode="before")(validate_request)
-
     # Core Research Parameters
     query: str = Field(..., description="Research question or topic to investigate")
 
@@ -497,6 +494,9 @@ class ResearchRequest(BaseModel):
         default=None,
         description="Host filesystem path where research report should be saved. If not provided, saves to /tmp/"
     )
+
+    agentischer_lauf: Optional[AgentischerLauf] = None
+    _agentischer_vertrag = model_validator(mode="before")(validate_request)
 
     # SuperClaude Research Depth
     depth: Optional[Literal["quick", "standard", "deep", "exhaustive"]] = Field(
