@@ -1,5 +1,5 @@
 from typing import List, Optional, Dict, Any, Union, Literal, Annotated
-from pydantic import BaseModel, Field, field_validator, model_validator, Discriminator
+from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, field_validator, model_validator, Discriminator
 from enum import Enum
 from datetime import datetime
 import uuid
@@ -38,10 +38,27 @@ class PrivacyMode(str, Enum):
     DISABLED = "disabled"  # Never anonymize
 
 
+class CacheControl(BaseModel):
+    """Cache-Grenze am Textblock (Anthropic-Form ``{"type": "ephemeral"}``).
+
+    Strikt: ein unbekannter Schluessel (z. B. ``ttl``) wird abgewiesen statt still
+    ignoriert — die Bridge reicht nur weiter, was sie nachweislich durchreicht
+    (CACHE2, src/cache_boundary.py).
+    """
+    model_config = ConfigDict(extra="forbid")
+    type: Literal["ephemeral"]
+
+
 class TextContentPart(BaseModel):
-    """Text content part for multimodal messages."""
+    """Text content part for multimodal messages.
+
+    ``cache_control`` markiert das Ende eines stabilen Praefixes. Die Bridge reicht
+    die LETZTE Marke einer Anfrage als Blockgrenze bis zur CLI durch
+    (src/cache_boundary.py); ohne Marke ist alles wie bisher.
+    """
     type: Literal["text"]
     text: str
+    cache_control: Optional[CacheControl] = None
 
 
 class ImageUrlDetail(BaseModel):
@@ -81,12 +98,21 @@ class Message(BaseModel):
     role: Literal["system", "user", "assistant"]
     content: Union[str, List[ContentPart]]
     name: Optional[str] = None
+    # Zeichenzahl des abgeflachten Inhalts bis einschliesslich des letzten Textblocks
+    # mit cache_control; None ohne Marke. Privat: kein Aufrufer kann sie setzen.
+    _cache_prefix_chars: Optional[int] = PrivateAttr(default=None)
+
+    @property
+    def cache_prefix_chars(self) -> Optional[int]:
+        return self._cache_prefix_chars
 
     @model_validator(mode='after')
     def normalize_content(self):
         """Convert array content to string for Claude Code compatibility.
 
         IMPORTANT: If content contains images, do NOT normalize - VisionProvider handles it.
+        Text-only: the string is unchanged by CACHE2; only the position of the last
+        ``cache_control`` mark is remembered in ``cache_prefix_chars``.
         """
         if isinstance(self.content, list):
             # Check if content contains images - if so, DON'T normalize
@@ -102,14 +128,21 @@ class Message(BaseModel):
 
             # Text-only content: Extract text from content parts and concatenate
             text_parts = []
+            marked_upto: Optional[int] = None
             for part in self.content:
                 if isinstance(part, TextContentPart):
                     text_parts.append(part.text)
+                    if part.cache_control is not None:
+                        marked_upto = len(text_parts)
                 elif isinstance(part, dict) and part.get("type") == "text":
                     text_parts.append(part.get("text", ""))
 
             # Join all text parts with newlines
             self.content = "\n".join(text_parts) if text_parts else ""
+            if marked_upto is not None:
+                # Laenge von "\n".join(text_parts[:marked_upto]) ohne den String zu bauen
+                prefix_len = sum(len(t) for t in text_parts[:marked_upto]) + (marked_upto - 1)
+                self._cache_prefix_chars = prefix_len if prefix_len > 0 else None
 
         return self
 
@@ -206,6 +239,23 @@ class ChatCompletionRequest(BaseModel):
         default=None,
         description="Passthrough for the Anthropic Messages API 'output_config' param, e.g. {'effort': 'low'|'medium'|'high'|'max'}. Same forwarding scope and caveats as 'thinking'. Omit for unchanged default behavior."
     )
+
+    @field_validator('messages')
+    @classmethod
+    def reject_cache_marker_chars(cls, v):
+        # U+E000..U+E002 sind die Cache-Grenzmarke der Bridge (src/cache_boundary.py).
+        # Steht eine davon schon im Text, waere die Grenze nicht eindeutig: abweisen.
+        from src.cache_boundary import contains_sentinel_chars
+        for m in v:
+            texts = [m.content] if isinstance(m.content, str) else [
+                getattr(p, "text", "") for p in m.content if getattr(p, "type", None) == "text"
+            ]
+            if any(contains_sentinel_chars(t or "") for t in texts):
+                raise ValueError(
+                    "message text contains reserved characters U+E000..U+E002 "
+                    "(bridge cache-boundary marker)"
+                )
+        return v
 
     @field_validator('n')
     @classmethod

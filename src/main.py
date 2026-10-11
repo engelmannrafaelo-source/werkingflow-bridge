@@ -65,6 +65,7 @@ from src.claude_cli import (
 )
 from src.middleware.bridge_error import SDKDisconnectError
 from src.message_adapter import MessageAdapter
+from src import cache_boundary
 from src.tool_leak_detector import hardened_system_prompt, looks_like_tool_leak
 from src.vision_provider import VisionProvider, get_vision_provider
 from src.routing.vision_router import (
@@ -1643,6 +1644,9 @@ async def generate_streaming_response(
         all_messages, actual_session_id = session_manager.process_messages(
             request.messages, request.session_id
         )
+        # CACHE2: mitgeschickte Cache-Grenze als Marke in den Text (ueberlebt
+        # Anonymisierung und filter_content), vor der CLI wieder herausgeschnitten.
+        all_messages, cache_boundary_requested = cache_boundary.mark_messages(all_messages)
 
         # Log chat completion start
         logger.info(f"Chat completion: session_id={actual_session_id}, total_messages={len(all_messages)}")
@@ -1685,6 +1689,12 @@ async def generate_streaming_response(
         prompt = MessageAdapter.filter_content(prompt)
         if system_prompt:
             system_prompt = MessageAdapter.filter_content(system_prompt)
+            system_prompt = cache_boundary.strip_sentinel_chars(system_prompt)
+        prompt, cache_boundary_at, cache_boundary_status = cache_boundary.split_prompt(
+            prompt, cache_boundary_requested
+        )
+        if cache_boundary_status:
+            logger.info(f"cache_boundary (streaming): status={cache_boundary_status} at={cache_boundary_at}")
         
         # Get Claude Code SDK options from request
         claude_options = request.to_claude_options()
@@ -1834,7 +1844,8 @@ async def generate_streaming_response(
                 stream=True,
                 enable_file_discovery=claude_options.get('enable_file_discovery', False),
                 max_thinking_tokens=claude_options.get('max_thinking_tokens'),
-                backend_env_vars=backend_config.env_vars if backend_config else None
+                backend_env_vars=backend_config.env_vars if backend_config else None,
+                cache_boundary=cache_boundary_at,
             ):
                 # Capture metadata chunk (don't stream it in SSE)
                 if isinstance(chunk, dict) and chunk.get("type") == "x_claude_metadata":
@@ -3771,6 +3782,8 @@ async def chat_completions(
             all_messages, actual_session_id = session_manager.process_messages(
                 request_body.messages, request_body.session_id
             )
+            # CACHE2: siehe generate_streaming_response
+            all_messages, cache_boundary_requested = cache_boundary.mark_messages(all_messages)
 
             logger.info(f"Chat completion: session_id={actual_session_id}, total_messages={len(all_messages)}")
 
@@ -3812,6 +3825,12 @@ async def chat_completions(
             prompt = MessageAdapter.filter_content(prompt)
             if system_prompt:
                 system_prompt = MessageAdapter.filter_content(system_prompt)
+                system_prompt = cache_boundary.strip_sentinel_chars(system_prompt)
+            prompt, cache_boundary_at, cache_boundary_status = cache_boundary.split_prompt(
+                prompt, cache_boundary_requested
+            )
+            if cache_boundary_status:
+                logger.info(f"cache_boundary: status={cache_boundary_status} at={cache_boundary_at}")
             
             # Get Claude Code SDK options from request
             claude_options = request_body.to_claude_options()
@@ -3862,7 +3881,8 @@ async def chat_completions(
                 stream=False,
                 enable_file_discovery=claude_options.get('enable_file_discovery', False),
                 max_thinking_tokens=claude_options.get('max_thinking_tokens'),
-                backend_env_vars=backend_config.env_vars if backend_config else None
+                backend_env_vars=backend_config.env_vars if backend_config else None,
+                cache_boundary=cache_boundary_at,
             ):
                 # Capture metadata chunk separately
                 if isinstance(chunk, dict) and chunk.get("type") == "x_claude_metadata":
@@ -4089,7 +4109,8 @@ async def chat_completions(
                     stream=False,
                     enable_file_discovery=retry_options.get('enable_file_discovery', False),
                     max_thinking_tokens=retry_options.get('max_thinking_tokens'),
-                    backend_env_vars=backend_config.env_vars if backend_config else None
+                    backend_env_vars=backend_config.env_vars if backend_config else None,
+                    cache_boundary=cache_boundary_at,
                 ):
                     if isinstance(chunk, dict) and chunk.get("type") == "x_claude_metadata":
                         continue
@@ -4290,6 +4311,9 @@ async def chat_completions(
 
                 # Return enriched response with session ID and worker headers
                 headers = {"X-Worker-Instance": worker_instance}
+                if cache_boundary_status:
+                    headers["X-Cache-Boundary"] = cache_boundary_status
+                    response_dict["x_claude_metadata"]["cache_boundary"] = cache_boundary_status
                 if cli_session_id:
                     headers["X-Claude-Session-ID"] = cli_session_id
                 else:
@@ -4302,6 +4326,9 @@ async def chat_completions(
             response_dict = response.model_dump()
             response_dict["x_claude_metadata"] = {"worker_instance": worker_instance}
             headers = {"X-Worker-Instance": worker_instance}
+            if cache_boundary_status:
+                headers["X-Cache-Boundary"] = cache_boundary_status
+                response_dict["x_claude_metadata"]["cache_boundary"] = cache_boundary_status
             if cli_session_id:
                 headers["X-Claude-Session-ID"] = cli_session_id
             else:

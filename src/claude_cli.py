@@ -1430,6 +1430,7 @@ class ClaudeCodeCLI:
         max_thinking_tokens: Optional[int] = None,
         sdk_mcp_servers: Optional[Dict[str, Any]] = None,
         resume_workdir: Optional[Path] = None,
+        cache_boundary: Optional[int] = None,
     ) -> AsyncGenerator[Dict[str, Any], None]:
         """Run Claude Code using the Python SDK and yield response chunks.
 
@@ -1475,7 +1476,15 @@ class ClaudeCodeCLI:
                         is seeded again, and the bookkeeping files get a
                         ``.fortsetzung`` suffix so the first run's prompt.txt /
                         metadata.json stay as they were.
+            cache_boundary: Zeichenindex in ``prompt``, bis zu dem der Text ein
+                        stabiler, cachebarer Praefix ist (CACHE2, src/cache_boundary.py).
+                        Gesetzt: die Nutzernachricht geht als zwei Inhaltsbloecke ueber
+                        den Stream-JSON-Eingang, der erste mit ``cache_control``. None:
+                        unveraendert wie bisher. Schreibt dieser Lauf den Prompt selbst
+                        um (Datei-Suche, Recherche-Protokoll), passt der Index nicht mehr
+                        und die Grenze wird mit ERROR verworfen.
         """
+        _prompt_as_received = prompt
         if resume_workdir is not None:
             if not session_id or continue_session:
                 raise ValueError("resume_workdir needs session_id (and no continue_session)")
@@ -2000,11 +2009,23 @@ class ClaudeCodeCLI:
                 # Solution: pass as an AsyncIterable so the SDK uses stdin (stream-json).
                 # LARGE_ARG_THRESHOLD_BYTES is defined at module level.
 
+                if cache_boundary is not None and prompt != _prompt_as_received:
+                    logger.error(
+                        "cache_boundary: prompt was rewritten inside run_completion "
+                        "(file discovery / research protocol) — boundary %s no longer "
+                        "valid, running WITHOUT cache boundary", cache_boundary,
+                    )
+                    cache_boundary = None
+                # CACHE2: mit Grenze zwei Textbloecke (Praefix mit cache_control),
+                # sonst der unveraenderte String — src/cache_boundary.py.
+                from src.cache_boundary import cli_user_content
+                _user_content = cli_user_content(prompt, cache_boundary)
+
                 async def _prompt_to_stream(prompt_text: str):
                     """Convert string prompt to AsyncIterable for streaming mode (stdin)."""
                     yield {
                         "type": "user",
-                        "message": {"role": "user", "content": prompt_text}
+                        "message": {"role": "user", "content": _user_content}
                     }
 
                 # SDK MCP servers need the control protocol, i.e. streaming
@@ -2019,12 +2040,20 @@ class ClaudeCodeCLI:
                 async def _prompt_stream_held_open(prompt_text: str):
                     yield {
                         "type": "user",
-                        "message": {"role": "user", "content": prompt_text}
+                        "message": {"role": "user", "content": _user_content}
                     }
                     await _sdk_result_seen.wait()
 
                 if sdk_mcp_servers:
                     prompt_source = _prompt_stream_held_open(prompt)
+                elif cache_boundary is not None:
+                    # Bloecke gibt es nur ueber den Stream-JSON-Eingang (argv kennt
+                    # nur einen String) — unabhaengig von der Groesse.
+                    logger.info(
+                        f"🧱 cache boundary at {cache_boundary:,}/{len(prompt):,} chars "
+                        f"→ streaming mode (stdin) with content blocks"
+                    )
+                    prompt_source = _prompt_to_stream(prompt)
                 elif len(prompt.encode("utf-8")) > LARGE_ARG_THRESHOLD_BYTES:
                     logger.info(
                         f"🔄 Large user prompt ({len(prompt):,} chars) → streaming mode (stdin) "
