@@ -705,6 +705,43 @@ def _metrics_document_performance(ctx: Ctx) -> ProbeResult:
                        f"{len(d['agents'])} agent(s) reported", r.status_code, ms)
 
 
+_JR_EP = "/v1/metrics/jobs-retention"
+
+
+@probe("metrics_jobs_retention", _JR_EP, {"hetzner"},
+       repro="curl $AI_BRIDGE_URL" + _JR_EP
+       + " -H 'Authorization: Bearer $AI_BRIDGE_API_KEY' " + ATTRIBUTION_REPRO)
+def _metrics_jobs_retention(ctx: Ctx) -> ProbeResult:
+    """BR11 job-retention / lost-row counters. Read-only GET of in-memory
+    counters (src/jobs/store_client.retention_snapshot), so probed rather than
+    EXCLUDED. Not under the LB emergency block (BR14N blocks named metrics
+    paths only) and not routed to the metrics-reader: the LB hands it to one
+    worker, which is the build just deployed.
+
+    Shape only, never counts: the counters are per worker and since start, so a
+    non-empty `row_missing_by_op` is STATE (and a rollback would not bring the
+    lost rows back) — it is reported in the detail, not judged."""
+    name, ep = "metrics_jobs_retention", _JR_EP
+    r, ms = _timed(lambda: requests.get(f"{ctx.base_url}{ep}",
+                                        headers=ctx.headers(), timeout=30))
+    if r.status_code != 200:
+        return ProbeResult(name, ep, False, f"HTTP {r.status_code}: {r.text[:200]}",
+                           r.status_code, ms)
+    d = r.json()
+    bad = [k for k in ("row_missing_by_op", "retention")
+           if not isinstance(d.get(k), dict)]
+    if "since_epoch" not in d:
+        bad.append("since_epoch")
+    if bad:
+        return ProbeResult(name, ep, False,
+                           f"missing/invalid key(s) {bad}: {str(d)[:150]}",
+                           r.status_code, ms)
+    return ProbeResult(name, ep, True,
+                       f"row_missing_by_op={d['row_missing_by_op']} "
+                       f"retention={d['retention']}",
+                       r.status_code, ms)
+
+
 # Endpoints covered by dedicated probes above but whose canonical route differs
 # from the probe endpoint are mapped here so the coverage validator sees them.
 COVERED_ALIASES = {
