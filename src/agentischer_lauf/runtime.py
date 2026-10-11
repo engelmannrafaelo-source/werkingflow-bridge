@@ -141,6 +141,18 @@ class Runtime:
                 "cache": {"hit": False, "ursprung_lauf_id": None},
             },
             "usage": unknown_usage(),
+            # Shared by main run and review: every model call was reserved as
+            # counted input + max_tokens against the remaining total before it
+            # was sent (see adapter.BoundedModel).
+            "grenze": {
+                "tokens_gesamt": run.grenzen.tokens_gesamt,
+                "zeit_s": run.grenzen.zeit_s,
+                "durchsetzung": "vorab_reserviert",
+                "tokens_verbraucht": 0,
+                "tokens_reserviert_max": 0,
+                "modellaufrufe": 0,
+                "ursache": None,
+            },
             "werkzeugaufrufe": {"vollstaendig": False, "eintraege": [], "protokoll_ref": None},
             "artefakte": [],
             "pruefung": None,
@@ -298,6 +310,15 @@ class Runtime:
                             {"content": result["content"], "artefakte": result["artefakte"]},
                         )
                         result["usage"] = aggregate([result["usage"], check["usage"]])
+                        for key in ("tokens_verbraucht", "modellaufrufe"):
+                            result["grenze"][key] += check["grenze"][key]
+                        result["grenze"]["tokens_reserviert_max"] = max(
+                            result["grenze"]["tokens_reserviert_max"],
+                            check["grenze"]["tokens_reserviert_max"],
+                        )
+                        result["grenze"]["ursache"] = (
+                            result["grenze"]["ursache"] or check["grenze"]["ursache"]
+                        )
                         if check["status"] != "success":
                             result.update(
                                 status="error",
@@ -375,6 +396,15 @@ class Runtime:
         )
         specs = [t.model_dump() for t in tools]
         provider = self.adapters.require(model)
+        if getattr(provider, "eigene_schleife", False):
+            # The CLI drives its own tool loop; its declared limits: cli.py.
+            from .cli import cli_phase
+
+            return await cli_phase(
+                self, provider, request, tenant, state, directory, result, material,
+                instruction, systemtext, model, tools, output, turns, max_tokens,
+                budget, phase, main_result,
+            )
         usages = []
         seen_calls = set()
         try:

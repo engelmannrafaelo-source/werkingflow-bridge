@@ -643,6 +643,7 @@ class ResearchResponse(ErrorVerdictFields):
 
     Returns both container and host file paths, plus execution metadata.
     """
+    grenze: Optional[Dict[str, Any]] = None
     status: Literal["success", "error"]
     query: str
     model: str

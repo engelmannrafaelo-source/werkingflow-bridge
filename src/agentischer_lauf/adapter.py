@@ -60,6 +60,22 @@ class Adapters:
             raise RunError("faehigkeit_nicht_verfuegbar")
         self._models[name] = model
 
+    def register_cli(self, name: str, run):
+        """A CLI place drives its own loop: no hard total bound, declared limits.
+
+        Registered only with every declared limit of cli.CliLauf; results
+        report hard_token_bound False instead of claiming a reservation.
+        """
+        from .cli import CliLauf
+
+        if (
+            not isinstance(run, CliLauf)
+            or run.hard_token_bound
+            or set(run.erklaerte_grenzen) != set(CliLauf.erklaerte_grenzen)
+        ):
+            raise RunError("faehigkeit_nicht_verfuegbar")
+        self._models[name] = run
+
     def require(self, name: str) -> BoundedModel:
         if name not in self._models:
             raise RunError("faehigkeit_nicht_verfuegbar")
