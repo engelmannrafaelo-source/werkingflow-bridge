@@ -42,9 +42,10 @@ from config.logging_config import get_logger
 
 logger = get_logger(__name__)
 
-# Drei Zeichen aus der Private Use Area. Kommen in echten Texten praktisch nicht vor;
-# tun sie es doch, wird die Anfrage abgewiesen (mark_messages), statt still falsch
-# zu schneiden.
+# Drei Zeichen aus der Private Use Area. Selten, aber nicht unmoeglich (Symbolschriften
+# in extrahiertem PDF-Text). Nur wenn eine Grenze angefordert ist, wird eine Anfrage mit
+# diesen Zeichen abgewiesen statt still falsch geschnitten; ohne Grenze bleiben sie
+# unangetastet wie vor CACHE2.
 SENTINEL = ""
 _SENTINEL_CHARS = set(SENTINEL)
 
@@ -65,6 +66,17 @@ def strip_sentinel_chars(text: str) -> str:
     return "".join(ch for ch in text if ch not in _SENTINEL_CHARS)
 
 
+def boundary_requested(messages: Sequence[Any]) -> bool:
+    """True, wenn eine Nutzernachricht eine Grenze mitbringt — dieselbe Regel wie
+    in ``mark_messages``. Davon haengt ab, ob die Markenzeichen reserviert sind."""
+    return any(
+        getattr(m, "role", None) == "user"
+        and isinstance(getattr(m, "content", None), str)
+        and getattr(m, "cache_prefix_chars", None) is not None
+        for m in messages
+    )
+
+
 def mark_messages(messages: Sequence[Any]) -> Tuple[List[Any], bool]:
     """Setzt die Marke an die LETZTE mitgeschickte Grenze einer Nutzernachricht.
 
@@ -75,21 +87,17 @@ def mark_messages(messages: Sequence[Any]) -> Tuple[List[Any], bool]:
     die markierte Nachricht ist eine Kopie, damit eine Session-Historie keine Marke
     speichert.
 
+    Ohne Grenze kommt die Liste unveraendert zurueck, auch mit Markenzeichen im Text.
+
     Raises:
-        ValueError: wenn eine Nachricht die Markenzeichen schon selbst enthaelt —
-            die Grenze waere dann nicht eindeutig (wird zu 400).
+        ValueError: wenn eine Grenze angefordert ist und eine Nachricht die
+            Markenzeichen schon selbst enthaelt — die Grenze waere dann nicht
+            eindeutig. (Die Anfrage selbst weist der Request-Validator schon ab;
+            das hier trifft nur eine Session-Historie mit solchen Zeichen.)
     """
     from src.models import Message  # lokaler Import: models importiert dieses Modul
 
     out = list(messages)
-    for m in out:
-        content = getattr(m, "content", None)
-        if isinstance(content, str) and contains_sentinel_chars(content):
-            raise ValueError(
-                "Nachrichtentext enthaelt reservierte Zeichen U+E000..U+E002 "
-                "(Cache-Grenzmarke der Bridge) — bitte entfernen."
-            )
-
     last_idx: Optional[int] = None
     for i, m in enumerate(out):
         if getattr(m, "role", None) == "user" and isinstance(getattr(m, "content", None), str) \
@@ -97,6 +105,14 @@ def mark_messages(messages: Sequence[Any]) -> Tuple[List[Any], bool]:
             last_idx = i
     if last_idx is None:
         return out, False
+
+    for m in out:
+        content = getattr(m, "content", None)
+        if isinstance(content, str) and contains_sentinel_chars(content):
+            raise ValueError(
+                "Nachrichtentext enthaelt reservierte Zeichen U+E000..U+E002 "
+                "(Cache-Grenzmarke der Bridge) zusammen mit cache_control — bitte entfernen."
+            )
 
     m = out[last_idx]
     pos = m.cache_prefix_chars
@@ -118,10 +134,12 @@ def split_prompt(prompt: str, requested: bool) -> Tuple[str, Optional[int], Opti
 
     ``grenze`` ist der Zeichenindex im bereinigten Prompt, bis zu dem die CLI einen
     cachebaren Block bekommt. ``status`` ist None, wenn keine Grenze angefordert war.
-    Reste der Markenzeichen werden IMMER entfernt — das Modell sieht sie nie.
+    Ohne Grenze bleibt der Prompt Zeichen fuer Zeichen unveraendert (wie vor CACHE2,
+    auch mit U+E000..U+E002 aus dem Aufrufertext). Mit Grenze werden Reste der
+    Markenzeichen immer entfernt — das Modell sieht sie nie.
     """
     if not requested:
-        return strip_sentinel_chars(prompt), None, None
+        return prompt, None, None
     count = prompt.count(SENTINEL)
     if count != 1:
         status = LOST_SENTINEL_MISSING if count == 0 else LOST_SENTINEL_DUPLICATED

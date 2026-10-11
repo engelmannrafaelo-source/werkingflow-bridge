@@ -41,12 +41,27 @@ class PrivacyMode(str, Enum):
 class CacheControl(BaseModel):
     """Cache-Grenze am Textblock (Anthropic-Form ``{"type": "ephemeral"}``).
 
-    Strikt: ein unbekannter Schluessel (z. B. ``ttl``) wird abgewiesen statt still
-    ignoriert — die Bridge reicht nur weiter, was sie nachweislich durchreicht
-    (CACHE2, src/cache_boundary.py).
+    Unbekannte Schluessel (z. B. ``ttl``) werden ignoriert wie vor CACHE2, als dort
+    das ganze ``cache_control`` still wegfiel — ein bisher laufender Aufruf darf
+    nicht zu 422 werden (CACHE2R B2). Ignoriert wird aber LAUT (WARN mit den
+    Schluesselnamen): wer ``ttl: 1h`` schickt, bekommt die 5-Minuten-Grenze der CLI,
+    und eine Kostenmessung, die mit 1 h rechnet, waere sonst still falsch.
     """
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="ignore")
     type: Literal["ephemeral"]
+
+    @model_validator(mode="before")
+    @classmethod
+    def warn_unknown_keys(cls, data):
+        if isinstance(data, dict):
+            unknown = sorted(str(k) for k in data if k != "type")
+            if unknown:
+                logger.warning(
+                    "cache_control: unbekannte Schluessel %s ignoriert — die Bridge reicht nur "
+                    "{'type': 'ephemeral'} an die CLI durch (deren TTL gilt, 5 min)",
+                    unknown,
+                )
+        return data
 
 
 class TextContentPart(BaseModel):
@@ -244,8 +259,13 @@ class ChatCompletionRequest(BaseModel):
     @classmethod
     def reject_cache_marker_chars(cls, v):
         # U+E000..U+E002 sind die Cache-Grenzmarke der Bridge (src/cache_boundary.py).
-        # Steht eine davon schon im Text, waere die Grenze nicht eindeutig: abweisen.
-        from src.cache_boundary import contains_sentinel_chars
+        # Steht eine davon schon im Text, waere die Grenze nicht eindeutig: abweisen —
+        # aber NUR, wenn eine Grenze angefordert ist. Ohne cache_control laufen diese
+        # Zeichen (Symbolschriften in extrahiertem PDF-Text) unveraendert durch wie
+        # vor CACHE2 (CACHE2R B2).
+        from src.cache_boundary import boundary_requested, contains_sentinel_chars
+        if not boundary_requested(v):
+            return v
         for m in v:
             texts = [m.content] if isinstance(m.content, str) else [
                 getattr(p, "text", "") for p in m.content if getattr(p, "type", None) == "text"
@@ -253,7 +273,7 @@ class ChatCompletionRequest(BaseModel):
             if any(contains_sentinel_chars(t or "") for t in texts):
                 raise ValueError(
                     "message text contains reserved characters U+E000..U+E002 "
-                    "(bridge cache-boundary marker)"
+                    "(bridge cache-boundary marker); not allowed together with cache_control"
                 )
         return v
 

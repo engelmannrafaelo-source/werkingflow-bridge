@@ -14,6 +14,7 @@ uebernimmt, ist gegen eine Attrappe der Messages-API gemessen
 (CACHE2-ergebnis.md) — hier nicht wiederholbar ohne die CLI.
 """
 
+import re
 from pathlib import Path
 
 import pytest
@@ -73,15 +74,39 @@ class TestRequestModel:
         assert r.messages[1].cache_prefix_chars is None
         assert _req("plain").messages[1].cache_prefix_chars is None
 
-    def test_unknown_cache_control_key_is_rejected_not_dropped(self):
-        with pytest.raises(ValidationError):
-            _req([{"type": "text", "text": "x", "cache_control": {"type": "ephemeral", "ttl": "1h"}}])
+    def test_unknown_cache_control_key_is_ignored_loudly(self, caplog):
+        # CACHE2R B2: vor CACHE2 lief {"ttl": ...} mit 200 durch (cache_control wurde
+        # ignoriert). Das bleibt so — die Grenze gilt, ttl nicht, und das steht im Log.
+        blocks = [
+            {"type": "text", "text": STABIL, "cache_control": {"type": "ephemeral", "ttl": "1h"}},
+            {"type": "text", "text": AUFGABE},
+        ]
+        with caplog.at_level("WARNING"):
+            r = _req(blocks)
+        assert r.messages[1].content == STABIL + "\n" + AUFGABE
+        assert r.messages[1].cache_prefix_chars == len(STABIL)
+        assert "cache_control: unbekannte Schluessel ['ttl'] ignoriert" in caplog.text
 
-    def test_reserved_marker_chars_in_request_rejected(self):
+    def test_known_cache_control_logs_nothing(self, caplog):
+        with caplog.at_level("WARNING"):
+            _req(_marked_blocks())
+        assert "cache_control" not in caplog.text
+
+    def test_reserved_marker_chars_rejected_only_with_boundary(self):
         with pytest.raises(ValidationError):
-            _req("text mit " + SENTINEL)
-        with pytest.raises(ValidationError):
-            _req([{"type": "text", "text": "xy"}])
+            _req([{"type": "text", "text": "x\ue001y", "cache_control": {"type": "ephemeral"}},
+                  {"type": "text", "text": AUFGABE}])
+        with pytest.raises(ValidationError):   # Zeichen im ungemarkten Rest, Grenze davor
+            _req([{"type": "text", "text": STABIL, "cache_control": {"type": "ephemeral"}},
+                  {"type": "text", "text": "Symbol \ue000 aus PDF"}])
+
+    def test_reserved_marker_chars_without_boundary_pass_unchanged(self):
+        # CACHE2R B2: Private-Use-Zeichen aus Symbolschriften in PDF-Text. Ohne
+        # cache_control ist das ein ganz normaler Aufruf wie vor CACHE2.
+        for content in ("text mit " + SENTINEL,
+                        [{"type": "text", "text": "x\ue001y"}, {"type": "text", "text": AUFGABE}]):
+            r = _req(content)
+            assert r.messages[1].cache_prefix_chars is None
 
 
 class TestChain:
@@ -117,6 +142,16 @@ class TestChain:
         assert at is None and status == cache_boundary.LOST_SENTINEL_MISSING
         assert not cache_boundary.contains_sentinel_chars(prompt)
         assert "OHNE Cache-Grenze" in caplog.text
+
+    def test_reserved_chars_without_boundary_reach_the_cli_unchanged(self):
+        # vorher (CACHE2) entfernte split_prompt sie auch ohne Grenze still
+        text = "Messwert \ue000 23,5 \ue002 aus Symbolschrift"
+        msgs = _req(text, system="System \ue001 mit Symbol").messages
+        prompt, at, status, system = _chain(msgs)
+        assert (at, status) == (None, None)
+        assert prompt == "Human: " + text
+        assert system == "System \ue001 mit Symbol"
+        assert cli_user_content(prompt, at) == prompt
 
     def test_session_history_is_not_marked(self):
         msgs = _req(_marked_blocks()).messages
@@ -159,3 +194,7 @@ def test_main_passes_boundary_on_every_chat_cli_call():
     assert main.count("cache_boundary.mark_messages(all_messages)") == 2      # stream + non-stream
     assert main.count("cache_boundary.split_prompt(") == 2
     assert main.count("cache_boundary=cache_boundary_at,") == 3             # + tool-leak retry
+    # Systemprompt wird nur bei angeforderter Grenze von Markenzeichen bereinigt (B2)
+    assert main.count("strip_sentinel_chars(system_prompt)") == 2
+    assert len(re.findall(r"if cache_boundary_requested:\n\s+system_prompt = cache_boundary"
+                          r"\.strip_sentinel_chars\(system_prompt\)", main)) == 2

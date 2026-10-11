@@ -1689,7 +1689,8 @@ async def generate_streaming_response(
         prompt = MessageAdapter.filter_content(prompt)
         if system_prompt:
             system_prompt = MessageAdapter.filter_content(system_prompt)
-            system_prompt = cache_boundary.strip_sentinel_chars(system_prompt)
+            if cache_boundary_requested:
+                system_prompt = cache_boundary.strip_sentinel_chars(system_prompt)
         prompt, cache_boundary_at, cache_boundary_status = cache_boundary.split_prompt(
             prompt, cache_boundary_requested
         )
@@ -3825,7 +3826,8 @@ async def chat_completions(
             prompt = MessageAdapter.filter_content(prompt)
             if system_prompt:
                 system_prompt = MessageAdapter.filter_content(system_prompt)
-                system_prompt = cache_boundary.strip_sentinel_chars(system_prompt)
+                if cache_boundary_requested:
+                    system_prompt = cache_boundary.strip_sentinel_chars(system_prompt)
             prompt, cache_boundary_at, cache_boundary_status = cache_boundary.split_prompt(
                 prompt, cache_boundary_requested
             )
