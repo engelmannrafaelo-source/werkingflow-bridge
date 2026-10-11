@@ -51,12 +51,18 @@ _GRENZE_TURN = (
     "were doing. Pick up mid-thought if that is where the cut happened. Break "
     "remaining work into smaller pieces."
 )
-_LOST_TEXT = "API Error: Connection lost before a response was produced. Try again."
+# Verbatim from the real CLI 2.1.285 run with exhausted continuations (BRTRUNC2R).
+_LOST_TEXT = "API Error: Connection lost mid-response. The response above may be incomplete."
 _BLOCK_START = '```pruefwissen-auswahl\n{"dokument_ids": ["kw-1", "kw-2", '
 _BLOCK_REST = '"kw-3"]}\n```'
 
 WORKER_DOCKERFILE = (
     Path(__file__).resolve().parent.parent / "docker" / "Dockerfile.worker"
+)
+# Same CLI, own image (BRTRUNC2R note): both must move together.
+CLI_DOCKERFILES = (
+    WORKER_DOCKERFILE,
+    Path(__file__).resolve().parent.parent / "docker" / "Dockerfile.erkunder",
 )
 
 
@@ -171,6 +177,8 @@ async def test_abbruch_erschoepft_ueber_echten_parser(monkeypatch, tmp_path):
     raw += [_a(_LOST_TEXT, error="server_error"), _r(is_error=True)]
     chunks = await _durch_run_completion(raw, monkeypatch, tmp_path)
     assert antwort_ende(chunks) == "abbruch_fortgesetzt"
+    # The CLI's own error message is not part of the answer (BRTRUNC2N).
+    assert teilantwort(chunks) == "T1 " + _BLOCK_START + "T2T3T4"
 
 
 @pytest.mark.asyncio
@@ -324,14 +332,17 @@ async def test_dateivertrag_abbruch_nur_auskunft(tmp_path):
 
 
 def test_cli_saetze_gegen_worker_pin_geprueft():
-    """Fails when docker/Dockerfile.worker moves to another CLI version: then
+    """Fails when docker/Dockerfile.worker or .erkunder moves to another CLI version: then
     re-read both continuation sentences (strings on the npm package, search
     'Resume directly') and update CLI_CONTINUATION_VERIFIED_PIN."""
-    pins = re.findall(
-        r"@anthropic-ai/claude-code@([0-9][0-9A-Za-z.\-]*)",
-        WORKER_DOCKERFILE.read_text(),
-    )
-    assert pins, "no claude-code pin in docker/Dockerfile.worker"
+    pins = [
+        pin
+        for dockerfile in CLI_DOCKERFILES
+        for pin in re.findall(
+            r"@anthropic-ai/claude-code@([0-9][0-9A-Za-z.\-]*)", dockerfile.read_text()
+        )
+    ]
+    assert len(pins) >= len(CLI_DOCKERFILES), f"claude-code pin missing in {CLI_DOCKERFILES}"
     assert set(pins) == {claude_cli.CLI_CONTINUATION_VERIFIED_PIN}, (
         f"worker CLI pin {pins} != {claude_cli.CLI_CONTINUATION_VERIFIED_PIN}: "
         f"re-verify CLI_CONTINUATION_SENTENCE / CLI_ABBRUCH_SENTENCE"

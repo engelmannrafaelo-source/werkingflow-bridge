@@ -1179,11 +1179,17 @@ def teilantwort(chunks: list) -> Optional[str]:
     """The parts of a cut-off final answer, joined as the CLI streamed them
     (everything after the last tool call, no separator at the seams). NOT the
     answer: seams may repeat, skip or change form. Handed to the caller only
-    next to fehler_code antwort_abgeschnitten, as material for its repair."""
+    next to fehler_code antwort_abgeschnitten, as material for its repair.
+
+    Messages the CLI wrote itself (``cli_error`` set, e.g. "API Error:
+    Connection lost mid-response..." once its continuations are used up) are
+    not part of the answer and stay out (BRTRUNC2N)."""
     assistants = [c for c in chunks if _is_assistant_chunk(c)]
     tools = [i for i, c in enumerate(assistants) if _has_tool_use(c)]
     last_tool = tools[-1] if tools else -1
-    text = "".join(_message_text(c) for c in assistants[last_tool + 1:])
+    text = "".join(
+        _message_text(c) for c in assistants[last_tool + 1:] if not c.get("cli_error")
+    )
     return text or None
 
 
