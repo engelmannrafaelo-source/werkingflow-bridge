@@ -542,6 +542,12 @@ def _raise_on_status_error(kind: str, result: Dict[str, Any]) -> None:
         f"{result.get('error') or 'no error message'}",
         retryable=verdict.get("retryable", False),
         retry_after_s=verdict.get("retry_after_s"),
+        # Passed on as the endpoint answered them; only bodies that carry the
+        # fields (research since RUSAGE) put them on the job error.
+        usage_felder=(
+            {"usage": result.get("usage"), "usage_fehlt": result.get("usage_fehlt")}
+            if "usage" in result or "usage_fehlt" in result else None
+        ),
     )
 
 

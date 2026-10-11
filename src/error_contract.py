@@ -71,10 +71,21 @@ class JobFailure(RuntimeError):
     lost its connection."""
 
     def __init__(self, message: str, *, retryable: bool,
-                 retry_after_s: Optional[float] = None):
+                 retry_after_s: Optional[float] = None,
+                 usage_felder: Optional[Dict[str, Any]] = None):
         super().__init__(message)
         self.retryable = bool(retryable)
         self.retry_after_s = retry_after_s
+        # usage / usage_fehlt of the failed self-call (research, RUSAGE): a
+        # failed run was paid for, and the job error is all its caller gets.
+        # None = the failure carries no usage information at all.
+        self.usage_felder = usage_felder
+
+
+def job_usage_fields(exc: BaseException) -> Dict[str, Any]:
+    """usage / usage_fehlt for the job error row, {} when the failure has none."""
+    felder = getattr(exc, "usage_felder", None)
+    return dict(felder) if isinstance(felder, dict) else {}
 
 
 def _upstream_status(code: Optional[str]) -> Optional[int]:

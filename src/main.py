@@ -41,6 +41,7 @@ from src.models import (
     SessionListResponse,
     ResearchRequest,
     ResearchResponse,
+    ResearchUsage,
     AsyncResearchStatus,
     DocAgentRequest,
     DocAgentResponse,
@@ -5041,6 +5042,7 @@ async def _research_strom(strom, antwort_im_text: bool):
                 f"complete answer."
             )
             truncated.antwort_ende = ende
+            truncated.usage = e.usage
             raise truncated from e
         raise
 
@@ -5296,6 +5298,42 @@ async def _pool_luecken_rueckrunde(
     return neu, rr_usage
 
 
+def _research_usage_felder(
+    input_tokens: Optional[int],
+    output_tokens: Optional[int],
+    cache_creation: int,
+    cache_read: int,
+    grund: str,
+) -> Dict[str, Any]:
+    """usage / usage_fehlt of a ResearchResponse from the run's sums (RUSAGE).
+
+    None counts mean the run reported nothing: then usage stays None and
+    usage_fehlt names why — never a made-up 0 a caller would bill."""
+    if input_tokens is None and output_tokens is None:
+        return {"usage": None, "usage_fehlt": grund}
+    return {"usage": ResearchUsage.aus_summen(
+        input_tokens or 0, output_tokens or 0, cache_creation or 0, cache_read or 0,
+    )}
+
+
+def _vorenthaltene_usage(e: BaseException) -> Optional[Dict[str, int]]:
+    """Usage of a CLI result the run withheld because it ended in an API error
+    (CliApiError.usage) — directly, or as the cause of the truncation verdict
+    _research_strom raises from it. None for every other exception: their
+    rounds were already summed where they ran."""
+    for kandidat in (e, e.__cause__):
+        if isinstance(kandidat, CliApiError):
+            return kandidat.usage
+    return None
+
+
+# usage_fehlt of the pool path: the CLI never started, or it ran and no result
+# message with usage reached the bridge (timeout, crash, stream cut).
+USAGE_FEHLT_KEIN_LAUF = "kein_lauf"
+USAGE_FEHLT_CLI = "cli_ohne_usage"
+USAGE_FEHLT_RESEARCH_CLOUD = "research_cloud_fehler"
+
+
 async def _execute_research_impl(
     request_body: ResearchRequest,
     backend_config: Optional[BackendConfig],
@@ -5322,6 +5360,7 @@ async def _execute_research_impl(
     # How the final assistant message ended (claude_cli.antwort_ende); set
     # once the stream is complete, reported on success and on error.
     research_antwort_ende: Optional[str] = None
+    research_lauf_gestartet = False  # usage_fehlt: kein_lauf vs cli_ohne_usage
 
     try:
         logger.info(
@@ -5515,6 +5554,7 @@ async def _execute_research_impl(
         file_metadata = None
         cli_resume_id: Optional[str] = None
 
+        research_lauf_gestartet = True
         async for chunk in _research_strom(claude_cli.run_completion(
             prompt=research_prompt,
             append_system_prompt=library_append_prompt,
@@ -5818,6 +5858,8 @@ async def _execute_research_impl(
                 if e.usage:  # the error ledger row carries the repair round too
                     accumulated_input_tokens = (accumulated_input_tokens or 0) + e.usage["input_tokens"]
                     accumulated_output_tokens = (accumulated_output_tokens or 0) + e.usage["output_tokens"]
+                    accumulated_cache_read += e.usage["cache_read_tokens"]
+                    accumulated_cache_creation += e.usage["cache_creation_tokens"]
                 raise
             if nachhol_usage:
                 accumulated_input_tokens = (accumulated_input_tokens or 0) + nachhol_usage["input_tokens"]
@@ -6000,6 +6042,10 @@ async def _execute_research_impl(
             library_calls=library_calls if library_active else None,
             antwort_quelle=antwort_quelle,
             antwort_ende=research_antwort_ende,
+            **_research_usage_felder(
+                accumulated_input_tokens, accumulated_output_tokens,
+                accumulated_cache_creation, accumulated_cache_read, USAGE_FEHLT_CLI,
+            ),
         )
 
     except (WorkerUnavailableError, RateLimitError):
@@ -6019,6 +6065,14 @@ async def _execute_research_impl(
                 "execution_time": execution_time
             }
         )
+
+        # The result an API error withheld still reports what the run used.
+        _vorenthalten = _vorenthaltene_usage(e)
+        if _vorenthalten:
+            accumulated_input_tokens = (accumulated_input_tokens or 0) + _vorenthalten["input_tokens"]
+            accumulated_output_tokens = (accumulated_output_tokens or 0) + _vorenthalten["output_tokens"]
+            accumulated_cache_read += _vorenthalten["cache_read_tokens"]
+            accumulated_cache_creation += _vorenthalten["cache_creation_tokens"]
 
         # R1: Persist error activity (best-effort — must not shadow the original error)
         try:
@@ -6065,6 +6119,12 @@ async def _execute_research_impl(
             # The raiser's own verdict (error_contract rule 1), e.g. CliApiError:
             # a 400 from the API stays final, a 529 may be asked again.
             **_eigenes_urteil(e),
+            # A failed run was paid for as far as it got.
+            **_research_usage_felder(
+                accumulated_input_tokens, accumulated_output_tokens,
+                accumulated_cache_creation, accumulated_cache_read,
+                USAGE_FEHLT_CLI if research_lauf_gestartet else USAGE_FEHLT_KEIN_LAUF,
+            ),
         )
 
 
@@ -6270,6 +6330,9 @@ async def _execute_research_cloud_impl(
             model=request_body.model,
             execution_time_seconds=round(execution_time, 2),
             **error_fields,
+            # The executor raises without the usage of the rounds before the
+            # failure; the ledger row above books 0 for the same reason.
+            usage_fehlt=USAGE_FEHLT_RESEARCH_CLOUD,
         )
 
     # Real-cost ledger booking — research-cloud always books real cost
@@ -6348,6 +6411,10 @@ async def _execute_research_cloud_impl(
         library_calls=result.library_calls,
         antwort_quelle="text",
         antwort_ende=result.stop_reason,
+        usage=ResearchUsage.aus_summen(
+            result.usage.input_tokens, result.usage.output_tokens,
+            result.usage.cache_creation_input_tokens, result.usage.cache_read_input_tokens,
+        ),
     )
 
 

@@ -271,6 +271,7 @@ async def mark_error(
     code: Optional[str] = None,
     retryable: Optional[bool] = None,
     retry_after_s: Optional[int] = None,
+    **usage_felder: Any,
 ) -> None:
     """Terminal error. `retryable`/`retry_after_s` are the verdict of
     src/error_contract.py; when a caller has none (a writer from before BR9),
@@ -281,6 +282,14 @@ async def mark_error(
     if retryable is not None:
         error["retryable"] = bool(retryable)
         error["retry_after_s"] = retry_after_s
+    # usage / usage_fehlt of a failed research run (RUSAGE): only the keys the
+    # caller passed — a job without them keeps the row shape it had.
+    for key in ("usage", "usage_fehlt"):
+        if key in usage_felder:
+            error[key] = usage_felder[key]
+    unbekannt = set(usage_felder) - {"usage", "usage_fehlt"}
+    if unbekannt:
+        raise TypeError(f"mark_error: unknown fields {sorted(unbekannt)}")
     pool = get_pool()
     async with pool.acquire() as conn:
         tag = await conn.execute(

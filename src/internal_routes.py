@@ -690,6 +690,10 @@ class InternalJobError(BaseModel):
     # send neither.
     retryable: Optional[bool] = None
     retry_after_s: Optional[int] = Field(default=None, ge=0)
+    # Failed research self-call (RUSAGE): the run's usage, or why there is none.
+    # Absent for every other job; stored only when sent.
+    usage: Optional[Dict[str, Any]] = None
+    usage_fehlt: Optional[str] = None
 
 
 class InternalJobDefer(BaseModel):
@@ -855,6 +859,7 @@ async def internal_mark_error(
         await store.mark_error(
             job_id, body.message, code=body.code,
             retryable=body.retryable, retry_after_s=body.retry_after_s,
+            **body.model_dump(include={"usage", "usage_fehlt"}, exclude_unset=True),
         )
     except store.JobRowMissing as e:
         raise _job_row_missing(e)

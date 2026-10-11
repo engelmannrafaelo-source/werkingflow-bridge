@@ -621,6 +621,43 @@ class ErrorVerdictFields(BaseModel):
         return self
 
 
+class ResearchUsage(Usage):
+    """Token usage of one research run (RUSAGE, 11.10.2026).
+
+    The chat/completions shape (Usage: prompt_tokens = uncached + cache-write +
+    cache-read input, completion_tokens, cache_read_tokens, cache_write_tokens)
+    plus the Anthropic names the CLI and the Messages API report
+    (input_tokens = UNCACHED input only). Both from the same numbers: a caller
+    that reads chat usage reads this, one that reads Anthropic usage too.
+    Sum over every round the run paid for (repair round, gap round)."""
+    input_tokens: int
+    output_tokens: int
+    cache_creation_input_tokens: int
+    cache_read_input_tokens: int
+
+    @classmethod
+    def aus_summen(cls, input_tokens: int, output_tokens: int,
+                   cache_creation_input_tokens: int,
+                   cache_read_input_tokens: int) -> "ResearchUsage":
+        prompt = input_tokens + cache_creation_input_tokens + cache_read_input_tokens
+        return cls(
+            prompt_tokens=prompt,
+            completion_tokens=output_tokens,
+            total_tokens=prompt + output_tokens,
+            cache_read_tokens=cache_read_input_tokens,
+            cache_write_tokens=cache_creation_input_tokens,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            cache_creation_input_tokens=cache_creation_input_tokens,
+            cache_read_input_tokens=cache_read_input_tokens,
+        )
+
+
+# usage_fehlt when the path that built the response measured nothing — e.g. a
+# request refused before any run. The run paths name their own reason.
+RESEARCH_USAGE_NICHT_GEMESSEN = "nicht_gemessen"
+
+
 class ResearchResponse(ErrorVerdictFields):
     """
     Response model for research endpoint.
@@ -718,6 +755,31 @@ class ResearchResponse(ErrorVerdictFields):
             "a smaller one will not. None for every other error."
         ),
     )
+    usage: Optional[ResearchUsage] = Field(
+        default=None,
+        description=(
+            "success AND error: tokens the run used, as far as the run reported them "
+            "(the CLI's result message, the Messages API on the research-cloud path). "
+            "None when nothing was reported — never a made-up 0; usage_fehlt says why."
+        ),
+    )
+    usage_fehlt: Optional[str] = Field(
+        default=None,
+        description=(
+            "set exactly when usage is None: why there is no usage, e.g. "
+            "'cli_ohne_usage' (the run ended without a result carrying usage), "
+            "'research_cloud_fehler' (the cloud run failed before reporting it), "
+            "'nicht_gemessen' (no run measured, e.g. refused before it started)."
+        ),
+    )
+
+    @model_validator(mode="after")
+    def _usage_oder_grund(self):
+        if self.usage is not None:
+            self.usage_fehlt = None
+        elif not self.usage_fehlt:
+            self.usage_fehlt = RESEARCH_USAGE_NICHT_GEMESSEN
+        return self
 
 
 class DocAgentFile(BaseModel):

@@ -472,8 +472,10 @@ def detect_cli_api_error(message: Any) -> Optional[Dict[str, Any]]:
 
 
 def raise_cli_api_error(worker_id: str, turn: Optional[Dict[str, Any]],
-                        result: Optional[Dict[str, Any]]) -> None:
-    """Log loudly and raise CliApiError from the withheld turn and/or result."""
+                        result: Optional[Dict[str, Any]],
+                        usage: Optional[Dict[str, int]] = None) -> None:
+    """Log loudly and raise CliApiError from the withheld turn and/or result.
+    `usage`: what the withheld result message reported (extract_result_usage)."""
     status = (result or {}).get("status")
     cli_error = (turn or {}).get("cli_error")
     text = (turn or {}).get("text") or (result or {}).get("text") or ""
@@ -484,7 +486,9 @@ def raise_cli_api_error(worker_id: str, turn: Optional[Dict[str, Any]],
         extra={"cli_api_error": True, "worker_id": worker_id,
                "upstream_status": status},
     )
-    raise CliApiError(status, cli_error, text, worker_id)
+    err = CliApiError(status, cli_error, text, worker_id)
+    err.usage = usage
+    raise err
 
 
 def handle_account_limit(worker_id: str, signal: str, message: Any) -> None:
@@ -2282,6 +2286,9 @@ class ClaudeCodeCLI:
                                     raise_cli_api_error(
                                         os.environ.get("INSTANCE_NAME", "unknown"),
                                         _api_error_turn, _api_error,
+                                        usage=extract_result_usage(
+                                            sdk_message_to_dict(message)
+                                        ),
                                     )
                                 _api_error_turn = _api_error
                                 continue

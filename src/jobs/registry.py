@@ -29,7 +29,7 @@ import logging
 import os
 from typing import Any, Awaitable, Callable, Dict, List, Optional
 
-from src.error_contract import job_code_fields, job_error_fields
+from src.error_contract import job_code_fields, job_error_fields, job_usage_fields
 from src.jobs import store_client
 from src.jobs.store import JOB_STATUS_CANCELLED
 
@@ -338,7 +338,9 @@ async def _run_body(
         # src/error_contract.py — never re-derived from the message text.
         logger.error(f"❌ Async job {job_id} (kind={kind}) crashed: {e}", exc_info=True)
         try:
-            await store_client.mark_error(job_id, str(e), **job_error_fields(e))
+            await store_client.mark_error(
+                job_id, str(e), **job_error_fields(e), **job_usage_fields(e)
+            )
         except store_client.JobRowMissing:
             pass  # counted and logged by store_client
     finally:

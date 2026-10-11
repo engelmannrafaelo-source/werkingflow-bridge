@@ -708,6 +708,10 @@ class CliApiError(ClassifiedError):
         self.retryable = self._transient()
         # Same Retry-After as the 429 envelope below; None when final.
         self.retry_after_s = 30 if self.retryable else None
+        # Usage of the withheld result message (claude_cli.extract_result_usage
+        # shape), None when the run ended without one. The run was paid for
+        # even though its answer is not handed out (RUSAGE).
+        self.usage: Optional[Dict[str, int]] = None
 
     def _transient(self) -> bool:
         s = self.status
