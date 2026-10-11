@@ -10,7 +10,12 @@
 --   (BRIDGE_WORKERS env: worker1..4 on primary, worker-sahori/worker-kurt on
 --    production) or "unavailable".
 -- Sets ngx.var.x_pool_decision to: weighted_capacity | round_robin_fallback |
---   all_unavail | all_unavail_overflow
+--   all_unavail | all_unavail_overflow | affinity (CACHE2), with
+--   "+affinity_fallback" appended when a requested affinity could not be served
+-- Sets ngx.var.affinity_upstream (CACHE2) to claude_workers_affin_<worker> on an
+--   affinity hit; otherwise it keeps the location default "claude_workers".
+-- Sets ngx.var.x_cache_affinity (CACHE2) to "hit" | "fallback:<reason>" when the
+--   request carried X-Cache-Affinity-Key, "" otherwise.
 -- Sets ngx.var.pool_exhausted to "1" ONLY in the all_unavail_overflow case.
 --
 -- Decision logic:
@@ -250,7 +255,60 @@ end
 -- This module keeps the I/O, the shared state and the logging.
 -- ---------------------------------------------------------------------------
 local pool_pick = require "pool_pick"
-local pick_weighted_account = pool_pick.pick_weighted_account
+
+-- ---------------------------------------------------------------------------
+-- Account affinity (CACHE2) — see pool_pick.pick_with_affinity for the policy.
+--
+-- Request header X-Cache-Affinity-Key (caller's run/job id). Without it nothing
+-- changes: $affinity_upstream stays "claude_workers" (round-robin, as before).
+-- With it, a hit names the per-worker group claude_workers_affin_<worker>
+-- (generate-bridge-upstreams.sh) so the request REACHES the preferred account;
+-- every miss is said out loud: response header X-Cache-Affinity
+-- ("hit" | "fallback:<reason>"), a WARN line with the reason, a counter in
+-- /internal/pool-router/state, and "+affinity_fallback" on the pool_decision.
+-- ---------------------------------------------------------------------------
+local AFFINITY_KEY_MAX_LEN = 256
+local AFFINITY_UPSTREAM_PREFIX = "claude_workers_affin_"
+
+local WORKER_SET = {}
+for _, w in ipairs(WORKER_NAMES) do WORKER_SET[w] = true end
+local function worker_ok(w) return WORKER_SET[w] == true end
+
+local function read_affinity_key()
+    local key = ngx.var.http_x_cache_affinity_key
+    if type(key) == "table" then key = key[1] end   -- repeated header: first wins
+    if key == nil or key == "" then return nil, nil end
+    if #key > AFFINITY_KEY_MAX_LEN then
+        return nil, "fallback:key_too_long"
+    end
+    return key, nil
+end
+
+-- Variables are declared per location (`set $affinity_upstream claude_workers;`
+-- `set $x_cache_affinity "";`). A location that forgot them must not 500 every
+-- request: log loud and leave routing as it was.
+local function set_affinity_vars(status, upstream)
+    local ok = pcall(function()
+        ngx.var.x_cache_affinity = status or ""
+        if upstream then ngx.var.affinity_upstream = upstream end
+    end)
+    if not ok then
+        ngx.log(ngx.ERR, "pool_router: $x_cache_affinity/$affinity_upstream not declared ",
+                "in this location — affinity cannot take effect here. Fix: add ",
+                "`set $affinity_upstream claude_workers;` and `set $x_cache_affinity \"\";`.")
+        return false
+    end
+    return true
+end
+
+local function affinity_fallback(key, status, extra)
+    set_affinity_vars(status, nil)
+    shared:incr("affinity_fallback", 1, 0)
+    shared:set("affinity_last_fallback", status)
+    ngx.log(ngx.WARN, "pool_router: AFFINITY LOST key_hash=",
+            string.format("%08x", pool_pick.fnv1a32(key or "")), " ", status,
+            extra and (" " .. extra) or "", " — routing without account affinity")
+end
 
 -- ---------------------------------------------------------------------------
 -- Public API
@@ -314,6 +372,10 @@ end
 --   endpoint-agnostic.
 function M.choose(opts)
     local overflow_capable = (opts and opts.overflow_capable) or false
+    local affinity_key, affinity_key_problem = read_affinity_key()
+    if affinity_key_problem then
+        affinity_fallback(nil, affinity_key_problem, nil)
+    end
 
     -- Gemini-Bildweg (X-Vision-Provider: gemini): braucht KEIN Claude-Konto,
     -- also darf ihn weder das Wochenfenster noch ein leerer Pool abweisen
@@ -327,6 +389,7 @@ function M.choose(opts)
         count_decision(pick)
         ngx.var.target_worker   = pick
         ngx.var.x_pool_decision = "gemini_vision_bypass"
+        if affinity_key then affinity_fallback(affinity_key, "fallback:gemini_vision_bypass") end
         return
     end
     local state_str      = shared:get("state")
@@ -346,6 +409,7 @@ function M.choose(opts)
                 " refresh_status=", refresh_status,
                 " last_err=", refresh_err,
                 " — round_robin_fallback to ", pick)
+        if affinity_key then affinity_fallback(affinity_key, "fallback:state_stale") end
         return
     end
 
@@ -360,6 +424,7 @@ function M.choose(opts)
                 " refresh_status=", refresh_status,
                 " last_err=", refresh_err,
                 " — round_robin_fallback to ", pick)
+        if affinity_key then affinity_fallback(affinity_key, "fallback:state_invalid") end
         return
     end
 
@@ -375,6 +440,7 @@ function M.choose(opts)
                 " state_age_s=", string.format("%.1f", age),
                 " refresh_status=", refresh_status,
                 " — round_robin_fallback to ", pick)
+        if affinity_key then affinity_fallback(affinity_key, "fallback:no_accounts") end
         return
     end
 
@@ -383,7 +449,8 @@ function M.choose(opts)
     local est_tokens = math.max(500, math.floor(req_len / 4))
 
     local picked, picked_worker, picked_weight, total_weight, from_measured,
-          unmeasured_names = pick_weighted_account(data.accounts, est_tokens)
+          unmeasured_names, affinity, preferred =
+        pool_pick.pick_with_affinity(data.accounts, est_tokens, affinity_key, nil, worker_ok)
 
     if picked and not from_measured then
         -- Loud: the pool is routing on capacity numbers nobody has verified.
@@ -395,6 +462,10 @@ function M.choose(opts)
     end
 
     if not picked then
+        if affinity_key then
+            affinity_fallback(affinity_key, affinity or "fallback:no_eligible",
+                              "preferred=" .. tostring(preferred))
+        end
         if overflow_capable then
             -- Marker FIRST: routing on without it would tell the app the pool
             -- is healthy and send it into a call that cannot be served.
@@ -442,11 +513,25 @@ function M.choose(opts)
     -- Distinct decision label when the pick came from the unmeasured bucket, so
     -- "we routed blind" is visible in the access log and in /internal/
     -- pool-router/state instead of being indistinguishable from a normal pick.
-    ngx.var.x_pool_decision = from_measured and "weighted_capacity"
-                              or "weighted_capacity_unmeasured"
+    local decision = from_measured and "weighted_capacity" or "weighted_capacity_unmeasured"
+    if affinity == "hit" then
+        -- Only a hit changes WHERE the request goes: the preferred worker's
+        -- group, with every other worker as retry backup.
+        if set_affinity_vars("hit", AFFINITY_UPSTREAM_PREFIX .. worker) then
+            decision = "affinity"
+            shared:incr("affinity_hit", 1, 0)
+        else
+            decision = decision .. "+affinity_fallback"
+        end
+    elseif affinity then
+        affinity_fallback(affinity_key, affinity, "preferred=" .. tostring(preferred))
+        -- keep the weighted/unmeasured label, append the fallback
+        decision = decision .. "+affinity_fallback"
+    end
+    ngx.var.x_pool_decision = decision
     local share_pct = (total_weight > 0) and (picked_weight * 100.0 / total_weight) or 0
     ngx.log(ngx.INFO, "pool_router.choose: routed_to=", worker,
-            " reason=", (from_measured and "weighted_capacity" or "weighted_capacity_unmeasured"),
+            " reason=", decision,
             " account=", picked,
             " weight=", picked_weight,
             " share_pct=", string.format("%.1f", share_pct),
@@ -494,11 +579,16 @@ function M.state_handler()
     ngx.say(string.format(
         '{"ts":%.3f,"state_age_s":%.1f,"last_refresh_status":%s,' ..
         '"last_refresh_err":%s,"metrics_url":%s,"consecutive_failures":%d,' ..
-        '"decision_counter_per_worker":%s,"last_state_snapshot":%s}',
+        '"decision_counter_per_worker":%s,"affinity":{"hit":%d,"fallback":%d,' ..
+        '"last_fallback":%s},"last_state_snapshot":%s}',
         state_ts, state_age_s, jstr(refresh_status), jstr(refresh_err or ""),
         METRICS_URL and jstr(METRICS_URL) or "null",
         tonumber(shared:get("consecutive_failures")) or 0,
-        counters_enc, state_snapshot
+        counters_enc,
+        tonumber(shared:get("affinity_hit")) or 0,
+        tonumber(shared:get("affinity_fallback")) or 0,
+        jstr(shared:get("affinity_last_fallback") or ""),
+        state_snapshot
     ))
 end
 

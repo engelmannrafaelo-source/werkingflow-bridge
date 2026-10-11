@@ -35,6 +35,33 @@ local M = {}
 -- 429s that the cross-worker retry then has to clean up.
 M.WEEKLY_HARD_EXCLUDE_PCT = 96
 
+-- Eligibility of ONE account — the single definition used by the weighted pick
+-- and by the affinity check, so "eligible" cannot mean two things.
+-- Returns nil when eligible, else a short reason (also the affinity fallback
+-- reason in the X-Cache-Affinity header and the log).
+function M.account_rejection(info, min_required)
+    if type(info) ~= "table" then return "unknown_account" end
+    local cooldown   = tonumber(info.cooldown_remaining_s) or 0
+    local eff_cap    = tonumber(info.effective_cap_tokens) or 0
+    local in_flight  = tonumber(info.current_in_flight_tokens) or 0
+    local weekly_pct = tonumber(info.weekly_percent)
+    -- Strictly `== true`: a missing field decodes to nil, and anything that
+    -- is not an explicit true must count as unmeasured. Never `~= false` —
+    -- a worker on an image that predates usage_known has measured nothing.
+    local known      = (info.usage_known == true)
+    local capacity   = eff_cap - in_flight
+    -- The weekly hard wall can only exclude on a real reading. With no
+    -- measurement there is no weekly% to compare against, so the check is
+    -- skipped and the account lands in the unmeasured bucket instead.
+    local past_wall  = known and weekly_pct ~= nil
+                       and weekly_pct >= M.WEEKLY_HARD_EXCLUDE_PCT
+    if not info.available then return "unavailable" end
+    if cooldown ~= 0 then return "cooldown" end
+    if past_wall then return "weekly_wall" end
+    if not (capacity > (min_required or 0)) then return "no_capacity" end
+    return nil
+end
+
 -- Weighted-capacity picker.
 --
 -- Weight = effective_cap_tokens − current_in_flight_tokens (= live admit
@@ -56,23 +83,11 @@ function M.pick_weighted_account(accounts, est_tokens, rand)
     local min_required = est_tokens or 0
 
     for name, info in pairs(accounts) do
-        local available  = info.available
-        local cooldown   = tonumber(info.cooldown_remaining_s) or 0
-        local eff_cap    = tonumber(info.effective_cap_tokens) or 0
-        local in_flight  = tonumber(info.current_in_flight_tokens) or 0
-        local weekly_pct = tonumber(info.weekly_percent)
-        -- Strictly `== true`: a missing field decodes to nil, and anything that
-        -- is not an explicit true must count as unmeasured. Never `~= false` —
-        -- a worker on an image that predates usage_known has measured nothing.
         local known      = (info.usage_known == true)
-        local capacity   = eff_cap - in_flight
-        -- The weekly hard wall can only exclude on a real reading. With no
-        -- measurement there is no weekly% to compare against, so the check is
-        -- skipped and the account lands in the unmeasured bucket instead.
-        local past_wall  = known and weekly_pct ~= nil
-                           and weekly_pct >= M.WEEKLY_HARD_EXCLUDE_PCT
+        local capacity   = (tonumber(info.effective_cap_tokens) or 0)
+                           - (tonumber(info.current_in_flight_tokens) or 0)
 
-        if available and cooldown == 0 and capacity > min_required and not past_wall then
+        if M.account_rejection(info, min_required) == nil then
             -- Carry the account's own worker upstream name (topology-agnostic:
             -- no hardcoded account→worker map). Fall back to the account name
             -- only if the state somehow omitted `.worker`.
@@ -111,6 +126,95 @@ function M.pick_weighted_account(accounts, est_tokens, rand)
     -- Floating-point safety: fall through to last
     local last = eligible[#eligible]
     return last.name, last.worker, last.weight, total, from_measured, unmeasured_names
+end
+
+-- ---------------------------------------------------------------------------
+-- Account affinity (CACHE2)
+--
+-- The prompt cache is per account. Spreading the calls of one run over four
+-- accounts makes a cache hit a 1-in-4 coincidence (CACHE1, cause 2). A caller
+-- sends a key (X-Cache-Affinity-Key: its run or job id); the same key prefers
+-- the same account.
+--
+-- Rendezvous (highest-random-weight) hashing over ALL accounts in the state,
+-- not over the eligible ones: the preferred account of a key must not move
+-- because some OTHER account is momentarily full. When an account joins or
+-- leaves, only the keys that preferred it move.
+--
+-- The preferred account is used only when it passes the SAME eligibility as
+-- the weighted pick and does not jump the measured-before-unmeasured rule.
+-- Otherwise the weighted pick runs unchanged and the reason is returned, so the
+-- router can say it out loud. Affinity never overrides a guard.
+-- ---------------------------------------------------------------------------
+local bit = require "bit"
+
+-- 32-bit FNV-1a. Multiplication split in 16-bit halves: a plain h * prime
+-- exceeds 2^53 and loses bits in a double.
+local function mul32(a, b)
+    local a_lo = a % 65536
+    local a_hi = (a - a_lo) / 65536
+    return ((a_hi * b) % 4294967296 * 65536 + a_lo * b) % 4294967296
+end
+
+function M.fnv1a32(s)
+    local h = 2166136261
+    for i = 1, #s do
+        h = bit.bxor(h, s:byte(i)) % 4294967296
+        h = mul32(h, 16777619)
+    end
+    return h
+end
+
+-- Preferred account for `key`: highest fnv1a32(key .. "\0" .. name), ties by
+-- name. Returns name, info — or nil when the state has no accounts.
+function M.preferred_account(accounts, key)
+    local best_name, best_score
+    for name, _ in pairs(accounts) do
+        local score = M.fnv1a32(key .. "\0" .. name)
+        if best_score == nil or score > best_score
+           or (score == best_score and name < best_name) then
+            best_name, best_score = name, score
+        end
+    end
+    if best_name == nil then return nil, nil end
+    return best_name, accounts[best_name]
+end
+
+-- Pick with affinity. Returns the same six values as pick_weighted_account,
+-- plus:
+--   7. affinity: nil (no key) | "hit" | "fallback:<reason>"
+--   8. preferred account name (nil without key)
+-- `worker_ok(worker)` (optional) says whether the router can actually reach
+-- that worker as an affinity target; a "no" is a fallback, never a guess.
+function M.pick_with_affinity(accounts, est_tokens, key, rand, worker_ok)
+    local name, worker, weight, total, from_measured, unmeasured_names =
+        M.pick_weighted_account(accounts, est_tokens, rand)
+    if key == nil or key == "" then
+        return name, worker, weight, total, from_measured, unmeasured_names, nil, nil
+    end
+    local pref, info = M.preferred_account(accounts, key)
+    local reason
+    if pref == nil then
+        reason = "no_accounts"
+    else
+        reason = M.account_rejection(info, est_tokens or 0)
+        if reason == nil and info.usage_known ~= true and from_measured and name ~= nil then
+            -- A measured account could take it: the unmeasured preferred one
+            -- stays held back, exactly like in the weighted pick.
+            reason = "held_back_unmeasured"
+        end
+        if reason == nil and worker_ok and not worker_ok(info.worker or pref) then
+            reason = "unknown_worker"
+        end
+    end
+    if reason ~= nil then
+        return name, worker, weight, total, from_measured, unmeasured_names,
+               "fallback:" .. reason, pref
+    end
+    local capacity = (tonumber(info.effective_cap_tokens) or 0)
+                     - (tonumber(info.current_in_flight_tokens) or 0)
+    return pref, (info.worker or pref), capacity, total,
+           (info.usage_known == true), unmeasured_names, "hit", pref
 end
 
 return M

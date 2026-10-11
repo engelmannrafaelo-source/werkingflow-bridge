@@ -139,6 +139,47 @@ emit_upstream() {
     echo "}"
 }
 
+# --- CACHE2: account affinity for the prompt cache ---------------------------
+# The prompt cache is per ACCOUNT, and every worker has its own account. A caller
+# that sends X-Cache-Affinity-Key gets the same account for the same key
+# (pool_router.lua picks it, rendezvous-hashed over the pool state). For that
+# pick to take EFFECT, the request has to reach that worker first — the plain
+# claude_workers pool is round-robin and ignores $target_worker.
+#
+# One group per worker: the preferred worker as the only regular server, every
+# other entry of claude_workers as `backup`. The cross-worker retry
+# (proxy_next_upstream) therefore works exactly as before once the preferred
+# worker fails: nginx walks the backups. Local backups carry weight=100 and the
+# peer bridge (production only) weight=1, so a retry stays on this bridge's
+# workers in all but ~1 of 300 backup picks — nginx has no strict backup tiers.
+#
+# nginx.conf selects the group via `proxy_pass http://$affinity_upstream;`. A
+# variable whose value NAMES an upstream{} block uses that block (balancing,
+# backup, retries, keepalive) — no resolver involved. The Lua router only ever
+# names a group for a worker in BRIDGE_WORKERS; everything else keeps the value
+# "claude_workers", i.e. exactly the old routing.
+#
+# $1 = default-backup mode of claude_workers, $2 = targets-array NAME, then workers
+emit_affinity_upstreams() {
+    local mode="$1"; local targets_name="$2"; shift 2
+    local pref w target
+    for pref in "$@"; do
+        echo "upstream claude_workers_affin_${pref} {"
+        target="$(resolve_target "$pref" "$targets_name")"
+        echo "    server ${target} weight=1 max_fails=0;"
+        for w in "$@"; do
+            [ "$w" = "$pref" ] && continue
+            target="$(resolve_target "$w" "$targets_name")"
+            echo "    server ${target} backup weight=100 max_fails=0;"
+        done
+        if [ "$mode" = "local-first" ]; then
+            echo "    server \${BRIDGE_BACKUP_HOST}:8000 backup weight=1 max_fails=1 fail_timeout=10s;"
+        fi
+        echo "    keepalive 8;"
+        echo "}"
+    done
+}
+
 # --- ADR-0012: job polls follow the job, not the pool ------------------------
 # A job row lives in the store of the bridge that ACCEPTED the POST — and under
 # the two-tier overflow pool that can be the peer bridge (proxy_next_upstream
@@ -239,6 +280,11 @@ emit_worker_map() {
 # by pool_router.lua setting $target_worker, and the static `proxy_pass
 # http://claude_workers` (static is required — a variable proxy_pass disables
 # proxy_next_upstream). Do not reintroduce a map "for structural parity".
+# CACHE2 (2026-10-11) refines that last sentence: a variable proxy_pass to a
+# HOST loses the upstream group; a variable whose value is the NAME of an
+# upstream{} block keeps it, retries included (nginx proxy_pass docs: "the name
+# is searched among the described server groups"). $affinity_upstream only
+# ever holds such names — proven end to end in tests/nginx/test_cache_affinity_e2e.sh.
 
 generate() {
     local id="$1"
@@ -280,6 +326,10 @@ HEADER
 
     echo "# Round-robin default pool (used by /health, Lua-routed /v1 SSE, default /)."
     emit_upstream claude_workers 32 "$default_backup" "$targets_name" "${workers[@]}"
+    echo
+
+    echo "# Account-affinity groups (CACHE2) — one per worker, see emit_affinity_upstreams."
+    emit_affinity_upstreams "$default_backup" "$targets_name" "${workers[@]}"
     echo
 
     echo "# Production-priority pool (X-Priority: production)."
