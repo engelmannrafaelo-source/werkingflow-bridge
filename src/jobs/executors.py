@@ -531,7 +531,8 @@ def _raise_on_status_error(kind: str, result: Dict[str, Any]) -> None:
     """A 200 body with status=error ends the job as an error. The endpoint's
     verdict (ErrorVerdictFields.retryable / retry_after_s, e.g. from
     CliApiError, a research-cloud failure marked retryable) becomes the job's
-    verdict, the error text its message."""
+    verdict, the error text its message, and what the answer says about the
+    run (fehler_code, antwort_ende, session_id — JOBENDE) the job's details."""
     if result.get("status") != "error":
         return
     from src.error_contract import JobFailure, envelope_fields
@@ -542,6 +543,7 @@ def _raise_on_status_error(kind: str, result: Dict[str, Any]) -> None:
         f"{result.get('error') or 'no error message'}",
         retryable=verdict.get("retryable", False),
         retry_after_s=verdict.get("retry_after_s"),
+        details=result,
     )
 
 

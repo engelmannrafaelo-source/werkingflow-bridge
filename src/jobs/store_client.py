@@ -323,7 +323,9 @@ async def mark_error(
     code: Optional[str] = None,
     retryable: Optional[bool] = None,
     retry_after_s: Optional[int] = None,
+    details: Optional[Dict[str, Any]] = None,
 ) -> None:
+    # A platform-api from before JOBENDE drops `details` the same way.
     # A platform-api from before BR9 ignores retryable/retry_after_s (pydantic
     # drops unknown fields) and stores {message, code}; GET then derives the
     # verdict from the code (error_contract.job_code_fields). Degraded, not wrong
@@ -332,7 +334,8 @@ async def mark_error(
         resp = await call_platform(
             "POST", f"/v1/internal/jobs/{job_id}/error",
             json={"message": message, "code": code,
-                  "retryable": retryable, "retry_after_s": retry_after_s},
+                  "retryable": retryable, "retry_after_s": retry_after_s,
+                  **({"details": details} if details else {})},
             timeout_s=_WRITE_TIMEOUT_S,
         )
     except PlatformUnavailable as e:
@@ -341,6 +344,7 @@ async def mark_error(
             return await store.mark_error(
                 job_id, message, code=code,
                 retryable=retryable, retry_after_s=retry_after_s,
+                details=details,
             )
         except store.JobRowMissing as missing:
             raise _row_missing_error("mark_error", job_id, missing)

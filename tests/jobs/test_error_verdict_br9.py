@@ -371,3 +371,151 @@ def test_status_rule_of_the_envelope_is_unchanged():
         body = json.loads(bridge_error(source="bridge_internal", error_type="internal",
                                        message="m", status_code=status).body)
         assert body["error"]["retryable"] is want, status
+
+
+# --- JOBENDE: what the error says about the run reaches the job ------------------
+# DS3 Lauf 1 (11.10.2026): a research answer cut at the 64000-token output limit
+# came back as status=error with fehler_code/antwort_ende/session_id; the job
+# error kept only the text, the /v1/jobs caller read antwort_ende=None.
+
+CUT = {"fehler_code": "antwort_abgeschnitten", "antwort_ende": "max_tokens",
+       "session_id": "sess-1"}
+
+
+async def test_research_cut_at_the_output_limit_reaches_the_job_with_its_details():
+    seam = _Seam()
+    answer = httpx.Response(200, json={
+        "status": "error", "query": "q", "model": "m",
+        "error": "Research answer cut off at the output limit "
+                 "(antwort_ende=max_tokens)",
+        "retryable": False, "antwort_quelle": None, **CUT,
+    })
+    await _run("research", seam, answer=answer)
+    assert seam.verdict() == ("EXECUTOR_ERROR", False, None)
+    assert seam.mark_error.await_args.kwargs["details"] == CUT
+
+
+async def test_research_error_without_details_writes_none():
+    seam = _Seam()
+    answer = httpx.Response(200, json={
+        "status": "error", "query": "q", "model": "m",
+        "error": "research provider pin unservable", "retryable": False,
+        "fehler_code": None, "antwort_ende": None,
+    })
+    await _run("research", seam, answer=answer)
+    assert "details" not in seam.mark_error.await_args.kwargs
+
+
+async def test_any_job_error_carrying_the_fields_keeps_them():
+    """Not only research: any exception that ends a job with these fields."""
+    class Cut(RuntimeError):
+        fehler_code = "antwort_abgeschnitten"
+
+    async def cut(payload, attribution, report_progress):
+        e = Cut("cut")
+        e.antwort_ende = "max_tokens_fortgesetzt"
+        raise e
+
+    seam = _Seam()
+    await _run("jobende-cut", seam, executor=cut)
+    assert seam.mark_error.await_args.kwargs["details"] == {
+        "fehler_code": "antwort_abgeschnitten",
+        "antwort_ende": "max_tokens_fortgesetzt"}
+
+    async def via_details(payload, attribution, report_progress):
+        from src.error_contract import JobFailure
+        raise JobFailure("x", retryable=False,
+                         details={"session_id": "s", "other": "y"})
+
+    seam = _Seam()
+    await _run("jobende-details", seam, executor=via_details)
+    assert seam.mark_error.await_args.kwargs["details"] == {"session_id": "s"}
+
+
+async def test_unclassified_crash_without_fields_has_no_details():
+    async def boom(payload, attribution, report_progress):
+        raise RuntimeError("plain")
+
+    seam = _Seam()
+    await _run("jobende-plain", seam, executor=boom)
+    assert "details" not in seam.mark_error.await_args.kwargs
+
+
+async def test_store_client_sends_details_and_its_fallback_keeps_them():
+    sent = {}
+
+    async def fake_call(method, path, json=None, timeout_s=None):
+        sent.update(json)
+        return type("R", (), {"status_code": 204, "json": None})()
+
+    with patch.object(store_client, "call_platform", fake_call):
+        await store_client.mark_error("j", "m", code="EXECUTOR_ERROR",
+                                      retryable=False, retry_after_s=None, details=CUT)
+    assert sent["details"] == CUT
+
+    from src.jobs import store
+    from src.platform_client import PlatformUnavailable
+
+    direct = AsyncMock()
+    with patch.object(store_client, "call_platform",
+                      AsyncMock(side_effect=PlatformUnavailable("down"))), \
+         patch.object(store_client, "_fallback_or_raise", lambda op, e: None), \
+         patch.object(store, "mark_error", direct):
+        await store_client.mark_error("j", "m", code="EXECUTOR_ERROR",
+                                      retryable=False, details=CUT)
+    assert direct.await_args.kwargs["details"] == CUT
+
+
+async def test_store_writes_details_flat_into_the_error_row():
+    from src.jobs import store
+
+    conn = AsyncMock()
+    conn.execute.return_value = "UPDATE 1"
+
+    class _Pool:
+        def acquire(self):
+            class _Ctx:
+                async def __aenter__(self_inner):
+                    return conn
+
+                async def __aexit__(self_inner, *a):
+                    return False
+            return _Ctx()
+
+    with patch.object(store, "get_pool", return_value=_Pool()):
+        await store.mark_error("j", "m", code="EXECUTOR_ERROR", retryable=False,
+                               details={**CUT, "message": "overwrite?", "x": "y"})
+    row = json.loads(conn.execute.await_args.args[2])
+    assert row == {"message": "m", "code": "EXECUTOR_ERROR", "retryable": False,
+                   "retry_after_s": None, **CUT}
+
+
+async def test_internal_route_takes_details_and_refuses_unknown_keys():
+    import pytest
+    from pydantic import ValidationError
+
+    from src import internal_routes
+    from src.internal_routes import InternalJobError
+
+    body = InternalJobError(message="m", code="X", retryable=False, details=CUT)
+    with pytest.raises(ValidationError):
+        InternalJobError(message="m", details={"message": "overwrite"})
+    assert InternalJobError(message="m").details is None
+
+    from src.jobs import store
+
+    direct = AsyncMock()
+    with patch.object(store, "mark_error", direct):
+        await internal_routes.internal_mark_error("j", body, None)
+        bare = InternalJobError(message="m")
+        await internal_routes.internal_mark_error("j", bare, None)
+    assert direct.await_args_list[0].kwargs["details"] == CUT
+    assert direct.await_args_list[1].kwargs["details"] is None
+
+
+async def test_poll_shows_the_details(monkeypatch):
+    stored = {"message": "m", "code": "EXECUTOR_ERROR", "retryable": False,
+              "retry_after_s": None, **CUT}
+    out = await _poll(_job(status="error", error=stored), monkeypatch)
+    assert out["error"]["antwort_ende"] == "max_tokens"
+    assert out["error"]["fehler_code"] == "antwort_abgeschnitten"
