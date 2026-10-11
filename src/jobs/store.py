@@ -271,16 +271,25 @@ async def mark_error(
     code: Optional[str] = None,
     retryable: Optional[bool] = None,
     retry_after_s: Optional[int] = None,
+    fehler_code: Optional[str] = None,
+    antwort_ende: Optional[str] = None,
+    teilantwort: Optional[str] = None,
 ) -> None:
     """Terminal error. `retryable`/`retry_after_s` are the verdict of
     src/error_contract.py; when a caller has none (a writer from before BR9),
     the row keeps {message, code} and GET derives the verdict from the code.
+    fehler_code / antwort_ende / teilantwort: the cause fields of the endpoint
+    (error_contract.JOB_ERROR_DETAIL_FIELDS), stored only when set.
 
     Raises JobRowMissing when the row is gone."""
     error: Dict[str, Any] = {"message": message, "code": code}
     if retryable is not None:
         error["retryable"] = bool(retryable)
         error["retry_after_s"] = retry_after_s
+    for name, value in (("fehler_code", fehler_code), ("antwort_ende", antwort_ende),
+                        ("teilantwort", teilantwort)):
+        if value is not None:
+            error[name] = value
     pool = get_pool()
     async with pool.acquire() as conn:
         tag = await conn.execute(

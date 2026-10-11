@@ -65,16 +65,30 @@ def fields(retryable: bool, retry_after_s: Optional[float] = None) -> Dict[str, 
     return {"retryable": bool(retryable), "retry_after_s": after}
 
 
+# Fields of an endpoint's error answer that name the cause (BRTRUNC2): carried
+# by JobFailure into the job's error object exactly as the endpoint returned
+# them, so a /v1/jobs caller reads the same contract as a direct caller
+# (/v1/research fehler_code / antwort_ende / teilantwort) instead of matching
+# the message text.
+JOB_ERROR_DETAIL_FIELDS = ("fehler_code", "antwort_ende", "teilantwort")
+
+
 class JobFailure(RuntimeError):
     """An executor failure that carries its own verdict (rule 1), e.g. a
     research answer with status=error and retryable:true, or a self-call that
-    lost its connection."""
+    lost its connection. ``details``: the endpoint's cause fields
+    (JOB_ERROR_DETAIL_FIELDS); None values are dropped."""
 
     def __init__(self, message: str, *, retryable: bool,
-                 retry_after_s: Optional[float] = None):
+                 retry_after_s: Optional[float] = None,
+                 details: Optional[Dict[str, Any]] = None):
         super().__init__(message)
         self.retryable = bool(retryable)
         self.retry_after_s = retry_after_s
+        self.details = {
+            k: v for k, v in (details or {}).items()
+            if k in JOB_ERROR_DETAIL_FIELDS and v is not None
+        }
 
 
 def _upstream_status(code: Optional[str]) -> Optional[int]:
@@ -127,7 +141,7 @@ def job_error_fields(exc: BaseException) -> Dict[str, Any]:
                                        exc.retry_after_s)}
     if isinstance(exc, JobFailure):
         return {"code": JOB_CODE_EXECUTOR_ERROR,
-                **fields(exc.retryable, exc.retry_after_s)}
+                **fields(exc.retryable, exc.retry_after_s), **exc.details}
     return {"code": JOB_CODE_EXECUTOR_ERROR, **fields(UNCLASSIFIED_RETRYABLE)}
 
 

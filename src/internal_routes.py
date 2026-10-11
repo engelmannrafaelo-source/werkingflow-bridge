@@ -690,6 +690,11 @@ class InternalJobError(BaseModel):
     # send neither.
     retryable: Optional[bool] = None
     retry_after_s: Optional[int] = Field(default=None, ge=0)
+    # Cause fields of the endpoint (BRTRUNC2, error_contract.
+    # JOB_ERROR_DETAIL_FIELDS). Optional: older workers send none.
+    fehler_code: Optional[str] = None
+    antwort_ende: Optional[str] = None
+    teilantwort: Optional[str] = None
 
 
 class InternalJobDefer(BaseModel):
@@ -855,6 +860,8 @@ async def internal_mark_error(
         await store.mark_error(
             job_id, body.message, code=body.code,
             retryable=body.retryable, retry_after_s=body.retry_after_s,
+            fehler_code=body.fehler_code, antwort_ende=body.antwort_ende,
+            teilantwort=body.teilantwort,
         )
     except store.JobRowMissing as e:
         raise _job_row_missing(e)
