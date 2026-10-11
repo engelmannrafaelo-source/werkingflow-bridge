@@ -271,6 +271,9 @@ async def mark_error(
     code: Optional[str] = None,
     retryable: Optional[bool] = None,
     retry_after_s: Optional[int] = None,
+    antwort_ende: Optional[str] = None,
+    usage: Optional[Dict[str, Any]] = None,
+    diagnose_ref: Optional[str] = None,
 ) -> None:
     """Terminal error. `retryable`/`retry_after_s` are the verdict of
     src/error_contract.py; when a caller has none (a writer from before BR9),
@@ -281,6 +284,8 @@ async def mark_error(
     if retryable is not None:
         error["retryable"] = bool(retryable)
         error["retry_after_s"] = retry_after_s
+    error.update({k: v for k, v in {"antwort_ende": antwort_ende,
+                  "usage": usage, "diagnose_ref": diagnose_ref}.items() if v is not None})
     pool = get_pool()
     async with pool.acquire() as conn:
         tag = await conn.execute(

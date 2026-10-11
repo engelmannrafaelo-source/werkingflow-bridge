@@ -323,6 +323,9 @@ async def mark_error(
     code: Optional[str] = None,
     retryable: Optional[bool] = None,
     retry_after_s: Optional[int] = None,
+    antwort_ende: Optional[str] = None,
+    usage: Optional[Dict[str, Any]] = None,
+    diagnose_ref: Optional[str] = None,
 ) -> None:
     # A platform-api from before BR9 ignores retryable/retry_after_s (pydantic
     # drops unknown fields) and stores {message, code}; GET then derives the
@@ -332,7 +335,9 @@ async def mark_error(
         resp = await call_platform(
             "POST", f"/v1/internal/jobs/{job_id}/error",
             json={"message": message, "code": code,
-                  "retryable": retryable, "retry_after_s": retry_after_s},
+                  "retryable": retryable, "retry_after_s": retry_after_s,
+                  **{k: v for k, v in {"antwort_ende": antwort_ende, "usage": usage,
+                                       "diagnose_ref": diagnose_ref}.items() if v is not None}},
             timeout_s=_WRITE_TIMEOUT_S,
         )
     except PlatformUnavailable as e:
@@ -341,6 +346,7 @@ async def mark_error(
             return await store.mark_error(
                 job_id, message, code=code,
                 retryable=retryable, retry_after_s=retry_after_s,
+                antwort_ende=antwort_ende, usage=usage, diagnose_ref=diagnose_ref,
             )
         except store.JobRowMissing as missing:
             raise _row_missing_error("mark_error", job_id, missing)

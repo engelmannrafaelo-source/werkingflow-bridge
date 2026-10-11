@@ -534,6 +534,8 @@ async def research_executor(
             f"{result.get('error') or 'no error message'}",
             retryable=verdict.get("retryable", False),
             retry_after_s=verdict.get("retry_after_s"),
+            fehler_code=result.get("fehler_code"), antwort_ende=result.get("antwort_ende"),
+            usage=result.get("usage"), diagnose_ref=result.get("diagnose_ref"),
         )
     return result
 

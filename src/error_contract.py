@@ -71,10 +71,16 @@ class JobFailure(RuntimeError):
     lost its connection."""
 
     def __init__(self, message: str, *, retryable: bool,
-                 retry_after_s: Optional[float] = None):
+                 retry_after_s: Optional[float] = None,
+                 fehler_code: Optional[str] = None, antwort_ende: Optional[str] = None,
+                 usage: Optional[Dict[str, Any]] = None, diagnose_ref: Optional[str] = None):
         super().__init__(message)
         self.retryable = bool(retryable)
         self.retry_after_s = retry_after_s
+        self.fehler_code = fehler_code
+        self.antwort_ende = antwort_ende
+        self.usage = usage
+        self.diagnose_ref = diagnose_ref
 
 
 def _upstream_status(code: Optional[str]) -> Optional[int]:
@@ -126,7 +132,9 @@ def job_error_fields(exc: BaseException) -> Dict[str, Any]:
         return {"code": code, **fields(is_retryable_status(exc.status_code),
                                        exc.retry_after_s)}
     if isinstance(exc, JobFailure):
-        return {"code": JOB_CODE_EXECUTOR_ERROR,
+        return {"code": exc.fehler_code or JOB_CODE_EXECUTOR_ERROR,
+                **({k: v for k, v in {"antwort_ende": exc.antwort_ende,
+                    "usage": exc.usage, "diagnose_ref": exc.diagnose_ref}.items() if v is not None}),
                 **fields(exc.retryable, exc.retry_after_s)}
     return {"code": JOB_CODE_EXECUTOR_ERROR, **fields(UNCLASSIFIED_RETRYABLE)}
 

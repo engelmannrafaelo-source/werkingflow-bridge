@@ -449,6 +449,9 @@ class SessionListResponse(BaseModel):
 # Research Endpoint Models
 # ============================================================================
 
+from src.agentischer_lauf.models import Run as AgentischerLauf, validate_request
+
+
 class ResearchRequest(BaseModel):
     """
     Request model for dedicated /v1/research endpoint.
@@ -456,6 +459,9 @@ class ResearchRequest(BaseModel):
     Designed for Claude Code research tasks with SuperClaude integration.
     Supports depth levels, planning strategies, and advanced research options.
     """
+    agentischer_lauf: Optional[AgentischerLauf] = None
+    _agentischer_vertrag = model_validator(mode="before")(validate_request)
+
     # Core Research Parameters
     query: str = Field(..., description="Research question or topic to investigate")
 
@@ -627,6 +633,13 @@ class ResearchResponse(ErrorVerdictFields):
 
     Returns both container and host file paths, plus execution metadata.
     """
+    herkunft: Optional[Dict[str, Any]] = None
+    usage: Optional[Dict[str, Any]] = None
+    werkzeugaufrufe: Optional[Dict[str, Any]] = None
+    artefakte: List[Dict[str, Any]] = Field(default_factory=list)
+    pruefung: Optional[Dict[str, Any]] = None
+    diagnose_ref: Optional[str] = None
+
     status: Literal["success", "error"]
     query: str
     model: str
@@ -708,7 +721,7 @@ class ResearchResponse(ErrorVerdictFields):
             "of the answer. None when the run reported no end."
         ),
     )
-    fehler_code: Optional[Literal["antwort_abgeschnitten"]] = Field(
+    fehler_code: Optional[str] = Field(
         default=None,
         description=(
             "status='error' only, when the bridge knows the cause: 'antwort_abgeschnitten' = "

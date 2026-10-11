@@ -691,6 +691,10 @@ class InternalJobError(BaseModel):
     retryable: Optional[bool] = None
     retry_after_s: Optional[int] = Field(default=None, ge=0)
 
+    antwort_ende: Optional[str] = None
+    usage: Optional[Dict[str, Any]] = None
+    diagnose_ref: Optional[str] = None
+
 
 class InternalJobDefer(BaseModel):
     delay_seconds: int = Field(ge=1, le=24 * 3600)
@@ -855,6 +859,7 @@ async def internal_mark_error(
         await store.mark_error(
             job_id, body.message, code=body.code,
             retryable=body.retryable, retry_after_s=body.retry_after_s,
+            antwort_ende=body.antwort_ende, usage=body.usage, diagnose_ref=body.diagnose_ref,
         )
     except store.JobRowMissing as e:
         raise _job_row_missing(e)
