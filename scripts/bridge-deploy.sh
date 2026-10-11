@@ -1134,11 +1134,24 @@ phase_smoke_test() {
         return 0
     fi
 
-    local version_host="$pool_host" expected_git_sha
-    [[ "$label" == "server2" ]] && version_host="$WORKERHOST_HOST"
-    expected_git_sha=$(rssh "$version_host" "cd ${REMOTE_REPO} && git rev-parse HEAD") || return 1
-    [[ "$expected_git_sha" =~ ^[0-9a-f]{40}$ ]] || { error_ "Invalid worker checkout SHA"; return 1; }
-    extra_args+=(--expected-git-sha "$expected_git_sha")
+    # Only workers built by this deploy can be expected to carry its HEAD.
+    local worker_built=false svc expected_git_sha
+    for svc in "${DEPLOYED_SERVICES[@]}"; do
+        case "$svc" in worker[1-4]|worker-*) worker_built=true ;; esac
+    done
+    if [[ "$worker_built" == true ]]; then
+        if ! expected_git_sha=$(rssh "$pool_host" "cd ${REMOTE_REPO} && git rev-parse HEAD"); then
+            error_ "Cannot read expected worker SHA for ${label}"
+            return 1
+        fi
+        [[ "$expected_git_sha" =~ ^[0-9a-f]{40}$ ]] || { error_ "Invalid worker checkout SHA"; return 1; }
+        extra_args+=(--expected-git-sha "$expected_git_sha")
+    else
+        local reason="no workers built in this run (${DEPLOYED_SERVICES[*]}); worker SHA not proven"
+        warn "SMOKE_VERSION_UNPROVEN: ${label}: ${reason}"
+        SMOKE_UNPROVEN+=("${label}: version UNPROVEN — ${reason}")
+        extra_args+=(--version-unproven "$reason")
+    fi
 
     # Make AI_BRIDGE_API_KEY / INFISICAL_WS_DEV_SERVER available to the smoke
     # script's key resolution (env first, Infisical fallback).
@@ -2226,6 +2239,13 @@ EOF
 # missing. A clean deploy writes DEPLOYED_SHA_FILE and clears that file.
 record_deploy_proof() {
     local host="$1" server_name="$2" sha="$3"
+    local gap
+    for gap in "${SMOKE_UNPROVEN[@]}"; do
+        if [[ "$gap" == "${server_name}: version UNPROVEN"* ]]; then
+            warn "NOT recorded as proven: worker SHA not proven; keeping previous proof markers"
+            return 0
+        fi
+    done
     if [[ "$server_name" == "hetzner" && -n "$SMOKE_UNPROVEN_PROBES" ]]; then
         write_smoke_unproven_marker "$host" "$sha" \
             || error_ "could not write ${SMOKE_UNPROVEN_FILE} on ${host} — the prod gates still see no proof (${DEPLOYED_SHA_FILE} was not advanced)"
@@ -2711,7 +2731,7 @@ case "$SERVER" in
         if (( ${#SMOKE_UNPROVEN[@]} > 0 )); then
             for _u in "${SMOKE_UNPROVEN[@]}"; do warn "UNPROVEN ${_u}"; done
             error_ "=== both: STOPPED after hetzner — dev is UNPROVEN, server2 (prod) NOT deployed (exit 3) ==="
-            error_ "  Catch up with 'bridge-deploy.sh smoke-nachholen', then deploy server2."
+            error_ "  For pool gaps use smoke-nachholen; for an unproven worker SHA deploy the workers first."
             exit 3
         fi
         deploy_server "server2" || exit $?

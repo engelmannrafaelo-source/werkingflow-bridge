@@ -140,3 +140,17 @@ def test_public_version_run_needs_no_credentials(monkeypatch, profile):
     monkeypatch.setattr(smoke.requests, "get", get)
     result = smoke.run("http://stub.invalid", profile, "version", {}, 1, expected_git_sha="a" * 40)
     assert len(result) == 1 and result[0].ok
+
+
+def test_generator_version_pool_has_no_backup(tmp_path):
+    import os
+    result = subprocess.run(["bash", str(ROOT / "scripts/generate-bridge-upstreams.sh"), "all"],
+                            env={**os.environ, "UPSTREAMS_OUT_DIR": str(tmp_path)},
+                            capture_output=True, text=True, timeout=10)
+    assert result.returncode == 0, result.stderr
+    for topology in ("primary", "prod"):
+        generated = (tmp_path / f"upstreams-{topology}.conf").read_text()
+        upstream = block(generated, "upstream claude_version")
+        assert "backup" not in upstream
+        assert "BRIDGE_BACKUP_HOST" not in upstream
+        assert generated == (ROOT / f"docker/upstreams-{topology}.conf").read_text()
