@@ -622,12 +622,12 @@ async def erkunder_executor(
     import httpx
     from pydantic import ValidationError
 
-    from src.erkunder.models import Auftrag, Ergebnis
+    from src.compat import coordinator_contract
     from src.erkunder.zugang import intern_config
     from src.jobs.registry import DEPENDENCY_UNAVAILABLE_STATUS
 
     try:
-        auftrag = Auftrag.model_validate(payload)
+        auftrag = coordinator_contract.parse_order(payload)
     except ValidationError:
         raise ExecutorHTTPError(400, "ungueltiger Erkunder-Auftrag") from None
     token_path = os.environ.get("CLAUDE_CODE_OAUTH_TOKEN_FILE")
@@ -678,9 +678,7 @@ async def erkunder_executor(
                     {key: state[key] for key in ("schritt", "fertig", "gesamt")}
                 )
                 if state["zustand"] == "fertig":
-                    return Ergebnis.model_validate(state["meta"]).model_dump(
-                        by_alias=True
-                    )
+                    return coordinator_contract.parse_result(state["meta"])
                 if state["zustand"] == "abbruch":
                     error = state.get("fehler", {})
                     reason = (
@@ -704,24 +702,7 @@ async def erkunder_executor(
                         "unbekannt",
                     }:
                         known = "unbekannt"
-                    safe_step = (
-                        step
-                        if step
-                        in {
-                            "daten",
-                            "wiederaufnahme",
-                            "erkunder-1",
-                            "erkunder-2",
-                            "erkunder-3",
-                            "harmonisierung",
-                            "pruefung",
-                            "harmonisierung-korrektur",
-                            "pruefung-korrektur",
-                            *(f"{kind}-korrektur-{n}" for kind in ("harmonisierung", "pruefung")
-                              for n in range(2, 6)),
-                        }
-                        else "unbekannt"
-                    )
+                    safe_step = coordinator_contract.safe_step(step)
                     raise RuntimeError(f"erkunder abbruch: {safe_step}: {known}")
                 if state["zustand"] != "laeuft":
                     raise RuntimeError("Erkunder: ungueltiger Zustand")

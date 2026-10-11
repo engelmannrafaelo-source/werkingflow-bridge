@@ -335,3 +335,43 @@ async def test_perplexity_wiring_gate_prompt_and_cost(monkeypatch):
     assert booked["extra_cost_usd"] == 0.15
     assert booked["provider_meta"]["perplexity_calls"] == 3
     assert set(result.model_dump().keys()) == set(ResearchResponse.model_fields.keys())
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("terms", [None, ["Oboe"]])
+async def test_caller_policy_replaces_legacy_and_passes_privacy_gate(terms):
+    req = _make_req(research_instructions="App instruction", research_mode="academic", privacy_allowlist=terms)
+    with (
+        patch("src.research_cloud.anonymize_gate.anonymize_query_for_cloud",
+              new=AsyncMock(side_effect=["safe query", "safe instruction", "safe tool query"])) as gate,
+        patch("src.research_cloud.executor.run_research_cloud",
+              new=AsyncMock(return_value=_cloud_result())) as executor,
+        patch("src.activity.ai_call_writer.persist_ai_call_activity", new=AsyncMock()),
+        patch("src.research_cloud.library.load_library_for_run", new=AsyncMock(return_value=None)),
+        patch("src.research_cloud.luecken.nachkontrolle_aktiv",
+              side_effect=AssertionError("legacy review entered")),
+        patch("src.scholarly.scholarly_enabled", return_value=True),
+        patch("src.scholarly.build_oa_context", new=AsyncMock(return_value="forbidden OA")) as scholarly,
+    ):
+        result = await src.main._execute_research_cloud_impl(MagicMock(), req, attribution_ctx={})
+        assert await executor.await_args.kwargs["anonymize"]("tool query") == "safe tool query"
+    scholarly.assert_not_awaited()
+    assert result.status == "success"
+    assert gate.await_count == 3
+    assert all(c.kwargs == {"privacy_allowlist": terms or []} for c in gate.await_args_list)
+    assert executor.await_args.args == ("safe query", "safe instruction")
+    assert executor.await_args.kwargs["nachkontrolle"] is None
+    assert executor.await_args.kwargs["research_instructions"] == "safe instruction"
+
+
+@pytest.mark.asyncio
+async def test_caller_policy_privacy_failure_prevents_executor():
+    req = _make_req(research_instructions="App instruction")
+    with (
+        patch("src.research_cloud.anonymize_gate.anonymize_query_for_cloud",
+              new=AsyncMock(side_effect=["safe query", CloudAnonymizeError("refused")])),
+        patch("src.research_cloud.executor.run_research_cloud", new=AsyncMock()) as executor,
+    ):
+        result = await src.main._execute_research_cloud_impl(MagicMock(), req, attribution_ctx={})
+    assert result.status == "error"
+    executor.assert_not_awaited()

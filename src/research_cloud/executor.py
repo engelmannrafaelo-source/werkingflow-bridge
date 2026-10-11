@@ -32,6 +32,8 @@ from typing import Any, Awaitable, Callable, Dict, List, Optional
 
 import httpx
 
+from src.research_instructions import TOOL_DESCRIPTIONS
+
 from src.research_cloud.library import (
     LibraryConfig,
     LibraryFetchError,
@@ -201,6 +203,7 @@ def _build_tools(
     config: ResearchCloudConfig,
     library_cfg: LibraryConfig,
     perplexity_cfg: Optional[PerplexityConfig] = None,
+    research_instructions: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     tools = [
         {"type": "web_search_20260209", "name": "web_search", "max_uses": config.web_search_max_uses},
@@ -234,13 +237,17 @@ def _build_tools(
         # Perplexity finds the datasheet, fetch_document reads it: web_fetch
         # returned nothing readable from a text-layer PDF (Dev, 02.10.2026).
         tools.append(copy.deepcopy(FETCH_DOCUMENT_TOOL))
+    if research_instructions is not None:
+        for tool in tools:
+            if tool["name"] in TOOL_DESCRIPTIONS:
+                tool["description"] = TOOL_DESCRIPTIONS[tool["name"]]
     return tools
 
 
 # A return-round answer shorter than this share of the report before it is
 # not "the full report with additions" but a summary of the changes — keep the
 # earlier report instead of handing out a fragment.
-RUECKRUNDE_MIN_ANTEIL = 0.5
+from src.compat.research_content import RUECKRUNDE_MIN_ANTEIL
 
 
 def _report_text(parsed: Optional[AnthropicMessagesResponse]) -> str:
@@ -385,6 +392,7 @@ async def run_research_cloud(
     perplexity_client: Optional[httpx.AsyncClient] = None,
     fetch_document_kwargs: Optional[Dict[str, Any]] = None,
     nachkontrolle: Optional[Nachkontrolle] = None,
+    research_instructions: Optional[str] = None,
 ) -> ResearchCloudResult:
     """Run one research-cloud job to completion (all pause_turn continuations).
 
@@ -467,7 +475,9 @@ async def run_research_cloud(
         raise ResearchCloudExecutorError(
             "Lücken-Nachkontrolle ohne perplexity_search — die Rückrunde hätte nichts zum Suchen"
         )
-    tools = _build_tools(config, library_cfg, perplexity_cfg)
+    if research_instructions is not None and nachkontrolle is not None:
+        raise ResearchCloudExecutorError("Caller-owned research cannot use legacy editorial review")
+    tools = _build_tools(config, library_cfg, perplexity_cfg, research_instructions)
     client_tools = _client_tool_names(tools)
     system: List[Dict[str, Any]] = [
         {"type": "text", "text": system_prompt, "cache_control": {"type": "ephemeral"}}

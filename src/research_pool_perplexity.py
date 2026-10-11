@@ -30,6 +30,8 @@ from typing import Any, Awaitable, Callable, Dict, Optional
 
 import httpx
 
+from src.research_instructions import TOOL_DESCRIPTIONS
+
 from src.research_cloud.fetch_document import (
     FETCH_DOCUMENT_TOOL,
     FETCH_DOCUMENT_TOOL_NAME,
@@ -100,7 +102,9 @@ class PoolPerplexityTool:
         anonymize: Callable[[str], Awaitable[str]],
         client: Optional[httpx.AsyncClient],
         max_uses: int,
+        research_instructions: Optional[str] = None,
     ) -> None:
+        self.research_instructions = research_instructions
         self.config = config
         self.anonymize = anonymize
         self.client = client
@@ -169,7 +173,8 @@ class PoolPerplexityTool:
         sdk_tool = tool(
             PERPLEXITY_TOOL_NAME,
             # Same text as the cloud tool, with the CLI's name for the fetch tool.
-            PERPLEXITY_TOOL["description"].replace("web_fetch", "WebFetch").replace("web_search", "WebSearch"),
+            (TOOL_DESCRIPTIONS[PERPLEXITY_TOOL_NAME] if self.research_instructions is not None
+             else PERPLEXITY_TOOL["description"]).replace("web_fetch", "WebFetch").replace("web_search", "WebSearch"),
             PERPLEXITY_TOOL["input_schema"],
         )(self.handle)
         config = dict(create_sdk_mcp_server(name=MCP_SERVER_NAME, tools=[sdk_tool]))
@@ -204,7 +209,8 @@ class PoolDocumentTool:
     that carries the named reason (src/research_cloud/fetch_document.py).
     """
 
-    def __init__(self, max_uses: int, **fetch_kwargs: Any) -> None:
+    def __init__(self, max_uses: int, research_instructions: Optional[str] = None, **fetch_kwargs: Any) -> None:
+        self.research_instructions = research_instructions
         self.counters = DocumentCounters(max_uses=max_uses)
         self._fetch_kwargs = fetch_kwargs
 
@@ -220,7 +226,8 @@ class PoolDocumentTool:
 
         sdk_tool = tool(
             FETCH_DOCUMENT_TOOL_NAME,
-            _cli_tool_names(FETCH_DOCUMENT_TOOL["description"]),
+            _cli_tool_names(TOOL_DESCRIPTIONS[FETCH_DOCUMENT_TOOL_NAME]
+                            if self.research_instructions is not None else FETCH_DOCUMENT_TOOL["description"]),
             FETCH_DOCUMENT_TOOL["input_schema"],
         )(self.handle)
         config = dict(create_sdk_mcp_server(name=DOC_MCP_SERVER_NAME, tools=[sdk_tool]))

@@ -36,6 +36,8 @@ from urllib.parse import urljoin, urlparse
 
 import httpx
 
+from src.compat.research_content import FETCH_DOCUMENT_TOOL_DESCRIPTION
+
 logger = logging.getLogger(__name__)
 
 FETCH_DOCUMENT_TOOL_NAME = "fetch_document"
@@ -62,16 +64,7 @@ _IMAGE_MARKDOWN = re.compile(r"^!\[[^\]]*\]\([^)]*\)\s*$", re.MULTILINE)
 
 FETCH_DOCUMENT_TOOL: Dict[str, Any] = {
     "name": FETCH_DOCUMENT_TOOL_NAME,
-    "description": (
-        "Lädt ein öffentliches Dokument (PDF, DOCX, PPTX, XLSX) von einer URL und liefert seinen Text "
-        "mit Seitenzahlen — für Datenblätter, Broschüren, Kataloge, Normauszüge und Merkblätter, die "
-        "web_fetch nicht lesbar liefert. Optional `seiten` (z. B. \"3-5\" oder \"2,7\") oder `suchbegriff` "
-        "(z. B. eine Typbezeichnung), um bei langen Dokumenten nur die passenden Seiten zu bekommen.\n"
-        "Zitiere Kennwerte mit Dokument-URL und Seite. Liefert das Werkzeug einen Fehler (kein Textinhalt, "
-        "zu groß, nicht erreichbar) oder steht der gesuchte Typ nicht im Dokument, suchst du eine zweite "
-        "Fundstelle desselben Dokuments oder derselben Angabe (Herstellerseite, andere Händler- oder "
-        "Katalogfassung), bevor du einen Wert als „nicht bestätigt“ führst."
-    ),
+    "description": FETCH_DOCUMENT_TOOL_DESCRIPTION,
     "input_schema": {
         "type": "object",
         "properties": {

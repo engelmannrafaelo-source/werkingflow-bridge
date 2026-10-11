@@ -1579,6 +1579,7 @@ class ClaudeCodeCLI:
         resume_workdir: Optional[Path] = None,
         cache_boundary: Optional[int] = None,
         antwort_im_text: bool = False,
+        research_instructions: Optional[str] = None,
     ) -> AsyncGenerator[Dict[str, Any], None]:
         """Run Claude Code using the Python SDK and yield response chunks.
 
@@ -1695,6 +1696,8 @@ class ClaudeCodeCLI:
             prompt, max_turns, research_depth = build_research_execution_prompt(
                 prompt, max_turns, library_dir=research_library_dir,
                 antwort_im_text=antwort_im_text,
+                **({"research_instructions": research_instructions}
+                   if research_instructions is not None else {}),
             )
             logger.info(
                 f"   Research depth: {research_depth}, max_turns: {max_turns}, "
