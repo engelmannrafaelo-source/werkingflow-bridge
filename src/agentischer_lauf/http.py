@@ -94,7 +94,7 @@ def content_dispatch(legacy):
 def job_dispatch(legacy):
     @wraps(legacy)
     async def dispatch(body, request, credentials=None):
-        if body.kind != "research" or "agentischer_lauf" not in body.payload:
+        if body.kind != "research" or body.payload.get("agentischer_lauf") is None:
             return await legacy(body, request, credentials)
         from pydantic import ValidationError
         from src.models import ResearchRequest

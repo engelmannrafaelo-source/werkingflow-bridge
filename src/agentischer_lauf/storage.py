@@ -65,6 +65,17 @@ class Storage:
         finally:
             os.close(fd)
 
+    def archive(self, directory, attempt, state):
+        """Keep prior usage, artifacts and diagnosis before accepting a retry.
+
+        Called under the run lock. Repeating after a crash before state replacement
+        writes the same checkpoint; it never loses the previous attempt.
+        """
+        archive = directory / "attempts" / str(attempt)
+        archive.parent.mkdir(mode=0o700, exist_ok=True)
+        archive.mkdir(mode=0o700, exist_ok=True)
+        self.save(archive, state)
+
     def reference(self, tenant, run_id, phase, name):
         # Opaque resource id. Retrieval re-derives tenant scope; no host path.
         return (

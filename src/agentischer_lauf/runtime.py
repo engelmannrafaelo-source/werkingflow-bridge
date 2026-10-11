@@ -143,6 +143,23 @@ class Runtime:
             "diagnose_ref": self.storage.reference(tenant, run.lauf_id, phase, "diagnose"),
         }
 
+    @staticmethod
+    def retryable_state(state):
+        # A released but incomplete checkpoint is uncertain, never retryable.
+        return bool(
+            state
+            and state["stage"] == "finished"
+            and state["result"]["status"] == "error"
+            and state["result"].get("retryable") is True
+        )
+
+    def next_attempt(self, directory, state):
+        if not self.retryable_state(state):
+            return state.get("attempt", 1) if state else 1
+        attempt = state.get("attempt", 1)
+        self.storage.archive(directory, attempt, state)
+        return attempt + 1
+
     def reserve(self, request, tenant):
         """Checkpoint acceptance time before a durable job can be deferred."""
         run = request.agentischer_lauf
@@ -152,10 +169,13 @@ class Runtime:
             if state is not None:
                 if state["digest"] != digest:
                     raise RunError("lauf_konflikt")
-                return
+                if not self.retryable_state(state):
+                    return
+            attempt = self.next_attempt(directory, state)
             self.storage.save(
                 directory,
                 {
+                    "attempt": attempt,
                     "digest": digest,
                     "accepted_at": time.time(),
                     "stage": "accepted",
@@ -176,7 +196,7 @@ class Runtime:
             accepted = state if state and state["stage"] == "accepted" else None
             if state and state["digest"] != digest:
                 raise RunError("lauf_konflikt")
-            if state and not accepted:
+            if state and not accepted and not self.retryable_state(state):
                 if state["digest"] != digest:
                     raise RunError("lauf_konflikt")
                 result = copy.deepcopy(state["result"])
@@ -199,8 +219,10 @@ class Runtime:
                     if result.get("pruefung"):
                         result["pruefung"]["usage"] = copy.deepcopy(result["usage"])
                 return result
+            attempt = self.next_attempt(directory, state)
             result = self.empty_result(request, tenant, digest, request.model, "hauptlauf")
             state = {
+                "attempt": attempt,
                 "digest": digest,
                 "accepted_at": accepted["accepted_at"] if accepted else time.time(),
                 "stage": "started",

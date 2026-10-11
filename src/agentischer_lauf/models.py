@@ -163,13 +163,12 @@ class Run(Contract):
 
 def validate_request(values):
     """Before legacy coercion/defaults: explicit contradictory options are errors."""
-    if not isinstance(values, dict) or "agentischer_lauf" not in values:
+    if not isinstance(values, dict) or values.get("agentischer_lauf") is None:
         return values
-    if values["agentischer_lauf"] is None:
-        raise ValueError("auftrag_ungueltig: missing run object")
     forbidden = {
         "research_mode",
         "research_instructions",
+        "privacy_allowlist",
         "depth",
         "strategy",
         "max_hops",

@@ -55,8 +55,38 @@ abgeschlossener Checkpoint liefert `lauf_unvollstaendig`; möglicherweise bereit
 berechnete Modellantworten werden nicht automatisch erneut erzeugt.
 
 Ein bereits angenommener Auftrag behält seine Frist über Job-Deferrals hinweg.
-Gleiche Lauf-ID mit geändertem Inhaltsdigest ergibt 409. Ein gespeicherter Fehler
-bleibt Fehler. Wiederverwendeter Erfolg verursacht keine erneuten Nutzungskosten;
+Gleiche Lauf-ID mit geändertem Wire-Digest ergibt 409. Ein gespeicherter Fehler
+mit `retryable: false` bleibt endgültig. Ein vollständig gespeicherter Fehler mit
+`retryable: true` ist dagegen kein endgültiger Laufabschluss: ein erneuter POST
+mit demselben Auftrag und derselben `lauf_id` beginnt einen neuen Versuch unter
+derselben Tenant/Lauf-Sperre. GET (Job, Diagnose oder Artefakt) führt nichts aus;
+ein terminaler Job wechselt dadurch nicht nachträglich auf Erfolg.
+
+Jeder neue Versuch bekommt ein frisches Zeit- und Tokenbudget aus demselben
+Auftrag. Wiederholte Reservierung eines bereits angenommenen Versuchs verlängert
+seine Frist nicht. Ein unvollständiger Checkpoint wird weiterhin niemals neu
+ausgeführt, auch wenn ein darin vermerkter Teilfehler retrybar war. Die gesamte
+Ausführung einschließlich einer optionalen Prüfung startet frisch; weder
+Teilantworten noch Teilsandboxes werden als erfolgreich übernommen. Der Aufrufer
+beachtet `retry_after_s` und begrenzt Zahl und Gesamtkosten seiner Wiederholungen.
+Die Bridge startet keinen Hintergrund-Retry und verspricht für retrybare Fehler
+keine Exactly-once-Ausführung.
+
+Vor Beginn archiviert die Bridge den alten Checkpoint samt Usage, Diagnose und
+Artefaktbytes unter `attempts/<interne Nummer>/state.json` im geschützten Laufvolume.
+Diese Nummer ist kein Wire-Feld und verändert den Digest nicht. Ein Archivfehler
+verhindert den neuen Versuch. Öffentliche Laufreferenzen zeigen auf den aktuellen
+Versuch; frühere Daten bleiben intern für Diagnose und Abrechnung erhalten.
+
+Diese Variante erhält den bisherigen Wire-Vertrag und die deterministische
+Lauf-ID. Ein zusätzliches verpflichtendes Versuchsfeld würde dagegen jeden
+Aufrufer und dessen Digest-Bildung ändern. Energy benötigt nur eine additive
+Transportänderung: nach einem terminalen Jobfehler mit `retryable: true` (und der
+Wartefrist) einen neuen `POST /v1/jobs` mit identischer Payload senden, die neue
+`job_id` speichern und diese abfragen. Der alte Job bleibt Fehler; bloßes GET auf
+dessen ID löst keinen Versuch aus. Energy behält Bahn, Fachablauf und Digest.
+Für einen abgeschlossenen, nicht retrybaren Lauf ist eine neue Lauf-ID nötig.
+ Wiederverwendeter Erfolg verursacht keine erneuten Nutzungskosten;
 die ursprünglichen Nutzungsdaten bleiben in der geschützten Diagnose.
 
 Artefakte werden vollständig unter der bestehenden authentifizierten
@@ -81,3 +111,130 @@ Research-Protokoll, Scholarly und der Legacy-Research-Funktionskörper bleiben
 unverändert. Beim Merge mit parallelen Research-Arbeiten diese Dekoratoren und
 die ResearchResponse-Erweiterungen erhalten. Die neue JSON-Schema-Abhängigkeit
 wird ausdrücklich in `pyproject.toml` geführt.
+
+## CXA-Wire-Digest (normativer Vertrag, A3)
+
+`herkunft.auftrag_sha256` ist SHA-256 über das kanonische UTF-8-JSON der sechs
+Felder `query`, `model`, `max_turns`, `max_tokens`, `antwort_im_text` und
+`agentischer_lauf` des validierten ResearchRequest. Das vollständige Laufobjekt
+enthält **lauf_id**, den Schema-Alias `schema` und sämtliche Modell-Defaults:
+`systemtext: ""`, `pruefung: null` sowie nicht genutzte Ausgabefelder
+`datei: null` und `json_schema: null`. Bei vorhandener Prüfung gilt dasselbe
+für deren Systemtext und Ausgabe. Entfernt wird ausschließlich `quelle` aus
+jedem Materialeintrag, einschließlich Inline-Bytes oder URL; Identität, Ziel,
+Bytezahl und Material-SHA bleiben enthalten. `async_mode` und alle übrigen
+äußeren Research-Felder gehören nicht in den Digest. Die sechs äußeren Felder
+sind für diesen Modus ausdrücklich anzugeben, es gibt keine Modellwahl per Default.
+
+Objektschlüssel werden rekursiv sortiert, Listen behalten ihre Reihenfolge.
+Separatoren sind Komma und Doppelpunkt ohne Leerzeichen; Unicode wird nicht
+ASCII-escaped, NaN/Infinity sind unzulässig. Es gibt keine zusätzliche
+Unicode-Normalisierung und keinen abschließenden Zeilenumbruch. SHA-256 wird
+als 64-stelliger Hexwert in Kleinbuchstaben übertragen.
+
+Dies präzisiert die CX0-Inhaltsdigest-Formulierung: der hier festgelegte
+**Wire-Digest enthält lauf_id**. Ein von der App zur Erzeugung der Lauf-ID
+verwendeter Inhaltsdigest ist davon getrennt und kein Herkunfts-Wire-Digest.
+Der folgende normative Vektor wird direkt aus diesem Vertrag durch
+`tests/agentischer_lauf/test_retry_contract.py` gelesen und mit dem Laufcode verglichen.
+
+```json wire-digest-contract
+{
+  "fields": [
+    "query",
+    "model",
+    "max_turns",
+    "max_tokens",
+    "antwort_im_text",
+    "agentischer_lauf"
+  ],
+  "encoding": "utf-8",
+  "json_options": {
+    "sort_keys": true,
+    "separators": [
+      ",",
+      ":"
+    ],
+    "ensure_ascii": false,
+    "allow_nan": false
+  },
+  "vector": {
+    "request": {
+      "query": "Sortiere Bücher: α",
+      "model": "synthetic",
+      "max_turns": 2,
+      "max_tokens": 40,
+      "antwort_im_text": true,
+      "async_mode": false,
+      "agentischer_lauf": {
+        "schema": "agentischer-lauf/1",
+        "lauf_id": "digest-example",
+        "material": [
+          {
+            "id": "book",
+            "ziel": "input.txt",
+            "bytes": 1,
+            "sha256": "2d711642b726b04401627ca9fbac32f5c8530fb1903cc4db02258717921a4881",
+            "quelle": {
+              "art": "inline",
+              "content_base64": "eA=="
+            }
+          }
+        ],
+        "werkzeuge": [],
+        "ausgabe": {
+          "modus": "text",
+          "artefakte": []
+        },
+        "grenzen": {
+          "zeit_s": 20,
+          "tokens_gesamt": 500
+        }
+      }
+    },
+    "normalized": {
+      "query": "Sortiere Bücher: α",
+      "model": "synthetic",
+      "max_turns": 2,
+      "max_tokens": 40,
+      "antwort_im_text": true,
+      "agentischer_lauf": {
+        "schema": "agentischer-lauf/1",
+        "lauf_id": "digest-example",
+        "material": [
+          {
+            "id": "book",
+            "ziel": "input.txt",
+            "bytes": 1,
+            "sha256": "2d711642b726b04401627ca9fbac32f5c8530fb1903cc4db02258717921a4881"
+          }
+        ],
+        "werkzeuge": [],
+        "ausgabe": {
+          "modus": "text",
+          "artefakte": [],
+          "datei": null,
+          "json_schema": null
+        },
+        "grenzen": {
+          "zeit_s": 20,
+          "tokens_gesamt": 500
+        },
+        "systemtext": "",
+        "pruefung": null
+      }
+    },
+    "sha256": "0b9bf21a181708a7d028a74f8644b3d03870d00c427b9ea5d82397896333784f"
+  }
+}
+```
+
+## Zusammenspiel mit CX3
+
+`ResearchRequest` führt `research_instructions`, `privacy_allowlist` und
+`agentischer_lauf` hinter dem Klassen-Docstring. Die ersten beiden Felder sind
+CX3-Felder und bei gesetztem Laufobjekt auch mit null/leeren Werten unzulässig.
+`agentischer_lauf: null` gilt wie ein fehlendes Feld und benutzt den Legacy-Weg,
+auch nach `model_dump → model_validate` und bei der Job-Weitergabe. Die Nutzung
+der CX3-Instruktionen auf dem Rechercheweg setzt weiterhin den CX3-Handler voraus;
+dieser Zweig übernimmt nur deren Schema zur konfliktarmen Zusammenführung.
