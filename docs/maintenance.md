@@ -278,13 +278,16 @@ lokalen Workern stammen.
 ## Worker-SHA bei Dienst-Teilmengen
 
 `bridge-deploy.sh` setzt den Soll-SHA der Versionsprobe nur, wenn der jeweilige
-Deploy Worker gebaut hat (`DEPLOYED_SERVICES`, Phase 4). Die Dienstlisten im
-Skript sind die Quelle der Auswahl:
+Deploy alle vier Pool-Worker worker1 bis worker4 gebaut hat (`DEPLOYED_SERVICES`,
+Phase 4). Der Pool `claude_version` verteilt reihum auf alle vier; nach einer
+Teilmenge antworten die übrigen mit ihrem alten Image, ein Treffer bewiese nur
+einen Worker. Die Dienstlisten im Skript sind die Quelle der Auswahl:
 
 | Aufruf | Worker-Bau | Versionsnachweis |
 |---|---|---|
 | `bridge-deploy.sh hetzner` | worker1 bis worker4 | Soll-SHA vom gebauten Checkout |
-| `bridge-deploy.sh hetzner worker1` (analog worker2–4) | ausgewählter Worker | Soll-SHA; Pool-Antwort beweist keinen vollständigen Rollout |
+| `bridge-deploy.sh hetzner worker1 worker2 worker3 worker4` | alle vier Pool-Worker | Soll-SHA vom gebauten Checkout |
+| `bridge-deploy.sh hetzner worker1` (jede echte Teilmenge von worker1–4) | ausgewählte Worker | UNPROVEN; Grund nennt die nicht gebauten Worker |
 | `bridge-deploy.sh hetzner nginx` / `hetzner platform-api` / Erkunder-Dienste | keiner | UNPROVEN |
 | `bridge-deploy.sh server2` / `server2 platform-api` / `server2 nginx` | keiner; vollständige Auswahl: postgres-prod, platform-api, nginx | UNPROVEN |
 | `bridge-deploy.sh both` | hetzner baut Worker, server2 nicht | getrennte Bewertung je Ziel |

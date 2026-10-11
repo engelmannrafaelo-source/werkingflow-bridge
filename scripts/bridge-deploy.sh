@@ -1133,12 +1133,22 @@ phase_smoke_test() {
         return 0
     fi
 
-    # Only workers built by this deploy can be expected to carry its HEAD.
-    local worker_built=false svc expected_git_sha
+    # Only workers built by this deploy can be expected to carry its HEAD. The
+    # claude_version pool round-robins worker1-4, so its answer proves the SHA
+    # only when all four were rebuilt; a subset keeps old images in the pool.
+    local svc expected_git_sha pool_workers=() missing_workers=() w
     for svc in "${DEPLOYED_SERVICES[@]}"; do
-        case "$svc" in worker[1-4]|worker-*) worker_built=true ;; esac
+        case "$svc" in worker[1-4]|worker-*) pool_workers+=("$svc") ;; esac
     done
-    if [[ "$worker_built" == true ]]; then
+    for w in worker1 worker2 worker3 worker4; do
+        [[ " ${DEPLOYED_SERVICES[*]} " == *" $w "* ]] || missing_workers+=("$w")
+    done
+    if (( ${#pool_workers[@]} > 0 && ${#missing_workers[@]} > 0 )); then
+        local reason="only ${pool_workers[*]} rebuilt, ${missing_workers[*]} keep their old image in the claude_version pool; worker SHA not proven"
+        warn "SMOKE_VERSION_UNPROVEN: ${label}: ${reason}"
+        SMOKE_UNPROVEN+=("${label}: version UNPROVEN — ${reason}")
+        extra_args+=(--version-unproven "$reason")
+    elif (( ${#pool_workers[@]} > 0 )); then
         if ! expected_git_sha=$(rssh "$pool_host" "cd ${REMOTE_REPO} && git rev-parse HEAD"); then
             error_ "Cannot read expected worker SHA for ${label}"
             return 1
