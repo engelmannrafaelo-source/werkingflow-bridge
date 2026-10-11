@@ -135,7 +135,11 @@ async def _job_runs_off_pool(
         return False
 
 
+from src.agentischer_lauf.http import job_dispatch
+
+
 @router.post("/v1/jobs")
+@job_dispatch
 async def create_job_endpoint(
     body: JobCreateRequest,
     request: Request,

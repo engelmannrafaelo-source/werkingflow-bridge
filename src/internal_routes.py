@@ -697,6 +697,8 @@ class InternalJobError(BaseModel):
     fehler_code: Optional[str] = None
     antwort_ende: Optional[str] = None
     teilantwort: Optional[str] = None
+    usage: Optional[Dict[str, Any]] = None
+    diagnose_ref: Optional[str] = None
 
 
 class InternalJobDefer(BaseModel):
@@ -869,7 +871,7 @@ async def internal_mark_error(
             job_id, body.message, code=body.code,
             retryable=body.retryable, retry_after_s=body.retry_after_s,
             fehler_code=body.fehler_code, antwort_ende=body.antwort_ende,
-            teilantwort=body.teilantwort,
+            teilantwort=body.teilantwort, usage=body.usage, diagnose_ref=body.diagnose_ref,
         )
     except store.JobRowMissing as e:
         raise _job_row_missing(e)

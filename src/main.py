@@ -6542,7 +6542,11 @@ async def _cleanup_old_research_jobs() -> None:
             logger.warning(f"⚠️ Research job cleanup error: {e}", exc_info=True)
 
 
+from src.agentischer_lauf.http import research_dispatch, content_dispatch
+
+
 @app.post("/v1/research", response_model=ResearchResponse)
+@research_dispatch
 async def research(
     request_body: ResearchRequest,
     request: Request,
@@ -7482,6 +7486,7 @@ def _research_content_not_here(session_id: str) -> HTTPException:
 
 
 @app.get("/v1/research/{session_id}/content")
+@content_dispatch
 async def get_research_content(
     session_id: str,
     request: Request,
