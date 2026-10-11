@@ -274,3 +274,30 @@ Fuer den Nachweis eines bestimmten Workers die gleiche Probe gegen dessen
 konfigurierten direkten Worker-Endpunkt ausfuehren. Die Pool-Probe beweist keinen
 vollstaendigen Rollout; Version und OpenAPI am Pool koennen von verschiedenen
 lokalen Workern stammen.
+
+## Worker-SHA bei Dienst-Teilmengen
+
+`bridge-deploy.sh` setzt den Soll-SHA der Versionsprobe nur, wenn der jeweilige
+Deploy Worker gebaut hat (`DEPLOYED_SERVICES`, Phase 4). Die Dienstlisten im
+Skript sind die Quelle der Auswahl:
+
+| Aufruf | Worker-Bau | Versionsnachweis |
+|---|---|---|
+| `bridge-deploy.sh hetzner` | worker1 bis worker4 | Soll-SHA vom gebauten Checkout |
+| `bridge-deploy.sh hetzner worker1` (analog worker2–4) | ausgewählter Worker | Soll-SHA; Pool-Antwort beweist keinen vollständigen Rollout |
+| `bridge-deploy.sh hetzner nginx` / `hetzner platform-api` / Erkunder-Dienste | keiner | UNPROVEN |
+| `bridge-deploy.sh server2` / `server2 platform-api` / `server2 nginx` | keiner; vollständige Auswahl: postgres-prod, platform-api, nginx | UNPROVEN |
+| `bridge-deploy.sh both` | hetzner baut Worker, server2 nicht | getrennte Bewertung je Ziel |
+| `bridge-deploy.sh prod-workers` | worker-sahori, worker-kurt, worker-coach, worker-erk | bestehende Container-Prüfungen; kein öffentlicher Smoke in diesem Zweig |
+| `bridge-deploy.sh prod-workers metrics-reader` | keiner | kein öffentlicher Smoke |
+
+Ohne Worker-Bau wird `/v1/version` nicht gegen einen fremden Checkout-HEAD
+geprüft: `SMOKE_VERSION_UNPROVEN` nennt den Grund. Die übrigen Smoke-Proben
+laufen weiter und echte Fehler lösen weiterhin den Rollback aus. Ein sonst
+erfolgreicher Lauf endet sichtbar mit UNPROVEN (Exit 3), ohne Rollback und ohne
+den bisherigen Nachweis-Marker zu überschreiben. Ein fehlender Worker-SHA wird
+durch einen Worker-Deploy mit Versionsprobe nachgewiesen, nicht durch
+`smoke-nachholen` (dieser Befehl gilt den Pool-Lücken).
+
+Offline-Regressionsprobe: `python3 -m pytest -o addopts= -q
+ tests/test_deploy_version_scope.py tests/test_version_delivery.py`.

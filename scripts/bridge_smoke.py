@@ -792,8 +792,12 @@ def resolve_api_key() -> str:
 
 
 def run(base_url: str, profile: str, only: Optional[str], extra_header: dict, attempts: int,
-        expect_bridge: str = "", served_by_required: bool = True, expected_git_sha: str = "") -> list:
+        expect_bridge: str = "", served_by_required: bool = True, expected_git_sha: str = "", version_unproven: str = "") -> list:
     selected = [p for p in PROBES if (profile in p.profiles) and (only is None or p.name in only.split(","))]
+    if version_unproven:
+        if expected_git_sha:
+            raise ValueError("version_unproven and expected_git_sha are mutually exclusive")
+        selected = [p for p in selected if p.name != "version"]
     api_key = resolve_api_key() if any(p.name != "version" for p in selected) else ""
     ctx = Ctx(base_url=base_url.rstrip("/"), api_key=api_key, extra_header=extra_header,
               expect_bridge=expect_bridge, served_by_required=served_by_required, expected_git_sha=expected_git_sha)
@@ -868,7 +872,10 @@ def partition_results(results: list) -> tuple:
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--base-url", required=True)
-    ap.add_argument("--expected-git-sha", default="", help="Full deployed worker commit; required by version probe")
+    version = ap.add_mutually_exclusive_group()
+    version.add_argument("--version-unproven", default="", metavar="REASON",
+                         help="Report worker SHA UNPROVEN without probing version (no worker build)")
+    version.add_argument("--expected-git-sha", default="", help="Full deployed worker commit; required by version probe")
     ap.add_argument("--profile", default="hetzner", choices=["hetzner", "server2"])
     ap.add_argument("--only", default=None, help="run only these probes (comma-separated names)")
     ap.add_argument("--extra-header", action="append", default=[],
@@ -892,7 +899,10 @@ def main():
 
     results = run(args.base_url, args.profile, args.only, extra, args.attempts,
                   expect_bridge=args.expect_bridge.strip().lower(),
-                  served_by_required=not args.served_by_optional, expected_git_sha=args.expected_git_sha)
+                  served_by_required=not args.served_by_optional, expected_git_sha=args.expected_git_sha,
+                  version_unproven=args.version_unproven)
+    if args.version_unproven:
+        print(f"SMOKE_VERSION_UNPROVEN: worker SHA not proven: {args.version_unproven}")
     if not results:
         print(f"SMOKE_FAIL: no probes selected for profile={args.profile} only={args.only}", file=sys.stderr)
         sys.exit(2)
