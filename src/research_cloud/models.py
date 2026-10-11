@@ -18,11 +18,19 @@ class ResearchCloudUsage(BaseModel):
     cache_read_input_tokens: int = 0
     cache_creation_input_tokens: int = 0
 
+    # Messages API responses that reported usage / that carried none. A
+    # response without usage adds nothing above — the counters keep "measured
+    # 0" apart from "not measured" (RUSAGE2).
+    runden_gemessen: int = 0
+    runden_ohne_usage: int = 0
+
     def add(self, other: "ResearchCloudUsage") -> None:
         self.input_tokens += other.input_tokens
         self.output_tokens += other.output_tokens
         self.cache_read_input_tokens += other.cache_read_input_tokens
         self.cache_creation_input_tokens += other.cache_creation_input_tokens
+        self.runden_gemessen += other.runden_gemessen
+        self.runden_ohne_usage += other.runden_ohne_usage
 
 
 class ResearchCloudResult(BaseModel):
@@ -115,7 +123,8 @@ class AnthropicMessagesResponse(BaseModel):
     model: Optional[str] = None
     stop_reason: Optional[str] = None
     container: Optional[AnthropicContainer] = None
-    usage: AnthropicUsage = Field(default_factory=AnthropicUsage)
+    # None = the response carried no usage key — not measured, not 0.
+    usage: Optional[AnthropicUsage] = None
     # Raw content blocks — kept as dicts (not a discriminated union) because
     # they are round-tripped verbatim into the next continuation request's
     # `assistant` message; re-serializing a parsed model risks dropping fields

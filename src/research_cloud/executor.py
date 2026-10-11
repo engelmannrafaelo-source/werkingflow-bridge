@@ -527,14 +527,22 @@ async def run_research_cloud(
 
                     if parsed.container:
                         container_id = parsed.container.id
-                    usage.add(
-                        ResearchCloudUsage(
-                            input_tokens=parsed.usage.input_tokens,
-                            output_tokens=parsed.usage.output_tokens,
-                            cache_read_input_tokens=parsed.usage.cache_read_input_tokens,
-                            cache_creation_input_tokens=parsed.usage.cache_creation_input_tokens,
+                    if parsed.usage is None:
+                        logger.error(
+                            "research-cloud: Messages API response carries no usage — "
+                            "this round's tokens are not measured"
                         )
-                    )
+                        usage.add(ResearchCloudUsage(runden_ohne_usage=1))
+                    else:
+                        usage.add(
+                            ResearchCloudUsage(
+                                input_tokens=parsed.usage.input_tokens,
+                                output_tokens=parsed.usage.output_tokens,
+                                cache_read_input_tokens=parsed.usage.cache_read_input_tokens,
+                                cache_creation_input_tokens=parsed.usage.cache_creation_input_tokens,
+                                runden_gemessen=1,
+                            )
+                        )
                     for block in parsed.content:
                         if block.get("type") == "server_tool_use":
                             if block.get("name") == "web_search":

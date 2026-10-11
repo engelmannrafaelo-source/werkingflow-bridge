@@ -773,11 +773,22 @@ class ResearchResponse(ErrorVerdictFields):
         ),
     )
 
+    usage_unvollstaendig: Optional[str] = Field(
+        default=None,
+        description=(
+            "set when usage is present but does not cover every round of the run: "
+            "e.g. 'research_cloud_ohne_usage: 1 von 3 Runden ohne usage' — the "
+            "usage sums are a lower bound then. None when complete or usage is None."
+        ),
+    )
+
     @model_validator(mode="after")
     def _usage_oder_grund(self):
         if self.usage is not None:
             self.usage_fehlt = None
-        elif not self.usage_fehlt:
+        else:
+            self.usage_unvollstaendig = None
+        if self.usage is None and not self.usage_fehlt:
             self.usage_fehlt = RESEARCH_USAGE_NICHT_GEMESSEN
         return self
 

@@ -5168,6 +5168,23 @@ async def _pool_berichtsdatei_nachholen(
     return _read_research_report(datei), usage
 
 
+def _rueckrunden_usage(
+    chunks: List[Dict[str, Any]], vorenthalten: Optional[Dict[str, int]],
+) -> Optional[Dict[str, int]]:
+    """Sum of the usage the return round's result messages reported, plus the
+    usage of a result an API error withheld (CliApiError.usage). None when the
+    round reported nothing — never a made-up 0."""
+    summe: Optional[Dict[str, int]] = None
+    gemeldet = [u for u in (extract_result_usage(c) for c in chunks) if u]
+    if vorenthalten:
+        gemeldet.append(vorenthalten)
+    for u in gemeldet:
+        summe = summe or {"input_tokens": 0, "output_tokens": 0, "cache_read_tokens": 0, "cache_creation_tokens": 0}
+        for k in summe:
+            summe[k] += u[k]
+    return summe
+
+
 async def _pool_luecken_rueckrunde(
     *,
     nachkontrolle,
@@ -5249,13 +5266,13 @@ async def _pool_luecken_rueckrunde(
         # der Bericht von vorher an seinen Platz — Datei und Antwort gleich.
         if datei is not None:
             datei.write_text(bericht, encoding="utf-8")
+        # The failed round was paid for as far as it got: the result messages
+        # streamed before the exception plus the one an API error withheld.
+        # The exception ends here, so the outer error path never sees it.
+        rr_usage = _rueckrunden_usage(chunks, _vorenthaltene_usage(e))
+        nachkontrolle.rueckrunde_usage = dict(rr_usage or {}, usage_source="api" if rr_usage else "missing")
         return scheitern(f"{type(e).__name__}: {e}")
-    for chunk in chunks:
-        u = extract_result_usage(chunk)
-        if u:
-            rr_usage = rr_usage or {"input_tokens": 0, "output_tokens": 0, "cache_read_tokens": 0, "cache_creation_tokens": 0}
-            for k in rr_usage:
-                rr_usage[k] += u[k]
+    rr_usage = _rueckrunden_usage(chunks, None)
     nachkontrolle.rueckrunde_usage = dict(rr_usage or {}, usage_source="api" if rr_usage else "missing")
     from src.claude_cli import describe_unfinished_result, find_unfinished_result
     _rr_unfertig = find_unfinished_result(chunks)
@@ -6091,6 +6108,10 @@ async def _execute_research_impl(
                 model=request_body.model,
                 input_tokens=_err_in or 0,
                 output_tokens=accumulated_output_tokens or 0,
+                # Same four sums as the error response below — a failed run's
+                # cache reads are paid for like a successful run's.
+                cache_read_tokens=accumulated_cache_read or 0,
+                cache_creation_tokens=accumulated_cache_creation or 0,
                 status="error",
                 duration_ms=int(execution_time * 1000),
                 error_code="research_error",
@@ -6372,6 +6393,9 @@ async def _execute_research_cloud_impl(
                 "iterations": result.iterations,
                 "container_id": result.container_id,
                 "stop_reason": result.stop_reason,
+                # Rounds whose response carried no usage: their tokens are
+                # NOT in the counts above (RUSAGE2).
+                "usage_runden_ohne_messung": result.usage.runden_ohne_usage,
                 "depth": request_body.depth,
                 # Observability only — NOT wired into the deduction path yet,
                 # see src/research_cloud/pricing_tiers.py docstring.
@@ -6411,11 +6435,30 @@ async def _execute_research_cloud_impl(
         library_calls=result.library_calls,
         antwort_quelle="text",
         antwort_ende=result.stop_reason,
-        usage=ResearchUsage.aus_summen(
-            result.usage.input_tokens, result.usage.output_tokens,
-            result.usage.cache_creation_input_tokens, result.usage.cache_read_input_tokens,
-        ),
+        **_cloud_usage_felder(result.usage),
     )
+
+
+USAGE_FEHLT_RESEARCH_CLOUD_OHNE_USAGE = "research_cloud_ohne_usage"
+
+
+def _cloud_usage_felder(usage) -> Dict[str, Any]:
+    """usage / usage_fehlt / usage_unvollstaendig of a successful
+    research-cloud run (RUSAGE2). No Messages API response reported usage:
+    usage None with a reason, never a made-up 0. Some did not: the sums of the
+    measured ones, and usage_unvollstaendig names how many rounds are missing."""
+    if usage.runden_gemessen == 0:
+        return {"usage": None, "usage_fehlt": USAGE_FEHLT_RESEARCH_CLOUD_OHNE_USAGE}
+    felder: Dict[str, Any] = {"usage": ResearchUsage.aus_summen(
+        usage.input_tokens, usage.output_tokens,
+        usage.cache_creation_input_tokens, usage.cache_read_input_tokens,
+    )}
+    if usage.runden_ohne_usage:
+        felder["usage_unvollstaendig"] = (
+            f"{USAGE_FEHLT_RESEARCH_CLOUD_OHNE_USAGE}: {usage.runden_ohne_usage} von "
+            f"{usage.runden_gemessen + usage.runden_ohne_usage} Runden ohne usage"
+        )
+    return felder
 
 
 # nginx's pool_router sets this to "1" when it found no eligible account but
