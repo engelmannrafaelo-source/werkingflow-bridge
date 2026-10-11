@@ -51,6 +51,13 @@ JOB_PATIENCE_SPENT_STATUSES = frozenset({424, 429})
 
 UNCLASSIFIED_RETRYABLE = False
 
+# What a job error says about the run besides message, code and verdict
+# (JOBENDE, 11.10.2026). A research answer cut at the output limit came back
+# as status=error with fehler_code/antwort_ende/session_id; the job error kept
+# only the text, so a /v1/jobs caller read antwort_ende=None. Stored flat in
+# the error row next to message/code, only when set.
+JOB_ERROR_DETAIL_KEYS = ("fehler_code", "antwort_ende", "session_id")
+
 
 def is_retryable_status(status_code: int) -> bool:
     """Rule 2: the verdict for an HTTP status nobody classified explicitly."""
@@ -72,7 +79,8 @@ class JobFailure(RuntimeError):
 
     def __init__(self, message: str, *, retryable: bool,
                  retry_after_s: Optional[float] = None,
-                 usage_felder: Optional[Dict[str, Any]] = None):
+                 usage_felder: Optional[Dict[str, Any]] = None,
+                 details: Optional[Dict[str, Any]] = None):
         super().__init__(message)
         self.retryable = bool(retryable)
         self.retry_after_s = retry_after_s
@@ -80,6 +88,8 @@ class JobFailure(RuntimeError):
         # failed run was paid for, and the job error is all its caller gets.
         # None = the failure carries no usage information at all.
         self.usage_felder = usage_felder
+        # JOB_ERROR_DETAIL_KEYS of the failed answer; job_error_details reads it.
+        self.details = job_error_details(details)
 
 
 def job_usage_fields(exc: BaseException) -> Dict[str, Any]:
@@ -124,8 +134,35 @@ def job_code_fields(code: Optional[str]) -> Dict[str, Any]:
     return fields(UNCLASSIFIED_RETRYABLE)
 
 
+def job_error_details(source: Any) -> Dict[str, str]:
+    """JOB_ERROR_DETAIL_KEYS that are set, from a mapping (an endpoint's error
+    answer) or from an exception — its own attributes (e.g. fehler_code /
+    antwort_ende on a research truncation), then its `details` mapping.
+    {} when none is set; values as text."""
+    if source is None:
+        return {}
+    found: Dict[str, Any] = {}
+    if isinstance(source, dict):
+        found.update(source)
+    else:
+        for key in JOB_ERROR_DETAIL_KEYS:
+            found[key] = getattr(source, key, None)
+        own = getattr(source, "details", None)
+        if isinstance(own, dict):
+            found.update({k: v for k, v in own.items() if v is not None})
+    return {key: str(found[key]) for key in JOB_ERROR_DETAIL_KEYS
+            if found.get(key) not in (None, "")}
+
+
 def job_error_fields(exc: BaseException) -> Dict[str, Any]:
-    """Code + verdict for an exception that ends a job (rule 1, then 2/3)."""
+    """Code + verdict for an exception that ends a job (rule 1, then 2/3),
+    plus `details` when the exception carries any JOB_ERROR_DETAIL_KEYS."""
+    details = job_error_details(exc)
+    extra = {"details": details} if details else {}
+    return {**_job_error_verdict(exc), **extra}
+
+
+def _job_error_verdict(exc: BaseException) -> Dict[str, Any]:
     from src.jobs.executors import ExecutorHTTPError
 
     if isinstance(exc, ExecutorHTTPError):

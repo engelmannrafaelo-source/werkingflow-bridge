@@ -323,12 +323,14 @@ async def mark_error(
     code: Optional[str] = None,
     retryable: Optional[bool] = None,
     retry_after_s: Optional[int] = None,
+    details: Optional[Dict[str, Any]] = None,
     **usage_felder: Any,
 ) -> None:
     # usage_felder: usage / usage_fehlt of a failed research self-call
     # (error_contract.job_usage_fields). A platform-api from before RUSAGE
     # drops them like the BR9 fields below — the job error loses the usage,
     # nothing else.
+    # A platform-api from before JOBENDE drops `details` the same way.
     # A platform-api from before BR9 ignores retryable/retry_after_s (pydantic
     # drops unknown fields) and stores {message, code}; GET then derives the
     # verdict from the code (error_contract.job_code_fields). Degraded, not wrong
@@ -338,7 +340,8 @@ async def mark_error(
             "POST", f"/v1/internal/jobs/{job_id}/error",
             json={"message": message, "code": code,
                   "retryable": retryable, "retry_after_s": retry_after_s,
-                  **usage_felder},
+                  **usage_felder,
+                  **({"details": details} if details else {})},
             timeout_s=_WRITE_TIMEOUT_S,
         )
     except PlatformUnavailable as e:
@@ -347,6 +350,7 @@ async def mark_error(
             return await store.mark_error(
                 job_id, message, code=code,
                 retryable=retryable, retry_after_s=retry_after_s,
+                details=details,
                 **usage_felder,
             )
         except store.JobRowMissing as missing:

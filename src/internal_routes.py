@@ -33,7 +33,7 @@ import logging
 from typing import Any, Dict, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Response
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from src.api_auth import require_service_token, AuthClaims
 from src.audit.db_writer import insert_audit_event
@@ -683,6 +683,16 @@ class InternalJobDone(BaseModel):
     result: Optional[Dict[str, Any]] = None
 
 
+class InternalJobErrorDetails(BaseModel):
+    """error_contract.JOB_ERROR_DETAIL_KEYS (JOBENDE). Unknown keys are a 422,
+    not silently stored."""
+    model_config = ConfigDict(extra="forbid")
+
+    fehler_code: Optional[str] = None
+    antwort_ende: Optional[str] = None
+    session_id: Optional[str] = None
+
+
 class InternalJobError(BaseModel):
     message: str
     code: Optional[str] = None
@@ -694,6 +704,8 @@ class InternalJobError(BaseModel):
     # Absent for every other job; stored only when sent.
     usage: Optional[Dict[str, Any]] = None
     usage_fehlt: Optional[str] = None
+    # Workers from before JOBENDE send none.
+    details: Optional[InternalJobErrorDetails] = None
 
 
 class InternalJobDefer(BaseModel):
@@ -860,6 +872,8 @@ async def internal_mark_error(
             job_id, body.message, code=body.code,
             retryable=body.retryable, retry_after_s=body.retry_after_s,
             **body.model_dump(include={"usage", "usage_fehlt"}, exclude_unset=True),
+            details=(body.details.model_dump(exclude_none=True)
+                     if body.details else None),
         )
     except store.JobRowMissing as e:
         raise _job_row_missing(e)

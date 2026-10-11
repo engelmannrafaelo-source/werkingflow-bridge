@@ -271,13 +271,18 @@ async def mark_error(
     code: Optional[str] = None,
     retryable: Optional[bool] = None,
     retry_after_s: Optional[int] = None,
+    details: Optional[Dict[str, Any]] = None,
     **usage_felder: Any,
 ) -> None:
     """Terminal error. `retryable`/`retry_after_s` are the verdict of
     src/error_contract.py; when a caller has none (a writer from before BR9),
     the row keeps {message, code} and GET derives the verdict from the code.
+    `details` (error_contract.JOB_ERROR_DETAIL_KEYS) go into the row flat,
+    only the keys that are set.
 
     Raises JobRowMissing when the row is gone."""
+    from src.error_contract import job_error_details
+
     error: Dict[str, Any] = {"message": message, "code": code}
     if retryable is not None:
         error["retryable"] = bool(retryable)
@@ -290,6 +295,7 @@ async def mark_error(
     unbekannt = set(usage_felder) - {"usage", "usage_fehlt"}
     if unbekannt:
         raise TypeError(f"mark_error: unknown fields {sorted(unbekannt)}")
+    error.update(job_error_details(details))
     pool = get_pool()
     async with pool.acquire() as conn:
         tag = await conn.execute(
