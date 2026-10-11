@@ -169,6 +169,7 @@ def validate_request(values):
         raise ValueError("auftrag_ungueltig: missing run object")
     forbidden = {
         "research_mode",
+        "research_instructions",
         "depth",
         "strategy",
         "max_hops",
