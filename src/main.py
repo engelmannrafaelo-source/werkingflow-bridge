@@ -1194,23 +1194,62 @@ async def _pick_alternative_worker(
     return max(candidates, key=lambda x: x[1])[0]
 
 
-# Response headers a relay must not copy from the answering worker: hop-by-hop
-# headers (RFC 9110 §7.6.1) and the framing/encoding of the upstream bytes,
-# which the relay re-encodes itself (httpx has already decoded the body).
-_RELAY_DROP_HEADERS = frozenset({
-    "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
-    "te", "trailer", "transfer-encoding", "upgrade",
-    "content-length", "content-encoding", "content-type", "date", "server",
+# Response headers a cross-worker relay passes on: exactly the public
+# diagnostic/cost/backoff headers a caller gets from a worker on the direct
+# path. Everything else stays behind (Set-Cookie, Authorization, internal
+# tokens, hop-by-hop, framing — the relay builds its own JSON framing).
+# X-Bridge-Served-By is deliberately absent: ServedByMiddleware stamps the
+# relaying worker's identity on every answer it sends (src/federation.py).
+# All entries are single-value fields.
+_RELAY_HEADERS = frozenset({
+    "x-cache-boundary",
+    "x-worker-instance",
+    "x-claude-session-id",
+    "x-backend",
+    "x-backend-region",
+    "x-provider-tier",
+    "x-bridge-cost-eur",
+    "x-bridge-cost-calls",
+    "x-bridge-pricing-version",
+    "retry-after",
+    "x-rate-limit-reset",
+    "x-rate-limited",
+    "x-worker-id",
+    "x-worker-failover",
 })
 
 
 def _relay_headers(upstream) -> list[tuple[bytes, bytes]]:
-    """Raw response headers of an upstream httpx answer that a relay passes on."""
-    return [
-        (k.lower(), v)
-        for k, v in upstream.headers.raw
-        if k.decode("latin-1").lower() not in _RELAY_DROP_HEADERS
-    ]
+    """Allowlisted response headers of an upstream httpx answer, one each.
+
+    A name listed in ``Connection`` is hop-by-hop for this exchange and never
+    relayed. A header sent twice with the same value is passed once; sent
+    twice with DIFFERENT values it is dropped and logged — the caller then
+    sees the header missing (the deploy smoke goes red) instead of a value
+    the relay picked by position.
+    """
+    raw = [(k.decode("latin-1").lower(), v) for k, v in upstream.headers.raw]
+    hop = {
+        name.strip().lower()
+        for k, v in raw
+        if k == "connection"
+        for name in v.decode("latin-1").split(",")
+        if name.strip()
+    }
+    values: dict[str, list[bytes]] = {}
+    for k, v in raw:
+        if k in _RELAY_HEADERS and k not in hop:
+            values.setdefault(k, []).append(v)
+    out: list[tuple[bytes, bytes]] = []
+    for k, vs in values.items():
+        if len(set(vs)) > 1:
+            logger.error(
+                f"cross-worker relay: contradictory {k} values {vs!r} from upstream "
+                "— header dropped"
+            )
+            continue
+        out.append((k.encode("latin-1"), vs[0]))
+    return out
 
 
 async def _cross_worker_retry(
