@@ -202,3 +202,19 @@ Netzverkehr). Das ist Dienstbereitschaft, kein Modell-/Bericht-End-to-End-Test.
 Rollback prueft aeltere Images ohne Docker-Healthcheck mit derselben Probe aus
 dem Deploy-Werkzeug. Ein fehlgeschlagener oder nur teilweise gestarteter
 Erkunder-Release wird als ganze Gruppe zurueckgerollt; Fehler bleiben laut.
+
+
+## Versionsvertrag
+
+`GET /v1/version` ist wie Health öffentlich und liefert ausschließlich
+`git_sha` (vollständiger Git-SHA), `built_at` (ISO-8601 mit Zeitzone) und
+`contract_version` (Version des Wire-Vertrags, unabhängig vom Git-Stand).
+Der Worker-Build schreibt SHA und Bauzeit unveränderlich ins Image; die
+Vertragsversion steht beim Response-Modell. Änderungen am Wire-Vertrag
+werden mit den konsumierenden Apps abgestimmt. Fehlende oder ungültige
+Build-Metadaten ergeben 503, keine erfundene Version oder Startzeit.
+Lokale Quellstarts benötigen dieselbe Datei `src/build-metadata.json`;
+sie wird nicht eingecheckt und enthält nur `git_sha` und `built_at`.
+
+Beim Review gilt die Architekturgrenze in [CLAUDE.md](../CLAUDE.md):
+Allgemeine Ausführung bleibt in der Bridge, fachliches Wissen in der App.
