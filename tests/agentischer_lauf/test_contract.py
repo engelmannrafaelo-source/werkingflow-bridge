@@ -138,3 +138,14 @@ def test_legacy_prompts_byte_identical_to_frozen_base():
         hashlib.sha256(raw).hexdigest()
         == "72895db295ca5841f3340532750f1b68ad2a46b47d57dc961a7088007b951388"
     )
+
+
+def test_legacy_wire_shape_does_not_gain_unset_agentic_fields():
+    response = ResearchResponse(status="success", query="q", model="synthetic", content="ok")
+    agentic = {"herkunft", "usage", "grenze", "werkzeugaufrufe", "artefakte", "pruefung", "diagnose_ref"}
+    assert agentic.isdisjoint(response.model_dump())
+    explicit = ResearchResponse(status="success", query="q", model="synthetic", content="ok",
+                                herkunft={"cache": {"hit": False}}, usage=None, artefakte=[])
+    assert explicit.model_dump()["usage"] is None
+    assert explicit.model_dump()["artefakte"] == []
+    assert explicit.model_dump()["herkunft"] == {"cache": {"hit": False}}

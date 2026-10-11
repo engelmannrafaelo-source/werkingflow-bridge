@@ -1,5 +1,5 @@
 from typing import Annotated, List, Optional, Dict, Any, Union, Literal, Annotated
-from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, field_validator, model_validator, Discriminator
+from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, field_validator, model_validator, model_serializer, Discriminator
 from enum import Enum
 from datetime import datetime
 import uuid
@@ -653,6 +653,17 @@ class ResearchResponse(ErrorVerdictFields):
     artefakte: List[Dict[str, Any]] = Field(default_factory=list)
     pruefung: Optional[Dict[str, Any]] = None
     diagnose_ref: Optional[str] = None
+
+    @model_serializer(mode="wrap")
+    def _preserve_legacy_wire_shape(self, serialize):
+        result = serialize(self)
+        # Legacy handlers never set these additive agentic response fields.
+        # Keep their existing JSON shape while preserving explicitly set data.
+        for name in ("herkunft", "usage", "grenze", "werkzeugaufrufe", "artefakte",
+                     "pruefung", "diagnose_ref"):
+            if name not in self.model_fields_set:
+                result.pop(name, None)
+        return result
     status: Literal["success", "error"]
     query: str
     model: str
