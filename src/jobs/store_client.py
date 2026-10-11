@@ -43,6 +43,7 @@ from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 from src.db.client import is_db_enabled
+from src.error_contract import JOB_ERROR_CAUSE_ECHO_KEY
 from src.jobs import store
 from src.platform_client import PlatformUnavailable, call_platform
 
@@ -69,6 +70,8 @@ _STARTED_AT = time.time()
 _lock = threading.Lock()
 _row_missing: Dict[str, int] = defaultdict(int)
 _retention: Dict[str, int] = defaultdict(int)
+# Cause fields a platform-api did not confirm (BRTRUNC2N), by field name.
+_cause_dropped: Dict[str, int] = defaultdict(int)
 
 
 def _count(bucket: Dict[str, int], key: str, n: int = 1) -> None:
@@ -82,6 +85,7 @@ def retention_snapshot() -> Dict[str, Any]:
             "since_epoch": _STARTED_AT,
             "row_missing_by_op": dict(_row_missing),
             "retention": dict(_retention),
+            "cause_fields_dropped": dict(_cause_dropped),
         }
 
 
@@ -334,11 +338,12 @@ async def mark_error(
     body: Dict[str, Any] = {"message": message, "code": code,
                             "retryable": retryable, "retry_after_s": retry_after_s}
     # Cause fields (BRTRUNC2) only when set. A platform-api from before
-    # BRTRUNC2 drops them like the verdict above; the message text stays.
-    for name, value in (("fehler_code", fehler_code), ("antwort_ende", antwort_ende),
-                        ("teilantwort", teilantwort)):
-        if value is not None:
-            body[name] = value
+    # BRTRUNC2 drops them without a word; the confirmation check below makes
+    # that loud (BRTRUNC2N).
+    cause = {name: value for name, value in (
+        ("fehler_code", fehler_code), ("antwort_ende", antwort_ende),
+        ("teilantwort", teilantwort)) if value is not None}
+    body.update(cause)
     try:
         resp = await call_platform(
             "POST", f"/v1/internal/jobs/{job_id}/error",
@@ -358,8 +363,64 @@ async def mark_error(
             raise _row_missing_error("mark_error", job_id, missing)
     if _is_row_missing(resp):
         raise _row_missing_error("mark_error", job_id)
-    if resp.status_code != 204:
+    if resp.status_code not in (200, 204):
         raise _unexpected("mark_error", resp.status_code, resp.json)
+    if not cause:
+        return
+    echo = resp.json if resp.status_code == 200 and isinstance(resp.json, dict) else {}
+    stored = echo.get(JOB_ERROR_CAUSE_ECHO_KEY)
+    stored = stored if isinstance(stored, list) else []
+    dropped = [name for name in cause if name not in stored]
+    if dropped:
+        await _report_dropped_cause(job_id, body, cause, dropped, resp.status_code)
+
+
+async def _report_dropped_cause(
+    job_id: str,
+    body: Dict[str, Any],
+    cause: Dict[str, Any],
+    dropped: List[str],
+    status: int,
+) -> None:
+    """The platform-api stored the error but did not confirm its cause fields:
+    it predates BRTRUNC2 (204 without echo) and dropped them. Deploy order is
+    platform-api first, then the workers (server2 before the worker host).
+
+    Loud at the job, not only in the log: the error is rewritten with the
+    fields an old platform-api keeps (message, code, verdict), the message
+    naming what was dropped and the short cause values. The old route updates
+    the row by job_id regardless of status, so the second write lands."""
+    for name in dropped:
+        _count(_cause_dropped, name)
+    logger.error(
+        "💀 job store mark_error: platform-api (status=%s) did not confirm the "
+        "cause fields %s of job %s — it predates BRTRUNC2 and dropped them. "
+        "Deploy platform-api before the workers.",
+        status, dropped, job_id,
+    )
+    kurz = ", ".join(
+        f"{name}={cause[name]}" for name in dropped if name != "teilantwort"
+    )
+    note = (
+        f" [bridge-vertrag: platform-api ohne BRTRUNC2 hat {', '.join(dropped)} "
+        f"verworfen{'; ' + kurz if kurz else ''}]"
+    )
+    try:
+        resp = await call_platform(
+            "POST", f"/v1/internal/jobs/{job_id}/error",
+            json={**{k: v for k, v in body.items() if k not in cause},
+                  "message": f"{body['message']}{note}"},
+            timeout_s=_WRITE_TIMEOUT_S,
+        )
+        if resp.status_code != 204:
+            raise _unexpected("mark_error (vertrag)", resp.status_code, resp.json)
+    except Exception as e:
+        # The error itself is stored; only the note is missing. Said here,
+        # once more, at error level — the run must still end (registry).
+        logger.error(
+            "💀 job store mark_error: note about the dropped cause fields of job "
+            "%s could not be written: %s", job_id, e,
+        )
 
 
 async def defer_job(job_id: str, delay_seconds: int, reason: str) -> None:

@@ -71,6 +71,10 @@ def fields(retryable: bool, retry_after_s: Optional[float] = None) -> Dict[str, 
 # (/v1/research fehler_code / antwort_ende / teilantwort) instead of matching
 # the message text.
 JOB_ERROR_DETAIL_FIELDS = ("fehler_code", "antwort_ende", "teilantwort")
+# Key of platform-api's answer to POST /v1/internal/jobs/{id}/error that names
+# the cause fields it stored (BRTRUNC2N). Missing (204) = a platform-api from
+# before BRTRUNC2, which drops them; store_client.mark_error says so loudly.
+JOB_ERROR_CAUSE_ECHO_KEY = "ursache_felder"
 
 
 class JobFailure(RuntimeError):

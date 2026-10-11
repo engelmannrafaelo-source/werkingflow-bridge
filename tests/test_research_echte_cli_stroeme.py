@@ -36,7 +36,11 @@ _REST = '"kw-3"]}\n```'
 
 
 def _strom(name):
-    return [json.loads(z) for z in (STROEME / f"{name}.jsonl").read_text().splitlines() if z.strip()]
+    return [
+        json.loads(z)
+        for z in (STROEME / f"{name}.jsonl").read_text().splitlines()
+        if z.strip()
+    ]
 
 
 @pytest.mark.asyncio

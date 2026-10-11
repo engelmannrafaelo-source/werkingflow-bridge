@@ -724,5 +724,7 @@ async def test_watchdog_still_runs_when_retention_route_is_missing(monkeypatch):
 async def test_metrics_endpoint_exposes_counters():
     main = _main()
     snap = await main.get_jobs_retention_metrics(credentials=None)
-    assert set(snap) == {"since_epoch", "row_missing_by_op", "retention"}
+    assert set(snap) == {
+        "since_epoch", "row_missing_by_op", "retention", "cause_fields_dropped",
+    }
     json.dumps(snap)

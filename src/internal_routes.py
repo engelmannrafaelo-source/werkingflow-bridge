@@ -33,10 +33,12 @@ import logging
 from typing import Any, Dict, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Response
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 from src.api_auth import require_service_token, AuthClaims
 from src.audit.db_writer import insert_audit_event
+from src.error_contract import JOB_ERROR_CAUSE_ECHO_KEY
 
 logger = logging.getLogger(__name__)
 
@@ -854,10 +856,16 @@ async def internal_mark_error(
     body: InternalJobError,
     _claims: AuthClaims = Depends(require_service_token),
 ) -> Response:
+    """204 when the error carried no cause field — unchanged for workers from
+    before BRTRUNC2, which accept only 204. With cause fields: 200
+    {"ursache_felder": [stored names]} (BRTRUNC2N). The echo is the worker's
+    proof that they were stored: a platform-api from before BRTRUNC2 drops them
+    (pydantic ignores unknown fields) and answers 204, which the worker reports
+    loudly (store_client.mark_error)."""
     from src.jobs import store
 
     try:
-        await store.mark_error(
+        stored = await store.mark_error(
             job_id, body.message, code=body.code,
             retryable=body.retryable, retry_after_s=body.retry_after_s,
             fehler_code=body.fehler_code, antwort_ende=body.antwort_ende,
@@ -865,6 +873,8 @@ async def internal_mark_error(
         )
     except store.JobRowMissing as e:
         raise _job_row_missing(e)
+    if stored:
+        return JSONResponse(status_code=200, content={JOB_ERROR_CAUSE_ECHO_KEY: stored})
     return Response(status_code=204)
 
 

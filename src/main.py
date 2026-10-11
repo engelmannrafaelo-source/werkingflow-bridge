@@ -9699,7 +9699,10 @@ async def get_jobs_retention_metrics(
     (mark_done/mark_error = a finished result lost) — must stay empty.
     `retention`: removed_terminal, expired_max_age (pending past the 24 h
     backstop), running_over_max_age_seen, prune_route_missing (platform-api
-    predates BR11, nothing deleted). See src/jobs/store_client.py."""
+    predates BR11, nothing deleted). `cause_fields_dropped`: research cause
+    fields (fehler_code, antwort_ende, teilantwort) a platform-api from
+    before BRTRUNC2 did not confirm — must stay empty; deploy platform-api
+    before the workers (BRTRUNC2N). See src/jobs/store_client.py."""
     return jobs_store_client.retention_snapshot()
 
 

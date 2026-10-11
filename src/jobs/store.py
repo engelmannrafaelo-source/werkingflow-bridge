@@ -19,6 +19,7 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 from src.db.client import get_pool
+from src.error_contract import JOB_ERROR_DETAIL_FIELDS
 
 # Terminal vs in-flight. Polling clients stop on done/error/cancelled.
 JOB_STATUS_PENDING = "pending"
@@ -274,14 +275,15 @@ async def mark_error(
     fehler_code: Optional[str] = None,
     antwort_ende: Optional[str] = None,
     teilantwort: Optional[str] = None,
-) -> None:
+) -> List[str]:
     """Terminal error. `retryable`/`retry_after_s` are the verdict of
     src/error_contract.py; when a caller has none (a writer from before BR9),
     the row keeps {message, code} and GET derives the verdict from the code.
     fehler_code / antwort_ende / teilantwort: the cause fields of the endpoint
     (error_contract.JOB_ERROR_DETAIL_FIELDS), stored only when set.
 
-    Raises JobRowMissing when the row is gone."""
+    Returns the names of the cause fields it stored (the platform-api route
+    echoes them, BRTRUNC2N). Raises JobRowMissing when the row is gone."""
     error: Dict[str, Any] = {"message": message, "code": code}
     if retryable is not None:
         error["retryable"] = bool(retryable)
@@ -303,6 +305,7 @@ async def mark_error(
         )
     if _affected(tag) == 0:
         raise JobRowMissing("mark_error", job_id)
+    return [name for name in JOB_ERROR_DETAIL_FIELDS if name in error]
 
 
 async def cleanup_old(ttl_seconds: int) -> int:

@@ -113,6 +113,31 @@ Wo es landet:
   Die Bridge wartet absichtlich und startet den Job dann selbst neu.
   Dazu kommen `defer_count` und `defer_reason`.
 
+### Ursachenfelder bei Jobs: platform-api vor den Workern ausrollen
+
+Ein Research-Job, dessen Antwort abgeschnitten ist, traegt im Fehlerobjekt
+dieselben Ursachenfelder wie `/v1/research`: `fehler_code`, `antwort_ende`
+und `teilantwort` (`error_contract.JOB_ERROR_DETAIL_FIELDS`). Der Worker
+schickt sie an die platform-api der Job-Heimat, und diese speichert sie.
+
+Eine platform-api, die diese Felder noch nicht kennt, verwirft sie, weil
+pydantic unbekannte Felder ignoriert. Deshalb gilt:
+
+- **Pflicht beim Ausrollen: zuerst die platform-api, dann die Worker.**
+  Auf Prod sind das zwei getrennte Ziele: die platform-api auf server2,
+  die Worker auf dem Worker-Host (ADR-0009). Wer nur die Worker ausrollt,
+  erzeugt genau diese Versionsschere.
+- **Die Schere bleibt nicht still.** Mit Ursachenfeldern antwortet die
+  platform-api `200 {"ursache_felder": [...]}` und nennt, was sie
+  gespeichert hat. Ohne Ursachenfelder antwortet sie wie bisher `204`, damit
+  aeltere Worker weiterlaufen. Kommt beim Worker `204` oder ein
+  unvollstaendiges Echo an, meldet `store_client.mark_error` das mit
+  `logger.error`. Der Zaehler `cause_fields_dropped` in
+  `/v1/metrics/jobs-retention` steigt. Ausserdem schreibt der Worker den
+  Fehler erneut: Die Meldung bekommt den Zusatz
+  `[bridge-vertrag: platform-api ohne BRTRUNC2 hat … verworfen; fehler_code=…]`.
+  So ist die Schere am Job selbst sichtbar.
+
 ## Erkunder im Deploy
 
 Auf dem Dev-Ziel gehoeren Ausgang, drei Plaetze und Leitstand zu einer
