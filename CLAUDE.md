@@ -4,6 +4,19 @@ Die Bridge stellt eine OpenAI-kompatible KI-API und Recherche bereit.
 Normale App-, Dev- und Partner-Aufgaben nutzen diesen Dienst ueber seinen
 API-Vertrag; die interne Bereitstellung gehoert nicht zum Standardkontext.
 
+## Architekturgrenze zwischen Bridge und Apps
+
+Die Bridge stellt allgemeine Sandbox- und KI-Funktionen bereit: Isolation,
+Konten, Transport, Cache, Jobmodell, Ende-Signal und Werkzeuge wie einen
+Rechenstand. Fachliche Prompts, Prüfregeln, Urteile, Quellen- und Herkunftslogik,
+Fachschemata und Fachbegriffe gehören in die jeweilige App; die App schickt
+sie als Auftrag und Material mit. Die Bridge führt diesen Auftrag aus und
+liefert Antwort, technische Herkunft und Ende-Signal zurück.
+
+Im Review beurteilt der Reviewer, ob eine Änderung allgemeine Infrastruktur
+bereitstellt oder fachliches Wissen einer App voraussetzt. Letzteres gehört
+in die App. Maßgeblich ist dieses Urteil im Kontext, keine Wortliste.
+
 ## Nutzung
 
 - Chat: `POST /v1/chat/completions`; Recherche: `POST /v1/research`.

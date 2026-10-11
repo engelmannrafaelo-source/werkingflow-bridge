@@ -372,6 +372,9 @@ HEADER
     echo "# Round-robin default pool (used by /health, Lua-routed /v1 SSE, default /)."
     emit_upstream claude_workers 32 "$default_backup" "$targets_name" "${workers[@]}"
     echo
+    echo "# Local build provenance only: no cross-bridge backup."
+    emit_upstream claude_version 8 nobackup "$targets_name" "${workers[@]}"
+    echo
 
     echo "# Account-affinity groups (CACHE2) — one per worker, see emit_affinity_upstreams."
     emit_affinity_upstreams "$default_backup" "$targets_name" "${workers[@]}"

@@ -227,3 +227,50 @@ Netzverkehr). Das ist Dienstbereitschaft, kein Modell-/Bericht-End-to-End-Test.
 Rollback prueft aeltere Images ohne Docker-Healthcheck mit derselben Probe aus
 dem Deploy-Werkzeug. Ein fehlgeschlagener oder nur teilweise gestarteter
 Erkunder-Release wird als ganze Gruppe zurueckgerollt; Fehler bleiben laut.
+
+
+## Versionsvertrag
+
+`GET /v1/version` ist wie Health öffentlich und liefert ausschließlich
+`git_sha` (vollständiger Git-SHA), `built_at` (ISO-8601 mit Zeitzone) und
+`contract_version` (Version des Wire-Vertrags, unabhängig vom Git-Stand).
+Der Worker-Build schreibt SHA und Bauzeit unveränderlich ins Image; die
+Vertragsversion steht beim Response-Modell. Änderungen am Wire-Vertrag
+werden mit den konsumierenden Apps abgestimmt. Fehlende oder ungültige
+Build-Metadaten ergeben 503, keine erfundene Version oder Startzeit.
+Lokale Quellstarts benötigen dieselbe Datei `src/build-metadata.json`;
+sie wird nicht eingecheckt und enthält nur `git_sha` und `built_at`.
+
+Beim Review gilt die Architekturgrenze in [CLAUDE.md](../CLAUDE.md):
+Allgemeine Ausführung bleibt in der Bridge, fachliches Wissen in der App.
+
+
+## Build-Provenienz und Versionsprobe
+
+`/v1/version` liest nur die im Worker-Image eingebrannten Metadaten. Fehlende
+oder ungueltige Metadaten ergeben 503 als nicht wiederholbaren Konfigurationsfehler.
+Der Lastverteiler nutzt dafuer einen lokalen Pool ohne Backup, ohne Wiederholung
+auf einem anderen Worker und ohne Kapazitaets-Umschreibung. Eine einzelne Antwort
+belegt den ausgewaehlten lokalen Worker, nicht die Gleichheit aller Worker.
+
+Nur `scripts/bridge-deploy.sh` setzt `GIT_COMMIT` automatisch beim Worker-Bau.
+`docker/rebuild.sh`, `setup-prod-server.sh` und ein direktes `compose build`
+setzen es nicht selbst: Ohne expliziten vollstaendigen Commit-SHA entsteht wegen
+`${GIT_COMMIT:-unknown}` ein Image, dessen Versionsroute dauerhaft 503 liefert.
+Die Bauzeit stammt aus dem Image-Bau, nicht vom Worker-Start. `/health` bleibt
+unabhaengig davon der Lebenszeichen-Endpunkt.
+
+Die Smoke-Probe `version` verlangt `--expected-git-sha` mit dem vollen ausgerollten
+Worker-SHA. Der Deploy liest ihn unabhaengig von der HTTP-Antwort aus dem
+Worker-Checkout; beim server2-Lastverteiler ist dies der separate Worker-Host.
+Ein Checkout/Image-Unterschied bleibt dadurch ein Fehler. Manuelle Proben muessen
+den erwarteten SHA explizit mitgeben. Beispiel ohne KI-Aufruf:
+
+```sh
+python3 scripts/bridge_smoke.py --base-url "$BRIDGE_URL" --only version --expected-git-sha "$DEPLOYED_SHA"
+```
+
+Fuer den Nachweis eines bestimmten Workers die gleiche Probe gegen dessen
+konfigurierten direkten Worker-Endpunkt ausfuehren. Die Pool-Probe beweist keinen
+vollstaendigen Rollout; Version und OpenAPI am Pool koennen von verschiedenen
+lokalen Workern stammen.
