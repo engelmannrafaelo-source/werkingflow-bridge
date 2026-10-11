@@ -27,22 +27,43 @@ class RateLimitEvent:
         )
 
 
+def _retain_cli_end_fields(parsed: Any, data: dict[str, Any]) -> None:
+    """Keep the CLI fields that say HOW a message or run ended.
+
+    claude-code-sdk 0.0.25 builds AssistantMessage(content, model,
+    parent_tool_use_id) and ResultMessage without them, so they would be gone
+    before any bridge code sees the chunk. Measured in CLI 2.1.296 (BRTRUNC,
+    11.10.2026): an answer cut at the output limit arrives as an assistant
+    message with top-level ``"error": "max_output_tokens"``, and the result
+    carries ``stop_reason`` and ``api_error``. sdk_message_to_dict hands them
+    on as ``cli_error`` / ``stop_reason`` / ``api_error``."""
+    kept: dict[str, Any] = {}
+    if data.get("type") == "assistant":
+        if data.get("error"):
+            kept["_bridge_cli_error"] = data["error"]
+        message = data.get("message")
+        if isinstance(message, dict) and "stop_reason" in message:
+            kept["_bridge_stop_reason"] = message["stop_reason"]
+    elif data.get("type") == "result":
+        if "stop_reason" in data:
+            kept["_bridge_stop_reason"] = data["stop_reason"]
+        if data.get("api_error"):
+            kept["_bridge_api_error"] = data["api_error"]
+    for name, value in kept.items():
+        try:
+            setattr(parsed, name, value)
+        except (AttributeError, TypeError):
+            LOG.error("Could not retain the CLI field %s on an SDK message", name)
+
+
 def resilient_parse_message(
     data: Any, original_parse_message: Callable[[Any], Any]
 ) -> Any:
     """Ignore informational unknown SDK events, but preserve real parse failures."""
     try:
         parsed = original_parse_message(data)
-        if (
-            parsed is not None
-            and isinstance(data, dict)
-            and data.get("type") == "assistant"
-            and data.get("error")
-        ):
-            try:
-                parsed._bridge_cli_error = data["error"]
-            except (AttributeError, TypeError):
-                LOG.error("Could not retain the CLI error field on an SDK message")
+        if parsed is not None and isinstance(data, dict):
+            _retain_cli_end_fields(parsed, data)
         return parsed
     except MessageParseError as error:
         if "unknown message type" not in str(error).lower():

@@ -4922,6 +4922,17 @@ class ResearchReportMissing(RuntimeError):
         self.usage = usage
 
 
+class ResearchAnswerTruncated(ResearchReportMissing):
+    """antwort_im_text and the final message ended at the output limit
+    (claude_cli.antwort_ende). The text is not the answer: it stops mid-way,
+    or — after the CLI's own continuation — is only the tail of it. Its own
+    error (fehler_code) so the caller can shrink the task instead of telling
+    the model a block is missing; a retry of the same request hits the same
+    limit (retryable stays false)."""
+
+    fehler_code = "antwort_abgeschnitten"
+
+
 # A report is text the reader can read. discovered_files holds EVERY file a
 # Write call touched — measured 11.10.2026 (Energy DS2, Phase 4): with no
 # output.md the fallback handed out the run's helper scripts (4.355 and
@@ -5196,6 +5207,9 @@ async def _execute_research_impl(
     accumulated_cache_read = 0
     accumulated_cache_creation = 0
     research_prompt = None  # built inside try, read in error path for estimates
+    # How the final assistant message ended (claude_cli.antwort_ende); set
+    # once the stream is complete, reported on success and on error.
+    research_antwort_ende: Optional[str] = None
 
     try:
         logger.info(
@@ -5456,6 +5470,9 @@ async def _execute_research_impl(
 
         execution_time = time.time() - start_time
 
+        from src.claude_cli import antwort_abgeschnitten, antwort_ende
+        research_antwort_ende = antwort_ende(all_chunks)
+
         # Bibliotheksaufrufe zählbar machen — das Gegenstück zu library_calls
         # des Cloud-Executors. Ohne diese Zahl ist "die Bibliothek wurde
         # benutzt" eine Behauptung, und die Messung vom 05.09. (Katalog spart
@@ -5579,6 +5596,28 @@ async def _execute_research_impl(
                         "Check worker logs for rate_limit_event around session start."
                     ),
                 },
+            )
+
+        # antwort_im_text: the final message IS the answer. Ended at the output
+        # limit it is cut off — or, after the CLI's own continuation, only the
+        # tail of the answer — while the run itself may still report success.
+        # Before the unfinished-run check: when the CLI gave up continuing, the
+        # result reads "success flagged is_error", which would hide the cause.
+        if antwort_im_text and antwort_abgeschnitten(research_antwort_ende):
+            raise ResearchAnswerTruncated(
+                f"Research answer cut off at the output limit (antwort_ende="
+                f"{research_antwort_ende}, session_id={session_id}): antwort_im_text was set and "
+                f"the run's final message is not the complete answer. Not 'no answer' and not "
+                f"error_max_turns — the answer is longer than one message can be; a smaller "
+                f"task fits, the same request hits the same limit."
+            )
+        if antwort_abgeschnitten(research_antwort_ende):
+            # File contract: the report is the file, not the message. Reported
+            # in antwort_ende, logged so a cut-off final message is visible.
+            logger.warning(
+                f"research: final message ended at the output limit (antwort_ende="
+                f"{research_antwort_ende}, session_id={session_id}) — file contract, the report "
+                f"file is the answer"
             )
 
         # The run itself must have ended with success. error_max_turns is not
@@ -5848,6 +5887,7 @@ async def _execute_research_impl(
             session_id=session_id,
             library_calls=library_calls if library_active else None,
             antwort_quelle=antwort_quelle,
+            antwort_ende=research_antwort_ende,
         )
 
     except (WorkerUnavailableError, RateLimitError):
@@ -5905,7 +5945,9 @@ async def _execute_research_impl(
             execution_time_seconds=round(execution_time, 2),
             file_size_bytes=None,
             error=str(e),
-            session_id=session_id
+            session_id=session_id,
+            antwort_ende=research_antwort_ende,
+            fehler_code=getattr(e, "fehler_code", None),
         )
 
 
@@ -6176,6 +6218,7 @@ async def _execute_research_cloud_impl(
         web_fetches=result.fetches,
         library_calls=result.library_calls,
         antwort_quelle="text",
+        antwort_ende=result.stop_reason,
     )
 
 

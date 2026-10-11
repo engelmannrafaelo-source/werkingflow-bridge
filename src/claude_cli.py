@@ -1006,7 +1006,19 @@ def sdk_message_to_dict(message: Any) -> Any:
             except (AttributeError, TypeError) as e:
                 # Expected for properties that raise or computed attributes
                 logger.debug(f"Could not get attribute '{attr_name}': {e}")
+    # How the message / run ended (sdk_parser._retain_cli_end_fields): the
+    # SDK dataclass has no field for it, the private carrier is skipped above.
+    for carrier, key in _CLI_END_CARRIERS:
+        if hasattr(message, carrier):
+            message_dict[key] = getattr(message, carrier)
     return message_dict
+
+
+_CLI_END_CARRIERS = (
+    ("_bridge_cli_error", "cli_error"),
+    ("_bridge_stop_reason", "stop_reason"),
+    ("_bridge_api_error", "api_error"),
+)
 
 
 def is_result_chunk(chunk: Any) -> bool:
@@ -1044,6 +1056,74 @@ def find_unfinished_result(chunks: list) -> Optional[dict]:
     if result is None:
         return {"type": "result", "subtype": "no_result", "is_error": True}
     return None
+
+
+# antwort_ende (BRTRUNC, 11.10.2026): how the run's final answer ended.
+# "max_tokens" = the last assistant message stopped at the output limit;
+# "max_tokens_fortgesetzt" = it did, the CLI continued on its own (meta turn
+# "Output token limit hit. Resume directly", up to 3 times in CLI 2.1.296) and
+# the final answer is spread over several messages — the last one is only its
+# tail. Any other value is the CLI's stop_reason (end_turn, tool_use, ...);
+# None = the CLI reported none.
+ANTWORT_ENDE_AUSGABEGRENZE = "max_tokens"
+ANTWORT_ENDE_FORTGESETZT = "max_tokens_fortgesetzt"
+CLI_OUTPUT_LIMIT_ERROR = "max_output_tokens"
+FORTSETZUNG_KEY = "fortsetzung_nach_ausgabegrenze"
+
+
+def _is_assistant_chunk(chunk: Any) -> bool:
+    return (
+        isinstance(chunk, dict)
+        and not is_result_chunk(chunk)
+        and chunk.get("type") in (None, "assistant")
+        and isinstance(chunk.get("content"), list)
+    )
+
+
+def _has_tool_use(chunk: dict) -> bool:
+    for block in chunk.get("content") or []:
+        if type(block).__name__ == "ToolUseBlock":
+            return True
+        if isinstance(block, dict) and block.get("type") == "tool_use":
+            return True
+    return False
+
+
+def antwort_ende(chunks: list) -> Optional[str]:
+    """How the final answer of a run_completion stream ended (see above).
+
+    The final answer is everything after the last tool call. Signals, strongest
+    first: the CLI's output-limit error on an assistant message or on the
+    result, a stop_reason max_tokens, an automatic continuation inside the
+    final answer; otherwise the reported stop_reason."""
+    result = None
+    for chunk in chunks:
+        if is_result_chunk(chunk):
+            result = chunk
+    assistants = [c for c in chunks if _is_assistant_chunk(c)]
+    last_tool = max((i for i, c in enumerate(assistants) if _has_tool_use(c)), default=-1)
+    final = assistants[last_tool + 1:]
+    if result is not None and (
+        result.get("api_error") == CLI_OUTPUT_LIMIT_ERROR
+        or result.get("stop_reason") == ANTWORT_ENDE_AUSGABEGRENZE
+    ):
+        return ANTWORT_ENDE_AUSGABEGRENZE
+    if assistants and (
+        assistants[-1].get("cli_error") == CLI_OUTPUT_LIMIT_ERROR
+        or assistants[-1].get("stop_reason") == ANTWORT_ENDE_AUSGABEGRENZE
+    ):
+        return ANTWORT_ENDE_AUSGABEGRENZE
+    if any(c.get(FORTSETZUNG_KEY) for c in final):
+        return ANTWORT_ENDE_FORTGESETZT
+    if result is not None and isinstance(result.get("stop_reason"), str):
+        return result["stop_reason"]
+    if assistants and isinstance(assistants[-1].get("stop_reason"), str):
+        return assistants[-1]["stop_reason"]
+    return None
+
+
+def antwort_abgeschnitten(ende: Optional[str]) -> bool:
+    return ende in (ANTWORT_ENDE_AUSGABEGRENZE, ANTWORT_ENDE_FORTGESETZT)
 
 
 def describe_unfinished_result(chunk: dict) -> str:
@@ -2079,6 +2159,7 @@ class ClaudeCodeCLI:
                     prompt_source = prompt
                 # === END LARGE USER PROMPT HANDLING ===
 
+                fortsetzung_ausstehend = False
                 try:
                     async with asyncio.timeout(self.timeout):
                         async for message in query(prompt=prompt_source, options=options):
@@ -2185,6 +2266,9 @@ class ClaudeCodeCLI:
                             # assistant text. Still counted + in messages.jsonl.
                             if is_user_turn(message):
                                 if CLI_CONTINUATION_SENTENCE in _message_text(message):
+                                    # The next assistant message continues a
+                                    # cut-off one (antwort_ende).
+                                    fortsetzung_ausstehend = True
                                     logger.info(
                                         f"🧩 CLI auto-continuation (max_output_tokens) in session "
                                         f"{cli_session_id} — meta user turn withheld from content stream",
@@ -2203,7 +2287,11 @@ class ClaudeCodeCLI:
                             # SystemMessage chunks (init, ...) are passed on like
                             # any other: they are not content and never a result
                             # (is_result_chunk).
+                            ist_assistent = type(message).__name__ == 'AssistantMessage'
                             message = sdk_message_to_dict(message)
+                            if ist_assistent and fortsetzung_ausstehend and isinstance(message, dict):
+                                message[FORTSETZUNG_KEY] = True
+                                fortsetzung_ausstehend = False
                             logger.debug(f"Converted message dict: {message}")
 
                             # Cache chunk to file for crash recovery (with error handling)
