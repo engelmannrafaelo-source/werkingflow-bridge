@@ -444,3 +444,13 @@ async def test_echter_run_completion_max_turns_ist_fehler(monkeypatch, tmp_path,
     result = await _run_echt(monkeypatch, tmp_path,
                              sdk.result("error_max_turns", is_error=True, session_id="cli-echt-1"))
     assert result.status == "error" and "error_max_turns" in result.error
+
+
+@pytest.mark.asyncio
+async def test_caller_short_result_is_written_without_legacy_length_verdict(tmp_path, persist):
+    req = _make_req()
+    req.research_instructions = "Return JSON"
+    fake = FakeCli(tmp_path, chat="{}", nachhol_text="{}")
+    result = await _run(fake, req)
+    assert result.status == "success" and result.content == "{}"
+    assert len(fake.calls["nachhol"]) == 1

@@ -247,7 +247,7 @@ def _build_tools(
 # A return-round answer shorter than this share of the report before it is
 # not "the full report with additions" but a summary of the changes — keep the
 # earlier report instead of handing out a fragment.
-RUECKRUNDE_MIN_ANTEIL = 0.5
+from src.compat.research_content import RUECKRUNDE_MIN_ANTEIL
 
 
 def _report_text(parsed: Optional[AnthropicMessagesResponse]) -> str:

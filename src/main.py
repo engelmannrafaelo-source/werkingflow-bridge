@@ -5007,7 +5007,7 @@ async def _pool_berichtsdatei_nachholen(
         f"The research is finished, but the report file {datei} does not exist. Whoever ordered "
         f"this research receives exactly the contents of that file and nothing else: your chat "
         f"replies are not passed on, and code in a chat reply is never run, so a script that would "
-        f"write the file has not created it. Write the finished report itself now — in Markdown, "
+        f"write the file has not created it. Write the finished report itself now — in the requested format, "
         f"with all findings and sources you have — into {datei} with the Write tool. If it is very "
         f"long, write the first part with Write and add the rest with Edit."
     )
@@ -5673,7 +5673,8 @@ async def _execute_research_impl(
             # the sibling guard above already names (a rate_limit_event whose
             # internal retry never recovered). Raising here makes the caller defer
             # and retry instead of storing an announcement as a research result.
-            if len(parsed_assistant_text.strip()) < RESEARCH_MIN_INLINE_REPORT_CHARS:
+            if (caller_instructions(request_body) is None
+                    and len(parsed_assistant_text.strip()) < RESEARCH_MIN_INLINE_REPORT_CHARS):
                 logger.error(
                     f"❌ Research produced no report: no output file and only "
                     f"{len(parsed_assistant_text.strip())} chars of inline text "
@@ -6318,7 +6319,7 @@ async def _admit_research_to_pool(
 
 # Floor for an inline research answer that never produced a report file. See
 # the guard in _execute_research_impl for the calibration.
-RESEARCH_MIN_INLINE_REPORT_CHARS = 500
+from src.compat.research_content import RESEARCH_MIN_INLINE_REPORT_CHARS
 
 
 # Same-path retries before a cloud failure is surfaced loud: 1 initial
