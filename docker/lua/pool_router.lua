@@ -17,6 +17,9 @@
 -- Sets ngx.var.x_cache_affinity (CACHE2) to "hit" | "fallback:<reason>" when the
 --   request carried X-Cache-Affinity-Key, "" otherwise.
 -- Sets ngx.var.pool_exhausted to "1" ONLY in the all_unavail_overflow case.
+-- priority_pool()/priority_pool_header_filter() (CACHE2N) serve the X-Priority
+--   pool locations, which never call choose(): they state "bypass:<why>" when a
+--   key cannot take effect there (see the block above M.priority_pool).
 --
 -- Decision logic:
 --   1. Refresh timer reads /v1/metrics/account-pool-state every 2s
@@ -315,6 +318,36 @@ end
 -- ---------------------------------------------------------------------------
 local M = {}
 
+-- ---------------------------------------------------------------------------
+-- CACHE2N: the X-Priority pool (@production_streaming / @production_jobs)
+--
+-- Requests whose $llm_backend_pool is claude_production never reach choose():
+-- the 418 jump into the named location happens in the rewrite phase, before
+-- any access_by_lua_block. What that means for X-Cache-Affinity-Key depends on
+-- the topology, emitted by generate-bridge-upstreams.sh as
+-- $priority_pool_affinity:
+--   peer   (primary)    claude_production is the PEER bridge first; the request
+--                       arrives there hopped and gets the full choose() incl.
+--                       affinity. Its X-Cache-Affinity header passes through.
+--                       If no such header comes back (peer down → local backup
+--                       worker answered, or a peer without CACHE2), the header
+--                       filter says so: bypass:peer_without_affinity + WARN.
+--   bypass (production) claude_production is the LOCAL prod workers, plain
+--                       round-robin, no Lua pick → the key cannot take effect.
+--                       That is stated: bypass:priority_pool + WARN + counter.
+-- Without the header nothing changes on either path.
+-- ---------------------------------------------------------------------------
+local BYPASS_PRIORITY_POOL = "bypass:priority_pool"
+local BYPASS_PEER          = "bypass:peer_without_affinity"
+
+local function affinity_bypassed(key, status, why)
+    shared:incr("affinity_bypass", 1, 0)
+    shared:set("affinity_last_bypass", status)
+    ngx.log(ngx.WARN, "pool_router: AFFINITY BYPASSED key_hash=",
+            string.format("%08x", pool_pick.fnv1a32(key or "")), " ", status,
+            " — ", why)
+end
+
 function M.init()
     -- Seed math.random per nginx worker process — without this, every worker
     -- starts with the same default sequence and weighted-random pick clusters.
@@ -540,6 +573,40 @@ function M.choose(opts)
             " state_age_s=", string.format("%.1f", age))
 end
 
+-- Access phase of @production_streaming / @production_jobs. Never rejects and
+-- never changes the upstream: the priority pool keeps its own capacity and
+-- overflow rules (no Lua gate, dev bridge as backup on production).
+function M.priority_pool(mode)
+    local key, problem = read_affinity_key()
+    if key == nil and problem == nil then return end
+    if mode == "peer" then return end          -- decided by the peer; see header filter
+    if mode ~= "bypass" then
+        ngx.log(ngx.ERR, "pool_router.priority_pool: unknown $priority_pool_affinity '",
+                tostring(mode), "' — treating as bypass. Regenerate the upstreams include.")
+    end
+    local status = problem or BYPASS_PRIORITY_POOL
+    set_affinity_vars(status, nil)
+    affinity_bypassed(key, status,
+        "X-Priority pool claude_production routes round-robin without the account "
+        .. "pick; X-Cache-Affinity-Key has no effect on this path")
+end
+
+-- Header filter of the same locations, for mode "peer" only: the peer bridge
+-- must have stated its affinity decision. If it did not, the request was served
+-- without affinity and that must not look like success.
+function M.priority_pool_header_filter(mode)
+    if mode ~= "peer" then return end
+    local key = read_affinity_key()
+    if key == nil then return end
+    local peer = ngx.var.upstream_http_x_cache_affinity
+    if peer ~= nil and peer ~= "" then return end
+    ngx.header["X-Cache-Affinity"] = BYPASS_PEER
+    affinity_bypassed(key, BYPASS_PEER,
+        "answered by " .. tostring(ngx.var.upstream_addr)
+        .. " without an X-Cache-Affinity decision (peer bridge down → local backup, "
+        .. "or peer without CACHE2)")
+end
+
 -- ---------------------------------------------------------------------------
 -- Internal state endpoint: called from content_by_lua_block
 -- in location = /internal/pool-router/state (Docker-network-only access)
@@ -580,7 +647,7 @@ function M.state_handler()
         '{"ts":%.3f,"state_age_s":%.1f,"last_refresh_status":%s,' ..
         '"last_refresh_err":%s,"metrics_url":%s,"consecutive_failures":%d,' ..
         '"decision_counter_per_worker":%s,"affinity":{"hit":%d,"fallback":%d,' ..
-        '"last_fallback":%s},"last_state_snapshot":%s}',
+        '"last_fallback":%s,"bypass":%d,"last_bypass":%s},"last_state_snapshot":%s}',
         state_ts, state_age_s, jstr(refresh_status), jstr(refresh_err or ""),
         METRICS_URL and jstr(METRICS_URL) or "null",
         tonumber(shared:get("consecutive_failures")) or 0,
@@ -588,6 +655,8 @@ function M.state_handler()
         tonumber(shared:get("affinity_hit")) or 0,
         tonumber(shared:get("affinity_fallback")) or 0,
         jstr(shared:get("affinity_last_fallback") or ""),
+        tonumber(shared:get("affinity_bypass")) or 0,
+        jstr(shared:get("affinity_last_bypass") or ""),
         state_snapshot
     ))
 end

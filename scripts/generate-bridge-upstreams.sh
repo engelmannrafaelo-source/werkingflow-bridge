@@ -180,6 +180,31 @@ emit_affinity_upstreams() {
     done
 }
 
+# --- CACHE2N: what X-Cache-Affinity-Key means on the X-Priority pool ---------
+# @production_streaming / @production_jobs (nginx.conf) never run choose(); the
+# Lua there only reports. The mode is topology, so it lives here:
+#   primary    -> peer    claude_production is the peer bridge first; the key
+#                         takes effect THERE (hopped → choose()). A response
+#                         without the peer's X-Cache-Affinity is flagged.
+#   production -> bypass  claude_production is the local prod workers without
+#                         the account pick: the key cannot take effect; every
+#                         such request answers X-Cache-Affinity:
+#                         bypass:priority_pool and logs a WARN.
+# $1 = topology id
+emit_priority_pool_affinity() {
+    local mode
+    case "$1" in
+        primary)    mode="peer" ;;
+        production) mode="bypass" ;;
+        *) echo "ERROR: emit_priority_pool_affinity: unknown topology '$1'" >&2; return 1 ;;
+    esac
+    echo "# Account affinity on the X-Priority pool (CACHE2N) — see"
+    echo "# emit_priority_pool_affinity in the generator and pool_router.priority_pool."
+    echo "map \$http_x_cache_affinity_key \$priority_pool_affinity {"
+    echo "    default ${mode};"
+    echo "}"
+}
+
 # --- ADR-0012: job polls follow the job, not the pool ------------------------
 # A job row lives in the store of the bridge that ACCEPTED the POST — and under
 # the two-tier overflow pool that can be the peer bridge (proxy_next_upstream
@@ -394,6 +419,9 @@ map "$bridge_hopped:$http_x_priority" $llm_backend_pool {
 }
 MAP
     fi
+    echo
+
+    emit_priority_pool_affinity "$id"
     echo
 
     echo "# Job-poll routing by home-bridge marker (ADR-0012)."

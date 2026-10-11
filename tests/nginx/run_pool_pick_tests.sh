@@ -9,8 +9,9 @@ IMAGE="${OPENRESTY_IMAGE:-openresty/openresty:1.27.1.1-alpine}"
 
 # test_pool_affinity.lua (CACHE2) also drives pool_router.choose() with a stub
 # ngx; the router reads its worker set from BRIDGE_WORKERS like in production.
+# test_priority_affinity.lua (CACHE2N) drives priority_pool() the same way.
 exec docker run --rm \
   -e BRIDGE_WORKERS="worker1,worker2,worker3,worker4" \
   -v "$REPO/docker/lua:/lua:ro" \
   -v "$REPO/tests/nginx:/tests:ro" \
-  "$IMAGE" sh -c 'luajit /tests/test_pool_pick.lua && luajit /tests/test_pool_affinity.lua'
+  "$IMAGE" sh -c 'luajit /tests/test_pool_pick.lua && luajit /tests/test_pool_affinity.lua && luajit /tests/test_priority_affinity.lua'

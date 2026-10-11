@@ -40,6 +40,7 @@ cat > "$WORK/worker.py" <<'PYEOF'
 import json, os
 from http.server import BaseHTTPRequestHandler, HTTPServer
 NAME = os.environ["NAME"]; FAIL = os.environ.get("FAIL") == "1"
+PEER_AFFINITY = os.environ.get("PEER_AFFINITY", "")   # stands in for a peer bridge's own decision
 class H(BaseHTTPRequestHandler):
     def _h(self):
         self.rfile.read(int(self.headers.get("Content-Length") or 0))
@@ -49,6 +50,8 @@ class H(BaseHTTPRequestHandler):
         self.send_response(code)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
+        if PEER_AFFINITY and self.headers.get("X-Cache-Affinity-Key"):
+            self.send_header("X-Cache-Affinity", PEER_AFFINITY)
         self.end_headers()
         self.wfile.write(body)
     do_GET = do_POST = _h
@@ -61,8 +64,9 @@ cat > "$WORK/metrics.py" <<'PYEOF'
 import json, os
 from http.server import BaseHTTPRequestHandler, HTTPServer
 TIGHT = os.environ.get("TIGHT", "")
+WORKERS = os.environ.get("WORKERS", "worker1,worker2,worker3,worker4").split(",")
 ACC = {}
-for n, w in [("engelmann", "worker1"), ("office", "worker2"), ("gmail", "worker3"), ("werking", "worker4")]:
+for n, w in zip(["engelmann", "office", "gmail", "werking"], WORKERS):
     ACC[n] = {"worker": w, "available": True, "cooldown_remaining_s": 0,
               "effective_cap_tokens": 400000, "current_in_flight_tokens": 0,
               "weekly_percent": 20.0, "usage_known": True}
@@ -83,30 +87,42 @@ PYEOF
 echo "Building $IMG from docker/Dockerfile.nginx-lb ..."
 docker build -q -f "$D/Dockerfile.nginx-lb" -t $IMG "$REPO" >/dev/null || { echo "FAIL: image build"; exit 1; }
 
-render() {
+PROD_WORKERS="worker-sahori,worker-kurt,worker-coach,worker-erk"
+
+render() { # $1 = primary (default) | prod
     sed "s/\${BRIDGE_ID}/test/g; s/\${BRIDGE_BACKUP_HOST}/192.0.2.10/g; s/\${METRICS_READER_TARGET}/metrics-elsewhere:8000/g" \
         "$D/nginx.conf" > "$WORK/nginx.conf"
-    sed 's/${BRIDGE_BACKUP_HOST}/backup-host/g; s/${BRIDGE_ID}/test/g' "$D/upstreams-primary.conf" > "$WORK/upstreams.conf"
+    if [ "${1:-primary}" = prod ]; then
+        # the prod include, with its worker-host targets pointed at the stub workers
+        sed 's/${BRIDGE_BACKUP_HOST}/backup-host/g; s/${BRIDGE_ID}/test/g; s/100\.93\.143\.105:800\([1-4]\)/worker\1:8000/g' \
+            "$D/upstreams-prod.conf" > "$WORK/upstreams.conf"
+    else
+        sed 's/${BRIDGE_BACKUP_HOST}/backup-host/g; s/${BRIDGE_ID}/test/g' "$D/upstreams-primary.conf" > "$WORK/upstreams.conf"
+    fi
     cp "$D/routes-metrics-reader.conf" "$D/routes-platform-api.conf" "$D/worker-map-primary.conf" "$WORK/"
 }
 
 start_stack() { # $1 = failing worker (e.g. worker4) or ""   $2 = TIGHT account or ""
+               # $3 = topology primary (default) | prod   $4 = X-Cache-Affinity the misc/peer stub answers with
     cleanup
     docker network create $NET >/dev/null
-    render
+    local topo="${3:-primary}" workers="worker1,worker2,worker3,worker4"
+    [ "$topo" = prod ] && workers="$PROD_WORKERS"
+    render "$topo"
     local i
     for i in 1 2 3 4; do
-        local f=""; [ "worker$i" = "${1:-}" ] && f=1
+        local f="" name; [ "worker$i" = "${1:-}" ] && f=1
+        name=$(printf '%s' "$workers" | cut -d, -f$i)
         docker run -d --name ca-w$i --network $NET --network-alias worker$i \
-            -e NAME=worker$i -e FAIL=$f -v "$WORK/worker.py:/w.py:ro" $PY python /w.py >/dev/null
+            -e NAME="$name" -e FAIL=$f -v "$WORK/worker.py:/w.py:ro" $PY python /w.py >/dev/null
     done
     docker run -d --name ca-misc --network $NET --network-alias backup-host \
         --network-alias platform-api --network-alias privacy-pdf \
-        -e NAME=misc -v "$WORK/worker.py:/w.py:ro" $PY python /w.py >/dev/null
+        -e NAME=misc -e PEER_AFFINITY="${4:-}" -v "$WORK/worker.py:/w.py:ro" $PY python /w.py >/dev/null
     docker run -d --name ca-metrics --network $NET --network-alias metrics-elsewhere \
-        -e TIGHT="${2:-}" -v "$WORK/metrics.py:/m.py:ro" $PY python /m.py >/dev/null
+        -e TIGHT="${2:-}" -e WORKERS="$workers" -v "$WORK/metrics.py:/m.py:ro" $PY python /m.py >/dev/null
     docker run -d --name ca-nginx --network $NET -p $PORT:80 --tmpfs /var/log/nginx \
-        -e BRIDGE_WORKERS="worker1,worker2,worker3,worker4" -e METRICS_READER_TARGET=metrics-elsewhere:8000 \
+        -e BRIDGE_WORKERS="$workers" -e METRICS_READER_TARGET=metrics-elsewhere:8000 \
         -v "$WORK/nginx.conf:/usr/local/openresty/nginx/conf/nginx.conf:ro" \
         -v "$WORK/upstreams.conf:/tmp/upstreams.conf:ro" \
         -v "$WORK/worker-map-primary.conf:/tmp/worker-map.conf:ro" \
@@ -115,6 +131,28 @@ start_stack() { # $1 = failing worker (e.g. worker4) or ""   $2 = TIGHT account 
         $IMG >/dev/null
     for _ in $(seq 60); do curl -sf -o /dev/null http://127.0.0.1:$PORT/health && break; sleep 0.25; done
     sleep 3   # router refresh timer (2 s)
+}
+
+# preq <path> [key] → like req, but as a NON-hopped X-Priority: production call
+# (the Energy-Prod customer path: llm_client.py / ai_bridge_client.py)
+preq() {
+    local path="$1" key="${2:-}" hdrs out code body
+    hdrs="$WORK/h.txt"
+    if [ -n "$key" ]; then
+        out=$(curl -s -D "$hdrs" -w '\n%{http_code}' -XPOST "http://127.0.0.1:$PORT$path" \
+              -H "X-Priority: production" -H "X-Cache-Affinity-Key: $key" -d '{"q":1}')
+    else
+        out=$(curl -s -D "$hdrs" -w '\n%{http_code}' -XPOST "http://127.0.0.1:$PORT$path" \
+              -H "X-Priority: production" -d '{"q":1}')
+    fi
+    code=$(printf '%s' "$out" | tail -1)
+    body=$(printf '%s' "$out" | sed '$d')
+    local w ca n
+    w=$(printf '%s' "$body" | python3 -c "import sys,json
+try: print(json.load(sys.stdin)['worker'])
+except Exception: print('n/a')")
+    ca=$(grep -i '^x-cache-affinity:' "$hdrs" | tr -d '\r' | awk '{print $2}' | paste -sd+)
+    echo "$code $w ${ca:-none}"
 }
 
 # req <path> [key] → prints "<http> <answering-worker> <X-Target-Worker> <X-Cache-Affinity> <X-Pool-Decision>"
@@ -239,6 +277,52 @@ for _ in $(seq 8); do set -- $(req /v1/chat/completions "$key4"); seen="$seen $2
 distinct=$(printf '%s\n' $seen | sort -u | wc -l)
 [ "$distinct" -ge 3 ] && pass "fallback requests are spread like before ($distinct workers)" \
                       || fail "fallback requests not spread: $seen"
+
+echo
+echo "=== Scenario: production topology, X-Priority: production (Energy-Prod path) ==="
+# @production_streaming / @production_jobs run no account pick. A key there must
+# be answered with bypass:priority_pool and a WARN line — never look like a hit.
+start_stack "" "" prod
+ok=1
+for path in /v1/chat/completions /v1/jobs; do
+    set -- $(preq $path job-affinity-1)
+    if [ "$1" != 200 ] || [ "$3" != "bypass:priority_pool" ]; then ok=0; echo "    $path got: $*"; fi
+done
+[ $ok = 1 ] && pass "priority pool (prod): chat + jobs with key → 200, X-Cache-Affinity: bypass:priority_pool" \
+            || fail "priority pool (prod): bypass not reported"
+n=$(docker exec ca-nginx cat /var/log/nginx/error.log | grep -c 'AFFINITY BYPASSED.*bypass:priority_pool')
+[ "$n" -ge 2 ] && pass "priority bypass logged ($n x WARN 'AFFINITY BYPASSED … bypass:priority_pool')" \
+               || fail "priority bypass: $n WARN line(s), want >= 2"
+seen=""; hdr_ok=1
+for _ in $(seq 8); do set -- $(preq /v1/chat/completions); seen="$seen $2"; [ "$3" = none ] || hdr_ok=0; done
+distinct=$(printf '%s\n' $seen | sort -u | wc -l)
+[ "$distinct" -eq 4 ] && [ $hdr_ok = 1 ] && pass "priority pool (prod) without key: round-robin over 4 prod workers, no header" \
+    || fail "priority pool (prod) without key: $distinct workers (want 4), header_absent=$hdr_ok"
+st=$(docker exec ca-nginx curl -s http://127.0.0.1/internal/pool-router/state)
+STATE="$st" python3 -c "import json,os,sys; d=json.loads(os.environ['STATE']); a=d['affinity']; sys.exit(0 if a['bypass']>=2 and a['last_bypass']=='bypass:priority_pool' else 1)" \
+    && pass "state endpoint counts priority bypasses" || fail "state endpoint: ${st:0:200}"
+# the hopped path on the same LB still has the full affinity (that is where the
+# dev bridge sends Energy-Staging)
+set -- $(req /v1/chat/completions job-affinity-1)
+[ "$1" = 200 ] && [ "$4" = hit ] && pass "prod LB, hopped: affinity hit as before ($3)" \
+    || fail "prod LB, hopped: $*"
+
+echo
+echo "=== Scenario: primary topology, X-Priority pool forwards to the peer bridge ==="
+start_stack "" "" primary hit
+set -- $(preq /v1/chat/completions job-affinity-1)
+[ "$1" = 200 ] && [ "$2" = misc ] && [ "$3" = hit ] \
+    && pass "peer states its decision → passed through unchanged (one header, 'hit')" \
+    || fail "peer decision not passed through cleanly: $*"
+start_stack "" "" primary ""
+set -- $(preq /v1/chat/completions job-affinity-1)
+[ "$1" = 200 ] && [ "$3" = "bypass:peer_without_affinity" ] \
+    && pass "answer without the peer's decision → bypass:peer_without_affinity" \
+    || fail "missing peer decision not reported: $*"
+docker exec ca-nginx cat /var/log/nginx/error.log | grep -q 'AFFINITY BYPASSED.*bypass:peer_without_affinity' \
+    && pass "missing peer decision logged at WARN" || fail "no WARN for missing peer decision"
+set -- $(preq /v1/chat/completions)
+[ "$3" = none ] && pass "peer path without key: no header" || fail "peer path without key: $*"
 
 echo
 if [ "$FAILURES" -eq 0 ]; then
