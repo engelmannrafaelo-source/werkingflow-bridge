@@ -88,7 +88,9 @@ class Runtime:
         revision: str,
         max_bytes: int,
         material_resolver=None,
+        bash=None,
     ):
+        self.bash = bash
         self.adapters = adapters
         self.storage = storage
         self.revision = revision
@@ -104,6 +106,8 @@ class Runtime:
         ):
             self.adapters.require(model)
             Sandbox.validate_tools(tools)
+            if any(t.name == "Bash" for t in tools) and self.bash is None:
+                raise RunError("faehigkeit_nicht_verfuegbar")
         if sum(m.bytes for m in run.material) > self.max_bytes:
             raise RunError("auftrag_ungueltig")
         if any(m.quelle.art == "verweis" for m in run.material) and self.material_resolver is None:
@@ -352,6 +356,7 @@ class Runtime:
             tools,
             output.artefakte + ([output.datei] if output.datei else []),
             self.max_bytes,
+            bash=self.bash,
         )
         messages = []
         if systemtext:
@@ -477,7 +482,10 @@ class Runtime:
                     result["werkzeugaufrufe"]["eintraege"].append(event)
                     started = time.monotonic()
                     try:
-                        value = sandbox.call(name, args)
+                        value = await sandbox.acall(name, args)
+                    except RunError as exc:
+                        event.update(status="error", fehler_code=exc.code)
+                        raise
                     except Exception:
                         event.update(status="error", fehler_code="werkzeug_fehler")
                         raise RunError("werkzeug_fehler") from None
@@ -489,6 +497,18 @@ class Runtime:
                         for m in request.agentischer_lauf.material
                         if args.get("path") == m.ziel and name == "Read"
                     ]
+                    if name == "Bash":
+                        # A computation returns a complete snapshot, including
+                        # deletions. Do not resurrect a prior script in review/cache.
+                        state["blobs"] = {
+                            ref: blob
+                            for ref, blob in state["blobs"].items()
+                            if blob["phase"] != phase or blob["pfad"] in sandbox.files
+                        }
+                        result["artefakte"] = [
+                            item for item in result["artefakte"] if item["pfad"] in sandbox.files
+                        ]
+                        event["artefakt_ids"] = [sha(p.encode()) for p in sorted(sandbox.files)]
                     if name == "Write":
                         event["artefakt_ids"] = [sha(args["path"].encode())]
                     self.publish(request, tenant, state, result, phase, sandbox.files)

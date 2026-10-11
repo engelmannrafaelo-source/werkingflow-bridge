@@ -30,12 +30,56 @@ werden. Ihr gesamtes Tokenbudget ist bisher nicht vorab hart durchsetzbar.
 
 ## Sandbox und Material
 
-Die vermittelte Dateisandbox hält unveränderliches Eingangsmaterial getrennt von
-beschreibbaren, ausdrücklich deklarierten Ausgaben. Sie bietet `Read`, `Write`
-und `List` mit leerem Konfigurationsobjekt an. Kein Modell erhält Zugriff auf
-Host-Dateien, Prozesse, Netzwerk oder Credentials. Weitere Werkzeuge, insbesondere
-Bash/Python, benötigen einen gesonderten isolierten Adapter und werden hier
-abgelehnt. Das ist eine bewusst begrenzte technische Fähigkeit, keine Fachregel.
+Die vermittelte Sandbox hält unveränderliches Eingangsmaterial getrennt von
+beschreibbaren, ausdrücklich deklarierten Ausgaben. `Read`, `Write`, `List` und
+`Bash` akzeptieren jeweils ein leeres Konfigurationsobjekt (`parameter: {}`).
+Unbekannte Werkzeuge oder Werkzeugkonfigurationen werden vor dem Modellaufruf
+mit HTTP 422 abgewiesen. Jeder Teilauftrag erhält genau seine eigene Werkzeugliste;
+die Prüfung erbt keine Freigaben vom Hauptlauf.
+
+`Bash` wird ausdrücklich serverseitig über `Runtime(..., bash=BashPlace(...))`
+gebunden. Ohne diese Bindung bleibt ein Bash-Auftrag bei HTTP 422
+`faehigkeit_nicht_verfuegbar`. Der Werkzeugaufruf lautet
+`{"command": "python scripts/calculate.py"}`; Ergebnis sind `exit_code`, `stdout`
+und `stderr`. Eine normale Rückgabe mit Exitcode ungleich null ist ein sichtbares
+Befehlsergebnis für das Modell. Zeit-, Isolations- und Artefaktfehler brechen den
+Lauf mit Fehlercode ab. `stdout` und `stderr` sind begrenzter UTF-8-Text;
+binäre Rechenergebnisse gehören in deklarierte Artefaktdateien.
+
+### Rechenplatz
+
+`BashPlace` verwendet das vorhandene Rechenimage aus `Dockerfile.erkunder`,
+serverseitig auf eine geprüfte lokale Image-ID festgelegt. Der Betreiber übergibt
+außerdem einen privaten Ablagepfad und den lokalen Docker-Zugang. Code und
+Ablagepfad müssen unter denselben Pfaden auf dem Docker-Host sichtbar sein.
+Das ist eine Voraussetzung der Serverkomposition, keine vom Auftrag wählbare
+Option; dieser Anschluss erteilt keinem Worker automatisch Docker-Rechte.
+
+Jeder Aufruf bekommt einen eigenen Platz mit PID-, IPC- und Netz-Namensraum,
+schreibgeschütztem Root-Dateisystem, begrenzten tmpfs-Verzeichnissen, 2 GiB RAM,
+128 Prozessen und einer CPU. Der Rechenplatz hat überhaupt keinen Netzausgang
+(auch keinen Modell-Proxy). Das kurze Bootstrap bereitet Verzeichnisrechte vor;
+vor jedem Befehl werden UID/GID und die dafür benötigten Fähigkeiten abgelegt.
+Das Kind läuft unprivilegiert mit `no-new-privileges`, dem bestehenden
+`protect_process`-Schutz und einer expliziten Umgebung ohne Zugangsdaten.
+Die vorhandenen Prozess-Aufräumfunktionen beenden und ernten die Nachkommen;
+abschließend wird der gesamte Container auch bei Abbruch entfernt.
+
+Material wird einzeln schreibgeschützt eingebunden und nach dem Befehl auf seine
+Identität geprüft. Die bisherigen Ausgaben werden für den nächsten Aufruf
+übernommen. Nur reguläre Dateien unter deklarierten Ausgabezielen dürfen zurück;
+Links, Spezialdateien, zu viele Dateien, übergroße Ausgaben und veränderte
+Materialpfade führen zu einem Fehler. Der Zustand umfasst auch Löschungen.
+Bash erlaubt das Lesen und Schreiben innerhalb dieses Rechenplatzes; eine
+zusätzliche `Write`-Freigabe ist für Rechenartefakte nicht erforderlich.
+Prozessumgebung, laufende Prozesse und temporäre Dateien werden nicht fortgesetzt.
+Es gibt keine fachliche Festlegung auf bestimmte Skript- oder Ergebnisnamen.
+
+Die Servergrenze pro Befehl beträgt standardmäßig 30 Sekunden, konfigurierbar bis
+480 Sekunden; zusätzlich gilt die Gesamtfrist des Auftrags. Das zwingende
+Aufräumen wird bei einer Fristüberschreitung noch abgewartet. Erreicht ein Befehl
+die Dateigrößengrenze, kann eine begrenzte Teildatei zurückbleiben; der nicht
+erfolgreiche Exitcode bleibt sichtbar.
 
 Inline-Material wird nach SHA-256 und Bytezahl geprüft. HTTPS-Verweise benötigen
 einen serverseitig gebundenen Resolver, der Ziel und jeden Redirect autorisiert,
@@ -99,8 +143,12 @@ noch an die Betriebsregeln des allgemeinen Laufvolumes angeschlossen werden.
 
 ## Prüfung und Integration
 
-`tests/agentischer_lauf/` nutzt ausschließlich synthetische SDK-Antworten und
-HTTP-/Store-Doubles. Die Tests prüfen unveränderten App-Wortlaut, Ende-Signale,
+`tests/agentischer_lauf/` nutzt synthetische SDK-Antworten und HTTP-/Store-Doubles.
+Die Bash-Tests führen echte, kurzlebige Rechencontainer ohne Modellaufrufe aus;
+`ABASH_TEST_IMAGE` muss eine lokale, geprüfte Image-ID benennen. Sie prüfen auch
+Netz-/Pfadausbrüche, Prozesserschöpfung, Abbruch und binäre Artefakte. Smoke-Suiten
+mit globalen SDK-Mocks laufen in einem eigenen pytest-Prozess.
+Die Laufkerntests prüfen unveränderten App-Wortlaut, Ende-Signale,
 Werkzeugfreigabe, Budgetreservierung, Ausgaben, isolierte Prüfrunden,
 Materialintegrität, Idempotenz und den Fehlertransport durch die Speicherung.
 Der SHA-256-Test des Legacy-Promptmoduls belegt dessen unveränderte Fassung.
