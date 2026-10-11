@@ -4922,12 +4922,29 @@ class ResearchReportMissing(RuntimeError):
         self.usage = usage
 
 
+# A report is text the reader can read. discovered_files holds EVERY file a
+# Write call touched — measured 11.10.2026 (Energy DS2, Phase 4): with no
+# output.md the fallback handed out the run's helper scripts (4.355 and
+# 40.562 chars of Python, one of them ending in open(".../output.md","w"))
+# as the research result with status=success.
+RESEARCH_REPORT_SUFFIXES = frozenset({".md", ".markdown", ".txt"})
+
+# Text contract (ResearchRequest.antwort_im_text): no tool that writes a file
+# or runs code. Write/Edit are the file channel the contract replaces; Bash is
+# how the run turned "write the answer" into "write a program that writes it".
+RESEARCH_TEXT_CONTRACT_DISALLOWED_TOOLS = ["Write", "Edit", "MultiEdit", "NotebookEdit", "Bash"]
+
+
 def _research_report_file(discovered_files: List[Path], ordered_file: Optional[Path]) -> Optional[Path]:
     """The run's report: the file the bridge named as OUTPUT_FILE_PATH if it
-    exists, otherwise the first discovered file that exists."""
+    exists, otherwise the first discovered report-type file that exists
+    (RESEARCH_REPORT_SUFFIXES — never a script or data file the run wrote)."""
     if ordered_file is not None and ordered_file.is_file():
         return ordered_file
     for path in discovered_files:
+        if path.suffix.lower() not in RESEARCH_REPORT_SUFFIXES:
+            logger.warning(f"research: {path.name} is not a report file — not handed out as the result")
+            continue
         if path.is_file():
             return path
     return None
@@ -5096,6 +5113,10 @@ async def _pool_luecken_rueckrunde(
             sdk_mcp_servers=sdk_mcp_servers,
             session_id=cli_resume_id,
             resume_workdir=workdir,
+            disallowed_tools=(
+                list(RESEARCH_TEXT_CONTRACT_DISALLOWED_TOOLS)
+                if getattr(request_body, "antwort_im_text", False) is True else None
+            ),
         ):
             chunks.append(chunk)
     except Exception as e:
@@ -5132,7 +5153,9 @@ async def _pool_luecken_rueckrunde(
         except OSError as e:
             return scheitern(f"Berichtsdatei nach der Rückrunde nicht lesbar: {e}")
     else:
-        neu = claude_cli.parse_claude_message(chunks) or ""
+        # LAST text — the revised report closes the round; the first text is
+        # its opening move ("Ich ergänze zuerst …").
+        neu = _doc_agent_extract_last_assistant_text(chunks) or ""
     if len(neu.strip()) < len(bericht.strip()) * RUECKRUNDE_MIN_ANTEIL:
         if datei is not None:
             # The model overwrote the file with a fragment — put the report back.
@@ -5360,6 +5383,8 @@ async def _execute_research_impl(
 
         logger.info("🚀 Starting research execution...")
 
+        # `is True`: a missing/None field (older callers) is the file contract.
+        antwort_im_text = getattr(request_body, "antwort_im_text", False) is True
         all_chunks = []
         file_metadata = None
         cli_resume_id: Optional[str] = None
@@ -5370,6 +5395,8 @@ async def _execute_research_impl(
             model=request_body.model,
             max_turns=request_body.max_turns,
             allowed_tools=None,
+            disallowed_tools=list(RESEARCH_TEXT_CONTRACT_DISALLOWED_TOOLS) if antwort_im_text else None,
+            antwort_im_text=antwort_im_text,
             stream=True,
             enable_file_discovery=True,
             backend_env_vars=backend_config.env_vars if backend_config else None,
@@ -5487,7 +5514,14 @@ async def _execute_research_impl(
         # written elsewhere.
         workdir = _research_workdir(file_metadata, str(discovered_files[0]) if discovered_files else None)
         ordered_file = workdir / "claudedocs" / RESEARCH_OUTPUT_FILENAME if workdir is not None else None
-        report_path = _research_report_file(discovered_files, ordered_file)
+        if antwort_im_text:
+            # The final message is the answer; a file is never the answer here
+            # (the run had no tool to write one — this only keeps a stray file
+            # from a seeded workdir out of the result).
+            discovered_files = []
+            report_path = None
+        else:
+            report_path = _research_report_file(discovered_files, ordered_file)
 
         # Content comes from the run's OWN file, never from a copy: the old
         # default copy target was /tmp/<name> — /tmp/output.md for every run
@@ -5505,7 +5539,12 @@ async def _execute_research_impl(
         from src.claude_cli import detect_quota_exhaustion as _dqe
 
         try:
-            parsed_assistant_text = claude_cli.parse_claude_message(all_chunks)
+            if antwort_im_text:
+                # LAST assistant text: parse_claude_message returns the FIRST,
+                # which in a multi-turn run is the opening move.
+                parsed_assistant_text = _doc_agent_extract_last_assistant_text(all_chunks)
+            else:
+                parsed_assistant_text = claude_cli.parse_claude_message(all_chunks)
         except Exception as _parse_err:
             logger.error(f"❌ Research parse_claude_message raised: {_parse_err}", exc_info=True)
             parsed_assistant_text = None
@@ -5555,11 +5594,19 @@ async def _execute_research_impl(
                 f"Research run ended with "
                 f"{describe_unfinished_result(_research_unfertig)} instead of a clean "
                 f"success (session_id={session_id}) — "
-                + (f"the report file {container_file} may be partly written and is not handed out."
+                + ("antwort_im_text: the final message of a cut-off run is not the answer."
+                   if antwort_im_text else
+                   f"the report file {container_file} may be partly written and is not handed out."
                    if container_file else "no report file was written; the chat text is not a report.")
             )
 
-        if not content and parsed_assistant_text:
+        antwort_quelle = "datei" if content else None
+        if antwort_im_text:
+            # No floor, no repair round: the caller prescribed the format and
+            # validates the text itself; an empty final message fails below.
+            content = parsed_assistant_text
+            antwort_quelle = "text"
+        elif not content and parsed_assistant_text:
             # The fallback is for "the agent answered inline instead of writing a
             # file" — not for "the agent said what it was about to do and then
             # stopped". Measured 2026-09-04 (A/B-Lauf, Frage Fluchtweglänge): the
@@ -5628,8 +5675,14 @@ async def _execute_research_impl(
                 accumulated_cache_creation += nachhol_usage["cache_creation_tokens"]
             container_file = content_file = str(ordered_file)
             file_size_bytes = ordered_file.stat().st_size
+            antwort_quelle = "datei"
 
         if not content or not content.strip():
+            if antwort_im_text:
+                raise ResearchReportMissing(
+                    f"Research finished without an answer: antwort_im_text was set and the run's "
+                    f"final message has no text (session_id={session_id})."
+                )
             raise ResearchReportMissing(
                 "Research finished without a report: "
                 + (f"the report file {container_file} is empty" if container_file
@@ -5640,7 +5693,17 @@ async def _execute_research_impl(
         # The caller's copy target, if it named one. Written from the report
         # that is returned — a failed copy is logged, the content is intact.
         output_file = container_file
-        if request_body.output_path:
+        if antwort_im_text and request_body.output_path:
+            # Same convenience as the research-cloud path: the bridge writes
+            # the returned text to the caller's copy target itself.
+            try:
+                with open(request_body.output_path, "w", encoding="utf-8") as f:
+                    f.write(content)
+                output_file = request_body.output_path
+                file_size_bytes = len(content.encode("utf-8"))
+            except OSError as e:
+                logger.error(f"❌ Could not write output_path {request_body.output_path!r}: {e}")
+        elif request_body.output_path:
             try:
                 shutil.copy2(container_file, request_body.output_path)
                 output_file = request_body.output_path
@@ -5783,7 +5846,8 @@ async def _execute_research_impl(
             content=content,
             error=None,
             session_id=session_id,
-            library_calls=library_calls if library_active else None
+            library_calls=library_calls if library_active else None,
+            antwort_quelle=antwort_quelle,
         )
 
     except (WorkerUnavailableError, RateLimitError):
@@ -6111,6 +6175,7 @@ async def _execute_research_cloud_impl(
         web_searches=result.searches,
         web_fetches=result.fetches,
         library_calls=result.library_calls,
+        antwort_quelle="text",
     )
 
 

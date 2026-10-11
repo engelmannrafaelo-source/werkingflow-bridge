@@ -56,7 +56,10 @@ def parse_depth(prompt: str) -> str:
 
 
 def build_research_execution_prompt(
-    prompt: str, max_turns: int, library_dir: Optional[str] = None
+    prompt: str,
+    max_turns: int,
+    library_dir: Optional[str] = None,
+    antwort_im_text: bool = False,
 ) -> Tuple[str, int, str]:
     """Transform a ``/sc:research "…" --flags`` prompt into the direct
     execution protocol, honouring the requested depth.
@@ -70,6 +73,15 @@ def build_research_execution_prompt(
     against 2 library reads with 204 documents in the folder, because step 1
     of this protocol named only the web). Without a library the protocol is
     byte-identical to the pre-change text (snapshot-tested).
+
+    ``antwort_im_text`` is the caller's output contract (ResearchRequest):
+    the answer is the text of the FINAL assistant message, in the format the
+    query prescribes. The protocol then names no file at all. The default
+    protocol orders a report file (and claude_cli injects OUTPUT_FILE_PATH
+    with "Do NOT reply in chat!"), which overrules a caller who asks for a
+    block in the reply text — Energy DS2, 11.10.2026: the agent wrote Python
+    scripts that write claudedocs/output.md, the caller got the script back.
+    Without the contract both protocols stay byte-identical.
 
     Everything that isn't the command token or a known flag stays part of
     the query — including an injected OA literature block, which must reach
@@ -96,13 +108,15 @@ def build_research_execution_prompt(
     if library_dir:
         return (
             _library_first_protocol(
-                research_query, depth, search_budget, fetch_budget, library_dir
+                research_query, depth, search_budget, fetch_budget, library_dir,
+                antwort_im_text=antwort_im_text,
             ),
             effective_turns,
             depth,
         )
 
-    execution_prompt = f"""Research this query and write output IMMEDIATELY:
+    lead, write_step, stop_step, closing = _output_lines(antwort_im_text)
+    execution_prompt = f"""{lead}
 
 QUERY: {research_query}
 
@@ -110,8 +124,8 @@ PROTOCOL (depth: {depth} — budgets are ceilings, not targets):
 1. Use WebSearch (up to {search_budget} searches) and WebFetch (up to {fetch_budget} page fetches) — targeted, no filler queries
 2. Address EVERY question/category the query contains. If the budget cannot cover all of them in depth, reduce per-item depth instead of dropping items, and list anything you could not source under an explicit "Offene Lücken / Open gaps" heading — never drop a sub-question silently
 3. Extract key findings with sources (keep each finding under {_FINDING_WORDS[depth]} words)
-4. Write the report into the file named under OUTPUT_FILE_PATH IMMEDIATELY after your searches are done
-5. DO NOT conduct additional searches after writing the file
+4. {write_step} after your searches are done
+5. {stop_step}
 
 OUTPUT STRUCTURE:
 # Research Report
@@ -131,7 +145,7 @@ OUTPUT STRUCTURE:
 ## Sources
 [List URLs]
 
-The report file is the result of this research: whoever ordered it reads that file and nothing else.
+{closing}
 """
     return execution_prompt, effective_turns, depth
 
@@ -142,6 +156,7 @@ def _library_first_protocol(
     search_budget: int,
     fetch_budget: int,
     library_dir: str,
+    antwort_im_text: bool = False,
 ) -> str:
     """Protocol for a run with a curated library in the workdir.
 
@@ -150,7 +165,8 @@ def _library_first_protocol(
     Same order and same source split as the appended catalogue block
     (``research_cloud.prompt._POOL_LIBRARY_HEADER``) and the cloud path.
     """
-    return f"""Research this query and write output IMMEDIATELY:
+    lead, write_step, stop_step, closing = _output_lines(antwort_im_text)
+    return f"""{lead}
 
 QUERY: {research_query}
 
@@ -159,8 +175,8 @@ PROTOCOL (depth: {depth} — budgets are ceilings, not targets):
 2. WebSearch/WebFetch nur für das, was dort fehlt, und für Aktualität/Fassungsstand (up to {search_budget} searches and up to {fetch_budget} page fetches — targeted, no filler queries)
 3. Address EVERY question/category the query contains. If the budget cannot cover all of them in depth, reduce per-item depth instead of dropping items, and list anything you could not source under an explicit "Offene Lücken / Open gaps" heading — never drop a sub-question silently
 4. Extract key findings with sources (keep each finding under {_FINDING_WORDS[depth]} words). Every number states its origin: (Bibliothek: <id>) or (Web: <URL>)
-5. Write the report into the file named under OUTPUT_FILE_PATH IMMEDIATELY after your research is done
-6. DO NOT conduct additional searches after writing the file
+5. {write_step} after your research is done
+6. {stop_step}
 
 OUTPUT STRUCTURE:
 # Research Report
@@ -182,5 +198,33 @@ OUTPUT STRUCTURE:
 Bibliothek: <id>
 Web: <URL>]
 
-The report file is the result of this research: whoever ordered it reads that file and nothing else.
+{closing}
 """
+
+
+def _output_lines(antwort_im_text: bool) -> Tuple[str, str, str, str]:
+    """The four places where the protocol names the output channel.
+
+    Default: the report FILE (byte-identical to the pre-contract wording).
+    ``antwort_im_text``: the text of the final message; files and scripts
+    are named as dead ends, and a format prescribed by the query wins over
+    the default report structure — the caller parses the reply mechanically.
+    """
+    if not antwort_im_text:
+        return (
+            "Research this query and write output IMMEDIATELY:",
+            "Write the report into the file named under OUTPUT_FILE_PATH IMMEDIATELY",
+            "DO NOT conduct additional searches after writing the file",
+            "The report file is the result of this research: whoever ordered it "
+            "reads that file and nothing else.",
+        )
+    return (
+        "Research this query. The text of your FINAL message is the answer:",
+        "Give the complete answer as the text of your FINAL message",
+        "DO NOT write files and DO NOT write or run scripts that produce the answer"
+        " — write the answer itself, verbatim, into the final message",
+        "Only the text of your final message reaches whoever ordered this research;"
+        " files and earlier messages are discarded. If the query prescribes an output"
+        " format (e.g. a fenced block with a given name), follow it exactly — it takes"
+        " precedence over OUTPUT STRUCTURE above.",
+    )

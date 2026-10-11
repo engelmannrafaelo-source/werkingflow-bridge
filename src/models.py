@@ -580,6 +580,24 @@ class ResearchRequest(BaseModel):
         description="Allow this research call to overflow to the Anthropic-API research-cloud path if the subscription worker pool looks saturated. No effect unless the research-cloud feature is enabled server-side."
     )
 
+    # Output contract (BRRES, 11.10.2026). Default false = unchanged: the
+    # answer is the report FILE the run writes (BR2). True = the answer is the
+    # text of the run's FINAL assistant message — for callers that parse a
+    # prescribed format out of the reply (Energy: ```pruefwissen-auswahl```).
+    # Under the file contract such a caller is overruled by the bridge's own
+    # "write the report into OUTPUT_FILE_PATH" order, and got back whatever
+    # file the run touched first (a Python script, a 926-char summary).
+    antwort_im_text: Optional[bool] = Field(
+        default=False,
+        description=(
+            "Output contract. true: the answer is the text of the run's final assistant "
+            "message, in the format the query prescribes; the run gets no file to write "
+            "and no Write/Edit/Bash tools, files are never returned. false (default): the "
+            "answer is the report file the run writes. Response field antwort_quelle "
+            "says which one was used."
+        ),
+    )
+
 
 class ErrorVerdictFields(BaseModel):
     """retryable / retry_after_s on endpoints that answer errors with HTTP 200
@@ -670,6 +688,15 @@ class ResearchResponse(ErrorVerdictFields):
             "on the research-cloud path, file reads under the library workdir on the "
             "worker-pool path; None when the library was off"
         )
+    )
+    antwort_quelle: Optional[Literal["datei", "text"]] = Field(
+        default=None,
+        description=(
+            "success only: where content came from — 'datei' = the report file the run "
+            "wrote (path in container_file), 'text' = the final assistant message "
+            "(antwort_im_text=true, or the research-cloud path). None on errors and "
+            "on bridges that predate the field."
+        ),
     )
 
 

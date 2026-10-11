@@ -1431,6 +1431,7 @@ class ClaudeCodeCLI:
         sdk_mcp_servers: Optional[Dict[str, Any]] = None,
         resume_workdir: Optional[Path] = None,
         cache_boundary: Optional[int] = None,
+        antwort_im_text: bool = False,
     ) -> AsyncGenerator[Dict[str, Any], None]:
         """Run Claude Code using the Python SDK and yield response chunks.
 
@@ -1483,6 +1484,10 @@ class ClaudeCodeCLI:
                         unveraendert wie bisher. Schreibt dieser Lauf den Prompt selbst
                         um (Datei-Suche, Recherche-Protokoll), passt der Index nicht mehr
                         und die Grenze wird mit ERROR verworfen.
+            antwort_im_text: Output contract of /v1/research
+                        (ResearchRequest.antwort_im_text): the research
+                        protocol names the final message as the answer and
+                        no OUTPUT_FILE_PATH is injected.
         """
         _prompt_as_received = prompt
         if resume_workdir is not None:
@@ -1541,7 +1546,8 @@ class ClaudeCodeCLI:
                 else None
             )
             prompt, max_turns, research_depth = build_research_execution_prompt(
-                prompt, max_turns, library_dir=research_library_dir
+                prompt, max_turns, library_dir=research_library_dir,
+                antwort_im_text=antwort_im_text,
             )
             logger.info(
                 f"   Research depth: {research_depth}, max_turns: {max_turns}, "
@@ -1771,7 +1777,16 @@ class ClaudeCodeCLI:
                 )
 
                 # Inject output path for file discovery (research or opt-in)
-                if enable_file_discovery and disallowed_tools and 'Write' in disallowed_tools:
+                if antwort_im_text:
+                    # Text contract (ResearchRequest.antwort_im_text): the answer
+                    # is the final message. Naming OUTPUT_FILE_PATH here would
+                    # be the same contradiction the guard below describes — the
+                    # caller's format says "reply", the bridge says "file".
+                    logger.info(
+                        "📝 Output contract antwort_im_text: no OUTPUT_FILE_PATH injected, "
+                        "the final assistant message is the answer"
+                    )
+                elif enable_file_discovery and disallowed_tools and 'Write' in disallowed_tools:
                     # Contradiction guard: file discovery ORDERS the model to
                     # use the Write tool while this request has Write
                     # disallowed (enable_tools=false). Injecting anyway makes

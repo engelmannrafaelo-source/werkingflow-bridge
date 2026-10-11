@@ -127,7 +127,7 @@ async def _captured_library_dir(monkeypatch, tmp_path, seed_links):
 
     seen = {}
 
-    def spy(prompt, max_turns, library_dir=None):
+    def spy(prompt, max_turns, library_dir=None, antwort_im_text=False):
         seen["library_dir"] = library_dir
         raise _Stop
 
