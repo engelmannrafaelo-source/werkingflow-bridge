@@ -1194,6 +1194,25 @@ async def _pick_alternative_worker(
     return max(candidates, key=lambda x: x[1])[0]
 
 
+# Response headers a relay must not copy from the answering worker: hop-by-hop
+# headers (RFC 9110 §7.6.1) and the framing/encoding of the upstream bytes,
+# which the relay re-encodes itself (httpx has already decoded the body).
+_RELAY_DROP_HEADERS = frozenset({
+    "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
+    "te", "trailer", "transfer-encoding", "upgrade",
+    "content-length", "content-encoding", "content-type", "date", "server",
+})
+
+
+def _relay_headers(upstream) -> list[tuple[bytes, bytes]]:
+    """Raw response headers of an upstream httpx answer that a relay passes on."""
+    return [
+        (k.lower(), v)
+        for k, v in upstream.headers.raw
+        if k.decode("latin-1").lower() not in _RELAY_DROP_HEADERS
+    ]
+
+
 async def _cross_worker_retry(
     request: Request, self_worker: str
 ) -> Optional[JSONResponse]:
@@ -1275,7 +1294,13 @@ async def _cross_worker_retry(
             content = r.json()
         except Exception:
             content = {"error": {"message": "non-json retry response"}}
-        return JSONResponse(status_code=r.status_code, content=content)
+        relayed = JSONResponse(status_code=r.status_code, content=content)
+        # The answering worker's headers belong to the answer (X-Cache-Boundary,
+        # X-Worker-Instance, X-Claude-Session-ID, cost headers, Retry-After).
+        # Rebuilding the response from the body alone dropped all of them on
+        # exactly this path (CACHEFIX3, DBD2 deploy smoke 11.10.2026).
+        relayed.raw_headers.extend(_relay_headers(r))
+        return relayed
     except Exception as exc:
         logger.error(
             f"cross-worker retry HTTP call to {target} failed: {exc}", exc_info=True
