@@ -1216,6 +1216,9 @@ _RELAY_HEADERS = frozenset({
     "x-rate-limited",
     "x-worker-id",
     "x-worker-failover",
+    # Read by the job executor (src/jobs/executors.py
+    # _raise_if_dependency_unavailable): turns the 503 into a 424 → parked job.
+    "x-bridge-dependency-unavailable",
 })
 
 
