@@ -41,13 +41,14 @@ import src.main as main_module
 from src.claude_cli import antwort_ende, sdk_message_to_dict
 
 _CUT_TEXT = (
-    "API Error: Claude's response exceeded the 64000 output token maximum. "
-    "To configure this behavior, set the CLAUDE_CODE_MAX_OUTPUT_TOKENS environment variable."
+    "API Error: Claude's response exceeded the 64000 output token "
+    "maximum. To configure this behavior, set the "
+    "CLAUDE_CODE_MAX_OUTPUT_TOKENS environment variable."
 )
 _META_TURN = (
-    "Output token limit hit. Resume directly — no apology, no recap of what "
-    "you were doing. Pick up mid-thought if that is where the cut happened. Break remaining work "
-    "into smaller pieces."
+    "Output token limit hit. Resume directly — no apology, no recap of "
+    "what you were doing. Pick up mid-thought if that is where the cut "
+    "happened. Break remaining work into smaller pieces."
 )
 _BLOCK_START = '```pruefwissen-auswahl\n{"dokument_ids": ["kw-1", "kw-2", '
 
