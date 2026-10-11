@@ -83,9 +83,9 @@ async def test_success_response_is_formgleich_to_pool_path():
         result = await src.main._execute_research_cloud_impl(MagicMock(), req, attribution_ctx={})
 
     assert isinstance(result, ResearchResponse)
-    # Same field surface as any other ResearchResponse — apps can't
+    # Same serialized field surface as a legacy pool response — apps can't
     # distinguish the serving path structurally.
-    assert set(result.model_dump().keys()) == set(ResearchResponse.model_fields.keys())
+    assert set(result.model_dump().keys()) == set(ResearchResponse(status="success", query=req.query, model=req.model).model_dump())
     assert result.status == "success"
     assert result.query == req.query  # original (non-anonymized) query echoed back
     assert result.model == "claude-sonnet-5"
@@ -334,7 +334,7 @@ async def test_perplexity_wiring_gate_prompt_and_cost(monkeypatch):
     booked = persist.await_args.kwargs
     assert booked["extra_cost_usd"] == 0.15
     assert booked["provider_meta"]["perplexity_calls"] == 3
-    assert set(result.model_dump().keys()) == set(ResearchResponse.model_fields.keys())
+    assert set(result.model_dump().keys()) == set(ResearchResponse(status="success", query=req.query, model=req.model).model_dump())
 
 
 @pytest.mark.asyncio
