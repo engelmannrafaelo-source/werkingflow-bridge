@@ -91,10 +91,10 @@ def test_legacy_model_dump_validate_roundtrip(extra):
 
 
 @pytest.mark.parametrize("field,values", [
-    ("research_instructions", [None, "", "Caller policy"]),
-    ("privacy_allowlist", [None, [], ["Synthetic"]]),
+    ("research_instructions", ["", "Caller policy"]),
+    ("privacy_allowlist", [[], ["Synthetic"]]),
 ])
-def test_cx3_options_forbidden_even_when_empty(field, values):
+def test_cx3_non_default_options_forbidden(field, values):
     for value in values:
         with pytest.raises(ValidationError, match="auftrag_ungueltig"):
             ResearchRequest(**payload(**{field: value}))
@@ -169,3 +169,30 @@ def test_http_retry_smoke(monkeypatch, tmp_path):
         second = client.post("/v1/research", json=payload()).json()
         assert second["status"] == "success" and not second["herkunft"]["cache"]["hit"]
         assert sdk.complete.await_count == 2
+
+
+@pytest.mark.parametrize("mode", ["text", "json", "datei"])
+@pytest.mark.parametrize("review", [False, True])
+def test_full_agentic_model_dump_roundtrip(mode, review):
+    body = payload(antwort_im_text=mode != "datei")
+    output = {"modus": mode, "artefakte": []}
+    if mode == "json":
+        output["json_schema"] = {"type": "object"}
+    if mode == "datei":
+        output["datei"] = "result.txt"
+    body["agentischer_lauf"]["ausgabe"] = output
+    if review:
+        body["agentischer_lauf"]["pruefung"] = {
+            "auftrag": "Check output", "model": "synthetic", "werkzeuge": [],
+            "ausgabe": {"modus": "text", "artefakte": []},
+            "max_turns": 2, "max_tokens": 20,
+        }
+    request = ResearchRequest(**body)
+    dumped = request.model_dump()
+    restored = ResearchRequest.model_validate(dumped)
+    assert restored == request
+    assert ResearchRequest.model_validate_json(request.model_dump_json()) == request
+    assert request_digest(restored) == request_digest(request)
+    dumped["depth"] = "deep"
+    with pytest.raises(ValidationError, match="legacy research options"):
+        ResearchRequest.model_validate(dumped)

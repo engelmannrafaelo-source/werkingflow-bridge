@@ -21,7 +21,7 @@ def request_payload():
                     "grenzen": {"zeit_s": 20, "tokens_gesamt": 500}})
 
 
-@pytest.mark.parametrize("instructions", [None, "", {}, "Synthetic app instruction"])
+@pytest.mark.parametrize("instructions", ["", {}, "Synthetic app instruction"])
 def test_research_instructions_rejected(instructions):
     with pytest.raises(ValidationError, match="auftrag_ungueltig"):
         ResearchRequest(**request_payload(), research_instructions=instructions)
@@ -57,8 +57,9 @@ async def test_executor_error_reaches_store_unchanged(local_fallback):
     async def platform(method, path, json, timeout_s):
         if local_fallback:
             raise PlatformUnavailable("synthetic outage")
-        await internal_mark_error("synthetic-job", InternalJobError(**json), _claims=None)
-        return type("Response", (), {"status_code": 204, "json": None})()
+        result = await internal_mark_error("synthetic-job", InternalJobError(**json), _claims=None)
+        return type("Response", (), {"status_code": result.status_code,
+            "json": __import__("json").loads(result.body) if result.body else None})()
 
     conn = AsyncMock()
     conn.execute.return_value = "UPDATE 1"

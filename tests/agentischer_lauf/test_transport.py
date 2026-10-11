@@ -39,7 +39,7 @@ async def test_error_executor_through_storage(tmp_path):
     async def platform(method, path, json, timeout_s):
         body = InternalJobError(**json)
         result = await internal_mark_error("job-test", body, _claims=None)
-        return type("Response", (), {"status_code": 200, "json": result})()
+        return type("Response", (), {"status_code": result.status_code, "json": __import__("json").loads(result.body) if result.body else None})()
 
     conn = AsyncMock()
     conn.execute.return_value = "UPDATE 1"

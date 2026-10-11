@@ -90,9 +90,9 @@ class Output(Contract):
 
     @model_validator(mode="after")
     def validate_output(self):
-        if ("datei" in self.model_fields_set) != (self.modus == "datei"):
+        if (self.datei is not None) != (self.modus == "datei"):
             raise ValueError("auftrag_ungueltig: file mode requires file only")
-        if ("json_schema" in self.model_fields_set) != (self.modus == "json"):
+        if (self.json_schema is not None) != (self.modus == "json"):
             raise ValueError("auftrag_ungueltig: JSON mode requires schema only")
         if self.modus == "datei":
             safe_path(self.datei)
@@ -149,8 +149,6 @@ class Run(Contract):
 
     @model_validator(mode="after")
     def no_collisions(self):
-        if "pruefung" in self.model_fields_set and self.pruefung is None:
-            raise ValueError("auftrag_ungueltig: omit absent review")
         ids = [m.id for m in self.material]
         paths = [m.ziel for m in self.material]
         if len(ids) != len(set(ids)) or len(paths) != len(set(paths)):
@@ -178,7 +176,15 @@ def validate_request(values):
         "output_path",
         "cloud_overflow",
     }
-    if forbidden.intersection(values):
+    # Full model_dump includes unset legacy defaults. Only an effective
+    # non-default value requests legacy behavior in an agentic run.
+    from src.models import ResearchRequest
+
+    if any(
+        values.get(name) is not None
+        and values[name] != ResearchRequest.model_fields[name].default
+        for name in forbidden
+    ):
         raise ValueError("auftrag_ungueltig: legacy research options")
     for name in ("max_turns", "max_tokens"):
         if type(values.get(name)) is not int or values[name] <= 0:
