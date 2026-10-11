@@ -1134,6 +1134,12 @@ phase_smoke_test() {
         return 0
     fi
 
+    local version_host="$pool_host" expected_git_sha
+    [[ "$label" == "server2" ]] && version_host="$WORKERHOST_HOST"
+    expected_git_sha=$(rssh "$version_host" "cd ${REMOTE_REPO} && git rev-parse HEAD") || return 1
+    [[ "$expected_git_sha" =~ ^[0-9a-f]{40}$ ]] || { error_ "Invalid worker checkout SHA"; return 1; }
+    extra_args+=(--expected-git-sha "$expected_git_sha")
+
     # Make AI_BRIDGE_API_KEY / INFISICAL_WS_DEV_SERVER available to the smoke
     # script's key resolution (env first, Infisical fallback).
     # shellcheck source=/root/.infisical/infisical-api.sh
