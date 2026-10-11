@@ -37,4 +37,10 @@ async def get_version() -> VersionResponse:
             contract_version=CONTRACT_VERSION,
         )
     except (OSError, ValueError, KeyError, TypeError, ValidationError):
-        raise HTTPException(503, "Build metadata unavailable") from None
+        from src.middleware.bridge_error import bridge_error, SOURCE_BRIDGE_CONFIG, TYPE_INTERNAL
+        response = bridge_error(
+            source=SOURCE_BRIDGE_CONFIG, error_type=TYPE_INTERNAL,
+            message="Build metadata unavailable", status_code=503,
+            retryable_override=False, reason="build_metadata_unavailable",
+        )
+        raise HTTPException(503, json.loads(response.body)["error"]) from None
