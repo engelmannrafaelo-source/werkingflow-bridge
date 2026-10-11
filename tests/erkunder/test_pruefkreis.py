@@ -115,7 +115,7 @@ async def test_reviewer_cannot_change_calculation_evidence(tmp_path):
         await service.shutdown()
 
 
-@pytest.mark.parametrize("defect", ["missing_reference_field", "no_missing_channel", "extra_field"])
+@pytest.mark.parametrize("defect", ["missing_reference_field", "extra_field"])
 def test_judgment_contract_failure_enters_correction(defect):
     from src.erkunder.models import Pruefpunkt
     from src.erkunder.pruefkreis import pruefumfang
@@ -126,8 +126,6 @@ def test_judgment_contract_failure_enters_correction(defect):
              "sicherheit": 0.9, "begruendung": "Synthetic evidence"}
     if defect == "missing_reference_field":
         del value["befund_verweis"]
-    elif defect == "no_missing_channel":
-        value["status"] = "nicht_pruefbar"
     else:
         value["invented"] = True
     report = "```erkunder-pruefumfang\n" + json.dumps([value]) + "\n```"

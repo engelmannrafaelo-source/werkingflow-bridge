@@ -41,6 +41,7 @@ from .pruefkreis import (
     zahlenbelege,
 )
 from .quellen import kanalmanifest
+from .rechenstand import rechenstand
 
 LOG = logging.getLogger(__name__)
 ID = re.compile(r"^[a-z0-9-]{8,80}$")
@@ -372,13 +373,30 @@ class Coordinator:
         except (OSError, ValueError) as error:
             raise StepFailed(name, "cli_fehler: ergebnis-pfad oder groesse") from error
 
+    def input_path(self, directory: Path, name: str, filename: str, slot: int) -> Path:
+        """Nested step inputs stay inside the fresh step folder, owned by the place."""
+        parts = Path(filename).parts
+        unsafe = any(p in ("", ".", "..") for p in parts)
+        if not parts or Path(filename).is_absolute() or unsafe:
+            raise StepFailed(name, f"cli_fehler: eingang-pfad {filename!r}")
+        parent = directory
+        for part in parts[:-1]:
+            parent = parent / part
+            if not parent.exists():
+                parent.mkdir(mode=0o700)
+                parent.chmod(0o700)
+                self.chown(parent, 1101 + slot, 1100)
+            elif parent.is_symlink() or not parent.is_dir():
+                raise StepFailed(name, f"cli_fehler: eingang-pfad {filename!r}")
+        return parent / parts[-1]
+
     async def step(
         self,
         ident: str,
         name: str,
         slot: int,
         prompt: str,
-        inputs: dict[str, str] | None = None,
+        inputs: dict[str, str | bytes] | None = None,
     ) -> None:
         state = self.states[ident]
         if self.successful(ident, name):
@@ -407,9 +425,12 @@ class Coordinator:
                         shutil.rmtree(directory)
                     directory.mkdir(mode=0o700)
                     directory.chmod(0o700)
-                    for filename, text in (inputs or {}).items():
-                        file = directory / filename
-                        file.write_text(text)
+                    for filename, content in (inputs or {}).items():
+                        file = self.input_path(directory, name, filename, slot)
+                        if isinstance(content, bytes):
+                            file.write_bytes(content)
+                        else:
+                            file.write_text(content)
                         file.chmod(0o600)
                         self.chown(file, 1101 + slot, 1100)
                     self.chown(directory, 1101 + slot, 1100)
@@ -642,9 +663,15 @@ class Coordinator:
             review_name = "pruefung" + suffix
             report = self.output(ident, report_name)
             machine = self.report_evidence(ident, report_name, report, order)
-            await self.step(ident, review_name, 0, pruefung_prompt(order), {
+            calculation, gaps = rechenstand(
+                self.directory(ident) / report_name, "rechenstand/"
+            )
+            machine.extend(gaps)
+            prompt = pruefung_prompt(order, bool(calculation))
+            await self.step(ident, review_name, 0, prompt, {
                 "gutachten.md": report,
                 "maschinenbefunde.json": json.dumps(machine, ensure_ascii=False),
+                **calculation,
             })
             try:
                 findings = pruefurteil(self.output(ident, review_name))
@@ -664,14 +691,20 @@ class Coordinator:
             if not state["offene_befunde"] or round_no == order.korrekturkreis:
                 return
             next_no = round_no + 1
+            gutachten_name = report_name
             report_name = "harmonisierung-korrektur" + (f"-{next_no}" if next_no > 1 else "")
             state["korrekturkreis_gelaufen"] = True
             state["gesamt"] = 5 + 2 * next_no
             self.save(ident)
-            await self.step(ident, report_name, 0, korrektur_prompt(order), {
+            # The previous version's calculation continues in the new skripte/;
+            # its gaps already stand in offene_befunde from the review above.
+            calculation, _ = rechenstand(self.directory(ident) / gutachten_name, "")
+            prompt = korrektur_prompt(order, bool(calculation))
+            await self.step(ident, report_name, 0, prompt, {
                 "gutachten.md": report,
                 "pruefung.md": self.output(ident, review_name),
                 "maschinenbefunde.json": json.dumps(state["offene_befunde"], ensure_ascii=False),
+                **calculation,
             })
 
     def status(self, ident: str) -> dict[str, Any]:

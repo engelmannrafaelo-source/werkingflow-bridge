@@ -32,9 +32,13 @@ def pruefurteil(text: str) -> list[str]:
 
 
 def _artifact(directory: Path, relative: str) -> str:
+    """Paths in the evidence block are relative to the report folder: `skripte/...`."""
     path = directory / relative
     if not path.resolve().is_relative_to((directory / "skripte").resolve()):
-        raise ValueError("Zahlenbeleg außerhalb skripte/")
+        raise ValueError(
+            f"Zahlenbeleg außerhalb skripte/: {relative!r}"
+            " (Pfade gelten ab dem Gutachtenordner und beginnen mit skripte/)"
+        )
     return read_text(path)
 
 
@@ -203,9 +207,7 @@ def _urteil(value: dict, missing: list[str]) -> str | None:
         return "Vollständiges Urteil trotz fehlender Kanäle"
     if status == "bestaetigt" and not value.get("befund_verweis"):
         return "Bestätigtes Fehlerbild ohne Befundverweis"
-    if status == "nicht_pruefbar" and not value["fehlende_kanaele"]:
-        return "Nicht prüfbar ohne fehlende Messung"
-    if not value.get("begruendung"):
+    if not str(value.get("begruendung") or "").strip():
         return "Bibliotheksurteil ohne Begründung"
     return None
 

@@ -127,7 +127,8 @@ class Ergebnis(Vertrag):
     schema_: Literal["erkunder-ergebnis/1"] = Field(alias="schema")
     bericht_id: BerichtId
     prompt_version: Literal[
-        "erkunder-prompts/1", "erkunder-prompts/2", "erkunder-prompts/3"
+        "erkunder-prompts/1", "erkunder-prompts/2", "erkunder-prompts/3",
+        "erkunder-prompts/4",
     ]
     modell: ModellName
     schritte: list[Schritt]
