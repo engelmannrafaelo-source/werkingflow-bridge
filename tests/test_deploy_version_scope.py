@@ -16,7 +16,8 @@ def function(text, name):
 @pytest.mark.parametrize("target,services,worker", [
     ("hetzner", "nginx", False), ("hetzner", "platform-api", False),
     ("server2", "", False), ("server2", "platform-api", False),
-    ("hetzner", "worker1", True),
+    ("hetzner", "worker1", False), ("hetzner", "worker1 worker2 worker3", False),
+    ("hetzner", "worker1 worker2 worker3 worker4", True), ("hetzner", "", True),
 ])
 @pytest.mark.parametrize("smoke_failure", [False, True])
 def test_deploy_service_subset(tmp_path, target, services, worker, smoke_failure):
@@ -88,6 +89,9 @@ deploy_server {target} || exit $?
         assert "SMOKE_VERSION_UNPROVEN:" in output
         assert "worker SHA not proven" in output
         assert "/stub/proof &&" not in output
+        if "worker" in services:
+            # A pool subset keeps old images answering claude_version (CX4N2R).
+            assert "keep their old image in the claude_version pool" in output
         if not smoke_failure:
             assert "finished: DEPLOYED, NOT rolled back — but UNPROVEN" in output
             assert "finished successfully" not in output
