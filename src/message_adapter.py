@@ -108,8 +108,7 @@ class MessageAdapter:
         content = re.sub(placeholder_pattern, '', content)
         
         # Clean up extra whitespace and newlines
-        content = re.sub(r'\n\s*\n\s*\n', '\n\n', content)  # Multiple newlines to double
-        content = content.strip()
+        content = MessageAdapter._normalize_whitespace(content)
 
         # Defensive: If content is empty after filtering, raise error (no silent fallback)
         if not content or content.isspace():
@@ -117,6 +116,43 @@ class MessageAdapter:
 
         return content
     
+    @staticmethod
+    def _normalize_whitespace(content: str) -> str:
+        """Collapse runs of 3+ newlines to two, strip the ends.
+
+        A cache boundary marker (cache_boundary.SENTINEL, exactly once) is
+        invisible to this step: the text is normalized WITHOUT it and the marker
+        goes back in at the matching place. Otherwise a marker inside a newline
+        run or after a trailing newline breaks the run and the CLI gets one
+        newline more than without a boundary (CACHE4R, 18 of 61 cases). Zero or
+        several markers: unchanged behaviour, split_prompt reports the loss."""
+        from src.cache_boundary import SENTINEL
+
+        pos = content.find(SENTINEL)
+        if pos < 0 or content.count(SENTINEL) != 1:
+            return re.sub(r'\n\s*\n\s*\n', '\n\n', content).strip()
+        text = content[:pos] + content[pos + len(SENTINEL):]
+        out = []
+        last = 0
+        new_pos = None
+        for match in re.finditer(r'\n\s*\n\s*\n', text):
+            if new_pos is None and pos < match.start():
+                new_pos = sum(len(part) for part in out) + (pos - last)
+            out.append(text[last:match.start()])
+            if new_pos is None and pos < match.end():
+                new_pos = sum(len(part) for part in out) + min(pos - match.start(), 2)
+            out.append('\n\n')
+            last = match.end()
+        if new_pos is None:
+            new_pos = sum(len(part) for part in out) + (pos - last)
+        out.append(text[last:])
+        collapsed = ''.join(out)
+        stripped = collapsed.lstrip()
+        new_pos = max(0, new_pos - (len(collapsed) - len(stripped)))
+        stripped = stripped.rstrip()
+        new_pos = min(new_pos, len(stripped))
+        return stripped[:new_pos] + SENTINEL + stripped[new_pos:]
+
     @staticmethod
     def format_claude_response(content: str, model: str, finish_reason: str = "stop") -> Dict[str, Any]:
         """Format Claude response for OpenAI compatibility."""
