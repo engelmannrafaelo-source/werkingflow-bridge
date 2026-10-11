@@ -718,7 +718,9 @@ class ResearchResponse(ErrorVerdictFields):
             "assistant message ended — the CLI's stop_reason ('end_turn', 'tool_use', ...), "
             "'max_tokens' = cut at the output limit, 'max_tokens_fortgesetzt' = cut there "
             "and continued automatically by the CLI, so the final message is only the tail "
-            "of the answer. None when the run reported no end."
+            "of the answer, 'abbruch_fortgesetzt' = the stream broke off mid-answer "
+            "and the CLI continued automatically, same consequence. None when the "
+            "run reported no end."
         ),
     )
     fehler_code: Optional[str] = Field(
@@ -726,9 +728,19 @@ class ResearchResponse(ErrorVerdictFields):
         description=(
             "status='error' only, when the bridge knows the cause: 'antwort_abgeschnitten' = "
             "antwort_im_text and the final message ended at the output limit "
-            "(antwort_ende 'max_tokens'/'max_tokens_fortgesetzt'). Not 'no answer', not "
+            "or broke off and was continued (antwort_ende 'max_tokens'/"
+            "'max_tokens_fortgesetzt'/'abbruch_fortgesetzt'). Not 'no answer', not "
             "error_max_turns: the same request will hit the same limit (retryable=false), "
             "a smaller one will not. None for every other error."
+        ),
+    )
+    teilantwort: Optional[str] = Field(
+        default=None,
+        description=(
+            "only with fehler_code='antwort_abgeschnitten': the parts of the "
+            "cut-off final answer, joined as streamed (everything after the last "
+            "tool call). NOT the answer — the seams may repeat, skip or change "
+            "form; material for the caller's repair. Optional, None without text."
         ),
     )
 

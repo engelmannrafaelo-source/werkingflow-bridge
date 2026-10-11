@@ -36,7 +36,11 @@ def _retain_cli_end_fields(parsed: Any, data: dict[str, Any]) -> None:
     11.10.2026): an answer cut at the output limit arrives as an assistant
     message with top-level ``"error": "max_output_tokens"``, and the result
     carries ``stop_reason`` and ``api_error``. sdk_message_to_dict hands them
-    on as ``cli_error`` / ``stop_reason`` / ``api_error``."""
+    on as ``cli_error`` / ``stop_reason`` / ``api_error``.
+
+    User turns: ``isSynthetic`` (BRTRUNC2) — CLI 2.1.285 stamps every meta
+    turn it injects itself (``isSynthetic: isMeta || …``), among them both
+    automatic continuations. Kept as ``_bridge_is_synthetic``."""
     kept: dict[str, Any] = {}
     if data.get("type") == "assistant":
         if data.get("error"):
@@ -44,6 +48,9 @@ def _retain_cli_end_fields(parsed: Any, data: dict[str, Any]) -> None:
         message = data.get("message")
         if isinstance(message, dict) and "stop_reason" in message:
             kept["_bridge_stop_reason"] = message["stop_reason"]
+    elif data.get("type") == "user":
+        if "isSynthetic" in data:
+            kept["_bridge_is_synthetic"] = data["isSynthetic"]
     elif data.get("type") == "result":
         if "stop_reason" in data:
             kept["_bridge_stop_reason"] = data["stop_reason"]

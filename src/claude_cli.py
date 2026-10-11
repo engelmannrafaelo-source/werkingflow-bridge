@@ -835,6 +835,18 @@ def _handle_rate_limit_event(message, worker_id):
 # =============================================================================
 
 CLI_CONTINUATION_SENTENCE = "Output token limit hit. Resume directly"
+# Second automatic continuation (BRTRUNC2, CLI 2.1.285 truncated_response_
+# recovery): the API stream died after some output; the CLI withholds its
+# "Connection lost" error and appends "Your response above was cut off
+# mid-stream. Resume directly …" (subagents: "… and only your next message is
+# delivered"), on the same counter as above. The CLI emits no structured kind:
+# both turns are only isSynthetic=true user messages, the transition reason
+# stays inside the CLI. The kind is therefore read from the sentence —
+# verified against the worker pin (docker/Dockerfile.worker), and
+# tests/test_research_abbruch_fortgesetzt.py fails when that pin changes.
+CLI_ABBRUCH_SENTENCE = "Your response above was cut off mid-stream"
+CLI_CONTINUATION_SENTENCES = (CLI_CONTINUATION_SENTENCE, CLI_ABBRUCH_SENTENCE)
+CLI_CONTINUATION_VERIFIED_PIN = "2.1.285"
 
 # The file the bridge names to the model as OUTPUT_FILE_PATH (inside the run's
 # claudedocs/). The research handler reads THIS file first — it is the one
@@ -870,12 +882,15 @@ def warn_if_continuation_leak(text: Optional[str], *, where: str, **context: Any
     Returns True when found. Does NOT alter the text — the caller's content is
     not ours to rewrite; the WARNING is the alarm (with app/job for triage).
     """
-    if not text or CLI_CONTINUATION_SENTENCE not in text:
+    if not text:
+        return False
+    found = [sentence for sentence in CLI_CONTINUATION_SENTENCES if sentence in text]
+    if not found:
         return False
     ctx = " ".join(f"{k}={v}" for k, v in context.items())
     logger.warning(
         f"⚠️ CLI continuation instruction found in assistant content ({where}) {ctx} — "
-        f"'{CLI_CONTINUATION_SENTENCE}…' must never reach a client",
+        f"'{found[0]}…' must never reach a client",
         extra={"continuation_leak": True, "where": where, **context},
     )
     return True
@@ -1069,6 +1084,34 @@ ANTWORT_ENDE_AUSGABEGRENZE = "max_tokens"
 ANTWORT_ENDE_FORTGESETZT = "max_tokens_fortgesetzt"
 CLI_OUTPUT_LIMIT_ERROR = "max_output_tokens"
 FORTSETZUNG_KEY = "fortsetzung_nach_ausgabegrenze"
+# "abbruch_fortgesetzt" (BRTRUNC2) = the stream broke off mid-answer, the CLI
+# continued on its own ("Your response above was cut off mid-stream") — as
+# above, the last message is only the tail.
+ANTWORT_ENDE_ABBRUCH_FORTGESETZT = "abbruch_fortgesetzt"
+ABBRUCH_FORTSETZUNG_KEY = "fortsetzung_nach_abbruch"
+
+
+def cli_fortsetzung(message: Any) -> Optional[str]:
+    """The marker key for the assistant message that follows ``message`` when
+    it is one of the CLI's automatic continuation turns, else None.
+
+    Structure first: only a user turn, and not one the CLI marked as not
+    synthetic (isSynthetic=false — a real prompt or tool result). The kind
+    comes from the CLI's own sentence in the turn, because the
+    CLI hands out no other carrier for it (see CLI_ABBRUCH_SENTENCE)."""
+    if not is_user_turn(message):
+        return None
+    synthetic = message.get("isSynthetic") if isinstance(message, dict) else getattr(
+        message, "_bridge_is_synthetic", None
+    )
+    if synthetic is False:
+        return None
+    text = _message_text(message)
+    if CLI_CONTINUATION_SENTENCE in text:
+        return FORTSETZUNG_KEY
+    if CLI_ABBRUCH_SENTENCE in text:
+        return ABBRUCH_FORTSETZUNG_KEY
+    return None
 
 
 def _is_assistant_chunk(chunk: Any) -> bool:
@@ -1115,6 +1158,8 @@ def antwort_ende(chunks: list) -> Optional[str]:
         return ANTWORT_ENDE_AUSGABEGRENZE
     if any(c.get(FORTSETZUNG_KEY) for c in final):
         return ANTWORT_ENDE_FORTGESETZT
+    if any(c.get(ABBRUCH_FORTSETZUNG_KEY) for c in final):
+        return ANTWORT_ENDE_ABBRUCH_FORTGESETZT
     if result is not None and isinstance(result.get("stop_reason"), str):
         return result["stop_reason"]
     if assistants and isinstance(assistants[-1].get("stop_reason"), str):
@@ -1123,7 +1168,23 @@ def antwort_ende(chunks: list) -> Optional[str]:
 
 
 def antwort_abgeschnitten(ende: Optional[str]) -> bool:
-    return ende in (ANTWORT_ENDE_AUSGABEGRENZE, ANTWORT_ENDE_FORTGESETZT)
+    return ende in (
+        ANTWORT_ENDE_AUSGABEGRENZE,
+        ANTWORT_ENDE_FORTGESETZT,
+        ANTWORT_ENDE_ABBRUCH_FORTGESETZT,
+    )
+
+
+def teilantwort(chunks: list) -> Optional[str]:
+    """The parts of a cut-off final answer, joined as the CLI streamed them
+    (everything after the last tool call, no separator at the seams). NOT the
+    answer: seams may repeat, skip or change form. Handed to the caller only
+    next to fehler_code antwort_abgeschnitten, as material for its repair."""
+    assistants = [c for c in chunks if _is_assistant_chunk(c)]
+    tools = [i for i, c in enumerate(assistants) if _has_tool_use(c)]
+    last_tool = tools[-1] if tools else -1
+    text = "".join(_message_text(c) for c in assistants[last_tool + 1:])
+    return text or None
 
 
 def describe_unfinished_result(chunk: dict) -> str:
@@ -2159,7 +2220,7 @@ class ClaudeCodeCLI:
                     prompt_source = prompt
                 # === END LARGE USER PROMPT HANDLING ===
 
-                fortsetzung_ausstehend = False
+                fortsetzung_ausstehend: Optional[str] = None
                 try:
                     async with asyncio.timeout(self.timeout):
                         async for message in query(prompt=prompt_source, options=options):
@@ -2265,12 +2326,14 @@ class ClaudeCodeCLI:
                             # every consumer reads {"content": [...]} as
                             # assistant text. Still counted + in messages.jsonl.
                             if is_user_turn(message):
-                                if CLI_CONTINUATION_SENTENCE in _message_text(message):
+                                fortsetzung = cli_fortsetzung(message)
+                                if fortsetzung:
                                     # The next assistant message continues a
                                     # cut-off one (antwort_ende).
-                                    fortsetzung_ausstehend = True
+                                    fortsetzung_ausstehend = fortsetzung
                                     logger.info(
-                                        f"🧩 CLI auto-continuation (max_output_tokens) in session "
+                                        f"🧩 CLI auto-continuation ({fortsetzung}) "
+                                        f"in session "
                                         f"{cli_session_id} — meta user turn withheld from content stream",
                                         extra={"cli_session_id": cli_session_id},
                                     )
@@ -2290,8 +2353,8 @@ class ClaudeCodeCLI:
                             ist_assistent = type(message).__name__ == 'AssistantMessage'
                             message = sdk_message_to_dict(message)
                             if ist_assistent and fortsetzung_ausstehend and isinstance(message, dict):
-                                message[FORTSETZUNG_KEY] = True
-                                fortsetzung_ausstehend = False
+                                message[fortsetzung_ausstehend] = True
+                                fortsetzung_ausstehend = None
                             logger.debug(f"Converted message dict: {message}")
 
                             # Cache chunk to file for crash recovery (with error handling)

@@ -65,22 +65,32 @@ def fields(retryable: bool, retry_after_s: Optional[float] = None) -> Dict[str, 
     return {"retryable": bool(retryable), "retry_after_s": after}
 
 
+# Fields of an endpoint's error answer that name the cause (BRTRUNC2): carried
+# by JobFailure into the job's error object exactly as the endpoint returned
+# them, so a /v1/jobs caller reads the same contract as a direct caller
+# (/v1/research fehler_code / antwort_ende / teilantwort) instead of matching
+# the message text.
+JOB_ERROR_DETAIL_FIELDS = (
+    "fehler_code", "antwort_ende", "teilantwort", "usage", "diagnose_ref",
+)
+
+
 class JobFailure(RuntimeError):
     """An executor failure that carries its own verdict (rule 1), e.g. a
     research answer with status=error and retryable:true, or a self-call that
-    lost its connection."""
+    lost its connection. ``details``: the endpoint's cause fields
+    (JOB_ERROR_DETAIL_FIELDS); None values are dropped."""
 
     def __init__(self, message: str, *, retryable: bool,
                  retry_after_s: Optional[float] = None,
-                 fehler_code: Optional[str] = None, antwort_ende: Optional[str] = None,
-                 usage: Optional[Dict[str, Any]] = None, diagnose_ref: Optional[str] = None):
+                 details: Optional[Dict[str, Any]] = None):
         super().__init__(message)
         self.retryable = bool(retryable)
         self.retry_after_s = retry_after_s
-        self.fehler_code = fehler_code
-        self.antwort_ende = antwort_ende
-        self.usage = usage
-        self.diagnose_ref = diagnose_ref
+        self.details = {
+            k: v for k, v in (details or {}).items()
+            if k in JOB_ERROR_DETAIL_FIELDS and v is not None
+        }
 
 
 def _upstream_status(code: Optional[str]) -> Optional[int]:
@@ -132,10 +142,8 @@ def job_error_fields(exc: BaseException) -> Dict[str, Any]:
         return {"code": code, **fields(is_retryable_status(exc.status_code),
                                        exc.retry_after_s)}
     if isinstance(exc, JobFailure):
-        return {"code": exc.fehler_code or JOB_CODE_EXECUTOR_ERROR,
-                **({k: v for k, v in {"antwort_ende": exc.antwort_ende,
-                    "usage": exc.usage, "diagnose_ref": exc.diagnose_ref}.items() if v is not None}),
-                **fields(exc.retryable, exc.retry_after_s)}
+        return {"code": JOB_CODE_EXECUTOR_ERROR,
+                **fields(exc.retryable, exc.retry_after_s), **exc.details}
     return {"code": JOB_CODE_EXECUTOR_ERROR, **fields(UNCLASSIFIED_RETRYABLE)}
 
 

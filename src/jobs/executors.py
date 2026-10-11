@@ -529,13 +529,14 @@ async def research_executor(
         from src.error_contract import JobFailure, envelope_fields
 
         verdict = envelope_fields(result)
+        # fehler_code / antwort_ende / teilantwort travel with it: the job
+        # caller reads the same contract as a direct /v1/research caller.
         raise JobFailure(
             "research self-call returned status=error: "
             f"{result.get('error') or 'no error message'}",
             retryable=verdict.get("retryable", False),
             retry_after_s=verdict.get("retry_after_s"),
-            fehler_code=result.get("fehler_code"), antwort_ende=result.get("antwort_ende"),
-            usage=result.get("usage"), diagnose_ref=result.get("diagnose_ref"),
+            details=result,
         )
     return result
 

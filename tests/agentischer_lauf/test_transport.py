@@ -30,7 +30,8 @@ async def test_error_executor_through_storage(tmp_path):
         with pytest.raises(JobFailure) as caught:
             await research_executor(payload(), {}, AsyncMock())
     fields = job_error_fields(caught.value)
-    assert fields["code"] == result["fehler_code"]
+    assert fields["code"] == "EXECUTOR_ERROR"
+    assert fields["fehler_code"] == result["fehler_code"]
     assert fields["antwort_ende"] == result["antwort_ende"]
     assert fields["usage"] == result["usage"]
     assert fields["retryable"] is False

@@ -4928,9 +4928,22 @@ class ResearchAnswerTruncated(ResearchReportMissing):
     or — after the CLI's own continuation — is only the tail of it. Its own
     error (fehler_code) so the caller can shrink the task instead of telling
     the model a block is missing; a retry of the same request hits the same
-    limit (retryable stays false)."""
+    limit (retryable stays false). The same holds when the stream broke off
+    mid-answer and the CLI continued (antwort_ende abbruch_fortgesetzt).
+
+    teilantwort: the final answer's parts joined (claude_cli.teilantwort) —
+    material for the caller's repair, never the answer."""
 
     fehler_code = "antwort_abgeschnitten"
+
+    def __init__(
+        self,
+        message: str,
+        usage: Optional[Dict[str, int]] = None,
+        teilantwort: Optional[str] = None,
+    ):
+        super().__init__(message, usage)
+        self.teilantwort = teilantwort
 
 
 # A report is text the reader can read. discovered_files holds EVERY file a
@@ -5470,7 +5483,7 @@ async def _execute_research_impl(
 
         execution_time = time.time() - start_time
 
-        from src.claude_cli import antwort_abgeschnitten, antwort_ende
+        from src.claude_cli import antwort_abgeschnitten, antwort_ende, teilantwort
         research_antwort_ende = antwort_ende(all_chunks)
 
         # Bibliotheksaufrufe zählbar machen — das Gegenstück zu library_calls
@@ -5604,12 +5617,20 @@ async def _execute_research_impl(
         # Before the unfinished-run check: when the CLI gave up continuing, the
         # result reads "success flagged is_error", which would hide the cause.
         if antwort_im_text and antwort_abgeschnitten(research_antwort_ende):
+            # The opening words stay as they were for the output limit: callers
+            # on /v1/jobs matched them before fehler_code reached that path.
+            wo = (
+                "mid-stream"
+                if research_antwort_ende == "abbruch_fortgesetzt"
+                else "at the output limit"
+            )
             raise ResearchAnswerTruncated(
-                f"Research answer cut off at the output limit (antwort_ende="
-                f"{research_antwort_ende}, session_id={session_id}): antwort_im_text was set and "
-                f"the run's final message is not the complete answer. Not 'no answer' and not "
-                f"error_max_turns — the answer is longer than one message can be; a smaller "
-                f"task fits, the same request hits the same limit."
+                f"Research answer cut off {wo} "
+                f"(antwort_ende={research_antwort_ende}, session_id={session_id}): "
+                f"antwort_im_text was set and the run's final message is not the "
+                f"complete answer. Not 'no answer' and not error_max_turns; the "
+                f"joined parts are in teilantwort, not in content.",
+                teilantwort=teilantwort(all_chunks),
             )
         if antwort_abgeschnitten(research_antwort_ende):
             # File contract: the report is the file, not the message. Reported
@@ -5948,6 +5969,7 @@ async def _execute_research_impl(
             session_id=session_id,
             antwort_ende=research_antwort_ende,
             fehler_code=getattr(e, "fehler_code", None),
+            teilantwort=getattr(e, "teilantwort", None),
         )
 
 

@@ -323,7 +323,9 @@ async def mark_error(
     code: Optional[str] = None,
     retryable: Optional[bool] = None,
     retry_after_s: Optional[int] = None,
+    fehler_code: Optional[str] = None,
     antwort_ende: Optional[str] = None,
+    teilantwort: Optional[str] = None,
     usage: Optional[Dict[str, Any]] = None,
     diagnose_ref: Optional[str] = None,
 ) -> None:
@@ -331,13 +333,19 @@ async def mark_error(
     # drops unknown fields) and stores {message, code}; GET then derives the
     # verdict from the code (error_contract.job_code_fields). Degraded, not wrong
     # for any code except a research/transport failure, which reads as final.
+    body: Dict[str, Any] = {"message": message, "code": code,
+                            "retryable": retryable, "retry_after_s": retry_after_s}
+    # Cause fields (BRTRUNC2) only when set. A platform-api from before
+    # BRTRUNC2 drops them like the verdict above; the message text stays.
+    for name, value in (("fehler_code", fehler_code), ("antwort_ende", antwort_ende),
+                        ("teilantwort", teilantwort),
+                        ("usage", usage), ("diagnose_ref", diagnose_ref)):
+        if value is not None:
+            body[name] = value
     try:
         resp = await call_platform(
             "POST", f"/v1/internal/jobs/{job_id}/error",
-            json={"message": message, "code": code,
-                  "retryable": retryable, "retry_after_s": retry_after_s,
-                  **{k: v for k, v in {"antwort_ende": antwort_ende, "usage": usage,
-                                       "diagnose_ref": diagnose_ref}.items() if v is not None}},
+            json=body,
             timeout_s=_WRITE_TIMEOUT_S,
         )
     except PlatformUnavailable as e:
@@ -346,7 +354,8 @@ async def mark_error(
             return await store.mark_error(
                 job_id, message, code=code,
                 retryable=retryable, retry_after_s=retry_after_s,
-                antwort_ende=antwort_ende, usage=usage, diagnose_ref=diagnose_ref,
+                fehler_code=fehler_code, antwort_ende=antwort_ende,
+                teilantwort=teilantwort, usage=usage, diagnose_ref=diagnose_ref,
             )
         except store.JobRowMissing as missing:
             raise _row_missing_error("mark_error", job_id, missing)
