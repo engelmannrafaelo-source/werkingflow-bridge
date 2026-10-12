@@ -105,7 +105,7 @@ class MemStore:
             "attribution": OWNER_ATTR if attribution is None else attribution,
             "created_at": now - timedelta(minutes=2), "updated_at": now,
             "progress": None, "result": None, "error": None,
-            "deferred_until": None, "defer_count": 0, "defer_reason": None,
+            "deferred_until": None, "defer_count": 0, "attempts": 0, "defer_reason": None,
             "cancel_requested": False, **over,
         }
 

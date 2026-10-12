@@ -76,6 +76,8 @@ class MemStore:
             "created_at": now - timedelta(minutes=2),
             "updated_at": now,
             "progress": None,
+            # As on a real row that never started; FK25BR R5 reads it.
+            "attempts": 0,
             "result": None,
             "error": None,
             "deferred_until": None,
