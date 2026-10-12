@@ -335,3 +335,71 @@ async def test_perplexity_wiring_gate_prompt_and_cost(monkeypatch):
     assert booked["extra_cost_usd"] == 0.15
     assert booked["provider_meta"]["perplexity_calls"] == 3
     assert set(result.model_dump().keys()) == set(ResearchResponse.model_fields.keys())
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("code,retryable", [
+    ("privacy_gate_failed", False), ("privacy_service_unreachable", True),
+])
+async def test_anonymize_gate_failure_carries_fehler_code(code, retryable):
+    req = _make_req()
+    err = CloudAnonymizeError("privacy-service down")
+    err.fehler_code, err.retryable = code, retryable
+    with (
+        patch("src.research_cloud.anonymize_gate.anonymize_query_for_cloud", new=AsyncMock(side_effect=err)),
+        patch("src.research_cloud.executor.run_research_cloud", AsyncMock()),
+    ):
+        result = await src.main._execute_research_cloud_impl(MagicMock(), req, attribution_ctx={})
+    assert result.status == "error"
+    assert result.fehler_code == code and result.retryable is retryable
+    assert result.error == "research-cloud requires verified anonymization, which failed: privacy-service down"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("code,retryable", [
+    ("privacy_gate_failed", False), ("privacy_service_unreachable", True),
+])
+async def test_perplexity_gate_failure_in_executor_carries_fehler_code(code, retryable):
+    from src.research_cloud.executor import ResearchCloudExecutorError
+
+    req = _make_req()
+    err = ResearchCloudExecutorError("perplexity_search: anonymize gate failed — x")
+    err.fehler_code, err.retryable = code, retryable
+    with (
+        patch("src.research_cloud.anonymize_gate.anonymize_query_for_cloud", new=AsyncMock(return_value="ANON")),
+        patch("src.research_cloud.executor.run_research_cloud", AsyncMock(side_effect=err)),
+        patch("src.activity.ai_call_writer.persist_ai_call_activity", new=AsyncMock()),
+    ):
+        result = await src.main._execute_research_cloud_impl(MagicMock(), req, attribution_ctx={})
+    assert result.status == "error"
+    assert result.fehler_code == code and result.retryable is retryable
+    assert result.error == "perplexity_search: anonymize gate failed — x"
+
+    from src.error_contract import JobFailure
+    from src.jobs import executors
+
+    with pytest.raises(JobFailure) as ei:
+        executors._raise_on_status_error("research", result.model_dump())
+    assert ei.value.retryable is retryable
+    assert ei.value.details.get("fehler_code") == code
+
+
+@pytest.mark.asyncio
+async def test_executor_perplexity_tool_classifies_the_gate():
+    from src.privacy_client import PrivacyServiceUnavailable
+    from src.research_cloud.executor import (
+        ResearchCloudExecutorError,
+        _handle_perplexity_tool_call,
+    )
+
+    block = {"id": "t1", "input": {"frage": "Firma X"}}
+    for cause, code, retryable in (
+        (PrivacyServiceUnavailable("down"), "privacy_service_unreachable", True),
+        (CloudAnonymizeError("refused"), "privacy_gate_failed", False),
+    ):
+        with pytest.raises(ResearchCloudExecutorError) as ei:
+            await _handle_perplexity_tool_call(block, MagicMock(), AsyncMock(side_effect=cause), MagicMock())
+        assert (ei.value.fehler_code, ei.value.retryable) == (code, retryable)
+    with pytest.raises(ResearchCloudExecutorError) as ei:
+        await _handle_perplexity_tool_call(block, MagicMock(), AsyncMock(return_value=" "), MagicMock())
+    assert (ei.value.fehler_code, ei.value.retryable) == ("privacy_gate_failed", False)

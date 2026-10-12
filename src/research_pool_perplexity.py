@@ -30,6 +30,7 @@ from typing import Any, Awaitable, Callable, Dict, Optional
 
 import httpx
 
+from src.research_cloud.anonymize_gate import privacy_urteil
 from src.research_cloud.fetch_document import (
     FETCH_DOCUMENT_TOOL,
     FETCH_DOCUMENT_TOOL_NAME,
@@ -109,6 +110,8 @@ class PoolPerplexityTool:
         self.cost_usd = 0.0
         self.cost_missing = 0
         self.gate_error: Optional[str] = None
+        # fehler_code / retryable of the gate failure (anonymize_gate.privacy_urteil).
+        self.gate_urteil: Optional[Dict[str, Any]] = None
 
     async def handle(self, args: Dict[str, Any]) -> Dict[str, Any]:
         if self.gate_error:
@@ -132,6 +135,7 @@ class PoolPerplexityTool:
             # Recorded, not just answered: the caller turns this into a failed
             # run. A broken privacy path must not end as a "successful" report.
             self.gate_error = f"{type(e).__name__}: {e}"
+            self.gate_urteil = privacy_urteil(e)
             logger.error(f"research pool: perplexity_search anonymize gate failed — nothing sent: {e}")
             raise PoolToolError(
                 "perplexity_search: Anonymisierung fehlgeschlagen — die Anfrage wurde NICHT gesendet."

@@ -94,3 +94,44 @@ async def test_underlying_exception_is_wrapped_and_aborts():
     ):
         with pytest.raises(CloudAnonymizeError, match="refusing research-cloud call"):
             await anonymize_query_for_cloud(_fake_request(), "query text")
+
+
+# ── fehler_code / retryable of a gate failure (Kanzler, 12.10.2026) ─────────
+
+@pytest.mark.asyncio
+async def test_unreachable_privacy_service_is_retryable():
+    from src.privacy_client import PrivacyServiceUnavailable
+
+    down = PrivacyServiceUnavailable("no endpoint answered", tried=["primary", "fallback"])
+    with patch("src.main._smart_anonymize_core", new=AsyncMock(side_effect=down)):
+        with pytest.raises(CloudAnonymizeError) as ei:
+            await anonymize_query_for_cloud(_fake_request(), "query text")
+    assert ei.value.fehler_code == "privacy_service_unreachable"
+    assert ei.value.retryable is True
+    assert "no endpoint answered" in str(ei.value)
+
+
+@pytest.mark.asyncio
+async def test_refused_anonymization_is_gate_failed_not_retryable():
+    fake_result = MagicMock(
+        status="error", anonymization_performed=False, smart_anonymized_text=None, error="detector refused"
+    )
+    with patch("src.main._smart_anonymize_core", new=AsyncMock(return_value=fake_result)):
+        with pytest.raises(CloudAnonymizeError) as ei:
+            await anonymize_query_for_cloud(_fake_request(), "query text")
+    assert ei.value.fehler_code == "privacy_gate_failed"
+    assert ei.value.retryable is False
+
+
+def test_privacy_urteil_follows_the_cause_chain():
+    from src.privacy_client import PrivacyServiceUnavailable
+    from src.research_cloud.anonymize_gate import privacy_urteil
+
+    try:
+        try:
+            raise PrivacyServiceUnavailable("down")
+        except PrivacyServiceUnavailable as inner:
+            raise CloudAnonymizeError("gate") from inner
+    except CloudAnonymizeError as outer:
+        assert privacy_urteil(outer) == {"fehler_code": "privacy_service_unreachable", "retryable": True}
+    assert privacy_urteil(RuntimeError("x")) == {"fehler_code": "privacy_gate_failed", "retryable": False}

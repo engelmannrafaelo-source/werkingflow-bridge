@@ -33,6 +33,7 @@ from typing import Any, Awaitable, Callable, Dict, List, Optional
 import httpx
 
 from src.lauf_abschluss import LaufUnfertig, ModellAbbruch, abschluss_aus_stop_reason, annehmen
+from src.research_cloud.anonymize_gate import PRIVACY_GATE_FAILED, privacy_urteil
 from src.research_cloud.library import (
     LibraryConfig,
     LibraryFetchError,
@@ -161,6 +162,11 @@ class ResearchCloudExecutorError(Exception):
     decide retryability without parsing the message text (config/protocol
     failures below leave it None).
     """
+
+    # Set where the cause is known (anonymize gate: privacy_gate_failed /
+    # privacy_service_unreachable, anonymize_gate.privacy_urteil).
+    fehler_code: Optional[str] = None
+    retryable: Optional[bool] = None
 
     def __init__(self, message: str, *, status_code: Optional[int] = None):
         super().__init__(message)
@@ -304,13 +310,18 @@ async def _handle_perplexity_tool_call(
     try:
         anonymized = await anonymize(frage)
     except Exception as e:
-        raise ResearchCloudExecutorError(
+        fehler = ResearchCloudExecutorError(
             f"perplexity_search: anonymize gate failed — refusing to send the query to Perplexity: {e}"
-        ) from e
+        )
+        urteil = privacy_urteil(e)
+        fehler.fehler_code, fehler.retryable = urteil["fehler_code"], urteil["retryable"]
+        raise fehler from e
     if not anonymized or not anonymized.strip():
-        raise ResearchCloudExecutorError(
+        fehler = ResearchCloudExecutorError(
             "perplexity_search: anonymize gate returned empty text — refusing to send the query"
         )
+        fehler.fehler_code, fehler.retryable = PRIVACY_GATE_FAILED, False
+        raise fehler
     try:
         answer = await ask_perplexity(anonymized, perplexity_cfg, client)
     except PerplexityCallError as e:

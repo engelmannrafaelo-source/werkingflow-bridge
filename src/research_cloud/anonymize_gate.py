@@ -16,12 +16,42 @@ sending the raw query, and no silent fallback to the worker pool either
 """
 from __future__ import annotations
 
+from typing import Optional
+
 from fastapi import Request
+
+PRIVACY_GATE_FAILED = "privacy_gate_failed"
+PRIVACY_SERVICE_UNREACHABLE = "privacy_service_unreachable"
+
+
+def privacy_urteil(exc: BaseException) -> dict:
+    """fehler_code / retryable of a failed anonymize gate.
+
+    privacy_service_unreachable: no privacy endpoint answered (primary and
+    fallback, src.privacy_client.PrivacyServiceUnavailable anywhere in the
+    cause chain) — the same request can succeed once the service is back:
+    retryable. privacy_gate_failed: the service answered but did not attest
+    a verified anonymization (or returned empty text) — not retryable, the
+    gate refused this text."""
+    from src.privacy_client import PrivacyServiceUnavailable
+
+    seen = set()
+    e: Optional[BaseException] = exc
+    while e is not None and id(e) not in seen:
+        seen.add(id(e))
+        if isinstance(e, PrivacyServiceUnavailable):
+            return {"fehler_code": PRIVACY_SERVICE_UNREACHABLE, "retryable": True}
+        e = e.__cause__ or e.__context__
+    return {"fehler_code": PRIVACY_GATE_FAILED, "retryable": False}
 
 
 class CloudAnonymizeError(Exception):
     """Raised when the query cannot be verifiably anonymized before a
-    research-cloud call. The caller must abort the cloud call entirely."""
+    research-cloud call. The caller must abort the cloud call entirely.
+    ``fehler_code`` / ``retryable``: privacy_urteil of the cause."""
+
+    fehler_code = PRIVACY_GATE_FAILED
+    retryable = False
 
 
 async def anonymize_query_for_cloud(request: Request, query: str, language: str = "de") -> str:
@@ -35,9 +65,12 @@ async def anonymize_query_for_cloud(request: Request, query: str, language: str 
     try:
         result = await _smart_anonymize_core(request, text=query, language=language)
     except Exception as e:
-        raise CloudAnonymizeError(
+        fehler = CloudAnonymizeError(
             f"anonymize gate raised before attesting success — refusing research-cloud call: {e}"
-        ) from e
+        )
+        urteil = privacy_urteil(e)
+        fehler.fehler_code, fehler.retryable = urteil["fehler_code"], urteil["retryable"]
+        raise fehler from e
 
     if result.status != "success" or not result.anonymization_performed:
         raise CloudAnonymizeError(

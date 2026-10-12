@@ -764,7 +764,9 @@ class ResearchResponse(ErrorVerdictFields):
             "of the answer. None when the run reported no end."
         ),
     )
-    fehler_code: Optional[Literal["antwort_abgeschnitten", "modell_abbruch"]] = Field(
+    fehler_code: Optional[Literal[
+        "antwort_abgeschnitten", "modell_abbruch", "privacy_gate_failed", "privacy_service_unreachable",
+    ]] = Field(
         default=None,
         description=(
             "status='error' only, when the bridge knows the cause: 'antwort_abgeschnitten' = "
@@ -773,7 +775,11 @@ class ResearchResponse(ErrorVerdictFields):
             "error_max_turns: the same request will hit the same limit (retryable=false), "
             "a smaller one will not. 'modell_abbruch' = the model's safety classifier "
             "stopped a message of the run (antwort_ende 'refusal'), for either answer "
-            "contract (retryable=false). None for every other error."
+            "contract (retryable=false). 'privacy_gate_failed' = the anonymize gate "
+            "(research-cloud prompt or perplexity_search) did not attest a verified "
+            "anonymization — nothing was sent (retryable=false). 'privacy_service_unreachable' "
+            "= no privacy endpoint answered (primary and fallback) — retryable once the service "
+            "is back. None for every other error."
         ),
     )
     usage: Optional[ResearchUsage] = Field(

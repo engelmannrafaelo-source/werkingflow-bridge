@@ -276,3 +276,44 @@ async def test_flag_on_without_anonymizer_service_refuses(spy_cli, persist, pplx
     result = await src.main._execute_research_impl(_make_req(), None, request=MagicMock())
     assert result.status == "error" and "BRIDGE_ANONYMIZE_ENABLED" in result.error
     spy.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_gate_failure_records_its_verdict():
+    from src.privacy_client import PrivacyServiceUnavailable
+
+    t = _tool(AsyncMock(side_effect=PrivacyServiceUnavailable("down")))
+    with pytest.raises(rpp.PoolToolError):
+        await t.handle({"frage": "x"})
+    assert t.gate_urteil == {"fehler_code": "privacy_service_unreachable", "retryable": True}
+    t = _tool(AsyncMock(return_value=""))
+    with pytest.raises(rpp.PoolToolError):
+        await t.handle({"frage": "x"})
+    assert t.gate_urteil == {"fehler_code": "privacy_gate_failed", "retryable": False}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("urteil", [
+    {"fehler_code": "privacy_gate_failed", "retryable": False},
+    {"fehler_code": "privacy_service_unreachable", "retryable": True},
+])
+async def test_gate_failure_ends_the_run_with_fehler_code(spy_cli, persist, pplx_on, urteil):
+    _, _, on_run = spy_cli
+    instances = []
+    real_init = rpp.PoolPerplexityTool.__init__
+
+    def _init(self, *a, **kw):
+        real_init(self, *a, **kw)
+        instances.append(self)
+
+    def _fail():
+        instances[-1].gate_error = "RuntimeError: detector down"
+        instances[-1].gate_urteil = urteil
+
+    on_run.append(_fail)
+    with patch.object(rpp.PoolPerplexityTool, "__init__", _init):
+        result = await src.main._execute_research_impl(_make_req(), None, request=MagicMock())
+    assert result.status == "error"
+    assert result.fehler_code == urteil["fehler_code"]
+    assert result.retryable is urteil["retryable"]
+    assert "Anonymisierungssperre fehlgeschlagen (RuntimeError: detector down)" in result.error

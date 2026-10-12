@@ -6094,10 +6094,15 @@ async def _execute_research_impl(
         if pool_pplx is not None and pool_pplx.gate_error:
             # Nothing was sent (the handler refused), but a report written while
             # the privacy path was broken is not one to hand out as a success.
-            raise RuntimeError(
+            # fehler_code / retryable from the gate's cause (privacy_urteil).
+            gate_fehler = RuntimeError(
                 "perplexity_search: Anonymisierungssperre fehlgeschlagen "
                 f"({pool_pplx.gate_error}) — Lauf als Fehler beendet, die Anfrage wurde nicht gesendet"
             )
+            urteil = pool_pplx.gate_urteil or {"fehler_code": "privacy_gate_failed", "retryable": False}
+            gate_fehler.fehler_code = urteil["fehler_code"]
+            gate_fehler.retryable = urteil["retryable"]
+            raise gate_fehler
 
         nachkontrolle = None
         if luecken_an and pool_pplx is not None:
@@ -6395,13 +6400,15 @@ async def _execute_research_cloud_impl(
     try:
         anonymized_query = await anonymize_query_for_cloud(request, request_body.query)
     except CloudAnonymizeError as e:
-        logger.error(f"research-cloud: anonymize gate refused the call: {e}")
+        logger.error(f"research-cloud: anonymize gate refused the call: {e} ({e.fehler_code})")
         return ResearchResponse(
             status="error",
             query=request_body.query,
             model=request_body.model,
             execution_time_seconds=round(time.time() - start_time, 2),
             error=f"research-cloud requires verified anonymization, which failed: {e}",
+            fehler_code=e.fehler_code,
+            retryable=e.retryable,
         )
 
     # OA-Scholarly-Schicht (Weg A) is backend-agnostic prompt injection — same
@@ -6520,7 +6527,12 @@ async def _execute_research_cloud_impl(
             logger.warning(f"research-cloud error activity tracking failed (non-fatal): {_track_err}")
         from src.research_cloud.executor import TRANSIENT_HTTP_STATUSES
         error_message = str(e)
-        if e.status_code in TRANSIENT_HTTP_STATUSES:
+        if e.fehler_code is not None:
+            # A cause the executor named (anonymize gate): its own verdict,
+            # the message unchanged.
+            error_fields = {"error": error_message, "fehler_code": e.fehler_code,
+                            "retryable": e.retryable}
+        elif e.status_code in TRANSIENT_HTTP_STATUSES:
             # A capacity/availability-shaped upstream failure (429/5xx) —
             # mark it recognizable-retryable so the caller defers instead of
             # treating it as a permanent break (see _mark_retryable).
