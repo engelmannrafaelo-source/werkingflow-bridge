@@ -108,7 +108,7 @@ async def test_cancel_during_recovery_watchdog_then_delete_is_not_plain_success(
             502, "job_cancel_ledger_unknown", "cancelled",
         ), r.text
         assert "already-written-call" in err["message"]
-    assert responses[0].json() == responses[1].json()
+    assert f.ohne_zeit(responses[0]) == f.ohne_zeit(responses[1])
     assert deductions == ["already-written-call"] and bookings == []
 
 

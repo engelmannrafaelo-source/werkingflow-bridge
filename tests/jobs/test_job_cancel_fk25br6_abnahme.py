@@ -26,7 +26,7 @@ mem = f.mem
 async def twice():
     x = await f._delete(f.JOB, f.OWNER_HEADERS)
     y = await f._delete(f.JOB, f.OWNER_HEADERS)
-    assert x.status_code == y.status_code and x.json() == y.json()
+    assert x.status_code == y.status_code and f.ohne_zeit(x) == f.ohne_zeit(y)
     return x
 
 
@@ -238,3 +238,88 @@ async def test_matrix(mem, weg, bericht, spur):
             assert (v["anzahl"], v["abgebrochen_ohne_bericht"]) == (
                 1, 0 if spur == "nur_geparkt" else 1,
             )
+
+
+# The third way into the same answer: the stopping DELETE itself
+# (_stop_running sees the row turn 'cancelled' and answers from it). The stop
+# is simulated by the local wake-up: it closes the row with the account, as
+# registry._als_abgebrochen_schliessen / the watchdog / defer_job would.
+FAELLE_STOPP = [(b_, s) for b_ in BERICHTE if b_ is not None for s in SPUREN]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bericht,spur", FAELLE_STOPP)
+async def test_matrix_im_stopp(mem, monkeypatch, bericht, spur):
+    from src.jobs import routes
+
+    attempts, defer_count = _zaehler(bericht, spur)
+    mem.add(f.JOB, "running", attempts=attempts, defer_count=defer_count)
+    progress = (
+        {"abbruch": "not-a-dict"} if bericht == "kaputt"
+        else {"abbruch": {"ledger": bericht, "ledger_outcomes": ["x"]}}
+    )
+
+    def stopp(job_id):
+        mem.rows[job_id].update(status="cancelled", progress=progress)
+        return True
+
+    monkeypatch.setattr(routes, "abbruch_melden", stopp)
+    r = await twice()  # first: the stopping DELETE; second: the repeat
+    status, code = _erwartet(bericht, spur)
+    assert r.status_code == status, (bericht, spur, r.text)
+    teil = r.json()["error"] if code else r.json()
+    if code:
+        assert teil["code"] == code
+    assert teil["status"] == "cancelled"
+    assert teil.get("ledger") == ("unlesbar" if bericht == "kaputt" else bericht)
+    assert ("fruehere_versuche" in teil) == (spur != "keine")
+
+
+# ---------------------------------------------------------------------------
+# Part 3 — the DELETE route's other branches, each once
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_feature_off_is_503(mem, monkeypatch):
+    from fastapi import HTTPException
+
+    from src.jobs import routes
+
+    def aus():
+        raise HTTPException(status_code=503, detail="Generic async jobs disabled")
+
+    monkeypatch.setattr(routes, "_require_enabled", aus)
+    mem.add(f.JOB, "pending")
+    r = await f._delete(f.JOB, f.OWNER_HEADERS)
+    assert r.status_code == 503 and mem.rows[f.JOB]["status"] == "pending"
+
+
+@pytest.mark.asyncio
+async def test_home_unconfigured_is_503(mem, monkeypatch):
+    monkeypatch.delenv("BRIDGE_ORIGIN_ID", raising=False)
+    mem.add(f.JOB, "pending")
+    r = await f._delete(f.JOB, f.OWNER_HEADERS)
+    assert r.status_code == 503 and mem.rows[f.JOB]["status"] == "pending"
+
+
+@pytest.mark.asyncio
+async def test_row_vanishes_while_stopping_is_404(mem, monkeypatch):
+    from src.jobs import routes
+
+    mem.add(f.JOB, "running")
+
+    def weg(job_id):
+        del mem.rows[job_id]
+        return True
+
+    monkeypatch.setattr(routes, "abbruch_melden", weg)
+    r = await f._delete(f.JOB, f.OWNER_HEADERS)
+    assert (r.status_code, r.json()["error"]["code"]) == (404, "job_not_found")
+
+
+@pytest.mark.asyncio
+async def test_unknown_store_status_is_loud(mem):
+    mem.add(f.JOB, "rätselhaft")
+    with pytest.raises(RuntimeError, match="unknown status"):
+        await f._delete(f.JOB, f.OWNER_HEADERS)

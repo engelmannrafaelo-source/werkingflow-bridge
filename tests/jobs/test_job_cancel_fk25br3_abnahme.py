@@ -70,7 +70,7 @@ async def test_repeat_delete_keeps_ledger_state(welt, monkeypatch, spooled):
                 assert (r.status_code, err["code"], err["status"]) == (
                     502, "job_cancel_ledger_failed", "cancelled",
                 ), r.text
-        assert first.json() == second.json()
+        assert f.ohne_zeit(first) == f.ohne_zeit(second)
         assert len(runs) == 1 and len(booked) == 1
         assert welt.mem.rows[f.JOB]["progress"]["abbruch"]["ledger"] == (
             "rueckstau" if spooled else "fehlgeschlagen"
@@ -116,7 +116,7 @@ async def test_concurrent_delete_while_stopping_answers_alike(welt, monkeypatch,
         await asyncio.wait_for(task, 3)
         expected = 200 if ledger_ok else 502
         assert (r1.status_code, r2.status_code) == (expected, expected), (r1.text, r2.text)
-        assert r1.json() == r2.json()
+        assert f.ohne_zeit(r1) == f.ohne_zeit(r2)
         assert len(booked) == 1
     finally:
         release.set()

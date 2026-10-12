@@ -21,7 +21,7 @@ async def _zweimal(job_id, status=200):
     first = await f._delete(job_id, f.OWNER_HEADERS)
     second = await f._delete(job_id, f.OWNER_HEADERS)
     assert first.status_code == second.status_code == status, first.text
-    assert first.json() == second.json()
+    assert f.ohne_zeit(first) == f.ohne_zeit(second)
     body = first.json()
     return body["error"] if status == 502 else body
 

@@ -190,6 +190,15 @@ def _router_app():
     return app
 
 
+def ohne_zeit(r):
+    """The answer without the envelope's second-resolution timestamp: two
+    identical answers a second apart differ only there."""
+    body = r.json()
+    if isinstance(body.get("error"), dict):
+        body = {**body, "error": {k: v for k, v in body["error"].items() if k != "timestamp"}}
+    return body
+
+
 async def _delete(job_id, headers):
     transport = httpx.ASGITransport(app=_router_app())
     async with httpx.AsyncClient(transport=transport, base_url="http://bridge") as c:
