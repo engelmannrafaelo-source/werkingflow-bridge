@@ -132,6 +132,8 @@ REASON_JOB_TERMINAL = "job_terminal"
 REASON_JOB_STORE_INCOMPATIBLE = "job_store_incompatible"
 # FK25BR R2 — a running job was stopped, but its ledger booking failed.
 REASON_JOB_CANCEL_LEDGER_FAILED = "job_cancel_ledger_failed"
+# FK25BR R4 — it ran; its stop's booking was never confirmed (worker died).
+REASON_JOB_CANCEL_LEDGER_UNKNOWN = "job_cancel_ledger_unknown"
 # BRREF2 — Idempotency-Key on POST /v1/jobs. Also carried in error.code.
 REASON_IDEMPOTENCY_KEY_REUSED = "idempotency_key_reused"
 REASON_IDEMPOTENCY_KEY_INVALID = "idempotency_key_invalid"

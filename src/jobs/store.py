@@ -624,6 +624,11 @@ async def defer_job(job_id: str, delay_seconds: int, reason: str) -> None:
     statement, so no watchdog can ever start it again. The caller learns the
     outcome from the row (registry._defer_job reads it for its log line); the
     platform seam stays 204-without-body so a pre-BR10b worker keeps working.
+
+    The 'cancelled' branch closes a row that ran: its run ended on its own
+    (dependency/capacity), and that run booked its own call like any run that
+    ends. It gets ``progress.abbruch.ledger = 'vom_lauf'`` so DELETE does not
+    read the row as never worked on (FK25BR R4).
     """
     pool = get_pool()
     async with pool.acquire() as conn:
@@ -632,6 +637,11 @@ async def defer_job(job_id: str, delay_seconds: int, reason: str) -> None:
             UPDATE ai_jobs
                SET status = CASE WHEN cancel_requested_at IS NULL
                                  THEN 'pending' ELSE 'cancelled' END,
+                   progress = CASE WHEN cancel_requested_at IS NULL THEN progress
+                       ELSE COALESCE(progress, '{}'::jsonb) || jsonb_build_object(
+                           'abbruch', jsonb_build_object(
+                               'ledger', 'vom_lauf', 'geschlossen_von', 'defer_job'))
+                       END,
                    -- BR11: the 'cancelled' branch is terminal; its retention
                    -- clock starts here.
                    finished_at = CASE WHEN cancel_requested_at IS NULL
@@ -669,13 +679,30 @@ async def claim_stale_job(stale_seconds: int, max_attempts: int) -> Optional[Dic
     defer_job) is closed as 'cancelled' at once, a 'running' one as soon as its
     heartbeat is stale (dead worker) — in the same call, before the claim, so
     the watchdog neither re-runs it nor leaves it non-terminal. A live run
-    with a fresh heartbeat is left alone."""
+    with a fresh heartbeat is left alone.
+
+    A 'running' row closed this way WAS worked on, and nobody confirmed how
+    its stop was booked: the stopping worker died before it wrote its account
+    (FK25BR R4). The row gets ``progress.abbruch.ledger = 'unbekannt'``
+    (keeping what a stop recorded before it started booking: its open
+    deductions), so DELETE answers "booking unknown", never a plain success.
+    A 'pending' row was not running: no stamp."""
     pool = get_pool()
     async with pool.acquire() as conn:
         await conn.execute(
             f"""
             UPDATE ai_jobs
-               SET status = 'cancelled', updated_at = NOW(), finished_at = NOW()
+               SET status = 'cancelled', updated_at = NOW(), finished_at = NOW(),
+                   progress = CASE
+                       WHEN status = 'running'
+                            AND COALESCE(progress->'abbruch'->>'ledger', 'offen') = 'offen'
+                       THEN COALESCE(progress, '{{}}'::jsonb) || jsonb_build_object(
+                           'abbruch',
+                           COALESCE(progress->'abbruch', '{{}}'::jsonb)
+                           || jsonb_build_object(
+                               'ledger', 'unbekannt',
+                               'geschlossen_von', 'watchdog'))
+                       ELSE progress END
              WHERE cancel_requested_at IS NOT NULL
                AND (status = 'pending'
                     OR (status = 'running'

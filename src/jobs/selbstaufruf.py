@@ -234,6 +234,10 @@ async def unter_job_aufsicht(
 LEDGER_GEBUCHT = "gebucht"            # every row settled (written/duplicate/skipped)
 LEDGER_RUECKSTAU = "rueckstau"        # a row is owed, but on disk: the flusher books it
 LEDGER_FEHLGESCHLAGEN = "fehlgeschlagen"  # a row is neither booked nor spooled: lost
+# Stored while a stop books; never an answer. A row closed with it (the
+# stopping worker died) is turned into 'unbekannt' by the watchdog (store).
+LEDGER_OFFEN = "offen"
+LEDGER_UNBEKANNT = "unbekannt"
 
 
 async def _buchen(**felder: Any) -> "tuple[str, str]":
@@ -259,6 +263,33 @@ async def _buchen(**felder: Any) -> "tuple[str, str]":
         # it and still answers 'written' — the stop does not call that booked.
         return f"{outcome}+deduction_lost", LEDGER_FEHLGESCHLAGEN
     return outcome, LEDGER_FEHLGESCHLAGEN
+
+
+async def _buchung_offen_vermerken(
+    job_id: str, code: str, abzuege: Dict[str, Dict[str, Any]]
+) -> None:
+    """Before booking: record on the row that a stop is booking (FK25BR R4).
+    If this worker dies before the account is written, the watchdog closes
+    the row and turns 'offen' into 'unbekannt' — the open deductions named —
+    instead of the row reading like a job that never ran. A failed write is
+    logged; the watchdog's stamp still covers the row, only without names."""
+    from src.jobs import store_client
+    from src.jobs.registry import ABBRUCH_PROGRESS_KEY
+
+    try:
+        await store_client.update_progress(job_id, {
+            "phase": "cancelling",
+            ABBRUCH_PROGRESS_KEY: {
+                "job_id": job_id, "grund": code, "ledger": LEDGER_OFFEN,
+                "offene_abzuege": list(abzuege),
+            },
+        })
+    except Exception as e:  # noqa: BLE001 — the stop and its booking go on
+        logger.error(
+            f"🛑 job stop {job_id}: could not record 'booking in progress' ({e}); "
+            f"if this worker dies now the watchdog marks the booking unknown "
+            f"without the open deductions' ids {list(abzuege)}"
+        )
 
 
 async def _abzuege_nachholen(
@@ -377,6 +408,8 @@ async def _im_ledger_vermerken(
         abzuege = laufender.offene_abzuege() if laufender is not None else {}
     # The run's own rows that were written, but whose deduction the stop
     # interrupted: resumed, never booked again (FK25BR R3).
+    if grund == _GRUND_WUNSCH:
+        await _buchung_offen_vermerken(job_id, code, abzuege)
     ergebnisse, offene_abzuege = await _abzuege_nachholen(abzuege)
     if not summe:
         ergebnisse.append(await _buchen(

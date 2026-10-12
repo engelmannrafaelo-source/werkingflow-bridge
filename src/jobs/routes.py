@@ -37,6 +37,7 @@ from src.middleware.bridge_error import (
     REASON_IDEMPOTENCY_KEY_REUSED,
     REASON_JOB_ALREADY_RUNNING,
     REASON_JOB_CANCEL_LEDGER_FAILED,
+    REASON_JOB_CANCEL_LEDGER_UNKNOWN,
     REASON_JOB_NOT_FOUND,
     REASON_JOB_STORE_INCOMPATIBLE,
     REASON_JOB_TERMINAL,
@@ -845,11 +846,19 @@ async def _cancelled_answer(job_id: str, kind: Optional[str], wo: str) -> JSONRe
       fehlgeschlagen  502 job_cancel_ledger_failed — stopped, the booking is
                       lost (neither written nor spooled)
 
+      vom_lauf        200 {status:'cancelled', ledger:'vom_lauf'} — the run
+                      ended on its own and booked itself (defer_job)
+      unbekannt       502 job_cancel_ledger_unknown — it ran, the stopping
+                      worker died before its account; the watchdog closed
+                      it (FK25BR R4)
+
     Answered alike to the DELETE that stopped the run and to every repeated
     or concurrent one (FK25BR R3) — the account is stored on the row before
-    it reads 'cancelled'. No account at all: cancelled without a run being
-    stopped (cancelled while pending, or parked and closed by defer_job) —
-    nothing ran, 200 without a ledger claim."""
+    it reads 'cancelled'. No account at all: no run was stopped — cancelled
+    while pending, or by the watchdog while pending. Every path that closes a
+    RUNNING row as cancelled leaves an account (finish_cancelled after the
+    report, the watchdog's 'unbekannt', defer_job's 'vom_lauf') — so no
+    account means nothing ran: 200 without a ledger claim."""
     job = await store_client.get_job(job_id)
     bericht = ((job or {}).get("progress") or {}).get(ABBRUCH_PROGRESS_KEY)
     if not isinstance(bericht, dict):
@@ -858,6 +867,12 @@ async def _cancelled_answer(job_id: str, kind: Optional[str], wo: str) -> JSONRe
             status_code=200, content={"job_id": job_id, "status": store.JOB_STATUS_CANCELLED}
         )
     ledger = bericht.get("ledger")
+    if ledger == "vom_lauf":
+        # The run ended on its own (parked by defer_job with the wish
+        # recorded) and booked its call itself, like any finished run.
+        return JSONResponse(status_code=200, content={
+            "job_id": job_id, "status": store.JOB_STATUS_CANCELLED, "ledger": ledger,
+        })
     if ledger == "gebucht":
         logger.info(
             f"🛑 Async job {job_id} (kind={kind}) cancelled by its owner while "
@@ -879,6 +894,23 @@ async def _cancelled_answer(job_id: str, kind: Optional[str], wo: str) -> JSONRe
                 f"books it later. Not yet billed."
             ),
         })
+    if ledger != "fehlgeschlagen":
+        # 'unbekannt' (the watchdog closed a running row whose stop never
+        # wrote its account), 'offen' on a closed row, or anything else: the
+        # booking is not confirmed — never a plain success (FK25BR R4).
+        logger.error(
+            f"🛑 Async job {job_id} (kind={kind}) cancelled after it ran, but its "
+            f"stop's ledger booking is not confirmed (ledger={ledger!r}, open "
+            f"deductions: {bericht.get('offene_abzuege')})"
+        )
+        return job_cancel_error(
+            job_id, REASON_JOB_CANCEL_LEDGER_UNKNOWN, 502,
+            f"Async job {job_id} is cancelled after it ran, but the worker stopping "
+            f"it went away before its ledger booking was confirmed (ledger: "
+            f"{ledger}; open budget deductions: {bericht.get('offene_abzuege') or 'none known'}). "
+            f"Whether this usage is metered is unknown.",
+            job_status=store.JOB_STATUS_CANCELLED,
+        )
     logger.error(
         f"🛑 Async job {job_id} (kind={kind}) stopped, but its ledger booking "
         f"{ledger!r} ({bericht.get('ledger_outcomes')}) — usage not metered"
