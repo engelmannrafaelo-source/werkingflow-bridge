@@ -154,7 +154,9 @@ class MemStore:
         pass
 
     async def update_progress(self, job_id, progress):
-        pass
+        self.calls.append(("update_progress", job_id))
+        if job_id in self.rows:
+            self.rows[job_id]["progress"] = progress
 
     def ops(self, name):
         return [c for c in self.calls if c[0] == name]
@@ -328,7 +330,7 @@ async def test_delete_stoppt_den_laufenden_job_auf_diesem_worker(welt):
     resp = await _delete(JOB, OWNER_HEADERS)
     dauer = time.monotonic() - t0
     assert resp.status_code == 200, resp.text
-    assert resp.json() == {"job_id": JOB, "status": "cancelled"}
+    assert resp.json() == {"job_id": JOB, "status": "cancelled", "ledger": "gebucht"}
     assert dauer < 3.0, dauer
     # FK25B2: 200 means the run HAS ended and the stop IS booked — not later.
     assert "abgebrochen" in welt.lauf.ereignisse, welt.lauf.ereignisse
@@ -607,7 +609,7 @@ async def test_finish_route_fehlt_endet_laut(mem, monkeypatch):
     async def executor(payload, attribution, report_progress):
         while not mem.rows[JOB]["cancel_requested"]:
             await asyncio.sleep(0.02)
-        raise selbstaufruf.JobLaufAbgebrochen({"grund": "job_cancelled"})
+        raise selbstaufruf.JobLaufAbgebrochen({"grund": "job_cancelled", "ledger": "gebucht"})
 
     monkeypatch.setitem(registry._EXECUTORS, "chat", executor)
     mem.add(JOB, "running")
@@ -773,7 +775,7 @@ async def test_pg_laufender_chatjob_endet_cancelled_und_kommt_nie_wieder(pg_stor
         while not (await store.cancel_state(JOB))["cancel_requested"]:
             await asyncio.sleep(0.05)
         ende.append("abgebrochen")
-        raise selbstaufruf.JobLaufAbgebrochen({"grund": "job_cancelled"})
+        raise selbstaufruf.JobLaufAbgebrochen({"grund": "job_cancelled", "ledger": "gebucht"})
 
     calls = AsyncMock(side_effect=executor)
     monkeypatch.setitem(registry._EXECUTORS, "chat", calls)
@@ -781,10 +783,14 @@ async def test_pg_laufender_chatjob_endet_cancelled_und_kommt_nie_wieder(pg_stor
     lauf = asyncio.ensure_future(registry.run_generic_job(JOB, "chat", {}, OWNER_ATTR))
     await asyncio.wait_for(gestartet.wait(), 5)
     resp = await _delete(JOB, OWNER_HEADERS)
-    assert (resp.status_code, resp.json()) == (200, {"job_id": JOB, "status": "cancelled"})
+    assert (resp.status_code, resp.json()) == (
+        200, {"job_id": JOB, "status": "cancelled", "ledger": "gebucht"},
+    )
     await asyncio.wait_for(lauf, 5)
     assert ende == ["abgebrochen"]
     assert await br10._status(pg_store, JOB) == "cancelled"
+    # The stop's account survives finish_cancelled on the real row.
+    assert (await store.get_job(JOB))["progress"]["abbruch"]["ledger"] == "gebucht"
     async with pg_store.acquire() as conn:
         await conn.execute(
             "UPDATE ai_jobs SET deferred_until = NOW() - interval '1 second', "

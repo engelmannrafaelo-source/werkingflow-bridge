@@ -130,6 +130,8 @@ REASON_JOB_ALREADY_RUNNING = "job_already_running"
 REASON_JOB_TERMINAL = "job_terminal"
 # FK25B2 — the platform-api predates the routes a running job's cancel needs.
 REASON_JOB_STORE_INCOMPATIBLE = "job_store_incompatible"
+# FK25BR R2 — a running job was stopped, but its ledger booking failed.
+REASON_JOB_CANCEL_LEDGER_FAILED = "job_cancel_ledger_failed"
 # BRREF2 — Idempotency-Key on POST /v1/jobs. Also carried in error.code.
 REASON_IDEMPOTENCY_KEY_REUSED = "idempotency_key_reused"
 REASON_IDEMPOTENCY_KEY_INVALID = "idempotency_key_invalid"

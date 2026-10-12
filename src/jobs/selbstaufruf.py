@@ -12,10 +12,12 @@ only here is it known whether the run had already finished:
     children through the bounded close (claude_cli, BRLZR R2) — and books the
     stop in the ledger;
   * only then it answers: 409 with ABBRUCH_HEADER = "bestaetigt" and the
-    account of the stop. The runner reads that as "stopped" and closes the
-    row as 'cancelled' (registry). The DELETE route answers 200 only once the
-    row reads 'cancelled' — so 200 means: process gone, ledger booked
-    (FK25BR Befund 2);
+    account of the stop, including what the ledger writer answered
+    (``ledger``: gebucht / rueckstau / fehlgeschlagen). The runner stores
+    that account on the row and closes it as 'cancelled' (registry). DELETE
+    answers 200 only for 'gebucht' — process gone AND booked (FK25BR Befund
+    2, R2 P1); a booking that is merely owed in the spool or lost is said
+    so (routes._stop_running);
   * if the run returns a result while being stopped (it finished in the same
     instant), that result is the answer — the runner stores it as 'done'
     and the DELETE gets 409 job_terminal. A finished, paid result is never
@@ -227,6 +229,36 @@ async def unter_job_aufsicht(
                 del _LAUFENDE[job_id]
 
 
+# What the writer's answers mean for the stop's booking (ledger_spool outcomes).
+LEDGER_GEBUCHT = "gebucht"            # every row settled (written/duplicate/skipped)
+LEDGER_RUECKSTAU = "rueckstau"        # a row is owed, but on disk: the flusher books it
+LEDGER_FEHLGESCHLAGEN = "fehlgeschlagen"  # a row is neither booked nor spooled: lost
+
+
+async def _buchen(**felder: Any) -> "tuple[str, str]":
+    """One row through the writer; returns (writer outcome, ledger state).
+
+    The writer never raises for an Exception and answers with a ledger_spool
+    outcome; 'failed' (or 'deduction_owed') is part of its contract, so its
+    return is the booking's result — not the fact that it returned."""
+    from src.activity import ai_call_writer, ledger_spool
+    from src.jobs import teilverbrauch
+
+    buchung, token = teilverbrauch.eigene_buchung()
+    try:
+        outcome = await ai_call_writer.persist_ai_call_activity(**felder)
+    finally:
+        teilverbrauch.eigene_buchung_beenden(token)
+    if ledger_spool.is_definitive(outcome):
+        return outcome, LEDGER_GEBUCHT
+    if buchung.gesichert:
+        return outcome, LEDGER_RUECKSTAU
+    return outcome, LEDGER_FEHLGESCHLAGEN
+
+
+_LEDGER_RANG = (LEDGER_GEBUCHT, LEDGER_RUECKSTAU, LEDGER_FEHLGESCHLAGEN)
+
+
 def _summe_je_modell(zuege: List[Dict[str, Any]]) -> Dict[str, Dict[str, int]]:
     summe: Dict[str, Dict[str, int]] = {}
     for zug in zuege:
@@ -251,8 +283,9 @@ async def _im_ledger_vermerken(
     grund: str,
     zuege: List[Dict[str, Any]],
 ) -> Dict[str, Any]:
-    """Book the stop; returns the account the confirmation carries."""
-    from src.activity.ai_call_writer import persist_ai_call_activity
+    """Book the stop; returns the account the confirmation carries —
+    ``ledger`` is the worst state of its rows, ``ledger_outcomes`` what the
+    writer answered for each."""
     from src.activity.delivery import STATUS_UNDELIVERED
     from src.activity.providers import PROVIDER_UNROUTED
 
@@ -299,8 +332,9 @@ async def _im_ledger_vermerken(
         error_code=code,
         app_env=attribution.get("app_env"),
     )
+    ergebnisse: List["tuple[str, str]"] = []
     if not summe:
-        await persist_ai_call_activity(
+        ergebnisse.append(await _buchen(
             **gemeinsam,
             provider_meta=meta,
             model=model or "unknown",
@@ -308,11 +342,11 @@ async def _im_ledger_vermerken(
             output_tokens=0,
             status="error",
             error_message=f"{warum}; Lauf nach {dauer_s:.0f}s beendet. {luecke}",
-        )
+        ))
     for modell, s in summe.items():
         # 'undelivered': the model calls ran and are paid for, their answer
         # reached nobody — the ledger prices and deducts them like any call.
-        await persist_ai_call_activity(
+        ergebnisse.append(await _buchen(
             **gemeinsam,
             provider_meta={**meta, "zuege_dieses_modells": s["zuege"]},
             model=modell,
@@ -325,6 +359,20 @@ async def _im_ledger_vermerken(
                 f"{warum}; Lauf nach {dauer_s:.0f}s beendet. Gebucht: {s['zuege']} "
                 f"abgeschlossene Modellaufrufe. {luecke}"
             ),
+        ))
+    ledger = max((z for _, z in ergebnisse), key=_LEDGER_RANG.index)
+    outcomes = [o for o, _ in ergebnisse]
+    if ledger == LEDGER_FEHLGESCHLAGEN:
+        logger.error(
+            f"🛑 job self-call {endpunkt} for {job_id}: run stopped, but its ledger "
+            f"booking FAILED and is not spooled — this usage is not metered "
+            f"(writer: {outcomes}, provider={provider}, verbrauch={verbrauch})"
+        )
+    elif ledger == LEDGER_RUECKSTAU:
+        logger.error(
+            f"🛑 job self-call {endpunkt} for {job_id}: run stopped, ledger booking "
+            f"not settled — owed in the ledger spool, the flusher books it "
+            f"(writer: {outcomes})"
         )
     return {
         "job_id": job_id,
@@ -335,5 +383,6 @@ async def _im_ledger_vermerken(
         "verbrauch": verbrauch,
         "gemessene_zuege": meta["gemessene_zuege"],
         "offener_zug_unbekannt": geroutet,
-        "ledger": "gebucht",
+        "ledger": ledger,
+        "ledger_outcomes": outcomes,
     }

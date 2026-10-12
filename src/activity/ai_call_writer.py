@@ -93,6 +93,14 @@ _skip_counts: dict = defaultdict(int)
 # this is where callers expect to find it.
 
 
+def _buchung_gesichert() -> None:
+    """Tell a job self-call that this booking is durable (FK25B2,
+    src/jobs/teilverbrauch.py). Synchronous: no cancellation point."""
+    from src.jobs.teilverbrauch import buchung_gesichert
+
+    buchung_gesichert()
+
+
 def resolve_ledger_cost(
     billing_mode_text: str, provider: str, call_cost_eur: float
 ) -> tuple:
@@ -475,12 +483,16 @@ async def persist_ai_call_activity(
             # writer that predates this parameter (rollback window).
             **({"extra_cost_usd": extra_cost_usd} if extra_cost_usd else {}),
         })
+    if spooled:
+        _buchung_gesichert()
 
     def _settle(outcome: str) -> str:
         """Single exit. A definitive answer releases the spooled record; any
         other outcome leaves it owed, which is what makes the retry happen."""
         if spooled and ledger_spool.is_definitive(outcome):
             ledger_spool.ack(call_uid, outcome)
+        if not replaying and ledger_spool.is_definitive(outcome):
+            _buchung_gesichert()
         return outcome
 
     # ── Delivery: 'success' is a claim about the CALLER, not about the model ──

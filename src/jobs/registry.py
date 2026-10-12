@@ -217,6 +217,8 @@ JOB_ABBRECHBAR_IM_LAUF = frozenset({"chat", "research", "doc-agent"})
 # attribution key of the owner bound at submit (routes._caller_owns, FK25B2).
 # A job without it (submitted before FK25B2) is not stopped in its run.
 EIGENTUEMER_KEY = "eigentuemer"
+# progress key of the endpoint's account of a stop (selbstaufruf._im_ledger_vermerken).
+ABBRUCH_PROGRESS_KEY = "abbruch"
 
 _job_lauf: "contextvars.ContextVar[Optional[str]]" = contextvars.ContextVar(
     "bridge_job_lauf", default=None
@@ -431,7 +433,14 @@ async def _ausfuehren(
 async def _als_abgebrochen_schliessen(
     job_id: str, kind: str, bericht: Dict[str, Any]
 ) -> None:
-    """The endpoint stopped the run and booked it; close the row."""
+    """The endpoint stopped the run; record its account (incl. how the ledger
+    booking went) on the row, then close the row. The account is what lets
+    DELETE — on any worker — tell "stopped and booked" from "stopped, booking
+    owed/failed" (routes._stop_running, FK25BR R2 P1). A failed write here
+    propagates: the row must not read 'cancelled' without it."""
+    await store_client.update_progress(
+        job_id, {"phase": "cancelled", ABBRUCH_PROGRESS_KEY: bericht}
+    )
     try:
         changed = await store_client.finish_cancelled(job_id)
     except store_client.CancelRouteMissing as e:
@@ -442,15 +451,16 @@ async def _als_abgebrochen_schliessen(
         )
         await store_client.mark_error(
             job_id,
-            f"Run stopped on its owner's cancel and booked ({bericht}), but the "
+            f"Run stopped on its owner's cancel ({bericht}), but the "
             f"job store cannot record 'cancelled': {e}",
             **job_code_fields_for(JOB_CODE_STORE_INCOMPATIBLE),
         )
         return
     if changed:
-        logger.warning(
+        log = logger.warning if bericht.get("ledger") == "gebucht" else logger.error
+        log(
             f"🛑 Async job {job_id} (kind={kind}) cancelled while running — "
-            f"stopped and booked by the endpoint ({bericht})"
+            f"stopped by the endpoint, ledger {bericht.get('ledger')!r} ({bericht})"
         )
         return
     try:

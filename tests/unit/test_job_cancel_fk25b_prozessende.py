@@ -113,7 +113,7 @@ class Store:
         pass
 
     async def update_progress(self, job_id, progress):
-        pass
+        self.row["progress"] = progress
 
 
 def _port() -> int:
@@ -248,7 +248,7 @@ async def test_delete_beendet_cli_samt_kind(tmp_path, monkeypatch, weg, kind):
             resp = await c.delete(f"/v1/jobs/{JOB}", headers=OWNER)
         weg_nach = time.monotonic() - t0
         assert resp.status_code == 200, resp.text
-        assert resp.json()["status"] == "cancelled"
+        assert resp.json() == {"job_id": JOB, "status": "cancelled", "ledger": "gebucht"}
         cli_lebt, kind_lebt = _lebt(cli_pid), _lebt(kind_pid)
         gebucht = [(r["status"], r["input_tokens"]) for r in ledger]
         print(f"\nAT_200 {kind} {weg}: {weg_nach:.2f}s cli_alive={cli_lebt} "

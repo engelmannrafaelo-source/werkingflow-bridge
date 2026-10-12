@@ -36,6 +36,7 @@ from src.middleware.bridge_error import (
     REASON_IDEMPOTENCY_KEY_INVALID,
     REASON_IDEMPOTENCY_KEY_REUSED,
     REASON_JOB_ALREADY_RUNNING,
+    REASON_JOB_CANCEL_LEDGER_FAILED,
     REASON_JOB_NOT_FOUND,
     REASON_JOB_STORE_INCOMPATIBLE,
     REASON_JOB_TERMINAL,
@@ -54,6 +55,7 @@ from src.jobs.job_id import (
     parse_home,
 )
 from src.jobs.registry import (
+    ABBRUCH_PROGRESS_KEY,
     EIGENTUEMER_KEY,
     JOB_ABBRECHBAR_IM_LAUF,
     get_executor,
@@ -735,6 +737,10 @@ async def cancel_job_endpoint(
                                         effect; the result is kept
       502 job_store_incompatible        the platform-api predates FK25B: a
                                         running job cannot be stopped
+      202 {status:'cancelled',ledger:'rueckstau'} / 502 job_cancel_ledger_failed
+                                        stopped, but the stop's booking is
+                                        only owed in the spool / lost
+                                        (_cancelled_answer, FK25BR R2)
       409 job_already_running           every OTHER kind (erkunder, ping,
                                         proxy, pdf) a worker has (also when
                                         it won the
@@ -823,6 +829,63 @@ JOB_CANCEL_WAIT_S = float(os.getenv("BRIDGE_JOB_CANCEL_WAIT_S", "10"))
 JOB_CANCEL_WAIT_TICK_S = 0.25
 
 
+async def _cancelled_answer(job_id: str, kind: Optional[str], local: bool) -> JSONResponse:
+    """The row reads 'cancelled'. Whether that is 200 depends on the stop's
+    ledger booking, recorded by the endpoint (FK25BR R2 P1):
+
+      gebucht         200 {status:'cancelled', ledger:'gebucht'}
+      rueckstau       202 {status:'cancelled', ledger:'rueckstau'} — stopped;
+                      the booking is owed in the ledger spool, the flusher
+                      books it
+      fehlgeschlagen  502 job_cancel_ledger_failed — stopped, the booking is
+                      lost (neither written nor spooled)
+
+    No account at all: closed 'cancelled' without a stopped run (it parked and
+    defer_job closed it) — nothing to book, 200 without a ledger claim."""
+    job = await store_client.get_job(job_id)
+    bericht = ((job or {}).get("progress") or {}).get(ABBRUCH_PROGRESS_KEY)
+    wo = "this worker" if local else "another worker"
+    if not isinstance(bericht, dict):
+        logger.info(f"🛑 Async job {job_id} (kind={kind}) cancelled by its owner ({wo})")
+        return JSONResponse(
+            status_code=200, content={"job_id": job_id, "status": store.JOB_STATUS_CANCELLED}
+        )
+    ledger = bericht.get("ledger")
+    if ledger == "gebucht":
+        logger.info(
+            f"🛑 Async job {job_id} (kind={kind}) cancelled by its owner while "
+            f"running ({wo}); stop booked"
+        )
+        return JSONResponse(status_code=200, content={
+            "job_id": job_id, "status": store.JOB_STATUS_CANCELLED, "ledger": ledger,
+        })
+    if ledger == "rueckstau":
+        logger.error(
+            f"🛑 Async job {job_id} (kind={kind}) stopped, ledger booking owed in "
+            f"the spool ({bericht.get('ledger_outcomes')})"
+        )
+        return JSONResponse(status_code=202, content={
+            "job_id": job_id, "status": store.JOB_STATUS_CANCELLED, "ledger": ledger,
+            "message": (
+                f"Async job {job_id} is stopped; its ledger booking did not go "
+                f"through yet and is owed in the bridge's ledger spool, which "
+                f"books it later. Not yet billed."
+            ),
+        })
+    logger.error(
+        f"🛑 Async job {job_id} (kind={kind}) stopped, but its ledger booking "
+        f"{ledger!r} ({bericht.get('ledger_outcomes')}) — usage not metered"
+    )
+    return job_cancel_error(
+        job_id, REASON_JOB_CANCEL_LEDGER_FAILED, 502,
+        f"Async job {job_id} is stopped (cancelled), but booking its usage in the "
+        f"ledger failed and was not spooled (writer: {bericht.get('ledger_outcomes')}, "
+        f"verbrauch: {bericht.get('verbrauch')}). The run is over; the usage is "
+        f"not metered.",
+        job_status=store.JOB_STATUS_CANCELLED,
+    )
+
+
 def _store_incompatible(job_id: str, detail: str, gestoppt: bool = False) -> JSONResponse:
     """502: the platform-api predates FK25B. Never answered as BR10b's 409 or
     as 'being stopped' — a deploy mismatch someone has to see (FK25BR 4)."""
@@ -851,9 +914,13 @@ def _store_incompatible(job_id: str, detail: str, gestoppt: bool = False) -> JSO
 async def _stop_running(job_id: str, kind: Optional[str]) -> JSONResponse:
     """Stop a running job whose cancel wish is recorded (FK25B, FK25B2).
 
-      200 {status:'cancelled'}          the endpoint stopped the run, the CLI
-                                        has ended and the stop is booked; the
+      200 {status:'cancelled',          the endpoint stopped the run, the CLI
+           ledger:'gebucht'}            has ended and the stop is booked; the
                                         row is cancelled
+      202 {status:'cancelled',          stopped; the booking is owed in the
+           ledger:'rueckstau'}          ledger spool (not yet billed)
+      502 job_cancel_ledger_failed      stopped; the booking failed and is
+                                        not spooled (usage not metered)
       202 {status:'running',            the wish is recorded, the run is not
            cancel_requested:true}       confirmed stopped yet; GET shows the
                                         end ('cancelled', or 'done' if it
@@ -882,13 +949,7 @@ async def _stop_running(job_id: str, kind: Optional[str]) -> JSONResponse:
 
     status = state["status"]
     if status == store.JOB_STATUS_CANCELLED:
-        logger.info(
-            f"🛑 Async job {job_id} (kind={kind}) cancelled by its owner while "
-            f"running ({'this worker' if local else 'another worker'})"
-        )
-        return JSONResponse(
-            status_code=200, content={"job_id": job_id, "status": store.JOB_STATUS_CANCELLED}
-        )
+        return await _cancelled_answer(job_id, kind, local)
     if status == store.JOB_STATUS_RUNNING:
         logger.warning(
             f"🛑 Async job {job_id} (kind={kind}) not confirmed stopped "
