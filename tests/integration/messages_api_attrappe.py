@@ -8,6 +8,12 @@ Modus "refusal" (BRREFUSAL): jede Anfrage antwortet mit einem angefangenen Text 
 endet mit stop_reason "refusal" samt stop_details (Form wie FK32, Kategorie
 reasoning_extraction). Modus "refusal_dann_ok": die erste Messages-Anfrage so, jede
 weitere normal "OK" — zeigt, ob die CLI nach einem Refusal einen Folgezug schickt.
+Modus "folge:<art>,<art>,..." (BRREFUSAL R2): die n-te Messages-Anfrage bekommt die
+n-te Art, die letzte gilt fuer alle weiteren. Arten: ok, tool (tool_use Read), maxtok
+(Text + max_tokens), refusal (Text, Kategorie reasoning_extraction), cyber (Text,
+Kategorie cyber), cyber_leer (ohne Text, Kategorie cyber). Fuer cyber und ein Refusal
+ohne Text hat die CLI einen Ersatzmodell-Fallback (model_refusal_fallback), fuer
+reasoning_extraction nicht. Das Urteil nennt Art und angefragtes Modell.
 
 Jede Anfrage liegt danach als req-NNN.json im Mitschnittordner, das Urteil daneben.
 Aufruf als Skript: python3 -I messages_api_attrappe.py <port> <ordner> [regel|immer400]
@@ -78,6 +84,10 @@ def handler(out: str, mode: str):
                 self.wfile.write(b'{"input_tokens": 10}')
                 return
             messages_nr = sum(1 for _ in __import__("glob").glob(f"{out}/req-*.verdict")) + 1
+            if mode.startswith("folge:"):
+                arten = mode.split(":", 1)[1].split(",")
+                return self._folge(n, arten[min(messages_nr, len(arten)) - 1],
+                                   json.loads(body).get("model"))
             refusal = mode == "refusal" or (mode == "refusal_dann_ok" and messages_nr == 1)
             if mode in ("regel", "refusal", "refusal_dann_ok"):
                 bad = ttl_violation(json.loads(body)) if mode == "regel" else None
@@ -160,6 +170,55 @@ def handler(out: str, mode: str):
                 ),
                 ("message_stop", {"type": "message_stop"}),
             ]:
+                self.wfile.write(sse(ev, d))
+
+        def _folge(self, n, art, modell):
+            with open(f"{out}/req-{n:03d}.verdict", "w") as f:
+                f.write(f"200 {art} model={modell}")
+            self.send_response(200)
+            self.send_header("content-type", "text/event-stream")
+            self.end_headers()
+            u = {"input_tokens": 5, "output_tokens": 1,
+                 "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0}
+            msg = {"id": f"msg_attrappe_{n}", "type": "message", "role": "assistant",
+                   "model": modell, "content": [], "stop_reason": None,
+                   "stop_sequence": None, "usage": u}
+            evs = [("message_start", {"type": "message_start", "message": msg})]
+            if art == "tool":
+                evs += [
+                    ("content_block_start", {"type": "content_block_start", "index": 0,
+                     "content_block": {"type": "tool_use", "id": f"toolu_attrappe_{n}",
+                                       "name": "Read", "input": {}}}),
+                    ("content_block_delta", {"type": "content_block_delta", "index": 0,
+                     "delta": {"type": "input_json_delta",
+                               "partial_json": json.dumps({"file_path": "/etc/hostname"})}}),
+                    ("content_block_stop", {"type": "content_block_stop", "index": 0}),
+                ]
+                stop = {"stop_reason": "tool_use", "stop_sequence": None}
+            else:
+                text = {"ok": "OK", "maxtok": "Teil A ", "refusal": '<teil nr="1">angefangen',
+                        "cyber": "Teil B angefangen", "cyber_leer": None}[art]
+                if text is not None:
+                    evs += [
+                        ("content_block_start", {"type": "content_block_start", "index": 0,
+                         "content_block": {"type": "text", "text": ""}}),
+                        ("content_block_delta", {"type": "content_block_delta", "index": 0,
+                         "delta": {"type": "text_delta", "text": text}}),
+                        ("content_block_stop", {"type": "content_block_stop", "index": 0}),
+                    ]
+                if art == "ok":
+                    stop = {"stop_reason": "end_turn", "stop_sequence": None}
+                elif art == "maxtok":
+                    stop = {"stop_reason": "max_tokens", "stop_sequence": None}
+                else:
+                    kategorie = "reasoning_extraction" if art == "refusal" else "cyber"
+                    stop = {"stop_reason": "refusal", "stop_sequence": None,
+                            "stop_details": {"type": "refusal", "category": kategorie,
+                                             "explanation": "Attrappe"}}
+            evs += [("message_delta", {"type": "message_delta", "delta": stop,
+                                       "usage": {"output_tokens": 1}}),
+                    ("message_stop", {"type": "message_stop"})]
+            for ev, d in evs:
                 self.wfile.write(sse(ev, d))
 
     return H

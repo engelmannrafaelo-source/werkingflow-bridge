@@ -67,3 +67,68 @@ async def test_normaler_lauf_unberuehrt(cli, attrappe, monkeypatch):  # noqa: F8
     got, err, anfragen = await _lauf(cli, attrappe, monkeypatch, "regel")
     assert err is None and anfragen == ["200"]
     assert any("OK" in str(c) for c in got)
+
+
+# ── BRREFUSAL R2 (BRREFUSALR P1): the CLI's other-model fallback ──────────────
+# Category cyber and a refusal without text have a fallback model in the CLI
+# (model_refusal_fallback); reasoning_extraction (FK32) has none. With only the
+# same-model retry off, the second request went to another model and the run
+# came back as finish_reason=stop. Each form: (attrappe sequence, category).
+ACHT_FORMEN = {
+    "cyber_dann_ok": ("folge:cyber,ok", "cyber"),
+    "ohne_text_dann_ok": ("folge:cyber_leer,ok", "cyber"),
+    "cyber_immer": ("folge:cyber", "cyber"),
+    "cyber_zweimal_dann_ok": ("folge:cyber,cyber,ok", "cyber"),
+    "reasoning_extraction_fk32": ("folge:refusal", "reasoning_extraction"),
+    "cyber_nach_werkzeugzug": ("folge:tool,cyber,ok", "cyber"),
+    "cyber_nach_max_tokens": ("folge:maxtok,cyber,ok", "cyber"),
+    "reasoning_nach_werkzeugzug": ("folge:tool,refusal,ok", "reasoning_extraction"),
+}
+ANGEFRAGT = "claude-sonnet-5-5"
+
+
+def _art(verdict: str) -> str:
+    return verdict.split()[1]
+
+
+@pytest.mark.parametrize("form", list(ACHT_FORMEN))
+async def test_acht_formen_ein_refusal_aufruf_und_422(cli, attrappe, monkeypatch, form):  # noqa: F811
+    """Default (both CLI follow-ups off): the refused request is the LAST one
+    — no retry, no other model — and the run ends as 422 modell_abbruch.
+    Tool turn / max_tokens continuation before it keep their own request."""
+    from src.middleware.bridge_error import CliModellAbbruch
+
+    monkeypatch.delenv("BRIDGE_CLI_REFUSAL_RETRY", raising=False)
+    monkeypatch.delenv("BRIDGE_CLI_REFUSAL_FALLBACK", raising=False)
+    mode, kategorie = ACHT_FORMEN[form]
+    got, err, anfragen = await _lauf(cli, attrappe, monkeypatch, mode)
+    vorlauf = [a for a in mode.split(":", 1)[1].split(",") if a in ("tool", "maxtok")]
+    arten = [_art(a) for a in anfragen]
+    assert arten == vorlauf + [arten[-1]], anfragen
+    assert arten[-1] in ("refusal", "cyber", "cyber_leer"), anfragen
+    assert all(a.endswith(f"model={ANGEFRAGT}") for a in anfragen), anfragen
+    assert isinstance(err, CliModellAbbruch), (err, anfragen)
+    assert err.refusal["category"] == kategorie
+    assert err.refusal["quelle"] in ("model_refusal_no_fallback", "api_error_turn")
+    antwort = err.envelope()
+    assert antwort.status_code == 422 and "retry-after" not in antwort.headers
+
+
+async def test_ersatzmodell_wird_nie_als_antwort_angenommen(cli, attrappe, monkeypatch):  # noqa: F811
+    """Second net: a CLI that falls back anyway (here: the bridge switch lets
+    it) — model_refusal_fallback ends the run as modell_abbruch, and nothing
+    the fallback model writes reaches the caller."""
+    from src.middleware.bridge_error import CliModellAbbruch
+
+    monkeypatch.delenv("BRIDGE_CLI_REFUSAL_RETRY", raising=False)
+    monkeypatch.setenv("BRIDGE_CLI_REFUSAL_FALLBACK", "true")
+    got, err, anfragen = await _lauf(cli, attrappe, monkeypatch, "folge:cyber,ok")
+    assert isinstance(err, CliModellAbbruch), (err, anfragen)
+    assert err.refusal["quelle"] == "model_refusal_fallback"
+    assert err.refusal["fallback_model"] and err.refusal["fallback_model"] != ANGEFRAGT
+    assert err.envelope().status_code == 422
+    texte = [
+        b.get("text") if isinstance(b, dict) else getattr(b, "text", None)
+        for c in got if isinstance(c, dict) for b in (c.get("content") or [])
+    ]
+    assert "OK" not in texte, texte

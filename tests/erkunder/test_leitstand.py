@@ -47,8 +47,9 @@ def body(ident="bericht-123", files=None, token="secret"):
 
 
 class Places:
-    def __init__(self, failures=None, review="trägt", hold=False):
+    def __init__(self, failures=None, review="trägt", hold=False, grund="zeit"):
         self.failures = failures or {}
+        self.grund = grund
         self.review = review
         self.hold = hold
         self.calls = []
@@ -104,7 +105,7 @@ class Places:
                 "zustand": "abbruch" if failed else "fertig",
                 "meta": {
                     "status": "abbruch" if failed else "ok",
-                    "abbruch_grund": "zeit" if failed else None,
+                    "abbruch_grund": self.grund if failed else None,
                 },
             },
         )

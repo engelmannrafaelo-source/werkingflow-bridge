@@ -772,8 +772,9 @@ class CliModellAbbruch(CliApiError):
     were a capacity shortage.
 
     Recognised from structured CLI fields only (claude_cli.cli_refusal_signal):
-    the API-error turn's stop_reason "refusal", or the CLI's system message
-    subtype "model_refusal_no_fallback" — never from the sentence.
+    the API-error turn's stop_reason (or stop_details.type) "refusal", or the
+    CLI's system message subtype "model_refusal_no_fallback" /
+    "model_refusal_fallback" — never from the sentence.
 
     422, not 409 or 429: the request was understood and cannot be served as it
     stands (Unprocessable Content). 429/5xx mean "come back later" to every
@@ -788,8 +789,9 @@ class CliModellAbbruch(CliApiError):
     def __init__(self, status: Optional[int], cli_error: Optional[str], text: str,
                  worker_id: str, refusal: Dict[str, Any]) -> None:
         super().__init__(status, cli_error, text, worker_id)
-        # {"stop_reason", "category", "quelle"} — quelle names which CLI field
-        # carried the refusal (api_error_turn / model_refusal_no_fallback).
+        # {"stop_reason", "category", "quelle"[, "fallback_model", …]} — quelle
+        # names which CLI field carried the refusal (api_error_turn /
+        # model_refusal_no_fallback / model_refusal_fallback).
         self.refusal = dict(refusal)
         self.retryable = False
         self.retry_after_s = None
@@ -813,6 +815,9 @@ class CliModellAbbruch(CliApiError):
                 "stop_reason": self.refusal.get("stop_reason") or "refusal",
                 "category": self.refusal.get("category"),
                 "refusal_quelle": self.refusal.get("quelle"),
+                # model_refusal_fallback: the model the CLI wanted to hand the
+                # request to (BRREFUSALR P1); null otherwise.
+                "fallback_model": self.refusal.get("fallback_model"),
                 "upstream_status": self.status,
                 "cli_error": self.cli_error,
             },

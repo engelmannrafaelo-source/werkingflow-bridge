@@ -763,6 +763,7 @@ async def erkunder_executor(
                         "zeit",
                         "speicher",
                         "cli_fehler",
+                        "modell_abbruch",
                         "geheimnis_im_ergebnis",
                         "platz_neustart",
                         "Ergebnis-Integritaet",
@@ -790,6 +791,16 @@ async def erkunder_executor(
                         }
                         else "unbekannt"
                     )
+                    if known == "modell_abbruch":
+                        # Same code and verdict as every other bridge path
+                        # (BRREFUSALR P2-c): final, named in the job details.
+                        from src.error_contract import JobFailure
+
+                        raise JobFailure(
+                            f"erkunder abbruch: {safe_step}: {known}",
+                            retryable=False,
+                            details={"fehler_code": known},
+                        )
                     raise RuntimeError(f"erkunder abbruch: {safe_step}: {known}")
                 if state["zustand"] != "laeuft":
                     raise RuntimeError("Erkunder: ungueltiger Zustand")

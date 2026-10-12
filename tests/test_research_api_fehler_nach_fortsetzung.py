@@ -204,3 +204,39 @@ async def test_brtrunc2_echter_strom_abbruch_immer(monkeypatch, tmp_path):
     assert res.teilantwort == _ANFANG + "T-weiter " * 3
     assert "API Error" not in res.teilantwort
     assert res.content is None
+
+
+# --- BRREFUSAL R2 (BRREFUSALR P2-e): a refusal in the continuation -------------
+
+
+def _refusal_fehlerframe():
+    msg = sdk.AssistantMessage(
+        content=[sdk.TextBlock(text="Claude's safeguards flagged this message.")],
+        model="<synthetic>",
+    )
+    msg._bridge_cli_error = "unknown"
+    msg._bridge_is_api_error_message = True
+    msg._bridge_stop_reason = "refusal"
+    msg._bridge_stop_details = {"type": "refusal", "category": "cyber"}
+    return msg
+
+
+async def test_refusal_in_der_fortsetzung_bleibt_modell_abbruch(monkeypatch, tmp_path):
+    """Under antwort_im_text the continuation was refused: the classifier
+    ended the answer, not its length — named modell_abbruch, final, and the
+    end of the answer still reported."""
+    monkeypatch.delenv("BRIDGE_CLI_REFUSAL_RETRY", raising=False)
+    msgs = [
+        sdk.init(),
+        _text(_ANFANG),
+        UserMessage(content=[sdk.TextBlock(text=_META_TURN)]),
+        _text(_REST),
+        _refusal_fehlerframe(),
+        _api_fehler_result(),
+    ]
+    res = await _research(monkeypatch, tmp_path, msgs, _req())
+    assert res.status == "error"
+    assert res.fehler_code == "modell_abbruch"
+    assert res.retryable is False
+    assert res.antwort_ende == "max_tokens_fortgesetzt"
+    assert res.content is None

@@ -520,6 +520,10 @@ class Coordinator:
             self.save(ident)
             if record["status"] == "ok":
                 return
+            if record["abbruch_grund"] == "modell_abbruch":
+                # The model refused (BRREFUSALR P2-c): a second attempt sends
+                # the same prompt to the same classifier.
+                break
         reason = next(
             s["abbruch_grund"] for s in reversed(state["schritte"]) if s["name"] == name
         )

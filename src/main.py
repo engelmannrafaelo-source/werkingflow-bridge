@@ -2407,7 +2407,8 @@ async def generate_streaming_response(
                         # BRREFUSAL: why the stream ended, when the model refused
                         **({"stop_reason": _refusal.get("stop_reason"),
                             "category": _refusal.get("category"),
-                            "refusal_quelle": _refusal.get("quelle")}
+                            "refusal_quelle": _refusal.get("quelle"),
+                            "fallback_model": _refusal.get("fallback_model")}
                            if (_refusal := getattr(sdk_stream_error, "refusal", None)) else {}),
                     },
                 )
@@ -5319,7 +5320,10 @@ async def _research_strom(strom, antwort_im_text: bool):
     fixture abbruch_immer). Then the answer is cut off: under antwort_im_text
     the truncation verdict holds (fehler_code, not retryable — the same
     request breaks the same way), the API error stays its cause. Otherwise
-    the CliApiError goes on, carrying antwort_ende for the error response."""
+    the CliApiError goes on, carrying antwort_ende for the error response.
+    A model refusal (CliModellAbbruch) always goes on as itself, also after a
+    continuation: the classifier, not the length, ended the answer
+    (BRREFUSALR P2-e) — fehler_code modell_abbruch, not antwort_abgeschnitten."""
     from src.claude_cli import antwort_abgeschnitten, antwort_ende
 
     seen: List[Dict[str, Any]] = []
@@ -5330,7 +5334,8 @@ async def _research_strom(strom, antwort_im_text: bool):
     except CliApiError as e:
         ende = antwort_ende(seen)
         e.antwort_ende = ende
-        if antwort_im_text and antwort_abgeschnitten(ende):
+        if (antwort_im_text and antwort_abgeschnitten(ende)
+                and not isinstance(e, CliModellAbbruch)):
             truncated = ResearchAnswerTruncated(
                 f"Research answer cut off (antwort_ende={ende}): the CLI continued "
                 f"a cut answer and the continuation ended in an API error ({e}). "
@@ -6632,6 +6637,7 @@ async def _modell_abbruch_buchen(
             "stop_reason": refusal.get("stop_reason"),
             "category": refusal.get("category"),
             "refusal_quelle": refusal.get("quelle"),
+            "fallback_model": refusal.get("fallback_model"),
             "usage_vorenthalten": getattr(e, "usage", None),
         },
     )

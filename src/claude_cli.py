@@ -636,6 +636,12 @@ def detect_cli_api_error(message: Any) -> Optional[Dict[str, Any]]:
             details = get("stop_details")
             turn["stop_reason"] = get("stop_reason")
             turn["category"] = details.get("category") if isinstance(details, dict) else None
+        details = get("stop_details")
+        if isinstance(details, dict) and details.get("type") is not None:
+            # BRREFUSALR P2-d: stop_details.type is the second field that
+            # names the refusal (lauf_abschluss.ist_modell_abbruch reads both).
+            turn["stop_details_type"] = details.get("type")
+            turn.setdefault("category", details.get("category"))
         return turn
     if is_result:
         status = get("api_error_status")
@@ -667,58 +673,49 @@ def detect_cli_api_error(message: Any) -> Optional[Dict[str, Any]]:
 # it back in every path (lauf_abschluss.AbbruchFilter). Only a refusal is
 # affected; every other multi-turn run (tools, max_output_tokens continuation)
 # keeps its turns.
+#
+# CLAUDE_CODE_DISABLE_REFUSAL_FALLBACK (same CLI versions, BRREFUSALR R1 P1)
+# switches the CLI's second refusal mechanism off: the retry on ANOTHER model
+# (system message "model_refusal_fallback", direction "retry", fields
+# original_model / fallback_model / api_refusal_category). It is independent
+# of the same-model retry (bundle: wL(){return!…DISABLE_REFUSAL_FALLBACK&&…}).
+# Measured with the real CLI against the Messages-API mock: category cyber and
+# a refusal without text went to the fallback model when only the retry was
+# off, and the run came back as finish_reason=stop — refused beginning plus
+# the fallback model's answer, under the requested model's name.
+# reasoning_extraction (FK32) has no fallback, which is why it did not show.
 # =============================================================================
-CLI_REFUSAL_NO_FALLBACK_SUBTYPE = "model_refusal_no_fallback"
-CLI_DISABLE_REFUSAL_RETRY_ENV = "CLAUDE_CODE_DISABLE_REFUSAL_RETRY"
-# Switch for the bridge: "true" lets the CLI retry after a refusal again
-# (pre-BRREFUSAL behaviour). Default: retry off.
-BRIDGE_CLI_REFUSAL_RETRY_ENV = "BRIDGE_CLI_REFUSAL_RETRY"
-
-
-def cli_refusal_retry_allowed() -> bool:
-    return os.getenv(BRIDGE_CLI_REFUSAL_RETRY_ENV, "false").strip().lower() in ("true", "1", "yes")
+# Switches and the system-message recogniser live in src/cli_refusal.py: the
+# explorer's CLI path (src/erkunder/kind.py) needs them without this module.
+from src.cli_refusal import (  # noqa: E402,F401  (re-exported)
+    BRIDGE_CLI_REFUSAL_FALLBACK_ENV,
+    BRIDGE_CLI_REFUSAL_RETRY_ENV,
+    CLI_DISABLE_REFUSAL_FALLBACK_ENV,
+    CLI_DISABLE_REFUSAL_RETRY_ENV,
+    CLI_REFUSAL_FALLBACK_SUBTYPE,
+    CLI_REFUSAL_NO_FALLBACK_SUBTYPE,
+    cli_refusal_fallback_allowed,
+    cli_refusal_retry_allowed,
+    cli_refusal_signal,
+    refusal_policy_env,
+)
 
 
 def apply_refusal_retry_policy(options: "ClaudeCodeOptions") -> None:
-    """Switch the CLI's same-model retry after a refusal off for this run's
-    subprocess (options.env, like apply_thinking_budget), unless
-    BRIDGE_CLI_REFUSAL_RETRY allows it."""
-    if cli_refusal_retry_allowed():
-        logger.info(f"↩️ {BRIDGE_CLI_REFUSAL_RETRY_ENV}=true — CLI may retry after a refusal")
-        return
-    options.env = {**(options.env or {}), CLI_DISABLE_REFUSAL_RETRY_ENV: "1"}
+    """Switch the CLI's refusal follow-ups (same-model retry, other-model
+    fallback) off for this run's subprocess (options.env, like
+    apply_thinking_budget), unless the bridge switches allow them."""
+    options.env = {**(options.env or {}), **refusal_policy_env()}
 
 
 def cli_refusal_signal_of_turn(turn: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
     """Refusal signal of a withheld API-error turn (detect_cli_api_error):
-    its stop_reason is "refusal". None otherwise."""
-    if not turn or turn.get("stop_reason") not in MODELL_ABBRUCH_STOP_REASONS:
+    its stop_reason or stop_details.type is "refusal". None otherwise."""
+    if not turn or (turn.get("stop_reason") not in MODELL_ABBRUCH_STOP_REASONS
+                    and turn.get("stop_details_type") not in MODELL_ABBRUCH_STOP_REASONS):
         return None
-    return {"stop_reason": turn["stop_reason"], "category": turn.get("category"),
+    return {"stop_reason": "refusal", "category": turn.get("category"),
             "quelle": "api_error_turn"}
-
-
-def cli_refusal_signal(message: Any) -> Optional[Dict[str, Any]]:
-    """{stop_reason, category, quelle} if `message` is the CLI's system message
-    "model_refusal_no_fallback", else None. SDK form: SystemMessage(subtype,
-    data); dict form: {"type": "system", "subtype": ..., ...} or with "data"."""
-    if message is None:
-        return None
-    if isinstance(message, dict):
-        subtype = message.get("subtype")
-        data = message.get("data") if isinstance(message.get("data"), dict) else message
-        if message.get("type") not in (None, "system") and data.get("type") != "system":
-            return None
-    else:
-        if type(message).__name__ != "SystemMessage":
-            return None
-        subtype = getattr(message, "subtype", None)
-        data = getattr(message, "data", None)
-        data = data if isinstance(data, dict) else {}
-    if subtype != CLI_REFUSAL_NO_FALLBACK_SUBTYPE:
-        return None
-    return {"stop_reason": "refusal", "category": data.get("api_refusal_category"),
-            "quelle": CLI_REFUSAL_NO_FALLBACK_SUBTYPE}
 
 
 def raise_cli_api_error(worker_id: str, turn: Optional[Dict[str, Any]],
@@ -2650,12 +2647,23 @@ class ClaudeCodeCLI:
                             if _refusal is not None:
                                 _refusal_signal = _refusal
                                 logger.warning(
-                                    f"🛑 CLI model_refusal_no_fallback in session {cli_session_id} "
+                                    f"🛑 CLI {_refusal['quelle']} in session {cli_session_id} "
                                     f"(category={_refusal.get('category')}) — the run ends as a "
                                     f"model refusal",
                                     extra={"cli_session_id": cli_session_id,
                                            "modell_abbruch": True},
                                 )
+                                if _refusal["quelle"] == CLI_REFUSAL_FALLBACK_SUBTYPE:
+                                    # BRREFUSALR P1, second net: the CLI hands the
+                                    # request to another model (the switch is off
+                                    # or a CLI ignores it). Stop here — nothing the
+                                    # other model writes may go out as this run's
+                                    # answer, under this run's model.
+                                    raise_cli_api_error(
+                                        os.environ.get("INSTANCE_NAME", "unknown"),
+                                        _api_error_turn, None, usage=_result_usage,
+                                        refusal=_refusal,
+                                    )
 
                             _api_error = detect_cli_api_error(message)
                             if _api_error is not None:

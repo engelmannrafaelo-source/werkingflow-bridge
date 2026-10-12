@@ -8,6 +8,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
+from src.cli_refusal import cli_refusal_signal, refusal_policy_env
 from src.sdk_parser import install_resilient_parser
 
 ALLOWED_TOOLS = ["Bash", "Read", "Write", "Edit", "Glob", "Grep", "LS"]
@@ -45,6 +46,18 @@ DISALLOWED_TOOLS = [
     "ReportFindings",
     "ListAgents",
 ]
+
+
+# Abbruchgrund, wenn das Modell verweigert (BRREFUSALR P2-c): derselbe Code
+# wie auf allen anderen Bridge-Wegen (bridge_error.REASON_MODELL_ABBRUCH).
+MODELL_ABBRUCH = "modell_abbruch"
+
+
+class ModellAbbruch(RuntimeError):
+    """The CLI reported a refusal (model_refusal_no_fallback /
+    model_refusal_fallback). The step ends here: whatever a fallback model
+    would write is no answer to this step, and the same prompt meets the same
+    classifier again."""
 
 
 LESEWERKZEUGE = {"Read": "read", "Grep": "grep", "Glob": "glob"}
@@ -108,6 +121,8 @@ def sdk_options(body: dict[str, Any]) -> Any:
             "CLAUDE_CODE_OAUTH_TOKEN": body["claude_token"],
             "MPLCONFIGDIR": f"{home}/mpl",
             "PATH": "/opt/rechnen/bin:/usr/local/bin:/usr/bin:/bin",
+            # No same-model retry and no other-model fallback after a refusal.
+            **refusal_policy_env(),
         },
     )
 
@@ -119,6 +134,8 @@ async def run(body: dict[str, Any]) -> dict[str, Any]:
     result = None
     zugriffe: list[dict[str, str]] = []
     async for message in query(prompt=body["prompt"], options=sdk_options(body)):
+        if cli_refusal_signal(message) is not None:
+            raise ModellAbbruch(MODELL_ABBRUCH)
         if isinstance(message, AssistantMessage):
             for block in message.content:
                 if isinstance(block, ToolUseBlock):
@@ -142,6 +159,8 @@ async def run(body: dict[str, Any]) -> dict[str, Any]:
 
 def failure_reason(error: Exception) -> str:
     """Return a status-safe reason without serializing SDK payloads or prompts."""
+    if isinstance(error, ModellAbbruch):
+        return MODELL_ABBRUCH
     return f"cli_fehler: SDK-Lauf: {type(error).__name__}"
 
 
