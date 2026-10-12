@@ -821,6 +821,7 @@ async def internal_list_jobs(
     user_id: Optional[str] = None,
     status: Optional[str] = None,
     limit: int = 50,
+    viewer_owner: Optional[str] = None,
     _claims: AuthClaims = Depends(require_service_token),
 ) -> Dict[str, Any]:
     """List projection, scoped. ValueError from the store (missing scope, bad
@@ -829,10 +830,16 @@ async def internal_list_jobs(
     from src.jobs import store
 
     try:
-        jobs = await store.list_jobs(app_id=app_id, user_id=user_id, status=status, limit=limit)
+        jobs = await store.list_jobs(
+            app_id=app_id, user_id=user_id, status=status, limit=limit,
+            viewer_owner=viewer_owner,
+        )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
-    return {"jobs": jobs}
+    # IDEMR R2: tells the worker the keyed-job filter was applied. A
+    # platform-api without it ignores viewer_owner and would list foreign
+    # keyed jobs — the worker refuses such an answer.
+    return {"jobs": jobs, "keyed_owner_filter": True}
 
 
 @router.get("/jobs/{job_id}")

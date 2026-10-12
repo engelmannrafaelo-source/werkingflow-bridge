@@ -69,7 +69,10 @@ class _PlatformApi:
         if path == "/v1/internal/jobs" and method == "POST":
             return PlatformResponse(204, None)
         if path == "/v1/internal/jobs" and method == "GET":
-            return PlatformResponse(200, {"jobs": [{"job_id": "job_1", "created_at": "2026-08-31T04:00:00+00:00"}]})
+            return PlatformResponse(200, {
+                "jobs": [{"job_id": "job_1", "created_at": "2026-08-31T04:00:00+00:00"}],
+                "keyed_owner_filter": True,  # IDEMR R2: platform confirms the filter
+            })
         if path == "/v1/internal/jobs/job_x":
             return PlatformResponse(200, {"job": {
                 "job_id": "job_x", "kind": "ping", "status": "pending",

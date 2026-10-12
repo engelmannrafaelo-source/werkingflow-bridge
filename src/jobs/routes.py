@@ -170,6 +170,23 @@ def _idempotency_owner(request: Request) -> str:
     return "v1:" + h.hexdigest()
 
 
+def _visible_to_caller(job: Optional[Dict[str, Any]], request: Request) -> bool:
+    """THE ownership boundary of a keyed job (IDEMR R2) — every public access
+    to a single job goes through here (GET, DELETE); the list applies the same
+    rule in SQL with the same owner (store.list_jobs viewer_owner).
+
+    A job created under an Idempotency-Key (migration 065) is visible only to
+    the owner that created it: its id can be learned by retrying someone
+    else's key, so the id alone must open nothing. Anyone else is told what
+    an unknown id is told. Unkeyed jobs: always True here — their access
+    rules stay as they were (GET by id is a capability, DELETE checks
+    _caller_owns)."""
+    if not job:
+        return False
+    held = job.get("idempotency_owner")
+    return not held or held == _idempotency_owner(request)
+
+
 def _key_reused(key: str, owner: str, held_by: str) -> JSONResponse:
     logger.warning(
         "job submission refused — Idempotency-Key reused with a different "
@@ -483,7 +500,11 @@ async def list_jobs_endpoint(
                 ),
             )
 
-    jobs = await store_client.list_jobs(app_id=app_id, user_id=user_id, status=status, limit=limit)
+    # Keyed jobs only for their owner — the rule of _visible_to_caller, in SQL.
+    jobs = await store_client.list_jobs(
+        app_id=app_id, user_id=user_id, status=status, limit=limit,
+        viewer_owner=_idempotency_owner(request),
+    )
     return {"jobs": jobs}
 
 
@@ -565,12 +586,7 @@ async def get_job_endpoint(
         return guard
 
     job = await store_client.get_job(job_id)
-    # A keyed job (migration 065) answers only its owner (IDEMR): its id can be
-    # learned from a guessed key, so the id alone must not open it. Anyone else
-    # gets exactly the 404 of an unknown id. Unkeyed jobs: unchanged.
-    if job and job.get("idempotency_owner") and (
-        job["idempotency_owner"] != _idempotency_owner(request)
-    ):
+    if not _visible_to_caller(job, request):
         job = None
     if not job:
         raise HTTPException(
@@ -700,7 +716,7 @@ async def cancel_job_endpoint(
     job = await store_client.get_job(job_id)
     if not job:
         return _job_not_found(job_id)
-    if not _caller_owns(job, request):
+    if not _visible_to_caller(job, request) or not _caller_owns(job, request):
         # Server-side only: the wire answer is the plain not-found above.
         logger.warning(
             "job cancel refused — caller is not the owner of %s (answered 404)", job_id

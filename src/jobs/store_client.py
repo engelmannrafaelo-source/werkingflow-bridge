@@ -543,7 +543,11 @@ async def list_jobs(
     user_id: Optional[str] = None,
     status: Optional[str] = None,
     limit: int = 50,
+    viewer_owner: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
+    """viewer_owner (IDEMR R2): keyed jobs only for this owner. A platform-api
+    that does not confirm the filter (keyed_owner_filter) predates it and may
+    have listed foreign keyed jobs — refused loudly, never passed on."""
     params: Dict[str, Any] = {"limit": limit}
     if app_id is not None:
         params["app_id"] = app_id
@@ -551,18 +555,29 @@ async def list_jobs(
         params["user_id"] = user_id
     if status is not None:
         params["status"] = status
+    if viewer_owner is not None:
+        params["viewer_owner"] = viewer_owner
     try:
         resp = await call_platform(
             "GET", "/v1/internal/jobs", params=params, timeout_s=_READ_TIMEOUT_S
         )
     except PlatformUnavailable as e:
         _fallback_or_raise("list_jobs", e)
-        return await store.list_jobs(app_id=app_id, user_id=user_id, status=status, limit=limit)
+        return await store.list_jobs(
+            app_id=app_id, user_id=user_id, status=status, limit=limit,
+            viewer_owner=viewer_owner,
+        )
     if resp.status_code == 400:
         # The internal route maps the store's ValueError to 400 — re-raise as
         # the same type so both stages present one contract to routes.py.
         detail = (resp.json or {}).get("detail") if isinstance(resp.json, dict) else None
         raise ValueError(detail or "invalid list_jobs arguments")
-    if resp.status_code == 200 and isinstance(resp.json, dict) and isinstance(resp.json.get("jobs"), list):
-        return resp.json["jobs"]
+    body = resp.json if isinstance(resp.json, dict) else {}
+    if resp.status_code == 200 and isinstance(body.get("jobs"), list):
+        if body.get("keyed_owner_filter") is not True:
+            raise IdempotencyUnsupported(
+                "job store list_jobs: platform-api did not confirm the keyed-job "
+                "owner filter — it predates IDEMR R2; listing refused"
+            )
+        return body["jobs"]
     raise _unexpected("list_jobs", resp.status_code, resp.json)

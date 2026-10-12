@@ -301,4 +301,10 @@ def test_list_passes_correct_params_to_store(client):
         resp = client.get("/v1/jobs?app_id=myapp&status=done&limit=25")
 
     assert resp.status_code == 200
-    mock_list.assert_awaited_once_with(app_id="myapp", user_id=None, status="done", limit=25)
+    mock_list.assert_awaited_once()
+    kw = mock_list.await_args.kwargs
+    assert {k: kw[k] for k in ("app_id", "user_id", "status", "limit")} == {
+        "app_id": "myapp", "user_id": None, "status": "done", "limit": 25,
+    }
+    # IDEMR R2: the caller's owner always goes along (keyed jobs only for it).
+    assert kw["viewer_owner"].startswith("v1:")

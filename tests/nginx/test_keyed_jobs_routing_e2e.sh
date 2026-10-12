@@ -28,10 +28,16 @@ WORK="$(mktemp -d)"
 FAILURES=0
 STUBS="worker1 worker2 worker3 worker4 backup-host"
 PORT=$((19000 + SUFFIX % 800))
+# Own subnet outside every trusted range of nginx.conf; the ONE trusted sender
+# (stands for the peer LB / a worker re-dispatch) is a client container with a
+# fixed address. Requests from this host via the published port are external.
+NET_OCTET=$((10 + SUFFIX % 200))
+SUBNET="10.231.$NET_OCTET.0/24"
+TRUSTED_IP="10.231.$NET_OCTET.250"
 URL="http://127.0.0.1:$PORT"
 
 cleanup() {
-    for s in $STUBS nginx; do docker rm -f "kj-$s-$SUFFIX" >/dev/null 2>&1; done
+    for s in $STUBS nginx trusted; do docker rm -f "kj-$s-$SUFFIX" >/dev/null 2>&1; done
     docker network rm "$NET" >/dev/null 2>&1
 }
 [ -n "${KEEP:-}" ] || trap 'cleanup; rm -rf "$WORK"' EXIT
@@ -154,9 +160,10 @@ start_stack() { # <primary|prod>
     local topo="$1" id=dev
     [ "$topo" = prod ] && id=prod
     cleanup
-    docker network create "$NET" >/dev/null
-    sed "s/\${BRIDGE_ID}/$id/g; s/\${BRIDGE_BACKUP_HOST}/192.0.2.10/g; s/\${METRICS_READER_TARGET}/metrics-elsewhere:8000/g" \
+    docker network create --subnet "$SUBNET" "$NET" >/dev/null
+    sed "s/\${BRIDGE_ID}/$id/g; s/\${BRIDGE_BACKUP_HOST}/192.0.2.10/g; s/\${METRICS_READER_TARGET}/metrics-elsewhere:8000/g; s#172\.16\.0\.0/12  1;#$TRUSTED_IP/32 1;#" \
         "$D/nginx.conf" > "$WORK/nginx.conf"
+    grep -q "$TRUSTED_IP/32 1;" "$WORK/nginx.conf" || { echo "ABORT: trusted range not found in nginx.conf"; exit 2; }
     # Worker addresses of the production file → the stub aliases worker1..4.
     sed -E "s/\\$\\{BRIDGE_BACKUP_HOST\\}/backup-host/g; s/\\$\\{BRIDGE_ID\\}/$id/g; s/[0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+:800([1-4])/worker\\1:8000/g" \
         "$D/upstreams-$topo.conf" > "$WORK/upstreams.conf"
@@ -222,6 +229,18 @@ post() { # <outfile> <key or -> [extra curl args...] → http code
         --data '{"kind":"chat","payload":{"text":"hallo"}}'
 }
 
+post_trusted() { # like post, but from the trusted sender inside the network
+    local out="$1" key="$2"; shift 2
+    local kh=()
+    [ "$key" != "-" ] && kh=(-H "Idempotency-Key: $key")
+    docker run --rm --name "kj-trusted-$SUFFIX" --network "$NET" --ip "$TRUSTED_IP" \
+        --memory 32m --entrypoint sh -v "$WORK:/w" $IMG -c \
+        "curl -s -m 60 -o /w/$(basename "$out") -D /w/$(basename "$out").h -w '%{http_code}' \
+         -X POST http://kj-nginx-$SUFFIX:80/v1/jobs -H 'Content-Type: application/json' \
+         $(printf "'%s' " "${kh[@]}" "$@") \
+         --data '{\"kind\":\"chat\",\"payload\":{\"text\":\"hallo\"}}'"
+}
+
 field() { python3 -c "
 import json
 try: v = json.load(open('$1'))
@@ -281,14 +300,22 @@ echo "=== 4. peer verdict on the request passes through ==="
 c=$(post "$O" K6 -H "X-Stub-Peer: e422"); check "K6 422 passes" "$c" = 422
 check "K6 no local POST" "$(hits K6 $LOCAL)" -eq 0
 
-echo "=== 5. key + hopped → local workers (this IS the fixed bridge) ==="
-c=$(post "$O" K7 -H "X-Bridge-Hop: 1"); check "K7 hopped: local" "$(hits K7 $LOCAL)" -eq 1
+echo "=== 5. key + hop from a TRUSTED sender → local workers (this IS the fixed bridge) ==="
+c=$(post_trusted "$O" K7 -H "X-Bridge-Hop: 1"); check "K7 hopped: local" "$(hits K7 $LOCAL)" -eq 1
 check "K7 hopped: peer untouched" "$(hits K7 backup-host)" -eq 0
 check "K7 hopped: status" "$c" = 201
-c=$(post "$O" K7b -H "X-Bridge-Hop: 1" -H "X-Stub-Local: workers429")
+c=$(post_trusted "$O" K7b -H "X-Bridge-Hop: 1" -H "X-Stub-Local: workers429")
 check "K7b hopped, all local 429: status" "$c" = 429
 check "K7b every local worker asked (429 retry)" "$(hits K7b $LOCAL)" -eq 4
 check "K7b peer untouched" "$(hits K7b backup-host)" -eq 0
+
+echo "=== IDEMR R2: hop header from an EXTERNAL sender changes nothing ==="
+c=$(post "$O" KH); check "KH without hop: peer" "$c" = 201
+a=$(field "$O" job_id)
+c=$(post "$O" KH -H "X-Bridge-Hop: 1"); check "KH with forged hop: replay at the peer" "$c" = 200
+check "KH same job" "$(field "$O" job_id)" = "$a"
+check "KH local POSTs" "$(hits KH $LOCAL)" -eq 0
+c=$(post "$O" - -H "X-Bridge-Hop: 1"); check "unkeyed forged hop: ignored, peer first" "$(field "$O" worker)" = backup-host
 
 echo "=== 6. without key: unchanged ==="
 c=$(post "$O" - -H "X-Stub-Peer: pool_exhausted"); check "no key, peer 429 → local (as before)" "$(field "$O" worker)" != backup-host

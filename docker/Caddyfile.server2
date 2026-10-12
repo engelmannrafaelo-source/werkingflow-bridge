@@ -17,5 +17,9 @@ prod-bridge.werking.tools {
 	# Caddyfile.hetzner (identischer Fall).
 	reverse_proxy nginx:80 {
 		header_up -X-Bridge-Origin
+		# IDEMR R2: the hop decides which bridge holds an Idempotency-Key —
+		# never from outside (nginx honors it only from trusted senders, and
+		# Caddy itself is one).
+		header_up -X-Bridge-Hop
 	}
 }

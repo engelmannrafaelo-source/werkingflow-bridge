@@ -15,9 +15,13 @@ bridge.werking.tools {
 	# ADR-0011: Caddy wohnt im Docker-Netz — sein remote_addr faellt beim LB
 	# in den vertrauten Bereich. Ohne diesen Strip koennte JEDER externe
 	# HTTPS-Client einen X-Bridge-Origin faelschen und damit umleiten,
-	# wessen Budget zahlt. X-Bridge-Hop bleibt bewusst durchgelassen
-	# (Faelschung = nur Selbstbeschraenkung, ADR-0010).
+	# wessen Budget zahlt. Seit IDEMR R2 wird auch X-Bridge-Hop entfernt:
+	# er entscheidet, welche Bridge einen Idempotency-Key haelt.
 	reverse_proxy nginx:80 {
 		header_up -X-Bridge-Origin
+		# IDEMR R2: the hop decides which bridge holds an Idempotency-Key —
+		# never from outside (nginx honors it only from trusted senders, and
+		# Caddy itself is one).
+		header_up -X-Bridge-Hop
 	}
 }

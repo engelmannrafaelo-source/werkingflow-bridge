@@ -767,8 +767,14 @@ async def list_jobs(
     user_id: Optional[str] = None,
     status: Optional[str] = None,
     limit: int = 50,
+    viewer_owner: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     """Return up to `limit` jobs scoped to app_id/user_id, newest first.
+
+    Keyed jobs (migration 065) are listed only for their owner: a row with an
+    idempotency_owner appears only when it equals viewer_owner — with
+    viewer_owner None, no keyed row appears at all (IDEMR R2). Unkeyed rows
+    are unaffected.
 
     Requires at least one of app_id/user_id — raises ValueError otherwise.
     limit is capped at 200; an out-of-range value raises ValueError.
@@ -799,6 +805,14 @@ async def list_jobs(
     if status is not None:
         params.append(status)
         conditions.append(f"status = ${len(params)}")
+
+    if viewer_owner is None:
+        conditions.append("idempotency_owner IS NULL")
+    else:
+        params.append(viewer_owner)
+        conditions.append(
+            f"(idempotency_owner IS NULL OR idempotency_owner = ${len(params)})"
+        )
 
     params.append(limit)
     limit_placeholder = f"${len(params)}"
