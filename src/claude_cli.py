@@ -193,16 +193,24 @@ def _apply_open_process_patch() -> None:
 # (its comment promises a timeout, the code has none). A CLI that does not
 # react to SIGTERM kept the aborted run — and the request — hanging after the
 # research deadline (Codex BRLZR, measured with a SIGTERM-ignoring process).
-# So close() is bounded here: SIGTERM, at most CLI_TERM_GRACE_S, then SIGKILL
-# to the CLI's whole process group (its children included), then reap.
+# So close() is bounded here, in two steps:
+#   1. the CLI itself: SIGTERM (the SDK), at most CLI_TERM_GRACE_S, then
+#      SIGKILL, reap within CLI_KILL_REAP_S;
+#   2. ALWAYS its process group, whatever the CLI's own exit (BRLZR R2): a
+#      CLI that has already ended can leave a child behind that holds stdout
+#      open — the SDK then waits on it until the deadline, and the child's work
+#      runs on. SIGTERM to the group, at most CLI_TERM_GRACE_S, then SIGKILL,
+#      at most CLI_KILL_REAP_S. The group stays registered until it is empty.
+# Worst case 2 × (grace + reap) = 30 s with the defaults, inside the 100 s
+# between the research deadline (3300 s) and the cross-worker wait (3400 s).
 CLI_TERM_GRACE_S = float(os.getenv("BRIDGE_CLI_TERM_GRACE_S", "10"))
 CLI_KILL_REAP_S = 5.0
 # pids of CLI processes started in a session of their own (pgid == pid). Only
-# these groups are ever killed — never a group this module did not create.
+# these groups are ever signalled — never a group this module did not create.
 _OWN_SESSION_PIDS: set = set()
 
 
-def _kill_own_group(pid: int) -> None:
+def _kill_own_group(pid: int, sig: Optional[int] = None) -> None:
     import signal
 
     if pid not in _OWN_SESSION_PIDS:
@@ -210,9 +218,68 @@ def _kill_own_group(pid: int) -> None:
     if pid == os.getpgrp():  # can only be a bug — never kill ourselves
         raise RuntimeError(f"CLI pid {pid} names the worker's own process group")
     try:
-        os.killpg(pid, signal.SIGKILL)
+        os.killpg(pid, signal.SIGKILL if sig is None else sig)
     except ProcessLookupError:
         pass  # the group is already empty
+
+
+def _group_alive(pgid: int) -> bool:
+    """Does any LIVING process still belong to group pgid? Zombies do not
+    count: an orphan whose new parent has not reaped it yet does no work, and
+    kill(…, 0) would report it alive forever."""
+    try:
+        eintraege = os.listdir("/proc")
+    except OSError:
+        try:
+            os.killpg(pgid, 0)
+            return True
+        except ProcessLookupError:
+            return False
+    for eintrag in eintraege:
+        if not eintrag.isdigit():
+            continue
+        try:
+            with open(f"/proc/{eintrag}/stat") as f:
+                felder = f.read().rsplit(")", 1)[1].split()
+        except OSError:
+            continue  # gone meanwhile
+        # after the comm: state ppid pgrp ...
+        if int(felder[2]) == pgid and felder[0] not in ("Z", "X"):
+            return True
+    return False
+
+
+async def _wait_group_empty(pgid: int, timeout_s: float) -> bool:
+    import anyio
+
+    with anyio.move_on_after(timeout_s, shield=True):
+        while _group_alive(pgid):
+            await anyio.sleep(0.05)
+        return True
+    return not _group_alive(pgid)
+
+
+async def _clear_own_group(pid: int) -> None:
+    """Step 2 above. Only for a registered group; unregisters it once empty,
+    keeps it (loudly) when even SIGKILL did not empty it."""
+    import signal
+
+    if pid not in _OWN_SESSION_PIDS:
+        return
+    if _group_alive(pid):
+        _kill_own_group(pid, signal.SIGTERM)
+        if not await _wait_group_empty(pid, CLI_TERM_GRACE_S):
+            logger.error(
+                f"🛑 process group {pid} of a closed CLI still alive "
+                f"{CLI_TERM_GRACE_S:.0f}s after SIGTERM — SIGKILL"
+            )
+            _kill_own_group(pid)
+            if not await _wait_group_empty(pid, CLI_KILL_REAP_S):
+                logger.error(
+                    f"🛑 process group {pid} survived SIGKILL — stays registered"
+                )
+                return
+    _OWN_SESSION_PIDS.discard(pid)
 
 
 def _apply_bounded_close_patch() -> None:
@@ -236,39 +303,31 @@ def _apply_bounded_close_patch() -> None:
 
     async def _bounded_transport_close(self) -> None:
         proc = getattr(self, "_process", None)
-        aborted = proc is not None and proc.returncode is None
         pid = proc.pid if proc is not None else None
         # Shielded but bounded: an outer cancel scope must not cut the cleanup
         # short (the process would be left behind), and nothing may hang it.
-        with anyio.move_on_after(CLI_TERM_GRACE_S, shield=True) as scope:
+        with anyio.move_on_after(CLI_TERM_GRACE_S, shield=True):
             await original_close(self)
-        if not aborted:
-            _OWN_SESSION_PIDS.discard(pid)
-            return
-        if scope.cancelled_caught:
+        if proc is not None and proc.returncode is None:
             logger.error(
-                f"🛑 CLI pid {pid} still alive {CLI_TERM_GRACE_S:.0f}s after SIGTERM — "
-                f"SIGKILL to its process group"
+                f"🛑 CLI pid {pid} still alive {CLI_TERM_GRACE_S:.0f}s after "
+                f"SIGTERM — SIGKILL"
             )
-        # Also after a clean SIGTERM exit: whatever the CLI started (tool
-        # shells, MCP servers) must not outlive the aborted run.
-        if pid in _OWN_SESSION_PIDS:
-            _kill_own_group(pid)
-        elif proc.returncode is None:
-            # Not started through our spawn path (no group of its own): the
-            # process itself is all that can be killed without hitting the worker.
-            try:
-                proc.kill()
-            except ProcessLookupError:
-                pass
-        if proc.returncode is None:
+            if pid in _OWN_SESSION_PIDS:
+                _kill_own_group(pid)
+            else:
+                # Not started through our spawn path (no group of its own):
+                # the process itself is all that can be killed safely.
+                try:
+                    proc.kill()
+                except ProcessLookupError:
+                    pass
             with anyio.move_on_after(CLI_KILL_REAP_S, shield=True):
                 await proc.wait()
-        _OWN_SESSION_PIDS.discard(pid)
-        if proc.returncode is None:
-            logger.error(
-                f"🛑 CLI pid {pid} survived SIGKILL of its group — cannot be stopped"
-            )
+            if proc.returncode is None:
+                logger.error(f"🛑 CLI pid {pid} survived SIGKILL — cannot be stopped")
+        if pid is not None:
+            await _clear_own_group(pid)
         self._process = None
         self._stdout_stream = None
         self._stdin_stream = None
@@ -1832,8 +1891,8 @@ class ClaudeCodeCLI:
         # timeout_s (BRREF-LAUFZEIT): the caller's remaining time, e.g. the
         # research run's overall deadline. Never longer than MAX_TIMEOUT. When
         # it fires, asyncio.timeout cancels the SDK query, whose finally closes
-        # the transport: SIGTERM, then at most CLI_TERM_GRACE_S, then SIGKILL
-        # to the CLI's process group (_bounded_transport_close, BRLZR P3).
+        # the transport: the CLI and then always its whole process group end
+        # within a bounded time (_bounded_transport_close, BRLZR P3/R2).
         _timeout = self.timeout if timeout_s is None else max(1.0, min(self.timeout, float(timeout_s)))
         _prompt_as_received = prompt
         if resume_workdir is not None:

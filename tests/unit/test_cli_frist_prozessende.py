@@ -124,3 +124,84 @@ async def test_normales_ende_toetet_keine_gruppe(tmp_path, monkeypatch):
     kill.assert_not_called()
     assert pid not in claude_cli._OWN_SESSION_PIDS
 
+
+
+# ── BRLZR R2: an ended CLI does not take its group's cleanup with it ───────
+# Codex BRLZR R2 counter-samples (local-storage/brlzr-review-20261012/r2/),
+# taken over as acceptance tests.
+
+
+@pytest.mark.asyncio
+async def test_beendeter_leiter_laesst_kein_kind_zurueck(tmp_path, monkeypatch):
+    """The CLI exits by itself, its SIGTERM-resistant child keeps stdout open:
+    the SDK waits until the deadline. After it, the child must be gone and
+    the group unregistered."""
+    import os
+    import signal
+
+    from claude_code_sdk import ClaudeCodeOptions
+    from claude_code_sdk import query as sdk_query
+    from claude_code_sdk._internal.transport.subprocess_cli import (
+        SubprocessCLITransport,
+    )
+
+    path = tmp_path / "pids"
+    cli = tmp_path / "claude"
+    cli.write_text(
+        f"#!/bin/sh\ntrap \"\" TERM\nsleep 30 &\necho $$ $! > {path}\nexit 0\n"
+    )
+    cli.chmod(0o755)
+    monkeypatch.setattr(claude_cli, "CLI_TERM_GRACE_S", 0.1)
+    tr = SubprocessCLITransport(
+        prompt="p", options=ClaudeCodeOptions(), cli_path=str(cli)
+    )
+    try:
+        with pytest.raises(TimeoutError):
+            async with asyncio.timeout(0.3):
+                async for _ in sdk_query(prompt="p", transport=tr):
+                    pass
+        parent, child = map(int, path.read_text().split())
+        assert not _lebt(child), "deadline returned but CLI child is still alive"
+        assert parent not in claude_cli._OWN_SESSION_PIDS
+    finally:
+        if path.exists():
+            for pid in map(int, path.read_text().split()):
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+
+
+@pytest.mark.asyncio
+async def test_gruppenkill_laesst_fremden_prozess_leben(tmp_path, monkeypatch):
+    import os
+
+    import anyio
+    from claude_code_sdk import ClaudeCodeOptions
+    from claude_code_sdk._internal.transport.subprocess_cli import (
+        SubprocessCLITransport,
+    )
+
+    outsider = await anyio.open_process(["/bin/sleep", "30"])
+    cli = tmp_path / "claude"
+    cli.write_text('#!/bin/sh\ntrap "" TERM\nwhile :; do sleep 1; done\n')
+    cli.chmod(0o755)
+    monkeypatch.setattr(claude_cli, "CLI_TERM_GRACE_S", 0.1)
+    tr = SubprocessCLITransport(
+        prompt="p", options=ClaudeCodeOptions(), cli_path=str(cli)
+    )
+    try:
+        await tr.connect()
+        ownpid = tr._process.pid
+        assert os.getpgid(ownpid) == ownpid != os.getpgrp()
+        await tr.close()
+        assert not _lebt(ownpid)
+        assert _lebt(outsider.pid)
+        with patch.object(os, "killpg") as kill:
+            claude_cli._kill_own_group(outsider.pid)
+            kill.assert_not_called()
+    finally:
+        outsider.kill()
+        await outsider.wait()
+        if tr._process is not None:
+            await tr.close()
