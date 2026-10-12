@@ -1157,13 +1157,21 @@ async def worker_unavailable_handler(request: Request, exc: WorkerUnavailableErr
 # prevention is local to the call chain (no shared state required).
 # =============================================================================
 async def _pick_alternative_worker(
-    exclude_workers: set[str], min_capacity_tokens: int = 500
+    exclude_workers: set[str],
+    benoetigt_tokens: int = 500,
+    request: Optional[Request] = None,
 ) -> Optional[str]:
-    """Pick the worker with the highest free capacity, excluding any in the
-    given set. Capacity = effective_cap_tokens − current_in_flight_tokens.
-    Returns None if no eligible worker has at least min_capacity_tokens free.
+    """Pick the worker with the most free budget that can carry this call,
+    excluding the given set. Free budget = effective_cap_tokens −
+    current_in_flight_tokens and must be at least ``benoetigt_tokens`` (the
+    request's token estimate) — a 500-token floor sent a 164k-token prompt to
+    a worker whose budget was already held (CHATFWD, 12.10.2026 17:31Z).
+    The pool verdict is kept on ``request.state.chat_pool_lage`` so the error
+    the caller finally gets can name the real reason (src/chat_weiterleitung.py).
+    Returns None if no eligible worker has enough free budget.
     """
     import httpx
+    from src.chat_weiterleitung import pool_lage
     try:
         async with httpx.AsyncClient(timeout=3.0) as client:
             r = await client.get(
@@ -1173,26 +1181,22 @@ async def _pick_alternative_worker(
             data = r.json()
     except Exception as exc:
         logger.warning(f"_pick_alternative_worker: fetch failed: {exc}")
-        return None
+        data = {}
 
-    candidates: list[tuple[str, int]] = []
-    for _account, info in (data.get("accounts") or {}).items():
-        worker = info.get("worker")
-        if not worker or worker in exclude_workers:
-            continue
-        if not info.get("available"):
-            continue
-        if int(info.get("cooldown_remaining_s") or 0) > 0:
-            continue
-        eff_cap = int(info.get("effective_cap_tokens") or 0)
-        in_flight = int(info.get("current_in_flight_tokens") or 0)
-        capacity = eff_cap - in_flight
-        if capacity > min_capacity_tokens:
-            candidates.append((worker, capacity))
-
-    if not candidates:
-        return None
-    return max(candidates, key=lambda x: x[1])[0]
+    lage = pool_lage(
+        data.get("accounts") or {},
+        benoetigt_tokens=benoetigt_tokens,
+        ausgeschlossen=exclude_workers,
+    )
+    if request is not None:
+        request.state.chat_pool_lage = lage
+    if lage["ziel"] is None:
+        logger.info(
+            f"_pick_alternative_worker: no worker carries {lage['benoetigt_tokens']} tokens "
+            f"({lage['grund']}): "
+            + ", ".join(f"{w['worker']}={w['zustand']}/{w['frei_tokens']}" for w in lage["worker"])
+        )
+    return lage["ziel"]
 
 
 # Response headers a cross-worker relay passes on: exactly the public
@@ -1279,7 +1283,13 @@ async def _cross_worker_retry(
     if not cached_body or cached_body.get("stream"):
         return None  # streaming retries need different machinery
 
-    target = await _pick_alternative_worker(excluded)
+    from src import chat_weiterleitung as _cw
+    _est = getattr(request.state, "adaptive_est_tokens", None)
+    target = await _pick_alternative_worker(
+        excluded,
+        benoetigt_tokens=int(_est) if isinstance(_est, (int, float)) and _est > 0 else 500,
+        request=request,
+    )
     if not target:
         logger.info(
             f"🔄 cross-worker retry: no alternative for {self_worker} "
@@ -1312,10 +1322,11 @@ async def _cross_worker_retry(
         f"(excluded={sorted(excluded)})"
     )
 
-    # Path-dependent timeout: chat is sub-30s, research is 5-40 minutes.
-    # Use a generous research timeout so the alternative worker has room to
-    # complete a real research run; chat keeps the original tight 30s budget
-    # so a hung retry does not itself become the 429 source.
+    # Path-dependent timeout. Both paths carry ONE deadline to the peer and
+    # wait for it: a waiter that gives up before the run it started ends
+    # leaves an orphan that is paid for and holds the peer's budget. Chat had
+    # a fixed 30 s here while a 164k-token call needs 64-119 s (CHATFWD,
+    # 12.10.2026 17:31Z) — src/chat_weiterleitung.py.
     request_path = str(request.url.path) or "/v1/chat/completions"
     if request_path.endswith("/v1/research"):
         # Time chain (src/research_laufzeit.py, SSoT): the peer works to the
@@ -1331,15 +1342,22 @@ async def _cross_worker_retry(
         _bis = getattr(getattr(request, "state", None), "research_frist_bis", None)
         headers[FRIST_HEADER] = repr(_bis if isinstance(_bis, float) else frist_bis(request))
     else:
-        retry_timeout_s = 30.0
+        _bis = _cw.frist_bis(request)
+        headers[_cw.FRIST_HEADER] = repr(_bis)
+        retry_timeout_s = _cw.relay_timeout_s(_bis)
 
-    try:
+    async def _relay_call():
         async with httpx.AsyncClient(timeout=retry_timeout_s) as client:
-            r = await client.post(
+            return await client.post(
                 f"http://{target}:8000{request_path}",
                 json=cached_body,
                 headers=headers,
             )
+
+    try:
+        # Leaving with the caller closes the connection to the peer — which is
+        # how the peer learns its caller is gone and cancels its run.
+        r = await _cw.relay_unter_aufsicht(_relay_call())
         # Pass through whatever the alternative worker returned. If it also
         # 429s, the recursive _cross_worker_retry on that worker either found
         # yet another candidate or reached the retry-count cap; either way
@@ -1348,6 +1366,15 @@ async def _cross_worker_retry(
             content = r.json()
         except Exception:
             content = {"error": {"message": "non-json retry response"}}
+        if (
+            r.status_code == 503
+            and isinstance(content, dict)
+            and ((content.get("error") or {}).get("reason") == _cw.REASON_RELAY_FRIST_ZU_KURZ)
+        ):
+            # The peer did not take it (too little of the deadline left): no
+            # relay happened, this worker answers with its own error.
+            logger.info(f"🔄 cross-worker retry: {target} refused — deadline too short")
+            return None
         relayed = JSONResponse(status_code=r.status_code, content=content)
         # The answering worker's headers belong to the answer (X-Cache-Boundary,
         # X-Worker-Instance, X-Claude-Session-ID, cost headers, Retry-After).
@@ -1355,6 +1382,10 @@ async def _cross_worker_retry(
         # exactly this path (CACHEFIX3, DBD2 deploy smoke 11.10.2026).
         relayed.raw_headers.extend(_relay_headers(r))
         return relayed
+    except _cw.AufruferWeg:
+        # Nobody reads this answer; the relay and the peer's run are gone.
+        logger.warning(f"🔌 chat relay to {target} abandoned: caller gone")
+        return JSONResponse(status_code=499, content={"error": {"message": "caller gone"}})
     except Exception as exc:
         logger.error(
             f"cross-worker retry HTTP call to {target} failed: {exc}", exc_info=True
@@ -1402,30 +1433,52 @@ async def rate_limit_handler(request: Request, exc: RateLimitError):
         if retry_response is not None:
             return retry_response
 
+    # What THIS worker hit is its own account's limit. "All accounts at weekly
+    # limit" was said here even when another worker's account had room but no
+    # free budget (CHATFWD, 12.10.2026 17:31Z). When a relay was looked for,
+    # the pool verdict names the real reason and the retry_after that fits it.
+    from src.chat_weiterleitung import ehrliche_lage
+    eigener_grund = (
+        f"[Bridge {worker_id}] This worker's Anthropic account is at its usage "
+        f"limit (reset in {retry_after}s)"
+    )
+    lage = ehrliche_lage(request, eigener_grund)
+    error_body = {
+        # OpenAI-compat
+        "message": f"{eigener_grund}. Retry after {retry_after}s.",
+        "type": "rate_limit_exceeded",
+        "code": "429",
+        # Bridge discriminators
+        "source": "bridge_account",
+        "bridge_type": "account_exhausted",
+        "bridge_worker": worker_id,
+        "retryable": True,
+        "retry": True,
+        "retry_after_s": retry_after,
+        "retry_after_seconds": retry_after,  # legacy alias
+        "reset_time": exc.reset_time.isoformat() if exc.reset_time else None,
+        "worker_retry_after_s": retry_after,
+    }
+    if lage is not None:
+        error_body["reason"] = lage["reason"]
+        error_body["pool"] = lage["pool"]
+        if lage["retry_after_s"] is None:
+            error_body.update(
+                message=lage["message"] + ".", retryable=False, retry=False,
+                retry_after_s=None, retry_after_seconds=None,
+            )
+        else:
+            retry_after = int(lage["retry_after_s"])
+            error_body.update(
+                message=f"{lage['message']}. Retry after {retry_after}s.",
+                retry_after_s=retry_after, retry_after_seconds=retry_after,
+            )
+
     return JSONResponse(
         status_code=429,
-        content={
-            "error": {
-                # OpenAI-compat
-                "message": (
-                    f"[Bridge {worker_id}] All Anthropic accounts at weekly limit. "
-                    f"Retry after {retry_after}s."
-                ),
-                "type": "rate_limit_exceeded",
-                "code": "429",
-                # Bridge discriminators
-                "source": "bridge_account",
-                "bridge_type": "account_exhausted",
-                "bridge_worker": worker_id,
-                "retryable": True,
-                "retry": True,
-                "retry_after_s": retry_after,
-                "retry_after_seconds": retry_after,  # legacy alias
-                "reset_time": exc.reset_time.isoformat() if exc.reset_time else None,
-            }
-        },
+        content={"error": error_body},
         headers={
-            "Retry-After": str(retry_after),
+            "Retry-After": str(retry_after if error_body["retry_after_s"] is not None else 0),
             "X-Rate-Limit-Reset": exc.reset_time.isoformat() if exc.reset_time else "",
             "X-Worker-Id": worker_id
         }
@@ -2593,7 +2646,45 @@ async def chat_completions(
     # not in adaptive_limit_dependency, which other Claude endpoints share.
     _adaptive=Depends(cache_request_body_dependency)
 ):
-    """OpenAI-compatible chat completions endpoint."""
+    """OpenAI-compatible chat completions endpoint.
+
+    A call relayed from another worker carries its caller's deadline
+    (src/chat_weiterleitung.py, CHATFWD): it is only accepted while enough of
+    that deadline is left, and its run — admission queue, CLI, everything —
+    is cancelled when the deadline passes or the relaying worker hangs up.
+    Before, a relayed run went on for a minute after its caller had given up,
+    paid for and holding this worker's token budget.
+    """
+    from fastapi.responses import JSONResponse
+    from src import chat_weiterleitung as _cw
+
+    bis = _cw.frist_bis(request)  # first worker: anchored at the call's arrival
+    if _cw.eingehende_frist(request) is None:
+        return await _chat_completions_lauf(request_body, request, credentials, _adaptive)
+    rest = _cw.rest_s(bis)
+    if rest < _cw.CHAT_RELAY_MIN_REST_S:
+        logger.warning(
+            f"🛑 relayed chat call refused: {rest:.0f}s of the caller's deadline left "
+            f"(< {_cw.CHAT_RELAY_MIN_REST_S:.0f}s)"
+        )
+        return _cw.frist_zu_kurz_error(rest)
+    try:
+        return await _cw.unter_aufsicht(
+            _chat_completions_lauf(request_body, request, credentials, _adaptive), bis
+        )
+    except _cw.FristAbgelaufen:
+        return _cw.frist_abgelaufen_error(bis)
+    except _cw.AufruferWeg:
+        return JSONResponse(status_code=499, content={"error": {"message": "caller gone"}})
+
+
+async def _chat_completions_lauf(
+    request_body: ChatCompletionRequest,
+    request: Request,
+    credentials: Optional[HTTPAuthorizationCredentials],
+    _adaptive=None,
+):
+    """The chat call itself (see chat_completions)."""
     import time
     from fastapi.responses import JSONResponse
     from src.middleware.adaptive_limiter import is_gemini_vision_request
@@ -10877,6 +10968,40 @@ async def privacy_unavailable_handler(request: Request, exc: PrivacyServiceUnava
     )
 
 
+def _ehrliche_antwort(request: Request, response: JSONResponse) -> JSONResponse:
+    """A worker-local capacity envelope plus what the pool says, when a relay
+    was looked for and none was possible (src/chat_weiterleitung.py)."""
+    import json as _json
+    from src.chat_weiterleitung import ehrliche_lage
+    try:
+        body = _json.loads(response.body)
+        fehler = body["error"]
+    except Exception:
+        return response
+    lage = ehrliche_lage(request, str(fehler.get("message") or "").rstrip("."))
+    if lage is None:
+        return response
+    fehler["worker_reason"] = fehler.get("reason")
+    fehler["worker_retry_after_s"] = fehler.get("retry_after_s")
+    fehler["reason"] = lage["reason"]
+    fehler["pool"] = lage["pool"]
+    headers = {
+        k: v for k, v in response.headers.items()
+        if k.lower() not in ("content-length", "retry-after")
+    }
+    if lage["retry_after_s"] is None:
+        fehler.update(
+            message=lage["message"] + ".", retryable=False, retry=False, retry_after_s=None
+        )
+    else:
+        fehler.update(
+            message=f"{lage['message']}. Retry after {int(lage['retry_after_s'])}s.",
+            retry_after_s=int(lage["retry_after_s"]),
+        )
+        headers["Retry-After"] = str(int(lage["retry_after_s"]))
+    return JSONResponse(status_code=response.status_code, content=body, headers=headers)
+
+
 @app.exception_handler(BridgeError)
 async def bridge_error_handler(request: Request, exc: BridgeError):
     """Unwrap BridgeError → its carried structured response. The envelope is
@@ -10933,6 +11058,9 @@ async def bridge_error_handler(request: Request, exc: BridgeError):
         cross_worker_response = await _cross_worker_retry(request, self_worker)
         if cross_worker_response is not None:
             return cross_worker_response
+        # No peer took it: name the pool's real reason and retry_after in the
+        # envelope the caller gets (also on the cross-bridge path's fall-throughs).
+        exc.response = _ehrliche_antwort(request, exc.response)
 
         from src.providers.fallback import (
             get_fallback_tiers as _fb_tiers,

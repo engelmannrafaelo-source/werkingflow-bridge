@@ -226,7 +226,9 @@ class TestSelfWorkerScope:
         # _self_worker is now worker_id, which is set unconditionally.
         # We verify by checking the source doesn't have the variable only in branches:
         import inspect
-        src_lines = inspect.getsource(main_module.chat_completions)
+        # The call body lives in _chat_completions_lauf since CHATFWD (the route
+        # wraps it with the relay deadline).
+        src_lines = inspect.getsource(main_module._chat_completions_lauf)
         # The variable must NOT appear for the first time only inside an `if` block
         # — rough structural check: count top-level assignments vs branch assignments.
         # A proper check: if we can grep for the unconditional assignment.
