@@ -2664,7 +2664,16 @@ async def chat_completions(
         logger.error(f"🛑 chat call refused: {exc}")
         return _cw.frist_ungueltig_error(exc)
     if request.headers.get(_cw.FRIST_HEADER) is None:
-        return await _chat_completions_lauf(request_body, request, credentials, _adaptive)
+        # FK25B: a job's self-call stops when the job is cancelled.
+        from src.jobs.selbstaufruf import unter_job_aufsicht
+
+        return await unter_job_aufsicht(
+            request,
+            _chat_completions_lauf(request_body, request, credentials, _adaptive),
+            attribution=extract_attribution_context(request),
+            model=request_body.model,
+            endpunkt="/v1/chat/completions",
+        )
     rest = _cw.rest_s(bis)
     if rest < _cw.CHAT_RELAY_MIN_REST_S:
         logger.warning(
@@ -3176,6 +3185,10 @@ async def _chat_completions_lauf(
                 privacy=request_body.privacy or PrivacyMode.AUTO,
                 bedrock_region=request_body.bedrock_region,
                 provider_tier=request_body.provider_tier,
+            )
+            from src.jobs.selbstaufruf import ledger_provider_merken
+            ledger_provider_merken(
+                request, ledger_provider_for_backend(backend_config.backend)
             )
         except RuntimeError as e:
             # A user PINNED to this backend (provider_config) gets 503, not
@@ -7647,12 +7660,23 @@ async def research(
         f"research dispatch: path={'cloud' if _use_research_cloud else 'pool'} "
         f"async={bool(getattr(request_body, 'async_mode', False))}"
     )
+    # FK25B: a job's self-call stops when the job is cancelled.
+    from src.activity.providers import PROVIDER_RESEARCH_CLOUD
+    from src.jobs.selbstaufruf import ledger_provider_merken, unter_job_aufsicht
+
     if _use_research_cloud:
-        return await _execute_research_cloud_with_pool_fallback(
+        ledger_provider_merken(request, PROVIDER_RESEARCH_CLOUD)
+        lauf = _execute_research_cloud_with_pool_fallback(
             request, request_body, attribution_ctx=_research_attr
         )
-    return await _execute_research_impl(
-        request_body, backend_config, attribution_ctx=_research_attr, request=request
+    else:
+        ledger_provider_merken(request, ledger_provider_for_backend(backend_config.backend))
+        lauf = _execute_research_impl(
+            request_body, backend_config, attribution_ctx=_research_attr, request=request
+        )
+    return await unter_job_aufsicht(
+        request, lauf, attribution=_research_attr,
+        model=request_body.model, endpunkt="/v1/research",
     )
 
 
@@ -8149,7 +8173,18 @@ async def doc_agent(
     except Exception as _ge:
         logger.error(f"budget gate (doc-agent) unexpected error (letting call through): {_ge}")
 
-    return await _execute_doc_agent_impl(request_body, attribution_ctx=_da_attr)
+    # FK25B: a job's self-call stops when the job is cancelled. Doc-agent
+    # runs on the subscription pool only (no pins, see above).
+    from src.jobs.selbstaufruf import ledger_provider_merken, unter_job_aufsicht
+
+    ledger_provider_merken(request, PROVIDER_ANTHROPIC)
+    return await unter_job_aufsicht(
+        request,
+        _execute_doc_agent_impl(request_body, attribution_ctx=_da_attr),
+        attribution=_da_attr,
+        model=request_body.model,
+        endpunkt="/v1/doc-agent",
+    )
 
 
 # A research session id is the uuid of the run's directory under

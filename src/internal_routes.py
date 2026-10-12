@@ -888,6 +888,30 @@ async def internal_cancel_job(
     return {"job": await store.cancel_job(job_id)}
 
 
+@router.get("/jobs/{job_id}/cancel-state")
+async def internal_cancel_state(
+    job_id: str,
+    _claims: AuthClaims = Depends(require_service_token),
+) -> Dict[str, Any]:
+    """FK25B, store.cancel_state. Always 200 (``{"job": null}`` for an
+    unknown id) — same reason as the cancel route: a 404/405 then can only
+    mean "this platform-api predates the route"."""
+    from src.jobs import store
+
+    return {"job": await store.cancel_state(job_id)}
+
+
+@router.post("/jobs/{job_id}/finish-cancelled")
+async def internal_finish_cancelled(
+    job_id: str,
+    _claims: AuthClaims = Depends(require_service_token),
+) -> Dict[str, Any]:
+    """FK25B, store.finish_cancelled. Always 200 ``{"changed": bool}``."""
+    from src.jobs import store
+
+    return {"changed": await store.finish_cancelled(job_id)}
+
+
 @router.post("/jobs/{job_id}/heartbeat", status_code=204)
 async def internal_heartbeat(
     job_id: str,

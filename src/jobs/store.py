@@ -358,6 +358,45 @@ async def cancel_job(job_id: str) -> Optional[Dict[str, Any]]:
     return {"status": JOB_STATUS_CANCELLED, "changed": True, "cancel_requested": False}
 
 
+async def cancel_state(job_id: str) -> Optional[Dict[str, Any]]:
+    """``{"status", "cancel_requested"}`` of a job, or None for an unknown id
+    (FK25B). Deliberately narrow: the running worker asks this every few
+    seconds while a job runs, and the DELETE route while it waits for the
+    run to end — the full row (payload, result) would be read each time."""
+    pool = get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT status, cancel_requested_at IS NOT NULL AS cancel_requested "
+            "FROM ai_jobs WHERE job_id = $1",
+            job_id,
+        )
+    if row is None:
+        return None
+    return {"status": row["status"], "cancel_requested": bool(row["cancel_requested"])}
+
+
+async def finish_cancelled(job_id: str) -> bool:
+    """End a RUNNING job its owner asked to cancel (FK25B): the worker that
+    ran it has stopped the run, the row becomes 'cancelled' (terminal, stamps
+    finished_at like every terminal transition).
+
+    Only 'running' with a recorded wish (cancel_requested_at) qualifies, so
+    this can neither cancel a job nobody asked to cancel nor overwrite a run
+    that ended done/error first. Returns whether THIS call moved the row."""
+    pool = get_pool()
+    async with pool.acquire() as conn:
+        tag = await conn.execute(
+            """
+            UPDATE ai_jobs SET status = 'cancelled', updated_at = NOW(),
+                               finished_at = NOW()
+             WHERE job_id = $1 AND status = 'running'
+               AND cancel_requested_at IS NOT NULL
+            """,
+            job_id,
+        )
+    return _affected(tag) == 1
+
+
 async def heartbeat(job_id: str) -> None:
     """Raises JobRowMissing when the row is gone (see there)."""
     pool = get_pool()

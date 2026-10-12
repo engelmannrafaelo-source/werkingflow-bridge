@@ -409,6 +409,13 @@ def _build_headers(attribution: Optional[Dict[str, Any]]) -> Dict[str, str]:
                 headers[hdr] = str(val)
     if "X-App-ID" not in headers:
         headers["X-Client-ID"] = _SELFCALL_CLIENT_ID
+    # FK25B: marks the self-call of a running job, so the endpoint stops the
+    # run when the job is cancelled (the runner closes this connection).
+    from src.jobs.registry import JOB_LAUF_HEADER, laufender_job
+
+    job_id = laufender_job()
+    if job_id:
+        headers[JOB_LAUF_HEADER] = job_id
     return headers
 
 

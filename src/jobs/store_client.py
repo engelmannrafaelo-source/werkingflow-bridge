@@ -363,6 +363,61 @@ async def cancel_job(job_id: str) -> Optional[Dict[str, Any]]:
     raise _unexpected("cancel_job", resp.status_code, resp.json)
 
 
+class CancelRouteMissing(RuntimeError):
+    """platform-api predates FK25B (no /cancel-state or /finish-cancelled).
+    A running job then cannot be stopped from outside: the caller keeps the
+    BR10b behaviour (409, wish recorded) and says so — never a guessed answer."""
+
+
+async def cancel_state(job_id: str) -> Optional[Dict[str, Any]]:
+    """store.cancel_state over the platform seam (FK25B). None = unknown id.
+    Raises CancelRouteMissing behind a platform-api without the route."""
+    try:
+        resp = await call_platform(
+            "GET", f"/v1/internal/jobs/{job_id}/cancel-state", timeout_s=_READ_TIMEOUT_S
+        )
+    except PlatformUnavailable as e:
+        _fallback_or_raise("cancel_state", e)
+        return await store.cancel_state(job_id)
+    if resp.status_code in (404, 405):
+        raise CancelRouteMissing(
+            f"job store cancel_state: platform-api has no cancel-state route "
+            f"(HTTP {resp.status_code}) — deployed before FK25B"
+        )
+    if resp.status_code == 200 and isinstance(resp.json, dict) and "job" in resp.json:
+        job = resp.json["job"]
+        if job is None:
+            return None
+        if isinstance(job, dict) and "status" in job and "cancel_requested" in job:
+            return job
+    raise _unexpected("cancel_state", resp.status_code, resp.json)
+
+
+async def finish_cancelled(job_id: str) -> bool:
+    """store.finish_cancelled over the platform seam (FK25B). Raises
+    CancelRouteMissing behind a platform-api without the route."""
+    try:
+        resp = await call_platform(
+            "POST", f"/v1/internal/jobs/{job_id}/finish-cancelled",
+            timeout_s=_WRITE_TIMEOUT_S,
+        )
+    except PlatformUnavailable as e:
+        _fallback_or_raise("finish_cancelled", e)
+        return await store.finish_cancelled(job_id)
+    if resp.status_code in (404, 405):
+        raise CancelRouteMissing(
+            f"job store finish_cancelled: platform-api has no finish-cancelled "
+            f"route (HTTP {resp.status_code}) — deployed before FK25B"
+        )
+    if (
+        resp.status_code == 200
+        and isinstance(resp.json, dict)
+        and isinstance(resp.json.get("changed"), bool)
+    ):
+        return resp.json["changed"]
+    raise _unexpected("finish_cancelled", resp.status_code, resp.json)
+
+
 async def heartbeat(job_id: str) -> None:
     """Raises JobRowMissing (counted, logged) when the row is gone."""
     try:

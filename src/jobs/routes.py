@@ -3,7 +3,8 @@
     POST /v1/jobs           → { job_id, status:'pending', kind }   (returns in <1s)
                               with Idempotency-Key: 201 new / 200 replay (BRREF2)
     GET  /v1/jobs/{job_id}   → { status, elapsed_seconds, progress, result?, error? }
-    DELETE /v1/jobs/{job_id} → withdraw a job no worker has started yet (BR10)
+    DELETE /v1/jobs/{job_id} → withdraw a job no worker has started yet (BR10),
+                              or stop a running chat/research/doc-agent job (FK25B)
 
 Inert unless BRIDGE_GENERIC_JOBS_ENABLED=true (503 otherwise) AND a job store is
 reachable — platform-api (BRIDGE_SERVICE_TOKEN, ADR-0009 Weg b) or the direct
@@ -15,9 +16,11 @@ and injects its canonical attribution extractor (set_attribution_extractor) so w
 reuse the same X-* header parsing/billing as every other endpoint without an import
 cycle (main.py imports this module, not the other way around).
 """
+import asyncio
 import hashlib
 import logging
 import os
+import time
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, Optional
 
@@ -48,7 +51,14 @@ from src.jobs.job_id import (
     new_job_id,
     parse_home,
 )
-from src.jobs.registry import get_executor, registered_kinds, run_generic_job, spawn
+from src.jobs.registry import (
+    JOB_ABBRECHBAR_IM_LAUF,
+    abbruch_melden,
+    get_executor,
+    registered_kinds,
+    run_generic_job,
+    spawn,
+)
 from src.lauf_abschluss import abschluss_eines_ergebnisses
 
 logger = logging.getLogger(__name__)
@@ -678,15 +688,27 @@ async def cancel_job_endpoint(
     request: Request,
     credentials: Optional[HTTPAuthorizationCredentials] = Depends(security),
 ):
-    """Withdraw a job that no worker has started yet (BR10).
+    """Withdraw a job that no worker has started yet (BR10), or stop one
+    that runs (FK25B).
 
     Its owner gives up waiting (a caller's deadline) — without this, a job
     still 'pending' (fresh, or parked with deferred_until) would be started
     later anyway and billed for a result nobody reads.
 
       200 {job_id, status:'cancelled'}  pending/deferred → cancelled, or it
-                                        already was cancelled (idempotent)
-      409 job_already_running           a worker has it (also when it won the
+                                        already was cancelled (idempotent);
+                                        also a running chat/research/
+                                        doc-agent job whose run stopped
+                                        within JOB_CANCEL_WAIT_S (FK25B,
+                                        _stop_running: its self-call and
+                                        CLI end, the ledger notes it)
+      202 {status:'running',            such a job is still being stopped;
+           cancel_requested:true}       GET shows 'cancelled' once it is
+      409 job_terminal (running kind)   it finished before the cancel took
+                                        effect; the result is kept
+      409 job_already_running           every OTHER kind (erkunder, ping,
+                                        proxy, pdf) a worker has (also when
+                                        it won the
                                         race against this call by a hair).
                                         The run is not stopped, but the wish
                                         is recorded (error.cancel_requested
@@ -739,6 +761,10 @@ async def cancel_job_endpoint(
         # False only behind a platform-api from before BR10b, which records
         # no wish — the body then says so instead of promising it.
         requested = bool(outcome.get("cancel_requested"))
+        if requested and job.get("kind") in JOB_ABBRECHBAR_IM_LAUF:
+            stopped = await _stop_running(job_id, job.get("kind"))
+            if stopped is not None:
+                return stopped
         if requested:
             logger.info(
                 f"🛑 Async job {job_id} (kind={job.get('kind')}) running — "
@@ -760,6 +786,82 @@ async def cancel_job_endpoint(
         )
     # A status this code does not know is a contract break, not a datum.
     raise RuntimeError(f"job cancel {job_id}: store returned unknown status {status!r}")
+
+
+# FK25B: how long DELETE waits for a running job to end before it answers
+# 202. Covers the running worker's poll (registry.JOB_CANCEL_POLL_S) and
+# cancelling its self-call; the CLI's bounded close (up to 2 × (grace +
+# reap)) runs on in the endpoint and is not waited for here.
+JOB_CANCEL_WAIT_S = float(os.getenv("BRIDGE_JOB_CANCEL_WAIT_S", "10"))
+JOB_CANCEL_WAIT_TICK_S = 0.25
+
+
+async def _stop_running(job_id: str, kind: Optional[str]) -> Optional[JSONResponse]:
+    """Stop a running job whose cancel wish is recorded (FK25B).
+
+      200 {status:'cancelled'}          the run stopped, the row is cancelled
+      202 {status:'running',            the wish is recorded and the run is
+           cancel_requested:true}       being stopped; GET shows the end
+      409 job_terminal                  it finished done/error first (billed;
+                                        the result is kept)
+      None                              this store cannot tell (platform-api
+                                        before FK25B) — the caller answers as
+                                        BR10b did
+
+    Wakes the run directly when it runs on this worker; otherwise its worker
+    sees the wish within registry.JOB_CANCEL_POLL_S."""
+    local = abbruch_melden(job_id)
+    deadline = time.monotonic() + JOB_CANCEL_WAIT_S
+    state: Optional[Dict[str, Any]] = None
+    while True:
+        try:
+            state = await store_client.cancel_state(job_id)
+        except store_client.CancelRouteMissing as e:
+            logger.error("job cancel %s: %s — answering as before FK25B", job_id, e)
+            return None
+        if state is None:
+            return _job_not_found(job_id)
+        if state["status"] != store.JOB_STATUS_RUNNING:
+            break
+        if time.monotonic() >= deadline:
+            break
+        await asyncio.sleep(JOB_CANCEL_WAIT_TICK_S)
+
+    status = state["status"]
+    if status == store.JOB_STATUS_CANCELLED:
+        logger.info(
+            f"🛑 Async job {job_id} (kind={kind}) cancelled by its owner while "
+            f"running ({'this worker' if local else 'another worker'})"
+        )
+        return JSONResponse(
+            status_code=200, content={"job_id": job_id, "status": store.JOB_STATUS_CANCELLED}
+        )
+    if status == store.JOB_STATUS_RUNNING:
+        logger.warning(
+            f"🛑 Async job {job_id} (kind={kind}) still running "
+            f"{JOB_CANCEL_WAIT_S:.0f}s after its cancel — being stopped"
+        )
+        return JSONResponse(
+            status_code=202,
+            content={
+                "job_id": job_id,
+                "status": store.JOB_STATUS_RUNNING,
+                "cancel_requested": True,
+                "message": (
+                    f"Async job {job_id} is being stopped; poll GET /v1/jobs/{job_id} "
+                    f"until it reads 'cancelled'"
+                ),
+            },
+        )
+    if status in store.JOB_TERMINAL_STATUSES:
+        return job_cancel_error(
+            job_id, REASON_JOB_TERMINAL, 409,
+            f"Async job {job_id} finished ({status}) before the cancel took effect",
+            job_status=status,
+        )
+    # 'pending' again: the run parked itself and defer_job closed it as
+    # cancelled — or a status this code does not know. Neither is guessed.
+    raise RuntimeError(f"job cancel {job_id}: unexpected status {status!r} while stopping")
 
 
 def _deferral_view(job: Dict[str, Any]) -> Dict[str, Any]:

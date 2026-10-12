@@ -53,7 +53,9 @@ pg_store = br10.pg_store
 
 
 async def test_running_409_says_the_wish_is_recorded(mem, monkeypatch):
-    mem.add(JOB, "running")
+    # FK25B: chat/research/doc-agent are stopped now (test_job_cancel_fk25b);
+    # every other kind keeps this contract — erkunder stands for them.
+    mem.add(JOB, "running", kind="erkunder")
     monkeypatch.setattr(
         store_client,
         "cancel_job",
@@ -289,12 +291,16 @@ async def test_running_job_cancelled_then_refused_429_is_never_resumed(
         raise ExecutorHTTPError(429, "no account capacity", retry_after_s=30)
 
     calls = AsyncMock(side_effect=executor)
-    # The row's kind ('chat') is what a watchdog re-run would look up.
-    monkeypatch.setitem(registry._EXECUTORS, "chat", calls)
+    # The row's kind is what a watchdog re-run would look up. FK25B: a chat
+    # job is stopped by the DELETE itself (test_job_cancel_fk25b); the BR10b
+    # path stays for every other kind — 'proxy' stands for them here.
+    monkeypatch.setitem(registry._EXECUTORS, "proxy", calls)
     await _insert(wired, JOB, "pending")
+    async with wired.acquire() as conn:
+        await conn.execute("UPDATE ai_jobs SET kind = 'proxy' WHERE job_id = $1", JOB)
 
     with caplog.at_level(logging.WARNING, logger=registry.logger.name):
-        await registry.run_generic_job(JOB, "chat", {}, OWNER_ATTR)
+        await registry.run_generic_job(JOB, "proxy", {}, OWNER_ATTR)
     assert seen == [(409, True)]
     assert await _status(wired, JOB) == "cancelled"
     assert "cancelled instead of deferred" in caplog.text
