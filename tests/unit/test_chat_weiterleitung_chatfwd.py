@@ -398,3 +398,28 @@ def test_voll_belegtes_budget_ist_kein_kontolimit():
     zustand = {w["worker"]: w["zustand"] for w in lage["worker"]}
     assert zustand["worker1"] == "kapazitaet_belegt"
     assert zustand["worker2"] == "konto_limit"
+
+
+@pytest.mark.parametrize(
+    "mult, effektiv, erwartet",
+    [
+        (1.0, 850_000, "zu_gross"),  # only the safety margin: no reset helps
+        (0.5, 425_000, "konto_limit"),  # weekly squeeze: unsqueezed 850k carries 800k
+        (0.0, 0, "konto_limit"),  # weekly ≥ 97 %: account limit whatever the size
+    ],
+)
+def test_sicherheitsreserve_ist_kein_kontolimit(mult, effektiv, erwartet):
+    """CHATFWDR R2: effective = cap × margin × multiplier. Only the multiplier
+    is an account squeeze; the margin (adaptive 1M → 850k) is not."""
+    import src.chat_weiterleitung as cw
+
+    info = {"worker": "worker1", "available": True, "usage_known": True,
+            "session_percent": 0.0, "weekly_percent": 0.0, "budget_multiplier": mult,
+            "adaptive_cap_tokens": 1_000_000, "effective_cap_tokens": effektiv,
+            "current_in_flight_tokens": 0}
+    benoetigt = 900_000 if erwartet == "zu_gross" else 800_000
+    lage = cw.pool_lage({"a": info}, benoetigt_tokens=benoetigt, ausgeschlossen=set())
+    assert lage["worker"][0]["zustand"] == erwartet
+    if erwartet == "zu_gross":
+        assert lage["grund"] == cw.REASON_POOL_ZU_GROSS
+        assert lage["retry_after_s"] is None

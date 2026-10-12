@@ -286,8 +286,14 @@ def _worker_zustand(info: Dict[str, Any], benoetigt: int) -> tuple[str, Optional
     ``cooldown_remaining_s`` alone, which also carries adaptive and temporary
     holds (CHATFWDR P2).
 
-    * zu_gross          — the call exceeds the worker's cap even unsqueezed
-                          (adaptive_cap_tokens): no wait helps on this worker.
+    * zu_gross          — the call exceeds what the worker admits even without
+                          the weekly squeeze: effective_cap_tokens is
+                          cap × safety margin × budget_multiplier
+                          (AdaptiveLoadLimiter._effective_cap), so the
+                          unsqueezed admit limit is effective / multiplier. NOT
+                          adaptive_cap_tokens — that is the raw cap BEFORE the
+                          safety margin, which no account reset frees
+                          (CHATFWDR R2).
     * konto_limit       — capacity lock (Anthropic reset_at) or a measured
                           session ≥ 95 % / weekly ≥ 100 %, or the weekly squeeze
                           (effective cap below the call, unsqueezed cap above).
@@ -297,7 +303,10 @@ def _worker_zustand(info: Dict[str, Any], benoetigt: int) -> tuple[str, Optional
     * frei              — takes the call now.
     """
     cap = int(_zahl(info, "effective_cap_tokens"))
-    voller_cap = max(cap, int(_zahl(info, "adaptive_cap_tokens")))
+    mult = _zahl(info, "budget_multiplier") if info.get("budget_multiplier") is not None else 1.0
+    # multiplier 0 (weekly ≥ 97 %): the squeeze hides the unsqueezed limit;
+    # that worker is limited by its account, whatever the call's size.
+    voller_cap = int(cap / mult) if mult > 0 else None
     frei = cap - int(_zahl(info, "current_in_flight_tokens"))
     cooldown = int(_zahl(info, "cooldown_remaining_s"))
     lock = int(_zahl(info, "capacity_lock_remaining_s"))
@@ -307,7 +316,7 @@ def _worker_zustand(info: Dict[str, Any], benoetigt: int) -> tuple[str, Optional
     session_voll = gemessen and isinstance(session, (int, float)) and session >= 95.0
     weekly_voll = gemessen and isinstance(weekly, (int, float)) and weekly >= 100.0
 
-    if voller_cap < benoetigt:
+    if voller_cap is not None and voller_cap < benoetigt:
         return "zu_gross", None, "keine"
     if lock > 0:
         return "konto_limit", lock, "kontosperre"
