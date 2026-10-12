@@ -16,19 +16,29 @@ the REAL run_completion (only `query` is replaced) and the real chat routes.
 """
 from __future__ import annotations
 
+import importlib
 import json
 import sys
 from dataclasses import dataclass
 from pathlib import Path
 from unittest.mock import MagicMock as _MagicMock
 
+# Stand-ins only where the SDK is not importable (it lives in the worker
+# image). A MagicMock over a real SDK is global for the whole session:
+# ClaudeCodeOptions() then returns one shared object and options leak from
+# test to test (seen in test_cache_boundary_cli). Other test modules may
+# already have put a bare mock in place — then its submodules are added.
 for _mod_name in [
     "claude_code_sdk",
     "claude_code_sdk._errors",
     "claude_code_sdk._internal",
     "claude_code_sdk._internal.client",
 ]:
-    if _mod_name not in sys.modules:
+    if _mod_name in sys.modules:
+        continue
+    try:
+        importlib.import_module(_mod_name)
+    except ImportError:
         sys.modules[_mod_name] = _MagicMock()
 
 from unittest.mock import AsyncMock, MagicMock, patch  # noqa: E402
@@ -41,14 +51,22 @@ import src.middleware.capacity_lock as capacity_lock_mod  # noqa: E402
 from src.claude_cli import (  # noqa: E402
     ClaudeCodeCLI,
     antwort_ende,
-    finish_reason_fuer_lauf,
+    lauf_abschluss,
     rate_limit_tracker,
-    usage_je_zug,
 )
 from src.sdk_parser import resilient_parse_message  # noqa: E402
 from tests import sdk_strom as sdk  # noqa: E402
 
 WORKER = "worker-brref"
+
+
+def finish_reason_fuer_lauf(chunks):
+    abschluss = lauf_abschluss(chunks)
+    return abschluss.finish_reason, abschluss.details()
+
+
+def usage_je_zug(chunks):
+    return lauf_abschluss(chunks).zuege
 
 # Lengths and usage as measured (struktur.txt lines 13, 15, 16/17); the texts
 # are placeholders of the same length.

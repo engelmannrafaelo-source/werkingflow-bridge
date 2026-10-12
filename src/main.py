@@ -1901,9 +1901,10 @@ async def generate_streaming_response(
         # fake finish_reason="stop" that hid truncation. Phase 2 will add
         # buffer-and-replay with internal retry so most crashes never surface.
         sdk_stream_error: Optional[Exception] = None
-        from src.claude_cli import NACH_MODELLABBRUCH_KEY
-        from src.claude_cli import ist_modell_abbruch as _chunk_ist_abbruch
-        abbruch_gesehen = False
+        # BRREF: one filter decides what belongs to the answer (claude_cli,
+        # "HOW THE MODEL ENDED") — here live, chunk by chunk.
+        from src.claude_cli import AbbruchFilter
+        stream_filter = AbbruchFilter()
 
         try:
             async for chunk in claude_cli.run_completion(
@@ -1942,13 +1943,8 @@ async def generate_streaming_response(
 
                 # BRREF: after a safety-classifier stop the CLI runs one more
                 # model call; its text is not the answer and is not streamed.
-                if abbruch_gesehen:
+                if not stream_filter.nimmt(chunk):
                     continue
-                if isinstance(chunk, dict) and chunk.get(NACH_MODELLABBRUCH_KEY):
-                    abbruch_gesehen = True
-                    continue
-                if isinstance(chunk, dict) and _chunk_ist_abbruch(chunk):
-                    abbruch_gesehen = True
 
                 # Check if we have an assistant message
                 # Handle both old format (type/message structure) and new format (direct content)
@@ -2099,7 +2095,7 @@ async def generate_streaming_response(
                     f"stream ended without completion marker "
                     f"({_truncation_marker.get('subtype')}) — response is truncated"
                 )
-            elif not content_sent and not chunks_have_tool_use(chunks_buffer) and not abbruch_gesehen:
+            elif not content_sent and not chunks_have_tool_use(chunks_buffer) and stream_filter.abbruch is None:
                 sdk_stream_error = StreamEndedWithoutCompletion(
                     f"stream ended without content ({len(chunks_buffer)} chunks)"
                 )
@@ -2107,22 +2103,17 @@ async def generate_streaming_response(
                 logger.error(f"❌ Streaming: {sdk_stream_error}")
 
         # Extract assistant response from all chunks for session storage
-        from src.claude_cli import (
-            chunks_bis_abbruch,
-            finish_reason_fuer_lauf,
-            modell_abbruch,
-        )
-        _stream_abbruch = modell_abbruch(chunks_buffer)
-        stream_finish_reason, stream_finish_details = finish_reason_fuer_lauf(chunks_buffer)
+        from src.claude_cli import lauf_abschluss
+        stream_abschluss = lauf_abschluss(chunks_buffer)
+        stream_finish_reason = stream_abschluss.finish_reason
+        stream_finish_details = stream_abschluss.details()
         if stream_finish_reason != "stop":
             logger.warning(
-                f"🛑 Streaming run ended with stop_reason={stream_finish_details.get('stop_reason')} "
+                f"🛑 Streaming run ended with stop_reason={stream_abschluss.stop_reason} "
                 f"→ finish_reason={stream_finish_reason} ({stream_finish_details})"
             )
         if actual_session_id and chunks_buffer:
-            assistant_content = claude_cli.parse_claude_message(
-                chunks_bis_abbruch(chunks_buffer, _stream_abbruch)
-            )
+            assistant_content = claude_cli.parse_claude_message(stream_abschluss.antwort_chunks)
             if assistant_content:
                 assistant_message = Message(role="assistant", content=assistant_content)
                 session_manager.add_assistant_response(actual_session_id, assistant_message)
@@ -4022,35 +4013,30 @@ async def chat_completions(
             # BRREF: how the model ended. A safety-classifier stop ends the
             # answer at the refused message — the CLI's follow-up turn is not
             # the answer — and is reported as content_filter, never as "stop".
-            from src.claude_cli import (
-                chunks_bis_abbruch,
-                finish_reason_fuer_lauf,
-                modell_abbruch,
-                usage_je_zug,
-            )
-            _abbruch = modell_abbruch(chunks)
-            _finish_reason, _finish_details = finish_reason_fuer_lauf(chunks)
-            _usage_zuege = usage_je_zug(chunks)
-            if _abbruch is not None:
+            # All output below (content, finish_reason, usage per call) reads
+            # from this one LaufAbschluss — and from the retry's, if one runs.
+            from src.claude_cli import lauf_abschluss
+            _abschluss = lauf_abschluss(chunks)
+            _usage_zuege = list(_abschluss.zuege)
+            if _abschluss.modell_abbruch:
                 raw_assistant_content = claude_cli.parse_claude_message(
-                    chunks_bis_abbruch(chunks, _abbruch)
+                    _abschluss.antwort_chunks
                 ) or ""
                 logger.warning(
-                    f"🛑 Model stop on worker {_self_worker}: stop_reason={_abbruch['stop_reason']} "
-                    f"category={_abbruch['category']} folgezuege={_abbruch['folgezuege']} "
+                    f"🛑 Model stop on worker {_self_worker}: {_abschluss.details()} "
                     f"partial_chars={len(raw_assistant_content)} — finish_reason=content_filter"
                 )
-            elif _finish_reason != "stop":
+            elif _abschluss.finish_reason != "stop":
                 logger.warning(
                     f"⚠️ Chat run on worker {_self_worker} ended with "
-                    f"stop_reason={_finish_details.get('stop_reason')} → finish_reason={_finish_reason}"
+                    f"stop_reason={_abschluss.stop_reason} → finish_reason={_abschluss.finish_reason}"
                 )
 
             # 2026-05-05 v2: detect SDK-early-termination (layered, post-parse).
             # Pure-function helpers in claude_cli.py validated by pytest.
             from src.claude_cli import is_incomplete_response, chunks_have_tool_use
             _has_tools = chunks_have_tool_use(chunks)
-            if _abbruch is None and is_incomplete_response(len(chunks), raw_assistant_content, _has_tools):
+            if not _abschluss.modell_abbruch and is_incomplete_response(len(chunks), raw_assistant_content, _has_tools):
                 logger.warning(
                     f"⚠️  Incomplete SDK response on worker {_self_worker} "
                     f"(chunks={len(chunks)}, content_empty=True, has_tools=False) "
@@ -4174,7 +4160,7 @@ async def chat_completions(
                         f"[Bridge {_self_worker}] Quota exhaustion detected in response content"
                     )
 
-            if not raw_assistant_content and _abbruch is None:
+            if not raw_assistant_content and not _abschluss.modell_abbruch:
                 # CRITICAL: Detailed error logging for debugging
                 logger.error(f"❌ parse_claude_message returned None!")
                 logger.error(f"   Chunks count: {len(chunks)}")
@@ -4223,7 +4209,7 @@ async def chat_completions(
             # hardened system prompt and max_turns=2 so a blocked-tool turn can still
             # recover with real text.
             if (
-                _abbruch is None
+                not _abschluss.modell_abbruch
                 and not request_body.enable_tools
                 and looks_like_tool_leak(assistant_content, prompt_chars=len(prompt or ""))
             ):
@@ -4251,8 +4237,30 @@ async def chat_completions(
                     if isinstance(chunk, dict) and chunk.get("type") == "x_claude_metadata":
                         continue
                     retry_chunks.append(chunk)
-                retry_raw = claude_cli.parse_claude_message(retry_chunks)
-                if retry_raw:
+                # The retry is a run of its own: same evaluation, and its
+                # calls are paid too — usage and per-call list include them.
+                _retry_abschluss = lauf_abschluss(retry_chunks)
+                _usage_zuege += [dict(z, lauf="tool_leak_retry") for z in _retry_abschluss.zuege]
+                _retry_usage = next(
+                    (u for u in map(extract_result_usage, retry_chunks) if u), None
+                )
+                if _retry_usage:
+                    result_usage = (
+                        {k: result_usage[k] + _retry_usage[k] for k in _retry_usage}
+                        if result_usage else _retry_usage
+                    )
+                retry_raw = claude_cli.parse_claude_message(_retry_abschluss.antwort_chunks)
+                if _retry_abschluss.modell_abbruch:
+                    # The original was a tool leak, the retry was stopped by
+                    # the model: neither is a finished answer.
+                    assistant_content = MessageAdapter.filter_content(retry_raw) if retry_raw else ""
+                    _abschluss = _retry_abschluss
+                    logger.warning(
+                        f"🛑 Tool-leak retry stopped by the model on worker {_self_worker}: "
+                        f"{_retry_abschluss.details()} partial_chars={len(assistant_content)} "
+                        f"— finish_reason=content_filter"
+                    )
+                elif retry_raw:
                     retry_content = MessageAdapter.filter_content(retry_raw)
                     if not looks_like_tool_leak(retry_content, prompt_chars=len(prompt or "")):
                         logger.info(
@@ -4260,6 +4268,7 @@ async def chat_completions(
                             f"(was {len(assistant_content)})"
                         )
                         assistant_content = retry_content
+                        _abschluss = _retry_abschluss
                     else:
                         logger.error(
                             "❌ Tool-leak retry still leaked — returning best-effort original response. "
@@ -4314,7 +4323,7 @@ async def chat_completions(
                 choices=[Choice(
                     index=0,
                     message=Message(role="assistant", content=assistant_content),
-                    finish_reason=_finish_reason
+                    finish_reason=_abschluss.finish_reason
                 )],
                 usage=Usage(
                     prompt_tokens=prompt_tokens,
@@ -4325,7 +4334,7 @@ async def chat_completions(
                     image_count=0  # Text-only request (no images)
                 ),
                 x_backend_info=BackendInfo(**get_backend_info_dict(backend_config)) if backend_config else None,
-                x_bridge_finish=_finish_details,
+                x_bridge_finish=_abschluss.details(),
                 x_bridge_model_calls=len(_usage_zuege) if (usage_source == "api" and _usage_zuege) else None,
                 x_bridge_usage_zuege=_usage_zuege or None,
             )
@@ -5071,13 +5080,15 @@ class ResearchAnswerTruncated(ResearchReportMissing):
 
 
 class ResearchModelStopped(ResearchReportMissing):
-    """antwort_im_text and a safety classifier stopped a message of the run
-    (antwort_ende "refusal", BRREF 12.10.2026). The CLI then lets the model
-    answer once more; that follow-up — typically a short refusal — is the final
-    message, but it is not the answer. Not retryable: the same request meets
-    the same classifier."""
+    """A safety classifier stopped a message of the run (antwort_ende
+    "refusal", BRREF 12.10.2026). The CLI then lets the model answer once more
+    and reports success; neither that follow-up nor a report file written up
+    to the stop is the finished research — for both answer contracts.
+    retryable=false: the run ended as the model decided; the same request is
+    likely to meet the same classifier."""
 
     fehler_code = "modell_abbruch"
+    retryable = False
 
 
 async def _research_strom(strom, antwort_im_text: bool):
@@ -5819,6 +5830,21 @@ async def _execute_research_impl(
                 )
                 raise RateLimitError(f"[Bridge research] Quota exhaustion detected in {_label}")
 
+        # BRREF: a model stop anywhere in the run ends the research as an
+        # error — before the generic "no output" case, which would blame rate
+        # limits, and regardless of the answer contract: the CLI reports
+        # success after its follow-up turn, and a report file that exists is
+        # no proof it was finished before the stop.
+        if research_antwort_ende in MODELL_ABBRUCH_STOP_REASONS:
+            raise ResearchModelStopped(
+                f"Research stopped by the model's safety classifier (antwort_ende="
+                f"{research_antwort_ende}, session_id={session_id}): "
+                + ("the final message is the CLI's follow-up turn, not the answer."
+                   if antwort_im_text else
+                   f"the report file {container_file} may be partly written and is not handed out."
+                   if container_file else "no report file was written.")
+            )
+
         if not discovered_files and not content and not parsed_assistant_text:
             logger.error(
                 f"❌ Research produced no output: "
@@ -5852,18 +5878,6 @@ async def _execute_research_impl(
                 f"the run's final message is not the complete answer. Not 'no answer' and not "
                 f"error_max_turns — the answer is longer than one message can be; a smaller "
                 f"task fits, the same request hits the same limit."
-            )
-        if research_antwort_ende in MODELL_ABBRUCH_STOP_REASONS:
-            if antwort_im_text:
-                raise ResearchModelStopped(
-                    f"Research answer stopped by the model's safety classifier (antwort_ende="
-                    f"{research_antwort_ende}, session_id={session_id}): the final message is the "
-                    f"CLI's follow-up turn, not the answer."
-                )
-            logger.warning(
-                f"research: a message was stopped by the safety classifier (antwort_ende="
-                f"{research_antwort_ende}, session_id={session_id}) — file contract, the report "
-                f"file is the answer; reported in antwort_ende"
             )
         if antwort_abgeschnitten(research_antwort_ende):
             # File contract: the report is the file, not the message. Reported

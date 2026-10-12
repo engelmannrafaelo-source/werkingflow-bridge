@@ -764,14 +764,16 @@ class ResearchResponse(ErrorVerdictFields):
             "of the answer. None when the run reported no end."
         ),
     )
-    fehler_code: Optional[Literal["antwort_abgeschnitten"]] = Field(
+    fehler_code: Optional[Literal["antwort_abgeschnitten", "modell_abbruch"]] = Field(
         default=None,
         description=(
             "status='error' only, when the bridge knows the cause: 'antwort_abgeschnitten' = "
             "antwort_im_text and the final message ended at the output limit "
             "(antwort_ende 'max_tokens'/'max_tokens_fortgesetzt'). Not 'no answer', not "
             "error_max_turns: the same request will hit the same limit (retryable=false), "
-            "a smaller one will not. None for every other error."
+            "a smaller one will not. 'modell_abbruch' = the model's safety classifier "
+            "stopped a message of the run (antwort_ende 'refusal'), for either answer "
+            "contract (retryable=false). None for every other error."
         ),
     )
     usage: Optional[ResearchUsage] = Field(
