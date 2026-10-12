@@ -320,3 +320,55 @@ async def test_abgeschnittener_pruefer_meldet_keine_luecken_freiheit(tmp_path, p
     assert meta.get("luecken_gemeldet") is None
     assert "abgeschnitten" in json.dumps(meta, ensure_ascii=False)
     assert result.status == "success"
+
+
+class _SperreInDerRueckrundeCli(FakeCli):
+    """The anonymize gate breaks only during the return round."""
+
+    def __init__(self, workdir, tools, urteil, **kw):
+        super().__init__(workdir, **kw)
+        self.tools = tools
+        self.urteil = urteil
+
+    def __call__(self, **kw):
+        if kw.get("resume_workdir") is not None and "does not exist" not in kw["prompt"]:
+            self.tools[-1].gate_error = "PrivacyServiceUnavailable: no endpoint answered"
+            self.tools[-1].gate_urteil = self.urteil
+        return super().__call__(**kw)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("urteil", [
+    {"fehler_code": "privacy_service_unreachable", "retryable": True},
+    {"fehler_code": "privacy_gate_failed", "retryable": False},
+])
+async def test_sperre_in_der_rueckrunde_beendet_den_lauf_als_fehler(tmp_path, persist, pplx_on, urteil):
+    """Kanzler, 12.10.2026: the report from before must not stay a success
+    once the gate broke in the return round — the run ends with the gate's
+    error (fehler_code / retryable as classified), and the job takes it over."""
+    from src.error_contract import JobFailure
+    from src.jobs import executors
+
+    work = tmp_path / "work"
+    work.mkdir()
+    tools = []
+    real_init = rpp.PoolPerplexityTool.__init__
+
+    def _init(self, *a, **kw):
+        real_init(self, *a, **kw)
+        tools.append(self)
+
+    fake = _SperreInDerRueckrundeCli(work, tools, urteil, mit_datei=True)
+    with patch.object(rpp.PoolPerplexityTool, "__init__", _init):
+        result = await _run(fake)
+    assert len(fake.calls["rueckrunde"]) == 1
+    assert result.status == "error", result.model_dump()
+    assert result.content is None
+    assert result.fehler_code == urteil["fehler_code"] and result.retryable is urteil["retryable"]
+    assert "Anonymisierungssperre fehlgeschlagen (PrivacyServiceUnavailable: no endpoint answered)" in result.error
+    # The return round's revision is not left in the file either.
+    assert fake.datei.read_text(encoding="utf-8") == ALT
+    with pytest.raises(JobFailure) as ei:
+        executors._raise_on_status_error("research", result.model_dump())
+    assert ei.value.retryable is urteil["retryable"]
+    assert ei.value.details.get("fehler_code") == urteil["fehler_code"]

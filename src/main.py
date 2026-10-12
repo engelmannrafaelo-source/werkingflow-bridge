@@ -5133,6 +5133,24 @@ def _research_annehmen(abschluss, *, session_id: Optional[str], was: str, usage=
         ) from e
 
 
+def _pool_sperre_pruefen(pool_pplx) -> None:
+    """The run ends with the anonymize gate's error once perplexity_search's
+    gate broke — after the first round and after the return round alike.
+    Nothing was sent (the handler refused), but a run whose privacy path was
+    broken is not handed out as a success. fehler_code / retryable from the
+    gate's cause (anonymize_gate.privacy_urteil)."""
+    if pool_pplx is None or not pool_pplx.gate_error:
+        return
+    gate_fehler = RuntimeError(
+        "perplexity_search: Anonymisierungssperre fehlgeschlagen "
+        f"({pool_pplx.gate_error}) — Lauf als Fehler beendet, die Anfrage wurde nicht gesendet"
+    )
+    urteil = pool_pplx.gate_urteil or {"fehler_code": "privacy_gate_failed", "retryable": False}
+    gate_fehler.fehler_code = urteil["fehler_code"]
+    gate_fehler.retryable = urteil["retryable"]
+    raise gate_fehler
+
+
 class ResearchModelStopped(ResearchReportMissing):
     """A safety classifier stopped a message of the run (antwort_ende
     "refusal", BRREF 12.10.2026). The CLI then lets the model answer once more
@@ -5434,8 +5452,13 @@ async def _pool_luecken_rueckrunde(
         return scheitern(
             f"Rückrunde abgeschnitten ({_rr_abschluss.transport or _rr_abschluss.unfertig})")
     if pool_pplx.gate_error:
-        # Same rule as the first round: a report written while the privacy
-        # gate was broken is not handed out — the caller raises on gate_error.
+        # Same rule as the first round: the run ends with the gate's error.
+        # This only leaves the revised report out and names the cause; the
+        # caller raises right after the round (_pool_sperre_pruefen) — the
+        # report from before is NOT handed out as a success either. The
+        # round's revision is undone like on every other failed round.
+        if datei is not None:
+            datei.write_text(bericht, encoding="utf-8")
         return scheitern(f"Anonymisierungssperre in der Rückrunde: {pool_pplx.gate_error}")
 
     if datei is not None:
@@ -6091,18 +6114,7 @@ async def _execute_research_impl(
                     extra={"container_file": container_file, "output_file": request_body.output_path}
                 )
 
-        if pool_pplx is not None and pool_pplx.gate_error:
-            # Nothing was sent (the handler refused), but a report written while
-            # the privacy path was broken is not one to hand out as a success.
-            # fehler_code / retryable from the gate's cause (privacy_urteil).
-            gate_fehler = RuntimeError(
-                "perplexity_search: Anonymisierungssperre fehlgeschlagen "
-                f"({pool_pplx.gate_error}) — Lauf als Fehler beendet, die Anfrage wurde nicht gesendet"
-            )
-            urteil = pool_pplx.gate_urteil or {"fehler_code": "privacy_gate_failed", "retryable": False}
-            gate_fehler.fehler_code = urteil["fehler_code"]
-            gate_fehler.retryable = urteil["retryable"]
-            raise gate_fehler
+        _pool_sperre_pruefen(pool_pplx)
 
         nachkontrolle = None
         if luecken_an and pool_pplx is not None:
@@ -6138,6 +6150,10 @@ async def _execute_research_impl(
                     accumulated_output_tokens = (accumulated_output_tokens or 0) + rr_usage["output_tokens"]
                     accumulated_cache_read += rr_usage["cache_read_tokens"]
                     accumulated_cache_creation += rr_usage["cache_creation_tokens"]
+                # The gate broke during the return round: same rule as after
+                # the first round — the run ends with the gate's error, even
+                # though the report from before was written while it held.
+                _pool_sperre_pruefen(pool_pplx)
                 if content_file and Path(content_file).exists():
                     file_size_bytes = Path(content_file).stat().st_size
 
