@@ -108,10 +108,14 @@ async def _post_self(client, path: str, body: Dict[str, Any], headers: Dict[str,
 
       * connection refused/reset, server gone mid-answer → transient (the
         request never arrived, or the worker restarted under it);
-      * read/write timeout → NOT promised as transient: the self-call timeout
-        sits above the endpoint's own budget (see the timeouts below), so the
-        endpoint ran past it — a retry would most likely run past it again,
-        at the price of a full run."""
+      * read/write timeout → NOT promised as transient. For research the
+        self-call timeout sits above the endpoint's overall deadline (time
+        chain in src/research_laufzeit.py, checked at import), so the endpoint
+        answers first — even when its deadline ran out (laufzeit_erschoepft).
+        A self-call timeout therefore means the endpoint broke its own
+        deadline; a retry would most likely do so again, at the price of a
+        full run. (Before BRREF-LAUFZEIT both were 2400 s, while one research
+        is up to five CLI calls of up to 2400 s each — not "above" at all.)"""
     import httpx
 
     from src.error_contract import JobFailure
@@ -292,9 +296,13 @@ async def _post_with_capacity_redispatch(
 # alive meanwhile, and the watchdog only requeues a genuinely dead worker.
 CHAT_SELF_CALL_TIMEOUT_S = float(os.getenv("BRIDGE_CHAT_JOB_TIMEOUT_S", "600"))
 
-# Research (esp. deep/exhaustive) can run far longer than a chat — many minutes up
-# to ~40 min. The heartbeat keeps the job row alive for the whole run.
-RESEARCH_SELF_CALL_TIMEOUT_S = float(os.getenv("BRIDGE_RESEARCH_JOB_TIMEOUT_S", "2400"))
+# Research (esp. deep/exhaustive) can run far longer than a chat — up to its
+# overall deadline. The heartbeat keeps the job row alive for the whole run.
+# The value lives in the time chain src/research_laufzeit.py (SSoT, checked
+# order: deadline 3300 < cross-worker 3400 < this 3500 < Energy poller 3600).
+from src.research_laufzeit import (  # noqa: E402
+    JOB_SELBSTAUFRUF_TIMEOUT_S as RESEARCH_SELF_CALL_TIMEOUT_S,
+)
 
 # Generic JSON proxy self-call timeout (default for allowlisted paths — short).
 PROXY_SELF_CALL_TIMEOUT_S = float(os.getenv("BRIDGE_PROXY_JOB_TIMEOUT_S", "300"))

@@ -766,6 +766,7 @@ class ResearchResponse(ErrorVerdictFields):
     )
     fehler_code: Optional[Literal[
         "antwort_abgeschnitten", "modell_abbruch", "privacy_gate_failed", "privacy_service_unreachable",
+        "laufzeit_erschoepft",
     ]] = Field(
         default=None,
         description=(
@@ -779,7 +780,32 @@ class ResearchResponse(ErrorVerdictFields):
             "(research-cloud prompt or perplexity_search) did not attest a verified "
             "anonymization — nothing was sent (retryable=false). 'privacy_service_unreachable' "
             "= no privacy endpoint answered (primary and fallback) — retryable once the service "
-            "is back. None for every other error."
+            "is back. 'laufzeit_erschoepft' = a mandatory round (main run, repair "
+            "round) did not finish within the run's overall deadline (laufzeit.frist_s) or "
+            "the CLI's MAX_TIMEOUT; the agent was terminated, no partial report "
+            "(retryable=false). None for every other error."
+        ),
+    )
+    nachkontrolle: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description=(
+            "Pool path with the gap check on, success AND error: what the check after the "
+            "report did. status 'durchgefuehrt' (checked; nothing open, or the return round "
+            "revised the report), 'uebersprungen' (a step left out — the run's remaining time "
+            "or the perplexity budget; grund names it), 'gescheitert' (the check or the "
+            "return round failed, e.g. it ran out of time — the report handed out is the "
+            "complete one from BEFORE the return round). Also: rueckrunde, luecken_gemeldet, "
+            "luecken_ohne_suche, luecken_ohne_suche_nach_rueckrunde, nachmessung. None when "
+            "the gap check was not part of the run."
+        ),
+    )
+    laufzeit: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description=(
+            "Pool path, success AND error: gesamt_s = run time of the whole call (every "
+            "round), frist_s = the run's overall deadline, runden = seconds per round "
+            "(hauptlauf, reparatur, pruefer, rueckrunde, nachmessung). execution_time_seconds "
+            "is the same whole-call time."
         ),
     )
     usage: Optional[ResearchUsage] = Field(

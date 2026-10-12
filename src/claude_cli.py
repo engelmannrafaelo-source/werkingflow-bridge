@@ -1671,6 +1671,7 @@ class ClaudeCodeCLI:
         resume_workdir: Optional[Path] = None,
         cache_boundary: Optional[int] = None,
         antwort_im_text: bool = False,
+        timeout_s: Optional[float] = None,
     ) -> AsyncGenerator[Dict[str, Any], None]:
         """Run Claude Code using the Python SDK and yield response chunks.
 
@@ -1728,6 +1729,12 @@ class ClaudeCodeCLI:
                         protocol names the final message as the answer and
                         no OUTPUT_FILE_PATH is injected.
         """
+        # timeout_s (BRREF-LAUFZEIT): the caller's remaining time, e.g. the
+        # research run's overall deadline. Never longer than MAX_TIMEOUT. When
+        # it fires, asyncio.timeout cancels the SDK query, whose finally closes
+        # the transport and terminates the CLI process — the agent stops and
+        # costs nothing more.
+        _timeout = self.timeout if timeout_s is None else max(1.0, min(self.timeout, float(timeout_s)))
         _prompt_as_received = prompt
         if resume_workdir is not None:
             if not session_id or continue_session:
@@ -2234,8 +2241,8 @@ class ClaudeCodeCLI:
                 # === END: Save exact prompt ===
 
                 # Run the query with timeout to prevent zombie processes
-                # Timeout is set to self.timeout (converted from ms to seconds in __init__)
-                logger.info(f"🕐 Starting SDK query with {self.timeout}s timeout")
+                # Timeout is set to _timeout (MAX_TIMEOUT, or the caller's shorter timeout_s)
+                logger.info(f"🕐 Starting SDK query with {_timeout}s timeout")
 
                 # Setup file-based caching for crash recovery
                 # Use unique filename to prevent race conditions
@@ -2328,7 +2335,7 @@ class ClaudeCodeCLI:
                 nach_abbruch_ausstehend = False
                 _api_error_turn = None
                 try:
-                    async with asyncio.timeout(self.timeout):
+                    async with asyncio.timeout(_timeout):
                         async for message in query(prompt=prompt_source, options=options):
                             # Skip None messages (from monkey-patched parse_message for unknown types)
                             if message is None:
@@ -2568,9 +2575,9 @@ class ClaudeCodeCLI:
                             os.environ.get("INSTANCE_NAME", "unknown"),
                             _api_error_turn, None,
                         )
-                    logger.error(f"⏱️ TIMEOUT: SDK query timed out after {self.timeout}s")
+                    logger.error(f"⏱️ TIMEOUT: SDK query timed out after {_timeout}s")
                     logger.error(f"   Timeout Type: Claude Code SDK Query (Inner Loop)")
-                    logger.error(f"   Timeout Duration: {self.timeout}s ({self.timeout/60:.1f} minutes)")
+                    logger.error(f"   Timeout Duration: {_timeout}s ({_timeout/60:.1f} minutes)")
                     logger.error(f"   Session ID: {cli_session_id}")
                     logger.error(f"   Chunks received before timeout: {chunks_received}")
                     logger.error(f"   Impact: Query cancelled to prevent zombie process")
@@ -2587,7 +2594,7 @@ class ClaudeCodeCLI:
                         "type": "result",
                         "subtype": "timeout_incomplete",
                         "is_error": True,
-                        "error_message": f"Claude Code SDK query timed out after {self.timeout}s ({self.timeout/60:.1f} minutes). For long research operations, increase MAX_TIMEOUT.",
+                        "error_message": f"Claude Code SDK query timed out after {_timeout}s ({_timeout/60:.1f} minutes). For long research operations, increase MAX_TIMEOUT.",
                         "action_required": "INCREASE_TIMEOUT_OR_REDUCE_PROMPT"
                     }
                     raise  # Re-raise to ensure proper cleanup
@@ -2907,7 +2914,7 @@ class ClaudeCodeCLI:
             cli_session_manager.complete_session(cli_session_id, status="failed")
             logger.error(f"⏱️ TIMEOUT: CLI session timed out: {cli_session_id}")
             logger.error(f"   Timeout Type: Claude Code SDK Query (Session Level)")
-            logger.error(f"   Timeout Duration: {self.timeout}s ({self.timeout/60:.1f} minutes)")
+            logger.error(f"   Timeout Duration: {_timeout}s ({_timeout/60:.1f} minutes)")
             logger.error(f"   Session ID: {cli_session_id}")
             logger.error(f"   Action: Re-raising timeout exception for upstream handling")
             logger.error(f"   Suggestion: Increase MAX_TIMEOUT env var (current: {self.timeout*1000}ms, recommended for research: 2400000ms)")

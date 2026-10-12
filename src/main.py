@@ -11,7 +11,7 @@ from pathlib import Path
 from datetime import datetime, timedelta
 import shutil
 from typing import Optional, AsyncGenerator, Dict, Any, List, Tuple
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, nullcontext
 
 from fastapi import FastAPI, HTTPException, Request, Depends
 from fastapi.security import HTTPAuthorizationCredentials
@@ -1318,7 +1318,18 @@ async def _cross_worker_retry(
     # so a hung retry does not itself become the 429 source.
     request_path = str(request.url.path) or "/v1/chat/completions"
     if request_path.endswith("/v1/research"):
-        retry_timeout_s = 2400.0  # match SDK 2400s ceiling
+        # Time chain (src/research_laufzeit.py, SSoT): the peer works to the
+        # ORIGINAL deadline of this research (forwarded header), and this
+        # waiter waits longer than that deadline — it never gives up on a
+        # run that is still going and being paid for.
+        from src.research_laufzeit import (
+            CROSS_WORKER_TIMEOUT_S,
+            FRIST_HEADER,
+            frist_bis,
+        )
+        retry_timeout_s = CROSS_WORKER_TIMEOUT_S
+        _bis = getattr(getattr(request, "state", None), "research_frist_bis", None)
+        headers[FRIST_HEADER] = repr(_bis if isinstance(_bis, float) else frist_bis(request))
     else:
         retry_timeout_s = 30.0
 
@@ -5045,13 +5056,15 @@ _LUECKEN_PRUEFER_OHNE_WERKZEUGE = [
 ]
 
 
-def _pool_luecken_pruefer(backend_config: Optional[BackendConfig]):
-    """Gap checker for the pool path: one CLI turn of the cheap model."""
+def _pool_luecken_pruefer(backend_config: Optional[BackendConfig], laufzeit=None):
+    """Gap checker for the pool path: one CLI turn of the cheap model. With
+    the run's Laufzeit it never runs past the run's deadline."""
     from src.research_cloud.luecken import PRUEF_MODELL, pool_pruefer
 
     async def lauf(system: str, anfrage: str):
         chunks: List[Dict[str, Any]] = []
         async for chunk in claude_cli.run_completion(
+            timeout_s=laufzeit.frist_fuer("pruefer") if laufzeit is not None else None,
             prompt=anfrage,
             system_prompt=system,
             model=PRUEF_MODELL,
@@ -5237,6 +5250,7 @@ BERICHTSDATEI_NACHHOLEN_MAX_TURNS = 6
 
 async def _pool_berichtsdatei_nachholen(
     *,
+    laufzeit=None,
     cli_resume_id: Optional[str],
     datei: Optional[Path],
     chat_chars: int,
@@ -5273,18 +5287,22 @@ async def _pool_berichtsdatei_nachholen(
         f"{cli_resume_id} once to write {datei}"
     )
     chunks: List[Dict[str, Any]] = []
-    async for chunk in claude_cli.run_completion(
-        prompt=auftrag,
-        append_system_prompt=append_system_prompt,
-        model=request_body.model,
-        max_turns=BERICHTSDATEI_NACHHOLEN_MAX_TURNS,
-        stream=True,
-        backend_env_vars=backend_config.env_vars if backend_config else None,
-        sdk_mcp_servers=sdk_mcp_servers,
-        session_id=cli_resume_id,
-        resume_workdir=datei.parent.parent,
-    ):
-        chunks.append(chunk)
+    # Mandatory round: within the run's deadline; a timeout here ends the run
+    # with laufzeit_erschoepft (research_laufzeit.als_laufzeitfehler).
+    with (laufzeit.messen("reparatur") if laufzeit is not None else nullcontext()):
+        async for chunk in claude_cli.run_completion(
+            timeout_s=laufzeit.frist_fuer("reparatur") if laufzeit is not None else None,
+            prompt=auftrag,
+            append_system_prompt=append_system_prompt,
+            model=request_body.model,
+            max_turns=BERICHTSDATEI_NACHHOLEN_MAX_TURNS,
+            stream=True,
+            backend_env_vars=backend_config.env_vars if backend_config else None,
+            sdk_mcp_servers=sdk_mcp_servers,
+            session_id=cli_resume_id,
+            resume_workdir=datei.parent.parent,
+        ):
+            chunks.append(chunk)
     usage: Optional[Dict[str, int]] = None
     for chunk in chunks:
         u = extract_result_usage(chunk)
@@ -5340,6 +5358,7 @@ def _rueckrunden_usage(
 
 async def _pool_luecken_rueckrunde(
     *,
+    laufzeit=None,
     nachkontrolle,
     offene,
     bericht: str,
@@ -5396,8 +5415,18 @@ async def _pool_luecken_rueckrunde(
         ziel=ziel,
     )
     chunks: List[Dict[str, Any]] = []
+    from src.research_laufzeit import PRUEFER_MIN_REST_S
+    if laufzeit is not None:
+        laufzeit.beginne("rueckrunde")
     try:
         async for chunk in claude_cli.run_completion(
+            # Optional round: it ends in time for the re-check after it; a
+            # timeout here is a failed return round (report from before,
+            # named in nachkontrolle), never an overrun of the run's deadline.
+            timeout_s=(
+                laufzeit.frist_fuer("rueckrunde", reserve_s=PRUEFER_MIN_REST_S)
+                if laufzeit is not None else None
+            ),
             prompt=auftrag,
             append_system_prompt=append_system_prompt,
             model=request_body.model,
@@ -5415,6 +5444,8 @@ async def _pool_luecken_rueckrunde(
         ):
             chunks.append(chunk)
     except Exception as e:
+        if laufzeit is not None:
+            laufzeit.beende("rueckrunde")
         # Hat das Modell die Datei vor dem Abbruch schon ueberschrieben, kommt
         # der Bericht von vorher an seinen Platz — Datei und Antwort gleich.
         if datei is not None:
@@ -5424,7 +5455,15 @@ async def _pool_luecken_rueckrunde(
         # The exception ends here, so the outer error path never sees it.
         rr_usage = _rueckrunden_usage(chunks, _vorenthaltene_usage(e))
         nachkontrolle.rueckrunde_usage = dict(rr_usage or {}, usage_source="api" if rr_usage else "missing")
+        if isinstance(e, TimeoutError):
+            return scheitern(
+                f"laufzeit: Rückrunde nach {laufzeit.runden.get('rueckrunde', 0):.0f} s abgebrochen, "
+                "die Frist des Laufs reichte nicht — Agent beendet" if laufzeit is not None
+                else f"laufzeit: Rückrunde an MAX_TIMEOUT abgebrochen ({e})"
+            )
         return scheitern(f"{type(e).__name__}: {e}")
+    if laufzeit is not None:
+        laufzeit.beende("rueckrunde")
     rr_usage = _rueckrunden_usage(chunks, None)
     nachkontrolle.rueckrunde_usage = dict(rr_usage or {}, usage_source="api" if rr_usage else "missing")
     # The acceptance point, strict: abgeschnitten (ZB3D), error_max_turns
@@ -5475,7 +5514,13 @@ async def _pool_luecken_rueckrunde(
             Path(output_file).write_text(neu, encoding="utf-8")
         except OSError as e:
             logger.error(f"research Lücken-Nachkontrolle: output_file nicht aktualisiert: {e}")
-    await nachkontrolle.nachmessen(neu, protokoll_aus_pool_chunks(list(erste_chunks) + chunks))
+    if laufzeit is not None and not laufzeit.reicht(PRUEFER_MIN_REST_S):
+        nachkontrolle.ueberspringen(
+            "nachmessung", f"laufzeit: {laufzeit.rest():.0f} s Rest, Nachmessung braucht {PRUEFER_MIN_REST_S:.0f} s",
+        )
+    else:
+        with (laufzeit.messen("nachmessung") if laufzeit is not None else nullcontext()):
+            await nachkontrolle.nachmessen(neu, protokoll_aus_pool_chunks(list(erste_chunks) + chunks))
     return neu, rr_usage
 
 
@@ -5547,6 +5592,10 @@ async def _execute_research_impl(
     # perplexity_search of this run (pool path); its Sperrstand wins in the
     # error path below over every other error (anonymize_gate.sperre_gewinnt).
     pool_pplx = None
+    # The run's overall deadline and per-round run time (research_laufzeit).
+    from src.research_laufzeit import Laufzeit
+    laufzeit = Laufzeit.fuer_anfrage(request)
+    nachkontrolle = None
 
     try:
         logger.info(
@@ -5741,7 +5790,9 @@ async def _execute_research_impl(
         cli_resume_id: Optional[str] = None
 
         research_lauf_gestartet = True
+        laufzeit.beginne("hauptlauf")
         async for chunk in _research_strom(claude_cli.run_completion(
+            timeout_s=laufzeit.frist_fuer("hauptlauf"),
             prompt=research_prompt,
             append_system_prompt=library_append_prompt,
             model=request_body.model,
@@ -5784,6 +5835,7 @@ async def _execute_research_impl(
                 accumulated_cache_read += _chunk_usage["cache_read_tokens"]
                 accumulated_cache_creation += _chunk_usage["cache_creation_tokens"]
 
+        laufzeit.beende("hauptlauf")
         if not all_chunks:
             raise ValueError("No response received from Claude Code execution")
 
@@ -6052,6 +6104,7 @@ async def _execute_research_impl(
             # result goes. If that cannot produce the file, the run fails loud.
             try:
                 content, nachhol_usage = await _pool_berichtsdatei_nachholen(
+                    laufzeit=laufzeit,
                     cli_resume_id=cli_resume_id,
                     datei=ordered_file,
                     chat_chars=len(parsed_assistant_text.strip()),
@@ -6121,17 +6174,37 @@ async def _execute_research_impl(
 
         _pool_sperre_pruefen(pool_pplx)
 
-        nachkontrolle = None
         if luecken_an and pool_pplx is not None:
-            from src.research_cloud.luecken import Nachkontrolle, protokoll_aus_pool_chunks
-            nachkontrolle = Nachkontrolle(pruefer=_pool_luecken_pruefer(backend_config))
-            offene = await nachkontrolle.entscheide(
-                content or "",
-                protokoll_aus_pool_chunks(all_chunks),
-                perplexity_rest=pool_pplx.max_uses - pool_pplx.calls,
+            from src.research_cloud.luecken import (
+                Nachkontrolle,
+                protokoll_aus_pool_chunks,
             )
+            from src.research_laufzeit import PRUEFER_MIN_REST_S, RUECKRUNDE_MIN_REST_S
+            nachkontrolle = Nachkontrolle(pruefer=_pool_luecken_pruefer(backend_config, laufzeit))
+            # Optional rounds start only when the remaining time is enough for
+            # them — skipped and named otherwise, never started to overrun.
+            offene = None
+            if not laufzeit.reicht(PRUEFER_MIN_REST_S):
+                nachkontrolle.ueberspringen(
+                    "pruefung", f"laufzeit: {laufzeit.rest():.0f} s Rest, Prüfung braucht {PRUEFER_MIN_REST_S:.0f} s",
+                )
+            else:
+                with laufzeit.messen("pruefer"):
+                    offene = await nachkontrolle.entscheide(
+                        content or "",
+                        protokoll_aus_pool_chunks(all_chunks),
+                        perplexity_rest=pool_pplx.max_uses - pool_pplx.calls,
+                    )
+            if offene and not laufzeit.reicht(RUECKRUNDE_MIN_REST_S + PRUEFER_MIN_REST_S):
+                nachkontrolle.ueberspringen(
+                    "rueckrunde",
+                    f"laufzeit: {laufzeit.rest():.0f} s Rest, Rückrunde und Nachmessung brauchen "
+                    f"{RUECKRUNDE_MIN_REST_S + PRUEFER_MIN_REST_S:.0f} s",
+                )
+                offene = None
             if offene:
                 content, rr_usage = await _pool_luecken_rueckrunde(
+                    laufzeit=laufzeit,
                     nachkontrolle=nachkontrolle,
                     offene=offene,
                     bericht=content or "",
@@ -6161,6 +6234,11 @@ async def _execute_research_impl(
                 _pool_sperre_pruefen(pool_pplx)
                 if content_file and Path(content_file).exists():
                     file_size_bytes = Path(content_file).stat().st_size
+
+        # Run time of the WHOLE call, every round included (BRREF-LAUFZEIT:
+        # it used to stop after the main run — 282 s for a 2392 s run).
+        laufzeit.beende_alle()
+        execution_time = time.time() - start_time
 
         # R1: Persist activity — resolve token counts (SDK-provided preferred, estimate fallback)
         try:
@@ -6251,6 +6329,8 @@ async def _execute_research_impl(
             library_calls=library_calls if library_active else None,
             antwort_quelle=antwort_quelle,
             antwort_ende=research_antwort_ende,
+            nachkontrolle=nachkontrolle.status() if nachkontrolle is not None else None,
+            laufzeit=laufzeit.details(),
             **_research_usage_felder(
                 accumulated_input_tokens, accumulated_output_tokens,
                 accumulated_cache_creation, accumulated_cache_read, USAGE_FEHLT_CLI,
@@ -6267,7 +6347,12 @@ async def _execute_research_impl(
         # the next model turn, a missing report, an account limit
         # (anonymize_gate.sperre_gewinnt). Then no other worker repeats the run.
         from src.research_cloud.anonymize_gate import sperre_gewinnt
+        from src.research_laufzeit import als_laufzeitfehler
         e = sperre_gewinnt(getattr(pool_pplx, "sperre", None), e)
+        # A CLI timeout in a mandatory round: the deadline (or MAX_TIMEOUT)
+        # ran out, the agent was terminated — its own code, not a generic error.
+        e = als_laufzeitfehler(e, laufzeit)
+        laufzeit.beende_alle()
         if isinstance(e, (WorkerUnavailableError, RateLimitError)):
             # Re-raise to trigger HTTP 503 and Nginx failover to another worker.
             # RateLimitError: account limit — rate_limit_handler retries on another
@@ -6342,6 +6427,8 @@ async def _execute_research_impl(
             # carries the end of what it had streamed until then.
             antwort_ende=research_antwort_ende or getattr(e, "antwort_ende", None),
             fehler_code=getattr(e, "fehler_code", None),
+            nachkontrolle=nachkontrolle.status() if nachkontrolle is not None else None,
+            laufzeit=laufzeit.details(),
             # The raiser's own verdict (error_contract rule 1), e.g. CliApiError:
             # a 400 from the API stays final, a 529 may be asked again.
             **_eigenes_urteil(e),

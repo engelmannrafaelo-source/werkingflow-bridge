@@ -423,6 +423,10 @@ class Nachkontrolle:
     pruef_kosten_usd: float = 0.0
     pruef_kosten_fehlen: int = 0
     rueckrunde_usage: Dict[str, Any] = field(default_factory=dict)
+    # BRREF-LAUFZEIT: a step left out because the run's remaining time was not
+    # enough for it ("pruefung" / "rueckrunde" / "nachmessung") and why.
+    uebersprungen: Dict[str, str] = field(default_factory=dict)
+    nachmessung_durchgefuehrt: bool = False
     _entschieden: bool = False
 
     async def _pruefe(self, bericht: str, protokoll: List[WerkzeugAufruf], phase: str) -> Optional[LueckenBefund]:
@@ -475,9 +479,55 @@ class Nachkontrolle:
         )
         return offene
 
+    def ueberspringen(self, schritt: str, grund: str) -> None:
+        """A step is left out on purpose (the run's remaining time) — named,
+        never silent. Skipping the check itself also settles the decision."""
+        self.uebersprungen[schritt] = grund
+        if schritt == "pruefung":
+            self._entschieden = True
+            self.rueckrunde_grund = "pruefung_uebersprungen"
+        elif schritt == "rueckrunde":
+            self.rueckrunde = False
+            self.rueckrunde_grund = "rueckrunde_uebersprungen"
+        logger.warning(f"research Lücken-Nachkontrolle: {schritt} übersprungen ({grund})")
+
+    def status(self) -> Dict[str, Any]:
+        """What the caller sees (ResearchResponse.nachkontrolle):
+        status durchgefuehrt / uebersprungen / gescheitert, with grund.
+
+        durchgefuehrt = checked, and either nothing was open or the return
+        round revised the report; uebersprungen = a step was left out (time,
+        perplexity budget); gescheitert = the check or the return round failed
+        — the report handed out is the one from before the return round."""
+        if self.rueckrunde_fehler:
+            status, grund = "gescheitert", self.rueckrunde_fehler
+        elif self.rueckrunde_grund == "pruefung_fehlgeschlagen":
+            status, grund = "gescheitert", "; ".join(self.pruef_fehler) or "pruefung_fehlgeschlagen"
+        elif self.uebersprungen:
+            status = "uebersprungen"
+            grund = "; ".join(f"{k}: {v}" for k, v in self.uebersprungen.items())
+        elif self.rueckrunde_grund == "budget_erschoepft":
+            status, grund = "uebersprungen", "perplexity_search-Budget erschöpft"
+        else:
+            status, grund = "durchgefuehrt", self.rueckrunde_grund
+        return {
+            "status": status,
+            "grund": grund,
+            "rueckrunde": self.rueckrunde and not self.rueckrunde_fehler,
+            "luecken_gemeldet": self.luecken_gemeldet,
+            "luecken_ohne_suche": self.luecken_ohne_suche,
+            "luecken_ohne_suche_nach_rueckrunde": self.luecken_ohne_suche_nach_rueckrunde,
+            "nachmessung": (
+                "durchgefuehrt" if self.nachmessung_durchgefuehrt
+                else "uebersprungen" if "nachmessung" in self.uebersprungen
+                else None
+            ),
+        }
+
     async def nachmessen(self, bericht: str, protokoll: List[WerkzeugAufruf]) -> None:
         """After the return round: count again. Measures only, triggers nothing."""
         befund = await self._pruefe(bericht, protokoll, "nachher")
+        self.nachmessung_durchgefuehrt = befund is not None
         if befund is not None:
             self.luecken_nach_rueckrunde = len(befund.luecken)
             self.luecken_ohne_suche_nach_rueckrunde = len(offene_luecken(befund))
@@ -503,4 +553,7 @@ class Nachkontrolle:
             meta["rueckrunde_usage"] = self.rueckrunde_usage
         if self.rueckrunde_fehler:
             meta["rueckrunde_fehler"] = self.rueckrunde_fehler
+        if self.uebersprungen:
+            meta["luecken_uebersprungen"] = dict(self.uebersprungen)
+        meta["nachkontrolle_status"] = self.status()["status"]
         return meta
