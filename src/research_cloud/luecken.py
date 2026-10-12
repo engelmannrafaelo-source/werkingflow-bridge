@@ -86,6 +86,18 @@ def nachkontrolle_aktiv(perplexity_an: bool) -> bool:
     raise LueckenKonfigFehler(f"{FLAG}={roh!r} ist kein gültiger Wert (an: {_AN}, aus: {_AUS})")
 
 
+# Per request (P6NOGAP, 12.10.2026): ResearchRequest.luecken_nachkontrolle=false
+# switches the check off for this request — the caller checks the report
+# itself. Visible in the response as status=uebersprungen with this reason,
+# whatever the deployment flag says; it can never switch the check on.
+ABWAHL_GRUND = "anfrage: luecken_nachkontrolle=false"
+
+
+def abgewaehlt(request_body: Any) -> bool:
+    """True only for an explicit false; missing/None/true leave the deployment flag in charge."""
+    return getattr(request_body, "luecken_nachkontrolle", None) is False
+
+
 # ---------------------------------------------------------------------------
 # Tool log
 # ---------------------------------------------------------------------------

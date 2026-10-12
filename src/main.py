@@ -6174,7 +6174,9 @@ async def _execute_research_impl(
 
         _pool_sperre_pruefen(pool_pplx)
 
-        if luecken_an and pool_pplx is not None:
+        from src.research_cloud.luecken import ABWAHL_GRUND, abgewaehlt
+        luecken_abgewaehlt = abgewaehlt(request_body)
+        if luecken_abgewaehlt or (luecken_an and pool_pplx is not None):
             from src.research_cloud.luecken import (
                 Nachkontrolle,
                 protokoll_aus_pool_chunks,
@@ -6184,9 +6186,10 @@ async def _execute_research_impl(
             # Optional rounds start only when the remaining time is enough for
             # them — skipped and named otherwise, never started to overrun.
             offene = None
-            if getattr(request_body, "luecken_nachkontrolle", None) is False:
-                # The caller checks the report itself (Energy P6) — named, not silent.
-                nachkontrolle.ueberspringen("pruefung", "anfrage: luecken_nachkontrolle=false")
+            if luecken_abgewaehlt:
+                # The caller checks the report itself (Energy P6) — named, not
+                # silent, also when the deployment has the check off anyway.
+                nachkontrolle.ueberspringen("pruefung", ABWAHL_GRUND)
             elif not laufzeit.reicht(PRUEFER_MIN_REST_S):
                 nachkontrolle.ueberspringen(
                     "pruefung", f"laufzeit: {laufzeit.rest():.0f} s Rest, Prüfung braucht {PRUEFER_MIN_REST_S:.0f} s",
@@ -6577,17 +6580,23 @@ async def _execute_research_cloud_impl(
     # Lücken-Nachkontrolle (Rafael 03.10.2026): same switch semantics as the
     # pool path; the checker is a forced tool call on the research lane's key.
     from src.research_cloud.luecken import (
+        ABWAHL_GRUND,
         LueckenKonfigFehler,
         Nachkontrolle,
+        abgewaehlt,
         messages_api_pruefer,
         nachkontrolle_aktiv,
     )
     nachkontrolle = None
+    # luecken_nachkontrolle=false: the caller checks the report itself — the
+    # executor gets no check, the response names the skip (also with the
+    # deployment flag off).
+    abgewaehlt_nk = None
+    if abgewaehlt(request_body):
+        abgewaehlt_nk = Nachkontrolle(pruefer=None)
+        abgewaehlt_nk.ueberspringen("pruefung", ABWAHL_GRUND)
     try:
-        # luecken_nachkontrolle=false: the caller checks the report itself.
-        if nachkontrolle_aktiv(perplexity_enabled(perplexity_cfg)) and (
-            getattr(request_body, "luecken_nachkontrolle", None) is not False
-        ):
+        if nachkontrolle_aktiv(perplexity_enabled(perplexity_cfg)) and abgewaehlt_nk is None:
             # Same key as the executor; without it the executor itself refuses
             # the run before the checker could ever be asked.
             nachkontrolle = Nachkontrolle(
@@ -6772,6 +6781,7 @@ async def _execute_research_cloud_impl(
         library_calls=result.library_calls,
         antwort_quelle="text",
         antwort_ende=result.stop_reason,
+        nachkontrolle=abgewaehlt_nk.status() if abgewaehlt_nk is not None else None,
         **_cloud_usage_felder(result.usage),
     )
 
