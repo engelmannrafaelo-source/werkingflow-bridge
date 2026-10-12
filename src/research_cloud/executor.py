@@ -33,7 +33,7 @@ from typing import Any, Awaitable, Callable, Dict, List, Optional
 import httpx
 
 from src.lauf_abschluss import LaufUnfertig, ModellAbbruch, abschluss_aus_stop_reason, annehmen
-from src.research_cloud.anonymize_gate import PRIVACY_GATE_FAILED, privacy_urteil
+from src.research_cloud.anonymize_gate import CloudAnonymizeError, Sperrstand, sperre_pruefen
 from src.research_cloud.library import (
     LibraryConfig,
     LibraryFetchError,
@@ -291,6 +291,7 @@ async def _handle_perplexity_tool_call(
     perplexity_cfg: PerplexityConfig,
     anonymize: Callable[[str], Awaitable[str]],
     client: httpx.AsyncClient,
+    sperre: Optional[Sperrstand] = None,
 ) -> tuple:
     """Execute one perplexity_search tool_use. Returns (tool_result, answer|None).
 
@@ -307,21 +308,23 @@ async def _handle_perplexity_tool_call(
              "content": [{"type": "text", "text": "perplexity_search braucht den Parameter 'frage'."}]},
             None,
         )
+    # The run's Sperrstand (one per run) is what the round loop checks after
+    # every round (anonymize_gate.sperre_pruefen); a call without one keeps
+    # the same verdict on its own.
+    stand = sperre if sperre is not None else Sperrstand()
     try:
         anonymized = await anonymize(frage)
     except Exception as e:
-        fehler = ResearchCloudExecutorError(
+        stand.vermerken(e, meldung=(
             f"perplexity_search: anonymize gate failed — refusing to send the query to Perplexity: {e}"
-        )
-        urteil = privacy_urteil(e)
-        fehler.fehler_code, fehler.retryable = urteil["fehler_code"], urteil["retryable"]
-        raise fehler from e
+        ))
+        sperre_pruefen(stand, fehler_typ=ResearchCloudExecutorError)
     if not anonymized or not anonymized.strip():
-        fehler = ResearchCloudExecutorError(
-            "perplexity_search: anonymize gate returned empty text — refusing to send the query"
+        stand.vermerken(
+            CloudAnonymizeError("anonymize gate returned empty text"),
+            meldung="perplexity_search: anonymize gate returned empty text — refusing to send the query",
         )
-        fehler.fehler_code, fehler.retryable = PRIVACY_GATE_FAILED, False
-        raise fehler
+        sperre_pruefen(stand, fehler_typ=ResearchCloudExecutorError)
     try:
         answer = await ask_perplexity(anonymized, perplexity_cfg, client)
     except PerplexityCallError as e:
@@ -511,6 +514,10 @@ async def run_research_cloud(
     iteration = 0
     gesamt_iterationen = 0
     phase = "bericht"
+    # Privacy state of this run, checked after every round (first round and
+    # return round) — anonymize_gate.sperre_pruefen, the same check point the
+    # pool path uses.
+    sperre = Sperrstand()
     vorher_parsed: Optional[AnthropicMessagesResponse] = None
     usage_vor_rueckrunde: Optional[ResearchCloudUsage] = None
     t0 = time.monotonic()
@@ -629,7 +636,7 @@ async def run_research_cloud(
                                     continue
                                 perplexity_calls += 1
                                 tool_result, answer = await _handle_perplexity_tool_call(
-                                    tool_block, perplexity_cfg, anonymize, pplx_client
+                                    tool_block, perplexity_cfg, anonymize, pplx_client, sperre
                                 )
                                 if answer is not None:
                                     if answer.kosten_usd is None:
@@ -744,15 +751,20 @@ async def run_research_cloud(
                         f"{config.max_continuations} without finishing (still {parsed.stop_reason})"
                     )
             except ResearchCloudExecutorError as e:
+                # Privacy check point: a gate that broke in this round ends the
+                # run with its error — in the return round too; the report from
+                # before is not handed out as a success then.
+                sperre_pruefen(sperre, fehler_typ=ResearchCloudExecutorError)
                 if phase != "rueckrunde":
                     raise
-                # The return round failed: the report written before it is
-                # still a finished report — hand that out and say why.
+                # The return round failed otherwise: the report written before
+                # it is still a finished report — hand that out and say why.
                 nachkontrolle.rueckrunde_fehler = f"{type(e).__name__}: {e}"[:500]
                 logger.error(f"research-cloud: Rückrunde fehlgeschlagen, Bericht von vorher bleibt: {e}")
                 parsed = vorher_parsed
                 break
             gesamt_iterationen += iteration + 1
+            sperre_pruefen(sperre, fehler_typ=ResearchCloudExecutorError)
             if nachkontrolle is None:
                 break
             if phase == "rueckrunde":

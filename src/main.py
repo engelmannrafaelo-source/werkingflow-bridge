@@ -5134,21 +5134,13 @@ def _research_annehmen(abschluss, *, session_id: Optional[str], was: str, usage=
 
 
 def _pool_sperre_pruefen(pool_pplx) -> None:
-    """The run ends with the anonymize gate's error once perplexity_search's
-    gate broke — after the first round and after the return round alike.
-    Nothing was sent (the handler refused), but a run whose privacy path was
-    broken is not handed out as a success. fehler_code / retryable from the
-    gate's cause (anonymize_gate.privacy_urteil)."""
-    if pool_pplx is None or not pool_pplx.gate_error:
-        return
-    gate_fehler = RuntimeError(
-        "perplexity_search: Anonymisierungssperre fehlgeschlagen "
-        f"({pool_pplx.gate_error}) — Lauf als Fehler beendet, die Anfrage wurde nicht gesendet"
-    )
-    urteil = pool_pplx.gate_urteil or {"fehler_code": "privacy_gate_failed", "retryable": False}
-    gate_fehler.fehler_code = urteil["fehler_code"]
-    gate_fehler.retryable = urteil["retryable"]
-    raise gate_fehler
+    """Pool side of THE privacy check point (anonymize_gate.sperre_pruefen),
+    called after every round of the run: first round, repair round, return
+    round. Nothing was sent (the handler refused), but a run whose privacy
+    path broke ends with the gate's error, fehler_code / retryable from its
+    cause."""
+    from src.research_cloud.anonymize_gate import sperre_pruefen
+    sperre_pruefen(getattr(pool_pplx, "sperre", None))
 
 
 class ResearchModelStopped(ResearchReportMissing):
@@ -5792,6 +5784,11 @@ async def _execute_research_impl(
         if not all_chunks:
             raise ValueError("No response received from Claude Code execution")
 
+        # Privacy check point after the first round — before any other
+        # verdict on it and before a repair round could run with a broken
+        # gate: the gate's error is the cause and carries its own code.
+        _pool_sperre_pruefen(pool_pplx)
+
         # Strom ohne Result-Nachricht der CLI = abgebrochener Lauf (ZB3D): ein
         # bis dahin geschriebener Bericht ist womoeglich abgeschnitten.
         from src.claude_cli import find_truncation_marker
@@ -6066,12 +6063,17 @@ async def _execute_research_impl(
                     accumulated_output_tokens = (accumulated_output_tokens or 0) + e.usage["output_tokens"]
                     accumulated_cache_read += e.usage["cache_read_tokens"]
                     accumulated_cache_creation += e.usage["cache_creation_tokens"]
+                # The repair round may have used perplexity_search: a gate
+                # that broke there is the cause, not the missing file.
+                _pool_sperre_pruefen(pool_pplx)
                 raise
             if nachhol_usage:
                 accumulated_input_tokens = (accumulated_input_tokens or 0) + nachhol_usage["input_tokens"]
                 accumulated_output_tokens = (accumulated_output_tokens or 0) + nachhol_usage["output_tokens"]
                 accumulated_cache_read += nachhol_usage["cache_read_tokens"]
                 accumulated_cache_creation += nachhol_usage["cache_creation_tokens"]
+            # Privacy check point after the repair round (its usage booked first).
+            _pool_sperre_pruefen(pool_pplx)
             container_file = content_file = str(ordered_file)
             file_size_bytes = ordered_file.stat().st_size
             antwort_quelle = "datei"

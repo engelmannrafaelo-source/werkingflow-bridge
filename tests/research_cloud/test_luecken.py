@@ -6,7 +6,7 @@ customer names from the case that triggered this). External HTTP is mocked
 """
 import json
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 import pytest
@@ -401,3 +401,75 @@ async def test_cloud_nachkontrolle_without_perplexity_refuses():
 async def test_cloud_without_nachkontrolle_unchanged():
     result, client = await _run([_end(ALT)], None)
     assert result.content == ALT and client.post.await_count == 1 and result.iterations == 1
+
+
+# ── PRIVCODE: the cloud return round does not swallow the privacy gate ──────
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("down", [False, True])
+async def test_sperre_in_der_cloud_rueckrunde_bricht_den_lauf_ab(down):
+    """Codex PRIVCODE probe: the gate breaks in the return round's
+    perplexity_search — the run ends with the gate's error (code + retryable),
+    not with the report from before as success; nothing goes to Perplexity."""
+    from src.privacy_client import PrivacyServiceUnavailable
+    from src.research_cloud.anonymize_gate import CloudAnonymizeError
+    from src.research_cloud.executor import ResearchCloudExecutorError
+
+    client = MagicMock()
+    client.post = AsyncMock(side_effect=[_end(ALT), _tool_use("perplexity_search", {"frage": "Norm ABC"})])
+    pplx = _pplx_ok()
+    err = PrivacyServiceUnavailable("opaque") if down else CloudAnonymizeError("opaque")
+    nk = Nachkontrolle(pruefer=_pruefer([LUECKE_NORM]))
+    with pytest.raises(ResearchCloudExecutorError) as ei:
+        await run_research_cloud(
+            "frage", "system", api_key="sk-test", client=client,
+            library_config=LibraryConfig(), library_index={}, perplexity_config=_PPLX_ON,
+            anonymize=AsyncMock(side_effect=err), perplexity_client=pplx, nachkontrolle=nk,
+        )
+    assert ei.value.retryable is down
+    assert ei.value.fehler_code == ("privacy_service_unreachable" if down else "privacy_gate_failed")
+    assert str(ei.value) == f"perplexity_search: anonymize gate failed — refusing to send the query to Perplexity: {err}"
+    pplx.post.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("down", [False, True])
+async def test_sperre_in_der_cloud_rueckrunde_erreicht_route_und_job(down):
+    """End to end through the real executor: route answers status=error with
+    the gate's fehler_code / retryable, the job takes both over."""
+    import src.main
+    from src.error_contract import JobFailure
+    from src.jobs import executors
+    from src.privacy_client import PrivacyServiceUnavailable
+    from src.research_cloud.anonymize_gate import CloudAnonymizeError
+
+    client = MagicMock()
+    client.post = AsyncMock(side_effect=[_end(ALT), _tool_use("perplexity_search", {"frage": "Norm ABC"})])
+    err = PrivacyServiceUnavailable("opaque") if down else CloudAnonymizeError("opaque")
+    echt = run_research_cloud
+
+    async def lauf(*a, **kw):
+        kw.update(client=client, library_config=LibraryConfig(), library_index={},
+                  perplexity_config=_PPLX_ON, anonymize=AsyncMock(side_effect=err),
+                  perplexity_client=_pplx_ok(), nachkontrolle=Nachkontrolle(pruefer=_pruefer([LUECKE_NORM])),
+                  api_key="sk-test")
+        kw.pop("config", None)
+        kw.pop("library_cfg", None)
+        return await echt(*a, **kw)
+
+    req = MagicMock()
+    for k, v in dict(query="Was regelt ÖNORM H 5155?", model="claude-sonnet-5", depth="standard",
+                     strategy="planning", output_path=None, research_mode="standard").items():
+        setattr(req, k, v)
+    with (
+        patch("src.research_cloud.executor.run_research_cloud", new=lauf),
+        patch("src.research_cloud.anonymize_gate.anonymize_query_for_cloud", new=AsyncMock(return_value="ANON")),
+        patch("src.activity.ai_call_writer.persist_ai_call_activity", new=AsyncMock()),
+    ):
+        result = await src.main._execute_research_cloud_impl(MagicMock(), req, attribution_ctx={})
+    code = "privacy_service_unreachable" if down else "privacy_gate_failed"
+    assert result.status == "error" and result.content is None
+    assert result.fehler_code == code and result.retryable is down
+    with pytest.raises(JobFailure) as ei:
+        executors._raise_on_status_error("research", result.model_dump())
+    assert ei.value.retryable is down and ei.value.details.get("fehler_code") == code

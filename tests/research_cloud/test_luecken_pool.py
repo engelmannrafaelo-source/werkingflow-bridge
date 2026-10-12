@@ -372,3 +372,60 @@ async def test_sperre_in_der_rueckrunde_beendet_den_lauf_als_fehler(tmp_path, pe
         executors._raise_on_status_error("research", result.model_dump())
     assert ei.value.retryable is urteil["retryable"]
     assert ei.value.details.get("fehler_code") == urteil["fehler_code"]
+
+
+# ── PRIVCODE: one privacy check point after EVERY round (Kanzler, 12.10.2026) ─
+
+class _SperreInRundeCli(FakeCli):
+    """The anonymize gate breaks in a chosen round: "research" or "nachhol"."""
+
+    def __init__(self, workdir, tools, runde, **kw):
+        super().__init__(workdir, **kw)
+        self.tools, self.runde = tools, runde
+
+    def __call__(self, **kw):
+        nachhol = kw.get("resume_workdir") is not None and "does not exist" in kw["prompt"]
+        research = kw.get("resume_workdir") is None and kw.get("session_id") is None and "luecken" not in kw.get("prompt", "")
+        if (self.runde == "nachhol" and nachhol) or (self.runde == "research" and research and not self.calls["research"]):
+            from src.privacy_client import PrivacyServiceUnavailable
+            self.tools[-1].sperre.vermerken(PrivacyServiceUnavailable("no endpoint answered"))
+        return super().__call__(**kw)
+
+
+def _mit_tools():
+    tools = []
+    real_init = rpp.PoolPerplexityTool.__init__
+
+    def _init(self, *a, **kw):
+        real_init(self, *a, **kw)
+        tools.append(self)
+
+    return tools, patch.object(rpp.PoolPerplexityTool, "__init__", _init)
+
+
+@pytest.mark.asyncio
+async def test_sperre_in_der_reparaturrunde_endet_mit_sperrfehler(tmp_path, persist, pplx_on):
+    """The repair round may call perplexity_search too: a gate that broke
+    there ends the run with the gate's code, not as success and not as a
+    generic missing-report error."""
+    tools, patcher = _mit_tools()
+    fake = _SperreInRundeCli(tmp_path, tools, "nachhol")
+    with patcher:
+        result = await _run(fake)
+    assert len(fake.calls["nachhol"]) == 1
+    assert fake.calls["rueckrunde"] == []
+    assert result.status == "error" and result.content is None
+    assert result.fehler_code == "privacy_service_unreachable" and result.retryable is True
+    assert "Anonymisierungssperre fehlgeschlagen (PrivacyServiceUnavailable: no endpoint answered)" in result.error
+
+
+@pytest.mark.asyncio
+async def test_sperre_in_der_ersten_runde_startet_keine_reparatur(tmp_path, persist, pplx_on):
+    """Check point right after the first round: no repair round with a broken gate."""
+    tools, patcher = _mit_tools()
+    fake = _SperreInRundeCli(tmp_path, tools, "research")
+    with patcher:
+        result = await _run(fake)
+    assert fake.calls["nachhol"] == [] and fake.calls["rueckrunde"] == []
+    assert result.status == "error"
+    assert result.fehler_code == "privacy_service_unreachable" and result.retryable is True

@@ -45,6 +45,58 @@ def privacy_urteil(exc: BaseException) -> dict:
     return {"fehler_code": PRIVACY_GATE_FAILED, "retryable": False}
 
 
+class Sperrstand:
+    """The first failed anonymization of one research run — pool or cloud.
+
+    Each path records it where the gate fails (``vermerken``) and asks
+    ``sperre_pruefen`` after EVERY round — first round, repair round, return
+    round. A broken gate ends the run with its own error even when an earlier
+    report exists: a run whose privacy path broke is not handed out as a
+    success, and its fehler_code / retryable must reach the caller.
+
+    ``vorlage``: the run's error message, ``{grund}`` = "Type: message" and
+    ``{ursache}`` = the message of the cause."""
+
+    def __init__(self, vorlage: str = "{grund}") -> None:
+        self.vorlage = vorlage
+        self.grund: Optional[str] = None
+        self.ursache: Optional[str] = None
+        self.urteil: Optional[dict] = None
+        self.meldung_fest: Optional[str] = None
+
+    @property
+    def gesperrt(self) -> bool:
+        return self.grund is not None
+
+    @property
+    def meldung(self) -> str:
+        if self.meldung_fest is not None:
+            return self.meldung_fest
+        return self.vorlage.format(grund=self.grund, ursache=self.ursache)
+
+    def vermerken(self, exc: BaseException, *, meldung: Optional[str] = None) -> None:
+        """Record the gate failure (the first one counts)."""
+        if self.gesperrt:
+            return
+        self.grund = f"{type(exc).__name__}: {exc}"
+        self.ursache = str(exc)
+        self.urteil = privacy_urteil(exc)
+        self.meldung_fest = meldung
+
+
+def sperre_pruefen(stand: Optional[Sperrstand], *, fehler_typ: type = RuntimeError) -> None:
+    """THE privacy check point after every round of a research run: raise
+    ``fehler_typ(stand.meldung)`` carrying fehler_code / retryable when the
+    gate broke during the run, else return."""
+    if stand is None or not stand.gesperrt:
+        return
+    urteil = stand.urteil or {"fehler_code": PRIVACY_GATE_FAILED, "retryable": False}
+    fehler = fehler_typ(stand.meldung)
+    fehler.fehler_code = urteil["fehler_code"]
+    fehler.retryable = urteil["retryable"]
+    raise fehler
+
+
 class CloudAnonymizeError(Exception):
     """Raised when the query cannot be verifiably anonymized before a
     research-cloud call. The caller must abort the cloud call entirely.
