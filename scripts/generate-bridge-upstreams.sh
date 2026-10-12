@@ -294,6 +294,42 @@ map "\$bridge_hopped:\$job_home_marker" \$job_poll_pool {
 MAPHEAD
 }
 
+# Keyed job submissions (BRREF2b): POST /v1/jobs WITH Idempotency-Key.
+#
+# The key is unique per bridge DATABASE (migration 065). A retry that lands on
+# the other bridge than the first attempt creates a second job. So a keyed
+# submission goes to ONE deterministic bridge — this topology's first tier —
+# and leaves it only on a CONFIRMED refusal (docker/nginx.conf
+# @keyed_jobs_peer_*). Two things here make that possible:
+#
+#   claude_jobs_keyed_peer  the peer bridge ALONE, max_fails=0. With the
+#                           max_fails=1 of claude_production a single timeout
+#                           marked the peer down for 10 s, and the client's
+#                           retry with the same key went straight to the local
+#                           backups — the second job this exists to prevent.
+#   $jobs_peer_first        1 where the first tier of POST /v1/jobs IS the peer
+#                           (primary: claude_production is remote-first), 0
+#                           where it is local (production: local-first, peer
+#                           only behind a 429 — already the wanted order).
+#
+# $1 = topology id
+emit_keyed_job_routing() {
+    local first
+    case "$1" in
+        primary)    first=1 ;;
+        production) first=0 ;;
+        *) echo "ERROR: emit_keyed_job_routing: unknown topology '$1'" >&2; return 1 ;;
+    esac
+    echo "upstream claude_jobs_keyed_peer {"
+    echo "    server \${BRIDGE_BACKUP_HOST}:8000 weight=1 max_fails=0;"
+    echo "    keepalive 8;"
+    echo "}"
+    echo
+    echo "map \$host \$jobs_peer_first {"
+    echo "    default ${first};"
+    echo "}"
+}
+
 # Emits the nginx `map` body (just the entries, caller wraps the map{} block)
 # resolving a worker NAME to its network TARGET for the direct-worker debug
 # route (docker/nginx.conf `location ~ ^/(worker[a-zA-Z0-9_-]+)/(.*)$`).
@@ -446,6 +482,9 @@ MAP
 
     echo "# Job-poll routing by home-bridge marker (ADR-0012)."
     emit_job_poll_routing "$peer_marker" "$targets_name" "${workers[@]}"
+    echo
+    echo "# Keyed job submission routing (BRREF2b, Idempotency-Key)."
+    emit_keyed_job_routing "$id"
 }
 
 generate_worker_map() {

@@ -102,7 +102,9 @@ class JobCreateRequest(BaseModel):
 # Every keyed answer echoes Idempotency-Key. The key lives as long as its job
 # row: never deleted while pending/running, and 24 h past the terminal state
 # (store.IDEMPOTENCY_RETENTION_SECONDS). Exactly-once under concurrency is the
-# store's UNIQUE index (migration 065), not a check in this file.
+# store's UNIQUE index (migration 065), not a check in this file. The index is
+# per bridge database; that a retry reaches the SAME bridge is the LB's part
+# (docker/nginx.conf @keyed_jobs_peer, BRREF2b).
 IDEMPOTENCY_HEADER = "Idempotency-Key"
 REPLAYED_HEADER = "Idempotent-Replayed"
 IDEMPOTENCY_KEY_MAX_LEN = 200
