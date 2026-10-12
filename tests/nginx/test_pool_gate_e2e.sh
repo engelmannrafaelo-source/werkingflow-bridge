@@ -210,7 +210,7 @@ start_stack() { # $1 = exhausted|healthy  $2 = METRICS_READER_TARGET for nginx (
     # Same envsubst the compose performs before nginx loads the config.
     # nginx.conf uses the backup host in a geo{} block, which needs an address
     # (TEST-NET-1, never routed); the upstreams keep the resolvable stub alias.
-    sed "s/\${BRIDGE_ID}/test/g; s/\${BRIDGE_BACKUP_HOST}/192.0.2.10/g; s/\${METRICS_READER_TARGET}/${target:-unset-target}/g" \
+    sed "s/\${BRIDGE_ID}/test/g; s/\${BRIDGE_BACKUP_HOST}/192.0.2.10/g; s/\${BRIDGE_NET_GATEWAY}/192.0.2.1/g; s/\${METRICS_READER_TARGET}/${target:-unset-target}/g" \
         "$D/nginx.conf" > "$WORK/nginx.conf"
     sed 's/${BRIDGE_BACKUP_HOST}/backup-host/g; s/${BRIDGE_ID}/test/g' "$D/upstreams-primary.conf" > "$WORK/upstreams.conf"
     cp "$D/routes-metrics-reader.conf" "$D/routes-platform-api.conf" "$D/worker-map-primary.conf" "$WORK/"

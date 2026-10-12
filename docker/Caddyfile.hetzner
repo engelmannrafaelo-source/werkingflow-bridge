@@ -15,13 +15,16 @@ bridge.werking.tools {
 	# ADR-0011: Caddy wohnt im Docker-Netz — sein remote_addr faellt beim LB
 	# in den vertrauten Bereich. Ohne diesen Strip koennte JEDER externe
 	# HTTPS-Client einen X-Bridge-Origin faelschen und damit umleiten,
-	# wessen Budget zahlt. Seit IDEMR R2 wird auch X-Bridge-Hop entfernt:
-	# er entscheidet, welche Bridge einen Idempotency-Key haelt.
+	# wessen Budget zahlt. X-Bridge-Hop bleibt durchgelassen; X-Bridge-Edge
+	# markiert ihn als von aussen (IDEMR R3).
 	reverse_proxy nginx:80 {
 		header_up -X-Bridge-Origin
-		# IDEMR R2: the hop decides which bridge holds an Idempotency-Key —
-		# never from outside (nginx honors it only from trusted senders, and
-		# Caddy itself is one).
-		header_up -X-Bridge-Hop
+		# IDEMR R3: X-Bridge-Hop passes (werking-energy uses it on purpose to
+		# stay on this bridge; harmless without an Idempotency-Key). Caddy sits
+		# in the trusted network, so it marks everything it relays from
+		# outside: nginx then never takes a relayed hop as trusted, which is
+		# what decides the bridge of a keyed job. Set, not add — a client
+		# value is overwritten.
+		header_up X-Bridge-Edge "1"
 	}
 }

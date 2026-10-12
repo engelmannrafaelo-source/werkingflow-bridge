@@ -17,9 +17,12 @@ prod-bridge.werking.tools {
 	# Caddyfile.hetzner (identischer Fall).
 	reverse_proxy nginx:80 {
 		header_up -X-Bridge-Origin
-		# IDEMR R2: the hop decides which bridge holds an Idempotency-Key —
-		# never from outside (nginx honors it only from trusted senders, and
-		# Caddy itself is one).
-		header_up -X-Bridge-Hop
+		# IDEMR R3: X-Bridge-Hop passes (werking-energy uses it on purpose to
+		# stay on this bridge; harmless without an Idempotency-Key). Caddy sits
+		# in the trusted network, so it marks everything it relays from
+		# outside: nginx then never takes a relayed hop as trusted, which is
+		# what decides the bridge of a keyed job. Set, not add — a client
+		# value is overwritten.
+		header_up X-Bridge-Edge "1"
 	}
 }

@@ -730,7 +730,7 @@ phase_validate() {
     # The only per-bridge input is the generated upstreams include.
     local nginx_conf upstreams_conf worker_map_conf envsubst_vars add_hosts
     nginx_conf="docker/nginx.conf"
-    envsubst_vars='$BRIDGE_BACKUP_HOST $BRIDGE_ID $METRICS_READER_TARGET'
+    envsubst_vars='$BRIDGE_BACKUP_HOST $BRIDGE_ID $METRICS_READER_TARGET $BRIDGE_NET_GATEWAY'
     if [[ "$compose" == *"prod"* ]]; then
         upstreams_conf="docker/upstreams-prod.conf"
         worker_map_conf="docker/worker-map-prod.conf"
@@ -797,6 +797,7 @@ EOF
     nginx_output=$(rssh_run "$host" <<EOF
 cd ${REMOTE_REPO}
 BRIDGE_BACKUP_HOST=127.0.0.1 BRIDGE_ID=validate-probe METRICS_READER_TARGET=metrics-reader:8000 \
+    BRIDGE_NET_GATEWAY=127.0.0.2 \
     envsubst '${envsubst_vars}' \
     < ${nginx_conf} > /tmp/bridge-nginx-check.conf 2>&1
 # Render the per-topology upstreams include (nginx.conf does include /tmp/upstreams.conf).

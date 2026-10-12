@@ -28,12 +28,20 @@ WORK="$(mktemp -d)"
 FAILURES=0
 STUBS="worker1 worker2 worker3 worker4 backup-host"
 PORT=$((19000 + SUFFIX % 800))
-# Own subnet outside every trusted range of nginx.conf; the ONE trusted sender
-# (stands for the peer LB / a worker re-dispatch) is a client container with a
-# fixed address. Requests from this host via the published port are external.
+# Own subnet that stands in for the docker network of a real bridge: the WHOLE
+# subnet is trusted (as 172.16.0.0/12 is in production) — except its gateway,
+# which docker/nginx-start.sh reads from nginx's default route (IDEMR R3).
+# Requests from this host reach nginx through docker-proxy, i.e. FROM THAT
+# GATEWAY — the same path an external IPv6 client takes on the live host; the
+# test asserts that address in nginx's log. A client container with a fixed
+# address is the trusted sender (peer LB / worker re-dispatch / Caddy).
 NET_OCTET=$((10 + SUFFIX % 200))
 SUBNET="10.231.$NET_OCTET.0/24"
+GATEWAY_IP="10.231.$NET_OCTET.1"
 TRUSTED_IP="10.231.$NET_OCTET.250"
+# Stands for the PEER LB: nginx gets it as BRIDGE_BACKUP_HOST (only the geo of
+# nginx.conf reads that; the upstreams keep the stub alias backup-host).
+PEER_SENDER_IP="10.231.$NET_OCTET.251"
 URL="http://127.0.0.1:$PORT"
 
 cleanup() {
@@ -161,9 +169,10 @@ start_stack() { # <primary|prod>
     [ "$topo" = prod ] && id=prod
     cleanup
     docker network create --subnet "$SUBNET" "$NET" >/dev/null
-    sed "s/\${BRIDGE_ID}/$id/g; s/\${BRIDGE_BACKUP_HOST}/192.0.2.10/g; s/\${METRICS_READER_TARGET}/metrics-elsewhere:8000/g; s#172\.16\.0\.0/12  1;#$TRUSTED_IP/32 1;#" \
-        "$D/nginx.conf" > "$WORK/nginx.conf"
-    grep -q "$TRUSTED_IP/32 1;" "$WORK/nginx.conf" || { echo "ABORT: trusted range not found in nginx.conf"; exit 2; }
+    # Only the trusted range is swapped; every ${VAR} is left to the REAL
+    # start script (docker/nginx-start.sh), gateway included.
+    sed "s#172\.16\.0\.0/12  1;#$SUBNET 1;#" "$D/nginx.conf" > "$WORK/nginx.conf"
+    grep -q "$SUBNET 1;" "$WORK/nginx.conf" || { echo "ABORT: trusted range not found in nginx.conf"; exit 2; }
     # Worker addresses of the production file → the stub aliases worker1..4.
     sed -E "s/\\$\\{BRIDGE_BACKUP_HOST\\}/backup-host/g; s/\\$\\{BRIDGE_ID\\}/$id/g; s/[0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+:800([1-4])/worker\\1:8000/g" \
         "$D/upstreams-$topo.conf" > "$WORK/upstreams.conf"
@@ -183,12 +192,14 @@ start_stack() { # <primary|prod>
         --memory 128m --tmpfs /var/log/nginx \
         -e BRIDGE_WORKERS="worker1,worker2,worker3,worker4" \
         -e METRICS_READER_TARGET="metrics-elsewhere:8000" \
-        -v "$WORK/nginx.conf:/usr/local/openresty/nginx/conf/nginx.conf:ro" \
-        -v "$WORK/upstreams.conf:/tmp/upstreams.conf:ro" \
-        -v "$WORK/worker-map-primary.conf:/tmp/worker-map.conf:ro" \
+        -e BRIDGE_BACKUP_HOST="$PEER_SENDER_IP" -e BRIDGE_ID="$id" \
+        -v "$WORK/nginx.conf:/etc/nginx/nginx.conf:ro" \
+        -v "$WORK/upstreams.conf:/etc/nginx/upstreams.conf:ro" \
+        -v "$WORK/worker-map-primary.conf:/etc/nginx/worker-map.conf:ro" \
         -v "$WORK/routes-metrics-reader.conf:/etc/nginx/routes-metrics-reader.conf:ro" \
         -v "$WORK/routes-platform-api.conf:/etc/nginx/routes-platform-api.conf:ro" \
-        $IMG >/dev/null
+        -v "$D/nginx-start.sh:/etc/nginx/nginx-start.sh:ro" \
+        $IMG /bin/sh /etc/nginx/nginx-start.sh >/dev/null
     for _ in $(seq 60); do
         [ "$(curl -s -o /dev/null -w '%{http_code}' "$URL/health")" != 000 ] && return 0
         sleep 0.25
@@ -233,7 +244,7 @@ post_trusted() { # like post, but from the trusted sender inside the network
     local out="$1" key="$2"; shift 2
     local kh=()
     [ "$key" != "-" ] && kh=(-H "Idempotency-Key: $key")
-    docker run --rm --name "kj-trusted-$SUFFIX" --network "$NET" --ip "$TRUSTED_IP" \
+    docker run --rm --name "kj-trusted-$SUFFIX" --network "$NET" --ip "${SENDER_IP:-$TRUSTED_IP}" \
         --memory 32m --entrypoint sh -v "$WORK:/w" $IMG -c \
         "curl -s -m 60 -o /w/$(basename "$out") -D /w/$(basename "$out").h -w '%{http_code}' \
          -X POST http://kj-nginx-$SUFFIX:80/v1/jobs -H 'Content-Type: application/json' \
@@ -296,6 +307,11 @@ check "C refused attempt: status" "$c" = 429
 c=$(post "$O" KC); check "C retry at the peer: created once" "$c" = 201
 check "C local POSTs" "$(hits KC $LOCAL)" -eq 0
 
+echo "=== IDEMR R3: the PEER LB relaying a request its Caddy marked — its hop counts ==="
+c=$(SENDER_IP=$PEER_SENDER_IP post_trusted "$O" KP -H "X-Bridge-Hop: 1" -H "X-Bridge-Edge: 1")
+check "KP peer+edge+hop+key: served locally (hop trusted)" "$(hits KP $LOCAL)" -eq 1
+check "KP not sent back to the peer" "$(hits KP backup-host)" -eq 0
+
 echo "=== 4. peer verdict on the request passes through ==="
 c=$(post "$O" K6 -H "X-Stub-Peer: e422"); check "K6 422 passes" "$c" = 422
 check "K6 no local POST" "$(hits K6 $LOCAL)" -eq 0
@@ -309,13 +325,27 @@ check "K7b hopped, all local 429: status" "$c" = 429
 check "K7b every local worker asked (429 retry)" "$(hits K7b $LOCAL)" -eq 4
 check "K7b peer untouched" "$(hits K7b backup-host)" -eq 0
 
-echo "=== IDEMR R2: hop header from an EXTERNAL sender changes nothing ==="
+echo "=== IDEMR R2/R3: hop header from an EXTERNAL sender (via the gateway) changes nothing for a key ==="
 c=$(post "$O" KH); check "KH without hop: peer" "$c" = 201
 a=$(field "$O" job_id)
-c=$(post "$O" KH -H "X-Bridge-Hop: 1"); check "KH with forged hop: replay at the peer" "$c" = 200
+c=$(post "$O" KH -H "X-Bridge-Hop: 1"); check "KH with external hop: replay at the peer" "$c" = 200
 check "KH same job" "$(field "$O" job_id)" = "$a"
 check "KH local POSTs" "$(hits KH $LOCAL)" -eq 0
-c=$(post "$O" - -H "X-Bridge-Hop: 1"); check "unkeyed forged hop: ignored, peer first" "$(field "$O" worker)" = backup-host
+check "R3 host request arrived FROM THE GATEWAY (docker-proxy path)" "$(docker exec "kj-nginx-$SUFFIX" sh -c 'grep -c "\"remote\":\"'"$GATEWAY_IP"'\"" /var/log/nginx/access.jsonl')" -gt 0
+check "R3 ... and the gateway is NOT trusted (hopped_trusted 0)" "$(docker exec "kj-nginx-$SUFFIX" sh -c 'grep "\"remote\":\"'"$GATEWAY_IP"'\"" /var/log/nginx/access.jsonl | grep -c "\"hopped_trusted\":1"')" -eq 0
+c=$(post "$O" - -H "X-Bridge-Origin: prod"); check "R3 gateway cannot set X-Bridge-Origin (origin stays dev)" "$(docker exec "kj-nginx-$SUFFIX" sh -c 'tail -1 /var/log/nginx/access.jsonl' | python3 -c 'import json,sys; print(json.load(sys.stdin)["origin"])')" = dev
+
+echo "=== IDEMR R3: Energy — hop:1 WITHOUT key from outside stays on THIS bridge ==="
+c=$(post "$O" - -H "X-Bridge-Hop: 1"); check "Energy /v1/jobs hop:1 no key (gateway): local" "$(field "$O" worker)" != backup-host
+check "Energy /v1/jobs: status" "$c" = 200
+c=$(curl -s -m 30 -o "$O" -w '%{http_code}' -X POST "$URL/v1/chat/completions" -H "Content-Type: application/json" -H "X-Bridge-Hop: 1" --data '{"model":"x","messages":[]}')
+check "Energy /v1/chat/completions hop:1 (gateway): local" "$(field "$O" worker)" != backup-host
+c=$(post_trusted "$O" - -H "X-Bridge-Hop: 1" -H "X-Bridge-Edge: 1"); check "Energy via Caddy (edge-marked) hop:1 no key: local" "$(field "$O" worker)" != backup-host
+c=$(post "$O" -); check "control: no hop, no key → peer first" "$(field "$O" worker)" = backup-host
+
+echo "=== IDEMR R3: a hop RELAYED by Caddy (edge-marked) does not pick the bridge of a key ==="
+c=$(post_trusted "$O" KE -H "X-Bridge-Hop: 1" -H "X-Bridge-Edge: 1"); check "KE edge+hop+key: peer" "$(field "$O" worker)" = backup-host
+check "KE local POSTs" "$(hits KE $LOCAL)" -eq 0
 
 echo "=== 6. without key: unchanged ==="
 c=$(post "$O" - -H "X-Stub-Peer: pool_exhausted"); check "no key, peer 429 → local (as before)" "$(field "$O" worker)" != backup-host

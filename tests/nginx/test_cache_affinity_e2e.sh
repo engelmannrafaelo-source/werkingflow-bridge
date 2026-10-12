@@ -90,7 +90,7 @@ docker build -q -f "$D/Dockerfile.nginx-lb" -t $IMG "$REPO" >/dev/null || { echo
 PROD_WORKERS="worker-sahori,worker-kurt,worker-coach,worker-erk"
 
 render() { # $1 = primary (default) | prod | prod-affinity
-    sed "s/\${BRIDGE_ID}/test/g; s/\${BRIDGE_BACKUP_HOST}/192.0.2.10/g; s/\${METRICS_READER_TARGET}/metrics-elsewhere:8000/g" \
+    sed "s/\${BRIDGE_ID}/test/g; s/\${BRIDGE_BACKUP_HOST}/192.0.2.10/g; s/\${BRIDGE_NET_GATEWAY}/192.0.2.1/g; s/\${METRICS_READER_TARGET}/metrics-elsewhere:8000/g" \
         "$D/nginx.conf" > "$WORK/nginx.conf"
     if [ "${1:-primary}" = prod ] || [ "${1:-primary}" = prod-affinity ]; then
         # the prod include, with its worker-host targets pointed at the stub workers;

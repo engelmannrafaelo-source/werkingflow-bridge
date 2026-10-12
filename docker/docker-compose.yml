@@ -24,6 +24,7 @@ services:
       - ./worker-map-primary.conf:/etc/nginx/worker-map.conf:ro
       - ./routes-metrics-reader.conf:/etc/nginx/routes-metrics-reader.conf:ro
       - ./routes-platform-api.conf:/etc/nginx/routes-platform-api.conf:ro
+      - ./nginx-start.sh:/etc/nginx/nginx-start.sh:ro
       - ../logs/nginx:/var/log/nginx
     environment:
       # Backup bridge for the production-priority pool = Server-2 (from the deploy
@@ -41,7 +42,9 @@ services:
     # this bridge's own marker off it, so the id the workers stamp and the id
     # the router matches come from one value.
     # then start openresty. nginx.conf does `include /tmp/upstreams.conf`.
-    command: ["/bin/sh", "-c", "envsubst '$$BRIDGE_BACKUP_HOST $$BRIDGE_ID $$METRICS_READER_TARGET' < /etc/nginx/nginx.conf > /tmp/nginx.conf && envsubst '$$BRIDGE_BACKUP_HOST $$BRIDGE_ID' < /etc/nginx/upstreams.conf > /tmp/upstreams.conf && cp /etc/nginx/worker-map.conf /tmp/worker-map.conf && openresty -c /tmp/nginx.conf -g 'daemon off;'"]
+    # docker/nginx-start.sh: derives BRIDGE_NET_GATEWAY (IDEMR R3), then the
+    # same envsubst + openresty start as before.
+    command: ["/bin/sh", "/etc/nginx/nginx-start.sh"]
     depends_on:
       - worker1
       - worker2

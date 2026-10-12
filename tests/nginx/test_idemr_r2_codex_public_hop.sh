@@ -154,7 +154,7 @@ start_stack() { # <primary|prod>
     [ "$topo" = prod ] && id=prod
     cleanup
     docker network create --internal "$NET" >/dev/null
-    sed "s/\${BRIDGE_ID}/$id/g; s/\${BRIDGE_BACKUP_HOST}/192.0.2.10/g; s/\${METRICS_READER_TARGET}/metrics-elsewhere:8000/g" \
+    sed "s/\${BRIDGE_ID}/$id/g; s/\${BRIDGE_BACKUP_HOST}/192.0.2.10/g; s/\${BRIDGE_NET_GATEWAY}/192.0.2.1/g; s/\${METRICS_READER_TARGET}/metrics-elsewhere:8000/g" \
         "$D/nginx.conf" > "$WORK/nginx.conf"
     # Worker addresses of the production file → the stub aliases worker1..4.
     sed -E "s/\\$\\{BRIDGE_BACKUP_HOST\\}/backup-host/g; s/\\$\\{BRIDGE_ID\\}/$id/g; s/[0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+:800([1-4])/worker\\1:8000/g" \
