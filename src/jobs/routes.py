@@ -15,6 +15,7 @@ and injects its canonical attribution extractor (set_attribution_extractor) so w
 reuse the same X-* header parsing/billing as every other endpoint without an import
 cycle (main.py imports this module, not the other way around).
 """
+import hashlib
 import logging
 import os
 from datetime import datetime, timezone
@@ -97,14 +98,19 @@ class JobCreateRequest(BaseModel):
 #   same key + owner, same body    → 200, the SAME job_id, no new job, whatever
 #                                    its status (pending/running/done/error/
 #                                    cancelled), Idempotent-Replayed: true
-#   same key + owner, other body   → 422 idempotency_key_reused, no job
+#   same key + owner, other body   → 422 idempotency_key_reused, no job; the
+#                                    answer names no job (IDEMR)
 #   malformed key                  → 400 idempotency_key_invalid, no job
+# An existing key is looked up BEFORE the capacity veto (IDEMR): a full bridge
+# still answers the retry with its job. GET /v1/jobs/{id} answers a keyed job
+# only to the owner that created it — anyone else gets the same 404 as for an
+# unknown id. Unkeyed jobs keep GET-by-id as before.
 # Every keyed answer echoes Idempotency-Key. The key lives as long as its job
 # row: never deleted while pending/running, and 24 h past the terminal state
 # (store.IDEMPOTENCY_RETENTION_SECONDS). Exactly-once under concurrency is the
 # store's UNIQUE index (migration 065), not a check in this file. The index is
-# per bridge database; that a retry reaches the SAME bridge is the LB's part
-# (docker/nginx.conf @keyed_jobs_peer, BRREF2b).
+# per bridge database; that every attempt reaches the SAME bridge is the LB's
+# part (docker/nginx.conf, keyed submissions: one fixed bridge, no fallback).
 IDEMPOTENCY_HEADER = "Idempotency-Key"
 REPLAYED_HEADER = "Idempotent-Replayed"
 IDEMPOTENCY_KEY_MAX_LEN = 200
@@ -129,22 +135,52 @@ def _idempotency_key(request: Request) -> Optional[str]:
 
 
 def _idempotency_owner(request: Request) -> str:
-    """Whose key namespace this is: the authenticated principal (or the shared
-    key) plus the calling app. Two apps using the same key string get two
-    jobs; the same app retrying gets its one job back.
+    """Whose key namespace this is — an opaque digest over the identity parts,
+    each length-prefixed, so no choice of names can make two different
+    identities collide (IDEMR: "service|app"+"report" and "service"+
+    "app|report" were one owner when the parts were joined with "|").
 
-    The app comes from the caller's X-* headers via the canonical extractor —
-    never from the body's attribution, which a caller can set freely per
-    request. No extractor wired (main.py always wires one) → fail loud."""
+    Parts: how the caller authenticated (principal or shared key), the
+    principal's name, the app and the user. App and user come from the
+    caller's X-* headers via the canonical extractor — never from the body's
+    attribution, which a caller sets freely per request. Under the shared key
+    the user part is what keeps alice's key from naming bob's job; it is a
+    header the key holder asserts, not authenticated identity (the same limit
+    _caller_owns documents). No extractor wired → fail loud."""
     if _attribution_extractor is None:
         raise RuntimeError(
             "POST /v1/jobs with Idempotency-Key: no attribution extractor wired "
             "(main.py set_attribution_extractor) — cannot establish the key owner"
         )
     principal = getattr(request.state, "principal", None)
-    who = getattr(principal, "name", None) or "shared-key"
-    app = (_attribution_extractor(request) or {}).get("app_id") or "-"
-    return f"{who}|{app}"
+    name = getattr(principal, "name", None)
+    caller = _attribution_extractor(request) or {}
+    parts = (
+        "idem-owner-v1",
+        "principal" if name else "shared-key",
+        name or "",
+        caller.get("app_id") or "",
+        caller.get("user_id") or "",
+    )
+    h = hashlib.sha256()
+    for part in parts:
+        raw = str(part).encode("utf-8")
+        h.update(len(raw).to_bytes(4, "big"))
+        h.update(raw)
+    return "v1:" + h.hexdigest()
+
+
+def _key_reused(key: str, owner: str, held_by: str) -> JSONResponse:
+    logger.warning(
+        "job submission refused — Idempotency-Key reused with a different "
+        "body (owner=%s, existing job %s)", owner, held_by,
+    )
+    return idempotency_error(
+        REASON_IDEMPOTENCY_KEY_REUSED, 422,
+        f"{IDEMPOTENCY_HEADER} was already used with a different request body; "
+        f"no job created",
+        idempotency_key=key,
+    )
 
 
 def _keyed_response(
@@ -271,6 +307,23 @@ async def create_job_endpoint(
     # check — the reject is retry-safe by construction. (Root-caused
     # 2026-07-29: energy harmonize jobs landed round-robin on weekly-locked
     # workers and died with UPSTREAM_HTTP_429 wrapped in job errors.)
+    # IDEMR: an existing key is answered before any capacity decision — the
+    # job it names exists no matter how full this worker is.
+    idem_owner = None
+    if idem_key is not None:
+        idem_owner = _idempotency_owner(request)
+        try:
+            held = await store_client.find_job_by_idempotency_key(
+                idem_owner, idem_key, body.kind, body.payload
+            )
+        except store_client.IdempotencyKeyReused as e:
+            return _key_reused(idem_key, idem_owner, e.job_id)
+        except store_client.IdempotencyUnsupported as e:
+            logger.error("job submission refused — %s", e)
+            raise HTTPException(status_code=503, detail=str(e)) from None
+        if held is not None:
+            return _replay(held, idem_key)
+
     from src.middleware.capacity_lock import get_capacity_lock
     from src.middleware.bridge_error import account_exhausted_error
 
@@ -304,9 +357,7 @@ async def create_job_endpoint(
         return job_home_unconfigured_error(str(e))
 
     if idem_key is not None:
-        return await _create_keyed_job(
-            job_id, body, attribution, idem_key, _idempotency_owner(request)
-        )
+        return await _create_keyed_job(job_id, body, attribution, idem_key, idem_owner)
 
     # Persist FIRST (durable 'pending'), then dispatch. If this worker dies before
     # the task runs, the row survives at 'pending' and the watchdog requeues it
@@ -333,17 +384,7 @@ async def _create_keyed_job(
             job_id, body.kind, body.payload, attribution, owner, key
         )
     except store_client.IdempotencyKeyReused as e:
-        logger.warning(
-            "job submission refused — Idempotency-Key reused with a different "
-            "body (owner=%s, existing job %s)", owner, e.job_id,
-        )
-        return idempotency_error(
-            REASON_IDEMPOTENCY_KEY_REUSED, 422,
-            f"{IDEMPOTENCY_HEADER} was already used for job {e.job_id} with a "
-            f"different request body; no job created",
-            idempotency_key=key,
-            job_id=e.job_id,
-        )
+        return _key_reused(key, owner, e.job_id)
     except store_client.IdempotencyUnsupported as e:
         # A job store that cannot keep the promise gets no job at all — the
         # caller retries later; a plain create here would be the double job.
@@ -363,6 +404,10 @@ async def _create_keyed_job(
             {"job_id": job_id, "status": store.JOB_STATUS_PENDING, "kind": body.kind},
             key, replayed=False,
         )
+    return _replay(job, key)
+
+
+def _replay(job: Dict[str, Any], key: str) -> JSONResponse:
     logger.info(
         f"♻️ Async job {job['job_id']} replayed for Idempotency-Key "
         f"(status={job['status']}, kind={job['kind']}) — no new job"
@@ -520,6 +565,13 @@ async def get_job_endpoint(
         return guard
 
     job = await store_client.get_job(job_id)
+    # A keyed job (migration 065) answers only its owner (IDEMR): its id can be
+    # learned from a guessed key, so the id alone must not open it. Anyone else
+    # gets exactly the 404 of an unknown id. Unkeyed jobs: unchanged.
+    if job and job.get("idempotency_owner") and (
+        job["idempotency_owner"] != _idempotency_owner(request)
+    ):
+        job = None
     if not job:
         raise HTTPException(
             status_code=404,

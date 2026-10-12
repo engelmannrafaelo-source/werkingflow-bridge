@@ -70,6 +70,16 @@ class MemStore:
             "digest": store.payload_digest(payload),
         }
 
+    async def find_job_by_idempotency_key(self, owner, key, kind, payload):
+        self.calls.append("find_job_by_idempotency_key")
+        held = self.keys.get((owner, key))
+        if held is None:
+            return None
+        row = self.rows[held]
+        if row["kind"] != kind or row["digest"] != store.payload_digest(payload):
+            raise store.IdempotencyKeyReused(held)
+        return {k: row[k] for k in ("job_id", "kind", "status")}
+
     async def create_job_idempotent(
         self, job_id, kind, payload, attribution, owner, key
     ):
@@ -117,6 +127,9 @@ def mem(monkeypatch):
     monkeypatch.setitem(registry._EXECUTORS, "idem-probe", AsyncMock())
     monkeypatch.setattr(store_client, "create_job", m.create_job)
     monkeypatch.setattr(store_client, "create_job_idempotent", m.create_job_idempotent)
+    monkeypatch.setattr(
+        store_client, "find_job_by_idempotency_key", m.find_job_by_idempotency_key
+    )
     m.spawned = spawned
     return m
 
@@ -207,7 +220,9 @@ async def test_3_other_body_422_no_job(mem, other):
     err = r.json()["error"]
     assert err["code"] == err["reason"] == "idempotency_key_reused"
     assert err["retryable"] is False
-    assert err["job_id"] == first.json()["job_id"]
+    # IDEMR: the answer names no job — neither field nor message.
+    assert "job_id" not in err
+    assert first.json()["job_id"] not in r.text
     assert r.headers["Idempotency-Key"] == KEY
     assert len(mem.rows) == 1 and len(mem.spawned) == 1
 
@@ -263,6 +278,7 @@ async def test_platform_without_route_is_503_no_job(mem, monkeypatch):
         raise store_client.IdempotencyUnsupported("platform-api predates BRREF2")
 
     monkeypatch.setattr(store_client, "create_job_idempotent", _unsupported)
+    monkeypatch.setattr(store_client, "find_job_by_idempotency_key", _unsupported)
     r = await _post(key=KEY)
     assert r.status_code == 503
     assert mem.spawned == []
@@ -389,6 +405,9 @@ async def test_4_pg_parallel_double_post_through_route(pg_store, mem, monkeypatc
     """The real route against the real store: two POSTs at once, one job."""
     monkeypatch.setattr(
         store_client, "create_job_idempotent", store.create_job_idempotent
+    )
+    monkeypatch.setattr(
+        store_client, "find_job_by_idempotency_key", store.find_job_by_idempotency_key
     )
     app = _app()
     r1, r2 = await asyncio.gather(_post(key=KEY, app=app), _post(key=KEY, app=app))

@@ -213,6 +213,42 @@ class IdempotencyUnsupported(JobStoreUnavailable):
     exactly the silent double job the key exists to prevent."""
 
 
+async def find_job_by_idempotency_key(
+    owner: str, key: str, kind: str, payload: Optional[Dict[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    """store.find_job_by_idempotency_key over the platform seam (IDEMR). A read:
+    the direct-DB fallback after a timeout is safe."""
+    try:
+        resp = await call_platform(
+            "POST", "/v1/internal/jobs/idempotency-lookup",
+            json={"kind": kind, "payload": payload,
+                  "idempotency_owner": owner, "idempotency_key": key},
+            timeout_s=_WRITE_TIMEOUT_S,
+        )
+    except PlatformUnavailable as e:
+        _fallback_or_raise("find_job_by_idempotency_key", e)
+        return await store.find_job_by_idempotency_key(owner, key, kind, payload)
+    body = resp.json if isinstance(resp.json, dict) else {}
+    if resp.status_code == 200 and "job" in body:
+        job = body["job"]
+        if job is None or isinstance(job, dict):
+            return job
+    detail = body.get("detail")
+    if (
+        resp.status_code == 409
+        and isinstance(detail, dict)
+        and detail.get("reason") == "idempotency_key_reused"
+    ):
+        raise IdempotencyKeyReused(str(detail.get("job_id")))
+    if resp.status_code in (404, 405):
+        raise IdempotencyUnsupported(
+            f"job store find_job_by_idempotency_key: platform-api has no "
+            f"/v1/internal/jobs/idempotency-lookup (status={resp.status_code}) — "
+            f"it predates IDEMR; no job created"
+        )
+    raise _unexpected("find_job_by_idempotency_key", resp.status_code, resp.json)
+
+
 async def create_job_idempotent(
     job_id: str,
     kind: str,

@@ -1,18 +1,18 @@
 #!/usr/bin/env bash
-# BRREF2b — keyed job submissions keep to ONE bridge (docker/nginx.conf
-# @keyed_jobs_peer*, generator emit_keyed_job_routing).
+# BRREF2b/IDEMR — a keyed job lives on ONE fixed bridge (docker/nginx.conf
+# @keyed_jobs_*, generator emit_keyed_job_routing).
 #
-# The Idempotency-Key is exactly-once per bridge DATABASE. On the primary
-# bridge POST /v1/jobs goes to the peer first; before BRREF2b a lost answer
-# marked the peer down (max_fails=1) and the client's retry with the same key
-# landed on the local workers: a second job. Rule now: same key → same bridge;
-# the local tier only after a CONFIRMED refusal (peer not reached, its pool
-# gate, or 429 from every worker behind it); every unknown outcome → retryable
-# 503 to the client, no local fallback. Without the key: unchanged.
+# The Idempotency-Key is exactly-once per bridge DATABASE. Rule (Kanzler,
+# after Codex IDEMR): with a key there is NO fallback to the other bridge —
+# primary topology: always the peer; production topology and hopped requests:
+# always the local workers. Fixed bridge busy → its 429 passes; unreachable or
+# 5xx → 503 idempotent_outcome_unknown, retryable. No nginx pool gate for
+# keyed submissions (the worker looks the key up before its capacity veto).
+# Without the key: unchanged.
 #
-# Real nginx.conf + real upstreams-primary.conf against stub workers and a
-# stub peer that keeps key → job like a database. Stub hosts only (docker
-# aliases worker1..4, backup-host) — no real address is ever configured.
+# Real nginx.conf + real upstreams (primary AND production, IPs replaced by
+# stub hosts; a guard aborts on any remaining IP) against stub workers and a
+# stub peer that keep key → job like a database.
 #
 # USAGE  tests/nginx/test_keyed_jobs_routing_e2e.sh      (needs docker)
 set -uo pipefail
@@ -46,8 +46,36 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 NAME = os.environ["NAME"]
 PEER = NAME == "backup-host"
 HITS = []
-JOBS = {}          # key -> job_id, the peer's "database"
 SEEN_LOSE = set()
+
+
+class Jobs:
+    """key -> job_id. The peer keeps its own; the four local stubs share one
+    directory, like the real local workers share one database."""
+
+    def __init__(self, root):
+        self.root = root
+        os.makedirs(root, exist_ok=True)
+
+    def __contains__(self, key):
+        return os.path.exists(os.path.join(self.root, key))
+
+    def __len__(self):
+        return len(os.listdir(self.root))
+
+    def setdefault(self, key, job):
+        path = os.path.join(self.root, key)
+        try:
+            fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            os.write(fd, job.encode())
+            os.close(fd)
+        except FileExistsError:
+            pass
+        with open(path) as f:
+            return f.read()
+
+
+JOBS = Jobs("/peerdb" if PEER else "/db")
 
 
 class H(BaseHTTPRequestHandler):
@@ -73,7 +101,8 @@ class H(BaseHTTPRequestHandler):
         n = int(self.headers.get("Content-Length") or 0)
         body = self.rfile.read(n) if n else b""
         key = self.headers.get("Idempotency-Key")
-        mode = self.headers.get("X-Stub-Peer", "accept") if PEER else "accept"
+        mode = (self.headers.get("X-Stub-Peer", "accept") if PEER
+                else self.headers.get("X-Stub-Local", "accept"))
         HITS.append({"method": "POST", "path": self.path, "key": key,
                      "hop": self.headers.get("X-Bridge-Hop"), "len": len(body)})
         if mode == "lose_once" and key not in SEEN_LOSE:
@@ -121,22 +150,26 @@ if ! docker image inspect $IMG >/dev/null 2>&1; then
         echo "FAIL: image build"; exit 1; }
 fi
 
-start_stack() {
+start_stack() { # <primary|prod>
+    local topo="$1" id=dev
+    [ "$topo" = prod ] && id=prod
     cleanup
     docker network create "$NET" >/dev/null
-    sed "s/\${BRIDGE_ID}/dev/g; s/\${BRIDGE_BACKUP_HOST}/192.0.2.10/g; s/\${METRICS_READER_TARGET}/metrics-elsewhere:8000/g" \
+    sed "s/\${BRIDGE_ID}/$id/g; s/\${BRIDGE_BACKUP_HOST}/192.0.2.10/g; s/\${METRICS_READER_TARGET}/metrics-elsewhere:8000/g" \
         "$D/nginx.conf" > "$WORK/nginx.conf"
-    sed 's/${BRIDGE_BACKUP_HOST}/backup-host/g; s/${BRIDGE_ID}/dev/g' \
-        "$D/upstreams-primary.conf" > "$WORK/upstreams.conf"
+    # Worker addresses of the production file → the stub aliases worker1..4.
+    sed -E "s/\\$\\{BRIDGE_BACKUP_HOST\\}/backup-host/g; s/\\$\\{BRIDGE_ID\\}/$id/g; s/[0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+:800([1-4])/worker\\1:8000/g" \
+        "$D/upstreams-$topo.conf" > "$WORK/upstreams.conf"
     # Guard: only stub hosts may be configured as upstream targets.
     if grep -E 'server +[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' "$WORK/upstreams.conf"; then
         echo "ABORT: real IP in upstreams under test"; exit 2
     fi
     cp "$D/routes-metrics-reader.conf" "$D/routes-platform-api.conf" \
         "$D/worker-map-primary.conf" "$WORK/"
+    rm -rf "$WORK/db"; mkdir -p "$WORK/db"; chmod 777 "$WORK/db"
     for s in $STUBS; do
         docker run -d --name "kj-$s-$SUFFIX" --network "$NET" --network-alias "$s" \
-            --memory 64m -e NAME="$s" \
+            --memory 64m -e NAME="$s" -v "$WORK/db:/db" \
             -v "$WORK/stub.py:/stub.py:ro" $PY python /stub.py >/dev/null
     done
     docker run -d --name "kj-nginx-$SUFFIX" --network "$NET" -p "127.0.0.1:$PORT:80" \
@@ -199,60 +232,96 @@ print('MISSING' if v is None else v)"; }
 header() { grep -i "^$2:" "$1.h" | head -1 | cut -d: -f2- | tr -d ' \r'; }
 
 LOCAL="worker1 worker2 worker3 worker4"
-start_stack
 O="$WORK/o"
+
+echo "############ PRIMARY topology (fixed bridge = peer) ############"
+start_stack primary
 
 echo "=== 1. key, peer accepts → peer, never local ==="
 c=$(post "$O" K1); check "K1 status" "$c" = 201
 check "K1 answered by the peer" "$(field "$O" worker)" = backup-host
 check "K1 local POSTs" "$(hits K1 $LOCAL)" -eq 0
 
-echo "=== 2. key, peer takes the job, answer LOST → retry = same job, no local ==="
+echo "=== 2. peer takes the job, answer LOST → retry = same job, no local ==="
 c=$(post "$O" K2 -H "X-Stub-Peer: lose_once"); check "K2 first: status" "$c" = 503
 check "K2 first: reason" "$(field "$O" error.reason)" = idempotent_outcome_unknown
 check "K2 first: retryable" "$(field "$O" error.retryable)" = True
 check "K2 first: Idempotency-Key echoed" "$(header "$O" Idempotency-Key)" = K2
-check "K2 first: no local POST" "$(hits K2 $LOCAL)" -eq 0
 c=$(post "$O" K2); check "K2 retry: status (replay)" "$c" = 200
 check "K2 retry: same job as the peer stored" "$(field "$O" job_id)" = job_backup-host_1
-check "K2 retry: answered by the peer" "$(field "$O" worker)" = backup-host
-check "K2 retry: still no local POST" "$(hits K2 $LOCAL)" -eq 0
-check "K2 peer POSTs (lost + retry)" "$(hits K2 backup-host)" -eq 2
-c=$(post "$O" K3); check "K3 right after the loss: peer not marked down" "$(field "$O" worker)" = backup-host
+check "K2 local POSTs" "$(hits K2 $LOCAL)" -eq 0
+c=$(post "$O" K3); check "K3 right after the loss: still the peer" "$(field "$O" worker)" = backup-host
 
-echo "=== 3. key, CONFIRMED refusals → local tier ==="
-c=$(post "$O" K4 -H "X-Stub-Peer: pool_exhausted"); check "K4 pool_exhausted: status" "$c" = 201
-check "K4 answered locally" "$(hits K4 $LOCAL)" -eq 1
-check "K4 local got the whole body" "$(field "$O" len)" -gt 30
-check "K4 fallback reason" "$(header "$O" X-Keyed-Fallback)" = peer_pool_exhausted
-c=$(post "$O" K5 -H "X-Stub-Peer: workers429"); check "K5 all-429 behind the peer → local" "$(hits K5 $LOCAL)" -eq 1
-check "K5 fallback reason" "$(header "$O" X-Keyed-Fallback)" = peer_workers_429
-
-echo "=== 4. key, UNKNOWN outcomes → 503 retryable, no local ==="
-for m in ambig429 busy503; do
-    c=$(post "$O" "K-$m" -H "X-Stub-Peer: $m"); check "K-$m: status" "$c" = 503
-    check "K-$m: reason" "$(field "$O" error.reason)" = idempotent_outcome_unknown
+echo "=== 3. peer busy → its 429 passes, NO local fallback ==="
+for m in pool_exhausted workers429 ambig429; do
+    c=$(post "$O" "K-$m" -H "X-Stub-Peer: $m"); check "K-$m: status" "$c" = 429
     check "K-$m: no local POST" "$(hits "K-$m" $LOCAL)" -eq 0
 done
+c=$(post "$O" K-busy503 -H "X-Stub-Peer: busy503"); check "K-busy503: status" "$c" = 503
+check "K-busy503: reason" "$(field "$O" error.reason)" = idempotent_outcome_unknown
+check "K-busy503: no local POST" "$(hits K-busy503 $LOCAL)" -eq 0
 
-echo "=== 5. key, peer verdict on the request passes through ==="
+echo "=== Codex IDEMR A: peer refused, then recovers → ONE job only ==="
+c=$(post "$O" K-pool_exhausted); check "A retry at the recovered peer" "$c" = 201
+c=$(post "$O" K-pool_exhausted); check "A next retry: replay" "$c" = 200
+check "A local POSTs (no second job anywhere)" "$(hits K-pool_exhausted $LOCAL)" -eq 0
+
+echo "=== Codex IDEMR B: key exists at the peer, peer at capacity → no local job ==="
+c=$(post "$O" K2 -H "X-Stub-Peer: workers429")
+check "B status" "$c" = 429
+check "B local POSTs" "$(hits K2 $LOCAL)" -eq 0
+
+echo "=== Codex IDEMR C: no local attempt exists that could be lost ==="
+c=$(post "$O" KC -H "X-Stub-Peer: pool_exhausted" -H "X-Stub-Local: lose_once")
+check "C refused attempt: status" "$c" = 429
+c=$(post "$O" KC); check "C retry at the peer: created once" "$c" = 201
+check "C local POSTs" "$(hits KC $LOCAL)" -eq 0
+
+echo "=== 4. peer verdict on the request passes through ==="
 c=$(post "$O" K6 -H "X-Stub-Peer: e422"); check "K6 422 passes" "$c" = 422
 check "K6 no local POST" "$(hits K6 $LOCAL)" -eq 0
 
-echo "=== 6. key + hopped → local tier, as before ==="
+echo "=== 5. key + hopped → local workers (this IS the fixed bridge) ==="
 c=$(post "$O" K7 -H "X-Bridge-Hop: 1"); check "K7 hopped: local" "$(hits K7 $LOCAL)" -eq 1
 check "K7 hopped: peer untouched" "$(hits K7 backup-host)" -eq 0
+check "K7 hopped: status" "$c" = 201
+c=$(post "$O" K7b -H "X-Bridge-Hop: 1" -H "X-Stub-Local: workers429")
+check "K7b hopped, all local 429: status" "$c" = 429
+check "K7b every local worker asked (429 retry)" "$(hits K7b $LOCAL)" -eq 4
+check "K7b peer untouched" "$(hits K7b backup-host)" -eq 0
 
-echo "=== 7. without key: unchanged ==="
+echo "=== 6. without key: unchanged ==="
 c=$(post "$O" - -H "X-Stub-Peer: pool_exhausted"); check "no key, peer 429 → local (as before)" "$(field "$O" worker)" != backup-host
-check "no key, no keyed fallback header" "$(header "$O" X-Keyed-Fallback)" = ""
 
-echo "=== 8. key, peer NOT reachable (nothing sent) → local ==="
+echo "=== 7. key, peer NOT reachable → 503 unknown, no local ==="
 docker exec "kj-backup-host-$SUFFIX" python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/__down')" >/dev/null
 sleep 0.5
-c=$(post "$O" K8); check "K8 peer down: status" "$c" = 201
-check "K8 answered locally" "$(hits K8 $LOCAL)" -eq 1
-check "K8 fallback reason" "$(header "$O" X-Keyed-Fallback)" = peer_not_reached
+c=$(post "$O" K8); check "K8 peer down: status" "$c" = 503
+check "K8 reason" "$(field "$O" error.reason)" = idempotent_outcome_unknown
+check "K8 no local POST" "$(hits K8 $LOCAL)" -eq 0
+
+echo "############ PRODUCTION topology (fixed bridge = local) ############"
+start_stack prod
+
+echo "=== P1. key → local, never the peer ==="
+c=$(post "$O" P1); check "P1 status" "$c" = 201
+check "P1 local" "$(hits P1 $LOCAL)" -eq 1
+check "P1 peer untouched" "$(hits P1 backup-host)" -eq 0
+
+echo "=== P2. key + X-Priority production, all local 429 → 429, NOT the peer ==="
+c=$(post "$O" P2 -H "X-Priority: production" -H "X-Stub-Local: workers429")
+check "P2 status" "$c" = 429
+check "P2 peer untouched" "$(hits P2 backup-host)" -eq 0
+
+echo "=== P3. key, local answer LOST → 503 unknown, retry = same job ==="
+c=$(post "$O" P3 -H "X-Stub-Local: lose_once"); check "P3 first: status" "$c" = 503
+check "P3 first: reason" "$(field "$O" error.reason)" = idempotent_outcome_unknown
+c=$(post "$O" P3); check "P3 retry: replay" "$c" = 200
+check "P3 peer untouched" "$(hits P3 backup-host)" -eq 0
+
+echo "=== P4. without key: unchanged (X-Priority production overflows to the peer) ==="
+c=$(post "$O" - -H "X-Priority: production" -H "X-Stub-Local: workers429")
+check "P4 no key: reached the peer as before" "$(hits - backup-host)" -ge 1
 
 echo
 if [ "$FAILURES" -eq 0 ]; then echo "ALL PASS"; else echo "$FAILURES FAILURE(S)"; docker logs "kj-nginx-$SUFFIX" 2>&1 | grep -i "keyed\|emerg\|error" | tail -8; fi

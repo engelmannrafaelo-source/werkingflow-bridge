@@ -294,32 +294,37 @@ map "\$bridge_hopped:\$job_home_marker" \$job_poll_pool {
 MAPHEAD
 }
 
-# Keyed job submissions (BRREF2b): POST /v1/jobs WITH Idempotency-Key.
+# Keyed job submissions (BRREF2b/IDEMR): POST /v1/jobs WITH Idempotency-Key.
 #
-# The key is unique per bridge DATABASE (migration 065). A retry that lands on
-# the other bridge than the first attempt creates a second job. So a keyed
-# submission goes to ONE deterministic bridge — this topology's first tier —
-# and leaves it only on a CONFIRMED refusal (docker/nginx.conf
-# @keyed_jobs_peer_*). Two things here make that possible:
+# The key is unique per bridge DATABASE (migration 065). So a keyed job lives
+# on ONE fixed bridge and every attempt with the key goes there, with no
+# fallback to the other one (docker/nginx.conf @keyed_jobs_*):
 #
 #   claude_jobs_keyed_peer  the peer bridge ALONE, max_fails=0. With the
 #                           max_fails=1 of claude_production a single timeout
-#                           marked the peer down for 10 s, and the client's
-#                           retry with the same key went straight to the local
-#                           backups — the second job this exists to prevent.
-#   $jobs_peer_first        1 where the first tier of POST /v1/jobs IS the peer
-#                           (primary: claude_production is remote-first), 0
-#                           where it is local (production: local-first, peer
-#                           only behind a 429 — already the wanted order).
+#                           marked the peer down and the retry went elsewhere.
+#   claude_jobs_keyed_local this bridge's own workers ALONE (never the peer),
+#                           max_fails=0 — where the fixed bridge is local.
+#   $jobs_peer_first        1 where the fixed bridge is the peer (primary),
+#                           0 where it is the local one (production).
 #
-# $1 = topology id
+# $1 = topology id, $2 = targets-array NAME, then worker names
 emit_keyed_job_routing() {
-    local first
-    case "$1" in
+    local first id="$1" targets_name="$2" w target
+    shift 2
+    case "$id" in
         primary)    first=1 ;;
         production) first=0 ;;
-        *) echo "ERROR: emit_keyed_job_routing: unknown topology '$1'" >&2; return 1 ;;
+        *) echo "ERROR: emit_keyed_job_routing: unknown topology '$id'" >&2; return 1 ;;
     esac
+    echo "upstream claude_jobs_keyed_local {"
+    for w in "$@"; do
+        target="$(resolve_target "$w" "$targets_name")"
+        echo "    server ${target} weight=1 max_fails=0;"
+    done
+    echo "    keepalive 16;"
+    echo "}"
+    echo
     echo "upstream claude_jobs_keyed_peer {"
     echo "    server \${BRIDGE_BACKUP_HOST}:8000 weight=1 max_fails=0;"
     echo "    keepalive 8;"
@@ -484,7 +489,7 @@ MAP
     emit_job_poll_routing "$peer_marker" "$targets_name" "${workers[@]}"
     echo
     echo "# Keyed job submission routing (BRREF2b, Idempotency-Key)."
-    emit_keyed_job_routing "$id"
+    emit_keyed_job_routing "$id" "$targets_name" "${workers[@]}"
 }
 
 generate_worker_map() {

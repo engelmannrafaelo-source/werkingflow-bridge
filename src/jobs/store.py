@@ -100,6 +100,9 @@ def _row_to_job(row) -> Dict[str, Any]:
         "defer_reason": _col(row, "defer_reason"),
         # Migration 063 — same rollout-window reasoning as above.
         "finished_at": _col(row, "finished_at"),
+        # Migration 065 — whose Idempotency-Key created the row (None: no key).
+        # GET answers a keyed job only to that owner (routes.get_job_endpoint).
+        "idempotency_owner": _col(row, "idempotency_owner"),
     }
 
 
@@ -150,6 +153,36 @@ class IdempotencyKeyReused(ValueError):
             f"idempotency key already used for job {job_id} with a different body"
         )
         self.job_id = job_id
+
+
+async def find_job_by_idempotency_key(
+    owner: str,
+    key: str,
+    kind: str,
+    payload: Optional[Dict[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    """The job (owner, key) already names, or None. Raises IdempotencyKeyReused
+    when it was submitted with another kind or payload.
+
+    Asked BEFORE any capacity decision (IDEMR): a full bridge must still answer
+    a retry with the job it holds, not with 429 — a 429 there tells the client
+    "not taken" about a job that exists. A miss is no promise: the INSERT of
+    create_job_idempotent stays the one atomic decision."""
+    pool = get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            SELECT job_id, kind, status, payload_digest FROM ai_jobs
+             WHERE idempotency_owner = $1 AND idempotency_key = $2
+            """,
+            owner,
+            key,
+        )
+    if row is None:
+        return None
+    if row["kind"] != kind or row["payload_digest"] != payload_digest(payload):
+        raise IdempotencyKeyReused(row["job_id"])
+    return {"job_id": row["job_id"], "kind": row["kind"], "status": row["status"]}
 
 
 async def create_job_idempotent(

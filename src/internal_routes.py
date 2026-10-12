@@ -760,6 +760,35 @@ async def internal_create_job(
     return Response(status_code=204)
 
 
+class InternalJobIdempotencyLookup(BaseModel):
+    kind: str
+    payload: Optional[Dict[str, Any]] = None
+    idempotency_owner: str = Field(min_length=1, max_length=400)
+    idempotency_key: str = Field(min_length=1, max_length=200)
+
+
+@router.post("/jobs/idempotency-lookup")
+async def internal_find_job_by_idempotency_key(
+    body: InternalJobIdempotencyLookup,
+    _claims: AuthClaims = Depends(require_service_token),
+) -> Any:
+    """store.find_job_by_idempotency_key (IDEMR). 200 {"job": {...}|null};
+    409 {"detail": {"reason": "idempotency_key_reused", "job_id"}} — the
+    public route never passes that id on."""
+    from src.jobs import store
+
+    try:
+        job = await store.find_job_by_idempotency_key(
+            body.idempotency_owner, body.idempotency_key, body.kind, body.payload
+        )
+    except store.IdempotencyKeyReused as e:
+        raise HTTPException(
+            status_code=409,
+            detail={"reason": "idempotency_key_reused", "job_id": e.job_id},
+        )
+    return {"job": job}
+
+
 @router.post("/jobs/create-idempotent")
 async def internal_create_job_idempotent(
     body: InternalJobCreateIdempotent,
