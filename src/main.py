@@ -6184,7 +6184,10 @@ async def _execute_research_impl(
             # Optional rounds start only when the remaining time is enough for
             # them — skipped and named otherwise, never started to overrun.
             offene = None
-            if not laufzeit.reicht(PRUEFER_MIN_REST_S):
+            if getattr(request_body, "luecken_nachkontrolle", None) is False:
+                # The caller checks the report itself (Energy P6) — named, not silent.
+                nachkontrolle.ueberspringen("pruefung", "anfrage: luecken_nachkontrolle=false")
+            elif not laufzeit.reicht(PRUEFER_MIN_REST_S):
                 nachkontrolle.ueberspringen(
                     "pruefung", f"laufzeit: {laufzeit.rest():.0f} s Rest, Prüfung braucht {PRUEFER_MIN_REST_S:.0f} s",
                 )
@@ -6581,7 +6584,10 @@ async def _execute_research_cloud_impl(
     )
     nachkontrolle = None
     try:
-        if nachkontrolle_aktiv(perplexity_enabled(perplexity_cfg)):
+        # luecken_nachkontrolle=false: the caller checks the report itself.
+        if nachkontrolle_aktiv(perplexity_enabled(perplexity_cfg)) and (
+            getattr(request_body, "luecken_nachkontrolle", None) is not False
+        ):
             # Same key as the executor; without it the executor itself refuses
             # the run before the checker could ever be asked.
             nachkontrolle = Nachkontrolle(

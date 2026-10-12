@@ -215,6 +215,33 @@ async def test_flag_off_no_checker(tmp_path, persist, pplx_on, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_request_off_skips_check_and_return_round_named(tmp_path, persist, pplx_on):
+    # P6NOGAP: the caller checks the report itself — no checker, no return
+    # round, and the response says so instead of looking like "no gaps".
+    req = _make_req()
+    req.luecken_nachkontrolle = False
+    fake = FakeCli(tmp_path, mit_datei=True)
+    result = await _run(fake, req)
+    assert result.status == "success" and result.content == ALT
+    assert fake.calls["pruefer"] == [] and fake.calls["rueckrunde"] == []
+    nk = result.nachkontrolle
+    assert nk["status"] == "uebersprungen" and nk["rueckrunde"] is False
+    assert nk["grund"] == "pruefung: anfrage: luecken_nachkontrolle=false"
+    assert persist.await_args.kwargs["provider_meta"]["rueckrunde"] is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("wert", [None, True])
+async def test_request_unset_or_true_keeps_the_deployment_setting(tmp_path, persist, pplx_on, wert):
+    req = _make_req()
+    req.luecken_nachkontrolle = wert
+    fake = FakeCli(tmp_path, mit_datei=True)
+    result = await _run(fake, req)
+    assert result.content == NEU
+    assert len(fake.calls["pruefer"]) == 2 and len(fake.calls["rueckrunde"]) == 1
+
+
+@pytest.mark.asyncio
 async def test_flag_on_without_perplexity_refuses_before_the_cli(tmp_path, persist, monkeypatch):
     monkeypatch.delenv("RESEARCH_PERPLEXITY_ENABLED", raising=False)
     monkeypatch.setenv(FLAG, "on")
