@@ -2658,8 +2658,12 @@ async def chat_completions(
     from fastapi.responses import JSONResponse
     from src import chat_weiterleitung as _cw
 
-    bis = _cw.frist_bis(request)  # first worker: anchored at the call's arrival
-    if _cw.eingehende_frist(request) is None:
+    try:
+        bis = _cw.frist_bis(request)  # anchored at the call's arrival on this worker
+    except _cw.UngueltigeFrist as exc:
+        logger.error(f"🛑 chat call refused: {exc}")
+        return _cw.frist_ungueltig_error(exc)
+    if request.headers.get(_cw.FRIST_HEADER) is None:
         return await _chat_completions_lauf(request_body, request, credentials, _adaptive)
     rest = _cw.rest_s(bis)
     if rest < _cw.CHAT_RELAY_MIN_REST_S:

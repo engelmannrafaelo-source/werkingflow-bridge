@@ -118,7 +118,9 @@ class H(BaseHTTPRequestHandler):
         mode = (self.headers.get("X-Stub-Peer", "accept") if PEER
                 else self.headers.get("X-Stub-Local", "accept"))
         HITS.append({"method": "POST", "path": self.path, "key": key,
-                     "hop": self.headers.get("X-Bridge-Hop"), "len": len(body)})
+                     "hop": self.headers.get("X-Bridge-Hop"), "len": len(body),
+                     "frist": [self.headers.get("X-Bridge-Chat-Frist-Bis"),
+                               self.headers.get("X-Bridge-Research-Frist-Bis")]})
         if mode == "lose_once" and key not in SEEN_LOSE:
             SEEN_LOSE.add(key)
             JOBS.setdefault(key, f"job_{NAME}_{len(JOBS)}")   # persisted ...
@@ -264,6 +266,18 @@ header() { grep -i "^$2:" "$1.h" | head -1 | cut -d: -f2- | tr -d ' \r'; }
 LOCAL="worker1 worker2 worker3 worker4"
 O="$WORK/o"
 
+fristen() { # <key> <stubs...> → "<POSTs with that key>/<deadline headers they carried>"
+    local posts=0 gesehen=0 n
+    for s in "${@:2}"; do
+        n=$(docker exec "kj-$s-$SUFFIX" python -c "
+import json, urllib.request
+h = [x for x in json.load(urllib.request.urlopen('http://127.0.0.1:8000/__hits')) if x['key'] == '$1']
+print(len(h), sum(1 for x in h for f in x['frist'] if f is not None))" 2>/dev/null || echo "0 0")
+        posts=$((posts + ${n% *})); gesehen=$((gesehen + ${n#* }))
+    done
+    echo "$posts/$gesehen"
+}
+
 echo "############ PRIMARY topology (fixed bridge = peer) ############"
 start_stack primary
 
@@ -375,6 +389,14 @@ c=$(post "$O" P3 -H "X-Stub-Local: lose_once"); check "P3 first: status" "$c" = 
 check "P3 first: reason" "$(field "$O" error.reason)" = idempotent_outcome_unknown
 c=$(post "$O" P3); check "P3 retry: replay" "$c" = 200
 check "P3 peer untouched" "$(hits P3 backup-host)" -eq 0
+
+echo "=== CHATFWDR P1: internal deadline headers never pass the LB (public AND trusted sender) ==="
+for v in 9999999999 inf nan; do
+    post "$O" "KF-$v" -H "X-Bridge-Chat-Frist-Bis: $v" -H "X-Bridge-Research-Frist-Bis: $v" >/dev/null
+    check "KF-$v public: deadline headers at the workers" "$(fristen "KF-$v" backup-host $LOCAL)" = "1/0"
+done
+post_trusted "$O" KF-trusted -H "X-Bridge-Chat-Frist-Bis: 9999999999" >/dev/null
+check "KF trusted sender: deadline headers at the workers" "$(fristen KF-trusted backup-host $LOCAL)" = "1/0"
 
 echo "=== P4. without key: unchanged (X-Priority production overflows to the peer) ==="
 c=$(post "$O" - -H "X-Priority: production" -H "X-Stub-Local: workers429")

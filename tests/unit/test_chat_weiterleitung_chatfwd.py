@@ -69,9 +69,11 @@ POOL_BELEGT = {
             "effective_cap_tokens": 400_000, "current_in_flight_tokens": 327_124,
             "weekly_percent": 40.0},
     "ki2": {"worker": "worker2", "available": False, "cooldown_remaining_s": 7_200,
+            "capacity_lock_remaining_s": 7_200, "usage_known": True,
             "effective_cap_tokens": 400_000, "current_in_flight_tokens": 0,
             "weekly_percent": 100.0},
     "ki3": {"worker": "worker3", "available": False, "cooldown_remaining_s": 9_000,
+            "capacity_lock_remaining_s": 9_000, "usage_known": True,
             "effective_cap_tokens": 400_000, "current_in_flight_tokens": 0,
             "weekly_percent": 100.0},
     "ki4": {"worker": "worker4", "available": True, "cooldown_remaining_s": 0,
@@ -83,8 +85,10 @@ POOL_FREI = {k: dict(v) for k, v in POOL_BELEGT.items()}
 POOL_FREI["ki1"]["current_in_flight_tokens"] = 0
 # Every account at its limit.
 POOL_LIMIT = {k: dict(v, available=False) for k, v in POOL_BELEGT.items()}
-POOL_LIMIT["ki1"]["cooldown_remaining_s"] = 1_800
-POOL_LIMIT["ki4"]["cooldown_remaining_s"] = 3_600
+POOL_LIMIT["ki1"].update(cooldown_remaining_s=1_800, capacity_lock_remaining_s=1_800,
+                         usage_known=True, weekly_percent=100.0)
+# worker4 resets first, but its cap cannot hold the prompt: not this call's retry.
+POOL_LIMIT["ki4"].update(cooldown_remaining_s=10, capacity_lock_remaining_s=10)
 
 
 def _cli(tmp_path) -> ClaudeCodeCLI:
@@ -337,7 +341,7 @@ def test_alle_konten_am_limit_retry_after_vom_fruehesten_reset(welt):
     assert resp.status_code == 429
     err = resp.json()["error"]
     assert err["reason"] == "pool_accounts_limited"
-    assert err["retry_after_s"] == 1_800  # worker1's account frees first
+    assert err["retry_after_s"] == 1_800  # worker1's account frees first, worker4 is too small
     assert resp.headers["retry-after"] == "1800"
 
 
@@ -352,3 +356,45 @@ def test_fristenkette_passt_zu_nginx():
     assert cw.CHAT_GESAMTFRIST_S + cw.CHAT_RELAY_GRACE_S < cw.NGINX_CHAT_READ_TIMEOUT_S
     assert cw.CHAT_RELAY_MARGIN_S < cw.CHAT_RELAY_MIN_REST_S
     cw.pruefe_staffelung()
+
+
+@pytest.mark.parametrize("wert", ["inf", "-inf", "nan", "morgen"])
+def test_ungueltige_frist_wird_abgelehnt(welt, wert):
+    """CHATFWDR P1: a non-finite or unreadable deadline is refused (400),
+    never turned into a deadline — and no run starts."""
+    resp = _post(welt, headers={"x-bridge-retry-count": "1", FRIST_HEADER: wert})
+    assert resp.status_code == 400, resp.text[:300]
+    assert resp.json()["error"]["reason"] == "relay_deadline_invalid"
+    assert welt.lauf.ereignisse == []
+
+
+def test_frist_verlaengert_nie_ueber_die_eigene(welt, monkeypatch):
+    """CHATFWDR P1: a forwarded deadline a day ahead is capped at this
+    worker's own (here scaled to 1.5 s): the 3 s run ends at it."""
+    import src.chat_weiterleitung as cw
+
+    monkeypatch.setattr(cw, "CHAT_GESAMTFRIST_S", 1.5)
+    resp = _post(
+        welt,
+        headers={"x-bridge-retry-count": "1", FRIST_HEADER: repr(time.time() + 86_400)},
+        timeout=LAUF_S + 5,
+    )
+    assert resp.status_code == 504, resp.text[:300]
+    assert _abwarten(welt, 0.5) == ["start", "abgebrochen"]
+
+
+def test_voll_belegtes_budget_ist_kein_kontolimit():
+    """CHATFWDR P2: the real pool state says available=false for a full
+    in-flight budget (headroom 0) — that is capacity, 60 s, not an account
+    limit with the peer's 7200 s."""
+    import src.chat_weiterleitung as cw
+
+    pool = {k: dict(v) for k, v in POOL_BELEGT.items()}
+    pool["ki1"].update(available=False, current_in_flight_tokens=400_000,
+                       usage_known=True, weekly_percent=40.0, session_percent=20.0)
+    lage = cw.pool_lage(pool, benoetigt_tokens=EST_TOKENS, ausgeschlossen={"worker2"})
+    assert lage["grund"] == cw.REASON_POOL_KAPAZITAET_BELEGT
+    assert lage["retry_after_s"] == 60
+    zustand = {w["worker"]: w["zustand"] for w in lage["worker"]}
+    assert zustand["worker1"] == "kapazitaet_belegt"
+    assert zustand["worker2"] == "konto_limit"

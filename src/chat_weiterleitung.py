@@ -45,6 +45,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import os
 import time
 from typing import Any, Awaitable, Dict, Iterable, Optional, TypeVar
@@ -78,6 +79,7 @@ NGINX_CHAT_READ_TIMEOUT_S = 3450.0
 
 # Reasons, stable identifiers in the error envelope.
 REASON_RELAY_FRIST_ZU_KURZ = "relay_deadline_too_short"
+REASON_RELAY_FRIST_UNGUELTIG = "relay_deadline_invalid"
 REASON_RELAY_FRIST_ABGELAUFEN = "relay_deadline_expired"
 REASON_POOL_KAPAZITAET_BELEGT = "pool_capacity_busy"
 REASON_POOL_KONTEN_LIMIT = "pool_accounts_limited"
@@ -113,31 +115,63 @@ class FristAbgelaufen(Exception):
     """The chat call's deadline passed while its run was still going."""
 
 
+class UngueltigeFrist(ValueError):
+    """The deadline header is not a finite number."""
+
+
 def eingehende_frist(request: Any) -> Optional[float]:
-    """Deadline this call arrived with on a relay hop, else None."""
+    """Deadline this call arrived with on a relay hop, else None.
+
+    Trust boundary (CHATFWDR P1): only a worker sets this header, on its own
+    direct worker-to-worker relay; the LB clears any inbound copy
+    (docker/nginx.conf more_clear_input_headers), like X-Pool-Exhausted. What
+    reaches a worker is therefore a peer's — and even so it can only SHORTEN
+    the call's deadline (frist_bis caps it at this worker's own). inf, nan
+    and anything unreadable are refused (UngueltigeFrist → 400), never
+    turned into a deadline.
+    """
     roh = request.headers.get(FRIST_HEADER)
     if roh is None:
         return None
     try:
-        return float(roh)
+        wert = float(roh)
     except ValueError:
-        # Loud: a peer sent a deadline we cannot read. Treat as expired rather
-        # than inventing a fresh one — a fresh clock is exactly the orphan.
-        logger.error(f"chat relay: malformed {FRIST_HEADER}={roh!r} — treated as expired")
-        return 0.0
+        raise UngueltigeFrist(f"{FRIST_HEADER}={roh[:40]!r} is not a number") from None
+    if not math.isfinite(wert):
+        raise UngueltigeFrist(f"{FRIST_HEADER}={roh[:40]!r} is not finite")
+    return wert
 
 
 def frist_bis(request: Any) -> float:
-    """Absolute deadline of this chat call: the forwarded one, else first
-    worker's now + CHAT_GESAMTFRIST_S. Remembered on request.state."""
+    """Absolute deadline of this chat call: this worker's own (arrival +
+    CHAT_GESAMTFRIST_S), shortened to a forwarded one if that is earlier —
+    never extended by it. Remembered on request.state. Raises UngueltigeFrist."""
     state = request.state
     bis = getattr(state, "chat_frist_bis", None)
     if isinstance(bis, float):
         return bis
+    eigene = time.time() + CHAT_GESAMTFRIST_S
     eingang = eingehende_frist(request)
-    bis = eingang if eingang is not None else time.time() + CHAT_GESAMTFRIST_S
+    bis = eigene if eingang is None else min(eingang, eigene)
     state.chat_frist_bis = bis
     return bis
+
+
+def frist_ungueltig_error(exc: UngueltigeFrist):
+    from src.middleware.bridge_error import (
+        SOURCE_BRIDGE_INTERNAL,
+        TYPE_INTERNAL,
+        bridge_error,
+    )
+
+    return bridge_error(
+        source=SOURCE_BRIDGE_INTERNAL,
+        error_type=TYPE_INTERNAL,
+        reason=REASON_RELAY_FRIST_UNGUELTIG,
+        message=f"Invalid relay deadline: {exc}.",
+        status_code=400,
+        retryable_override=False,
+    )
 
 
 def relay_timeout_s(bis: float) -> float:
@@ -236,6 +270,61 @@ async def relay_unter_aufsicht(arbeit: Awaitable[T]) -> T:
     return await _beaufsichtigt(arbeit, bis=None, wer="chat relay")
 
 
+def _zahl(info: Dict[str, Any], feld: str) -> float:
+    try:
+        wert = float(info.get(feld) or 0)
+    except (TypeError, ValueError):
+        return 0.0
+    return wert if math.isfinite(wert) else 0.0
+
+
+def _worker_zustand(info: Dict[str, Any], benoetigt: int) -> tuple[str, Optional[int], str]:
+    """(zustand, retry_after_s, retry_quelle) of one worker for a call of
+    ``benoetigt`` tokens, from the budget and limit FIELDS of the pool state —
+    not from ``available``, which is false for a full in-flight budget
+    (headroom 0) just as for an account limit, nor from the aggregated
+    ``cooldown_remaining_s`` alone, which also carries adaptive and temporary
+    holds (CHATFWDR P2).
+
+    * zu_gross          — the call exceeds the worker's cap even unsqueezed
+                          (adaptive_cap_tokens): no wait helps on this worker.
+    * konto_limit       — capacity lock (Anthropic reset_at) or a measured
+                          session ≥ 95 % / weekly ≥ 100 %, or the weekly squeeze
+                          (effective cap below the call, unsqueezed cap above).
+                          retry = the lock / session reset when known.
+    * gedrosselt        — a temporary hold (cooldown) without an account limit.
+    * kapazitaet_belegt — the budget is held by running calls.
+    * frei              — takes the call now.
+    """
+    cap = int(_zahl(info, "effective_cap_tokens"))
+    voller_cap = max(cap, int(_zahl(info, "adaptive_cap_tokens")))
+    frei = cap - int(_zahl(info, "current_in_flight_tokens"))
+    cooldown = int(_zahl(info, "cooldown_remaining_s"))
+    lock = int(_zahl(info, "capacity_lock_remaining_s"))
+    gemessen = bool(info.get("usage_known"))
+    session = info.get("session_percent")
+    weekly = info.get("weekly_percent")
+    session_voll = gemessen and isinstance(session, (int, float)) and session >= 95.0
+    weekly_voll = gemessen and isinstance(weekly, (int, float)) and weekly >= 100.0
+
+    if voller_cap < benoetigt:
+        return "zu_gross", None, "keine"
+    if lock > 0:
+        return "konto_limit", lock, "kontosperre"
+    if session_voll:
+        reset = int(_zahl(info, "session_reset_in_s"))
+        if reset > 0:
+            return "konto_limit", reset, "session_reset"
+        return "konto_limit", None, "unbekannt"
+    if weekly_voll or cap < benoetigt:
+        return "konto_limit", None, "unbekannt"
+    if cooldown > 0:
+        return "gedrosselt", cooldown, "cooldown"
+    if frei < benoetigt:
+        return "kapazitaet_belegt", CHAT_KAPAZITAET_RETRY_S, "schaetzung"
+    return "frei", CHAT_KAPAZITAET_RETRY_S, "schaetzung"
+
+
 def pool_lage(
     accounts: Dict[str, Dict[str, Any]],
     *,
@@ -245,36 +334,28 @@ def pool_lage(
     """Which worker can carry a call of ``benoetigt_tokens`` — and if none,
     why, with a retry_after that matches the pool.
 
-    A target must be available, out of cooldown, and have free budget
-    (effective cap − in flight) of at least the request's estimate. Workers in
-    ``ausgeschlossen`` (this one, earlier hops) are reported but not chosen.
+    Workers in ``ausgeschlossen`` (this one, earlier hops) are reported but
+    not chosen. Only workers whose cap can hold the call decide the reason and
+    the retry: a too-small worker's early reset does not help this call.
+    Account keys are not reported — only worker ids.
     """
     ausgeschlossen = set(ausgeschlossen)
     benoetigt = max(int(benoetigt_tokens or 0), 1)
     worker_lage: list[Dict[str, Any]] = []
     ziele: list[tuple[str, int]] = []
-    for konto, info in accounts.items():
+    for info in accounts.values():
         worker = info.get("worker")
         if not worker:
             continue
-        cap = int(info.get("effective_cap_tokens") or 0)
-        frei = cap - int(info.get("current_in_flight_tokens") or 0)
-        cooldown = int(info.get("cooldown_remaining_s") or 0)
-        verfuegbar = bool(info.get("available")) and cooldown <= 0
-        if not verfuegbar:
-            zustand = "konto_limit"
-        elif cap < benoetigt:
-            zustand = "zu_gross"
-        elif frei < benoetigt:
-            zustand = "kapazitaet_belegt"
-        else:
-            zustand = "frei"
+        zustand, retry, quelle = _worker_zustand(info, benoetigt)
+        frei = int(_zahl(info, "effective_cap_tokens") - _zahl(info, "current_in_flight_tokens"))
         worker_lage.append({
             "worker": worker,
             "zustand": zustand,
             "frei_tokens": max(frei, 0),
-            "cap_tokens": cap,
-            "cooldown_s": cooldown,
+            "cap_tokens": int(_zahl(info, "effective_cap_tokens")),
+            "retry_after_s": retry,
+            "retry_quelle": quelle,
             "weekly_percent": info.get("weekly_percent"),
             "ausgeschlossen": worker in ausgeschlossen,
         })
@@ -282,18 +363,30 @@ def pool_lage(
             ziele.append((worker, frei))
 
     ziel = max(ziele, key=lambda x: x[1])[0] if ziele else None
-    zustaende = {w["zustand"] for w in worker_lage}
+
+    def frueheste(zustaende: set) -> Optional[int]:
+        werte = [
+            w["retry_after_s"] for w in worker_lage
+            if w["zustand"] in zustaende and w["retry_after_s"] is not None
+        ]
+        return min(werte) if werte else None
+
+    vorhanden = {w["zustand"] for w in worker_lage}
     if not worker_lage:
         grund, retry = REASON_POOL_UNBEKANNT, CHAT_KAPAZITAET_RETRY_S
-    elif "frei" in zustaende or "kapazitaet_belegt" in zustaende:
-        # Some account could take it as soon as running calls end (or right
-        # now, on a worker this call already tried).
-        grund, retry = REASON_POOL_KAPAZITAET_BELEGT, CHAT_KAPAZITAET_RETRY_S
-    elif "konto_limit" in zustaende:
-        limits = [w["cooldown_s"] for w in worker_lage if w["zustand"] == "konto_limit"]
-        bekannte = [c for c in limits if c > 0]
+    elif vorhanden & {"frei", "kapazitaet_belegt", "gedrosselt"}:
+        # Some account with room under its limit: it takes the call once
+        # running calls end or its temporary hold lapses.
+        grund = REASON_POOL_KAPAZITAET_BELEGT
+        retry = frueheste({"frei", "kapazitaet_belegt", "gedrosselt"})
+    elif "konto_limit" in vorhanden:
         grund = REASON_POOL_KONTEN_LIMIT
-        retry = min(bekannte) if bekannte else CHAT_KAPAZITAET_RETRY_S
+        # Earliest KNOWN reset among the limited workers that could carry the
+        # call. None known (weekly limit without a lock): no invented number —
+        # the capacity estimate, marked as such in pool.worker[].retry_quelle.
+        retry = frueheste({"konto_limit"})
+        if retry is None:
+            retry = CHAT_KAPAZITAET_RETRY_S
     else:
         grund, retry = REASON_POOL_ZU_GROSS, None
     return {
