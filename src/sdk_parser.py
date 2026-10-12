@@ -48,6 +48,16 @@ def _retain_cli_end_fields(parsed: Any, data: dict[str, Any]) -> None:
         message = data.get("message")
         if isinstance(message, dict) and "stop_reason" in message:
             kept["_bridge_stop_reason"] = message["stop_reason"]
+        # BRREF (12.10.2026): a safety classifier stop arrives as stop_reason
+        # "refusal" with stop_details {type, category, explanation}; usage and
+        # id are per model call — the result's usage is the sum over calls.
+        if isinstance(message, dict):
+            if isinstance(message.get("stop_details"), dict):
+                kept["_bridge_stop_details"] = message["stop_details"]
+            if isinstance(message.get("usage"), dict):
+                kept["_bridge_message_usage"] = message["usage"]
+            if message.get("id"):
+                kept["_bridge_message_id"] = message["id"]
     elif data.get("type") == "result":
         if "stop_reason" in data:
             kept["_bridge_stop_reason"] = data["stop_reason"]

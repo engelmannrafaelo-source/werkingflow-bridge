@@ -903,6 +903,10 @@ def _handle_rate_limit_event(message, worker_id):
 # =============================================================================
 
 CLI_CONTINUATION_SENTENCE = "Output token limit hit. Resume directly"
+# BRREF (12.10.2026, CLI 2.1.285): after a stop_reason "refusal" the CLI
+# appends a meta user turn starting with this and lets the model answer once
+# more ("continuing once with that noted").
+CLI_SAFETY_STOP_SENTENCE = "stopped by a safety classifier"
 
 # The file the bridge names to the model as OUTPUT_FILE_PATH (inside the run's
 # claudedocs/). The research handler reads THIS file first — it is the one
@@ -1089,6 +1093,9 @@ _CLI_END_CARRIERS = (
     ("_bridge_is_api_error_message", "is_api_error_message"),
     ("_bridge_api_error_status", "api_error_status"),
     ("_bridge_terminal_reason", "terminal_reason"),
+    ("_bridge_stop_details", "stop_details"),
+    ("_bridge_message_usage", "message_usage"),
+    ("_bridge_message_id", "message_id"),
 )
 
 
@@ -1134,7 +1141,8 @@ def find_unfinished_result(chunks: list) -> Optional[dict]:
 # "max_tokens_fortgesetzt" = it did, the CLI continued on its own (meta turn
 # "Output token limit hit. Resume directly", up to 3 times in CLI 2.1.296) and
 # the final answer is spread over several messages — the last one is only its
-# tail. Any other value is the CLI's stop_reason (end_turn, tool_use, ...);
+# tail. "refusal" = a safety classifier stopped a message (modell_abbruch),
+# wherever it sits in the run. Any other value is the CLI's stop_reason (end_turn, tool_use, ...);
 # None = the CLI reported none.
 ANTWORT_ENDE_AUSGABEGRENZE = "max_tokens"
 ANTWORT_ENDE_FORTGESETZT = "max_tokens_fortgesetzt"
@@ -1167,6 +1175,11 @@ def antwort_ende(chunks: list) -> Optional[str]:
     first: the CLI's output-limit error on an assistant message or on the
     result, a stop_reason max_tokens, an automatic continuation inside the
     final answer; otherwise the reported stop_reason."""
+    abbruch = modell_abbruch(chunks)
+    if abbruch is not None:
+        # BRREF: the CLI's follow-up turn after a classifier stop would
+        # otherwise report end_turn for a refused answer.
+        return abbruch["stop_reason"]
     result = None
     for chunk in chunks:
         if is_result_chunk(chunk):
@@ -1195,6 +1208,151 @@ def antwort_ende(chunks: list) -> Optional[str]:
 
 def antwort_abgeschnitten(ende: Optional[str]) -> bool:
     return ende in (ANTWORT_ENDE_AUSGABEGRENZE, ANTWORT_ENDE_FORTGESETZT)
+
+
+# =============================================================================
+# HOW THE MODEL ENDED (BRREF, 12.10.2026)
+#
+# Measured on dev/worker1, 12.10.2026 09:58Z (CLI 2.1.285): Anthropic's safety
+# classifier stopped an answer — assistant message stop_reason "refusal",
+# stop_details {type: refusal, category: reasoning_extraction}. The CLI then
+# added a meta user turn ("…stopped by a safety classifier…") and ran a SECOND
+# model call, which answered with a 232-char apology. The chat route returned
+# the cut first message with finish_reason "stop" (hard-wired) and the result's
+# usage — the sum of both calls — as if it were one.
+#
+# Rule: finish_reason comes from how the model ended, never a constant.
+#   refusal (stop_reason or stop_details.type)  → "content_filter"
+#   max_tokens / CLI output-limit continuation  → "length"
+#   end_turn / stop_sequence / none reported    → "stop"
+#   anything else                               → passed on unchanged
+# The content of a refused run ends with the refused message; the CLI's
+# follow-up turn is never part of the answer.
+# =============================================================================
+
+NACH_MODELLABBRUCH_KEY = "nach_modellabbruch"
+MODELL_ABBRUCH_STOP_REASONS = ("refusal",)
+
+_STOP_REASON_FINISH = {
+    "end_turn": "stop",
+    "stop_sequence": "stop",
+    "max_tokens": "length",
+    ANTWORT_ENDE_FORTGESETZT: "length",
+    "model_context_window_exceeded": "length",
+    "refusal": "content_filter",
+}
+
+
+def ist_modell_abbruch(chunk: dict) -> bool:
+    details = chunk.get("stop_details")
+    return chunk.get("stop_reason") in MODELL_ABBRUCH_STOP_REASONS or (
+        isinstance(details, dict) and details.get("type") in MODELL_ABBRUCH_STOP_REASONS
+    )
+
+
+def modell_abbruch(chunks: list) -> Optional[dict]:
+    """The first model-side stop (safety classifier) in a run, or None.
+
+    {"index": position in `chunks` of the refused assistant message,
+     "stop_reason": "refusal", "category": stop_details.category or None,
+     "folgezuege": number of assistant model calls after it}.
+    Recognised by the message's own stop_reason / stop_details; second net:
+    an assistant message run_completion marked as the CLI's follow-up turn
+    (NACH_MODELLABBRUCH_KEY) — then the assistant message before it was the
+    refused one even if its stop fields got lost."""
+    index = None
+    for i, c in enumerate(chunks):
+        if _is_assistant_chunk(c) and ist_modell_abbruch(c):
+            index = i
+            break
+    if index is None:
+        for i, c in enumerate(chunks):
+            if _is_assistant_chunk(c) and c.get(NACH_MODELLABBRUCH_KEY):
+                vorher = [j for j in range(i) if _is_assistant_chunk(chunks[j])]
+                index = vorher[-1] if vorher else i
+                break
+    if index is None:
+        return None
+    refused = chunks[index]
+    details = refused.get("stop_details") if isinstance(refused.get("stop_details"), dict) else {}
+    later_ids = {
+        c.get("message_id") or id(c)
+        for c in chunks[index + 1:]
+        if _is_assistant_chunk(c) and c.get("message_id") != refused.get("message_id")
+    }
+    return {
+        "index": index,
+        "stop_reason": refused.get("stop_reason") or "refusal",
+        "category": details.get("category"),
+        "folgezuege": len(later_ids),
+    }
+
+
+def chunks_bis_abbruch(chunks: list, abbruch: Optional[dict]) -> list:
+    """`chunks` up to and including the refused message (all of them if None).
+    Assistant chunks with the same message_id (the CLI yields one per content
+    block) stay in."""
+    if abbruch is None:
+        return chunks
+    index = abbruch["index"]
+    msg_id = chunks[index].get("message_id")
+    end = index + 1
+    while (
+        msg_id
+        and end < len(chunks)
+        and _is_assistant_chunk(chunks[end])
+        and chunks[end].get("message_id") == msg_id
+    ):
+        end += 1
+    return chunks[:end]
+
+
+def finish_reason_fuer_lauf(chunks: list) -> tuple:
+    """(finish_reason, details) for a chat run of the CLI worker.
+
+    details: {"stop_reason": raw value or None, "category": … (refusal only),
+    "folgezuege": … (refusal only)}. See the rule block above."""
+    abbruch = modell_abbruch(chunks)
+    if abbruch is not None:
+        return "content_filter", {
+            "stop_reason": abbruch["stop_reason"],
+            "category": abbruch["category"],
+            "folgezuege": abbruch["folgezuege"],
+        }
+    ende = antwort_ende(chunks)
+    if ende is None:
+        return "stop", {"stop_reason": None}
+    return _STOP_REASON_FINISH.get(ende, ende), {"stop_reason": ende}
+
+
+def usage_je_zug(chunks: list) -> list:
+    """Usage of each model call in the run, in order, one entry per message id.
+
+    The CLI yields one assistant message per content block, each carrying the
+    usage of its whole model call — counted once. The result chunk's usage is
+    the SUM over these calls."""
+    zuege: list = []
+    gesehen: dict = {}
+    for c in chunks:
+        if not _is_assistant_chunk(c) or not isinstance(c.get("message_usage"), dict):
+            continue
+        key = c.get("message_id") or f"anon-{len(zuege)}"
+        u = c["message_usage"]
+        eintrag = {
+            "message_id": c.get("message_id"),
+            "stop_reason": c.get("stop_reason"),
+            "input_tokens": int(u.get("input_tokens") or 0),
+            "cache_creation_tokens": int(u.get("cache_creation_input_tokens") or 0),
+            "cache_read_tokens": int(u.get("cache_read_input_tokens") or 0),
+            "output_tokens": int(u.get("output_tokens") or 0),
+        }
+        if key in gesehen:
+            # Later block of the same call: the last report is the final one.
+            zuege[gesehen[key]] = eintrag
+        else:
+            gesehen[key] = len(zuege)
+            zuege.append(eintrag)
+    return zuege
 
 
 def describe_unfinished_result(chunk: dict) -> str:
@@ -2237,6 +2395,7 @@ class ClaudeCodeCLI:
                 # === END LARGE USER PROMPT HANDLING ===
 
                 fortsetzung_ausstehend = False
+                nach_abbruch_ausstehend = False
                 _api_error_turn = None
                 try:
                     async with asyncio.timeout(self.timeout):
@@ -2361,6 +2520,17 @@ class ClaudeCodeCLI:
                             # every consumer reads {"content": [...]} as
                             # assistant text. Still counted + in messages.jsonl.
                             if is_user_turn(message):
+                                if CLI_SAFETY_STOP_SENTENCE in _message_text(message):
+                                    # BRREF: the CLI re-prompts the model once
+                                    # after a classifier stop; the next
+                                    # assistant message is that follow-up, not
+                                    # the answer (modell_abbruch).
+                                    nach_abbruch_ausstehend = True
+                                    logger.warning(
+                                        f"🛑 CLI safety-classifier stop in session {cli_session_id} "
+                                        f"— follow-up turn will be marked, not taken as the answer",
+                                        extra={"cli_session_id": cli_session_id},
+                                    )
                                 if CLI_CONTINUATION_SENTENCE in _message_text(message):
                                     # The next assistant message continues a
                                     # cut-off one (antwort_ende).
@@ -2388,6 +2558,9 @@ class ClaudeCodeCLI:
                             if ist_assistent and fortsetzung_ausstehend and isinstance(message, dict):
                                 message[FORTSETZUNG_KEY] = True
                                 fortsetzung_ausstehend = False
+                            if ist_assistent and nach_abbruch_ausstehend and isinstance(message, dict):
+                                message[NACH_MODELLABBRUCH_KEY] = True
+                                nach_abbruch_ausstehend = False
                             logger.debug(f"Converted message dict: {message}")
 
                             # Cache chunk to file for crash recovery (with error handling)

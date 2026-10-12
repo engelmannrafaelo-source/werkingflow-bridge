@@ -480,6 +480,9 @@ _FINISH_REASON_MAP = {
     "stop_sequence": "stop",
     "max_tokens": "length",
     "tool_use": "tool_calls",
+    # BRREF (12.10.2026): a safety-classifier stop is a cut answer, OpenAI's
+    # value for it is content_filter (same as bedrock_service).
+    "refusal": "content_filter",
 }
 
 

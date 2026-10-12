@@ -1901,6 +1901,9 @@ async def generate_streaming_response(
         # fake finish_reason="stop" that hid truncation. Phase 2 will add
         # buffer-and-replay with internal retry so most crashes never surface.
         sdk_stream_error: Optional[Exception] = None
+        from src.claude_cli import NACH_MODELLABBRUCH_KEY
+        from src.claude_cli import ist_modell_abbruch as _chunk_ist_abbruch
+        abbruch_gesehen = False
 
         try:
             async for chunk in claude_cli.run_completion(
@@ -1936,6 +1939,16 @@ async def generate_streaming_response(
                         logger.debug(f"✅ Streaming started signal sent, CLI session: {cli_session_for_disconnect['cli_session_id']}")
 
                 chunks_buffer.append(chunk)
+
+                # BRREF: after a safety-classifier stop the CLI runs one more
+                # model call; its text is not the answer and is not streamed.
+                if abbruch_gesehen:
+                    continue
+                if isinstance(chunk, dict) and chunk.get(NACH_MODELLABBRUCH_KEY):
+                    abbruch_gesehen = True
+                    continue
+                if isinstance(chunk, dict) and _chunk_ist_abbruch(chunk):
+                    abbruch_gesehen = True
 
                 # Check if we have an assistant message
                 # Handle both old format (type/message structure) and new format (direct content)
@@ -2086,7 +2099,7 @@ async def generate_streaming_response(
                     f"stream ended without completion marker "
                     f"({_truncation_marker.get('subtype')}) — response is truncated"
                 )
-            elif not content_sent and not chunks_have_tool_use(chunks_buffer):
+            elif not content_sent and not chunks_have_tool_use(chunks_buffer) and not abbruch_gesehen:
                 sdk_stream_error = StreamEndedWithoutCompletion(
                     f"stream ended without content ({len(chunks_buffer)} chunks)"
                 )
@@ -2094,8 +2107,22 @@ async def generate_streaming_response(
                 logger.error(f"❌ Streaming: {sdk_stream_error}")
 
         # Extract assistant response from all chunks for session storage
+        from src.claude_cli import (
+            chunks_bis_abbruch,
+            finish_reason_fuer_lauf,
+            modell_abbruch,
+        )
+        _stream_abbruch = modell_abbruch(chunks_buffer)
+        stream_finish_reason, stream_finish_details = finish_reason_fuer_lauf(chunks_buffer)
+        if stream_finish_reason != "stop":
+            logger.warning(
+                f"🛑 Streaming run ended with stop_reason={stream_finish_details.get('stop_reason')} "
+                f"→ finish_reason={stream_finish_reason} ({stream_finish_details})"
+            )
         if actual_session_id and chunks_buffer:
-            assistant_content = claude_cli.parse_claude_message(chunks_buffer)
+            assistant_content = claude_cli.parse_claude_message(
+                chunks_bis_abbruch(chunks_buffer, _stream_abbruch)
+            )
             if assistant_content:
                 assistant_message = Message(role="assistant", content=assistant_content)
                 session_manager.add_assistant_response(actual_session_id, assistant_message)
@@ -2111,8 +2138,9 @@ async def generate_streaming_response(
                 choices=[StreamChoice(
                     index=0,
                     delta={},
-                    finish_reason="stop"
-                )]
+                    finish_reason=stream_finish_reason
+                )],
+                x_bridge_finish=stream_finish_details,
             )
             yield f"data: {final_chunk.model_dump_json()}\n\n"
         elif isinstance(sdk_stream_error, RateLimitError):
@@ -3991,11 +4019,38 @@ async def chat_completions(
             # Extract assistant message
             raw_assistant_content = claude_cli.parse_claude_message(chunks)
 
+            # BRREF: how the model ended. A safety-classifier stop ends the
+            # answer at the refused message — the CLI's follow-up turn is not
+            # the answer — and is reported as content_filter, never as "stop".
+            from src.claude_cli import (
+                chunks_bis_abbruch,
+                finish_reason_fuer_lauf,
+                modell_abbruch,
+                usage_je_zug,
+            )
+            _abbruch = modell_abbruch(chunks)
+            _finish_reason, _finish_details = finish_reason_fuer_lauf(chunks)
+            _usage_zuege = usage_je_zug(chunks)
+            if _abbruch is not None:
+                raw_assistant_content = claude_cli.parse_claude_message(
+                    chunks_bis_abbruch(chunks, _abbruch)
+                ) or ""
+                logger.warning(
+                    f"🛑 Model stop on worker {_self_worker}: stop_reason={_abbruch['stop_reason']} "
+                    f"category={_abbruch['category']} folgezuege={_abbruch['folgezuege']} "
+                    f"partial_chars={len(raw_assistant_content)} — finish_reason=content_filter"
+                )
+            elif _finish_reason != "stop":
+                logger.warning(
+                    f"⚠️ Chat run on worker {_self_worker} ended with "
+                    f"stop_reason={_finish_details.get('stop_reason')} → finish_reason={_finish_reason}"
+                )
+
             # 2026-05-05 v2: detect SDK-early-termination (layered, post-parse).
             # Pure-function helpers in claude_cli.py validated by pytest.
             from src.claude_cli import is_incomplete_response, chunks_have_tool_use
             _has_tools = chunks_have_tool_use(chunks)
-            if is_incomplete_response(len(chunks), raw_assistant_content, _has_tools):
+            if _abbruch is None and is_incomplete_response(len(chunks), raw_assistant_content, _has_tools):
                 logger.warning(
                     f"⚠️  Incomplete SDK response on worker {_self_worker} "
                     f"(chunks={len(chunks)}, content_empty=True, has_tools=False) "
@@ -4119,7 +4174,7 @@ async def chat_completions(
                         f"[Bridge {_self_worker}] Quota exhaustion detected in response content"
                     )
 
-            if not raw_assistant_content:
+            if not raw_assistant_content and _abbruch is None:
                 # CRITICAL: Detailed error logging for debugging
                 logger.error(f"❌ parse_claude_message returned None!")
                 logger.error(f"   Chunks count: {len(chunks)}")
@@ -4168,7 +4223,8 @@ async def chat_completions(
             # hardened system prompt and max_turns=2 so a blocked-tool turn can still
             # recover with real text.
             if (
-                not request_body.enable_tools
+                _abbruch is None
+                and not request_body.enable_tools
                 and looks_like_tool_leak(assistant_content, prompt_chars=len(prompt or ""))
             ):
                 logger.warning(
@@ -4258,7 +4314,7 @@ async def chat_completions(
                 choices=[Choice(
                     index=0,
                     message=Message(role="assistant", content=assistant_content),
-                    finish_reason="stop"
+                    finish_reason=_finish_reason
                 )],
                 usage=Usage(
                     prompt_tokens=prompt_tokens,
@@ -4268,7 +4324,10 @@ async def chat_completions(
                     cache_write_tokens=cache_creation_tokens,
                     image_count=0  # Text-only request (no images)
                 ),
-                x_backend_info=BackendInfo(**get_backend_info_dict(backend_config)) if backend_config else None
+                x_backend_info=BackendInfo(**get_backend_info_dict(backend_config)) if backend_config else None,
+                x_bridge_finish=_finish_details,
+                x_bridge_model_calls=len(_usage_zuege) if (usage_source == "api" and _usage_zuege) else None,
+                x_bridge_usage_zuege=_usage_zuege or None,
             )
 
             # Log successful chat completion event
@@ -5011,6 +5070,16 @@ class ResearchAnswerTruncated(ResearchReportMissing):
     fehler_code = "antwort_abgeschnitten"
 
 
+class ResearchModelStopped(ResearchReportMissing):
+    """antwort_im_text and a safety classifier stopped a message of the run
+    (antwort_ende "refusal", BRREF 12.10.2026). The CLI then lets the model
+    answer once more; that follow-up — typically a short refusal — is the final
+    message, but it is not the answer. Not retryable: the same request meets
+    the same classifier."""
+
+    fehler_code = "modell_abbruch"
+
+
 async def _research_strom(strom, antwort_im_text: bool):
     """run_completion for research, with the end of the answer on an API error.
 
@@ -5639,7 +5708,11 @@ async def _execute_research_impl(
 
         execution_time = time.time() - start_time
 
-        from src.claude_cli import antwort_abgeschnitten, antwort_ende
+        from src.claude_cli import (
+            MODELL_ABBRUCH_STOP_REASONS,
+            antwort_abgeschnitten,
+            antwort_ende,
+        )
         research_antwort_ende = antwort_ende(all_chunks)
 
         # Bibliotheksaufrufe zählbar machen — das Gegenstück zu library_calls
@@ -5779,6 +5852,18 @@ async def _execute_research_impl(
                 f"the run's final message is not the complete answer. Not 'no answer' and not "
                 f"error_max_turns — the answer is longer than one message can be; a smaller "
                 f"task fits, the same request hits the same limit."
+            )
+        if research_antwort_ende in MODELL_ABBRUCH_STOP_REASONS:
+            if antwort_im_text:
+                raise ResearchModelStopped(
+                    f"Research answer stopped by the model's safety classifier (antwort_ende="
+                    f"{research_antwort_ende}, session_id={session_id}): the final message is the "
+                    f"CLI's follow-up turn, not the answer."
+                )
+            logger.warning(
+                f"research: a message was stopped by the safety classifier (antwort_ende="
+                f"{research_antwort_ende}, session_id={session_id}) — file contract, the report "
+                f"file is the answer; reported in antwort_ende"
             )
         if antwort_abgeschnitten(research_antwort_ende):
             # File contract: the report is the file, not the message. Reported

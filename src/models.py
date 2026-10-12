@@ -404,6 +404,23 @@ class ChatCompletionResponse(BaseModel):
         default=None,
         description="Backend routing information (non-standard OpenAI extension)"
     )
+    x_bridge_finish: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description=(
+            "How the model ended (non-standard extension): stop_reason as the model "
+            "reported it; on finish_reason content_filter also category and folgezuege"
+        ),
+    )
+    # BRREF (12.10.2026): a CLI run can make several model calls (tool turns,
+    # the CLI's own follow-up after a safety stop); usage is then their SUM.
+    x_bridge_model_calls: Optional[int] = Field(
+        default=None,
+        description="Number of model calls usage is summed over (non-standard extension)",
+    )
+    x_bridge_usage_zuege: Optional[List[Dict[str, Any]]] = Field(
+        default=None,
+        description="Usage per model call; usage above is their sum (non-standard extension)",
+    )
 
 
 class StreamChoice(BaseModel):
@@ -419,6 +436,8 @@ class ChatCompletionStreamResponse(BaseModel):
     model: str
     choices: List[StreamChoice]
     system_fingerprint: Optional[str] = None
+    # Final chunk only (BRREF): see ChatCompletionResponse.x_bridge_finish.
+    x_bridge_finish: Optional[Dict[str, Any]] = None
 
 
 class ErrorDetail(BaseModel):
