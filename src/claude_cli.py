@@ -128,6 +128,11 @@ def _apply_open_process_patch() -> None:
             and str(command[0]).endswith("claude")
         )
         if is_claude_cmd:
+            # BRLZR P3: the CLI and everything it starts (MCP servers, tool
+            # shells) get a process group of their own, so a run aborted at its
+            # deadline can be killed as a whole (_bounded_transport_close) —
+            # without ever touching the worker's own group.
+            kwargs.setdefault("start_new_session", True)
             tempfile_path = _current_sys_prompt_tempfile.get()
             if tempfile_path:
                 # options.system_prompt was intentionally NOT set for this request
@@ -146,7 +151,10 @@ def _apply_open_process_patch() -> None:
                     f"🔧 open_process patch: injected --append-system-prompt-file "
                     f"{append_tempfile_path!r}"
                 )
-        return await _original_open_process(command, *args, **kwargs)
+        process = await _original_open_process(command, *args, **kwargs)
+        if is_claude_cmd and kwargs.get("start_new_session"):
+            _OWN_SESSION_PIDS.add(process.pid)
+        return process
 
     anyio.open_process = _intercepted_open_process  # type: ignore[assignment]
 
@@ -180,6 +188,95 @@ def _apply_open_process_patch() -> None:
     )
 
 
+# BRLZR P3 (12.10.2026): claude-code-sdk 0.0.25 SubprocessCLITransport.close()
+# sends SIGTERM and then awaits process.wait() with no timeout and no SIGKILL
+# (its comment promises a timeout, the code has none). A CLI that does not
+# react to SIGTERM kept the aborted run — and the request — hanging after the
+# research deadline (Codex BRLZR, measured with a SIGTERM-ignoring process).
+# So close() is bounded here: SIGTERM, at most CLI_TERM_GRACE_S, then SIGKILL
+# to the CLI's whole process group (its children included), then reap.
+CLI_TERM_GRACE_S = float(os.getenv("BRIDGE_CLI_TERM_GRACE_S", "10"))
+CLI_KILL_REAP_S = 5.0
+# pids of CLI processes started in a session of their own (pgid == pid). Only
+# these groups are ever killed — never a group this module did not create.
+_OWN_SESSION_PIDS: set = set()
+
+
+def _kill_own_group(pid: int) -> None:
+    import signal
+
+    if pid not in _OWN_SESSION_PIDS:
+        return
+    if pid == os.getpgrp():  # can only be a bug — never kill ourselves
+        raise RuntimeError(f"CLI pid {pid} names the worker's own process group")
+    try:
+        os.killpg(pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass  # the group is already empty
+
+
+def _apply_bounded_close_patch() -> None:
+    import anyio
+    import claude_code_sdk
+
+    if not isinstance(getattr(claude_code_sdk, "__file__", None), str):
+        # A test stand-in (sys.modules MagicMock), not an SDK: no CLI can be
+        # spawned through it, so there is no transport to bound.
+        logger.warning(
+            "claude_code_sdk is a stand-in — bounded CLI close not installed"
+        )
+        return
+    from claude_code_sdk._internal.transport.subprocess_cli import (
+        SubprocessCLITransport,
+    )
+
+    original_close = SubprocessCLITransport.close
+    if getattr(original_close, "_bridge_bounded", False):
+        return
+
+    async def _bounded_transport_close(self) -> None:
+        proc = getattr(self, "_process", None)
+        aborted = proc is not None and proc.returncode is None
+        pid = proc.pid if proc is not None else None
+        # Shielded but bounded: an outer cancel scope must not cut the cleanup
+        # short (the process would be left behind), and nothing may hang it.
+        with anyio.move_on_after(CLI_TERM_GRACE_S, shield=True) as scope:
+            await original_close(self)
+        if not aborted:
+            _OWN_SESSION_PIDS.discard(pid)
+            return
+        if scope.cancelled_caught:
+            logger.error(
+                f"🛑 CLI pid {pid} still alive {CLI_TERM_GRACE_S:.0f}s after SIGTERM — "
+                f"SIGKILL to its process group"
+            )
+        # Also after a clean SIGTERM exit: whatever the CLI started (tool
+        # shells, MCP servers) must not outlive the aborted run.
+        if pid in _OWN_SESSION_PIDS:
+            _kill_own_group(pid)
+        elif proc.returncode is None:
+            # Not started through our spawn path (no group of its own): the
+            # process itself is all that can be killed without hitting the worker.
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                pass
+        if proc.returncode is None:
+            with anyio.move_on_after(CLI_KILL_REAP_S, shield=True):
+                await proc.wait()
+        _OWN_SESSION_PIDS.discard(pid)
+        if proc.returncode is None:
+            logger.error(
+                f"🛑 CLI pid {pid} survived SIGKILL of its group — cannot be stopped"
+            )
+        self._process = None
+        self._stdout_stream = None
+        self._stdin_stream = None
+
+    _bounded_transport_close._bridge_bounded = True  # type: ignore[attr-defined]
+    SubprocessCLITransport.close = _bounded_transport_close  # type: ignore[assignment]
+
+
 try:
     _apply_open_process_patch()
 except Exception as _sp_patch_err:
@@ -187,6 +284,9 @@ except Exception as _sp_patch_err:
         f"⚠️ Could not apply anyio.open_process patch for large system_prompt: {_sp_patch_err}. "
         f"Requests with system_prompt > {LARGE_ARG_THRESHOLD_BYTES:,} bytes will fail loudly."
     )
+# No try here: a CLI that cannot be stopped at its deadline runs on and costs —
+# an SDK whose transport moved must fail the worker's start, not the bill.
+_apply_bounded_close_patch()
 # =============================================================================
 
 
@@ -1732,8 +1832,8 @@ class ClaudeCodeCLI:
         # timeout_s (BRREF-LAUFZEIT): the caller's remaining time, e.g. the
         # research run's overall deadline. Never longer than MAX_TIMEOUT. When
         # it fires, asyncio.timeout cancels the SDK query, whose finally closes
-        # the transport and terminates the CLI process — the agent stops and
-        # costs nothing more.
+        # the transport: SIGTERM, then at most CLI_TERM_GRACE_S, then SIGKILL
+        # to the CLI's process group (_bounded_transport_close, BRLZR P3).
         _timeout = self.timeout if timeout_s is None else max(1.0, min(self.timeout, float(timeout_s)))
         _prompt_as_received = prompt
         if resume_workdir is not None:

@@ -27,8 +27,19 @@ it started goes on and is paid for —
     CLI round   ≤ remaining time of the deadline (and ≤ MAX_TIMEOUT)
     deadline    RESEARCH_GESAMTFRIST_S          3300 s
   < cross-worker research retry                  3400 s  (main._cross_worker_retry)
+  < nginx read timeout, research location        3450 s  (docker/nginx.conf)
   < durable job self-call                        3500 s  (jobs/executors.py)
   < Energy's job poller                          3600 s  (outside the bridge)
+
+The nginx step (BRLZR P1): a job whose self-call meets a capacity 429 is
+re-dispatched THROUGH the local LB (executors._post_with_capacity_redispatch),
+so the research then runs behind nginx's proxy_read_timeout. With 2500 s there
+nginx gave up on a 2700 s run, answered 503, the job was parked and could run
+again while the first run still worked. That location now waits longer than
+the worker can take (its deadline, or its own cross-worker retry) and shorter
+than the job self-call waiting on it. nginx.conf cannot read this module, so
+``NGINX_RESEARCH_READ_TIMEOUT_S`` is the number the file must carry, and
+tests/research_cloud/test_research_laufzeit.py reads the file and compares.
 
 ``pruefe_staffelung`` checks the order at import — a misconfigured env fails
 the worker's start, loudly, instead of cutting runs at random. A run retried
@@ -53,6 +64,9 @@ PRUEFER_MIN_REST_S = float(os.getenv("RESEARCH_PRUEFER_MIN_REST_S", "240"))
 RUECKRUNDE_MIN_REST_S = float(os.getenv("RESEARCH_RUECKRUNDE_MIN_REST_S", "600"))
 
 CROSS_WORKER_TIMEOUT_S = float(os.getenv("RESEARCH_CROSS_WORKER_TIMEOUT_S", "3400"))
+# docker/nginx.conf proxy_read_timeout of the chat/research location and of
+# @production_streaming — a constant, because the file is static (test-checked).
+NGINX_RESEARCH_READ_TIMEOUT_S = 3450.0
 JOB_SELBSTAUFRUF_TIMEOUT_S = float(os.getenv("BRIDGE_RESEARCH_JOB_TIMEOUT_S", "3500"))
 # Outside the bridge (werking-energy's job poller) — here only for the order.
 ENERGY_POLLER_S = 3600.0
@@ -71,16 +85,20 @@ def staffelung() -> Dict[str, float]:
         "max_timeout_s": MAX_TIMEOUT_S,
         "gesamtfrist_s": GESAMTFRIST_S,
         "cross_worker_s": CROSS_WORKER_TIMEOUT_S,
+        "nginx_research_s": NGINX_RESEARCH_READ_TIMEOUT_S,
         "job_selbstaufruf_s": JOB_SELBSTAUFRUF_TIMEOUT_S,
         "energy_poller_s": ENERGY_POLLER_S,
     }
 
 
 def pruefe_staffelung(werte: Optional[Dict[str, float]] = None) -> None:
-    """Raise ValueError unless MAX_TIMEOUT ≤ deadline < cross-worker < job
-    self-call < Energy poller."""
+    """Raise ValueError unless MAX_TIMEOUT ≤ deadline < cross-worker < nginx
+    research location < job self-call < Energy poller."""
     w = werte or staffelung()
-    kette = ["gesamtfrist_s", "cross_worker_s", "job_selbstaufruf_s", "energy_poller_s"]
+    kette = [
+        "gesamtfrist_s", "cross_worker_s", "nginx_research_s",
+        "job_selbstaufruf_s", "energy_poller_s",
+    ]
     fehler = [
         f"{a}={w[a]:.0f} must be < {b}={w[b]:.0f}"
         for a, b in zip(kette, kette[1:]) if not w[a] < w[b]

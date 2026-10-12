@@ -427,6 +427,10 @@ class Nachkontrolle:
     # enough for it ("pruefung" / "rueckrunde" / "nachmessung") and why.
     uebersprungen: Dict[str, str] = field(default_factory=dict)
     nachmessung_durchgefuehrt: bool = False
+    # BRLZR: the re-check after the return round ran and failed (its deadline,
+    # an error) — why. The revised report still goes out; the claim that it
+    # was checked again must not.
+    nachmessung_fehler: Optional[str] = None
     _entschieden: bool = False
 
     async def _pruefe(self, bericht: str, protokoll: List[WerkzeugAufruf], phase: str) -> Optional[LueckenBefund]:
@@ -498,9 +502,13 @@ class Nachkontrolle:
         durchgefuehrt = checked, and either nothing was open or the return
         round revised the report; uebersprungen = a step was left out (time,
         perplexity budget); gescheitert = the check or the return round failed
-        — the report handed out is the one from before the return round."""
+        — the report handed out is the one from before the return round — or
+        the re-check after a return round failed (nachmessung gescheitert):
+        then the revised report goes out, unchecked, and grund says why."""
         if self.rueckrunde_fehler:
             status, grund = "gescheitert", self.rueckrunde_fehler
+        elif self.nachmessung_fehler:
+            status, grund = "gescheitert", f"nachmessung: {self.nachmessung_fehler}"
         elif self.rueckrunde_grund == "pruefung_fehlgeschlagen":
             status, grund = "gescheitert", "; ".join(self.pruef_fehler) or "pruefung_fehlgeschlagen"
         elif self.uebersprungen:
@@ -519,6 +527,7 @@ class Nachkontrolle:
             "luecken_ohne_suche_nach_rueckrunde": self.luecken_ohne_suche_nach_rueckrunde,
             "nachmessung": (
                 "durchgefuehrt" if self.nachmessung_durchgefuehrt
+                else "gescheitert" if self.nachmessung_fehler
                 else "uebersprungen" if "nachmessung" in self.uebersprungen
                 else None
             ),
@@ -528,6 +537,11 @@ class Nachkontrolle:
         """After the return round: count again. Measures only, triggers nothing."""
         befund = await self._pruefe(bericht, protokoll, "nachher")
         self.nachmessung_durchgefuehrt = befund is not None
+        if befund is None:
+            # _pruefe has just named the failure as its last entry.
+            self.nachmessung_fehler = (
+                self.pruef_fehler[-1] if self.pruef_fehler else "unbekannt"
+            )
         if befund is not None:
             self.luecken_nach_rueckrunde = len(befund.luecken)
             self.luecken_ohne_suche_nach_rueckrunde = len(offene_luecken(befund))
@@ -553,6 +567,8 @@ class Nachkontrolle:
             meta["rueckrunde_usage"] = self.rueckrunde_usage
         if self.rueckrunde_fehler:
             meta["rueckrunde_fehler"] = self.rueckrunde_fehler
+        if self.nachmessung_fehler:
+            meta["nachmessung_fehler"] = self.nachmessung_fehler
         if self.uebersprungen:
             meta["luecken_uebersprungen"] = dict(self.uebersprungen)
         meta["nachkontrolle_status"] = self.status()["status"]

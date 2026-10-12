@@ -32,7 +32,8 @@ def test_staffelung_der_fristen():
     w = rl.staffelung()
     assert w["max_timeout_s"] <= w["gesamtfrist_s"] == 3300
     assert w["gesamtfrist_s"] < w["cross_worker_s"] == 3400
-    assert w["cross_worker_s"] < w["job_selbstaufruf_s"] == 3500
+    assert w["cross_worker_s"] < w["nginx_research_s"] == 3450
+    assert w["nginx_research_s"] < w["job_selbstaufruf_s"] == 3500
     assert w["job_selbstaufruf_s"] < w["energy_poller_s"] == 3600
     rl.pruefe_staffelung()
 
@@ -40,11 +41,44 @@ def test_staffelung_der_fristen():
 @pytest.mark.parametrize("kaputt", [
     {"job_selbstaufruf_s": 3300},          # the 2400/2400 situation of 12.10.
     {"cross_worker_s": 3600},
+    {"nginx_research_s": 2500},            # the 2500 s of BRLZR P1
+    {"nginx_research_s": 3500},
     {"max_timeout_s": 4000},
 ])
 def test_falsche_staffelung_faellt_laut(kaputt):
     with pytest.raises(ValueError, match="time chain out of order"):
         rl.pruefe_staffelung(dict(rl.staffelung(), **kaputt))
+
+
+def _nginx_read_timeouts() -> dict:
+    """proxy_read_timeout per location block of docker/nginx.conf."""
+    import re
+    from pathlib import Path
+
+    conf = (Path(__file__).resolve().parents[2] / "docker" / "nginx.conf").read_text()
+    out, location = {}, None
+    for line in conf.splitlines():
+        m = re.match(r"\s*location\s+(.+?)\s*\{", line)
+        if m:
+            location = m.group(1)
+        m = re.match(r"\s*proxy_read_timeout\s+(\d+)s;", line)
+        if m and location:
+            out.setdefault(location, []).append(float(m.group(1)))
+    return out
+
+
+def test_nginx_research_location_steht_in_der_staffel():
+    """BRLZR P1: a job re-dispatched through the LB after a capacity 429 runs
+    behind these two locations — their read timeout is a step of the chain."""
+    t = _nginx_read_timeouts()
+    for location in ("~ ^/v1/(chat/completions|research)", "@production_streaming"):
+        assert t[location] == [rl.NGINX_RESEARCH_READ_TIMEOUT_S], location
+
+
+def test_redispatch_geht_durch_die_research_location():
+    """The re-dispatch path is the one the nginx step guards."""
+    from src.jobs import executors
+    assert "/v1/research" in executors.JOB_REDISPATCH_PATHS
 
 
 def test_job_selbstaufruf_liest_die_eine_quelle():
@@ -282,3 +316,41 @@ def test_nachkontrolle_status_regeln():
     nk = Nachkontrolle(pruefer=None)
     nk.rueckrunde_grund = "budget_erschoepft"
     assert nk.status()["status"] == "uebersprungen"
+
+
+# ── BRLZR P2: a failed re-check is not a performed one ─────────────────────
+
+class _NachmessungTimeout(FakeCli):
+    """Codex BRLZR counter-sample: the re-check after the return round times out."""
+
+    def __call__(self, **kw):
+        from src.research_cloud.luecken import PRUEF_MODELL
+        if kw.get("model") == PRUEF_MODELL and self.calls["pruefer"]:
+            async def fail():
+                raise TimeoutError("review: deadline in recheck")
+                yield
+            return fail()
+        return super().__call__(**kw)
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("persist", "pplx_on")
+async def test_nachmessung_timeout_ist_oeffentlich_gescheitert(tmp_path):
+    result = await _run(_NachmessungTimeout(tmp_path, mit_datei=True))
+    nk = result.nachkontrolle
+    assert result.status == "success"  # the revised report still goes out
+    assert nk["status"] == "gescheitert"
+    assert nk["nachmessung"] == "gescheitert"
+    assert nk["grund"].startswith("nachmessung: nachher: TimeoutError")
+    assert nk["rueckrunde"] is True
+
+
+def test_nachmessung_fehler_im_status():
+    from src.research_cloud.luecken import Nachkontrolle
+
+    nk = Nachkontrolle(pruefer=None)
+    nk.rueckrunde, nk.rueckrunde_grund = True, "luecken_ohne_suche"
+    nk.nachmessung_fehler = "nachher: TimeoutError: x"
+    st = nk.status()
+    assert (st["status"], st["nachmessung"]) == ("gescheitert", "gescheitert")
+    assert nk.as_meta()["nachmessung_fehler"] == "nachher: TimeoutError: x"
