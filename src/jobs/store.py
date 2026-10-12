@@ -454,6 +454,16 @@ async def mark_error(
     `details` (error_contract.JOB_ERROR_DETAIL_KEYS) go into the row flat,
     only the keys that are set.
 
+    A running row whose owner asked to cancel it and whose stop had begun
+    booking (progress.abbruch.ledger 'offen') is NOT an ordinary error: the
+    stop took effect, its booking is unconfirmed — the stopping endpoint died
+    and the runner only saw the broken self-call (FK25BR R7). Such a row is
+    closed like the watchdog closes it: 'cancelled', ledger 'unbekannt',
+    geschlossen_von 'mark_error', open deductions kept; the error is kept in
+    the row for diagnosis. DELETE then answers 502 job_cancel_ledger_unknown
+    (routes._cancelled_answer), GET reads 'cancelled', never a retryable
+    error. Decided in the same statement as the update, under its row lock.
+
     Raises JobRowMissing when the row is gone."""
     from src.error_contract import job_error_details
 
@@ -474,8 +484,21 @@ async def mark_error(
     async with pool.acquire() as conn:
         tag = await conn.execute(
             """
-            UPDATE ai_jobs SET status = 'error', error = $2::jsonb,
-                               updated_at = NOW(), finished_at = NOW()
+            UPDATE ai_jobs
+               SET status = CASE WHEN status = 'running'
+                                       AND cancel_requested_at IS NOT NULL
+                                       AND progress->'abbruch'->>'ledger' = 'offen'
+                                 THEN 'cancelled' ELSE 'error' END,
+                   progress = CASE WHEN status = 'running'
+                                        AND cancel_requested_at IS NOT NULL
+                                        AND progress->'abbruch'->>'ledger' = 'offen'
+                       THEN progress || jsonb_build_object(
+                           'abbruch', (progress->'abbruch') || jsonb_build_object(
+                               'ledger', 'unbekannt',
+                               'geschlossen_von', 'mark_error'))
+                       ELSE progress END,
+                   error = $2::jsonb,
+                   updated_at = NOW(), finished_at = NOW()
              WHERE job_id = $1
             """,
             job_id,
