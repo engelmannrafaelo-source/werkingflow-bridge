@@ -1,6 +1,7 @@
 """Generic async-job HTTP surface — additive, feature-flagged.
 
     POST /v1/jobs           → { job_id, status:'pending', kind }   (returns in <1s)
+                              with Idempotency-Key: 201 new / 200 replay (BRREF2)
     GET  /v1/jobs/{job_id}   → { status, elapsed_seconds, progress, result?, error? }
     DELETE /v1/jobs/{job_id} → withdraw a job no worker has started yet (BR10)
 
@@ -27,9 +28,12 @@ from pydantic import BaseModel
 from src.auth import security, verify_api_key
 from src.error_contract import job_error_view
 from src.middleware.bridge_error import (
+    REASON_IDEMPOTENCY_KEY_INVALID,
+    REASON_IDEMPOTENCY_KEY_REUSED,
     REASON_JOB_ALREADY_RUNNING,
     REASON_JOB_NOT_FOUND,
     REASON_JOB_TERMINAL,
+    idempotency_error,
     job_cancel_error,
     job_home_unconfigured_error,
     job_id_malformed_error,
@@ -84,6 +88,74 @@ class JobCreateRequest(BaseModel):
     payload: Dict[str, Any] = {}
     # Optional explicit attribution; if omitted, derived from request headers.
     attribution: Optional[Dict[str, Any]] = None
+
+
+# ── Idempotency-Key (BRREF2) ─────────────────────────────────────────────
+# Contract, agreed with the report side:
+#   no header                      → unchanged (200, a new job every time)
+#   new key                        → 201, new job, Idempotent-Replayed: false
+#   same key + owner, same body    → 200, the SAME job_id, no new job, whatever
+#                                    its status (pending/running/done/error/
+#                                    cancelled), Idempotent-Replayed: true
+#   same key + owner, other body   → 422 idempotency_key_reused, no job
+#   malformed key                  → 400 idempotency_key_invalid, no job
+# Every keyed answer echoes Idempotency-Key. The key lives as long as its job
+# row: never deleted while pending/running, and 24 h past the terminal state
+# (store.IDEMPOTENCY_RETENTION_SECONDS). Exactly-once under concurrency is the
+# store's UNIQUE index (migration 065), not a check in this file.
+IDEMPOTENCY_HEADER = "Idempotency-Key"
+REPLAYED_HEADER = "Idempotent-Replayed"
+IDEMPOTENCY_KEY_MAX_LEN = 200
+
+
+def _idempotency_key(request: Request) -> Optional[str]:
+    """The header value, or None when absent. Raises ValueError when present
+    but unusable (empty, longer than 200, or not printable ASCII)."""
+    raw = request.headers.get(IDEMPOTENCY_HEADER)
+    if raw is None:
+        return None
+    if not raw:
+        raise ValueError(f"{IDEMPOTENCY_HEADER} is empty")
+    if len(raw) > IDEMPOTENCY_KEY_MAX_LEN:
+        raise ValueError(
+            f"{IDEMPOTENCY_HEADER} is {len(raw)} characters, at most "
+            f"{IDEMPOTENCY_KEY_MAX_LEN} are allowed"
+        )
+    if not all(0x20 <= ord(c) <= 0x7E for c in raw):
+        raise ValueError(f"{IDEMPOTENCY_HEADER} must be printable ASCII")
+    return raw
+
+
+def _idempotency_owner(request: Request) -> str:
+    """Whose key namespace this is: the authenticated principal (or the shared
+    key) plus the calling app. Two apps using the same key string get two
+    jobs; the same app retrying gets its one job back.
+
+    The app comes from the caller's X-* headers via the canonical extractor —
+    never from the body's attribution, which a caller can set freely per
+    request. No extractor wired (main.py always wires one) → fail loud."""
+    if _attribution_extractor is None:
+        raise RuntimeError(
+            "POST /v1/jobs with Idempotency-Key: no attribution extractor wired "
+            "(main.py set_attribution_extractor) — cannot establish the key owner"
+        )
+    principal = getattr(request.state, "principal", None)
+    who = getattr(principal, "name", None) or "shared-key"
+    app = (_attribution_extractor(request) or {}).get("app_id") or "-"
+    return f"{who}|{app}"
+
+
+def _keyed_response(
+    status_code: int, body: Dict[str, Any], key: str, replayed: bool
+) -> JSONResponse:
+    return JSONResponse(
+        status_code=status_code,
+        content=body,
+        headers={
+            IDEMPOTENCY_HEADER: key,
+            REPLAYED_HEADER: "true" if replayed else "false",
+        },
+    )
 
 
 async def _job_runs_off_pool(
@@ -158,6 +230,11 @@ async def create_job_endpoint(
             raise HTTPException(400, "ungueltiger Erkunder-Auftrag") from None
     _require_enabled()
 
+    try:
+        idem_key = _idempotency_key(request)
+    except ValueError as e:
+        return idempotency_error(REASON_IDEMPOTENCY_KEY_INVALID, 400, str(e))
+
     if get_executor(body.kind) is None:
         raise HTTPException(
             status_code=400,
@@ -224,6 +301,11 @@ async def create_job_endpoint(
         logger.error("job submission refused — job home unconfigured: %s", e)
         return job_home_unconfigured_error(str(e))
 
+    if idem_key is not None:
+        return await _create_keyed_job(
+            job_id, body, attribution, idem_key, _idempotency_owner(request)
+        )
+
     # Persist FIRST (durable 'pending'), then dispatch. If this worker dies before
     # the task runs, the row survives at 'pending' and the watchdog requeues it
     # from any worker — the dispatch is never a silent fire-and-forget loss.
@@ -232,6 +314,61 @@ async def create_job_endpoint(
     logger.info(f"📨 Async job {job_id} dispatched (kind={body.kind})")
 
     return {"job_id": job_id, "status": "pending", "kind": body.kind}
+
+
+async def _create_keyed_job(
+    job_id: str,
+    body: "JobCreateRequest",
+    attribution: Optional[Dict[str, Any]],
+    key: str,
+    owner: str,
+) -> JSONResponse:
+    """Persist-then-dispatch like the unkeyed path, but through the store's
+    atomic create-once (BRREF2). Only the request that created the row
+    dispatches it; a replay returns the existing job and starts nothing."""
+    try:
+        outcome = await store_client.create_job_idempotent(
+            job_id, body.kind, body.payload, attribution, owner, key
+        )
+    except store_client.IdempotencyKeyReused as e:
+        logger.warning(
+            "job submission refused — Idempotency-Key reused with a different "
+            "body (owner=%s, existing job %s)", owner, e.job_id,
+        )
+        return idempotency_error(
+            REASON_IDEMPOTENCY_KEY_REUSED, 422,
+            f"{IDEMPOTENCY_HEADER} was already used for job {e.job_id} with a "
+            f"different request body; no job created",
+            idempotency_key=key,
+            job_id=e.job_id,
+        )
+    except store_client.IdempotencyUnsupported as e:
+        # A job store that cannot keep the promise gets no job at all — the
+        # caller retries later; a plain create here would be the double job.
+        logger.error("job submission refused — %s", e)
+        raise HTTPException(status_code=503, detail=str(e)) from None
+
+    job = outcome["job"]
+    # The row this request named itself is ours even when the store reports a
+    # replay: after a platform timeout the direct-DB fallback finds the row the
+    # lost platform call already inserted (store_client.create_job_idempotent).
+    created = bool(outcome["created"]) or job["job_id"] == job_id
+    if created:
+        spawn(run_generic_job(job_id, body.kind, body.payload, attribution))
+        logger.info(f"📨 Async job {job_id} dispatched (kind={body.kind}, keyed)")
+        return _keyed_response(
+            201,
+            {"job_id": job_id, "status": store.JOB_STATUS_PENDING, "kind": body.kind},
+            key, replayed=False,
+        )
+    logger.info(
+        f"♻️ Async job {job['job_id']} replayed for Idempotency-Key "
+        f"(status={job['status']}, kind={job['kind']}) — no new job"
+    )
+    return _keyed_response(
+        200, {"job_id": job["job_id"], "status": job["status"], "kind": job["kind"]},
+        key, replayed=True,
+    )
 
 
 @router.get("/v1/jobs")

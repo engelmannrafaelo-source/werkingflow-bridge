@@ -535,6 +535,7 @@ _JOBS_DDL = [
     REPO / "docker" / "migrations" / "044_ai_jobs_dependency_deferral.sql",
     REPO / "docker" / "migrations" / "063_ai_jobs_finished_at.sql",
     REPO / "docker" / "migrations" / "064_ai_jobs_cancel_requested.sql",
+    REPO / "docker" / "migrations" / "065_ai_jobs_idempotency_key.sql",
 ]
 
 

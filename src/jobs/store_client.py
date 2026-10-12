@@ -203,6 +203,68 @@ async def create_job(
         raise _unexpected("create_job", resp.status_code, resp.json)
 
 
+# Re-exported for routes.py.
+IdempotencyKeyReused = store.IdempotencyKeyReused
+
+
+class IdempotencyUnsupported(JobStoreUnavailable):
+    """platform-api predates BRREF2 and has no create-idempotent route. The
+    key cannot be honoured, so NO job is created — a plain create would be
+    exactly the silent double job the key exists to prevent."""
+
+
+async def create_job_idempotent(
+    job_id: str,
+    kind: str,
+    payload: Optional[Dict[str, Any]],
+    attribution: Optional[Dict[str, Any]],
+    owner: str,
+    key: str,
+) -> Dict[str, Any]:
+    """store.create_job_idempotent over the platform seam (BRREF2).
+
+    Safe to fall back after a timeout, unlike mark_running: if the platform
+    call did insert the row and only the answer got lost, the direct-DB call
+    finds that row under the same (owner, key) and reports a replay of the
+    very job this worker just named. created=False with the caller's OWN
+    job_id therefore means "created by me", and routes.py dispatches it
+    (mark_running is a conditional claim, so even a second dispatch could not
+    run it twice). One job, never two."""
+    try:
+        resp = await call_platform(
+            "POST", "/v1/internal/jobs/create-idempotent",
+            json={
+                "job_id": job_id, "kind": kind, "payload": payload,
+                "attribution": attribution,
+                "idempotency_owner": owner, "idempotency_key": key,
+            },
+            timeout_s=_WRITE_TIMEOUT_S,
+        )
+    except PlatformUnavailable as e:
+        _fallback_or_raise("create_job_idempotent", e)
+        return await store.create_job_idempotent(
+            job_id, kind, payload, attribution, owner, key
+        )
+    body = resp.json if isinstance(resp.json, dict) else {}
+    created_shape = isinstance(body.get("job"), dict) and "created" in body
+    if resp.status_code == 200 and created_shape:
+        return {"created": bool(body["created"]), "job": body["job"]}
+    detail = body.get("detail")
+    if (
+        resp.status_code == 409
+        and isinstance(detail, dict)
+        and detail.get("reason") == "idempotency_key_reused"
+    ):
+        raise IdempotencyKeyReused(str(detail.get("job_id")))
+    if resp.status_code in (404, 405):
+        raise IdempotencyUnsupported(
+            f"job store create_job_idempotent: platform-api has no "
+            f"/v1/internal/jobs/create-idempotent (status={resp.status_code}) — "
+            f"it predates BRREF2; no job created"
+        )
+    raise _unexpected("create_job_idempotent", resp.status_code, resp.json)
+
+
 async def get_job(job_id: str) -> Optional[Dict[str, Any]]:
     try:
         resp = await call_platform(

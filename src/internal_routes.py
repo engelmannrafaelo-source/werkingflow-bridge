@@ -675,6 +675,14 @@ class InternalJobCreate(BaseModel):
     attribution: Optional[Dict[str, Any]] = None
 
 
+class InternalJobCreateIdempotent(InternalJobCreate):
+    """BRREF2: create once per (owner, key). The public route has validated the
+    key (ASCII, <= 200) and derived the owner; repeated here so the store never
+    sees anything else."""
+    idempotency_owner: str = Field(min_length=1, max_length=400)
+    idempotency_key: str = Field(min_length=1, max_length=200)
+
+
 class InternalJobProgress(BaseModel):
     progress: Dict[str, Any]
 
@@ -750,6 +758,32 @@ async def internal_create_job(
 
     await store.create_job(body.job_id, body.kind, body.payload, body.attribution)
     return Response(status_code=204)
+
+
+@router.post("/jobs/create-idempotent")
+async def internal_create_job_idempotent(
+    body: InternalJobCreateIdempotent,
+    _claims: AuthClaims = Depends(require_service_token),
+) -> Any:
+    """store.create_job_idempotent (BRREF2). 200 {"created", "job"} for a new
+    job and for a replay alike; 409 {"detail": {"reason":
+    "idempotency_key_reused", "job_id"}} when the key holds another body.
+    409, not 422: FastAPI answers its own validation errors with 422, and the
+    worker must not read a malformed request as a reused key. A platform-api
+    from before BRREF2 answers 405 (the path matches GET /jobs/{job_id}) —
+    the worker treats that as "cannot honour the key", never as created."""
+    from src.jobs import store
+
+    try:
+        return await store.create_job_idempotent(
+            body.job_id, body.kind, body.payload, body.attribution,
+            body.idempotency_owner, body.idempotency_key,
+        )
+    except store.IdempotencyKeyReused as e:
+        raise HTTPException(
+            status_code=409,
+            detail={"reason": "idempotency_key_reused", "job_id": e.job_id},
+        )
 
 
 @router.get("/jobs")

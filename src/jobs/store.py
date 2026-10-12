@@ -133,6 +133,108 @@ async def create_job(
         )
 
 
+# Idempotency-Key (BRREF2, migration 065). A terminal row that carries a key
+# outlives the usual terminal TTL by this much, counted from its terminal state:
+# the key must answer a retry for at least 24 h, and a row that is still
+# pending/running is never deleted anyway — so the key outlives every run.
+IDEMPOTENCY_RETENTION_SECONDS = 24 * 60 * 60
+
+
+class IdempotencyKeyReused(ValueError):
+    """The (owner, key) pair already names a job with a DIFFERENT body (kind or
+    payload digest). No job was created; the caller reused a key for another
+    request, which is its mistake (422), never a silent second job."""
+
+    def __init__(self, job_id: str):
+        super().__init__(
+            f"idempotency key already used for job {job_id} with a different body"
+        )
+        self.job_id = job_id
+
+
+async def create_job_idempotent(
+    job_id: str,
+    kind: str,
+    payload: Optional[Dict[str, Any]],
+    attribution: Optional[Dict[str, Any]],
+    owner: str,
+    key: str,
+) -> Dict[str, Any]:
+    """Create the job for (owner, key) exactly once.
+
+    Returns {"created": bool, "job": {job_id, kind, status}}. created=False is
+    a replay: the job that already holds this key, whatever its status — the
+    caller must not dispatch it again. Raises IdempotencyKeyReused when that
+    job was submitted with another kind or payload.
+
+    Atomic through the partial UNIQUE index ux_ai_jobs_idempotency, not
+    read-then-write: concurrent submits all run the same INSERT ... ON
+    CONFLICT DO NOTHING; Postgres lets exactly one insert the row, the others
+    wait for its commit, insert nothing, and read the winner afterwards (READ
+    COMMITTED: the SELECT is a new statement and sees the committed row).
+
+    The row can vanish between the INSERT and the SELECT only through retention
+    (24 h after its terminal state) — then the key is free again and the loop
+    inserts once more. Two such rounds in a row are not a race but a broken
+    store, and raise."""
+    digest = payload_digest(payload)
+    pool = get_pool()
+    async with pool.acquire() as conn:
+        for _ in range(2):
+            inserted = await conn.fetchval(
+                """
+                INSERT INTO ai_jobs (job_id, kind, status, payload, payload_digest,
+                                     attribution, idempotency_owner, idempotency_key)
+                VALUES ($1, $2, 'pending', $3::jsonb, $4, $5::jsonb, $6, $7)
+                ON CONFLICT (idempotency_owner, idempotency_key)
+                    WHERE idempotency_key IS NOT NULL
+                DO NOTHING
+                RETURNING job_id
+                """,
+                job_id,
+                kind,
+                json.dumps(payload, default=str) if payload is not None else None,
+                digest,
+                (
+                    json.dumps(attribution, default=str)
+                    if attribution is not None else None
+                ),
+                owner,
+                key,
+            )
+            if inserted is not None:
+                return {
+                    "created": True,
+                    "job": {
+                        "job_id": inserted, "kind": kind, "status": JOB_STATUS_PENDING,
+                    },
+                }
+            row = await conn.fetchrow(
+                """
+                SELECT job_id, kind, status, payload_digest FROM ai_jobs
+                 WHERE idempotency_owner = $1 AND idempotency_key = $2
+                """,
+                owner,
+                key,
+            )
+            if row is None:
+                continue
+            if row["kind"] != kind or row["payload_digest"] != digest:
+                raise IdempotencyKeyReused(row["job_id"])
+            return {
+                "created": False,
+                "job": {
+                    "job_id": row["job_id"],
+                    "kind": row["kind"],
+                    "status": row["status"],
+                },
+            }
+    raise RuntimeError(
+        f"create_job_idempotent: key conflict on ({owner!r}, {key!r}) twice without "
+        f"a row holding it — the unique index and the table disagree"
+    )
+
+
 async def get_job(job_id: str) -> Optional[Dict[str, Any]]:
     pool = get_pool()
     async with pool.acquire() as conn:
@@ -318,7 +420,8 @@ async def cleanup_old(ttl_seconds: int) -> int:
     Kept under its old name because workers from before BR11 still call it
     through POST /v1/internal/jobs-maintenance/cleanup. Its old body deleted by
     created_at whatever the status (BR10R M-B); a platform-api with this body
-    makes that route safe for old callers too. New callers use prune_jobs."""
+    makes that route safe for old callers too. New callers use prune_jobs.
+    Keyed rows (migration 065) keep their 24 h here as well."""
     pool = get_pool()
     async with pool.acquire() as conn:
         result = await conn.execute(
@@ -326,8 +429,11 @@ async def cleanup_old(ttl_seconds: int) -> int:
             DELETE FROM ai_jobs
              WHERE status IN {_TERMINAL_SQL}
                AND {_RETENTION_CLOCK} < NOW() - ($1 || ' seconds')::interval
+               AND (idempotency_key IS NULL
+                    OR {_RETENTION_CLOCK} < NOW() - ($2 || ' seconds')::interval)
             """,
             str(ttl_seconds),
+            str(max(ttl_seconds, IDEMPOTENCY_RETENTION_SECONDS)),
         )
     return _affected(result)
 
@@ -336,7 +442,9 @@ async def prune_jobs(terminal_ttl_seconds: int, max_age_seconds: int) -> Dict[st
     """One retention pass (BR11). Three parts, each bounded to its own rows:
 
     1. Delete terminal rows (done/error/cancelled) whose terminal state is
-       older than terminal_ttl_seconds. Nothing else is ever deleted.
+       older than terminal_ttl_seconds — rows carrying an Idempotency-Key
+       (migration 065) only once it is also older than
+       IDEMPOTENCY_RETENTION_SECONDS. Nothing else is ever deleted.
     2. Backstop for parked work: a 'pending' row older than max_age_seconds
        (counted from submit) is turned into a terminal error
        JOB_MAX_AGE_EXCEEDED — not deleted, so the poller gets a truthful
@@ -367,8 +475,11 @@ async def prune_jobs(terminal_ttl_seconds: int, max_age_seconds: int) -> Dict[st
             DELETE FROM ai_jobs
              WHERE status IN {_TERMINAL_SQL}
                AND {_RETENTION_CLOCK} < NOW() - ($1 || ' seconds')::interval
+               AND (idempotency_key IS NULL
+                    OR {_RETENTION_CLOCK} < NOW() - ($2 || ' seconds')::interval)
             """,
             str(terminal_ttl_seconds),
+            str(max(terminal_ttl_seconds, IDEMPOTENCY_RETENTION_SECONDS)),
         ))
         expired_rows = await conn.fetch(
             """

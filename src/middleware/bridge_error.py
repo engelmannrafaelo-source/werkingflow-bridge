@@ -128,6 +128,9 @@ REASON_JOB_HOME_UNCONFIGURED = "job_home_unconfigured"
 REASON_JOB_NOT_FOUND = "job_not_found"
 REASON_JOB_ALREADY_RUNNING = "job_already_running"
 REASON_JOB_TERMINAL = "job_terminal"
+# BRREF2 — Idempotency-Key on POST /v1/jobs. Also carried in error.code.
+REASON_IDEMPOTENCY_KEY_REUSED = "idempotency_key_reused"
+REASON_IDEMPOTENCY_KEY_INVALID = "idempotency_key_invalid"
 
 
 def bridge_error(
@@ -1002,3 +1005,33 @@ def job_cancel_error(
         retryable_override=False,
         extra=extra,
     )
+
+
+def idempotency_error(
+    reason: str, status_code: int, message: str,
+    idempotency_key: Optional[str] = None,
+    job_id: Optional[str] = None,
+) -> JSONResponse:
+    """A POST /v1/jobs whose Idempotency-Key could not be honoured (BRREF2).
+    No job was created. Never retryable: the same request with the same key
+    gets the same answer. ``error.code`` = ``error.reason`` like
+    job_cancel_error, so callers branch on the identifier, not on 422/400.
+
+    ``job_id`` (only on idempotency_key_reused) names the job that already
+    holds the key — the caller's own job under its own key, so nothing
+    foreign is revealed."""
+    extra: Dict[str, Any] = {"code": reason}
+    if job_id is not None:
+        extra["job_id"] = job_id[:120]
+    resp = bridge_error(
+        source=SOURCE_BRIDGE_INTERNAL,
+        error_type=TYPE_JOB_STATE,
+        reason=reason,
+        message=message,
+        status_code=status_code,
+        retryable_override=False,
+        extra=extra,
+    )
+    if idempotency_key is not None:
+        resp.headers["Idempotency-Key"] = idempotency_key
+    return resp
