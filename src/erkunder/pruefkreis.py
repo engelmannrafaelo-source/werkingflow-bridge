@@ -4,7 +4,6 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-from collections import Counter
 from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
@@ -22,13 +21,87 @@ def block(text: str, name: str) -> Any:
 
 
 def pruefurteil(text: str) -> list[str]:
+    """Blocking findings, read as meant: texts or objects that describe one finding."""
+    return _urteil_lesen(text)[0]
+
+
+def pruefhinweise(text: str) -> list[str]:
+    """Non-blocking remarks; shown with the report, never counted as open findings."""
+    return _urteil_lesen(text)[1]
+
+
+def _urteil_lesen(text: str) -> tuple[list[str], list[str]]:
     value = block(text, "erkunder-pruefung")
-    if not isinstance(value, dict) or set(value) != {"befunde"}:
-        raise ValueError("Prüfurteil benötigt befunde")
-    findings = value["befunde"]
-    if not isinstance(findings, list) or any(not isinstance(x, str) or not x.strip() for x in findings):
-        raise ValueError("Prüfbefunde müssen eine Liste konkreter Texte sein")
-    return findings
+    if (
+        not isinstance(value, dict)
+        or "befunde" not in value
+        or not set(value) <= {"befunde", "hinweise"}
+    ):
+        raise ValueError("Prüfurteil benötigt befunde und höchstens noch hinweise")
+    lists = []
+    for key in ("befunde", "hinweise"):
+        items = value.get(key, [])
+        if not isinstance(items, list):
+            raise ValueError(f"{key} ist keine Liste")
+        lists.append(
+            [_befundtext(key, index, item) for index, item in enumerate(items, 1)]
+        )
+    return lists[0], lists[1]
+
+
+def _befundtext(key: str, index: int, item: Any) -> str:
+    if isinstance(item, str) and item.strip():
+        return item.strip()
+    if isinstance(item, dict):
+        parts = [
+            f"{field}: {_feldtext(value)}"
+            for field, value in item.items()
+            if isinstance(field, str) and _feldtext(value)
+        ]
+        if parts:
+            return "; ".join(parts)
+    raise ValueError(
+        f"{key}[{index}] ist weder ein Text noch ein lesbares Objekt: {item!r:.200}"
+    )
+
+
+def _feldtext(value: Any) -> str:
+    if isinstance(value, str):
+        return value.strip()
+    if value is None or isinstance(value, bool):
+        return ""
+    if isinstance(value, int | float):
+        return str(value)
+    return json.dumps(value, ensure_ascii=False) if value else ""
+
+
+def zahlenpruefung(text: str) -> dict:
+    """Form of the reviewer's number list; content is compared in prueferzahlen."""
+    data = block(text, "erkunder-zahlenpruefung")
+    if not isinstance(data, dict) or not isinstance(data.get("vollstaendig"), bool):
+        raise ValueError("Zahlenprüfung benötigt vollstaendig (true/false)")
+    if not isinstance(data.get("zahlen"), list):
+        raise ValueError("Zahlenprüfung benötigt zahlen als Liste")
+    for index, item in enumerate(data["zahlen"], 1):
+        if not isinstance(item, dict) or not all(
+            isinstance(item.get(key), str) and item[key].strip()
+            for key in ("zitat", "zahl", "id")
+        ):
+            raise ValueError(
+                f"Zahleneintrag {index} braucht zitat, zahl und id als nichtleere Texte"
+            )
+    return data
+
+
+def pruefform(text: str) -> list[str]:
+    """What keeps the coordinator from reading the review; goes back to the reviewer."""
+    problems = []
+    for reader in (pruefurteil, zahlenpruefung):
+        try:
+            reader(text)
+        except (ValueError, TypeError) as error:
+            problems.append(str(error))
+    return problems
 
 
 def _artifact(directory: Path, relative: str) -> str:
@@ -88,36 +161,78 @@ def zahlenbelege(directory: Path, text: str, sources: dict[str, list[str]]) -> t
 
 
 def prueferzahlen(directory: Path, report: str, review: str, sources: dict[str, list[str]]) -> list[str]:
-    """The independent reviewer also identifies unlinked numerical statements."""
+    """Reviewer lists numbers without a `zahl:` link; links are compared by machine."""
     try:
-        data = block(review, "erkunder-zahlenpruefung")
-        if data["vollstaendig"] is not True or not isinstance(data["zahlen"], list):
-            raise ValueError("Vollständige Zahlenprüfung nicht bestätigt")
+        data = zahlenpruefung(review)
+    except (ValueError, TypeError) as error:
+        return [f"Zahlenprüfung des Prüfers unlesbar: {error}"]
+    findings = (
+        []
+        if data["vollstaendig"]
+        else [
+            "Zahlenprüfung unvollständig: der Prüfer konnte nicht jede unverknüpfte"
+            " berechnete Zahl zuordnen"
+        ]
+    )
+    try:
         channels, values, _ = _zahlendaten(directory, report, sources)
-        findings = [finding for item in data["zahlen"]
-                if (finding := _prueferzahl(item, report, values, channels, sources))]
-        findings.extend(_fehlende_verweise(report, data["zahlen"], values))
-        return findings
     except (OSError, ValueError, KeyError, TypeError) as error:
-        return [f"Zahlenprüfung unvollständig: {error}"]
-
-
-def _fehlende_verweise(report: str, reviewed: list[dict], values: dict) -> list[str]:
-    expected = Counter(zahlenverweise(report))
-    actual = Counter((item["zahl"], item["id"]) for item in reviewed)
-    return [f"Zahlenprüfung: verknüpfte Textzahl {shown} (zahl:{ident}) fehlt im Zahlenabgleich"
-            f" ({count} Vorkommen); {_zahlkontext(shown, ident, values)}"
-            for (shown, ident), count in sorted((expected - actual).items())]
+        return [*findings, f"Zahlenprüfung unvollständig: {error}"]
+    findings.extend(
+        finding
+        for item in data["zahlen"]
+        if (finding := _prueferzahl(item, report, values, channels, sources))
+    )
+    return findings
 
 
 def _prueferzahl(item: dict, report: str, values: dict, channels: dict,
                  sources: dict[str, list[str]]) -> str | None:
-    quote, shown = item["zitat"], item["zahl"]
-    if not all(isinstance(item[key], str) and item[key].strip() for key in ("zitat", "zahl", "id")):
-        raise ValueError("Zahlenprüfung: Zitat, Zahl und ID müssen nichtleere Texte sein")
-    if quote not in report or not zahl_im_zitat(shown, quote):
-        return "Zahlenprüfung: Zahlenzitat nicht im Gutachten"
-    return _vergleich(shown, item["id"], values, channels, sources)
+    quote, shown, ident = item["zitat"], item["zahl"], item["id"]
+    line = fundstelle(report, quote)
+    if line is None:
+        return (
+            f"Zahlenprüfung: Zahlenzitat nicht im Gutachten: {quote!r}"
+            f" (Zahl {shown!r}, ID {ident})"
+        )
+    if not zahl_im_zitat(shown, quote):
+        return (
+            f"Zahlenprüfung: Zahl {shown!r} steht nicht im Zitat {quote!r}"
+            f" (Gutachten Zeile {line})"
+        )
+    finding = _vergleich(shown, ident, values, channels, sources)
+    return finding and f"{finding} (Gutachten Zeile {line}: {quote!r})"
+
+
+def _leerraum_normiert(text: str) -> tuple[str, list[int]]:
+    """Whitespace runs become one space, none next to a pipe; keeps char origins."""
+    chars: list[str] = []
+    origin: list[int] = []
+    for index, char in enumerate(text):
+        if char.isspace():
+            if chars and chars[-1] not in " |":
+                chars.append(" ")
+                origin.append(index)
+            continue
+        if char == "|" and chars and chars[-1] == " ":
+            chars.pop()
+            origin.pop()
+        chars.append(char)
+        origin.append(index)
+    if chars and chars[-1] == " ":
+        chars.pop()
+        origin.pop()
+    return "".join(chars), origin
+
+
+def fundstelle(report: str, quote: str) -> int | None:
+    """Report line where the quote starts; line breaks and cell spacing do not count."""
+    needle, _ = _leerraum_normiert(quote)
+    haystack, origin = _leerraum_normiert(report)
+    position = haystack.find(needle) if needle else -1
+    if position < 0:
+        return None
+    return report.count("\n", 0, origin[position]) + 1
 
 
 def _vergleich(shown: str, ident: str, values: dict, channels: dict,

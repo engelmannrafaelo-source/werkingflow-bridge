@@ -270,4 +270,9 @@ def test_statusregeln_stehen_bei_erkunder_und_pruefer(auftrag):
     assert "rechenstand/" not in pruefung_prompt(a)
     assert "Rechenstand deiner Vorfassung" not in korrektur_prompt(a)
     assert "rechenstand/skripte/" in pruefung_prompt(a, True)
-    assert "Rechenstand deiner Vorfassung" in korrektur_prompt(a, True)
+    korrektur = korrektur_prompt(a, ["skripte/pruefe_links.py", "skripte/zahlen.json"])
+    assert "Rechenstand deiner Vorfassung" in korrektur
+    # Kontextlücke aus DS3 Lauf 1: der Korrektor kennt die echten Dateinamen und
+    # weiß, unter welchem Namen der Prüfer Fassung und Skripte liest.
+    assert "`skripte/pruefe_links.py`, `skripte/zahlen.json`" in korrektur
+    assert "`rechenstand/skripte/…`" in korrektur and "`gutachten.md`" in korrektur

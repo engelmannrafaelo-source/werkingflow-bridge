@@ -43,7 +43,7 @@ def test_prose_code_and_non_number_links_are_not_number_claims():
     assert zahlenverweise(text) == []
 
 
-def test_scientific_link_repro_compares_both_sides_and_requires_review_entry(tmp_path):
+def test_scientific_link_repro_is_compared_by_machine_without_review_entry(tmp_path):
     report = evidence(tmp_path, "14").replace('zahl:starts', 'zahl:ok')
     path = tmp_path / 'skripte/values.json'
     record = json.loads(path.read_text())['starts']
@@ -53,8 +53,8 @@ def test_scientific_link_repro_compares_both_sides_and_requires_review_entry(tmp
     compared, _ = zahlenbelege(tmp_path, report, SOURCES)
     coverage = prueferzahlen(tmp_path, report, reviewer, SOURCES)
     assert any("bad: Text '1e3', Skript 7" in finding for finding in compared)
-    assert any('zahl:bad' in finding and 'fehlt im Zahlenabgleich' in finding and 'Skript 7' in finding
-               for finding in coverage)
+    # Verknüpfte Zahlen gleicht der Leitstand selbst ab; der Prüfer schreibt sie nicht ab.
+    assert coverage == []
 
 
 @pytest.mark.parametrize('shown', ['', 'unlesbar', '1.234,5', 'NaN', 'Infinity', '1e999999999'])
@@ -89,12 +89,13 @@ def test_valid_scientific_number_passes_comparison_and_coverage(tmp_path):
     assert prueferzahlen(tmp_path, report, reviewer, SOURCES) == []
 
 
-def test_repeated_links_each_need_a_review_entry(tmp_path):
+def test_repeated_links_need_no_review_entry(tmp_path):
     report = evidence(tmp_path, '14') + '\n[14](zahl:starts)'
     item = {'zitat': '[14](zahl:starts)', 'zahl': '14', 'id': 'starts'}
     assert len(zahlenverweise(report)) == 2
-    assert prueferzahlen(tmp_path, report, review([item]), SOURCES)
-    assert prueferzahlen(tmp_path, report, review([item, item]), SOURCES) == []
+    assert zahlenbelege(tmp_path, report, SOURCES)[0] == []
+    assert prueferzahlen(tmp_path, report, review([]), SOURCES) == []
+    assert prueferzahlen(tmp_path, report, review([item]), SOURCES) == []
 
 
 def test_reference_link_invalid_label_is_not_hidden_by_valid_inline_link(tmp_path):
@@ -102,7 +103,7 @@ def test_reference_link_invalid_label_is_not_hidden_by_valid_inline_link(tmp_pat
     findings, _ = zahlenbelege(tmp_path, report, SOURCES)
     assert any("Text 'unlesbar', Skript 14" in finding for finding in findings)
     item = {'zitat': '[14](zahl:starts)', 'zahl': '14', 'id': 'starts'}
-    assert prueferzahlen(tmp_path, report, review([item]), SOURCES)
+    assert prueferzahlen(tmp_path, report, review([item]), SOURCES) == []  # Befund kommt von der Maschine
 
 
 async def test_scientific_link_finding_reaches_correction_and_re_review(tmp_path, monkeypatch):
@@ -134,7 +135,6 @@ async def test_scientific_link_finding_reaches_correction_and_re_review(tmp_path
         path = service.directory('bericht-123') / 'harmonisierung-korrektur/maschinenbefunde.json'
         findings = json.loads(path.read_text())
         assert any("bad: Text '1e3', Skript 7" in finding for finding in findings)
-        assert any('zahl:bad' in finding and 'fehlt im Zahlenabgleich' in finding for finding in findings)
     finally:
         await service.shutdown()
 
@@ -162,7 +162,7 @@ def test_reviewer_quotes_use_the_same_visible_text_as_the_number_links(tmp_path,
 def test_number_absent_from_visible_quote_is_rejected(tmp_path):
     report = evidence(tmp_path, '14')
     reviewer = review([{'zitat': '[14](zahl:starts)', 'zahl': '7', 'id': 'starts'}])
-    assert 'Zahlenzitat nicht im Gutachten' in prueferzahlen(tmp_path, report, reviewer, SOURCES)[0]
+    assert "Zahl '7' steht nicht im Zitat" in prueferzahlen(tmp_path, report, reviewer, SOURCES)[0]
 
 
 def test_image_alt_link_is_not_an_active_number_link(tmp_path):

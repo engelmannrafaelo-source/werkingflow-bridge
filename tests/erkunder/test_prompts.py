@@ -22,10 +22,17 @@ def test_prompts(auftrag):
         assert "vertiefung.md" not in prompt
         assert "zusätzlich fragt" not in prompt
         assert "{gegenstand}" not in prompt
-    assert PROMPT_VERSION == "erkunder-prompts/4"
+    assert PROMPT_VERSION == "erkunder-prompts/5"
     assert "ausgefallen" not in harmonisierung_prompt(a, [])
     assert "trägt / trägt teilweise / trägt nicht" in pruefung_prompt(a)
     assert "Ersatzgröße" in pruefung_prompt(a)
+    # Zielkontext: was ein Befund bewirkt, wohin Hinweise gehören,
+    # welche Frage er beantwortet.
+    assert "`befunde` ist die Freigabeentscheidung" in pruefung_prompt(a)
+    assert "`hinweise` sind Anmerkungen" in pruefung_prompt(a)
+    assert "ob es dafür fachlich trägt" in pruefung_prompt(a)
+    assert "unverknüpften berechneten Zahlen" in pruefung_prompt(a)
+    assert "`antwort-pruefer.md`" in korrektur_prompt(a)
 
 
 def test_optional_context(auftrag):

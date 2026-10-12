@@ -27,6 +27,7 @@ from .models import EINGANGSORDNER, VORGABE_MODELL, Auftrag
 from .prompts import (
     PROMPT_VERSION,
     erkunder_prompt,
+    formrueckfrage_prompt,
     harmonisierung_prompt,
     korrektur_prompt,
     pruefung_prompt,
@@ -36,6 +37,8 @@ from .pruefkreis import (
     manifest_text,
     migriere_altauftrag,
     prueferzahlen,
+    pruefform,
+    pruefhinweise,
     pruefumfang,
     pruefurteil,
     zahlenbelege,
@@ -355,11 +358,12 @@ class Coordinator:
             for s in self.states[ident]["schritte"]
         )
 
-    def output(self, ident: str, name: str) -> str:
+    def output(self, ident: str, name: str, fresh: bool = False) -> str:
+        """`fresh`: the attempt that just ended has no record yet to compare."""
         filename = "pruefung.md" if name.startswith("pruefung") else "ergebnis.md"
         try:
             text = read_text(self.directory(ident) / name / filename)
-            records = [
+            records = [] if fresh else [
                 item for item in self.states[ident]["schritte"]
                 if item["name"] == name and item["status"] == "ok"
             ]
@@ -397,9 +401,12 @@ class Coordinator:
         slot: int,
         prompt: str,
         inputs: dict[str, str | bytes] | None = None,
+        wiederholen: bool = False,
     ) -> None:
+        """`wiederholen`: second attempt of a step whose first result was unusable."""
         state = self.states[ident]
-        if self.successful(ident, name):
+        done = sum(s["name"] == name and s["status"] == "ok" for s in state["schritte"])
+        if done >= (2 if wiederholen else 1):
             return
         attempts = sum(s["name"] == name for s in state["schritte"])
         while attempts < 2:
@@ -498,7 +505,7 @@ class Coordinator:
                 record["lesezugriffe"] = meta["lesezugriffe"]
             if record["status"] == "ok":
                 try:
-                    text = self.output(ident, name)
+                    text = self.output(ident, name, fresh=True)
                     if not text.strip():
                         raise ValueError("empty")
                     record["sha256"] = hashlib.sha256(text.encode("utf-8")).hexdigest()
@@ -667,25 +674,31 @@ class Coordinator:
                 self.directory(ident) / report_name, "rechenstand/"
             )
             machine.extend(gaps)
-            prompt = pruefung_prompt(order, bool(calculation))
-            await self.step(ident, review_name, 0, prompt, {
+            inputs = {
                 "gutachten.md": report,
                 "maschinenbefunde.json": json.dumps(machine, ensure_ascii=False),
                 **calculation,
-            })
-            try:
-                findings = pruefurteil(self.output(ident, review_name))
-            except ValueError as error:
-                findings = [f"Prüfurteil unvollständig: {error}"]
+            }
+            await self.step(
+                ident, review_name, 0, pruefung_prompt(order, bool(calculation)), inputs
+            )
+            await self.read_review(ident, review_name, order, bool(calculation), inputs)
+            review = self.output(ident, review_name)
+            findings, notes = pruefurteil(review), pruefhinweise(review)
             self.report_evidence(ident, report_name, report, order)
             machine.extend(prueferzahlen(
-                self.directory(ident) / report_name, report, self.output(ident, review_name),
+                self.directory(ident) / report_name,
+                report,
+                review,
                 state["quellkanaele"],
             ))
             state.update(
-                offene_befunde=list(dict.fromkeys(machine + findings)),
+                offene_befunde=list(dict.fromkeys(machine + findings)), hinweise=notes,
                 gutachten_schritt=report_name, pruefung_schritt=review_name,
                 korrekturrunden=round_no,
+            )
+            self.protokolliere_runde(
+                ident, round_no, review_name, findings, notes, machine
             )
             self.save(ident)
             if not state["offene_befunde"] or round_no == order.korrekturkreis:
@@ -694,18 +707,102 @@ class Coordinator:
             gutachten_name = report_name
             report_name = "harmonisierung-korrektur" + (f"-{next_no}" if next_no > 1 else "")
             state["korrekturkreis_gelaufen"] = True
-            state["gesamt"] = 5 + 2 * next_no
+            state["gesamt"] = 5 + 2 * next_no + len(state.get("formrueckfragen", {}))
             self.save(ident)
             # The previous version's calculation continues in the new skripte/;
             # its gaps already stand in offene_befunde from the review above.
             calculation, _ = rechenstand(self.directory(ident) / gutachten_name, "")
-            prompt = korrektur_prompt(order, bool(calculation))
+            prompt = korrektur_prompt(order, sorted(calculation))
             await self.step(ident, report_name, 0, prompt, {
                 "gutachten.md": report,
                 "pruefung.md": self.output(ident, review_name),
                 "maschinenbefunde.json": json.dumps(state["offene_befunde"], ensure_ascii=False),
                 **calculation,
             })
+
+    async def read_review(
+        self,
+        ident: str,
+        name: str,
+        order: Auftrag,
+        calculation: bool,
+        inputs: dict[str, str | bytes],
+    ) -> None:
+        """An unreadable review goes back to its reviewer once, never to the corrector.
+
+        The second attempt sees only its own draft and the coordinator's form message,
+        never an earlier round's review or version. Unreadable after that ends the
+        report loudly; it is never counted as green or as open findings.
+        """
+        state = self.states[ident]
+        asked = state.setdefault("formrueckfragen", {})
+        if name not in asked:
+            problems = pruefform(self.output(ident, name))
+            if not problems:
+                return
+            if sum(s["name"] == name for s in state["schritte"]) >= 2:
+                raise StepFailed(
+                    name,
+                    "unbekannt: Prüfurteil unlesbar, kein Versuch für die "
+                    "Formrückfrage übrig: " + " | ".join(problems),
+                )
+            asked[name] = {"probleme": problems, "entwurf": self.output(ident, name)}
+            state["gesamt"] += 1
+            self.save(ident)
+            LOG.warning(
+                "bericht_id=%s schritt=%s formrueckfrage=%s", ident, name, problems
+            )
+        question = asked[name]
+        await self.step(
+            ident,
+            name,
+            0,
+            formrueckfrage_prompt(order, calculation, question["probleme"]),
+            {**inputs, "pruefung-entwurf.md": question["entwurf"]},
+            wiederholen=True,
+        )
+        if problems := pruefform(self.output(ident, name)):
+            raise StepFailed(
+                name,
+                "unbekannt: Prüfurteil auch nach Formrückfrage unlesbar: "
+                + " | ".join(problems),
+            )
+
+    def protokolliere_runde(
+        self,
+        ident: str,
+        round_no: int,
+        name: str,
+        findings: list[str],
+        notes: list[str],
+        machine: list[str],
+    ) -> None:
+        """One countable line per round; the report folder is gone after cleanup."""
+        state = self.states[ident]
+        entry = {
+            "runde": round_no,
+            "pruefung": name,
+            "befunde": len(findings),
+            "hinweise": len(notes),
+            "maschinenbefunde": len(machine),
+            "formmeldungen": len(
+                state.get("formrueckfragen", {}).get(name, {}).get("probleme", [])
+            ),
+            "offen": len(state["offene_befunde"]),
+        }
+        if round_no:
+            report = "harmonisierung-korrektur" + (
+                f"-{round_no}" if round_no > 1 else ""
+            )
+            entry["antwort_pruefer"] = (
+                self.directory(ident) / report / "antwort-pruefer.md"
+            ).is_file()
+        state.setdefault("runden", [])[round_no:] = [entry]
+        LOG.info(
+            "bericht_id=%s pruefrunde %s",
+            ident,
+            " ".join(f"{key}={value}" for key, value in entry.items()),
+        )
 
     def status(self, ident: str) -> dict[str, Any]:
         self.directory(ident)
@@ -790,6 +887,11 @@ class Coordinator:
         if state["offene_befunde"]:
             final += "\n\n## Offene Befunde nach Korrekturgrenze\n\n" + "\n".join(
                 "- " + finding for finding in state["offene_befunde"]
+            )
+        if state.get("hinweise"):
+            final += (
+                "\n\n## Hinweise des Prüfers (halten das Gutachten nicht an)\n\n"
+                + "\n".join("- " + note for note in state["hinweise"])
             )
         final += "\n\n" + manifest_text(Auftrag.model_validate(state["auftrag"]))
         return final

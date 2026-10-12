@@ -128,7 +128,7 @@ class Ergebnis(Vertrag):
     bericht_id: BerichtId
     prompt_version: Literal[
         "erkunder-prompts/1", "erkunder-prompts/2", "erkunder-prompts/3",
-        "erkunder-prompts/4",
+        "erkunder-prompts/4", "erkunder-prompts/5",
     ]
     modell: ModellName
     schritte: list[Schritt]

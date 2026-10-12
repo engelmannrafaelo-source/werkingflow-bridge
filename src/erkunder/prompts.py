@@ -2,7 +2,7 @@
 
 from src.erkunder.models import Auftrag
 
-PROMPT_VERSION = "erkunder-prompts/4"
+PROMPT_VERSION = "erkunder-prompts/5"
 
 
 def _eingang(a: Auftrag) -> str:
@@ -107,19 +107,29 @@ def pruefung_prompt(a: Auftrag, rechenstand: bool = False) -> str:
     )
 
 
-def korrektur_prompt(a: Auftrag, rechenstand: bool = False) -> str:
+def korrektur_prompt(a: Auftrag, skripte: list[str] | None = None) -> str:
     return (
         "Ein unabhängiger Zweitgutachter hat dein Gutachten gegen die Rohdaten "
         "geprüft. "
-        "Überarbeite es: Was er belegt widerlegt, korrigierst du; wo du nach eigener "
-        "Nachrechnung bei deiner Aussage bleibst, begründest du das mit Zahlen. "
+        "Überarbeite es an den Stellen, die er beanstandet: Was er belegt widerlegt, "
+        "korrigierst du; wo du nach eigener Nachrechnung bei deiner Aussage bleibst, "
+        "trägt das Gutachten die fachliche Begründung mit Zahlen. "
+        "Das Gutachten richtet "
+        "sich an den Betreiber und liest sich als eine Fassung aus einem Guss; die "
+        "neue Fassung prüft wieder ein unabhängiger Prüfer, der weder die Vorfassung "
+        "noch diese Prüfung kennt. Deine Antwort an den Prüfer, also was du je Punkt "
+        "umgesetzt hast und wo du warum bei deiner Aussage bleibst, schreibst du "
+        "deshalb in die eigene Datei `antwort-pruefer.md` neben `ergebnis.md`, nicht "
+        "ins Gutachten. "
         + _kontext(a)
         + "Dein Gutachten liegt in `gutachten.md`, die Prüfung in "
         "`pruefung.md`. "
-        + (RECHENSTAND_KORREKTUR if rechenstand else "")
+        + (rechenstand_korrektur(skripte) if skripte else "")
         + "Lege deine Skripte in `skripte/` ab und schreibe die neue "
         "Fassung als `ergebnis.md` in diesen Ordner. Die Datei `maschinenbefunde.json` "
-        "enthält ebenfalls zu klärende Befunde." + NACHWEIS + _vertiefung(a)
+        "enthält die Befunde, die das Gutachten anhalten, samt den rechnerischen des "
+        "Leitstands; die `hinweise` des Prüfers halten es nicht an, du nimmst sie auf, "
+        "wo sie das Gutachten verbessern." + NACHWEIS + _vertiefung(a)
     )
 
 
@@ -148,12 +158,17 @@ RECHENSTAND_PRUEFUNG = (
     "Skripte lesen und ausführen. "
 )
 
-RECHENSTAND_KORREKTUR = (
-    "In `skripte/` liegt bereits der Rechenstand deiner Vorfassung, Skripte und "
-    "Ergebnisdateien, so wie der Prüfer ihn gesehen hat. Rechne darauf weiter; "
-    "die Ergebnisdateien gehören danach zur neuen Fassung, also laufen geänderte "
-    "Skripte erneut. "
-)
+def rechenstand_korrektur(skripte: list[str]) -> str:
+    return (
+        "In `skripte/` liegt bereits der Rechenstand deiner Vorfassung, Skripte und "
+        "Ergebnisdateien, so wie der Prüfer ihn gesehen hat: "
+        + ", ".join(f"`{name}`" for name in skripte)
+        + ". Der Prüfer fand dieselben Dateien unter `rechenstand/skripte/…` und "
+        "deine Fassung als `gutachten.md`; nennt er eine dieser Dateien, ist es die "
+        "gleichnamige hier. Rechne darauf weiter; "
+        "die Ergebnisdateien gehören danach zur neuen Fassung, also laufen geänderte "
+        "Skripte erneut. "
+    )
 
 NACHWEIS = """
 Das Gutachten ist anhand seiner Quellen nachrechenbar. Das Verzeichnis
@@ -174,7 +189,9 @@ beginnen deshalb mit `skripte/`, etwa
 `{"skript": "skripte/rechnen.py", "ergebnis": "skripte/ergebnisse.json"}`;
 so findet der Leitstand die Dateien. Skripte und Ergebnisdateien gehören zur
 aktuellen Gutachtenfassung; der Leitstand sichert sie zusammen und gibt sie mit dem
-Gutachten an den Prüfer.
+Gutachten an den Prüfer. Beim Prüfer heißt die Fassung `gutachten.md`, und die Skripte
+liegen dort unter `rechenstand/skripte/`; ein Skript, das das Gutachten selbst liest,
+läuft auch dort.
 Im Vorwissen ausgewählte Bibliotheks-Punkte beantwortest du vollständig. Ein
 JSON-Block `erkunder-pruefumfang` enthält eine Liste: `anlage`, `fehlerbild_id`,
 `dokument_id`, `status` (bestaetigt/widerlegt/teilweise/nicht_pruefbar),
@@ -186,24 +203,50 @@ anhand der Anlage und Daten.
 """ + STATUSREGELN
 
 PRUEFURTEIL = """
-Die Prüfung endet mit genau einem JSON-Block `erkunder-pruefung` mit `befunde`:
-einer Liste konkreter offener Fehler und Widersprüche der vorliegenden Fassung.
-Eine leere Liste bedeutet, dass diese Fassung trägt. Auch fehlende Zahlenbelege,
-unbelegte Auswahlkriterien, Zahlen ohne Skript-Verknüpfung und fehlende oder
-widersprüchliche Bibliotheksurteile sind Befunde. Dokumentierte Grenzen einer
-korrekten Aussage sind keine Fehler. `maschinenbefunde.json` enthält ergänzende
-rechnerische Befunde des Leitstands, die mitzuprüfen sind.
-In einem zusätzlichen JSON-Block `erkunder-zahlenpruefung` steht `vollstaendig`
-(true, sobald jede berechnete Zahl im Gutachten gegen einen Skriptbeleg zugeordnet
-ist) und `zahlen`: alle berechneten Zahlen einschließlich Zahlen ohne Markdown-
-Verknüpfung, jeweils mit `zitat` (wörtlicher Textausschnitt), `zahl` (exakte
-Zahlenschreibweise im Zitat) und `id` (Schlüssel im Skript-JSON). Jeder ausdrücklich
-gesetzte `zahl:`-Link wird unabhängig von seiner Zahlenschreibweise erfasst, auch
-Referenzlinks. Die Liste enthält je Auftreten einen Eintrag mit dem lesbaren
-Linktext (ohne Markdown-Hervorhebung) und der Zahlen-ID. Unlesbarer Linktext oder
-ein fehlender Skriptwert erscheint als konkreter Befund mit beiden Seiten.
-Der Leitstand gleicht die Liste mit allen Verweisen nach Linktext und ID ab und
-vergleicht auch die unabhängig erfassten Textzahlen maschinell. Zahlen ohne
-Beleg erzeugen einen Befund; Datumsangaben, Gliederungsnummern und Kanalnamen
-sind Quellen-/Strukturangaben und keine berechneten Zahlen.
+Wofür dein Urteil gebraucht wird: Das Gutachten geht an den Betreiber und ist Grundlage
+der folgenden Arbeitsschritte, die seine Befunde und Zahlen übernehmen. Deine Prüfung
+beantwortet die Frage, ob es dafür fachlich trägt: Würde jemand, der sich darauf
+verlässt, an einer Stelle zu einer falschen Schlussfolgerung kommen oder eine falsche
+Zahl übernehmen?
+Die Prüfung endet mit genau einem JSON-Block `erkunder-pruefung` mit zwei Listen.
+`befunde` ist die Freigabeentscheidung: Jeder Eintrag hält das Gutachten an und geht
+als Korrekturauftrag an den Verfasser, der daraufhin eine neue Fassung schreibt, die
+wiederum ein unabhängiger Prüfer prüft. Dorthin gehören die Stellen, an denen die
+Antwort auf die Frage oben nein ist: widerlegte oder unbelegte Aussagen, Widersprüche,
+Zahlen ohne oder mit abweichendem Beleg, fehlende oder widersprüchliche
+Bibliotheksurteile, unbelegte Auswahlkriterien. Eine leere Liste bedeutet, dass diese
+Fassung trägt. `hinweise` sind Anmerkungen, die das Gutachten besser machen, ohne
+eine Schlussfolgerung oder Zahl zu ändern, etwa eine Präzisierung, eine fehlende
+Quellenangabe zu einer vertretbaren Zahl oder eine Formulierung; sie stehen sichtbar
+beim Gutachten und halten es nicht an. Dokumentierte Grenzen einer korrekten Aussage
+sind weder das eine noch das andere. Jeder Eintrag beider Listen ist ein Text, der
+Stelle und Sache in einem Satz nennt, so dass der Verfasser ihn ohne die übrige
+Prüfung versteht. `maschinenbefunde.json` enthält ergänzende rechnerische Befunde des
+Leitstands, die mitzuprüfen sind.
+Die `[ZAHL](zahl:ID)`-Verweise gleicht der Leitstand selbst mit den Skriptergebnissen
+ab; ein Verweis, den du inhaltlich für falsch hältst, ist ein Befund wie jeder andere.
+Berechnete Zahlen ohne solchen Verweis kann nur ein Leser finden. Sie stehen in einem
+zusätzlichen JSON-Block `erkunder-zahlenpruefung`: `zahlen` ist die Liste dieser
+unverknüpften berechneten Zahlen, jeweils mit `zitat` (wörtlicher Textausschnitt um
+die Zahl), `zahl` (exakte Zahlenschreibweise im Zitat) und `id` (Schlüssel im
+Skript-JSON, der die Zahl belegt), und `vollstaendig` ist true, sobald jede solche
+Zahl darin einem Skriptbeleg zugeordnet ist. Ein Zitat darf über Zeilen- und
+Tabellenzellgrenzen reichen; der Leitstand sucht es ohne Rücksicht auf Leerraum und
+vergleicht die Zahl maschinell. Eine berechnete Zahl ohne Beleg ist ein Befund.
+Datumsangaben, Gliederungsnummern und Kanalnamen sind Quellen-/Strukturangaben und
+keine berechneten Zahlen.
 """
+
+
+def formrueckfrage_prompt(a: Auftrag, rechenstand: bool, probleme: list[str]) -> str:
+    """Second attempt of the same review step; the first one was unreadable."""
+    return (
+        pruefung_prompt(a, rechenstand)
+        + "\nDiese Prüfung hast du bereits geschrieben; sie liegt als "
+        "`pruefung-entwurf.md` in diesem Ordner. Der Leitstand konnte ihre "
+        "maschinenlesbaren Blöcke nicht lesen: "
+        + " | ".join(probleme)
+        + ". Schreibe `pruefung.md` mit demselben Urteil und denselben Befunden, die "
+        "Blöcke in der oben beschriebenen Form. Wo dir beim Umschreiben ein Fehler "
+        "deines Entwurfs auffällt, gilt deine berichtigte Prüfung."
+    )
