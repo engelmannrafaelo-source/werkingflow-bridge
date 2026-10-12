@@ -42,7 +42,7 @@ import logging
 import time
 from collections import defaultdict
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Any, Optional
 
 from src.activity import ledger_client, ledger_spool
 from src.activity.ledger_spool import (
@@ -96,9 +96,15 @@ _skip_counts: dict = defaultdict(int)
 def _buchung_gesichert() -> None:
     """Tell a job self-call that this booking is durable (FK25B2,
     src/jobs/teilverbrauch.py). Synchronous: no cancellation point."""
-    from src.jobs.teilverbrauch import buchung_gesichert
+    _job_hook("buchung_gesichert")
 
-    buchung_gesichert()
+
+def _job_hook(name: str, *args: Any) -> None:
+    """Report a booking step to a supervised job self-call
+    (src/jobs/teilverbrauch.py); a no-op outside one. Synchronous."""
+    from src.jobs import teilverbrauch
+
+    getattr(teilverbrauch, name)(*args)
 
 
 def resolve_ledger_cost(
@@ -492,7 +498,7 @@ async def persist_ai_call_activity(
         if spooled and ledger_spool.is_definitive(outcome):
             ledger_spool.ack(call_uid, outcome)
         if not replaying and ledger_spool.is_definitive(outcome):
-            _buchung_gesichert()
+            _job_hook("buchung_erledigt")
         return outcome
 
     # ── Delivery: 'success' is a claim about the CALLER, not about the model ──
@@ -876,6 +882,10 @@ async def persist_ai_call_activity(
         })
         ledger_written = _outcome == OUTCOME_WRITTEN
         outcome = OUTCOME_WRITTEN if ledger_written else OUTCOME_DUPLICATE
+        if not replaying:
+            # Before the deduction's await, where a job cancel can land
+            # (FK25BR R3): the row exists, a stop must not book it again.
+            _job_hook("zeile_geschrieben")
         if not ledger_written:
             # A replay caught up with a row that had already landed — the
             # spooled record simply outlived its ack. Nothing to repair;
@@ -942,10 +952,17 @@ async def persist_ai_call_activity(
             billing_account, app_id, agent_id, call_cost_eur,
         )
     elif user_id and app_id and call_cost_eur > 0 and user_id != ANONYMOUS_USER_ID:
+        if not replaying:
+            _job_hook("abzug_beginnt", call_uid, {
+                "user_id": user_id, "app_id": app_id, "cost_eur": call_cost_eur,
+                "workflow_id": workflow_id, "tenant_id": tenant_id, "call_ts": call_ts,
+            }, bool(spooled))
         settled = await _deduct_call_cost(
             user_id, app_id, call_cost_eur, workflow_id, tenant_id, call_ts,
             call_uid=call_uid,
         )
+        if not replaying:
+            _job_hook("abzug_endet", call_uid, bool(settled))
         if not settled:
             if spooled or replaying:
                 outcome = OUTCOME_DEDUCTION_OWED

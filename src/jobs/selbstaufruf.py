@@ -199,6 +199,7 @@ async def unter_job_aufsicht(
             bericht = await _im_ledger_vermerken(
                 request, job_id, attribution, model, endpunkt,
                 time.time() - beginn, grund, sammler.zuege(),
+                abzuege=sammler.offene_abzuege(),
             )
             bericht["stopp_s"] = round(time.monotonic() - stopp, 2)
             if grund == _GRUND_GETRENNT:
@@ -249,11 +250,47 @@ async def _buchen(**felder: Any) -> "tuple[str, str]":
         outcome = await ai_call_writer.persist_ai_call_activity(**felder)
     finally:
         teilverbrauch.eigene_buchung_beenden(token)
-    if ledger_spool.is_definitive(outcome):
+    if ledger_spool.is_definitive(outcome) and not buchung.abzug_offen:
         return outcome, LEDGER_GEBUCHT
     if buchung.gesichert:
         return outcome, LEDGER_RUECKSTAU
+    if ledger_spool.is_definitive(outcome):
+        # Row written, its deduction lost and not spooled: the writer logs
+        # it and still answers 'written' — the stop does not call that booked.
+        return f"{outcome}+deduction_lost", LEDGER_FEHLGESCHLAGEN
     return outcome, LEDGER_FEHLGESCHLAGEN
+
+
+async def _abzuege_nachholen(
+    abzuege: Dict[str, Dict[str, Any]],
+) -> "tuple[List[tuple[str, str]], List[str]]":
+    """Re-send deductions of the run's rows that were not settled — the run
+    was stopped while awaiting them (FK25BR R3). Same call_uid: platform-api
+    applies a call's deduction at most once. Returns (results, still open)."""
+    from src.activity import ai_call_writer
+
+    ergebnisse: List["tuple[str, str]"] = []
+    offen: List[str] = []
+    for call_uid, eintrag in abzuege.items():
+        a = eintrag["args"]
+        try:
+            settled = await ai_call_writer._deduct_call_cost(
+                a["user_id"], a["app_id"], a["cost_eur"], a["workflow_id"],
+                a["tenant_id"], a["call_ts"], call_uid=call_uid,
+            )
+        except Exception as e:  # noqa: BLE001 — _deduct_call_cost never raises; belt
+            logger.error(f"job stop: re-sending deduction {call_uid} raised: {e}")
+            settled = False
+        if settled:
+            ergebnisse.append(("deduction_resumed", LEDGER_GEBUCHT))
+            continue
+        offen.append(call_uid)
+        if eintrag["gespoolt"]:
+            # The spooled record is still owed: its replay re-sends it.
+            ergebnisse.append(("deduction_owed", LEDGER_RUECKSTAU))
+        else:
+            ergebnisse.append(("deduction_lost", LEDGER_FEHLGESCHLAGEN))
+    return ergebnisse, offen
 
 
 _LEDGER_RANG = (LEDGER_GEBUCHT, LEDGER_RUECKSTAU, LEDGER_FEHLGESCHLAGEN)
@@ -282,6 +319,7 @@ async def _im_ledger_vermerken(
     dauer_s: float,
     grund: str,
     zuege: List[Dict[str, Any]],
+    abzuege: Optional[Dict[str, Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
     """Book the stop; returns the account the confirmation carries —
     ``ledger`` is the worst state of its rows, ``ledger_outcomes`` what the
@@ -332,7 +370,14 @@ async def _im_ledger_vermerken(
         error_code=code,
         app_env=attribution.get("app_env"),
     )
-    ergebnisse: List["tuple[str, str]"] = []
+    from src.jobs import teilverbrauch
+
+    if abzuege is None:
+        laufender = teilverbrauch._aktuell.get()
+        abzuege = laufender.offene_abzuege() if laufender is not None else {}
+    # The run's own rows that were written, but whose deduction the stop
+    # interrupted: resumed, never booked again (FK25BR R3).
+    ergebnisse, offene_abzuege = await _abzuege_nachholen(abzuege)
     if not summe:
         ergebnisse.append(await _buchen(
             **gemeinsam,
@@ -385,4 +430,6 @@ async def _im_ledger_vermerken(
         "offener_zug_unbekannt": geroutet,
         "ledger": ledger,
         "ledger_outcomes": outcomes,
+        "nachgeholte_abzuege": len(abzuege) - len(offene_abzuege),
+        "offene_abzuege": offene_abzuege,
     }

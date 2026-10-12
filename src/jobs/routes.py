@@ -788,10 +788,15 @@ async def cancel_job_endpoint(
     status = outcome["status"]
     if status == store.JOB_STATUS_CANCELLED:
         if outcome["changed"]:
+            # THIS call cancelled a pending job: nothing ran, nothing to book.
             logger.info(
                 f"🛑 Async job {job_id} (kind={job.get('kind')}) cancelled by its owner"
             )
-        return {"job_id": job_id, "status": store.JOB_STATUS_CANCELLED}
+            return {"job_id": job_id, "status": store.JOB_STATUS_CANCELLED}
+        # Already cancelled (a repeated or concurrent DELETE): the same answer
+        # as the DELETE that stopped it — from the stored account of the stop,
+        # never a bare 200 over a failed or owed booking (FK25BR R3).
+        return await _cancelled_answer(job_id, job.get("kind"), "repeated")
     if status == store.JOB_STATUS_RUNNING:
         # False only behind a platform-api from before BR10b, which records
         # no wish — the body then says so instead of promising it.
@@ -829,7 +834,7 @@ JOB_CANCEL_WAIT_S = float(os.getenv("BRIDGE_JOB_CANCEL_WAIT_S", "10"))
 JOB_CANCEL_WAIT_TICK_S = 0.25
 
 
-async def _cancelled_answer(job_id: str, kind: Optional[str], local: bool) -> JSONResponse:
+async def _cancelled_answer(job_id: str, kind: Optional[str], wo: str) -> JSONResponse:
     """The row reads 'cancelled'. Whether that is 200 depends on the stop's
     ledger booking, recorded by the endpoint (FK25BR R2 P1):
 
@@ -840,11 +845,13 @@ async def _cancelled_answer(job_id: str, kind: Optional[str], local: bool) -> JS
       fehlgeschlagen  502 job_cancel_ledger_failed — stopped, the booking is
                       lost (neither written nor spooled)
 
-    No account at all: closed 'cancelled' without a stopped run (it parked and
-    defer_job closed it) — nothing to book, 200 without a ledger claim."""
+    Answered alike to the DELETE that stopped the run and to every repeated
+    or concurrent one (FK25BR R3) — the account is stored on the row before
+    it reads 'cancelled'. No account at all: cancelled without a run being
+    stopped (cancelled while pending, or parked and closed by defer_job) —
+    nothing ran, 200 without a ledger claim."""
     job = await store_client.get_job(job_id)
     bericht = ((job or {}).get("progress") or {}).get(ABBRUCH_PROGRESS_KEY)
-    wo = "this worker" if local else "another worker"
     if not isinstance(bericht, dict):
         logger.info(f"🛑 Async job {job_id} (kind={kind}) cancelled by its owner ({wo})")
         return JSONResponse(
@@ -949,7 +956,9 @@ async def _stop_running(job_id: str, kind: Optional[str]) -> JSONResponse:
 
     status = state["status"]
     if status == store.JOB_STATUS_CANCELLED:
-        return await _cancelled_answer(job_id, kind, local)
+        return await _cancelled_answer(
+            job_id, kind, "this worker" if local else "another worker"
+        )
     if status == store.JOB_STATUS_RUNNING:
         logger.warning(
             f"🛑 Async job {job_id} (kind={kind}) not confirmed stopped "

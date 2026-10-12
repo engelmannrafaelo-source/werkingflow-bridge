@@ -29,6 +29,15 @@ The writer reports to whichever booking is listening in the current
 context: the run's own (the collector), or a stop's own booking
 (``eigene_buchung``), which needs to know whether its rows are durable.
 
+Ledger row and budget deduction are two steps (FK25BR R3): the writer
+reports the row the moment it is written (``zeile_geschrieben``) — before
+its next await, the deduction, where a job cancel can land. The collector
+then drops the calls (no second row under a new identity), but keeps the
+deduction as OPEN (``abzug_beginnt``) until the writer reports it settled
+(``abzug_endet``). A stop finds it open and re-sends it under the call's
+own key, which platform-api applies at most once (migration 061) — so an
+interrupted deduction is neither lost nor counted as done.
+
 Request-scoped through a ContextVar: the supervised task and every task it
 creates (the SDK's reader) see the same collector; nothing else does.
 """
@@ -55,6 +64,9 @@ class Teilverbrauch:
         # Calls of runs that ended with their result: booked by that run,
         # once the writer has them durably (buchung_gesichert).
         self._abgeschlossen: Dict[str, Dict[str, Any]] = {}
+        # call_uid → {"args": deduction arguments, "gespoolt": bool}: rows
+        # written whose budget deduction has not been settled.
+        self._offene_abzuege: Dict[str, Dict[str, Any]] = {}
         self._anonym = 0
 
     def zug(self, message_id: Optional[str], model: Optional[str], usage: Dict[str, Any]) -> None:
@@ -83,6 +95,10 @@ class Teilverbrauch:
         """Measured calls nobody has durably booked yet."""
         return list(self._abgeschlossen.values()) + list(self._zuege.values())
 
+    def offene_abzuege(self) -> Dict[str, Dict[str, Any]]:
+        """Deductions of written rows that were not settled."""
+        return dict(self._offene_abzuege)
+
 
 _aktuell: "contextvars.ContextVar[Optional[Teilverbrauch]]" = contextvars.ContextVar(
     "bridge_job_teilverbrauch", default=None
@@ -103,6 +119,9 @@ class EigeneBuchung:
 
     def __init__(self) -> None:
         self.gesichert = False  # the write-ahead spool has the record
+        # A deduction of this booking ended unsettled — the writer's outcome
+        # may still read 'written' then (spool off: the loss is only logged).
+        self.abzug_offen = False
 
 
 _eigene: "contextvars.ContextVar[Optional[EigeneBuchung]]" = contextvars.ContextVar(
@@ -120,8 +139,8 @@ def eigene_buchung_beenden(token: "contextvars.Token") -> None:
 
 
 def buchung_gesichert() -> None:
-    """Called by ai_call_writer once a booking is durable (spooled, or
-    settled definitively). A no-op outside a supervised job self-call."""
+    """Called by ai_call_writer once the write-ahead spool has the booking.
+    A no-op outside a supervised job self-call."""
     eigene = _eigene.get()
     if eigene is not None:
         eigene.gesichert = True
@@ -129,6 +148,50 @@ def buchung_gesichert() -> None:
     sammler = _aktuell.get()
     if sammler is not None:
         sammler.lauf_gebucht()
+
+
+def buchung_erledigt() -> None:
+    """Called by ai_call_writer when it settled a booking definitively. For a
+    run's own booking the calls are booked; a stop's own booking reads the
+    writer's outcome itself (``gesichert`` means spooled, nothing else)."""
+    if _eigene.get() is not None:
+        return
+    sammler = _aktuell.get()
+    if sammler is not None:
+        sammler.lauf_gebucht()
+
+
+def zeile_geschrieben() -> None:
+    """Called by ai_call_writer right after the usage row is written (or
+    found already written), before the deduction's await. For a run's own
+    booking: its measured calls are booked now."""
+    if _eigene.get() is not None:
+        return
+    sammler = _aktuell.get()
+    if sammler is not None:
+        sammler.lauf_gebucht()
+
+
+def abzug_beginnt(call_uid: str, args: Dict[str, Any], gespoolt: bool) -> None:
+    """Called by ai_call_writer before it awaits a deduction."""
+    if _eigene.get() is not None:
+        return
+    sammler = _aktuell.get()
+    if sammler is not None:
+        sammler._offene_abzuege[call_uid] = {"args": args, "gespoolt": gespoolt}
+
+
+def abzug_endet(call_uid: str, settled: bool) -> None:
+    """Called by ai_call_writer when the deduction answered. Not called when
+    the await was cancelled — the deduction then stays open."""
+    eigene = _eigene.get()
+    if eigene is not None:
+        if not settled:
+            eigene.abzug_offen = True
+        return
+    sammler = _aktuell.get()
+    if sammler is not None and settled:
+        sammler._offene_abzuege.pop(call_uid, None)
 
 
 def aus_cli_nachricht(data: Dict[str, Any]) -> None:
