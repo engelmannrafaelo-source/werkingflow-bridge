@@ -777,8 +777,15 @@ class Coordinator:
         notes: list[str],
         machine: list[str],
     ) -> None:
-        """One countable line per round; the report folder is gone after cleanup."""
+        """One countable line per round; the report folder is gone after cleanup.
+
+        After a restart the loop reads finished rounds again; their stored entry
+        already stands and is neither replaced nor logged a second time.
+        """
         state = self.states[ident]
+        stored = state.setdefault("runden", [])
+        if round_no < len(stored) and stored[round_no].get("pruefung") == name:
+            return
         entry = {
             "runde": round_no,
             "pruefung": name,
@@ -797,7 +804,7 @@ class Coordinator:
             entry["antwort_pruefer"] = (
                 self.directory(ident) / report / "antwort-pruefer.md"
             ).is_file()
-        state.setdefault("runden", [])[round_no:] = [entry]
+        stored[round_no:] = [entry]
         LOG.info(
             "bericht_id=%s pruefrunde %s",
             ident,

@@ -676,3 +676,50 @@ async def test_formmeldung_wird_getrennt_protokolliert(tmp_path):
         assert service.states["bericht-123"]["runden"][0]["formmeldungen"] == 1
     finally:
         await service.shutdown()
+
+
+async def test_wiederanlauf_protokolliert_jede_runde_genau_einmal(tmp_path, caplog):
+    import asyncio
+
+    import httpx
+
+    from src.erkunder.leitstand import Coordinator
+
+    caplog.set_level("INFO", logger="src.erkunder.leitstand")
+    service, places, _ = await setup(tmp_path, review="sperrender Befund")
+    original = service.step
+
+    async def interrupted(ident, name, slot, prompt, inputs=None, **kwargs):
+        if name == "harmonisierung-korrektur":
+            raise asyncio.CancelledError()
+        await original(ident, name, slot, prompt, inputs, **kwargs)
+
+    service.step = interrupted
+    order = body()
+    order.auftrag.korrekturkreis = 1
+    await service.start(order)
+    with pytest.raises(asyncio.CancelledError):
+        await service.tasks["bericht-123"]
+    stored = service.states["bericht-123"]["runden"][0]
+    await service.shutdown()
+    resumed = Coordinator(
+        service.root,
+        client=httpx.AsyncClient(transport=httpx.MockTransport(places)),
+        chown=lambda *args: None,
+        poll_s=0,
+    )
+    await resumed.startup()
+    try:
+        order = body(token="fresh")
+        order.auftrag.korrekturkreis = 1
+        await resumed.start(order)
+        await resumed.tasks["bericht-123"]
+        assert resumed.status("bericht-123")["zustand"] == "fertig"
+        messages = [record.getMessage() for record in caplog.records]
+        lines = [message for message in messages if "pruefrunde" in message]
+        assert [line.split("runde=")[1].split()[0] for line in lines] == ["0", "1"]
+        runden = resumed.states["bericht-123"]["runden"]
+        assert [r["runde"] for r in runden] == [0, 1]
+        assert runden[0] == stored  # gespeicherter Eintrag bleibt, wie abgeschlossen
+    finally:
+        await resumed.shutdown()

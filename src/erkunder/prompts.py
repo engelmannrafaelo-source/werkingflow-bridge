@@ -205,14 +205,14 @@ anhand der Anlage und Daten.
 PRUEFURTEIL = """
 Wofür dein Urteil gebraucht wird: Das Gutachten geht an den Betreiber und ist Grundlage
 der folgenden Arbeitsschritte, die seine Befunde und Zahlen übernehmen. Deine Prüfung
-beantwortet die Frage, ob es dafür fachlich trägt: Würde jemand, der sich darauf
-verlässt, an einer Stelle zu einer falschen Schlussfolgerung kommen oder eine falsche
-Zahl übernehmen?
+beantwortet die Frage, ob es dafür fachlich trägt: Kann sich jemand, der seine
+Schlussfolgerungen und Zahlen übernimmt, an jeder Stelle darauf verlassen?
 Die Prüfung endet mit genau einem JSON-Block `erkunder-pruefung` mit zwei Listen.
 `befunde` ist die Freigabeentscheidung: Jeder Eintrag hält das Gutachten an und geht
 als Korrekturauftrag an den Verfasser, der daraufhin eine neue Fassung schreibt, die
-wiederum ein unabhängiger Prüfer prüft. Dorthin gehören die Stellen, an denen die
-Antwort auf die Frage oben nein ist: widerlegte oder unbelegte Aussagen, Widersprüche,
+wiederum ein unabhängiger Prüfer prüft. Dorthin gehören die Stellen, an denen er sich
+nicht darauf verlassen kann, weil er dort eine falsche Schlussfolgerung ziehen oder
+eine falsche Zahl übernehmen würde: widerlegte oder unbelegte Aussagen, Widersprüche,
 Zahlen ohne oder mit abweichendem Beleg, fehlende oder widersprüchliche
 Bibliotheksurteile, unbelegte Auswahlkriterien. Eine leere Liste bedeutet, dass diese
 Fassung trägt. `hinweise` sind Anmerkungen, die das Gutachten besser machen, ohne

@@ -31,6 +31,11 @@ def test_prompts(auftrag):
     assert "`befunde` ist die Freigabeentscheidung" in pruefung_prompt(a)
     assert "`hinweise` sind Anmerkungen" in pruefung_prompt(a)
     assert "ob es dafür fachlich trägt" in pruefung_prompt(a)
+    # Frage und Zuordnung zeigen in dieselbe Richtung: befunde = nicht verlassbar.
+    assert "an jeder Stelle darauf verlassen?" in pruefung_prompt(a)
+    zuordnung = "Stellen, an denen er sich\nnicht darauf verlassen kann"
+    assert zuordnung in pruefung_prompt(a)
+    assert "Antwort auf die Frage oben nein" not in pruefung_prompt(a)
     assert "unverknüpften berechneten Zahlen" in pruefung_prompt(a)
     assert "`antwort-pruefer.md`" in korrektur_prompt(a)
 
