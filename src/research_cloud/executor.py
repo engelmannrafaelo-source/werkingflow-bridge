@@ -32,7 +32,7 @@ from typing import Any, Awaitable, Callable, Dict, List, Optional
 
 import httpx
 
-from src.lauf_abschluss import ModellAbbruch, abschluss_aus_stop_reason, annehmen
+from src.lauf_abschluss import LaufUnfertig, ModellAbbruch, abschluss_aus_stop_reason, annehmen
 from src.research_cloud.library import (
     LibraryConfig,
     LibraryFetchError,
@@ -687,23 +687,35 @@ async def run_research_cloud(
                             f"{config.model}). Refusing to return a partial report as a finished one."
                         )
 
-                    # The acceptance point (src/lauf_abschluss): a classifier
-                    # stop is no report. In the return round the exception
-                    # keeps the report from before (handled below).
-                    _abschluss = abschluss_aus_stop_reason(
-                        parsed.stop_reason,
-                        category=(parsed.stop_details or {}).get("category"),
-                    )
-                    try:
-                        annehmen(_abschluss)
-                    except ModellAbbruch as e:
-                        raise ResearchCloudModelAbbruch(
-                            f"research-cloud report stopped by the model's safety classifier "
-                            f"({_abschluss.details()}) — a partial report is not handed out",
-                            usage=usage.model_copy(), abschluss=_abschluss,
-                        ) from e
-
-                    if parsed.stop_reason != "pause_turn":
+                    if parsed.stop_reason == "pause_turn":
+                        # A server tool paused the turn: an intermediate
+                        # step, continued below — not an end to judge.
+                        pass
+                    else:
+                        # The acceptance point (src/lauf_abschluss), strict:
+                        # this response ENDS the report, so it must be
+                        # complete — no classifier stop, no reason nobody
+                        # reported (None -> "unknown"), no context-window
+                        # end. In the return round the exception keeps the
+                        # report from before (handled below).
+                        _abschluss = abschluss_aus_stop_reason(
+                            parsed.stop_reason,
+                            category=(parsed.stop_details or {}).get("category"),
+                        )
+                        try:
+                            annehmen(_abschluss, ganz_fertig=True)
+                        except ModellAbbruch as e:
+                            raise ResearchCloudModelAbbruch(
+                                f"research-cloud report stopped by the model's safety classifier "
+                                f"({_abschluss.details()}) — a partial report is not handed out",
+                                usage=usage.model_copy(), abschluss=_abschluss,
+                            ) from e
+                        except LaufUnfertig as e:
+                            raise ResearchCloudExecutorError(
+                                f"research-cloud report did not end complete (stop_reason="
+                                f"{parsed.stop_reason!r} -> finish_reason {_abschluss.finish_reason}) — "
+                                "a report without a complete end is not handed out"
+                            ) from e
                         break
 
                     # Do NOT append a synthetic "Continue" user turn — the API

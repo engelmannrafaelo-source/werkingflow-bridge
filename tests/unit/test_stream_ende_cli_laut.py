@@ -38,7 +38,11 @@ def _text(t):
     return {"content": [{"type": "text", "text": t}]}
 
 
-_RESULT_OK = {"subtype": "success", "is_error": False, "usage": {"input_tokens": 1, "output_tokens": 1}}
+# The converted SDK ResultMessage always carries num_turns (tests/sdk_strom.py);
+# without it the chunk is no result at all, and since BRREF a run without a
+# result is not complete.
+_RESULT_OK = {"subtype": "success", "is_error": False, "num_turns": 1,
+              "usage": {"input_tokens": 1, "output_tokens": 1}}
 _MARKER = {"type": "result", "subtype": "no_completion_marker", "is_error": True,
            "error_message": "Response may be incomplete - no completion marker received"}
 _TOOL = {"content": [{"type": "tool_use", "id": "t1", "name": "Read", "input": {}}]}

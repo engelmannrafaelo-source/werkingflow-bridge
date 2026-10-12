@@ -2087,15 +2087,30 @@ async def generate_streaming_response(
         # Abschneide-Marker, und ein Lauf ohne Text und ohne Werkzeugaufruf hat
         # nichts geliefert. Frueher endeten beide mit finish_reason "stop" +
         # [DONE] — im zweiten Fall sogar mit einem erfundenen Ersatzsatz.
+        # The stream ends through the same acceptance point as every other
+        # path (src/lauf_abschluss.annehmen): a transport break becomes the
+        # error event below; a model stop ends with finish_reason
+        # content_filter; an unfinished run (error_max_turns, ...) ends with
+        # "length" and x_bridge_finish.vollstaendig false.
+        from src.claude_cli import chunks_have_tool_use, lauf_abschluss
+        from src.lauf_abschluss import ModellAbbruch, TransportAbbruch, annehmen
+        stream_abschluss = lauf_abschluss(chunks_buffer)
         if sdk_stream_error is None:
-            from src.claude_cli import chunks_have_tool_use, find_truncation_marker
-            _truncation_marker = find_truncation_marker(chunks_buffer)
-            if _truncation_marker is not None:
+            try:
+                annehmen(stream_abschluss)
+            except TransportAbbruch:
                 sdk_stream_error = StreamEndedWithoutCompletion(
                     f"stream ended without completion marker "
-                    f"({_truncation_marker.get('subtype')}) — response is truncated"
+                    f"({stream_abschluss.transport}) — response is truncated"
                 )
-            elif not content_sent and not chunks_have_tool_use(chunks_buffer) and stream_filter.abbruch is None:
+            except ModellAbbruch:
+                pass
+            if (
+                sdk_stream_error is None
+                and not content_sent
+                and not chunks_have_tool_use(chunks_buffer)
+                and not stream_abschluss.modell_abbruch
+            ):
                 sdk_stream_error = StreamEndedWithoutCompletion(
                     f"stream ended without content ({len(chunks_buffer)} chunks)"
                 )
@@ -2103,8 +2118,6 @@ async def generate_streaming_response(
                 logger.error(f"❌ Streaming: {sdk_stream_error}")
 
         # Extract assistant response from all chunks for session storage
-        from src.claude_cli import lauf_abschluss
-        stream_abschluss = lauf_abschluss(chunks_buffer)
         stream_finish_reason = stream_abschluss.finish_reason
         stream_finish_details = stream_abschluss.details()
         if stream_finish_reason != "stop":
@@ -6526,14 +6539,27 @@ async def _execute_research_cloud_impl(
         )
 
     # The acceptance point on what the executor returned, too: whatever path
-    # produced a result, a model stop in its stop_reason is no report.
-    from src.lauf_abschluss import ModellAbbruch, abschluss_aus_stop_reason, annehmen
+    # produced it, only a complete end is a report.
+    from src.lauf_abschluss import (
+        LaufUnfertig,
+        ModellAbbruch,
+        abschluss_aus_stop_reason,
+        annehmen,
+    )
     _cloud_abschluss = abschluss_aus_stop_reason(result.stop_reason)
     try:
-        annehmen(_cloud_abschluss)
+        annehmen(_cloud_abschluss, ganz_fertig=True)
     except ModellAbbruch as e:
         return await _cloud_modell_abbruch_antwort(
             request_body, attribution_ctx, start_time, str(e), result.usage, _cloud_abschluss,
+        )
+    except LaufUnfertig as e:
+        # The executor only returns complete reports; one that is not is a
+        # contract break between the two, said as such.
+        return await _cloud_modell_abbruch_antwort(
+            request_body, attribution_ctx, start_time,
+            f"research-cloud executor returned a report that did not end complete: {e}",
+            result.usage, _cloud_abschluss, fehler_code=None,
         )
 
     # Real-cost ledger booking — research-cloud always books real cost
@@ -6624,10 +6650,11 @@ USAGE_FEHLT_RESEARCH_CLOUD_OHNE_USAGE = "research_cloud_ohne_usage"
 
 async def _cloud_modell_abbruch_antwort(
     request_body, attribution_ctx, start_time: float, message: str, usage, abschluss,
+    *, fehler_code: Optional[str] = "modell_abbruch",
 ) -> ResearchResponse:
-    """research-cloud run stopped by the model (BRREF): status=error,
-    fehler_code modell_abbruch, not retryable — with the usage of every round
-    up to the stop, in the response and in the ledger row."""
+    """research-cloud run not accepted (BRREF): status=error, not retryable —
+    with the usage of every round up to the stop, in the response and in the
+    ledger row. fehler_code modell_abbruch for a model stop."""
     execution_time = time.time() - start_time
     logger.error(f"research-cloud: {message}")
     try:
@@ -6644,7 +6671,7 @@ async def _cloud_modell_abbruch_antwort(
             cache_creation_tokens=usage.cache_creation_input_tokens,
             status="error",
             duration_ms=int(execution_time * 1000),
-            error_code="modell_abbruch",
+            error_code=fehler_code or "research_cloud_nicht_abgeschlossen",
             app_env=attribution_ctx.get("app_env") if attribution_ctx else None,
             provider="research-cloud",
             error_message=message,
@@ -6657,7 +6684,7 @@ async def _cloud_modell_abbruch_antwort(
         model=request_body.model,
         execution_time_seconds=round(execution_time, 2),
         error=message,
-        fehler_code="modell_abbruch",
+        fehler_code=fehler_code,
         antwort_ende=abschluss.stop_reason,
         retryable=False,
         **_cloud_usage_felder(usage),

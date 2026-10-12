@@ -164,8 +164,15 @@ class LaufAbschluss:
 
     @property
     def vollstaendig(self) -> bool:
+        """True only for a run that is finished in every respect: it reached
+        its completion marker (no transport break), the model did not stop
+        it, the CLI result is not unfinished (error_max_turns, error subtype,
+        none at all), and the finish reason is one of a complete answer.
+        Anything else — including a reason nobody reported — is not."""
         return (
             self.transport is None
+            and not self.modell_abbruch
+            and self.unfertig is None
             and self.finish_reason in VOLLSTAENDIGE_FINISH_REASONS
         )
 
@@ -176,6 +183,8 @@ class LaufAbschluss:
             d.update(category=self.category, folgezuege=self.folgezuege)
         if self.transport:
             d["transport"] = self.transport
+        if self.unfertig:
+            d["unfertig"] = self.unfertig
         return d
 
 
@@ -225,7 +234,9 @@ class ModellAbbruch(LaufNichtAbgeschlossen):
 
 
 class LaufUnfertig(LaufNichtAbgeschlossen):
-    """The CLI result did not end in success (error_max_turns, error subtype)."""
+    """The run is not complete (abschluss.vollstaendig is false) for a reason
+    other than a transport break or a model stop: error_max_turns, an error
+    result, the output limit, a finish reason nobody reported."""
 
     grund = "unfertig"
 
@@ -234,8 +245,14 @@ def annehmen(abschluss: LaufAbschluss, *, ganz_fertig: bool = False) -> LaufAbsc
     """THE acceptance point: return ``abschluss`` if its result may be handed
     out, raise otherwise. Order: transport break first (nothing arrived
     whole, not even the stop), then a model stop, then — with
-    ``ganz_fertig``, for runs that write their output in parts — an
-    unfinished CLI result."""
+    ``ganz_fertig`` — anything that is not ``vollstaendig``.
+
+    ganz_fertig=True: the result is final as it stands — a research report,
+    a revised report, a file the run wrote. Only a complete run may be handed
+    out. ganz_fertig=False: the protocol can carry an incomplete result
+    honestly — chat answers it with finish_reason "length" (or "unknown")
+    and x_bridge_finish.vollstaendig false; a caller must not read it as
+    complete."""
     if abschluss.transport:
         raise TransportAbbruch(
             f"model run ended without completion marker ({abschluss.transport}) — the result is cut",
@@ -248,9 +265,11 @@ def annehmen(abschluss: LaufAbschluss, *, ganz_fertig: bool = False) -> LaufAbsc
             "not a finished result",
             abschluss,
         )
-    if ganz_fertig and abschluss.unfertig:
+    if ganz_fertig and not abschluss.vollstaendig:
         raise LaufUnfertig(
-            f"model run did not end in success ({abschluss.unfertig}) — not a finished result",
+            f"model run did not end complete (finish_reason={abschluss.finish_reason}, "
+            f"stop_reason={abschluss.stop_reason}, unfertig={abschluss.unfertig}) — "
+            "not a finished result",
             abschluss,
         )
     return abschluss
@@ -291,11 +310,13 @@ def vermerkt(verzeichnis: Path) -> Optional[dict]:
 def abschluss_eines_ergebnisses(result: Any) -> Optional[dict]:
     """The verdict a stored job result carries, for the poll (GET /v1/jobs).
 
-    A chat result carries it as x_bridge_finish (with ``vollstaendig``); an
-    older or foreign chat-shaped result is judged by its finish_reason —
-    only "stop"/"tool_calls" are complete. Other results (research,
-    doc-agent) reach a done job only on success and carry no verdict here:
-    None."""
+    ``vollstaendig`` is always a boolean and true ONLY when the result itself
+    says so (x_bridge_finish.vollstaendig is True). Results written before
+    that field existed — chat results with x_bridge_finish from BRREF R1/R2,
+    or without any, when "stop" was hard-wired — cannot vouch for it: false,
+    with ``vollstaendig_unbekannt`` and a reason, never true by inference.
+    Results that are not chat-shaped (research, doc-agent reach a done job
+    only on success and carry no verdict here): None."""
     if not isinstance(result, dict):
         return None
     finish = None
@@ -303,8 +324,15 @@ def abschluss_eines_ergebnisses(result: Any) -> Optional[dict]:
     if isinstance(choices, list) and choices and isinstance(choices[0], dict):
         finish = choices[0].get("finish_reason")
     gemeldet = result.get("x_bridge_finish")
-    if isinstance(gemeldet, dict):
-        return dict(gemeldet, finish_reason=finish)
-    if choices is None:
+    if choices is None and not isinstance(gemeldet, dict):
         return None
-    return {"finish_reason": finish, "vollstaendig": finish in VOLLSTAENDIGE_FINISH_REASONS}
+    abschluss = dict(gemeldet) if isinstance(gemeldet, dict) else {}
+    abschluss["finish_reason"] = finish
+    if abschluss.get("vollstaendig") is not True and abschluss.get("vollstaendig") is not False:
+        abschluss["vollstaendig"] = False
+        abschluss["vollstaendig_unbekannt"] = True
+        abschluss["grund"] = (
+            "x_bridge_finish_ohne_vollstaendig" if isinstance(gemeldet, dict)
+            else "kein_x_bridge_finish"
+        )
+    return abschluss

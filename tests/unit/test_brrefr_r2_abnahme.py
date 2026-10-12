@@ -230,12 +230,16 @@ async def test_chat_job_poll_zeigt_abschluss(monkeypatch):
     assert body["abschluss"]["finish_reason"] == "content_filter"
 
 
-async def test_altes_chat_ergebnis_ohne_vermerk_wird_am_finish_reason_gemessen(monkeypatch):
+@pytest.mark.parametrize("finish", ["length", "stop"])
+async def test_altes_chat_ergebnis_ohne_vermerk_ist_nie_vollstaendig(monkeypatch, finish):
+    """Before BRREF "stop" was hard-wired: an old result cannot vouch for
+    itself, not even with "stop" (BRREFR R3-3)."""
     from tests.jobs.test_error_verdict_br9 import _job, _poll
 
-    ergebnis = {"choices": [{"index": 0, "finish_reason": "length", "message": {"content": "x"}}]}
+    ergebnis = {"choices": [{"index": 0, "finish_reason": finish, "message": {"content": "x"}}]}
     body = await _poll(_job(status="done", result=ergebnis), monkeypatch)
-    assert body["abschluss"] == {"finish_reason": "length", "vollstaendig": False}
+    assert body["abschluss"] == {"finish_reason": finish, "vollstaendig": False,
+                                 "vollstaendig_unbekannt": True, "grund": "kein_x_bridge_finish"}
 
 
 # ── Gemini: no reason reported is not "stop" ────────────────────────────────

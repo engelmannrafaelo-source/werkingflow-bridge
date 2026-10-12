@@ -1276,6 +1276,12 @@ def lauf_abschluss(chunks: list) -> LaufAbschluss:
         )
     ende = antwort_ende(chunks)
     finish = "stop" if ende is None else STOP_REASON_FINISH.get(ende, ende)
+    if gemeinsam["unfertig"] and finish in ("stop", "tool_calls"):
+        # The CLI result says the run did not finish (error_max_turns, an
+        # error subtype, none at all): what the model said last is not the
+        # end of the answer, whatever its own stop reason was — or when it
+        # reported none. "length" is OpenAI's value for "cut before the end".
+        finish = "length"
     return LaufAbschluss(finish_reason=finish, stop_reason=ende, **gemeinsam)
 
 
