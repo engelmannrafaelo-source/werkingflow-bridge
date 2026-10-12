@@ -18,6 +18,7 @@ cycle (main.py imports this module, not the other way around).
 """
 import asyncio
 import hashlib
+import hmac
 import logging
 import os
 import time
@@ -30,12 +31,13 @@ from fastapi.security import HTTPAuthorizationCredentials
 from pydantic import BaseModel
 
 from src.auth import security, verify_api_key
-from src.error_contract import job_error_view
+from src.error_contract import JOB_CODE_STORE_INCOMPATIBLE, job_error_view
 from src.middleware.bridge_error import (
     REASON_IDEMPOTENCY_KEY_INVALID,
     REASON_IDEMPOTENCY_KEY_REUSED,
     REASON_JOB_ALREADY_RUNNING,
     REASON_JOB_NOT_FOUND,
+    REASON_JOB_STORE_INCOMPATIBLE,
     REASON_JOB_TERMINAL,
     idempotency_error,
     job_cancel_error,
@@ -52,13 +54,14 @@ from src.jobs.job_id import (
     parse_home,
 )
 from src.jobs.registry import (
+    EIGENTUEMER_KEY,
     JOB_ABBRECHBAR_IM_LAUF,
-    abbruch_melden,
     get_executor,
     registered_kinds,
     run_generic_job,
     spawn,
 )
+from src.jobs.selbstaufruf import abbruch_melden
 from src.lauf_abschluss import abschluss_eines_ergebnisses
 
 logger = logging.getLogger(__name__)
@@ -321,6 +324,14 @@ async def create_job_endpoint(
         attribution["bridge_origin"] = _origin
     elif attribution and "bridge_origin" in attribution:
         attribution = {k: v for k, v in attribution.items() if k != "bridge_origin"}
+
+    # FK25B2: who may cancel this job, bound at submit to the caller's
+    # AUTHENTICATED identity — the IDEMR owner (_idempotency_owner), never
+    # a value from the body. See _caller_owns.
+    attribution = {k: v for k, v in (attribution or {}).items() if k != EIGENTUEMER_KEY}
+    if _attribution_extractor is not None:
+        attribution[EIGENTUEMER_KEY] = _idempotency_owner(request)
+    attribution = attribution or None
 
     # Placement veto (Autobahn): the job EXECUTES on THIS worker (spawn below),
     # and the executor's chat self-call pins to localhost — the LLM work can
@@ -642,24 +653,29 @@ _OWNER_KEYS = ("app_id", "user_id")
 
 
 def _caller_owns(job: Dict[str, Any], request: Request) -> bool:
-    """Does the caller of this request own `job`? (BR10)
+    """Does the caller of this request own `job`? (BR10, FK25B2)
 
-    Owner = the job's stored attribution (app_id, user_id), which the submit
-    took from the caller's X-* headers unless the body named it explicitly.
-    The caller is read with the SAME extractor, so a client that cancels with
-    the headers it submitted with matches by construction; an absent value
-    matches only an absent value. The job id itself is not proof of
-    ownership — GET treats it as a capability, a write must not.
+    The trust boundary is the one IDEMR draws for an Idempotency-Key, so GET
+    (keyed jobs, _visible_to_caller), the key and DELETE agree on who an
+    owner is: _idempotency_owner — how the caller authenticated, the
+    authenticated principal's name, and the app/user it states.
 
-    What this protects, honestly: it is hygiene, not authentication. The
-    compared values are headers the caller asserts itself (X-App-ID,
-    X-User-ID, X-Client-ID), and every holder of the shared bridge API key
-    can send any of them — with principals off (BRIDGE_PRINCIPALS_ENABLED,
-    default off) nothing binds them to the key. It stops a caller from
-    cancelling someone else's job by mistake (wrong id, another app's id in a
-    log); it does not stop a key holder who forges the owner's headers, which
-    GET /v1/jobs even lists alongside the ids. Real protection needs the
-    owner bound to the authenticated principal at submit time.
+      * Jobs submitted since FK25B2 carry that owner, stamped at submit
+        (attribution[EIGENTUEMER_KEY], set server-side, never from the
+        body). With principals on (BRIDGE_PRINCIPALS_ENABLED) a principal's
+        job can be cancelled by that principal only: the name comes from its
+        token, so other principals and the shared (legacy) key are refused
+        whatever headers they send.
+      * Under the shared key there is no authenticated user: every holder is
+        a trusted backend that states the user in X-* headers — the same
+        boundary as IDEMR and as the LB-stamped Hop/Origin headers (trusted
+        because the sender is). A shared-key holder who states another
+        user's headers is, to the bridge, that user. That is the named
+        limit of the shared key, not of this check; it ends with principals.
+      * Rows from before FK25B2 (no stamp) are matched on app/user as
+        before. Their run cannot be stopped (registry: the self-call of an
+        unbound job is not marked), so for them DELETE only records the
+        wish (BR10b).
 
     No extractor wired (main.py always wires one) would make everybody an
     owner of nothing or of everything — fail closed and loud instead."""
@@ -668,9 +684,18 @@ def _caller_owns(job: Dict[str, Any], request: Request) -> bool:
             "DELETE /v1/jobs/{id}: no attribution extractor wired "
             "(main.py set_attribution_extractor) — cannot establish the owner"
         )
-    caller = _attribution_extractor(request) or {}
     owner = job.get("attribution") or {}
+    stamp = owner.get(EIGENTUEMER_KEY)
+    if stamp:
+        return hmac.compare_digest(str(stamp), _idempotency_owner(request))
+    caller = _attribution_extractor(request) or {}
     return all((caller.get(k) or None) == (owner.get(k) or None) for k in _OWNER_KEYS)
+
+
+def _owner_bound(job: Dict[str, Any]) -> bool:
+    """Was the owner bound at submit (FK25B2)? Only such a job's run can be
+    stopped."""
+    return bool((job.get("attribution") or {}).get(EIGENTUEMER_KEY))
 
 
 def _job_not_found(job_id: str) -> JSONResponse:
@@ -698,14 +723,18 @@ async def cancel_job_endpoint(
       200 {job_id, status:'cancelled'}  pending/deferred → cancelled, or it
                                         already was cancelled (idempotent);
                                         also a running chat/research/
-                                        doc-agent job whose run stopped
-                                        within JOB_CANCEL_WAIT_S (FK25B,
-                                        _stop_running: its self-call and
-                                        CLI end, the ledger notes it)
-      202 {status:'running',            such a job is still being stopped;
-           cancel_requested:true}       GET shows 'cancelled' once it is
+                                        doc-agent job whose endpoint
+                                        confirmed the stop within
+                                        JOB_CANCEL_WAIT_S (FK25B2,
+                                        _stop_running: the CLI has ended,
+                                        the stop is booked)
+      202 {status:'running',            such a job is not confirmed stopped
+           cancel_requested:true}       yet; GET shows 'cancelled' once it
+                                        is (or 'done' if it finished first)
       409 job_terminal (running kind)   it finished before the cancel took
                                         effect; the result is kept
+      502 job_store_incompatible        the platform-api predates FK25B: a
+                                        running job cannot be stopped
       409 job_already_running           every OTHER kind (erkunder, ping,
                                         proxy, pdf) a worker has (also when
                                         it won the
@@ -761,10 +790,8 @@ async def cancel_job_endpoint(
         # False only behind a platform-api from before BR10b, which records
         # no wish — the body then says so instead of promising it.
         requested = bool(outcome.get("cancel_requested"))
-        if requested and job.get("kind") in JOB_ABBRECHBAR_IM_LAUF:
-            stopped = await _stop_running(job_id, job.get("kind"))
-            if stopped is not None:
-                return stopped
+        if requested and job.get("kind") in JOB_ABBRECHBAR_IM_LAUF and _owner_bound(job):
+            return await _stop_running(job_id, job.get("kind"))
         if requested:
             logger.info(
                 f"🛑 Async job {job_id} (kind={job.get('kind')}) running — "
@@ -789,36 +816,62 @@ async def cancel_job_endpoint(
 
 
 # FK25B: how long DELETE waits for a running job to end before it answers
-# 202. Covers the running worker's poll (registry.JOB_CANCEL_POLL_S) and
-# cancelling its self-call; the CLI's bounded close (up to 2 × (grace +
-# reap)) runs on in the endpoint and is not waited for here.
+# 202. Covers the endpoint's poll (selbstaufruf.JOB_CANCEL_POLL_S), the CLI's
+# bounded close (up to 2 × (grace + reap), BRLZR R2) and the ledger booking:
+# the row turns 'cancelled' only after all of them (FK25B2).
 JOB_CANCEL_WAIT_S = float(os.getenv("BRIDGE_JOB_CANCEL_WAIT_S", "10"))
 JOB_CANCEL_WAIT_TICK_S = 0.25
 
 
-async def _stop_running(job_id: str, kind: Optional[str]) -> Optional[JSONResponse]:
-    """Stop a running job whose cancel wish is recorded (FK25B).
+def _store_incompatible(job_id: str, detail: str, gestoppt: bool = False) -> JSONResponse:
+    """502: the platform-api predates FK25B. Never answered as BR10b's 409 or
+    as 'being stopped' — a deploy mismatch someone has to see (FK25BR 4)."""
+    logger.error(f"🛑 job cancel {job_id}: job store incompatible — {detail}")
+    if gestoppt:
+        lage = (
+            "its run was stopped and booked, but the job store cannot record "
+            "'cancelled' — the job reads 'error' (JOB_STORE_INCOMPATIBLE)"
+        )
+        status = store.JOB_STATUS_ERROR
+    else:
+        lage = (
+            "it runs on and cannot be stopped; the cancel wish is recorded "
+            "(BR10b: the run is not resumed if it pauses)"
+        )
+        status = store.JOB_STATUS_RUNNING
+    return job_cancel_error(
+        job_id, REASON_JOB_STORE_INCOMPATIBLE, 502,
+        f"Async job {job_id}: the job store (platform-api) predates FK25B "
+        f"({detail}) — {lage}. Deploy platform-api together with the workers.",
+        job_status=status,
+        cancel_requested=True,
+    )
 
-      200 {status:'cancelled'}          the run stopped, the row is cancelled
-      202 {status:'running',            the wish is recorded and the run is
-           cancel_requested:true}       being stopped; GET shows the end
+
+async def _stop_running(job_id: str, kind: Optional[str]) -> JSONResponse:
+    """Stop a running job whose cancel wish is recorded (FK25B, FK25B2).
+
+      200 {status:'cancelled'}          the endpoint stopped the run, the CLI
+                                        has ended and the stop is booked; the
+                                        row is cancelled
+      202 {status:'running',            the wish is recorded, the run is not
+           cancel_requested:true}       confirmed stopped yet; GET shows the
+                                        end ('cancelled', or 'done' if it
+                                        finished first)
       409 job_terminal                  it finished done/error first (billed;
                                         the result is kept)
-      None                              this store cannot tell (platform-api
-                                        before FK25B) — the caller answers as
-                                        BR10b did
+      502 job_store_incompatible        the platform-api predates FK25B: the
+                                        run cannot be stopped (wish recorded)
 
-    Wakes the run directly when it runs on this worker; otherwise its worker
-    sees the wish within registry.JOB_CANCEL_POLL_S."""
+    Wakes the run directly when it runs on this worker; otherwise its
+    endpoint sees the wish within selbstaufruf.JOB_CANCEL_POLL_S."""
     local = abbruch_melden(job_id)
     deadline = time.monotonic() + JOB_CANCEL_WAIT_S
-    state: Optional[Dict[str, Any]] = None
     while True:
         try:
             state = await store_client.cancel_state(job_id)
         except store_client.CancelRouteMissing as e:
-            logger.error("job cancel %s: %s — answering as before FK25B", job_id, e)
-            return None
+            return _store_incompatible(job_id, str(e))
         if state is None:
             return _job_not_found(job_id)
         if state["status"] != store.JOB_STATUS_RUNNING:
@@ -838,8 +891,8 @@ async def _stop_running(job_id: str, kind: Optional[str]) -> Optional[JSONRespon
         )
     if status == store.JOB_STATUS_RUNNING:
         logger.warning(
-            f"🛑 Async job {job_id} (kind={kind}) still running "
-            f"{JOB_CANCEL_WAIT_S:.0f}s after its cancel — being stopped"
+            f"🛑 Async job {job_id} (kind={kind}) not confirmed stopped "
+            f"{JOB_CANCEL_WAIT_S:.0f}s after its cancel"
         )
         return JSONResponse(
             status_code=202,
@@ -849,10 +902,15 @@ async def _stop_running(job_id: str, kind: Optional[str]) -> Optional[JSONRespon
                 "cancel_requested": True,
                 "message": (
                     f"Async job {job_id} is being stopped; poll GET /v1/jobs/{job_id} "
-                    f"until it reads 'cancelled'"
+                    f"until it reads 'cancelled' (or 'done', if it finished first)"
                 ),
             },
         )
+    if status == store.JOB_STATUS_ERROR:
+        job = await store_client.get_job(job_id)
+        code = ((job or {}).get("error") or {}).get("code")
+        if code == JOB_CODE_STORE_INCOMPATIBLE:
+            return _store_incompatible(job_id, "no finish-cancelled route", gestoppt=True)
     if status in store.JOB_TERMINAL_STATUSES:
         return job_cancel_error(
             job_id, REASON_JOB_TERMINAL, 409,

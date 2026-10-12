@@ -1,5 +1,12 @@
-"""FK25B Gegenprobe: running job → DELETE → the CLI process and its child are
-gone within seconds.
+"""FK25B / FK25B2: running job → DELETE → the CLI process and its child are
+gone — and already gone when DELETE says 200.
+
+Taken over from Codex' counterprobe (FK25BR, test_process_all.py, all three
+kinds × both ways) as the acceptance of FK25B2: there 200 came while CLI and
+child still lived and the ledger was empty (6/6); here 200 may only come
+after both ended and the stop is booked. The stand-in CLI reports one
+completed model call before it hangs: its usage must reach the ledger through
+the REAL SDK parser (sdk_parser → teilverbrauch, FK25BR Befund 5).
 
 The whole chain with real parts: the job runner (registry._run_body) runs the
 chat executor, whose self-call goes over a real socket into the real app
@@ -40,11 +47,27 @@ import uvicorn  # noqa: E402
 import src.claude_cli as claude_cli  # noqa: E402
 import src.main as main  # noqa: E402
 from src.claude_cli import ClaudeCodeCLI  # noqa: E402
-from src.jobs import executors, registry, routes, store_client  # noqa: E402
+from src.jobs import executors, registry, routes, selbstaufruf, store_client  # noqa: E402
 
 JOB = f"job_dev_{'0123456789abcdef' * 2}"
 OWNER = {"X-App-ID": "werking-energy", "X-User-ID": "user-a"}
-ATTR = {"app_id": "werking-energy", "user_id": "user-a", "bridge_origin": "dev"}
+
+
+def _eigentuemer() -> str:
+    from starlette.requests import Request
+
+    req = Request({
+        "type": "http",
+        "headers": [(k.lower().encode(), v.encode()) for k, v in OWNER.items()],
+    })
+    with patch.object(routes, "_attribution_extractor", main.extract_attribution_context):
+        return routes._idempotency_owner(req)
+
+
+ATTR = {
+    "app_id": "werking-energy", "user_id": "user-a", "bridge_origin": "dev",
+    registry.EIGENTUEMER_KEY: _eigentuemer(),
+}
 BODY = {"model": "claude-sonnet-5-5", "messages": [{"role": "user", "content": "x"}]}
 
 
@@ -111,8 +134,9 @@ def _cli(tmp_path) -> ClaudeCodeCLI:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["chat", "research", "doc-agent"])
 @pytest.mark.parametrize("weg", ["dieser_worker", "anderer_worker"])
-async def test_delete_beendet_cli_samt_kind(tmp_path, monkeypatch, weg):
+async def test_delete_beendet_cli_samt_kind(tmp_path, monkeypatch, weg, kind):
     from claude_code_sdk import ClaudeCodeOptions
     from claude_code_sdk import query as sdk_query
     from claude_code_sdk._internal.transport.subprocess_cli import (
@@ -124,6 +148,10 @@ async def test_delete_beendet_cli_samt_kind(tmp_path, monkeypatch, weg):
     cli.write_text(
         "#!/bin/sh\n"
         "trap '' TERM\n"
+        "echo '{\"type\":\"assistant\",\"message\":{\"id\":\"msg_t1\","
+        "\"model\":\"claude-sonnet-5-5\",\"role\":\"assistant\",\"content\":"
+        "[{\"type\":\"text\",\"text\":\"Teil\"}],\"usage\":{\"input_tokens\":111,"
+        "\"output_tokens\":22}}}'\n"
         "sleep 60 &\n"
         f"echo $$ $! > {pids}\n"
         "while :; do sleep 1; done\n"
@@ -140,18 +168,20 @@ async def test_delete_beendet_cli_samt_kind(tmp_path, monkeypatch, weg):
     monkeypatch.setenv("INSTANCE_NAME", "worker1")
     monkeypatch.setenv("API_KEY", "")
     monkeypatch.setenv("BRIDGE_ORIGIN_ID", "dev")
-    monkeypatch.setattr(claude_cli, "CLI_TERM_GRACE_S", 0.5, raising=False)
+    monkeypatch.setattr(claude_cli, "CLI_TERM_GRACE_S", 2.0, raising=False)
     monkeypatch.setattr(claude_cli, "query", echte_query)
     monkeypatch.setattr(main.claude_cli, "run_completion", _cli(tmp_path).run_completion)
     monkeypatch.setattr(cw, "AUFSICHT_TAKT_S", 0.05)
-    monkeypatch.setattr(registry, "JOB_CANCEL_POLL_S", 0.5)
-    monkeypatch.setattr(routes, "JOB_CANCEL_WAIT_S", 5.0)
+    monkeypatch.setattr(selbstaufruf, "JOB_CANCEL_POLL_S", 0.5)
+    monkeypatch.setattr(routes, "JOB_CANCEL_WAIT_S", 8.0)
     monkeypatch.setattr(routes, "verify_api_key", AsyncMock(return_value=True))
     monkeypatch.setattr(routes, "_require_enabled", lambda: None)
     monkeypatch.setattr(routes, "_attribution_extractor", main.extract_attribution_context)
     if weg == "anderer_worker":
         monkeypatch.setattr(routes, "abbruch_melden", lambda job_id: False)
     st = Store()
+    st.row["kind"] = kind
+    monkeypatch.setattr("src.middleware.adaptive_limiter.enforce_pool_admission", AsyncMock())
     for name in ("get_job", "cancel_job", "cancel_state", "finish_cancelled",
                  "mark_done", "mark_error", "heartbeat", "update_progress"):
         monkeypatch.setattr(store_client, name, getattr(st, name))
@@ -162,7 +192,17 @@ async def test_delete_beendet_cli_samt_kind(tmp_path, monkeypatch, weg):
         return "written"
 
     monkeypatch.setattr("src.activity.ai_call_writer.persist_ai_call_activity", persist)
-    registry.register_executor("chat", executors.chat_executor)
+    registry.register_executor(kind, {
+        "chat": executors.chat_executor,
+        "research": executors.research_executor,
+        "doc-agent": executors.doc_agent_executor,
+    }[kind])
+    body = {
+        "chat": BODY,
+        "research": {"query": "stub review", "model": BODY["model"]},
+        "doc-agent": {"question": "stub review", "model": BODY["model"],
+                      "files": [{"name": "a.txt", "content": "stub"}]},
+    }[kind]
     port = _port()
     monkeypatch.setattr(executors, "SELF_BASE_URL", f"http://127.0.0.1:{port}")
 
@@ -189,7 +229,7 @@ async def test_delete_beendet_cli_samt_kind(tmp_path, monkeypatch, weg):
                 break
             await asyncio.sleep(0.05)
         assert server.started
-        lauf = asyncio.ensure_future(registry._run_body(JOB, "chat", BODY, ATTR))
+        lauf = asyncio.ensure_future(registry._run_body(JOB, kind, body, ATTR))
         for _ in range(200):
             if pids.exists() and pids.read_text().strip():
                 break
@@ -206,25 +246,25 @@ async def test_delete_beendet_cli_samt_kind(tmp_path, monkeypatch, weg):
             transport=httpx.ASGITransport(app=app), base_url="http://bridge"
         ) as c:
             resp = await c.delete(f"/v1/jobs/{JOB}", headers=OWNER)
+        weg_nach = time.monotonic() - t0
         assert resp.status_code == 200, resp.text
         assert resp.json()["status"] == "cancelled"
-
-        for _ in range(200):
-            if not (_lebt(cli_pid) or _lebt(kind_pid)):
-                break
-            await asyncio.sleep(0.05)
-        weg_nach = time.monotonic() - t0
-        assert not _lebt(cli_pid), "CLI survived the job cancel"
-        assert not _lebt(kind_pid), "the CLI's child survived the job cancel"
+        cli_lebt, kind_lebt = _lebt(cli_pid), _lebt(kind_pid)
+        gebucht = [(r["status"], r["input_tokens"]) for r in ledger]
+        print(f"\nAT_200 {kind} {weg}: {weg_nach:.2f}s cli_alive={cli_lebt} "
+              f"child_alive={kind_lebt} ledger={gebucht}")
+        # FK25BR Befund 2, inverted: at 200 the work IS over and booked.
+        assert not cli_lebt, "200 while the CLI still lives"
+        assert not kind_lebt, "200 while the CLI's child still lives"
+        assert [r["error_code"] for r in ledger] == ["job_cancelled"], ledger
+        (row,) = ledger
+        assert (row["status"], row["model"], row["input_tokens"], row["output_tokens"]) == (
+            "undelivered", "claude-sonnet-5-5", 111, 22,
+        ), row
+        assert row["provider_meta"]["offener_zug_unbekannt"] is True
         assert weg_nach < 8.0, weg_nach
         await asyncio.wait_for(lauf, 5)
         assert st.row["status"] == "cancelled"
-        for _ in range(100):
-            if ledger:
-                break
-            await asyncio.sleep(0.05)
-        assert [r["error_code"] for r in ledger] == ["job_cancelled"]
-        print(f"\nFK25B {weg}: CLI + Kind weg {weg_nach:.2f}s nach DELETE")
     finally:
         if lauf is not None and not lauf.done():
             lauf.cancel()

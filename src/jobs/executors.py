@@ -135,6 +135,21 @@ async def _post_self(client, path: str, body: Dict[str, Any], headers: Dict[str,
         ) from e
 
 
+def _raise_if_cancel_confirmed(response: Any, path: str) -> None:
+    """The endpoint stopped this job's run on its owner's cancel, waited for
+    it to end and booked it (FK25B2, src/jobs/selbstaufruf.py). The runner
+    closes the row as 'cancelled' (registry._ausfuehren)."""
+    from src.jobs.selbstaufruf import ABBRUCH_HEADER, BESTAETIGT, JobLaufAbgebrochen
+
+    if response.headers.get(ABBRUCH_HEADER) != BESTAETIGT:
+        return
+    try:
+        bericht = response.json().get("job_abbruch") or {}
+    except Exception:
+        bericht = {}
+    raise JobLaufAbgebrochen({"path": path, **bericht})
+
+
 def _raise_if_dependency_unavailable(response: Any, path: str) -> None:
     """The endpoint said: "a dependency did not answer, nothing was decided".
     Raise that as a 424, whatever the HTTP status: research answers it with
@@ -409,9 +424,10 @@ def _build_headers(attribution: Optional[Dict[str, Any]]) -> Dict[str, str]:
                 headers[hdr] = str(val)
     if "X-App-ID" not in headers:
         headers["X-Client-ID"] = _SELFCALL_CLIENT_ID
-    # FK25B: marks the self-call of a running job, so the endpoint stops the
-    # run when the job is cancelled (the runner closes this connection).
-    from src.jobs.registry import JOB_LAUF_HEADER, laufender_job
+    # FK25B: marks the self-call of a stoppable job, so the endpoint stops the
+    # run when the job is cancelled (src/jobs/selbstaufruf.py).
+    from src.jobs.registry import laufender_job
+    from src.jobs.selbstaufruf import JOB_LAUF_HEADER
 
     job_id = laufender_job()
     if job_id:
@@ -441,6 +457,7 @@ async def chat_executor(
             client, "/v1/chat/completions", body, headers
         )
 
+    _raise_if_cancel_confirmed(response, "/v1/chat/completions")
     _raise_if_dependency_unavailable(response, "/v1/chat/completions")
     if response.status_code >= 400:
         # Surface the upstream status + a trimmed body so the job error is actionable.
@@ -513,6 +530,7 @@ async def _self_post_json(
     async with httpx.AsyncClient(timeout=timeout_s) as client:
         response, rejection = await _post_self(client, path, body, headers)
 
+    _raise_if_cancel_confirmed(response, path)
     _raise_if_dependency_unavailable(response, path)
     if response.status_code >= 400:
         raise _http_error(

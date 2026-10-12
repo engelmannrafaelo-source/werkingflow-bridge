@@ -82,6 +82,10 @@ def resilient_parse_message(
         parsed = original_parse_message(data)
         if parsed is not None and isinstance(data, dict):
             _retain_cli_end_fields(parsed, data)
+            # FK25B2: usage of completed model calls, for a job cancel's row.
+            from src.jobs.teilverbrauch import aus_cli_nachricht
+
+            aus_cli_nachricht(data)
         return parsed
     except MessageParseError as error:
         if "unknown message type" not in str(error).lower():

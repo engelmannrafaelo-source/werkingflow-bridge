@@ -4,14 +4,15 @@ Befund 12.10.2026 (Energy cancel, deploy window, orphans): a DELETE on a
 running job only recorded the wish (BR10b, 409). The worker ran the job to
 the end — up to 40 min, paid for, result discarded, capacity held.
 
-The contract now, for chat/research/doc-agent:
+The contract now, for chat/research/doc-agent (FK25B2: decided and
+confirmed by the endpoint that runs the work, src/jobs/selbstaufruf.py):
 
-  own + running → the wish is stored, the running worker stops the run
-                  (directly when the DELETE reaches it, else within its
-                  poll), its self-call's endpoint cancels the CLI run, the
-                  row ends 'cancelled', the ledger notes job_cancelled
-                  → 200 cancelled (202 while still being stopped; 409
-                  job_terminal when it finished first)
+  own + running → the wish is stored; the self-call's endpoint sees it
+                  (directly when the DELETE reaches its worker, else within
+                  its poll), stops the CLI run, waits for it to end, books
+                  the stop and confirms; only then the runner closes the row
+                  'cancelled' → 200 cancelled (202 while not yet confirmed;
+                  409 job_terminal when it finished first — its result kept)
   foreign       → 404, nothing stored, nothing stopped
   replay        → the same key after the cancel answers the cancelled job
   other kinds   → BR10b unchanged (erkunder: its run is not in this worker)
@@ -55,13 +56,33 @@ import uvicorn  # noqa: E402
 import src.claude_cli as claude_cli  # noqa: E402
 import src.main as main  # noqa: E402
 from src.claude_cli import ClaudeCodeCLI  # noqa: E402
-from src.jobs import executors, registry, routes, store, store_client  # noqa: E402
+from src.jobs import executors, registry, routes, selbstaufruf, store, store_client  # noqa: E402
 from tests import sdk_strom as sdk  # noqa: E402
 
 HOME = "dev"
 JOB = f"job_{HOME}_{'0123456789abcdef' * 2}"
 OWNER_HEADERS = {"X-App-ID": "werking-energy", "X-User-ID": "user-a"}
-OWNER_ATTR = {"app_id": "werking-energy", "user_id": "user-a", "bridge_origin": "dev"}
+
+
+def _eigentuemer(headers: Dict[str, str]) -> str:
+    """The owner POST /v1/jobs binds for a caller with these headers
+    (shared key, no principal) — routes._idempotency_owner (FK25B2)."""
+    from starlette.requests import Request
+
+    from src.main import extract_attribution_context
+
+    req = Request({
+        "type": "http",
+        "headers": [(k.lower().encode(), v.encode()) for k, v in headers.items()],
+    })
+    with patch.object(routes, "_attribution_extractor", extract_attribution_context):
+        return routes._idempotency_owner(req)
+
+
+OWNER_ATTR = {
+    "app_id": "werking-energy", "user_id": "user-a", "bridge_origin": "dev",
+    registry.EIGENTUEMER_KEY: _eigentuemer(OWNER_HEADERS),
+}
 FOREIGN_HEADERS = {"X-App-ID": "werking-energy", "X-User-ID": "user-b"}
 BODY = {
     "model": "claude-sonnet-5-5",
@@ -150,7 +171,7 @@ def mem(monkeypatch):
     monkeypatch.setattr(routes, "_attribution_extractor", extract_attribution_context)
     monkeypatch.setattr(routes, "JOB_CANCEL_WAIT_S", 5.0)
     monkeypatch.setattr(routes, "JOB_CANCEL_WAIT_TICK_S", 0.05)
-    monkeypatch.setattr(registry, "JOB_CANCEL_POLL_S", 0.2)
+    monkeypatch.setattr(selbstaufruf, "JOB_CANCEL_POLL_S", 0.2)
     for name in (
         "get_job", "cancel_job", "cancel_state", "finish_cancelled",
         "mark_done", "mark_error", "heartbeat", "update_progress",
@@ -309,24 +330,26 @@ async def test_delete_stoppt_den_laufenden_job_auf_diesem_worker(welt):
     assert resp.status_code == 200, resp.text
     assert resp.json() == {"job_id": JOB, "status": "cancelled"}
     assert dauer < 3.0, dauer
-    assert await _bis(lambda: "abgebrochen" in welt.lauf.ereignisse, 5), welt.lauf.ereignisse
+    # FK25B2: 200 means the run HAS ended and the stop IS booked — not later.
+    assert "abgebrochen" in welt.lauf.ereignisse, welt.lauf.ereignisse
+    assert [r["error_code"] for r in welt.ledger] == ["job_cancelled"]
     assert "ende" not in welt.lauf.ereignisse
     await asyncio.wait_for(task, 5)
     assert welt.mem.rows[JOB]["status"] == "cancelled"
     assert not welt.mem.ops("mark_done") and not welt.mem.ops("mark_error")
-    assert JOB not in registry._LAUFENDE
+    assert JOB not in selbstaufruf._LAUFENDE
 
 
 async def test_delete_auf_anderem_worker_wirkt_ueber_den_store(welt, monkeypatch):
     """The DELETE reaches another worker of the bridge: no local wake-up, the
-    running worker sees the stored wish within its poll."""
+    endpoint running the work sees the stored wish within its poll."""
     monkeypatch.setattr(routes, "abbruch_melden", lambda job_id: False)
     task = await _laufenden_job_starten(welt)
     resp = await _delete(JOB, OWNER_HEADERS)
     assert (resp.status_code, resp.json()["status"]) == (200, "cancelled"), resp.text
     assert await _bis(lambda: "abgebrochen" in welt.lauf.ereignisse, 5)
     await asyncio.wait_for(task, 5)
-    assert welt.mem.ops("cancel_state"), "the runner never asked the store"
+    assert welt.mem.ops("cancel_state"), "the endpoint never asked the store"
 
 
 async def test_ledger_vermerkt_den_abbruch(welt):
@@ -335,15 +358,64 @@ async def test_ledger_vermerkt_den_abbruch(welt):
     await asyncio.wait_for(task, 5)
     assert await _bis(lambda: welt.ledger, 5), "no ledger row for the stopped run"
     (row,) = welt.ledger
+    # Nothing measured (the stand-in reports no model call before the stop):
+    # 'error', 0 tokens — and the row says the in-flight call is unknown.
     assert row["status"] == "error"
     assert row["error_code"] == "job_cancelled"
     assert row["provider"] == "anthropic"  # routed to the pool before the stop
     assert (row["input_tokens"], row["output_tokens"]) == (0, 0)
     assert row["provider_meta"] == {
-        "job_id": JOB, "endpunkt": "/v1/chat/completions", "usage_bekannt": False,
+        "job_id": JOB, "endpunkt": "/v1/chat/completions", "verbrauch": "unbekannt",
+        "gemessene_zuege": 0, "offener_zug_unbekannt": True,
     }
     assert (row["app_id"], row["user_id"]) == ("werking-energy", "user-a")
-    assert "nicht gemessen" in row["error_message"]
+    assert "nicht messbar" in row["error_message"]
+
+
+async def test_ledger_bucht_gemessene_modellaufrufe(welt, monkeypatch):
+    """FK25BR Befund 5: model calls completed before the stop are booked at
+    their usage as 'undelivered' (cost-bearing), per model; the call in
+    flight is named unknown. The stand-in hands its messages to the same
+    collector hook the SDK parser calls (sdk_parser → teilverbrauch); that
+    the real parser does is tests/unit/test_job_cancel_fk25b_prozessende.py."""
+    from src.jobs import teilverbrauch
+
+    async def query(prompt, options):
+        welt.lauf.ereignisse.append("start")
+        for mid, model, usage in (
+            ("msg_1", "claude-sonnet-5-5", {"input_tokens": 1200, "output_tokens": 300,
+                                            "cache_read_input_tokens": 5000}),
+            ("msg_1", "claude-sonnet-5-5", {"input_tokens": 1200, "output_tokens": 340,
+                                            "cache_read_input_tokens": 5000}),
+            ("msg_2", "claude-haiku-4-5-20251001", {"input_tokens": 80, "output_tokens": 9}),
+        ):
+            teilverbrauch.aus_cli_nachricht(
+                {"type": "assistant", "message": {"id": mid, "model": model, "usage": usage}}
+            )
+        try:
+            yield sdk.init()
+            await asyncio.sleep(LAUF_S)
+        except (asyncio.CancelledError, GeneratorExit):
+            welt.lauf.ereignisse.append("abgebrochen")
+            raise
+
+    monkeypatch.setattr(claude_cli, "query", query)
+    task = await _laufenden_job_starten(welt)
+    resp = await _delete(JOB, OWNER_HEADERS)
+    assert resp.status_code == 200, resp.text
+    await asyncio.wait_for(task, 5)
+    rows = {r["model"]: r for r in welt.ledger}
+    assert set(rows) == {"claude-sonnet-5-5", "claude-haiku-4-5-20251001"}
+    sonnet = rows["claude-sonnet-5-5"]
+    assert sonnet["status"] == "undelivered"
+    assert (sonnet["input_tokens"], sonnet["output_tokens"], sonnet["cache_read_tokens"]) == (
+        1200, 340, 5000,  # one model call, the last report wins
+    )
+    assert sonnet["error_code"] == "job_cancelled"
+    assert sonnet["provider_meta"]["verbrauch"] == "teilweise_gemessen"
+    assert sonnet["provider_meta"]["gemessene_zuege"] == 2
+    assert sonnet["provider_meta"]["offener_zug_unbekannt"] is True
+    assert rows["claude-haiku-4-5-20251001"]["input_tokens"] == 80
 
 
 async def test_fremder_eigentuemer_404_und_der_lauf_geht_weiter(welt):
@@ -417,17 +489,33 @@ async def test_erkunder_bleibt_bei_br10b(mem):
     assert not mem.ops("cancel_state")
 
 
-async def test_platform_api_ohne_route_antwortet_wie_vorher(mem, monkeypatch):
+async def test_platform_api_ohne_route_ist_laut(mem, monkeypatch):
+    """FK25BR Befund 4: never BR10b's 409 in disguise — 502 that names it."""
     async def fehlt(job_id):
-        raise store_client.CancelRouteMissing("no route")
+        raise store_client.CancelRouteMissing("no cancel-state route")
 
     monkeypatch.setattr(store_client, "cancel_state", fehlt)
     mem.add(JOB, "running")
     resp = await _delete(JOB, OWNER_HEADERS)
     err = resp.json()["error"]
+    assert (resp.status_code, err["code"], err["cancel_requested"], err["status"]) == (
+        502, "job_store_incompatible", True, "running",
+    )
+    assert "no cancel-state route" in err["message"]
+    assert err["retryable"] is False
+
+
+async def test_unbundener_altjob_bleibt_bei_br10b(mem):
+    """A row from before FK25B2 has no bound owner: its run is not stopped,
+    DELETE records the wish as BR10b did."""
+    attr = {k: v for k, v in OWNER_ATTR.items() if k != registry.EIGENTUEMER_KEY}
+    mem.add(JOB, "running", attribution=attr)
+    resp = await _delete(JOB, OWNER_HEADERS)
+    err = resp.json()["error"]
     assert (resp.status_code, err["code"], err["cancel_requested"]) == (
         409, "job_already_running", True,
     )
+    assert not mem.ops("cancel_state")
 
 
 async def test_replay_nach_dem_abbruch_nennt_den_abgebrochenen_job(mem, monkeypatch):
@@ -465,63 +553,86 @@ async def test_replay_nach_dem_abbruch_nennt_den_abgebrochenen_job(mem, monkeypa
 # ---------------------------------------------------------------------------
 
 
-async def test_selbstaufruf_traegt_die_jobmarke_nur_im_joblauf(mem):
+async def test_selbstaufruf_traegt_die_jobmarke_nur_im_joblauf(mem, monkeypatch):
+    """Marked: the self-call of a stoppable kind with a bound owner. Not: any
+    other kind (a proxy job calling a chat path stays BR10b), an unbound
+    (pre-FK25B2) job, a call outside a job."""
     seen = {}
 
     async def executor(payload, attribution, report_progress):
-        seen["headers"] = executors._build_headers(attribution)
+        seen.setdefault("headers", []).append(executors._build_headers(attribution))
         return {"ok": True}
 
-    registry.register_executor("fk25b-probe", executor)
-    mem.add(JOB, "running", kind="fk25b-probe")
-    await registry._run_body(JOB, "fk25b-probe", {}, OWNER_ATTR)
-    assert seen["headers"][registry.JOB_LAUF_HEADER] == JOB
-    assert registry.JOB_LAUF_HEADER not in executors._build_headers(OWNER_ATTR)
+    unbound = {k: v for k, v in OWNER_ATTR.items() if k != registry.EIGENTUEMER_KEY}
+    monkeypatch.setitem(registry._EXECUTORS, "chat", executor)
+    monkeypatch.setitem(registry._EXECUTORS, "proxy", executor)
+    for kind, attr in (("chat", OWNER_ATTR), ("proxy", OWNER_ATTR), ("chat", unbound)):
+        mem.add(JOB, "running", kind=kind)
+        await registry._run_body(JOB, kind, {}, attr)
+    marks = [h.get(selbstaufruf.JOB_LAUF_HEADER) for h in seen["headers"]]
+    assert marks == [JOB, None, None]
+    assert selbstaufruf.JOB_LAUF_HEADER not in executors._build_headers(OWNER_ATTR)
 
 
-async def test_ergebnis_im_selben_moment_wird_behalten(mem):
-    """The run completes in the instant it is stopped: its paid result is kept."""
-    gestartet = asyncio.Event()
+async def test_ohne_bestaetigung_bleibt_der_job_im_lauf(mem, monkeypatch):
+    """The runner never closes the row on its own: without the endpoint's
+    confirmation the row stays running (DELETE says 202) until the run ends."""
+    monkeypatch.setattr(routes, "JOB_CANCEL_WAIT_S", 0.3)
+    halt = asyncio.Event()
 
     async def executor(payload, attribution, report_progress):
-        gestartet.set()
-        try:
-            await asyncio.sleep(LAUF_S)
-        except asyncio.CancelledError:
-            return {"schon": "fertig"}
-        return {}
+        await halt.wait()
+        return {"ok": True}
 
-    registry.register_executor("chat", executor)
-    try:
-        mem.add(JOB, "running")
-        task = asyncio.ensure_future(registry._run_body(JOB, "chat", {}, OWNER_ATTR))
-        await gestartet.wait()
-        mem.rows[JOB]["cancel_requested"] = True
-        registry.abbruch_melden(JOB)
-        await asyncio.wait_for(task, 5)
-    finally:
-        registry.register_executor("chat", executors.chat_executor)
+    monkeypatch.setitem(registry._EXECUTORS, "chat", executor)
+    mem.add(JOB, "running")
+    task = asyncio.ensure_future(registry._run_body(JOB, "chat", {}, OWNER_ATTR))
+    resp = await _delete(JOB, OWNER_HEADERS)
+    assert resp.status_code == 202 and mem.rows[JOB]["status"] == "running"
+    halt.set()
+    await asyncio.wait_for(task, 5)
     assert mem.rows[JOB]["status"] == "done"
-    assert mem.rows[JOB]["result"] == {"schon": "fertig"}
     assert not mem.ops("finish_cancelled")
 
 
-async def test_wache_endet_nicht_den_lauf_wenn_der_store_hakt(mem, monkeypatch):
-    """A failing poll is logged, never read as a cancel."""
+async def test_finish_route_fehlt_endet_laut(mem, monkeypatch):
+    """FK25BR Befund 4 (finish-cancelled missing): the run was stopped; the
+    row ends 'error' JOB_STORE_INCOMPATIBLE, DELETE answers 502 — never a
+    'running' row nobody runs, never 202."""
+    monkeypatch.setattr(
+        store_client, "finish_cancelled",
+        AsyncMock(side_effect=store_client.CancelRouteMissing("no finish-cancelled route")),
+    )
+
+    async def executor(payload, attribution, report_progress):
+        while not mem.rows[JOB]["cancel_requested"]:
+            await asyncio.sleep(0.02)
+        raise selbstaufruf.JobLaufAbgebrochen({"grund": "job_cancelled"})
+
+    monkeypatch.setitem(registry._EXECUTORS, "chat", executor)
+    mem.add(JOB, "running")
+    task = asyncio.ensure_future(registry._run_body(JOB, "chat", {}, OWNER_ATTR))
+    resp = await _delete(JOB, OWNER_HEADERS)
+    await asyncio.wait_for(task, 5)
+    err = resp.json()["error"]
+    assert (resp.status_code, err["code"], err["status"]) == (
+        502, "job_store_incompatible", "error",
+    )
+    assert mem.rows[JOB]["status"] == "error"
+    assert mem.rows[JOB]["error"]["code"] == "JOB_STORE_INCOMPATIBLE"
+
+
+async def test_aufsicht_endet_nicht_den_lauf_wenn_der_store_hakt(welt, monkeypatch):
+    """A failing poll at the endpoint is logged, never read as a cancel."""
     async def kaputt(job_id):
         raise RuntimeError("platform-api hiccup")
 
     monkeypatch.setattr(store_client, "cancel_state", kaputt)
-
-    async def executor(payload, attribution, report_progress):
-        await asyncio.sleep(0.8)
-        return {"ok": True}
-
-    registry.register_executor("fk25b-probe", executor)
-    mem.add(JOB, "running", kind="chat")
-    with patch.object(registry, "get_executor", lambda kind: executor):
-        await registry._run_body(JOB, "chat", {}, OWNER_ATTR)
-    assert mem.rows[JOB]["status"] == "done"
+    monkeypatch.setattr(sys.modules[__name__], "LAUF_S", 1.0)
+    task = await _laufenden_job_starten(welt)
+    await asyncio.wait_for(task, 10)
+    assert welt.lauf.ereignisse == ["start", "ende"]
+    assert welt.mem.rows[JOB]["status"] == "done"
 
 
 # ---------------------------------------------------------------------------
@@ -646,7 +757,6 @@ async def test_pg_laufender_chatjob_endet_cancelled_und_kommt_nie_wieder(pg_stor
     monkeypatch.setattr(routes, "verify_api_key", AsyncMock(return_value=True))
     monkeypatch.setattr(routes, "_require_enabled", lambda: None)
     monkeypatch.setattr(routes, "_attribution_extractor", extract_attribution_context)
-    monkeypatch.setattr(registry, "JOB_CANCEL_POLL_S", 0.2)
     for name in (
         "get_job", "cancel_job", "cancel_state", "finish_cancelled", "mark_running",
         "defer_job", "heartbeat", "update_progress", "mark_done", "mark_error",
@@ -657,17 +767,17 @@ async def test_pg_laufender_chatjob_endet_cancelled_und_kommt_nie_wieder(pg_stor
     ende = []
 
     async def executor(payload, attribution, report_progress):
+        # Stands for the self-call: its endpoint sees the stored wish, stops
+        # the run and confirms (selbstaufruf; over a socket in section 1).
         gestartet.set()
-        try:
-            await asyncio.sleep(LAUF_S)
-        except asyncio.CancelledError:
-            ende.append("abgebrochen")
-            raise
-        return {}
+        while not (await store.cancel_state(JOB))["cancel_requested"]:
+            await asyncio.sleep(0.05)
+        ende.append("abgebrochen")
+        raise selbstaufruf.JobLaufAbgebrochen({"grund": "job_cancelled"})
 
     calls = AsyncMock(side_effect=executor)
     monkeypatch.setitem(registry._EXECUTORS, "chat", calls)
-    await br10._insert(pg_store, JOB, "pending")
+    await br10._insert(pg_store, JOB, "pending", attribution=OWNER_ATTR)
     lauf = asyncio.ensure_future(registry.run_generic_job(JOB, "chat", {}, OWNER_ATTR))
     await asyncio.wait_for(gestartet.wait(), 5)
     resp = await _delete(JOB, OWNER_HEADERS)

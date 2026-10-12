@@ -28,10 +28,14 @@ import asyncio
 import contextvars
 import logging
 import os
-import time
 from typing import Any, Awaitable, Callable, Dict, List, Optional
 
-from src.error_contract import job_code_fields, job_error_fields, job_usage_fields
+from src.error_contract import (
+    JOB_CODE_STORE_INCOMPATIBLE,
+    job_code_fields,
+    job_error_fields,
+    job_usage_fields,
+)
 from src.jobs import store_client
 from src.jobs.store import JOB_STATUS_CANCELLED
 
@@ -184,77 +188,44 @@ def _capacity_retry_delay(exc: "Exception") -> int:
 
 
 # ---------------------------------------------------------------------------
-# Cancelling a RUNNING job (FK25B)
+# Cancelling a RUNNING job (FK25B, FK25B2)
 # ---------------------------------------------------------------------------
 # Before FK25B a DELETE on a running job only recorded the wish (BR10b); the
 # run went on for up to 40 min, was paid for, and its result was thrown away
-# (12.10.2026: Energy cancel, deploy window, orphans). Now the worker running
-# the job watches for the wish and stops the run:
+# (12.10.2026: Energy cancel, deploy window, orphans).
 #
-#   * the executor task is cancelled — its self-call's connection closes;
-#   * the self-called endpoint runs under supervision for job self-calls
-#     (src/chat_weiterleitung.job_lauf_unter_aufsicht, marked by JOB_LAUF_HEADER):
-#     a closed connection cancels the run, and the CLI with its children ends
-#     through the bounded close (claude_cli, BRLZR R2);
-#   * the row becomes 'cancelled' (store.finish_cancelled).
+# The run is stopped where it runs: in the self-called endpoint
+# (src/jobs/selbstaufruf.py). It watches for the wish, stops the run, waits
+# for the CLI to end, books the stop and only then answers with its
+# confirmation (selbstaufruf.ABBRUCH_HEADER). The runner here does NOT cancel
+# its request — it waits for that answer like for any other:
 #
-# Which worker runs the job is not known to the one the DELETE reaches, so the
-# wish travels through the store: the running worker asks every
-# JOB_CANCEL_POLL_S. When the DELETE lands on the running worker itself, the
-# route wakes the run directly (abbruch_melden) — no poll delay.
+#   * confirmation → the row becomes 'cancelled' (store.finish_cancelled);
+#   * a result (the run finished in the same instant) → 'done', as always.
 #
-# Only kinds whose executor is a self-call to a supervised endpoint can be
-# stopped this way. Every other kind (erkunder: its run lives in the
-# coordinator, not here; ping/proxy/pdf: short, no model) keeps BR10b.
+# FK25B cancelled the request from this side instead; the endpoint then
+# learned of it only from the closed socket, so DELETE could say 200 while
+# the CLI still ran and nothing was booked, and a result completed in that
+# instant was lost (FK25BR Befunde 2 und 3).
+#
+# Only kinds whose executor is ONE self-call to a supervised endpoint are
+# stopped this way, and only their self-call is marked (JOB_LAUF_HEADER).
+# Every other kind (erkunder: its run lives in the coordinator, not here;
+# ping/proxy/pdf: short, no model — a proxy job calling a chat path stays
+# unmarked) keeps BR10b.
 JOB_ABBRECHBAR_IM_LAUF = frozenset({"chat", "research", "doc-agent"})
-JOB_CANCEL_POLL_S = float(os.getenv("BRIDGE_JOB_CANCEL_POLL_S", "2"))
-# Marks a job's self-call; carries the job id (executors._build_headers).
-JOB_LAUF_HEADER = "X-Bridge-Job-Lauf"
+# attribution key of the owner bound at submit (routes._caller_owns, FK25B2).
+# A job without it (submitted before FK25B2) is not stopped in its run.
+EIGENTUEMER_KEY = "eigentuemer"
 
 _job_lauf: "contextvars.ContextVar[Optional[str]]" = contextvars.ContextVar(
     "bridge_job_lauf", default=None
 )
-# job id → event of the run on THIS worker (set = stop it).
-_LAUFENDE: Dict[str, asyncio.Event] = {}
 
 
 def laufender_job() -> Optional[str]:
-    """Id of the job whose body runs in this task, else None."""
+    """Id of the stoppable job whose body runs in this task, else None."""
     return _job_lauf.get()
-
-
-def abbruch_melden(job_id: str) -> bool:
-    """Wake the run of ``job_id`` if it runs on THIS worker. True when it did."""
-    event = _LAUFENDE.get(job_id)
-    if event is None:
-        return False
-    event.set()
-    return True
-
-
-async def _abbruch_wache(job_id: str, kind: str, event: asyncio.Event) -> None:
-    """Returns once the job's owner asked to cancel it (local wake-up or the
-    store's wish). Runs until cancelled otherwise."""
-    while True:
-        try:
-            await asyncio.wait_for(event.wait(), timeout=JOB_CANCEL_POLL_S)
-            return
-        except asyncio.TimeoutError:
-            pass
-        try:
-            state = await store_client.cancel_state(job_id)
-        except store_client.CancelRouteMissing as e:
-            logger.error(
-                f"🛑 Async job {job_id} (kind={kind}): cannot watch for a cancel — {e}. "
-                f"Only a DELETE on this worker can stop it now."
-            )
-            await event.wait()
-            return
-        except Exception as e:  # a failed poll must not end the run
-            logger.warning(f"⚠️ cancel poll failed for job {job_id}: {e}")
-            continue
-        if state is not None and state.get("cancel_requested"):
-            return
 
 
 def job_code_fields_for(code: str) -> Dict[str, Any]:
@@ -440,69 +411,46 @@ async def _ausfuehren(
     attribution: Optional[Dict[str, Any]],
     report_progress: Callable[[Dict[str, Any]], Awaitable[None]],
 ) -> Any:
-    """Run the executor; for JOB_ABBRECHBAR_IM_LAUF kinds stop it when its
-    owner cancels (FK25B). Returns the executor's result, or _ABGEBROCHEN
-    when the run was stopped (the row is then 'cancelled'). The executor's
-    own exceptions propagate unchanged."""
-    token = _job_lauf.set(job_id)  # copied into the executor task below
+    """Run the executor. Returns its result, or _ABGEBROCHEN when the endpoint
+    confirmed it stopped the run on the owner's cancel (FK25B2). The
+    executor's own exceptions propagate unchanged."""
+    from src.jobs.selbstaufruf import JobLaufAbgebrochen
+
+    if kind not in JOB_ABBRECHBAR_IM_LAUF or not (attribution or {}).get(EIGENTUEMER_KEY):
+        return await executor(payload, attribution, report_progress)
+    token = _job_lauf.set(job_id)
     try:
-        if kind not in JOB_ABBRECHBAR_IM_LAUF:
-            return await executor(payload, attribution, report_progress)
-        event = asyncio.Event()
-        _LAUFENDE[job_id] = event
-        lauf = asyncio.ensure_future(executor(payload, attribution, report_progress))
-        wache = asyncio.ensure_future(_abbruch_wache(job_id, kind, event))
-        try:
-            await asyncio.wait({lauf, wache}, return_when=asyncio.FIRST_COMPLETED)
-            if lauf.done():
-                return lauf.result()
-            beginn = time.monotonic()
-            logger.warning(
-                f"🛑 Async job {job_id} (kind={kind}): its owner cancelled it — "
-                f"stopping the run"
-            )
-            lauf.cancel()
-            try:
-                result = await lauf
-            except asyncio.CancelledError:
-                pass
-            except Exception as e:  # noqa: BLE001 — the run's own end, while being stopped
-                logger.info(f"Async job {job_id}: run ended with {e!r} while being stopped")
-            else:
-                # Finished in the same instant: the work is done and paid for,
-                # its result is kept rather than thrown away.
-                logger.warning(
-                    f"Async job {job_id}: run finished before the cancel took "
-                    f"effect — keeping its result"
-                )
-                return result
-            await _als_abgebrochen_schliessen(job_id, kind, time.monotonic() - beginn)
-            return _ABGEBROCHEN
-        finally:
-            wache.cancel()
-            if not lauf.done():
-                lauf.cancel()  # our own task was cancelled (shutdown): take the run along
-            if _LAUFENDE.get(job_id) is event:
-                del _LAUFENDE[job_id]
+        return await executor(payload, attribution, report_progress)
+    except JobLaufAbgebrochen as e:
+        await _als_abgebrochen_schliessen(job_id, kind, e.bericht)
+        return _ABGEBROCHEN
     finally:
         _job_lauf.reset(token)
 
 
-async def _als_abgebrochen_schliessen(job_id: str, kind: str, dauer_s: float) -> None:
+async def _als_abgebrochen_schliessen(
+    job_id: str, kind: str, bericht: Dict[str, Any]
+) -> None:
+    """The endpoint stopped the run and booked it; close the row."""
     try:
         changed = await store_client.finish_cancelled(job_id)
     except store_client.CancelRouteMissing as e:
-        # The heartbeat stops with this run; the watchdog closes a row with
-        # a recorded wish as 'cancelled' after the stale window (BR10b).
+        # Fail loud, never a row that reads 'running' for a run that ended:
+        # the DELETE route reports this code as 502 job_store_incompatible.
         logger.error(
-            f"🛑 Async job {job_id} (kind={kind}) stopped, but {e} — the watchdog "
-            f"closes it as 'cancelled' after the stale window"
+            f"🛑 Async job {job_id} (kind={kind}) stopped on its owner's cancel, but {e}"
+        )
+        await store_client.mark_error(
+            job_id,
+            f"Run stopped on its owner's cancel and booked ({bericht}), but the "
+            f"job store cannot record 'cancelled': {e}",
+            **job_code_fields_for(JOB_CODE_STORE_INCOMPATIBLE),
         )
         return
     if changed:
         logger.warning(
-            f"🛑 Async job {job_id} (kind={kind}) cancelled while running — run "
-            f"stopped {dauer_s:.1f}s after the cancel was seen"
+            f"🛑 Async job {job_id} (kind={kind}) cancelled while running — "
+            f"stopped and booked by the endpoint ({bericht})"
         )
         return
     try:
@@ -510,8 +458,9 @@ async def _als_abgebrochen_schliessen(job_id: str, kind: str, dauer_s: float) ->
     except Exception as e:  # noqa: BLE001 — only feeds the log line below
         state = f"unreadable: {e}"
     logger.error(
-        f"🛑 Async job {job_id} (kind={kind}) stopped, but its row was not closed "
-        f"as 'cancelled' (now: {state}) — no recorded cancel on a running row"
+        f"🛑 Async job {job_id} (kind={kind}) stopped by the endpoint ({bericht}), "
+        f"but its row was not closed as 'cancelled' (now: {state}) — no recorded "
+        f"cancel on a running row"
     )
 
 

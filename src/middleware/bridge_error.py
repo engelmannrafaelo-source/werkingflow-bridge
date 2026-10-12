@@ -128,6 +128,8 @@ REASON_JOB_HOME_UNCONFIGURED = "job_home_unconfigured"
 REASON_JOB_NOT_FOUND = "job_not_found"
 REASON_JOB_ALREADY_RUNNING = "job_already_running"
 REASON_JOB_TERMINAL = "job_terminal"
+# FK25B2 — the platform-api predates the routes a running job's cancel needs.
+REASON_JOB_STORE_INCOMPATIBLE = "job_store_incompatible"
 # BRREF2 — Idempotency-Key on POST /v1/jobs. Also carried in error.code.
 REASON_IDEMPOTENCY_KEY_REUSED = "idempotency_key_reused"
 REASON_IDEMPOTENCY_KEY_INVALID = "idempotency_key_invalid"
