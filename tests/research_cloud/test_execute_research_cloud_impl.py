@@ -403,3 +403,24 @@ async def test_executor_perplexity_tool_classifies_the_gate():
     with pytest.raises(ResearchCloudExecutorError) as ei:
         await _handle_perplexity_tool_call(block, MagicMock(), AsyncMock(return_value=" "), MagicMock())
     assert (ei.value.fehler_code, ei.value.retryable) == ("privacy_gate_failed", False)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("wert,mit_pruefung", [(False, False), (None, True), (True, True)])
+async def test_luecken_nachkontrolle_per_request(monkeypatch, wert, mit_pruefung):
+    """P6NOGAP: luecken_nachkontrolle=false hands the executor no gap check;
+    unset/true leaves the deployment setting in charge."""
+    monkeypatch.setenv("RESEARCH_PERPLEXITY_ENABLED", "true")
+    monkeypatch.setenv("PERPLEXITY_API_KEY", "pplx-test")
+    monkeypatch.setenv("BRIDGE_ANONYMIZE_ENABLED", "true")
+    monkeypatch.delenv("RESEARCH_LUECKEN_NACHKONTROLLE", raising=False)
+    req = _make_req(luecken_nachkontrolle=wert)
+    executor_mock = AsyncMock(return_value=_cloud_result())
+    with (
+        patch("src.research_cloud.anonymize_gate.anonymize_query_for_cloud", new=AsyncMock(return_value="x")),
+        patch("src.research_cloud.executor.run_research_cloud", executor_mock),
+        patch("src.activity.ai_call_writer.persist_ai_call_activity", new=AsyncMock()),
+        patch("src.scholarly.scholarly_enabled", return_value=False),
+    ):
+        await src.main._execute_research_cloud_impl(MagicMock(), req, attribution_ctx={})
+    assert (executor_mock.await_args.kwargs["nachkontrolle"] is not None) is mit_pruefung

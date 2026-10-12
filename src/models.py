@@ -617,6 +617,21 @@ class ResearchRequest(BaseModel):
         ),
     )
 
+    # Gap check per request (P6NOGAP, 12.10.2026). Default None = unchanged:
+    # the deployment flag RESEARCH_LUECKEN_NACHKONTROLLE decides. False = this
+    # request runs without the gap checker and without the return round — for
+    # callers that check the report themselves afterwards (Energy phase 6: its
+    # applicability check). A request can only switch it off, never on: the
+    # return round needs Perplexity, which only the deployment can provide.
+    luecken_nachkontrolle: Optional[bool] = Field(
+        default=None,
+        description=(
+            "Gap check for this request. false: no gap checker and no return round; the "
+            "response field nachkontrolle says status=uebersprungen with the reason. "
+            "null/true (default): the deployment setting decides."
+        ),
+    )
+
 
 class ErrorVerdictFields(BaseModel):
     """retryable / retry_after_s on endpoints that answer errors with HTTP 200
