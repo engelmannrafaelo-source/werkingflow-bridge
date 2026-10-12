@@ -5544,6 +5544,9 @@ async def _execute_research_impl(
     # once the stream is complete, reported on success and on error.
     research_antwort_ende: Optional[str] = None
     research_lauf_gestartet = False  # usage_fehlt: kein_lauf vs cli_ohne_usage
+    # perplexity_search of this run (pool path); its Sperrstand wins in the
+    # error path below over every other error (anonymize_gate.sperre_gewinnt).
+    pool_pplx = None
 
     try:
         logger.info(
@@ -6258,13 +6261,18 @@ async def _execute_research_impl(
         vermerken(vermerk_dir, auslieferbar=True, abschluss=research_abschluss)
         return antwort
 
-    except (WorkerUnavailableError, RateLimitError):
-        # Re-raise to trigger HTTP 503 and Nginx failover to another worker.
-        # RateLimitError: account limit — rate_limit_handler retries on another
-        # worker, else 429 with Retry-After; never a 200 status=error.
-        raise
-
     except Exception as e:
+        # Common exit of every round: a gate failure recorded during the run
+        # wins over whatever error ended it afterwards — a CLI API error on
+        # the next model turn, a missing report, an account limit
+        # (anonymize_gate.sperre_gewinnt). Then no other worker repeats the run.
+        from src.research_cloud.anonymize_gate import sperre_gewinnt
+        e = sperre_gewinnt(getattr(pool_pplx, "sperre", None), e)
+        if isinstance(e, (WorkerUnavailableError, RateLimitError)):
+            # Re-raise to trigger HTTP 503 and Nginx failover to another worker.
+            # RateLimitError: account limit — rate_limit_handler retries on another
+            # worker, else 429 with Retry-After; never a 200 status=error.
+            raise e
         execution_time = time.time() - start_time
         # The report on disk stays as a diagnostic artefact; the vermerk keeps
         # the download from serving it as a finished research.

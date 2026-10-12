@@ -33,7 +33,12 @@ from typing import Any, Awaitable, Callable, Dict, List, Optional
 import httpx
 
 from src.lauf_abschluss import LaufUnfertig, ModellAbbruch, abschluss_aus_stop_reason, annehmen
-from src.research_cloud.anonymize_gate import CloudAnonymizeError, Sperrstand, sperre_pruefen
+from src.research_cloud.anonymize_gate import (
+    CloudAnonymizeError,
+    Sperrstand,
+    sperre_gewinnt,
+    sperre_pruefen,
+)
 from src.research_cloud.library import (
     LibraryConfig,
     LibraryFetchError,
@@ -528,286 +533,294 @@ async def run_research_cloud(
     owns_pplx_client = perplexity_client is None and perplexity_enabled(perplexity_cfg)
     pplx_client = perplexity_client or (httpx.AsyncClient() if owns_pplx_client else None)
     try:
-        while True:
-            try:
-                for iteration in range(config.max_continuations):
-                    _mark_cache_control(messages)
-                    body: Dict[str, Any] = {
-                        "model": config.model,
-                        "max_tokens": config.max_tokens,
-                        "system": system,
-                        "thinking": {"type": "adaptive"},
-                        "tools": tools,
-                        "messages": messages,
-                    }
-                    if config.inference_geo:
-                        body["inference_geo"] = config.inference_geo
-                    if container_id:
-                        # web_search/web_fetch _20260209 run code-execution under the
-                        # hood; on pause_turn the pending tool uses live in this
-                        # container and the continuation MUST reference it, else 400
-                        # "container_id is required..." (eval-verified 2026-07-24).
-                        body["container"] = container_id
+        try:
+            while True:
+                try:
+                    for iteration in range(config.max_continuations):
+                        _mark_cache_control(messages)
+                        body: Dict[str, Any] = {
+                            "model": config.model,
+                            "max_tokens": config.max_tokens,
+                            "system": system,
+                            "thinking": {"type": "adaptive"},
+                            "tools": tools,
+                            "messages": messages,
+                        }
+                        if config.inference_geo:
+                            body["inference_geo"] = config.inference_geo
+                        if container_id:
+                            # web_search/web_fetch _20260209 run code-execution under the
+                            # hood; on pause_turn the pending tool uses live in this
+                            # container and the continuation MUST reference it, else 400
+                            # "container_id is required..." (eval-verified 2026-07-24).
+                            body["container"] = container_id
 
-                    response = await http_client.post(ANTHROPIC_API_URL, headers=headers, json=body)
-                    if response.status_code != 200:
-                        raise ResearchCloudExecutorError(
-                            f"research-cloud Messages API call failed: HTTP {response.status_code}: "
-                            f"{response.text[:500]}",
-                            status_code=response.status_code,
-                        )
-                    parsed = AnthropicMessagesResponse(**response.json())
+                        response = await http_client.post(ANTHROPIC_API_URL, headers=headers, json=body)
+                        if response.status_code != 200:
+                            raise ResearchCloudExecutorError(
+                                f"research-cloud Messages API call failed: HTTP {response.status_code}: "
+                                f"{response.text[:500]}",
+                                status_code=response.status_code,
+                            )
+                        parsed = AnthropicMessagesResponse(**response.json())
 
-                    if parsed.container:
-                        container_id = parsed.container.id
-                    if parsed.usage is None:
-                        logger.error(
-                            "research-cloud: Messages API response carries no usage — "
-                            "this round's tokens are not measured"
-                        )
-                        usage.add(ResearchCloudUsage(runden_ohne_usage=1))
-                    else:
-                        usage.add(
-                            ResearchCloudUsage(
-                                input_tokens=parsed.usage.input_tokens,
-                                output_tokens=parsed.usage.output_tokens,
-                                cache_read_input_tokens=parsed.usage.cache_read_input_tokens,
-                                cache_creation_input_tokens=parsed.usage.cache_creation_input_tokens,
-                                runden_gemessen=1,
+                        if parsed.container:
+                            container_id = parsed.container.id
+                        if parsed.usage is None:
+                            logger.error(
+                                "research-cloud: Messages API response carries no usage — "
+                                "this round's tokens are not measured"
                             )
-                        )
-                    for block in parsed.content:
-                        if block.get("type") == "server_tool_use":
-                            if block.get("name") == "web_search":
-                                searches += 1
-                            elif block.get("name") == "web_fetch":
-                                fetches += 1
-
-                    if parsed.stop_reason == "tool_use":
-                        # A pending client tool_use always yields stop_reason
-                        # "tool_use", never "pause_turn" — even if server_tool_use
-                        # blocks are also present in this same response (bridge-research
-                        # 2026-07-31, platform.claude.com/docs/.../handling-stop-reasons).
-                        # Only the client tools offered on THIS request are answerable;
-                        # anything else is a tool the model was never given (fail
-                        # loud, not a silent skip).
-                        tool_use_blocks = [b for b in parsed.content if b.get("type") == "tool_use"]
-                        if not tool_use_blocks:
-                            raise ResearchCloudExecutorError(
-                                "research-cloud executor got stop_reason=tool_use with no "
-                                f"client tool_use block in content: {parsed.content!r}"
-                            )
-                        # Fail fast on anything we cannot answer — an unanswered
-                        # client tool_use would otherwise surface later as an opaque
-                        # API 400 ("tool_use ids were found without tool_result").
-                        foreign = [b.get("name") for b in tool_use_blocks if b.get("name") not in client_tools]
-                        if foreign:
-                            raise ResearchCloudExecutorError(
-                                f"research-cloud executor cannot answer client tools {foreign!r} — "
-                                f"only {sorted(client_tools)} are defined on this request"
-                            )
-                        # Programmatic tool calling (caller != direct) would mean the
-                        # call comes from paused code in a server-side container whose
-                        # id we would have to echo back — a flow this executor
-                        # deliberately disables via allowed_callers=["direct"]. If it
-                        # shows up anyway, the API contract changed: stop loudly.
-                        ptc = [
-                            b.get("name") for b in tool_use_blocks
-                            if (b.get("caller") or {}).get("type") not in (None, "direct")
-                        ]
-                        if ptc:
-                            raise ResearchCloudExecutorError(
-                                f"research-cloud executor got programmatic (non-direct) tool calls "
-                                f"{ptc!r} despite allowed_callers=['direct'] — refusing to continue "
-                                f"a container flow whose id the API did not expose"
-                            )
-                        tool_results = []
-                        for tool_block in tool_use_blocks:
-                            t_start = time.monotonic()
-                            if tool_block.get("name") == PERPLEXITY_TOOL_NAME:
-                                if perplexity_calls >= config.perplexity_max_uses:
-                                    tool_results.append({
-                                        "type": "tool_result", "tool_use_id": tool_block.get("id"), "is_error": True,
-                                        "content": [{"type": "text", "text": (
-                                            f"perplexity_search: Budget dieser Recherche erschöpft "
-                                            f"({config.perplexity_max_uses} Aufrufe). Weiter mit web_search/web_fetch."
-                                        )}],
-                                    })
-                                    continue
-                                perplexity_calls += 1
-                                tool_result, answer = await _handle_perplexity_tool_call(
-                                    tool_block, perplexity_cfg, anonymize, pplx_client, sperre
+                            usage.add(ResearchCloudUsage(runden_ohne_usage=1))
+                        else:
+                            usage.add(
+                                ResearchCloudUsage(
+                                    input_tokens=parsed.usage.input_tokens,
+                                    output_tokens=parsed.usage.output_tokens,
+                                    cache_read_input_tokens=parsed.usage.cache_read_input_tokens,
+                                    cache_creation_input_tokens=parsed.usage.cache_creation_input_tokens,
+                                    runden_gemessen=1,
                                 )
-                                if answer is not None:
-                                    if answer.kosten_usd is None:
-                                        perplexity_cost_missing += 1
-                                        logger.error(
-                                            "research-cloud: perplexity answer carries no usage.cost.total_cost — "
-                                            "this call is NOT in the booked cost"
-                                        )
-                                    else:
-                                        perplexity_cost_usd += answer.kosten_usd
-                                logger.info(
-                                    f"research-cloud perplexity call -> "
-                                    f"{'ERROR' if tool_result.get('is_error') else 'ok'}, "
-                                    f"{len(answer.quellen) if answer else 0} sources, "
-                                    f"cost_usd={answer.kosten_usd if answer else None}, "
-                                    f"{(time.monotonic() - t_start) * 1000:.0f}ms"
+                            )
+                        for block in parsed.content:
+                            if block.get("type") == "server_tool_use":
+                                if block.get("name") == "web_search":
+                                    searches += 1
+                                elif block.get("name") == "web_fetch":
+                                    fetches += 1
+
+                        if parsed.stop_reason == "tool_use":
+                            # A pending client tool_use always yields stop_reason
+                            # "tool_use", never "pause_turn" — even if server_tool_use
+                            # blocks are also present in this same response (bridge-research
+                            # 2026-07-31, platform.claude.com/docs/.../handling-stop-reasons).
+                            # Only the client tools offered on THIS request are answerable;
+                            # anything else is a tool the model was never given (fail
+                            # loud, not a silent skip).
+                            tool_use_blocks = [b for b in parsed.content if b.get("type") == "tool_use"]
+                            if not tool_use_blocks:
+                                raise ResearchCloudExecutorError(
+                                    "research-cloud executor got stop_reason=tool_use with no "
+                                    f"client tool_use block in content: {parsed.content!r}"
                                 )
-                                tool_results.append(tool_result)
-                                continue
-                            if tool_block.get("name") == FETCH_DOCUMENT_TOOL_NAME:
-                                try:
-                                    text = await fetch_document(
-                                        tool_block.get("input") or {}, doc_counters, **(fetch_document_kwargs or {})
+                            # Fail fast on anything we cannot answer — an unanswered
+                            # client tool_use would otherwise surface later as an opaque
+                            # API 400 ("tool_use ids were found without tool_result").
+                            foreign = [b.get("name") for b in tool_use_blocks if b.get("name") not in client_tools]
+                            if foreign:
+                                raise ResearchCloudExecutorError(
+                                    f"research-cloud executor cannot answer client tools {foreign!r} — "
+                                    f"only {sorted(client_tools)} are defined on this request"
+                                )
+                            # Programmatic tool calling (caller != direct) would mean the
+                            # call comes from paused code in a server-side container whose
+                            # id we would have to echo back — a flow this executor
+                            # deliberately disables via allowed_callers=["direct"]. If it
+                            # shows up anyway, the API contract changed: stop loudly.
+                            ptc = [
+                                b.get("name") for b in tool_use_blocks
+                                if (b.get("caller") or {}).get("type") not in (None, "direct")
+                            ]
+                            if ptc:
+                                raise ResearchCloudExecutorError(
+                                    f"research-cloud executor got programmatic (non-direct) tool calls "
+                                    f"{ptc!r} despite allowed_callers=['direct'] — refusing to continue "
+                                    f"a container flow whose id the API did not expose"
+                                )
+                            tool_results = []
+                            for tool_block in tool_use_blocks:
+                                t_start = time.monotonic()
+                                if tool_block.get("name") == PERPLEXITY_TOOL_NAME:
+                                    if perplexity_calls >= config.perplexity_max_uses:
+                                        tool_results.append({
+                                            "type": "tool_result", "tool_use_id": tool_block.get("id"), "is_error": True,
+                                            "content": [{"type": "text", "text": (
+                                                f"perplexity_search: Budget dieser Recherche erschöpft "
+                                                f"({config.perplexity_max_uses} Aufrufe). Weiter mit web_search/web_fetch."
+                                            )}],
+                                        })
+                                        continue
+                                    perplexity_calls += 1
+                                    tool_result, answer = await _handle_perplexity_tool_call(
+                                        tool_block, perplexity_cfg, anonymize, pplx_client, sperre
                                     )
-                                    tool_results.append({
-                                        "type": "tool_result", "tool_use_id": tool_block.get("id"),
-                                        "content": [{"type": "text", "text": text}],
-                                    })
-                                except DocumentFetchError as e:
-                                    tool_results.append({
-                                        "type": "tool_result", "tool_use_id": tool_block.get("id"), "is_error": True,
-                                        "content": [{"type": "text", "text": f"fetch_document: {e}"}],
-                                    })
-                                continue
-                            tool_result = await _handle_library_tool_call(
-                                tool_block, library_cfg, library_index or {}
-                            )
-                            library_calls += 1
-                            _log_library_call(tool_block, tool_result, time.monotonic() - t_start)
-                            tool_results.append(tool_result)
-                        # The client tool_result ends this assistant turn — fold it into
-                        # the retained history. Completed turns MUST stay in the request:
-                        # a later server_tool_use (web_fetch) may reference a source tool
-                        # (web_search) from an EARLIER turn, and the API 400s with
-                        # "source tool ... not found" if that turn was dropped
-                        # (live-verified job_a2c433bd, 2026-07-31).
-                        base_messages = base_messages + [
-                            {"role": "assistant", "content": parsed.content},
-                            {"role": "user", "content": tool_results},
-                        ]
-                        messages = list(base_messages)
-                        continue
+                                    if answer is not None:
+                                        if answer.kosten_usd is None:
+                                            perplexity_cost_missing += 1
+                                            logger.error(
+                                                "research-cloud: perplexity answer carries no usage.cost.total_cost — "
+                                                "this call is NOT in the booked cost"
+                                            )
+                                        else:
+                                            perplexity_cost_usd += answer.kosten_usd
+                                    logger.info(
+                                        f"research-cloud perplexity call -> "
+                                        f"{'ERROR' if tool_result.get('is_error') else 'ok'}, "
+                                        f"{len(answer.quellen) if answer else 0} sources, "
+                                        f"cost_usd={answer.kosten_usd if answer else None}, "
+                                        f"{(time.monotonic() - t_start) * 1000:.0f}ms"
+                                    )
+                                    tool_results.append(tool_result)
+                                    continue
+                                if tool_block.get("name") == FETCH_DOCUMENT_TOOL_NAME:
+                                    try:
+                                        text = await fetch_document(
+                                            tool_block.get("input") or {}, doc_counters, **(fetch_document_kwargs or {})
+                                        )
+                                        tool_results.append({
+                                            "type": "tool_result", "tool_use_id": tool_block.get("id"),
+                                            "content": [{"type": "text", "text": text}],
+                                        })
+                                    except DocumentFetchError as e:
+                                        tool_results.append({
+                                            "type": "tool_result", "tool_use_id": tool_block.get("id"), "is_error": True,
+                                            "content": [{"type": "text", "text": f"fetch_document: {e}"}],
+                                        })
+                                    continue
+                                tool_result = await _handle_library_tool_call(
+                                    tool_block, library_cfg, library_index or {}
+                                )
+                                library_calls += 1
+                                _log_library_call(tool_block, tool_result, time.monotonic() - t_start)
+                                tool_results.append(tool_result)
+                            # The client tool_result ends this assistant turn — fold it into
+                            # the retained history. Completed turns MUST stay in the request:
+                            # a later server_tool_use (web_fetch) may reference a source tool
+                            # (web_search) from an EARLIER turn, and the API 400s with
+                            # "source tool ... not found" if that turn was dropped
+                            # (live-verified job_a2c433bd, 2026-07-31).
+                            base_messages = base_messages + [
+                                {"role": "assistant", "content": parsed.content},
+                                {"role": "user", "content": tool_results},
+                            ]
+                            messages = list(base_messages)
+                            continue
 
-                    if parsed.stop_reason == "max_tokens":
-                        # A report cut off at the token ceiling is not a report, and it
-                        # cannot be continued: assistant prefill is removed on Sonnet 5
-                        # (400), so there is no way to resume a truncated turn. Returning
-                        # it as status="success" is the same silent-degradation class as
-                        # the library that quietly switched itself off — worse here,
-                        # because the missing part is typically the tail: the source list
-                        # and the caveats. Measured 2026-09-05 on the first
-                        # catalogue-enabled run, whose source list ended mid-entry.
-                        raise ResearchCloudExecutorError(
-                            f"research-cloud run hit max_tokens={config.max_tokens} — the report "
-                            f"is truncated and cannot be resumed (no assistant prefill on "
-                            f"{config.model}). Refusing to return a partial report as a finished one."
-                        )
-
-                    if parsed.stop_reason == "pause_turn":
-                        # A server tool paused the turn: an intermediate
-                        # step, continued below — not an end to judge.
-                        pass
-                    else:
-                        # The acceptance point (src/lauf_abschluss), strict:
-                        # this response ENDS the report, so it must be
-                        # complete — no classifier stop, no reason nobody
-                        # reported (None -> "unknown"), no context-window
-                        # end. In the return round the exception keeps the
-                        # report from before (handled below).
-                        _abschluss = abschluss_aus_stop_reason(
-                            parsed.stop_reason,
-                            category=(parsed.stop_details or {}).get("category"),
-                        )
-                        try:
-                            annehmen(_abschluss, ganz_fertig=True)
-                        except ModellAbbruch as e:
-                            raise ResearchCloudModelAbbruch(
-                                f"research-cloud report stopped by the model's safety classifier "
-                                f"({_abschluss.details()}) — a partial report is not handed out",
-                                usage=usage.model_copy(), abschluss=_abschluss,
-                            ) from e
-                        except LaufUnfertig as e:
+                        if parsed.stop_reason == "max_tokens":
+                            # A report cut off at the token ceiling is not a report, and it
+                            # cannot be continued: assistant prefill is removed on Sonnet 5
+                            # (400), so there is no way to resume a truncated turn. Returning
+                            # it as status="success" is the same silent-degradation class as
+                            # the library that quietly switched itself off — worse here,
+                            # because the missing part is typically the tail: the source list
+                            # and the caveats. Measured 2026-09-05 on the first
+                            # catalogue-enabled run, whose source list ended mid-entry.
                             raise ResearchCloudExecutorError(
-                                f"research-cloud report did not end complete (stop_reason="
-                                f"{parsed.stop_reason!r} -> finish_reason {_abschluss.finish_reason}) — "
-                                "a report without a complete end is not handed out"
-                            ) from e
-                        break
+                                f"research-cloud run hit max_tokens={config.max_tokens} — the report "
+                                f"is truncated and cannot be resumed (no assistant prefill on "
+                                f"{config.model}). Refusing to return a partial report as a finished one."
+                            )
 
-                    # Do NOT append a synthetic "Continue" user turn — the API
-                    # detects the trailing server_tool_use block and resumes
-                    # automatically (shared/tool-use-concepts.md: Stop reasons for
-                    # server-side tools). parsed.content is CUMULATIVE within the
-                    # current assistant turn, so the in-progress turn is replaced,
-                    # while all completed turns (base_messages) are kept.
-                    messages = base_messages + [
-                        {"role": "assistant", "content": parsed.content},
-                    ]
-                else:
-                    raise ResearchCloudExecutorError(
-                        f"research-cloud executor exceeded max_continuations="
-                        f"{config.max_continuations} without finishing (still {parsed.stop_reason})"
-                    )
-            except ResearchCloudExecutorError as e:
-                # Privacy check point: a gate that broke in this round ends the
-                # run with its error — in the return round too; the report from
-                # before is not handed out as a success then.
-                sperre_pruefen(sperre, fehler_typ=ResearchCloudExecutorError)
-                if phase != "rueckrunde":
-                    raise
-                # The return round failed otherwise: the report written before
-                # it is still a finished report — hand that out and say why.
-                nachkontrolle.rueckrunde_fehler = f"{type(e).__name__}: {e}"[:500]
-                logger.error(f"research-cloud: Rückrunde fehlgeschlagen, Bericht von vorher bleibt: {e}")
-                parsed = vorher_parsed
-                break
-            gesamt_iterationen += iteration + 1
-            sperre_pruefen(sperre, fehler_typ=ResearchCloudExecutorError)
-            if nachkontrolle is None:
-                break
-            if phase == "rueckrunde":
-                neu = _report_text(parsed)
-                alt = _report_text(vorher_parsed)
-                nachkontrolle.rueckrunde_usage = _usage_diff(usage, usage_vor_rueckrunde)
-                if len(neu.strip()) < len(alt.strip()) * RUECKRUNDE_MIN_ANTEIL:
-                    nachkontrolle.rueckrunde_fehler = (
-                        f"Rückrunde lieferte keinen vollständigen Bericht ({len(neu.strip())} "
-                        f"von vorher {len(alt.strip())} Zeichen) — Bericht von vorher bleibt"
-                    )
-                    logger.error(f"research-cloud: {nachkontrolle.rueckrunde_fehler}")
+                        if parsed.stop_reason == "pause_turn":
+                            # A server tool paused the turn: an intermediate
+                            # step, continued below — not an end to judge.
+                            pass
+                        else:
+                            # The acceptance point (src/lauf_abschluss), strict:
+                            # this response ENDS the report, so it must be
+                            # complete — no classifier stop, no reason nobody
+                            # reported (None -> "unknown"), no context-window
+                            # end. In the return round the exception keeps the
+                            # report from before (handled below).
+                            _abschluss = abschluss_aus_stop_reason(
+                                parsed.stop_reason,
+                                category=(parsed.stop_details or {}).get("category"),
+                            )
+                            try:
+                                annehmen(_abschluss, ganz_fertig=True)
+                            except ModellAbbruch as e:
+                                raise ResearchCloudModelAbbruch(
+                                    f"research-cloud report stopped by the model's safety classifier "
+                                    f"({_abschluss.details()}) — a partial report is not handed out",
+                                    usage=usage.model_copy(), abschluss=_abschluss,
+                                ) from e
+                            except LaufUnfertig as e:
+                                raise ResearchCloudExecutorError(
+                                    f"research-cloud report did not end complete (stop_reason="
+                                    f"{parsed.stop_reason!r} -> finish_reason {_abschluss.finish_reason}) — "
+                                    "a report without a complete end is not handed out"
+                                ) from e
+                            break
+
+                        # Do NOT append a synthetic "Continue" user turn — the API
+                        # detects the trailing server_tool_use block and resumes
+                        # automatically (shared/tool-use-concepts.md: Stop reasons for
+                        # server-side tools). parsed.content is CUMULATIVE within the
+                        # current assistant turn, so the in-progress turn is replaced,
+                        # while all completed turns (base_messages) are kept.
+                        messages = base_messages + [
+                            {"role": "assistant", "content": parsed.content},
+                        ]
+                    else:
+                        raise ResearchCloudExecutorError(
+                            f"research-cloud executor exceeded max_continuations="
+                            f"{config.max_continuations} without finishing (still {parsed.stop_reason})"
+                        )
+                except ResearchCloudExecutorError as e:
+                    # Privacy check point: a gate that broke in this round ends the
+                    # run with its error — in the return round too; the report from
+                    # before is not handed out as a success then.
+                    sperre_pruefen(sperre, fehler_typ=ResearchCloudExecutorError)
+                    if phase != "rueckrunde":
+                        raise
+                    # The return round failed otherwise: the report written before
+                    # it is still a finished report — hand that out and say why.
+                    nachkontrolle.rueckrunde_fehler = f"{type(e).__name__}: {e}"[:500]
+                    logger.error(f"research-cloud: Rückrunde fehlgeschlagen, Bericht von vorher bleibt: {e}")
                     parsed = vorher_parsed
                     break
-                await nachkontrolle.nachmessen(
-                    neu, protokoll_aus_cloud_nachrichten(base_messages + [{"role": "assistant", "content": parsed.content}])
-                )
-                break
-            offene = await nachkontrolle.entscheide(
-                _report_text(parsed),
-                protokoll_aus_cloud_nachrichten(base_messages + [{"role": "assistant", "content": parsed.content}]),
-                perplexity_rest=config.perplexity_max_uses - perplexity_calls,
-            )
-            if not offene:
-                break
-            phase = "rueckrunde"
-            vorher_parsed = parsed
-            usage_vor_rueckrunde = usage.model_copy()
-            base_messages = base_messages + [
-                {"role": "assistant", "content": parsed.content},
-                {"role": "user", "content": baue_rueckrunden_auftrag(
-                    offene,
-                    perplexity_werkzeug=PERPLEXITY_TOOL_NAME,
-                    dokument_werkzeug=FETCH_DOCUMENT_TOOL_NAME,
+                gesamt_iterationen += iteration + 1
+                sperre_pruefen(sperre, fehler_typ=ResearchCloudExecutorError)
+                if nachkontrolle is None:
+                    break
+                if phase == "rueckrunde":
+                    neu = _report_text(parsed)
+                    alt = _report_text(vorher_parsed)
+                    nachkontrolle.rueckrunde_usage = _usage_diff(usage, usage_vor_rueckrunde)
+                    if len(neu.strip()) < len(alt.strip()) * RUECKRUNDE_MIN_ANTEIL:
+                        nachkontrolle.rueckrunde_fehler = (
+                            f"Rückrunde lieferte keinen vollständigen Bericht ({len(neu.strip())} "
+                            f"von vorher {len(alt.strip())} Zeichen) — Bericht von vorher bleibt"
+                        )
+                        logger.error(f"research-cloud: {nachkontrolle.rueckrunde_fehler}")
+                        parsed = vorher_parsed
+                        break
+                    await nachkontrolle.nachmessen(
+                        neu, protokoll_aus_cloud_nachrichten(base_messages + [{"role": "assistant", "content": parsed.content}])
+                    )
+                    break
+                offene = await nachkontrolle.entscheide(
+                    _report_text(parsed),
+                    protokoll_aus_cloud_nachrichten(base_messages + [{"role": "assistant", "content": parsed.content}]),
                     perplexity_rest=config.perplexity_max_uses - perplexity_calls,
-                    dokument_rest=max(config.fetch_document_max_uses - doc_counters.calls, 0),
-                    ziel=(
-                        "Gib danach den VOLLSTÄNDIGEN Bericht als Antwort aus — den ganzen Bericht mit den "
-                        "Ergänzungen, nicht nur die geänderten Stellen."
-                    ),
-                )},
-            ]
-            messages = list(base_messages)
+                )
+                if not offene:
+                    break
+                phase = "rueckrunde"
+                vorher_parsed = parsed
+                usage_vor_rueckrunde = usage.model_copy()
+                base_messages = base_messages + [
+                    {"role": "assistant", "content": parsed.content},
+                    {"role": "user", "content": baue_rueckrunden_auftrag(
+                        offene,
+                        perplexity_werkzeug=PERPLEXITY_TOOL_NAME,
+                        dokument_werkzeug=FETCH_DOCUMENT_TOOL_NAME,
+                        perplexity_rest=config.perplexity_max_uses - perplexity_calls,
+                        dokument_rest=max(config.fetch_document_max_uses - doc_counters.calls, 0),
+                        ziel=(
+                            "Gib danach den VOLLSTÄNDIGEN Bericht als Antwort aus — den ganzen Bericht mit den "
+                            "Ergänzungen, nicht nur die geänderten Stellen."
+                        ),
+                    )},
+                ]
+                messages = list(base_messages)
+        except Exception as e:
+            # Common exit of every round: a recorded gate failure wins over any
+            # error that ended the run after it (anonymize_gate.sperre_gewinnt).
+            gewinner = sperre_gewinnt(sperre, e, fehler_typ=ResearchCloudExecutorError)
+            if gewinner is e:
+                raise
+            raise gewinner from e
     finally:
         if owns_client:
             await http_client.aclose()

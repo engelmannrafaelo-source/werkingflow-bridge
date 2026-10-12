@@ -429,3 +429,83 @@ async def test_sperre_in_der_ersten_runde_startet_keine_reparatur(tmp_path, pers
     assert fake.calls["nachhol"] == [] and fake.calls["rueckrunde"] == []
     assert result.status == "error"
     assert result.fehler_code == "privacy_service_unreachable" and result.retryable is True
+
+
+# ── PRIVCODE R2: a recorded gate failure wins over every later error ────────
+
+def _rollen_cli(normal, runde, broken):
+    from src.research_cloud.luecken import PRUEF_MODELL
+
+    def cli(**kw):
+        role = ("nachhol" if kw.get("resume_workdir") is not None and "does not exist" in kw["prompt"]
+                else "rueckrunde" if kw.get("resume_workdir") is not None
+                else "pruefer" if kw.get("model") == PRUEF_MODELL else "research")
+        return broken() if role == runde else normal(**kw)
+    return cli
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("down", [True, False])
+@pytest.mark.parametrize("runde", ["research", "nachhol", "rueckrunde"])
+async def test_sperre_gewinnt_gegen_spaeteren_cli_fehler(tmp_path, persist, pplx_on, runde, down):
+    """Codex PRIVCODE R2 probe: the gate breaks, the model's next turn then
+    fails with a CLI API error — the run still ends with the gate's verdict."""
+    from src.middleware.bridge_error import CliApiError
+    from src.privacy_client import PrivacyServiceUnavailable
+    from src.research_cloud.anonymize_gate import CloudAnonymizeError
+
+    tools, patcher = _mit_tools()
+    normal = FakeCli(tmp_path)
+
+    async def broken():
+        yield {"content": [{"type": "text", "text": "Recherche läuft."}]}
+        cause = PrivacyServiceUnavailable("opaque outage") if down else CloudAnonymizeError("refused")
+        tools[-1].anonymize = AsyncMock(side_effect=cause)
+        with pytest.raises(rpp.PoolToolError):
+            await tools[-1].handle({"frage": "Norm ABC"})
+        raise CliApiError(400 if down else 529, "invalid_request_error" if down else "overloaded_error",
+                          "next model turn failed", "review")
+
+    with patcher, patch("src.research_pool_perplexity.ask_perplexity", new=AsyncMock()) as send:
+        result = await _run(_rollen_cli(normal, runde, broken))
+    send.assert_not_awaited()
+    assert result.status == "error" and result.content is None
+    code = "privacy_service_unreachable" if down else "privacy_gate_failed"
+    assert (result.fehler_code, result.retryable) == (code, down), result.model_dump()
+    assert "Anonymisierungssperre fehlgeschlagen" in result.error
+
+
+@pytest.mark.asyncio
+async def test_sperre_gewinnt_gegen_kontolimit_kein_failover(tmp_path, persist, pplx_on):
+    """An account limit after the gate broke must not hand the run to the
+    next worker (429/503 failover): the gate's error is the answer."""
+    from src.claude_cli import RateLimitError
+    from src.privacy_client import PrivacyServiceUnavailable
+
+    tools, patcher = _mit_tools()
+    normal = FakeCli(tmp_path)
+
+    async def broken():
+        yield {"content": [{"type": "text", "text": "Recherche läuft."}]}
+        tools[-1].anonymize = AsyncMock(side_effect=PrivacyServiceUnavailable("down"))
+        with pytest.raises(rpp.PoolToolError):
+            await tools[-1].handle({"frage": "Norm ABC"})
+        raise RateLimitError("seven_day limit hit")
+
+    with patcher:
+        result = await _run(_rollen_cli(normal, "research", broken))
+    assert result.status == "error"
+    assert (result.fehler_code, result.retryable) == ("privacy_service_unreachable", True)
+
+
+@pytest.mark.asyncio
+async def test_kontolimit_ohne_sperre_bleibt_failover(tmp_path, persist, pplx_on):
+    from src.claude_cli import RateLimitError
+
+    async def broken():
+        yield {"content": [{"type": "text", "text": "Recherche läuft."}]}
+        raise RateLimitError("seven_day limit hit")
+
+    tools, patcher = _mit_tools()
+    with patcher, pytest.raises(RateLimitError):
+        await _run(_rollen_cli(FakeCli(tmp_path), "research", broken))

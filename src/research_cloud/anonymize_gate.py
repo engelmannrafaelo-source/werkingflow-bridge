@@ -97,6 +97,24 @@ def sperre_pruefen(stand: Optional[Sperrstand], *, fehler_typ: type = RuntimeErr
     raise fehler
 
 
+def sperre_gewinnt(stand: Optional[Sperrstand], exc: BaseException, *,
+                   fehler_typ: type = RuntimeError) -> BaseException:
+    """The common exit of a research run's error path: a recorded gate
+    failure ALWAYS wins over whatever error ended the run afterwards (a CLI
+    API error on the next model turn, a missing report, a timeout ...).
+    Returns the gate's error (chained to ``exc``) or ``exc`` itself."""
+    if stand is None or not stand.gesperrt or getattr(exc, "fehler_code", None) in (
+        PRIVACY_GATE_FAILED, PRIVACY_SERVICE_UNREACHABLE,
+    ):
+        return exc
+    try:
+        sperre_pruefen(stand, fehler_typ=fehler_typ)
+    except fehler_typ as sperrfehler:
+        sperrfehler.__cause__ = exc
+        return sperrfehler
+    return exc
+
+
 class CloudAnonymizeError(Exception):
     """Raised when the query cannot be verifiably anonymized before a
     research-cloud call. The caller must abort the cloud call entirely.

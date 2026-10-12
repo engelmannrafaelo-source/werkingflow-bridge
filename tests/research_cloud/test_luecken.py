@@ -473,3 +473,50 @@ async def test_sperre_in_der_cloud_rueckrunde_erreicht_route_und_job(down):
     with pytest.raises(JobFailure) as ei:
         executors._raise_on_status_error("research", result.model_dump())
     assert ei.value.retryable is down and ei.value.details.get("fehler_code") == code
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("down", [False, True])
+async def test_sperre_gewinnt_gegen_spaeteren_fehler_in_der_cloud(down):
+    """PRIVCODE R2, cloud side: the gate breaks (the model gets an error
+    tool_result in some other form) and a later call fails with something
+    else — HTTP 500 here: the run ends with the gate's verdict, not the 500."""
+    from src.privacy_client import PrivacyServiceUnavailable
+    from src.research_cloud.anonymize_gate import CloudAnonymizeError
+    from src.research_cloud.executor import ResearchCloudExecutorError
+
+    err = PrivacyServiceUnavailable("opaque") if down else CloudAnonymizeError("opaque")
+    calls = {"n": 0}
+
+    async def anonymize(text):
+        calls["n"] += 1
+        raise err
+
+    client = MagicMock()
+    client.post = AsyncMock(side_effect=[
+        _tool_use("perplexity_search", {"frage": "Norm ABC"}),
+        httpx.ConnectError("api gone"),
+    ])
+    import src.research_cloud.executor as ex
+    echt = ex._handle_perplexity_tool_call
+
+    async def handle_und_weiter(block, cfg, anon, cl, sperre=None):
+        # Record the gate failure as the real handler does, then let the run
+        # continue as if the error had gone back to the model.
+        try:
+            return await echt(block, cfg, anon, cl, sperre)
+        except ResearchCloudExecutorError:
+            return ({"type": "tool_result", "tool_use_id": block.get("id"), "is_error": True,
+                     "content": [{"type": "text", "text": "gesperrt"}]}, None)
+
+    with patch.object(ex, "_handle_perplexity_tool_call", new=handle_und_weiter):
+        with pytest.raises(ResearchCloudExecutorError) as ei:
+            await run_research_cloud(
+                "frage", "system", api_key="sk-test", client=client,
+                library_config=LibraryConfig(), library_index={}, perplexity_config=_PPLX_ON,
+                anonymize=anonymize, perplexity_client=_pplx_ok(),
+            )
+    assert calls["n"] == 1
+    assert ei.value.fehler_code == ("privacy_service_unreachable" if down else "privacy_gate_failed")
+    assert ei.value.retryable is down
+    assert isinstance(ei.value.__cause__, httpx.ConnectError)
