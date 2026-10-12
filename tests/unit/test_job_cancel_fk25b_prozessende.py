@@ -85,6 +85,9 @@ class Store:
         self.row = {
             "job_id": JOB, "kind": "chat", "status": "running", "attribution": ATTR,
             "created_at": datetime.now(timezone.utc), "cancel_requested": False,
+            # As on a real row whose one run was started (mark_running);
+            # FK25BR R6 reads the counters for earlier attempts.
+            "attempts": 1, "defer_count": 0,
         }
 
     async def get_job(self, job_id):

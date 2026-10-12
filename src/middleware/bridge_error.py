@@ -981,8 +981,11 @@ def job_cancel_error(
     job_id: str, reason: str, status_code: int, message: str,
     job_status: Optional[str] = None,
     cancel_requested: Optional[bool] = None,
+    details: Optional[Dict[str, Any]] = None,
 ) -> JSONResponse:
-    """A DELETE /v1/jobs/{id} that did not cancel (BR10). Never retryable: the
+    """A DELETE /v1/jobs/{id} that did not cancel (BR10), or cancelled with a
+    booking that is not confirmed (FK25B2: ``details`` carries the stop's
+    ledger state and the earlier attempts). Never retryable: the
     job's state will not turn back into 'pending', and an unknown id stays
     unknown.
 
@@ -1002,6 +1005,8 @@ def job_cancel_error(
         extra["status"] = job_status
     if cancel_requested is not None:
         extra["cancel_requested"] = cancel_requested
+    if details:
+        extra.update(details)
     return bridge_error(
         source=SOURCE_BRIDGE_INTERNAL,
         error_type=TYPE_JOB_STATE,

@@ -834,153 +834,191 @@ JOB_CANCEL_WAIT_S = float(os.getenv("BRIDGE_JOB_CANCEL_WAIT_S", "10"))
 JOB_CANCEL_WAIT_TICK_S = 0.25
 
 
-def _fruehere_versuche(job: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    """Trace of earlier attempts of a job cancelled without a stop's account
-    (FK25BR R5), or None when it provably never ran.
+_CALL_UIDS_HINWEIS = (
+    "per-attempt call_uids and ledger status are not recorded on the job; "
+    "nothing was reconstructed or re-booked"
+)
 
-    ``attempts`` counts every start of a run (mark_running, watchdog claim);
-    ``defer_count`` the attempts that parked themselves (defer_job). An
-    attempt that parked ended on its own and booked its call itself
-    ('vom_lauf'). Every other attempt that ended with the row back in
-    pending was requeued by the watchdog: its runner died, and how its usage
-    was booked is not known here. Neither their ledger status nor their
-    call_uids are recorded on the row — named, not guessed."""
+
+def _fruehere_versuche(
+    job: Dict[str, Any], bericht_ledger: Optional[str]
+) -> Optional[Dict[str, Any]]:
+    """The attempts of a cancelled job BEFORE the one its current account (if
+    any) covers — or None when there were none (FK25BR R5/R6).
+
+    ``attempts`` counts every start (mark_running, watchdog claim);
+    ``defer_count`` the starts that parked themselves (defer_job). A park
+    proves a start, so starts = max(attempts, defer_count). The current
+    account always covers the LAST attempt — it is written by the one path
+    that closed the row: a stop or the watchdog (a non-parked attempt), or
+    defer_job ('vom_lauf', a parked one). It is not counted again.
+
+    Of the earlier attempts, a parked one ended on its own and booked its call
+    itself; any other one ended with its runner gone (the watchdog claimed it
+    back) and how it was booked is not known here: ``buchung`` 'unbekannt'.
+    Unreadable counters cannot prove anything: 'unbekannt' too."""
     attempts = job.get("attempts")
     defer_count = job.get("defer_count")
-    if not isinstance(attempts, int) or not isinstance(defer_count, int):
-        # A row without the counters cannot prove "never ran".
+    if not isinstance(attempts, int) or isinstance(attempts, bool) or \
+            not isinstance(defer_count, int) or isinstance(defer_count, bool):
         return {
             "anzahl": None, "geparkt": None, "abgebrochen_ohne_bericht": None,
-            "buchung": "unbekannt",
-            "hinweis": "attempts/defer_count not readable from the job store",
+            "buchung": "unbekannt", "call_uids": None,
+            "hinweis": (
+                f"attempts/defer_count not readable from the job store "
+                f"(attempts={attempts!r}, defer_count={defer_count!r}): earlier "
+                f"attempts cannot be ruled out; " + _CALL_UIDS_HINWEIS
+            ),
         }
-    anzahl = max(attempts, defer_count)
-    if anzahl == 0:
+    starts = max(attempts, defer_count)
+    parks = defer_count
+    if bericht_ledger is not None:
+        starts -= 1
+        if bericht_ledger == "vom_lauf":
+            parks -= 1
+    starts = max(0, starts)
+    parks = max(0, min(parks, starts))
+    if starts == 0:
         return None
-    ohne_bericht = max(0, attempts - defer_count)
+    ohne_bericht = starts - parks
     return {
-        "anzahl": anzahl,
-        "geparkt": defer_count,
+        "anzahl": starts,
+        "geparkt": parks,
         "abgebrochen_ohne_bericht": ohne_bericht,
         "buchung": "unbekannt" if ohne_bericht else "vom_lauf",
         "call_uids": None,
         "hinweis": (
             "parked attempts booked their own calls; "
-            + (f"{ohne_bericht} attempt(s) ended with their runner gone (requeued "
-               f"by the watchdog), their booking is unknown; "
+            + (f"{ohne_bericht} attempt(s) ended with their runner gone (claimed "
+               f"back by the watchdog), their booking is unknown; "
                if ohne_bericht else "")
-            + "per-attempt call_uids and ledger status are not recorded on the job"
+            + _CALL_UIDS_HINWEIS
         ),
     }
 
 
+# The current account's ledger state → (HTTP status, reason or None).
+_BERICHT_ANTWORT = {
+    None: (200, None),                       # no account: no attempt was stopped
+    "gebucht": (200, None),
+    "vom_lauf": (200, None),
+    "rueckstau": (202, None),
+    "fehlgeschlagen": (502, REASON_JOB_CANCEL_LEDGER_FAILED),
+}
+
+
 async def _cancelled_answer(job_id: str, kind: Optional[str], wo: str) -> JSONResponse:
-    """The row reads 'cancelled'. Whether that is 200 depends on the stop's
-    ledger booking, recorded by the endpoint (FK25BR R2 P1):
+    """Answer for a job that reads 'cancelled' — the same for the DELETE that
+    cancelled it and for every repeated or concurrent one (FK25BR R3).
 
-      gebucht         200 {status:'cancelled', ledger:'gebucht'}
-      rueckstau       202 {status:'cancelled', ledger:'rueckstau'} — stopped;
-                      the booking is owed in the ledger spool, the flusher
-                      books it
-      fehlgeschlagen  502 job_cancel_ledger_failed — stopped, the booking is
-                      lost (neither written nor spooled)
+    Two inputs, judged together (FK25BR R6):
 
-      vom_lauf        200 {status:'cancelled', ledger:'vom_lauf'} — the run
-                      ended on its own and booked itself (defer_job)
-      unbekannt       502 job_cancel_ledger_unknown — it ran, the stopping
-                      worker died before its account; the watchdog closed
-                      it (FK25BR R4)
+      * the current account (progress.abbruch.ledger) — written by the path
+        that closed the row: the stop (gebucht / rueckstau / fehlgeschlagen),
+        the watchdog ('unbekannt', also over a stop's 'offen'), defer_job
+        ('vom_lauf'); none when a pending row was cancelled;
+      * the earlier attempts (_fruehere_versuche) — those the account does
+        not cover.
 
-    Answered alike to the DELETE that stopped the run and to every repeated
-    or concurrent one (FK25BR R3) — the account is stored on the row before
-    it reads 'cancelled'. No account at all: no run was stopped — cancelled
-    while pending, or by the watchdog while pending. Every path that closes a
-    RUNNING row as cancelled leaves an account (finish_cancelled after the
-    report, the watchdog's 'unbekannt', defer_job's 'vom_lauf'). A pending
-    row may still have run before (FK25BR R5):
+    The current account sets the base answer:
 
-      no attempt ever 200 {status:'cancelled'} — it never ran
-      earlier attempts 200 {status:'cancelled', ledger:'fruehere_versuche',
-                      fruehere_versuche:{anzahl, geparkt,
-                      abgebrochen_ohne_bericht, buchung: vom_lauf|unbekannt}}"""
-    job = await store_client.get_job(job_id)
-    bericht = ((job or {}).get("progress") or {}).get(ABBRUCH_PROGRESS_KEY)
-    versuche = _fruehere_versuche(job or {})
-    if not isinstance(bericht, dict):
-        if versuche is None:
-            logger.info(
-                f"🛑 Async job {job_id} (kind={kind}) cancelled by its owner ({wo}); "
-                f"it never ran"
-            )
-            return JSONResponse(
-                status_code=200, content={"job_id": job_id, "status": store.JOB_STATUS_CANCELLED}
-            )
-        log = logger.warning if versuche["buchung"] == "vom_lauf" else logger.error
-        log(
-            f"🛑 Async job {job_id} (kind={kind}) cancelled by its owner ({wo}) after "
-            f"earlier attempts: {versuche}"
-        )
-        return JSONResponse(status_code=200, content={
-            "job_id": job_id, "status": store.JOB_STATUS_CANCELLED,
-            "ledger": "fruehere_versuche", "fruehere_versuche": versuche,
-        })
-    ledger = bericht.get("ledger")
-    if ledger == "vom_lauf":
-        # The run ended on its own (parked by defer_job with the wish
-        # recorded) and booked its call itself, like any finished run.
-        inhalt = {"job_id": job_id, "status": store.JOB_STATUS_CANCELLED, "ledger": ledger}
-        if versuche is not None and versuche["abgebrochen_ohne_bericht"]:
-            inhalt["fruehere_versuche"] = versuche
-        return JSONResponse(status_code=200, content=inhalt)
-    if ledger == "gebucht":
-        logger.info(
-            f"🛑 Async job {job_id} (kind={kind}) cancelled by its owner while "
-            f"running ({wo}); stop booked"
-        )
-        return JSONResponse(status_code=200, content={
-            "job_id": job_id, "status": store.JOB_STATUS_CANCELLED, "ledger": ledger,
-        })
-    if ledger == "rueckstau":
-        logger.error(
-            f"🛑 Async job {job_id} (kind={kind}) stopped, ledger booking owed in "
-            f"the spool ({bericht.get('ledger_outcomes')})"
-        )
-        return JSONResponse(status_code=202, content={
-            "job_id": job_id, "status": store.JOB_STATUS_CANCELLED, "ledger": ledger,
-            "message": (
+      none, gebucht, vom_lauf   200
+      rueckstau                 202
+      fehlgeschlagen            502 job_cancel_ledger_failed
+      unbekannt, offen, other   502 job_cancel_ledger_unknown
+      (malformed account)       502 job_cancel_ledger_unknown
+
+    The earlier attempts never disappear behind it:
+
+      none                      base answer unchanged (none + none = the
+                                plain 200 of a job that provably never ran)
+      only parked               base answer + fruehere_versuche (buchung
+                                vom_lauf); with no account: ledger
+                                'fruehere_versuche'
+      unknown / unreadable      a 200 or 202 becomes 502
+                                job_cancel_ledger_unknown; a 502 keeps its
+                                code; fruehere_versuche always in the body
+
+    Every 502 body: status 'cancelled' (it IS cancelled — nothing runs or is
+    re-booked), ledger, fruehere_versuche. ERROR log for every unknown or
+    failed booking, WARNING for parked history."""
+    job = await store_client.get_job(job_id) or {}
+    progress = job.get("progress")
+    roh = progress.get(ABBRUCH_PROGRESS_KEY) if isinstance(progress, dict) else None
+    if roh is None:
+        ledger: Optional[str] = None
+        bericht: Dict[str, Any] = {}
+    elif isinstance(roh, dict):
+        ledger = roh.get("ledger") if isinstance(roh.get("ledger"), str) else "unlesbar"
+        bericht = roh
+    else:
+        ledger, bericht = "unlesbar", {}
+    versuche = _fruehere_versuche(job, ledger)
+    status, reason = _BERICHT_ANTWORT.get(ledger, (502, REASON_JOB_CANCEL_LEDGER_UNKNOWN))
+    historie_unbekannt = versuche is not None and versuche["buchung"] == "unbekannt"
+    if historie_unbekannt and status < 300:
+        status, reason = 502, REASON_JOB_CANCEL_LEDGER_UNKNOWN
+
+    inhalt: Dict[str, Any] = {"job_id": job_id, "status": store.JOB_STATUS_CANCELLED}
+    if ledger is not None:
+        inhalt["ledger"] = ledger
+    elif versuche is not None:
+        inhalt["ledger"] = "fruehere_versuche"
+    if versuche is not None:
+        inhalt["fruehere_versuche"] = versuche
+    lage = (
+        f"Async job {job_id} (kind={kind}) cancelled ({wo}): current account "
+        f"ledger={ledger!r} (writer: {bericht.get('ledger_outcomes')}, open "
+        f"deductions: {bericht.get('offene_abzuege')}), earlier attempts: {versuche}"
+    )
+    if reason is not None or status == 202:
+        logger.error(f"🛑 {lage}")
+    elif versuche is not None:
+        logger.warning(f"🛑 {lage}")
+    else:
+        logger.info(f"🛑 {lage}")
+
+    if reason is None:
+        if status == 202:
+            inhalt["message"] = (
                 f"Async job {job_id} is stopped; its ledger booking did not go "
                 f"through yet and is owed in the bridge's ledger spool, which "
                 f"books it later. Not yet billed."
-            ),
-        })
-    if ledger != "fehlgeschlagen":
-        # 'unbekannt' (the watchdog closed a running row whose stop never
-        # wrote its account), 'offen' on a closed row, or anything else: the
-        # booking is not confirmed — never a plain success (FK25BR R4).
-        logger.error(
-            f"🛑 Async job {job_id} (kind={kind}) cancelled after it ran, but its "
-            f"stop's ledger booking is not confirmed (ledger={ledger!r}, open "
-            f"deductions: {bericht.get('offene_abzuege')})"
+            )
+        return JSONResponse(status_code=status, content=inhalt)
+
+    if reason == REASON_JOB_CANCEL_LEDGER_FAILED:
+        message = (
+            f"Async job {job_id} is stopped (cancelled), but booking its usage in "
+            f"the ledger failed and was not spooled (writer: "
+            f"{bericht.get('ledger_outcomes')}, verbrauch: {bericht.get('verbrauch')}). "
+            f"The run is over; the usage is not metered."
         )
-        return job_cancel_error(
-            job_id, REASON_JOB_CANCEL_LEDGER_UNKNOWN, 502,
-            f"Async job {job_id} is cancelled after it ran, but the worker stopping "
-            f"it went away before its ledger booking was confirmed (ledger: "
-            f"{ledger}; open budget deductions: {bericht.get('offene_abzuege') or 'none known'}). "
-            f"Whether this usage is metered is unknown.",
-            job_status=store.JOB_STATUS_CANCELLED,
+    else:
+        teile = []
+        if ledger not in _BERICHT_ANTWORT:
+            teile.append(
+                f"the worker stopping its last attempt went away before its ledger "
+                f"booking was confirmed (ledger: {ledger}; open budget deductions: "
+                f"{bericht.get('offene_abzuege') or 'none known'})"
+            )
+        if historie_unbekannt:
+            teile.append(
+                f"earlier attempts ended without an account (attempts: "
+                f"{versuche.get('anzahl')}, of them without account: "
+                f"{versuche.get('abgebrochen_ohne_bericht')})"
+            )
+        message = (
+            f"Async job {job_id} is cancelled, nothing runs any more, but "
+            + "; ".join(teile)
+            + ". Whether this usage is metered is unknown."
         )
-    logger.error(
-        f"🛑 Async job {job_id} (kind={kind}) stopped, but its ledger booking "
-        f"{ledger!r} ({bericht.get('ledger_outcomes')}) — usage not metered"
-    )
+    if historie_unbekannt and reason == REASON_JOB_CANCEL_LEDGER_FAILED:
+        message += " Earlier attempts' booking is unknown as well."
+    details = {k: v for k, v in inhalt.items() if k in ("ledger", "fruehere_versuche")}
     return job_cancel_error(
-        job_id, REASON_JOB_CANCEL_LEDGER_FAILED, 502,
-        f"Async job {job_id} is stopped (cancelled), but booking its usage in the "
-        f"ledger failed and was not spooled (writer: {bericht.get('ledger_outcomes')}, "
-        f"verbrauch: {bericht.get('verbrauch')}). The run is over; the usage is "
-        f"not metered.",
-        job_status=store.JOB_STATUS_CANCELLED,
+        job_id, reason, status, message,
+        job_status=store.JOB_STATUS_CANCELLED, details=details,
     )
 
 

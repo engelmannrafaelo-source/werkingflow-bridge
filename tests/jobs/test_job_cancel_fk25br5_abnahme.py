@@ -17,12 +17,13 @@ from tests.jobs import test_job_cancel_fk25br4_abnahme as a
 pg_store = br10.pg_store
 
 
-async def _zweimal(job_id):
+async def _zweimal(job_id, status=200):
     first = await f._delete(job_id, f.OWNER_HEADERS)
     second = await f._delete(job_id, f.OWNER_HEADERS)
-    assert first.status_code == second.status_code == 200
+    assert first.status_code == second.status_code == status, first.text
     assert first.json() == second.json()
-    return first.json()
+    body = first.json()
+    return body["error"] if status == 502 else body
 
 
 @pytest.mark.asyncio
@@ -54,8 +55,10 @@ async def test_defer_delete_order(pg_store, monkeypatch, order):
 async def test_crash_requeue_then_delete_names_unknown_attempt(pg_store, monkeypatch):
     """The crash chain: a run started (attempts 1), its worker died, the
     watchdog requeued it to pending (claim bumps attempts, a failed second
-    start leaves it pending again), then DELETE. Not a plain 200: the dead
-    attempts are named, their booking 'unbekannt'."""
+    start leaves it pending again — set by test SQL, a state simulation, as
+    Codex R6 notes), then DELETE. Not a plain 200: the dead attempts are
+    named, their booking 'unbekannt' — since R6 as 502
+    job_cancel_ledger_unknown."""
     a._real_store(monkeypatch)
     await br10._insert(pg_store, f.JOB, "pending", attribution=f.OWNER_ATTR)
     assert await store.mark_running(f.JOB)  # attempt 1 starts
@@ -66,7 +69,8 @@ async def test_crash_requeue_then_delete_names_unknown_attempt(pg_store, monkeyp
         await c.execute(                    # the row is pending again (requeue state)
             "UPDATE ai_jobs SET status='pending' WHERE job_id=$1", f.JOB
         )
-    body = await _zweimal(f.JOB)
+    body = await _zweimal(f.JOB, 502)
+    assert body["code"] == "job_cancel_ledger_unknown"
     assert body["ledger"] == "fruehere_versuche"
     v = body["fruehere_versuche"]
     assert (v["anzahl"], v["geparkt"], v["abgebrochen_ohne_bericht"], v["buchung"]) == (
@@ -77,14 +81,15 @@ async def test_crash_requeue_then_delete_names_unknown_attempt(pg_store, monkeyp
 
 @pytest.mark.asyncio
 async def test_crash_then_park_mixes_both(pg_store, monkeypatch):
-    """One crashed attempt, then one that parked: 'unbekannt' wins, both counted."""
+    """One crashed attempt, then one that parked: 'unbekannt' wins (502 since
+    R6), both counted."""
     a._real_store(monkeypatch)
     await br10._insert(pg_store, f.JOB, "pending", attribution=f.OWNER_ATTR)
     assert await store.mark_running(f.JOB)
     await a._altern(pg_store, f.JOB)
     assert await store.claim_stale_job(60, 5) is not None
     await store.defer_job(f.JOB, 30, "synthetic capacity wait")
-    body = await _zweimal(f.JOB)
+    body = await _zweimal(f.JOB, 502)
     v = body["fruehere_versuche"]
     assert (v["anzahl"], v["geparkt"], v["abgebrochen_ohne_bericht"], v["buchung"]) == (
         2, 1, 1, "unbekannt",
