@@ -44,6 +44,7 @@ from src.jobs.job_id import (
     parse_home,
 )
 from src.jobs.registry import get_executor, registered_kinds, run_generic_job, spawn
+from src.lauf_abschluss import abschluss_eines_ergebnisses
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -401,6 +402,13 @@ async def get_job_endpoint(
         "elapsed_seconds": elapsed,
         "progress": job.get("progress"),
         "result": job.get("result") if job["status"] == store.JOB_STATUS_DONE else None,
+        # done = executed, not "a finished answer": a chat job whose model
+        # stopped the answer is done with abschluss.vollstaendig false
+        # (src/lauf_abschluss, BRREF). Read it before using result.
+        "abschluss": (
+            abschluss_eines_ergebnisses(job.get("result"))
+            if job["status"] == store.JOB_STATUS_DONE else None
+        ),
         # Always carries retryable/retry_after_s (src/error_contract.py).
         "error": (
             job_error_view(job.get("error"))

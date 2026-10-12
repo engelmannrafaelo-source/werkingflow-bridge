@@ -30,6 +30,7 @@ import pytest  # noqa: E402
 from fastapi import HTTPException  # noqa: E402
 
 import src.main  # noqa: E402
+from src.lauf_abschluss import vermerken  # noqa: E402
 
 EIGENE = "3aeda720-8443-4379-951d-b35b8246a7c3"
 FREMDE = "0b1c2d3e-4f50-4617-8899-aabbccddeeff"
@@ -40,6 +41,9 @@ def _sitzung(root: Path, session_id: str, text: str) -> None:
     docs = root / f"2026-10-10-0100_{session_id}" / "claudedocs"
     docs.mkdir(parents=True)
     (docs / "output.md").write_text(text, encoding="utf-8")
+    # A finished research leaves its vermerk (BRREF): the download serves a
+    # report only under it.
+    vermerken(docs.parent, auslieferbar=True)
 
 
 async def _content(session_id: str, root: Path, monkeypatch):

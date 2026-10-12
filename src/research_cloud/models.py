@@ -122,6 +122,9 @@ class AnthropicMessagesResponse(BaseModel):
     id: Optional[str] = None
     model: Optional[str] = None
     stop_reason: Optional[str] = None
+    # A classifier stop (stop_reason "refusal") names its category here
+    # (BRREF, 12.10.2026).
+    stop_details: Optional[Dict[str, Any]] = None
     container: Optional[AnthropicContainer] = None
     # None = the response carried no usage key — not measured, not 0.
     usage: Optional[AnthropicUsage] = None

@@ -7,7 +7,6 @@ import uuid
 import time
 import hashlib
 import tempfile
-from dataclasses import dataclass, field
 from typing import AsyncGenerator, Dict, Any, Optional, List
 from pathlib import Path
 from contextvars import ContextVar
@@ -19,6 +18,14 @@ from datetime import datetime, timedelta
 import shutil
 
 # File discovery for /sc:research
+from src.lauf_abschluss import (  # noqa: F401  (MODELL_ABBRUCH_STOP_REASONS, NACH_MODELLABBRUCH_KEY, ist_modell_abbruch re-exported)
+    MODELL_ABBRUCH_STOP_REASONS,
+    NACH_MODELLABBRUCH_KEY,
+    STOP_REASON_FINISH,
+    AbbruchFilter,
+    LaufAbschluss,
+    ist_modell_abbruch,
+)
 from src.file_discovery import FileDiscoveryService, FileMetadata, SDKMessageParsingError, DirectoryScanError
 from src.sdk_parser import RateLimitEvent, install_resilient_parser
 
@@ -1214,121 +1221,12 @@ def antwort_abgeschnitten(ende: Optional[str]) -> bool:
 
 
 # =============================================================================
-# HOW THE MODEL ENDED (BRREF, 12.10.2026)
+# HOW THE MODEL ENDED (BRREF, 12.10.2026) — src/lauf_abschluss.py
 #
-# Measured on dev/worker1, 12.10.2026 09:58Z (CLI 2.1.285): Anthropic's safety
-# classifier stopped an answer — assistant message stop_reason "refusal",
-# stop_details {type: refusal, category: reasoning_extraction}. The CLI then
-# added a meta user turn ("…stopped by a safety classifier…") and ran a SECOND
-# model call, which answered with a 232-char apology. The chat route returned
-# the cut first message with finish_reason "stop" (hard-wired) and the result's
-# usage — the sum of both calls — as if it were one.
-#
-# The end of a run is established in ONE place: AbbruchFilter decides chunk by
-# chunk what belongs to the answer (streaming uses it live), lauf_abschluss()
-# turns a whole run into a LaufAbschluss — finish_reason, the raw stop_reason,
-# the answer's chunks and the usage of every model call. Sync chat, its
-# tool-leak retry, streaming and research read only from there.
-#
-#   refusal (stop_reason or stop_details.type)  → "content_filter"
-#   max_tokens / CLI output-limit continuation  → "length"
-#   end_turn / stop_sequence / none reported    → "stop"
-#   anything else                               → passed on unchanged
-# After a refusal the answer ends with the refused model call (all its content
-# blocks, same message_id); the CLI's follow-up call is never part of it.
+# The verdict and the one acceptance point live there; this builds it from a
+# run_completion stream (stop fields, the CLI's follow-up turn, transport
+# marker, unfinished result, usage per model call).
 # =============================================================================
-
-NACH_MODELLABBRUCH_KEY = "nach_modellabbruch"
-MODELL_ABBRUCH_STOP_REASONS = ("refusal",)
-
-_STOP_REASON_FINISH = {
-    "end_turn": "stop",
-    "stop_sequence": "stop",
-    "max_tokens": "length",
-    ANTWORT_ENDE_FORTGESETZT: "length",
-    "model_context_window_exceeded": "length",
-    "refusal": "content_filter",
-}
-
-
-def ist_modell_abbruch(chunk: dict) -> bool:
-    details = chunk.get("stop_details")
-    return chunk.get("stop_reason") in MODELL_ABBRUCH_STOP_REASONS or (
-        isinstance(details, dict) and details.get("type") in MODELL_ABBRUCH_STOP_REASONS
-    )
-
-
-class AbbruchFilter:
-    """Chunk by chunk: does this chunk belong to the answer?
-
-    Non-assistant chunks (system, result, markers) always pass — they are no
-    content. Before a model stop every assistant chunk passes. The refused
-    call is recognised by its own stop_reason / stop_details; its further
-    content blocks (same message_id) still pass. After it, every assistant
-    chunk of another call is the CLI's follow-up and is held back. Second net:
-    a chunk run_completion marked NACH_MODELLABBRUCH_KEY (the CLI's meta turn
-    came, the stop fields got lost) — the stop is then recorded there."""
-
-    def __init__(self) -> None:
-        self.abbruch: Optional[dict] = None
-        self._gesperrte_id: Optional[str] = None
-        self._folge_ids: set = set()
-
-    def nimmt(self, chunk: Any) -> bool:
-        if not _is_assistant_chunk(chunk):
-            return True
-        msg_id = chunk.get("message_id")
-        if self.abbruch is not None:
-            if msg_id is not None and msg_id == self._gesperrte_id:
-                return True
-            self._folge_ids.add(msg_id or f"anon-{len(self._folge_ids)}")
-            self.abbruch["folgezuege"] = len(self._folge_ids)
-            return False
-        if ist_modell_abbruch(chunk):
-            details = chunk.get("stop_details") if isinstance(chunk.get("stop_details"), dict) else {}
-            self.abbruch = {
-                "stop_reason": chunk.get("stop_reason") or details.get("type") or "refusal",
-                "category": details.get("category"),
-                "folgezuege": 0,
-            }
-            self._gesperrte_id = msg_id
-            return True
-        if chunk.get(NACH_MODELLABBRUCH_KEY):
-            self.abbruch = {"stop_reason": "refusal", "category": None, "folgezuege": 0}
-            self._folge_ids.add(msg_id or "anon-0")
-            self.abbruch["folgezuege"] = 1
-            return False
-        return True
-
-
-@dataclass
-class LaufAbschluss:
-    """How one run_completion run ended — the single source for every output path.
-
-    finish_reason: OpenAI value (see the rule block above).
-    stop_reason: raw value the model reported (None: none reported).
-    category / folgezuege: only after a model stop.
-    antwort_chunks: the run's chunks without the CLI's follow-up call.
-    zuege: usage per model call, in order (one entry per message_id); the
-    result chunk's usage is their sum."""
-
-    finish_reason: str
-    stop_reason: Optional[str]
-    category: Optional[str] = None
-    folgezuege: int = 0
-    antwort_chunks: list = field(default_factory=list)
-    zuege: list = field(default_factory=list)
-
-    @property
-    def modell_abbruch(self) -> bool:
-        return self.finish_reason == "content_filter"
-
-    def details(self) -> dict:
-        if self.modell_abbruch:
-            return {"stop_reason": self.stop_reason, "category": self.category,
-                    "folgezuege": self.folgezuege}
-        return {"stop_reason": self.stop_reason}
-
 
 def _usage_je_zug(chunks: list) -> list:
     """The CLI yields one assistant message per content block, each carrying
@@ -1357,23 +1255,28 @@ def _usage_je_zug(chunks: list) -> list:
 
 
 def lauf_abschluss(chunks: list) -> LaufAbschluss:
-    """The end of a whole run (see LaufAbschluss)."""
+    """LaufAbschluss of a whole run_completion stream (see src/lauf_abschluss.py)."""
     filt = AbbruchFilter()
     antwort = [c for c in chunks if filt.nimmt(c)]
-    zuege = _usage_je_zug(chunks)
+    marker = find_truncation_marker(chunks)
+    unfertig = find_unfinished_result(chunks)
+    gemeinsam = dict(
+        transport=marker.get("subtype") if marker else None,
+        unfertig=describe_unfinished_result(unfertig) if unfertig else None,
+        antwort_chunks=antwort,
+        zuege=_usage_je_zug(chunks),
+    )
     if filt.abbruch is not None:
         return LaufAbschluss(
             finish_reason="content_filter",
             stop_reason=filt.abbruch["stop_reason"],
             category=filt.abbruch["category"],
             folgezuege=filt.abbruch["folgezuege"],
-            antwort_chunks=antwort,
-            zuege=zuege,
+            **gemeinsam,
         )
     ende = antwort_ende(chunks)
-    finish = "stop" if ende is None else _STOP_REASON_FINISH.get(ende, ende)
-    return LaufAbschluss(finish_reason=finish, stop_reason=ende,
-                         antwort_chunks=antwort, zuege=zuege)
+    finish = "stop" if ende is None else STOP_REASON_FINISH.get(ende, ende)
+    return LaufAbschluss(finish_reason=finish, stop_reason=ende, **gemeinsam)
 
 
 def describe_unfinished_result(chunk: dict) -> str:

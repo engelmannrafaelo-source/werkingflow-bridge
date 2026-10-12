@@ -2513,6 +2513,51 @@ def enforce_tools_policy(enable_tools: bool, x_claude_allowed_tools: str) -> boo
     return enable_tools
 
 
+def _chat_lauf_annehmen(abschluss, *, worker: str, chunks_received: int, partial_chars: int) -> None:
+    """Chat side of the acceptance point (src/lauf_abschluss.annehmen), for
+    every CLI run whose text the route hands out — the first run and the
+    tool-leak retry alike.
+
+    A transport break (stream ended without the CLI's result, e.g. the CLI's
+    API_TIMEOUT_MS mid-generation) is a 503, retryable: the partial text
+    parses fine, so without this the caller would get 200 with a silently cut
+    body. A model stop passes: the route answers it with finish_reason
+    content_filter, OpenAI's loud form for it."""
+    from src.lauf_abschluss import ModellAbbruch, TransportAbbruch, annehmen
+    try:
+        annehmen(abschluss)
+    except ModellAbbruch:
+        return
+    except TransportAbbruch:
+        logger.warning(
+            f"⚠️  Truncated SDK response on worker {worker} (subtype={abschluss.transport}, "
+            f"chunks={chunks_received}, partial_chars={partial_chars}) "
+            f"— surfacing 503 instead of silent partial content"
+        )
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "error": {
+                    "message": (
+                        f"[Bridge {worker}] Upstream SDK stream ended without "
+                        f"completion marker ({abschluss.transport}) — "
+                        f"response is truncated. Retry."
+                    ),
+                    "type": "service_unavailable",
+                    "code": "503",
+                    "source": "bridge_internal",
+                    "bridge_type": "incomplete_response",
+                    "reason": abschluss.transport,
+                    "retryable": True,
+                    "retry_after_s": 15,
+                    "bridge_worker": worker,
+                    "chunks_received": chunks_received,
+                    "partial_content_chars": partial_chars,
+                }
+            },
+        )
+
+
 @app.post("/v1/chat/completions")
 @rate_limit_endpoint("chat")
 async def chat_completions(
@@ -4082,37 +4127,10 @@ async def chat_completions(
             # check the caller gets HTTP 200 + finish_reason=stop with a
             # silently truncated body (downstream JSON consumers then fail on
             # "Unterminated string"). Fail loud instead: 503 retryable.
-            from src.claude_cli import find_truncation_marker
-            _truncation_marker = find_truncation_marker(chunks)
-            if _truncation_marker is not None:
-                logger.warning(
-                    f"⚠️  Truncated SDK response on worker {_self_worker} "
-                    f"(subtype={_truncation_marker.get('subtype')}, "
-                    f"chunks={len(chunks)}, partial_chars={len(raw_assistant_content or '')}) "
-                    f"— surfacing 503 instead of silent partial content"
-                )
-                raise HTTPException(
-                    status_code=503,
-                    detail={
-                        "error": {
-                            "message": (
-                                f"[Bridge {_self_worker}] Upstream SDK stream ended without "
-                                f"completion marker ({_truncation_marker.get('subtype')}) — "
-                                f"response is truncated. Retry."
-                            ),
-                            "type": "service_unavailable",
-                            "code": "503",
-                            "source": "bridge_internal",
-                            "bridge_type": "incomplete_response",
-                            "reason": _truncation_marker.get("subtype"),
-                            "retryable": True,
-                            "retry_after_s": 15,
-                            "bridge_worker": _self_worker,
-                            "chunks_received": len(chunks),
-                            "partial_content_chars": len(raw_assistant_content or ""),
-                        }
-                    },
-                )
+            _chat_lauf_annehmen(
+                _abschluss, worker=_self_worker, chunks_received=len(chunks),
+                partial_chars=len(raw_assistant_content or ""),
+            )
 
             # Rate-limit phrasing in the assistant text (non-streaming path).
             # Second net only: the CLI's own limit answer is recognised by its
@@ -4250,6 +4268,12 @@ async def chat_completions(
                         if result_usage else _retry_usage
                     )
                 retry_raw = claude_cli.parse_claude_message(_retry_abschluss.antwort_chunks)
+                # Same acceptance point as the first run: a retry whose stream
+                # ended without the CLI's result is cut — 503, never 200.
+                _chat_lauf_annehmen(
+                    _retry_abschluss, worker=_self_worker, chunks_received=len(retry_chunks),
+                    partial_chars=len(retry_raw or ""),
+                )
                 if _retry_abschluss.modell_abbruch:
                     # The original was a tool leak, the retry was stopped by
                     # the model: neither is a finished answer.
@@ -5079,6 +5103,23 @@ class ResearchAnswerTruncated(ResearchReportMissing):
     fehler_code = "antwort_abgeschnitten"
 
 
+def _research_annehmen(abschluss, *, session_id: Optional[str], was: str, usage=None) -> None:
+    """Research side of the acceptance point (src/lauf_abschluss.annehmen),
+    for every CLI run whose output research hands out: the main run, the
+    report-file repair round. A model stop is ResearchModelStopped
+    (fehler_code modell_abbruch); a transport break or an unfinished run
+    propagates as the acceptance point raised it."""
+    from src.lauf_abschluss import ModellAbbruch, annehmen
+    try:
+        annehmen(abschluss)
+    except ModellAbbruch as e:
+        raise ResearchModelStopped(
+            f"Research stopped by the model's safety classifier (antwort_ende="
+            f"{abschluss.stop_reason}, category={abschluss.category}, session_id={session_id}): {was}",
+            usage,
+        ) from e
+
+
 class ResearchModelStopped(ResearchReportMissing):
     """A safety classifier stopped a message of the run (antwort_ende
     "refusal", BRREF 12.10.2026). The CLI then lets the model answer once more
@@ -5228,17 +5269,26 @@ async def _pool_berichtsdatei_nachholen(
             usage = usage or {"input_tokens": 0, "output_tokens": 0, "cache_read_tokens": 0, "cache_creation_tokens": 0}
             for k in usage:
                 usage[k] += u[k]
-    from src.claude_cli import describe_unfinished_result, find_unfinished_result
-    unfertig = find_unfinished_result(chunks)
-    if unfertig is not None:
-        # error_max_turns too: written with Write and then Edit, the file
-        # exists after the first part and looks like a finished report.
+    # The acceptance point, strict: error_max_turns too — written with Write
+    # and then Edit, the file exists after the first part and looks like a
+    # finished report. A model stop is its own error (modell_abbruch).
+    from src.claude_cli import lauf_abschluss
+    from src.lauf_abschluss import LaufNichtAbgeschlossen, ModellAbbruch, annehmen
+    abschluss = lauf_abschluss(chunks)
+    try:
+        annehmen(abschluss, ganz_fertig=True)
+    except ModellAbbruch:
+        _research_annehmen(
+            abschluss, session_id=cli_resume_id, usage=usage,
+            was=f"the round to write {datei.name} was stopped; a partly written file is not handed out.",
+        )
+    except LaufNichtAbgeschlossen as e:
         raise ResearchReportMissing(
             f"The round to write the report file ended with "
-            f"{describe_unfinished_result(unfertig)} instead of a clean success — "
+            f"{abschluss.transport or abschluss.unfertig} instead of a clean success — "
             f"a partly written {datei.name} is not handed out.",
             usage,
-        )
+        ) from e
     if not datei.is_file():
         raise ResearchReportMissing(
             f"Research ended with {chat_chars} chars of chat text but no report file; resuming the "
@@ -5354,16 +5404,22 @@ async def _pool_luecken_rueckrunde(
         return scheitern(f"{type(e).__name__}: {e}")
     rr_usage = _rueckrunden_usage(chunks, None)
     nachkontrolle.rueckrunde_usage = dict(rr_usage or {}, usage_source="api" if rr_usage else "missing")
-    from src.claude_cli import describe_unfinished_result, find_unfinished_result
-    _rr_unfertig = find_unfinished_result(chunks)
-    if _rr_unfertig is not None:
-        # Rueckrunde nicht mit success beendet (abgeschnitten ZB3D, oder
-        # error_max_turns mitten im Ueberarbeiten): eine halb ueberarbeitete
-        # Datei geht nicht raus — der Bericht von vorher kommt zurueck an seinen Platz.
+    # The acceptance point, strict: abgeschnitten (ZB3D), error_max_turns
+    # mitten im Ueberarbeiten, oder vom Modell abgebrochen (BRREF) — eine
+    # halb ueberarbeitete Datei geht nicht raus, auch wenn sie lang genug
+    # aussieht: der Bericht von vorher kommt zurueck an seinen Platz.
+    from src.claude_cli import lauf_abschluss
+    from src.lauf_abschluss import LaufNichtAbgeschlossen, ModellAbbruch, annehmen
+    _rr_abschluss = lauf_abschluss(chunks)
+    try:
+        annehmen(_rr_abschluss, ganz_fertig=True)
+    except LaufNichtAbgeschlossen as e:
         if datei is not None:
             datei.write_text(bericht, encoding="utf-8")
+        if isinstance(e, ModellAbbruch):
+            return scheitern(f"Rückrunde vom Modell abgebrochen ({_rr_abschluss.details()})")
         return scheitern(
-            f"Rückrunde abgeschnitten ({describe_unfinished_result(_rr_unfertig)})")
+            f"Rückrunde abgeschnitten ({_rr_abschluss.transport or _rr_abschluss.unfertig})")
     if pool_pplx.gate_error:
         # Same rule as the first round: a report written while the privacy
         # gate was broken is not handed out — the caller raises on gate_error.
@@ -5443,7 +5499,9 @@ async def _execute_research_impl(
     for HTTP 503 propagation through nginx failover.
     """
     start_time = time.time()
+    from src.lauf_abschluss import vermerken
     session_id = None
+    vermerk_dir: Optional[Path] = None
     container_file = None
     output_file = None
     # R1: token accumulators — populated from SDK result chunks (preferred) or
@@ -5719,12 +5777,9 @@ async def _execute_research_impl(
 
         execution_time = time.time() - start_time
 
-        from src.claude_cli import (
-            MODELL_ABBRUCH_STOP_REASONS,
-            antwort_abgeschnitten,
-            antwort_ende,
-        )
-        research_antwort_ende = antwort_ende(all_chunks)
+        from src.claude_cli import antwort_abgeschnitten, lauf_abschluss
+        research_abschluss = lauf_abschluss(all_chunks)
+        research_antwort_ende = research_abschluss.stop_reason
 
         # Bibliotheksaufrufe zählbar machen — das Gegenstück zu library_calls
         # des Cloud-Executors. Ohne diese Zahl ist "die Bibliothek wurde
@@ -5783,6 +5838,7 @@ async def _execute_research_impl(
         # (a notes file, a source list) and stays the fallback for a report
         # written elsewhere.
         workdir = _research_workdir(file_metadata, str(discovered_files[0]) if discovered_files else None)
+        vermerk_dir = workdir
         ordered_file = workdir / "claudedocs" / RESEARCH_OUTPUT_FILENAME if workdir is not None else None
         if antwort_im_text:
             # The final message is the answer; a file is never the answer here
@@ -5835,15 +5891,13 @@ async def _execute_research_impl(
         # limits, and regardless of the answer contract: the CLI reports
         # success after its follow-up turn, and a report file that exists is
         # no proof it was finished before the stop.
-        if research_antwort_ende in MODELL_ABBRUCH_STOP_REASONS:
-            raise ResearchModelStopped(
-                f"Research stopped by the model's safety classifier (antwort_ende="
-                f"{research_antwort_ende}, session_id={session_id}): "
-                + ("the final message is the CLI's follow-up turn, not the answer."
-                   if antwort_im_text else
-                   f"the report file {container_file} may be partly written and is not handed out."
-                   if container_file else "no report file was written.")
-            )
+        _research_annehmen(
+            research_abschluss, session_id=session_id,
+            was=("the final message is the CLI's follow-up turn, not the answer."
+                 if antwort_im_text else
+                 f"the report file {container_file} may be partly written and is not handed out."
+                 if container_file else "no report file was written."),
+        )
 
         if not discovered_files and not content and not parsed_assistant_text:
             logger.error(
@@ -6144,7 +6198,7 @@ async def _execute_research_impl(
         except Exception as _track_err:
             logger.warning(f"⚠️ research activity tracking failed (non-fatal): {_track_err}")
 
-        return ResearchResponse(
+        antwort = ResearchResponse(
             status="success",
             query=request_body.query,
             model=request_body.model,
@@ -6163,6 +6217,10 @@ async def _execute_research_impl(
                 accumulated_cache_creation, accumulated_cache_read, USAGE_FEHLT_CLI,
             ),
         )
+        # The session's report may be downloaded (GET /v1/research/{id}/content)
+        # only under this vermerk — written last, after every round.
+        vermerken(vermerk_dir, auslieferbar=True, abschluss=research_abschluss)
+        return antwort
 
     except (WorkerUnavailableError, RateLimitError):
         # Re-raise to trigger HTTP 503 and Nginx failover to another worker.
@@ -6172,6 +6230,10 @@ async def _execute_research_impl(
 
     except Exception as e:
         execution_time = time.time() - start_time
+        # The report on disk stays as a diagnostic artefact; the vermerk keeps
+        # the download from serving it as a finished research.
+        vermerken(vermerk_dir, auslieferbar=False,
+                  grund=getattr(e, "fehler_code", None) or type(e).__name__)
         logger.error(
             f"❌ Research failed: {e}",
             exc_info=True,
@@ -6305,7 +6367,11 @@ async def _execute_research_cloud_impl(
     function is ever called).
     """
     from src.research_cloud.anonymize_gate import CloudAnonymizeError, anonymize_query_for_cloud
-    from src.research_cloud.executor import ResearchCloudExecutorError, run_research_cloud
+    from src.research_cloud.executor import (
+        ResearchCloudExecutorError,
+        ResearchCloudModelAbbruch,
+        run_research_cloud,
+    )
     from src.research_cloud.library import LibraryUnavailableError, load_library_config, load_library_for_run
     from src.research_cloud.models import ResearchCloudConfig
     from src.research_cloud.pricing_tiers import customer_price_eur
@@ -6411,6 +6477,10 @@ async def _execute_research_cloud_impl(
             anonymize=lambda text: anonymize_query_for_cloud(request, text),
             nachkontrolle=nachkontrolle,
         )
+    except ResearchCloudModelAbbruch as e:
+        return await _cloud_modell_abbruch_antwort(
+            request_body, attribution_ctx, start_time, str(e), e.usage, e.abschluss,
+        )
     except ResearchCloudExecutorError as e:
         execution_time = time.time() - start_time
         logger.error(f"research-cloud: executor failed: {e}", exc_info=True)
@@ -6453,6 +6523,17 @@ async def _execute_research_cloud_impl(
             # The executor raises without the usage of the rounds before the
             # failure; the ledger row above books 0 for the same reason.
             usage_fehlt=USAGE_FEHLT_RESEARCH_CLOUD,
+        )
+
+    # The acceptance point on what the executor returned, too: whatever path
+    # produced a result, a model stop in its stop_reason is no report.
+    from src.lauf_abschluss import ModellAbbruch, abschluss_aus_stop_reason, annehmen
+    _cloud_abschluss = abschluss_aus_stop_reason(result.stop_reason)
+    try:
+        annehmen(_cloud_abschluss)
+    except ModellAbbruch as e:
+        return await _cloud_modell_abbruch_antwort(
+            request_body, attribution_ctx, start_time, str(e), result.usage, _cloud_abschluss,
         )
 
     # Real-cost ledger booking — research-cloud always books real cost
@@ -6539,6 +6620,48 @@ async def _execute_research_cloud_impl(
 
 
 USAGE_FEHLT_RESEARCH_CLOUD_OHNE_USAGE = "research_cloud_ohne_usage"
+
+
+async def _cloud_modell_abbruch_antwort(
+    request_body, attribution_ctx, start_time: float, message: str, usage, abschluss,
+) -> ResearchResponse:
+    """research-cloud run stopped by the model (BRREF): status=error,
+    fehler_code modell_abbruch, not retryable — with the usage of every round
+    up to the stop, in the response and in the ledger row."""
+    execution_time = time.time() - start_time
+    logger.error(f"research-cloud: {message}")
+    try:
+        from src.activity.ai_call_writer import persist_ai_call_activity
+        await persist_ai_call_activity(
+            app_id=attribution_ctx.get("app_id") if attribution_ctx else None,
+            user_id=attribution_ctx.get("user_id") if attribution_ctx else None,
+            agent_id=f"research-cloud:{request_body.strategy or 'default'}",
+            workflow_id=attribution_ctx.get("workflow_id") if attribution_ctx else None,
+            model=request_body.model,
+            input_tokens=usage.input_tokens,
+            output_tokens=usage.output_tokens,
+            cache_read_tokens=usage.cache_read_input_tokens,
+            cache_creation_tokens=usage.cache_creation_input_tokens,
+            status="error",
+            duration_ms=int(execution_time * 1000),
+            error_code="modell_abbruch",
+            app_env=attribution_ctx.get("app_env") if attribution_ctx else None,
+            provider="research-cloud",
+            error_message=message,
+        )
+    except Exception as _track_err:
+        logger.warning(f"research-cloud error activity tracking failed (non-fatal): {_track_err}")
+    return ResearchResponse(
+        status="error",
+        query=request_body.query,
+        model=request_body.model,
+        execution_time_seconds=round(execution_time, 2),
+        error=message,
+        fehler_code="modell_abbruch",
+        antwort_ende=abschluss.stop_reason,
+        retryable=False,
+        **_cloud_usage_felder(usage),
+    )
 
 
 def _cloud_usage_felder(usage) -> Dict[str, Any]:
@@ -7469,23 +7592,34 @@ async def _execute_doc_agent_impl(
         if not all_chunks:
             raise ValueError("No response received from Claude Code execution")
 
-        # Strom ohne Result-Nachricht der CLI = abgeschnittene Antwort (ZB3D).
-        from src.claude_cli import find_truncation_marker
-        _doc_truncation = find_truncation_marker(all_chunks)
-        if _doc_truncation is not None:
+        # The acceptance point: a stream without the CLI's result is cut
+        # (ZB3D) — 503, retryable; a model stop (BRREF) is an error — after it
+        # the last assistant text is the CLI's follow-up turn, not the answer.
+        from src.claude_cli import lauf_abschluss
+        from src.lauf_abschluss import ModellAbbruch, TransportAbbruch, annehmen
+        _doc_abschluss = lauf_abschluss(all_chunks)
+        try:
+            annehmen(_doc_abschluss)
+        except TransportAbbruch:
             raise HTTPException(
                 status_code=503,
                 detail={
                     "message": (
                         "Doc-agent stream ended without completion marker "
-                        f"({_doc_truncation.get('subtype')}) — answer is truncated. Retry."
+                        f"({_doc_abschluss.transport}) — answer is truncated. Retry."
                     ),
-                    "reason": _doc_truncation.get("subtype"),
+                    "reason": _doc_abschluss.transport,
                     "retryable": True,
                     "chunks_received": len(all_chunks),
                     "session_id": session_id,
                 },
             )
+        except ModellAbbruch as e:
+            raise ModellAbbruch(
+                f"Doc-agent answer stopped by the model's safety classifier "
+                f"({_doc_abschluss.details()}, session_id={session_id}) — no answer is handed out.",
+                _doc_abschluss,
+            ) from e
 
         execution_time = time.time() - start_time
         answer = _doc_agent_extract_last_assistant_text(all_chunks)
@@ -7842,6 +7976,35 @@ async def get_research_content(
                     f"writing its report; its chat text is not a report and is not served as one."
                 ),
                 "reason": "research_session_without_report",
+                "session_id": session_id,
+            },
+        )
+
+    # The report is a finished research only under the session's vermerk
+    # (src/lauf_abschluss, written by the research handler after its last
+    # round). A run that ended in an error — a model stop, a cut stream —
+    # leaves its file as a diagnostic artefact; it is not served as a report.
+    # No vermerk: the run is still going, died before it was written, or ran
+    # before BRREF — none of them is a finished report either.
+    from src.lauf_abschluss import vermerkt
+    vermerk = vermerkt(session_dir)
+    if vermerk is None or vermerk.get("auslieferbar") is not True:
+        grund = (vermerk or {}).get("grund") or "kein_vermerk"
+        logger.warning(
+            f"Research report not served, run not accepted: {session_id} ({grund})",
+            extra={"session_id": session_id},
+        )
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": (
+                    f"Research session {session_id} has a report file, but the run did not end as a "
+                    f"finished research ({grund}). The file is kept for diagnosis and is not served as "
+                    f"the report."
+                ),
+                "reason": "research_session_nicht_abgeschlossen",
+                "grund": grund,
+                "abschluss": (vermerk or {}).get("abschluss"),
                 "session_id": session_id,
             },
         )

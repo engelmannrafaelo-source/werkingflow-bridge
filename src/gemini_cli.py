@@ -149,9 +149,17 @@ async def call_gemini_cli(
                     "role": "assistant",
                     "content": response_text,
                 },
-                "finish_reason": "stop",
+                # The Gemini CLI's JSON reports no finish reason. "unknown",
+                # not "stop": no client may read completeness into a missing
+                # reason (BRREF, 12.10.2026).
+                "finish_reason": "unknown",
             }
         ],
+        "x_bridge_finish": {
+            "stop_reason": None,
+            "vollstaendig": False,
+            "grund": "gemini_cli_meldet_keinen_abschlussgrund",
+        },
         "usage": {
             "prompt_tokens": prompt_tokens,
             "completion_tokens": completion_tokens,

@@ -207,7 +207,7 @@ async def test_lauf_mit_refusal_ergibt_content_filter(monkeypatch, tmp_path):
     finish, details = finish_reason_fuer_lauf(chunks)
     assert finish == "content_filter"
     assert details == {"stop_reason": "refusal", "category": "reasoning_extraction",
-                       "folgezuege": 1}
+                       "folgezuege": 1, "vollstaendig": False}
     assert antwort_ende(chunks) == "refusal"
 
 
@@ -235,7 +235,8 @@ async def test_usage_je_zug_statt_nur_summe(monkeypatch, tmp_path):
 ])
 async def test_normaler_lauf_bildet_stop_reason_ab(monkeypatch, tmp_path, stop_reason, finish):
     chunks = await _chunks(monkeypatch, tmp_path, normal_verlauf(stop_reason))
-    assert finish_reason_fuer_lauf(chunks) == (finish, {"stop_reason": stop_reason})
+    assert finish_reason_fuer_lauf(chunks) == (
+        finish, {"stop_reason": stop_reason, "vollstaendig": finish == "stop"})
     assert usage_je_zug(chunks)[0]["output_tokens"] == 20
 
 
@@ -243,7 +244,7 @@ def test_ohne_gemeldeten_stop_reason_bleibt_stop():
     """The CLI reported none (older stream shape): not invented as an error."""
     chunks = [{"type": "assistant", "content": [{"type": "text", "text": "a"}]},
               {"type": "result", "subtype": "success", "is_error": False, "num_turns": 1}]
-    assert finish_reason_fuer_lauf(chunks) == ("stop", {"stop_reason": None})
+    assert finish_reason_fuer_lauf(chunks) == ("stop", {"stop_reason": None, "vollstaendig": True})
 
 
 def test_api_worker_mapper_kennt_refusal():

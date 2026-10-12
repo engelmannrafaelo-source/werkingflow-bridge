@@ -38,6 +38,7 @@ from fastapi import HTTPException  # noqa: E402
 
 import src.main  # noqa: E402
 from src.claude_cli import inject_output_path_for_file_discovery  # noqa: E402
+from src.lauf_abschluss import vermerken  # noqa: E402
 from src.research_cloud.luecken import FLAG  # noqa: E402
 from tests import sdk_strom as sdk  # noqa: E402
 
@@ -350,6 +351,9 @@ def _session(root: Path, files: dict) -> Path:
     for name, text in files.items():
         (d / "claudedocs" / name).write_text(text, encoding="utf-8")
     (d / "final_response.json").write_text('{"response": {"text": "chat"}}', encoding="utf-8")
+    # A finished research leaves its vermerk (BRREF): the download serves a
+    # report only under it.
+    vermerken(d, auslieferbar=True)
     return d
 
 

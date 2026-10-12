@@ -32,6 +32,7 @@ from typing import Any, Awaitable, Callable, Dict, List, Optional
 
 import httpx
 
+from src.lauf_abschluss import ModellAbbruch, abschluss_aus_stop_reason, annehmen
 from src.research_cloud.library import (
     LibraryConfig,
     LibraryFetchError,
@@ -164,6 +165,20 @@ class ResearchCloudExecutorError(Exception):
     def __init__(self, message: str, *, status_code: Optional[int] = None):
         super().__init__(message)
         self.status_code = status_code
+
+
+class ResearchCloudModelAbbruch(ResearchCloudExecutorError):
+    """The model stopped the report (stop_reason "refusal", BRREF) — same
+    acceptance point as the CLI paths (src/lauf_abschluss.annehmen). Carries
+    the usage of every round up to the stop: it was paid for."""
+
+    fehler_code = "modell_abbruch"
+    retryable = False
+
+    def __init__(self, message: str, *, usage, abschluss):
+        super().__init__(message)
+        self.usage = usage
+        self.abschluss = abschluss
 
 
 # Anthropic Messages API statuses that mean "try again later, nothing is
@@ -671,6 +686,22 @@ async def run_research_cloud(
                             f"is truncated and cannot be resumed (no assistant prefill on "
                             f"{config.model}). Refusing to return a partial report as a finished one."
                         )
+
+                    # The acceptance point (src/lauf_abschluss): a classifier
+                    # stop is no report. In the return round the exception
+                    # keeps the report from before (handled below).
+                    _abschluss = abschluss_aus_stop_reason(
+                        parsed.stop_reason,
+                        category=(parsed.stop_details or {}).get("category"),
+                    )
+                    try:
+                        annehmen(_abschluss)
+                    except ModellAbbruch as e:
+                        raise ResearchCloudModelAbbruch(
+                            f"research-cloud report stopped by the model's safety classifier "
+                            f"({_abschluss.details()}) — a partial report is not handed out",
+                            usage=usage.model_copy(), abschluss=_abschluss,
+                        ) from e
 
                     if parsed.stop_reason != "pause_turn":
                         break
