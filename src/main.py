@@ -7619,14 +7619,22 @@ async def _execute_doc_agent_impl(
         if not all_chunks:
             raise ValueError("No response received from Claude Code execution")
 
-        # The acceptance point: a stream without the CLI's result is cut
-        # (ZB3D) — 503, retryable; a model stop (BRREF) is an error — after it
-        # the last assistant text is the CLI's follow-up turn, not the answer.
+        # The acceptance point, strict like every path whose result is final
+        # as it stands: a stream without the CLI's result is cut (ZB3D) —
+        # 503, retryable; a model stop (BRREF) is an error — after it the last
+        # assistant text is the CLI's follow-up turn, not the answer; a run
+        # that is not complete (error_max_turns, max_tokens, ...) is an error
+        # too — its last text is a partial answer (BRREFR R4).
         from src.claude_cli import lauf_abschluss
-        from src.lauf_abschluss import ModellAbbruch, TransportAbbruch, annehmen
+        from src.lauf_abschluss import (
+            LaufUnfertig,
+            ModellAbbruch,
+            TransportAbbruch,
+            annehmen,
+        )
         _doc_abschluss = lauf_abschluss(all_chunks)
         try:
-            annehmen(_doc_abschluss)
+            annehmen(_doc_abschluss, ganz_fertig=True)
         except TransportAbbruch:
             raise HTTPException(
                 status_code=503,
@@ -7647,6 +7655,17 @@ async def _execute_doc_agent_impl(
                 f"({_doc_abschluss.details()}, session_id={session_id}) — no answer is handed out.",
                 _doc_abschluss,
             ) from e
+        except LaufUnfertig as e:
+            # Not retryable: the same request runs into the same turn or
+            # output limit; a smaller question or more max_turns may not.
+            unfertig = LaufUnfertig(
+                f"Doc-agent run did not end complete (finish_reason={_doc_abschluss.finish_reason}, "
+                f"stop_reason={_doc_abschluss.stop_reason}, unfertig={_doc_abschluss.unfertig}, "
+                f"session_id={session_id}) — a partial answer is not handed out as one.",
+                _doc_abschluss,
+            )
+            unfertig.retryable = False
+            raise unfertig from e
 
         execution_time = time.time() - start_time
         answer = _doc_agent_extract_last_assistant_text(all_chunks)
