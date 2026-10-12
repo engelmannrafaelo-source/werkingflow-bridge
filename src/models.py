@@ -903,6 +903,15 @@ class DocAgentResponse(ErrorVerdictFields):
     execution_time_seconds: Optional[float] = None
     session_id: Optional[str] = None
     error: Optional[str] = None
+    fehler_code: Optional[Literal["modell_abbruch"]] = Field(
+        default=None,
+        description=(
+            "status='error' only, when the bridge knows the cause: 'modell_abbruch' = the "
+            "model's safety classifier refused or stopped the run (retryable=false; the same "
+            "content meets the same classifier). Same code as ResearchResponse.fehler_code "
+            "and the chat error envelope (error.code, 422)."
+        ),
+    )
 
 
 class AsyncResearchStatus(BaseModel):

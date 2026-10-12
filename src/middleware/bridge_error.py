@@ -36,6 +36,7 @@ Reasons (error.reason) — narrow stable identifiers for panel aggregation:
     upstream_request_rejected        → upstream 4xx, request not servable (4xx)
     vision_response_rejected         → 200, but the answer was a refusal  (422)
     vision_response_unreadable       → 200, but the answer can't be read  (422)
+    modell_abbruch                   → the model's safety classifier refused (422)
 
 Every response includes a `Retry-After` header when retryable.
 """
@@ -112,6 +113,11 @@ REASON_UPSTREAM_REJECTED = "upstream_request_rejected"
 # paid; the identical request gets the same answer again (BR9f).
 REASON_VISION_RESPONSE_REJECTED = "vision_response_rejected"
 REASON_VISION_RESPONSE_UNREADABLE = "vision_response_unreadable"
+# BRREFUSAL (FK32 b): the model's safety classifier refused the request inside
+# the CLI. Same word as research's fehler_code for a model stop
+# (lauf_abschluss.ModellAbbruch) — one code for one cause on every path. Also
+# carried in error.code and error.fehler_code.
+REASON_MODELL_ABBRUCH = "modell_abbruch"
 # 500-class (contract violation — must be investigated)
 REASON_INTERNAL = "worker_internal_error"
 REASON_MISCONFIGURED = "worker_misconfigured"
@@ -751,6 +757,65 @@ class CliApiError(ClassifiedError):
                     else REASON_UPSTREAM_REJECTED),
             message=f"Anthropic rejected the request (not retryable): {detail}",
             status_code=self.status, retryable_override=False, extra=extra,
+        )
+
+
+class CliModellAbbruch(CliApiError):
+    """The model's safety classifier refused, and the CLI ended the run with an
+    API-error turn (BRREFUSAL, FK32 b, 12.10.2026).
+
+    Measured on dev (CLI 2.1.285, f81d92d461ad, 20:04-20:08Z): the classifier
+    stopped turn 1, the CLI's own same-model retry was refused again, and the
+    run ended in the API-error frame ("…'s safeguards flagged this message").
+    That frame has no HTTP status, so CliApiError made it a retryable 429 with
+    Retry-After 30, and Energy sent the same context up to 24 times as if it
+    were a capacity shortage.
+
+    Recognised from structured CLI fields only (claude_cli.cli_refusal_signal):
+    the API-error turn's stop_reason "refusal", or the CLI's system message
+    subtype "model_refusal_no_fallback" — never from the sentence.
+
+    422, not 409 or 429: the request was understood and cannot be served as it
+    stands (Unprocessable Content). 429/5xx mean "come back later" to every
+    caller that decides on the status alone (Energy bridge_fehlerform,
+    nginx, werking-report); 409 already means a job/idempotency state conflict
+    on this bridge (job_already_running, idempotency_key_reused, job_terminal).
+    422 is the status the bridge already gives a vision refusal
+    (vision_response_rejected). Not retryable, no Retry-After."""
+
+    fehler_code = REASON_MODELL_ABBRUCH
+
+    def __init__(self, status: Optional[int], cli_error: Optional[str], text: str,
+                 worker_id: str, refusal: Dict[str, Any]) -> None:
+        super().__init__(status, cli_error, text, worker_id)
+        # {"stop_reason", "category", "quelle"} — quelle names which CLI field
+        # carried the refusal (api_error_turn / model_refusal_no_fallback).
+        self.refusal = dict(refusal)
+        self.retryable = False
+        self.retry_after_s = None
+
+    def _transient(self) -> bool:
+        return False
+
+    def envelope(self) -> JSONResponse:
+        return bridge_error(
+            source=SOURCE_UPSTREAM_ANTHROPIC, error_type=TYPE_UPSTREAM_ERROR,
+            reason=REASON_MODELL_ABBRUCH,
+            message=(
+                "The model's safety classifier refused this request (not retryable: "
+                "the same content meets the same classifier; change the content). "
+                f"category={self.refusal.get('category')}. CLI: {self.text[:300]}"
+            ),
+            status_code=422, retryable_override=False,
+            extra={
+                "code": REASON_MODELL_ABBRUCH,
+                "fehler_code": REASON_MODELL_ABBRUCH,
+                "stop_reason": self.refusal.get("stop_reason") or "refusal",
+                "category": self.refusal.get("category"),
+                "refusal_quelle": self.refusal.get("quelle"),
+                "upstream_status": self.status,
+                "cli_error": self.cli_error,
+            },
         )
 
 

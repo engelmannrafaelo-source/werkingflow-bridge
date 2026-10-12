@@ -4,6 +4,10 @@ Modus "regel": die ttl-Reihenfolgeregel der echten API. Geprueft wird wie dort i
 Reihenfolge tools, system, messages; ein Block ohne ttl gilt als 5m. Kommt ein 1h-Block
 nach einem 5m-Block -> 400 invalid_request_error mit dem Wortlaut aus DBD2, sonst eine
 normale SSE-Antwort "OK". Modus "immer400": jede Anfrage 400 mit demselben Wortlaut.
+Modus "refusal" (BRREFUSAL): jede Anfrage antwortet mit einem angefangenen Text und
+endet mit stop_reason "refusal" samt stop_details (Form wie FK32, Kategorie
+reasoning_extraction). Modus "refusal_dann_ok": die erste Messages-Anfrage so, jede
+weitere normal "OK" — zeigt, ob die CLI nach einem Refusal einen Folgezug schickt.
 
 Jede Anfrage liegt danach als req-NNN.json im Mitschnittordner, das Urteil daneben.
 Aufruf als Skript: python3 -I messages_api_attrappe.py <port> <ordner> [regel|immer400]
@@ -73,11 +77,12 @@ def handler(out: str, mode: str):
                 self.end_headers()
                 self.wfile.write(b'{"input_tokens": 10}')
                 return
-            bad = (
-                ttl_violation(json.loads(body))
-                if mode == "regel"
-                else "messages.0.content.0.cache_control.ttl"
-            )
+            messages_nr = sum(1 for _ in __import__("glob").glob(f"{out}/req-*.verdict")) + 1
+            refusal = mode == "refusal" or (mode == "refusal_dann_ok" and messages_nr == 1)
+            if mode in ("regel", "refusal", "refusal_dann_ok"):
+                bad = ttl_violation(json.loads(body)) if mode == "regel" else None
+            else:
+                bad = "messages.0.content.0.cache_control.ttl"
             if bad:
                 err = {
                     "type": "error",
@@ -98,7 +103,7 @@ def handler(out: str, mode: str):
                     f.write("400 " + bad)
                 return
             with open(f"{out}/req-{n:03d}.verdict", "w") as f:
-                f.write("200")
+                f.write("200 refusal" if refusal else "200")
             self.send_response(200)
             self.send_header("content-type", "text/event-stream")
             self.end_headers()
@@ -133,7 +138,8 @@ def handler(out: str, mode: str):
                     {
                         "type": "content_block_delta",
                         "index": 0,
-                        "delta": {"type": "text_delta", "text": "OK"},
+                        "delta": {"type": "text_delta",
+                                  "text": '<teil nr="1">angefangen' if refusal else "OK"},
                     },
                 ),
                 ("content_block_stop", {"type": "content_block_stop", "index": 0}),
@@ -141,7 +147,14 @@ def handler(out: str, mode: str):
                     "message_delta",
                     {
                         "type": "message_delta",
-                        "delta": {"stop_reason": "end_turn", "stop_sequence": None},
+                        "delta": (
+                            {"stop_reason": "refusal", "stop_sequence": None,
+                             "stop_details": {"type": "refusal",
+                                              "category": "reasoning_extraction",
+                                              "explanation": "Attrappe"}}
+                            if refusal else
+                            {"stop_reason": "end_turn", "stop_sequence": None}
+                        ),
                         "usage": {"output_tokens": 1},
                     },
                 ),

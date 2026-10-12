@@ -64,7 +64,7 @@ from src.claude_cli import (
     StreamEndedWithoutCompletion,
     RESEARCH_OUTPUT_FILENAME,
 )
-from src.middleware.bridge_error import CliApiError, SDKDisconnectError
+from src.middleware.bridge_error import CliApiError, CliModellAbbruch, SDKDisconnectError
 from src.message_adapter import MessageAdapter
 from src import cache_boundary
 from src.tool_leak_detector import hardened_system_prompt, looks_like_tool_leak
@@ -2104,8 +2104,22 @@ async def generate_streaming_response(
             # answers with the error's own status (event_stream_response);
             # after the first chunk → event: error with status and cause.
             if not role_sent:
+                if isinstance(e, CliModellAbbruch) and fastapi_request is not None:
+                    # Leaves the generator before the usage block below; the
+                    # refusal still gets its audit row (BRREFUSAL).
+                    try:
+                        await _modell_abbruch_buchen(
+                            e, attribution=extract_attribution_context(fastapi_request),
+                            model=request.model, duration_s=time.time() - stream_start_time,
+                            provider=(ledger_provider_for_backend(backend_config.backend)
+                                      if backend_config else PROVIDER_ANTHROPIC),
+                        )
+                    except Exception as _book_err:
+                        logger.error(f"modell_abbruch audit row failed: {_book_err}")
                 raise BridgeError(e.envelope()) from e
             sdk_stream_error = BridgeError(e.envelope())
+            sdk_stream_error.fehler_code = getattr(e, "fehler_code", None)
+            sdk_stream_error.refusal = getattr(e, "refusal", None)
         except Exception as e:
             sdk_stream_error = e
             logger.error(
@@ -2302,7 +2316,7 @@ async def generate_streaming_response(
                 None if sdk_stream_error is None
                 else "stream_incomplete" if isinstance(sdk_stream_error, StreamEndedWithoutCompletion)
                 else "account_rate_limited" if isinstance(sdk_stream_error, RateLimitError)
-                else "sdk_crash"
+                else getattr(sdk_stream_error, "fehler_code", None) or "sdk_crash"
             )
 
             stream_result_usage = None
@@ -2388,7 +2402,14 @@ async def generate_streaming_response(
                         f"{type(sdk_stream_error).__name__}: {str(sdk_stream_error)[:300]}"
                         if sdk_stream_error is not None else None
                     ),
-                    provider_meta={"usage_source": stream_usage_source},
+                    provider_meta={
+                        "usage_source": stream_usage_source,
+                        # BRREFUSAL: why the stream ended, when the model refused
+                        **({"stop_reason": _refusal.get("stop_reason"),
+                            "category": _refusal.get("category"),
+                            "refusal_quelle": _refusal.get("quelle")}
+                           if (_refusal := getattr(sdk_stream_error, "refusal", None)) else {}),
+                    },
                 )
         except Exception as track_err:
             logger.warning(f"⚠️ Streaming usage tracking failed (non-fatal): {track_err}")
@@ -5044,6 +5065,16 @@ async def _chat_completions_lauf(
             logger.debug(f"rolling_metrics completion (Exception) failed: {_e}")
 
         logger.error(f"Chat completion error: {e}")
+        if isinstance(e, CliModellAbbruch):
+            try:
+                await _modell_abbruch_buchen(
+                    e, attribution=extract_attribution_context(request),
+                    model=request_body.model, duration_s=duration,
+                    provider=ledger_provider_for_backend(
+                        getattr(locals().get("backend_config"), "backend", None)),
+                )
+            except Exception as _book_err:
+                logger.error(f"modell_abbruch audit row failed: {_book_err}")
         # Classify — upstream markers (overloaded/gateway/timeout) get tagged
         # as source=upstream_anthropic / upstream_network so apps can tell the
         # error came from Anthropic, not the bridge itself. Only unclassifiable
@@ -6518,7 +6549,11 @@ async def _execute_research_impl(
                 cache_creation_tokens=accumulated_cache_creation or 0,
                 status="error",
                 duration_ms=int(execution_time * 1000),
-                error_code="research_error",
+                # BRREFUSAL: a model refusal is named in the audit, not hidden
+                # behind the generic code.
+                error_code=("modell_abbruch"
+                            if getattr(e, "fehler_code", None) == "modell_abbruch"
+                            else "research_error"),
                 app_env=attribution_ctx.get("app_env") if attribution_ctx else None,
                 # Der error_code hier ist eine feste Kennung und erklaert nichts —
                 # ohne den Text bleibt offen, WARUM der Call scheiterte.
@@ -6565,6 +6600,41 @@ def _eigenes_urteil(e: BaseException) -> Dict[str, Any]:
     after = getattr(e, "retry_after_s", None)
     return {"retryable": retryable,
             "retry_after_s": after if isinstance(after, int) else None}
+
+
+async def _modell_abbruch_buchen(
+    e: BaseException, *, attribution: Dict[str, Any], model: str, duration_s: float,
+    provider: str,
+) -> None:
+    """Audit row for a chat run the model's safety classifier refused
+    (CliModellAbbruch, BRREFUSAL). Before, such a run ended as CliApiError with
+    no ledger row at all (FK32: attempts 1, 2, 4 of f81d92d461ad). status=error,
+    error_code modell_abbruch; the usage the CLI reported for the withheld
+    result goes into provider_meta only — an error row does not bill."""
+    from src.activity.ai_call_writer import persist_ai_call_activity
+
+    refusal = getattr(e, "refusal", None) or {}
+    await persist_ai_call_activity(
+        provider=provider,
+        app_id=attribution.get("app_id"),
+        user_id=attribution.get("user_id"),
+        agent_id=attribution.get("agent_id"),
+        workflow_id=attribution.get("workflow_id"),
+        model=model,
+        input_tokens=0,
+        output_tokens=0,
+        status="error",
+        duration_ms=int(duration_s * 1000),
+        error_code=getattr(e, "fehler_code", None) or "modell_abbruch",
+        error_message=str(e)[:500],
+        app_env=attribution.get("app_env"),
+        provider_meta={
+            "stop_reason": refusal.get("stop_reason"),
+            "category": refusal.get("category"),
+            "refusal_quelle": refusal.get("quelle"),
+            "usage_vorenthalten": getattr(e, "usage", None),
+        },
+    )
 
 
 def _mark_retryable(message: str) -> str:
@@ -8021,7 +8091,9 @@ async def _execute_doc_agent_impl(
                 output_tokens=accumulated_output_tokens or 0,
                 status="error",
                 duration_ms=int(execution_time * 1000),
-                error_code="doc_agent_error",
+                error_code=("modell_abbruch"
+                            if getattr(e, "fehler_code", None) == "modell_abbruch"
+                            else "doc_agent_error"),
                 app_env=attribution_ctx.get("app_env") if attribution_ctx else None,
                 # Der error_code hier ist eine feste Kennung und erklaert nichts —
                 # ohne den Text bleibt offen, WARUM der Call scheiterte.
@@ -8037,6 +8109,8 @@ async def _execute_doc_agent_impl(
             execution_time_seconds=round(execution_time, 2),
             session_id=session_id,
             error=str(e),
+            fehler_code=("modell_abbruch"
+                         if getattr(e, "fehler_code", None) == "modell_abbruch" else None),
             **_eigenes_urteil(e),
         )
 

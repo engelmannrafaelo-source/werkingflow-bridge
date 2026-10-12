@@ -398,7 +398,7 @@ class RateLimitError(Exception):
 
 
 from src.middleware.bridge_error import SDKDisconnectError  # noqa: F401 (re-exported)
-from src.middleware.bridge_error import CliApiError
+from src.middleware.bridge_error import CliApiError, CliModellAbbruch
 
 import re as _re
 _QUOTA_EXHAUSTION_RE = _re.compile(
@@ -629,7 +629,14 @@ def detect_cli_api_error(message: Any) -> Optional[Dict[str, Any]]:
     if CLI_OUTPUT_LIMIT_ERROR in (cli_error, get("api_error")):
         return None
     if is_turn:
-        return {"status": None, "cli_error": cli_error, "text": text or ""}
+        turn = {"status": None, "cli_error": cli_error, "text": text or ""}
+        # BRREFUSAL: the CLI's refusal error frame is this turn with
+        # stop_reason "refusal" (cli_refusal_signal_of_turn).
+        if get("stop_reason") is not None:
+            details = get("stop_details")
+            turn["stop_reason"] = get("stop_reason")
+            turn["category"] = details.get("category") if isinstance(details, dict) else None
+        return turn
     if is_result:
         status = get("api_error_status")
         if isinstance(status, int) or get("terminal_reason") == "api_error":
@@ -638,14 +645,108 @@ def detect_cli_api_error(message: Any) -> Optional[Dict[str, Any]]:
     return None
 
 
+# =============================================================================
+# MODEL REFUSAL THAT ENDS THE RUN (BRREFUSAL, FK32 b, 12.10.2026)
+#
+# When the safety classifier stops an answer and no retry follows (or the
+# retry is refused again), the CLI ends the run with its API-error frame — an
+# assistant turn flagged is_api_error_message whose stop_reason is "refusal" —
+# and emits a system message subtype "model_refusal_no_fallback". CLI 2.1.285
+# and 2.1.296 document that message as "the structured counterpart to
+# detecting stop_reason 'refusal' on the assistant error frame" (SDK schema in
+# the CLI bundle; internal check: isApiErrorMessage && stop_reason ===
+# "refusal"). Both are fields; the sentence ("…'s safeguards flagged this
+# message") is never read. Measured on dev 12.10.2026 (171b5947, 27415153,
+# d308d235, 29d39a14, 2cbb3ec6): every hard "safeguards flagged" run carried
+# model_refusal_no_fallback with api_refusal_category.
+#
+# CLAUDE_CODE_DISABLE_REFUSAL_RETRY (same CLI versions) switches the CLI's
+# same-model retry after a refusal off — the "continuing once with that
+# noted" follow-up turn that re-sent the full context (FK32: 835k-919k booked
+# for one ~455k request) and never produced a usable answer: the bridge holds
+# it back in every path (lauf_abschluss.AbbruchFilter). Only a refusal is
+# affected; every other multi-turn run (tools, max_output_tokens continuation)
+# keeps its turns.
+# =============================================================================
+CLI_REFUSAL_NO_FALLBACK_SUBTYPE = "model_refusal_no_fallback"
+CLI_DISABLE_REFUSAL_RETRY_ENV = "CLAUDE_CODE_DISABLE_REFUSAL_RETRY"
+# Switch for the bridge: "true" lets the CLI retry after a refusal again
+# (pre-BRREFUSAL behaviour). Default: retry off.
+BRIDGE_CLI_REFUSAL_RETRY_ENV = "BRIDGE_CLI_REFUSAL_RETRY"
+
+
+def cli_refusal_retry_allowed() -> bool:
+    return os.getenv(BRIDGE_CLI_REFUSAL_RETRY_ENV, "false").strip().lower() in ("true", "1", "yes")
+
+
+def apply_refusal_retry_policy(options: "ClaudeCodeOptions") -> None:
+    """Switch the CLI's same-model retry after a refusal off for this run's
+    subprocess (options.env, like apply_thinking_budget), unless
+    BRIDGE_CLI_REFUSAL_RETRY allows it."""
+    if cli_refusal_retry_allowed():
+        logger.info(f"↩️ {BRIDGE_CLI_REFUSAL_RETRY_ENV}=true — CLI may retry after a refusal")
+        return
+    options.env = {**(options.env or {}), CLI_DISABLE_REFUSAL_RETRY_ENV: "1"}
+
+
+def cli_refusal_signal_of_turn(turn: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """Refusal signal of a withheld API-error turn (detect_cli_api_error):
+    its stop_reason is "refusal". None otherwise."""
+    if not turn or turn.get("stop_reason") not in MODELL_ABBRUCH_STOP_REASONS:
+        return None
+    return {"stop_reason": turn["stop_reason"], "category": turn.get("category"),
+            "quelle": "api_error_turn"}
+
+
+def cli_refusal_signal(message: Any) -> Optional[Dict[str, Any]]:
+    """{stop_reason, category, quelle} if `message` is the CLI's system message
+    "model_refusal_no_fallback", else None. SDK form: SystemMessage(subtype,
+    data); dict form: {"type": "system", "subtype": ..., ...} or with "data"."""
+    if message is None:
+        return None
+    if isinstance(message, dict):
+        subtype = message.get("subtype")
+        data = message.get("data") if isinstance(message.get("data"), dict) else message
+        if message.get("type") not in (None, "system") and data.get("type") != "system":
+            return None
+    else:
+        if type(message).__name__ != "SystemMessage":
+            return None
+        subtype = getattr(message, "subtype", None)
+        data = getattr(message, "data", None)
+        data = data if isinstance(data, dict) else {}
+    if subtype != CLI_REFUSAL_NO_FALLBACK_SUBTYPE:
+        return None
+    return {"stop_reason": "refusal", "category": data.get("api_refusal_category"),
+            "quelle": CLI_REFUSAL_NO_FALLBACK_SUBTYPE}
+
+
 def raise_cli_api_error(worker_id: str, turn: Optional[Dict[str, Any]],
                         result: Optional[Dict[str, Any]],
-                        usage: Optional[Dict[str, int]] = None) -> None:
+                        usage: Optional[Dict[str, int]] = None,
+                        refusal: Optional[Dict[str, Any]] = None) -> None:
     """Log loudly and raise CliApiError from the withheld turn and/or result.
-    `usage`: what the withheld result message reported (extract_result_usage)."""
+    `usage`: what the withheld result message reported (extract_result_usage).
+    `refusal`: the run's refusal signal (cli_refusal_signal) — then the error
+    is the model's refusal (CliModellAbbruch, 422, not retryable), not an
+    upstream capacity error."""
     status = (result or {}).get("status")
     cli_error = (turn or {}).get("cli_error")
     text = (turn or {}).get("text") or (result or {}).get("text") or ""
+    if refusal is None:
+        refusal = cli_refusal_signal_of_turn(turn)
+    if refusal is not None:
+        logger.error(
+            f"🛑 Model refusal inside the CLI on worker {worker_id}: "
+            f"category={refusal.get('category')} quelle={refusal.get('quelle')} "
+            f"status={status} — answer withheld, raising CliModellAbbruch "
+            f"(422 modell_abbruch, not retryable). CLI text: {text[:300]!r}",
+            extra={"cli_api_error": True, "modell_abbruch": True,
+                   "worker_id": worker_id, "upstream_status": status},
+        )
+        err = CliModellAbbruch(status, cli_error, text, worker_id, refusal)
+        err.usage = usage
+        raise err
     logger.error(
         f"🛑 API error inside the CLI on worker {worker_id}: status={status} "
         f"cli_error={cli_error} — answer withheld, raising CliApiError. "
@@ -1966,6 +2067,12 @@ class ClaudeCodeCLI:
         # before the outer try: every later way out (result, end of stream,
         # timeout, SDK crash) must still end in CliApiError (CACHEFIX2).
         _api_error_turn: Optional[Dict[str, Any]] = None
+        # BRREFUSAL: the CLI's model_refusal_no_fallback (cli_refusal_signal),
+        # whether a streamed assistant chunk carried the refusal stop itself,
+        # and the usage of the run's result (for a refusal raised after it).
+        _refusal_signal: Optional[Dict[str, Any]] = None
+        _refusal_stop_gestreamt = False
+        _result_usage: Optional[Dict[str, int]] = None
         try:
             # CRITICAL: Verify ANTHROPIC_API_KEY is NOT in environment
             # If present, the SDK silently falls back to paid API when OAuth fails.
@@ -2246,6 +2353,8 @@ class ClaudeCodeCLI:
                 # not os.environ — concurrent requests on this worker must not
                 # see each other's budget.
                 apply_thinking_budget(options, max_thinking_tokens)
+                # BRREFUSAL: no same-model retry after a refusal (full context again).
+                apply_refusal_retry_policy(options)
 
                 # Set permission mode if specified via environment variable
                 permission_mode = os.getenv("CLAUDE_PERMISSION_MODE")
@@ -2493,6 +2602,9 @@ class ClaudeCodeCLI:
                 fortsetzung_ausstehend = False
                 nach_abbruch_ausstehend = False
                 _api_error_turn = None
+                _refusal_signal = None
+                _refusal_stop_gestreamt = False
+                _result_usage = None
                 try:
                     async with asyncio.timeout(_timeout):
                         async for message in query(prompt=prompt_source, options=options):
@@ -2534,6 +2646,17 @@ class ClaudeCodeCLI:
                             # flagged turn, then a result carrying the status.
                             # Never yield the turn — raise at the result (or
                             # at the end of the stream, see below).
+                            _refusal = cli_refusal_signal(message)
+                            if _refusal is not None:
+                                _refusal_signal = _refusal
+                                logger.warning(
+                                    f"🛑 CLI model_refusal_no_fallback in session {cli_session_id} "
+                                    f"(category={_refusal.get('category')}) — the run ends as a "
+                                    f"model refusal",
+                                    extra={"cli_session_id": cli_session_id,
+                                           "modell_abbruch": True},
+                                )
+
                             _api_error = detect_cli_api_error(message)
                             if _api_error is not None:
                                 if (type(message).__name__ == 'ResultMessage'
@@ -2544,6 +2667,7 @@ class ClaudeCodeCLI:
                                         usage=extract_result_usage(
                                             sdk_message_to_dict(message)
                                         ),
+                                        refusal=_refusal_signal,
                                     )
                                 _api_error_turn = _api_error
                                 continue
@@ -2657,6 +2781,11 @@ class ClaudeCodeCLI:
                             if ist_assistent and nach_abbruch_ausstehend and isinstance(message, dict):
                                 message[NACH_MODELLABBRUCH_KEY] = True
                                 nach_abbruch_ausstehend = False
+                            if isinstance(message, dict):
+                                if ist_assistent and ist_modell_abbruch(message):
+                                    _refusal_stop_gestreamt = True
+                                if is_result_chunk(message):
+                                    _result_usage = extract_result_usage(message) or _result_usage
                             logger.debug(f"Converted message dict: {message}")
 
                             # Cache chunk to file for crash recovery (with error handling)
@@ -2732,7 +2861,7 @@ class ClaudeCodeCLI:
                         # only how its stream ended.
                         raise_cli_api_error(
                             os.environ.get("INSTANCE_NAME", "unknown"),
-                            _api_error_turn, None,
+                            _api_error_turn, None, refusal=_refusal_signal,
                         )
                     logger.error(f"⏱️ TIMEOUT: SDK query timed out after {_timeout}s")
                     logger.error(f"   Timeout Type: Claude Code SDK Query (Inner Loop)")
@@ -2778,7 +2907,17 @@ class ClaudeCodeCLI:
                     # Flagged turn, but the stream ended without a result.
                     raise_cli_api_error(
                         os.environ.get("INSTANCE_NAME", "unknown"),
-                        _api_error_turn, None,
+                        _api_error_turn, None, refusal=_refusal_signal,
+                    )
+                if _refusal_signal is not None and not _refusal_stop_gestreamt:
+                    # The CLI said "refusal, no retry" (model_refusal_no_fallback)
+                    # but no streamed chunk carried the stop, so the acceptance
+                    # point (lauf_abschluss) could not see it: without this the
+                    # run would pass as finished. With the CLI's retry off
+                    # there is no meta turn either (NACH_MODELLABBRUCH_KEY).
+                    raise_cli_api_error(
+                        os.environ.get("INSTANCE_NAME", "unknown"),
+                        None, None, usage=_result_usage, refusal=_refusal_signal,
                     )
 
                 # Post-streaming validation: Check for completion marker
@@ -3119,6 +3258,20 @@ class ClaudeCodeCLI:
                 )
                 raise_cli_api_error(
                     os.environ.get("INSTANCE_NAME", "unknown"), _api_error_turn, None,
+                    refusal=_refusal_signal,
+                )
+            if _refusal_signal is not None:
+                # The CLI reported the refusal (model_refusal_no_fallback);
+                # the crash after it is how the stream ended. The generic
+                # classifier below would read it as capacity/rate limit.
+                cli_session_manager.complete_session(cli_session_id, status="failed")
+                logger.error(
+                    f"SDK ended with {type(e).__name__} after the CLI's refusal "
+                    f"signal: {e} — raising the model refusal"
+                )
+                raise_cli_api_error(
+                    os.environ.get("INSTANCE_NAME", "unknown"), None, None, usage=_result_usage,
+                    refusal=_refusal_signal,
                 )
             logger.error(f"Claude Code SDK error: {e}")
 
