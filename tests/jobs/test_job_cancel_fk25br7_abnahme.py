@@ -162,3 +162,51 @@ async def test_stop_running_sees_pending_again_is_loud(mem, monkeypatch):
     monkeypatch.setattr(routes, "abbruch_melden", zurueck)
     with pytest.raises(RuntimeError, match="unexpected status 'pending'"):
         await f._delete(f.JOB, f.OWNER_HEADERS)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("ledger", ["unbekannt", "gebucht", None])
+async def test_w1_mark_error_after_watchdog_keeps_cancelled(pg_store, monkeypatch, caplog, ledger):
+    """FK25BR R8 P2-a, the reviewer's W1 (test_r8_wettlauf.py,
+    test_w1_watchdog_zuerst_dann_mark_error; it printed 'error' + 409): the
+    watchdog closed the row while the runner still lived; the runner's late
+    mark_error must not turn 'cancelled'/'unbekannt' into a retryable error.
+    Also for a row closed by a stop ('gebucht') or a pending cancel (no account)."""
+    a._real_store(monkeypatch)
+    if ledger == "unbekannt":
+        await b._insert(pg_store, f.JOB, "running", attribution=f.OWNER_ATTR)
+        await store.cancel_job(f.JOB)
+        await selbstaufruf._buchung_offen_vermerken(f.JOB, "job_cancelled", {"uid-offen-1": {}})
+        await a._altern(pg_store, f.JOB)
+        await store.claim_stale_job(1, 5)
+    elif ledger == "gebucht":
+        await b._insert(pg_store, f.JOB, "running", attribution=f.OWNER_ATTR)
+        await store.cancel_job(f.JOB)
+        await registry._als_abgebrochen_schliessen(f.JOB, "chat", {"ledger": "gebucht"})
+    else:
+        await b._insert(pg_store, f.JOB, "pending", attribution=f.OWNER_ATTR)
+        await store.cancel_job(f.JOB)
+    vorher = await store.get_job(f.JOB)
+    assert vorher["status"] == "cancelled"
+    await store.mark_error(f.JOB, "late runner error", code="EXECUTOR_ERROR", retryable=True)
+    nachher = await store.get_job(f.JOB)
+    assert (nachher["status"], nachher["progress"], nachher["error"]) == (
+        "cancelled", vorher["progress"], vorher["error"],
+    )
+    assert any(r.levelname == "ERROR" and "mark_error" in r.message and "ignored" in r.message
+               for r in caplog.records)
+    r = await f._delete(f.JOB, f.OWNER_HEADERS)
+    if ledger == "unbekannt":
+        assert (r.status_code, r.json()["error"]["code"]) == (502, "job_cancel_ledger_unknown")
+    else:
+        assert r.status_code == 200
+    g = (await _get(f.JOB)).json()
+    assert (g["status"], g["error"]) == ("cancelled", None)
+
+
+@pytest.mark.asyncio
+async def test_mark_error_on_vanished_row_still_raises(pg_store, monkeypatch):
+    """The 'cancelled' carve-out does not hide a row that is really gone."""
+    a._real_store(monkeypatch)
+    with pytest.raises(store.JobRowMissing):
+        await store.mark_error("job_dev_" + "f" * 32, "boom", code="EXECUTOR_ERROR")

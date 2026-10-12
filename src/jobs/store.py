@@ -15,10 +15,13 @@ and read back with _loads (asyncpg returns jsonb as text by default).
 """
 import hashlib
 import json
+import logging
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 from src.db.client import get_pool
+
+logger = logging.getLogger(__name__)
 
 # Terminal vs in-flight. Polling clients stop on done/error/cancelled.
 JOB_STATUS_PENDING = "pending"
@@ -464,6 +467,9 @@ async def mark_error(
     (routes._cancelled_answer), GET reads 'cancelled', never a retryable
     error. Decided in the same statement as the update, under its row lock.
 
+    A row that is already 'cancelled' (closed by the watchdog, a stop or
+    defer_job) is left as it is — logged, not overwritten (FK25BR R8 P2-a).
+
     Raises JobRowMissing when the row is gone."""
     from src.error_contract import job_error_details
 
@@ -499,11 +505,28 @@ async def mark_error(
                        ELSE progress END,
                    error = $2::jsonb,
                    updated_at = NOW(), finished_at = NOW()
-             WHERE job_id = $1
+             WHERE job_id = $1 AND status <> 'cancelled'
             """,
             job_id,
             json.dumps(error, default=str),
         )
+        if _affected(tag) == 0:
+            # 'cancelled' is terminal and carries its account (the watchdog's
+            # 'unbekannt', a stop's report): a late runner error must not turn
+            # it into an ordinary, retryable error (FK25BR R8 P2-a). Kept
+            # as is, said loudly; only a row that is really gone raises.
+            zeile = await conn.fetchrow(
+                "SELECT progress->'abbruch'->>'ledger' AS ledger FROM ai_jobs "
+                "WHERE job_id = $1 AND status = 'cancelled'",
+                job_id,
+            )
+            if zeile is not None:
+                logger.error(
+                    f"mark_error for {job_id} ignored: the row is already 'cancelled' "
+                    f"(abbruch.ledger={zeile['ledger']!r}) — late runner error kept "
+                    f"out of it: {error.get('message')!r}"
+                )
+                return
     if _affected(tag) == 0:
         raise JobRowMissing("mark_error", job_id)
 
