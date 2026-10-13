@@ -307,6 +307,60 @@ def _docling_images_scale() -> float:
         )
     return value
 
+
+# Docling keeps every page's raster (at 1.0 AND at ``images_scale``) until the
+# whole conversion ends whenever ``generate_picture_images`` is on
+# (``keep_images`` in docling's StandardPdfPipeline), so one ``convert`` over the
+# whole PDF grows linearly with the page count. A 1393-page PDF took the shared
+# GPU document service (Dev AND Prod, 16 GiB) down by cgroup OOM on 12.10.2026.
+# Above DOCLING_BATCH_PAGES pages the PDF is converted in page_range batches and
+# the documents are concatenated; at or below it the single-pass path is the
+# unchanged historic one (byte-identical output).
+# Measured 13.10.2026 (CPU, synthetic A4 pages with one photo each): at
+# images_scale 3 Docling holds 14.3 MB of rasters per page until the end and
+# peaks ~62 MB per page in flight; batched, the peak stays flat over the whole
+# document. 25 pages ≈ 1.6 GB per conversion, two concurrent conversions
+# (BRIDGE_MAX_CONCURRENT_CONVERSIONS) ≈ 3.1 GB on top of the models.
+DOCLING_BATCH_PAGES_DEFAULT = 25
+# Hard cap: above this a PDF is refused (HTTP 413) before Docling runs. Batching
+# bounds Docling's memory, not the run time: at ~0.45 s/page (measured CPU
+# 2.7 s/page, GPU OCR ~6x faster — not measured on the GPU host) 600 pages fit
+# the main caller's 300 s whole-document timeout; a longer run keeps a shared
+# conversion slot busy after its caller has already given up.
+DOCLING_MAX_PAGES_DEFAULT = 600
+
+
+class DocumentTooLargeError(ValueError):
+    """The document exceeds a hard size limit — callers map this to HTTP 413.
+
+    Never retried by another adapter and never answered with a partial result:
+    the message names the limit and how to get under it.
+    """
+
+
+def _positive_int_env(name: str, default: int) -> int:
+    """``name`` as int >= 1; unset/empty → ``default``; anything else fails loud."""
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError as e:
+        raise ValueError(f"{name}={raw!r} ist keine ganze Zahl") from e
+    if value < 1:
+        raise ValueError(f"{name}={value} muss mindestens 1 sein")
+    return value
+
+
+def _docling_batch_pages() -> int:
+    """Pages per Docling ``convert`` call (``DOCLING_BATCH_PAGES``)."""
+    return _positive_int_env("DOCLING_BATCH_PAGES", DOCLING_BATCH_PAGES_DEFAULT)
+
+
+def _docling_max_pages() -> int:
+    """Largest PDF page count the service accepts (``DOCLING_MAX_PAGES``)."""
+    return _positive_int_env("DOCLING_MAX_PAGES", DOCLING_MAX_PAGES_DEFAULT)
+
 # A page with fewer than this many native (non-OCR) text-layer characters is
 # treated as image/scan-only and rendered whole for Vision.
 MIN_PAGE_TEXT_CHARS = 40
@@ -567,11 +621,11 @@ def _docling_convert_pdf(
         tmp_pdf_path = tmp_pdf.name
 
     try:
-        result = converter.convert(tmp_pdf_path)
+        document = _docling_document(converter, tmp_pdf_path, pdf_bytes)
 
         with tempfile.TemporaryDirectory() as tmp_dir:
             md_path = os.path.join(tmp_dir, "output.md")
-            result.document.save_as_markdown(md_path, image_mode=ImageRefMode.REFERENCED)
+            document.save_as_markdown(md_path, image_mode=ImageRefMode.REFERENCED)
 
             with open(md_path, "r") as f:
                 markdown = f.read()
@@ -588,9 +642,7 @@ def _docling_convert_pdf(
             for img_name in figures:
                 markdown = markdown.replace(os.path.join(artifacts_dir, img_name), img_name)
 
-            page_count = (
-                len(result.document.pages) if hasattr(result.document, "pages") else None
-            )
+            page_count = len(document.pages) if hasattr(document, "pages") else None
 
             # Optional per-page split for callers that need page-faithful text
             # (e.g. selective anonymization: user picks the PII pages, only
@@ -607,7 +659,7 @@ def _docling_convert_pdf(
             page_markdowns: Optional[List[Dict[str, Any]]] = None
             try:
                 paged_path = os.path.join(tmp_dir, "paged.md")
-                result.document.save_as_markdown(
+                document.save_as_markdown(
                     paged_path,
                     image_mode=ImageRefMode.REFERENCED,
                     page_break_placeholder=PAGE_BREAK_TOKEN,
@@ -636,7 +688,7 @@ def _docling_convert_pdf(
             # yields None — never a caption on the wrong photo.
             figure_meta: Optional[List[Dict[str, Any]]] = None
             try:
-                raw_meta = _figure_meta(result.document)
+                raw_meta = _figure_meta(document)
                 by_index = {
                     int(name[len("image_"):len("image_") + 6]): name
                     for name in figures
@@ -662,6 +714,67 @@ def _docling_convert_pdf(
             return markdown, page_count, figures, page_markdowns, figure_meta
     finally:
         os.unlink(tmp_pdf_path)
+
+
+def _docling_document(converter: Any, pdf_path: str, pdf_bytes: bytes) -> Any:
+    """Docling's document for the whole PDF — one pass, or concatenated batches.
+
+    Up to ``DOCLING_BATCH_PAGES`` pages: exactly the historic single
+    ``converter.convert`` (same output, byte for byte). Above it: one
+    ``convert(page_range=…)`` per batch, so Docling never holds more than one
+    batch of page rasters, then ``DoclingDocument.concatenate`` — a single export
+    of the merged document keeps the figure numbering, the page-break split and
+    the figure pages exactly as one export of the whole PDF would.
+
+    Fail loud, never a partial document: a batch that raises, that Docling only
+    reports as PARTIAL_SUCCESS (Docling does NOT raise on that) or whose pages
+    are not exactly its range raises, naming the batch — the caller's existing
+    contract (render every page for Vision, ``docling_parsed: false``) applies.
+    """
+    import pypdfium2 as pdfium
+
+    pdf = pdfium.PdfDocument(pdf_bytes)
+    try:
+        total_pages = len(pdf)
+    finally:
+        pdf.close()
+    batch_pages = _docling_batch_pages()
+    if total_pages <= batch_pages:
+        return converter.convert(pdf_path).document
+
+    from docling.datamodel.base_models import ConversionStatus
+    from docling_core.types.doc import DoclingDocument
+
+    parts: List[Any] = []
+    for start in range(1, total_pages + 1, batch_pages):
+        end = min(total_pages, start + batch_pages - 1)
+        where = f"Docling-Stapel Seiten {start}-{end} von {total_pages}"
+        try:
+            result = converter.convert(pdf_path, page_range=(start, end))
+        except Exception as e:  # noqa: BLE001 — re-raised with the batch named
+            raise RuntimeError(f"{where} gescheitert: {e}") from e
+        if result.status != ConversionStatus.SUCCESS:
+            errors = "; ".join(str(err.error_message) for err in result.errors or [])
+            raise RuntimeError(
+                f"{where} nur teilweise umgewandelt (Status {result.status.value}"
+                f"{': ' + errors if errors else ''})"
+            )
+        got = sorted(result.document.pages)
+        if got != list(range(start, end + 1)):
+            raise RuntimeError(f"{where}: Docling lieferte die Seiten {got[:3]}…{got[-3:]}")
+        parts.append(result.document)
+        # The ConversionResult holds this batch's page rasters; drop it before
+        # the next batch so they never pile up across batches.
+        del result
+        logger.info(f"[pdf] {where} umgewandelt")
+
+    document = DoclingDocument.concatenate(parts)
+    if sorted(document.pages) != list(range(1, total_pages + 1)):
+        raise RuntimeError(
+            f"Docling-Stapel: zusammengefuegtes Dokument hat {len(document.pages)} "
+            f"statt {total_pages} Seiten"
+        )
+    return document
 
 
 # Unusual fixed token: a real document containing it would corrupt the split —
@@ -721,6 +834,21 @@ def convert_pdf_bytes(pdf_bytes: bytes) -> Tuple[str, Dict[str, Any], Dict[str, 
     """
     geometry = _pdf_page_geometry(pdf_bytes)
     total_pages = len(geometry)
+    # Before any Docling or render work, outside the Docling try below: a refused
+    # document must never fall back to rendering all of its pages instead.
+    max_pages = _docling_max_pages()
+    batch_pages = _docling_batch_pages()  # fail loud on a bad value here, not as a Docling fallback
+    if total_pages > max_pages:
+        raise DocumentTooLargeError(
+            f"PDF hat {total_pages} Seiten, die Obergrenze dieses Dienstes ist "
+            f"{max_pages} Seiten (DOCLING_MAX_PAGES). Bitte in Teile mit hoechstens "
+            f"{max_pages} Seiten zerlegen und einzeln umwandeln."
+        )
+    if total_pages > batch_pages:
+        logger.info(
+            f"[pdf] {total_pages} Seiten: Docling in Stapeln zu {batch_pages} Seiten "
+            f"(DOCLING_BATCH_PAGES)"
+        )
 
     # 1. Docling for the text/table Markdown + figure extraction (defensive:
     #    a Docling failure is not fatal — we render every page instead).
