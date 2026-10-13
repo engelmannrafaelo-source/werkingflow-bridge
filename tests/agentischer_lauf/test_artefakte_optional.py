@@ -237,3 +237,16 @@ async def test_cli_file_mode_collects_the_answer_file_through_the_place(tmp_path
     assert set(platz.auftraege[0].ausgaben) == {"bericht.md", "skripte"}
     assert result["herkunft"]["antwort"]["pfad"] == "bericht.md"
     assert {a["pfad"] for a in result["artefakte"]} == {"bericht.md", "skripte/rechne.py"}
+
+
+def test_sibling_targets_sharing_a_name_prefix_are_accepted():
+    """AOPTR2 P3-A: nesting means a "/" boundary. "skripte" and "skripte2" are
+    siblings, among optional targets and against declared ones."""
+    for ausgabe in (
+        {"artefakte": [], "artefakte_optional": ["skripte", "skripte2"]},
+        {"artefakte": [], "artefakte_optional": ["skripte2", "skripte"]},
+        {"artefakte": ["skripte"], "artefakte_optional": ["skripte2"]},
+        {"artefakte": ["skripte2"], "artefakte_optional": ["skripte"]},
+    ):
+        lauf = ResearchRequest(**with_output(payload(), modus="text", **ausgabe)).agentischer_lauf
+        assert lauf.ausgabe.artefakte_optional == ausgabe["artefakte_optional"]
