@@ -42,11 +42,20 @@ def prepare(body):
     return work
 
 
+def cpu_grenze(timeout_s) -> int:
+    """CPU seconds per process: a backstop ABOVE the wall clock. With both at
+    ceil(timeout_s) a busy loop raced them: when SIGXCPU won, the command
+    ended as an ordinary result (exit -24) instead of grenze_zeit (BRINT2,
+    test_res_cpu_loop_times_out_and_cleans). One CPU (--cpus=1) cannot spend
+    more CPU time than wall time, so the wall clock now always ends it first."""
+    return max(1, math.ceil(timeout_s)) + 1
+
+
 def limits(body):
     resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
     resource.setrlimit(resource.RLIMIT_FSIZE, (body["max_bytes"], body["max_bytes"]))
     resource.setrlimit(resource.RLIMIT_NOFILE, (64, 64))
-    cpu = max(1, math.ceil(body["timeout_s"]))
+    cpu = cpu_grenze(body["timeout_s"])
     resource.setrlimit(resource.RLIMIT_CPU, (cpu, cpu))
 
 
@@ -149,6 +158,9 @@ async def run(body):
 
 
 if __name__ == "__main__":
+    # `kill -INT 1` from the command must not end the call as a sandbox fault
+    # (KeyboardInterrupt escapes `except Exception`, ABASHR finding 3).
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
     try:
         result = asyncio.run(run(json.load(sys.stdin)))
     except TimeoutError:

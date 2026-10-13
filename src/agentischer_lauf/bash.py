@@ -29,6 +29,7 @@ class BashPlace:
         work_bytes=32_000_000,
         docker="/usr/bin/docker",
         socket="unix:///var/run/docker.sock",
+        max_parallel=3,
     ):
         # A reviewed local image, never a mutable tag or an implicit image pull.
         if not re.fullmatch(r"sha256:[a-f0-9]{64}", image):
@@ -42,6 +43,13 @@ class BashPlace:
             raise ValueError("computation requires a local dedicated Docker daemon")
         self.root.mkdir(mode=0o700, parents=True, exist_ok=True)
         self.env = {"PATH": "/usr/bin:/bin", "LANG": "C.UTF-8"}
+        # Upper bound of computation containers of this process at once
+        # (ABASHR condition 2): N runs otherwise mean N x 2 GiB / 1 CPU. Full
+        # is a loud, repeatable 429, not a queue that waits unseen.
+        if not 0 < max_parallel <= 16:
+            raise ValueError("invalid computation parallelism")
+        self.max_parallel = max_parallel
+        self.belegt = 0
 
     async def _command(self, args, *, data=None, timeout=10, limit=1_000_000):
         process = await asyncio.create_subprocess_exec(
@@ -96,12 +104,24 @@ class BashPlace:
             raise RunError("werkzeug_fehler")
         for path in [*material, *files, *outputs]:
             safe_path(path)
+        if self.belegt >= self.max_parallel:
+            raise RunError("lauf_belegt", retryable=True, retry_after_s=5)
+        self.belegt += 1
+        try:
+            return await self._run(command, material, files, outputs, max_bytes)
+        finally:
+            self.belegt -= 1
+
+    async def _run(self, command, material, files, outputs, max_bytes):
         with tempfile.TemporaryDirectory(prefix="bash-", dir=self.root) as temporary:
             name = "agentic-bash-" + uuid.uuid4().hex
             args = [
                 "create",
                 "--name",
                 name,
+                # Removed by the daemon once its process ends, also when this
+                # process dies hard before its own `rm` (ABASHR finding 4).
+                "--rm",
                 "--pull=never",
                 "--interactive",
                 "--network=none",

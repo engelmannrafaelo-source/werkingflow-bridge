@@ -37,9 +37,20 @@ Unbekannte Werkzeuge oder Werkzeugkonfigurationen werden vor dem Modellaufruf
 mit HTTP 422 abgewiesen. Jeder Teilauftrag erhält genau seine eigene Werkzeugliste;
 die Prüfung erbt keine Freigaben vom Hauptlauf.
 
-`Bash` wird ausdrücklich serverseitig über `Runtime(..., bash=BashPlace(...))`
-gebunden. Ohne diese Bindung bleibt ein Bash-Auftrag bei HTTP 422
-`faehigkeit_nicht_verfuegbar`. Der Werkzeugaufruf lautet
+`Bash` hat zwei Ausführungsorte, beide serverseitig gewählt:
+
+- **CLI-Platz** (ausgeliefert): Läuft die Phase über einen CLI-Adapter, führt
+  die CLI Bash selbst im Platz aus. Der Platz hat eine eigene UID, ein
+  schreibgeschütztes Image und Netzausgang nur über seinen Proxy, wie der
+  Erkunder heute. Zugelassen wird das nur auf einem geprüften Platz (siehe
+  [agentischer-lauf-cli.md](agentischer-lauf-cli.md), Zulassung).
+- **Rechenplatz** `Runtime(..., bash=BashPlace(...))`: ein frischer Container je
+  Aufruf. Er ist **nicht gebunden**. Er braucht einen Docker-Daemon, den der
+  Aufrufer erreicht, und das ist ohne rootless Daemon Root auf dem Host
+  (ABASHR-Auflage 1). Ohne diese Bindung endet ein Bash-Auftrag an einen
+  Nicht-CLI-Adapter mit HTTP 422 `faehigkeit_nicht_verfuegbar`.
+
+Für den Rechenplatz gilt: Der Werkzeugaufruf lautet
 `{"command": "python scripts/calculate.py"}`; Ergebnis sind `exit_code`, `stdout`
 und `stderr`. Eine normale Rückgabe mit Exitcode ungleich null ist ein sichtbares
 Befehlsergebnis für das Modell. Zeit-, Isolations- und Artefaktfehler brechen den
@@ -54,6 +65,14 @@ außerdem einen privaten Ablagepfad und den lokalen Docker-Zugang. Code und
 Ablagepfad müssen unter denselben Pfaden auf dem Docker-Host sichtbar sein.
 Das ist eine Voraussetzung der Serverkomposition, keine vom Auftrag wählbare
 Option; dieser Anschluss erteilt keinem Worker automatisch Docker-Rechte.
+Bevor er gebunden wird, muss der Daemon rootless laufen oder hinter einem eigenen
+Dienst liegen, der allein den Socket hält. Nie den Host-Socket in einen Worker.
+Gleichzeitig laufen je Prozess höchstens `max_parallel` Rechencontainer
+(Vorgabe 3). Darüber antwortet der Platz mit 429 `lauf_belegt` (wiederholbar).
+Container werden mit `--rm` angelegt, damit der Daemon sie auch nach einem harten
+Absturz des Aufrufers entfernt. PID 1 im Container ignoriert SIGINT. Die
+CPU-Grenze je Prozess liegt eine Sekunde über der Zeitgrenze, damit immer die
+Zeitgrenze greift (`grenze_zeit`).
 
 Jeder Aufruf bekommt einen eigenen Platz mit PID-, IPC- und Netz-Namensraum,
 schreibgeschütztem Root-Dateisystem, begrenzten tmpfs-Verzeichnissen, 2 GiB RAM,

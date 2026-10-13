@@ -1,0 +1,97 @@
+"""ABASHR conditions that hold without a Docker daemon (BRUMBAU, 13.10.2026):
+parallelism bound (2), SIGINT on PID 1 (3), daemon-side removal (4), and the
+CPU/wall race behind the flaky test_res_cpu_loop_times_out_and_cleans."""
+
+import asyncio
+import math
+import os
+
+import pytest
+
+from src.agentischer_lauf.adapter import RunError
+from src.agentischer_lauf.http import failure
+
+IMAGE = "sha256:" + "0" * 64
+
+
+def place(tmp_path, **kw):
+    from src.agentischer_lauf.bash import BashPlace
+
+    return BashPlace(image=IMAGE, root=tmp_path, **kw)
+
+
+@pytest.mark.parametrize("timeout_s", [0.5, 1, 2, 4, 30, 480])
+def test_cpu_limit_stays_above_wall_clock(timeout_s):
+    from src.agentischer_lauf.bash_kind import cpu_grenze
+
+    assert cpu_grenze(timeout_s) >= math.ceil(timeout_s) + 1 > timeout_s
+
+
+async def test_parallel_bound_is_loud_429(tmp_path):
+    box = place(tmp_path, max_parallel=1)
+    started, release = asyncio.Event(), asyncio.Event()
+
+    async def slow(*args):
+        started.set()
+        await release.wait()
+        return {"exit_code": 0}
+
+    box._run = slow
+    first = asyncio.create_task(box.run(command="true", material={}, files={}, outputs=[], max_bytes=1))
+    await started.wait()
+    with pytest.raises(RunError) as caught:
+        await box.run(command="true", material={}, files={}, outputs=[], max_bytes=1)
+    assert caught.value.code == "lauf_belegt" and caught.value.retryable is True
+    assert failure(caught.value).status_code == 429
+    release.set()
+    assert await first == {"exit_code": 0}
+    assert box.belegt == 0
+
+
+async def test_parallel_slot_is_freed_on_failure(tmp_path):
+    box = place(tmp_path, max_parallel=1)
+
+    async def broken(*args):
+        raise RunError("sandbox_fehler")
+
+    box._run = broken
+    for _ in range(2):
+        with pytest.raises(RunError, match="sandbox_fehler"):
+            await box.run(command="true", material={}, files={}, outputs=[], max_bytes=1)
+    assert box.belegt == 0
+
+
+@pytest.mark.parametrize("value", [0, 17])
+def test_parallel_bound_is_validated(tmp_path, value):
+    with pytest.raises(ValueError):
+        place(tmp_path, max_parallel=value)
+
+
+async def test_container_is_created_with_daemon_side_removal(tmp_path):
+    box = place(tmp_path)
+    calls = []
+
+    async def command(args, **kw):
+        calls.append(list(args))
+        return (1, b"", b"No such container") if args[0] != "create" else (1, b"", b"")
+
+    box._command = command
+    with pytest.raises(RunError, match="sandbox_fehler"):
+        await box.run(command="true", material={}, files={}, outputs=[], max_bytes=1)
+    assert calls[0][0] == "create" and "--rm" in calls[0]
+    assert calls[-1][:2] == ["rm", "--force"]
+
+
+async def test_sigint_to_pid1_is_ignored(tmp_path):
+    """Real container (ABASH_TEST_IMAGE): `kill -INT 1` leaves the call an
+    ordinary result instead of sandbox_fehler."""
+    from src.agentischer_lauf.bash import BashPlace
+
+    image = os.environ.get("ABASH_TEST_IMAGE")
+    if not image:
+        pytest.fail("ABASH_TEST_IMAGE must name the local computation image for isolation tests")
+    box = BashPlace(image=image, root=tmp_path, timeout_s=4, work_bytes=8_000_000)
+    result = await box.run(command="kill -INT 1; sleep 0.2; echo survived > result.txt",
+                           material={}, files={}, outputs=["result.txt"], max_bytes=100000)
+    assert result["exit_code"] == 0
+    assert "result.txt" in result["files"]
