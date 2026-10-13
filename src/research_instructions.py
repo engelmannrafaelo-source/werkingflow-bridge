@@ -19,6 +19,17 @@ def caller_instructions(request) -> Optional[str]:
     return value
 
 
+def caller_literatur_planer(request) -> Optional[str]:
+    """The caller's instruction for planning literature search terms (BRAUS
+    F19); only together with research_instructions (ResearchRequest checks)."""
+    value = vars(request).get("literatur_planer")
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError("literatur_planer must be a nonblank string")
+    return value
+
+
 def research_privacy_options(request) -> dict:
     """Only the legacy request may use the frozen app exceptions."""
     terms = vars(request).get("privacy_allowlist")

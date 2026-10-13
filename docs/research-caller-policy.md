@@ -37,8 +37,35 @@ mechanism; hard identifiers such as email and phone remain protected. A nonempty
 list requires the postprocessor to be active; otherwise the cloud gate fails.
 Without either field the frozen legacy behavior remains available.
 
-F19 (planner prompt and OA context header) is frozen in `compat/scholarly.py`;
-`scholarly.py` is only its import adapter. New research requests never invoke it.
+## Literature layer (F19)
+
+The open-access literature layer is a Bridge service: plan search terms with
+a model call, fetch OpenAlex/CORE material, rank it and format source blocks
+(title, year, DOI/URL, provenance). It lives in `src/literatur.py` and carries
+no app vocabulary. What to search for is the caller's: `literatur_planer` is
+the planner instruction (its answer is a JSON array of search terms). It is
+accepted only together with `research_instructions`. The layer runs when
+`research_mode` is `academic`, `BRIDGE_SCHOLARLY_ENABLED=true` and
+`BRIDGE_SCHOLARLY_PROFILE=full`. Every planned term passes the research
+privacy gate (with the request's `privacy_allowlist`) before it leaves for
+OpenAlex/CORE; on the cloud route the planner already sees the anonymized
+query. The block carries a neutral heading only; what the material is for
+belongs in `research_instructions`.
+
+The run never fails because of the layer, but its outcome is reported:
+`ResearchResponse.literatur` is `{"status": "eingefuegt", "quellen",
+"suchbegriffe"}` (with `suchbegriffe_verworfen` when the planner named more
+than 14 terms) or `{"status": "uebersprungen", "grund"}`. Possible reasons:
+`schicht_aus`, `research_mode_nicht_academic`, `profil_light`,
+`keine_suchbegriffe`, `planer_gescheitert` (with `ursache`; the Bridge does
+not search with a substitute then), `anonymisierung_gescheitert`,
+`keine_quellen`, `zeitbudget`, `fehler: <Typ>`. The field comes with every
+answer after the layer ran, error answers included. Without
+`literatur_planer` the field is absent and no literature is fetched.
+
+The legacy Energy planner prompt and context header are frozen in
+`compat/scholarly.py` on top of the same mechanism; `scholarly.py` is only its
+import adapter. New research requests never invoke it.
 F20 is frozen in `compat/fach_allowlist.json`. Apps own the decision which
 exact exceptions to send; no app-specific defaults are added to new requests.
 These are transitional copies for unmigrated clients, not a completed app rollout.

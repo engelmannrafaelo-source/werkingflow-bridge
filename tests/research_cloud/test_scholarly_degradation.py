@@ -13,7 +13,9 @@ import logging
 import pytest
 import requests
 
-from src import scholarly
+# The mechanism moved to src/literatur.py (BRUMBAU step 3, BRAUS F19);
+# src.scholarly keeps only the frozen legacy planner and header.
+from src import literatur as scholarly
 
 # Marker, auf die orchestrator/bin/research-cloud-monitor.py die Inbox-Alarme baut.
 RUN_LEVEL_MARKER = "davon 0 Volltext"
@@ -91,12 +93,12 @@ def test_lauf_mit_volltext_meldet_nichts(caplog):
 
 
 def _format(papers):
-    """_retrieve_and_format über einen gestubbten Fetch fahren (kein Netz)."""
-    import src.scholarly as sc
+    """quellen_bloecke über einen gestubbten Fetch fahren (kein Netz)."""
+    import src.literatur as sc
     orig_openalex, orig_core = sc._openalex, sc._core
     sc._openalex = lambda q, n: papers
     sc._core = lambda q, n: []
     try:
-        return sc._retrieve_and_format(["q1"], 12)
+        return sc.quellen_bloecke(["q1"], 12)
     finally:
         sc._openalex, sc._core = orig_openalex, orig_core
