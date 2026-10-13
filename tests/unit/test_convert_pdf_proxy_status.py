@@ -23,10 +23,11 @@ for _mod in [
 import json  # noqa: E402
 from unittest.mock import AsyncMock, MagicMock, patch  # noqa: E402
 
-import httpx  # noqa: E402
 import pytest  # noqa: E402
 
-import src.main  # noqa: E402
+# src.main needs the full Bridge environment (e.g. not in the Docling-only venv).
+httpx = pytest.importorskip("httpx")
+src_main = pytest.importorskip("src.main")
 from src.privacy_client import PrivacyServiceClient  # noqa: E402
 
 
@@ -51,7 +52,7 @@ async def _call(downstream: httpx.Response):
              "app_id": "werking-report", "user_id": None, "workflow_id": None,
              "session_id": None, "job_id": None,
          }):
-        return await src.main.convert_pdf_endpoint(request=_request(), credentials=None)
+        return await src_main.convert_pdf_endpoint(request=_request(), credentials=None)
 
 
 @pytest.mark.asyncio
