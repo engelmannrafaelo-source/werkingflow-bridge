@@ -93,4 +93,11 @@ Felder der Konfiguration: `platz_wurzel`, `befehl`, `settings`,
 `dedicated_uid`, `max_bytes`, `zugang_variable` (Name der Umgebungsvariable mit
 dem Zugang), `cli_zugang_variable`, `zaehler_url`, `oauth`, `modelle`
 (Vertragsname → CLI-Modell), `werkzeuge`, die vier Maxima, `speicher`,
-`revision`, optional `geteilter_schluessel` und `max_strom_bytes`.
+optional `revision`, `geteilter_schluessel` und `max_strom_bytes`.
+
+`herkunft.bridge_revision` jedes Laufs ist der `git_sha` der Build-Metadaten
+des Images, also derselbe Wert, den `GET /v1/version` meldet. Ein Aufrufer
+kann beides gegen die Revision prüfen, die er freigegeben hat. Fehlen die
+Build-Metadaten, bricht der Start laut ab. `revision` in der Konfiguration ist
+nur eine Gegenprobe: Ein anderer Wert als der `git_sha` bricht den Start
+ebenfalls laut ab (`faehigkeit_nicht_verfuegbar`, Grund im Log).

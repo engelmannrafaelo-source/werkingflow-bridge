@@ -16,6 +16,8 @@ from pathlib import Path
 
 from fastapi import HTTPException
 
+from src.version import METADATA_ERRORS, read_version
+
 from .adapter import Adapters, RunError
 
 LOG = logging.getLogger(__name__)
@@ -156,6 +158,33 @@ def pruefe_platz(wurzel: Path, settings: Path, *, uid=None, stat=os.stat, access
         raise RunError("faehigkeit_nicht_verfuegbar")
 
 
+def laufrevision(konfig: dict) -> str:
+    """The revision every run states in herkunft.bridge_revision: the git_sha
+    of this image's build metadata, the same value GET /v1/version answers.
+    A caller checks both against the revision it released; a second, hand-kept
+    value let the version probe pass and then failed every paid run
+    (BRUMBAU-N1 D1). ``revision`` in the configuration is optional and only a
+    cross-check: a different value is a misconfiguration and stops the start."""
+    try:
+        sha = read_version().git_sha
+    except METADATA_ERRORS as exc:
+        LOG.error(
+            "agentischer Lauf: keine Build-Metadaten fuer die Laufrevision (%s: %s), "
+            "Start abgebrochen",
+            type(exc).__name__, exc,
+        )
+        raise RunError("faehigkeit_nicht_verfuegbar") from None
+    angegeben = konfig.get("revision")
+    if angegeben is not None and str(angegeben) != sha:
+        LOG.error(
+            "agentischer Lauf: Konfig-revision %r weicht von der Build-Revision %s ab "
+            "(/v1/version), Start abgebrochen",
+            angegeben, sha,
+        )
+        raise RunError("faehigkeit_nicht_verfuegbar")
+    return sha
+
+
 def verdrahte(konfig: dict):
     """Compose runtime and policy; every missing setting fails at start."""
     from . import http
@@ -168,6 +197,7 @@ def verdrahte(konfig: dict):
         LOG.error("agentischer Lauf: dedicated_uid muss true sein (ACLIR P2), Start abgebrochen")
         raise RunError("faehigkeit_nicht_verfuegbar")
     pruefe_platz(Path(konfig["platz_wurzel"]), Path(konfig["settings"]))
+    revision = laufrevision(konfig)
     variable = konfig["zugang_variable"]
 
     def zugang():
@@ -205,7 +235,7 @@ def verdrahte(konfig: dict):
     runtime = Runtime(
         adapters,
         Storage(Path(konfig["speicher"])),
-        revision=str(konfig["revision"]),
+        revision=revision,
         max_bytes=int(konfig["max_bytes"]),
     )
     http.configure(runtime, zulassung(politik))
