@@ -405,6 +405,8 @@ async def test_place_stops_process_group_and_cleans_up(tmp_path):
     assert seen[0] == {"type": "probe", "eingang_beschreibbar": False}
     args, env = seen[1]["args"], seen[1]["env"]
     assert args[args.index("--tools") + 1] == "Read"
+    # Only the place's own --settings: no user/project/local sources (N1).
+    assert args[args.index("--setting-sources") + 1] == ""
     assert args[args.index("--max-turns") + 1] == "3"
     assert "--include-partial-messages" in args
     assert "CLAUDE_CODE_MAX_OUTPUT_TOKENS" in env and "ZUGANG_TEST" in env
