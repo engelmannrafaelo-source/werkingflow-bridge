@@ -478,7 +478,8 @@ def auftrag(**overrides):
 
 
 async def test_place_stops_process_group_and_cleans_up(tmp_path):
-    platz = kind_platz(tmp_path, "enkel")
+    pid_datei = tmp_path / "enkel.pid"
+    platz = kind_platz(tmp_path, "enkel", ACLI_PIDDATEI=str(pid_datei))
     seen = []
 
     def beobachter(line):
@@ -492,21 +493,21 @@ async def test_place_stops_process_group_and_cleans_up(tmp_path):
     assert seen[0] == {"type": "probe", "eingang_beschreibbar": False}
     args, env = seen[1]["args"], seen[1]["env"]
     assert args[args.index("--tools") + 1] == "Read"
+    # Only the place's own --settings: no user/project/local sources (N1).
+    assert args[args.index("--setting-sources") + 1] == ""
     assert args[args.index("--max-turns") + 1] == "3"
     assert "--include-partial-messages" in args
     assert "CLAUDE_CODE_MAX_OUTPUT_TOKENS" in env and "ZUGANG_TEST" in env
     assert not any(k.startswith(("AWS_", "INFISICAL", "AI_BRIDGE")) for k in env)
     assert list((tmp_path / "arbeit").iterdir()) == []
-    time.sleep(0.2)
-    # The grandchild of the killed process group is gone as well.
-    assert not any(b"time.sleep(60)" in cmdline(p) for p in Path("/proc").iterdir())
-
-
-def cmdline(proc):
-    try:
-        return (proc / "cmdline").read_bytes() if proc.name.isdecimal() else b""
-    except OSError:
-        return b""
+    # The grandchild of the killed process group is gone as well. Only this
+    # run's own grandchild is asked, by its PID: a scan of all /proc saw the
+    # sleepers of other runs and sessions (BRUMBAU2R P2-5).
+    enkel = int(pid_datei.read_text())
+    frist = time.monotonic() + 2
+    while lebt(enkel) and time.monotonic() < frist:
+        time.sleep(0.05)
+    assert not lebt(enkel)
 
 
 async def test_place_time_limit(tmp_path):
@@ -659,19 +660,39 @@ def _stat(uid, mode):
     return SimpleNamespace(st_uid=uid, st_mode=mode)
 
 
-def _platz_pruefung(wurzel, settings, *, uid=1101, schreibbar=False):
+_ROOT_ORDNER = _stat(0, 0o40755)
+_SETTINGS = "/etc/erkunder/settings.json"
+
+
+def _platz_pruefung(wurzel, settings, *, uid=1101, schreibbar=False, ordner=None,
+                    pfad=_SETTINGS):
+    """Stand-in stat/access. ``ordner`` overrides single folders above the
+    settings (default: root, 0755); ``schreibbar`` is True (every path) or a
+    set of paths the place could write."""
     from src.agentischer_lauf.zulassung import pruefe_platz
 
-    infos = {"wurzel": wurzel, "settings": settings}
+    infos = {"/arbeit/platz1": wurzel, pfad: settings,
+             "/etc/erkunder": _ROOT_ORDNER, "/etc": _ROOT_ORDNER, "/": _ROOT_ORDNER,
+             **(ordner or {})}
+    gefolgt = []
 
     def stat(path, follow_symlinks=True):
-        info = infos["wurzel" if str(path) == "/arbeit/platz1" else "settings"]
+        gefolgt.append(follow_symlinks)
+        info = infos.get(str(path))
         if info is None:
             raise FileNotFoundError(path)
         return info
 
-    pruefe_platz(Path("/arbeit/platz1"), Path("/etc/erkunder/settings.json"), uid=uid,
-                 stat=stat, access=lambda path, mode: schreibbar)
+    def access(path, mode):
+        return schreibbar is True or (bool(schreibbar) and str(path) in schreibbar)
+
+    try:
+        pruefe_platz(
+            Path("/arbeit/platz1"), Path(pfad), uid=uid, stat=stat, access=access
+        )
+    finally:
+        # Never follows a symlink: a link is checked as the link (P2-3).
+        assert gefolgt and not any(gefolgt)
 
 
 def test_place_check_accepts_the_place_container_layout():
@@ -686,6 +707,17 @@ def test_place_check_accepts_the_place_container_layout():
     dict(settings=_stat(1101, 0o100644)),
     dict(schreibbar=True),
     dict(settings=None),
+    # BRUMBAU2R P2-3: the folders above the settings, and symlinks.
+    dict(settings=_stat(0, 0o120777)),
+    dict(ordner={"/etc/erkunder": _stat(1101, 0o40755)}),
+    dict(ordner={"/etc/erkunder": _stat(0, 0o40777)}),
+    dict(ordner={"/etc/erkunder": _stat(0, 0o40775)}),
+    dict(ordner={"/etc": _stat(0, 0o120777)}),
+    dict(ordner={"/etc/erkunder": None}),
+    dict(schreibbar={"/etc/erkunder"}),
+    dict(schreibbar={"/"}),
+    dict(pfad="erkunder/settings.json",
+         ordner={"erkunder": _ROOT_ORDNER, ".": _ROOT_ORDNER}),
 ])
 def test_place_check_refuses_anything_else(fall, caplog):
     args = dict(wurzel=_stat(1101, 0o40700), settings=_stat(0, 0o100644))
@@ -694,6 +726,16 @@ def test_place_check_refuses_anything_else(fall, caplog):
         _platz_pruefung(args.pop("wurzel"), args.pop("settings"), **args)
     assert caught.value.code == "faehigkeit_nicht_verfuegbar"
     assert "kein isolierter Platz" in caplog.text
+
+
+def test_place_check_on_this_host_refuses_a_symlinked_settings(tmp_path):
+    """Real lstat: a link to a root-owned, read-only file is still refused."""
+    from src.agentischer_lauf.zulassung import pruefe_platz
+
+    link = tmp_path / "settings.json"
+    link.symlink_to("/etc/hostname")
+    with pytest.raises(RunError):
+        pruefe_platz(tmp_path, link, uid=1101)
 
 
 def test_place_check_on_this_host_refuses_a_plain_folder(tmp_path):

@@ -21,12 +21,81 @@ def function(text, name):
 ])
 @pytest.mark.parametrize("smoke_failure", [False, True])
 def test_deploy_service_subset(tmp_path, target, services, worker, smoke_failure):
+    result, output = _deploy(tmp_path, target, services,
+                             "echo SMOKE_FAIL: stub; return 1" if smoke_failure
+                             else "echo SMOKE_OK: stub")
+    assert "FORBIDDEN" not in output
+    assert result.returncode == (1 if smoke_failure else 0 if worker else 3), output
+    assert ("ROLLBACK" in output) == smoke_failure, output
+    assert ("--expected-git-sha " + "a" * 40 in output) == worker, output
+    # Proof per worker through the direct route whenever a SHA is expected.
+    assert ("--version-workers worker1,worker2,worker3,worker4" in output) == worker, output
+    assert ("--version-unproven" in output) != worker, output
+    if not worker:
+        assert "SMOKE_VERSION_UNPROVEN:" in output
+        assert "worker SHA not proven" in output
+        assert "/stub/proof &&" not in output
+        if "worker" in services:
+            # A pool subset keeps old images answering claude_version (CX4N2R).
+            assert "keep their old image in the claude_version pool" in output
+        if not smoke_failure:
+            assert "finished: DEPLOYED, NOT rolled back — but UNPROVEN" in output
+            assert "finished successfully" not in output
+
+
+def test_version_workers_come_from_the_host_service_list(tmp_path):
+    """BRUMBAU2R P2-4: the workers named for proof per worker are the host's
+    configured workers, not a fixed worker1-4."""
+    config = 'HETZNER_ALL="platform-api nginx worker-a worker-b erkunder"'
+    result, output = _deploy(tmp_path, "hetzner", "worker-a worker-b",
+                             "echo SMOKE_OK: stub", config=config)
+    assert "FORBIDDEN" not in output
+    assert result.returncode == 0, output
+    assert re.search(r"--version-workers worker-a,worker-b$", output, re.M), output
+    assert "worker1" not in output
+
+
+def test_config_workers_name_each_targets_own_workers():
     text = (ROOT / "scripts/bridge-deploy.sh").read_text()
-    names = ["deploy_server", "phase_smoke_test", "record_deploy_proof"]
+    constants = "\n".join(re.findall(
+        r"^(?:HETZNER|SERVER2|WORKERHOST)_ALL=.*$", text, re.M))
+    script = f"""ERKUNDER_SERVICES="erkunder-platz-1 erkunder"
+{constants}
+error_() {{ echo "ERROR $*"; }}
+{function(text, "config_workers")}
+for t in hetzner server2 prod-workers; do echo "$t=[$(config_workers $t)]"; done
+config_workers nirgends || echo "rc=$?"
+"""
+    out = subprocess.run(["bash", "-c", script], capture_output=True, text=True,
+                         timeout=10, env={"PATH": os.defpath}).stdout
+    assert "hetzner=[worker1 worker2 worker3 worker4]" in out
+    assert "server2=[]" in out
+    assert "prod-workers=[worker-sahori worker-kurt worker-coach worker-erk]" in out
+    assert "ERROR config_workers: unknown deploy target 'nirgends'" in out
+    assert "rc=1" in out
+
+
+def test_smoke_without_proof_per_worker_is_unproven_not_a_pass(tmp_path):
+    """BRUMBAU2R P2-4: the smoke's own 'no proof per worker' state makes the
+    run UNPROVEN (exit 3), never 'finished successfully'."""
+    result, output = _deploy(
+        tmp_path, "hetzner", "worker1 worker2 worker3 worker4",
+        "echo 'SMOKE_VERSION_PER_WORKER_UNPROVEN: no proof per worker'")
+    assert "FORBIDDEN" not in output
+    assert result.returncode == 3, output
+    assert "version UNPROVEN — no proof per worker" in output
+    assert "finished successfully" not in output
+    assert "/stub/proof &&" not in output
+
+
+def _deploy(tmp_path, target, services, smoke_body, config=""):
+    text = (ROOT / "scripts/bridge-deploy.sh").read_text()
+    names = ["deploy_server", "phase_smoke_test", "record_deploy_proof",
+             "config_workers"]
     definitions = "\n".join(function(text, name) for name in names)
     # Load service lists from the real CLI, never its host config or entry point.
     constants = "\n".join(re.findall(
-        r"^(?:HETZNER|SERVER2)_(?:ALL|NEEDS_BUILD)=.*$", text, re.M))
+        r"^(?:HETZNER|SERVER2|WORKERHOST)_(?:ALL|NEEDS_BUILD)=.*$", text, re.M))
     stubs = "\n".join(name + "() { :; }" for name in [
         "phase_tooling_freshness_gate", "phase_prod_order_gate", "phase_preflight",
         "phase_code_update", "phase_validate", "phase_reconcile_worker_key",
@@ -39,6 +108,7 @@ def test_deploy_service_subset(tmp_path, target, services, worker, smoke_failure
     script = f"""set -eo pipefail
 ERKUNDER_SERVICES=erkunder
 {constants}
+{config}
 {definitions}
 {stubs}
 info() {{ echo "$*"; }}
@@ -59,7 +129,7 @@ rssh() {{
 }}
 python3() {{
     echo "PROBE_ARGS $*"
-    {'echo SMOKE_FAIL: stub; return 1' if smoke_failure else 'echo SMOKE_OK: stub'}
+    {smoke_body}
 }}
 HETZNER_HOST=stub.invalid
 SERVER2_HOST=stub.invalid
@@ -80,23 +150,7 @@ deploy_server {target} || exit $?
     result = subprocess.run(["bash", "-c", script], capture_output=True, text=True,
                             timeout=10, env={"PATH": os.defpath, "HOME": str(tmp_path)})
     output = result.stdout + result.stderr
-    assert "FORBIDDEN" not in output
-    assert result.returncode == (1 if smoke_failure else 0 if worker else 3), output
-    assert ("ROLLBACK" in output) == smoke_failure, output
-    assert ("--expected-git-sha " + "a" * 40 in output) == worker, output
-    # Proof per worker through the direct route whenever a SHA is expected.
-    assert ("--version-workers worker1,worker2,worker3,worker4" in output) == worker, output
-    assert ("--version-unproven" in output) != worker, output
-    if not worker:
-        assert "SMOKE_VERSION_UNPROVEN:" in output
-        assert "worker SHA not proven" in output
-        assert "/stub/proof &&" not in output
-        if "worker" in services:
-            # A pool subset keeps old images answering claude_version (CX4N2R).
-            assert "keep their old image in the claude_version pool" in output
-        if not smoke_failure:
-            assert "finished: DEPLOYED, NOT rolled back — but UNPROVEN" in output
-            assert "finished successfully" not in output
+    return result, output
 
 
 def test_unproven_skips_only_version(monkeypatch, capsys):

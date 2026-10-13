@@ -17,6 +17,11 @@ from src.agentischer_lauf.http import failure
 from src.agentischer_lauf.models import Tool
 from src.agentischer_lauf.sandbox import Sandbox
 
+# Every container of this test run carries its own prefix, so leftover() sees
+# only this run's containers, never those of another session on the same
+# daemon (BRUMBAU2R P2-5).
+LAUF = "agentic-bash-t" + uuid.uuid4().hex[:12] + "-"
+
 
 @pytest.fixture
 def place(tmp_path):
@@ -25,7 +30,8 @@ def place(tmp_path):
     image = os.environ.get("ABASH_TEST_IMAGE")
     if not image:
         pytest.fail("ABASH_TEST_IMAGE required")
-    return BashPlace(image=image, root=tmp_path, timeout_s=6, work_bytes=8_000_000)
+    return BashPlace(image=image, root=tmp_path, timeout_s=6, work_bytes=8_000_000,
+                     name_prefix=LAUF)
 
 
 def box(place, material=None, tools=("Bash",), limit=200_000):
@@ -44,7 +50,7 @@ async def sh(b, command):
 
 def leftover():
     out = subprocess.run(
-        ["docker", "ps", "-aq", "--filter", "name=agentic-bash-"],
+        ["docker", "ps", "-aq", "--filter", "name=" + LAUF],
         capture_output=True, text=True, check=True,
     ).stdout.split()
     return out

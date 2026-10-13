@@ -37,7 +37,8 @@ names = ['log', 'info', 'warn', 'error_', 'step', 'phase_smoke_test',
          'fetch_pool_router_state', 'pool_router_exhaustion', 'probe_unpooled_stamp',
          'measure_pool_before_deploy', 'smoke_pool_unproven', 'check_pool_router_state',
          'phase_distribution_test', 'distribution_assertion', 'phase_prod_order_gate',
-         'record_deploy_proof', 'write_smoke_unproven_marker', 'catch_up_unproven_smoke']
+         'record_deploy_proof', 'write_smoke_unproven_marker', 'catch_up_unproven_smoke',
+         'config_workers']
 lines = source.split('\n')
 
 def extract(name):
@@ -154,6 +155,8 @@ fail=0
 ok_()  { printf '  ok    %s\n' "$1"; pass=$((pass + 1)); }
 bad_() { printf '  FAIL  %s\n' "$1"; [[ -n "${2:-}" ]] && printf '%s\n' "$2"; fail=$((fail + 1)); }
 
+# The host's configured workers, read by config_workers (BRUMBAU2R P2-4).
+HETZNER_ALL="platform-api metrics-reader nginx worker1 worker2 worker3 worker4 erkunder"
 DEPLOYED_SERVICES=(platform-api metrics-reader nginx worker1 worker2 worker3 worker4)
 case_() {  # name expected(PASS|UNPROVEN|FAIL) smoke-out smoke-rc pre-state post-state health [state-rc] [curl-rc]
     local name="$1" want="$2" got rc=0 log pre_log=""

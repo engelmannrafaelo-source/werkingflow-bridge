@@ -143,6 +143,15 @@ class CliPlatz:
             "--strict-mcp-config",
             "--mcp-config",
             '{"mcpServers":{}}',
+            # No user, project or local settings: only --settings (the place's
+            # root-owned hook) applies. HOME and the working folder are the
+            # run's own and writable; a settings file there present at start
+            # would apply, and disableAllHooks in it switches off the place
+            # hook too. Measured on CLI 2.1.296 (BRUMBAU-N1): a file written
+            # during the run is not reloaded, one present at start is; with
+            # --setting-sources "" neither applies.
+            "--setting-sources",
+            "",
         ]
         if self.settings is not None:
             line += ["--settings", str(self.settings)]
