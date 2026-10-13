@@ -125,3 +125,27 @@ def test_real_worker_exception_envelope(tmp_path, monkeypatch):
     assert error["retryable"] is False
     assert error["type"] != "bridge_throttle"
     assert error["message"].endswith("Build metadata unavailable")
+
+
+def _health(monkeypatch, metadata_path):
+    from fastapi.testclient import TestClient
+    import src.main as main_mod
+    monkeypatch.setattr(version, "BUILD_METADATA", metadata_path)
+    response = TestClient(main_mod.app).get("/health")
+    assert response.status_code == 200  # docker healthcheck is `curl -f`
+    return response.json()
+
+
+def test_health_reports_same_commit_as_version(tmp_path, monkeypatch):
+    metadata = tmp_path / "build.json"
+    metadata.write_text(json.dumps({"git_sha": "b" * 40, "built_at": "2026-10-13T11:00:00Z"}))
+    body = _health(monkeypatch, metadata)
+    assert body["git_commit"] == "b" * 40
+    assert "git_commit_error" not in body
+
+
+def test_health_without_metadata_says_so_and_stays_healthy(tmp_path, monkeypatch):
+    body = _health(monkeypatch, tmp_path / "missing.json")
+    assert body["status"] == "healthy"
+    assert body["git_commit"] is None
+    assert body["git_commit_error"] == "build_metadata_unavailable: FileNotFoundError"

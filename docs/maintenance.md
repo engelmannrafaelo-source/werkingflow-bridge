@@ -115,10 +115,13 @@ Wo es landet:
 
 ### Ursachenfelder bei Jobs: platform-api vor den Workern ausrollen
 
-Ein Research-Job, dessen Antwort abgeschnitten ist, traegt im Fehlerobjekt
-dieselben Ursachenfelder wie `/v1/research`: `fehler_code`, `antwort_ende`
-und `teilantwort` (`error_contract.JOB_ERROR_DETAIL_FIELDS`). Der Worker
-schickt sie an die platform-api der Job-Heimat, und diese speichert sie.
+Ein Research-Job, der mit `status=error` endet, traegt im Fehlerobjekt
+dieselben Ursachenfelder wie `/v1/research`. `fehler_code`, `antwort_ende`
+und `session_id` reisen in `details` (`error_contract.JOB_ERROR_DETAIL_KEYS`,
+JOBENDE). `teilantwort` und `diagnose_ref` reisen flach daneben
+(`JOB_ERROR_CAUSE_EXTRA_KEYS`, BRTRUNC2), ebenso `usage`/`usage_fehlt`
+(RUSAGE). Der Worker schickt sie an die platform-api der Job-Heimat, und
+diese legt sie flach in der Fehlerzeile ab.
 
 Eine platform-api, die diese Felder noch nicht kennt, verwirft sie, weil
 pydantic unbekannte Felder ignoriert. Deshalb gilt:
@@ -127,16 +130,18 @@ pydantic unbekannte Felder ignoriert. Deshalb gilt:
   Auf Prod sind das zwei getrennte Ziele: die platform-api auf server2,
   die Worker auf dem Worker-Host (ADR-0009). Wer nur die Worker ausrollt,
   erzeugt genau diese Versionsschere.
-- **Die Schere bleibt nicht still.** Mit Ursachenfeldern antwortet die
-  platform-api `200 {"ursache_felder": [...]}` und nennt, was sie
-  gespeichert hat. Ohne Ursachenfelder antwortet sie wie bisher `204`, damit
-  aeltere Worker weiterlaufen. Kommt beim Worker `204` oder ein
-  unvollstaendiges Echo an, meldet `store_client.mark_error` das mit
-  `logger.error`. Der Zaehler `cause_fields_dropped` in
-  `/v1/metrics/jobs-retention` steigt. Ausserdem schreibt der Worker den
-  Fehler erneut: Die Meldung bekommt den Zusatz
-  `[bridge-vertrag: platform-api ohne BRTRUNC2 hat … verworfen; fehler_code=…]`.
-  So ist die Schere am Job selbst sichtbar.
+- **Die Schere bleibt nicht still.** Ein Worker mit Ursachenfeldern bittet um
+  Bestaetigung (`ursache_bestaetigen: true`). Eine aktuelle platform-api
+  antwortet dann `200 {"ursache_felder": [...]}` und nennt, was sie
+  gespeichert hat. Ohne diese Bitte antwortet sie wie bisher `204`, denn
+  aeltere Worker nehmen nichts anderes an. War die Zeile schon `cancelled`,
+  steht im Echo `zeile_unveraendert`. Das ist kein Vertragsbruch.
+  Kommt beim Worker `204` oder ein unvollstaendiges Echo an, meldet
+  `store_client.mark_error` das mit `logger.error`, und der Zaehler
+  `cause_fields_dropped` in `/v1/metrics/jobs-retention` steigt. Ausserdem
+  schreibt der Worker den Fehler erneut, mit denselben Feldern. Die Meldung
+  bekommt den Zusatz `[bridge-vertrag: platform-api ohne BRTRUNC2N hat …
+  nicht bestaetigt; fehler_code=…]`. So ist die Schere am Job selbst sichtbar.
 
 ## Erkunder im Deploy
 
@@ -259,6 +264,9 @@ setzen es nicht selbst: Ohne expliziten vollstaendigen Commit-SHA entsteht wegen
 `${GIT_COMMIT:-unknown}` ein Image, dessen Versionsroute dauerhaft 503 liefert.
 Die Bauzeit stammt aus dem Image-Bau, nicht vom Worker-Start. `/health` bleibt
 unabhaengig davon der Lebenszeichen-Endpunkt.
+`/health` nennt denselben SHA im Feld `git_commit`, aus derselben Datei. Fehlt
+sie oder ist sie ungueltig, steht dort `null` plus `git_commit_error`; der
+Status bleibt 200 und `healthy`, damit der Docker-Healthcheck nicht kippt.
 
 Die Smoke-Probe `version` verlangt `--expected-git-sha` mit dem vollen ausgerollten
 Worker-SHA. Der Deploy liest ihn unabhaengig von der HTTP-Antwort aus dem

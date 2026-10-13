@@ -27,16 +27,24 @@ class VersionResponse(BaseModel):
         return value
 
 
+METADATA_ERRORS = (OSError, ValueError, KeyError, TypeError, ValidationError)
+
+
+def read_version() -> VersionResponse:
+    """Build provenance from the image; raises one of METADATA_ERRORS if absent or malformed."""
+    metadata = json.loads(BUILD_METADATA.read_text())
+    return VersionResponse(
+        git_sha=metadata["git_sha"],
+        built_at=metadata["built_at"],
+        contract_version=CONTRACT_VERSION,
+    )
+
+
 @router.get("/v1/version", response_model=VersionResponse)
 async def get_version() -> VersionResponse:
     try:
-        metadata = json.loads(BUILD_METADATA.read_text())
-        return VersionResponse(
-            git_sha=metadata["git_sha"],
-            built_at=metadata["built_at"],
-            contract_version=CONTRACT_VERSION,
-        )
-    except (OSError, ValueError, KeyError, TypeError, ValidationError):
+        return read_version()
+    except METADATA_ERRORS:
         from src.middleware.bridge_error import bridge_error, SOURCE_BRIDGE_CONFIG, TYPE_INTERNAL
         response = bridge_error(
             source=SOURCE_BRIDGE_CONFIG, error_type=TYPE_INTERNAL,
