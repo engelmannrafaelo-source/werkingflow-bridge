@@ -571,19 +571,39 @@ def _stat(uid, mode):
     return SimpleNamespace(st_uid=uid, st_mode=mode)
 
 
-def _platz_pruefung(wurzel, settings, *, uid=1101, schreibbar=False):
+_ROOT_ORDNER = _stat(0, 0o40755)
+_SETTINGS = "/etc/erkunder/settings.json"
+
+
+def _platz_pruefung(wurzel, settings, *, uid=1101, schreibbar=False, ordner=None,
+                    pfad=_SETTINGS):
+    """Stand-in stat/access. ``ordner`` overrides single folders above the
+    settings (default: root, 0755); ``schreibbar`` is True (every path) or a
+    set of paths the place could write."""
     from src.agentischer_lauf.zulassung import pruefe_platz
 
-    infos = {"wurzel": wurzel, "settings": settings}
+    infos = {"/arbeit/platz1": wurzel, pfad: settings,
+             "/etc/erkunder": _ROOT_ORDNER, "/etc": _ROOT_ORDNER, "/": _ROOT_ORDNER,
+             **(ordner or {})}
+    gefolgt = []
 
     def stat(path, follow_symlinks=True):
-        info = infos["wurzel" if str(path) == "/arbeit/platz1" else "settings"]
+        gefolgt.append(follow_symlinks)
+        info = infos.get(str(path))
         if info is None:
             raise FileNotFoundError(path)
         return info
 
-    pruefe_platz(Path("/arbeit/platz1"), Path("/etc/erkunder/settings.json"), uid=uid,
-                 stat=stat, access=lambda path, mode: schreibbar)
+    def access(path, mode):
+        return schreibbar is True or (bool(schreibbar) and str(path) in schreibbar)
+
+    try:
+        pruefe_platz(
+            Path("/arbeit/platz1"), Path(pfad), uid=uid, stat=stat, access=access
+        )
+    finally:
+        # Never follows a symlink: a link is checked as the link (P2-3).
+        assert gefolgt and not any(gefolgt)
 
 
 def test_place_check_accepts_the_place_container_layout():
@@ -598,6 +618,17 @@ def test_place_check_accepts_the_place_container_layout():
     dict(settings=_stat(1101, 0o100644)),
     dict(schreibbar=True),
     dict(settings=None),
+    # BRUMBAU2R P2-3: the folders above the settings, and symlinks.
+    dict(settings=_stat(0, 0o120777)),
+    dict(ordner={"/etc/erkunder": _stat(1101, 0o40755)}),
+    dict(ordner={"/etc/erkunder": _stat(0, 0o40777)}),
+    dict(ordner={"/etc/erkunder": _stat(0, 0o40775)}),
+    dict(ordner={"/etc": _stat(0, 0o120777)}),
+    dict(ordner={"/etc/erkunder": None}),
+    dict(schreibbar={"/etc/erkunder"}),
+    dict(schreibbar={"/"}),
+    dict(pfad="erkunder/settings.json",
+         ordner={"erkunder": _ROOT_ORDNER, ".": _ROOT_ORDNER}),
 ])
 def test_place_check_refuses_anything_else(fall, caplog):
     args = dict(wurzel=_stat(1101, 0o40700), settings=_stat(0, 0o100644))
@@ -606,6 +637,16 @@ def test_place_check_refuses_anything_else(fall, caplog):
         _platz_pruefung(args.pop("wurzel"), args.pop("settings"), **args)
     assert caught.value.code == "faehigkeit_nicht_verfuegbar"
     assert "kein isolierter Platz" in caplog.text
+
+
+def test_place_check_on_this_host_refuses_a_symlinked_settings(tmp_path):
+    """Real lstat: a link to a root-owned, read-only file is still refused."""
+    from src.agentischer_lauf.zulassung import pruefe_platz
+
+    link = tmp_path / "settings.json"
+    link.symlink_to("/etc/hostname")
+    with pytest.raises(RunError):
+        pruefe_platz(tmp_path, link, uid=1101)
 
 
 def test_place_check_on_this_host_refuses_a_plain_folder(tmp_path):

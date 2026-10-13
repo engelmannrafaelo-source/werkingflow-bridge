@@ -13,6 +13,7 @@ import logging
 import os
 from dataclasses import dataclass
 from pathlib import Path
+from stat import S_ISLNK
 
 from fastapi import HTTPException
 
@@ -131,7 +132,13 @@ def pruefe_platz(wurzel: Path, settings: Path, *, uid=None, stat=os.stat, access
     * platz_wurzel belongs to this UID and is closed to group and others
       (the place container: /arbeit/<platz>, mode 0700);
     * the hook settings belong to root and this UID cannot write them, so the
-      model cannot loosen its own hook.
+      model cannot loosen its own hook;
+    * the settings path is absolute, neither the file nor any folder above it
+      is a symlink, and every folder above it belongs to root and is closed
+      to this UID and to group/others writes. A writable folder lets a Bash
+      run replace the file with ``mv``; the place lives on, so every later run
+      would start without the hook (BRUMBAU2R P2-3). ``stat`` is called
+      without following symlinks throughout.
     """
     uid = os.getuid() if uid is None else uid
     gruende = []
@@ -144,13 +151,34 @@ def pruefe_platz(wurzel: Path, settings: Path, *, uid=None, stat=os.stat, access
     else:
         if info.st_uid != uid or info.st_mode & 0o077:
             gruende.append(f"platz_wurzel {wurzel} gehoert nicht allein dieser UID")
-    try:
-        info = stat(settings)
-    except OSError:
-        gruende.append(f"settings {settings} fehlt")
+    if not settings.is_absolute():
+        gruende.append(f"settings {settings} ist kein absoluter Pfad")
     else:
-        if info.st_uid != 0 or access(settings, os.W_OK):
-            gruende.append(f"settings {settings} nicht root-eigen oder fuer den Platz beschreibbar")
+        try:
+            info = stat(settings, follow_symlinks=False)
+        except OSError:
+            gruende.append(f"settings {settings} fehlt")
+        else:
+            if S_ISLNK(info.st_mode):
+                gruende.append(f"settings {settings} ist ein Symlink")
+            elif info.st_uid != 0 or access(settings, os.W_OK):
+                gruende.append(
+                    f"settings {settings} nicht root-eigen oder "
+                    "fuer den Platz beschreibbar"
+                )
+        for ordner in settings.parents:
+            try:
+                info = stat(ordner, follow_symlinks=False)
+            except OSError:
+                gruende.append(f"settings-Ordner {ordner} fehlt")
+                continue
+            if S_ISLNK(info.st_mode):
+                gruende.append(f"settings-Ordner {ordner} ist ein Symlink")
+            elif info.st_uid != 0 or info.st_mode & 0o022 or access(ordner, os.W_OK):
+                gruende.append(
+                    f"settings-Ordner {ordner} nicht root-eigen oder "
+                    "fuer den Platz beschreibbar"
+                )
     if gruende:
         LOG.error("agentischer Lauf: kein isolierter Platz, Start abgebrochen: %s", "; ".join(gruende))
         raise RunError("faehigkeit_nicht_verfuegbar")
