@@ -364,13 +364,42 @@ def probe(name, endpoint, profiles, repro="", retry=True):
     return deco
 
 
-# claude_version round-robins over the pool's four workers, and every nginx
-# worker process keeps its own position: one answer proves one worker. The
-# probe asks this many times and EVERY answer must carry the expected SHA.
+# Proof per worker: nginx's direct route /<worker>/... (location
+# ^/(worker...)/) reaches exactly that worker, so one answer per named worker
+# proves each of them (BRUMBAU1R P2). The pool route claude_version is asked
+# as well — it is what callers use — but its round-robin position is kept per
+# nginx worker process: with `worker_processes auto` samples there prove
+# nothing per worker. Without named workers (manual runs) only the pool is
+# sampled, and the result says that it is no proof per worker.
 VERSION_SAMPLES = 8
-# A sample that did not arrive (connection) is asked again this often; an
+# A request that got no answer (connection) is asked again this often; an
 # answer that arrived is never asked again — it is the worker's own word.
 VERSION_SAMPLE_TRANSPORT_RETRIES = 2
+
+
+def _version_answer(ctx, path, label):
+    """None when ``path`` answers the expected SHA, else the failing result."""
+    for transport_try in range(VERSION_SAMPLE_TRANSPORT_RETRIES + 1):
+        try:
+            response, ms = _timed(lambda: requests.get(
+                ctx.base_url + path, timeout=ctx.timeout, allow_redirects=False))
+            break
+        except requests.RequestException as e:
+            if transport_try == VERSION_SAMPLE_TRANSPORT_RETRIES:
+                return ProbeResult("version", "/v1/version", False,
+                                   f"{label}: no answer ({type(e).__name__})")
+    try:
+        sha = response.json().get("git_sha") if response.status_code == 200 else None
+    except ValueError:
+        sha = None
+    if response.status_code != 200 or sha != ctx.expected_git_sha:
+        return ProbeResult(
+            "version", "/v1/version", False,
+            f"{label}: version missing or deployed SHA mismatch "
+            f"(status {response.status_code}, git_sha {sha!r}) — it does not run "
+            f"the expected commit",
+            response.status_code, ms)
+    return None
 
 
 @probe("version", "/v1/version", {"hetzner", "server2"}, retry=False)
@@ -378,33 +407,24 @@ def version(ctx):
     import re
     if not re.fullmatch(r"[0-9a-f]{40}", ctx.expected_git_sha):
         return ProbeResult("version", "/v1/version", False, "Expected full deployed SHA is required")
-    total_ms = 0
-    for sample in range(1, VERSION_SAMPLES + 1):
-        for transport_try in range(VERSION_SAMPLE_TRANSPORT_RETRIES + 1):
-            try:
-                response, ms = _timed(lambda: requests.get(
-                    ctx.base_url + "/v1/version", timeout=ctx.timeout, allow_redirects=False))
-                break
-            except requests.RequestException as e:
-                if transport_try == VERSION_SAMPLE_TRANSPORT_RETRIES:
-                    return ProbeResult(
-                        "version", "/v1/version", False,
-                        f"sample {sample}/{VERSION_SAMPLES}: no answer ({type(e).__name__})")
-        total_ms += ms
-        try:
-            sha = response.json().get("git_sha") if response.status_code == 200 else None
-        except ValueError:
-            sha = None
-        if response.status_code != 200 or sha != ctx.expected_git_sha:
-            return ProbeResult(
-                "version", "/v1/version", False,
-                f"sample {sample}/{VERSION_SAMPLES}: version missing or deployed SHA mismatch "
-                f"(status {response.status_code}, git_sha {sha!r}) — a worker of the pool "
-                f"does not run the expected commit",
-                response.status_code, total_ms)
+    for worker in ctx.version_workers:
+        if not re.fullmatch(r"worker[a-zA-Z0-9_-]+", worker):
+            return ProbeResult("version", "/v1/version", False, f"invalid worker name {worker!r}")
+        failed = _version_answer(ctx, f"/{worker}/v1/version", f"{worker} (direct route)")
+        if failed:
+            return failed
+    samples = 1 if ctx.version_workers else VERSION_SAMPLES
+    for sample in range(1, samples + 1):
+        failed = _version_answer(ctx, "/v1/version", f"pool sample {sample}/{samples}")
+        if failed:
+            return failed
+    if ctx.version_workers:
+        return ProbeResult("version", "/v1/version", True,
+                           f"Deployed SHA on each of {', '.join(ctx.version_workers)} "
+                           f"(direct route) and on the pool route", 200)
     return ProbeResult("version", "/v1/version", True,
-                       f"Deployed SHA matches on all {VERSION_SAMPLES} samples",
-                       200, total_ms)
+                       f"Deployed SHA on all {VERSION_SAMPLES} pool samples — "
+                       f"no proof per worker (no --version-workers)", 200)
 
 
 # EXCLUDED: endpoint -> reason. Enforced by the coverage validator. These are
@@ -470,6 +490,8 @@ class Ctx:
     expect_bridge: str = ""
     served_by_required: bool = True
     expected_git_sha: str = ""
+    # Workers whose direct route must each report expected_git_sha.
+    version_workers: tuple = ()
 
     def headers(self, extra=None):
         h = dict(SMOKE_HEADERS)
@@ -882,7 +904,8 @@ def resolve_api_key() -> str:
 
 
 def run(base_url: str, profile: str, only: Optional[str], extra_header: dict, attempts: int,
-        expect_bridge: str = "", served_by_required: bool = True, expected_git_sha: str = "", version_unproven: str = "") -> list:
+        expect_bridge: str = "", served_by_required: bool = True, expected_git_sha: str = "", version_unproven: str = "",
+        version_workers: tuple = ()) -> list:
     selected = [p for p in PROBES if (profile in p.profiles) and (only is None or p.name in only.split(","))]
     if version_unproven:
         if expected_git_sha:
@@ -890,7 +913,8 @@ def run(base_url: str, profile: str, only: Optional[str], extra_header: dict, at
         selected = [p for p in selected if p.name != "version"]
     api_key = resolve_api_key() if any(p.name != "version" for p in selected) else ""
     ctx = Ctx(base_url=base_url.rstrip("/"), api_key=api_key, extra_header=extra_header,
-              expect_bridge=expect_bridge, served_by_required=served_by_required, expected_git_sha=expected_git_sha)
+              expect_bridge=expect_bridge, served_by_required=served_by_required, expected_git_sha=expected_git_sha,
+              version_workers=tuple(version_workers))
     results = []
     for p in selected:
         last = None
@@ -966,6 +990,9 @@ def main():
     version.add_argument("--version-unproven", default="", metavar="REASON",
                          help="Report worker SHA UNPROVEN without probing version (no worker build)")
     version.add_argument("--expected-git-sha", default="", help="Full deployed worker commit; required by version probe")
+    ap.add_argument("--version-workers", default="",
+                    help="comma-separated workers whose direct route /<worker>/v1/version "
+                         "must each report --expected-git-sha (proof per worker)")
     ap.add_argument("--profile", default="hetzner", choices=["hetzner", "server2"])
     ap.add_argument("--only", default=None, help="run only these probes (comma-separated names)")
     ap.add_argument("--extra-header", action="append", default=[],
@@ -990,7 +1017,8 @@ def main():
     results = run(args.base_url, args.profile, args.only, extra, args.attempts,
                   expect_bridge=args.expect_bridge.strip().lower(),
                   served_by_required=not args.served_by_optional, expected_git_sha=args.expected_git_sha,
-                  version_unproven=args.version_unproven)
+                  version_unproven=args.version_unproven,
+                  version_workers=tuple(w for w in args.version_workers.split(",") if w))
     if args.version_unproven:
         print(f"SMOKE_VERSION_UNPROVEN: worker SHA not proven: {args.version_unproven}")
     if not results:

@@ -84,6 +84,8 @@ deploy_server {target} || exit $?
     assert result.returncode == (1 if smoke_failure else 0 if worker else 3), output
     assert ("ROLLBACK" in output) == smoke_failure, output
     assert ("--expected-git-sha " + "a" * 40 in output) == worker, output
+    # Proof per worker through the direct route whenever a SHA is expected.
+    assert ("--version-workers worker1,worker2,worker3,worker4" in output) == worker, output
     assert ("--version-unproven" in output) != worker, output
     if not worker:
         assert "SMOKE_VERSION_UNPROVEN:" in output

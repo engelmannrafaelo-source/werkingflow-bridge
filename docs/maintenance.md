@@ -278,10 +278,14 @@ den erwarteten SHA explizit mitgeben. Beispiel ohne KI-Aufruf:
 python3 scripts/bridge_smoke.py --base-url "$BRIDGE_URL" --only version --expected-git-sha "$DEPLOYED_SHA"
 ```
 
-Fuer den Nachweis eines bestimmten Workers die gleiche Probe gegen dessen
-konfigurierten direkten Worker-Endpunkt ausfuehren. Die Pool-Probe beweist keinen
-vollstaendigen Rollout; Version und OpenAPI am Pool koennen von verschiedenen
-lokalen Workern stammen.
+Den Nachweis je Worker liefert `--version-workers worker1,worker2,worker3,worker4`.
+Die Probe fragt dann jeden Worker über die nginx-Direktroute
+`/<worker>/v1/version`, und jeder muss den Soll-SHA melden. Danach muss auch die
+Pool-Route antworten. `bridge-deploy.sh` setzt das immer, wenn es einen Soll-SHA
+setzt. Ohne `--version-workers` stammen alle Antworten aus dem Pool, und das
+Ergebnis sagt ausdrücklich, dass es kein Nachweis je Worker ist. Das Round-Robin
+läuft je nginx-Prozess, und mit `worker_processes auto` treffen Pool-Stichproben
+nicht sicher jeden Worker.
 
 ## Worker-SHA bei Dienst-Teilmengen
 

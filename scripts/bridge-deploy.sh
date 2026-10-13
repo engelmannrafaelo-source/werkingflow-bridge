@@ -1160,7 +1160,7 @@ phase_smoke_test() {
             error_ "Invalid worker checkout SHA for ${label} from ${pool_host}: '${expected_git_sha}' — smoke not run"
             return 1
         }
-        extra_args+=(--expected-git-sha "$expected_git_sha")
+        extra_args+=(--expected-git-sha "$expected_git_sha" --version-workers "worker1,worker2,worker3,worker4")
     else
         local reason="no workers built in this run (${DEPLOYED_SERVICES[*]}); worker SHA not proven"
         warn "SMOKE_VERSION_UNPROVEN: ${label}: ${reason}"

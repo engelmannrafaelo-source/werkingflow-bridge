@@ -205,3 +205,88 @@ def test_generator_version_pool_has_no_backup(tmp_path):
         assert "backup" not in upstream
         assert "BRIDGE_BACKUP_HOST" not in upstream
         assert generated == (ROOT / f"docker/upstreams-{topology}.conf").read_text()
+
+
+WORKERS = ("worker1", "worker2", "worker3", "worker4")
+
+
+def _route_answers(monkeypatch, by_path):
+    """GET answers by path; records every path asked."""
+    from types import SimpleNamespace
+    asked = []
+
+    def get(url, **kwargs):
+        path = url.removeprefix("http://stub.invalid")
+        asked.append(path)
+        status, sha = by_path.get(path, by_path["default"])
+        return SimpleNamespace(status_code=status, json=lambda: {"git_sha": sha})
+
+    monkeypatch.setattr(smoke.requests, "get", get)
+    monkeypatch.setattr(smoke, "resolve_api_key", lambda: "")
+    monkeypatch.setattr(smoke.time, "sleep", lambda *_: None)
+    return asked
+
+
+def test_version_proves_each_worker_through_its_direct_route(monkeypatch):
+    asked = _route_answers(monkeypatch, {"default": (200, "a" * 40)})
+    res = smoke.run("http://stub.invalid", "hetzner", "version", {}, 3,
+                    expected_git_sha="a" * 40, version_workers=WORKERS)
+    assert res[0].ok is True, res[0].detail
+    assert asked == [f"/{w}/v1/version" for w in WORKERS] + ["/v1/version"]
+
+
+@pytest.mark.parametrize("stale", WORKERS)
+def test_version_stale_worker_fails_whatever_the_pool_says(monkeypatch, stale):
+    """BRUMBAU1R P2 (step 2): with nginx worker_processes > 1 the pool order is
+    per process — pool samples may all hit current workers. The direct route
+    still finds the stale one."""
+    asked = _route_answers(monkeypatch, {"default": (200, "a" * 40),
+                                         f"/{stale}/v1/version": (200, "d" * 40)})
+    res = smoke.run("http://stub.invalid", "hetzner", "version", {}, 3,
+                    expected_git_sha="a" * 40, version_workers=WORKERS)
+    assert res[0].ok is False
+    assert stale in res[0].detail and "d" * 40 in res[0].detail
+    assert asked[-1] == f"/{stale}/v1/version"
+
+
+def test_version_pool_route_still_has_to_answer(monkeypatch):
+    _route_answers(monkeypatch, {"default": (200, "a" * 40), "/v1/version": (503, None)})
+    res = smoke.run("http://stub.invalid", "hetzner", "version", {}, 1,
+                    expected_git_sha="a" * 40, version_workers=WORKERS)
+    assert res[0].ok is False and "pool sample" in res[0].detail
+
+
+def test_version_refuses_a_worker_name_outside_the_direct_route(monkeypatch):
+    asked = _route_answers(monkeypatch, {"default": (200, "a" * 40)})
+    res = smoke.run("http://stub.invalid", "hetzner", "version", {}, 1,
+                    expected_git_sha="a" * 40, version_workers=("../admin",))
+    assert res[0].ok is False and asked == []
+
+
+def test_version_without_workers_says_it_is_no_proof_per_worker(monkeypatch):
+    _route_answers(monkeypatch, {"default": (200, "a" * 40)})
+    res = smoke.run("http://stub.invalid", "hetzner", "version", {}, 1, expected_git_sha="a" * 40)
+    assert res[0].ok is True and "no proof per worker" in res[0].detail
+
+
+def test_version_workers_reach_the_probe_from_the_command_line(monkeypatch):
+    seen = {}
+
+    def fake_run(*args, **kwargs):
+        seen.update(kwargs)
+        return [smoke.ProbeResult("version", "/v1/version", True, "stub")]
+
+    monkeypatch.setattr(smoke, "run", fake_run)
+    import sys
+    monkeypatch.setattr(sys, "argv", ["smoke", "--base-url", "http://stub.invalid", "--only", "version",
+                                   "--expected-git-sha", "a" * 40,
+                                   "--version-workers", "worker1,worker2,worker3,worker4"])
+    with pytest.raises(SystemExit):
+        smoke.main()
+    assert seen["version_workers"] == WORKERS
+
+
+def test_direct_worker_route_exists_in_nginx():
+    """The proof per worker relies on this route; it must stay."""
+    conf = (Path(__file__).parents[1] / "docker/nginx.conf").read_text()
+    assert "location ~ ^/(worker[a-zA-Z0-9_-]+)/(.*)$ {" in conf
