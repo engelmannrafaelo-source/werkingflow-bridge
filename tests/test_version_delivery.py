@@ -117,7 +117,11 @@ def test_version_smoke_checks_deployed_sha(monkeypatch, actual, status, expected
     ctx = smoke.Ctx("http://stub.invalid", "unused")
     ctx.expected_git_sha = expected
     probe = next(p for p in smoke.PROBES if p.name == "version")
-    assert probe.fn(ctx).ok is ok
+    result = probe.fn(ctx)
+    # Without named workers even all-agreeing samples are no proof per worker:
+    # their own state (version_reason), never ok (BRUMBAU2R P2-4).
+    assert result.ok is False
+    assert (result.version_reason is not None) is ok
     # Every sample is asked when all agree; the first wrong answer ends it.
     assert len(calls) == (smoke.VERSION_SAMPLES if ok else int(bool(expected)))
 
@@ -161,7 +165,7 @@ def test_version_transport_error_is_asked_again(monkeypatch):
     _version_answers(monkeypatch, answers)
     res = smoke.run("http://stub.invalid", "hetzner", "version", {}, 1,
                     expected_git_sha="a" * 40)
-    assert res[0].ok is True
+    assert res[0].version_reason and "no answer" not in res[0].detail
 
 
 def test_version_lasting_transport_error_fails(monkeypatch):
@@ -190,7 +194,7 @@ def test_public_version_run_needs_no_credentials(monkeypatch, profile):
         return SimpleNamespace(status_code=200, json=lambda: {"git_sha": "a" * 40})
     monkeypatch.setattr(smoke.requests, "get", get)
     result = smoke.run("http://stub.invalid", profile, "version", {}, 1, expected_git_sha="a" * 40)
-    assert len(result) == 1 and result[0].ok
+    assert len(result) == 1 and result[0].version_reason
 
 
 def test_generator_version_pool_has_no_backup(tmp_path):
@@ -263,10 +267,35 @@ def test_version_refuses_a_worker_name_outside_the_direct_route(monkeypatch):
     assert res[0].ok is False and asked == []
 
 
-def test_version_without_workers_says_it_is_no_proof_per_worker(monkeypatch):
+def test_version_without_workers_is_its_own_state_not_a_pass(monkeypatch):
+    """BRUMBAU2R P2-4: pool samples prove nothing per worker — not ok, not a
+    code failure, its own UNPROVEN state."""
     _route_answers(monkeypatch, {"default": (200, "a" * 40)})
     res = smoke.run("http://stub.invalid", "hetzner", "version", {}, 1, expected_git_sha="a" * 40)
-    assert res[0].ok is True and "no proof per worker" in res[0].detail
+    assert res[0].ok is False and "no proof per worker" in res[0].detail
+    assert res[0].version_reason
+    passed, gaps, failures = smoke.partition_results(res)
+    assert gaps == res and not passed and not failures
+
+
+def test_version_without_workers_never_prints_smoke_ok(monkeypatch, capsys):
+    _route_answers(monkeypatch, {"default": (200, "a" * 40)})
+    import sys
+    monkeypatch.setattr(sys, "argv", ["smoke", "--base-url", "http://stub.invalid",
+                                   "--only", "version", "--expected-git-sha", "a" * 40])
+    with pytest.raises(SystemExit):
+        smoke.main()
+    out = capsys.readouterr()
+    assert "SMOKE_OK" not in out.out
+    assert "SMOKE_VERSION_PER_WORKER_UNPROVEN: no proof per worker" in out.err
+    assert "[VERS]" in out.out
+
+
+def test_version_stale_pool_without_workers_is_a_failure(monkeypatch):
+    _route_answers(monkeypatch, {"default": (200, "d" * 40)})
+    res = smoke.run("http://stub.invalid", "hetzner", "version", {}, 1, expected_git_sha="a" * 40)
+    assert res[0].ok is False and not res[0].version_reason
+    assert smoke.partition_results(res)[2] == res
 
 
 def test_version_workers_reach_the_probe_from_the_command_line(monkeypatch):

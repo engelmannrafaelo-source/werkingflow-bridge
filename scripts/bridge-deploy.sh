@@ -1085,6 +1085,24 @@ deployed_bridge_id() {
     echo "$id"
 }
 
+# config_workers <label>: the worker services of that deploy target, from its
+# service list (HETZNER_ALL / SERVER2_ALL / WORKERHOST_ALL) — the same list
+# the deploy builds from. Empty for a host without workers (server2).
+config_workers() {
+    local list
+    case "$1" in
+        hetzner) list="$HETZNER_ALL" ;;
+        server2) list="$SERVER2_ALL" ;;
+        prod-workers) list="$WORKERHOST_ALL" ;;
+        *) error_ "config_workers: unknown deploy target '$1'"; return 1 ;;
+    esac
+    local svc out=()
+    for svc in $list; do
+        case "$svc" in worker*) out+=("$svc") ;; esac
+    done
+    echo "${out[*]}"
+}
+
 # phase_smoke_test <label> <url> <expect-bridge> <required|optional> <pool-host> <pool-lb> [header...]
 #   expect-bridge  bridge id that must answer research/chat (X-Bridge-Served-By)
 #   required       a missing stamp FAILS (the answering workers were deployed in
@@ -1135,13 +1153,16 @@ phase_smoke_test() {
     fi
 
     # Only workers built by this deploy can be expected to carry its HEAD. The
-    # claude_version pool round-robins worker1-4, so its answer proves the SHA
-    # only when all four were rebuilt; a subset keeps old images in the pool.
-    local svc expected_git_sha pool_workers=() missing_workers=() w
+    # claude_version pool round-robins over this host's workers, so its answer
+    # proves the SHA only when all of them were rebuilt; a subset keeps old
+    # images in the pool. Which workers the host has comes from its service
+    # list (config_workers), never a fixed worker1-4 (BRUMBAU2R P2-4).
+    local svc expected_git_sha pool_workers=() missing_workers=() host_workers=() w
+    read -r -a host_workers <<< "$(config_workers "$label")"
     for svc in "${DEPLOYED_SERVICES[@]}"; do
-        case "$svc" in worker[1-4]|worker-*) pool_workers+=("$svc") ;; esac
+        case "$svc" in worker*) pool_workers+=("$svc") ;; esac
     done
-    for w in worker1 worker2 worker3 worker4; do
+    for w in "${host_workers[@]}"; do
         [[ " ${DEPLOYED_SERVICES[*]} " == *" $w "* ]] || missing_workers+=("$w")
     done
     if (( ${#pool_workers[@]} > 0 && ${#missing_workers[@]} > 0 )); then
@@ -1160,7 +1181,13 @@ phase_smoke_test() {
             error_ "Invalid worker checkout SHA for ${label} from ${pool_host}: '${expected_git_sha}' — smoke not run"
             return 1
         }
-        extra_args+=(--expected-git-sha "$expected_git_sha" --version-workers "worker1,worker2,worker3,worker4")
+        if (( ${#host_workers[@]} == 0 )); then
+            error_ "No workers configured for ${label} (config_workers), but ${pool_workers[*]} were deployed — smoke not run"
+            return 1
+        fi
+        local version_workers
+        version_workers=$(IFS=,; echo "${host_workers[*]}")
+        extra_args+=(--expected-git-sha "$expected_git_sha" --version-workers "$version_workers")
     else
         local reason="no workers built in this run (${DEPLOYED_SERVICES[*]}); worker SHA not proven"
         warn "SMOKE_VERSION_UNPROVEN: ${label}: ${reason}"
@@ -1181,6 +1208,12 @@ phase_smoke_test() {
         # without X-Bridge-Served-By, so which bridge served them is unproven.
         # Only possible with served_by=optional. Reported before the other
         # gap markers so it is never hidden behind them.
+        # SMOKE_VERSION_PER_WORKER_UNPROVEN = exit 0, NOT a pass: the pool
+        # route carries the SHA, but no worker was asked on its own route.
+        if grep -q '^SMOKE_VERSION_PER_WORKER_UNPROVEN:' <<< "$smoke_out"; then
+            warn "SMOKE_VERSION_UNPROVEN: ${label}: no proof per worker"
+            SMOKE_UNPROVEN+=("${label}: version UNPROVEN — no proof per worker")
+        fi
         if grep -q '^SMOKE_TARGET:' <<< "$smoke_out"; then
             warn "Smoke for ${label}: research/chat answered, but NOT PROVEN to come from bridge '${expect_bridge}'"
             warn "  Deploy the answering workers (prod-workers), then re-run — see the SMOKE_TARGET line above."

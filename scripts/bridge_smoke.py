@@ -109,6 +109,10 @@ class ProbeResult:
     # workers on the worker-host) and may predate the header.
     target_reason: Optional[str] = None
     served_by: Optional[str] = None
+    # Set ONLY by version() without named workers: the pool route answered
+    # the expected SHA, but pool samples prove nothing per worker (BRUMBAU2R
+    # P2-4). Its own state — neither a pass nor a code failure.
+    version_reason: Optional[str] = None
 
 
 # ---------------------------------------------------------------------------
@@ -370,7 +374,8 @@ def probe(name, endpoint, profiles, repro="", retry=True):
 # as well — it is what callers use — but its round-robin position is kept per
 # nginx worker process: with `worker_processes auto` samples there prove
 # nothing per worker. Without named workers (manual runs) only the pool is
-# sampled, and the result says that it is no proof per worker.
+# sampled, and the result is its own state, not a pass: no proof per worker
+# (SMOKE_VERSION_PER_WORKER_UNPROVEN, BRUMBAU2R P2-4).
 VERSION_SAMPLES = 8
 # A request that got no answer (connection) is asked again this often; an
 # answer that arrived is never asked again — it is the worker's own word.
@@ -422,9 +427,10 @@ def version(ctx):
         return ProbeResult("version", "/v1/version", True,
                            f"Deployed SHA on each of {', '.join(ctx.version_workers)} "
                            f"(direct route) and on the pool route", 200)
-    return ProbeResult("version", "/v1/version", True,
-                       f"Deployed SHA on all {VERSION_SAMPLES} pool samples — "
-                       f"no proof per worker (no --version-workers)", 200)
+    reason = "no proof per worker (no --version-workers)"
+    return ProbeResult("version", "/v1/version", False,
+                       f"Deployed SHA on all {VERSION_SAMPLES} pool samples — {reason}", 200,
+                       version_reason=reason)
 
 
 # EXCLUDED: endpoint -> reason. Enforced by the coverage validator. These are
@@ -967,10 +973,10 @@ def partition_results(results: list) -> tuple:
                   if not r.ok and not r.capacity_reason and r.dependency_reason]
     unproven = [r for r in results
                 if not r.ok and not r.capacity_reason and not r.dependency_reason
-                and r.target_reason]
+                and (r.target_reason or r.version_reason)]
     failures = [r for r in results
                 if not r.ok and not r.capacity_reason and not r.dependency_reason
-                and not r.target_reason]
+                and not r.target_reason and not r.version_reason]
 
     # A target-unproven probe DID pass through the gate — it only cannot say
     # which bridge answered.
@@ -1029,10 +1035,12 @@ def main():
     gap_names = {r.name for r in gaps}
     dep_names = {r.name for r in gaps if r.dependency_reason}
     trg_names = {r.name for r in gaps if r.target_reason}
+    ver_names = {r.name for r in gaps if r.version_reason}
     for r in results:
         mark = ("OK  " if r.ok else
                 "DEP " if r.name in dep_names else
                 "TRGT" if r.name in trg_names else
+                "VERS" if r.name in ver_names else
                 "CAPA" if r.name in gap_names else "FAIL")
         ms = f"{r.elapsed_ms}ms" if r.elapsed_ms is not None else "-"
         print(f"  [{mark}] {r.name:22s} {r.endpoint:34s} ({ms}) {r.detail}")
@@ -1141,6 +1149,15 @@ def main():
             "--profile <profile> --expect-bridge <id> --only <probe>.",
             file=sys.stderr,
         )
+
+    version_gaps = [r for r in gaps if r.version_reason]
+    if version_gaps:
+        # NOT a pass: the pool route carries the SHA, but which workers do is
+        # unproven. bridge-deploy.sh always names its workers; a run without
+        # them (by hand) must not read as a proven deploy.
+        print(f"SMOKE_VERSION_PER_WORKER_UNPROVEN: {version_gaps[0].version_reason} — "
+              f"pass --version-workers for proof per worker (profile={args.profile})",
+              file=sys.stderr)
 
     if gaps:
         sys.exit(0)
