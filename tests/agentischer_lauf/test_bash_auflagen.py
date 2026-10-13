@@ -79,7 +79,42 @@ async def test_container_is_created_with_daemon_side_removal(tmp_path):
     with pytest.raises(RunError, match="sandbox_fehler"):
         await box.run(command="true", material={}, files={}, outputs=[], max_bytes=1)
     assert calls[0][0] == "create" and "--rm" in calls[0]
-    assert calls[-1][:2] == ["rm", "--force"]
+    assert ["rm", "--force"] == calls[1][:2]
+    assert calls[-1][:2] == ["container", "inspect"]
+
+
+async def test_removal_waits_for_the_daemons_own_removal(tmp_path):
+    """--rm races our rm: "already in progress" is no error, but the call
+    returns only once the container is gone (nothing outlives it)."""
+    box = place(tmp_path)
+    inspects = []
+
+    async def command(args, **kw):
+        if args[0] == "rm":
+            return 1, b"", b"Error: removal of container x is already in progress"
+        inspects.append(args)
+        return (0, b"id", b"") if len(inspects) < 3 else (1, b"", b"Error: No such container: x")
+
+    box._command = command
+    await box._entfernen("x")
+    assert len(inspects) == 3
+
+
+async def test_removal_that_never_finishes_is_loud(tmp_path, monkeypatch):
+    box = place(tmp_path)
+
+    async def command(args, **kw):
+        return (1, b"", b"removal already in progress") if args[0] == "rm" else (0, b"id", b"")
+
+    monkeypatch.setattr("src.agentischer_lauf.bash.asyncio.sleep", AsyncMockSleep())
+    box._command = command
+    with pytest.raises(RunError, match="sandbox_fehler"):
+        await box._entfernen("x")
+
+
+class AsyncMockSleep:
+    async def __call__(self, *_):
+        return None
 
 
 async def test_sigint_to_pid1_is_ignored(tmp_path):

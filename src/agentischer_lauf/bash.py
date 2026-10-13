@@ -184,13 +184,27 @@ class BashPlace:
             finally:
                 # Removing the namespace kills even setsid/double-fork descendants.
                 # Shield cleanup from the runtime's overall deadline/cancellation.
-                cleanup = asyncio.create_task(self._command(["rm", "--force", name]))
+                cleanup = asyncio.create_task(self._entfernen(name))
                 try:
-                    code, _, error = await asyncio.shield(cleanup)
+                    await asyncio.shield(cleanup)
                 except asyncio.CancelledError:
-                    code, _, error = await cleanup
-                    if code and b"No such container" not in error:
+                    try:
+                        await cleanup
+                    except RunError:
                         raise RunError("sandbox_fehler") from None
                     raise
-                if code and b"No such container" not in error:
-                    raise RunError("sandbox_fehler")
+
+    async def _entfernen(self, name):
+        """Remove the container and return only once it is gone. With --rm
+        the daemon may already be removing it ("removal ... already in
+        progress"); then wait for that, so nothing outlives the call."""
+        code, _, error = await self._command(["rm", "--force", name])
+        if code and b"No such container" not in error and b"already in progress" not in error:
+            raise RunError("sandbox_fehler")
+        for _ in range(100):
+            code, _, error = await self._command(
+                ["container", "inspect", "--format", "{{.Id}}", name])
+            if code and b"No such" in error:
+                return
+            await asyncio.sleep(0.1)
+        raise RunError("sandbox_fehler")
