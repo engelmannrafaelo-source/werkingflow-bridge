@@ -112,6 +112,38 @@ async def test_removal_that_never_finishes_is_loud(tmp_path, monkeypatch):
         await box._entfernen("x")
 
 
+async def test_container_name_carries_the_place_prefix(tmp_path):
+    """BRUMBAU2R P2-5: a test run names its containers with its own prefix, so
+    it finds only its own leftovers on a shared daemon."""
+    box = place(tmp_path, name_prefix="agentic-bash-tabc-")
+    names = []
+
+    async def command(args, **kw):
+        if args[0] == "create":
+            names.append(args[args.index("--name") + 1])
+            return 1, b"", b"stub"
+        if args[0] == "inspect":
+            return 1, b"", b"Error: No such container"
+        return 0, b"", b""
+
+    box._command = command
+    with pytest.raises(RunError):
+        await box.run(command="true", material={}, files={}, outputs=[], max_bytes=1000)
+    assert len(names) == 1 and names[0].startswith("agentic-bash-tabc-")
+    assert len(names[0]) == len("agentic-bash-tabc-") + 32
+
+
+@pytest.mark.parametrize("prefix", ["", "bash-", "agentic-bash-X", "agentic-bash-a/b",
+                                    "agentic-bash-" + "a" * 41])
+def test_container_prefix_must_stay_in_the_bash_namespace(tmp_path, prefix):
+    with pytest.raises(ValueError):
+        place(tmp_path, name_prefix=prefix)
+
+
+def test_default_prefix_is_unchanged(tmp_path):
+    assert place(tmp_path).name_prefix == "agentic-bash-"
+
+
 class AsyncMockSleep:
     async def __call__(self, *_):
         return None

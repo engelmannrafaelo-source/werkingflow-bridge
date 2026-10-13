@@ -46,8 +46,9 @@ def test_deploy_service_subset(tmp_path, target, services, worker, smoke_failure
 def test_version_workers_come_from_the_host_service_list(tmp_path):
     """BRUMBAU2R P2-4: the workers named for proof per worker are the host's
     configured workers, not a fixed worker1-4."""
-    result, output = _deploy(tmp_path, "hetzner", "worker-a worker-b", "echo SMOKE_OK: stub",
-                             config='HETZNER_ALL="platform-api nginx worker-a worker-b erkunder"')
+    config = 'HETZNER_ALL="platform-api nginx worker-a worker-b erkunder"'
+    result, output = _deploy(tmp_path, "hetzner", "worker-a worker-b",
+                             "echo SMOKE_OK: stub", config=config)
     assert "FORBIDDEN" not in output
     assert result.returncode == 0, output
     assert re.search(r"--version-workers worker-a,worker-b$", output, re.M), output
@@ -65,12 +66,13 @@ error_() {{ echo "ERROR $*"; }}
 for t in hetzner server2 prod-workers; do echo "$t=[$(config_workers $t)]"; done
 config_workers nirgends || echo "rc=$?"
 """
-    out = subprocess.run(["bash", "-c", script], capture_output=True, text=True, timeout=10,
-                         env={"PATH": os.defpath}).stdout
+    out = subprocess.run(["bash", "-c", script], capture_output=True, text=True,
+                         timeout=10, env={"PATH": os.defpath}).stdout
     assert "hetzner=[worker1 worker2 worker3 worker4]" in out
     assert "server2=[]" in out
     assert "prod-workers=[worker-sahori worker-kurt worker-coach worker-erk]" in out
-    assert "ERROR config_workers: unknown deploy target 'nirgends'" in out and "rc=1" in out
+    assert "ERROR config_workers: unknown deploy target 'nirgends'" in out
+    assert "rc=1" in out
 
 
 def test_smoke_without_proof_per_worker_is_unproven_not_a_pass(tmp_path):
@@ -88,7 +90,8 @@ def test_smoke_without_proof_per_worker_is_unproven_not_a_pass(tmp_path):
 
 def _deploy(tmp_path, target, services, smoke_body, config=""):
     text = (ROOT / "scripts/bridge-deploy.sh").read_text()
-    names = ["deploy_server", "phase_smoke_test", "record_deploy_proof", "config_workers"]
+    names = ["deploy_server", "phase_smoke_test", "record_deploy_proof",
+             "config_workers"]
     definitions = "\n".join(function(text, name) for name in names)
     # Load service lists from the real CLI, never its host config or entry point.
     constants = "\n".join(re.findall(

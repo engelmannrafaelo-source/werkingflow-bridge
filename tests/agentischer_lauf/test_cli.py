@@ -390,7 +390,8 @@ def auftrag(**overrides):
 
 
 async def test_place_stops_process_group_and_cleans_up(tmp_path):
-    platz = kind_platz(tmp_path, "enkel")
+    pid_datei = tmp_path / "enkel.pid"
+    platz = kind_platz(tmp_path, "enkel", ACLI_PIDDATEI=str(pid_datei))
     seen = []
 
     def beobachter(line):
@@ -409,16 +410,14 @@ async def test_place_stops_process_group_and_cleans_up(tmp_path):
     assert "CLAUDE_CODE_MAX_OUTPUT_TOKENS" in env and "ZUGANG_TEST" in env
     assert not any(k.startswith(("AWS_", "INFISICAL", "AI_BRIDGE")) for k in env)
     assert list((tmp_path / "arbeit").iterdir()) == []
-    time.sleep(0.2)
-    # The grandchild of the killed process group is gone as well.
-    assert not any(b"time.sleep(60)" in cmdline(p) for p in Path("/proc").iterdir())
-
-
-def cmdline(proc):
-    try:
-        return (proc / "cmdline").read_bytes() if proc.name.isdecimal() else b""
-    except OSError:
-        return b""
+    # The grandchild of the killed process group is gone as well. Only this
+    # run's own grandchild is asked, by its PID: a scan of all /proc saw the
+    # sleepers of other runs and sessions (BRUMBAU2R P2-5).
+    enkel = int(pid_datei.read_text())
+    frist = time.monotonic() + 2
+    while lebt(enkel) and time.monotonic() < frist:
+        time.sleep(0.05)
+    assert not lebt(enkel)
 
 
 async def test_place_time_limit(tmp_path):

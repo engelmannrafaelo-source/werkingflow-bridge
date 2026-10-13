@@ -271,7 +271,8 @@ def test_version_without_workers_is_its_own_state_not_a_pass(monkeypatch):
     """BRUMBAU2R P2-4: pool samples prove nothing per worker — not ok, not a
     code failure, its own UNPROVEN state."""
     _route_answers(monkeypatch, {"default": (200, "a" * 40)})
-    res = smoke.run("http://stub.invalid", "hetzner", "version", {}, 1, expected_git_sha="a" * 40)
+    res = smoke.run("http://stub.invalid", "hetzner", "version", {}, 1,
+                    expected_git_sha="a" * 40)
     assert res[0].ok is False and "no proof per worker" in res[0].detail
     assert res[0].version_reason
     passed, gaps, failures = smoke.partition_results(res)
@@ -293,7 +294,8 @@ def test_version_without_workers_never_prints_smoke_ok(monkeypatch, capsys):
 
 def test_version_stale_pool_without_workers_is_a_failure(monkeypatch):
     _route_answers(monkeypatch, {"default": (200, "d" * 40)})
-    res = smoke.run("http://stub.invalid", "hetzner", "version", {}, 1, expected_git_sha="a" * 40)
+    res = smoke.run("http://stub.invalid", "hetzner", "version", {}, 1,
+                    expected_git_sha="a" * 40)
     assert res[0].ok is False and not res[0].version_reason
     assert smoke.partition_results(res)[2] == res
 

@@ -30,12 +30,19 @@ class BashPlace:
         docker="/usr/bin/docker",
         socket="unix:///var/run/docker.sock",
         max_parallel=3,
+        name_prefix="agentic-bash-",
     ):
         # A reviewed local image, never a mutable tag or an implicit image pull.
         if not re.fullmatch(r"sha256:[a-f0-9]{64}", image):
             raise ValueError("computation image must be pinned by local image ID")
         if not 0 < timeout_s <= 480 or not 0 < work_bytes <= 256_000_000:
             raise ValueError("invalid computation limits")
+        # Container names start with this. Tests give each run its own prefix
+        # so their leftover check sees only their own containers on a shared
+        # daemon (BRUMBAU2R P2-5); the runtime keeps the default.
+        if not re.fullmatch(r"agentic-bash-[a-z0-9-]{0,40}", name_prefix):
+            raise ValueError("container name prefix must start with agentic-bash-")
+        self.name_prefix = name_prefix
         self.image, self.root = image, Path(root).resolve()
         self.timeout_s, self.work_bytes = timeout_s, work_bytes
         self.cli = [docker, "--host", socket]
@@ -114,7 +121,7 @@ class BashPlace:
 
     async def _run(self, command, material, files, outputs, max_bytes):
         with tempfile.TemporaryDirectory(prefix="bash-", dir=self.root) as temporary:
-            name = "agentic-bash-" + uuid.uuid4().hex
+            name = self.name_prefix + uuid.uuid4().hex
             args = [
                 "create",
                 "--name",

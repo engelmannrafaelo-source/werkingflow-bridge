@@ -429,8 +429,8 @@ def version(ctx):
                            f"(direct route) and on the pool route", 200)
     reason = "no proof per worker (no --version-workers)"
     return ProbeResult("version", "/v1/version", False,
-                       f"Deployed SHA on all {VERSION_SAMPLES} pool samples — {reason}", 200,
-                       version_reason=reason)
+                       f"Deployed SHA on all {VERSION_SAMPLES} pool samples — {reason}",
+                       200, version_reason=reason)
 
 
 # EXCLUDED: endpoint -> reason. Enforced by the coverage validator. These are

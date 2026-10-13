@@ -116,3 +116,37 @@ def _no_ambient_research_library(monkeypatch):
         "PERPLEXITY_API_KEY",
     ):
         monkeypatch.delenv(var, raising=False)
+
+
+# --- *_prozessende modules run on their own (BRUMBAU2R P2-5) -----------------
+# They need the REAL claude_code_sdk and real process ends. In a session that
+# also collects modules which replace the SDK in sys.modules (tests/agentischer_lauf
+# imports the real one first, so their own skip guard no longer fires), they
+# run in a polluted state and fail (FileNotFoundError .../pids): a whole run is
+# then six red tests noisier and the next real red goes unseen. So a mixed run
+# leaves them out — loudly, with the call that runs them — and a run of only
+# these modules runs them: scripts/test-prozessende.sh, one process per module.
+PROZESSENDE_SUFFIX = "_prozessende.py"
+PROZESSENDE_AUFRUF = "scripts/test-prozessende.sh"
+_PROZESSENDE_KEY = pytest.StashKey()
+
+
+def pytest_collection_modifyitems(config, items):
+    eigene = [i for i in items if i.path.name.endswith(PROZESSENDE_SUFFIX)]
+    if not eigene or len(eigene) == len(items):
+        return
+    items[:] = [i for i in items if not i.path.name.endswith(PROZESSENDE_SUFFIX)]
+    config.hook.pytest_deselected(items=eigene)
+    module = sorted({i.path.name for i in eigene})
+    config.stash[_PROZESSENDE_KEY] = module, len(eigene)
+
+
+def pytest_terminal_summary(terminalreporter, config):
+    abgetrennt = config.stash.get(_PROZESSENDE_KEY, None)
+    if abgetrennt:
+        module, anzahl = abgetrennt
+        terminalreporter.write_line(
+            f"PROZESSENDE NICHT GELAUFEN: {anzahl} Tests in {', '.join(module)} laufen "
+            f"nur in eigenem Prozess — {PROZESSENDE_AUFRUF}",
+            yellow=True, bold=True,
+        )
