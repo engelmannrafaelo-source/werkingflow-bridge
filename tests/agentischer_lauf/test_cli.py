@@ -228,6 +228,17 @@ def test_stream_without_usage_is_unknown():
 # --- Gate 2: composition and admission ---------------------------------------
 
 
+REVISION = "5e" * 20
+
+
+def version_von(sha):
+    from src.version import VersionResponse
+
+    return VersionResponse(
+        git_sha=sha, built_at="2026-10-13T12:00:00Z", contract_version="1"
+    )
+
+
 def konfig(tmp_path, **overrides):
     settings = tmp_path / "settings.json"
     settings.write_text("{}")
@@ -248,7 +259,6 @@ def konfig(tmp_path, **overrides):
         "max_turns": 10,
         "max_tokens_je_antwort": 100,
         "speicher": str(tmp_path / "protected"),
-        "revision": "test",
     }
     result.update(overrides)
     return result
@@ -267,6 +277,10 @@ def server(monkeypatch, tmp_path):
     # Wiring tests run outside a place container; pruefe_platz has its own tests.
     from src.agentischer_lauf import zulassung
     monkeypatch.setattr(zulassung, "pruefe_platz", lambda *a, **k: None)
+    # The image's build metadata, as /v1/version reads it (src/version.py).
+    monkeypatch.setattr(
+        zulassung, "read_version", lambda: version_von(REVISION), raising=False
+    )
     monkeypatch.setattr(http, "_runtime", None)
     monkeypatch.setattr(http, "_admit", None)
     monkeypatch.setenv("ACLI_TEST_ZUGANG", "geheimer-zugang")
@@ -321,6 +335,80 @@ def test_gate2_requires_verified_tenant(server, tmp_path, who, app_id):
     with TestClient(app()) as client:
         out = client.post("/v1/research", json=cli_payload(), headers={"X-App-ID": app_id})
     assert out.status_code == 403
+
+
+def test_gate2_herkunft_traegt_die_revision_von_v1_version(server, tmp_path):
+    """D1 (BRUMBAU-N1): herkunft.bridge_revision and /v1/version git_sha are one
+    value. A caller checks both against the revision it released; a second,
+    hand-kept source let the version probe pass and every paid run then fail."""
+    runtime, _ = verdrahte(konfig(tmp_path))
+    assert runtime.revision == REVISION
+    platz = Platz(strom("werkzeug"), {"ergebnis.txt": b"Ergebnis\n"})
+    provider = runtime.adapters.require("cli")
+    provider.platz = platz
+    provider.zaehler = AsyncMock(return_value=7)
+    with TestClient(app()) as client:
+        out = client.post(
+            "/v1/research", json=cli_payload(), headers={"X-App-ID": "app-x"}
+        )
+    assert out.status_code == 200, out.text
+    assert out.json()["herkunft"]["bridge_revision"] == REVISION
+
+
+def test_gate2_gleiche_konfig_revision_ist_zulaessig(server, tmp_path):
+    runtime, _ = verdrahte(konfig(tmp_path, revision=REVISION))
+    assert runtime.revision == REVISION
+
+
+@pytest.mark.parametrize("angegeben", [
+    "test",
+    # The operating case behind D1: a short SHA of the right commit is still
+    # another value (BRUMBAU3R P3-D2, mutant D6).
+    REVISION[:7],
+    REVISION[:39],
+    REVISION.upper(),
+])
+def test_gate2_abweichende_konfig_revision_bricht_start_ab(
+    server, tmp_path, caplog, angegeben
+):
+    with pytest.raises(RunError) as caught:
+        verdrahte(konfig(tmp_path, revision=angegeben))
+    assert caught.value.code == "faehigkeit_nicht_verfuegbar"
+    assert repr(angegeben) in caplog.text and REVISION in caplog.text
+    assert http._runtime is None
+
+
+def test_gate2_ohne_build_metadaten_bricht_start_ab(
+    server, tmp_path, monkeypatch, caplog
+):
+    from src.agentischer_lauf import zulassung
+
+    def fehlt():
+        raise FileNotFoundError("build-metadata.json")
+
+    monkeypatch.setattr(zulassung, "read_version", fehlt, raising=False)
+    with pytest.raises(RunError) as caught:
+        verdrahte(konfig(tmp_path))
+    assert caught.value.code == "faehigkeit_nicht_verfuegbar"
+    assert "build-metadata.json" in caplog.text
+    assert http._runtime is None
+
+
+def test_gate2_handbau_ohne_git_commit_sagt_was_zu_tun_ist(
+    server, tmp_path, monkeypatch, caplog
+):
+    """BRUMBAU3R P3-D1: git_sha "unknown" (no GIT_COMMIT at build) stops the
+    start, and the log names the fix."""
+    from src.agentischer_lauf import zulassung
+
+    monkeypatch.setattr(zulassung, "read_version", lambda: version_von("unknown"),
+                        raising=False)
+    with pytest.raises(RunError) as caught:
+        verdrahte(konfig(tmp_path))
+    assert caught.value.code == "faehigkeit_nicht_verfuegbar"
+    assert "GIT_COMMIT=$(git rev-parse HEAD)" in caplog.text
+    assert "startet der Worker nicht" in caplog.text
+    assert http._runtime is None
 
 
 def test_gate2_missing_isolation_fails_at_start(tmp_path):
