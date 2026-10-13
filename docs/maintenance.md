@@ -234,6 +234,9 @@ setzen es nicht selbst: Ohne expliziten vollstaendigen Commit-SHA entsteht wegen
 `${GIT_COMMIT:-unknown}` ein Image, dessen Versionsroute dauerhaft 503 liefert.
 Die Bauzeit stammt aus dem Image-Bau, nicht vom Worker-Start. `/health` bleibt
 unabhaengig davon der Lebenszeichen-Endpunkt.
+`/health` nennt denselben SHA im Feld `git_commit`, aus derselben Datei. Fehlt
+sie oder ist sie ungueltig, steht dort `null` plus `git_commit_error`; der
+Status bleibt 200 und `healthy`, damit der Docker-Healthcheck nicht kippt.
 
 Die Smoke-Probe `version` verlangt `--expected-git-sha` mit dem vollen ausgerollten
 Worker-SHA. Der Deploy liest ihn unabhaengig von der HTTP-Antwort aus dem
