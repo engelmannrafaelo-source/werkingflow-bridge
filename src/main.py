@@ -903,6 +903,9 @@ app = FastAPI(
 
 # Generic async-job endpoints (POST /v1/jobs, GET /v1/jobs/{id}) — additive,
 # inert unless BRIDGE_GENERIC_JOBS_ENABLED=true.
+from src.version import router as version_router
+
+app.include_router(version_router)
 app.include_router(jobs_router)
 app.include_router(erkunder_router)
 
@@ -8432,6 +8435,15 @@ async def health_check(request: Request):
         "service": "claude-code-openai-wrapper",
         "worker_instance": worker_instance,
     }
+
+    # Which code this worker runs — same source as GET /v1/version. null plus
+    # git_commit_error = the image carries no usable build metadata.
+    from src.version import METADATA_ERRORS, read_version
+    try:
+        result["git_commit"] = read_version().git_sha
+    except METADATA_ERRORS as e:
+        result["git_commit"] = None
+        result["git_commit_error"] = f"build_metadata_unavailable: {type(e).__name__}"
 
     # ADR-0012: which job store this worker writes to — the marker it stamps
     # into every job_id, and the one the load balancer routes polls by. Exposed

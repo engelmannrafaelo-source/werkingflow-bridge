@@ -50,6 +50,8 @@ def discover_routes() -> set:
     with open(MAIN) as fh:
         src = fh.read()
     routes = set(ROUTE_RE.findall(src))
+    # Explicit router surface; keep it visible without importing the worker SDKs.
+    routes.add("/v1/version")
     return {r for r in routes if not r.startswith(IGNORE_PREFIXES)}
 
 

@@ -336,6 +336,9 @@ class Probe:
     profiles: set            # which server profiles run this probe
     fn: Callable             # (ctx) -> ProbeResult
     repro: str = ""          # human repro command shown on failure / to fix-session
+    # False: a failed result is final. For a probe whose single success does
+    # not cancel an earlier failure (version: one stale worker in the pool).
+    retry: bool = True
 
 
 PROBES: list = []
@@ -353,12 +356,55 @@ def with_attribution(repro: str) -> str:
     return repro.rstrip() + " " + ATTRIBUTION_REPRO.rstrip()
 
 
-def probe(name, endpoint, profiles, repro=""):
+def probe(name, endpoint, profiles, repro="", retry=True):
     def deco(fn):
         PROBES.append(Probe(name=name, endpoint=endpoint, profiles=set(profiles),
-                            fn=fn, repro=with_attribution(repro)))
+                            fn=fn, repro=with_attribution(repro), retry=retry))
         return fn
     return deco
+
+
+# claude_version round-robins over the pool's four workers, and every nginx
+# worker process keeps its own position: one answer proves one worker. The
+# probe asks this many times and EVERY answer must carry the expected SHA.
+VERSION_SAMPLES = 8
+# A sample that did not arrive (connection) is asked again this often; an
+# answer that arrived is never asked again — it is the worker's own word.
+VERSION_SAMPLE_TRANSPORT_RETRIES = 2
+
+
+@probe("version", "/v1/version", {"hetzner", "server2"}, retry=False)
+def version(ctx):
+    import re
+    if not re.fullmatch(r"[0-9a-f]{40}", ctx.expected_git_sha):
+        return ProbeResult("version", "/v1/version", False, "Expected full deployed SHA is required")
+    total_ms = 0
+    for sample in range(1, VERSION_SAMPLES + 1):
+        for transport_try in range(VERSION_SAMPLE_TRANSPORT_RETRIES + 1):
+            try:
+                response, ms = _timed(lambda: requests.get(
+                    ctx.base_url + "/v1/version", timeout=ctx.timeout, allow_redirects=False))
+                break
+            except requests.RequestException as e:
+                if transport_try == VERSION_SAMPLE_TRANSPORT_RETRIES:
+                    return ProbeResult(
+                        "version", "/v1/version", False,
+                        f"sample {sample}/{VERSION_SAMPLES}: no answer ({type(e).__name__})")
+        total_ms += ms
+        try:
+            sha = response.json().get("git_sha") if response.status_code == 200 else None
+        except ValueError:
+            sha = None
+        if response.status_code != 200 or sha != ctx.expected_git_sha:
+            return ProbeResult(
+                "version", "/v1/version", False,
+                f"sample {sample}/{VERSION_SAMPLES}: version missing or deployed SHA mismatch "
+                f"(status {response.status_code}, git_sha {sha!r}) — a worker of the pool "
+                f"does not run the expected commit",
+                response.status_code, total_ms)
+    return ProbeResult("version", "/v1/version", True,
+                       f"Deployed SHA matches on all {VERSION_SAMPLES} samples",
+                       200, total_ms)
 
 
 # EXCLUDED: endpoint -> reason. Enforced by the coverage validator. These are
@@ -423,6 +469,7 @@ class Ctx:
     # = no target check (manual runs). bridge-deploy.sh always sets it.
     expect_bridge: str = ""
     served_by_required: bool = True
+    expected_git_sha: str = ""
 
     def headers(self, extra=None):
         h = dict(SMOKE_HEADERS)
@@ -835,10 +882,15 @@ def resolve_api_key() -> str:
 
 
 def run(base_url: str, profile: str, only: Optional[str], extra_header: dict, attempts: int,
-        expect_bridge: str = "", served_by_required: bool = True) -> list:
-    ctx = Ctx(base_url=base_url.rstrip("/"), api_key=resolve_api_key(), extra_header=extra_header,
-              expect_bridge=expect_bridge, served_by_required=served_by_required)
+        expect_bridge: str = "", served_by_required: bool = True, expected_git_sha: str = "", version_unproven: str = "") -> list:
     selected = [p for p in PROBES if (profile in p.profiles) and (only is None or p.name in only.split(","))]
+    if version_unproven:
+        if expected_git_sha:
+            raise ValueError("version_unproven and expected_git_sha are mutually exclusive")
+        selected = [p for p in selected if p.name != "version"]
+    api_key = resolve_api_key() if any(p.name != "version" for p in selected) else ""
+    ctx = Ctx(base_url=base_url.rstrip("/"), api_key=api_key, extra_header=extra_header,
+              expect_bridge=expect_bridge, served_by_required=served_by_required, expected_git_sha=expected_git_sha)
     results = []
     for p in selected:
         last = None
@@ -847,7 +899,7 @@ def run(base_url: str, profile: str, only: Optional[str], extra_header: dict, at
                 last = p.fn(ctx)
             except Exception as e:  # a probe raising = that probe FAILS loud, never skipped
                 last = ProbeResult(p.name, p.endpoint, False, f"probe raised: {type(e).__name__}: {e}")
-            if last.ok:
+            if last.ok or not p.retry:
                 break
             if attempt < attempts:
                 # Honor the envelope's own Retry-After for capacity refusals —
@@ -910,6 +962,10 @@ def partition_results(results: list) -> tuple:
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--base-url", required=True)
+    version = ap.add_mutually_exclusive_group()
+    version.add_argument("--version-unproven", default="", metavar="REASON",
+                         help="Report worker SHA UNPROVEN without probing version (no worker build)")
+    version.add_argument("--expected-git-sha", default="", help="Full deployed worker commit; required by version probe")
     ap.add_argument("--profile", default="hetzner", choices=["hetzner", "server2"])
     ap.add_argument("--only", default=None, help="run only these probes (comma-separated names)")
     ap.add_argument("--extra-header", action="append", default=[],
@@ -933,7 +989,10 @@ def main():
 
     results = run(args.base_url, args.profile, args.only, extra, args.attempts,
                   expect_bridge=args.expect_bridge.strip().lower(),
-                  served_by_required=not args.served_by_optional)
+                  served_by_required=not args.served_by_optional, expected_git_sha=args.expected_git_sha,
+                  version_unproven=args.version_unproven)
+    if args.version_unproven:
+        print(f"SMOKE_VERSION_UNPROVEN: worker SHA not proven: {args.version_unproven}")
     if not results:
         print(f"SMOKE_FAIL: no probes selected for profile={args.profile} only={args.only}", file=sys.stderr)
         sys.exit(2)

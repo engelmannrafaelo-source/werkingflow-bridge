@@ -1134,6 +1134,40 @@ phase_smoke_test() {
         return 0
     fi
 
+    # Only workers built by this deploy can be expected to carry its HEAD. The
+    # claude_version pool round-robins worker1-4, so its answer proves the SHA
+    # only when all four were rebuilt; a subset keeps old images in the pool.
+    local svc expected_git_sha pool_workers=() missing_workers=() w
+    for svc in "${DEPLOYED_SERVICES[@]}"; do
+        case "$svc" in worker[1-4]|worker-*) pool_workers+=("$svc") ;; esac
+    done
+    for w in worker1 worker2 worker3 worker4; do
+        [[ " ${DEPLOYED_SERVICES[*]} " == *" $w "* ]] || missing_workers+=("$w")
+    done
+    if (( ${#pool_workers[@]} > 0 && ${#missing_workers[@]} > 0 )); then
+        local reason="only ${pool_workers[*]} rebuilt, ${missing_workers[*]} keep their old image in the claude_version pool; worker SHA not proven"
+        warn "SMOKE_VERSION_UNPROVEN: ${label}: ${reason}"
+        SMOKE_UNPROVEN+=("${label}: version UNPROVEN — ${reason}")
+        extra_args+=(--version-unproven "$reason")
+    elif (( ${#pool_workers[@]} > 0 )); then
+        local rssh_rc=0
+        expected_git_sha=$(rssh "$pool_host" "cd ${REMOTE_REPO} && git rev-parse HEAD") || rssh_rc=$?
+        if (( rssh_rc != 0 )); then
+            error_ "Cannot read expected worker SHA for ${label}: rssh ${pool_host} 'git rev-parse HEAD' in ${REMOTE_REPO} failed (rc=${rssh_rc}) — smoke not run"
+            return 1
+        fi
+        [[ "$expected_git_sha" =~ ^[0-9a-f]{40}$ ]] || {
+            error_ "Invalid worker checkout SHA for ${label} from ${pool_host}: '${expected_git_sha}' — smoke not run"
+            return 1
+        }
+        extra_args+=(--expected-git-sha "$expected_git_sha")
+    else
+        local reason="no workers built in this run (${DEPLOYED_SERVICES[*]}); worker SHA not proven"
+        warn "SMOKE_VERSION_UNPROVEN: ${label}: ${reason}"
+        SMOKE_UNPROVEN+=("${label}: version UNPROVEN — ${reason}")
+        extra_args+=(--version-unproven "$reason")
+    fi
+
     # Make AI_BRIDGE_API_KEY / INFISICAL_WS_DEV_SERVER available to the smoke
     # script's key resolution (env first, Infisical fallback).
     # shellcheck source=/root/.infisical/infisical-api.sh
@@ -2220,6 +2254,13 @@ EOF
 # missing. A clean deploy writes DEPLOYED_SHA_FILE and clears that file.
 record_deploy_proof() {
     local host="$1" server_name="$2" sha="$3"
+    local gap
+    for gap in "${SMOKE_UNPROVEN[@]}"; do
+        if [[ "$gap" == "${server_name}: version UNPROVEN"* ]]; then
+            warn "NOT recorded as proven: worker SHA not proven; keeping previous proof markers"
+            return 0
+        fi
+    done
     if [[ "$server_name" == "hetzner" && -n "$SMOKE_UNPROVEN_PROBES" ]]; then
         write_smoke_unproven_marker "$host" "$sha" \
             || error_ "could not write ${SMOKE_UNPROVEN_FILE} on ${host} — the prod gates still see no proof (${DEPLOYED_SHA_FILE} was not advanced)"
@@ -2705,7 +2746,7 @@ case "$SERVER" in
         if (( ${#SMOKE_UNPROVEN[@]} > 0 )); then
             for _u in "${SMOKE_UNPROVEN[@]}"; do warn "UNPROVEN ${_u}"; done
             error_ "=== both: STOPPED after hetzner — dev is UNPROVEN, server2 (prod) NOT deployed (exit 3) ==="
-            error_ "  Catch up with 'bridge-deploy.sh smoke-nachholen', then deploy server2."
+            error_ "  For pool gaps use smoke-nachholen; for an unproven worker SHA deploy the workers first."
             exit 3
         fi
         deploy_server "server2" || exit $?
