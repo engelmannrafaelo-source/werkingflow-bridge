@@ -147,6 +147,9 @@ class Output(Contract):
             safe_path(path)
         if len(set(self.artefakte_optional)) != len(self.artefakte_optional):
             raise ValueError("auftrag_ungueltig: duplicate artifact target")
+        for a in self.artefakte_optional:
+            if any(b.startswith(a + "/") for b in self.artefakte_optional):
+                raise ValueError("auftrag_ungueltig: nested optional targets")
         # An optional target must not equal, contain or lie inside a declared
         # one or the answer file: the same bytes would be required and optional.
         fest = self.artefakte + ([self.datei] if self.datei else [])

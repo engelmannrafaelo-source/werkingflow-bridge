@@ -36,6 +36,8 @@ def with_output(body, **ausgabe):
         {"artefakte": [], "artefakte_optional": ["/abs"]},
         {"artefakte": [], "artefakte_optional": ["a/../b"]},
         {"artefakte": [], "artefakte_optional": ["skripte", "skripte"]},
+        {"artefakte": [], "artefakte_optional": ["skripte", "skripte/a.py"]},
+        {"artefakte": [], "artefakte_optional": ["skripte/a.py", "skripte"]},
         {"artefakte": ["skripte"], "artefakte_optional": ["skripte"]},
         {"artefakte": ["skripte"], "artefakte_optional": ["skripte/a.py"]},
         {"artefakte": ["skripte/a.py"], "artefakte_optional": ["skripte"]},
@@ -218,3 +220,20 @@ async def test_cli_review_order_carries_its_optional_targets(tmp_path):
     assert result["status"] == "success", result.get("fehler_code")
     assert platz.auftraege[1].ausgaben == ["notizen"]
     assert [a["pfad"] for a in result["pruefung"]["artefakte"]] == ["notizen/n.md"]
+
+
+async def test_cli_file_mode_collects_the_answer_file_through_the_place(tmp_path):
+    """AOPTR P3-2: the answer file reaches the place's output list (ziele), so a
+    place that returns only declared outputs still delivers it."""
+    platz = DeklarierterPlatz(strom("werkzeug"), {"bericht.md": b"Bericht\n",
+                                                  "skripte/rechne.py": b"x"})
+    rt, _ = cli_runtime(tmp_path, platz)
+    body = cli_body()
+    body["antwort_im_text"] = False
+    body["agentischer_lauf"]["ausgabe"] = {"modus": "datei", "datei": "bericht.md",
+                                           "artefakte": [], "artefakte_optional": ["skripte"]}
+    result = await rt.execute(ResearchRequest(**body), "tenant-a")
+    assert result["status"] == "success", result.get("fehler_code")
+    assert set(platz.auftraege[0].ausgaben) == {"bericht.md", "skripte"}
+    assert result["herkunft"]["antwort"]["pfad"] == "bericht.md"
+    assert {a["pfad"] for a in result["artefakte"]} == {"bericht.md", "skripte/rechne.py"}
