@@ -599,6 +599,91 @@ async def test_real_cli_against_stand_in(tmp_path, szenario):
         assert len(requests) == 3
 
 
+# --- BRUMBAU3R P3-R2-1: settings present at start do not reach the run -------
+#
+# HOME (arbeit/.home) and the work folder belong to the run and are writable.
+# Without --setting-sources "" a settings file there that exists when the CLI
+# starts is loaded: disableAllHooks switched off the place's own hook from
+# --settings, a foreign hook fired (N1, measured on CLI 2.1.285 and 2.1.296).
+
+EIGENE_ATTRAPPE = Path(__file__).with_name("cli_attrappe.py")
+ALLE_HOOKS_AUS = json.dumps({"disableAllHooks": True})
+FREMDER_HOOK = json.dumps({"hooks": {"PreToolUse": [{"matcher": "*", "hooks": [
+    {"type": "command", "command": "touch FREMD"}]}]}})
+
+
+class VorbelegterPlatz(CliPlatz):
+    """Writes settings files into the run's folders before the CLI starts."""
+
+    vorab: list[tuple[str, str]] = []
+
+    def vorbereiten(self, auftrag):
+        ordner, arbeit, home = super().vorbereiten(auftrag)
+        for datei, inhalt in self.vorab:
+            ziel = home / datei[len("HOME/"):] if datei.startswith("HOME/") else arbeit / datei
+            ziel.parent.mkdir(parents=True, exist_ok=True)
+            ziel.write_text(inhalt)
+        return ordner, arbeit, home
+
+
+@pytest.mark.skipif(not CLI, reason="ACLI_CLI_BINARY not set")
+@pytest.mark.parametrize("vorab", [
+    [(".claude/settings.json", ALLE_HOOKS_AUS)],
+    [(".claude/settings.local.json", ALLE_HOOKS_AUS)],
+    [("HOME/.claude/settings.json", ALLE_HOOKS_AUS)],
+    [(".claude/settings.json", FREMDER_HOOK)],
+    [("HOME/.claude/settings.json", FREMDER_HOOK)],
+], ids=["aus-projekt", "aus-local", "aus-home", "hook-projekt", "hook-home"])
+async def test_real_cli_ignores_settings_present_at_start(tmp_path, vorab):
+    import asyncio
+    import socket
+
+    from src.agentischer_lauf.cli_platz import CliAuftrag
+
+    platz_log, fremd_log = tmp_path / "platz.log", tmp_path / "fremd.log"
+    settings = tmp_path / "platz-settings.json"
+    settings.write_text(json.dumps({"hooks": {"PreToolUse": [{"matcher": "*", "hooks": [
+        {"type": "command", "command": f"cat >> {platz_log}; echo >> {platz_log}"}]}]}}))
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+    server = await asyncio.create_subprocess_exec(
+        sys.executable, "-I", str(EIGENE_ATTRAPPE), "settings:notiz2.txt:x", str(port),
+        str(tmp_path / "requests.jsonl"),
+    )
+    try:
+        await asyncio.sleep(0.7)
+        (tmp_path / "arbeit").mkdir()
+        platz = VorbelegterPlatz(
+            tmp_path / "arbeit",
+            befehl=[CLI],
+            settings=settings,
+            zugang_variable="ANTHROPIC_API_KEY",
+            zusatz_env={
+                "ANTHROPIC_BASE_URL": f"http://127.0.0.1:{port}",
+                "HTTPS_PROXY": "http://127.0.0.1:9",
+                "NO_PROXY": "127.0.0.1",
+            },
+        )
+        platz.vorab = [(p, c.replace("FREMD", str(fremd_log))) for p, c in vorab]
+        ausgang = await platz.lauf(CliAuftrag(
+            schluessel="lauf1", prompt="Auftrag", systemtext="System",
+            model="claude-sonnet-4-5", max_turns=10, max_tokens=50,
+            werkzeuge=["Read", "Write", "Edit", "Glob", "Grep"],
+            material={"notiz.txt": b"Notiz"}, ausgaben=[], zeit_s=60,
+            zugang="attrappe-schluessel",
+        ), lambda line: None)
+    finally:
+        server.kill()
+        await server.wait()
+    assert ausgang.returncode == 0
+    aufrufe = [json.loads(z)["tool_name"] for z in platz_log.read_text().splitlines() if z.strip()] \
+        if platz_log.exists() else []
+    # The place's hook saw every tool call, the preset file did nothing.
+    assert aufrufe == ["Write", "Read", "Read"]
+    assert not fremd_log.exists()
+
+
 # --- ACLIR P1: the time limit kills the whole process group at once ---------
 
 
