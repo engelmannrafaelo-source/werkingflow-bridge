@@ -9213,7 +9213,21 @@ async def convert_pdf_endpoint(
                 files={"file": (filename, pdf_bytes, "application/pdf")},
                 timeout=privacy_timeout(300.0),  # PDF conversion can take a while
             )
-        response.raise_for_status()
+        if response.status_code >= 400:
+            # Surface the service's status and reason 1:1 (413 page/render cap,
+            # 500 misconfiguration, …) like /v1/document/*; raise_for_status()
+            # turned every one of them into 200 {"status":"error"} and lost both.
+            try:
+                payload = response.json()
+            except Exception:
+                payload = {"status": "error", "error": response.text[:500]}
+            _record_document_call_metrics(
+                request, agent_id="pdf-konvertierung", model="docling",
+                status="error", duration_ms=int((time.time() - _start) * 1000),
+                concurrent_calls_at_start=_concurrent_before,
+                error_code=str(response.status_code),
+            )
+            return JSONResponse(status_code=response.status_code, content=payload)
         data = response.json()
         _record_document_call_metrics(
             request, agent_id="pdf-konvertierung", model="docling",

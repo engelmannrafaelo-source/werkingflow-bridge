@@ -22,6 +22,8 @@ from fastapi.responses import JSONResponse
 
 from src.privacy_service.document_converter import (
     convert_pdf_bytes,
+    DocumentTooLargeError,
+    ServiceConfigError,
     UnsupportedFormatError,
 )
 from src.privacy_service.adapters import (
@@ -364,6 +366,15 @@ async def convert_pdf_service_endpoint(request: Request):
             response["page_markdowns"] = metadata["page_markdowns"]
         return response
 
+    except DocumentTooLargeError as e:
+        logger.warning(f"convert-pdf abgelehnt (413): {e}")
+        return JSONResponse(status_code=413, content={"status": "error", "error": str(e)})
+    except ServiceConfigError as e:
+        logger.error(f"convert-pdf Konfigurationsfehler (500): {e}")
+        return JSONResponse(
+            status_code=500,
+            content={"status": "error", "error": f"Konfigurationsfehler des Dienstes: {e}"},
+        )
     except ImportError as e:
         logger.error(f"Docling not installed: {e}")
         return {
@@ -470,6 +481,12 @@ async def document_convert_endpoint(request: Request):
             result = await loop.run_in_executor(
                 None, chain.convert, content, filename, mime_hint
             )
+    except DocumentTooLargeError as e:
+        logger.warning(f"document/convert abgelehnt (413): {e}")
+        raise HTTPException(status_code=413, detail=str(e))
+    except ServiceConfigError as e:
+        logger.error(f"document/convert Konfigurationsfehler (500): {e}")
+        raise HTTPException(status_code=500, detail=f"Konfigurationsfehler des Dienstes: {e}")
     except UnsupportedFormatError as e:
         logger.warning(f"document/convert unsupported: {e}")
         raise HTTPException(status_code=415, detail=str(e))
@@ -564,6 +581,12 @@ async def document_convert_and_anonymize_endpoint(request: Request):
             conversion = await loop.run_in_executor(
                 None, chain.convert, content, filename, mime_hint
             )
+    except DocumentTooLargeError as e:
+        logger.warning(f"convert-and-anonymize abgelehnt (413): {e}")
+        raise HTTPException(status_code=413, detail=str(e))
+    except ServiceConfigError as e:
+        logger.error(f"convert-and-anonymize Konfigurationsfehler (500): {e}")
+        raise HTTPException(status_code=500, detail=f"Konfigurationsfehler des Dienstes: {e}")
     except UnsupportedFormatError as e:
         logger.warning(f"convert-and-anonymize unsupported: {e}")
         raise HTTPException(status_code=415, detail=str(e))
