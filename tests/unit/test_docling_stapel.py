@@ -97,7 +97,7 @@ def test_cap_boundary_is_inclusive(monkeypatch):
     monkeypatch.setenv("DOCLING_MAX_PAGES", "3")
     monkeypatch.setattr(dc, "_pdf_page_geometry", _fake_geometry(3))
     monkeypatch.setattr(
-        dc, "_docling_convert_pdf", lambda pdf_bytes: ("# ok", 3, {}, None, None)
+        dc, "_docling_convert_pdf", lambda pdf_bytes: ("# ok", 3, {}, None, None, [])
     )
     markdown, meta, images = convert_pdf_bytes(b"%PDF-fake")
     assert markdown == "# ok" and meta["pages"] == 3 and meta["docling_parsed"] is True
@@ -193,9 +193,10 @@ def _page_doc(start: int, end: int):
 
 
 class _FakeConverter:
-    def __init__(self, *, partial_at=None, raise_at=None, drop_page=None):
+    def __init__(self, *, partial_at=None, raise_at=None, drop_page=None, foreign_at=None):
         self.calls = []
         self.partial_at, self.raise_at, self.drop_page = partial_at, raise_at, drop_page
+        self.foreign_at = foreign_at
 
     def convert(self, path, page_range=None):
         from docling.datamodel.base_models import ConversionStatus
@@ -206,7 +207,15 @@ class _FakeConverter:
             raise RuntimeError("layout model exploded")
         doc = _page_doc(start, end)
         if self.drop_page and start <= self.drop_page <= end:
+            # What Docling does on a failed page: the page and its content are gone.
             del doc.pages[self.drop_page]
+            for item in [*doc.texts, *doc.pictures]:
+                if item.prov and item.prov[0].page_no == self.drop_page:
+                    doc.delete_items(node_items=[item])
+        if self.foreign_at == start:
+            from docling_core.types.doc import Size
+
+            doc.add_page(page_no=end + 1, size=Size(width=595, height=842))
         status = ConversionStatus.PARTIAL_SUCCESS if self.partial_at == start else ConversionStatus.SUCCESS
         errors = []
         if status != ConversionStatus.SUCCESS:
@@ -244,8 +253,8 @@ def test_batches_cover_every_page_in_order(monkeypatch, pages, batch, expected):
     pytest.importorskip("docling")
     monkeypatch.setenv("DOCLING_BATCH_PAGES", str(batch))
     conv = _FakeConverter()
-    doc = dc._docling_document(conv, "x.pdf", _pdf_bytes_with(monkeypatch, pages))
-    assert conv.calls == expected
+    doc, failed = dc._docling_document(conv, "x.pdf", _pdf_bytes_with(monkeypatch, pages))
+    assert conv.calls == expected and failed == []
     assert sorted(doc.pages) == list(range(1, pages + 1))
     texts = [t.text for t in doc.texts]
     assert texts == [f"Text Seite {p}" for p in range(1, pages + 1)]
@@ -265,7 +274,7 @@ def test_at_or_below_batch_size_is_the_single_historic_call(monkeypatch):
             return SimpleNamespace(document="DOC")
 
     conv = _Single()
-    assert dc._docling_document(conv, "x.pdf", _pdf_bytes_with(monkeypatch, 5)) == "DOC"
+    assert dc._docling_document(conv, "x.pdf", _pdf_bytes_with(monkeypatch, 5)) == ("DOC", [])
     assert conv.calls == [{}]  # no page_range at all — exactly the old call
 
 
@@ -274,7 +283,7 @@ def test_at_or_below_batch_size_is_the_single_historic_call(monkeypatch):
     [
         ({"raise_at": 4}, "Seiten 4-6 von 7 gescheitert: layout model exploded"),
         ({"partial_at": 4}, "Seiten 4-6 von 7 nur teilweise umgewandelt"),
-        ({"drop_page": 5}, "Seiten 4-6 von 7: Docling lieferte"),
+        ({"drop_page": 5}, "Seiten 4-6 von 7: Docling meldet Erfolg, aber es fehlen die Seiten [5]"),
     ],
 )
 def test_failing_batch_fails_the_document_named(monkeypatch, kwargs, needle):
@@ -323,7 +332,8 @@ def test_real_docling_batched_equals_single_pass(monkeypatch):
     pytest.importorskip("docling")
     pdf = _synthetic_pdf(5)
     single = _docling_run(monkeypatch, pdf, 100)
-    md, pages, figures, page_mds, fig_meta = single
+    md, pages, figures, page_mds, fig_meta, failed = single
+    assert failed == []
     assert pages == 5 and len(figures) == 5
     assert [m["markdown"].splitlines()[0] for m in page_mds] == [
         f"## Abschnitt {p}: Messbericht Seite {p}" for p in range(1, 6)
@@ -343,3 +353,214 @@ def test_real_docling_blank_page_inside_a_batch(monkeypatch):
     assert single[1] == 4
     assert _docling_run(monkeypatch, pdf, 2) == single
     assert _docling_run(monkeypatch, pdf, 3) == single
+
+
+# ---------------------------------------------------------------------------
+# 4. Nachtrag R1: page-local PARTIAL_SUCCESS, render budget, config errors
+# ---------------------------------------------------------------------------
+
+
+def test_partial_batch_names_the_failed_page_and_goes_on(monkeypatch):
+    """One page Docling drops (PARTIAL_SUCCESS) is named — the other batches
+    still run and keep their Docling text; no render-all fallback."""
+    pytest.importorskip("docling")
+    monkeypatch.setenv("DOCLING_BATCH_PAGES", "3")
+    conv = _FakeConverter(partial_at=4, drop_page=5)
+    doc, failed = dc._docling_document(conv, "x.pdf", _pdf_bytes_with(monkeypatch, 7))
+    assert conv.calls == [(1, 3), (4, 6), (7, 7)]
+    assert failed == [5]
+    assert sorted(doc.pages) == [1, 2, 3, 4, 6, 7]
+    assert [t.text for t in doc.texts] == [f"Text Seite {p}" for p in (1, 2, 3, 4, 6, 7)]
+    assert [pic.prov[0].page_no for pic in doc.pictures] == [1, 2, 3, 4, 6, 7]
+
+
+def test_foreign_page_in_a_batch_fails_the_document(monkeypatch):
+    pytest.importorskip("docling")
+    monkeypatch.setenv("DOCLING_BATCH_PAGES", "3")
+    with pytest.raises(RuntimeError, match="Seiten 4-6 von 7: Docling lieferte fremde Seiten"):
+        dc._docling_document(
+            _FakeConverter(foreign_at=4), "x.pdf", _pdf_bytes_with(monkeypatch, 7)
+        )
+
+
+def _patch_docling_converter(monkeypatch, fake):
+    import docling.document_converter as ddc
+
+    monkeypatch.setattr(ddc, "DocumentConverter", lambda *a, **k: fake)
+
+
+def test_partial_page_end_to_end_is_rendered_and_named(monkeypatch):
+    """convert_pdf_bytes over a real 7-page PDF, Docling (fake) fails page 5:
+    Docling text for the other pages, page 5 rendered for Vision, named in
+    metadata and visibly in the markdown, page count 7, no page map."""
+    pytest.importorskip("docling")
+    pytest.importorskip("pypdfium2")
+    pdf = _synthetic_pdf(7, figures=False)
+    monkeypatch.setenv("DOCLING_BATCH_PAGES", "3")
+    _patch_docling_converter(monkeypatch, _FakeConverter(partial_at=4, drop_page=5))
+
+    markdown, meta, images = convert_pdf_bytes(pdf)
+
+    assert meta["docling_parsed"] is True
+    assert meta["docling_failed_pages"] == [5]
+    assert meta["rendered_page_numbers"] == [5]
+    assert meta["pages"] == 7
+    assert "page_markdowns" not in meta
+    assert "page-005.png" in images
+    assert "Text Seite 4" in markdown and "Text Seite 6" in markdown
+    assert "Text Seite 5" not in markdown
+    assert "Docling konnte die Seite 5 nicht in Text umwandeln" in markdown
+    assert "page-005.png" in markdown
+
+
+def test_partial_without_a_dropped_page_still_takes_the_render_all_path(monkeypatch):
+    pytest.importorskip("docling")
+    pytest.importorskip("pypdfium2")
+    pdf = _synthetic_pdf(4, figures=False)
+    monkeypatch.setenv("DOCLING_BATCH_PAGES", "2")
+    _patch_docling_converter(monkeypatch, _FakeConverter(partial_at=3))
+    markdown, meta, images = convert_pdf_bytes(pdf)
+    assert meta["docling_parsed"] is False
+    assert meta["rendered_page_numbers"] == [1, 2, 3, 4]
+    assert "docling_failed_pages" not in meta
+
+
+def _noise_pdf(pages: int) -> bytes:
+    """Every page shows the SAME full-page noise image (one shared XObject):
+    a small PDF whose pages render to large PNGs."""
+    pytest.importorskip("reportlab")
+    import random
+
+    from PIL import Image
+    from reportlab.lib.pagesizes import A4
+    from reportlab.lib.utils import ImageReader
+    from reportlab.pdfgen import canvas
+
+    rnd = random.Random(1)
+    im = Image.frombytes("RGB", (400, 566), bytes(rnd.getrandbits(8) for _ in range(400 * 566 * 3)))
+    img = io.BytesIO()
+    im.save(img, "JPEG", quality=60)
+    buf = io.BytesIO()
+    c = canvas.Canvas(buf, pagesize=A4)
+    w, h = A4
+    for _ in range(pages):
+        c.drawImage(ImageReader(io.BytesIO(img.getvalue())), 0, 0, width=w, height=h)
+        c.showPage()
+    c.save()
+    return buf.getvalue()
+
+
+def _count_renders(monkeypatch):
+    import pypdfium2 as pdfium
+
+    seen = []
+    real = pdfium.PdfPage.render
+
+    def _spy(self, *a, **k):
+        seen.append(1)
+        return real(self, *a, **k)
+
+    monkeypatch.setattr(pdfium.PdfPage, "render", _spy)
+    return seen
+
+
+def test_render_budget_refuses_with_413_reason_and_stops_rendering(monkeypatch):
+    """Render-all fallback over pages that render large: refused once the
+    budget is crossed, with the reason — not after rendering every page."""
+    pytest.importorskip("pypdfium2")
+    pdf = _noise_pdf(12)
+    monkeypatch.setenv("PDF_RENDER_MAX_MB", "4")
+    monkeypatch.setattr(
+        dc, "_docling_convert_pdf", lambda b: (_ for _ in ()).throw(RuntimeError("docling kaputt"))
+    )
+    rendered = _count_renders(monkeypatch)
+    with pytest.raises(DocumentTooLargeError) as exc:
+        convert_pdf_bytes(pdf)
+    msg = str(exc.value)
+    assert "PDF_RENDER_MAX_MB" in msg and "4 MB" in msg
+    assert "Docling das Dokument nicht lesen konnte" in msg
+    assert "von 12 Seiten" in msg
+    assert 1 <= len(rendered) < 12
+
+
+def test_render_budget_also_guards_the_scan_path(monkeypatch):
+    """Docling succeeds but no page has a text layer (scan PDF): same budget."""
+    pytest.importorskip("pypdfium2")
+    pdf = _noise_pdf(12)
+    monkeypatch.setenv("PDF_RENDER_MAX_MB", "4")
+    monkeypatch.setattr(dc, "_docling_convert_pdf", lambda b: ("", 12, {}, None, None, []))
+    with pytest.raises(DocumentTooLargeError, match="keine verwertbare Textebene"):
+        convert_pdf_bytes(pdf)
+
+
+def test_within_render_budget_the_contract_is_unchanged(monkeypatch):
+    pytest.importorskip("pypdfium2")
+    pdf = _noise_pdf(3)
+    monkeypatch.setenv("PDF_RENDER_MAX_MB", "64")
+    monkeypatch.setattr(
+        dc, "_docling_convert_pdf", lambda b: (_ for _ in ()).throw(RuntimeError("docling kaputt"))
+    )
+    markdown, meta, images = convert_pdf_bytes(pdf)
+    assert meta["docling_parsed"] is False
+    assert meta["rendered_page_numbers"] == [1, 2, 3]
+    assert meta["rendered_page_count"] == 3
+    assert set(images) == {"page-001.png", "page-002.png", "page-003.png"}
+
+
+def test_render_budget_default_is_documented_constant(monkeypatch):
+    monkeypatch.delenv("PDF_RENDER_MAX_MB", raising=False)
+    assert dc._render_max_bytes() == dc.PDF_RENDER_MAX_MB_DEFAULT * 2**20
+
+
+@pytest.mark.parametrize(
+    "name,raw",
+    [("PDF_RENDER_MAX_MB", "0"), ("PDF_RENDER_MAX_MB", "viel"), ("DOCLING_IMAGES_SCALE", "9"),
+     ("DOCLING_IMAGES_SCALE", "abc")],
+)
+def test_bad_config_is_a_config_error_before_any_work(monkeypatch, name, raw):
+    """Also DOCLING_IMAGES_SCALE: read inside the Docling try it used to be
+    swallowed into the render-all fallback."""
+    monkeypatch.setenv(name, raw)
+    monkeypatch.setattr(dc, "_pdf_page_geometry", _fake_geometry(2))
+    monkeypatch.setattr(dc, "_docling_convert_pdf", lambda b: pytest.fail("Docling ran"))
+    monkeypatch.setattr(dc, "_render_pdf_pages", lambda *a, **k: pytest.fail("render ran"))
+    with pytest.raises(dc.ServiceConfigError, match=name):
+        convert_pdf_bytes(b"%PDF-fake")
+
+
+def test_chain_does_not_turn_config_error_into_415(monkeypatch):
+    from src.privacy_service.adapters import build_default_chain
+
+    monkeypatch.setenv("DOCLING_BATCH_PAGES", "0")
+    monkeypatch.setattr(dc, "_pdf_page_geometry", _fake_geometry(2))
+    with pytest.raises(dc.ServiceConfigError):
+        build_default_chain().convert(b"%PDF-fake", "a.pdf", "application/pdf")
+
+
+@pytest.fixture()
+def bad_config_client(monkeypatch):
+    pytest.importorskip("fastapi")
+    pytest.importorskip("fastapi.testclient")
+    from fastapi.testclient import TestClient
+
+    from src.privacy_service import app as app_mod
+
+    monkeypatch.setattr(app_mod, "_DOCUMENT_CHAIN", None)
+    monkeypatch.setenv("DOCLING_BATCH_PAGES", "0")
+    monkeypatch.setattr(dc, "_pdf_page_geometry", _fake_geometry(2))
+    return TestClient(app_mod.app)
+
+
+@pytest.mark.parametrize("path", ["/document/convert", "/document/convert-and-anonymize"])
+def test_endpoints_answer_500_on_bad_config(bad_config_client, path):
+    resp = bad_config_client.post(path, files={"file": ("a.pdf", b"%PDF-fake", "application/pdf")})
+    assert resp.status_code == 500, resp.text
+    assert "Konfigurationsfehler" in resp.json()["detail"]
+    assert "DOCLING_BATCH_PAGES=0" in resp.json()["detail"]
+
+
+def test_legacy_convert_pdf_answers_500_on_bad_config(bad_config_client):
+    resp = bad_config_client.post("/convert-pdf", files={"file": ("a.pdf", b"%PDF-fake", "application/pdf")})
+    assert resp.status_code == 500, resp.text
+    body = resp.json()
+    assert body["status"] == "error" and "DOCLING_BATCH_PAGES=0" in body["error"]

@@ -292,6 +292,14 @@ DOCLING_IMAGES_SCALE_DEFAULT = 1.0
 DOCLING_IMAGES_SCALE_MAX = 4.0
 
 
+class ServiceConfigError(ValueError):
+    """A service env value is unusable — a deployment error, answered with HTTP 500.
+
+    Never treated as an adapter failure (that would end as 415 "unsupported")
+    and never swallowed into the Docling render-all fallback.
+    """
+
+
 def _docling_images_scale() -> float:
     """``DOCLING_IMAGES_SCALE`` as float; fail loud on anything unusable."""
     raw = os.getenv("DOCLING_IMAGES_SCALE", "").strip()
@@ -300,9 +308,9 @@ def _docling_images_scale() -> float:
     try:
         value = float(raw)
     except ValueError as e:
-        raise ValueError(f"DOCLING_IMAGES_SCALE={raw!r} ist keine Zahl") from e
+        raise ServiceConfigError(f"DOCLING_IMAGES_SCALE={raw!r} ist keine Zahl") from e
     if not (1.0 <= value <= DOCLING_IMAGES_SCALE_MAX):
-        raise ValueError(
+        raise ServiceConfigError(
             f"DOCLING_IMAGES_SCALE={value} liegt ausserhalb 1.0..{DOCLING_IMAGES_SCALE_MAX}"
         )
     return value
@@ -346,9 +354,9 @@ def _positive_int_env(name: str, default: int) -> int:
     try:
         value = int(raw)
     except ValueError as e:
-        raise ValueError(f"{name}={raw!r} ist keine ganze Zahl") from e
+        raise ServiceConfigError(f"{name}={raw!r} ist keine ganze Zahl") from e
     if value < 1:
-        raise ValueError(f"{name}={value} muss mindestens 1 sein")
+        raise ServiceConfigError(f"{name}={value} muss mindestens 1 sein")
     return value
 
 
@@ -360,6 +368,22 @@ def _docling_batch_pages() -> int:
 def _docling_max_pages() -> int:
     """Largest PDF page count the service accepts (``DOCLING_MAX_PAGES``)."""
     return _positive_int_env("DOCLING_MAX_PAGES", DOCLING_MAX_PAGES_DEFAULT)
+
+
+# Rendered whole pages (scan pages, large-format plans, every page of a PDF
+# Docling could not read) are held as base64 PNGs until the response is built,
+# and the JSON response copies them twice more. The PDF's size does not bound
+# them: one image XObject reused on every page keeps the file small while every
+# page renders anew (1.6 MB PDF, 600 pages of noise ≈ 3.8 GB base64, OOM under
+# 2 GB, measured 13.10.2026). Above this budget the conversion is refused with
+# 413 and the reason instead of rendering on. A plain grey scan renders to
+# ~0.5 MB per page, so 600 such pages stay well inside the default.
+PDF_RENDER_MAX_MB_DEFAULT = 384
+
+
+def _render_max_bytes() -> int:
+    """Budget for all rendered page images of one PDF (``PDF_RENDER_MAX_MB``), in bytes."""
+    return _positive_int_env("PDF_RENDER_MAX_MB", PDF_RENDER_MAX_MB_DEFAULT) * 2**20
 
 # A page with fewer than this many native (non-OCR) text-layer characters is
 # treated as image/scan-only and rendered whole for Vision.
@@ -407,7 +431,12 @@ def _pdf_page_geometry(pdf_bytes: bytes) -> List[Tuple[int, float]]:
 
 
 def _render_pdf_pages(
-    pdf_bytes: bytes, page_indices: List[int], max_edge: int = RENDER_PAGE_MAX_EDGE
+    pdf_bytes: bytes,
+    page_indices: List[int],
+    max_edge: int = RENDER_PAGE_MAX_EDGE,
+    *,
+    max_total_bytes: Optional[int] = None,
+    why: str = "",
 ) -> Dict[str, str]:
     """Render the given 0-indexed pages to down-scaled PNGs.
 
@@ -415,6 +444,10 @@ def _render_pdf_pages(
     reads naturally in the appended descriptions). The render scale is chosen so
     the long edge lands at ``max_edge`` px, which both avoids the giant-raster
     blow-up and keeps CAD detail legible for Vision.
+
+    ``max_total_bytes`` bounds the summed base64 size: one page over it raises
+    ``DocumentTooLargeError`` (413) naming the budget, the page reached and
+    ``why`` these pages are rendered — never a truncated set of pages.
     """
     if not page_indices:
         return {}
@@ -427,8 +460,9 @@ def _render_pdf_pages(
         raise RuntimeError(f"Could not open PDF for page rendering: {e}") from e
 
     rendered: Dict[str, str] = {}
+    total_bytes = 0
     try:
-        for idx in page_indices:
+        for done, idx in enumerate(page_indices, start=1):
             page = pdf[idx]
             try:
                 width_pt, height_pt = page.get_size()
@@ -443,9 +477,22 @@ def _render_pdf_pages(
                 pil_image = pil_image.convert("RGB")
             buf = io.BytesIO()
             pil_image.save(buf, format="PNG")
-            rendered[f"page-{idx + 1:03d}.png"] = base64.b64encode(
-                buf.getvalue()
-            ).decode("utf-8")
+            b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
+            total_bytes += len(b64)
+            if max_total_bytes is not None and total_bytes > max_total_bytes:
+                budget_mb = max_total_bytes / 2**20
+                per_page_mb = total_bytes / done / 2**20
+                raise DocumentTooLargeError(
+                    f"Die als Bild zu rendernden Seiten ueberschreiten die Obergrenze "
+                    f"von {budget_mb:.0f} MB fuer gerenderte Seitenbilder "
+                    f"(PDF_RENDER_MAX_MB): nach {done} von {len(page_indices)} "
+                    f"Seiten (bis Seite {idx + 1}) bereits {total_bytes / 2**20:.0f} MB, "
+                    f"im Mittel {per_page_mb:.1f} MB je Seite. Gerendert wird, weil "
+                    f"{why or 'diese Seiten keine verwertbare Textebene haben'}. "
+                    f"Bitte in Teile mit hoechstens {max(1, int(budget_mb / per_page_mb))} "
+                    f"solchen Seiten zerlegen und einzeln umwandeln."
+                )
+            rendered[f"page-{idx + 1:03d}.png"] = b64
     finally:
         pdf.close()
     return rendered
@@ -568,11 +615,20 @@ def _figure_meta(document: Any) -> List[Dict[str, Any]]:
 
 def _docling_convert_pdf(
     pdf_bytes: bytes,
-) -> Tuple[str, Optional[int], Dict[str, str], Optional[List[Dict[str, Any]]], Optional[List[Dict[str, Any]]]]:
-    """Run Docling over a PDF → (markdown, page_count, figures, page_markdowns, figure_meta).
+) -> Tuple[
+    str,
+    Optional[int],
+    Dict[str, str],
+    Optional[List[Dict[str, Any]]],
+    Optional[List[Dict[str, Any]]],
+    List[int],
+]:
+    """Run Docling over a PDF → (markdown, page_count, figures, page_markdowns, figure_meta, failed_pages).
 
     This is the text/table extraction half of the cascade. Raises on any Docling
-    failure so the caller can fall back to a full page render.
+    failure so the caller can fall back to a full page render. ``failed_pages``
+    (1-based) are single pages Docling could not convert inside an otherwise
+    converted batch (see _docling_document); the caller renders them.
     """
     from docling.document_converter import DocumentConverter, PdfFormatOption
     from docling.datamodel.pipeline_options import (
@@ -621,7 +677,7 @@ def _docling_convert_pdf(
         tmp_pdf_path = tmp_pdf.name
 
     try:
-        document = _docling_document(converter, tmp_pdf_path, pdf_bytes)
+        document, failed_pages = _docling_document(converter, tmp_pdf_path, pdf_bytes)
 
         with tempfile.TemporaryDirectory() as tmp_dir:
             md_path = os.path.join(tmp_dir, "output.md")
@@ -673,7 +729,15 @@ def _docling_convert_pdf(
                             os.path.join(paged_artifacts, img_name), img_name
                         )
                 page_markdowns = _split_paged_markdown(paged, page_count)
-                if page_markdowns is None:
+                if failed_pages:
+                    # The split would number the remaining pages 1..n and shift
+                    # every page after a failed one — never a wrong page map.
+                    page_markdowns = None
+                    logger.warning(
+                        f"[pdf] page_markdowns omitted: Docling failed on pages "
+                        f"{failed_pages} — callers fall back to whole-document handling"
+                    )
+                elif page_markdowns is None:
                     logger.warning(
                         f"[pdf] page_markdowns omitted: page-break split does not "
                         f"match page_count={page_count} (blank pages or token "
@@ -711,25 +775,34 @@ def _docling_convert_pdf(
                 figure_meta = None
                 logger.warning(f"[pdf] figure_meta omitted: {e}")
 
-            return markdown, page_count, figures, page_markdowns, figure_meta
+            return markdown, page_count, figures, page_markdowns, figure_meta, failed_pages
     finally:
         os.unlink(tmp_pdf_path)
 
 
-def _docling_document(converter: Any, pdf_path: str, pdf_bytes: bytes) -> Any:
+def _docling_document(converter: Any, pdf_path: str, pdf_bytes: bytes) -> Tuple[Any, List[int]]:
     """Docling's document for the whole PDF — one pass, or concatenated batches.
 
-    Up to ``DOCLING_BATCH_PAGES`` pages: exactly the historic single
-    ``converter.convert`` (same output, byte for byte). Above it: one
-    ``convert(page_range=…)`` per batch, so Docling never holds more than one
-    batch of page rasters, then ``DoclingDocument.concatenate`` — a single export
-    of the merged document keeps the figure numbering, the page-break split and
-    the figure pages exactly as one export of the whole PDF would.
+    Returns ``(document, failed_pages)``; ``failed_pages`` (1-based) are pages
+    Docling dropped from a batch it reported as PARTIAL_SUCCESS.
 
-    Fail loud, never a partial document: a batch that raises, that Docling only
-    reports as PARTIAL_SUCCESS (Docling does NOT raise on that) or whose pages
-    are not exactly its range raises, naming the batch — the caller's existing
-    contract (render every page for Vision, ``docling_parsed: false``) applies.
+    Up to ``DOCLING_BATCH_PAGES`` pages: exactly the historic single
+    ``converter.convert`` (same output, byte for byte; ``failed_pages`` empty).
+    Above it: one ``convert(page_range=…)`` per batch, so Docling never holds
+    more than one batch of page rasters, then ``DoclingDocument.concatenate`` —
+    a single export of the merged document keeps the figure numbering, the
+    page-break split and the figure pages exactly as one export of the whole PDF
+    would.
+
+    Never a silent partial document. A batch that raises, ends in any status
+    other than SUCCESS/PARTIAL_SUCCESS, or carries pages outside its range
+    raises, naming the batch — the caller's contract (render every page for
+    Vision, ``docling_parsed: false``) applies. PARTIAL_SUCCESS (Docling does NOT
+    raise on that) is page-local: Docling drops exactly the pages it failed on
+    from ``document.pages`` (blank pages stay in it), so those pages are named in
+    ``failed_pages`` and the caller renders them for Vision like a scan page —
+    one bad page no longer sends a 600-page document into the render-all path.
+    A PARTIAL_SUCCESS that drops no page cannot be localised and raises.
     """
     import pypdfium2 as pdfium
 
@@ -740,12 +813,13 @@ def _docling_document(converter: Any, pdf_path: str, pdf_bytes: bytes) -> Any:
         pdf.close()
     batch_pages = _docling_batch_pages()
     if total_pages <= batch_pages:
-        return converter.convert(pdf_path).document
+        return converter.convert(pdf_path).document, []
 
     from docling.datamodel.base_models import ConversionStatus
     from docling_core.types.doc import DoclingDocument
 
     parts: List[Any] = []
+    failed_pages: List[int] = []
     for start in range(1, total_pages + 1, batch_pages):
         end = min(total_pages, start + batch_pages - 1)
         where = f"Docling-Stapel Seiten {start}-{end} von {total_pages}"
@@ -753,15 +827,31 @@ def _docling_document(converter: Any, pdf_path: str, pdf_bytes: bytes) -> Any:
             result = converter.convert(pdf_path, page_range=(start, end))
         except Exception as e:  # noqa: BLE001 — re-raised with the batch named
             raise RuntimeError(f"{where} gescheitert: {e}") from e
-        if result.status != ConversionStatus.SUCCESS:
-            errors = "; ".join(str(err.error_message) for err in result.errors or [])
+        errors = "; ".join(str(err.error_message) for err in result.errors or [])
+        expected = set(range(start, end + 1))
+        got = set(result.document.pages)
+        if got - expected:
+            extra = sorted(got - expected)
+            raise RuntimeError(f"{where}: Docling lieferte fremde Seiten {extra[:3]}…{extra[-3:]}")
+        missing = sorted(expected - got)
+        if result.status == ConversionStatus.SUCCESS and missing:
+            raise RuntimeError(f"{where}: Docling meldet Erfolg, aber es fehlen die Seiten {missing}")
+        if result.status == ConversionStatus.PARTIAL_SUCCESS:
+            if not missing:
+                raise RuntimeError(
+                    f"{where} nur teilweise umgewandelt, ohne fehlende Seite "
+                    f"(Status {result.status.value}{': ' + errors if errors else ''})"
+                )
+            logger.warning(
+                f"[pdf] {where}: Docling konnte die Seiten {missing} nicht umwandeln "
+                f"({errors or 'ohne Meldung'}) — sie werden als Bild gerendert"
+            )
+            failed_pages.extend(missing)
+        elif result.status != ConversionStatus.SUCCESS:
             raise RuntimeError(
-                f"{where} nur teilweise umgewandelt (Status {result.status.value}"
+                f"{where} nicht umgewandelt (Status {result.status.value}"
                 f"{': ' + errors if errors else ''})"
             )
-        got = sorted(result.document.pages)
-        if got != list(range(start, end + 1)):
-            raise RuntimeError(f"{where}: Docling lieferte die Seiten {got[:3]}…{got[-3:]}")
         parts.append(result.document)
         # The ConversionResult holds this batch's page rasters; drop it before
         # the next batch so they never pile up across batches.
@@ -769,12 +859,13 @@ def _docling_document(converter: Any, pdf_path: str, pdf_bytes: bytes) -> Any:
         logger.info(f"[pdf] {where} umgewandelt")
 
     document = DoclingDocument.concatenate(parts)
-    if sorted(document.pages) != list(range(1, total_pages + 1)):
+    expected_pages = sorted(set(range(1, total_pages + 1)) - set(failed_pages))
+    if sorted(document.pages) != expected_pages:
         raise RuntimeError(
             f"Docling-Stapel: zusammengefuegtes Dokument hat {len(document.pages)} "
-            f"statt {total_pages} Seiten"
+            f"statt {len(expected_pages)} Seiten"
         )
-    return document
+    return document, failed_pages
 
 
 # Unusual fixed token: a real document containing it would corrupt the split —
@@ -836,8 +927,12 @@ def convert_pdf_bytes(pdf_bytes: bytes) -> Tuple[str, Dict[str, Any], Dict[str, 
     total_pages = len(geometry)
     # Before any Docling or render work, outside the Docling try below: a refused
     # document must never fall back to rendering all of its pages instead.
+    # Every env value is read here so a bad one fails loud (ServiceConfigError →
+    # 500), never inside the Docling try as a render-all fallback.
     max_pages = _docling_max_pages()
-    batch_pages = _docling_batch_pages()  # fail loud on a bad value here, not as a Docling fallback
+    batch_pages = _docling_batch_pages()
+    render_max_bytes = _render_max_bytes()
+    _docling_images_scale()
     if total_pages > max_pages:
         raise DocumentTooLargeError(
             f"PDF hat {total_pages} Seiten, die Obergrenze dieses Dienstes ist "
@@ -857,9 +952,17 @@ def convert_pdf_bytes(pdf_bytes: bytes) -> Tuple[str, Dict[str, Any], Dict[str, 
     figures: Dict[str, str] = {}
     page_markdowns: Optional[List[Dict[str, Any]]] = None
     figure_meta: Optional[List[Dict[str, Any]]] = None
+    docling_failed_pages: List[int] = []
     docling_ok = False
     try:
-        docling_markdown, docling_page_count, figures, page_markdowns, figure_meta = _docling_convert_pdf(pdf_bytes)
+        (
+            docling_markdown,
+            docling_page_count,
+            figures,
+            page_markdowns,
+            figure_meta,
+            docling_failed_pages,
+        ) = _docling_convert_pdf(pdf_bytes)
         docling_ok = True
     except Exception as e:  # noqa: BLE001 — fall back to full page render
         logger.warning(
@@ -867,18 +970,28 @@ def convert_pdf_bytes(pdf_bytes: bytes) -> Tuple[str, Dict[str, Any], Dict[str, 
             f"rendering all {total_pages} page(s) for Vision instead."
         )
 
-    # 2. Decide which pages to render whole.
+    # 2. Decide which pages to render whole. A page Docling failed on inside a
+    #    converted batch is rendered like a scan page (its text is not in the
+    #    markdown; Vision describes the image).
     if docling_ok:
+        failed = {p - 1 for p in docling_failed_pages}
         pages_to_render = [
             i
             for i, (text_chars, long_edge_pt) in enumerate(geometry)
             if text_chars < MIN_PAGE_TEXT_CHARS
             or long_edge_pt > OVERSIZE_PAGE_LONG_EDGE_PT
+            or i in failed
         ]
+        why = (
+            "diese Seiten keine verwertbare Textebene haben (Scan) oder Grossformat sind"
+        )
     else:
         pages_to_render = list(range(total_pages))
+        why = "Docling das Dokument nicht lesen konnte und deshalb jede Seite gerendert wird"
 
-    rendered_pages = _render_pdf_pages(pdf_bytes, pages_to_render)
+    rendered_pages = _render_pdf_pages(
+        pdf_bytes, pages_to_render, max_total_bytes=render_max_bytes, why=why
+    )
 
     # 3. Uniform down-scale guard over ALL images (figures + rendered pages).
     images: Dict[str, str] = {
@@ -890,6 +1003,14 @@ def convert_pdf_bytes(pdf_bytes: bytes) -> Tuple[str, Dict[str, Any], Dict[str, 
     #    references the page images (fail loud only if we have literally nothing).
     if docling_ok:
         markdown = docling_markdown
+        if docling_failed_pages:
+            names = ", ".join(f"page-{p:03d}.png" for p in docling_failed_pages)
+            markdown = (
+                f"{markdown.rstrip()}\n\n> **Hinweis:** Docling konnte "
+                f"{'die Seiten' if len(docling_failed_pages) > 1 else 'die Seite'} "
+                f"{', '.join(str(p) for p in docling_failed_pages)} nicht in Text "
+                f"umwandeln. Sie liegen als gerendertes Bild bei ({names}).\n"
+            )
     elif rendered_pages:
         markdown = _render_only_markdown(rendered_pages)
     else:
@@ -899,7 +1020,12 @@ def convert_pdf_bytes(pdf_bytes: bytes) -> Tuple[str, Dict[str, Any], Dict[str, 
         )
 
     metadata: Dict[str, Any] = {
-        "pages": docling_page_count if docling_page_count is not None else total_pages,
+        # Docling's own count lacks the pages it failed on.
+        "pages": (
+            docling_page_count
+            if docling_page_count is not None and not docling_failed_pages
+            else total_pages
+        ),
         "docling_parsed": docling_ok,
         "rendered_page_numbers": [i + 1 for i in pages_to_render],
         "rendered_page_count": len(rendered_pages),
@@ -914,6 +1040,10 @@ def convert_pdf_bytes(pdf_bytes: bytes) -> Tuple[str, Dict[str, Any], Dict[str, 
     # figures and have no entry). Absent when the mapping is not provably right.
     if docling_ok and figure_meta:
         metadata["figures"] = figure_meta
+    # Pages Docling could not convert inside a converted batch; they are also in
+    # rendered_page_numbers. Absent when there are none.
+    if docling_failed_pages:
+        metadata["docling_failed_pages"] = docling_failed_pages
     return markdown, metadata, images
 
 

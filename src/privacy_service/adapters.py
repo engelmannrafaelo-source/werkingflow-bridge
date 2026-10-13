@@ -21,6 +21,7 @@ from typing import List, Optional
 from .document_converter import (
     ConversionResult,
     DocumentTooLargeError,
+    ServiceConfigError,
     UnsupportedFormatError,
     convert_csv_bytes,
     convert_docx_bytes,
@@ -119,8 +120,10 @@ class _LegacyAdapter(BaseAdapter):
                 self.name,
                 image_kind=self.image_kind,
             )
-        except DocumentTooLargeError:
-            raise  # a size refusal is the answer, not an adapter failure (HTTP 413)
+        except (DocumentTooLargeError, ServiceConfigError):
+            # A size refusal (413) or a bad service env value (500) is the
+            # answer, not an adapter failure.
+            raise
         except Exception as e:
             raise AdapterError(self.name, str(e), cause=e) from e
 
@@ -244,9 +247,10 @@ class AdapterChain:
             logger.info(f"adapter_chain: trying {adapter.name}")
             try:
                 result = adapter.convert(content, filename, mime_type_hint)
-            except DocumentTooLargeError:
-                # The document itself is over a hard limit — no other adapter may
-                # try it, and it must not end as "unsupported" (415).
+            except (DocumentTooLargeError, ServiceConfigError):
+                # The document is over a hard limit, or the service itself is
+                # misconfigured — no other adapter may try it, and neither may
+                # end as "unsupported" (415).
                 raise
             except AdapterError as e:
                 logger.warning(f"adapter_chain: {adapter.name} failed: {e.cause or e}")
