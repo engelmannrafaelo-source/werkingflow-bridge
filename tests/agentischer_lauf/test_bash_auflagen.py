@@ -162,3 +162,78 @@ async def test_sigint_to_pid1_is_ignored(tmp_path):
                            material={}, files={}, outputs=["result.txt"], max_bytes=100000)
     assert result["exit_code"] == 0
     assert "result.txt" in result["files"]
+
+
+# --- BRUMBAU3R P3-R2-3: Created leftovers of hard-killed runs ----------------
+
+
+def daemon_stub(container, rm_code=0):
+    """container: id -> (name, status, seconds ago). Records rm calls."""
+    from datetime import datetime, timedelta, timezone
+
+    entfernt = []
+
+    async def command(args, **kw):
+        if args[0] == "ps":
+            assert "status=created" in args and "name=agentic-bash-tabc-" in args
+            return 0, "\n".join(container).encode(), b""
+        if args[:2] == ["container", "inspect"] and "{{.Id}}" not in args[3]:
+            name, status, vor = container[args[-1]]
+            erstellt = (datetime.now(timezone.utc) - timedelta(seconds=vor)).strftime(
+                "%Y-%m-%dT%H:%M:%S.123456789Z")
+            return 0, f'"/{name}" "{status}" "{erstellt}"\n'.encode(), b""
+        if args[0] == "rm":
+            entfernt.append(args[-1])
+            return rm_code, b"", b"" if not rm_code else b"Error: daemon says no"
+        if args[:2] == ["container", "inspect"]:
+            return 1, b"", b"Error: No such container"
+        raise AssertionError(args)
+
+    return command, entfernt
+
+
+async def test_cleanup_removes_only_old_created_containers_of_the_prefix(tmp_path):
+    box = place(tmp_path, name_prefix="agentic-bash-tabc-")
+    box._command, entfernt = daemon_stub({
+        "a": ("agentic-bash-tabc-alt", "created", 600),
+        "b": ("agentic-bash-tabc-jung", "created", 2),
+        "c": ("agentic-bash-tabc-laeuft", "running", 600),
+        "d": ("x-agentic-bash-tabc-fremd", "created", 600),
+    })
+    assert await box.aufraeumen() == ["agentic-bash-tabc-alt"]
+    assert entfernt == ["agentic-bash-tabc-alt"]
+
+
+async def test_cleanup_skips_a_container_gone_meanwhile(tmp_path):
+    box = place(tmp_path, name_prefix="agentic-bash-tabc-")
+    command, entfernt = daemon_stub({"a": ("agentic-bash-tabc-alt", "created", 600)})
+
+    async def weg(args, **kw):
+        if args[:2] == ["container", "inspect"] and args[-1] == "a":
+            return 1, b"", b"Error: No such object: a"
+        return await command(args, **kw)
+
+    box._command = weg
+    assert await box.aufraeumen() == [] and entfernt == []
+
+
+async def test_cleanup_that_fails_is_loud(tmp_path):
+    box = place(tmp_path, name_prefix="agentic-bash-tabc-")
+    box._command, _ = daemon_stub({"a": ("agentic-bash-tabc-alt", "created", 600)}, rm_code=1)
+    with pytest.raises(RunError, match="sandbox_fehler"):
+        await box.aufraeumen()
+
+
+async def test_cleanup_with_unreadable_container_is_loud(tmp_path):
+    box = place(tmp_path, name_prefix="agentic-bash-tabc-")
+    command, entfernt = daemon_stub({"a": ("agentic-bash-tabc-alt", "created", 600)})
+
+    async def kaputt(args, **kw):
+        if args[:2] == ["container", "inspect"]:
+            return 1, b"", b"Error: daemon not reachable"
+        return await command(args, **kw)
+
+    box._command = kaputt
+    with pytest.raises(RunError, match="sandbox_fehler"):
+        await box.aufraeumen()
+    assert entfernt == []

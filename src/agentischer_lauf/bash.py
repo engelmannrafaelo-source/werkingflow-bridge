@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+from datetime import datetime, timezone
 import json
 import hashlib
 from pathlib import Path
@@ -200,6 +201,41 @@ class BashPlace:
                     except RunError:
                         raise RunError("sandbox_fehler") from None
                     raise
+
+    async def aufraeumen(self, *, alter_s=60):
+        """Remove containers of this prefix that were created but never
+        started, older than alter_s. --rm takes effect only once a container
+        has started; a process killed hard between `create` and its own `rm`
+        leaves it in state Created for good (BRUMBAU3R P3-R2-3). Running ones
+        and young ones (another process between create and start on the same
+        daemon) stay. Call when the place is set up. Returns the removed names;
+        a removal that fails is loud."""
+        code, output, _ = await self._command(
+            ["ps", "--all", "--quiet", "--no-trunc", "--filter", "status=created",
+             "--filter", "name=" + self.name_prefix])
+        if code:
+            raise RunError("sandbox_fehler")
+        jetzt = datetime.now(timezone.utc)
+        weg = []
+        for ident in output.decode().split():
+            code, zeile, error = await self._command(
+                ["container", "inspect", "--format",
+                 "{{json .Name}} {{json .State.Status}} {{json .Created}}", ident])
+            if code and b"No such" in error:
+                continue  # gone meanwhile, e.g. started and removed by --rm
+            if code:
+                raise RunError("sandbox_fehler")
+            name, status, erstellt = (json.loads(t) for t in zeile.decode().split())
+            name = name.lstrip("/")
+            # The daemon's name filter matches anywhere in the name.
+            if not name.startswith(self.name_prefix) or status != "created":
+                continue
+            # RFC 3339 with nanoseconds; seconds are enough for the age.
+            erstellt = datetime.fromisoformat(erstellt.split(".")[0].rstrip("Z") + "+00:00")
+            if (jetzt - erstellt).total_seconds() >= alter_s:
+                await self._entfernen(name)
+                weg.append(name)
+        return weg
 
     async def _entfernen(self, name):
         """Remove the container and return only once it is gone. With --rm

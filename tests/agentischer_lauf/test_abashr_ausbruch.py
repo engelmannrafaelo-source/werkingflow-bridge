@@ -324,3 +324,38 @@ async def test_grant_bash_args_cannot_carry_extras(place):
     for args in ({"command": "true", "image": "alpine"}, {"command": "true", "network": "host"}, ["true"]):
         with pytest.raises(RunError):
             await box(place).acall("Bash", args)
+
+
+# ------------------------------------- Created leftovers (BRUMBAU3R P3-R2-3)
+async def test_cleanup_removes_a_created_never_started_container(place):
+    """A run killed hard between `create` and its own `rm` leaves the container
+    in state Created: --rm takes effect only after a start. The place's
+    cleanup removes it; this run's own name, created exactly like that."""
+    name = LAUF + uuid.uuid4().hex
+    subprocess.run(["docker", "create", "--name", name, "--pull=never", "--network=none",
+                    place.image, "true"], capture_output=True, check=True)
+    assert leftover() != []
+    # A young one stays: another process may be between create and start.
+    assert await place.aufraeumen() == []
+    assert await place.aufraeumen(alter_s=0) == [name]
+    assert leftover() == []
+
+
+@pytest.fixture(scope="module", autouse=True)
+def frueherer_laeufe_reste():
+    """Created leftovers of earlier test runs killed hard (any agentic-bash-t
+    prefix, older than a minute) are removed before this module runs."""
+    image = os.environ.get("ABASH_TEST_IMAGE")
+    if not image:
+        yield
+        return
+    import tempfile
+
+    from src.agentischer_lauf.bash import BashPlace
+
+    with tempfile.TemporaryDirectory() as root:
+        weg = asyncio.run(BashPlace(image=image, root=root, name_prefix="agentic-bash-t")
+                          .aufraeumen())
+    if weg:
+        print(f"\nCREATED-RESTE FRUEHERER LAEUFE ENTFERNT: {len(weg)}: {' '.join(weg)}")
+    yield
