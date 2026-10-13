@@ -118,7 +118,58 @@ def test_version_smoke_checks_deployed_sha(monkeypatch, actual, status, expected
     ctx.expected_git_sha = expected
     probe = next(p for p in smoke.PROBES if p.name == "version")
     assert probe.fn(ctx).ok is ok
-    assert len(calls) == bool(expected)
+    # Every sample is asked when all agree; the first wrong answer ends it.
+    assert len(calls) == (smoke.VERSION_SAMPLES if ok else int(bool(expected)))
+
+
+def _version_answers(monkeypatch, answers):
+    from types import SimpleNamespace
+    seq = iter(answers)
+    calls = []
+
+    def get(url, **kwargs):
+        calls.append(url)
+        answer = next(seq)
+        if isinstance(answer, Exception):
+            raise answer
+        status, sha = answer
+        return SimpleNamespace(status_code=status, json=lambda: {"git_sha": sha})
+
+    monkeypatch.setattr(smoke.requests, "get", get)
+    monkeypatch.setattr(smoke, "resolve_api_key", lambda: "")
+    monkeypatch.setattr(smoke.time, "sleep", lambda *_: None)
+    return calls
+
+
+@pytest.mark.parametrize("stale_at", [0, 1, 3, 7])
+def test_version_one_stale_worker_fails_wherever_it_answers(monkeypatch, stale_at):
+    """BRUMBAU1R P2a: one worker of the pool on an old image is a failure, even
+    when other samples (or later attempts) hit up-to-date workers."""
+    answers = [(200, "a" * 40)] * smoke.VERSION_SAMPLES * 3
+    answers[stale_at] = (200, "d" * 40)
+    calls = _version_answers(monkeypatch, answers)
+    res = smoke.run("http://stub.invalid", "hetzner", "version", {}, 3,
+                    expected_git_sha="a" * 40)
+    assert res[0].ok is False
+    assert "mismatch" in res[0].detail and "d" * 40 in res[0].detail
+    assert len(calls) == stale_at + 1  # no further attempt after a worker's own answer
+
+
+def test_version_transport_error_is_asked_again(monkeypatch):
+    import requests
+    answers = [requests.ConnectionError("reset")] + [(200, "a" * 40)] * smoke.VERSION_SAMPLES
+    _version_answers(monkeypatch, answers)
+    res = smoke.run("http://stub.invalid", "hetzner", "version", {}, 1,
+                    expected_git_sha="a" * 40)
+    assert res[0].ok is True
+
+
+def test_version_lasting_transport_error_fails(monkeypatch):
+    import requests
+    _version_answers(monkeypatch, [requests.ConnectionError("down")] * 10)
+    res = smoke.run("http://stub.invalid", "hetzner", "version", {}, 3,
+                    expected_git_sha="a" * 40)
+    assert res[0].ok is False and "no answer" in res[0].detail
 
 
 def test_coverage_includes_version_router():

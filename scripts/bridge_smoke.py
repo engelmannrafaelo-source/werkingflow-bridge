@@ -336,6 +336,9 @@ class Probe:
     profiles: set            # which server profiles run this probe
     fn: Callable             # (ctx) -> ProbeResult
     repro: str = ""          # human repro command shown on failure / to fix-session
+    # False: a failed result is final. For a probe whose single success does
+    # not cancel an earlier failure (version: one stale worker in the pool).
+    retry: bool = True
 
 
 PROBES: list = []
@@ -353,25 +356,55 @@ def with_attribution(repro: str) -> str:
     return repro.rstrip() + " " + ATTRIBUTION_REPRO.rstrip()
 
 
-def probe(name, endpoint, profiles, repro=""):
+def probe(name, endpoint, profiles, repro="", retry=True):
     def deco(fn):
         PROBES.append(Probe(name=name, endpoint=endpoint, profiles=set(profiles),
-                            fn=fn, repro=with_attribution(repro)))
+                            fn=fn, repro=with_attribution(repro), retry=retry))
         return fn
     return deco
 
 
-@probe("version", "/v1/version", {"hetzner", "server2"})
+# claude_version round-robins over the pool's four workers, and every nginx
+# worker process keeps its own position: one answer proves one worker. The
+# probe asks this many times and EVERY answer must carry the expected SHA.
+VERSION_SAMPLES = 8
+# A sample that did not arrive (connection) is asked again this often; an
+# answer that arrived is never asked again — it is the worker's own word.
+VERSION_SAMPLE_TRANSPORT_RETRIES = 2
+
+
+@probe("version", "/v1/version", {"hetzner", "server2"}, retry=False)
 def version(ctx):
     import re
     if not re.fullmatch(r"[0-9a-f]{40}", ctx.expected_git_sha):
         return ProbeResult("version", "/v1/version", False, "Expected full deployed SHA is required")
-    response, ms = _timed(lambda: requests.get(
-        ctx.base_url + "/v1/version", timeout=ctx.timeout, allow_redirects=False))
-    ok = response.status_code == 200 and response.json().get("git_sha") == ctx.expected_git_sha
-    return ProbeResult("version", "/v1/version", ok,
-                       "Deployed SHA matches" if ok else "Version missing or deployed SHA mismatch",
-                       response.status_code, ms)
+    total_ms = 0
+    for sample in range(1, VERSION_SAMPLES + 1):
+        for transport_try in range(VERSION_SAMPLE_TRANSPORT_RETRIES + 1):
+            try:
+                response, ms = _timed(lambda: requests.get(
+                    ctx.base_url + "/v1/version", timeout=ctx.timeout, allow_redirects=False))
+                break
+            except requests.RequestException as e:
+                if transport_try == VERSION_SAMPLE_TRANSPORT_RETRIES:
+                    return ProbeResult(
+                        "version", "/v1/version", False,
+                        f"sample {sample}/{VERSION_SAMPLES}: no answer ({type(e).__name__})")
+        total_ms += ms
+        try:
+            sha = response.json().get("git_sha") if response.status_code == 200 else None
+        except ValueError:
+            sha = None
+        if response.status_code != 200 or sha != ctx.expected_git_sha:
+            return ProbeResult(
+                "version", "/v1/version", False,
+                f"sample {sample}/{VERSION_SAMPLES}: version missing or deployed SHA mismatch "
+                f"(status {response.status_code}, git_sha {sha!r}) — a worker of the pool "
+                f"does not run the expected commit",
+                response.status_code, total_ms)
+    return ProbeResult("version", "/v1/version", True,
+                       f"Deployed SHA matches on all {VERSION_SAMPLES} samples",
+                       200, total_ms)
 
 
 # EXCLUDED: endpoint -> reason. Enforced by the coverage validator. These are
@@ -866,7 +899,7 @@ def run(base_url: str, profile: str, only: Optional[str], extra_header: dict, at
                 last = p.fn(ctx)
             except Exception as e:  # a probe raising = that probe FAILS loud, never skipped
                 last = ProbeResult(p.name, p.endpoint, False, f"probe raised: {type(e).__name__}: {e}")
-            if last.ok:
+            if last.ok or not p.retry:
                 break
             if attempt < attempts:
                 # Honor the envelope's own Retry-After for capacity refusals —

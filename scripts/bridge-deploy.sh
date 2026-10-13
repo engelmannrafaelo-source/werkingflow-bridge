@@ -1150,11 +1150,16 @@ phase_smoke_test() {
         SMOKE_UNPROVEN+=("${label}: version UNPROVEN — ${reason}")
         extra_args+=(--version-unproven "$reason")
     elif (( ${#pool_workers[@]} > 0 )); then
-        if ! expected_git_sha=$(rssh "$pool_host" "cd ${REMOTE_REPO} && git rev-parse HEAD"); then
-            error_ "Cannot read expected worker SHA for ${label}"
+        local rssh_rc=0
+        expected_git_sha=$(rssh "$pool_host" "cd ${REMOTE_REPO} && git rev-parse HEAD") || rssh_rc=$?
+        if (( rssh_rc != 0 )); then
+            error_ "Cannot read expected worker SHA for ${label}: rssh ${pool_host} 'git rev-parse HEAD' in ${REMOTE_REPO} failed (rc=${rssh_rc}) — smoke not run"
             return 1
         fi
-        [[ "$expected_git_sha" =~ ^[0-9a-f]{40}$ ]] || { error_ "Invalid worker checkout SHA"; return 1; }
+        [[ "$expected_git_sha" =~ ^[0-9a-f]{40}$ ]] || {
+            error_ "Invalid worker checkout SHA for ${label} from ${pool_host}: '${expected_git_sha}' — smoke not run"
+            return 1
+        }
         extra_args+=(--expected-git-sha "$expected_git_sha")
     else
         local reason="no workers built in this run (${DEPLOYED_SERVICES[*]}); worker SHA not proven"
