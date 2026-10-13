@@ -1,5 +1,5 @@
-from typing import List, Optional, Dict, Any, Union, Literal, Annotated
-from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, field_validator, model_validator, Discriminator
+from typing import Annotated, List, Optional, Dict, Any, Union, Literal
+from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, field_validator, model_validator, model_serializer, Discriminator
 from enum import Enum
 from datetime import datetime
 import uuid
@@ -468,6 +468,9 @@ class SessionListResponse(BaseModel):
 # Research Endpoint Models
 # ============================================================================
 
+from src.agentischer_lauf.models import Run as AgentischerLauf, validate_request
+
+
 class ResearchRequest(BaseModel):
     """
     Request model for dedicated /v1/research endpoint.
@@ -475,6 +478,19 @@ class ResearchRequest(BaseModel):
     Designed for Claude Code research tasks with SuperClaude integration.
     Supports depth levels, planning strategies, and advanced research options.
     """
+    research_instructions: Optional[str] = Field(
+        default=None, min_length=1, pattern=r"\S", strict=True,
+        description=("Complete caller-owned research policy, format and source rules. "
+                     "Replaces legacy editorial prompts and disables Bridge editorial review. "
+                     "The app owns review and follow-up calls. Omit for legacy compatibility."),
+    )
+
+    privacy_allowlist: Optional[List[Annotated[str, Field(strict=True, min_length=1, pattern=r"\S")]]] = Field(
+        default=None,
+        description="Caller-owned exact terms exempt from name/location masking. "
+                    "New research policy defaults to no exemptions; omitted legacy requests retain compatibility.",
+    )
+
     # Core Research Parameters
     query: str = Field(..., description="Research question or topic to investigate")
 
@@ -497,6 +513,9 @@ class ResearchRequest(BaseModel):
         default=None,
         description="Host filesystem path where research report should be saved. If not provided, saves to /tmp/"
     )
+
+    agentischer_lauf: Optional[AgentischerLauf] = None
+    _agentischer_vertrag = model_validator(mode="before")(validate_request)
 
     # SuperClaude Research Depth
     depth: Optional[Literal["quick", "standard", "deep", "exhaustive"]] = Field(
@@ -698,6 +717,26 @@ class ResearchResponse(ErrorVerdictFields):
 
     Returns both container and host file paths, plus execution metadata.
     """
+    herkunft: Optional[Dict[str, Any]] = None
+    # usage: one field for both paths, declared with usage_fehlt below.
+    grenze: Optional[Dict[str, Any]] = None
+    werkzeugaufrufe: Optional[Dict[str, Any]] = None
+    artefakte: List[Dict[str, Any]] = Field(default_factory=list)
+    pruefung: Optional[Dict[str, Any]] = None
+    diagnose_ref: Optional[str] = None
+
+    @model_serializer(mode="wrap")
+    def _preserve_legacy_wire_shape(self, serialize):
+        result = serialize(self)
+        # Legacy handlers never set these additive agentic response fields.
+        # Keep their existing JSON shape while preserving explicitly set data.
+        # usage is not among them: research reports it (or usage_fehlt) on
+        # every answer since RUSAGE.
+        for name in ("herkunft", "grenze", "werkzeugaufrufe", "artefakte",
+                     "pruefung", "diagnose_ref"):
+            if name not in self.model_fields_set:
+                result.pop(name, None)
+        return result
     status: Literal["success", "error"]
     query: str
     model: str
@@ -776,18 +815,18 @@ class ResearchResponse(ErrorVerdictFields):
             "assistant message ended — the CLI's stop_reason ('end_turn', 'tool_use', ...), "
             "'max_tokens' = cut at the output limit, 'max_tokens_fortgesetzt' = cut there "
             "and continued automatically by the CLI, so the final message is only the tail "
-            "of the answer. None when the run reported no end."
+            "of the answer, 'abbruch_fortgesetzt' = the stream broke off mid-answer "
+            "and the CLI continued automatically, same consequence. None when the "
+            "run reported no end."
         ),
     )
-    fehler_code: Optional[Literal[
-        "antwort_abgeschnitten", "modell_abbruch", "privacy_gate_failed", "privacy_service_unreachable",
-        "laufzeit_erschoepft",
-    ]] = Field(
+    fehler_code: Optional[str] = Field(
         default=None,
         description=(
             "status='error' only, when the bridge knows the cause: 'antwort_abgeschnitten' = "
             "antwort_im_text and the final message ended at the output limit "
-            "(antwort_ende 'max_tokens'/'max_tokens_fortgesetzt'). Not 'no answer', not "
+            "or broke off and was continued (antwort_ende 'max_tokens'/"
+            "'max_tokens_fortgesetzt'/'abbruch_fortgesetzt'). Not 'no answer', not "
             "error_max_turns: the same request will hit the same limit (retryable=false), "
             "a smaller one will not. 'modell_abbruch' = the model's safety classifier "
             "stopped a message of the run (antwort_ende 'refusal'), for either answer "
@@ -798,7 +837,8 @@ class ResearchResponse(ErrorVerdictFields):
             "is back. 'laufzeit_erschoepft' = a mandatory round (main run, repair "
             "round) did not finish within the run's overall deadline (laufzeit.frist_s) or "
             "the CLI's MAX_TIMEOUT; the agent was terminated, no partial report "
-            "(retryable=false). None for every other error."
+            "(retryable=false). An agentischer_lauf names its own general codes "
+            "(CX0 contract, src/agentischer_lauf). None for every other error."
         ),
     )
     nachkontrolle: Optional[Dict[str, Any]] = Field(
@@ -823,12 +863,17 @@ class ResearchResponse(ErrorVerdictFields):
             "is the same whole-call time."
         ),
     )
-    usage: Optional[ResearchUsage] = Field(
+    usage: Optional[Union[ResearchUsage, Dict[str, Any]]] = Field(
         default=None,
+        # ResearchUsage first: a research usage given as a plain dict must
+        # still be read as one, not kept as an untyped dict.
+        union_mode="left_to_right",
         description=(
             "success AND error: tokens the run used, as far as the run reported them "
             "(the CLI's result message, the Messages API on the research-cloud path). "
-            "None when nothing was reported — never a made-up 0; usage_fehlt says why."
+            "None when nothing was reported — never a made-up 0; usage_fehlt says why. "
+            "An agentischer_lauf reports its own aggregate (token keys that may be "
+            "null each, cost_eur, cost_source), see src/agentischer_lauf/runtime.py."
         ),
     )
     usage_fehlt: Optional[str] = Field(
@@ -859,6 +904,15 @@ class ResearchResponse(ErrorVerdictFields):
         if self.usage is None and not self.usage_fehlt:
             self.usage_fehlt = RESEARCH_USAGE_NICHT_GEMESSEN
         return self
+    teilantwort: Optional[str] = Field(
+        default=None,
+        description=(
+            "only with fehler_code='antwort_abgeschnitten': the parts of the "
+            "cut-off final answer, joined as streamed (everything after the last "
+            "tool call). NOT the answer — the seams may repeat, skip or change "
+            "form; material for the caller's repair. Optional, None without text."
+        ),
+    )
 
 
 class DocAgentFile(BaseModel):

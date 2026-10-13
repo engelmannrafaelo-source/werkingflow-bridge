@@ -449,13 +449,16 @@ async def mark_error(
     retryable: Optional[bool] = None,
     retry_after_s: Optional[int] = None,
     details: Optional[Dict[str, Any]] = None,
+    teilantwort: Optional[str] = None,
+    diagnose_ref: Optional[str] = None,
     **usage_felder: Any,
-) -> None:
+) -> Optional[List[str]]:
     """Terminal error. `retryable`/`retry_after_s` are the verdict of
     src/error_contract.py; when a caller has none (a writer from before BR9),
     the row keeps {message, code} and GET derives the verdict from the code.
     `details` (error_contract.JOB_ERROR_DETAIL_KEYS) go into the row flat,
-    only the keys that are set.
+    only the keys that are set; so do teilantwort / diagnose_ref
+    (error_contract.JOB_ERROR_CAUSE_EXTRA_KEYS, BRTRUNC2).
 
     A running row whose owner asked to cancel it and whose stop had begun
     booking (progress.abbruch.ledger 'offen') is NOT an ordinary error: the
@@ -470,7 +473,9 @@ async def mark_error(
     A row that is already 'cancelled' (closed by the watchdog, a stop or
     defer_job) is left as it is — logged, not overwritten (FK25BR R8 P2-a).
 
-    Raises JobRowMissing when the row is gone."""
+    Returns the names of the cause fields it stored (the platform-api route
+    echoes them, BRTRUNC2N) — None when it left an already 'cancelled' row as
+    it was. Raises JobRowMissing when the row is gone."""
     from src.error_contract import job_error_details
 
     error: Dict[str, Any] = {"message": message, "code": code}
@@ -485,7 +490,11 @@ async def mark_error(
     unbekannt = set(usage_felder) - {"usage", "usage_fehlt"}
     if unbekannt:
         raise TypeError(f"mark_error: unknown fields {sorted(unbekannt)}")
-    error.update(job_error_details(details))
+    ursache = dict(job_error_details(details))
+    for name, value in (("teilantwort", teilantwort), ("diagnose_ref", diagnose_ref)):
+        if value is not None:
+            ursache[name] = value
+    error.update(ursache)
     pool = get_pool()
     async with pool.acquire() as conn:
         tag = await conn.execute(
@@ -526,9 +535,11 @@ async def mark_error(
                     f"(abbruch.ledger={zeile['ledger']!r}) — late runner error kept "
                     f"out of it: {error.get('message')!r}"
                 )
-                return
+                return None
     if _affected(tag) == 0:
         raise JobRowMissing("mark_error", job_id)
+    usage_namen = [key for key in ("usage", "usage_fehlt") if key in error]
+    return sorted(ursache) + usage_namen
 
 
 async def cleanup_old(ttl_seconds: int) -> int:

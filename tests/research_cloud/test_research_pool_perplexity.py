@@ -317,3 +317,17 @@ async def test_gate_failure_ends_the_run_with_fehler_code(spy_cli, persist, pplx
     assert result.fehler_code == urteil["fehler_code"]
     assert result.retryable is urteil["retryable"]
     assert "Anonymisierungssperre fehlgeschlagen (RuntimeError: detector down)" in result.error
+
+
+@pytest.mark.asyncio
+async def test_caller_policy_with_tools_has_no_legacy_appendix(spy_cli, persist, pplx_on):
+    _, captured, _ = spy_cli
+    req = _make_req()
+    req.research_instructions = "Caller rules"
+    with patch("src.research_cloud.luecken.nachkontrolle_aktiv",
+               side_effect=AssertionError("legacy review entered")):
+        result = await src.main._execute_research_impl(req, None, request=MagicMock())
+    assert result.status == "success"
+    assert captured["research_instructions"] == "Caller rules"
+    assert captured["sdk_mcp_servers"]
+    assert not captured["append_system_prompt"]

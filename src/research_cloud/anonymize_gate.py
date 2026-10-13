@@ -124,7 +124,7 @@ class CloudAnonymizeError(Exception):
     retryable = False
 
 
-async def anonymize_query_for_cloud(request: Request, query: str, language: str = "de") -> str:
+async def anonymize_query_for_cloud(request: Request, query: str, language: str = "de", *, privacy_allowlist: list[str] | None = None) -> str:
     """Anonymize ``query`` via the central fail-closed path and return the
     anonymized text. Raises CloudAnonymizeError (never returns unanonymized
     text) if the detector is disabled, the call fails, or the result doesn't
@@ -133,7 +133,8 @@ async def anonymize_query_for_cloud(request: Request, query: str, language: str 
     from src.main import _smart_anonymize_core  # lazy: avoid import cycle with the app module
 
     try:
-        result = await _smart_anonymize_core(request, text=query, language=language)
+        options = {"privacy_allowlist": privacy_allowlist} if privacy_allowlist is not None else {}
+        result = await _smart_anonymize_core(request, text=query, language=language, **options)
     except Exception as e:
         fehler = CloudAnonymizeError(
             f"anonymize gate raised before attesting success — refusing research-cloud call: {e}"

@@ -107,6 +107,7 @@ from src.jobs.executors import (
     erkunder_executor,
 )
 from src.stream_start import event_stream_response  # noqa: E402
+from src.research_instructions import caller_instructions, research_privacy_options
 from src.parameter_validator import ParameterValidator, CompatibilityReporter
 from src.model_registry import (
     get_models_for_api,
@@ -541,6 +542,11 @@ async def lifespan(app: FastAPI):
     )
     logger.info("✅ Config integrity OK — declared DB-backed features have a database")
 
+    # Agentic run (CX0): composed only from the server's own configuration;
+    # without it the mode answers 422 faehigkeit_nicht_verfuegbar.
+    from src.agentischer_lauf.zulassung import verdrahte_aus_konfiguration
+    verdrahte_aus_konfiguration()
+
     # Validate authentication first
     auth_valid, auth_info = validate_claude_code_auth()
     
@@ -903,6 +909,9 @@ app = FastAPI(
 
 # Generic async-job endpoints (POST /v1/jobs, GET /v1/jobs/{id}) — additive,
 # inert unless BRIDGE_GENERIC_JOBS_ENABLED=true.
+from src.version import router as version_router
+
+app.include_router(version_router)
 app.include_router(jobs_router)
 app.include_router(erkunder_router)
 
@@ -5232,9 +5241,22 @@ class ResearchAnswerTruncated(ResearchReportMissing):
     or — after the CLI's own continuation — is only the tail of it. Its own
     error (fehler_code) so the caller can shrink the task instead of telling
     the model a block is missing; a retry of the same request hits the same
-    limit (retryable stays false)."""
+    limit (retryable stays false). The same holds when the stream broke off
+    mid-answer and the CLI continued (antwort_ende abbruch_fortgesetzt).
+
+    teilantwort: the final answer's parts joined (claude_cli.teilantwort) —
+    material for the caller's repair, never the answer."""
 
     fehler_code = "antwort_abgeschnitten"
+
+    def __init__(
+        self,
+        message: str,
+        usage: Optional[Dict[str, int]] = None,
+        teilantwort: Optional[str] = None,
+    ):
+        super().__init__(message, usage)
+        self.teilantwort = teilantwort
 
 
 def _research_annehmen(abschluss, *, session_id: Optional[str], was: str, usage=None) -> None:
@@ -5288,8 +5310,10 @@ async def _research_strom(strom, antwort_im_text: bool):
     fixture abbruch_immer). Then the answer is cut off: under antwort_im_text
     the truncation verdict holds (fehler_code, not retryable — the same
     request breaks the same way), the API error stays its cause. Otherwise
-    the CliApiError goes on, carrying antwort_ende for the error response."""
-    from src.claude_cli import antwort_abgeschnitten, antwort_ende
+    the CliApiError goes on, carrying antwort_ende for the error response.
+    teilantwort comes from the chunks before the API error: run_completion
+    withholds the CLI's own error turn, so its text is not part of it."""
+    from src.claude_cli import antwort_abgeschnitten, antwort_ende, teilantwort
 
     seen: List[Dict[str, Any]] = []
     try:
@@ -5304,7 +5328,8 @@ async def _research_strom(strom, antwort_im_text: bool):
                 f"Research answer cut off (antwort_ende={ende}): the CLI continued "
                 f"a cut answer and the continuation ended in an API error ({e}). "
                 f"antwort_im_text was set and the run's final message is not the "
-                f"complete answer."
+                f"complete answer.",
+                teilantwort=teilantwort(seen),
             )
             truncated.antwort_ende = ende
             truncated.usage = e.usage
@@ -5382,11 +5407,12 @@ async def _pool_berichtsdatei_nachholen(
             f"session cannot be resumed to write it (cli_session={cli_resume_id!r}, file={datei}). "
             "The chat text is not returned as the report."
         )
+    report_format = "in Markdown" if caller_instructions(request_body) is None else "in the requested format"
     auftrag = (
         f"The research is finished, but the report file {datei} does not exist. Whoever ordered "
         f"this research receives exactly the contents of that file and nothing else: your chat "
         f"replies are not passed on, and code in a chat reply is never run, so a script that would "
-        f"write the file has not created it. Write the finished report itself now — in Markdown, "
+        f"write the file has not created it. Write the finished report itself now — {report_format}, "
         f"with all findings and sources you have — into {datei} with the Write tool. If it is very "
         f"long, write the first part with Write and add the rest with Edit."
     )
@@ -5741,7 +5767,7 @@ async def _execute_research_impl(
         # Default aus → bestehende Caller unverändert.
         try:
             from src.scholarly import scholarly_enabled, build_oa_context
-            if scholarly_enabled(getattr(request_body, "research_mode", None)):
+            if caller_instructions(request_body) is None and scholarly_enabled(getattr(request_body, "research_mode", None)):
                 oa_block = await build_oa_context(
                     request_body.query, attribution=attribution_ctx, model=request_body.model
                 )
@@ -5786,6 +5812,7 @@ async def _execute_research_impl(
                 library_append_prompt = build_pool_library_catalogue(
                     _library_index,
                     dir_name=LIBRARY_WORKDIR_NAME,
+                    research_instructions=caller_instructions(request_body),
                     unavailable_ids=set(_mirror.missing_ids),
                 )
                 if not library_append_prompt:
@@ -5860,25 +5887,31 @@ async def _execute_research_impl(
             )
             pool_pplx = PoolPerplexityTool(
                 _pplx_cfg,
-                lambda text: anonymize_query_for_cloud(request, text),
+                lambda text: anonymize_query_for_cloud(request, text, **research_privacy_options(request_body)),
                 None,
                 ResearchCloudConfig().perplexity_max_uses,
+                research_instructions=caller_instructions(request_body),
             )
             # fetch_document kommt mit Perplexity: Perplexity findet das
             # Datenblatt, fetch_document liest es (WebFetch lieferte aus einem
             # PDF mit Textebene nichts Lesbares, Dev 02.10.2026).
-            pool_doc = PoolDocumentTool(ResearchCloudConfig().fetch_document_max_uses)
+            pool_doc = PoolDocumentTool(
+                ResearchCloudConfig().fetch_document_max_uses,
+                research_instructions=caller_instructions(request_body),
+            )
             pool_sdk_mcp_servers = {
                 MCP_SERVER_NAME: pool_pplx.server(),
                 DOC_MCP_SERVER_NAME: pool_doc.server(),
             }
-            library_append_prompt = (library_append_prompt or "") + POOL_PROMPT_SECTION
+            if caller_instructions(request_body) is None:
+                library_append_prompt = (library_append_prompt or "") + POOL_PROMPT_SECTION
 
         # Lücken-Nachkontrolle (Rafael 03.10.2026): eigene Flagge, Vorgabe wie
         # Perplexity. Falsch gesetzt -> Lauf wird nicht gestartet.
         from src.research_cloud.luecken import LueckenKonfigFehler, nachkontrolle_aktiv
         try:
-            luecken_an = nachkontrolle_aktiv(perplexity_enabled(_pplx_cfg))
+            luecken_an = (caller_instructions(request_body) is None
+                          and nachkontrolle_aktiv(perplexity_enabled(_pplx_cfg)))
         except LueckenKonfigFehler as _lk_err:
             logger.error(f"research: Lücken-Nachkontrolle falsch konfiguriert, Lauf wird nicht gestartet: {_lk_err}")
             return ResearchResponse(
@@ -5908,6 +5941,7 @@ async def _execute_research_impl(
             allowed_tools=None,
             disallowed_tools=list(RESEARCH_TEXT_CONTRACT_DISALLOWED_TOOLS) if antwort_im_text else None,
             antwort_im_text=antwort_im_text,
+            research_instructions=caller_instructions(request_body),
             stream=True,
             enable_file_discovery=True,
             backend_env_vars=backend_config.env_vars if backend_config else None,
@@ -5973,7 +6007,7 @@ async def _execute_research_impl(
 
         execution_time = time.time() - start_time
 
-        from src.claude_cli import antwort_abgeschnitten, lauf_abschluss
+        from src.claude_cli import antwort_abgeschnitten, lauf_abschluss, teilantwort
         research_abschluss = lauf_abschluss(all_chunks)
         research_antwort_ende = research_abschluss.stop_reason
 
@@ -6122,12 +6156,20 @@ async def _execute_research_impl(
         # Before the unfinished-run check: when the CLI gave up continuing, the
         # result reads "success flagged is_error", which would hide the cause.
         if antwort_im_text and antwort_abgeschnitten(research_antwort_ende):
+            # The opening words stay as they were for the output limit: callers
+            # on /v1/jobs matched them before fehler_code reached that path.
+            wo = (
+                "mid-stream"
+                if research_antwort_ende == "abbruch_fortgesetzt"
+                else "at the output limit"
+            )
             raise ResearchAnswerTruncated(
-                f"Research answer cut off at the output limit (antwort_ende="
-                f"{research_antwort_ende}, session_id={session_id}): antwort_im_text was set and "
-                f"the run's final message is not the complete answer. Not 'no answer' and not "
-                f"error_max_turns — the answer is longer than one message can be; a smaller "
-                f"task fits, the same request hits the same limit."
+                f"Research answer cut off {wo} "
+                f"(antwort_ende={research_antwort_ende}, session_id={session_id}): "
+                f"antwort_im_text was set and the run's final message is not the "
+                f"complete answer. Not 'no answer' and not error_max_turns; the "
+                f"joined parts are in teilantwort, not in content.",
+                teilantwort=teilantwort(all_chunks),
             )
         if antwort_abgeschnitten(research_antwort_ende):
             # File contract: the report is the file, not the message. Reported
@@ -6182,7 +6224,8 @@ async def _execute_research_impl(
             # the sibling guard above already names (a rate_limit_event whose
             # internal retry never recovered). Raising here makes the caller defer
             # and retry instead of storing an announcement as a research result.
-            if len(parsed_assistant_text.strip()) < RESEARCH_MIN_INLINE_REPORT_CHARS:
+            if (caller_instructions(request_body) is None
+                    and len(parsed_assistant_text.strip()) < RESEARCH_MIN_INLINE_REPORT_CHARS):
                 logger.error(
                     f"❌ Research produced no report: no output file and only "
                     f"{len(parsed_assistant_text.strip())} chars of inline text "
@@ -6552,6 +6595,7 @@ async def _execute_research_impl(
                 accumulated_cache_creation, accumulated_cache_read,
                 USAGE_FEHLT_CLI if research_lauf_gestartet else USAGE_FEHLT_KEIN_LAUF,
             ),
+            teilantwort=getattr(e, "teilantwort", None),
         )
 
 
@@ -6625,7 +6669,14 @@ async def _execute_research_cloud_impl(
     start_time = time.time()
 
     try:
-        anonymized_query = await anonymize_query_for_cloud(request, request_body.query)
+        instructions = caller_instructions(request_body)
+        anonymized_query = await anonymize_query_for_cloud(
+            request, request_body.query, **research_privacy_options(request_body)
+        )
+        anonymized_instructions = (
+            await anonymize_query_for_cloud(request, instructions, **research_privacy_options(request_body))
+            if instructions is not None else None
+        )
     except CloudAnonymizeError as e:
         logger.error(f"research-cloud: anonymize gate refused the call: {e} ({e.fehler_code})")
         return ResearchResponse(
@@ -6645,7 +6696,7 @@ async def _execute_research_cloud_impl(
     prompt = anonymized_query
     try:
         from src.scholarly import scholarly_enabled, build_oa_context
-        if scholarly_enabled(getattr(request_body, "research_mode", None)):
+        if caller_instructions(request_body) is None and scholarly_enabled(getattr(request_body, "research_mode", None)):
             oa_block = await build_oa_context(
                 anonymized_query, attribution=attribution_ctx, model=request_body.model
             )
@@ -6681,6 +6732,7 @@ async def _execute_research_cloud_impl(
         request_body.depth,
         library_index=library_index,
         perplexity=perplexity_enabled(perplexity_cfg),
+        research_instructions=anonymized_instructions,
     )
     search_max_uses, fetch_max_uses = search_budget_for_depth(request_body.depth)
     config = ResearchCloudConfig(web_search_max_uses=search_max_uses, web_fetch_max_uses=fetch_max_uses)
@@ -6704,7 +6756,9 @@ async def _execute_research_cloud_impl(
         abgewaehlt_nk = Nachkontrolle(pruefer=None)
         abgewaehlt_nk.ueberspringen("pruefung", ABWAHL_GRUND)
     try:
-        if nachkontrolle_aktiv(perplexity_enabled(perplexity_cfg)) and abgewaehlt_nk is None:
+        if (caller_instructions(request_body) is None
+                and nachkontrolle_aktiv(perplexity_enabled(perplexity_cfg))
+                and abgewaehlt_nk is None):
             # Same key as the executor; without it the executor itself refuses
             # the run before the checker could ever be asked.
             nachkontrolle = Nachkontrolle(
@@ -6730,8 +6784,9 @@ async def _execute_research_cloud_impl(
             perplexity_config=perplexity_cfg,
             # Every perplexity_search query passes the SAME fail-closed gate as
             # the prompt above before it leaves for the third party.
-            anonymize=lambda text: anonymize_query_for_cloud(request, text),
+            anonymize=lambda text: anonymize_query_for_cloud(request, text, **research_privacy_options(request_body)),
             nachkontrolle=nachkontrolle,
+            research_instructions=anonymized_instructions,
         )
     except ResearchCloudModelAbbruch as e:
         return await _cloud_modell_abbruch_antwort(
@@ -7039,7 +7094,7 @@ async def _admit_research_to_pool(
 
 # Floor for an inline research answer that never produced a report file. See
 # the guard in _execute_research_impl for the calibration.
-RESEARCH_MIN_INLINE_REPORT_CHARS = 500
+from src.compat.research_content import RESEARCH_MIN_INLINE_REPORT_CHARS
 
 
 # Same-path retries before a cloud failure is surfaced loud: 1 initial
@@ -7234,7 +7289,11 @@ async def _cleanup_old_research_jobs() -> None:
             logger.warning(f"⚠️ Research job cleanup error: {e}", exc_info=True)
 
 
+from src.agentischer_lauf.http import research_dispatch, content_dispatch
+
+
 @app.post("/v1/research", response_model=ResearchResponse)
+@research_dispatch
 async def research(
     request_body: ResearchRequest,
     request: Request,
@@ -8227,6 +8286,7 @@ def _research_content_not_here(session_id: str) -> HTTPException:
 
 
 @app.get("/v1/research/{session_id}/content")
+@content_dispatch
 async def get_research_content(
     session_id: str,
     request: Request,
@@ -8960,6 +9020,7 @@ async def _smart_anonymize_core(
     context_hint: Optional[str] = None,
     prefix: Optional[str] = None,
     known_entities: Optional[Dict[str, str]] = None,
+    privacy_allowlist: Optional[List[str]] = None,
 ) -> SmartAnonymizeResponse:
     """Core smart-pseudonymization logic: proxy to privacy-pdf-service, persist
     activity + a value-free DSGVO attestation, feed prompt-metrics. Shared by
@@ -9013,9 +9074,13 @@ async def _smart_anonymize_core(
         # Ein Fehler darin ist ein Fehler des Aufrufs (fail loud) — nie die ungefilterte
         # Antwort als gefiltert ausgeben.
         from src import privacy_postprocess as _pp
+        if privacy_allowlist and not _pp.ist_aktiv():
+            raise ValueError("privacy_allowlist requires BRIDGE_PSEUDONYM_POSTPROCESS")
         if _pp.ist_aktiv():
+            from src.privacy_postprocess.rules import caller_freiliste
             _payload = _pp.postprocess_smart_anonymize(
                 text, _payload, prefix=prefix, known_entities=known_entities,
+                freiliste=caller_freiliste(privacy_allowlist) if privacy_allowlist is not None else None,
             )
         elif known_entities:
             logger.warning(
@@ -10510,7 +10575,10 @@ async def get_jobs_retention_metrics(
     (mark_done/mark_error = a finished result lost) — must stay empty.
     `retention`: removed_terminal, expired_max_age (pending past the 24 h
     backstop), running_over_max_age_seen, prune_route_missing (platform-api
-    predates BR11, nothing deleted). See src/jobs/store_client.py."""
+    predates BR11, nothing deleted). `cause_fields_dropped`: research cause
+    fields (fehler_code, antwort_ende, teilantwort) a platform-api from
+    before BRTRUNC2 did not confirm — must stay empty; deploy platform-api
+    before the workers (BRTRUNC2N). See src/jobs/store_client.py."""
     return jobs_store_client.retention_snapshot()
 
 

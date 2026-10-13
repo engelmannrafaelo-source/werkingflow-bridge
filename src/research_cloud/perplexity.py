@@ -31,6 +31,8 @@ from typing import Any, Dict, List, Optional
 import httpx
 from pydantic import BaseModel, Field
 
+from src.compat.research_content import PERPLEXITY_TOOL_DESCRIPTION
+
 logger = logging.getLogger(__name__)
 
 PERPLEXITY_TOOL_NAME = "perplexity_search"
@@ -39,20 +41,7 @@ PRESETS = ("fast", "low", "medium", "high", "xhigh")
 
 PERPLEXITY_TOOL: Dict[str, Any] = {
     "name": PERPLEXITY_TOOL_NAME,
-    "description": (
-        "Web-Recherche über Perplexity: beantwortet eine präzise Frage aus vielen Webquellen "
-        "und liefert die Antwort mit nummerierter Quellenliste (nr, titel, url). Erste Wahl für "
-        "Hersteller-Datenblätter, Produktkennwerte und die aktuell gültige Ausgabe einer Norm "
-        "oder Vorschrift — hier ZUERST fragen (eine Frage je Produkt bzw. Regelwerk, mit "
-        "Typbezeichnung bzw. Normnummer), web_search nur als Rückfall. Ebenso gut, um "
-        "Gesetzesstellen und Behördenseiten zu finden und den Stand einer Frage zu überblicken.\n"
-        "Die Antwort ist eine Zusammenfassung Dritter und allein KEIN Beleg: Jede Zahl oder "
-        "Vorgabe, die der Bericht tragen soll, liest du mit web_fetch an der Originalquelle "
-        "nach (Norm, Gesetz, Hersteller-PDF) und zitierst die Originalquelle, nicht Perplexity.\n"
-        "Die kuratierte Bibliothek bleibt die erste Quelle; nutze dieses Werkzeug für das, "
-        "was dort fehlt. Formuliere die Frage sachlich und ohne Namen von Personen oder Firmen "
-        "des Auftraggebers — sie wird vor dem Senden anonymisiert."
-    ),
+    "description": PERPLEXITY_TOOL_DESCRIPTION,
     "input_schema": {
         "type": "object",
         "properties": {

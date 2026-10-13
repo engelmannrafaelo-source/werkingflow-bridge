@@ -29,6 +29,7 @@ So there is one place for it, and every output path goes past it:
 Rule for the finish reason:
   refusal (stop_reason or stop_details.type)  → "content_filter"
   max_tokens / CLI output-limit continuation  → "length"
+  abbruch_fortgesetzt (stream break continued) → "length"
   end_turn / stop_sequence / none reported    → "stop" (CLI path)
   anything else                               → passed on unchanged
 After a refusal the answer ends with the refused model call (all its content
@@ -49,12 +50,16 @@ MODELL_ABBRUCH_STOP_REASONS = ("refusal",)
 # claude_cli.ANTWORT_ENDE_FORTGESETZT — repeated here so this module stays
 # importable without the CLI stack (research-cloud uses it too).
 ANTWORT_ENDE_FORTGESETZT = "max_tokens_fortgesetzt"
+# claude_cli.ANTWORT_ENDE_ABBRUCH_FORTGESETZT (BRTRUNC2): the stream broke off
+# mid-answer and the CLI continued on its own — cut like the output limit.
+ANTWORT_ENDE_ABBRUCH_FORTGESETZT = "abbruch_fortgesetzt"
 
 STOP_REASON_FINISH = {
     "end_turn": "stop",
     "stop_sequence": "stop",
     "max_tokens": "length",
     ANTWORT_ENDE_FORTGESETZT: "length",
+    ANTWORT_ENDE_ABBRUCH_FORTGESETZT: "length",
     "model_context_window_exceeded": "length",
     "refusal": "content_filter",
 }

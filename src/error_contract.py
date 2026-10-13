@@ -76,10 +76,27 @@ def fields(retryable: bool, retry_after_s: Optional[float] = None) -> Dict[str, 
     return {"retryable": bool(retryable), "retry_after_s": after}
 
 
+# Further cause fields of an endpoint's error answer (BRTRUNC2, agentischer
+# Lauf): the parts of a cut-off answer (teilantwort, material for the
+# caller's repair, may be long) and the reference to the run's protected
+# diagnosis (diagnose_ref). Sent and stored flat next to message/code, kept
+# as the endpoint returned them, only when set. Flat, not in `details`: a
+# platform-api from before them ignores an unknown top-level field, whereas
+# InternalJobErrorDetails rejects unknown keys with 422 and the error would
+# not be stored at all.
+JOB_ERROR_CAUSE_EXTRA_KEYS = ("teilantwort", "diagnose_ref")
+# Key of platform-api's answer to POST /v1/internal/jobs/{id}/error that names
+# every cause field it stored — details keys, usage/usage_fehlt and the extra
+# keys (BRTRUNC2N). Missing (204) = a platform-api from before it, which
+# confirms nothing; store_client.mark_error says so loudly.
+JOB_ERROR_CAUSE_ECHO_KEY = "ursache_felder"
+
+
 class JobFailure(RuntimeError):
     """An executor failure that carries its own verdict (rule 1), e.g. a
     research answer with status=error and retryable:true, or a self-call that
-    lost its connection."""
+    lost its connection. ``details``: the endpoint's error answer; its
+    JOB_ERROR_DETAIL_KEYS and JOB_ERROR_CAUSE_EXTRA_KEYS are kept."""
 
     def __init__(self, message: str, *, retryable: bool,
                  retry_after_s: Optional[float] = None,
@@ -94,6 +111,16 @@ class JobFailure(RuntimeError):
         self.usage_felder = usage_felder
         # JOB_ERROR_DETAIL_KEYS of the failed answer; job_error_details reads it.
         self.details = job_error_details(details)
+        # JOB_ERROR_CAUSE_EXTRA_KEYS of the failed answer, as it gave them.
+        self.ursache_extra = job_cause_extra(details)
+
+
+def job_cause_extra(answer: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """JOB_ERROR_CAUSE_EXTRA_KEYS that are set in an error answer, unchanged."""
+    if not isinstance(answer, dict):
+        return {}
+    return {key: answer[key] for key in JOB_ERROR_CAUSE_EXTRA_KEYS
+            if answer.get(key) not in (None, "")}
 
 
 def job_usage_fields(exc: BaseException) -> Dict[str, Any]:
@@ -169,10 +196,13 @@ def job_error_details(source: Any) -> Dict[str, str]:
 
 def job_error_fields(exc: BaseException) -> Dict[str, Any]:
     """Code + verdict for an exception that ends a job (rule 1, then 2/3),
-    plus `details` when the exception carries any JOB_ERROR_DETAIL_KEYS."""
+    plus `details` when the exception carries any JOB_ERROR_DETAIL_KEYS and
+    the JOB_ERROR_CAUSE_EXTRA_KEYS it carries (flat)."""
     details = job_error_details(exc)
     extra = {"details": details} if details else {}
-    return {**_job_error_verdict(exc), **extra}
+    ursache = getattr(exc, "ursache_extra", None)
+    return {**_job_error_verdict(exc), **extra,
+            **(ursache if isinstance(ursache, dict) else {})}
 
 
 def _job_error_verdict(exc: BaseException) -> Dict[str, Any]:

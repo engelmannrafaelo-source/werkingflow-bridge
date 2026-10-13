@@ -113,6 +113,31 @@ Wo es landet:
   Die Bridge wartet absichtlich und startet den Job dann selbst neu.
   Dazu kommen `defer_count` und `defer_reason`.
 
+### Ursachenfelder bei Jobs: platform-api vor den Workern ausrollen
+
+Ein Research-Job, dessen Antwort abgeschnitten ist, traegt im Fehlerobjekt
+dieselben Ursachenfelder wie `/v1/research`: `fehler_code`, `antwort_ende`
+und `teilantwort` (`error_contract.JOB_ERROR_DETAIL_FIELDS`). Der Worker
+schickt sie an die platform-api der Job-Heimat, und diese speichert sie.
+
+Eine platform-api, die diese Felder noch nicht kennt, verwirft sie, weil
+pydantic unbekannte Felder ignoriert. Deshalb gilt:
+
+- **Pflicht beim Ausrollen: zuerst die platform-api, dann die Worker.**
+  Auf Prod sind das zwei getrennte Ziele: die platform-api auf server2,
+  die Worker auf dem Worker-Host (ADR-0009). Wer nur die Worker ausrollt,
+  erzeugt genau diese Versionsschere.
+- **Die Schere bleibt nicht still.** Mit Ursachenfeldern antwortet die
+  platform-api `200 {"ursache_felder": [...]}` und nennt, was sie
+  gespeichert hat. Ohne Ursachenfelder antwortet sie wie bisher `204`, damit
+  aeltere Worker weiterlaufen. Kommt beim Worker `204` oder ein
+  unvollstaendiges Echo an, meldet `store_client.mark_error` das mit
+  `logger.error`. Der Zaehler `cause_fields_dropped` in
+  `/v1/metrics/jobs-retention` steigt. Ausserdem schreibt der Worker den
+  Fehler erneut: Die Meldung bekommt den Zusatz
+  `[bridge-vertrag: platform-api ohne BRTRUNC2 hat … verworfen; fehler_code=…]`.
+  So ist die Schere am Job selbst sichtbar.
+
 ## Erkunder im Deploy
 
 Auf dem Dev-Ziel gehoeren Ausgang, drei Plaetze und Leitstand zu einer
@@ -202,3 +227,80 @@ Netzverkehr). Das ist Dienstbereitschaft, kein Modell-/Bericht-End-to-End-Test.
 Rollback prueft aeltere Images ohne Docker-Healthcheck mit derselben Probe aus
 dem Deploy-Werkzeug. Ein fehlgeschlagener oder nur teilweise gestarteter
 Erkunder-Release wird als ganze Gruppe zurueckgerollt; Fehler bleiben laut.
+
+
+## Versionsvertrag
+
+`GET /v1/version` ist wie Health öffentlich und liefert ausschließlich
+`git_sha` (vollständiger Git-SHA), `built_at` (ISO-8601 mit Zeitzone) und
+`contract_version` (Version des Wire-Vertrags, unabhängig vom Git-Stand).
+Der Worker-Build schreibt SHA und Bauzeit unveränderlich ins Image; die
+Vertragsversion steht beim Response-Modell. Änderungen am Wire-Vertrag
+werden mit den konsumierenden Apps abgestimmt. Fehlende oder ungültige
+Build-Metadaten ergeben 503, keine erfundene Version oder Startzeit.
+Lokale Quellstarts benötigen dieselbe Datei `src/build-metadata.json`;
+sie wird nicht eingecheckt und enthält nur `git_sha` und `built_at`.
+
+Beim Review gilt die Architekturgrenze in [CLAUDE.md](../CLAUDE.md):
+Allgemeine Ausführung bleibt in der Bridge, fachliches Wissen in der App.
+
+
+## Build-Provenienz und Versionsprobe
+
+`/v1/version` liest nur die im Worker-Image eingebrannten Metadaten. Fehlende
+oder ungueltige Metadaten ergeben 503 als nicht wiederholbaren Konfigurationsfehler.
+Der Lastverteiler nutzt dafuer einen lokalen Pool ohne Backup, ohne Wiederholung
+auf einem anderen Worker und ohne Kapazitaets-Umschreibung. Eine einzelne Antwort
+belegt den ausgewaehlten lokalen Worker, nicht die Gleichheit aller Worker.
+
+Nur `scripts/bridge-deploy.sh` setzt `GIT_COMMIT` automatisch beim Worker-Bau.
+`docker/rebuild.sh`, `setup-prod-server.sh` und ein direktes `compose build`
+setzen es nicht selbst: Ohne expliziten vollstaendigen Commit-SHA entsteht wegen
+`${GIT_COMMIT:-unknown}` ein Image, dessen Versionsroute dauerhaft 503 liefert.
+Die Bauzeit stammt aus dem Image-Bau, nicht vom Worker-Start. `/health` bleibt
+unabhaengig davon der Lebenszeichen-Endpunkt.
+
+Die Smoke-Probe `version` verlangt `--expected-git-sha` mit dem vollen ausgerollten
+Worker-SHA. Der Deploy liest ihn unabhaengig von der HTTP-Antwort aus dem
+Worker-Checkout; beim server2-Lastverteiler ist dies der separate Worker-Host.
+Ein Checkout/Image-Unterschied bleibt dadurch ein Fehler. Manuelle Proben muessen
+den erwarteten SHA explizit mitgeben. Beispiel ohne KI-Aufruf:
+
+```sh
+python3 scripts/bridge_smoke.py --base-url "$BRIDGE_URL" --only version --expected-git-sha "$DEPLOYED_SHA"
+```
+
+Fuer den Nachweis eines bestimmten Workers die gleiche Probe gegen dessen
+konfigurierten direkten Worker-Endpunkt ausfuehren. Die Pool-Probe beweist keinen
+vollstaendigen Rollout; Version und OpenAPI am Pool koennen von verschiedenen
+lokalen Workern stammen.
+
+## Worker-SHA bei Dienst-Teilmengen
+
+`bridge-deploy.sh` setzt den Soll-SHA der Versionsprobe nur, wenn der jeweilige
+Deploy alle vier Pool-Worker worker1 bis worker4 gebaut hat (`DEPLOYED_SERVICES`,
+Phase 4). Der Pool `claude_version` verteilt reihum auf alle vier; nach einer
+Teilmenge antworten die übrigen mit ihrem alten Image, ein Treffer bewiese nur
+einen Worker. Die Dienstlisten im Skript sind die Quelle der Auswahl:
+
+| Aufruf | Worker-Bau | Versionsnachweis |
+|---|---|---|
+| `bridge-deploy.sh hetzner` | worker1 bis worker4 | Soll-SHA vom gebauten Checkout |
+| `bridge-deploy.sh hetzner worker1 worker2 worker3 worker4` | alle vier Pool-Worker | Soll-SHA vom gebauten Checkout |
+| `bridge-deploy.sh hetzner worker1` (jede echte Teilmenge von worker1–4) | ausgewählte Worker | UNPROVEN; Grund nennt die nicht gebauten Worker |
+| `bridge-deploy.sh hetzner nginx` / `hetzner platform-api` / Erkunder-Dienste | keiner | UNPROVEN |
+| `bridge-deploy.sh server2` / `server2 platform-api` / `server2 nginx` | keiner; vollständige Auswahl: postgres-prod, platform-api, nginx | UNPROVEN |
+| `bridge-deploy.sh both` | hetzner baut Worker, server2 nicht | getrennte Bewertung je Ziel |
+| `bridge-deploy.sh prod-workers` | worker-sahori, worker-kurt, worker-coach, worker-erk | bestehende Container-Prüfungen; kein öffentlicher Smoke in diesem Zweig |
+| `bridge-deploy.sh prod-workers metrics-reader` | keiner | kein öffentlicher Smoke |
+
+Ohne Worker-Bau wird `/v1/version` nicht gegen einen fremden Checkout-HEAD
+geprüft: `SMOKE_VERSION_UNPROVEN` nennt den Grund. Die übrigen Smoke-Proben
+laufen weiter und echte Fehler lösen weiterhin den Rollback aus. Ein sonst
+erfolgreicher Lauf endet sichtbar mit UNPROVEN (Exit 3), ohne Rollback und ohne
+den bisherigen Nachweis-Marker zu überschreiben. Ein fehlender Worker-SHA wird
+durch einen Worker-Deploy mit Versionsprobe nachgewiesen, nicht durch
+`smoke-nachholen` (dieser Befehl gilt den Pool-Lücken).
+
+Offline-Regressionsprobe: `python3 -m pytest -o addopts= -q
+ tests/test_deploy_version_scope.py tests/test_version_delivery.py`.

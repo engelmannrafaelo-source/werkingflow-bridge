@@ -164,6 +164,7 @@ async def test_skript_im_chat_wird_nie_der_bericht(tmp_path, persist):
     assert str(fake.datei) in nachhol[0]["prompt"]
     assert "receives exactly the contents of that file" in nachhol[0]["prompt"]
     assert "never run" in nachhol[0]["prompt"]
+    assert "itself now — in Markdown, " in nachhol[0]["prompt"]
     booked = persist.await_args.kwargs
     assert booked["input_tokens"] == 120 and booked["output_tokens"] == 1100
 
@@ -448,3 +449,23 @@ async def test_echter_run_completion_max_turns_ist_fehler(monkeypatch, tmp_path,
     result = await _run_echt(monkeypatch, tmp_path,
                              sdk.result("error_max_turns", is_error=True, session_id="cli-echt-1"))
     assert result.status == "error" and "error_max_turns" in result.error
+
+
+@pytest.mark.asyncio
+async def test_caller_short_result_is_written_without_legacy_length_verdict(tmp_path, persist):
+    req = _make_req()
+    req.research_instructions = "Return JSON"
+    fake = FakeCli(tmp_path, chat="{}", nachhol_text="{}")
+    result = await _run(fake, req)
+    assert result.status == "success" and result.content == "{}"
+    assert len(fake.calls["nachhol"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_caller_repair_preserves_requested_format(tmp_path, persist):
+    fake = FakeCli(tmp_path, chat="{}", nachhol_text="{}")
+    req = _make_req()
+    req.research_instructions = "Return JSON"
+    result = await _run(fake, req)
+    assert result.status == "success"
+    assert "itself now — in the requested format, " in fake.calls["nachhol"][0]["prompt"]

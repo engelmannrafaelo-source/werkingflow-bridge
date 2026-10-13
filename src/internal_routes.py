@@ -33,10 +33,12 @@ import logging
 from typing import Any, Dict, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Response
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field
 
 from src.api_auth import require_service_token, AuthClaims
 from src.audit.db_writer import insert_audit_event
+from src.error_contract import JOB_ERROR_CAUSE_ECHO_KEY
 
 logger = logging.getLogger(__name__)
 
@@ -714,6 +716,13 @@ class InternalJobError(BaseModel):
     usage_fehlt: Optional[str] = None
     # Workers from before JOBENDE send none.
     details: Optional[InternalJobErrorDetails] = None
+    # error_contract.JOB_ERROR_CAUSE_EXTRA_KEYS (BRTRUNC2). Optional: older
+    # workers send none.
+    teilantwort: Optional[str] = None
+    diagnose_ref: Optional[str] = None
+    # The worker asks which cause fields were stored (BRTRUNC2N). Workers
+    # from before it accept only 204 and never ask.
+    ursache_bestaetigen: bool = False
 
 
 class InternalJobDefer(BaseModel):
@@ -959,18 +968,31 @@ async def internal_mark_error(
     body: InternalJobError,
     _claims: AuthClaims = Depends(require_service_token),
 ) -> Response:
+    """204 unless the worker asks (ursache_bestaetigen) — unchanged for
+    workers from before BRTRUNC2N, which accept only 204. Asked: 200
+    {"ursache_felder": [stored cause field names]} (BRTRUNC2N), plus
+    "zeile_unveraendert": "cancelled" when the row was already closed and
+    nothing was written. The echo is the worker's proof that they were
+    stored: a platform-api from before it answers 204, which the worker
+    reports loudly (store_client.mark_error)."""
     from src.jobs import store
 
     try:
-        await store.mark_error(
+        stored = await store.mark_error(
             job_id, body.message, code=body.code,
             retryable=body.retryable, retry_after_s=body.retry_after_s,
             **body.model_dump(include={"usage", "usage_fehlt"}, exclude_unset=True),
             details=(body.details.model_dump(exclude_none=True)
                      if body.details else None),
+            teilantwort=body.teilantwort, diagnose_ref=body.diagnose_ref,
         )
     except store.JobRowMissing as e:
         raise _job_row_missing(e)
+    if body.ursache_bestaetigen:
+        echo: Dict[str, Any] = {JOB_ERROR_CAUSE_ECHO_KEY: stored or []}
+        if stored is None:
+            echo["zeile_unveraendert"] = "cancelled"
+        return JSONResponse(status_code=200, content=echo)
     return Response(status_code=204)
 
 

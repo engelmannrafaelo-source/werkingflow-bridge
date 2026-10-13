@@ -272,6 +272,8 @@ class TenantMiddleware(BaseHTTPMiddleware):
 
     def _is_exempt_path(self, path: str) -> bool:
         """Check if path is exempt from tenant validation."""
+        if path == "/v1/version":
+            return True
         exempt_paths = [
             "/health",
             "/stats",

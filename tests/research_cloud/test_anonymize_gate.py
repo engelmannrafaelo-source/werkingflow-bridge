@@ -135,3 +135,12 @@ def test_privacy_urteil_follows_the_cause_chain():
     except CloudAnonymizeError as outer:
         assert privacy_urteil(outer) == {"fehler_code": "privacy_service_unreachable", "retryable": True}
     assert privacy_urteil(RuntimeError("x")) == {"fehler_code": "privacy_gate_failed", "retryable": False}
+
+
+@pytest.mark.asyncio
+async def test_caller_allowlist_reaches_core():
+    from types import SimpleNamespace
+    safe = SimpleNamespace(status="success", anonymization_performed=True, smart_anonymized_text="COP", error=None)
+    with patch("src.main._smart_anonymize_core", new=AsyncMock(return_value=safe)) as core:
+        assert await anonymize_query_for_cloud(_fake_request(), "COP", privacy_allowlist=["COP"]) == "COP"
+    assert core.await_args.kwargs["privacy_allowlist"] == ["COP"]

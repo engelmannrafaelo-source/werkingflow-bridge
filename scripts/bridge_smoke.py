@@ -361,6 +361,19 @@ def probe(name, endpoint, profiles, repro=""):
     return deco
 
 
+@probe("version", "/v1/version", {"hetzner", "server2"})
+def version(ctx):
+    import re
+    if not re.fullmatch(r"[0-9a-f]{40}", ctx.expected_git_sha):
+        return ProbeResult("version", "/v1/version", False, "Expected full deployed SHA is required")
+    response, ms = _timed(lambda: requests.get(
+        ctx.base_url + "/v1/version", timeout=ctx.timeout, allow_redirects=False))
+    ok = response.status_code == 200 and response.json().get("git_sha") == ctx.expected_git_sha
+    return ProbeResult("version", "/v1/version", ok,
+                       "Deployed SHA matches" if ok else "Version missing or deployed SHA mismatch",
+                       response.status_code, ms)
+
+
 # EXCLUDED: endpoint -> reason. Enforced by the coverage validator. These are
 # deliberately NOT smoke-tested; each needs a reason so the gap stays honest.
 EXCLUDED = {
@@ -423,6 +436,7 @@ class Ctx:
     # = no target check (manual runs). bridge-deploy.sh always sets it.
     expect_bridge: str = ""
     served_by_required: bool = True
+    expected_git_sha: str = ""
 
     def headers(self, extra=None):
         h = dict(SMOKE_HEADERS)
@@ -835,10 +849,15 @@ def resolve_api_key() -> str:
 
 
 def run(base_url: str, profile: str, only: Optional[str], extra_header: dict, attempts: int,
-        expect_bridge: str = "", served_by_required: bool = True) -> list:
-    ctx = Ctx(base_url=base_url.rstrip("/"), api_key=resolve_api_key(), extra_header=extra_header,
-              expect_bridge=expect_bridge, served_by_required=served_by_required)
+        expect_bridge: str = "", served_by_required: bool = True, expected_git_sha: str = "", version_unproven: str = "") -> list:
     selected = [p for p in PROBES if (profile in p.profiles) and (only is None or p.name in only.split(","))]
+    if version_unproven:
+        if expected_git_sha:
+            raise ValueError("version_unproven and expected_git_sha are mutually exclusive")
+        selected = [p for p in selected if p.name != "version"]
+    api_key = resolve_api_key() if any(p.name != "version" for p in selected) else ""
+    ctx = Ctx(base_url=base_url.rstrip("/"), api_key=api_key, extra_header=extra_header,
+              expect_bridge=expect_bridge, served_by_required=served_by_required, expected_git_sha=expected_git_sha)
     results = []
     for p in selected:
         last = None
@@ -910,6 +929,10 @@ def partition_results(results: list) -> tuple:
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--base-url", required=True)
+    version = ap.add_mutually_exclusive_group()
+    version.add_argument("--version-unproven", default="", metavar="REASON",
+                         help="Report worker SHA UNPROVEN without probing version (no worker build)")
+    version.add_argument("--expected-git-sha", default="", help="Full deployed worker commit; required by version probe")
     ap.add_argument("--profile", default="hetzner", choices=["hetzner", "server2"])
     ap.add_argument("--only", default=None, help="run only these probes (comma-separated names)")
     ap.add_argument("--extra-header", action="append", default=[],
@@ -933,7 +956,10 @@ def main():
 
     results = run(args.base_url, args.profile, args.only, extra, args.attempts,
                   expect_bridge=args.expect_bridge.strip().lower(),
-                  served_by_required=not args.served_by_optional)
+                  served_by_required=not args.served_by_optional, expected_git_sha=args.expected_git_sha,
+                  version_unproven=args.version_unproven)
+    if args.version_unproven:
+        print(f"SMOKE_VERSION_UNPROVEN: worker SHA not proven: {args.version_unproven}")
     if not results:
         print(f"SMOKE_FAIL: no probes selected for profile={args.profile} only={args.only}", file=sys.stderr)
         sys.exit(2)
