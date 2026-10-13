@@ -119,6 +119,43 @@ class MessagesZaehler:
             raise RunError("anbieter_fehler") from None
 
 
+def pruefe_platz(wurzel: Path, settings: Path, *, uid=None, stat=os.stat, access=os.access) -> None:
+    """The CLI run starts only inside an isolated place (ACLIR P2). Before,
+    "isolation present" was concluded from the settings file existing, and
+    dedicated_uid:false was accepted: in the bridge's main container with a
+    stray settings file that left process group and hook, no own UID, no
+    egress proxy. Required now, each checked at start, loud on failure:
+
+    * not root — the place sweep (stop_uid_processes) kills every process of
+      this UID, which must be the place's alone;
+    * platz_wurzel belongs to this UID and is closed to group and others
+      (the place container: /arbeit/<platz>, mode 0700);
+    * the hook settings belong to root and this UID cannot write them, so the
+      model cannot loosen its own hook.
+    """
+    uid = os.getuid() if uid is None else uid
+    gruende = []
+    if uid == 0:
+        gruende.append("laeuft als root")
+    try:
+        info = stat(wurzel, follow_symlinks=False)
+    except OSError:
+        gruende.append(f"platz_wurzel {wurzel} fehlt")
+    else:
+        if info.st_uid != uid or info.st_mode & 0o077:
+            gruende.append(f"platz_wurzel {wurzel} gehoert nicht allein dieser UID")
+    try:
+        info = stat(settings)
+    except OSError:
+        gruende.append(f"settings {settings} fehlt")
+    else:
+        if info.st_uid != 0 or access(settings, os.W_OK):
+            gruende.append(f"settings {settings} nicht root-eigen oder fuer den Platz beschreibbar")
+    if gruende:
+        LOG.error("agentischer Lauf: kein isolierter Platz, Start abgebrochen: %s", "; ".join(gruende))
+        raise RunError("faehigkeit_nicht_verfuegbar")
+
+
 def verdrahte(konfig: dict):
     """Compose runtime and policy; every missing setting fails at start."""
     from . import http
@@ -127,6 +164,10 @@ def verdrahte(konfig: dict):
     from .runtime import Runtime
     from .storage import Storage
 
+    if konfig.get("dedicated_uid") is not True:
+        LOG.error("agentischer Lauf: dedicated_uid muss true sein (ACLIR P2), Start abgebrochen")
+        raise RunError("faehigkeit_nicht_verfuegbar")
+    pruefe_platz(Path(konfig["platz_wurzel"]), Path(konfig["settings"]))
     variable = konfig["zugang_variable"]
 
     def zugang():
@@ -140,8 +181,10 @@ def verdrahte(konfig: dict):
         befehl=list(konfig["befehl"]),
         settings=Path(konfig["settings"]),
         zugang_variable=konfig.get("cli_zugang_variable", "CLAUDE_CODE_OAUTH_TOKEN"),
-        dedicated_uid=bool(konfig["dedicated_uid"]),
+        dedicated_uid=True,
         max_bytes=int(konfig["max_bytes"]),
+        **({"max_strom_bytes": int(konfig["max_strom_bytes"])}
+           if "max_strom_bytes" in konfig else {}),
     )
     platz.bereit()
     zaehler = MessagesZaehler(konfig["zaehler_url"], zugang, oauth=bool(konfig["oauth"]))

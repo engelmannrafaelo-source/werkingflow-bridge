@@ -236,7 +236,7 @@ def konfig(tmp_path, **overrides):
         "platz_wurzel": str(tmp_path / "platz"),
         "befehl": ["claude"],
         "settings": str(settings),
-        "dedicated_uid": False,
+        "dedicated_uid": True,
         "max_bytes": 100000,
         "zugang_variable": "ACLI_TEST_ZUGANG",
         "zaehler_url": "http://127.0.0.1:9",
@@ -264,6 +264,9 @@ def server(monkeypatch, tmp_path):
             request.state.principal = principal["value"]
 
     monkeypatch.setattr(http, "authorized", authorized)
+    # Wiring tests run outside a place container; pruefe_platz has its own tests.
+    from src.agentischer_lauf import zulassung
+    monkeypatch.setattr(zulassung, "pruefe_platz", lambda *a, **k: None)
     monkeypatch.setattr(http, "_runtime", None)
     monkeypatch.setattr(http, "_admit", None)
     monkeypatch.setenv("ACLI_TEST_ZUGANG", "geheimer-zugang")
@@ -335,6 +338,8 @@ mode = os.environ["ACLI_KIND"]
 if mode == "enkel":
     child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
     open("enkel.pid", "w").write(str(child.pid))
+    if os.environ.get("ACLI_PIDDATEI"):
+        open(os.environ["ACLI_PIDDATEI"], "w").write(str(child.pid))
 if mode == "link":
     os.symlink("/etc/hostname", "ergebnis.txt")
 else:
@@ -351,7 +356,7 @@ for _ in range(1000 if mode in ("enkel", "lang") else 0):
 """
 
 
-def kind_platz(tmp_path, mode):
+def kind_platz(tmp_path, mode, **env):
     script = tmp_path / "kind.py"
     script.write_text(KIND)
     (tmp_path / "arbeit").mkdir()
@@ -360,7 +365,7 @@ def kind_platz(tmp_path, mode):
         befehl=[sys.executable, str(script)],
         settings=None,
         zugang_variable="ZUGANG_TEST",
-        zusatz_env={"ACLI_KIND": mode},
+        zusatz_env={"ACLI_KIND": mode, **env},
     )
 
 
@@ -503,3 +508,149 @@ async def test_real_cli_against_stand_in(tmp_path, szenario):
         assert result["grenze"]["ursache"] == "laufende_nutzung_ueber_budget"
         # Killed at the third answer (3 x 420 > 1000), long before max_turns=10.
         assert len(requests) == 3
+
+
+# --- ACLIR P1: the time limit kills the whole process group at once ---------
+
+
+def lebt(pid):
+    try:
+        state = (Path("/proc") / str(pid) / "stat").read_text().rsplit(")", 1)[1].split()[0]
+    except OSError:
+        return False
+    return state not in ("Z", "X")
+
+
+async def test_place_time_limit_kills_group_at_once(tmp_path):
+    """The child alone would tick for 10 s and its grandchild sleep 60 s:
+    grenze_zeit must end both right away, not wait for them to finish."""
+    pid_datei = tmp_path / "enkel.pid"
+    platz = kind_platz(tmp_path, "enkel", ACLI_PIDDATEI=str(pid_datei))
+    start = time.monotonic()
+    with pytest.raises(RunError) as caught:
+        await platz.lauf(auftrag(zeit_s=0.5), lambda line: None)
+    assert caught.value.code == "grenze_zeit"
+    assert time.monotonic() - start < 5
+    enkel = int(pid_datei.read_text())
+    frist = time.monotonic() + 2
+    while lebt(enkel) and time.monotonic() < frist:
+        time.sleep(0.05)
+    assert not lebt(enkel)
+    assert list((tmp_path / "arbeit").iterdir()) == []
+
+
+# --- ACLIR P3: the kept stream has a total bound -----------------------------
+
+
+async def test_place_stream_total_is_bounded(tmp_path):
+    platz = kind_platz(tmp_path, "lang")
+    platz.max_strom_bytes = 2000
+    with pytest.raises(RunError) as caught:
+        await platz.lauf(auftrag(), lambda line: None)
+    assert caught.value.code == "protokoll_unvollstaendig"
+    assert list((tmp_path / "arbeit").iterdir()) == []
+
+
+@pytest.mark.parametrize("value", [0, 64_000_001])
+def test_place_stream_bound_is_validated(tmp_path, value):
+    with pytest.raises(ValueError):
+        CliPlatz(tmp_path, befehl=["x"], settings=None, max_strom_bytes=value)
+
+
+# --- ACLIR P2: only a verified place starts ----------------------------------
+
+
+def test_gate2_requires_dedicated_uid(server, tmp_path):
+    with pytest.raises(RunError) as caught:
+        verdrahte(konfig(tmp_path, dedicated_uid=False))
+    assert caught.value.code == "faehigkeit_nicht_verfuegbar"
+
+
+def _stat(uid, mode):
+    from types import SimpleNamespace
+    return SimpleNamespace(st_uid=uid, st_mode=mode)
+
+
+def _platz_pruefung(wurzel, settings, *, uid=1101, schreibbar=False):
+    from src.agentischer_lauf.zulassung import pruefe_platz
+
+    infos = {"wurzel": wurzel, "settings": settings}
+
+    def stat(path, follow_symlinks=True):
+        info = infos["wurzel" if str(path) == "/arbeit/platz1" else "settings"]
+        if info is None:
+            raise FileNotFoundError(path)
+        return info
+
+    pruefe_platz(Path("/arbeit/platz1"), Path("/etc/erkunder/settings.json"), uid=uid,
+                 stat=stat, access=lambda path, mode: schreibbar)
+
+
+def test_place_check_accepts_the_place_container_layout():
+    _platz_pruefung(_stat(1101, 0o40700), _stat(0, 0o100644))
+
+
+@pytest.mark.parametrize("fall", [
+    dict(uid=0, wurzel=_stat(0, 0o40700)),
+    dict(wurzel=_stat(1000, 0o40700)),
+    dict(wurzel=_stat(1101, 0o40750)),
+    dict(wurzel=None),
+    dict(settings=_stat(1101, 0o100644)),
+    dict(schreibbar=True),
+    dict(settings=None),
+])
+def test_place_check_refuses_anything_else(fall, caplog):
+    args = dict(wurzel=_stat(1101, 0o40700), settings=_stat(0, 0o100644))
+    args.update(fall)
+    with pytest.raises(RunError) as caught:
+        _platz_pruefung(args.pop("wurzel"), args.pop("settings"), **args)
+    assert caught.value.code == "faehigkeit_nicht_verfuegbar"
+    assert "kein isolierter Platz" in caplog.text
+
+
+def test_place_check_on_this_host_refuses_a_plain_folder(tmp_path):
+    """Real stat: a test folder with a settings file the user owns is no place."""
+    from src.agentischer_lauf.zulassung import pruefe_platz
+
+    settings = tmp_path / "settings.json"
+    settings.write_text("{}")
+    with pytest.raises(RunError):
+        pruefe_platz(tmp_path, settings)
+
+
+# --- Bash runs in the CLI place, only a verified one --------------------------
+
+
+def _bash():
+    from src.agentischer_lauf.models import Tool
+    return [Tool(name="Bash", parameter={})]
+
+
+def test_bash_on_cli_needs_a_dedicated_place(tmp_path):
+    run = CliLauf(kind_platz(tmp_path, "kurz"), cli_modell="m", zugang=lambda: "x",
+                  zaehler=AsyncMock())
+    with pytest.raises(RunError) as caught:
+        run.werkzeuge(_bash())
+    assert caught.value.code == "faehigkeit_nicht_verfuegbar"
+    run.platz.dedicated_uid = True
+    assert run.werkzeuge(_bash()) == ["Bash"]
+
+
+def test_bash_in_the_cli_command_line(tmp_path):
+    platz = kind_platz(tmp_path, "kurz")
+    line = platz.befehlszeile(auftrag(werkzeuge=["Read", "Bash"]))
+    assert line[line.index("--tools") + 1] == "Read,Bash"
+    assert "Bash" not in line[line.index("--disallowedTools") + 1].split(",")
+
+
+def test_runtime_admits_bash_through_a_verified_cli_place(tmp_path):
+    platz = kind_platz(tmp_path, "kurz")
+    runtime, _ = cli_runtime(tmp_path, platz)
+    raw = cli_payload()
+    raw["agentischer_lauf"]["werkzeuge"].append({"name": "Bash", "parameter": {}})
+    body = ResearchRequest(**raw)
+    with pytest.raises(RunError) as caught:
+        runtime.preflight(body)
+    assert caught.value.code == "faehigkeit_nicht_verfuegbar"
+    platz.dedicated_uid = True
+    runtime.preflight(body)

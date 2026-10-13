@@ -48,7 +48,7 @@ Artefakt, `artefakt_integritaet` bei Links, Spezialdateien oder Übergröße.
 
 Die Vertragsnamen bleiben dieselben wie im Sandbox-Weg. Der Platz bildet sie
 auf CLI-Werkzeuge ab: `Read` → Read, Glob, Grep; `List` → Glob; `Write` →
-Write, Edit. Alles andere ist über `--tools` nicht verfügbar und zusätzlich
+Write, Edit; `Bash` → Bash, nur auf einem geprüften Platz (`dedicated_uid`). Alles andere ist über `--tools` nicht verfügbar und zusätzlich
 über `--disallowedTools` gesperrt.
 
 ## Isolation und Ablage
@@ -76,8 +76,21 @@ geprüft; danach wird der Ordner entfernt.
 - ausdrücklich gesetzte Grenzen innerhalb der Servermaxima
   (`max_zeit_s`, `max_tokens_gesamt`, `max_turns`, `max_tokens_je_antwort`).
 
+Gestartet wird nur auf einem isolierten Platz. Fehlt etwas davon, bricht der Start
+laut ab (`faehigkeit_nicht_verfuegbar`, Grund im Log):
+
+- `dedicated_uid` ist ausdrücklich `true`,
+- der Prozess läuft nicht als root,
+- `platz_wurzel` gehört dieser UID und ist für Gruppe und andere geschlossen,
+- die Hook-Settings gehören root, und der Platz kann sie nicht schreiben.
+
+Der gesammelte Zeilenstrom eines Laufs ist auf `max_strom_bytes` begrenzt
+(Vorgabe und Höchstwert 64 MB). Darüber endet der Lauf mit
+`protokoll_unvollstaendig`. Bei `grenze_zeit` wird die ganze Prozessgruppe sofort
+beendet, der Abbruch wartet nicht auf Kind oder Enkel.
+
 Felder der Konfiguration: `platz_wurzel`, `befehl`, `settings`,
 `dedicated_uid`, `max_bytes`, `zugang_variable` (Name der Umgebungsvariable mit
 dem Zugang), `cli_zugang_variable`, `zaehler_url`, `oauth`, `modelle`
 (Vertragsname → CLI-Modell), `werkzeuge`, die vier Maxima, `speicher`,
-`revision`, optional `geteilter_schluessel`.
+`revision`, optional `geteilter_schluessel` und `max_strom_bytes`.

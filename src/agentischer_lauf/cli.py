@@ -36,7 +36,15 @@ CLI_WERKZEUGE = {
     "Read": ("Read", "Glob", "Grep"),
     "List": ("Glob",),
     "Write": ("Write", "Edit"),
+    # Computation runs where the Erkunder computes today: inside the place
+    # (own UID, read-only image, egress only through its proxy). A fresh
+    # container per call (BashPlace) would need a Docker daemon the worker can
+    # reach, which is host root unless the daemon runs rootless (ABASHR
+    # condition 1, BRUMBAU 13.10.2026). Only on a verified place.
+    "Bash": ("Bash",),
 }
+# Werkzeuge that execute code: only where the place's own UID is the boundary.
+CLI_NUR_IM_PLATZ = frozenset({"Bash"})
 # Answers to an overloaded or rate-limited request; repeatable later.
 KAPAZITAET_STATUS = {429, 503, 529}
 
@@ -265,6 +273,8 @@ class CliLauf:
         names = []
         for tool in tools:
             if tool.name not in CLI_WERKZEUGE or tool.parameter != {}:
+                raise RunError("faehigkeit_nicht_verfuegbar")
+            if tool.name in CLI_NUR_IM_PLATZ and not self.platz.dedicated_uid:
                 raise RunError("faehigkeit_nicht_verfuegbar")
             names += [n for n in CLI_WERKZEUGE[tool.name] if n not in names]
         return names

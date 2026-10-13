@@ -53,6 +53,10 @@ DURCHGEREICHT = {
     "no_proxy",
 }
 ZEILE_MAX = 16_000_000
+# Whole stream kept per run (ACLIR P3): lines are held until the run ends, so
+# without a total a run could gather 16 MB lines until its time limit — past
+# the 2 GB per process the server allows. Beyond it the run ends loudly.
+STROM_MAX = 64_000_000
 
 
 @dataclass
@@ -88,6 +92,7 @@ class CliPlatz:
         zusatz_env: dict[str, str] | None = None,
         dedicated_uid: bool = False,
         max_bytes: int = 5_000_000,
+        max_strom_bytes: int = STROM_MAX,
     ):
         self.root = Path(root)
         self.befehl = list(befehl)
@@ -96,6 +101,9 @@ class CliPlatz:
         self.zusatz_env = dict(zusatz_env or {})
         self.dedicated_uid = dedicated_uid
         self.max_bytes = max_bytes
+        if not 0 < max_strom_bytes <= STROM_MAX:
+            raise ValueError("invalid stream limit")
+        self.max_strom_bytes = max_strom_bytes
         self.lock = asyncio.Lock()
 
     def bereit(self) -> None:
@@ -206,6 +214,7 @@ class CliPlatz:
                 await process.stdin.drain()
                 process.stdin.close()
                 ende = time.monotonic() + auftrag.zeit_s
+                strom_bytes = 0
                 while True:
                     rest = ende - time.monotonic()
                     if rest <= 0:
@@ -218,6 +227,9 @@ class CliPlatz:
                         raise RunError("protokoll_unvollstaendig") from None
                     if not raw:
                         break
+                    strom_bytes += len(raw)
+                    if strom_bytes > self.max_strom_bytes:
+                        raise RunError("protokoll_unvollstaendig")
                     try:
                         line = json.loads(raw)
                     except ValueError:

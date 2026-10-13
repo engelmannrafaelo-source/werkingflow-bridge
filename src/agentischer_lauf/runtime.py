@@ -104,10 +104,17 @@ class Runtime:
         for model, tools in [(request.model, run.werkzeuge)] + (
             [(run.pruefung.model, run.pruefung.werkzeuge)] if run.pruefung else []
         ):
-            self.adapters.require(model)
+            adapter = self.adapters.require(model)
             Sandbox.validate_tools(tools)
-            if any(t.name == "Bash" for t in tools) and self.bash is None:
-                raise RunError("faehigkeit_nicht_verfuegbar")
+            if any(t.name == "Bash" for t in tools):
+                from .cli import CliLauf
+
+                if isinstance(adapter, CliLauf):
+                    # The CLI place runs Bash itself; CliLauf.werkzeuge admits
+                    # it only on a verified place.
+                    adapter.werkzeuge(tools)
+                elif self.bash is None:
+                    raise RunError("faehigkeit_nicht_verfuegbar")
         if sum(m.bytes for m in run.material) > self.max_bytes:
             raise RunError("auftrag_ungueltig")
         if any(m.quelle.art == "verweis" for m in run.material) and self.material_resolver is None:
