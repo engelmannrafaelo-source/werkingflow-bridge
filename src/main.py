@@ -107,7 +107,7 @@ from src.jobs.executors import (
     erkunder_executor,
 )
 from src.stream_start import event_stream_response  # noqa: E402
-from src.research_instructions import caller_instructions, research_privacy_options
+from src.research_instructions import caller_instructions, caller_literatur_planer, research_privacy_options
 from src.parameter_validator import ParameterValidator, CompatibilityReporter
 from src.model_registry import (
     get_models_for_api,
@@ -5694,6 +5694,31 @@ USAGE_FEHLT_CLI = "cli_ohne_usage"
 USAGE_FEHLT_RESEARCH_CLOUD = "research_cloud_fehler"
 
 
+async def _literatur_schicht(request, request_body, query: str, attribution_ctx):
+    """(block, status) of the caller-owned literature layer, (None, None) when
+    the request names no literatur_planer. The run never fails because of it;
+    a layer that did not run says why (ResearchResponse.literatur)."""
+    planer = caller_literatur_planer(request_body)
+    if planer is None:
+        return None, None
+    from src.literatur import literatur_kontext, nicht_aktiv_grund
+    from src.research_cloud.anonymize_gate import anonymize_query_for_cloud
+    grund = nicht_aktiv_grund(getattr(request_body, "research_mode", None))
+    if grund is not None:
+        return None, {"status": "uebersprungen", "grund": grund}
+    block, status = await literatur_kontext(
+        query,
+        planer=planer,
+        # Search terms leave for OpenAlex/CORE: the same gate as perplexity_search.
+        anonymize=lambda text: anonymize_query_for_cloud(
+            request, text, **research_privacy_options(request_body)),
+        attribution=attribution_ctx,
+        model=request_body.model,
+    )
+    logger.info(f"📚 Literaturschicht: {status}")
+    return block, status
+
+
 async def _execute_research_impl(
     request_body: ResearchRequest,
     backend_config: Optional[BackendConfig],
@@ -5730,6 +5755,7 @@ async def _execute_research_impl(
     from src.research_laufzeit import Laufzeit
     laufzeit = Laufzeit.fuer_anfrage(request)
     nachkontrolle = None
+    literatur_status = None  # ResearchResponse.literatur, only with literatur_planer
 
     try:
         logger.info(
@@ -5776,6 +5802,12 @@ async def _execute_research_impl(
                     logger.info("📚 OA-Literatur-Kontext injiziert", extra={"chars": len(oa_block)})
         except Exception as _oa_err:  # Research darf NIE an dieser Zusatzschicht scheitern
             logger.warning(f"⚠️ OA-Scholarly-Schicht übersprungen (fail-soft): {_oa_err}")
+        # Caller-owned literature layer (BRAUS F19): the caller's planner, the
+        # Bridge's neutral retrieval; its outcome goes into the response.
+        literatur_block, literatur_status = await _literatur_schicht(
+            request, request_body, request_body.query, attribution_ctx)
+        if literatur_block:
+            research_prompt += "\n\n" + literatur_block
 
         # Kuratierte Normenbibliothek auf dem Abo-Pool-Weg (Karte k20, Rafael
         # 07.09.2026, Weg a). Der Cloud-Executor reicht sie dem Modell als
@@ -6488,6 +6520,7 @@ async def _execute_research_impl(
             antwort_ende=research_antwort_ende,
             nachkontrolle=nachkontrolle.status() if nachkontrolle is not None else None,
             laufzeit=laufzeit.details(),
+            **({"literatur": literatur_status} if literatur_status is not None else {}),
             **_research_usage_felder(
                 accumulated_input_tokens, accumulated_output_tokens,
                 accumulated_cache_creation, accumulated_cache_read, USAGE_FEHLT_CLI,
@@ -6586,6 +6619,7 @@ async def _execute_research_impl(
             fehler_code=getattr(e, "fehler_code", None),
             nachkontrolle=nachkontrolle.status() if nachkontrolle is not None else None,
             laufzeit=laufzeit.details(),
+            **({"literatur": literatur_status} if literatur_status is not None else {}),
             # The raiser's own verdict (error_contract rule 1), e.g. CliApiError:
             # a 400 from the API stays final, a 529 may be asked again.
             **_eigenes_urteil(e),
@@ -6704,6 +6738,12 @@ async def _execute_research_cloud_impl(
                 prompt += "\n\n" + oa_block
     except Exception as _oa_err:
         logger.warning(f"research-cloud: OA-Scholarly-Schicht übersprungen (fail-soft): {_oa_err}")
+    # Caller-owned literature layer (BRAUS F19), planned from the anonymized query.
+    literatur_block, literatur_status = await _literatur_schicht(
+        request, request_body, anonymized_query, attribution_ctx)
+    if literatur_block:
+        prompt += "\n\n" + literatur_block
+    literatur_feld = {"literatur": literatur_status} if literatur_status is not None else {}
 
     library_cfg = load_library_config()
     # Resolve the library BEFORE the first token is spent: this both loads the
@@ -6839,6 +6879,7 @@ async def _execute_research_cloud_impl(
             # The executor raises without the usage of the rounds before the
             # failure; the ledger row above books 0 for the same reason.
             usage_fehlt=USAGE_FEHLT_RESEARCH_CLOUD,
+            **literatur_feld,
         )
 
     # The acceptance point on what the executor returned, too: whatever path
@@ -6946,6 +6987,7 @@ async def _execute_research_cloud_impl(
         antwort_ende=result.stop_reason,
         nachkontrolle=abgewaehlt_nk.status() if abgewaehlt_nk is not None else None,
         **_cloud_usage_felder(result.usage),
+        **literatur_feld,
     )
 
 

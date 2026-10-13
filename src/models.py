@@ -485,6 +485,13 @@ class ResearchRequest(BaseModel):
                      "The app owns review and follow-up calls. Omit for legacy compatibility."),
     )
 
+    literatur_planer: Optional[str] = Field(
+        default=None, min_length=1, pattern=r"\S", strict=True,
+        description=("Caller-owned instruction for planning open-access literature search terms "
+                     "(answer: JSON array of strings). Only with research_instructions and "
+                     "research_mode='academic'; the outcome is reported in ResearchResponse.literatur."),
+    )
+
     privacy_allowlist: Optional[List[Annotated[str, Field(strict=True, min_length=1, pattern=r"\S")]]] = Field(
         default=None,
         description="Caller-owned exact terms exempt from name/location masking. "
@@ -516,6 +523,15 @@ class ResearchRequest(BaseModel):
 
     agentischer_lauf: Optional[AgentischerLauf] = None
     _agentischer_vertrag = model_validator(mode="before")(validate_request)
+
+    @model_validator(mode="after")
+    def _literatur_planer_braucht_anweisungen(self):
+        # The legacy request keeps its frozen planner (compat); a caller
+        # planner without the caller's own research policy has no owner for
+        # what the material is for.
+        if self.literatur_planer is not None and self.research_instructions is None:
+            raise ValueError("literatur_planer requires research_instructions")
+        return self
 
     # SuperClaude Research Depth
     depth: Optional[Literal["quick", "standard", "deep", "exhaustive"]] = Field(
@@ -718,6 +734,9 @@ class ResearchResponse(ErrorVerdictFields):
     Returns both container and host file paths, plus execution metadata.
     """
     herkunft: Optional[Dict[str, Any]] = None
+    # Only when the request named literatur_planer: {"status": "eingefuegt",
+    # "quellen", "suchbegriffe"} or {"status": "uebersprungen", "grund"}.
+    literatur: Optional[Dict[str, Any]] = None
     # usage: one field for both paths, declared with usage_fehlt below.
     grenze: Optional[Dict[str, Any]] = None
     werkzeugaufrufe: Optional[Dict[str, Any]] = None
@@ -732,7 +751,7 @@ class ResearchResponse(ErrorVerdictFields):
         # Keep their existing JSON shape while preserving explicitly set data.
         # usage is not among them: research reports it (or usage_fehlt) on
         # every answer since RUSAGE.
-        for name in ("herkunft", "grenze", "werkzeugaufrufe", "artefakte",
+        for name in ("herkunft", "literatur", "grenze", "werkzeugaufrufe", "artefakte",
                      "pruefung", "diagnose_ref"):
             if name not in self.model_fields_set:
                 result.pop(name, None)

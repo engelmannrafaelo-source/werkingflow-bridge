@@ -166,6 +166,7 @@ def validate_request(values):
     forbidden = {
         "research_mode",
         "research_instructions",
+        "literatur_planer",
         "privacy_allowlist",
         "depth",
         "strategy",
