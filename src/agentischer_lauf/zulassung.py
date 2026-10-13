@@ -168,9 +168,15 @@ def laufrevision(konfig: dict) -> str:
     try:
         sha = read_version().git_sha
     except METADATA_ERRORS as exc:
+        # A hand build without GIT_COMMIT carries git_sha "unknown"
+        # (compose default ${GIT_COMMIT:-unknown}): the whole worker then does
+        # not start while AGENTISCHER_LAUF_KONFIG is set. Say how to fix it.
         LOG.error(
-            "agentischer Lauf: keine Build-Metadaten fuer die Laufrevision (%s: %s), "
-            "Start abgebrochen",
+            "agentischer Lauf: keine gueltige Build-Revision in "
+            "src/build-metadata.json (%s: %s), Start abgebrochen. Das Image mit "
+            "GIT_COMMIT=$(git rev-parse HEAD) bauen (scripts/bridge-deploy.sh "
+            "setzt es) oder AGENTISCHER_LAUF_KONFIG fuer diesen Worker weglassen; "
+            "solange beides fehlt, startet der Worker nicht.",
             type(exc).__name__, exc,
         )
         raise RunError("faehigkeit_nicht_verfuegbar") from None

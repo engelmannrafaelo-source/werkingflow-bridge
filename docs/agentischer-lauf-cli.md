@@ -98,6 +98,11 @@ optional `revision`, `geteilter_schluessel` und `max_strom_bytes`.
 `herkunft.bridge_revision` jedes Laufs ist der `git_sha` der Build-Metadaten
 des Images, also derselbe Wert, den `GET /v1/version` meldet. Ein Aufrufer
 kann beides gegen die Revision prüfen, die er freigegeben hat. Fehlen die
-Build-Metadaten, bricht der Start laut ab. `revision` in der Konfiguration ist
-nur eine Gegenprobe: Ein anderer Wert als der `git_sha` bricht den Start
+Build-Metadaten, bricht der Start laut ab. Das betrifft auch ein Image, das
+von Hand ohne `GIT_COMMIT` gebaut wurde (`git_sha: "unknown"`): Ist dort
+`AGENTISCHER_LAUF_KONFIG` gesetzt, startet der **ganze Worker** nicht, also
+auch Chat und Research. Abhilfe: mit `GIT_COMMIT=$(git rev-parse HEAD)` bauen,
+wie `scripts/bridge-deploy.sh` es tut, oder die Konfig für diesen Worker weglassen.
+`revision` in der Konfiguration ist nur eine Gegenprobe: Ein anderer Wert
+als der volle `git_sha`, auch ein Kurz-SHA desselben Commits, bricht den Start
 ebenfalls laut ab (`faehigkeit_nicht_verfuegbar`, Grund im Log).

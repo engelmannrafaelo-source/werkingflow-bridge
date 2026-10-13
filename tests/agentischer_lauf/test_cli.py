@@ -360,11 +360,21 @@ def test_gate2_gleiche_konfig_revision_ist_zulaessig(server, tmp_path):
     assert runtime.revision == REVISION
 
 
-def test_gate2_abweichende_konfig_revision_bricht_start_ab(server, tmp_path, caplog):
+@pytest.mark.parametrize("angegeben", [
+    "test",
+    # The operating case behind D1: a short SHA of the right commit is still
+    # another value (BRUMBAU3R P3-D2, mutant D6).
+    REVISION[:7],
+    REVISION[:39],
+    REVISION.upper(),
+])
+def test_gate2_abweichende_konfig_revision_bricht_start_ab(
+    server, tmp_path, caplog, angegeben
+):
     with pytest.raises(RunError) as caught:
-        verdrahte(konfig(tmp_path, revision="test"))
+        verdrahte(konfig(tmp_path, revision=angegeben))
     assert caught.value.code == "faehigkeit_nicht_verfuegbar"
-    assert "test" in caplog.text and REVISION in caplog.text
+    assert repr(angegeben) in caplog.text and REVISION in caplog.text
     assert http._runtime is None
 
 
@@ -381,6 +391,23 @@ def test_gate2_ohne_build_metadaten_bricht_start_ab(
         verdrahte(konfig(tmp_path))
     assert caught.value.code == "faehigkeit_nicht_verfuegbar"
     assert "build-metadata.json" in caplog.text
+    assert http._runtime is None
+
+
+def test_gate2_handbau_ohne_git_commit_sagt_was_zu_tun_ist(
+    server, tmp_path, monkeypatch, caplog
+):
+    """BRUMBAU3R P3-D1: git_sha "unknown" (no GIT_COMMIT at build) stops the
+    start, and the log names the fix."""
+    from src.agentischer_lauf import zulassung
+
+    monkeypatch.setattr(zulassung, "read_version", lambda: version_von("unknown"),
+                        raising=False)
+    with pytest.raises(RunError) as caught:
+        verdrahte(konfig(tmp_path))
+    assert caught.value.code == "faehigkeit_nicht_verfuegbar"
+    assert "GIT_COMMIT=$(git rev-parse HEAD)" in caplog.text
+    assert "startet der Worker nicht" in caplog.text
     assert http._runtime is None
 
 
