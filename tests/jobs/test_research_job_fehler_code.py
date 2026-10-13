@@ -269,6 +269,58 @@ async def test_alte_platform_api_verwirft_felder_laut(caplog):
     assert "teilantwort" in zeile["message"] and "teilantwort=" not in zeile["message"]
 
 
+async def test_zweitschreibung_behaelt_jede_ursache():
+    """The second write (platform-api without BRTRUNC2N, 204 without echo)
+    carries every cause field of the first one unchanged. A platform-api from
+    JOBENDE stores details and usage, and the second write updates the same
+    row: dropping a field there loses what the first write kept (BRUMBAU2R
+    P2-1, mutant M6)."""
+    calls = []
+
+    async def fake_call(method, path, json=None, timeout_s=None):
+        calls.append(json)
+        return _Resp(204)
+
+    ursache = {
+        "details": {"fehler_code": "antwort_abgeschnitten",
+                    "antwort_ende": "max_tokens", "session_id": "s1"},
+        "usage": {"input_tokens": 1, "output_tokens": 2},
+        "teilantwort": "Teil",
+        "diagnose_ref": "diag-1",
+    }
+    with patch.object(store_client, "call_platform", fake_call):
+        await store_client.mark_error(
+            "j-zweit", "m", code="EXECUTOR_ERROR", retryable=False,
+            details=ursache["details"], teilantwort=ursache["teilantwort"],
+            diagnose_ref=ursache["diagnose_ref"], usage=ursache["usage"],
+        )
+    assert len(calls) == 2
+    erste, zweite = calls
+    for name, wert in ursache.items():
+        assert erste[name] == wert, name
+        assert zweite[name] == wert, name
+    assert "ursache_bestaetigen" not in zweite
+    assert {k: v for k, v in zweite.items() if k != "message"} == {
+        k: v for k, v in erste.items() if k not in ("message", "ursache_bestaetigen")
+    }
+
+
+async def test_zweitschreibung_behaelt_usage_fehlt():
+    calls = []
+
+    async def fake_call(method, path, json=None, timeout_s=None):
+        calls.append(json)
+        return _Resp(204)
+
+    with patch.object(store_client, "call_platform", fake_call):
+        await store_client.mark_error(
+            "j-zweit-uf", "m", code="EXECUTOR_ERROR", retryable=False,
+            usage_fehlt="nicht_gemessen",
+        )
+    assert len(calls) == 2
+    assert calls[-1]["usage_fehlt"] == "nicht_gemessen"
+
+
 async def test_bestaetigung_unvollstaendig_ist_laut(caplog):
     calls = []
 
