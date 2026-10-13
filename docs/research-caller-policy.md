@@ -54,11 +54,14 @@ belongs in `research_instructions`.
 
 The run never fails because of the layer, but its outcome is reported:
 `ResearchResponse.literatur` is `{"status": "eingefuegt", "quellen",
-"suchbegriffe"}` or `{"status": "uebersprungen", "grund"}`. Possible reasons:
+"suchbegriffe"}` (with `suchbegriffe_verworfen` when the planner named more
+than 14 terms) or `{"status": "uebersprungen", "grund"}`. Possible reasons:
 `schicht_aus`, `research_mode_nicht_academic`, `profil_light`,
-`keine_suchbegriffe`, `anonymisierung_gescheitert`, `keine_quellen`,
-`zeitbudget`, `fehler: <Typ>`. Without `literatur_planer` the field is absent
-and no literature is fetched.
+`keine_suchbegriffe`, `planer_gescheitert` (with `ursache`; the Bridge does
+not search with a substitute then), `anonymisierung_gescheitert`,
+`keine_quellen`, `zeitbudget`, `fehler: <Typ>`. The field comes with every
+answer after the layer ran, error answers included. Without
+`literatur_planer` the field is absent and no literature is fetched.
 
 The legacy Energy planner prompt and context header are frozen in
 `compat/scholarly.py` on top of the same mechanism; `scholarly.py` is only its

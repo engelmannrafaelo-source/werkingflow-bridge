@@ -365,11 +365,23 @@ KOPF = (
 )
 
 
-async def plan_queries(query: str, planer: str, attribution: Optional[Dict[str, Any]],
-                       model: Optional[str]) -> List[str]:
-    """Search terms for ``query`` by a model following ``planer``; the answer
-    must be a JSON array of strings. Fail-soft: [query[:180]]."""
-    fallback = [query.strip()[:180]] if query.strip() else []
+#: Search terms used per request; more planned terms are counted, not sent.
+MAX_SUCHBEGRIFFE = 14
+
+
+class PlanerGescheitert(Exception):
+    """The planner gave no usable answer; ``ursache`` names how."""
+
+    def __init__(self, ursache: str):
+        super().__init__(ursache)
+        self.ursache = ursache
+
+
+async def _plane(query: str, planer: str, attribution: Optional[Dict[str, Any]],
+                 model: Optional[str]) -> List[str]:
+    """Search terms for ``query`` by a model following ``planer``, exactly as
+    planned (possibly none). No substitute: a failed call or an answer
+    without a JSON array of strings raises PlanerGescheitert."""
     try:
         from src.jobs.executors import _self_post_json
         body = {
@@ -382,12 +394,29 @@ async def plan_queries(query: str, planer: str, attribution: Optional[Dict[str, 
         }
         data = await _self_post_json("/v1/chat/completions", body, attribution, 60.0)
         content = data["choices"][0]["message"]["content"]
-        m = re.search(r"\[.*\]", content, re.DOTALL)
-        queries = [q.strip() for q in json.loads(m.group(0)) if isinstance(q, str) and q.strip()]
-        return queries[:14] or fallback
     except Exception as e:
-        logger.warning(f"scholarly planner fiel auf raw-query zurück: {type(e).__name__}: {e}")
+        raise PlanerGescheitert(f"aufruf: {type(e).__name__}") from e
+    m = re.search(r"\[.*\]", content, re.DOTALL) if isinstance(content, str) else None
+    try:
+        geplant = json.loads(m.group(0)) if m else None
+    except ValueError:
+        geplant = None
+    if not isinstance(geplant, list):
+        raise PlanerGescheitert("antwort_ohne_json_array")
+    return [q.strip() for q in geplant if isinstance(q, str) and q.strip()]
+
+
+async def plan_queries(query: str, planer: str, attribution: Optional[Dict[str, Any]],
+                       model: Optional[str]) -> List[str]:
+    """Legacy planner (compat/scholarly.py) only. Fail-soft: [query[:180]].
+    The caller-owned layer (literatur_kontext) never falls back."""
+    fallback = [query.strip()[:180]] if query.strip() else []
+    try:
+        queries = await _plane(query, planer, attribution, model)
+    except PlanerGescheitert as e:
+        logger.warning(f"scholarly planner fiel auf raw-query zurück: {e.ursache}")
         return fallback
+    return queries[:MAX_SUCHBEGRIFFE] or fallback
 
 
 async def literatur_kontext(
@@ -404,14 +433,27 @@ async def literatur_kontext(
 
     Every planned search term passes ``anonymize`` (the research privacy
     gate) before it leaves for OpenAlex/CORE; a refused term ends the layer,
-    nothing unchecked is sent. The run never fails because of this layer, but
-    its outcome is reported: ``{"status": "eingefuegt", "quellen": n}`` or
-    ``{"status": "uebersprungen", "grund": ...}`` (ResearchResponse.literatur).
+    nothing unchecked is sent. WHAT to search for is the caller's: when its
+    planner fails, the layer ends (``planer_gescheitert``) instead of searching
+    with a substitute. The run never fails because of this layer, but its
+    outcome is reported: ``{"status": "eingefuegt", "quellen": n,
+    "suchbegriffe": k}`` (plus ``suchbegriffe_verworfen`` when the planner
+    named more than MAX_SUCHBEGRIFFE) or ``{"status": "uebersprungen",
+    "grund": ...}`` (ResearchResponse.literatur).
     """
     async def _run() -> Tuple[str, Dict[str, Any]]:
-        queries = await plan_queries(query, planer, attribution, model)
-        if not queries:
+        if not query.strip():
             return "", {"status": "uebersprungen", "grund": "keine_suchbegriffe"}
+        try:
+            geplant = await _plane(query, planer, attribution, model)
+        except PlanerGescheitert as e:
+            logger.warning(
+                f"Literaturschicht: Planer des Aufrufers gescheitert: {e.ursache}")
+            return "", {"status": "uebersprungen", "grund": "planer_gescheitert",
+                        "ursache": e.ursache}
+        if not geplant:
+            return "", {"status": "uebersprungen", "grund": "keine_suchbegriffe"}
+        queries = geplant[:MAX_SUCHBEGRIFFE]
         try:
             geprueft = [await anonymize(q) for q in queries]
         except Exception as e:
@@ -420,7 +462,10 @@ async def literatur_kontext(
         bloecke, n = await asyncio.to_thread(quellen_bloecke, geprueft, per_query)
         if not n:
             return "", {"status": "uebersprungen", "grund": "keine_quellen"}
-        return KOPF + bloecke, {"status": "eingefuegt", "quellen": n, "suchbegriffe": len(geprueft)}
+        status = {"status": "eingefuegt", "quellen": n, "suchbegriffe": len(geprueft)}
+        if len(geplant) > len(queries):
+            status["suchbegriffe_verworfen"] = len(geplant) - len(queries)
+        return KOPF + bloecke, status
 
     try:
         return await asyncio.wait_for(_run(), timeout=overall_timeout)

@@ -94,6 +94,101 @@ async def test_no_sources_is_said(monkeypatch):
     assert block == "" and status == {"status": "uebersprungen", "grund": "keine_quellen"}
 
 
+# --- BRUMBAU3R P2-1: the caller's planner or nothing ------------------------------
+
+@pytest.mark.parametrize("antwort,ursache", [
+    (RuntimeError("bridge down"), "aufruf: RuntimeError"),
+    ({"choices": []}, "aufruf: IndexError"),
+    ({"choices": [{"message": {"content": "no array"}}]}, "antwort_ohne_json_array"),
+    ({"choices": [{"message": {"content": "[not json"}}]}, "antwort_ohne_json_array"),
+    ({"choices": [{"message": {"content": None}}]}, "antwort_ohne_json_array"),
+])
+async def test_failed_planner_is_named_and_nothing_is_searched(
+        monkeypatch, antwort, ursache):
+    async def self_post(path, body, attribution, timeout):
+        if isinstance(antwort, Exception):
+            raise antwort
+        return antwort
+
+    monkeypatch.setattr("src.jobs.executors._self_post_json", self_post)
+    fetched = MagicMock(return_value=("### A", 1))
+    monkeypatch.setattr(literatur, "quellen_bloecke", fetched)
+    anonymize = AsyncMock(side_effect=lambda t: t)
+    block, status = await literatur.literatur_kontext("Question " * 40, planer=PLANER,
+                                                      anonymize=anonymize)
+    assert block == ""
+    assert status == {"status": "uebersprungen", "grund": "planer_gescheitert",
+                      "ursache": ursache}
+    # No substitute search with the raw question.
+    fetched.assert_not_called()
+    anonymize.assert_not_called()
+
+
+async def test_empty_plan_is_keine_suchbegriffe(monkeypatch):
+    block, status, _, fetched, _ = await _kontext(monkeypatch, planned=[" ", ""])
+    assert block == ""
+    assert status == {"status": "uebersprungen", "grund": "keine_suchbegriffe"}
+    fetched.assert_not_called()
+
+
+async def test_blank_question_plans_nothing(monkeypatch):
+    called = AsyncMock()
+    monkeypatch.setattr("src.jobs.executors._self_post_json", called)
+    block, status = await literatur.literatur_kontext(
+        "  ", planer=PLANER, anonymize=AsyncMock())
+    assert status == {"status": "uebersprungen", "grund": "keine_suchbegriffe"}
+    called.assert_not_called()
+
+
+async def test_terms_over_the_limit_are_counted(monkeypatch):
+    planned = [f"t{i}" for i in range(literatur.MAX_SUCHBEGRIFFE + 3)]
+    block, status, _, fetched, _ = await _kontext(monkeypatch, planned=planned)
+    assert len(fetched.call_args.args[0]) == literatur.MAX_SUCHBEGRIFFE
+    assert status == {"status": "eingefuegt", "quellen": 1,
+                      "suchbegriffe": literatur.MAX_SUCHBEGRIFFE,
+                      "suchbegriffe_verworfen": 3}
+
+
+async def test_legacy_planner_keeps_its_raw_query_fallback(monkeypatch):
+    """The frozen legacy path is unchanged: it still falls back."""
+    from src.compat import scholarly as legacy
+
+    async def self_post(path, body, attribution, timeout):
+        raise RuntimeError("down")
+
+    monkeypatch.setattr("src.jobs.executors._self_post_json", self_post)
+    assert await legacy._plan_queries("Question", None, None) == ["Question"]
+
+
+# --- BRUMBAU3R P3-1: the remaining reasons -------------------------------------------
+
+async def test_time_budget_is_its_own_reason(monkeypatch):
+    import asyncio
+
+    async def self_post(path, body, attribution, timeout):
+        await asyncio.sleep(5)
+
+    monkeypatch.setattr("src.jobs.executors._self_post_json", self_post)
+    block, status = await literatur.literatur_kontext(
+        "Question", planer=PLANER, anonymize=AsyncMock(), overall_timeout=0.05)
+    assert block == "" and status == {"status": "uebersprungen", "grund": "zeitbudget"}
+
+
+async def test_unexpected_error_names_its_type(monkeypatch):
+    def kaputt(queries, per_query):
+        raise KeyError("x")
+
+    async def self_post(path, body, attribution, timeout):
+        return {"choices": [{"message": {"content": "[\"t\"]"}}]}
+
+    monkeypatch.setattr("src.jobs.executors._self_post_json", self_post)
+    monkeypatch.setattr(literatur, "quellen_bloecke", kaputt)
+    block, status = await literatur.literatur_kontext(
+        "Question", planer=PLANER, anonymize=AsyncMock(side_effect=lambda t: t))
+    assert block == ""
+    assert status == {"status": "uebersprungen", "grund": "fehler: KeyError"}
+
+
 @pytest.mark.parametrize("env,mode,grund", [
     ({"BRIDGE_SCHOLARLY_ENABLED": "false"}, "academic", "schicht_aus"),
     ({"BRIDGE_SCHOLARLY_ENABLED": "true", "BRIDGE_SCHOLARLY_PROFILE": "full"}, "standard",
@@ -122,7 +217,13 @@ async def test_legacy_planner_and_header_unchanged(monkeypatch):
     assert await legacy._plan_queries("Question", None, None) == ["q"]
     assert sent["body"]["messages"][0]["content"] == legacy._PLANNER_SYS
     monkeypatch.setattr(legacy, "quellen_bloecke", lambda q, n: ("### A", 1))
-    assert legacy._retrieve_and_format(["q"], 12).startswith("## VERIFIZIERTE OA-LITERATUR")
+    # The whole legacy header, pinned: sha256 of develop 6b924c3's header
+    # (src/scholarly.py) followed by the block "### A" (BRUMBAU3R P3-1, M14).
+    import hashlib
+    block = legacy._retrieve_and_format(["q"], 12)
+    assert block.startswith("## VERIFIZIERTE OA-LITERATUR") and block.endswith("### A")
+    assert hashlib.sha256(block.encode()).hexdigest() == (
+        "323db9b25ac8ec91f0253ea2e9f290769e6c84c1154714de8684e8fa0adcc8b9")
     monkeypatch.setattr(legacy, "quellen_bloecke", lambda q, n: ("", 0))
     assert legacy._retrieve_and_format(["q"], 12) == ""
 
@@ -234,3 +335,102 @@ async def test_pool_path_injects_the_callers_literature(spy_cli, persist, monkey
     assert captured["prompt"].endswith(literatur.KOPF + "### Pool")
     assert result.status == "success", result.error
     assert result.literatur == status
+
+
+# --- BRUMBAU3R P2-2: the status comes with error answers too ------------------------
+
+LIT_STATUS = {"status": "eingefuegt", "quellen": 1, "suchbegriffe": 1}
+
+
+def _lit_env(monkeypatch):
+    monkeypatch.setenv("BRIDGE_SCHOLARLY_ENABLED", "true")
+    monkeypatch.setenv("BRIDGE_SCHOLARLY_PROFILE", "full")
+    return patch("src.literatur.literatur_kontext",
+                 new=AsyncMock(return_value=(literatur.KOPF + "### A",
+                                             dict(LIT_STATUS))))
+
+
+async def test_cloud_unusable_library_keeps_the_literature_status(monkeypatch):
+    from src.research_cloud.library import LibraryUnavailableError
+
+    req = _make_req(research_instructions="App rules", research_mode="academic",
+                    literatur_planer=PLANER)
+    with _lit_env(monkeypatch), \
+         patch("src.research_cloud.anonymize_gate.anonymize_query_for_cloud",
+               new=AsyncMock(side_effect=["safe query", "safe instruction"])), \
+         patch("src.research_cloud.library.load_library_for_run",
+               new=AsyncMock(side_effect=LibraryUnavailableError("kaputt"))), \
+         patch("src.research_cloud.executor.run_research_cloud",
+               new=AsyncMock()) as executor:
+        result = await src.main._execute_research_cloud_impl(
+            MagicMock(), req, attribution_ctx={})
+    executor.assert_not_awaited()
+    assert result.status == "error" and "Bibliothek" in result.error
+    assert result.literatur == LIT_STATUS
+    assert json.loads(result.model_dump_json())["literatur"] == LIT_STATUS
+
+
+async def test_cloud_model_stop_keeps_the_literature_status(monkeypatch):
+    from src.lauf_abschluss import abschluss_aus_stop_reason
+    from src.research_cloud.executor import ResearchCloudModelAbbruch
+    from src.research_cloud.models import ResearchCloudUsage
+
+    req = _make_req(research_instructions="App rules", research_mode="academic",
+                    literatur_planer=PLANER)
+    abbruch = ResearchCloudModelAbbruch(
+        "stopped", usage=ResearchCloudUsage(),
+        abschluss=abschluss_aus_stop_reason("refusal", category=None))
+    a, b, c = _cloud_patches(["safe query", "safe instruction"])
+    with a, b, c, _lit_env(monkeypatch), \
+         patch("src.research_cloud.executor.run_research_cloud",
+               new=AsyncMock(side_effect=abbruch)):
+        result = await src.main._execute_research_cloud_impl(
+            MagicMock(), req, attribution_ctx={})
+    assert result.status == "error"
+    assert result.literatur == LIT_STATUS
+
+
+async def test_pool_unusable_library_keeps_the_literature_status(
+        spy_cli, persist, monkeypatch):
+    from src.research_cloud.library import LibraryUnavailableError
+
+    spy, _, _ = spy_cli
+    req = _pool_req()
+    req.research_instructions = "App rules"
+    req.research_mode = "academic"
+    req.literatur_planer = PLANER
+    with _lit_env(monkeypatch), \
+         patch("src.research_cloud.anonymize_gate.anonymize_query_for_cloud",
+               new=AsyncMock(return_value="x")), \
+         patch("src.research_cloud.library.load_library_for_run",
+               new=AsyncMock(side_effect=LibraryUnavailableError("index laedt nicht"))):
+        result = await src.main._execute_research_impl(req, None, request=MagicMock())
+    spy.assert_not_called()
+    assert result.status == "error" and "Bibliothek" in result.error
+    assert result.literatur == LIT_STATUS
+
+
+async def test_pool_unusable_perplexity_keeps_the_literature_status(
+        spy_cli, persist, monkeypatch):
+    spy, _, _ = spy_cli
+    monkeypatch.setenv("RESEARCH_PERPLEXITY_ENABLED", "true")
+    monkeypatch.delenv("PERPLEXITY_API_KEY", raising=False)
+    req = _pool_req()
+    req.research_instructions = "App rules"
+    req.research_mode = "academic"
+    req.literatur_planer = PLANER
+    with _lit_env(monkeypatch), \
+         patch("src.research_cloud.anonymize_gate.anonymize_query_for_cloud",
+               new=AsyncMock(return_value="x")):
+        result = await src.main._execute_research_impl(req, None, request=MagicMock())
+    spy.assert_not_called()
+    assert result.status == "error" and "PERPLEXITY_API_KEY" in result.error
+    assert result.literatur == LIT_STATUS
+
+
+def test_answer_before_the_layer_has_no_literature_field():
+    """Only an answer after the layer carries the field: an empty holder (the
+    run ended before the layer, or no literatur_planer) adds nothing."""
+    response = src.main.ResearchResponse(status="error", query="q", model="m")
+    assert "literatur" not in src.main._mit_literatur(response, {}).model_dump()
+    assert "literatur" not in src.main._mit_literatur(response, {"status": None}).model_dump()
