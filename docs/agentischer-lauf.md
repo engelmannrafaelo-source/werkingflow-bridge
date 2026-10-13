@@ -37,6 +37,14 @@ Unbekannte Werkzeuge oder Werkzeugkonfigurationen werden vor dem Modellaufruf
 mit HTTP 422 abgewiesen. Jeder Teilauftrag erhält genau seine eigene Werkzeugliste;
 die Prüfung erbt keine Freigaben vom Hauptlauf.
 
+Ausgabeziele stehen in `ausgabe.artefakte` und optional in
+`ausgabe.artefakte_optional` (Vorgabe: leer). Beide sind beschreibbar und kommen
+mit Herkunft (`sha256`, `bytes`, `ref`) zurück. Fehlt unter einem Ziel aus
+`artefakte` jede Datei, endet der Lauf mit `antwort_fehlt`; fehlt sie unter
+einem optionalen Ziel, wird das Ziel ausgelassen. Ein optionales Ziel darf ein
+Ziel aus `artefakte` oder `datei` weder gleichen noch enthalten noch in ihm
+liegen. Dasselbe gilt für `pruefung.ausgabe`.
+
 `Bash` hat zwei Ausführungsorte, beide serverseitig gewählt:
 
 - **CLI-Platz** (ausgeliefert): Läuft die Phase über einen CLI-Adapter, führt
@@ -187,7 +195,10 @@ Felder `query`, `model`, `max_turns`, `max_tokens`, `antwort_im_text` und
 enthält **lauf_id**, den Schema-Alias `schema` und sämtliche Modell-Defaults:
 `systemtext: ""`, `pruefung: null` sowie nicht genutzte Ausgabefelder
 `datei: null` und `json_schema: null`. Bei vorhandener Prüfung gilt dasselbe
-für deren Systemtext und Ausgabe. Entfernt wird ausschließlich `quelle` aus
+für deren Systemtext und Ausgabe. Einzige Ausnahme von den Defaults:
+`artefakte_optional` steht nur im Digest, wenn die Liste nicht leer ist; leer
+entfällt der Schlüssel, in `ausgabe` wie in `pruefung.ausgabe`. So bleibt
+jeder Digest ohne optionale Ziele unverändert. Entfernt wird außerdem nur `quelle` aus
 jedem Materialeintrag, einschließlich Inline-Bytes oder URL; Identität, Ziel,
 Bytezahl und Material-SHA bleiben enthalten. `async_mode` und alle übrigen
 äußeren Research-Felder gehören nicht in den Digest. Die sechs äußeren Felder
@@ -293,6 +304,117 @@ Der folgende normative Vektor wird direkt aus diesem Vertrag durch
     },
     "sha256": "0b9bf21a181708a7d028a74f8644b3d03870d00c427b9ea5d82397896333784f"
   }
+}
+```
+
+Zweiter normativer Vektor mit nicht-leerer `artefakte_optional` im Hauptlauf und
+leerer (also entfallender) in der Prüfung; gelesen von demselben Test:
+
+```json wire-digest-vector-optional
+{
+  "request": {
+    "query": "Sortiere Bücher: α",
+    "model": "synthetic",
+    "max_turns": 2,
+    "max_tokens": 40,
+    "antwort_im_text": false,
+    "async_mode": false,
+    "agentischer_lauf": {
+      "schema": "agentischer-lauf/1",
+      "lauf_id": "digest-example-optional",
+      "material": [
+        {
+          "id": "book",
+          "ziel": "input.txt",
+          "bytes": 1,
+          "sha256": "2d711642b726b04401627ca9fbac32f5c8530fb1903cc4db02258717921a4881",
+          "quelle": {
+            "art": "inline",
+            "content_base64": "eA=="
+          }
+        }
+      ],
+      "werkzeuge": [],
+      "ausgabe": {
+        "modus": "datei",
+        "datei": "bericht.md",
+        "artefakte": [
+          "daten"
+        ],
+        "artefakte_optional": [
+          "skripte",
+          "antwort-pruefer.md"
+        ]
+      },
+      "pruefung": {
+        "auftrag": "Prüfe den Bericht",
+        "model": "synthetic",
+        "werkzeuge": [],
+        "ausgabe": {
+          "modus": "text",
+          "artefakte": []
+        },
+        "max_turns": 1,
+        "max_tokens": 20
+      },
+      "grenzen": {
+        "zeit_s": 20,
+        "tokens_gesamt": 500
+      }
+    }
+  },
+  "normalized": {
+    "query": "Sortiere Bücher: α",
+    "model": "synthetic",
+    "max_turns": 2,
+    "max_tokens": 40,
+    "antwort_im_text": false,
+    "agentischer_lauf": {
+      "schema": "agentischer-lauf/1",
+      "lauf_id": "digest-example-optional",
+      "systemtext": "",
+      "material": [
+        {
+          "id": "book",
+          "ziel": "input.txt",
+          "sha256": "2d711642b726b04401627ca9fbac32f5c8530fb1903cc4db02258717921a4881",
+          "bytes": 1
+        }
+      ],
+      "werkzeuge": [],
+      "ausgabe": {
+        "modus": "datei",
+        "datei": "bericht.md",
+        "json_schema": null,
+        "artefakte": [
+          "daten"
+        ],
+        "artefakte_optional": [
+          "skripte",
+          "antwort-pruefer.md"
+        ]
+      },
+      "pruefung": {
+        "auftrag": "Prüfe den Bericht",
+        "systemtext": "",
+        "model": "synthetic",
+        "werkzeuge": [],
+        "ausgabe": {
+          "modus": "text",
+          "datei": null,
+          "json_schema": null,
+          "artefakte": []
+        },
+        "max_turns": 1,
+        "max_tokens": 20
+      },
+      "grenzen": {
+        "zeit_s": 20,
+        "tokens_gesamt": 500
+      }
+    }
+  },
+  "sha256": "87368e8c7ea0deeffb4c35221e83f0cc7510d171093fd7ae198b4cd20c138950"
 }
 ```
 

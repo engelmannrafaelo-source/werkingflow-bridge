@@ -7,7 +7,14 @@ import binascii
 import re
 from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator, field_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    field_validator,
+    model_serializer,
+    model_validator,
+)
 
 Positive = Annotated[int, Field(strict=True, gt=0)]
 Size = Annotated[int, Field(strict=True, ge=0)]
@@ -87,6 +94,23 @@ class Output(Contract):
     datei: str | None = None
     json_schema: dict[str, Any] | None = None
     artefakte: list[str]
+    # Targets the run may write; what lies there comes back with provenance
+    # like a declared target, absence is no antwort_fehlt (ERKNEUR P2-1).
+    artefakte_optional: list[str] = Field(default_factory=list)
+
+    @model_serializer(mode="wrap")
+    def drop_empty_optional(self, handler):
+        # Empty means absent: the A3 wire digest and the output contract shown
+        # to the model stay byte-identical for every run without the field.
+        data = handler(self)
+        if not self.artefakte_optional:
+            data.pop("artefakte_optional", None)
+        return data
+
+    @property
+    def ziele(self) -> list[str]:
+        """Every path the run may write: declared, optional, answer file."""
+        return self.artefakte + self.artefakte_optional + ([self.datei] if self.datei else [])
 
     @model_validator(mode="after")
     def validate_output(self):
@@ -119,6 +143,16 @@ class Output(Contract):
             safe_path(path)
         if len(set(self.artefakte)) != len(self.artefakte):
             raise ValueError("auftrag_ungueltig: duplicate artifact target")
+        for path in self.artefakte_optional:
+            safe_path(path)
+        if len(set(self.artefakte_optional)) != len(self.artefakte_optional):
+            raise ValueError("auftrag_ungueltig: duplicate artifact target")
+        # An optional target must not equal, contain or lie inside a declared
+        # one or the answer file: the same bytes would be required and optional.
+        fest = self.artefakte + ([self.datei] if self.datei else [])
+        for a in self.artefakte_optional:
+            if any(a == b or a.startswith(b + "/") or b.startswith(a + "/") for b in fest):
+                raise ValueError("auftrag_ungueltig: optional target overlaps declared target")
         return self
 
 

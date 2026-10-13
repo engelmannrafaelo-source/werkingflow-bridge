@@ -29,7 +29,7 @@ from src.erkunder.kind import lesezugriff
 
 from .adapter import TOKEN_KEYS, RunError
 from .cli_platz import CliAuftrag
-from .sandbox import canonical, sha
+from .sandbox import canonical, select_artifacts, sha
 
 # Contract tool names onto the CLI tools that implement exactly that access.
 CLI_WERKZEUGE = {
@@ -363,7 +363,7 @@ async def cli_phase(
             max_tokens=max_tokens,
             werkzeuge=provider.werkzeuge(tools),
             material=material,
-            ausgaben=output.artefakte + ([output.datei] if output.datei else []),
+            ausgaben=output.ziele,
             zeit_s=max(0.0, state["accepted_at"] + run.grenzen.zeit_s - time.time()),
             zugang=zugang,
         )
@@ -424,14 +424,7 @@ async def cli_phase(
                 Draft202012Validator(output.json_schema).validate(parsed)
             except Exception:
                 raise RunError("ausgabe_ungueltig") from None
-        blobs = {}
-        for target in output.artefakte:
-            matches = {
-                p: b for p, b in ausgang.dateien.items() if p == target or p.startswith(target + "/")
-            }
-            if not matches:
-                raise RunError("antwort_fehlt")
-            blobs.update(matches)
+        blobs = select_artifacts(ausgang.dateien, output.artefakte, output.artefakte_optional)
         if output.datei:
             blobs[output.datei] = ausgang.dateien[output.datei]
         runtime.publish(request, tenant, state, result, phase, blobs)

@@ -382,7 +382,7 @@ class Runtime:
         sandbox = Sandbox(
             material,
             tools,
-            output.artefakte + ([output.datei] if output.datei else []),
+            output.ziele,
             self.max_bytes,
             bash=self.bash,
         )
@@ -481,6 +481,8 @@ class Runtime:
                             Draft202012Validator(output.json_schema).validate(parsed)
                         except Exception:
                             raise RunError("ausgabe_ungueltig") from None
+                    # Optional targets need no step here: every tool call already
+                    # published all files under output.ziele.
                     blobs = sandbox.artifacts(output.artefakte)
                     if output.datei:
                         blobs[output.datei] = sandbox.read(output.datei)

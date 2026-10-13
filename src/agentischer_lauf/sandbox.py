@@ -111,12 +111,16 @@ class Sandbox:
         return {key: result[key] for key in ("exit_code", "stdout", "stderr")}
 
     def artifacts(self, targets):
-        selected = {}
-        for target in targets:
-            matches = {
-                p: b for p, b in self.files.items() if p == target or p.startswith(target + "/")
-            }
-            if not matches:
-                raise RunError("antwort_fehlt")
-            selected.update(matches)
-        return selected
+        return select_artifacts(self.files, targets)
+
+
+def select_artifacts(files, targets, optional=()):
+    """The files under each target. A declared target without any file is
+    antwort_fehlt; an optional one is simply left out."""
+    selected = {}
+    for target, pflicht in [(t, True) for t in targets] + [(t, False) for t in optional]:
+        matches = {p: b for p, b in files.items() if p == target or p.startswith(target + "/")}
+        if not matches and pflicht:
+            raise RunError("antwort_fehlt")
+        selected.update(matches)
+    return selected
