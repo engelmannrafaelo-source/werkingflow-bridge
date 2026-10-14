@@ -277,3 +277,56 @@ def test_vertraegt_dict_bloecke_und_fremde_chunks():
     ]
     calls, docs = count_library_reads(chunks)
     assert calls == 1 and docs == ["tirol-bo"]
+
+
+def test_grep_ohne_pfad_mit_glob_zaehlt():
+    # Energy P4 (14.10.2026): Grep ueber die Dokumente per glob, ohne path —
+    # durchsucht das Sitzungsverzeichnis samt bibliothek/, wurde als 0 gezaehlt.
+    chunks = [
+        {"content": [_Block("Grep", {"pattern": "U-Wert", "glob": "*.md"})]},
+        {"content": [_Block("Grep", {"pattern": "OIB", "glob": "bibliothek/*.md", "path": "."})]},
+        {"content": [_Block("Grep", {"pattern": "Heizlast"})]},
+        {"content": [_Block("Glob", {"pattern": "**/*.md"})]},
+    ]
+    assert count_library_reads(chunks) == (4, [])
+
+
+def test_grep_auf_fremden_ordner_zaehlt_nicht():
+    chunks = [
+        {"content": [_Block("Grep", {"pattern": "x", "path": "unterlagen/"})]},
+        {"content": [_Block("Grep", {"pattern": "x", "glob": "unterlagen/*.md"})]},
+        {"content": [_Block("Glob", {"pattern": "unterlagen/**/*.pdf"})]},
+        {"content": [_Block("Grep", {"pattern": "x", "path": "/etc"})]},
+    ]
+    assert count_library_reads(chunks) == (0, [])
+
+
+def test_read_ausserhalb_zaehlt_weiter_nicht_und_glob_im_ordner_zaehlt():
+    chunks = [
+        {"content": [_Block("Read", {"file_path": "notizen.md"})]},
+        {"content": [_Block("Glob", {"pattern": "*.md", "path": "bibliothek"})]},
+        {"content": [_Block("Glob", {"pattern": "bibliothek/oib*"})]},
+    ]
+    assert count_library_reads(chunks) == (2, [])
+
+
+def test_suche_ohne_pfad_zaehlt_nur_wenn_das_muster_die_bibliothek_treffen_kann():
+    # BRIDGEFOLGER P3-c: nicht-rekursives Glob und fremde Endungen treffen
+    # bibliothek/<id>.md nicht.
+    zaehlt = [
+        _Block("Grep", {"pattern": "x", "glob": "*.md"}),        # ripgrep: jede Tiefe
+        _Block("Grep", {"pattern": "x", "glob": "*.{md,txt}"}),
+        _Block("Grep", {"pattern": "x", "glob": "**/*"}),
+        _Block("Glob", {"pattern": "**/*.md"}),
+        _Block("Glob", {"pattern": "*/oib*"}),
+    ]
+    zaehlt_nicht = [
+        _Block("Glob", {"pattern": "*.md"}),                     # nur oberste Ebene
+        _Block("Grep", {"pattern": "x", "glob": "*.pdf"}),
+        _Block("Glob", {"pattern": "**/*.pdf"}),
+        _Block("Glob", {"pattern": "unterlagen/*.md"}),
+    ]
+    for b in zaehlt:
+        assert count_library_reads([{"content": [b]}]) == (1, []), b.input
+    for b in zaehlt_nicht:
+        assert count_library_reads([{"content": [b]}]) == (0, []), b.input
