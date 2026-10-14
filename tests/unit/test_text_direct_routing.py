@@ -611,3 +611,34 @@ async def test_lifespan_bricht_bei_kaputtem_wert_ab(bereich, monkeypatch, wert, 
     monkeypatch.setenv("BRIDGE_TEXT_DIRECT_ROUTING_APPS", wert)
     with pytest.raises(RuntimeError, match=meldung):
         await _lifespan_start()
+
+
+@pytest.mark.asyncio
+async def test_zweite_linie_vergleicht_den_app_teil_exakt(bereich, monkeypatch):
+    # P3-g: ein kaputter Eintrag fuer "werking-noise-beta" darf werking-noise
+    # nicht treffen (vorher: Teilzeichenkette → 503 fuer werking-noise).
+    monkeypatch.setenv(
+        "BRIDGE_TEXT_DIRECT_ROUTING_APPS",
+        "werking-energy:schema_analysis/beschreibung,werking-noise-beta;essenz",
+    )
+    weg, _, _ = await _run(_body(max_tokens=64000), app_id="werking-noise",
+                           headers={"X-Agent-ID": "essenz"})
+    assert weg == "sdk"
+    weg, antwort, _ = await _run(_body(max_tokens=64), app_id="werking-noise-beta",
+                                 headers={"X-Agent-ID": "essenz"}, sonst_antwort=True)
+    assert _code(antwort) == (503, "text_direct_config_invalid")
+    weg, _, _ = await _run(_body(max_tokens=64))
+    assert weg == "direct"
+
+
+@pytest.mark.parametrize("eintrag, app", [
+    ("werking-energy", "werking-energy"),
+    ("werking-energy:", "werking-energy"),
+    ("werking-energy;schema_analysis", "werking-energy"),
+    ("werking-energy:schema analysis", "werking-energy"),
+    ("werking-energy/x", "werking-energy"),
+    (":schema_analysis", ""),
+])
+def test_app_teil(eintrag, app):
+    from src.routing.text_direct_routing import _app_teil
+    assert _app_teil(eintrag) == app

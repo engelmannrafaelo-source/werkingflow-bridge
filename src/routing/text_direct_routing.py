@@ -114,6 +114,13 @@ def _zerlege(raw: str) -> tuple[list[tuple[str, str]], list[str]]:
     return gueltig, fehlerhaft
 
 
+def _app_teil(eintrag: str) -> str:
+    """App-Teil eines (auch fehlerhaften) Eintrags: alles vor dem ersten
+    Trenner (":", ";", "/", Leerraum). Exakt verglichen, nie als
+    Teilzeichenkette — ``werking-noise-beta;x`` nennt nicht ``werking-noise``."""
+    return re.split(r"[:;/\s]", eintrag.strip(), maxsplit=1)[0]
+
+
 def _fehlertext(fehlerhaft: list[str], raw: str) -> str:
     return (
         f"{_APPS_ENV}: Eintrag/Eintraege {fehlerhaft!r} nicht im Format "
@@ -178,7 +185,7 @@ def _laufzeit_bereich(app_id: Optional[str]) -> list[tuple[str, str]]:
     if raw not in _gemeldet:
         _gemeldet.add(raw)
         logger.error("text_direct_routing: %s", _fehlertext(fehlerhaft, raw))
-    if app_id and any(app_id in eintrag for eintrag in fehlerhaft):
+    if app_id and any(_app_teil(eintrag) == app_id for eintrag in fehlerhaft):
         raise TextDirectRoutingError(
             503, "text_direct_config_invalid", _fehlertext(fehlerhaft, raw)
         )
