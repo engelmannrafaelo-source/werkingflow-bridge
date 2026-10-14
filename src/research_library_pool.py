@@ -296,10 +296,17 @@ def link_sources(mirror: LibraryMirror) -> Dict[str, str]:
 def count_library_reads(chunks: List[Any]) -> Tuple[int, List[str]]:
     """(Anzahl Bibliotheksaufrufe, gelesene Dokument-ids) aus den CLI-Chunks.
 
-    Zaehlweise wie beim Dokument-Agenten (_doc_agent_extract_files_read): jeder
-    Read/Grep/Glob-Block, dessen Pfad/Muster in den Bibliotheksordner zeigt, ist
-    ein Aufruf — das ist auf diesem Weg das Gegenstueck zu ``library_calls`` des
-    Cloud-Executors. Read liefert zusaetzlich die Dokument-id.
+    Jeder Read/Grep/Glob-Block, dessen Suchbereich die Bibliothek einschliesst,
+    ist ein Aufruf — das ist auf diesem Weg das Gegenstueck zu ``library_calls``
+    des Cloud-Executors. Read liefert zusaetzlich die Dokument-id.
+
+    Suchbereich einer Grep/Glob-Suche: ``path`` zeigt in den Bibliotheksordner,
+    das Dateimuster (Grep ``glob``, Glob ``pattern``) nennt ihn, oder ``path``
+    fehlt bzw. ist das Arbeitsverzeichnis selbst (".") — dann durchsucht das
+    Werkzeug das Sitzungsverzeichnis, in dem ``bibliothek/`` liegt, und ein
+    Muster wie ``**/*.md`` trifft die Volltexte. Bis 14.10.2026 zaehlten nur
+    Pfade mit dem Ordnernamen; ein ``Grep(pattern=..., glob="*.md")`` ueber die
+    Dokumente ging als 0 Aufrufe in library_calls ein (Energy P4).
     """
     marker = f"{LIBRARY_WORKDIR_NAME}/"
     calls = 0
@@ -320,20 +327,32 @@ def count_library_reads(chunks: List[Any]) -> Tuple[int, List[str]]:
             if block_input is None and isinstance(block, dict):
                 block_input = block.get("input")
             block_input = block_input or {}
-            candidates = [
-                block_input.get("file_path"),
-                block_input.get("path"),
-                block_input.get("pattern") if name == "Glob" else None,
-            ]
-            hit = next(
-                (c for c in candidates if isinstance(c, str) and (marker in c or c.rstrip("/").endswith(LIBRARY_WORKDIR_NAME))),
-                None,
-            )
-            if hit is None:
-                continue
-            calls += 1
+
+            def _in_library(value: Any) -> bool:
+                return isinstance(value, str) and (
+                    marker in value or value.rstrip("/").endswith(LIBRARY_WORKDIR_NAME)
+                )
+
             if name == "Read":
-                doc_id = Path(hit).stem
+                file_path = block_input.get("file_path")
+                if not _in_library(file_path):
+                    continue
+                calls += 1
+                doc_id = Path(file_path).stem
                 if doc_id and doc_id not in doc_ids:
                     doc_ids.append(doc_id)
+                continue
+
+            path = block_input.get("path")
+            file_filter = block_input.get("glob") if name == "Grep" else block_input.get("pattern")
+            searches_workdir = path is None or (isinstance(path, str) and path.strip() in ("", ".", "./"))
+            # Ein Muster, das mit einem festen fremden Ordner beginnt
+            # ("unterlagen/*.md"), schliesst die Bibliothek wieder aus.
+            other_dir = (
+                isinstance(file_filter, str)
+                and "/" in file_filter.lstrip("./")
+                and not any(ch in file_filter.lstrip("./").split("/", 1)[0] for ch in "*?[{")
+            )
+            if _in_library(path) or _in_library(file_filter) or (searches_workdir and not other_dir):
+                calls += 1
     return calls, doc_ids
