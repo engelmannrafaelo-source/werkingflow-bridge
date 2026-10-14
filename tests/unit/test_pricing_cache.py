@@ -111,3 +111,42 @@ class TestRoutingConfigFullyPriced:
         from src.pricing import validate_billing_integrity
 
         validate_billing_integrity()  # raises RuntimeError on any gap
+
+
+# --- Haiku 5.5: zwei Preisstufen je Aufruf (PRICING_VERSION v12) -------------
+# Liste: Prompt <= 100k 0,10/0,50, darueber 0,50/2,50 fuer den ganzen Aufruf;
+# Cache-Lesen 0,1x, Cache-Schreiben 1,25x der jeweiligen Stufe.
+
+def test_haiku_5_5_unter_100k_untere_stufe():
+    from src.pricing import cost_usd
+    # 50k Cache-Lesen + 10k Eingabe + 1k Ausgabe: Prompt 60k -> 0,10/0,50
+    usd = cost_usd("claude-haiku-5-5", 10_000, 1_000, cache_read_tokens=50_000)
+    assert usd == pytest.approx(0.01 * 0.10 + 0.05 * 0.01 + 0.001 * 0.50)
+
+
+def test_haiku_5_5_cache_lesen_ueber_100k_kostet_0_05():
+    from src.pricing import cost_usd
+    # Befund HAIKUTEST/HAIKUABR P3-a: v11 rechnete hier 0,01 statt 0,05.
+    usd = cost_usd("claude-haiku-5-5", 0, 0, cache_read_tokens=1_000_000)
+    assert usd == pytest.approx(0.05)
+
+
+def test_haiku_5_5_obere_stufe_gilt_fuer_den_ganzen_aufruf():
+    from src.pricing import cost_usd
+    # 90k Cache-Lesen + 20k Schreiben -> Prompt 110k: alles zur oberen Stufe
+    usd = cost_usd("claude-haiku-5-5", 0, 10_000,
+                   cache_read_tokens=90_000, cache_creation_tokens=20_000)
+    assert usd == pytest.approx(0.09 * 0.05 + 0.02 * 0.50 * 1.25 + 0.01 * 2.50)
+
+
+def test_haiku_5_5_genau_100k_ist_noch_untere_stufe():
+    from src.pricing import cost_usd
+    assert cost_usd("claude-haiku-5-5", 100_000, 0) == pytest.approx(0.01)
+    assert cost_usd("claude-haiku-5-5", 100_001, 0) == pytest.approx(100_001 / 1e6 * 0.50)
+
+
+def test_haiku_5_5_ledger_eur_nutzt_die_stufe():
+    from src.pricing import cost_usd
+    assert cost_eur("claude-haiku-5-5", 0, 0, cache_read_tokens=1_000_000) == pytest.approx(
+        round(cost_usd("claude-haiku-5-5", 0, 0, cache_read_tokens=1_000_000) * usd_to_eur_rate(), 6)
+    )

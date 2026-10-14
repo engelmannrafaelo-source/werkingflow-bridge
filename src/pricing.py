@@ -55,14 +55,17 @@ import re
 # v9 (2026-09-24): Fable 5.1 enabled; cache read $0.25 per MTok.
 # v10 (2026-09-30): Sonnet 5.5, $2/$10; cache read $0.20, 5m write $2.50.
 # v11 (2026-10-08): claude-haiku-5-5 registriert, konservativ mit der hohen Stufe 0,50/2,50.
-PRICING_VERSION = "v11"
+# v12 (2026-10-14): claude-haiku-5-5 stufengerecht ("bis_prompt"). v11 rechnete
+#                   Cache-Lesen flach 0,01 — ueber 100k Prompt kostet es 0,05,
+#                   v11 unterberechnete dort Cache-Lesen um Faktor 5.
+PRICING_VERSION = "v12"
 
 # USD per 1M tokens. {model_id: {"in": input_price, "out": output_price}}
 # Quelle je Zeile: Anthropic "Model pricing"-Tabelle,
 # https://platform.claude.com/docs/en/about-claude/pricing (Datum = letzte
 # Verifikation dieser Zeile; keine Autoinvalidierung -> bei Preisaenderungen
 # manuell nachziehen + PRICING_VERSION bumpen).
-MODEL_PRICING: dict[str, dict[str, float]] = {
+MODEL_PRICING: dict[str, dict] = {
     # 2026-09-02: $2/$10 ist der PERMANENTE Preis (Intro-Label entfernt, s.
     # PRICING_VERSION-Changelog oben) — NICHT den zuvor angekuendigten,
     # inzwischen gecancelten $3/$15-Anstieg eintragen.
@@ -83,11 +86,18 @@ MODEL_PRICING: dict[str, dict[str, float]] = {
     "claude-fable-5-1":           {"in": 10.00, "out": 50.00, "cache_read_mult": 0.025},
     "claude-haiku-4-5":           {"in": 1.00,  "out": 5.00},   # 2026-07-03
     "claude-haiku-4-5-20251001":  {"in": 1.00,  "out": 5.00},   # 2026-07-03
-    # Haiku 5.5: Ankuendigung 2026-10-07 nennt 0,10/0,50 bis 100k Prompt und
-    # 0,50/2,50 darueber; Cache-Lesen 0,01. Die Preisseite listete es am
-    # 2026-10-08 noch nicht. Konservativ mit der HOHEN Stufe eingetragen
-    # (nie unterberechnen); Cache-Lesen 0,01 = 0,02 x 0,50. Nachmessen am Ledger.
-    "claude-haiku-5-5":           {"in": 0.50,  "out": 2.50, "cache_read_mult": 0.02},
+    # Haiku 5.5: zwei Preisstufen je Aufruf. Prompt (Eingabe + Cache-Lesen +
+    # Cache-Schreiben) <= 100k: 0,10/0,50; darueber 0,50/2,50 fuer den GANZEN
+    # Aufruf. Cache-Faktoren wie ueblich 0,1x / 1,25x der jeweiligen Stufe ->
+    # Cache-Lesen 0,01 bzw. 0,05. Geprueft 2026-10-14 gegen die Claude-API-
+    # Modelltabelle (Stand 2026-10-06: "$0.10 / $0.50 ... prompts up to 100K
+    # tokens ($0.50 / $2.50 beyond)") und am Ledger (BEFUND-2b785d2d,
+    # 2026-10-08: Cache-Lesen 0,01, 1-h-Schreiben 0,20 = 2 x 0,10).
+    # in/out tragen die HOHE Stufe: wer nur in/out liest (/metrics/pricing,
+    # Registry-Anzeige), rechnet hoch statt zu niedrig; cost_usd nimmt die
+    # untere Stufe aus "bis_prompt".
+    "claude-haiku-5-5":           {"in": 0.50,  "out": 2.50,
+                                   "bis_prompt": {"tokens": 100_000, "in": 0.10, "out": 0.50}},
     # Google Gemini — Bildweg (nur Nicht-Prod erreichbar, siehe
     # src/routing/gemini_vision_gate.py). Bildeingabe wird zum Token-Preis
     # abgerechnet, es gibt also keinen getrennten Bildposten. Geprueft
@@ -210,6 +220,16 @@ def validate_billing_integrity() -> None:
         )
 
 
+def _stufe(p: dict, prompt_tokens: int) -> dict:
+    """Preiszeile fuer die Prompt-Groesse dieses Aufrufs. Zeilen mit
+    "bis_prompt" (Haiku 5.5) gelten bis einschliesslich tokens mit der unteren
+    Stufe; darueber gilt die Grundzeile fuer den ganzen Aufruf."""
+    unten = p.get("bis_prompt")
+    if not unten or prompt_tokens > unten["tokens"]:
+        return p
+    return {**p, "in": unten["in"], "out": unten["out"]}
+
+
 def cost_usd(
     model: str,
     input_tokens: int,
@@ -227,6 +247,7 @@ def cost_usd(
     p = price_entry(model)
     if p is None:
         raise KeyError(f"No price for model {model!r} in MODEL_PRICING")
+    p = _stufe(p, (input_tokens or 0) + (cache_read_tokens or 0) + (cache_creation_tokens or 0))
     return (
         (input_tokens or 0) / 1_000_000.0 * p["in"]
         + (cache_creation_tokens or 0) / 1_000_000.0 * p["in"] * CACHE_WRITE_MULT
