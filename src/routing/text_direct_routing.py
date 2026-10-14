@@ -42,9 +42,11 @@ nicht ``schema_analysis_alt``). Im Bereich geht JEDER reine Textaufruf direkt,
 auch ohne output_config und mit kleinem max_tokens — der SDK-Weg haelt
 max_tokens ueberhaupt nicht ein (Probe TEILE 14.10.2026: max_tokens 64 → 4 759
 Ausgabe-Token). Alle anderen Aufrufe bleiben unveraendert. Ein Tippfehler im
-Format ist laut: der Worker startet nicht (lifespan, ``pruefe_beim_start``).
-Zur Laufzeit trifft ein fehlerhafter Eintrag nur Aufrufe der darin genannten
-App (503 ``text_direct_config_invalid``); alle anderen laufen unveraendert.
+Format oder eine unbekannte App-ID (gegen ``KNOWN_APP_IDS``) ist laut: der
+Worker startet nicht (lifespan, ``pruefe_beim_start``). Zur Laufzeit gilt der
+beim Start gepruefte Wert. Nur ohne Startpruefung wird tolerant gelesen; dann
+trifft ein fehlerhafter Eintrag nur Aufrufe der darin genannten App (503
+``text_direct_config_invalid``), alle anderen laufen unveraendert.
 Fehlt bei gesetztem Bereich der Schluessel des direkten Wegs, startet der
 Worker ebenfalls nicht; zur Laufzeit antwortet ein Aufruf im Bereich 503
 ``text_direct_key_missing`` statt still auf den SDK-Weg zu fallen.
@@ -136,22 +138,38 @@ def geltungsbereich() -> list[tuple[str, str]]:
     return gueltig
 
 
-_gemeldet: set[str] = set()
+_gemeldet: set = set()
+
+# Der beim Start gepruefte Bereich (``pruefe_beim_start``). Ist er gesetzt, gilt
+# zur Laufzeit NUR er — die Umgebung wird nicht erneut gelesen.
+_start_stand: Optional[tuple[str, list[tuple[str, str]]]] = None
 
 
 def _laufzeit_bereich(app_id: Optional[str]) -> list[tuple[str, str]]:
-    """Gueltige Eintraege fuer diesen Aufruf; ein Tippfehler trifft nur seine App.
+    """Gueltige Eintraege fuer diesen Aufruf.
 
-    Der Wert wird beim Start streng geprueft (``pruefe_beim_start``, lifespan) —
-    ein Prozess mit fehlerhaftem Wert startet nicht. Dieser Zweig ist die
-    zweite Linie (Prozess ohne lifespan, Umgebung nachtraeglich geaendert):
-    Nennt ein fehlerhafter Eintrag die App dieses Aufrufs, scheitert der
-    Aufruf laut (503 text_direct_config_invalid) — er koennte zum Bereich
-    gehoeren, und still auf den SDK-Weg zu fallen hiesse, dass sein Budget
-    nicht gilt. Jeder andere Aufruf laeuft mit den gueltigen Eintraegen
-    weiter; der Fehler steht einmal je Wert als ERROR im Log.
+    Normalfall: der beim Start streng gepruefte Wert (``pruefe_beim_start``,
+    lifespan). Ein Prozess mit fehlerhaftem Wert startet nicht; was hier
+    ankommt, ist geprueft, und eine spaeter geaenderte Umgebung aendert nichts
+    (einmal ERROR im Log).
+
+    Zweite Linie — Prozess ohne Startpruefung (Test-Harness, anderer
+    Einstieg): der Wert wird tolerant gelesen. Nennt ein fehlerhafter Eintrag
+    die App dieses Aufrufs, scheitert nur dieser Aufruf laut (503
+    text_direct_config_invalid); gueltige Eintraege wirken, jeder andere
+    Aufruf laeuft unveraendert, der Fehler steht einmal je Wert als ERROR im Log.
     """
     raw = os.getenv(_APPS_ENV, "").strip()
+    if _start_stand is not None:
+        start_raw, start_bereich = _start_stand
+        if raw != start_raw and ("geaendert", raw) not in _gemeldet:
+            _gemeldet.add(("geaendert", raw))
+            logger.error(
+                "text_direct_routing: %s hat sich seit dem Start geaendert (%r → %r) — "
+                "es gilt weiter der beim Start gepruefte Wert; wirksam erst nach Neustart.",
+                _APPS_ENV, start_raw, raw,
+            )
+        return start_bereich
     if not raw:
         return []
     gueltig, fehlerhaft = _zerlege(raw)
@@ -180,10 +198,24 @@ def im_geltungsbereich(app_id: Optional[str], agent_id: Optional[str]) -> Option
     return None
 
 
-def pruefe_beim_start() -> list[tuple[str, str]]:
-    """Startpruefung (lifespan): Format, Abo-Grenze und — wenn ein Bereich gesetzt
-    ist — der Schluessel des direkten Wegs. Wirft; der Worker startet dann nicht."""
+def pruefe_beim_start(known_app_ids: Optional[set] = None) -> list[tuple[str, str]]:
+    """Startpruefung (lifespan): Format, App-IDs, Abo-Grenze und — wenn ein Bereich
+    gesetzt ist — der Schluessel des direkten Wegs. Wirft; der Worker startet
+    dann nicht. Bei Erfolg gilt der Bereich fuer die ganze Laufzeit.
+
+    ``known_app_ids`` (main.KNOWN_APP_IDS): ein Eintrag mit gueltigem Format,
+    aber unbekannter App (``werking-enrgy:…``) bewirkte sonst still nichts.
+    """
+    global _start_stand
+    raw = os.getenv(_APPS_ENV, "").strip()
     bereich = geltungsbereich()
+    if known_app_ids is not None:
+        unbekannt = sorted({app for app, _ in bereich if app not in known_app_ids})
+        if unbekannt:
+            raise RuntimeError(
+                f"{_APPS_ENV}: unbekannte App-ID(s) {unbekannt} — bekannt sind "
+                f"{sorted(known_app_ids)}; ganzer Wert {raw!r}"
+            )
     abo_ausgabegrenze()
     if bereich:
         from src.providers.registry import is_tier_usable
@@ -194,6 +226,7 @@ def pruefe_beim_start() -> list[tuple[str, str]]:
                 "auf diesem Host nicht eingerichtet (ANTHROPIC_VISION_API_KEY fehlt) — "
                 "Aufrufe im Bereich koennten nicht direkt laufen."
             )
+    _start_stand = (raw, bereich)
     return bereich
 
 

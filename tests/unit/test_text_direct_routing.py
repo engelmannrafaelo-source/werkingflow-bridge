@@ -41,6 +41,14 @@ _PIN_CONFIG = "src.routing.user_provider_override.get_user_provider_config"
 _TIER_POLICY = "src.routing.app_tier_policy.resolve_app_tier_policy"
 
 
+@pytest.fixture(autouse=True)
+def _ohne_startstand(monkeypatch):
+    # Jeder Test beginnt ohne beim Start gepruefte Fassung; Tests der
+    # Startpruefung setzen sie selbst.
+    import src.routing.text_direct_routing as td
+    monkeypatch.setattr(td, "_start_stand", None)
+
+
 class _DirectReached(BaseException):
     pass
 
@@ -548,3 +556,58 @@ async def test_lifespan_ruft_die_startpruefung_und_bricht_ab(bereich, monkeypatc
         with pytest.raises(RuntimeError, match="ANTHROPIC_VISION_API_KEY"):
             async with src.main.lifespan(src.main.app):
                 pass
+
+
+# --- BRIDGEFOLGER Delta-Runde: P2 / P3-d / P3-e ------------------------------
+
+@pytest.mark.asyncio
+async def test_laufzeit_gilt_der_beim_start_gepruefte_wert(bereich, monkeypatch):
+    # P2: Start mit gueltigem Wert, danach kaputte Umgebung — es gilt weiter
+    # der gepruefte Bereich; keine App bekommt einen Fehler.
+    from src.routing.text_direct_routing import pruefe_beim_start
+    pruefe_beim_start(src.main.KNOWN_APP_IDS)
+    monkeypatch.setenv("BRIDGE_TEXT_DIRECT_ROUTING_APPS", "werking-energy;kaputt")
+    weg, rb, _ = await _run(_body(max_tokens=64))
+    assert weg == "direct"
+    for app_id in ("werking-report", "werking-noise", "cui", None):
+        weg, _, _ = await _run(_body(output_config={"effort": "low"}, max_tokens=64000),
+                               app_id=app_id)
+        assert weg == "sdk", app_id
+
+
+@pytest.mark.asyncio
+async def test_start_ohne_bereich_bleibt_ohne_bereich(bereich, monkeypatch):
+    from src.routing.text_direct_routing import pruefe_beim_start
+    monkeypatch.delenv("BRIDGE_TEXT_DIRECT_ROUTING_APPS")
+    pruefe_beim_start(src.main.KNOWN_APP_IDS)
+    monkeypatch.setenv("BRIDGE_TEXT_DIRECT_ROUTING_APPS", _BEREICH)
+    weg, _, _ = await _run(_body(max_tokens=64))
+    assert weg == "sdk"
+
+
+def test_start_unbekannte_app_id_bricht_ab(bereich, monkeypatch):
+    # P3-d: gueltiges Format, falscher App-Name wirkte sonst still gar nicht.
+    from src.routing.text_direct_routing import pruefe_beim_start
+    monkeypatch.setenv("BRIDGE_TEXT_DIRECT_ROUTING_APPS", "werking-enrgy:schema_analysis/beschreibung")
+    with pytest.raises(RuntimeError, match="unbekannte App-ID"):
+        pruefe_beim_start(src.main.KNOWN_APP_IDS)
+
+
+async def _lifespan_start():
+    with patch("src.pricing.validate_billing_integrity", MagicMock()):
+        async with src.main.lifespan(src.main.app):
+            pass
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("wert, meldung", [
+    ("werking-energy", "app-id:agent-praefix"),
+    ("werking-energy:schema_analysis/beschreibung,", "app-id:agent-praefix"),
+    ("werking-enrgy:schema_analysis/beschreibung", "unbekannte App-ID"),
+])
+async def test_lifespan_bricht_bei_kaputtem_wert_ab(bereich, monkeypatch, wert, meldung):
+    # P3-e: der echte lifespan faehrt die Startpruefung und bricht ab, bevor
+    # der Worker Aufrufe annimmt (vor der SDK-Pruefung).
+    monkeypatch.setenv("BRIDGE_TEXT_DIRECT_ROUTING_APPS", wert)
+    with pytest.raises(RuntimeError, match=meldung):
+        await _lifespan_start()

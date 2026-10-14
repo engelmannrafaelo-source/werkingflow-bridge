@@ -534,7 +534,7 @@ async def lifespan(app: FastAPI):
     # FAIL-FAST: ein Tippfehler in BRIDGE_TEXT_DIRECT_ROUTING_APPS soll den
     # Start verhindern, nicht still "nichts geht direkt" heissen.
     from src.routing.text_direct_routing import pruefe_beim_start as _td_pruefen
-    _td = _td_pruefen()
+    _td = _td_pruefen(KNOWN_APP_IDS)
     if _td:
         logger.info("✅ Text-Wegwahl Geltungsbereich: %s", _td)
     logger.info("✅ Billing integrity OK — every servable model is priced")
