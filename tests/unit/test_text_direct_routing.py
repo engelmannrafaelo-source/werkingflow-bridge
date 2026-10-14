@@ -82,7 +82,7 @@ def _tracker():
 
 
 async def _run(body: dict, *, pin_config=None, tier_policy=None, app_id="werking-energy",
-               headers=None):
+               headers=None, cap=(False, 0.0, 100.0), sonst_antwort=False):
     """Fuehrt den echten Handler bis zum ersten Backend-Aufruf.
 
     Rueckgabe ("direct", request, backend_config) oder ("sdk", kwargs).
@@ -106,18 +106,26 @@ async def _run(body: dict, *, pin_config=None, tier_policy=None, app_id="werking
          patch(_PIN_CONFIG, AsyncMock(return_value=pin_config)), \
          patch(_TIER_POLICY, AsyncMock(return_value=tier_policy)), \
          patch("src.routing.prepaid_cap.prepaid_vision_over_cap",
-               AsyncMock(return_value=(False, 0.0, 100.0))), \
+               AsyncMock(return_value=cap)), \
          patch.object(src.main, "prepaid_vision_over_cap",
-                      AsyncMock(return_value=(False, 0.0, 100.0)), create=True), \
+                      AsyncMock(return_value=cap), create=True), \
          patch.object(src.main.claude_cli, "run_completion", MagicMock(side_effect=_sdk)), \
          patch("src.providers.anthropic_direct.call_anthropic_direct", _direct):
         try:
-            await handler(ChatCompletionRequest(**body), _request(body, app_id, headers), None, None)
+            antwort = await handler(
+                ChatCompletionRequest(**body), _request(body, app_id, headers), None, None
+            )
+            if sonst_antwort:
+                return "antwort", antwort, None
         except _DirectReached:
             rb, cfg = seen["direct"]
             return "direct", rb, cfg
         except _SdkReached:
             return "sdk", seen["sdk"], None
+        except Exception as e:  # noqa: BLE001
+            if sonst_antwort:
+                return "fehler", e, None
+            raise
     raise AssertionError("weder direkter Weg noch SDK-Weg erreicht")
 
 
@@ -264,3 +272,135 @@ def test_regel_kaputte_grenze_ist_laut(monkeypatch):
     monkeypatch.setenv("BRIDGE_ABO_AUSGABEGRENZE", "viel")
     with pytest.raises(RuntimeError):
         direct_route_reason(_req(max_tokens=64000), has_images=False)
+
+
+# --- eingeengter Geltungsbereich (BRIDGE_TEXT_DIRECT_ROUTING_APPS) -----------
+
+_BEREICH = "werking-energy:schema_analysis/beschreibung"
+
+
+@pytest.fixture
+def bereich(monkeypatch):
+    # Globaler Schalter AUS — der Bereich muss allein wirken.
+    monkeypatch.delenv("BRIDGE_TEXT_DIRECT_ROUTING_ENABLED", raising=False)
+    monkeypatch.setenv("BRIDGE_TEXT_DIRECT_ROUTING_APPS", _BEREICH)
+    monkeypatch.setenv("ANTHROPIC_VISION_API_KEY", "test-key")
+    monkeypatch.delenv("BRIDGE_ABO_AUSGABEGRENZE", raising=False)
+
+
+@pytest.mark.asyncio
+async def test_bereich_energy_beschreibung_geht_direkt_ohne_globalen_schalter(bereich):
+    weg, rb, cfg = await _run(_body(output_config={"effort": "low"}, max_tokens=64000))
+    assert weg == "direct"
+    assert rb.provider_tier == DIRECT_TIER
+    assert rb.output_config == {"effort": "low"}
+    assert rb.max_tokens == 64000
+    assert cfg.provider_model == "claude-haiku-5-5"
+
+
+@pytest.mark.asyncio
+async def test_bereich_auch_kleines_budget_ohne_output_config(bereich):
+    # Probe TEILE: max_tokens 64 → 4 759 Ausgabe auf dem SDK-Weg.
+    weg, rb, _ = await _run(_body(max_tokens=64))
+    assert weg == "direct"
+    assert rb.max_tokens == 64
+
+
+@pytest.mark.asyncio
+async def test_bereich_mit_festem_app_tier_kommt_direkt_an(bereich):
+    # Die App schickt heute provider_tier fest; die App-Regel raeumt ihn ab,
+    # der Bereich setzt den direkten Weg wieder.
+    weg, rb, _ = await _run(_body(provider_tier=DIRECT_TIER, max_tokens=64000,
+                                  output_config={"effort": "low"}))
+    assert weg == "direct"
+    assert rb.output_config == {"effort": "low"}
+
+
+@pytest.mark.asyncio
+async def test_bereich_andere_agent_id_derselben_app_bleibt_sdk(bereich):
+    weg, _, _ = await _run(_body(output_config={"effort": "low"}, max_tokens=64000),
+                           headers={"X-Agent-ID": "schema_analysis/block"})
+    assert weg == "sdk"
+
+
+@pytest.mark.asyncio
+async def test_bereich_praefix_greift_segmentweise(bereich):
+    weg, _, _ = await _run(_body(max_tokens=64000),
+                           headers={"X-Agent-ID": "schema_analysis/beschreibung_alt"})
+    assert weg == "sdk"
+    weg, _, _ = await _run(_body(max_tokens=64000),
+                           headers={"X-Agent-ID": "schema_analysis/beschreibung/lang"})
+    assert weg == "direct"
+
+
+@pytest.mark.asyncio
+async def test_bereich_andere_app_gleicher_agent_bleibt_sdk(bereich):
+    weg, _, _ = await _run(_body(output_config={"effort": "low"}), app_id="werking-report")
+    assert weg == "sdk"
+
+
+@pytest.mark.asyncio
+async def test_bereich_werkzeuge_bleiben_sdk(bereich):
+    weg, _, _ = await _run(_body(max_tokens=64000, enable_tools=True),
+                           headers={"X-Claude-Allowed-Tools": "Read"})
+    assert weg == "sdk"
+
+
+@pytest.mark.asyncio
+async def test_bereich_nutzer_pin_anthropic_gewinnt(bereich):
+    weg, _, _ = await _run(_body(max_tokens=64000), pin_config={"provider": "anthropic"})
+    assert weg == "sdk"
+
+
+@pytest.mark.asyncio
+async def test_bereich_nutzer_pin_bedrock_erreicht_nie_den_direkten_weg(bereich):
+    weg, ergebnis, _ = await _run(
+        _body(max_tokens=64000),
+        pin_config={"provider": "bedrock", "region": "eu-central-1"},
+        headers={"X-App-Env": "prod"},  # der Bedrock-Pin gilt nur in prod
+        sonst_antwort=True,
+    )
+    assert weg != "direct", ergebnis
+
+
+@pytest.mark.asyncio
+async def test_bereich_tagesdeckel_ist_lautes_429(bereich):
+    weg, antwort, _ = await _run(_body(max_tokens=64000), cap=(True, 50.0, 50.0),
+                                 sonst_antwort=True)
+    assert weg == "antwort"
+    assert antwort.status_code == 429
+    assert json.loads(antwort.body)["error"]["code"] == "prepaid_daily_cap"
+
+
+@pytest.mark.parametrize("wert", [
+    "werking-energy",                       # Agent fehlt
+    "werking-energy:",                      # Agent leer
+    ":schema_analysis/beschreibung",        # App fehlt
+    "werking-energy;schema_analysis",       # falsches Trennzeichen
+    "werking-energy:schema analysis",       # Leerzeichen
+    "werking-energy:a,,x:b",                # leerer Eintrag
+])
+def test_bereich_tippfehler_ist_laut(monkeypatch, wert):
+    from src.routing.text_direct_routing import geltungsbereich
+    monkeypatch.setenv("BRIDGE_TEXT_DIRECT_ROUTING_APPS", wert)
+    with pytest.raises(RuntimeError):
+        geltungsbereich()
+
+
+def test_bereich_mehrere_eintraege(monkeypatch):
+    from src.routing.text_direct_routing import geltungsbereich, im_geltungsbereich
+    monkeypatch.setenv("BRIDGE_TEXT_DIRECT_ROUTING_APPS",
+                       " werking-energy:schema_analysis/beschreibung , werking-noise:essenz/ ")
+    assert geltungsbereich() == [("werking-energy", "schema_analysis/beschreibung"),
+                                 ("werking-noise", "essenz")]
+    assert im_geltungsbereich("werking-noise", "essenz/x") == "werking-noise:essenz"
+    assert im_geltungsbereich("werking-noise", None) is None
+
+
+@pytest.mark.asyncio
+async def test_bereich_tippfehler_bricht_den_aufruf_laut(monkeypatch):
+    monkeypatch.setenv("BRIDGE_TEXT_DIRECT_ROUTING_APPS", "werking-energy")
+    weg, ergebnis, _ = await _run(_body(max_tokens=64000), sonst_antwort=True)
+    assert weg in ("fehler", "antwort")
+    if weg == "antwort":
+        assert ergebnis.status_code >= 500

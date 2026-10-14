@@ -530,6 +530,13 @@ async def lifespan(app: FastAPI):
     # deploy time instead of at first request. Defensive coding, fail fast.
     from src.pricing import validate_billing_integrity
     validate_billing_integrity()
+
+    # FAIL-FAST: ein Tippfehler in BRIDGE_TEXT_DIRECT_ROUTING_APPS soll den
+    # Start verhindern, nicht still "nichts geht direkt" heissen.
+    from src.routing.text_direct_routing import geltungsbereich as _td_bereich
+    _td = _td_bereich()
+    if _td:
+        logger.info("✅ Text-Wegwahl Geltungsbereich: %s", _td)
     logger.info("✅ Billing integrity OK — every servable model is priced")
 
     # FAIL-FAST config invariant: a worker that declares DB-backed features must
@@ -3198,11 +3205,14 @@ async def _chat_completions_lauf(
         )
         if _text_rule_allowed and not request_body.provider_tier:
             from src.routing.text_direct_routing import apply_text_direct_routing
+            _td_attr = extract_attribution_context(request)
             _text_direct_reason = apply_text_direct_routing(
                 request_body,
                 has_images=has_vision_content(
                     prepare_messages_for_vision(request_body.messages)
                 ),
+                app_id=_td_attr.get("app_id"),
+                agent_id=_td_attr.get("agent_id"),
             )
             if _text_direct_reason:
                 logger.info(

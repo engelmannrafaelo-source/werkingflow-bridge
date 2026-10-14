@@ -34,7 +34,17 @@ Ein Aufruf geht auf den direkten Weg, wenn ALLE Bedingungen gelten:
   Zug der CLI, ab der sie selbst fortsetzt). Der Feld-Default (64 000) zaehlt
   nicht: nur was der Aufrufer schickt, ist verlangt.
 
-Schalter ``BRIDGE_TEXT_DIRECT_ROUTING_ENABLED`` (Vorgabe AUS). Grund: der direkte
+Eingeengter Geltungsbereich ``BRIDGE_TEXT_DIRECT_ROUTING_APPS`` — unabhaengig
+vom globalen Schalter: kommagetrennte Eintraege ``app-id:agent-praefix``, z. B.
+``werking-energy:schema_analysis/beschreibung``. Der Praefix greift
+segmentweise (``schema_analysis`` deckt ``schema_analysis/beschreibung``, aber
+nicht ``schema_analysis_alt``). Im Bereich geht JEDER reine Textaufruf direkt,
+auch ohne output_config und mit kleinem max_tokens — der SDK-Weg haelt
+max_tokens ueberhaupt nicht ein (Probe TEILE 14.10.2026: max_tokens 64 → 4 759
+Ausgabe-Token). Alle anderen Aufrufe bleiben unveraendert. Ein Tippfehler im
+Format ist laut: beim Start (lifespan) und bei jedem Aufruf.
+
+Globaler Schalter ``BRIDGE_TEXT_DIRECT_ROUTING_ENABLED`` (Vorgabe AUS). Grund: der direkte
 Weg bucht auf den Prepaid-Schluessel mit Tagesdeckel (prepaid_cap), der Abo-Weg
 nicht. Die Regel verschiebt also Kosten und kann den Deckel erreichen; das
 Einschalten ist eine Entscheidung, keine Nebenwirkung eines Deploys.
@@ -48,6 +58,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 from typing import Optional
 
 logger = logging.getLogger(__name__)
@@ -57,6 +68,44 @@ DIRECT_TIER = "claude-direct-notools"
 _FLAG_ENV = "BRIDGE_TEXT_DIRECT_ROUTING_ENABLED"
 _GRENZE_ENV = "BRIDGE_ABO_AUSGABEGRENZE"
 DEFAULT_ABO_AUSGABEGRENZE = 32_000
+
+
+_APPS_ENV = "BRIDGE_TEXT_DIRECT_ROUTING_APPS"
+_SEGMENT = r"[A-Za-z0-9._-]+"
+_EINTRAG = re.compile(rf"^({_SEGMENT}):({_SEGMENT}(?:/{_SEGMENT})*/?)$")
+
+
+def geltungsbereich() -> list[tuple[str, str]]:
+    """``BRIDGE_TEXT_DIRECT_ROUTING_APPS`` als [(app_id, agent_praefix)].
+
+    Leer/ungesetzt = kein Bereich. Jeder Eintrag, der nicht exakt
+    ``app-id:agent/praefix`` ist, wirft — ein still ignorierter Tippfehler
+    hiesse: der Bereich ist "an", aber nichts geht direkt.
+    """
+    raw = os.getenv(_APPS_ENV, "").strip()
+    if not raw:
+        return []
+    bereich: list[tuple[str, str]] = []
+    for teil in raw.split(","):
+        eintrag = teil.strip()
+        m = _EINTRAG.match(eintrag)
+        if not m:
+            raise RuntimeError(
+                f"{_APPS_ENV}: Eintrag {eintrag!r} ist nicht 'app-id:agent-praefix' "
+                f"(z. B. 'werking-energy:schema_analysis/beschreibung'); ganzer Wert {raw!r}"
+            )
+        bereich.append((m.group(1), m.group(2).rstrip("/")))
+    return bereich
+
+
+def im_geltungsbereich(app_id: Optional[str], agent_id: Optional[str]) -> Optional[str]:
+    """Der passende Eintrag ``app:praefix`` — oder None."""
+    if not app_id or not agent_id:
+        return None
+    for app, praefix in geltungsbereich():
+        if app == app_id and (agent_id == praefix or agent_id.startswith(praefix + "/")):
+            return f"{app}:{praefix}"
+    return None
 
 
 def is_enabled() -> bool:
@@ -76,24 +125,30 @@ def abo_ausgabegrenze() -> int:
     return wert
 
 
+def _reiner_textaufruf(request_body, *, has_images: bool) -> bool:
+    """Kein Weg gewaehlt, Backend anthropic, keine Werkzeuge, kein Bild, keine Sitzung."""
+    from src.models import BackendType
+
+    if getattr(request_body, "provider_tier", None):
+        return False
+    if getattr(request_body, "backend", None) not in (None, BackendType.ANTHROPIC):
+        return False
+    if getattr(request_body, "enable_tools", None) is True:
+        return False
+    if has_images:
+        return False
+    if getattr(request_body, "session_id", None):
+        return False
+    return True
+
+
 def direct_route_reason(request_body, *, has_images: bool) -> Optional[str]:
     """Warum dieser Aufruf auf den direkten Weg gehoert — oder None.
 
     Reine Funktion ueber die Anfrage; Schalter, Pin und Einrichtung des Wegs
     prueft ``apply_text_direct_routing``.
     """
-    from src.models import BackendType
-
-    if getattr(request_body, "provider_tier", None):
-        return None
-    backend = getattr(request_body, "backend", None)
-    if backend not in (None, BackendType.ANTHROPIC):
-        return None
-    if getattr(request_body, "enable_tools", None) is True:
-        return None
-    if has_images:
-        return None
-    if getattr(request_body, "session_id", None):
+    if not _reiner_textaufruf(request_body, has_images=has_images):
         return None
 
     if getattr(request_body, "output_config", None):
@@ -108,15 +163,24 @@ def direct_route_reason(request_body, *, has_images: bool) -> Optional[str]:
     return None
 
 
-def apply_text_direct_routing(request_body, *, has_images: bool) -> Optional[str]:
+def apply_text_direct_routing(
+    request_body,
+    *,
+    has_images: bool,
+    app_id: Optional[str] = None,
+    agent_id: Optional[str] = None,
+) -> Optional[str]:
     """Setzt ``provider_tier`` auf den direkten Weg, wenn die Regel greift.
 
     Gibt den Grund zurueck (fuer Log und Tests) oder None, wenn der Aufruf
     bleibt, wo er ist. Aufruf nur fuer nicht gepinnte Nutzer (main.py).
     """
-    if not is_enabled():
-        return None
-    reason = direct_route_reason(request_body, has_images=has_images)
+    reason: Optional[str] = None
+    eintrag = im_geltungsbereich(app_id, agent_id)
+    if eintrag and _reiner_textaufruf(request_body, has_images=has_images):
+        reason = f"bereich {eintrag}"
+    elif is_enabled():
+        reason = direct_route_reason(request_body, has_images=has_images)
     if reason is None:
         return None
 
