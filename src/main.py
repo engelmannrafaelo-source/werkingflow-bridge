@@ -63,6 +63,7 @@ from src.claude_cli import (
     warn_if_continuation_leak,
     StreamEndedWithoutCompletion,
     RESEARCH_OUTPUT_FILENAME,
+    FORTSETZUNG_KEY,
 )
 from src.middleware.bridge_error import CliApiError, SDKDisconnectError
 from src.message_adapter import MessageAdapter
@@ -1905,6 +1906,14 @@ async def generate_streaming_response(
         role_sent = False  # Track if we've sent the initial role chunk
         content_sent = False  # Track if we've sent any content
         deanon_buffer = ""  # Buffer for streaming de-anonymization (handles split placeholders)
+        # BRIDGETEXT: filter_content strips every block. At a CLI continuation
+        # seam the whitespace between the parts IS content ("Wort " | "weiter.",
+        # "Zeile 1\n" | "Zeile 2", table rows). naht_offen: the next text block
+        # opens a continuation part; letzter_rand: trailing whitespace of the
+        # last sent block, sent only if a seam follows. Without a seam the
+        # stream is unchanged.
+        naht_offen = False
+        letzter_rand = ""
 
         # Background task for disconnect detection
         async def monitor_client_disconnect():
@@ -2032,6 +2041,9 @@ async def generate_streaming_response(
                     # New format: {"content": [TextBlock(...)]}  (converted AssistantMessage)
                     content = chunk["content"]
             
+                if content is not None and chunk.get(FORTSETZUNG_KEY):
+                    naht_offen = True
+
                 if content is not None:
                     # Send initial role chunk if we haven't already
                     if not role_sent:
@@ -2059,9 +2071,22 @@ async def generate_streaming_response(
                             else:
                                 continue
                             
+                            if naht_offen and not raw_text.strip():
+                                # Whitespace-only start of a continuation part.
+                                letzter_rand += raw_text
+                                continue
                             # Filter out tool usage and thinking blocks
                             filtered_text = MessageAdapter.filter_content(raw_text)
                             _warn_continuation_leak_streaming(filtered_text)
+                            if filtered_text:
+                                if naht_offen:
+                                    filtered_text = (
+                                        letzter_rand
+                                        + raw_text[: len(raw_text) - len(raw_text.lstrip())]
+                                        + filtered_text
+                                    )
+                                    naht_offen = False
+                                letzter_rand = raw_text[len(raw_text.rstrip()):]
 
                             # Privacy: De-anonymize chunk with buffering (handles split placeholders)
                             if anonymization_mapping and filtered_text:

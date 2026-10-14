@@ -17,6 +17,8 @@ block, then the text block — one assistant message each, same message id.
 from __future__ import annotations
 
 # First: it puts SDK stand-ins in place where the SDK is not installed.
+import pytest  # noqa: E402
+
 from tests.unit.test_chat_modell_abbruch import (  # noqa: F401  (fixture)
     UserMessage,
     _chunks,
@@ -163,3 +165,68 @@ async def test_streaming_gleiche_naht_und_stop(monkeypatch, tmp_path):
     assert daten[-1]["choices"][0]["finish_reason"] == "stop"
     assert daten[-1]["x_bridge_finish"]["fortsetzungen"] == 1
 
+
+
+# BRIDGETEXTR P2-a: the whitespace at the seam is content. With BPE it usually
+# opens part 2; it can also close part 1. filter_content strips every block, so
+# the stream must keep it itself — and say "stop" only on the same text the
+# chat route returns.
+LEERRAUM_NAEHTE = [
+    ("Wort", " weiter."),
+    ("Wort ", "weiter."),
+    ("Zeile 1\n", "Zeile 2"),
+    ("Zeile 1", "\nZeile 2"),
+    ("Absatz.\n\n", "Neuer Absatz."),
+    ("Absatz.", "\n\nNeuer Absatz."),
+    ("| a | b |\n|---|---|\n| 1 | 2 |\n", "| 3 | 4 |\n| 5 | 6 |"),
+    ("| a | b |\n|---|---|\n| 1 | 2 |", "\n| 3 | 4 |"),
+    ("# Titel\n\n## Abschnitt", " 2\n\nText."),
+]
+
+
+@pytest.mark.parametrize("teil_1,teil_2", LEERRAUM_NAEHTE)
+async def test_streaming_behaelt_leerraum_an_der_naht(monkeypatch, tmp_path, teil_1, teil_2):
+    _, daten = await _stream(monkeypatch, tmp_path, fortsetzungs_verlauf(teil_1, teil_2))
+    text = "".join(d["choices"][0]["delta"].get("content", "") for d in daten)
+    assert text == (teil_1 + teil_2).strip()
+    assert daten[-1]["choices"][0]["finish_reason"] == "stop"
+
+
+@pytest.mark.parametrize("teil_1,teil_2", LEERRAUM_NAEHTE)
+def test_sync_chat_behaelt_leerraum_an_der_naht(monkeypatch, tmp_path, teil_1, teil_2):
+    resp = _sync_chat(monkeypatch, tmp_path, fortsetzungs_verlauf(teil_1, teil_2))
+    assert resp.status_code == 200, resp.text[:300]
+    assert resp.json()["choices"][0]["message"]["content"] == (teil_1 + teil_2).strip()
+
+
+async def test_streaming_leerraum_nur_block_am_anfang_der_fortsetzung(monkeypatch, tmp_path):
+    """Part 2's first text block is only whitespace, its text follows in a
+    second block of the same call."""
+    verlauf = fortsetzungs_verlauf("Wort", "weiter.")
+    # [..., part 2 thinking, part 2 text, result]: the blank block goes between.
+    verlauf.insert(-2, _parsed("msg_1", [{"type": "text", "text": "\n\n"}], "end_turn", USAGE_REST))
+    _, daten = await _stream(monkeypatch, tmp_path, verlauf)
+    text = "".join(d["choices"][0]["delta"].get("content", "") for d in daten)
+    assert text == "Wort\n\nweiter."
+
+
+async def test_streaming_ohne_naht_unveraendert(monkeypatch, tmp_path):
+    """No continuation: trailing whitespace of a block is not sent (as before)."""
+    usage = dict(USAGE, output_tokens=20)
+    verlauf = [sdk.init(), *_zug("msg_1", "Fertig.\n\n", "end_turn", usage),
+               sdk.result("success", usage=usage, num_turns=1)]
+    _, daten = await _stream(monkeypatch, tmp_path, verlauf)
+    text = "".join(d["choices"][0]["delta"].get("content", "") for d in daten)
+    assert text == "Fertig."
+
+
+def test_ohne_message_id_kein_gleicher_aufruf():
+    """BRIDGETEXTR P3-a: without ids nothing proves "same call"."""
+    chunks = [
+        {"content": [{"type": "text", "text": "A"}]},
+        {"content": [{"type": "text", "text": "B"}]},
+    ]
+    assert antwort_teile(chunks) == ("A", 0)
+    # A marked continuation still joins without ids.
+    chunks[1][FORTSETZUNG_KEY] = True
+    assert antwort_teile(chunks) == ("AB", 1)

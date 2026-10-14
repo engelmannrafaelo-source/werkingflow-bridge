@@ -1387,11 +1387,12 @@ def antwort_abgeschnitten(ende: Optional[str]) -> bool:
 # run_completion), … The CLI yields one assistant message per content block,
 # so a call can span several chunks (thinking, then text) that share its
 # message_id. antwort_teile assembles the answer from the first text on:
-#   * further chunks of the same call → joined with "\n" (as text blocks of
-#     one message always were);
+#   * further chunks of the same call (same, known message_id) → joined with
+#     "\n" (as text blocks of one message always were);
 #   * a continuation → joined directly, no separator: the CLI tells the model
-#     to "pick up mid-thought", the cut may sit inside a word — the same seam
-#     the SSE stream has always delivered (it streams every part as it comes);
+#     to "pick up mid-thought", the cut may sit inside a word. Whitespace at
+#     the seam is kept on both sides; the SSE stream keeps it too
+#     (generate_streaming_response, naht_offen/letzter_rand);
 #   * anything else ends the answer, as before: a tool call (the text was a
 #     preamble), another call without the continuation mark, the CLI's
 #     follow-up after a classifier stop, the CLI's own error message after the
@@ -1463,7 +1464,8 @@ def antwort_teile(messages: list) -> Tuple[Optional[str], int]:
             fortsetzungen += 1
             naht_direkt = True
             aktuelle_id = message.get("message_id")
-        elif message.get("message_id") != aktuelle_id:
+        elif aktuelle_id is None or message.get("message_id") != aktuelle_id:
+            # Without an id nothing proves "same call" — end, as before.
             break
         if teil:
             text += ("" if naht_direkt else "\n") + teil
