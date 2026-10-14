@@ -268,10 +268,11 @@ def test_regel_bedrock_bleibt_unberuehrt():
                                has_images=False) is None
 
 
-def test_regel_kaputte_grenze_ist_laut(monkeypatch):
+def test_regel_kaputte_grenze_schaltet_nur_die_budget_bedingung_ab(monkeypatch):
+    # Laut ist der Start (pruefe_beim_start); zur Laufzeit kein Wurf, der
+    # jeden Aufruf mit max_tokens zu einem 500 machte.
     monkeypatch.setenv("BRIDGE_ABO_AUSGABEGRENZE", "viel")
-    with pytest.raises(RuntimeError):
-        direct_route_reason(_req(max_tokens=64000), has_images=False)
+    assert direct_route_reason(_req(max_tokens=64000), has_images=False) is None
 
 
 # --- eingeengter Geltungsbereich (BRIDGE_TEXT_DIRECT_ROUTING_APPS) -----------
@@ -397,15 +398,6 @@ def test_bereich_mehrere_eintraege(monkeypatch):
     assert im_geltungsbereich("werking-noise", None) is None
 
 
-@pytest.mark.asyncio
-async def test_bereich_tippfehler_bricht_den_aufruf_laut(monkeypatch):
-    monkeypatch.setenv("BRIDGE_TEXT_DIRECT_ROUTING_APPS", "werking-energy")
-    weg, ergebnis, _ = await _run(_body(max_tokens=64000), sonst_antwort=True)
-    assert weg in ("fehler", "antwort")
-    if weg == "antwort":
-        assert ergebnis.status_code >= 500
-
-
 # --- BRIDGEFOLGER P3-a / P3-b -----------------------------------------------
 
 @pytest.mark.asyncio
@@ -451,3 +443,108 @@ async def test_engelmann_mit_ueberstimmtem_pin_bleibt_auch_global_auf_sdk(an):
         sonst_antwort=True,
     )
     assert weg == "sdk", ergebnis
+
+
+# --- Kanzler 12:3xZ: kein Kollateralschaden, kein stiller Rueckfall ----------
+
+def _code(antwort):
+    return antwort.status_code, json.loads(antwort.body)["error"]["code"]
+
+
+@pytest.mark.asyncio
+async def test_tippfehler_zur_laufzeit_trifft_nur_die_genannte_app(bereich, monkeypatch):
+    monkeypatch.setenv(
+        "BRIDGE_TEXT_DIRECT_ROUTING_APPS",
+        "werking-energy:schema_analysis/beschreibung,werking-noise;essenz",
+    )
+    # gueltiger Eintrag wirkt weiter
+    weg, rb, _ = await _run(_body(max_tokens=64))
+    assert weg == "direct"
+    # die App des kaputten Eintrags: laut, nur dieser Aufruf
+    weg, antwort, _ = await _run(_body(max_tokens=64), app_id="werking-noise",
+                                 headers={"X-Agent-ID": "essenz"}, sonst_antwort=True)
+    assert weg == "antwort"
+    assert _code(antwort) == (503, "text_direct_config_invalid")
+    # alle anderen unveraendert
+    for app_id in ("werking-report", "cui", None):
+        weg, _, _ = await _run(_body(output_config={"effort": "low"}, max_tokens=64000),
+                               app_id=app_id)
+        assert weg == "sdk", app_id
+
+
+@pytest.mark.asyncio
+async def test_tippfehler_ohne_gueltigen_eintrag_laesst_fremde_apps_unberuehrt(bereich, monkeypatch):
+    monkeypatch.setenv("BRIDGE_TEXT_DIRECT_ROUTING_APPS", "werking-energy")
+    weg, antwort, _ = await _run(_body(max_tokens=64), sonst_antwort=True)
+    assert _code(antwort) == (503, "text_direct_config_invalid")
+    weg, _, _ = await _run(_body(max_tokens=64000), app_id="werking-report")
+    assert weg == "sdk"
+
+
+@pytest.mark.asyncio
+async def test_kaputte_abo_grenze_zur_laufzeit_kein_500(an, monkeypatch):
+    monkeypatch.setenv("BRIDGE_ABO_AUSGABEGRENZE", "viel")
+    weg, _, _ = await _run(_body(max_tokens=64000), app_id="werking-report")
+    assert weg == "sdk"
+
+
+@pytest.mark.asyncio
+async def test_bereich_ohne_schluessel_ist_503_kein_stiller_rueckfall(bereich, monkeypatch):
+    monkeypatch.delenv("ANTHROPIC_VISION_API_KEY", raising=False)
+    weg, antwort, _ = await _run(_body(output_config={"effort": "low"}, max_tokens=64000),
+                                 sonst_antwort=True)
+    assert weg == "antwort"
+    assert _code(antwort) == (503, "text_direct_key_missing")
+    # ausserhalb des Bereichs unveraendert
+    weg, _, _ = await _run(_body(max_tokens=64000),
+                           headers={"X-Agent-ID": "schema_analysis/block"})
+    assert weg == "sdk"
+    weg, _, _ = await _run(_body(max_tokens=64000), app_id="werking-report")
+    assert weg == "sdk"
+
+
+# Startpruefung
+
+def test_start_ohne_bereich_ok(monkeypatch):
+    from src.routing.text_direct_routing import pruefe_beim_start
+    monkeypatch.delenv("BRIDGE_TEXT_DIRECT_ROUTING_APPS", raising=False)
+    monkeypatch.delenv("ANTHROPIC_VISION_API_KEY", raising=False)
+    monkeypatch.delenv("BRIDGE_ABO_AUSGABEGRENZE", raising=False)
+    assert pruefe_beim_start() == []
+
+
+def test_start_bricht_bei_tippfehler_ab(bereich, monkeypatch):
+    from src.routing.text_direct_routing import pruefe_beim_start
+    monkeypatch.setenv("BRIDGE_TEXT_DIRECT_ROUTING_APPS", "werking-energy;schema_analysis")
+    with pytest.raises(RuntimeError, match="app-id:agent-praefix"):
+        pruefe_beim_start()
+
+
+def test_start_bricht_bei_bereich_ohne_schluessel_ab(bereich, monkeypatch):
+    from src.routing.text_direct_routing import pruefe_beim_start
+    monkeypatch.delenv("ANTHROPIC_VISION_API_KEY", raising=False)
+    with pytest.raises(RuntimeError, match="ANTHROPIC_VISION_API_KEY"):
+        pruefe_beim_start()
+
+
+def test_start_bricht_bei_kaputter_abo_grenze_ab(monkeypatch):
+    from src.routing.text_direct_routing import pruefe_beim_start
+    monkeypatch.setenv("BRIDGE_ABO_AUSGABEGRENZE", "viel")
+    with pytest.raises(RuntimeError):
+        pruefe_beim_start()
+
+
+def test_start_mit_bereich_und_schluessel_ok(bereich):
+    from src.routing.text_direct_routing import pruefe_beim_start
+    assert pruefe_beim_start() == [("werking-energy", "schema_analysis/beschreibung")]
+
+
+@pytest.mark.asyncio
+async def test_lifespan_ruft_die_startpruefung_und_bricht_ab(bereich, monkeypatch):
+    # Am echten lifespan: Bereich ohne Schluessel -> Start bricht ab, bevor
+    # der Worker Aufrufe annimmt.
+    monkeypatch.delenv("ANTHROPIC_VISION_API_KEY", raising=False)
+    with patch("src.pricing.validate_billing_integrity", MagicMock()):
+        with pytest.raises(RuntimeError, match="ANTHROPIC_VISION_API_KEY"):
+            async with src.main.lifespan(src.main.app):
+                pass

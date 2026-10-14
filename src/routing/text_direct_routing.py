@@ -42,7 +42,12 @@ nicht ``schema_analysis_alt``). Im Bereich geht JEDER reine Textaufruf direkt,
 auch ohne output_config und mit kleinem max_tokens — der SDK-Weg haelt
 max_tokens ueberhaupt nicht ein (Probe TEILE 14.10.2026: max_tokens 64 → 4 759
 Ausgabe-Token). Alle anderen Aufrufe bleiben unveraendert. Ein Tippfehler im
-Format ist laut: beim Start (lifespan) und bei jedem Aufruf.
+Format ist laut: der Worker startet nicht (lifespan, ``pruefe_beim_start``).
+Zur Laufzeit trifft ein fehlerhafter Eintrag nur Aufrufe der darin genannten
+App (503 ``text_direct_config_invalid``); alle anderen laufen unveraendert.
+Fehlt bei gesetztem Bereich der Schluessel des direkten Wegs, startet der
+Worker ebenfalls nicht; zur Laufzeit antwortet ein Aufruf im Bereich 503
+``text_direct_key_missing`` statt still auf den SDK-Weg zu fallen.
 
 Globaler Schalter ``BRIDGE_TEXT_DIRECT_ROUTING_ENABLED`` (Vorgabe AUS). Er gilt
 fuer JEDEN Aufrufer ohne Nutzer-Pin: alle Kunden-Apps, Aufrufe ohne X-App-ID
@@ -79,37 +84,117 @@ _SEGMENT = r"[A-Za-z0-9._-]+"
 _EINTRAG = re.compile(rf"^({_SEGMENT}):({_SEGMENT}(?:/{_SEGMENT})*/?)$")
 
 
-def geltungsbereich() -> list[tuple[str, str]]:
-    """``BRIDGE_TEXT_DIRECT_ROUTING_APPS`` als [(app_id, agent_praefix)].
+class TextDirectRoutingError(Exception):
+    """Ein Aufruf IM Geltungsbereich kann nicht wie verlangt bedient werden.
 
-    Leer/ungesetzt = kein Bereich. Jeder Eintrag, der nicht exakt
-    ``app-id:agent/praefix`` ist, wirft — ein still ignorierter Tippfehler
-    hiesse: der Bereich ist "an", aber nichts geht direkt.
+    main.py antwortet mit ``status`` und ``code`` — laut, aber nur fuer diesen
+    Aufruf. Aufrufe ausserhalb des Bereichs bekommen diesen Fehler nie.
+    """
+
+    def __init__(self, status: int, code: str, message: str):
+        super().__init__(message)
+        self.status = status
+        self.code = code
+        self.message = message
+
+
+def _zerlege(raw: str) -> tuple[list[tuple[str, str]], list[str]]:
+    """(gueltige Eintraege, fehlerhafte Rohtexte)."""
+    gueltig: list[tuple[str, str]] = []
+    fehlerhaft: list[str] = []
+    for teil in raw.split(","):
+        eintrag = teil.strip()
+        m = _EINTRAG.match(eintrag)
+        if m:
+            gueltig.append((m.group(1), m.group(2).rstrip("/")))
+        else:
+            fehlerhaft.append(eintrag)
+    return gueltig, fehlerhaft
+
+
+def _fehlertext(fehlerhaft: list[str], raw: str) -> str:
+    return (
+        f"{_APPS_ENV}: Eintrag/Eintraege {fehlerhaft!r} nicht im Format "
+        f"'app-id:agent-praefix' (z. B. 'werking-energy:schema_analysis/beschreibung'); "
+        f"ganzer Wert {raw!r}"
+    )
+
+
+def geltungsbereich() -> list[tuple[str, str]]:
+    """``BRIDGE_TEXT_DIRECT_ROUTING_APPS`` als [(app_id, agent_praefix)] — STRENG.
+
+    Fuer den Start (``pruefe_beim_start``): jeder fehlerhafte Eintrag wirft.
+    Zur Laufzeit gilt ``_laufzeit_bereich`` — dort darf ein Tippfehler nie
+    Aufrufe ausserhalb des Bereichs treffen.
     """
     raw = os.getenv(_APPS_ENV, "").strip()
     if not raw:
         return []
-    bereich: list[tuple[str, str]] = []
-    for teil in raw.split(","):
-        eintrag = teil.strip()
-        m = _EINTRAG.match(eintrag)
-        if not m:
-            raise RuntimeError(
-                f"{_APPS_ENV}: Eintrag {eintrag!r} ist nicht 'app-id:agent-praefix' "
-                f"(z. B. 'werking-energy:schema_analysis/beschreibung'); ganzer Wert {raw!r}"
-            )
-        bereich.append((m.group(1), m.group(2).rstrip("/")))
-    return bereich
+    gueltig, fehlerhaft = _zerlege(raw)
+    if fehlerhaft:
+        raise RuntimeError(_fehlertext(fehlerhaft, raw))
+    return gueltig
+
+
+_gemeldet: set[str] = set()
+
+
+def _laufzeit_bereich(app_id: Optional[str]) -> list[tuple[str, str]]:
+    """Gueltige Eintraege fuer diesen Aufruf; ein Tippfehler trifft nur seine App.
+
+    Der Wert wird beim Start streng geprueft (``pruefe_beim_start``, lifespan) —
+    ein Prozess mit fehlerhaftem Wert startet nicht. Dieser Zweig ist die
+    zweite Linie (Prozess ohne lifespan, Umgebung nachtraeglich geaendert):
+    Nennt ein fehlerhafter Eintrag die App dieses Aufrufs, scheitert der
+    Aufruf laut (503 text_direct_config_invalid) — er koennte zum Bereich
+    gehoeren, und still auf den SDK-Weg zu fallen hiesse, dass sein Budget
+    nicht gilt. Jeder andere Aufruf laeuft mit den gueltigen Eintraegen
+    weiter; der Fehler steht einmal je Wert als ERROR im Log.
+    """
+    raw = os.getenv(_APPS_ENV, "").strip()
+    if not raw:
+        return []
+    gueltig, fehlerhaft = _zerlege(raw)
+    if not fehlerhaft:
+        return gueltig
+    if raw not in _gemeldet:
+        _gemeldet.add(raw)
+        logger.error("text_direct_routing: %s", _fehlertext(fehlerhaft, raw))
+    if app_id and any(app_id in eintrag for eintrag in fehlerhaft):
+        raise TextDirectRoutingError(
+            503, "text_direct_config_invalid", _fehlertext(fehlerhaft, raw)
+        )
+    return gueltig
 
 
 def im_geltungsbereich(app_id: Optional[str], agent_id: Optional[str]) -> Optional[str]:
     """Der passende Eintrag ``app:praefix`` — oder None."""
-    if not app_id or not agent_id:
+    if not app_id:
         return None
-    for app, praefix in geltungsbereich():
+    bereich = _laufzeit_bereich(app_id)
+    if not agent_id:
+        return None
+    for app, praefix in bereich:
         if app == app_id and (agent_id == praefix or agent_id.startswith(praefix + "/")):
             return f"{app}:{praefix}"
     return None
+
+
+def pruefe_beim_start() -> list[tuple[str, str]]:
+    """Startpruefung (lifespan): Format, Abo-Grenze und — wenn ein Bereich gesetzt
+    ist — der Schluessel des direkten Wegs. Wirft; der Worker startet dann nicht."""
+    bereich = geltungsbereich()
+    abo_ausgabegrenze()
+    if bereich:
+        from src.providers.registry import is_tier_usable
+
+        if not is_tier_usable(DIRECT_TIER):
+            raise RuntimeError(
+                f"{_APPS_ENV}={os.getenv(_APPS_ENV)!r} ist gesetzt, aber {DIRECT_TIER!r} ist "
+                "auf diesem Host nicht eingerichtet (ANTHROPIC_VISION_API_KEY fehlt) — "
+                "Aufrufe im Bereich koennten nicht direkt laufen."
+            )
+    return bereich
 
 
 def is_enabled() -> bool:
@@ -158,12 +243,18 @@ def direct_route_reason(request_body, *, has_images: bool) -> Optional[str]:
     if getattr(request_body, "output_config", None):
         return "output_config"
     max_tokens = getattr(request_body, "max_tokens", None)
-    if (
-        "max_tokens" in getattr(request_body, "model_fields_set", set())
-        and isinstance(max_tokens, int)
-        and max_tokens > abo_ausgabegrenze()
+    if "max_tokens" in getattr(request_body, "model_fields_set", set()) and isinstance(
+        max_tokens, int
     ):
-        return f"max_tokens={max_tokens}>{abo_ausgabegrenze()}"
+        try:
+            grenze = abo_ausgabegrenze()
+        except RuntimeError as e:
+            # Startpruefung faengt das ab; zur Laufzeit trifft ein Tippfehler
+            # hier nur die Budget-Bedingung des globalen Schalters, nie alle Aufrufe.
+            logger.error("text_direct_routing: %s — Budget-Bedingung aus", e)
+            return None
+        if max_tokens > grenze:
+            return f"max_tokens={max_tokens}>{grenze}"
     return None
 
 
@@ -191,6 +282,15 @@ def apply_text_direct_routing(
     from src.providers.registry import is_tier_usable
 
     if not is_tier_usable(DIRECT_TIER):
+        if eintrag:
+            # Im Bereich ist der direkte Weg zugesagt: kein stiller Rueckfall.
+            raise TextDirectRoutingError(
+                503,
+                "text_direct_key_missing",
+                f"Aufruf im Geltungsbereich {eintrag} muss ueber {DIRECT_TIER!r} laufen, "
+                "der Weg ist auf diesem Host nicht eingerichtet (ANTHROPIC_VISION_API_KEY "
+                "fehlt). Der SDK-Weg haelt max_tokens/output_config nicht ein.",
+            )
         logger.warning(
             "text_direct_routing: Aufruf verlangt %s, aber %r ist auf diesem Host "
             "nicht eingerichtet — bleibt auf dem SDK-Weg, wo das NICHT gilt.",

@@ -533,8 +533,8 @@ async def lifespan(app: FastAPI):
 
     # FAIL-FAST: ein Tippfehler in BRIDGE_TEXT_DIRECT_ROUTING_APPS soll den
     # Start verhindern, nicht still "nichts geht direkt" heissen.
-    from src.routing.text_direct_routing import geltungsbereich as _td_bereich
-    _td = _td_bereich()
+    from src.routing.text_direct_routing import pruefe_beim_start as _td_pruefen
+    _td = _td_pruefen()
     if _td:
         logger.info("✅ Text-Wegwahl Geltungsbereich: %s", _td)
     logger.info("✅ Billing integrity OK — every servable model is priced")
@@ -3208,16 +3208,33 @@ async def _chat_completions_lauf(
             or (_provider_from_app_rule and user_pinned_provider == "anthropic")
         )
         if _text_rule_allowed and not request_body.provider_tier:
-            from src.routing.text_direct_routing import apply_text_direct_routing
-            _td_attr = extract_attribution_context(request)
-            _text_direct_reason = apply_text_direct_routing(
-                request_body,
-                has_images=has_vision_content(
-                    prepare_messages_for_vision(request_body.messages)
-                ),
-                app_id=_td_attr.get("app_id"),
-                agent_id=_td_attr.get("agent_id"),
+            from src.routing.text_direct_routing import (
+                TextDirectRoutingError, apply_text_direct_routing,
             )
+            _td_attr = extract_attribution_context(request)
+            try:
+                _text_direct_reason = apply_text_direct_routing(
+                    request_body,
+                    has_images=has_vision_content(
+                        prepare_messages_for_vision(request_body.messages)
+                    ),
+                    app_id=_td_attr.get("app_id"),
+                    agent_id=_td_attr.get("agent_id"),
+                )
+            except TextDirectRoutingError as _td_err:
+                logger.error(
+                    "Text-Wegwahl: %s (app=%s agent=%s)",
+                    _td_err.message, _td_attr.get("app_id"), _td_attr.get("agent_id"),
+                )
+                return JSONResponse(
+                    status_code=_td_err.status,
+                    content={"error": {
+                        "message": _td_err.message,
+                        "type": "configuration_error",
+                        "code": _td_err.code,
+                        "retryable": False,
+                    }},
+                )
             if _text_direct_reason:
                 logger.info(
                     "🎯 Text-Wegwahl: %s → tier=%s (model=%s)",
