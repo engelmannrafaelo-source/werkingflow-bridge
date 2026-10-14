@@ -35,6 +35,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
@@ -293,6 +294,31 @@ def link_sources(mirror: LibraryMirror) -> Dict[str, str]:
     return {f"{doc_id}.md": str(mirror.docs_dir / f"{doc_id}.md") for doc_id in mirror.available_ids}
 
 
+def _filter_kann_bibliothek_treffen(werkzeug: str, file_filter: Any) -> bool:
+    """Kann eine Suche im Sitzungsverzeichnis mit diesem Dateimuster einen
+    Volltext unter ``bibliothek/<id>.md`` treffen?
+
+    - Grep ohne ``glob`` durchsucht alles: ja.
+    - Grep-``glob`` ohne "/" passt (ripgrep) auf Dateinamen in jeder Tiefe;
+      Glob-``pattern`` ohne "/" nur auf die oberste Ebene: dort liegt kein
+      Volltext, also nein.
+    - Ein Muster mit festem erstem Ordner ("unterlagen/*.md") meint einen
+      anderen Ordner: nein (``bibliothek/...`` faengt _in_library vorher ab).
+    - Endet das Muster auf eine feste Endung ausser .md ("*.pdf"): nein.
+    """
+    if not isinstance(file_filter, str) or not file_filter.strip():
+        return werkzeug == "Grep"
+    muster = file_filter.strip().removeprefix("./")
+    if "/" in muster:
+        erster = muster.split("/", 1)[0]
+        if not any(ch in erster for ch in "*?[{"):
+            return False
+    elif werkzeug == "Glob":
+        return False
+    endung = re.search(r"\.([A-Za-z0-9]+)$", muster)
+    return endung is None or endung.group(1).lower() == "md"
+
+
 def count_library_reads(chunks: List[Any]) -> Tuple[int, List[str]]:
     """(Anzahl Bibliotheksaufrufe, gelesene Dokument-ids) aus den CLI-Chunks.
 
@@ -346,13 +372,8 @@ def count_library_reads(chunks: List[Any]) -> Tuple[int, List[str]]:
             path = block_input.get("path")
             file_filter = block_input.get("glob") if name == "Grep" else block_input.get("pattern")
             searches_workdir = path is None or (isinstance(path, str) and path.strip() in ("", ".", "./"))
-            # Ein Muster, das mit einem festen fremden Ordner beginnt
-            # ("unterlagen/*.md"), schliesst die Bibliothek wieder aus.
-            other_dir = (
-                isinstance(file_filter, str)
-                and "/" in file_filter.lstrip("./")
-                and not any(ch in file_filter.lstrip("./").split("/", 1)[0] for ch in "*?[{")
-            )
-            if _in_library(path) or _in_library(file_filter) or (searches_workdir and not other_dir):
+            if _in_library(path) or _in_library(file_filter) or (
+                searches_workdir and _filter_kann_bibliothek_treffen(name, file_filter)
+            ):
                 calls += 1
     return calls, doc_ids

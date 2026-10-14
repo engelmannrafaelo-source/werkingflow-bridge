@@ -308,3 +308,25 @@ def test_read_ausserhalb_zaehlt_weiter_nicht_und_glob_im_ordner_zaehlt():
         {"content": [_Block("Glob", {"pattern": "bibliothek/oib*"})]},
     ]
     assert count_library_reads(chunks) == (2, [])
+
+
+def test_suche_ohne_pfad_zaehlt_nur_wenn_das_muster_die_bibliothek_treffen_kann():
+    # BRIDGEFOLGER P3-c: nicht-rekursives Glob und fremde Endungen treffen
+    # bibliothek/<id>.md nicht.
+    zaehlt = [
+        _Block("Grep", {"pattern": "x", "glob": "*.md"}),        # ripgrep: jede Tiefe
+        _Block("Grep", {"pattern": "x", "glob": "*.{md,txt}"}),
+        _Block("Grep", {"pattern": "x", "glob": "**/*"}),
+        _Block("Glob", {"pattern": "**/*.md"}),
+        _Block("Glob", {"pattern": "*/oib*"}),
+    ]
+    zaehlt_nicht = [
+        _Block("Glob", {"pattern": "*.md"}),                     # nur oberste Ebene
+        _Block("Grep", {"pattern": "x", "glob": "*.pdf"}),
+        _Block("Glob", {"pattern": "**/*.pdf"}),
+        _Block("Glob", {"pattern": "unterlagen/*.md"}),
+    ]
+    for b in zaehlt:
+        assert count_library_reads([{"content": [b]}]) == (1, []), b.input
+    for b in zaehlt_nicht:
+        assert count_library_reads([{"content": [b]}]) == (0, []), b.input
