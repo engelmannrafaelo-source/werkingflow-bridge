@@ -1,0 +1,134 @@
+"""Wegwahl fuer Textaufrufe: was nur der direkte Weg einhalten kann, geht dorthin.
+
+Der Standardweg der Bridge (Claude-Code-SDK im Abo-Pool) reicht weder
+``output_config`` (Denk-Stufe, Ausgabeformat) noch ``max_tokens`` an das Modell
+weiter (``ChatCompletionRequest.log_unsupported_parameters``). Die CLI setzt nach
+ihrer eigenen Ausgabegrenze sogar selbst fort ("Output token limit hit. Resume
+directly"). Ein verlangtes Budget gilt dort also nicht: Muehls Langbeschreibung
+kam am 14.10.2026 mit 71 197 Ausgabe-Token bei max_tokens 64 000 zurueck.
+
+Bis hierher hat die App das selbst entschieden und ``provider_tier=
+claude-direct-notools`` fest mitgeschickt (werking-energy
+schema_analysis/bridge_client.py). Die Entscheidung gehoert in die Bridge — sie
+allein weiss, welcher Weg welches Feld einhaelt. Diese Regel ergaenzt die
+tabellengesteuerte ``app_tier_policy``: dort entscheidet (App, Agent, Umgebung),
+hier die Form der Anfrage.
+
+Ein Aufruf geht auf den direkten Weg, wenn ALLE Bedingungen gelten:
+
+- kein Weg ist schon gewaehlt — weder vom Aufrufer (``provider_tier``) noch von
+  der app_tier_policy — und kein Nutzer-Pin steht dagegen (das prueft main.py).
+  Die App-Provider-Regel ``anthropic`` (jede Kunden-App, auch per globaler
+  Vorgabe) haelt die Regel nicht auf: sie sperrt Bedrock und fremde Gateways,
+  der direkte Weg ist derselbe Anbieter. Sie raeumt allerdings jeden vom
+  Aufrufer geschickten ``provider_tier`` ab — deshalb kommt das feste
+  ``claude-direct-notools`` der App bei der Bridge gar nicht an, und diese
+  Regel ist der einzige Weg, auf dem es wirkt;
+- Standard-Backend ``anthropic`` (Bedrock/OpenAI-kompatibel bleiben unberuehrt);
+- reiner Textaufruf: ``enable_tools`` nicht True, kein Bild, keine
+  ``session_id`` (der direkte Weg ist zustandslos, eine SDK-Sitzung liesse sich
+  dort nicht fortsetzen);
+- der Aufruf verlangt etwas, das nur der direkte Weg einhaelt: ``output_config``
+  ist gesetzt, ODER ``max_tokens`` ist ausdruecklich gesetzt und groesser als die
+  Abo-Grenze (``BRIDGE_ABO_AUSGABEGRENZE``, Vorgabe 32 000 — die Ausgabegrenze je
+  Zug der CLI, ab der sie selbst fortsetzt). Der Feld-Default (64 000) zaehlt
+  nicht: nur was der Aufrufer schickt, ist verlangt.
+
+Schalter ``BRIDGE_TEXT_DIRECT_ROUTING_ENABLED`` (Vorgabe AUS). Grund: der direkte
+Weg bucht auf den Prepaid-Schluessel mit Tagesdeckel (prepaid_cap), der Abo-Weg
+nicht. Die Regel verschiebt also Kosten und kann den Deckel erreichen; das
+Einschalten ist eine Entscheidung, keine Nebenwirkung eines Deploys.
+
+Fail-open wie die app_tier_policy: ist der direkte Weg auf diesem Host nicht
+eingerichtet (kein Schluessel), bleibt der Aufruf auf dem Standardweg — laut im
+Log, weil sein Budget dann wieder nicht gilt.
+"""
+
+from __future__ import annotations
+
+import logging
+import os
+from typing import Optional
+
+logger = logging.getLogger(__name__)
+
+DIRECT_TIER = "claude-direct-notools"
+
+_FLAG_ENV = "BRIDGE_TEXT_DIRECT_ROUTING_ENABLED"
+_GRENZE_ENV = "BRIDGE_ABO_AUSGABEGRENZE"
+DEFAULT_ABO_AUSGABEGRENZE = 32_000
+
+
+def is_enabled() -> bool:
+    return os.getenv(_FLAG_ENV, "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def abo_ausgabegrenze() -> int:
+    raw = os.getenv(_GRENZE_ENV, "").strip()
+    if not raw:
+        return DEFAULT_ABO_AUSGABEGRENZE
+    try:
+        wert = int(raw)
+    except ValueError as e:
+        raise RuntimeError(f"{_GRENZE_ENV}={raw!r} ist keine ganze Zahl") from e
+    if wert <= 0:
+        raise RuntimeError(f"{_GRENZE_ENV}={raw!r} muss positiv sein")
+    return wert
+
+
+def direct_route_reason(request_body, *, has_images: bool) -> Optional[str]:
+    """Warum dieser Aufruf auf den direkten Weg gehoert — oder None.
+
+    Reine Funktion ueber die Anfrage; Schalter, Pin und Einrichtung des Wegs
+    prueft ``apply_text_direct_routing``.
+    """
+    from src.models import BackendType
+
+    if getattr(request_body, "provider_tier", None):
+        return None
+    backend = getattr(request_body, "backend", None)
+    if backend not in (None, BackendType.ANTHROPIC):
+        return None
+    if getattr(request_body, "enable_tools", None) is True:
+        return None
+    if has_images:
+        return None
+    if getattr(request_body, "session_id", None):
+        return None
+
+    if getattr(request_body, "output_config", None):
+        return "output_config"
+    max_tokens = getattr(request_body, "max_tokens", None)
+    if (
+        "max_tokens" in getattr(request_body, "model_fields_set", set())
+        and isinstance(max_tokens, int)
+        and max_tokens > abo_ausgabegrenze()
+    ):
+        return f"max_tokens={max_tokens}>{abo_ausgabegrenze()}"
+    return None
+
+
+def apply_text_direct_routing(request_body, *, has_images: bool) -> Optional[str]:
+    """Setzt ``provider_tier`` auf den direkten Weg, wenn die Regel greift.
+
+    Gibt den Grund zurueck (fuer Log und Tests) oder None, wenn der Aufruf
+    bleibt, wo er ist. Aufruf nur fuer nicht gepinnte Nutzer (main.py).
+    """
+    if not is_enabled():
+        return None
+    reason = direct_route_reason(request_body, has_images=has_images)
+    if reason is None:
+        return None
+
+    from src.providers.registry import is_tier_usable
+
+    if not is_tier_usable(DIRECT_TIER):
+        logger.warning(
+            "text_direct_routing: Aufruf verlangt %s, aber %r ist auf diesem Host "
+            "nicht eingerichtet — bleibt auf dem SDK-Weg, wo das NICHT gilt.",
+            reason, DIRECT_TIER,
+        )
+        return None
+
+    request_body.provider_tier = DIRECT_TIER
+    return reason

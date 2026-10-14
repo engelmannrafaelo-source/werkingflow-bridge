@@ -3116,6 +3116,7 @@ async def _chat_completions_lauf(
             app_rule_outranks_user_pin, AppProviderPolicyError,
         )
         _app_rule, _app_rule_app_id = resolve_app_provider_policy(request)
+        _provider_from_app_rule = False
         if user_pinned_provider is None or app_rule_outranks_user_pin(_app_rule_app_id):
             if _app_rule is not None:
                 try:
@@ -3138,6 +3139,7 @@ async def _chat_completions_lauf(
                     )
                 if _app_applied:
                     user_pinned_provider = _app_applied
+                    _provider_from_app_rule = True
                     request.state.user_provider_pinned = _app_applied
                     logger.info(
                         "🏢 App-level provider policy: app=%s → provider=%s region=%s",
@@ -3179,6 +3181,35 @@ async def _chat_completions_lauf(
             except Exception as _pol_e:  # noqa: BLE001 — cost routing never breaks a call
                 logger.warning("app_tier_policy application failed (fail-open): %s", _pol_e)
 
+        # TEXT-WEGWAHL: ein reiner Textaufruf, der output_config oder ein
+        # Ausgabebudget ueber der Abo-Grenze verlangt, geht auf den direkten
+        # Weg — der SDK-Weg haelt beides nicht ein (src/routing/
+        # text_direct_routing.py). Nur wenn weder Aufrufer noch
+        # app_tier_policy einen Weg gewaehlt haben, und nie gegen einen
+        # Nutzer-Pin. Die App-Regel "anthropic" (werking-energy, -report,
+        # -noise) haelt die Regel NICHT auf: sie sperrt Bedrock und fremde
+        # Gateways, der direkte Weg ist derselbe Anbieter. Ohne diese Ausnahme
+        # erreichte die Regel genau die App nie, fuer die sie gebaut ist —
+        # apply_app_provider_policy raeumt dort sogar ein vom Aufrufer
+        # geschicktes provider_tier ab (gemessen 14.10.2026, BRIDGEFOLGE).
+        _text_direct_reason: Optional[str] = None
+        _text_rule_allowed = user_pinned_provider is None or (
+            _provider_from_app_rule and user_pinned_provider == "anthropic"
+        )
+        if _text_rule_allowed and not request_body.provider_tier:
+            from src.routing.text_direct_routing import apply_text_direct_routing
+            _text_direct_reason = apply_text_direct_routing(
+                request_body,
+                has_images=has_vision_content(
+                    prepare_messages_for_vision(request_body.messages)
+                ),
+            )
+            if _text_direct_reason:
+                logger.info(
+                    "🎯 Text-Wegwahl: %s → tier=%s (model=%s)",
+                    _text_direct_reason, request_body.provider_tier, resolved_model,
+                )
+
         # BACKEND ROUTING: Resolve backend configuration (Anthropic / Bedrock / OpenAI-Compatible)
         backend_config = None
         try:
@@ -3189,6 +3220,10 @@ async def _chat_completions_lauf(
                 bedrock_region=request_body.bedrock_region,
                 provider_tier=request_body.provider_tier,
             )
+            # Der direkte Tier traegt sein eigenes Modell (Sonnet-Vorgabe). Die
+            # Text-Wegwahl aendert nur den Weg, nie das angefragte Modell.
+            if _text_direct_reason and backend_config.backend == BackendType.ANTHROPIC_DIRECT:
+                backend_config.provider_model = resolved_model
             from src.jobs.selbstaufruf import ledger_provider_merken
             ledger_provider_merken(
                 request, ledger_provider_for_backend(backend_config.backend)
