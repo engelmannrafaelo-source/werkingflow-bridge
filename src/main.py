@@ -3200,8 +3200,12 @@ async def _chat_completions_lauf(
         # apply_app_provider_policy raeumt dort sogar ein vom Aufrufer
         # geschicktes provider_tier ab (gemessen 14.10.2026, BRIDGEFOLGE).
         _text_direct_reason: Optional[str] = None
-        _text_rule_allowed = user_pinned_provider is None or (
-            _provider_from_app_rule and user_pinned_provider == "anthropic"
+        # Ein echter Nutzer-Pin sperrt die Regel immer — auch wenn eine
+        # App-Regel ihn ueberstimmt hat (Engelmann, app_rule_outranks_user_pin:
+        # der Hub gehoert auf den Pauschal-Pool, BRIDGEFOLGER P3-a).
+        _text_rule_allowed = operator_pinned_provider is None and (
+            user_pinned_provider is None
+            or (_provider_from_app_rule and user_pinned_provider == "anthropic")
         )
         if _text_rule_allowed and not request_body.provider_tier:
             from src.routing.text_direct_routing import apply_text_direct_routing

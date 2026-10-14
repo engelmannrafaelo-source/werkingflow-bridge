@@ -44,7 +44,11 @@ max_tokens ueberhaupt nicht ein (Probe TEILE 14.10.2026: max_tokens 64 → 4 759
 Ausgabe-Token). Alle anderen Aufrufe bleiben unveraendert. Ein Tippfehler im
 Format ist laut: beim Start (lifespan) und bei jedem Aufruf.
 
-Globaler Schalter ``BRIDGE_TEXT_DIRECT_ROUTING_ENABLED`` (Vorgabe AUS). Grund: der direkte
+Globaler Schalter ``BRIDGE_TEXT_DIRECT_ROUTING_ENABLED`` (Vorgabe AUS). Er gilt
+fuer JEDEN Aufrufer ohne Nutzer-Pin: alle Kunden-Apps, Aufrufe ohne X-App-ID
+und die Nicht-Kunden-Apps (cui, platform, dev-tooling, partner-platform). Ein
+Nutzer-Pin sperrt die Regel immer, auch wenn eine App-Regel ihn ueberstimmt
+(Engelmann). Fuer einen einzelnen Pfad ist der Geltungsbereich oben der Weg. Grund: der direkte
 Weg bucht auf den Prepaid-Schluessel mit Tagesdeckel (prepaid_cap), der Abo-Weg
 nicht. Die Regel verschiebt also Kosten und kann den Deckel erreichen; das
 Einschalten ist eine Entscheidung, keine Nebenwirkung eines Deploys.

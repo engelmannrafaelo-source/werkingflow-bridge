@@ -63,7 +63,7 @@ def _request(body: dict, app_id: str, extra_headers=None):
     req.state = MagicMock(spec=[])
     req.headers = {
         "X-User-ID": "user-wegwahl",
-        "X-App-ID": app_id,
+        **({"X-App-ID": app_id} if app_id else {}),
         "X-App-Env": "staging",
         "X-Agent-ID": "schema_analysis/beschreibung",
         **(extra_headers or {}),
@@ -404,3 +404,50 @@ async def test_bereich_tippfehler_bricht_den_aufruf_laut(monkeypatch):
     assert weg in ("fehler", "antwort")
     if weg == "antwort":
         assert ergebnis.status_code >= 500
+
+
+# --- BRIDGEFOLGER P3-a / P3-b -----------------------------------------------
+
+@pytest.mark.asyncio
+async def test_ohne_app_regel_global_an_geht_direkt(an):
+    # P3-b: der Zweig user_pinned_provider is None (keine X-App-ID → keine
+    # App-Provider-Regel) braucht einen eigenen Test, der direkt erwartet.
+    weg, rb, cfg = await _run(_body(output_config={"effort": "low"}), app_id=None)
+    assert weg == "direct"
+    assert cfg.provider_model == "claude-haiku-5-5"
+
+
+@pytest.mark.asyncio
+async def test_bereich_fuer_nicht_kunden_app_ohne_app_regel_geht_direkt(bereich, monkeypatch):
+    # P3-b ueber den Bereich: cui hat keine App-Provider-Regel
+    # (NON_CUSTOMER_APP_IDS) → user_pinned_provider bleibt None.
+    monkeypatch.setenv("BRIDGE_TEXT_DIRECT_ROUTING_APPS", "cui:werkzeug")
+    weg, rb, _ = await _run(_body(max_tokens=64), app_id="cui",
+                            headers={"X-Agent-ID": "werkzeug/zusammenfassung"})
+    assert weg == "direct"
+    assert rb.max_tokens == 64
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("app_id", [None, "cui", "platform", "dev-tooling",
+                                    "partner-platform", "engelmann"])
+async def test_nur_bereich_an_laesst_alle_anderen_unberuehrt(bereich, app_id):
+    # P3-a: mit nur dem eingeengten Bereich geht weder ein Aufruf ohne
+    # App-ID noch einer der Nicht-Kunden-Apps oder Engelmann direkt.
+    weg, _, _ = await _run(_body(output_config={"effort": "low"}, max_tokens=64000),
+                           app_id=app_id)
+    assert weg == "sdk"
+
+
+@pytest.mark.asyncio
+async def test_engelmann_mit_ueberstimmtem_pin_bleibt_auch_global_auf_sdk(an):
+    # P3-a: Engelmanns App-Regel ueberstimmt einen Nutzer-Pin
+    # (app_rule_outranks_user_pin). Der Pin sperrt die Text-Regel trotzdem.
+    weg, ergebnis, _ = await _run(
+        _body(output_config={"effort": "low"}, max_tokens=64000),
+        app_id="engelmann",
+        pin_config={"provider": "bedrock", "region": "eu-central-1"},
+        headers={"X-App-Env": "prod"},
+        sonst_antwort=True,
+    )
+    assert weg == "sdk", ergebnis
