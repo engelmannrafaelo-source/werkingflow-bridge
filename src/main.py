@@ -2168,7 +2168,7 @@ async def generate_streaming_response(
         # "length" and x_bridge_finish.vollstaendig false.
         from src.claude_cli import chunks_have_tool_use, lauf_abschluss
         from src.lauf_abschluss import ModellAbbruch, TransportAbbruch, annehmen
-        stream_abschluss = lauf_abschluss(chunks_buffer)
+        stream_abschluss = lauf_abschluss(chunks_buffer, antwort_zusammengesetzt=True)
         if sdk_stream_error is None:
             try:
                 annehmen(stream_abschluss)
@@ -4262,7 +4262,7 @@ async def _chat_completions_lauf(
             # All output below (content, finish_reason, usage per call) reads
             # from this one LaufAbschluss — and from the retry's, if one runs.
             from src.claude_cli import lauf_abschluss
-            _abschluss = lauf_abschluss(chunks)
+            _abschluss = lauf_abschluss(chunks, antwort_zusammengesetzt=True)
             _usage_zuege = list(_abschluss.zuege)
             if _abschluss.modell_abbruch:
                 raw_assistant_content = claude_cli.parse_claude_message(
@@ -4458,7 +4458,7 @@ async def _chat_completions_lauf(
                     retry_chunks.append(chunk)
                 # The retry is a run of its own: same evaluation, and its
                 # calls are paid too — usage and per-call list include them.
-                _retry_abschluss = lauf_abschluss(retry_chunks)
+                _retry_abschluss = lauf_abschluss(retry_chunks, antwort_zusammengesetzt=True)
                 _usage_zuege += [dict(z, lauf="tool_leak_retry") for z in _retry_abschluss.zuege]
                 _retry_usage = next(
                     (u for u in map(extract_result_usage, retry_chunks) if u), None
