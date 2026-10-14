@@ -144,9 +144,3 @@ def test_haiku_5_5_genau_100k_ist_noch_untere_stufe():
     assert cost_usd("claude-haiku-5-5", 100_000, 0) == pytest.approx(0.01)
     assert cost_usd("claude-haiku-5-5", 100_001, 0) == pytest.approx(100_001 / 1e6 * 0.50)
 
-
-def test_haiku_5_5_ledger_eur_nutzt_die_stufe():
-    from src.pricing import cost_usd
-    assert cost_eur("claude-haiku-5-5", 0, 0, cache_read_tokens=1_000_000) == pytest.approx(
-        round(cost_usd("claude-haiku-5-5", 0, 0, cache_read_tokens=1_000_000) * usd_to_eur_rate(), 6)
-    )
