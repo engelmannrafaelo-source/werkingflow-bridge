@@ -147,7 +147,10 @@ class LaufAbschluss:
       (claude_cli.find_unfinished_result) — error_max_turns, an error subtype,
       no result at all. Matters where a run writes its output in parts.
     antwort_chunks: the run's chunks without the CLI's follow-up call.
-    zuege: usage per model call, in order (one entry per message_id)."""
+    zuege: usage per model call, in order (one entry per message_id).
+    fortsetzungen: seams in the handed-out answer — the CLI continued it past
+      its output limit this often and the parts were assembled (BRIDGETEXT,
+      claude_cli.antwort_teile). 0 everywhere else."""
 
     finish_reason: str
     stop_reason: Optional[str]
@@ -157,6 +160,7 @@ class LaufAbschluss:
     unfertig: Optional[str] = None
     antwort_chunks: list = field(default_factory=list)
     zuege: list = field(default_factory=list)
+    fortsetzungen: int = 0
 
     @property
     def modell_abbruch(self) -> bool:
@@ -185,6 +189,8 @@ class LaufAbschluss:
             d["transport"] = self.transport
         if self.unfertig:
             d["unfertig"] = self.unfertig
+        if self.fortsetzungen:
+            d["fortsetzungen"] = self.fortsetzungen
         return d
 
 

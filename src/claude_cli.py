@@ -7,7 +7,7 @@ import uuid
 import time
 import hashlib
 import tempfile
-from typing import AsyncGenerator, Dict, Any, Optional, List
+from typing import AsyncGenerator, Dict, Any, Optional, List, Tuple
 from pathlib import Path
 from contextvars import ContextVar
 
@@ -1380,6 +1380,100 @@ def antwort_abgeschnitten(ende: Optional[str]) -> bool:
 
 
 # =============================================================================
+# THE ANSWER IS EVERY PART OF IT (BRIDGETEXT, 14.10.2026)
+#
+# An answer the CLI continued past its output limit arrives as several model
+# calls: part 1, the withheld meta turn, part 2 (marked FORTSETZUNG_KEY by
+# run_completion), … The CLI yields one assistant message per content block,
+# so a call can span several chunks (thinking, then text) that share its
+# message_id. antwort_teile assembles the answer from the first text on:
+#   * further chunks of the same call (same, known message_id) → joined with
+#     "\n" (as text blocks of one message always were);
+#   * a continuation → joined directly, no separator: the CLI tells the model
+#     to "pick up mid-thought", the cut may sit inside a word. Whitespace at
+#     the seam is kept on both sides; the SSE stream keeps it too
+#     (generate_streaming_response, naht_offen/letzter_rand);
+#   * anything else ends the answer, as before: a tool call (the text was a
+#     preamble), another call without the continuation mark, the CLI's
+#     follow-up after a classifier stop, the CLI's own error message after the
+#     continuations ran out (cli_error / is_api_error_message).
+# Returns (text, number of continuations it spans); (None, n) without any text.
+# =============================================================================
+
+def _teil_text(message: Any) -> Optional[str]:
+    """Text of one chunk in either shape (SDK dict, legacy type=assistant);
+    "" for an assistant chunk without text, None for no assistant chunk."""
+    if not isinstance(message, dict):
+        return None
+    content = message.get("content")
+    if isinstance(content, list):
+        parts = []
+        for block in content:
+            if hasattr(block, "text"):
+                parts.append(block.text)
+            elif isinstance(block, dict) and block.get("type") == "text":
+                parts.append(block.get("text", ""))
+            elif isinstance(block, str):
+                parts.append(block)
+        return "\n".join(parts)
+    if message.get("type") == "assistant" and isinstance(message.get("message"), dict):
+        content = message["message"].get("content")
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            return "\n".join(
+                b.get("text", "") for b in content
+                if isinstance(b, dict) and b.get("type") == "text"
+            )
+    return None
+
+
+def _beendet_antwort(message: dict) -> bool:
+    return (
+        _has_tool_use(message)
+        or bool(message.get(NACH_MODELLABBRUCH_KEY))
+        or bool(message.get("cli_error"))
+        or message.get("is_api_error_message") is True
+    )
+
+
+def antwort_teile(messages: list) -> Tuple[Optional[str], int]:
+    """The answer and how many CLI continuations it contains (see above)."""
+    text: Optional[str] = None
+    fortsetzungen = 0
+    aktuelle_id: Any = None
+    naht_direkt = False
+    for message in messages:
+        teil = _teil_text(message)
+        if teil is None:
+            continue
+        if text is None:
+            # A part without text (a call cut while thinking) still counts
+            # when the answer's text begins in its continuation.
+            if message.get(FORTSETZUNG_KEY):
+                fortsetzungen += 1
+            if _has_tool_use(message):
+                fortsetzungen = 0
+            if teil:
+                text = teil
+                aktuelle_id = message.get("message_id")
+            continue
+        if _beendet_antwort(message):
+            break
+        if message.get(FORTSETZUNG_KEY):
+            fortsetzungen += 1
+            naht_direkt = True
+            aktuelle_id = message.get("message_id")
+        elif aktuelle_id is None or message.get("message_id") != aktuelle_id:
+            # Without an id nothing proves "same call" — end, as before.
+            break
+        if teil:
+            text += ("" if naht_direkt else "\n") + teil
+            naht_direkt = False
+    return text, fortsetzungen
+
+
+# =============================================================================
 # HOW THE MODEL ENDED (BRREF, 12.10.2026) — src/lauf_abschluss.py
 #
 # The verdict and the one acceptance point live there; this builds it from a
@@ -1413,8 +1507,17 @@ def _usage_je_zug(chunks: list) -> list:
     return zuege
 
 
-def lauf_abschluss(chunks: list) -> LaufAbschluss:
-    """LaufAbschluss of a whole run_completion stream (see src/lauf_abschluss.py)."""
+def lauf_abschluss(chunks: list, *, antwort_zusammengesetzt: bool = False) -> LaufAbschluss:
+    """LaufAbschluss of a whole run_completion stream (see src/lauf_abschluss.py).
+
+    antwort_zusammengesetzt (BRIDGETEXT): the caller hands out the answer as
+    parse_claude_message / the SSE stream build it — every part of a continued
+    answer, not just the last. Then an answer the CLI continued is complete
+    ("stop") if antwort_teile holds EVERY continuation of the final answer and
+    the last part did not stop at the limit itself (antwort_ende checks that
+    first); fortsetzungen says how many seams it has. Paths that read the LAST
+    message as the answer (research/doc-agent antwort_im_text) leave it False:
+    for them a continued answer stays "length"."""
     filt = AbbruchFilter()
     antwort = [c for c in chunks if filt.nimmt(c)]
     marker = find_truncation_marker(chunks)
@@ -1435,6 +1538,17 @@ def lauf_abschluss(chunks: list) -> LaufAbschluss:
         )
     ende = antwort_ende(chunks)
     finish = "stop" if ende is None else STOP_REASON_FINISH.get(ende, ende)
+    if antwort_zusammengesetzt and ende == ANTWORT_ENDE_FORTGESETZT:
+        _, enthalten = antwort_teile(antwort)
+        gesamt = sum(1 for c in antwort if _is_assistant_chunk(c) and c.get(FORTSETZUNG_KEY))
+        if enthalten and enthalten == gesamt:
+            finish = "stop"
+            gemeinsam["fortsetzungen"] = enthalten
+        else:
+            logger.warning(
+                f"⚠️ CLI continued the answer {gesamt}x, assembled answer holds "
+                f"{enthalten} — finish_reason stays {finish}"
+            )
     if gemeinsam["unfertig"] and finish in ("stop", "tool_calls"):
         # The CLI result says the run did not finish (error_max_turns, an
         # error subtype, none at all): what the model said last is not the
@@ -3267,72 +3381,31 @@ class ClaudeCodeCLI:
             cli_session_manager.complete_session(cli_session_id, status="failed")
     
     def parse_claude_message(self, messages: List[Dict[str, Any]]) -> Optional[str]:
-        """Extract the assistant message from Claude Code SDK messages."""
+        """Extract the assistant answer from Claude Code SDK messages.
+
+        The answer starts at the first assistant message with text and runs on
+        through the rest of that model call (the CLI yields one message per
+        content block) and through every automatic continuation of it
+        (antwort_teile). Before BRIDGETEXT it ended at the first message: an
+        answer the CLI continued past its output limit came back as part 1 only
+        — with HTTP 200, while usage counted every part (werking-energy, Mühl,
+        14.10.2026)."""
         logger.debug(f"parse_claude_message: Processing {len(messages)} messages")
 
         if not messages:
             logger.warning("parse_claude_message: Empty messages list")
             return None
 
-        for i, message in enumerate(messages):
-            # Log message structure for debugging
-            msg_type = type(message).__name__
-            logger.debug(f"Message {i}: type={msg_type}, is_dict={isinstance(message, dict)}")
-            if isinstance(message, dict):
-                logger.debug(f"Message {i} keys: {list(message.keys())}")
-
-            # Look for AssistantMessage type (new SDK format)
-            if "content" in message and isinstance(message["content"], list):
-                logger.debug(f"Message {i}: Found new SDK format (content list)")
-                text_parts = []
-                for block_idx, block in enumerate(message["content"]):
-                    # Handle TextBlock objects
-                    if hasattr(block, 'text'):
-                        logger.debug(f"Message {i}, block {block_idx}: TextBlock with {len(block.text)} chars")
-                        text_parts.append(block.text)
-                    elif isinstance(block, dict) and block.get("type") == "text":
-                        text = block.get("text", "")
-                        logger.debug(f"Message {i}, block {block_idx}: Dict text block with {len(text)} chars")
-                        text_parts.append(text)
-                    elif isinstance(block, str):
-                        logger.debug(f"Message {i}, block {block_idx}: String block with {len(block)} chars")
-                        text_parts.append(block)
-
-                if text_parts:
-                    result = "\n".join(text_parts)
-                    logger.info(f"✅ Extracted {len(result)} chars from {len(text_parts)} text blocks")
-                    return result
-                else:
-                    logger.warning(f"Message {i}: content list present but no text blocks found")
-            
-            # Fallback: look for old format
-            elif message.get("type") == "assistant" and "message" in message:
-                logger.debug(f"Message {i}: Found old SDK format (type=assistant)")
-                sdk_message = message["message"]
-                if isinstance(sdk_message, dict) and "content" in sdk_message:
-                    content = sdk_message["content"]
-                    if isinstance(content, list) and len(content) > 0:
-                        logger.debug(f"Message {i}: Old format content list with {len(content)} blocks")
-                        # Handle content blocks (Anthropic SDK format)
-                        text_parts = []
-                        for block in content:
-                            if isinstance(block, dict) and block.get("type") == "text":
-                                text_parts.append(block.get("text", ""))
-                        if text_parts:
-                            result = "\n".join(text_parts)
-                            logger.info(f"✅ Extracted {len(result)} chars from old format")
-                            return result
-                        else:
-                            logger.warning(f"Message {i}: Old format but no text blocks found")
-                            return None
-                    elif isinstance(content, str):
-                        logger.info(f"✅ Extracted {len(content)} chars from old format (string)")
-                        return content
+        text, fortsetzungen = antwort_teile(messages)
+        if text is not None:
+            if fortsetzungen:
+                logger.info(
+                    f"🧩 Answer assembled from {fortsetzungen + 1} parts "
+                    f"({fortsetzungen} CLI continuation(s)): {len(text)} chars"
+                )
             else:
-                # Log unrecognized message format
-                msg_keys = list(message.keys()) if isinstance(message, dict) else "not dict"
-                msg_type_field = message.get("type") if isinstance(message, dict) else None
-                logger.debug(f"Message {i}: Unrecognized format - keys={msg_keys}, type field={msg_type_field}")
+                logger.info(f"✅ Extracted {len(text)} chars")
+            return text
 
         # No assistant message found in any format
         logger.warning(f"❌ parse_claude_message: No assistant message found in {len(messages)} chunks")

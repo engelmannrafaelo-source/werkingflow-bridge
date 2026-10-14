@@ -408,7 +408,10 @@ class ChatCompletionResponse(BaseModel):
         default=None,
         description=(
             "How the model ended (non-standard extension): stop_reason as the model "
-            "reported it; on finish_reason content_filter also category and folgezuege"
+            "reported it; on finish_reason content_filter also category and folgezuege; "
+            "fortsetzungen = the CLI continued the answer past its output limit this "
+            "often and content holds every part, joined directly at each seam "
+            "(stop_reason 'max_tokens_fortgesetzt', finish_reason 'stop')"
         ),
     )
     # BRREF (12.10.2026): a CLI run can make several model calls (tool turns,
