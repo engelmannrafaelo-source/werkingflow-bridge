@@ -125,6 +125,10 @@ _BACKEND_TO_PROVIDER = {
     # Migration am CHECK-Constraint aus 053 und liesse jede bestehende
     # Datenschutz-Auswertung auf provider='gemini' still danebengreifen).
     BackendType.GEMINI_API: PROVIDER_GEMINI,
+    # Claude-Modell, aber der Empfaenger der Daten ist Google (Vertex AI, EU).
+    # Das Hauptbuch beantwortet "WER hat die Daten bekommen" — also Google, nicht
+    # Anthropic. Bewusst keine neue Vokabel (CHECK-Constraint aus Migration 053).
+    BackendType.VERTEX_CLAUDE: PROVIDER_GEMINI,
 }
 
 

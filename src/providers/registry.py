@@ -138,6 +138,30 @@ PROVIDERS: dict[str, ProviderConfig] = {
     ),
 
     # =========================================================================
+    # Claude via Google Vertex AI (EU-Endpunkt) — AUSDRUECKLICH und nur mit Flag
+    #
+    # Zusaetzlicher Weg, kein Ersatz: in keiner Fallback-Kette, kein Standard.
+    # Ohne BRIDGE_VERTEX_CLAUDE_ENABLED ist der Tier fuer Aufrufer nicht
+    # vorhanden (get_provider weist ihn wie einen unbekannten Tier ab, die
+    # Provider-Liste blendet ihn aus). Fehler von Google (z.B. 429 bei
+    # Kontingent 0) gehen laut durch, nie still an einen anderen Anbieter.
+    # Google ist hier Unterauftragsverarbeiter fuer Claude-Inferenz — die
+    # AVV-Frage (avv.md §5.4) ist NICHT entschieden, deshalb dsgvo_compliant=False.
+    # =========================================================================
+    "claude-vertex-eu": ProviderConfig(
+        tier_id="claude-vertex-eu",
+        name="Claude via Google Vertex AI (EU, nur mit Flag)",
+        backend=BackendType.VERTEX_CLAUDE,
+        model="claude-sonnet-5-5",
+        dsgvo_compliant=False,
+        supports_tools=False,
+        description=(
+            "Claude ueber Google Vertex AI, EU-Endpunkt. Nur ausdruecklich "
+            "anforderbar und nur wenn BRIDGE_VERTEX_CLAUDE_ENABLED gesetzt ist."
+        ),
+    ),
+
+    # =========================================================================
     # Google Gemini — CLI Subprocess (OAuth, Google Account Subscription)
     # =========================================================================
 
@@ -307,6 +331,18 @@ class UnknownProviderTierError(RuntimeError):
     """
 
 
+#: Tiers, die nur mit ihrem Master-Flag existieren: tier_id -> (Pruefung, Flag-Name).
+#: Ohne Flag verhalten sie sich fuer Aufrufer wie nicht vorhanden.
+_FLAG_GATED_TIERS = {"claude-vertex-eu": ("vertex_claude", "BRIDGE_VERTEX_CLAUDE_ENABLED")}
+
+
+def _flag_gated_tier_enabled(tier_id: str) -> bool:
+    if tier_id == "claude-vertex-eu":
+        from src.providers.vertex_claude import vertex_claude_enabled
+        return vertex_claude_enabled()
+    return True
+
+
 def get_provider(tier_id: Optional[str]) -> ProviderConfig:
     """Get provider config by tier ID.
 
@@ -315,6 +351,11 @@ def get_provider(tier_id: Optional[str]) -> ProviderConfig:
     """
     if not tier_id:
         return PROVIDERS[DEFAULT_TIER]
+    if tier_id in _FLAG_GATED_TIERS and not _flag_gated_tier_enabled(tier_id):
+        raise UnknownProviderTierError(
+            f"provider_tier {tier_id!r} ist auf dieser Bridge nicht eingeschaltet "
+            f"({_FLAG_GATED_TIERS[tier_id][1]} nicht gesetzt)."
+        )
     if tier_id not in PROVIDERS:
         raise UnknownProviderTierError(
             f"unknown provider_tier {tier_id!r} — this bridge serves "
@@ -338,10 +379,15 @@ def list_available_providers() -> list[dict]:
     """List all configured providers (with API keys / OAuth credentials present)."""
     available = []
     for tier_id, config in PROVIDERS.items():
+        if tier_id in _FLAG_GATED_TIERS and not _flag_gated_tier_enabled(tier_id):
+            continue  # Flag aus: Liste bleibt wie vor Einfuehrung des Tiers
         has_key = True
         if config.auth_type == AuthType.OAUTH_GOOGLE:
             from src.providers.gemini_oauth import gemini_oauth_manager
             has_key = gemini_oauth_manager.is_configured()
+        elif config.backend == BackendType.VERTEX_CLAUDE:
+            from src.providers.vertex_claude import vertex_claude_configured
+            has_key = vertex_claude_configured()
         elif config.api_key_env:
             has_key = bool(os.getenv(config.api_key_env))
 

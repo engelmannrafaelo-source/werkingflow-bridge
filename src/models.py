@@ -29,6 +29,9 @@ class BackendType(str, Enum):
                                        # die Bildanalyse, auf prod gesperrt — siehe
                                        # src/routing/gemini_vision_gate.py. Nicht zu verwechseln mit
                                        # GEMINI_CLI (OAuth-Subprozess, ohne Bildeingabe).
+    VERTEX_CLAUDE = "vertex_claude"    # Claude ueber Google Vertex AI (EU-Endpunkt). Nur per Tier
+                                       # 'claude-vertex-eu' UND Flag BRIDGE_VERTEX_CLAUDE_ENABLED
+                                       # (default aus) — siehe src/providers/vertex_claude.py
 
 
 class PrivacyMode(str, Enum):

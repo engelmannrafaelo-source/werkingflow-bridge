@@ -2961,6 +2961,88 @@ async def chat_completions(
             return response_data
 
         # =======================================================================
+        # VERTEX-CLAUDE ROUTING: Claude ueber Google Vertex AI (EU). Nur ueber
+        # provider_tier='claude-vertex-eu' UND Flag BRIDGE_VERTEX_CLAUDE_ENABLED
+        # erreichbar (sonst scheitert schon die Tier-Aufloesung oben mit 400).
+        # Fehler von Google gehen mit ihrem Original-Status laut durch — kein
+        # Rueckfall, keine Fallback-Kette (siehe src/providers/vertex_claude.py).
+        # =======================================================================
+        if backend_config and backend_config.backend == BackendType.VERTEX_CLAUDE:
+            from src.providers.vertex_claude import call_vertex_claude, VertexClaudeError, VertexClaudeRefused
+            vertex_tier = backend_config.provider_tier or "claude-vertex-eu"
+            if request_body.enable_tools or request_body.stream:
+                _what = "tool support" if request_body.enable_tools else "streaming"
+                raise HTTPException(
+                    status_code=400,
+                    detail={
+                        "error": {
+                            "message": (
+                                f"provider_tier='{vertex_tier}' has no {_what} yet — "
+                                "send the request with enable_tools=false and stream=false."
+                            ),
+                            "type": "invalid_request_error",
+                            "code": "unsupported_on_vertex_tier",
+                        }
+                    },
+                )
+            logger.info(f"🔀 Routing to Claude on Vertex AI EU (tier={vertex_tier})")
+            from src.activity.ai_call_writer import persist_ai_call_activity
+            vertex_attribution = extract_attribution_context(request)
+
+            async def _persist_vertex_usage(*, usage: dict, status: str, error_code: Optional[str] = None,
+                                            error_message: Optional[str] = None) -> None:
+                if status != "success":
+                    request.state.ai_call_error_persisted = True
+                await persist_ai_call_activity(
+                    provider=ledger_provider_for_backend(BackendType.VERTEX_CLAUDE),
+                    app_id=vertex_attribution.get("app_id"),
+                    user_id=vertex_attribution.get("user_id"),
+                    agent_id=vertex_attribution.get("agent_id"),
+                    workflow_id=vertex_attribution.get("workflow_id"),
+                    model=backend_config.provider_model or resolved_model,
+                    input_tokens=usage.get("prompt_tokens", 0) or 0,
+                    output_tokens=usage.get("completion_tokens", 0) or 0,
+                    cache_read_tokens=usage.get("cache_read_input_tokens", 0) or 0,
+                    cache_creation_tokens=usage.get("cache_creation_input_tokens", 0) or 0,
+                    status=status,
+                    duration_ms=int((time.time() - start_time) * 1000),
+                    error_code=error_code,
+                    error_message=error_message,
+                    app_env=vertex_attribution.get("app_env"),
+                    provider_meta={"provider_tier": vertex_tier, "usage_source": "vertex_rawpredict"},
+                )
+
+            try:
+                response_data = await call_vertex_claude(request_body, backend_config.provider_model)
+            except Exception as vertex_exc:
+                await _persist_vertex_usage(
+                    usage={}, status="error",
+                    error_code=type(vertex_exc).__name__, error_message=str(vertex_exc)[:500],
+                )
+                if isinstance(vertex_exc, VertexClaudeError):
+                    raise HTTPException(
+                        status_code=vertex_exc.status_code,
+                        detail={
+                            "error": {
+                                "message": str(vertex_exc),
+                                "type": "rate_limit_error" if vertex_exc.status_code == 429 else "upstream_error",
+                                "code": "vertex_upstream_error",
+                                "upstream_status": vertex_exc.status_code,
+                            }
+                        },
+                    )
+                if isinstance(vertex_exc, VertexClaudeRefused):
+                    raise HTTPException(
+                        status_code=503,
+                        detail={"error": {"message": str(vertex_exc), "type": "configuration_error",
+                                          "code": "provider_not_configured"}},
+                    )
+                raise
+            await _persist_vertex_usage(usage=response_data.get("usage") or {}, status="success")
+            response_data["x_backend_info"] = get_backend_info_dict(backend_config)
+            return response_data
+
+        # =======================================================================
         # OPENAI-COMPATIBLE ROUTING: Generic httpx call (IONOS, Mistral, etc.)
         # =======================================================================
         if backend_config and backend_config.backend == BackendType.OPENAI_COMPATIBLE:

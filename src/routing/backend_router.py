@@ -206,6 +206,32 @@ def _resolve_provider_tier(
             bedrock_region=None,
         )
 
+    elif config.backend == BackendType.VERTEX_CLAUDE:
+        # Tier 'claude-vertex-eu' — get_provider() hat das Flag bereits geprueft;
+        # hier zusaetzlich die Konfiguration (SA-JSON). Fehlt sie, ist das laut
+        # ein RuntimeError (-> HTTP 400), kein Rueckfall.
+        from src.providers.vertex_claude import (
+            VertexClaudeRefused, assert_vertex_claude_allowed,
+        )
+        try:
+            assert_vertex_claude_allowed()
+        except VertexClaudeRefused as e:
+            raise RuntimeError(f"Provider '{tier_id}' not available: {e}") from None
+
+        logger.info(f"🔀 Provider tier: {tier_id} → {config.name} (model={config.model})")
+
+        return BackendConfig(
+            backend=BackendType.VERTEX_CLAUDE,
+            region=None,
+            model_id=config.model,
+            bedrock_model_id=None,
+            # AUTO folgt der globalen Middleware-Einstellung (kein DSGVO-Tier).
+            privacy_enabled=_resolve_privacy_mode(privacy, BackendType.VERTEX_CLAUDE, None),
+            env_vars={},
+            provider_tier=tier_id,
+            provider_model=config.model,
+        )
+
     elif config.backend == BackendType.ANTHROPIC_DIRECT:
         # Tier maps to the direct Anthropic Messages API, no CLI subprocess
         # (e.g. 'claude-direct-notools' — see src/providers/anthropic_direct.py).
