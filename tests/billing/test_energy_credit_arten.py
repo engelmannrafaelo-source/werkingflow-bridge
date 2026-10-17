@@ -192,9 +192,14 @@ def test_alte_credit_art_ist_nicht_mehr_kaeuflich():
 async def test_kauf_je_art_legt_bestellung_der_art_zum_artpreis_an(pid):
     from src.billing import billing_service
 
-    create = AsyncMock(return_value={"id": uuid.uuid4()})
+    from decimal import Decimal
+
+    create = AsyncMock(return_value={"id": uuid.uuid4(), "invoiceId": str(uuid.uuid4())})
     conn = AsyncMock()
     conn.fetchval = AsyncMock(return_value=True)  # Bestandskunde
+    # Rechnungsentwurf der Bestellung: Netto = Artpreis, Brutto = +20 % (AT).
+    netto = Decimal(str(KINDS[pid]))
+    conn.fetchrow = AsyncMock(return_value={"subtotal_eur": netto, "total_eur": netto * Decimal("1.2")})
 
     @asynccontextmanager
     async def _acquire():
@@ -223,8 +228,8 @@ async def test_kauf_je_art_legt_bestellung_der_art_zum_artpreis_an(pid):
         )
     assert create.await_args.args[1] == pid
     kw = mollie.create_one_time_payment.await_args.kwargs
-    # Der Zahlungsbetrag ist der Katalogpreis der Art (price_basis 'net').
-    assert kw["amount_eur"] == KINDS[pid]
+    # Mollie zieht das Brutto der Rechnung ein (Rafael 17.10.2026): Artpreis netto + USt.
+    assert kw["amount_eur"] == round(KINDS[pid] * 1.2, 2)
     assert kw["metadata"]["planId"] == pid
 
 

@@ -110,6 +110,164 @@ def _determine_tax_rate(
     return 0.0, None
 
 
+# ---------------------------------------------------------------------------
+# Rechnungsbetraege — EINE Quelle fuer Rechnung UND Mollie-Betrag
+# ---------------------------------------------------------------------------
+#
+# Rafael-Entscheid 17.10.2026 (e-energy-mollie-brutto-20261017 = a): Mollie
+# zieht brutto ein (Nettopreis + USt.), damit abgebuchter Betrag und Rechnung
+# uebereinstimmen. Katalogpreise sind netto (plans.price_basis, Migration 066).
+# Steuersatz: _determine_tax_rate aus der Rechnungsadresse (resolve_invoice_tax).
+# Rundung: genau eine Stelle — die Steuer wird kaufmaennisch (ROUND_HALF_UP) auf
+# Cent gerundet; Netto ist bereits ein Centbetrag, Brutto = Netto + Steuer ohne
+# weitere Rundung. Bis 17.10.2026 rundete quantize() mit dem Kontext-Default
+# ROUND_HALF_EVEN (Bankrundung) — bei glatten Katalogpreisen ohne Unterschied.
+
+from decimal import Decimal, ROUND_HALF_UP  # noqa: E402
+
+_CENT = Decimal("0.01")
+
+
+def invoice_amounts(net_eur: Any, tax_rate: float) -> Tuple[Decimal, Decimal, Decimal]:
+    """(subtotal, tax, total) einer Rechnung aus dem Nettobetrag.
+
+    Wirft ValueError, wenn der Nettobetrag kein Centbetrag ist oder negativ —
+    eine zweite, stille Rundung am Netto waere die zweite Rundungsstelle.
+    """
+    subtotal = Decimal(str(net_eur))
+    if subtotal < 0 or subtotal != subtotal.quantize(_CENT):
+        raise ValueError(f"net amount must be a non-negative cent amount, got {net_eur!r}")
+    tax = (subtotal * Decimal(str(tax_rate)) / Decimal("100")).quantize(_CENT, rounding=ROUND_HALF_UP)
+    return subtotal, tax, subtotal + tax
+
+
+async def resolve_invoice_tax(user_id: str, *, log_prefix: str = "[invoice]") -> Dict[str, Any]:
+    """Rechnungsadresse und Steuersatz des Kaeufers — dieselbe Aufloesung fuer
+    auto_create_invoice, die Bestell-Rechnung (pending_orders_service) und die
+    Bruttoanzeige vor dem Kauf (price_quote).
+
+    Returns dict: tenantId, billingAddress (oder None), taxRate,
+    reverseChargeNote (oder None), euB2c (bool).
+    """
+    pool = get_pool()
+    tenant_id: str | None = None
+    billing_address: Dict[str, Any] | None = None
+    # Failure is non-fatal: invoice is created with NULL billing_address and
+    # marked incomplete (Bestandsverhalten).
+    try:
+        async with pool.acquire() as conn:
+            trow = await conn.fetchrow(
+                """
+                SELECT u.tenant_id,
+                       t.billing_name, t.billing_street, t.billing_city,
+                       t.billing_postcode, t.billing_country, t.billing_vat_id
+                FROM users u
+                LEFT JOIN tenants t ON t.id = u.tenant_id
+                WHERE u.id = $1
+                """,
+                uuid.UUID(user_id),
+            )
+        if trow and trow["tenant_id"]:
+            tenant_id = trow["tenant_id"]
+            if trow["billing_name"]:
+                billing_address = {
+                    "name": trow["billing_name"],
+                    "street": trow["billing_street"],
+                    "city": trow["billing_city"],
+                    "postcode": trow["billing_postcode"],
+                    "country": (trow["billing_country"] or "").upper().strip() or None,
+                    "vatId": trow["billing_vat_id"],
+                }
+    except Exception as e:  # noqa: BLE001 — silent-ok: Bestandsverhalten, Rechnung wird als incomplete markiert
+        logger.warning("%s billing address lookup failed for user=%s: %s", log_prefix, user_id, e)
+
+    # Wurde die erfasste UID gegen VIES bestaetigt? Nur dann darf Reverse
+    # Charge greifen. Ein Fehler beim Nachschlagen bedeutet "nicht bestaetigt",
+    # nie "schon in Ordnung" — die teure Richtung ist die Nullsteuer.
+    vat_id_confirmed = False
+    if tenant_id and billing_address and (billing_address.get("vatId") or "").strip():
+        try:
+            async with pool.acquire() as conn:
+                vat_id_confirmed = await vat_id_module.has_confirmed_validation(
+                    conn, tenant_id=str(tenant_id), vat_id=billing_address["vatId"],
+                )
+        except Exception as e:
+            logger.warning(
+                "%s VIES confirmation lookup failed for tenant=%s: %s — "
+                "invoicing WITH VAT (safe default)", log_prefix, tenant_id, e,
+            )
+
+    tax_rate, reverse_charge_note = _determine_tax_rate(
+        billing_address, vat_id_confirmed=vat_id_confirmed,
+    )
+
+    # Detect EU B2C (no vatId in EU non-AT country) — mark for operator review.
+    eu_b2c = False
+    if billing_address:
+        country = (billing_address.get("country") or "").upper()
+        vat_id = (billing_address.get("vatId") or "").strip()
+        eu_b2c = country in _EU_COUNTRIES_NON_AT and not vat_id
+
+    return {
+        "tenantId": tenant_id,
+        "billingAddress": billing_address,
+        "taxRate": tax_rate,
+        "reverseChargeNote": reverse_charge_note,
+        "euB2c": eu_b2c,
+    }
+
+
+async def price_quote(user_id: str, plan_id: str, quantity: int) -> Dict[str, Any]:
+    """Bruttobetrag eines Kaufs VOR dem Checkout — fuer die Kauf-/Kassenanzeige.
+
+    Gleiche Rechnung wie die Bestell-Rechnung (invoice_amounts +
+    resolve_invoice_tax). Massgeblich bleibt der Betrag der Rechnung, die der
+    Checkout anlegt; aendert sich die Rechnungsadresse dazwischen, zieht Mollie
+    den Betrag dieser Rechnung ein, nicht den des Angebots.
+    """
+    from src.budget.plans import require_sellable
+    plan = require_sellable(plan_id)
+    if quantity < 1:
+        raise ValueError("quantity must be >= 1")
+    tax = await resolve_invoice_tax(user_id, log_prefix="[price-quote]")
+    net = Decimal(str(plan.price)) * quantity
+    subtotal, tax_eur, total = invoice_amounts(net, tax["taxRate"])
+    return {
+        "planId": plan_id,
+        "quantity": quantity,
+        "netEur": float(subtotal),
+        "taxRate": tax["taxRate"],
+        "taxEur": float(tax_eur),
+        "grossEur": float(total),
+        "reverseChargeNote": tax["reverseChargeNote"],
+        "billingAddressComplete": tax["billingAddress"] is not None,
+    }
+
+
+async def _order_invoice_gross(order: Dict[str, Any], *, expected_net: float) -> float:
+    """Mollie-Betrag einer Self-Service-Bestellung = total_eur ihrer Rechnung.
+
+    Die Rechnung (Entwurf) legt create_pending_order VOR der Zahlung an; ihr
+    Brutto ist der einzige Betrag, den Mollie einziehen darf. Stimmt ihr Netto
+    nicht mit dem Katalogpreis ueberein, ist etwas zwischen Bestellung und
+    Rechnung auseinandergelaufen → laut scheitern, keine Zahlung.
+    """
+    pool = get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT subtotal_eur, total_eur FROM invoices WHERE id = $1",
+            uuid.UUID(str(order["invoiceId"])),
+        )
+    if not row:
+        raise RuntimeError(f"order {order['id']}: invoice {order['invoiceId']} not found — no payment started")
+    if Decimal(str(row["subtotal_eur"])) != Decimal(str(expected_net)).quantize(_CENT):
+        raise RuntimeError(
+            f"order {order['id']}: invoice subtotal {row['subtotal_eur']} != catalog net "
+            f"{expected_net} — no payment started"
+        )
+    return float(Decimal(str(row["total_eur"])))
+
+
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -321,7 +479,8 @@ async def start_project_pack_checkout(
         user_id, plan_id, quantity, send_email=False, payment_method="mollie",
     )
     order_id = str(order["id"])
-    amount = round(float(plan.price) * quantity, 2)
+    # Brutto (Rafael 17.10.2026): Mollie zieht den Rechnungsbetrag ein.
+    amount = await _order_invoice_gross(order, expected_net=round(float(plan.price) * quantity, 2))
 
     # Zustimmung festhalten, BEVOR die Zahlung entsteht (Migration 054).
     # Reihenfolge ist Absicht: schlaegt das Schreiben fehl, gibt es keine
@@ -499,6 +658,9 @@ async def start_first_purchase_pack_checkout(
         user_id, plan_id, quantity, send_email=False, payment_method="mollie",
     )
     order_id = str(order["id"])
+    # Brutto (Rafael 17.10.2026): Mollie zieht den Rechnungsbetrag ein. Der
+    # Preis-Cap oben bleibt bewusst auf dem Netto (Bestandsregel).
+    amount = await _order_invoice_gross(order, expected_net=amount)
 
     # Zustimmung festhalten, BEVOR die Zahlung entsteht (Migration 054).
     # Reihenfolge ist Absicht: schlaegt das Schreiben fehl, gibt es keine
@@ -1243,6 +1405,43 @@ async def change_subscription(
     }
 
 
+async def _pruefe_bezahlten_betrag(order_id: str, payment_id: str, paid_eur: Any) -> None:
+    """Bezahlter Mollie-Betrag gegen das Brutto der Bestell-Rechnung.
+
+    Seit 17.10.2026 muessen beide gleich sein (Mollie brutto). Eine Abweichung
+    wird LAUT protokolliert (Log-Fehler + billing_event payment.amount_mismatch),
+    die bezahlte Bestellung aber trotzdem freigegeben: der Kunde hat gezahlt,
+    der Credit steht ihm zu. Typischer Fall: eine vor dem Umstieg gestartete,
+    noch netto angelegte Zahlung.
+    """
+    from decimal import Decimal as _D
+    pool = get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """SELECT o.user_id, i.id AS invoice_id, i.total_eur
+                 FROM pending_orders o JOIN invoices i ON i.id = o.invoice_id
+                WHERE o.id = $1""",
+            uuid.UUID(str(order_id)),
+        )
+    if not row:
+        return  # release_order meldet die fehlende Bestellung selbst laut
+    if paid_eur is not None and _D(str(paid_eur)).quantize(_CENT) == _D(str(row["total_eur"])).quantize(_CENT):
+        return
+    logger.error(
+        "[webhook] payment %s for order %s: paid %s != invoice total %s",
+        payment_id, order_id, paid_eur, row["total_eur"],
+    )
+    await log_billing_event(
+        "payment.amount_mismatch",
+        user_id=str(row["user_id"]),
+        invoice_id=str(row["invoice_id"]),
+        mollie_payment_id=payment_id,
+        amount_eur=float(paid_eur) if paid_eur is not None else None,
+        source="mollie-webhook",
+        payload={"orderId": str(order_id), "invoiceTotalEur": float(row["total_eur"])},
+    )
+
+
 async def handle_webhook(payment_id: str) -> Dict[str, Any]:
     mollie = get_mollie_adapter()
     payment = await mollie.get_payment(payment_id)
@@ -1324,6 +1523,7 @@ async def handle_webhook(payment_id: str) -> Dict[str, Any]:
         if not order_id:
             raise RuntimeError("project_pack webhook: orderId missing from payment metadata")
         from src.billing.pending_orders_service import release_order, OrderNotReleasableError
+        await _pruefe_bezahlten_betrag(order_id, payment_id, payment.get("amount_eur"))
         try:
             released = await release_order(
                 order_id, operator_user_id=None, note="self-service Mollie payment",
@@ -1784,68 +1984,17 @@ async def auto_create_invoice(
         if existing:
             return str(existing)
 
-    # Resolve tenant and billing address.  Failure is non-fatal: invoice is
-    # created with NULL billing_address and marked incomplete.
-    tenant_id: str | None = None
-    billing_address: Dict[str, Any] | None = None
-    eu_b2c_flag = False
-    try:
-        async with pool.acquire() as conn:
-            trow = await conn.fetchrow(
-                """
-                SELECT u.tenant_id,
-                       t.billing_name, t.billing_street, t.billing_city,
-                       t.billing_postcode, t.billing_country, t.billing_vat_id
-                FROM users u
-                LEFT JOIN tenants t ON t.id = u.tenant_id
-                WHERE u.id = $1
-                """,
-                uuid.UUID(user_id),
-            )
-        if trow and trow["tenant_id"]:
-            tenant_id = trow["tenant_id"]
-            if trow["billing_name"]:
-                billing_address = {
-                    "name": trow["billing_name"],
-                    "street": trow["billing_street"],
-                    "city": trow["billing_city"],
-                    "postcode": trow["billing_postcode"],
-                    "country": (trow["billing_country"] or "").upper().strip() or None,
-                    "vatId": trow["billing_vat_id"],
-                }
-    except Exception:
-        pass  # billing_address stays None — marked incomplete below
+    tax_info = await resolve_invoice_tax(user_id, log_prefix="[invoice]")
+    tenant_id = tax_info["tenantId"]
+    billing_address = tax_info["billingAddress"]
+    tax_rate = tax_info["taxRate"]
+    reverse_charge_note = tax_info["reverseChargeNote"]
+    eu_b2c_flag = tax_info["euB2c"]
 
-    # Wurde die erfasste UID gegen VIES bestaetigt? Nur dann darf Reverse
-    # Charge greifen. Ein Fehler beim Nachschlagen bedeutet "nicht bestaetigt",
-    # nie "schon in Ordnung" — die teure Richtung ist die Nullsteuer.
-    vat_id_confirmed = False
-    if tenant_id and billing_address and (billing_address.get("vatId") or "").strip():
-        try:
-            async with pool.acquire() as conn:
-                vat_id_confirmed = await vat_id_module.has_confirmed_validation(
-                    conn, tenant_id=str(tenant_id), vat_id=billing_address["vatId"],
-                )
-        except Exception as e:
-            logger.warning(
-                "[invoice] VIES confirmation lookup failed for tenant=%s: %s — "
-                "invoicing WITH VAT (safe default)", tenant_id, e,
-            )
-
-    tax_rate, reverse_charge_note = _determine_tax_rate(
-        billing_address, vat_id_confirmed=vat_id_confirmed,
-    )
-
-    # Detect EU B2C (no vatId in EU non-AT country) — mark for operator review.
-    if billing_address:
-        country = (billing_address.get("country") or "").upper()
-        vat_id = (billing_address.get("vatId") or "").strip()
-        if country in _EU_COUNTRIES_NON_AT and not vat_id:
-            eu_b2c_flag = True
-
-    subtotal = Decimal(str(amount_eur))
-    tax = (subtotal * Decimal(str(tax_rate)) / Decimal("100")).quantize(Decimal("0.01"))
-    total = (subtotal + tax).quantize(Decimal("0.01"))
+    # Abos und Top-Ups: amount_eur ist der NETTO-Betrag, die Rechnung schlaegt
+    # die USt auf. Mollie hat bei diesen Bahnen bisher den Nettobetrag
+    # eingezogen (offener Befund, s. ERGEBNIS 17.10.2026) — hier unveraendert.
+    subtotal, tax, total = invoice_amounts(round(float(amount_eur), 2), tax_rate)
 
     line_items = [{
         "description": description,

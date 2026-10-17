@@ -687,6 +687,24 @@ async def billing_list_subs(
     return {"subscriptions": await billing_service.list_subscriptions(user_id)}
 
 
+@router.get("/{user_id}/price-quote")
+async def billing_price_quote(
+    user_id: str,
+    planId: str = Query(..., min_length=1),
+    quantity: int = Query(1, ge=1, le=100),
+    _claims: AuthClaims = Depends(require_self_or_admin),
+) -> Dict[str, Any]:
+    """Netto, USt. und Brutto eines Kaufs fuer die Kauf-/Kassenanzeige.
+
+    Dieselbe Rechnung wie die Bestell-Rechnung, deren Brutto Mollie einzieht
+    (Rafael 17.10.2026, e-energy-mollie-brutto-20261017 = a).
+    """
+    try:
+        return await billing_service.price_quote(user_id, planId, quantity)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
 @router.get("/{user_id}/credit-purchases")
 async def billing_list_credits(
     user_id: str,

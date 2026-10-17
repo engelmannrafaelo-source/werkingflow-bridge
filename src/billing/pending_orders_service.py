@@ -24,11 +24,11 @@ from typing import Any, Dict, List, Optional
 import httpx
 
 from src.api_auth.tenant_resolver import resolve_tenant_for_user
-from src.billing import vat_id as vat_id_module
 from src.billing.billing_service import (
-    _determine_tax_rate,
     _provision_plan_budget,
+    invoice_amounts,
     log_billing_event,
+    resolve_invoice_tax,
 )
 from src.billing.invoice_numbering import next_invoice_number, prefix_for_app
 from src.db.client import get_pool
@@ -127,68 +127,18 @@ async def _create_order_invoice(
     """
     pool = get_pool()
 
-    tenant_id: Optional[str] = None
-    billing_address: Optional[Dict[str, Any]] = None
-    eu_b2c_flag = False
-    try:
-        async with pool.acquire() as conn:
-            trow = await conn.fetchrow(
-                """
-                SELECT u.tenant_id,
-                       t.billing_name, t.billing_street, t.billing_city,
-                       t.billing_postcode, t.billing_country, t.billing_vat_id
-                FROM users u
-                LEFT JOIN tenants t ON t.id = u.tenant_id
-                WHERE u.id = $1
-                """,
-                uuid.UUID(user_id),
-            )
-        if trow and trow["tenant_id"]:
-            tenant_id = trow["tenant_id"]
-            if trow["billing_name"]:
-                billing_address = {
-                    "name": trow["billing_name"],
-                    "street": trow["billing_street"],
-                    "city": trow["billing_city"],
-                    "postcode": trow["billing_postcode"],
-                    "country": (trow["billing_country"] or "").upper().strip() or None,
-                    "vatId": trow["billing_vat_id"],
-                }
-    except Exception:
-        pass
+    # Gleiche Adress- und Steueraufloesung wie auto_create_invoice und die
+    # Bruttoanzeige (billing_service.resolve_invoice_tax); gleiche Rundung
+    # (invoice_amounts). Der Mollie-Betrag der Self-Service-Lane ist total_eur
+    # DIESER Rechnung (billing_service._order_invoice_gross).
+    tax_info = await resolve_invoice_tax(user_id, log_prefix="[pending-order]")
+    tenant_id = tax_info["tenantId"]
+    billing_address = tax_info["billingAddress"]
+    tax_rate = tax_info["taxRate"]
+    reverse_charge_note = tax_info["reverseChargeNote"]
+    eu_b2c_flag = tax_info["euB2c"]
 
-    # Wurde die erfasste UID gegen VIES bestaetigt? Nur dann darf Reverse
-    # Charge greifen. Ein Fehler beim Nachschlagen bedeutet "nicht bestaetigt",
-    # nie "schon in Ordnung" — die teure Richtung ist die Nullsteuer.
-    # (Gleiches Muster wie auto_create_invoice in billing_service.py.)
-    vat_id_confirmed = False
-    if tenant_id and billing_address and (billing_address.get("vatId") or "").strip():
-        try:
-            async with pool.acquire() as conn:
-                vat_id_confirmed = await vat_id_module.has_confirmed_validation(
-                    conn, tenant_id=str(tenant_id), vat_id=billing_address["vatId"],
-                )
-        except Exception as e:
-            import logging
-            logging.getLogger(__name__).warning(
-                "[pending-order] VIES confirmation lookup failed for tenant=%s: %s — "
-                "invoicing WITH VAT (safe default)", tenant_id, e,
-            )
-
-    tax_rate, reverse_charge_note = _determine_tax_rate(
-        billing_address, vat_id_confirmed=vat_id_confirmed,
-    )
-
-    from src.billing.billing_service import _EU_COUNTRIES_NON_AT
-    if billing_address:
-        country = (billing_address.get("country") or "").upper()
-        vat_id = (billing_address.get("vatId") or "").strip()
-        if country in _EU_COUNTRIES_NON_AT and not vat_id:
-            eu_b2c_flag = True
-
-    subtotal = Decimal(str(total_eur))
-    tax = (subtotal * Decimal(str(tax_rate)) / Decimal("100")).quantize(Decimal("0.01"))
-    total = (subtotal + tax).quantize(Decimal("0.01"))
+    subtotal, tax, total = invoice_amounts(total_eur, tax_rate)
 
     line_items = [{
         # Kundentext, kein Systemtext: der interne plan_id-Schluessel stand bis
