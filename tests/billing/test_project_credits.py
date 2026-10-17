@@ -28,6 +28,39 @@ from src.billing.project_credits_service import (
 
 
 # ---------------------------------------------------------------------------
+# Catalog: consume_credit / get_available_credits resolve the accepted credit
+# kinds from PLANS (migration 066/067). Same shape as the seeded Energy rows.
+# ---------------------------------------------------------------------------
+
+from src.budget.plans import PLANS, PlanConfig
+
+
+def energy_catalog() -> dict:
+    def kind(pid, price, budget_plan_id=None, sellable=True):
+        return PlanConfig(
+            id=pid, app_id="werking-energy", name=pid, price=price, interval="project",
+            api_budget_eur=100, description="x", price_basis="net",
+            sellable=sellable, budget_plan_id=budget_plan_id,
+        )
+    return {
+        "energy-project": kind("energy-project", 600, sellable=False),
+        "energy-anlagendokumentation": kind("energy-anlagendokumentation", 150, "energy-project"),
+        "energy-objektbericht": kind("energy-objektbericht", 300, "energy-project"),
+        "energy-analysebericht": kind("energy-analysebericht", 600, "energy-project"),
+    }
+
+
+@pytest.fixture(autouse=True)
+def _energy_catalog():
+    before = dict(PLANS)
+    PLANS.clear()
+    PLANS.update(energy_catalog())
+    yield
+    PLANS.clear()
+    PLANS.update(before)
+
+
+# ---------------------------------------------------------------------------
 # Mock helpers
 # ---------------------------------------------------------------------------
 

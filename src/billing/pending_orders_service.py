@@ -348,8 +348,10 @@ async def create_pending_order(
       ValueError   — unbekannter oder Trial-Plan, quantity < 1
       RuntimeError — Email-Versand fehlgeschlagen (RESEND_API_KEY fehlt o.ä.)
     """
-    from src.budget.plans import get_plan
-    plan = get_plan(plan_id)
+    from src.budget.plans import require_sellable
+    # A plan that is no longer for sale (sellable=false, migration 066) must
+    # not get NEW orders; releasing an existing order stays possible.
+    plan = require_sellable(plan_id)
     if plan.trial:
         raise ValueError(f"Cannot create pending order for trial plan '{plan_id}'")
     if quantity < 1:

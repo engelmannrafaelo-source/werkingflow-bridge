@@ -296,6 +296,13 @@ async def list_plans() -> Dict[str, Any]:
                 "apiBudgetEur": p.api_budget_eur,
                 "description": p.description,
                 "trial": p.trial,
+                # Migration 066: priceEur is "net" (VAT added on the invoice)
+                # unless stated otherwise — consumers show it with that label.
+                "priceBasis": p.price_basis,
+                "sellable": p.sellable,
+                # Set = pure credit kind drawing on this pot plan; its pot's
+                # credits are accepted for it (legacy credit migration).
+                "budgetPlanId": p.budget_plan_id,
             }
             for p in PLANS.values()
         ]
@@ -951,7 +958,12 @@ async def list_project_credits(
         credits = await project_credits_service.list_user_credits(_uuid.UUID(user_id))
     except ValueError:
         raise HTTPException(status_code=400, detail=f"Invalid user_id: {user_id}")
-    return {"credits": credits}
+    # usableByPlan (migration 066/067): slots consume would accept per plan,
+    # including legacy pot credits that count for every credit kind.
+    return {
+        "credits": credits,
+        "usableByPlan": project_credits_service.usable_credits_by_plan(credits),
+    }
 
 
 @_project_credits_router.get("/v1/users/{user_id}/project-budgets")
@@ -1009,8 +1021,9 @@ async def consume_project_credit(
         )
     except project_credits_service.CreditsExhaustedError as e:
         raise HTTPException(status_code=402, detail=str(e))
-    except ValueError:
-        raise HTTPException(status_code=400, detail=f"Invalid user_id: {user_id}")
+    except ValueError as e:
+        # Invalid user_id or unknown plan_id — both are caller errors.
+        raise HTTPException(status_code=400, detail=str(e))
 
 
 # ---------------------------------------------------------------------------

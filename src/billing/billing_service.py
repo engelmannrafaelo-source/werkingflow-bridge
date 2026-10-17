@@ -284,10 +284,12 @@ async def start_project_pack_checkout(
       ValueError — Plan ist kein Projekt-Plan, quantity < 1, Kunde ist kein
                    Bestandskunde, oder Rechnungsadresse unvollständig.
     """
-    from src.budget.plans import get_plan
+    from src.budget.plans import require_sellable
     from src.billing import pending_orders_service
 
-    plan = get_plan(plan_id)
+    # sellable=false (migration 066, e.g. the former single Energy kind
+    # 'energy-project') → PlanNotSellable, a ValueError → HTTP 400.
+    plan = require_sellable(plan_id)
     if plan.interval != "project":
         raise ValueError(
             f"plan '{plan_id}' is not a project plan (interval={plan.interval}) — "

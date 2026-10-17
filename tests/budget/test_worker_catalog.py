@@ -4,7 +4,7 @@ import pytest
 from src.budget import plans
 from src.platform_client import PlatformResponse, PlatformUnavailable
 
-ROW = {"id":"report-standard","appId":"werking-report","name":"Report","priceEur":250,"interval":"month","apiBudgetEur":100,"description":"Report","trial":False}
+ROW = {"id":"report-standard","appId":"werking-report","name":"Report","priceEur":250,"interval":"month","apiBudgetEur":100,"description":"Report","trial":False,"priceBasis":"net","sellable":True,"budgetPlanId":None}
 
 @pytest.mark.asyncio
 async def test_dbfree_worker_loads_catalog_and_deducts_monthly_call_once():

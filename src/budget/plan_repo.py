@@ -33,7 +33,8 @@ async def load_plans_from_db() -> Dict[str, PlanConfig]:
         rows = await conn.fetch(
             """
             SELECT id, app_id, name, price_eur, interval, api_budget_eur,
-                   description, is_trial
+                   description, is_trial, price_basis, sellable,
+                   budget_plan_id
             FROM plans
             WHERE is_active = TRUE
             ORDER BY sort_order, id
@@ -59,5 +60,8 @@ async def load_plans_from_db() -> Dict[str, PlanConfig]:
             api_budget_eur=float(row["api_budget_eur"]),
             description=row["description"],
             trial=row["is_trial"],
+            price_basis=row["price_basis"],
+            sellable=row["sellable"],
+            budget_plan_id=row["budget_plan_id"],
         )
     return result

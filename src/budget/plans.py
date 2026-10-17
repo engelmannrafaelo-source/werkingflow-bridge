@@ -24,6 +24,19 @@ class PlanConfig:
     api_budget_eur: float
     description: str
     trial: bool = False
+    # Migration 066. Every catalog price is NET today — the invoice adds VAT
+    # on top of price (billing_service). The field makes that explicit for
+    # consumers that show a price, instead of leaving it implied.
+    price_basis: str = "net"   # net | gross
+    # False = no longer for sale (checkout/order refuse), but still in the
+    # runtime catalog so existing credits, budgets and subscriptions keep
+    # resolving. is_active=FALSE would drop the plan from PLANS entirely.
+    sellable: bool = True
+    # None = this plan is its own per-project budget pot (every plan before
+    # 066). Set = a pure credit kind: a consumed slot allocates its API budget
+    # under this pot plan, and the pot plan's own credits are accepted for it
+    # (see accepted_credit_plan_ids). Pot resolution never sees credit kinds.
+    budget_plan_id: "str | None" = None
 
 
 # Mutable runtime cache. Populated by reload_plans() at startup. Mutated
@@ -56,6 +69,9 @@ async def reload_plans() -> int:
     return len(PLANS)
 
 
+PRICE_BASES = ("net", "gross")
+
+
 class PlanCatalogUnavailable(RuntimeError):
     """An unloaded catalog is an infrastructure failure, never an unbilled app."""
 
@@ -72,13 +88,25 @@ async def _load_plans_via_platform() -> dict[str, PlanConfig]:
     result = {}
     try:
         for row in rows:
+            # priceBasis/sellable/budgetPlanId are REQUIRED keys (066): a
+            # worker that silently defaulted them against an older
+            # platform-api would treat credit kinds as budget pots and refuse
+            # unallocated calls of that app — fail at boot instead.
             plan = PlanConfig(
                 id=row["id"], app_id=row["appId"], name=row["name"],
                 price=float(row["priceEur"]), interval=row["interval"],
                 api_budget_eur=float(row["apiBudgetEur"]),
                 description=row["description"], trial=row["trial"],
+                price_basis=row["priceBasis"], sellable=row["sellable"],
+                budget_plan_id=row["budgetPlanId"],
             )
-            if not plan.id or not plan.app_id or not isinstance(plan.trial, bool) or plan.id in result:
+            if (
+                not plan.id or not plan.app_id or not isinstance(plan.trial, bool)
+                or plan.id in result
+                or plan.price_basis not in PRICE_BASES
+                or not isinstance(plan.sellable, bool)
+                or not (plan.budget_plan_id is None or isinstance(plan.budget_plan_id, str))
+            ):
                 raise ValueError("invalid or duplicate plan")
             result[plan.id] = plan
     except (KeyError, TypeError, ValueError) as exc:
@@ -143,14 +171,64 @@ def find_project_plans_for_app(app_id: str) -> "tuple[PlanConfig, ...]":
     1/5/20 packs). Which of them pays for a given call is decided by the
     allocated project budget, not by this catalog — see
     src.budget.plan_resolution.resolve_billing_plan.
+
+    Pure credit kinds (budget_plan_id set, migration 066) are NOT budget pots
+    and are left out: their slots allocate under their pot plan, so a call is
+    never metered against them. Energy therefore keeps exactly one project pot
+    ('energy-project') although it sells three credit kinds.
     """
     _require_loaded_catalog()
     return tuple(
         sorted(
-            (p for p in PLANS.values() if p.app_id == app_id and not p.trial and p.interval == "project"),
+            (
+                p for p in PLANS.values()
+                if p.app_id == app_id and not p.trial and p.interval == "project"
+                and p.budget_plan_id is None
+            ),
             key=lambda p: p.id,
         )
     )
+
+
+def budget_plan_for(plan: PlanConfig) -> PlanConfig:
+    """The pot a consumed slot of `plan` allocates its project budget under."""
+    return plan if plan.budget_plan_id is None else get_plan(plan.budget_plan_id)
+
+
+def accepted_credit_plan_ids(plan_id: str) -> "tuple[str, ...]":
+    """
+    Credit rows (manual_project_credits.plan_id) that may be consumed for
+    `plan_id`, in consumption order.
+
+    * a pot plan or a plan without pot: only its own credits;
+    * a credit kind (budget_plan_id set): its own credits first, then the pot
+      plan's credits. That second entry is the migration path of 066/067:
+      credits bought as the former single kind ('energy-project', paid at
+      600 or 1000 EUR) stay valid for every Berichtsart. Named here once,
+      not as a silent fallback — consume_credit reports which kind paid.
+    """
+    plan = get_plan(plan_id)
+    if plan.budget_plan_id is None:
+        return (plan.id,)
+    return (plan.id, plan.budget_plan_id)
+
+
+class PlanNotSellable(ValueError):
+    """The plan exists (credits/budgets resolve) but may not be bought."""
+
+
+def require_sellable(plan_id: str) -> PlanConfig:
+    plan = get_plan(plan_id)
+    if not plan.sellable:
+        sellable_siblings = sorted(
+            p.id for p in PLANS.values()
+            if p.app_id == plan.app_id and p.sellable and not p.trial and p.interval == plan.interval
+        )
+        raise PlanNotSellable(
+            f"plan '{plan_id}' is no longer for sale (sellable=false). "
+            f"Buy one of {sellable_siblings} instead."
+        )
+    return plan
 
 
 def assert_catalog_is_unambiguous() -> None:
@@ -163,6 +241,22 @@ def assert_catalog_is_unambiguous() -> None:
     start rather than serve traffic that looks healthy while silently
     charging the wrong pot.
     """
+    for plan in PLANS.values():
+        if plan.budget_plan_id is None:
+            continue
+        pot = PLANS.get(plan.budget_plan_id)
+        # A credit kind must point at an active pot of the SAME app that is
+        # itself a pot — otherwise its slot allocates somewhere no call of the
+        # app is ever metered against.
+        if (
+            pot is None or pot.app_id != plan.app_id or pot.interval != "project"
+            or plan.interval != "project" or pot.budget_plan_id is not None or pot.trial
+        ):
+            raise AmbiguousPlanCatalog(
+                f"[PlanManager] plan {plan.id!r} declares budget_plan_id="
+                f"{plan.budget_plan_id!r}, which is not an active per-project pot plan "
+                f"of app {plan.app_id!r}."
+            )
     for app_id in {p.app_id for p in PLANS.values()}:
         find_monthly_plan_for_app(app_id)  # raises on two monthly pots
         # Several per-project plans WITHOUT a monthly plan is a legal shape
