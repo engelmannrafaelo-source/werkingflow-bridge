@@ -55,15 +55,20 @@ INSERT INTO plans (id, app_id, name, price_eur, interval, api_budget_eur, descri
      600, 'project', 100,
      'Ein Projekt-Credit für einen Analysebericht. KI-Budget inklusive.',
      FALSE, 33, '{"refundGuarantee": {"days": 14, "until": "pdf-export"}}'::jsonb, 'net', TRUE, 'energy-project')
--- DO UPDATE statt DO NOTHING (Zweitpruefung 17.10.2026): Preis und
--- Netto-Kennzeichen SIND der Rafael-Entscheid. Eine vorhandene Zeile (z. B. von
--- Hand angelegt) mit anderem Preis bliebe sonst still falsch. Die uebrigen
--- Spalten bleiben unberuehrt; die Seeds 020/041/043 nutzen DO NOTHING, weil
--- sie Startdaten sind, keine Preisentscheidung.
+-- DO UPDATE statt DO NOTHING (Zweitpruefung 17.10.2026, R2): Preis,
+-- Netto-Kennzeichen, Kaeuflichkeit und Topf-Zuordnung SIND der Rafael-Entscheid
+-- bzw. die Bedingung fuer genau EINEN Energy-Topf. Eine vorhandene, falsch
+-- angelegte Zeile (z. B. von Hand, 999 brutto, ohne budget_plan_id) bliebe
+-- sonst still falsch — ohne budget_plan_id waere sie ein zweiter Projekt-Topf
+-- und unallokierte Energy-Calls scheiterten mit PlanResolutionError. Name,
+-- Beschreibung und Budget bleiben unberuehrt; die Seeds 020/041/043 nutzen
+-- DO NOTHING, weil sie Startdaten sind, keine Preisentscheidung.
 ON CONFLICT (id) DO UPDATE
-   SET price_eur   = EXCLUDED.price_eur,
-       price_basis = EXCLUDED.price_basis,
-       updated_at  = NOW();
+   SET price_eur      = EXCLUDED.price_eur,
+       price_basis    = EXCLUDED.price_basis,
+       sellable       = EXCLUDED.sellable,
+       budget_plan_id = EXCLUDED.budget_plan_id,
+       updated_at     = NOW();
 
 UPDATE plans
    SET sellable = FALSE,
