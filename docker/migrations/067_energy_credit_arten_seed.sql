@@ -60,11 +60,15 @@ INSERT INTO plans (id, app_id, name, price_eur, interval, api_budget_eur, descri
 -- bzw. die Bedingung fuer genau EINEN Energy-Topf. Eine vorhandene, falsch
 -- angelegte Zeile (z. B. von Hand, 999 brutto, ohne budget_plan_id) bliebe
 -- sonst still falsch — ohne budget_plan_id waere sie ein zweiter Projekt-Topf
--- und unallokierte Energy-Calls scheiterten mit PlanResolutionError. Name,
--- Beschreibung und Budget bleiben unberuehrt; die Seeds 020/041/043 nutzen
--- DO NOTHING, weil sie Startdaten sind, keine Preisentscheidung.
+-- und unallokierte Energy-Calls scheiterten mit PlanResolutionError. Auch
+-- Name und Aktiv-Status (R3): der Name steht in der Mollie-Beschreibung und
+-- auf der Rechnung, eine inaktive Zeile fehlte im Laufzeitkatalog. Beschreibung
+-- und Budget bleiben unberuehrt; die Seeds 020/041/043 nutzen DO NOTHING, weil
+-- sie Startdaten sind, keine Preisentscheidung.
 ON CONFLICT (id) DO UPDATE
-   SET price_eur      = EXCLUDED.price_eur,
+   SET name           = EXCLUDED.name,
+       is_active      = TRUE,
+       price_eur      = EXCLUDED.price_eur,
        price_basis    = EXCLUDED.price_basis,
        sellable       = EXCLUDED.sellable,
        budget_plan_id = EXCLUDED.budget_plan_id,

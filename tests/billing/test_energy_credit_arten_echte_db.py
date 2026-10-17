@@ -200,19 +200,27 @@ async def test_067_korrigiert_eine_falsch_angelegte_vorab_zeile(db):
     async with db.acquire() as conn:
         await conn.execute(
             """UPDATE plans SET price_eur=999, price_basis='gross', sellable=FALSE, budget_plan_id=NULL,
-                      name='Handarbeit' WHERE id='energy-objektbericht'"""
+                      name='Handarbeit', is_active=FALSE WHERE id='energy-objektbericht'"""
         )
         await plans.reload_plans()
-        # Vorher: ohne budget_plan_id ist die Zeile selbst ein Projekt-Topf.
+        # Vorher: inaktiv, also nicht im Laufzeitkatalog.
+        assert "energy-objektbericht" not in plans.PLANS
+        await conn.execute("UPDATE plans SET is_active=TRUE WHERE id='energy-objektbericht'")
+        await plans.reload_plans()
+        # Aktiv, aber ohne budget_plan_id: die Zeile ist selbst ein Projekt-Topf.
         assert len([p for p in plans.find_project_plans_for_app("werking-energy")]) >= 2
+        await conn.execute("UPDATE plans SET is_active=FALSE WHERE id='energy-objektbericht'")
         async with conn.transaction():
             await conn.execute(sql)
         row = await conn.fetchrow(
-            "SELECT price_eur, price_basis, sellable, budget_plan_id, name FROM plans WHERE id='energy-objektbericht'"
+            "SELECT price_eur, price_basis, sellable, budget_plan_id, name, is_active, description FROM plans WHERE id='energy-objektbericht'"
         )
     assert (float(row["price_eur"]), row["price_basis"], row["sellable"], row["budget_plan_id"]) == (
         300.0, "net", True, "energy-project",
     )
-    assert row["name"] == "Handarbeit"  # nur die Entscheidungsspalten werden gesetzt
+    # Name steht in der Mollie-Beschreibung und auf der Rechnung (R3).
+    assert row["name"] == "WerkING Energy — Objektbericht"
+    assert row["is_active"] is True
+    assert row["description"].startswith("Ein Projekt-Credit für einen Objektbericht")
     await plans.reload_plans()
     assert [p.id for p in plans.find_project_plans_for_app("werking-energy")] == ["energy-project"]
