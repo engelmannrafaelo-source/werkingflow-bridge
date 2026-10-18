@@ -943,6 +943,13 @@ app.add_middleware(TenantMiddleware)
 from src.attribution import AttributionEnforcementMiddleware
 app.add_middleware(AttributionEnforcementMiddleware)
 
+# Bild-Policy (Rafael 07.10.2026: Energy-Bildarbeit nur Gemini): Bildinhalt einer
+# Gemini-only-App wird HIER, am Server, erkannt — egal mit welcher Bibliothek der
+# Client sendet. Pure ASGI; Koerper wird nur fuer Apps unter der Policy gepuffert.
+# Siehe src/routing/bild_policy.py.
+from src.middleware.bild_policy_middleware import ImagePolicyMiddleware
+app.add_middleware(ImagePolicyMiddleware)
+
 # Add performance monitoring middleware (FIRST - to track all requests)
 # Pure ASGI implementation - streaming-safe
 from src.middleware.performance_monitor import PerformanceMonitorMiddleware
