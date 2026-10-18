@@ -464,3 +464,49 @@ async def test_rechnung_patch_bezahlt_storno_409(db):
     assert r["status"] == "cancelled"
     async with db.acquire() as conn:
         assert await conn.fetchval("SELECT status FROM invoices WHERE id=$1", uuid.UUID(bezahlt)) == "paid"
+
+
+async def test_paket_bestellrechnung_vies_nicht_lesbar_kein_checkout(db):
+    """Self-Service-Paket: das Brutto der Bestell-Rechnung IST der Mollie-Betrag —
+    ein VIES-Ausfall darf keine 20-%-Rechnung und keine Zahlung erzeugen."""
+    from src.billing import billing_service
+    from src.billing.mollie_adapter import get_mollie_adapter, reset_mollie_adapter
+
+    reset_mollie_adapter()
+    async with db.acquire() as conn:
+        uid, tid = await _bestandskunde_mit_altguthaben(conn, slots=1)
+        await _setze_steuerfall(conn, tid, "DE-B2B-RC")
+        rechnungen_vorher = await _zaehle(conn, "SELECT count(*) FROM invoices WHERE user_id=$1", uid)
+    kaputt = AsyncMock(side_effect=ConnectionError("VIES weg (Probe)"))
+    with patch.object(billing_service.vat_id_module, "has_confirmed_validation", kaputt), \
+         patch("src.invoices.routes.auto_approve_and_send_invoice", AsyncMock()):
+        with pytest.raises(billing_service.SteuerdatenNichtErmittelbar):
+            await billing_service.start_project_pack_checkout(
+                str(uid), "energy-objektbericht", 1, "https://x/ok", "u@test.local", "Owner",
+                consent=_consent(),
+            )
+    assert get_mollie_adapter()._payments == {}
+    async with db.acquire() as conn:
+        assert await _zaehle(conn, "SELECT count(*) FROM invoices WHERE user_id=$1", uid) == rechnungen_vorher
+
+
+async def test_folgezahlung_brutto_vies_nicht_lesbar_wiederholung_zieht_nach(db):
+    """Folgezahlung eines Brutto-Abos (DE-RC, 0 %): VIES-Ausfall -> keine 20-%-Rechnung,
+    Webhook scheitert laut; die Wiederholung legt die richtige Rechnung an."""
+    from src.billing import billing_service
+    from src.billing.mollie_adapter import reset_mollie_adapter
+
+    reset_mollie_adapter()
+    uid, sub, netto, brutto = await _brutto_abo(db, "DE-B2B-RC")
+    assert brutto == netto
+    pay = _folgezahlung(sub, brutto)
+    kaputt = AsyncMock(side_effect=ConnectionError("VIES weg (Probe)"))
+    with patch.object(billing_service.vat_id_module, "has_confirmed_validation", kaputt):
+        with pytest.raises(billing_service.SteuerdatenNichtErmittelbar):
+            await billing_service.handle_webhook(pay)
+    async with db.acquire() as conn:
+        assert await _zaehle(conn, "SELECT count(*) FROM invoices WHERE mollie_payment_id=$1", pay) == 0
+    await billing_service.handle_webhook(pay)
+    async with db.acquire() as conn:
+        inv = await conn.fetchrow("SELECT total_eur FROM invoices WHERE mollie_payment_id=$1", pay)
+    assert _q(inv["total_eur"]) == netto
