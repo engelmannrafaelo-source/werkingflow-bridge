@@ -159,13 +159,24 @@ LANGUAGE sql IMMUTABLE AS $$
     SELECT hashtext('abo-konto:' || p_user::text || ':' || p_app::text)::bigint
 $$;
 
+-- Positivliste der Isolation (Codex R3): schreibende Transaktionen auf Abos
+-- und Abschluessen NUR unter READ COMMITTED. Jede andere Stufe haelt einen
+-- Schnappschuss, der vor der Kontosperre liegen kann (REPEATABLE READ und
+-- SERIALIZABLE neben READ-COMMITTED-Schreibern gemessen) — Aufloesungs-Trigger
+-- und Commit-Pruefung saehen dann nicht den aktuellen Stand.
+CREATE OR REPLACE FUNCTION abo_nur_read_committed() RETURNS void
+LANGUAGE plpgsql AS $$
+BEGIN
+    IF current_setting('transaction_isolation') <> 'read committed' THEN
+        RAISE EXCEPTION 'Abo-/Abschlussaenderungen nur unter READ COMMITTED (hier: %)',
+            current_setting('transaction_isolation') USING ERRCODE = 'check_violation';
+    END IF;
+END $$;
+
 CREATE OR REPLACE FUNCTION abo_konto_sperren(p_user UUID, p_app app_id) RETURNS void
 LANGUAGE plpgsql AS $$
 BEGIN
-    IF current_setting('transaction_isolation') = 'repeatable read' THEN
-        RAISE EXCEPTION 'Abo-/Abschlussaenderungen nur unter READ COMMITTED oder SERIALIZABLE (Konto %/%)', p_user, p_app
-            USING ERRCODE = 'check_violation';
-    END IF;
+    PERFORM abo_nur_read_committed();
     PERFORM pg_advisory_xact_lock(abo_konto_schluessel(p_user, p_app));
 END $$;
 
@@ -174,6 +185,7 @@ END $$;
 CREATE OR REPLACE FUNCTION abo_00_subscriptions_sperre() RETURNS trigger
 LANGUAGE plpgsql AS $$
 BEGIN
+    PERFORM abo_nur_read_committed();   -- jede Zeile, auch ohne Mollie-Abo
     IF TG_OP = 'UPDATE' THEN
         IF NEW.user_id IS DISTINCT FROM OLD.user_id OR NEW.app_id IS DISTINCT FROM OLD.app_id THEN
             RAISE EXCEPTION 'subscriptions %: user_id/app_id sind unveraenderlich', OLD.id
@@ -208,6 +220,7 @@ CREATE TRIGGER abo_00_subscriptions_sperre
 CREATE OR REPLACE FUNCTION abo_00_abschluesse_sperre() RETURNS trigger
 LANGUAGE plpgsql AS $$
 BEGIN
+    PERFORM abo_nur_read_committed();
     IF TG_OP = 'UPDATE' AND (NEW.user_id IS DISTINCT FROM OLD.user_id
                              OR NEW.app_id IS DISTINCT FROM OLD.app_id
                              OR NEW.alt_abo_id IS DISTINCT FROM OLD.alt_abo_id
@@ -255,6 +268,7 @@ DECLARE
     n_ersatz   INTEGER;
     r          RECORD;
 BEGIN
+    PERFORM abo_nur_read_committed();
     SELECT count(*) FILTER (WHERE ueberlappt_abo_id IS NULL),
            count(*) FILTER (WHERE ueberlappt_abo_id IS NOT NULL)
       INTO n_regulaer, n_ersatz
@@ -323,6 +337,44 @@ CREATE CONSTRAINT TRIGGER abo_zz_konto_invariante
     AFTER INSERT OR UPDATE OR DELETE ON abo_abschluesse
     DEFERRABLE INITIALLY DEFERRED
     FOR EACH ROW EXECUTE FUNCTION abo_konto_invariante_trigger();
+
+-- (e) TRUNCATE umgeht alle Zeilen-Trigger (Codex R3). Laut abweisen —
+-- auch kaskadiert (TRUNCATE users CASCADE erreicht die Tabellen ebenfalls) —
+-- und das Recht entziehen: PUBLIC und jedem Inhaber, den Eigentuemer
+-- eingeschlossen. Eigentuemer/Superuser koennen beides zuruecknehmen; diese
+-- Grenze ist benannt, nicht geschlossen.
+CREATE OR REPLACE FUNCTION abo_truncate_abweisen() RETURNS trigger
+LANGUAGE plpgsql AS $$
+BEGIN
+    RAISE EXCEPTION 'TRUNCATE auf % ist gesperrt (Abo-Invariante, Migration 070)', TG_TABLE_NAME
+        USING ERRCODE = 'insufficient_privilege';
+END $$;
+
+DROP TRIGGER IF EXISTS abo_truncate_abweisen ON subscriptions;
+CREATE TRIGGER abo_truncate_abweisen BEFORE TRUNCATE ON subscriptions
+    FOR EACH STATEMENT EXECUTE FUNCTION abo_truncate_abweisen();
+DROP TRIGGER IF EXISTS abo_truncate_abweisen ON abo_abschluesse;
+CREATE TRIGGER abo_truncate_abweisen BEFORE TRUNCATE ON abo_abschluesse
+    FOR EACH STATEMENT EXECUTE FUNCTION abo_truncate_abweisen();
+
+DO $$
+DECLARE
+    r RECORD;
+BEGIN
+    FOR r IN
+        SELECT DISTINCT c.relname, a.grantee
+          FROM pg_class c,
+               aclexplode(COALESCE(c.relacl, acldefault('r', c.relowner))) a
+         WHERE c.oid IN ('subscriptions'::regclass, 'abo_abschluesse'::regclass)
+           AND a.privilege_type = 'TRUNCATE'
+    LOOP
+        IF r.grantee = 0 THEN
+            EXECUTE format('REVOKE TRUNCATE ON %I FROM PUBLIC', r.relname);
+        ELSE
+            EXECUTE format('REVOKE TRUNCATE ON %I FROM %I', r.relname, pg_get_userbyid(r.grantee));
+        END IF;
+    END LOOP;
+END $$;
 
 -- ---------------------------------------------------------------------------
 -- 3. Bestand pruefen, dann die Invariante als Index

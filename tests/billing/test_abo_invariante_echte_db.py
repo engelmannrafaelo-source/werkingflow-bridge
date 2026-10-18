@@ -46,6 +46,27 @@ MIGRATION_070 = (pathlib.Path(__file__).resolve().parents[2]
                  / "docker" / "migrations" / "070_abo_abschluss_invariante.sql")
 
 
+async def _immer_zurueckrollen(conn, *schritte):
+    """Fuehrt die Schritte (sql oder (sql, *args)) in einer Transaktion aus,
+    loest zurueckgestellte Pruefungen per SET CONSTRAINTS ALL IMMEDIATE aus und
+    rollt IMMER zurueck — auch wenn der erwartete Schutz fehlt (Mutante, alte
+    Migration). Ohne das committete eine Gegenprobe gegen die alte 070 ein
+    TRUNCATE in der Wegwerf-DB r3 (18.10.2026). Gibt die Ausnahme zurueck,
+    None wenn keine kam."""
+    tr = conn.transaction()
+    await tr.start()
+    try:
+        for schritt in schritte:
+            sql, *args = (schritt,) if isinstance(schritt, str) else schritt
+            await conn.execute(sql, *args)
+        await conn.execute("SET CONSTRAINTS ALL IMMEDIATE")
+    except Exception as exc:  # noqa: BLE001 — Pruefling ist die Ausnahme selbst
+        return exc
+    finally:
+        await tr.rollback()
+    return None
+
+
 async def _wechsel(uid, plan):
     from src.billing import billing_service
 
@@ -529,19 +550,19 @@ async def test_migration_070_bricht_bei_bestandsdubletten_ab(db):
     uid, plan_a, plan_b, alt = await _kunde_mit_aktivem_abo(db)
     sql = MIGRATION_070.read_text()
     async with db.acquire() as conn:
-        with pytest.raises(asyncpg.RaiseError, match=r"070: \d+ Konto/Konten mit mehr als einem"):
-            async with conn.transaction():
-                await conn.execute("DROP INDEX subscriptions_ein_mollie_abo_je_konto")
-                await conn.execute("DROP TRIGGER abo_zz_konto_invariante ON subscriptions")
-                await conn.execute("DROP TRIGGER abo_00_subscriptions_sperre ON subscriptions")
-                await conn.execute(
-                    """INSERT INTO subscriptions (user_id, app_id, plan_id, status, mollie_customer_id,
-                           mollie_subscription_id, mollie_first_payment_id, seats)
-                       SELECT user_id, app_id, plan_id, 'active', mollie_customer_id, $2, $2, 1
-                         FROM subscriptions WHERE id=$1""",
-                    uuid.UUID(alt), "d" + uuid.uuid4().hex,
-                )
-                await conn.execute(sql)
+        exc = await _immer_zurueckrollen(
+            conn,
+            "DROP INDEX subscriptions_ein_mollie_abo_je_konto",
+            "DROP TRIGGER abo_zz_konto_invariante ON subscriptions",
+            "DROP TRIGGER abo_00_subscriptions_sperre ON subscriptions",
+            ("""INSERT INTO subscriptions (user_id, app_id, plan_id, status, mollie_customer_id,
+                    mollie_subscription_id, mollie_first_payment_id, seats)
+                SELECT user_id, app_id, plan_id, 'active', mollie_customer_id, $2, $2, 1
+                  FROM subscriptions WHERE id=$1""", uuid.UUID(alt), "d" + uuid.uuid4().hex),
+            sql,
+        )
+        assert isinstance(exc, asyncpg.RaiseError), exc
+        assert "Konto/Konten mit mehr als einem" in str(exc), exc
         # Rollback: Index und Trigger wieder da.
         assert await conn.fetchval(
             "SELECT 1 FROM pg_indexes WHERE indexname='subscriptions_ein_mollie_abo_je_konto'") == 1
@@ -682,12 +703,12 @@ async def test_abschluss_schliessen_loest_ersatz_in_derselben_transaktion(db):
     uid, a, b, pid = await _paar_doppelt_aktiv(db)
     async with db.acquire() as conn:
         # Schliessen, waehrend beide laufen: abgewiesen (zwei regulaere Abos).
-        with pytest.raises((asyncpg.UniqueViolationError, asyncpg.CheckViolationError)):
-            await conn.execute(
-                "UPDATE abo_abschluesse SET status='abgeschlossen', ergebnis='x' WHERE payment_id=$1", pid)
-        # Loeschen des offenen Wechsels: ebenso.
-        with pytest.raises((asyncpg.UniqueViolationError, asyncpg.CheckViolationError)):
-            await conn.execute("DELETE FROM abo_abschluesse WHERE payment_id=$1", pid)
+        for schritt in (
+            ("UPDATE abo_abschluesse SET status='abgeschlossen', ergebnis='x' WHERE payment_id=$1", pid),
+            ("DELETE FROM abo_abschluesse WHERE payment_id=$1", pid),   # Loeschen: ebenso
+        ):
+            exc = await _immer_zurueckrollen(conn, schritt)
+            assert isinstance(exc, (asyncpg.UniqueViolationError, asyncpg.CheckViolationError)), (schritt, exc)
         # Altes kuendigen UND schliessen in einer Transaktion: erlaubt, Vermerk weg.
         async with conn.transaction():
             await conn.execute("UPDATE subscriptions SET status='cancelled' WHERE id=$1", a)
@@ -726,11 +747,13 @@ async def test_deferred_pruefung_greift_auch_ohne_indizes(db):
     die Invariante: zweites regulaeres Mollie-Abo wird abgewiesen."""
     uid, plan_a, plan_b, alt = await _kunde_mit_aktivem_abo(db)
     async with db.acquire() as conn:
-        with pytest.raises(asyncpg.CheckViolationError, match="Abo-Invariante verletzt"):
-            async with conn.transaction():
-                await conn.execute("DROP INDEX subscriptions_ein_mollie_abo_je_konto")
-                await conn.execute("DROP INDEX subscriptions_hoechstens_ein_ersatz_je_konto")
-                await conn.execute(_REGULAER_SQL, uuid.UUID(alt), "y" + uuid.uuid4().hex)
+        exc = await _immer_zurueckrollen(
+            conn,
+            "DROP INDEX subscriptions_ein_mollie_abo_je_konto",
+            "DROP INDEX subscriptions_hoechstens_ein_ersatz_je_konto",
+            (_REGULAER_SQL, uuid.UUID(alt), "y" + uuid.uuid4().hex),
+        )
+        assert isinstance(exc, asyncpg.CheckViolationError) and "Abo-Invariante verletzt" in str(exc), exc
         assert await _aktive_mollie(conn, uid) == 1
 
 
@@ -796,3 +819,146 @@ async def test_abschlussaenderung_sperrt_das_konto(db):
     finally:
         await c1.close()
         await c2.close()
+
+
+# ---------------------------------------------------------------------------
+# R4 — Codex-Pruefung R3: Isolations-Positivliste, TRUNCATE, D5-Gegenprobe
+# ---------------------------------------------------------------------------
+
+async def test_codex_r3_serializable_alter_schnappschuss_neben_read_committed(db):
+    """Codex R3, Schlussprobe (Ablauf unveraendert uebernommen): Verbindung S
+    legt unter SERIALIZABLE einen Schnappschuss fest, der echte Serviceweg
+    erzeugt danach A+B (doppelt_aktiv), S kuendigt A. Vorher committete S und
+    hinterliess B -> gekuendigtes A. Jetzt wird S beim Schreiben abgewiesen."""
+    from src.billing import billing_service
+
+    uid, plan_a, plan_b, alt = await _kunde_mit_aktivem_abo(db)
+    a = uuid.UUID(alt)
+    c = await asyncpg.connect(PG_URL)
+    try:
+        with pytest.raises(asyncpg.CheckViolationError, match="nur unter READ COMMITTED"):
+            async with c.transaction(isolation="serializable"):
+                await c.fetch("SELECT * FROM subscriptions WHERE user_id=$1", uid)
+                w = await _wechsel(uid, plan_b)
+                with patch.object(_mollie(), "cancel_subscription",
+                                  AsyncMock(side_effect=RuntimeError("synthetic failure"))):
+                    with pytest.raises(billing_service.AboDoppeltAktiv):
+                        await billing_service.handle_webhook(w["paymentId"])
+                await c.execute("UPDATE subscriptions SET status='cancelled' WHERE id=$1", a)
+    finally:
+        await c.close()
+    async with db.acquire() as x:
+        haengend = await x.fetchrow(
+            """SELECT s.id, s.ueberlappt_abo_id, t.status FROM subscriptions s
+                 JOIN subscriptions t ON t.id = s.ueberlappt_abo_id
+                WHERE s.user_id = $1 AND t.status <> 'active'""", uid)
+        assert haengend is None, dict(haengend)
+    assert await _status(db, alt) == "active"
+    assert (await _abschluss(db, w["paymentId"]))["status"] == "doppelt_aktiv"
+
+
+@pytest.mark.parametrize("isolation", ["serializable", "repeatable_read"])
+@pytest.mark.parametrize("tabelle", ["subscriptions", "abo_abschluesse"])
+async def test_nur_read_committed_darf_schreiben(db, isolation, tabelle):
+    """Positivliste: jede andere Isolation wird beim Schreiben abgewiesen — auf
+    beiden Tabellen und auch fuer Zeilen ohne Mollie-Abo."""
+    uid, plan_a, plan_b, alt = await _kunde_mit_aktivem_abo(db)
+    sql = {
+        "subscriptions": """INSERT INTO subscriptions (user_id, app_id, plan_id, status, mollie_customer_id, seats)
+                            SELECT user_id, app_id, plan_id, 'active', 'seed-x', 1 FROM subscriptions WHERE id=$1""",
+        "abo_abschluesse": """INSERT INTO abo_abschluesse (user_id, app_id, plan_id, seats, status)
+                              SELECT user_id, app_id, plan_id, 1, 'reserviert' FROM subscriptions WHERE id=$1""",
+    }[tabelle]
+    async with db.acquire() as conn:
+        with pytest.raises(asyncpg.CheckViolationError, match="nur unter READ COMMITTED"):
+            async with conn.transaction(isolation=isolation):
+                await conn.execute(sql, uuid.UUID(alt))
+        # Lesen bleibt unter jeder Isolation erlaubt; READ COMMITTED schreibt.
+        async with conn.transaction(isolation=isolation, readonly=True):
+            assert await conn.fetchval("SELECT count(*) FROM subscriptions WHERE user_id=$1", uid) >= 1
+        async with conn.transaction(isolation="read_committed"):
+            await conn.execute(sql, uuid.UUID(alt))
+
+
+@pytest.mark.parametrize("tabelle", ["subscriptions", "abo_abschluesse"])
+async def test_truncate_abgewiesen_auch_mit_recht(db, tabelle):
+    """TRUNCATE umgeht Zeilen-Trigger. Der Statement-Trigger weist es laut ab —
+    hier als Superuser (Recht vorhanden), in einer Transaktion: nichts geloescht."""
+    uid, plan_a, plan_b, alt = await _kunde_mit_aktivem_abo(db)
+    async with db.acquire() as conn:
+        vorher = await conn.fetchval(f"SELECT count(*) FROM {tabelle}")
+        exc = await _immer_zurueckrollen(conn, f"TRUNCATE {tabelle} CASCADE")
+        assert isinstance(exc, asyncpg.InsufficientPrivilegeError) and "ist gesperrt" in str(exc), exc
+        assert await conn.fetchval(f"SELECT count(*) FROM {tabelle}") == vorher
+
+
+async def test_truncate_kaskadiert_ueber_users_abgewiesen(db):
+    uid, plan_a, plan_b, alt = await _kunde_mit_aktivem_abo(db)
+    async with db.acquire() as conn:
+        vorher = await conn.fetchval("SELECT count(*) FROM subscriptions")
+        exc = await _immer_zurueckrollen(conn, "TRUNCATE users CASCADE")
+        assert isinstance(exc, asyncpg.InsufficientPrivilegeError) and "ist gesperrt" in str(exc), exc
+        assert await conn.fetchval("SELECT count(*) FROM subscriptions") == vorher
+
+
+async def test_truncate_recht_entzogen_fuer_dml_rolle(db):
+    """070 entzieht TRUNCATE allen Inhabern (PUBLIC, Eigentuemer). Eine
+    App-artige Rolle mit vollem DML hat es danach nicht; ACL ohne 'D'."""
+    async with db.acquire() as conn:
+        # Wirksame Rechte (fehlende ACL = Standardrechte des Eigentuemers inkl. TRUNCATE).
+        inhaber = await conn.fetch(
+            """SELECT c.relname, a.grantee FROM pg_class c,
+                      aclexplode(COALESCE(c.relacl, acldefault('r', c.relowner))) a
+                WHERE c.oid IN ('subscriptions'::regclass, 'abo_abschluesse'::regclass)
+                  AND a.privilege_type = 'TRUNCATE'""")
+        assert inhaber == [], [dict(r) for r in inhaber]
+        rolle = "abo_app_" + uuid.uuid4().hex[:12]
+        await conn.execute(f"CREATE ROLE {rolle} NOSUPERUSER")
+        await conn.execute(f"GRANT USAGE ON SCHEMA public TO {rolle}")
+        await conn.execute(f"GRANT SELECT, INSERT, UPDATE, DELETE ON subscriptions, abo_abschluesse TO {rolle}")
+        async with conn.transaction():
+            await conn.execute(f"SET LOCAL ROLE {rolle}")
+            for t in ("subscriptions", "abo_abschluesse"):
+                assert not await conn.fetchval("SELECT has_table_privilege(current_user, $1, 'TRUNCATE')", t)
+            for sql in ("TRUNCATE abo_abschluesse", "ALTER TABLE subscriptions DISABLE TRIGGER USER"):
+                exc = await _immer_zurueckrollen(conn, sql)
+                assert isinstance(exc, asyncpg.InsufficientPrivilegeError), (sql, exc)
+
+
+async def test_d5_gegenprobe_ersatzvermerk_sofort_nur_auf_aktives_abo(db):
+    """Codex R3 zu Mutante D5: ohne Sofort-Trigger wird ein Zwischenschritt
+    akzeptiert, den das Original abweist (Ersatz zeigt auf beendetes Abo, erst
+    spaeter wird es reaktiviert und ein Abschluss nachgetragen). Das Original
+    weist schon das erste INSERT ab — mit der Meldung des Sofort-Triggers."""
+    uid, plan_a, plan_b, alt = await _kunde_mit_aktivem_abo(db)
+    a = uuid.UUID(alt)
+    async with db.acquire() as conn:
+        await conn.execute("UPDATE subscriptions SET status='cancelled' WHERE id=$1", a)
+        neu_id = uuid.uuid4()
+        exc = await _immer_zurueckrollen(
+            conn,
+            ("""INSERT INTO subscriptions (id, user_id, app_id, plan_id, status, mollie_customer_id,
+                    mollie_subscription_id, seats, ueberlappt_abo_id)
+                SELECT $3, user_id, app_id, plan_id, 'active', mollie_customer_id, $2, 1, id
+                  FROM subscriptions WHERE id=$1""", a, "d5_" + uuid.uuid4().hex, neu_id),
+            ("UPDATE subscriptions SET status='active' WHERE id=$1", a),
+            ("""INSERT INTO abo_abschluesse (user_id, app_id, plan_id, seats, alt_abo_id, neu_abo_id, status)
+                SELECT user_id, app_id, plan_id, 1, id, $2, 'neu_aktiv' FROM subscriptions WHERE id=$1""",
+             a, neu_id),
+        )
+        # Original: Abbruch am ERSTEN Schritt mit der Meldung des Sofort-Triggers.
+        # Mutante D5: Endzustand gueltig, kein Abbruch -> exc None.
+        assert isinstance(exc, asyncpg.CheckViolationError), exc
+        assert "zeigt nicht auf ein aktives, unmarkiertes Mollie-Abo" in str(exc), exc
+
+
+@pytest.mark.parametrize("modus", ["ALL IMMEDIATE", "ALL DEFERRED"])
+async def test_codex_r3_constraint_modus_oeffnet_keinen_weg(db, modus):
+    uid, a, b, pid = await _paar_doppelt_aktiv(db)
+    async with db.acquire() as conn:
+        exc = await _immer_zurueckrollen(
+            conn, f"SET CONSTRAINTS {modus}",
+            ("UPDATE abo_abschluesse SET status='abgeschlossen', ergebnis='x' WHERE payment_id=$1", pid))
+        assert isinstance(exc, (asyncpg.UniqueViolationError, asyncpg.CheckViolationError)), exc
+        assert (await _abschluss(db, pid))["status"] == "doppelt_aktiv"
+        assert await _aktive_mollie(conn, uid) == 2
