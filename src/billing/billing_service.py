@@ -1679,6 +1679,12 @@ async def _erstattung_melden(payment_id: str, payment: Dict[str, Any]) -> Dict[s
         user_id = await conn.fetchval(
             "SELECT user_id FROM pending_payments WHERE payment_id = $1", payment_id,
         )
+        if user_id is None and payment.get("subscription_id"):
+            # Abo-Folgezahlung: steht nie in pending_payments.
+            user_id = await conn.fetchval(
+                "SELECT user_id FROM subscriptions WHERE mollie_subscription_id = $1",
+                payment.get("subscription_id"),
+            )
         schon = await conn.fetchval(
             "SELECT 1 FROM billing_events WHERE event_type = 'payment.refund_unbooked' "
             "AND mollie_payment_id = $1 AND payload->>'refundedEur' = $2 "

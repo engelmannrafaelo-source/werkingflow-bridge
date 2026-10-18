@@ -486,9 +486,12 @@ class TestCreditTopup:
 
         assert result["alreadyCredited"] is True
         assert result["balanceEur"] == 150.0
-        # No new billing event or invoice for a duplicate
+        # No new billing event for a duplicate. The invoice call IS repeated:
+        # auto_create_invoice is idempotent per mollie_payment_id and heals an
+        # invoice that failed on the first delivery (Codex 18.10.2026, Befund 4).
         mock_log.assert_not_called()
-        mock_inv.assert_not_called()
+        mock_inv.assert_awaited_once()
+        assert mock_inv.await_args.kwargs["mollie_payment_id"] == "pay_topup_dup"
 
 
 # ---------------------------------------------------------------------------
