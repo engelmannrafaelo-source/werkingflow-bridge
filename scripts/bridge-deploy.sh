@@ -74,6 +74,7 @@ WORKERHOST_COMPOSE="-f docker/docker-compose-worker-host.yml"
 HEALTH_TIMEOUT="${HEALTH_TIMEOUT:-360}"
 ROLLBACK_HEALTH_TIMEOUT="${ROLLBACK_HEALTH_TIMEOUT:-360}"   # symmetric: rollback restart hits the same lifespan pause
 SKIP_DIST_TEST="${SKIP_DIST_TEST:-false}"  # escape hatch: SKIP_DIST_TEST=true bridge-deploy.sh hetzner
+# BRIDGE_KEEP_BUILD_CACHE=1 preserves existing cache/images when deletion is not authorized.
 MIN_FREE_KB=$(( 5 * 1024 * 1024 ))  # 5 GB in KiB
 
 # Hetzner: service → container name
@@ -484,7 +485,9 @@ phase_preflight() {
     # below sees the real free space. Safe: dangling images are orphaned, build
     # cache is reclaimable, rollback rebuilds from code (never reuses an old
     # image). Non-fatal — a prune hiccup must never block a deploy.
-    if [[ "$DRY_RUN" == "false" ]]; then
+    if [[ "${BRIDGE_KEEP_BUILD_CACHE:-0}" == "1" ]]; then
+        info "BRIDGE_KEEP_BUILD_CACHE=1: preserving existing images and build cache (no prune)"
+    elif [[ "$DRY_RUN" == "false" ]]; then
         info "Reclaiming disk (dangling images + build cache)..."
         local prune_out
         prune_out=$(rssh "$host" "docker image prune -f >/dev/null 2>&1; docker builder prune -af 2>&1 | tail -1" 2>&1 || true)
