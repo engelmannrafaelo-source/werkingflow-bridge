@@ -1191,3 +1191,19 @@ async def test_codex_r4_schatten_abschluss_taeuscht_commit_pruefung_nicht(db):
         finally:
             await tr.rollback()
     assert abgewiesen is not None and "ohne offenen Wechsel" in str(abgewiesen), abgewiesen
+
+
+async def test_keine_waechter_an_spaltenlisten_gebunden(db):
+    """Vertrag (Kanzler, Codex R4): kein Trigger auf den Abo-Tabellen ist an
+    eine Spaltenliste gebunden (UPDATE OF ...). Eine Liste haette heute fuer
+    die Commit-Pruefung keine Verhaltensfolge (die Invariante haengt nur an
+    gelisteten Spalten, die Isolation prueft der Sperr-Trigger), wuerde aber
+    jede kuenftige Abhaengigkeit von einer weiteren Spalte still entwerten."""
+    async with db.acquire() as conn:
+        rows = await conn.fetch(
+            """SELECT tgname, pg_get_triggerdef(oid) AS def FROM pg_trigger
+                WHERE tgrelid IN ('public.subscriptions'::regclass, 'public.abo_abschluesse'::regclass)
+                  AND NOT tgisinternal""")
+    assert len(rows) >= 9, [r["tgname"] for r in rows]
+    gebunden = [(r["tgname"], r["def"]) for r in rows if " UPDATE OF " in r["def"]]
+    assert gebunden == [], gebunden
