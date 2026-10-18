@@ -1,6 +1,6 @@
 # Runbook: ADR-0011 Stufe B — Föderation auf Prod scharf schalten
 
-**Voraussetzung: Rafaels DIREKTE Freigabe in der ausführenden Session** (Prod-
+**Voraussetzung: belegte Freigabe fuer den konkreten Prod-Eingriff; vorgesehenes Deploy-Fenster beachten. Keine erneute Direktnachricht wegen Sitzungswechsel (Rafael, 18.10.2026)** (Prod-
 Bridge-Deploy + Prod-Host-Konfig). Geschrieben 2026-08-31 (Session 7f122be0),
 alle Host-Fakten an diesem Tag live gemessen; vor Ausführung die Pre-Checks
 FRISCH wiederholen.

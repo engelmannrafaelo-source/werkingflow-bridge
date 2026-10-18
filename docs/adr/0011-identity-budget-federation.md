@@ -198,8 +198,7 @@ Föderations-Go-Live entstanden; Bereinigung bleibt Rafael-gated.
   kompletten Mechanik über einen synthetischen Peer-Eintrag, der auf die
   EIGENE platform-api via Tailscale-Binding zeigt (fremder Origin →
   Peer-URL → Token → Gate-Antwort), ohne Prod anzufassen.
-- **Stufe B (prod, NUR mit Rafaels Direktfreigabe in der ausführenden
-  Session):** geteilte nginx.conf (Origin-Stempel) auf Prod, Tailscale-
+- **Stufe B (prod, nur im belegten Freigabeumfang und vorgesehenen Deploy-Fenster; keine erneute Direktnachricht wegen Sitzungswechsel, Rafael 18.10.2026):** geteilte nginx.conf (Origin-Stempel) auf Prod, Tailscale-
   Binding beider platform-apis, wechselseitige Token-Übergabe
   (`FEDERATION_TOKEN_*`), Prod-Worker-Env.
 - **Danach:** Reaktivierung der ADR-0010-Default-Stufe (Ein-Zeilen-Revert im

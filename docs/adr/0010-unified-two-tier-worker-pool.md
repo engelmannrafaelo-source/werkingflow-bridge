@@ -120,8 +120,7 @@ Mechanik (alles in `generate-bridge-upstreams.sh` + der geteilten
 - Prod-Bridge: fuer das Zielbild ist prod-seitig KEINE Pool-Aenderung noetig
   (beide Pools dort sind bereits Level1-first mit Dev-Backup). Der naechste
   Prod-Deploy bringt die geteilte nginx.conf (Hop-Guard + Map-Umbau) mit —
-  wie jeder Prod-Bridge-Deploy nur mit Rafaels Direktfreigabe in der
-  ausfuehrenden Session.
+  wie jeder Prod-Bridge-Deploy im belegten Freigabeumfang und unter Beachtung des vorgesehenen Deploy-Fensters. Keine erneute Direktnachricht in der ausfuehrenden Session verlangen (Rafael, 18.10.2026).
 - Rueckweg: Generator-Commit revertieren + regenerieren + nginx-Deploy — die
   gleiche auto-rollback-gesicherte Route wie jeder nginx-Deploy (ADR-0006).
 
