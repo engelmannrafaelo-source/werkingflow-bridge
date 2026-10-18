@@ -84,6 +84,10 @@ def child_failure_reason(output: bytes) -> str:
     except (TypeError, ValueError):
         return "cli_fehler: Kindprozess"
     reason = message.get("fehler") if isinstance(message, dict) else None
+    if isinstance(reason, str) and reason.startswith((
+        "image_requires_gemini: ", "image_tool_access_refused: ",
+    )):
+        return reason
     if isinstance(reason, str) and re.fullmatch(
         r"cli_fehler: SDK-Lauf: [A-Za-z][A-Za-z0-9_]*", reason
     ):

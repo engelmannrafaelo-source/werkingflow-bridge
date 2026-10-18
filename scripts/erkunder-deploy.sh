@@ -23,7 +23,7 @@ for svc in ${ERKUNDER_SERVICES}; do
         }
     fi
     git cat-file -e "\$commit^{commit}" || exit 1
-    git diff --quiet "\$commit" HEAD -- src/erkunder src/sdk_parser.py src/__init__.py pyproject.toml poetry.lock .dockerignore docker/Dockerfile.erkunder docker/erkunder docker/docker-compose.yml docker/docker-compose-platform-overlay.yml scripts/erkunder-deploy.sh || exit 1
+    git diff --quiet "\$commit" HEAD -- src/erkunder src/routing/bild_policy.py src/routing/__init__.py src/sdk_parser.py src/__init__.py pyproject.toml poetry.lock .dockerignore docker/Dockerfile.erkunder docker/erkunder docker/docker-compose.yml docker/docker-compose-platform-overlay.yml scripts/erkunder-deploy.sh || exit 1
 done
 EOF
 }

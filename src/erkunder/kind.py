@@ -86,16 +86,14 @@ def lesezugriff(name: str, eingabe: Any, cwd: str) -> list[dict[str, str]]:
 
 
 def sdk_options(body: dict[str, Any]) -> Any:
-    from src.routing.bild_policy import guard_agent_tools
-    # This worker needs Bash/Read to do its job. Refuse instead of pretending
-    # that a text-only run had inspected/calculated the source files.
-    guard_agent_tools("erkunder", ALLOWED_TOOLS, DISALLOWED_TOOLS)
     from claude_code_sdk import ClaudeCodeOptions
+
+    from src.routing.bild_policy import constrain_agent_options
 
     home = str(Path(body["ordner"]) / ".home")
     Path(home, "mpl").mkdir(parents=True, exist_ok=True)
     Path(home, "tmp").mkdir(parents=True, exist_ok=True)
-    return ClaudeCodeOptions(
+    options = ClaudeCodeOptions(
         model=body.get("modell", "claude-sonnet-5-5"),
         cwd=body["ordner"],
         max_turns=body["max_turns"],
@@ -113,6 +111,9 @@ def sdk_options(body: dict[str, Any]) -> Any:
         },
     )
 
+    constrain_agent_options(options)
+    return options
+
 
 async def run(body: dict[str, Any]) -> dict[str, Any]:
     options = sdk_options(body)  # policy before any SDK activity
@@ -122,17 +123,22 @@ async def run(body: dict[str, Any]) -> dict[str, Any]:
 
     install_resilient_parser()
     from src.routing.bild_policy import guard_prompt_text
+
     # Separater Prozess ohne App-Kontext: eingeschraenkt.
     guard_prompt_text("erkunder", body["prompt"])
     result = None
     zugriffe: list[dict[str, str]] = []
     async for message in query(prompt=body["prompt"], options=options):
+        if getattr(options, "_image_policy_failures", []):
+            raise options._image_policy_failures[0]
         if isinstance(message, AssistantMessage):
             for block in message.content:
                 if isinstance(block, ToolUseBlock):
                     zugriffe += lesezugriff(block.name, block.input, body["ordner"])
         if isinstance(message, ResultMessage):
             result = message
+    if getattr(options, "_image_policy_failures", []):
+        raise options._image_policy_failures[0]
     if result is None or result.is_error:
         raise RuntimeError("cli_fehler: SDK ohne erfolgreiches ResultMessage")
     usage = result.usage or {}
@@ -151,6 +157,7 @@ async def run(body: dict[str, Any]) -> dict[str, Any]:
 def failure_reason(error: Exception) -> str:
     """Return a status-safe reason without serializing SDK payloads or prompts."""
     from src.routing.bild_policy import ImageEgressRefused
+
     if isinstance(error, ImageEgressRefused):
         return f"{error.code}: {error.message}"
     return f"cli_fehler: SDK-Lauf: {type(error).__name__}"

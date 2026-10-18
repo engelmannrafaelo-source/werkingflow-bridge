@@ -246,6 +246,113 @@ def find_images(
     return funde
 
 
+
+def nontext_content(obj: Any, path: str = "payload") -> list[str]:
+    """Positive content contract at a non-Gemini sink, independent of MIME.
+
+    Envelopes are traversed only at their content slots, not at tool schemas.
+    Unknown content blocks/fields fail closed. Tool inputs are JSON arguments,
+    not model attachments; the independent payload scan still checks them.
+    """
+    findings: list[str] = []
+    visited = 0
+
+    def content(
+        value: Any, where: str, depth: int = 0, *, text_result: bool = False
+    ) -> None:
+        nonlocal visited
+        visited += 1
+        if depth > _MAX_DEPTH or visited > _MAX_NODES:
+            raise ValueError("Inhalt zu tief oder zu gross")
+        if hasattr(value, "model_dump"):
+            value = value.model_dump(exclude_none=True)
+        if isinstance(value, str):
+            return
+        if isinstance(value, list):
+            for i, item in enumerate(value):
+                content(item, f"{where}[{i}]", depth + 1, text_result=text_result)
+            return
+        if not isinstance(value, dict):
+            findings.append(f"{where}: kein belegter Textinhalt")
+            return
+        typ = value.get("type")
+        if text_result and typ not in {"text", "input_text", "output_text"}:
+            findings.append(f"{where}: Werkzeugergebnis muss ausschließlich Text sein")
+            return
+        fields = {
+            "text": {"type", "text", "cache_control", "citations"},
+            "input_text": {"type", "text"},
+            "output_text": {"type", "text", "annotations"},
+            "tool_use": {"type", "id", "name", "input", "cache_control"},
+            "tool_result": {
+                "type",
+                "tool_use_id",
+                "content",
+                "is_error",
+                "cache_control",
+            },
+            "document": {
+                "type",
+                "source",
+                "title",
+                "context",
+                "citations",
+                "cache_control",
+            },
+        }
+        if not isinstance(typ, str) or typ not in fields or set(value) - fields[typ]:
+            findings.append(f"{where}: Inhaltsform nicht auf Text-Positivliste")
+            return
+        if typ in {"text", "input_text", "output_text"}:
+            if not isinstance(value.get("text"), str):
+                findings.append(f"{where}: Textblock ohne Text")
+        elif typ == "tool_result":
+            content(
+                value.get("content", ""), where + ".content", depth + 1,
+                text_result=True,
+            )
+        elif typ == "tool_use":
+            if not isinstance(value.get("input"), dict):
+                findings.append(f"{where}: Werkzeugargumente sind kein JSON-Objekt")
+        elif typ == "document":
+            source = value.get("source")
+            if not (
+                isinstance(source, dict)
+                and source.get("type") == "text"
+                and isinstance(source.get("data"), str)
+                and source.get("media_type", "text/plain") == "text/plain"
+                and not set(source) - {"type", "data", "media_type"}
+            ):
+                findings.append(f"{where}: Dokumentquelle ist kein belegter Klartext")
+
+    def envelope(value: Any, where: str, depth: int = 0) -> None:
+        if depth > _MAX_DEPTH:
+            raise ValueError("Nachrichten zu tief verschachtelt")
+        if hasattr(value, "model_dump"):
+            value = value.model_dump(exclude_none=True)
+        if isinstance(value, list):
+            for i, item in enumerate(value):
+                envelope(item, f"{where}[{i}]", depth + 1)
+        elif isinstance(value, dict):
+            if "type" in value:
+                content(value, where)
+            elif "role" in value:
+                # Null assistant content is normal for OpenAI tool calls.
+                if value.get("content") is not None:
+                    content(value["content"], where + ".content")
+            else:
+                for key in ("messages", "input", "system", "content", "prompt"):
+                    if key in value:
+                        envelope(value[key], f"{where}.{key}", depth + 1)
+        elif isinstance(value, str):
+            return
+        elif value is not None:
+            findings.append(f"{where}: unbekannte Nachrichtenform")
+
+    envelope(obj, path)
+    return findings
+
+
 def _scan_text_bytes(data: bytes, path: str) -> list[str]:
     hit = scan_string(data.decode("utf-8", errors="ignore"))
     return [f"{path}: {hit}"] if hit else []
@@ -476,7 +583,7 @@ def app_is_gemini_only(*app_ids: Optional[str]) -> bool:
 
 
 def structural_images(obj: Any, path: str = "payload") -> list[str]:
-    return find_images(obj, path, structural_only=True)
+    return nontext_content(obj, path) + find_images(obj, path, structural_only=True)
 
 
 def guard_provider_payload(provider: str, payload: Any) -> None:
@@ -549,9 +656,11 @@ def guard_prompt_text(provider: str, text: Any) -> None:
         )
 
 
-# These built-ins return text; Read (images/PDF), Bash (arbitrary programs),
-# fetch, notebooks, MCP and delegation do not have that contract.
-TEXT_ONLY_AGENT_TOOLS = frozenset({"Grep", "Glob", "Write", "Edit"})
+# Read is checked before execution, built-in results after execution.
+# Fetch, notebooks, MCP and delegation do not have this contract.
+TEXT_ONLY_AGENT_TOOLS = frozenset(
+    {"Grep", "Glob", "Write", "Edit", "Read", "Bash", "LS"}
+)
 
 
 def guard_agent_tools(
@@ -582,8 +691,8 @@ def guard_agent_tools(
         raise ImageEgressRefused(
             f"{provider}: Werkzeugzugriff kann Bilder an Claude liefern. "
             "Für diese App sind nur ausdrücklich gewählte Textwerkzeuge "
-            "(Grep, Glob, Write, Edit) oder ein Aufruf ohne Werkzeuge erlaubt. "
-            "Read, Bash, MCP und Sitzungsfortsetzung nicht ausgeführt.",
+            "(Grep, Glob, Write, Edit, Read, Bash, LS) mit Inhaltsprüfung erlaubt. "
+            "MCP und Sitzungsfortsetzung nicht ausgeführt.",
             code="image_tool_access_refused",
         )
     return wanted
@@ -601,6 +710,7 @@ def constrain_agent_options(options: Any) -> None:
     )
     if exact is None:
         return
+    install_agent_content_hooks(options)
     options.extra_args = {
         **(getattr(options, "extra_args", None) or {}),
         "tools": ",".join(exact),
@@ -608,3 +718,127 @@ def constrain_agent_options(options: Any) -> None:
         "setting-sources": "",
         "disable-slash-commands": None,
     }
+
+
+def check_read_text(tool_input: Any, cwd: str) -> None:
+    """Read has native image/PDF modes: prove the complete file is text first."""
+    from pathlib import Path
+
+    from src.erkunder.dateien import read_bytes
+
+    raw = tool_input.get("file_path") if isinstance(tool_input, dict) else None
+    try:
+        if not isinstance(raw, str):
+            raise ValueError("Dateipfad fehlt")
+        path = Path(raw)
+        path = path if path.is_absolute() else Path(cwd) / path
+        data = read_bytes(path)
+        # PDF can be entirely ASCII; UTF-8 alone is not proof of plain text.
+        if b"%PDF-" in data[:1024] or _is_raw_image(data):
+            raise ValueError("Bild-/PDF-Signatur")
+        text = data.decode("utf-8")
+        if any(ord(c) < 32 and c not in "\n\r\t\f" for c in text):
+            raise ValueError("Binaere Steuerzeichen")
+        if scan_string(text):
+            raise ValueError("Bildnutzlast im Text")
+    except (OSError, UnicodeError, ValueError) as exc:
+        raise ImageEgressRefused(
+            "Read abgewiesen: Datei ist nicht als reiner UTF-8-Text belegt "
+            "(Inhaltsprüfung einschließlich Bild-/PDF-Signaturen).",
+            code="image_tool_access_refused",
+        ) from exc
+
+
+def check_tool_response(name: str, response: Any) -> None:
+    """Normalize documented CLI text wrappers; everything else is content."""
+    content = response
+    if isinstance(response, dict) and name == "Bash":
+        allowed = {
+            "stdout",
+            "stderr",
+            "interrupted",
+            "isImage",
+            "backgroundTaskId",
+            "returnCode",
+            "exitCode",
+        }
+        if set(response) <= allowed and not response.get("isImage", False):
+            if all(isinstance(response.get(k, ""), str) for k in ("stdout", "stderr")):
+                content = response.get("stdout", "") + "\n" + response.get("stderr", "")
+    elif (
+        isinstance(response, dict) and name == "Read" and response.get("type") == "text"
+    ):
+        file = response.get("file")
+        if (
+            set(response) <= {"type", "file"}
+            and isinstance(file, dict)
+            and set(file)
+            <= {"filePath", "content", "numLines", "startLine", "totalLines"}
+            and isinstance(file.get("content"), str)
+        ):
+            content = file["content"]
+    elif name in {"Grep", "Glob", "Write", "Edit", "LS"} and isinstance(response, dict):
+        # These CLI built-ins serialize their structured results as text.
+        # Typed content, if present, must still pass the block contract.
+        if "type" not in response and "content" not in response:
+            content = json.dumps(response)
+        elif "type" not in response and isinstance(response.get("content"), str):
+            content = response["content"]
+    # Wrap to force content validation even for an unknown dict without a type.
+    findings = nontext_content({"type": "tool_result", "content": content})
+    findings += find_images(content)
+    if findings:
+        raise ImageEgressRefused(
+            "Werkzeugantwort abgewiesen: Inhalt nicht auf Text-Positivliste; "
+            "nur an Gemini.",
+            code="image_tool_access_refused",
+        )
+
+
+def install_agent_content_hooks(options: Any) -> None:
+    from claude_code_sdk import HookMatcher
+
+    failures: list[ImageEgressRefused] = []
+    options._image_policy_failures = failures
+
+    async def before(event: dict, tool_use_id: Any, context: Any) -> dict:
+        try:
+            if event.get("tool_name") == "Read":
+                check_read_text(event.get("tool_input"), str(options.cwd))
+        except ImageEgressRefused as exc:
+            failures.append(exc)
+            return {
+                "continue": False,
+                "stopReason": exc.message,
+                "hookSpecificOutput": {
+                    "hookEventName": "PreToolUse",
+                    "permissionDecision": "deny",
+                    "permissionDecisionReason": exc.message,
+                },
+            }
+        return {}
+
+    async def after(event: dict, tool_use_id: Any, context: Any) -> dict:
+        try:
+            check_tool_response(event.get("tool_name", ""), event.get("tool_response"))
+        except ImageEgressRefused as exc:
+            failures.append(exc)
+            return {
+                "continue": False,
+                "stopReason": exc.message,
+                "decision": "block",
+                "reason": exc.message,
+            }
+        return {}
+
+    existing = dict(getattr(options, "hooks", None) or {})
+    # Preserve path-boundary hooks; the policy applies to every selected tool.
+    existing["PreToolUse"] = [
+        *existing.get("PreToolUse", []),
+        HookMatcher(matcher="Read", hooks=[before]),
+    ]
+    existing["PostToolUse"] = [
+        *existing.get("PostToolUse", []),
+        HookMatcher(hooks=[after]),
+    ]
+    options.hooks = existing

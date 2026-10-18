@@ -13,10 +13,15 @@ from pydantic import (
 )
 
 BerichtId = Annotated[str, Field(pattern=r"^[a-z0-9-]{8,80}$")]
-SchrittName = Annotated[str, Field(pattern=(
-    r"^(erkunder-[123]|harmonisierung|pruefung|"
-    r"(?:harmonisierung|pruefung)-korrektur(?:-[2-5])?)$"
-))]
+SchrittName = Annotated[
+    str,
+    Field(
+        pattern=(
+            r"^(erkunder-[123]|harmonisierung|pruefung|"
+            r"(?:harmonisierung|pruefung)-korrektur(?:-[2-5])?)$"
+        )
+    ),
+]
 
 
 class Vertrag(BaseModel):
@@ -98,8 +103,11 @@ class Schritt(Vertrag):
     versuch: int = Field(ge=1, le=2)
     status: Literal["ok", "abbruch"]
     abbruch_grund: str | None = Field(
-        pattern=(r"^(zeit|speicher|cli_fehler|geheimnis_im_ergebnis|"
-                 r"platz_neustart|konto|unbekannt)(: .*)?$")
+        pattern=(
+            r"^(zeit|speicher|cli_fehler|geheimnis_im_ergebnis|"
+            r"platz_neustart|konto|unbekannt|"
+            r"image_requires_gemini|image_tool_access_refused)(: .*)?$"
+        )
     )
     dauer_s: float = Field(ge=0)
     zuege: int = Field(ge=0)
@@ -127,8 +135,11 @@ class Ergebnis(Vertrag):
     schema_: Literal["erkunder-ergebnis/1"] = Field(alias="schema")
     bericht_id: BerichtId
     prompt_version: Literal[
-        "erkunder-prompts/1", "erkunder-prompts/2", "erkunder-prompts/3",
-        "erkunder-prompts/4", "erkunder-prompts/5",
+        "erkunder-prompts/1",
+        "erkunder-prompts/2",
+        "erkunder-prompts/3",
+        "erkunder-prompts/4",
+        "erkunder-prompts/5",
     ]
     modell: ModellName
     schritte: list[Schritt]

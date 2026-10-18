@@ -19,7 +19,7 @@ def energy():
 
 @pytest.mark.parametrize(
     "tools",
-    [None, ["Read"], ["Bash"], ["WebFetch"], ["Agent"], ["mcp__x"], ["Grep", "Read"]],
+    [None, ["WebFetch"], ["Agent"], ["mcp__x"]],
 )
 def test_unsafe_tools_are_refused(tools):
     with pytest.raises(bp.ImageEgressRefused, match="Werkzeugzugriff") as error:
@@ -90,7 +90,7 @@ def test_native_entry_refuses_before_subprocess():
 def test_sdk_entry_refuses_before_setup_or_query():
     async def run():
         async for _ in original_method("run_completion")(
-            SimpleNamespace(), "Lies plan.png", allowed_tools=["Read", "Bash"]
+            SimpleNamespace(), "Lies plan.png", allowed_tools=["WebFetch"]
         ):
             pytest.fail("SDK started")
 
@@ -98,11 +98,15 @@ def test_sdk_entry_refuses_before_setup_or_query():
         asyncio.run(run())
 
 
-def test_erkunder_refuses_before_sdk_import_or_start():
+def test_erkunder_uses_guarded_read_and_bash(tmp_path):
     from src.erkunder.kind import sdk_options
 
-    with pytest.raises(bp.ImageEgressRefused):
-        sdk_options({})
+    options = sdk_options(
+        {"ordner": str(tmp_path), "max_turns": 1, "claude_token": "offline"}
+    )
+    assert {"Read", "Bash"} <= set(options.allowed_tools)
+    assert set(options.hooks) >= {"PreToolUse", "PostToolUse"}
+    assert options.extra_args["tools"].split(",") == options.allowed_tools
 
 
 def test_system_prompt_is_checked_before_sdk_setup():
@@ -125,8 +129,7 @@ def test_sdk_final_options_guard_is_at_dispatch():
     code = source.read_text()
     assert (
         "constrain_agent_options(options)\n"
-        "                        async for message in query("
-        in code
+        "                        async for message in query(" in code
     )
 
 
