@@ -363,10 +363,96 @@ def _plan_price(plan_id: str) -> float:
 from src.billing import purchase_consent
 
 
+# ---------------------------------------------------------------------------
+# Abschluss-Markierung: Betragsbasis von Abo und Top-Up
+# ---------------------------------------------------------------------------
+#
+# Rafael-Entscheid 18.10.2026 (e-bridge-abos-brutto = a): Abo und Top-Up
+# ziehen brutto ein (Netto + USt., Rechnung == Abbuchung) — aber nur bei NEUEN
+# Abschluessen. Die Basis wird beim Checkout festgelegt und mit dem Abschluss
+# gespeichert (pending_payments.amount_basis, subscriptions.amount_basis,
+# Migration 068). Ein bestehendes Mollie-Abo behaelt seinen Betrag; eine vor
+# dem Umstieg netto angelegte, spaeter bezahlte Zahlung bleibt netto.
+
+BASIS_NETTO = "net"
+BASIS_BRUTTO = "gross"
+_BASEN = frozenset({BASIS_NETTO, BASIS_BRUTTO})
+
+# Basis jedes neuen Abschlusses (Abo-Erstzahlung, Top-Up).
+BASIS_NEUER_ABSCHLUSS = BASIS_BRUTTO
+
+# Planwechsel (change_subscription): True = der Wechsel ist ein neuer Abschluss
+# und bekommt BASIS_NEUER_ABSCHLUSS; False = das neue Abo uebernimmt die Basis
+# des abgeloesten. Rafaels Antwort steht aus (Kanzler 18.10.2026) — sie aendert
+# nur diese Zeile.
+PLANWECHSEL_IST_NEUER_ABSCHLUSS = True
+
+
+def _pruefe_basis(basis: str) -> str:
+    if basis not in _BASEN:
+        raise ValueError(f"unknown amount basis {basis!r} — allowed: {sorted(_BASEN)}")
+    return basis
+
+
+async def _abschluss_betrag(user_id: str, net_eur: Any, basis: str) -> Tuple[Decimal, Decimal]:
+    """(Nettobetrag, Mollie-Betrag) eines Abschlusses in der gegebenen Basis.
+
+    Brutto aus derselben Quelle wie jede Rechnung: resolve_invoice_tax +
+    invoice_amounts (eine Rundungsstelle). Netto muss ein Centbetrag sein.
+    """
+    _pruefe_basis(basis)
+    if basis == BASIS_NETTO:
+        net, _, _ = invoice_amounts(net_eur, 0.0)  # prueft nur den Centbetrag
+        return net, net
+    tax = await resolve_invoice_tax(user_id, log_prefix="[checkout]")
+    net, _, gross = invoice_amounts(net_eur, tax["taxRate"])
+    return net, gross
+
+
+async def _pruefe_rechnung_gegen_zahlung(
+    *, invoice_id: Optional[str], user_id: str, payment_id: str, paid_eur: Any, bahn: str,
+) -> None:
+    """Brutto-Abschluss: bezahlter Mollie-Betrag muss das Rechnungsbrutto sein.
+
+    Abweichung (z. B. Rechnungsadresse zwischen Checkout und Zahlung geaendert)
+    wird LAUT gemeldet — Log-Fehler + billing_event payment.amount_mismatch —,
+    die Leistung bleibt freigegeben: der Kunde hat gezahlt. Gleiche Regel wie
+    _pruefe_bezahlten_betrag fuer Self-Service-Pakete.
+    """
+    total = None
+    if invoice_id:
+        async with get_pool().acquire() as conn:
+            total = await conn.fetchval(
+                "SELECT total_eur FROM invoices WHERE id = $1", uuid.UUID(str(invoice_id)),
+            )
+    if (
+        total is not None and paid_eur is not None
+        and Decimal(str(paid_eur)).quantize(_CENT) == Decimal(str(total)).quantize(_CENT)
+    ):
+        return
+    logger.error(
+        "[webhook] %s payment %s: paid %s != invoice total %s (invoice %s)",
+        bahn, payment_id, paid_eur, total, invoice_id,
+    )
+    await log_billing_event(
+        "payment.amount_mismatch",
+        user_id=user_id,
+        invoice_id=str(invoice_id) if invoice_id else None,
+        mollie_payment_id=payment_id,
+        amount_eur=float(paid_eur) if paid_eur is not None else None,
+        source="mollie-webhook",
+        payload={"bahn": bahn, "invoiceTotalEur": float(total) if total is not None else None},
+    )
+
+
 async def start_subscription_checkout(
     user_id: str, plan_id: str, seats: int, success_redirect: str,
     email: str, name: str, *, consent: "purchase_consent.PurchaseConsentIn",
+    betragsbasis: Optional[str] = None,
 ) -> Dict[str, str]:
+    """Abo-Erstzahlung. `betragsbasis` None = neuer Abschluss
+    (BASIS_NEUER_ABSCHLUSS); gesetzt nur von change_subscription."""
+    basis = _pruefe_basis(betragsbasis or BASIS_NEUER_ABSCHLUSS)
     # Fail-fast: refuse the Mollie round-trip if the tenant's billing address
     # is incomplete. Without this gate, a user could complete payment on
     # Mollie and then provision_subscription (the webhook handler) would
@@ -379,6 +465,11 @@ async def start_subscription_checkout(
     async with pool.acquire() as conn:
         await _assert_complete_billing_address(conn, uuid.UUID(user_id), plan_id)
 
+    # Betrag VOR der Zustimmung: der Beleg traegt den Betrag, den Mollie einzieht.
+    net, amount = await _abschluss_betrag(
+        user_id, Decimal(str(_plan_price(plan_id))) * seats, basis,
+    )
+
     # Zustimmung festhalten, BEVOR die Zahlung entsteht (Migration 054).
     # Diese Bahn erzeugt keine pending_order — order_id bleibt None, die Bahn
     # steht am Beleg.
@@ -386,15 +477,15 @@ async def start_subscription_checkout(
         await purchase_consent.record_consent(
             conn, consent=consent, user_id=user_id,
             lane=purchase_consent.LANE_SUBSCRIPTION, plan_id=plan_id,
+            amount_eur=float(amount),
         )
 
     customer = await get_or_create_customer(user_id, email, name)
-    amount = _plan_price(plan_id) * seats
 
     mollie = get_mollie_adapter()
     checkout = await mollie.create_first_payment(
         customer_id=customer["mollieCustomerId"],
-        amount_eur=amount,
+        amount_eur=float(amount),
         description=f"{plan_id} ({seats} Sitz{'e' if seats > 1 else ''})",
         redirect_url=success_redirect,
         webhook_url=config.mollie_webhook_url,
@@ -403,6 +494,7 @@ async def start_subscription_checkout(
             "userId": user_id,
             "planId": plan_id,
             "seats": str(seats),
+            "betragsbasis": basis,
         },
     )
 
@@ -410,11 +502,12 @@ async def start_subscription_checkout(
     async with pool.acquire() as conn:
         await conn.execute(
             """
-            INSERT INTO pending_payments (payment_id, user_id, type, plan_id, amount_eur, created_at)
-            VALUES ($1, $2, 'subscription_first', $3, $4, NOW())
+            INSERT INTO pending_payments
+              (payment_id, user_id, type, plan_id, amount_eur, amount_basis, net_eur, created_at)
+            VALUES ($1, $2, 'subscription_first', $3, $4, $5, $6, NOW())
             ON CONFLICT (payment_id) DO NOTHING
             """,
-            checkout["paymentId"], uuid.UUID(user_id), plan_id, amount,
+            checkout["paymentId"], uuid.UUID(user_id), plan_id, amount, basis, net,
         )
     return checkout
 
@@ -513,8 +606,8 @@ async def start_project_pack_checkout(
     async with pool.acquire() as conn:
         await conn.execute(
             """
-            INSERT INTO pending_payments (payment_id, user_id, type, plan_id, amount_eur, created_at)
-            VALUES ($1, $2, 'project_pack', $3, $4, NOW())
+            INSERT INTO pending_payments (payment_id, user_id, type, plan_id, amount_eur, amount_basis, created_at)
+            VALUES ($1, $2, 'project_pack', $3, $4, 'gross', NOW())
             ON CONFLICT (payment_id) DO NOTHING
             """,
             checkout["paymentId"], user_uuid, plan_id, amount,
@@ -694,8 +787,8 @@ async def start_first_purchase_pack_checkout(
     async with pool.acquire() as conn:
         await conn.execute(
             """
-            INSERT INTO pending_payments (payment_id, user_id, type, plan_id, amount_eur, created_at)
-            VALUES ($1, $2, 'project_pack', $3, $4, NOW())
+            INSERT INTO pending_payments (payment_id, user_id, type, plan_id, amount_eur, amount_basis, created_at)
+            VALUES ($1, $2, 'project_pack', $3, $4, 'gross', NOW())
             ON CONFLICT (payment_id) DO NOTHING
             """,
             checkout["paymentId"], user_uuid, plan_id, amount,
@@ -706,9 +799,20 @@ async def start_first_purchase_pack_checkout(
 async def _activate_subscription(
     user_id: str, plan_id: str, seats: int, customer_id: str,
     first_payment_id: str,
+    *,
+    betragsbasis: str = BASIS_NETTO,
+    abo_betrag_eur: Any = None,
+    netto_eur: Any = None,
+    bezahlt_eur: Any = None,
 ) -> Dict[str, Any]:
     """
     Idempotent subscription activation.
+
+    Betragsbasis (Migration 068): 'net' = Bestandsverhalten (Mollie-Abo mit
+    Planpreis x Sitze, Rechnung schlaegt die USt. auf). 'gross' = das
+    Mollie-Abo bucht monatlich genau den Betrag der Erstzahlung
+    (`abo_betrag_eur`, das am Checkout festgelegte Brutto); die Rechnung geht
+    vom Netto aus und muss `bezahlt_eur` treffen.
 
     Mollie retries the webhook POST until it gets a 200. Without an
     idempotency guard, every retry would create another 'active' row.
@@ -748,7 +852,18 @@ async def _activate_subscription(
             return _serialize_subscription(existing)
 
     # First-time activation. Call Mollie to create the recurring subscription.
-    amount = _plan_price(plan_id) * seats
+    _pruefe_basis(betragsbasis)
+    if betragsbasis == BASIS_BRUTTO:
+        if abo_betrag_eur is None or netto_eur is None:
+            raise RuntimeError(
+                f"subscription_first {first_payment_id}: gross basis without "
+                "amount/net — no subscription created"
+            )
+        amount = float(Decimal(str(abo_betrag_eur)))
+        invoice_net = float(Decimal(str(netto_eur)))
+    else:
+        amount = _plan_price(plan_id) * seats
+        invoice_net = amount
     mollie = get_mollie_adapter()
     sub_resp = await mollie.create_subscription(
         customer_id=customer_id,
@@ -756,7 +871,7 @@ async def _activate_subscription(
         interval="1 month",
         description=f"{plan_id} ({seats} Sitz{'e' if seats > 1 else ''})",
         webhook_url=config.mollie_webhook_url,
-        metadata={"userId": user_id, "planId": plan_id},
+        metadata={"userId": user_id, "planId": plan_id, "betragsbasis": betragsbasis},
     )
 
     sub_uuid = uuid.uuid4()
@@ -766,14 +881,15 @@ async def _activate_subscription(
             INSERT INTO subscriptions
               (id, user_id, app_id, plan_id, status,
                mollie_customer_id, mollie_subscription_id, mollie_first_payment_id,
-               seats, started_at)
-            VALUES ($1, $2, $3, $4, 'active', $5, $6, $7, $8, NOW())
+               seats, started_at, amount_basis)
+            VALUES ($1, $2, $3, $4, 'active', $5, $6, $7, $8, NOW(), $9)
             ON CONFLICT (mollie_first_payment_id) DO NOTHING
             RETURNING id, user_id, app_id, plan_id, status, mollie_customer_id,
                       mollie_subscription_id, seats, started_at, cancelled_at
             """,
             sub_uuid, uuid.UUID(user_id), app_id, plan_id,
             customer_id, sub_resp["subscriptionId"], first_payment_id, seats,
+            betragsbasis,
         )
         if row:
             await _ensure_monthly_budget_pot(conn, uuid.UUID(user_id), plan_id)
@@ -786,14 +902,19 @@ async def _activate_subscription(
                 source="mollie-webhook",
                 payload={"planId": plan_id, "seats": seats},
             )
-            await auto_create_invoice(
+            invoice_id = await auto_create_invoice(
                 user_id=user_id,
-                amount_eur=float(amount),
+                amount_eur=invoice_net,
                 description=f"{plan_id} — Erste Monatsabrechnung ({seats} Sitz" + ("e" if seats > 1 else "") + ")",
                 subscription_id=str(row["id"]),
                 mollie_payment_id=first_payment_id,
                 number_prefix=prefix_for_app(app_id),
             )
+            if betragsbasis == BASIS_BRUTTO:
+                await _pruefe_rechnung_gegen_zahlung(
+                    invoice_id=invoice_id, user_id=user_id, payment_id=first_payment_id,
+                    paid_eur=bezahlt_eur, bahn="subscription_first",
+                )
             return _serialize_subscription(row)
 
         # Conflict: another webhook delivery raced us between the probe
@@ -1120,40 +1241,53 @@ async def start_topup_checkout(
     if amount_eur < 50 or amount_eur > 1000:
         raise ValueError(f"Top-Up amount EUR {amount_eur} out of range [50, 1000]")
 
+    # amount_eur ist das GUTHABEN (netto). Neue Abschluesse ziehen brutto ein
+    # (Rafael 18.10.2026, e-bridge-abos-brutto = a); gutgeschrieben wird weiter
+    # das Netto, die Rechnung zeigt Netto + USt. == Abbuchung.
+    basis = _pruefe_basis(BASIS_NEUER_ABSCHLUSS)
+    net, charge = await _abschluss_betrag(user_id, Decimal(str(amount_eur)), basis)
+
     # Zustimmung festhalten, BEVOR die Zahlung entsteht (Migration 054).
     # Diese Bahn erzeugt keine pending_order — order_id bleibt None, die Bahn
-    # steht am Beleg.
+    # steht am Beleg. Der Beleg traegt den Betrag, den Mollie einzieht.
     async with get_pool().acquire() as _conn:
         await purchase_consent.record_consent(
             _conn, consent=consent, user_id=user_id,
-            lane=purchase_consent.LANE_TOPUP, amount_eur=amount_eur,
+            lane=purchase_consent.LANE_TOPUP, amount_eur=float(charge),
         )
 
     customer = await get_or_create_customer(user_id, email, name)
     mollie = get_mollie_adapter()
     checkout = await mollie.create_one_time_payment(
         customer_id=customer["mollieCustomerId"],
-        amount_eur=amount_eur,
+        amount_eur=float(charge),
         description=f"API-Top-Up EUR {amount_eur}",
         redirect_url=success_redirect,
         webhook_url=config.mollie_webhook_url,
-        metadata={"type": "topup", "userId": user_id},
+        metadata={"type": "topup", "userId": user_id, "betragsbasis": basis},
     )
 
     pool = get_pool()
     async with pool.acquire() as conn:
         await conn.execute(
             """
-            INSERT INTO pending_payments (payment_id, user_id, type, amount_eur, created_at)
-            VALUES ($1, $2, 'topup', $3, NOW())
+            INSERT INTO pending_payments
+              (payment_id, user_id, type, amount_eur, amount_basis, net_eur, created_at)
+            VALUES ($1, $2, 'topup', $3, $4, $5, NOW())
             ON CONFLICT (payment_id) DO NOTHING
             """,
-            checkout["paymentId"], uuid.UUID(user_id), amount_eur,
+            checkout["paymentId"], uuid.UUID(user_id), charge, basis, net,
         )
     return checkout
 
 
-async def _credit_topup(user_id: str, amount_eur: float, mollie_payment_id: str) -> Dict[str, Any]:
+async def _credit_topup(
+    user_id: str, amount_eur: float, mollie_payment_id: str,
+    *, betragsbasis: str = BASIS_NETTO, bezahlt_eur: Any = None,
+) -> Dict[str, Any]:
+    """Gutschrift einer bezahlten Aufladung. `amount_eur` ist IMMER das
+    Guthaben (netto); bei Basis 'gross' muss die Rechnung `bezahlt_eur` treffen."""
+    _pruefe_basis(betragsbasis)
     pool = get_pool()
     user_uuid = uuid.UUID(user_id)
     async with pool.acquire() as conn:
@@ -1217,13 +1351,18 @@ async def _credit_topup(user_id: str, amount_eur: float, mollie_payment_id: str)
         source="mollie-webhook",
         payload={"newBalanceEur": float(new_balance)},
     )
-    await auto_create_invoice(
+    invoice_id = await auto_create_invoice(
         user_id=user_id,
         amount_eur=amount_eur,
         description=f"API-Top-Up € {amount_eur:.2f}",
         mollie_payment_id=mollie_payment_id,
         number_prefix=TOPUP_PREFIX,
     )
+    if betragsbasis == BASIS_BRUTTO:
+        await _pruefe_rechnung_gegen_zahlung(
+            invoice_id=invoice_id, user_id=user_id, payment_id=mollie_payment_id,
+            paid_eur=bezahlt_eur, bahn="topup",
+        )
     return {"alreadyCredited": False, "balanceEur": float(new_balance)}
 
 
@@ -1368,7 +1507,8 @@ async def change_subscription(
     async with pool.acquire() as conn:
         sub = await conn.fetchrow(
             """
-            SELECT id, plan_id, seats, mollie_customer_id, mollie_subscription_id
+            SELECT id, plan_id, seats, mollie_customer_id, mollie_subscription_id,
+                   amount_basis
               FROM subscriptions
              WHERE user_id = $1 AND status = 'active'
              ORDER BY started_at DESC
@@ -1390,10 +1530,14 @@ async def change_subscription(
     # Validate the new plan exists (raises ValueError for unknown).
     _plan_price(new_plan_id)
 
+    # Betragsbasis des neuen Abos: eine Zeile (PLANWECHSEL_IST_NEUER_ABSCHLUSS).
+    basis = None if PLANWECHSEL_IST_NEUER_ABSCHLUSS else _pruefe_basis(sub["amount_basis"])
+
     sub_id = str(sub["id"])
     await cancel_subscription(user_id, sub_id)
     checkout = await start_subscription_checkout(
         user_id, new_plan_id, seats, success_redirect, email, name,
+        betragsbasis=basis,
     )
     return {
         "cancelledSubscriptionId": sub_id,
@@ -1487,15 +1631,26 @@ async def handle_webhook(payment_id: str) -> Dict[str, Any]:
     pool = get_pool()
     async with pool.acquire() as conn:
         pending = await conn.fetchrow(
-            "SELECT user_id, type, plan_id, amount_eur FROM pending_payments WHERE payment_id = $1",
+            "SELECT user_id, type, plan_id, amount_eur, amount_basis, net_eur "
+            "FROM pending_payments WHERE payment_id = $1",
             payment_id,
         )
     if not pending:
         return {"handled": False, "reason": "unknown payment_id"}
 
     user_id = str(pending["user_id"])
+    # Basis steht am Abschluss (Migration 068), nicht an der Uhrzeit: eine vor
+    # dem Umstieg netto angelegte Zahlung bleibt netto.
+    basis = _pruefe_basis(pending["amount_basis"])
     if pending["type"] == "topup":
-        result = await _credit_topup(user_id, float(pending["amount_eur"]), payment_id)
+        if basis == BASIS_BRUTTO:
+            guthaben = float(pending["net_eur"])  # DB-Check: Brutto-Top-Up hat net_eur
+        else:
+            guthaben = float(pending["amount_eur"])
+        result = await _credit_topup(
+            user_id, guthaben, payment_id,
+            betragsbasis=basis, bezahlt_eur=payment.get("amount_eur"),
+        )
         return {"handled": True, "type": "topup", "result": result}
 
     if pending["type"] == "subscription_first":
@@ -1513,6 +1668,10 @@ async def handle_webhook(payment_id: str) -> Dict[str, Any]:
             raise RuntimeError("subscription_first: customer_id missing")
         sub = await _activate_subscription(
             user_id, pending["plan_id"], seats, cust, first_payment_id=payment_id,
+            betragsbasis=basis,
+            abo_betrag_eur=pending["amount_eur"],
+            netto_eur=pending["net_eur"],
+            bezahlt_eur=payment.get("amount_eur"),
         )
         return {"handled": True, "type": "subscription_first", "subscription": sub}
 
@@ -1992,8 +2151,9 @@ async def auto_create_invoice(
     eu_b2c_flag = tax_info["euB2c"]
 
     # Abos und Top-Ups: amount_eur ist der NETTO-Betrag, die Rechnung schlaegt
-    # die USt auf. Mollie hat bei diesen Bahnen bisher den Nettobetrag
-    # eingezogen (offener Befund, s. ERGEBNIS 17.10.2026) — hier unveraendert.
+    # die USt auf. Neue Abschluesse ziehen bei Mollie dieses Brutto ein
+    # (Basis 'gross', Migration 068; der Aufrufer prueft Rechnung == Zahlung),
+    # Bestandsabschluesse (Basis 'net') weiter das Netto.
     subtotal, tax, total = invoice_amounts(round(float(amount_eur), 2), tax_rate)
 
     line_items = [{

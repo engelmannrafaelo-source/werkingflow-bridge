@@ -3,9 +3,9 @@ Mollie zieht brutto ein (Rafael-Entscheid 17.10.2026, e-energy-mollie-brutto-202
 
 Ohne Datenbank: die eine Rundungsstelle (invoice_amounts), der Steuersatz aus
 derselben Quelle wie die Rechnung (_determine_tax_rate ueber resolve_invoice_tax)
-und die Bahnen, die NICHT umgestellt sind (Abo, Top-Up) — deren Bestandsverhalten
-ist hier festgehalten. Rechnungsbrutto == Mollie-Betrag gegen echten Postgres:
-test_mollie_brutto_echte_db.py.
+und Abo/Top-Up: neue Abschluesse brutto, Bestand netto (Rafael-Entscheid
+18.10.2026, e-bridge-abos-brutto = a). Rechnungsbrutto == Mollie-Betrag gegen
+echten Postgres: test_mollie_brutto_echte_db.py, test_abo_topup_brutto_echte_db.py.
 """
 from __future__ import annotations
 
@@ -138,47 +138,213 @@ async def test_rechnung_netto_weicht_vom_katalog_ab_keine_zahlung():
 
 
 # --------------------------------------------------------------------------
-# Abo und Top-Up: NICHT umgestellt — Bestandsverhalten festgehalten
+# Abo und Top-Up: neue Abschluesse brutto, Bestand netto
+# (Rafael-Entscheid 18.10.2026, e-bridge-abos-brutto = a)
 # --------------------------------------------------------------------------
-# Beide Bahnen ziehen bei Mollie den NETTO-Betrag ein (Abo: plan.price × Sitze,
-# Top-Up: der Guthabenbetrag) und schreiben die Rechnung danach mit USt. darauf.
-# Abgebucht und Rechnung weichen also ab. Der Rafael-Entscheid betraf die
-# Self-Service-Pakete (Energy-Arten, Check-Pakete); Abo und Top-Up brauchen
-# einen eigenen Entscheid (Abo-Folgezahlungen laufen ueber eine feste
-# Mollie-Subscription, Top-Up-Betraege sind Guthaben, nicht Preise). Diese Tests
-# brechen, sobald jemand das aendert — dann bewusst.
+# Die Basis wird am Checkout festgelegt und mit dem Abschluss gespeichert
+# (Migration 068). Diese Tests brechen, sobald jemand das aendert — dann bewusst.
+
+def _steuer(satz):
+    return AsyncMock(return_value={"taxRate": satz, "tenantId": "t1", "billingAddress": {"country": "AT"},
+                                   "reverseChargeNote": None, "euB2c": False})
+
+
+def _checkout_patches(pool, mollie, satz=20.0):
+    from contextlib import ExitStack
+    st = ExitStack()
+    st.enter_context(patch.object(billing_service, "get_pool", return_value=pool))
+    st.enter_context(patch.object(billing_service, "_assert_complete_billing_address", AsyncMock()))
+    consent = st.enter_context(patch.object(billing_service.purchase_consent, "record_consent", AsyncMock()))
+    st.enter_context(patch.object(billing_service, "get_or_create_customer",
+                                  AsyncMock(return_value={"mollieCustomerId": "c"})))
+    st.enter_context(patch.object(billing_service, "get_mollie_adapter", return_value=mollie))
+    st.enter_context(patch.object(billing_service, "_plan_price", return_value=250.0))
+    st.enter_context(patch.object(billing_service, "config", MagicMock(mollie_webhook_url="https://t/wh")))
+    st.enter_context(patch.object(billing_service, "resolve_invoice_tax", _steuer(satz)))
+    return st, consent
+
+
+def _pool_mit_conn():
+    conn = AsyncMock()
+    pool = MagicMock()
+
+    class _Ctx:
+        async def __aenter__(self):
+            return conn
+
+        async def __aexit__(self, *a):
+            return False
+
+    pool.acquire = lambda: _Ctx()
+    return pool, conn
+
+
+def test_neuer_abschluss_ist_brutto():
+    assert billing_service.BASIS_NEUER_ABSCHLUSS == billing_service.BASIS_BRUTTO
+
 
 @pytest.mark.asyncio
-async def test_abo_zieht_bisher_netto_ein():
+@pytest.mark.parametrize("satz,brutto", [(20.0, Decimal("600.00")), (0.0, Decimal("500.00"))])
+async def test_abo_neuer_abschluss_zieht_brutto_ein(satz, brutto):
     mollie = MagicMock()
     mollie.create_first_payment = AsyncMock(return_value={"paymentId": "tr_a", "checkoutUrl": "https://x"})
-    pool, _ = _pool_mit(None, False)
-    with patch.object(billing_service, "get_pool", return_value=pool), patch.object(
-        billing_service, "_assert_complete_billing_address", AsyncMock(),
-    ), patch.object(billing_service.purchase_consent, "record_consent", AsyncMock()), patch.object(
-        billing_service, "get_or_create_customer", AsyncMock(return_value={"mollieCustomerId": "c"}),
-    ), patch.object(billing_service, "get_mollie_adapter", return_value=mollie), patch.object(
-        billing_service, "_plan_price", return_value=250.0,
-    ), patch.object(billing_service, "config", MagicMock(mollie_webhook_url="https://t/wh")):
+    pool, conn = _pool_mit_conn()
+    st, consent = _checkout_patches(pool, mollie, satz)
+    with st:
         await billing_service.start_subscription_checkout(
             str(uuid.uuid4()), "report-standard", 2, "https://x/ok", "u@x", "U", consent=MagicMock(),
         )
-    assert mollie.create_first_payment.await_args.kwargs["amount_eur"] == 500.0  # netto
+    kw = mollie.create_first_payment.await_args.kwargs
+    assert Decimal(str(kw["amount_eur"])) == brutto
+    assert kw["metadata"]["betragsbasis"] == "gross"
+    assert Decimal(str(consent.await_args.kwargs["amount_eur"])) == brutto   # Beleg == Abbuchung
+    args = conn.execute.await_args.args                                      # pending_payments
+    assert args[4] == brutto and args[5] == "gross" and args[6] == Decimal("500.00")
 
 
 @pytest.mark.asyncio
-async def test_top_up_zieht_bisher_den_guthabenbetrag_ein():
+async def test_abo_mit_netto_basis_bleibt_bestandsverhalten():
+    """Nur ueber change_subscription mit PLANWECHSEL_IST_NEUER_ABSCHLUSS=False erreichbar."""
+    mollie = MagicMock()
+    mollie.create_first_payment = AsyncMock(return_value={"paymentId": "tr_a", "checkoutUrl": "https://x"})
+    pool, conn = _pool_mit_conn()
+    st, _ = _checkout_patches(pool, mollie)
+    with st:
+        await billing_service.start_subscription_checkout(
+            str(uuid.uuid4()), "report-standard", 2, "https://x/ok", "u@x", "U", consent=MagicMock(),
+            betragsbasis="net",
+        )
+    assert mollie.create_first_payment.await_args.kwargs["amount_eur"] == 500.0
+    assert conn.execute.await_args.args[5] == "net"
+
+
+@pytest.mark.asyncio
+async def test_unbekannte_basis_laut():
+    with pytest.raises(ValueError, match="amount basis"):
+        await billing_service.start_subscription_checkout(
+            str(uuid.uuid4()), "report-standard", 1, "https://x/ok", "u@x", "U", consent=MagicMock(),
+            betragsbasis="brutto",
+        )
+
+
+@pytest.mark.asyncio
+async def test_top_up_neuer_abschluss_zieht_brutto_ein_und_merkt_das_guthaben():
     mollie = MagicMock()
     mollie.create_one_time_payment = AsyncMock(return_value={"paymentId": "tr_t", "checkoutUrl": "https://x"})
-    pool, _ = _pool_mit(None, False)
-    with patch.object(billing_service, "get_pool", return_value=pool), patch.object(
-        billing_service.purchase_consent, "record_consent", AsyncMock(),
-    ), patch.object(
-        billing_service, "get_or_create_customer", AsyncMock(return_value={"mollieCustomerId": "c"}),
-    ), patch.object(billing_service, "get_mollie_adapter", return_value=mollie), patch.object(
-        billing_service, "config", MagicMock(mollie_webhook_url="https://t/wh"),
-    ):
+    pool, conn = _pool_mit_conn()
+    st, consent = _checkout_patches(pool, mollie)
+    with st:
         await billing_service.start_topup_checkout(
             str(uuid.uuid4()), 50.0, "https://x/ok", "u@x", "U", consent=MagicMock(),
         )
-    assert mollie.create_one_time_payment.await_args.kwargs["amount_eur"] == 50.0
+    kw = mollie.create_one_time_payment.await_args.kwargs
+    assert kw["amount_eur"] == 60.0 and kw["metadata"]["betragsbasis"] == "gross"
+    assert consent.await_args.kwargs["amount_eur"] == 60.0
+    args = conn.execute.await_args.args
+    assert args[3] == Decimal("60.00") and args[4] == "gross" and args[5] == Decimal("50.00")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("schalter,alte_basis,erwartet", [
+    (True, "net", None),      # Planwechsel = neuer Abschluss → Standard (brutto)
+    (True, "gross", None),
+    (False, "net", "net"),    # Planwechsel erbt die Basis des alten Abos
+    (False, "gross", "gross"),
+])
+async def test_planwechsel_folgt_einer_zeile(schalter, alte_basis, erwartet):
+    pool, conn = _pool_mit_conn()
+    conn.fetchrow = AsyncMock(return_value={
+        "id": uuid.uuid4(), "plan_id": "report-standard", "seats": 1,
+        "mollie_customer_id": "c", "mollie_subscription_id": "s", "amount_basis": alte_basis,
+    })
+    checkout = AsyncMock(return_value={"checkoutUrl": "https://x", "paymentId": "tr_n"})
+    with patch.object(billing_service, "get_pool", return_value=pool), patch.object(
+        billing_service, "PLANWECHSEL_IST_NEUER_ABSCHLUSS", schalter,
+    ), patch.object(billing_service, "_plan_price", return_value=250.0), patch.object(
+        billing_service, "cancel_subscription", AsyncMock(),
+    ), patch.object(billing_service, "start_subscription_checkout", checkout):
+        await billing_service.change_subscription(
+            str(uuid.uuid4()), "report-pro", 2, "https://x/ok", "u@x", "U",
+        )
+    assert checkout.await_args.kwargs["betragsbasis"] == erwartet
+
+
+def _webhook_patches(pending, paid):
+    pool, conn = _pool_mit_conn()
+    conn.fetchrow = AsyncMock(return_value=pending)
+    mollie = MagicMock()
+    mollie.get_payment = AsyncMock(return_value={"status": "paid", "amount_eur": paid, "metadata": {"seats": "2"},
+                                                 "customer_id": "c"})
+    return pool, mollie
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("basis,amount,net,guthaben", [
+    ("gross", Decimal("60.00"), Decimal("50.00"), 50.0),   # neuer Abschluss: Guthaben = Netto
+    ("net", Decimal("50.00"), None, 50.0),                  # Bestand: Guthaben = eingezogener Betrag
+])
+async def test_webhook_top_up_schreibt_immer_das_netto_gut(basis, amount, net, guthaben):
+    pending = {"user_id": uuid.uuid4(), "type": "topup", "plan_id": None, "amount_eur": amount,
+               "amount_basis": basis, "net_eur": net}
+    pool, mollie = _webhook_patches(pending, str(amount))
+    gut = AsyncMock(return_value={"alreadyCredited": False, "balanceEur": guthaben})
+    with patch.object(billing_service, "get_pool", return_value=pool), patch.object(
+        billing_service, "get_mollie_adapter", return_value=mollie,
+    ), patch.object(billing_service, "_credit_topup", gut):
+        await billing_service.handle_webhook("tr_t")
+    assert gut.await_args.args[1] == guthaben
+    assert gut.await_args.kwargs["betragsbasis"] == basis
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("basis,amount,net", [
+    ("gross", Decimal("600.00"), Decimal("500.00")),
+    ("net", Decimal("500.00"), None),
+])
+async def test_webhook_abo_reicht_basis_und_betraege_weiter(basis, amount, net):
+    pending = {"user_id": uuid.uuid4(), "type": "subscription_first", "plan_id": "report-standard",
+               "amount_eur": amount, "amount_basis": basis, "net_eur": net}
+    pool, mollie = _webhook_patches(pending, str(amount))
+    akt = AsyncMock(return_value={"id": "s"})
+    with patch.object(billing_service, "get_pool", return_value=pool), patch.object(
+        billing_service, "get_mollie_adapter", return_value=mollie,
+    ), patch.object(billing_service, "_activate_subscription", akt):
+        await billing_service.handle_webhook("tr_a")
+    kw = akt.await_args.kwargs
+    assert (kw["betragsbasis"], kw["abo_betrag_eur"], kw["netto_eur"]) == (basis, amount, net)
+
+
+@pytest.mark.asyncio
+async def test_brutto_abo_ohne_netto_legt_kein_abo_an():
+    mollie = MagicMock()
+    mollie.create_subscription = AsyncMock()
+    pool, conn = _pool_mit_conn()
+    conn.fetchrow = AsyncMock(return_value=None)
+    plan = MagicMock(app_id="werking-report")
+    with patch.object(billing_service, "get_pool", return_value=pool), patch.object(
+        billing_service, "get_mollie_adapter", return_value=mollie,
+    ), patch("src.budget.plans.get_plan", return_value=plan):
+        with pytest.raises(RuntimeError, match="no subscription created"):
+            await billing_service._activate_subscription(
+                str(uuid.uuid4()), "report-standard", 1, "c", "tr_a",
+                betragsbasis="gross", abo_betrag_eur=Decimal("300.00"), netto_eur=None,
+            )
+    mollie.create_subscription.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bezahlt,gemeldet", [("600.00", False), ("500.00", True), (None, True)])
+async def test_rechnung_gegen_zahlung(bezahlt, gemeldet):
+    pool, conn = _pool_mit_conn()
+    conn.fetchval = AsyncMock(return_value=Decimal("600.00"))
+    ev = AsyncMock()
+    with patch.object(billing_service, "get_pool", return_value=pool), patch.object(
+        billing_service, "log_billing_event", ev,
+    ):
+        await billing_service._pruefe_rechnung_gegen_zahlung(
+            invoice_id=str(uuid.uuid4()), user_id=str(uuid.uuid4()), payment_id="tr_a",
+            paid_eur=bezahlt, bahn="subscription_first",
+        )
+    assert (ev.await_count == 1) == gemeldet
+    if gemeldet:
+        assert ev.await_args.args[0] == "payment.amount_mismatch"
