@@ -387,6 +387,49 @@ async def test_netto_basis_abweichender_zahlbetrag_gemeldet(db):
     assert _q(payload["abweichungZumFrueherenNettopreisEur"]) == _q(inv["subtotal_eur"]) - netto
 
 
+async def test_netto_basis_altlast_rechnung_ueber_zahlbetrag_wird_gemeldet(db):
+    """Vor dem Deploy angelegte Rechnung (Zahlbetrag + USt., 'paid') zu einer
+    Zahlung: die Wiederholung legt keine zweite an, meldet aber die Abweichung."""
+    from src.billing import billing_service
+    from src.billing.mollie_adapter import reset_mollie_adapter
+
+    reset_mollie_adapter()
+    uid, sub, _erst, netto = await _netto_bestandsabo(db, "AT")
+    pay = _folgezahlung(sub, netto)
+    alt = await billing_service.auto_create_invoice(   # so rechnete der alte Code
+        user_id=str(uid), amount_eur=float(netto), description="Altlast",
+        subscription_id=str(sub["id"]), mollie_payment_id=pay,
+    )
+    await billing_service.handle_webhook(pay)
+    async with db.acquire() as conn:
+        assert await _zaehle(conn, "SELECT count(*) FROM invoices WHERE mollie_payment_id=$1", pay) == 1
+        ev = await conn.fetch(
+            "SELECT invoice_id FROM billing_events WHERE mollie_payment_id=$1 "
+            "AND event_type='payment.amount_mismatch'", pay)
+    assert len(ev) == 1 and str(ev[0]["invoice_id"]) == alt
+
+
+async def test_netto_basis_rechnung_folgt_zahlbetrag_nicht_bestellbetrag(db):
+    """Top-Up mit Basis net: Mollie meldet einen anderen Betrag als die
+    Bestellung — die Rechnung zeigt den GEZAHLTEN Betrag."""
+    from src.billing import billing_service
+    from src.billing.mollie_adapter import get_mollie_adapter, reset_mollie_adapter
+
+    reset_mollie_adapter()
+    mollie = get_mollie_adapter()
+    async with db.acquire() as conn:
+        uid, tid = await _bestandskunde_mit_altguthaben(conn, slots=1)
+        await _setze_steuerfall(conn, tid, "AT")
+    cust = await billing_service.get_or_create_customer(str(uid), "u@test.local", "Owner")
+    pay = mollie._create_payment(cust["mollieCustomerId"], 60.0, {"type": "topup"})["paymentId"]
+    async with db.acquire() as conn:
+        await _netto_zahlung_von_frueher(conn, uid, pay, "topup", None, Decimal("50"))
+    await billing_service.handle_webhook(pay)
+    async with db.acquire() as conn:
+        total = await conn.fetchval("SELECT total_eur FROM invoices WHERE mollie_payment_id=$1", pay)
+    assert _q(total) == Decimal("60.00")
+
+
 async def test_netto_basis_unbekannter_schalterwert_laut(db, monkeypatch):
     from src.billing import billing_service
     from src.billing.mollie_adapter import reset_mollie_adapter
@@ -618,6 +661,8 @@ async def test_rechnung_umweg_paid_issued_refunded_gesperrt(db):
     ("issued", "paid", True), ("issued", "cancelled", True),
     ("issued", "draft", False), ("draft", "refunded", False), ("issued", "refunded", False),
     ("cancelled", "issued", False), ("cancelled", "paid", False), ("refunded", "issued", False),
+    # paid ist endgueltig, auch bei Altdaten ohne paid_at
+    ("paid", "issued", False), ("paid", "draft", False),
 ])
 async def test_statuskanten_unbezahlter_rechnungen(db, von, nach, erlaubt):
     from fastapi import HTTPException
