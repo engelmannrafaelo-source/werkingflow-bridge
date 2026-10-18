@@ -2007,6 +2007,11 @@ class ClaudeCodeCLI:
         # it fires, asyncio.timeout cancels the SDK query, whose finally closes
         # the transport: the CLI and then always its whole process group end
         # within a bounded time (_bounded_transport_close, BRLZR P3/R2).
+        # BILD-AUSGANG (R6): auch der Agentenweg (Research-Pool, Doc-Agent, Chat-Fallback) laeuft durch
+        # dieselbe Ausgangspruefung wie jeder Anbieter-Body. Ein Agent mit Werkzeugen kann Base64 im
+        # Prompt dekodieren und als Bild lesen -> hier gilt auch Bildnutzlast im Text.
+        from src.routing.bild_policy import guard_prompt_text
+        guard_prompt_text("claude-cli", prompt)
         _timeout = self.timeout if timeout_s is None else max(1.0, min(self.timeout, float(timeout_s)))
         _prompt_as_received = prompt
         if resume_workdir is not None:

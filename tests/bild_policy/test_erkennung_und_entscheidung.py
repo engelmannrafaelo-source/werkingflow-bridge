@@ -194,17 +194,38 @@ def test_multipart_ohne_boundary_ist_nicht_pruefbar():
 
 # --- Geltungsbereich ----------------------------------------------------------------
 
-def test_andere_app_und_lesende_methoden_sind_unberuehrt():
+def test_erlaubte_apps_und_lesende_methoden_sind_unberuehrt():
     body = chat(BAUARTEN["image_url_block"])
-    assert ev(body, app="werking-report") is None
-    assert ev(body, app=None) is None
+    for app in ("werking-report", "engelmann", "cui", "platform", "werking-noise", "werking-safety", "acro-community"):
+        assert ev(body, app=app) is None, app
     assert ev(body, method="GET") is None
 
 
-def test_app_liste_ist_ueberschreibbar(monkeypatch):
-    monkeypatch.setenv("BRIDGE_IMAGE_POLICY_APPS", "werking-report")
+@pytest.mark.parametrize("app", [None, "", "unbekannt", "werking-energy", "Werking-Energy", "werking-report ", "anonymous:kein-header",
+                                 "werking-report2", "werking", "energy"])
+def test_fehlende_oder_unbekannte_identitaet_gilt_wie_energy(app):
+    """R6 Umkehr: nur ausdruecklich erlaubte Apps duerfen Bilder an Nicht-Gemini schicken."""
+    v = ev(chat(BAUARTEN["image_url_block"]), app=app)
+    assert v is not None and v.code == "image_requires_gemini"
+    assert ev(chat(BAUARTEN["image_url_block"], provider_tier="gemini-vision"), app=app) is None
+
+
+def test_positivliste_ist_ueberschreibbar_energy_nie(monkeypatch):
+    monkeypatch.setenv("BRIDGE_IMAGE_ANTHROPIC_ALLOWED_APPS", "meine-neue-app,werking-energy")
+    assert ev(chat(BAUARTEN["image_url_block"]), app="meine-neue-app") is None
     assert ev(chat(BAUARTEN["image_url_block"]), app="werking-report") is not None
-    assert ev(chat(BAUARTEN["image_url_block"]), app=ENERGY) is None
+    assert ev(chat(BAUARTEN["image_url_block"]), app="werking-energy") is not None
+    assert "werking-energy" not in bp.allowed_apps()
+
+
+def test_positivliste_entspricht_known_app_ids_ohne_energy():
+    import ast
+    import pathlib
+    src = (pathlib.Path(__file__).parents[2] / "src/main.py").read_text()
+    node = next(n for n in ast.walk(ast.parse(src)) if isinstance(n, ast.Assign)
+                and getattr(n.targets[0], "id", "") == "KNOWN_APP_IDS")
+    known = {e.value for e in node.value.elts}
+    assert bp.IMAGE_ANTHROPIC_ALLOWED_APPS == known - {"werking-energy"}
 
 
 def test_zu_grosser_koerper_wird_nicht_still_durchgelassen(monkeypatch):

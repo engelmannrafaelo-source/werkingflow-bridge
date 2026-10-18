@@ -150,6 +150,20 @@ _active_requests_lock = asyncio.Lock()
 
 
 @app.middleware("http")
+async def bild_policy_app_context(request: Request, call_next):
+    """Bild-Ausgang (R6): die von der Bridge verifizierte App uebernehmen. Ohne Header gilt "" = ohne
+    Identitaet = eingeschraenkt (Bild nur Gemini; der Dokumentdienst hat keinen -> der Provider-Guard sperrt).
+    Der Dienst ist nur aus dem Bridge-Netz erreichbar; der Header ist keine Nutzereingabe."""
+    from src.routing import bild_policy
+
+    token = bild_policy.CURRENT_APP.set(request.headers.get("x-bridge-verified-app", ""))
+    try:
+        return await call_next(request)
+    finally:
+        bild_policy.CURRENT_APP.reset(token)
+
+
+@app.middleware("http")
 async def track_active_requests(request: Request, call_next):
     global _active_requests
     if request.url.path not in ("/health", "/ready", "/status"):

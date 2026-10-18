@@ -40,6 +40,8 @@ from os import environ
 from typing import Any, Awaitable, Callable, Dict, List, Literal, Optional
 
 import httpx
+
+from src.routing.bild_policy import guard_provider_payload
 from pydantic import BaseModel, Field, ValidationError
 
 logger = logging.getLogger(__name__)
@@ -367,6 +369,7 @@ def messages_api_pruefer(
             "messages": [{"role": "user", "content": anfrage}],
         }
         headers = {"Content-Type": "application/json", "x-api-key": api_key, "anthropic-version": "2023-06-01"}
+        guard_provider_payload("anthropic-luecken", body)  # Bild-Ausgang
         eigener = client is None
         c = client or httpx.AsyncClient(timeout=timeout_seconds)
         try:

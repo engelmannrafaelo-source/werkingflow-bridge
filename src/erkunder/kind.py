@@ -116,6 +116,8 @@ async def run(body: dict[str, Any]) -> dict[str, Any]:
     from claude_code_sdk import AssistantMessage, ResultMessage, ToolUseBlock, query
 
     install_resilient_parser()
+    from src.routing.bild_policy import guard_prompt_text
+    guard_prompt_text("erkunder", body["prompt"])  # Bild-Ausgang: separater Prozess, kein App-Kontext -> eingeschraenkt
     result = None
     zugriffe: list[dict[str, str]] = []
     async for message in query(prompt=body["prompt"], options=sdk_options(body)):

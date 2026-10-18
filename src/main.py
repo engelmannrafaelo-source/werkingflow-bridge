@@ -9900,11 +9900,22 @@ async def _proxy_document_endpoint(
             content, filename, content_type, extra_data.get("mime_type_hint", ""),
         )
 
+        # BILD-AUSGANG (R6): der Privacy-Dienst beschreibt Bilder mit dem Anthropic-Vision-Provider und hat
+        # keinen Gemini-Weg. Fuer eingeschraenkte Apps (Energy, unbekannt, ohne Identitaet) wird die
+        # Bestellung von Bildbeschreibungen LAUT abgewiesen — nicht still ohne Beschreibung zurueckgegeben.
+        from src.routing import bild_policy as _bild_policy
+        _doc_app = _bild_policy.CURRENT_APP.get() or get_app_id_from_request(request)
+        _doc_refusal = _bild_policy.describe_images_refusal(_doc_app, extra_data.get("describe_images"))
+        if _doc_refusal is not None:
+            return JSONResponse(status_code=_doc_refusal.status, content={"status": "error", "error": {
+                "code": _doc_refusal.code, "message": _doc_refusal.message}})
+
         async with privacy_client.track_call() as _concurrent_before:
             response = await privacy_client.post(
                 downstream_path,
                 files={"file": (filename, content, content_type)},
                 data=extra_data,
+                headers={"X-Bridge-Verified-App": _doc_app or ""},
                 timeout=privacy_timeout(timeout),
             )
 

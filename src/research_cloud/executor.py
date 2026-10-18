@@ -32,6 +32,8 @@ from typing import Any, Awaitable, Callable, Dict, List, Optional
 
 import httpx
 
+from src.routing.bild_policy import guard_provider_payload
+
 from src.lauf_abschluss import LaufUnfertig, ModellAbbruch, abschluss_aus_stop_reason, annehmen
 from src.research_cloud.anonymize_gate import (
     CloudAnonymizeError,
@@ -555,6 +557,7 @@ async def run_research_cloud(
                             # "container_id is required..." (eval-verified 2026-07-24).
                             body["container"] = container_id
 
+                        guard_provider_payload("anthropic-research", body)  # Bild-Ausgang
                         response = await http_client.post(ANTHROPIC_API_URL, headers=headers, json=body)
                         if response.status_code != 200:
                             raise ResearchCloudExecutorError(

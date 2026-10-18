@@ -110,12 +110,13 @@ class ImagePolicyMiddleware:
             return
         headers = _headers(scope)
         app_id = await _app_id(headers)
-        if not app_id or app_id not in bild_policy.policy_apps():
-            await self.app(scope, receive, send)
-            return
-        token = bild_policy.CURRENT_APP.set(app_id)  # fuer die Ausgangspruefung (guard_provider_payload)
+        # Kontext fuer die Ausgangspruefung: "" = ohne Identitaet (gilt als eingeschraenkt).
+        token = bild_policy.CURRENT_APP.set(app_id or "")
         try:
-            await self._guarded(scope, receive, send, headers, app_id)
+            if not bild_policy.is_restricted(app_id):
+                await self.app(scope, receive, send)  # ausdruecklich erlaubte App: Koerper unberuehrt
+                return
+            await self._guarded(scope, receive, send, headers, app_id or "")
         finally:
             bild_policy.CURRENT_APP.reset(token)
 

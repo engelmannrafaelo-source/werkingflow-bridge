@@ -68,8 +68,15 @@ from typing import Any, Iterable, Optional
 
 logger = logging.getLogger(__name__)
 
-#: Apps, deren Bildinhalt nur an Gemini gehen darf. Eine festgeschriebene
-#: Architekturentscheidung (Rafael 07.10.2026), kein Ops-Schalter.
+#: UMGEKEHRT (R6, Kanzler Dev 18.10.2026): Bildinhalt an einen Nicht-Gemini-Anbieter ist NUR fuer diese
+#: ausdruecklich erlaubten Apps zulaessig (Positivliste). Fehlende oder unbekannte App-Identitaet wird
+#: wie Energy behandelt: nur Gemini, sonst 403. Die Sicherheit haengt damit nicht mehr daran, dass jeder
+#: Nebenweg (PDF-Proxy, Privacy-Dienst, Research, Erkunder, Jobs) die Identitaet korrekt weiterreicht.
+#: Eine festgeschriebene Architekturentscheidung = KNOWN_APP_IDS (main.py) ohne werking-energy.
+IMAGE_ANTHROPIC_ALLOWED_APPS = frozenset({
+    "engelmann", "werking-report", "werking-safety", "werking-noise", "cui", "platform", "acro-community",
+})
+#: Diese Apps sind nie erlaubt, auch nicht per Umgebungsvariable (Rafael 07.10.2026).
 IMAGE_GEMINI_ONLY_APPS = frozenset({"werking-energy"})
 
 GEMINI_VISION_TIER = "gemini-vision"
@@ -179,6 +186,8 @@ def find_images(obj: Any, path: str = "body", *, structural_only: bool = False) 
     nodes = 0
     while stack:
         node, p, depth = stack.pop()
+        if not isinstance(node, (dict, list, str, int, float, bool, type(None))) and hasattr(node, "model_dump"):
+            node = node.model_dump()  # Pydantic-ContentPart & Co.: auf dem serialisierten Body pruefen
         nodes += 1
         if depth > _MAX_DEPTH or nodes > _MAX_NODES:
             raise ValueError("Koerper zu tief oder zu gross verschachtelt, um ihn zu pruefen")
@@ -270,16 +279,19 @@ def find_images_in_body(body: bytes, content_type: str) -> list[str]:
 
 # ------------------------------------------------------------------------ Policy
 
-def policy_apps() -> frozenset[str]:
-    """Apps unter der Policy. ``BRIDGE_IMAGE_POLICY_APPS`` (kommagetrennt) ersetzt die Liste;
-    leer gesetzt schaltet die Policy ab (Notausgang, laut protokolliert)."""
-    raw = os.getenv("BRIDGE_IMAGE_POLICY_APPS")
-    if raw is None:
-        return IMAGE_GEMINI_ONLY_APPS
-    apps = frozenset(a.strip() for a in raw.split(",") if a.strip())
-    if not apps:
-        logger.warning("BRIDGE_IMAGE_POLICY_APPS ist leer: Bild-Policy ist ABGESCHALTET")
-    return apps
+def allowed_apps() -> frozenset[str]:
+    """Apps, die Bildinhalt auch an Nicht-Gemini-Anbieter schicken duerfen.
+
+    ``BRIDGE_IMAGE_ANTHROPIC_ALLOWED_APPS`` (kommagetrennt) ersetzt die Liste; ``werking-energy`` bleibt
+    in jedem Fall ausgeschlossen. Leer = niemand ausser Gemini."""
+    raw = os.getenv("BRIDGE_IMAGE_ANTHROPIC_ALLOWED_APPS")
+    apps = IMAGE_ANTHROPIC_ALLOWED_APPS if raw is None else frozenset(a.strip() for a in raw.split(",") if a.strip())
+    return apps - IMAGE_GEMINI_ONLY_APPS
+
+
+def is_restricted(app_id: Optional[str]) -> bool:
+    """Gilt fuer diese App 'Bild nur an Gemini'? Fehlend/leer/unbekannt = ja."""
+    return not app_id or app_id not in allowed_apps()
 
 
 def max_body_bytes() -> int:
@@ -313,6 +325,20 @@ def _refusal(funde: list[str], where: str) -> Violation:
     )
 
 
+def describe_images_refusal(app_id: Optional[str], form_value: Any) -> Optional[Violation]:
+    """Dokumentdienst (describe_images): Bildbeschreibung laeuft ueber den Anthropic-Vision-Provider und hat
+    keinen Gemini-Weg. Fuer eingeschraenkte Apps laut abweisen statt still ohne Beschreibung zu antworten."""
+    wanted = str(form_value or "").strip().lower() in ("1", "true", "yes", "on")
+    if wanted and is_restricted(app_id):
+        return Violation(
+            403, "image_requires_gemini",
+            "describe_images=true schickt Bilder an den Anthropic-Vision-Provider; fuer diese App (Energy bzw. ohne "
+            "erlaubte Identitaet) sind Bilder nur an Gemini zulaessig, und der Dokumentdienst hat keinen Gemini-Weg. "
+            "Nicht stillschweigend ohne Beschreibung beantwortet.",
+        )
+    return None
+
+
 def too_large(size: int) -> Violation:
     return Violation(
         413,
@@ -331,7 +357,7 @@ def evaluate(
     body: bytes,
 ) -> Optional[Violation]:
     """Die Entscheidung. ``None`` = durchlassen. Wirft nie; Unpruefbares ist eine Absage."""
-    if not app_id or app_id not in policy_apps() or method.upper() not in _WRITE_METHODS:
+    if not is_restricted(app_id) or method.upper() not in _WRITE_METHODS:
         return None
     if len(body) > max_body_bytes():
         return too_large(len(body))
@@ -386,7 +412,8 @@ def _parse(body: bytes) -> Any:
 
 import contextvars  # noqa: E402
 
-#: Die vom Eingang aufgeloeste App des laufenden Requests (None = unbekannt).
+#: Die vom Eingang aufgeloeste App des laufenden Requests: None = nicht gesetzt (kein Request-Kontext),
+#: "" = Eingang lief, aber ohne Identitaet. Beides gilt als eingeschraenkt.
 CURRENT_APP: "contextvars.ContextVar[Optional[str]]" = contextvars.ContextVar("bild_policy_app", default=None)
 
 
@@ -399,8 +426,10 @@ class ImageEgressRefused(Exception):
 
 
 def app_is_gemini_only(*app_ids: Optional[str]) -> bool:
-    apps = policy_apps()
-    return any(a and a in apps for a in (CURRENT_APP.get(), *app_ids))
+    """Eingeschraenkt (nur Gemini)? Die vom Eingang aufgeloeste App gewinnt; ohne Kontext die uebergebene."""
+    current = CURRENT_APP.get()
+    effective = current if current is not None else next((a for a in app_ids if a), None)
+    return is_restricted(effective)
 
 
 def structural_images(obj: Any, path: str = "payload") -> list[str]:
@@ -461,3 +490,17 @@ def enforce_image_egress(*, app_id: Optional[str], messages: Any, has_vision: bo
         "nicht an Gemini gehen. Nicht stillschweigend umgeleitet: provider_tier='gemini-vision' senden, "
         "ohne Operator-Pin.",
     )
+
+
+def guard_prompt_text(provider: str, text: Any) -> None:
+    """Ausgang fuer Wege, die einen TEXT-Prompt an einen Agenten mit Werkzeugen geben (Claude-CLI,
+    Erkunder, Research). Dort kann ein Agent Base64 dekodieren und als Bild lesen — deshalb gilt hier
+    auch Bildnutzlast im Text (anders als im typisierten Chat-Body, siehe Abschnitt AUSGANG)."""
+    if not app_is_gemini_only():
+        return
+    funde = find_images(text if not isinstance(text, (bytes, bytearray)) else bytes(text).decode("utf-8", "ignore"), f"{provider}-prompt")
+    if funde:
+        raise ImageEgressRefused(
+            f"Bildinhalt ({'; '.join(funde[:3])}) darf fuer diese App nicht an {provider} gehen — nur an Gemini. "
+            "Aufruf nicht gesendet."
+        )

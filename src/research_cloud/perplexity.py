@@ -29,6 +29,8 @@ from os import environ
 from typing import Any, Dict, List, Optional
 
 import httpx
+
+from src.routing.bild_policy import guard_prompt_text
 from pydantic import BaseModel, Field
 
 logger = logging.getLogger(__name__)
@@ -220,6 +222,7 @@ async def ask_perplexity(
         raise PerplexityCallError("PERPLEXITY_API_KEY missing")
     body = {"input": frage, "preset": config.preset, "stream": False}
     headers = {"Authorization": f"Bearer {config.api_key}", "Content-Type": "application/json"}
+    guard_prompt_text("perplexity", frage)  # Bild-Ausgang (Textrecherche; Bildnutzlast im Text gesperrt)
     for attempt in range(config.max_retries + 1):
         try:
             resp = await client.post(PERPLEXITY_API_URL, json=body, headers=headers, timeout=config.timeout_seconds)

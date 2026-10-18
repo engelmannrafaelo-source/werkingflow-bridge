@@ -86,9 +86,14 @@ def test_base64_als_text_ist_kein_bildtransport():
     bp.guard_provider_payload("bedrock", {"messages": [{"role": "user", "content": [{"type": "text", "text": TEXT_MSG[0]["content"]}]}]})
 
 
-def test_andere_apps_sind_unberuehrt():
+def test_erlaubte_apps_sind_unberuehrt_unbekannte_nicht():
     egress(BILD_MSG, app="werking-report")
+    tok = bp.CURRENT_APP.set("werking-report")
     bp.guard_provider_payload("bedrock", {"messages": [{"content": [{"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "QUJD"}}]}]})
+    bp.CURRENT_APP.reset(tok)
+    for app in (None, "", "x"):
+        with pytest.raises(bp.ImageEgressRefused):
+            egress(BILD_MSG, app=app)
 
 
 # --- Letztpruefung am fertigen Anbieter-Body -------------------------------------------------
