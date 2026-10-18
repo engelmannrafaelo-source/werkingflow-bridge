@@ -104,7 +104,7 @@ def test_pydantic_content_part_wird_im_anbieter_body_erkannt():
 
 def test_openai_adapter_serialisiert_vor_dem_guard():
     text = (SRC / "providers/openai_compatible.py").read_text(encoding="utf-8")
-    assert text.count('guard_provider_payload("openai-compatible"') == 2
+    assert text.count("text_egress.post(") + text.count("text_egress.stream(") == 2
 
 
 # --- Agenten-/Textwege: Prompt mit Bildnutzlast --------------------------------------------------
@@ -136,11 +136,12 @@ def test_run_completion_und_erkunder_rufen_den_text_guard():
 #: CENTRAL = laeuft durch enforce_image_egress in chat_completions (Chat-Dispatch).
 #: KEIN_BILD = Anbieter ist Gemini selbst, Abrechnung/Metadaten/Registry oder reiner Text ohne Bildweg (Grund).
 AUSGANG = {
-    "bedrock_service.py": "GUARD",
-    "vision_provider.py": "GUARD",
-    "providers/openai_compatible.py": "GUARD",
-    "research_cloud/executor.py": "GUARD",
-    "research_cloud/luecken.py": "GUARD",
+    "providers/text_egress.py": "GUARD",
+    "bedrock_service.py": "TRANSPORT",
+    "vision_provider.py": "TRANSPORT",
+    "providers/openai_compatible.py": "TRANSPORT",
+    "research_cloud/executor.py": "TRANSPORT",
+    "research_cloud/luecken.py": "TRANSPORT",
     "research_cloud/perplexity.py": "GUARD",
     "claude_cli.py": "GUARD",
     "erkunder/kind.py": "GUARD",

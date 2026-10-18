@@ -6,6 +6,8 @@ Hosts all heavy NLP dependencies (Presidio, spaCy, Docling, PyTorch).
 Internal-only: not exposed to nginx/public internet.
 """
 
+from src.providers import text_egress
+
 import os
 import re
 import json
@@ -159,6 +161,11 @@ async def bild_policy_app_context(request: Request, call_next):
     token = bild_policy.CURRENT_APP.set(request.headers.get("x-bridge-verified-app", ""))
     try:
         return await call_next(request)
+    except bild_policy.ImageEgressRefused as exc:
+        return JSONResponse(
+            status_code=exc.status,
+            content={"error": {"code": exc.code, "message": exc.message}},
+        )
     finally:
         bild_policy.CURRENT_APP.reset(token)
 
@@ -713,7 +720,7 @@ async def document_convert_and_anonymize_endpoint(request: Request):
 # Direct Anthropic API — bypasses Bridge workers to avoid rate-limit contention
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 HAIKU_MODEL = "claude-haiku-4-5-20251001"
-ANTHROPIC_API_URL = "https://api.anthropic.com/v1/messages"
+ANTHROPIC_API_URL = text_egress.ANTHROPIC_MESSAGES_URL
 
 SEMANTIC_CONVERTER_SYSTEM_PROMPT = """# HTML-Strukturkonverter fuer Dokumenten-Templates
 
@@ -858,7 +865,7 @@ async def _call_ai_for_conversion(html_chunk: str, max_retries: int = 4) -> str:
     for attempt in range(max_retries):
         try:
             async with httpx.AsyncClient(timeout=300.0) as client:
-                response = await client.post(ANTHROPIC_API_URL, headers=headers, json=request_body)
+                response = await text_egress.post(client, ANTHROPIC_API_URL, headers=headers, json=request_body)
 
             if response.status_code == 200:
                 result = response.json()

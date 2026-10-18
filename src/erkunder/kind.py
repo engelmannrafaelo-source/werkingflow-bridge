@@ -88,7 +88,37 @@ def lesezugriff(name: str, eingabe: Any, cwd: str) -> list[dict[str, str]]:
 def sdk_options(body: dict[str, Any]) -> Any:
     from claude_code_sdk import ClaudeCodeOptions
 
-    from src.routing.bild_policy import constrain_agent_options
+    from src.erkunder.dateien import read_bytes
+    from src.routing.bild_policy import ImageEgressRefused, constrain_agent_options
+    from src.routing.text_material import require_text_bytes
+
+    entry = Path(body["ordner"]).parent / "eingang"
+    if entry.exists():
+        for source in entry.rglob("*"):
+            if source.is_dir() and not source.is_symlink():
+                continue
+            try:
+                require_text_bytes(
+                    read_bytes(
+                        source, limit=128 * 1024 * 1024, max_bytes=128 * 1024 * 1024
+                    )
+                )
+                if source.suffix.lower() in {
+                    ".pdf",
+                    ".png",
+                    ".jpg",
+                    ".jpeg",
+                    ".gif",
+                    ".webp",
+                    ".parquet",
+                }:
+                    raise ValueError("Original statt Textableitung")
+            except (OSError, UnicodeError, ValueError) as exc:
+                raise ImageEgressRefused(
+                    "Erkunder-Eingang enthaelt keine reine Textableitung; "
+                    "Auftrag neu vorbereiten.",
+                    code="image_tool_access_refused",
+                ) from exc
 
     home = str(Path(body["ordner"]) / ".home")
     Path(home, "mpl").mkdir(parents=True, exist_ok=True)

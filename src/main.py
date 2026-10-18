@@ -1,6 +1,7 @@
 import os
 import json
 import asyncio
+from src.providers import text_egress
 import secrets
 import string
 import re
@@ -10154,7 +10155,9 @@ def _resolve_stt_provider() -> dict:
             raise BridgeError(config_error(
                 detail="OPENAI_API_KEY not configured on Bridge — contact admin"
             ))
-        base = (os.getenv("OPENAI_STT_BASE_URL") or "https://api.openai.com/v1").rstrip("/")
+        base = (
+            os.getenv("OPENAI_STT_BASE_URL") or text_egress.OPENAI_BASE_URL
+        ).rstrip("/")
         return {
             "kind": "proxy",
             "provider": "openai",
@@ -10216,7 +10219,7 @@ def _sagemaker_transcribe_sync(
         aws_access_key_id=access_key,
         aws_secret_access_key=secret_key,
     )
-    resp = client.invoke_endpoint(
+    resp = text_egress.invoke_endpoint(client,
         EndpointName=endpoint_name,
         ContentType=content_type or "audio/wav",
         Accept="application/json",
@@ -10312,7 +10315,7 @@ async def audio_transcriptions(
                 data["temperature"] = temperature
 
             async with httpx.AsyncClient(timeout=120.0) as client:
-                response = await client.post(
+                response = await text_egress.post(client,
                     _stt["url"],
                     headers=_stt["headers"],
                     files=files,

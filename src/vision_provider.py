@@ -10,6 +10,8 @@ Usage:
     response = await provider.analyze(messages, model="claude-sonnet-4-5-20250929")
 """
 
+from src.providers import text_egress
+
 import os
 import base64
 import re
@@ -40,7 +42,7 @@ class VisionProvider:
     Bypasses Claude Code SDK which doesn't support multimodal inputs.
     """
 
-    ANTHROPIC_API_URL = "https://api.anthropic.com/v1/messages"
+    ANTHROPIC_API_URL = text_egress.ANTHROPIC_MESSAGES_URL
     ANTHROPIC_VERSION = "2023-06-01"
 
     # Supported image formats
@@ -377,12 +379,10 @@ class VisionProvider:
             request_body["output_config"] = output_config
 
         adapt_model_request(model, request_body)
-        from src.routing.bild_policy import guard_provider_payload
-        guard_provider_payload("anthropic", request_body)  # Bild-Ausgang: fertiger Anbieter-Body
 
         # Make API request
         async with httpx.AsyncClient(timeout=timeout) as client:
-            response = await client.post(
+            response = await text_egress.post(client,
                 self.ANTHROPIC_API_URL,
                 headers={
                     "Content-Type": "application/json",

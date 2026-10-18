@@ -6,16 +6,12 @@ import time
 from pathlib import Path
 
 import httpx
-import pyarrow as pa
-import pyarrow.parquet as pq
 import pytest
 from fastapi import HTTPException
 
 from src.erkunder.leitstand import Coordinator, Start, create_app
 
-_buffer = pa.BufferOutputStream()
-pq.write_table(pa.table({"sensor_id": ["pump"], "timestamp": [0], "value": [1.0]}), _buffer)
-MEASUREMENT_BYTES = _buffer.getvalue().to_pybytes()
+MEASUREMENT_BYTES = b"sensor_id,timestamp,value\npump,0,1.0\n"
 
 
 def body(ident="bericht-123", files=None, token="secret"):
@@ -37,7 +33,7 @@ def body(ident="bericht-123", files=None, token="secret"):
                 "vorwissen_md": "Vorwissen",
                 "vertiefung_md": None,
                 "dateien": files if files is not None else [{
-                    "ziel": "messdaten/test.parquet", "url": "https://download.test/data",
+                    "ziel": "messdaten/test.csv", "url": "https://download.test/data",
                     "sha256": hashlib.sha256(MEASUREMENT_BYTES).hexdigest(), "bytes": len(MEASUREMENT_BYTES),
                 }],
                 "korrekturkreis": 1,
@@ -88,7 +84,7 @@ class Places:
                 (directory / "skripte").mkdir(exist_ok=True)
                 (directory / "skripte/rechnung.py").write_text("# synthetic calculation")
                 (directory / "skripte/zahlen.json").write_text(json.dumps({"n": {
-                    "wert": 14, "einheit": "Starts", "quelle": "messdaten/test.parquet",
+                    "wert": 14, "einheit": "Starts", "quelle": "messdaten/test.csv",
                     "kanaele": ["p"], "raster": "1 min", "auswahl": "alle steigenden Flanken",
                 }}))
                 content = name + " [14](zahl:n)\n```erkunder-nachweis\n" + json.dumps({
@@ -160,7 +156,7 @@ async def test_download_integrity(tmp_path, size, digest):
             body(
                 files=[
                     {
-                        "ziel": "messdaten/x.parquet",
+                        "ziel": "messdaten/x.csv",
                         "url": "https://download.test/file",
                         "sha256": digest,
                         "bytes": size,
@@ -436,7 +432,7 @@ async def test_signed_download_url_not_logged(tmp_path, caplog):
             body(
                 files=[
                     {
-                        "ziel": "messdaten/x.parquet",
+                        "ziel": "messdaten/x.csv",
                         "url": "https://download.test/file?signature=private-signature",
                         "sha256": hashlib.sha256(MEASUREMENT_BYTES).hexdigest(),
                         "bytes": len(MEASUREMENT_BYTES),
@@ -1009,7 +1005,7 @@ async def test_lesezugriffe_je_schritt_und_pruefwissen_eingang(tmp_path):
     await service.startup()
     digest = hashlib.sha256(MEASUREMENT_BYTES).hexdigest()
     files = [
-        {"ziel": "messdaten/test.parquet", "url": "https://download.test/data",
+        {"ziel": "messdaten/test.csv", "url": "https://download.test/data",
          "sha256": digest, "bytes": len(MEASUREMENT_BYTES)},
         {"ziel": "pruefwissen/kw-thema-a.md", "url": "https://download.test/kw",
          "sha256": digest, "bytes": len(MEASUREMENT_BYTES)},

@@ -315,6 +315,11 @@ class Coordinator:
         return {"X-Erkunder-Intern": os.environ.get("ERKUNDER_INTERNAL_TOKEN", "")}
 
     async def download(self, ident: str, order: Auftrag) -> None:
+        from src.routing.text_material import require_text_bytes
+
+        require_text_bytes(order.vorwissen_md.encode("utf-8"))
+        if order.vertiefung_md is not None:
+            require_text_bytes(order.vertiefung_md.encode("utf-8"))
         entry = self.directory(ident) / "eingang"
         entry.mkdir(exist_ok=True, mode=0o755)
         entry.chmod(0o755)
@@ -335,16 +340,30 @@ class Coordinator:
             async with asyncio.timeout(120):
                 async with self.client.stream("GET", str(file.url)) as response:
                     response.raise_for_status()
-                    with target.open("wb") as stream:
-                        async for chunk in response.aiter_bytes():
-                            size += len(chunk)
-                            if size > file.bytes:
-                                raise StepFailed("daten", "unbekannt: bytes")
-                            digest.update(chunk)
-                            stream.write(chunk)
-            target.chmod(0o644)
+                    content = bytearray()
+                    async for chunk in response.aiter_bytes():
+                        size += len(chunk)
+                        if size > file.bytes or size > 128 * 1024 * 1024:
+                            raise StepFailed("daten", "unbekannt: bytes")
+                        digest.update(chunk)
+                        content.extend(chunk)
             if size != file.bytes or digest.hexdigest().lower() != file.sha256.lower():
                 raise StepFailed("daten", "unbekannt: sha256 oder bytes")
+            try:
+                text = require_text_bytes(bytes(content))
+            except (UnicodeError, ValueError) as exc:
+                raise StepFailed(
+                    "daten",
+                    "image_tool_access_refused: Eingang ist keine Textableitung",
+                ) from exc
+            if target.suffix.lower() in {
+                ".pdf", ".png", ".jpg", ".jpeg", ".gif", ".webp", ".parquet",
+            }:
+                raise StepFailed(
+                    "daten", "image_tool_access_refused: Originaldatei im Eingang"
+                )
+            target.write_text(text, encoding="utf-8")
+            target.chmod(0o644)
         self.states[ident]["quellkanaele"] = kanalmanifest(entry, order)
         (entry / "quellen.md").write_text(manifest_text(order) + "\n\n## Messkanäle je Quelle\n\n"
                                             + json.dumps(self.states[ident]["quellkanaele"], ensure_ascii=False))

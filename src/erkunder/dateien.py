@@ -7,7 +7,9 @@ from pathlib import Path
 MAX_FILE_BYTES = 5_000_000
 
 
-def read_bytes(path: Path, *, limit: int = MAX_FILE_BYTES) -> bytes:
+def read_bytes(
+    path: Path, *, limit: int = MAX_FILE_BYTES, max_bytes: int = MAX_FILE_BYTES
+) -> bytes:
     """Reject links in every component, special files and oversized/growing files."""
     path = path.absolute()
     # Parents need search permission only (root-owned 0711 in a place).
@@ -28,10 +30,10 @@ def read_bytes(path: Path, *, limit: int = MAX_FILE_BYTES) -> bytes:
         info = os.fstat(source.fileno())
         if not stat.S_ISREG(info.st_mode):
             raise ValueError("keine regulaere Datei")
-        if info.st_size > MAX_FILE_BYTES:
+        if info.st_size > max_bytes:
             raise ValueError("ergebnis zu gross")
-        data = source.read(min(limit, MAX_FILE_BYTES) + 1)
-        if len(data) > MAX_FILE_BYTES:
+        data = source.read(min(limit, max_bytes) + 1)
+        if len(data) > max_bytes:
             raise ValueError("ergebnis zu gross")
         return data
 

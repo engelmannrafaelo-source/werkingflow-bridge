@@ -79,11 +79,12 @@ def test_bild_das_die_weiche_nicht_routet_wird_abgewiesen():
     assert e.value.status == 400 and e.value.code == "image_not_routable"
 
 
-def test_base64_als_text_ist_kein_bildtransport():
+def test_base64_als_text_wird_am_ausgang_abgewiesen():
     """Befund 3: im fertigen Anbieter-Payload ist das ein Textstring (Token, kein Pixel)."""
     egress(TEXT_MSG, has_vision=False)  # geht durch: kein Bild
     bp.CURRENT_APP.set(ENERGY)
-    bp.guard_provider_payload("bedrock", {"messages": [{"role": "user", "content": [{"type": "text", "text": TEXT_MSG[0]["content"]}]}]})
+    with pytest.raises(bp.ImageEgressRefused):
+        bp.guard_provider_payload("bedrock", {"messages": [{"role": "user", "content": [{"type": "text", "text": TEXT_MSG[0]["content"]}]}]})
 
 
 def test_erlaubte_apps_sind_unberuehrt_unbekannte_nicht():
@@ -132,4 +133,5 @@ def test_zentrale_pruefung_steht_vor_dem_ersten_backend_zweig():
 @pytest.mark.parametrize("datei,anzahl", [("bedrock_service.py", 2), ("vision_provider.py", 1), ("providers/openai_compatible.py", 2)])
 def test_jeder_serialisierer_ruft_die_letztpruefung(datei, anzahl):
     text = (SRC / datei).read_text(encoding="utf-8")
-    assert len(re.findall(r'guard_provider_payload\("', text)) == anzahl, datei
+    calls = re.findall(r'text_egress\.(?:post|stream|invoke)\(', text)
+    assert len(calls) == anzahl, datei

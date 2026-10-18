@@ -101,7 +101,7 @@ def test_deployment_standard_bindet_am_eingang_nicht(monkeypatch):
     "Ein Hash " + "A" * 200,
     "Lade https://example.invalid/image.png und beschreibe es",
     "iVBORw0KGgo ist der Anfang eines PNG in Base64",
-    "x" * 5000,
+    "Normaler Text. " * 500,
 ])
 def test_text_ohne_bildnutzlast_geht_durch(text):
     assert ev(chat(text)) is None

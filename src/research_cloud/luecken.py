@@ -32,6 +32,8 @@ only measures (``luecken_nach_rueckrunde``) and never triggers anything.
 """
 from __future__ import annotations
 
+from src.providers import text_egress
+
 import json
 import logging
 import re
@@ -41,7 +43,6 @@ from typing import Any, Awaitable, Callable, Dict, List, Literal, Optional
 
 import httpx
 
-from src.routing.bild_policy import guard_provider_payload
 from pydantic import BaseModel, Field, ValidationError
 
 logger = logging.getLogger(__name__)
@@ -348,7 +349,7 @@ def messages_api_pruefer(
     api_key: Optional[str],
     client: Optional[httpx.AsyncClient] = None,
     *,
-    url: str = "https://api.anthropic.com/v1/messages",
+    url: str = text_egress.ANTHROPIC_MESSAGES_URL,
     timeout_seconds: float = 120.0,
 ) -> Pruefer:
     """Cloud path: a forced tool call, so the answer IS the schema."""
@@ -369,11 +370,10 @@ def messages_api_pruefer(
             "messages": [{"role": "user", "content": anfrage}],
         }
         headers = {"Content-Type": "application/json", "x-api-key": api_key, "anthropic-version": "2023-06-01"}
-        guard_provider_payload("anthropic-luecken", body)  # Bild-Ausgang
         eigener = client is None
         c = client or httpx.AsyncClient(timeout=timeout_seconds)
         try:
-            antwort = await c.post(url, headers=headers, json=body)
+            antwort = await text_egress.post(c, url, headers=headers, json=body)
         except httpx.HTTPError as e:
             raise LueckenPruefFehler(f"Prüfaufruf nicht erreichbar: {type(e).__name__}: {e}") from e
         finally:

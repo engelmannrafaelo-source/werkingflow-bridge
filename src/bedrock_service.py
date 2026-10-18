@@ -8,6 +8,8 @@ DSGVO-compliant: Default region is eu-central-1 (Frankfurt).
 
 import asyncio
 import os
+from src.providers import text_egress
+
 import json
 import uuid
 from datetime import datetime
@@ -379,8 +381,6 @@ async def call_bedrock(
         body["output_config"] = request.output_config
 
     adapt_model_request(resolved_model, body)
-    from src.routing.bild_policy import guard_provider_payload
-    guard_provider_payload("bedrock", body)  # Bild-Ausgang: fertiger Anbieter-Body
 
     logger.info(f"Calling Bedrock: model={bedrock_model_id}, region={actual_region}")
 
@@ -394,7 +394,7 @@ async def call_bedrock(
         # job and bills the generation twice. Run call + body-read on a worker
         # thread so the loop stays responsive.
         def _invoke_sync():
-            resp = boto_client.invoke_model(
+            resp = text_egress.invoke(boto_client,
                 modelId=bedrock_model_id,
                 contentType="application/json",
                 accept="application/json",
@@ -551,8 +551,6 @@ async def stream_bedrock(
         body["output_config"] = request.output_config
 
     adapt_model_request(resolved_model, body)
-    from src.routing.bild_policy import guard_provider_payload
-    guard_provider_payload("bedrock", body)  # Bild-Ausgang: fertiger Anbieter-Body
 
     logger.info(f"Streaming from Bedrock: model={bedrock_model_id}, region={actual_region}")
 
@@ -564,7 +562,7 @@ async def stream_bedrock(
         # EventStream next() are blocking network reads — pull both on worker
         # threads so slow chunks never stall /health or the jobs watchdog.
         response = await asyncio.to_thread(
-            lambda: boto_client.invoke_model_with_response_stream(
+            lambda: text_egress.invoke(boto_client, streaming=True,
                 modelId=bedrock_model_id,
                 contentType="application/json",
                 accept="application/json",

@@ -23,6 +23,8 @@ fail-closed gate as the research prompt; if that gate fails, the run aborts.
 """
 from __future__ import annotations
 
+from src.providers import text_egress
+
 import copy
 import json
 import logging
@@ -32,7 +34,6 @@ from typing import Any, Awaitable, Callable, Dict, List, Optional
 
 import httpx
 
-from src.routing.bild_policy import guard_provider_payload
 
 from src.lauf_abschluss import LaufUnfertig, ModellAbbruch, abschluss_aus_stop_reason, annehmen
 from src.research_cloud.anonymize_gate import (
@@ -115,7 +116,7 @@ def _log_key_lane_once(api_key: str) -> None:
             "research-cloud key lane: dedicated (separate from the image lane)"
         )
 
-ANTHROPIC_API_URL = "https://api.anthropic.com/v1/messages"
+ANTHROPIC_API_URL = text_egress.ANTHROPIC_MESSAGES_URL
 ANTHROPIC_VERSION = "2023-06-01"
 
 _LIBRARY_INDEX_TOOL: Dict[str, Any] = {
@@ -557,8 +558,7 @@ async def run_research_cloud(
                             # "container_id is required..." (eval-verified 2026-07-24).
                             body["container"] = container_id
 
-                        guard_provider_payload("anthropic-research", body)  # Bild-Ausgang
-                        response = await http_client.post(ANTHROPIC_API_URL, headers=headers, json=body)
+                        response = await text_egress.post(http_client, ANTHROPIC_API_URL, headers=headers, json=body)
                         if response.status_code != 200:
                             raise ResearchCloudExecutorError(
                                 f"research-cloud Messages API call failed: HTTP {response.status_code}: "

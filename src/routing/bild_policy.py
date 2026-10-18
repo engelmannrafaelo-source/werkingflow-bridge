@@ -67,6 +67,8 @@ import re
 from dataclasses import dataclass
 from typing import Any, Iterable, Optional
 
+from src.routing.text_material import binary_text_reason
+
 logger = logging.getLogger(__name__)
 
 #: UMGEKEHRT (R6, Kanzler Dev 18.10.2026): Bildinhalt an einen Nicht-Gemini-Anbieter ist NUR fuer diese
@@ -162,6 +164,9 @@ def _b64_image_at(text: str, start: int) -> bool:
 
 def scan_string(text: str) -> Optional[str]:
     """Fund-Beschreibung, wenn der String Bildnutzlast traegt; sonst None."""
+    reason = binary_text_reason(text)
+    if reason:
+        return reason
     if len(text) < 24:
         return None
     if "data:image/" in text.lower() and _DATA_URL.search(text):
@@ -553,12 +558,9 @@ def _parse(body: bytes) -> Any:
 #    (Bedrock, Anthropic-Vision, OpenAI-kompatibel) auf dem fertigen Anbieter-Body, auch fuer
 #    Wege, die nicht durch ``chat_completions`` laufen.
 #
-# Base64/Data-URL, die im fertigen Anbieter-Body nur als TEXT steht, ist kein Bildtransport: bei
-# Anthropic, Bedrock, OpenAI-kompatiblen Anbietern und Gemini wird ein Bild ausschliesslich ueber
-# einen typisierten Block (image / image_url / inline_data) als Pixel gelesen; ein Textstring wird
-# tokenisiert wie jeder Text. Das Modell sieht kein Bild (eine PNG-Nutzlast ist komprimiert und
-# fuer ein Sprachmodell nicht entzifferbar) — es kostet Token. Der Eingang weist es trotzdem ab
-# (Datenminimierung, kein Roh-Bild an Anthropic), der Ausgang zaehlt es nicht als Bild.
+# Auch als Text eingebettete Data-URLs und reversibel kodierte Binaerdaten
+# sind kein erlaubter Text. Anbietertransport und Werkzeugantworten pruefen
+# denselben Materialvertrag; die Vision-Weiche bleibt ausschliesslich Gemini.
 
 import contextvars  # noqa: E402
 
@@ -590,7 +592,7 @@ def guard_provider_payload(provider: str, payload: Any) -> None:
     """Letztpruefung im Serialisierer eines Nicht-Gemini-Anbieters (fertiger Body)."""
     if not app_is_gemini_only():
         return
-    funde = structural_images(payload, f"{provider}-payload")
+    funde = structural_images(payload, f"{provider}-payload") + find_images(payload)
     if funde:
         raise ImageEgressRefused(
             f"Bildinhalt ({'; '.join(funde[:3])}) darf fuer diese App nicht an {provider} gehen — "
@@ -643,9 +645,7 @@ def enforce_image_egress(*, app_id: Optional[str], messages: Any, has_vision: bo
 
 
 def guard_prompt_text(provider: str, text: Any) -> None:
-    """Ausgang fuer Wege, die einen TEXT-Prompt an einen Agenten mit Werkzeugen geben (Claude-CLI,
-    Erkunder, Research). Dort kann ein Agent Base64 dekodieren und als Bild lesen — deshalb gilt hier
-    auch Bildnutzlast im Text (anders als im typisierten Chat-Body, siehe Abschnitt AUSGANG)."""
+    """Check text prompts before dispatch to CLI, explorer or research tools."""
     if not app_is_gemini_only():
         return
     funde = find_images(text if not isinstance(text, (bytes, bytearray)) else bytes(text).decode("utf-8", "ignore"), f"{provider}-prompt")

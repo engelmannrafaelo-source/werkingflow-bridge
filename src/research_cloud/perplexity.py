@@ -28,6 +28,8 @@ import re
 from os import environ
 from typing import Any, Dict, List, Optional
 
+from src.providers import text_egress
+
 import httpx
 
 from src.routing.bild_policy import guard_prompt_text
@@ -36,7 +38,7 @@ from pydantic import BaseModel, Field
 logger = logging.getLogger(__name__)
 
 PERPLEXITY_TOOL_NAME = "perplexity_search"
-PERPLEXITY_API_URL = "https://api.perplexity.ai/v1/responses"
+PERPLEXITY_API_URL = text_egress.PERPLEXITY_URL
 PRESETS = ("fast", "low", "medium", "high", "xhigh")
 
 PERPLEXITY_TOOL: Dict[str, Any] = {
@@ -225,7 +227,7 @@ async def ask_perplexity(
     guard_prompt_text("perplexity", frage)  # Bild-Ausgang (Textrecherche; Bildnutzlast im Text gesperrt)
     for attempt in range(config.max_retries + 1):
         try:
-            resp = await client.post(PERPLEXITY_API_URL, json=body, headers=headers, timeout=config.timeout_seconds)
+            resp = await text_egress.post(client, PERPLEXITY_API_URL, json=body, headers=headers, timeout=config.timeout_seconds)
         except httpx.HTTPError as e:
             raise PerplexityCallError(f"Perplexity request failed: {type(e).__name__}: {e}") from e
         if resp.status_code == 200:
