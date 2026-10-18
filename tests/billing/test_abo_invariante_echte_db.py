@@ -732,3 +732,67 @@ async def test_deferred_pruefung_greift_auch_ohne_indizes(db):
                 await conn.execute("DROP INDEX subscriptions_hoechstens_ein_ersatz_je_konto")
                 await conn.execute(_REGULAER_SQL, uuid.UUID(alt), "y" + uuid.uuid4().hex)
         assert await _aktive_mollie(conn, uid) == 1
+
+
+@pytest.mark.parametrize("zuerst", ["aktivierung", "kuendigung"])
+async def test_kundenkuendigung_gleichzeitig_mit_aktivierung_ohne_deadlock(db, zuerst):
+    """Kunde kuendigt A, waehrend der Webhook den Ersatz aktiviert — in beiden
+    Reihenfolgen. Alle Schreiber nehmen zuerst die Kontosperre, dann Zeilen;
+    ohne das liefen Aktivierung (Zeile A, dann Sperre per Trigger) und
+    Kuendigung (Sperre, dann Zeile A) in einen Deadlock."""
+    from src.billing import billing_service
+
+    uid, plan_a, plan_b, alt = await _kunde_mit_aktivem_abo(db)
+    w = await _wechsel(uid, plan_b)
+    m = _mollie()
+    echt_suche, echt_kuendigung = m.find_subscription_for_first_payment, m.cancel_subscription
+
+    async def langsame_suche(*a, **kw):
+        if zuerst == "aktivierung":
+            await asyncio.sleep(0.4)
+        return await echt_suche(*a, **kw)
+
+    async def langsame_kuendigung(*a, **kw):
+        if zuerst == "kuendigung":
+            await asyncio.sleep(0.4)
+        return await echt_kuendigung(*a, **kw)
+
+    with patch.object(m, "find_subscription_for_first_payment", side_effect=langsame_suche), \
+         patch.object(m, "cancel_subscription", side_effect=langsame_kuendigung):
+        if zuerst == "aktivierung":
+            erster = asyncio.create_task(billing_service.handle_webhook(w["paymentId"]))
+            await asyncio.sleep(0.15)
+            zweiter = asyncio.create_task(billing_service.cancel_subscription(str(uid), alt))
+        else:
+            erster = asyncio.create_task(billing_service.cancel_subscription(str(uid), alt))
+            await asyncio.sleep(0.15)
+            zweiter = asyncio.create_task(billing_service.handle_webhook(w["paymentId"]))
+        erg = await asyncio.gather(erster, zweiter, return_exceptions=True)
+    assert not [e for e in erg if isinstance(e, BaseException)], erg
+    assert await _status(db, alt) == "cancelled"
+    assert await _aktive(db, uid) == [plan_b]
+    ab = await _abschluss(db, w["paymentId"])
+    assert ab["status"] == "abgeschlossen"
+    async with db.acquire() as conn:
+        assert await conn.fetchval(
+            "SELECT ueberlappt_abo_id FROM subscriptions WHERE id=$1", ab["neu_abo_id"]) is None
+
+
+async def test_abschlussaenderung_sperrt_das_konto(db):
+    """Auch eine Hand-Aenderung an einem Abschluss serialisiert das Konto: solange
+    sie offen ist, kommt keine Abo-Aenderung desselben Kontos durch."""
+    uid, plan_a, plan_b, alt = await _kunde_mit_aktivem_abo(db)
+    w = await _wechsel(uid, plan_b)
+    c1 = await asyncpg.connect(PG_URL)
+    c2 = await asyncpg.connect(PG_URL)
+    try:
+        tr = c1.transaction()
+        await tr.start()
+        await c1.execute("UPDATE abo_abschluesse SET geaendert_am = NOW() WHERE payment_id=$1", w["paymentId"])
+        await c2.execute("SET lock_timeout='300ms'")
+        with pytest.raises(asyncpg.LockNotAvailableError):
+            await c2.execute("UPDATE subscriptions SET status='cancelled' WHERE id=$1", uuid.UUID(alt))
+        await tr.rollback()
+    finally:
+        await c1.close()
+        await c2.close()
