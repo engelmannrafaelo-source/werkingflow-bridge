@@ -962,3 +962,232 @@ async def test_codex_r3_constraint_modus_oeffnet_keinen_weg(db, modus):
         assert isinstance(exc, (asyncpg.UniqueViolationError, asyncpg.CheckViolationError)), exc
         assert (await _abschluss(db, pid))["status"] == "doppelt_aktiv"
         assert await _aktive_mollie(conn, uid) == 2
+
+
+# ---------------------------------------------------------------------------
+# R5 — Codex-Pruefung R4: Schattentabellen, Spaltenbindung, Vorpruefung
+# ---------------------------------------------------------------------------
+
+VORPRUEFUNG = (pathlib.Path(__file__).resolve().parents[2]
+               / "scripts" / "migrations" / "070_vorpruefung_bestand.sql")
+
+
+def _vorpruefung_abfrage(variante: str) -> str:
+    """Die markierte Blockade-Abfrage der Vorpruefung, wortgleich aus der Datei."""
+    text = VORPRUEFUNG.read_text()
+    a = text.index(f"-- BLOCKIERT-{variante}-BEGINN")
+    b = text.index(f"-- BLOCKIERT-{variante}-ENDE")
+    return text[a:b]
+
+
+async def _dml_rolle_mit_temp(conn) -> str:
+    """NOSUPERUSER-Rolle mit DML auf allen Tabellen. Ruft der Test innerhalb
+    einer Transaktion auf, die er zurueckrollt (CREATE ROLE ist transaktional)."""
+    rolle = "abo_dml_" + uuid.uuid4().hex[:12]
+    await conn.execute(f"CREATE ROLE {rolle} NOSUPERUSER")
+    await conn.execute(f"GRANT USAGE ON SCHEMA public TO {rolle}")
+    await conn.execute(f"GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO {rolle}")
+    return rolle
+
+
+async def test_dml_rolle_hat_kein_temp_recht(db):
+    """070 entzieht PUBLIC das TEMP-Recht: eine gewoehnliche DML-Rolle kann
+    keine Schattentabelle mehr anlegen."""
+    async with db.acquire() as conn:
+        tr = conn.transaction()
+        await tr.start()
+        try:
+            rolle = await _dml_rolle_mit_temp(conn)
+            await conn.execute(f"SET LOCAL ROLE {rolle}")
+            assert not await conn.fetchval(
+                "SELECT has_database_privilege(current_user, current_database(), 'TEMP')")
+            with pytest.raises(asyncpg.InsufficientPrivilegeError):
+                async with conn.transaction():
+                    await conn.execute("CREATE TEMP TABLE subscriptions AS SELECT * FROM public.subscriptions")
+        finally:
+            await tr.rollback()
+
+
+@pytest.mark.parametrize("schatten", ["subscriptions", "abo_abschluesse", "beide"])
+async def test_codex_r4_schattentabelle_taeuscht_keine_pruefung(db, schatten):
+    """Codex R4, Befund 1, fuer beide Tabellen: selbst MIT ausdruecklich
+    gewaehrtem TEMP-Recht taeuscht eine temporaere Tabelle gleichen Namens
+    weder Sofort- noch Commit-Pruefung (fester search_path, qualifizierte Namen).
+    Angriff: A beendet, Vermerk korrekt aufgeloest; im Schatten A wieder aktiv
+    bzw. ein offener Wechsel vorgetaeuscht; dann B -> A in der echten Tabelle."""
+    uid, a, b, pid = await _paar_doppelt_aktiv(db)
+    async with db.acquire() as conn:
+        await conn.execute("UPDATE subscriptions SET status='cancelled' WHERE id=$1", a)
+        assert await conn.fetchval("SELECT ueberlappt_abo_id FROM subscriptions WHERE id=$1", b) is None
+        tr = conn.transaction()
+        await tr.start()
+        abgewiesen = None
+        try:
+            rolle = await _dml_rolle_mit_temp(conn)
+            await conn.execute(f"GRANT TEMPORARY ON DATABASE {await conn.fetchval('SELECT current_database()')} TO {rolle}")
+            await conn.execute(f"SET LOCAL ROLE {rolle}")
+            if schatten in ("subscriptions", "beide"):
+                await conn.execute("CREATE TEMP TABLE subscriptions AS SELECT * FROM public.subscriptions")
+                await conn.execute("UPDATE pg_temp.subscriptions SET status='active' WHERE id=$1", a)
+                await conn.execute("UPDATE pg_temp.subscriptions SET ueberlappt_abo_id=$2 WHERE id=$1", b, a)
+            if schatten in ("abo_abschluesse", "beide"):
+                await conn.execute("CREATE TEMP TABLE abo_abschluesse AS SELECT * FROM public.abo_abschluesse")
+                await conn.execute(
+                    "UPDATE pg_temp.abo_abschluesse SET status='doppelt_aktiv' WHERE neu_abo_id=$1", b)
+            try:
+                await conn.execute("UPDATE public.subscriptions SET ueberlappt_abo_id=$2 WHERE id=$1", b, a)
+                await conn.execute("SET CONSTRAINTS ALL IMMEDIATE")
+            except asyncpg.CheckViolationError as exc:
+                abgewiesen = exc
+        finally:
+            await tr.rollback()
+    assert abgewiesen is not None, f"Schattentabelle ({schatten}) umgeht die Pruefung"
+    async with db.acquire() as conn:
+        assert await conn.fetchval("SELECT ueberlappt_abo_id FROM public.subscriptions WHERE id=$1", b) is None
+        assert await _aktive_mollie(conn, uid) == 1
+
+
+@pytest.mark.parametrize("sql", [
+    "UPDATE subscriptions SET seats = seats + 1 WHERE id = $1",                       # Codex R4, Befund 2
+    "UPDATE subscriptions SET metadata = '{\"x\": 1}'::jsonb WHERE id = $1",
+    "UPDATE subscriptions SET trial_warning_3d_sent_at = NOW() WHERE id = $1",
+])
+async def test_jede_spaltenaenderung_nur_unter_read_committed(db, sql):
+    uid, plan_a, plan_b, alt = await _kunde_mit_aktivem_abo(db)
+    async with db.acquire() as conn:
+        for isolation in ("serializable", "repeatable_read", "read_uncommitted"):
+            tr = conn.transaction(isolation=isolation)
+            await tr.start()
+            try:
+                with pytest.raises(asyncpg.CheckViolationError, match="nur unter READ COMMITTED"):
+                    await conn.execute(sql, uuid.UUID(alt))
+            finally:
+                await tr.rollback()
+        async with conn.transaction(isolation="read_committed"):
+            await conn.execute(sql, uuid.UUID(alt))
+
+
+async def test_jede_abschlussaenderung_nur_unter_read_committed(db):
+    uid, plan_a, plan_b, alt = await _kunde_mit_aktivem_abo(db)
+    w = await _wechsel(uid, plan_b)
+    async with db.acquire() as conn:
+        tr = conn.transaction(isolation="serializable")
+        await tr.start()
+        try:
+            with pytest.raises(asyncpg.CheckViolationError, match="nur unter READ COMMITTED"):
+                await conn.execute(
+                    "UPDATE abo_abschluesse SET geaendert_am = NOW() WHERE payment_id=$1", w["paymentId"])
+        finally:
+            await tr.rollback()
+
+
+async def test_codex_r4_copy_ohne_mollie_unter_serializable(db):
+    uid, plan_a, plan_b, alt = await _kunde_mit_aktivem_abo(db)
+    async with db.acquire() as conn:
+        tr = conn.transaction(isolation="serializable")
+        await tr.start()
+        try:
+            with pytest.raises(asyncpg.CheckViolationError):
+                await conn.copy_records_to_table(
+                    "subscriptions", columns=["user_id", "app_id", "plan_id", "status", "seats"],
+                    records=[(uid, "werking-report", plan_a[0], "active", 1)])
+        finally:
+            await tr.rollback()
+
+
+async def test_alle_invariantenfunktionen_mit_festem_search_path(db):
+    async with db.acquire() as conn:
+        rows = await conn.fetch(
+            """SELECT p.proname, p.proconfig FROM pg_proc p
+                WHERE p.oid IN (SELECT t.tgfoid FROM pg_trigger t
+                                 WHERE t.tgrelid IN ('public.subscriptions'::regclass,
+                                                     'public.abo_abschluesse'::regclass)
+                                   AND NOT t.tgisinternal)
+                   OR p.proname IN ('abo_konto_pruefen', 'abo_konto_sperren',
+                                    'abo_nur_read_committed', 'abo_konto_schluessel')""")
+    assert len(rows) >= 11, [r["proname"] for r in rows]
+    for r in rows:
+        assert r["proconfig"] == ["search_path=pg_catalog, public, pg_temp"], (r["proname"], r["proconfig"])
+
+
+async def test_vorpruefung_und_070_urteilen_gleich_erlaubter_ersatz(db):
+    """Codex R4, Befund 3: Vorgaenger + markierter Ersatz mit offenem Wechsel
+    ist erlaubt — die Vorpruefung meldet ihn nicht, und 070 laeuft durch."""
+    uid, a, b, pid = await _paar_doppelt_aktiv(db)
+    async with db.acquire() as conn:
+        zeilen = await conn.fetch(_vorpruefung_abfrage("MIT-ERSATZSPALTE"))
+        assert uid not in {r["user_id"] for r in zeilen}
+        exc = await _immer_zurueckrollen(conn, MIGRATION_070.read_text())
+        assert exc is None, exc
+
+
+async def test_vorpruefung_und_070_urteilen_gleich_echte_dublette(db):
+    """Zwei unmarkierte aktive Mollie-Abos (Bestand vor 070 nachgestellt): beide
+    Abfragevarianten der Vorpruefung melden das Konto, 070 bricht ab."""
+    uid, plan_a, plan_b, alt = await _kunde_mit_aktivem_abo(db)
+    async with db.acquire() as conn:
+        tr = conn.transaction()
+        await tr.start()
+        try:
+            await conn.execute("DROP INDEX subscriptions_ein_mollie_abo_je_konto")
+            await conn.execute("DROP TRIGGER abo_zz_konto_invariante ON subscriptions")
+            await conn.execute(_REGULAER_SQL, uuid.UUID(alt), "dup" + uuid.uuid4().hex)
+            for variante in ("MIT-ERSATZSPALTE", "OHNE-ERSATZSPALTE"):
+                zeilen = await conn.fetch(_vorpruefung_abfrage(variante))
+                assert uid in {r["user_id"] for r in zeilen}, variante
+            with pytest.raises(asyncpg.RaiseError, match="Konto/Konten mit mehr als einem"):
+                async with conn.transaction():
+                    await conn.execute(MIGRATION_070.read_text())
+        finally:
+            await tr.rollback()
+
+
+async def test_vorpruefung_datei_laeuft_nur_lesend_per_psql(db):
+    import shutil
+    import subprocess
+
+    if shutil.which("psql") is None:
+        pytest.skip("psql nicht installiert — Vorpruefung nicht als Datei gefahren")
+    uid, a, b, pid = await _paar_doppelt_aktiv(db)
+    r = subprocess.run(["psql", PG_URL, "-v", "ON_ERROR_STOP=1", "-f", str(VORPRUEFUNG)],
+                       capture_output=True, text=True, timeout=60)
+    assert r.returncode == 0, r.stderr
+    assert "BLOCKIERT 070" in r.stdout and r.stdout.rstrip().endswith("ROLLBACK")
+    assert str(b) in r.stdout  # erlaubter Ersatz steht als Info in Teil 2
+
+
+async def test_codex_r4_schatten_abschluss_taeuscht_commit_pruefung_nicht(db):
+    """Gezielt gegen die Commit-Pruefung: A ist aktiv (kein Wechsel). Ein roher
+    Ersatz B' -> A passiert den Sofort-Trigger (A ist aktiv); nur ein offener
+    Wechsel fuer (B', A) wuerde ihn erlauben — der steht ausschliesslich in
+    einer temporaeren abo_abschluesse. Die Commit-Pruefung muss die echte
+    Tabelle lesen und abweisen."""
+    uid, plan_a, plan_b, alt = await _kunde_mit_aktivem_abo(db)
+    a = uuid.UUID(alt)
+    neu = uuid.uuid4()
+    async with db.acquire() as conn:
+        tr = conn.transaction()
+        await tr.start()
+        abgewiesen = None
+        try:
+            rolle = await _dml_rolle_mit_temp(conn)
+            await conn.execute(f"GRANT TEMPORARY ON DATABASE {await conn.fetchval('SELECT current_database()')} TO {rolle}")
+            await conn.execute(f"SET LOCAL ROLE {rolle}")
+            await conn.execute("CREATE TEMP TABLE abo_abschluesse AS SELECT * FROM public.abo_abschluesse WITH NO DATA")
+            await conn.execute(
+                """INSERT INTO pg_temp.abo_abschluesse (id, user_id, app_id, plan_id, seats, alt_abo_id,
+                       neu_abo_id, status, angelegt_am, geaendert_am, kuendigung_versuche)
+                   SELECT gen_random_uuid(), user_id, app_id, plan_id, 1, id, $2, 'neu_aktiv', NOW(), NOW(), 0
+                     FROM public.subscriptions WHERE id=$1""", a, neu)
+            try:
+                await conn.execute(
+                    """INSERT INTO public.subscriptions (id, user_id, app_id, plan_id, status, mollie_customer_id,
+                           mollie_subscription_id, seats, ueberlappt_abo_id)
+                       SELECT $2, user_id, app_id, plan_id, 'active', mollie_customer_id, $3, 1, id
+                         FROM public.subscriptions WHERE id=$1""", a, neu, "schatten" + uuid.uuid4().hex)
+                await conn.execute("SET CONSTRAINTS ALL IMMEDIATE")
+            except asyncpg.CheckViolationError as exc:
+                abgewiesen = exc
+        finally:
+            await tr.rollback()
+    assert abgewiesen is not None and "ohne offenen Wechsel" in str(abgewiesen), abgewiesen
