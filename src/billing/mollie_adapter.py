@@ -38,7 +38,11 @@ class MollieAdapter(Protocol):
         description: str,
         webhook_url: str,
         metadata: Dict[str, str],
+        idempotency_key: Optional[str] = None,
     ) -> Dict[str, str]: ...
+    async def find_subscription_for_first_payment(
+        self, customer_id: str, first_payment_id: str,
+    ) -> Optional[str]: ...
     async def create_one_time_payment(
         self,
         *,
@@ -64,6 +68,7 @@ class FakeMollieAdapter:
         self._customers: Dict[str, Dict[str, str]] = {}
         self._payments: Dict[str, Dict[str, Any]] = {}
         self._subscriptions: Dict[str, Dict[str, Any]] = {}
+        self._idempotenz: Dict[str, str] = {}
 
     async def create_customer(self, email: str, name: str) -> str:
         cust_id = f"fake_cust_{uuid.uuid4().hex[:12]}"
@@ -91,8 +96,14 @@ class FakeMollieAdapter:
         description: str,
         webhook_url: str,
         metadata: Dict[str, str],
+        idempotency_key: Optional[str] = None,
     ) -> Dict[str, str]:
+        # Wie Mollie: derselbe Idempotenzschluessel liefert dasselbe Abo.
+        if idempotency_key and idempotency_key in self._idempotenz:
+            return {"subscriptionId": self._idempotenz[idempotency_key]}
         sub_id = f"fake_sub_{uuid.uuid4().hex[:12]}"
+        if idempotency_key:
+            self._idempotenz[idempotency_key] = sub_id
         self._subscriptions[sub_id] = {
             "customer_id": customer_id,
             "amount_eur": amount_eur,
@@ -113,6 +124,16 @@ class FakeMollieAdapter:
         metadata: Dict[str, str],
     ) -> Dict[str, str]:
         return self._create_payment(customer_id, amount_eur, metadata)
+
+    async def find_subscription_for_first_payment(
+        self, customer_id: str, first_payment_id: str,
+    ) -> Optional[str]:
+        for sub_id, sub in self._subscriptions.items():
+            if (sub["customer_id"] == customer_id
+                    and sub["status"] in ("active", "pending")
+                    and sub["metadata"].get("firstPaymentId") == first_payment_id):
+                return sub_id
+        return None
 
     async def cancel_subscription(self, customer_id: str, subscription_id: str) -> None:
         if subscription_id in self._subscriptions:
@@ -233,9 +254,13 @@ class LiveMollieAdapter:
         description: str,
         webhook_url: str,
         metadata: Dict[str, str],
+        idempotency_key: Optional[str] = None,
     ) -> Dict[str, str]:
+        # Ohne eigenen Schluessel erzeugt mollie-api-python je Aufruf einen
+        # zufaelligen — eine Wiederholung legte dann ein zweites Abo an.
+        resource = self._client.customer_subscriptions.with_parent_id(customer_id)
         subscription = await asyncio.to_thread(
-            self._client.customer_subscriptions.with_parent_id(customer_id).create,
+            resource.create,
             {
                 "amount": self._amount(amount_eur),
                 "interval": interval,
@@ -243,8 +268,30 @@ class LiveMollieAdapter:
                 "webhookUrl": webhook_url,
                 "metadata": metadata,
             },
+            idempotency_key=idempotency_key or "",
         )
         return {"subscriptionId": subscription.id}
+
+    async def find_subscription_for_first_payment(
+        self, customer_id: str, first_payment_id: str,
+    ) -> Optional[str]:
+        """Laufendes Abo dieses Kunden, das zu dieser Erstzahlung angelegt wurde
+        (metadata.firstPaymentId). Deckt den Fall ab, dass Mollie das Abo anlegte,
+        die eigene Zeile aber nie geschrieben wurde (Absturz, Verbindungsabbruch)
+        und der Idempotenzschluessel bei Mollie schon verfallen ist."""
+        def _suchen() -> Optional[str]:
+            seite = self._client.customer_subscriptions.with_parent_id(customer_id).list(limit=250)
+            while True:
+                for sub in seite:
+                    meta = sub.get("metadata") or {}
+                    if (isinstance(meta, dict)
+                            and meta.get("firstPaymentId") == first_payment_id
+                            and sub.get("status") in ("active", "pending")):
+                        return str(sub.get("id"))
+                if not seite.has_next():
+                    return None
+                seite = seite.get_next()
+        return await asyncio.to_thread(_suchen)
 
     async def cancel_subscription(self, customer_id: str, subscription_id: str) -> None:
         await asyncio.to_thread(

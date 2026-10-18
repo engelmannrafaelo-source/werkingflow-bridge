@@ -535,6 +535,8 @@ async def billing_sub_checkout(
             user_id, body.planId, body.seats, body.successRedirect,
             email, name, consent=body.consent,
         )
+    except (billing_service.AboAbschlussOffen, billing_service.AboSchonAktiv) as e:
+        raise HTTPException(status_code=409, detail=str(e))
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
@@ -771,6 +773,8 @@ async def billing_sub_change(
             user_id, body.newPlanId, body.seats, body.successRedirect,
             email, name, consent=body.consent,
         )
+    except billing_service.AboAbschlussOffen as e:
+        raise HTTPException(status_code=409, detail=str(e))
     except LookupError as e:
         raise HTTPException(status_code=404, detail=str(e))
     except ValueError as e:
@@ -793,6 +797,39 @@ async def billing_cancel_sub(
 # ---------------------------------------------------------------------------
 # Events — Mollie audit trail
 # ---------------------------------------------------------------------------
+
+
+@router.get("/abo-abschluesse")
+async def list_abo_abschluesse(
+    status: str = Query("doppelt_aktiv"),
+    limit: int = Query(200, ge=1, le=1000),
+    _claims: AuthClaims = Depends(require_admin),
+) -> Dict[str, Any]:
+    """Abo-Abschluesse/Planwechsel je Status (Migration 070). Standard:
+    'doppelt_aktiv' — Wechsel, bei denen altes UND neues Abo abrechnen."""
+    pool = get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """SELECT id, user_id, app_id, plan_id, seats, alt_abo_id, neu_abo_id, payment_id,
+                      status, ergebnis, kuendigung_versuche, letzter_fehler,
+                      doppelt_aktiv_seit, angelegt_am, geaendert_am
+                 FROM abo_abschluesse WHERE status = $1
+                ORDER BY geaendert_am DESC LIMIT $2""",
+            status, limit,
+        )
+    def _wert(v: Any) -> Any:
+        if isinstance(v, uuid.UUID):
+            return str(v)
+        return v.isoformat() if hasattr(v, "isoformat") else v
+    return {"abschluesse": [{k: _wert(v) for k, v in dict(r).items()} for r in rows]}
+
+
+@router.post("/abo-abschluesse/nachholen")
+async def abo_abschluesse_nachholen(
+    _claims: AuthClaims = Depends(require_admin),
+) -> Dict[str, Any]:
+    """Nachholauftrag sofort ausfuehren (laeuft sonst periodisch)."""
+    return await billing_service.wechsel_kuendigungen_nachholen()
 
 
 @router.get("/events")

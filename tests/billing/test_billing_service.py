@@ -400,8 +400,13 @@ class TestActivateSubscription:
         twin of grant_subscription's fix — see _ensure_monthly_budget_pot)."""
         new_row = _sub_row(status="active", plan_id="report-standard",
                            mollie_subscription_id="sub_new_123")
-        # probe returns None (no existing row), insert returns the new row
-        pool, conn = _mock_pool(None, new_row)
+        user_id = uuid.uuid4()
+        abschluss = {"id": uuid.uuid4(), "user_id": user_id, "status": "offen",
+                     "alt_abo_id": None, "neu_abo_id": None}
+        # Ablauf (Migration 070): Bestand? nein -> Abschluss? nein -> angelegt ->
+        # gelesen -> Abo-Zeile eingefuegt.
+        pool, conn = _mock_pool(None, None, abschluss, new_row)
+        conn.fetch = AsyncMock(return_value=[])   # kein anderes aktives Mollie-Abo
 
         fake_mollie = FakeMollieAdapter()
         from src.config import BridgeConfig
@@ -413,13 +418,20 @@ class TestActivateSubscription:
                           new_callable=PropertyMock,
                           return_value="https://bridge.test/v1/billing/mollie-webhook"):
             result = await _activate_subscription(
-                str(uuid.uuid4()), "report-standard", 1,
+                str(user_id), "report-standard", 1,
                 "cust_abc", first_payment_id="pay_new_001",
             )
 
         assert result["status"] == "active"
-        # Mollie subscription was created
+        # Mollie subscription was created — mit Idempotenzschluessel/Erstzahlung
         assert len(fake_mollie._subscriptions) == 1
+        (angelegt,) = fake_mollie._subscriptions.values()
+        assert angelegt["metadata"]["firstPaymentId"] == "pay_new_001"
+        assert fake_mollie._idempotenz == {
+            "abo-erstzahlung-pay_new_001": next(iter(fake_mollie._subscriptions)),
+        }
+        abschluss_sql = [c[0][0] for c in conn.execute.call_args_list if "abo_abschluesse" in c[0][0]]
+        assert any("UPDATE abo_abschluesse" in q for q in abschluss_sql)
         # Billing event + invoice were created
         mock_log.assert_called_once()
         assert mock_log.call_args[0][0] == "subscription.activated"
@@ -615,7 +627,9 @@ class TestAutoCreateInvoice:
 class TestChangeSubscription:
     async def test_raises_lookup_error_when_no_active_subscription(self):
         pool, conn = _mock_pool(None)
-        with patch("src.billing.billing_service.get_pool", return_value=pool):
+        with patch("src.billing.billing_service.get_pool", return_value=pool), \
+             patch("src.billing.billing_service._plan_price", return_value=29.0), \
+             patch("src.budget.plans.get_plan", return_value=MagicMock(app_id="werking-report")):
             with pytest.raises(LookupError, match="No active subscription"):
                 await change_subscription(
                     str(uuid.uuid4()), "report-standard", 1,
@@ -626,7 +640,9 @@ class TestChangeSubscription:
     async def test_raises_value_error_on_no_op_change(self):
         sub = _sub_row(plan_id="report-standard", seats=1)
         pool, conn = _mock_pool(sub)
-        with patch("src.billing.billing_service.get_pool", return_value=pool):
+        with patch("src.billing.billing_service.get_pool", return_value=pool), \
+             patch("src.billing.billing_service._plan_price", return_value=29.0), \
+             patch("src.budget.plans.get_plan", return_value=MagicMock(app_id="werking-report")):
             with pytest.raises(ValueError, match="identical to current"):
                 await change_subscription(
                     str(sub["user_id"]), "report-standard", 1,
@@ -648,6 +664,7 @@ class TestChangeSubscription:
 
         with patch("src.billing.billing_service.get_pool", return_value=pool), \
              patch("src.billing.billing_service._plan_price", return_value=29.0), \
+             patch("src.budget.plans.get_plan", return_value=MagicMock(app_id="werking-report")), \
              patch("src.billing.billing_service.cancel_subscription",
                    new_callable=AsyncMock) as mock_cancel, \
              patch("src.billing.billing_service.start_subscription_checkout",
@@ -679,6 +696,7 @@ class TestChangeSubscription:
         conn.fetchrow = AsyncMock(side_effect=[sub])
         with patch("src.billing.billing_service.get_pool", return_value=pool), \
              patch("src.billing.billing_service._plan_price", return_value=29.0), \
+             patch("src.budget.plans.get_plan", return_value=MagicMock(app_id="werking-report")), \
              patch("src.billing.billing_service.cancel_subscription",
                    new_callable=AsyncMock) as mock_cancel, \
              patch("src.billing.billing_service.start_subscription_checkout",
@@ -815,3 +833,30 @@ class TestSubscriptionChangeRoute:
         resp, ch = self._post(self._body(userId=str(uuid.uuid4())), {})
         assert resp.status_code == 401
         ch.assert_not_called()
+
+    def test_offener_wechsel_409_fester_satz(self):
+        """Zweiter offener Abschluss/Wechsel je Konto (Migration 070) -> 409."""
+        from src.billing import billing_service
+        me = uuid.uuid4()
+        with patch("src.billing.billing_service.change_subscription",
+                   AsyncMock(side_effect=billing_service.AboAbschlussOffen())), \
+             patch("src.billing.routes._self_checkout_state", AsyncMock(return_value=(True, None))):
+            resp = self._client().post("/v1/billing/subscription/change",
+                                       json=self._body(), headers=self._jwt(me))
+        assert resp.status_code == 409, resp.text
+        assert resp.json()["detail"] == billing_service.ABSCHLUSS_OFFEN_SATZ
+
+    def test_checkout_409_offen_und_schon_aktiv(self):
+        from src.billing import billing_service
+        me = uuid.uuid4()
+        body = {k: v for k, v in self._body().items() if k != "newPlanId"}
+        body["planId"] = "report-standard"
+        for fehler, satz in ((billing_service.AboAbschlussOffen(), billing_service.ABSCHLUSS_OFFEN_SATZ),
+                             (billing_service.AboSchonAktiv(), billing_service.ABO_SCHON_AKTIV_SATZ)):
+            with patch("src.billing.billing_service.start_subscription_checkout",
+                       AsyncMock(side_effect=fehler)), \
+                 patch("src.billing.routes._self_checkout_state", AsyncMock(return_value=(True, None))):
+                resp = self._client().post("/v1/billing/subscription/checkout",
+                                           json=body, headers=self._jwt(me))
+            assert resp.status_code == 409, resp.text
+            assert resp.json()["detail"] == satz

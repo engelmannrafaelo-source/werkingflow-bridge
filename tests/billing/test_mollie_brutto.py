@@ -159,7 +159,10 @@ async def test_abo_zieht_bisher_netto_ein():
         billing_service, "get_or_create_customer", AsyncMock(return_value={"mollieCustomerId": "c"}),
     ), patch.object(billing_service, "get_mollie_adapter", return_value=mollie), patch.object(
         billing_service, "_plan_price", return_value=250.0,
-    ), patch.object(billing_service, "config", MagicMock(mollie_webhook_url="https://t/wh")):
+    ), patch.object(billing_service, "config", MagicMock(mollie_webhook_url="https://t/wh")), patch(
+        "src.budget.plans.get_plan", return_value=MagicMock(app_id="werking-report"),
+    ), patch.object(billing_service, "_abschluss_reservieren", AsyncMock(return_value=uuid.uuid4())), \
+            patch.object(billing_service, "_abschluss_checkout_eintragen", AsyncMock()):
         await billing_service.start_subscription_checkout(
             str(uuid.uuid4()), "report-standard", 2, "https://x/ok", "u@x", "U", consent=MagicMock(),
         )

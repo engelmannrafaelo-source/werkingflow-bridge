@@ -148,6 +148,13 @@ async def lifespan(app: FastAPI):
         logger.error(f"Failed to start trial-warning loop: {_e}")
 
     try:
+        from src.billing.abo_wechsel_nachholen import start_abo_wechsel_nachhol_loop
+        start_abo_wechsel_nachhol_loop()
+        logger.info("🔁 Planwechsel-Nachholauftrag eingeplant (abo_abschluesse neu_aktiv/doppelt_aktiv)")
+    except Exception as _e:
+        logger.error(f"Failed to start Planwechsel-Nachholauftrag: {_e}")
+
+    try:
         from src.billing.budget_warnings import start_budget_warning_loop
         start_budget_warning_loop()
         logger.info("📊 Budget-Vorwarnung eingeplant (taeglich 07:00 UTC)")

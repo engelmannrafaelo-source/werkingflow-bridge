@@ -13,6 +13,8 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
+import asyncpg
+
 from src.config import config
 from src.db.client import get_pool
 from src.billing.mollie_adapter import get_mollie_adapter
@@ -363,14 +365,202 @@ def _plan_price(plan_id: str) -> float:
 from src.billing import purchase_consent
 
 
+# ---------------------------------------------------------------------------
+# Abo-Invariante je Abrechnungskonto (Migration 070)
+# ---------------------------------------------------------------------------
+#
+# Konto = (user_id, app_id). Die Datenbank erzwingt: hoechstens EIN aktives
+# Mollie-Abo je Konto, waehrend eines laufenden Wechsels zusaetzlich genau ein
+# als Ersatz markiertes (subscriptions.ueberlappt_abo_id), und hoechstens EIN
+# offener Abschluss (abo_abschluesse). Der Code bindet sich daran:
+#   - jeder Abo-Checkout reserviert zuerst den einen Platz (zweiter -> 409),
+#   - die Aktivierung laeuft unter der Zeilensperre des Abschlusses; das
+#     Mollie-Abo entsteht hoechstens einmal (Sperre + Idempotenzschluessel +
+#     Suche nach metadata.firstPaymentId),
+#   - das alte Abo wird nur gekuendigt, wenn das neue aktiv ist und das alte
+#     das im Wechsel gemerkte ist; scheitert die Kuendigung, steht der Wechsel
+#     sichtbar auf 'doppelt_aktiv' (Alarm), der Nachholauftrag wiederholt.
+
+ABSCHLUSS_OFFEN_SATZ = (
+    "Für dieses Konto läuft bereits ein Abo-Abschluss oder Planwechsel. "
+    "Ein weiterer ist erst möglich, wenn dieser bezahlt, abgebrochen oder verfallen ist."
+)
+ABO_SCHON_AKTIV_SATZ = (
+    "Für dieses Konto ist bereits ein Abo aktiv. Bitte den Planwechsel verwenden."
+)
+# Eine Reservierung ohne Mollie-Checkout gilt danach als liegengeblieben
+# (Absturz zwischen Reservierung und Checkout). Ohne Checkout-URL kann der
+# Kunde nichts bezahlen; die Freigabe verliert also kein Geld.
+RESERVIERUNG_VERFALL = timedelta(minutes=15)
+_OFFENE_ABSCHLUESSE = ["reserviert", "offen", "neu_aktiv", "doppelt_aktiv"]
+_ZAHLUNG_GESCHEITERT = ("failed", "expired", "canceled")
+
+
+class AboAbschlussOffen(Exception):
+    """Es laeuft schon ein Abschluss/Wechsel fuer dieses Konto (HTTP 409)."""
+
+    def __init__(self) -> None:
+        super().__init__(ABSCHLUSS_OFFEN_SATZ)
+
+
+class AboSchonAktiv(Exception):
+    """Erstkauf, obwohl schon ein Mollie-Abo aktiv ist (HTTP 409)."""
+
+    def __init__(self) -> None:
+        super().__init__(ABO_SCHON_AKTIV_SATZ)
+
+
+class AboAbschlussKonflikt(RuntimeError):
+    """Bezahlte Erstzahlung, die die Invariante verletzen wuerde. ALARM —
+    der Kunde hat gezahlt, ein Mensch muss entscheiden (Webhook antwortet 500)."""
+
+
+class AboDoppeltAktiv(RuntimeError):
+    """Kuendigung des ersetzten Abos gescheitert: altes und neues laufen.
+    Zustand steht in abo_abschluesse ('doppelt_aktiv'), Alarm ist ausgeloest;
+    Webhook antwortet 500, damit auch Mollie wiederholt."""
+
+
+def _konto_sperrschluessel(user_uuid: uuid.UUID, app_id: str) -> str:
+    return f"abo-konto:{user_uuid}:{app_id}"
+
+
+async def _abschluss_reservieren(
+    user_uuid: uuid.UUID, app_id: str, plan_id: str, seats: int,
+    alt_abo_id: Optional[uuid.UUID],
+) -> uuid.UUID:
+    """Belegt den einen Abschluss-Platz des Kontos, BEVOR Mollie etwas anlegt.
+
+    Ein offener Platz wird nur freigegeben, wenn er nachweislich tot ist:
+    Reservierung ohne Checkout aelter als RESERVIERUNG_VERFALL, oder Erstzahlung
+    laut Mollie gescheitert. Sonst AboAbschlussOffen (409, fester Satz).
+    """
+    pool = get_pool()
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            await conn.execute(
+                "SELECT pg_advisory_xact_lock(hashtext($1))",
+                _konto_sperrschluessel(user_uuid, app_id),
+            )
+            offen = await conn.fetchrow(
+                """SELECT id, status, payment_id, angelegt_am FROM abo_abschluesse
+                    WHERE user_id = $1 AND app_id = $2::app_id AND status = ANY($3::text[])
+                    FOR UPDATE""",
+                user_uuid, app_id, _OFFENE_ABSCHLUESSE,
+            )
+            if offen:
+                neuer_status = None
+                if (offen["status"] == "reserviert"
+                        and offen["angelegt_am"] < datetime.now(timezone.utc) - RESERVIERUNG_VERFALL):
+                    neuer_status = "verworfen"
+                elif offen["status"] == "offen":
+                    zahlung = await get_mollie_adapter().get_payment(offen["payment_id"])
+                    if zahlung.get("status") in _ZAHLUNG_GESCHEITERT:
+                        neuer_status = "abgebrochen"
+                if neuer_status is None:
+                    raise AboAbschlussOffen()
+                await conn.execute(
+                    """UPDATE abo_abschluesse SET status = $2, geaendert_am = NOW(),
+                              letzter_fehler = 'beim naechsten Abschluss als tot erkannt'
+                        WHERE id = $1""",
+                    offen["id"], neuer_status,
+                )
+                logger.warning(
+                    "[abo-abschluss] %s (%s) freigegeben als %s fuer neuen Abschluss",
+                    offen["id"], offen["status"], neuer_status,
+                )
+
+            aktive = {r["id"] for r in await conn.fetch(
+                """SELECT id FROM subscriptions
+                    WHERE user_id = $1 AND app_id = $2::app_id AND status = 'active'
+                      AND mollie_subscription_id IS NOT NULL""",
+                user_uuid, app_id,
+            )}
+            if alt_abo_id is None:
+                if aktive:
+                    raise AboSchonAktiv()
+            else:
+                alt = await conn.fetchrow(
+                    "SELECT user_id, app_id, status FROM subscriptions WHERE id = $1",
+                    alt_abo_id,
+                )
+                if (not alt or alt["user_id"] != user_uuid or alt["app_id"] != app_id
+                        or alt["status"] != "active"):
+                    raise LookupError(f"Abo {alt_abo_id} ist kein aktives Abo dieses Kontos")
+                if aktive - {alt_abo_id}:
+                    # Kann bei geltender Invariante nicht vorkommen (ein Ersatz
+                    # existiert nur bei offenem Abschluss, der oben ausgeschlossen ist).
+                    raise AboAbschlussKonflikt(
+                        f"Konto {user_uuid}/{app_id}: weiteres aktives Mollie-Abo neben {alt_abo_id}"
+                    )
+            return await conn.fetchval(
+                """INSERT INTO abo_abschluesse (user_id, app_id, plan_id, seats, alt_abo_id, status)
+                   VALUES ($1, $2::app_id, $3::plan_id, $4, $5, 'reserviert') RETURNING id""",
+                user_uuid, app_id, plan_id, seats, alt_abo_id,
+            )
+
+
+async def _abschluss_checkout_eintragen(
+    abschluss_id: uuid.UUID, payment_id: str, user_uuid: uuid.UUID, plan_id: str,
+    amount: float, alt_uuid: Optional[uuid.UUID],
+) -> None:
+    """Erstzahlung und Abschluss in EINER Transaktion festschreiben. Ist die
+    Reservierung inzwischen verfallen, wird die Checkout-URL nicht ausgegeben."""
+    pool = get_pool()
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            await conn.execute(
+                """
+                INSERT INTO pending_payments
+                  (payment_id, user_id, type, plan_id, amount_eur, ersetzt_abo_id, created_at)
+                VALUES ($1, $2, 'subscription_first', $3, $4, $5, NOW())
+                ON CONFLICT (payment_id) DO NOTHING
+                """,
+                payment_id, user_uuid, plan_id, amount, alt_uuid,
+            )
+            done = await conn.execute(
+                """UPDATE abo_abschluesse SET payment_id = $2, status = 'offen',
+                          geaendert_am = NOW()
+                    WHERE id = $1 AND status = 'reserviert'""",
+                abschluss_id, payment_id,
+            )
+            if done != "UPDATE 1":
+                raise RuntimeError(
+                    f"Abschluss {abschluss_id} war nicht mehr reserviert ({done}) — "
+                    "Checkout wird nicht ausgegeben"
+                )
+
+
+async def _abschluss_abbrechen(abschluss_id: uuid.UUID, grund: str) -> None:
+    """Checkout nicht zustande gekommen: Platz freigeben. Scheitert schon das,
+    bleibt die Reservierung liegen und verfaellt nach RESERVIERUNG_VERFALL."""
+    try:
+        pool = get_pool()
+        async with pool.acquire() as conn:
+            await conn.execute(
+                """UPDATE abo_abschluesse SET status = 'abgebrochen', letzter_fehler = $2,
+                          geaendert_am = NOW()
+                    WHERE id = $1 AND status = 'reserviert'""",
+                abschluss_id, grund[:2000],
+            )
+    except Exception as exc:  # noqa: BLE001 — Ursprungsfehler wird vom Aufrufer weitergeworfen
+        logger.error(
+            "[abo-abschluss] Reservierung %s nicht freigegeben (verfaellt nach %s): %s",
+            abschluss_id, RESERVIERUNG_VERFALL, exc,
+        )
+
+
 async def start_subscription_checkout(
     user_id: str, plan_id: str, seats: int, success_redirect: str,
     email: str, name: str, *, consent: "purchase_consent.PurchaseConsentIn",
     ersetzt_abo_id: Optional[str] = None,
 ) -> Dict[str, str]:
-    """Abo-Erstzahlung. `ersetzt_abo_id` setzt nur change_subscription: das
-    genannte Abo wird im Webhook gekuendigt, NACHDEM dieses aktiviert ist
-    (Migration 069) — nie vorher."""
+    """Abo-Erstzahlung (Erstkauf oder, mit `ersetzt_abo_id`, Planwechsel).
+
+    Belegt zuerst den einen Abschluss-Platz des Kontos (Migration 070): ein
+    zweiter offener Abschluss -> AboAbschlussOffen, ein Erstkauf neben einem
+    aktiven Mollie-Abo -> AboSchonAktiv. Das ersetzte Abo wird im Webhook
+    gekuendigt, NACHDEM dieses aktiviert ist — nie vorher."""
     # Fail-fast: refuse the Mollie round-trip if the tenant's billing address
     # is incomplete. Without this gate, a user could complete payment on
     # Mollie and then provision_subscription (the webhook handler) would
@@ -379,49 +569,50 @@ async def start_subscription_checkout(
     # to 422 with a missing_fields detail, matching the existing webhook
     # error shape. Trial plan does not need this gate, but the FE never
     # checkouts trial; defence-in-depth.
+    from src.budget.plans import get_plan
+
+    user_uuid = uuid.UUID(user_id)
     pool = get_pool()
     async with pool.acquire() as conn:
-        await _assert_complete_billing_address(conn, uuid.UUID(user_id), plan_id)
-
-    # Zustimmung festhalten, BEVOR die Zahlung entsteht (Migration 054).
-    # Diese Bahn erzeugt keine pending_order — order_id bleibt None, die Bahn
-    # steht am Beleg.
-    async with pool.acquire() as conn:
-        await purchase_consent.record_consent(
-            conn, consent=consent, user_id=user_id,
-            lane=purchase_consent.LANE_SUBSCRIPTION, plan_id=plan_id,
-        )
-
-    customer = await get_or_create_customer(user_id, email, name)
+        await _assert_complete_billing_address(conn, user_uuid, plan_id)
     amount = _plan_price(plan_id) * seats
+    app_id = get_plan(plan_id).app_id
+    alt_uuid = uuid.UUID(ersetzt_abo_id) if ersetzt_abo_id else None
 
-    mollie = get_mollie_adapter()
-    checkout = await mollie.create_first_payment(
-        customer_id=customer["mollieCustomerId"],
-        amount_eur=amount,
-        description=f"{plan_id} ({seats} Sitz{'e' if seats > 1 else ''})",
-        redirect_url=success_redirect,
-        webhook_url=config.mollie_webhook_url,
-        metadata={
-            "type": "subscription_first",
-            "userId": user_id,
-            "planId": plan_id,
-            "seats": str(seats),
-        },
-    )
+    abschluss_id = await _abschluss_reservieren(user_uuid, app_id, plan_id, seats, alt_uuid)
+    try:
+        # Zustimmung festhalten, BEVOR die Zahlung entsteht (Migration 054).
+        # Diese Bahn erzeugt keine pending_order — order_id bleibt None, die Bahn
+        # steht am Beleg.
+        async with pool.acquire() as conn:
+            await purchase_consent.record_consent(
+                conn, consent=consent, user_id=user_id,
+                lane=purchase_consent.LANE_SUBSCRIPTION, plan_id=plan_id,
+            )
 
-    pool = get_pool()
-    async with pool.acquire() as conn:
-        await conn.execute(
-            """
-            INSERT INTO pending_payments
-              (payment_id, user_id, type, plan_id, amount_eur, ersetzt_abo_id, created_at)
-            VALUES ($1, $2, 'subscription_first', $3, $4, $5, NOW())
-            ON CONFLICT (payment_id) DO NOTHING
-            """,
-            checkout["paymentId"], uuid.UUID(user_id), plan_id, amount,
-            uuid.UUID(ersetzt_abo_id) if ersetzt_abo_id else None,
+        customer = await get_or_create_customer(user_id, email, name)
+        mollie = get_mollie_adapter()
+        checkout = await mollie.create_first_payment(
+            customer_id=customer["mollieCustomerId"],
+            amount_eur=amount,
+            description=f"{plan_id} ({seats} Sitz{'e' if seats > 1 else ''})",
+            redirect_url=success_redirect,
+            webhook_url=config.mollie_webhook_url,
+            metadata={
+                "type": "subscription_first",
+                "userId": user_id,
+                "planId": plan_id,
+                "seats": str(seats),
+                "abschlussId": str(abschluss_id),
+            },
         )
+
+        await _abschluss_checkout_eintragen(
+            abschluss_id, checkout["paymentId"], user_uuid, plan_id, amount, alt_uuid,
+        )
+    except BaseException as exc:
+        await _abschluss_abbrechen(abschluss_id, f"{type(exc).__name__}: {exc}")
+        raise
     return checkout
 
 
@@ -709,115 +900,380 @@ async def start_first_purchase_pack_checkout(
     return checkout
 
 
+async def _abschluss_fuer_zahlung(
+    conn: Any, first_payment_id: str, user_uuid: uuid.UUID, app_id: str,
+    plan_id: str, seats: int, ersetzt_abo_id: Optional[uuid.UUID],
+) -> Optional[Any]:
+    """Abschluss-Zeile dieser Erstzahlung, gesperrt (FOR UPDATE).
+
+    Zahlungen von vor Migration 070 haben keine Zeile: sie wird hier
+    nachgetragen. Belegt schon ein anderer offener Abschluss den Platz, wird
+    sie als 'konflikt' angelegt (Alarm beim Aufrufer)."""
+    sql = "SELECT * FROM abo_abschluesse WHERE payment_id = $1 FOR UPDATE"
+    ab = await conn.fetchrow(sql, first_payment_id)
+    if ab:
+        return ab
+    try:
+        async with conn.transaction():
+            await conn.execute(
+                """INSERT INTO abo_abschluesse
+                     (user_id, app_id, plan_id, seats, alt_abo_id, payment_id, status)
+                   VALUES ($1, $2::app_id, $3::plan_id, $4, $5, $6, 'offen')
+                   ON CONFLICT (payment_id) DO NOTHING""",
+                user_uuid, app_id, plan_id, seats, ersetzt_abo_id, first_payment_id,
+            )
+    except asyncpg.UniqueViolationError:
+        await conn.execute(
+            """INSERT INTO abo_abschluesse
+                 (user_id, app_id, plan_id, seats, alt_abo_id, payment_id, status, letzter_fehler)
+               VALUES ($1, $2::app_id, $3::plan_id, $4, $5, $6, 'konflikt',
+                       'Erstzahlung ohne Abschluss, Platz von anderem Abschluss belegt')
+               ON CONFLICT (payment_id) DO NOTHING""",
+            user_uuid, app_id, plan_id, seats, ersetzt_abo_id, first_payment_id,
+        )
+    return await conn.fetchrow(sql, first_payment_id)
+
+
+_ABO_SPALTEN = """id, user_id, app_id, plan_id, status, mollie_customer_id,
+                  mollie_subscription_id, seats, started_at, cancelled_at"""
+
+
 async def _activate_subscription(
     user_id: str, plan_id: str, seats: int, customer_id: str,
-    first_payment_id: str,
+    first_payment_id: str, ersetzt_abo_id: Optional[uuid.UUID] = None,
 ) -> Dict[str, Any]:
     """
-    Idempotent subscription activation.
+    Aktiviert das Abo einer bezahlten Erstzahlung — genau einmal, auch bei
+    gleichzeitigen Webhooks und nach Abstuerzen (Codex-Befund 4, 18.10.2026).
 
-    Mollie retries the webhook POST until it gets a 200. Without an
-    idempotency guard, every retry would create another 'active' row.
-    `subscriptions.mollie_first_payment_id` is UNIQUE: a retry finds the
-    existing row and returns it untouched. Mollie's create_subscription
-    call is only made on the first webhook firing — after the row exists,
-    we return the persisted state.
+    Unter der Zeilensperre des Abschlusses (abo_abschluesse, FOR UPDATE):
+      - schon aktiviert -> vorhandene Zeile zurueck, Mollie wird nicht gerufen;
+      - sonst Mollie-Abo suchen (metadata.firstPaymentId) oder mit
+        Idempotenzschluessel anlegen, Zeile schreiben, Abschluss fortschreiben.
+    Ein zweiter Webhook wartet auf die Sperre und sieht danach die Zeile.
+
+    Wuerde die Aktivierung die Invariante verletzen (anderes aktives
+    Mollie-Abo im Konto, Abschluss schon abgebrochen), wird nichts angelegt:
+    Abschluss -> 'konflikt', Alarm, AboAbschlussKonflikt.
 
     Provisions the plan's monthly budget pot alongside the row (see
     _ensure_monthly_budget_pot) — this is the real paid-checkout path, so a
     subscription activated here without a pot is the exact "Kein KI-Guthaben
     despite active paid plan" bug the helper exists to prevent.
     """
-    pool = get_pool()
-
-    # Map plan -> app (mirrors plans.py PLANS[*].app_id but kept local for
-    # speed; should diverge only when a plan_id intentionally serves multiple
-    # apps, which the schema does not currently allow).
     from src.budget.plans import get_plan
+
+    pool = get_pool()
     app_id = get_plan(plan_id).app_id
-
-    # Idempotency probe FIRST. If we already activated this payment, return
-    # the existing row without calling Mollie a second time.
-    async with pool.acquire() as conn:
-        existing = await conn.fetchrow(
-            """
-            SELECT id, user_id, app_id, plan_id, status, mollie_customer_id,
-                   mollie_subscription_id, seats, started_at, cancelled_at
-            FROM subscriptions WHERE mollie_first_payment_id = $1
-            """,
-            first_payment_id,
-        )
-        if existing:
-            # Self-heal: a payment activated before the pot became mandatory
-            # on this path never got one.
-            await _ensure_monthly_budget_pot(conn, uuid.UUID(user_id), plan_id)
-            return _serialize_subscription(existing)
-
-    # First-time activation. Call Mollie to create the recurring subscription.
+    user_uuid = uuid.UUID(user_id)
     amount = _plan_price(plan_id) * seats
-    mollie = get_mollie_adapter()
-    sub_resp = await mollie.create_subscription(
-        customer_id=customer_id,
-        amount_eur=amount,
-        interval="1 month",
-        description=f"{plan_id} ({seats} Sitz{'e' if seats > 1 else ''})",
-        webhook_url=config.mollie_webhook_url,
-        metadata={"userId": user_id, "planId": plan_id},
-    )
+    angelegt = None
+    konflikt: Optional[str] = None
+    konflikt_neu = False
 
-    sub_uuid = uuid.uuid4()
     async with pool.acquire() as conn:
-        row = await conn.fetchrow(
-            """
-            INSERT INTO subscriptions
-              (id, user_id, app_id, plan_id, status,
-               mollie_customer_id, mollie_subscription_id, mollie_first_payment_id,
-               seats, started_at)
-            VALUES ($1, $2, $3, $4, 'active', $5, $6, $7, $8, NOW())
-            ON CONFLICT (mollie_first_payment_id) DO NOTHING
-            RETURNING id, user_id, app_id, plan_id, status, mollie_customer_id,
-                      mollie_subscription_id, seats, started_at, cancelled_at
-            """,
-            sub_uuid, uuid.UUID(user_id), app_id, plan_id,
-            customer_id, sub_resp["subscriptionId"], first_payment_id, seats,
-        )
-        if row:
-            await _ensure_monthly_budget_pot(conn, uuid.UUID(user_id), plan_id)
-            await log_billing_event(
-                "subscription.activated",
-                user_id=user_id,
-                subscription_id=str(row["id"]),
-                mollie_payment_id=first_payment_id,
-                amount_eur=float(amount),
-                source="mollie-webhook",
-                payload={"planId": plan_id, "seats": seats},
-            )
-            await auto_create_invoice(
-                user_id=user_id,
-                amount_eur=float(amount),
-                description=f"{plan_id} — Erste Monatsabrechnung ({seats} Sitz" + ("e" if seats > 1 else "") + ")",
-                subscription_id=str(row["id"]),
-                mollie_payment_id=first_payment_id,
-                number_prefix=prefix_for_app(app_id),
-            )
-            return _serialize_subscription(row)
-
-        # Conflict: another webhook delivery raced us between the probe
-        # and the insert. Return the row the winner wrote.
-        winner = await conn.fetchrow(
-            """
-            SELECT id, user_id, app_id, plan_id, status, mollie_customer_id,
-                   mollie_subscription_id, seats, started_at, cancelled_at
-            FROM subscriptions WHERE mollie_first_payment_id = $1
-            """,
+        # Aktivierung von vor Migration 070 (alter Code, kein Abschluss):
+        # unveraendert zurueckgeben.
+        bestand = await conn.fetchrow(
+            f"SELECT {_ABO_SPALTEN} FROM subscriptions WHERE mollie_first_payment_id = $1",
             first_payment_id,
         )
-        if not winner:
-            raise RuntimeError(
-                f"_activate_subscription: ON CONFLICT fired but no row found "
-                f"for first_payment_id={first_payment_id}"
+        hat_abschluss = await conn.fetchval(
+            "SELECT 1 FROM abo_abschluesse WHERE payment_id = $1", first_payment_id,
+        )
+        if bestand and not hat_abschluss:
+            await _ensure_monthly_budget_pot(conn, user_uuid, plan_id)
+            return _serialize_subscription(bestand)
+
+        async with conn.transaction():
+            ab = await _abschluss_fuer_zahlung(
+                conn, first_payment_id, user_uuid, app_id, plan_id, seats, ersetzt_abo_id,
             )
-        return _serialize_subscription(winner)
+            if ab["user_id"] != user_uuid:
+                raise AboAbschlussKonflikt(
+                    f"Erstzahlung {first_payment_id}: Abschluss gehoert {ab['user_id']}, nicht {user_id}"
+                )
+            if ab["status"] in ("neu_aktiv", "doppelt_aktiv", "abgeschlossen"):
+                # Wiederholung: aktiviert ist schon. Mollie NICHT erneut rufen.
+                row = await conn.fetchrow(
+                    f"SELECT {_ABO_SPALTEN} FROM subscriptions WHERE id = $1", ab["neu_abo_id"],
+                )
+                await _ensure_monthly_budget_pot(conn, user_uuid, plan_id)
+                return _serialize_subscription(row)
+
+            if ab["status"] != "offen":
+                konflikt = f"Abschluss {ab['id']} steht auf '{ab['status']}'"
+            else:
+                alt_id = ab["alt_abo_id"]
+                alt = None
+                if alt_id is not None:
+                    alt = await conn.fetchrow(
+                        "SELECT id, status, mollie_subscription_id FROM subscriptions WHERE id = $1 FOR UPDATE",
+                        alt_id,
+                    )
+                andere = [r["id"] for r in await conn.fetch(
+                    """SELECT id FROM subscriptions
+                        WHERE user_id = $1 AND app_id = $2::app_id AND status = 'active'
+                          AND mollie_subscription_id IS NOT NULL
+                        FOR UPDATE""",
+                    user_uuid, app_id,
+                ) if r["id"] != alt_id and (bestand is None or r["id"] != bestand["id"])]
+                if andere:
+                    konflikt = f"weiteres aktives Mollie-Abo {andere} im Konto"
+                else:
+                    row = bestand
+                    if row is None:
+                        mollie = get_mollie_adapter()
+                        mollie_sub = await mollie.find_subscription_for_first_payment(
+                            customer_id, first_payment_id,
+                        )
+                        if mollie_sub is None:
+                            resp = await mollie.create_subscription(
+                                customer_id=customer_id,
+                                amount_eur=amount,
+                                interval="1 month",
+                                description=f"{plan_id} ({seats} Sitz{'e' if seats > 1 else ''})",
+                                webhook_url=config.mollie_webhook_url,
+                                metadata={
+                                    "userId": user_id, "planId": plan_id,
+                                    "firstPaymentId": first_payment_id,
+                                    "abschlussId": str(ab["id"]),
+                                },
+                                idempotency_key=f"abo-erstzahlung-{first_payment_id}",
+                            )
+                            mollie_sub = resp["subscriptionId"]
+                        else:
+                            logger.warning(
+                                "[abo-abschluss] Mollie-Abo %s zu Erstzahlung %s gefunden statt neu angelegt",
+                                mollie_sub, first_payment_id,
+                            )
+                        ueberlappt = (
+                            alt_id if alt is not None and alt["status"] == "active"
+                            and alt["mollie_subscription_id"] else None
+                        )
+                        row = await conn.fetchrow(
+                            f"""
+                            INSERT INTO subscriptions
+                              (id, user_id, app_id, plan_id, status,
+                               mollie_customer_id, mollie_subscription_id, mollie_first_payment_id,
+                               seats, started_at, ueberlappt_abo_id)
+                            VALUES ($1, $2, $3, $4, 'active', $5, $6, $7, $8, NOW(), $9)
+                            RETURNING {_ABO_SPALTEN}
+                            """,
+                            uuid.uuid4(), user_uuid, app_id, plan_id,
+                            customer_id, mollie_sub, first_payment_id, seats, ueberlappt,
+                        )
+                        angelegt = row
+                    await _ensure_monthly_budget_pot(conn, user_uuid, plan_id)
+                    alt_laeuft = alt is not None and alt["status"] in ("active", "suspended")
+                    await conn.execute(
+                        """UPDATE abo_abschluesse SET neu_abo_id = $2, status = $3, ergebnis = $4,
+                                  geaendert_am = NOW()
+                            WHERE id = $1""",
+                        ab["id"], row["id"],
+                        "neu_aktiv" if alt_laeuft else "abgeschlossen",
+                        None if alt_laeuft else ("erstkauf" if alt_id is None else "alt_schon_beendet"),
+                    )
+
+            if konflikt:
+                # Ereignis genau einmal je Zahlung — auch wenn die Zeile schon
+                # als 'konflikt' angelegt wurde (Altbestand ohne freien Platz).
+                konflikt_neu = not await conn.fetchval(
+                    """SELECT 1 FROM billing_events
+                        WHERE event_type = 'subscription.activation_conflict'
+                          AND mollie_payment_id = $1""",
+                    first_payment_id,
+                )
+                await conn.execute(
+                    """UPDATE abo_abschluesse SET status = 'konflikt', letzter_fehler = $2,
+                              geaendert_am = NOW()
+                        WHERE id = $1""",
+                    ab["id"], konflikt,
+                )
+
+    if konflikt:
+        logger.error(
+            "[ALARM][abo-abschluss] bezahlte Erstzahlung %s (Nutzer %s, %s) NICHT aktiviert: %s",
+            first_payment_id, user_id, plan_id, konflikt,
+        )
+        if konflikt_neu:
+            await log_billing_event(
+                "subscription.activation_conflict",
+                user_id=user_id, mollie_payment_id=first_payment_id,
+                amount_eur=float(amount), source="mollie-webhook",
+                payload={"planId": plan_id, "seats": seats, "grund": konflikt},
+            )
+        raise AboAbschlussKonflikt(konflikt)
+
+    if angelegt is not None:
+        # Nach dem Commit: billing_events/invoices haengen per FK an der neuen
+        # Zeile (zweite Verbindung, siehe cancel_subscription).
+        await log_billing_event(
+            "subscription.activated",
+            user_id=user_id,
+            subscription_id=str(angelegt["id"]),
+            mollie_payment_id=first_payment_id,
+            amount_eur=float(amount),
+            source="mollie-webhook",
+            payload={"planId": plan_id, "seats": seats},
+        )
+        await auto_create_invoice(
+            user_id=user_id,
+            amount_eur=float(amount),
+            description=f"{plan_id} — Erste Monatsabrechnung ({seats} Sitz" + ("e" if seats > 1 else "") + ")",
+            subscription_id=str(angelegt["id"]),
+            mollie_payment_id=first_payment_id,
+            number_prefix=prefix_for_app(app_id),
+        )
+    return _serialize_subscription(row)
+
+
+async def _wechsel_abschliessen(first_payment_id: str) -> Dict[str, Any]:
+    """Kuendigt das im Wechsel gemerkte alte Abo — nur wenn das neue aktiv ist.
+
+    Unter Sperre von Abschluss, neuem und altem Abo:
+      - altes laeuft nicht mehr       -> abgeschlossen (alt_schon_beendet)
+      - neues nicht (mehr) aktiv      -> abgeschlossen (ersatz_nicht_aktiv),
+        altes bleibt: nie das letzte Abo kuendigen (Codex-Befund 3)
+      - sonst Mollie-Kuendigung; Erfolg -> abgeschlossen (alt_gekuendigt),
+        Fehler -> 'doppelt_aktiv' + ALARM, AboDoppeltAktiv (Codex-Befund 2).
+    Wiederholbar: Webhook-Wiederholung und Nachholauftrag rufen dasselbe.
+    """
+    pool = get_pool()
+    ergebnis: Dict[str, Any] = {}
+    fehler: Optional[str] = None
+    erster_alarm = False
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            ab = await conn.fetchrow(
+                "SELECT * FROM abo_abschluesse WHERE payment_id = $1 FOR UPDATE", first_payment_id,
+            )
+            if ab is None or ab["status"] not in ("neu_aktiv", "doppelt_aktiv"):
+                return {
+                    "status": ab["status"] if ab else None,
+                    "ergebnis": ab["ergebnis"] if ab else None,
+                    "altAboId": str(ab["alt_abo_id"]) if ab and ab["alt_abo_id"] else None,
+                }
+            neu = await conn.fetchrow(
+                "SELECT status FROM subscriptions WHERE id = $1 FOR UPDATE", ab["neu_abo_id"],
+            )
+            alt = await conn.fetchrow(
+                """SELECT status, mollie_customer_id, mollie_subscription_id
+                     FROM subscriptions WHERE id = $1 FOR UPDATE""",
+                ab["alt_abo_id"],
+            )
+            ergebnis = {"altAboId": str(ab["alt_abo_id"]), "neuAboId": str(ab["neu_abo_id"]),
+                        "userId": str(ab["user_id"])}
+            if alt["status"] not in ("active", "suspended"):
+                ausgang = "alt_schon_beendet"
+            elif neu["status"] != "active":
+                ausgang = "ersatz_nicht_aktiv"
+            else:
+                try:
+                    if alt["mollie_subscription_id"]:
+                        await get_mollie_adapter().cancel_subscription(
+                            alt["mollie_customer_id"], alt["mollie_subscription_id"],
+                        )
+                except Exception as exc:  # noqa: BLE001 — wird als doppelt_aktiv festgehalten und weitergeworfen
+                    fehler = f"{type(exc).__name__}: {exc}"
+                    ausgang = None
+                else:
+                    await conn.execute(
+                        "UPDATE subscriptions SET status='cancelled', cancelled_at=NOW() WHERE id=$1",
+                        ab["alt_abo_id"],
+                    )
+                    ausgang = "alt_gekuendigt"
+            if fehler is not None:
+                erster_alarm = ab["status"] != "doppelt_aktiv"
+                zeile = await conn.fetchrow(
+                    """UPDATE abo_abschluesse
+                          SET status = 'doppelt_aktiv', letzter_fehler = $2,
+                              kuendigung_versuche = kuendigung_versuche + 1,
+                              doppelt_aktiv_seit = COALESCE(doppelt_aktiv_seit, NOW()),
+                              geaendert_am = NOW()
+                        WHERE id = $1
+                    RETURNING kuendigung_versuche, doppelt_aktiv_seit""",
+                    ab["id"], fehler[:2000],
+                )
+                ergebnis.update(status="doppelt_aktiv", ergebnis=None,
+                                versuche=zeile["kuendigung_versuche"],
+                                doppeltAktivSeit=zeile["doppelt_aktiv_seit"].isoformat())
+            else:
+                await conn.execute(
+                    """UPDATE abo_abschluesse
+                          SET status = 'abgeschlossen', ergebnis = $2::varchar, geaendert_am = NOW(),
+                              kuendigung_versuche = kuendigung_versuche
+                                  + CASE WHEN $2::varchar = 'alt_gekuendigt' THEN 1 ELSE 0 END
+                        WHERE id = $1""",
+                    ab["id"], ausgang,
+                )
+                ergebnis.update(status="abgeschlossen", ergebnis=ausgang,
+                                warDoppeltAktiv=ab["status"] == "doppelt_aktiv")
+
+    uid = ergebnis["userId"]
+    if fehler is not None:
+        logger.error(
+            "[ALARM][abo-wechsel] Kuendigung von Abo %s gescheitert (Versuch %s) — altes UND neues "
+            "Abo %s laufen seit %s, Abbuchungen des alten Abos ab dann sind zu erstatten: %s",
+            ergebnis["altAboId"], ergebnis["versuche"], ergebnis["neuAboId"],
+            ergebnis["doppeltAktivSeit"], fehler,
+        )
+        if erster_alarm:
+            await log_billing_event(
+                "subscription.double_active", user_id=uid,
+                subscription_id=ergebnis["altAboId"], mollie_payment_id=first_payment_id,
+                source="plan-change",
+                payload={"neuAboId": ergebnis["neuAboId"], "fehler": fehler,
+                         "seit": ergebnis["doppeltAktivSeit"]},
+            )
+        raise AboDoppeltAktiv(
+            f"Abo {ergebnis['altAboId']} nicht gekuendigt, {ergebnis['neuAboId']} aktiv: {fehler}"
+        )
+    if ergebnis["ergebnis"] == "alt_gekuendigt":
+        await log_billing_event(
+            "subscription.cancelled", user_id=uid, subscription_id=ergebnis["altAboId"],
+            mollie_payment_id=first_payment_id, source="plan-change",
+            payload={"ersetztDurch": ergebnis["neuAboId"]},
+        )
+    elif ergebnis["ergebnis"] == "ersatz_nicht_aktiv":
+        logger.warning(
+            "[abo-wechsel] Ersatz %s nicht aktiv — altes Abo %s bleibt bestehen",
+            ergebnis["neuAboId"], ergebnis["altAboId"],
+        )
+        await log_billing_event(
+            "subscription.change_kept_old", user_id=uid, subscription_id=ergebnis["altAboId"],
+            mollie_payment_id=first_payment_id, source="plan-change",
+            payload={"neuAboId": ergebnis["neuAboId"]},
+        )
+    if ergebnis.get("warDoppeltAktiv"):
+        await log_billing_event(
+            "subscription.double_active_resolved", user_id=uid,
+            subscription_id=ergebnis["altAboId"], mollie_payment_id=first_payment_id,
+            source="plan-change", payload={"ergebnis": ergebnis["ergebnis"]},
+        )
+    return ergebnis
+
+
+async def wechsel_kuendigungen_nachholen() -> Dict[str, Any]:
+    """Nachholauftrag: jeder Wechsel in 'neu_aktiv'/'doppelt_aktiv' wird erneut
+    abgeschlossen. Fehler bleiben je Wechsel sichtbar (Alarm, Status), der Lauf
+    geht weiter."""
+    pool = get_pool()
+    async with pool.acquire() as conn:
+        zahlungen = [r["payment_id"] for r in await conn.fetch(
+            """SELECT payment_id FROM abo_abschluesse
+                WHERE status IN ('neu_aktiv', 'doppelt_aktiv') ORDER BY geaendert_am"""
+        )]
+    bericht: Dict[str, Any] = {"geprueft": len(zahlungen), "abgeschlossen": 0, "doppeltAktiv": []}
+    for pid in zahlungen:
+        try:
+            erg = await _wechsel_abschliessen(pid)
+        except AboDoppeltAktiv:
+            bericht["doppeltAktiv"].append(pid)
+            continue
+        if erg.get("status") == "abgeschlossen":
+            bericht["abgeschlossen"] += 1
+    return bericht
 
 
 async def list_subscriptions(user_id: str) -> List[Dict[str, Any]]:
@@ -1376,21 +1832,29 @@ async def change_subscription(
       LookupError  — no active subscription found for the user.
       ValueError   — new plan/seats are identical to the current ones (no-op guard).
     """
+    # Validate the new plan exists (raises ValueError for unknown).
+    _plan_price(new_plan_id)
+    from src.budget.plans import get_plan
+    app_id = get_plan(new_plan_id).app_id
+
+    # Ersetzt wird das aktive Abo DERSELBEN App (Konto = Nutzer + App), ein
+    # abrechnendes Mollie-Abo vor Testphase/Vergabe. Bis 18.10.2026 nahm die
+    # Funktion das juengste aktive Abo irgendeiner App.
     pool = get_pool()
     async with pool.acquire() as conn:
         sub = await conn.fetchrow(
             """
             SELECT id, plan_id, seats, mollie_customer_id, mollie_subscription_id
               FROM subscriptions
-             WHERE user_id = $1 AND status = 'active'
-             ORDER BY started_at DESC
+             WHERE user_id = $1 AND app_id = $2::app_id AND status = 'active'
+             ORDER BY (mollie_subscription_id IS NOT NULL) DESC, started_at DESC
              LIMIT 1
             """,
-            uuid.UUID(user_id),
+            uuid.UUID(user_id), app_id,
         )
 
     if not sub:
-        raise LookupError(f"No active subscription for user {user_id}")
+        raise LookupError(f"No active subscription for user {user_id} in app {app_id}")
 
     current_plan = sub["plan_id"]
     current_seats = sub["seats"]
@@ -1398,9 +1862,6 @@ async def change_subscription(
         raise ValueError(
             f"New plan ({new_plan_id}, {seats} seats) identical to current — nothing to change"
         )
-
-    # Validate the new plan exists (raises ValueError for unknown).
-    _plan_price(new_plan_id)
 
     sub_id = str(sub["id"])
     checkout = await start_subscription_checkout(
@@ -1467,6 +1928,15 @@ async def handle_webhook(payment_id: str) -> Dict[str, Any]:
         # but a lost payment must never vanish silently from the trail.
         if status in ("failed", "expired", "canceled"):
             await _record_failed_payment(payment_id, status)
+            # Abo-Erstzahlung gescheitert: Abschluss-Platz des Kontos freigeben.
+            pool = get_pool()
+            async with pool.acquire() as conn:
+                await conn.execute(
+                    """UPDATE abo_abschluesse SET status = 'abgebrochen', geaendert_am = NOW(),
+                              letzter_fehler = $2
+                        WHERE payment_id = $1 AND status IN ('reserviert', 'offen')""",
+                    payment_id, f"Erstzahlung {status}",
+                )
             # Recurring subscription payments are NOT in pending_payments.
             # When such a payment fails, suspend the linked subscription.
             mollie_sub_id = payment.get("subscription_id")
@@ -1527,19 +1997,22 @@ async def handle_webhook(payment_id: str) -> Dict[str, Any]:
             raise RuntimeError("subscription_first: customer_id missing")
         sub = await _activate_subscription(
             user_id, pending["plan_id"], seats, cust, first_payment_id=payment_id,
+            ersetzt_abo_id=pending["ersetzt_abo_id"],
         )
-        # Planwechsel: das alte Abo erst JETZT kuendigen, wo das neue aktiv ist.
-        # Scheitert die Kuendigung, wirft der Webhook (500) und Mollie wiederholt;
-        # die Aktivierung ist idempotent, die Kuendigung ebenso.
-        ersetzt = pending["ersetzt_abo_id"]
-        if ersetzt is not None:
-            await cancel_subscription(user_id, str(ersetzt))
+        # Planwechsel: das alte Abo erst JETZT kuendigen, wo das neue aktiv ist —
+        # und nur, solange das neue aktiv ist. Scheitert die Kuendigung, steht
+        # der Wechsel auf 'doppelt_aktiv' (Alarm) und der Webhook antwortet 500;
+        # Mollie und der Nachholauftrag wiederholen.
+        wechsel = await _wechsel_abschliessen(payment_id)
+        ersetzt = wechsel.get("altAboId") if wechsel.get("ergebnis") == "alt_gekuendigt" else None
+        if ersetzt:
             logger.info(
                 "[webhook] plan change: subscription %s replaced by %s (payment %s)",
                 ersetzt, sub.get("id"), payment_id,
             )
         return {"handled": True, "type": "subscription_first", "subscription": sub,
-                "replacedSubscriptionId": str(ersetzt) if ersetzt is not None else None}
+                "replacedSubscriptionId": ersetzt,
+                "wechsel": {"status": wechsel.get("status"), "ergebnis": wechsel.get("ergebnis")}}
 
     if pending["type"] == "project_pack":
         # Self-Service-Projekt-Paket: dieselbe Freigabe-Logik wie der Operator,
