@@ -714,30 +714,62 @@ async def billing_list_credits(
 
 
 class SubscriptionChangeRequest(BaseModel):
-    userId: str
-    email: str
-    name: str
+    # PFLICHT — der Planwechsel ist ein neuer Kauf mit eigenem Zustimmungsbeleg.
+    consent: PurchaseConsentIn
     newPlanId: str
     seats: int = Field(default=1, ge=1, le=100)
     successRedirect: str
-    consent: PurchaseConsentIn
+    # Wie SubscriptionCheckoutRequest: die Identitaet kommt aus dem
+    # Auth-Kontext. body.userId ist nur der ausdrueckliche Auftrag eines
+    # Operators (Service-Token OHNE X-User-ID); mit Nutzerkontext muss es
+    # fehlen oder gleich sein — eine fremde userId ist 403, nicht still ignoriert.
+    userId: Optional[str] = None
+    email: Optional[str] = None
+    name: Optional[str] = None
+
+
+def _pruefe_fremde_user_id(claims: AuthClaims, body_user_id: Optional[str]) -> None:
+    """403, wenn ein Nutzerkontext (JWT oder Service-Token + X-User-ID) eine
+    ANDERE userId im Body nennt. Wirkt vor jedem Datenbankzugriff."""
+    acting = claims.effective_user_id
+    if acting is None or not body_user_id:
+        return
+    if str(body_user_id).strip().lower() != str(acting).strip().lower():
+        raise HTTPException(status_code=403, detail={
+            "error": "foreign_user_id",
+            "message": "userId im Auftrag gehoert nicht zum angemeldeten Konto.",
+        })
 
 
 @router.post("/subscription/change")
 async def billing_sub_change(
     body: SubscriptionChangeRequest,
-    _claims: AuthClaims = Depends(require_jwt_or_service),
+    claims: AuthClaims = Depends(require_jwt_or_service),
 ) -> Dict[str, Any]:
     """Upgrade, downgrade, or reseat an active subscription.
+
+    Abgesichert wie /subscription/checkout (Fix 18.10.2026 — vorher nahm die
+    Route body.userId ungeprueft, ein beliebiger angemeldeter Nutzer konnte
+    damit das Abo eines anderen wechseln):
+      - Nutzer-JWT / Service-Token + X-User-ID: es gilt NUR die eigene
+        Identitaet; eine abweichende body.userId -> 403.
+      - Service-Token ohne X-User-ID (Operator): body.userId ist Pflicht
+        (ausdruecklicher Auftrag), sonst 400.
+      - Danach dieselbe Selbstbuchungs-Sperre wie beim Erstkauf (403).
 
     Starts a checkout for the new plan. The current subscription stays
     active until the new one is paid and activated; the webhook cancels it
     then. Returns the checkout URL and the ID of the subscription it replaces.
     """
+    _pruefe_fremde_user_id(claims, body.userId)
+    user_id, email, name = await _resolve_billing_identity(
+        claims, body.userId, body.email, body.name,
+    )
+    await _assert_self_checkout_allowed(user_id)
     try:
         return await billing_service.change_subscription(
-            body.userId, body.newPlanId, body.seats, body.successRedirect,
-            body.email, body.name, consent=body.consent,
+            user_id, body.newPlanId, body.seats, body.successRedirect,
+            email, name, consent=body.consent,
         )
     except LookupError as e:
         raise HTTPException(status_code=404, detail=str(e))

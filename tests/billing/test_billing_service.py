@@ -699,6 +699,17 @@ class TestChangeSubscription:
 # ---------------------------------------------------------------------------
 
 class TestSubscriptionChangeRoute:
+    """Absicherung wie /subscription/checkout (Fix 18.10.2026, Kanzler 13:40Z):
+    fremde userId -> 403, eigene ok, Operator (Service-Token ohne X-User-ID)
+    nur mit ausdruecklicher userId, Selbstbuchungs-Sperre greift."""
+
+    @pytest.fixture(autouse=True)
+    def _geheimnisse(self, monkeypatch):
+        # Wegwerfwerte nur fuer diesen Test — weder der Laufzeit-Schluessel
+        # noch ein echtes Service-Token.
+        monkeypatch.setenv("BRIDGE_JWT_SECRET", "test-secret-for-unit-tests")
+        monkeypatch.setenv("BRIDGE_SERVICE_TOKEN", "test-service-token")
+
     def _client(self):
         from fastapi import FastAPI
         from fastapi.testclient import TestClient
@@ -707,39 +718,100 @@ class TestSubscriptionChangeRoute:
         app.include_router(router)
         return TestClient(app)
 
+    @staticmethod
+    def _consent():
+        from src.billing.purchase_consent import PurchaseConsentIn
+        c = {"termsVersion": "test", "actingAsBusiness": True, "professionallyQualified": True,
+             "immediateStartRequested": True, "acceptedAt": "2026-10-18T13:00:00Z"}
+        c = {k: v for k, v in c.items() if k in PurchaseConsentIn.model_fields}
+        for name, feld in PurchaseConsentIn.model_fields.items():
+            if feld.is_required() and name not in c:
+                c[name] = True
+        return c
+
     def _body(self, **extra):
-        body = {"userId": str(uuid.uuid4()), "email": "u@test.com", "name": "U",
-                "newPlanId": "report-standard", "seats": 2,
-                "successRedirect": "https://example.com/ok"}
+        body = {"newPlanId": "report-standard", "seats": 2,
+                "successRedirect": "https://example.com/ok", "consent": self._consent(),
+                "email": "u@test.com", "name": "U"}
         body.update(extra)
         return body
 
-    def test_ohne_zustimmung_422_und_kein_aufruf(self):
+    @staticmethod
+    def _jwt(uid):
+        from src.identity.jwt_utils import sign_jwt
+        return {"Authorization": "Bearer " + sign_jwt(
+            user_id=str(uid), email="u@test.com", tenant_id="t1", app_licenses=[])}
+
+    @staticmethod
+    def _service(acting=None):
         from src.config import config
-        with patch("src.billing.billing_service.change_subscription", new_callable=AsyncMock) as ch:
-            resp = self._client().post(
-                "/v1/billing/subscription/change", json=self._body(),
-                headers={"X-Bridge-Service-Token": config.service_token},
-            )
+        h = {"X-Bridge-Service-Token": config.service_token}
+        if acting:
+            h["X-User-ID"] = str(acting)
+        return h
+
+    def _post(self, body, headers, erlaubt=True):
+        ch = AsyncMock(return_value={"checkoutUrl": "https://x", "replacesSubscriptionId": "s"})
+        with patch("src.billing.billing_service.change_subscription", ch), \
+             patch("src.billing.routes._self_checkout_state",
+                   AsyncMock(return_value=(True, None) if erlaubt else (False, "tenant_managed"))):
+            resp = self._client().post("/v1/billing/subscription/change", json=body, headers=headers)
+        return resp, ch
+
+    def test_ohne_zustimmung_422(self):
+        me = uuid.uuid4()
+        body = self._body(); body.pop("consent")
+        resp, ch = self._post(body, self._jwt(me))
         assert resp.status_code == 422
         ch.assert_not_called()
 
-    def test_zustimmung_wird_durchgereicht(self):
-        from src.config import config
+    def test_jwt_fremde_user_id_403(self):
+        me, fremd = uuid.uuid4(), uuid.uuid4()
+        resp, ch = self._post(self._body(userId=str(fremd)), self._jwt(me))
+        assert resp.status_code == 403, resp.text
+        assert resp.json()["detail"]["error"] == "foreign_user_id"
+        ch.assert_not_called()
+
+    def test_service_mit_x_user_id_fremde_user_id_403(self):
+        me, fremd = uuid.uuid4(), uuid.uuid4()
+        resp, ch = self._post(self._body(userId=str(fremd)), self._service(acting=me))
+        assert resp.status_code == 403
+        ch.assert_not_called()
+
+    def test_jwt_eigene_identitaet_ok(self):
         from src.billing.purchase_consent import PurchaseConsentIn
-        consent = {
-            "termsVersion": "test", "actingAsBusiness": True, "professionallyQualified": True,
-            "immediateStartRequested": True, "acceptedAt": "2026-10-18T13:00:00Z",
-        }
-        consent = {k: v for k, v in consent.items() if k in PurchaseConsentIn.model_fields}
-        for name, feld in PurchaseConsentIn.model_fields.items():
-            if feld.is_required() and name not in consent:
-                consent[name] = True
-        with patch("src.billing.billing_service.change_subscription", new_callable=AsyncMock,
-                   return_value={"checkoutUrl": "https://x", "replacesSubscriptionId": "s"}) as ch:
-            resp = self._client().post(
-                "/v1/billing/subscription/change", json=self._body(consent=consent),
-                headers={"X-Bridge-Service-Token": config.service_token},
-            )
+        me = uuid.uuid4()
+        for body in (self._body(), self._body(userId=str(me)), self._body(userId=str(me).upper())):
+            resp, ch = self._post(body, self._jwt(me))
+            assert resp.status_code == 200, resp.text
+            assert ch.call_args.args[0] == str(me)
+            assert isinstance(ch.call_args.kwargs["consent"], PurchaseConsentIn)
+
+    def test_service_mit_x_user_id_eigene_ok(self):
+        me = uuid.uuid4()
+        resp, ch = self._post(self._body(), self._service(acting=me))
         assert resp.status_code == 200, resp.text
-        assert isinstance(ch.call_args.kwargs["consent"], PurchaseConsentIn)
+        assert ch.call_args.args[0] == str(me)
+
+    def test_operator_braucht_ausdrueckliche_user_id(self):
+        resp, ch = self._post(self._body(), self._service())
+        assert resp.status_code == 400
+        ch.assert_not_called()
+
+    def test_operator_mit_user_id_ok(self):
+        kunde = uuid.uuid4()
+        resp, ch = self._post(self._body(userId=str(kunde)), self._service())
+        assert resp.status_code == 200, resp.text
+        assert ch.call_args.args[0] == str(kunde)
+
+    def test_selbstbuchung_gesperrt_403(self):
+        me = uuid.uuid4()
+        resp, ch = self._post(self._body(), self._jwt(me), erlaubt=False)
+        assert resp.status_code == 403
+        assert resp.json()["detail"]["error"] == "self_checkout_disabled"
+        ch.assert_not_called()
+
+    def test_ohne_anmeldung_401(self):
+        resp, ch = self._post(self._body(userId=str(uuid.uuid4())), {})
+        assert resp.status_code == 401
+        ch.assert_not_called()
