@@ -366,7 +366,11 @@ from src.billing import purchase_consent
 async def start_subscription_checkout(
     user_id: str, plan_id: str, seats: int, success_redirect: str,
     email: str, name: str, *, consent: "purchase_consent.PurchaseConsentIn",
+    ersetzt_abo_id: Optional[str] = None,
 ) -> Dict[str, str]:
+    """Abo-Erstzahlung. `ersetzt_abo_id` setzt nur change_subscription: das
+    genannte Abo wird im Webhook gekuendigt, NACHDEM dieses aktiviert ist
+    (Migration 069) — nie vorher."""
     # Fail-fast: refuse the Mollie round-trip if the tenant's billing address
     # is incomplete. Without this gate, a user could complete payment on
     # Mollie and then provision_subscription (the webhook handler) would
@@ -410,11 +414,13 @@ async def start_subscription_checkout(
     async with pool.acquire() as conn:
         await conn.execute(
             """
-            INSERT INTO pending_payments (payment_id, user_id, type, plan_id, amount_eur, created_at)
-            VALUES ($1, $2, 'subscription_first', $3, $4, NOW())
+            INSERT INTO pending_payments
+              (payment_id, user_id, type, plan_id, amount_eur, ersetzt_abo_id, created_at)
+            VALUES ($1, $2, 'subscription_first', $3, $4, $5, NOW())
             ON CONFLICT (payment_id) DO NOTHING
             """,
             checkout["paymentId"], uuid.UUID(user_id), plan_id, amount,
+            uuid.UUID(ersetzt_abo_id) if ersetzt_abo_id else None,
         )
     return checkout
 
@@ -1350,15 +1356,21 @@ async def change_subscription(
     success_redirect: str,
     email: str,
     name: str,
+    *,
+    consent: "purchase_consent.PurchaseConsentIn",
 ) -> Dict[str, Any]:
     """Upgrade, downgrade, or reseat a subscription.
 
-    Cancels the current active subscription (Mollie + DB) and immediately
-    starts a checkout for the new plan.  The new subscription is activated
-    when the first payment completes via the Mollie webhook.
+    Starts a checkout for the new plan and records which subscription it
+    replaces. The current subscription stays ACTIVE until the new one is
+    activated by the Mollie webhook; only then is the old one cancelled
+    (handle_webhook). An abandoned or failed checkout therefore leaves the
+    customer on the old plan — never without a subscription (Fix 18.10.2026:
+    previously the old subscription was cancelled first and the checkout then
+    failed for lack of `consent`).
 
-    Returns the checkout URL together with the ID of the cancelled subscription
-    so the caller can communicate the transition to the user.
+    Returns the checkout URL and the ID of the subscription that will be
+    replaced once the new one is paid.
 
     Raises:
       LookupError  — no active subscription found for the user.
@@ -1391,12 +1403,13 @@ async def change_subscription(
     _plan_price(new_plan_id)
 
     sub_id = str(sub["id"])
-    await cancel_subscription(user_id, sub_id)
     checkout = await start_subscription_checkout(
         user_id, new_plan_id, seats, success_redirect, email, name,
+        consent=consent, ersetzt_abo_id=sub_id,
     )
     return {
-        "cancelledSubscriptionId": sub_id,
+        "replacesSubscriptionId": sub_id,
+        "cancelledOnActivation": True,
         "previousPlanId": current_plan,
         "newPlanId": new_plan_id,
         "seats": seats,
@@ -1487,7 +1500,8 @@ async def handle_webhook(payment_id: str) -> Dict[str, Any]:
     pool = get_pool()
     async with pool.acquire() as conn:
         pending = await conn.fetchrow(
-            "SELECT user_id, type, plan_id, amount_eur FROM pending_payments WHERE payment_id = $1",
+            "SELECT user_id, type, plan_id, amount_eur, ersetzt_abo_id "
+            "FROM pending_payments WHERE payment_id = $1",
             payment_id,
         )
     if not pending:
@@ -1514,7 +1528,18 @@ async def handle_webhook(payment_id: str) -> Dict[str, Any]:
         sub = await _activate_subscription(
             user_id, pending["plan_id"], seats, cust, first_payment_id=payment_id,
         )
-        return {"handled": True, "type": "subscription_first", "subscription": sub}
+        # Planwechsel: das alte Abo erst JETZT kuendigen, wo das neue aktiv ist.
+        # Scheitert die Kuendigung, wirft der Webhook (500) und Mollie wiederholt;
+        # die Aktivierung ist idempotent, die Kuendigung ebenso.
+        ersetzt = pending["ersetzt_abo_id"]
+        if ersetzt is not None:
+            await cancel_subscription(user_id, str(ersetzt))
+            logger.info(
+                "[webhook] plan change: subscription %s replaced by %s (payment %s)",
+                ersetzt, sub.get("id"), payment_id,
+            )
+        return {"handled": True, "type": "subscription_first", "subscription": sub,
+                "replacedSubscriptionId": str(ersetzt) if ersetzt is not None else None}
 
     if pending["type"] == "project_pack":
         # Self-Service-Projekt-Paket: dieselbe Freigabe-Logik wie der Operator,

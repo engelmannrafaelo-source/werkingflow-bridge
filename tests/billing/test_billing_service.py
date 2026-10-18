@@ -620,6 +620,7 @@ class TestChangeSubscription:
                 await change_subscription(
                     str(uuid.uuid4()), "report-standard", 1,
                     "https://example.com/success", "user@test.com", "Test User",
+                    consent=MagicMock(),
                 )
 
     async def test_raises_value_error_on_no_op_change(self):
@@ -630,36 +631,23 @@ class TestChangeSubscription:
                 await change_subscription(
                     str(sub["user_id"]), "report-standard", 1,
                     "https://example.com/success", "user@test.com", "Test User",
+                    consent=MagicMock(),
                 )
 
-    async def test_plan_change_cancels_and_starts_checkout(self):
-        """Changing from trial to report-standard: cancel existing + new checkout."""
+    async def test_plan_change_starts_checkout_and_does_not_cancel_yet(self):
+        """Planwechsel: Checkout mit Zustimmung und ersetzt_abo_id — das alte Abo
+        bleibt aktiv, bis das neue bezahlt ist (Kuendigung erst im Webhook)."""
         user_id = uuid.uuid4()
         sub = _sub_row(
             user_id=user_id, plan_id="trial", seats=1,
             mollie_subscription_id="sub_trial_123",
         )
-        # cancel_subscription lookup + checkout customer lookup
-        cancel_lookup = _sub_row(
-            user_id=user_id, plan_id="trial", seats=1,
-            mollie_customer_id="cust_abc",
-            mollie_subscription_id="sub_trial_123",
-            status="active",
-        )
-        # Pools for find active sub + cancel_subscription + start checkout
         pool, conn = _mock_pool()
-        conn.fetchrow = AsyncMock(side_effect=[
-            sub,          # change_subscription: find active sub
-            cancel_lookup,  # cancel_subscription: FOR UPDATE lock
-            None,         # get_or_create_customer: no existing customer
-        ])
+        conn.fetchrow = AsyncMock(side_effect=[sub])
+        consent = MagicMock()
 
-        fake_mollie = FakeMollieAdapter()
-        # Pre-seed customer so checkout works
-        fake_mollie._customers["cust_abc"] = {"email": "u@test.com", "name": "User"}
-
-        # Mock cancel_subscription and start_subscription_checkout to keep scope tight
         with patch("src.billing.billing_service.get_pool", return_value=pool), \
+             patch("src.billing.billing_service._plan_price", return_value=29.0), \
              patch("src.billing.billing_service.cancel_subscription",
                    new_callable=AsyncMock) as mock_cancel, \
              patch("src.billing.billing_service.start_subscription_checkout",
@@ -668,11 +656,90 @@ class TestChangeSubscription:
             result = await change_subscription(
                 str(user_id), "report-standard", 2,
                 "https://example.com/success", "u@test.com", "User",
+                consent=consent,
             )
 
-        mock_cancel.assert_called_once_with(str(user_id), str(sub["id"]))
+        mock_cancel.assert_not_called()
         mock_checkout.assert_called_once()
+        kw = mock_checkout.call_args.kwargs
+        assert kw["consent"] is consent
+        assert kw["ersetzt_abo_id"] == str(sub["id"])
+        assert result["replacesSubscriptionId"] == str(sub["id"])
+        assert result["cancelledOnActivation"] is True
         assert result["previousPlanId"] == "trial"
         assert result["newPlanId"] == "report-standard"
         assert result["seats"] == 2
         assert "checkoutUrl" in result
+
+    async def test_plan_change_checkout_failure_keeps_old_subscription(self):
+        """Scheitert der Checkout, bleibt das alte Abo unangetastet."""
+        user_id = uuid.uuid4()
+        sub = _sub_row(user_id=user_id, plan_id="trial", seats=1)
+        pool, conn = _mock_pool()
+        conn.fetchrow = AsyncMock(side_effect=[sub])
+        with patch("src.billing.billing_service.get_pool", return_value=pool), \
+             patch("src.billing.billing_service._plan_price", return_value=29.0), \
+             patch("src.billing.billing_service.cancel_subscription",
+                   new_callable=AsyncMock) as mock_cancel, \
+             patch("src.billing.billing_service.start_subscription_checkout",
+                   new_callable=AsyncMock, side_effect=ValueError("billing address incomplete")):
+            with pytest.raises(ValueError):
+                await change_subscription(
+                    str(user_id), "report-standard", 1,
+                    "https://example.com/success", "u@test.com", "User",
+                    consent=MagicMock(),
+                )
+        mock_cancel.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Route /v1/billing/subscription/change: Zustimmung ist Pflicht und erreicht
+# den Checkout (Fix 18.10.2026 — vorher fehlte sie, der Checkout brach NACH der
+# Kuendigung mit TypeError ab).
+# ---------------------------------------------------------------------------
+
+class TestSubscriptionChangeRoute:
+    def _client(self):
+        from fastapi import FastAPI
+        from fastapi.testclient import TestClient
+        from src.billing.routes import router
+        app = FastAPI()
+        app.include_router(router)
+        return TestClient(app)
+
+    def _body(self, **extra):
+        body = {"userId": str(uuid.uuid4()), "email": "u@test.com", "name": "U",
+                "newPlanId": "report-standard", "seats": 2,
+                "successRedirect": "https://example.com/ok"}
+        body.update(extra)
+        return body
+
+    def test_ohne_zustimmung_422_und_kein_aufruf(self):
+        from src.config import config
+        with patch("src.billing.billing_service.change_subscription", new_callable=AsyncMock) as ch:
+            resp = self._client().post(
+                "/v1/billing/subscription/change", json=self._body(),
+                headers={"X-Bridge-Service-Token": config.service_token},
+            )
+        assert resp.status_code == 422
+        ch.assert_not_called()
+
+    def test_zustimmung_wird_durchgereicht(self):
+        from src.config import config
+        from src.billing.purchase_consent import PurchaseConsentIn
+        consent = {
+            "termsVersion": "test", "actingAsBusiness": True, "professionallyQualified": True,
+            "immediateStartRequested": True, "acceptedAt": "2026-10-18T13:00:00Z",
+        }
+        consent = {k: v for k, v in consent.items() if k in PurchaseConsentIn.model_fields}
+        for name, feld in PurchaseConsentIn.model_fields.items():
+            if feld.is_required() and name not in consent:
+                consent[name] = True
+        with patch("src.billing.billing_service.change_subscription", new_callable=AsyncMock,
+                   return_value={"checkoutUrl": "https://x", "replacesSubscriptionId": "s"}) as ch:
+            resp = self._client().post(
+                "/v1/billing/subscription/change", json=self._body(consent=consent),
+                headers={"X-Bridge-Service-Token": config.service_token},
+            )
+        assert resp.status_code == 200, resp.text
+        assert isinstance(ch.call_args.kwargs["consent"], PurchaseConsentIn)

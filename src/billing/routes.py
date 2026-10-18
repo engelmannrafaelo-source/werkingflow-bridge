@@ -720,6 +720,7 @@ class SubscriptionChangeRequest(BaseModel):
     newPlanId: str
     seats: int = Field(default=1, ge=1, le=100)
     successRedirect: str
+    consent: PurchaseConsentIn
 
 
 @router.post("/subscription/change")
@@ -729,14 +730,14 @@ async def billing_sub_change(
 ) -> Dict[str, Any]:
     """Upgrade, downgrade, or reseat an active subscription.
 
-    Cancels the current active subscription and starts a new checkout.
-    The new subscription activates when the first payment completes.
-    Returns the checkout URL and the ID of the cancelled subscription.
+    Starts a checkout for the new plan. The current subscription stays
+    active until the new one is paid and activated; the webhook cancels it
+    then. Returns the checkout URL and the ID of the subscription it replaces.
     """
     try:
         return await billing_service.change_subscription(
             body.userId, body.newPlanId, body.seats, body.successRedirect,
-            body.email, body.name,
+            body.email, body.name, consent=body.consent,
         )
     except LookupError as e:
         raise HTTPException(status_code=404, detail=str(e))
