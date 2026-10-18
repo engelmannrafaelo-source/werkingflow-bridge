@@ -208,3 +208,42 @@ def test_guard_module_rufen_den_ausgang_wirklich():
 def test_zentraler_ausgang_steht_in_chat_completions():
     main = (SRC / "main.py").read_text(encoding="utf-8")
     assert "enforce_image_egress(" in main and "image_route(" in main
+
+
+def test_kontext_des_eingangs_gewinnt_vor_dem_selbst_erklaerten_app_id():
+    """Principal sagt Energy, Kopfzeile sagt Report: Energy gilt (Eingang setzt CURRENT_APP)."""
+    bp.CURRENT_APP.set("werking-energy")
+    assert bp.app_is_gemini_only("werking-report") is True
+    bp.CURRENT_APP.set("werking-report")
+    assert bp.app_is_gemini_only("werking-energy") is False
+    bp.CURRENT_APP.set(None)  # kein Request-Kontext: die uebergebene App gilt
+    assert bp.app_is_gemini_only("werking-report") is False and bp.app_is_gemini_only(None) is True
+
+
+def test_eingang_ohne_identitaet_setzt_kontext_eingeschraenkt_und_sperrt_am_provider():
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    from src.middleware.bild_policy_middleware import ImagePolicyMiddleware
+
+    api = FastAPI()
+    seen = []
+
+    @api.post("/v1/anything")
+    async def anything():
+        seen.append(bp.CURRENT_APP.get())
+        try:
+            bp.guard_provider_payload("anthropic", ANTHROPIC_IMG)
+            return {"gesperrt": False}
+        except bp.ImageEgressRefused:
+            return {"gesperrt": True}
+
+    api.add_middleware(ImagePolicyMiddleware)
+    c = TestClient(api)
+    harmlos = {"messages": [{"role": "user", "content": "hallo"}]}
+    assert c.post("/v1/anything", json=harmlos).json() == {"gesperrt": True}       # keine Identitaet
+    assert c.post("/v1/anything", json=harmlos, headers={"X-App-ID": "werking-report"}).json() == {"gesperrt": False}
+    assert seen == ["", "werking-report"]
+    # Bild ohne Identitaet und ohne Gemini: schon am Eingang abgewiesen
+    assert c.post("/v1/anything", json=ANTHROPIC_IMG).status_code == 403
+    assert c.post("/v1/anything", json=ANTHROPIC_IMG, headers={"X-App-ID": "werking-report"}).status_code == 200
