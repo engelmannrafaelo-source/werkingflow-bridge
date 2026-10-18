@@ -129,7 +129,7 @@ def test_run_completion_und_erkunder_rufen_den_text_guard():
     assert 'guard_prompt_text("erkunder"' in (SRC / "erkunder/kind.py").read_text(encoding="utf-8")
 
 
-# --- 2 EIN Ausgang: AST-/Import-Inventar aller Anbieter-Zugriffe ----------------------------------
+# --- 2 Inventar-Lint: bekannte Anbieter-Schreibweisen, keine Vollstaendigkeitsgarantie ----------------------------------
 
 #: Module, die einen Modellanbieter erreichen, und wie sie den Ausgang durchlaufen.
 #: GUARD  = ruft guard_provider_payload / guard_prompt_text im selben Modul.
@@ -182,7 +182,7 @@ def _module_mit_anbieterzugriff() -> set[str]:
     return gefunden
 
 
-def test_jeder_anbieterzugriff_ist_im_inventar_neuer_weg_ist_rot():
+def test_inventar_lint_erkennt_bekannte_anbietermarker():
     unbekannt = sorted(_module_mit_anbieterzugriff() - set(AUSGANG) - KEIN_MODELLZUGANG)
     assert not unbekannt, (
         f"Neues Modul mit Anbieterzugriff: {unbekannt}. Es muss durch den gemeinsamen Ausgang laufen "
@@ -199,7 +199,7 @@ def test_inventar_hat_keine_toten_eintraege():
     assert ohne_marker == [], ohne_marker
 
 
-def test_guard_module_rufen_den_ausgang_wirklich():
+def test_inventar_lint_findet_guard_aufruf_im_modul():
     fehlt = []
     for m, art in AUSGANG.items():
         if art != "GUARD":

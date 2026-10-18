@@ -6,10 +6,11 @@ Rafael, 07.10.2026: Energy-Bildarbeit nur ueber Gemini Flash. Eine Pruefung im
 CLIENT (Wache im Python-Client, im TS-Client) sieht nur die Sendewege, die sie
 kennt; curl, urllib, ein Socket, Node-fetch, ein neuer SDK-Client gehen daran
 vorbei (Codex-Urteil R3: sieben Transportproben, alle kamen mit PNG-Base64 und
-ohne Gemini-Felder an). Die Bridge ist der einzige verpflichtende Ausgang zu einem
-Modell: wer ein Bild an Anthropic bringen will, muss durch diese Anwendung. Die
-Erkennung sitzt deshalb hier, einmal, unabhaengig davon, mit welcher Bibliothek
-der Client sendet.
+ohne Gemini-Felder an). Die Bridge prueft die durch sie laufenden Anbieter-Ausgaenge unabhaengig
+von der Client-Bibliothek. Der externe Sandbox-Passthrough hat einen eigenen
+Riegel mit wortgleicher Erkennung und Vertragstest; CLI-Werkzeugwege werden
+vor dem Start auf einen ausdruecklich textuellen Vertrag beschraenkt.
+Ein Quelltext-Inventar ist dabei nur eine Lint-Hilfe, kein Vollstaendigkeitsbeweis.
 
 WAS SIE TUT
 -----------
