@@ -101,7 +101,8 @@ def test_guarded_sdk_round_and_exact_parent_reason(monkeypatch, tmp_path):
     body = {
         "ordner": str(tmp_path),
         "max_turns": 2,
-        "claude_token": "offline",
+        "claude_token": "erkunder-proxy-offline",
+        "model_proxy_url": "http://proxy.invalid/model",
         "prompt": "Rechne",
     }
     result = sdk.ResultMessage(
@@ -153,7 +154,7 @@ def test_guarded_sdk_round_and_exact_parent_reason(monkeypatch, tmp_path):
     assert state["sent"] == 1
     reason = kind.failure_reason(error.value)
     assert child_failure_reason(json.dumps({"fehler": reason}).encode()) == reason
-    assert "Read abgewiesen" in reason
+    assert "reine Textkopie" in reason
 
 
 def test_tool_result_unknown_and_image_block_stop():
@@ -168,35 +169,61 @@ def test_tool_result_unknown_and_image_block_stop():
 
 def test_policy_reason_is_accepted_by_status_schema():
     from src.erkunder.models import Schritt
+
     reason = "image_tool_access_refused: Read abgewiesen: PDF-Signatur"
     step = Schritt(
-        name="erkunder-1", versuch=1, status="abbruch", abbruch_grund=reason,
-        dauer_s=0, zuege=0,
+        name="erkunder-1",
+        versuch=1,
+        status="abbruch",
+        abbruch_grund=reason,
+        dauer_s=0,
+        zuege=0,
         tokens={"input": 0, "output": 0, "cache_read": 0, "cache_creation": 0},
-        ram_spitze_mb=0, worker="offline",
+        ram_spitze_mb=0,
+        worker="offline",
     )
     assert step.model_dump()["abbruch_grund"] == reason
 
 
 def test_tool_result_may_not_smuggle_another_tool_call():
     with pytest.raises(bp.ImageEgressRefused):
-        bp.guard_provider_payload("anthropic", {
-            "type": "tool_result", "tool_use_id": "t",
-            "content": [{"type": "tool_use", "id": "x", "name": "Read", "input": {}}],
-        })
+        bp.guard_provider_payload(
+            "anthropic",
+            {
+                "type": "tool_result",
+                "tool_use_id": "t",
+                "content": [
+                    {"type": "tool_use", "id": "x", "name": "Read", "input": {}}
+                ],
+            },
+        )
 
 
 def test_actual_response_hook_stops_unknown_payload(tmp_path):
     from src.erkunder.kind import sdk_options
-    options = sdk_options({
-        "ordner": str(tmp_path), "max_turns": 1, "claude_token": "offline",
-    })
+
+    options = sdk_options(
+        {
+            "ordner": str(tmp_path),
+            "max_turns": 1,
+            "claude_token": "erkunder-proxy-offline",
+            "model_proxy_url": "http://proxy.invalid/model",
+        }
+    )
     after = options.hooks["PostToolUse"][-1].hooks[0]
-    decision = asyncio.run(after({
-        "tool_name": "Read", "tool_response": {
-            "type": "document", "source": {"type": "file", "file_id": "file_offline"},
-        },
-    }, None, None))
+    decision = asyncio.run(
+        after(
+            {
+                "tool_name": "Read",
+                "tool_response": {
+                    "type": "document",
+                    "source": {"type": "file", "file_id": "file_offline"},
+                },
+            },
+            None,
+            None,
+        )
+    )
     assert decision["continue"] is False
     assert decision["decision"] == "block"
     assert options._image_policy_failures[0].code == "image_tool_access_refused"

@@ -38,7 +38,7 @@ from src.privacy_service.image_describer import (
     append_descriptions_to_markdown,
 )
 from src.privacy_service.image_triage import plan_image_descriptions
-from src.vision_provider import vision_available
+from src.privacy_service.model_proxy import vision_available, post_messages
 
 # Eine Meldung, drei Verwender (Pre-Flight in beiden Convert-Endpoints +
 # Startup-Log): describe_images ist eine Zusage, keine Option mit Fallback.
@@ -47,8 +47,8 @@ from src.vision_provider import vision_available
 # Konvertierung starb erst NACH der Docling-Arbeit als unhandled ValueError,
 # 500 ohne Aussage, drei Kundenanlaeufe lang unerkannt.
 _VISION_KEY_MISSING_MSG = (
-    "ANTHROPIC_VISION_API_KEY ist auf dieser Privacy-Instanz nicht gesetzt oder leer — "
-    "describe_images=true kann nicht bedient werden. Host-.env pruefen (ANTHROPIC_API_KEY) "
+    "Privacy-Modellproxy ist auf dieser Instanz nicht konfiguriert — "
+    "describe_images=true kann nicht bedient werden. PRIVACY_MODEL_PROXY_URL/TOKEN pruefen "
     "und den Container neu erstellen; Konvertierung OHNE Bildbeschreibung ist davon nicht betroffen."
 )
 
@@ -717,8 +717,7 @@ async def document_convert_and_anonymize_endpoint(request: Request):
 
 # ======================== Semantic HTML Conversion ========================
 
-# Direct Anthropic API — bypasses Bridge workers to avoid rate-limit contention
-ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
+# Only the Bridge owns provider credentials; Privacy uses its internal proxy.
 HAIKU_MODEL = "claude-haiku-4-5-20251001"
 ANTHROPIC_API_URL = text_egress.ANTHROPIC_MESSAGES_URL
 
@@ -839,12 +838,12 @@ def _strip_markdown_fences(text: str) -> str:
 
 
 async def _call_ai_for_conversion(html_chunk: str, max_retries: int = 4) -> str:
-    """Call Anthropic API directly for HTML conversion (bypasses Bridge workers)."""
+    """Convert via the credential-holding Bridge boundary."""
     import asyncio
     import httpx
 
-    if not ANTHROPIC_API_KEY:
-        raise RuntimeError("ANTHROPIC_API_KEY not set — required for semantic HTML conversion")
+    if not vision_available():
+        raise RuntimeError("Privacy model proxy URL/token required")
 
     request_body = {
         "model": HAIKU_MODEL,
@@ -855,17 +854,10 @@ async def _call_ai_for_conversion(html_chunk: str, max_retries: int = 4) -> str:
         ],
     }
 
-    headers = {
-        "Content-Type": "application/json",
-        "x-api-key": ANTHROPIC_API_KEY,
-        "anthropic-version": "2023-06-01",
-    }
-
     last_error = None
     for attempt in range(max_retries):
         try:
-            async with httpx.AsyncClient(timeout=300.0) as client:
-                response = await text_egress.post(client, ANTHROPIC_API_URL, headers=headers, json=request_body)
+            response = await post_messages(request_body)
 
             if response.status_code == 200:
                 result = response.json()

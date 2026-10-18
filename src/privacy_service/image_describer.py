@@ -25,13 +25,13 @@ import asyncio
 import logging
 from typing import Dict, Tuple
 
-from src.vision_provider import get_vision_provider
-from src.model_registry import get_default_model
+from src.privacy_service.model_proxy import get_vision_provider
+from src.providers.gemini_vision import resolve_gemini_vision_model
 
 logger = logging.getLogger(__name__)
 
-# Current Claude vision model (matches VisionProvider's documented default).
-DEFAULT_VISION_MODEL = get_default_model("sonnet").id
+# Privacy images always use the Gemini-only Bridge capability.
+DEFAULT_VISION_MODEL = resolve_gemini_vision_model()
 
 _SYSTEM_PROMPT = (
     "Du beschreibst Bilder aus Fachdokumenten (Diagramme, Schemata, Grafiken, "

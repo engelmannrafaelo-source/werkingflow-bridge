@@ -2,6 +2,7 @@ import os
 import json
 import asyncio
 from src.providers import text_egress
+from src.providers.privacy_proxy import router as privacy_model_router
 import secrets
 import string
 import re
@@ -913,6 +914,8 @@ app = FastAPI(
 # Generic async-job endpoints (POST /v1/jobs, GET /v1/jobs/{id}) — additive,
 # inert unless BRIDGE_GENERIC_JOBS_ENABLED=true.
 from src.version import router as version_router
+
+app.include_router(privacy_model_router)
 
 app.include_router(version_router)
 app.include_router(jobs_router)

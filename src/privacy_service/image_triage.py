@@ -36,8 +36,8 @@ import os
 import re
 from typing import Dict, List, Optional, Tuple
 
-from src.vision_provider import get_vision_provider
-from src.model_registry import get_default_model
+from src.privacy_service.model_proxy import get_vision_provider
+from src.providers.gemini_vision import resolve_gemini_vision_model
 from src.privacy_service.document_converter import _downscale_b64_png
 
 logger = logging.getLogger("privacy-service.image-triage")
@@ -207,7 +207,7 @@ async def select_relevant_images(
         return {}
 
     batch_size = batch_size or _triage_batch_size()
-    model = model or get_default_model("haiku").id
+    model = model or resolve_gemini_vision_model()
     provider = get_vision_provider()
     system_prompt = triage_prompt or _TRIAGE_SYSTEM_PROMPT
 

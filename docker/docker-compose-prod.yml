@@ -169,6 +169,7 @@ services:
       - CLAUDE_PERMISSION_MODE=bypassPermissions
       - TAVILY_API_KEY=${TAVILY_API_KEY}
       - ANTHROPIC_VISION_API_KEY=${ANTHROPIC_API_KEY}
+      - PRIVACY_MODEL_PROXY_TOKEN=${PRIVACY_MODEL_PROXY_TOKEN:-}
       # KEIN GEMINI_VISION_API_KEY auf prod — und das ist Absicht, keine Luecke.
       # Auf der DEV-Bridge ist Gemini seit 2026-09-03 der Standard fuer die
       # Bildanalyse; auf PRODUKTION bleibt es beim bisherigen Weg. Google ist in
@@ -330,6 +331,7 @@ services:
       - CLAUDE_PERMISSION_MODE=bypassPermissions
       - TAVILY_API_KEY=${TAVILY_API_KEY}
       - ANTHROPIC_VISION_API_KEY=${ANTHROPIC_API_KEY}
+      - PRIVACY_MODEL_PROXY_TOKEN=${PRIVACY_MODEL_PROXY_TOKEN:-}
       # KEIN GEMINI_VISION_API_KEY auf prod — und das ist Absicht, keine Luecke.
       # Auf der DEV-Bridge ist Gemini seit 2026-09-03 der Standard fuer die
       # Bildanalyse; auf PRODUKTION bleibt es beim bisherigen Weg. Google ist in
@@ -492,6 +494,7 @@ services:
       - CLAUDE_PERMISSION_MODE=bypassPermissions
       - TAVILY_API_KEY=${TAVILY_API_KEY}
       - ANTHROPIC_VISION_API_KEY=${ANTHROPIC_API_KEY}
+      - PRIVACY_MODEL_PROXY_TOKEN=${PRIVACY_MODEL_PROXY_TOKEN:-}
       # KEIN GEMINI_VISION_API_KEY auf prod — und das ist Absicht, keine Luecke.
       # Auf der DEV-Bridge ist Gemini seit 2026-09-03 der Standard fuer die
       # Bildanalyse; auf PRODUKTION bleibt es beim bisherigen Weg. Google ist in
@@ -654,6 +657,7 @@ services:
       - CLAUDE_PERMISSION_MODE=bypassPermissions
       - TAVILY_API_KEY=${TAVILY_API_KEY}
       - ANTHROPIC_VISION_API_KEY=${ANTHROPIC_API_KEY}
+      - PRIVACY_MODEL_PROXY_TOKEN=${PRIVACY_MODEL_PROXY_TOKEN:-}
       # KEIN GEMINI_VISION_API_KEY auf prod — und das ist Absicht, keine Luecke.
       # Auf der DEV-Bridge ist Gemini seit 2026-09-03 der Standard fuer die
       # Bildanalyse; auf PRODUKTION bleibt es beim bisherigen Weg. Google ist in

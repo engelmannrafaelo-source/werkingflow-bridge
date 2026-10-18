@@ -28,7 +28,7 @@ def read_bytes(
         os.close(directory)
     with os.fdopen(fd, "rb") as source:
         info = os.fstat(source.fileno())
-        if not stat.S_ISREG(info.st_mode):
+        if not stat.S_ISREG(info.st_mode) or info.st_nlink > 1:
             raise ValueError("keine regulaere Datei")
         if info.st_size > max_bytes:
             raise ValueError("ergebnis zu gross")

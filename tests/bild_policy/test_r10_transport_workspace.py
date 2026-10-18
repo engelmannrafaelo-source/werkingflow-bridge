@@ -69,8 +69,14 @@ def test_real_bash_encoding_is_blocked(command, data, tmp_path):
     source = tmp_path / "original.txt"
     source.write_bytes(data)
     stdout = subprocess.check_output([*command, str(source)]).decode()
+    (tmp_path / "work").mkdir()
     options = sdk_options(
-        {"ordner": str(tmp_path / "work"), "max_turns": 1, "claude_token": "offline"}
+        {
+            "ordner": str(tmp_path / "work"),
+            "max_turns": 1,
+            "claude_token": "erkunder-proxy-offline",
+            "model_proxy_url": "http://proxy.invalid/model",
+        }
     )
     decision = asyncio.run(
         options.hooks["PostToolUse"][-1].hooks[0](
@@ -118,7 +124,8 @@ def test_privacy_conversion_never_sends_data_url(monkeypatch, quote):
                 },
             )
 
-    monkeypatch.setattr(app, "ANTHROPIC_API_KEY", "offline")
+    monkeypatch.setenv("PRIVACY_MODEL_PROXY_URL", "http://proxy.invalid/messages")
+    monkeypatch.setenv("PRIVACY_MODEL_PROXY_TOKEN", "offline")
     monkeypatch.setattr(httpx, "AsyncClient", Client)
     response = TestClient(app.app).post(
         "/convert-semantic-html",
@@ -236,7 +243,8 @@ def test_resume_refuses_old_original(tmp_path):
             {
                 "ordner": str(tmp_path / "work"),
                 "max_turns": 1,
-                "claude_token": "offline",
+                "claude_token": "erkunder-proxy-offline",
+                "model_proxy_url": "http://proxy.invalid/model",
             }
         )
 

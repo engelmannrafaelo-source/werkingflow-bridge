@@ -102,7 +102,12 @@ def test_erkunder_uses_guarded_read_and_bash(tmp_path):
     from src.erkunder.kind import sdk_options
 
     options = sdk_options(
-        {"ordner": str(tmp_path), "max_turns": 1, "claude_token": "offline"}
+        {
+            "ordner": str(tmp_path),
+            "max_turns": 1,
+            "claude_token": "erkunder-proxy-offline",
+            "model_proxy_url": "http://proxy.invalid/model",
+        }
     )
     assert {"Read", "Bash"} <= set(options.allowed_tools)
     assert set(options.hooks) >= {"PreToolUse", "PostToolUse"}

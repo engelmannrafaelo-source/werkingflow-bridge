@@ -156,6 +156,7 @@ services:
       - CLAUDE_CODE_MAX_OUTPUT_TOKENS=64000
       - CLAUDE_PERMISSION_MODE=bypassPermissions
       - ANTHROPIC_VISION_API_KEY=${ANTHROPIC_API_KEY}
+      - PRIVACY_MODEL_PROXY_TOKEN=${PRIVACY_MODEL_PROXY_TOKEN:-}
       # Gemini-Bildweg (Rafael 2026-09-03: auf DIESER Bridge der Standard fuer
       # die Bildanalyse, Modell gemini-2.5-flash). Bewusst NUR hier verdrahtet:
       # auf prod bleibt Gemini unerreichbar, weil Google kein gelisteter
@@ -355,6 +356,7 @@ services:
       - CLAUDE_CODE_MAX_OUTPUT_TOKENS=64000
       - CLAUDE_PERMISSION_MODE=bypassPermissions
       - ANTHROPIC_VISION_API_KEY=${ANTHROPIC_API_KEY}
+      - PRIVACY_MODEL_PROXY_TOKEN=${PRIVACY_MODEL_PROXY_TOKEN:-}
       # Gemini-Bildweg (Rafael 2026-09-03: auf DIESER Bridge der Standard fuer
       # die Bildanalyse, Modell gemini-2.5-flash). Bewusst NUR hier verdrahtet:
       # auf prod bleibt Gemini unerreichbar, weil Google kein gelisteter
@@ -554,6 +556,7 @@ services:
       - CLAUDE_CODE_MAX_OUTPUT_TOKENS=64000
       - CLAUDE_PERMISSION_MODE=bypassPermissions
       - ANTHROPIC_VISION_API_KEY=${ANTHROPIC_API_KEY}
+      - PRIVACY_MODEL_PROXY_TOKEN=${PRIVACY_MODEL_PROXY_TOKEN:-}
       # Gemini-Bildweg (Rafael 2026-09-03: auf DIESER Bridge der Standard fuer
       # die Bildanalyse, Modell gemini-2.5-flash). Bewusst NUR hier verdrahtet:
       # auf prod bleibt Gemini unerreichbar, weil Google kein gelisteter
@@ -753,6 +756,7 @@ services:
       - CLAUDE_CODE_MAX_OUTPUT_TOKENS=64000
       - CLAUDE_PERMISSION_MODE=bypassPermissions
       - ANTHROPIC_VISION_API_KEY=${ANTHROPIC_API_KEY}
+      - PRIVACY_MODEL_PROXY_TOKEN=${PRIVACY_MODEL_PROXY_TOKEN:-}
       # Gemini-Bildweg (Rafael 2026-09-03: auf DIESER Bridge der Standard fuer
       # die Bildanalyse, Modell gemini-2.5-flash). Bewusst NUR hier verdrahtet:
       # auf prod bleibt Gemini unerreichbar, weil Google kein gelisteter
@@ -942,16 +946,20 @@ services:
     command: ["python", "-m", "src.erkunder.platz"]
     # The protected server must be PID 1: an init would expose its environment.
     # It reaps step descendants after subprocess communication has settled.
-    user: "1101:1100"
+    user: "0:0"
     mem_limit: 3g
     memswap_limit: 3g
     pids_limit: 512
     read_only: true
     ipc: private  # IPC belongs to this place; finally removes each step's objects.
-    tmpfs: ["/tmp:size=512m"]
+    tmpfs: ["/tmp:size=512m", "/versuche:size=512m,mode=0700"]
     cap_drop: [ALL]
-    security_opt: ["no-new-privileges:true"]
+    cap_add: [SYS_ADMIN, DAC_OVERRIDE]
+    # Only the trusted supervisor mounts the private filesystem. The SDK child then
+    # runs inside its own mount/PID namespace without capabilities.
+    security_opt: ["no-new-privileges:true", "seccomp=unconfined", "apparmor=unconfined"]
     environment:
+      ERKUNDER_ATTEMPTS_DIR: /versuche
       HTTPS_PROXY: http://erkunder-ausgang:8888
       HTTP_PROXY: http://erkunder-ausgang:8888
       NO_PROXY: erkunder
@@ -973,16 +981,20 @@ services:
       start_period: 10s
     command: ["python", "-m", "src.erkunder.platz"]
     # See erkunder-platz-1: the protected server is also the orphan reaper.
-    user: "1102:1100"
+    user: "0:0"
     mem_limit: 3g
     memswap_limit: 3g
     pids_limit: 512
     read_only: true
     ipc: private  # IPC belongs to this place; finally removes each step's objects.
-    tmpfs: ["/tmp:size=512m"]
+    tmpfs: ["/tmp:size=512m", "/versuche:size=512m,mode=0700"]
     cap_drop: [ALL]
-    security_opt: ["no-new-privileges:true"]
+    cap_add: [SYS_ADMIN, DAC_OVERRIDE]
+    # Only the trusted supervisor mounts the private filesystem. The SDK child then
+    # runs inside its own mount/PID namespace without capabilities.
+    security_opt: ["no-new-privileges:true", "seccomp=unconfined", "apparmor=unconfined"]
     environment:
+      ERKUNDER_ATTEMPTS_DIR: /versuche
       HTTPS_PROXY: http://erkunder-ausgang:8888
       HTTP_PROXY: http://erkunder-ausgang:8888
       NO_PROXY: erkunder
@@ -1004,16 +1016,20 @@ services:
       start_period: 10s
     command: ["python", "-m", "src.erkunder.platz"]
     # See erkunder-platz-1: the protected server is also the orphan reaper.
-    user: "1103:1100"
+    user: "0:0"
     mem_limit: 3g
     memswap_limit: 3g
     pids_limit: 512
     read_only: true
     ipc: private  # IPC belongs to this place; finally removes each step's objects.
-    tmpfs: ["/tmp:size=512m"]
+    tmpfs: ["/tmp:size=512m", "/versuche:size=512m,mode=0700"]
     cap_drop: [ALL]
-    security_opt: ["no-new-privileges:true"]
+    cap_add: [SYS_ADMIN, DAC_OVERRIDE]
+    # Only the trusted supervisor mounts the private filesystem. The SDK child then
+    # runs inside its own mount/PID namespace without capabilities.
+    security_opt: ["no-new-privileges:true", "seccomp=unconfined", "apparmor=unconfined"]
     environment:
+      ERKUNDER_ATTEMPTS_DIR: /versuche
       HTTPS_PROXY: http://erkunder-ausgang:8888
       HTTP_PROXY: http://erkunder-ausgang:8888
       NO_PROXY: erkunder

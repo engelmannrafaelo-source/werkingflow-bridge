@@ -7,6 +7,7 @@ import json
 import logging
 import os
 import re
+import secrets
 import signal
 import sys
 import time
@@ -16,8 +17,9 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import quote_from_bytes
 
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import JSONResponse
+import httpx
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field, SecretStr
 
 from src.erkunder.aufraeumen import (
@@ -84,9 +86,12 @@ def child_failure_reason(output: bytes) -> str:
     except (TypeError, ValueError):
         return "cli_fehler: Kindprozess"
     reason = message.get("fehler") if isinstance(message, dict) else None
-    if isinstance(reason, str) and reason.startswith((
-        "image_requires_gemini: ", "image_tool_access_refused: ",
-    )):
+    if isinstance(reason, str) and reason.startswith(
+        (
+            "image_requires_gemini: ",
+            "image_tool_access_refused: ",
+        )
+    ):
         return reason
     if isinstance(reason, str) and re.fullmatch(
         r"cli_fehler: SDK-Lauf: [A-Za-z][A-Za-z0-9_]*", reason
@@ -113,6 +118,9 @@ class Platz:
         self.lock = asyncio.Lock()
         self.cancelled = False
         self.cleanup_failed = False
+        self.model_capability = ""
+        self.provider_token = ""
+        self.model_proxy_url = ""
 
     def memory(self) -> tuple[int, int]:
         current = int((self.cgroup / "memory.current").read_text())
@@ -163,42 +171,30 @@ class Platz:
         metrics: dict[str, Any] = {}
         communication = None
         self.process = None
+        fresh = None
         try:
             peak, initial_oom = self.memory()
             if self.cancelled:
                 raise RuntimeError("abgebrochen")
-            temporary = Path(body.ordner) / ".home" / "tmp"
-            temporary.mkdir(parents=True, exist_ok=True)
+            from src.erkunder.arbeitsbereich import fresh_copy, isolated_command
+
+            fresh = fresh_copy(
+                Path(body.ordner), Path(os.environ["ERKUNDER_ATTEMPTS_DIR"])
+            )
+            self.model_capability = "erkunder-proxy-" + secrets.token_urlsafe(32)
+            self.provider_token = body.claude_token.get_secret_value()
+            command = isolated_command(fresh, Path(body.ordner), self.command)
             self.process = await asyncio.create_subprocess_exec(
-                *self.command,
+                *command,
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.DEVNULL,
                 start_new_session=True,
-                env={
-                    "TMPDIR": str(temporary),
-                    **{
-                        key: value
-                        for key, value in os.environ.items()
-                        if key
-                        in {
-                            "PATH",
-                            "LANG",
-                            "LC_ALL",
-                            "PYTHONPATH",
-                            "HTTPS_PROXY",
-                            "HTTP_PROXY",
-                            "NO_PROXY",
-                            "https_proxy",
-                            "http_proxy",
-                            "no_proxy",
-                            "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC",
-                        }
-                    },
-                },
+                env={"PATH": os.environ["PATH"]},
             )
             payload = body.model_dump()
-            payload["claude_token"] = body.claude_token.get_secret_value()
+            payload["claude_token"] = self.model_capability
+            payload["model_proxy_url"] = self.model_proxy_url
             communication = asyncio.create_task(
                 self.process.communicate(json.dumps(payload).encode())
             )
@@ -237,6 +233,28 @@ class Platz:
             self.kill()
             await stop_uid_processes()
             await communication
+            from src.erkunder.dateien import read_bytes
+
+            isolated_step = fresh / body.schritt
+            for name in ("ergebnis.md", "pruefung.md", "skripte"):
+                source = isolated_step / name
+                if not source.exists() and not source.is_symlink():
+                    continue
+                candidates_out = (
+                    list(source.rglob("*")) if source.is_dir() else [source]
+                )
+                for item in candidates_out:
+                    if item.is_dir() and not item.is_symlink():
+                        continue
+                    data = read_bytes(item)
+                    target = Path(body.ordner) / item.relative_to(isolated_step)
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    # Parent is trusted step; refuse overwriting any linked result.
+                    if target.is_symlink() or (
+                        target.exists() and target.stat().st_nlink != 1
+                    ):
+                        raise ValueError("linked result")
+                    target.write_bytes(data)
             folder = Path(body.ordner)
             result = folder / (
                 "pruefung.md" if body.schritt.startswith("pruefung") else "ergebnis.md"
@@ -269,10 +287,14 @@ class Platz:
             # Exception text/tracebacks can contain the request's OAuth token.
             LOG.error(
                 "bericht_id=%s schritt=%s ausfuehrung=fehlgeschlagen fehler=%s",
-                body.bericht_id, body.schritt, type(error).__name__,
+                body.bericht_id,
+                body.schritt,
+                type(error).__name__,
             )
             reason = reason or "cli_fehler: Platz-Ausfuehrung"
         finally:
+            self.model_capability = ""
+            self.provider_token = ""
             # Fail closed even if another cancellation interrupts this finally.
             self.cleanup_failed = True
             cleanup_cancelled = False
@@ -290,6 +312,8 @@ class Platz:
                 if self.process:
                     await self.process.wait()
                 await reap_children()
+                if fresh is not None:
+                    remove_tree(fresh)
                 clear_owned_tmp()
                 clear_owned_ipc()
                 home = Path(body.ordner) / ".home"
@@ -356,8 +380,27 @@ def create_app(platz: Platz | None = None) -> FastAPI:
 
     app = FastAPI(lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None)
 
+    from src.routing.bild_policy import ImageEgressRefused
+
+    @app.exception_handler(ImageEgressRefused)
+    async def refused_image(request: Request, exc: ImageEgressRefused):
+        return JSONResponse(
+            status_code=exc.status,
+            content={"error": {"code": exc.code, "message": exc.message}},
+        )
+
     @app.middleware("http")
     async def authenticate(request, call_next):
+        if request.url.path == "/model/v1/messages":
+            supplied = request.headers.get("authorization", "")
+            expected = "Bearer " + service.model_capability
+            if not service.model_capability or not hmac.compare_digest(
+                supplied, expected
+            ):
+                return JSONResponse(
+                    status_code=403, content={"detail": "model capability refused"}
+                )
+            return await call_next(request)
         supplied = request.headers.get("X-Erkunder-Intern", "")
         if not internal_token or not hmac.compare_digest(internal_token, supplied):
             return JSONResponse(
@@ -369,8 +412,49 @@ def create_app(platz: Platz | None = None) -> FastAPI:
             )
         return await call_next(request)
 
+    @app.post("/model/v1/messages")
+    async def model(request: Request):
+        from src.providers import text_egress
+        from src.routing.bild_policy import guard_provider_payload
+
+        payload = await request.json()
+        # Empty app context is deliberately restricted; no client-selected app.
+        guard_provider_payload(text_egress.ANTHROPIC_MESSAGES_URL, payload)
+        headers = {
+            "authorization": "Bearer " + service.provider_token,
+            "anthropic-version": request.headers.get("anthropic-version", "2023-06-01"),
+            "content-type": "application/json",
+        }
+        if request.headers.get("anthropic-beta"):
+            headers["anthropic-beta"] = request.headers["anthropic-beta"]
+
+        async def stream():
+            async with httpx.AsyncClient(timeout=600) as client:
+                async with text_egress.stream(
+                    client,
+                    "POST",
+                    text_egress.ANTHROPIC_MESSAGES_URL,
+                    json=payload,
+                    headers=headers,
+                ) as response:
+                    response.raise_for_status()
+                    async for chunk in response.aiter_bytes():
+                        yield chunk
+
+        if payload.get("stream"):
+            return StreamingResponse(stream(), media_type="text/event-stream")
+        async with httpx.AsyncClient(timeout=600) as client:
+            response = await text_egress.post(
+                client,
+                text_egress.ANTHROPIC_MESSAGES_URL,
+                json=payload,
+                headers=headers,
+            )
+        return JSONResponse(status_code=response.status_code, content=response.json())
+
     @app.post("/schritt")
-    async def start(body: Schritt) -> dict[str, str]:
+    async def start(body: Schritt, request: Request) -> dict[str, str]:
+        service.model_proxy_url = str(request.base_url).rstrip("/") + "/model"
         return await service.start(body)
 
     @app.get("/schritt/{bericht_id}/{schritt}")
