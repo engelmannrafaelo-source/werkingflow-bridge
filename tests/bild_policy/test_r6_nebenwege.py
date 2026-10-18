@@ -1,4 +1,9 @@
-"""R6: Identitaet darf kein Schalter sein, Nebenwege laufen durch denselben Ausgang (Codex R5)."""
+"""R6: Laufzeitproben und Inventar-Lint.
+
+Das Inventar findet bekannte Schreibweisen, keine vollstaendige Ausgangsabdeckung.
+Dynamische Imports/URLs und weitere Calls in bekannten Modulen koennen unentdeckt
+bleiben. Die tragende Sperre ist der Laufzeit-Ausgang, nicht dieser Lint.
+"""
 from __future__ import annotations
 
 import ast
@@ -120,7 +125,7 @@ def test_agentenwege_sperren_bildnutzlast_im_prompt(provider, prompt):
 
 
 def test_run_completion_und_erkunder_rufen_den_text_guard():
-    assert 'guard_prompt_text("claude-cli", prompt)' in (SRC / "claude_cli.py").read_text(encoding="utf-8")
+    assert 'guard_prompt_text("claude-cli", [prompt, system_prompt, append_system_prompt])' in (SRC / "claude_cli.py").read_text(encoding="utf-8")
     assert 'guard_prompt_text("erkunder"' in (SRC / "erkunder/kind.py").read_text(encoding="utf-8")
 
 

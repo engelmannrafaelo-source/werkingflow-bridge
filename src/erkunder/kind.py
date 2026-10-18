@@ -8,8 +8,6 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from src.sdk_parser import install_resilient_parser
-
 ALLOWED_TOOLS = ["Bash", "Read", "Write", "Edit", "Glob", "Grep", "LS"]
 DISALLOWED_TOOLS = [
     "Task",
@@ -88,6 +86,10 @@ def lesezugriff(name: str, eingabe: Any, cwd: str) -> list[dict[str, str]]:
 
 
 def sdk_options(body: dict[str, Any]) -> Any:
+    from src.routing.bild_policy import guard_agent_tools
+    # This worker needs Bash/Read to do its job. Refuse instead of pretending
+    # that a text-only run had inspected/calculated the source files.
+    guard_agent_tools("erkunder", ALLOWED_TOOLS, DISALLOWED_TOOLS)
     from claude_code_sdk import ClaudeCodeOptions
 
     home = str(Path(body["ordner"]) / ".home")
@@ -113,14 +115,18 @@ def sdk_options(body: dict[str, Any]) -> Any:
 
 
 async def run(body: dict[str, Any]) -> dict[str, Any]:
+    options = sdk_options(body)  # policy before any SDK activity
     from claude_code_sdk import AssistantMessage, ResultMessage, ToolUseBlock, query
+
+    from src.sdk_parser import install_resilient_parser
 
     install_resilient_parser()
     from src.routing.bild_policy import guard_prompt_text
-    guard_prompt_text("erkunder", body["prompt"])  # Bild-Ausgang: separater Prozess, kein App-Kontext -> eingeschraenkt
+    # Separater Prozess ohne App-Kontext: eingeschraenkt.
+    guard_prompt_text("erkunder", body["prompt"])
     result = None
     zugriffe: list[dict[str, str]] = []
-    async for message in query(prompt=body["prompt"], options=sdk_options(body)):
+    async for message in query(prompt=body["prompt"], options=options):
         if isinstance(message, AssistantMessage):
             for block in message.content:
                 if isinstance(block, ToolUseBlock):
@@ -144,6 +150,9 @@ async def run(body: dict[str, Any]) -> dict[str, Any]:
 
 def failure_reason(error: Exception) -> str:
     """Return a status-safe reason without serializing SDK payloads or prompts."""
+    from src.routing.bild_policy import ImageEgressRefused
+    if isinstance(error, ImageEgressRefused):
+        return f"{error.code}: {error.message}"
     return f"cli_fehler: SDK-Lauf: {type(error).__name__}"
 
 

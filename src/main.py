@@ -3915,6 +3915,30 @@ async def _chat_completions_lauf(
         # Extract Claude-specific parameters from headers
         claude_headers = ParameterValidator.extract_claude_headers(dict(request.headers))
 
+        # Before starting SSE: a policy refusal must still be an HTTP 403.
+        _agent_options = {**request_body.to_claude_options(), **claude_headers}
+        try:
+            _bild_policy.guard_agent_tools(
+                "claude-cli",
+                _agent_options.get("allowed_tools"),
+                _agent_options.get("disallowed_tools")
+                if request_body.enable_tools
+                else TOOLS_DISABLED_DENYLIST,
+                resume=_agent_options.get("session_id")
+                or _agent_options.get("continue_session"),
+            )
+        except _bild_policy.ImageEgressRefused as refused:
+            return JSONResponse(
+                status_code=refused.status,
+                content={
+                    "error": {
+                        "message": refused.message,
+                        "code": refused.code,
+                        "type": "invalid_request_error",
+                    }
+                },
+            )
+
         # Log compatibility info
         if DEBUG_MODE or VERBOSE:
             compatibility_report = CompatibilityReporter.generate_compatibility_report(request_body)

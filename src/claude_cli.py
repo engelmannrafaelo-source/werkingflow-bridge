@@ -1870,6 +1870,10 @@ class ClaudeCodeCLI:
 
         Returns session metadata including session_id and directory path.
         """
+        from src.routing.bild_policy import guard_agent_tools, guard_prompt_text
+        guard_prompt_text("claude-native", prompt)
+        # Native slash commands need unrestricted tools.
+        guard_agent_tools("claude-native", None)
         logger.info("🔧 Using native CLI fallback for slash command execution")
 
         if not session_dir:
@@ -2011,7 +2015,12 @@ class ClaudeCodeCLI:
         # dieselbe Ausgangspruefung wie jeder Anbieter-Body. Ein Agent mit Werkzeugen kann Base64 im
         # Prompt dekodieren und als Bild lesen -> hier gilt auch Bildnutzlast im Text.
         from src.routing.bild_policy import guard_prompt_text
-        guard_prompt_text("claude-cli", prompt)
+        guard_prompt_text("claude-cli", [prompt, system_prompt, append_system_prompt])
+        from src.routing.bild_policy import guard_agent_tools
+        guard_agent_tools(
+            "claude-cli", allowed_tools, disallowed_tools,
+            mcp_servers=sdk_mcp_servers, resume=session_id or continue_session,
+        )
         _timeout = self.timeout if timeout_s is None else max(1.0, min(self.timeout, float(timeout_s)))
         _prompt_as_received = prompt
         if resume_workdir is not None:
@@ -2614,6 +2623,8 @@ class ClaudeCodeCLI:
                 _api_error_turn = None
                 try:
                     async with asyncio.timeout(_timeout):
+                        from src.routing.bild_policy import constrain_agent_options
+                        constrain_agent_options(options)
                         async for message in query(prompt=prompt_source, options=options):
                             # Skip None messages (from monkey-patched parse_message for unknown types)
                             if message is None:

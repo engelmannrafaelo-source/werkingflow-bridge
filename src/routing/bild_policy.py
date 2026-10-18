@@ -89,9 +89,25 @@ JOBS_PATH = "/v1/jobs"
 
 _WRITE_METHODS = frozenset({"POST", "PUT", "PATCH"})
 _IMAGE_BLOCK_TYPES = frozenset({"image", "image_url", "input_image", "input_image_url"})
-_MIME_KEYS = frozenset({"media_type", "mime_type", "mimetype", "content_type", "contenttype"})
-_DATA_KEYS = frozenset({"data", "bytes", "base64", "b64_json", "content", "url", "source", "file_data"})
-_IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".tif", ".tiff", ".heic", ".avif", ".svg")
+_MIME_KEYS = frozenset(
+    {"media_type", "mime_type", "mimetype", "content_type", "contenttype"}
+)
+_DATA_KEYS = frozenset(
+    {"data", "bytes", "base64", "b64_json", "content", "url", "source", "file_data"}
+)
+_IMAGE_EXTENSIONS = (
+    ".png",
+    ".jpg",
+    ".jpeg",
+    ".gif",
+    ".webp",
+    ".bmp",
+    ".tif",
+    ".tiff",
+    ".heic",
+    ".avif",
+    ".svg",
+)
 _MAX_DEPTH = 64
 _MAX_NODES = 2_000_000
 
@@ -116,6 +132,7 @@ class Violation:
 
 # --------------------------------------------------------------------- Erkennung
 
+
 def _is_raw_image(head: bytes) -> bool:
     if head.startswith(_RAW_MAGIC):
         return True
@@ -123,8 +140,8 @@ def _is_raw_image(head: bytes) -> bool:
 
 
 def _b64_image_at(text: str, start: int) -> bool:
-    """Dekodiert die ersten Bytes ab ``start`` und vergleicht mit den Bild-Signaturen."""
-    window = text[start:start + 400]
+    """Vergleicht dekodierte Bytes ab start mit Bild-Signaturen."""
+    window = text[start : start + 400]
     m = _B64_CHARS.match(window)
     if m is None:
         return False
@@ -134,7 +151,10 @@ def _b64_image_at(text: str, start: int) -> bool:
         return False
     try:
         raw = base64.b64decode(cleaned[:64], validate=False)
-    except (binascii.Error, ValueError):  # silent-ok: kein gueltiges Base64 = kein Bild-Treffer
+    except (
+        binascii.Error,
+        ValueError,
+    ):  # silent-ok: kein gueltiges Base64 = kein Bild-Treffer
         return False
     return _is_raw_image(raw)
 
@@ -171,30 +191,48 @@ def _dict_findings(node: dict[str, Any], path: str) -> list[str]:
             if mime is None or _mime_is_image(mime):
                 found.append(f"{path}: {key}")
     src = node.get("source")
-    if isinstance(src, dict) and any(_mime_is_image(src.get(k)) for k in ("media_type", "mime_type", "mimeType")):
+    # Native PDF/document blocks may be rasterized by Anthropic. Without decoding
+    # the document we cannot prove text-only content; URL/base64 PDFs are refused.
+    if typ == "document" and isinstance(src, dict):
+        if src.get("type") == "url" or (
+            src.get("type") == "base64" and src.get("media_type") != "text/plain"
+        ):
+            found.append(f"{path}: visuell auswertbarer Dokumentblock")
+    if isinstance(src, dict) and any(
+        _mime_is_image(src.get(k)) for k in ("media_type", "mime_type", "mimeType")
+    ):
         found.append(f"{path}: source mit Bild-MIME")
-    mimes = [v for k, v in node.items() if isinstance(k, str) and k.lower().replace("-", "_") in _MIME_KEYS]
+    mimes = [
+        v
+        for k, v in node.items()
+        if isinstance(k, str) and k.lower().replace("-", "_") in _MIME_KEYS
+    ]
     if any(_mime_is_image(v) for v in mimes) and any(k in _DATA_KEYS for k in node):
         found.append(f"{path}: Bild-MIME neben Datenfeld")
     return found
 
 
-def find_images(obj: Any, path: str = "body", *, structural_only: bool = False) -> list[str]:
+def find_images(
+    obj: Any, path: str = "body", *, structural_only: bool = False
+) -> list[str]:
     """Alle Bildfunde in einem JSON-Objekt (Pfad + Art). Wirft bei uebertiefer Struktur.
 
-    ``structural_only``: nur Bildbloecke im Schema eines Anbieters (image/image_url/inline_data/
-    source mit Bild-MIME). Base64 oder eine data:-URL, die nur als TEXT dasteht, zaehlt dann nicht:
-    kein Anbieter wertet einen Textstring als Bild (siehe Modul-Doku, Abschnitt AUSGANG)."""
+    structural_only: nur Anbieter-Bildbloecke, keine Textstrings mit Base64
+    oder Data-URL (siehe Modul-Doku, Abschnitt AUSGANG)."""
     funde: list[str] = []
     stack: list[tuple[Any, str, int]] = [(obj, path, 0)]
     nodes = 0
     while stack:
         node, p, depth = stack.pop()
-        if not isinstance(node, (dict, list, str, int, float, bool, type(None))) and hasattr(node, "model_dump"):
-            node = node.model_dump()  # Pydantic-ContentPart & Co.: auf dem serialisierten Body pruefen
+        if not isinstance(
+            node, (dict, list, str, int, float, bool, type(None))
+        ) and hasattr(node, "model_dump"):
+            node = node.model_dump()  # Pydantic: serialisierten Body pruefen
         nodes += 1
         if depth > _MAX_DEPTH or nodes > _MAX_NODES:
-            raise ValueError("Koerper zu tief oder zu gross verschachtelt, um ihn zu pruefen")
+            raise ValueError(
+                "Koerper zu tief oder zu gross verschachtelt, um ihn zu pruefen"
+            )
         if isinstance(node, dict):
             funde.extend(_dict_findings(node, p))
             stack.extend((v, f"{p}.{k}", depth + 1) for k, v in node.items())
@@ -508,3 +546,64 @@ def guard_prompt_text(provider: str, text: Any) -> None:
             f"Bildinhalt ({'; '.join(funde[:3])}) darf fuer diese App nicht an {provider} gehen — nur an Gemini. "
             "Aufruf nicht gesendet."
         )
+
+
+# These built-ins return text; Read (images/PDF), Bash (arbitrary programs),
+# fetch, notebooks, MCP and delegation do not have that contract.
+TEXT_ONLY_AGENT_TOOLS = frozenset({"Grep", "Glob", "Write", "Edit"})
+
+
+def guard_agent_tools(
+    provider: str,
+    allowed: Any,
+    denied: Any = None,
+    *,
+    mcp_servers: Any = None,
+    resume: Any = None,
+) -> Optional[list[str]]:
+    """Return the exact CLI tool set, or refuse a capability we cannot constrain.
+
+    None means an unrestricted app. An empty list means NO tools (CLI --tools "").
+    allowed_tools alone is a permission list, not removal of the other built-ins.
+    """
+    if not app_is_gemini_only():
+        return None
+    wanted = list(allowed or [])
+    # No explicit allow list normally means all CLI defaults. Only the existing
+    # no-tools contract (Read AND Bash denied) is safe to interpret as no tools.
+    implicit_defaults = not wanted and not {"Read", "Bash"}.issubset(set(denied or []))
+    if (
+        implicit_defaults
+        or set(wanted) - TEXT_ONLY_AGENT_TOOLS
+        or mcp_servers
+        or resume
+    ):
+        raise ImageEgressRefused(
+            f"{provider}: Werkzeugzugriff kann Bilder an Claude liefern. "
+            "Für diese App sind nur ausdrücklich gewählte Textwerkzeuge "
+            "(Grep, Glob, Write, Edit) oder ein Aufruf ohne Werkzeuge erlaubt. "
+            "Read, Bash, MCP und Sitzungsfortsetzung nicht ausgeführt.",
+            code="image_tool_access_refused",
+        )
+    return wanted
+
+
+def constrain_agent_options(options: Any) -> None:
+    """Final tool restriction immediately before SDK dispatch."""
+    exact = guard_agent_tools(
+        "claude-cli",
+        options.allowed_tools,
+        options.disallowed_tools,
+        mcp_servers=options.mcp_servers,
+        resume=getattr(options, "resume", None)
+        or getattr(options, "continue_conversation", False),
+    )
+    if exact is None:
+        return
+    options.extra_args = {
+        **(getattr(options, "extra_args", None) or {}),
+        "tools": ",".join(exact),
+        "strict-mcp-config": None,
+        "setting-sources": "",
+        "disable-slash-commands": None,
+    }
