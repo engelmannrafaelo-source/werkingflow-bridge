@@ -2671,7 +2671,12 @@ fi
 sync_principals="$(dirname "${BASH_SOURCE[0]}")/sync-principals.sh"
 if [[ -f "$sync_principals" ]]; then
     step "Phase 3.6: principal union sync"
-    if sync_out=$(DRY_RUN="$DRY_RUN" bash "$sync_principals" 2>&1); then
+    principal_sync_dry_run="$DRY_RUN"
+    if [[ "${BRIDGE_PRINCIPAL_SYNC_READ_ONLY:-0}" == "1" ]]; then
+        principal_sync_dry_run=true
+        info "BRIDGE_PRINCIPAL_SYNC_READ_ONLY=1: principal union is read-only on both hosts"
+    fi
+    if sync_out=$(DRY_RUN="$principal_sync_dry_run" bash "$sync_principals" 2>&1); then
         # Dev-only skips (principals-dev-only.txt) are a standing exception — WARN, not INFO.
         while IFS= read -r line; do
             if [[ "$line" == *"SKIPPED dev-only"* || "$line" == *"dev-only principal"*EXISTS* ]]; then warn "$line"; else info "$line"; fi
