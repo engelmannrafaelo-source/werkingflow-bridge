@@ -336,9 +336,8 @@ async def test_brutto_abo_ohne_netto_legt_kein_abo_an():
 @pytest.mark.parametrize("bezahlt,gemeldet", [("600.00", False), ("500.00", True), (None, True)])
 async def test_rechnung_gegen_zahlung(bezahlt, gemeldet):
     pool, conn = _pool_mit_conn()
-    # 1. Rechnungssumme, 2. "schon gemeldet?" (nur bei Abweichung gefragt)
-    conn.fetchval = AsyncMock(side_effect=[Decimal("600.00"), None])
-    ev = AsyncMock()
+    conn.fetchval = AsyncMock(return_value=Decimal("600.00"))   # Rechnungssumme
+    ev = AsyncMock(return_value=True)
     with patch.object(billing_service, "get_pool", return_value=pool), patch.object(
         billing_service, "log_billing_event", ev,
     ):
@@ -349,19 +348,23 @@ async def test_rechnung_gegen_zahlung(bezahlt, gemeldet):
     assert (ev.await_count == 1) == gemeldet
     if gemeldet:
         assert ev.await_args.args[0] == "payment.amount_mismatch"
+        # Einmaligkeit liegt in der Datenbank (Migration 071), nicht in einem SELECT davor
+        assert ev.await_args.kwargs["ereignis_schluessel"] == "payment.amount_mismatch:tr_a"
 
 
 @pytest.mark.asyncio
-async def test_rechnung_gegen_zahlung_meldet_je_zahlung_nur_einmal():
-    """Webhook-Wiederholung: Abweichung steht schon als Ereignis -> kein zweites."""
+async def test_rechnung_gegen_zahlung_wiederholung_nur_warnung(caplog):
+    """Ereignis schon vorhanden (ON CONFLICT -> False): kein zweiter Fehler-Alarm."""
+    import logging
     pool, conn = _pool_mit_conn()
-    conn.fetchval = AsyncMock(side_effect=[Decimal("600.00"), 1])
-    ev = AsyncMock()
+    conn.fetchval = AsyncMock(return_value=Decimal("600.00"))
+    caplog.set_level(logging.WARNING)
     with patch.object(billing_service, "get_pool", return_value=pool), patch.object(
-        billing_service, "log_billing_event", ev,
+        billing_service, "log_billing_event", AsyncMock(return_value=False),
     ):
         await billing_service._pruefe_rechnung_gegen_zahlung(
             invoice_id=str(uuid.uuid4()), user_id=str(uuid.uuid4()), payment_id="tr_a",
             paid_eur="500.00", bahn="subscription_first",
         )
-    ev.assert_not_awaited()
+    stufen = [r.levelno for r in caplog.records if "tr_a" in r.getMessage()]
+    assert stufen == [logging.WARNING]

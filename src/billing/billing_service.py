@@ -543,21 +543,12 @@ async def _nettobasis_alarm(
         )
         if inv is None or Decimal(str(inv["tax_eur"])) == 0:
             return
-        schon = await conn.fetchval(
-            "SELECT 1 FROM billing_events WHERE event_type = 'invoice.net_basis_vat_from_payment' "
-            "AND mollie_payment_id = $1 LIMIT 1", payment_id,
-        )
     abweichung = (Decimal(str(inv["subtotal_eur"])) - frueher) if frueher is not None else None
-    logger.error(
-        "[webhook] ALARM %s payment %s (net basis): invoice total = paid %s, VAT %s taken out of "
-        "the payment; net %s vs earlier net price %s (deviation %s) — invoice %s",
-        bahn, payment_id, inv["total_eur"], inv["tax_eur"], inv["subtotal_eur"], frueher,
-        abweichung, invoice_id,
-    )
-    if schon:
-        return
-    await log_billing_event(
+    # Ereignis ZUERST (ON CONFLICT, Migration 071), Alarm nur fuer den Aufruf,
+    # der es angelegt hat — parallele Webhooks melden genau einmal.
+    neu = await log_billing_event(
         "invoice.net_basis_vat_from_payment",
+        ereignis_schluessel=ereignis_schluessel("invoice.net_basis_vat_from_payment", payment_id),
         user_id=user_id,
         invoice_id=str(invoice_id),
         mollie_payment_id=payment_id,
@@ -570,6 +561,15 @@ async def _nettobasis_alarm(
             "abweichungZumFrueherenNettopreisEur": float(abweichung) if abweichung is not None else None,
         },
     )
+    if neu:
+        logger.error(
+            "[webhook] ALARM %s payment %s (net basis): invoice total = paid %s, VAT %s taken out of "
+            "the payment; net %s vs earlier net price %s (deviation %s) — invoice %s",
+            bahn, payment_id, inv["total_eur"], inv["tax_eur"], inv["subtotal_eur"], frueher,
+            abweichung, invoice_id,
+        )
+    else:
+        logger.warning("[webhook] %s payment %s: net-basis VAT alarm already reported", bahn, payment_id)
 
 
 async def _pruefe_rechnung_gegen_zahlung(
@@ -593,20 +593,9 @@ async def _pruefe_rechnung_gegen_zahlung(
         and Decimal(str(paid_eur)).quantize(_CENT) == Decimal(str(total)).quantize(_CENT)
     ):
         return
-    logger.error(
-        "[webhook] %s payment %s: paid %s != invoice total %s (invoice %s)",
-        bahn, payment_id, paid_eur, total, invoice_id,
-    )
-    # Webhook-Wiederholungen laufen hier erneut durch: das Ereignis nur einmal
-    # je Zahlung schreiben (Log-Fehler bleibt bei jedem Durchlauf).
-    async with get_pool().acquire() as conn:
-        schon = await conn.fetchval(
-            "SELECT 1 FROM billing_events WHERE event_type = 'payment.amount_mismatch' "
-            "AND mollie_payment_id = $1 LIMIT 1", payment_id,
-        )
-    if schon:
-        return
-    await log_billing_event(
+    # Webhook-Wiederholungen und parallele Webhooks laufen hier erneut durch:
+    # das Ereignis ist per Schluessel einmalig (Migration 071, ON CONFLICT).
+    neu = await log_billing_event(
         "payment.amount_mismatch",
         user_id=user_id,
         invoice_id=str(invoice_id) if invoice_id else None,
@@ -614,7 +603,15 @@ async def _pruefe_rechnung_gegen_zahlung(
         amount_eur=float(paid_eur) if paid_eur is not None else None,
         source="mollie-webhook",
         payload={"bahn": bahn, "invoiceTotalEur": float(total) if total is not None else None},
+        ereignis_schluessel=ereignis_schluessel("payment.amount_mismatch", payment_id),
     )
+    if neu:
+        logger.error(
+            "[webhook] %s payment %s: paid %s != invoice total %s (invoice %s)",
+            bahn, payment_id, paid_eur, total, invoice_id,
+        )
+    else:
+        logger.warning("[webhook] %s payment %s: amount mismatch already reported", bahn, payment_id)
 
 
 async def start_subscription_checkout(
@@ -1788,10 +1785,6 @@ async def _erstattung_melden(payment_id: str, payment: Dict[str, Any]) -> Dict[s
     werden angefasst; Alarm + einmaliges billing_event je Zahlung."""
     erstattet = float(payment.get("amount_refunded_eur") or 0)
     rueck = float(payment.get("amount_charged_back_eur") or 0)
-    logger.error(
-        "[webhook] ALARM refund/chargeback on payment %s (refunded %.2f, charged back %.2f) "
-        "— not booked automatically: %s", payment_id, erstattet, rueck, ERSTATTUNG_GESPERRT_GRUND,
-    )
     async with get_pool().acquire() as conn:
         user_id = await conn.fetchval(
             "SELECT user_id FROM pending_payments WHERE payment_id = $1", payment_id,
@@ -1802,22 +1795,24 @@ async def _erstattung_melden(payment_id: str, payment: Dict[str, Any]) -> Dict[s
                 "SELECT user_id FROM subscriptions WHERE mollie_subscription_id = $1",
                 payment.get("subscription_id"),
             )
-        schon = await conn.fetchval(
-            "SELECT 1 FROM billing_events WHERE event_type = 'payment.refund_unbooked' "
-            "AND mollie_payment_id = $1 AND payload->>'refundedEur' = $2 "
-            "AND payload->>'chargedBackEur' = $3 LIMIT 1",
-            payment_id, f"{erstattet:.2f}", f"{rueck:.2f}",
+    neu = await log_billing_event(
+        "payment.refund_unbooked",
+        user_id=str(user_id) if user_id else None,
+        mollie_payment_id=payment_id,
+        amount_eur=erstattet + rueck,
+        source="mollie-webhook",
+        payload={"refundedEur": f"{erstattet:.2f}", "chargedBackEur": f"{rueck:.2f}",
+                 "grund": ERSTATTUNG_GESPERRT_GRUND},
+        ereignis_schluessel=ereignis_schluessel(
+            "payment.refund_unbooked", payment_id, f"{erstattet:.2f}", f"{rueck:.2f}"),
+    )
+    if neu:
+        logger.error(
+            "[webhook] ALARM refund/chargeback on payment %s (refunded %.2f, charged back %.2f) "
+            "— not booked automatically: %s", payment_id, erstattet, rueck, ERSTATTUNG_GESPERRT_GRUND,
         )
-    if not schon:
-        await log_billing_event(
-            "payment.refund_unbooked",
-            user_id=str(user_id) if user_id else None,
-            mollie_payment_id=payment_id,
-            amount_eur=erstattet + rueck,
-            source="mollie-webhook",
-            payload={"refundedEur": f"{erstattet:.2f}", "chargedBackEur": f"{rueck:.2f}",
-                     "grund": ERSTATTUNG_GESPERRT_GRUND},
-        )
+    else:
+        logger.warning("[webhook] refund/chargeback on payment %s already reported", payment_id)
     return {"handled": False, "reason": "refund_not_supported", "detail": ERSTATTUNG_GESPERRT_GRUND}
 
 
@@ -2087,9 +2082,15 @@ async def log_billing_event(
     amount_eur: Optional[float] = None,
     source: str = "system",
     payload: Optional[Dict[str, Any]] = None,
-) -> None:
+    ereignis_schluessel: Optional[str] = None,
+) -> bool:
     """
     Append a row to billing_events. Append-only — never updates.
+
+    `ereignis_schluessel` (Migration 071): fachlich einmalige Ereignisse. Die
+    Zeile wird mit INSERT ... ON CONFLICT DO NOTHING geschrieben; Rueckgabe
+    True nur fuer den einen Aufruf, der sie angelegt hat — auch bei
+    parallelen Webhooks. Ohne Schluessel immer True.
 
     tenant_id falls back to the user's tenant when not given explicitly, so
     billing events stay mode-filterable even if a caller forgets it. A truly
@@ -2102,12 +2103,15 @@ async def log_billing_event(
         tenant_id = await resolve_tenant_for_user(user_id)
     pool = get_pool()
     async with pool.acquire() as conn:
-        await conn.execute(
+        neu = await conn.fetchval(
             """
             INSERT INTO billing_events
               (event_type, user_id, tenant_id, subscription_id, invoice_id,
-               mollie_payment_id, amount_eur, source, payload)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb)
+               mollie_payment_id, amount_eur, source, payload, ereignis_schluessel)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, $10)
+            ON CONFLICT (ereignis_schluessel) WHERE ereignis_schluessel IS NOT NULL
+            DO NOTHING
+            RETURNING id
             """,
             event_type,
             uuid.UUID(user_id) if user_id else None,
@@ -2118,7 +2122,16 @@ async def log_billing_event(
             amount_eur,
             source,
             _json.dumps(payload or {}),
+            ereignis_schluessel,
         )
+    return neu is not None
+
+
+def ereignis_schluessel(event_type: str, payment_id: str, *teile: str) -> str:
+    """Fachlicher Schluessel eines einmaligen Zahlungsereignisses (Migration 071)."""
+    if not payment_id:
+        raise ValueError(f"{event_type}: einmaliges Ereignis ohne payment_id")
+    return ":".join((event_type, payment_id, *teile))
 
 
 # ---------------------------------------------------------------------------
