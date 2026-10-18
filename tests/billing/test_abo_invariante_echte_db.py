@@ -497,26 +497,18 @@ async def test_tabelle_verbietet_zweites_aktives_mollie_abo(db):
         )
 
 
-async def test_tabelle_hoechstens_ein_ersatz_und_nur_auf_aktives(db):
-    uid, plan_a, plan_b, alt = await _kunde_mit_aktivem_abo(db)
-    einfuegen = """INSERT INTO subscriptions (user_id, app_id, plan_id, status, mollie_customer_id,
-                       mollie_subscription_id, mollie_first_payment_id, seats, ueberlappt_abo_id)
-                   SELECT user_id, app_id, plan_id, 'active', mollie_customer_id, $2, $3, 1, $4
-                     FROM subscriptions WHERE id=$1"""
-    a = uuid.UUID(alt)
-    k = uuid.uuid4().hex[:8]
+async def test_tabelle_hoechstens_ein_ersatz_und_nur_mit_offenem_wechsel(db):
+    uid, a, b, pid = await _paar_doppelt_aktiv(db)
     async with db.acquire() as conn:
-        await conn.execute(einfuegen, a, f"sub_e1{k}", f"tr_e1{k}", a)  # ein Ersatz: erlaubt
-        with pytest.raises(asyncpg.UniqueViolationError) as exc:
-            await conn.execute(einfuegen, a, f"sub_e2{k}", f"tr_e2{k}", a)  # zweiter Ersatz
-        assert exc.value.constraint_name == "subscriptions_hoechstens_ein_ersatz_je_konto"
+        # Zweiter Ersatz neben dem echten: abgewiesen.
+        with pytest.raises((asyncpg.UniqueViolationError, asyncpg.CheckViolationError)):
+            await conn.execute(_ERSATZ_SQL, a, "e2" + uuid.uuid4().hex, a)
         # Altes endet -> Vermerk faellt (Trigger), Ersatz ist das eine Abo.
         await conn.execute("UPDATE subscriptions SET status='cancelled' WHERE id=$1", a)
-        assert await conn.fetchval(
-            "SELECT count(*) FROM subscriptions WHERE ueberlappt_abo_id=$1", a) == 0
+        assert await conn.fetchval("SELECT ueberlappt_abo_id FROM subscriptions WHERE id=$1", b) is None
         # Vermerk auf ein nicht aktives Abo: abgewiesen.
         with pytest.raises(asyncpg.CheckViolationError):
-            await conn.execute(einfuegen, a, f"sub_e3{k}", f"tr_e3{k}", a)
+            await conn.execute(_ERSATZ_SQL, a, "e3" + uuid.uuid4().hex, a)
 
 
 async def test_tabelle_ein_offener_abschluss_je_konto(db):
@@ -532,20 +524,211 @@ async def test_tabelle_ein_offener_abschluss_je_konto(db):
 
 
 async def test_migration_070_bricht_bei_bestandsdubletten_ab(db):
+    """Bestand von vor 070 nachgestellt (Index und Trigger in der Transaktion
+    entfernt), dann 070: laut abgebrochen, nichts bereinigt."""
     uid, plan_a, plan_b, alt = await _kunde_mit_aktivem_abo(db)
     sql = MIGRATION_070.read_text()
     async with db.acquire() as conn:
         with pytest.raises(asyncpg.RaiseError, match=r"070: \d+ Konto/Konten mit mehr als einem"):
             async with conn.transaction():
                 await conn.execute("DROP INDEX subscriptions_ein_mollie_abo_je_konto")
+                await conn.execute("DROP TRIGGER abo_zz_konto_invariante ON subscriptions")
+                await conn.execute("DROP TRIGGER abo_00_subscriptions_sperre ON subscriptions")
                 await conn.execute(
                     """INSERT INTO subscriptions (user_id, app_id, plan_id, status, mollie_customer_id,
                            mollie_subscription_id, mollie_first_payment_id, seats)
-                       SELECT user_id, app_id, plan_id, 'active', mollie_customer_id, 'sub_d', 'tr_d', 1
+                       SELECT user_id, app_id, plan_id, 'active', mollie_customer_id, $2, $2, 1
                          FROM subscriptions WHERE id=$1""",
-                    uuid.UUID(alt),
+                    uuid.UUID(alt), "d" + uuid.uuid4().hex,
                 )
                 await conn.execute(sql)
-        # Rollback: Index wieder da.
+        # Rollback: Index und Trigger wieder da.
         assert await conn.fetchval(
             "SELECT 1 FROM pg_indexes WHERE indexname='subscriptions_ein_mollie_abo_je_konto'") == 1
+        assert await conn.fetchval(
+            "SELECT count(*) FROM pg_trigger WHERE tgname IN ('abo_zz_konto_invariante','abo_00_subscriptions_sperre')") == 3
+
+
+# ---------------------------------------------------------------------------
+# R3 — Invariante unabhaengig vom Codepfad (Codex-Pruefung R2, Befunde A und B)
+# ---------------------------------------------------------------------------
+
+_ERSATZ_SQL = """INSERT INTO subscriptions (user_id, app_id, plan_id, status, mollie_customer_id,
+                     mollie_subscription_id, mollie_first_payment_id, seats, ueberlappt_abo_id)
+                 SELECT user_id, app_id, plan_id, 'active', mollie_customer_id, $2, $2, 1, $3
+                   FROM subscriptions WHERE id=$1"""
+_REGULAER_SQL = """INSERT INTO subscriptions (user_id, app_id, plan_id, status, mollie_customer_id,
+                       mollie_subscription_id, mollie_first_payment_id, seats)
+                   SELECT user_id, app_id, plan_id, 'active', mollie_customer_id, $2, $2, 1
+                     FROM subscriptions WHERE id=$1"""
+
+
+async def _paar_doppelt_aktiv(db):
+    """Gueltige Ersatzbeziehung ueber den echten Weg: Wechsel bezahlt, Kuendigung
+    des alten Abos gescheitert -> A und B aktiv, B.ueberlappt_abo_id = A,
+    Abschluss doppelt_aktiv."""
+    from src.billing import billing_service
+
+    uid, plan_a, plan_b, alt = await _kunde_mit_aktivem_abo(db)
+    w = await _wechsel(uid, plan_b)
+    with patch.object(_mollie(), "cancel_subscription", AsyncMock(side_effect=RuntimeError("mollie 503"))):
+        with pytest.raises(billing_service.AboDoppeltAktiv):
+            await billing_service.handle_webhook(w["paymentId"])
+    ab = await _abschluss(db, w["paymentId"])
+    async with db.acquire() as conn:
+        assert await conn.fetchval(
+            "SELECT ueberlappt_abo_id FROM subscriptions WHERE id=$1", ab["neu_abo_id"]) == uuid.UUID(alt)
+    return uid, uuid.UUID(alt), ab["neu_abo_id"], w["paymentId"]
+
+
+async def _aktive_mollie(conn, uid):
+    return await conn.fetchval(
+        """SELECT count(*) FROM subscriptions WHERE user_id=$1 AND status='active'
+              AND mollie_subscription_id IS NOT NULL""", uid)
+
+
+@pytest.mark.parametrize("ziel,sql", [
+    ("alt", "UPDATE subscriptions SET app_id='engelmann' WHERE id=$1"),
+    ("neu", "UPDATE subscriptions SET app_id='engelmann' WHERE id=$1"),
+    ("alt", "UPDATE subscriptions SET mollie_subscription_id=NULL WHERE id=$1"),
+    ("neu", "UPDATE subscriptions SET mollie_subscription_id='anders' WHERE id=$1"),
+    ("alt", "UPDATE subscriptions SET user_id=gen_random_uuid() WHERE id=$1"),
+])
+async def test_codex_direkte_updates_an_kontofeldern_abgewiesen(db, ziel, sql):
+    """Codex R2 Befund B: direkte UPDATEs an beiden Seiten der Beziehung."""
+    uid, a, b, pid = await _paar_doppelt_aktiv(db)
+    async with db.acquire() as conn:
+        with pytest.raises(asyncpg.CheckViolationError):
+            await conn.execute(sql, a if ziel == "alt" else b)
+        zeilen = await conn.fetch(
+            "SELECT id, app_id, mollie_subscription_id, ueberlappt_abo_id FROM subscriptions WHERE id = ANY($1)",
+            [a, b])
+    assert {r["app_id"] for r in zeilen} == {"werking-report"}
+    assert all(r["mollie_subscription_id"] for r in zeilen)
+
+
+async def test_codex_ersatz_ohne_offenen_wechsel_abgewiesen(db):
+    """Ein Ersatzvermerk ohne offenen Wechsel (gewoehnliches INSERT) scheitert."""
+    uid, plan_a, plan_b, alt = await _kunde_mit_aktivem_abo(db)
+    async with db.acquire() as conn:
+        with pytest.raises(asyncpg.CheckViolationError, match="ohne offenen Wechsel"):
+            await conn.execute(_ERSATZ_SQL, uuid.UUID(alt), "x" + uuid.uuid4().hex, uuid.UUID(alt))
+        assert await _aktive_mollie(conn, uid) == 1
+
+
+async def test_codex_rennen_ersatz_insert_gegen_kuendigung_mit_lock_timeout(db):
+    """Codex R2 Befund A, wortgleich: Verbindung 1 fuegt den Ersatz ein und haelt
+    den Commit, Verbindung 2 kuendigt den Vorgaenger. Verbindung 2 kommt nicht an
+    der Kontosperre vorbei; Verbindung 1 scheitert zum Commit (kein offener Wechsel)."""
+    uid, plan_a, plan_b, alt = await _kunde_mit_aktivem_abo(db)
+    a = uuid.UUID(alt)
+    c1 = await asyncpg.connect(PG_URL)
+    c2 = await asyncpg.connect(PG_URL)
+    try:
+        tr = c1.transaction()
+        await tr.start()
+        await c1.execute(_ERSATZ_SQL, a, "race" + uuid.uuid4().hex, a)
+        await c2.execute("SET lock_timeout='500ms'")
+        with pytest.raises(asyncpg.LockNotAvailableError):
+            await c2.execute("UPDATE subscriptions SET status='cancelled' WHERE id=$1", a)
+        with pytest.raises(asyncpg.CheckViolationError, match="ohne offenen Wechsel"):
+            await tr.commit()
+        # Ein weiteres regulaeres Abo neben A: abgewiesen.
+        with pytest.raises((asyncpg.UniqueViolationError, asyncpg.CheckViolationError)):
+            await c2.execute(_REGULAER_SQL, a, "extra" + uuid.uuid4().hex)
+        assert await _aktive_mollie(c2, uid) == 1
+        assert await _status(db, alt) == "active"
+    finally:
+        await c1.close()
+        await c2.close()
+
+
+async def test_codex_rennen_ohne_timeout_kuendigung_wartet_und_loest_auf(db):
+    """Dasselbe Rennen mit gueltigem Wechsel und ohne lock_timeout: Verbindung 2
+    wartet, bis Verbindung 1 committet, und loest DANN den Vermerk auf. Danach
+    genau ein aktives Mollie-Abo, und kein zweites laesst sich einfuegen."""
+    from src.billing import billing_service
+
+    uid, plan_a, plan_b, alt = await _kunde_mit_aktivem_abo(db)
+    a = uuid.UUID(alt)
+    w = await _wechsel(uid, plan_b)
+    ab_id = (await _abschluss(db, w["paymentId"]))["id"]
+    c1 = await asyncpg.connect(PG_URL)
+    c2 = await asyncpg.connect(PG_URL)
+    try:
+        tr = c1.transaction()
+        await tr.start()
+        b = await c1.fetchval(_ERSATZ_SQL + " RETURNING id", a, "neu" + uuid.uuid4().hex, a)
+        await c1.execute(
+            "UPDATE abo_abschluesse SET neu_abo_id=$2, status='neu_aktiv' WHERE id=$1", ab_id, b)
+        kuendigung = asyncio.create_task(
+            c2.execute("UPDATE subscriptions SET status='cancelled' WHERE id=$1", a))
+        await asyncio.sleep(0.4)
+        assert not kuendigung.done(), "Kuendigung lief an der Kontosperre vorbei"
+        await tr.commit()
+        await asyncio.wait_for(kuendigung, 10)
+        assert await c2.fetchval("SELECT ueberlappt_abo_id FROM subscriptions WHERE id=$1", b) is None
+        assert await _aktive_mollie(c2, uid) == 1
+        with pytest.raises((asyncpg.UniqueViolationError, asyncpg.CheckViolationError)):
+            await c2.execute(_REGULAER_SQL, a, "extra" + uuid.uuid4().hex)
+    finally:
+        await c1.close()
+        await c2.close()
+    res = await billing_service._wechsel_abschliessen(w["paymentId"])
+    assert res["ergebnis"] == "alt_schon_beendet"
+
+
+async def test_abschluss_schliessen_loest_ersatz_in_derselben_transaktion(db):
+    uid, a, b, pid = await _paar_doppelt_aktiv(db)
+    async with db.acquire() as conn:
+        # Schliessen, waehrend beide laufen: abgewiesen (zwei regulaere Abos).
+        with pytest.raises((asyncpg.UniqueViolationError, asyncpg.CheckViolationError)):
+            await conn.execute(
+                "UPDATE abo_abschluesse SET status='abgeschlossen', ergebnis='x' WHERE payment_id=$1", pid)
+        # Loeschen des offenen Wechsels: ebenso.
+        with pytest.raises((asyncpg.UniqueViolationError, asyncpg.CheckViolationError)):
+            await conn.execute("DELETE FROM abo_abschluesse WHERE payment_id=$1", pid)
+        # Altes kuendigen UND schliessen in einer Transaktion: erlaubt, Vermerk weg.
+        async with conn.transaction():
+            await conn.execute("UPDATE subscriptions SET status='cancelled' WHERE id=$1", a)
+            await conn.execute(
+                "UPDATE abo_abschluesse SET status='abgeschlossen', ergebnis='alt_gekuendigt' WHERE payment_id=$1", pid)
+        assert await conn.fetchval("SELECT ueberlappt_abo_id FROM subscriptions WHERE id=$1", b) is None
+        assert await _aktive_mollie(conn, uid) == 1
+
+
+async def test_ersatz_bleibt_nach_schliessen_nicht_stehen(db):
+    """Ersatz gesperrt, Wechsel endet mit ersatz_nicht_aktiv: Vermerk weg, und ein
+    spaeteres Wiederaufleben des Ersatzes neben dem alten scheitert."""
+    from src.billing import billing_service
+
+    uid, a, b, pid = await _paar_doppelt_aktiv(db)
+    await billing_service._suspend_subscription_by_mollie_id(await _mollie_id(db, b), "tr_f", "failed")
+    res = await billing_service.handle_webhook(pid)
+    assert res["wechsel"]["ergebnis"] == "ersatz_nicht_aktiv"
+    async with db.acquire() as conn:
+        assert await conn.fetchval("SELECT ueberlappt_abo_id FROM subscriptions WHERE id=$1", b) is None
+        with pytest.raises((asyncpg.UniqueViolationError, asyncpg.CheckViolationError)):
+            await conn.execute("UPDATE subscriptions SET status='active' WHERE id=$1", b)
+
+
+async def test_repeatable_read_wird_abgewiesen(db):
+    uid, plan_a, plan_b, alt = await _kunde_mit_aktivem_abo(db)
+    async with db.acquire() as conn:
+        with pytest.raises(asyncpg.CheckViolationError, match="READ COMMITTED"):
+            async with conn.transaction(isolation="repeatable_read"):
+                await conn.execute("UPDATE subscriptions SET status='suspended' WHERE id=$1", uuid.UUID(alt))
+        assert await _status(db, alt) == "active"
+
+
+async def test_deferred_pruefung_greift_auch_ohne_indizes(db):
+    """Die Commit-Pruefung allein (Indizes in der Transaktion entfernt) haelt
+    die Invariante: zweites regulaeres Mollie-Abo wird abgewiesen."""
+    uid, plan_a, plan_b, alt = await _kunde_mit_aktivem_abo(db)
+    async with db.acquire() as conn:
+        with pytest.raises(asyncpg.CheckViolationError, match="Abo-Invariante verletzt"):
+            async with conn.transaction():
+                await conn.execute("DROP INDEX subscriptions_ein_mollie_abo_je_konto")
+                await conn.execute("DROP INDEX subscriptions_hoechstens_ein_ersatz_je_konto")
+                await conn.execute(_REGULAER_SQL, uuid.UUID(alt), "y" + uuid.uuid4().hex)
+        assert await _aktive_mollie(conn, uid) == 1

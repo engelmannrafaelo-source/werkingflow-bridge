@@ -133,6 +133,198 @@ CREATE TRIGGER subscriptions_ueberlappung_aufloesen
     FOR EACH ROW EXECUTE FUNCTION subscriptions_ueberlappung_aufloesen();
 
 -- ---------------------------------------------------------------------------
+-- 2b. Die Invariante unabhaengig vom Codepfad (Codex-Pruefung R2)
+-- ---------------------------------------------------------------------------
+-- Indizes und Sofort-Trigger allein reichen nicht: ein gleichzeitiges Beenden
+-- des Vorgaengers sah einen noch nicht committeten Ersatz nicht, und direkte
+-- UPDATEs an Konto- oder Mollie-Feldern pruefte niemand nach. Deshalb:
+--   (a) Kontofelder sind unveraenderlich (user_id, app_id; mollie_subscription_id
+--       sobald gesetzt) — ein Abo wechselt nie Besitzer, App oder Mollie-Abo;
+--   (b) jede Aenderung an einem Mollie-Abo oder Abschluss sperrt das Konto
+--       (pg_advisory_xact_lock, gleicher Schluessel wie der Code) — Schreiber
+--       eines Kontos laufen nacheinander, auch per Hand-SQL;
+--   (c) schliesst ein Abschluss, verliert sein Ersatz den Vermerk in DERSELBEN
+--       Transaktion;
+--   (d) zum Commit prueft ein zurueckgestellter Constraint-Trigger das ganze
+--       Konto: hoechstens ein regulaeres aktives Mollie-Abo, hoechstens ein
+--       Ersatz, und jeder Ersatz nur, solange ein offener Wechsel (neu_aktiv /
+--       doppelt_aktiv) genau dieses Paar traegt.
+-- Wegen (b) sieht die Pruefung (d) unter READ COMMITTED den committeten Stand
+-- jedes frueheren Schreibers. REPEATABLE READ wird abgewiesen: dessen
+-- Schnappschuss kann vor der Sperre liegen.
+
+CREATE OR REPLACE FUNCTION abo_konto_schluessel(p_user UUID, p_app app_id) RETURNS bigint
+LANGUAGE sql IMMUTABLE AS $$
+    -- Identisch mit billing_service._konto_sperrschluessel (hashtext des Textes).
+    SELECT hashtext('abo-konto:' || p_user::text || ':' || p_app::text)::bigint
+$$;
+
+CREATE OR REPLACE FUNCTION abo_konto_sperren(p_user UUID, p_app app_id) RETURNS void
+LANGUAGE plpgsql AS $$
+BEGIN
+    IF current_setting('transaction_isolation') = 'repeatable read' THEN
+        RAISE EXCEPTION 'Abo-/Abschlussaenderungen nur unter READ COMMITTED oder SERIALIZABLE (Konto %/%)', p_user, p_app
+            USING ERRCODE = 'check_violation';
+    END IF;
+    PERFORM pg_advisory_xact_lock(abo_konto_schluessel(p_user, p_app));
+END $$;
+
+-- (a)+(b) fuer subscriptions. Name beginnt mit "abo_00": BEFORE-Trigger laufen
+-- in Namensreihenfolge, die Sperre also vor subscriptions_ueberlappt_pruefen.
+CREATE OR REPLACE FUNCTION abo_00_subscriptions_sperre() RETURNS trigger
+LANGUAGE plpgsql AS $$
+BEGIN
+    IF TG_OP = 'UPDATE' THEN
+        IF NEW.user_id IS DISTINCT FROM OLD.user_id OR NEW.app_id IS DISTINCT FROM OLD.app_id THEN
+            RAISE EXCEPTION 'subscriptions %: user_id/app_id sind unveraenderlich', OLD.id
+                USING ERRCODE = 'check_violation';
+        END IF;
+        IF OLD.mollie_subscription_id IS NOT NULL
+           AND NEW.mollie_subscription_id IS DISTINCT FROM OLD.mollie_subscription_id THEN
+            RAISE EXCEPTION 'subscriptions %: mollie_subscription_id ist gesetzt und unveraenderlich', OLD.id
+                USING ERRCODE = 'check_violation';
+        END IF;
+    END IF;
+    IF TG_OP = 'DELETE' THEN
+        IF OLD.mollie_subscription_id IS NOT NULL OR OLD.ueberlappt_abo_id IS NOT NULL THEN
+            PERFORM abo_konto_sperren(OLD.user_id, OLD.app_id);
+        END IF;
+        RETURN OLD;
+    END IF;
+    IF NEW.mollie_subscription_id IS NOT NULL OR NEW.ueberlappt_abo_id IS NOT NULL
+       OR (TG_OP = 'UPDATE' AND OLD.ueberlappt_abo_id IS NOT NULL) THEN
+        PERFORM abo_konto_sperren(NEW.user_id, NEW.app_id);
+    END IF;
+    RETURN NEW;
+END $$;
+
+DROP TRIGGER IF EXISTS abo_00_subscriptions_sperre ON subscriptions;
+CREATE TRIGGER abo_00_subscriptions_sperre
+    BEFORE INSERT OR DELETE OR UPDATE OF user_id, app_id, status, mollie_subscription_id, ueberlappt_abo_id
+    ON subscriptions
+    FOR EACH ROW EXECUTE FUNCTION abo_00_subscriptions_sperre();
+
+-- (a)+(b) fuer abo_abschluesse.
+CREATE OR REPLACE FUNCTION abo_00_abschluesse_sperre() RETURNS trigger
+LANGUAGE plpgsql AS $$
+BEGIN
+    IF TG_OP = 'UPDATE' AND (NEW.user_id IS DISTINCT FROM OLD.user_id
+                             OR NEW.app_id IS DISTINCT FROM OLD.app_id
+                             OR NEW.alt_abo_id IS DISTINCT FROM OLD.alt_abo_id
+                             OR (OLD.neu_abo_id IS NOT NULL AND NEW.neu_abo_id IS DISTINCT FROM OLD.neu_abo_id)) THEN
+        RAISE EXCEPTION 'abo_abschluesse %: Konto, altes und (gesetztes) neues Abo sind unveraenderlich', OLD.id
+            USING ERRCODE = 'check_violation';
+    END IF;
+    IF TG_OP = 'DELETE' THEN
+        PERFORM abo_konto_sperren(OLD.user_id, OLD.app_id);
+        RETURN OLD;
+    END IF;
+    PERFORM abo_konto_sperren(NEW.user_id, NEW.app_id);
+    RETURN NEW;
+END $$;
+
+DROP TRIGGER IF EXISTS abo_00_abschluesse_sperre ON abo_abschluesse;
+CREATE TRIGGER abo_00_abschluesse_sperre
+    BEFORE INSERT OR UPDATE OR DELETE ON abo_abschluesse
+    FOR EACH ROW EXECUTE FUNCTION abo_00_abschluesse_sperre();
+
+-- (c) Abschluss verlaesst neu_aktiv/doppelt_aktiv (oder wird geloescht):
+-- Ersatzvermerk in derselben Transaktion aufloesen. Laeuft das alte Abo dann
+-- noch, scheitert das sofort am Index bzw. spaetestens zum Commit an (d).
+CREATE OR REPLACE FUNCTION abo_abschluss_ersatz_aufloesen() RETURNS trigger
+LANGUAGE plpgsql AS $$
+BEGIN
+    IF OLD.status IN ('neu_aktiv', 'doppelt_aktiv') AND OLD.neu_abo_id IS NOT NULL
+       AND (TG_OP = 'DELETE' OR NEW.status NOT IN ('neu_aktiv', 'doppelt_aktiv')) THEN
+        UPDATE subscriptions SET ueberlappt_abo_id = NULL
+         WHERE id = OLD.neu_abo_id AND ueberlappt_abo_id IS NOT NULL;
+    END IF;
+    RETURN NULL;
+END $$;
+
+DROP TRIGGER IF EXISTS abo_abschluss_ersatz_aufloesen ON abo_abschluesse;
+CREATE TRIGGER abo_abschluss_ersatz_aufloesen
+    AFTER UPDATE OF status OR DELETE ON abo_abschluesse
+    FOR EACH ROW EXECUTE FUNCTION abo_abschluss_ersatz_aufloesen();
+
+-- (d) Die Kontoinvariante, geprueft zum Commit.
+CREATE OR REPLACE FUNCTION abo_konto_pruefen(p_user UUID, p_app app_id) RETURNS void
+LANGUAGE plpgsql AS $$
+DECLARE
+    n_regulaer INTEGER;
+    n_ersatz   INTEGER;
+    r          RECORD;
+BEGIN
+    SELECT count(*) FILTER (WHERE ueberlappt_abo_id IS NULL),
+           count(*) FILTER (WHERE ueberlappt_abo_id IS NOT NULL)
+      INTO n_regulaer, n_ersatz
+      FROM subscriptions
+     WHERE user_id = p_user AND app_id = p_app
+       AND status = 'active' AND mollie_subscription_id IS NOT NULL;
+    IF n_regulaer > 1 OR n_ersatz > 1 THEN
+        RAISE EXCEPTION 'Abo-Invariante verletzt: Konto %/% hat % regulaere und % Ersatz-Mollie-Abos (erlaubt 1 + hoechstens 1 waehrend eines offenen Wechsels)',
+            p_user, p_app, n_regulaer, n_ersatz USING ERRCODE = 'check_violation';
+    END IF;
+
+    -- Ein Ersatz existiert nur, solange ein offener Wechsel genau dieses Paar
+    -- traegt, und nur neben einem aktiven, regulaeren Mollie-Abo desselben Kontos.
+    FOR r IN SELECT id, ueberlappt_abo_id FROM subscriptions
+              WHERE user_id = p_user AND app_id = p_app AND ueberlappt_abo_id IS NOT NULL LOOP
+        IF NOT EXISTS (SELECT 1 FROM abo_abschluesse ab
+                        WHERE ab.neu_abo_id = r.id AND ab.alt_abo_id = r.ueberlappt_abo_id
+                          AND ab.user_id = p_user AND ab.app_id = p_app
+                          AND ab.status IN ('neu_aktiv', 'doppelt_aktiv')) THEN
+            RAISE EXCEPTION 'Abo-Invariante verletzt: Ersatz % -> % ohne offenen Wechsel (Konto %/%)',
+                r.id, r.ueberlappt_abo_id, p_user, p_app USING ERRCODE = 'check_violation';
+        END IF;
+        IF NOT EXISTS (SELECT 1 FROM subscriptions t
+                        WHERE t.id = r.ueberlappt_abo_id AND t.user_id = p_user AND t.app_id = p_app
+                          AND t.status = 'active' AND t.mollie_subscription_id IS NOT NULL
+                          AND t.ueberlappt_abo_id IS NULL) THEN
+            RAISE EXCEPTION 'Abo-Invariante verletzt: Ersatz % zeigt auf % — kein aktives, regulaeres Mollie-Abo des Kontos %/%',
+                r.id, r.ueberlappt_abo_id, p_user, p_app USING ERRCODE = 'check_violation';
+        END IF;
+    END LOOP;
+
+    -- Offene Wechsel mit gesetztem neuen Abo: beide Abos gehoeren diesem Konto.
+    IF EXISTS (SELECT 1 FROM abo_abschluesse ab
+                 JOIN subscriptions n ON n.id = ab.neu_abo_id
+                 JOIN subscriptions a ON a.id = ab.alt_abo_id
+                WHERE ab.user_id = p_user AND ab.app_id = p_app
+                  AND ab.status IN ('neu_aktiv', 'doppelt_aktiv')
+                  AND (n.user_id <> p_user OR n.app_id <> p_app
+                       OR a.user_id <> p_user OR a.app_id <> p_app)) THEN
+        RAISE EXCEPTION 'Abo-Invariante verletzt: offener Wechsel im Konto %/% verweist auf ein fremdes Abo', p_user, p_app
+            USING ERRCODE = 'check_violation';
+    END IF;
+END $$;
+
+CREATE OR REPLACE FUNCTION abo_konto_invariante_trigger() RETURNS trigger
+LANGUAGE plpgsql AS $$
+BEGIN
+    IF TG_OP IN ('UPDATE', 'DELETE') THEN
+        PERFORM abo_konto_pruefen(OLD.user_id, OLD.app_id);
+    END IF;
+    IF TG_OP = 'INSERT' THEN
+        PERFORM abo_konto_pruefen(NEW.user_id, NEW.app_id);
+    END IF;
+    RETURN NULL;
+END $$;
+
+DROP TRIGGER IF EXISTS abo_zz_konto_invariante ON subscriptions;
+CREATE CONSTRAINT TRIGGER abo_zz_konto_invariante
+    AFTER INSERT OR DELETE OR UPDATE OF user_id, app_id, status, mollie_subscription_id, ueberlappt_abo_id
+    ON subscriptions
+    DEFERRABLE INITIALLY DEFERRED
+    FOR EACH ROW EXECUTE FUNCTION abo_konto_invariante_trigger();
+
+DROP TRIGGER IF EXISTS abo_zz_konto_invariante ON abo_abschluesse;
+CREATE CONSTRAINT TRIGGER abo_zz_konto_invariante
+    AFTER INSERT OR UPDATE OR DELETE ON abo_abschluesse
+    DEFERRABLE INITIALLY DEFERRED
+    FOR EACH ROW EXECUTE FUNCTION abo_konto_invariante_trigger();
+
+-- ---------------------------------------------------------------------------
 -- 3. Bestand pruefen, dann die Invariante als Index
 -- ---------------------------------------------------------------------------
 DO $$

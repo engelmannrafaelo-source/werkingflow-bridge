@@ -421,8 +421,24 @@ class AboDoppeltAktiv(RuntimeError):
     Webhook antwortet 500, damit auch Mollie wiederholt."""
 
 
-def _konto_sperrschluessel(user_uuid: uuid.UUID, app_id: str) -> str:
-    return f"abo-konto:{user_uuid}:{app_id}"
+# Kontosperre am ANFANG jeder Transaktion, die Abos oder Abschluesse eines
+# Kontos aendert. Der Schluessel kommt aus der Datenbank (abo_konto_schluessel,
+# Migration 070) — dieselbe Funktion nehmen die Trigger bei der ersten
+# Schreibzeile. Wer die Sperre zuerst nimmt, haelt die Reihenfolge
+# Kontosperre -> Zeilensperre ein und laeuft nicht in einen Deadlock.
+_SPERRE = "pg_advisory_xact_lock(abo_konto_schluessel(user_id, app_id))"
+
+
+async def _konto_sperren(conn: Any, user_uuid: uuid.UUID, app_id: str) -> None:
+    await conn.execute(
+        "SELECT pg_advisory_xact_lock(abo_konto_schluessel($1::uuid, $2::app_id))",
+        uuid.UUID(str(user_uuid)), app_id,
+    )
+
+
+async def _abschluss_konto_sperren(conn: Any, sql_where: str, wert: Any) -> None:
+    """Sperrt das Konto eines Abschlusses, gesucht ueber `sql_where`."""
+    await conn.execute(f"SELECT {_SPERRE} FROM abo_abschluesse WHERE {sql_where}", wert)
 
 
 async def _abschluss_reservieren(
@@ -438,10 +454,7 @@ async def _abschluss_reservieren(
     pool = get_pool()
     async with pool.acquire() as conn:
         async with conn.transaction():
-            await conn.execute(
-                "SELECT pg_advisory_xact_lock(hashtext($1))",
-                _konto_sperrschluessel(user_uuid, app_id),
-            )
+            await _konto_sperren(conn, user_uuid, app_id)
             offen = await conn.fetchrow(
                 """SELECT id, status, payment_id, angelegt_am FROM abo_abschluesse
                     WHERE user_id = $1 AND app_id = $2::app_id AND status = ANY($3::text[])
@@ -509,6 +522,7 @@ async def _abschluss_checkout_eintragen(
     pool = get_pool()
     async with pool.acquire() as conn:
         async with conn.transaction():
+            await _abschluss_konto_sperren(conn, "id = $1", abschluss_id)
             await conn.execute(
                 """
                 INSERT INTO pending_payments
@@ -537,12 +551,14 @@ async def _abschluss_abbrechen(abschluss_id: uuid.UUID, grund: str) -> None:
     try:
         pool = get_pool()
         async with pool.acquire() as conn:
-            await conn.execute(
-                """UPDATE abo_abschluesse SET status = 'abgebrochen', letzter_fehler = $2,
-                          geaendert_am = NOW()
-                    WHERE id = $1 AND status = 'reserviert'""",
-                abschluss_id, grund[:2000],
-            )
+            async with conn.transaction():
+                await _abschluss_konto_sperren(conn, "id = $1", abschluss_id)
+                await conn.execute(
+                    """UPDATE abo_abschluesse SET status = 'abgebrochen', letzter_fehler = $2,
+                              geaendert_am = NOW()
+                        WHERE id = $1 AND status = 'reserviert'""",
+                    abschluss_id, grund[:2000],
+                )
     except Exception as exc:  # noqa: BLE001 — Ursprungsfehler wird vom Aufrufer weitergeworfen
         logger.error(
             "[abo-abschluss] Reservierung %s nicht freigegeben (verfaellt nach %s): %s",
@@ -986,6 +1002,7 @@ async def _activate_subscription(
             return _serialize_subscription(bestand)
 
         async with conn.transaction():
+            await _konto_sperren(conn, user_uuid, app_id)
             ab = await _abschluss_fuer_zahlung(
                 conn, first_payment_id, user_uuid, app_id, plan_id, seats, ersetzt_abo_id,
             )
@@ -1145,6 +1162,7 @@ async def _wechsel_abschliessen(first_payment_id: str) -> Dict[str, Any]:
     erster_alarm = False
     async with pool.acquire() as conn:
         async with conn.transaction():
+            await _abschluss_konto_sperren(conn, "payment_id = $1", first_payment_id)
             ab = await conn.fetchrow(
                 "SELECT * FROM abo_abschluesse WHERE payment_id = $1 FOR UPDATE", first_payment_id,
             )
@@ -1529,6 +1547,11 @@ async def cancel_subscription(user_id: str, subscription_id: str) -> None:
 
     async with pool.acquire() as conn:
         async with conn.transaction():
+            # Kontosperre vor der Zeilensperre (Reihenfolge wie alle Abo-Schreiber, 070).
+            await conn.execute(
+                f"SELECT {_SPERRE} FROM subscriptions WHERE id = $1 AND user_id = $2",
+                sub_uuid, user_uuid,
+            )
             row = await conn.fetchrow(
                 """
                 SELECT mollie_customer_id, mollie_subscription_id, status
@@ -1756,15 +1779,20 @@ async def _suspend_subscription_by_mollie_id(
     """
     pool = get_pool()
     async with pool.acquire() as conn:
-        row = await conn.fetchrow(
-            """
-            UPDATE subscriptions
-               SET status = 'suspended', suspended_at = NOW()
-             WHERE mollie_subscription_id = $1 AND status = 'active'
-            RETURNING id, user_id
-            """,
-            mollie_subscription_id,
-        )
+        async with conn.transaction():
+            await conn.execute(
+                f"SELECT {_SPERRE} FROM subscriptions WHERE mollie_subscription_id = $1",
+                mollie_subscription_id,
+            )
+            row = await conn.fetchrow(
+                """
+                UPDATE subscriptions
+                   SET status = 'suspended', suspended_at = NOW()
+                 WHERE mollie_subscription_id = $1 AND status = 'active'
+                RETURNING id, user_id
+                """,
+                mollie_subscription_id,
+            )
     if row:
         await log_billing_event(
             "subscription.suspended",
@@ -1931,12 +1959,14 @@ async def handle_webhook(payment_id: str) -> Dict[str, Any]:
             # Abo-Erstzahlung gescheitert: Abschluss-Platz des Kontos freigeben.
             pool = get_pool()
             async with pool.acquire() as conn:
-                await conn.execute(
-                    """UPDATE abo_abschluesse SET status = 'abgebrochen', geaendert_am = NOW(),
-                              letzter_fehler = $2
-                        WHERE payment_id = $1 AND status IN ('reserviert', 'offen')""",
-                    payment_id, f"Erstzahlung {status}",
-                )
+                async with conn.transaction():
+                    await _abschluss_konto_sperren(conn, "payment_id = $1", payment_id)
+                    await conn.execute(
+                        """UPDATE abo_abschluesse SET status = 'abgebrochen', geaendert_am = NOW(),
+                                  letzter_fehler = $2
+                            WHERE payment_id = $1 AND status IN ('reserviert', 'offen')""",
+                        payment_id, f"Erstzahlung {status}",
+                    )
             # Recurring subscription payments are NOT in pending_payments.
             # When such a payment fails, suspend the linked subscription.
             mollie_sub_id = payment.get("subscription_id")
