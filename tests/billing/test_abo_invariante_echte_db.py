@@ -219,6 +219,29 @@ async def test_gleichzeitige_wechselanfragen_nur_eine(db):
     assert len(ok) == 1 and len(abgewiesen) == 1, erg
 
 
+async def test_wechsel_ersetzt_nur_abo_derselben_app(db):
+    """Konto = Nutzer + App: ein juengeres Mollie-Abo einer ANDEREN App wird
+    vom Wechsel nicht angefasst (bis 18.10. nahm change_subscription das
+    juengste aktive Abo irgendeiner App)."""
+    from src.billing import billing_service
+
+    uid, plan_a, plan_b, alt = await _kunde_mit_aktivem_abo(db)
+    async with db.acquire() as conn:
+        fremd = await conn.fetchval(
+            """INSERT INTO subscriptions (user_id, app_id, plan_id, status, mollie_customer_id,
+                   mollie_subscription_id, mollie_first_payment_id, seats, started_at)
+               VALUES ($1, 'engelmann', 'engelmann-custom', 'active', 'cst_f', $2, $2, 1,
+                       NOW() + interval '1 hour')
+               RETURNING id""",
+            uid, "f" + uuid.uuid4().hex,
+        )
+    w = await _wechsel(uid, plan_b)
+    assert w["replacesSubscriptionId"] == alt
+    await billing_service.handle_webhook(w["paymentId"])
+    assert await _status(db, str(fremd)) == "active"
+    assert await _status(db, alt) == "cancelled"
+
+
 async def test_erstkauf_neben_aktivem_abo_409(db):
     from src.billing import billing_service
 
@@ -493,7 +516,7 @@ async def test_migration_070_bricht_bei_bestandsdubletten_ab(db):
     uid, plan_a, plan_b, alt = await _kunde_mit_aktivem_abo(db)
     sql = MIGRATION_070.read_text()
     async with db.acquire() as conn:
-        with pytest.raises(asyncpg.RaiseError, match="070: 1 Konto"):
+        with pytest.raises(asyncpg.RaiseError, match=r"070: \d+ Konto/Konten mit mehr als einem"):
             async with conn.transaction():
                 await conn.execute("DROP INDEX subscriptions_ein_mollie_abo_je_konto")
                 await conn.execute(

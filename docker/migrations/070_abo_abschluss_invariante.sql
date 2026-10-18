@@ -142,10 +142,11 @@ BEGIN
     SELECT count(*) INTO n FROM (
         SELECT 1 FROM subscriptions
          WHERE status = 'active' AND mollie_subscription_id IS NOT NULL
+           AND ueberlappt_abo_id IS NULL      -- markierter Ersatz ist erlaubt
          GROUP BY user_id, app_id HAVING count(*) > 1
     ) d;
     IF n > 0 THEN
-        RAISE EXCEPTION '070: % Konto/Konten mit mehr als einem aktiven Mollie-Abo — erst von Hand klaeren: SELECT user_id, app_id, array_agg(id) FROM subscriptions WHERE status=''active'' AND mollie_subscription_id IS NOT NULL GROUP BY 1,2 HAVING count(*)>1', n;
+        RAISE EXCEPTION '070: % Konto/Konten mit mehr als einem aktiven Mollie-Abo — erst von Hand klaeren: SELECT user_id, app_id, array_agg(id) FROM subscriptions WHERE status=''active'' AND mollie_subscription_id IS NOT NULL AND ueberlappt_abo_id IS NULL GROUP BY 1,2 HAVING count(*)>1', n;
     END IF;
 END $$;
 
