@@ -22,8 +22,35 @@ from src.routing import bild_policy
 logger = logging.getLogger(__name__)
 
 
+#: Kopfzeilen, die genau einmal vorkommen duerfen. Starlette/FastAPI liest bei Doppelten den ERSTEN,
+#: ein dict aus der Liste behielte den LETZTEN: wer Policy und Parser verschieden liest, wird umgangen
+#: (Codex R4: doppelter Content-Type). Mehrdeutig = 400, bevor irgendetwas geparst wird.
+_SINGLETON = frozenset({
+    "content-type", "content-length", "content-encoding", "transfer-encoding",
+    "x-app-id", "x-client-id", "authorization", "x-bridge-origin",
+})
+
+
 def _headers(scope: Scope) -> dict[str, str]:
     return {k.decode("latin-1").lower(): v.decode("latin-1") for k, v in scope.get("headers", [])}
+
+
+def ambiguity(scope: Scope) -> Optional[str]:
+    """Grund, wenn der Request mehrdeutig ist; sonst None."""
+    seen: dict[str, str] = {}
+    for k, v in scope.get("headers", []):
+        name, value = k.decode("latin-1").lower(), v.decode("latin-1")
+        if name in _SINGLETON and name in seen:
+            return f"Kopfzeile {name} mehrfach"
+        seen[name] = value
+    enc = seen.get("content-encoding", "").strip().lower()
+    if enc and enc != "identity":
+        return f"Content-Encoding {enc!r} wird nicht angenommen (Koerper nicht pruefbar)"
+    if "transfer-encoding" in seen and "content-length" in seen:
+        return "Content-Length zugleich mit Transfer-Encoding"
+    if "content-length" in seen and not seen["content-length"].strip().isdigit():
+        return "Content-Length ist keine Zahl"
+    return None
 
 
 def _app_from_client_id(client_id: Optional[str]) -> Optional[str]:
@@ -74,11 +101,25 @@ class ImagePolicyMiddleware:
         if scope["type"] != "http" or scope.get("method", "").upper() not in ("POST", "PUT", "PATCH"):
             await self.app(scope, receive, send)
             return
+        reason = ambiguity(scope)
+        if reason is not None:
+            logger.warning("⛔ bild-policy: mehrdeutiger Request (%s) %s %s", reason, scope["method"], scope.get("path"))
+            start, end = _reject(bild_policy.Violation(400, "ambiguous_request", f"Mehrdeutiger Request abgewiesen: {reason}."))
+            await send(start)
+            await send(end)
+            return
         headers = _headers(scope)
         app_id = await _app_id(headers)
         if not app_id or app_id not in bild_policy.policy_apps():
             await self.app(scope, receive, send)
             return
+        token = bild_policy.CURRENT_APP.set(app_id)  # fuer die Ausgangspruefung (guard_provider_payload)
+        try:
+            await self._guarded(scope, receive, send, headers, app_id)
+        finally:
+            bild_policy.CURRENT_APP.reset(token)
+
+    async def _guarded(self, scope: Scope, receive: Receive, send: Send, headers: dict[str, str], app_id: str) -> None:
 
         limit = bild_policy.max_body_bytes()
         chunks: list[bytes] = []
@@ -90,8 +131,9 @@ class ImagePolicyMiddleware:
                 return
             chunk = message.get("body", b"")
             size += len(chunk)
-            if size <= limit + 1:
-                chunks.append(chunk)
+            if size > limit:
+                break  # frueh abweisen: ein endloser Sender haelt den Request nicht offen
+            chunks.append(chunk)
             more = message.get("more_body", False)
         body = b"".join(chunks)
 

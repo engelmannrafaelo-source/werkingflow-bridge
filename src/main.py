@@ -3374,6 +3374,27 @@ async def _chat_completions_lauf(
                 }},
             )
 
+        # BILD-AUSGANG (Rafael 07.10.2026: Energy-Bildarbeit nur Gemini; Codex R4/R5): die tragende
+        # Pruefung sitzt HIER, nach allen Pins und Tier-Entscheidungen, vor dem ersten Backend-Zweig —
+        # nicht am rohen Eingang. Dieselbe Weiche wie der Router (has_vision_content +
+        # resolve_vision_target): ein Bild einer Gemini-only-App ist nur zulaessig, wenn der Router
+        # es selbst an Gemini schickt. Letztpruefung zusaetzlich in jedem Anbieter-Serialisierer.
+        from src.routing import bild_policy as _bild_policy
+        _egress_msgs = prepare_messages_for_vision(request_body.messages)
+        try:
+            _egress_gemini, _egress_router = _bild_policy.image_route(backend_config)
+            _bild_policy.enforce_image_egress(
+                app_id=extract_attribution_context(request).get("app_id"),
+                messages=[m.model_dump() if hasattr(m, "model_dump") else m for m in request_body.messages],
+                has_vision=has_vision_content(_egress_msgs),
+                backend_is_gemini=_egress_gemini,
+                router_sends_to_gemini=_egress_router,
+            )
+        except _bild_policy.ImageEgressRefused as _egress:
+            logger.warning("⛔ bild-ausgang: %s", _egress.message)
+            return JSONResponse(status_code=_egress.status, content={"error": {
+                "message": _egress.message, "type": "invalid_request_error", "code": _egress.code}})
+
         # BEDROCK-GATE: effektiver Backend darf nur per Operator-Pin Bedrock
         # sein (deckt backend=bedrock UND Bedrock-provider_tiers ab) — jeder
         # Bedrock-Call muss einem echten User zuordenbar sein.

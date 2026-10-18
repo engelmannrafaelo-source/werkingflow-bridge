@@ -379,6 +379,8 @@ async def call_bedrock(
         body["output_config"] = request.output_config
 
     adapt_model_request(resolved_model, body)
+    from src.routing.bild_policy import guard_provider_payload
+    guard_provider_payload("bedrock", body)  # Bild-Ausgang: fertiger Anbieter-Body
 
     logger.info(f"Calling Bedrock: model={bedrock_model_id}, region={actual_region}")
 
@@ -549,6 +551,8 @@ async def stream_bedrock(
         body["output_config"] = request.output_config
 
     adapt_model_request(resolved_model, body)
+    from src.routing.bild_policy import guard_provider_payload
+    guard_provider_payload("bedrock", body)  # Bild-Ausgang: fertiger Anbieter-Body
 
     logger.info(f"Streaming from Bedrock: model={bedrock_model_id}, region={actual_region}")
 

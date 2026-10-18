@@ -86,10 +86,11 @@ def test_andere_provider_werden_abgewiesen(extra):
     assert v is not None and v.code == "image_requires_gemini"
 
 
-def test_deployment_standard_gemini_zaehlt_als_bindung(monkeypatch):
+def test_deployment_standard_bindet_am_eingang_nicht(monkeypatch):
+    """Codex R4: ein Deploymentdefault belegt weder Erkennung noch endgueltigen Anbieter."""
     monkeypatch.setenv("BRIDGE_VISION_DEFAULT_PROVIDER", "gemini")
-    assert ev(chat(BAUARTEN["image_url_block"])) is None
-    assert ev(chat(BAUARTEN["image_url_block"], provider_tier="bedrock")) is not None
+    assert ev(chat(BAUARTEN["image_url_block"])) is not None
+    assert ev(chat(BAUARTEN["image_url_block"], provider_tier="gemini-vision")) is None
 
 
 # --- Text-Fehlalarme duerfen durch -------------------------------------------------
@@ -172,6 +173,18 @@ def test_multipart_mit_bild_wird_abgewiesen(headers, payload):
 def test_multipart_pdf_geht_durch():
     body, ctype = _multipart([(['Content-Disposition: form-data; name="f"; filename="a.pdf"', "Content-Type: application/pdf"], b"%PDF-1.7 " + b"\x00" * 50)])
     assert ev(body, path="/v1/convert-pdf", ctype=ctype) is None
+
+
+def test_multipart_ohne_erkennbare_teile_ist_nicht_pruefbar():
+    v = ev(b"das ist kein multipart-koerper", ctype="multipart/form-data; boundary=missing")
+    assert v is not None and v.code == "image_policy_unverifiable"
+
+
+@pytest.mark.parametrize("ctype", ["application/pdf", "audio/wav", "video/mp4"])
+def test_behaupteter_pdf_audio_video_typ_ist_kein_freibrief(ctype):
+    assert ev(chat(BAUARTEN["image_url_block"]), ctype=ctype) is not None
+    body, _ = _multipart([(['Content-Disposition: form-data; name="m"', f"Content-Type: {ctype}"], chat(BAUARTEN["image_url_block"]))])
+    assert ev(body, path="/v1/document/convert", ctype="multipart/form-data; boundary=BOUNDARY123") is not None
 
 
 def test_multipart_ohne_boundary_ist_nicht_pruefbar():

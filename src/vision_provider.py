@@ -377,6 +377,8 @@ class VisionProvider:
             request_body["output_config"] = output_config
 
         adapt_model_request(model, request_body)
+        from src.routing.bild_policy import guard_provider_payload
+        guard_provider_payload("anthropic", request_body)  # Bild-Ausgang: fertiger Anbieter-Body
 
         # Make API request
         async with httpx.AsyncClient(timeout=timeout) as client:

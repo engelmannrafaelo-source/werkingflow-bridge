@@ -168,8 +168,12 @@ def _dict_findings(node: dict[str, Any], path: str) -> list[str]:
     return found
 
 
-def find_images(obj: Any, path: str = "body") -> list[str]:
-    """Alle Bildfunde in einem JSON-Objekt (Pfad + Art). Wirft bei uebertiefer Struktur."""
+def find_images(obj: Any, path: str = "body", *, structural_only: bool = False) -> list[str]:
+    """Alle Bildfunde in einem JSON-Objekt (Pfad + Art). Wirft bei uebertiefer Struktur.
+
+    ``structural_only``: nur Bildbloecke im Schema eines Anbieters (image/image_url/inline_data/
+    source mit Bild-MIME). Base64 oder eine data:-URL, die nur als TEXT dasteht, zaehlt dann nicht:
+    kein Anbieter wertet einen Textstring als Bild (siehe Modul-Doku, Abschnitt AUSGANG)."""
     funde: list[str] = []
     stack: list[tuple[Any, str, int]] = [(obj, path, 0)]
     nodes = 0
@@ -183,7 +187,7 @@ def find_images(obj: Any, path: str = "body") -> list[str]:
             stack.extend((v, f"{p}.{k}", depth + 1) for k, v in node.items())
         elif isinstance(node, list):
             stack.extend((v, f"{p}[{i}]", depth + 1) for i, v in enumerate(node))
-        elif isinstance(node, str):
+        elif isinstance(node, str) and not structural_only:
             hit = scan_string(node)
             if hit:
                 funde.append(f"{p}: {hit}")
@@ -226,7 +230,10 @@ def _multipart_findings(body: bytes, content_type: str) -> list[str]:
         raise ValueError("Multipart ohne boundary, nicht pruefbar")
     boundary = (m.group(1) or m.group(2)).encode("latin-1")
     funde: list[str] = []
-    for i, (headers, payload) in enumerate(_multipart_parts(body, boundary)):
+    teile = list(_multipart_parts(body, boundary))
+    if body.strip() and not teile:
+        raise ValueError("Multipart ohne erkennbare Teile bei nichtleerem Koerper")
+    for i, (headers, payload) in enumerate(teile):
         p = f"body.part[{i}]"
         disposition = headers.get("content-disposition", "")
         fname = re.search(r"filename\*?=(?:\"([^\"]*)\"|([^;]+))", disposition, re.IGNORECASE)
@@ -238,7 +245,7 @@ def _multipart_findings(body: bytes, content_type: str) -> list[str]:
             funde.append(f"{p}: Datei mit Bild-Endung ({name})")
         elif _is_raw_image(payload[:16]):
             funde.append(f"{p}: Bild-Magic-Bytes")
-        elif ptype.startswith(("application/pdf", "audio/", "video/")):
+        elif payload.startswith(b"%PDF-"):
             continue
         else:
             funde.extend(_json_or_text(payload, p))
@@ -256,8 +263,8 @@ def find_images_in_body(body: bytes, content_type: str) -> list[str]:
         return ["body: Bild-Magic-Bytes"]
     if ctype.startswith("multipart/"):
         return _multipart_findings(body, content_type)
-    if ctype in ("application/pdf",) or ctype.startswith(("audio/", "video/")):
-        return []
+    if body.startswith(b"%PDF-"):
+        return []  # ein echtes PDF; ein behaupteter PDF-/Audio-/Video-Typ ist kein Freibrief fuer beliebige Bytes
     return _json_or_text(body, "body")
 
 
@@ -286,18 +293,13 @@ def max_body_bytes() -> int:
 
 
 def is_gemini_bound(chat_body: Any) -> bool:
-    """Ist dieser Chat-Aufruf an den Gemini-Bildweg gebunden (wie ``resolve_vision_target``)?"""
+    """Am Eingang gilt NUR die ausdrueckliche Bindung ``provider_tier=gemini-vision``.
+
+    Ein Deployment-Standard bindet nicht (Codex R4): ob ein Bild wirklich an Gemini geht, entscheidet
+    erst die Weiche NACH allen Pins; das prueft ``enforce_image_egress`` am Ausgang."""
     if not isinstance(chat_body, dict):
         return False
-    tier = chat_body.get("provider_tier")
-    backend = chat_body.get("backend")
-    if tier == GEMINI_VISION_TIER:
-        return backend in (None, "", "gemini_api")
-    if tier or backend:
-        return False
-    from src.routing.vision_router import VISION_TARGET_GEMINI, default_vision_target
-
-    return default_vision_target() == VISION_TARGET_GEMINI
+    return chat_body.get("provider_tier") == GEMINI_VISION_TIER and chat_body.get("backend") in (None, "", "gemini_api")
 
 
 def _refusal(funde: list[str], where: str) -> Violation:
@@ -359,3 +361,103 @@ def _parse(body: bytes) -> Any:
         return json.loads(body)
     except (ValueError, UnicodeDecodeError):  # silent-ok: kein JSON -> nicht an Gemini gebunden
         return None
+
+
+# ----------------------------------------------------------------------------- AUSGANG
+#
+# Die TRAGENDE Pruefung (Kanzler Dev, 18.10.2026, R5): nicht der rohe Eingang, den wir anders
+# parsen koennten als FastAPI, sondern das, was wir selbst zum Anbieter schicken.
+#
+# 1. ``enforce_image_egress`` sitzt in ``chat_completions`` EINMAL nach allen Pins und Tier-
+#    Entscheidungen, vor dem ersten Backend-Zweig. Es benutzt dieselbe Weiche wie der Router
+#    (``has_vision_content`` + ``resolve_vision_target``): ein Bild einer Gemini-only-App ist nur
+#    zulaessig, wenn der Router es selbst an Gemini schickt. Bedrock-Pin, Anthropic-Direct,
+#    OpenAI-kompatibel, Claude-Vision-Schluessel: alles andere endet laut.
+# 2. ``guard_provider_payload`` ist die Letztpruefung im Serialisierer jedes Nicht-Gemini-Anbieters
+#    (Bedrock, Anthropic-Vision, OpenAI-kompatibel) auf dem fertigen Anbieter-Body, auch fuer
+#    Wege, die nicht durch ``chat_completions`` laufen.
+#
+# Base64/Data-URL, die im fertigen Anbieter-Body nur als TEXT steht, ist kein Bildtransport: bei
+# Anthropic, Bedrock, OpenAI-kompatiblen Anbietern und Gemini wird ein Bild ausschliesslich ueber
+# einen typisierten Block (image / image_url / inline_data) als Pixel gelesen; ein Textstring wird
+# tokenisiert wie jeder Text. Das Modell sieht kein Bild (eine PNG-Nutzlast ist komprimiert und
+# fuer ein Sprachmodell nicht entzifferbar) — es kostet Token. Der Eingang weist es trotzdem ab
+# (Datenminimierung, kein Roh-Bild an Anthropic), der Ausgang zaehlt es nicht als Bild.
+
+import contextvars  # noqa: E402
+
+#: Die vom Eingang aufgeloeste App des laufenden Requests (None = unbekannt).
+CURRENT_APP: "contextvars.ContextVar[Optional[str]]" = contextvars.ContextVar("bild_policy_app", default=None)
+
+
+class ImageEgressRefused(Exception):
+    """Ein Nicht-Gemini-Anbieter soll Bildinhalt einer Gemini-only-App bekommen."""
+
+    def __init__(self, message: str, status: int = 403, code: str = "image_requires_gemini") -> None:
+        super().__init__(message)
+        self.message, self.status, self.code = message, status, code
+
+
+def app_is_gemini_only(*app_ids: Optional[str]) -> bool:
+    apps = policy_apps()
+    return any(a and a in apps for a in (CURRENT_APP.get(), *app_ids))
+
+
+def structural_images(obj: Any, path: str = "payload") -> list[str]:
+    return find_images(obj, path, structural_only=True)
+
+
+def guard_provider_payload(provider: str, payload: Any) -> None:
+    """Letztpruefung im Serialisierer eines Nicht-Gemini-Anbieters (fertiger Body)."""
+    if not app_is_gemini_only():
+        return
+    funde = structural_images(payload, f"{provider}-payload")
+    if funde:
+        raise ImageEgressRefused(
+            f"Bildinhalt ({'; '.join(funde[:3])}) darf fuer diese App nicht an {provider} gehen — "
+            "nur an Gemini (provider_tier='gemini-vision'). Aufruf nicht gesendet."
+        )
+
+
+def image_route(backend_config: Any) -> tuple[bool, bool]:
+    """(backend ist Gemini, Vision-Weiche schickt ein Bild an Gemini) fuer das FINALE backend_config.
+
+    Dieselbe Funktion (``resolve_vision_target``) entscheidet im Router; ein Bedrock-Pin bleibt
+    Anthropic, ein fremder provider_tier ebenso — auch bei gesetztem Deployment-Standard."""
+    from src.models import BackendType
+    from src.routing.vision_router import VISION_TARGET_GEMINI, resolve_vision_target
+
+    backend = getattr(backend_config, "backend", None)
+    return (
+        backend == BackendType.GEMINI_API,
+        backend != BackendType.BEDROCK and resolve_vision_target(backend_config) == VISION_TARGET_GEMINI,
+    )
+
+
+def enforce_image_egress(*, app_id: Optional[str], messages: Any, has_vision: bool, backend_is_gemini: bool,
+                         router_sends_to_gemini: bool) -> None:
+    """Die zentrale Pruefung vor dem Backend-Dispatch. Wirft :class:`ImageEgressRefused`.
+
+    ``has_vision``: Ergebnis von ``has_vision_content`` (die Weiche, die das Bild erst erkennt);
+    ``router_sends_to_gemini``: ``resolve_vision_target(...) == gemini`` UND kein Bedrock-Pin.
+    """
+    if not app_is_gemini_only(app_id):
+        return
+    funde = structural_images(messages, "messages")
+    if not funde:
+        return
+    if backend_is_gemini:
+        return
+    if has_vision and router_sends_to_gemini:
+        return
+    if not has_vision:
+        raise ImageEgressRefused(
+            f"Bildinhalt ({'; '.join(funde[:3])}) liegt in einer Form vor, die die Vision-Weiche nicht "
+            "an Gemini routet (z. B. in assistant-/tool-Nachrichten). Er wird nicht an ein Claude-Modell "
+            "geschickt.", 400, "image_not_routable",
+        )
+    raise ImageEgressRefused(
+        f"Bildinhalt ({'; '.join(funde[:3])}) wuerde nach den Provider-Entscheidungen (Pin/Tier/Standard) "
+        "nicht an Gemini gehen. Nicht stillschweigend umgeleitet: provider_tier='gemini-vision' senden, "
+        "ohne Operator-Pin.",
+    )

@@ -22,6 +22,7 @@ import httpx
 
 from src.error_contract import fields
 from src.models import ChatCompletionRequest
+from src.routing.bild_policy import guard_provider_payload
 
 logger = logging.getLogger(__name__)
 
@@ -125,6 +126,7 @@ async def call_openai_compatible(
     start = time.time()
     logger.info(f"🌐 OpenAI-compatible call: {url} (model: {body['model']})")
 
+    guard_provider_payload("openai-compatible", body)  # Bild-Ausgang (ausserhalb der Wiederholungsschleife)
     last_error: Optional[Exception] = None
     async with httpx.AsyncClient(timeout=TIMEOUT) as client:
         for attempt in range(_MAX_RETRIES + 1):
@@ -250,6 +252,7 @@ async def stream_openai_compatible(
     # Once streaming has started, a mid-stream failure must surface (the client
     # has already received partial output; re-running would duplicate content
     # and double-bill tokens).
+    guard_provider_payload("openai-compatible", body)  # Bild-Ausgang (ausserhalb der Wiederholungsschleife)
     last_error: Optional[Exception] = None
     stream_started = False
     async with httpx.AsyncClient(timeout=TIMEOUT) as client:
