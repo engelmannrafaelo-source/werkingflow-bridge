@@ -259,10 +259,28 @@ class LiveMollieAdapter:
             "id": payment.id,
             "status": payment.status,
             "customer_id": getattr(payment, "customer_id", None),
-            "subscription_id": getattr(payment, "subscriptionId", None),
+            # Payment ist ein dict der API-Daten (mollie ObjectBase): der
+            # Schluessel heisst "subscriptionId". getattr(payment, "subscriptionId")
+            # lieferte bis 18.10.2026 IMMER None — Folgezahlungen wurden so nie
+            # einem Abo zugeordnet (weder Sperre bei Fehlschlag noch Rechnung).
+            "subscription_id": payment.get("subscriptionId"),
             "metadata": payment.metadata or {},
             "amount_eur": float(amount["value"]) if amount else 0.0,
+            # Erstattung/Rueckbuchung: Mollie laesst status='paid' und meldet
+            # die Betraege getrennt (handle_webhook sperrt sie laut).
+            "amount_refunded_eur": _betrag(payment.get("amountRefunded")),
+            "amount_charged_back_eur": _betrag(payment.get("amountChargedBack")),
         }
+
+
+def _betrag(feld: Any) -> float:
+    """Mollie-Betragsobjekt {'value': '12.00', 'currency': 'EUR'} -> float; fehlt -> 0."""
+    if not feld:
+        return 0.0
+    wert = feld.get("value") if isinstance(feld, dict) else getattr(feld, "value", None)
+    if wert is None:
+        raise ValueError(f"Mollie amount without value: {feld!r}")
+    return float(wert)
 
 
 # ---------------------------------------------------------------------------

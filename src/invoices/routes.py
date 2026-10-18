@@ -357,6 +357,25 @@ async def update_invoice(
     if body.status is not None and body.status not in _ALLOWED_STATUS:
         raise HTTPException(status_code=400, detail=f"Unknown status: {body.status}")
 
+    if body.status in ("cancelled", "refunded"):
+        # Storno/Erstattung einer BEZAHLTEN Rechnung ist laut gesperrt (Codex
+        # 18.10.2026, Befund 5): ein blosser Statuswechsel taeuscht eine
+        # Rueckabwicklung vor, die nicht stattfindet — keine Gutschrift, keine
+        # Rueckbuchung von Guthaben/Credits, keine Mollie-Erstattung.
+        # Unbezahlte Rechnungen (draft/issued) bleiben stornierbar.
+        from src.billing.billing_service import ERSTATTUNG_GESPERRT_GRUND
+        async with get_pool().acquire() as conn:
+            aktuell = await conn.fetchval(
+                "SELECT status FROM invoices WHERE id = $1", uuid.UUID(invoice_id),
+            )
+        if aktuell is None:
+            raise HTTPException(status_code=404, detail=f"Invoice {invoice_id} not found")
+        if aktuell in ("paid", "refunded"):
+            raise HTTPException(status_code=409, detail={
+                "error": "refund_not_supported",
+                "message": ERSTATTUNG_GESPERRT_GRUND,
+            })
+
     sets: List[str] = []
     args: List[Any] = []
 

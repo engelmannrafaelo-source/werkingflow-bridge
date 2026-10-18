@@ -535,6 +535,12 @@ async def billing_sub_checkout(
             user_id, body.planId, body.seats, body.successRedirect,
             email, name, consent=body.consent,
         )
+    except billing_service.SteuerdatenNichtErmittelbar as e:
+        # Kein Checkout mit Ersatz-Steuersatz (Codex 18.10.2026, Befund 1).
+        raise HTTPException(status_code=503, detail={
+            "error": "tax_data_unavailable",
+            "message": "Steuerdaten derzeit nicht ermittelbar — bitte spaeter erneut versuchen.",
+        }) from e
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
@@ -572,6 +578,12 @@ async def billing_project_pack_checkout(
             user_id, body.planId, body.quantity, body.successRedirect,
             email, name, consent=body.consent,
         )
+    except billing_service.SteuerdatenNichtErmittelbar as e:
+        # Kein Checkout mit Ersatz-Steuersatz (Codex 18.10.2026, Befund 1).
+        raise HTTPException(status_code=503, detail={
+            "error": "tax_data_unavailable",
+            "message": "Steuerdaten derzeit nicht ermittelbar — bitte spaeter erneut versuchen.",
+        }) from e
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
@@ -617,6 +629,12 @@ async def billing_first_purchase_pack_checkout(
             user_id, body.planId, body.quantity, body.successRedirect,
             email, name, consent=body.consent,
         )
+    except billing_service.SteuerdatenNichtErmittelbar as e:
+        # Kein Checkout mit Ersatz-Steuersatz (Codex 18.10.2026, Befund 1).
+        raise HTTPException(status_code=503, detail={
+            "error": "tax_data_unavailable",
+            "message": "Steuerdaten derzeit nicht ermittelbar — bitte spaeter erneut versuchen.",
+        }) from e
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
@@ -652,6 +670,12 @@ async def billing_topup_checkout(
             user_id, body.amountEur, body.successRedirect,
             email, name, consent=body.consent,
         )
+    except billing_service.SteuerdatenNichtErmittelbar as e:
+        # Kein Checkout mit Ersatz-Steuersatz (Codex 18.10.2026, Befund 1).
+        raise HTTPException(status_code=503, detail={
+            "error": "tax_data_unavailable",
+            "message": "Steuerdaten derzeit nicht ermittelbar — bitte spaeter erneut versuchen.",
+        }) from e
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
@@ -701,6 +725,11 @@ async def billing_price_quote(
     """
     try:
         return await billing_service.price_quote(user_id, planId, quantity)
+    except billing_service.SteuerdatenNichtErmittelbar as e:
+        raise HTTPException(status_code=503, detail={
+            "error": "tax_data_unavailable",
+            "message": "Steuerdaten derzeit nicht ermittelbar — bitte spaeter erneut versuchen.",
+        }) from e
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 

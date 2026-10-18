@@ -17,6 +17,7 @@
 --   subscriptions.amount_basis     Basis, mit der das Mollie-Abo dieses Abos
 --       angelegt wurde (Mollie bucht diesen Betrag monatlich weiter ab).
 --       Default 'net' = jedes Bestands-Abo.
+--   subscriptions.net_eur          Monatsnetto (Rechnung jeder Folgezahlung).
 --
 -- Alter Code liest keine der Spalten und schreibt ueber die Defaults den
 -- Bestand; Migration vor dem Code ist deshalb gefahrlos (Deploy-Gate 3.7).
@@ -42,10 +43,20 @@ ALTER TABLE pending_payments
     );
 
 ALTER TABLE subscriptions
-    ADD COLUMN IF NOT EXISTS amount_basis TEXT NOT NULL DEFAULT 'net';
+    ADD COLUMN IF NOT EXISTS amount_basis TEXT NOT NULL DEFAULT 'net',
+    ADD COLUMN IF NOT EXISTS net_eur NUMERIC(8,2);
 
 ALTER TABLE subscriptions
     DROP CONSTRAINT IF EXISTS subscriptions_amount_basis_check;
 ALTER TABLE subscriptions
     ADD CONSTRAINT subscriptions_amount_basis_check
     CHECK (amount_basis IN ('net', 'gross'));
+
+-- subscriptions.net_eur: Nettobetrag je Monat (Rechnung jeder Folgezahlung).
+-- Pflicht bei gross — sonst waere das Netto aus dem Bruttobetrag zu raten.
+-- NULL bei Bestands-Abos (net): deren Folgerechnung geht vom bezahlten Betrag aus.
+ALTER TABLE subscriptions
+    DROP CONSTRAINT IF EXISTS subscriptions_brutto_braucht_netto;
+ALTER TABLE subscriptions
+    ADD CONSTRAINT subscriptions_brutto_braucht_netto
+    CHECK (amount_basis = 'net' OR (net_eur IS NOT NULL AND net_eur > 0));

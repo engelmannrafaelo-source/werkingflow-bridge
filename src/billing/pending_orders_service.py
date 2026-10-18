@@ -131,7 +131,11 @@ async def _create_order_invoice(
     # Bruttoanzeige (billing_service.resolve_invoice_tax); gleiche Rundung
     # (invoice_amounts). Der Mollie-Betrag der Self-Service-Lane ist total_eur
     # DIESER Rechnung (billing_service._order_invoice_gross).
-    tax_info = await resolve_invoice_tax(user_id, log_prefix="[pending-order]")
+    # Mollie-Lane: der Rechnungsbetrag IST der Abbuchungsbetrag — strikt
+    # (kein Ersatzsatz bei Lookup-Ausfall, Codex 18.10.2026 Befund 1).
+    tax_info = await resolve_invoice_tax(
+        user_id, log_prefix="[pending-order]", strikt=(payment_method == "mollie"),
+    )
     tenant_id = tax_info["tenantId"]
     billing_address = tax_info["billingAddress"]
     tax_rate = tax_info["taxRate"]

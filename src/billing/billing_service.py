@@ -141,10 +141,37 @@ def invoice_amounts(net_eur: Any, tax_rate: float) -> Tuple[Decimal, Decimal, De
     return subtotal, tax, subtotal + tax
 
 
-async def resolve_invoice_tax(user_id: str, *, log_prefix: str = "[invoice]") -> Dict[str, Any]:
+class SteuerdatenNichtErmittelbar(RuntimeError):
+    """Adresse oder UID-Bestaetigung technisch nicht lesbar (z. B. DB-Ausfall).
+
+    Im strikten Modus (jeder Betrag, den Mollie abbucht, und jede Rechnung zu
+    einem Brutto-Abschluss) wird dann NICHT mit einem Ersatzsatz weitergerechnet:
+    ein Ausfall darf nie zu 20 % USt. fuer einen Kunden fuehren, der 0 %
+    (Reverse Charge, Drittland) zahlt. Codex-Pruefung 18.10.2026, Befund 1.
+    Routen antworten 503; der Webhook wirft, Mollie wiederholt.
+    """
+
+
+def _steuer_alarm(log_prefix: str, was: str, user_id: str, e: BaseException) -> "SteuerdatenNichtErmittelbar":
+    logger.error(
+        "%s ALARM tax data unavailable (%s) for user=%s: %s — no charge/invoice "
+        "with a substitute rate", log_prefix, was, user_id, e,
+    )
+    return SteuerdatenNichtErmittelbar(f"{was} lookup failed for user {user_id}: {e}")
+
+
+async def resolve_invoice_tax(
+    user_id: str, *, log_prefix: str = "[invoice]", strikt: bool = False,
+) -> Dict[str, Any]:
     """Rechnungsadresse und Steuersatz des Kaeufers — dieselbe Aufloesung fuer
     auto_create_invoice, die Bestell-Rechnung (pending_orders_service) und die
     Bruttoanzeige vor dem Kauf (price_quote).
+
+    `strikt=True`: ein TECHNISCHER Fehler beim Nachschlagen von Adresse oder
+    UID-Bestaetigung wirft SteuerdatenNichtErmittelbar statt mit AT-Satz
+    weiterzurechnen. Eine nachweislich unbestaetigte UID ist dagegen ein
+    Sachverhalt (Satz nach Adresse), kein Fehler. `strikt=False` ist das
+    Bestandsverhalten der Netto-Rechnungen (Rechnung wird incomplete markiert).
 
     Returns dict: tenantId, billingAddress (oder None), taxRate,
     reverseChargeNote (oder None), euB2c (bool).
@@ -178,7 +205,9 @@ async def resolve_invoice_tax(user_id: str, *, log_prefix: str = "[invoice]") ->
                     "country": (trow["billing_country"] or "").upper().strip() or None,
                     "vatId": trow["billing_vat_id"],
                 }
-    except Exception as e:  # noqa: BLE001 — silent-ok: Bestandsverhalten, Rechnung wird als incomplete markiert
+    except Exception as e:  # noqa: BLE001 — silent-ok: Bestandsverhalten (nicht strikt), Rechnung wird als incomplete markiert
+        if strikt:
+            raise _steuer_alarm(log_prefix, "billing address", user_id, e) from e
         logger.warning("%s billing address lookup failed for user=%s: %s", log_prefix, user_id, e)
 
     # Wurde die erfasste UID gegen VIES bestaetigt? Nur dann darf Reverse
@@ -192,6 +221,8 @@ async def resolve_invoice_tax(user_id: str, *, log_prefix: str = "[invoice]") ->
                     conn, tenant_id=str(tenant_id), vat_id=billing_address["vatId"],
                 )
         except Exception as e:
+            if strikt:
+                raise _steuer_alarm(log_prefix, "VIES confirmation", user_id, e) from e
             logger.warning(
                 "%s VIES confirmation lookup failed for tenant=%s: %s — "
                 "invoicing WITH VAT (safe default)", log_prefix, tenant_id, e,
@@ -229,7 +260,7 @@ async def price_quote(user_id: str, plan_id: str, quantity: int) -> Dict[str, An
     plan = require_sellable(plan_id)
     if quantity < 1:
         raise ValueError("quantity must be >= 1")
-    tax = await resolve_invoice_tax(user_id, log_prefix="[price-quote]")
+    tax = await resolve_invoice_tax(user_id, log_prefix="[price-quote]", strikt=True)
     net = Decimal(str(plan.price)) * quantity
     subtotal, tax_eur, total = invoice_amounts(net, tax["taxRate"])
     return {
@@ -404,7 +435,7 @@ async def _abschluss_betrag(user_id: str, net_eur: Any, basis: str) -> Tuple[Dec
     if basis == BASIS_NETTO:
         net, _, _ = invoice_amounts(net_eur, 0.0)  # prueft nur den Centbetrag
         return net, net
-    tax = await resolve_invoice_tax(user_id, log_prefix="[checkout]")
+    tax = await resolve_invoice_tax(user_id, log_prefix="[checkout]", strikt=True)
     net, _, gross = invoice_amounts(net_eur, tax["taxRate"])
     return net, gross
 
@@ -434,6 +465,15 @@ async def _pruefe_rechnung_gegen_zahlung(
         "[webhook] %s payment %s: paid %s != invoice total %s (invoice %s)",
         bahn, payment_id, paid_eur, total, invoice_id,
     )
+    # Webhook-Wiederholungen laufen hier erneut durch: das Ereignis nur einmal
+    # je Zahlung schreiben (Log-Fehler bleibt bei jedem Durchlauf).
+    async with get_pool().acquire() as conn:
+        schon = await conn.fetchval(
+            "SELECT 1 FROM billing_events WHERE event_type = 'payment.amount_mismatch' "
+            "AND mollie_payment_id = $1 LIMIT 1", payment_id,
+        )
+    if schon:
+        return
     await log_billing_event(
         "payment.amount_mismatch",
         user_id=user_id,
@@ -834,8 +874,44 @@ async def _activate_subscription(
     from src.budget.plans import get_plan
     app_id = get_plan(plan_id).app_id
 
-    # Idempotency probe FIRST. If we already activated this payment, return
-    # the existing row without calling Mollie a second time.
+    # Betraege VOR der Idempotenz-Probe: auch eine Wiederholung muss eine
+    # fehlende Rechnung nachziehen koennen (Codex 18.10.2026, Befund 4).
+    _pruefe_basis(betragsbasis)
+    if betragsbasis == BASIS_BRUTTO:
+        if abo_betrag_eur is None or netto_eur is None:
+            raise RuntimeError(
+                f"subscription_first {first_payment_id}: gross basis without "
+                "amount/net — no subscription created"
+            )
+        amount = float(Decimal(str(abo_betrag_eur)))
+        invoice_net = float(Decimal(str(netto_eur)))
+    else:
+        # Netto: der Mollie-Abobetrag ist der bei Checkout angelegte und bezahlte
+        # Betrag (pending_payments.amount_eur), nicht ein inzwischen geaenderter
+        # Katalogpreis. Ohne Angabe (Altaufrufer) der Katalogpreis wie bisher.
+        amount = (float(Decimal(str(abo_betrag_eur))) if abo_betrag_eur is not None
+                  else _plan_price(plan_id) * seats)
+        invoice_net = amount
+
+    async def _rechnung(sub_id: str) -> None:
+        invoice_id = await auto_create_invoice(
+            user_id=user_id,
+            amount_eur=invoice_net,
+            description=f"{plan_id} — Erste Monatsabrechnung ({seats} Sitz" + ("e" if seats > 1 else "") + ")",
+            subscription_id=sub_id,
+            mollie_payment_id=first_payment_id,
+            number_prefix=prefix_for_app(app_id),
+            strikt=betragsbasis == BASIS_BRUTTO,
+        )
+        if betragsbasis == BASIS_BRUTTO:
+            await _pruefe_rechnung_gegen_zahlung(
+                invoice_id=invoice_id, user_id=user_id, payment_id=first_payment_id,
+                paid_eur=bezahlt_eur, bahn="subscription_first",
+            )
+
+    # Idempotency probe. If we already activated this payment, return the
+    # existing row without calling Mollie a second time — but heal a missing
+    # invoice (auto_create_invoice is idempotent per mollie_payment_id).
     async with pool.acquire() as conn:
         existing = await conn.fetchrow(
             """
@@ -849,21 +925,11 @@ async def _activate_subscription(
             # Self-heal: a payment activated before the pot became mandatory
             # on this path never got one.
             await _ensure_monthly_budget_pot(conn, uuid.UUID(user_id), plan_id)
-            return _serialize_subscription(existing)
+    if existing:
+        await _rechnung(str(existing["id"]))
+        return _serialize_subscription(existing)
 
     # First-time activation. Call Mollie to create the recurring subscription.
-    _pruefe_basis(betragsbasis)
-    if betragsbasis == BASIS_BRUTTO:
-        if abo_betrag_eur is None or netto_eur is None:
-            raise RuntimeError(
-                f"subscription_first {first_payment_id}: gross basis without "
-                "amount/net — no subscription created"
-            )
-        amount = float(Decimal(str(abo_betrag_eur)))
-        invoice_net = float(Decimal(str(netto_eur)))
-    else:
-        amount = _plan_price(plan_id) * seats
-        invoice_net = amount
     mollie = get_mollie_adapter()
     sub_resp = await mollie.create_subscription(
         customer_id=customer_id,
@@ -881,15 +947,15 @@ async def _activate_subscription(
             INSERT INTO subscriptions
               (id, user_id, app_id, plan_id, status,
                mollie_customer_id, mollie_subscription_id, mollie_first_payment_id,
-               seats, started_at, amount_basis)
-            VALUES ($1, $2, $3, $4, 'active', $5, $6, $7, $8, NOW(), $9)
+               seats, started_at, amount_basis, net_eur)
+            VALUES ($1, $2, $3, $4, 'active', $5, $6, $7, $8, NOW(), $9, $10)
             ON CONFLICT (mollie_first_payment_id) DO NOTHING
             RETURNING id, user_id, app_id, plan_id, status, mollie_customer_id,
                       mollie_subscription_id, seats, started_at, cancelled_at
             """,
             sub_uuid, uuid.UUID(user_id), app_id, plan_id,
             customer_id, sub_resp["subscriptionId"], first_payment_id, seats,
-            betragsbasis,
+            betragsbasis, Decimal(str(invoice_net)),
         )
         if row:
             await _ensure_monthly_budget_pot(conn, uuid.UUID(user_id), plan_id)
@@ -902,23 +968,13 @@ async def _activate_subscription(
                 source="mollie-webhook",
                 payload={"planId": plan_id, "seats": seats},
             )
-            invoice_id = await auto_create_invoice(
-                user_id=user_id,
-                amount_eur=invoice_net,
-                description=f"{plan_id} — Erste Monatsabrechnung ({seats} Sitz" + ("e" if seats > 1 else "") + ")",
-                subscription_id=str(row["id"]),
-                mollie_payment_id=first_payment_id,
-                number_prefix=prefix_for_app(app_id),
-            )
-            if betragsbasis == BASIS_BRUTTO:
-                await _pruefe_rechnung_gegen_zahlung(
-                    invoice_id=invoice_id, user_id=user_id, payment_id=first_payment_id,
-                    paid_eur=bezahlt_eur, bahn="subscription_first",
-                )
-            return _serialize_subscription(row)
+    if row:
+        await _rechnung(str(row["id"]))
+        return _serialize_subscription(row)
 
-        # Conflict: another webhook delivery raced us between the probe
-        # and the insert. Return the row the winner wrote.
+    # Conflict: another webhook delivery raced us between the probe
+    # and the insert. Return the row the winner wrote.
+    async with pool.acquire() as conn:
         winner = await conn.fetchrow(
             """
             SELECT id, user_id, app_id, plan_id, status, mollie_customer_id,
@@ -932,7 +988,8 @@ async def _activate_subscription(
                 f"_activate_subscription: ON CONFLICT fired but no row found "
                 f"for first_payment_id={first_payment_id}"
             )
-        return _serialize_subscription(winner)
+    await _rechnung(str(winner["id"]))
+    return _serialize_subscription(winner)
 
 
 async def list_subscriptions(user_id: str) -> List[Dict[str, Any]]:
@@ -1312,7 +1369,13 @@ async def _credit_topup(
             if existing:
                 # Hole aktuellen Balance ohne nochmal zu erhoehen
                 balance = await conn.fetchval(_active_balance_sql, user_uuid)
-                return {"alreadyCredited": True, "balanceEur": float(balance or 0)}
+    if existing:
+        # Wiederholung: Gutschrift steht, eine beim ersten Durchlauf
+        # gescheiterte Rechnung wird nachgezogen (Codex 18.10.2026, Befund 4).
+        await _topup_rechnung(user_id, amount_eur, mollie_payment_id, betragsbasis, bezahlt_eur)
+        return {"alreadyCredited": True, "balanceEur": float(balance or 0)}
+    async with pool.acquire() as conn:
+        async with conn.transaction():
 
             purchase_id = uuid.uuid4()
             paid_at = await conn.fetchval(
@@ -1351,19 +1414,27 @@ async def _credit_topup(
         source="mollie-webhook",
         payload={"newBalanceEur": float(new_balance)},
     )
+    await _topup_rechnung(user_id, amount_eur, mollie_payment_id, betragsbasis, bezahlt_eur)
+    return {"alreadyCredited": False, "balanceEur": float(new_balance)}
+
+
+async def _topup_rechnung(
+    user_id: str, amount_eur: float, mollie_payment_id: str, betragsbasis: str, bezahlt_eur: Any,
+) -> None:
+    """Rechnung einer gutgeschriebenen Aufladung — idempotent je payment_id."""
     invoice_id = await auto_create_invoice(
         user_id=user_id,
         amount_eur=amount_eur,
         description=f"API-Top-Up € {amount_eur:.2f}",
         mollie_payment_id=mollie_payment_id,
         number_prefix=TOPUP_PREFIX,
+        strikt=betragsbasis == BASIS_BRUTTO,
     )
     if betragsbasis == BASIS_BRUTTO:
         await _pruefe_rechnung_gegen_zahlung(
             invoice_id=invoice_id, user_id=user_id, payment_id=mollie_payment_id,
             paid_eur=bezahlt_eur, bahn="topup",
         )
-    return {"alreadyCredited": False, "balanceEur": float(new_balance)}
 
 
 async def list_credit_purchases(user_id: str) -> List[Dict[str, Any]]:
@@ -1586,10 +1657,108 @@ async def _pruefe_bezahlten_betrag(order_id: str, payment_id: str, paid_eur: Any
     )
 
 
+ERSTATTUNG_GESPERRT_GRUND = (
+    "Erstattungen und Rueckbuchungen werden nicht automatisch verbucht: es fehlen "
+    "Gutschrift (Rechnungskorrektur), Rueckbuchung von Guthaben/Credits und die "
+    "Abo-Folge. Bis dieser Weg gebaut ist, laeuft jede Erstattung ueber die "
+    "Buchhaltung von Hand; die Bridge meldet sie laut und aendert nichts."
+)
+
+
+async def _erstattung_melden(payment_id: str, payment: Dict[str, Any]) -> Dict[str, Any]:
+    """Erstattung/Rueckbuchung an einer Mollie-Zahlung: laut gesperrt (Codex
+    18.10.2026, Befund 5). Kein stiller Teilweg — weder Status noch Guthaben
+    werden angefasst; Alarm + einmaliges billing_event je Zahlung."""
+    erstattet = float(payment.get("amount_refunded_eur") or 0)
+    rueck = float(payment.get("amount_charged_back_eur") or 0)
+    logger.error(
+        "[webhook] ALARM refund/chargeback on payment %s (refunded %.2f, charged back %.2f) "
+        "— not booked automatically: %s", payment_id, erstattet, rueck, ERSTATTUNG_GESPERRT_GRUND,
+    )
+    async with get_pool().acquire() as conn:
+        user_id = await conn.fetchval(
+            "SELECT user_id FROM pending_payments WHERE payment_id = $1", payment_id,
+        )
+        schon = await conn.fetchval(
+            "SELECT 1 FROM billing_events WHERE event_type = 'payment.refund_unbooked' "
+            "AND mollie_payment_id = $1 AND payload->>'refundedEur' = $2 "
+            "AND payload->>'chargedBackEur' = $3 LIMIT 1",
+            payment_id, f"{erstattet:.2f}", f"{rueck:.2f}",
+        )
+    if not schon:
+        await log_billing_event(
+            "payment.refund_unbooked",
+            user_id=str(user_id) if user_id else None,
+            mollie_payment_id=payment_id,
+            amount_eur=erstattet + rueck,
+            source="mollie-webhook",
+            payload={"refundedEur": f"{erstattet:.2f}", "chargedBackEur": f"{rueck:.2f}",
+                     "grund": ERSTATTUNG_GESPERRT_GRUND},
+        )
+    return {"handled": False, "reason": "refund_not_supported", "detail": ERSTATTUNG_GESPERRT_GRUND}
+
+
+async def _folgezahlung_verbuchen(payment_id: str, payment: Dict[str, Any]) -> Dict[str, Any]:
+    """Bezahlte Abo-Folgezahlung (Mollie-Subscription) -> Rechnung, idempotent
+    je payment_id (Codex 18.10.2026, Befund 2: bis dahin bekam keine
+    Folgezahlung eine Rechnung).
+
+    Basis des Abos (subscriptions.amount_basis, Migration 068):
+      gross — Rechnung vom gespeicherten Netto (subscriptions.net_eur), strikt;
+              Rechnungsbrutto muss die Zahlung treffen (sonst amount_mismatch).
+      net   — Bestand: Mollie zieht den Nettobetrag ein; Rechnung vom bezahlten
+              Betrag, USt. wie bei der Erstzahlung aufgeschlagen.
+    """
+    mollie_sub_id = payment.get("subscription_id")
+    async with get_pool().acquire() as conn:
+        sub = await conn.fetchrow(
+            """SELECT id, user_id, app_id, plan_id, seats, amount_basis, net_eur
+                 FROM subscriptions WHERE mollie_subscription_id = $1""",
+            mollie_sub_id,
+        )
+    if not sub:
+        raise RuntimeError(
+            f"recurring payment {payment_id}: no subscription for mollie id {mollie_sub_id}"
+        )
+    basis = _pruefe_basis(sub["amount_basis"])
+    user_id = str(sub["user_id"])
+    if basis == BASIS_BRUTTO:
+        if sub["net_eur"] is None:
+            raise RuntimeError(
+                f"recurring payment {payment_id}: gross subscription {sub['id']} without net_eur"
+            )
+        netto = float(sub["net_eur"])
+    else:
+        netto = float(payment.get("amount_eur") or 0)
+        if netto <= 0:
+            raise RuntimeError(f"recurring payment {payment_id}: paid amount missing")
+    seats = sub["seats"]
+    invoice_id = await auto_create_invoice(
+        user_id=user_id,
+        amount_eur=netto,
+        description=f"{sub['plan_id']} — Monatsabrechnung ({seats} Sitz" + ("e" if seats > 1 else "") + ")",
+        subscription_id=str(sub["id"]),
+        mollie_payment_id=payment_id,
+        number_prefix=prefix_for_app(sub["app_id"]),
+        strikt=basis == BASIS_BRUTTO,
+    )
+    if basis == BASIS_BRUTTO:
+        await _pruefe_rechnung_gegen_zahlung(
+            invoice_id=invoice_id, user_id=user_id, payment_id=payment_id,
+            paid_eur=payment.get("amount_eur"), bahn="subscription_recurring",
+        )
+    return {"handled": True, "type": "subscription_recurring",
+            "subscriptionId": str(sub["id"]), "invoiceId": invoice_id}
+
+
 async def handle_webhook(payment_id: str) -> Dict[str, Any]:
     mollie = get_mollie_adapter()
     payment = await mollie.get_payment(payment_id)
     status = payment.get("status")
+    # Erstattung / Rueckbuchung: Mollie laesst den Status auf 'paid' und meldet
+    # die Betraege getrennt. Laut gesperrt, VOR jeder Verbuchung.
+    if float(payment.get("amount_refunded_eur") or 0) > 0 or float(payment.get("amount_charged_back_eur") or 0) > 0:
+        return await _erstattung_melden(payment_id, payment)
     if status != "paid":
         # open / pending / authorized are non-terminal — Mollie fires the
         # webhook again once the payment settles, so there is nothing to do.
@@ -1636,6 +1805,9 @@ async def handle_webhook(payment_id: str) -> Dict[str, Any]:
             payment_id,
         )
     if not pending:
+        # Abo-Folgezahlungen stehen nie in pending_payments.
+        if payment.get("subscription_id"):
+            return await _folgezahlung_verbuchen(payment_id, payment)
         return {"handled": False, "reason": "unknown payment_id"}
 
     user_id = str(pending["user_id"])
@@ -2114,8 +2286,13 @@ async def auto_create_invoice(
     credit_purchase_id: str | None = None,
     mollie_payment_id: str | None = None,
     number_prefix: str = FALLBACK_PREFIX,
+    strikt: bool = False,
 ) -> str | None:
     """Insert one invoice row, mark it 'paid', return the id.
+
+    `strikt=True` (Brutto-Abschluesse): Steuerdaten-Ausfall wirft statt mit
+    Ersatzsatz zu rechnen (resolve_invoice_tax); der Webhook scheitert laut,
+    Mollie wiederholt, die Wiederholung zieht die Rechnung nach.
 
     Idempotent: if an invoice already exists for this mollie_payment_id, return
     the existing id without re-inserting (fixes Mollie webhook retries).
@@ -2143,7 +2320,7 @@ async def auto_create_invoice(
         if existing:
             return str(existing)
 
-    tax_info = await resolve_invoice_tax(user_id, log_prefix="[invoice]")
+    tax_info = await resolve_invoice_tax(user_id, log_prefix="[invoice]", strikt=strikt)
     tenant_id = tax_info["tenantId"]
     billing_address = tax_info["billingAddress"]
     tax_rate = tax_info["taxRate"]
