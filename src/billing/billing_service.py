@@ -141,6 +141,49 @@ def invoice_amounts(net_eur: Any, tax_rate: float) -> Tuple[Decimal, Decimal, De
     return subtotal, tax, subtotal + tax
 
 
+def invoice_amounts_from_gross(gross_eur: Any, tax_rate: float) -> Tuple[Decimal, Decimal, Decimal]:
+    """(subtotal, tax, total) einer Rechnung, deren ENDBETRAG feststeht.
+
+    Die USt. wird herausgerechnet, nicht aufgeschlagen: 50,00 bei 20 % ergibt
+    41,67 + 8,33 = 50,00. Genau eine Rundungsstelle (Netto, ROUND_HALF_UP),
+    Steuer = Brutto - Netto; der Endbetrag ist damit centgenau der Zahlbetrag.
+    """
+    total = Decimal(str(gross_eur))
+    if total < 0 or total != total.quantize(_CENT):
+        raise ValueError(f"gross amount must be a non-negative cent amount, got {gross_eur!r}")
+    subtotal = (total * Decimal("100") / (Decimal("100") + Decimal(str(tax_rate)))).quantize(
+        _CENT, rounding=ROUND_HALF_UP)
+    return subtotal, total - subtotal, total
+
+
+# Rechnung zu einer Zahlung mit Basis 'net' (Bestand: Mollie zieht den frueheren
+# Nettopreis ein). Codex R2 18.10.2026, Befund B1: bis dahin entstand eine
+# Rechnung Zahlbetrag + USt. als 'paid' (Zahlung 50, Rechnung 60) — eine als
+# bezahlt markierte Rechnung ueber dem Zahlbetrag. Regel: NIE.
+#
+# Schalter BRIDGE_NETTOBASIS_RECHNUNGSWEG, sicherer Standard und derzeit
+# einziger Wert:
+#   zahlbetrag_brutto — Rechnungsendbetrag = Zahlbetrag, USt. herausgerechnet;
+#       die Abweichung zum frueheren Nettopreis steht als Vermerk in der
+#       Rechnung und als Alarm (Log + billing_event, einmal je Zahlung).
+# Die Alternative "Preis auf brutto anheben" ist eine Vertragsaenderung mit
+# Kundeneinwilligung und NICHT gebaut (Rafael-Entscheidung, Kanzler 14:15Z).
+# Unbekannte Werte werfen — kein stilles Zurueckfallen.
+NETTOBASIS_RECHNUNGSWEGE = frozenset({"zahlbetrag_brutto"})
+NETTOBASIS_RECHNUNGSWEG_STANDARD = "zahlbetrag_brutto"
+
+
+def nettobasis_rechnungsweg() -> str:
+    import os
+    weg = os.getenv("BRIDGE_NETTOBASIS_RECHNUNGSWEG") or NETTOBASIS_RECHNUNGSWEG_STANDARD
+    if weg not in NETTOBASIS_RECHNUNGSWEGE:
+        raise RuntimeError(
+            f"BRIDGE_NETTOBASIS_RECHNUNGSWEG={weg!r} unbekannt — erlaubt: "
+            f"{sorted(NETTOBASIS_RECHNUNGSWEGE)}"
+        )
+    return weg
+
+
 class SteuerdatenNichtErmittelbar(RuntimeError):
     """Adresse oder UID-Bestaetigung technisch nicht lesbar (z. B. DB-Ausfall).
 
@@ -438,6 +481,95 @@ async def _abschluss_betrag(user_id: str, net_eur: Any, basis: str) -> Tuple[Dec
     tax = await resolve_invoice_tax(user_id, log_prefix="[checkout]", strikt=True)
     net, _, gross = invoice_amounts(net_eur, tax["taxRate"])
     return net, gross
+
+
+async def _rechnung_zur_zahlung(
+    *, basis: str, user_id: str, betrag_eur: Any, bezahlt_eur: Any, description: str,
+    mollie_payment_id: str, number_prefix: str, bahn: str,
+    subscription_id: Optional[str] = None, frueherer_nettopreis_eur: Any = None,
+) -> Optional[str]:
+    """Rechnung zu einer bezahlten Zahlung (Abo-Erst-, Abo-Folgezahlung, Top-Up).
+
+    gross: `betrag_eur` ist das Netto; USt. aufgeschlagen, Brutto == Zahlung.
+    net:   Rechnungsendbetrag = Zahlbetrag (`bezahlt_eur`, ohne Angabe
+           `betrag_eur`), USt. herausgerechnet (nettobasis_rechnungsweg).
+    Beide: Steuerdaten strikt, Rechnung gegen Zahlung abgeglichen.
+    """
+    _pruefe_basis(basis)
+    if basis == BASIS_BRUTTO:
+        invoice_id = await auto_create_invoice(
+            user_id=user_id, amount_eur=float(Decimal(str(betrag_eur))), description=description,
+            subscription_id=subscription_id, mollie_payment_id=mollie_payment_id,
+            number_prefix=number_prefix, strikt=True,
+        )
+    else:
+        weg = nettobasis_rechnungsweg()
+        endbetrag = Decimal(str(bezahlt_eur if bezahlt_eur is not None else betrag_eur)).quantize(_CENT)
+        frueher = (Decimal(str(frueherer_nettopreis_eur)).quantize(_CENT)
+                   if frueherer_nettopreis_eur is not None else None)
+        invoice_id = await auto_create_invoice(
+            user_id=user_id, amount_eur=float(endbetrag), description=description,
+            subscription_id=subscription_id, mollie_payment_id=mollie_payment_id,
+            number_prefix=number_prefix, strikt=True, betrag_ist="brutto",
+            vermerk={"nettobasis": {
+                "weg": weg, "bahn": bahn, "zahlbetragEur": float(endbetrag),
+                "fruehererNettopreisEur": float(frueher) if frueher is not None else None,
+            }},
+        )
+        await _nettobasis_alarm(
+            invoice_id=invoice_id, user_id=user_id, payment_id=mollie_payment_id,
+            bahn=bahn, frueher=frueher,
+        )
+    if bezahlt_eur is not None or basis == BASIS_BRUTTO:
+        await _pruefe_rechnung_gegen_zahlung(
+            invoice_id=invoice_id, user_id=user_id, payment_id=mollie_payment_id,
+            paid_eur=bezahlt_eur, bahn=bahn,
+        )
+    return invoice_id
+
+
+async def _nettobasis_alarm(
+    *, invoice_id: Optional[str], user_id: str, payment_id: str, bahn: str, frueher: Optional[Decimal],
+) -> None:
+    """Nettobasis: liegt das Rechnungsnetto unter dem frueheren Nettopreis
+    (USt. aus dem Zahlbetrag herausgerechnet), wird das LAUT gemeldet —
+    Log + billing_event invoice.net_basis_vat_from_payment, einmal je Zahlung."""
+    if not invoice_id:
+        return
+    async with get_pool().acquire() as conn:
+        inv = await conn.fetchrow(
+            "SELECT subtotal_eur, tax_eur, total_eur FROM invoices WHERE id = $1",
+            uuid.UUID(str(invoice_id)),
+        )
+        if inv is None or Decimal(str(inv["tax_eur"])) == 0:
+            return
+        schon = await conn.fetchval(
+            "SELECT 1 FROM billing_events WHERE event_type = 'invoice.net_basis_vat_from_payment' "
+            "AND mollie_payment_id = $1 LIMIT 1", payment_id,
+        )
+    abweichung = (Decimal(str(inv["subtotal_eur"])) - frueher) if frueher is not None else None
+    logger.error(
+        "[webhook] ALARM %s payment %s (net basis): invoice total = paid %s, VAT %s taken out of "
+        "the payment; net %s vs earlier net price %s (deviation %s) — invoice %s",
+        bahn, payment_id, inv["total_eur"], inv["tax_eur"], inv["subtotal_eur"], frueher,
+        abweichung, invoice_id,
+    )
+    if schon:
+        return
+    await log_billing_event(
+        "invoice.net_basis_vat_from_payment",
+        user_id=user_id,
+        invoice_id=str(invoice_id),
+        mollie_payment_id=payment_id,
+        amount_eur=float(inv["total_eur"]),
+        source="mollie-webhook",
+        payload={
+            "bahn": bahn, "weg": nettobasis_rechnungsweg(),
+            "rechnungNettoEur": float(inv["subtotal_eur"]), "ustEur": float(inv["tax_eur"]),
+            "fruehererNettopreisEur": float(frueher) if frueher is not None else None,
+            "abweichungZumFrueherenNettopreisEur": float(abweichung) if abweichung is not None else None,
+        },
+    )
 
 
 async def _pruefe_rechnung_gegen_zahlung(
@@ -894,20 +1026,13 @@ async def _activate_subscription(
         invoice_net = amount
 
     async def _rechnung(sub_id: str) -> None:
-        invoice_id = await auto_create_invoice(
-            user_id=user_id,
-            amount_eur=invoice_net,
+        await _rechnung_zur_zahlung(
+            basis=betragsbasis, user_id=user_id, betrag_eur=invoice_net, bezahlt_eur=bezahlt_eur,
             description=f"{plan_id} — Erste Monatsabrechnung ({seats} Sitz" + ("e" if seats > 1 else "") + ")",
-            subscription_id=sub_id,
-            mollie_payment_id=first_payment_id,
-            number_prefix=prefix_for_app(app_id),
-            strikt=betragsbasis == BASIS_BRUTTO,
+            subscription_id=sub_id, mollie_payment_id=first_payment_id,
+            number_prefix=prefix_for_app(app_id), bahn="subscription_first",
+            frueherer_nettopreis_eur=amount,
         )
-        if betragsbasis == BASIS_BRUTTO:
-            await _pruefe_rechnung_gegen_zahlung(
-                invoice_id=invoice_id, user_id=user_id, payment_id=first_payment_id,
-                paid_eur=bezahlt_eur, bahn="subscription_first",
-            )
 
     # Idempotency probe. If we already activated this payment, return the
     # existing row without calling Mollie a second time — but heal a missing
@@ -1422,19 +1547,11 @@ async def _topup_rechnung(
     user_id: str, amount_eur: float, mollie_payment_id: str, betragsbasis: str, bezahlt_eur: Any,
 ) -> None:
     """Rechnung einer gutgeschriebenen Aufladung — idempotent je payment_id."""
-    invoice_id = await auto_create_invoice(
-        user_id=user_id,
-        amount_eur=amount_eur,
-        description=f"API-Top-Up € {amount_eur:.2f}",
-        mollie_payment_id=mollie_payment_id,
-        number_prefix=TOPUP_PREFIX,
-        strikt=betragsbasis == BASIS_BRUTTO,
+    await _rechnung_zur_zahlung(
+        basis=betragsbasis, user_id=user_id, betrag_eur=amount_eur, bezahlt_eur=bezahlt_eur,
+        description=f"API-Top-Up € {amount_eur:.2f}", mollie_payment_id=mollie_payment_id,
+        number_prefix=TOPUP_PREFIX, bahn="topup", frueherer_nettopreis_eur=amount_eur,
     )
-    if betragsbasis == BASIS_BRUTTO:
-        await _pruefe_rechnung_gegen_zahlung(
-            invoice_id=invoice_id, user_id=user_id, payment_id=mollie_payment_id,
-            paid_eur=bezahlt_eur, bahn="topup",
-        )
 
 
 async def list_credit_purchases(user_id: str) -> List[Dict[str, Any]]:
@@ -1712,13 +1829,15 @@ async def _folgezahlung_verbuchen(payment_id: str, payment: Dict[str, Any]) -> D
     Basis des Abos (subscriptions.amount_basis, Migration 068):
       gross — Rechnung vom gespeicherten Netto (subscriptions.net_eur), strikt;
               Rechnungsbrutto muss die Zahlung treffen (sonst amount_mismatch).
-      net   — Bestand: Mollie zieht den Nettobetrag ein; Rechnung vom bezahlten
-              Betrag, USt. wie bei der Erstzahlung aufgeschlagen.
+      net   — Bestand: Mollie zieht den frueheren Nettopreis ein; Rechnungs-
+              endbetrag = Zahlbetrag, USt. herausgerechnet, Vermerk + Alarm
+              (Codex R2, B1 — nie eine Rechnung ueber dem Zahlbetrag als paid).
     """
     mollie_sub_id = payment.get("subscription_id")
     async with get_pool().acquire() as conn:
         sub = await conn.fetchrow(
-            """SELECT id, user_id, app_id, plan_id, seats, amount_basis, net_eur
+            """SELECT id, user_id, app_id, plan_id, seats, amount_basis, net_eur,
+                      mollie_first_payment_id
                  FROM subscriptions WHERE mollie_subscription_id = $1""",
             mollie_sub_id,
         )
@@ -1728,31 +1847,34 @@ async def _folgezahlung_verbuchen(payment_id: str, payment: Dict[str, Any]) -> D
         )
     basis = _pruefe_basis(sub["amount_basis"])
     user_id = str(sub["user_id"])
+    bezahlt = payment.get("amount_eur")
+    if bezahlt is None or Decimal(str(bezahlt)) <= 0:
+        raise RuntimeError(f"recurring payment {payment_id}: paid amount missing")
+    frueher = None
     if basis == BASIS_BRUTTO:
         if sub["net_eur"] is None:
             raise RuntimeError(
                 f"recurring payment {payment_id}: gross subscription {sub['id']} without net_eur"
             )
-        netto = float(sub["net_eur"])
+        betrag = sub["net_eur"]
     else:
-        netto = float(payment.get("amount_eur") or 0)
-        if netto <= 0:
-            raise RuntimeError(f"recurring payment {payment_id}: paid amount missing")
+        # Frueherer Nettopreis = Betrag der Erstzahlung, mit dem das Mollie-Abo
+        # angelegt wurde (ohne Erstzahlungszeile: unbekannt, im Vermerk null).
+        betrag = bezahlt
+        if sub["mollie_first_payment_id"]:
+            async with get_pool().acquire() as conn:
+                frueher = await conn.fetchval(
+                    "SELECT amount_eur FROM pending_payments WHERE payment_id = $1",
+                    sub["mollie_first_payment_id"],
+                )
     seats = sub["seats"]
-    invoice_id = await auto_create_invoice(
-        user_id=user_id,
-        amount_eur=netto,
+    invoice_id = await _rechnung_zur_zahlung(
+        basis=basis, user_id=user_id, betrag_eur=betrag, bezahlt_eur=bezahlt,
         description=f"{sub['plan_id']} — Monatsabrechnung ({seats} Sitz" + ("e" if seats > 1 else "") + ")",
-        subscription_id=str(sub["id"]),
-        mollie_payment_id=payment_id,
-        number_prefix=prefix_for_app(sub["app_id"]),
-        strikt=basis == BASIS_BRUTTO,
+        subscription_id=str(sub["id"]), mollie_payment_id=payment_id,
+        number_prefix=prefix_for_app(sub["app_id"]), bahn="subscription_recurring",
+        frueherer_nettopreis_eur=frueher,
     )
-    if basis == BASIS_BRUTTO:
-        await _pruefe_rechnung_gegen_zahlung(
-            invoice_id=invoice_id, user_id=user_id, payment_id=payment_id,
-            paid_eur=payment.get("amount_eur"), bahn="subscription_recurring",
-        )
     return {"handled": True, "type": "subscription_recurring",
             "subscriptionId": str(sub["id"]), "invoiceId": invoice_id}
 
@@ -2293,8 +2415,14 @@ async def auto_create_invoice(
     mollie_payment_id: str | None = None,
     number_prefix: str = FALLBACK_PREFIX,
     strikt: bool = False,
+    betrag_ist: str = "netto",
+    vermerk: Optional[Dict[str, Any]] = None,
 ) -> str | None:
     """Insert one invoice row, mark it 'paid', return the id.
+
+    `betrag_ist`: "netto" — amount_eur ist das Netto, USt. aufgeschlagen;
+    "brutto" — amount_eur ist der Endbetrag (= Zahlbetrag), USt. herausgerechnet.
+    `vermerk` geht in invoices.metadata.
 
     `strikt=True` (Brutto-Abschluesse): Steuerdaten-Ausfall wirft statt mit
     Ersatzsatz zu rechnen (resolve_invoice_tax); der Webhook scheitert laut,
@@ -2336,8 +2464,14 @@ async def auto_create_invoice(
     # Abos und Top-Ups: amount_eur ist der NETTO-Betrag, die Rechnung schlaegt
     # die USt auf. Neue Abschluesse ziehen bei Mollie dieses Brutto ein
     # (Basis 'gross', Migration 068; der Aufrufer prueft Rechnung == Zahlung),
-    # Bestandsabschluesse (Basis 'net') weiter das Netto.
-    subtotal, tax, total = invoice_amounts(round(float(amount_eur), 2), tax_rate)
+    # Bestandsabschluesse (Basis 'net') kommen mit betrag_ist="brutto" (Endbetrag
+    # = Zahlbetrag, siehe _rechnung_zur_zahlung).
+    if betrag_ist == "netto":
+        subtotal, tax, total = invoice_amounts(round(float(amount_eur), 2), tax_rate)
+    elif betrag_ist == "brutto":
+        subtotal, tax, total = invoice_amounts_from_gross(round(float(amount_eur), 2), tax_rate)
+    else:
+        raise ValueError(f"betrag_ist must be 'netto' or 'brutto', got {betrag_ist!r}")
 
     line_items = [{
         "description": description,
@@ -2348,6 +2482,8 @@ async def auto_create_invoice(
     }]
 
     metadata: Dict[str, Any] = {"autoCreated": True, "source": "mollie-webhook"}
+    if vermerk:
+        metadata.update(vermerk)
     if billing_address is None:
         metadata["incomplete"] = True
         metadata["missingBillingAddress"] = True

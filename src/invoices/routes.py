@@ -41,6 +41,22 @@ router = APIRouter(prefix="/v1/invoices", tags=["invoices"])
 
 _ALLOWED_STATUS = {"draft", "issued", "paid", "cancelled", "refunded"}
 
+# Erlaubte Statuskanten fuer den Admin-PATCH (Codex R2 18.10.2026, Befund B2).
+# Bis dahin pruefte die Sperre nur den AKTUELLEN Status: paid -> issued ->
+# refunded umging sie und taeuschte eine Erstattung vor, die nie stattfand.
+# Jetzt gilt: nur diese Kanten, und eine Rechnung, die je bezahlt war
+# (paid_at gesetzt), verlaesst diesen Stand nicht mehr — Storno/Erstattung
+# einer bezahlten Rechnung ist laut gesperrt (ERSTATTUNG_GESPERRT_GRUND).
+# Gleicher Status = keine Statusaenderung (nur notes/metadata).
+_STATUS_KANTEN: Dict[str, frozenset] = {
+    "draft": frozenset({"issued", "paid", "cancelled"}),
+    "issued": frozenset({"paid", "cancelled"}),
+    "paid": frozenset(),
+    "cancelled": frozenset(),
+    "refunded": frozenset(),
+}
+assert set(_STATUS_KANTEN) == _ALLOWED_STATUS
+
 
 def _approval_required() -> bool:
     """
@@ -357,25 +373,6 @@ async def update_invoice(
     if body.status is not None and body.status not in _ALLOWED_STATUS:
         raise HTTPException(status_code=400, detail=f"Unknown status: {body.status}")
 
-    if body.status in ("cancelled", "refunded"):
-        # Storno/Erstattung einer BEZAHLTEN Rechnung ist laut gesperrt (Codex
-        # 18.10.2026, Befund 5): ein blosser Statuswechsel taeuscht eine
-        # Rueckabwicklung vor, die nicht stattfindet — keine Gutschrift, keine
-        # Rueckbuchung von Guthaben/Credits, keine Mollie-Erstattung.
-        # Unbezahlte Rechnungen (draft/issued) bleiben stornierbar.
-        from src.billing.billing_service import ERSTATTUNG_GESPERRT_GRUND
-        async with get_pool().acquire() as conn:
-            aktuell = await conn.fetchval(
-                "SELECT status FROM invoices WHERE id = $1", uuid.UUID(invoice_id),
-            )
-        if aktuell is None:
-            raise HTTPException(status_code=404, detail=f"Invoice {invoice_id} not found")
-        if aktuell in ("paid", "refunded"):
-            raise HTTPException(status_code=409, detail={
-                "error": "refund_not_supported",
-                "message": ERSTATTUNG_GESPERRT_GRUND,
-            })
-
     sets: List[str] = []
     args: List[Any] = []
 
@@ -405,10 +402,37 @@ async def update_invoice(
 
     pool = get_pool()
     async with pool.acquire() as conn:
-        r = await conn.fetchrow(sql, *args)
-    if not r:
-        raise HTTPException(status_code=404, detail=f"Invoice {invoice_id} not found")
+        async with conn.transaction():
+            # Pruefung und Aenderung atomar: die Zeile bleibt bis zum UPDATE gesperrt.
+            aktuell = await conn.fetchrow(
+                "SELECT status, paid_at FROM invoices WHERE id = $1 FOR UPDATE",
+                uuid.UUID(invoice_id),
+            )
+            if not aktuell:
+                raise HTTPException(status_code=404, detail=f"Invoice {invoice_id} not found")
+            if body.status is not None:
+                _pruefe_statuskante(aktuell["status"], body.status, aktuell["paid_at"])
+            r = await conn.fetchrow(sql, *args)
     return _row(r)
+
+
+def _pruefe_statuskante(von: str, nach: str, paid_at: Any) -> None:
+    """Wirft 409, wenn der Statuswechsel keine erlaubte Kante ist."""
+    if von == nach:
+        return
+    if paid_at is not None or von in ("paid", "refunded"):
+        from src.billing.billing_service import ERSTATTUNG_GESPERRT_GRUND
+        raise HTTPException(status_code=409, detail={
+            "error": "refund_not_supported",
+            "message": ERSTATTUNG_GESPERRT_GRUND,
+            "from": von, "to": nach,
+        })
+    if nach not in _STATUS_KANTEN.get(von, frozenset()):
+        raise HTTPException(status_code=409, detail={
+            "error": "invalid_status_transition",
+            "message": f"Statuswechsel {von} -> {nach} ist nicht erlaubt.",
+            "from": von, "to": nach,
+        })
 
 
 # ---------------------------------------------------------------------------

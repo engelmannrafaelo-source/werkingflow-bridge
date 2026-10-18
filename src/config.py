@@ -110,6 +110,14 @@ def _load() -> BridgeConfig:
         service_token_raw=os.getenv("BRIDGE_SERVICE_TOKEN") or None,
     )
 
+    # Rechnungsweg fuer Zahlungen mit Basis 'net' — unbekannter Wert bricht den
+    # Start ab, statt erst beim ersten Webhook (billing_service.nettobasis_rechnungsweg).
+    _weg = os.getenv("BRIDGE_NETTOBASIS_RECHNUNGSWEG")
+    if _weg and _weg not in ("zahlbetrag_brutto",):
+        raise RuntimeError(
+            f"BRIDGE_NETTOBASIS_RECHNUNGSWEG={_weg!r} unbekannt — erlaubt: zahlbetrag_brutto"
+        )
+
     if cfg.db_enabled:
         # DB-backed routes (identity/budget/billing/activity/admin) need these.
         # Fail loudly at boot rather than at first request.

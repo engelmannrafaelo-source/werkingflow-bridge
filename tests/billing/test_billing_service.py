@@ -382,7 +382,7 @@ class TestActivateSubscription:
         with patch("src.billing.billing_service.get_pool", return_value=pool), \
              patch("src.billing.billing_service.get_mollie_adapter", return_value=fake_mollie), \
              patch("src.billing.billing_service.log_billing_event", new_callable=AsyncMock), \
-             patch("src.billing.billing_service.auto_create_invoice", new_callable=AsyncMock):
+             patch("src.billing.billing_service.auto_create_invoice", new_callable=AsyncMock, return_value=None):
             result = await _activate_subscription(
                 str(uuid.uuid4()), "report-standard", 1,
                 "cust_abc", first_payment_id="pay_001",
@@ -408,7 +408,7 @@ class TestActivateSubscription:
         with patch("src.billing.billing_service.get_pool", return_value=pool), \
              patch("src.billing.billing_service.get_mollie_adapter", return_value=fake_mollie), \
              patch("src.billing.billing_service.log_billing_event", new_callable=AsyncMock) as mock_log, \
-             patch("src.billing.billing_service.auto_create_invoice", new_callable=AsyncMock) as mock_inv, \
+             patch("src.billing.billing_service.auto_create_invoice", new_callable=AsyncMock, return_value=None) as mock_inv, \
              patch.object(BridgeConfig, "mollie_webhook_url",
                           new_callable=PropertyMock,
                           return_value="https://bridge.test/v1/billing/mollie-webhook"):
@@ -424,6 +424,10 @@ class TestActivateSubscription:
         mock_log.assert_called_once()
         assert mock_log.call_args[0][0] == "subscription.activated"
         mock_inv.assert_called_once()
+        # Basis net (Altaufrufer): Endbetrag = Zahlbetrag, USt. herausgerechnet,
+        # strikt (Codex R2 B1 — nie Rechnung ueber dem Zahlbetrag als paid).
+        assert mock_inv.call_args.kwargs["betrag_ist"] == "brutto"
+        assert mock_inv.call_args.kwargs["strikt"] is True
         # The monthly budget pot was provisioned alongside the new row.
         budget_sql = [c[0][0] for c in conn.execute.call_args_list if "user_budgets" in c[0][0]]
         assert len(budget_sql) == 1
@@ -458,7 +462,7 @@ class TestCreditTopup:
 
         with patch("src.billing.billing_service.get_pool", return_value=pool), \
              patch("src.billing.billing_service.log_billing_event", new_callable=AsyncMock), \
-             patch("src.billing.billing_service.auto_create_invoice", new_callable=AsyncMock):
+             patch("src.billing.billing_service.auto_create_invoice", new_callable=AsyncMock, return_value=None):
             result = await _credit_topup(str(user_id), 100.0, "pay_topup_001")
 
         assert result["alreadyCredited"] is False
@@ -481,7 +485,7 @@ class TestCreditTopup:
 
         with patch("src.billing.billing_service.get_pool", return_value=pool), \
              patch("src.billing.billing_service.log_billing_event", new_callable=AsyncMock) as mock_log, \
-             patch("src.billing.billing_service.auto_create_invoice", new_callable=AsyncMock) as mock_inv:
+             patch("src.billing.billing_service.auto_create_invoice", new_callable=AsyncMock, return_value=None) as mock_inv:
             result = await _credit_topup(str(user_id), 50.0, "pay_topup_dup")
 
         assert result["alreadyCredited"] is True

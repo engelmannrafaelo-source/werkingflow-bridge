@@ -251,15 +251,15 @@ async def test_folgezahlung_brutto_abweichung_gemeldet_einmal(db):
         assert await _zaehle(conn, "SELECT count(*) FROM invoices WHERE mollie_payment_id=$1", pay) == 1
 
 
-async def test_folgezahlung_netto_bestandsabo(db):
-    """Bestands-Abo (net): Rechnung vom bezahlten Betrag, USt. wie bei der Erstzahlung."""
+async def _netto_bestandsabo(db, fall="AT"):
+    """Bestands-Abo mit Basis net (Erstzahlung vor dem Umstieg angelegt)."""
     from src.billing import billing_service
-    from src.billing.mollie_adapter import get_mollie_adapter, reset_mollie_adapter
+    from src.billing.mollie_adapter import get_mollie_adapter
 
-    reset_mollie_adapter()
     mollie = get_mollie_adapter()
     async with db.acquire() as conn:
-        uid, _ = await _bestandskunde_mit_altguthaben(conn, slots=1)
+        uid, tid = await _bestandskunde_mit_altguthaben(conn, slots=1)
+        await _setze_steuerfall(conn, tid, fall)
         plan_id, netto = await _abo_plan(conn)
     cust = await billing_service.get_or_create_customer(str(uid), "u@test.local", "Owner")
     erst = mollie._create_payment(cust["mollieCustomerId"], float(netto),
@@ -273,16 +273,132 @@ async def test_folgezahlung_netto_bestandsabo(db):
             "FROM subscriptions WHERE mollie_first_payment_id=$1", erst,
         )
     assert sub["amount_basis"] == "net"
+    return uid, sub, erst, _q(netto)
 
+
+def _aus_brutto(brutto: Decimal, satz: Decimal) -> tuple[Decimal, Decimal]:
+    netto = (brutto * 100 / (100 + satz)).quantize(Decimal("0.01"), rounding="ROUND_HALF_UP")
+    return netto, brutto - netto
+
+
+@pytest.mark.parametrize("fall", sorted(STEUERFAELLE))
+async def test_netto_basis_rechnung_nie_ueber_zahlbetrag(db, fall):
+    """Codex R2 B1: Bestands-Abo (net) — Erst- und Folgerechnung haben als
+    Endbetrag genau den Zahlbetrag, USt. herausgerechnet; Vermerk + Alarm,
+    kein amount_mismatch. RC/Export: 0 %, kein Alarm."""
+    from src.billing import billing_service
+    from src.billing.mollie_adapter import reset_mollie_adapter
+
+    reset_mollie_adapter()
+    uid, sub, erst, netto = await _netto_bestandsabo(db, fall)
+    satz = STEUERFAELLE[fall][3]
     pay = _folgezahlung(sub, netto)
     res = await billing_service.handle_webhook(pay)
     assert res["type"] == "subscription_recurring"
+    await billing_service.handle_webhook(pay)   # Wiederholung
+    erw_netto, erw_ust = _aus_brutto(netto, satz)
+    for zahlung in (erst, pay):
+        async with db.acquire() as conn:
+            inv = await conn.fetchrow(
+                "SELECT subtotal_eur, tax_eur, total_eur, status, metadata FROM invoices "
+                "WHERE mollie_payment_id=$1", zahlung,
+            )
+            alarm = await _zaehle(
+                conn, "SELECT count(*) FROM billing_events WHERE mollie_payment_id=$1 "
+                "AND event_type='invoice.net_basis_vat_from_payment'", zahlung)
+            mismatch = await _zaehle(
+                conn, "SELECT count(*) FROM billing_events WHERE mollie_payment_id=$1 "
+                "AND event_type='payment.amount_mismatch'", zahlung)
+        assert inv["status"] == "paid"
+        assert _q(inv["total_eur"]) == netto, (fall, zahlung, inv)   # nie ueber dem Zahlbetrag
+        assert _q(inv["subtotal_eur"]) == erw_netto and _q(inv["tax_eur"]) == erw_ust
+        meta = inv["metadata"] if isinstance(inv["metadata"], dict) else __import__("json").loads(inv["metadata"])
+        assert meta["nettobasis"]["weg"] == "zahlbetrag_brutto"
+        assert _q(meta["nettobasis"]["zahlbetragEur"]) == netto
+        assert _q(meta["nettobasis"]["fruehererNettopreisEur"]) == netto
+        assert alarm == (1 if satz > 0 else 0)
+        assert mismatch == 0
+
+
+async def test_netto_basis_50_euro_at_ergibt_41_67_plus_8_33(db):
+    """Das Beispiel aus dem Auftrag: Zahlung 50,00, AT 20 % -> 41,67 + 8,33 = 50,00."""
+    from src.billing import billing_service
+    from src.billing.mollie_adapter import reset_mollie_adapter
+
+    reset_mollie_adapter()
+    uid, sub, _erst, _netto = await _netto_bestandsabo(db, "AT")
+    pay = _folgezahlung(sub, Decimal("50.00"))
+    await billing_service.handle_webhook(pay)
     async with db.acquire() as conn:
         inv = await conn.fetchrow(
-            "SELECT subtotal_eur, total_eur FROM invoices WHERE mollie_payment_id=$1", pay,
-        )
-    assert _q(inv["subtotal_eur"]) == _q(netto)
-    assert _q(inv["total_eur"]) == _q(netto * Decimal("1.2"))   # AT, Bestandsverhalten
+            "SELECT subtotal_eur, tax_eur, total_eur FROM invoices WHERE mollie_payment_id=$1", pay)
+        ev = await conn.fetchrow(
+            "SELECT payload FROM billing_events WHERE mollie_payment_id=$1 "
+            "AND event_type='invoice.net_basis_vat_from_payment'", pay)
+    assert (_q(inv["subtotal_eur"]), _q(inv["tax_eur"]), _q(inv["total_eur"])) == (
+        Decimal("41.67"), Decimal("8.33"), Decimal("50.00"))
+    payload = ev["payload"] if isinstance(ev["payload"], dict) else __import__("json").loads(ev["payload"])
+    assert payload["rechnungNettoEur"] == 41.67 and payload["ustEur"] == 8.33
+
+
+async def test_netto_basis_topup_rechnung_gleich_zahlbetrag(db):
+    from src.billing import billing_service
+    from src.billing.mollie_adapter import get_mollie_adapter, reset_mollie_adapter
+
+    reset_mollie_adapter()
+    mollie = get_mollie_adapter()
+    async with db.acquire() as conn:
+        uid, tid = await _bestandskunde_mit_altguthaben(conn, slots=1)
+        await _setze_steuerfall(conn, tid, "AT")
+    cust = await billing_service.get_or_create_customer(str(uid), "u@test.local", "Owner")
+    pay = mollie._create_payment(cust["mollieCustomerId"], 50.0, {"type": "topup"})["paymentId"]
+    async with db.acquire() as conn:
+        await _netto_zahlung_von_frueher(conn, uid, pay, "topup", None, Decimal("50"))
+    await billing_service.handle_webhook(pay)
+    async with db.acquire() as conn:
+        inv = await conn.fetchrow(
+            "SELECT subtotal_eur, tax_eur, total_eur FROM invoices WHERE mollie_payment_id=$1", pay)
+        lots = await conn.fetchval(
+            "SELECT sum(l.amount_eur) FROM user_topup_lots l JOIN credit_purchases c "
+            "ON c.id = l.credit_purchase_id WHERE c.mollie_payment_id=$1", pay)
+    assert _q(inv["total_eur"]) == Decimal("50.00")
+    assert (_q(inv["subtotal_eur"]), _q(inv["tax_eur"])) == (Decimal("41.67"), Decimal("8.33"))
+    assert _q(lots) == Decimal("50.00")     # Gutschrift wie bisher
+
+
+async def test_netto_basis_abweichender_zahlbetrag_gemeldet(db):
+    """Zahlung weicht vom Mollie-Abobetrag ab: Rechnung = Zahlung, Abweichung zum
+    frueheren Nettopreis im Ereignis; Rechnung und Zahlung stimmen, kein Mismatch."""
+    from src.billing import billing_service
+    from src.billing.mollie_adapter import reset_mollie_adapter
+
+    reset_mollie_adapter()
+    uid, sub, _erst, netto = await _netto_bestandsabo(db, "AT")
+    pay = _folgezahlung(sub, netto + Decimal("12.00"))
+    await billing_service.handle_webhook(pay)
+    async with db.acquire() as conn:
+        inv = await conn.fetchrow("SELECT subtotal_eur, total_eur FROM invoices WHERE mollie_payment_id=$1", pay)
+        ev = await conn.fetchrow(
+            "SELECT payload FROM billing_events WHERE mollie_payment_id=$1 "
+            "AND event_type='invoice.net_basis_vat_from_payment'", pay)
+    payload = ev["payload"] if isinstance(ev["payload"], dict) else __import__("json").loads(ev["payload"])
+    assert _q(inv["total_eur"]) == netto + Decimal("12.00")
+    assert _q(payload["fruehererNettopreisEur"]) == netto
+    assert _q(payload["abweichungZumFrueherenNettopreisEur"]) == _q(inv["subtotal_eur"]) - netto
+
+
+async def test_netto_basis_unbekannter_schalterwert_laut(db, monkeypatch):
+    from src.billing import billing_service
+    from src.billing.mollie_adapter import reset_mollie_adapter
+
+    reset_mollie_adapter()
+    uid, sub, _erst, netto = await _netto_bestandsabo(db, "AT")
+    pay = _folgezahlung(sub, netto)
+    monkeypatch.setenv("BRIDGE_NETTOBASIS_RECHNUNGSWEG", "netto_plus_ust")
+    with pytest.raises(RuntimeError, match="BRIDGE_NETTOBASIS_RECHNUNGSWEG"):
+        await billing_service.handle_webhook(pay)
+    async with db.acquire() as conn:
+        assert await _zaehle(conn, "SELECT count(*) FROM invoices WHERE mollie_payment_id=$1", pay) == 0
 
 
 async def test_folgezahlung_ohne_abo_laut(db):
@@ -437,11 +553,8 @@ async def test_erstattung_folgezahlung_ordnet_kunden_zu(db):
         assert await _zaehle(conn, "SELECT count(*) FROM invoices WHERE mollie_payment_id=$1", pay) == 0
 
 
-async def test_rechnung_patch_bezahlt_storno_409(db):
-    from fastapi import HTTPException
-
+async def _probe_rechnungen(db):
     from src.billing import billing_service
-    from src.invoices import routes as inv_routes
 
     async with db.acquire() as conn:
         uid, _ = await _bestandskunde_mit_altguthaben(conn, slots=1)
@@ -451,19 +564,79 @@ async def test_rechnung_patch_bezahlt_storno_409(db):
     offen = await billing_service.auto_create_invoice(
         user_id=str(uid), amount_eur=10.0, description="Probe", mollie_payment_id="tr_" + uuid.uuid4().hex[:8],
     )
-    async with db.acquire() as conn:
-        await conn.execute("UPDATE invoices SET status='issued' WHERE id=$1", uuid.UUID(offen))
+    async with db.acquire() as conn:   # echte offene Rechnung: nie bezahlt
+        await conn.execute("UPDATE invoices SET status='issued', paid_at=NULL WHERE id=$1", uuid.UUID(offen))
+    return bezahlt, offen
 
-    for ziel in ("refunded", "cancelled"):
+
+async def test_rechnung_patch_bezahlt_storno_409(db):
+    from fastapi import HTTPException
+
+    from src.invoices import routes as inv_routes
+
+    bezahlt, offen = await _probe_rechnungen(db)
+    for ziel in ("refunded", "cancelled", "issued", "draft"):
         with pytest.raises(HTTPException) as e:
             await inv_routes.update_invoice(bezahlt, inv_routes.InvoiceUpdate(status=ziel), MagicMock())
         assert e.value.status_code == 409
         assert e.value.detail["error"] == "refund_not_supported"
+    # gleicher Status / nur Notiz bleibt moeglich
+    r = await inv_routes.update_invoice(bezahlt, inv_routes.InvoiceUpdate(status="paid", notes="ok"), MagicMock())
+    assert r["status"] == "paid" and r["notes"] == "ok"
     # Unbezahlte Rechnung bleibt stornierbar
     r = await inv_routes.update_invoice(offen, inv_routes.InvoiceUpdate(status="cancelled"), MagicMock())
     assert r["status"] == "cancelled"
     async with db.acquire() as conn:
         assert await conn.fetchval("SELECT status FROM invoices WHERE id=$1", uuid.UUID(bezahlt)) == "paid"
+
+
+async def test_rechnung_umweg_paid_issued_refunded_gesperrt(db):
+    """Codex R2 B2: paid -> issued -> refunded umging die Sperre."""
+    from fastapi import HTTPException
+
+    from src.invoices import routes as inv_routes
+
+    bezahlt, _ = await _probe_rechnungen(db)
+    with pytest.raises(HTTPException) as e:
+        await inv_routes.update_invoice(bezahlt, inv_routes.InvoiceUpdate(status="issued"), MagicMock())
+    assert e.value.status_code == 409
+    # Altlast: schon zurueckgesetzte Rechnung (issued, aber paid_at gesetzt) bleibt gesperrt
+    async with db.acquire() as conn:
+        await conn.execute("UPDATE invoices SET status='issued' WHERE id=$1", uuid.UUID(bezahlt))
+    for ziel in ("refunded", "cancelled"):
+        with pytest.raises(HTTPException) as e:
+            await inv_routes.update_invoice(bezahlt, inv_routes.InvoiceUpdate(status=ziel), MagicMock())
+        assert e.value.status_code == 409 and e.value.detail["error"] == "refund_not_supported"
+    async with db.acquire() as conn:
+        row = await conn.fetchrow("SELECT status, refunded_at, cancelled_at FROM invoices WHERE id=$1",
+                                  uuid.UUID(bezahlt))
+    assert row["status"] == "issued" and row["refunded_at"] is None and row["cancelled_at"] is None
+
+
+@pytest.mark.parametrize("von,nach,erlaubt", [
+    ("draft", "issued", True), ("draft", "paid", True), ("draft", "cancelled", True),
+    ("issued", "paid", True), ("issued", "cancelled", True),
+    ("issued", "draft", False), ("draft", "refunded", False), ("issued", "refunded", False),
+    ("cancelled", "issued", False), ("cancelled", "paid", False), ("refunded", "issued", False),
+])
+async def test_statuskanten_unbezahlter_rechnungen(db, von, nach, erlaubt):
+    from fastapi import HTTPException
+
+    from src.invoices import routes as inv_routes
+
+    _, rechnung = await _probe_rechnungen(db)
+    async with db.acquire() as conn:
+        await conn.execute("UPDATE invoices SET status=$2::invoice_status, paid_at=NULL WHERE id=$1",
+                           uuid.UUID(rechnung), von)
+    if erlaubt:
+        r = await inv_routes.update_invoice(rechnung, inv_routes.InvoiceUpdate(status=nach), MagicMock())
+        assert r["status"] == nach
+    else:
+        with pytest.raises(HTTPException) as e:
+            await inv_routes.update_invoice(rechnung, inv_routes.InvoiceUpdate(status=nach), MagicMock())
+        assert e.value.status_code == 409
+        async with db.acquire() as conn:
+            assert await conn.fetchval("SELECT status FROM invoices WHERE id=$1", uuid.UUID(rechnung)) == von
 
 
 async def test_paket_bestellrechnung_vies_nicht_lesbar_kein_checkout(db):
