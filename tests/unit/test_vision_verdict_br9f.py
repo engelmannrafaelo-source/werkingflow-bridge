@@ -278,3 +278,13 @@ async def test_chat_http_exception_429_is_untouched(monkeypatch):
     sent = await _run_route(monkeypatch, BackendType.ANTHROPIC, stream=False)
     assert _status(sent) == 429, _text(sent)[:300]
     assert _json_body(sent)["error"]["retryable"] is True
+
+
+@pytest.fixture(autouse=True)
+def _erlaubte_app_im_kontext():
+    """R6: ohne Request-Kontext gilt ein Aufruf als eingeschraenkt (Bild nur Gemini). Diese Tests pruefen
+    die Fehlerklassifikation des Anthropic-Wegs und laufen deshalb als ausdruecklich erlaubte App."""
+    from src.routing import bild_policy
+    token = bild_policy.CURRENT_APP.set("werking-report")
+    yield
+    bild_policy.CURRENT_APP.reset(token)
