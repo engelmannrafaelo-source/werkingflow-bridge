@@ -373,6 +373,25 @@ async def test_altes_abo_inzwischen_beendet_keine_kuendigung(db):
     assert await _aktive(db, uid) == [plan_b]
 
 
+async def test_kunde_kuendigt_altes_waehrend_doppelt_aktiv(db):
+    """Waehrend 'doppelt_aktiv' kuendigt der Kunde das alte Abo selbst. Die
+    Wiederholung kuendigt nicht ein zweites Mal und schliesst ab."""
+    from src.billing import billing_service
+
+    uid, plan_a, plan_b, alt = await _kunde_mit_aktivem_abo(db)
+    w = await _wechsel(uid, plan_b)
+    with patch.object(_mollie(), "cancel_subscription", AsyncMock(side_effect=RuntimeError("mollie 503"))):
+        with pytest.raises(billing_service.AboDoppeltAktiv):
+            await billing_service.handle_webhook(w["paymentId"])
+    await billing_service.cancel_subscription(str(uid), alt)            # Kunde, Route /cancel
+    kuendigen = AsyncMock()
+    with patch.object(_mollie(), "cancel_subscription", kuendigen):
+        res = await billing_service.handle_webhook(w["paymentId"])
+    kuendigen.assert_not_awaited()
+    assert res["wechsel"] == {"status": "abgeschlossen", "ergebnis": "alt_schon_beendet"}
+    assert await _aktive(db, uid) == [plan_b]
+
+
 # ---------------------------------------------------------------------------
 # Befund 4 — konkurrierende identische Webhooks, kein Geisterabo
 # ---------------------------------------------------------------------------
