@@ -225,7 +225,8 @@ def test_positivliste_entspricht_known_app_ids_ohne_energy():
     node = next(n for n in ast.walk(ast.parse(src)) if isinstance(n, ast.Assign)
                 and getattr(n.targets[0], "id", "") == "KNOWN_APP_IDS")
     known = {e.value for e in node.value.elts}
-    assert bp.IMAGE_ANTHROPIC_ALLOWED_APPS == known - {"werking-energy"}
+    assert bp.IMAGE_ANTHROPIC_ALLOWED_APPS == (known - {"werking-energy"}) | {"partner-platform", "dev-tooling"}
+    assert bp.IMAGE_ANTHROPIC_ALLOWED_EXTRA_APPS == {"partner-platform", "dev-tooling"}
 
 
 def test_zu_grosser_koerper_wird_nicht_still_durchgelassen(monkeypatch):

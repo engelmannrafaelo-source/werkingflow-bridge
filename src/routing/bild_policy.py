@@ -73,9 +73,13 @@ logger = logging.getLogger(__name__)
 #: wie Energy behandelt: nur Gemini, sonst 403. Die Sicherheit haengt damit nicht mehr daran, dass jeder
 #: Nebenweg (PDF-Proxy, Privacy-Dienst, Research, Erkunder, Jobs) die Identitaet korrekt weiterreicht.
 #: Eine festgeschriebene Architekturentscheidung = KNOWN_APP_IDS (main.py) ohne werking-energy.
+#: Namentlich zugefuegt (Inventar 18.10.2026, kein KNOWN_APP_IDS-Eintrag): ``partner-platform`` (CUI-Server,
+#: journey-evaluator/bridgeChat sendet Claude-Vision-Bilder mit X-App-ID partner-platform) und ``dev-tooling``
+#: (Orchestrator-Werkzeuge, z. B. der Prepaid-Probe-Aufruf von vision-prepaid-budget-guard, der ein 1x1-PNG an Haiku sendet).
+IMAGE_ANTHROPIC_ALLOWED_EXTRA_APPS = frozenset({"partner-platform", "dev-tooling"})
 IMAGE_ANTHROPIC_ALLOWED_APPS = frozenset({
     "engelmann", "werking-report", "werking-safety", "werking-noise", "cui", "platform", "acro-community",
-})
+}) | IMAGE_ANTHROPIC_ALLOWED_EXTRA_APPS
 #: Diese Apps sind nie erlaubt, auch nicht per Umgebungsvariable (Rafael 07.10.2026).
 IMAGE_GEMINI_ONLY_APPS = frozenset({"werking-energy"})
 
