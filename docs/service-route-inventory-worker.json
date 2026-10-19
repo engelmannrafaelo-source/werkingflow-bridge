@@ -1,0 +1,23 @@
+{
+  "_doc": "Worker-App (src/main.py) routes outside docs/service-route-inventory.json that an app principal can reach with its service token or a bearer credential. Assessed R14 (19.10.2026) after the R13 second review: none of them issues tokens, credentials, principals or scopes, and none touches image egress. Gate = dependency the route must carry (tests/unit/test_r14_worker_routes.py).",
+  "routes": [
+    {"path": "/health/reset", "methods": ["POST"], "gate": "require_admin", "data": "mutation: resets provider breaker state", "assessment": "admin mutation; app principals must not reset shared provider health -> bridge:admin (changed in R14)"},
+    {"path": "/debug/tokens", "methods": ["GET"], "gate": "require_service_token", "data": "token count, rotation index, file paths, fingerprints; no key material (test_debug_tokens_endpoint)", "assessment": "diagnostic read; no secret, no bild relevance; stays service-token"},
+    {"path": "/license-health", "methods": ["GET"], "gate": "require_service_token", "data": "license/token health without previews (incident 02.09.2026)", "assessment": "diagnostic read; stays service-token"},
+    {"path": "/v1/debug/request", "methods": ["POST"], "gate": "require_service_token", "data": "echo of the caller's own request for validation", "assessment": "self-diagnostic; no cross-tenant data; stays service-token"},
+    {"path": "/v1/metrics", "methods": ["GET"], "gate": "HTTPBearer", "data": "aggregate counters", "assessment": "operational metrics; handler verifies bearer; no credential or image path"},
+    {"path": "/v1/metrics/attribution", "methods": ["GET"], "gate": "HTTPBearer", "data": "attribution counters", "assessment": "operational metrics"},
+    {"path": "/v1/metrics/jobs-retention", "methods": ["GET"], "gate": "HTTPBearer", "data": "retention counters", "assessment": "operational metrics"},
+    {"path": "/v1/metrics/anonymization", "methods": ["GET"], "gate": "HTTPBearer", "data": "anonymization counters", "assessment": "operational metrics"},
+    {"path": "/v1/metrics/prompt-performance", "methods": ["GET"], "gate": "HTTPBearer", "data": "latency/quality aggregates", "assessment": "operational metrics"},
+    {"path": "/v1/metrics/prompt-performance/timeline", "methods": ["GET"], "gate": "HTTPBearer", "data": "latency/quality aggregates", "assessment": "operational metrics"},
+    {"path": "/v1/metrics/prompt-performance/calls", "methods": ["GET"], "gate": "HTTPBearer", "data": "per-call aggregates", "assessment": "operational metrics"},
+    {"path": "/v1/metrics/throughput", "methods": ["GET"], "gate": "HTTPBearer", "data": "throughput counters", "assessment": "operational metrics"},
+    {"path": "/v1/metrics/usage-breakdown", "methods": ["GET"], "gate": "HTTPBearer", "data": "usage aggregates", "assessment": "operational metrics"},
+    {"path": "/v1/metrics/document-performance", "methods": ["GET"], "gate": "HTTPBearer", "data": "document pipeline aggregates", "assessment": "operational metrics"},
+    {"path": "/v1/metrics/request-log", "methods": ["GET"], "gate": "HTTPBearer", "data": "recent request log entries", "assessment": "operational diagnostics; no credentials"},
+    {"path": "/v1/metrics/cc-usage-history", "methods": ["GET"], "gate": "HTTPBearer", "data": "usage history", "assessment": "operational metrics"},
+    {"path": "/v1/metrics/cc-usage-snapshot", "methods": ["POST"], "gate": "HTTPBearer", "data": "usage snapshot write", "assessment": "metrics write; no credential or image path"},
+    {"path": "/v1/metrics/queue-forecast", "methods": ["GET"], "gate": "HTTPBearer", "data": "queue forecast", "assessment": "operational metrics"}
+  ]
+}
