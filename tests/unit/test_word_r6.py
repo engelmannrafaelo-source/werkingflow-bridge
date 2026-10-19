@@ -65,10 +65,20 @@ class Source:
         )
         return self
 
+    def _keys(self):
+        return [p for t in self.provenance.texts for p in t.paragraphs]
+
     def mark(self, index):
-        """Writer's export of the bookmark of the n-th recorded paragraph."""
-        keys = [p.key for t in self.provenance.texts for p in t.paragraphs]
-        return f'<a name="wqtest_{keys[index]}"></a>'
+        """Writer's export of the start sentinel of the n-th recorded paragraph."""
+        return f"wqtest_{self._keys()[index].key}_"
+
+    def end(self, index):
+        """Writer's export of its end sentinel."""
+        return f"wqtest_{self._keys()[index].end}_"
+
+    def span(self, index, inner):
+        """The n-th paragraph as Writer exports it: both sentinels around it."""
+        return self.mark(index) + inner + self.end(index)
 
     def apply(self, html):
         soup = BeautifulSoup(f"<body>{html}</body>", "html.parser")
@@ -93,54 +103,59 @@ def test_same_text_in_the_body_does_not_stand_in_for_lost_note_cells():
     source = Source().body(para("QXSHAREDQZ")).footnotes([(1, para("FN") + table)])
     # Writer exports body and note text, but not the table inside the note.
     soup, notices = source.apply(
-        f"<p>{source.mark(0)}QXSHAREDQZ</p>"
-        f'<div id="sdfootnote1"><p>{source.mark(1)}1 FN</p></div>'
+        f"<p>{source.span(0, 'QXSHAREDQZ')}</p>"
+        f'<div id="sdfootnote1"><p>{source.span(1, "1 FN")}</p></div>'
     )
     assert count(soup, "QXSHAREDQZ") == 5
+    # the note's export ends with its last mark: the cells' place is known
     assert notices == [
-        "Fußnoten: 4 Absätze im Export nicht enthalten, aus der Quelle angehängt"
+        "Fußnoten: 4 Absätze im Export nicht enthalten, an seiner Stelle aus der"
+        " Quelle eingefügt"
     ]
     # Inserted next to the note it belongs to, not at the end of the body.
     note = soup.find("div", id="sdfootnote1")
     assert note.get_text().count("QXSHAREDQZ") == 4
 
 
-@pytest.mark.parametrize("stamp", [True, False])
-def test_repeated_paragraphs_are_counted_per_occurrence(stamp):
-    source = Source(stamp).body(para("QXREPEATQZ") * 2)
-    first = source.mark(0) if stamp else ""
-    soup, notices = source.apply(f"<p>{first}QXREPEATQZ</p>")
+def test_repeated_paragraphs_are_counted_per_occurrence():
+    source = Source().body(para("QXREPEATQZ") * 2)
+    soup, notices = source.apply(f"<p>{source.span(0, 'QXREPEATQZ')}</p>")
     assert count(soup, "QXREPEATQZ") == 2
     assert notices == [
-        "Dokumenttext: 1 Absatz im Export nicht enthalten, aus der Quelle angehängt"
+        "Dokumenttext: 1 Absatz im Export nicht enthalten, an seiner Stelle aus der"
+        " Quelle eingefügt"
     ]
 
 
 def test_one_export_occurrence_serves_one_source_paragraph():
     source = Source().body(para("QXAQZ") + para("QXAQZ") + para("QXBQZ"))
-    # Writer kept the first and the third bookmark; the second paragraph's
-    # text is not in its own region, and the first one's text may not count.
+    # Writer kept the first and the third paragraph; the second one's place
+    # (between their marks) is empty, and the first one's text may not count.
     soup, notices = source.apply(
-        f"<p>{source.mark(0)}QXAQZ</p><p>{source.mark(2)}QXBQZ</p>"
+        f"<p>{source.span(0, 'QXAQZ')}</p><p>{source.span(2, 'QXBQZ')}</p>"
     )
     assert count(soup, "QXAQZ") == 2 and count(soup, "QXBQZ") == 1
-    assert len(notices) == 1
-    # The lost one is inserted right after its predecessor, before QXBQZ.
+    assert notices == [
+        "Dokumenttext: 1 Absatz im Export nicht enthalten, an seiner Stelle aus der"
+        " Quelle eingefügt"
+    ]
+    # The lost one is inserted at its own place, before QXBQZ.
     text = soup.body.get_text()
     assert text.index("QXAQZ", text.index("QXAQZ") + 1) < text.index("QXBQZ")
 
 
-def test_paragraph_region_ends_at_the_next_paragraph():
+def test_paragraph_span_ends_at_its_own_end_mark():
     source = Source().body(para("QXSAMEQZ") + para("QXSAMEQZ"))
-    # The first paragraph's block came out empty; the second paragraph's
+    # The first paragraph's span came out empty; the second paragraph's
     # occurrence is its own and cannot be borrowed by the first.
     soup, notices = source.apply(
-        f"<p>{source.mark(0)}</p><p>{source.mark(1)}QXSAMEQZ</p>"
+        f"<p>{source.span(0, '')}</p><p>{source.span(1, 'QXSAMEQZ')}</p>"
     )
     first, second = soup.find_all("p")
     assert "QXSAMEQZ" in first.get_text() and second.get_text() == "QXSAMEQZ"
     assert notices == [
-        "Dokumenttext: 1 Absatz im Export unvollständig, aus der Quelle ersetzt"
+        "Dokumenttext: 1 Absatz im Export nicht enthalten, an seiner Stelle aus der"
+        " Quelle eingefügt"
     ]
 
 
@@ -153,25 +168,25 @@ def test_field_result_copy_does_not_stand_in_for_a_lost_heading():
         toc + para("Einleitung") + para("QXKAPQZ") + para("Ende")
     )
     # Writer shows the table of contents (a field result, not a source unit)
-    # but lost the heading itself, bookmark and text.
+    # but lost the heading itself, marks and text.
     soup, notices = source.apply(
-        f"<p>QXKAPQZ</p><p>{source.mark(0)}Einleitung</p><p>{source.mark(2)}Ende</p>"
+        f"<p>QXKAPQZ</p><p>{source.span(1, 'Einleitung')}</p>"
+        f"<p>{source.span(3, 'Ende')}</p>"
     )
     assert count(soup, "QXKAPQZ") == 2
     assert notices == [
-        "Dokumenttext: 1 Absatz im Export nicht enthalten, aus der Quelle angehängt"
+        "Dokumenttext: 1 Absatz im Export nicht enthalten, an seiner Stelle aus der"
+        " Quelle eingefügt"
     ]
     text = soup.body.get_text()
     assert text.index("Einleitung") < text.rindex("QXKAPQZ") < text.index("Ende")
 
 
-@pytest.mark.parametrize("stamp", [True, False])
-def test_incomplete_paragraph_replaces_its_own_block_once(stamp):
-    source = Source(stamp).body(
+def test_incomplete_paragraph_replaces_its_own_span_once():
+    source = Source().body(
         "<w:p><w:r><w:t>QXKEPTQZ</w:t><w:br/><w:t>QXLOSTQZ</w:t></w:r></w:p>"
     )
-    first = source.mark(0) if stamp else ""
-    soup, notices = source.apply(f"<p>{first}QXKEPTQZ</p>")
+    soup, notices = source.apply(f"<p>{source.span(0, 'QXKEPTQZ')}</p>")
     assert count(soup, "QXKEPTQZ") == 1 and count(soup, "QXLOSTQZ") == 1
     assert notices == [
         "Dokumenttext: 1 Absatz im Export unvollständig, aus der Quelle ersetzt"
@@ -179,22 +194,21 @@ def test_incomplete_paragraph_replaces_its_own_block_once(stamp):
     assert "Absatz im Export unvollständig" in soup.p.get_text()
 
 
-def test_incomplete_paragraph_in_a_shared_block_is_inserted_whole_and_named():
+def test_incomplete_paragraph_in_a_shared_block_replaces_only_its_own_span():
     source = Source().body(
         "<w:p><w:r><w:t>QXKEPTQZ</w:t><w:br/><w:t>QXLOSTQZ</w:t></w:r></w:p>"
         + para("QXNEXTQZ")
     )
-    # Writer merged both paragraphs into one block: rewriting it would touch
-    # the other paragraph, so the whole source paragraph is inserted, named.
+    # Writer merged both paragraphs into one block: only the first one's
+    # span is rewritten, the other paragraph stays as exported.
     soup, notices = source.apply(
-        f"<p>{source.mark(0)}QXKEPTQZ {source.mark(1)}QXNEXTQZ</p>"
+        f"<p>{source.span(0, 'QXKEPTQZ')} {source.span(1, '<b>QXNEXTQZ</b>')}</p>"
     )
-    assert count(soup, "QXLOSTQZ") == 1 and count(soup, "QXNEXTQZ") == 1
+    assert count(soup, "QXKEPTQZ") == 1 and count(soup, "QXLOSTQZ") == 1
+    assert count(soup, "QXNEXTQZ") == 1 and soup.find("b").get_text() == "QXNEXTQZ"
     assert notices == [
-        "Dokumenttext: 1 Absatz im Export unvollständig, vollständig aus der Quelle"
-        " angehängt"
+        "Dokumenttext: 1 Absatz im Export unvollständig, aus der Quelle ersetzt"
     ]
-    assert "Absatz im Export unvollständig, vollständig" in soup.body.get_text()
 
 
 def test_text_box_text_does_not_make_its_anchor_incomplete():
@@ -207,8 +221,8 @@ def test_text_box_text_does_not_make_its_anchor_incomplete():
     keys = [p.key for p in source.provenance.texts[0].paragraphs]
     assert source.provenance.texts[0].paragraphs[1].parent == keys[0]
     soup, notices = source.apply(
-        f"<p>{source.mark(0)}QXVORQZ<span><p>{source.mark(1)}QXBOXQZ</p></span>"
-        "QXNACHQZ</p>"
+        f"<p>{source.mark(0)}QXVORQZ<span><p>{source.span(1, 'QXBOXQZ')}</p></span>"
+        f"QXNACHQZ{source.end(0)}</p>"
     )
     assert notices == []
 
@@ -220,9 +234,10 @@ def test_text_box_cannot_borrow_its_anchors_text():
         + "</w:txbxContent></w:drawing></w:r>"
     )
     source = Source().body(f"<w:p>{run('QXSAMEQZ')}{box}</w:p>")
-    # Writer exported the anchor text and the box bookmark, but not the box text.
+    # Writer exported the anchor text and the box marks, but not the box text.
     soup, notices = source.apply(
-        f"<p>{source.mark(0)}QXSAMEQZ<span><p>{source.mark(1)}</p></span></p>"
+        f"<p>{source.mark(0)}QXSAMEQZ<span><p>{source.span(1, '')}</p></span>"
+        f"{source.end(0)}</p>"
     )
     assert count(soup, "QXSAMEQZ") == 2
     assert len(notices) == 1
@@ -237,11 +252,12 @@ def test_writer_showing_the_fallback_branch_counts_as_present():
     )
     source = Source().body(f"<w:p>{run('QXANKERQZ')}<w:r>{alternatives}</w:r></w:p>")
     soup, notices = source.apply(
-        f"<p>{source.mark(0)}QXANKERQZ<span>{source.mark(2)}QXBOXQZ</span></p>"
+        f"<p>{source.mark(0)}QXANKERQZ<span>{source.span(2, 'QXBOXQZ')}</span>"
+        f"{source.end(0)}</p>"
     )
     assert notices == [] and count(soup, "QXBOXQZ") == 1
     # Neither branch exported: the shown branch (mc:Choice) is inserted once.
-    soup, notices = source.apply(f"<p>{source.mark(0)}QXANKERQZ</p>")
+    soup, notices = source.apply(f"<p>{source.span(0, 'QXANKERQZ')}</p>")
     assert count(soup, "QXBOXQZ") == 1 and len(notices) == 1
 
 
@@ -255,7 +271,8 @@ def test_the_branch_writer_did_not_show_is_not_inserted():
     )
     source = Source().body(f"<w:p>{run('QXANKERQZ')}<w:r>{alternatives}</w:r></w:p>")
     soup, notices = source.apply(
-        f"<p>{source.mark(0)}QXANKERQZ<span>{source.mark(2)}QXFALLQZ</span></p>"
+        f"<p>{source.mark(0)}QXANKERQZ<span>{source.span(2, 'QXFALLQZ')}</span>"
+        f"{source.end(0)}</p>"
     )
     assert notices == [] and count(soup, "QXCHOICEQZ") == 0
 

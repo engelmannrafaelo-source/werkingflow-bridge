@@ -210,28 +210,36 @@ def test_simple_table_escapes_literal_pipe(monkeypatch):
 
 
 def test_writer_cell_without_source_is_not_trusted(monkeypatch):
-    """R4: the replaced order matching failed the whole file here; now local."""
+    """R4: the replaced order matching failed the whole file here; now local.
+
+    R7: the stub export carries no mark of the body at all. Its text is
+    unbound and stands for nothing: the body comes back whole from the
+    source, named, and the unmarked stub text with its unmarked table cell
+    does not stay as if it were part of the document."""
     from tests.unit.test_docx_paragraphs import _export_html
 
     _export_html(
         monkeypatch,
         "<body><p>Bleibt</p><table><tr><td colspan='2'>different</td></tr></table></"
         "body>",
+        bind=True,
     )
     markdown, meta, _ = convert_docx_bytes(FIXTURE.read_bytes())
-    assert "Bleibt" in markdown and "different" in markdown
+    assert "Bleibt" not in markdown and "different" not in markdown
     assert "Tabellenstruktur nicht sicher zuordenbar" in markdown
-    assert "colspan" not in markdown
-    # The stub export also lacks header and footer: both come from the source.
-    # The stub also lacks the body and footnote text: the ledger names both.
-    assert meta["word_notices"][:3] == [
+    assert "colspan" not in markdown.split("Verschachtelte Tabelle")[0]
+    assert "[Dokumenttext: Herkunft im Export nicht zuordenbar" in markdown
+    assert "Absatz EINS." in markdown and "QUERVERBUNDEN" in markdown
+    notices = meta["word_notices"]
+    assert notices[0].startswith("Dokumenttext: ")
+    assert notices[0].endswith(
+        "ohne zuordenbare Herkunft im Export, aus der Quelle ersetzt"
+    )
+    assert notices[1:] == [
         "Tabelle ohne Spaltenzuordnung ausgegeben: Exporttabelle ohne Quellzuordnung",
         "Kopfzeile (Standard) aus der Quelle angehängt",
         "Fußzeile (Standard) aus der Quelle angehängt",
-    ]
-    assert [n.split(":")[0] for n in meta["word_notices"][3:]] == [
-        "Dokumenttext",
-        "Fußnoten",
+        "Fußnoten: 1 Absatz im Export nicht enthalten, aus der Quelle angehängt",
     ]
     assert "KOPFZEILENTEXT" in markdown and "FUSSZEILENTEXT" in markdown
 

@@ -28,6 +28,7 @@ from collections import Counter
 from pathlib import Path
 
 import pytest
+from bs4 import BeautifulSoup
 from docx import Document
 from lxml import etree
 
@@ -175,7 +176,13 @@ RENDERED = {
     ],
 }
 # Probes whose every source text run must be visible verbatim once rendered.
-LITERAL = {"d09_markup_literal_kontexte.docx", "d10_markdown_literal.docx"}
+LITERAL = {
+    "d09_markup_literal_kontexte.docx",
+    "d10_markdown_literal.docx",
+    "e05_literal_contexts_new.docx",
+    "e06_literal_notes.docx",
+    "e07_literal_split_runs.docx",
+}
 # Image targets of the R5 Codex review (worker1/own.py), generated from c10:
 # (target spelling, member name, required notice).
 _TOO_BIG = "Eingebettetes Bild zu groß (30000×30000 Pixel)"
@@ -249,6 +256,9 @@ NO_NOTICES = {
     },
 }
 
+# Probes whose regional ledger is knowingly not balanced, with the reason.
+REGIONS_OPEN: dict[str, str] = {}
+
 _W = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
 _SENTINEL = re.compile(r"QX[A-Z0-9]+?QZ")
 
@@ -266,6 +276,66 @@ def source_runs(raw: bytes) -> list[str]:
                 if not any(a.tag.endswith("}Fallback") for a in node.iterancestors()):
                     runs.append(node.text or "")
     return runs
+
+
+_PARTS = {
+    f"{{{_W}}}document": "Haupttext",
+    f"{{{_W}}}hdr": "Kopfzeile",
+    f"{{{_W}}}ftr": "Fußzeile",
+    f"{{{_W}}}footnotes": "Fußnote",
+    f"{{{_W}}}endnotes": "Endnote",
+}
+
+
+def source_regions(raw: bytes) -> Counter:
+    """Sentinels per region, read from the source package itself: the part
+    (body, header, footer, footnotes, endnotes) and inside it text box or
+    table cell. Independent of the converter: it only reads the XML."""
+    found: Counter = Counter()
+    with zipfile.ZipFile(io.BytesIO(raw)) as package:
+        for name in package.namelist():
+            if not name.endswith(".xml"):
+                continue
+            root = etree.fromstring(package.read(name))
+            if root.tag not in _PARTS:
+                continue
+            for node in root.iter(f"{{{_W}}}t"):
+                tags = [a.tag for a in node.iterancestors()]
+                if any(t.endswith("}Fallback") for t in tags):
+                    continue
+                region = _PARTS[root.tag]
+                if f"{{{_W}}}txbxContent" in tags:
+                    region += "/Textfeld"
+                elif f"{{{_W}}}tc" in tags:
+                    region += "/Zelle"
+                for sentinel in _SENTINEL.findall(node.text or ""):
+                    found[(region, sentinel)] += 1
+    return found
+
+
+def output_regions(body) -> Counter:
+    """Sentinels per region of the reconciled export, by where they stand."""
+    found: Counter = Counter()
+    for node in body.find_all(string=True):
+        region = "Haupttext"
+        inner = ""
+        for parent in node.parents:
+            name, ident = parent.name, parent.get("id") or ""
+            if not inner and (
+                name in {"td", "th"} or parent.get("data-word-region") == "Zelle"
+            ):
+                inner = "/Zelle"
+            if name in {"span", "div"} and ident.startswith("Frame"):
+                inner = "/Textfeld"
+            if name == "div" and parent.get("title") in {"header", "footer"}:
+                region = "Kopfzeile" if parent["title"] == "header" else "Fußzeile"
+            if name == "div" and re.match(r"sdfootnote\d+$", ident):
+                region = "Fußnote"
+            if name == "div" and re.match(r"sdendnote\d+$", ident):
+                region = "Endnote"
+        for sentinel in _SENTINEL.findall(str(node)):
+            found[(region + inner, sentinel)] += 1
+    return found
 
 
 def rendered_text(markdown: str) -> str:
@@ -433,8 +503,9 @@ PROBES = sorted(
 def test_korpus_is_complete():
     # 48 committed reviewer probes (R1 5, R2 20 without bombe,
     # R3 23 without h17/h20a/h20b)
-    # plus 12 of the R4 Codex review (c01–c12) and 12 of the R5 one (d01–d12).
-    assert len(PROBES) == 72
+    # plus 12 of the R4 Codex review (c01–c12), 12 of the R5 one (d01–d12)
+    # and the 7 Writer documents of the R6 one (e01–e07).
+    assert len(PROBES) == 79
     named = (
         set(EXPECT)
         | set(FORBIDDEN)
@@ -462,6 +533,17 @@ def test_korpus_probe(name, client, generated, monkeypatch):
             "run",
             lambda *a, **kw: pytest.fail(f"Writer started for {name}"),
         )
+    from src.privacy_service import word_provenance as wp
+
+    reconciled = []
+    apply = wp.apply_provenance
+
+    def keep(soup, body, provenance):
+        notices = apply(soup, body, provenance)
+        reconciled.append(BeautifulSoup(str(body), "html.parser"))
+        return notices
+
+    monkeypatch.setattr(wp, "apply_provenance", keep)
     with path.open("rb") as handle:
         response = client.post(
             "/document/convert", files={"file": (name, handle, MIME)}
@@ -496,6 +578,11 @@ def test_korpus_probe(name, client, generated, monkeypatch):
     runs = source_runs(raw) if zipfile.is_zipfile(io.BytesIO(raw)) else []
     expected = Counter(_SENTINEL.findall(" ".join(runs)))
     assert Counter(_SENTINEL.findall(shown)) == expected, name
+    # ... and per region: text found in the wrong part never balances a loss.
+    if name in REGIONS_OPEN or not runs or name.endswith(".doc"):
+        return
+    (html,) = reconciled
+    assert output_regions(html) == source_regions(raw), name
     if name in LITERAL:
         visible = "".join(shown.split())
         for run in runs:

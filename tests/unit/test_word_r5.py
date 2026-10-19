@@ -57,14 +57,26 @@ def member(content, name):
         return package.read(name)
 
 
-def ledger(xml):
+def ledger(xml, stamp=False):
     """Text ledger of one body built from raw WordprocessingML paragraphs."""
     root = etree.fromstring(f"<w:document {WNS}><w:body>{xml}</w:body></w:document>")
     provenance = Provenance("wqtest_")
     wp.record_text(
-        provenance, "word/document.xml", root, [], {"footnote": set(), "endnote": set()}
+        provenance,
+        "word/document.xml",
+        root,
+        [],
+        {"footnote": set(), "endnote": set()},
+        wp._Stamper(provenance) if stamp else None,
     )
     return provenance
+
+
+def spans(provenance, part, texts):
+    """Writer's export of a part's paragraphs: sentinels around each text."""
+    pre = provenance.prefix
+    paragraphs = next(t for t in provenance.texts if t.name == part).paragraphs
+    return [f"{pre}{p.key}_{text}{pre}{p.end}_" for p, text in zip(paragraphs, texts)]
 
 
 # A1: a table Writer never exports is found by the text ledger, not by identity.
@@ -74,10 +86,12 @@ def test_source_table_missing_from_export_is_appended_and_named():
     table = document.add_table(rows=1, cols=2)
     table.cell(0, 0).text, table.cell(0, 1).text = "QXLOSTAQZ", "QXLOSTBQZ"
     prepared = ws.prepare_word(packed(document))
-    soup = BeautifulSoup("<body><p>QXBODYQZ</p></body>", "html.parser")
+    (body,) = spans(prepared.provenance, "word/document.xml", ["QXBODYQZ"])
+    soup = BeautifulSoup(f"<body><p>{body}</p></body>", "html.parser")
     notices = apply_provenance(soup, soup.body, prepared.provenance)
     assert notices == [
-        "Dokumenttext: 2 Absätze im Export nicht enthalten, aus der Quelle angehängt"
+        "Dokumenttext: 2 Absätze im Export nicht enthalten, an seiner Stelle aus der"
+        " Quelle eingefügt"
     ]
     text = soup.get_text(" ")
     assert (
@@ -136,13 +150,19 @@ def test_ledger_keeps_branches_and_text_boxes_separate():
 def test_missing_text_reports_only_lost_paragraphs_once():
     provenance = ledger(
         "<w:p><w:r><w:t>Eins</w:t></w:r></w:p>"
-        "<w:p><w:r><w:t>Zwei Drei</w:t></w:r></w:p>"
+        "<w:p><w:r><w:t>Zwei Drei</w:t></w:r></w:p>",
+        stamp=True,
     )
-    soup = BeautifulSoup("<body><p>E i n s</p></body>", "html.parser")
+    one, two = spans(provenance, "word/document.xml", ["E i n s", "ZweiDrei"])
+    soup = BeautifulSoup(f"<body><p>{one}</p></body>", "html.parser")
     ((part, paragraphs),) = missing_text(soup.body, provenance)
     assert paragraphs == ["Zwei Drei"]
-    soup = BeautifulSoup("<body><p>ZweiDrei</p><p>Eins</p></body>", "html.parser")
+    soup = BeautifulSoup(f"<body><p>{two}</p><p>{one}</p></body>", "html.parser")
+    # Each one in its own span, in whatever order Writer wrote them.
     assert missing_text(soup.body, provenance) == []
+    # Unmarked text is no occurrence of anything, even when it is the same text.
+    soup = BeautifulSoup("<body><p>Eins</p><p>ZweiDrei</p></body>", "html.parser")
+    assert len(missing_text(soup.body, provenance)[0][1]) == 2
 
 
 # A2: presence is recorded before a local flatten drops the bookmarks.
@@ -152,11 +172,13 @@ def test_flattened_header_table_is_not_reported_missing():
     table = next(t for t in provenance.tables.values() if t.part == header.name)
     assert not table.valid
     pre = provenance.prefix
+    head = spans(provenance, header.name, [f"QXAMHEAD{i}QZ" for i in range(4)])
+    (body,) = spans(provenance, "word/document.xml", ["QXHEADERAMBODYQZ"])
     soup = BeautifulSoup(
         f'<body><div title="header"><table><tr><td><a name="{pre}{header.marker}"></a>'
-        f'<a name="{pre}t{table.key}r0c0"></a>QXAMHEAD0QZ</td><td>QXAMHEAD1QZ</td></tr>'
-        "<tr><td>QXAMHEAD2QZ</td><td>QXAMHEAD3QZ</td></tr></table></div>"
-        "<p>QXHEADERAMBODYQZ</p></body>",
+        f'<a name="{pre}t{table.key}r0c0"></a>{head[0]}</td><td>{head[1]}</td></tr>'
+        f"<tr><td>{head[2]}</td><td>{head[3]}</td></tr></table></div>"
+        f"<p>{body}</p></body>",
         "html.parser",
     )
     notices = apply_provenance(soup, soup.body, provenance)

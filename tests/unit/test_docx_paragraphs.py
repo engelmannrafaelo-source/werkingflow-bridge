@@ -38,8 +38,21 @@ def test_docx_preserves_markdown_blocks_and_hard_break():
         assert base64.b64decode(image).startswith(b"\x89PNG")
 
 
-def _export_html(monkeypatch, html, *, image=None, exit_code=0, write=True):
+def _export_html(
+    monkeypatch, html, *, image=None, exit_code=0, write=True, bind=False
+):
+    """Stand in for Writer with a hand-written export.
+
+    Such an export carries none of the paragraph sentinels Writer writes, so
+    it cannot be bound to the converted document; tests using it are about
+    the HTML-to-Markdown steps and take it as it is (``bind`` reconciles it
+    anyway: a stub then stands for an export that lost every mark).
+    """
+    from src.privacy_service import word_provenance as wp
+
     monkeypatch.setattr(dc.shutil, "which", lambda name: "/test/libreoffice")
+    if not bind:
+        monkeypatch.setattr(wp, "apply_provenance", lambda soup, body, provenance: [])
 
     def run(command, **kwargs):
         root = Path(command[command.index("--outdir") + 1])
