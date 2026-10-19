@@ -130,6 +130,41 @@ def test_one_export_occurrence_serves_one_source_paragraph():
     assert text.index("QXAQZ", text.index("QXAQZ") + 1) < text.index("QXBQZ")
 
 
+def test_paragraph_region_ends_at_the_next_paragraph():
+    source = Source().body(para("QXSAMEQZ") + para("QXSAMEQZ"))
+    # The first paragraph's block came out empty; the second paragraph's
+    # occurrence is its own and cannot be borrowed by the first.
+    soup, notices = source.apply(
+        f"<p>{source.mark(0)}</p><p>{source.mark(1)}QXSAMEQZ</p>"
+    )
+    first, second = soup.find_all("p")
+    assert "QXSAMEQZ" in first.get_text() and second.get_text() == "QXSAMEQZ"
+    assert notices == [
+        "Dokumenttext: 1 Absatz im Export unvollständig, aus der Quelle ersetzt"
+    ]
+
+
+def test_field_result_copy_does_not_stand_in_for_a_lost_heading():
+    toc = (
+        '<w:p><w:fldSimple w:instr="TOC"><w:r><w:t>QXKAPQZ</w:t></w:r>'
+        "</w:fldSimple></w:p>"
+    )
+    source = Source().body(
+        toc + para("Einleitung") + para("QXKAPQZ") + para("Ende")
+    )
+    # Writer shows the table of contents (a field result, not a source unit)
+    # but lost the heading itself, bookmark and text.
+    soup, notices = source.apply(
+        f"<p>QXKAPQZ</p><p>{source.mark(0)}Einleitung</p><p>{source.mark(2)}Ende</p>"
+    )
+    assert count(soup, "QXKAPQZ") == 2
+    assert notices == [
+        "Dokumenttext: 1 Absatz im Export nicht enthalten, aus der Quelle angehängt"
+    ]
+    text = soup.body.get_text()
+    assert text.index("Einleitung") < text.rindex("QXKAPQZ") < text.index("Ende")
+
+
 @pytest.mark.parametrize("stamp", [True, False])
 def test_incomplete_paragraph_replaces_its_own_block_once(stamp):
     source = Source(stamp).body(
