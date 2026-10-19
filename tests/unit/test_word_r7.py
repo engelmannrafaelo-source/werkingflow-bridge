@@ -506,3 +506,46 @@ def test_codex_r6_probes_with_start_marks_only(name, source, html, expected):
     assert {t: count(soup, t) for t in expected} == expected, name
     # without end marks nothing is bound: never silent
     assert notices, name
+
+
+def test_place_between_neighbours_only_when_their_marks_are_adjacent():
+    # R7 mutant B6: X is lost with its marks. Writer wrote C between A and B,
+    # and before it the unmarked result of a field paragraph (nothing to
+    # deliver from the source). X's place is unknown: inserted next to A,
+    # the field text may not be taken as X's remains.
+    toc = (
+        '<w:p><w:fldSimple w:instr="TOC"><w:r><w:t>QXTOCQZ</w:t></w:r>'
+        "</w:fldSimple></w:p>"
+    )
+    s = Source().body(
+        para("QXAQZ") + para("QXXQZ") + para("QXBQZ") + toc + para("QXCQZ")
+    )
+    soup, notices = s.apply(
+        f"<p>{s.span(0, 'QXAQZ')}</p><p>QXTOCQZ</p><p>{s.span(4, 'QXCQZ')}</p>"
+        f"<p>{s.span(2, 'QXBQZ')}</p>"
+    )
+    expected = ("QXAQZ", "QXXQZ", "QXBQZ", "QXTOCQZ", "QXCQZ")
+    assert counts(soup, *expected) == dict.fromkeys(expected, 1)
+    assert notices == [
+        "Dokumenttext: 1 Absatz im Export nicht enthalten, aus der Quelle angehängt"
+    ]
+
+
+def test_lost_note_paragraph_without_place_stays_in_its_note():
+    # R7 mutant C4b: the neighbours' marks stand in two different notes, so
+    # X has no place; it goes next to its predecessor, inside that note.
+    s = (
+        Source()
+        .body(para("QXBODYQZ"))
+        .footnotes([(1, para("QXNONEQZ") + para("QXXQZ")), (2, para("QXNTWOQZ"))])
+    )
+    soup, notices = s.apply(
+        f"<p>{s.span(0, 'QXBODYQZ')}</p>"
+        f'<div id="sdfootnote1"><p>{s.span(1, "QXNONEQZ")}</p></div>'
+        f'<div id="sdfootnote2"><p>{s.span(3, "QXNTWOQZ")}</p></div>'
+    )
+    first = soup.find("div", id="sdfootnote1").get_text()
+    assert "QXXQZ" in first and count(soup, "QXXQZ") == 1
+    assert notices == [
+        "Fußnoten: 1 Absatz im Export nicht enthalten, aus der Quelle angehängt"
+    ]
