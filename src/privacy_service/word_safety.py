@@ -2,10 +2,13 @@
 
 import io
 import posixpath
+import shutil
 import zipfile
 from urllib.parse import urlsplit
 
 from lxml import etree
+
+from .word_symbols import SYMBOL_UNICODE
 
 W = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
 R = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
@@ -24,6 +27,56 @@ def safe_link(url: str) -> bool:
     }
 
 
+
+# Budgets apply before any member is inflated, independently of compressed size.
+MAX_WORD_ENTRIES = 10_000
+MAX_WORD_EXPANDED = 1_000 * 1024 * 1024
+MAX_WORD_XML_PART = 50 * 1024 * 1024
+MAX_WORD_XML_TOTAL = 100 * 1024 * 1024
+
+
+def checked_word_package(content: bytes):
+    """Return a bounded OOXML Word package; reject other ZIP payloads."""
+    from .document_converter import DocumentTooLargeError
+
+    try:
+        source = zipfile.ZipFile(io.BytesIO(content))
+    except zipfile.BadZipFile as exc:
+        raise ValueError("Kein Word-Dokument: gültiges OOXML-Paket erforderlich") from exc
+    try:
+        entries = source.infolist()
+        xml_parts = [i for i in entries if i.filename.endswith((".xml", ".rels"))]
+        if (len(entries) > MAX_WORD_ENTRIES
+                or sum(i.file_size for i in entries) > MAX_WORD_EXPANDED
+                or sum(i.file_size for i in xml_parts) > MAX_WORD_XML_TOTAL
+                or any(i.file_size > MAX_WORD_XML_PART for i in xml_parts)):
+            raise DocumentTooLargeError("Word package exceeds expanded size/entry budget")
+        names = source.namelist()
+        if len(names) != len(set(names)):
+            raise ValueError("Ambiguous Word package: duplicate ZIP entries")
+        required = {"[Content_Types].xml", "_rels/.rels", "word/document.xml"}
+        if not required.issubset(names):
+            raise ValueError("Kein Word-Dokument: OOXML Word-Teile fehlen")
+        parser = etree.XMLParser(resolve_entities=False, no_network=True)
+        document = etree.fromstring(source.read("word/document.xml"), parser)
+        types = etree.fromstring(source.read("[Content_Types].xml"), parser)
+        rels = etree.fromstring(source.read("_rels/.rels"), parser)
+        if (document.tag != f"{{{W}}}document"
+                or document.find("w:body", NS) is None
+                or not any(n.get("PartName") == "/word/document.xml"
+                           and n.get("ContentType") ==
+                           "application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"
+                           for n in types)
+                or not any(n.get("Type", "").endswith("/officeDocument")
+                           and n.get("Target", "").lstrip("/") == "word/document.xml"
+                           and n.get("TargetMode") != "External" for n in rels)):
+            raise ValueError("Kein Word-Dokument: ungültiger OOXML Word-Hauptteil")
+        return source
+    except BaseException:
+        source.close()
+        raise
+
+
 def sanitize_docx(content: bytes) -> bytes:
     """Accept insertions; discard deletions, comments and effectively hidden runs.
 
@@ -32,8 +85,9 @@ def sanitize_docx(content: bytes) -> bytes:
     No ZIP members are extracted to the filesystem.
     """
     parser = etree.XMLParser(resolve_entities=False, no_network=True)
-    with zipfile.ZipFile(io.BytesIO(content)) as source:
-        parts = {name: source.read(name) for name in source.namelist()}
+    with checked_word_package(content) as source:
+        parts = {name: source.read(name) for name in source.namelist()
+                 if name.endswith((".xml", ".rels"))}
     styles = {}
     defaults = {}
     if "word/styles.xml" in parts:
@@ -71,11 +125,29 @@ def sanitize_docx(content: bytes) -> bytes:
         if root.tag == f"{{{W}}}comments":
             for child in list(root):
                 root.remove(child)
+        # A row/cell deletion changes structure, not just run visibility.
+        for node in root.xpath("//w:tr[w:trPr/w:del] | //w:tc[w:tcPr/w:cellDel]",
+                               namespaces=NS):
+            node.getparent().remove(node)
+        for table in root.findall(".//w:tbl", NS):
+            rows = table.findall("w:tr", NS)
+            if not rows or any(not row.findall("w:tc", NS) for row in rows):
+                raise ValueError("Empty Word table geometry after tracked deletions")
         for node in root.xpath(
             "//w:del | //w:moveFrom | //w:commentReference | //w:commentRangeStart | //w:commentRangeEnd",
             namespaces=NS,
         ):
             node.getparent().remove(node)
+        for symbol in root.findall(".//w:sym", NS):
+            code = int(symbol.get(f"{{{W}}}char"), 16)
+            font = symbol.get(f"{{{W}}}font", "")
+            if font.lower() == "symbol":
+                value = SYMBOL_UNICODE.get(code - 0xF000 if code >= 0xF000 else code)
+            else:
+                value = chr(code) if not (0xE000 <= code <= 0xF8FF) else None
+            replacement = etree.Element(f"{{{W}}}t")
+            replacement.text = value or f"[Symbol aus {font}: U+{code:04X} nicht als Unicode verfügbar]"
+            symbol.getparent().replace(symbol, replacement)
         for run in list(root.findall(".//w:r", NS)):
             flags = dict(defaults)
             paragraph = next(
@@ -147,9 +219,17 @@ def sanitize_docx(content: bytes) -> bytes:
             )
         parts[name] = etree.tostring(root, xml_declaration=True, encoding="UTF-8")
     output = io.BytesIO()
-    with zipfile.ZipFile(output, "w", zipfile.ZIP_DEFLATED) as target:
-        for name, raw in parts.items():
-            target.writestr(name, raw)
+    with checked_word_package(content) as source, zipfile.ZipFile(
+        output, "w", zipfile.ZIP_DEFLATED
+    ) as target:
+        for info in source.infolist():
+            if info.filename in parts:
+                target.writestr(info, parts[info.filename])
+            else:
+                # Binary members stay out of the in-memory XML working set.
+                # Stream in bounded chunks, validating ZIP CRC on the way.
+                with source.open(info) as reader, target.open(info, "w") as writer:
+                    shutil.copyfileobj(reader, writer, length=64 * 1024)
     return output.getvalue()
 
 
@@ -166,53 +246,59 @@ def _visibility(properties):
 def restore_table_geometry(soup, content: bytes) -> None:
     """Restore OOXML cell spans; Writer can put a colspan on the wrong cell.
 
-    Match tables by their text, then pair physical cells within each row.
-    Ambiguity or changed cell counts is a loud failure, never a shifted value.
+    Pair tables in document order within each Word part, independently of
+    dynamic field results and symbol text. Only spanned tables need repair.
+    Row/cell counts still guard against shifted data.
     """
-    import re
-
-    def signature(text):
-        return re.sub(r"\s+", "", text)
-
-    candidates = {}
-    with zipfile.ZipFile(io.BytesIO(content)) as source:
+    groups = {"body": [], "header": [], "footer": [], "footnotes": [], "endnotes": []}
+    part_counts = {key: 0 for key in groups}
+    with checked_word_package(content) as source:
         for name in source.namelist():
-            if name.startswith("word/") and name.endswith(".xml"):
-                root = etree.fromstring(
-                    source.read(name),
-                    etree.XMLParser(resolve_entities=False, no_network=True),
-                )
-                for table in root.findall(".//w:tbl", NS):
-                    key = signature(
-                        "".join(table.xpath(".//w:t/text()", namespaces=NS))
-                    )
-                    candidates.setdefault(key, []).append(table)
+            if name == "word/document.xml":
+                group = "body"
+            elif name.startswith("word/header") and name.endswith(".xml"):
+                group = "header"
+            elif name.startswith("word/footer") and name.endswith(".xml"):
+                group = "footer"
+            elif name in {"word/footnotes.xml", "word/endnotes.xml"}:
+                group = name.split("/")[-1].split(".")[0]
+            else:
+                continue
+            root = etree.fromstring(source.read(name),
+                                    etree.XMLParser(resolve_entities=False, no_network=True))
+            tables = root.findall(".//w:tbl", NS)
+            if tables:
+                part_counts[group] += 1
+            groups[group].extend(tables)
+
+    html_groups = {key: [] for key in groups}
     for table in soup.find_all("table"):
-        key = signature(table.get_text())
-        matches = candidates.get(key, [])
-        if not matches:
-            raise ValueError("Word table geometry cannot be matched to source")
-        layouts = {
-            tuple(
-                tuple(
-                    tuple(
-                        (
-                            name,
-                            None
-                            if (prop := cell.find(f"w:tcPr/w:{name}", NS)) is None
-                            else prop.get(f"{{{W}}}val", "continue"),
-                        )
-                        for name in ("gridSpan", "vMerge")
-                    )
-                    for cell in row.findall("w:tc", NS)
-                )
-                for row in candidate.findall("w:tr", NS)
-            )
-            for candidate in matches
-        }
-        if len(layouts) > 1:
-            raise ValueError("Ambiguous Word table geometry for identical text")
-        source_table = matches.pop(0)
+        group = "body"
+        for parent in table.parents:
+            if parent.get("title") in {"header", "footer"}:
+                group = parent["title"]
+                break
+            identity = parent.get("id", "")
+            if identity.startswith("sdfootnote"):
+                group = "footnotes"
+                break
+            if identity.startswith("sdendnote"):
+                group = "endnotes"
+                break
+        html_groups[group].append(table)
+    pairs = []
+    for group, sources in groups.items():
+        # Ordinary tables need no source matching: Writer handles fields,
+        # tabs, protected hyphens and symbols itself.
+        if not any(t.xpath(".//w:gridSpan | .//w:vMerge", namespaces=NS) for t in sources):
+            continue
+        if part_counts[group] > 1:
+            raise ValueError("Ambiguous Word table geometry: multiple " + group + " parts")
+        exports = html_groups[group]
+        if len(sources) != len(exports):
+            raise ValueError("Ambiguous Word table geometry: table count changed in " + group)
+        pairs.extend(zip(sources, exports))
+    for source_table, table in pairs:
         source_rows = source_table.findall("w:tr", NS)
         html_rows = [r for r in table.find_all("tr") if r.find_parent("table") is table]
         if len(source_rows) != len(html_rows):

@@ -136,7 +136,7 @@ def test_unsafe_links_become_text(scheme, monkeypatch):
     from tests.unit.test_docx_paragraphs import _export_html
 
     _export_html(monkeypatch, f'<body><p><a href="{scheme}">Caption</a></p></body>')
-    markdown, _, _ = convert_docx_bytes(b"word")
+    markdown, _, _ = convert_docx_bytes((Path(__file__).parents[1] / "fixtures/docx/paragraphs.docx").read_bytes())
     assert markdown == "Caption"
 
 
@@ -200,7 +200,7 @@ def test_simple_table_escapes_literal_pipe(monkeypatch):
         "<body><table><tr><td>Label</td><td>Value</td></tr>"
         "<tr><td>A | B</td><td>1.5</td></tr></table></body>",
     )
-    markdown, _, _ = convert_docx_bytes(b"word")
+    markdown, _, _ = convert_docx_bytes((Path(__file__).parents[1] / "fixtures/docx/paragraphs.docx").read_bytes())
     assert r"| A \| B | 1.5 |" in markdown
 
 
@@ -208,7 +208,7 @@ def test_changed_cell_count_is_loud():
     from src.privacy_service.word_safety import restore_table_geometry
 
     soup = BeautifulSoup("<table><tr><td>different</td></tr></table>", "html.parser")
-    with pytest.raises(ValueError, match="cannot be matched"):
+    with pytest.raises(ValueError, match="table count changed"):
         restore_table_geometry(soup, FIXTURE.read_bytes())
 
 

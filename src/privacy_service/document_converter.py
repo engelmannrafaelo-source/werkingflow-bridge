@@ -1191,7 +1191,7 @@ def convert_docx_bytes(content: bytes) -> tuple[str, dict[str, Any], dict[str, s
     from bs4 import BeautifulSoup
     from markdownify import markdownify
 
-    from .image_format import resize_word_image
+    from .image_format import UnprocessableWordImage, resize_word_image
     from .word_safety import (
         EXTERNAL_IMAGE_NOTICE,
         restore_table_geometry,
@@ -1218,8 +1218,7 @@ def convert_docx_bytes(content: bytes) -> tuple[str, dict[str, Any], dict[str, s
             word_content = (root / "legacy.docx").read_bytes()
         else:
             word_content = content
-        if zipfile.is_zipfile(io.BytesIO(word_content)):
-            word_content = sanitize_docx(word_content)
+        word_content = sanitize_docx(word_content)
         (root / "input.docx").write_bytes(word_content)
         # A private profile prevents concurrent conversions attaching to another
         # Writer process and returning before their own output exists.
@@ -1248,9 +1247,10 @@ def convert_docx_bytes(content: bytes) -> tuple[str, dict[str, Any], dict[str, s
             if node.find_parent("pre"):
                 continue
             text = re.sub(r"\s+", " ", str(node))
-            if node.previous_sibling is None or getattr(node.previous_sibling, "name", None) == "br":
+            block = node.parent.name in {"p", "li", "td", "th", "h1", "h2", "h3", "h4", "h5", "h6"}
+            if (block and node.previous_sibling is None) or getattr(node.previous_sibling, "name", None) == "br":
                 text = text.lstrip()
-            if node.next_sibling is None or getattr(node.next_sibling, "name", None) == "br":
+            if (block and node.next_sibling is None) or getattr(node.next_sibling, "name", None) == "br":
                 text = text.rstrip()
             if not text or (not text.strip() and node.parent.name in {
                 "body", "table", "thead", "tbody", "tfoot", "tr", "ul", "ol",
@@ -1272,7 +1272,12 @@ def convert_docx_bytes(content: bytes) -> tuple[str, dict[str, Any], dict[str, s
             path = (root / source).resolve()
             if not source or path.parent != root.resolve() or not path.is_file():
                 raise RuntimeError(f"Word image is not a local export artifact: {source!r}")
-            raw, extension = resize_word_image(path.read_bytes(), MAX_IMAGE_EDGE)
+            try:
+                raw, extension = resize_word_image(path.read_bytes(), MAX_IMAGE_EDGE)
+            except UnprocessableWordImage as exc:
+                logger.warning("Word image omitted with visible notice: %s", exc)
+                image.replace_with("[Eingebettetes Bild nicht verarbeitbar]")
+                continue
             name = path.stem + extension
             images[name] = base64.b64encode(raw).decode("ascii")
             image["src"] = name
@@ -1305,6 +1310,8 @@ def convert_docx_bytes(content: bytes) -> tuple[str, dict[str, Any], dict[str, s
                 html_tables[marker] = "\n\n" + notice + "\n\n" + str(table) + "\n\n"
                 table.replace_with(marker)
             else:
+                for line_break in table.find_all("br"):
+                    line_break.replace_with(" ")
                 for column in table.find_all(["col", "colgroup"]):
                     column.decompose()
                 for node in list(table.find_all(string=True)):
@@ -1314,7 +1321,7 @@ def convert_docx_bytes(content: bytes) -> tuple[str, dict[str, Any], dict[str, s
                     for cell in first_row.find_all("td", recursive=False):
                         cell.name = "th"
         markdown = markdownify(
-            str(soup.body), heading_style="ATX", escape_misc=False,
+            str(soup.body), heading_style="ATX", escape_misc=False, escape_asterisks=False,
         ).strip()
         for marker, table_html in html_tables.items():
             markdown = markdown.replace(marker, table_html)
@@ -1603,9 +1610,8 @@ def convert_eml_bytes(content: bytes) -> Tuple[str, Dict[str, Any], Dict[str, st
 
 @_mojibake_repaired
 def convert_image_bytes(content: bytes, suffix: str = ".png") -> Tuple[str, Dict[str, Any], Dict[str, str]]:
-    """Image → Markdown via Docling (best-effort).
-        from docling.datamodel.base_models import InputFormat  # noqa: F401  (sanity import)
-        from docling.document_converter import DocumentConverter
+    """Image → Markdown via Docling using InputFormat.IMAGE (best-effort).
+
     If the running Docling build lacks that input format, fail loud.
     """
     try:
