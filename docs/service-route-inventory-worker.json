@@ -1,23 +1,879 @@
 {
-  "_doc": "Worker-App (src/main.py) routes outside docs/service-route-inventory.json that an app principal can reach with its service token or a bearer credential. Assessed R14 (19.10.2026) after the R13 second review: none of them issues tokens, credentials, principals or scopes, and none touches image egress. Gate = dependency the route must carry (tests/unit/test_r14_worker_routes.py).",
-  "routes": [
-    {"path": "/health/reset", "methods": ["POST"], "gate": "require_admin", "data": "mutation: resets provider breaker state", "assessment": "admin mutation; app principals must not reset shared provider health -> bridge:admin (changed in R14)"},
-    {"path": "/debug/tokens", "methods": ["GET"], "gate": "require_service_token", "data": "token count, rotation index, file paths, fingerprints; no key material (test_debug_tokens_endpoint)", "assessment": "diagnostic read; no secret, no bild relevance; stays service-token"},
-    {"path": "/license-health", "methods": ["GET"], "gate": "require_service_token", "data": "license/token health without previews (incident 02.09.2026)", "assessment": "diagnostic read; stays service-token"},
-    {"path": "/v1/debug/request", "methods": ["POST"], "gate": "require_service_token", "data": "echo of the caller's own request for validation", "assessment": "self-diagnostic; no cross-tenant data; stays service-token"},
-    {"path": "/v1/metrics", "methods": ["GET"], "gate": "HTTPBearer", "data": "aggregate counters", "assessment": "operational metrics; handler verifies bearer; no credential or image path"},
-    {"path": "/v1/metrics/attribution", "methods": ["GET"], "gate": "HTTPBearer", "data": "attribution counters", "assessment": "operational metrics"},
-    {"path": "/v1/metrics/jobs-retention", "methods": ["GET"], "gate": "HTTPBearer", "data": "retention counters", "assessment": "operational metrics"},
-    {"path": "/v1/metrics/anonymization", "methods": ["GET"], "gate": "HTTPBearer", "data": "anonymization counters", "assessment": "operational metrics"},
-    {"path": "/v1/metrics/prompt-performance", "methods": ["GET"], "gate": "HTTPBearer", "data": "latency/quality aggregates", "assessment": "operational metrics"},
-    {"path": "/v1/metrics/prompt-performance/timeline", "methods": ["GET"], "gate": "HTTPBearer", "data": "latency/quality aggregates", "assessment": "operational metrics"},
-    {"path": "/v1/metrics/prompt-performance/calls", "methods": ["GET"], "gate": "HTTPBearer", "data": "per-call aggregates", "assessment": "operational metrics"},
-    {"path": "/v1/metrics/throughput", "methods": ["GET"], "gate": "HTTPBearer", "data": "throughput counters", "assessment": "operational metrics"},
-    {"path": "/v1/metrics/usage-breakdown", "methods": ["GET"], "gate": "HTTPBearer", "data": "usage aggregates", "assessment": "operational metrics"},
-    {"path": "/v1/metrics/document-performance", "methods": ["GET"], "gate": "HTTPBearer", "data": "document pipeline aggregates", "assessment": "operational metrics"},
-    {"path": "/v1/metrics/request-log", "methods": ["GET"], "gate": "HTTPBearer", "data": "recent request log entries", "assessment": "operational diagnostics; no credentials"},
-    {"path": "/v1/metrics/cc-usage-history", "methods": ["GET"], "gate": "HTTPBearer", "data": "usage history", "assessment": "operational metrics"},
-    {"path": "/v1/metrics/cc-usage-snapshot", "methods": ["POST"], "gate": "HTTPBearer", "data": "usage snapshot write", "assessment": "metrics write; no credential or image path"},
-    {"path": "/v1/metrics/queue-forecast", "methods": ["GET"], "gate": "HTTPBearer", "data": "queue forecast", "assessment": "operational metrics"}
-  ]
+ "_doc": "Every effective worker route (src/main.py incl. included routers), one row per method, built by scripts/worker_route_inventory.py from the real app. enforcement: dependency | handler (verifier[, via]) | public (reason in tests/unit/test_no_unauthenticated_routes.PUBLIC_ROUTES) | none (declared gate without enforcement, offen = where the fix is). Checked by tests/unit/test_r15_worker_route_inventory.py: completeness in both directions, gate present, enforcement real (behavioural probe or verifier source).",
+ "routes": [
+  {
+   "path": "/debug/tokens",
+   "method": "GET",
+   "gate": "require_service_token",
+   "dependencies": [
+    "require_service_token"
+   ],
+   "endpoint": "src.main.debug_tokens",
+   "has_body": false,
+   "data": "token count/rotation, no key material",
+   "assessment": "service-token diagnostic",
+   "enforcement": "dependency"
+  },
+  {
+   "path": "/health",
+   "method": "GET",
+   "gate": "none",
+   "dependencies": [],
+   "endpoint": "src.main.health_check",
+   "has_body": false,
+   "data": "liveness + provider health flags",
+   "assessment": "public by decision; no key material, no customer data",
+   "enforcement": "public"
+  },
+  {
+   "path": "/health/reset",
+   "method": "POST",
+   "gate": "require_admin",
+   "dependencies": [
+    "HTTPBearer",
+    "require_admin",
+    "require_jwt_or_service"
+   ],
+   "endpoint": "src.main.reset_provider_health_endpoint",
+   "has_body": false,
+   "data": "mutation: resets provider breaker state",
+   "assessment": "bridge:admin only (R14); app principals 403",
+   "enforcement": "dependency"
+  },
+  {
+   "path": "/internal/privacy/messages",
+   "method": "POST",
+   "gate": "none",
+   "dependencies": [],
+   "endpoint": "src.providers.privacy_proxy.messages",
+   "has_body": false,
+   "data": "text-only Anthropic call; app label never grants images",
+   "assessment": "internal: hmac of PRIVACY_MODEL_PROXY_TOKEN in handler before body read; not reachable with an app token",
+   "enforcement": "handler",
+   "verifier": "PRIVACY_MODEL_PROXY_TOKEN"
+  },
+  {
+   "path": "/internal/privacy/vision",
+   "method": "POST",
+   "gate": "none",
+   "dependencies": [],
+   "endpoint": "src.providers.privacy_proxy.vision",
+   "has_body": false,
+   "data": "Gemini-only vision call",
+   "assessment": "internal: hmac of PRIVACY_MODEL_PROXY_TOKEN in handler before body read; not reachable with an app token",
+   "enforcement": "handler",
+   "verifier": "PRIVACY_MODEL_PROXY_TOKEN"
+  },
+  {
+   "path": "/license-health",
+   "method": "GET",
+   "gate": "require_service_token",
+   "dependencies": [
+    "require_service_token"
+   ],
+   "endpoint": "src.main.license_health_check",
+   "has_body": false,
+   "data": "license health without previews",
+   "assessment": "service-token diagnostic",
+   "enforcement": "dependency"
+  },
+  {
+   "path": "/rate-limits",
+   "method": "GET",
+   "gate": "none",
+   "dependencies": [],
+   "endpoint": "src.main.get_rate_limits",
+   "has_body": false,
+   "data": "current limits",
+   "assessment": "public by decision; no key material, no customer data",
+   "enforcement": "public"
+  },
+  {
+   "path": "/ready",
+   "method": "GET",
+   "gate": "none",
+   "dependencies": [],
+   "endpoint": "src.main.ready_check",
+   "has_body": false,
+   "data": "active request count",
+   "assessment": "public by decision; no key material, no customer data",
+   "enforcement": "public"
+  },
+  {
+   "path": "/stats",
+   "method": "GET",
+   "gate": "none",
+   "dependencies": [],
+   "endpoint": "src.main.get_stats",
+   "has_body": false,
+   "data": "aggregate counters",
+   "assessment": "public by decision; no key material, no customer data",
+   "enforcement": "public"
+  },
+  {
+   "path": "/v1/audio/transcriptions",
+   "method": "POST",
+   "gate": "HTTPBearer",
+   "dependencies": [
+    "HTTPBearer"
+   ],
+   "endpoint": "src.main.audio_transcriptions",
+   "has_body": false,
+   "data": "speech to text",
+   "assessment": "verify_api_key in handler; app principal scoped by enforce_app_request/bild_policy",
+   "enforcement": "handler",
+   "verifier": "verify_api_key"
+  },
+  {
+   "path": "/v1/auth/status",
+   "method": "GET",
+   "gate": "none",
+   "dependencies": [],
+   "endpoint": "src.main.get_auth_status",
+   "has_body": false,
+   "data": "whether auth is configured; no credentials",
+   "assessment": "public by decision; no key material, no customer data",
+   "enforcement": "public"
+  },
+  {
+   "path": "/v1/chat/completions",
+   "method": "POST",
+   "gate": "HTTPBearer",
+   "dependencies": [
+    "HTTPBearer",
+    "cache_request_body_dependency"
+   ],
+   "endpoint": "src.main.chat_completions",
+   "has_body": true,
+   "data": "chat completion",
+   "assessment": "verify_api_key inside _chat_completions_lauf; image egress decided at bild_policy",
+   "enforcement": "handler",
+   "verifier": "verify_api_key",
+   "via": "_chat_completions_lauf"
+  },
+  {
+   "path": "/v1/cli-sessions",
+   "method": "DELETE",
+   "gate": "HTTPBearer",
+   "dependencies": [
+    "HTTPBearer"
+   ],
+   "endpoint": "src.main.cleanup_old_cli_sessions",
+   "has_body": false,
+   "data": "mutation: cleanup of finished CLI runs",
+   "assessment": "operator view across all callers: _verify_operator_key (shared key; resolved app principal 403) — BR13",
+   "enforcement": "handler",
+   "verifier": "_verify_operator_key"
+  },
+  {
+   "path": "/v1/cli-sessions",
+   "method": "GET",
+   "gate": "HTTPBearer",
+   "dependencies": [
+    "HTTPBearer"
+   ],
+   "endpoint": "src.main.list_cli_sessions",
+   "has_body": false,
+   "data": "all CLI runs incl. prompt[:200]",
+   "assessment": "operator view across all callers: _verify_operator_key (shared key; resolved app principal 403) — BR13",
+   "enforcement": "handler",
+   "verifier": "_verify_operator_key"
+  },
+  {
+   "path": "/v1/cli-sessions/stats",
+   "method": "GET",
+   "gate": "HTTPBearer",
+   "dependencies": [
+    "HTTPBearer"
+   ],
+   "endpoint": "src.main.get_cli_session_stats",
+   "has_body": false,
+   "data": "CLI counters",
+   "assessment": "operator view across all callers: _verify_operator_key (shared key; resolved app principal 403) — BR13",
+   "enforcement": "handler",
+   "verifier": "_verify_operator_key"
+  },
+  {
+   "path": "/v1/cli-sessions/{cli_session_id}",
+   "method": "DELETE",
+   "gate": "HTTPBearer",
+   "dependencies": [
+    "HTTPBearer"
+   ],
+   "endpoint": "src.main.cancel_cli_session",
+   "has_body": false,
+   "data": "mutation: aborts a running call",
+   "assessment": "operator view across all callers: _verify_operator_key (shared key; resolved app principal 403) — BR13",
+   "enforcement": "handler",
+   "verifier": "_verify_operator_key"
+  },
+  {
+   "path": "/v1/cli-sessions/{cli_session_id}",
+   "method": "GET",
+   "gate": "HTTPBearer",
+   "dependencies": [
+    "HTTPBearer"
+   ],
+   "endpoint": "src.main.get_cli_session",
+   "has_body": false,
+   "data": "one CLI run",
+   "assessment": "operator view across all callers: _verify_operator_key (shared key; resolved app principal 403) — BR13",
+   "enforcement": "handler",
+   "verifier": "_verify_operator_key"
+  },
+  {
+   "path": "/v1/compatibility",
+   "method": "POST",
+   "gate": "none",
+   "dependencies": [],
+   "endpoint": "src.main.check_compatibility",
+   "has_body": true,
+   "data": "protocol negotiation",
+   "assessment": "public by decision; no key material, no customer data",
+   "enforcement": "public"
+  },
+  {
+   "path": "/v1/convert-docx-to-html",
+   "method": "POST",
+   "gate": "HTTPBearer",
+   "dependencies": [
+    "HTTPBearer"
+   ],
+   "endpoint": "src.main.convert_docx_to_html_endpoint",
+   "has_body": false,
+   "data": "docx->html",
+   "assessment": "verify_api_key in handler; app principal scoped by enforce_app_request/bild_policy",
+   "enforcement": "handler",
+   "verifier": "verify_api_key"
+  },
+  {
+   "path": "/v1/convert-html-to-docx",
+   "method": "POST",
+   "gate": "HTTPBearer",
+   "dependencies": [
+    "HTTPBearer"
+   ],
+   "endpoint": "src.main.convert_html_to_docx_endpoint",
+   "has_body": false,
+   "data": "html->docx",
+   "assessment": "verify_api_key in handler; app principal scoped by enforce_app_request/bild_policy",
+   "enforcement": "handler",
+   "verifier": "verify_api_key"
+  },
+  {
+   "path": "/v1/convert-html-to-pdf",
+   "method": "POST",
+   "gate": "HTTPBearer",
+   "dependencies": [
+    "HTTPBearer"
+   ],
+   "endpoint": "src.main.convert_html_to_pdf_endpoint",
+   "has_body": false,
+   "data": "html->pdf",
+   "assessment": "verify_api_key in handler; app principal scoped by enforce_app_request/bild_policy",
+   "enforcement": "handler",
+   "verifier": "verify_api_key"
+  },
+  {
+   "path": "/v1/convert-html-to-screenshot",
+   "method": "POST",
+   "gate": "HTTPBearer",
+   "dependencies": [
+    "HTTPBearer"
+   ],
+   "endpoint": "src.main.convert_html_to_screenshot_endpoint",
+   "has_body": false,
+   "data": "html->png",
+   "assessment": "verify_api_key in handler; app principal scoped by enforce_app_request/bild_policy",
+   "enforcement": "handler",
+   "verifier": "verify_api_key"
+  },
+  {
+   "path": "/v1/convert-pdf",
+   "method": "POST",
+   "gate": "HTTPBearer",
+   "dependencies": [
+    "HTTPBearer"
+   ],
+   "endpoint": "src.main.convert_pdf_endpoint",
+   "has_body": false,
+   "data": "pdf->markdown",
+   "assessment": "verify_api_key in handler; app principal scoped by enforce_app_request/bild_policy",
+   "enforcement": "handler",
+   "verifier": "verify_api_key"
+  },
+  {
+   "path": "/v1/convert-pdf-to-html-direct",
+   "method": "POST",
+   "gate": "HTTPBearer",
+   "dependencies": [
+    "HTTPBearer"
+   ],
+   "endpoint": "src.main.convert_pdf_to_html_direct_endpoint",
+   "has_body": false,
+   "data": "pdf->html",
+   "assessment": "verify_api_key in handler; app principal scoped by enforce_app_request/bild_policy",
+   "enforcement": "handler",
+   "verifier": "verify_api_key"
+  },
+  {
+   "path": "/v1/convert-pdf-to-semantic-html",
+   "method": "POST",
+   "gate": "HTTPBearer",
+   "dependencies": [
+    "HTTPBearer"
+   ],
+   "endpoint": "src.main.convert_pdf_to_semantic_html_endpoint",
+   "has_body": false,
+   "data": "pdf->html",
+   "assessment": "verify_api_key in handler; app principal scoped by enforce_app_request/bild_policy",
+   "enforcement": "handler",
+   "verifier": "verify_api_key"
+  },
+  {
+   "path": "/v1/debug/request",
+   "method": "POST",
+   "gate": "require_service_token",
+   "dependencies": [
+    "require_service_token"
+   ],
+   "endpoint": "src.main.debug_request_validation",
+   "has_body": false,
+   "data": "echo of own request",
+   "assessment": "service-token self-diagnostic",
+   "enforcement": "dependency"
+  },
+  {
+   "path": "/v1/doc-agent",
+   "method": "POST",
+   "gate": "HTTPBearer",
+   "dependencies": [
+    "HTTPBearer",
+    "adaptive_limit_dependency"
+   ],
+   "endpoint": "src.main.doc_agent",
+   "has_body": true,
+   "data": "document agent run",
+   "assessment": "verify_api_key in handler; app principal scoped by enforce_app_request/bild_policy",
+   "enforcement": "handler",
+   "verifier": "verify_api_key"
+  },
+  {
+   "path": "/v1/document/convert",
+   "method": "POST",
+   "gate": "HTTPBearer",
+   "dependencies": [
+    "HTTPBearer"
+   ],
+   "endpoint": "src.main.convert_document_endpoint",
+   "has_body": false,
+   "data": "document->markdown; describe_images never for Energy",
+   "assessment": "verify_api_key in handler; app principal scoped by enforce_app_request/bild_policy",
+   "enforcement": "handler",
+   "verifier": "verify_api_key"
+  },
+  {
+   "path": "/v1/document/convert-and-anonymize",
+   "method": "POST",
+   "gate": "HTTPBearer",
+   "dependencies": [
+    "HTTPBearer"
+   ],
+   "endpoint": "src.main.convert_and_anonymize_document_endpoint",
+   "has_body": false,
+   "data": "convert + anonymise",
+   "assessment": "verify_api_key in handler; app principal scoped by enforce_app_request/bild_policy",
+   "enforcement": "handler",
+   "verifier": "verify_api_key"
+  },
+  {
+   "path": "/v1/erkunder/bericht/{bericht_id}/aufraeumen",
+   "method": "POST",
+   "gate": "HTTPBearer",
+   "dependencies": [
+    "HTTPBearer"
+   ],
+   "endpoint": "src.erkunder.routes.aufraeumen",
+   "has_body": false,
+   "data": "erkunder result / cleanup",
+   "assessment": "verify_api_key inside _forward",
+   "enforcement": "handler",
+   "verifier": "verify_api_key",
+   "via": "_forward"
+  },
+  {
+   "path": "/v1/erkunder/bericht/{bericht_id}/ergebnis",
+   "method": "GET",
+   "gate": "HTTPBearer",
+   "dependencies": [
+    "HTTPBearer"
+   ],
+   "endpoint": "src.erkunder.routes.ergebnis",
+   "has_body": false,
+   "data": "erkunder result / cleanup",
+   "assessment": "verify_api_key inside _forward",
+   "enforcement": "handler",
+   "verifier": "verify_api_key",
+   "via": "_forward"
+  },
+  {
+   "path": "/v1/erkunder/bibliothek",
+   "method": "GET",
+   "gate": "HTTPBearer",
+   "dependencies": [
+    "HTTPBearer"
+   ],
+   "endpoint": "src.erkunder.routes.bibliothek",
+   "has_body": false,
+   "data": "erkunder library",
+   "assessment": "verify_api_key in handler; app principal scoped by enforce_app_request/bild_policy",
+   "enforcement": "handler",
+   "verifier": "verify_api_key"
+  },
+  {
+   "path": "/v1/jobs",
+   "method": "GET",
+   "gate": "HTTPBearer",
+   "dependencies": [
+    "HTTPBearer"
+   ],
+   "endpoint": "src.jobs.routes.list_jobs_endpoint",
+   "has_body": false,
+   "data": "own jobs",
+   "assessment": "verify_api_key in handler; app principal scoped by enforce_app_request/bild_policy",
+   "enforcement": "handler",
+   "verifier": "verify_api_key"
+  },
+  {
+   "path": "/v1/jobs",
+   "method": "POST",
+   "gate": "HTTPBearer",
+   "dependencies": [
+    "HTTPBearer"
+   ],
+   "endpoint": "src.jobs.routes.create_job_endpoint",
+   "has_body": true,
+   "data": "generic async job",
+   "assessment": "verify_api_key in handler; app principal scoped by enforce_app_request/bild_policy",
+   "enforcement": "handler",
+   "verifier": "verify_api_key"
+  },
+  {
+   "path": "/v1/jobs/{job_id}",
+   "method": "DELETE",
+   "gate": "HTTPBearer",
+   "dependencies": [
+    "HTTPBearer"
+   ],
+   "endpoint": "src.jobs.routes.cancel_job_endpoint",
+   "has_body": false,
+   "data": "cancel own job",
+   "assessment": "verify_api_key in handler; app principal scoped by enforce_app_request/bild_policy",
+   "enforcement": "handler",
+   "verifier": "verify_api_key"
+  },
+  {
+   "path": "/v1/jobs/{job_id}",
+   "method": "GET",
+   "gate": "HTTPBearer",
+   "dependencies": [
+    "HTTPBearer"
+   ],
+   "endpoint": "src.jobs.routes.get_job_endpoint",
+   "has_body": false,
+   "data": "own job",
+   "assessment": "verify_api_key in handler; app principal scoped by enforce_app_request/bild_policy",
+   "enforcement": "handler",
+   "verifier": "verify_api_key"
+  },
+  {
+   "path": "/v1/metrics",
+   "method": "GET",
+   "gate": "HTTPBearer",
+   "dependencies": [
+    "HTTPBearer"
+   ],
+   "endpoint": "src.main.get_performance_metrics",
+   "has_body": false,
+   "data": "performance summary",
+   "assessment": "declared HTTPBearer but the handler never calls verify_api_key: reachable without a key. Not an Energy image/credential path. Fix exists as BR14 (bridge 9579599, not in develop); needs scraper/daemon keys first.",
+   "enforcement": "none",
+   "offen": "BR14 9579599 / hotfix 9306dee — not in develop"
+  },
+  {
+   "path": "/v1/metrics/account-pool-state",
+   "method": "GET",
+   "gate": "none",
+   "dependencies": [],
+   "endpoint": "src.main.get_account_pool_state",
+   "has_body": false,
+   "data": "limiter snapshot for nginx pool-router",
+   "assessment": "public by decision; no key material, no customer data",
+   "enforcement": "public"
+  },
+  {
+   "path": "/v1/metrics/anonymization",
+   "method": "GET",
+   "gate": "HTTPBearer",
+   "dependencies": [
+    "HTTPBearer"
+   ],
+   "endpoint": "src.main.get_anonymization_metrics",
+   "has_body": false,
+   "data": "audit counters",
+   "assessment": "verify_api_key in handler; app principal scoped by enforce_app_request/bild_policy",
+   "enforcement": "handler",
+   "verifier": "verify_api_key"
+  },
+  {
+   "path": "/v1/metrics/attribution",
+   "method": "GET",
+   "gate": "HTTPBearer",
+   "dependencies": [
+    "HTTPBearer"
+   ],
+   "endpoint": "src.main.get_attribution_metrics",
+   "has_body": false,
+   "data": "attribution counters",
+   "assessment": "declared HTTPBearer but the handler never calls verify_api_key: reachable without a key. Not an Energy image/credential path. Fix exists as BR14 (bridge 9579599, not in develop); needs scraper/daemon keys first.",
+   "enforcement": "none",
+   "offen": "BR14 9579599 / hotfix 9306dee — not in develop"
+  },
+  {
+   "path": "/v1/metrics/cc-usage-history",
+   "method": "GET",
+   "gate": "HTTPBearer",
+   "dependencies": [
+    "HTTPBearer"
+   ],
+   "endpoint": "src.main.get_cc_usage_history",
+   "has_body": false,
+   "data": "account usage history",
+   "assessment": "declared HTTPBearer but the handler never calls verify_api_key: reachable without a key. Not an Energy image/credential path. Fix exists as BR14 (bridge 9579599, not in develop); needs scraper/daemon keys first.",
+   "enforcement": "none",
+   "offen": "BR14 9579599 / hotfix 9306dee — not in develop"
+  },
+  {
+   "path": "/v1/metrics/cc-usage-snapshot",
+   "method": "POST",
+   "gate": "HTTPBearer",
+   "dependencies": [
+    "HTTPBearer"
+   ],
+   "endpoint": "src.main.save_cc_usage_snapshot",
+   "has_body": false,
+   "data": "mutation: writes quota store the adaptive limiter reads",
+   "assessment": "declared HTTPBearer but the handler never calls verify_api_key: reachable without a key. Not an Energy image/credential path. Fix exists as BR14 (bridge 9579599, not in develop); needs scraper/daemon keys first.",
+   "enforcement": "none",
+   "offen": "BR14 9579599 / hotfix 9306dee — not in develop"
+  },
+  {
+   "path": "/v1/metrics/document-performance",
+   "method": "GET",
+   "gate": "HTTPBearer",
+   "dependencies": [
+    "HTTPBearer"
+   ],
+   "endpoint": "src.main.get_document_performance",
+   "has_body": false,
+   "data": "document pipeline aggregates",
+   "assessment": "declared HTTPBearer but the handler never calls verify_api_key: reachable without a key. Not an Energy image/credential path. Fix exists as BR14 (bridge 9579599, not in develop); needs scraper/daemon keys first.",
+   "enforcement": "none",
+   "offen": "BR14 9579599 / hotfix 9306dee — not in develop"
+  },
+  {
+   "path": "/v1/metrics/jobs-retention",
+   "method": "GET",
+   "gate": "HTTPBearer",
+   "dependencies": [
+    "HTTPBearer"
+   ],
+   "endpoint": "src.main.get_jobs_retention_metrics",
+   "has_body": false,
+   "data": "retention counters",
+   "assessment": "declared HTTPBearer but the handler never calls verify_api_key: reachable without a key. Not an Energy image/credential path. Fix exists as BR14 (bridge 9579599, not in develop); needs scraper/daemon keys first.",
+   "enforcement": "none",
+   "offen": "BR14 9579599 / hotfix 9306dee — not in develop"
+  },
+  {
+   "path": "/v1/metrics/prompt-performance",
+   "method": "GET",
+   "gate": "HTTPBearer",
+   "dependencies": [
+    "HTTPBearer"
+   ],
+   "endpoint": "src.main.get_prompt_performance",
+   "has_body": false,
+   "data": "latency/quality aggregates",
+   "assessment": "declared HTTPBearer but the handler never calls verify_api_key: reachable without a key. Not an Energy image/credential path. Fix exists as BR14 (bridge 9579599, not in develop); needs scraper/daemon keys first.",
+   "enforcement": "none",
+   "offen": "BR14 9579599 / hotfix 9306dee — not in develop"
+  },
+  {
+   "path": "/v1/metrics/prompt-performance/calls",
+   "method": "GET",
+   "gate": "HTTPBearer",
+   "dependencies": [
+    "HTTPBearer"
+   ],
+   "endpoint": "src.main.get_prompt_calls",
+   "has_body": false,
+   "data": "per-call rows incl. user_id",
+   "assessment": "declared HTTPBearer but the handler never calls verify_api_key: reachable without a key. Not an Energy image/credential path. Fix exists as BR14 (bridge 9579599, not in develop); needs scraper/daemon keys first.",
+   "enforcement": "none",
+   "offen": "BR14 9579599 / hotfix 9306dee — not in develop"
+  },
+  {
+   "path": "/v1/metrics/prompt-performance/timeline",
+   "method": "GET",
+   "gate": "HTTPBearer",
+   "dependencies": [
+    "HTTPBearer"
+   ],
+   "endpoint": "src.main.get_prompt_timeline",
+   "has_body": false,
+   "data": "aggregates per app+agent",
+   "assessment": "declared HTTPBearer but the handler never calls verify_api_key: reachable without a key. Not an Energy image/credential path. Fix exists as BR14 (bridge 9579599, not in develop); needs scraper/daemon keys first.",
+   "enforcement": "none",
+   "offen": "BR14 9579599 / hotfix 9306dee — not in develop"
+  },
+  {
+   "path": "/v1/metrics/queue-forecast",
+   "method": "GET",
+   "gate": "HTTPBearer",
+   "dependencies": [
+    "HTTPBearer"
+   ],
+   "endpoint": "src.main.get_queue_forecast",
+   "has_body": false,
+   "data": "queue forecast incl. account names",
+   "assessment": "declared HTTPBearer but the handler never calls verify_api_key: reachable without a key. Not an Energy image/credential path. Fix exists as BR14 (bridge 9579599, not in develop); needs scraper/daemon keys first.",
+   "enforcement": "none",
+   "offen": "BR14 9579599 / hotfix 9306dee — not in develop"
+  },
+  {
+   "path": "/v1/metrics/request-log",
+   "method": "GET",
+   "gate": "HTTPBearer",
+   "dependencies": [
+    "HTTPBearer"
+   ],
+   "endpoint": "src.main.get_request_log_endpoint",
+   "has_body": false,
+   "data": "request log incl. client IPs",
+   "assessment": "declared HTTPBearer but the handler never calls verify_api_key: reachable without a key. Not an Energy image/credential path. Fix exists as BR14 (bridge 9579599, not in develop); needs scraper/daemon keys first.",
+   "enforcement": "none",
+   "offen": "BR14 9579599 / hotfix 9306dee — not in develop"
+  },
+  {
+   "path": "/v1/metrics/throughput",
+   "method": "GET",
+   "gate": "HTTPBearer",
+   "dependencies": [
+    "HTTPBearer"
+   ],
+   "endpoint": "src.main.get_throughput",
+   "has_body": false,
+   "data": "throughput timeline",
+   "assessment": "declared HTTPBearer but the handler never calls verify_api_key: reachable without a key. Not an Energy image/credential path. Fix exists as BR14 (bridge 9579599, not in develop); needs scraper/daemon keys first.",
+   "enforcement": "none",
+   "offen": "BR14 9579599 / hotfix 9306dee — not in develop"
+  },
+  {
+   "path": "/v1/metrics/usage-breakdown",
+   "method": "GET",
+   "gate": "HTTPBearer",
+   "dependencies": [
+    "HTTPBearer"
+   ],
+   "endpoint": "src.main.get_usage_breakdown",
+   "has_body": false,
+   "data": "usage per app/user/model",
+   "assessment": "declared HTTPBearer but the handler never calls verify_api_key: reachable without a key. Not an Energy image/credential path. Fix exists as BR14 (bridge 9579599, not in develop); needs scraper/daemon keys first.",
+   "enforcement": "none",
+   "offen": "BR14 9579599 / hotfix 9306dee — not in develop"
+  },
+  {
+   "path": "/v1/models",
+   "method": "GET",
+   "gate": "HTTPBearer",
+   "dependencies": [
+    "HTTPBearer"
+   ],
+   "endpoint": "src.main.list_models",
+   "has_body": false,
+   "data": "model list",
+   "assessment": "verify_api_key in handler; app principal scoped by enforce_app_request/bild_policy",
+   "enforcement": "handler",
+   "verifier": "verify_api_key"
+  },
+  {
+   "path": "/v1/privacy/smart-anonymize",
+   "method": "POST",
+   "gate": "HTTPBearer",
+   "dependencies": [
+    "HTTPBearer"
+   ],
+   "endpoint": "src.main.smart_anonymize_endpoint",
+   "has_body": true,
+   "data": "pseudonymisation",
+   "assessment": "verify_api_key in handler; app principal scoped by enforce_app_request/bild_policy",
+   "enforcement": "handler",
+   "verifier": "verify_api_key"
+  },
+  {
+   "path": "/v1/privacy/status",
+   "method": "GET",
+   "gate": "none",
+   "dependencies": [],
+   "endpoint": "src.main.get_privacy_status",
+   "has_body": false,
+   "data": "privacy layer on/off + counters",
+   "assessment": "public by decision; no key material, no customer data",
+   "enforcement": "public"
+  },
+  {
+   "path": "/v1/providers",
+   "method": "GET",
+   "gate": "none",
+   "dependencies": [],
+   "endpoint": "src.main.list_providers",
+   "has_body": false,
+   "data": "provider tier catalogue",
+   "assessment": "public by decision; no key material, no customer data",
+   "enforcement": "public"
+  },
+  {
+   "path": "/v1/research",
+   "method": "POST",
+   "gate": "HTTPBearer",
+   "dependencies": [
+    "HTTPBearer",
+    "cache_request_body_dependency"
+   ],
+   "endpoint": "src.main.research",
+   "has_body": true,
+   "data": "research job",
+   "assessment": "verify_api_key in handler; app principal scoped by enforce_app_request/bild_policy",
+   "enforcement": "handler",
+   "verifier": "verify_api_key"
+  },
+  {
+   "path": "/v1/research/async/{request_id}",
+   "method": "GET",
+   "gate": "HTTPBearer",
+   "dependencies": [
+    "HTTPBearer"
+   ],
+   "endpoint": "src.main.get_async_research_status",
+   "has_body": false,
+   "data": "async research status",
+   "assessment": "verify_api_key in handler; app principal scoped by enforce_app_request/bild_policy",
+   "enforcement": "handler",
+   "verifier": "verify_api_key"
+  },
+  {
+   "path": "/v1/research/{session_id}/content",
+   "method": "GET",
+   "gate": "HTTPBearer",
+   "dependencies": [
+    "HTTPBearer"
+   ],
+   "endpoint": "src.main.get_research_content",
+   "has_body": false,
+   "data": "research report file",
+   "assessment": "verify_api_key in handler; app principal scoped by enforce_app_request/bild_policy",
+   "enforcement": "handler",
+   "verifier": "verify_api_key"
+  },
+  {
+   "path": "/v1/sessions",
+   "method": "GET",
+   "gate": "HTTPBearer",
+   "dependencies": [
+    "HTTPBearer"
+   ],
+   "endpoint": "src.main.list_sessions",
+   "has_body": false,
+   "data": "all session ids",
+   "assessment": "operator view across all callers: _verify_operator_key (shared key; resolved app principal 403) — BR13",
+   "enforcement": "handler",
+   "verifier": "_verify_operator_key"
+  },
+  {
+   "path": "/v1/sessions/stats",
+   "method": "GET",
+   "gate": "HTTPBearer",
+   "dependencies": [
+    "HTTPBearer"
+   ],
+   "endpoint": "src.main.get_session_stats",
+   "has_body": false,
+   "data": "session counters",
+   "assessment": "operator view across all callers: _verify_operator_key (shared key; resolved app principal 403) — BR13",
+   "enforcement": "handler",
+   "verifier": "_verify_operator_key"
+  },
+  {
+   "path": "/v1/sessions/{session_id}",
+   "method": "DELETE",
+   "gate": "HTTPBearer",
+   "dependencies": [
+    "HTTPBearer"
+   ],
+   "endpoint": "src.main.delete_session",
+   "has_body": false,
+   "data": "mutation: deletes a conversation",
+   "assessment": "operator view across all callers: _verify_operator_key (shared key; resolved app principal 403) — BR13",
+   "enforcement": "handler",
+   "verifier": "_verify_operator_key"
+  },
+  {
+   "path": "/v1/sessions/{session_id}",
+   "method": "GET",
+   "gate": "HTTPBearer",
+   "dependencies": [
+    "HTTPBearer"
+   ],
+   "endpoint": "src.main.get_session",
+   "has_body": false,
+   "data": "one session",
+   "assessment": "operator view across all callers: _verify_operator_key (shared key; resolved app principal 403) — BR13",
+   "enforcement": "handler",
+   "verifier": "_verify_operator_key"
+  },
+  {
+   "path": "/v1/usage/status",
+   "method": "GET",
+   "gate": "none",
+   "dependencies": [],
+   "endpoint": "src.main.usage_status",
+   "has_body": false,
+   "data": "aggregate usage state",
+   "assessment": "public by decision; no key material, no customer data",
+   "enforcement": "public"
+  },
+  {
+   "path": "/v1/version",
+   "method": "GET",
+   "gate": "none",
+   "dependencies": [],
+   "endpoint": "src.version.get_version",
+   "has_body": false,
+   "data": "build sha, build time, contract revision",
+   "assessment": "public by decision; no key material, no customer data",
+   "enforcement": "public"
+  },
+  {
+   "path": "/worker-capacity",
+   "method": "GET",
+   "gate": "none",
+   "dependencies": [],
+   "endpoint": "src.main.worker_capacity",
+   "has_body": false,
+   "data": "free capacity numbers",
+   "assessment": "public by decision; no key material, no customer data",
+   "enforcement": "public"
+  }
+ ]
 }

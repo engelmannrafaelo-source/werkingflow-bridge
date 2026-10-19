@@ -1,11 +1,9 @@
-"""R14 (g): worker routes outside the platform inventory are named, assessed and gated.
-
-Same import stubbing as test_no_unauthenticated_routes.py; no network, no DB.
+"""R14 (g) → R15: the worker inventory and its completeness live in
+tests/unit/test_r15_worker_route_inventory.py (derived from the real router, no
+prefix filter). Kept here: the /health/reset admin binding introduced in R14.
 """
 
-import json
 import sys
-from pathlib import Path
 from unittest.mock import MagicMock as _MagicMock
 
 for _mod_name in [
@@ -26,11 +24,6 @@ from fastapi.routing import APIRoute  # noqa: E402
 from src.api_auth.deps import AuthClaims, require_admin  # noqa: E402
 from src.main import app  # noqa: E402
 
-ROOT = Path(__file__).parents[2]
-INVENTORY = json.loads((ROOT / "docs/service-route-inventory-worker.json").read_text())
-PLATFORM = json.loads((ROOT / "docs/service-route-inventory.json").read_text())
-APP_REACHABLE_GATES = {"require_service_token", "HTTPBearer", "require_admin"}
-
 
 def _dependency_names(route: APIRoute) -> set:
     found = set()
@@ -46,26 +39,9 @@ def _dependency_names(route: APIRoute) -> set:
     return found
 
 
-def _routes():
-    return {r.path: r for r in app.routes if isinstance(r, APIRoute)}
-
-
-def test_every_inventoried_worker_route_exists_with_its_declared_gate():
-    routes = _routes()
-    for row in INVENTORY["routes"]:
-        route = routes.get(row["path"])
-        assert route is not None, row["path"]
-        assert set(row["methods"]) <= route.methods, row["path"]
-        assert row["gate"] in _dependency_names(route), (
-            row["path"],
-            _dependency_names(route),
-        )
-
-
 def test_health_reset_requires_the_isolated_admin_principal():
-    route = _routes()["/health/reset"]
-    names = _dependency_names(route)
-    assert "require_admin" in names
+    route = {r.path: r for r in app.routes if isinstance(r, APIRoute)}["/health/reset"]
+    assert "require_admin" in _dependency_names(route)
     app_claims = AuthClaims(
         kind="service",
         user_id=None,
@@ -79,21 +55,3 @@ def test_health_reset_requires_the_isolated_admin_principal():
     with pytest.raises(HTTPException) as exc:
         require_admin(app_claims)
     assert exc.value.status_code == 403
-
-
-def test_no_unassessed_app_reachable_worker_route():
-    """A new service-token/bearer worker route must be assessed here
-    or in the platform inventory."""
-    platform_paths = {row["path"] for row in PLATFORM}
-    inventoried = {row["path"] for row in INVENTORY["routes"]}
-    unassessed = sorted(
-        path
-        for path, route in _routes().items()
-        if (_dependency_names(route) & APP_REACHABLE_GATES)
-        and path not in platform_paths
-        and path not in inventoried
-        and path.startswith(
-            ("/health", "/debug", "/license", "/v1/debug", "/v1/metrics")
-        )
-    )
-    assert unassessed == [], unassessed
