@@ -189,7 +189,10 @@ def test_arithmetic_asterisk():
     doc = Document()
     doc.add_paragraph("5*3 = 15")
     markdown, _, _ = convert_docx_bytes(packed(doc))
-    assert "5*3 = 15" in markdown
+    # the asterisk is Markdown-escaped and shown as written
+    markdown_it = pytest.importorskip("markdown_it")
+    html = markdown_it.MarkdownIt("commonmark").render(markdown)
+    assert "5*3 = 15" in BeautifulSoup(html, "html.parser").get_text()
 
 
 @pytest.mark.parametrize(

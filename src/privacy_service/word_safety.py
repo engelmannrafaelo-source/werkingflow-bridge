@@ -16,7 +16,6 @@ from .word_provenance import (
     _Stamper,
     header_footer_uses,
     new_provenance,
-    next_bookmark_id,
     note_references,
     part_target,
     record_text,
@@ -178,7 +177,7 @@ def prepare_word(content: bytes) -> PreparedWord:
             if name.endswith((".xml", ".rels"))
         }
     provenance = new_provenance(parts)
-    stamper = _Stamper(provenance, next_bookmark_id(parts))
+    stamper = _Stamper(provenance)
     pictures = _PictureBudget(content, set(names))
     dropped = _drop_macros(parts, main, provenance)
     styles = {}
@@ -338,7 +337,9 @@ def prepare_word(content: bytes) -> PreparedWord:
         stamp_part(provenance, stamper, name, root)
         if root.tag in {f"{{{W}}}hdr", f"{{{W}}}ftr"}:
             stamp_header_footer(provenance, stamper, name, root, uses.get(name, []))
-        record_text(provenance, name, root, uses.get(name, []), references)
+        record_text(
+            provenance, name, root, uses.get(name, []), references, stamper
+        )
         parts[name] = etree.tostring(root, xml_declaration=True, encoding="UTF-8")
     output = io.BytesIO()
     with (

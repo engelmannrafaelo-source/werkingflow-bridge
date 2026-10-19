@@ -95,7 +95,7 @@ def test_source_table_missing_from_export_is_appended_and_named():
 def test_footnote_table_is_in_the_ledger(name):
     provenance = ws.prepare_word(probe(name)).provenance
     notes = [t for t in provenance.texts if t.kind == "notes" and t.label == "Fußnoten"]
-    units = [u for t in notes for _, units in t.paragraphs for u in units]
+    units = [u for t in notes for p in t.paragraphs for u in p.units]
     assert [f"QXNOTE{i}QZ" for i in range(4)] == [
         u for u in units if u.startswith("QXNOTE")
     ]
@@ -113,12 +113,12 @@ def test_ledger_ignores_field_results_and_splits_at_note_marks():
         'w:r>'
         "<w:r><w:t> weiter</w:t></w:r></w:p>"
     )
-    ((text, units),) = provenance.texts[0].paragraphs
-    assert units == ["Seite", "von", "Satz", "weiter"]
-    assert text == "Seite 7 von9Satz weiter"
+    ((paragraph,),) = [provenance.texts[0].paragraphs]
+    assert paragraph.units == ["Seite", "von", "Satz", "weiter"]
+    assert paragraph.text == "Seite 7 von9Satz weiter"
 
 
-def test_ledger_skips_fallback_copies_and_keeps_text_boxes_separate():
+def test_ledger_keeps_branches_and_text_boxes_separate():
     mc = "http://schemas.openxmlformats.org/markup-compatibility/2006"
     provenance = ledger(
         f'<w:p><w:r><w:t>Anker</w:t></w:r><mc:AlternateContent xmlns:mc="{mc}">'
@@ -127,10 +127,10 @@ def test_ledger_skips_fallback_copies_and_keeps_text_boxes_separate():
         "<mc:Fallback><w:txbxContent><w:p><w:r><w:t>BOX</w:t></w:r></w:p></w:txbxContent>"
         "</mc:Fallback></mc:AlternateContent><w:r><w:t>Ende</w:t></w:r></w:p>"
     )
-    assert [units for _, units in provenance.texts[0].paragraphs] == [
-        ["Anker", "Ende"],
-        ["BOX"],
-    ]
+    paragraphs = provenance.texts[0].paragraphs
+    assert [p.units for p in paragraphs] == [["Anker", "Ende"], ["BOX"], ["BOX"]]
+    group = paragraphs[1].branches[0][0]
+    assert [p.branches for p in paragraphs] == [(), ((group, 0),), ((group, 1),)]
 
 
 def test_missing_text_reports_only_lost_paragraphs_once():

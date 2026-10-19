@@ -33,6 +33,13 @@ def probe(name):
     return (KORPUS / name).read_bytes()
 
 
+def shown(markdown):
+    """The text a CommonMark reader is shown (literal characters unescaped)."""
+    markdown_it = pytest.importorskip("markdown_it")
+    html = markdown_it.MarkdownIt("commonmark").enable("table").render(markdown)
+    return BeautifulSoup(html, "html.parser").get_text()
+
+
 def tables(markdown):
     return BeautifulSoup(markdown, "html.parser").find_all("table")
 
@@ -328,7 +335,7 @@ def test_default_content_type_template_and_macro_documents():
         assert "word/vbaProject.bin" not in archive.namelist()
         assert b"vbaProject" not in archive.read("word/_rels/document.xml.rels")
     markdown, meta, _ = convert_docx_bytes(content)
-    assert markdown.startswith(ws.MACRO_NOTICE)
+    assert shown(markdown).startswith(ws.MACRO_NOTICE)
     assert "MAKROTEXT" in markdown
     assert "Makros (VBA) entfernt, nicht ausgeführt" in meta["word_notices"]
 
@@ -387,7 +394,9 @@ def test_unreadable_embedded_object_gets_notice():
         lambda d: b"kein Arbeitsblatt",
     )
     markdown, meta, _ = convert_docx_bytes(content)
-    assert "[Eingebettetes Objekt (Excel.Sheet.12) nicht übernommen]" in markdown
+    assert "[Eingebettetes Objekt (Excel.Sheet.12) nicht übernommen]" in shown(
+        markdown
+    )
     assert "Vor Excel" in markdown and "Nach Excel" in markdown
     assert meta["word_notices"] == [
         "Eingebettetes Objekt (Excel.Sheet.12) nicht übernommen"
@@ -457,7 +466,9 @@ def test_pixel_bomb_is_a_local_notice_before_writer():
         xml = archive.read("word/document.xml").decode()
     assert "Eingebettetes Bild zu groß (30000×30000 Pixel), nicht geladen" in xml
     markdown, meta, images = convert_docx_bytes(content)
-    assert "[Eingebettetes Bild zu groß (30000×30000 Pixel), nicht geladen]" in markdown
+    assert "[Eingebettetes Bild zu groß (30000×30000 Pixel), nicht geladen]" in shown(
+        markdown
+    )
     assert images == {}
     assert meta["word_notices"] == [
         "Eingebettetes Bild zu groß (30000×30000 Pixel), nicht geladen"

@@ -10,18 +10,26 @@ being committed. Soll per probe: ``tests/fixtures/docx/korpus/README.md``.
 R5 adds the R4 Codex probes (c01–c12) and a stricter ledger: unique
 sentinel texts must appear exactly once in the text a CommonMark renderer
 shows — no silent loss, no duplication, no literal text turned into markup.
+
+R6 adds the R5 Codex probes (d01–d12 and the generated image path
+variants) and an independent occurrence ledger: the multiset of sentinel
+texts read from the source package itself must equal the multiset in the
+rendered text, so the same text elsewhere cannot stand in for a lost one.
 """
 
 import binascii
 import io
+import re
 import shutil
 import struct
 import zipfile
 import zlib
+from collections import Counter
 from pathlib import Path
 
 import pytest
 from docx import Document
+from lxml import etree
 
 KORPUS = Path(__file__).parents[1] / "fixtures/docx/korpus"
 MIME = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
@@ -66,7 +74,11 @@ EXPECT = {
     "h01b_kopf_gerade_ohne_tabelle.docx": ["Gerade", "Kopfzeile (gerade Seiten)"],
     "h02_textfeld_tabelle.docx": ['colspan="2"><p>B-QUER', "TB-A", "TB-B"],
     "h03_sdt_zeile.docx": ['colspan="2"><p>S-QUER', "S22"],
-    "h05_fussnote_endnote.docx": ["FN **FETT** und *KURSIV* Wert 5*3.", "ENDNOTENTEXT"],
+    "h05_fussnote_endnote.docx": [
+        "FN **FETT** und *KURSIV* Wert",  # Word formatting as Markdown
+        "FN FETT und KURSIV Wert 5*3.",  # the literal asterisk as shown
+        "ENDNOTENTEXT",
+    ],
     "h06_kommentar_tabelle.docx": ['colspan="2"><p>KQUER'],
     "h07_rtl_emoji.docx": ["مرحبا", "👨‍👩‍👧", "🇦🇹", "𠜎", 'colspan="2"><p>E-QUER'],
     "h10_lange_tabelle.docx": [],
@@ -162,8 +174,56 @@ RENDERED = {
         'QXSTARTQZ <a name="wqdeadbeef_t1r0c0"> QXENDQZ'
     ],
 }
+# Probes whose every source text run must be visible verbatim once rendered.
+LITERAL = {"d09_markup_literal_kontexte.docx", "d10_markdown_literal.docx"}
+# Image targets of the R5 Codex review (worker1/own.py), generated from c10:
+# (target spelling, member name, required notice).
+_TOO_BIG = "Eingebettetes Bild zu groß (30000×30000 Pixel)"
+IMAGE_PATHS = {
+    "p1_punktsegmente_fragment.docx": (
+        "../word/media/./image1.png#piece",
+        "word/media/image1.png",
+        _TOO_BIG,
+    ),
+    "p2_paketabsolut_kodiert.docx": (
+        "/word/media/%69mage1.png",
+        "word/media/image1.png",
+        _TOO_BIG,
+    ),
+    "p3_prozent_leerzeichen.docx": (
+        "media/space%20image.png",
+        "word/media/space image.png",
+        _TOO_BIG,
+    ),
+    "p4_prozent_raute.docx": (
+        "media/hash%23image.png",
+        "word/media/hash#image.png",
+        _TOO_BIG,
+    ),
+    "p5_prozentzeichen_im_namen.docx": (
+        "media/literal%2520image.png",
+        "word/media/literal%20image.png",
+        _TOO_BIG,
+    ),
+    "p6_backslash.docx": ("media\\image1.png", "word/media/image1.png", _TOO_BIG),
+    "p7_ausserhalb.docx": (
+        "../../outside.png",
+        "word/media/image1.png",
+        "Eingebettetes Bild nicht im Dokument gefunden",
+    ),
+}
 # Required notices (prefixes) — a loss repaired from the source is never silent.
 NOTICES = {
+    "d01_endnote_tabelle_eindeutig.docx": ["Endnoten: 4 Absätze"],
+    "d02_endnote_tabelle_wiederholt.docx": ["Endnoten: 4 Absätze"],
+    "d03_fussnote_tabelle_wie_haupttext.docx": ["Fußnoten: 4 Absätze"],
+    "d04_endnote_tabelle_wie_haupttext.docx": ["Endnoten: 4 Absätze"],
+    "d05_fusszeile_standard_mehrdeutig.docx": [
+        "Tabelle ohne Spaltenzuordnung ausgegeben"
+    ],
+    "d06_fusszeile_gerade_mehrdeutig.docx": ["Fußzeile (gerade Seiten)"],
+    "d07_folgezelle_verschachtelt.docx": ["Text einer vertikal verbundenen Folgezelle"],
+    **{name: [notice] for name, (_, _, notice) in IMAGE_PATHS.items()},
     "c01_fussnote_tabelle_nach_absatz.docx": ["Fußnoten: 4 Absätze"],
     "c02_fussnote_tabelle_vor_absatz.docx": ["Fußnoten: 4 Absätze"],
     "c03_kopf_mehrdeutig.docx": ["Tabelle ohne Spaltenzuordnung ausgegeben"],
@@ -176,7 +236,36 @@ NO_NOTICES = {
     "c03_kopf_mehrdeutig.docx": ["Kopfzeile", "im Export nicht enthalten"],
     "c06_lesezeichen_kollision.docx": ["im Export nicht enthalten"],
     "c07_verschachtelt_verbunden.docx": ["im Export nicht enthalten"],
+    "d05_fusszeile_standard_mehrdeutig.docx": ["Fußzeile", "im Export"],
+    **{
+        name: ["im Export"]
+        for name in (
+            "d08_platzhalter_zwei_ziehungen.docx",
+            "d09_markup_literal_kontexte.docx",
+            "d10_markdown_literal.docx",
+            "d11_textfeld_in_zelle.docx",
+            "d12_utf16_hauptteil.docx",
+        )
+    },
 }
+
+_W = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+_SENTINEL = re.compile(r"QX[A-Z0-9]+?QZ")
+
+
+def source_runs(raw: bytes) -> list[str]:
+    """Stored text runs of every XML part, read from the source package itself
+    (mc:Fallback copies excluded: Word shows one branch)."""
+    runs = []
+    with zipfile.ZipFile(io.BytesIO(raw)) as package:
+        for name in package.namelist():
+            if not name.endswith(".xml"):
+                continue
+            root = etree.fromstring(package.read(name))
+            for node in root.iter(f"{{{_W}}}t"):
+                if not any(a.tag.endswith("}Fallback") for a in node.iterancestors()):
+                    runs.append(node.text or "")
+    return runs
 
 
 def rendered_text(markdown: str) -> str:
@@ -298,6 +387,20 @@ def generated(tmp_path_factory):
     _bomb(root / "h20a_unterbudget_unreferenziert.docx", 950, referenced=False)
     _bomb(root / "h20b_unterbudget_bild.docx", 950, referenced=True)
     _lying_size(root / "h17_luegengroesse.docx")
+    raw = (KORPUS / "c10_bild_paketabsolut.docx").read_bytes()
+    for name, (target, member, _) in IMAGE_PATHS.items():
+        with (
+            zipfile.ZipFile(io.BytesIO(raw)) as source,
+            zipfile.ZipFile(root / name, "w") as package,
+        ):
+            for info in source.infolist():
+                data = source.read(info)
+                if info.filename == "word/_rels/document.xml.rels":
+                    data = data.replace(b"/word/media/image1.png", target.encode())
+                if info.filename == "word/media/image1.png":
+                    package.writestr(member, data)
+                else:
+                    package.writestr(info.filename, data)
     return {p.name: p for p in root.iterdir()}
 
 
@@ -320,6 +423,7 @@ GENERATED = [
     "h17_luegengroesse.docx",
     "h20a_unterbudget_unreferenziert.docx",
     "h20b_unterbudget_bild.docx",
+    *IMAGE_PATHS,
 ]
 PROBES = sorted(
     p.name for p in KORPUS.iterdir() if p.suffix in {".docx", ".doc", ".docm", ".dotx"}
@@ -329,9 +433,16 @@ PROBES = sorted(
 def test_korpus_is_complete():
     # 48 committed reviewer probes (R1 5, R2 20 without bombe,
     # R3 23 without h17/h20a/h20b)
-    # plus 12 of the R4 Codex review (c01–c12).
-    assert len(PROBES) == 60
-    named = set(EXPECT) | set(FORBIDDEN) | set(SENTINELS) | set(RENDERED) | set(NOTICES)
+    # plus 12 of the R4 Codex review (c01–c12) and 12 of the R5 one (d01–d12).
+    assert len(PROBES) == 72
+    named = (
+        set(EXPECT)
+        | set(FORBIDDEN)
+        | set(SENTINELS)
+        | set(RENDERED)
+        | set(NOTICES)
+        | LITERAL
+    )
     assert named <= set(PROBES) | set(GENERATED)
     assert not set(GENERATED) & set(PROBES)
 
@@ -364,8 +475,11 @@ def test_korpus_probe(name, client, generated, monkeypatch):
     body = response.json()
     markdown = body["markdown"]
     assert markdown.strip()
+    shown = " ".join(rendered_text(markdown).split())
+    # Named content survives as Markdown (formatting, HTML tables) or as the
+    # text a reader is shown (literal characters are escaped in Markdown).
     for text in EXPECT.get(name, []):
-        assert text in markdown, (name, text)
+        assert text in markdown or text in shown, (name, text)
     for text in FORBIDDEN.get(name, []):
         assert text not in markdown, (name, text)
     notices = body["metadata"]["word_notices"]
@@ -373,9 +487,16 @@ def test_korpus_probe(name, client, generated, monkeypatch):
         assert any(n.startswith(prefix) for n in notices), (name, prefix, notices)
     for part in NO_NOTICES.get(name, []):
         assert not any(part in n for n in notices), (name, part, notices)
-    if name in SENTINELS or name in RENDERED:
-        shown = " ".join(rendered_text(markdown).split())
-        for sentinel in SENTINELS.get(name, []):
-            assert shown.count(sentinel) == 1, (name, sentinel, shown.count(sentinel))
-        for text in RENDERED.get(name, []):
-            assert text in shown, (name, text)
+    for sentinel in SENTINELS.get(name, []):
+        assert shown.count(sentinel) == 1, (name, sentinel, shown.count(sentinel))
+    for text in RENDERED.get(name, []):
+        assert text in shown, (name, text)
+    # Occurrence ledger: every source occurrence once, counted independently.
+    raw = path.read_bytes()
+    runs = source_runs(raw) if zipfile.is_zipfile(io.BytesIO(raw)) else []
+    expected = Counter(_SENTINEL.findall(" ".join(runs)))
+    assert Counter(_SENTINEL.findall(shown)) == expected, name
+    if name in LITERAL:
+        visible = "".join(shown.split())
+        for run in runs:
+            assert "".join(run.split()) in visible, (name, run)

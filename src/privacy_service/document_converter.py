@@ -1183,8 +1183,27 @@ def _convert_via_libreoffice(content: bytes, suffix: str) -> Tuple[str, Dict[str
     return convert_pdf_bytes(pdf_bytes)
 
 
-# Where CommonMark would start raw HTML, an autolink or an entity.
-_LITERAL_MARKUP = re.compile(r"<(?=[A-Za-z/!?])|&(?=#?[0-9A-Za-z]+;)")
+# Document text is text: wherever CommonMark (or GFM tables/strikethrough)
+# would read a character as syntax, it is backslash-escaped. Inline syntax
+# anywhere in a line: emphasis, code spans, pipes, raw HTML, autolinks,
+# entities, the backslash itself, and ``]`` — no link, image or reference
+# definition can close without it, so ``[`` stays as written.
+_INLINE_SYNTAX = re.compile(r"[\\`*_\]~|]|<(?=[A-Za-z/!?])|&(?=#?[0-9A-Za-z]+;)")
+# Block syntax only where a line starts: heading, quote, list item, rule or
+# setext underline. Any text node may start a rendered line.
+_LINE_START = re.compile(
+    r"^(\s*)(?:(#{1,6}(?=\s|$)|>|[-+](?=\s|$)|[=-]+\s*$)|(\d{1,9})([.)])(?=\s|$))"
+)
+
+
+def _literal_text(text: str) -> str:
+    """Escape Word text so a Markdown reader shows exactly these characters."""
+    text = _INLINE_SYNTAX.sub(r"\\\g<0>", text)
+    return _LINE_START.sub(
+        lambda m: m.group(1)
+        + (f"\\{m.group(2)}" if m.group(2) else f"{m.group(3)}\\{m.group(4)}"),
+        text,
+    )
 
 
 @_mojibake_repaired
@@ -1199,7 +1218,7 @@ def convert_docx_bytes(content: bytes) -> tuple[str, dict[str, Any], dict[str, s
     from pathlib import Path
     from urllib.parse import unquote, urlsplit
 
-    from bs4 import BeautifulSoup
+    from bs4 import BeautifulSoup, NavigableString
     from markdownify import markdownify
 
     from .image_format import UnprocessableWordImage, resize_word_image
@@ -1414,17 +1433,20 @@ def convert_docx_bytes(content: bytes) -> tuple[str, dict[str, Any], dict[str, s
                     line_break.replace_with(" ")
                 for column in table.find_all(["col", "colgroup"]):
                     column.decompose()
-                for node in list(table.find_all(string=True)):
-                    node.replace_with(str(node).replace("|", r"\|"))
                 first_row = table.find("tr")
                 if first_row is not None and not first_row.find("th"):
                     for cell in first_row.find_all("td", recursive=False):
                         cell.name = "th"
-        # Text that merely looks like HTML (``<a name=…>``, ``&amp;``) must stay
-        # text: escape it for CommonMark. The HTML tables above are already
-        # serialized with entities and are not touched here.
+        # Text that merely looks like Markdown or HTML (``*x*``, ``[a](b)``,
+        # ``<a name=…>``, ``&amp;``) must stay text: escaped here, in one place,
+        # so markdownify's own escaping is off. The HTML tables above are
+        # already serialized with entities and are not touched here.
         for node in list(soup.body.find_all(string=True)):
-            escaped = _LITERAL_MARKUP.sub(r"\\\g<0>", str(node))
+            if type(node) is not NavigableString or node.find_parent(
+                ["pre", "code", "kbd", "samp"]
+            ):
+                continue
+            escaped = _literal_text(str(node))
             if escaped != str(node):
                 node.replace_with(escaped)
         markdown = markdownify(
@@ -1432,6 +1454,7 @@ def convert_docx_bytes(content: bytes) -> tuple[str, dict[str, Any], dict[str, s
             heading_style="ATX",
             escape_misc=False,
             escape_asterisks=False,
+            escape_underscores=False,
         ).strip()
         for marker, table_html in html_tables.items():
             markdown = markdown.replace(marker, table_html)

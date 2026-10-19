@@ -11,10 +11,16 @@ Writer exports bookmarks as ``<a name>``, so each HTML cell names the source
 cell it came from. Problems stay local to one table or part.
 
 Identity alone cannot see what Writer never exports (a table in a footnote,
-the text of a merged continuation cell). So every displayed part also keeps
-a text ledger of its source paragraphs; after the export, any source text
-missing from the result is appended from the source with a visible notice
-and named in ``word_notices`` — never dropped silently.
+the text of a merged continuation cell). So every source paragraph of a
+displayed part carries a bookmark of its own as well, together with its
+stored text units. After the export each paragraph is accounted for by its
+own occurrence: the text between its bookmark and the next paragraph
+bookmark (plus its text boxes) must hold its units, and every character of
+the result is consumed by at most one source paragraph. The same text
+elsewhere never stands in for it. A paragraph whose occurrence is missing is
+inserted whole from the source next to its neighbour, an incomplete one
+replaces its own export block — both with a visible notice and named in
+``word_notices``, never dropped silently.
 """
 
 from __future__ import annotations
@@ -23,6 +29,7 @@ import logging
 import posixpath
 import re
 import secrets
+from bisect import bisect_right
 from dataclasses import dataclass, field
 from urllib.parse import unquote
 
@@ -145,13 +152,25 @@ class SourcePart:
 
 
 @dataclass
+class SourceParagraph:
+    """One source paragraph: display text and its stored text units."""
+
+    text: str
+    units: list[str]
+    key: str | None = None  # bookmark suffix; None when not stamped
+    parent: str | None = None  # key of the paragraph holding its text box
+    # (mc:AlternateContent group, branch index) of every enclosing alternative
+    branches: tuple[tuple[str, int], ...] = ()
+
+
+@dataclass
 class SourceText:
-    """Text ledger of one displayed part: (paragraph text, checked units)."""
+    """Text ledger of one displayed part."""
 
     name: str
     kind: str  # body | header | footer | notes
     label: str
-    paragraphs: list[tuple[str, list[str]]]
+    paragraphs: list[SourceParagraph]
 
 
 @dataclass
@@ -162,31 +181,40 @@ class Provenance:
     texts: list[SourceText] = field(default_factory=list)
     notices: list[str] = field(default_factory=list)
     macros_removed: bool = False
+    next_id: int = 1  # first free w:id for new bookmarks
 
     def cell_pattern(self):
         return re.compile(re.escape(self.prefix) + r"t(\d+)r(\d+)c(\d+)$")
 
 
-def _bookmark_names(raw_parts: dict[str, bytes]) -> list[str]:
-    """Bookmark names as Writer will see them, i.e. after XML decoding."""
+def _scan(raw_parts: dict[str, bytes], prefix: str) -> int | None:
+    """Highest w:id in the package, or None if ``prefix`` occurs anywhere.
+
+    Every XML part is parsed in its declared encoding first (UTF-16 as well
+    as UTF-8, character references resolved), so names, attribute values
+    and text are compared as Writer will read them — no raw byte prefilter.
+    """
     parser = etree.XMLParser(resolve_entities=False, no_network=True)
-    names = []
+    highest = 0
     for name, raw in raw_parts.items():
-        if not name.endswith(".xml") or b"bookmarkStart" not in raw:
+        if not name.endswith((".xml", ".rels")):
             continue
-        root = etree.fromstring(raw, parser)
-        names.extend(root.xpath("//w:bookmarkStart/@w:name", namespaces=NS))
-    return names
+        for node in etree.fromstring(raw, parser).iter():
+            texts = [node.text, node.tail, *node.attrib.values()]
+            if any(prefix in t for t in texts if t):
+                return None
+            value = node.get(q("id"))
+            if value is not None and value.lstrip("-").isdigit():
+                highest = max(highest, int(value))
+    return highest
 
 
 def new_provenance(raw_parts: dict[str, bytes]) -> Provenance:
-    names = _bookmark_names(raw_parts)
     while True:
         prefix = "wq" + secrets.token_hex(4) + "_"
-        if not any(prefix.encode() in raw for raw in raw_parts.values()) and not any(
-            prefix in name for name in names
-        ):
-            return Provenance(prefix)
+        highest = _scan(raw_parts, prefix)
+        if highest is not None:
+            return Provenance(prefix, next_id=highest + 1)
 
 
 def table_geometry(table, key: str = "", part: str = "", stamp=None) -> SourceTable:
@@ -224,11 +252,15 @@ def table_geometry(table, key: str = "", part: str = "", stamp=None) -> SourceTa
 
 
 class _Stamper:
-    def __init__(self, provenance: Provenance, next_id: int):
+    def __init__(self, provenance: Provenance, next_id: int | None = None):
         self.provenance = provenance
-        self.next_id = next_id
+        self.next_id = provenance.next_id if next_id is None else next_id
+        self.names: set[str] = set()
 
     def bookmark(self, paragraph, name: str) -> None:
+        if name in self.names:
+            raise RuntimeError(f"Provenance bookmark issued twice: {name}")
+        self.names.add(name)
         start = etree.Element(q("bookmarkStart"))
         start.set(q("id"), str(self.next_id))
         start.set(q("name"), self.provenance.prefix + name)
@@ -271,15 +303,6 @@ def _keep_continuation(provenance: Provenance, origin, cell) -> None:
     if origin[-1].tag != q("p"):
         etree.SubElement(origin, q("p"))
     etree.SubElement(cell, q("p"))
-
-
-def next_bookmark_id(raw_parts: dict[str, bytes]) -> int:
-    ids = [
-        int(m)
-        for raw in raw_parts.values()
-        for m in re.findall(rb'w:id="(-?\d+)"', raw)
-    ]
-    return max([0, *ids]) + 1
 
 
 # --------------------------------------------------------------------------
@@ -393,17 +416,16 @@ class _Ledger:
 
     def __init__(self):
         self.fields: list[str] = []
-        self.paragraphs: list[tuple[str, list[str]]] = []
 
-    def paragraph(self, node) -> None:
+    def paragraph(self, node) -> SourceParagraph | None:
         self.units: list[str] = []
         self.current: list[str] = []
         self.display: list[str] = []
         self._walk(node)
         self._flush()
-        text = " ".join("".join(self.display).split())
-        if self.units:
-            self.paragraphs.append((text, self.units))
+        if not self.units:
+            return None
+        return SourceParagraph(" ".join("".join(self.display).split()), self.units)
 
     def _flush(self) -> None:
         unit = "".join("".join(self.current).split())
@@ -456,8 +478,28 @@ def note_references(main_root) -> dict[str, set[str]]:
     }
 
 
-def record_text(provenance: Provenance, name: str, root, uses, references) -> None:
-    """Keep the text ledger of a part Word displays (call after all edits)."""
+def _branches(paragraph, groups: dict, part: str) -> tuple[tuple[str, int], ...]:
+    """The mc:AlternateContent branches a paragraph lies in, outermost first."""
+    found = []
+    node = paragraph
+    for ancestor in paragraph.iterancestors():
+        if ancestor.tag == f"{{{MC}}}AlternateContent":
+            group = groups.setdefault(ancestor, f"{part}#{len(groups) + 1}")
+            found.append((group, ancestor.index(node)))
+        node = ancestor
+    return tuple(reversed(found))
+
+
+def record_text(
+    provenance: Provenance, name: str, root, uses, references, stamper=None
+) -> None:
+    """Keep the text ledger of a part Word displays (call after all edits).
+
+    With a ``stamper``, every paragraph with text gets its own bookmark, so
+    its occurrence in Writer's export can be found by identity. Paragraphs
+    of every mc:AlternateContent branch are kept with their branch: Writer
+    shows one branch, and the branch it showed is the one that counts.
+    """
     ledger = _Ledger()
     tag = root.tag
     if tag == q("document"):
@@ -476,12 +518,25 @@ def record_text(provenance: Provenance, name: str, root, uses, references) -> No
         ]
     else:
         return
+    entries: list[SourceParagraph] = []
+    keys: dict = {}
+    groups: dict = {}
     for scope in scopes:
-        for paragraph in scope.iter(q("p")):
-            if not _in_fallback(paragraph):
-                ledger.paragraph(paragraph)
-    if ledger.paragraphs:
-        provenance.texts.append(SourceText(name, kind, label, ledger.paragraphs))
+        for paragraph in list(scope.iter(q("p"))):
+            entry = ledger.paragraph(paragraph)
+            if entry is None:
+                continue
+            entry.branches = _branches(paragraph, groups, name)
+            entry.parent = next(
+                (keys[a] for a in paragraph.iterancestors() if a in keys), None
+            )
+            if stamper is not None:
+                entry.key = f"s{stamper.next_id}"
+                stamper.bookmark(paragraph, entry.key)
+                keys[paragraph] = entry.key
+            entries.append(entry)
+    if entries:
+        provenance.texts.append(SourceText(name, kind, label, entries))
 
 
 # --------------------------------------------------------------------------
@@ -704,6 +759,28 @@ def apply_provenance(soup, body, provenance: Provenance) -> list[str]:
         name = anchor.get("name") or anchor.get("id") or ""
         if name.startswith(provenance.prefix):
             present.add(name[len(provenance.prefix) :])
+    # Text is accounted for on Writer's own export, by occurrence; a part
+    # appended whole from the source is accounted for as that part.
+    appended = {p.name for p in _missing_parts(provenance, present)}
+    occurrences, flat = _reconcile(body, provenance, appended)
+    keys = {p.key for t in provenance.texts for p in t.paragraphs if p.key}
+    replaced: dict[str, int] = {}
+    for occurrence in occurrences:
+        if occurrence.status == "incomplete" and _replaceable(
+            occurrence, flat, keys, provenance.prefix
+        ):
+            _replace_block(soup, occurrence, provenance.prefix)
+            occurrence.replaced = True
+            label = occurrence.part.label
+            replaced[label] = replaced.get(label, 0) + 1
+    for label, count in replaced.items():
+        logger.warning(
+            "Word paragraph incomplete in Writer export: %s (%d)", label, count
+        )
+        notices.append(
+            f"{label}: {count} {'Absatz' if count == 1 else 'Absätze'} im Export "
+            "unvollständig, aus der Quelle ersetzt"
+        )
     # Innermost first: a rebuilt inner table moves along with its cell content.
     for table in reversed(body.find_all("table")):
         has_markers = any(
@@ -734,7 +811,7 @@ def apply_provenance(soup, body, provenance: Provenance) -> list[str]:
             _rebuild(soup, table, result, provenance, pattern, rebuilt)
 
     _append_missing_parts(soup, body, provenance, present, notices)
-    _append_missing_text(soup, body, provenance, notices)
+    _insert_missing_text(soup, body, occurrences, notices)
 
     for anchor in body.find_all("a"):
         name = anchor.get("name") or anchor.get("id") or ""
@@ -744,15 +821,19 @@ def apply_provenance(soup, body, provenance: Provenance) -> list[str]:
     return notices
 
 
+def _missing_parts(provenance, present) -> list[SourcePart]:
+    return [
+        p
+        for p in provenance.parts
+        if p.uses and p.html and p.marker not in present
+    ]
+
+
 def _append_missing_parts(soup, body, provenance, present, notices) -> None:
     from bs4 import BeautifulSoup
 
     for kind in ("header", "footer"):
-        missing = [
-            p
-            for p in provenance.parts
-            if p.kind == kind and p.uses and p.html and p.marker not in present
-        ]
+        missing = [p for p in _missing_parts(provenance, present) if p.kind == kind]
         if not missing:
             continue
         exported = body.find("div", attrs={"title": kind})
@@ -783,60 +864,406 @@ def _append_missing_parts(soup, body, provenance, present, notices) -> None:
             anchor = box
 
 
-def missing_text(body, provenance: Provenance) -> list[tuple[SourceText, list[str]]]:
-    """Source paragraphs with a unit absent from the result text.
+_BLOCK_TAGS = {
+    "p",
+    "li",
+    "h1",
+    "h2",
+    "h3",
+    "h4",
+    "h5",
+    "h6",
+    "td",
+    "th",
+    "pre",
+    "blockquote",
+    "dd",
+    "dt",
+    "caption",
+    "div",
+}
 
-    Whitespace is ignored on both sides (Writer re-wraps it). Units are looked
-    up in document order per part, falling back to anywhere in the result.
+
+@dataclass
+class Occurrence:
+    """Where one source paragraph stands in the export, if anywhere."""
+
+    part: SourceText
+    paragraph: SourceParagraph
+    status: str  # found | missing | incomplete
+    block: object = field(default=None, repr=False, compare=False)
+    hits: list[tuple[int, int]] = field(default_factory=list, repr=False)
+    replaced: bool = False  # incomplete block rewritten in place
+
+
+class _Flat:
+    """Export text without whitespace, with bookmark offsets and string nodes."""
+
+    def __init__(self, body, prefix: str):
+        from bs4 import CData, NavigableString, Tag
+
+        pieces: list[str] = []
+        self.offsets: dict[str, int] = {}
+        self.anchors: dict[str, object] = {}
+        self.order: list[str] = []
+        self.starts: list[int] = []
+        self.nodes: list = []
+        self.node_offset: dict[int, int] = {}
+        length = 0
+        for node in body.descendants:
+            if isinstance(node, Tag):
+                name = node.get("name") or node.get("id") or ""
+                if node.name == "a" and name.startswith(prefix):
+                    key = name[len(prefix) :]
+                    if key not in self.offsets:
+                        self.offsets[key] = length
+                        self.anchors[key] = node
+                        self.order.append(key)
+                continue
+            if type(node) not in (NavigableString, CData):
+                continue
+            piece = "".join(str(node).split())
+            if piece:
+                self.starts.append(length)
+                self.nodes.append(node)
+                self.node_offset[id(node)] = length
+                pieces.append(piece)
+                length += len(piece)
+        self.text = "".join(pieces)
+        self.used = bytearray(len(self.text))
+
+    def node_at(self, position: int):
+        return self.nodes[bisect_right(self.starts, position) - 1]
+
+    def span_of(self, block) -> tuple[int, int] | None:
+        found = [
+            (self.node_offset[id(n)], len("".join(str(n).split())))
+            for n in block.find_all(string=True)
+            if id(n) in self.node_offset
+        ]
+        if not found:
+            return None
+        return found[0][0], found[-1][0] + found[-1][1]
+
+
+class _Window:
+    """Unconsumed export characters of some spans, searchable as one string."""
+
+    def __init__(self, flat: _Flat, spans: list[tuple[int, int]]):
+        self.flat = flat
+        pieces: list[str] = []
+        self.starts: list[int] = []
+        self.globals: list[int] = []
+        length = 0
+        for start, end in sorted(spans):
+            i = start
+            while i < end:
+                j = flat.used.find(1, i, end)
+                stop = end if j < 0 else j
+                if stop > i:
+                    pieces.append(flat.text[i:stop])
+                    self.starts.append(length)
+                    self.globals.append(i)
+                    length += stop - i
+                if j < 0:
+                    break
+                k = flat.used.find(0, j, end)
+                i = end if k < 0 else k
+        self.text = "".join(pieces)
+        self.taken = bytearray(len(self.text))
+
+    def take(self, units: list[str]) -> tuple[list[tuple[int, int]], int]:
+        """Match units in order; every character serves at most one unit."""
+        cursor, hits, lost = 0, [], 0
+        for unit in units:
+            at = self.text.find(unit, cursor)
+            while at >= 0 and self.taken.find(1, at, at + len(unit)) >= 0:
+                at = self.text.find(unit, at + 1)
+            if at < 0:
+                lost += 1
+                continue
+            self.taken[at : at + len(unit)] = b"\x01" * len(unit)
+            hits.append((at, at + len(unit)))
+            cursor = at + len(unit)
+        return hits, lost
+
+    def commit(self, hits: list[tuple[int, int]]) -> list[tuple[int, int]]:
+        """Mark hits as consumed in the export; return them as export ranges."""
+        ranges = []
+        for start, end in hits:
+            k = bisect_right(self.starts, start) - 1
+            while start < end:
+                last = k + 1 == len(self.starts)
+                stop = min(end, len(self.text) if last else self.starts[k + 1])
+                first = self.globals[k] + start - self.starts[k]
+                self.flat.used[first : first + stop - start] = b"\x01" * (stop - start)
+                ranges.append((first, first + stop - start))
+                start = stop
+                k += 1
+        return ranges
+
+
+def _block(node, body):
+    for parent in [node, *node.parents]:
+        if parent is body:
+            break
+        if getattr(parent, "name", None) in _BLOCK_TAGS:
+            return parent
+    top = node
+    while top.parent is not None and top.parent is not body:
+        top = top.parent
+    return top
+
+
+def reconcile_text(body, provenance: Provenance, skipped=()) -> list[Occurrence]:
+    return _reconcile(body, provenance, skipped)[0]
+
+
+def _reconcile(body, provenance: Provenance, skipped=()):
+    """Account for every active source paragraph by its own occurrence.
+
+    A stamped paragraph is looked for between its bookmark and the next
+    paragraph bookmark, together with the regions of its own text boxes
+    (deepest first, so a box consumes its text before the paragraph around
+    it). A paragraph whose bookmark is not in the export may only use what
+    is left between its present neighbours in the same part. Every export
+    character is consumed at most once: text elsewhere never stands in.
     """
-    flat = "".join(body.get_text().split())
-    result = []
-    for part in provenance.texts:
-        cursor, missing = 0, []
-        for text, units in part.paragraphs:
-            lost = False
-            for unit in units:
-                at = flat.find(unit, cursor)
-                if at >= 0:
-                    cursor = at + len(unit)
-                elif unit not in flat:
-                    lost = True
-            if lost:
-                missing.append(text)
-        if missing:
-            result.append((part, missing))
-    return result
+    flat = _Flat(body, provenance.prefix)
+    entries = [
+        (part, paragraph)
+        for part in provenance.texts
+        if part.name not in skipped
+        for paragraph in part.paragraphs
+    ]
+    every_key = {
+        p.key for part in provenance.texts for p in part.paragraphs if p.key
+    }
+    bounds = [k for k in flat.order if k in every_key]
+    region = {
+        key: (flat.offsets[key], flat.offsets[bounds[i + 1]])
+        if i + 1 < len(bounds)
+        else (flat.offsets[key], len(flat.text))
+        for i, key in enumerate(bounds)
+    }
+    # Writer shows one branch of an mc:AlternateContent: the one whose
+    # bookmarks it exported (the first, i.e. mc:Choice, if none).
+    chosen: dict[str, int] = {}
+    for _, paragraph in entries:
+        if paragraph.key in region:
+            for group, branch in paragraph.branches:
+                chosen[group] = min(chosen.get(group, branch), branch)
+    entries = [
+        (part, p)
+        for part, p in entries
+        if all(chosen.get(g, 0) == b for g, b in p.branches)
+    ]
+    parents = {p.key: p.parent for _, p in entries if p.key}
+    children: dict[str, list[str]] = {}
+    for key, parent in parents.items():
+        if parent:
+            children.setdefault(parent, []).append(key)
+    depths: dict[str, int] = {}
+
+    def depth(key):
+        if key not in depths:
+            parent = parents.get(key)
+            depths[key] = depth(parent) + 1 if parent else 0
+        return depths[key]
+
+    def spans(key):
+        """Its own region and those of the text boxes it holds."""
+        own, stack = [], [key]
+        while stack:
+            current = stack.pop()
+            if current in region:
+                own.append(region[current])
+            stack.extend(children.get(current, []))
+        return own
+
+    result: dict[int, Occurrence] = {}
+    present = [(part, p) for part, p in entries if p.key in region]
+    for part, paragraph in sorted(present, key=lambda e: -depth(e[1].key)):
+        window = _Window(flat, spans(paragraph.key))
+        hits, lost = window.take(paragraph.units)
+        result[id(paragraph)] = Occurrence(
+            part,
+            paragraph,
+            "incomplete" if lost else "found",
+            _block(flat.anchors[paragraph.key], body),
+            window.commit(hits),
+        )
+    # Paragraphs without an exported bookmark: only the text left between
+    # their present neighbours of the same part.
+    for part in {id(part): part for part, _ in entries}.values():
+        own = [p for q, p in entries if q is part]
+        after: list[int] = []
+        following = len(flat.text)
+        for paragraph in reversed(own):
+            after.append(following)
+            if paragraph.key in region:
+                following = flat.offsets[paragraph.key]
+        after.reverse()
+        windows: dict[tuple[int, int], _Window] = {}
+        preceding = 0
+        for index, paragraph in enumerate(own):
+            if paragraph.key in region:
+                preceding = flat.offsets[paragraph.key]
+                continue
+            limits = (preceding, after[index])
+            if limits not in windows:
+                windows[limits] = _Window(flat, [limits])
+            window = windows[limits]
+            hits, lost = window.take(paragraph.units)
+            occurrence = Occurrence(part, paragraph, "missing")
+            if hits:
+                occurrence.hits = window.commit(hits)
+                occurrence.status = "incomplete" if lost else "found"
+                occurrence.block = _block(flat.node_at(occurrence.hits[0][0]), body)
+            result[id(paragraph)] = occurrence
+    return [result[id(p)] for _, p in entries], flat
 
 
-def _append_missing_text(soup, body, provenance, notices) -> None:
+def missing_text(body, provenance: Provenance) -> list[tuple[SourceText, list[str]]]:
+    """Source paragraphs whose own occurrence is missing or incomplete."""
+    result: dict[int, tuple[SourceText, list[str]]] = {}
+    for occurrence in reconcile_text(body, provenance):
+        if occurrence.status != "found":
+            part = occurrence.part
+            result.setdefault(id(part), (part, []))[1].append(
+                occurrence.paragraph.text
+            )
+    return list(result.values())
+
+
+def _replaceable(occurrence: Occurrence, flat: _Flat, keys: set[str], prefix) -> bool:
+    """The export block belongs to this paragraph alone and may be rewritten."""
+    block = occurrence.block
+    if block is None or block.find("table") is not None:
+        return False
+    own = occurrence.paragraph.key
+    for anchor in block.find_all("a"):
+        name = anchor.get("name") or anchor.get("id") or ""
+        if name.startswith(prefix) and name[len(prefix) :] in keys - {own}:
+            return False
+    span = flat.span_of(block)
+    if span is None:
+        return True
+    mine = sum(
+        min(end, span[1]) - max(start, span[0])
+        for start, end in occurrence.hits
+        if start < span[1] and end > span[0]
+    )
+    return flat.used.count(1, span[0], span[1]) == mine
+
+
+def _replace_block(soup, occurrence: Occurrence, prefix: str) -> None:
+    block = occurrence.block
+    keep = [
+        tag
+        for tag in block.find_all(["a", "img"])
+        if tag.name == "img"
+        or (tag.get("name") or tag.get("id") or "").startswith(prefix)
+    ]
+    block.clear()
+    for tag in keep:
+        block.append(tag.extract())
+    block.append(
+        f"[{occurrence.part.label}: Absatz im Export unvollständig, aus dem Dokument"
+        f" übernommen:] {occurrence.paragraph.text}"
+    )
+
+
+def _attached(node, body) -> bool:
+    return node is not None and any(parent is body for parent in node.parents)
+
+
+def _outside_tables(node):
+    tables = [p for p in node.parents if getattr(p, "name", None) == "table"]
+    return tables[-1] if tables else node
+
+
+def _insert_missing_text(soup, body, occurrences, notices) -> None:
+    """Insert every lost paragraph whole, next to its nearest exported neighbour."""
     top = body.find("div", attrs={"title": "header"})
-    for part, paragraphs in missing_text(body, provenance):
-        count = len(paragraphs)
-        logger.warning(
-            "Word text not in Writer export, appended from source: %s (%d)",
-            part.name,
-            count,
-        )
-        notices.append(
-            f"{part.label}: {count} {'Absatz' if count == 1 else 'Absätze'} "
-            "im Export nicht enthalten, aus der Quelle angehängt"
-        )
-        box = soup.new_tag("div")
-        note = soup.new_tag("p")
-        note.string = (
-            f"[{part.label}: Text im Export nicht enthalten, "
-            "aus dem Dokument übernommen]"
-        )
-        box.append(note)
-        for text in paragraphs:
-            line = soup.new_tag("p")
-            line.string = text
-            box.append(line)
-        if part.kind == "header":
-            if top is not None:
-                top.insert_after(box)
+    after: dict[int, object] = {}
+    by_part: dict[int, list[Occurrence]] = {}
+    for occurrence in occurrences:
+        by_part.setdefault(id(occurrence.part), []).append(occurrence)
+    for own in by_part.values():
+        part = own[0].part
+        counts = {"missing": 0, "incomplete": 0}
+        index = 0
+        while index < len(own):
+            if own[index].status == "found" or own[index].replaced:
+                index += 1
+                continue
+            kind = own[index].status
+            end = index
+            while end < len(own) and own[end].status == kind and not own[end].replaced:
+                end += 1
+            run = own[index:end]
+            counts[kind] += len(run)
+            logger.warning(
+                "Word text not in Writer export, inserted from source: %s (%d, %s)",
+                part.name,
+                len(run),
+                kind,
+            )
+            box = soup.new_tag("div")
+            note = soup.new_tag("p")
+            note.string = (
+                f"[{part.label}: Text im Export nicht enthalten, "
+                "aus dem Dokument übernommen]"
+                if kind == "missing"
+                else f"[{part.label}: Absatz im Export unvollständig, vollständig "
+                "aus dem Dokument übernommen]"
+            )
+            box.append(note)
+            for occurrence in run:
+                line = soup.new_tag("p")
+                line.string = occurrence.paragraph.text
+                box.append(line)
+            previous = next(
+                (
+                    o.block
+                    for o in reversed(own[:index])
+                    if o.status != "missing" and _attached(o.block, body)
+                ),
+                None,
+            )
+            following = next(
+                (
+                    o.block
+                    for o in own[end:]
+                    if o.status != "missing" and _attached(o.block, body)
+                ),
+                None,
+            )
+            if previous is not None:
+                anchor = _outside_tables(previous)
+                after.get(id(anchor), anchor).insert_after(box)
+                after[id(anchor)] = box
+            elif following is not None:
+                _outside_tables(following).insert_before(box)
+            elif part.kind == "header":
+                if top is not None:
+                    top.insert_after(box)
+                else:
+                    body.insert(0, box)
+                top = box
             else:
-                body.insert(0, box)
-            top = box
-        else:
-            body.append(box)
+                body.append(box)
+            index = end
+        if counts["missing"]:
+            count = counts["missing"]
+            notices.append(
+                f"{part.label}: {count} {'Absatz' if count == 1 else 'Absätze'} "
+                "im Export nicht enthalten, aus der Quelle angehängt"
+            )
+        if counts["incomplete"]:
+            count = counts["incomplete"]
+            notices.append(
+                f"{part.label}: {count} {'Absatz' if count == 1 else 'Absätze'} "
+                "im Export unvollständig, vollständig aus der Quelle angehängt"
+            )
