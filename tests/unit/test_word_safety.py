@@ -204,20 +204,33 @@ def test_simple_table_escapes_literal_pipe(monkeypatch):
     assert r"| A \| B | 1.5 |" in markdown
 
 
-def test_changed_cell_count_is_loud():
-    from src.privacy_service.word_safety import restore_table_geometry
+def test_writer_cell_without_source_is_not_trusted(monkeypatch):
+    """R4: the replaced order matching failed the whole file here; now local."""
+    from tests.unit.test_docx_paragraphs import _export_html
 
-    soup = BeautifulSoup("<table><tr><td>different</td></tr></table>", "html.parser")
-    with pytest.raises(ValueError, match="table count changed"):
-        restore_table_geometry(soup, FIXTURE.read_bytes())
+    _export_html(
+        monkeypatch,
+        "<body><p>Bleibt</p><table><tr><td colspan='2'>different</td></tr></table></body>",
+    )
+    markdown, meta, _ = convert_docx_bytes(FIXTURE.read_bytes())
+    assert "Bleibt" in markdown and "different" in markdown
+    assert "Tabellenstruktur nicht sicher zuordenbar" in markdown
+    assert "colspan" not in markdown
+    # The stub export also lacks header and footer: both come from the source.
+    assert meta["word_notices"] == [
+        "Tabelle ohne Spaltenzuordnung ausgegeben: Exporttabelle ohne Quellzuordnung",
+        "Kopfzeile (Standard) aus der Quelle angehängt",
+        "Fußzeile (Standard) aus der Quelle angehängt",
+    ]
+    assert "KOPFZEILENTEXT" in markdown and "FUSSZEILENTEXT" in markdown
 
 
-def test_ambiguous_tables_fail_instead_of_guessing_geometry(converted):
+def test_identical_tables_with_different_geometry_keep_their_own(converted):
     from copy import deepcopy
 
     from lxml import etree
 
-    from src.privacy_service.word_safety import NS, W, restore_table_geometry
+    from src.privacy_service.word_safety import NS, W
 
     output = io.BytesIO()
     with zipfile.ZipFile(FIXTURE) as source, zipfile.ZipFile(output, "w") as target:
@@ -227,10 +240,17 @@ def test_ambiguous_tables_fail_instead_of_guessing_geometry(converted):
                 root = etree.fromstring(raw)
                 table = root.find(".//w:tbl", NS)
                 duplicate = deepcopy(table)
-                duplicate.find(".//w:gridSpan", NS).set(f"{{{W}}}val", "1")
-                table.getparent().append(duplicate)
+                duplicate.find(".//w:gridSpan", NS).getparent().remove(
+                    duplicate.find(".//w:gridSpan", NS))
+                row = duplicate.findall("w:tr", NS)[1]
+                extra = deepcopy(row.findall("w:tc", NS)[-1])
+                row.append(extra)
+                table.addnext(etree.Element(f"{{{W}}}p"))
+                table.getnext().addnext(duplicate)
                 raw = etree.tostring(root)
             target.writestr(name, raw)
-    soup = BeautifulSoup(converted[0], "html.parser")
-    with pytest.raises(ValueError, match="Ambiguous"):
-        restore_table_geometry(soup, output.getvalue())
+    markdown, _, _ = convert_docx_bytes(output.getvalue())
+    first, second = [t for t in BeautifulSoup(markdown, "html.parser").find_all("table")
+                     if t.find_parent("table") is None][:2]
+    assert first.find_all("tr", recursive=False)[1].find("td")["colspan"] == "2"
+    assert second.find_all("tr", recursive=False)[1].find("td").get("colspan", "1") == "1"

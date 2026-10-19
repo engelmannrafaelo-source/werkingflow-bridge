@@ -165,12 +165,15 @@ def test_tracked_structure_deletion(kind):
         assert len(rows[1].findall("w:tc", ws.NS)) == 1
 
 
-def test_empty_geometry_is_loud():
+def test_empty_geometry_is_removed_locally():
+    """R4: a table emptied by accepted deletions disappears, the file stays."""
     doc = Document()
+    doc.add_paragraph("Bleibt")
     table = doc.add_table(rows=1, cols=1)
     table.rows[0]._tr.get_or_add_trPr().append(element("w:del"))
-    with pytest.raises(ValueError, match="Empty Word table geometry"):
-        ws.sanitize_docx(packed(doc))
+    with zipfile.ZipFile(io.BytesIO(ws.sanitize_docx(packed(doc)))) as archive:
+        text = archive.read("word/document.xml").decode()
+    assert "<w:tbl>" not in text and "Bleibt" in text
 
 
 def test_arithmetic_asterisk():

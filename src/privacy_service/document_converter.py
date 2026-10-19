@@ -48,6 +48,9 @@ logger = logging.getLogger("privacy-service.document-converter")
 _EXTENSION_FORMATS: Dict[str, str] = {
     ".pdf": "pdf",
     ".docx": "docx",
+    ".docm": "docx",
+    ".dotx": "docx",
+    ".dotm": "docx",
     ".doc": "docx",
     ".pptx": "pptx",
     ".ppt": "pptx",
@@ -70,6 +73,9 @@ _MIME_FORMATS: Dict[str, str] = {
     "application/pdf": "pdf",
     "application/msword": "docx",
     "application/vnd.openxmlformats-officedocument.wordprocessingml.document": "docx",
+    "application/vnd.ms-word.document.macroenabled.12": "docx",
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.template": "docx",
+    "application/vnd.ms-word.template.macroenabled.12": "docx",
     "application/vnd.ms-powerpoint": "pptx",
     "application/vnd.openxmlformats-officedocument.presentationml.presentation": "pptx",
     "application/vnd.ms-excel": "xlsx",
@@ -1192,11 +1198,12 @@ def convert_docx_bytes(content: bytes) -> tuple[str, dict[str, Any], dict[str, s
     from markdownify import markdownify
 
     from .image_format import UnprocessableWordImage, resize_word_image
+    from .word_provenance import apply_provenance
     from .word_safety import (
         EXTERNAL_IMAGE_NOTICE,
-        restore_table_geometry,
+        MACRO_NOTICE,
+        prepare_word,
         safe_link,
-        sanitize_docx,
     )
 
     binary = shutil.which("libreoffice") or shutil.which("soffice")
@@ -1216,10 +1223,12 @@ def convert_docx_bytes(content: bytes) -> tuple[str, dict[str, Any], dict[str, s
             if normalized.returncode or not (root / "legacy.docx").is_file():
                 raise RuntimeError("LibreOffice legacy Word normalization failed")
             word_content = (root / "legacy.docx").read_bytes()
+            legacy_doc = True
         else:
             word_content = content
-        word_content = sanitize_docx(word_content)
-        (root / "input.docx").write_bytes(word_content)
+            legacy_doc = False
+        prepared = prepare_word(word_content)
+        (root / "input.docx").write_bytes(prepared.content)
         # A private profile prevents concurrent conversions attaching to another
         # Writer process and returning before their own output exists.
         proc = subprocess.run(
@@ -1241,6 +1250,13 @@ def convert_docx_bytes(content: bytes) -> tuple[str, dict[str, Any], dict[str, s
         soup = BeautifulSoup(output.read_text(encoding="utf-8"), "html.parser")
         if soup.body is None:
             raise RuntimeError("LibreOffice Word HTML has no body.")
+        # Geometry comes from the source cell each HTML cell names, never
+        # from Writer's counting; a doubtful table stays local and visible.
+        notices = apply_provenance(soup, soup.body, prepared.provenance)
+        if prepared.provenance.macros_removed:
+            note = soup.new_tag("p")
+            note.string = MACRO_NOTICE
+            soup.body.insert(0, note)
         # Writer pretty-prints its HTML. Those source newlines are whitespace,
         # not Word breaks; only <br> must become Markdown's hard line break.
         for node in list(soup.body.find_all(string=True)):
@@ -1282,8 +1298,6 @@ def convert_docx_bytes(content: bytes) -> tuple[str, dict[str, Any], dict[str, s
             images[name] = base64.b64encode(raw).decode("ascii")
             image["src"] = name
 
-        if zipfile.is_zipfile(io.BytesIO(word_content)):
-            restore_table_geometry(soup.body, word_content)
 
         # Pipe tables cannot represent spans/nesting. Keep these as sanitized
         # HTML, including their exact cell geometry, and say so explicitly.
@@ -1307,6 +1321,11 @@ def convert_docx_bytes(content: bytes) -> tuple[str, dict[str, Any], dict[str, s
                 notice = ("Verschachtelte Tabelle: als HTML mit Zellstruktur erhalten."
                           if table.find("table") else
                           "Verbundene Tabellenzellen: als HTML mit Zellstruktur erhalten.")
+                if legacy_doc:
+                    # The geometry source is LibreOffice's own .doc reading;
+                    # there is no independent original to check it against.
+                    notice += (" Zellverbindungen stammen aus der .doc-Umwandlung"
+                               " und sind nicht gegen das Original prüfbar.")
                 html_tables[marker] = "\n\n" + notice + "\n\n" + str(table) + "\n\n"
                 table.replace_with(marker)
             else:
@@ -1330,6 +1349,7 @@ def convert_docx_bytes(content: bytes) -> tuple[str, dict[str, Any], dict[str, s
         "pages": None,
         "page_count_status": "unavailable",
         "page_count_note": "Keine Seitenangabe: Word wurde ohne Seitenlayout konvertiert.",
+        "word_notices": notices,
     }, images
 
 
