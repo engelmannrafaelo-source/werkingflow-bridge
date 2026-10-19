@@ -17,6 +17,9 @@ from .word_provenance import (
     header_footer_uses,
     new_provenance,
     next_bookmark_id,
+    note_references,
+    part_target,
+    record_text,
     stamp_header_footer,
     stamp_part,
 )
@@ -28,6 +31,7 @@ W = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
 R = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
 NS = {"w": W}
 EXTERNAL_IMAGE_NOTICE = "[Extern verlinktes Bild nicht geladen]"
+MISSING_IMAGE_NOTICE = "[Eingebettetes Bild nicht im Dokument gefunden, nicht geladen]"
 
 
 def safe_link(url: str) -> bool:
@@ -39,7 +43,6 @@ def safe_link(url: str) -> bool:
         "https",
         "mailto",
     }
-
 
 
 # Budgets apply before any member is inflated, independently of compressed size.
@@ -73,14 +76,25 @@ CT = "{http://schemas.openxmlformats.org/package/2006/content-types}"
 def _main_part(types, rels) -> str | None:
     """Resolve the main document via the package relationship and content type."""
     for rel in rels:
-        if (rel.get("Type", "").endswith("/officeDocument")
-                and rel.get("TargetMode") != "External"):
-            name = posixpath.normpath(rel.get("Target", "").lstrip("/"))
-            override = {n.get("PartName"): n.get("ContentType")
-                        for n in types if n.tag == CT + "Override"}
-            default = {n.get("Extension", "").lower(): n.get("ContentType")
-                       for n in types if n.tag == CT + "Default"}
-            kind = override.get("/" + name) or default.get(posixpath.splitext(name)[1][1:].lower())
+        if (
+            rel.get("Type", "").endswith("/officeDocument")
+            and rel.get("TargetMode") != "External"
+        ):
+            name = part_target("", rel.get("Target", ""))
+            if name is None:
+                return None
+            override = {
+                n.get("PartName"): n.get("ContentType")
+                for n in types
+                if n.tag == CT + "Override"
+            }
+            default = {
+                n.get("Extension", "").lower(): n.get("ContentType")
+                for n in types
+                if n.tag == CT + "Default"
+            }
+            extension = posixpath.splitext(name)[1][1:].lower()
+            kind = override.get("/" + name) or default.get(extension)
             return name if kind in WORD_MAIN_TYPES else None
     return None
 
@@ -92,18 +106,26 @@ def checked_word_package(content: bytes):
     try:
         source = zipfile.ZipFile(io.BytesIO(content))
     except zipfile.BadZipFile as exc:
-        raise ValueError("Kein Word-Dokument: gültiges OOXML-Paket erforderlich") from exc
+        raise ValueError(
+            "Kein Word-Dokument: gültiges OOXML-Paket erforderlich"
+        ) from exc
     try:
         entries = source.infolist()
         xml_parts = [i for i in entries if i.filename.endswith((".xml", ".rels"))]
-        if (len(entries) > MAX_WORD_ENTRIES
-                or sum(i.file_size for i in entries) > MAX_WORD_EXPANDED
-                or sum(i.file_size for i in xml_parts) > MAX_WORD_XML_TOTAL
-                or any(i.file_size > MAX_WORD_XML_PART for i in xml_parts)
-                or any(i.file_size > MAX_WORD_RATIO_FREE
-                       and i.file_size > MAX_WORD_RATIO * max(i.compress_size, 1)
-                       for i in entries)):
-            raise DocumentTooLargeError("Word package exceeds expanded size/entry budget")
+        if (
+            len(entries) > MAX_WORD_ENTRIES
+            or sum(i.file_size for i in entries) > MAX_WORD_EXPANDED
+            or sum(i.file_size for i in xml_parts) > MAX_WORD_XML_TOTAL
+            or any(i.file_size > MAX_WORD_XML_PART for i in xml_parts)
+            or any(
+                i.file_size > MAX_WORD_RATIO_FREE
+                and i.file_size > MAX_WORD_RATIO * max(i.compress_size, 1)
+                for i in entries
+            )
+        ):
+            raise DocumentTooLargeError(
+                "Word package exceeds expanded size/entry budget"
+            )
         names = source.namelist()
         if len(names) != len(set(names)):
             raise ValueError("Ambiguous Word package: duplicate ZIP entries")
@@ -149,11 +171,15 @@ def prepare_word(content: bytes) -> PreparedWord:
     parser = etree.XMLParser(resolve_entities=False, no_network=True)
     with checked_word_package(content) as source:
         main = source.word_main
-        parts = {name: source.read(name) for name in source.namelist()
-                 if name.endswith((".xml", ".rels"))}
+        names = source.namelist()
+        parts = {
+            name: source.read(name)
+            for name in names
+            if name.endswith((".xml", ".rels"))
+        }
     provenance = new_provenance(parts)
     stamper = _Stamper(provenance, next_bookmark_id(parts))
-    pictures = _PictureBudget(content)
+    pictures = _PictureBudget(content, set(names))
     dropped = _drop_macros(parts, main, provenance)
     styles = {}
     defaults = {}
@@ -184,14 +210,18 @@ def prepare_word(content: bytes) -> PreparedWord:
         defaults.update(style_flags(key))
 
     main_rels_name = _rels_name(main)
+    main_root = etree.fromstring(parts[main], parser)
+    references = note_references(main_root)
     uses = {}
     if main_rels_name in parts:
-        uses = header_footer_uses(etree.fromstring(parts[main], parser),
-                                  etree.fromstring(parts[main_rels_name], parser),
-                                  posixpath.dirname(main))
+        uses = header_footer_uses(
+            main_root, etree.fromstring(parts[main_rels_name], parser), main
+        )
 
+    # Every XML part, not only word/*: OPC lets the main document and its
+    # parts live under any name, and the relationships decide what Writer loads.
     for name, raw in list(parts.items()):
-        if not name.startswith("word/") or not name.endswith(".xml"):
+        if not name.endswith(".xml") or name == "[Content_Types].xml":
             continue
         root = etree.fromstring(raw, parser)
         # Empty comment parts as well as removing references: nothing downstream
@@ -200,12 +230,14 @@ def prepare_word(content: bytes) -> PreparedWord:
             for child in list(root):
                 root.remove(child)
         # A row/cell deletion changes structure, not just run visibility.
-        for node in root.xpath("//w:tr[w:trPr/w:del] | //w:tc[w:tcPr/w:cellDel]",
-                               namespaces=NS):
+        for node in root.xpath(
+            "//w:tr[w:trPr/w:del] | //w:tc[w:tcPr/w:cellDel]", namespaces=NS
+        ):
             node.getparent().remove(node)
         _drop_empty_geometry(root)
         for node in root.xpath(
-            "//w:del | //w:moveFrom | //w:commentReference | //w:commentRangeStart | //w:commentRangeEnd",
+            "//w:del | //w:moveFrom | //w:commentReference | //w:commentRangeStart"
+            " | //w:commentRangeEnd",
             namespaces=NS,
         ):
             node.getparent().remove(node)
@@ -217,7 +249,10 @@ def prepare_word(content: bytes) -> PreparedWord:
             else:
                 value = chr(code) if not (0xE000 <= code <= 0xF8FF) else None
             replacement = etree.Element(f"{{{W}}}t")
-            replacement.text = value or f"[Symbol aus {font}: U+{code:04X} nicht als Unicode verfügbar]"
+            replacement.text = (
+                value
+                or f"[Symbol aus {font}: U+{code:04X} nicht als Unicode verfügbar]"
+            )
             symbol.getparent().replace(symbol, replacement)
         for run in list(root.findall(".//w:r", NS)):
             flags = dict(defaults)
@@ -252,8 +287,9 @@ def prepare_word(content: bytes) -> PreparedWord:
                 if kind.endswith("/image") and rel.get("TargetMode") == "External":
                     blocked_images[rel.get("Id")] = EXTERNAL_IMAGE_NOTICE
                     rels.remove(rel)
-                elif kind.endswith("/image") and (notice := pictures.refuse(
-                        posixpath.normpath(posixpath.join(posixpath.dirname(name), target)))):
+                elif kind.endswith("/image") and (
+                    notice := pictures.refuse(name, target)
+                ):
                     blocked_images[rel.get("Id")] = notice
                     provenance.notices.append(notice.strip("[]"))
                     rels.remove(rel)
@@ -276,11 +312,17 @@ def prepare_word(content: bytes) -> PreparedWord:
                     if picture is None:
                         # e.g. a page background fill: the relationship is
                         # already gone, so Writer cannot load it; say so.
-                        logger.warning("Blocked Word image outside drawing/pict: %s", node.tag)
-                        provenance.notices.append("Bild außerhalb einer Zeichnung nicht geladen")
+                        logger.warning(
+                            "Blocked Word image outside drawing/pict: %s", node.tag
+                        )
+                        provenance.notices.append(
+                            "Bild außerhalb einer Zeichnung nicht geladen"
+                        )
                     elif picture.getparent() is not None:
                         text = etree.Element(f"{{{W}}}t")
-                        text.text = blocked_images[next(iter(refs & blocked_images.keys()))]
+                        text.text = blocked_images[
+                            next(iter(refs & blocked_images.keys()))
+                        ]
                         picture.getparent().replace(picture, text)
                 if node.tag == f"{{{W}}}hyperlink" and refs & blocked_links:
                     parent = node.getparent()
@@ -296,11 +338,13 @@ def prepare_word(content: bytes) -> PreparedWord:
         stamp_part(provenance, stamper, name, root)
         if root.tag in {f"{{{W}}}hdr", f"{{{W}}}ftr"}:
             stamp_header_footer(provenance, stamper, name, root, uses.get(name, []))
+        record_text(provenance, name, root, uses.get(name, []), references)
         parts[name] = etree.tostring(root, xml_declaration=True, encoding="UTF-8")
     output = io.BytesIO()
-    with checked_word_package(content) as source, zipfile.ZipFile(
-        output, "w", zipfile.ZIP_DEFLATED
-    ) as target:
+    with (
+        checked_word_package(content) as source,
+        zipfile.ZipFile(output, "w", zipfile.ZIP_DEFLATED) as target,
+    ):
         for info in source.infolist():
             if info.filename in dropped:
                 continue
@@ -317,8 +361,9 @@ def prepare_word(content: bytes) -> PreparedWord:
 class _PictureBudget:
     """Pixel sizes from picture headers only; nothing is decoded here."""
 
-    def __init__(self, content: bytes):
+    def __init__(self, content: bytes, names: set[str]):
         self.content = content
+        self.names = names
         self.admitted: set[str] = set()
         self.total = 0
 
@@ -328,23 +373,38 @@ class _PictureBudget:
         from PIL import Image, UnidentifiedImageError
 
         try:
-            with (zipfile.ZipFile(io.BytesIO(self.content)) as package, package.open(member) as raw,
-                  warnings.catch_warnings(action="ignore", category=Image.DecompressionBombWarning),
-                  Image.open(raw) as image):
+            with (
+                zipfile.ZipFile(io.BytesIO(self.content)) as package,
+                package.open(member) as raw,
+                warnings.catch_warnings(
+                    action="ignore", category=Image.DecompressionBombWarning
+                ),
+                Image.open(raw) as image,
+            ):
                 return image.size
         except Image.DecompressionBombError:
             return self._png_size(member)  # beyond Pillow's own ceiling
-        except (KeyError, UnidentifiedImageError, OSError, ValueError, zipfile.BadZipFile):
+        except (UnidentifiedImageError, OSError, ValueError, zipfile.BadZipFile):
             return ()  # not a raster header Pillow knows: Writer decides as before
 
     def _png_size(self, member: str):
-        with zipfile.ZipFile(io.BytesIO(self.content)) as package, package.open(member) as raw:
+        with (
+            zipfile.ZipFile(io.BytesIO(self.content)) as package,
+            package.open(member) as raw,
+        ):
             head = raw.read(24)
         if head[:8] == b"\x89PNG\r\n\x1a\n" and head[12:16] == b"IHDR":
-            return int.from_bytes(head[16:20], "big"), int.from_bytes(head[20:24], "big")
+            return int.from_bytes(head[16:20], "big"), int.from_bytes(
+                head[20:24], "big"
+            )
         return None
 
-    def refuse(self, member: str) -> str | None:
+    def refuse(self, source: str, target: str) -> str | None:
+        member = part_target(source, target, self.names)
+        if member is None:
+            # Unresolvable for us means unbudgeted for Writer: never pass it on.
+            logger.warning("Word picture target not in package, not loaded: %r", target)
+            return MISSING_IMAGE_NOTICE
         if member in self.admitted:
             return None
         size = self._size(member)
@@ -353,18 +413,27 @@ class _PictureBudget:
         pixels = size[0] * size[1] if size else None
         label = f"{size[0]}×{size[1]} Pixel" if size else "über Pillows Grenze"
         if pixels is None or pixels > MAX_WORD_IMAGE_PIXELS:
-            logger.warning("Word picture over pixel budget, not loaded: %s (%s)", member, label)
+            logger.warning(
+                "Word picture over pixel budget, not loaded: %s (%s)", member, label
+            )
             return f"[Eingebettetes Bild zu groß ({label}), nicht geladen]"
         if self.total + pixels > MAX_WORD_IMAGE_PIXELS_TOTAL:
-            logger.warning("Word pictures over total pixel budget, not loaded: %s", member)
-            return f"[Eingebettetes Bild nicht geladen: Bildbudget des Dokuments erschöpft ({label})]"
+            logger.warning(
+                "Word pictures over total pixel budget, not loaded: %s", member
+            )
+            return (
+                "[Eingebettetes Bild nicht geladen: Bildbudget des Dokuments "
+                f"erschöpft ({label})]"
+            )
         self.admitted.add(member)
         self.total += pixels
         return None
 
 
 def _rels_name(name: str) -> str:
-    return posixpath.join(posixpath.dirname(name), "_rels", posixpath.basename(name) + ".rels")
+    return posixpath.join(
+        posixpath.dirname(name), "_rels", posixpath.basename(name) + ".rels"
+    )
 
 
 def _drop_empty_geometry(root) -> None:
@@ -382,31 +451,51 @@ def _drop_empty_geometry(root) -> None:
                 parent.append(etree.Element(f"{{{W}}}p"))
 
 
-MACRO_RELS = ("/vbaProject", "/wordVbaData", "/keyMapCustomizations", "/attachedToolbars")
-MACRO_NOTICE = "[Hinweis: Das Dokument enthielt Makros (VBA); sie wurden entfernt und nicht ausgeführt.]"
+MACRO_RELS = (
+    "/vbaProject",
+    "/wordVbaData",
+    "/keyMapCustomizations",
+    "/attachedToolbars",
+)
+MACRO_NOTICE = (
+    "[Hinweis: Das Dokument enthielt Makros (VBA); sie wurden entfernt und nicht "
+    "ausgeführt.]"
+)
 
 
-def _drop_macros(parts: dict[str, bytes], main: str, provenance: Provenance) -> set[str]:
+def _drop_macros(
+    parts: dict[str, bytes], main: str, provenance: Provenance
+) -> set[str]:
     """Remove VBA projects before Writer opens the package; name the removal."""
     parser = etree.XMLParser(resolve_entities=False, no_network=True)
     rel_name = _rels_name(main)
     if rel_name not in parts:
         return set()
     rels = etree.fromstring(parts[rel_name], parser)
-    dropped = set()
+    dropped, removed = set(), False
     for rel in list(rels):
-        if rel.get("Type", "").endswith(MACRO_RELS) and rel.get("TargetMode") != "External":
-            target = posixpath.normpath(posixpath.join(posixpath.dirname(main), rel.get("Target", "")))
-            dropped |= {target, _rels_name(target)}
+        if (
+            rel.get("Type", "").endswith(MACRO_RELS)
+            and rel.get("TargetMode") != "External"
+        ):
+            target = part_target(main, rel.get("Target", ""))
+            if target is not None:
+                dropped |= {target, _rels_name(target)}
             rels.remove(rel)
-    if not dropped:
+            removed = True
+    if not removed:
         return set()
     parts[rel_name] = etree.tostring(rels, xml_declaration=True, encoding="UTF-8")
     types = etree.fromstring(parts["[Content_Types].xml"], parser)
     for node in list(types):
-        if node.tag == CT + "Override" and node.get("PartName", "").lstrip("/") in dropped:
+        if (
+            node.tag == CT + "Override"
+            and node.get("PartName", "").lstrip("/") in dropped
+        ):
             types.remove(node)
-    parts["[Content_Types].xml"] = etree.tostring(types, xml_declaration=True, encoding="UTF-8")
+    parts["[Content_Types].xml"] = etree.tostring(
+        types, xml_declaration=True, encoding="UTF-8"
+    )
     for name in dropped:
         parts.pop(name, None)
     logger.warning("Word macros removed before conversion: %s", sorted(dropped))
@@ -415,23 +504,40 @@ def _drop_macros(parts: dict[str, bytes], main: str, provenance: Provenance) -> 
     return dropped
 
 
-O = "urn:schemas-microsoft-com:office:office"
+OFFICE = "urn:schemas-microsoft-com:office:office"
 MAX_EMBEDDED_ROWS = 200
 MAX_EMBEDDED_COLUMNS = 30
 MAX_EMBEDDED_EXPANDED = 32 * 1024 * 1024
 
 
-def _replace_embedded_objects(content: bytes, name: str, root, rels, provenance) -> None:
+def _replace_embedded_objects(
+    content: bytes, name: str, root, rels, provenance
+) -> None:
     """OLE objects vanish in Writer's HTML; leave a notice and, for Excel, the cells."""
-    targets = {rel.get("Id"): rel.get("Target", "") for rel in rels
-               if rel.get("TargetMode") != "External"}
-    for ole in list(root.iter(f"{{{O}}}OLEObject")):
-        container = next((a for a in ole.iterancestors()
-                          if a.tag in {f"{{{W}}}object", f"{{{W}}}pict"}), None)
+    targets = {
+        rel.get("Id"): rel.get("Target", "")
+        for rel in rels
+        if rel.get("TargetMode") != "External"
+    }
+    for ole in list(root.iter(f"{{{OFFICE}}}OLEObject")):
+        container = next(
+            (
+                a
+                for a in ole.iterancestors()
+                if a.tag in {f"{{{W}}}object", f"{{{W}}}pict"}
+            ),
+            None,
+        )
         if container is None or container.getparent() is None:
             continue
-        fallback = next((a for a in container.iterancestors()
-                         if a.tag == f"{{{MC}}}AlternateContent"), None)
+        fallback = next(
+            (
+                a
+                for a in container.iterancestors()
+                if a.tag == f"{{{MC}}}AlternateContent"
+            ),
+            None,
+        )
         if fallback is not None:
             container = fallback
         if root not in container.iterancestors():
@@ -440,15 +546,22 @@ def _replace_embedded_objects(content: bytes, name: str, root, rels, provenance)
         target = targets.get(ole.get(f"{{{R}}}id"))
         cells = None
         if target and target.lower().endswith((".xlsx", ".xlsm")):
-            member = posixpath.normpath(posixpath.join(posixpath.dirname(name), target))
-            cells = _embedded_workbook_cells(content, member)
+            member = part_target(name, target)
+            cells = _embedded_workbook_cells(content, member) if member else None
         if cells is None:
             text = f"[Eingebettetes Objekt ({progid}) nicht übernommen]"
         else:
             truncated = cells[1]
-            text = (f"[Eingebettetes Objekt ({progid}): Tabelleninhalt des aktiven Blatts "
-                    f"übernommen{', gekürzt' if truncated else ''}; Darstellung nicht übernommen]")
-        logger.warning("Word embedded object replaced: %s (%s)", progid, "cells" if cells else "notice")
+            text = (
+                f"[Eingebettetes Objekt ({progid}): Tabelleninhalt des aktiven Blatts "
+                f"übernommen{', gekürzt' if truncated else ''}; Darstellung nicht "
+                "übernommen]"
+            )
+        logger.warning(
+            "Word embedded object replaced: %s (%s)",
+            progid,
+            "cells" if cells else "notice",
+        )
         provenance.notices.append(text.strip("[]"))
         notice = etree.Element(f"{{{W}}}t")
         notice.text = text
@@ -457,7 +570,9 @@ def _replace_embedded_objects(content: bytes, name: str, root, rels, provenance)
             run = etree.Element(f"{{{W}}}r")
             run.append(notice)
             notice = run
-        paragraph = next((a for a in container.iterancestors() if a.tag == f"{{{W}}}p"), None)
+        paragraph = next(
+            (a for a in container.iterancestors() if a.tag == f"{{{W}}}p"), None
+        )
         parent.replace(container, notice)
         if cells is not None and paragraph is not None:
             table = _cells_table(cells[0])
@@ -475,7 +590,10 @@ def _embedded_workbook_cells(content: bytes, member: str):
             embedded = outer.read(member)
         with zipfile.ZipFile(io.BytesIO(embedded)) as inner:
             infos = inner.infolist()
-            if len(infos) > 1000 or sum(i.file_size for i in infos) > MAX_EMBEDDED_EXPANDED:
+            if (
+                len(infos) > 1000
+                or sum(i.file_size for i in infos) > MAX_EMBEDDED_EXPANDED
+            ):
                 logger.warning("Embedded workbook over budget: %s", member)
                 return None
         book = load_workbook(io.BytesIO(embedded), read_only=True, data_only=True)
@@ -488,7 +606,9 @@ def _embedded_workbook_cells(content: bytes, member: str):
                     break
                 if len(row) > MAX_EMBEDDED_COLUMNS:
                     truncated = True
-                rows.append(["" if v is None else str(v) for v in row[:MAX_EMBEDDED_COLUMNS]])
+                rows.append(
+                    ["" if v is None else str(v) for v in row[:MAX_EMBEDDED_COLUMNS]]
+                )
         finally:
             book.close()
     except Exception as exc:  # noqa: BLE001 — local notice instead of whole-document failure

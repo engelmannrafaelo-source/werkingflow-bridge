@@ -6,6 +6,10 @@ size budget) may answer 4xx — then without starting Writer. Everything else
 must return text, with local notices where an element could not be kept.
 The reviewer's sizes for the bomb probes are generated here instead of
 being committed. Soll per probe: ``tests/fixtures/docx/korpus/README.md``.
+
+R5 adds the R4 Codex probes (c01–c12) and a stricter ledger: unique
+sentinel texts must appear exactly once in the text a CommonMark renderer
+shows — no silent loss, no duplication, no literal text turned into markup.
 """
 
 import binascii
@@ -36,8 +40,15 @@ DANGER = {
 
 # Content the reviews named per probe; every listed string must survive.
 EXPECT = {
-    "voll.docx": ["Absatz EINS.", "EINGEFUEGTERTEXT", "KOPFZEILENTEXT", "FUSSZEILENTEXT",
-                  "FUSSNOTENTEXT", "TEXTFELDINHALT", 'colspan="2"><p>QUERVERBUNDEN'],
+    "voll.docx": [
+        "Absatz EINS.",
+        "EINGEFUEGTERTEXT",
+        "KOPFZEILENTEXT",
+        "FUSSZEILENTEXT",
+        "FUSSNOTENTEXT",
+        "TEXTFELDINHALT",
+        'colspan="2"><p>QUERVERBUNDEN',
+    ],
     "voll.doc": ["Absatz EINS.", "QUERVERBUNDEN", "nicht gegen das Original prüfbar"],
     "spaces.docx": ["**Fett** Text danach.", "Vorher *kursiv* und weiter.", "5*3 = 15"],
     "t_sym.docx": ["20°C"],
@@ -46,7 +57,12 @@ EXPECT = {
     "t_pagefeld.docx": ["|"],
     "tab_mehrabsatz.docx": ["Zeile a Zeile b"],
     "tab_delrow.docx": ["| Z0 | W0 |", "| Z2 | W2 |"],
-    "h01_kopf_mehrfach.docx": ["KD-QUER", "KE-QUER", "Kopfzeile (erste Seite)", "Brieftext."],
+    "h01_kopf_mehrfach.docx": [
+        "KD-QUER",
+        "KE-QUER",
+        "Kopfzeile (erste Seite)",
+        "Brieftext.",
+    ],
     "h01b_kopf_gerade_ohne_tabelle.docx": ["Gerade", "Kopfzeile (gerade Seiten)"],
     "h02_textfeld_tabelle.docx": ['colspan="2"><p>B-QUER', "TB-A", "TB-B"],
     "h03_sdt_zeile.docx": ['colspan="2"><p>S-QUER', "S22"],
@@ -59,11 +75,37 @@ EXPECT = {
     "h13_makro.docm": ["Makros (VBA)", "MAKROTEXT", 'colspan="2"><p>D-QUER'],
     "h15_wingdings.docx": ["Symbol aus Wingdings"],
     "h16_gridafter.docx": ['colspan="2"><p>G-QUER', "G21"],
-    "h19_pixelbombe.docx": ["[Eingebettetes Bild zu groß (30000×30000 Pixel), nicht geladen]"],
-    "h19b_pixelbombe_60k.docx": ["[Eingebettetes Bild zu groß (60000×60000 Pixel), nicht geladen]"],
-    "h21_excel_ole.docx": ["| EXCELZELLE | 42 |", "Eingebettetes Objekt (Excel.Sheet.12)"],
-    "h21b_excel_ole_word.docx": ["| EXCELZELLE | 42 |", "Eingebettetes Objekt (Excel.Sheet.12)"],
+    "h19_pixelbombe.docx": [
+        "[Eingebettetes Bild zu groß (30000×30000 Pixel), nicht geladen]"
+    ],
+    "h19b_pixelbombe_60k.docx": [
+        "[Eingebettetes Bild zu groß (60000×60000 Pixel), nicht geladen]"
+    ],
+    "h21_excel_ole.docx": [
+        "| EXCELZELLE | 42 |",
+        "Eingebettetes Objekt (Excel.Sheet.12)",
+    ],
+    "h21b_excel_ole_word.docx": [
+        "| EXCELZELLE | 42 |",
+        "Eingebettetes Objekt (Excel.Sheet.12)",
+    ],
     "h24_zwei_angrenzende_tabellen.docx": ["| Einheit | kWh/m2a |", 'colspan="2"><p>Q'],
+    "c05_platzhalter_literal.docx": ["WORDTABLEPLACEHOLDER0END", "QXMERGEDQZ"],
+    "c09_textfeld_tabelle.docx": ['colspan="2"><p>B-QUER', "TB-A", "TB-B", "B22"],
+    "c10_bild_paketabsolut.docx": [
+        "[Eingebettetes Bild zu groß (30000×30000 Pixel), nicht geladen]"
+    ],
+    "c11_hauptteil_verlegt_bild.docx": [
+        "[Eingebettetes Bild zu groß (30000×30000 Pixel), nicht geladen]"
+    ],
+    # voll.docx with its main document moved from word/ to content/
+    "c12_hauptteil_verlegt_privat.docx": [
+        "Absatz EINS.",
+        "EINGEFUEGTERTEXT",
+        "KOPFZEILENTEXT",
+        "FUSSZEILENTEXT",
+        "FUSSNOTENTEXT",
+    ],
 }
 FORBIDDEN = {
     "voll.docx": ["VERSTECKTERTEXT", "KOMMENTARTEXT", "GELOESCHTERTEXT", "javascript:"],
@@ -72,7 +114,78 @@ FORBIDDEN = {
     "tab_delrow2.docx": ["GELOESCHT", "ZEILEWEG"],
     "h06_kommentar_tabelle.docx": ["KOMMENTAR"],
     "spaces.docx": ["FettText", "Vorherkursiv"],
+    "c12_hauptteil_verlegt_privat.docx": [
+        "VERSTECKTERTEXT",
+        "KOMMENTARTEXT",
+        "GELOESCHTERTEXT",
+        "example.invalid",
+        "javascript:",
+    ],
 }
+
+# R5 ledger: every sentinel exactly once in the rendered text.
+_HEAD = [f"QXHEAD{k}{i}QZ" for i in (0, 1) for k in ("ER", "MERGE", "NEST", "END")]
+SENTINELS = {
+    "c01_fussnote_tabelle_nach_absatz.docx": [f"QXNOTE{i}QZ" for i in range(4)],
+    "c02_fussnote_tabelle_vor_absatz.docx": [f"QXNOTE{i}QZ" for i in range(4)],
+    "c03_kopf_mehrdeutig.docx": [
+        "QXHEADERAMBODYQZ",
+        *[f"QXAMHEAD{i}QZ" for i in range(4)],
+    ],
+    "c04_vmerge_folgezelle_text.docx": [
+        "QXVMSTARTQZ",
+        "QXCONTINUATIONQZ",
+        *[f"QXVMCELL{i}QZ" for i in range(4)],
+    ],
+    "c05_platzhalter_literal.docx": ["QXBEFOREQZ", "QXAFTERQZ", "QXMERGEDQZ"],
+    "c06_lesezeichen_kollision.docx": [
+        "QXSTARTQZ",
+        "QXENDQZ",
+        *[f"QXCELL{i}QZ" for i in range(4)],
+    ],
+    "c07_verschachtelt_verbunden.docx": [
+        "QXBEFOREQZ",
+        "QXOUTERQZ",
+        "QXPARENTQZ",
+        *[f"QXINNER{i}QZ" for i in range(4)],
+        "QXAFTERNESTQZ",
+        "QXNEIGHBOURQZ",
+        "QXAFTERQZ",
+    ],
+    "c08_kopf_varianten_verschachtelt.docx": ["QXBODYHEADERQZ", *_HEAD],
+}
+# Literal source text that must stay visible text (not markup) once rendered.
+RENDERED = {
+    "spaces.docx": ["<tag> & Co."],
+    "c05_platzhalter_literal.docx": ["QXBEFOREQZ WORDTABLEPLACEHOLDER0END QXAFTERQZ"],
+    "c06_lesezeichen_kollision.docx": [
+        'QXSTARTQZ <a name="wqdeadbeef_t1r0c0"> QXENDQZ'
+    ],
+}
+# Required notices (prefixes) — a loss repaired from the source is never silent.
+NOTICES = {
+    "c01_fussnote_tabelle_nach_absatz.docx": ["Fußnoten: 4 Absätze"],
+    "c02_fussnote_tabelle_vor_absatz.docx": ["Fußnoten: 4 Absätze"],
+    "c03_kopf_mehrdeutig.docx": ["Tabelle ohne Spaltenzuordnung ausgegeben"],
+    "c04_vmerge_folgezelle_text.docx": ["Text einer vertikal verbundenen Folgezelle"],
+    "c10_bild_paketabsolut.docx": ["Eingebettetes Bild zu groß"],
+    "c11_hauptteil_verlegt_bild.docx": ["Eingebettetes Bild zu groß"],
+}
+# Notices that must not appear (e.g. a present part reported missing).
+NO_NOTICES = {
+    "c03_kopf_mehrdeutig.docx": ["Kopfzeile", "im Export nicht enthalten"],
+    "c06_lesezeichen_kollision.docx": ["im Export nicht enthalten"],
+    "c07_verschachtelt_verbunden.docx": ["im Export nicht enthalten"],
+}
+
+
+def rendered_text(markdown: str) -> str:
+    """What a CommonMark reader shows (tables as GFM), as plain text."""
+    from bs4 import BeautifulSoup
+
+    markdown_it = pytest.importorskip("markdown_it")
+    html = markdown_it.MarkdownIt("commonmark").enable("table").render(markdown)
+    return BeautifulSoup(html, "html.parser").get_text(" ")
 
 
 def _bomb(path, megabytes, referenced):
@@ -122,16 +235,59 @@ def _lying_size(path, megabytes=1536):
     name = b"word/media/luege.bin"
     cd_offset = data.find(b"PK\x01\x02")
     end_offset = data.find(b"PK\x05\x06")
-    local = struct.pack("<IHHHHHIIIHH", 0x04034B50, 20, 0, 8, 0, 0, crc, len(payload), 1024,
-                        len(name), 0) + name
-    central = struct.pack("<IHHHHHHIIIHHHHHII", 0x02014B50, 20, 20, 0, 8, 0, 0, crc, len(payload),
-                          1024, len(name), 0, 0, 0, 0, 0, cd_offset) + name
-    entries, = struct.unpack("<H", data[end_offset + 10:end_offset + 12])
+    local = (
+        struct.pack(
+            "<IHHHHHIIIHH",
+            0x04034B50,
+            20,
+            0,
+            8,
+            0,
+            0,
+            crc,
+            len(payload),
+            1024,
+            len(name),
+            0,
+        )
+        + name
+    )
+    central = (
+        struct.pack(
+            "<IHHHHHHIIIHHHHHII",
+            0x02014B50,
+            20,
+            20,
+            0,
+            8,
+            0,
+            0,
+            crc,
+            len(payload),
+            1024,
+            len(name),
+            0,
+            0,
+            0,
+            0,
+            0,
+            cd_offset,
+        )
+        + name
+    )
+    (entries,) = struct.unpack("<H", data[end_offset + 10 : end_offset + 12])
     directory = data[cd_offset:end_offset] + central
-    end = (data[end_offset:end_offset + 8]
-           + struct.pack("<HHII", entries + 1, entries + 1, len(directory),
-                         cd_offset + len(local) + len(payload))
-           + data[end_offset + 20:])
+    end = (
+        data[end_offset : end_offset + 8]
+        + struct.pack(
+            "<HHII",
+            entries + 1,
+            entries + 1,
+            len(directory),
+            cd_offset + len(local) + len(payload),
+        )
+        + data[end_offset + 20 :]
+    )
     path.write_bytes(data[:cd_offset] + local + payload + directory + end)
 
 
@@ -159,30 +315,46 @@ def client():
     app_mod._DOCUMENT_CHAIN = previous
 
 
-GENERATED = ["bombe.docx", "h17_luegengroesse.docx", "h20a_unterbudget_unreferenziert.docx",
-             "h20b_unterbudget_bild.docx"]
-PROBES = sorted(p.name for p in KORPUS.iterdir() if p.suffix in {".docx", ".doc", ".docm", ".dotx"})
+GENERATED = [
+    "bombe.docx",
+    "h17_luegengroesse.docx",
+    "h20a_unterbudget_unreferenziert.docx",
+    "h20b_unterbudget_bild.docx",
+]
+PROBES = sorted(
+    p.name for p in KORPUS.iterdir() if p.suffix in {".docx", ".doc", ".docm", ".dotx"}
+)
 
 
 def test_korpus_is_complete():
-    # 48 committed reviewer probes (R1 5, R2 20 without bombe, R3 23 without h17/h20a/h20b).
-    assert len(PROBES) == 48
-    assert set(EXPECT) | set(FORBIDDEN) <= set(PROBES) | set(GENERATED)
+    # 48 committed reviewer probes (R1 5, R2 20 without bombe,
+    # R3 23 without h17/h20a/h20b)
+    # plus 12 of the R4 Codex review (c01–c12).
+    assert len(PROBES) == 60
+    named = set(EXPECT) | set(FORBIDDEN) | set(SENTINELS) | set(RENDERED) | set(NOTICES)
+    assert named <= set(PROBES) | set(GENERATED)
     assert not set(GENERATED) & set(PROBES)
 
 
-@pytest.mark.skipif(not shutil.which("libreoffice") and not shutil.which("soffice"),
-                    reason="requires LibreOffice")
+@pytest.mark.skipif(
+    not shutil.which("libreoffice") and not shutil.which("soffice"),
+    reason="requires LibreOffice",
+)
 @pytest.mark.parametrize("name", PROBES + GENERATED)
 def test_korpus_probe(name, client, generated, monkeypatch):
     from src.privacy_service import document_converter as dc
 
     path = generated[name] if name in generated else KORPUS / name
     if name in DANGER:
-        monkeypatch.setattr(dc.subprocess, "run",
-                            lambda *a, **kw: pytest.fail(f"Writer started for {name}"))
+        monkeypatch.setattr(
+            dc.subprocess,
+            "run",
+            lambda *a, **kw: pytest.fail(f"Writer started for {name}"),
+        )
     with path.open("rb") as handle:
-        response = client.post("/document/convert", files={"file": (name, handle, MIME)})
+        response = client.post(
+            "/document/convert", files={"file": (name, handle, MIME)}
+        )
     if name in DANGER:
         status, reason = DANGER[name]
         assert response.status_code == status, response.text[:300]
@@ -196,3 +368,14 @@ def test_korpus_probe(name, client, generated, monkeypatch):
         assert text in markdown, (name, text)
     for text in FORBIDDEN.get(name, []):
         assert text not in markdown, (name, text)
+    notices = body["metadata"]["word_notices"]
+    for prefix in NOTICES.get(name, []):
+        assert any(n.startswith(prefix) for n in notices), (name, prefix, notices)
+    for part in NO_NOTICES.get(name, []):
+        assert not any(part in n for n in notices), (name, part, notices)
+    if name in SENTINELS or name in RENDERED:
+        shown = " ".join(rendered_text(markdown).split())
+        for sentinel in SENTINELS.get(name, []):
+            assert shown.count(sentinel) == 1, (name, sentinel, shown.count(sentinel))
+        for text in RENDERED.get(name, []):
+            assert text in shown, (name, text)

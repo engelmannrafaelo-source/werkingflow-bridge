@@ -9,6 +9,12 @@ before Writer runs, a bookmark with a per-conversion prefix is written into
 the first paragraph of every origin cell and of every header/footer part.
 Writer exports bookmarks as ``<a name>``, so each HTML cell names the source
 cell it came from. Problems stay local to one table or part.
+
+Identity alone cannot see what Writer never exports (a table in a footnote,
+the text of a merged continuation cell). So every displayed part also keeps
+a text ledger of its source paragraphs; after the export, any source text
+missing from the result is appended from the source with a visible notice
+and named in ``word_notices`` — never dropped silently.
 """
 
 from __future__ import annotations
@@ -18,6 +24,7 @@ import posixpath
 import re
 import secrets
 from dataclasses import dataclass, field
+from urllib.parse import unquote
 
 from lxml import etree
 
@@ -29,10 +36,36 @@ MC = "http://schemas.openxmlformats.org/markup-compatibility/2006"
 NS = {"w": W, "r": R}
 
 UNCERTAIN_TABLE_NOTICE = (
-    "[Tabellenstruktur nicht sicher zuordenbar: Zellen je Zeile in Dokumentreihenfolge, "
+    "[Tabellenstruktur nicht sicher zuordenbar: Zellen je Zeile in Dokumentreihenfolge,"
+    " "
     "ohne Spaltenzuordnung]"
 )
 VARIANT_LABELS = {"first": "erste Seite", "even": "gerade Seiten", "default": ""}
+CONTINUATION_NOTICE = "[Weiterer Text aus einer vertikal verbundenen Folgezelle:]"
+
+
+def part_target(source: str, target: str, names=None) -> str | None:
+    """Resolve an OPC relationship target to a package member name.
+
+    One resolution for every internal relationship: relative to the source
+    part, package-absolute (leading slash) and percent-encoded alike. A target
+    outside the package resolves to ``None``. With ``names``, the member must
+    exist (encoded and decoded spelling are both tried), otherwise ``None``.
+    """
+    target = target.split("#", 1)[0].replace("\\", "/")
+    candidates = []
+    for spelling in dict.fromkeys([unquote(target), target]):
+        if spelling.startswith("/"):
+            path = spelling.lstrip("/")
+        else:
+            path = posixpath.join(posixpath.dirname(source), spelling)
+        path = posixpath.normpath(path) if path else ""
+        if not path or path in {".", ".."} or path.startswith(("../", "/")):
+            continue
+        candidates.append(path)
+    if names is None:
+        return candidates[0] if candidates else None
+    return next((c for c in candidates if c in names), None)
 
 
 def q(tag: str) -> str:
@@ -94,6 +127,8 @@ class SourceTable:
     rows: list[SourceRow]
     valid: bool
     reason: str = ""
+    # (origin cell, continuation cell node) of every valid vertical merge
+    continuations: list = field(default_factory=list, repr=False, compare=False)
 
     @property
     def spanned(self) -> bool:
@@ -110,10 +145,21 @@ class SourcePart:
 
 
 @dataclass
+class SourceText:
+    """Text ledger of one displayed part: (paragraph text, checked units)."""
+
+    name: str
+    kind: str  # body | header | footer | notes
+    label: str
+    paragraphs: list[tuple[str, list[str]]]
+
+
+@dataclass
 class Provenance:
     prefix: str
     tables: dict[str, SourceTable] = field(default_factory=dict)
     parts: list[SourcePart] = field(default_factory=list)
+    texts: list[SourceText] = field(default_factory=list)
     notices: list[str] = field(default_factory=list)
     macros_removed: bool = False
 
@@ -121,10 +167,25 @@ class Provenance:
         return re.compile(re.escape(self.prefix) + r"t(\d+)r(\d+)c(\d+)$")
 
 
+def _bookmark_names(raw_parts: dict[str, bytes]) -> list[str]:
+    """Bookmark names as Writer will see them, i.e. after XML decoding."""
+    parser = etree.XMLParser(resolve_entities=False, no_network=True)
+    names = []
+    for name, raw in raw_parts.items():
+        if not name.endswith(".xml") or b"bookmarkStart" not in raw:
+            continue
+        root = etree.fromstring(raw, parser)
+        names.extend(root.xpath("//w:bookmarkStart/@w:name", namespaces=NS))
+    return names
+
+
 def new_provenance(raw_parts: dict[str, bytes]) -> Provenance:
+    names = _bookmark_names(raw_parts)
     while True:
         prefix = "wq" + secrets.token_hex(4) + "_"
-        if not any(prefix.encode() in raw for raw in raw_parts.values()):
+        if not any(prefix.encode() in raw for raw in raw_parts.values()) and not any(
+            prefix in name for name in names
+        ):
             return Provenance(prefix)
 
 
@@ -133,6 +194,7 @@ def table_geometry(table, key: str = "", part: str = "", stamp=None) -> SourceTa
     rows: list[SourceRow] = []
     active: dict[int, SourceCell] = {}
     valid, reason = True, ""
+    continuations = []
     for r, row in enumerate(_children(table, "tr")):
         column = _val(row, "w:trPr/w:gridBefore", 0)
         source_row = SourceRow(column, [])
@@ -145,6 +207,7 @@ def table_geometry(table, key: str = "", part: str = "", stamp=None) -> SourceTa
                 if origin is not None and origin.colspan == span:
                     origin.rowspan += 1
                     current[column] = origin
+                    continuations.append((origin, cell))
                     column += span
                     continue
                 valid, reason = False, "vertikale Verbindung ohne Ursprungszelle"
@@ -157,7 +220,7 @@ def table_geometry(table, key: str = "", part: str = "", stamp=None) -> SourceTa
             column += span
         active = current
         rows.append(source_row)
-    return SourceTable(key, part, rows, valid, reason)
+    return SourceTable(key, part, rows, valid, reason, continuations)
 
 
 class _Stamper:
@@ -186,12 +249,36 @@ def stamp_part(provenance: Provenance, stamper: _Stamper, name: str, root) -> No
     """Give every table in a Word part its own identity (Choice and Fallback alike)."""
     for table in list(root.iter(q("tbl"))):
         key = str(len(provenance.tables) + 1)
-        provenance.tables["t" + key] = table_geometry(table, key, name, stamper.cell)
+        geometry = table_geometry(table, key, name, stamper.cell)
+        provenance.tables["t" + key] = geometry
+        for origin, cell in geometry.continuations:
+            _keep_continuation(provenance, origin.node, cell)
+
+
+def _keep_continuation(provenance: Provenance, origin, cell) -> None:
+    """A continuation cell is no export cell: its stored text moves to the origin."""
+    blocks = [c for c in cell if c.tag in {q("p"), q("tbl"), *_TRANSPARENT}]
+    if not any(t.text and t.text.strip() for b in blocks for t in b.iter(q("t"))):
+        return
+    logger.warning("Text in a vertical merge continuation cell kept in its origin cell")
+    provenance.notices.append(
+        "Text einer vertikal verbundenen Folgezelle in die Ursprungszelle übernommen"
+    )
+    note = etree.SubElement(origin, q("p"))
+    etree.SubElement(etree.SubElement(note, q("r")), q("t")).text = CONTINUATION_NOTICE
+    for block in blocks:
+        origin.append(block)
+    if origin[-1].tag != q("p"):
+        etree.SubElement(origin, q("p"))
+    etree.SubElement(cell, q("p"))
 
 
 def next_bookmark_id(raw_parts: dict[str, bytes]) -> int:
-    ids = [int(m) for raw in raw_parts.values()
-           for m in re.findall(rb'w:id="(-?\d+)"', raw)]
+    ids = [
+        int(m)
+        for raw in raw_parts.values()
+        for m in re.findall(rb'w:id="(-?\d+)"', raw)
+    ]
     return max([0, *ids]) + 1
 
 
@@ -200,20 +287,29 @@ def next_bookmark_id(raw_parts: dict[str, bytes]) -> int:
 # --------------------------------------------------------------------------
 
 
-def header_footer_uses(main_root, main_rels, base: str) -> dict[str, list[tuple[int, str]]]:
+def header_footer_uses(
+    main_root, main_rels, main: str
+) -> dict[str, list[tuple[int, str]]]:
     """Map header/footer part names to the (section, type) uses in the body."""
     targets = {}
     for rel in main_rels:
         kind, target = rel.get("Type", ""), rel.get("Target", "")
-        if kind.endswith(("/header", "/footer")) and rel.get("TargetMode") != "External":
-            targets[rel.get("Id")] = posixpath.normpath(
-                target.lstrip("/") if target.startswith("/") else posixpath.join(base, target))
+        if (
+            kind.endswith(("/header", "/footer"))
+            and rel.get("TargetMode") != "External"
+        ):
+            targets[rel.get("Id")] = part_target(main, target)
     uses: dict[str, list[tuple[int, str]]] = {}
     for section, sect in enumerate(main_root.iter(q("sectPr")), start=1):
-        for ref in [*sect.findall("w:headerReference", NS), *sect.findall("w:footerReference", NS)]:
+        for ref in [
+            *sect.findall("w:headerReference", NS),
+            *sect.findall("w:footerReference", NS),
+        ]:
             target = targets.get(ref.get(f"{{{R}}}id"))
             if target:
-                uses.setdefault(target, []).append((section, ref.get(q("type"), "default")))
+                uses.setdefault(target, []).append(
+                    (section, ref.get(q("type"), "default"))
+                )
     return uses
 
 
@@ -228,19 +324,164 @@ def part_label(part: SourcePart) -> str:
     return f"{base} ({'; '.join(dict.fromkeys(labels))})"
 
 
-def stamp_header_footer(provenance: Provenance, stamper: _Stamper, name: str, root,
-                        uses: list[tuple[int, str]]) -> None:
+def stamp_header_footer(
+    provenance: Provenance,
+    stamper: _Stamper,
+    name: str,
+    root,
+    uses: list[tuple[int, str]],
+) -> None:
     kind = "header" if root.tag == q("hdr") else "footer"
     marker = None
     paragraph = next((p for p in root.iter(q("p")) if not _in_fallback(p)), None)
     if paragraph is not None:
         marker = f"p{len(provenance.parts) + 1}"
         stamper.bookmark(paragraph, marker)
-    provenance.parts.append(SourcePart(name, kind, marker, uses, render_source_html(root)))
+    provenance.parts.append(
+        SourcePart(name, kind, marker, uses, render_source_html(root))
+    )
 
 
 def _in_fallback(node) -> bool:
     return any(a.tag == f"{{{MC}}}Fallback" for a in node.iterancestors())
+
+
+# --------------------------------------------------------------------------
+# Text ledger: what each displayed part says, independent of Writer.
+# --------------------------------------------------------------------------
+
+# Zero-width markers: they neither carry text nor separate it.
+_SILENT = {
+    q(t)
+    for t in (
+        "pPr",
+        "rPr",
+        "bookmarkStart",
+        "bookmarkEnd",
+        "proofErr",
+        "permStart",
+        "permEnd",
+        "lastRenderedPageBreak",
+        "instrText",
+        "delText",
+        "delInstrText",
+    )
+}
+# Containers whose text continues the surrounding text.
+_INLINE = {
+    q(t)
+    for t in (
+        "r",
+        "hyperlink",
+        "smartTag",
+        "sdt",
+        "sdtContent",
+        "customXml",
+        "ins",
+        "moveTo",
+        "dir",
+        "bdo",
+    )
+} | {f"{{{MC}}}AlternateContent", f"{{{MC}}}Choice"}
+_OWN_BLOCKS = {q("p"), q("tbl"), q("txbxContent")}
+
+
+class _Ledger:
+    """Units are contiguous stored text, split wherever Writer may insert or
+    rewrite something (note marks, fields, pictures, tabs, breaks). Field
+    results are skipped: Writer recomputes them (PAGE, DATE, TOC)."""
+
+    def __init__(self):
+        self.fields: list[str] = []
+        self.paragraphs: list[tuple[str, list[str]]] = []
+
+    def paragraph(self, node) -> None:
+        self.units: list[str] = []
+        self.current: list[str] = []
+        self.display: list[str] = []
+        self._walk(node)
+        self._flush()
+        text = " ".join("".join(self.display).split())
+        if self.units:
+            self.paragraphs.append((text, self.units))
+
+    def _flush(self) -> None:
+        unit = "".join("".join(self.current).split())
+        if unit:
+            self.units.append(unit)
+        self.current = []
+
+    def _walk(self, node) -> None:
+        for child in node:
+            tag = child.tag
+            if tag == f"{{{MC}}}Fallback" or tag in _SILENT or not isinstance(tag, str):
+                continue
+            if tag in _OWN_BLOCKS:
+                self._flush()  # nested text boxes are paragraphs of their own
+            elif tag == q("t"):
+                text = child.text or ""
+                self.display.append(text)
+                if self.fields:
+                    self._flush()
+                else:
+                    self.current.append(text)
+            elif tag == q("fldChar"):
+                self._flush()
+                kind = child.get(q("fldCharType"))
+                if kind == "begin":
+                    self.fields.append("instr")
+                elif kind == "separate" and self.fields:
+                    self.fields[-1] = "result"
+                elif kind == "end" and self.fields:
+                    self.fields.pop()
+            elif tag == q("fldSimple"):
+                self._flush()
+                self.fields.append("result")
+                self._walk(child)
+                self.fields.pop()
+                self._flush()
+            elif tag in _INLINE:
+                self._walk(child)
+            else:
+                self.display.append(" " if tag in {q("tab"), q("br"), q("cr")} else "")
+                self._flush()
+                self._walk(child)
+                self._flush()
+
+
+def note_references(main_root) -> dict[str, set[str]]:
+    return {
+        kind: {r.get(q("id")) for r in main_root.iter(q(f"{kind}Reference"))}
+        for kind in ("footnote", "endnote")
+    }
+
+
+def record_text(provenance: Provenance, name: str, root, uses, references) -> None:
+    """Keep the text ledger of a part Word displays (call after all edits)."""
+    ledger = _Ledger()
+    tag = root.tag
+    if tag == q("document"):
+        kind, label, scopes = "body", "Dokumenttext", [root]
+    elif tag in {q("hdr"), q("ftr")} and uses:
+        kind = "header" if tag == q("hdr") else "footer"
+        label, scopes = part_label(SourcePart(name, kind, None, uses, "")), [root]
+    elif tag in {q("footnotes"), q("endnotes")}:
+        note = "footnote" if tag == q("footnotes") else "endnote"
+        kind, label = "notes", "Fußnoten" if note == "footnote" else "Endnoten"
+        # separators carry a type and are always shown; others only if referenced
+        scopes = [
+            n
+            for n in root.iter(q(note))
+            if n.get(q("type")) or n.get(q("id")) in references[note]
+        ]
+    else:
+        return
+    for scope in scopes:
+        for paragraph in scope.iter(q("p")):
+            if not _in_fallback(paragraph):
+                ledger.paragraph(paragraph)
+    if ledger.paragraphs:
+        provenance.texts.append(SourceText(name, kind, label, ledger.paragraphs))
 
 
 # --------------------------------------------------------------------------
@@ -251,7 +492,12 @@ def _in_fallback(node) -> bool:
 def _paragraph(node, out, blocks) -> None:
     for child in node:
         tag = child.tag
-        if tag == f"{{{MC}}}Fallback" or tag in {q("instrText"), q("delText"), q("pPr"), q("rPr")}:
+        if tag == f"{{{MC}}}Fallback" or tag in {
+            q("instrText"),
+            q("delText"),
+            q("pPr"),
+            q("rPr"),
+        }:
             continue
         if tag == q("t"):
             _append_text(out, child.text or "")
@@ -311,7 +557,9 @@ def render_source_html(root) -> str:
     _blocks(root, container)
     if not "".join(container.itertext()).strip():
         return ""
-    return "".join(etree.tostring(c, method="html", encoding="unicode") for c in container)
+    return "".join(
+        etree.tostring(c, method="html", encoding="unicode") for c in container
+    )
 
 
 # --------------------------------------------------------------------------
@@ -330,7 +578,10 @@ def _own_markers(soup_cell, pattern):
 
 
 def _has_content(soup_cell) -> bool:
-    return bool(soup_cell.get_text(strip=True)) or soup_cell.find(["img", "table"]) is not None
+    return (
+        bool(soup_cell.get_text(strip=True))
+        or soup_cell.find(["img", "table"]) is not None
+    )
 
 
 def _direct_rows(table):
@@ -381,7 +632,7 @@ def _verify(table, provenance, pattern, rebuilt):
             continue
         if len(keys) > 1:
             return "eine Exportzeile mischt Quellzeilen"
-        (t, r), = keys
+        ((t, r),) = keys
         key = f"t{t}"
         if segments and segments[-1][0] == key:
             segments[-1][1].append((r, row))
@@ -399,8 +650,11 @@ def _verify(table, provenance, pattern, rebuilt):
         if [r for r, _ in rows] != expected:
             return "Zeilenfolge weicht von der Quelle ab"
         for r, row in rows:
-            cells = [m[2] for c in row.find_all(["td", "th"], recursive=False)
-                     for m in _own_markers(c, pattern)]
+            cells = [
+                m[2]
+                for c in row.find_all(["td", "th"], recursive=False)
+                for m in _own_markers(c, pattern)
+            ]
             if cells != list(range(len(source.rows[r].cells))):
                 return "Zellfolge weicht von der Quelle ab"
     return segments
@@ -416,7 +670,9 @@ def _rebuild(soup, table, segments, provenance, pattern, rebuilt):
             tr = soup.new_tag("tr")
             new_table.append(tr)
             if source_row.grid_before:
-                tr.append(soup.new_tag("td", attrs={"colspan": str(source_row.grid_before)}))
+                tr.append(
+                    soup.new_tag("td", attrs={"colspan": str(source_row.grid_before)})
+                )
             exported = {}
             if index in html_rows:
                 for cell in html_rows[index].find_all(["td", "th"], recursive=False):
@@ -441,13 +697,33 @@ def apply_provenance(soup, body, provenance: Provenance) -> list[str]:
     notices = list(provenance.notices)
     pattern = provenance.cell_pattern()
     rebuilt: set[str] = set()
+    # Presence is a fact of Writer's export; record it before any local
+    # rebuild or flattening drops the bookmarks.
+    present = set()
+    for anchor in body.find_all("a"):
+        name = anchor.get("name") or anchor.get("id") or ""
+        if name.startswith(provenance.prefix):
+            present.add(name[len(provenance.prefix) :])
     # Innermost first: a rebuilt inner table moves along with its cell content.
     for table in reversed(body.find_all("table")):
-        has_markers = any(_own_markers(c, pattern) for row in _direct_rows(table)
-                          for c in row.find_all(["td", "th"], recursive=False))
+        has_markers = any(
+            _own_markers(c, pattern)
+            for row in _direct_rows(table)
+            for c in row.find_all(["td", "th"], recursive=False)
+        )
         if not has_markers:
-            spanned = table.find(lambda tag: tag.name in {"td", "th"} and (
-                tag.get("colspan", "1") != "1" or tag.get("rowspan", "1") != "1")) is not None
+            spanned = (
+                table.find(
+                    lambda tag: (
+                        tag.name in {"td", "th"}
+                        and (
+                            tag.get("colspan", "1") != "1"
+                            or tag.get("rowspan", "1") != "1"
+                        )
+                    )
+                )
+                is not None
+            )
             if spanned:
                 _flatten(soup, table, "Exporttabelle ohne Quellzuordnung", notices)
             continue
@@ -457,12 +733,8 @@ def apply_provenance(soup, body, provenance: Provenance) -> list[str]:
         else:
             _rebuild(soup, table, result, provenance, pattern, rebuilt)
 
-    present = set()
-    for anchor in body.find_all("a"):
-        name = anchor.get("name") or anchor.get("id") or ""
-        if name.startswith(provenance.prefix):
-            present.add(name[len(provenance.prefix):])
     _append_missing_parts(soup, body, provenance, present, notices)
+    _append_missing_text(soup, body, provenance, notices)
 
     for anchor in body.find_all("a"):
         name = anchor.get("name") or anchor.get("id") or ""
@@ -476,19 +748,28 @@ def _append_missing_parts(soup, body, provenance, present, notices) -> None:
     from bs4 import BeautifulSoup
 
     for kind in ("header", "footer"):
-        missing = [p for p in provenance.parts if p.kind == kind and p.uses and p.html
-                   and p.marker not in present]
+        missing = [
+            p
+            for p in provenance.parts
+            if p.kind == kind and p.uses and p.html and p.marker not in present
+        ]
         if not missing:
             continue
         exported = body.find("div", attrs={"title": kind})
         anchor = exported
         for part in missing:
             label = part_label(part)
-            logger.warning("Word %s not in Writer export, appended from source: %s", kind, part.name)
+            logger.warning(
+                "Word %s not in Writer export, appended from source: %s",
+                kind,
+                part.name,
+            )
             notices.append(f"{label} aus der Quelle angehängt")
             box = soup.new_tag("div")
             note = soup.new_tag("p")
-            note.string = f"[{label}: im Export nicht enthalten, aus dem Dokument übernommen]"
+            note.string = (
+                f"[{label}: im Export nicht enthalten, aus dem Dokument übernommen]"
+            )
             box.append(note)
             fragment = BeautifulSoup(part.html, "html.parser")
             for child in list(fragment.contents):
@@ -500,3 +781,62 @@ def _append_missing_parts(soup, body, provenance, present, notices) -> None:
             else:
                 body.append(box)
             anchor = box
+
+
+def missing_text(body, provenance: Provenance) -> list[tuple[SourceText, list[str]]]:
+    """Source paragraphs with a unit absent from the result text.
+
+    Whitespace is ignored on both sides (Writer re-wraps it). Units are looked
+    up in document order per part, falling back to anywhere in the result.
+    """
+    flat = "".join(body.get_text().split())
+    result = []
+    for part in provenance.texts:
+        cursor, missing = 0, []
+        for text, units in part.paragraphs:
+            lost = False
+            for unit in units:
+                at = flat.find(unit, cursor)
+                if at >= 0:
+                    cursor = at + len(unit)
+                elif unit not in flat:
+                    lost = True
+            if lost:
+                missing.append(text)
+        if missing:
+            result.append((part, missing))
+    return result
+
+
+def _append_missing_text(soup, body, provenance, notices) -> None:
+    top = body.find("div", attrs={"title": "header"})
+    for part, paragraphs in missing_text(body, provenance):
+        count = len(paragraphs)
+        logger.warning(
+            "Word text not in Writer export, appended from source: %s (%d)",
+            part.name,
+            count,
+        )
+        notices.append(
+            f"{part.label}: {count} {'Absatz' if count == 1 else 'Absätze'} "
+            "im Export nicht enthalten, aus der Quelle angehängt"
+        )
+        box = soup.new_tag("div")
+        note = soup.new_tag("p")
+        note.string = (
+            f"[{part.label}: Text im Export nicht enthalten, "
+            "aus dem Dokument übernommen]"
+        )
+        box.append(note)
+        for text in paragraphs:
+            line = soup.new_tag("p")
+            line.string = text
+            box.append(line)
+        if part.kind == "header":
+            if top is not None:
+                top.insert_after(box)
+            else:
+                body.insert(0, box)
+            top = box
+        else:
+            body.append(box)

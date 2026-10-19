@@ -31,6 +31,7 @@ import io
 import logging
 import os
 import re
+import secrets
 import shutil
 import subprocess
 import tempfile
@@ -1182,6 +1183,10 @@ def _convert_via_libreoffice(content: bytes, suffix: str) -> Tuple[str, Dict[str
     return convert_pdf_bytes(pdf_bytes)
 
 
+# Where CommonMark would start raw HTML, an autolink or an entity.
+_LITERAL_MARKUP = re.compile(r"<(?=[A-Za-z/!?])|&(?=#?[0-9A-Za-z]+;)")
+
+
 @_mojibake_repaired
 def convert_docx_bytes(content: bytes) -> tuple[str, dict[str, Any], dict[str, str]]:
     """DOCX/DOC → HTML → Markdown, retaining Word's block boundaries.
@@ -1208,17 +1213,33 @@ def convert_docx_bytes(content: bytes) -> tuple[str, dict[str, Any], dict[str, s
 
     binary = shutil.which("libreoffice") or shutil.which("soffice")
     if not binary:
-        raise RuntimeError("LibreOffice is not installed — cannot convert Word documents.")
+        raise RuntimeError(
+            "LibreOffice is not installed — cannot convert Word documents."
+        )
     with tempfile.TemporaryDirectory() as work_dir:
         root = Path(work_dir)
-        if not zipfile.is_zipfile(io.BytesIO(content)) and content.startswith(bytes.fromhex("d0cf11e0a1b11ae1")):
+        if not zipfile.is_zipfile(io.BytesIO(content)) and content.startswith(
+            bytes.fromhex("d0cf11e0a1b11ae1")
+        ):
             legacy = root / "legacy.doc"
             legacy.write_bytes(content)
             normalized = subprocess.run(
-                [binary, f"-env:UserInstallation={(root / 'normalize-profile').as_uri()}",
-                 "--headless", "--norestore", "--nologo", "--nofirststartwizard",
-                 "--convert-to", "docx", "--outdir", work_dir, str(legacy)],
-                capture_output=True, timeout=300, check=False,
+                [
+                    binary,
+                    f"-env:UserInstallation={(root / 'normalize-profile').as_uri()}",
+                    "--headless",
+                    "--norestore",
+                    "--nologo",
+                    "--nofirststartwizard",
+                    "--convert-to",
+                    "docx",
+                    "--outdir",
+                    work_dir,
+                    str(legacy),
+                ],
+                capture_output=True,
+                timeout=300,
+                check=False,
             )
             if normalized.returncode or not (root / "legacy.docx").is_file():
                 raise RuntimeError("LibreOffice legacy Word normalization failed")
@@ -1232,11 +1253,22 @@ def convert_docx_bytes(content: bytes) -> tuple[str, dict[str, Any], dict[str, s
         # A private profile prevents concurrent conversions attaching to another
         # Writer process and returning before their own output exists.
         proc = subprocess.run(
-            [binary, f"-env:UserInstallation={(root / 'profile').as_uri()}",
-             "--headless", "--norestore", "--nologo", "--nofirststartwizard",
-             "--convert-to", "html:HTML (StarWriter)", "--outdir", work_dir,
-             str(root / "input.docx")],
-            capture_output=True, timeout=300, check=False,
+            [
+                binary,
+                f"-env:UserInstallation={(root / 'profile').as_uri()}",
+                "--headless",
+                "--norestore",
+                "--nologo",
+                "--nofirststartwizard",
+                "--convert-to",
+                "html:HTML (StarWriter)",
+                "--outdir",
+                work_dir,
+                str(root / "input.docx"),
+            ],
+            capture_output=True,
+            timeout=300,
+            check=False,
         )
         output = root / "input.html"
         if proc.returncode != 0 or not output.is_file():
@@ -1263,14 +1295,40 @@ def convert_docx_bytes(content: bytes) -> tuple[str, dict[str, Any], dict[str, s
             if node.find_parent("pre"):
                 continue
             text = re.sub(r"\s+", " ", str(node))
-            block = node.parent.name in {"p", "li", "td", "th", "h1", "h2", "h3", "h4", "h5", "h6"}
-            if (block and node.previous_sibling is None) or getattr(node.previous_sibling, "name", None) == "br":
+            block = node.parent.name in {
+                "p",
+                "li",
+                "td",
+                "th",
+                "h1",
+                "h2",
+                "h3",
+                "h4",
+                "h5",
+                "h6",
+            }
+            if (block and node.previous_sibling is None) or getattr(
+                node.previous_sibling, "name", None
+            ) == "br":
                 text = text.lstrip()
-            if (block and node.next_sibling is None) or getattr(node.next_sibling, "name", None) == "br":
+            if (block and node.next_sibling is None) or getattr(
+                node.next_sibling, "name", None
+            ) == "br":
                 text = text.rstrip()
-            if not text or (not text.strip() and node.parent.name in {
-                "body", "table", "thead", "tbody", "tfoot", "tr", "ul", "ol",
-            }):
+            if not text or (
+                not text.strip()
+                and node.parent.name
+                in {
+                    "body",
+                    "table",
+                    "thead",
+                    "tbody",
+                    "tfoot",
+                    "tr",
+                    "ul",
+                    "ol",
+                }
+            ):
                 node.extract()
             else:
                 node.replace_with(text)
@@ -1287,7 +1345,9 @@ def convert_docx_bytes(content: bytes) -> tuple[str, dict[str, Any], dict[str, s
                 continue
             path = (root / source).resolve()
             if not source or path.parent != root.resolve() or not path.is_file():
-                raise RuntimeError(f"Word image is not a local export artifact: {source!r}")
+                raise RuntimeError(
+                    f"Word image is not a local export artifact: {source!r}"
+                )
             try:
                 raw, extension = resize_word_image(path.read_bytes(), MAX_IMAGE_EDGE)
             except UnprocessableWordImage as exc:
@@ -1298,34 +1358,55 @@ def convert_docx_bytes(content: bytes) -> tuple[str, dict[str, Any], dict[str, s
             images[name] = base64.b64encode(raw).decode("ascii")
             image["src"] = name
 
-
         # Pipe tables cannot represent spans/nesting. Keep these as sanitized
         # HTML, including their exact cell geometry, and say so explicitly.
         html_tables = {}
+        # A per-document token: ordinary document text can never collide.
+        document_text = soup.body.get_text()
+        token = secrets.token_hex(6)
+        while token in document_text:
+            token = secrets.token_hex(6)
         for table in list(soup.body.find_all("table")):
             if table.find_parent("table") is not None:
                 continue
-            complex_table = table.find("table") is not None or table.find(
-                lambda tag: tag.name in {"td", "th"} and
-                (int(tag.get("colspan", 1)) > 1 or int(tag.get("rowspan", 1)) > 1)
-            ) is not None
+            complex_table = (
+                table.find("table") is not None
+                or table.find(
+                    lambda tag: (
+                        tag.name in {"td", "th"}
+                        and (
+                            int(tag.get("colspan", 1)) > 1
+                            or int(tag.get("rowspan", 1)) > 1
+                        )
+                    )
+                )
+                is not None
+            )
             if complex_table:
                 for tag in [table, *table.find_all(True)]:
-                    tag.attrs = {k: v for k, v in tag.attrs.items()
-                                 if (tag.name in {"td", "th"} and k in {"rowspan", "colspan"})
-                                 or (tag.name == "a" and k == "href")
-                                 or (tag.name == "img" and k in {"src", "alt"})}
-                marker = f"WORDTABLEPLACEHOLDER{len(html_tables)}END"
-                if marker in soup.get_text():
-                    raise RuntimeError("Word table placeholder collides with document text")
-                notice = ("Verschachtelte Tabelle: als HTML mit Zellstruktur erhalten."
-                          if table.find("table") else
-                          "Verbundene Tabellenzellen: als HTML mit Zellstruktur erhalten.")
+                    tag.attrs = {
+                        k: v
+                        for k, v in tag.attrs.items()
+                        if (tag.name in {"td", "th"} and k in {"rowspan", "colspan"})
+                        or (tag.name == "a" and k == "href")
+                        or (tag.name == "img" and k in {"src", "alt"})
+                    }
+                for anchor in table.find_all("a", href=False):
+                    anchor.unwrap()  # Writer's bookmark anchors, now without a name
+                marker = f"WORDTABLE{token}N{len(html_tables)}END"
+                notice = (
+                    "Verschachtelte Tabelle: als HTML mit Zellstruktur erhalten."
+                    if table.find("table")
+                    else "Verbundene Tabellenzellen: als HTML mit Zellstruktur "
+                    "erhalten."
+                )
                 if legacy_doc:
                     # The geometry source is LibreOffice's own .doc reading;
                     # there is no independent original to check it against.
-                    notice += (" Zellverbindungen stammen aus der .doc-Umwandlung"
-                               " und sind nicht gegen das Original prüfbar.")
+                    notice += (
+                        " Zellverbindungen stammen aus der .doc-Umwandlung"
+                        " und sind nicht gegen das Original prüfbar."
+                    )
                 html_tables[marker] = "\n\n" + notice + "\n\n" + str(table) + "\n\n"
                 table.replace_with(marker)
             else:
@@ -1339,18 +1420,34 @@ def convert_docx_bytes(content: bytes) -> tuple[str, dict[str, Any], dict[str, s
                 if first_row is not None and not first_row.find("th"):
                     for cell in first_row.find_all("td", recursive=False):
                         cell.name = "th"
+        # Text that merely looks like HTML (``<a name=…>``, ``&amp;``) must stay
+        # text: escape it for CommonMark. The HTML tables above are already
+        # serialized with entities and are not touched here.
+        for node in list(soup.body.find_all(string=True)):
+            escaped = _LITERAL_MARKUP.sub(r"\\\g<0>", str(node))
+            if escaped != str(node):
+                node.replace_with(escaped)
         markdown = markdownify(
-            str(soup.body), heading_style="ATX", escape_misc=False, escape_asterisks=False,
+            str(soup.body),
+            heading_style="ATX",
+            escape_misc=False,
+            escape_asterisks=False,
         ).strip()
         for marker, table_html in html_tables.items():
             markdown = markdown.replace(marker, table_html)
-    return markdown, {
-        "original_size_bytes": len(content),
-        "pages": None,
-        "page_count_status": "unavailable",
-        "page_count_note": "Keine Seitenangabe: Word wurde ohne Seitenlayout konvertiert.",
-        "word_notices": notices,
-    }, images
+    return (
+        markdown,
+        {
+            "original_size_bytes": len(content),
+            "pages": None,
+            "page_count_status": "unavailable",
+            "page_count_note": (
+                "Keine Seitenangabe: Word wurde ohne Seitenlayout konvertiert."
+            ),
+            "word_notices": notices,
+        },
+        images,
+    )
 
 
 def convert_pptx_bytes(content: bytes) -> Tuple[str, Dict[str, Any], Dict[str, str]]:

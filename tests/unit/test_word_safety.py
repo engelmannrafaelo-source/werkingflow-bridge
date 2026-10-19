@@ -136,8 +136,11 @@ def test_unsafe_links_become_text(scheme, monkeypatch):
     from tests.unit.test_docx_paragraphs import _export_html
 
     _export_html(monkeypatch, f'<body><p><a href="{scheme}">Caption</a></p></body>')
-    markdown, _, _ = convert_docx_bytes((Path(__file__).parents[1] / "fixtures/docx/paragraphs.docx").read_bytes())
-    assert markdown == "Caption"
+    fixture = Path(__file__).parents[1] / "fixtures/docx/paragraphs.docx"
+    markdown, _, _ = convert_docx_bytes(fixture.read_bytes())
+    # The stub export lacks the fixture's own text; R5 appends it from the source.
+    assert markdown.split("\n")[0] == "Caption"
+    assert scheme.split(":")[0] not in markdown and "href" not in markdown
 
 
 @pytest.mark.parametrize("fmt", ["JPEG", "PNG", "GIF"])
@@ -200,7 +203,9 @@ def test_simple_table_escapes_literal_pipe(monkeypatch):
         "<body><table><tr><td>Label</td><td>Value</td></tr>"
         "<tr><td>A | B</td><td>1.5</td></tr></table></body>",
     )
-    markdown, _, _ = convert_docx_bytes((Path(__file__).parents[1] / "fixtures/docx/paragraphs.docx").read_bytes())
+    markdown, _, _ = convert_docx_bytes(
+        (Path(__file__).parents[1] / "fixtures/docx/paragraphs.docx").read_bytes()
+    )
     assert r"| A \| B | 1.5 |" in markdown
 
 
@@ -210,17 +215,23 @@ def test_writer_cell_without_source_is_not_trusted(monkeypatch):
 
     _export_html(
         monkeypatch,
-        "<body><p>Bleibt</p><table><tr><td colspan='2'>different</td></tr></table></body>",
+        "<body><p>Bleibt</p><table><tr><td colspan='2'>different</td></tr></table></"
+        "body>",
     )
     markdown, meta, _ = convert_docx_bytes(FIXTURE.read_bytes())
     assert "Bleibt" in markdown and "different" in markdown
     assert "Tabellenstruktur nicht sicher zuordenbar" in markdown
     assert "colspan" not in markdown
     # The stub export also lacks header and footer: both come from the source.
-    assert meta["word_notices"] == [
+    # The stub also lacks the body and footnote text: the ledger names both.
+    assert meta["word_notices"][:3] == [
         "Tabelle ohne Spaltenzuordnung ausgegeben: Exporttabelle ohne Quellzuordnung",
         "Kopfzeile (Standard) aus der Quelle angehängt",
         "Fußzeile (Standard) aus der Quelle angehängt",
+    ]
+    assert [n.split(":")[0] for n in meta["word_notices"][3:]] == [
+        "Dokumenttext",
+        "Fußnoten",
     ]
     assert "KOPFZEILENTEXT" in markdown and "FUSSZEILENTEXT" in markdown
 
@@ -241,7 +252,8 @@ def test_identical_tables_with_different_geometry_keep_their_own(converted):
                 table = root.find(".//w:tbl", NS)
                 duplicate = deepcopy(table)
                 duplicate.find(".//w:gridSpan", NS).getparent().remove(
-                    duplicate.find(".//w:gridSpan", NS))
+                    duplicate.find(".//w:gridSpan", NS)
+                )
                 row = duplicate.findall("w:tr", NS)[1]
                 extra = deepcopy(row.findall("w:tc", NS)[-1])
                 row.append(extra)
@@ -250,7 +262,12 @@ def test_identical_tables_with_different_geometry_keep_their_own(converted):
                 raw = etree.tostring(root)
             target.writestr(name, raw)
     markdown, _, _ = convert_docx_bytes(output.getvalue())
-    first, second = [t for t in BeautifulSoup(markdown, "html.parser").find_all("table")
-                     if t.find_parent("table") is None][:2]
+    first, second = [
+        t
+        for t in BeautifulSoup(markdown, "html.parser").find_all("table")
+        if t.find_parent("table") is None
+    ][:2]
     assert first.find_all("tr", recursive=False)[1].find("td")["colspan"] == "2"
-    assert second.find_all("tr", recursive=False)[1].find("td").get("colspan", "1") == "1"
+    assert (
+        second.find_all("tr", recursive=False)[1].find("td").get("colspan", "1") == "1"
+    )
