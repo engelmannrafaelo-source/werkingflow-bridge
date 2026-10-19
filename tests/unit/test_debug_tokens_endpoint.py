@@ -60,6 +60,34 @@ def rotator():
         yield rot
 
 
+# Seit R14 (c4b18cb) loest _verify_service_token jeden Token, der NICHT der
+# Bridge-Schluessel ist, als Principal auf (src.principals). Der MagicMock fuer
+# src.db.client oben liefert dabei eine Schein-Zeile mit ungueltigen Scopes —
+# 403 statt 401. Hier wird der Lookup vollstaendig offline modelliert: eine
+# Principal-Tabelle ohne Eintrag, beide Lookup-Wege (DB-Zeile und platform-api)
+# antworten mit None. Die Zugangskontrolle selbst bleibt unveraendert.
+_PRINCIPALS_BY_HASH: dict[str, dict] = {}
+
+
+async def _row_by_hash(token_hash: str):
+    return _PRINCIPALS_BY_HASH.get(token_hash)
+
+
+async def _principal_by_token(token: str):
+    from src.principals import hash_token
+
+    row = _PRINCIPALS_BY_HASH.get(hash_token(token))
+    assert row is None, "Testtabelle enthaelt nur Zeilen ohne Principal-Objekt"
+    return None
+
+
+@pytest.fixture(autouse=True)
+def principal_lookup_offline():
+    with patch("src.principals.get_principal_row_by_hash", new=_row_by_hash), \
+         patch("src.principals.resolve_principal_by_token", new=_principal_by_token):
+        yield
+
+
 class MagicMockRotator:
     tokens = _FAKE_TOKENS
     current_index = 0
