@@ -82,6 +82,14 @@ def isolated_command(fresh: Path, original_step: Path, command: list[str]) -> li
         "--unshare-uts",
         "--cap-drop",
         "ALL",
+        "--cap-add",
+        "CAP_SETUID",
+        "--cap-add",
+        "CAP_SETGID",
+        "--cap-add",
+        "CAP_CHOWN",
+        "--cap-add",
+        "CAP_DAC_OVERRIDE",
         "--clearenv",
     ]
     for name in (
@@ -98,10 +106,18 @@ def isolated_command(fresh: Path, original_step: Path, command: list[str]) -> li
     for directory in ("/usr", "/lib", "/lib64", "/bin", "/opt", "/app"):
         if Path(directory).exists():
             args += ["--ro-bind", directory, directory]
+    args += ["--perms", "0755", "--dir", "/etc"]
     for path in ("/etc/ssl", "/etc/resolv.conf", "/etc/hosts", "/etc/erkunder"):
         if Path(path).exists():
             args += ["--ro-bind", path, path]
+    for ancestor in reversed(original_step.parent.parents):
+        if ancestor != Path("/"):
+            args += ["--perms", "0755", "--dir", str(ancestor)]
     args += [
+        "--perms",
+        "1777",
+        "--tmpfs",
+        "/tmp",
         "--proc",
         "/proc",
         "--dev",
@@ -112,6 +128,10 @@ def isolated_command(fresh: Path, original_step: Path, command: list[str]) -> li
         "--chdir",
         str(original_step),
         "--",
+        "/app/.venv/bin/python",
+        "-m",
+        "src.erkunder.unprivileged",
+        str(original_step.parent),
         *command,
     ]
     return args

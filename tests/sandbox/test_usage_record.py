@@ -368,7 +368,7 @@ class TestPreGateOnLease:
         no lease row is written to the DB.
         """
         from src.sandbox.routes import router
-        from src.api_auth import require_service_token, AuthClaims
+        from src.api_auth.broker import require_credential_broker, CredentialBroker
         from fastapi.testclient import TestClient
         from fastapi import FastAPI
 
@@ -376,14 +376,7 @@ class TestPreGateOnLease:
         app_instance.include_router(router)
 
         # Bypass auth via dependency_overrides
-        fake_claims = AuthClaims(
-            kind="service",
-            user_id=None,
-            email=None,
-            tenant_id=None,
-            is_admin=False,
-        )
-        app_instance.dependency_overrides[require_service_token] = lambda: fake_claims
+        app_instance.dependency_overrides[require_credential_broker] = CredentialBroker
 
         # enforce_budget raises 402
         async def _gate_raises(*args, **kwargs):

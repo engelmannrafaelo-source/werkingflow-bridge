@@ -4,7 +4,7 @@ Sandbox endpoints — OAuth-lease authority + usage tracking.
 Mounted under /v1/sandbox — only active when BRIDGE_DB_URL is set.
 
 Auth:
-  - POST /v1/sandbox/lease-token              : require_service_token
+  - POST /v1/sandbox/lease-token              : require_credential_broker
   - POST /v1/sandbox/lease-token/:id/heartbeat: require_service_token
   - POST /v1/sandbox/lease-token/:id/release  : require_service_token
   - POST /v1/sandbox/lease-token/:id/attach-session: require_service_token
@@ -33,6 +33,7 @@ from src.api_auth import (
     require_self_or_admin,
     AuthClaims,
 )
+from src.api_auth.broker import CredentialBroker, require_credential_broker
 from src.db.client import get_pool
 from src.budget.gate import enforce_budget
 from src.identity.user_resolver import resolve_user_id, UnresolvableUserIdentity
@@ -150,7 +151,7 @@ class UsageRecordResponse(BaseModel):
 @router.post("/lease-token", response_model=LeaseTokenResponse)
 async def lease_token(
     body: LeaseTokenRequest,
-    _claims: AuthClaims = Depends(require_service_token),
+    _claims: CredentialBroker = Depends(require_credential_broker),
 ):
     # Resolve the billing identity (Bridge UUID, or a licensed email for
     # Engelmann) to the canonical UUID. Fail-fast: a lease must be billable, so

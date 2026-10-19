@@ -954,10 +954,11 @@ services:
     ipc: private  # IPC belongs to this place; finally removes each step's objects.
     tmpfs: ["/tmp:size=512m", "/versuche:size=512m,mode=0700"]
     cap_drop: [ALL]
-    cap_add: [SYS_ADMIN, DAC_OVERRIDE]
+    cap_add: [SYS_ADMIN, DAC_OVERRIDE, CHOWN, SETUID, SETGID]
     # Only the trusted supervisor mounts the private filesystem. The SDK child then
-    # runs inside its own mount/PID namespace without capabilities.
-    security_opt: ["no-new-privileges:true", "seccomp=unconfined", "apparmor=unconfined"]
+    # hands the copy to an unprivileged UID; its helper drops all capabilities
+    # and stacks a child seccomp filter before exec.
+    security_opt: ["no-new-privileges:true", "seccomp=./erkunder/supervisor-seccomp.json", "apparmor=erkunder-supervisor"]
     environment:
       ERKUNDER_ATTEMPTS_DIR: /versuche
       HTTPS_PROXY: http://erkunder-ausgang:8888
@@ -989,10 +990,11 @@ services:
     ipc: private  # IPC belongs to this place; finally removes each step's objects.
     tmpfs: ["/tmp:size=512m", "/versuche:size=512m,mode=0700"]
     cap_drop: [ALL]
-    cap_add: [SYS_ADMIN, DAC_OVERRIDE]
+    cap_add: [SYS_ADMIN, DAC_OVERRIDE, CHOWN, SETUID, SETGID]
     # Only the trusted supervisor mounts the private filesystem. The SDK child then
-    # runs inside its own mount/PID namespace without capabilities.
-    security_opt: ["no-new-privileges:true", "seccomp=unconfined", "apparmor=unconfined"]
+    # hands the copy to an unprivileged UID; its helper drops all capabilities
+    # and stacks a child seccomp filter before exec.
+    security_opt: ["no-new-privileges:true", "seccomp=./erkunder/supervisor-seccomp.json", "apparmor=erkunder-supervisor"]
     environment:
       ERKUNDER_ATTEMPTS_DIR: /versuche
       HTTPS_PROXY: http://erkunder-ausgang:8888
@@ -1024,10 +1026,11 @@ services:
     ipc: private  # IPC belongs to this place; finally removes each step's objects.
     tmpfs: ["/tmp:size=512m", "/versuche:size=512m,mode=0700"]
     cap_drop: [ALL]
-    cap_add: [SYS_ADMIN, DAC_OVERRIDE]
+    cap_add: [SYS_ADMIN, DAC_OVERRIDE, CHOWN, SETUID, SETGID]
     # Only the trusted supervisor mounts the private filesystem. The SDK child then
-    # runs inside its own mount/PID namespace without capabilities.
-    security_opt: ["no-new-privileges:true", "seccomp=unconfined", "apparmor=unconfined"]
+    # hands the copy to an unprivileged UID; its helper drops all capabilities
+    # and stacks a child seccomp filter before exec.
+    security_opt: ["no-new-privileges:true", "seccomp=./erkunder/supervisor-seccomp.json", "apparmor=erkunder-supervisor"]
     environment:
       ERKUNDER_ATTEMPTS_DIR: /versuche
       HTTPS_PROXY: http://erkunder-ausgang:8888
