@@ -245,6 +245,21 @@ def test_writer_showing_the_fallback_branch_counts_as_present():
     assert count(soup, "QXBOXQZ") == 1 and len(notices) == 1
 
 
+def test_the_branch_writer_did_not_show_is_not_inserted():
+    # Word lets the branches differ (e.g. a simplified VML fallback).
+    alternatives = (
+        f'<mc:AlternateContent xmlns:mc="{MC}">'
+        f"<mc:Choice><w:txbxContent>{para('QXCHOICEQZ')}</w:txbxContent></mc:Choice>"
+        f"<mc:Fallback><w:txbxContent>{para('QXFALLQZ')}</w:txbxContent>"
+        "</mc:Fallback></mc:AlternateContent>"
+    )
+    source = Source().body(f"<w:p>{run('QXANKERQZ')}<w:r>{alternatives}</w:r></w:p>")
+    soup, notices = source.apply(
+        f"<p>{source.mark(0)}QXANKERQZ<span>{source.mark(2)}QXFALLQZ</span></p>"
+    )
+    assert notices == [] and count(soup, "QXCHOICEQZ") == 0
+
+
 # --------------------------------------------------------------------------
 # Collision check in the declared encoding (Codex R5, Nachbesserung 2)
 # --------------------------------------------------------------------------
