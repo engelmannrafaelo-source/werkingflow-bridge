@@ -3,6 +3,7 @@
 import io
 import zipfile
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from bs4 import BeautifulSoup
@@ -251,21 +252,31 @@ def test_relocated_main_document_is_sanitized():
     assert b"example.invalid" not in rels
 
 
-# A5: ordinary text never collides with the table placeholder.
+# A5: ordinary text never collides with the table placeholder. Real Writer
+# export: the merged table carries provenance and takes the HTML-table path.
 def test_placeholder_is_redrawn_when_the_document_contains_it(monkeypatch):
-    from tests.unit.test_docx_paragraphs import _export_html
-
+    # Only the converter's draw is scripted; the provenance prefix keeps the
+    # real generator, otherwise it would consume the colliding first token.
     tokens = iter(["aaaaaaaaaaaa", "bbbbbbbbbbbb"])
-    monkeypatch.setattr(dc.secrets, "token_hex", lambda n: next(tokens))
-    _export_html(
-        monkeypatch,
-        "<body><p>WORDTABLEaaaaaaaaaaaaN0END</p>"
-        '<table><tr><td colspan="2">X</td></tr><tr><td>a</td><td>b</td></tr></table>'
-        "</body>",
-    )
-    markdown, _, _ = convert_docx_bytes(probe("c05_platzhalter_literal.docx"))
-    assert "WORDTABLEaaaaaaaaaaaaN0END" in markdown
+    drawn = []
+
+    def token_hex(n):
+        drawn.append(next(tokens))
+        return drawn[-1]
+
+    monkeypatch.setattr(dc, "secrets", SimpleNamespace(token_hex=token_hex))
+    document = Document()
+    document.add_paragraph("QXVORQZ WORDTABLEaaaaaaaaaaaaN0END QXNACHQZ")
+    table = document.add_table(rows=2, cols=2)
+    table.cell(0, 0).merge(table.cell(0, 1)).text = "QXKOPFQZ"
+    table.cell(1, 0).text = "QXLINKSQZ"
+    table.cell(1, 1).text = "QXRECHTSQZ"
+    markdown, _, _ = convert_docx_bytes(packed(document))
+    assert "QXVORQZ WORDTABLEaaaaaaaaaaaaN0END QXNACHQZ" in markdown
+    assert markdown.count("QXKOPFQZ") == 1
+    assert 'colspan="2"' in markdown
     assert "WORDTABLEbbbbbbbbbbbb" not in markdown
+    assert drawn == ["aaaaaaaaaaaa", "bbbbbbbbbbbb"]
 
 
 # A6: collisions are checked against decoded bookmark names.
