@@ -162,7 +162,7 @@ class _FakeProvider:
 
 @pytest.mark.asyncio
 async def test_select_maps_indices_to_names(monkeypatch):
-    monkeypatch.setattr(it, "_downscale_b64_png", lambda b64, max_edge=0: b64)
+    monkeypatch.setattr(it, "_downscale_b64_png", lambda b64, max_edge=0: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jRZkAAAAASUVORK5CYII=")
     provider = _FakeProvider(
         '{"1": {"relevant": true, "label": "Schema"}, '
         '"2": {"relevant": false, "label": "Logo"}}'
@@ -179,7 +179,7 @@ async def test_select_maps_indices_to_names(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_select_batches_split_by_size(monkeypatch):
-    monkeypatch.setattr(it, "_downscale_b64_png", lambda b64, max_edge=0: b64)
+    monkeypatch.setattr(it, "_downscale_b64_png", lambda b64, max_edge=0: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jRZkAAAAASUVORK5CYII=")
     provider = _FakeProvider('{"1": {"relevant": true, "label": "x"}}')
     monkeypatch.setattr(it, "get_vision_provider", lambda: provider)
 
@@ -190,7 +190,7 @@ async def test_select_batches_split_by_size(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_select_unparseable_reply_keeps_all_relevant(monkeypatch):
-    monkeypatch.setattr(it, "_downscale_b64_png", lambda b64, max_edge=0: b64)
+    monkeypatch.setattr(it, "_downscale_b64_png", lambda b64, max_edge=0: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jRZkAAAAASUVORK5CYII=")
     provider = _FakeProvider("Sorry, kann ich nicht.")
     monkeypatch.setattr(it, "get_vision_provider", lambda: provider)
 

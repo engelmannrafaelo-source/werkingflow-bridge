@@ -1184,18 +1184,43 @@ def convert_docx_bytes(content: bytes) -> tuple[str, dict[str, Any], dict[str, s
     Writer's HTML export retains that distinction as p versus br, including
     headings, lists and tables. Other Office formats keep the PDF pipeline.
     """
+    import zipfile
     from pathlib import Path
-    from urllib.parse import unquote
+    from urllib.parse import unquote, urlsplit
 
     from bs4 import BeautifulSoup
     from markdownify import markdownify
+
+    from .image_format import resize_word_image
+    from .word_safety import (
+        EXTERNAL_IMAGE_NOTICE,
+        restore_table_geometry,
+        safe_link,
+        sanitize_docx,
+    )
 
     binary = shutil.which("libreoffice") or shutil.which("soffice")
     if not binary:
         raise RuntimeError("LibreOffice is not installed — cannot convert Word documents.")
     with tempfile.TemporaryDirectory() as work_dir:
         root = Path(work_dir)
-        (root / "input.docx").write_bytes(content)
+        if not zipfile.is_zipfile(io.BytesIO(content)) and content.startswith(bytes.fromhex("d0cf11e0a1b11ae1")):
+            legacy = root / "legacy.doc"
+            legacy.write_bytes(content)
+            normalized = subprocess.run(
+                [binary, f"-env:UserInstallation={(root / 'normalize-profile').as_uri()}",
+                 "--headless", "--norestore", "--nologo", "--nofirststartwizard",
+                 "--convert-to", "docx", "--outdir", work_dir, str(legacy)],
+                capture_output=True, timeout=300, check=False,
+            )
+            if normalized.returncode or not (root / "legacy.docx").is_file():
+                raise RuntimeError("LibreOffice legacy Word normalization failed")
+            word_content = (root / "legacy.docx").read_bytes()
+        else:
+            word_content = content
+        if zipfile.is_zipfile(io.BytesIO(word_content)):
+            word_content = sanitize_docx(word_content)
+        (root / "input.docx").write_bytes(word_content)
         # A private profile prevents concurrent conversions attaching to another
         # Writer process and returning before their own output exists.
         proc = subprocess.run(
@@ -1233,27 +1258,72 @@ def convert_docx_bytes(content: bytes) -> tuple[str, dict[str, Any], dict[str, s
                 node.extract()
             else:
                 node.replace_with(text)
-        # Writer emits col/colgroup before tr and td even for header rows.
-        # Give markdownify an explicit header so it emits the required divider.
-        for table in soup.body.find_all("table"):
-            for column in table.find_all(["col", "colgroup"]):
-                column.decompose()
-            first_row = table.find("tr")
-            if first_row is not None and not first_row.find("th"):
-                for cell in first_row.find_all("td", recursive=False):
-                    cell.name = "th"
+        for node in soup.body.find_all(["script", "style"]):
+            node.decompose()
+        for link in soup.body.find_all("a", href=True):
+            if not safe_link(link["href"]):
+                link.unwrap()
         images: dict[str, str] = {}
         for image in soup.body.find_all("img"):
             source = unquote(image.get("src", ""))
+            if urlsplit(source).scheme or source.startswith("//"):
+                image.replace_with(EXTERNAL_IMAGE_NOTICE)
+                continue
             path = (root / source).resolve()
             if not source or path.parent != root.resolve() or not path.is_file():
                 raise RuntimeError(f"Word image is not a local export artifact: {source!r}")
-            images[path.name] = _downscale_b64_png(
-                base64.b64encode(path.read_bytes()).decode("ascii")
-            )
-            image["src"] = path.name
-        markdown = markdownify(str(soup.body), heading_style="ATX").strip()
-    return markdown, {"original_size_bytes": len(content)}, images
+            raw, extension = resize_word_image(path.read_bytes(), MAX_IMAGE_EDGE)
+            name = path.stem + extension
+            images[name] = base64.b64encode(raw).decode("ascii")
+            image["src"] = name
+
+        if zipfile.is_zipfile(io.BytesIO(word_content)):
+            restore_table_geometry(soup.body, word_content)
+
+        # Pipe tables cannot represent spans/nesting. Keep these as sanitized
+        # HTML, including their exact cell geometry, and say so explicitly.
+        html_tables = {}
+        for table in list(soup.body.find_all("table")):
+            if table.find_parent("table") is not None:
+                continue
+            complex_table = table.find("table") is not None or table.find(
+                lambda tag: tag.name in {"td", "th"} and
+                (int(tag.get("colspan", 1)) > 1 or int(tag.get("rowspan", 1)) > 1)
+            ) is not None
+            if complex_table:
+                for tag in [table, *table.find_all(True)]:
+                    tag.attrs = {k: v for k, v in tag.attrs.items()
+                                 if (tag.name in {"td", "th"} and k in {"rowspan", "colspan"})
+                                 or (tag.name == "a" and k == "href")
+                                 or (tag.name == "img" and k in {"src", "alt"})}
+                marker = f"WORDTABLEPLACEHOLDER{len(html_tables)}END"
+                if marker in soup.get_text():
+                    raise RuntimeError("Word table placeholder collides with document text")
+                notice = ("Verschachtelte Tabelle: als HTML mit Zellstruktur erhalten."
+                          if table.find("table") else
+                          "Verbundene Tabellenzellen: als HTML mit Zellstruktur erhalten.")
+                html_tables[marker] = "\n\n" + notice + "\n\n" + str(table) + "\n\n"
+                table.replace_with(marker)
+            else:
+                for column in table.find_all(["col", "colgroup"]):
+                    column.decompose()
+                for node in list(table.find_all(string=True)):
+                    node.replace_with(str(node).replace("|", r"\|"))
+                first_row = table.find("tr")
+                if first_row is not None and not first_row.find("th"):
+                    for cell in first_row.find_all("td", recursive=False):
+                        cell.name = "th"
+        markdown = markdownify(
+            str(soup.body), heading_style="ATX", escape_misc=False,
+        ).strip()
+        for marker, table_html in html_tables.items():
+            markdown = markdown.replace(marker, table_html)
+    return markdown, {
+        "original_size_bytes": len(content),
+        "pages": None,
+        "page_count_status": "unavailable",
+        "page_count_note": "Keine Seitenangabe: Word wurde ohne Seitenlayout konvertiert.",
+    }, images
 
 
 def convert_pptx_bytes(content: bytes) -> Tuple[str, Dict[str, Any], Dict[str, str]]:
@@ -1534,8 +1604,8 @@ def convert_eml_bytes(content: bytes) -> Tuple[str, Dict[str, Any], Dict[str, st
 @_mojibake_repaired
 def convert_image_bytes(content: bytes, suffix: str = ".png") -> Tuple[str, Dict[str, Any], Dict[str, str]]:
     """Image → Markdown via Docling (best-effort).
-
-    Docling supports images as ``InputFormat.IMAGE`` in recent versions.
+        from docling.datamodel.base_models import InputFormat  # noqa: F401  (sanity import)
+        from docling.document_converter import DocumentConverter
     If the running Docling build lacks that input format, fail loud.
     """
     try:

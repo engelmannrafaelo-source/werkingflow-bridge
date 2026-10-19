@@ -77,8 +77,15 @@ def test_word_export_failure_is_loud(monkeypatch, exit_code, write):
         dc.convert_docx_bytes(b"word")
 
 
-@pytest.mark.parametrize("source", ["../outside.png", "https://example.org/image.png", "missing.png"])
+@pytest.mark.parametrize("source", ["../outside.png", "missing.png"])
 def test_word_does_not_read_external_or_missing_images(monkeypatch, source):
     _export_html(monkeypatch, f'<body><img src="{source}"/></body>')
     with pytest.raises(RuntimeError, match="not a local export artifact"):
         dc.convert_docx_bytes(b"word")
+
+
+def test_external_image_is_visible_notice_without_fetch(monkeypatch):
+    _export_html(monkeypatch, '<body><img src="https://example.invalid/image.png"/></body>')
+    markdown, _, images = dc.convert_docx_bytes(b"word")
+    assert "Extern verlinktes Bild nicht geladen" in markdown
+    assert images == {}

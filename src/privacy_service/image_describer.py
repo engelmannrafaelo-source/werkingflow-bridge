@@ -25,6 +25,7 @@ import asyncio
 import logging
 from typing import Dict, Tuple
 
+from src.privacy_service.image_format import image_mime
 from src.vision_provider import get_vision_provider
 from src.model_registry import get_default_model
 
@@ -66,7 +67,7 @@ async def _describe_one(
                 {"type": "text", "text": user_text},
                 {
                     "type": "image_url",
-                    "image_url": {"url": f"data:image/png;base64,{b64}"},
+                    "image_url": {"url": f"data:{image_mime(b64)};base64,{b64}"},
                 },
             ],
         }

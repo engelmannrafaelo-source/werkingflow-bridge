@@ -36,6 +36,7 @@ import os
 import re
 from typing import Dict, List, Optional, Tuple
 
+from src.privacy_service.image_format import image_mime
 from src.vision_provider import get_vision_provider
 from src.model_registry import get_default_model
 from src.privacy_service.document_converter import _downscale_b64_png
@@ -156,7 +157,7 @@ async def _triage_one_batch(
         thumb = _downscale_b64_png(b64, max_edge=_TRIAGE_THUMB_EDGE)
         content.append({"type": "text", "text": f"Bild {idx}:"})
         content.append(
-            {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{thumb}"}}
+            {"type": "image_url", "image_url": {"url": f"data:{image_mime(thumb)};base64,{thumb}"}}
         )
     messages = [{"role": "user", "content": content}]
 
