@@ -1,0 +1,660 @@
+[
+  {
+    "path": "/v1/users",
+    "methods": [
+      "GET"
+    ],
+    "module": "src.db.admin_routes"
+  },
+  {
+    "path": "/v1/users",
+    "methods": [
+      "POST"
+    ],
+    "module": "src.db.admin_routes"
+  },
+  {
+    "path": "/v1/users/{user_id}/anonymize",
+    "methods": [
+      "POST"
+    ],
+    "module": "src.db.admin_routes"
+  },
+  {
+    "path": "/v1/admin/users/lookup",
+    "methods": [
+      "GET"
+    ],
+    "module": "src.db.admin_routes"
+  },
+  {
+    "path": "/v1/admin/users/{user_id}/app-licenses",
+    "methods": [
+      "POST"
+    ],
+    "module": "src.db.admin_routes"
+  },
+  {
+    "path": "/v1/admin/users/{user_id}/subscriptions",
+    "methods": [
+      "POST"
+    ],
+    "module": "src.db.admin_routes"
+  },
+  {
+    "path": "/v1/tenants",
+    "methods": [
+      "GET"
+    ],
+    "module": "src.db.admin_routes"
+  },
+  {
+    "path": "/v1/tenants/incomplete",
+    "methods": [
+      "GET"
+    ],
+    "module": "src.db.admin_routes"
+  },
+  {
+    "path": "/v1/tenants",
+    "methods": [
+      "POST"
+    ],
+    "module": "src.db.admin_routes"
+  },
+  {
+    "path": "/v1/tenants/{tenant_id}",
+    "methods": [
+      "PATCH"
+    ],
+    "module": "src.db.admin_routes"
+  },
+  {
+    "path": "/v1/tenants/orphaned",
+    "methods": [
+      "GET"
+    ],
+    "module": "src.db.admin_routes"
+  },
+  {
+    "path": "/v1/tenants/{tenant_id}",
+    "methods": [
+      "DELETE"
+    ],
+    "module": "src.db.admin_routes"
+  },
+  {
+    "path": "/v1/platform-config/self-checkout",
+    "methods": [
+      "GET"
+    ],
+    "module": "src.db.admin_routes"
+  },
+  {
+    "path": "/v1/platform-config/self-checkout",
+    "methods": [
+      "PATCH"
+    ],
+    "module": "src.db.admin_routes"
+  },
+  {
+    "path": "/v1/platform-config/contracts",
+    "methods": [
+      "GET"
+    ],
+    "module": "src.db.admin_routes"
+  },
+  {
+    "path": "/v1/platform-config/contracts",
+    "methods": [
+      "PUT"
+    ],
+    "module": "src.db.admin_routes"
+  },
+  {
+    "path": "/v1/users/{user_id}/app-licenses",
+    "methods": [
+      "POST"
+    ],
+    "module": "src.db.admin_routes"
+  },
+  {
+    "path": "/v1/users/{user_id}/app-licenses/{app_id}",
+    "methods": [
+      "DELETE"
+    ],
+    "module": "src.db.admin_routes"
+  },
+  {
+    "path": "/v1/auth/test-token",
+    "methods": [
+      "POST"
+    ],
+    "module": "src.identity.routes"
+  },
+  {
+    "path": "/v1/auth/issue",
+    "methods": [
+      "POST"
+    ],
+    "module": "src.identity.routes"
+  },
+  {
+    "path": "/v1/users/{user_id}/change-password",
+    "methods": [
+      "POST"
+    ],
+    "module": "src.identity.self_service"
+  },
+  {
+    "path": "/v1/budget/topup/credit",
+    "methods": [
+      "POST"
+    ],
+    "module": "src.budget.routes"
+  },
+  {
+    "path": "/v1/budget",
+    "methods": [
+      "GET"
+    ],
+    "module": "src.budget.routes"
+  },
+  {
+    "path": "/v1/billing/overview",
+    "methods": [
+      "GET"
+    ],
+    "module": "src.billing.routes"
+  },
+  {
+    "path": "/v1/billing/plans/reload",
+    "methods": [
+      "POST"
+    ],
+    "module": "src.billing.routes"
+  },
+  {
+    "path": "/v1/billing/subscription/provision",
+    "methods": [
+      "POST"
+    ],
+    "module": "src.billing.routes"
+  },
+  {
+    "path": "/v1/billing/seed-legacy-trials/{app_id}",
+    "methods": [
+      "POST"
+    ],
+    "module": "src.billing.routes"
+  },
+  {
+    "path": "/v1/billing/events",
+    "methods": [
+      "GET"
+    ],
+    "module": "src.billing.routes"
+  },
+  {
+    "path": "/v1/admin/orders/pending",
+    "methods": [
+      "GET"
+    ],
+    "module": "src.billing.routes"
+  },
+  {
+    "path": "/v1/admin/orders/{order_id}/release",
+    "methods": [
+      "POST"
+    ],
+    "module": "src.billing.routes"
+  },
+  {
+    "path": "/v1/project-resets",
+    "methods": [
+      "GET"
+    ],
+    "module": "src.billing.routes"
+  },
+  {
+    "path": "/v1/project-resets/{request_id}/approve",
+    "methods": [
+      "POST"
+    ],
+    "module": "src.billing.routes"
+  },
+  {
+    "path": "/v1/project-resets/{request_id}/reject",
+    "methods": [
+      "POST"
+    ],
+    "module": "src.billing.routes"
+  },
+  {
+    "path": "/v1/feedback",
+    "methods": [
+      "GET"
+    ],
+    "module": "src.feedback.routes"
+  },
+  {
+    "path": "/v1/feedback/{feedback_id}",
+    "methods": [
+      "PATCH"
+    ],
+    "module": "src.feedback.routes"
+  },
+  {
+    "path": "/v1/audit/query",
+    "methods": [
+      "GET"
+    ],
+    "module": "src.audit.routes"
+  },
+  {
+    "path": "/v1/developer-tokens",
+    "methods": [
+      "POST"
+    ],
+    "module": "src.dev_tokens.routes"
+  },
+  {
+    "path": "/v1/developer-tokens",
+    "methods": [
+      "GET"
+    ],
+    "module": "src.dev_tokens.routes"
+  },
+  {
+    "path": "/v1/developer-tokens/{token_id}",
+    "methods": [
+      "DELETE"
+    ],
+    "module": "src.dev_tokens.routes"
+  },
+  {
+    "path": "/v1/developer-tokens/{token_id}/rotate",
+    "methods": [
+      "POST"
+    ],
+    "module": "src.dev_tokens.routes"
+  },
+  {
+    "path": "/v1/stammdaten/{tenant_id}/{app_id}",
+    "methods": [
+      "PUT"
+    ],
+    "module": "src.stammdaten.routes"
+  },
+  {
+    "path": "/v1/stammdaten/{tenant_id}/{app_id}",
+    "methods": [
+      "DELETE"
+    ],
+    "module": "src.stammdaten.routes"
+  },
+  {
+    "path": "/v1/invoices",
+    "methods": [
+      "POST"
+    ],
+    "module": "src.invoices.routes"
+  },
+  {
+    "path": "/v1/invoices/{invoice_id}",
+    "methods": [
+      "PATCH"
+    ],
+    "module": "src.invoices.routes"
+  },
+  {
+    "path": "/v1/invoices/{invoice_id}/approve",
+    "methods": [
+      "POST"
+    ],
+    "module": "src.invoices.routes"
+  },
+  {
+    "path": "/v1/metrics/pricing",
+    "methods": [
+      "GET"
+    ],
+    "module": "src.metrics.routes"
+  },
+  {
+    "path": "/v1/metrics/usage",
+    "methods": [
+      "GET"
+    ],
+    "module": "src.metrics.routes"
+  },
+  {
+    "path": "/v1/metrics/timeseries",
+    "methods": [
+      "GET"
+    ],
+    "module": "src.metrics.routes"
+  },
+  {
+    "path": "/v1/metrics/bedrock-reconciliation",
+    "methods": [
+      "GET"
+    ],
+    "module": "src.metrics.routes"
+  },
+  {
+    "path": "/v1/metrics/bedrock-reconciliation/run",
+    "methods": [
+      "POST"
+    ],
+    "module": "src.metrics.routes"
+  },
+  {
+    "path": "/v1/system/health",
+    "methods": [
+      "GET"
+    ],
+    "module": "src.system.routes"
+  },
+  {
+    "path": "/v1/auth/impersonate/{user_id}",
+    "methods": [
+      "POST"
+    ],
+    "module": "src.impersonation.routes"
+  },
+  {
+    "path": "/v1/auth/impersonate/active",
+    "methods": [
+      "GET"
+    ],
+    "module": "src.impersonation.routes"
+  },
+  {
+    "path": "/v1/admin/service-principals",
+    "methods": [
+      "POST"
+    ],
+    "module": "src.principals_routes"
+  },
+  {
+    "path": "/v1/admin/service-principals",
+    "methods": [
+      "GET"
+    ],
+    "module": "src.principals_routes"
+  },
+  {
+    "path": "/v1/admin/service-principals/rotate",
+    "methods": [
+      "POST"
+    ],
+    "module": "src.principals_routes"
+  },
+  {
+    "path": "/v1/admin/service-principals/set-active",
+    "methods": [
+      "POST"
+    ],
+    "module": "src.principals_routes"
+  },
+  {
+    "path": "/v1/internal/principals/{token_hash}",
+    "methods": [
+      "GET"
+    ],
+    "module": "src.internal_routes"
+  },
+  {
+    "path": "/v1/internal/prepaid-vision/spent-24h",
+    "methods": [
+      "GET"
+    ],
+    "module": "src.internal_routes"
+  },
+  {
+    "path": "/v1/internal/research-cloud/spent-24h",
+    "methods": [
+      "GET"
+    ],
+    "module": "src.internal_routes"
+  },
+  {
+    "path": "/v1/internal/audit/anonymization-metrics",
+    "methods": [
+      "GET"
+    ],
+    "module": "src.internal_routes"
+  },
+  {
+    "path": "/v1/internal/audit-events",
+    "methods": [
+      "POST"
+    ],
+    "module": "src.internal_routes"
+  },
+  {
+    "path": "/v1/internal/users/lookup-by-email",
+    "methods": [
+      "POST"
+    ],
+    "module": "src.internal_routes"
+  },
+  {
+    "path": "/v1/internal/users/{user_id}/provider-config",
+    "methods": [
+      "GET"
+    ],
+    "module": "src.internal_routes"
+  },
+  {
+    "path": "/v1/internal/users/{user_id}/tenant",
+    "methods": [
+      "GET"
+    ],
+    "module": "src.internal_routes"
+  },
+  {
+    "path": "/v1/internal/project-budgets/allocated-plan-id",
+    "methods": [
+      "GET"
+    ],
+    "module": "src.internal_routes"
+  },
+  {
+    "path": "/v1/internal/project-budgets/state",
+    "methods": [
+      "POST"
+    ],
+    "module": "src.internal_routes"
+  },
+  {
+    "path": "/v1/internal/budget/user-budget-state",
+    "methods": [
+      "POST"
+    ],
+    "module": "src.internal_routes"
+  },
+  {
+    "path": "/v1/internal/budget/ensure-trial",
+    "methods": [
+      "POST"
+    ],
+    "module": "src.internal_routes"
+  },
+  {
+    "path": "/v1/internal/identity/anonymous",
+    "methods": [
+      "GET"
+    ],
+    "module": "src.internal_routes"
+  },
+  {
+    "path": "/v1/internal/users/{user_id}/billing-context",
+    "methods": [
+      "GET"
+    ],
+    "module": "src.internal_routes"
+  },
+  {
+    "path": "/v1/internal/usage/ai-call",
+    "methods": [
+      "POST"
+    ],
+    "module": "src.internal_routes"
+  },
+  {
+    "path": "/v1/internal/project-budgets/deduct",
+    "methods": [
+      "POST"
+    ],
+    "module": "src.internal_routes"
+  },
+  {
+    "path": "/v1/internal/app-tier-policy",
+    "methods": [
+      "GET"
+    ],
+    "module": "src.internal_routes"
+  },
+  {
+    "path": "/v1/internal/app-id-enum",
+    "methods": [
+      "GET"
+    ],
+    "module": "src.internal_routes"
+  },
+  {
+    "path": "/v1/internal/jobs",
+    "methods": [
+      "POST"
+    ],
+    "module": "src.internal_routes"
+  },
+  {
+    "path": "/v1/internal/jobs/idempotency-lookup",
+    "methods": [
+      "POST"
+    ],
+    "module": "src.internal_routes"
+  },
+  {
+    "path": "/v1/internal/jobs/create-idempotent",
+    "methods": [
+      "POST"
+    ],
+    "module": "src.internal_routes"
+  },
+  {
+    "path": "/v1/internal/jobs",
+    "methods": [
+      "GET"
+    ],
+    "module": "src.internal_routes"
+  },
+  {
+    "path": "/v1/internal/jobs/{job_id}",
+    "methods": [
+      "GET"
+    ],
+    "module": "src.internal_routes"
+  },
+  {
+    "path": "/v1/internal/jobs/{job_id}/mark-running",
+    "methods": [
+      "POST"
+    ],
+    "module": "src.internal_routes"
+  },
+  {
+    "path": "/v1/internal/jobs/{job_id}/cancel",
+    "methods": [
+      "POST"
+    ],
+    "module": "src.internal_routes"
+  },
+  {
+    "path": "/v1/internal/jobs/{job_id}/cancel-state",
+    "methods": [
+      "GET"
+    ],
+    "module": "src.internal_routes"
+  },
+  {
+    "path": "/v1/internal/jobs/{job_id}/finish-cancelled",
+    "methods": [
+      "POST"
+    ],
+    "module": "src.internal_routes"
+  },
+  {
+    "path": "/v1/internal/jobs/{job_id}/heartbeat",
+    "methods": [
+      "POST"
+    ],
+    "module": "src.internal_routes"
+  },
+  {
+    "path": "/v1/internal/jobs/{job_id}/progress",
+    "methods": [
+      "POST"
+    ],
+    "module": "src.internal_routes"
+  },
+  {
+    "path": "/v1/internal/jobs/{job_id}/done",
+    "methods": [
+      "POST"
+    ],
+    "module": "src.internal_routes"
+  },
+  {
+    "path": "/v1/internal/jobs/{job_id}/error",
+    "methods": [
+      "POST"
+    ],
+    "module": "src.internal_routes"
+  },
+  {
+    "path": "/v1/internal/jobs/{job_id}/defer",
+    "methods": [
+      "POST"
+    ],
+    "module": "src.internal_routes"
+  },
+  {
+    "path": "/v1/internal/jobs-maintenance/claim-stale",
+    "methods": [
+      "POST"
+    ],
+    "module": "src.internal_routes"
+  },
+  {
+    "path": "/v1/internal/jobs-maintenance/abandoned",
+    "methods": [
+      "GET"
+    ],
+    "module": "src.internal_routes"
+  },
+  {
+    "path": "/v1/internal/jobs-maintenance/active",
+    "methods": [
+      "GET"
+    ],
+    "module": "src.internal_routes"
+  },
+  {
+    "path": "/v1/internal/jobs-maintenance/cleanup",
+    "methods": [
+      "POST"
+    ],
+    "module": "src.internal_routes"
+  },
+  {
+    "path": "/v1/internal/jobs-maintenance/prune",
+    "methods": [
+      "POST"
+    ],
+    "module": "src.internal_routes"
+  }
+]

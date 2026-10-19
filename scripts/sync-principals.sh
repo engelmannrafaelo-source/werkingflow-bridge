@@ -48,7 +48,7 @@ psql_on() { # host, sql-on-stdin
 # Row format: name<TAB>token_hash<TAB>token_prefix<TAB>apps<TAB>paths<TAB>cap
 ACTIVE_SQL="SELECT name || E'\t' || token_hash || E'\t' || token_prefix || E'\t' ||
 array_to_string(allowed_apps, ',') || E'\t' || array_to_string(allowed_paths, ',') || E'\t' ||
-COALESCE(monthly_cap_eur::text, 'NULL') FROM service_principals WHERE active ORDER BY name;"
+COALESCE(monthly_cap_eur::text, 'NULL') || E'\t' || array_to_string(scopes, ',') FROM service_principals WHERE active AND scopes <> ARRAY['bridge:admin'] ORDER BY name;"
 ALLNAMES_SQL="SELECT name FROM service_principals ORDER BY name;"
 
 declare -A ACTIVE ALLNAMES
@@ -93,10 +93,10 @@ for h in "${HOSTS[@]}"; do
       echo "⚠️  SKIPPED dev-only principal '${name}' for ${h}: not copied off the dev bridge (principals-dev-only.txt; Prod-Ort offen bei Rafael, e-pva-erkunder-prodort)." >&2
       continue
     fi
-    IFS=$'\t' read -r _ hash prefix apps paths cap <<< "${UNION[$name]}"
+    IFS=$'\t' read -r _ hash prefix apps paths cap scopes <<< "${UNION[$name]}"
     stmt+="
-INSERT INTO service_principals (name, token_hash, token_prefix, allowed_apps, allowed_paths, monthly_cap_eur, active)
-VALUES ('${name}', '${hash}', '${prefix}', '{${apps}}', '{${paths}}', ${cap}, true)
+INSERT INTO service_principals (name, token_hash, token_prefix, allowed_apps, allowed_paths, monthly_cap_eur, scopes, active)
+VALUES ('${name}', '${hash}', '${prefix}', '{${apps}}', '{${paths}}', ${cap}, '{${scopes}}', true)
 ON CONFLICT (name) DO NOTHING;"
     n=$((n+1))
   done

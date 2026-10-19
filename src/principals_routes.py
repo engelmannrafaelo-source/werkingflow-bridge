@@ -15,9 +15,9 @@ from typing import List, Optional
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 
-from src.api_auth import require_admin, AuthClaims
-from src.db.client import is_db_enabled
 from src import principals as principals_repo
+from src.api_auth import AuthClaims, require_admin, require_service_token
+from src.db.client import is_db_enabled
 
 logger = logging.getLogger(__name__)
 
@@ -32,6 +32,7 @@ def _require_db() -> None:
 class CreatePrincipalRequest(BaseModel):
     name: str = Field(..., min_length=1, max_length=64)
     allowed_apps: List[str] = Field(default_factory=list)
+    scopes: Optional[List[str]] = None
     allowed_paths: Optional[List[str]] = None
     monthly_cap_eur: Optional[float] = Field(default=None, ge=0)
 
@@ -58,12 +59,19 @@ async def create_principal(
     """Create a principal and return its cleartext token ONCE. Store the token in
     the caller's Infisical workspace immediately — it is not recoverable."""
     _require_db()
+    try:
+        scopes = principals_repo.validate_principal_scopes(
+            body.allowed_apps, body.scopes
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
     token = _new_token()
     try:
         principal = await principals_repo.create_principal(
             name=body.name,
             token=token,
             allowed_apps=body.allowed_apps,
+            scopes=scopes,
             allowed_paths=body.allowed_paths,
             monthly_cap_eur=body.monthly_cap_eur,
         )
@@ -74,6 +82,7 @@ async def create_principal(
         "id": principal.id,
         "name": principal.name,
         "allowed_apps": principal.allowed_apps,
+        "scopes": principal.scopes,
         "allowed_paths": principal.allowed_paths,
         "monthly_cap_eur": principal.monthly_cap_eur,
         "token": token,  # shown ONCE
@@ -115,3 +124,10 @@ async def set_active(
         raise HTTPException(status_code=404, detail=f"no principal named '{body.name}'")
     logger.info("service-principal set active=%s: name=%s", body.active, body.name)
     return {"name": body.name, "active": body.active}
+
+
+@router.get("/v1/auth/service-scope")
+async def service_scope(claims: AuthClaims = Depends(require_service_token)):
+    """Self scope introspection; no token material or other identities."""
+    return {"principal": claims.principal_name, "scopes": claims.scopes,
+            "allowed_apps": claims.allowed_apps}

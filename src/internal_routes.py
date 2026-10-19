@@ -35,7 +35,8 @@ from typing import Any, Dict, Optional
 from fastapi import APIRouter, Depends, HTTPException, Response
 from pydantic import BaseModel, ConfigDict, Field
 
-from src.api_auth import require_service_token, AuthClaims
+from src.api_auth import AuthClaims
+from src.api_auth.deps import require_internal_service
 from src.audit.db_writer import insert_audit_event
 
 logger = logging.getLogger(__name__)
@@ -48,7 +49,7 @@ router = APIRouter(prefix="/v1/internal", tags=["internal"])
 @router.get("/principals/{token_hash}")
 async def get_principal_by_hash(
     token_hash: str,
-    _claims: AuthClaims = Depends(require_service_token),
+    _claims: AuthClaims = Depends(require_internal_service),
 ) -> Dict[str, Any]:
     """Mirrors src.principals.get_principal_row_by_hash — the same query a
     worker's own direct-DB fallback runs. 404 is a real, cacheable answer
@@ -67,7 +68,7 @@ async def get_principal_by_hash(
 
 @router.get("/prepaid-vision/spent-24h")
 async def get_prepaid_vision_spent_24h(
-    _claims: AuthClaims = Depends(require_service_token),
+    _claims: AuthClaims = Depends(require_internal_service),
 ) -> Dict[str, Any]:
     """Mirrors src.routing.prepaid_cap's direct query — rolling-24h prepaid
     vision spend in EUR. No 404 case: absence of spend is 0.0, not "not found"."""
@@ -81,7 +82,7 @@ async def get_prepaid_vision_spent_24h(
 
 @router.get("/research-cloud/spent-24h")
 async def get_research_cloud_spent_24h(
-    _claims: AuthClaims = Depends(require_service_token),
+    _claims: AuthClaims = Depends(require_internal_service),
 ) -> Dict[str, Any]:
     """Mirrors src.research_cloud.cap's direct query — rolling-24h research-cloud
     real spend in EUR. No 404 case: absence of spend is 0.0, not "not found"."""
@@ -96,7 +97,7 @@ async def get_research_cloud_spent_24h(
 @router.get("/audit/anonymization-metrics")
 async def get_anonymization_metrics_internal(
     hours: int = 24,
-    _claims: AuthClaims = Depends(require_service_token),
+    _claims: AuthClaims = Depends(require_internal_service),
 ) -> Dict[str, Any]:
     """Mirrors the worker's public GET /v1/metrics/anonymization (minus the
     "db" envelope key, which describes the WORKER's resolution stage). A DB
@@ -121,7 +122,7 @@ class AuditEventRequest(BaseModel):
 @router.post("/audit-events", status_code=204)
 async def post_audit_event(
     body: AuditEventRequest,
-    _claims: AuthClaims = Depends(require_service_token),
+    _claims: AuthClaims = Depends(require_internal_service),
 ) -> Response:
     """Mirrors POST /v1/audit/log's INSERT, but takes an explicit
     actor_user_id in the body — the JWT-derived actor of /v1/audit/log doesn't
@@ -148,7 +149,7 @@ class EmailLookupRequest(BaseModel):
 @router.post("/users/lookup-by-email")
 async def post_lookup_user_by_email(
     body: EmailLookupRequest,
-    _claims: AuthClaims = Depends(require_service_token),
+    _claims: AuthClaims = Depends(require_internal_service),
 ) -> Dict[str, Any]:
     """Mirrors src.identity.user_resolver.lookup_user_id_by_email.
 
@@ -174,7 +175,7 @@ async def post_lookup_user_by_email(
 @router.get("/users/{user_id}/provider-config")
 async def get_user_provider_config_route(
     user_id: str,
-    _claims: AuthClaims = Depends(require_service_token),
+    _claims: AuthClaims = Depends(require_internal_service),
 ) -> Dict[str, Any]:
     """Mirrors src.routing.user_provider_override.fetch_provider_config_from_db
     — the operator-set backend pin (users.provider_config).
@@ -209,7 +210,7 @@ async def get_user_provider_config_route(
 @router.get("/users/{user_id}/tenant")
 async def get_user_tenant_route(
     user_id: str,
-    _claims: AuthClaims = Depends(require_service_token),
+    _claims: AuthClaims = Depends(require_internal_service),
 ) -> Dict[str, Any]:
     """Mirrors src.api_auth.tenant_resolver.fetch_user_tenant_row.
 
@@ -241,7 +242,7 @@ async def get_user_tenant_route(
 async def get_allocated_plan_id(
     user_id: str,
     project_id: str,
-    _claims: AuthClaims = Depends(require_service_token),
+    _claims: AuthClaims = Depends(require_internal_service),
 ) -> Dict[str, Any]:
     """Mirrors src.billing.project_budgets_service.find_allocated_plan_id.
 
@@ -284,7 +285,7 @@ class ProjectBudgetStateRequest(BaseModel):
 @router.post("/project-budgets/state")
 async def post_project_budget_state(
     body: ProjectBudgetStateRequest,
-    _claims: AuthClaims = Depends(require_service_token),
+    _claims: AuthClaims = Depends(require_internal_service),
 ) -> Dict[str, Any]:
     """Mirrors src.billing.project_budgets_service.evaluate — returns
     {exists, allowed, remainingEur, topUpRemainingEur}.
@@ -312,7 +313,7 @@ class UserBudgetStateRequest(BaseModel):
 @router.post("/budget/user-budget-state")
 async def post_user_budget_state(
     body: UserBudgetStateRequest,
-    _claims: AuthClaims = Depends(require_service_token),
+    _claims: AuthClaims = Depends(require_internal_service),
 ) -> Dict[str, Any]:
     """Mirrors src.budget.routes.load_user_budget_state — DATA, not a verdict.
 
@@ -351,7 +352,7 @@ class EnsureTrialRequest(BaseModel):
 @router.post("/budget/ensure-trial")
 async def post_ensure_trial(
     body: EnsureTrialRequest,
-    _claims: AuthClaims = Depends(require_service_token),
+    _claims: AuthClaims = Depends(require_internal_service),
 ) -> Dict[str, Any]:
     """Mirrors src.budget.routes.ensure_trial_provisioned.
 
@@ -387,7 +388,7 @@ async def post_ensure_trial(
 
 @router.get("/identity/anonymous")
 async def get_anonymous_identity(
-    _claims: AuthClaims = Depends(require_service_token),
+    _claims: AuthClaims = Depends(require_internal_service),
 ) -> Dict[str, Any]:
     """Mirrors src.activity.ledger_db.anonymous_identity_present.
 
@@ -407,7 +408,7 @@ async def get_anonymous_identity(
 @router.get("/users/{user_id}/billing-context")
 async def get_billing_context(
     user_id: str,
-    _claims: AuthClaims = Depends(require_service_token),
+    _claims: AuthClaims = Depends(require_internal_service),
 ) -> Dict[str, Any]:
     """Mirrors src.activity.ledger_db.load_billing_context — DATA, not a verdict.
 
@@ -466,7 +467,7 @@ class AiCallLedgerRequest(BaseModel):
 @router.post("/usage/ai-call")
 async def post_ai_call_ledger(
     body: AiCallLedgerRequest,
-    _claims: AuthClaims = Depends(require_service_token),
+    _claims: AuthClaims = Depends(require_internal_service),
 ) -> Dict[str, Any]:
     """The one write the worker's money path cannot do without: one usage_events
     row plus, only if that row was created here, its `activities` audit row.
@@ -488,7 +489,8 @@ async def post_ai_call_ledger(
     and turn a retryable miss into unbilled usage — the exact loss Schritt 1
     was built to close.
     """
-    from datetime import datetime as _dt, timezone as _tz
+    from datetime import datetime as _dt
+    from datetime import timezone as _tz
 
     from src.activity.ledger_db import insert_ai_call
 
@@ -557,7 +559,7 @@ class ProjectBudgetDeductRequest(BaseModel):
 @router.post("/project-budgets/deduct")
 async def post_project_budget_deduct(
     body: ProjectBudgetDeductRequest,
-    _claims: AuthClaims = Depends(require_service_token),
+    _claims: AuthClaims = Depends(require_internal_service),
 ) -> Dict[str, Any]:
     """Mirrors src.billing.project_budgets_service.deduct — the project-plan
     counterpart of the pre-existing POST /v1/budget/deduct, which covers only
@@ -604,7 +606,7 @@ async def get_app_tier_policy(
     app_id: str,
     agent_id: Optional[str] = None,
     app_env: Optional[str] = None,
-    _claims: AuthClaims = Depends(require_service_token),
+    _claims: AuthClaims = Depends(require_internal_service),
 ) -> Dict[str, Any]:
     """Mirrors src.routing.app_tier_policy.lookup_policy_from_db.
 
@@ -630,7 +632,7 @@ async def get_app_tier_policy(
 
 @router.get("/app-id-enum")
 async def get_app_id_enum(
-    _claims: AuthClaims = Depends(require_service_token),
+    _claims: AuthClaims = Depends(require_internal_service),
 ) -> Dict[str, Any]:
     """Mirrors src.activity.app_registry.read_app_id_enum_from_db.
 
@@ -750,7 +752,7 @@ def _job_row_missing(e: Any) -> HTTPException:
 @router.post("/jobs", status_code=204)
 async def internal_create_job(
     body: InternalJobCreate,
-    _claims: AuthClaims = Depends(require_service_token),
+    _claims: AuthClaims = Depends(require_internal_service),
 ) -> Response:
     """Insert a fresh 'pending' job. Idempotent on job_id (ON CONFLICT DO
     NOTHING) — a client retry after a lost answer cannot create a second row."""
@@ -770,7 +772,7 @@ class InternalJobIdempotencyLookup(BaseModel):
 @router.post("/jobs/idempotency-lookup")
 async def internal_find_job_by_idempotency_key(
     body: InternalJobIdempotencyLookup,
-    _claims: AuthClaims = Depends(require_service_token),
+    _claims: AuthClaims = Depends(require_internal_service),
 ) -> Any:
     """store.find_job_by_idempotency_key (IDEMR). 200 {"job": {...}|null};
     409 {"detail": {"reason": "idempotency_key_reused", "job_id"}} — the
@@ -792,7 +794,7 @@ async def internal_find_job_by_idempotency_key(
 @router.post("/jobs/create-idempotent")
 async def internal_create_job_idempotent(
     body: InternalJobCreateIdempotent,
-    _claims: AuthClaims = Depends(require_service_token),
+    _claims: AuthClaims = Depends(require_internal_service),
 ) -> Any:
     """store.create_job_idempotent (BRREF2). 200 {"created", "job"} for a new
     job and for a replay alike; 409 {"detail": {"reason":
@@ -822,7 +824,7 @@ async def internal_list_jobs(
     status: Optional[str] = None,
     limit: int = 50,
     viewer_owner: Optional[str] = None,
-    _claims: AuthClaims = Depends(require_service_token),
+    _claims: AuthClaims = Depends(require_internal_service),
 ) -> Dict[str, Any]:
     """List projection, scoped. ValueError from the store (missing scope, bad
     status/limit) is a caller mistake → 400, never a 5xx (a 5xx would read as
@@ -845,7 +847,7 @@ async def internal_list_jobs(
 @router.get("/jobs/{job_id}")
 async def internal_get_job(
     job_id: str,
-    _claims: AuthClaims = Depends(require_service_token),
+    _claims: AuthClaims = Depends(require_internal_service),
 ) -> Dict[str, Any]:
     """Full job row. 404 = unknown id — a real, interpretable answer (the
     public GET /v1/jobs/{id} turns it into its own 404), not an outage."""
@@ -860,7 +862,7 @@ async def internal_get_job(
 @router.post("/jobs/{job_id}/mark-running", status_code=204)
 async def internal_mark_running(
     job_id: str,
-    _claims: AuthClaims = Depends(require_service_token),
+    _claims: AuthClaims = Depends(require_internal_service),
 ) -> Response:
     """204 = claimed (pending → running). 409 = the row was not 'pending' any
     more — cancelled by its owner (BR10) or already claimed — and the worker
@@ -876,7 +878,7 @@ async def internal_mark_running(
 @router.post("/jobs/{job_id}/cancel")
 async def internal_cancel_job(
     job_id: str,
-    _claims: AuthClaims = Depends(require_service_token),
+    _claims: AuthClaims = Depends(require_internal_service),
 ) -> Dict[str, Any]:
     """Withdraw a not-yet-started job (BR10, store.cancel_job). Always 200:
     ``{"job": null}`` for an unknown id, else
@@ -891,7 +893,7 @@ async def internal_cancel_job(
 @router.get("/jobs/{job_id}/cancel-state")
 async def internal_cancel_state(
     job_id: str,
-    _claims: AuthClaims = Depends(require_service_token),
+    _claims: AuthClaims = Depends(require_internal_service),
 ) -> Dict[str, Any]:
     """FK25B, store.cancel_state. Always 200 (``{"job": null}`` for an
     unknown id) — same reason as the cancel route: a 404/405 then can only
@@ -904,7 +906,7 @@ async def internal_cancel_state(
 @router.post("/jobs/{job_id}/finish-cancelled")
 async def internal_finish_cancelled(
     job_id: str,
-    _claims: AuthClaims = Depends(require_service_token),
+    _claims: AuthClaims = Depends(require_internal_service),
 ) -> Dict[str, Any]:
     """FK25B, store.finish_cancelled. Always 200 ``{"changed": bool}``."""
     from src.jobs import store
@@ -915,7 +917,7 @@ async def internal_finish_cancelled(
 @router.post("/jobs/{job_id}/heartbeat", status_code=204)
 async def internal_heartbeat(
     job_id: str,
-    _claims: AuthClaims = Depends(require_service_token),
+    _claims: AuthClaims = Depends(require_internal_service),
 ) -> Response:
     from src.jobs import store
 
@@ -930,7 +932,7 @@ async def internal_heartbeat(
 async def internal_update_progress(
     job_id: str,
     body: InternalJobProgress,
-    _claims: AuthClaims = Depends(require_service_token),
+    _claims: AuthClaims = Depends(require_internal_service),
 ) -> Response:
     from src.jobs import store
 
@@ -942,7 +944,7 @@ async def internal_update_progress(
 async def internal_mark_done(
     job_id: str,
     body: InternalJobDone,
-    _claims: AuthClaims = Depends(require_service_token),
+    _claims: AuthClaims = Depends(require_internal_service),
 ) -> Response:
     from src.jobs import store
 
@@ -957,7 +959,7 @@ async def internal_mark_done(
 async def internal_mark_error(
     job_id: str,
     body: InternalJobError,
-    _claims: AuthClaims = Depends(require_service_token),
+    _claims: AuthClaims = Depends(require_internal_service),
 ) -> Response:
     from src.jobs import store
 
@@ -978,7 +980,7 @@ async def internal_mark_error(
 async def internal_defer_job(
     job_id: str,
     body: InternalJobDefer,
-    _claims: AuthClaims = Depends(require_service_token),
+    _claims: AuthClaims = Depends(require_internal_service),
 ) -> Response:
     from src.jobs import store
 
@@ -989,7 +991,7 @@ async def internal_defer_job(
 @router.post("/jobs-maintenance/claim-stale")
 async def internal_claim_stale_job(
     body: InternalJobClaimStale,
-    _claims: AuthClaims = Depends(require_service_token),
+    _claims: AuthClaims = Depends(require_internal_service),
 ) -> Dict[str, Any]:
     """Atomically claim ONE stale-but-retryable job (FOR UPDATE SKIP LOCKED —
     concurrent callers each get a DIFFERENT row or none). {"job": null} means
@@ -1004,7 +1006,7 @@ async def internal_claim_stale_job(
 async def internal_find_abandoned(
     stale_seconds: int,
     max_attempts: int,
-    _claims: AuthClaims = Depends(require_service_token),
+    _claims: AuthClaims = Depends(require_internal_service),
 ) -> Dict[str, Any]:
     from src.jobs import store
 
@@ -1016,7 +1018,7 @@ async def internal_find_abandoned(
 async def internal_find_active(
     origin: Optional[str] = None,
     limit: int = 50,
-    _claims: AuthClaims = Depends(require_service_token),
+    _claims: AuthClaims = Depends(require_internal_service),
 ) -> Dict[str, Any]:
     """Counts the jobs that depend on a platform-api right now, for the deploy
     gate in front of a platform-api recreation (BR8). ``origin`` limits the
@@ -1032,7 +1034,7 @@ async def internal_find_active(
 @router.post("/jobs-maintenance/cleanup")
 async def internal_cleanup_old(
     body: InternalJobCleanup,
-    _claims: AuthClaims = Depends(require_service_token),
+    _claims: AuthClaims = Depends(require_internal_service),
 ) -> Dict[str, Any]:
     from src.jobs import store
 
@@ -1043,7 +1045,7 @@ async def internal_cleanup_old(
 @router.post("/jobs-maintenance/prune")
 async def internal_prune_jobs(
     body: InternalJobPrune,
-    _claims: AuthClaims = Depends(require_service_token),
+    _claims: AuthClaims = Depends(require_internal_service),
 ) -> Dict[str, Any]:
     """Retention pass of BR11 (store.prune_jobs). A new route on purpose: a
     worker from BR11 on calls only this one, so against a platform-api from

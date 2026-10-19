@@ -15,7 +15,7 @@ from src.sandbox import routes
 @pytest.fixture
 def client(monkeypatch):
     monkeypatch.setenv("SANDBOX_BROKER_TOKEN", "synthetic-broker")
-    config = SimpleNamespace(service_token="synthetic-energy-service")
+    config = SimpleNamespace(service_token="synthetic-energy-service", db_enabled=True)
     monkeypatch.setattr(broker, "config", config)
     monkeypatch.setattr(deps, "config", config)
 
@@ -110,11 +110,17 @@ def test_response_model_inventory_requires_broker():
     assert found == ["/v1/sandbox/lease-token"]
 
 
-def test_broker_is_not_a_general_app_service_token(client):
+@pytest.mark.asyncio
+async def test_broker_is_not_a_general_app_service_token(client, monkeypatch):
+    from src import principals
+
+    monkeypatch.setattr(
+        principals, "get_principal_row_by_hash", AsyncMock(return_value=None)
+    )
     from fastapi import HTTPException
 
     with pytest.raises(HTTPException) as rejected:
-        deps.require_service_token("synthetic-broker")
+        await deps._verify_service_token("synthetic-broker")
     assert rejected.value.status_code == 401
     claims = broker.require_credential_broker("synthetic-broker")
     assert claims.principal == "sandbox-broker"
@@ -132,7 +138,8 @@ def test_source_inventory_of_provider_credential_routes():
             if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 continue
             route = any(
-                isinstance(d, ast.Call) and isinstance(d.func, ast.Attribute)
+                isinstance(d, ast.Call)
+                and isinstance(d.func, ast.Attribute)
                 and d.func.attr in {"get", "post", "put", "patch", "delete"}
                 for d in node.decorator_list
             )
@@ -140,7 +147,8 @@ def test_source_inventory_of_provider_credential_routes():
                 continue
             body = ast.unparse(node)
             if "oauthToken" in body or "read_oauth_token(" in body:
-                found.append((path.relative_to(Path(__file__).parents[2]).as_posix(),
-                              node.name))
+                found.append(
+                    (path.relative_to(Path(__file__).parents[2]).as_posix(), node.name)
+                )
                 assert "Depends(require_credential_broker)" in body
     assert found == [("src/sandbox/routes.py", "lease_token")]

@@ -21,6 +21,7 @@ PRINCIPAL_JSON = {
     "id": "11111111-1111-1111-1111-111111111111",
     "name": "engelmann",
     "allowed_apps": ["engelmann"],
+    "scopes": ["app:engelmann"],
     "allowed_paths": ["*"],
     "monthly_cap_eur": 50.0,
 }
@@ -93,6 +94,7 @@ async def test_platform_unavailable_falls_back_to_direct_db():
         id="11111111-1111-1111-1111-111111111111",
         name="engelmann",
         allowed_apps=["engelmann"],
+        scopes=["app:engelmann"],
         allowed_paths=["*"],
         monthly_cap_eur=50.0,
     )
@@ -134,6 +136,7 @@ async def test_get_principal_row_by_hash_is_pure_db_read():
         id="22222222-2222-2222-2222-222222222222",
         name="werking-report",
         allowed_apps=["werking-report"],
+        scopes=["app:werking-report"],
         allowed_paths=["*"],
         monthly_cap_eur=None,
     )
@@ -145,6 +148,7 @@ async def test_get_principal_row_by_hash_is_pure_db_read():
         "id": "22222222-2222-2222-2222-222222222222",
         "name": "werking-report",
         "allowed_apps": ["werking-report"],
+        "scopes": ["app:werking-report"],
         "allowed_paths": ["*"],
         "monthly_cap_eur": None,
     }

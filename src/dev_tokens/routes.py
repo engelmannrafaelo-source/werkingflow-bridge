@@ -21,10 +21,9 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
 
 from src.api_auth import (
-    require_admin,
-    require_jwt_or_service,
     AuthClaims,
 )
+from src.api_auth.deps import require_credential_admin_or_user
 from src.db.client import get_pool
 
 router = APIRouter(prefix="/v1/developer-tokens", tags=["developer-tokens"])
@@ -68,7 +67,7 @@ class TokenCreate(BaseModel):
 @router.post("", status_code=201)
 async def create_token(
     body: TokenCreate,
-    claims: AuthClaims = Depends(require_jwt_or_service),
+    claims: AuthClaims = Depends(require_credential_admin_or_user),
 ) -> Dict[str, Any]:
     # Scoped callers (user JWT, customer proxy) create only their own tokens;
     # operators may create tokens for any user.
@@ -98,7 +97,7 @@ async def list_tokens(
     userId: Optional[str] = Query(default=None),
     includeRevoked: bool = Query(default=False),
     limit: int = Query(default=100, ge=1, le=500),
-    claims: AuthClaims = Depends(require_jwt_or_service),
+    claims: AuthClaims = Depends(require_credential_admin_or_user),
 ) -> Dict[str, Any]:
     # Scoped callers see only their own tokens; operators see all.
     if not claims.is_operator:
@@ -137,7 +136,7 @@ async def list_tokens(
 @router.delete("/{token_id}")
 async def revoke_token(
     token_id: str,
-    claims: AuthClaims = Depends(require_jwt_or_service),
+    claims: AuthClaims = Depends(require_credential_admin_or_user),
 ) -> None:
     pool = get_pool()
     async with pool.acquire() as conn:
@@ -159,7 +158,7 @@ async def revoke_token(
 @router.post("/{token_id}/rotate")
 async def rotate_token(
     token_id: str,
-    claims: AuthClaims = Depends(require_jwt_or_service),
+    claims: AuthClaims = Depends(require_credential_admin_or_user),
 ) -> Dict[str, Any]:
     pool = get_pool()
     async with pool.acquire() as conn:

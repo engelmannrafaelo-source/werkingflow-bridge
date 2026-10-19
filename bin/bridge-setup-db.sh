@@ -9,14 +9,14 @@
 #   5. Verification  — GET  /v1/users?account_type=test
 #
 # Voraussetzungen:
-#   - BRIDGE_SERVICE_TOKEN muss als Umgebungsvariable gesetzt sein
+#   - BRIDGE_ADMIN_TOKEN muss als Umgebungsvariable gesetzt sein
 #   - BRIDGE_URL (optional, default: http://localhost:8000)
 #   - Docker-Container bridge-postgres-prod muss laufen (für Migrations)
 #   - python3 + requests
 #
 # Usage:
-#   BRIDGE_SERVICE_TOKEN=<token> ./bridge-setup-db.sh
-#   BRIDGE_SERVICE_TOKEN=<token> ./bridge-setup-db.sh --verify-only
+#   BRIDGE_ADMIN_TOKEN=<token> ./bridge-setup-db.sh
+#   BRIDGE_ADMIN_TOKEN=<token> ./bridge-setup-db.sh --verify-only
 #
 # NOTE: Login-Verifikation (POST /v1/auth/login) fehlt noch — dieser Endpoint
 # existiert auf der Bridge noch nicht. Verifikation prüft nur User-Existenz
@@ -49,10 +49,10 @@ log_error()   { printf "  ${RED}[FAIL]${RESET}  %s\n" "$*" >&2; }
 phase_header() { printf "\n${BOLD}=== Phase %s: %s ===${RESET}\n" "$1" "$2"; }
 
 # ---- guards -----------------------------------------------------------------
-if [ -z "${BRIDGE_SERVICE_TOKEN:-}" ]; then
-  log_error "BRIDGE_SERVICE_TOKEN is not set — cannot authenticate against admin endpoints"
+if [ -z "${BRIDGE_ADMIN_TOKEN:-}" ]; then
+  log_error "BRIDGE_ADMIN_TOKEN is not set — cannot authenticate against admin endpoints"
   log_error "Set it in the environment before running this script:"
-  log_error "  BRIDGE_SERVICE_TOKEN=<token> $0"
+  log_error "  BRIDGE_ADMIN_TOKEN=<token> $0"
   exit 1
 fi
 
@@ -139,7 +139,7 @@ if not tenants:
 
 headers = {
     'Content-Type': 'application/json',
-    'X-Bridge-Service-Token': '${BRIDGE_SERVICE_TOKEN}',
+    'X-Bridge-Service-Token': '${BRIDGE_ADMIN_TOKEN}',
 }
 ok = True
 
@@ -188,7 +188,7 @@ if not users:
 
 headers = {
     'Content-Type': 'application/json',
-    'X-Bridge-Service-Token': '${BRIDGE_SERVICE_TOKEN}',
+    'X-Bridge-Service-Token': '${BRIDGE_ADMIN_TOKEN}',
 }
 ok = True
 
@@ -232,7 +232,7 @@ import json, sys, requests
 creds = json.load(open('${CREDENTIALS_JSON}'))
 expected_emails = {u['email'] for u in creds.get('users', {}).values()}
 
-headers = {'X-Bridge-Service-Token': '${BRIDGE_SERVICE_TOKEN}'}
+headers = {'X-Bridge-Service-Token': '${BRIDGE_ADMIN_TOKEN}'}
 try:
     r = requests.get(
         '${BRIDGE_URL}/v1/users',

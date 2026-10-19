@@ -7,10 +7,9 @@ Two distinct credential types:
    Issued by POST /v1/auth/login. Carries user_id + tenant_id + app_licenses.
    Used by app frontends acting on behalf of an end-user.
 
-2. **Service token** (X-Bridge-Service-Token: <shared-secret>)
-   Shared secret from BRIDGE_SERVICE_TOKEN env. Used by app backends for
-   server-to-server calls (e.g. budget-deduct, topup-credit-webhook from
-   internal Mollie processor). Never sent from a browser.
+2. **Service principal token** (X-Bridge-Service-Token)
+   DB-backed, with an explicit app or isolated bridge:admin grant. The shared
+   infrastructure secret is bridge:internal only, never an app/admin credential.
 
 Each dependency raises HTTPException(401/403) on rejection — defensive,
 fail-loud, no silent pass-through.
@@ -28,9 +27,10 @@ With a user JWT the JWT `sub` is authoritative; an `X-User-ID` header is
 silently ignored to prevent identity spoofing (same principle as ADR 0007's
 "body tenantId is ignored for JWT callers").
 """
+
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from typing import Optional
 
 import jwt
@@ -47,6 +47,7 @@ _bearer = HTTPBearer(auto_error=False)
 # AuthClaims — uniform shape passed downstream
 # ---------------------------------------------------------------------------
 
+
 @dataclass(frozen=True)
 class AuthClaims:
     """
@@ -55,15 +56,22 @@ class AuthClaims:
     `acting_user_id` is the user identity this request is scoped to:
       - User JWT  → acting_user_id == user_id (JWT sub)
       - Service token + X-User-ID → acting_user_id == that header value
-      - Service token without X-User-ID → acting_user_id is None (operator)
+      - Service token without X-User-ID → acting_user_id is None (grants unchanged)
     """
-    kind: str                       # "user" | "service"
-    user_id: Optional[str]          # set when kind == "user"
+
+    kind: str  # "user" | "service"
+    user_id: Optional[str]  # set when kind == "user"
     email: Optional[str]
     tenant_id: Optional[str]
-    is_admin: bool                  # raw privilege claim — gate authz on is_operator, never on this
+    is_admin: bool  # raw privilege claim — gate authz on is_operator, never on this
     acting_user_id: Optional[str] = field(default=None)
-    role: Optional[str] = field(default=None)  # platform role from JWT; None for service tokens
+    scopes: tuple[str, ...] = ()
+    allowed_apps: tuple[str, ...] = ()
+    allowed_paths: tuple[str, ...] = ("*",)
+    principal_name: Optional[str] = None
+    role: Optional[str] = field(
+        default=None
+    )  # platform role from JWT; None for service tokens
 
     @property
     def is_user(self) -> bool:
@@ -75,23 +83,17 @@ class AuthClaims:
 
     @property
     def is_operator(self) -> bool:
-        """
-        True when this credential grants unrestricted cross-user access.
+        """Only the isolated admin service principal can administer the platform.
 
-        Two cases:
-          1. Service token without a proxied user (acting_user_id is None).
-             The classic operator: CUI platform panel, background jobs, etc.
-          2. User JWT with is_admin=True. Currently is_admin is never set in
-             JWTs (known bug tracked separately), but is handled here for
-             correctness when that changes.
-
-        A service token WITH X-User-ID is NOT an operator: it is scoped to
-        that specific user for all self-service endpoints.
+        Neither a legacy infrastructure secret, user JWT role nor absence of
+        X-User-ID creates an admin grant. Proxied admin calls are self-scoped.
         """
-        if self.is_service:
-            return self.acting_user_id is None
-        # User JWT: operator only when explicitly flagged as admin.
-        return self.is_admin
+        return (
+            self.is_service
+            and self.acting_user_id is None
+            and self.scopes == ("bridge:admin",)
+            and not self.allowed_apps
+        )
 
     @property
     def effective_user_id(self) -> Optional[str]:
@@ -107,6 +109,7 @@ class AuthClaims:
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
+
 
 def _decode_user_jwt(token: str) -> AuthClaims:
     """Decode a Bearer JWT into AuthClaims. Raises 401 on failure."""
@@ -133,31 +136,62 @@ def _decode_user_jwt(token: str) -> AuthClaims:
     )
 
 
-def _verify_service_token(token: str, x_user_id: Optional[str] = None) -> AuthClaims:
-    """
-    Constant-time compare against configured service token. Raises 401 on mismatch.
-
-    x_user_id, when given, sets acting_user_id — the request is then scoped
-    to that user (customer self-service proxy). Without it, acting_user_id is
-    None, meaning the caller has unrestricted operator access.
-    """
+async def _verify_service_token(
+    token: str, x_user_id: Optional[str] = None
+) -> AuthClaims:
+    """Resolve immutable service grants. Shared infrastructure is never admin."""
     import hmac
-    expected = config.service_token
-    if not hmac.compare_digest(token, expected):
+
+    from src.principals import (
+        get_principal_row_by_hash,
+        hash_token,
+        resolve_principal_by_token,
+        validate_principal_scopes,
+    )
+
+    if hmac.compare_digest(token, config.service_token):
+        return AuthClaims(
+            kind="service",
+            user_id=None,
+            email=None,
+            tenant_id=None,
+            is_admin=False,
+            scopes=("bridge:internal",),
+            principal_name="bridge-internal",
+            acting_user_id=x_user_id,
+        )
+    # Platform uses its own DB; DB-less workers resolve through the internal seam.
+    if config.db_enabled:
+        row = await get_principal_row_by_hash(hash_token(token))
+    else:
+        principal = await resolve_principal_by_token(token)
+        row = asdict(principal) if principal is not None else None
+    if row is None:
         raise HTTPException(status_code=401, detail="Invalid service token")
+    try:
+        scopes = validate_principal_scopes(row["allowed_apps"], row["scopes"])
+    except ValueError:
+        raise HTTPException(
+            status_code=403, detail="Principal has invalid service scopes"
+        )
     return AuthClaims(
         kind="service",
         user_id=None,
         email=None,
         tenant_id=None,
-        is_admin=True,  # service tokens implicitly admin
-        acting_user_id=x_user_id,  # None = operator, set = proxy for user
+        is_admin=scopes == ["bridge:admin"],
+        scopes=tuple(scopes),
+        allowed_apps=tuple(row["allowed_apps"]),
+        allowed_paths=tuple(row["allowed_paths"]),
+        principal_name=row["name"],
+        acting_user_id=x_user_id,
     )
 
 
 # ---------------------------------------------------------------------------
 # Dependencies — wire these into routes via Depends()
 # ---------------------------------------------------------------------------
+
 
 def require_jwt(
     credentials: Optional[HTTPAuthorizationCredentials] = Depends(_bearer),
@@ -168,19 +202,23 @@ def require_jwt(
     return _decode_user_jwt(credentials.credentials)
 
 
-def require_service_token(
+async def require_service_token(
+    request: Request,
     x_bridge_service_token: Optional[str] = Header(default=None),
 ) -> AuthClaims:
     """Require the internal service token. Use for service-to-service endpoints."""
     if not x_bridge_service_token:
-        raise HTTPException(status_code=401, detail="Missing X-Bridge-Service-Token header")
-    # require_service_token is used for machine-to-machine calls that never
-    # proxy for an end-user (e.g. budget top-up after Mollie webhook). No
-    # X-User-ID handling here — the acting_user_id stays None (operator).
-    return _verify_service_token(x_bridge_service_token)
+        raise HTTPException(
+            status_code=401, detail="Missing X-Bridge-Service-Token header"
+        )
+    # Machine callers keep their explicit grants; no implicit operator role.
+    claims = await _verify_service_token(x_bridge_service_token)
+    await enforce_app_request(claims, request)
+    return claims
 
 
-def require_jwt_or_service(
+async def require_jwt_or_service(
+    request: Request,
     credentials: Optional[HTTPAuthorizationCredentials] = Depends(_bearer),
     x_bridge_service_token: Optional[str] = Header(default=None),
     x_user_id: Optional[str] = Header(default=None),
@@ -201,7 +239,11 @@ def require_jwt_or_service(
     (that would be an identity-spoofing vector).
     """
     if x_bridge_service_token:
-        return _verify_service_token(x_bridge_service_token, x_user_id=x_user_id)
+        claims = await _verify_service_token(
+            x_bridge_service_token, x_user_id=x_user_id
+        )
+        await enforce_app_request(claims, request)
+        return claims
     if credentials and credentials.credentials:
         # x_user_id is intentionally NOT passed — JWT sub is the acting identity.
         return _decode_user_jwt(credentials.credentials)
@@ -212,13 +254,7 @@ def require_jwt_or_service(
 
 
 def require_admin(claims: AuthClaims = Depends(require_jwt_or_service)) -> AuthClaims:
-    """
-    Operator-only endpoints (list all users, list all tenants, etc.).
-
-    Gated on is_operator, NOT is_admin: every service token is is_admin, but a
-    service token carrying X-User-ID is a customer self-service proxy scoped to
-    one user — it must never reach an operator endpoint.
-    """
+    """Require the isolated bridge:admin principal, never an app or user role."""
     if not claims.is_operator:
         raise HTTPException(status_code=403, detail="Admin privileges required")
     return claims
@@ -259,3 +295,53 @@ def require_self_or_admin(
     if claims.user_id == user_id:
         return claims
     raise HTTPException(status_code=403, detail="Forbidden: can only act on own user")
+
+
+async def require_internal_service(
+    claims: AuthClaims = Depends(require_service_token),
+) -> AuthClaims:
+    """Bridge workers only; app principals cannot use internal data/mutation APIs."""
+    if claims.scopes != ("bridge:internal",):
+        raise HTTPException(status_code=403, detail="Bridge internal scope required")
+    return claims
+
+
+async def require_credential_admin_or_user(
+    claims: AuthClaims = Depends(require_jwt_or_service),
+) -> AuthClaims:
+    """Users manage their own credentials; machine callers require admin scope."""
+    if claims.is_service and not claims.is_operator:
+        raise HTTPException(
+            status_code=403, detail="Admin scope required for credential management"
+        )
+    return claims
+
+
+async def enforce_app_request(claims: AuthClaims, request: Request) -> None:
+    """An app grant cannot be relabelled by header, route, query or body."""
+    if not claims.allowed_apps:
+        return
+    if (
+        request.url.path != "/v1/auth/service-scope"
+        and claims.allowed_paths
+        and "*" not in claims.allowed_paths
+        and request.url.path not in claims.allowed_paths
+    ):
+        raise HTTPException(
+            status_code=403, detail="Service principal path scope mismatch"
+        )
+    app = claims.allowed_apps[0]
+    candidates = [request.headers.get("x-app-id")]
+    for source in (request.query_params, request.path_params):
+        candidates.extend(source.get(key) for key in ("app", "app_id", "appId"))
+    if "application/json" in request.headers.get("content-type", ""):
+        try:
+            body = await request.json()
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid JSON")
+        if isinstance(body, dict):
+            candidates.extend(body.get(key) for key in ("app", "app_id", "appId"))
+    if any(value is not None and value != app for value in candidates):
+        raise HTTPException(
+            status_code=403, detail="Service principal app scope mismatch"
+        )

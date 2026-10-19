@@ -29,7 +29,7 @@ from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi import Security
 from pydantic import BaseModel, EmailStr, Field
 
-from src.api_auth import require_jwt, require_service_token, AuthClaims
+from src.api_auth import require_jwt, require_admin, AuthClaims
 from src.db.client import get_pool
 from src.identity.password import hash_password, verify_password
 from src.identity.jwt_utils import sign_jwt, verify_jwt
@@ -240,7 +240,7 @@ async def _issue_token(conn: Any, row: Any) -> Dict[str, Any]:
 @router.post("/test-token")
 async def test_token(
     body: TestTokenRequest,
-    _claims: AuthClaims = Depends(require_service_token),
+    _claims: AuthClaims = Depends(require_admin),
 ) -> Dict[str, Any]:
     """
     Mint a JWT for a test user without a password — for the unified tester.
@@ -365,7 +365,7 @@ class IssueTokenRequest(BaseModel):
 @router.post("/issue")
 async def issue_token(
     body: IssueTokenRequest,
-    _claims: AuthClaims = Depends(require_service_token),
+    _claims: AuthClaims = Depends(require_admin),
 ) -> Dict[str, Any]:
     """
     Issue a user-scoped JWT for `userId`. Service-token auth only.

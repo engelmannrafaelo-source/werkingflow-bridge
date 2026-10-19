@@ -60,8 +60,11 @@ class Principal:
     # True for the synthetic legacy principal (not a DB row) — lets callers and
     # metrics distinguish "still on the shared key" from a real per-caller token.
     is_legacy: bool = False
+    scopes: List[str] = field(default_factory=list)
 
     def may_use_app(self, app_id: Optional[str]) -> bool:
+        if not self.is_legacy and self.scopes != [f"app:{app_id}"]:
+            return False
         if WILDCARD in self.allowed_apps:
             return True
         if not app_id:
@@ -123,6 +126,7 @@ def _row_to_principal(row) -> Principal:
     return Principal(
         id=str(row["id"]),
         name=row["name"],
+        scopes=list(row["scopes"]),
         allowed_apps=list(row["allowed_apps"] or []),
         allowed_paths=list(row["allowed_paths"] or [WILDCARD]),
         monthly_cap_eur=float(row["monthly_cap_eur"]) if row["monthly_cap_eur"] is not None else None,
@@ -136,6 +140,7 @@ def _dict_to_principal(data: dict) -> Principal:
     return Principal(
         id=str(data["id"]),
         name=data["name"],
+        scopes=list(data["scopes"]),
         allowed_apps=list(data.get("allowed_apps") or []),
         allowed_paths=list(data.get("allowed_paths") or [WILDCARD]),
         monthly_cap_eur=float(data["monthly_cap_eur"]) if data.get("monthly_cap_eur") is not None else None,
@@ -151,7 +156,7 @@ async def get_principal_row_by_hash(token_hash: str) -> Optional[dict]:
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
             """
-            SELECT id, name, allowed_apps, allowed_paths, monthly_cap_eur
+            SELECT id, name, allowed_apps, allowed_paths, monthly_cap_eur, scopes
             FROM service_principals
             WHERE token_hash = $1 AND active
             """,
@@ -162,6 +167,7 @@ async def get_principal_row_by_hash(token_hash: str) -> Optional[dict]:
     return {
         "id": str(row["id"]),
         "name": row["name"],
+        "scopes": list(row["scopes"]),
         "allowed_apps": list(row["allowed_apps"] or []),
         "allowed_paths": list(row["allowed_paths"] or [WILDCARD]),
         "monthly_cap_eur": float(row["monthly_cap_eur"]) if row["monthly_cap_eur"] is not None else None,
@@ -231,17 +237,19 @@ async def create_principal(
     allowed_apps: List[str],
     allowed_paths: Optional[List[str]] = None,
     monthly_cap_eur: Optional[float] = None,
+    scopes: Optional[List[str]] = None,
 ) -> Principal:
     """Insert a new principal. The cleartext token is provided by the route (it
     generates + returns it once); here we store only the hash + prefix."""
+    scopes = validate_principal_scopes(allowed_apps, scopes)
     pool = get_pool()
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
             """
             INSERT INTO service_principals
-                (name, token_hash, token_prefix, allowed_apps, allowed_paths, monthly_cap_eur)
-            VALUES ($1, $2, $3, $4, $5, $6)
-            RETURNING id, name, allowed_apps, allowed_paths, monthly_cap_eur
+                (name, token_hash, token_prefix, allowed_apps, allowed_paths, monthly_cap_eur, scopes)
+            VALUES ($1, $2, $3, $4, $5, $6, $7)
+            RETURNING id, name, allowed_apps, allowed_paths, monthly_cap_eur, scopes
             """,
             name,
             hash_token(token),
@@ -249,6 +257,7 @@ async def create_principal(
             allowed_apps,
             allowed_paths if allowed_paths is not None else [WILDCARD],
             monthly_cap_eur,
+            scopes,
         )
     invalidate_cache()
     return _row_to_principal(row)
@@ -292,7 +301,7 @@ async def list_principals() -> List[dict]:
     async with pool.acquire() as conn:
         rows = await conn.fetch(
             """
-            SELECT id, name, token_prefix, allowed_apps, allowed_paths,
+            SELECT id, name, token_prefix, allowed_apps, allowed_paths, scopes,
                    monthly_cap_eur, active, rotated_at, created_at
             FROM service_principals
             ORDER BY name
@@ -302,6 +311,7 @@ async def list_principals() -> List[dict]:
         {
             "id": str(r["id"]),
             "name": r["name"],
+            "scopes": list(r["scopes"]),
             "token_prefix": r["token_prefix"],
             "allowed_apps": list(r["allowed_apps"] or []),
             "allowed_paths": list(r["allowed_paths"] or []),
@@ -312,3 +322,20 @@ async def list_principals() -> List[dict]:
         }
         for r in rows
     ]
+
+
+def validate_principal_scopes(
+    apps: List[str], scopes: Optional[List[str]]
+) -> List[str]:
+    """One app OR administration. No wildcard, mixed, or implied admin grant."""
+    resolved = scopes if scopes is not None else [f"app:{app}" for app in apps]
+    if not apps and resolved == ["bridge:admin"]:
+        return resolved
+    if (
+        len(apps) == 1 and apps[0] and "*" not in apps[0]
+        and resolved == [f"app:{apps[0]}"]
+    ):
+        return resolved
+    raise ValueError(
+        "Principal requires exactly one app scope or isolated bridge:admin"
+    )

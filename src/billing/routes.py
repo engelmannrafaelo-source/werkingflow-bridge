@@ -434,7 +434,7 @@ class SubscriptionProvisionRequest(BaseModel):
 @router.post("/subscription/provision", status_code=201)
 async def billing_sub_provision(
     body: SubscriptionProvisionRequest,
-    _claims: AuthClaims = Depends(require_service_token),
+    _claims: AuthClaims = Depends(require_admin),
 ) -> Dict[str, Any]:
     """
     Directly provision an active subscription without Mollie — service-token only.
@@ -457,7 +457,7 @@ async def billing_sub_provision(
 @router.post("/seed-legacy-trials/{app_id}")
 async def billing_seed_legacy_trials(
     app_id: str,
-    _claims: AuthClaims = Depends(require_service_token),
+    _claims: AuthClaims = Depends(require_admin),
 ) -> Dict[str, Any]:
     """
     One-shot backfill: every user without an active subscription for `app_id`

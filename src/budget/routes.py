@@ -32,33 +32,41 @@ from typing import Any, Dict, List, Optional
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 
-from src.db.client import get_pool
 from src.api_auth import (
-    require_jwt_or_service,
-    require_service_token,
-    require_self_or_admin,
-    require_admin,
     AuthClaims,
+    require_admin,
+    require_jwt_or_service,
+    require_self_or_admin,
 )
+from src.api_auth.deps import require_internal_service
+from src.budget import deduction_keys as _dedup
 from src.budget.calculator import (
-    rollover_monthly_if_due,
-    UserBudget,
     MonthlyBudgetEntry,
     TopUpLot,
+    UserBudget,
     check_budget,
     deduct_budget,
-    topup_balance_eur,
     next_topup_expiry,
+    rollover_monthly_if_due,
+    topup_balance_eur,
 )
-from src.budget.plans import PlanConfig, get_plan, find_trial_plan_for
-from src.budget import deduction_keys as _dedup
+from src.budget.plans import PlanConfig, find_trial_plan_for, get_plan
 from src.budget.topup_store import (
     LegacyTopUpBalanceError,
-    plus_12_months as _plus_12_months,
+)
+from src.budget.topup_store import (
     assert_no_legacy_topup_balance as _assert_no_legacy_topup_balance,
+)
+from src.budget.topup_store import (
     load_topup_lots as _load_topup_lots,
+)
+from src.budget.topup_store import (
     persist_topup_lots as _persist_topup_lots,
 )
+from src.budget.topup_store import (
+    plus_12_months as _plus_12_months,
+)
+from src.db.client import get_pool
 
 logger = logging.getLogger(__name__)
 
@@ -305,7 +313,9 @@ async def evaluate_budget(
             # Best-effort: mark any active trial subscription as expired.
             # Non-fatal — a missing subscription row (trial was budget-only) is fine.
             try:
-                from src.billing.billing_service import expire_subscription_for_user_plan
+                from src.billing.billing_service import (
+                    expire_subscription_for_user_plan,
+                )
                 await expire_subscription_for_user_plan(str(user_id), effective_plan_id)
             except Exception:
                 logger.warning(
@@ -636,7 +646,7 @@ class TopUpCreditRequest(BaseModel):
 @router.post("/topup/credit")
 async def topup_credit(
     body: TopUpCreditRequest,
-    _claims: AuthClaims = Depends(require_service_token),
+    _claims: AuthClaims = Depends(require_internal_service),
 ) -> Dict[str, Any]:
     if body.amountEur <= 0:
         # Should never reach here thanks to Field(gt=0), but defence in depth.

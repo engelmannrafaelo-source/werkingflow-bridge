@@ -10,13 +10,13 @@
 #   - The default tenant is also created with account_type=test.
 #
 # Prerequisites:
-#   BRIDGE_SERVICE_TOKEN  — X-Bridge-Service-Token for admin endpoints
+#   BRIDGE_ADMIN_TOKEN  — X-Bridge-Service-Token for admin endpoints
 #   BRIDGE_URL            — optional, default http://localhost:8000
 #
 # Usage:
-#   BRIDGE_SERVICE_TOKEN=<token> ./seed-bridge-users.sh werking-report
-#   BRIDGE_SERVICE_TOKEN=<token> ./seed-bridge-users.sh werking-energy
-#   BRIDGE_SERVICE_TOKEN=<token> BRIDGE_URL=http://49.12.72.66:8000 ./seed-bridge-users.sh werking-report
+#   BRIDGE_ADMIN_TOKEN=<token> ./seed-bridge-users.sh werking-report
+#   BRIDGE_ADMIN_TOKEN=<token> ./seed-bridge-users.sh werking-energy
+#   BRIDGE_ADMIN_TOKEN=<token> BRIDGE_URL=http://49.12.72.66:8000 ./seed-bridge-users.sh werking-report
 
 set -euo pipefail
 
@@ -51,9 +51,9 @@ log_error()   { printf "  ${RED}[FAIL]${RESET}  %s\n" "$*" >&2; }
 phase_header() { printf "\n${BOLD}=== Phase %s: %s ===${RESET}\n" "$1" "$2"; }
 
 # ---- guards -----------------------------------------------------------------
-if [ -z "${BRIDGE_SERVICE_TOKEN:-}" ]; then
-  log_error "BRIDGE_SERVICE_TOKEN is not set"
-  log_error "Usage: BRIDGE_SERVICE_TOKEN=<token> $0 <app>"
+if [ -z "${BRIDGE_ADMIN_TOKEN:-}" ]; then
+  log_error "BRIDGE_ADMIN_TOKEN is not set"
+  log_error "Usage: BRIDGE_ADMIN_TOKEN=<token> $0 <app>"
   exit 1
 fi
 
@@ -115,7 +115,7 @@ creds = _testkonten.lade_datei('${CREDENTIALS_JSON}')
 users = creds.get('users', {})
 headers = {
     'Content-Type': 'application/json',
-    'X-Bridge-Service-Token': '${BRIDGE_SERVICE_TOKEN}',
+    'X-Bridge-Service-Token': '${BRIDGE_ADMIN_TOKEN}',
 }
 
 # Collect declared tenantIds from users + add app-default for users without tenantId
@@ -206,7 +206,7 @@ creds = _testkonten.lade_datei('${CREDENTIALS_JSON}')
 users = creds.get('users', {})
 headers = {
     'Content-Type': 'application/json',
-    'X-Bridge-Service-Token': '${BRIDGE_SERVICE_TOKEN}',
+    'X-Bridge-Service-Token': '${BRIDGE_ADMIN_TOKEN}',
 }
 
 # Same tenant set as Phase 2 — declared + app-default.
@@ -296,7 +296,7 @@ else:
 
 headers = {
     'Content-Type': 'application/json',
-    'X-Bridge-Service-Token': '${BRIDGE_SERVICE_TOKEN}',
+    'X-Bridge-Service-Token': '${BRIDGE_ADMIN_TOKEN}',
 }
 default_tenant_id = '${DEFAULT_TENANT_ID}'
 ok = True
@@ -508,7 +508,7 @@ import testkonten as _testkonten  # passwordRef -> Infisical; fehlt ein Wert: la
 creds = _testkonten.lade_datei('${CREDENTIALS_JSON}')
 expected_emails = {u['email'] for u in creds.get('users', {}).values()}
 
-headers = {'X-Bridge-Service-Token': '${BRIDGE_SERVICE_TOKEN}'}
+headers = {'X-Bridge-Service-Token': '${BRIDGE_ADMIN_TOKEN}'}
 found_emails = set()
 offset = 0
 page_size = 200
@@ -581,7 +581,7 @@ users = creds.get('users', {})
 
 headers = {
     'Content-Type': 'application/json',
-    'X-Bridge-Service-Token': '${BRIDGE_SERVICE_TOKEN}',
+    'X-Bridge-Service-Token': '${BRIDGE_ADMIN_TOKEN}',
 }
 
 # One paid (non-trial) plan per app — must match src/budget/plans.py
@@ -817,7 +817,7 @@ users = creds.get('users', {})
 
 headers = {
     'Content-Type': 'application/json',
-    'X-Bridge-Service-Token': '${BRIDGE_SERVICE_TOKEN}',
+    'X-Bridge-Service-Token': '${BRIDGE_ADMIN_TOKEN}',
 }
 
 app_id = '${APP}'
@@ -920,7 +920,7 @@ from datetime import datetime, timezone
 
 headers = {
     'Content-Type': 'application/json',
-    'X-Bridge-Service-Token': '${BRIDGE_SERVICE_TOKEN}',
+    'X-Bridge-Service-Token': '${BRIDGE_ADMIN_TOKEN}',
 }
 
 INTERACTIVE_EMAIL    = 'interactive@werkingflow.com'

@@ -21,7 +21,7 @@ def _operator() -> AuthClaims:
     """Service token without X-User-ID — unrestricted operator."""
     return AuthClaims(
         kind="service", user_id=None, email=None, tenant_id=None,
-        is_admin=True, acting_user_id=None,
+        is_admin=True, acting_user_id=None, scopes=("bridge:admin",),
     )
 
 
@@ -68,7 +68,7 @@ class TestIsOperator:
         assert _user("user-A").is_operator is False
 
     def test_admin_jwt_is_operator(self):
-        assert _admin_jwt().is_operator is True
+        assert _admin_jwt().is_operator is False
 
 
 # ---------------------------------------------------------------------------
@@ -124,8 +124,9 @@ class TestRequireSelfOrAdmin:
 
     # Admin JWT: unrestricted
     def test_admin_jwt_can_access_any_user(self):
-        require_self_or_admin("user-A", _admin_jwt())
-        require_self_or_admin("user-B", _admin_jwt())
+        with pytest.raises(HTTPException) as exc:
+            require_self_or_admin("user-A", _admin_jwt())
+        assert exc.value.status_code == 403
 
 
 # ---------------------------------------------------------------------------
@@ -165,7 +166,9 @@ class TestRequireAdmin:
         assert require_admin(_operator()).is_operator is True
 
     def test_admin_jwt_allowed(self):
-        assert require_admin(_admin_jwt()).is_operator is True
+        with pytest.raises(HTTPException) as exc:
+            require_admin(_admin_jwt())
+        assert exc.value.status_code == 403
 
     def test_proxy_token_rejected(self):
         """A customer proxy is is_admin=True but must NOT reach operator endpoints."""

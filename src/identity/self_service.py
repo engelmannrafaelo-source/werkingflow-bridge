@@ -17,6 +17,7 @@ from pydantic import BaseModel, Field
 
 from src.api_auth import require_self_or_admin, AuthClaims
 from src.db.client import get_pool
+from src.api_auth.deps import require_credential_admin_or_user
 from src.identity.password import hash_password, verify_password
 from src.identity.tenant_lifecycle import strip_email_from_tenant_name
 
@@ -32,7 +33,8 @@ class ChangePasswordRequest(BaseModel):
     newPassword: str = Field(min_length=8)
 
 
-@router.post("/v1/users/{user_id}/change-password", status_code=204, response_class=Response)
+@router.post("/v1/users/{user_id}/change-password", status_code=204, response_class=Response,
+             dependencies=[Depends(require_credential_admin_or_user)])
 async def change_password(
     user_id: str,
     body: ChangePasswordRequest,
