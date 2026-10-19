@@ -1316,9 +1316,30 @@ def _reconcile(body, provenance: Provenance, skipped=()) -> _Plan:
             parent = of_key[parent].parent if parent in of_key else None
         return False
 
-    # Paragraphs with a mark but no valid span: from a start mark the place
-    # runs forward, from an end mark backward, each to the next mark that is
-    # not one of its own text boxes. What is unbound there is its remains.
+    # Paragraphs with a mark but no valid span: the place reaches from each
+    # present mark to the nearest mark on either side that is not one of its
+    # own text boxes. What is unbound there is taken as its remains: it is
+    # replaced by the whole source paragraph, so nothing of it stays twice.
+    # Not towards a neighbour without marks that has nothing to deliver
+    # (field results only): what is unbound there may be its, and would be
+    # lost.
+    neighbour: dict[tuple[int, int], object] = {}
+    sequence: dict[int, list] = {}
+    for part, paragraph in entries:
+        sequence.setdefault(id(part), []).append(paragraph)
+    for own in sequence.values():
+        for i, paragraph in enumerate(own):
+            neighbour[(id(paragraph), -1)] = own[i - 1] if i else None
+            neighbour[(id(paragraph), 1)] = own[i + 1] if i + 1 < len(own) else None
+
+    def silent(other) -> bool:
+        return (
+            other is not None
+            and not other.units
+            and other.key not in index
+            and other.end not in index
+        )
+
     for part, paragraph in entries:
         if id(paragraph) in valid:
             continue
@@ -1334,19 +1355,21 @@ def _reconcile(body, provenance: Provenance, skipped=()) -> _Plan:
             continue
         nodes = []
         for here in present:
-            step = 1 if here == paragraph.key else -1
-            j = index[here] + step
-            while 0 <= j < len(marks) and (
-                marks[j][1] is paragraph or descendant(marks[j][1], paragraph)
-            ):
-                j += step
-            if step > 0:
-                start = flat.offsets[here]
-                end = flat.offsets[marks[j][0]] if j < len(marks) else len(flat.text)
-            else:
-                start = flat.offsets[marks[j][0]] if j >= 0 else 0
-                end = flat.offsets[here]
-            nodes += unowned(start, end, _region(flat.anchors[here], body))
+            for step in (1, -1):
+                if silent(neighbour[(id(paragraph), step)]):
+                    continue
+                j = index[here] + step
+                while 0 <= j < len(marks) and (
+                    marks[j][1] is paragraph or descendant(marks[j][1], paragraph)
+                ):
+                    j += step
+                if step > 0:
+                    start = flat.offsets[here]
+                    end = at_mark(j) if j < len(marks) else len(flat.text)
+                else:
+                    start = at_mark(j) if j >= 0 else 0
+                    end = flat.offsets[here]
+                nodes += unowned(start, end, _region(flat.anchors[here], body))
         occurrence = Occurrence(
             part, paragraph, "unbound" if nodes else "missing", _block(anchor, body)
         )

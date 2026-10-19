@@ -455,3 +455,54 @@ def test_header_without_its_part_mark_is_not_appended_twice():
         f"<p>{s.span(1, 'QXBODYQZ')}</p>"
     )
     assert notices == [] and count(soup, "QXHEADQZ") == 1
+
+
+# Codex's R6 probes in their original form: Writer kept only start marks
+# (R6 had nothing else), each case then damaged as Codex damaged it.
+def _codex_probes():
+    s = Source().body(SPLIT)
+    yield "split_complete", s, (
+        f"<p>{s.mark(0)}QXKEPTQZ</p><p>QXLOSTQZ</p><p>QXTAILQZ</p>"
+    ), {"QXKEPTQZ": 1, "QXLOSTQZ": 1, "QXTAILQZ": 1}
+    s = Source().body(SPLIT)
+    yield "split_partial", s, f"<p>{s.mark(0)}QXKEPTQZ</p><p>QXTAILQZ</p>", {
+        "QXKEPTQZ": 1, "QXLOSTQZ": 1, "QXTAILQZ": 1
+    }
+    s = Source().body(SPLIT + para("QXNEXTQZ"))
+    yield "shared_block", s, f"<p>{s.mark(0)}QXKEPTQZ {s.mark(1)}QXNEXTQZ</p>", {
+        "QXKEPTQZ": 1, "QXLOSTQZ": 1, "QXTAILQZ": 1, "QXNEXTQZ": 1
+    }
+    s = Source().body(para("QXSAMEQZ")).footnotes([(1, para("QXSAMEQZ"))])
+    yield "foreign_unclaimed", s, (
+        f'<p>{s.mark(0)}QXSAMEQZ</p><div title="header"><p>QXSAMEQZ</p></div>'
+    ), {"QXSAMEQZ": 3}
+    s = Source().body(para("QXAQZ") + para("QXBQZ"))
+    yield "shifted", s, f"<p>QXAQZ</p><p>{s.mark(0)}{s.mark(1)}QXBQZ</p>", {
+        "QXAQZ": 1, "QXBQZ": 1
+    }
+    s = Source().body(para("QXAQZ") + para("QXBQZ"))
+    yield "intact_text", s, f"<p>QXAQZ</p><p>{s.mark(1)}QXBQZ</p>", {
+        "QXAQZ": 1, "QXBQZ": 1
+    }
+    s = Source().body(para("QXAQZ") + para("QXBQZ"))
+    yield "text_lost", s, f"<p>{s.mark(1)}QXBQZ</p>", {"QXAQZ": 1, "QXBQZ": 1}
+    toc = (
+        '<w:p><w:fldSimple w:instr="TOC"><w:r><w:t>QXSAMEQZ</w:t></w:r>'
+        "</w:fldSimple></w:p>"
+    )
+    s = Source().body(toc + para("QXBODYQZ")).footnotes([(1, para("QXSAMEQZ"))])
+    yield "field_copy", s, f"<p>QXSAMEQZ</p><p>{s.mark(1)}QXBODYQZ</p>", {
+        "QXSAMEQZ": 2, "QXBODYQZ": 1
+    }
+
+
+@pytest.mark.parametrize(
+    "name,source,html,expected",
+    list(_codex_probes()),
+    ids=[probe[0] for probe in _codex_probes()],
+)
+def test_codex_r6_probes_with_start_marks_only(name, source, html, expected):
+    soup, notices = source.apply(html)
+    assert {t: count(soup, t) for t in expected} == expected, name
+    # without end marks nothing is bound: never silent
+    assert notices, name
