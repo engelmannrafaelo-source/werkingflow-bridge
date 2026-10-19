@@ -33,7 +33,6 @@ from src.privacy_service.document_converter import (  # noqa: E402
     RENDER_PAGE_MAX_EDGE,
     UnsupportedFormatError,
     convert_csv_bytes,
-    convert_docx_bytes,
     convert_eml_bytes,
     convert_html_bytes,
     convert_pdf_bytes,
@@ -690,8 +689,8 @@ class TestMojibakeRepairWiredIntoProductionPaths:
         assert result.fmt == "csv"
         assert "Prüfung" in result.markdown and "Ã" not in result.markdown
 
-    def test_docx_inherits_repair_via_pdf_delegation(self, monkeypatch, tmp_path):
-        """DOCX/PPTX carry no @_mojibake_repaired of their own — they delegate
+    def test_pptx_inherits_repair_via_pdf_delegation(self, monkeypatch, tmp_path):
+        """PPTX carries no @_mojibake_repaired of its own — it delegates
         to convert_pdf_bytes via LibreOffice, so the repair must come along
         for free. This is the reason those two functions stay undecorated."""
         mojibake_md = (
@@ -709,7 +708,7 @@ class TestMojibakeRepairWiredIntoProductionPaths:
             dc, "_docling_convert_pdf", lambda pdf_bytes: (mojibake_md, 1, {}, None, None, [])
         )
 
-        markdown, metadata, images = convert_docx_bytes(b"fake docx bytes")
+        markdown, metadata, images = dc.convert_pptx_bytes(b"fake pptx bytes")
 
         assert "Prüfung" in markdown and "Gebäude" in markdown and "Ã" not in markdown
 

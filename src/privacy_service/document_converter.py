@@ -9,7 +9,8 @@ There is no shared dispatcher — three independent production entry points call
 these adapters directly: ``/convert-pdf`` calls ``convert_pdf_bytes`` itself;
 ``/document/convert`` and ``/document/convert-and-anonymize`` go through
 ``adapters.AdapterChain``, which also calls the ``convert_*_bytes`` functions
-directly; DOCX/PPTX route through LibreOffice → ``convert_pdf_bytes``. Anything
+directly; PPTX routes through LibreOffice → ``convert_pdf_bytes``, while Word
+uses LibreOffice HTML to retain paragraph/list/break structure. Anything
 that must hold for every real caller — like the mojibake repair below — is
 therefore wired directly onto the adapter functions via the
 ``@_mojibake_repaired`` decorator, not onto a dispatcher some callers skip.
@@ -18,7 +19,7 @@ Design constraints (per task brief):
 - Fail loud on unknown formats — never silently fall back to a different adapter.
 - Reuse the existing Docling PDF pipeline for PDF and for LibreOffice-converted
   Office documents so the OCR/table behaviour stays consistent.
-- DOCX/PPTX go through LibreOffice → PDF → Docling. PPTX with very complex
+- DOCX/DOC go through LibreOffice → HTML → Markdown. PPTX with very complex
   layouts logs a warning but does not fail.
 """
 
@@ -165,8 +166,8 @@ class ConversionResult:
 # (``/convert-pdf``, and the ``AdapterChain`` behind ``/document/convert`` and
 # ``/document/convert-and-anonymize``) all call these functions directly, so
 # decorating them guarantees the repair applies everywhere a document can
-# actually be converted. ``convert_docx_bytes``/``convert_pptx_bytes`` carry no
-# decorator of their own — they delegate to the (already decorated)
+# actually be converted. ``convert_pptx_bytes`` carries no
+# decorator of its own — it delegates to the (already decorated)
 # ``convert_pdf_bytes`` via LibreOffice → PDF → Docling, so they inherit the
 # repair for free.
 
@@ -1116,7 +1117,7 @@ def convert_pdf_bytes(pdf_bytes: bytes) -> Tuple[str, Dict[str, Any], Dict[str, 
 
 
 # ----------------------------------------------------------------------------
-# LibreOffice helper (used by DOCX, PPTX, XLS legacy fallback)
+# LibreOffice PDF helper (used by PPTX and the XLS legacy fallback)
 # ----------------------------------------------------------------------------
 
 
@@ -1175,9 +1176,84 @@ def _convert_via_libreoffice(content: bytes, suffix: str) -> Tuple[str, Dict[str
     return convert_pdf_bytes(pdf_bytes)
 
 
-def convert_docx_bytes(content: bytes) -> Tuple[str, Dict[str, Any], Dict[str, str]]:
-    """DOCX/DOC → Markdown via LibreOffice → PDF → Docling."""
-    return _convert_via_libreoffice(content, ".docx")
+@_mojibake_repaired
+def convert_docx_bytes(content: bytes) -> tuple[str, dict[str, Any], dict[str, str]]:
+    """DOCX/DOC → HTML → Markdown, retaining Word's block boundaries.
+
+    PDF layout extraction cannot distinguish w:p from a wrapped line or w:br.
+    Writer's HTML export retains that distinction as p versus br, including
+    headings, lists and tables. Other Office formats keep the PDF pipeline.
+    """
+    from pathlib import Path
+    from urllib.parse import unquote
+
+    from bs4 import BeautifulSoup
+    from markdownify import markdownify
+
+    binary = shutil.which("libreoffice") or shutil.which("soffice")
+    if not binary:
+        raise RuntimeError("LibreOffice is not installed — cannot convert Word documents.")
+    with tempfile.TemporaryDirectory() as work_dir:
+        root = Path(work_dir)
+        (root / "input.docx").write_bytes(content)
+        # A private profile prevents concurrent conversions attaching to another
+        # Writer process and returning before their own output exists.
+        proc = subprocess.run(
+            [binary, f"-env:UserInstallation={(root / 'profile').as_uri()}",
+             "--headless", "--norestore", "--nologo", "--nofirststartwizard",
+             "--convert-to", "html:HTML (StarWriter)", "--outdir", work_dir,
+             str(root / "input.docx")],
+            capture_output=True, timeout=300, check=False,
+        )
+        output = root / "input.html"
+        if proc.returncode != 0 or not output.is_file():
+            raise RuntimeError(
+                f"LibreOffice Word HTML conversion failed (exit {proc.returncode}): "
+                f"{proc.stderr.decode('utf-8', errors='replace')[:500]} "
+                f"{proc.stdout.decode('utf-8', errors='replace')[:300]}"
+            )
+        # Writer exports UTF-8; do not let an optional charset detector guess
+        # a different encoding for short text (including repairable mojibake).
+        soup = BeautifulSoup(output.read_text(encoding="utf-8"), "html.parser")
+        if soup.body is None:
+            raise RuntimeError("LibreOffice Word HTML has no body.")
+        # Writer pretty-prints its HTML. Those source newlines are whitespace,
+        # not Word breaks; only <br> must become Markdown's hard line break.
+        for node in list(soup.body.find_all(string=True)):
+            if node.find_parent("pre"):
+                continue
+            text = re.sub(r"\s+", " ", str(node))
+            if node.previous_sibling is None or getattr(node.previous_sibling, "name", None) == "br":
+                text = text.lstrip()
+            if node.next_sibling is None or getattr(node.next_sibling, "name", None) == "br":
+                text = text.rstrip()
+            if not text or (not text.strip() and node.parent.name in {
+                "body", "table", "thead", "tbody", "tfoot", "tr", "ul", "ol",
+            }):
+                node.extract()
+            else:
+                node.replace_with(text)
+        # Writer emits col/colgroup before tr and td even for header rows.
+        # Give markdownify an explicit header so it emits the required divider.
+        for table in soup.body.find_all("table"):
+            for column in table.find_all(["col", "colgroup"]):
+                column.decompose()
+            first_row = table.find("tr")
+            if first_row is not None and not first_row.find("th"):
+                for cell in first_row.find_all("td", recursive=False):
+                    cell.name = "th"
+        images: dict[str, str] = {}
+        for image in soup.body.find_all("img"):
+            source = unquote(image.get("src", ""))
+            path = (root / source).resolve()
+            if not source or path.parent != root.resolve() or not path.is_file():
+                raise RuntimeError(f"Word image is not a local export artifact: {source!r}")
+            images[path.name] = _downscale_b64_png(
+                base64.b64encode(path.read_bytes()).decode("ascii")
+            )
+            image["src"] = path.name
+        markdown = markdownify(str(soup.body), heading_style="ATX").strip()
+    return markdown, {"original_size_bytes": len(content)}, images
 
 
 def convert_pptx_bytes(content: bytes) -> Tuple[str, Dict[str, Any], Dict[str, str]]:
