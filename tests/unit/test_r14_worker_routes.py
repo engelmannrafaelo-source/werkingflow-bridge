@@ -2,14 +2,19 @@
 
 Same import stubbing as test_no_unauthenticated_routes.py; no network, no DB.
 """
+
 import json
 import sys
 from pathlib import Path
 from unittest.mock import MagicMock as _MagicMock
 
 for _mod_name in [
-    "claude_code_sdk", "claude_code_sdk._errors", "claude_code_sdk._internal",
-    "claude_code_sdk._internal.client", "src.identity.routes", "src.db.client",
+    "claude_code_sdk",
+    "claude_code_sdk._errors",
+    "claude_code_sdk._internal",
+    "claude_code_sdk._internal.client",
+    "src.identity.routes",
+    "src.db.client",
 ]:
     if _mod_name not in sys.modules:
         sys.modules[_mod_name] = _MagicMock()
@@ -51,7 +56,10 @@ def test_every_inventoried_worker_route_exists_with_its_declared_gate():
         route = routes.get(row["path"])
         assert route is not None, row["path"]
         assert set(row["methods"]) <= route.methods, row["path"]
-        assert row["gate"] in _dependency_names(route), (row["path"], _dependency_names(route))
+        assert row["gate"] in _dependency_names(route), (
+            row["path"],
+            _dependency_names(route),
+        )
 
 
 def test_health_reset_requires_the_isolated_admin_principal():
@@ -59,8 +67,14 @@ def test_health_reset_requires_the_isolated_admin_principal():
     names = _dependency_names(route)
     assert "require_admin" in names
     app_claims = AuthClaims(
-        kind="service", user_id=None, email=None, tenant_id=None, is_admin=False,
-        acting_user_id=None, scopes=("app:werking-energy",), allowed_apps=("werking-energy",),
+        kind="service",
+        user_id=None,
+        email=None,
+        tenant_id=None,
+        is_admin=False,
+        acting_user_id=None,
+        scopes=("app:werking-energy",),
+        allowed_apps=("werking-energy",),
     )
     with pytest.raises(HTTPException) as exc:
         require_admin(app_claims)
@@ -68,13 +82,18 @@ def test_health_reset_requires_the_isolated_admin_principal():
 
 
 def test_no_unassessed_app_reachable_worker_route():
-    """A new service-token/bearer worker route must be assessed here or in the platform inventory."""
+    """A new service-token/bearer worker route must be assessed here
+    or in the platform inventory."""
     platform_paths = {row["path"] for row in PLATFORM}
     inventoried = {row["path"] for row in INVENTORY["routes"]}
     unassessed = sorted(
-        path for path, route in _routes().items()
+        path
+        for path, route in _routes().items()
         if (_dependency_names(route) & APP_REACHABLE_GATES)
-        and path not in platform_paths and path not in inventoried
-        and path.startswith(("/health", "/debug", "/license", "/v1/debug", "/v1/metrics"))
+        and path not in platform_paths
+        and path not in inventoried
+        and path.startswith(
+            ("/health", "/debug", "/license", "/v1/debug", "/v1/metrics")
+        )
     )
     assert unassessed == [], unassessed
