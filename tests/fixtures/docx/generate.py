@@ -22,7 +22,11 @@ for cell, text in zip(
     cell.text = text
 for text in ("Nummer Eins", "Nummer Zwei"):
     document.add_paragraph(text, style="List Number")
-document.add_picture(io.BytesIO(base64.b64decode(
-    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jRZkAAAAASUVORK5CYII="
-)))
+document.add_picture(
+    io.BytesIO(
+        base64.b64decode(
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jRZkAAAAASUVORK5CYII="
+        )
+    )
+)
 document.save(Path(__file__).with_name("paragraphs.docx"))

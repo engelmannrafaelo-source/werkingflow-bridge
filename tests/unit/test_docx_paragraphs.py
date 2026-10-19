@@ -22,9 +22,13 @@ def test_docx_preserves_markdown_blocks_and_hard_break():
         expected = f"Absatz {number}: Dies ist ein eigenstaendiger Absatz."
         assert expected in [" ".join(block.split()) for block in blocks]
     assert re.search(r"^#+ Ueberschrift$", markdown, re.MULTILINE)
-    assert re.search(r"^[*+-] Erster Punkt\n[*+-] Zweiter Punkt$", markdown, re.MULTILINE)
+    assert re.search(
+        r"^[*+-] Erster Punkt\n[*+-] Zweiter Punkt$", markdown, re.MULTILINE
+    )
     assert "Vor dem Umbruch  \nNach dem Umbruch" in markdown
-    assert re.search(r"\| Name\s*\| Wert\s*\|\n\|[ -]+\|[ -]+\|\n\| Alpha\s*\| 42\s*\|", markdown)
+    assert re.search(
+        r"\| Name\s*\| Wert\s*\|\n\|[ -]+\|[ -]+\|\n\| Alpha\s*\| 42\s*\|", markdown
+    )
     assert result.fmt == "docx"
     assert result.metadata["original_size_bytes"] == len(content)
     assert "1. Nummer Eins\n2. Nummer Zwei" in markdown
@@ -54,14 +58,20 @@ def test_word_html_keeps_inline_spaces_images_and_repairs_mojibake(monkeypatch):
     image = base64.b64decode(
         "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jRZkAAAAASUVORK5CYII="
     )
-    _export_html(monkeypatch, """<html><body>
+    _export_html(
+        monkeypatch,
+        """<html><body>
       <p><b>Ein</b> <i>Wort</i></p>
       <p>PrÃ¼fung GebÃ¤ude gemÃ¤ÃŸ</p>
       <ol><li><p>Eins</p></li><li><p>Zwei</p></li></ol>
       <p>Vorher<br/>\nNachher</p><p>Danach</p>
       <p><img src="figure.png" alt="Bild"/></p>
-    </body></html>""", image=image)
-    markdown, _, images = dc.convert_docx_bytes((Path(__file__).parents[1] / "fixtures/docx/paragraphs.docx").read_bytes())
+    </body></html>""",
+        image=image,
+    )
+    markdown, _, images = dc.convert_docx_bytes(
+        (Path(__file__).parents[1] / "fixtures/docx/paragraphs.docx").read_bytes()
+    )
     assert "**Ein** *Wort*" in markdown
     assert "Prüfung Gebäude gemäß" in markdown
     assert "1. Eins\n2. Zwei" in markdown
@@ -74,18 +84,26 @@ def test_word_html_keeps_inline_spaces_images_and_repairs_mojibake(monkeypatch):
 def test_word_export_failure_is_loud(monkeypatch, exit_code, write):
     _export_html(monkeypatch, "<body></body>", exit_code=exit_code, write=write)
     with pytest.raises(RuntimeError, match="Word HTML conversion failed"):
-        dc.convert_docx_bytes((Path(__file__).parents[1] / "fixtures/docx/paragraphs.docx").read_bytes())
+        dc.convert_docx_bytes(
+            (Path(__file__).parents[1] / "fixtures/docx/paragraphs.docx").read_bytes()
+        )
 
 
 @pytest.mark.parametrize("source", ["../outside.png", "missing.png"])
 def test_word_does_not_read_external_or_missing_images(monkeypatch, source):
     _export_html(monkeypatch, f'<body><img src="{source}"/></body>')
     with pytest.raises(RuntimeError, match="not a local export artifact"):
-        dc.convert_docx_bytes((Path(__file__).parents[1] / "fixtures/docx/paragraphs.docx").read_bytes())
+        dc.convert_docx_bytes(
+            (Path(__file__).parents[1] / "fixtures/docx/paragraphs.docx").read_bytes()
+        )
 
 
 def test_external_image_is_visible_notice_without_fetch(monkeypatch):
-    _export_html(monkeypatch, '<body><img src="https://example.invalid/image.png"/></body>')
-    markdown, _, images = dc.convert_docx_bytes((Path(__file__).parents[1] / "fixtures/docx/paragraphs.docx").read_bytes())
+    _export_html(
+        monkeypatch, '<body><img src="https://example.invalid/image.png"/></body>'
+    )
+    markdown, _, images = dc.convert_docx_bytes(
+        (Path(__file__).parents[1] / "fixtures/docx/paragraphs.docx").read_bytes()
+    )
     assert "Extern verlinktes Bild nicht geladen" in markdown
     assert images == {}

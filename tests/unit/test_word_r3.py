@@ -75,7 +75,10 @@ def test_ordinary_word_content_in_tables(part, merged):
     p.add_run("C")
     p = table.cell(1, 2).paragraphs[0]
     p.text = ""
-    field = element("w:fldSimple", **{"w:instr": 'DATE \\@ "dd.MM.yyyy"' if part == "body" else "PAGE"})
+    field = element(
+        "w:fldSimple",
+        **{"w:instr": 'DATE \\@ "dd.MM.yyyy"' if part == "body" else "PAGE"},
+    )
     run = element("w:r")
     text = element("w:t")
     text.text = "1"
@@ -108,7 +111,9 @@ def test_zip_budget_before_read(monkeypatch):
         ws.sanitize_docx(out.getvalue())
 
 
-@pytest.mark.parametrize("budget", ["MAX_WORD_ENTRIES", "MAX_WORD_XML_PART", "MAX_WORD_XML_TOTAL"])
+@pytest.mark.parametrize(
+    "budget", ["MAX_WORD_ENTRIES", "MAX_WORD_XML_PART", "MAX_WORD_XML_TOTAL"]
+)
 def test_other_zip_budgets(monkeypatch, budget):
     monkeypatch.setattr(ws, budget, 1)
     with pytest.raises(DocumentTooLargeError):
@@ -134,8 +139,11 @@ def test_raster_image_conversion(fmt):
 def test_unreadable_image_notice(monkeypatch):
     from tests.unit.test_docx_paragraphs import _export_html
 
-    _export_html(monkeypatch, '<body><p>Text bleibt</p><img src="figure.png"/></body>',
-                 image=b"unrenderable metafile")
+    _export_html(
+        monkeypatch,
+        '<body><p>Text bleibt</p><img src="figure.png"/></body>',
+        image=b"unrenderable metafile",
+    )
     markdown, _, images = convert_docx_bytes(packed(Document()))
     assert "Text bleibt" in markdown
     assert "Eingebettetes Bild nicht verarbeitbar" in markdown
@@ -157,6 +165,7 @@ def test_tracked_structure_deletion(kind):
         table.cell(1, 0)._tc.get_or_add_tcPr().append(element("w:cellDel"))
     with zipfile.ZipFile(io.BytesIO(ws.sanitize_docx(packed(doc)))) as archive:
         from lxml import etree
+
         root = etree.fromstring(archive.read("word/document.xml"))
     assert "GELOESCHT" not in "".join(root.itertext())
     rows = root.findall(".//w:tr", ws.NS)
@@ -183,11 +192,17 @@ def test_arithmetic_asterisk():
     assert "5*3 = 15" in markdown
 
 
-@pytest.mark.parametrize("content", [b"random non Word bytes", b"%PDF-1.4", b"PK\x03\x04not a zip"])
+@pytest.mark.parametrize(
+    "content", [b"random non Word bytes", b"%PDF-1.4", b"PK\x03\x04not a zip"]
+)
 def test_non_word_rejected_before_writer(content, monkeypatch):
     from src.privacy_service import document_converter as dc
 
-    monkeypatch.setattr(dc.subprocess, "run", lambda *a, **kw: pytest.fail("Writer received non Word input"))
+    monkeypatch.setattr(
+        dc.subprocess,
+        "run",
+        lambda *a, **kw: pytest.fail("Writer received non Word input"),
+    )
     with pytest.raises(ValueError, match="Kein Word-Dokument"):
         convert_docx_bytes(content)
 
@@ -214,10 +229,16 @@ def test_word_zip_limit_returns_http_413(monkeypatch):
     monkeypatch.setattr(ws, "MAX_WORD_EXPANDED", 1)
     monkeypatch.setattr(app_mod, "_DOCUMENT_CHAIN", build_default_chain())
     with TestClient(app_mod.app) as client:
-        response = client.post("/document/convert", files={
-            "file": ("budget.docx", packed(Document()),
-                     "application/vnd.openxmlformats-officedocument.wordprocessingml.document")
-        })
+        response = client.post(
+            "/document/convert",
+            files={
+                "file": (
+                    "budget.docx",
+                    packed(Document()),
+                    "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                )
+            },
+        )
     assert response.status_code == 413, response.text
     assert "expanded size/entry budget" in response.json()["detail"]
 

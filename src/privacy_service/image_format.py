@@ -14,7 +14,6 @@ def image_mime(b64: str) -> str:
         return mime
 
 
-
 class UnprocessableWordImage(ValueError):
     """An embedded picture has no available raster decoder."""
 
@@ -26,8 +25,12 @@ def resize_word_image(raw: bytes, max_edge: int) -> tuple[bytes, str]:
     try:
         with Image.open(io.BytesIO(raw)) as image:
             fmt = image.format
-            extension = {"JPEG": ".jpg", "PNG": ".png", "GIF": ".gif",
-                         "WEBP": ".webp"}.get(fmt)
+            extension = {
+                "JPEG": ".jpg",
+                "PNG": ".png",
+                "GIF": ".gif",
+                "WEBP": ".webp",
+            }.get(fmt)
             if extension is not None and max(image.size) <= max_edge:
                 image.load()
                 return raw, extension
@@ -38,5 +41,10 @@ def resize_word_image(raw: bytes, max_edge: int) -> tuple[bytes, str]:
             output = io.BytesIO()
             image.save(output, format=fmt)
             return output.getvalue(), extension
-    except (UnidentifiedImageError, OSError, ValueError, Image.DecompressionBombError) as exc:
+    except (
+        UnidentifiedImageError,
+        OSError,
+        ValueError,
+        Image.DecompressionBombError,
+    ) as exc:
         raise UnprocessableWordImage(f"Bild nicht verarbeitbar: {exc}") from exc

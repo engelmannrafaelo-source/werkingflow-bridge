@@ -38,14 +38,21 @@ def tables(markdown):
 
 
 def cells(table):
-    return [[(td.get_text(strip=True), td.get("colspan", "1"), td.get("rowspan", "1"))
-             for td in tr.find_all("td", recursive=False)]
-            for tr in table.find_all("tr", recursive=False)]
+    return [
+        [
+            (td.get_text(strip=True), td.get("colspan", "1"), td.get("rowspan", "1"))
+            for td in tr.find_all("td", recursive=False)
+        ]
+        for tr in table.find_all("tr", recursive=False)
+    ]
 
 
 def rewrite(content, name, change):
     out = io.BytesIO()
-    with zipfile.ZipFile(io.BytesIO(content)) as source, zipfile.ZipFile(out, "w") as target:
+    with (
+        zipfile.ZipFile(io.BytesIO(content)) as source,
+        zipfile.ZipFile(out, "w") as target,
+    ):
         for info in source.infolist():
             data = source.read(info)
             if info.filename == name:
@@ -65,6 +72,7 @@ def packed(document):
 def test_textbox_table_before_and_after_merged_table(order):
     content = probe("h02_textfeld_tabelle.docx")
     if order == "textbox_before":
+
         def change(data):
             root = etree.fromstring(data)
             body = root.find("w:body", ws.NS)
@@ -73,6 +81,7 @@ def test_textbox_table_before_and_after_merged_table(order):
             body.insert(0, paragraph)
             assert table.tag == f"{{{W}}}tbl"
             return etree.tostring(root)
+
         content = rewrite(content, "word/document.xml", change)
     markdown, meta, _ = convert_docx_bytes(content)
     assert markdown.count("TB-A") == 1 and markdown.count("TB-B") == 1
@@ -89,7 +98,10 @@ def test_first_page_header_with_merged_tables():
     found = {t.get_text(" ", strip=True).split()[0]: t for t in tables(markdown)}
     assert set(found) == {"KD00", "KE00"}
     for key, prefix in (("KD00", "KD"), ("KE00", "KE")):
-        assert cells(found[key])[1] == [(f"{prefix}-QUER", "2", "1"), (f"{prefix}12", "1", "1")]
+        assert cells(found[key])[1] == [
+            (f"{prefix}-QUER", "2", "1"),
+            (f"{prefix}12", "1", "1"),
+        ]
     assert "[Kopfzeile (erste Seite): im Export nicht enthalten" in markdown
     assert meta["word_notices"] == ["Kopfzeile (erste Seite) aus der Quelle angehängt"]
     assert markdown.index("KD00") < markdown.index("KE00") < markdown.index("Brieftext")
@@ -100,7 +112,9 @@ def test_even_page_header_is_appended():
     assert "Gerade" in markdown
     assert "[Kopfzeile (gerade Seiten): im Export nicht enthalten" in markdown
     assert "KD-QUER" in markdown
-    assert meta["word_notices"] == ["Kopfzeile (gerade Seiten) aus der Quelle angehängt"]
+    assert meta["word_notices"] == [
+        "Kopfzeile (gerade Seiten) aus der Quelle angehängt"
+    ]
 
 
 def test_second_section_footer_is_appended():
@@ -115,7 +129,9 @@ def test_second_section_footer_is_appended():
     assert "FUSS-EINS" in markdown and "FUSS-ZWEI" in markdown
     assert markdown.count("FUSS-ZWEI") == 1
     if "Fußzeile (Abschnitt 2)" in markdown:
-        assert meta["word_notices"] == ["Fußzeile (Abschnitt 2) aus der Quelle angehängt"]
+        assert meta["word_notices"] == [
+            "Fußzeile (Abschnitt 2) aus der Quelle angehängt"
+        ]
 
 
 # Auflage 3: rows/cells through content controls, gridAfter, adjacent tables.
@@ -145,39 +161,67 @@ def test_writer_joined_adjacent_tables_are_split_again():
 
 def _provenance(spanned=True):
     provenance = Provenance("wqtest_")
-    provenance.tables["t1"] = SourceTable("1", "word/document.xml", [
-        SourceRow(0, [SourceCell("t1r0c0", 2 if spanned else 1)]),
-        SourceRow(0, [SourceCell("t1r1c0", 1), SourceCell("t1r1c1", 1)]),
-    ], True)
+    provenance.tables["t1"] = SourceTable(
+        "1",
+        "word/document.xml",
+        [
+            SourceRow(0, [SourceCell("t1r0c0", 2 if spanned else 1)]),
+            SourceRow(0, [SourceCell("t1r1c0", 1), SourceCell("t1r1c1", 1)]),
+        ],
+        True,
+    )
     return provenance
 
 
 def _html(rows, extra=""):
-    body = "".join("<tr>" + "".join(f"<td>{c}</td>" for c in row) + "</tr>" for row in rows)
-    return BeautifulSoup(f"<body><p>Davor</p><table>{body}</table>{extra}<p>Danach</p></body>",
-                         "html.parser")
+    body = "".join(
+        "<tr>" + "".join(f"<td>{c}</td>" for c in row) + "</tr>" for row in rows
+    )
+    return BeautifulSoup(
+        f"<body><p>Davor</p><table>{body}</table>{extra}<p>Danach</p></body>",
+        "html.parser",
+    )
 
 
 def test_verified_table_takes_geometry_from_source_not_writer():
-    soup = _html([['<a name="wqtest_t1r0c0"></a>A'],
-                  ['<a name="wqtest_t1r1c0"></a>B', '<a name="wqtest_t1r1c1"></a>C']])
+    soup = _html(
+        [
+            ['<a name="wqtest_t1r0c0"></a>A'],
+            ['<a name="wqtest_t1r1c0"></a>B', '<a name="wqtest_t1r1c1"></a>C'],
+        ]
+    )
     soup.find("td")["colspan"] = "1"
     soup.find_all("td")[1]["colspan"] = "2"  # Writer put the span on the wrong cell
     assert apply_provenance(soup, soup.body, _provenance()) == []
-    assert cells(soup.find("table")) == [[("A", "2", "1")], [("B", "1", "1"), ("C", "1", "1")]]
+    assert cells(soup.find("table")) == [
+        [("A", "2", "1")],
+        [("B", "1", "1"), ("C", "1", "1")],
+    ]
     assert "wqtest_" not in str(soup)
 
 
-@pytest.mark.parametrize("rows,reason", [
-    ([['<a name="wqtest_t1r0c0"></a>A'], ['<a name="wqtest_t1r1c0"></a>B', 'UNMARKIERT']],
-     "Zelle mit Inhalt ohne Quellzuordnung"),
-    ([['<a name="wqtest_t1r0c0"></a>A'], ['<a name="wqtest_t1r1c1"></a>C']],
-     "Zellfolge weicht von der Quelle ab"),
-    ([['<a name="wqtest_t1r0c0"></a>A', '<a name="wqtest_t1r1c0"></a>B']],
-     "eine Exportzeile mischt Quellzeilen"),
-])
+@pytest.mark.parametrize(
+    "rows,reason",
+    [
+        (
+            [
+                ['<a name="wqtest_t1r0c0"></a>A'],
+                ['<a name="wqtest_t1r1c0"></a>B', "UNMARKIERT"],
+            ],
+            "Zelle mit Inhalt ohne Quellzuordnung",
+        ),
+        (
+            [['<a name="wqtest_t1r0c0"></a>A'], ['<a name="wqtest_t1r1c1"></a>C']],
+            "Zellfolge weicht von der Quelle ab",
+        ),
+        (
+            [['<a name="wqtest_t1r0c0"></a>A', '<a name="wqtest_t1r1c0"></a>B']],
+            "eine Exportzeile mischt Quellzeilen",
+        ),
+    ],
+)
 def test_ambiguous_table_is_local_and_visible(rows, reason):
-    soup = _html(rows, extra='<table><tr><td>Andere</td><td>Tabelle</td></tr></table>')
+    soup = _html(rows, extra="<table><tr><td>Andere</td><td>Tabelle</td></tr></table>")
     soup.find("td")["colspan"] = "2"
     notices = apply_provenance(soup, soup.body, _provenance())
     assert notices == [f"Tabelle ohne Spaltenzuordnung ausgegeben: {reason}"]
@@ -190,10 +234,15 @@ def test_ambiguous_table_is_local_and_visible(rows, reason):
 
 
 def test_unmarked_writer_span_is_not_trusted():
-    soup = BeautifulSoup('<body><table><tr><td colspan="2">X</td></tr><tr><td>a</td><td>b</td></tr>'
-                         "</table></body>", "html.parser")
+    soup = BeautifulSoup(
+        '<body><table><tr><td colspan="2">X</td></tr><tr><td>a</td><td>b</td></tr>'
+        "</table></body>",
+        "html.parser",
+    )
     notices = apply_provenance(soup, soup.body, Provenance("wqtest_"))
-    assert notices == ["Tabelle ohne Spaltenzuordnung ausgegeben: Exporttabelle ohne Quellzuordnung"]
+    assert notices == [
+        "Tabelle ohne Spaltenzuordnung ausgegeben: Exporttabelle ohne Quellzuordnung"
+    ]
     assert soup.find("table") is None and "X" in soup.get_text()
 
 
@@ -209,7 +258,9 @@ def test_invalid_vertical_merge_is_local():
     markdown, meta, _ = convert_docx_bytes(packed(doc))
     assert "Bleibt" in markdown and "OBEN" in markdown and "UNTEN" in markdown
     assert meta["word_notices"] == [
-        "Tabelle ohne Spaltenzuordnung ausgegeben: vertikale Verbindung ohne Ursprungszelle"]
+        "Tabelle ohne Spaltenzuordnung ausgegeben: vertikale Verbindung ohne "
+        "Ursprungszelle"
+    ]
 
 
 def test_empty_geometry_after_tracked_deletion_is_local():
@@ -250,7 +301,9 @@ def _padded_picture(megabytes):
 def test_inflating_referenced_part_rejected_before_writer(monkeypatch):
     content = _padded_picture(12)  # 12 MiB from ~12 KiB: far beyond any real image
     assert len(content) < 100_000
-    monkeypatch.setattr(dc.subprocess, "run", lambda *a, **kw: pytest.fail("Writer started"))
+    monkeypatch.setattr(
+        dc.subprocess, "run", lambda *a, **kw: pytest.fail("Writer started")
+    )
     with pytest.raises(DocumentTooLargeError, match="expanded size"):
         convert_docx_bytes(content)
 
@@ -280,19 +333,32 @@ def test_default_content_type_template_and_macro_documents():
     assert "Makros (VBA) entfernt, nicht ausgeführt" in meta["word_notices"]
 
 
-@pytest.mark.parametrize("filename,mime", [
-    ("a.docm", None), ("a.dotx", None), ("a.dotm", None),
-    ("x", "application/vnd.ms-word.document.macroEnabled.12"),
-    ("x", "application/vnd.openxmlformats-officedocument.wordprocessingml.template"),
-    ("x", "application/vnd.ms-word.template.macroEnabled.12"),
-])
+@pytest.mark.parametrize(
+    "filename,mime",
+    [
+        ("a.docm", None),
+        ("a.dotx", None),
+        ("a.dotm", None),
+        ("x", "application/vnd.ms-word.document.macroEnabled.12"),
+        (
+            "x",
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.template",
+        ),
+        ("x", "application/vnd.ms-word.template.macroEnabled.12"),
+    ],
+)
 def test_word_variants_reach_word_adapter(filename, mime):
     assert detect_format(filename, mime) == "docx"
 
 
 def test_foreign_main_content_type_rejected():
-    content = rewrite(probe("h22_default_contenttype.docx"), "[Content_Types].xml",
-                      lambda d: d.replace(b"wordprocessingml.document.main+xml", b"spreadsheetml.sheet.main+xml"))
+    content = rewrite(
+        probe("h22_default_contenttype.docx"),
+        "[Content_Types].xml",
+        lambda d: d.replace(
+            b"wordprocessingml.document.main+xml", b"spreadsheetml.sheet.main+xml"
+        ),
+    )
     with pytest.raises(ValueError, match="Kein Word-Dokument"):
         ws.sanitize_docx(content)
 
@@ -300,19 +366,32 @@ def test_foreign_main_content_type_rejected():
 # Auflage 6: embedded objects are never silently dropped.
 def test_embedded_excel_keeps_cell_values():
     markdown, meta, _ = convert_docx_bytes(probe("h21b_excel_ole_word.docx"))
-    assert "[Eingebettetes Objekt (Excel.Sheet.12): Tabelleninhalt des aktiven Blatts übernommen" in markdown
+    assert (
+        "[Eingebettetes Objekt (Excel.Sheet.12): Tabelleninhalt des aktiven Blatts "
+        "übernommen"
+        in markdown
+    )
     assert "| EXCELZELLE | 42 |" in markdown
-    assert markdown.index("Vor Excel") < markdown.index("EXCELZELLE") < markdown.index("Nach Excel")
+    assert (
+        markdown.index("Vor Excel")
+        < markdown.index("EXCELZELLE")
+        < markdown.index("Nach Excel")
+    )
     assert len(meta["word_notices"]) == 1
 
 
 def test_unreadable_embedded_object_gets_notice():
-    content = rewrite(probe("h21b_excel_ole_word.docx"), "word/embeddings/Microsoft_Excel_Worksheet.xlsx",
-                      lambda d: b"kein Arbeitsblatt")
+    content = rewrite(
+        probe("h21b_excel_ole_word.docx"),
+        "word/embeddings/Microsoft_Excel_Worksheet.xlsx",
+        lambda d: b"kein Arbeitsblatt",
+    )
     markdown, meta, _ = convert_docx_bytes(content)
     assert "[Eingebettetes Objekt (Excel.Sheet.12) nicht übernommen]" in markdown
     assert "Vor Excel" in markdown and "Nach Excel" in markdown
-    assert meta["word_notices"] == ["Eingebettetes Objekt (Excel.Sheet.12) nicht übernommen"]
+    assert meta["word_notices"] == [
+        "Eingebettetes Objekt (Excel.Sheet.12) nicht übernommen"
+    ]
 
 
 def test_grid_before_offsets_vertical_merge():
@@ -322,19 +401,24 @@ def test_grid_before_offsets_vertical_merge():
     for cell, text in zip(table.rows[0].cells, ["X", "A", "B"]):
         cell.text = text
     first = table.rows[0]._tr.findall(f"{{{W}}}tc")
-    etree.SubElement(first[1].get_or_add_tcPr(), f"{{{W}}}vMerge").set(f"{{{W}}}val", "restart")
+    etree.SubElement(first[1].get_or_add_tcPr(), f"{{{W}}}vMerge").set(
+        f"{{{W}}}val", "restart"
+    )
     second = table.rows[1]._tr
     cont, last, spare = second.findall(f"{{{W}}}tc")
     second.remove(spare)
     etree.SubElement(cont.get_or_add_tcPr(), f"{{{W}}}vMerge")
-    last.find(f".//{{{W}}}p").append(etree.fromstring(
-        f'<w:r xmlns:w="{W}"><w:t>C</w:t></w:r>'))
+    last.find(f".//{{{W}}}p").append(
+        etree.fromstring(f'<w:r xmlns:w="{W}"><w:t>C</w:t></w:r>')
+    )
     tr_pr = second.get_or_add_trPr()
     etree.SubElement(tr_pr, f"{{{W}}}gridBefore").set(f"{{{W}}}val", "1")
     markdown, meta, _ = convert_docx_bytes(packed(doc))
     (html,) = tables(markdown)
-    assert cells(html) == [[("X", "1", "1"), ("A", "1", "2"), ("B", "1", "1")],
-                           [("", "1", "1"), ("C", "1", "1")]]
+    assert cells(html) == [
+        [("X", "1", "1"), ("A", "1", "2"), ("B", "1", "1")],
+        [("", "1", "1"), ("C", "1", "1")],
+    ]
     assert meta["word_notices"] == []
 
 
@@ -375,13 +459,17 @@ def test_pixel_bomb_is_a_local_notice_before_writer():
     markdown, meta, images = convert_docx_bytes(content)
     assert "[Eingebettetes Bild zu groß (30000×30000 Pixel), nicht geladen]" in markdown
     assert images == {}
-    assert meta["word_notices"] == ["Eingebettetes Bild zu groß (30000×30000 Pixel), nicht geladen"]
+    assert meta["word_notices"] == [
+        "Eingebettetes Bild zu groß (30000×30000 Pixel), nicht geladen"
+    ]
 
 
 def test_total_picture_budget_keeps_first_pictures(monkeypatch):
     monkeypatch.setattr(ws, "MAX_WORD_IMAGE_PIXELS", 2_000_000)
     monkeypatch.setattr(ws, "MAX_WORD_IMAGE_PIXELS_TOTAL", 3_000_000)
-    markdown, meta, images = convert_docx_bytes(_pixel_document(1000, 1000, 1200, 1500, 900))
+    markdown, meta, images = convert_docx_bytes(
+        _pixel_document(1000, 1000, 1200, 1500, 900)
+    )
     assert len(images) == 3  # 1000², 1000², 900²: 2.81 M px within the total
     assert markdown.count("Bildbudget des Dokuments erschöpft (1200×1200 Pixel)") == 1
     assert markdown.count("Eingebettetes Bild zu groß (1500×1500 Pixel)") == 1
