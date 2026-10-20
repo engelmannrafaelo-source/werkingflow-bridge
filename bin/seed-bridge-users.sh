@@ -696,6 +696,19 @@ def grenzkonto(key, u):
         return '_note nennt DEPLETED/all_exhausted'
     return ''
 
+def guthaben_aus_antwort(r):
+    """topUpBalanceEur als float oder None (fehlt/null/keine Zahl/kein JSON). None heisst UNKLAR."""
+    try:
+        wert = r.json().get('topUpBalanceEur')
+    except (ValueError, AttributeError):
+        return None
+    if wert is None or isinstance(wert, bool):
+        return None
+    try:
+        return float(wert)
+    except (TypeError, ValueError):
+        return None
+
 def topup_bis_soll(uid, label, soll=TEST_TOPUP_EUR):
     """Guthaben lesen, nur die Differenz bis zum Sollstand gutschreiben. Rueckgabe True bei Erfolg.
     Bis 20.10.2026 additiv (+500 je Lauf): demo-report@ stand bei 355.500 EUR / 711 Losen."""
@@ -707,10 +720,10 @@ def topup_bis_soll(uid, label, soll=TEST_TOPUP_EUR):
     if r.status_code != 200:
         print(f"  [FAIL]  {label}: GET /v1/budget/{{uid}} HTTP {r.status_code} — {r.text[:200]}", file=sys.stderr)
         return False
-    try:
-        ist = float(r.json().get('topUpBalanceEur') or 0.0)
-    except (ValueError, TypeError, AttributeError):
-        print(f"  [FAIL]  {label}: budget response ohne topUpBalanceEur", file=sys.stderr)
+    ist = guthaben_aus_antwort(r)
+    if ist is None:
+        # HTTP 200 ohne Zahl (Feld fehlt/null/kein JSON) ist UNKLAR, nie 0: sonst +500 (R1-Befund).
+        print(f"  [FAIL]  {label}: budget response ohne gueltiges topUpBalanceEur — nichts geschrieben", file=sys.stderr)
         return False
     fehlt = round(soll - ist, 2)
     if fehlt <= 0:
@@ -1172,13 +1185,30 @@ for app_id, plan_id in INTERACTIVE_APP_PLANS.items():
         ok = False
 
 # Step F: top-up credit — bis zum Sollstand (Guthaben lesen, nur Differenz), nie additiv.
+def _guthaben(r):
+    try:
+        wert = r.json().get('topUpBalanceEur')
+    except (ValueError, AttributeError):
+        return None
+    if wert is None or isinstance(wert, bool):
+        return None
+    try:
+        return float(wert)
+    except (TypeError, ValueError):
+        return None
 try:
     r = requests.get(f'${BRIDGE_URL}/v1/budget/{uid}', headers=headers, timeout=15)
-    ist = float(r.json().get('topUpBalanceEur') or 0.0) if r.status_code == 200 else None
-except (requests.RequestException, ValueError, TypeError, AttributeError) as e:
+    ist = _guthaben(r) if r.status_code == 200 else None
+    if r.status_code == 200 and ist is None:
+        # 200 ohne Zahl ist UNKLAR, nie 0 (R1-Befund): nichts schreiben.
+        print(f"  [FAIL]  budget response ohne gueltiges topUpBalanceEur — nichts geschrieben", file=sys.stderr)
+        ok = False
+        r = None
+except requests.RequestException as e:
     print(f"  [FAIL]  budget read error: {e}", file=sys.stderr)
     ok = False
     ist = None
+    r = None
 if ist is not None:
     fehlt = round(TEST_TOPUP_EUR - ist, 2)
     if fehlt <= 0:
@@ -1201,7 +1231,7 @@ if ist is not None:
             else:
                 print(f"  [FAIL]  Top-up HTTP {r.status_code} — {r.text[:200]}", file=sys.stderr)
                 ok = False
-elif ist is None and ok:
+elif r is not None:
     print(f"  [FAIL]  GET /v1/budget/{{uid}} HTTP {r.status_code}", file=sys.stderr)
     ok = False
 
