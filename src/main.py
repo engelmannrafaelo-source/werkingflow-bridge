@@ -1397,11 +1397,45 @@ async def _cross_worker_retry(
         # Nobody reads this answer; the relay and the peer's run are gone.
         logger.warning(f"🔌 chat relay to {target} abandoned: caller gone")
         return JSONResponse(status_code=499, content={"error": {"message": "caller gone"}})
-    except Exception as exc:
-        logger.error(
-            f"cross-worker retry HTTP call to {target} failed: {exc}", exc_info=True
-        )
+    except (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout) as exc:
+        # The request never reached the peer: nothing runs there, so this
+        # worker's own error (which nginx may retry) is still true.
+        logger.error(f"cross-worker retry to {target}: peer not reached: {exc!r}")
         return None
+    except Exception as exc:
+        # The request REACHED the peer and its answer was lost (read timeout,
+        # broken connection, ...): the peer may be computing — and paying
+        # for — this call. Answering with this worker's own 429/503 here made
+        # nginx (proxy_next_upstream http_429/5xx non_idempotent) start a
+        # SECOND run while the first one ran to the end as
+        # undelivered/caller_gone (Muehl P1, 20.10.2026: 6 orphans, ~28 % of
+        # the window's cost). 424 is not in proxy_next_upstream and has no
+        # error_page mapping: it reaches the caller unchanged, loudly.
+        logger.error(
+            f"cross-worker retry HTTP call to {target} failed after the request "
+            f"reached it: {exc!r} — answering 424 relay_outcome_unknown, no LB retry",
+            exc_info=True,
+        )
+        from src.middleware.bridge_error import (
+            SOURCE_BRIDGE_INTERNAL,
+            TYPE_UPSTREAM_TIMEOUT,
+            bridge_error,
+        )
+        return bridge_error(
+            source=SOURCE_BRIDGE_INTERNAL,
+            error_type=TYPE_UPSTREAM_TIMEOUT,
+            reason=_cw.REASON_RELAY_AUSGANG_UNBEKANNT,
+            message=(
+                f"Call was relayed from {self_worker} to {target}, which may still be "
+                f"running it; its answer was lost ({type(exc).__name__}). Not "
+                f"retried on another worker, to avoid a second paid run. A retry by "
+                f"the caller may duplicate work."
+            ),
+            status_code=424,
+            retry_after_s=_cw.CHAT_KAPAZITAET_RETRY_S,
+            retryable_override=True,
+            extra={"relay_target": target, "relay_from": self_worker},
+        )
 
 
 @app.exception_handler(RateLimitError)
@@ -11158,6 +11192,42 @@ def _ehrliche_antwort(request: Request, response: JSONResponse) -> JSONResponse:
     return JSONResponse(status_code=response.status_code, content=body, headers=headers)
 
 
+def _lb_failover_antwort(response: JSONResponse, self_worker: str, ziel: str) -> JSONResponse:
+    """This worker's capacity 429 (throttle/queue_timeout), unchanged in
+    status and reason, marked as "nothing ran here, no relay, the LB moves
+    it": ``failover`` in the body, X-Bridge-Failover header. ``peer_with_room``
+    is the pool's choice at this moment — nginx picks the next upstream itself."""
+    import json as _json
+    from src import chat_weiterleitung as _cw
+    try:
+        body = _json.loads(response.body)
+        fehler = body["error"]
+    except Exception:
+        logger.error(f"lb failover: unreadable capacity envelope from {self_worker}")
+        return response
+    fehler["failover"] = {
+        "via": "lb",
+        "relayed": False,
+        "ran_on_worker": False,
+        "peer_with_room": ziel,
+    }
+    fehler["message"] = (
+        str(fehler.get("message") or "").rstrip(".")
+        + f". Nothing ran on this worker and the call was not relayed; "
+        f"{ziel} has room — the load balancer retries on the next worker."
+    )
+    headers = {
+        k: v for k, v in response.headers.items() if k.lower() != "content-length"
+    }
+    headers[_cw.LB_FAILOVER_HEADER] = _cw.LB_FAILOVER_WERT
+    headers["X-Worker-Id"] = self_worker
+    logger.info(
+        f"🔁 {self_worker}: {fehler.get('bridge_type')} before any run — 429 for LB "
+        f"failover, no relay (peer with room: {ziel})"
+    )
+    return JSONResponse(status_code=response.status_code, content=body, headers=headers)
+
+
 @app.exception_handler(BridgeError)
 async def bridge_error_handler(request: Request, exc: BridgeError):
     """Unwrap BridgeError → its carried structured response. The envelope is
@@ -11170,6 +11240,10 @@ async def bridge_error_handler(request: Request, exc: BridgeError):
     try the fallback chain (terminating in `bridge-prod-emergency`) BEFORE
     surfacing the envelope. This closes the gap where dep-raised BridgeErrors
     never reached the route handler's own fallback path.
+
+    throttle/queue_timeout are never relayed to a peer worker (20.10.2026):
+    when the pool has a worker with room, the 429 goes straight back and the
+    LB retries it; only account_exhausted keeps the cross-worker relay.
     """
     # Only the chat-completions path is a candidate for cross-bridge fallback.
     # Other endpoints (research, health, metrics) keep the original envelope.
@@ -11205,15 +11279,36 @@ async def bridge_error_handler(request: Request, exc: BridgeError):
         ):
             return exc.response
 
-        # First: try a cross-worker retry on this same bridge before falling
-        # over to a different provider tier. The current worker's local
-        # admission control rejected the request, but other workers on this
-        # bridge may still have capacity. Bounded to 2 attempts via the same
-        # X-Bridge-Retry-Count header used by rate_limit_handler.
         self_worker = os.getenv("INSTANCE_NAME", "unknown")
-        cross_worker_response = await _cross_worker_retry(request, self_worker)
-        if cross_worker_response is not None:
-            return cross_worker_response
+        if err_type in ("throttle", "queue_timeout"):
+            # Admission rejected the call BEFORE anything ran on this worker.
+            # No bridge-internal relay here: nginx already retries a 429 on the
+            # next worker (proxy_next_upstream http_429 non_idempotent), and two
+            # stacked retry layers ran the same call twice — the relay started
+            # the run on a peer, gave up waiting, answered 429, and nginx started
+            # a second run (Muehl P1, 20.10.2026: 6 orphaned runs, ~28 % of the
+            # window's cost). The pool is only READ: a peer with room → plain
+            # 429 for the LB failover; none → the honest pool envelope and the
+            # cross-bridge chain below, as before.
+            excluded = {
+                w for w in (request.headers.get("x-bridge-retry-excluded") or "").split(",") if w
+            }
+            excluded.add(self_worker)
+            _est = getattr(request.state, "adaptive_est_tokens", None)
+            ziel = await _pick_alternative_worker(
+                excluded,
+                benoetigt_tokens=int(_est) if isinstance(_est, (int, float)) and _est > 0 else 500,
+                request=request,
+            )
+            if ziel is not None:
+                return _lb_failover_antwort(exc.response, self_worker, ziel)
+        else:
+            # account_exhausted: try a cross-worker retry on this same bridge
+            # before falling over to a different provider tier. Bounded to 2
+            # attempts via X-Bridge-Retry-Count, as in rate_limit_handler.
+            cross_worker_response = await _cross_worker_retry(request, self_worker)
+            if cross_worker_response is not None:
+                return cross_worker_response
         # No peer took it: name the pool's real reason and retry_after in the
         # envelope the caller gets (also on the cross-bridge path's fall-throughs).
         exc.response = _ehrliche_antwort(request, exc.response)

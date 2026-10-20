@@ -85,6 +85,14 @@ REASON_POOL_KAPAZITAET_BELEGT = "pool_capacity_busy"
 REASON_POOL_KONTEN_LIMIT = "pool_accounts_limited"
 REASON_POOL_ZU_GROSS = "pool_request_exceeds_every_cap"
 REASON_POOL_UNBEKANNT = "pool_state_unknown"
+# The relay reached the peer, then its answer was lost: the peer may be running
+# the call. Answered 424 (never retried by nginx), main._cross_worker_retry.
+REASON_RELAY_AUSGANG_UNBEKANNT = "relay_outcome_unknown"
+# Capacity rejection (throttle/queue_timeout) before anything ran, with a peer
+# that has room: no relay, the 429 carries this marker and the LB moves the
+# call (main.bridge_error_handler, 20.10.2026). Response header of the same name.
+LB_FAILOVER_HEADER = "x-bridge-failover"
+LB_FAILOVER_WERT = "lb-no-relay"
 
 
 def pruefe_staffelung() -> None:
