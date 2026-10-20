@@ -9463,54 +9463,60 @@ async def convert_html_to_docx_endpoint(
     (src/pricing.py) nicht; die Zeile bucht 0.00 EUR und traegt die von
     ConvertAPI gemeldeten Sekunden in provider_metadata.convertapi_cost_seconds.
 
-    Budget-Gate VOR dem ConvertAPI-Aufruf: ein erschoepftes Budget antwortet
-    402, bevor Kosten entstehen (gleiches Muster wie /v1/research).
+    Budget-Gate VOR dem ConvertAPI-Aufruf, sobald ein Preis feststeht: dann
+    antwortet ein erschoepftes Budget 402, bevor Kosten entstehen (Muster
+    /v1/research). Bei 0,00 EUR bleibt es aus — nicht strenger als PDF.
     """
     await verify_api_key(request, credentials)
 
     _attr = extract_attribution_context(request)
-    try:
-        from src.budget.gate import enforce_budget
-        await enforce_budget(
-            user_id=_attr.get("user_id"),
-            app_id=_attr.get("app_id"),
-            estimated_cost_eur=0.0,  # kein ConvertAPI-Preis in der SSoT; Gate sperrt "Budget weg"-Zustaende
-            project_id=_attr.get("workflow_id"),
-        )
-    except HTTPException as _budget_402:
-        # Wie im Chat-Weg: die Ablehnung sichtbar ins Ledger, damit "Budget
-        # erschoepft" nicht wie Stille aussieht. Nichts wurde gesendet → unrouted.
-        if _budget_402.status_code == 402:
-            try:
-                from src.activity.ai_call_writer import persist_ai_call_activity
-                from src.activity.providers import PROVIDER_UNROUTED
-                _detail = _budget_402.detail if isinstance(_budget_402.detail, dict) else {}
-                await persist_ai_call_activity(
-                    provider=PROVIDER_UNROUTED,
-                    app_id=_attr.get("app_id"),
-                    user_id=_attr.get("user_id"),
-                    agent_id="docx-export",
-                    workflow_id=_attr.get("workflow_id"),
-                    model="convertapi",
-                    input_tokens=0,
-                    output_tokens=0,
-                    status="error",
-                    duration_ms=0,
-                    error_code="402",
-                    error_message=str(
-                        _detail.get("message") or _detail.get("reason")
-                        or _detail.get("error") or "budget_exhausted"
-                    )[:500],
-                    app_env=_attr.get("app_env"),
-                )
-            except Exception as _log_e:  # noqa: BLE001 — never let ledger logging affect the 402 response
-                logger.error(
-                    "docx-export budget gate: failed to log the 402 rejection "
-                    "(app=%s user=%s): %s", _attr.get("app_id"), _attr.get("user_id"), _log_e,
-                )
-        raise
-    except Exception as _ge:  # noqa: BLE001 — gleiche Fail-open-Politik wie research/doc-agent
-        logger.error(f"budget gate (docx-export) unexpected error (letting call through): {_ge}")
+    # Budget-Gate erst, wenn ein Preis je ConvertAPI-Sekunde in der Preis-SSoT steht (a1ceab8d, 20.10.2026):
+    # solange 0,00 EUR gebucht werden, ist DOCX nicht strenger als PDF — ein leerer Topf sperrt keinen
+    # Download, den er beim PDF nicht sperrt. Mit Preis greift das Gate VOR dem ConvertAPI-Aufruf.
+    _docx_schaetzung_eur = 0.0
+    if _docx_schaetzung_eur > 0:
+        try:
+            from src.budget.gate import enforce_budget
+            await enforce_budget(
+                user_id=_attr.get("user_id"),
+                app_id=_attr.get("app_id"),
+                estimated_cost_eur=_docx_schaetzung_eur,
+                project_id=_attr.get("workflow_id"),
+            )
+        except HTTPException as _budget_402:
+            # Wie im Chat-Weg: die Ablehnung sichtbar ins Ledger, damit "Budget
+            # erschoepft" nicht wie Stille aussieht. Nichts wurde gesendet → unrouted.
+            if _budget_402.status_code == 402:
+                try:
+                    from src.activity.ai_call_writer import persist_ai_call_activity
+                    from src.activity.providers import PROVIDER_UNROUTED
+                    _detail = _budget_402.detail if isinstance(_budget_402.detail, dict) else {}
+                    await persist_ai_call_activity(
+                        provider=PROVIDER_UNROUTED,
+                        app_id=_attr.get("app_id"),
+                        user_id=_attr.get("user_id"),
+                        agent_id="docx-export",
+                        workflow_id=_attr.get("workflow_id"),
+                        model="convertapi",
+                        input_tokens=0,
+                        output_tokens=0,
+                        status="error",
+                        duration_ms=0,
+                        error_code="402",
+                        error_message=str(
+                            _detail.get("message") or _detail.get("reason")
+                            or _detail.get("error") or "budget_exhausted"
+                        )[:500],
+                        app_env=_attr.get("app_env"),
+                    )
+                except Exception as _log_e:  # noqa: BLE001 — never let ledger logging affect the 402 response
+                    logger.error(
+                        "docx-export budget gate: failed to log the 402 rejection "
+                        "(app=%s user=%s): %s", _attr.get("app_id"), _attr.get("user_id"), _log_e,
+                    )
+            raise
+        except Exception as _ge:  # noqa: BLE001 — gleiche Fail-open-Politik wie research/doc-agent
+            logger.error(f"budget gate (docx-export) unexpected error (letting call through): {_ge}")
 
     _start = time.time()
     privacy_client = get_privacy_client()
