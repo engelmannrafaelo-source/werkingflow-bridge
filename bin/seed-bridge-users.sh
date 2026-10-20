@@ -39,6 +39,29 @@ fi
 APP="$1"
 CREDENTIALS_JSON="${APPS_ROOT}/${APP}/config/test-credentials.json"
 BRIDGE_URL="${BRIDGE_URL:-http://localhost:8000}"
+
+# Seed-Ziel-Sperre (Kanzler Dev 20.10.2026, Befund Demo-Guthaben): dieses Skript schreibt Nutzer,
+# Abos und Guthaben in die Bridge. Die Dev-Bridge (49.12.72.66 / bridge.werking.tools) ist zwischen
+# allen Apps, Haeusern und dem Report-Staging GETEILT — jeder Tier-2-Lauf lud dort 73 Testkonten
+# additiv auf (demo-report@: 711 Lose). Seeden nur, wenn die Bridge lokal laeuft ODER ihr Host
+# ausdruecklich als Seed-Ziel deklariert ist (TESTER_SEED_ZIELE=host1,host2 — dieselbe Deklaration
+# wie run-in-container --seed-ziel). Sonst lauter Abbruch, exit 3, bevor irgendetwas geschrieben wird.
+_bridge_host="$(printf '%s' "$BRIDGE_URL" | sed -E 's#^[a-z]+://##; s#[:/].*$##' | tr 'A-Z' 'a-z')"
+_seed_erlaubt=""
+case "$_bridge_host" in
+  localhost|127.0.0.1|::1|host.docker.internal) _seed_erlaubt="lokale Bridge ($_bridge_host)" ;;
+esac
+if [ -z "$_seed_erlaubt" ]; then
+  for _z in $(printf '%s' "${TESTER_SEED_ZIELE:-}" | tr ',' ' '); do
+    [ "$(printf '%s' "$_z" | tr 'A-Z' 'a-z')" = "$_bridge_host" ] && _seed_erlaubt="deklariertes Seed-Ziel ($_bridge_host)"
+  done
+fi
+if [ -z "$_seed_erlaubt" ]; then
+  printf '  [FAIL]  Bridge %s ist weder lokal noch als Seed-Ziel deklariert (TESTER_SEED_ZIELE) — kein Seeding,\n' "$_bridge_host" >&2
+  printf '          kein Schreibzugriff auf eine geteilte Bridge (Dev-Bridge = Report-Staging-Guthaben). exit 3\n' >&2
+  exit 3
+fi
+printf '  [info]  Seed-Ziel: %s\n' "$_seed_erlaubt"
 DEFAULT_TENANT_ID="${APP}-test"
 
 # ---- colours ----------------------------------------------------------------
@@ -562,11 +585,14 @@ log_success "Verification passed"
 #
 # Per test user:
 #   1. POST /v1/billing/subscription/provision — active subscription (no Mollie)
-#   2. POST /v1/budget/topup/credit           — generous test credit
+#   2. GET /v1/budget/{uid} + POST /v1/budget/topup/credit — Guthaben bis zum SOLLSTAND
+#      (TEST_TOPUP_EUR); nur die Differenz wird gutgeschrieben. Grenzkonten (depleted-budget@,
+#      keinTopup/noTopup/budgetFixture, Schluessel-/_note-Muster) werden NIE aufgeladen.
 #
 # Subscription provision is idempotent (existing active sub returned as-is).
-# Top-up is additive, not idempotent — calling the seeder multiple times adds
-# more credits, which is harmless in test environments.
+# Bis 20.10.2026 war das Top-up additiv: jeder Tier-2-Lauf des Testers lud alle 73 Report-
+# Testkonten auf der geteilten Dev-Bridge um +500 EUR auf (demo-report@: 711 Lose, 355.500 EUR;
+# depleted-budget@ nie leer). Jetzt idempotent und mit Seed-Ziel-Sperre (oben).
 # ============================================================================
 phase_header 5 "BILLING PROVISION"
 
@@ -651,8 +677,60 @@ while True:
               file=sys.stderr)
         sys.exit(1)
 
-TEST_TOPUP_EUR = 500.0  # generous test credit
+TEST_TOPUP_EUR = 500.0  # SOLLSTAND des Test-Guthabens (nicht additiv: nur die Differenz wird gutgeschrieben)
 TEST_PROJECT_SLOTS = 50  # generous project-credit slots for slot-based (interval='project') plans
+
+import re as _re
+_GRENZ_KEY_RE = _re.compile(r'(depleted|exhausted|leer|grenz|limit|zero|nobudget|kein-?budget)', _re.I)
+_GRENZ_NOTE_RE = _re.compile(r'(DEPLETED-BUDGET|all_exhausted|budget 0|kein Guthaben|keinTopup)', _re.I)
+
+def grenzkonto(key, u):
+    """Absichtliche Leer-/Grenzkonten nie aufladen (Kanzler Dev 20.10.2026): depleted-budget@ muss
+    bei 0 bleiben, damit die 402/all_exhausted-Szenarien ueberhaupt greifen. Markierung: Feld
+    keinTopup/noTopup/budgetFixture, Schluessel- oder _note-Muster."""
+    if u.get('keinTopup') or u.get('noTopup') or u.get('budgetFixture'):
+        return 'Feld keinTopup/noTopup/budgetFixture'
+    if _GRENZ_KEY_RE.search(key or ''):
+        return f'Schluessel {key!r}'
+    if _GRENZ_NOTE_RE.search(str(u.get('_note') or '')):
+        return '_note nennt DEPLETED/all_exhausted'
+    return ''
+
+def topup_bis_soll(uid, label, soll=TEST_TOPUP_EUR):
+    """Guthaben lesen, nur die Differenz bis zum Sollstand gutschreiben. Rueckgabe True bei Erfolg.
+    Bis 20.10.2026 additiv (+500 je Lauf): demo-report@ stand bei 355.500 EUR / 711 Losen."""
+    try:
+        r = requests.get(f'${BRIDGE_URL}/v1/budget/{uid}', headers=headers, timeout=15)
+    except requests.RequestException as e:
+        print(f"  [FAIL]  {label}: budget read error — {e}", file=sys.stderr)
+        return False
+    if r.status_code != 200:
+        print(f"  [FAIL]  {label}: GET /v1/budget/{{uid}} HTTP {r.status_code} — {r.text[:200]}", file=sys.stderr)
+        return False
+    try:
+        ist = float(r.json().get('topUpBalanceEur') or 0.0)
+    except (ValueError, TypeError, AttributeError):
+        print(f"  [FAIL]  {label}: budget response ohne topUpBalanceEur", file=sys.stderr)
+        return False
+    fehlt = round(soll - ist, 2)
+    if fehlt <= 0:
+        print(f"  [ok]    Guthaben EUR {ist:.2f} >= Soll EUR {soll:.2f} — kein Top-up: {label}")
+        return True
+    try:
+        r = requests.post(
+            f'${BRIDGE_URL}/v1/budget/topup/credit',
+            json={'userId': uid, 'amountEur': fehlt},
+            headers=headers,
+            timeout=15,
+        )
+    except requests.RequestException as e:
+        print(f"  [FAIL]  {label}: topup request error — {e}", file=sys.stderr)
+        return False
+    if r.status_code == 200:
+        print(f"  [ok]    Top-up +EUR {fehlt:.2f} (Ist {ist:.2f} -> Soll {soll:.2f}) → balance EUR {r.json().get('newBalance', '?')}: {label}")
+        return True
+    print(f"  [FAIL]  {label}: topup HTTP {r.status_code} — {r.text[:200]}", file=sys.stderr)
+    return False
 
 ok = True
 for key, u in users.items():
@@ -704,25 +782,13 @@ for key, u in users.items():
         ok = False
         continue
 
-    # 2. Top-up credit (additive — multiple seeds accumulate, harmless for tests)
-    try:
-        r = requests.post(
-            '${BRIDGE_URL}/v1/budget/topup/credit',
-            json={'userId': uid, 'amountEur': TEST_TOPUP_EUR},
-            headers=headers,
-            timeout=15,
-        )
-    except requests.RequestException as e:
-        print(f"  [FAIL]  User {key}: topup request error — {e}", file=sys.stderr)
+    # 2. Top-up credit — bis zum Sollstand, nie additiv; Grenzkonten nie aufladen.
+    grund = grenzkonto(key, u)
+    if grund:
+        print(f"  [info]  Grenzkonto — kein Top-up ({grund}): {key} ({u['email']})")
+    elif not topup_bis_soll(uid, f"User {key}"):
         ok = False
         continue
-
-    if r.status_code == 200:
-        balance = r.json().get('newBalance', '?')
-        print(f"  [ok]    Top-up +EUR {TEST_TOPUP_EUR} → balance EUR {balance}: {key}")
-    else:
-        print(f"  [FAIL]  User {key}: topup HTTP {r.status_code} — {r.text}", file=sys.stderr)
-        ok = False
 
     # 3. Project-credit SLOTS — ONLY for slot-based (interval='project') plans.
     #    Mirrors a real purchase: create a pending order, then release it (operator),
@@ -1080,7 +1146,7 @@ except requests.RequestException as e:
     print(f"  [FAIL]  GET /v1/billing/plans failed: {e}", file=sys.stderr)
     sys.exit(1)
 
-TEST_TOPUP_EUR    = 500.0  # generous test credit
+TEST_TOPUP_EUR    = 500.0  # SOLLSTAND (nicht additiv, siehe Phase 5 topup_bis_soll)
 TEST_PROJECT_SLOTS = 50   # generous project-credit slots for slot-based plans
 
 for app_id, plan_id in INTERACTIVE_APP_PLANS.items():
@@ -1105,25 +1171,39 @@ for app_id, plan_id in INTERACTIVE_APP_PLANS.items():
         print(f"  [FAIL]  provision {plan_id}: HTTP {r.status_code} — {r.text[:200]}", file=sys.stderr)
         ok = False
 
-# Step F: top-up credit — additive (same as Phase 5; harmless on re-seed)
+# Step F: top-up credit — bis zum Sollstand (Guthaben lesen, nur Differenz), nie additiv.
 try:
-    r = requests.post(
-        '${BRIDGE_URL}/v1/budget/topup/credit',
-        json={'userId': uid, 'amountEur': TEST_TOPUP_EUR},
-        headers=headers,
-        timeout=15,
-    )
-except requests.RequestException as e:
-    print(f"  [FAIL]  Top-up request error: {e}", file=sys.stderr)
+    r = requests.get(f'${BRIDGE_URL}/v1/budget/{uid}', headers=headers, timeout=15)
+    ist = float(r.json().get('topUpBalanceEur') or 0.0) if r.status_code == 200 else None
+except (requests.RequestException, ValueError, TypeError, AttributeError) as e:
+    print(f"  [FAIL]  budget read error: {e}", file=sys.stderr)
     ok = False
-    r = None
-if r is not None:
-    if r.status_code == 200:
-        balance = r.json().get('newBalance', '?')
-        print(f"  [ok]    Top-up +EUR {TEST_TOPUP_EUR} → balance EUR {balance}")
+    ist = None
+if ist is not None:
+    fehlt = round(TEST_TOPUP_EUR - ist, 2)
+    if fehlt <= 0:
+        print(f"  [ok]    Guthaben EUR {ist:.2f} >= Soll EUR {TEST_TOPUP_EUR:.2f} — kein Top-up")
     else:
-        print(f"  [FAIL]  Top-up HTTP {r.status_code} — {r.text[:200]}", file=sys.stderr)
-        ok = False
+        try:
+            r = requests.post(
+                '${BRIDGE_URL}/v1/budget/topup/credit',
+                json={'userId': uid, 'amountEur': fehlt},
+                headers=headers,
+                timeout=15,
+            )
+        except requests.RequestException as e:
+            print(f"  [FAIL]  Top-up request error: {e}", file=sys.stderr)
+            ok = False
+            r = None
+        if r is not None:
+            if r.status_code == 200:
+                print(f"  [ok]    Top-up +EUR {fehlt:.2f} (Ist {ist:.2f} -> Soll {TEST_TOPUP_EUR:.2f}) → balance EUR {r.json().get('newBalance', '?')}")
+            else:
+                print(f"  [FAIL]  Top-up HTTP {r.status_code} — {r.text[:200]}", file=sys.stderr)
+                ok = False
+elif ist is None and ok:
+    print(f"  [FAIL]  GET /v1/budget/{{uid}} HTTP {r.status_code}", file=sys.stderr)
+    ok = False
 
 # Step G: project-credit SLOTS — only for slot-based (interval='project') plans.
 # Mirrors Phase 5 pattern: check existing → create order → release.
