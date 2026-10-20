@@ -103,6 +103,8 @@ class TestMengen:
         aus_migration = {
             "anthropic", "bedrock", "research-cloud", "openai", "aws-sagemaker",
             "openai-compatible", "gemini", "local", "unrouted", "unknown",
+            # erweitert durch docker/migrations/068_usage_events_provider_convertapi.sql
+            "convertapi",
         }
         assert set(LEDGER_PROVIDERS) == aus_migration
 

@@ -82,6 +82,7 @@ from src.routing.backend_router import resolve_backend_config, get_backend_info_
 from src.activity.providers import (
     ledger_provider_for_backend,
     PROVIDER_ANTHROPIC,
+    PROVIDER_CONVERTAPI,
     PROVIDER_LOCAL,
     PROVIDER_OPENAI,
     PROVIDER_SAGEMAKER,
@@ -9452,8 +9453,64 @@ async def convert_html_to_docx_endpoint(
     request: Request,
     credentials: Optional[HTTPAuthorizationCredentials] = Depends(security)
 ):
-    """Convert HTML to DOCX via ConvertAPI. Proxied to privacy-pdf-service."""
+    """Convert HTML to DOCX via ConvertAPI. Proxied to privacy-pdf-service.
+
+    Verbucht wie /v1/convert-html-to-pdf: eine Aktivitaetszeile (usage_events,
+    KI-Aktivitaet) ueber persist_ai_call_activity, Erfolg wie Fehler, plus
+    prompt-metrics. Anders als beim PDF verlaesst das Dokument hier unsere
+    Infrastruktur (ConvertAPI-SaaS) — deshalb provider=convertapi statt local.
+    Einen Euro-Preis fuer eine ConvertAPI-Sekunde gibt es in der Preis-SSoT
+    (src/pricing.py) nicht; die Zeile bucht 0.00 EUR und traegt die von
+    ConvertAPI gemeldeten Sekunden in provider_metadata.convertapi_cost_seconds.
+
+    Budget-Gate VOR dem ConvertAPI-Aufruf: ein erschoepftes Budget antwortet
+    402, bevor Kosten entstehen (gleiches Muster wie /v1/research).
+    """
     await verify_api_key(request, credentials)
+
+    _attr = extract_attribution_context(request)
+    try:
+        from src.budget.gate import enforce_budget
+        await enforce_budget(
+            user_id=_attr.get("user_id"),
+            app_id=_attr.get("app_id"),
+            estimated_cost_eur=0.0,  # kein ConvertAPI-Preis in der SSoT; Gate sperrt "Budget weg"-Zustaende
+            project_id=_attr.get("workflow_id"),
+        )
+    except HTTPException as _budget_402:
+        # Wie im Chat-Weg: die Ablehnung sichtbar ins Ledger, damit "Budget
+        # erschoepft" nicht wie Stille aussieht. Nichts wurde gesendet → unrouted.
+        if _budget_402.status_code == 402:
+            try:
+                from src.activity.ai_call_writer import persist_ai_call_activity
+                from src.activity.providers import PROVIDER_UNROUTED
+                _detail = _budget_402.detail if isinstance(_budget_402.detail, dict) else {}
+                await persist_ai_call_activity(
+                    provider=PROVIDER_UNROUTED,
+                    app_id=_attr.get("app_id"),
+                    user_id=_attr.get("user_id"),
+                    agent_id="docx-export",
+                    workflow_id=_attr.get("workflow_id"),
+                    model="convertapi",
+                    input_tokens=0,
+                    output_tokens=0,
+                    status="error",
+                    duration_ms=0,
+                    error_code="402",
+                    error_message=str(
+                        _detail.get("message") or _detail.get("reason")
+                        or _detail.get("error") or "budget_exhausted"
+                    )[:500],
+                    app_env=_attr.get("app_env"),
+                )
+            except Exception as _log_e:  # noqa: BLE001 — never let ledger logging affect the 402 response
+                logger.error(
+                    "docx-export budget gate: failed to log the 402 rejection "
+                    "(app=%s user=%s): %s", _attr.get("app_id"), _attr.get("user_id"), _log_e,
+                )
+        raise
+    except Exception as _ge:  # noqa: BLE001 — gleiche Fail-open-Politik wie research/doc-agent
+        logger.error(f"budget gate (docx-export) unexpected error (letting call through): {_ge}")
 
     _start = time.time()
     privacy_client = get_privacy_client()
@@ -9473,18 +9530,61 @@ async def convert_html_to_docx_endpoint(
                 timeout=privacy_timeout(600.0),
             )
         response.raise_for_status()
+        _payload = response.json()
+        _duration_ms = int((time.time() - _start) * 1000)
+        try:
+            from src.activity.ai_call_writer import persist_ai_call_activity
+            _meta = {}
+            if isinstance(_payload, dict) and _payload.get("cost") is not None:
+                _meta["convertapi_cost_seconds"] = _payload.get("cost")
+            await persist_ai_call_activity(
+                provider=PROVIDER_CONVERTAPI,
+                app_id=_attr.get("app_id"),
+                user_id=_attr.get("user_id"),
+                agent_id="docx-export",
+                workflow_id=_attr.get("workflow_id"),
+                model="convertapi",
+                input_tokens=0,
+                output_tokens=0,
+                status="success",
+                duration_ms=_duration_ms,
+                app_env=_attr.get("app_env"),
+                provider_meta=_meta or None,
+            )
+        except Exception as _te:
+            logger.warning(f"docx-export activity tracking failed (non-blocking): {_te}")
         _record_document_call_metrics(
             request, agent_id="html-zu-docx", model="convertapi",
-            status="success", duration_ms=int((time.time() - _start) * 1000),
+            status="success", duration_ms=_duration_ms,
             concurrent_calls_at_start=_concurrent_before,
         )
-        return JSONResponse(content=response.json())
+        return JSONResponse(content=_payload)
 
     except Exception as e:
         logger.error(f"HTML-to-DOCX proxy failed: {e}", exc_info=True)
+        _duration_ms = int((time.time() - _start) * 1000)
+        try:
+            from src.activity.ai_call_writer import persist_ai_call_activity
+            await persist_ai_call_activity(
+                provider=PROVIDER_CONVERTAPI,
+                app_id=_attr.get("app_id"),
+                user_id=_attr.get("user_id"),
+                agent_id="docx-export",
+                workflow_id=_attr.get("workflow_id"),
+                model="convertapi",
+                input_tokens=0,
+                output_tokens=0,
+                status="error",
+                duration_ms=_duration_ms,
+                app_env=_attr.get("app_env"),
+                error_code=type(e).__name__,
+                error_message=str(e),
+            )
+        except Exception as _te:
+            logger.warning(f"docx-export error tracking failed (non-blocking): {_te}")
         _record_document_call_metrics(
             request, agent_id="html-zu-docx", model="convertapi",
-            status="error", duration_ms=int((time.time() - _start) * 1000),
+            status="error", duration_ms=_duration_ms,
             concurrent_calls_at_start=_concurrent_before, error_code=type(e).__name__,
         )
         # Unreachable dependency: metrics/activity above are recorded first

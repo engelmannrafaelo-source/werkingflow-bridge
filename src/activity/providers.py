@@ -68,6 +68,7 @@ PROVIDER_OPENAI = "openai"                  # OpenAI (Whisper STT)
 PROVIDER_SAGEMAKER = "aws-sagemaker"        # self-hosted STT model on AWS SageMaker
 PROVIDER_OPENAI_COMPATIBLE = "openai-compatible"  # OpenRouter et al. (BackendType.OPENAI_COMPATIBLE)
 PROVIDER_GEMINI = "gemini"                  # Google Gemini (CLI-OAuth ODER API-Key-Bildweg)
+PROVIDER_CONVERTAPI = "convertapi"          # ConvertAPI-SaaS (Word-Export HTML -> DOCX; Migration 068)
 
 # --- Non-external: nothing was transmitted to a third party ----------------
 PROVIDER_LOCAL = "local"
@@ -95,6 +96,7 @@ LEDGER_PROVIDERS = frozenset({
     PROVIDER_SAGEMAKER,
     PROVIDER_OPENAI_COMPATIBLE,
     PROVIDER_GEMINI,
+    PROVIDER_CONVERTAPI,
     PROVIDER_LOCAL,
     PROVIDER_UNROUTED,
     PROVIDER_UNKNOWN,
