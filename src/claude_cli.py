@@ -69,7 +69,8 @@ except Exception as patch_err:
 # FIX for system_prompt: Intercept anyio.open_process (the function the SDK
 # actually calls — NOT asyncio.create_subprocess_exec) before it reaches the OS.
 # A ContextVar carries the temp-file path for the current async task; when set,
-# --system-prompt-file <path> is appended to the claude command list instead of
+# --system-prompt-file <path> is inserted into the claude command list (directly
+# after the binary, i.e. before any `--print -- <prompt>` tail) instead of
 # --system-prompt <large_value>.
 # ContextVar gives each concurrent task its own isolated context (no global state).
 #
@@ -96,6 +97,45 @@ _current_append_sys_prompt_tempfile: ContextVar[Optional[str]] = ContextVar(
 _open_process_patch_applied: bool = False
 
 
+def _inject_cli_options(command, file_options: list) -> list:
+    """Insert (flag, value) pairs directly after the CLI binary and verify the
+    result. Raises RuntimeError when an injected flag would not be parsed as
+    an option — i.e. is missing, duplicated, or sits at/after a `--` end-of-
+    options marker (SDK string mode: `... --print -- <prompt>`). Failing here
+    aborts the request loudly instead of letting the CLI run without the
+    system prompt and still answer 200.
+    """
+    extra: list = []
+    for flag, value in file_options:
+        extra.extend([flag, value])
+    new_command = [command[0], *extra, *list(command)[1:]]
+    _verify_cli_options(new_command, file_options)
+    return new_command
+
+
+def _verify_cli_options(new_command: list, file_options: list) -> None:
+    """Post-condition for _inject_cli_options: each flag exactly once, with
+    its value, before any `--`. Raises RuntimeError otherwise."""
+    try:
+        end_of_options = new_command.index("--")
+    except ValueError:
+        end_of_options = len(new_command)
+    for flag, value in file_options:
+        positions = [i for i, a in enumerate(new_command) if a == flag]
+        option_positions = [i for i in positions if i < end_of_options]
+        if (
+            len(option_positions) != 1
+            or option_positions[0] + 1 >= end_of_options
+            or new_command[option_positions[0] + 1] != value
+        ):
+            raise RuntimeError(
+                f"open_process patch: {flag} is not a parsed CLI option in the final "
+                f"argv (found at {positions}, end-of-options '--' at "
+                f"{end_of_options if end_of_options < len(new_command) else 'none'}). "
+                f"The CLI would run WITHOUT this prompt part — refusing to spawn."
+            )
+
+
 def _apply_open_process_patch() -> None:
     """Monkey-patch anyio.open_process once at module load.
 
@@ -105,9 +145,17 @@ def _apply_open_process_patch() -> None:
     whose first element is the claude binary path (shutil.which("claude")).
 
     When _current_sys_prompt_tempfile is set for the current async task, this
-    patch appends ["--system-prompt-file", <path>] to that command list so the
+    patch inserts ["--system-prompt-file", <path>] into that command list so the
     CLI reads the (oversized) system prompt from a file instead of argv.
     ContextVar isolates concurrent async tasks.
+
+    Position matters: in string mode the SDK ends the command with
+    `--print -- <prompt>`; anything after `--` is a positional argument, so an
+    appended option was silently ignored and the system prompt never reached
+    the model (HTTP 200 regardless — Mühl P1, 20.10.2026). The options are
+    therefore inserted right after the binary and the final argv is verified
+    by _inject_cli_options(), which raises instead of spawning a CLI that would
+    run without its system prompt.
 
     The SDK does `import anyio` and calls `anyio.open_process` (attribute lookup
     at call time), so patching the anyio module attribute is sufficient. We
@@ -133,23 +181,22 @@ def _apply_open_process_patch() -> None:
             # deadline can be killed as a whole (_bounded_transport_close) —
             # without ever touching the worker's own group.
             kwargs.setdefault("start_new_session", True)
+            # options.system_prompt / append_system_prompt were intentionally
+            # NOT set when a temp file exists (so the SDK did not add the big
+            # argv value). Inject the file variants instead, which the claude
+            # CLI reads off-argv.
+            file_options: list = []
             tempfile_path = _current_sys_prompt_tempfile.get()
             if tempfile_path:
-                # options.system_prompt was intentionally NOT set for this request
-                # (so the SDK did not add --system-prompt <big>). Inject the file
-                # variant instead, which the claude CLI reads off-argv.
-                command = list(command) + ["--system-prompt-file", tempfile_path]
-                logger.debug(
-                    f"🔧 open_process patch: injected --system-prompt-file {tempfile_path!r}"
-                )
+                file_options.append(("--system-prompt-file", tempfile_path))
             append_tempfile_path = _current_append_sys_prompt_tempfile.get()
             if append_tempfile_path:
-                command = list(command) + [
-                    "--append-system-prompt-file", append_tempfile_path
-                ]
+                file_options.append(("--append-system-prompt-file", append_tempfile_path))
+            if file_options:
+                command = _inject_cli_options(command, file_options)
                 logger.debug(
-                    f"🔧 open_process patch: injected --append-system-prompt-file "
-                    f"{append_tempfile_path!r}"
+                    f"🔧 open_process patch: injected {[f for f, _ in file_options]} "
+                    f"before the prompt tail"
                 )
         process = await _original_open_process(command, *args, **kwargs)
         if is_claude_cmd and kwargs.get("start_new_session"):
@@ -2673,6 +2720,29 @@ class ClaudeCodeCLI:
                             # it and rejected healthy responses.
                             if type(message).__name__ == 'ResultMessage':
                                 _sdk_result_seen.set()
+                                # Wächter: a system prompt delivered via file must
+                                # show up in the billed input. Real text runs at
+                                # ~2-4 chars/token; less than chars/8 means the
+                                # model did not see it (Mühl P1, 20.10.2026:
+                                # 241,551 chars sent, 8,303 tokens read).
+                                if _sys_prompt_tempfile_path and system_prompt:
+                                    _u = getattr(message, 'usage', None) or {}
+                                    _gelesen = sum(
+                                        int(_u.get(k) or 0) for k in (
+                                            'input_tokens',
+                                            'cache_read_input_tokens',
+                                            'cache_creation_input_tokens',
+                                        )
+                                    )
+                                    _untergrenze = len(system_prompt) // 8
+                                    if _u and _gelesen < _untergrenze:
+                                        logger.error(
+                                            f"🚨 system_prompt via file NOT reflected in usage: "
+                                            f"read {_gelesen:,} input tokens, expected at least "
+                                            f"{_untergrenze:,} for a {len(system_prompt):,}-char "
+                                            f"system prompt — the model likely ran without it",
+                                            extra={"cli_session_id": cli_session_id},
+                                        )
                                 _result_subtype = getattr(message, 'subtype', None)
                                 if _result_subtype in ('complete', 'success'):
                                     response_complete = True
