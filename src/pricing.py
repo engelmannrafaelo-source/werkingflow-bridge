@@ -134,6 +134,9 @@ CACHE_READ_MULT = 0.10
 # on top of cost_usd()'s token-based total (see cost_usd's search_count arg).
 WEB_SEARCH_FEE_USD = 0.01
 
+# Vertex AI EU-Multi-Region: +10 % auf Listenpreis (Google/Anthropic, 21.10.2026).
+VERTEX_EU_PRICE_MULT = 1.10
+
 _DEFAULT_USD_TO_EUR = 0.92
 
 
