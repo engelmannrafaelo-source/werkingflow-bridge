@@ -10,6 +10,7 @@ GET  /v1/system/health   require_admin
 from __future__ import annotations
 
 import asyncio
+import os
 import time
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
@@ -22,26 +23,60 @@ from src.db.client import get_pool
 
 router = APIRouter(prefix="/v1/system", tags=["system"])
 
-# Known app health-check URLs. The aggregator probes each in parallel and
-# folds the responses into one panel-friendly snapshot. URLs configurable
-# via env later — hard-coded here for v1 to keep the surface small.
+# Known app health checks: (app id, default base URL, health path). The aggregator
+# probes each in parallel and folds the responses into one panel-friendly snapshot.
+#
+# The default base is the app's *.vercel.app alias. Once Vercel deployment
+# protection is on, that alias answers 401 without a bypass header, so every
+# app can be redirected per environment, nothing is hard-wired:
+#   APP_HEALTH_BASE_<APP>    own domain of the app (e.g. https://app.example.com)
+#   APP_HEALTH_BYPASS_<APP>  protection bypass secret, sent as
+#                            x-vercel-protection-bypass (for apps without own domain)
+# <APP> is the app id upper-cased with "-" -> "_" (WERKING_ENERGY).
+# Where to set them: this route runs in the platform-api service, whose environment is
+# secrets/platform.env (env_file in docker/docker-compose-*platform*.yml). That file is
+# maintained by hand per Bridge host (dev Bridge and server2/prod); sync-infisical-to-bridge
+# does not reach it. Redirects are never followed: a 3xx is reported as unhealthy.
 _APP_HEALTH_TARGETS = [
-    ("werking-report", "https://werking-report.vercel.app/api/admin/health"),
-    ("werking-energy",  "https://werking-energy.vercel.app/api/health"),
-    ("werking-safety",  "https://werking-safety.vercel.app/api/health"),
-    ("werking-noise",   "https://werking-noise.vercel.app/api/health"),
-    ("engelmann",       "https://engelmann.vercel.app/api/health"),
+    ("werking-report", "https://werking-report.vercel.app", "/api/admin/health"),
+    ("werking-energy", "https://werking-energy.vercel.app", "/api/health"),
+    ("werking-safety", "https://werking-safety.vercel.app", "/api/health"),
+    ("werking-noise",  "https://werking-noise.vercel.app",  "/api/health"),
+    ("engelmann",      "https://engelmann.vercel.app",      "/api/health"),
 ]
-_ALLOWED_APP_IDS = {name for name, _ in _APP_HEALTH_TARGETS}
+_ALLOWED_APP_IDS = {name for name, _, _ in _APP_HEALTH_TARGETS}
 _PROBE_TIMEOUT_S = 4.0
 
 
-async def _probe_app(client: httpx.AsyncClient, name: str, url: str) -> Dict[str, Any]:
+def _app_env_key(name: str) -> str:
+    return name.upper().replace("-", "_")
+
+
+def _resolve_target(name: str, default_base: str, path: str) -> tuple[str, Dict[str, str]]:
+    """URL + request headers for one app, from env overrides (see above)."""
+    key = _app_env_key(name)
+    base = (os.environ.get(f"APP_HEALTH_BASE_{key}") or default_base).rstrip("/")
+    bypass = (os.environ.get(f"APP_HEALTH_BYPASS_{key}") or "").strip()
+    headers = {"x-vercel-protection-bypass": bypass} if bypass else {}
+    return base + path, headers
+
+
+async def _probe_app(
+    client: httpx.AsyncClient, name: str, url: str, headers: Optional[Dict[str, str]] = None
+) -> Dict[str, Any]:
     """Probe an app's health endpoint. Returns a panel-friendly status dict."""
     started = time.monotonic()
     try:
-        r = await client.get(url, timeout=_PROBE_TIMEOUT_S)
+        r = await client.get(url, headers=headers or None, timeout=_PROBE_TIMEOUT_S)
         latency_ms = int((time.monotonic() - started) * 1000)
+        if r.is_redirect:
+            # Protected deployments answer 302 -> vercel.com login (HTTP 200 there).
+            # Never follow: that would look healthy and send the bypass header to a foreign host.
+            return {
+                "name": name, "url": url, "status": "unhealthy", "httpStatus": r.status_code,
+                "latencyMs": latency_ms,
+                "error": "redirect (protection without valid bypass?) - not followed",
+            }
         return {
             "name": name,
             "url": url,
@@ -118,15 +153,16 @@ async def system_health_overview(
     if app and app not in _ALLOWED_APP_IDS:
         raise HTTPException(status_code=400, detail=f"Unknown app: {app}")
 
-    targets = (
-        [(name, url) for name, url in _APP_HEALTH_TARGETS if name == app]
-        if app else _APP_HEALTH_TARGETS
-    )
+    targets = [
+        (name, *_resolve_target(name, base, path))
+        for name, base, path in _APP_HEALTH_TARGETS
+        if not app or name == app
+    ]
 
     db_task = asyncio.create_task(_db_snapshot())
-    async with httpx.AsyncClient(follow_redirects=True) as client:
+    async with httpx.AsyncClient(follow_redirects=False) as client:
         app_results = await asyncio.gather(
-            *(_probe_app(client, name, url) for name, url in targets),
+            *(_probe_app(client, name, url, hdrs) for name, url, hdrs in targets),
             return_exceptions=False,
         )
     db = await db_task
