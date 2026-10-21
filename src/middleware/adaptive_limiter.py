@@ -462,6 +462,7 @@ class AdaptiveLoadLimiter:
 
         weekly = float(weekly_raw)
         session = float(session_raw)
+        self._maybe_release_capacity_lock(weekly, session, snap_ts)
         self._maybe_set_capacity_lock(acc)
         if not self._account_usage.get("known"):
             logger.info(
@@ -480,6 +481,32 @@ class AdaptiveLoadLimiter:
             "reason": "",
         }
 
+
+    def _maybe_release_capacity_lock(
+        self, weekly_pct: float, session_pct: float, snap_ts: Optional[float]
+    ) -> None:
+        """End a weekly/session quota lock once a fresh measurement of THIS
+        worker's account is back below the wall.
+
+        Same account: the values come from latest_for_account(WORKER_ACCOUNT),
+        and the lock is keyed by this worker, which is bound to that account.
+        Same window: weekly_window is checked against weeklyAllModels, the
+        field _maybe_set_capacity_lock reads to set it; session_window against
+        currentSession. Fresh: the caller already rejected snapshots older than
+        CC_USAGE_MAX_AGE_SEC, and the lock itself rejects any snapshot that
+        predates the lock.
+        """
+        if snap_ts is None:
+            return
+        try:
+            from src.middleware.capacity_lock import get_capacity_lock
+            get_capacity_lock().release_quota_lock(
+                self.worker,
+                {"weekly_window": weekly_pct, "session_window": session_pct},
+                float(snap_ts),
+            )
+        except Exception as e:
+            logger.error(f"_maybe_release_capacity_lock failed: {e}")
 
     def _maybe_set_capacity_lock(self, acc: dict) -> None:
         """Lock this worker until Anthropic's reported reset time when at quota wall (≥95%)."""
