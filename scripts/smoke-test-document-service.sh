@@ -16,6 +16,17 @@ HOST="${1:-http://localhost:8100}"
 SCRATCH="$(mktemp -d)"
 trap 'rm -rf "$SCRATCH"' EXIT
 
+# Der Dienst verlangt ausser /health ein Bearer-Token (PRIVACY_SERVICE_TOKEN).
+# Der Header liegt in einer Datei (nicht in argv), damit er in `ps` nicht sichtbar wird.
+AUTH_HDR="$SCRATCH/.auth"
+if [[ -n "${PRIVACY_SERVICE_TOKEN:-}" ]]; then
+    (umask 077; printf 'Authorization: Bearer %s\n' "$PRIVACY_SERVICE_TOKEN" > "$AUTH_HDR")
+else
+    : > "$AUTH_HDR"
+    echo "WARNUNG: PRIVACY_SERVICE_TOKEN nicht gesetzt - Aufrufe gehen ohne Anmeldung, ein Dienst mit Pflicht antwortet 401." >&2
+fi
+api() { curl -H "@$AUTH_HDR" "$@"; }
+
 green()  { printf '\033[32m%s\033[0m\n' "$*"; }
 red()    { printf '\033[31m%s\033[0m\n' "$*"; }
 yellow() { printf '\033[33m%s\033[0m\n' "$*"; }
@@ -43,7 +54,7 @@ assert_jq_success() {
 
 # ---- Health ----
 yellow "→ /health"
-HEALTH=$(curl -fsS "$HOST/health" || true)
+HEALTH=$(api -fsS "$HOST/health" || true)
 if [[ "$(echo "$HEALTH" | jq -r '.status // empty')" == "healthy" ]]; then
     green "  ✓ healthy"
     PASS=$((PASS + 1))
@@ -55,13 +66,13 @@ fi
 # ---- CSV ----
 yellow "→ /document/convert (CSV)"
 printf 'name,city\nAlice,Wien\nBob,Graz\n' > "$SCRATCH/sample.csv"
-RESPONSE=$(curl -fsS -F "file=@$SCRATCH/sample.csv" "$HOST/document/convert" || true)
+RESPONSE=$(api -fsS -F "file=@$SCRATCH/sample.csv" "$HOST/document/convert" || true)
 assert_jq_success "CSV adapter" "$SCRATCH/sample.csv" "csv" "$RESPONSE"
 
 # ---- HTML ----
 yellow "→ /document/convert (HTML)"
 printf '<html><body><h1>Hi</h1><p>Hello</p></body></html>' > "$SCRATCH/sample.html"
-RESPONSE=$(curl -fsS -F "file=@$SCRATCH/sample.html" "$HOST/document/convert" || true)
+RESPONSE=$(api -fsS -F "file=@$SCRATCH/sample.html" "$HOST/document/convert" || true)
 assert_jq_success "HTML adapter" "$SCRATCH/sample.html" "html" "$RESPONSE"
 
 # ---- EML ----
@@ -74,7 +85,7 @@ Content-Type: text/plain; charset=utf-8
 
 Body text.
 EOF
-RESPONSE=$(curl -fsS -F "file=@$SCRATCH/sample.eml" "$HOST/document/convert" || true)
+RESPONSE=$(api -fsS -F "file=@$SCRATCH/sample.eml" "$HOST/document/convert" || true)
 assert_jq_success "EML adapter" "$SCRATCH/sample.eml" "eml" "$RESPONSE"
 
 # ---- XLSX ---- (build via python in the container if openpyxl available)
@@ -97,14 +108,14 @@ except ImportError:
 PY
 
 if [[ -s "$SCRATCH/sample.xlsx" ]]; then
-    RESPONSE=$(curl -fsS -F "file=@$SCRATCH/sample.xlsx" "$HOST/document/convert" || true)
+    RESPONSE=$(api -fsS -F "file=@$SCRATCH/sample.xlsx" "$HOST/document/convert" || true)
     assert_jq_success "XLSX adapter" "$SCRATCH/sample.xlsx" "xlsx" "$RESPONSE"
 fi
 
 # ---- Unsupported format → expect 415 ----
 yellow "→ /document/convert (unsupported extension)"
 echo "binary blob" > "$SCRATCH/sample.xyz"
-HTTP_CODE=$(curl -s -o "$SCRATCH/_resp" -w "%{http_code}" -F "file=@$SCRATCH/sample.xyz" "$HOST/document/convert")
+HTTP_CODE=$(api -s -o "$SCRATCH/_resp" -w "%{http_code}" -F "file=@$SCRATCH/sample.xyz" "$HOST/document/convert")
 if [[ "$HTTP_CODE" == "415" ]]; then
     green "  ✓ 415 Unsupported Media Type"
     PASS=$((PASS + 1))
@@ -118,7 +129,7 @@ fi
 # ---- Empty file → expect 400 ----
 yellow "→ /document/convert (empty)"
 : > "$SCRATCH/empty.csv"
-HTTP_CODE=$(curl -s -o "$SCRATCH/_resp" -w "%{http_code}" -F "file=@$SCRATCH/empty.csv" "$HOST/document/convert")
+HTTP_CODE=$(api -s -o "$SCRATCH/_resp" -w "%{http_code}" -F "file=@$SCRATCH/empty.csv" "$HOST/document/convert")
 if [[ "$HTTP_CODE" == "400" ]]; then
     green "  ✓ 400 Empty"
     PASS=$((PASS + 1))

@@ -147,9 +147,10 @@ conversion and the Python extras `privacy + pdf + documents` from
 Smoke test once the container is up:
 
 ```bash
+# Alle Pfade ausser /health brauchen: -H "Authorization: Bearer $PRIVACY_SERVICE_TOKEN"
 curl http://localhost:8100/health
-curl -F file=@sample.csv http://localhost:8100/document/convert
-curl -F file=@sample.docx http://localhost:8100/document/convert
+curl -H "Authorization: Bearer $PRIVACY_SERVICE_TOKEN" -F file=@sample.csv http://localhost:8100/document/convert
+curl -H "Authorization: Bearer $PRIVACY_SERVICE_TOKEN" -F file=@sample.docx http://localhost:8100/document/convert
 ```
 
 ## Tests
