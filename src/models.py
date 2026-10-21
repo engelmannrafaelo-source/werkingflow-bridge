@@ -29,6 +29,9 @@ class BackendType(str, Enum):
                                        # die Bildanalyse, auf prod gesperrt — siehe
                                        # src/routing/gemini_vision_gate.py. Nicht zu verwechseln mit
                                        # GEMINI_CLI (OAuth-Subprozess, ohne Bildeingabe).
+    VERTEX_EU = "vertex_eu"            # Claude ueber Google Vertex AI, locations/eu (Service-Account
+                                       # GCP_VERTEX_SA_JSON). Nur per Operator-Pin, Schalter
+                                       # VERTEX_EU_ENABLED standardmaessig aus — src/vertex_eu_service.py.
 
 
 class PrivacyMode(str, Enum):

@@ -347,6 +347,11 @@ def _requests_bedrock_explicitly(request_body: Any) -> bool:
     (e.g. 'claude-dsgvo')."""
     if getattr(request_body, "backend", None) == BackendType.BEDROCK:
         return True
+    # Vertex EU (21.10.2026) ist ebenso pin-only und Echtgeld: ein Client-
+    # Opt-in darf von der App-Regel nicht still auf den Pool umgeschrieben
+    # werden, sondern muss am Vertex-Gate laut abgewiesen werden (403).
+    if getattr(request_body, "backend", None) == BackendType.VERTEX_EU:
+        return True
     tier_id = getattr(request_body, "provider_tier", None)
     if not tier_id:
         return False

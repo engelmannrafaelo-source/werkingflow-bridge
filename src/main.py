@@ -3466,6 +3466,32 @@ async def _chat_completions_lauf(
                     }
                 )
 
+        # VERTEX-EU-GATE: Pin, Umgebung, Zuordnung — gleiche Fragen wie Bedrock.
+        if backend_config and backend_config.backend == BackendType.VERTEX_EU:
+            from src.routing.user_provider_override import (
+                assert_vertex_eu_allowed, VertexEUGateError,
+            )
+            _vertex_attr = extract_attribution_context(request)
+            try:
+                assert_vertex_eu_allowed(
+                    backend_config.backend,
+                    operator_pinned_provider,
+                    app_env=_vertex_attr["app_env"],
+                    app_id=_vertex_attr.get("app_id"),
+                )
+            except VertexEUGateError as e:
+                raise HTTPException(
+                    status_code=e.status,
+                    detail={
+                        "error": {
+                            "message": str(e),
+                            "type": "permission_error" if e.status == 403 else "invalid_request_error",
+                            "code": e.code,
+                            "retryable": False,
+                        }
+                    },
+                )
+
         # =======================================================================
         # BEDROCK ROUTING: Direct boto3 call, bypass Claude Code SDK
         # =======================================================================
@@ -3618,6 +3644,148 @@ async def _chat_completions_lauf(
                 )
 
                 return response
+
+        # =======================================================================
+        # VERTEX-EU ROUTING: Claude ueber Google Vertex AI, locations/eu
+        # (src/vertex_eu_service.py). Nur erreichbar ueber den Operator-Pin
+        # provider_config.provider='vertex_eu' und VERTEX_EU_ENABLED; das Gate
+        # oben hat Pin, Umgebung und Zuordnung schon geprueft. Gebucht wird wie
+        # Bedrock ueber persist_ai_call_activity (usage_events, provider
+        # 'vertex-eu'), Strom genau einmal im finally.
+        # =======================================================================
+        if backend_config and backend_config.backend == BackendType.VERTEX_EU:
+            from src.vertex_eu_service import call_vertex_eu, stream_vertex_eu
+            from src.activity.ai_call_writer import persist_ai_call_activity
+            from src.activity.providers import PROVIDER_VERTEX_EU
+            logger.info(f"🔀 Routing to Vertex EU (location={backend_config.region})")
+            vertex_attribution = extract_attribution_context(request)
+
+            async def _persist_vertex_usage(
+                *, input_tokens: int, output_tokens: int, status: str,
+                duration_ms: int, provider_meta: dict, error_code: Optional[str] = None,
+                error_message: Optional[str] = None,
+                cache_read_tokens: int = 0, cache_creation_tokens: int = 0,
+            ) -> None:
+                if status != "success":
+                    request.state.ai_call_error_persisted = True
+                await persist_ai_call_activity(
+                    app_id=vertex_attribution.get("app_id"),
+                    user_id=vertex_attribution.get("user_id"),
+                    agent_id=vertex_attribution.get("agent_id"),
+                    workflow_id=vertex_attribution.get("workflow_id"),
+                    model=resolved_model,
+                    input_tokens=input_tokens,
+                    output_tokens=output_tokens,
+                    cache_read_tokens=cache_read_tokens,
+                    cache_creation_tokens=cache_creation_tokens,
+                    status=status,
+                    duration_ms=duration_ms,
+                    error_code=error_code,
+                    error_message=error_message,
+                    app_env=vertex_attribution.get("app_env"),
+                    provider=PROVIDER_VERTEX_EU,
+                    provider_meta=provider_meta,
+                    region=provider_meta.get("location") or backend_config.region,
+                )
+
+            if request_body.stream:
+                vertex_usage_sink: Dict[str, Any] = {}
+
+                async def _tracked_vertex_stream():
+                    cut_off = False
+                    try:
+                        async for chunk in stream_vertex_eu(
+                            request_body, usage_sink=vertex_usage_sink
+                        ):
+                            yield chunk
+                    except _STREAM_CUT_OFF:
+                        cut_off = True
+                        raise
+                    finally:
+                        await _shielded_booking(_book_vertex_stream(cut_off))
+
+                async def _book_vertex_stream(cut_off: bool) -> None:
+                    from src.activity.delivery import (
+                        ERROR_CODE_CALLER_GONE,
+                        STATUS_UNDELIVERED,
+                        caller_gone,
+                    )
+                    sink = vertex_usage_sink
+                    status = sink.get("status", "error")
+                    error_code = None if status == "success" else (sink.get("error_code") or "stream_aborted")
+                    error_message = sink.get("error_message")
+                    if cut_off and status != "success":
+                        if sink.get("input_tokens") or sink.get("output_tokens"):
+                            status = STATUS_UNDELIVERED
+                        gone = await caller_gone()
+                        error_code = ERROR_CODE_CALLER_GONE if gone else "stream_cancelled"
+                        error_message = error_message or (
+                            "Vertex-EU-Strom abgebrochen, "
+                            + ("der Aufrufer war weg" if gone else "die Anfrage wurde abgesagt")
+                            + " — gebucht ist der Verbrauch bis zum Abbruch."
+                        )
+                    await _persist_vertex_usage(
+                        input_tokens=sink.get("input_tokens", 0),
+                        output_tokens=sink.get("output_tokens", 0),
+                        cache_read_tokens=sink.get("cache_read_tokens", 0),
+                        cache_creation_tokens=sink.get("cache_creation_tokens", 0),
+                        status=status,
+                        duration_ms=int((time.time() - start_time) * 1000),
+                        error_code=error_code,
+                        error_message=error_message,
+                        provider_meta={
+                            "vertex_model_id": sink.get("vertex_model_id"),
+                            "location": sink.get("location"),
+                            "provider_request_id": sink.get("provider_request_id"),
+                            "user_pinned": bool(operator_pinned_provider),
+                        },
+                    )
+
+                return await event_stream_response(
+                    _tracked_vertex_stream(),
+                    headers={
+                        "Cache-Control": "no-cache",
+                        "Connection": "keep-alive",
+                        "X-Backend": "vertex_eu",
+                        "X-Backend-Region": backend_config.region or "eu",
+                    }
+                )
+
+            try:
+                vertex_response = await call_vertex_eu(request_body)
+            except HTTPException as vertex_err:
+                _vd = vertex_err.detail if isinstance(vertex_err.detail, dict) else {}
+                await _persist_vertex_usage(
+                    input_tokens=0, output_tokens=0, status="error",
+                    duration_ms=int((time.time() - start_time) * 1000),
+                    error_code=str(_vd.get("code") or vertex_err.status_code),
+                    error_message=str(_vd.get("message", vertex_err.detail))[:500],
+                    provider_meta={
+                        "vertex_model_id": backend_config.provider_model,
+                        "location": backend_config.region,
+                        "http_status": vertex_err.status_code,
+                        "user_pinned": bool(operator_pinned_provider),
+                    },
+                )
+                raise
+            duration = time.time() - start_time
+            _vu = vertex_response.get("usage") or {}
+            logger.info(f"✅ Vertex EU request completed in {duration:.2f}s")
+            await _persist_vertex_usage(
+                input_tokens=_vu.get("prompt_tokens", 0) or 0,
+                output_tokens=_vu.get("completion_tokens", 0) or 0,
+                cache_read_tokens=_vu.get("cache_read_input_tokens", 0) or 0,
+                cache_creation_tokens=_vu.get("cache_creation_input_tokens", 0) or 0,
+                status="success",
+                duration_ms=int(duration * 1000),
+                provider_meta={
+                    "vertex_model_id": backend_config.provider_model,
+                    "location": backend_config.region,
+                    "provider_request_id": (vertex_response.get("x_backend_info") or {}).get("provider_request_id"),
+                    "user_pinned": bool(operator_pinned_provider),
+                },
+            )
+            return vertex_response
 
         # =======================================================================
         # ANTHROPIC-DIRECT ROUTING (primary): prepaid Messages-API key, no CLI
@@ -7529,6 +7697,20 @@ async def research(
     # untouched.
     from src.research_cloud.routing import global_pin_defers_to_research_pin
 
+    if _research_pinned == "vertex_eu":
+        # Kein Research auf Vertex EU (keine WebSearch dort, nicht gebaut) und
+        # bewusst KEINE Bedrock-artige Ausnahme: die wurde fuer Bedrock von
+        # Rafael entschieden (27.07.), fuer Vertex nicht. Laut abweisen.
+        return ResearchResponse(
+            status="error",
+            query=request_body.query,
+            model=request_body.model,
+            error=(
+                "user provider pin 'vertex_eu' cannot serve research (no web search "
+                "on the Vertex EU path) — refused, no fallback by design"
+            ),
+        )
+
     _use_research_cloud = False
     if _research_pinned == "bedrock":
         # RESEARCH EXCEPTION TO THE GLOBAL BEDROCK PIN (Rafael 2026-07-27):
@@ -11363,7 +11545,7 @@ async def bridge_error_handler(request: Request, exc: BridgeError):
         # Provider-pinned traffic (users.provider_config, e.g. Bedrock for
         # DSGVO) must NEVER be rerouted to a different provider tier — the
         # pin exists precisely to guarantee where the data goes.
-        if getattr(request.state, "user_provider_pinned", None) or cached_body.get("backend") == "bedrock":
+        if getattr(request.state, "user_provider_pinned", None) or cached_body.get("backend") in ("bedrock", "vertex_eu"):
             return exc.response
 
         # Only attempt for retryable bridge-side errors (not, e.g., auth failures).

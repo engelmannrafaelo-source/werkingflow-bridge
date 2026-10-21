@@ -69,6 +69,7 @@ PROVIDER_SAGEMAKER = "aws-sagemaker"        # self-hosted STT model on AWS SageM
 PROVIDER_OPENAI_COMPATIBLE = "openai-compatible"  # OpenRouter et al. (BackendType.OPENAI_COMPATIBLE)
 PROVIDER_GEMINI = "gemini"                  # Google Gemini (CLI-OAuth ODER API-Key-Bildweg)
 PROVIDER_CONVERTAPI = "convertapi"          # ConvertAPI-SaaS (Word-Export HTML -> DOCX; Migration 068)
+PROVIDER_VERTEX_EU = "vertex-eu"            # Claude ueber Google Vertex AI, EU-Multiregion (Migration 069)
 
 # --- Non-external: nothing was transmitted to a third party ----------------
 PROVIDER_LOCAL = "local"
@@ -97,12 +98,13 @@ LEDGER_PROVIDERS = frozenset({
     PROVIDER_OPENAI_COMPATIBLE,
     PROVIDER_GEMINI,
     PROVIDER_CONVERTAPI,
+    PROVIDER_VERTEX_EU,
     PROVIDER_LOCAL,
     PROVIDER_UNROUTED,
     PROVIDER_UNKNOWN,
 })
 
-REAL_COST_PROVIDERS = frozenset({PROVIDER_BEDROCK, PROVIDER_RESEARCH_CLOUD})
+REAL_COST_PROVIDERS = frozenset({PROVIDER_BEDROCK, PROVIDER_RESEARCH_CLOUD, PROVIDER_VERTEX_EU})
 """Providers whose calls cost us real money per call, so the ledger's
 real_cost_eur must carry the computed cost instead of 0.0. Verbatim the
 pre-existing behaviour of ``resolve_ledger_cost`` — see the module docstring
@@ -127,6 +129,11 @@ _BACKEND_TO_PROVIDER = {
     # Migration am CHECK-Constraint aus 053 und liesse jede bestehende
     # Datenschutz-Auswertung auf provider='gemini' still danebengreifen).
     BackendType.GEMINI_API: PROVIDER_GEMINI,
+    # Eigene Vokabel statt 'gemini': Empfaenger ist zwar Google, aber Modell
+    # (Claude), Abrechnung (GCP pay-per-token) und Datenresidenz-Zusage
+    # (locations/eu) sind andere — eine Auswertung auf provider='gemini'
+    # darf diese Zeilen nicht still mitzaehlen.
+    BackendType.VERTEX_EU: PROVIDER_VERTEX_EU,
 }
 
 

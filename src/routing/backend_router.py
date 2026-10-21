@@ -68,6 +68,7 @@ def resolve_backend_config(
 
     env_vars = {}
     bedrock_model_id = None
+    vertex_model = None
     region = None
 
     if backend == BackendType.BEDROCK:
@@ -91,6 +92,21 @@ def resolve_backend_config(
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
         logger.info(f"🔀 Backend routing: bedrock (region={region}, model={bedrock_model_id})")
+    elif backend == BackendType.VERTEX_EU:
+        # Schalter + Zugangsdaten hier pruefen: fehlt eines, wirft das einen
+        # RuntimeError, den main.py fuer einen gepinnten Nutzer als 503
+        # user_provider_override_unavailable meldet — kein Rueckfall.
+        from src.vertex_eu_service import (
+            VertexEUError, readiness, vertex_model_id, DEFAULT_LOCATION,
+        )
+        import os as _os
+        readiness()
+        region = _os.getenv("VERTEX_EU_LOCATION") or DEFAULT_LOCATION
+        try:
+            vertex_model = vertex_model_id(model)
+        except VertexEUError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        logger.info(f"🔀 Backend routing: vertex_eu (location={region}, model={vertex_model})")
     else:
         logger.debug("🔀 Backend routing: anthropic (default SDK)")
 
@@ -103,7 +119,8 @@ def resolve_backend_config(
         model_id=model,
         bedrock_model_id=bedrock_model_id,
         privacy_enabled=privacy_enabled,
-        env_vars=env_vars
+        env_vars=env_vars,
+        provider_model=vertex_model,
     )
 
 
@@ -272,6 +289,10 @@ def _resolve_privacy_mode(
         return True
 
     # AUTO mode
+    if backend == BackendType.VERTEX_EU:
+        # Gleiches Urteil wie Bedrock EU: Verarbeitung in locations/eu.
+        logger.info("🔒 Privacy auto-disabled: Vertex EU (locations/eu)")
+        return False
     if backend == BackendType.BEDROCK and region:
         # Disable privacy for EU regions (data residency guaranteed)
         is_eu_region = region.startswith("eu-")
