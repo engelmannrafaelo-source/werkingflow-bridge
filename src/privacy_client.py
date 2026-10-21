@@ -21,6 +21,30 @@ logger = logging.getLogger(__name__)
 # Internal Docker service URL
 PRIVACY_SERVICE_URL = os.getenv("PRIVACY_SERVICE_URL", "http://privacy-service:8100")
 
+# Bearer token for the privacy service (Infisical key PRIVACY_SERVICE_TOKEN).
+# Read per client construction, never logged. Unset = calls go out without
+# Authorization, exactly as before the service required one; that state is
+# logged loudly (once per process) so a missing secret is never silent.
+PRIVACY_SERVICE_TOKEN_ENV = "PRIVACY_SERVICE_TOKEN"
+_missing_token_logged = False
+
+
+def privacy_auth_headers() -> Dict[str, str]:
+    """Authorization header for the privacy service, or {} if no token is set."""
+    global _missing_token_logged
+    token = os.getenv(PRIVACY_SERVICE_TOKEN_ENV, "").strip()
+    if token:
+        return {"Authorization": f"Bearer {token}"}
+    if not _missing_token_logged:
+        _missing_token_logged = True
+        logger.error(
+            "%s is not set: privacy-service calls go out WITHOUT authentication. "
+            "Works only while the service does not require a token.",
+            PRIVACY_SERVICE_TOKEN_ENV,
+        )
+    return {}
+
+
 # How long to wait for the TCP connection to the privacy service to be
 # ESTABLISHED — deliberately separate from the (deliberately long) read
 # timeouts the callers pass in.
@@ -124,6 +148,7 @@ class PrivacyServiceClient:
             self._client = httpx.AsyncClient(
                 base_url=self.base_url,
                 timeout=privacy_timeout(),
+                headers=privacy_auth_headers(),
             )
         return self._client
 
@@ -134,6 +159,7 @@ class PrivacyServiceClient:
             self._fallback_client = httpx.AsyncClient(
                 base_url=self.fallback_url,
                 timeout=privacy_timeout(),
+                headers=privacy_auth_headers(),
             )
         return self._fallback_client
 

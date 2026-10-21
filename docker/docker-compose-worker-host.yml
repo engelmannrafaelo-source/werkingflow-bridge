@@ -110,6 +110,7 @@ x-worker-env-common: &worker-env-common
   # over Tailscale from ANY host on the tailnet, this host included. No
   # change needed here at cutover.
   PRIVACY_SERVICE_URL: ${PRIVACY_SERVICE_URL:-http://100.65.149.39:8100}
+  PRIVACY_SERVICE_TOKEN: ${PRIVACY_SERVICE_TOKEN:-}
   BRIDGE_ANONYMIZE_ENABLED: "true"
   # Pseudonymisierungs-Paket 06.10.2026 — gleich wie docker-compose-prod.yml
   BRIDGE_PSEUDONYM_POSTPROCESS: "true"
