@@ -236,6 +236,7 @@ cat <<WORKER
       - RATE_LIMIT_ENABLED=false
       - DEFAULT_PRIVACY_MODE=none
       - PRIVACY_SERVICE_URL=http://privacy-service:8100
+      - PRIVACY_SERVICE_TOKEN=\${PRIVACY_SERVICE_TOKEN:-}
       - AI_BRIDGE_URL_PROD_FALLBACK=\${AI_BRIDGE_URL_PROD_FALLBACK:-}
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
@@ -279,6 +280,7 @@ cat <<TAIL
       - DOCLING_THREADS=$DOCLING_THREADS
       - BRIDGE_SELF_URL=http://nginx:80/v1/chat/completions
       - API_KEY=\${API_KEY:-}
+      - PRIVACY_SERVICE_TOKEN=\${PRIVACY_SERVICE_TOKEN:?PRIVACY_SERVICE_TOKEN fehlt}
       - CONVERTAPI_SECRET=\${CONVERTAPI_SECRET}
       - ANTHROPIC_API_KEY=\${ANTHROPIC_API_KEY:-}
     healthcheck:
