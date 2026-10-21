@@ -77,7 +77,7 @@ source = Path('scripts/bridge-deploy.sh').read_text()
 names = ['log', 'info', 'warn', 'error_', 'step', 'dry_rssh',
          'service_needs_build', 'deploy_one_service', 'container_for_svc',
          'svc_to_varname', 'phase_rollback', 'deployed_bridge_id',
-         'deploy_server']
+         'deploy_server', 'phase_selftest_and_record']
 Path(sys.argv[1]).write_text('\n'.join(
     re.search(r'^' + name + r'\(\) *\{(?:[^\n]*\}|.*?^\})', source, re.M | re.S)[0]
     for name in names
