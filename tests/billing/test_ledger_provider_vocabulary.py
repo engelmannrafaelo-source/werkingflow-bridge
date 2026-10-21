@@ -105,6 +105,8 @@ class TestMengen:
             "openai-compatible", "gemini", "local", "unrouted", "unknown",
             # erweitert durch docker/migrations/068_usage_events_provider_convertapi.sql
             "convertapi",
+            # erweitert durch docker/migrations/069_usage_events_provider_vertex_eu.sql
+            "vertex-eu",
         }
         assert set(LEDGER_PROVIDERS) == aus_migration
 
@@ -115,7 +117,8 @@ class TestKostenSemantikUnveraendert:
     darf die Abrechnung nicht nebenbei verschieben."""
 
     def test_bedrock_und_research_cloud_tragen_echte_kosten(self):
-        assert REAL_COST_PROVIDERS == {PROVIDER_BEDROCK, PROVIDER_RESEARCH_CLOUD}
+        # vertex-eu (21.10.2026) ist GCP pay-per-token, also ebenfalls Echtgeld.
+        assert REAL_COST_PROVIDERS == {PROVIDER_BEDROCK, PROVIDER_RESEARCH_CLOUD, "vertex-eu"}
         for provider in (PROVIDER_BEDROCK, PROVIDER_RESEARCH_CLOUD):
             modus, kosten = resolve_ledger_cost("flat_rate", provider, 0.42)
             assert (modus, kosten) == ("flat_rate_estimated", 0.42)

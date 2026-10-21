@@ -73,7 +73,11 @@ _cache: dict[str, tuple[float, Optional[dict]]] = {}
 #: (ANTHROPIC_VISION_API_KEY, provider tier ``claude-direct-notools``), NOT the
 #: subscription pool. Rafael 2026-09-16: while the AWS account is Bedrock-locked,
 #: TB Kainer's users run on this key instead of the internal flat-rate accounts.
-SUPPORTED_PROVIDERS = {"anthropic", "bedrock", "anthropic_direct"}
+#: ``vertex_eu`` = Claude ueber Google Vertex AI, locations/eu (21.10.2026
+#: vorgebaut, Schalter VERTEX_EU_ENABLED standardmaessig aus). Anders als der
+#: Bedrock-Pin wird er ausserhalb prod NICHT still heruntergestuft, sondern
+#: laut abgewiesen — siehe assert_vertex_eu_allowed.
+SUPPORTED_PROVIDERS = {"anthropic", "bedrock", "anthropic_direct", "vertex_eu"}
 DIRECT_PIN_TIER = "claude-direct-notools"
 
 
@@ -244,6 +248,64 @@ def assert_bedrock_attribution_complete(
         "the outbound Bridge request. Refusing to bill AWS cost that would be "
         "invisible / un-attributable in the cost dashboard."
     )
+
+
+class VertexEUGateError(RuntimeError):
+    """Vertex EU erreicht ohne Operator-Pin, aus falscher Umgebung oder ohne
+    volle Zuordnung. ``status``/``code`` tragen die Antwort (403/400)."""
+
+    def __init__(self, status: int, code: str, message: str):
+        super().__init__(message)
+        self.status = status
+        self.code = code
+
+
+def assert_vertex_eu_allowed(
+    effective_backend: Any,
+    pinned: Optional[str],
+    *,
+    app_env: Optional[str],
+    app_id: Optional[str],
+) -> None:
+    """Gate fuer den EFFEKTIVEN Backend vertex_eu — dieselben drei Fragen wie
+    bei Bedrock in einer Funktion: WER (echter Operator-Pin, kein Client-Opt-in
+    und kein App-Regel-Pin), WOHER (prod; staging/local nur mit
+    VERTEX_EU_ALLOW_NON_PROD=1, None nie) und ZUGEORDNET (app_env + app_id,
+    sonst echtes GCP-Geld ohne Kostensicht).
+
+    Bewusst ohne die Bedrock-Herabstufung ausserhalb prod: ein Vertex-Pin auf
+    staging ist ein Testaufbau, und ein still von Anthropic beantworteter
+    Test waere ein falsches Messergebnis."""
+    if effective_backend != BackendType.VERTEX_EU:
+        return
+    if pinned != "vertex_eu":
+        raise VertexEUGateError(
+            403, "vertex_eu_requires_operator_pin",
+            "Vertex EU is only reachable via the operator-set per-user pin "
+            "(users.provider_config.provider='vertex_eu'). Client-side backend "
+            "opt-in is not permitted: every Vertex call is real GCP spend and "
+            "must be attributable to a real user.",
+        )
+    from src.vertex_eu_service import non_prod_allowed
+
+    if app_env != "prod" and not (app_env in NON_PROD_APP_ENVS and non_prod_allowed()):
+        raise VertexEUGateError(
+            403, "vertex_eu_requires_production_env",
+            f"Vertex EU call reports app_env={app_env!r}. Allowed: production, or "
+            "staging/local when VERTEX_EU_ALLOW_NON_PROD=1 is set on this Bridge. "
+            "A missing X-App-Env is never allowed. No fallback to another backend.",
+        )
+    missing = []
+    if not app_env:
+        missing.append("X-App-Env")
+    if not app_id:
+        missing.append("X-App-ID")
+    if missing:
+        raise VertexEUGateError(
+            400, "vertex_eu_attribution_incomplete",
+            "Vertex EU is real-money GCP spend and must be fully attributable, "
+            "but this call is missing: " + ", ".join(missing) + ".",
+        )
 
 
 def invalidate_cache(user_key: Optional[str] = None) -> None:
@@ -580,6 +642,21 @@ def apply_user_provider_override(
         # A compliance pin also overrides any client-chosen provider tier.
         request_body.provider_tier = None
         return "bedrock"
+
+    if provider == "vertex_eu":
+        if getattr(request_body, "enable_tools", False):
+            # Wie anthropic_direct: kein CLI-Subprozess, also keine
+            # Claude-Code-Tools. Umleiten auf den Pool waere ein stiller
+            # Wechsel des Verarbeiters.
+            raise UserProviderOverrideError(
+                "provider_config.provider='vertex_eu' cannot serve a request with "
+                "enable_tools=true (Vertex Messages API has no Claude Code tools). "
+                "Send the request without tools or remove the pin."
+            )
+        request_body.backend = BackendType.VERTEX_EU
+        request_body.bedrock_region = None
+        request_body.provider_tier = None
+        return "vertex_eu"
 
     # provider == "anthropic": explicit pin to the default backend.
     if provider == "anthropic_direct":
