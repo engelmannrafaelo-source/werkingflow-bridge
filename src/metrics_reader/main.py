@@ -32,8 +32,19 @@ IMPLEMENTATION NOTES
 * Reuses the existing middleware modules (bridge_metrics_store.py,
   prompt_metrics.py) — single source of truth for JSONL parsing.
 * Volume is mounted read-only. Defensive: we do not open any file for write.
-* No authentication (mirrors current worker behaviour: credentials are
-  Optional on these endpoints). If API_KEY is ever enforced, add here too.
+* Authentication (BR14, 2026-10-10): every route except the ones in
+  READER_PUBLIC_ROUTES requires the shared bridge key (Authorization: Bearer
+  AI_BRIDGE_API_KEY, rotation key AI_BRIDGE_API_KEY_PREVIOUS), same as the
+  worker's verify_api_key. Until then the reader had no auth at all and
+  nginx routes-metrics-reader.conf put it on bridge.werking.tools /
+  prod-bridge.werking.tools: per-call user_id (prompt-performance/calls),
+  client IPs (request-log), account names + quotas (cc-usage-history) — and
+  POST sandbox-observed-rate-limit, which marks any account unavailable for
+  up to an hour in account-pool-state, the state pool_router.lua routes by.
+  Fail closed: without a configured key the protected routes answer 503,
+  never "open". POST sandbox-observed-rate-limit additionally accepts
+  X-Bridge-Service-Token (BRIDGE_SERVICE_TOKEN) — the sandbox-daemon already
+  holds that token for its lease calls.
 * Output schema is identical to the worker endpoints (the CUI consumer
   in cui/server/routes/bridge.ts expects specific shapes).
 
@@ -46,6 +57,7 @@ DEFENSIVE PROGRAMMING
 
 from __future__ import annotations
 
+import hmac
 import json
 import logging
 import os
@@ -53,7 +65,7 @@ import threading
 import time
 from typing import Dict, Optional
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
 
 # Reuse the SAME middleware modules as the Bridge workers.
@@ -148,6 +160,99 @@ _prod_has_metrics_reader: bool | None = None  # None = not yet probed
 _prod_last_probe: float = 0.0
 _PROBE_INTERVAL = 300  # re-probe every 5 minutes
 
+# ============================================================================
+# Authentication (BR14) — see module docstring
+# ============================================================================
+
+# Reachable without the key, each with its reason. Everything else needs it.
+READER_PUBLIC_ROUTES = {
+    "/health": "Container- und Deploy-Healthcheck.",
+    "/lb-status": (
+        "Worker-Gesundheit als Zaehler; CUI, bridge-health-monitor.sh und "
+        "Watchdog lesen ohne Schluessel."
+    ),
+    "/v1/metrics/account-pool-state": (
+        "pool_router.lua liest es alle 2 s direkt vom Reader "
+        "(ohne nginx, ohne Schluessel); "
+        "werking-energy-Preflight und unified-tester lesen es bewusst token-frei; "
+        "Compose-Healthcheck."
+    ),
+    "/v1/metrics/sandbox-observed-rate-limits": (
+        "Sandbox-Lease-Router der platform-api liest es direkt vom Reader "
+        "(src/sandbox/account_router.py), nicht ueber nginx."
+    ),
+    "/v1/metrics/{rest:path}": "Fehlrouting-Faenger, antwortet immer 404.",
+}
+
+
+def _reader_keys() -> list[str]:
+    # Same variable names as src/auth.py ClaudeCodeAuthManager.
+    active = os.getenv("AI_BRIDGE_API_KEY") or os.getenv("API_KEY")
+    return [k for k in (active, os.getenv("AI_BRIDGE_API_KEY_PREVIOUS")) if k]
+
+
+def _bearer(request: Request) -> str:
+    raw = request.headers.get("authorization", "")
+    scheme, _, token = raw.partition(" ")
+    return token.strip() if scheme.lower() == "bearer" else ""
+
+
+def _deny(request: Request, why: str) -> None:
+    token = _bearer(request)
+    logger.warning(
+        f"401 metrics-reader {why} (prefix={token[:8] or '-'}, "
+        f"path={request.url.path}, "
+        f"x-app-id={request.headers.get('x-app-id') or '-'})"
+    )
+    raise HTTPException(
+        status_code=401,
+        detail="Missing API key" if not token else "Invalid API key",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+
+
+def require_operator_key(request: Request) -> None:
+    """Shared bridge key only — the operator view across all callers."""
+    keys = _reader_keys()
+    if not keys:
+        logger.error(
+            "metrics-reader: AI_BRIDGE_API_KEY not set — refusing protected route"
+        )
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "metrics-reader: AI_BRIDGE_API_KEY not configured, "
+                "protected metrics refused"
+            ),
+        )
+    token = _bearer(request)
+    if token and any(hmac.compare_digest(token, k) for k in keys):
+        return
+    _deny(request, "shared-key mismatch")
+
+
+def require_operator_key_or_service_token(request: Request) -> None:
+    """Shared bridge key, or X-Bridge-Service-Token (sandbox-daemon)."""
+    service = os.getenv("BRIDGE_SERVICE_TOKEN") or ""
+    sent = request.headers.get("x-bridge-service-token") or ""
+    if service and sent and hmac.compare_digest(sent, service):
+        return
+    require_operator_key(request)
+
+
+OPERATOR = [Depends(require_operator_key)]
+OPERATOR_OR_SERVICE = [Depends(require_operator_key_or_service_token)]
+
+
+def _prod_request(url: str):
+    """Request to the production bridge, carrying the shared key (BR14: the
+    reader endpoints there require it, too)."""
+    import urllib.request
+    keys = _reader_keys()
+    headers = {"Authorization": f"Bearer {keys[0]}"} if keys else {}
+    return urllib.request.Request(url, headers=headers)
+
+
 app = FastAPI(
     title="Bridge Metrics Reader",
     description="Decoupled read-only service for historical Bridge metrics.",
@@ -175,7 +280,7 @@ def _prod_metrics_available() -> bool:
     _prod_last_probe = now
     try:
         url = f"{PROD_BRIDGE_URL}/v1/metrics/usage-breakdown?hours=0"
-        with urllib.request.urlopen(url, timeout=3) as resp:
+        with urllib.request.urlopen(_prod_request(url), timeout=3) as resp:
             data = _json.loads(resp.read())
             _prod_has_metrics_reader = "summary" in data
             logger.info(f"Prod metrics-reader probe: {'available' if _prod_has_metrics_reader else 'unavailable'}")
@@ -194,7 +299,7 @@ def _fetch_prod_direct(path: str, timeout: float = 5.0) -> dict | None:
     import json as _json
     try:
         url = f"{PROD_BRIDGE_URL}{path}"
-        with urllib.request.urlopen(url, timeout=timeout) as resp:
+        with urllib.request.urlopen(_prod_request(url), timeout=timeout) as resp:
             return _json.loads(resp.read())
     except Exception as e:
         logger.debug(f"Prod direct fetch {path} failed: {e}")
@@ -214,7 +319,7 @@ def _fetch_prod(path: str, timeout: float = 5.0) -> dict | None:
     import json as _json
     try:
         url = f"{PROD_BRIDGE_URL}{path}"
-        with urllib.request.urlopen(url, timeout=timeout) as resp:
+        with urllib.request.urlopen(_prod_request(url), timeout=timeout) as resp:
             return _json.loads(resp.read())
     except Exception as e:
         logger.debug(f"Prod fetch {path} failed: {e}")
@@ -387,7 +492,7 @@ def health() -> dict:
 # Prompt Performance Metrics (file-based)
 # ============================================================================
 
-@app.get("/v1/metrics/prompt-performance")
+@app.get("/v1/metrics/prompt-performance", dependencies=OPERATOR)
 def get_prompt_performance(hours: int = Query(24, ge=0)) -> dict:
     """Per-prompt-type stats. hours=0 ⇒ all time."""
     local = get_prompt_metrics().get_stats(hours=hours)
@@ -399,7 +504,7 @@ def get_prompt_performance(hours: int = Query(24, ge=0)) -> dict:
     return local
 
 
-@app.get("/v1/metrics/prompt-performance/timeline")
+@app.get("/v1/metrics/prompt-performance/timeline", dependencies=OPERATOR)
 def get_prompt_timeline(
     app_id: str,
     agent_id: str,
@@ -415,7 +520,7 @@ def get_prompt_timeline(
     )
 
 
-@app.get("/v1/metrics/prompt-performance/calls")
+@app.get("/v1/metrics/prompt-performance/calls", dependencies=OPERATOR)
 def get_prompt_calls(
     hours: int = Query(24, ge=0),
     limit: int = Query(200, ge=1, le=1000),
@@ -440,7 +545,7 @@ def get_prompt_calls(
     return local
 
 
-@app.get("/v1/metrics/throughput")
+@app.get("/v1/metrics/throughput", dependencies=OPERATOR)
 def get_throughput(
     hours: int = Query(24, ge=1, le=168),
     bucket_seconds: int = Query(60, ge=10, le=600),
@@ -452,7 +557,7 @@ def get_throughput(
     )
 
 
-@app.get("/v1/metrics/usage-breakdown")
+@app.get("/v1/metrics/usage-breakdown", dependencies=OPERATOR)
 def get_usage_breakdown(hours: int = Query(24, ge=0)) -> dict:
     """Token/cost breakdown per app, per user, per model."""
     local = get_prompt_metrics().get_usage_breakdown(hours=hours)
@@ -462,7 +567,7 @@ def get_usage_breakdown(hours: int = Query(24, ge=0)) -> dict:
     return local
 
 
-@app.get("/v1/metrics/document-performance")
+@app.get("/v1/metrics/document-performance", dependencies=OPERATOR)
 def get_document_performance(hours: int = Query(24, ge=0)) -> dict:
     """Capacity view for the document/privacy-service pipeline (convert-*,
     /v1/document/convert*, /v1/privacy/smart-anonymize). Same shape as
@@ -494,7 +599,7 @@ _REQUEST_LOG_CACHE_TTL_S = float(os.getenv("METRICS_READER_CACHE_TTL_S", "15"))
 _REQUEST_LOG_CACHE_LOCK = threading.Lock()
 
 
-@app.get("/v1/metrics/request-log")
+@app.get("/v1/metrics/request-log", dependencies=OPERATOR)
 def get_request_log_endpoint(
     hours: int = Query(24, ge=0),
     endpoint: Optional[str] = None,
@@ -534,7 +639,7 @@ def get_request_log_endpoint(
 # Contract Observability (file-based aggregation of request_log)
 # ============================================================================
 
-@app.get("/v1/metrics/contract")
+@app.get("/v1/metrics/contract", dependencies=OPERATOR)
 def get_contract_stats(
     hours: int = Query(24, ge=1, le=168),
     recent_limit: int = Query(50, ge=1, le=500),
@@ -662,7 +767,7 @@ def get_contract_stats(
 # Upstream Health — Claude API reachability proxy, derived from request log.
 # ============================================================================
 
-@app.get("/v1/metrics/upstream-health")
+@app.get("/v1/metrics/upstream-health", dependencies=OPERATOR)
 def get_upstream_health(
     recent_window_min: int = Query(5, ge=1, le=120),
     lookback_hours: int = Query(6, ge=1, le=168),
@@ -753,7 +858,7 @@ import glob as _glob
 import json as _json
 
 
-@app.get("/v1/metrics/limiter-trajectory")
+@app.get("/v1/metrics/limiter-trajectory", dependencies=OPERATOR)
 def get_limiter_trajectory(
     hours: int = Query(24, ge=1, le=168),
     max_points: int = Query(500, ge=50, le=5000),
@@ -867,7 +972,7 @@ def get_limiter_trajectory(
 # CC-Usage Snapshots (file-based, read-only)
 # ============================================================================
 
-@app.get("/v1/metrics/cc-usage-history")
+@app.get("/v1/metrics/cc-usage-history", dependencies=OPERATOR)
 def get_cc_usage_history(
     hours: int = Query(168, ge=0),
     limit: int = Query(500, ge=1, le=2000),
@@ -1060,7 +1165,7 @@ def get_account_pool_state():
     return result
 
 
-@app.post("/v1/metrics/sandbox-observed-rate-limit")
+@app.post("/v1/metrics/sandbox-observed-rate-limit", dependencies=OPERATOR_OR_SERVICE)
 def post_observed_rate_limit(payload: dict):
     """
     Record an observed 429 on the sandbox passthrough path. Worker-side

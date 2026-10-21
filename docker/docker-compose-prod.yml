@@ -764,6 +764,12 @@ services:
           memory: 128M
     volumes:
       - prod-logs:/app/logs:ro
+    # BR14: AI_BRIDGE_API_KEY (+ _PREVIOUS) and BRIDGE_SERVICE_TOKEN — every
+    # reader route except /health, /lb-status, account-pool-state and
+    # sandbox-observed-rate-limits requires the key; without it they answer
+    # 503 (fail closed). Same file the workers read the key from.
+    env_file:
+      - ../secrets/platform.env
     environment:
       - METRICS_DIR=/app/logs
       - LOG_LEVEL=INFO

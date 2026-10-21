@@ -10689,11 +10689,51 @@ async def get_auth_status(request: Request):
     }
 
 
+async def _verify_operator_key(
+    request: Request, credentials: Optional[HTTPAuthorizationCredentials]
+):
+    """Auth for the session-management routes below (BR13): the shared bridge key only.
+
+    These routes are an operator view across ALL callers — the CLI-session list
+    carries the first 200 characters of every prompt since container start, and
+    DELETE aborts a running call that someone else is paying for. Until
+    2026-10-10 they had no auth at all and were reachable through
+    bridge.werking.tools / prod-bridge.werking.tools (nginx `location /` and the
+    `/worker<NAME>/` passthrough). A per-app service principal
+    (BRIDGE_PRINCIPALS_ENABLED) must not see or cancel other apps' runs, so a
+    resolved non-legacy principal is refused with 403. The legitimate callers
+    (CUI Bridge-Monitor via /api/bridge-proxy, partner-platform team chat
+    history) send the shared AI_BRIDGE_API_KEY.
+
+    BR14 (2026-10-10): the worker's /v1/metrics* routes use the same check.
+    They are the same kind of operator view — per-call user_id/session_id
+    (prompt-performance/calls), client IPs (request-log), account names and
+    quotas (cc-usage-history, queue-forecast) — and POST cc-usage-snapshot
+    writes the quota store the adaptive limiter reads: a forged >=95 % entry
+    capacity-locks the worker until the forged reset. The scrapers that post
+    snapshots must send the key. Deliberately still open:
+    /v1/metrics/account-pool-state (token-free pre-flight of werking-energy,
+    see test_no_unauthenticated_routes.PUBLIC_ROUTES).
+    """
+    await verify_api_key(request, credentials)
+    principal = getattr(request.state, "principal", None)
+    if principal is not None and not principal.is_legacy:
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                f"principal '{principal.name}' may not use the "
+                "session-management routes"
+            ),
+        )
+
+
 @app.get("/v1/sessions/stats")
 async def get_session_stats(
+    request: Request,
     credentials: Optional[HTTPAuthorizationCredentials] = Depends(security)
 ):
     """Get session manager statistics."""
+    await _verify_operator_key(request, credentials)
     stats = session_manager.get_stats()
     return {
         "session_stats": stats,
@@ -10704,19 +10744,23 @@ async def get_session_stats(
 
 @app.get("/v1/sessions")
 async def list_sessions(
+    request: Request,
     credentials: Optional[HTTPAuthorizationCredentials] = Depends(security)
 ):
     """List all active sessions."""
+    await _verify_operator_key(request, credentials)
     sessions = session_manager.list_sessions()
     return SessionListResponse(sessions=sessions, total=len(sessions))
 
 
 @app.get("/v1/sessions/{session_id}")
 async def get_session(
+    request: Request,
     session_id: str,
     credentials: Optional[HTTPAuthorizationCredentials] = Depends(security)
 ):
     """Get information about a specific session."""
+    await _verify_operator_key(request, credentials)
     session = session_manager.get_session(session_id)
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
@@ -10726,10 +10770,12 @@ async def get_session(
 
 @app.delete("/v1/sessions/{session_id}")
 async def delete_session(
+    request: Request,
     session_id: str,
     credentials: Optional[HTTPAuthorizationCredentials] = Depends(security)
 ):
     """Delete a specific session."""
+    await _verify_operator_key(request, credentials)
     deleted = session_manager.delete_session(session_id)
     if not deleted:
         raise HTTPException(status_code=404, detail="Session not found")
@@ -10743,6 +10789,7 @@ async def delete_session(
 
 @app.get("/v1/cli-sessions")
 async def list_cli_sessions(
+    request: Request,
     status: Optional[str] = None,
     credentials: Optional[HTTPAuthorizationCredentials] = Depends(security)
 ):
@@ -10751,6 +10798,7 @@ async def list_cli_sessions(
     Args:
         status: Optional filter by status (running, completed, cancelled, failed)
     """
+    await _verify_operator_key(request, credentials)
     from src.cli_session_manager import cli_session_manager
 
     logger.debug(f"CLI session list requested (status_filter={status})")
@@ -10772,9 +10820,11 @@ async def list_cli_sessions(
 
 @app.get("/v1/cli-sessions/stats")
 async def get_cli_session_stats(
+    request: Request,
     credentials: Optional[HTTPAuthorizationCredentials] = Depends(security)
 ):
     """Get CLI session statistics."""
+    await _verify_operator_key(request, credentials)
     from src.cli_session_manager import cli_session_manager
 
     stats = cli_session_manager.get_stats()
@@ -10783,10 +10833,12 @@ async def get_cli_session_stats(
 
 @app.get("/v1/cli-sessions/{cli_session_id}")
 async def get_cli_session(
+    request: Request,
     cli_session_id: str,
     credentials: Optional[HTTPAuthorizationCredentials] = Depends(security)
 ):
     """Get information about a specific CLI session."""
+    await _verify_operator_key(request, credentials)
     from src.cli_session_manager import cli_session_manager
 
     session = cli_session_manager.get_session(cli_session_id)
@@ -10798,10 +10850,12 @@ async def get_cli_session(
 
 @app.delete("/v1/cli-sessions/{cli_session_id}")
 async def cancel_cli_session(
+    request: Request,
     cli_session_id: str,
     credentials: Optional[HTTPAuthorizationCredentials] = Depends(security)
 ):
     """Cancel a running CLI session (stops the Claude CLI call)."""
+    await _verify_operator_key(request, credentials)
     from src.cli_session_manager import cli_session_manager
 
     logger.info(f"CLI session cancellation requested: {cli_session_id}")
@@ -10844,6 +10898,7 @@ async def cancel_cli_session(
 
 @app.delete("/v1/cli-sessions")
 async def cleanup_old_cli_sessions(
+    request: Request,
     max_age_hours: int = 24,
     credentials: Optional[HTTPAuthorizationCredentials] = Depends(security)
 ):
@@ -10852,6 +10907,7 @@ async def cleanup_old_cli_sessions(
     Args:
         max_age_hours: Remove sessions older than this (default: 24 hours)
     """
+    await _verify_operator_key(request, credentials)
     from src.cli_session_manager import cli_session_manager
 
     logger.info(f"CLI session cleanup requested (max_age_hours={max_age_hours})")
@@ -10880,6 +10936,7 @@ async def cleanup_old_cli_sessions(
 
 @app.get("/v1/metrics")
 async def get_performance_metrics(
+    request: Request,
     credentials: Optional[HTTPAuthorizationCredentials] = Depends(security)
 ):
     """
@@ -10889,6 +10946,7 @@ async def get_performance_metrics(
         Performance summary including request counts, average duration,
         slow requests, and per-endpoint statistics.
     """
+    await _verify_operator_key(request, credentials)
     from src.middleware.performance_monitor import metrics
 
     summary = metrics.get_summary()
@@ -10911,6 +10969,7 @@ async def get_performance_metrics(
 
 @app.get("/v1/metrics/attribution")
 async def get_attribution_metrics(
+    request: Request,
     credentials: Optional[HTTPAuthorizationCredentials] = Depends(security)
 ):
     """Live attribution counters (per worker, in-memory since start).
@@ -10922,6 +10981,7 @@ async def get_attribution_metrics(
     query a specific worker via the nginx /workerN/ prefix, or sample via
     the LB. See src/attribution.py.
     """
+    await _verify_operator_key(request, credentials)
     from src.attribution import snapshot
     return snapshot()
 
@@ -10996,6 +11056,7 @@ async def get_anonymization_metrics(
 
 @app.get("/v1/metrics/prompt-performance")
 async def get_prompt_performance(
+    request: Request,
     hours: int = 24,
     credentials: Optional[HTTPAuthorizationCredentials] = Depends(security)
 ):
@@ -11008,6 +11069,7 @@ async def get_prompt_performance(
     Query params:
         hours: Time window (default 24, 0 = all time)
     """
+    await _verify_operator_key(request, credentials)
     from src.middleware.prompt_metrics import get_prompt_metrics
 
     hours = max(hours, 0)  # 0 = all time
@@ -11017,6 +11079,7 @@ async def get_prompt_performance(
 
 @app.get("/v1/metrics/prompt-performance/timeline")
 async def get_prompt_timeline(
+    request: Request,
     app_id: str,
     agent_id: str,
     hours: int = 24,
@@ -11032,6 +11095,7 @@ async def get_prompt_timeline(
         hours: Time window (default 24)
         bucket_minutes: Bucket size in minutes (default 60)
     """
+    await _verify_operator_key(request, credentials)
     from src.middleware.prompt_metrics import get_prompt_metrics
 
     hours = min(max(hours, 1), 168)
@@ -11042,6 +11106,7 @@ async def get_prompt_timeline(
 
 @app.get("/v1/metrics/prompt-performance/calls")
 async def get_prompt_calls(
+    request: Request,
     hours: int = 24,
     limit: int = 200,
     app_id: Optional[str] = None,
@@ -11061,6 +11126,7 @@ async def get_prompt_calls(
         app_id: Filter by app (optional)
         user_id: Filter by user (optional)
     """
+    await _verify_operator_key(request, credentials)
     from src.middleware.prompt_metrics import get_prompt_metrics
 
     collector = get_prompt_metrics()
@@ -11074,6 +11140,7 @@ async def get_prompt_calls(
 
 @app.get("/v1/metrics/throughput")
 async def get_throughput(
+    request: Request,
     hours: int = 24,
     bucket_seconds: int = 60,
     credentials: Optional[HTTPAuthorizationCredentials] = Depends(security)
@@ -11094,6 +11161,7 @@ async def get_throughput(
         hours          : lookback window (default 24, max 168)
         bucket_seconds : bucket size (default 60, min 10, max 600)
     """
+    await _verify_operator_key(request, credentials)
     from src.middleware.prompt_metrics import get_prompt_metrics
 
     hours = min(max(hours, 1), 168)
@@ -11104,6 +11172,7 @@ async def get_throughput(
 
 @app.get("/v1/metrics/usage-breakdown")
 async def get_usage_breakdown(
+    request: Request,
     hours: int = 24,
     credentials: Optional[HTTPAuthorizationCredentials] = Depends(security)
 ):
@@ -11116,6 +11185,7 @@ async def get_usage_breakdown(
     Query params:
         hours: Time window (default 24, 0 = all time)
     """
+    await _verify_operator_key(request, credentials)
     from src.middleware.prompt_metrics import get_prompt_metrics
 
     collector = get_prompt_metrics()
@@ -11124,6 +11194,7 @@ async def get_usage_breakdown(
 
 @app.get("/v1/metrics/document-performance")
 async def get_document_performance(
+    request: Request,
     hours: int = 24,
     credentials: Optional[HTTPAuthorizationCredentials] = Depends(security)
 ):
@@ -11147,6 +11218,7 @@ async def get_document_performance(
     Query params:
         hours: Time window (default 24, 0 = all time)
     """
+    await _verify_operator_key(request, credentials)
     from src.middleware.prompt_metrics import get_prompt_metrics, DOCUMENT_AGENT_IDS
 
     collector = get_prompt_metrics()
@@ -11166,6 +11238,7 @@ async def get_document_performance(
 
 @app.get("/v1/metrics/request-log")
 async def get_request_log_endpoint(
+    request: Request,
     hours: int = 24,
     endpoint: Optional[str] = None,
     status: Optional[str] = None,
@@ -11181,6 +11254,7 @@ async def get_request_log_endpoint(
         status: Filter by "success" or "error"
         limit: Max recent entries (default 200)
     """
+    await _verify_operator_key(request, credentials)
     from src.middleware.bridge_metrics_store import get_request_log
     return get_request_log().query(
         hours=max(hours, 0),
@@ -11196,6 +11270,7 @@ async def get_request_log_endpoint(
 
 @app.get("/v1/metrics/cc-usage-history")
 async def get_cc_usage_history(
+    request: Request,
     hours: int = 168,
     limit: int = 500,
     credentials: Optional[HTTPAuthorizationCredentials] = Depends(security)
@@ -11207,6 +11282,7 @@ async def get_cc_usage_history(
         hours: Time window (default 168 = 7 days, 0 = all time)
         limit: Max snapshots (default 500)
     """
+    await _verify_operator_key(request, credentials)
     from src.middleware.bridge_metrics_store import get_cc_usage_store
     return get_cc_usage_store().get_history(
         hours=max(hours, 0),
@@ -11224,6 +11300,7 @@ async def save_cc_usage_snapshot(
 
     Body: { "accounts": [ { account, plan, currentSession, ... } ] }
     """
+    await _verify_operator_key(request, credentials)
     body = await request.json()
     accounts = body.get("accounts", [])
     if not accounts:
@@ -11236,6 +11313,7 @@ async def save_cc_usage_snapshot(
 
 @app.get("/v1/metrics/queue-forecast")
 async def get_queue_forecast(
+    request: Request,
     window: int = 60,
     credentials: Optional[HTTPAuthorizationCredentials] = Depends(security)
 ):
@@ -11254,6 +11332,7 @@ async def get_queue_forecast(
     through nginx in a round-robin fashion — over a few requests, all four
     workers will report. The CC-usage block is global (shared snapshot store).
     """
+    await _verify_operator_key(request, credentials)
     from src.middleware.rolling_metrics import get_rolling_metrics
     from src.middleware.bridge_metrics_store import get_cc_usage_store
 
