@@ -229,7 +229,9 @@ async def require_bearer_token(request: Request, call_next):
         elif strict:
             return _unauthorized()
         else:
-            _TOKENLOS_ZAEHLER[path] = _TOKENLOS_ZAEHLER.get(path, 0) + 1
+            # Begrenzte Schluessel: Scanner-Pfade (/.env, /.git/...) duerfen den Zaehler nicht unbegrenzt wachsen lassen.
+            key = path if (path in _TOKENLOS_ZAEHLER or len(_TOKENLOS_ZAEHLER) < 50) else "<weitere>"
+            _TOKENLOS_ZAEHLER[key] = _TOKENLOS_ZAEHLER.get(key, 0) + 1
             now = _time.monotonic()
             if now - _tokenlos_last_log >= _TOKENLOS_LOG_INTERVAL_S:
                 _tokenlos_last_log = now
