@@ -22,7 +22,7 @@ def function(text, name):
 @pytest.mark.parametrize("smoke_failure", [False, True])
 def test_deploy_service_subset(tmp_path, target, services, worker, smoke_failure):
     text = (ROOT / "scripts/bridge-deploy.sh").read_text()
-    names = ["deploy_server", "phase_smoke_test", "record_deploy_proof"]
+    names = ["deploy_server", "phase_selftest_and_record", "phase_smoke_test", "record_deploy_proof"]
     definitions = "\n".join(function(text, name) for name in names)
     # Load service lists from the real CLI, never its host config or entry point.
     constants = "\n".join(re.findall(

@@ -67,6 +67,12 @@ App-Hälfte und LB-Hälfte je Bridge wirklich trennen (Service-Namen: Kopf von
 | 4 | LB dev scharf | `scripts/bridge-deploy.sh hetzner nginx` |
 | 5 | LB prod scharf | `scripts/bridge-deploy.sh server2 nginx` |
 
+Hängen Prod-Worker und Prod-platform-api voneinander ab (neue Worker brauchen
+die neue platform-api und umgekehrt der Smoke die neuen Worker), lassen sich
+Schritt 2 und 3/5 nicht trennen: dann `scripts/bridge-deploy.sh prod-zusammen`
+(beide Prod-Hosts, ein gemeinsamer Smoke, Rückweg auf beiden; siehe
+`docs/maintenance.md`, „Gekoppelter Prod-Deploy“).
+
 Nach jedem Schritt die Probe unten, bevor der nächste kommt. Zwischen 3 und 4
 liegt der einzige Zustand, in dem sich am Routing etwas ändert — davor ist
 alles durch Nichtstun reversibel.

@@ -271,6 +271,39 @@ einen Worker. Die Dienstlisten im Skript sind die Quelle der Auswahl:
 | `bridge-deploy.sh both` | hetzner baut Worker, server2 nicht | getrennte Bewertung je Ziel |
 | `bridge-deploy.sh prod-workers` | worker-sahori, worker-kurt, worker-coach, worker-erk | bestehende Container-Prüfungen; kein öffentlicher Smoke in diesem Zweig |
 | `bridge-deploy.sh prod-workers metrics-reader` | keiner | kein öffentlicher Smoke |
+| `bridge-deploy.sh prod-zusammen` | worker-sahori, worker-kurt, worker-coach, worker-erk (Worker-Host) | Soll-SHA vom Worker-Host-Checkout; ein gemeinsamer Smoke über den Prod-LB, Served-By Pflicht |
+
+### Gekoppelter Prod-Deploy (`prod-zusammen`)
+
+Wenn server2 und Worker-Host nur gemeinsam funktionieren, blockieren sich die
+Einzelmodi gegenseitig (gemessen 21.10.2026, 6ab9c2b/172482a → 672c3c0):
+`server2` allein scheitert am Smoke, weil `chat_cache_boundary` neue Worker
+braucht; `prod-workers` allein scheitert am Start der neuen Worker
+(`KeyError: 'priceBasis'`, Plankatalog der alten platform-api, Migration 066).
+`bridge-deploy.sh prod-zusammen [--dry-run] [--ack-foreign]` fährt beides in
+einem Lauf, beide Hosts auf denselben, zu Laufbeginn festgelegten
+origin/develop-SHA:
+
+1. S0: Die nginx-Quelldatei, mit der der laufende Prod-LB gestartet wurde,
+   wird nach `/root/bridge-deploy-rueckweg/` auf server2 gesichert, nachdem
+   Notsperre und Schutzregel in der geladenen `/tmp/nginx.conf` und von außen
+   (403) belegt sind. Fehlt ein Block schon im laufenden LB, bricht der Lauf
+   ohne Änderung ab.
+2. S1 server2 (postgres-prod, platform-api, nginx) und S2 Worker-Host
+   (rollend, Health-Wartezeit) mit allen Gates der Einzelmodi; nur der Smoke je
+   Host entfällt.
+3. S3: ein gemeinsamer Smoke über den Prod-LB; die Worker dieses Laufs müssen
+   antworten (Served-By Pflicht, SHA belegt). Danach Router-Blick,
+   Worker-Selbsttest und Nachweis-Marker auf beiden Hosts.
+
+Rot in einer Stufe oder im Smoke: Rückweg auf allen berührten Hosts, zuerst
+Worker-Host, dann server2 (alte Worker laufen mit der neuen platform-api, neue
+nicht mit der alten). Beim server2-Rückweg kommt die gesicherte Schutzdatei
+direkt nach `git reset` und vor dem nginx-Neustart in den Checkout; der
+Checkout ist danach wieder so verändert wie vor dem Lauf. DB-Migrationen sind
+additiv und bleiben. Am Ende jedes Laufs, auch bei Rot, prüft das Skript die
+geladene Konfiguration erneut, lädt bei Bedarf nach (nginx -t, dann HUP) und
+meldet einen fehlenden Block mit Exit 2.
 
 Ohne Worker-Bau wird `/v1/version` nicht gegen einen fremden Checkout-HEAD
 geprüft: `SMOKE_VERSION_UNPROVEN` nennt den Grund. Die übrigen Smoke-Proben

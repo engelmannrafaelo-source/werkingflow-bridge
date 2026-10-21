@@ -19,6 +19,44 @@
 #                   other sessions (see phase_foreign_commit_gate). Without it,
 #                   such a deploy ABORTS before touching the target.
 #
+#   prod-zusammen = the WHOLE prod bridge in one coupled run (server2 AND the
+#     worker-host), for releases where the two halves depend on each other.
+#     Usage: bridge-deploy.sh prod-zusammen [--dry-run] [--ack-foreign]
+#     (no service list: it always deploys SERVER2_ALL and WORKERHOST_ALL).
+#     Why coupled (measured 21.10.2026, 6ab9c2b/172482a -> 672c3c0): each
+#     single mode is blocked by the other half's gate —
+#       * `server2` alone: the server2 smoke needs NEW workers
+#         (chat_cache_boundary wants X-Cache-Boundary, SMOKE_VERSION_UNPROVEN)
+#         and auto-rolled back;
+#       * `prod-workers` alone: a new worker loads the plan catalog from the
+#         platform-api at startup and dies with KeyError 'priceBasis'
+#         (migration 066) while server2 still runs the OLD platform-api.
+#     Order: S0 save the LB's protective nginx config for the way back ->
+#     S1 server2 (postgres-prod, platform-api, nginx; every gate of the server2
+#     mode, only its own smoke is deferred) -> S2 worker-host (rolling, health
+#     wait; every gate of prod-workers) -> S3 ONE joint smoke over the whole
+#     prod bridge (workers of THIS run must answer, SHA proven) -> S4 router
+#     state, worker self-test, proof markers on both hosts.
+#     Both hosts are pinned to the SAME origin/develop SHA; if develop moves
+#     during the run, the second host refuses instead of shipping a mix.
+#     Way back: ANY red stage (or the joint smoke) rolls back BOTH hosts that
+#     were touched, worker-host FIRST (old workers run fine against the new
+#     platform-api, proven 21.10. 17:50Z; new workers die against the old one),
+#     then server2. DB migrations are additive and STAY (old code runs on the
+#     new schema; new code does not run on the old one) — the way back never
+#     touches the schema.
+#     nginx protection (Notsperre $notsperre, Schutzregel $br_sensible_route /
+#     $br_quelle_ok): must be active in the LOADED config of the prod LB in
+#     every phase, including the way back. S0 copies the source config the
+#     RUNNING LB was started from (inside the container, not the checkout)
+#     after proving both blocks are loaded; the way back puts it into the
+#     checkout right after `git reset` and BEFORE nginx is recreated, so the
+#     old image starts directly with the blocks. Afterwards (and at the end of
+#     every run, also red) the loaded /tmp/nginx.conf is checked for both
+#     blocks and measured from outside (403); a missing block is re-rendered
+#     in place (nginx -t, then reload/HUP) and reported loudly.
+#     Exit codes as below (0/1/2/3); 1 also = refused before any change.
+#
 # EXIT CODES:
 #   0 = success (or dry-run completed)
 #   1 = deployment failure (rollback attempted and succeeded), or the
@@ -181,6 +219,23 @@ POOL_PRE_DEPLOY_JSON=""
 # Phase 0 inspects THIS checkout, not a host — one verdict covers `both`.
 TOOLING_GATE_DONE="false"
 
+# prod-zusammen (deploy_prod_zusammen) state.
+# KOPPEL_STUFE non-empty = deploy_server runs as one stage of the coupled run:
+# its own smoke, self-test and proof markers are deferred to the joint end.
+KOPPEL_STUFE=""
+# Both hosts must land on this SHA (phase_code_update refuses anything else).
+KOPPEL_ZIEL_SHA=""
+# Host path (server2) of the LB source config saved in S0; the way back puts
+# it into the checkout after `git reset` (phase_rollback). Empty = no graft.
+KOPPEL_NGINX_RUECKWEG=""
+# Per-host state survives deploy_server's per-server reset.
+KOPPEL_S2_ROLLBACK_SHA=""; KOPPEL_S2_DEPLOYED=()
+KOPPEL_WH_ROLLBACK_SHA=""; KOPPEL_WH_DEPLOYED=()
+# phase_smoke_test version proof: which workers form the answering pool and
+# which host's checkout names their SHA. Defaults = the hetzner layout.
+SMOKE_POOL_SET="worker1 worker2 worker3 worker4"
+SMOKE_SHA_HOST=""
+
 # ============================================================================
 # Logging
 # ============================================================================
@@ -294,13 +349,14 @@ for arg in "$@"; do
         --dry-run) DRY_RUN=true ;;
         --ack-foreign) ACK_FOREIGN=true ;;
         --force-prod-ahead) FORCE_PROD_AHEAD=true ;;
-        hetzner|server2|both|prod-workers|smoke-nachholen) SERVER="$arg" ;;
+        hetzner|server2|both|prod-workers|prod-zusammen|smoke-nachholen) SERVER="$arg" ;;
         *) SERVICES_ARG+=("$arg") ;;
     esac
 done
 
 if [[ -z "$SERVER" ]]; then
     echo "Usage: bridge-deploy.sh <hetzner|server2|both|prod-workers> [service...] [--dry-run] [--ack-foreign] [--force-prod-ahead]" >&2
+    echo "       bridge-deploy.sh prod-zusammen [--dry-run] [--ack-foreign]   (server2 + worker-host coupled, one joint smoke)" >&2
     echo "       bridge-deploy.sh smoke-nachholen [--dry-run]   (re-run the probes an UNPROVEN hetzner deploy left open)" >&2
     echo "  --ack-foreign      proceed even though the deploy ships commits by other authors" >&2
     echo "  --force-prod-ahead override the dev-first order gate (typed TTY confirmation required)" >&2
@@ -321,7 +377,9 @@ fi
 # jedem Exit (auch kill/crash) automatisch.
 acquire_deploy_lock() {
     local host_label="$1" fd="$2"
-    local lockfile="/var/lock/bridge-deploy.${host_label}.lock"
+    # BRIDGE_DEPLOY_LOCK_DIR only for dummy runs (stubbed ssh), so a rehearsal
+    # never holds the real host lock a parallel real deploy needs.
+    local lockfile="${BRIDGE_DEPLOY_LOCK_DIR:-/var/lock}/bridge-deploy.${host_label}.lock"
     # Append-Modus: das Öffnen darf die Holder-Info eines laufenden Deploys
     # nicht trunkieren (ein '>' würde das tun, noch VOR dem flock-Versuch).
     eval "exec ${fd}>>\"\$lockfile\""
@@ -338,7 +396,12 @@ case "$SERVER" in
     server2)      acquire_deploy_lock "server2" 211 ;;
     both)         acquire_deploy_lock "hetzner" 210; acquire_deploy_lock "server2" 211 ;;
     prod-workers) acquire_deploy_lock "prod-workers" 212 ;;
+    prod-zusammen) acquire_deploy_lock "server2" 211; acquire_deploy_lock "prod-workers" 212 ;;
 esac
+if [[ "$SERVER" == "prod-zusammen" && ${#SERVICES_ARG[@]} -gt 0 ]]; then
+    error_ "prod-zusammen takes no service list (got: ${SERVICES_ARG[*]}) — it always deploys both hosts in full."
+    exit 1
+fi
 
 # ============================================================================
 # Phase 0: Tooling freshness (read-only, local — runs once per invocation)
@@ -674,6 +737,14 @@ phase_code_update() {
 
     local remote_sha
     remote_sha=$(rssh "$host" "cd ${REMOTE_REPO} && git rev-parse origin/develop")
+
+    # prod-zusammen: both hosts on ONE SHA. develop moving between the server2
+    # and the worker-host pull would otherwise ship a mixed prod bridge.
+    if [[ -n "${KOPPEL_ZIEL_SHA:-}" && "$remote_sha" != "${KOPPEL_ZIEL_SHA:-}" ]]; then
+        error_ "prod-zusammen: origin/develop on ${host} is ${remote_sha:0:9}, the run is pinned to ${KOPPEL_ZIEL_SHA:0:9}"
+        error_ "  develop moved during the run — refusing to put a different SHA on this host."
+        return 1
+    fi
 
     if [[ "${ROLLBACK_SHA}" == "${remote_sha}" ]]; then
         info "Already up-to-date at ${ROLLBACK_SHA} — skipping pull (idempotent)"
@@ -1138,10 +1209,11 @@ phase_smoke_test() {
     # claude_version pool round-robins worker1-4, so its answer proves the SHA
     # only when all four were rebuilt; a subset keeps old images in the pool.
     local svc expected_git_sha pool_workers=() missing_workers=() w
+    local sha_host="${SMOKE_SHA_HOST:-$pool_host}" pool_set="${SMOKE_POOL_SET:-worker1 worker2 worker3 worker4}"
     for svc in "${DEPLOYED_SERVICES[@]}"; do
         case "$svc" in worker[1-4]|worker-*) pool_workers+=("$svc") ;; esac
     done
-    for w in worker1 worker2 worker3 worker4; do
+    for w in ${pool_set}; do
         [[ " ${DEPLOYED_SERVICES[*]} " == *" $w "* ]] || missing_workers+=("$w")
     done
     if (( ${#pool_workers[@]} > 0 && ${#missing_workers[@]} > 0 )); then
@@ -1151,13 +1223,13 @@ phase_smoke_test() {
         extra_args+=(--version-unproven "$reason")
     elif (( ${#pool_workers[@]} > 0 )); then
         local rssh_rc=0
-        expected_git_sha=$(rssh "$pool_host" "cd ${REMOTE_REPO} && git rev-parse HEAD") || rssh_rc=$?
+        expected_git_sha=$(rssh "$sha_host" "cd ${REMOTE_REPO} && git rev-parse HEAD") || rssh_rc=$?
         if (( rssh_rc != 0 )); then
-            error_ "Cannot read expected worker SHA for ${label}: rssh ${pool_host} 'git rev-parse HEAD' in ${REMOTE_REPO} failed (rc=${rssh_rc}) — smoke not run"
+            error_ "Cannot read expected worker SHA for ${label}: rssh ${sha_host} 'git rev-parse HEAD' in ${REMOTE_REPO} failed (rc=${rssh_rc}) — smoke not run"
             return 1
         fi
         [[ "$expected_git_sha" =~ ^[0-9a-f]{40}$ ]] || {
-            error_ "Invalid worker checkout SHA for ${label} from ${pool_host}: '${expected_git_sha}' — smoke not run"
+            error_ "Invalid worker checkout SHA for ${label} from ${sha_host}: '${expected_git_sha}' — smoke not run"
             return 1
         }
         extra_args+=(--expected-git-sha "$expected_git_sha")
@@ -1856,6 +1928,20 @@ phase_rollback() {
     }
     warn "Code reset to ${sha}"
 
+    # prod-zusammen: the rollback SHA's docker/nginx.conf may lack the
+    # Notsperre/Schutzregel (on 21.10.2026 they existed on server2 only as a
+    # hand edit). Put the config the LB ran with before this run back into the
+    # checkout NOW — before nginx is recreated below — so the old image starts
+    # with both blocks and there is no unprotected window (the 21.10. 17:53Z
+    # server2 rollback ran ~80 s without them).
+    if [[ "$host" == "${SERVER2_HOST:-}" && -n "${KOPPEL_NGINX_RUECKWEG:-}" ]]; then
+        nginx_rueckweg_einspielen "$host" || {
+            error_ "CRITICAL: could not put the protective nginx config back into ${host}:${REMOTE_REPO}/docker/nginx.conf"
+            error_ "  saved copy: ${host}:${KOPPEL_NGINX_RUECKWEG} — copy it by hand, then recreate nginx"
+            return 2
+        }
+    fi
+
     local failed=false
     if [[ " ${services[*]} " == *" erkunder"* ]]; then
         rssh "$host" "cd ${REMOTE_REPO} && docker compose ${compose} stop erkunder" || {
@@ -2256,7 +2342,9 @@ record_deploy_proof() {
     local host="$1" server_name="$2" sha="$3"
     local gap
     for gap in "${SMOKE_UNPROVEN[@]}"; do
-        if [[ "$gap" == "${server_name}: version UNPROVEN"* ]]; then
+        # prod-zusammen: ONE joint smoke vouches for both hosts, so any gap in
+        # it keeps the markers of both (its label is the LB host, server2).
+        if [[ "$gap" == "${server_name}: version UNPROVEN"* || ( -n "${KOPPEL_STUFE:-}" && "$gap" == *": version UNPROVEN"* ) ]]; then
             warn "NOT recorded as proven: worker SHA not proven; keeping previous proof markers"
             return 0
         fi
@@ -2348,6 +2436,367 @@ catch_up_unproven_smoke() {
     error_ "RED: the pool-gated probes FAIL on the running dev build ${head:0:9}. Marker stays."
     error_ "  This command rolls nothing back — decide deliberately: redeploy a fixed build, or roll hetzner back."
     return 1
+}
+
+# ============================================================================
+# prod-zusammen: protection of the prod LB (Notsperre + Schutzregel)
+# ============================================================================
+# The LB reads /tmp/nginx.conf, rendered by envsubst from the mounted
+# docker/nginx.conf when the container starts. A block in the FILE proves
+# nothing about the running LB; only the loaded /tmp/nginx.conf and a request
+# from outside do. Markers = the two `if` lines that actually return 403.
+LB_MARKER_NOTSPERRE='if ($notsperre)'
+LB_MARKER_SCHUTZREGEL='$br_sensible_route$br_quelle_ok'
+
+# lb_schutz_geladen — 0 = both markers in the LOADED config of wt-prod-lb.
+# Prints what is missing.
+lb_schutz_geladen() {
+    local out
+    out=$(rssh "$SERVER2_HOST" "docker exec '${SERVER2_SVC_nginx}' sh -c 'for m in \"\$1\" \"\$2\"; do grep -qF -- \"\$m\" /tmp/nginx.conf || echo \"FEHLT: \$m\"; done; echo __GEPRUEFT__' _ '${LB_MARKER_NOTSPERRE}' '${LB_MARKER_SCHUTZREGEL}'" 2>&1) || true
+    if ! grep -q '__GEPRUEFT__' <<< "$out"; then
+        echo "geladene Konfiguration nicht lesbar: ${out}"
+        return 1
+    fi
+    grep '^FEHLT' <<< "$out" && return 1
+    return 0
+}
+
+# lb_schutz_messen — from outside (this machine) against the public :8000.
+# A foreign X-Forwarded-For makes a request look like it came through Caddy:
+#   /v1/metrics/request-log + XFF -> 403 (Notsperre BR14 and Schutzregel)
+#   /v1/sessions                -> 403 (Notsperre BR13-B, from anywhere)
+#   /openapi.json + XFF         -> 403 (Schutzregel alone)
+lb_schutz_messen() {
+    local url="http://${SERVER2_HOST}:8000" rc=0 code p path hdr
+    for p in "/v1/metrics/request-log|X-Forwarded-For: 203.0.113.9" "/v1/sessions|" "/openapi.json|X-Forwarded-For: 203.0.113.9"; do
+        path="${p%%|*}"; hdr="${p#*|}"
+        if [[ -n "$hdr" ]]; then
+            code=$(curl -s -o /dev/null -m 10 -w '%{http_code}' -H "$hdr" "${url}${path}" 2>/dev/null) || code="000"
+        else
+            code=$(curl -s -o /dev/null -m 10 -w '%{http_code}' "${url}${path}" 2>/dev/null) || code="000"
+        fi
+        if [[ "$code" == "403" ]]; then
+            info "  Schutzmessung ${path}${hdr:+ [$hdr]}: 403"
+        else
+            error_ "  Schutzmessung ${path}${hdr:+ [$hdr]}: ${code} (erwartet 403)"
+            rc=1
+        fi
+    done
+    return $rc
+}
+
+# lb_schutz_nachladen — re-render /tmp/nginx.conf from the mounted file the
+# way the container's own start command does, `openresty -t`, and only then
+# swap it in and HUP the master (PID 1). A failing -t leaves the running
+# config untouched.
+lb_schutz_nachladen() {
+    local script b64
+    script=$(cat <<'INNER'
+set -eu
+if grep -q 'BRIDGE_NET_GATEWAY' /etc/nginx/nginx.conf; then
+    hex=$(awk '$2 == "00000000" && $3 != "00000000" { print $3; exit }' /proc/net/route)
+    BRIDGE_NET_GATEWAY=$(printf '%d.%d.%d.%d' "0x$(echo "$hex" | cut -c7-8)" "0x$(echo "$hex" | cut -c5-6)" "0x$(echo "$hex" | cut -c3-4)" "0x$(echo "$hex" | cut -c1-2)")
+    export BRIDGE_NET_GATEWAY
+fi
+envsubst '$BRIDGE_BACKUP_HOST $BRIDGE_ID $METRICS_READER_TARGET $BRIDGE_NET_GATEWAY' < /etc/nginx/nginx.conf > /tmp/nginx.conf.schutz
+OR=$(command -v openresty || echo /usr/local/openresty/bin/openresty)
+"$OR" -t -c /tmp/nginx.conf.schutz
+cp /tmp/nginx.conf /tmp/nginx.conf.vor-schutz
+mv /tmp/nginx.conf.schutz /tmp/nginx.conf
+kill -HUP 1
+echo __NACHGELADEN__
+INNER
+)
+    b64=$(printf '%s\n' "$script" | base64 -w0)
+    local out
+    out=$(rssh "$SERVER2_HOST" "echo '${b64}' | base64 -d | docker exec -i '${SERVER2_SVC_nginx}' sh -s" 2>&1) || true
+    while IFS= read -r line; do [[ -n "$line" ]] && warn "  nachladen: ${line}"; done <<< "$out"
+    grep -q '__NACHGELADEN__' <<< "$out"
+}
+
+# lb_schutz_sicherstellen <phase> — loaded markers, repair if missing, measure.
+# 0 = both blocks loaded AND 403 from outside; 1 = loud, not repaired.
+lb_schutz_sicherstellen() {
+    local phase="$1" fehlt
+    step "LB-Schutz pruefen (${phase}): Notsperre + Schutzregel in der GELADENEN Konfiguration von ${SERVER2_SVC_nginx}"
+    if [[ "$DRY_RUN" == "true" ]]; then
+        info "[DRY-RUN] Would check /tmp/nginx.conf in ${SERVER2_SVC_nginx} for '${LB_MARKER_NOTSPERRE}' and '${LB_MARKER_SCHUTZREGEL}',"
+        info "[DRY-RUN]   re-render + openresty -t + HUP if missing, then measure 403 from outside (request-log, sessions, openapi.json)"
+        return 0
+    fi
+    if fehlt=$(lb_schutz_geladen); then
+        info "  geladen: beide Bloecke aktiv"
+    else
+        error_ "  LB-SCHUTZ FEHLT in der geladenen Konfiguration (${phase}): ${fehlt//$'\n'/; }"
+        error_ "  Nachladen aus der eingebundenen docker/nginx.conf (nginx -t, dann HUP)..."
+        if lb_schutz_nachladen && fehlt=$(lb_schutz_geladen); then
+            warn "  nachgeladen: beide Bloecke jetzt aktiv"
+        else
+            error_ "  NICHT REPARIERT: der Prod-LB laeuft OHNE Notsperre/Schutzregel — sofort von Hand herstellen"
+            error_ "  (Sicherung: ${SERVER2_HOST}:${KOPPEL_NGINX_RUECKWEG:-keine})"
+            lb_schutz_messen || true
+            return 1
+        fi
+    fi
+    lb_schutz_messen || {
+        error_ "  LB-SCHUTZ von aussen NICHT wirksam (${phase}) — Konfiguration geladen, Messung rot"
+        return 1
+    }
+    return 0
+}
+
+# koppel_nginx_rueckweg_sichern — S0. The config for the way back is the one
+# the RUNNING LB was started from (its mount, read inside the container), not
+# whatever the checkout holds: on 21.10.2026 the blocks existed on server2 only
+# as a hand edit of docker/nginx.conf, which the preflight's "clean checkout"
+# rule would otherwise make us throw away. Refuses (before any change) when
+# the running LB itself lacks a block — then there is nothing safe to go back to.
+# A dirty docker/nginx.conf identical to the saved copy is restored to the
+# committed version so the preflight passes; any other drift stays and the
+# preflight reports it.
+koppel_nginx_rueckweg_sichern() {
+    step "S0: nginx-Konfiguration des laufenden Prod-LB fuer den Rueckweg sichern (${SERVER2_HOST})"
+    local ts ziel
+    ts=$(date -u '+%Y%m%dT%H%M%SZ')
+    ziel="/root/bridge-deploy-rueckweg/nginx.conf.prod-zusammen-${ts}"
+    if [[ "$DRY_RUN" == "true" ]]; then
+        info "[DRY-RUN] Would verify both blocks in the loaded /tmp/nginx.conf of ${SERVER2_SVC_nginx},"
+        info "[DRY-RUN]   copy the LB's mounted /etc/nginx/nginx.conf to ${SERVER2_HOST}:${ziel} (must contain both blocks),"
+        info "[DRY-RUN]   and if docker/nginx.conf is a hand edit identical to it: git checkout -- docker/nginx.conf"
+        KOPPEL_NGINX_RUECKWEG="$ziel"
+        return 0
+    fi
+    local fehlt
+    if ! fehlt=$(lb_schutz_geladen); then
+        error_ "ABORTED: the running prod LB does NOT have both blocks loaded: ${fehlt//$'\n'/; }"
+        error_ "  There is no protected state to go back to. Restore the protection first. Nothing was changed."
+        return 1
+    fi
+    lb_schutz_messen || {
+        error_ "ABORTED: protection loaded, but not effective from outside. Nothing was changed."
+        return 1
+    }
+    local out
+    out=$(rssh_run "$SERVER2_HOST" <<EOF
+mkdir -p /root/bridge-deploy-rueckweg
+docker exec '${SERVER2_SVC_nginx}' cat /etc/nginx/nginx.conf > '${ziel}'
+grep -qF -- '${LB_MARKER_NOTSPERRE}' '${ziel}' || { echo "__FEHLT_NOTSPERRE__"; exit 1; }
+grep -qF -- '${LB_MARKER_SCHUTZREGEL}' '${ziel}' || { echo "__FEHLT_SCHUTZREGEL__"; exit 1; }
+cd ${REMOTE_REPO}
+dirty=\$(git status --porcelain -- docker/nginx.conf)
+if [ -n "\$dirty" ]; then
+    if cmp -s docker/nginx.conf '${ziel}'; then
+        git checkout -- docker/nginx.conf
+        echo "__HANDSTAND_ZURUECKGESETZT__"
+    else
+        echo "__HANDSTAND_ABWEICHEND__"
+    fi
+fi
+sha256sum '${ziel}'
+echo __GESICHERT__
+EOF
+    ) || true
+    while IFS= read -r line; do [[ -n "$line" ]] && info "  ${line}"; done <<< "$out"
+    if ! grep -q '__GESICHERT__' <<< "$out"; then
+        error_ "ABORTED: could not save the LB config with both blocks to ${SERVER2_HOST}:${ziel}. Nothing was deployed."
+        return 1
+    fi
+    grep -q '__HANDSTAND_ZURUECKGESETZT__' <<< "$out" && \
+        warn "  docker/nginx.conf was a hand edit identical to the LB config — saved, checkout reset to the commit (the running LB is unaffected: it reads /tmp/nginx.conf)"
+    grep -q '__HANDSTAND_ABWEICHEND__' <<< "$out" && \
+        warn "  docker/nginx.conf differs from BOTH the commit and the running LB — left as is; the preflight will refuse"
+    KOPPEL_NGINX_RUECKWEG="$ziel"
+    info "  Rueckweg-Konfiguration: ${SERVER2_HOST}:${KOPPEL_NGINX_RUECKWEG}"
+    return 0
+}
+
+# nginx_rueckweg_einspielen <host> — called by phase_rollback after git reset.
+# If the rollback SHA's own docker/nginx.conf already carries both blocks, it
+# is used as is; otherwise the S0 copy goes in (the checkout is then dirty
+# again, exactly like before the run — the next deploy's preflight says so).
+nginx_rueckweg_einspielen() {
+    local host="$1" out
+    out=$(rssh_run "$host" <<EOF
+cd ${REMOTE_REPO}
+if grep -qF -- '${LB_MARKER_NOTSPERRE}' docker/nginx.conf && grep -qF -- '${LB_MARKER_SCHUTZREGEL}' docker/nginx.conf; then
+    echo __COMMIT_HAT_SCHUTZ__
+else
+    test -s '${KOPPEL_NGINX_RUECKWEG}'
+    cp '${KOPPEL_NGINX_RUECKWEG}' docker/nginx.conf
+    echo __EINGESPIELT__
+fi
+EOF
+    ) || return 1
+    if grep -q '__COMMIT_HAT_SCHUTZ__' <<< "$out"; then
+        warn "  nginx.conf of the rollback SHA carries both blocks — used as is"
+    elif grep -q '__EINGESPIELT__' <<< "$out"; then
+        warn "  protective nginx.conf put back from ${KOPPEL_NGINX_RUECKWEG} (checkout dirty again, as before the run)"
+    else
+        return 1
+    fi
+    return 0
+}
+
+# ============================================================================
+# prod-zusammen: the coupled run
+# ============================================================================
+# koppel_rueckweg — the way back over BOTH touched hosts, worker-host first.
+# 0 = everything rolled back; 2 = a rollback itself failed (manual).
+koppel_rueckweg() {
+    local grund="$1" rc=0 r
+    error_ "=== prod-zusammen: RUECKWEG auf beiden Hosts (${grund}) — zuerst Worker-Host, dann server2 ==="
+    warn "  DB-Migrationen sind additiv und bleiben stehen (alter Code laeuft mit dem neuen Schema)."
+    if [[ -n "$KOPPEL_WH_ROLLBACK_SHA" && ${#KOPPEL_WH_DEPLOYED[@]} -gt 0 ]]; then
+        r=0; phase_rollback "$WORKERHOST_HOST" "$WORKERHOST_COMPOSE" "$KOPPEL_WH_ROLLBACK_SHA" "$WORKERHOST_NEEDS_BUILD" "${KOPPEL_WH_DEPLOYED[@]}" || r=$?
+        if (( r == 2 )); then
+            # New workers may still be running; they need the NEW platform-api
+            # for their plan catalog (KeyError 'priceBasis' against the old).
+            error_ "CRITICAL: Worker-Host-Rueckweg gescheitert — server2 bleibt NEU stehen (neue Worker brauchen die neue platform-api). Handarbeit."
+            lb_schutz_sicherstellen "nach gescheitertem Worker-Rueckweg" || true
+            return 2
+        fi
+    else
+        info "  Worker-Host: in diesem Lauf nicht beruehrt — kein Rueckweg noetig"
+    fi
+    if [[ -n "$KOPPEL_S2_ROLLBACK_SHA" && ${#KOPPEL_S2_DEPLOYED[@]} -gt 0 ]]; then
+        r=0; phase_rollback "$SERVER2_HOST" "$SERVER2_COMPOSE" "$KOPPEL_S2_ROLLBACK_SHA" "$SERVER2_NEEDS_BUILD" "${KOPPEL_S2_DEPLOYED[@]}" || r=$?
+        (( r == 2 )) && rc=2
+    else
+        info "  server2: in diesem Lauf nicht beruehrt — kein Rueckweg noetig"
+    fi
+    lb_schutz_sicherstellen "nach dem Rueckweg" || rc=2
+    return $rc
+}
+
+# koppel_rueckweg_planen — dry-run: print the way back without doing it.
+koppel_rueckweg_planen() {
+    local fall="$1"
+    info "[DRY-RUN] Rueckweg bei ${fall}:"
+    info "[DRY-RUN]   1. Worker-Host ${WORKERHOST_HOST}: git reset --hard <Rollback-SHA Worker-Host>, rebuild + recreate ${WORKERHOST_ALL} (Health-Wartezeit je Container)"
+    info "[DRY-RUN]   2. server2 ${SERVER2_HOST}: git reset --hard <Rollback-SHA server2>, Schutz-nginx.conf aus ${KOPPEL_NGINX_RUECKWEG:-<S0>} in docker/nginx.conf (vor dem nginx-Neustart), rebuild + recreate ${SERVER2_ALL}"
+    info "[DRY-RUN]   3. LB-Schutz: geladene /tmp/nginx.conf pruefen, ggf. nachladen (nginx -t, HUP), 403 von aussen messen"
+    info "[DRY-RUN]   DB-Migrationen bleiben (additiv)."
+}
+
+# _koppel_ende — EXIT trap of prod-zusammen: whatever happened, report the
+# LOADED protection of the prod LB once more (part 3b of the contract).
+_koppel_ende() {
+    local rc=$?
+    trap - EXIT
+    if [[ "$DRY_RUN" != "true" ]]; then
+        lb_schutz_sicherstellen "Laufende (exit ${rc})" || {
+            error_ "=== prod-zusammen endet mit FEHLENDEM LB-Schutz — Notsperre/Schutzregel von Hand herstellen ==="
+            (( rc == 0 || rc == 1 || rc == 3 )) && rc=2
+        }
+    else
+        lb_schutz_sicherstellen "Laufende (exit ${rc})" || true
+    fi
+    exit "$rc"
+}
+
+deploy_prod_zusammen() {
+    step "prod-zusammen: server2 (${SERVER2_HOST}) + Worker-Host (${WORKERHOST_HOST}), ein gemeinsamer Smoke"
+    trap _koppel_ende EXIT
+
+    local repo_dir r
+    repo_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+    git -C "$repo_dir" fetch --quiet origin develop || {
+        error_ "ABORTED: git fetch origin develop failed — cannot pin the target SHA."
+        return 1
+    }
+    KOPPEL_ZIEL_SHA="$(git -C "$repo_dir" rev-parse origin/develop)"
+    info "Ziel-SHA fuer beide Hosts: ${KOPPEL_ZIEL_SHA}"
+    if [[ "$DRY_RUN" == "true" ]]; then
+        info "[DRY-RUN] Reihenfolge: S0 nginx-Rueckweg sichern -> S1 server2 (${SERVER2_ALL}) -> S2 Worker-Host (${WORKERHOST_ALL})"
+        info "[DRY-RUN]   -> S3 gemeinsamer Smoke (Worker dieses Laufs muessen antworten) -> S4 Router-Blick, Selbsttest, Nachweise beider Hosts"
+    fi
+
+    # Pre-checks the single modes would run later, BEFORE anything changes:
+    # dev-first (both targets read the same marker) and the LB config to go back to.
+    phase_tooling_freshness_gate || return 1
+    phase_prod_order_gate "server2" || return 1
+    koppel_nginx_rueckweg_sichern || return 1
+
+    # === S1: server2 (all of its gates; smoke deferred) ===
+    KOPPEL_STUFE="S1"
+    r=0; deploy_server "server2" || r=$?
+    KOPPEL_S2_ROLLBACK_SHA="$ROLLBACK_SHA"; KOPPEL_S2_DEPLOYED=("${DEPLOYED_SERVICES[@]}")
+    if (( r != 0 )); then
+        # deploy_server rolled server2 back itself (phase_rollback, with the
+        # nginx graft); the worker-host was not touched yet.
+        error_ "S1 server2 rot (rc=${r}) — server2 hat seinen eigenen Rueckweg gemacht, Worker-Host unberuehrt"
+        if [[ "$DRY_RUN" == "true" ]]; then
+            koppel_rueckweg_planen "rotem S1"
+        elif (( r == 1 )); then
+            # A refusal before Phase 4 only resets the code, without
+            # phase_rollback — and S0 may have reset a hand-edited protective
+            # nginx.conf. Put it back so a later LB restart keeps the blocks.
+            nginx_rueckweg_einspielen "$SERVER2_HOST" || {
+                error_ "CRITICAL: protective nginx.conf NOT back in ${SERVER2_HOST}:${REMOTE_REPO}/docker/nginx.conf (copy: ${KOPPEL_NGINX_RUECKWEG})"
+                return 2
+            }
+        fi
+        return "$r"
+    fi
+    lb_schutz_sicherstellen "nach S1 server2" || {
+        [[ "$DRY_RUN" == "true" ]] && return 1
+        r=0; koppel_rueckweg "LB-Schutz nach S1 nicht wirksam" || r=$?
+        (( r == 2 )) && return 2
+        return 1
+    }
+
+    # === S2: worker-host (all of its gates; rolling, health wait) ===
+    KOPPEL_STUFE="S2"
+    r=0; deploy_server "prod-workers" || r=$?
+    KOPPEL_WH_ROLLBACK_SHA="$ROLLBACK_SHA"; KOPPEL_WH_DEPLOYED=("${DEPLOYED_SERVICES[@]}")
+    if (( r != 0 )); then
+        error_ "S2 Worker-Host rot (rc=${r}) — Worker-Host hat seinen eigenen Rueckweg gemacht"
+        if [[ "$DRY_RUN" == "true" ]]; then koppel_rueckweg_planen "rotem S2"; return "$r"; fi
+        (( r == 2 )) && { error_ "CRITICAL: Worker-Host-Rueckweg gescheitert — server2 bleibt NEU stehen (neue Worker brauchen die neue platform-api). Handarbeit."; return 2; }
+        # The worker-host is back already; only server2 is left.
+        KOPPEL_WH_DEPLOYED=()
+        r=0; koppel_rueckweg "S2 Worker-Host rot" || r=$?
+        (( r == 2 )) && return 2
+        return 1
+    fi
+
+    # === S3: ONE joint smoke over the whole prod bridge ===
+    local server2_bridge
+    server2_bridge=$(deployed_bridge_id "$SERVER2_HOST" "${SERVER2_SVC_nginx}") || server2_bridge=""
+    DEPLOYED_SERVICES=("${KOPPEL_WH_DEPLOYED[@]}")
+    SMOKE_POOL_SET="${WORKERHOST_ALL//metrics-reader/}"
+    SMOKE_SHA_HOST="$WORKERHOST_HOST"
+    local smoke_ok=true
+    if [[ -z "$server2_bridge" ]]; then
+        smoke_ok=false
+    else
+        # required: the workers answering are the ones THIS run deployed, so
+        # a missing X-Bridge-Served-By stamp is a failure, not UNPROVEN.
+        phase_smoke_test "server2" "http://${SERVER2_HOST}:8000" "${server2_bridge}" required \
+            - - "X-Priority: production" || smoke_ok=false
+    fi
+    if [[ "$DRY_RUN" == "true" ]]; then
+        koppel_rueckweg_planen "rotem gemeinsamem Smoke (S3)"
+    elif [[ "$smoke_ok" != "true" ]]; then
+        r=0; koppel_rueckweg "gemeinsamer Smoke rot" || r=$?
+        (( r == 2 )) && return 2
+        return 1
+    fi
+
+    # === S4: router eyes, self-test, proof markers (both hosts) ===
+    if [[ "$DRY_RUN" != "true" ]]; then
+        check_pool_router_state "$SERVER2_HOST" "${SERVER2_SVC_nginx}" || {
+            error_ "Deploy gestoppt: der Prod-LB laeuft, aber sein pool_router ist BLIND — KEIN Rueckweg"
+            error_ "  (Ursache Reader-Adresse/-Erreichbarkeit, nicht dieses Image). METRICS_READER_TARGET pruefen."
+            return 1
+        }
+    fi
+    DEPLOYED_SERVICES=("${KOPPEL_S2_DEPLOYED[@]}"); ROLLBACK_SHA="$KOPPEL_S2_ROLLBACK_SHA"
+    phase_selftest_and_record "server2" "$SERVER2_HOST" "SERVER2" "$SERVER2_ALL" || return 1
+    DEPLOYED_SERVICES=("${KOPPEL_WH_DEPLOYED[@]}"); ROLLBACK_SHA="$KOPPEL_WH_ROLLBACK_SHA"
+    phase_selftest_and_record "prod-workers" "$WORKERHOST_HOST" "WORKERHOST" "$WORKERHOST_ALL" || return 1
+    step "SUCCESS: prod-zusammen (server2 + Worker-Host auf ${KOPPEL_ZIEL_SHA:0:9})"
+    return 0
 }
 
 deploy_server() {
@@ -2517,6 +2966,14 @@ deploy_server() {
         fi
     done
 
+    # === prod-zusammen stage: stop here, the joint end does the rest ===
+    # Only the per-host smoke is deferred (it cannot pass with one half new);
+    # self-test and proof markers follow after the joint smoke, for both hosts.
+    if [[ -n "${KOPPEL_STUFE:-}" ]]; then
+        step "Phase 5: Smoke test deferred — ${server_name} is stage ${KOPPEL_STUFE} of prod-zusammen (joint smoke after both hosts)"
+        return 0
+    fi
+
     # === Phase 5: smoke test ===
     if [[ "$server_name" == "hetzner" ]]; then
         # Source env to get AI_BRIDGE_URL
@@ -2595,6 +3052,16 @@ deploy_server() {
         info "Per-worker health already verified in Phase 4 (${DEPLOYED_SERVICES[*]})."
         info "Full request-path smoke only applies after the nginx cutover — see ADR-0009."
     fi
+
+    phase_selftest_and_record "$server_name" "$host" "$server_prefix" "$all_services"
+}
+
+# phase_selftest_and_record <server-name> <host> <server-prefix> <all-services>
+# Phase 6 + 7 of a host, on the globals DEPLOYED_SERVICES / ROLLBACK_SHA.
+# Shared by deploy_server and the joint end of prod-zusammen.
+phase_selftest_and_record() {
+    local server_name="$1" host="$2" server_prefix="$3" all_services="$4"
+    local svc
 
     # === Phase 6: worker config self-test ===
     # Laeuft fuer JEDE Topologie, auch fuer prod-workers ohne oeffentlichen
@@ -2753,6 +3220,9 @@ case "$SERVER" in
         ;;
     prod-workers)
         deploy_server "prod-workers"
+        ;;
+    prod-zusammen)
+        deploy_prod_zusammen
         ;;
 esac
 
