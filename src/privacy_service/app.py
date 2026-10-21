@@ -143,9 +143,16 @@ class ConvertSemanticHtmlResponse(BaseModel):
 
 # ======================== App Setup ========================
 
-# Every route except /health requires `Authorization: Bearer <PRIVACY_SERVICE_TOKEN>`.
-# The service refuses to start without the token instead of running open;
-# the token comes from Infisical via the container environment.
+# Token scope is set by PRIVACY_TOKEN_PFLICHT:
+#   "alle"        (default) every route except /health requires
+#                 `Authorization: Bearer <PRIVACY_SERVICE_TOKEN>`.
+#   "deanonymize" transition mode: only _STRICT_PATHS require the token. On all
+#                 other product routes the token is optional: a presented token
+#                 must be correct (else 401), a missing one is let through and
+#                 counted (see _TOKENLOS_ZAEHLER, readable at /auth-status).
+# The service refuses to start without the token or with an unknown mode
+# instead of running open; the token comes from Infisical via the container
+# environment.
 _SERVICE_TOKEN = os.getenv("PRIVACY_SERVICE_TOKEN", "").strip()
 if not _SERVICE_TOKEN:
     raise RuntimeError(
@@ -153,7 +160,19 @@ if not _SERVICE_TOKEN:
         "without authentication."
     )
 _SERVICE_TOKEN_BYTES = _SERVICE_TOKEN.encode("utf-8")
+_TOKEN_PFLICHT = os.getenv("PRIVACY_TOKEN_PFLICHT", "alle").strip()
+if _TOKEN_PFLICHT not in ("alle", "deanonymize"):
+    raise RuntimeError(
+        f"PRIVACY_TOKEN_PFLICHT={_TOKEN_PFLICHT!r} is invalid — allowed values are "
+        "'alle' or 'deanonymize'. Refusing to start."
+    )
 _OPEN_PATHS = ("/health",)
+# Routes that accept a mapping or return it/plaintext-derived data on request
+# of the caller without the bridge using them today; token is always required.
+_STRICT_PATHS = ("/deanonymize", "/auth-status")
+_TOKENLOS_ZAEHLER: Dict[str, int] = {}
+_TOKENLOS_LOG_INTERVAL_S = 60.0
+_tokenlos_last_log = 0.0
 
 # No interactive docs / schema: they list every endpoint to anonymous callers.
 app = FastAPI(
@@ -185,20 +204,44 @@ async def track_active_requests(request: Request, call_next):
         return await call_next(request)
 
 
+def _unauthorized() -> JSONResponse:
+    return JSONResponse(
+        status_code=401,
+        content={"detail": "Unauthorized"},
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+
+
 @app.middleware("http")
 async def require_bearer_token(request: Request, call_next):
     """Registered after track_active_requests, so it runs first: no token, no work."""
-    if request.url.path not in _OPEN_PATHS:
+    global _tokenlos_last_log
+    path = request.url.path
+    if path not in _OPEN_PATHS:
         header = request.headers.get("authorization", "")
         scheme, _, presented = header.partition(" ")
-        if scheme.lower() != "bearer" or not hmac.compare_digest(
-            presented.strip().encode("utf-8"), _SERVICE_TOKEN_BYTES
-        ):
-            return JSONResponse(
-                status_code=401,
-                content={"detail": "Unauthorized"},
-                headers={"WWW-Authenticate": "Bearer"},
-            )
+        strict = _TOKEN_PFLICHT == "alle" or path in _STRICT_PATHS
+        if header:
+            if scheme.lower() != "bearer" or not hmac.compare_digest(
+                presented.strip().encode("utf-8"), _SERVICE_TOKEN_BYTES
+            ):
+                return _unauthorized()
+        elif strict:
+            return _unauthorized()
+        else:
+            # Begrenzte Schluessel: Scanner-Pfade (/.env, /.git/...) duerfen den Zaehler nicht unbegrenzt wachsen lassen.
+            key = path if (path in _TOKENLOS_ZAEHLER or len(_TOKENLOS_ZAEHLER) < 50) else "<weitere>"
+            _TOKENLOS_ZAEHLER[key] = _TOKENLOS_ZAEHLER.get(key, 0) + 1
+            now = _time.monotonic()
+            if now - _tokenlos_last_log >= _TOKENLOS_LOG_INTERVAL_S:
+                _tokenlos_last_log = now
+                logger.warning(
+                    "privacy-service: calls without bearer token accepted "
+                    "(transition mode PRIVACY_TOKEN_PFLICHT=deanonymize), "
+                    "total=%d by_path=%s",
+                    sum(_TOKENLOS_ZAEHLER.values()),
+                    dict(_TOKENLOS_ZAEHLER),
+                )
     return await call_next(request)
 
 
@@ -1735,6 +1778,16 @@ async def health():
     return {
         "status": "healthy",
         "service": "privacy-pdf-service",
+    }
+
+
+@app.get("/auth-status")
+async def auth_status():
+    """Token-required counter of calls accepted without a token (transition mode)."""
+    return {
+        "token_pflicht": _TOKEN_PFLICHT,
+        "tokenlos_gesamt": sum(_TOKENLOS_ZAEHLER.values()),
+        "tokenlos_je_pfad": dict(_TOKENLOS_ZAEHLER),
     }
 
 
