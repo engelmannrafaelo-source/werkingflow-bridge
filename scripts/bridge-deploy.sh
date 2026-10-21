@@ -32,13 +32,16 @@
 #         platform-api at startup and dies with KeyError 'priceBasis'
 #         (migration 066) while server2 still runs the OLD platform-api.
 #     Order: S0 save the LB's protective nginx config for the way back ->
-#     S1 server2 (postgres-prod, platform-api, nginx; every gate of the server2
+#     V read-only checks of BOTH hosts (preflight, foreign-commit gate,
+#     checkout HEAD == running build != target) -> S1 server2 (postgres-prod, platform-api, nginx; every gate of the server2
 #     mode, only its own smoke is deferred) -> S2 worker-host (rolling, health
 #     wait; every gate of prod-workers) -> S3 ONE joint smoke over the whole
 #     prod bridge (workers of THIS run must answer, SHA proven) -> S4 router
 #     state, worker self-test, proof markers on both hosts.
-#     Both hosts are pinned to the SAME origin/develop SHA; if develop moves
-#     during the run, the second host refuses instead of shipping a mix.
+#     Both hosts are pinned to the SAME origin/develop SHA (git merge --ff-only
+#     <sha>, HEAD checked, smoke expects that SHA); if develop moves during the
+#     run, the second host refuses and both go back instead of shipping a mix.
+#     Ctrl-C/kill still runs the end check and puts a reset hand edit back.
 #     Way back: ANY red stage (or the joint smoke) rolls back BOTH hosts that
 #     were touched, worker-host FIRST (old workers run fine against the new
 #     platform-api, proven 21.10. 17:50Z; new workers die against the old one),
@@ -54,7 +57,7 @@
 #     old image starts directly with the blocks. Afterwards (and at the end of
 #     every run, also red) the loaded /tmp/nginx.conf is checked for both
 #     blocks and measured from outside (403); a missing block is re-rendered
-#     in place (nginx -t, then reload/HUP) and reported loudly.
+#     in place (nginx -t, then openresty -s reload) and reported loudly.
 #     Exit codes as below (0/1/2/3); 1 also = refused before any change.
 #
 # EXIT CODES:
@@ -230,11 +233,16 @@ KOPPEL_ZIEL_SHA=""
 KOPPEL_NGINX_RUECKWEG=""
 # Per-host state survives deploy_server's per-server reset.
 KOPPEL_S2_ROLLBACK_SHA=""; KOPPEL_S2_DEPLOYED=()
+# true until S1 starts: the end check then only reports, never reloads (H3).
+KOPPEL_UNVERAENDERT="true"
+# S0 reset a hand-edited protective docker/nginx.conf on server2 (H1/H2).
+KOPPEL_HANDSTAND_ZURUECKGESETZT="false"
 KOPPEL_WH_ROLLBACK_SHA=""; KOPPEL_WH_DEPLOYED=()
 # phase_smoke_test version proof: which workers form the answering pool and
 # which host's checkout names their SHA. Defaults = the hetzner layout.
 SMOKE_POOL_SET="worker1 worker2 worker3 worker4"
 SMOKE_SHA_HOST=""
+SMOKE_EXPECTED_SHA=""
 
 # ============================================================================
 # Logging
@@ -379,6 +387,13 @@ acquire_deploy_lock() {
     local host_label="$1" fd="$2"
     # BRIDGE_DEPLOY_LOCK_DIR only for dummy runs (stubbed ssh), so a rehearsal
     # never holds the real host lock a parallel real deploy needs.
+    if [[ -n "${BRIDGE_DEPLOY_LOCK_DIR:-}" && "$DRY_RUN" != "true" ]]; then
+        case "$(command -v sudo)" in
+            /usr/bin/sudo|/bin/sudo)
+                error_ "BRIDGE_DEPLOY_LOCK_DIR is set, but sudo/ssh reach real hosts — a real deploy uses the real host lock. Unset it."
+                exit 1 ;;
+        esac
+    fi
     local lockfile="${BRIDGE_DEPLOY_LOCK_DIR:-/var/lock}/bridge-deploy.${host_label}.lock"
     # Append-Modus: das Öffnen darf die Holder-Info eines laufenden Deploys
     # nicht trunkieren (ein '>' würde das tun, noch VOR dem flock-Versuch).
@@ -754,6 +769,26 @@ phase_code_update() {
     info "Code: ${ROLLBACK_SHA} → ${remote_sha}"
 
     phase_foreign_commit_gate "$host" "${ROLLBACK_SHA}" "${remote_sha}" || return 1
+
+    # prod-zusammen: fast-forward to the PINNED SHA, not to whatever
+    # origin/develop is a second later (a pull re-fetches), then prove HEAD.
+    if [[ -n "${KOPPEL_ZIEL_SHA:-}" ]]; then
+        dry_rssh "$host" "cd ${REMOTE_REPO} && git merge --ff-only '${KOPPEL_ZIEL_SHA}'" || {
+            error_ "git merge --ff-only ${KOPPEL_ZIEL_SHA:0:9} failed on ${host}"
+            return 1
+        }
+        if [[ "$DRY_RUN" != "true" ]]; then
+            local head_now
+            head_now=$(rssh "$host" "cd ${REMOTE_REPO} && git rev-parse HEAD") || head_now="?"
+            if [[ "$head_now" != "$KOPPEL_ZIEL_SHA" ]]; then
+                error_ "prod-zusammen: HEAD on ${host} is ${head_now:0:9} after the fast-forward, expected ${KOPPEL_ZIEL_SHA:0:9} — reverting code"
+                rssh "$host" "cd ${REMOTE_REPO} && git reset --hard '${ROLLBACK_SHA}'" || true
+                return 1
+            fi
+        fi
+        info "Fast-forward OK → ${KOPPEL_ZIEL_SHA}"
+        return 0
+    fi
 
     dry_rssh "$host" "cd ${REMOTE_REPO} && git pull --ff-only origin develop" || {
         error_ "git pull --ff-only failed — cannot fast-forward to origin/develop"
@@ -1223,7 +1258,13 @@ phase_smoke_test() {
         extra_args+=(--version-unproven "$reason")
     elif (( ${#pool_workers[@]} > 0 )); then
         local rssh_rc=0
-        expected_git_sha=$(rssh "$sha_host" "cd ${REMOTE_REPO} && git rev-parse HEAD") || rssh_rc=$?
+        # prod-zusammen: the pinned SHA, never a host HEAD that could have
+        # moved past what dev proved.
+        if [[ -n "${SMOKE_EXPECTED_SHA:-}" ]]; then
+            expected_git_sha="$SMOKE_EXPECTED_SHA"
+        else
+            expected_git_sha=$(rssh "$sha_host" "cd ${REMOTE_REPO} && git rev-parse HEAD") || rssh_rc=$?
+        fi
         if (( rssh_rc != 0 )); then
             error_ "Cannot read expected worker SHA for ${label}: rssh ${sha_host} 'git rev-parse HEAD' in ${REMOTE_REPO} failed (rc=${rssh_rc}) — smoke not run"
             return 1
@@ -1262,6 +1303,10 @@ phase_smoke_test() {
         # deployed code, so they stayed UNVERIFIED. Deliberately not a
         # rollback (every build gets that same 429 while the Anthropic
         # accounts sit at their weekly wall), but it must never read as green.
+        # prod-zusammen: no green with unverified endpoints — exit 3, markers kept.
+        if [[ -n "${KOPPEL_STUFE:-}" ]] && grep -qE '^SMOKE_(CAPACITY|DEPENDENCY):' <<< "$smoke_out"; then
+            SMOKE_UNPROVEN+=("${label}: endpoints UNPROVEN — $(grep -E '^SMOKE_(CAPACITY|DEPENDENCY):' <<< "$smoke_out" | head -1)")
+        fi
         if grep -q '^SMOKE_CAPACITY:' <<< "$smoke_out"; then
             warn "Smoke test PASSED for ${label} WITH UNVERIFIED ENDPOINTS (pool capacity unavailable)"
             warn "  Re-run the affected probes once the pool recovers — see the SMOKE_CAPACITY line above."
@@ -2342,10 +2387,10 @@ record_deploy_proof() {
     local host="$1" server_name="$2" sha="$3"
     local gap
     for gap in "${SMOKE_UNPROVEN[@]}"; do
-        # prod-zusammen: ONE joint smoke vouches for both hosts, so any gap in
-        # it keeps the markers of both (its label is the LB host, server2).
-        if [[ "$gap" == "${server_name}: version UNPROVEN"* || ( -n "${KOPPEL_STUFE:-}" && "$gap" == *": version UNPROVEN"* ) ]]; then
-            warn "NOT recorded as proven: worker SHA not proven; keeping previous proof markers"
+        # prod-zusammen: ONE joint smoke vouches for both hosts, so ANY gap in
+        # it (version, capacity, dependency) keeps the markers of both.
+        if [[ "$gap" == "${server_name}: version UNPROVEN"* || -n "${KOPPEL_STUFE:-}" ]]; then
+            warn "NOT recorded as proven: ${gap}; keeping previous proof markers"
             return 0
         fi
     done
@@ -2487,8 +2532,11 @@ lb_schutz_messen() {
 
 # lb_schutz_nachladen — re-render /tmp/nginx.conf from the mounted file the
 # way the container's own start command does, `openresty -t`, and only then
-# swap it in and HUP the master (PID 1). A failing -t leaves the running
-# config untouched.
+# swap it in and `openresty -s reload` (signal to the master from its pid
+# file — PID 1 may be a shell without exec in older compose commands, which
+# would swallow a HUP). A failing -t leaves the running config untouched.
+# The file check after this proves nothing about the running master; the
+# caller's measurement from outside is the proof.
 lb_schutz_nachladen() {
     local script b64
     script=$(cat <<'INNER'
@@ -2503,7 +2551,8 @@ OR=$(command -v openresty || echo /usr/local/openresty/bin/openresty)
 "$OR" -t -c /tmp/nginx.conf.schutz
 cp /tmp/nginx.conf /tmp/nginx.conf.vor-schutz
 mv /tmp/nginx.conf.schutz /tmp/nginx.conf
-kill -HUP 1
+"$OR" -s reload -c /tmp/nginx.conf
+sleep 3
 echo __NACHGELADEN__
 INNER
 )
@@ -2517,18 +2566,23 @@ INNER
 # lb_schutz_sicherstellen <phase> — loaded markers, repair if missing, measure.
 # 0 = both blocks loaded AND 403 from outside; 1 = loud, not repaired.
 lb_schutz_sicherstellen() {
-    local phase="$1" fehlt
+    local phase="$1" modus="${2:-}" fehlt
     step "LB-Schutz pruefen (${phase}): Notsperre + Schutzregel in der GELADENEN Konfiguration von ${SERVER2_SVC_nginx}"
     if [[ "$DRY_RUN" == "true" ]]; then
         info "[DRY-RUN] Would check /tmp/nginx.conf in ${SERVER2_SVC_nginx} for '${LB_MARKER_NOTSPERRE}' and '${LB_MARKER_SCHUTZREGEL}',"
-        info "[DRY-RUN]   re-render + openresty -t + HUP if missing, then measure 403 from outside (request-log, sessions, openapi.json)"
+        info "[DRY-RUN]   re-render + openresty -t + openresty -s reload if missing, then measure 403 from outside (request-log, sessions, openapi.json)"
         return 0
     fi
     if fehlt=$(lb_schutz_geladen); then
         info "  geladen: beide Bloecke aktiv"
     else
         error_ "  LB-SCHUTZ FEHLT in der geladenen Konfiguration (${phase}): ${fehlt//$'\n'/; }"
-        error_ "  Nachladen aus der eingebundenen docker/nginx.conf (nginx -t, dann HUP)..."
+        if [[ "$modus" == "nur-pruefen" ]]; then
+            error_ "  Dieser Lauf hat am LB nichts geaendert und laedt deshalb auch nichts nach — Schutz von Hand herstellen."
+            lb_schutz_messen || true
+            return 1
+        fi
+        error_ "  Nachladen aus der eingebundenen docker/nginx.conf (nginx -t, dann openresty -s reload)..."
         if lb_schutz_nachladen && fehlt=$(lb_schutz_geladen); then
             warn "  nachgeladen: beide Bloecke jetzt aktiv"
         else
@@ -2601,6 +2655,7 @@ EOF
         error_ "ABORTED: could not save the LB config with both blocks to ${SERVER2_HOST}:${ziel}. Nothing was deployed."
         return 1
     fi
+    grep -q '__HANDSTAND_ZURUECKGESETZT__' <<< "$out" && KOPPEL_HANDSTAND_ZURUECKGESETZT="true"
     grep -q '__HANDSTAND_ZURUECKGESETZT__' <<< "$out" && \
         warn "  docker/nginx.conf was a hand edit identical to the LB config — saved, checkout reset to the commit (the running LB is unaffected: it reads /tmp/nginx.conf)"
     grep -q '__HANDSTAND_ABWEICHEND__' <<< "$out" && \
@@ -2640,6 +2695,55 @@ EOF
 # ============================================================================
 # prod-zusammen: the coupled run
 # ============================================================================
+# koppel_vorpruefung <name> <host> — before S1, per host: preflight (SSH,
+# disk, clean checkout, develop, provenance), fetch, and the rollback point.
+# The way back resets to the checkout HEAD, so that HEAD must be what RUNS:
+#   HEAD == pinned target  -> pulled without a deploy; the "way back" would
+#                             rebuild the new code -> refuse (W2)
+#   HEAD != .bridge-deployed-sha -> checkout and running build disagree -> refuse
+#   target not a fast-forward of HEAD -> refuse
+# then the foreign-commit gate for HEAD..target. Changes nothing.
+koppel_vorpruefung() {
+    local name="$1" host="$2" out head marker anc
+    step "Vorpruefung ${name} (${host}) — vor jeder Aenderung"
+    phase_preflight "$host" || return 1
+    if [[ "$DRY_RUN" == "true" ]]; then
+        info "[DRY-RUN] Would fetch on ${host} and refuse unless HEAD == .bridge-deployed-sha != ${KOPPEL_ZIEL_SHA:0:9} and ${KOPPEL_ZIEL_SHA:0:9} fast-forwards HEAD"
+        return 0
+    fi
+    out=$(rssh_run "$host" <<EOF
+cd ${REMOTE_REPO} || exit 1
+timeout 30 git fetch origin >/dev/null 2>&1 || { echo "FETCH_FEHLER"; exit 1; }
+echo "__VORPRUEFUNG__"
+echo "HEAD=\$(git rev-parse HEAD)"
+echo "MARKER=\$(cat ${DEPLOYED_SHA_FILE} 2>/dev/null | tr -d '[:space:]')"
+if git merge-base --is-ancestor HEAD '${KOPPEL_ZIEL_SHA}' 2>/dev/null; then echo "ANC=1"; else echo "ANC=0"; fi
+EOF
+    ) || true
+    if ! grep -q '__VORPRUEFUNG__' <<< "$out"; then
+        error_ "ABORTED (${name}): Vorpruefung auf ${host} nicht lesbar: ${out:-<keine Ausgabe>}"
+        return 1
+    fi
+    head=$(sed -n 's/^HEAD=//p' <<< "$out"); marker=$(sed -n 's/^MARKER=//p' <<< "$out"); anc=$(sed -n 's/^ANC=//p' <<< "$out")
+    info "  ${name}: HEAD ${head:0:9}, laeuft laut ${DEPLOYED_SHA_FILE##*/} ${marker:0:9}, Ziel ${KOPPEL_ZIEL_SHA:0:9}"
+    if [[ "$head" == "$KOPPEL_ZIEL_SHA" ]]; then
+        error_ "ABORTED (${name}): the checkout on ${host} already sits at the target ${KOPPEL_ZIEL_SHA:0:9}."
+        error_ "  The way back resets to the checkout HEAD — it would rebuild the NEW code. Nothing was changed."
+        error_ "  Reset the checkout to what runs (${marker:-?}) and start again."
+        return 1
+    fi
+    if [[ -z "$marker" || "$marker" != "$head" ]]; then
+        error_ "ABORTED (${name}): checkout HEAD ${head:0:9} != running build ${marker:-<kein Marker>} on ${host} — no reliable way back. Nothing was changed."
+        return 1
+    fi
+    if [[ "$anc" != "1" ]]; then
+        error_ "ABORTED (${name}): ${KOPPEL_ZIEL_SHA:0:9} is not a fast-forward of ${head:0:9} on ${host}. Nothing was changed."
+        return 1
+    fi
+    phase_foreign_commit_gate "$host" "$head" "$KOPPEL_ZIEL_SHA" || return 1
+    return 0
+}
+
 # koppel_rueckweg — the way back over BOTH touched hosts, worker-host first.
 # 0 = everything rolled back; 2 = a rollback itself failed (manual).
 koppel_rueckweg() {
@@ -2674,7 +2778,7 @@ koppel_rueckweg_planen() {
     info "[DRY-RUN] Rueckweg bei ${fall}:"
     info "[DRY-RUN]   1. Worker-Host ${WORKERHOST_HOST}: git reset --hard <Rollback-SHA Worker-Host>, rebuild + recreate ${WORKERHOST_ALL} (Health-Wartezeit je Container)"
     info "[DRY-RUN]   2. server2 ${SERVER2_HOST}: git reset --hard <Rollback-SHA server2>, Schutz-nginx.conf aus ${KOPPEL_NGINX_RUECKWEG:-<S0>} in docker/nginx.conf (vor dem nginx-Neustart), rebuild + recreate ${SERVER2_ALL}"
-    info "[DRY-RUN]   3. LB-Schutz: geladene /tmp/nginx.conf pruefen, ggf. nachladen (nginx -t, HUP), 403 von aussen messen"
+    info "[DRY-RUN]   3. LB-Schutz: geladene /tmp/nginx.conf pruefen, ggf. nachladen (nginx -t, openresty -s reload), 403 von aussen messen"
     info "[DRY-RUN]   DB-Migrationen bleiben (additiv)."
 }
 
@@ -2683,8 +2787,19 @@ koppel_rueckweg_planen() {
 _koppel_ende() {
     local rc=$?
     trap - EXIT
+    # A red or interrupted run must not leave server2's checkout without the
+    # protective nginx.conf S0 may have reset (H1/H2). Idempotent: a checkout
+    # whose own commit carries both blocks is left alone.
+    if [[ "$DRY_RUN" != "true" && $rc -ne 0 && "$KOPPEL_HANDSTAND_ZURUECKGESETZT" == "true" ]]; then
+        nginx_rueckweg_einspielen "$SERVER2_HOST" || {
+            error_ "CRITICAL: protective nginx.conf NOT back in ${SERVER2_HOST}:${REMOTE_REPO}/docker/nginx.conf (copy: ${KOPPEL_NGINX_RUECKWEG})"
+            rc=2
+        }
+    fi
+    local modus=""
+    [[ "$KOPPEL_UNVERAENDERT" == "true" ]] && modus="nur-pruefen"
     if [[ "$DRY_RUN" != "true" ]]; then
-        lb_schutz_sicherstellen "Laufende (exit ${rc})" || {
+        lb_schutz_sicherstellen "Laufende (exit ${rc})" "$modus" || {
             error_ "=== prod-zusammen endet mit FEHLENDEM LB-Schutz — Notsperre/Schutzregel von Hand herstellen ==="
             (( rc == 0 || rc == 1 || rc == 3 )) && rc=2
         }
@@ -2697,6 +2812,9 @@ _koppel_ende() {
 deploy_prod_zusammen() {
     step "prod-zusammen: server2 (${SERVER2_HOST}) + Worker-Host (${WORKERHOST_HOST}), ein gemeinsamer Smoke"
     trap _koppel_ende EXIT
+    # Ctrl-C / kill still runs the end check (bash skips EXIT traps on
+    # untrapped fatal signals).
+    trap 'exit 130' INT TERM HUP
 
     local repo_dir r
     repo_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -2716,6 +2834,11 @@ deploy_prod_zusammen() {
     phase_tooling_freshness_gate || return 1
     phase_prod_order_gate "server2" || return 1
     koppel_nginx_rueckweg_sichern || return 1
+    # Every read-only check of BOTH hosts before S1 touches anything, so a
+    # refusal of the worker-host never costs a server2 rollback (W4).
+    koppel_vorpruefung "server2" "$SERVER2_HOST" || return 1
+    koppel_vorpruefung "prod-workers" "$WORKERHOST_HOST" || return 1
+    KOPPEL_UNVERAENDERT="false"
 
     # === S1: server2 (all of its gates; smoke deferred) ===
     KOPPEL_STUFE="S1"
@@ -2766,6 +2889,7 @@ deploy_prod_zusammen() {
     DEPLOYED_SERVICES=("${KOPPEL_WH_DEPLOYED[@]}")
     SMOKE_POOL_SET="${WORKERHOST_ALL//metrics-reader/}"
     SMOKE_SHA_HOST="$WORKERHOST_HOST"
+    SMOKE_EXPECTED_SHA="$KOPPEL_ZIEL_SHA"
     local smoke_ok=true
     if [[ -z "$server2_bridge" ]]; then
         smoke_ok=false
@@ -3222,7 +3346,7 @@ case "$SERVER" in
         deploy_server "prod-workers"
         ;;
     prod-zusammen)
-        deploy_prod_zusammen
+        deploy_prod_zusammen || exit $?
         ;;
 esac
 

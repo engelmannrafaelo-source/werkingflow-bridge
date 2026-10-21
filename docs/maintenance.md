@@ -289,11 +289,19 @@ origin/develop-SHA:
    Notsperre und Schutzregel in der geladenen `/tmp/nginx.conf` und von außen
    (403) belegt sind. Fehlt ein Block schon im laufenden LB, bricht der Lauf
    ohne Änderung ab.
-2. S1 server2 (postgres-prod, platform-api, nginx) und S2 Worker-Host
+2. Vorprüfung beider Hosts, nur lesend: Preflight, Fremdcommit-Gate, und der
+   Checkout-HEAD muss dem laufenden Build (`.bridge-deployed-sha`) entsprechen
+   und darf nicht schon auf dem Ziel stehen, sonst gäbe es keinen echten
+   Rückweg. Eine Ablehnung hier ändert nichts.
+3. S1 server2 (postgres-prod, platform-api, nginx) und S2 Worker-Host
    (rollend, Health-Wartezeit) mit allen Gates der Einzelmodi; nur der Smoke je
-   Host entfällt.
-3. S3: ein gemeinsamer Smoke über den Prod-LB; die Worker dieses Laufs müssen
-   antworten (Served-By Pflicht, SHA belegt). Danach Router-Blick,
+   Host entfällt. Beide Hosts gehen per `git merge --ff-only <Ziel-SHA>` genau
+   auf den festgelegten SHA; bewegt sich develop während des Laufs, lehnt der
+   zweite Host ab und beide gehen zurück.
+4. S3: ein gemeinsamer Smoke über den Prod-LB; die Worker dieses Laufs müssen
+   antworten (Served-By Pflicht, erwarteter SHA = Ziel-SHA). Bleiben Endpunkte
+   wegen Kapazität oder Abhängigkeit ungeprüft, endet der Lauf mit UNPROVEN
+   (Exit 3) ohne Nachweis-Marker. Danach Router-Blick,
    Worker-Selbsttest und Nachweis-Marker auf beiden Hosts.
 
 Rot in einer Stufe oder im Smoke: Rückweg auf allen berührten Hosts, zuerst
@@ -302,8 +310,12 @@ nicht mit der alten). Beim server2-Rückweg kommt die gesicherte Schutzdatei
 direkt nach `git reset` und vor dem nginx-Neustart in den Checkout; der
 Checkout ist danach wieder so verändert wie vor dem Lauf. DB-Migrationen sind
 additiv und bleiben. Am Ende jedes Laufs, auch bei Rot, prüft das Skript die
-geladene Konfiguration erneut, lädt bei Bedarf nach (nginx -t, dann HUP) und
-meldet einen fehlenden Block mit Exit 2.
+geladene Konfiguration erneut, lädt bei Bedarf nach (`openresty -t`, dann
+`openresty -s reload`), misst von außen und meldet einen fehlenden Block mit
+Exit 2. Ein Lauf, der vor S1 abbricht, prüft nur und lädt nichts nach. Auch bei
+Abbruch (Ctrl-C, kill) legt er eine in S0 zurückgesetzte Handänderung der
+nginx.conf wieder in den Checkout. Mit `| tee` geloggt: `set -o pipefail`,
+sonst verdeckt `tee` den Exit-Code.
 
 Ohne Worker-Bau wird `/v1/version` nicht gegen einen fremden Checkout-HEAD
 geprüft: `SMOKE_VERSION_UNPROVEN` nennt den Grund. Die übrigen Smoke-Proben
