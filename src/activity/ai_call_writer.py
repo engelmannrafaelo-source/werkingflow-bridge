@@ -60,11 +60,11 @@ from src.activity.delivery import (
     caller_gone,
     get_delivery_probe,
 )
-from src.activity.providers import REAL_COST_PROVIDERS, normalize_ledger_provider
+from src.activity.providers import PROVIDER_VERTEX_EU, REAL_COST_PROVIDERS, normalize_ledger_provider
 from src.attribution import ANONYMOUS_USER_ID
 from src.budget.plan_resolution import PlanResolutionError
 from src.budget.plans import AmbiguousPlanCatalog, PlanCatalogUnavailable
-from src.pricing import cost_eur, PRICING_VERSION
+from src.pricing import cost_eur, PRICING_VERSION, VERTEX_EU_PRICE_MULT
 
 logger = logging.getLogger(__name__)
 
@@ -553,6 +553,10 @@ async def persist_ai_call_activity(
         )
         if status in COST_BEARING_STATUSES else 0.0
     )
+    if provider == PROVIDER_VERTEX_EU:
+        # Vertex EU Multi-Region: Google berechnet 10 % ueber Listenpreis
+        # (Rafael 21.10.2026, Wahl a) — auf Echtkosten und Abzug.
+        call_cost_eur = round(call_cost_eur * VERTEX_EU_PRICE_MULT, 6)
     if _probe is not None:
         # The ledger's own price for this call, handed to the response (header
         # X-Bridge-Cost-Eur, see DeliveryProbeMiddleware). A job reads it from

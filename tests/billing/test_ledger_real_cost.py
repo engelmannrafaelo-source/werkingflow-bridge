@@ -184,3 +184,14 @@ async def test_anthropic_row_stays_free_for_subscription_tenant(ledger_seam):
     assert row["provider"] == "anthropic"
     assert row["real_cost_eur"] == 0.0
     assert row["hypothetical_cost_eur"] > 0  # hypothetical bleibt bepreist
+
+
+@pytest.mark.asyncio
+async def test_vertex_eu_row_carries_ten_percent_surcharge(ledger_seam):
+    """Vertex EU Multi-Region kostet 10 % ueber Listenpreis (21.10.2026)."""
+    basis = (await _run_persist(ledger_seam, "bedrock", provider_meta={"region": "eu-central-1"}))["real_cost_eur"]
+    ledger_seam.ledger_calls.clear()
+    row = await _run_persist(ledger_seam, "vertex-eu", provider_meta={"location": "eu"})
+
+    assert row["provider"] == "vertex-eu"
+    assert row["real_cost_eur"] == pytest.approx(basis * 1.10, rel=1e-3)
