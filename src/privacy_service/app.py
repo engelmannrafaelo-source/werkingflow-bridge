@@ -10,6 +10,7 @@ import os
 import re
 import json
 import asyncio
+import hmac
 import logging
 import base64
 import tempfile
@@ -142,7 +143,26 @@ class ConvertSemanticHtmlResponse(BaseModel):
 
 # ======================== App Setup ========================
 
-app = FastAPI(title="Privacy & PDF Service", version="1.0.0")
+# Every route except /health requires `Authorization: Bearer <PRIVACY_SERVICE_TOKEN>`.
+# The service refuses to start without the token instead of running open;
+# the token comes from Infisical via the container environment.
+_SERVICE_TOKEN = os.getenv("PRIVACY_SERVICE_TOKEN", "").strip()
+if not _SERVICE_TOKEN:
+    raise RuntimeError(
+        "PRIVACY_SERVICE_TOKEN is not set — refusing to start the privacy service "
+        "without authentication."
+    )
+_SERVICE_TOKEN_BYTES = _SERVICE_TOKEN.encode("utf-8")
+_OPEN_PATHS = ("/health",)
+
+# No interactive docs / schema: they list every endpoint to anonymous callers.
+app = FastAPI(
+    title="Privacy & PDF Service",
+    version="1.0.0",
+    docs_url=None,
+    redoc_url=None,
+    openapi_url=None,
+)
 
 # Active request counter for graceful shutdown
 _active_requests = 0
@@ -163,6 +183,23 @@ async def track_active_requests(request: Request, call_next):
                 _active_requests -= 1
     else:
         return await call_next(request)
+
+
+@app.middleware("http")
+async def require_bearer_token(request: Request, call_next):
+    """Registered after track_active_requests, so it runs first: no token, no work."""
+    if request.url.path not in _OPEN_PATHS:
+        header = request.headers.get("authorization", "")
+        scheme, _, presented = header.partition(" ")
+        if scheme.lower() != "bearer" or not hmac.compare_digest(
+            presented.strip().encode("utf-8"), _SERVICE_TOKEN_BYTES
+        ):
+            return JSONResponse(
+                status_code=401,
+                content={"detail": "Unauthorized"},
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+    return await call_next(request)
 
 
 # Lazy-initialized middleware singleton
