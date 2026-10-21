@@ -33,6 +33,10 @@ router = APIRouter(prefix="/v1/system", tags=["system"])
 #   APP_HEALTH_BYPASS_<APP>  protection bypass secret, sent as
 #                            x-vercel-protection-bypass (for apps without own domain)
 # <APP> is the app id upper-cased with "-" -> "_" (WERKING_ENERGY).
+# Where to set them: this route runs in the platform-api service, whose environment is
+# secrets/platform.env (env_file in docker/docker-compose-*platform*.yml). That file is
+# maintained by hand per Bridge host (dev Bridge and server2/prod); sync-infisical-to-bridge
+# does not reach it. Redirects are never followed: a 3xx is reported as unhealthy.
 _APP_HEALTH_TARGETS = [
     ("werking-report", "https://werking-report.vercel.app", "/api/admin/health"),
     ("werking-energy", "https://werking-energy.vercel.app", "/api/health"),
@@ -65,6 +69,14 @@ async def _probe_app(
     try:
         r = await client.get(url, headers=headers or None, timeout=_PROBE_TIMEOUT_S)
         latency_ms = int((time.monotonic() - started) * 1000)
+        if r.is_redirect:
+            # Protected deployments answer 302 -> vercel.com login (HTTP 200 there).
+            # Never follow: that would look healthy and send the bypass header to a foreign host.
+            return {
+                "name": name, "url": url, "status": "unhealthy", "httpStatus": r.status_code,
+                "latencyMs": latency_ms,
+                "error": "redirect (protection without valid bypass?) - not followed",
+            }
         return {
             "name": name,
             "url": url,
@@ -148,7 +160,7 @@ async def system_health_overview(
     ]
 
     db_task = asyncio.create_task(_db_snapshot())
-    async with httpx.AsyncClient(follow_redirects=True) as client:
+    async with httpx.AsyncClient(follow_redirects=False) as client:
         app_results = await asyncio.gather(
             *(_probe_app(client, name, url, hdrs) for name, url, hdrs in targets),
             return_exceptions=False,
