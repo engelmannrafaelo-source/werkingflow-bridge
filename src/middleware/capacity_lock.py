@@ -12,6 +12,11 @@ import json, os, time, threading, logging
 
 logger = logging.getLogger(__name__)
 
+# Locks we set ourselves from a usage measurement at or above this percent.
+# Only these may be lifted early by a newer, lower measurement.
+QUOTA_LOCK_REASONS = ("weekly_window", "session_window")
+QUOTA_LOCK_THRESHOLD_PCT = 95.0
+
 
 @dataclass
 class WorkerLock:
@@ -66,6 +71,45 @@ class CapacityLock:
                 logger.info(f"🔓 capacity_lock: {worker} unlocked (expired)")
                 return False
             return True
+
+    def release_quota_lock(
+        self, worker: str, measured_pct: Dict[str, float], measured_ts: float
+    ) -> Optional[WorkerLock]:
+        """Lift a quota lock that a newer measurement of the same account
+        contradicts. Returns the lifted lock, or None if nothing was lifted.
+
+        `measured_pct` maps a lock reason ("weekly_window", "session_window")
+        to the percent measured for exactly that window. Only those two reasons
+        are quota locks: we set them ourselves from a usage snapshot, so a
+        later snapshot may also end them. Every other reason (Anthropic's own
+        reset_at, org_subscription_disabled) is an external signal and keeps
+        running until it expires.
+
+        The measurement must postdate the lock: a snapshot taken before the
+        lock was set is the one that set it (or an even older one) and says
+        nothing about the account today. A weekly reset since the lock shows up
+        here as the window's percent dropping below the threshold.
+        """
+        with self._lock:
+            lock = self._locks.get(worker)
+            if not lock or lock.reason not in QUOTA_LOCK_REASONS:
+                return None
+            pct = measured_pct.get(lock.reason)
+            if pct is None or pct >= QUOTA_LOCK_THRESHOLD_PCT:
+                return None
+            if measured_ts <= lock.set_at_ts:
+                return None
+            del self._locks[worker]
+            self._persist()
+            logger.warning(
+                f"🔓 capacity_lock: {worker} unlocked early (reason was "
+                f"{lock.reason}, measured {pct:.1f}% "
+                f"< {QUOTA_LOCK_THRESHOLD_PCT:.0f}%, "
+                f"measurement {int(time.time() - measured_ts)}s old, lock set "
+                f"{int(time.time() - lock.set_at_ts)}s ago, would have run "
+                f"{int(lock.locked_until_ts - time.time())}s more)"
+            )
+            return lock
 
     def remaining_s(self, worker: str) -> int:
         with self._lock:
