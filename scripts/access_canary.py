@@ -113,18 +113,38 @@ def check(app: str, pw: str) -> tuple[bool, str]:
     return True, f"Zugang steht ({guarded} 200, ohne Anmeldung {a.status_code if a else 'n/a'})"
 
 
+def check_ohne_login(app: str) -> tuple[bool, str]:
+    """Erreichbarkeit und Tor ohne Anmeldung: die geschuetzte Seite muss antworten
+    und darf ohne Cookie nicht 200 liefern (Weiterleitung auf Login/Abo oder 401/403).
+    Kein Login, also keine Sitzung eines Kunden und kein IP-Limiter-Verbrauch."""
+    base, _login_path, guarded, _email = APPS[app]
+    with httpx.Client(timeout=TIMEOUT, follow_redirects=False) as c:
+        try:
+            r = c.get(f"{base}{guarded}")
+        except httpx.HTTPError as e:
+            return False, f"{guarded} nicht erreichbar: {e}"
+    if r.status_code >= 500:
+        return False, f"App antwortet {r.status_code} auf {guarded}"
+    if r.status_code == 200:
+        return False, f"Tor offen: {guarded} liefert ohne Anmeldung 200"
+    return True, f"App erreichbar, {guarded} ohne Anmeldung {r.status_code} (kein Login geprueft)"
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--apps", default=",".join(APPS), help="Kommaliste, Standard: alle")
+    ap.add_argument("--mit-login", action="store_true",
+                    help="echter Login mit Kanarienvogel-Konto (nur gegen Staging; gegen Prod "
+                         "ist das Standardverhalten ohne Login)")
     args = ap.parse_args()
 
-    pw = canary_password()
+    pw = canary_password() if args.mit_login else ""
     failed: list[str] = []
     for app in [a.strip() for a in args.apps.split(",") if a.strip()]:
         if app not in APPS:
             print(f"  {app}: unbekannt — uebersprungen")
             continue
-        ok, msg = check(app, pw)
+        ok, msg = check(app, pw) if args.mit_login else check_ohne_login(app)
         print(f"  {app}: {'OK' if ok else 'FEHLER'} — {msg}")
         if not ok:
             failed.append(f"{app} ({msg})")
@@ -133,7 +153,8 @@ def main() -> int:
         # Marker-Zeile fuer bridge-deploy.sh: warnen, nicht zurueckrollen.
         print("CANARY_FAIL: " + "; ".join(failed))
     else:
-        print("CANARY_OK: alle geprueften Apps lassen ihren Nutzer hinein")
+        print("CANARY_OK: alle geprueften Apps lassen ihren Nutzer hinein" if args.mit_login
+              else "CANARY_OK: alle geprueften Apps erreichbar, Tor geschlossen (ohne Login)")
     return 0
 
 

@@ -1404,13 +1404,17 @@ phase_access_canary() {
         return 0
     fi
 
-    # Passwort kommt aus Infisical dev-server/dev (CANARY_PASSWORD); das Skript
-    # holt es sich selbst, wenn es nicht schon im Env steht.
+    # Nur mit CANARY_MIT_LOGIN=1: Passwort aus Infisical dev-server/dev
+    # (CANARY_PASSWORD); das Skript holt es sich selbst, wenn es nicht im Env steht.
     # shellcheck source=/root/.infisical/infisical-api.sh
     source /root/.infisical/infisical-api.sh 2>/dev/null || true
 
     local canary_out
-    canary_out=$(python3 "$canary_script" 2>&1) || true
+    # Standard: OHNE Login (kein Prod-Login, keine Kundensitzung, kein IP-Limiter).
+    # Der Login-Lauf braucht ausdruecklich CANARY_MIT_LOGIN=1 und gehoert gegen Staging.
+    local canary_args=()
+    [[ "${CANARY_MIT_LOGIN:-0}" == "1" ]] && canary_args+=(--mit-login)
+    canary_out=$(python3 "$canary_script" ${canary_args[@]+"${canary_args[@]}"} 2>&1) || true
     while IFS= read -r line; do info "  canary: ${line}"; done <<< "$canary_out"
 
     if grep -q '^CANARY_FAIL:' <<< "$canary_out"; then
