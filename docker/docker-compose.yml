@@ -733,10 +733,12 @@ services:
       # Energy claims calls (observed 728s); align with MAX_TIMEOUT (2400s).
       - BRIDGE_CHAT_JOB_TIMEOUT_S=2400
       - ADAPTIVE_INITIAL_CAP_TOKENS=1000000
-      # worker4 only: pinned floor so one Dev worker admits Energy 600k input
-      # (850000*0.85 = 722500 >= 600k+64k+11k = 675k). FLOOR_FROM_ENV makes this
-      # override the persisted limiter_state; set 500000 again to roll back exactly.
-      - ADAPTIVE_FLOOR_TOKENS=850000
+      # worker4 ROLLBACK (was 850000): FLOOR_FROM_ENV stays true on purpose. A changed
+      # env floor resets cap := floor (-> 500000/500000); without the switch the
+      # persisted limiter_state (850000/850000) wins again. Remove FLOOR_FROM_ENV
+      # only in a follow-up commit AFTER this value has been deployed and the
+      # worker restarted once (state then holds 500000).
+      - ADAPTIVE_FLOOR_TOKENS=500000
       - ADAPTIVE_FLOOR_FROM_ENV=true
       - ADAPTIVE_CEILING_TOKENS=4000000
       - ADAPTIVE_GROW_TRIGGER_SEC=300
