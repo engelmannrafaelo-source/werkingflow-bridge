@@ -14,7 +14,11 @@ gruen; erst die App-Seite hinter dem Abo-Tor beweist etwas.
 
 WAS ER TUT
 ----------
-Je App: echter Login ueber das App-Frontend, dann eine Seite, die nur mit
+Standard (seit 22.10.2026): OHNE Login. Je App wird die geschuetzte Seite ohne Cookie geholt:
+sie muss antworten und das Tor geschlossen halten (401/403 oder Weiterleitung auf Login/Abo);
+200 ohne Anmeldung oder 5xx ist FEHLER. Der Login-Lauf unten gibt es nur noch mit --mit-login.
+
+Login-Lauf (--mit-login): Je App: echter Login ueber das App-Frontend, dann eine Seite, die nur mit
 gueltiger Berechtigung 200 liefert. Zur Kontrolle wird dieselbe Seite OHNE
 Cookie geholt — antwortet sie auch dann 200, ist die Seite gar nicht geschuetzt
 und der Kanarienvogel waere ein Placebo. Das faellt hier auf, statt still zu
@@ -127,15 +131,21 @@ def check_ohne_login(app: str) -> tuple[bool, str]:
         return False, f"App antwortet {r.status_code} auf {guarded}"
     if r.status_code == 200:
         return False, f"Tor offen: {guarded} liefert ohne Anmeldung 200"
-    return True, f"App erreichbar, {guarded} ohne Anmeldung {r.status_code} (kein Login geprueft)"
+    if r.status_code in (401, 403):
+        return True, f"App erreichbar, {guarded} ohne Anmeldung {r.status_code} (kein Login geprueft)"
+    loc = r.headers.get("location", "")
+    if 300 <= r.status_code < 400 and any(k in loc for k in ("login", "anmeld", "sortiment", "signin")):
+        return True, f"App erreichbar, {guarded} leitet ohne Anmeldung auf {loc[:80]} ({r.status_code}, kein Login geprueft)"
+    return False, f"{guarded} ohne Anmeldung unerwartet {r.status_code} (Location: {loc[:80] or '-'})"
 
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--apps", default=",".join(APPS), help="Kommaliste, Standard: alle")
     ap.add_argument("--mit-login", action="store_true",
-                    help="echter Login mit Kanarienvogel-Konto (nur gegen Staging; gegen Prod "
-                         "ist das Standardverhalten ohne Login)")
+                    help="echter Login mit dem Kanarienvogel-Konto, und zwar gegen die PROD-Adressen "
+                         "in APPS (eigene @example.com-Konten, kein Kundenkonto). Nur auf "
+                         "ausdruecklichen Wunsch; Standard ist der Lauf ohne Login.")
     args = ap.parse_args()
 
     pw = canary_password() if args.mit_login else ""

@@ -1378,6 +1378,8 @@ phase_smoke_test() {
 # ============================================================================
 # Phase 5c: Zugangs-Kanarienvogel (access_canary.py)
 # ============================================================================
+# Seit 22.10.2026 ohne Login (Standard): prueft nur, dass die Apps antworten und
+# das Tor zu ist. Der Login-Lauf (Nutzer kommt hinein) nur mit CANARY_MIT_LOGIN=1.
 # Der Smoke prueft die Bridge, nicht das Anmelden — /login steht ausdruecklich
 # auf seiner Ausschlussliste ("would need a throwaway credential"). Damit war
 # nach jedem Deploy ungeprueft, ob ein zahlender Kunde noch in seine App kommt;
@@ -1418,7 +1420,7 @@ phase_access_canary() {
     while IFS= read -r line; do info "  canary: ${line}"; done <<< "$canary_out"
 
     if grep -q '^CANARY_FAIL:' <<< "$canary_out"; then
-        warn "ZUGANG ZU: mindestens eine App laesst ihren Nutzer nicht mehr hinein"
+        warn "KANARIENVOGEL ROT: mindestens eine App nicht erreichbar, Tor offen oder (mit Login) Nutzer ausgesperrt"
         warn "  $(grep '^CANARY_FAIL:' <<< "$canary_out")"
         warn "  Kein Rollback — pruefen, ob es der Deploy war (Abo/Passwort sind die anderen Ursachen)."
     elif ! grep -q '^CANARY_OK:' <<< "$canary_out"; then
