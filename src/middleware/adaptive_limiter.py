@@ -75,6 +75,13 @@ METRICS_DIR = os.path.join(os.getenv("METRICS_DIR", "/app/logs"), "bridge-metric
 INITIAL_CAP_TOKENS = int(os.getenv("ADAPTIVE_INITIAL_CAP_TOKENS", "250000"))
 FLOOR_TOKENS       = int(os.getenv("ADAPTIVE_FLOOR_TOKENS", "50000"))
 CEILING_TOKENS     = int(os.getenv("ADAPTIVE_CEILING_TOKENS", "2000000"))
+FLOOR_FROM_ENV     = os.getenv("ADAPTIVE_FLOOR_FROM_ENV", "false").lower() == "true"
+"""Per-worker opt-in: ADAPTIVE_FLOOR_TOKENS wins over the persisted floor.
+Default off — then the persisted limiter_state keeps winning (old behaviour).
+On: floor := env floor at every start. Unchanged floor keeps the learned cap
+(raised to at least the floor); a changed floor re-baselines cap := floor, so
+lowering the env floor again is an exact rollback. Floor is never learned at
+runtime, so the env is the only place it can come from."""
 
 SHRINK_FACTOR        = float(os.getenv("ADAPTIVE_SHRINK_FACTOR", "0.9"))   # -10%
 GROW_FACTOR          = float(os.getenv("ADAPTIVE_GROW_FACTOR",   "1.05"))  # +5%
@@ -327,7 +334,7 @@ class AdaptiveLoadLimiter:
             try:
                 with open(self.state_path) as f:
                     raw = json.load(f)
-                return LimiterState(
+                state = LimiterState(
                     worker=raw.get("worker", self.worker),
                     cap_tokens=int(raw.get("cap_tokens", INITIAL_CAP_TOKENS)),
                     floor_tokens=int(raw.get("floor_tokens", FLOOR_TOKENS)),
@@ -338,6 +345,17 @@ class AdaptiveLoadLimiter:
                     last_tune_ts=float(raw.get("last_tune_ts", 0.0)),
                     peak_inflight_window=[tuple(x) for x in raw.get("peak_inflight_window", [])],
                 )
+                if FLOOR_FROM_ENV and state.floor_tokens != FLOOR_TOKENS:
+                    logger.info(
+                        f"limiter[{self.worker}] floor from env: "
+                        f"{state.floor_tokens:,} -> {FLOOR_TOKENS:,}, cap re-baselined "
+                        f"{state.cap_tokens:,} -> {FLOOR_TOKENS:,}"
+                    )
+                    state.floor_tokens = FLOOR_TOKENS
+                    state.cap_tokens = FLOOR_TOKENS
+                elif FLOOR_FROM_ENV:
+                    state.cap_tokens = max(state.cap_tokens, state.floor_tokens)
+                return state
             except Exception as e:
                 logger.warning(f"limiter state {self.state_path} unreadable, resetting: {e}")
         return LimiterState(
