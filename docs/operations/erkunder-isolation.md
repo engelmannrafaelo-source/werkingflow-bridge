@@ -134,3 +134,11 @@ zusätzlich wird jeweils ein 4096-Byte-Leseblock verarbeitet. Dauerhaft bleibt
 nur die Whitelist-Fehlerklasse/der feste Fehlercode. Es gibt keine Rohtextdatei,
 kein stderr im Rückgabewert und keine Ausgabe von Credential-/Umgebungswerten.
 Die bereinigte JSON-Diagnose des Kindes hat bei gleichen Feldern Vorrang.
+
+Auch bei Zeit-, Speicher- oder angefordertem Abbruch übernimmt der Platz nach
+dem Beenden des Kindes die abschließende, bereits klassifizierte stderr-Diagnose.
+Der Abbruchgrund des Supervisors bleibt dabei erhalten. Die Diagnose enthält
+weiterhin nur feste Klassen; ein fehlender Eintrag beweist keinen fehlerfreien
+Modellfortschritt. Die bisherigen Archive enthalten keine SDK-Zwischenereignisse
+und erlauben deshalb keine nachträgliche Unterscheidung von Thinking, Wartezeit
+und Werkzeugausführung.

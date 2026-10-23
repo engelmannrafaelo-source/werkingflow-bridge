@@ -267,7 +267,11 @@ class Platz:
                     break
             self.kill()
             await stop_uid_processes()
-            await communication
+            # A deadline/OOM/cancellation leaves the loop before result() above.
+            # Killing the child closes stderr; retain its fixed classifications
+            # also on that path, without replacing the supervisor's reason.
+            _, final_diagnosis = await communication
+            diagnosis = {**final_diagnosis, **diagnosis}
             folder = Path(body.ordner)
             result = folder / (
                 "pruefung.md" if body.schritt.startswith("pruefung") else "ergebnis.md"
