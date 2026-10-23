@@ -32,7 +32,7 @@ from src.erkunder.dateien import read_bytes, read_text
 from src.erkunder.ipc import clear_owned_ipc
 from src.erkunder.models import VORGABE_MODELL, ModellName
 from src.erkunder.prozessschutz import protect_process
-from src.erkunder.ereignisse import clean_event, snapshot
+from src.erkunder.ereignisse import clean_event, snapshot, append_event
 from src.erkunder.diagnostik import details, exception_details, safe_reason, classify_stderr
 
 LOG = logging.getLogger(__name__)
@@ -118,7 +118,7 @@ async def communicate_diagnosed(process, payload: bytes, events=None):
                 if isinstance(value, dict) and "ereignis" in value:
                     event = clean_event(value["ereignis"])
                     if event is not None and events is not None:
-                        events.append(event)
+                        append_event(events, event)
                 else:
                     output.extend(line + b"\n")
         output.extend(pending)
@@ -205,8 +205,8 @@ class Platz:
         metrics: dict[str, Any] = {}
         diagnosis: dict[str, Any] = {}
         communication = None
-        events = []
-        self.states[(body.bericht_id, body.schritt)]["sdk"] = {"ereignisse": events}
+        events = {"ereignisse": []}
+        self.states[(body.bericht_id, body.schritt)]["sdk"] = events
         self.process = None
         try:
             peak, initial_oom = self.memory()
@@ -371,7 +371,7 @@ class Platz:
                 communication.cancel()
                 await asyncio.gather(communication, return_exceptions=True)
             meta = {
-                "sdk": snapshot({"ereignisse": events}),
+                "sdk": snapshot(events),
                 "name": body.schritt,
                 "versuch": 1,
                 "status": "abbruch" if reason else "ok",

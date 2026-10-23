@@ -90,6 +90,7 @@ class Coordinator:
         self.reattach_wait_s = reattach_wait_s
         self.ready = False
         self.states: dict[str, dict[str, Any]] = {}
+        self.diagnose_poll_zuletzt: dict[str, float] = {}
         self.tokens: dict[str, str] = {}
         self.token_ready: dict[str, asyncio.Event] = {}
         self.tasks: dict[str, asyncio.Task[None]] = {}
@@ -139,6 +140,7 @@ class Coordinator:
         evidence = {
             "schema": "erkunder-diagnose/2", "bericht_id": ident,
             "gesichert_ns": time.time_ns(),
+            "diagnosesicherung_fehler": state.get("diagnosesicherung_fehler", 0),
             "lauf_start": state["lauf_start"],
             "zustand": state["zustand"], "fehler": safe_reason(state.get("fehler")),
             "schritte": [step_record(s) for s in state["schritte"]],
@@ -547,7 +549,14 @@ class Coordinator:
                         meta = result["meta"]
                         break
                     self.save(ident)
-                    self.archive_diagnostics(ident)
+                    if time.monotonic() - self.diagnose_poll_zuletzt.get(ident, 0) >= 30:
+                        self.diagnose_poll_zuletzt[ident] = time.monotonic()
+                        try:
+                            self.archive_diagnostics(ident)
+                        except Exception as error:
+                            state["diagnosesicherung_fehler"] = state.get("diagnosesicherung_fehler", 0) + 1
+                            LOG.error("bericht_id=%s diagnosearchiv_poll=fehlgeschlagen fehler=%s",
+                                      ident, type(error).__name__)
                     await asyncio.sleep(self.poll_s)
             except (httpx.HTTPError, KeyError, ValueError):
                 state.setdefault("unsichere_plaetze", []).append(slot)

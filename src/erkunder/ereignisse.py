@@ -1,5 +1,9 @@
 """Content-free SDK telemetry; only fixed enums and nonnegative integers leave here."""
 import time
+import logging
+
+MAX_EVENTS = 1000
+LOG = logging.getLogger(__name__)
 
 CLASSES = {'system', 'assistant', 'tool_start', 'tool_result', 'result', 'tokens', 'rate_limit', 'other'}
 TOOLS = {'Read', 'Write', 'Edit', 'Bash', 'Glob', 'Grep', 'LS'}
@@ -21,13 +25,28 @@ def clean_event(value):
     return result
 
 
+def append_event(state, event):
+    state['werkzeugaufrufe'] = state.get('werkzeugaufrufe', 0) + (event['klasse'] == 'tool_start')
+    state['read_antwort_bytes'] = state.get('read_antwort_bytes', 0) + event.get('lesebytes', 0)
+    state['ereignisse_gesamt'] = state.get('ereignisse_gesamt', 0) + 1
+    state['ereignisse'].append(event)
+    del state['ereignisse'][:-MAX_EVENTS]
+
+
 def snapshot(value):
-    events = value.get('ereignisse', []) if isinstance(value, dict) else []
+    value = value if isinstance(value, dict) else {}
+    events = value.get('ereignisse', [])
     events = [clean_event(e) for e in events] if isinstance(events, list) else []
     events = [e for e in events if e is not None]
-    return {'ereignisse': events,
-            'werkzeugaufrufe': sum(e['klasse'] == 'tool_start' for e in events),
-            'read_antwort_bytes': sum(e.get('lesebytes', 0) for e in events)}
+    result = {'ereignisse': events[-MAX_EVENTS:]}
+    for key, fallback in (
+        ('werkzeugaufrufe', sum(e['klasse'] == 'tool_start' for e in events)),
+        ('read_antwort_bytes', sum(e.get('lesebytes', 0) for e in events)),
+        ('ereignisse_gesamt', len(events)),
+    ):
+        number = value.get(key)
+        result[key] = number if type(number) is int and number >= fallback else fallback
+    return result
 
 
 def usage_event(usage):
@@ -41,11 +60,21 @@ class Observer:
     def __init__(self, emit):
         self.emit = emit
         self.tools = {}
+        self.failed = False
 
     def send(self, event):
         self.emit({**clean_event(event), 'zeit_ns': time.time_ns()})
 
     def observe(self, message):
+        try:
+            self._observe(message)
+        except Exception:
+            # Never let telemetry change SDK execution; no exception payload.
+            if not self.failed:
+                self.failed = True
+                LOG.error("erkunder_sdk_beobachter=fehlgeschlagen")
+
+    def _observe(self, message):
         # SDK class names are compared, never serialized as arbitrary strings.
         kind = type(message).__name__
         self.send({'klasse': {'SystemMessage': 'system', 'AssistantMessage': 'assistant',

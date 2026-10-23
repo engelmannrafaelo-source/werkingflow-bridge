@@ -188,3 +188,20 @@ Kindprozess mit System/Tool-Ereignis und anschließendem Zeitabbruch; erfolgreic
 und fehlgeschlagene Versuche getrennt archiviert; Platzneustart behält letzten
 Poll-Stand; private synthetische Marker in allen SDK-Inhaltsfeldern bleiben aus
 der Diagnose; Token-Zwischenmeldungen und Gesamtsumme bleiben unterscheidbar.
+
+
+R1-Korrektur: Der Platz hält die letzten 1000 Ereignisse je Schritt; Werkzeug-
+und Read-Byte-Summen sowie `ereignisse_gesamt` werden beim Empfang fortgeschrieben
+und bleiben nach dem Kürzen erhalten. Snapshots erhalten diese Summen. Der
+Leitstand übernimmt live weiterhin beim normalen Polling; das zusätzliche
+Poll-Archiv wird je Lauf höchstens alle 30 Sekunden versucht. Ein Fehler dabei
+wird laut protokolliert und als `diagnosesicherung_fehler` gezählt, ohne den
+Schritt zu beenden oder einen Versuch zu verbrauchen. Archivierung am Schrittende
+und vor dem Löschen bleibt hart. Auch ein expliziter Diagnose-GET archiviert
+weiterhin. Beobachterfehler im Kind melden nur einen festen technischen Marker
+und brechen die SDK-Iteration nicht ab.
+
+Auch die `modellnachricht`-Verbrauchswerte untereinander **nicht addieren**:
+mehrere Assistant-Inhaltsblöcke derselben Modellantwort können dieselben
+Verbrauchswerte wiederholen. Sie sind Beobachtungen, keine additiven Deltas.
+Für die Endsumme gilt ausschließlich das Result (`laufgesamt`), sofern vorhanden.
