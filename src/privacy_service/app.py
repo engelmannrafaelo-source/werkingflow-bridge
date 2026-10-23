@@ -562,6 +562,7 @@ async def document_convert_endpoint(request: Request):
             (directory / "source").write_bytes(content)
             write_json(directory / "request.json", {
                 "filename": filename, "mime_type": mime_hint, "fields": extras,
+                "managed": False,
             })
             stop = asyncio.Event()
 

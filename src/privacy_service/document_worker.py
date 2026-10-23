@@ -13,13 +13,13 @@ from .document_process import write_json
 async def convert(directory: Path) -> dict:
     started = time.monotonic()
     from . import document_execution
-    document_execution.managed = True
+    request = json.loads((directory / "request.json").read_text())
+    document_execution.managed = request.get("managed") is True
     document_execution.provider_directory = directory
     from .adapters import build_default_chain
     from .image_describer import describe_images, append_descriptions_to_markdown
     from .image_triage import plan_image_descriptions
 
-    request = json.loads((directory / "request.json").read_text())
     fields = request["fields"]
     source = (directory / "source").read_bytes()
     if request.get("repair_actualtext") and (

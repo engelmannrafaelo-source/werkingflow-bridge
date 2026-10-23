@@ -22,15 +22,18 @@ und Lebensdauervertrag steht in [document-jobs.md](document-jobs.md).
    Owner-EOF und absolute Gesamtfrist wirken auch ohne lebende HTTP-Anfrage.
 5. `document_worker.py` führt dieselben Adapter, ActualText-Reparatur und
    Bildbeschreibung im isolierten Prozess aus. `document_execution.py` markiert
-   allein diesen Prozess als managed; Legacy-Threads werden nicht entgrenzt.
+   nur persistente Job-Ausführungen als managed; der synchrone Reaper-Pfad
+   und Legacy-Threads behalten ihre Schutzfristen.
 
 ## Ungewissheit ist kein Retry-Beleg
 
 Annahme vor Start ist dauerhaft. Ein Crash zwischen Startmarkierung und
 Prozessstart kann konservativ unknown hinterlassen. Ein noch laufender Guardian
 hält den Lock; ein abgestürzter Guardian ohne Quittung erlaubt keinen neuen
-Attempt. SIGKILL des Guardians oder Hostverlust ist kein nachgewiesener
-Prozessbaumstopp. Das Protokoll lügt nicht darüber, hat dafür aber noch keinen
+Attempt. SIGKILL des Guardians in derselben äußeren Instanz ist kein nachgewiesener
+Prozessbaumstopp. Ein anderer Kernel-Boot/PID-Namespace/PID-1-Start belegt
+dagegen den Verlust des alten Containers und führt zu einem lokalen
+`service_instance_gone`-Receipt; Anbieterarbeit bleibt gegebenenfalls unbekannt. Das Protokoll lügt nicht darüber, hat dafür aber noch keinen
 vollautomatischen infrastrukturellen Wiederanlauf.
 
 Vision-Pending-Dateien werden vor dem Send persistiert und nur nach empfangener
@@ -65,3 +68,10 @@ ursprüngliche Gesamtfrist über Workerwechsel, Retention ohne Datenverlust,
 großer Rückstau, komprimierte große PDFs und kleine Dateien mit großer
 Renderausdehnung. Peak-RSS je Prozess und bei Parallelität unter 2 GB messen.
 Kein neuer Unit-/Regressionstest und keine bezahlten KI-Läufe nur zum Testen.
+
+
+R1-Mindestfixes und die bewusste P2-2-Entscheidung stehen im Wire-Vertrag:
+permanente Remote-Ablehnung terminal, alter Protokolljob ohne call_id terminal,
+bekannter Attempt plus Remote-404 terminal statt erneutem PUT. Unaufklärbares
+unknown wird mit Diagnosecode und Beginn im öffentlichen Fortschritt sichtbar.
+ACK/Retention (P2-1) und L4-Lebendigkeit/Fortsetzung bleiben vor Deploy offen.

@@ -20,7 +20,7 @@ import uuid
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import JSONResponse
 
-from .document_process import run, write_json
+from .document_process import run, write_json, execution_identity
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/document/calls")
@@ -84,6 +84,18 @@ def status(path: Path) -> dict:
             else:
                 # Includes crash between durable start and process creation.
                 # No provider call may be repeated from an unknown outcome.
+                started = read(path, "started.json")
+                previous = started.get("execution_identity")
+                if previous is not None and previous != execution_identity():
+                    # Boot/PID namespace/PID-1 start changed: the old container
+                    # process tree cannot still exist in this service instance.
+                    write_json(path / "receipt.json", {
+                        "reason": "service_instance_gone", "local_stopped": True,
+                        "reaped": True,
+                        "provider_outcome": "unknown" if any(path.glob("provider-pending-*")) else "finished_or_not_started",
+                        "finished_at": datetime.now(timezone.utc).timestamp(),
+                    })
+                    return status(path)
                 answer["status"] = "unknown"
     return answer
 
@@ -125,7 +137,7 @@ async def execute(path: Path) -> None:
                 return
             await acquire
             acquired = True
-            write_json(path / "started.json", {"attempt_id": accepted["attempt_id"]})
+            write_json(path / "started.json", {"attempt_id": accepted["attempt_id"], "execution_identity": execution_identity()})
             await run(path, stop, lock_fd=lock.fileno())
         except Exception as exc:
             logger.error("document attempt supervisor failed (%s); outcome unconfirmed", type(exc).__name__)
@@ -162,7 +174,7 @@ async def accept(call_id: str, request: Request):
         except ValueError:
             raise HTTPException(400, "document deadline must be absolute with timezone") from None
     spec = {"filename": filename, "mime_type": mime, "fields": fields,
-            "repair_actualtext": request.headers.get("x-document-actualtext-repair") == "true"}
+            "managed": True, "repair_actualtext": request.headers.get("x-document-actualtext-repair") == "true"}
     digest = hashlib.sha256(content).hexdigest() + ":" + hashlib.sha256(
         json.dumps({**spec, "deadline_at": deadline}, sort_keys=True).encode()
     ).hexdigest()

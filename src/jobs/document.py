@@ -67,6 +67,25 @@ async def document_executor(payload, attribution, report_progress):
     raise RuntimeError("document-convert requires the fenced document runner")
 
 
+class DocumentRemoteRejected(RuntimeError):
+    """Value-free terminal control error; no remote response body in logs."""
+
+
+def check_control_response(response: httpx.Response) -> None:
+    code = response.status_code
+    if code < 300:
+        return
+    not_configured = False
+    if code == 503:
+        try:
+            not_configured = response.json().get("detail") == "document Vision is not configured"
+        except (ValueError, AttributeError):
+            pass
+    if (400 <= code < 500 and code not in (404, 408, 429)) or not_configured:
+        raise DocumentRemoteRejected(f"DOCUMENT_REMOTE_REJECTED_{code}")
+    raise RuntimeError(f"document control HTTP {code}")
+
+
 async def run_document_job(job_id: str, payload: dict, attribution: dict | None,
                            attempt: int | None = None) -> None:
     from src.federation import set_request_origin
@@ -77,6 +96,7 @@ async def run_document_job(job_id: str, payload: dict, attribution: dict | None,
     call_id = hashlib.sha256((str((attribution or {}).get("bridge_origin")) + ":" + job_id).encode()).hexdigest()[:32]
     remote_url = f"{PRIVACY_SERVICE_URL}/document/calls/{call_id}"
     failure = None
+    terminal_error = None
     document = DocumentPayload.model_validate(payload)
     headers = privacy_auth_headers()
     headers["X-Document-Actualtext-Repair"] = "true" if os.getenv("BRIDGE_PDF_ACTUALTEXT_REPAIR", "").strip().lower() == "true" else "false"
@@ -86,17 +106,43 @@ async def run_document_job(job_id: str, payload: dict, attribution: dict | None,
         while True:
             try:
                 if attempt is None:
-                    claim = await store_client.document_state(job_id, 0, "claim")
+                    claim = await store_client.document_state(job_id, 0, "claim",
+                        {"call_id": call_id, "phase": "document-claimed"})
                     if not claim["owned"]:
                         return
                     attempt = claim["attempt"]
                 state = await store_client.document_state(job_id, attempt, "heartbeat")
                 if not state["owned"]:
                     return
+                previous = state.get("progress") or {}
+                if not previous.get("call_id") and state["attempt"] == 1:
+                    # The watchdog can also claim a never-started pending job.
+                    # Its first fence proves no older execution was dispatched.
+                    previous = {"call_id": call_id, "phase": "document-claimed"}
+                    saved = await store_client.document_state(job_id, attempt, "progress", previous)
+                    if not saved["owned"]:
+                        return
+                if previous.get("call_id") != call_id:
+                    terminal_error = "DOCUMENT_PROTOCOL_UPGRADE"
+                if terminal_error:
+                    value = {"error": {"code": terminal_error,
+                        "message": "document control requires intervention",
+                        "retryable": False, "retry_after_s": None},
+                        "progress": {**previous, "phase": "document-error",
+                            "diagnostic_code": terminal_error,
+                            "remote_outcome": "unconfirmed"}}
+                    saved = await store_client.document_state(job_id, attempt, "error", value)
+                    if saved["owned"] and saved.get("written"):
+                        await record_completion(call_id, attribution or {}, "error", value)
+                    if not saved["owned"] or saved.get("written"):
+                        return
+                    continue
                 expired = document.deadline_at is not None and datetime.now(timezone.utc) >= datetime.fromisoformat(document.deadline_at)
                 cancelling = state["cancel_requested"] or expired
                 response = await client.get(remote_url)
                 if response.status_code == 404:
+                    if previous.get("attempt_id"):
+                        raise DocumentRemoteRejected("DOCUMENT_REMOTE_STATE_LOST")
                     if cancelling:
                         # No request was accepted under this identity. Persist
                         # a remote cancellation tombstone before acknowledging
@@ -110,10 +156,7 @@ async def run_document_job(job_id: str, payload: dict, attribution: dict | None,
                         )
                 if cancelling and response.status_code < 300:
                     response = await client.delete(remote_url)
-                if response.status_code >= 300:
-                    # 404/405 means an incompatible service, not permission to
-                    # fall back to a fresh synchronous conversion.
-                    raise RuntimeError(f"document control HTTP {response.status_code}")
+                check_control_response(response)
                 remote = response.json()
                 if remote.get("call_id") != call_id or "status" not in remote:
                     raise RuntimeError("invalid document control identity")
@@ -155,6 +198,13 @@ async def run_document_job(job_id: str, payload: dict, attribution: dict | None,
                     # Cancel won the database lock against late done. Read its
                     # wish and the SAME retained remote result on the next turn.
                 else:
+                    if remote["status"] == "unknown":
+                        progress.update({
+                            "diagnostic_code": "DOCUMENT_RECONCILIATION_REQUIRED",
+                            "reconciliation_required_since": previous.get("reconciliation_required_since")
+                                or datetime.now(timezone.utc).isoformat(),
+                            "remote_outcome": "unconfirmed",
+                        })
                     saved = await store_client.document_state(job_id, attempt, "progress", progress)
                     if not saved["owned"]:
                         return
@@ -163,6 +213,8 @@ async def run_document_job(job_id: str, payload: dict, attribution: dict | None,
                 if failure is not None:
                     logger.info("document control recovered")
                     failure = None
+            except DocumentRemoteRejected as exc:
+                terminal_error = str(exc)
             except asyncio.CancelledError:
                 # The persistent remote call remains addressable. The next
                 # fenced owner reconciles it; never send an unrequested DELETE.

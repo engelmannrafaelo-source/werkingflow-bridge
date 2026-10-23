@@ -1,7 +1,7 @@
 # Dokumentkonvertierung als Job
 
 Stand 23.10.2026, Folgeauftrag Dokumentdienst. Implementierter Feature-Zweig,
-**noch nicht zweitgeprüft, integriert oder ausgeliefert**. Große Dokumente und
+**R1 geprüft, Mindestfixes zur letzten Runde R2; nicht integriert oder ausgeliefert**. Große Dokumente und
 Postgres-CAS sind nicht Ende-zu-Ende abgenommen. Keine L4-/L6-Vollabnahme.
 
 ## Öffentlicher Auftrag
@@ -49,8 +49,14 @@ Jobstatus.
 
 Bei Antwortverlust zuerst GET; bei unbekanntem Remote-Ausgang kein neuer Attempt.
 Workerwechsel liest denselben laufenden Attempt oder sein gespeichertes Ergebnis.
-Ein fehlender Guardian ohne Quittung bleibt unknown und braucht Aufklärung;
-keine automatische erneute bezahlte Ausführung. Nach Dienstverlust quittiert der
+Ein fehlender Guardian ohne Quittung wird anhand der gespeicherten Kernel-Boot-,
+PID-Namespace- und PID-1-Startkennung aufgeklärt. Eine andere äußere Instanz
+belegt den lokalen Prozessbaumverlust: interrupted mit
+`reason=service_instance_gone`, `local_stopped=true` und `reaped=true`. Ein bloßer
+API-Prozessneustart ist dafür kein Beleg. Gleiche/fehlende Identität bleibt
+unknown; der öffentliche Fortschritt enthält dann
+`diagnostic_code=DOCUMENT_RECONCILIATION_REQUIRED` und
+`reconciliation_required_since`. Keine automatische erneute bezahlte Ausführung. Nach Dienstverlust quittiert der
 unabhängige Guardian lokal interrupted. Dies ist ein technischer Fehler, kein
 lokaler Zeit-/Versuchsabbruch. Es gibt noch keine Wiederaufnahme einzelner
 Docling-/Vision-Teilschritte nach einem solchen Ende.
@@ -84,7 +90,9 @@ Die Quittung belegt **lokale** Ressourcenfreigabe. Vor jedem Vision-Aufruf wird
 ein Pending-Beleg fsync-gesichert, erst eine empfangene Anbieterantwort entfernt
 ihn. Nach lokalem Stop kann Anbieterarbeit unbekannt bleiben. Dann lautet der
 Abbruchledger `unbekannt`, niemals bestätigte Anbieter-Stornierung oder Kosten-
-Rücknahme. Guardian-SIGKILL/Hostverlust ohne Quittung bleibt ebenfalls unbekannt.
+Rücknahme. Guardian-SIGKILL in derselben äußeren Instanz bleibt ohne Quittung unbekannt.
+Ein belegter Container-/Kernelwechsel quittiert nur den lokalen Verlust;
+Provider-Pending-Belege bleiben dabei maßgeblich.
 Ein lebender, hängender Konverter ohne Nutzerabbruch oder Gesamtfrist darf weiter
 laufen; Heartbeat ist keine Aussage über fachlichen Fortschritt.
 
@@ -93,7 +101,10 @@ laufen; Heartbeat ist keine Aussage über fachlichen Fortschritt.
 - Managed Konverter: keine 300-s-LibreOffice-/Vision-Frist, kein 600-Seiten-Abbruch.
 - Legacy `/convert-pdf` und `/document/convert-and-anonymize`: noch Threads und
   bisherige Fristen. `/document/convert` nutzt ebenfalls den Reaper, ist aber
-  synchron; ein Client-/nginx-Abbruch fordert lokalen Stop.
+  synchron und ausdrücklich `managed=False`: die bisherigen 300-s-
+  LibreOffice-/Vision-Fristen und der 600-Seiten-Deckel bleiben erhalten.
+  Ein am Dienst erkannter Client-Abbruch fordert lokalen Stop; eine verlässliche
+  Weiterleitung von Disconnects über die Bridge ist damit nicht belegt.
 - Vision-Verbindungsaufbau 10 s; Remote-Kontrollversuche 30 s; Store-Schreiben 10 s.
   Das sind Einzelversuche. Remote-Ausgang und fertige Ergebnisse werden danach
   abgeglichen, kein neuer fachlicher Auftrag erzeugt.
@@ -128,3 +139,42 @@ bezahlte Vision-Reconciliation und Opus-Abnahme. Keine neuen Unit-Tests.
 
 Lokale Kapazitätsmessung und ihre Grenzen:
 [synthetischer Befund vom 23.10.2026](../reports/document-capacity-20261023.md).
+
+## R1-Korrekturen: Ablehnung, Erstumstellung und Volume-Verlust
+
+HTTP 4xx außer 404/408/429 sowie die feste 503-Konfigurationsantwort
+`document Vision is not configured` enden als Jobfehler
+`DOCUMENT_REMOTE_REJECTED_<HTTP-Status>`, auch beim GET oder DELETE. Der Fehler
+belegt keine bestätigte Ressourcenfreigabe; `remote_outcome=unconfirmed` bleibt
+sichtbar. Transportfehler, 5xx ohne diesen Konfigurationsbefund und 429 werden
+weiter abgeglichen, ohne neue Zeit-/Zählgrenze. Freie Antworttexte werden weder
+in Jobfehler noch Logs übernommen.
+
+Der erste neue Claim schreibt `call_id` atomar mit dem Wechsel nach running.
+Heartbeat liefert den persistenten Fortschritt an den Besitzer zurück. Ein
+Watchdog-Erstclaim (Fence 1, nie zuvor gestartet) sichert die Identität vor
+dem ersten Remote-Aufruf; diese Erstaufnahme ist kein Protokoll-Upgrade. Ein
+übernommener alter Job ohne passende call_id endet vor jedem Remote-Aufruf mit
+`DOCUMENT_PROTOCOL_UPGRADE`. Das startet keine zweite Konvertierung, stoppt
+aber auch keinen unbekannten alten synchronen Aufruf. Deshalb bei der
+Erstumstellung Auftraggeber pausieren und alte Dokumentjobs/alte synchrone
+Konvertierungen auslaufen lassen; dann Platform-API, Dokumentdienst mit
+persistentem Volume, zuletzt Worker aktualisieren. Erst danach Annahme öffnen.
+Kein GPU-/Prod-Deploy ist durch diese Beschreibung autorisiert.
+
+**Entscheidung P2-2:** Eine bereits im Jobfortschritt bekannte attempt_id darf
+bei späterem GET-404 nicht durch einen neuen PUT ersetzt werden. Stattdessen
+endet der Job mit `DOCUMENT_REMOTE_STATE_LOST`, ohne bestätigten Stop und ohne
+automatische neue Konvertierung. Das gilt auch bei Abbruchwunsch. Ein 404 vor
+jeder bestätigten Remote-Annahme erlaubt den ersten idempotenten PUT bzw.
+den Abbruch-Tombstone weiterhin. Die Lücke „PUT-Antwort verloren und zugleich
+Volume verloren, bevor attempt_id gespeichert wurde“ ist damit nicht
+aufklärbar; eine vollständige Exactly-once-Garantie wird nicht behauptet.
+Ein großzügigeres Wiederanlaufmodell mit möglicher doppelter Vision-Berechnung
+gehört zur folgenden L4-Bauarbeit, nicht in diese Mindestfixes.
+
+P2-1 bleibt **Deploy-Sperre**: ACK nach dauerhaftem Jobabschluss, Löschung von
+Original/Ergebnis und begrenzte Aufbewahrung verwaister Inhalte fehlen. Diese
+Runde baut keine ungeprüfte Retention nebenbei. L4 bleibt ROT: fachliche
+Lebendigkeit, automatische Fortsetzung und die DB-/Container-/GPU-Laufbelege
+stehen weiterhin aus.

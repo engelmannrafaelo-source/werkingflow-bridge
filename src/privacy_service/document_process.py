@@ -41,6 +41,18 @@ def write_json(path: Path, value: dict) -> None:
         os.close(fd)
 
 
+def execution_identity() -> dict:
+    """Identity of the outer reaper, stable across API-process restarts.
+
+    An API restart alone does not prove orphan descendants dead. A different
+    kernel boot or PID namespace/PID-1 lifetime does. Never compare API UUIDs.
+    """
+    init_stat = Path("/proc/1/stat").read_text().rsplit(")", 1)[1].split()
+    return {"boot_id": Path("/proc/sys/kernel/random/boot_id").read_text().strip(),
+            "pid_namespace": os.readlink("/proc/self/ns/pid"),
+            "init_start_ticks": init_stat[19]}
+
+
 def _children() -> list[int]:
     # The guardian has one thread. After the direct child dies, Linux reparents
     # its descendants to this subreaper (including children that used setsid).
@@ -84,6 +96,9 @@ def guardian(directory: Path) -> None:
 
     signal.signal(signal.SIGTERM, stop)
     signal.signal(signal.SIGINT, stop)
+    if (directory / "started.json").exists():
+        started = json.loads((directory / "started.json").read_text())
+        write_json(directory / "started.json", {**started, "execution_identity": execution_identity()})
     process = subprocess.Popen(
         [sys.executable, "-m", "src.privacy_service.document_worker", str(directory)],
         start_new_session=True, stdin=subprocess.DEVNULL,

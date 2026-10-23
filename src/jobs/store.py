@@ -453,6 +453,10 @@ async def mark_done(job_id: str, result: Optional[Dict[str, Any]]) -> None:
         raise JobRowMissing("mark_done", job_id)
 
 
+def _document_progress(value) -> dict:
+    return json.loads(value) if isinstance(value, str) else (value or {})
+
+
 async def document_state(job_id: str, attempt: int, action: str, value: dict) -> dict:
     """Atomic document claim/CAS. `attempts` is a monotonically increasing fence.
 
@@ -472,12 +476,15 @@ async def document_state(job_id: str, attempt: int, action: str, value: dict) ->
                     return {"owned": False}
                 row = await conn.fetchrow(
                     "UPDATE ai_jobs SET status='running', attempts=attempts+1, "
-                    "heartbeat_at=NOW(), updated_at=NOW() WHERE job_id=$1 RETURNING *", job_id,
+                    "progress=CASE WHEN attempts=0 THEN $2::jsonb ELSE progress END, "
+                    "heartbeat_at=NOW(), updated_at=NOW() WHERE job_id=$1 RETURNING *",
+                    job_id, json.dumps(value),
                 )
             elif row["status"] != "running" or row["attempts"] != attempt:
                 return {"owned": False, "status": row["status"]}
             cancel = row["cancel_requested_at"] is not None
-            answer = {"owned": True, "attempt": row["attempts"], "cancel_requested": cancel}
+            answer = {"owned": True, "attempt": row["attempts"], "cancel_requested": cancel,
+                      "progress": _document_progress(row["progress"])}
             if action == "done" and cancel:
                 return {**answer, "written": False}
             if action in {"done", "error", "cancelled"}:
