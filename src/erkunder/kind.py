@@ -8,6 +8,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
+from src.erkunder.ereignisse import Observer
 from src.erkunder.diagnostik import exception_details, technical_line
 
 ALLOWED_TOOLS = ["Bash", "Read", "Write", "Edit", "Glob", "Grep", "LS"]
@@ -128,9 +129,11 @@ async def run(body: dict[str, Any]) -> dict[str, Any]:
 
     # This image intentionally has no worker/job-store package.
     install_resilient_parser()
+    observer = Observer(lambda event: print(json.dumps({"ereignis": event}), flush=True))
     result = None
     zugriffe: list[dict[str, str]] = []
     async for message in query(prompt=body["prompt"], options=sdk_options(body)):
+        observer.observe(message)
         if isinstance(message, AssistantMessage):
             for block in message.content:
                 if isinstance(block, ToolUseBlock):
