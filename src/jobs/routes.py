@@ -301,6 +301,15 @@ async def create_job_endpoint(
     """Dispatch a job and return immediately. The work runs off-request (here on
     the Bridge), so the caller never holds a long connection — poll GET /v1/jobs/{id}."""
     await verify_api_key(request, credentials)
+    if body.kind == "document-convert":
+        from pydantic import ValidationError
+        from src.jobs.document import DocumentPayload
+
+        try:
+            DocumentPayload.model_validate(body.payload)
+        except ValidationError:
+            # Pydantic errors include input values: never echo uploaded bytes.
+            raise HTTPException(400, "Invalid document-convert envelope") from None
     if body.kind == "erkunder":
         from pydantic import ValidationError
 
@@ -960,6 +969,9 @@ _BERICHT_ANTWORT = {
     None: (200, None),                       # no account: no attempt was stopped
     "gebucht": (200, None),
     "vom_lauf": (200, None),
+    # Completed document drain: current attempt ended normally, NOT parked.
+    # _fruehere_versuche must not subtract one from defer_count for it.
+    "vom_dokumentlauf": (200, None),
     "rueckstau": (202, None),
     "fehlgeschlagen": (502, REASON_JOB_CANCEL_LEDGER_FAILED),
 }

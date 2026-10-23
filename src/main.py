@@ -97,6 +97,7 @@ from src.jobs.registry import (
     DEPENDENCY_UNAVAILABLE_STATUS,
     DEPENDENCY_RETRY_DELAY_S,
 )
+from src.jobs.document import document_executor
 from src.jobs import store_client as jobs_store_client
 from src.erkunder.routes import router as erkunder_router  # noqa: E402
 from src.jobs.executors import (
@@ -648,6 +649,7 @@ async def lifespan(app: FastAPI):
     register_executor("doc-agent", doc_agent_executor)
     register_executor("erkunder", erkunder_executor)
     register_executor("proxy", proxy_executor)
+    register_executor("document-convert", document_executor)
     register_executor("convert-html-to-pdf", convert_html_to_pdf_executor)
     set_attribution_extractor(extract_attribution_context)
     if jobs_store_client.is_store_available():
@@ -10153,7 +10155,7 @@ async def _maybe_repair_pdf_actualtext(
 
 
 async def _proxy_document_endpoint(
-    request: Request, downstream_path: str, timeout: float,
+    request: Request, downstream_path: str, timeout: Optional[float],
     *, agent_id: str, model: str = "docling",
 ) -> JSONResponse:
     """Forward a multipart document upload to the privacy-pdf-service.
@@ -10284,7 +10286,7 @@ async def convert_document_endpoint(
     await verify_api_key(request, credentials)
     _start = time.time()
     result = await _proxy_document_endpoint(
-        request, "/document/convert", timeout=600.0, agent_id="dokument-konvertierung",
+        request, "/document/convert", timeout=None, agent_id="dokument-konvertierung",
     )
     try:
         _attr = extract_attribution_context(request)

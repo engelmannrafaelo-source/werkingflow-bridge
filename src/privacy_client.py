@@ -70,7 +70,7 @@ PRIVACY_CONNECT_TIMEOUT_S = float(os.getenv("PRIVACY_SERVICE_CONNECT_TIMEOUT_S",
 PRIVACY_DEFAULT_READ_TIMEOUT_S = 30.0
 
 
-def privacy_timeout(read_s: float = PRIVACY_DEFAULT_READ_TIMEOUT_S) -> httpx.Timeout:
+def privacy_timeout(read_s: Optional[float] = PRIVACY_DEFAULT_READ_TIMEOUT_S) -> httpx.Timeout:
     """Timeout for a privacy-service call: short connect, caller-chosen read.
 
     Pass this instead of a bare float wherever a long timeout is needed, so
