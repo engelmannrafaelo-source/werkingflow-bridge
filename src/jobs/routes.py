@@ -19,6 +19,7 @@ cycle (main.py imports this module, not the other way around).
 import asyncio
 import hashlib
 import hmac
+import json
 import logging
 import os
 import time
@@ -28,7 +29,7 @@ from typing import Any, Callable, Dict, Optional
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
 from fastapi.security import HTTPAuthorizationCredentials
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from src.auth import security, verify_api_key
 from src.error_contract import JOB_CODE_STORE_INCOMPATIBLE, job_error_view
@@ -100,7 +101,19 @@ def _require_enabled() -> None:
         )
 
 
+class JobAttemptIdentity(BaseModel):
+    # Opaque client identifiers, never customer names/content.
+    call_id: str = Field(min_length=1, max_length=128, pattern=r"^[A-Za-z0-9._:-]+$", strict=True)
+    attempt_id: str = Field(min_length=1, max_length=128, pattern=r"^[A-Za-z0-9._:-]+$", strict=True)
+
+    def key(self) -> str:
+        encoded = json.dumps([self.call_id, self.attempt_id], separators=(",", ":")).encode("ascii")
+        return "bridge-attempt-v1:" + hashlib.sha256(encoded).hexdigest()
+
+
 class JobCreateRequest(BaseModel):
+    call_id: Optional[str] = None
+    attempt_id: Optional[str] = None
     kind: str
     payload: Dict[str, Any] = {}
     # Optional explicit attribution; if omitted, derived from request headers.
@@ -306,6 +319,17 @@ async def create_job_endpoint(
     except ValueError as e:
         return idempotency_error(REASON_IDEMPOTENCY_KEY_INVALID, 400, str(e))
 
+    if body.call_id is not None or body.attempt_id is not None:
+        from pydantic import ValidationError
+        try:
+            identity = JobAttemptIdentity(call_id=body.call_id, attempt_id=body.attempt_id)
+        except ValidationError:
+            return idempotency_error(REASON_IDEMPOTENCY_KEY_INVALID, 400,
+                                     "call_id and attempt_id must both be valid opaque identifiers")
+        if idem_key != identity.key():
+            return idempotency_error(REASON_IDEMPOTENCY_KEY_INVALID, 400,
+                                     "Idempotency-Key must match call_id/attempt_id")
+
     if get_executor(body.kind) is None:
         raise HTTPException(
             status_code=400,
@@ -457,6 +481,40 @@ def _replay(job: Dict[str, Any], key: str) -> JSONResponse:
         200, {"job_id": job["job_id"], "status": job["status"], "kind": job["kind"]},
         key, replayed=True,
     )
+
+
+@router.post("/v1/jobs/lookup")
+async def lookup_job_endpoint(
+    body: JobAttemptIdentity,
+    request: Request,
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(security),
+):
+    """Read an attempt identity without submitting work or requiring its payload.
+
+    A miss is UNKNOWN, never proof of nonacceptance (retention/in-flight POST).
+    The required header also pins the LB to the same store as keyed submit.
+    """
+    await verify_api_key(request, credentials)
+    _require_enabled()
+    try:
+        key = _idempotency_key(request)
+    except ValueError as exc:
+        return idempotency_error(REASON_IDEMPOTENCY_KEY_INVALID, 400, str(exc))
+    if key != body.key():
+        return idempotency_error(REASON_IDEMPOTENCY_KEY_INVALID, 400,
+                                 "Idempotency-Key must match call_id/attempt_id")
+    try:
+        job = await store_client.resolve_job_identity(_idempotency_owner(request), key)
+    except store_client.JobStoreUnavailable:
+        raise HTTPException(503, "Job identity lookup unavailable; outcome unknown") from None
+    if job is None:
+        return JSONResponse(status_code=404, content={
+            "reason": "job_identity_unknown", "outcome": "unknown",
+            "job_id": None,
+        }, headers={IDEMPOTENCY_HEADER: key, "Cache-Control": "no-store"})
+    return JSONResponse(content={"job_id": job["job_id"], "kind": job["kind"],
+                                 "status": job["status"]},
+                        headers={IDEMPOTENCY_HEADER: key, "Cache-Control": "no-store"})
 
 
 @router.get("/v1/jobs")

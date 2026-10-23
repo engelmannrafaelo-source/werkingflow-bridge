@@ -213,6 +213,27 @@ class IdempotencyUnsupported(JobStoreUnavailable):
     exactly the silent double job the key exists to prevent."""
 
 
+async def resolve_job_identity(owner: str, key: str) -> Optional[Dict[str, Any]]:
+    """Read-only identity lookup; older platform APIs fail loud, never submit."""
+    try:
+        resp = await call_platform(
+            "POST", "/v1/internal/jobs/identity-lookup",
+            json={"idempotency_owner": owner, "idempotency_key": key},
+            timeout_s=_READ_TIMEOUT_S,
+        )
+    except PlatformUnavailable as exc:
+        _fallback_or_raise("resolve_job_identity", exc)
+        return await store.resolve_job_identity(owner, key)
+    body = resp.json if isinstance(resp.json, dict) else {}
+    if resp.status_code == 200 and "job" in body:
+        job = body["job"]
+        if job is None or (isinstance(job, dict) and all(
+            isinstance(job.get(field), str) and job[field] for field in ("job_id", "kind", "status")
+        )):
+            return job
+    raise JobStoreUnavailable("Job identity lookup unavailable or incompatible; outcome unknown")
+
+
 async def find_job_by_idempotency_key(
     owner: str, key: str, kind: str, payload: Optional[Dict[str, Any]],
 ) -> Optional[Dict[str, Any]]:

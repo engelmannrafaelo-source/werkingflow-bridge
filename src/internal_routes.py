@@ -760,6 +760,20 @@ async def internal_create_job(
     return Response(status_code=204)
 
 
+class InternalJobIdentityLookup(BaseModel):
+    idempotency_owner: str = Field(min_length=1, max_length=400)
+    idempotency_key: str = Field(min_length=1, max_length=200)
+
+
+@router.post("/jobs/identity-lookup")
+async def internal_resolve_job_identity(
+    body: InternalJobIdentityLookup,
+    _claims: AuthClaims = Depends(require_service_token),
+) -> Any:
+    from src.jobs import store
+    return {"job": await store.resolve_job_identity(body.idempotency_owner, body.idempotency_key)}
+
+
 class InternalJobIdempotencyLookup(BaseModel):
     kind: str
     payload: Optional[Dict[str, Any]] = None
