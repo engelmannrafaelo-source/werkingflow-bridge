@@ -53,9 +53,10 @@ wiederholbarer Fehler gemeldet. Der Watchdog ist keine Remote-Ausführungsquittu
 Am gelesenen Basisstand 9be0986 beträgt die terminale Aufbewahrung **2 Stunden**
 (`GENERIC_JOB_TTL_SECONDS`), nicht mehr 15 Minuten. Mit `Idempotency-Key` bleibt
 der terminale Datensatz mindestens **24 Stunden** (`IDEMPOTENCY_RETENTION_SECONDS`).
-Running-Jobs werden nicht wegen ihres Alters beendet oder gelöscht. Pending-Jobs
-unterliegen bislang weiterhin dem generischen Alters-Backstop (weitere offene
-Wanduhrgrenze für die vollständige Abnahme). Nach Ablauf liefert GET 404;
+Running-Jobs werden nicht wegen ihres Alters beendet oder gelöscht. Auch
+Pending-Dokumentjobs sind vom generischen Alters-Backstop ausgenommen.
+Kapazitäts-/Abhängigkeits-Parken endet für Dokumentjobs nicht mehr am lokalen
+Deferral-Zähler; die Warteintervalle bleiben Taktraten. Nach terminaler Aufbewahrung liefert GET 404;
 der Aufrufer muss fertige Ergebnisse rechtzeitig in seiner eigenen Ablage sichern.
 
 Der bestehende `Idempotency-Key`-Vertrag gilt bereits: gleicher Owner, Schlüssel,
@@ -88,9 +89,27 @@ Heartbeat beweist den lebenden Runner, nicht den Fortschritt des Konverters.
 Die Connection-Pool-Wartezeit ist ebenfalls nicht begrenzt. Ohne gebundenen
 Owner (z.B. fehlender Attribution-Extractor) gilt der bestehende Legacy-Vertrag:
 Running-DELETE antwortet 409; kein Drain-Abbruch wird versprochen.
-Die vorhandenen internen Konverter-/Vision-Fristen (z.B. LibreOffice und
-VisionProvider) sind hier ebenfalls noch nicht entfernt. Dieser Bauabschnitt
-beseitigt die Bridge-Transport-Wanduhr, nicht alle internen KI-Fristen.
+Die internen 300-s-Fristen von LibreOffice und Dokument-Vision sowie der
+600-Seiten-Deckel bleiben vorerst bestehen. Ihre ersatzlose Entfernung würde
+auch den gemeinsam genutzten synchronen Dienst betreffen und kann dort Plätze
+dauerhaft belegen. Erst ein wirklicher Remote-Ressourcenstopp erlaubt den Umbau.
+**L4 bleibt deshalb ROT; der Gesamtauftrag ist mit diesem Teilbau nicht erfüllt.**
+
+Unbegrenztes Parken bedeutet: Fällt eine Abhängigkeit dauerhaft aus und sendet
+der Aufrufer kein DELETE, bleiben die Originalbytes unbegrenzt im Jobstore.
+Es gibt noch keine `deadline_at`-Unterstützung. Alle Retry-Intervalle fallen weiter
+an, einschließlich erneuter Payload-Übertragung; gleichbleibende Deferral-Gründe
+werden nur auf DEBUG protokolliert, neue Gründe auf WARNING. Der erste Fehler
+der Cancel-Abfrage wird gemeldet, gleichartige Wiederholungen bleiben still,
+die Erholung wird auf INFO gemeldet. Eine fehlende Cancel-Route meldet einmal
+ERROR und beendet weitere Cancel-Polls; die Konvertierung selbst läuft weiter.
+
+## Verbleibende Grenzen und L6-Anschluss
+
+Siehe [Lebenszyklus und Remote-Attempt-Vertrag](document-attempts-design.md).
+Dort sind verbleibende Grenzen, der erforderliche Ressourcenstopp und der
+Unterschied zwischen vorhandener Submit-Idempotenz und fehlendem Attempt-Reconcile
+explizit festgehalten. Das Dokument ist ein Entwurf, keine vorhandene Remote-API.
 
 ## Pyramiden-Prüfkontext (vor Auslieferung)
 

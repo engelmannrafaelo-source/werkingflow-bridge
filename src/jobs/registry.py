@@ -137,13 +137,16 @@ async def _defer_job(
     Returns True when the job was deferred (caller must stop), False when the
     patience budget is spent and it should fail loud like any other error.
 
+    Document jobs keep waiting without a local retry-count deadline.
+    Other kinds retain the existing cap.
+
     Both wait kinds share `defer_count` deliberately: it counts "waits that
     were not the job's fault", which is exactly what the retry cap subtracts
-    out (migration 044). One bound, one column, one eventual fail-loud.
+    out (migration 044). Document jobs retain the counter as history only.
     """
     job = await store_client.get_job(job_id)
     deferred_so_far = (job or {}).get("defer_count") or 0
-    if deferred_so_far >= max_defers:
+    if kind != "document-convert" and deferred_so_far >= max_defers:
         logger.error(
             f"💀 Async job {job_id} (kind={kind}) gave up after {deferred_so_far} "
             f"waits: {reason}"
@@ -162,10 +165,13 @@ async def _defer_job(
         return True
     # ONE line per defer that names who refused (worker + account + reason)
     # — "why did this 3 s job take 90 s" must be answerable from the log alone.
+    wait_budget = "unbounded" if kind == "document-convert" else str(max_defers)
     who = rejected_by or f"worker={os.getenv('INSTANCE_NAME', 'unknown')}"
-    logger.warning(
+    log = (logger.debug if kind == "document-convert"
+           and (job or {}).get("defer_reason") == reason[:500] else logger.warning)
+    log(
         f"⏸️ Async job {job_id} (kind={kind}) deferred {delay_s}s "
-        f"(wait {deferred_so_far + 1}/{max_defers}) — {what} — "
+        f"(wait {deferred_so_far + 1}/{wait_budget}) — {what} — "
         f"rejected by: {who} — {reason[:200]}"
     )
     return True
@@ -460,7 +466,10 @@ async def _als_abgebrochen_schliessen(
         )
         return
     if changed:
-        log = logger.warning if bericht.get("ledger") == "gebucht" else logger.error
+        if bericht.get("ledger") == "vom_dokumentlauf":
+            log = logger.info
+        else:
+            log = logger.warning if bericht.get("ledger") == "gebucht" else logger.error
         log(
             f"🛑 Async job {job_id} (kind={kind}) cancelled while running — "
             f"stopped by the endpoint, ledger {bericht.get('ledger')!r} ({bericht})"
