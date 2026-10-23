@@ -158,6 +158,17 @@ class IdempotencyKeyReused(ValueError):
         self.job_id = job_id
 
 
+async def resolve_job_identity(owner: str, key: str) -> Optional[Dict[str, Any]]:
+    """Owner-scoped read only; a missing/retained-away row proves no outcome."""
+    pool = get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT job_id, kind, status FROM ai_jobs "
+            "WHERE idempotency_owner = $1 AND idempotency_key = $2", owner, key,
+        )
+    return dict(row) if row is not None else None
+
+
 async def find_job_by_idempotency_key(
     owner: str,
     key: str,
