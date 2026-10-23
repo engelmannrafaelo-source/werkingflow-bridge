@@ -41,8 +41,8 @@ JOB_TERMINAL_STATUSES = (JOB_STATUS_DONE, JOB_STATUS_ERROR, JOB_STATUS_CANCELLED
 # Retention (BR11). Only terminal rows may be deleted by age, and their age
 # counts from the terminal transition (finished_at, migration 063), never from
 # created_at. A row that is still pending or running is never deleted by
-# retention: its bounds are find_abandoned (crash budget) and defer_count (wait
-# budget), plus the loud max-age backstop in prune_jobs.
+# retention. Crash recovery retains its existing budget. Document jobs are
+# exempt from the wait-count and pending-age backstops; other kinds retain them.
 _TERMINAL_SQL = "('done', 'error', 'cancelled')"
 _RETENTION_CLOCK = "COALESCE(finished_at, updated_at)"
 
@@ -563,7 +563,8 @@ async def prune_jobs(terminal_ttl_seconds: int, max_age_seconds: int) -> Dict[st
        older than terminal_ttl_seconds — rows carrying an Idempotency-Key
        (migration 065) only once it is also older than
        IDEMPOTENCY_RETENTION_SECONDS. Nothing else is ever deleted.
-    2. Backstop for parked work: a 'pending' row older than max_age_seconds
+    2. Document jobs have no retention-created execution deadline. Other
+       parked work keeps the existing backstop: a 'pending' row older than max_age_seconds
        (counted from submit) is turned into a terminal error
        JOB_MAX_AGE_EXCEEDED — not deleted, so the poller gets a truthful
        answer, and from then on it ages out like any terminal row. The UPDATE
@@ -605,6 +606,7 @@ async def prune_jobs(terminal_ttl_seconds: int, max_age_seconds: int) -> Dict[st
                SET status = 'error', error = $2::jsonb,
                    updated_at = NOW(), finished_at = NOW()
              WHERE status = 'pending'
+               AND kind <> 'document-convert'
                AND created_at < NOW() - ($1 || ' seconds')::interval
             RETURNING job_id
             """,
@@ -663,7 +665,7 @@ async def defer_job(job_id: str, delay_seconds: int, reason: str) -> None:
     Returns it to 'pending' so the existing watchdog picks it up again once
     `deferred_until` passes. Bumps defer_count (which the retry cap subtracts
     out) so an outage of any length cannot exhaust the crash budget, while a
-    bounded defer_count still guarantees eventual fail-loud.
+    Non-document kinds retain a bounded defer_count; documents wait until cancelled.
 
     A job whose owner asked to cancel it while it ran (BR10b,
     cancel_requested_at) is NOT parked: it becomes 'cancelled' in the same
@@ -785,8 +787,8 @@ async def find_abandoned(stale_seconds: int, max_attempts: int) -> List[Dict[str
     the watchdog fails these loud ('error') so nothing sits non-terminal forever.
 
     A job still inside its dependency wait is NOT abandoned — it is waiting on
-    purpose. Its own bound is defer_count (enforced by the runner), so excluding
-    it here cannot make it immortal. A row with a cancel wish (BR10b) is not
+    purpose. Non-document jobs retain the runner's defer_count bound; document
+    jobs deliberately have no wait-count deadline. A row with a cancel wish (BR10b) is not
     failed here either: claim_stale_job, which the watchdog runs first, closes
     it as 'cancelled'."""
     pool = get_pool()
@@ -828,8 +830,8 @@ async def find_active(origin: Optional[str] = None, limit: int = 50) -> Dict[str
         params.append(origin.strip().lower())
         origin_clause = f"AND attribution->>'bridge_origin' = ${len(params)}"
     # Counted in full (the gate needs the true number); only the listing is
-    # capped at ``limit``. Non-terminal rows are few: the TTL cleanup keeps the
-    # table to the last hour or so.
+    # capped at ``limit``. Active/waiting document rows have no age-based TTL;
+    # terminal retention does not bound this result set.
     pool = get_pool()
     async with pool.acquire() as conn:
         rows = await conn.fetch(

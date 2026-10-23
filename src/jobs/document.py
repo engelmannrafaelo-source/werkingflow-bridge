@@ -84,22 +84,35 @@ async def document_executor(payload, attribution, report_progress) -> dict[str, 
             data=document.fields,
         ))
         cancel_requested = False
+        cancel_poll_available = True
+        cancel_poll_failure = None
         try:
             while not task.done():
                 done, _ = await asyncio.wait({task}, timeout=JOB_CANCEL_POLL_S)
                 if done:
                     break
-                if job_id and not cancel_requested:
+                if job_id and cancel_poll_available and not cancel_requested:
                     try:
                         state = await store_client.cancel_state(job_id)
+                    except store_client.CancelRouteMissing:
+                        logger.error(
+                            "document job store lacks cancel-state route; cancellation polling disabled"
+                        )
+                        cancel_poll_available = False
+                        continue
                     except Exception as exc:
                         # Store unavailability is not permission to abandon a
                         # conversion whose remote outcome is still unknown.
-                        logger.warning(
-                            "document job cancel poll unavailable (%s)",
-                            type(exc).__name__,
-                        )
+                        failure = type(exc).__name__
+                        if failure != cancel_poll_failure:
+                            logger.warning(
+                                "document job cancel poll unavailable (%s)", failure,
+                            )
+                        cancel_poll_failure = failure
                         continue
+                    if cancel_poll_failure is not None:
+                        logger.info("document job cancel poll recovered")
+                        cancel_poll_failure = None
                     if state and state.get("cancel_requested"):
                         cancel_requested = True
                         try:

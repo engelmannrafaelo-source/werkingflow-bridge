@@ -934,7 +934,7 @@ async def _cancelled_answer(job_id: str, kind: Optional[str], wo: str) -> JSONRe
 
     The current account sets the base answer:
 
-      none, gebucht, vom_lauf   200
+      none, gebucht, vom_lauf, vom_dokumentlauf   200
       rueckstau                 202
       fehlgeschlagen            502 job_cancel_ledger_failed
       unbekannt, offen, other   502 job_cancel_ledger_unknown
