@@ -60,7 +60,7 @@ async def main():
     print(json.dumps({"receipt":receipt,"status_code":envelope.get("status_code"),
         "success":result.get("success") is True,"metadata_keys":sorted(metadata),
         "docling_parsed":metadata.get("docling_parsed"),
-        "page_count":result.get("page_count",metadata.get("page_count")),
+        "page_count":result.get("page_count",metadata.get("pages",metadata.get("page_count"))),
         "conversion_time_seconds":result.get("conversion_time_seconds")}), flush=True)
 asyncio.run(main())
 """
@@ -190,6 +190,10 @@ def main():
                         held[str(pid)] = max(held.get(str(pid), 0), used)
                 overall_peak = max(overall_peak, total)
                 overall_gpu_peak = max(overall_gpu_peak, total_gpu)
+                if any(max(record["rss_process_peaks_bytes"].values(), default=0) > 2 * 1024**3
+                       for record in records):
+                    reason = "measurement_stopped_process_rss_limit"
+                    break
                 if gpu_free() < 2048 * 1024**2:
                     reason = "measurement_stopped_gpu_headroom"
                     break

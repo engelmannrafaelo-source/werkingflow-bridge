@@ -266,3 +266,10 @@ Der Bericht markiert diesen Warm-Cache ausdrücklich. Fehlende Offline-Gewichte
 sind keine Kapazitätsaussage; ein LocalEntryNotFoundError/Fallback bleibt rot.
 Ein erfolgreicher Warm-Cache-Lauf belegt weder vollständige Gewichte im Image
 noch einen erfolgreichen kalten Dienststart nach Recreation.
+
+
+Aus dem650-Seiten-Befund: Cgroup-Limit allein begrenzt den beobachteten Prozess-
+RSS nicht gleich, weil gemeinsam genutzte Modellseiten anders verrechnet werden.
+Die Messprobe stoppt deshalb zusätzlich ihre eigenen Container, sobald ein
+beobachteter Einzelprozess über2GiB RSS liegt. Auch das ist ausschließlich ein
+Ressourcenschutz des Messwerkzeugs, keine neue Kundendokument-Laufregel.
