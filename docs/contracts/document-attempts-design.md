@@ -139,3 +139,20 @@ Dienst-/Worker-Neustart braucht zusätzlich den persistenten Attempt-Abgleich
 (Bauabschnitt 3). Die internen Konverterfristen bleiben in Abschnitt 1 bestehen.
 Synthetischer CSV-Lauf: Ergebnis 200, Konverter-Exit 0, Reap-Quittung vorhanden;
 keine KI-Anfrage. Noch keine Opus-Prüfung dieses Folgeabschnitts.
+
+## Bauabschnitt Fristen
+
+Nur im reaper-eigenen Konverterprozess gilt jetzt: keine 300-s-LibreOffice-Frist,
+kein 600-Seiten-Abbruch, keine 300-s-Vision-Frist. Legacy-Aufrufer in Threads
+behalten diese Schutzgrenzen. Der Ausführungskontext ist nicht durch Eingabefelder
+oder eine Umgebungseinstellung aktivierbar. LibreOffice erhält ein eigenes Profil
+im Konverter-Verzeichnis; es darf sich nicht an einen fremden Prozess anhängen.
+
+Verbleibend: Vision-TCP-Aufbau 10 s (Verbindungsaufbau), Renderbudget 384 MiB
+(Speicherverweigerung, 413), Docling-Batchgröße 25 (Arbeitsportion), Vision-Ausgabe
+1500/1200 Tokens (Antwortbudget mit Unvollständigkeitsmarker), gemeinsames
+Konverter-Semaphore (Parallelität). Keine dieser Grenzen belegt vollständige
+Kapazität unter 2 GB. Der Sync-Pfad hat weiterhin nginx-/Aufruferfristen; dessen
+Verbindungsende fordert lokalen Stop. Ohne Nutzerabbruch oder Gesamtfrist kann
+ein lebender, aber hängender Konverter weiterhin laufen. Anbieterarbeit nach
+lokalem Stop bleibt unbekannt; es existiert keine Anbieter-Stop-API.

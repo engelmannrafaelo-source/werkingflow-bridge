@@ -289,7 +289,7 @@ class VisionProvider:
         max_tokens: int = 4096,
         temperature: float = 0.7,
         system_prompt: Optional[str] = None,
-        timeout: float = 300.0,
+        timeout: float | httpx.Timeout | None = 300.0,
         thinking: Optional[Dict[str, Any]] = None,
         output_config: Optional[Dict[str, Any]] = None,
     ) -> VisionResponse:

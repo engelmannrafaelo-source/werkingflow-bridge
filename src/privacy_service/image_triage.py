@@ -36,6 +36,7 @@ import os
 import re
 from typing import Dict, List, Optional, Tuple
 
+from .document_execution import vision_timeout
 from src.vision_provider import get_vision_provider
 from src.model_registry import get_default_model
 from src.privacy_service.document_converter import _downscale_b64_png
@@ -167,6 +168,7 @@ async def _triage_one_batch(
             max_tokens=1200,
             temperature=0.0,
             system_prompt=system_prompt,
+            timeout=vision_timeout(),
         )
         parsed = _parse_verdict(resp.content or "")
     except ValueError as e:
