@@ -208,12 +208,15 @@ def _capacity_retry_delay(exc: "Exception") -> int:
 # the CLI still ran and nothing was booked, and a result completed in that
 # instant was lost (FK25BR Befunde 2 und 3).
 #
-# Only kinds whose executor is ONE self-call to a supervised endpoint are
+# document-convert uses the same cancellation result protocol but drains its
+# remote conversion before acknowledging (src/jobs/document.py). It cannot
+# promise immediate cancellation of remote converter threads.
+# Other kinds whose executor is ONE self-call to a supervised endpoint are
 # stopped this way, and only their self-call is marked (JOB_LAUF_HEADER).
 # Every other kind (erkunder: its run lives in the coordinator, not here;
 # ping/proxy/pdf: short, no model — a proxy job calling a chat path stays
 # unmarked) keeps BR10b.
-JOB_ABBRECHBAR_IM_LAUF = frozenset({"chat", "research", "doc-agent"})
+JOB_ABBRECHBAR_IM_LAUF = frozenset({"chat", "research", "doc-agent", "document-convert"})
 # attribution key of the owner bound at submit (routes._caller_owns, FK25B2).
 # A job without it (submitted before FK25B2) is not stopped in its run.
 EIGENTUEMER_KEY = "eigentuemer"

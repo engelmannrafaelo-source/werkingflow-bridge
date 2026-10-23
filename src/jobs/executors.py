@@ -346,12 +346,9 @@ PDF_SELF_CALL_TIMEOUT_S = float(os.getenv("BRIDGE_PDF_JOB_TIMEOUT_S", "600"))
 
 # Allowlist for the generic 'proxy' executor. ONLY these paths may be invoked as a
 # proxy job — never arbitrary paths (no /v1/jobs recursion, no internal routes).
-# JSON-in / JSON-out endpoints ONLY; binary/multipart endpoints (document/convert,
-# audio/transcriptions) are deliberately out of scope — they return binary / take
-# file uploads that do not fit the JSON job-result model, and are short calls that
-# gain little from durability. /v1/convert-html-to-pdf is JSON-in/JSON-out
-# (base64) but long-running and has its own dedicated kind ('convert-html-to-pdf')
-# with a render-appropriate timeout — keep it out of the generic proxy.
+# JSON-in / JSON-out endpoints ONLY. Document uploads have the dedicated
+# document-convert kind (src/jobs/document.py), with a base64 envelope.
+# Binary audio endpoints remain outside the proxy allowlist.
 PROXY_ALLOWED_PATHS = {
     "/v1/privacy/smart-anonymize",
 }

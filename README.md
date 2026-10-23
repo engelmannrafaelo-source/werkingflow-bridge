@@ -23,6 +23,9 @@ Authentifizierung mit `Authorization: Bearer <API-Key>`. Die aufloesbare
 Nutzeridentitaet wird als `X-User-ID` uebermittelt; ein freier Anzeigename genuegt
 nicht. Modelle aus der Modellliste der Zielumgebung beziehen.
 
+Dokumentkonvertierung als persistenter Job: [Envelope, Ergebnis, Aufbewahrung
+und Abbruchgrenzen](docs/contracts/document-jobs.md).
+
 ## Recherche
 
 `POST /v1/research` erwartet eine `query`; `depth` unterstuetzt
