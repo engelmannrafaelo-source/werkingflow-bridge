@@ -17,16 +17,23 @@ import select
 import signal
 import subprocess
 import sys
+import tempfile
 import time
 
 
 def write_json(path: Path, value: dict) -> None:
-    temporary = path.with_suffix(path.suffix + ".new")
-    with temporary.open("w", encoding="utf-8") as stream:
-        json.dump(value, stream, ensure_ascii=False)
-        stream.flush()
-        os.fsync(stream.fileno())
-    os.replace(temporary, path)
+    # Deadline observer and DELETE may persist the same stop concurrently.
+    # Each writer owns its temporary inode; never share a fixed '.new' name.
+    fd, name = tempfile.mkstemp(prefix=path.name + ".", suffix=".new", dir=path.parent)
+    temporary = Path(name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            json.dump(value, stream, ensure_ascii=False)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
     fd = os.open(path.parent, os.O_DIRECTORY)
     try:
         os.fsync(fd)

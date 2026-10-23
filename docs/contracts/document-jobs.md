@@ -125,3 +125,6 @@ Zurücklesen, fehlende Guardian-Quittung und Owner-Pipe-Verlust.
 Offen: Postgres-CAS unter konkurrierenden Workern, voller nginx → Platform-API →
 DB → Watchdog-Pfad mit großen Dateien, Store-Antwortverlust, GPU-/PDF-Peaks,
 bezahlte Vision-Reconciliation und Opus-Abnahme. Keine neuen Unit-Tests.
+
+Lokale Kapazitätsmessung und ihre Grenzen:
+[synthetischer Befund vom 23.10.2026](../reports/document-capacity-20261023.md).
