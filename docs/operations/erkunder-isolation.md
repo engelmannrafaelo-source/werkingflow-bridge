@@ -1,22 +1,33 @@
 # Erkunder: Schrittgrenzen, Ergebnisintegrität und Wiederanlauf
 
 Fehlgeschlagene Schrittversuche werden vor dem Aufräumen zusätzlich unter
-`/arbeit/.diagnosen/<bericht_id>.json` gesichert (Verzeichnis 0700, Datei 0600).
+`/arbeit/.diagnosen/<bericht_id>.<lauf_start>.json` gesichert (Verzeichnis 0700, Datei 0600).
 Das Archiv liegt außerhalb des zu löschenden Berichts, wird atomar geschrieben,
-mit fsync gesichert und zurückgelesen. Scheitert die Sicherung oder fehlt die
-Stopp-/Metadatenquittung eines aktiven Platzes, bleiben Bericht und Eingang
-erhalten und Aufräumen schlägt sichtbar fehl. Laufende Aufgaben werden dabei
+mit fsync gesichert und zurückgelesen. Nur eine fehlgeschlagene Archivierung
+verweigert das Aufräumen mit 503. Fehlende Platzquittungen (auch 404 nach
+Neustart), laufende Plätze und Abbruchfehler werden als unbestätigte Versuche
+archiviert; anschließend werden Bericht und Eingang gelöscht. Abbruchfehler
+stehen weiter in `platz_abbruch_fehler`. Ein Ordner ohne Laufdiagnose erhält
+einen Minimalbeleg `zustand=ohne_laufdiagnose`. Neue Starts verlangen weiterhin
+den bestätigten `stop_places()`-Durchlauf. Laufende Aufgaben werden dabei
 als abgebrochen markiert, damit ein Neustart sie nicht wieder aufnimmt.
 
 `GET /diagnose/<id>` liefert das Archiv mit derselben internen Authentisierung
 wie die anderen Leitstand-Wege; es bleibt nach erfolgreichem Aufräumen erhalten.
+Jeder neue Lauf erhält eine eigene persistierte Nanosekunden-Startkennung.
+Der Abruf liefert den neuesten Lauf und unter `aeltere_laeufe` die älteren;
+ein Neulauf derselben bericht_id überschreibt keinen früheren Lauf. Auch
+vorhandene Archive im alten Dateinamen bleiben lesbar.
 Status und Logs enthalten ebenfalls Schrittname, Versuch, Abbruchkategorie und
 soweit verfügbar Fehlerklasse, Exitcode und eine klassifizierte technische
 stderr-Zeile. Freie SDK-Texte, Prompts, Kundendaten und Tokens werden nicht
 übernommen. Es gibt keine automatische Löschung dieses Diagnosearchivs.
-Die Worker-Erweiterung überträgt diese Angaben auch in Fortschritt und
-`erkunder abbruch: <schritt>: <grund>`; dafür muss der Worker diese Erweiterung
-tatsächlich ausführen. Ein reiner Erkunder-Rollout aktualisiert keinen Worker.
+Die Worker-Erweiterung überträgt diese Angaben in den Fortschritt. StepFailed,
+Leitstand-Fehler und `erkunder abbruch: <schritt>: <grund>` bleiben kurze
+klassifizierte Gründe ohne angehängte Zusammenfassung; damit bleibt der alte
+Worker beim Erkunder-only-Rollout kompatibel. Einzelgründe stehen ausschließlich
+in `schritt_diagnosen`, Archiv und Logs. Ein reiner Erkunder-Rollout aktualisiert
+keinen Worker.
 
 Der Proxy hält sein begrenztes Log in `/tmp/erkunder-proxy/tinyproxy.log`.
 Das Verzeichnis gehört root und ist nicht sticky; die vorhandene Logdatei

@@ -102,7 +102,7 @@ def test_worker_inherits_authorization_from_platform_env(number):
 
 def test_proxy_is_default_deny_with_single_host_and_connect_port():
     config = (DOCKER / "erkunder/tinyproxy.conf").read_text()
-    assert 'LogFile "/tmp/tinyproxy.log"' in config
+    assert 'LogFile "/tmp/erkunder-proxy/tinyproxy.log"' in config
     assert "/dev/stdout" not in config
     assert re.findall(r"^ConnectPort (\d+)$", config, re.MULTILINE) == ["443"]
     assert "FilterDefaultDeny Yes" in config
@@ -118,7 +118,10 @@ def test_proxy_is_default_deny_with_single_host_and_connect_port():
     assert "secrets" not in proxy
     assert "env_file" not in proxy
     proxy_entrypoint = (DOCKER / "erkunder/erkunder-proxy").read_text()
-    assert 'log=/tmp/tinyproxy.log' in proxy_entrypoint
+    assert "log_dir=/tmp/erkunder-proxy" in proxy_entrypoint
+    assert "log=$log_dir/tinyproxy.log" in proxy_entrypoint
+    assert 'chown root:root "$log_dir"' in proxy_entrypoint
+    assert 'chmod 0755 "$log_dir"' in proxy_entrypoint
     assert 'chown nobody:nogroup "$log"' in proxy_entrypoint
     max_log_bytes = int(
         re.search(r"^max_log_bytes=(\d+)$", proxy_entrypoint, re.MULTILINE).group(1)
@@ -145,7 +148,7 @@ def test_proxy_truncates_a_busy_log_under_dash_without_killing_proxy(tmp_path):
     log = tmp_path / "tinyproxy.log"
     writes = tmp_path / "writes"
     script = (DOCKER / "erkunder/erkunder-proxy").read_text().replace(
-        "log=/tmp/tinyproxy.log", f"log={log}"
+        "log_dir=/tmp/erkunder-proxy", f"log_dir={tmp_path}"
     )
     script = script.replace(
         "event_pipe=/tmp/erkunder-proxy-events.$$", f"event_pipe={tmp_path}/events.$$"

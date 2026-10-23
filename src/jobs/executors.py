@@ -742,7 +742,7 @@ async def erkunder_executor(
                 if response.status_code != 200:
                     raise RuntimeError(f"Erkunder status HTTP {response.status_code}")
                 state = response.json()
-                from src.erkunder.diagnostik import STEPS, safe_reason, step_record, summary
+                from src.erkunder.diagnostik import STEPS, safe_reason, step_record
                 diagnostic_rows = state.get("schritt_diagnosen", [])
                 diagnostic_rows = [step_record(s) for s in diagnostic_rows if isinstance(s, dict)] if isinstance(diagnostic_rows, list) else []
                 await report_progress(
@@ -763,8 +763,6 @@ async def erkunder_executor(
                     step = state["schritt"]
                     safe_step = step if step in STEPS else "unbekannt"
                     reason_text = safe_reason(reason)
-                    if diagnostic_rows:
-                        reason_text += "; " + summary(diagnostic_rows)
                     raise RuntimeError(f"erkunder abbruch: {safe_step}: {reason_text}")
                 if state["zustand"] != "laeuft":
                     raise RuntimeError("Erkunder: ungueltiger Zustand")

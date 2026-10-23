@@ -552,6 +552,8 @@ async def test_cleanup_deletes_report_after_place_abort_failure(
             "timeout": "ReadTimeout",
         }[failure]
         assert result["platz_abbruch_fehler"] == [{"platz": 0, "fehler": expected}]
+        assert result["diagnose_gesichert"] is True
+        assert service.diagnostics("bericht-123")["bericht_id"] == "bericht-123"
         assert f"abbrechen=fehlgeschlagen fehler={expected}" in caplog.text
     finally:
         await service.shutdown()
@@ -890,7 +892,7 @@ async def test_reattach_deadline_releases_allocation_but_retains_report(tmp_path
         await resumed.tasks["bericht-123"]
         state = resumed.status("bericht-123")
         assert state["zustand"] == "abbruch"
-        assert "Zeitgrenze" in state["fehler"]
+        assert state["fehler"] == "Wiederanhaengen"
         assert resumed.directory("bericht-123").exists()
         assert (await finish(resumed, body("bericht-456")))["zustand"] == "fertig"
     finally:
