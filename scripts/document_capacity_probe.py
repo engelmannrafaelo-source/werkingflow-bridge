@@ -124,6 +124,7 @@ def main():
     parser.add_argument("--image", required=True)
     parser.add_argument("--source-root", type=Path, required=True)
     parser.add_argument("--source-sha", required=True)
+    parser.add_argument("--model-cache", type=Path, help="Read-only existing HuggingFace hub weights; no token directory")
     parser.add_argument("--pages", type=int, default=25)
     parser.add_argument("--parallel", type=int, choices=(1, 2), default=1)
     parser.add_argument("--output", type=Path, required=True)
@@ -142,7 +143,7 @@ def main():
     report = {"image_id": image, "source_sha": args.source_sha,
               "pages_each": args.pages, "parallel": args.parallel,
               "sample_interval_seconds": 0.25, "memory_limit_each_bytes": 2 * 1024**3,
-              "network": "none", "records": records}
+              "network": "none", "model_cache_readonly": args.model_cache is not None, "records": records}
     with tempfile.TemporaryDirectory(prefix="document-capacity-") as temporary:
         runner = Path(temporary) / "runner.py"
         runner.write_text(RUNNER)
@@ -150,13 +151,18 @@ def main():
             for _ in range(args.parallel):
                 name = "document-capacity-" + uuid.uuid4().hex[:12]
                 names.append(name)
+                cache_mount = []
+                if args.model_cache is not None:
+                    if not args.model_cache.is_dir() or args.model_cache.name != "hub":
+                        raise ValueError("Expected an existing model hub directory")
+                    cache_mount = ["--mount", f"type=bind,src={args.model_cache.resolve()},dst=/home/claude/.cache/huggingface/hub,readonly"]
                 command("docker", "run", "-d", "--name", name,
                     "--network", "none", "--gpus", "all", "--memory", "2g",
                     "--memory-swap", "2g", "--cpus", "2", "--pids-limit", "256",
                     "--mount", f"type=bind,src={args.source_root.resolve() / 'src'},dst=/app/src,readonly",
                     "--mount", f"type=bind,src={runner},dst=/probe.py,readonly",
                     "--tmpfs", "/work:rw,size=256m",
-                    "--entrypoint", "/app/.venv/bin/python", image, "/probe.py", str(args.pages))
+                    *cache_mount, "--entrypoint", "/app/.venv/bin/python", image, "/probe.py", str(args.pages))
                 records.append({"name": name, "rss_tree_peak_bytes": 0, "gpu_peak_bytes": 0,
                                 "rss_process_peaks_bytes": {}, "gpu_process_peaks_bytes": {}})
             while True:

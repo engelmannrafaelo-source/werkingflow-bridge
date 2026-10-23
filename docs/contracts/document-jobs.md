@@ -258,3 +258,11 @@ Kapazitätsnachweis. Fremde Prozesse werden weder beendet noch verändert.
 Reale Messberichte, nicht dieser Werkzeugbau, entscheiden P2-6. Große Dateien,
 Parallelität, Dienst-Grundlast und der endgültige Release-Build bleiben Teil
 der Abnahme. L4 bleibt bis dahin ROT.
+
+
+Offline-Modellvoraussetzung: --model-cache darf einen vorhandenen HuggingFace-
+hub-Ordner ausschließlich read-only einbinden (keinen Token-/Credential-Ordner).
+Der Bericht markiert diesen Warm-Cache ausdrücklich. Fehlende Offline-Gewichte
+sind keine Kapazitätsaussage; ein LocalEntryNotFoundError/Fallback bleibt rot.
+Ein erfolgreicher Warm-Cache-Lauf belegt weder vollständige Gewichte im Image
+noch einen erfolgreichen kalten Dienststart nach Recreation.
