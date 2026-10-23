@@ -995,7 +995,8 @@ def convert_pdf_bytes(pdf_bytes: bytes) -> Tuple[str, Dict[str, Any], Dict[str, 
     batch_pages = _docling_batch_pages()
     render_max_bytes = _render_max_bytes()
     _docling_images_scale()
-    if total_pages > max_pages:
+    from .document_execution import managed
+    if not managed and total_pages > max_pages:
         raise DocumentTooLargeError(
             f"PDF hat {total_pages} Seiten, die Obergrenze dieses Dienstes ist "
             f"{max_pages} Seiten (DOCLING_MAX_PAGES). Bitte in Teile mit hoechstens "
@@ -1129,10 +1130,13 @@ def _libreoffice_to_pdf(input_path: str, output_dir: str, timeout: int = 300) ->
         raise RuntimeError(
             "LibreOffice is not installed in this container — cannot convert Office documents."
         )
+    from .document_execution import managed
+    from pathlib import Path
     binary = "libreoffice" if shutil.which("libreoffice") else "soffice"
     proc = subprocess.run(
         [
             binary,
+            "-env:UserInstallation=" + (Path(output_dir).resolve() / "lo-profile").as_uri(),
             "--headless",
             "--norestore",
             "--nologo",
@@ -1144,7 +1148,7 @@ def _libreoffice_to_pdf(input_path: str, output_dir: str, timeout: int = 300) ->
             input_path,
         ],
         capture_output=True,
-        timeout=timeout,
+        timeout=None if managed else timeout,
     )
     if proc.returncode != 0:
         raise RuntimeError(

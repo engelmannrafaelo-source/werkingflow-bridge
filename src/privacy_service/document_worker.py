@@ -10,6 +10,8 @@ from .document_process import write_json
 
 
 async def convert(directory: Path) -> dict:
+    from . import document_execution
+    document_execution.managed = True
     from .adapters import build_default_chain
     from .image_describer import describe_images, append_descriptions_to_markdown
     from .image_triage import plan_image_descriptions
