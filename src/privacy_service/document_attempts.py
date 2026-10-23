@@ -152,9 +152,6 @@ async def accept(call_id: str, request: Request):
     from .app import _read_uploaded_file
     path = call_path(call_id)
     content, filename, mime, fields = await _read_uploaded_file(request)
-    from src.vision_provider import vision_available
-    if str(fields.get("describe_images", "")).lower() in ("1", "true", "yes", "on") and not vision_available():
-        raise HTTPException(503, "document Vision is not configured")
     deadline = request.headers.get("x-document-deadline")
     if deadline:
         try:
@@ -176,6 +173,9 @@ async def accept(call_id: str, request: Request):
             if read(path, "accepted.json")["digest"] != digest:
                 raise HTTPException(409, "document call digest conflict")
         else:
+            from src.vision_provider import vision_available
+            if str(fields.get("describe_images", "")).lower() in ("1", "true", "yes", "on") and not vision_available():
+                raise HTTPException(503, "document Vision is not configured")
             path.mkdir(mode=0o700, exist_ok=True)
             with (path / "source").open("wb") as stream:
                 stream.write(content)
