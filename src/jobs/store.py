@@ -295,7 +295,7 @@ async def mark_running(job_id: str) -> bool:
             UPDATE ai_jobs
                SET status = 'running', attempts = attempts + 1,
                    heartbeat_at = NOW(), updated_at = NOW()
-             WHERE job_id = $1 AND status = 'pending'
+             WHERE job_id = $1 AND kind <> 'document-convert' AND status = 'pending'
             """,
             job_id,
         )
@@ -392,7 +392,7 @@ async def finish_cancelled(job_id: str) -> bool:
             """
             UPDATE ai_jobs SET status = 'cancelled', updated_at = NOW(),
                                finished_at = NOW()
-             WHERE job_id = $1 AND status = 'running'
+             WHERE job_id = $1 AND kind <> 'document-convert' AND status = 'running'
                AND cancel_requested_at IS NOT NULL
             """,
             job_id,
@@ -405,7 +405,7 @@ async def heartbeat(job_id: str) -> None:
     pool = get_pool()
     async with pool.acquire() as conn:
         result = await conn.execute(
-            "UPDATE ai_jobs SET heartbeat_at = NOW(), updated_at = NOW() WHERE job_id = $1",
+            "UPDATE ai_jobs SET heartbeat_at = NOW(), updated_at = NOW() WHERE job_id = $1 AND kind <> 'document-convert'",
             job_id,
         )
     if _affected(result) == 0:
@@ -418,7 +418,7 @@ async def update_progress(job_id: str, progress: Dict[str, Any]) -> None:
         await conn.execute(
             """
             UPDATE ai_jobs SET progress = $2::jsonb, heartbeat_at = NOW(), updated_at = NOW()
-             WHERE job_id = $1
+             WHERE job_id = $1 AND kind <> 'document-convert'
             """,
             job_id,
             json.dumps(progress, default=str),
@@ -433,13 +433,63 @@ async def mark_done(job_id: str, result: Optional[Dict[str, Any]]) -> None:
             """
             UPDATE ai_jobs SET status = 'done', result = $2::jsonb,
                                updated_at = NOW(), finished_at = NOW()
-             WHERE job_id = $1
+             WHERE job_id = $1 AND kind <> 'document-convert'
             """,
             job_id,
             json.dumps(result, default=str) if result is not None else None,
         )
     if _affected(tag) == 0:
         raise JobRowMissing("mark_done", job_id)
+
+
+async def document_state(job_id: str, attempt: int, action: str, value: dict) -> dict:
+    """Atomic document claim/CAS. `attempts` is a monotonically increasing fence.
+
+    All document runner writes use this route, including heartbeat and stop.
+    A cancellation wish is monotonic for a job ID; new work needs a new job ID.
+    The whole transition (including cancel-vs-done) holds the same row lock.
+    """
+    if action not in {"claim", "heartbeat", "progress", "done", "error", "cancelled"}:
+        raise ValueError("invalid document state action")
+    async with get_pool().acquire() as conn:
+        async with conn.transaction():
+            row = await conn.fetchrow("SELECT * FROM ai_jobs WHERE job_id=$1 FOR UPDATE", job_id)
+            if not row or row["kind"] != "document-convert":
+                return {"owned": False}
+            if action == "claim":
+                if row["status"] != "pending" or row["cancel_requested_at"] is not None:
+                    return {"owned": False}
+                row = await conn.fetchrow(
+                    "UPDATE ai_jobs SET status='running', attempts=attempts+1, "
+                    "heartbeat_at=NOW(), updated_at=NOW() WHERE job_id=$1 RETURNING *", job_id,
+                )
+            elif row["status"] != "running" or row["attempts"] != attempt:
+                return {"owned": False, "status": row["status"]}
+            cancel = row["cancel_requested_at"] is not None
+            answer = {"owned": True, "attempt": row["attempts"], "cancel_requested": cancel}
+            if action == "done" and cancel:
+                return {**answer, "written": False}
+            if action in {"done", "error", "cancelled"}:
+                # A deadline may cancel without a user's DELETE. The remote
+                # receipt is mandatory for both paths, supplied by the runner.
+                if action == "cancelled" and not value.get("stop_receipt", {}).get("reaped"):
+                    raise ValueError("document cancellation lacks stop receipt")
+                await conn.execute(
+                    "UPDATE ai_jobs SET status=$2, result=$3::jsonb, error=$4::jsonb, "
+                    "progress=$5::jsonb, updated_at=NOW(), finished_at=NOW() WHERE job_id=$1",
+                    job_id, action,
+                    json.dumps(value.get("result")) if action == "done" else None,
+                    json.dumps(value.get("error")) if action == "error" else None,
+                    json.dumps(value.get("progress", {})),
+                )
+            elif action == "progress":
+                await conn.execute(
+                    "UPDATE ai_jobs SET progress=$2::jsonb, heartbeat_at=NOW(), "
+                    "updated_at=NOW() WHERE job_id=$1", job_id, json.dumps(value),
+                )
+            else:
+                await conn.execute("UPDATE ai_jobs SET heartbeat_at=NOW(), updated_at=NOW() WHERE job_id=$1", job_id)
+            return {**answer, "written": True}
 
 
 async def mark_error(
@@ -505,7 +555,7 @@ async def mark_error(
                        ELSE progress END,
                    error = $2::jsonb,
                    updated_at = NOW(), finished_at = NOW()
-             WHERE job_id = $1 AND status <> 'cancelled'
+             WHERE job_id = $1 AND kind <> 'document-convert' AND status <> 'cancelled'
             """,
             job_id,
             json.dumps(error, default=str),
@@ -517,7 +567,7 @@ async def mark_error(
             # as is, said loudly; only a row that is really gone raises.
             zeile = await conn.fetchrow(
                 "SELECT progress->'abbruch'->>'ledger' AS ledger FROM ai_jobs "
-                "WHERE job_id = $1 AND status = 'cancelled'",
+                "WHERE job_id = $1 AND kind <> 'document-convert' AND status = 'cancelled'",
                 job_id,
             )
             if zeile is not None:
@@ -699,7 +749,7 @@ async def defer_job(job_id: str, delay_seconds: int, reason: str) -> None:
                    defer_reason = $3,
                    heartbeat_at = NOW(),
                    updated_at = NOW()
-             WHERE job_id = $1
+             WHERE job_id = $1 AND kind <> 'document-convert'
             """,
             job_id,
             str(delay_seconds),
@@ -710,6 +760,10 @@ async def defer_job(job_id: str, delay_seconds: int, reason: str) -> None:
 async def claim_stale_job(stale_seconds: int, max_attempts: int) -> Optional[Dict[str, Any]]:
     """Atomically claim ONE stale-but-retryable job for requeue and return it
     (now status='running', attempts bumped). Returns None when none are claimable.
+
+    Document jobs are exempt from the crash cap and cancellation closing below:
+    their new owner must reconcile/stop the SAME durable remote call first.
+    The following legacy cancellation rules apply only to other kinds.
 
     Multi-worker safe: `FOR UPDATE SKIP LOCKED` guarantees that when several
     workers run the watchdog at once, each claims a DIFFERENT row — never the same
@@ -752,6 +806,7 @@ async def claim_stale_job(stale_seconds: int, max_attempts: int) -> Optional[Dic
                                'geschlossen_von', 'watchdog'))
                        ELSE progress END
              WHERE cancel_requested_at IS NOT NULL
+               AND kind <> 'document-convert'
                AND (status = 'pending'
                     OR (status = 'running'
                         AND {_STALE_SINCE} < NOW() - ($1 || ' seconds')::interval))
@@ -766,9 +821,9 @@ async def claim_stale_job(stale_seconds: int, max_attempts: int) -> Optional[Dic
              WHERE job_id = (
                  SELECT job_id FROM ai_jobs
                   WHERE status IN ('pending', 'running')
-                    AND cancel_requested_at IS NULL
+                    AND (cancel_requested_at IS NULL OR kind = 'document-convert')
                     AND {_CLAIMABLE}
-                    AND {_CRASH_ATTEMPTS} < $2
+                    AND (kind = 'document-convert' OR {_CRASH_ATTEMPTS} < $2)
                     AND {_NOT_DEFERRED}
                   ORDER BY {_STALE_SINCE} ASC
                   FOR UPDATE SKIP LOCKED
@@ -797,6 +852,7 @@ async def find_abandoned(stale_seconds: int, max_attempts: int) -> List[Dict[str
             f"""
             SELECT * FROM ai_jobs
              WHERE status IN ('pending', 'running')
+               AND kind <> 'document-convert'
                AND cancel_requested_at IS NULL
                AND {_STALE_SINCE} < NOW() - ($1 || ' seconds')::interval
                AND {_CRASH_ATTEMPTS} >= $2

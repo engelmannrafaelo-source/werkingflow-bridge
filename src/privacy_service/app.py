@@ -220,7 +220,7 @@ async def require_bearer_token(request: Request, call_next):
     if path not in _OPEN_PATHS:
         header = request.headers.get("authorization", "")
         scheme, _, presented = header.partition(" ")
-        strict = _TOKEN_PFLICHT == "alle" or path in _STRICT_PATHS
+        strict = _TOKEN_PFLICHT == "alle" or path in _STRICT_PATHS or path.startswith("/document/calls/")
         if header:
             if scheme.lower() != "bearer" or not hmac.compare_digest(
                 presented.strip().encode("utf-8"), _SERVICE_TOKEN_BYTES
@@ -1779,3 +1779,8 @@ async def status():
             middleware.anonymizer.SUPPORTED_ENTITIES if middleware.enabled else []
         ),
     )
+
+
+from .document_attempts import router as document_attempt_router, configure as configure_document_attempts
+configure_document_attempts(_CONVERSION_SEMAPHORE)
+app.include_router(document_attempt_router)

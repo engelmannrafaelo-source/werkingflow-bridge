@@ -873,6 +873,24 @@ async def internal_mark_running(
     return Response(status_code=204)
 
 
+class DocumentStateRequest(BaseModel):
+    attempt: int = Field(ge=0)
+    action: str
+    value: Dict[str, Any] = Field(default_factory=dict)
+
+
+@router.post("/jobs/{job_id}/document-state")
+async def internal_document_state(
+    job_id: str, body: DocumentStateRequest,
+    _claims: AuthClaims = Depends(require_service_token),
+) -> Dict[str, Any]:
+    from src.jobs import store
+    try:
+        return await store.document_state(job_id, body.attempt, body.action, body.value)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from None
+
+
 @router.post("/jobs/{job_id}/cancel")
 async def internal_cancel_job(
     job_id: str,

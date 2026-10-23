@@ -49,7 +49,10 @@ COPY . /app
 WORKDIR /app
 
 # Create directories
-RUN mkdir -p /app/logs
+RUN mkdir -p /app/logs /var/lib/bridge-document-jobs && \
+    chown claude:claude /var/lib/bridge-document-jobs && \
+    chmod 700 /var/lib/bridge-document-jobs
+VOLUME ["/var/lib/bridge-document-jobs"]
 
 # Install Python deps WITH privacy + pdf + documents extras.
 # documents pulls openpyxl/pandas/tabulate/markdownify/extract-msg so the

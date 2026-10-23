@@ -78,7 +78,7 @@ async def _describe_one(
         max_tokens=1500,
         temperature=0.1,
         system_prompt=system_prompt,
-            timeout=vision_timeout(),
+        timeout=vision_timeout(),
     )
     text = (resp.content or "").strip()
     if getattr(resp, "stop_reason", None) == "max_tokens":
