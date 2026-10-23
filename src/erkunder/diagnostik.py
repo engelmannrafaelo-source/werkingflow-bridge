@@ -120,3 +120,22 @@ def summary(records: list[dict]) -> str:
         parts.append(f"{record['name']} Versuch {record['versuch']}: {record['abbruch_grund']}" +
                      (f" ({extra})" if extra else ""))
     return "; ".join(parts)
+
+
+async def classify_stderr(stream) -> dict:
+    """Drain stderr continuously; retain at most 8 KiB, return fixed classes only."""
+    tail = b""
+    diagnosis = {}
+    while chunk := await stream.read(4096):
+        tail = (tail + chunk)[-8192:]
+        text = tail.decode("utf-8", errors="replace")
+        line = technical_line(text)
+        code = LINE_CODES.get(line)
+        if code:
+            diagnosis.update(fehlerart="ProcessError", fehlercode=code)
+        for name in KINDS:
+            if re.search(r"(?:^|\n)" + re.escape(name) + r":", text):
+                diagnosis["fehlerart"] = name
+                if name in TYPE_CODES:
+                    diagnosis["fehlercode"] = TYPE_CODES[name]
+    return details(diagnosis)

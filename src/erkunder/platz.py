@@ -32,7 +32,7 @@ from src.erkunder.dateien import read_bytes, read_text
 from src.erkunder.ipc import clear_owned_ipc
 from src.erkunder.models import VORGABE_MODELL, ModellName
 from src.erkunder.prozessschutz import protect_process
-from src.erkunder.diagnostik import details, exception_details, safe_reason
+from src.erkunder.diagnostik import details, exception_details, safe_reason, classify_stderr
 
 LOG = logging.getLogger(__name__)
 
@@ -90,6 +90,30 @@ def child_failure_reason(output: bytes) -> str:
     ):
         return safe_reason(reason)
     return "cli_fehler: Kindprozess"
+
+
+async def communicate_diagnosed(process, payload: bytes):
+    """Drain both output pipes while sending stdin; never return raw stderr."""
+    async def send():
+        try:
+            process.stdin.write(payload)
+            await process.stdin.drain()
+        except (BrokenPipeError, ConnectionResetError):
+            pass  # Child startup may fail before it consumes stdin.
+        finally:
+            process.stdin.close()
+
+    tasks = [asyncio.create_task(send()),
+             asyncio.create_task(process.stdout.read()),
+             asyncio.create_task(classify_stderr(process.stderr))]
+    try:
+        _, stdout, diagnosis = await asyncio.gather(*tasks)
+        await process.wait()
+        return stdout, diagnosis
+    finally:
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
 
 
 class Platz:
@@ -171,7 +195,7 @@ class Platz:
                 *self.command,
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.PIPE,
                 start_new_session=True,
                 env={
                     "TMPDIR": str(temporary),
@@ -198,7 +222,7 @@ class Platz:
             payload = body.model_dump()
             payload["claude_token"] = body.claude_token.get_secret_value()
             communication = asyncio.create_task(
-                self.process.communicate(json.dumps(payload).encode())
+                communicate_diagnosed(self.process, json.dumps(payload).encode())
             )
             while True:
                 reap_adopted_children(self.process.pid)
@@ -222,11 +246,11 @@ class Platz:
                 if done:
                     current, oom = self.memory()
                     peak = max(peak, current)
-                    stdout, _ = communication.result()
+                    stdout, diagnosis = communication.result()
                     try:
                         child = json.loads(stdout)
                         if isinstance(child, dict):
-                            diagnosis = details(child.get("diagnose"))
+                            diagnosis.update(details(child.get("diagnose")))
                     except (TypeError, ValueError):
                         pass  # Exit code remains evidence even without a JSON envelope.
                     if oom > initial_oom:
