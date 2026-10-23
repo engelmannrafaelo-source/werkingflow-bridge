@@ -525,6 +525,7 @@ async def _read_uploaded_file(request: Request) -> Tuple[bytes, str, Optional[st
         "context_hint": form.get("context_hint"),
         "describe_images": form.get("describe_images"),
         "describe_prompt": form.get("describe_prompt"),
+        "triage_prompt": form.get("triage_prompt"),
     }
     return content, filename, mime_hint, extras
 
@@ -552,77 +553,43 @@ async def document_convert_endpoint(request: Request):
         logger.error(f"document/convert abgelehnt: {_VISION_KEY_MISSING_MSG}")
         raise HTTPException(status_code=500, detail=_VISION_KEY_MISSING_MSG)
 
-    t_start = _time.time()
-    loop = asyncio.get_event_loop()
-    chain = _get_chain()
+    from pathlib import Path
+    from .document_process import run, write_json
 
-    try:
-        async with _CONVERSION_SEMAPHORE:
-            result = await loop.run_in_executor(
-                None, chain.convert, content, filename, mime_hint
-            )
-    except DocumentTooLargeError as e:
-        logger.warning(f"document/convert abgelehnt (413): {e}")
-        raise HTTPException(status_code=413, detail=str(e))
-    except ServiceConfigError as e:
-        logger.error(f"document/convert Konfigurationsfehler (500): {e}")
-        raise HTTPException(status_code=500, detail=f"Konfigurationsfehler des Dienstes: {e}")
-    except UnsupportedFormatError as e:
-        logger.warning(f"document/convert unsupported: {e}")
-        raise HTTPException(status_code=415, detail=str(e))
-    except AdapterError as e:
-        logger.error(f"document/convert adapter error: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
-    except RuntimeError as e:
-        logger.error(f"document/convert chain error: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
+    async with _CONVERSION_SEMAPHORE:
+        with tempfile.TemporaryDirectory(prefix="document-process-") as temporary:
+            directory = Path(temporary)
+            (directory / "source").write_bytes(content)
+            write_json(directory / "request.json", {
+                "filename": filename, "mime_type": mime_hint, "fields": extras,
+            })
+            stop = asyncio.Event()
 
-    body = result.to_response()
+            async def observe_disconnect():
+                while not stop.is_set():
+                    if await request.is_disconnected():
+                        stop.set()
+                        return
+                    await asyncio.sleep(1)
 
-    # Opt-in: run extracted images through Vision and append the descriptions to
-    # the Markdown, so the converted document is self-contained without the raw
-    # images. Off by default (callers opt in via describe_images=true) so existing
-    # consumers stay byte-for-byte unchanged.
-    #
-    # For image-heavy documents a cheap triage pass first decides which figures
-    # are worth a full description (see image_triage). Triaged-out figures stay
-    # VISIBLE as a short marker — never silently dropped — and below the triage
-    # threshold nothing changes (to_describe == result.images, triage_meta None).
-    if want_descriptions and result.images:
-        triage_prompt = extras.get("triage_prompt") or ""
-        to_describe, skipped_labels, triage_meta = await plan_image_descriptions(
-            result.images, triage_prompt=triage_prompt
-        )
-        try:
-            descriptions = await describe_images(
-                to_describe, context=filename, describe_prompt=describe_prompt
-            )
-        except ValueError as e:
-            # Konfigurationsfehler aus dem Vision-Provider (der Pre-Flight oben
-            # faengt den leeren Key; hier landet, was der Provider sonst noch
-            # als Misskonfiguration meldet). Nie wieder als unhandled 500 ohne
-            # Response-Body — der Aufrufer braucht die Meldung.
-            logger.error(f"document/convert vision misconfiguration: {e}", exc_info=True)
-            raise HTTPException(status_code=500, detail=str(e))
-        # Keep triaged-out figures present in the document (fail-loud, no drop).
-        for name, label in skipped_labels.items():
-            descriptions[name] = f"_[nicht detailliert analysiert — {label}]_"
-        body["markdown"] = append_descriptions_to_markdown(body["markdown"], descriptions)
-        body["image_descriptions"] = descriptions
-        if triage_meta:
-            body["described_count"] = len(to_describe)
-            body["triage"] = triage_meta
-
-    duration = _time.time() - t_start
-    logger.info(
-        f"document/convert done: {filename} -> format={result.fmt} "
-        f"adapter={result.metadata.get('adapter')} "
-        f"chars={len(body['markdown'])} images={len(result.images or {})} "
-        f"described={want_descriptions} ({duration:.2f}s)"
-    )
-
-    body["conversion_time_seconds"] = round(duration, 2)
-    return body
+            observer = asyncio.create_task(observe_disconnect())
+            try:
+                receipt = await run(directory, stop)
+            finally:
+                observer.cancel()
+                await asyncio.gather(observer, return_exceptions=True)
+            if receipt["reason"] != "completed":
+                return JSONResponse(status_code=499, content={
+                    "success": False, "error": "document conversion stopped",
+                    "stop_receipt": receipt,
+                })
+            result_path = directory / "result.json"
+            if not result_path.exists():
+                raise HTTPException(status_code=500, detail="document converter exited without a result")
+            envelope = json.loads(result_path.read_text())
+            if envelope["status_code"] != 200:
+                raise HTTPException(status_code=envelope["status_code"], detail=envelope["error"])
+            return envelope["result"]
 
 
 @app.post("/document/convert-and-anonymize")
