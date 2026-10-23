@@ -495,12 +495,19 @@ async def _als_abgebrochen_schliessen(
     )
 
 
+_document_ack_task = None
+
+
 async def run_watchdog_pass(stale_seconds: int, max_attempts: int) -> Dict[str, int]:
     """One watchdog sweep:
       - atomically claim & requeue stale-but-retryable jobs (pending or running),
       - fail-loud the ones that exhausted their retry budget.
     Returns counts. Safe to run concurrently on every worker (atomic claim)."""
     requeued = await run_claim_pass(stale_seconds, max_attempts)
+    global _document_ack_task
+    from .document import reconcile_document_acks
+    if _document_ack_task is None or _document_ack_task.done():
+        _document_ack_task = spawn(reconcile_document_acks())
 
     failed = 0
     for job in await store_client.find_abandoned(stale_seconds, max_attempts):

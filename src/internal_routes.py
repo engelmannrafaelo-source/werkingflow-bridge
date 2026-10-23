@@ -1084,3 +1084,23 @@ async def internal_prune_jobs(
     from src.jobs import store
 
     return await store.prune_jobs(body.terminal_ttl_seconds, body.max_age_seconds)
+
+
+@router.get("/document-acks")
+async def internal_document_acks(_claims: AuthClaims = Depends(require_service_token)):
+    from src.jobs import store
+    return {"acks": await store.pending_document_acks()}
+
+
+class DocumentAckIdentity(BaseModel):
+    call_id: str
+    attempt_id: str | None = None
+    digest: str | None = None
+
+
+@router.post("/document-acks/{job_id}")
+async def internal_finish_document_ack(job_id: str, body: DocumentAckIdentity,
+                                      _claims: AuthClaims = Depends(require_service_token)):
+    from src.jobs import store
+    await store.finish_document_ack(job_id, body.model_dump())
+    return {"ok": True}

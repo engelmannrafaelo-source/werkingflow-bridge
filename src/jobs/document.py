@@ -162,9 +162,9 @@ async def run_document_job(job_id: str, payload: dict, attribution: dict | None,
                     raise RuntimeError("invalid document control identity")
                 progress = {
                     "phase": "document-" + remote["status"], "call_id": call_id,
-                    "attempt_id": remote.get("attempt_id"), "cancel_requested": cancelling,
+                    "attempt_id": remote.get("attempt_id"), "digest": remote.get("digest"), "cancel_requested": cancelling,
                 }
-                if remote["status"] in ("done", "error", "cancelled", "interrupted"):
+                if remote["status"] in ("done", "error", "cancelled", "interrupted", "released", "expired"):
                     receipt = remote.get("stop_receipt", {})
                     if not receipt.get("reaped") or not receipt.get("local_stopped"):
                         raise RuntimeError("document remote end lacks stop receipt")
@@ -252,3 +252,33 @@ async def record_completion(call_id: str, attribution: dict, action: str, value:
         )
     except Exception as exc:
         logger.error("document completion tracking failed (%s)", type(exc).__name__)
+
+
+async def reconcile_document_acks() -> None:
+    """Replay durable post-terminal ACK intents; never start or cancel work."""
+    from src.privacy_client import PRIVACY_SERVICE_URL, privacy_auth_headers, privacy_timeout
+    from . import store_client
+    import uuid
+    try:
+        pending = await store_client.pending_document_acks()
+    except Exception as exc:
+        logger.error("document ACK queue unavailable (%s)", type(exc).__name__)
+        return
+    if not pending:
+        return
+    async with httpx.AsyncClient(headers=privacy_auth_headers(), timeout=privacy_timeout(30)) as client:
+        for item in pending:
+            try:
+                call_id = item["call_id"]
+                if uuid.UUID(call_id).hex != call_id:
+                    raise ValueError("invalid stored call identity")
+                identity = {key: item.get(key) for key in ("call_id", "attempt_id", "digest")}
+                response = await client.post(f"{PRIVACY_SERVICE_URL}/document/calls/{call_id}/ack",
+                    json={key: identity[key] for key in ("attempt_id", "digest")})
+                response.raise_for_status()
+                released = response.json()
+                if any(released.get(key) != identity[key] for key in identity) or released.get("content_state") != "removed":
+                    raise ValueError("invalid document ACK receipt")
+                await store_client.finish_document_ack(item["job_id"], identity)
+            except Exception as exc:
+                logger.error("document ACK pending (%s)", type(exc).__name__)

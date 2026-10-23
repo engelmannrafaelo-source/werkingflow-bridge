@@ -2,7 +2,8 @@
 
 One shared local volume per document service; flock survives service restart
 through the guardian's inherited descriptor. Missing receipts are UNKNOWN, not
-permission to launch another conversion. No result eviction while unacknowledged.
+permission to launch another conversion. ACK or ended-content privacy retention
+removes payloads; durable technical tombstones prevent another execution.
 """
 from __future__ import annotations
 
@@ -14,11 +15,13 @@ import hashlib
 import json
 import logging
 import os
+import time
 from pathlib import Path
 import uuid
 
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import JSONResponse
+from pydantic import BaseModel
 
 from .document_process import run, write_json, execution_identity
 
@@ -27,6 +30,9 @@ router = APIRouter(prefix="/document/calls")
 ROOT = Path("/var/lib/bridge-document-jobs")
 _tasks: set[asyncio.Task] = set()
 _semaphore = None
+# Privacy retention after confirmed end, never a conversion runtime limit.
+CONTENT_RETENTION_SECONDS = 7 * 24 * 3600
+_retention_task = None
 
 
 def configure(semaphore) -> None:
@@ -62,6 +68,10 @@ def status(path: Path) -> dict:
         raise HTTPException(404, "document call not found")
     accepted = read(path, "accepted.json")
     answer = {key: accepted[key] for key in ("call_id", "attempt_id", "digest", "deadline_at")}
+    if (path / "released.json").exists():
+        released = read(path, "released.json")
+        return {**answer, "status": released["status"], "content_state": "removed",
+                "stop_receipt": read(path, "receipt.json")}
     if (path / "receipt.json").exists():
         receipt = read(path, "receipt.json")
         answer["stop_receipt"] = receipt
@@ -180,7 +190,7 @@ async def accept(call_id: str, request: Request):
     ).hexdigest()
     with locked(path):
         if (path / "accepted.json").exists():
-            if read(path, "accepted.json").get("tombstone"):
+            if read(path, "accepted.json").get("tombstone") or (path / "released.json").exists():
                 return JSONResponse(status_code=200, content=status(path))
             if read(path, "accepted.json")["digest"] != digest:
                 raise HTTPException(409, "document call digest conflict")
@@ -196,7 +206,7 @@ async def accept(call_id: str, request: Request):
             write_json(path / "request.json", spec)
             write_json(path / "accepted.json", {
                 "call_id": call_id, "attempt_id": uuid.uuid4().hex,
-                "digest": digest, "deadline_at": deadline,
+                "digest": digest, "deadline_at": deadline, "accepted_at": time.time(),
             })
     schedule(path)
     return JSONResponse(status_code=202, content=status(path))
@@ -227,10 +237,144 @@ async def cancel(call_id: str):
                 "deadline_at": None, "tombstone": True,
             })
         current = status(path)
-        if current["status"] in ("done", "error", "cancelled", "interrupted"):
+        if current["status"] in ("done", "error", "cancelled", "interrupted", "released", "expired"):
             return current
         if not (path / "cancel.json").exists():
             write_json(path / "cancel.json", {"reason": "user_cancelled"})
     if current["status"] == "accepted":
         schedule(path)
     return JSONResponse(status_code=202, content={**current, "cancel_requested": True})
+
+
+class Acknowledgement(BaseModel):
+    attempt_id: str | None
+    digest: str | None
+
+
+def remove_content(path: Path) -> None:
+    """Only called under admission AND execution locks, after a durable tombstone."""
+    retained = {"accepted.json", "receipt.json", "released.json", "execution.lock"}
+    for item in path.iterdir():
+        if item.name not in retained:
+            if not item.is_file():
+                raise RuntimeError("unexpected document spool entry")
+            item.unlink(missing_ok=True)
+    fd = os.open(path, os.O_DIRECTORY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def release_content(path: Path, state: str) -> None:
+    receipt = read(path, "receipt.json")
+    if not receipt.get("local_stopped") or not receipt.get("reaped"):
+        raise HTTPException(409, "document stop is unconfirmed")
+    if not (path / "released.json").exists():
+        write_json(path / "released.json", {"status": state, "released_at": time.time()})
+    remove_content(path)
+
+
+@router.post("/{call_id}/ack")
+async def acknowledge(call_id: str, body: Acknowledgement):
+    # Service authentication is enforced for ALL /document/calls/* routes.
+    path = call_path(call_id)
+    with locked(path):
+        if not (path / "accepted.json").exists():
+            raise HTTPException(404, "document call not found")
+        accepted = read(path, "accepted.json")
+        if accepted["attempt_id"] != body.attempt_id or accepted["digest"] != body.digest:
+            raise HTTPException(409, "document acknowledgement identity conflict")
+        with (path / "execution.lock").open("a+b") as lock:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                raise HTTPException(409, "document execution still owned") from None
+            if not (path / "receipt.json").exists():
+                raise HTTPException(409, "document stop is unconfirmed")
+            release_content(path, "released")
+        return status(path)
+
+
+def retention_pass() -> dict:
+    """Bound ended/orphaned content; never evict an executing/unknown attempt."""
+    ROOT.mkdir(mode=0o700, parents=True, exist_ok=True)
+    counts = {"removed": 0, "unconfirmed": 0, "failed": 0}
+    now = time.time()
+    for path in ROOT.iterdir():
+        if not path.is_dir() or len(path.name) != 32:
+            continue
+        try:
+            if uuid.UUID(path.name).hex != path.name:
+                continue
+            with locked(path), (path / "execution.lock").open("a+b") as lock:
+                try:
+                    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    continue
+                if (path / "released.json").exists():
+                    remove_content(path)  # also finishes a crash during deletion
+                    continue
+                accepted_file = path / "accepted.json"
+                receipt_file = path / "receipt.json"
+                started = (path / "started.json").exists()
+                # Updating a directory/lock mtime must never extend retention.
+                files = [p for p in path.iterdir() if p.is_file() and p.name != "execution.lock"]
+                since = min((p.stat().st_mtime for p in files), default=path.stat().st_mtime)
+                if accepted_file.exists():
+                    since = read(path, "accepted.json").get("accepted_at", accepted_file.stat().st_mtime)
+                if receipt_file.exists():
+                    since = read(path, "receipt.json").get("finished_at", receipt_file.stat().st_mtime)
+                if now - since < CONTENT_RETENTION_SECONDS:
+                    continue
+                if started and not receipt_file.exists():
+                    # status can prove loss of the old container, but never of
+                    # a guardian in the same process namespace.
+                    previous = read(path, "started.json").get("execution_identity")
+                    if previous is not None and previous != execution_identity():
+                        write_json(receipt_file, {"reason": "service_instance_gone",
+                            "local_stopped": True, "reaped": True,
+                            "provider_outcome": "unknown" if any(path.glob("provider-pending-*")) else "finished_or_not_started",
+                            "finished_at": now})
+                    else:
+                        counts["unconfirmed"] += 1
+                    continue
+                if not receipt_file.exists():
+                    # Execution lock is ours and no durable start exists.
+                    write_json(receipt_file, {"reason": "retention_before_start",
+                        "local_stopped": True, "reaped": True,
+                        "provider_outcome": "not_started", "finished_at": now})
+                if not accepted_file.exists():
+                    write_json(accepted_file, {"call_id": path.name, "attempt_id": None,
+                        "digest": None, "deadline_at": None, "tombstone": True})
+                release_content(path, "expired")
+                counts["removed"] += 1
+        except Exception as exc:
+            counts["failed"] += 1
+            logger.error("document retention failed (%s)", type(exc).__name__)
+    return counts
+
+
+async def retention_loop() -> None:
+    while True:
+        try:
+            counts = await asyncio.to_thread(retention_pass)
+            if counts["failed"] or counts["unconfirmed"]:
+                logger.error("document retention needs intervention: failed=%d unconfirmed=%d",
+                             counts["failed"], counts["unconfirmed"])
+        except Exception as exc:
+            logger.error("document retention unavailable (%s)", type(exc).__name__)
+        await asyncio.sleep(60)
+
+
+@router.on_event("startup")
+async def start_retention() -> None:
+    global _retention_task
+    _retention_task = asyncio.create_task(retention_loop())
+
+
+@router.on_event("shutdown")
+async def stop_retention() -> None:
+    if _retention_task is not None:
+        _retention_task.cancel()
+        await asyncio.gather(_retention_task, return_exceptions=True)

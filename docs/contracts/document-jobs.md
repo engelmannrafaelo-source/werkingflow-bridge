@@ -118,8 +118,9 @@ laufen; Heartbeat ist keine Aussage über fachlichen Fortschritt.
   enden nicht wegen ihres Alters oder Deferralzählers.
 - Remote-Daten unter `/var/lib/bridge-document-jobs`, privates Docker-Volume,
   Verzeichnis 0700. Keine öffentliche URL. Volume darf bei Recreation nicht
-  erneuert/gelöscht werden. Noch kein ACK-/Retention-Cleanup: Original und Ergebnis
-  bleiben bestehen. Betriebsfähiger begrenzter Speicher ist vor Deploy nachzuweisen.
+  erneuert/gelöscht werden. ACK und Inhaltsaufbewahrung sind im folgenden
+  Abschnitt beschrieben; ein vollständig begrenzter Speicher bei unbestätigt
+  laufenden Prozessen bleibt vor Deploy nachzuweisen.
 
 Keine neue Umgebungsvariable. Bestehende ActualText-Reparatureinstellung wird als
 unveränderlicher Remote-Vertragswert übertragen und im isolierten Prozess
@@ -173,8 +174,58 @@ aufklärbar; eine vollständige Exactly-once-Garantie wird nicht behauptet.
 Ein großzügigeres Wiederanlaufmodell mit möglicher doppelter Vision-Berechnung
 gehört zur folgenden L4-Bauarbeit, nicht in diese Mindestfixes.
 
-P2-1 bleibt **Deploy-Sperre**: ACK nach dauerhaftem Jobabschluss, Löschung von
-Original/Ergebnis und begrenzte Aufbewahrung verwaister Inhalte fehlen. Diese
+P2-1: ACK und Aufbewahrung für bestätigte Enden sind inzwischen gebaut (unten).
+Unbestätigte Prozessenden bleiben eine **Deploy-Sperre** für vollständig
+begrenzte Aufbewahrung. Diese
 Runde baut keine ungeprüfte Retention nebenbei. L4 bleibt ROT: fachliche
 Lebendigkeit, automatische Fortsetzung und die DB-/Container-/GPU-Laufbelege
 stehen weiterhin aus.
+
+
+## ACK und Inhaltsaufbewahrung (P2-1, Folgeabschnitt)
+
+Ein terminales document_state(done|error|cancelled) mit Stop-Receipt schreibt
+remote_ack=pending in derselben DB-Transaktion wie Ergebnis/Fehler und Endstatus.
+Der Worker-Watchdog startet höchstens einen separaten ACK-Durchlauf je Worker;
+die normale Jobübernahme wartet nicht auf den Dokumentdienst. Der Durchlauf
+liest bis zu 100 offene terminale ACKs, sendet authentifiziert
+POST /document/calls/{call_id}/ack mit {attempt_id,digest}, prüft die bestätigte
+Identität und content_state=removed und markiert den Store-Eintrag als done.
+Mehrere Worker dürfen dasselbe ACK senden. Der Store-Abschluss verändert
+weder Ergebnis noch finished_at. Verlorene Antworten werden über dasselbe
+dauerhafte ACK wiederholt, ohne PUT/DELETE oder einen neuen Attempt.
+
+Der Dienst prüft Identität, freien Execution-Lock und reaped/local_stopped.
+Fehlt eines davon: 409, keine Löschung. Er schreibt zuerst released.json
+atomar und fsync, dann löscht er source, result.json, request.json (einschließlich
+Dateiname/Prompts) und alle übrigen Inhaltsdateien. accepted.json mit technischem
+Digest/IDs, receipt.json, released.json und execution.lock bleiben. Nach einem
+Crash während der Löschung vollenden ACK-Replay oder der Janitor dieselbe
+Löschung. GET meldet released/expired und den Receipt, niemals ein erfundenes
+Ergebnis. Späte PUTs können den Tombstone nicht ersetzen und starten nichts.
+
+Der Janitor läuft beim Dienststart und danach etwa jede Minute. Inhaltsfrist:
+7 Tage seit bestätigtem Ende; ohne dauerhaften Start seit Annahme bzw. bei
+Teilannahmen seit ältester Datei. Das ist Datenschutzaufbewahrung, keine
+Konvertierungsfrist. Ausführungen mit gehaltenem Execution-Lock bleiben
+unangetastet. Nie gestartete Altannahmen werden unter beiden Locks mit
+not_started-Receipt und expired-Tombstone abgeschlossen; verspätete Starts
+bleiben ausgeschlossen. Bestätigt beendete unbestätigte Ergebnisse werden
+nach der Frist entfernt, auch wenn der Auftraggeber verschwunden ist.
+
+Offene Grenze: started ohne Receipt in derselben Prozessinstanz bleibt unknown,
+wird NICHT als beendet ausgegeben und wird laut mit unconfirmed-Zähler gemeldet.
+Bei belegtem Verlust der äußeren Instanz wird zunächst ein Stop-Receipt
+geschrieben; erst ab diesem Nachweis läuft die Inhaltsfrist. Ein alter unbekannter
+Prozess wird nicht durch sein Alter still beendet. Vollständige Aufbewahrung
+für diese Fälle benötigt die noch offene L4-Prozessklärung.
+
+Die bestehende öffentliche Jobretention bleibt unverändert (2h bzw. keyed
+mindestens 24h). Bei langer Nichtverfügbarkeit kann der ACK-Auftrag mit dieser
+Zeile verschwinden; der unabhängige 7-Tage-Janitor begrenzt trotzdem bestätigte
+Remote-Enden. Keine unbegrenzte Ergebnisverfügbarkeit versprochen. ACK bestätigt
+dauerhafte Speicherung im Jobstore, nicht schon die Abholung durch die App.
+
+Rollout: neue Platform-API (ACK-Abfragen/Bestätigung) vor neuen Workern; neuer
+Dokumentdienst für ACK/Janitor erforderlich. Kein neuer Env-Schalter. Der
+Privacy-/GPU-Deploy bleibt bis Kapazitätsnachweis und L4-Freigabe gesperrt.

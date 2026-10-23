@@ -492,13 +492,17 @@ async def document_state(job_id: str, attempt: int, action: str, value: dict) ->
                 # receipt is mandatory for both paths, supplied by the runner.
                 if action == "cancelled" and not value.get("stop_receipt", {}).get("reaped"):
                     raise ValueError("document cancellation lacks stop receipt")
+                progress = dict(value.get("progress", {}))
+                receipt = progress.get("stop_receipt") or {}
+                if receipt.get("local_stopped") and receipt.get("reaped") and progress.get("call_id"):
+                    progress["remote_ack"] = "pending"
                 await conn.execute(
                     "UPDATE ai_jobs SET status=$2, result=$3::jsonb, error=$4::jsonb, "
                     "progress=$5::jsonb, updated_at=NOW(), finished_at=NOW() WHERE job_id=$1",
                     job_id, action,
                     json.dumps(value.get("result")) if action == "done" else None,
                     json.dumps(value.get("error")) if action == "error" else None,
-                    json.dumps(value.get("progress", {})),
+                    json.dumps(progress),
                 )
             elif action == "progress":
                 await conn.execute(
@@ -1060,3 +1064,23 @@ def _row_to_list_item(row) -> Dict[str, Any]:
         "usage": usage,
         "attribution": attribution,
     }
+
+
+async def pending_document_acks() -> list[dict]:
+    async with get_pool().acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT job_id, progress FROM ai_jobs WHERE kind='document-convert' "
+            "AND status IN ('done','error','cancelled') "
+            "AND progress->>'remote_ack'='pending' ORDER BY finished_at LIMIT 100")
+    return [{"job_id": row["job_id"], **_document_progress(row["progress"])} for row in rows]
+
+
+async def finish_document_ack(job_id: str, identity: dict) -> None:
+    async with get_pool().acquire() as conn:
+        await conn.execute(
+            "UPDATE ai_jobs SET progress=jsonb_set(progress, '{remote_ack}', to_jsonb('done'::text)) "
+            "WHERE job_id=$1 AND kind='document-convert' AND status IN ('done','error','cancelled') "
+            "AND progress->>'remote_ack'='pending' AND progress->>'call_id'=$2 "
+            "AND (progress->>'attempt_id') IS NOT DISTINCT FROM $3 "
+            "AND (progress->>'digest') IS NOT DISTINCT FROM $4",
+            job_id, identity["call_id"], identity.get("attempt_id"), identity.get("digest"))

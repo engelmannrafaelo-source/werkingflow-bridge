@@ -669,3 +669,25 @@ async def list_jobs(
             )
         return body["jobs"]
     raise _unexpected("list_jobs", resp.status_code, resp.json)
+
+
+async def pending_document_acks() -> list[dict]:
+    try:
+        response = await call_platform("GET", "/v1/internal/document-acks", timeout_s=_READ_TIMEOUT_S)
+    except PlatformUnavailable as exc:
+        _fallback_or_raise("pending_document_acks", exc)
+        return await store.pending_document_acks()
+    if response.status_code == 200 and isinstance(response.json, dict) and isinstance(response.json.get("acks"), list):
+        return response.json["acks"]
+    raise JobStoreUnavailable("Document ACK queue unavailable or incompatible")
+
+
+async def finish_document_ack(job_id: str, identity: dict) -> None:
+    try:
+        response = await call_platform("POST", f"/v1/internal/document-acks/{job_id}",
+                                       json=identity, timeout_s=_WRITE_TIMEOUT_S)
+    except PlatformUnavailable as exc:
+        _fallback_or_raise("finish_document_ack", exc)
+        return await store.finish_document_ack(job_id, identity)
+    if response.status_code != 200:
+        raise JobStoreUnavailable("Document ACK confirmation unavailable")
