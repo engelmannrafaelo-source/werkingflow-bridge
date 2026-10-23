@@ -53,6 +53,13 @@ prepare_erkunder_deploy() {
         error_ "Erkunder build failed; no Erkunder container changed"
         return 1
     }
+    # Pin the newly built image ID, not the running container or host modules.
+    # Includes lazy parser imports; no network, token or customer volume.
+    info "Checking built Erkunder runtime and child parser as place UID"
+    dry_rssh "$host" "cd ${REMOTE_REPO} && image=\$(docker image inspect --format '{{.Id}}' \"bridge-erkunder:\$(git rev-parse HEAD)\") && docker run --rm --pull=never --network none --read-only --cap-drop ALL --security-opt no-new-privileges:true --user 1101:1100 --memory 512m --memory-swap 512m --pids-limit 64 --entrypoint python \"\$image\" -m src.erkunder.imagecheck" || {
+        error_ "Erkunder image check failed; no Erkunder container changed"
+        return 1
+    }
     erkunder_wait_idle "$host" "$compose"
 }
 

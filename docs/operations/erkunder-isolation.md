@@ -113,6 +113,20 @@ Exitcode; ein unbekannter Fehler wird nicht als Auth-/Proxyfehler ausgegeben.
 Es werden weder rohe stderr-Zeilen noch Modulnamen, Settings, HOME-Inhalte
 oder Umgebungswerte archiviert. Die vorhandene Informationsgrenze bleibt bestehen.
 
+Nach dem gemeinsamen Erkunder-Imagebau führt der reguläre Deployweg
+`src.erkunder.imagecheck` im gebauten Image aus. Das Werkzeug löst den neuen
+Commit-Tag zur unveränderlichen Image-ID auf. Ein Hilfscontainer ohne Netz,
+ohne Kundenvolume, mit read-only-Dateisystem und UID/GID 1101:1100 importiert
+SDK-Parser, Kind, Platz und Leitstand und verarbeitet synthetische System-,
+Assistant-, Result- und unbekannte SDK-Nachrichten über den installierten
+Kind-Parser. Es startet weder CLI noch Modell. Diese Architekturprobe prüft
+auch lazy Imports; ein bloßer Modulimport reicht dafür nicht.
+
+Jeder Fehler beendet `prepare_erkunder_deploy` mit Exitcode ungleich null,
+bevor Annahmesperre oder Recreate beginnen. Der Aufrufer in
+`scripts/bridge-deploy.sh` bricht den Deploy ab. Der Check ist ein Laufzeit-
+Image-Gate, kein neuer Unit-Test und kein fachlicher Gutachten-Smoke.
+
 
 Der Platz leert stderr parallel zu stdin/stdout über eine eigene Pipe. Nur die
 letzten maximal 8192 Bytes bleiben flüchtig zur Klassifizierung erhalten;
