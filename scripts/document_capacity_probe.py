@@ -18,17 +18,36 @@ RUNNER = r"""
 import asyncio, json, sys
 sys.path.insert(0, "/app")
 from pathlib import Path
-import fitz
 from src.privacy_service.document_process import run, write_json
 root=Path("/work/call")
 root.mkdir(parents=True)
-pdf=fitz.open()
+objects=[b"", b"", b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>"]
+pages=[]
 for n in range(int(sys.argv[1])):
-    page=pdf.new_page()
-    page.insert_textbox(fitz.Rect(40,40,550,780),
-        ("Synthetic inventory page %d. Fictional pumps and valves. No customer data.\n" % n)*25,
-        fontsize=11)
-pdf.save(root/"source")
+    lines=["BT /F1 11 Tf 40 780 Td 16 TL"]
+    for line in range(30):
+        lines.append("(Synthetic page %d row %d. Fictional pumps and valves.) Tj T*" % (n,line))
+    lines.append("ET")
+    data=" ".join(lines).encode("ascii")
+    content=len(objects)+1
+    objects.append(b"<< /Length "+str(len(data)).encode()+b" >>\nstream\n"+data+b"\nendstream")
+    page=len(objects)+1
+    pages.append(page)
+    objects.append(("<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] "
+        "/Resources << /Font << /F1 3 0 R >> >> /Contents %d 0 R >>" % content).encode())
+objects[0]=b"<< /Type /Catalog /Pages 2 0 R >>"
+objects[1]=("<< /Type /Pages /Count %d /Kids [%s] >>" %
+    (len(pages)," ".join("%d 0 R" % p for p in pages))).encode()
+pdf=bytearray(b"%PDF-1.4\n")
+offsets=[0]
+for n, obj in enumerate(objects,1):
+    offsets.append(len(pdf));pdf.extend(("%d 0 obj\n" % n).encode()+obj+b"\nendobj\n")
+xref=len(pdf)
+pdf.extend(("xref\n0 %d\n0000000000 65535 f \n" % len(offsets)).encode())
+for offset in offsets[1:]:pdf.extend(("%010d 00000 n \n" % offset).encode())
+pdf.extend(("trailer\n<< /Size %d /Root 1 0 R >>\nstartxref\n%d\n%%%%EOF\n" %
+    (len(offsets),xref)).encode())
+(root/"source").write_bytes(pdf)
 write_json(root/"request.json", {"filename":"synthetic.pdf","mime_type":"application/pdf",
     "fields":{"describe_images":"false"},"managed":True,"repair_actualtext":False})
 write_json(root/"accepted.json", {"deadline_at":None})
