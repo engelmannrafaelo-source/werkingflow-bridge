@@ -17,6 +17,52 @@ Bestehende Freigaben bleiben verbindlich. Keine eigenmaechtigen Eingriffe oder
 manuellen Konfigurationsaenderungen auf laufenden Hosts. Deploys nur ueber den
 vorgesehenen Repository-Prozess aus einem freigegebenen, committeten Stand.
 
+## Dev-Tokenbudgets: verbindlicher Betriebsstand seit 23.10.2026
+
+Rafaels Freigabe ist umgesetzt: alle vier Dev-Worker verwenden
+`ADAPTIVE_FLOOR_TOKENS=850000` und `ADAPTIVE_FLOOR_FROM_ENV=true`.
+Implementierung: `da166c162bc8f01873e5852a662334b8be714ba4`, erfolgreich
+mit `bridge-deploy.sh` ausgerollt am 23.10.2026 um 06:41Z.
+Die alten effektiven Werte 425000/467500/514250 sind historische Zustände,
+keine nachgewiesenen Modell-Kontextgrenzen und keine offene Freigabefrage.
+
+- Bei `budget_multiplier=1` bleiben nach 15 % Sicherheitsabstand **722500**
+  Tokens Zulassungsbudget pro Worker. Energy plant mit höchstens 600000
+  Eingabetokens plus 64000 Antwort- und 11000 Folgereserve (675000).
+- Dies ist ein **gemeinsames Budget gleichzeitig laufender Anfragen**, keine
+  garantierte Einzelpromptgrenze des Anbieters. Kontoverbrauch, laufende
+  Anfragen und Drosselung können die verfügbare Kapazität reduzieren.
+- Die historischen Absenkungen stammen aus gespeicherten Limiter-Ereignissen.
+  `record_rate_limit` wird auch bei unvollständigen SDK-Antworten/503 benutzt;
+  daraus keine Größenfehler des Anbieters ableiten.
+- Der Env-Schalter überschreibt eine abweichende gespeicherte Untergrenze.
+  Nur `ADAPTIVE_INITIAL_CAP_TOKENS` zu ändern genügt bei vorhandener State-Datei
+  nicht. Ein Git-Revert allein senkt die gespeicherten 850000 ebenfalls nicht:
+  für eine gewollte Rücknahme 500000 **mit** `FLOOR_FROM_ENV=true` deployen.
+- Live prüfen: `/v1/metrics/account-pool-state` für alle vier Accounts,
+  `adaptive_cap_tokens`, `effective_cap_tokens`, `budget_multiplier`,
+  `current_in_flight_tokens`, `usage_known` und Verfügbarkeit gemeinsam lesen.
+  Effektive Kapazität nicht mit dem zusätzlichen `headroom_tokens`-Anzeigewert
+  verwechseln.
+
+Deploy von Dev aus mit expliziter interner Testadresse (öffentliche Metrikrouten
+sind absichtlich gesperrt, sonst scheitert der Smoke mit 403):
+
+```bash
+AI_BRIDGE_URL=http://49.12.72.66:8000 scripts/bridge-deploy.sh hetzner worker1 worker2 worker3 worker4
+```
+
+Für den gemeinsamen Versionsnachweis alle vier Worker ausrollen; ein Teilrollout
+bleibt `SMOKE_VERSION_UNPROVEN`. Vorher laufende Jobs koordinieren; der Deploy
+wartet vor Worker-Neustarts auf Leerlauf. Keine Zugriffssperren für Tests lockern.
+
+Abnahme 23.10.06:41Z: vier Worker gesund, 15/15 Smoke-Proben, 8/8
+Verteilungsanfragen über alle vier Worker, Zugangskanarien, Worker-Selbsttests,
+Router-Parität und Release-Manifest-Abgleich bestanden. Betriebsbeleg auf Dev:
+`/root/projekte/local-storage/bridge-prompt-eingaben-20261023/dev-workers-850k-deploy.log`.
+Dies belegt den Bridge-Betrieb; der vollständige Energy-Durchlauf bis zum Bericht
+und die Behandlung fachlicher Datenfehler sind getrennte Abnahmen.
+
 ## Git-Identitaet in parallelen Worktrees
 
 `user.name` und `user.email` werden pro Sitzung im eigenen Worktree gesetzt,

@@ -340,3 +340,11 @@ Aufruf überhaupt getroffen hat.
 ---
 
 *Letzte Aktualisierung: 2026-07-02 (ADR-0006 Single-Source-Cutover verifiziert)*
+
+## Aktueller Dev-Betriebswert für große Energy-Aufträge
+
+Seit 23.10.2026 sind alle vier Dev-Worker auf 850000 Basis / bei voller
+Verfügbarkeit 722500 effektiv ausgerollt und geprüft. Die verbindliche
+[Größenregel samt Persistenz, Rückweg und Deploy-Prüfung](../maintenance.md#dev-tokenbudgets-verbindlicher-betriebsstand-seit-23102026)
+steht im Wartungseinstieg. Alte 425k-/514k-Notizen sind historische Befunde,
+keine erneute Freigabefrage an Rafael. Energy-Ende-zu-Ende-Abnahme separat führen.
