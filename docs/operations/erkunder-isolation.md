@@ -112,3 +112,11 @@ bei einem Prozessfehler ganz, lautet der Code `child_diagnostic_missing` mit
 Exitcode; ein unbekannter Fehler wird nicht als Auth-/Proxyfehler ausgegeben.
 Es werden weder rohe stderr-Zeilen noch Modulnamen, Settings, HOME-Inhalte
 oder Umgebungswerte archiviert. Die vorhandene Informationsgrenze bleibt bestehen.
+
+
+Der Platz leert stderr parallel zu stdin/stdout über eine eigene Pipe. Nur die
+letzten maximal 8192 Bytes bleiben flüchtig zur Klassifizierung erhalten;
+zusätzlich wird jeweils ein 4096-Byte-Leseblock verarbeitet. Dauerhaft bleibt
+nur die Whitelist-Fehlerklasse/der feste Fehlercode. Es gibt keine Rohtextdatei,
+kein stderr im Rückgabewert und keine Ausgabe von Credential-/Umgebungswerten.
+Die bereinigte JSON-Diagnose des Kindes hat bei gleichen Feldern Vorrang.
