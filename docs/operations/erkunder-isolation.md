@@ -93,3 +93,22 @@ Reproduzierbare Proben mit einem aus dem zu prüfenden Commit gebauten Image:
 
 Alle Proben verwenden Wegwerfcontainer und synthetische Daten. Die Startprobe
 verwendet ein eigenes internes Docker-Netz ohne veröffentlichte Ports.
+
+
+## SDK-Parser im schlanken Erkunder-Image
+
+Der gemeinsame SDK-Parser darf im Erkunder keine Worker-/Jobstore-Module
+voraussetzen. Das Kind installiert ihn ausdrücklich mit
+`track_job_usage=False`; der Worker behält standardmäßig seine bestehende
+Teilverbrauchsbuchung. Das Image enthält absichtlich kein `src.jobs`.
+
+Diagnosen lösen SDK-ExceptionGroups bis zur klassifizierbaren Blatt-Ausnahme
+auf. Fehlende Python-Abhängigkeiten werden als `ModuleNotFoundError` bzw.
+`ImportError` mit `fehlercode=dependency_missing` sichtbar. SDK-Importe liegen
+innerhalb der geschützten Kind-Ausführung. Auth-, Modell-, Proxy-/Netz-,
+Rechte- und CLI-Startsignaturen werden nur als feste Codes übernommen;
+HTTP404 allein beweist kein nicht verfügbares Modell. Fehlt die Diagnosehülle
+bei einem Prozessfehler ganz, lautet der Code `child_diagnostic_missing` mit
+Exitcode; ein unbekannter Fehler wird nicht als Auth-/Proxyfehler ausgegeben.
+Es werden weder rohe stderr-Zeilen noch Modulnamen, Settings, HOME-Inhalte
+oder Umgebungswerte archiviert. Die vorhandene Informationsgrenze bleibt bestehen.

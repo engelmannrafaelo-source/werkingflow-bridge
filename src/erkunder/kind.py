@@ -8,7 +8,6 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from src.sdk_parser import install_resilient_parser
 from src.erkunder.diagnostik import exception_details, technical_line
 
 ALLOWED_TOOLS = ["Bash", "Read", "Write", "Edit", "Glob", "Grep", "LS"]
@@ -117,9 +116,17 @@ class SDKResultFailure(RuntimeError):
     """Failed SDK completion with technical evidence, never result content."""
 
 
+def install_resilient_parser():
+    # Import inside the protected run: bootstrap errors get a safe envelope too.
+    from src.sdk_parser import install_resilient_parser as install
+
+    return install(track_job_usage=False)
+
+
 async def run(body: dict[str, Any]) -> dict[str, Any]:
     from claude_code_sdk import AssistantMessage, ResultMessage, ToolUseBlock, query
 
+    # This image intentionally has no worker/job-store package.
     install_resilient_parser()
     result = None
     zugriffe: list[dict[str, str]] = []

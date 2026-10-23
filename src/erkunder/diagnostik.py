@@ -12,12 +12,39 @@ KINDS = {"ProcessError", "CLIConnectionError", "CLINotFoundError", "CLIJSONDecod
          "MessageParseError", "RuntimeError", "SDKResultFailure", "Exception", "TimeoutError",
          "OSError", "PermissionError", "ConnectionResetError", "ConnectionError", "HTTPError",
          "ReadError", "ConnectError", "ReadTimeout", "ConnectTimeout", "ValueError", "KeyError",
-         "BrokenPipeError", "FileNotFoundError", "MemoryError", "CancelledError"}
+         "BrokenPipeError", "FileNotFoundError", "MemoryError", "CancelledError",
+         "ModuleNotFoundError", "ImportError", "ExceptionGroup", "BaseExceptionGroup",
+         "TypeError", "AttributeError", "SyntaxError", "ChildProcessError"}
 REASONS = {"zeit", "speicher", "cli_fehler", "geheimnis_im_ergebnis", "platz_neustart",
            "Ergebnis-Integritaet", "Nachweis-Integritaet", "Wiederanhaengen", "konto", "unbekannt"}
 LINES = {"Connection reset by peer", "Connection refused", "Permission denied", "Broken pipe",
          "ENOTFOUND", "ECONNRESET", "ETIMEDOUT", "certificate verify failed",
-         "Invalid API key", "authentication_error", "rate_limit_error", "overloaded_error"}
+         "Invalid API key", "authentication_error", "rate_limit_error", "overloaded_error",
+         "OAuth token has expired", "Invalid bearer token", "model_not_found",
+         "Could not resolve proxy", "Proxy connection ended before receiving CONNECT response",
+         "EACCES", "ENOENT", "No module named", "error: unknown option",
+         "Could not find Claude Code", "not_found_error"}
+CODES = {"auth_failed", "model_unavailable", "proxy_failed", "network_failed",
+         "permission_denied", "dependency_missing", "cli_start_failed",
+         "rate_limited", "upstream_overloaded", "child_diagnostic_missing"}
+LINE_CODES = {
+    "Invalid API key": "auth_failed", "authentication_error": "auth_failed",
+    "OAuth token has expired": "auth_failed", "Invalid bearer token": "auth_failed",
+    "model_not_found": "model_unavailable",
+    "HTTP 401": "auth_failed", "HTTP 407": "proxy_failed",
+    "HTTP 429": "rate_limited",
+    "Could not resolve proxy": "proxy_failed",
+    "Proxy connection ended before receiving CONNECT response": "proxy_failed",
+    "Permission denied": "permission_denied", "EACCES": "permission_denied",
+    "ENOENT": "cli_start_failed", "Could not find Claude Code": "cli_start_failed",
+    "error: unknown option": "cli_start_failed", "No module named": "dependency_missing",
+    "rate_limit_error": "rate_limited", "overloaded_error": "upstream_overloaded",
+    **{name: "network_failed" for name in ("Connection reset by peer", "Connection refused",
+       "Broken pipe", "ENOTFOUND", "ECONNRESET", "ETIMEDOUT", "certificate verify failed")},
+}
+TYPE_CODES = {"ModuleNotFoundError": "dependency_missing", "ImportError": "dependency_missing",
+              "PermissionError": "permission_denied", "CLINotFoundError": "cli_start_failed",
+              "FileNotFoundError": "cli_start_failed", "SyntaxError": "cli_start_failed"}
 
 
 def technical_line(text) -> str | None:
@@ -39,6 +66,8 @@ def details(value) -> dict:
     result = {}
     if value.get("fehlerart") in KINDS:
         result["fehlerart"] = value["fehlerart"]
+    if value.get("fehlercode") in CODES:
+        result["fehlercode"] = value["fehlercode"]
     code = value.get("exitcode")
     if type(code) is int and -255 <= code <= 255:
         result["exitcode"] = code
@@ -48,10 +77,21 @@ def details(value) -> dict:
     return result
 
 
-def exception_details(error: Exception) -> dict:
-    return details({"fehlerart": type(error).__name__,
+def exception_details(error: BaseException) -> dict:
+    # TaskGroup/SDK wrappers must not erase the actionable leaf exception.
+    nested = getattr(error, "exceptions", ())
+    if isinstance(nested, (tuple, list)):
+        for child in nested:
+            if isinstance(child, BaseException):
+                leaf = exception_details(child)
+                if leaf:
+                    return leaf
+    line = technical_line(getattr(error, "stderr", None) or str(error))
+    kind = type(error).__name__
+    return details({"fehlerart": kind,
+                    "fehlercode": TYPE_CODES.get(kind) or LINE_CODES.get(line),
                     "exitcode": getattr(error, "exit_code", None),
-                    "stderr_letzte_zeile": technical_line(getattr(error, "stderr", None) or str(error))})
+                    "stderr_letzte_zeile": line})
 
 
 def safe_reason(reason) -> str:

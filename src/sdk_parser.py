@@ -75,7 +75,7 @@ def _retain_cli_end_fields(parsed: Any, data: dict[str, Any]) -> None:
 
 
 def resilient_parse_message(
-    data: Any, original_parse_message: Callable[[Any], Any]
+    data: Any, original_parse_message: Callable[[Any], Any], *, track_job_usage: bool = True
 ) -> Any:
     """Ignore informational unknown SDK events, but preserve real parse failures."""
     try:
@@ -83,9 +83,10 @@ def resilient_parse_message(
         if parsed is not None and isinstance(data, dict):
             _retain_cli_end_fields(parsed, data)
             # FK25B2: usage of completed model calls, for a job cancel's row.
-            from src.jobs.teilverbrauch import aus_cli_nachricht
+            if track_job_usage:
+                from src.jobs.teilverbrauch import aus_cli_nachricht
 
-            aus_cli_nachricht(data)
+                aus_cli_nachricht(data)
         return parsed
     except MessageParseError as error:
         if "unknown message type" not in str(error).lower():
@@ -102,18 +103,21 @@ def resilient_parse_message(
         return None
 
 
-def install_resilient_parser() -> Callable[[Any], Any]:
+def install_resilient_parser(*, track_job_usage: bool = True) -> Callable[[Any], Any]:
     """Patch the SDK client once and return the parser used by its stream."""
     import claude_code_sdk._internal.client as sdk_client
     from claude_code_sdk._internal.message_parser import parse_message
 
     current = sdk_client.parse_message
     if getattr(current, "_bridge_resilient_parser", False):
+        if current._bridge_track_job_usage != track_job_usage:
+            raise RuntimeError("SDK parser usage mode already configured")
         return current
 
     def parser(data: Any) -> Any:
-        return resilient_parse_message(data, parse_message)
+        return resilient_parse_message(data, parse_message, track_job_usage=track_job_usage)
 
+    parser._bridge_track_job_usage = track_job_usage
     parser._bridge_resilient_parser = True  # type: ignore[attr-defined]
     sdk_client.parse_message = parser
     return parser

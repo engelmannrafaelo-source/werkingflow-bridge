@@ -233,6 +233,9 @@ class Platz:
                         reason = "speicher"
                     elif self.process.returncode != 0:
                         reason = child_failure_reason(stdout)
+                        if not diagnosis:
+                            diagnosis = {"fehlerart": "ChildProcessError",
+                                         "fehlercode": "child_diagnostic_missing"}
                     else:
                         metrics = json.loads(stdout)
                         if metrics.get("fehler"):
