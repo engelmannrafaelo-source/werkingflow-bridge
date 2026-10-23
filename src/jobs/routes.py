@@ -32,6 +32,7 @@ from fastapi.security import HTTPAuthorizationCredentials
 from pydantic import BaseModel, Field
 
 from src.auth import security, verify_api_key
+from src.config import config
 from src.error_contract import JOB_CODE_STORE_INCOMPATIBLE, job_error_view
 from src.middleware.bridge_error import (
     REASON_IDEMPOTENCY_KEY_INVALID,
@@ -319,7 +320,9 @@ async def create_job_endpoint(
     except ValueError as e:
         return idempotency_error(REASON_IDEMPOTENCY_KEY_INVALID, 400, str(e))
 
-    if body.call_id is not None or body.attempt_id is not None:
+    if config.job_attempt_identity_enabled and (
+        body.call_id is not None or body.attempt_id is not None
+    ):
         from pydantic import ValidationError
         try:
             identity = JobAttemptIdentity(call_id=body.call_id, attempt_id=body.attempt_id)
@@ -495,6 +498,10 @@ async def lookup_job_endpoint(
     The required header also pins the LB to the same store as keyed submit.
     """
     await verify_api_key(request, credentials)
+    if not config.job_attempt_identity_enabled:
+        return JSONResponse(status_code=404, content={
+            "reason": "feature_disabled", "outcome": "unknown", "job_id": None,
+        }, headers={"Cache-Control": "no-store"})
     _require_enabled()
     try:
         key = _idempotency_key(request)

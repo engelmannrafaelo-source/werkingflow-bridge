@@ -4,6 +4,30 @@ Allgemeine Bridge-Schnittstelle für A1 und andere Aufrufer. Sie erweitert den
 bestehenden atomaren Idempotency-Key-Vertrag; keine fachlichen Pipeline-Regeln
 in der Bridge. Ohne die neuen Felder bleibt der bestehende Submit unverändert.
 
+## Serverseitige Freischaltung (Default AUS)
+
+`BRIDGE_JOB_ATTEMPT_IDENTITY_ENABLED=false` ist der Default in `src/config.py`
+und den Env-Vorlagen. Der Worker liest den Schalter beim Prozessstart aus seinem
+bestehenden Compose-`env_file`; eine Änderung benötigt einen freigegebenen
+Worker-Rollout. Kein Live-Schalter und keine automatische Aktivierung beim Deploy.
+
+Bei AUS ignoriert Submit `call_id`/`attempt_id`: keine Paarprüfung, keine Ableitung
+oder Prüfung eines Attempt-Schlüssels, kein neuer Attempt-Identitätspfad.
+Es gilt das Verhalten vor dieser Erweiterung. Der schon vorher vorhandene
+`Idempotency-Key`-Header bleibt unverändert wirksam (einschließlich Validierung,
+Replay und Konflikten); ohne Header ist Submit unkeyed. Die normalen
+Request-Schematypen gelten weiterhin. AUS schaltet **nicht** die ältere allgemeine
+Header-Idempotenz ab. Clients dürfen daraus keine verfügbare Attempt-Schnittstelle
+ableiten und dürfen bei deaktiviertem Feature nicht auf unkeyed Submit ausweichen.
+
+Ein authentifizierter, schemagültiger öffentlicher Lookup liefert bei AUS
+`404 {reason:"feature_disabled",outcome:"unknown",job_id:null}` mit
+`Cache-Control: no-store`, ohne Store-Zugriff. Das ist kein Beleg für Nichtannahme.
+Authentifizierung und Request-Schema bleiben vorgeschaltet; nginx verlangt für
+das Home-Routing weiterhin den passenden Header. Der interne, Service-Token-
+geschützte Store-Leseweg bleibt Infrastruktur; die Freischaltung erfolgt am Worker.
+Die folgenden Submit-/Lookup-Regeln gelten bei EIN.
+
 ## Identität vor dem ersten Senden speichern
 
 Der Aufrufer persistiert `call_id`, `attempt_id`, Bridge-Basis-URL,
@@ -84,15 +108,30 @@ zur vermeintlichen Reparatur eines unbekannten Ausgangs.
 
 ## Auslieferung und Abnahme
 
-Platform-API zuerst (neuer interner `POST /v1/internal/jobs/identity-lookup`,
-Service-Token geschützt), dann Worker und nginx beider beteiligter Bridges.
-Alte Platform-API = Lookup 503, niemals Ausweichen auf Submit. Keine neue
-DB-Migration; vorhandene Migration 065 ist Voraussetzung. Neuer Worker hinter
-altem LB genügt nicht: `/v1/jobs/lookup` muss den keyed Home-Weg benutzen.
-Keine Aktivierung der neuen A1-Nutzung vor vollständigem geprüften Rollout.
+1. Client-Nutzung ausgeschaltet lassen. Auf beiden beteiligten Bridges zuerst
+   Platform-API ausrollen (neuer interner `POST /v1/internal/jobs/identity-lookup`,
+   Service-Token geschützt). Migration 065 muss vorhanden sein; keine neue Migration.
+2. Alle Worker beider Bridges mit neuem Code und Schalter AUS ausrollen, danach
+   nginx beider Bridges mit dem keyed Home-Weg für `/v1/jobs/lookup`.
+   Auch Peer-/Backup-Worker müssen diesen Stand haben. Neuer Worker hinter altem
+   LB genügt nicht; alte Platform-API führt zu 503, niemals zu Submit-Fallback.
+3. Vollständigen Stand je Dienst prüfen; bei AUS die `feature_disabled`-Antwort
+   sowie unveränderte Legacy-Submits abnehmen. Erst danach den Schalter über die
+   verwaltete Worker-Umgebung auf EIN setzen und alle beteiligten Worker ausrollen.
+   Keine Client-Aktivierung während eines gemischten Worker-Rollouts.
+4. Lookup und Submit mit synthetischer Identität durch beide nginx/Home-Wege
+   abnehmen. Erst dann die neue A1-Nutzung einschalten.
+
+Rücknahme: zuerst neue Client-Submits pausieren, vorhandene Job-IDs weiterpollen;
+ungeklärte Aufrufe behalten ihre Identität. Dann Worker-Schalter AUS ausrollen.
+`feature_disabled` erlaubt weder eine Ersatz-ID noch automatische Neueinreichung.
 Push/Deploy separat durch den Berater; dieser Vertrag ist keine Deploy-Freigabe.
 
 Pyramiden-Szenarien: konkurrierender Submit; verlorene Submit-Antwort;
 Resume ohne Job-ID; Ownerwechsel; abweichender Payload; voller Pool bei Lookup;
 Home-Ausfall; alte Platform-API; terminaler Replay; nach Retention unbekannter
 Ausgang ohne neue Modellarbeit. Keine neuen Unit-/Regressionstestdateien.
+
+Zusätzlicher Pyramiden-Prüfkontext: Default AUS, Lookup ohne Store-Zugriff,
+ignorierte Body-Identitäten bei AUS, unveränderte Legacy-Header-Idempotenz,
+Freischaltung erst nach vollständigem Rollout und Rücknahme mit offenen Aufrufen.

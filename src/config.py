@@ -63,6 +63,10 @@ class BridgeConfig:
     service_token_raw: str | None
     """Shared secret for internal service-to-service calls (topup/credit, webhooks-from-self)."""
 
+    # -- Optional pipeline attempt identity -----------------------------
+    job_attempt_identity_enabled: bool = False
+    """Enable call_id/attempt_id validation and public lookup; opt-in only."""
+
     @property
     def db_enabled(self) -> bool:
         return self.db_url is not None and self.db_url != ""
@@ -108,6 +112,7 @@ def _load() -> BridgeConfig:
         public_url_raw=os.getenv("BRIDGE_PUBLIC_URL") or None,
         mollie_api_key_raw=os.getenv("MOLLIE_API_KEY") or None,
         service_token_raw=os.getenv("BRIDGE_SERVICE_TOKEN") or None,
+        job_attempt_identity_enabled=_bool("BRIDGE_JOB_ATTEMPT_IDENTITY_ENABLED"),
     )
 
     if cfg.db_enabled:
