@@ -32,6 +32,7 @@ from src.erkunder.dateien import read_bytes, read_text
 from src.erkunder.ipc import clear_owned_ipc
 from src.erkunder.models import VORGABE_MODELL, ModellName
 from src.erkunder.prozessschutz import protect_process
+from src.erkunder.ereignisse import clean_event, snapshot
 from src.erkunder.diagnostik import details, exception_details, safe_reason, classify_stderr
 
 LOG = logging.getLogger(__name__)
@@ -92,7 +93,7 @@ def child_failure_reason(output: bytes) -> str:
     return "cli_fehler: Kindprozess"
 
 
-async def communicate_diagnosed(process, payload: bytes):
+async def communicate_diagnosed(process, payload: bytes, events=None):
     """Drain both output pipes while sending stdin; never return raw stderr."""
     async def send():
         try:
@@ -103,8 +104,28 @@ async def communicate_diagnosed(process, payload: bytes):
         finally:
             process.stdin.close()
 
+    async def receive():
+        pending = b""
+        output = bytearray()
+        while chunk := await process.stdout.read(65536):
+            pending += chunk
+            while b"\n" in pending:
+                line, pending = pending.split(b"\n", 1)
+                try:
+                    value = json.loads(line)
+                except (ValueError, TypeError):
+                    value = None
+                if isinstance(value, dict) and "ereignis" in value:
+                    event = clean_event(value["ereignis"])
+                    if event is not None and events is not None:
+                        events.append(event)
+                else:
+                    output.extend(line + b"\n")
+        output.extend(pending)
+        return bytes(output)
+
     tasks = [asyncio.create_task(send()),
-             asyncio.create_task(process.stdout.read()),
+             asyncio.create_task(receive()),
              asyncio.create_task(classify_stderr(process.stderr))]
     try:
         _, stdout, diagnosis = await asyncio.gather(*tasks)
@@ -184,6 +205,8 @@ class Platz:
         metrics: dict[str, Any] = {}
         diagnosis: dict[str, Any] = {}
         communication = None
+        events = []
+        self.states[(body.bericht_id, body.schritt)]["sdk"] = {"ereignisse": events}
         self.process = None
         try:
             peak, initial_oom = self.memory()
@@ -222,7 +245,7 @@ class Platz:
             payload = body.model_dump()
             payload["claude_token"] = body.claude_token.get_secret_value()
             communication = asyncio.create_task(
-                communicate_diagnosed(self.process, json.dumps(payload).encode())
+                communicate_diagnosed(self.process, json.dumps(payload).encode(), events)
             )
             while True:
                 reap_adopted_children(self.process.pid)
@@ -348,6 +371,7 @@ class Platz:
                 communication.cancel()
                 await asyncio.gather(communication, return_exceptions=True)
             meta = {
+                "sdk": snapshot({"ereignisse": events}),
                 "name": body.schritt,
                 "versuch": 1,
                 "status": "abbruch" if reason else "ok",
@@ -420,7 +444,7 @@ def create_app(platz: Platz | None = None) -> FastAPI:
         state = service.states.get((bericht_id, schritt))
         if state is None:
             raise HTTPException(404, "unbekannt")
-        return state
+        return {**state, "sdk": snapshot(state.get("sdk", state.get("meta", {}).get("sdk")))}
 
     @app.post("/abbrechen")
     async def abort() -> dict[str, bool]:

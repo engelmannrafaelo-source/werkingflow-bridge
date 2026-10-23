@@ -5,6 +5,8 @@ this boundary. An arbitrary 'redacted' stderr line is still customer content.
 """
 import re
 
+from .ereignisse import snapshot
+
 STEPS = {"daten", "wiederaufnahme", "erkunder-1", "erkunder-2", "erkunder-3",
          "harmonisierung", "pruefung", "harmonisierung-korrektur", "pruefung-korrektur",
          *(f"{kind}-korrektur-{n}" for kind in ("harmonisierung", "pruefung") for n in range(2, 6))}
@@ -106,8 +108,10 @@ def step_record(value: dict) -> dict:
     return {
         "name": value.get("name") if value.get("name") in STEPS else "unbekannt",
         "versuch": value.get("versuch") if type(value.get("versuch")) is int else 0,
-        "abbruch_grund": safe_reason(value.get("abbruch_grund")),
+        "abbruch_grund": safe_reason(value.get("abbruch_grund")) if value.get("status") != "ok" else None,
         **details(value.get("diagnose", value)),
+        "status": value.get("status") if value.get("status") in {"ok", "abbruch", "laeuft"} else "unbekannt",
+        "sdk": snapshot(value.get("sdk")),
     }
 
 

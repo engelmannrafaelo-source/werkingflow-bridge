@@ -46,6 +46,7 @@ from .pruefkreis import (
 )
 from .quellen import kanalmanifest
 from .rechenstand import rechenstand
+from .ereignisse import snapshot
 from .diagnostik import details, safe_reason, step_record
 
 LOG = logging.getLogger(__name__)
@@ -136,10 +137,14 @@ class Coordinator:
         if "lauf_start" not in state:
             state["lauf_start"] = time.time_ns()
         evidence = {
-            "schema": "erkunder-diagnose/1", "bericht_id": ident,
+            "schema": "erkunder-diagnose/2", "bericht_id": ident,
+            "gesichert_ns": time.time_ns(),
             "lauf_start": state["lauf_start"],
             "zustand": state["zustand"], "fehler": safe_reason(state.get("fehler")),
-            "schritte": [step_record(s) for s in state["schritte"] if s["status"] != "ok"],
+            "schritte": [step_record(s) for s in state["schritte"]],
+            "aktive_schritte": [step_record({**active, "name": name, "status": "laeuft",
+                "versuch": 1 + sum(s["name"] == name for s in state["schritte"])})
+                for name, active in state.get("active", {}).items()],
         }
         archive = self.root / ".diagnosen"
         archive.mkdir(mode=0o700, exist_ok=True)
@@ -537,10 +542,12 @@ class Coordinator:
                     )
                     response.raise_for_status()
                     result = response.json()
+                    state["active"][name]["sdk"] = snapshot(result.get("sdk"))
                     if result["zustand"] != "laeuft":
                         meta = result["meta"]
                         break
                     self.save(ident)
+                    self.archive_diagnostics(ident)
                     await asyncio.sleep(self.poll_s)
             except (httpx.HTTPError, KeyError, ValueError):
                 state.setdefault("unsichere_plaetze", []).append(slot)
@@ -548,6 +555,7 @@ class Coordinator:
             attempts += 1
             record = {
                 "name": name,
+                "sdk": snapshot(meta.get("sdk", state["active"].get(name, {}).get("sdk"))),
                 "versuch": attempts,
                 "status": meta["status"],
                 "abbruch_grund": meta.get("abbruch_grund"),
@@ -1034,6 +1042,7 @@ class Coordinator:
                         "status": meta.get("status", "abbruch"),
                         "abbruch_grund": safe_reason(meta.get("abbruch_grund")),
                         "diagnose": details(meta.get("diagnose")),
+                        "sdk": snapshot(meta.get("sdk", active.get("sdk"))),
                     })
                     state["active"].pop(name, None)
                 state.setdefault("lauf_start", time.time_ns())

@@ -142,3 +142,49 @@ weiterhin nur feste Klassen; ein fehlender Eintrag beweist keinen fehlerfreien
 Modellfortschritt. Die bisherigen Archive enthalten keine SDK-Zwischenereignisse
 und erlauben deshalb keine nachträgliche Unterscheidung von Thinking, Wartezeit
 und Werkzeugausführung.
+
+
+### Inhaltsfreie SDK-Ereignisdiagnose
+
+Das Kind sendet während der SDK-Iteration NDJSON-Ereignisse über seine vorhandene
+stdout-Pipe. Der Platz trennt diese vom abschließenden Ergebnis und übernimmt
+nur feste Klassen (`system`, `assistant`, `tool_start`, `tool_result`, `result`,
+`tokens`, `rate_limit`, `other`), feste Werkzeugnamen und nichtnegative ganze
+Zahlen. `zeit_ns` ist der UTC-Unix-Zeitpunkt der Beobachtung im Kind, nicht der
+serverseitige Beginn einer Modellanfrage. Prompts, Argumente, Pfade, Tool-IDs,
+Sitzungs-IDs, Resultattexte und Modellnamen sind nicht Teil dieser Diagnose.
+
+Live: authentifiziertes `GET /schritt/{bericht_id}/{schritt}` am Platz liefert
+`sdk.ereignisse`, `sdk.werkzeugaufrufe` und `sdk.read_antwort_bytes`. Der Leitstand
+übernimmt dies beim bestehenden Polling (normal alle zwei Sekunden) in `.lauf.json`
+und das atomar/fsync geschriebene private `.diagnosen/<id>.<lauf_start>.json`.
+`GET /diagnose/{id}` am Leitstand (bestehender Header `X-Erkunder-Intern`) liefert
+im Schema `erkunder-diagnose/2` `aktive_schritte` sowie abgeschlossene `schritte`,
+jetzt einschließlich erfolgreicher Schritte. `gesichert_ns` bezeichnet die
+Archivschreibung; einzelne Ereignisse tragen ihren eigenen Beobachtungszeitpunkt.
+Die vorhandene Lauf-Kennung trennt erneute Läufe; Versuchszähler trennen die
+bestehenden Wiederholungen. Keine Rohereignisse oder Inhalte in Logs/Archiven.
+
+`werkzeugaufrufe` zählt ToolUse-Blöcke. `read_antwort_bytes` zählt UTF-8-Textbytes
+in empfangenen Antworten des Werkzeugs Read, einschließlich dessen Textformatierung.
+Das sind weder Dateigrößen noch vollständige Dateisystem-I/O: Bash/Grep/Glob-Lesewege,
+Bild-/PDF-Binärblöcke und noch nicht zurückgegebene Read-Aufrufe sind damit nicht
+gemessen. Ein Wert 0 bzw. keine Ereignisse beweist keine Untätigkeit der CLI.
+Token-Ereignisse mit `umfang=modellnachricht` sind die vom Parser erhaltenen
+Assistant-Verbrauchsmeldungen; `umfang=laufgesamt` ist das abschließende Result.
+Beides nicht addieren (Doppelzählung); fehlende Meldungen liefern keinen Beleg
+für null Verbrauch. Die Diagnose erfasst SDK-Nachrichten, keine Token-Deltas
+innerhalb einer noch nicht gelieferten AssistantMessage.
+
+Bei regulärem Zeit-/OOM-/Abbruch bleiben empfangene Ereignisse bis nach dem Kill
+und im abschließenden Schritt erhalten. Bei Platzverlust behält der Leitstand
+den letzten empfangenen Stand, der Rest bis zur nächsten Poll-Antwort kann fehlen.
+Aufräumen sichert diese Diagnose wie bisher vor dem Löschen; wenn das Archiv
+nicht geschrieben werden kann, bleibt die bestehende Löschsperre wirksam.
+Fristen, max_turns, Versuche, Modellwahl und Werkzeuge bleiben unverändert.
+
+Pyramiden-Prüfkontext: laufende Ereignisse vor dem Result lesbar; blockierter
+Kindprozess mit System/Tool-Ereignis und anschließendem Zeitabbruch; erfolgreiche
+und fehlgeschlagene Versuche getrennt archiviert; Platzneustart behält letzten
+Poll-Stand; private synthetische Marker in allen SDK-Inhaltsfeldern bleiben aus
+der Diagnose; Token-Zwischenmeldungen und Gesamtsumme bleiben unterscheidbar.
