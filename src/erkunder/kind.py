@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from src.sdk_parser import install_resilient_parser
+from src.erkunder.diagnostik import exception_details, technical_line
 
 ALLOWED_TOOLS = ["Bash", "Read", "Write", "Edit", "Glob", "Grep", "LS"]
 DISALLOWED_TOOLS = [
@@ -112,6 +113,10 @@ def sdk_options(body: dict[str, Any]) -> Any:
     )
 
 
+class SDKResultFailure(RuntimeError):
+    """Failed SDK completion with technical evidence, never result content."""
+
+
 async def run(body: dict[str, Any]) -> dict[str, Any]:
     from claude_code_sdk import AssistantMessage, ResultMessage, ToolUseBlock, query
 
@@ -126,7 +131,9 @@ async def run(body: dict[str, Any]) -> dict[str, Any]:
         if isinstance(message, ResultMessage):
             result = message
     if result is None or result.is_error:
-        raise RuntimeError("cli_fehler: SDK ohne erfolgreiches ResultMessage")
+        error = SDKResultFailure("cli_fehler: SDK ohne erfolgreiches ResultMessage")
+        error.stderr = technical_line(getattr(result, "result", None))
+        raise error
     usage = result.usage or {}
     return {
         "zuege": result.num_turns,
@@ -150,6 +157,6 @@ if __name__ == "__main__":
         output = asyncio.run(run(json.load(sys.stdin)))
     except Exception as error:
         # SDK exceptions can contain credentials/prompts: never serialize them.
-        print(json.dumps({"fehler": failure_reason(error)}))
+        print(json.dumps({"fehler": failure_reason(error), "diagnose": exception_details(error)}))
         sys.exit(1)
     print(json.dumps(output))

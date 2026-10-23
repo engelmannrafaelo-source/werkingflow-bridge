@@ -32,6 +32,7 @@ from src.erkunder.dateien import read_bytes, read_text
 from src.erkunder.ipc import clear_owned_ipc
 from src.erkunder.models import VORGABE_MODELL, ModellName
 from src.erkunder.prozessschutz import protect_process
+from src.erkunder.diagnostik import details, exception_details, safe_reason
 
 LOG = logging.getLogger(__name__)
 
@@ -87,7 +88,7 @@ def child_failure_reason(output: bytes) -> str:
     if isinstance(reason, str) and re.fullmatch(
         r"cli_fehler: SDK-Lauf: [A-Za-z][A-Za-z0-9_]*", reason
     ):
-        return reason
+        return safe_reason(reason)
     return "cli_fehler: Kindprozess"
 
 
@@ -157,6 +158,7 @@ class Platz:
         peak = 0
         reason = None
         metrics: dict[str, Any] = {}
+        diagnosis: dict[str, Any] = {}
         communication = None
         self.process = None
         try:
@@ -221,6 +223,12 @@ class Platz:
                     current, oom = self.memory()
                     peak = max(peak, current)
                     stdout, _ = communication.result()
+                    try:
+                        child = json.loads(stdout)
+                        if isinstance(child, dict):
+                            diagnosis = details(child.get("diagnose"))
+                    except (TypeError, ValueError):
+                        pass  # Exit code remains evidence even without a JSON envelope.
                     if oom > initial_oom:
                         reason = "speicher"
                     elif self.process.returncode != 0:
@@ -262,6 +270,7 @@ class Platz:
             reason = "cli_fehler: abgebrochen"
             raise
         except Exception as error:
+            diagnosis.update(exception_details(error))
             # Exception text/tracebacks can contain the request's OAuth token.
             LOG.error(
                 "bericht_id=%s schritt=%s ausfuehrung=fehlgeschlagen fehler=%s",
@@ -321,6 +330,12 @@ class Platz:
                 "ram_spitze_mb": peak / 1024 / 1024,
                 "worker": os.environ.get("INSTANCE_NAME", "erkunder-platz"),
             }
+            if reason:
+                if self.process is not None:
+                    diagnosis.setdefault("exitcode", self.process.returncode)
+                meta["diagnose"] = details(diagnosis)
+                LOG.error("bericht_id=%s schritt=%s abbruch_grund=%s diagnose=%s",
+                          body.bericht_id, body.schritt, reason, json.dumps(meta["diagnose"]))
             if "lesezugriffe" in metrics:
                 meta["lesezugriffe"] = metrics["lesezugriffe"]
             self.states[(body.bericht_id, body.schritt)] = {

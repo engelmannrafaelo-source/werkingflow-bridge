@@ -1,5 +1,28 @@
 # Erkunder: Schrittgrenzen, Ergebnisintegrität und Wiederanlauf
 
+Fehlgeschlagene Schrittversuche werden vor dem Aufräumen zusätzlich unter
+`/arbeit/.diagnosen/<bericht_id>.json` gesichert (Verzeichnis 0700, Datei 0600).
+Das Archiv liegt außerhalb des zu löschenden Berichts, wird atomar geschrieben,
+mit fsync gesichert und zurückgelesen. Scheitert die Sicherung oder fehlt die
+Stopp-/Metadatenquittung eines aktiven Platzes, bleiben Bericht und Eingang
+erhalten und Aufräumen schlägt sichtbar fehl. Laufende Aufgaben werden dabei
+als abgebrochen markiert, damit ein Neustart sie nicht wieder aufnimmt.
+
+`GET /diagnose/<id>` liefert das Archiv mit derselben internen Authentisierung
+wie die anderen Leitstand-Wege; es bleibt nach erfolgreichem Aufräumen erhalten.
+Status und Logs enthalten ebenfalls Schrittname, Versuch, Abbruchkategorie und
+soweit verfügbar Fehlerklasse, Exitcode und eine klassifizierte technische
+stderr-Zeile. Freie SDK-Texte, Prompts, Kundendaten und Tokens werden nicht
+übernommen. Es gibt keine automatische Löschung dieses Diagnosearchivs.
+Die Worker-Erweiterung überträgt diese Angaben auch in Fortschritt und
+`erkunder abbruch: <schritt>: <grund>`; dafür muss der Worker diese Erweiterung
+tatsächlich ausführen. Ein reiner Erkunder-Rollout aktualisiert keinen Worker.
+
+Der Proxy hält sein begrenztes Log in `/tmp/erkunder-proxy/tinyproxy.log`.
+Das Verzeichnis gehört root und ist nicht sticky; die vorhandene Logdatei
+gehört nobody. So kann tinyproxy schreiben und der root-Trimmer kürzen, ohne
+am `fs.protected_regular`-Schutz des übergeordneten `/tmp` zu scheitern.
+
 Jeder Platz verwendet einen privaten Docker-IPC- und PID-Namespace sowie eine
 feste unprivilegierte UID. `ipc: private` trennt Plätze voneinander; es allein
 trennt **keine aufeinanderfolgenden Schritte**. Nach jedem Schritt beendet und

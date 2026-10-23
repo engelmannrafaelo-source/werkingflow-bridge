@@ -4,7 +4,14 @@ set -eu
 # tinyproxy opens LogFile after dropping to nobody:nogroup. Keep the actual
 # file on the writable tmpfs and mirror it to stdout so Docker retains allowed
 # and denied CONNECTs in the container log.
-log=/tmp/tinyproxy.log
+# A nobody-owned file directly in sticky /tmp cannot be opened with O_CREAT
+# by the root trimmer when fs.protected_regular=2. Use a root-owned, non-sticky
+# directory: nobody may write the existing logfile, but cannot replace it.
+log_dir=/tmp/erkunder-proxy
+mkdir -p "$log_dir"
+chown root:root "$log_dir"
+chmod 0755 "$log_dir"
+log=$log_dir/tinyproxy.log
 max_log_bytes=1048576
 # dash measures RLIMIT_FSIZE in 512-byte blocks: 8192 blocks are 4 MiB.  Keep
 # this hard backstop above the 1 MiB truncation point and below the 16 MiB tmpfs.

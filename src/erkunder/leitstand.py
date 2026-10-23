@@ -12,6 +12,7 @@ import re
 import shutil
 import stat
 import time
+import tempfile
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, Callable
@@ -45,6 +46,7 @@ from .pruefkreis import (
 )
 from .quellen import kanalmanifest
 from .rechenstand import rechenstand
+from .diagnostik import details, safe_reason, step_record, summary
 
 LOG = logging.getLogger(__name__)
 ID = re.compile(r"^[a-z0-9-]{8,80}$")
@@ -122,6 +124,53 @@ class Coordinator:
         if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.geteuid():
             raise RuntimeError("Berichtordner gehört nicht dem Leitstand")
         directory.chmod(0o700)
+
+    def archive_diagnostics(self, ident: str) -> dict:
+        """Persist value-free evidence outside the report's deletion boundary.
+
+        Failure propagates: callers must retain the source state on disk.
+        The private archive lives on the existing /arbeit volume.
+        """
+        self.directory(ident)
+        state = self.states[ident]
+        evidence = {
+            "schema": "erkunder-diagnose/1", "bericht_id": ident,
+            "zustand": state["zustand"], "fehler": safe_reason(state.get("fehler")),
+            "schritte": [step_record(s) for s in state["schritte"] if s["status"] != "ok"],
+        }
+        archive = self.root / ".diagnosen"
+        archive.mkdir(mode=0o700, exist_ok=True)
+        if archive.is_symlink() or archive.stat().st_uid != os.geteuid():
+            raise RuntimeError("Diagnosearchiv gehört nicht dem Leitstand")
+        archive.chmod(0o700)
+        fd, name = tempfile.mkstemp(dir=archive, prefix=".diagnose-")
+        temporary = Path(name)
+        target = archive / (ident + ".json")
+        try:
+            with os.fdopen(fd, "w") as stream:
+                json.dump(evidence, stream, ensure_ascii=False)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary, target)
+            descriptor = os.open(archive, os.O_DIRECTORY)
+            try:
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+            if json.loads(read_text(target)) != evidence:
+                raise RuntimeError("Diagnosesicherung nicht bestätigt")
+        finally:
+            temporary.unlink(missing_ok=True)
+        return evidence
+
+    def diagnostics(self, ident: str) -> dict:
+        self.directory(ident)
+        if ident in self.states:
+            return self.archive_diagnostics(ident)
+        path = self.root / ".diagnosen" / (ident + ".json")
+        if not path.exists():
+            raise HTTPException(404, "Keine gesicherte Diagnose")
+        return json.loads(read_text(path))
 
     def seal_reports(self) -> bool:
         found = False
@@ -501,6 +550,8 @@ class Coordinator:
                 "ram_spitze_mb": meta.get("ram_spitze_mb", 0),
                 "worker": state["active"].get(name, {}).get("worker", state["worker"]),
             }
+            if "diagnose" in meta:
+                record["diagnose"] = details(meta["diagnose"])
             if "lesezugriffe" in meta:
                 record["lesezugriffe"] = meta["lesezugriffe"]
             if record["status"] == "ok":
@@ -518,12 +569,17 @@ class Coordinator:
             if record["status"] == "ok":
                 state["fertig"] += 1
             self.save(ident)
+            self.archive_diagnostics(ident)
+            if record["status"] != "ok":
+                LOG.error("bericht_id=%s schritt_diagnose=%s", ident,
+                          json.dumps(step_record(record), ensure_ascii=False))
             if record["status"] == "ok":
                 return
         reason = next(
             s["abbruch_grund"] for s in reversed(state["schritte"]) if s["name"] == name
         )
-        raise StepFailed(name, reason)
+        failures = [s for s in state["schritte"] if s["name"] == name and s["status"] != "ok"]
+        raise StepFailed(name, safe_reason(reason) + "; " + summary(failures))
 
     async def run(self, ident: str) -> None:
         state = self.states[ident]
@@ -557,6 +613,10 @@ class Coordinator:
                 if isinstance(error, StepFailed)
                 else ("unbekannt: " + type(error).__name__)
             )
+            failures = [s for s in state["schritte"] if s["status"] != "ok"]
+            state["fehler"] = safe_reason(state["fehler"]) + (
+                "; " + summary(failures) if failures else ""
+            )
             LOG.error(
                 "bericht_id=%s schritt=%s grund=%s",
                 ident,
@@ -579,6 +639,7 @@ class Coordinator:
                 )
                 raise
         self.save(ident)
+        self.archive_diagnostics(ident)
 
     async def prepare_run(self, ident: str, order: Auftrag) -> None:
         state = self.states[ident]
@@ -618,7 +679,9 @@ class Coordinator:
         state["erkunder_ausgefallen"] = failed
         if len(failed) > 1:
             raise StepFailed(
-                failed[-1]["schritt"], "unbekannt: weniger als zwei Gutachten"
+                failed[-1]["schritt"], "cli_fehler: weniger als zwei Gutachten; " + summary(
+                    [s for s in state["schritte"] if s["status"] != "ok"]
+                )
             )
         return failed
 
@@ -636,7 +699,7 @@ class Coordinator:
             "prompt_version": PROMPT_VERSION,
             "modell": state["auftrag"].get("modell", VORGABE_MODELL),
             "schritte": [
-                {k: v for k, v in item.items() if k != "sha256"}
+                {k: v for k, v in item.items() if k not in {"sha256", "diagnose"}}
                 for item in state["schritte"]
             ],
             "erkunder_ausgefallen": failed,
@@ -816,11 +879,11 @@ class Coordinator:
         if ident not in self.states:
             raise HTTPException(404, "unbekannt")
         state = self.states[ident]
-        return {
+        return {"schritt_diagnosen": [step_record(s) for s in state["schritte"] if s["status"] != "ok"], **{
             k: state[k]
             for k in ("zustand", "schritt", "fertig", "gesamt", "meta", "fehler")
             if k in state
-        }
+        }}
 
     def result(self, ident: str) -> dict[str, Any]:
         if self.status(ident)["zustand"] != "fertig":
@@ -907,6 +970,12 @@ class Coordinator:
         async with self.lock:
             path = self.directory(ident)
             state = self.states.get(ident)
+            if state is None and path.exists():
+                file = path / ".lauf.json"
+                if not file.exists():
+                    raise HTTPException(503, "Aufraeumen verweigert: Laufdiagnose fehlt")
+                state = json.loads(read_text(file))
+                self.states[ident] = state
             if path.exists():
                 self.seal(ident)
             abort_errors: list[dict[str, Any]] = []
@@ -915,6 +984,10 @@ class Coordinator:
                 task.cancel()
                 await asyncio.gather(task, return_exceptions=True)
             if state:
+                if state["zustand"] == "laeuft":
+                    state["zustand"] = "abbruch"
+                    state["fehler"] = "cli_fehler: Aufraeumen angefordert"
+                    self.save(ident)
                 slots = {a["slot"] for a in state["active"].values()}
                 slots.update(state.get("unsichere_plaetze", []))
                 for slot in slots:
@@ -934,6 +1007,32 @@ class Coordinator:
                             slot,
                             type(error).__name__,
                         )
+                if abort_errors:
+                    self.save(ident)
+                    self.archive_diagnostics(ident)
+                    raise HTTPException(503, "Aufraeumen verweigert: Platz-Stopp unbestätigt")
+                # A cancelled coordinator task may not have consumed the final
+                # place metadata yet. Secure those diagnostics before deleting.
+                for name, active in list(state["active"].items()):
+                    response = await self.client.get(
+                        f"{self.places[active['slot']]}/schritt/{ident}/{name}", headers=self.headers(),
+                    )
+                    response.raise_for_status()
+                    final = response.json()
+                    if final.get("zustand") == "laeuft" or not isinstance(final.get("meta"), dict):
+                        raise HTTPException(503, "Aufraeumen verweigert: Schrittdiagnose unbestätigt")
+                    meta = final["meta"]
+                    state["schritte"].append({
+                        "name": name, "versuch": 1 + sum(s["name"] == name for s in state["schritte"]),
+                        "status": meta.get("status", "abbruch"),
+                        "abbruch_grund": safe_reason(meta.get("abbruch_grund")),
+                        "diagnose": details(meta.get("diagnose")),
+                    })
+                    state["active"].pop(name, None)
+                self.save(ident)
+                evidence = self.archive_diagnostics(ident)
+                LOG.info("bericht_id=%s gesicherte_schrittdiagnosen=%s", ident,
+                         json.dumps(evidence["schritte"], ensure_ascii=False))
             size = None
             try:
                 size = (
@@ -961,6 +1060,7 @@ class Coordinator:
                 "bericht_id": ident,
                 "geloescht_bytes": size,
                 "platz_abbruch_fehler": abort_errors,
+                "diagnose_gesichert": state is not None,
             }
 
 
@@ -1042,6 +1142,10 @@ def create_app(coordinator: Coordinator | None = None) -> FastAPI:
     @app.get("/status/{ident}")
     async def status(ident: str):
         return service.status(ident)
+
+    @app.get("/diagnose/{ident}")
+    async def diagnostics(ident: str):
+        return service.diagnostics(ident)
 
     @app.get("/ergebnis/{ident}")
     async def result(ident: str):

@@ -742,8 +742,12 @@ async def erkunder_executor(
                 if response.status_code != 200:
                     raise RuntimeError(f"Erkunder status HTTP {response.status_code}")
                 state = response.json()
+                from src.erkunder.diagnostik import STEPS, safe_reason, step_record, summary
+                diagnostic_rows = state.get("schritt_diagnosen", [])
+                diagnostic_rows = [step_record(s) for s in diagnostic_rows if isinstance(s, dict)] if isinstance(diagnostic_rows, list) else []
                 await report_progress(
-                    {key: state[key] for key in ("schritt", "fertig", "gesamt")}
+                    {**{key: state[key] for key in ("schritt", "fertig", "gesamt")},
+                     "schritt_diagnosen": diagnostic_rows}
                 )
                 if state["zustand"] == "fertig":
                     return Ergebnis.model_validate(state["meta"]).model_dump(
@@ -757,40 +761,11 @@ async def erkunder_executor(
                         else error
                     )
                     step = state["schritt"]
-                    # Never echo an upstream body/token into the generic job log.
-                    known = str(reason).split(":", 1)[0]
-                    if known not in {
-                        "zeit",
-                        "speicher",
-                        "cli_fehler",
-                        "geheimnis_im_ergebnis",
-                        "platz_neustart",
-                        "Ergebnis-Integritaet",
-                        "Nachweis-Integritaet",
-                        "Wiederanhaengen",
-                        "konto",
-                        "unbekannt",
-                    }:
-                        known = "unbekannt"
-                    safe_step = (
-                        step
-                        if step
-                        in {
-                            "daten",
-                            "wiederaufnahme",
-                            "erkunder-1",
-                            "erkunder-2",
-                            "erkunder-3",
-                            "harmonisierung",
-                            "pruefung",
-                            "harmonisierung-korrektur",
-                            "pruefung-korrektur",
-                            *(f"{kind}-korrektur-{n}" for kind in ("harmonisierung", "pruefung")
-                              for n in range(2, 6)),
-                        }
-                        else "unbekannt"
-                    )
-                    raise RuntimeError(f"erkunder abbruch: {safe_step}: {known}")
+                    safe_step = step if step in STEPS else "unbekannt"
+                    reason_text = safe_reason(reason)
+                    if diagnostic_rows:
+                        reason_text += "; " + summary(diagnostic_rows)
+                    raise RuntimeError(f"erkunder abbruch: {safe_step}: {reason_text}")
                 if state["zustand"] != "laeuft":
                     raise RuntimeError("Erkunder: ungueltiger Zustand")
                 await asyncio.sleep(15)
