@@ -17,7 +17,7 @@ KINDS = {"ProcessError", "CLIConnectionError", "CLINotFoundError", "CLIJSONDecod
          "BrokenPipeError", "FileNotFoundError", "MemoryError", "CancelledError",
          "ModuleNotFoundError", "ImportError", "ExceptionGroup", "BaseExceptionGroup",
          "TypeError", "AttributeError", "SyntaxError", "ChildProcessError"}
-REASONS = {"zeit", "speicher", "cli_fehler", "geheimnis_im_ergebnis", "platz_neustart",
+REASONS = {"stille", "zeit", "speicher", "cli_fehler", "geheimnis_im_ergebnis", "platz_neustart",
            "Ergebnis-Integritaet", "Nachweis-Integritaet", "Wiederanhaengen", "konto", "unbekannt"}
 LINES = {"Connection reset by peer", "Connection refused", "Permission denied", "Broken pipe",
          "ENOTFOUND", "ECONNRESET", "ETIMEDOUT", "certificate verify failed",

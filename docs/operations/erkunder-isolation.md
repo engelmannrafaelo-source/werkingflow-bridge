@@ -205,3 +205,43 @@ Auch die `modellnachricht`-Verbrauchswerte untereinander **nicht addieren**:
 mehrere Assistant-Inhaltsblöcke derselben Modellantwort können dieselben
 Verbrauchswerte wiederholen. Sie sind Beobachtungen, keine additiven Deltas.
 Für die Endsumme gilt ausschließlich das Result (`laufgesamt`), sofern vorhanden.
+
+
+### Aktivitätsüberwachung statt Schritt-/Job-Wanduhr
+
+`ERKUNDER_STILLE_S` ist ein positiver, endlicher Bridge-Betriebsparameter der
+Plätze, Default 1800 Sekunden, über Compose/Env-Vorlagen konfiguriert. Die
+monotone Uhr beginnt beim Kindstart und wird ausschließlich durch ein gültiges,
+empfangenes SDK-Diagnoseereignis erneuert. Statuspolls und stderr-Ausgaben zählen
+nicht als Aktivität. Der Default gewährt einem einzelnen Modell-/Werkzeugaufruf
+30 Minuten ohne SDK-Rückmeldung; er ist eine konservative Betriebsvorgabe, kein
+Nachweis einer maximal legitimen Antwortdauer. Lange Bash-/Read-/Modellarbeit
+kann bis zum nächsten SDK-Ereignis unsichtbar bleiben. Eine zukünftige Änderung
+dieses Fensters verlangt deshalb Beobachtungsbefunde, nicht eine Energy-Frist.
+
+Bei ausbleibendem Ereignis endet der Schritt mit `stille`; ansonsten besteht
+keine Gesamt-Wanduhr. Abbruch/Aufräumen, OOM und normales Kindende bleiben wie
+bisher. Die vorhandenen SDK-Zuggrenzen und Wiederholungsregeln bleiben unverändert.
+Das alte optionale Requestfeld `timeout_s` wird akzeptiert, aber ignoriert; es
+wird nicht zum Stillefenster umgedeutet. Neue Leitstände senden es nicht mehr.
+So können Alt-Clients weder aktive Arbeit abschneiden noch das Betriebsfenster
+verändern. Die frühere 1260-s-Notfrist im Leitstand entfällt ebenfalls.
+
+`sdk.letztes_ereignis_ns` enthält den Empfangszeitpunkt im Platz (Unix-UTC ns),
+auch nach Kürzen der Ereignisliste. Vor dem ersten Ereignis fehlt das Feld;
+`sdk.ueberwachung_start_ns` bezeichnet dann den Beginn der Überwachung.
+Beide Felder werden live und im Archiv erhalten. Für die Entscheidung zählt
+nur monotone Zeit, nicht ein vom Kind gelieferter Zeitstempel.
+
+Der Bridge-Executor für `kind=erkunder` wartet ohne frühere 6600-s-Gesamtfrist;
+`ERKUNDER_JOB_TIMEOUT_S` wird nicht mehr ausgewertet. Einzelne HTTP-Transport-
+fristen (60 s) bleiben für Erreichbarkeit bestehen und sind keine Laufzeitgrenze.
+Dieser Teil erfordert einen gesondert koordinierten Worker-Rollout: Ein reiner
+Erkunder-Deploy aktualisiert den bereits laufenden Worker-Executor nicht.
+Energy-Clients mit eigenen Gesamt-/Phasenfristen müssen separat angepasst werden;
+eine Bridge-Änderung kann deren Poll-Ende/Abbruchentscheidung nicht aufheben.
+
+Pyramiden-Kontext: Aktivität hält einen Schritt über das alte timeout_s hinaus
+am Leben; echte Stille vor/nach dem ersten Ereignis beendet ihn; Statuspolls
+verlängern das Fenster nicht; OOM/Abbruch/Erfolg bleiben wirksam; Empfangszeitpunkt
+bleibt über Snapshot und Archiv erhalten; kein Executor-Gesamtzeitlimit.

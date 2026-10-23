@@ -769,11 +769,7 @@ async def erkunder_executor(
                 await asyncio.sleep(15)
 
     try:
-        return await asyncio.wait_for(
-            run(), float(os.getenv("ERKUNDER_JOB_TIMEOUT_S", "6600"))
-        )
-    except asyncio.TimeoutError:
-        raise RuntimeError("Erkunder: Gesamtfrist abgelaufen") from None
+        return await run()
     except httpx.TransportError:
         # The watchdog retries /start with the same report ID and fresh token.
         # B1m then resumes interrupted steps; completed steps remain intact.

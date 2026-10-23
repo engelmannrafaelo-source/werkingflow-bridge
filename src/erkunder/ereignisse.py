@@ -46,6 +46,9 @@ def snapshot(value):
     ):
         number = value.get(key)
         result[key] = number if type(number) is int and number >= fallback else fallback
+    for key in ('letztes_ereignis_ns', 'ueberwachung_start_ns'):
+        if type(value.get(key)) is int and value[key] >= 0:
+            result[key] = value[key]
     return result
 
 

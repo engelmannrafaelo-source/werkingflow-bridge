@@ -5,6 +5,7 @@ import base64
 import hmac
 import json
 import logging
+import math
 import os
 import re
 import signal
@@ -49,7 +50,8 @@ class Schritt(BaseModel):
     )
     ordner: str
     prompt: str
-    timeout_s: float = Field(gt=0)
+    # Legacy wire field: accepted but no longer controls execution.
+    timeout_s: float | None = Field(default=None, gt=0)
     max_turns: int = Field(gt=0)
     claude_token: SecretStr = Field(min_length=1)
     modell: ModellName = VORGABE_MODELL
@@ -119,6 +121,8 @@ async def communicate_diagnosed(process, payload: bytes, events=None):
                     event = clean_event(value["ereignis"])
                     if event is not None and events is not None:
                         append_event(events, event)
+                        events["_aktiv_monoton"] = time.monotonic()
+                        events["letztes_ereignis_ns"] = time.time_ns()
                 else:
                     output.extend(line + b"\n")
         output.extend(pending)
@@ -149,6 +153,9 @@ class Platz:
         self.cgroup = cgroup
         self.command = command or [sys.executable, "-m", "src.erkunder.kind"]
         self.sample_s = sample_s
+        self.silence_s = float(os.environ.get("ERKUNDER_STILLE_S", "1800"))
+        if not math.isfinite(self.silence_s) or self.silence_s <= 0:
+            raise ValueError("ERKUNDER_STILLE_S muss endlich und positiv sein")
         self.task: asyncio.Task[None] | None = None
         self.process: asyncio.subprocess.Process | None = None
         self.states: dict[tuple[str, str], dict[str, Any]] = {}
@@ -205,7 +212,8 @@ class Platz:
         metrics: dict[str, Any] = {}
         diagnosis: dict[str, Any] = {}
         communication = None
-        events = {"ereignisse": []}
+        events = {"ereignisse": [], "_aktiv_monoton": started,
+                  "ueberwachung_start_ns": time.time_ns()}
         self.states[(body.bericht_id, body.schritt)]["sdk"] = events
         self.process = None
         try:
@@ -257,14 +265,14 @@ class Platz:
                 if self.cancelled:
                     reason = "cli_fehler: abgebrochen"
                     break
-                remaining = body.timeout_s - (time.monotonic() - started)
-                if remaining <= 0:
-                    reason = "zeit"
+                remaining = self.silence_s - (time.monotonic() - events["_aktiv_monoton"])
+                if remaining <= 0 and not communication.done():
+                    reason = "stille"
                     break
                 done, _ = await asyncio.wait(
                     [communication],
                     # Reap during long steps, before the PID budget is exhausted.
-                    timeout=min(self.sample_s, remaining, 0.01),
+                    timeout=max(0, min(self.sample_s, remaining, 0.01)),
                 )
                 if done:
                     current, oom = self.memory()
