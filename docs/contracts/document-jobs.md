@@ -229,3 +229,32 @@ dauerhafte Speicherung im Jobstore, nicht schon die Abholung durch die App.
 Rollout: neue Platform-API (ACK-Abfragen/Bestätigung) vor neuen Workern; neuer
 Dokumentdienst für ACK/Janitor erforderlich. Kein neuer Env-Schalter. Der
 Privacy-/GPU-Deploy bleibt bis Kapazitätsnachweis und L4-Freigabe gesperrt.
+
+
+## Kapazitätsmessung (P2-6)
+
+scripts/document_capacity_probe.py führt auf dem GPU-Host isolierte synthetische
+PDF-Konvertierungen mit dem echten document_process/document_worker-Pfad aus.
+Parameter: --image (lokal vorhandenes Image), --source-root (expliziter Checkout),
+--source-sha, --pages, --parallel 1|2, --output (privater Berichtspfad).
+Das Image wird per ID fixiert; ausschließlich der angegebene src-Baum wird
+read-only darübergelegt. Das ist eine Quellstandmessung mit diesen Image-
+Abhängigkeiten, kein Nachweis eines frisch gebauten Release-Images.
+
+Kein Dienststart/Deploy, kein Netz, keine Token, keine Vision, keine Kundendaten.
+Je eigener Container: 2 GiB RAM einschließlich Swap, zwei CPUs, 256 PIDs.
+Das Werkzeug sammelt hostseitig RSS des eigenen Prozessbaums sowie
+nvidia-smi-Compute-Speicher nur seiner eigenen PIDs. Gemeldet werden je Prozess
+und Konvertierung die beobachteten Peaks, der gemeinsame gleichzeitige Peak,
+Dauer, Exit/OOM, Reap-Receipt und tatsächliches docling_parsed. Abtastung etwa
+250 ms plus Messkosten; RSS summiert gemeinsame Seiten mehrfach und VRAM ist
+ein beobachteter Prozesswert, keine lückenlose Allokations-Höchstmarke.
+
+Die Probe beginnt nur mit mindestens 8 GiB freiem VRAM und beendet ihre eigenen
+Container bei weniger als 2 GiB Rest. Das sind Schutzbedingungen dieser
+Messung, keine neue Laufzeitregel für Kundenkonvertierungen. Ein OOM, fehlendes
+Ergebnis oder Docling-Fallback wird rot ausgegeben, nie als erfolgreicher
+Kapazitätsnachweis. Fremde Prozesse werden weder beendet noch verändert.
+Reale Messberichte, nicht dieser Werkzeugbau, entscheiden P2-6. Große Dateien,
+Parallelität, Dienst-Grundlast und der endgültige Release-Build bleiben Teil
+der Abnahme. L4 bleibt bis dahin ROT.
