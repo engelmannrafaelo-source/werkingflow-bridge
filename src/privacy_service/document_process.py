@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import ctypes
+from datetime import datetime, timezone
 import json
 import os
 from pathlib import Path
@@ -82,12 +83,17 @@ def guardian(directory: Path) -> None:
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
     )
     reason = "completed"
+    accepted = directory / "accepted.json"
+    deadline = json.loads(accepted.read_text()).get("deadline_at") if accepted.exists() else None
     try:
         while True:
             # waitid WNOWAIT observes exit without releasing the PID. This also
             # lets us clean up grandchildren after a converter crashes/exits.
             exited = os.waitid(os.P_PID, process.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT)
             if exited is not None:
+                break
+            if deadline and datetime.now(timezone.utc) >= datetime.fromisoformat(deadline):
+                reason = "deadline_expired"
                 break
             readable, _, _ = select.select([sys.stdin.buffer], [], [], 0.25)
             if readable:
@@ -102,20 +108,21 @@ def guardian(directory: Path) -> None:
         _kill_and_reap(process)
     # Marker is conservative: it is fsynced BEFORE any external Vision send.
     # Killing the local tree cannot acknowledge a provider-side cancellation.
-    external = (directory / "vision-started").exists()
+    external = any(directory.glob("provider-pending-*"))
     write_json(directory / "receipt.json", {
         "reason": reason, "local_stopped": True, "reaped": True,
         "converter_exit": process.returncode,
-        "provider_outcome": "unknown" if external and reason != "completed" else "finished_or_not_started",
+        "provider_outcome": "unknown" if external else "finished_or_not_started",
         "finished_at": time.time(),
     })
 
 
-async def run(directory: Path, stop: asyncio.Event) -> dict:
+async def run(directory: Path, stop: asyncio.Event, *, lock_fd: int | None = None) -> dict:
     process = await asyncio.create_subprocess_exec(
         sys.executable, "-m", "src.privacy_service.document_process", str(directory),
         stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.DEVNULL,
         stderr=asyncio.subprocess.DEVNULL, start_new_session=True,
+        pass_fds=() if lock_fd is None else (lock_fd,),
     )
     wait = asyncio.create_task(process.wait())
     cancel = asyncio.create_task(stop.wait())

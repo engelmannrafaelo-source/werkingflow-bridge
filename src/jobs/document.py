@@ -1,15 +1,13 @@
-"""Binary envelope and executor for the durable document conversion job.
-
-Cancellation drains an already submitted conversion: the remote converter uses
-threads and offers no stop acknowledgement. Never report that it stopped merely
-because our HTTP socket closed. The job heartbeat stays alive while draining.
-"""
+"""Durable document envelope and fenced remote reconciliation runner."""
 from __future__ import annotations
 
 import asyncio
 import base64
 import binascii
 import logging
+import os
+from datetime import datetime, timezone
+import hashlib
 from typing import Any
 
 import httpx
@@ -25,6 +23,17 @@ class DocumentPayload(BaseModel):
     content_base64: StrictStr = Field(min_length=1)
     content_type: StrictStr = "application/octet-stream"
     fields: dict[str, StrictStr] = Field(default_factory=dict)
+    deadline_at: StrictStr | None = None
+
+    @field_validator("deadline_at")
+    @classmethod
+    def deadline(cls, value):
+        if value is not None:
+            parsed = datetime.fromisoformat(value)
+            if parsed.tzinfo is None:
+                raise ValueError("deadline_at requires a timezone")
+            return parsed.astimezone(timezone.utc).isoformat()
+        return value
 
     @field_validator("filename", "content_type")
     @classmethod
@@ -52,110 +61,142 @@ class DocumentPayload(BaseModel):
         return value
 
 
-async def document_executor(payload, attribution, report_progress) -> dict[str, Any]:
-    from src.error_contract import JobFailure
-    from src.privacy_client import privacy_timeout
-    from src.jobs import store_client
-    from src.jobs.executors import (
-        SELF_BASE_URL, _build_headers, _http_error,
-        _raise_if_dependency_unavailable,
-    )
-    from src.jobs.registry import laufender_job
-    from src.jobs.selbstaufruf import JOB_CANCEL_POLL_S, JobLaufAbgebrochen
+async def document_executor(payload, attribution, report_progress):
+    # Registry dispatches this kind through run_document_job. There is no
+    # unfenced/synchronous fallback when either service lacks the new protocol.
+    raise RuntimeError("document-convert requires the fenced document runner")
 
-    try:
-        document = DocumentPayload.model_validate(payload)
-    except ValidationError:
-        raise JobFailure(
-            "Invalid document-convert envelope", retryable=False,
-        ) from None
-    headers = _build_headers(attribution)
-    headers.pop("Content-Type", None)  # httpx owns the multipart boundary
-    job_id = laufender_job()
-    await report_progress({"phase": "document-convert"})
-    async with httpx.AsyncClient(timeout=privacy_timeout(None)) as client:
-        task = asyncio.create_task(client.post(
-            f"{SELF_BASE_URL}/v1/document/convert",
-            headers=headers,
-            files={"file": (
-                document.filename, base64.b64decode(document.content_base64),
-                document.content_type,
-            )},
-            data=document.fields,
-        ))
-        cancel_requested = False
-        cancel_poll_available = True
-        cancel_poll_failure = None
-        try:
-            while not task.done():
-                done, _ = await asyncio.wait({task}, timeout=JOB_CANCEL_POLL_S)
-                if done:
-                    break
-                if job_id and cancel_poll_available and not cancel_requested:
-                    try:
-                        state = await store_client.cancel_state(job_id)
-                    except store_client.CancelRouteMissing:
-                        logger.error(
-                            "document job store lacks cancel-state route; cancellation polling disabled"
+
+async def run_document_job(job_id: str, payload: dict, attribution: dict | None,
+                           attempt: int | None = None) -> None:
+    from src.federation import set_request_origin
+    from src.privacy_client import PRIVACY_SERVICE_URL, privacy_auth_headers, privacy_timeout
+    from . import store_client
+
+    set_request_origin((attribution or {}).get("bridge_origin"))
+    call_id = hashlib.sha256((str((attribution or {}).get("bridge_origin")) + ":" + job_id).encode()).hexdigest()[:32]
+    remote_url = f"{PRIVACY_SERVICE_URL}/document/calls/{call_id}"
+    failure = None
+    document = DocumentPayload.model_validate(payload)
+    headers = privacy_auth_headers()
+    headers["X-Document-Actualtext-Repair"] = "true" if os.getenv("BRIDGE_PDF_ACTUALTEXT_REPAIR", "").strip().lower() == "true" else "false"
+    if document.deadline_at:
+        headers["X-Document-Deadline"] = document.deadline_at
+    async with httpx.AsyncClient(headers=headers, timeout=privacy_timeout(30)) as client:
+        while True:
+            try:
+                if attempt is None:
+                    claim = await store_client.document_state(job_id, 0, "claim")
+                    if not claim["owned"]:
+                        return
+                    attempt = claim["attempt"]
+                state = await store_client.document_state(job_id, attempt, "heartbeat")
+                if not state["owned"]:
+                    return
+                expired = document.deadline_at is not None and datetime.now(timezone.utc) >= datetime.fromisoformat(document.deadline_at)
+                cancelling = state["cancel_requested"] or expired
+                response = await client.get(remote_url)
+                if response.status_code == 404:
+                    if cancelling:
+                        # No request was accepted under this identity. Persist
+                        # a remote cancellation tombstone before acknowledging
+                        # stop; it fences a delayed PUT from an older worker.
+                        response = await client.delete(remote_url)
+                    else:
+                        response = await client.put(
+                            remote_url,
+                            files={"file": (document.filename, base64.b64decode(document.content_base64), document.content_type)},
+                            data=document.fields,
                         )
-                        cancel_poll_available = False
-                        continue
-                    except Exception as exc:
-                        # Store unavailability is not permission to abandon a
-                        # conversion whose remote outcome is still unknown.
-                        failure = type(exc).__name__
-                        if failure != cancel_poll_failure:
-                            logger.warning(
-                                "document job cancel poll unavailable (%s)", failure,
-                            )
-                        cancel_poll_failure = failure
-                        continue
-                    if cancel_poll_failure is not None:
-                        logger.info("document job cancel poll recovered")
-                        cancel_poll_failure = None
-                    if state and state.get("cancel_requested"):
-                        cancel_requested = True
-                        try:
-                            await report_progress({
-                                "phase": "cancel-requested-draining-conversion",
-                                "cancel_requested": True,
-                            })
-                        except Exception as exc:
-                            logger.warning(
-                                "document job cancel progress unavailable (%s)",
-                                type(exc).__name__,
-                            )
-            response = await task
-        except httpx.TransportError as exc:
-            # Remote execution may still exist. L6 will add attempt-level
-            # reconciliation; a blind re-submit cannot promise exactly-once.
-            raise JobFailure(
-                f"document conversion transport lost ({type(exc).__name__}); "
-                "remote execution outcome unknown", retryable=False,
-            ) from exc
-        finally:
-            if not task.done():
-                task.cancel()
-                await asyncio.gather(task, return_exceptions=True)
+                if cancelling and response.status_code < 300:
+                    response = await client.delete(remote_url)
+                if response.status_code >= 300:
+                    # 404/405 means an incompatible service, not permission to
+                    # fall back to a fresh synchronous conversion.
+                    raise RuntimeError(f"document control HTTP {response.status_code}")
+                remote = response.json()
+                if remote.get("call_id") != call_id or "status" not in remote:
+                    raise RuntimeError("invalid document control identity")
+                progress = {
+                    "phase": "document-" + remote["status"], "call_id": call_id,
+                    "attempt_id": remote.get("attempt_id"), "cancel_requested": cancelling,
+                }
+                if remote["status"] in ("done", "error", "cancelled", "interrupted"):
+                    receipt = remote.get("stop_receipt", {})
+                    if not receipt.get("reaped") or not receipt.get("local_stopped"):
+                        raise RuntimeError("document remote end lacks stop receipt")
+                    progress["stop_receipt"] = receipt
+                    if cancelling or remote["status"] == "cancelled":
+                        progress["abbruch"] = {
+                            "ledger": "unbekannt" if receipt.get("provider_outcome") == "unknown" else "vom_dokumentlauf",
+                            "mode": "process-reaped", "remote_finished": receipt.get("provider_outcome") != "unknown",
+                            "reason": "deadline_expired" if expired else "user_cancelled",
+                        }
+                        action = "cancelled"
+                        value = {"progress": progress, "stop_receipt": receipt}
+                    elif remote["status"] == "done":
+                        result = remote["result"]["result"]
+                        if result.get("success") is not True or not isinstance(result.get("markdown"), str):
+                            raise RuntimeError("document result schema invalid")
+                        action = "done"
+                        value = {"result": {**result, "call_id": call_id, "attempt_id": remote["attempt_id"]}, "progress": progress}
+                    else:
+                        action = "error"
+                        value = {"error": {
+                            "message": "document execution " + remote["status"],
+                            "code": "DOCUMENT_REMOTE_" + remote["status"].upper(),
+                            "retryable": False, "retry_after_s": None,
+                        }, "progress": progress}
+                    saved = await store_client.document_state(job_id, attempt, action, value)
+                    if saved["owned"] and saved.get("written"):
+                        await record_completion(call_id, attribution or {}, action, value)
+                    if not saved["owned"] or saved.get("written"):
+                        return
+                    # Cancel won the database lock against late done. Read its
+                    # wish and the SAME retained remote result on the next turn.
+                else:
+                    saved = await store_client.document_state(job_id, attempt, "progress", progress)
+                    if not saved["owned"]:
+                        return
+                    if remote["status"] == "unknown":
+                        raise RuntimeError("document guardian lost; reconciliation required")
+                if failure is not None:
+                    logger.info("document control recovered")
+                    failure = None
+            except asyncio.CancelledError:
+                # The persistent remote call remains addressable. The next
+                # fenced owner reconciles it; never send an unrequested DELETE.
+                raise
+            except Exception as exc:
+                current = (type(exc).__name__, str(exc) if isinstance(exc, RuntimeError) else "")
+                if current != failure:
+                    logger.error("document reconciliation waiting (%s %s)", *current)
+                    failure = current
+            await asyncio.sleep(2)
 
-    _raise_if_dependency_unavailable(response, "/v1/document/convert")
-    if response.status_code >= 300:
-        raise _http_error(response, f"document conversion HTTP {response.status_code}", None)
+
+async def record_completion(call_id: str, attribution: dict, action: str, value: dict) -> None:
+    """Preserve local document activity/metrics without recording source text."""
+    from src.activity.ai_call_writer import persist_ai_call_activity
+    from src.activity.providers import PROVIDER_LOCAL
+    from src.middleware.prompt_metrics import get_prompt_metrics
+    import uuid
+
+    duration = int(value.get("result", {}).get("conversion_time_seconds", 0) * 1000)
+    state = "success" if action == "done" else "error"
     try:
-        result = response.json()
-    except ValueError:
-        raise JobFailure("document conversion returned non-JSON", retryable=False) from None
-    if not isinstance(result, dict):
-        raise JobFailure("document conversion returned no object", retryable=False)
-    if result.get("status") == "error":
-        # An upstream error body can contain the uploaded document.
-        raise JobFailure("document conversion returned status=error", retryable=False)
-    if result.get("success") is not True or not isinstance(result.get("markdown"), str):
-        raise JobFailure("document conversion returned no successful Markdown result", retryable=False)
-    if cancel_requested:
-        # The response proves the remote conversion ended. Its activity/provider
-        # accounting belongs to that completed call; no second billing here.
-        raise JobLaufAbgebrochen({
-            "ledger": "vom_dokumentlauf", "mode": "drained", "remote_finished": True,
-        })
-    return result
+        get_prompt_metrics().record(
+            app_id=attribution.get("app_id"), agent_id="dokument-konvertierung",
+            workflow_id=attribution.get("workflow_id"), model="docling",
+            duration_ms=duration, status=state, user_id=attribution.get("user_id"),
+        )
+        await persist_ai_call_activity(
+            provider=PROVIDER_LOCAL, app_id=attribution.get("app_id"),
+            user_id=attribution.get("user_id"), agent_id="dokument-konvertierung",
+            workflow_id=attribution.get("workflow_id"), model="docling",
+            input_tokens=0, output_tokens=0, status=state, duration_ms=duration,
+            app_env=attribution.get("app_env"), bridge_origin=attribution.get("bridge_origin"),
+            _call_uid=str(uuid.UUID(call_id)),
+        )
+    except Exception as exc:
+        logger.error("document completion tracking failed (%s)", type(exc).__name__)

@@ -289,6 +289,10 @@ async def run_generic_job(
     The claim is conditional (BR10): a job its owner cancelled between submit
     and this dispatch — or one the watchdog already took — is not 'pending'
     any more, and running it anyway would do (and bill) work nobody wants."""
+    if kind == "document-convert":
+        from .document import run_document_job
+        await run_document_job(job_id, payload, attribution)
+        return
     if not await store_client.mark_running(job_id):
         logger.warning(
             f"⏭️ Async job {job_id} (kind={kind}) not started: no longer pending "
@@ -303,10 +307,15 @@ async def _run_body(
     kind: str,
     payload: Dict[str, Any],
     attribution: Optional[Dict[str, Any]],
+    document_attempt: int | None = None,
 ) -> None:
     """Execute one job that is ALREADY marked 'running'. Heartbeats for the whole
     run; records done/error. Never raises — a crash is persisted as status='error'
     (fail loud, queryable) so the job never sits non-terminal."""
+    if kind == "document-convert":
+        from .document import run_document_job
+        await run_document_job(job_id, payload, attribution, document_attempt)
+        return
     # ADR-0011: restore the job's HOME-bridge origin into this task's context.
     # The job body runs OUTSIDE the original request (spawned task, or a
     # reclaim after restart) — without this, every budget/ledger call during
@@ -521,7 +530,7 @@ async def run_claim_pass(stale_seconds: int, max_attempts: int) -> int:
         if job is None:
             break
         # Already claimed (status=running, attempts bumped) → run the body only.
-        spawn(_run_body(job["job_id"], job["kind"], job.get("payload") or {}, job.get("attribution")))
+        spawn(_run_body(job["job_id"], job["kind"], job.get("payload") or {}, job.get("attribution"), job["attempts"]))
         requeued += 1
         why = (
             f"deferred wait over ({job.get('defer_reason') or '?'})"

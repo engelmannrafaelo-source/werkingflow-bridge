@@ -1,121 +1,127 @@
 # Dokumentkonvertierung als Job
 
-Stand 23.10.2026. Jobart `document-convert`; dieselbe Konvertierung wie
-`POST /v1/document/convert`, einschließlich Multipart-Feldern und Attribution.
-Der bestehende Multipart-Endpunkt bleibt verfügbar. Kein JSON-Proxy auf Multipart.
+Stand 23.10.2026, Folgeauftrag Dokumentdienst. Implementierter Feature-Zweig,
+**noch nicht zweitgeprüft, integriert oder ausgeliefert**. Große Dokumente und
+Postgres-CAS sind nicht Ende-zu-Ende abgenommen. Keine L4-/L6-Vollabnahme.
 
-## Einreichen und Abholen
+## Öffentlicher Auftrag
 
-Authentifiziert `POST /v1/jobs`, mit denselben Owner-/App-/User-/Umgebungsheadern
-wie andere Jobs. Voraussetzung: generische Jobs und ihr persistenter Store aktiv.
+Authentifiziert `POST /v1/jobs`, `kind=document-convert`, bestehende
+Owner-/App-/User-/Home-Bridge-Bindung und `Idempotency-Key` wie bei anderen Jobs:
 
 ```json
 {
   "kind": "document-convert",
   "payload": {
-    "filename": "example.txt",
-    "content_type": "text/plain",
-    "content_base64": "SGFsbG8=",
-    "fields": {"describe_images": "false"}
+    "filename": "example.csv",
+    "content_type": "text/csv",
+    "content_base64": "YSxiCngsMQo=",
+    "fields": {"describe_images": "false"},
+    "deadline_at": "2026-11-01T12:00:00+00:00"
   }
 }
 ```
 
-`content_base64` enthält Standard-Base64 der Originaldatei, keinen Data-URI.
-`fields` enthält ausschließlich Stringwerte; `file` ist reserviert.
-Der Store enthält damit die Originalbytes, nicht eine öffentliche Downloadadresse.
-Die Authentifizierung und Formatprüfung des Dokumentdienstes bleiben wirksam.
-Base64 vergrößert den HTTP-/DB-Payload um ungefähr ein Drittel. Das bestehende
-nginx-Limit von 75M gilt für das gesamte JSON: weniger als ca. 56 MiB Rohdatei
-passen hinein (zusätzlich JSON-/Feld-Overhead), nicht 75 MiB wie bei Multipart.
-Dies ist nur eine obere Transportgrenze, keine bestätigte End-to-end-Kapazität.
-Der Platform-API-/DB-Pfad und sein vorhandener Schreibtimeout sind für große
-Dokumente noch nicht vermessen; große Uploads sind vor Auslieferung offen.
-Keine neue Umgebungsvariable. Ergebnis und Quelldaten nicht in Logs oder öffentliche Pfade legen.
+`deadline_at` ist optional, absolut und zeitzonengebunden. Es gehört zum
+unveränderlichen Auftragsdigest; Retry verlängert es nicht. Ohne Frist gibt es
+keine lokale Ersatzfrist. `fields` enthält nur Stringwerte; `file` ist reserviert.
+Base64 ist strikt, Dateiname/Content-Type enthalten kein CR/LF/NUL. Fehler nennen
+keine Eingabewerte. Gleicher Idempotenzschlüssel und Owner liefert dieselbe
+Job-ID; anderer Inhalt weiterhin **422** gemäß generischem Submit-Vertrag.
 
-Job-ID vor dem ersten Poll in der aufrufenden Arbeitsakte speichern.
-`GET /v1/jobs/{id}` liefert pending/running/done/error/cancelled und Fortschritt;
-bei done enthält dieselbe Antwort das Ergebnis.
-Darin ist `result` die Dokumentantwort mit `success`, `format`, `markdown`,
-`metadata` und gegebenenfalls Bildern. HTTP- und fehlerhafte JSON-Antworten werden
-nicht als erfolgreiche Konvertierung gespeichert. Nicht-JSON und unvollständiges
-Ergebnisschema sind terminale Fehler. Erneutes GET startet keine Konvertierung.
+`GET /v1/jobs/{id}` bleibt Ergebnisweg. Zustände bleiben
+pending/running/done/error/cancelled; kein neues `expired`-Enum. Fristablauf wird
+als cancelled mit `progress.abbruch.reason=deadline_expired` und Stop-Beleg
+sichtbar. Ein erfolgreiches Resultat enthält `success`, `format`, `markdown`,
+`metadata`, optionale Bilder sowie `call_id` und `attempt_id`.
 
-## Lebensdauer und Wiederaufnahme
+## Remote-Identität und Fencing
 
-Keine Gesamt-Wanduhrfrist im neuen Executor oder im Bridge-Konvertierungsproxy.
-Der Runner hält den bestehenden Heartbeat; nach Worker-Verlust übernimmt der
-bestehende Watchdog gemäß dessen Claim-/Versuchsregeln. Dies ist at-least-once:
-ein Worker-Verlust kann eine zweite Remote-Konvertierung verursachen. Ein
-Transportabbruch wird deshalb mit unbekanntem Remote-Ausgang als nicht automatisch
-wiederholbarer Fehler gemeldet. Der Watchdog ist keine Remote-Ausführungsquittung.
+Der Dokumentrunner benutzt die private authentifizierte Dienst-API
+`PUT|GET|DELETE /document/calls/{call_id}`. Er fällt bei fehlender API nicht auf
+den synchronen Endpunkt zurück. `call_id` wird aus Home-Bridge und serverseitiger
+Job-ID gebunden; Workerwechsel ändern es nicht. Der Dienst vergibt `attempt_id`
+bei persistenter Annahme. Quelle, Optionen, Reparaturmodus und Frist werden
+vor dem Start atomar veröffentlicht. Wiederholtes PUT liefert denselben Attempt;
+abweichender Digest dort **409**. GET liefert accepted/running/done/error/
+cancelled/interrupted/unknown. Diese internen Zustände sind kein neuer öffentlicher
+Jobstatus.
 
-Am gelesenen Basisstand 9be0986 beträgt die terminale Aufbewahrung **2 Stunden**
-(`GENERIC_JOB_TTL_SECONDS`), nicht mehr 15 Minuten. Mit `Idempotency-Key` bleibt
-der terminale Datensatz mindestens **24 Stunden** (`IDEMPOTENCY_RETENTION_SECONDS`).
-Running-Jobs werden nicht wegen ihres Alters beendet oder gelöscht. Auch
-Pending-Dokumentjobs sind vom generischen Alters-Backstop ausgenommen.
-Kapazitäts-/Abhängigkeits-Parken endet für Dokumentjobs nicht mehr am lokalen
-Deferral-Zähler; die Warteintervalle bleiben Taktraten. Nach terminaler Aufbewahrung liefert GET 404;
-der Aufrufer muss fertige Ergebnisse rechtzeitig in seiner eigenen Ablage sichern.
+Bei Antwortverlust zuerst GET; bei unbekanntem Remote-Ausgang kein neuer Attempt.
+Workerwechsel liest denselben laufenden Attempt oder sein gespeichertes Ergebnis.
+Ein fehlender Guardian ohne Quittung bleibt unknown und braucht Aufklärung;
+keine automatische erneute bezahlte Ausführung. Nach Dienstverlust quittiert der
+unabhängige Guardian lokal interrupted. Dies ist ein technischer Fehler, kein
+lokaler Zeit-/Versuchsabbruch. Es gibt noch keine Wiederaufnahme einzelner
+Docling-/Vision-Teilschritte nach einem solchen Ende.
 
-Der bestehende `Idempotency-Key`-Vertrag gilt bereits: gleicher Owner, Schlüssel,
-Jobart und Payload ergeben dieselbe Job-ID, ein abweichender Payload wird abgelehnt.
-L6 `call_id`/`attempt_id` ist damit nicht implementiert: diese spätere Erweiterung
-gehört in den gemeinsamen Jobvertrag samt Remote-Abgleich, nicht in freie
-Multipart-Felder. Noch keine neue Semantik oder Exactly-once-Zusage für diese IDs.
+`ai_jobs.attempts` ist der monoton steigende Claim-Fence. Der neue interne
+`document-state`-Weg prüft Claim, Zustand und Abbruchwunsch unter derselben
+Postgres-Zeilensperre. Heartbeat, Fortschritt, done, error und cancelled sind
+bedingt. Veraltete generische Mutatoren dürfen Dokumentzeilen nicht schreiben.
+Der Watchdog übernimmt stale Dokumente auch bei Abbruchwunsch zum Remote-Abgleich;
+er schließt sie weder nach Versuchszähler noch ohne Remote-Quittung. Frische
+Claims und Watchdog-Claims verwenden denselben Fence. Andere Jobarten behalten
+ihren bestehenden Vertrag. Platform-API, Worker und Dokumentdienst müssen vor
+Nutzung dieses Vertrags zusammenpassen; kein Upgrade laufender alter Dokumentjobs.
 
-## Abbruch: ausdrücklich begrenzter Vertrag
+## Ressourcenstopp und Abbruch
 
-`DELETE /v1/jobs/{id}` nutzt die bestehende Ownerprüfung. Pending kann sofort
-cancelled werden. Running vermerkt den Wunsch und antwortet zunächst 202;
-der Statusfortschritt wird `cancel-requested-draining-conversion`.
-Der entfernte Dienst führt synchrone Konverter in Threads aus und bietet noch
-keine Stop-Quittung. Daher bleibt der Heartbeat aktiv, bis die Konvertierung eine
-erfolgreiche vollständige Antwort geliefert hat. Erst dann wird cancelled mit
-`mode=drained`, `remote_finished=true`, `ledger=vom_dokumentlauf` quittiert.
-Dieser ausdrückliche Nutzerabbruch verwirft das später eingetroffene Markdown;
-bereits entstandene Kosten werden dadurch nicht rückgängig gemacht.
-`vom_dokumentlauf` bedeutet abgeschlossener Konvertierungslauf, keinen Parkvorgang
-und keine zweite Buchung durch den Jobexecutor. Eine Antwort, die vor Beobachtung
-des Abbruchwunschs fertig war, bleibt done. Fehler bleiben sichtbar als error,
-ein Verbindungsverlust ist kein bestätigter Abbruch.
+`DELETE /v1/jobs/{id}` nutzt weiter die Ownerprüfung. Pending kann sofort enden;
+Running registriert den Wunsch. Der Runner persistiert DELETE am Remote-Dienst.
+DELETE vor dessen PUT erzeugt einen Tombstone, der auch verspätete alte PUTs
+fenced. Erst nach lokaler Reap-Quittung darf der Job cancelled werden. Ein
+Nutzerabbruch, der unter der DB-Zeilensperre vor done gewinnt, verhindert spätes
+done. Fertige Remote-Ergebnisse bleiben auch bei verworfenem Job-Ergebnis erhalten.
 
-**Dies ist noch kein sofortiger Ressourcenabbruch beim Dokumentdienst.** Auch
-eine Nutzer-/Gesamtfrist kann zunächst nur diesen Abbruchwunsch stellen. Für die
-vollständige L4-Abnahme ist eine Remote-Stop-/Attempt-Schnittstelle erforderlich.
-Ein hängender Remote-Dienst kann deshalb dauerhaft running/202 bleiben: Der
-Heartbeat beweist den lebenden Runner, nicht den Fortschritt des Konverters.
-Die Connection-Pool-Wartezeit ist ebenfalls nicht begrenzt. Ohne gebundenen
-Owner (z.B. fehlender Attribution-Extractor) gilt der bestehende Legacy-Vertrag:
-Running-DELETE antwortet 409; kein Drain-Abbruch wird versprochen.
-Die internen 300-s-Fristen von LibreOffice und Dokument-Vision sowie der
-600-Seiten-Deckel bleiben vorerst bestehen. Ihre ersatzlose Entfernung würde
-auch den gemeinsam genutzten synchronen Dienst betreffen und kann dort Plätze
-dauerhaft belegen. Erst ein wirklicher Remote-Ressourcenstopp erlaubt den Umbau.
-**L4 bleibt deshalb ROT; der Gesamtauftrag ist mit diesem Teilbau nicht erfüllt.**
+Der Konverter läuft mit Docling/LibreOffice/Vision in einer eigenen Prozessgruppe.
+Ein separater Linux-Subreaper beendet die Gruppe und adoptierte Nachkommen. Er
+quittiert erst nach Reaping. Dienstverlust schließt seinen Kontrollkanal; die
+ursprüngliche Gesamtfrist überwacht er zusätzlich selbst. LibreOffice hat ein
+eigenes Profil, damit es nicht an einen fremden Prozess delegiert.
 
-Unbegrenztes Parken bedeutet: Fällt eine Abhängigkeit dauerhaft aus und sendet
-der Aufrufer kein DELETE, bleiben die Originalbytes unbegrenzt im Jobstore.
-Es gibt noch keine `deadline_at`-Unterstützung. Alle Retry-Intervalle fallen weiter
-an, einschließlich erneuter Payload-Übertragung; gleichbleibende Deferral-Gründe
-werden nur auf DEBUG protokolliert, neue Gründe auf WARNING. Der erste Fehler
-der Cancel-Abfrage wird gemeldet, gleichartige Wiederholungen bleiben still,
-die Erholung wird auf INFO gemeldet. Eine fehlende Cancel-Route meldet einmal
-ERROR und beendet weitere Cancel-Polls; die Konvertierung selbst läuft weiter.
+Die Quittung belegt **lokale** Ressourcenfreigabe. Vor jedem Vision-Aufruf wird
+ein Pending-Beleg fsync-gesichert, erst eine empfangene Anbieterantwort entfernt
+ihn. Nach lokalem Stop kann Anbieterarbeit unbekannt bleiben. Dann lautet der
+Abbruchledger `unbekannt`, niemals bestätigte Anbieter-Stornierung oder Kosten-
+Rücknahme. Guardian-SIGKILL/Hostverlust ohne Quittung bleibt ebenfalls unbekannt.
+Ein lebender, hängender Konverter ohne Nutzerabbruch oder Gesamtfrist darf weiter
+laufen; Heartbeat ist keine Aussage über fachlichen Fortschritt.
 
-## Verbleibende Grenzen und L6-Anschluss
+## Grenzen und Aufbewahrung
 
-Siehe [Lebenszyklus und Remote-Attempt-Vertrag](document-attempts-design.md).
-Dort sind verbleibende Grenzen, der erforderliche Ressourcenstopp und der
-Unterschied zwischen vorhandener Submit-Idempotenz und fehlendem Attempt-Reconcile
-explizit festgehalten. Das Dokument ist ein Entwurf, keine vorhandene Remote-API.
+- Managed Konverter: keine 300-s-LibreOffice-/Vision-Frist, kein 600-Seiten-Abbruch.
+- Legacy `/convert-pdf` und `/document/convert-and-anonymize`: noch Threads und
+  bisherige Fristen. `/document/convert` nutzt ebenfalls den Reaper, ist aber
+  synchron; ein Client-/nginx-Abbruch fordert lokalen Stop.
+- Vision-Verbindungsaufbau 10 s; Remote-Kontrollversuche 30 s; Store-Schreiben 10 s.
+  Das sind Einzelversuche. Remote-Ausgang und fertige Ergebnisse werden danach
+  abgeglichen, kein neuer fachlicher Auftrag erzeugt.
+- Docling-Batchgröße 25, Renderbudget 384 MiB, Vision-Ausgabe 1500/1200 Tokens,
+  Semaphore gemäß `BRIDGE_MAX_CONCURRENT_CONVERSIONS`: Arbeits-/Antwort-/Speicher-
+  grenzen. Renderüberschreitung bleibt 413. Keine Garantie vollständiger Abdeckung.
+- nginx JSON 75 MiB: Base64-Datei weniger als ca. 56 MiB einschließlich
+  Envelope-Reserve. Dokumentdienst selbst: 100 MiB Multipart. Dies sind
+  Transportgrenzen, **keine nachgewiesene E2E-Größenfreigabe**.
+- Terminaler Jobstore: 2 h, mit Idempotenz mindestens 24 h. Aktive Dokumentjobs
+  enden nicht wegen ihres Alters oder Deferralzählers.
+- Remote-Daten unter `/var/lib/bridge-document-jobs`, privates Docker-Volume,
+  Verzeichnis 0700. Keine öffentliche URL. Volume darf bei Recreation nicht
+  erneuert/gelöscht werden. Noch kein ACK-/Retention-Cleanup: Original und Ergebnis
+  bleiben bestehen. Betriebsfähiger begrenzter Speicher ist vor Deploy nachzuweisen.
 
-## Pyramiden-Prüfkontext (vor Auslieferung)
+Keine neue Umgebungsvariable. Bestehende ActualText-Reparatureinstellung wird als
+unveränderlicher Remote-Vertragswert übertragen und im isolierten Prozess
+angewandt. Lokale Dokumentaktivität verwendet eine stabile Call-UID;
+Attribution bleibt aus dem gespeicherten Auftrag. Best-effort-Metrik kann bei
+Workerverlust nach Jobabschluss fehlen; der persistente Job/Remote-Beleg bleibt.
 
-Synthetischer kalter Eingang; gleiche ID über Poll-/Workerwechsel; Lauf länger als
-bisherige 600/1200 Sekunden; erfolgreiche Abholung; 415/413 und fehlerhaftes JSON;
-Pending-/Running-Abbruch einschließlich Ergebnisrennen; Remote-Verlust ohne falsche
-Stop-Quittung; Besitzerwechsel; Idempotency-Replay und abweichende Bytes; Aufbewahrung
-2h/24h; große Base64-Payloads durch nginx, Platform-API, DB und Watchdog-Claim
-bei Parallelität einschließlich Prozessspeicher (2-GB-Betriebsgrenze). Kein Live-Lauf und keine vollständige L4-Abnahme mit diesem Entwurf behauptet.
+## Prüfkontext
+
+Bereits lokal mit synthetischem Material geprüft: Annahme/Replay/Digestkonflikt,
+CSV-Ergebnis mit Reap, Running-Abbruch, Tombstone vor verspätetem PUT,
+Frist vor Start, verpflichtende Auth auch im Übergangsmodus, persistentes
+Zurücklesen, fehlende Guardian-Quittung und Owner-Pipe-Verlust.
+Offen: Postgres-CAS unter konkurrierenden Workern, voller nginx → Platform-API →
+DB → Watchdog-Pfad mit großen Dateien, Store-Antwortverlust, GPU-/PDF-Peaks,
+bezahlte Vision-Reconciliation und Opus-Abnahme. Keine neuen Unit-Tests.

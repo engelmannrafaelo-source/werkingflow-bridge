@@ -491,6 +491,18 @@ async def mark_done(job_id: str, result: Optional[Dict[str, Any]]) -> None:
         raise _unexpected("mark_done", resp.status_code, resp.json)
 
 
+async def document_state(job_id: str, attempt: int, action: str, value: dict | None = None) -> dict:
+    # Fail closed on an old platform-api. Never fall back to unfenced writes.
+    resp = await call_platform(
+        "POST", f"/v1/internal/jobs/{job_id}/document-state",
+        json={"attempt": attempt, "action": action, "value": value or {}},
+        timeout_s=_WRITE_TIMEOUT_S,
+    )
+    if resp.status_code != 200 or not isinstance(resp.json, dict) or "owned" not in resp.json:
+        raise _unexpected("document_state", resp.status_code, resp.json)
+    return resp.json
+
+
 async def mark_error(
     job_id: str,
     message: str,

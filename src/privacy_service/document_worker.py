@@ -5,25 +5,42 @@ import asyncio
 import json
 from pathlib import Path
 import sys
+import time
 
 from .document_process import write_json
 
 
 async def convert(directory: Path) -> dict:
+    started = time.monotonic()
     from . import document_execution
     document_execution.managed = True
+    document_execution.provider_directory = directory
     from .adapters import build_default_chain
     from .image_describer import describe_images, append_descriptions_to_markdown
     from .image_triage import plan_image_descriptions
 
     request = json.loads((directory / "request.json").read_text())
     fields = request["fields"]
-    result = build_default_chain().convert(
-        (directory / "source").read_bytes(), request["filename"], request["mime_type"],
-    )
+    source = (directory / "source").read_bytes()
+    if request.get("repair_actualtext") and (
+        source.startswith(b"%PDF") or request["filename"].lower().endswith(".pdf")
+        or "pdf" in (request["mime_type"] or "").lower()
+    ):
+        from src.privacy.pdf_actualtext_repair import repair_actualtext_glyphs
+        repaired = repair_actualtext_glyphs(source)
+        if repaired.hint:
+            # Value-free diagnostic; the converter result carries the warning.
+            repair_warning = True
+        else:
+            repair_warning = False
+        source = repaired.pdf
+    else:
+        repair_warning = False
+    result = build_default_chain().convert(source, request["filename"], request["mime_type"])
+    if repair_warning:
+        result.metadata["actualtext_repair_warning"] = True
     body = result.to_response()
     if str(fields.get("describe_images", "")).lower() in ("1", "true", "yes", "on") and result.images:
-        write_json(directory / "vision-started", {"started": True})
         selected, skipped, triage = await plan_image_descriptions(
             result.images, triage_prompt=fields.get("triage_prompt") or "",
         )
@@ -37,6 +54,7 @@ async def convert(directory: Path) -> dict:
         if triage:
             body["described_count"] = len(selected)
             body["triage"] = triage
+    body["conversion_time_seconds"] = round(time.monotonic() - started, 2)
     return body
 
 

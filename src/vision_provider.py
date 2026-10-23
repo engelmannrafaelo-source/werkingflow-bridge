@@ -378,6 +378,9 @@ class VisionProvider:
 
         adapt_model_request(model, request_body)
 
+        # Durable evidence for managed document calls, inert for other users.
+        from src.privacy_service.document_execution import provider_started, provider_finished
+        pending_document_call = provider_started()
         # Make API request
         async with httpx.AsyncClient(timeout=timeout) as client:
             response = await client.post(
@@ -390,6 +393,7 @@ class VisionProvider:
                 json=request_body
             )
 
+        provider_finished(pending_document_call)
         if response.status_code != 200:
             error_body = response.text
             logger.error(
