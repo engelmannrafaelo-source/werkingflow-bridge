@@ -121,3 +121,21 @@ Opus R2 nennt Unit-Tests als Integrationsbedingung. Maßgeblich bleibt der
 explizite Auftrag: keine neuen Unit-Tests, stattdessen Architektur-/Pyramidenbelege
 für Prune-Ausnahme, Deferral nach bisheriger Zählgrenze, fehlende Cancel-Route und
 Poll-Fehler/Erholung. Solche Laufbelege sind mit diesem Teilbau nicht erbracht.
+
+## Bauabschnitt Ressourcenstopp (23.10.2026, Folgeauftrag)
+
+`/document/convert` verwendet jetzt einen separaten Konverterprozess und einen
+Linux-Subreaper. Docling, LibreOffice, Triage und Bildbeschreibung gehören zum
+Kindprozess. Nach Clientverlust oder Abbruch des Dienst-Tasks schließt der
+Kontrollkanal; der Reaper beendet die Prozessgruppe und sammelt auch adoptierte
+Nachkommen ein. Erst danach schreibt er eine fsync-gesicherte lokale Quittung.
+Dies ersetzt den Thread für diesen Endpunkt; `/convert-pdf` und
+`/document/convert-and-anonymize` behalten vorerst ihren bisherigen Vertrag.
+
+Die Quittung bestätigt ausschließlich lokale Ressourcen. Für gestartete Vision
+kann nach Abbruch der Anbieter-Ausgang unbekannt sein. Ein getöteter Reaper,
+Hostverlust oder fehlende Quittung ist niemals ein bestätigter Stop. Ein
+Dienst-/Worker-Neustart braucht zusätzlich den persistenten Attempt-Abgleich
+(Bauabschnitt 3). Die internen Konverterfristen bleiben in Abschnitt 1 bestehen.
+Synthetischer CSV-Lauf: Ergebnis 200, Konverter-Exit 0, Reap-Quittung vorhanden;
+keine KI-Anfrage. Noch keine Opus-Prüfung dieses Folgeabschnitts.
