@@ -98,7 +98,7 @@ class Schritt(Vertrag):
     versuch: int = Field(ge=1, le=2)
     status: Literal["ok", "abbruch"]
     abbruch_grund: str | None = Field(
-        pattern=(r"^(zeit|speicher|cli_fehler|geheimnis_im_ergebnis|"
+        pattern=(r"^(stille|zeit|speicher|cli_fehler|geheimnis_im_ergebnis|"
                  r"platz_neustart|konto|unbekannt)(: .*)?$")
     )
     dauer_s: float = Field(ge=0)

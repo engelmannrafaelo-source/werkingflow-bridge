@@ -979,6 +979,7 @@ services:
       HTTP_PROXY: http://erkunder-ausgang:8888
       NO_PROXY: erkunder
       CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1"
+      ERKUNDER_STILLE_S: ${ERKUNDER_STILLE_S:-1800}
       ERKUNDER_INTERNAL_TOKEN: ${ERKUNDER_INTERNAL_TOKEN:-}
     volumes:
       - erkunder-arbeit:/arbeit
@@ -1010,6 +1011,7 @@ services:
       HTTP_PROXY: http://erkunder-ausgang:8888
       NO_PROXY: erkunder
       CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1"
+      ERKUNDER_STILLE_S: ${ERKUNDER_STILLE_S:-1800}
       ERKUNDER_INTERNAL_TOKEN: ${ERKUNDER_INTERNAL_TOKEN:-}
     volumes:
       - erkunder-arbeit:/arbeit
@@ -1041,6 +1043,7 @@ services:
       HTTP_PROXY: http://erkunder-ausgang:8888
       NO_PROXY: erkunder
       CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1"
+      ERKUNDER_STILLE_S: ${ERKUNDER_STILLE_S:-1800}
       ERKUNDER_INTERNAL_TOKEN: ${ERKUNDER_INTERNAL_TOKEN:-}
     volumes:
       - erkunder-arbeit:/arbeit

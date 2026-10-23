@@ -523,7 +523,6 @@ class Coordinator:
                             "schritt": name,
                             "ordner": str(self.directory(ident) / name),
                             "prompt": prompt,
-                            "timeout_s": 1200,
                             "max_turns": 100,
                             "claude_token": self.tokens[ident],
                             "modell": state["auftrag"].get("modell", VORGABE_MODELL),
@@ -531,13 +530,6 @@ class Coordinator:
                     )
                     response.raise_for_status()
                 while True:
-                    if time.time() - state["active"][name]["started"] > 1260:
-                        response = await self.client.post(
-                            self.places[slot] + "/abbrechen", headers=self.headers()
-                        )
-                        response.raise_for_status()
-                        meta = {"status": "abbruch", "abbruch_grund": "zeit"}
-                        break
                     response = await self.client.get(
                         f"{self.places[slot]}/schritt/{ident}/{name}",
                         headers=self.headers(),
@@ -720,7 +712,7 @@ class Coordinator:
             "prompt_version": PROMPT_VERSION,
             "modell": state["auftrag"].get("modell", VORGABE_MODELL),
             "schritte": [
-                {k: v for k, v in item.items() if k not in {"sha256", "diagnose"}}
+                {k: v for k, v in item.items() if k not in {"sha256", "diagnose", "sdk"}}
                 for item in state["schritte"]
             ],
             "erkunder_ausgefallen": failed,
