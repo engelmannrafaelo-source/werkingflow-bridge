@@ -33,6 +33,7 @@ Auth model:
 """
 import json
 import logging
+import re
 import uuid
 from datetime import date, datetime, timezone
 from typing import Optional, List, Any, Dict
@@ -50,7 +51,7 @@ from src.identity.tenant_lifecycle import (
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, ConfigDict, EmailStr, Field
+from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator
 
 from src.api_auth import require_admin, require_jwt_or_service, require_self_or_admin, AuthClaims, get_tenant_of_user
 from src.billing import billing_service
@@ -1854,11 +1855,26 @@ async def _check_tenant_admin_role(claims: AuthClaims, tenant_id: str, conn: Any
         )
 
 
+# Format rules for identity fields (Befund R-2, 24.10.2026). Empty strings
+# stay valid: the portal form and werking-report send '' for unset fields.
+_PLZ_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 \-]{2,8}[A-Za-z0-9]$")  # 4-10 chars
+_EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+# Optional extension suffix ("Dw. 12", "DW 12", "ext. 12") is common in DE/AT.
+_PHONE_RE = re.compile(r"^\+?[0-9 ()/.\-]+(?:\s*(?:[Dd][Ww]\.?|[Ee]xt\.?|Durchwahl)\s*[0-9]+)?$")
+
+
 class _AdresseField(BaseModel):
     strasse: Optional[str] = Field(default=None, max_length=200)
     hausnummer: Optional[str] = Field(default=None, max_length=20)
     plz: Optional[str] = Field(default=None, max_length=10)
-    ort: Optional[str] = Field(default=None, max_length=200)
+    ort: Optional[str] = Field(default=None, max_length=100)
+
+    @field_validator("plz")
+    @classmethod
+    def _plz_form(cls, v: Optional[str]) -> Optional[str]:
+        if v and not _PLZ_RE.match(v):
+            raise ValueError("PLZ: 4-10 Zeichen, nur Ziffern, Buchstaben, Leerzeichen oder Bindestrich")
+        return v
 
 
 class _FirmaField(BaseModel):
@@ -1885,6 +1901,55 @@ def _jsonb(raw: Any) -> Dict[str, Any]:
         except Exception:
             return {}
     return raw or {}
+
+
+_STAMMDATEN_MERGE_MAX_DEPTH = 4
+_STAMMDATEN_MERGE_MAX_OBJECTS = 64
+
+
+def _count_objects(value: Any, depth: int = 0) -> int:
+    if not isinstance(value, dict):
+        return 0
+    if depth > _STAMMDATEN_MERGE_MAX_DEPTH:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Stammdaten patch nested too deep (max {_STAMMDATEN_MERGE_MAX_DEPTH} levels)",
+        )
+    return 1 + sum(_count_objects(v, depth + 1) for v in value.values())
+
+
+def _jsonb_deep_merge_sql(target: str, patch: Dict[str, Any], args: List[Any]) -> str:
+    """SQL expression that deep-merges ``patch`` into the JSONB ``target``.
+
+    Objects are merged key by key at every level; scalars, arrays and explicit
+    nulls in the patch replace the stored value. Keys absent from the patch keep
+    their stored value. Parameters are appended to ``args`` (no value or key is
+    interpolated into the SQL text). Runs as part of one UPSERT, so the merge
+    sees the row under the ON CONFLICT row lock — no read-modify-write race.
+
+    Befund R-2 (24.10.2026): the previous top-level ``||`` replaced a nested
+    object wholesale, so PATCH {gutachter:{vorname}} dropped nachname with 200.
+    """
+    if _count_objects(patch) > _STAMMDATEN_MERGE_MAX_OBJECTS:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Too many nested objects in stammdaten patch (max {_STAMMDATEN_MERGE_MAX_OBJECTS})",
+        )
+
+    def build(tgt: str, obj: Dict[str, Any]) -> str:
+        expr = f"(CASE WHEN jsonb_typeof({tgt}) = 'object' THEN {tgt} ELSE '{{}}'::jsonb END)"
+        flat = {k: v for k, v in obj.items() if not isinstance(v, dict)}
+        if flat:
+            args.append(json.dumps(flat))
+            expr = f"({expr} || ${len(args)}::jsonb)"
+        for key, sub in obj.items():
+            if isinstance(sub, dict):
+                args.append(key)
+                kp = len(args)
+                expr = f"({expr} || jsonb_build_object(${kp}::text, {build(f'({tgt} -> ${kp}::text)', sub)}))"
+        return expr
+
+    return build(target, patch)
 
 
 def _tenant_stammdaten_row(r: Any) -> Dict[str, Any]:
@@ -1944,34 +2009,35 @@ async def patch_tenant_stammdaten(
 
         # Build the upsert with merge semantics per field.
         # Only fields present in the request body change; absent fields keep their current value.
-        firma_json = (
-            json.dumps(body.firma.model_dump(exclude_none=True)) if body.firma is not None else None
-        )
+        # firma is deep-merged (firma.adresse too) — Befund R-2, 24.10.2026.
+        firma_patch = body.firma.model_dump(exclude_none=True) if body.firma is not None else None
         style_json = (
             json.dumps(body.styleSettings) if body.styleSettings is not None else None
         )
 
-        # We need COALESCE(existing, '{}') || patch for merge — done in SQL.
         sets = ["updated_at = NOW()", "updated_by = $1"]
-        args: List[Any] = [actor_id]
+        args: List[Any] = [actor_id, tenant_id]
+        # First write (no row yet) must persist the patch too; before R-2 the
+        # INSERT branch stored '{}' and silently dropped firma/logo/style.
+        args.append(json.dumps(firma_patch) if firma_patch is not None else None)
+        ins_firma = len(args)
+        args.append(body.logo)
+        ins_logo = len(args)
+        args.append(style_json)
+        ins_style = len(args)
 
-        if firma_json is not None:
-            args.append(firma_json)
-            sets.append(f"firma = COALESCE(tenant_stammdaten.firma, '{{}}'::jsonb) || ${len(args)}::jsonb")
+        if firma_patch is not None:
+            merged = _jsonb_deep_merge_sql("COALESCE(tenant_stammdaten.firma, '{}'::jsonb)", firma_patch, args)
+            sets.append(f"firma = {merged}")
         if body.logo is not None:
-            args.append(body.logo)
-            sets.append(f"logo = ${len(args)}")
+            sets.append(f"logo = ${ins_logo}")
         if style_json is not None:
-            args.append(style_json)
-            sets.append(f"style_settings = COALESCE(tenant_stammdaten.style_settings, '{{}}'::jsonb) || ${len(args)}::jsonb")
-
-        args.append(tenant_id)
-        tenant_pos = len(args)
+            sets.append(f"style_settings = COALESCE(tenant_stammdaten.style_settings, '{{}}'::jsonb) || ${ins_style}::jsonb")
 
         r = await conn.fetchrow(
             f"""
             INSERT INTO tenant_stammdaten (tenant_id, firma, logo, style_settings, updated_at, updated_by)
-            VALUES (${tenant_pos}, '{{}}'::jsonb, NULL, '{{}}'::jsonb, NOW(), $1)
+            VALUES ($2, COALESCE(${ins_firma}::jsonb, '{{}}'::jsonb), ${ins_logo}, COALESCE(${ins_style}::jsonb, '{{}}'::jsonb), NOW(), $1)
             ON CONFLICT (tenant_id) DO UPDATE SET {", ".join(sets)}
             RETURNING firma, logo, style_settings, updated_at, updated_by
             """,
@@ -1981,17 +2047,71 @@ async def patch_tenant_stammdaten(
 
 
 # ---------------------------------------------------------------------------
-# User stammdaten — Gutachter-Identität (opaker JSONB-Blob)
+# User stammdaten — Gutachter-Identität (JSONB-Blob)
 #
-# Bridge speichert, werking-report validiert das Schema.
-# Keine tiefe Feld-Validierung hier — nur "ist ein Objekt, vernünftige Größe".
+# Unbekannte Felder werden unverändert gespeichert (extra="allow"). Die bekannten
+# Identitätsfelder (Namen, Adresse, Kontakt) prüft die Bridge auf Länge/Form,
+# weil Portal-Proxy und Apps den PATCH ungeprüft durchreichen (Befund R-2).
+# PATCH merged tief: fehlende Unterfelder bleiben erhalten.
 # ---------------------------------------------------------------------------
 
 _USER_STAMMDATEN_MAX_KEYS = 100  # sanity guard against pathological payloads
 
 
+# Known fields are typed ``str`` with default None: absent keys stay untouched
+# (exclude_unset), an explicit JSON null is a 422 instead of overwriting the
+# stored string with null, which the portal's GET schema cannot parse.
+
+
+class _UserAdresseField(_AdresseField):
+    model_config = ConfigDict(extra="allow")
+    strasse: str = Field(default=None, max_length=200)
+    hausnummer: str = Field(default=None, max_length=20)
+    plz: str = Field(default=None, max_length=10)
+    ort: str = Field(default=None, max_length=100)
+
+
+class _KontaktField(BaseModel):
+    model_config = ConfigDict(extra="allow")
+    telefon: str = Field(default=None, max_length=50)
+    email: str = Field(default=None, max_length=200)
+    fax: str = Field(default=None, max_length=50)
+
+    @field_validator("email")
+    @classmethod
+    def _email_form(cls, v: Optional[str]) -> Optional[str]:
+        if v and not _EMAIL_RE.match(v):
+            raise ValueError("E-Mail-Adresse hat keine gueltige Form (name@domain.tld)")
+        return v
+
+    @field_validator("telefon", "fax")
+    @classmethod
+    def _phone_form(cls, v: Optional[str]) -> Optional[str]:
+        if v and (not _PHONE_RE.match(v) or sum(c.isdigit() for c in v) < 3):
+            raise ValueError("Nummer: mindestens 3 Ziffern, erlaubt sind + Ziffern Leerzeichen ( ) / . - und Durchwahl (Dw./ext.)")
+        return v
+
+
+class _GutachterField(BaseModel):
+    model_config = ConfigDict(extra="allow")
+    titel: str = Field(default=None, max_length=100)
+    vorname: str = Field(default=None, max_length=100)
+    nachname: str = Field(default=None, max_length=100)
+    adresse: _UserAdresseField = None
+    kontakt: _KontaktField = None
+
+
+class _UserFirmaField(_FirmaField):
+    model_config = ConfigDict(extra="allow")
+    name: str = Field(default=None, max_length=300)
+    rechtsform: str = Field(default=None, max_length=100)
+    adresse: _UserAdresseField = None
+
+
 class UserStammdatenPatch(BaseModel):
     model_config = ConfigDict(extra="allow")
+    gutachter: _GutachterField = None
+    firma: _UserFirmaField = None
 
 
 def _user_stammdaten_row(r: Any) -> Dict[str, Any]:
@@ -2023,28 +2143,30 @@ async def patch_user_stammdaten(
     body: UserStammdatenPatch,
     claims: AuthClaims = Depends(require_self_or_admin),
 ) -> Dict[str, Any]:
-    patch_data = body.model_dump()
+    # exclude_unset: only keys the caller actually sent (typed optional fields
+    # must not turn into explicit nulls that would overwrite stored values).
+    patch_data = body.model_dump(exclude_unset=True)
     if len(patch_data) > _USER_STAMMDATEN_MAX_KEYS:
         raise HTTPException(
             status_code=400,
             detail=f"Too many fields in stammdaten patch (max {_USER_STAMMDATEN_MAX_KEYS})",
         )
 
-    patch_json = json.dumps(patch_data)
+    args: List[Any] = [uuid.UUID(user_id), json.dumps(patch_data)]
+    merged = _jsonb_deep_merge_sql("COALESCE(user_stammdaten.data, '{}'::jsonb)", patch_data, args)
 
     pool = get_pool()
     async with pool.acquire() as conn:
         r = await conn.fetchrow(
-            """
+            f"""
             INSERT INTO user_stammdaten (user_id, data, updated_at)
             VALUES ($1, $2::jsonb, NOW())
             ON CONFLICT (user_id) DO UPDATE
-              SET data = COALESCE(user_stammdaten.data, '{}'::jsonb) || EXCLUDED.data,
+              SET data = {merged},
                   updated_at = NOW()
             RETURNING data, updated_at
             """,
-            uuid.UUID(user_id),
-            patch_json,
+            *args,
         )
     return _user_stammdaten_row(r)
 
