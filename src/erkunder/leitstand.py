@@ -11,19 +11,23 @@ import os
 import re
 import shutil
 import stat
-import time
 import tempfile
+import time
+from collections.abc import Callable
 from contextlib import asynccontextmanager
+from http import HTTPStatus
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 import httpx
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict
 
 from .dateien import read_bytes, read_text
+from .diagnostik import details, safe_reason, step_record
+from .ereignisse import snapshot
 from .models import EINGANGSORDNER, VORGABE_MODELL, Auftrag
 from .prompts import (
     PROMPT_VERSION,
@@ -46,11 +50,13 @@ from .pruefkreis import (
 )
 from .quellen import kanalmanifest
 from .rechenstand import rechenstand
-from .ereignisse import snapshot
-from .diagnostik import details, safe_reason, step_record
 
 LOG = logging.getLogger(__name__)
 ID = re.compile(r"^[a-z0-9-]{8,80}$")
+
+
+class LeitstandHTTPError(HTTPException):
+    """An operator-safe, authored reason; never request or upstream content."""
 
 
 class Start(BaseModel):
@@ -101,10 +107,10 @@ class Coordinator:
 
     def directory(self, ident: str) -> Path:
         if not ID.fullmatch(ident):
-            raise HTTPException(400, "Ungültige bericht_id")
+            raise LeitstandHTTPError(400, "Ungültige bericht_id")
         path = self.root / ident
         if path.resolve().parent != self.root.resolve() or path.is_symlink():
-            raise HTTPException(400, "Pfad liegt außerhalb /arbeit")
+            raise LeitstandHTTPError(400, "Pfad liegt außerhalb /arbeit")
         return path
 
     def save(self, ident: str) -> None:
@@ -183,7 +189,7 @@ class Coordinator:
         if legacy.exists():
             paths.append(legacy)
         if not paths:
-            raise HTTPException(404, "Keine gesicherte Diagnose")
+            raise LeitstandHTTPError(404, "Keine gesicherte Diagnose")
         records = [json.loads(read_text(path)) for path in paths]
         records.sort(key=lambda record: record.get("lauf_start", 0), reverse=True)
         return {**records[0], "aeltere_laeufe": records[1:]}
@@ -207,17 +213,22 @@ class Coordinator:
                 )
                 response.raise_for_status()
             except httpx.HTTPError as error:
-                LOG.error("platz=%s bericht_trennung=fehlgeschlagen", slot)
-                raise HTTPException(
+                LOG.error(
+                    "platz=%s bericht_trennung=fehlgeschlagen status=%s grund=%s",
+                    slot,
+                    error.response.status_code if isinstance(error, httpx.HTTPStatusError) else "transport",
+                    type(error).__name__,
+                )
+                raise LeitstandHTTPError(
                     503, "Bericht-Trennung: Platz nicht bereinigt"
                 ) from error
 
-    async def startup(self) -> None:
+    async def startup(self, *, wait_s: float | None = None) -> None:
         async with self.startup_lock:
             if not self.ready:
-                await self.initialize()
+                await self.initialize(wait_s=wait_s)
 
-    async def initialize(self) -> None:
+    async def initialize(self, *, wait_s: float | None = None) -> None:
         # This lifecycle runs only in the standalone Leitstand, never in a worker.
         # HTTPX INFO and HTTPCore DEBUG expose signed download URLs.
         logging.getLogger("httpx").setLevel(logging.WARNING)
@@ -229,7 +240,8 @@ class Coordinator:
         # On expiry stay alive but unavailable, rather than entering a restart loop.
         self.ready = False
         if self.seal_reports():
-            deadline = time.monotonic() + self.startup_wait_s
+            wait_s = self.startup_wait_s if wait_s is None else wait_s
+            deadline = time.monotonic() + wait_s
             while True:
                 try:
                     async with asyncio.timeout(max(0.001, deadline - time.monotonic())):
@@ -240,8 +252,8 @@ class Coordinator:
                     if remaining <= 0:
                         LOG.error(
                             "Leitstand gesperrt: Plaetze nach %.1fs nicht bereit; "
-                            "POST /aufraeumen/<id> zum Bereinigen und Wiederholen",
-                            self.startup_wait_s,
+                            "naechster POST /start wiederholt die Bereinigung",
+                            wait_s,
                         )
                         return
                     LOG.warning("Leitstand wartet auf Plaetze; Vergabe gesperrt")
@@ -338,14 +350,14 @@ class Coordinator:
         ident = body.auftrag.bericht_id
         async with self.lock:
             if not self.ready:
-                raise HTTPException(503, "Leitstand wartet auf bereinigte Plaetze")
+                raise LeitstandHTTPError(503, "Leitstand wartet auf bereinigte Plaetze")
             if ident in self.states:
                 self.tokens[ident] = body.claude_token
                 self.states[ident]["worker"] = body.worker
                 self.token_ready[ident].set()
                 return {"angehaengt": True}
             if self.deploy_pending:
-                raise HTTPException(503, "Leitstand wird ausgerollt")
+                raise LeitstandHTTPError(503, "Leitstand wird ausgerollt")
             for other, state in self.states.items():
                 if state["zustand"] == "laeuft":
                     raise HTTPException(409, {"belegt": other})
@@ -890,7 +902,7 @@ class Coordinator:
     def status(self, ident: str) -> dict[str, Any]:
         self.directory(ident)
         if ident not in self.states:
-            raise HTTPException(404, "unbekannt")
+            raise LeitstandHTTPError(404, "unbekannt")
         state = self.states[ident]
         return {"schritt_diagnosen": [step_record(s) for s in state["schritte"] if s["status"] != "ok"], **{
             k: state[k]
@@ -900,7 +912,7 @@ class Coordinator:
 
     def result(self, ident: str) -> dict[str, Any]:
         if self.status(ident)["zustand"] != "fertig":
-            raise HTTPException(409, "noch nicht fertig")
+            raise LeitstandHTTPError(409, "noch nicht fertig")
         state = self.states[ident]
         texts: dict[str, str] = {}
         scripts: dict[str, dict[str, str]] = {}
@@ -1057,7 +1069,7 @@ class Coordinator:
                     evidence = self.archive_diagnostics(ident)
                 except Exception as error:
                     LOG.error("bericht_id=%s diagnosearchiv=fehlgeschlagen fehler=%s", ident, type(error).__name__)
-                    raise HTTPException(503, "Aufraeumen verweigert: Diagnosearchiv nicht gesichert") from error
+                    raise LeitstandHTTPError(503, "Aufraeumen verweigert: Diagnosearchiv nicht gesichert") from error
                 LOG.info("bericht_id=%s gesicherte_schrittdiagnosen=%s", ident,
                          json.dumps(evidence["schritte"], ensure_ascii=False))
             size = None
@@ -1103,7 +1115,7 @@ def create_app(coordinator: Coordinator | None = None) -> FastAPI:
             or not x_erkunder_intern
             or not hmac.compare_digest(expected, x_erkunder_intern)
         ):
-            raise HTTPException(403, "Interner Schlüssel erforderlich")
+            raise LeitstandHTTPError(403, "Interner Schlüssel erforderlich")
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -1123,38 +1135,69 @@ def create_app(coordinator: Coordinator | None = None) -> FastAPI:
 
     @app.middleware("http")
     async def protect_every_request(request, call_next):
+        reason = None
         try:
             await authorize(request.headers.get("X-Erkunder-Intern"))
+            if not service.ready and request.method == "POST" and request.url.path == "/start":
+                # Retry initialization only before admission, serialized against
+                # other retries. Every place must acknowledge cleanup again;
+                # a health response alone never releases a UID for reuse.
+                await service.startup(wait_s=10)
+            if not service.ready and not (
+                request.method == "POST" and request.url.path.startswith("/aufraeumen/")
+            ):
+                raise LeitstandHTTPError(503, "Leitstand wartet auf bereinigte Plaetze")
+            response = await call_next(request)
         except HTTPException as error:
-            return JSONResponse(
-                status_code=error.status_code, content={"detail": error.detail}
-            )
-        if not service.ready and not (
-            request.method == "POST" and request.url.path.startswith("/aufraeumen/")
-        ):
-            # Also keep authenticated missing-route probes (B1n) unhealthy.
-            return JSONResponse(
-                status_code=503,
-                content={"detail": "Leitstand wartet auf bereinigte Plaetze"},
-            )
-        return await call_next(request)
+            reason = error.detail if isinstance(error, LeitstandHTTPError) else "HTTPException"
+            response = JSONResponse(status_code=error.status_code, content={"detail": error.detail})
+        except Exception as error:  # noqa: BLE001 - HTTP boundary logs the class and returns 500
+            # Exception strings/tracebacks may contain signed URLs or tokens.
+            reason = type(error).__name__
+            response = JSONResponse(status_code=500, content={"detail": "Interner Leitstandfehler"})
+        if not 200 <= response.status_code < 300:
+            route = request.scope.get("route")
+            endpoint = getattr(route, "path", None)
+            if endpoint is None:
+                endpoint = (
+                    "/start" if request.url.path == "/start" else
+                    "/status/{ident}" if request.url.path.startswith("/status/") else
+                    "middleware"
+                )
+            reason = reason or getattr(request.state, "failure_reason", None)
+            if reason is None:
+                try:
+                    reason = HTTPStatus(response.status_code).phrase
+                except ValueError:
+                    reason = "HTTP-Antwort"
+            LOG.error("leitstand endpoint=%s status=%s grund=%s", endpoint, response.status_code, reason)
+        return response
+
+    @app.exception_handler(HTTPException)
+    async def http_error(request, error):
+        request.state.failure_reason = (
+            error.detail if isinstance(error, LeitstandHTTPError) else "HTTPException"
+        )
+        return JSONResponse(status_code=error.status_code, content={"detail": error.detail}, headers=error.headers)
 
     @app.exception_handler(RequestValidationError)
     async def invalid_request(request, error):
+        request.state.failure_reason = "Ungültiger Auftrag"
         return JSONResponse(status_code=400, content={"detail": "Ungültiger Auftrag"})
 
     @app.get("/bereitschaft")
     async def readiness():
         if not service.ready:
-            raise HTTPException(503, "Leitstand wartet auf bereinigte Plaetze")
+            raise LeitstandHTTPError(503, "Leitstand wartet auf bereinigte Plaetze")
         return {"bereit": True}
 
     @app.post("/start")
-    async def start(body: Start):
+    async def start(body: Start, request: Request):
         try:
             return await service.start(body)
         except HTTPException as error:
             if error.status_code == 409:
+                request.state.failure_reason = "Leitstand belegt"
                 return JSONResponse(status_code=409, content=error.detail)
             raise
 

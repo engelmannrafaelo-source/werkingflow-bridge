@@ -70,11 +70,24 @@ hängen. Danach bleibt der Prozess erreichbar, aber Vergaben und die authentisie
 anderen authentisierten Wege außer Aufräumen mit 503; eine Probe über einen
 unbekannten Pfad kann damit nicht fälschlich Bereitschaft melden.
 Er stürzt dafür nicht ab und erzeugt keine
-Neustartschleife. Eine erfolgreiche Anfrage an `POST /aufraeumen/<id>` entfernt
+Neustartschleife. Ein authentisierter `POST /start` wiederholt bei gesperrtem Leitstand die
+Initialisierung mit bis zu zehn Sekunden Bereinigungswartezeit. Gleichzeitige
+Wiederholungen sind serialisiert; die Wartezeit vor dem Initialisierungsschloss
+ist zusätzlich. Alle Plätze müssen ihre Prozessbereinigung bestätigen, bevor
+der Leitstand wieder Arbeit vergibt. Ein gesund gemeldeter Platz allein genügt
+nicht. Bereite Instanzen und ihre laufenden Berichte werden nicht neu initialisiert.
+Eine erfolgreiche Anfrage an `POST /aufraeumen/<id>` entfernt
 den angegebenen Altbericht und versucht die Initialisierung erneut, falls der
 Leitstand noch gesperrt ist. HTTP-Authentisierung: `X-Erkunder-Intern` aus der
 internen Dienstkonfiguration. Ein Berichtpfad-/Rechtefehler bleibt ein harter
 Startfehler; er wird nicht als verzögerter Platzstart behandelt.
+
+Nicht erfolgreiche HTTP-Antworten werden mit Routenschablone, Status und Grund
+protokolliert. Nur `LeitstandHTTPError` trägt einen ausdrücklich selbst formulierten,
+protokollierbaren Grund; externe Exceptions liefern ausschließlich den Typnamen.
+Validierungsfehler liefern keine Eingabewerte, Pfade keine Request-Parameter.
+Upstream-Bereinigungsfehler nennen Platznummer, HTTP-Status und Fehlerklasse,
+keine Antworttexte, Tokens oder URLs. Die Deploy-Sperre bleibt unverändert.
 
 Laufende Altberichte warten nach erfolgreichem Start höchstens 300 Sekunden auf
 erneutes Anhängen mit frischem Token. Fünf Minuten lassen dem Worker Zeit für
