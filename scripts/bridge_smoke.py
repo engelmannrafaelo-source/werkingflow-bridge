@@ -767,15 +767,44 @@ def _jobs_home_marker(ctx: Ctx) -> ProbeResult:
                        r.status_code, ms)
 
 
+# BR13/BR14 LB emergency block, including the :8000 metrics protection in
+# docker/nginx.conf. Remove each entry when that route's block is lifted;
+# the regular payload checks below then apply again. Only these exact routes
+# accept a refusal, and only from OpenResty (never a worker's auth rejection).
+LB_EMERGENCY_BLOCK_EXPECTATIONS = {
+    "/v1/metrics/anonymization": (403, "openresty"),
+    "/v1/metrics/document-performance": (403, "openresty"),
+}
+
+
+def _lb_emergency_block(name: str, ep: str, r: requests.Response,
+                        ms: int) -> ProbeResult | None:
+    expected = LB_EMERGENCY_BLOCK_EXPECTATIONS.get(ep)
+    if expected is None:
+        return None
+    status, server_product = expected
+    server = r.headers.get("Server", "").split("/", 1)[0].strip().lower()
+    ok = r.status_code == status and server == server_product
+    if r.status_code == 200:
+        detail = "Notsperre BR13/BR14 weg: Sicherheitsbefund (HTTP 200)"
+    elif ok:
+        detail = f"Notsperre BR13/BR14 aktiv: HTTP {status} vom LB ({server_product})"
+    else:
+        detail = (f"Notsperre BR13/BR14: erwartet HTTP {status} vom LB "
+                  f"({server_product}), erhalten HTTP {r.status_code}, "
+                  f"Server={r.headers.get('Server', '<fehlt>')!r}")
+    return ProbeResult(name, ep, ok, detail, r.status_code, ms)
+
+
 @probe("metrics_anonymization", "/v1/metrics/anonymization", {"hetzner"},
        repro="curl $AI_BRIDGE_URL/v1/metrics/anonymization -H 'Authorization: Bearer $AI_BRIDGE_API_KEY' " + ATTRIBUTION_REPRO)
 def _metrics_anonymization(ctx: Ctx) -> ProbeResult:
-    """GDPR counters. Probed rather than EXCLUDED: it is a read-only GET, so
-    there is no reason to leave it uncovered — and `db:false` would mean the
-    pseudonymisation counters silently report nothing, which is exactly the kind
-    of blind instrument this suite exists to catch."""
+    """Assert the LB emergency block; after its removal, validate GDPR counters."""
     ep = "/v1/metrics/anonymization"
-    r, ms = _timed(lambda: requests.get(f"{ctx.base_url}{ep}", headers=ctx.headers(), timeout=30))
+    r, ms = _timed(lambda: requests.get(f"{ctx.base_url}{ep}", headers=ctx.headers(), timeout=30, allow_redirects=False))
+    blocked = _lb_emergency_block("metrics_anonymization", ep, r, ms)
+    if blocked is not None:
+        return blocked
     if r.status_code != 200:
         return ProbeResult("metrics_anonymization", ep, False, f"HTTP {r.status_code}: {r.text[:200]}", r.status_code, ms)
     d = r.json()
@@ -796,7 +825,10 @@ def _metrics_anonymization(ctx: Ctx) -> ProbeResult:
        repro="curl $AI_BRIDGE_URL/v1/metrics/document-performance -H 'Authorization: Bearer $AI_BRIDGE_API_KEY' " + ATTRIBUTION_REPRO)
 def _metrics_document_performance(ctx: Ctx) -> ProbeResult:
     ep = "/v1/metrics/document-performance"
-    r, ms = _timed(lambda: requests.get(f"{ctx.base_url}{ep}", headers=ctx.headers(), timeout=30))
+    r, ms = _timed(lambda: requests.get(f"{ctx.base_url}{ep}", headers=ctx.headers(), timeout=30, allow_redirects=False))
+    blocked = _lb_emergency_block("metrics_document_performance", ep, r, ms)
+    if blocked is not None:
+        return blocked
     if r.status_code != 200:
         return ProbeResult("metrics_document_performance", ep, False, f"HTTP {r.status_code}: {r.text[:200]}", r.status_code, ms)
     d = r.json()
