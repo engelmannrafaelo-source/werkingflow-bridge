@@ -1107,6 +1107,7 @@ async def reset_password_with_token(body: ResetPasswordWithTokenRequest) -> Resp
                   JOIN users u ON u.id = t.user_id
                  WHERE t.token_hash = $1
                    AND t.token_type = 'password_reset'::auth_token_type
+                 FOR UPDATE OF t
                 """,
                 token_hash,
             )
@@ -1146,7 +1147,13 @@ async def reset_password_with_token(body: ResetPasswordWithTokenRequest) -> Resp
         "identity.reset_password: password rotated + sessions revoked user_id=%s",
         user_id,
     )
-    return Response(status_code=204)
+    # App JWTs are independently signed. The authenticated reset-token holder
+    # receives the committed identity so app servers can invalidate their own
+    # session generations. Existing clients still receive an empty HTTP 204.
+    return Response(
+        status_code=204,
+        headers={"X-Reset-User-ID": str(user_id), "Cache-Control": "no-store"},
+    )
 
 
 # ---------------------------------------------------------------------------
