@@ -37,6 +37,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -770,7 +771,8 @@ def _jobs_home_marker(ctx: Ctx) -> ProbeResult:
 # BR13/BR14 LB emergency block, including the :8000 metrics protection in
 # docker/nginx.conf. Remove each entry when that route's block is lifted;
 # the regular payload checks below then apply again. Only these exact routes
-# accept a refusal, and only from OpenResty (never a worker's auth rejection).
+# accept the OpenResty HTML block page without upstream provenance. The Server
+# header alone also appears on worker replies and cannot identify the block.
 LB_EMERGENCY_BLOCK_EXPECTATIONS = {
     "/v1/metrics/anonymization": (403, "openresty"),
     "/v1/metrics/document-performance": (403, "openresty"),
@@ -783,8 +785,25 @@ def _lb_emergency_block(name: str, ep: str, r: requests.Response,
     if expected is None:
         return None
     status, server_product = expected
-    server = r.headers.get("Server", "").split("/", 1)[0].strip().lower()
-    ok = r.status_code == status and server == server_product
+    # requests combines repeated Server headers (Caddy + OpenResty) with commas.
+    server_products = {
+        value.strip().split("/", 1)[0].lower()
+        for value in r.headers.get("Server", "").split(",")
+    }
+    content_type = r.headers.get("Content-Type", "").split(";", 1)[0].strip().lower()
+    upstream_headers = [
+        header for header in ("X-Bridge-Served-By", "X-Upstream-Server")
+        if header in r.headers
+    ]
+    block_page = (
+        content_type == "text/html"
+        and "<title>403 Forbidden</title>" in r.text
+        and "<h1>403 Forbidden</h1>" in r.text
+        and re.search(r"<center>\s*" + re.escape(server_product)
+                      + r"(?:/[^\s<>]+)?\s*</center>", r.text) is not None
+    )
+    ok = (r.status_code == status and server_product in server_products
+          and block_page and not upstream_headers)
     if r.status_code == 200:
         detail = "Notsperre BR13/BR14 weg: Sicherheitsbefund (HTTP 200)"
     elif ok:
@@ -792,7 +811,9 @@ def _lb_emergency_block(name: str, ep: str, r: requests.Response,
     else:
         detail = (f"Notsperre BR13/BR14: erwartet HTTP {status} vom LB "
                   f"({server_product}), erhalten HTTP {r.status_code}, "
-                  f"Server={r.headers.get('Server', '<fehlt>')!r}")
+                  f"Server={r.headers.get('Server', '<fehlt>')!r}, "
+                  f"Content-Type={content_type!r}, Sperrseite={block_page}, "
+                  f"Upstream-Header={upstream_headers}")
     return ProbeResult(name, ep, ok, detail, r.status_code, ms)
 
 
