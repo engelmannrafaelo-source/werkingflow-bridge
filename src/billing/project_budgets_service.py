@@ -28,28 +28,23 @@ Design:
 - All amounts are EUR. Monetary math uses Decimal to avoid float drift in the
   ledger; callers pass floats (cost) which we quantize on the way in.
 
-TopUp fallback (BUDGET-MODELL.md Regel 6 — "TopUp ist das fungible Geld"):
-  A project's own EUR-100 budget is intentionally NOT fungible (Regel 1/5 —
-  no leftover transfer, a purchased project stays completable on its own
-  money). TopUp is the opposite: app-übergreifendes, sichtbares Geld that is
-  DESIGNED to back an otherwise-exhausted included pot before the user is
-  blocked — the monthly path (src/budget/routes.py apply_budget_deduction)
-  already does this; evaluate()/deduct() below mirror it for the per-project
-  pot so a customer with unused TopUp is never blocked by an empty project
-  budget alone. Both draw on the SAME user_topup_lots via
-  src/budget/topup_store.py (shared FIFO + persistence — never a second,
-  divergent implementation).
+Project limit is a hard ceiling (Befund Mühl 25.10.2026, 9 Aufrufe / 8,50 EUR
+aus dem TopUp über ein bestätigtes 200-EUR-Limit hinaus):
+  Ist das Projektbudget erschöpft, wird der Aufruf VOR dem Lauf abgewiesen
+  (evaluate -> allowed=False), und deduct() bucht nie vom TopUp ab. TopUp
+  (BUDGET-MODELL.md Regel 6, "app-übergreifend fungibel") bleibt das Geld
+  der Monatspfade; ein Projekt darf es nicht still anzapfen. Der frühere
+  Rückgriff (Commit 5d24074, 17.07.2026) hatte keinen Beleg in Rafaels Wort,
+  nur die Commit-Begründung. Eine Schätzung von 0 öffnet kein Tor mehr:
+  erlaubt wird nur bei Rest > 0.
 """
 from __future__ import annotations
 
 import logging
 import uuid
-from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any, Dict, Optional
 
-from src.budget.calculator import consume_topup_fifo, topup_balance_eur
-from src.budget.topup_store import load_topup_lots, persist_topup_lots
 from src.db.client import get_pool
 
 logger = logging.getLogger(__name__)
@@ -282,40 +277,25 @@ async def evaluate(
     treat that (a project that never consumed a slot, or a pre-feature
     in-flight project).
 
-    When the project's own budget alone can't cover the call, the user's
-    TopUp balance is checked as a fallback (see module docstring) before
-    reporting `allowed=False` — a project is only truly blocked once BOTH
-    pots are empty. `topUpRemainingEur` is 0.0 whenever the project budget
-    alone already covers the call (TopUp wasn't consulted, so its remaining
-    amount is irrelevant to this decision).
+    The project limit is a ceiling: `allowed` is True only while the project
+    still has budget left (remaining > 0). The TopUp balance is never
+    consulted, so `topUpRemainingEur` is always 0.0 (key kept for the
+    platform-api contract). `estimated_cost_eur` is a lower-bound hint from
+    the gate and may be 0 — it must not open the gate on its own.
     """
     budget = await get_budget(user_id, plan_id, project_id)
     if budget is None:
         return {"exists": False, "allowed": False, "remainingEur": 0.0, "topUpRemainingEur": 0.0}
     remaining = budget["remainingEur"]
-    # estimated_cost is a lower-bound hint from the gate; >0 remaining is the
-    # real signal (the post-call deduction caps the actual spend at the limit).
-    if remaining > 0 or estimated_cost_eur <= remaining:
-        return {"exists": True, "allowed": True, "remainingEur": remaining, "topUpRemainingEur": 0.0}
-
-    top_up_remaining = await _topup_remaining(user_id)
-    total_remaining = remaining + top_up_remaining
-    allowed = total_remaining > 0 or estimated_cost_eur <= total_remaining
+    # >0 remaining is the real signal (the post-call deduction caps the actual
+    # spend at the limit). An estimate of 0 against remaining 0 used to pass
+    # via `estimated_cost <= remaining`; that is the hole this check closes.
     return {
         "exists": True,
-        "allowed": allowed,
+        "allowed": remaining > 0,
         "remainingEur": remaining,
-        "topUpRemainingEur": top_up_remaining,
+        "topUpRemainingEur": 0.0,
     }
-
-
-async def _topup_remaining(user_id: uuid.UUID) -> float:
-    """Read-only TopUp balance check for the gate (no lock — deduct() takes
-    the FOR UPDATE lock when it actually spends)."""
-    pool = get_pool()
-    async with pool.acquire() as conn:
-        lots = await load_topup_lots(conn, user_id)
-    return topup_balance_eur(lots, datetime.now(timezone.utc))
 
 
 async def deduct(
@@ -328,19 +308,18 @@ async def deduct(
     tenant_id: Optional[str] = None,
     idempotency_key: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Atomically draw `cost_eur` from a project's budget, falling back to the
-    user's TopUp lots for any shortfall (see module docstring — TopUp is the
-    designed fallback for an exhausted included pot).
+    """Atomically draw `cost_eur` from a project's budget. Never from TopUp:
+    the project limit is a ceiling (see module docstring).
 
     Returns {exists, deductedEur, fromProjectEur, fromTopUpEur, usedEur,
-    remainingEur}. `exists=False` means no budget row and no allocation was
-    requested — nothing deducted (the caller logs the gap). `usedEur`/
-    `remainingEur` describe the PROJECT pot only (limit_eur never exceeded,
-    matching the DB CHECK constraint); `deductedEur` is the total actually
-    covered (project + TopUp), which can still be less than `cost_eur` if
-    both pots are exhausted — the call already happened (best-effort
-    post-call accounting), so the shortfall is absorbed with a loud warning
-    rather than raised.
+    remainingEur}; `fromTopUpEur` is always 0.0 (key kept for the
+    platform-api contract). `exists=False` means no budget row and no
+    allocation was requested — nothing deducted (the caller logs the gap).
+    `usedEur`/`remainingEur` describe the PROJECT pot (limit_eur never
+    exceeded, matching the DB CHECK constraint); `deductedEur` can be less
+    than `cost_eur` when the call that crossed the limit was already in
+    flight — that single overshoot is absorbed with a loud warning rather
+    than raised, and the pre-call gate rejects every following call.
 
     Lazy allocation: when the budget row is missing and both `allocate_limit_eur`
     and `tenant_id` are given, the row is created in-transaction (idempotent on
@@ -451,17 +430,6 @@ async def deduct(
             )
 
             from_top_up = Decimal("0")
-            remainder = amount - from_project
-            if remainder > 0:
-                # Project pot couldn't cover the full cost — draw the rest
-                # from the user's TopUp lots (FIFO, same pot the monthly path
-                # draws from). Locked for the rest of this transaction so a
-                # concurrent call can't double-spend the same TopUp euro.
-                old_lots = await load_topup_lots(conn, user_id, for_update=True)
-                now = datetime.now(timezone.utc)
-                new_lots, consumed = consume_topup_fifo(old_lots, float(remainder), now)
-                from_top_up = _eur(consumed)
-                await persist_topup_lots(conn, old_lots, new_lots)
 
             answer = {
                 "exists": True,
@@ -477,11 +445,10 @@ async def deduct(
     total_deducted = from_project + from_top_up
     if total_deducted < amount:
         logger.warning(
-            "project_budgets_service.deduct: project+TopUp insufficient to cover "
-            "the full cost — absorbing shortfall (call already happened) "
-            "user=%s plan=%s project=%s cost=%.4f covered=%.4f (project=%.4f top_up=%.4f)",
+            "project_budgets_service.deduct: project limit reached — absorbing the "
+            "overshoot of the call that crossed it (no TopUp draw) "
+            "user=%s plan=%s project=%s cost=%.4f covered=%.4f",
             user_id, plan_id, project_id, float(amount), float(total_deducted),
-            float(from_project), float(from_top_up),
         )
 
     return {**answer, "duplicate": False}
