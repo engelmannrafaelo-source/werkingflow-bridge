@@ -7937,6 +7937,7 @@ async def research(
             estimated_cost_eur=0.0,  # lower bound; gate blocks 'budget gone' states
             project_id=_research_attr.get("workflow_id"),
             hard_cap_hint=hard_cap_hint_from_request(request),
+            call_kind="research",
         )
     except HTTPException:
         raise  # 402 — propagate to the client
@@ -8481,6 +8482,7 @@ async def doc_agent(
             estimated_cost_eur=0.0,
             project_id=_da_attr.get("workflow_id"),
             hard_cap_hint=hard_cap_hint_from_request(request),
+            call_kind="doc-agent",
         )
     except HTTPException:
         raise
@@ -9668,6 +9670,7 @@ async def convert_html_to_docx_endpoint(
                 estimated_cost_eur=_docx_schaetzung_eur,
                 project_id=_attr.get("workflow_id"),
                 hard_cap_hint=hard_cap_hint_from_request(request),
+                call_kind="convert",
             )
         except HTTPException as _budget_402:
             # Wie im Chat-Weg: die Ablehnung sichtbar ins Ledger, damit "Budget

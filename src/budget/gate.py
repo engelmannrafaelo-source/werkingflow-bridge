@@ -77,6 +77,13 @@ _HARD_CAP_SEEN_TTL_S = 24 * 3600
 #: project; anything else, or no header, is ignored.
 HARD_CAP_HEADER = "X-Budget-Hard-Cap"
 
+#: Estimate used for a hard-cap project when the caller hands in none (0): research,
+#: doc-agent and document-conversion calls have no per-call estimate in the gate, so
+#: "remaining > 0" let a whole wave through (A2 measurement 26.10.2026). Roughly the
+#: observed p90 of Energy calls of that kind; adjust with measurement 3. Applies ONLY to
+#: hard-cap budgets and ONLY when the caller's estimate is 0 (a larger one wins).
+HARD_CAP_DEFAULT_ESTIMATE_EUR = {"research": 2.00, "doc-agent": 1.00, "convert": 0.50}
+
 #: Value of X-Bridge-Dependency-Unavailable on the fail-closed 503.
 BUDGET_STATE_DEPENDENCY = "budget-state"
 
@@ -143,6 +150,7 @@ async def enforce_budget(
     estimated_cost_eur: float,
     project_id: Optional[str] = None,
     hard_cap_hint: bool = False,
+    call_kind: Optional[str] = None,
 ) -> None:
     """
     Raise HTTPException(402) if the user's budget for this app is exhausted.
@@ -288,7 +296,12 @@ async def enforce_budget(
         if pr.get("exists") and pr.get("hardCap"):
             _remember_hard_cap(uid, project_id)
         if pr.get("exists"):
-            if pr.get("allowed"):
+            eff_estimate = estimated_cost_eur
+            if pr.get("hardCap") and eff_estimate <= 0:
+                eff_estimate = HARD_CAP_DEFAULT_ESTIMATE_EUR.get(call_kind or "", 0.0)
+            if pr.get("allowed") and not (
+                pr.get("hardCap") and pr.get("remainingEur", 0.0) < eff_estimate
+            ):
                 return
             if pr.get("hardCap"):
                 # Lauf-Deckel: the project limit is a ceiling, TopUp was not
@@ -309,7 +322,7 @@ async def enforce_budget(
                         "planId": plan.id,
                         "projectId": project_id,
                         "totalRemainingEur": pr.get("remainingEur", 0.0),
-                        "estimatedCostEur": estimated_cost_eur,
+                        "estimatedCostEur": eff_estimate,
                         "message": (
                             "Das Projektbudget ist aufgebraucht. Bitte ein neues Projekt-Paket buchen."
                             if pr.get("remainingEur", 0.0) <= 0
