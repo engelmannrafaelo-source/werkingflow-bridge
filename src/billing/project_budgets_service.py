@@ -309,8 +309,9 @@ async def evaluate(
     amount is irrelevant to this decision).
 
     A budget marked `hard_cap` (Lauf-Deckel) is the exception: its limit is a
-    ceiling. It is allowed only while remaining > 0, TopUp is never consulted,
-    and an estimate of 0 opens nothing. The answer carries `hardCap`. Calls that
+    ceiling. It is allowed only while remaining > 0 AND remaining covers the
+    pre-call estimate, TopUp is never consulted, and an estimate of 0 opens
+    nothing. The answer carries `hardCap`. Calls that
     run in parallel past the gate can each overshoot once before deduct() clamps
     used to the limit; the ceiling is hard for every call that starts afterwards.
     """
@@ -321,7 +322,9 @@ async def evaluate(
     if budget["hardCap"]:
         return {
             "exists": True,
-            "allowed": remaining > 0,
+            # The pre-call estimate must fit into what is left (the gate hands in
+            # input + max_tokens for chat); with estimate 0 this is remaining > 0.
+            "allowed": remaining > 0 and remaining >= estimated_cost_eur,
             "remainingEur": remaining,
             "topUpRemainingEur": 0.0,
             "hardCap": True,

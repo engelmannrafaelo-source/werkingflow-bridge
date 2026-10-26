@@ -37,6 +37,7 @@ See ADR 0007 lineage / token-tracking consolidation.
 from __future__ import annotations
 
 import logging
+import time
 import uuid
 from typing import Optional
 
@@ -62,6 +63,61 @@ from src.identity.user_resolver import (
 
 logger = logging.getLogger(__name__)
 
+# Hard-cap projects seen by THIS process: (user_id, project_id) -> monotonic time
+# of the last successful evaluation that reported hardCap=true. Used ONLY when
+# the budget state cannot be read (infra error): a known hard-cap project then
+# fails CLOSED instead of passing unmetered. Every other case keeps the
+# fail-open policy below. The cache is a hint that can only make the gate
+# stricter; losing it (restart) reverts to today's behaviour for that project.
+_HARD_CAP_SEEN: dict = {}
+_HARD_CAP_SEEN_TTL_S = 24 * 3600
+
+#: Optional caller hint with the same one-way effect as the cache (never looser).
+#: Value "1" or "true" (case-insensitive) = this call belongs to a hard-cap
+#: project; anything else, or no header, is ignored.
+HARD_CAP_HEADER = "X-Budget-Hard-Cap"
+
+#: Value of X-Bridge-Dependency-Unavailable on the fail-closed 503.
+BUDGET_STATE_DEPENDENCY = "budget-state"
+
+
+def hard_cap_hint_from_request(request) -> bool:
+    """True when the caller marked the call as belonging to a hard-cap project."""
+    try:
+        value = request.headers.get(HARD_CAP_HEADER)
+    except AttributeError:  # silent-ok: no request object (internal caller) = no hint
+        return False
+    return str(value or "").strip().lower() in ("1", "true")
+
+
+def _known_hard_cap(user_id, project_id, hint: bool) -> bool:
+    if hint:
+        return True
+    ts = _HARD_CAP_SEEN.get((str(user_id), project_id))
+    return ts is not None and (time.monotonic() - ts) < _HARD_CAP_SEEN_TTL_S
+
+
+def _budget_state_unavailable(user_id, project_id, why: str) -> HTTPException:
+    logger.error(
+        "budget gate: hard-cap project %s of user %s — budget state unavailable (%s); "
+        "failing CLOSED (503, retryable)", project_id, user_id, why,
+    )
+    return HTTPException(
+        status_code=503,
+        detail={
+            "error": "budget_unavailable",
+            "reason": "budget_unavailable",
+            "retryable": True,
+            "retry_after_s": 30,
+            "projectId": project_id,
+            "message": (
+                "Der Budgetstand dieses Projekts ist gerade nicht lesbar. Der Aufruf wird "
+                "nicht ungemessen durchgelassen; bitte in Kürze erneut versuchen."
+            ),
+        },
+        headers={"X-Bridge-Dependency-Unavailable": BUDGET_STATE_DEPENDENCY},
+    )
+
 # Reasons that hard-block the call.
 #   *_exhausted / *_exceeded_no_topup / trial_expired = "had budget, it's gone"
 #   unlicensed = "never had a plan entry" (added 2026-05-28 — was implicit grant)
@@ -78,6 +134,7 @@ async def enforce_budget(
     app_id: Optional[str],
     estimated_cost_eur: float,
     project_id: Optional[str] = None,
+    hard_cap_hint: bool = False,
 ) -> None:
     """
     Raise HTTPException(402) if the user's budget for this app is exhausted.
@@ -178,6 +235,8 @@ async def enforce_budget(
         )
         raise
     except Exception as e:  # noqa: BLE001 — fail-open: infra error must not kill the AI path
+        if project_id and _known_hard_cap(uid, project_id, hard_cap_hint):
+            raise _budget_state_unavailable(uid, project_id, f"plan resolution: {e}") from e
         logger.error("budget gate: plan resolution failed (%s) — letting call through", e)
         return
 
@@ -214,8 +273,12 @@ async def enforce_budget(
         try:
             pr = await _eval_project(uid, plan.id, project_id, estimated_cost_eur)
         except Exception as e:  # noqa: BLE001 — fail-open: infra error must not kill the AI path
+            if _known_hard_cap(uid, project_id, hard_cap_hint):
+                raise _budget_state_unavailable(uid, project_id, f"evaluation: {e}") from e
             logger.error("budget gate: project budget eval failed (%s) — letting call through", e)
             return
+        if pr.get("exists") and pr.get("hardCap"):
+            _HARD_CAP_SEEN[(str(uid), project_id)] = time.monotonic()
         if pr.get("exists"):
             if pr.get("allowed"):
                 return

@@ -2862,7 +2862,7 @@ async def _chat_completions_lauf(
         # "budget empty" blocks. See src/budget/gate.py.
         # ===================================================================
         try:
-            from src.budget.gate import enforce_budget
+            from src.budget.gate import enforce_budget, hard_cap_hint_from_request
             _gate_attr = extract_attribution_context(request)
             # Pre-call cost estimate via the pricing SSoT (src/pricing.py):
             # input estimate + max_tokens output. The gate only needs "is
@@ -2879,6 +2879,7 @@ async def _chat_completions_lauf(
                 app_id=_gate_attr.get("app_id"),
                 estimated_cost_eur=_gate_cost,
                 project_id=_gate_attr.get("workflow_id"),
+                hard_cap_hint=hard_cap_hint_from_request(request),
             )
         except HTTPException as _budget_402:
             # A 402 (budget exhausted) rejects the call before any usage_events
@@ -7929,12 +7930,13 @@ async def research(
     # job that would only block at worker-pickup time.
     _research_attr = extract_attribution_context(request)
     try:
-        from src.budget.gate import enforce_budget
+        from src.budget.gate import enforce_budget, hard_cap_hint_from_request
         await enforce_budget(
             user_id=_research_attr.get("user_id"),
             app_id=_research_attr.get("app_id"),
             estimated_cost_eur=0.0,  # lower bound; gate blocks 'budget gone' states
             project_id=_research_attr.get("workflow_id"),
+            hard_cap_hint=hard_cap_hint_from_request(request),
         )
     except HTTPException:
         raise  # 402 — propagate to the client
@@ -8472,12 +8474,13 @@ async def doc_agent(
     # Budget gate BEFORE execution (same as research)
     _da_attr = extract_attribution_context(request)
     try:
-        from src.budget.gate import enforce_budget
+        from src.budget.gate import enforce_budget, hard_cap_hint_from_request
         await enforce_budget(
             user_id=_da_attr.get("user_id"),
             app_id=_da_attr.get("app_id"),
             estimated_cost_eur=0.0,
             project_id=_da_attr.get("workflow_id"),
+            hard_cap_hint=hard_cap_hint_from_request(request),
         )
     except HTTPException:
         raise
@@ -9658,12 +9661,13 @@ async def convert_html_to_docx_endpoint(
     _docx_schaetzung_eur = 0.0
     if _docx_schaetzung_eur > 0:
         try:
-            from src.budget.gate import enforce_budget
+            from src.budget.gate import enforce_budget, hard_cap_hint_from_request
             await enforce_budget(
                 user_id=_attr.get("user_id"),
                 app_id=_attr.get("app_id"),
                 estimated_cost_eur=_docx_schaetzung_eur,
                 project_id=_attr.get("workflow_id"),
+                hard_cap_hint=hard_cap_hint_from_request(request),
             )
         except HTTPException as _budget_402:
             # Wie im Chat-Weg: die Ablehnung sichtbar ins Ledger, damit "Budget
