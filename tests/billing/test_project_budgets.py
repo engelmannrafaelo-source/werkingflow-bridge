@@ -351,8 +351,8 @@ def _mock_pool_fetch(*fetch_results):
 async def test_list_budgets_aggregates_pot_and_joins_tokens():
     # 2 projects × 100 = 500 pot; tokens joined by project_id; P2 has no tokens.
     budget_rows = [
-        {"project_id": "P1", "limit_eur": Decimal("100"), "used_eur": Decimal("40")},
-        {"project_id": "P2", "limit_eur": Decimal("100"), "used_eur": Decimal("0")},
+        {"project_id": "P1", "limit_eur": Decimal("100"), "used_eur": Decimal("40"), "hard_cap": True},
+        {"project_id": "P2", "limit_eur": Decimal("100"), "used_eur": Decimal("0"), "hard_cap": False},
     ]
     token_rows = [{"project_id": "P1", "tokens_used": 12345}]
     pool, _ = _mock_pool_fetch(budget_rows, token_rows)
@@ -369,8 +369,9 @@ async def test_list_budgets_aggregates_pot_and_joins_tokens():
     p1, p2 = out["projects"]
     assert p1 == {
         "projectId": "P1", "limitEur": 100.0, "usedEur": 40.0,
-        "remainingEur": 60.0, "tokensUsed": 12345,
+        "remainingEur": 60.0, "tokensUsed": 12345, "hardCap": True,
     }
+    assert p2["hardCap"] is False
     assert p2["tokensUsed"] == 0  # budget row without usage rows
 
 

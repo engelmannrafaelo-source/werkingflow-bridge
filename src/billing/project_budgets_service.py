@@ -213,7 +213,7 @@ async def list_budgets(user_id: uuid.UUID, plan_id: str) -> Dict[str, Any]:
 
       {
         "projects": [
-          {projectId, limitEur, usedEur, remainingEur, tokensUsed}, ...
+          {projectId, limitEur, usedEur, remainingEur, tokensUsed, hardCap}, ...
         ],
         "totals": {limitEur, usedEur, remainingEur, tokensUsed, projectCount},
       }
@@ -229,7 +229,7 @@ async def list_budgets(user_id: uuid.UUID, plan_id: str) -> Dict[str, Any]:
     async with pool.acquire() as conn:
         budget_rows = await conn.fetch(
             """
-            SELECT project_id, limit_eur, used_eur
+            SELECT project_id, limit_eur, used_eur, hard_cap
               FROM project_budgets
              WHERE user_id = $1 AND plan_id = $2
              ORDER BY created_at ASC
@@ -273,6 +273,8 @@ async def list_budgets(user_id: uuid.UUID, plan_id: str) -> Dict[str, Any]:
                 "usedEur": float(used),
                 "remainingEur": float(max(Decimal("0"), limit - used)),
                 "tokensUsed": tokens,
+                # Read-only: whether the row is an explicit run ceiling (Lauf-Deckel).
+                "hardCap": bool(row["hard_cap"]),
             }
         )
 

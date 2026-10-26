@@ -993,7 +993,7 @@ async def list_project_budgets(
     """
     Per-Projekt-Budgets eines Users (für die App-Budget-Anzeige).
 
-    Liefert pro Projekt {projectId, limitEur, usedEur, remainingEur, tokensUsed}
+    Liefert pro Projekt {projectId, limitEur, usedEur, remainingEur, tokensUsed, hardCap}
     plus aggregierte totals (N Projekte × EUR 100 = gemeinsamer Topf). Tokens
     kommen aus usage_events (workflow_id == project_id). Self-or-Admin: User
     sieht eigene Budgets, Operator alle.
