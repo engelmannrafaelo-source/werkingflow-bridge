@@ -120,19 +120,16 @@ MODELS: List[ModelInfo] = [
         family="haiku",
         version="4.5",
         release_date=date(2025, 10, 1),
-        description="Haiku 4.5 - Neuestes und schnellstes Haiku, ideal fuer Vision",
-        is_default=True
+        description="Haiku 4.5 - previous default"
     ),
-    # Haiku 5.5 (Ankuendigung 2026-10-07) ist registriert, aber NICHT Familien-Default:
-    # der Alias "haiku" zeigt weiter auf 4.5, weil Report/Energy/Partner-Stellen
-    # "haiku" fest verwenden und sonst still umgestellt wuerden. Umstellung des
-    # Alias erst nach Messung und bewusster Entscheidung (is_default=True).
+    # Haiku 5.5 rollout explicitly approved by Rafael, 2026-10-26.
     ModelInfo(
         id="claude-haiku-5-5",
         family="haiku",
         version="5.5",
         release_date=date(2026, 10, 7),
-        description="Haiku 5.5 - 1M context, 128k output; explizit anforderbar, nicht Alias-Default"
+        description="Haiku 5.5 - Default, 1M context, 128k output",
+        is_default=True
     ),
     ModelInfo(
         id="claude-3-5-haiku-20241022",
@@ -506,6 +503,7 @@ _BEDROCK_PROFILE_BASE_IDS: Dict[str, str] = {
     "claude-opus-4-8":            "anthropic.claude-opus-4-8",
     "claude-opus-5-5":            "anthropic.claude-opus-5-5",
     "claude-sonnet-5-5":          "anthropic.claude-sonnet-5-5",
+    "claude-haiku-5-5":           "anthropic.claude-haiku-5-5",
     "claude-sonnet-5":            "anthropic.claude-sonnet-5",
 }
 
