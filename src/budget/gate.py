@@ -97,6 +97,14 @@ def _known_hard_cap(user_id, project_id, hint: bool) -> bool:
     return ts is not None and (time.monotonic() - ts) < _HARD_CAP_SEEN_TTL_S
 
 
+def _remember_hard_cap(user_id, project_id) -> None:
+    now = time.monotonic()
+    if len(_HARD_CAP_SEEN) > 1024:  # drop expired entries so the map stays bounded
+        for k in [k for k, ts in _HARD_CAP_SEEN.items() if now - ts >= _HARD_CAP_SEEN_TTL_S]:
+            del _HARD_CAP_SEEN[k]
+    _HARD_CAP_SEEN[(str(user_id), project_id)] = now
+
+
 def _budget_state_unavailable(user_id, project_id, why: str) -> HTTPException:
     logger.error(
         "budget gate: hard-cap project %s of user %s — budget state unavailable (%s); "
@@ -278,7 +286,7 @@ async def enforce_budget(
             logger.error("budget gate: project budget eval failed (%s) — letting call through", e)
             return
         if pr.get("exists") and pr.get("hardCap"):
-            _HARD_CAP_SEEN[(str(uid), project_id)] = time.monotonic()
+            _remember_hard_cap(uid, project_id)
         if pr.get("exists"):
             if pr.get("allowed"):
                 return
@@ -301,7 +309,13 @@ async def enforce_budget(
                         "planId": plan.id,
                         "projectId": project_id,
                         "totalRemainingEur": pr.get("remainingEur", 0.0),
-                        "message": "Das Projektbudget ist aufgebraucht. Bitte ein neues Projekt-Paket buchen.",
+                        "estimatedCostEur": estimated_cost_eur,
+                        "message": (
+                            "Das Projektbudget ist aufgebraucht. Bitte ein neues Projekt-Paket buchen."
+                            if pr.get("remainingEur", 0.0) <= 0
+                            else "Der Rest des Projektbudgets reicht für diesen Aufruf nicht aus "
+                                 "(geschätzte Kosten höher als der Rest). Bitte ein neues Projekt-Paket buchen."
+                        ),
                     },
                 )
             # `allowed=False` here means BOTH pots are exhausted — evaluate()

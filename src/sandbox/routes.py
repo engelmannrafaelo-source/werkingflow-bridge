@@ -184,7 +184,8 @@ async def lease_token(
         # estimated_cost=0: we only need to detect "budget gone" states
         # (all_exhausted / monthly_exceeded_no_topup / trial_expired); the
         # gate lets unlicensed users through so trial users reach the sandbox.
-        # Fail-open on DB/infra errors (enforce_budget swallows them).
+        # Fail-open on DB/infra errors (enforce_budget swallows them), except for a
+        # known hard-cap project (503 budget_unavailable).
         await enforce_budget(str(uid), body.app, 0.0, project_id=body.projectId)
 
         # 4. Pick best account — S7 fair round-robin: pass recent lease counts

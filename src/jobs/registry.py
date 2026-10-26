@@ -91,6 +91,9 @@ DEPENDENCY_MAX_DEFERS = 240
 # to see.
 DEPENDENCY_PATIENCE: Dict[str, tuple] = {
     "provider-config": (30, 30),
+    # Budget state unreadable for a hard-cap project (src/budget/gate.py): the
+    # outage is short or someone has to see it — same patience as provider-config.
+    "budget-state": (30, 30),
 }
 
 # ---------------------------------------------------------------------------
