@@ -779,6 +779,13 @@ LB_EMERGENCY_BLOCK_EXPECTATIONS = {
 }
 
 
+def _lb_emergency_headers(ctx: Ctx, ep: str) -> dict:
+    # The deploy host is explicitly trusted by nginx on direct :8000 requests.
+    # Exercise the external/Caddy boundary, not that internal allowlist.
+    extra = {"X-Forwarded-For": "198.51.100.1"} if ep in LB_EMERGENCY_BLOCK_EXPECTATIONS else {}
+    return ctx.headers(extra)
+
+
 def _lb_emergency_block(name: str, ep: str, r: requests.Response,
                         ms: int) -> ProbeResult | None:
     expected = LB_EMERGENCY_BLOCK_EXPECTATIONS.get(ep)
@@ -818,11 +825,11 @@ def _lb_emergency_block(name: str, ep: str, r: requests.Response,
 
 
 @probe("metrics_anonymization", "/v1/metrics/anonymization", {"hetzner"},
-       repro="curl $AI_BRIDGE_URL/v1/metrics/anonymization -H 'Authorization: Bearer $AI_BRIDGE_API_KEY' " + ATTRIBUTION_REPRO)
+       repro="curl $AI_BRIDGE_URL/v1/metrics/anonymization -H 'X-Forwarded-For: 198.51.100.1' -H 'Authorization: Bearer $AI_BRIDGE_API_KEY' " + ATTRIBUTION_REPRO)
 def _metrics_anonymization(ctx: Ctx) -> ProbeResult:
     """Assert the LB emergency block; after its removal, validate GDPR counters."""
     ep = "/v1/metrics/anonymization"
-    r, ms = _timed(lambda: requests.get(f"{ctx.base_url}{ep}", headers=ctx.headers(), timeout=30, allow_redirects=False))
+    r, ms = _timed(lambda: requests.get(f"{ctx.base_url}{ep}", headers=_lb_emergency_headers(ctx, ep), timeout=30, allow_redirects=False))
     blocked = _lb_emergency_block("metrics_anonymization", ep, r, ms)
     if blocked is not None:
         return blocked
@@ -843,10 +850,10 @@ def _metrics_anonymization(ctx: Ctx) -> ProbeResult:
 
 
 @probe("metrics_document_performance", "/v1/metrics/document-performance", {"hetzner"},
-       repro="curl $AI_BRIDGE_URL/v1/metrics/document-performance -H 'Authorization: Bearer $AI_BRIDGE_API_KEY' " + ATTRIBUTION_REPRO)
+       repro="curl $AI_BRIDGE_URL/v1/metrics/document-performance -H 'X-Forwarded-For: 198.51.100.1' -H 'Authorization: Bearer $AI_BRIDGE_API_KEY' " + ATTRIBUTION_REPRO)
 def _metrics_document_performance(ctx: Ctx) -> ProbeResult:
     ep = "/v1/metrics/document-performance"
-    r, ms = _timed(lambda: requests.get(f"{ctx.base_url}{ep}", headers=ctx.headers(), timeout=30, allow_redirects=False))
+    r, ms = _timed(lambda: requests.get(f"{ctx.base_url}{ep}", headers=_lb_emergency_headers(ctx, ep), timeout=30, allow_redirects=False))
     blocked = _lb_emergency_block("metrics_document_performance", ep, r, ms)
     if blocked is not None:
         return blocked
