@@ -61,7 +61,7 @@ for attempt in $(seq 1 60); do
  sleep 5
 done
 if [[ "$healthy" != 1 ]]; then rollback_runtime; exit 1; fi
-docker exec gpu-privacy-pdf-service python -c 'from src.privacy_service.app import HAIKU_MODEL; assert HAIKU_MODEL == "claude-haiku-5-5"; print("GPU model:", HAIKU_MODEL)' || { rollback_runtime; exit 1; }
+docker exec gpu-privacy-pdf-service python -c 'import ast,pathlib; tree=ast.parse(pathlib.Path("/app/src/privacy_service/app.py").read_text()); model=next(ast.literal_eval(n.value) for n in tree.body if isinstance(n,ast.Assign) and any(isinstance(t,ast.Name) and t.id=="HAIKU_MODEL" for t in n.targets)); assert model=="claude-haiku-5-5"; print("GPU model:", model)' || { rollback_runtime; exit 1; }
 printf '%s\n' "$target" > .privacy-deployed-sha
 echo "GPU deploy healthy: $target"
 REMOTE
