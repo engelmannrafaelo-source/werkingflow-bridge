@@ -2411,17 +2411,38 @@ record_deploy_proof() {
         # it (version, capacity, dependency) keeps the markers of both.
         if [[ "$gap" == "${server_name}: version UNPROVEN"* || -n "${KOPPEL_STUFE:-}" ]]; then
             warn "NOT recorded as proven: ${gap}; keeping previous proof markers"
+            # The same fact reaches /health: this SHA runs, smoke not proven.
+            [[ "$server_name" == "hetzner" && -z "${KOPPEL_STUFE:-}" ]] && write_health_deploy_proof "$host" "$sha" unproven
             return 0
         fi
     done
     if [[ "$server_name" == "hetzner" && -n "$SMOKE_UNPROVEN_PROBES" ]]; then
         write_smoke_unproven_marker "$host" "$sha" \
             || error_ "could not write ${SMOKE_UNPROVEN_FILE} on ${host} — the prod gates still see no proof (${DEPLOYED_SHA_FILE} was not advanced)"
+        write_health_deploy_proof "$host" "$sha" unproven
         warn "NOT recorded as proven: ${DEPLOYED_SHA_FILE} stays at the last proven build; ${SMOKE_UNPROVEN_FILE} names ${sha:0:9}"
         return 0
     fi
     rssh "$host" "printf '%s\n' '${sha}' > ${DEPLOYED_SHA_FILE} && rm -f ${SMOKE_UNPROVEN_FILE}" \
         || warn "could not record deployed SHA on ${host} — the foreign-commit gate will fall back to the checkout HEAD next time"
+    [[ "$server_name" == "hetzner" ]] && write_health_deploy_proof "$host" "$sha" proven
+    return 0
+}
+
+# write_health_deploy_proof <host> <sha> <proven|unproven>
+# The dev-first proof as GET /health "deploy": {sha, smoke, am}. Written from
+# the very place that writes DEPLOYED_SHA_FILE / SMOKE_UNPROVEN_FILE — one
+# source of truth, deploy-production reads it over HTTPS instead of SSH. Lives
+# on the log volume all workers share (src/deploy_proof.py reads it). If the
+# write fails /health reports "unbekannt" and the prod gate refuses: loud here,
+# never a silent proven.
+write_health_deploy_proof() {
+    local host="$1" sha="$2" smoke="$3" body b64
+    body=$(printf '{"sha":"%s","smoke":"%s","am":"%s"}' "$sha" "$smoke" "$(date -u '+%Y-%m-%dT%H:%M:%SZ')")
+    b64=$(printf '%s' "$body" | base64 -w0)
+    rssh "$host" "c=\$(docker ps --format '{{.Names}}' | grep -m1 '^wt-wrapper-worker'); [ -n \"\$c\" ] && echo '${b64}' | base64 -d | docker exec -i \"\$c\" sh -c 'cat > /app/logs/deploy-proof.json.tmp && mv /app/logs/deploy-proof.json.tmp /app/logs/deploy-proof.json'" \
+        && info "Deploy proof for /health: ${smoke} ${sha:0:9}" \
+        || warn "could not write /health deploy proof on ${host} — /health will report smoke=unbekannt and the prod gate will refuse until a deploy records it"
 }
 
 # write_smoke_unproven_marker <host> <sha>

@@ -8758,6 +8758,12 @@ async def health_check(request: Request):
         result["git_commit"] = None
         result["git_commit_error"] = f"build_metadata_unavailable: {type(e).__name__}"
 
+    # Dev-first proof for deploy-production (read over HTTPS, no SSH): the SHA
+    # bridge-deploy.sh last recorded and whether its smoke was proven. Missing or
+    # unreadable source = smoke "unbekannt", never "proven".
+    from src.deploy_proof import read_deploy_proof
+    result["deploy"] = read_deploy_proof()
+
     # ADR-0012: which job store this worker writes to — the marker it stamps
     # into every job_id, and the one the load balancer routes polls by. Exposed
     # because it is the ONE thing a deploy must verify before the LB starts
