@@ -233,6 +233,7 @@ async def enforce_budget(
                         "error": "budget_exhausted",
                         "reason": "project_budget_exhausted",
                         "retryable": False,
+                        "hardCap": True,
                         "appId": app_id,
                         "planId": plan.id,
                         "projectId": project_id,

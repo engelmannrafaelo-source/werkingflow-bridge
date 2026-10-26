@@ -11807,6 +11807,7 @@ async def http_exception_handler(request: Request, exc: StarletteHTTPException):
                 detail["error"]
                 if exc.status_code == 402
                 and detail.get("reason") == "project_budget_exhausted"
+                and detail.get("hardCap") is True
                 and detail.get("retryable") is False
                 and isinstance(detail.get("error"), str)
                 else None
