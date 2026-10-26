@@ -308,8 +308,9 @@ async def enforce_budget(
                 # consulted (project_budgets_service.evaluate).
                 logger.info(
                     "budget gate: BLOCKED (hard cap) user=%s app=%s plan=%s project=%s "
-                    "projectRemaining=%.4f",
+                    "projectRemaining=%.4f estimate=%.4f kind=%s",
                     user_id, app_id, plan.id, project_id, pr.get("remainingEur", 0.0),
+                    eff_estimate, call_kind,
                 )
                 raise HTTPException(
                     status_code=402,
