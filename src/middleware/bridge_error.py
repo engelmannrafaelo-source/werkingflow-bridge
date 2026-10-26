@@ -149,6 +149,7 @@ def bridge_error(
     extra: Optional[Dict[str, Any]] = None,
     retryable_override: Optional[bool] = None,
     reason: Optional[str] = None,
+    type_override: Optional[str] = None,
 ) -> JSONResponse:
     """
     Build a structured bridge error response.
@@ -162,6 +163,9 @@ def bridge_error(
         retry_after_s: hint for client backoff; sets Retry-After header
         extra:        optional additional fields merged into the error body
         reason:       narrow stable identifier (REASON_*) for panel aggregation
+        type_override: explicit OpenAI-compat `type` for the body, replacing the
+                      source-derived label (a 402 budget rejection is not a
+                      throttle)
 
     Returns:
         JSONResponse with the structured body.
@@ -191,6 +195,8 @@ def bridge_error(
         compat_type = "configuration_error"
     else:
         compat_type = "api_error"
+    if type_override:
+        compat_type = type_override
     body: Dict[str, Any] = {
         "error": {
             # OpenAI-compat fields — DON'T break existing clients.

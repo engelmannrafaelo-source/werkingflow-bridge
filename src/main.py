@@ -11799,6 +11799,18 @@ async def http_exception_handler(request: Request, exc: StarletteHTTPException):
             ),
             extra=extra,
             retryable_override=verdict.get("retryable"),
+            # A hard-capped project's rejection (retryable=false) is its own
+            # case, not a throttle: carry the gate's detail code
+            # ("budget_exhausted") as the type. The TopUp-backed project 402
+            # keeps its label (Report's durable drivers retry on it).
+            type_override=(
+                detail["error"]
+                if exc.status_code == 402
+                and detail.get("reason") == "project_budget_exhausted"
+                and detail.get("retryable") is False
+                and isinstance(detail.get("error"), str)
+                else None
+            ),
         )
     # Plain string detail
     else:

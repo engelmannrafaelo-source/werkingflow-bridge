@@ -93,6 +93,9 @@ class LeaseTokenRequest(BaseModel):
     app: str
     estimatedDurationMin: int = Field(default=15, ge=1, le=480)
     preferredAccountId: Optional[str] = None
+    # Optional project key (== attribution workflow_id). When present the
+    # pre-gate checks that project's budget (a hard-capped project is refused).
+    projectId: Optional[str] = None
 
 
 class LeaseTokenResponse(BaseModel):
@@ -182,7 +185,7 @@ async def lease_token(
         # (all_exhausted / monthly_exceeded_no_topup / trial_expired); the
         # gate lets unlicensed users through so trial users reach the sandbox.
         # Fail-open on DB/infra errors (enforce_budget swallows them).
-        await enforce_budget(str(uid), body.app, 0.0)
+        await enforce_budget(str(uid), body.app, 0.0, project_id=body.projectId)
 
         # 4. Pick best account — S7 fair round-robin: pass recent lease counts
         # so the router prefers under-used accounts over the highest-headroom
