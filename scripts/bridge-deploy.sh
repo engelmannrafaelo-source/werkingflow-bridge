@@ -77,6 +77,11 @@
 #         3 = still UNPROVEN, 1 = the probes are RED on the running build).
 set -euo pipefail
 
+if [[ "${1:-}" == gpu-privacy ]]; then
+    shift
+    exec bash "$(dirname "${BASH_SOURCE[0]}")/gpu-privacy-deploy.sh" "$@"
+fi
+
 # An explicit release branch allows a model hotfix without unrelated develop
 # changes. All existing ancestry, dev-first, foreign-commit and smoke gates
 # still apply. Only safe remote branch names enter remote shell commands.
