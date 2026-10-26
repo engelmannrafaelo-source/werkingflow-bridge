@@ -9050,7 +9050,7 @@ async def license_health_check(
         async for message in cli.run_completion(
             prompt="Reply with exactly: OK",
             system_prompt=None,
-            model="claude-haiku-4-5-20251001",
+            model="claude-haiku-5-5",
             max_turns=1
         ):
             # Check for rate limit in response

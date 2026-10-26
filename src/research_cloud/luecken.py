@@ -45,7 +45,7 @@ from pydantic import BaseModel, Field, ValidationError
 logger = logging.getLogger(__name__)
 
 FLAG = "RESEARCH_LUECKEN_NACHKONTROLLE"
-PRUEF_MODELL = "claude-haiku-4-5-20251001"
+PRUEF_MODELL = "claude-haiku-5-5"
 PRUEF_WERKZEUG = "luecken_melden"
 # The checker reads the whole report; beyond this the tail is cut and the cut
 # is said in the request (a report of this size is far beyond what was measured).

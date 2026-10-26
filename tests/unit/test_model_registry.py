@@ -37,17 +37,19 @@ from src.model_registry import (
 # ============================================================================
 
 class TestHaiku55Registration:
-    """Haiku 5.5 ist registriert, aber NICHT Alias-Default: Report/Energy nutzen 'haiku'."""
+    """Haiku 5.5 is the approved family default, including legacy callers."""
 
     def test_exact_id_served_as_is(self):
         assert resolve_model("claude-haiku-5-5") == ("claude-haiku-5-5", None)
 
-    def test_alias_haiku_stays_on_4_5(self):
-        assert _DEFAULT_BY_FAMILY["haiku"].id == "claude-haiku-4-5-20251001"
-        assert resolve_model("haiku")[0] == "claude-haiku-4-5-20251001"
+    def test_alias_haiku_uses_5_5(self):
+        assert _DEFAULT_BY_FAMILY["haiku"].id == "claude-haiku-5-5"
+        assert resolve_model("haiku")[0] == "claude-haiku-5-5"
 
-    def test_haiku_4_5_not_force_upgraded(self):
-        assert resolve_model("claude-haiku-4-5-20251001") == ("claude-haiku-4-5-20251001", None)
+    def test_haiku_4_5_force_upgraded(self):
+        resolved, warning = resolve_model("claude-haiku-4-5-20251001")
+        assert resolved == "claude-haiku-5-5"
+        assert "Force-upgraded" in warning
 
     def test_temperature_not_supported_on_5_5(self):
         assert model_supports_temperature("claude-haiku-5-5") is False
@@ -65,7 +67,7 @@ class TestFamilyDefaults:
     def test_deliberate_defaults_hold(self):
         assert _DEFAULT_BY_FAMILY["sonnet"].id == "claude-sonnet-5-5"
         assert _DEFAULT_BY_FAMILY["opus"].id == "claude-opus-5-5"
-        assert _DEFAULT_BY_FAMILY["haiku"].id == "claude-haiku-4-5-20251001"
+        assert _DEFAULT_BY_FAMILY["haiku"].id == "claude-haiku-5-5"
 
     def test_default_carries_flag(self):
         """Jeder Familien-Default muss aus einem is_default=True-Eintrag
@@ -92,12 +94,12 @@ class TestResolveModel:
             ("claude-opus-4-8", "claude-opus-5-5"),
             ("claude-opus-4-7", "claude-opus-5-5"),
             ("claude-opus-4-20250514", "claude-opus-5-5"),
-            ("claude-3-5-haiku-20241022", "claude-haiku-4-5-20251001"),
+            ("claude-3-5-haiku-20241022", "claude-haiku-5-5"),
             ("sonnet", "claude-sonnet-5-5"),
             ("opus", "claude-opus-5-5"),
             ("opus-4", "claude-opus-5-5"),
             ("claude-opus-5", "claude-opus-5-5"),
-            ("haiku", "claude-haiku-4-5-20251001"),
+            ("haiku", "claude-haiku-5-5"),
         ],
     )
     def test_resolution(self, requested, expected):
@@ -134,6 +136,7 @@ class TestBedrockMapping:
             ("claude-opus-4-7", "eu.anthropic.claude-opus-4-7"),
             ("claude-opus-4-8", "eu.anthropic.claude-opus-4-8"),
             ("claude-opus-5-5", "eu.anthropic.claude-opus-5-5"),
+            ("claude-haiku-5-5", "eu.anthropic.claude-haiku-5-5"),
         ],
     )
     def test_profile_ids_and_roundtrip(self, model, profile):
@@ -235,7 +238,7 @@ def test_fable_request_adaptation(thinking, effort):
         assert body["thinking"] == {"type":"adaptive"}
 
 
-@pytest.mark.parametrize("model", ["claude-sonnet-6", "sonnet-5-6", "SONNET-6", "haiku-5"])
+@pytest.mark.parametrize("model", ["claude-sonnet-6", "sonnet-5-6", "SONNET-6", "haiku-6"])
 def test_future_versions_never_silently_downgrade(model):
     assert resolve_model(model)[0] is None
 
@@ -263,3 +266,20 @@ def test_sonnet_55_legacy_request_controls(thinking, expected):
     assert body["thinking"] == expected
     assert body["output_config"] == {"effort": "medium", "format": {"type": "json_schema"}}
     assert not ({"temperature", "top_p", "top_k"} & body.keys())
+
+
+@pytest.mark.parametrize("thinking", [
+    {"type": "enabled", "budget_tokens": 2048},
+    {"type": "adaptive", "display": "summarized"},
+])
+def test_haiku55_request_controls(thinking):
+    from src.model_request import adapt_model_request
+    body = {"thinking": thinking, "temperature": 0.3, "top_p": 0.9,
+            "top_k": 20, "output_config": {"effort": "low"},
+            "tool_choice": {"type": "tool", "name": "result"}}
+    adapt_model_request("claude-haiku-5-5", body)
+    assert body["thinking"]["type"] == "adaptive"
+    assert "budget_tokens" not in body["thinking"]
+    assert not ({"temperature", "top_p", "top_k"} & body.keys())
+    assert body["output_config"]["effort"] == "low"
+    assert body["tool_choice"] == {"type": "tool", "name": "result"}
