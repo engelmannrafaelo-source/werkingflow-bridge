@@ -101,7 +101,8 @@ def usable_credits_by_plan(credits: List[Dict[str, Any]]) -> Dict[str, int]:
 
 
 async def consume_credit(
-    user_id: uuid.UUID, plan_id: str, project_id: Optional[str] = None
+    user_id: uuid.UUID, plan_id: str, project_id: Optional[str] = None,
+    hard_cap: bool = False,
 ) -> Dict[str, Any]:
     """
     Decrement available credit by 1.
@@ -123,7 +124,8 @@ async def consume_credit(
     plan.api_budget_eur the moment its slot is consumed). The allocation is
     keyed by the POT plan (budget_plan_for), never by a credit kind — the
     metering path only knows pots. Allocation is idempotent, so a retried
-    job-create never double-allocates. Omitting project_id keeps the legacy
+    job-create never double-allocates. `hard_cap=True` marks that
+    budget as a run ceiling (no TopUp fallback, see project_budgets_service). Omitting project_id keeps the legacy
     behaviour (slot only; the budget then self-provisions lazily downstream).
     """
     from src.budget.plans import accepted_credit_plan_ids, budget_plan_for, get_plan
@@ -174,6 +176,7 @@ async def consume_credit(
                     project_id=project_id,
                     limit_eur=float(paying.api_budget_eur),
                     credit_id=row["id"],
+                    hard_cap=hard_cap,
                 )
 
     return {

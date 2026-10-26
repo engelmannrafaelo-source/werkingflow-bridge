@@ -122,7 +122,7 @@ async def test_allocate_rejects_empty_project_id():
 
 @pytest.mark.asyncio
 async def test_get_budget_computes_remaining():
-    pool, _ = _mock_pool(fetchrow_result={"limit_eur": Decimal("100"), "used_eur": Decimal("30")})
+    pool, _ = _mock_pool(fetchrow_result={"limit_eur": Decimal("100"), "used_eur": Decimal("30"), "hard_cap": False})
     with patch(PG, return_value=pool):
         b = await get_budget(uuid.uuid4(), "energy-project", "Proj_1")
     assert b == {"limitEur": 100.0, "usedEur": 30.0, "remainingEur": 70.0}
@@ -148,7 +148,7 @@ async def test_evaluate_not_exists_blocks():
 
 @pytest.mark.asyncio
 async def test_evaluate_allows_with_remaining():
-    pool, _ = _mock_pool(fetchrow_result={"limit_eur": Decimal("100"), "used_eur": Decimal("99.9")})
+    pool, _ = _mock_pool(fetchrow_result={"limit_eur": Decimal("100"), "used_eur": Decimal("99.9"), "hard_cap": False})
     with patch(PG, return_value=pool):
         r = await evaluate(uuid.uuid4(), "energy-project", "Proj_1", 0.0)
     assert r["exists"] is True and r["allowed"] is True
@@ -159,7 +159,7 @@ async def test_evaluate_allows_with_remaining():
 @pytest.mark.asyncio
 async def test_evaluate_blocks_when_exhausted():
     # Project pot exhausted AND no TopUp lots (default _mock_pool) → truly blocked.
-    pool, _ = _mock_pool(fetchrow_result={"limit_eur": Decimal("100"), "used_eur": Decimal("100")})
+    pool, _ = _mock_pool(fetchrow_result={"limit_eur": Decimal("100"), "used_eur": Decimal("100"), "hard_cap": False})
     with patch(PG, return_value=pool):
         r = await evaluate(uuid.uuid4(), "energy-project", "Proj_1", 0.5)
     assert r["exists"] is True and r["allowed"] is False
@@ -172,7 +172,7 @@ async def test_evaluate_falls_back_to_topup_when_project_exhausted():
     # TopUp — evaluate() must allow the call instead of raising 402 while
     # 15.500 EUR of TopUp sits unused.
     pool, _ = _mock_pool(
-        fetchrow_result={"limit_eur": Decimal("100"), "used_eur": Decimal("100")},
+        fetchrow_result={"limit_eur": Decimal("100"), "used_eur": Decimal("100"), "hard_cap": False},
         topup_rows=[_topup_row(_LOT_1, 50.0)],
     )
     with patch(PG, return_value=pool):
@@ -185,7 +185,7 @@ async def test_evaluate_falls_back_to_topup_when_project_exhausted():
 @pytest.mark.asyncio
 async def test_evaluate_ignores_expired_topup_lot():
     pool, _ = _mock_pool(
-        fetchrow_result={"limit_eur": Decimal("100"), "used_eur": Decimal("100")},
+        fetchrow_result={"limit_eur": Decimal("100"), "used_eur": Decimal("100"), "hard_cap": False},
         topup_rows=[_topup_row("expired", 50.0, purchased_days_ago=400, expires_in_days=-1)],
     )
     with patch(PG, return_value=pool):
@@ -198,7 +198,7 @@ async def test_evaluate_ignores_expired_topup_lot():
 
 @pytest.mark.asyncio
 async def test_deduct_happy_path():
-    pool, conn = _mock_pool(fetchrow_result={"limit_eur": Decimal("100"), "used_eur": Decimal("10")})
+    pool, conn = _mock_pool(fetchrow_result={"limit_eur": Decimal("100"), "used_eur": Decimal("10"), "hard_cap": False})
     with patch(PG, return_value=pool):
         r = await deduct(uuid.uuid4(), "energy-project", "Proj_1", 2.5)
     assert r["exists"] is True
@@ -213,7 +213,7 @@ async def test_deduct_happy_path():
 async def test_deduct_caps_at_remaining_when_no_topup_available():
     # 5 EUR remaining, call costs 8 EUR, no TopUp lots → 5 deducted total,
     # the 3 EUR shortfall is absorbed (logged), used == limit (100).
-    pool, conn = _mock_pool(fetchrow_result={"limit_eur": Decimal("100"), "used_eur": Decimal("95")})
+    pool, conn = _mock_pool(fetchrow_result={"limit_eur": Decimal("100"), "used_eur": Decimal("95"), "hard_cap": False})
     with patch(PG, return_value=pool):
         r = await deduct(uuid.uuid4(), "energy-project", "Proj_1", 8.0)
     assert r["deductedEur"] == 5.0
@@ -229,7 +229,7 @@ async def test_deduct_falls_back_to_topup_for_shortfall():
     # remaining 3 EUR must be drawn from the user's TopUp lot instead of
     # being silently absorbed.
     pool, conn = _mock_pool(
-        fetchrow_result={"limit_eur": Decimal("100"), "used_eur": Decimal("95")},
+        fetchrow_result={"limit_eur": Decimal("100"), "used_eur": Decimal("95"), "hard_cap": False},
         topup_rows=[_topup_row(_LOT_1, 50.0)],
     )
     with patch(PG, return_value=pool):
@@ -251,7 +251,7 @@ async def test_deduct_shortfall_when_project_and_topup_both_insufficient():
     # Project covers 5, TopUp lot only has 1 more → total covered 6, cost 8.
     # Must NOT raise — the call already happened; shortfall is absorbed.
     pool, conn = _mock_pool(
-        fetchrow_result={"limit_eur": Decimal("100"), "used_eur": Decimal("95")},
+        fetchrow_result={"limit_eur": Decimal("100"), "used_eur": Decimal("95"), "hard_cap": False},
         topup_rows=[_topup_row(_LOT_1, 1.0)],
     )
     with patch(PG, return_value=pool):
@@ -275,7 +275,7 @@ async def test_deduct_no_budget_row_is_noop():
 
 @pytest.mark.asyncio
 async def test_deduct_zero_cost_noop_with_state():
-    pool, _ = _mock_pool(fetchrow_result={"limit_eur": Decimal("100"), "used_eur": Decimal("40")})
+    pool, _ = _mock_pool(fetchrow_result={"limit_eur": Decimal("100"), "used_eur": Decimal("40"), "hard_cap": False})
     with patch(PG, return_value=pool):
         r = await deduct(uuid.uuid4(), "energy-project", "Proj_1", 0.0)
     assert r["exists"] is True and r["deductedEur"] == 0.0 and r["remainingEur"] == 60.0
@@ -288,7 +288,7 @@ async def test_deduct_lazy_allocates_when_missing():
     conn = AsyncMock()
     conn.execute = AsyncMock(return_value=None)
     conn.fetchrow = AsyncMock(
-        side_effect=[None, {"limit_eur": Decimal("100"), "used_eur": Decimal("0")}]
+        side_effect=[None, {"limit_eur": Decimal("100"), "used_eur": Decimal("0"), "hard_cap": False}]
     )
 
     @asynccontextmanager

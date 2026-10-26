@@ -219,24 +219,48 @@ async def enforce_budget(
         if pr.get("exists"):
             if pr.get("allowed"):
                 return
-            # `allowed=False` means the project's own limit is used up. The
-            # limit is a ceiling: TopUp is not consulted (project_budgets_service).
+            if pr.get("hardCap"):
+                # Lauf-Deckel: the project limit is a ceiling, TopUp was not
+                # consulted (project_budgets_service.evaluate).
+                logger.info(
+                    "budget gate: BLOCKED (hard cap) user=%s app=%s plan=%s project=%s "
+                    "projectRemaining=%.4f",
+                    user_id, app_id, plan.id, project_id, pr.get("remainingEur", 0.0),
+                )
+                raise HTTPException(
+                    status_code=402,
+                    detail={
+                        "error": "budget_exhausted",
+                        "reason": "project_budget_exhausted",
+                        "retryable": False,
+                        "appId": app_id,
+                        "planId": plan.id,
+                        "projectId": project_id,
+                        "totalRemainingEur": pr.get("remainingEur", 0.0),
+                        "message": "Das Projektbudget ist aufgebraucht. Bitte ein neues Projekt-Paket buchen.",
+                    },
+                )
+            # `allowed=False` here means BOTH pots are exhausted — evaluate()
+            # already fell back to the user's TopUp balance before reporting
+            # this (see project_budgets_service.evaluate). Not a bypassable
+            # per-project-only block anymore.
+            total_remaining = pr.get("remainingEur", 0.0) + pr.get("topUpRemainingEur", 0.0)
             logger.info(
                 "budget gate: BLOCKED (per-project) user=%s app=%s plan=%s project=%s "
-                "projectRemaining=%.4f",
-                user_id, app_id, plan.id, project_id, pr.get("remainingEur", 0.0),
+                "projectRemaining=%.4f topUpRemaining=%.4f",
+                user_id, app_id, plan.id, project_id,
+                pr.get("remainingEur", 0.0), pr.get("topUpRemainingEur", 0.0),
             )
             raise HTTPException(
                 status_code=402,
                 detail={
                     "error": "budget_exhausted",
                     "reason": "project_budget_exhausted",
-                    "retryable": False,
                     "appId": app_id,
                     "planId": plan.id,
                     "projectId": project_id,
-                    "totalRemainingEur": pr.get("remainingEur", 0.0),
-                    "message": "Das Projektbudget ist aufgebraucht. Bitte ein neues Projekt-Paket buchen.",
+                    "totalRemainingEur": total_remaining,
+                    "message": "Projekt- und TopUp-Guthaben aufgebraucht. Bitte ein neues Projekt-Paket buchen oder Guthaben aufladen.",
                 },
             )
         # Not allocated yet (the project's first call). The entitling slot was

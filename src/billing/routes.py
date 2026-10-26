@@ -1008,6 +1008,10 @@ class ConsumeProjectCreditRequest(BaseModel):
     # App-side project identifier (== Bridge attribution workflow_id). When
     # present, the consumed slot's per-project API budget is allocated atomically.
     project_id: Optional[str] = None
+    # Marks the allocated project budget as a hard run ceiling (Lauf-Deckel):
+    # no TopUp fallback once the limit is used up. Set by the creator of an
+    # Energy customer run; default False keeps the TopUp fallback.
+    hard_cap: bool = False
 
 
 @_project_credits_router.post(
@@ -1035,7 +1039,8 @@ async def consume_project_credit(
     project_id = body.project_id if body else None
     try:
         return await project_credits_service.consume_credit(
-            _uuid.UUID(user_id), plan_id, project_id
+            _uuid.UUID(user_id), plan_id, project_id,
+            hard_cap=bool(body.hard_cap) if body else False,
         )
     except project_credits_service.CreditsExhaustedError as e:
         raise HTTPException(status_code=402, detail=str(e))
