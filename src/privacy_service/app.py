@@ -778,7 +778,7 @@ async def document_convert_and_anonymize_endpoint(request: Request):
 
 # Direct Anthropic API — bypasses Bridge workers to avoid rate-limit contention
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
-HAIKU_MODEL = "claude-haiku-4-5-20251001"
+HAIKU_MODEL = "claude-haiku-5-5"
 ANTHROPIC_API_URL = "https://api.anthropic.com/v1/messages"
 
 SEMANTIC_CONVERTER_SYSTEM_PROMPT = """# HTML-Strukturkonverter fuer Dokumenten-Templates
