@@ -125,7 +125,7 @@ async def test_get_budget_computes_remaining():
     pool, _ = _mock_pool(fetchrow_result={"limit_eur": Decimal("100"), "used_eur": Decimal("30"), "hard_cap": False})
     with patch(PG, return_value=pool):
         b = await get_budget(uuid.uuid4(), "energy-project", "Proj_1")
-    assert b == {"limitEur": 100.0, "usedEur": 30.0, "remainingEur": 70.0}
+    assert b == {"limitEur": 100.0, "usedEur": 30.0, "remainingEur": 70.0, "hardCap": False}
 
 
 @pytest.mark.asyncio

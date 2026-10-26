@@ -111,6 +111,19 @@ async def allocate_budget(
         credit_id,
         hard_cap,
     )
+    if row is None and hard_cap:
+        # The row already existed (earlier lazy allocation or an earlier consume
+        # without the flag): the ceiling is only ever added, never dropped, so an
+        # explicitly requested hard_cap is not silently lost.
+        await conn.execute(
+            """
+            UPDATE project_budgets SET hard_cap = TRUE, updated_at = NOW()
+             WHERE user_id = $1 AND plan_id = $2 AND project_id = $3 AND NOT hard_cap
+            """,
+            user_id,
+            plan_id,
+            project_id,
+        )
     return row is not None
 
 
@@ -297,7 +310,9 @@ async def evaluate(
 
     A budget marked `hard_cap` (Lauf-Deckel) is the exception: its limit is a
     ceiling. It is allowed only while remaining > 0, TopUp is never consulted,
-    and an estimate of 0 opens nothing. The answer carries `hardCap`.
+    and an estimate of 0 opens nothing. The answer carries `hardCap`. Calls that
+    run in parallel past the gate can each overshoot once before deduct() clamps
+    used to the limit; the ceiling is hard for every call that starts afterwards.
     """
     budget = await get_budget(user_id, plan_id, project_id)
     if budget is None:

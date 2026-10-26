@@ -1037,6 +1037,10 @@ async def consume_project_credit(
     in project_id sauber durchgehen.
     """
     project_id = body.project_id if body else None
+    if body and body.hard_cap and not project_id:
+        # hard_cap marks a project budget; without project_id none is allocated
+        # and the ceiling would silently not exist.
+        raise HTTPException(status_code=400, detail="hard_cap requires project_id")
     try:
         return await project_credits_service.consume_credit(
             _uuid.UUID(user_id), plan_id, project_id,
