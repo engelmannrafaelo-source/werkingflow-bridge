@@ -77,6 +77,15 @@
 #         3 = still UNPROVEN, 1 = the probes are RED on the running build).
 set -euo pipefail
 
+# An explicit release branch allows a model hotfix without unrelated develop
+# changes. All existing ancestry, dev-first, foreign-commit and smoke gates
+# still apply. Only safe remote branch names enter remote shell commands.
+export DEPLOY_REF="${DEPLOY_REF:-origin/develop}"
+if [[ ! "$DEPLOY_REF" =~ ^origin/[A-Za-z0-9][A-Za-z0-9_./-]*$ ]] || [[ "$DEPLOY_REF" == *..* ]]; then
+    echo "Invalid DEPLOY_REF: expected origin/<release-branch>" >&2
+    exit 1
+fi
+
 # ============================================================================
 # Config
 # ============================================================================
@@ -470,11 +479,11 @@ phase_prod_order_gate() {
     local repo_dir target_sha dev_sha_raw dev_sha
     repo_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
     # Target = what Phase 2 will fast-forward the host to: origin/develop.
-    if ! git -C "$repo_dir" fetch --quiet origin develop; then
+    if ! git -C "$repo_dir" fetch --quiet origin; then
         error_ "ABORTED: git fetch origin develop failed — cannot determine the target ref."
         return 1
     fi
-    target_sha="$(git -C "$repo_dir" rev-parse origin/develop)"
+    target_sha="$(git -C "$repo_dir" rev-parse "$DEPLOY_REF")"
 
     dev_sha_raw="$(rssh "$HETZNER_HOST" "cat ${DEPLOYED_SHA_FILE} 2>/dev/null" | tr -d '[:space:]' || true)"
     if [[ ! "$dev_sha_raw" =~ ^[0-9a-f]{7,40}$ ]]; then
@@ -751,7 +760,7 @@ phase_code_update() {
     fi
 
     local remote_sha
-    remote_sha=$(rssh "$host" "cd ${REMOTE_REPO} && git rev-parse origin/develop")
+    remote_sha=$(rssh "$host" "cd ${REMOTE_REPO} && git rev-parse '${DEPLOY_REF}'")
 
     # prod-zusammen: both hosts on ONE SHA. develop moving between the server2
     # and the worker-host pull would otherwise ship a mixed prod bridge.
@@ -790,7 +799,7 @@ phase_code_update() {
         return 0
     fi
 
-    dry_rssh "$host" "cd ${REMOTE_REPO} && git pull --ff-only origin develop" || {
+    dry_rssh "$host" "cd ${REMOTE_REPO} && git merge --ff-only '${remote_sha}'" || {
         error_ "git pull --ff-only failed — cannot fast-forward to origin/develop"
         return 1
     }
@@ -2824,11 +2833,11 @@ deploy_prod_zusammen() {
 
     local repo_dir r
     repo_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-    git -C "$repo_dir" fetch --quiet origin develop || {
+    git -C "$repo_dir" fetch --quiet origin || {
         error_ "ABORTED: git fetch origin develop failed — cannot pin the target SHA."
         return 1
     }
-    KOPPEL_ZIEL_SHA="$(git -C "$repo_dir" rev-parse origin/develop)"
+    KOPPEL_ZIEL_SHA="$(git -C "$repo_dir" rev-parse "$DEPLOY_REF")"
     info "Ziel-SHA fuer beide Hosts: ${KOPPEL_ZIEL_SHA}"
     if [[ "$DRY_RUN" == "true" ]]; then
         info "[DRY-RUN] Reihenfolge: S0 nginx-Rueckweg sichern -> S1 server2 (${SERVER2_ALL}) -> S2 Worker-Host (${WORKERHOST_ALL})"
