@@ -13,7 +13,8 @@ cd /root/werkingflow-bridge
 git diff --quiet && git diff --cached --quiet || { echo 'Tracked GPU files modified'; exit 1; }
 old_sha=$(git rev-parse HEAD)
 old_image=$(docker inspect --format '{{.Image}}' gpu-privacy-pdf-service)
-git fetch origin
+branch="${1#origin/}"
+git fetch origin "$branch:refs/remotes/origin/$branch"
 target=$(git rev-parse "$1^{commit}")
 git merge-base --is-ancestor "$old_sha" "$target" || { echo 'Not a fast-forward'; exit 1; }
 # This release must not ship unrelated changes on the shared privacy host.
