@@ -476,6 +476,50 @@ phase_tooling_freshness_gate() {
 # Deliberately NO env-var bypass: the only exception path is --force-prod-ahead
 # plus a typed confirmation at a TTY. An emergency is a human decision made
 # consciously, not a flag a script sets.
+# read_dev_health_proof — the dev-first proof from https://<dev bridge>/health.
+# Sets DEV_PROOF_SHA / DEV_PROOF_SMOKE / DEV_PROOF_GRUND ("" when absent).
+# No redirect following; any curl failure, non-200 or unparsable body is an
+# error with the real cause — never an empty "not readable".
+DEV_HEALTH_URL="${DEV_HEALTH_URL:-https://bridge.werking.tools/health}"
+read_dev_health_proof() {
+    local body err http rc=0 fields home
+    body="$(mktemp)"; err="$(mktemp)"
+    http="$(curl -sS --max-time 15 -o "$body" -w '%{http_code}' "$DEV_HEALTH_URL" 2>"$err")" || rc=$?
+    if [[ $rc -ne 0 ]]; then
+        error_ "ABORTED: ${DEV_HEALTH_URL} unreachable (curl rc=${rc}): $(tr '\n' ' ' < "$err")"
+        rm -f "$body" "$err"; return 1
+    fi
+    if [[ "$http" != "200" ]]; then
+        error_ "ABORTED: ${DEV_HEALTH_URL} answered HTTP ${http} (expected 200; redirects are not followed)."
+        rm -f "$body" "$err"; return 1
+    fi
+    fields="$(python3 -I - "$body" <<'PY' || true
+import json, sys
+try:
+    d = json.load(open(sys.argv[1], encoding="utf-8"))
+    dep = d.get("deploy") or {}
+    row = [d.get("job_home"), dep.get("sha"), dep.get("smoke"), dep.get("grund")]
+except (OSError, ValueError, AttributeError, TypeError) as e:
+    print("PARSEFEHLER\t" + type(e).__name__)
+    raise SystemExit(0)
+print("\t".join("-" if v in (None, "") else str(v) for v in row))
+PY
+)"
+    rm -f "$body" "$err"
+    IFS=$'\t' read -r home DEV_PROOF_SHA DEV_PROOF_SMOKE DEV_PROOF_GRUND <<< "$fields"
+    if [[ "$home" == "PARSEFEHLER" || -z "$home" ]]; then
+        error_ "ABORTED: ${DEV_HEALTH_URL} returned no readable /health JSON (${DEV_PROOF_SHA:-no output})."
+        return 1
+    fi
+    if [[ "$home" != "dev" ]]; then
+        error_ "ABORTED: ${DEV_HEALTH_URL} is not answered by the dev bridge (job_home=${home}, expected dev)."
+        return 1
+    fi
+    [[ "$DEV_PROOF_SHA" == "-" ]] && DEV_PROOF_SHA=""
+    [[ "$DEV_PROOF_GRUND" == "-" ]] && DEV_PROOF_GRUND=""
+    return 0
+}
+
 phase_prod_order_gate() {
     local server_name="$1"
     case "$server_name" in server2|prod-workers) ;; *) return 0 ;; esac
@@ -490,44 +534,38 @@ phase_prod_order_gate() {
     fi
     target_sha="$(git -C "$repo_dir" rev-parse "$DEPLOY_REF")"
 
-    dev_sha_raw="$(rssh "$HETZNER_HOST" "cat ${DEPLOYED_SHA_FILE} 2>/dev/null" | tr -d '[:space:]' || true)"
-    if [[ ! "$dev_sha_raw" =~ ^[0-9a-f]{7,40}$ ]]; then
-        error_ "ABORTED: cannot read the dev bridge's deployed SHA (${HETZNER_HOST}:${DEPLOYED_SHA_FILE})."
-        error_ "  Without proof of what dev actually RUNS, this prod deploy is unverifiable."
-        error_ "  Deploy hetzner first (which writes the marker), then retry."
-        return 1
-    fi
-    dev_sha="$(git -C "$repo_dir" rev-parse --verify "${dev_sha_raw}^{commit}" 2>/dev/null || true)"
-    if [[ -z "$dev_sha" ]]; then
-        error_ "ABORTED: dev bridge's deployed SHA ${dev_sha_raw} is unknown to this repo (even after fetch)."
-        error_ "  That itself is a provenance problem — investigate before deploying prod."
-        return 1
-    fi
-
-    # An UNPROVEN hetzner deploy does not advance DEPLOYED_SHA_FILE, so dev_sha
-    # is still the last PROVEN build. The marker only sharpens the message — and
-    # catches a DEPLOYED_SHA_FILE that names the unproven build itself.
-    local unproven unproven_sha
-    unproven="$(rssh "$HETZNER_HOST" "cat ${SMOKE_UNPROVEN_FILE} 2>/dev/null" || true)"
-    unproven_sha="$(sed -n 's/^sha=//p' <<< "$unproven" | head -1 | tr -d '[:space:]')"
-    if [[ -n "$unproven" && -n "$unproven_sha" && "$dev_sha" == "$unproven_sha"* ]]; then
-        error_ "Dev bridge's deployed-SHA marker names ${dev_sha:0:9}, which ${SMOKE_UNPROVEN_FILE} lists as UNPROVEN."
-    elif git -C "$repo_dir" merge-base --is-ancestor "$target_sha" "$dev_sha"; then
-        info "OK: target ${target_sha:0:9} already runs on the dev bridge (deployed: ${dev_sha:0:9})."
-        [[ -n "$unproven" ]] && warn "  Note: dev currently runs a newer UNPROVEN build (${unproven_sha:0:9}); the target is covered by the proven ${dev_sha:0:9}."
-        return 0
+    # The dev-first proof is read over HTTPS from the dev bridge's GET /health
+    # (deploy {sha, smoke}), NOT over SSH: this gate also runs on PROD-OPS
+    # (deploy-production bridge -> prod-zusammen), which cannot reach port 22 of
+    # the dev bridge. read_dev_health_proof fails loud with the real cause.
+    local unproven=""
+    read_dev_health_proof || return 1
+    dev_sha_raw="$DEV_PROOF_SHA"
+    if [[ "$DEV_PROOF_SMOKE" != "proven" ]]; then
+        unproven="deploy.smoke=${DEV_PROOF_SMOKE} deploy.sha=${DEV_PROOF_SHA:-unknown} grund=${DEV_PROOF_GRUND:--}"
+        error_ "Dev bridge /health reports NO STAGING PROOF: ${unproven}"
+        dev_sha="${DEV_PROOF_SHA:-}"
+    else
+        dev_sha="$(git -C "$repo_dir" rev-parse --verify "${dev_sha_raw}^{commit}" 2>/dev/null || true)"
+        if [[ -z "$dev_sha" ]]; then
+            error_ "ABORTED: dev bridge's deployed SHA ${dev_sha_raw} is unknown to this repo (even after fetch)."
+            error_ "  That itself is a provenance problem — investigate before deploying prod."
+            return 1
+        fi
+        if git -C "$repo_dir" merge-base --is-ancestor "$target_sha" "$dev_sha"; then
+            info "OK: target ${target_sha:0:9} already runs PROVEN on the dev bridge (deployed: ${dev_sha:0:9})."
+            return 0
+        fi
     fi
 
     local behind
     behind="$(git -C "$repo_dir" rev-list --count "${dev_sha}..${target_sha}" 2>/dev/null || echo '?')"
     error_ "BLOCKED by the dev-first order gate: the target ref does NOT run on the dev bridge yet."
     error_ "  Target (origin/develop) : ${target_sha}"
-    error_ "  Dev bridge runs         : ${dev_sha} (${behind} commit(s) behind the target)"
+    error_ "  Dev bridge runs         : ${dev_sha:-unknown} (${behind} commit(s) behind the target)"
     if [[ -n "$unproven" ]]; then
-        error_ "  NO STAGING PROOF: dev runs ${unproven_sha:0:9}, but its pool-gated smoke"
-        error_ "  probes never passed (UNPROVEN, ${SMOKE_UNPROVEN_FILE}):"
-        while IFS= read -r line; do error_ "    ${line}"; done <<< "$unproven"
-        error_ "  Prove it first: 'bridge-deploy.sh smoke-nachholen' once the dev pool has capacity."
+        error_ "  NO STAGING PROOF (/health): ${unproven}"
+        error_ "  UNPROVEN: 'bridge-deploy.sh smoke-nachholen' once the dev pool has capacity; unbekannt: redeploy hetzner so the proof is recorded."
     fi
     error_ "  The order is deliberate (Rafael, 2026-08-20): deploy hetzner first, verify,"
     error_ "  THEN prod — or run 'bridge-deploy.sh both', which does exactly that."
@@ -2406,27 +2444,45 @@ EOF
 record_deploy_proof() {
     local host="$1" server_name="$2" sha="$3"
     local gap
+    # /health must never keep naming an OLDER proof while this deploy's result is
+    # not yet (or cannot be) recorded: clear it first. A failed write below then
+    # leaves "unbekannt" (gate red), not the previous "proven".
+    if [[ "$server_name" == "hetzner" && -z "${KOPPEL_STUFE:-}" ]]; then
+        clear_health_deploy_proof "$host" \
+            || { error_ "could not clear the /health deploy proof on ${host} — refusing to record a new result next to a stale one"; return 1; }
+    fi
     for gap in "${SMOKE_UNPROVEN[@]}"; do
         # prod-zusammen: ONE joint smoke vouches for both hosts, so ANY gap in
         # it (version, capacity, dependency) keeps the markers of both.
         if [[ "$gap" == "${server_name}: version UNPROVEN"* || -n "${KOPPEL_STUFE:-}" ]]; then
             warn "NOT recorded as proven: ${gap}; keeping previous proof markers"
             # The same fact reaches /health: this SHA runs, smoke not proven.
-            [[ "$server_name" == "hetzner" && -z "${KOPPEL_STUFE:-}" ]] && write_health_deploy_proof "$host" "$sha" unproven
+            if [[ "$server_name" == "hetzner" && -z "${KOPPEL_STUFE:-}" ]]; then
+                write_health_deploy_proof "$host" "$sha" unproven || true
+            fi
             return 0
         fi
     done
     if [[ "$server_name" == "hetzner" && -n "$SMOKE_UNPROVEN_PROBES" ]]; then
         write_smoke_unproven_marker "$host" "$sha" \
             || error_ "could not write ${SMOKE_UNPROVEN_FILE} on ${host} — the prod gates still see no proof (${DEPLOYED_SHA_FILE} was not advanced)"
-        write_health_deploy_proof "$host" "$sha" unproven
+        write_health_deploy_proof "$host" "$sha" unproven || true
         warn "NOT recorded as proven: ${DEPLOYED_SHA_FILE} stays at the last proven build; ${SMOKE_UNPROVEN_FILE} names ${sha:0:9}"
         return 0
     fi
-    rssh "$host" "printf '%s\n' '${sha}' > ${DEPLOYED_SHA_FILE} && rm -f ${SMOKE_UNPROVEN_FILE}" \
-        || warn "could not record deployed SHA on ${host} — the foreign-commit gate will fall back to the checkout HEAD next time"
-    [[ "$server_name" == "hetzner" ]] && write_health_deploy_proof "$host" "$sha" proven
+    if rssh "$host" "printf '%s\n' '${sha}' > ${DEPLOYED_SHA_FILE} && rm -f ${SMOKE_UNPROVEN_FILE}"; then
+        # proven only when the marker write above succeeded: one source, no split.
+        if [[ "$server_name" == "hetzner" ]]; then write_health_deploy_proof "$host" "$sha" proven || true; fi
+    else
+        warn "could not record deployed SHA on ${host} — the foreign-commit gate will fall back to the checkout HEAD next time; /health deploy proof stays unbekannt"
+    fi
     return 0
+}
+
+# clear_health_deploy_proof <host> — removes the /health deploy proof (all workers share the log volume).
+clear_health_deploy_proof() {
+    local host="$1"
+    rssh "$host" "c=\$(docker ps --format '{{.Names}}' | grep -m1 '^wt-wrapper-worker'); [ -n \"\$c\" ] && docker exec \"\$c\" rm -f /app/logs/deploy-proof.json /app/logs/deploy-proof.json.tmp"
 }
 
 # write_health_deploy_proof <host> <sha> <proven|unproven>
@@ -2434,15 +2490,18 @@ record_deploy_proof() {
 # the very place that writes DEPLOYED_SHA_FILE / SMOKE_UNPROVEN_FILE — one
 # source of truth, deploy-production reads it over HTTPS instead of SSH. Lives
 # on the log volume all workers share (src/deploy_proof.py reads it). If the
-# write fails /health reports "unbekannt" and the prod gate refuses: loud here,
-# never a silent proven.
+# write fails /health reports "unbekannt" (record_deploy_proof cleared it first)
+# and the prod gate refuses: loud here, never a silent proven. Returns 1 then.
 write_health_deploy_proof() {
     local host="$1" sha="$2" smoke="$3" body b64
     body=$(printf '{"sha":"%s","smoke":"%s","am":"%s"}' "$sha" "$smoke" "$(date -u '+%Y-%m-%dT%H:%M:%SZ')")
     b64=$(printf '%s' "$body" | base64 -w0)
-    rssh "$host" "c=\$(docker ps --format '{{.Names}}' | grep -m1 '^wt-wrapper-worker'); [ -n \"\$c\" ] && echo '${b64}' | base64 -d | docker exec -i \"\$c\" sh -c 'cat > /app/logs/deploy-proof.json.tmp && mv /app/logs/deploy-proof.json.tmp /app/logs/deploy-proof.json'" \
-        && info "Deploy proof for /health: ${smoke} ${sha:0:9}" \
-        || warn "could not write /health deploy proof on ${host} — /health will report smoke=unbekannt and the prod gate will refuse until a deploy records it"
+    if rssh "$host" "c=\$(docker ps --format '{{.Names}}' | grep -m1 '^wt-wrapper-worker'); [ -n \"\$c\" ] && echo '${b64}' | base64 -d | docker exec -i \"\$c\" sh -c 'cat > /app/logs/deploy-proof.json.tmp && mv /app/logs/deploy-proof.json.tmp /app/logs/deploy-proof.json'"; then
+        info "Deploy proof for /health: ${smoke} ${sha:0:9}"
+        return 0
+    fi
+    warn "could not write /health deploy proof on ${host} — /health reports smoke=unbekannt and the prod gate refuses until a deploy records it"
+    return 1
 }
 
 # write_smoke_unproven_marker <host> <sha>
@@ -2506,7 +2565,11 @@ catch_up_unproven_smoke() {
             error_ "Probes green, but recording the proof on ${host} failed — the marker may still stand."
             return 1
         }
-        info "PROVEN: ${probes} green on ${head:0:9} (bridge '${bridge}'); ${DEPLOYED_SHA_FILE} = ${head:0:9}, marker removed."
+        write_health_deploy_proof "$host" "$head" proven || {
+            error_ "Probes green and the marker is recorded, but the /health deploy proof could not be written on ${host} — the prod gate reads /health and stays red."
+            return 1
+        }
+        info "PROVEN: ${probes} green on ${head:0:9} (bridge '${bridge}'); ${DEPLOYED_SHA_FILE} = ${head:0:9}, marker removed, /health deploy proof = proven."
         return 0
     fi
     if [[ $rc -eq 0 ]] || grep -q '^SMOKE_POOL_REFUSED_ONLY:' <<< "$smoke_out"; then
