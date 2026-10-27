@@ -1069,13 +1069,18 @@ from decimal import Decimal as _Decimal  # noqa: E402
 from fastapi import Header  # noqa: E402
 
 from src.api_auth import get_tenant_of_user  # noqa: E402
-from src.billing.project_budgets_service import AUFTRAG_BUDGET_MAX_EUR  # noqa: E402
+from src.billing.project_budgets_service import (  # noqa: E402
+    AUFTRAG_BUDGET_MAX_EUR,
+    AUFTRAG_PROJECT_ID_PATTERN,
+)
 from src.budget.plans import get_plan  # noqa: E402
 
 
 class CreateAuftragBudgetRequest(BaseModel):
-    # The run's own workflow_id (== Bridge attribution X-Workflow-ID).
-    project_id: str = Field(min_length=1, max_length=200)
+    # The run's own workflow_id (== Bridge attribution X-Workflow-ID). Also a
+    # path segment of the raise/get routes, hence the URL/header-safe alphabet
+    # (see AUFTRAG_PROJECT_ID_PATTERN in the service for why parent is not).
+    project_id: str = Field(min_length=1, max_length=200, pattern=AUFTRAG_PROJECT_ID_PATTERN)
     # Absolute ceiling in EUR, 4 decimal places like the NUMERIC(12,4) ledger.
     limit_eur: _Decimal = Field(gt=0, le=AUFTRAG_BUDGET_MAX_EUR, decimal_places=4)
     plan_id: str = "energy-project"
@@ -1176,9 +1181,12 @@ async def create_auftrag_budget(
 
     201 neu angelegt, 200 dieselbe Zeile (Limit und Eltern gleich) schon da,
     409 `auftrag_budget_exists` bei anderem Limit/Eltern (anheben statt neu),
-    409 `project_id_in_use` wenn dort eine kind='projekt'-Zeile liegt,
-    404 wenn der Nutzer unbekannt ist oder keinen Tenant hat, 400 bei
-    unbekanntem plan_id. Muss VOR dem ersten Aufruf des Laufs geschehen.
+    409 `project_id_in_use` wenn dort eine kind='projekt'-Zeile oder eine
+    Zeile unter einem anderen plan_id liegt (das Gate loest den Plan ueber
+    (user, project) auf), 400 `parent_equals_project`, 404 wenn der Nutzer
+    unbekannt ist oder keinen Tenant hat, 400 bei unbekanntem plan_id, 422
+    bei project_id ausserhalb des Pfad-/Header-sicheren Musters. Muss VOR
+    dem ersten Aufruf des Laufs geschehen.
     """
     uid = _parse_user_id(user_id)
     try:
@@ -1229,9 +1237,10 @@ async def raise_auftrag_budget(
     der neue absolute Zielwert. Wirkt sofort: Gate und Abzug lesen ohne Cache.
 
     200 angehoben (oder gleich: changed=false; oder Schluessel schon
-    protokolliert: replayed=true), 404 keine Zeile, 409
+    protokolliert mit demselben Ziel: replayed=true), 404 keine Zeile, 409
     `not_an_auftrag_budget` bei einer kind='projekt'-Zeile, 409
-    `limit_decrease_refused` unter dem aktuellen Limit.
+    `limit_decrease_refused` unter dem aktuellen Limit, 409
+    `idempotency_key_mismatch` bei bekanntem Schluessel mit anderem Ziel.
     """
     uid = _parse_user_id(user_id)
     try:

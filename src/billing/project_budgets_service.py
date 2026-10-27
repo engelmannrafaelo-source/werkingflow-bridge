@@ -43,6 +43,7 @@ TopUp fallback (BUDGET-MODELL.md Regel 6 — "TopUp ist das fungible Geld"):
 from __future__ import annotations
 
 import logging
+import re
 import uuid
 from datetime import datetime, timezone
 from decimal import Decimal
@@ -194,6 +195,39 @@ class LimitDecreaseRefused(AuftragBudgetError):
     reason = "limit_decrease_refused"
 
 
+class IdempotencyKeyMismatch(AuftragBudgetError):
+    """The idempotency key was already used for a raise to a DIFFERENT limit.
+    A replay must repeat the same request; a new target needs a new key."""
+
+    reason = "idempotency_key_mismatch"
+
+
+class ParentEqualsProject(AuftragBudgetError):
+    """An Auftragsbudget cannot be its own parent (Form B sums would loop)."""
+
+    status_code = 400
+    reason = "parent_equals_project"
+
+
+# An Auftragsbudget project_id travels as X-Workflow-ID header AND as a path
+# segment of the raise/get routes, so it is restricted to a URL/header-safe
+# alphabet. Existing Energy customer project_ids are UUIDs (minted at upload,
+# session_helpers.session_budget_key) and are never created through this path;
+# parent_project_id is deliberately NOT restricted (body/query value only).
+AUFTRAG_PROJECT_ID_PATTERN = r"^[A-Za-z0-9._:@-]{1,200}$"
+_AUFTRAG_PROJECT_ID_RE = re.compile(AUFTRAG_PROJECT_ID_PATTERN)
+
+
+def _require_auftrag_project_id(value: Optional[str]) -> str:
+    project_id = _require_text(value, "project_id", 200)
+    if not _AUFTRAG_PROJECT_ID_RE.match(project_id):
+        raise ValueError(
+            f"project_id {project_id!r} must match {AUFTRAG_PROJECT_ID_PATTERN} "
+            "(path- and header-safe)"
+        )
+    return project_id
+
+
 def _auftrag_limit(value: float | Decimal) -> Decimal:
     """Bound-check a requested Auftragsbudget limit as a 4-place Decimal.
 
@@ -307,23 +341,57 @@ async def create_auftrag_budget(
     fail-closed starter's job, not this function's.
 
     Returns {created, budget}. Refuses loudly (AuftragBudgetError subclasses):
-      - ProjectIdInUse     a kind='projekt' row already holds this project_id
-      - AuftragBudgetExists the auftrag row exists with another limit/parent
-                            (raise_auftrag_budget is the way to change it)
-    One transaction: INSERT ... ON CONFLICT DO NOTHING plus the 'created'
-    protocol line. No manual_project_credits access — no slot is consumed.
+      - ParentEqualsProject  parent_project_id == project_id
+      - ProjectIdInUse       this project_id already holds a kind='projekt' row
+                             OR a row under ANOTHER plan_id. The unique key is
+                             (user, plan, project), but the gate resolves the
+                             plan by (user, project) alone (find_allocated_plan_id)
+                             and fails closed on two plans for one project — so a
+                             second plan must never be created here.
+      - AuftragBudgetExists  the auftrag row exists with another limit/parent
+                             (raise_auftrag_budget is the way to change it)
+    One transaction: the (user, project) rows are locked FOR UPDATE before the
+    INSERT ... ON CONFLICT DO NOTHING plus the 'created' protocol line. No
+    manual_project_credits access — no slot is consumed.
     """
-    project_id = _require_text(project_id, "project_id", 200)
+    project_id = _require_auftrag_project_id(project_id)
     grund = _require_text(grund, "grund", 300)
     actor = _require_text(actor, "actor", 200)
     if not tenant_id:
         raise ValueError("create_auftrag_budget requires a tenant_id")
     limit = _auftrag_limit(limit_eur)
     parent = (parent_project_id or "").strip() or None
+    if parent == project_id:
+        raise ParentEqualsProject(
+            f"parent_project_id must differ from project_id ({project_id!r})"
+        )
 
     pool = get_pool()
     async with pool.acquire() as conn:
         async with conn.transaction():
+            # Every row this project_id already has, under ANY plan, locked so a
+            # concurrent create/lazy-allocate serialises behind this decision.
+            occupied = await conn.fetch(
+                """
+                SELECT plan_id, kind
+                  FROM project_budgets
+                 WHERE user_id = $1 AND project_id = $2
+                   FOR UPDATE
+                """,
+                user_id,
+                project_id,
+            )
+            for occ in occupied:
+                if occ["plan_id"] != plan_id or occ["kind"] != KIND_AUFTRAG:
+                    raise ProjectIdInUse(
+                        f"project_id {project_id!r} (user={user_id}) already holds a "
+                        f"kind={occ['kind']!r} budget under plan {occ['plan_id']!r} "
+                        f"(requested plan {plan_id!r}) — refusing to re-purpose or "
+                        "double-allocate it",
+                        _auftrag_state(
+                            await _fetch_auftrag_row(conn, user_id, occ["plan_id"], project_id)
+                        ),
+                    )
             inserted = await conn.fetchrow(
                 f"""
                 INSERT INTO project_budgets
@@ -416,9 +484,11 @@ async def raise_auftrag_budget(
     Returns {changed, replayed, oldLimitEur, newLimitEur, budget}. Refuses
     loudly: AuftragBudgetNotFound (no row), NotAnAuftragBudget (kind !=
     'auftrag'), LimitDecreaseRefused (target below the current limit). A
-    target equal to the current limit is a no-op 200 (changed=False).
+    target equal to the current limit is a no-op 200 (changed=False) and does
+    NOT protocol its key. IdempotencyKeyMismatch when a known key arrives with
+    a different target than it was protocolled with.
     """
-    project_id = _require_text(project_id, "project_id", 200)
+    project_id = _require_auftrag_project_id(project_id)
     grund = _require_text(grund, "grund", 300)
     actor = _require_text(actor, "actor", 200)
     key = (idempotency_key or "").strip() or None
@@ -455,6 +525,19 @@ async def raise_auftrag_budget(
                     key,
                 )
                 if stored is not None:
+                    # A replay must repeat the same request: the key is bound to
+                    # the limit it was protocolled with. A different target under
+                    # an old key is refused, never answered with the old result.
+                    # (Only an actual raise protocols its key — the no-op
+                    # "target == current" path below records nothing, so a key
+                    # first used for a no-op is still free for a later raise.)
+                    if Decimal(stored["new_limit_eur"]) != new_limit:
+                        raise IdempotencyKeyMismatch(
+                            f"idempotency_key {key!r} was already used to raise "
+                            f"Auftragsbudget {project_id!r} to {Decimal(stored['new_limit_eur'])} EUR "
+                            f"(now requested {new_limit} EUR) — use a new key for a new target",
+                            state,
+                        )
                     logger.info(
                         "project_budgets_service.raise_auftrag_budget: key=%s already applied — "
                         "no second raise (user=%s plan=%s project=%s)",
