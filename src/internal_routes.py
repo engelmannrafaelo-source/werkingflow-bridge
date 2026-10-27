@@ -597,6 +597,77 @@ async def post_project_budget_deduct(
         raise HTTPException(status_code=400, detail=str(e))
 
 
+# ── Test-KI-Deckel (KD 91624155, 27.10.2026) ─────────────────────────────
+# Worker-Seite und Regeln: src/budget/test_ki_deckel.py. Ein DB-Fehler bleibt
+# hier ein 5xx; der Worker behandelt PlatformUnavailable fail-CLOSED (503).
+
+class KiDeckelTestkontoRequest(BaseModel):
+    user_id: str
+
+
+class KiDeckelReservierenRequest(BaseModel):
+    user_id: str
+    app: str = Field(min_length=1, max_length=64)
+    tag: str = Field(min_length=10, max_length=10)
+    lauf: str = Field(min_length=12, max_length=400)
+    betrag_eur: float = Field(ge=0)
+    deckel_lauf: float = Field(gt=0)
+    deckel_tag: float = Field(gt=0)
+
+
+class KiDeckelVerrechnenRequest(BaseModel):
+    app: str = Field(min_length=1, max_length=64)
+    tag: str = Field(min_length=10, max_length=10)
+    lauf: str = Field(min_length=12, max_length=400)
+    delta_eur: float
+
+
+def _test_ki_uid(raw: str):
+    import uuid as _uuid
+
+    try:
+        return _uuid.UUID(raw)
+    except (ValueError, AttributeError, TypeError):
+        raise HTTPException(status_code=400, detail=f"Invalid user id: {raw!r}")
+
+
+@router.post("/test-ki-deckel/testkonto")
+async def post_test_ki_testkonto(
+    body: KiDeckelTestkontoRequest,
+    _claims: AuthClaims = Depends(require_service_token),
+) -> Dict[str, Any]:
+    """{testkonto: true|false|null} aus tenants.account_type (null = Nutzer unbekannt)."""
+    from src.budget.test_ki_deckel import db_ist_testkonto
+
+    return {"testkonto": await db_ist_testkonto(_test_ki_uid(body.user_id))}
+
+
+@router.post("/test-ki-deckel/reservieren")
+async def post_test_ki_reservieren(
+    body: KiDeckelReservierenRequest,
+    _claims: AuthClaims = Depends(require_service_token),
+) -> Dict[str, Any]:
+    """Mirrors src.budget.test_ki_deckel.db_reservieren (eine Transaktion)."""
+    from src.budget.test_ki_deckel import db_reservieren
+
+    return await db_reservieren(
+        user_id=_test_ki_uid(body.user_id), app=body.app, tag=body.tag, lauf=body.lauf,
+        betrag_eur=body.betrag_eur, deckel_lauf=body.deckel_lauf, deckel_tag=body.deckel_tag,
+    )
+
+
+@router.post("/test-ki-deckel/verrechnen")
+async def post_test_ki_verrechnen(
+    body: KiDeckelVerrechnenRequest,
+    _claims: AuthClaims = Depends(require_service_token),
+) -> Dict[str, Any]:
+    """Mirrors src.budget.test_ki_deckel.db_verrechnen. NICHT idempotent — der
+    Worker ruft es hoechstens einmal je Reservierung und nie mit Wiederholung."""
+    from src.budget.test_ki_deckel import db_verrechnen
+
+    return await db_verrechnen(app=body.app, tag=body.tag, lauf=body.lauf, delta_eur=body.delta_eur)
+
+
 # ── 2c/C5: app-tier policy (who pays for this call-site) ─────────────────
 
 @router.get("/app-tier-policy")

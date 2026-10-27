@@ -3340,6 +3340,26 @@ async def _chat_completions_lauf(
             )
 
         # =======================================================================
+        # TEST-KI-DECKEL: Testkonten von Works/Report nur Haiku, gedeckelt
+        # =======================================================================
+        # Direkt am aufgeloesten Backend, damit das TATSAECHLICH geroutete
+        # Modell zaehlt (Alias, App-Regel, Tier, Pin). Inert ohne
+        # BRIDGE_TEST_KI_DECKEL=1. Regeln: src/budget/test_ki_deckel.py.
+        from src.budget import test_ki_deckel as _test_ki_deckel
+        await _test_ki_deckel.pruefe_und_reserviere(
+            attribution=extract_attribution_context(request),
+            backend=(
+                getattr(backend_config.backend, "value", backend_config.backend)
+                if backend_config else None
+            ),
+            effektives_modell=(
+                (backend_config.provider_model if backend_config else None) or resolved_model
+            ),
+            eingabe_tokens=_arrival_est_tokens or len(str(request_body.messages)) // 3,
+            max_tokens=getattr(request_body, "max_tokens", None),
+        )
+
+        # =======================================================================
         # GEMINI-BILDWEG: geht der Aufruf wirklich zu Gemini?
         # =======================================================================
         # Ein gemini-vision-Body hat oben Pool-Zulassung, Org-Sperre und
@@ -5087,9 +5107,12 @@ async def _chat_completions_lauf(
         # very host where this was measured) is not the answer to one dead
         # account.
         # =====================================================================
+        # Test-KI-Deckel: kein Wechsel auf andere Anbieter/Modelle.
+        from src.budget.test_ki_deckel import ist_gedeckelt as _test_ki_gedeckelt
         if (
             not request_body.stream
             and not user_pinned_provider
+            and not _test_ki_gedeckelt()
             and not isinstance(wue, OrgSubscriptionDisabledError)
         ):
             try:
@@ -5187,7 +5210,9 @@ async def _chat_completions_lauf(
         # FALLBACK: Attempt alternate providers if primary failed (non-streaming)
         # Provider-pinned users (provider_config) are excluded: no fallback by design.
         # =======================================================================
-        if not request_body.stream and not user_pinned_provider:
+        # Test-KI-Deckel: kein Fallback auf andere Anbieter/Modelle.
+        from src.budget.test_ki_deckel import ist_gedeckelt as _test_ki_gedeckelt
+        if not request_body.stream and not user_pinned_provider and not _test_ki_gedeckelt():
             try:
                 from src.providers.fallback import (
                     is_retryable_error, is_breaker_failure, record_failure, record_success,
