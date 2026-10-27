@@ -24,6 +24,35 @@ from src.model_registry import get_default_model, model_supports_temperature
 logger = get_logger(__name__)
 
 
+#: Herkunft einer UsageMessung: die Rohantwort der Anthropic Messages API.
+QUELLE_MESSAGES_API = "anthropic_messages_api"
+_MESSUNG_FELDER = ("input_tokens", "output_tokens", "cache_read_input_tokens", "cache_creation_input_tokens")
+
+
+@dataclass(frozen=True)
+class UsageMessung:
+    """Gemessene Usage, abgeleitet aus den UNVERAENDERTEN Rohwerten der Antwort
+    (Test-KI-Deckel, src/budget/test_ki_deckel.py). `vollstaendig` nur, wenn
+    `usage` ein dict ist und alle vier Felder echte int >= 0 sind (type(x) is
+    int, also kein bool, kein Float, kein None). Unvollstaendig -> die Felder
+    stehen auf 0 und duerfen nicht abgerechnet werden."""
+    quelle: str
+    vollstaendig: bool
+    eingabe: int = 0
+    ausgabe: int = 0
+    cache_lesen: int = 0
+    cache_anlage: int = 0
+
+
+def usage_messung_aus(roh: Any) -> UsageMessung:
+    if not isinstance(roh, dict):
+        return UsageMessung(quelle=QUELLE_MESSAGES_API, vollstaendig=False)
+    werte = [roh.get(f) for f in _MESSUNG_FELDER]
+    if not all(type(w) is int and w >= 0 for w in werte):
+        return UsageMessung(quelle=QUELLE_MESSAGES_API, vollstaendig=False)
+    return UsageMessung(QUELLE_MESSAGES_API, True, *werte)
+
+
 @dataclass
 class VisionResponse:
     """Response from vision analysis."""
@@ -31,6 +60,8 @@ class VisionResponse:
     model: str
     usage: Dict[str, int]
     stop_reason: str
+    # Nur der Anthropic-Messages-Weg setzt sie (_vision_response_from).
+    messung: Optional[UsageMessung] = None
 
 
 class VisionProvider:
@@ -430,6 +461,8 @@ def _vision_response_from(data: Dict[str, Any], model: str) -> VisionResponse:
         if block.get("type") == "text":
             response_text += block.get("text", "")
 
+    # Messung VOR jeder Ersatzwert-Bildung, aus dem Rohobjekt.
+    messung = usage_messung_aus(data.get("usage"))
     usage = data.get("usage", {})
 
     log = logger.warning if not response_text else logger.info
@@ -455,7 +488,8 @@ def _vision_response_from(data: Dict[str, Any], model: str) -> VisionResponse:
             "completion_tokens": usage.get("output_tokens", 0),
             "total_tokens": usage.get("input_tokens", 0) + usage.get("output_tokens", 0)
         },
-        stop_reason=_stop_reason_or_unknown(data.get("stop_reason"))
+        stop_reason=_stop_reason_or_unknown(data.get("stop_reason")),
+        messung=messung,
     )
 
 

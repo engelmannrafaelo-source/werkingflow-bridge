@@ -224,6 +224,15 @@ app.add_middleware(
 # Tenant middleware — required for per-tenant auth/privacy context
 app.add_middleware(TenantMiddleware)
 
+# Test-KI-Deckel (R4): ein mit X-Test-Lauf markierter Aufruf hat an platform-api
+# nichts zu suchen (Testaufrufe duerfen nur Haiku-Chat an einem Worker; Sandbox
+# u. a. sind Kostenwege). Nur (c) — hier gibt es keine App-Prinzipale; Worker
+# reichen den Kopf nicht weiter (platform_client sendet nur das Service-Token).
+from fastapi.exception_handlers import http_exception_handler as _http_exc_handler  # noqa: E402
+from src.budget.test_ki_deckel import TestKiWegeMiddleware  # noqa: E402
+
+app.add_middleware(TestKiWegeMiddleware, antwort=_http_exc_handler, nur_marker=True)
+
 
 @app.exception_handler(RequestValidationError)
 async def validation_exception_handler(request: Request, exc: RequestValidationError):
