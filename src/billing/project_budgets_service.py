@@ -369,8 +369,12 @@ async def create_auftrag_budget(
     pool = get_pool()
     async with pool.acquire() as conn:
         async with conn.transaction():
-            # Every row this project_id already has, under ANY plan, locked so a
-            # concurrent create/lazy-allocate serialises behind this decision.
+            # Every row this project_id already has, under ANY plan, locked while
+            # the decision is made. Only rows that exist are locked: two creates
+            # (or a create and the first lazy allocation) for a project without
+            # any row can still race into two rows under different plans; the
+            # gate then fails loudly with AmbiguousProjectBudget and releases
+            # no money (the starter creates the budget first, with a fixed plan).
             occupied = await conn.fetch(
                 """
                 SELECT plan_id, kind
