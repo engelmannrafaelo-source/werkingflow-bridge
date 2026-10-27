@@ -1054,12 +1054,255 @@ async def consume_project_credit(
 
 
 # ---------------------------------------------------------------------------
+# Auftragsbudgets — interner Kostendeckel je Auftrag (migration 071).
+# See project_budgets_service.py ("Auftragsbudget") and
+# ENTWURF-AUFTRAGSBUDGET-8462d3f6-20261027.md, Abschnitt 4.
+#
+# Service-Token only: the Energy starter creates the row BEFORE the run's first
+# LLM call (fail-closed), raises it on revision, reads it for display. The
+# operator token has no app binding, so every write is restricted to
+# kind='auftrag' rows and protocolled with the caller's X-App-ID/X-Agent-ID.
+# ---------------------------------------------------------------------------
+
+from decimal import Decimal as _Decimal  # noqa: E402
+
+from fastapi import Header  # noqa: E402
+
+from src.api_auth import get_tenant_of_user  # noqa: E402
+from src.billing.project_budgets_service import AUFTRAG_BUDGET_MAX_EUR  # noqa: E402
+from src.budget.plans import get_plan  # noqa: E402
+
+
+class CreateAuftragBudgetRequest(BaseModel):
+    # The run's own workflow_id (== Bridge attribution X-Workflow-ID).
+    project_id: str = Field(min_length=1, max_length=200)
+    # Absolute ceiling in EUR, 4 decimal places like the NUMERIC(12,4) ledger.
+    limit_eur: _Decimal = Field(gt=0, le=AUFTRAG_BUDGET_MAX_EUR, decimal_places=4)
+    plan_id: str = "energy-project"
+    # The customer project this run belongs to (Form B parent reference).
+    parent_project_id: Optional[str] = Field(default=None, max_length=200)
+    grund: str = Field(min_length=1, max_length=300)
+
+
+class RaiseAuftragBudgetRequest(BaseModel):
+    # New ABSOLUTE limit, never a delta. Only upwards.
+    limit_eur: _Decimal = Field(gt=0, le=AUFTRAG_BUDGET_MAX_EUR, decimal_places=4)
+    grund: str = Field(min_length=1, max_length=300)
+    # Replay-safe: a second call with the same key answers with the stored result.
+    idempotency_key: Optional[str] = Field(default=None, min_length=1, max_length=200)
+    plan_id: str = "energy-project"
+
+
+class LetzteAnhebung(BaseModel):
+    von: float
+    auf: float
+    grund: str
+    aktor: str
+    am: str
+
+
+class AuftragBudgetOut(BaseModel):
+    projectId: str
+    planId: str
+    kind: str
+    limitEur: float
+    usedEur: float
+    remainingEur: float
+    hardCap: bool
+    parentProjectId: Optional[str]
+    createdAt: str
+    updatedAt: str
+    letzteAnhebung: Optional[LetzteAnhebung]
+
+
+class CreateAuftragBudgetResponse(BaseModel):
+    created: bool
+    budget: AuftragBudgetOut
+
+
+class RaiseAuftragBudgetResponse(BaseModel):
+    changed: bool
+    replayed: bool
+    oldLimitEur: float
+    newLimitEur: float
+    budget: AuftragBudgetOut
+
+
+class AuftragBudgetListResponse(BaseModel):
+    parentProjectId: str
+    parent: Optional[AuftragBudgetOut]
+    auftraege: List[AuftragBudgetOut]
+    projektSummeEur: float
+    summeLimitEur: float
+
+
+def _auftrag_actor(x_app_id: Optional[str], x_agent_id: Optional[str]) -> str:
+    """Protocol identity of the caller: X-App-ID/X-Agent-ID, else 'service'."""
+    parts = [p.strip() for p in (x_app_id, x_agent_id) if p and p.strip()]
+    return "/".join(parts) if parts else "service"
+
+
+def _auftrag_error(e: project_budgets_service.AuftragBudgetError) -> HTTPException:
+    """409/404 with a machine-readable `reason` plus the current row (if any)."""
+    detail: Dict[str, Any] = {"reason": e.reason, "message": str(e)}
+    if e.state is not None:
+        detail["budget"] = e.state
+    return HTTPException(status_code=e.status_code, detail=detail)
+
+
+def _parse_user_id(user_id: str) -> _uuid.UUID:
+    try:
+        return _uuid.UUID(user_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail=f"Invalid user_id: {user_id}")
+
+
+@_project_credits_router.post(
+    "/v1/users/{user_id}/auftrag-budgets",
+    status_code=201,
+    response_model=CreateAuftragBudgetResponse,
+)
+async def create_auftrag_budget(
+    user_id: str,
+    body: CreateAuftragBudgetRequest,
+    response: Response,
+    x_app_id: Optional[str] = Header(default=None),
+    x_agent_id: Optional[str] = Header(default=None),
+    _claims: AuthClaims = Depends(require_service_token),
+) -> Dict[str, Any]:
+    """
+    Auftragsbudget anlegen (Service-Token only): eine hard_cap-Zeile in
+    project_budgets fuer genau diese workflow_id, ohne Credit-Slot.
+
+    201 neu angelegt, 200 dieselbe Zeile (Limit und Eltern gleich) schon da,
+    409 `auftrag_budget_exists` bei anderem Limit/Eltern (anheben statt neu),
+    409 `project_id_in_use` wenn dort eine kind='projekt'-Zeile liegt,
+    404 wenn der Nutzer unbekannt ist oder keinen Tenant hat, 400 bei
+    unbekanntem plan_id. Muss VOR dem ersten Aufruf des Laufs geschehen.
+    """
+    uid = _parse_user_id(user_id)
+    try:
+        get_plan(body.plan_id)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    tenant_id = await get_tenant_of_user(user_id)
+    if not tenant_id:
+        raise HTTPException(
+            status_code=404,
+            detail={"reason": "user_not_found", "message": f"user {user_id} unknown or without tenant"},
+        )
+    try:
+        result = await project_budgets_service.create_auftrag_budget(
+            user_id=uid,
+            tenant_id=tenant_id,
+            plan_id=body.plan_id,
+            project_id=body.project_id,
+            limit_eur=body.limit_eur,
+            grund=body.grund,
+            actor=_auftrag_actor(x_app_id, x_agent_id),
+            parent_project_id=body.parent_project_id,
+        )
+    except project_budgets_service.AuftragBudgetError as e:
+        raise _auftrag_error(e)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    if not result["created"]:
+        response.status_code = 200
+    return result
+
+
+@_project_credits_router.post(
+    "/v1/users/{user_id}/auftrag-budgets/{project_id}/raise",
+    status_code=200,
+    response_model=RaiseAuftragBudgetResponse,
+)
+async def raise_auftrag_budget(
+    user_id: str,
+    project_id: str,
+    body: RaiseAuftragBudgetRequest,
+    x_app_id: Optional[str] = Header(default=None),
+    x_agent_id: Optional[str] = Header(default=None),
+    _claims: AuthClaims = Depends(require_service_token),
+) -> Dict[str, Any]:
+    """
+    Auftragsbudget anheben (Service-Token only), nur nach oben, limit_eur ist
+    der neue absolute Zielwert. Wirkt sofort: Gate und Abzug lesen ohne Cache.
+
+    200 angehoben (oder gleich: changed=false; oder Schluessel schon
+    protokolliert: replayed=true), 404 keine Zeile, 409
+    `not_an_auftrag_budget` bei einer kind='projekt'-Zeile, 409
+    `limit_decrease_refused` unter dem aktuellen Limit.
+    """
+    uid = _parse_user_id(user_id)
+    try:
+        return await project_budgets_service.raise_auftrag_budget(
+            user_id=uid,
+            plan_id=body.plan_id,
+            project_id=project_id,
+            limit_eur=body.limit_eur,
+            grund=body.grund,
+            actor=_auftrag_actor(x_app_id, x_agent_id),
+            idempotency_key=body.idempotency_key,
+        )
+    except project_budgets_service.AuftragBudgetError as e:
+        raise _auftrag_error(e)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@_project_credits_router.get(
+    "/v1/users/{user_id}/auftrag-budgets/{project_id}",
+    response_model=AuftragBudgetOut,
+)
+async def get_auftrag_budget(
+    user_id: str,
+    project_id: str,
+    plan_id: str = "energy-project",
+    _claims: AuthClaims = Depends(require_service_token),
+) -> Dict[str, Any]:
+    """Stand einer Auftragszeile (Service-Token only) samt letzter Anhebung; 404 ohne Zeile."""
+    uid = _parse_user_id(user_id)
+    budget = await project_budgets_service.get_auftrag_budget(uid, plan_id, project_id)
+    if budget is None:
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "reason": "auftrag_budget_not_found",
+                "message": f"no budget for user={user_id} plan={plan_id} project={project_id!r}",
+            },
+        )
+    return budget
+
+
+@_project_credits_router.get(
+    "/v1/users/{user_id}/auftrag-budgets",
+    response_model=AuftragBudgetListResponse,
+)
+async def list_auftrag_budgets(
+    user_id: str,
+    parent_project_id: str = Query(min_length=1, max_length=200),
+    plan_id: str = "energy-project",
+    _claims: AuthClaims = Depends(require_service_token),
+) -> Dict[str, Any]:
+    """
+    Auftragszeilen eines Kundenprojekts (Service-Token only) plus
+    projektSummeEur (Elternzeile used + Summe Auftrag used) und summeLimitEur.
+    Hier ist die Projektsumme ablesbar; /project-budgets zeigt nur kind='projekt'.
+    """
+    uid = _parse_user_id(user_id)
+    try:
+        return await project_budgets_service.list_auftrag_budgets(uid, plan_id, parent_project_id)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+# ---------------------------------------------------------------------------
 # Project Resets — operator-gated one-shot "start this project over" grant.
 # See project_resets_service.py + migration 038_project_reset_requests.sql.
 # ---------------------------------------------------------------------------
 
 from src.billing import project_resets_service  # noqa: E402
-from src.api_auth import get_tenant_of_user  # noqa: E402
+# get_tenant_of_user: imported in the Auftragsbudget block above.
 
 _project_resets_router = APIRouter(tags=["billing"])
 
