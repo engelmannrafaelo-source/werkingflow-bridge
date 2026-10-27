@@ -135,8 +135,11 @@ services:
       # App und Tag, 20 EUR gesamt je Tag (fail-closed); jeder andere Weg 403.
       # Nichts davon befreit; alle anderen Aufrufe bleiben unberuehrt. Braucht
       # Migration 072. Vertrag: docs/contracts/test-ki-deckel.md. Kein Secret.
+      # PRINZIPALE bewusst LEER (K67, 27.10.2026, Works-Berater 3afd926f ueber
+      # den Vize): Works und Report nur ueber X-Test-Lauf gedeckelt; ein Eintrag
+      # sperrte jeden Nicht-Chat-Weg aller Nutzer dieses Prinzipals (403 KI_TEST_NUR_CHAT).
       - BRIDGE_TEST_KI_DECKEL=1
-      - BRIDGE_TEST_KI_PRINZIPALE=engelmann-vercel-preview
+      - BRIDGE_TEST_KI_PRINZIPALE=
       # Chat-job self-call timeout (claims/finalize). Default 600s cut long
       # Energy claims calls (observed 728s); align with MAX_TIMEOUT (2400s).
       - BRIDGE_CHAT_JOB_TIMEOUT_S=2400
@@ -346,8 +349,11 @@ services:
       # App und Tag, 20 EUR gesamt je Tag (fail-closed); jeder andere Weg 403.
       # Nichts davon befreit; alle anderen Aufrufe bleiben unberuehrt. Braucht
       # Migration 072. Vertrag: docs/contracts/test-ki-deckel.md. Kein Secret.
+      # PRINZIPALE bewusst LEER (K67, 27.10.2026, Works-Berater 3afd926f ueber
+      # den Vize): Works und Report nur ueber X-Test-Lauf gedeckelt; ein Eintrag
+      # sperrte jeden Nicht-Chat-Weg aller Nutzer dieses Prinzipals (403 KI_TEST_NUR_CHAT).
       - BRIDGE_TEST_KI_DECKEL=1
-      - BRIDGE_TEST_KI_PRINZIPALE=engelmann-vercel-preview
+      - BRIDGE_TEST_KI_PRINZIPALE=
       # Chat-job self-call timeout (claims/finalize). Default 600s cut long
       # Energy claims calls (observed 728s); align with MAX_TIMEOUT (2400s).
       - BRIDGE_CHAT_JOB_TIMEOUT_S=2400
@@ -557,8 +563,11 @@ services:
       # App und Tag, 20 EUR gesamt je Tag (fail-closed); jeder andere Weg 403.
       # Nichts davon befreit; alle anderen Aufrufe bleiben unberuehrt. Braucht
       # Migration 072. Vertrag: docs/contracts/test-ki-deckel.md. Kein Secret.
+      # PRINZIPALE bewusst LEER (K67, 27.10.2026, Works-Berater 3afd926f ueber
+      # den Vize): Works und Report nur ueber X-Test-Lauf gedeckelt; ein Eintrag
+      # sperrte jeden Nicht-Chat-Weg aller Nutzer dieses Prinzipals (403 KI_TEST_NUR_CHAT).
       - BRIDGE_TEST_KI_DECKEL=1
-      - BRIDGE_TEST_KI_PRINZIPALE=engelmann-vercel-preview
+      - BRIDGE_TEST_KI_PRINZIPALE=
       # Chat-job self-call timeout (claims/finalize). Default 600s cut long
       # Energy claims calls (observed 728s); align with MAX_TIMEOUT (2400s).
       - BRIDGE_CHAT_JOB_TIMEOUT_S=2400
@@ -768,8 +777,11 @@ services:
       # App und Tag, 20 EUR gesamt je Tag (fail-closed); jeder andere Weg 403.
       # Nichts davon befreit; alle anderen Aufrufe bleiben unberuehrt. Braucht
       # Migration 072. Vertrag: docs/contracts/test-ki-deckel.md. Kein Secret.
+      # PRINZIPALE bewusst LEER (K67, 27.10.2026, Works-Berater 3afd926f ueber
+      # den Vize): Works und Report nur ueber X-Test-Lauf gedeckelt; ein Eintrag
+      # sperrte jeden Nicht-Chat-Weg aller Nutzer dieses Prinzipals (403 KI_TEST_NUR_CHAT).
       - BRIDGE_TEST_KI_DECKEL=1
-      - BRIDGE_TEST_KI_PRINZIPALE=engelmann-vercel-preview
+      - BRIDGE_TEST_KI_PRINZIPALE=
       # Chat-job self-call timeout (claims/finalize). Default 600s cut long
       # Energy claims calls (observed 728s); align with MAX_TIMEOUT (2400s).
       - BRIDGE_CHAT_JOB_TIMEOUT_S=2400

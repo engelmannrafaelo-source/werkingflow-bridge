@@ -28,7 +28,7 @@ Alle anderen Aufrufe bleiben unberührt: Legacy, Works-Prod (`engelmann-vercel-d
 | Variable | Wert |
 |---|---|
 | `BRIDGE_TEST_KI_DECKEL` | `1` = Test-KI aktiv. Jeder andere Wert bedeutet: **jeder Testaufruf 403 `KI_TEST_DECKEL_INAKTIV`**. Ein Kopf allein öffnet also keinen ungedeckelten Weg. Prod setzt ihn nie. |
-| `BRIDGE_TEST_KI_PRINZIPALE` | Kommagetrennte `service_principals.name`, deren Aufrufe alle Testaufrufe sind. Dev: `engelmann-vercel-preview`. Leer bedeutet: nur (c). |
+| `BRIDGE_TEST_KI_PRINZIPALE` | Kommagetrennte `service_principals.name`, deren Aufrufe alle Testaufrufe sind. Dev: **leer** (K67, 27.10.2026: Works und Report nur über (c); ein Eintrag sperrte jeden Nicht-Chat-Weg aller Nutzer dieses Prinzipals). Leer bedeutet: nur (c). |
 
 Kein Secret. Die Deckel (0,50 € je Lauf, 10 € je App und Tag, 20 € gesamt je Tag) sind Konstanten im Code. Für (a) und (b) muss `BRIDGE_PRINCIPALS_ENABLED=true` gesetzt sein.
 
