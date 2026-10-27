@@ -951,6 +951,17 @@ from src.middleware.event_logger import EventLogger
 # Re-enabled: Pure ASGI implementation, not affected by BaseHTTPMiddleware bug
 app.add_middleware(PerformanceMonitorMiddleware)
 
+# Test-KI-Deckel (R4): ein Testaufruf (Test-Prinzipal, Job eines Test-
+# Prinzipals, X-Test-Lauf) darf an diesem Worker nur Haiku-Chat ueber das Tor
+# — jede andere Route ausser der kostenfreien Erlaubnisliste antwortet 403
+# KI_TEST_NUR_CHAT, bei Schalter aus jeder Testaufruf 403 KI_TEST_DECKEL_INAKTIV.
+# Eine Stelle fuer ALLE Routen, vor jeder Kostenwirkung (src/budget/test_ki_deckel.py).
+from src.budget.test_ki_deckel import TestKiWegeMiddleware
+app.add_middleware(
+    TestKiWegeMiddleware,
+    antwort=lambda request, exc: http_exception_handler(request, exc),
+)
+
 # ADR-0011: request-scoped HOME-bridge origin (X-Bridge-Origin, LB-stamped).
 # Added LAST → outermost, so the origin is in context before ANY other layer
 # (tenant, attribution, endpoints) touches identity/budget/ledger paths.
@@ -3345,8 +3356,9 @@ async def _chat_completions_lauf(
         # Nach jeder anderen Wegwahl (Pin, App-Regel, Tier, Text-Wegwahl): das
         # Tor ZWINGT gedeckelte Testaufrufe auf den Direktweg (ein Messages-API-
         # Aufruf, max_tokens wirksam, Usage gemessen) und prueft das Ergebnis am
-        # aufgeloesten Backend. Herkunft nur ueber den Prinzipal. Inert ohne
-        # BRIDGE_TEST_KI_DECKEL=1. Regeln: src/budget/test_ki_deckel.py.
+        # aufgeloesten Backend. Testaufruf = Test-Prinzipal, Job eines Test-
+        # Prinzipals oder X-Test-Lauf; nichts davon befreit. Regeln und die
+        # Wege-Schicht fuer alle anderen Routen: src/budget/test_ki_deckel.py.
         from src.budget import test_ki_deckel as _test_ki_deckel
 
         def _test_ki_direktweg():
@@ -3907,8 +3919,13 @@ async def _chat_completions_lauf(
                     },
                 )
 
+            # Test-KI-Deckel: ein FRISCHES, nur diesem Aufruf gehoerendes Messziel —
+            # und nur, wenn das Tor reserviert hat. Die Messung geht nie in die Antwort.
+            _test_ki_messung = _test_ki_deckel.MessungZiel() if _test_ki_deckel.ist_gedeckelt() else None
             try:
-                response_data = await call_anthropic_direct(request_body, backend_config)
+                response_data = await call_anthropic_direct(
+                    request_body, backend_config, messung_ziel=_test_ki_messung,
+                )
             except Exception as direct_err:
                 # Test-KI-Deckel: nichts gemessen -> Reservierung bleibt voll stehen.
                 await _test_ki_deckel.abrechnen(None)
@@ -3921,9 +3938,9 @@ async def _chat_completions_lauf(
                 raise
             duration = time.time() - start_time
             usage = response_data.get("usage") or {}
-            # Test-KI-Deckel: Abrechnung NUR aus der gemessenen API-Usage; fehlt
-            # sie, bleibt die volle Reservierung stehen.
-            await _test_ki_deckel.abrechnen(usage if response_data.get("usage") else None)
+            # Test-KI-Deckel: Abrechnung NUR aus der vollstaendigen UsageMessung der
+            # Rohantwort; sonst bleibt die volle Reservierung stehen.
+            await _test_ki_deckel.abrechnen(_test_ki_messung.messung if _test_ki_messung else None)
             logger.info(f"✅ Direct Anthropic request completed in {duration:.2f}s (tier={direct_tier})")
             await _persist_direct_usage(
                 input_tokens=usage.get("prompt_tokens", 0) or 0,

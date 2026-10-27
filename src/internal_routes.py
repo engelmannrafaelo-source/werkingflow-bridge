@@ -597,15 +597,11 @@ async def post_project_budget_deduct(
         raise HTTPException(status_code=400, detail=str(e))
 
 
-# ── Test-KI-Deckel (KD 91624155, 27.10.2026; R2) ─────────────────────────
+# ── Test-KI-Deckel (KD 91624155, 27.10.2026; R2/R4) ──────────────────────
 # Worker-Seite und Regeln: src/budget/test_ki_deckel.py. Dies ist der EINZIGE
 # Schreibweg (kein DB-Rueckfall im Worker). reservieren und abrechnen sind je
 # reservierung_id idempotent (test_ki_buchung, Primaerschluessel). Ein DB-Fehler
 # bleibt ein 5xx; der Worker behandelt jede Nicht-200-Antwort fail-closed.
-
-class KiDeckelTestkontoRequest(BaseModel):
-    user_id: str
-
 
 class KiDeckelReservierenRequest(BaseModel):
     reservierung_id: str
@@ -627,17 +623,6 @@ def _test_ki_uuid(raw: str, was: str):
         return _uuid.UUID(raw)
     except (ValueError, AttributeError, TypeError):
         raise HTTPException(status_code=400, detail=f"Invalid {was}: {raw!r}")
-
-
-@router.post("/test-ki-deckel/testkonto")
-async def post_test_ki_testkonto(
-    body: KiDeckelTestkontoRequest,
-    _claims: AuthClaims = Depends(require_service_token),
-) -> Dict[str, Any]:
-    """{testkonto: true|false|null} aus tenants.account_type (null = Nutzer unbekannt)."""
-    from src.budget.test_ki_deckel import db_ist_testkonto
-
-    return {"testkonto": await db_ist_testkonto(_test_ki_uuid(body.user_id, "user id"))}
 
 
 @router.post("/test-ki-deckel/reservieren")

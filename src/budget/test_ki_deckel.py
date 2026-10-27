@@ -1,43 +1,48 @@
-"""Gedeckelte echte KI (nur Haiku, Direktweg) fuer Testkonten von werking-works und werking-report.
+"""Gedeckelte echte KI (nur Haiku-Chat, Direktweg) fuer Testaufrufe von werking-works und werking-report.
 
 Auftrag KD 91624155, 27.10.2026 (Rafael 16:36Z: Tester pruefen mit echter KI,
-Haiku, gedeckelt). R2 nach Codex R1 (local-storage/bridge-ki-test-gedeckelt-
-20261027/PRUEFUNG-R1.md, ENTWURF-R2.md). Die Apps sperren Testaufrufe selbst
-und lassen nur Haiku-Chat in der Preview durch; dieses Tor ist der Deckel
-dahinter. Jede der drei R1-Klassen ist an EINER Stelle geschlossen:
+Haiku, gedeckelt). R4 nach Codex (PRUEFUNG-ENTWURF-R4.md) mit der Umfangs-
+entscheidung des Vize (a): Test-KI heisst NUR Haiku-Chat.
 
-  R1-1 Herkunft   — `ist_ausgenommen`: nur der vom Token aufgeloeste Prinzipal
-                    (request.state.principal, src/auth.py) kann einen Aufruf
-                    ausnehmen, nie ein Kopf. X-App-Env spielt keine Rolle.
-  R1-2 Obergrenze — `tor`: gedeckelte Aufrufe laufen IMMER ueber den Direktweg
-                    (claude-direct-notools, ein Messages-API-Aufruf, max_tokens
-                    wirksam, Usage gemessen); reserviert wird `obergrenze_eur`
-                    der Anfrage, nach dem Aufruf `abrechnen` aus gemessener
-                    Usage. Ohne Messung bleibt die volle Reservierung stehen.
-  R1-3 Idempotenz — reservierung_id je Aufruf, Dedup per Primaerschluessel in
-                    test_ki_buchung, einziger Schreibweg platform-api. Unklarer
-                    Ausgang beim Reservieren = 503, beim Abrechnen bleibt sie
-                    offen (zaehlt voll). Kein DB-Rueckfall.
+Vertrauensrichtung: Angaben koennen nur EINSCHRAENKEN, nie befreien. Ein Aufruf
+ist ein TESTAUFRUF, wenn mindestens eins gilt (`testgrund`):
+  (a) der vom Token aufgeloeste Prinzipal steht in BRIDGE_TEST_KI_PRINZIPALE;
+  (b) Job-Selbstaufruf (Worker-/Legacy-Schluessel) eines Jobs, den ein solcher
+      Prinzipal angelegt hat (gelesen aus dem Job, nie aus einem Kopf);
+  (c) der Aufruf traegt X-Test-Lauf — egal welcher Prinzipal, welcher Mandant.
+Alles andere bleibt unberuehrt (kein account_type, keine Ausnahmeliste).
 
-Wann das Tor greift (sonst bleibt der Aufruf unberuehrt):
-  1. BRIDGE_TEST_KI_DECKEL=1 auf dieser Bridge (nur Dev-Compose).
-  2. App (X-App-ID / X-Client-ID) werking-report, werking-works oder engelmann.
-     Die App ist schon vom Prinzipal geprueft (principal.may_use_app).
-  3. Der Prinzipal steht NICHT in BRIDGE_TEST_KI_PROD_PRINZIPALE.
-  4. tenants.account_type = 'test' fuer den Nutzer (Bridge-DB ueber platform-api).
+Ein Testaufruf darf an dieser Bridge genau eins: Chat ueber das Tor. Drei Stellen,
+jede fuer ALLE Wege ihrer Art:
+  1. `TestKiWegeMiddleware` (ASGI, vor jedem Worker-Endpunkt; in platform-api
+     nur fuer (c), dort gibt es keine App-Prinzipale): ein vorhandener,
+     aber leerer/ungueltiger X-Test-Lauf -> 403 lauf_ungueltig, ueberall.
+     Testaufruf + Schalter aus -> 403 KI_TEST_DECKEL_INAKTIV, ueberall.
+     Testaufruf auf jeder Route ausser dem Chat-Tor, dem Job-Anlegen und den
+     kostenfreien Lese-/Verwaltungsrouten in `DURCHLASS` -> 403 KI_TEST_NUR_CHAT.
+     Die Liste ist eine Erlaubnisliste: eine neue Route ist fuer Testaufrufe
+     zu, bis sie hier eingetragen wird.
+  2. `job_anlegen_pruefen` (POST /v1/jobs): Testaufruf nur mit Art chat/ping,
+     chat nur mit gueltigem X-Test-Lauf; der Marker bleibt am Job.
+     `job_lauf_pruefen` (Job-Runner, vor JEDEM Executor): dieselbe Regel fuer
+     gespeicherte Jobs — auch alte, auch Erkunder (eigener Transport).
+  3. `tor` (Chat): Haiku, keine Werkzeuge, Direktweg erzwungen, X-Test-Lauf
+     Pflicht, Reservierung gegen Lauf 0,50 / App-Tag 10,00 / Gesamt-Tag 20,00 EUR,
+     idempotent (test_ki_buchung), Abrechnung nur aus `UsageMessung`.
 
-Dann gilt: angefragtes Modell (nach Alias-Aufloesung) claude-haiku-5-5, keine
-Werkzeuge, X-Test-Lauf (64 Hex, sha256 einer App-Sitzungskennung, gesetzt von
-der App-Sperre) Pflicht; Weg wird auf den Direktweg gezwungen und am
-aufgeloesten Backend nachgeprueft; Reservierung gegen Lauf (0,50), App-Tag
-(10,00) und Gesamt-Tag (20,00 EUR). Fehlercodes:
-  403 KI_IM_TEST_GESPERRT (grund modell_nicht_haiku | werkzeuge | weg | ohne_lauf)
+Fehlercodes:
+  403 KI_IM_TEST_GESPERRT (grund modell_nicht_haiku | werkzeuge | weg | ohne_lauf
+      | lauf_ungueltig | app_unbekannt | ohne_nutzer | nutzer_unbekannt)
+  403 KI_TEST_NUR_CHAT        (Nicht-Chat-Weg fuer einen Testaufruf)
+  403 KI_TEST_DECKEL_INAKTIV  (Testaufruf auf einer Bridge mit Schalter aus)
   402 KI_TEST_DECKEL_ERREICHT (ebene lauf | tag | gesamt)
-  503 KI_TEST_DECKEL_NICHT_LESBAR (platform-api nicht erreichbar / unklar)
+  503 KI_TEST_DECKEL_NICHT_LESBAR (platform-api / Job-Store / Prinzipal nicht
+      lesbar; mit X-Bridge-Dependency-Unavailable, ein Job parkt)
 """
 from __future__ import annotations
 
 import contextvars
+import hmac
 import json
 import logging
 import os
@@ -52,7 +57,7 @@ from fastapi import HTTPException
 logger = logging.getLogger(__name__)
 
 SCHALTER = "BRIDGE_TEST_KI_DECKEL"
-PROD_PRINZIPALE = "BRIDGE_TEST_KI_PROD_PRINZIPALE"
+TEST_PRINZIPALE = "BRIDGE_TEST_KI_PRINZIPALE"
 MODELL = "claude-haiku-5-5"
 DIREKT_TIER = "claude-direct-notools"
 DECKEL_LAUF_EUR = 0.50
@@ -79,20 +84,54 @@ TOKENS_JE_BILD = 6_000
 CACHE_ANLAGE_MULT = 2.0
 
 CODE_GESPERRT = "KI_IM_TEST_GESPERRT"
+CODE_NUR_CHAT = "KI_TEST_NUR_CHAT"
+CODE_INAKTIV = "KI_TEST_DECKEL_INAKTIV"
 CODE_DECKEL = "KI_TEST_DECKEL_ERREICHT"
 CODE_NICHT_LESBAR = "KI_TEST_DECKEL_NICHT_LESBAR"
+
+# Wert von X-Bridge-Dependency-Unavailable, wenn Job-Store/Prinzipal/platform-api
+# nicht antworten: der Job-Executor parkt den Job (registry.DEPENDENCY_PATIENCE).
+ABHAENGIGKEIT = "test-ki-deckel"
 
 # Schluessel in der Job-Attribution: Prinzipal des ANLEGENDEN Aufrufs,
 # serverseitig gesetzt (src/jobs/routes.py), nie aus dem Rumpf uebernommen.
 JOB_PRINZIPAL_KEY = "test_ki_prinzipal"
+JOB_LAUF_KEY = "test_lauf"
+
+# Job-Arten, die ein Testaufruf anlegen/ausfuehren darf: chat (Selbstaufruf
+# durch das Tor) und ping (ohne Modell, ohne Selbstaufruf).
+JOB_ARTEN_TEST = frozenset({"chat", "ping"})
+
+CHAT_PFAD = "/v1/chat/completions"
+JOBS_PFAD = "/v1/jobs"
+
+# Erlaubnisliste fuer Testaufrufe an einem Worker (Methode, Pfadmuster). Alles
+# andere ist fuer Testaufrufe zu. Belegt 27.10.2026 an cc132ce: keine dieser
+# Routen loest einen Modell-, Render- oder Rechenaufruf aus.
+DURCHLASS = (
+    ("POST", re.compile(r"^/v1/chat/completions$")),    # tor()
+    ("POST", re.compile(r"^/v1/jobs$")),                # job_anlegen_pruefen()
+    ("POST", re.compile(r"^/v1/jobs/lookup$")),         # Store-Lesen (Idempotenz)
+    ("GET", re.compile(r"^/v1/jobs$")),                 # Store-Lesen
+    ("GET", re.compile(r"^/v1/jobs/[^/]+$")),           # Store-Lesen
+    ("DELETE", re.compile(r"^/v1/jobs/[^/]+$")),        # Abbruch eines Jobs
+    ("GET", re.compile(r"^/v1/models$")),
+    ("GET", re.compile(r"^/v1/version$")),
+    ("GET", re.compile(r"^/health$")),
+    ("GET", re.compile(r"^/ready$")),
+    ("OPTIONS", re.compile(r"^/.*$")),                  # CORS-Vorabfrage
+)
+# Von diesen Durchlass-Routen nimmt das Tor bzw. die Job-Pruefung die Entscheidung
+# selbst vor; die uebrigen sind kostenfrei und brauchen keine.
+_TORWEGE = (("POST", CHAT_PFAD), ("POST", JOBS_PFAD))
 
 
 def schalter_an() -> bool:
     return os.getenv(SCHALTER, "").strip() == "1"
 
 
-def _prod_prinzipale() -> frozenset[str]:
-    roh = os.getenv(PROD_PRINZIPALE, "")
+def test_prinzipale() -> frozenset[str]:
+    roh = os.getenv(TEST_PRINZIPALE, "")
     return frozenset(n.strip() for n in roh.split(",") if n.strip())
 
 
@@ -116,13 +155,289 @@ def ist_gedeckelt() -> bool:
     return _aktuell.get() is not None
 
 
-def _fehler(status: int, code: str, message: str, **extra: Any) -> HTTPException:
-    detail = {"error": {"message": message, "type": "test_ki_deckel", "code": code, **extra}}
-    return HTTPException(status_code=status, detail=detail)
+def _fehler(status: int, code: str, message: str, headers: Optional[Dict[str, str]] = None,
+            **extra: Any) -> HTTPException:
+    """Flache Huelle MIT `source`: der HTTPException-Handler der App reicht sie
+    dann unveraendert als {"error": {...}} durch (main.http_exception_handler,
+    erster Zweig). Ohne `source` machte er bis R2 aus `code` den HTTP-Status und
+    schrieb diese Felder als Text in `message` — der Code kam nie an."""
+    detail = {
+        "message": message, "type": "test_ki_deckel", "code": code,
+        "source": "bridge_internal", "retryable": status == 503, **extra,
+    }
+    return HTTPException(status_code=status, detail=detail, headers=headers)
+
+
+def fehler_code(exc: HTTPException) -> Optional[str]:
+    return exc.detail.get("code") if isinstance(exc.detail, dict) else None
+
+
+def _nicht_lesbar(text: str) -> HTTPException:
+    from src.platform_client import DEPENDENCY_UNAVAILABLE_HEADER
+
+    return _fehler(503, CODE_NICHT_LESBAR, text, headers={DEPENDENCY_UNAVAILABLE_HEADER: ABHAENGIGKEIT})
+
+
+def _gesperrt(grund: str, text: str) -> HTTPException:
+    logger.warning("test-ki gesperrt grund=%s: %s", grund, text)
+    return _fehler(403, CODE_GESPERRT, text, grund=grund)
+
+
+def _inaktiv(testgrund_: str) -> HTTPException:
+    logger.warning("test-ki inaktiv: Testaufruf (%s) auf einer Bridge ohne %s=1", testgrund_, SCHALTER)
+    return _fehler(
+        403, CODE_INAKTIV,
+        f"Test-KI ist auf dieser Bridge aus ({SCHALTER} != 1); Testaufrufe sind gesperrt.",
+        testgrund=testgrund_,
+    )
+
+
+def _nur_chat(testgrund_: str, weg: str) -> HTTPException:
+    logger.warning("test-ki nur chat: Testaufruf (%s) auf %s abgewiesen", testgrund_, weg)
+    return _fehler(
+        403, CODE_NUR_CHAT,
+        f"Testaufrufe duerfen nur Haiku-Chat ({CHAT_PFAD}) nutzen, nicht {weg}.",
+        testgrund=testgrund_, weg=weg,
+    )
 
 
 def _tag_heute() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+
+# ── Testaufruf erkennen (gemeinsam fuer Wege-Schicht, Job-Anlegen und Tor) ────
+
+def lauf_aus_koepfen(werte: list[str]) -> Optional[str]:
+    """X-Test-Lauf aus ALLEN Vorkommen des Kopfs. None = kein Kopf. Ein
+    vorhandener Kopf, der leer, ungueltig oder mehrfach ist, wird abgewiesen —
+    nie zu "kein Test" normalisiert (Codex R4 F2)."""
+    if not werte:
+        return None
+    if len(werte) != 1:
+        raise _gesperrt("lauf_ungueltig", f"{LAUF_KOPF} mehrfach gesetzt.")
+    wert = werte[0].strip().lower()
+    if not _LAUF_MUSTER.match(wert):
+        raise _gesperrt("lauf_ungueltig", f"{LAUF_KOPF} ist gesetzt, aber kein Lauf (64 Hex).")
+    return wert
+
+
+def _alle_werte(headers: Any, name: str) -> list[str]:
+    """Alle Vorkommen eines Kopfs. Starlette-Headers liefern Mehrfachwerte;
+    ein einfaches Mapping (Aufrufer ausserhalb von HTTP) hoechstens einen."""
+    if hasattr(headers, "getlist"):
+        return list(headers.getlist(name))
+    wert = headers.get(name)
+    if wert is None:
+        wert = next((v for k, v in headers.items() if k.lower() == name.lower()), None)
+    return [] if wert is None else [wert]
+
+
+def lauf_aus_request(request: Any) -> Optional[str]:
+    return lauf_aus_koepfen(_alle_werte(request.headers, LAUF_KOPF))
+
+
+def lauf_aus_attribution(attribution: Optional[Dict[str, Any]]) -> Optional[str]:
+    """Gespeicherter Marker eines Jobs; derselbe Massstab wie fuer den Kopf."""
+    if not attribution or JOB_LAUF_KEY not in attribution:
+        return None
+    wert = attribution.get(JOB_LAUF_KEY)
+    return lauf_aus_koepfen([wert if isinstance(wert, str) else ""])
+
+
+def _ist_legacy_oder_keiner(principal: Any) -> bool:
+    return principal is None or bool(getattr(principal, "is_legacy", False))
+
+
+async def _job_ist_test(job_id: str, liste: frozenset[str]) -> bool:
+    """(b): der referenzierte Job wurde von einem Test-Prinzipal angelegt oder
+    traegt einen Marker. Ein unbekannter Job ist keiner (es gibt nichts, das
+    einzuschraenken waere); ein nicht lesbarer Store ist KEIN "kein Test"."""
+    from src.jobs import store_client
+
+    try:
+        job = await store_client.get_job(job_id)
+    except Exception as e:
+        logger.error("test-ki-deckel: Job-Store nicht lesbar (%s) — kein Durchlass", e)
+        raise _nicht_lesbar("Job-Herkunft nicht lesbar (fail-closed).")
+    if not job:
+        return False
+    attr = (job.get("attribution") if isinstance(job, dict) else getattr(job, "attribution", None)) or {}
+    return attr.get(JOB_PRINZIPAL_KEY) in liste or JOB_LAUF_KEY in attr
+
+
+async def testgrund(*, lauf: Optional[str], principal: Any, job_id: Optional[str]) -> Optional[str]:
+    """'c' | 'a' | 'b' | None. `lauf` ist bereits mit lauf_aus_* geprueft."""
+    if lauf is not None:
+        return "c"
+    liste = test_prinzipale()
+    if not liste:
+        return None
+    if not _ist_legacy_oder_keiner(principal) and getattr(principal, "name", None) in liste:
+        return "a"
+    if job_id and _ist_legacy_oder_keiner(principal) and await _job_ist_test(job_id, liste):
+        return "b"
+    return None
+
+
+def _job_id_aus(headers: Any) -> Optional[str]:
+    from src.jobs.selbstaufruf import JOB_LAUF_HEADER
+
+    return (headers.get(JOB_LAUF_HEADER) or "").strip() or None
+
+
+async def testgrund_fuer_request(request: Any) -> tuple[Optional[str], Optional[str]]:
+    """(testgrund, lauf) eines authentisierten Requests (request.state.principal)."""
+    lauf = lauf_aus_request(request)
+    principal = getattr(getattr(request, "state", None), "principal", None)
+    return await testgrund(lauf=lauf, principal=principal, job_id=_job_id_aus(request.headers)), lauf
+
+
+# ── 1. Wege-Schicht: jede Worker-Route ausser dem Chat-Tor ───────────────────
+
+def _im_durchlass(methode: str, pfad: str) -> bool:
+    return any(m == methode and r.match(pfad) for m, r in DURCHLASS)
+
+
+async def _prinzipal_aus_koepfen(headers: Any) -> Any:
+    """Derselbe Prinzipal, den verify_api_key aufloesen wird (gleicher Cache),
+    ohne dessen Abweisungen — die bleiben beim Endpunkt. None = keiner."""
+    from src.auth import _principals_enabled, auth_manager
+
+    if not _principals_enabled():
+        return None
+    roh = headers.get("authorization") or ""
+    if not roh.lower().startswith("bearer "):
+        return None
+    token = roh[7:].strip()
+    if not token:
+        return None
+    from src.principals import LEGACY_PRINCIPAL, resolve_principal_by_token
+
+    schluessel = [k for k in (auth_manager.get_api_key(), auth_manager.env_api_key_previous) if k]
+    if any(hmac.compare_digest(token, k) for k in schluessel):
+        return LEGACY_PRINCIPAL
+    return await resolve_principal_by_token(token)
+
+
+async def wege_pruefen(methode: str, pfad: str, headers: Any, *, nur_marker: bool = False) -> None:
+    """Wirft 403/503 fuer einen Testaufruf, der hier nicht hin darf; sonst None.
+    `nur_marker`: platform-api — dort gibt es keine App-Prinzipale (Service-Token
+    bzw. Nutzer-JWT), also nur (c); kein Tor, keine Job-Anlage."""
+    lauf = lauf_aus_koepfen(_alle_werte(headers, LAUF_KOPF))
+    if _im_durchlass(methode, pfad) and (methode, pfad) not in _TORWEGE:
+        return  # kostenfrei
+    an = schalter_an()
+    if an and not nur_marker and (methode, pfad) in _TORWEGE:
+        return  # tor() bzw. job_anlegen_pruefen() entscheiden selbst
+    if lauf is not None:
+        grund = "c"
+    elif nur_marker:
+        return
+    else:
+        liste = test_prinzipale()
+        if not liste:
+            return
+        try:
+            principal = await _prinzipal_aus_koepfen(headers)
+        except Exception as e:
+            logger.error("test-ki-deckel: Prinzipal nicht lesbar (%s) — kein Durchlass", e)
+            raise _nicht_lesbar("Prinzipal nicht lesbar (fail-closed).")
+        grund = await testgrund(lauf=None, principal=principal, job_id=_job_id_aus(headers))
+    if grund is None:
+        return
+    if not an:
+        raise _inaktiv(grund)
+    raise _nur_chat(grund, f"{methode} {pfad}")
+
+
+class TestKiWegeMiddleware:
+    """Reines ASGI. `antwort(request, exc)` formt die Abweisung wie der
+    HTTPException-Handler der App (gleiche Huelle wie alle Bridge-Fehler)."""
+
+    def __init__(self, app, antwort, nur_marker: bool = False):
+        self.app = app
+        self.antwort = antwort
+        self.nur_marker = nur_marker
+
+    async def __call__(self, scope, receive, send):
+        if scope.get("type") != "http":
+            return await self.app(scope, receive, send)
+        from starlette.datastructures import Headers
+        from starlette.requests import Request
+
+        try:
+            await wege_pruefen(
+                scope.get("method", ""), scope.get("path", ""), Headers(scope=scope),
+                nur_marker=self.nur_marker,
+            )
+        except HTTPException as exc:
+            response = await self.antwort(Request(scope, receive), exc)
+            return await response(scope, receive, send)
+        return await self.app(scope, receive, send)
+
+
+# ── 2. Jobs: Anlegen und Ausfuehren ──────────────────────────────────────────
+
+async def job_anlegen_pruefen(request: Any, art: str) -> Optional[str]:
+    """POST /v1/jobs, nach verify_api_key. Rueckgabe: der gepruefte Marker
+    (wird mit dem Job gespeichert) oder None. Wirft fuer unzulaessige Testjobs."""
+    grund, lauf = await testgrund_fuer_request(request)
+    if grund is None:
+        return None
+    if not schalter_an():
+        raise _inaktiv(grund)
+    if art not in JOB_ARTEN_TEST:
+        raise _nur_chat(grund, f"Job-Art {art!r}")
+    if art == "chat" and lauf is None:
+        raise _gesperrt("ohne_lauf", f"Testaufruf ({grund}): Chat-Job ohne gueltigen {LAUF_KOPF}.")
+    return lauf
+
+
+def job_lauf_pruefen(art: str, attribution: Optional[Dict[str, Any]]) -> Optional[HTTPException]:
+    """Job-Runner, vor JEDEM Executor (auch Erkunder mit eigenem Transport und
+    Jobs von vor dem Schalter). Liest nur den gespeicherten Job. Rueckgabe: die
+    Abweisung oder None."""
+    try:
+        lauf = lauf_aus_attribution(attribution)
+    except HTTPException as e:
+        return e
+    liste = test_prinzipale()
+    if lauf is not None:
+        grund = "c"
+    elif liste and (attribution or {}).get(JOB_PRINZIPAL_KEY) in liste:
+        grund = "b"
+    else:
+        return None
+    if not schalter_an():
+        return _inaktiv(grund)
+    if art not in JOB_ARTEN_TEST:
+        return _nur_chat(grund, f"Job-Art {art!r}")
+    if art == "chat" and lauf is None:
+        return _gesperrt("ohne_lauf", f"Testjob ({grund}) ohne gueltigen {LAUF_KOPF}.")
+    return None
+
+
+# ── Usage-Messung (R2-1) ─────────────────────────────────────────────────────
+
+class MessungZiel:
+    """Je Aufruf FRISCH im Torzweig angelegt und nur dort an
+    call_anthropic_direct uebergeben; nimmt hoechstens eine Messung auf."""
+
+    __slots__ = ("_messung", "_gesetzt")
+
+    def __init__(self) -> None:
+        self._messung = None
+        self._gesetzt = False
+
+    def setzen(self, messung: Any) -> None:
+        if self._gesetzt:
+            raise RuntimeError("MessungZiel wiederverwendet — eine Messung je Aufruf")
+        self._gesetzt = True
+        self._messung = messung
+
+    @property
+    def messung(self) -> Any:
+        return self._messung
 
 
 # ── Preis-Obergrenze ─────────────────────────────────────────────────────────
@@ -181,22 +496,6 @@ def eingabe_obergrenze_tokens(request_body: Any) -> int:
 
 
 # ── Datenbank (laeuft NUR in platform-api) ───────────────────────────────────
-
-async def db_ist_testkonto(user_id: uuid.UUID) -> Optional[bool]:
-    """True/False aus tenants.account_type; None = Nutzer unbekannt."""
-    from src.db.client import get_pool
-
-    pool = get_pool()
-    async with pool.acquire() as conn:
-        row = await conn.fetchrow(
-            "SELECT t.account_type::text AS account_type FROM users u "
-            "JOIN tenants t ON t.id = u.tenant_id WHERE u.id = $1",
-            user_id,
-        )
-    if row is None:
-        return None
-    return row["account_type"] == "test"
-
 
 def _summen_schluessel(app: str, tag: str, lauf: str) -> list[tuple[str, str, str]]:
     # Feste Sperrreihenfolge: ebene alphabetisch (gesamt < lauf < tag).
@@ -330,46 +629,7 @@ async def _plattform(pfad: str, koerper: Dict[str, Any]) -> Dict[str, Any]:
     return resp.json
 
 
-async def _job_prinzipal(request: Any, user_id: str) -> Optional[str]:
-    """Prinzipal des Aufrufs, der den laufenden Job ANGELEGT hat — nur fuer den
-    Selbstaufruf des Job-Executors (der mit dem Worker-Schluessel laeuft).
-    Gilt nur, wenn der Job laeuft und demselben Nutzer gehoert."""
-    from src.jobs.selbstaufruf import JOB_LAUF_HEADER
-
-    job_id = (request.headers.get(JOB_LAUF_HEADER) or "").strip()
-    if not job_id:
-        return None
-    from src.jobs import store_client
-
-    job = await store_client.get_job(job_id)
-    if not job:
-        return None
-    attr = (job.get("attribution") if isinstance(job, dict) else getattr(job, "attribution", None)) or {}
-    status = job.get("status") if isinstance(job, dict) else getattr(job, "status", None)
-    if status != "running" or str(attr.get("user_id") or "") != str(user_id):
-        return None
-    name = attr.get(JOB_PRINZIPAL_KEY)
-    return name if isinstance(name, str) and name else None
-
-
-async def ist_ausgenommen(request: Any, user_id: str) -> bool:
-    """R1-1: allein der vom Token aufgeloeste Prinzipal entscheidet."""
-    erlaubt = _prod_prinzipale()
-    if not erlaubt:
-        return False
-    principal = getattr(getattr(request, "state", None), "principal", None)
-    name = getattr(principal, "name", None)
-    if name in erlaubt and not getattr(principal, "is_legacy", False):
-        return True
-    # Job-Selbstaufruf: laeuft mit dem Worker-Schluessel (Legacy oder keiner).
-    if principal is None or getattr(principal, "is_legacy", False):
-        try:
-            return (await _job_prinzipal(request, user_id)) in erlaubt
-        except Exception as e:
-            logger.error("test-ki-deckel: Job-Herkunft nicht lesbar (%s) — nicht ausgenommen", e)
-            return False
-    return False
-
+# ── 3. Das Chat-Tor ──────────────────────────────────────────────────────────
 
 async def tor(
     *,
@@ -379,18 +639,26 @@ async def tor(
     resolved_model: Optional[str],
     erzwinge_direktweg,
 ):
-    """Das Tor. Rueckgabe None = greift nicht; sonst die erzwungene
-    BackendConfig des Direktwegs. Wirft 403/402/503 (siehe Modulkopf).
-    `erzwinge_direktweg()` liefert die BackendConfig fuer DIREKT_TIER."""
+    """Rueckgabe None = kein Testaufruf; sonst die erzwungene BackendConfig des
+    Direktwegs. Wirft 403/402/503 (siehe Modulkopf). Ab einem positiven
+    Testgrund endet jeder Zweig in einer Reservierung oder einer Abweisung —
+    nie in None. `erzwinge_direktweg()` liefert die BackendConfig fuer DIREKT_TIER."""
     _aktuell.set(None)
+    grund, test_lauf = await testgrund_fuer_request(request)
+    if grund is None:
+        return None
     if not schalter_an():
-        return None
-    app = DECKEL_APP.get((attribution.get("app_id") or "").strip())
+        raise _inaktiv(grund)  # die Wege-Schicht hat das schon; hier zur Sicherheit
+
+    principal = getattr(getattr(request, "state", None), "principal", None)
+    p_name = getattr(principal, "name", None) or "-"
+    roh_app = (attribution.get("app_id") or "").strip()
+    app = DECKEL_APP.get(roh_app)
     if app is None:
-        return None
+        raise _gesperrt("app_unbekannt", f"Testaufruf ({grund}, {p_name}): App {roh_app or '-'!r} hat keinen Test-Deckel.")
     roh_nutzer = attribution.get("user_id")
     if not roh_nutzer:
-        return None
+        raise _gesperrt("ohne_nutzer", f"Testaufruf ({grund}, {p_name}): ohne X-User-ID kein Lauf.")
 
     from src.identity.user_resolver import (
         MalformedUserIdentity, UnknownUserIdentity, resolve_user_id,
@@ -399,31 +667,18 @@ async def tor(
     try:
         uid = await resolve_user_id(roh_nutzer)
     except (MalformedUserIdentity, UnknownUserIdentity):
-        return None
+        raise _gesperrt("nutzer_unbekannt", f"Testaufruf ({grund}, {p_name}): Nutzer nicht aufloesbar.")
     except Exception as e:
         logger.error("test-ki-deckel: Nutzer nicht aufloesbar (%s) — gesperrt", e)
-        raise _fehler(503, CODE_NICHT_LESBAR, "Testkonto-Pruefung nicht moeglich (fail-closed).")
+        raise _nicht_lesbar("Nutzer-Aufloesung nicht moeglich (fail-closed).")
 
-    # Roh-Kennung (UUID oder E-Mail), so wie sie auch in der Job-Attribution steht.
-    if await ist_ausgenommen(request, str(roh_nutzer)):
-        return None
-
-    try:
-        test = await _plattform("/v1/internal/test-ki-deckel/testkonto", {"user_id": str(uid)})
-    except Exception as e:
-        logger.error("test-ki-deckel: account_type nicht lesbar (%s) — gesperrt", e)
-        raise _fehler(503, CODE_NICHT_LESBAR, "Testkonto-Pruefung nicht moeglich (fail-closed).")
-    if test.get("testkonto") is not True:
-        return None
-
-    def _sperre(grund: str, text: str) -> HTTPException:
-        logger.warning("test-ki gesperrt app=%s grund=%s modell=%s", app, grund, resolved_model)
-        return _fehler(403, CODE_GESPERRT, text, grund=grund)
+    def _sperre(g: str, text: str) -> HTTPException:
+        return _gesperrt(g, f"Testaufruf ({grund}, {p_name}, {app}): {text}")
 
     if resolved_model != MODELL:
-        raise _sperre("modell_nicht_haiku", f"Testkonto: nur {MODELL} ist freigegeben (angefragt: {resolved_model}).")
+        raise _sperre("modell_nicht_haiku", f"nur {MODELL} ist freigegeben (angefragt: {resolved_model}).")
     if request_body.enable_tools:
-        raise _sperre("werkzeuge", "Testkonto: Aufrufe mit Werkzeugen sind gesperrt.")
+        raise _sperre("werkzeuge", "Aufrufe mit Werkzeugen sind gesperrt.")
 
     try:
         cfg = erzwinge_direktweg()
@@ -432,11 +687,10 @@ async def tor(
         cfg = None
     backend = getattr(cfg.backend, "value", cfg.backend) if cfg else None
     if not cfg or backend != "anthropic_direct" or cfg.provider_model != MODELL:
-        raise _sperre("weg", f"Testkonto: Direktweg mit {MODELL} nicht herstellbar ({backend}, {getattr(cfg, 'provider_model', None)}).")
+        raise _sperre("weg", f"Direktweg mit {MODELL} nicht herstellbar ({backend}, {getattr(cfg, 'provider_model', None)}).")
 
-    test_lauf = (request.headers.get(LAUF_KOPF) or "").strip().lower()
-    if not _LAUF_MUSTER.match(test_lauf):
-        raise _sperre("ohne_lauf", f"Testkonto: ohne gueltigen {LAUF_KOPF} (64 Hex, gesetzt von der App-Sperre) kein Lauf.")
+    if test_lauf is None:
+        raise _sperre("ohne_lauf", f"ohne gueltigen {LAUF_KOPF} (64 Hex, gesetzt von der App-Sperre) kein Lauf.")
 
     eingabe = eingabe_obergrenze_tokens(request_body)
     ausgabe = int(request_body.max_tokens) if request_body.max_tokens else 4096
@@ -451,15 +705,15 @@ async def tor(
         })
     except Exception as e:
         logger.error("test-ki-deckel: Reservierung ohne klares Ergebnis (%s) — gesperrt", e)
-        raise _fehler(503, CODE_NICHT_LESBAR, "Test-KI-Deckel nicht lesbar/schreibbar (fail-closed).")
+        raise _nicht_lesbar("Test-KI-Deckel nicht lesbar/schreibbar (fail-closed).")
 
     if not erg.get("ok"):
         ebene = erg.get("ebene")
         deckel = {"lauf": DECKEL_LAUF_EUR, "tag": DECKEL_TAG_EUR, "gesamt": DECKEL_GESAMT_EUR}.get(ebene)
         summe = erg.get(f"{ebene}_summe")
         logger.warning(
-            "test-ki deckel erreicht app=%s ebene=%s grund=%s summe=%s deckel=%s betrag=%.6f lauf=%s",
-            app, ebene, erg.get("grund"), summe, deckel, betrag, lauf,
+            "test-ki deckel erreicht testgrund=%s prinzipal=%s app=%s ebene=%s grund=%s summe=%s deckel=%s betrag=%.6f lauf=%s",
+            grund, p_name, app, ebene, erg.get("grund"), summe, deckel, betrag, lauf,
         )
         raise _fehler(
             402, CODE_DECKEL,
@@ -469,29 +723,38 @@ async def tor(
 
     _aktuell.set(Reservierung(reservierung_id=rid, app=app, lauf=lauf, tag=tag, betrag_eur=betrag))
     logger.info(
-        "test-ki echt, gedeckelt app=%s lauf=%s reserviert=%.6f (ein<=%d aus<=%d) "
+        "test-ki echt, gedeckelt testgrund=%s prinzipal=%s app=%s lauf=%s reserviert=%.6f (ein<=%d aus<=%d) "
         "lauf_summe=%.4f/%.2f tag_summe=%.4f/%.2f gesamt=%.4f/%.2f EUR",
-        app, lauf, betrag, eingabe, ausgabe, float(erg.get("lauf_summe") or 0), DECKEL_LAUF_EUR,
+        grund, p_name, app, lauf, betrag, eingabe, ausgabe, float(erg.get("lauf_summe") or 0), DECKEL_LAUF_EUR,
         float(erg.get("tag_summe") or 0), DECKEL_TAG_EUR, float(erg.get("gesamt_summe") or 0), DECKEL_GESAMT_EUR,
     )
     return cfg
 
 
-async def abrechnen(usage: Optional[Dict[str, Any]]) -> None:
-    """Nach dem Direktaufruf: aus GEMESSENER Usage abrechnen (usage None = nicht
-    gemessen, Reservierung bleibt voll). Wirft nie; scheitert der Aufruf, bleibt
-    die Buchung offen und zaehlt voll."""
+def _erstattbar(messung: Any) -> bool:
+    from src.vision_provider import QUELLE_MESSAGES_API, UsageMessung
+
+    return (
+        type(messung) is UsageMessung
+        and messung.quelle == QUELLE_MESSAGES_API
+        and messung.vollstaendig is True
+    )
+
+
+async def abrechnen(messung: Any) -> None:
+    """Nach dem Direktaufruf. Erstattet wird NUR auf eine vollstaendige
+    UsageMessung aus der Messages-API-Rohantwort; alles andere (None, Fehler,
+    unvollstaendig) laesst die volle Reservierung stehen. Wirft nie; scheitert
+    der Aufruf, bleibt die Buchung offen und zaehlt voll (Ausgang unklar)."""
     r = _aktuell.get()
     if r is None or r.erledigt:
         return
     r.erledigt = True
     ist: Optional[float] = None
-    if usage is not None:
+    if _erstattbar(messung):
         ist = kosten_obergrenze_eur(
-            eingabe=int(usage.get("prompt_tokens") or 0),
-            ausgabe=int(usage.get("completion_tokens") or 0),
-            cache_lesen=int(usage.get("cache_read_input_tokens") or 0),
-            cache_anlage=int(usage.get("cache_creation_input_tokens") or 0),
+            eingabe=messung.eingabe, ausgabe=messung.ausgabe,
+            cache_lesen=messung.cache_lesen, cache_anlage=messung.cache_anlage,
         )
     try:
         erg = await _plattform("/v1/internal/test-ki-deckel/abrechnen", {
@@ -507,6 +770,6 @@ async def abrechnen(usage: Optional[Dict[str, Any]]) -> None:
         )
     except Exception as e:
         logger.error(
-            "test-ki-deckel: Abrechnung ohne klares Ergebnis app=%s lauf=%s id=%s (%s) — Reservierung %.6f bleibt offen",
+            "test-ki-deckel: Abrechnung Ausgang unklar app=%s lauf=%s id=%s (%s) — Reservierung %.6f bleibt offen",
             r.app, r.lauf, r.reservierung_id, e, r.betrag_eur,
         )

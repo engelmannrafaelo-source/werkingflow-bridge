@@ -53,6 +53,9 @@ class VisionResult:
     #: Feld statt N benannter: was ein Anbieter ueber seinen Aufruf zu sagen hat,
     #: unterscheidet sich, und der Router soll das nicht vorher wissen muessen.
     extra_meta: Dict[str, Any] = field(default_factory=dict)
+    #: UsageMessung aus der Anthropic-Rohantwort (vision_provider); nur der
+    #: Anthropic-Zweig setzt sie, Gemini nie (Test-KI-Deckel, keine Ersatzquelle).
+    messung: Optional[Any] = None
 
 
 def default_vision_target() -> str:
@@ -232,6 +235,7 @@ async def route_to_vision(
         stop_reason=vision_response.stop_reason,
         ledger_provider=PROVIDER_ANTHROPIC,
         api_key_lane=LANE_ANTHROPIC_PREPAID,
+        messung=vision_response.messung,
     )
 
 
