@@ -492,16 +492,6 @@ async def persist_ai_call_activity(
     if spooled:
         _buchung_gesichert()
 
-    # Test-KI-Deckel: die Reservierung DIESES Aufrufs (falls es eine gibt) auf
-    # die Ist-Kosten verrechnen. Nur im Live-Pfad — der Spool-Flusher laeuft
-    # ausserhalb jeder Anfrage. Wirft nie (src/budget/test_ki_deckel.py).
-    if not replaying:
-        from src.budget.test_ki_deckel import verrechne_falls_offen
-        await verrechne_falls_offen(
-            model=model, input_tokens=input_tokens, output_tokens=output_tokens,
-            cache_read_tokens=cache_read_tokens, cache_creation_tokens=cache_creation_tokens,
-        )
-
     def _settle(outcome: str) -> str:
         """Single exit. A definitive answer releases the spooled record; any
         other outcome leaves it owed, which is what makes the retry happen."""

@@ -361,6 +361,19 @@ async def create_job_endpoint(
     attribution = {k: v for k, v in (attribution or {}).items() if k != EIGENTUEMER_KEY}
     if _attribution_extractor is not None:
         attribution[EIGENTUEMER_KEY] = _idempotency_owner(request)
+
+    # Test-KI-Deckel (src/budget/test_ki_deckel.py): der Selbstaufruf laeuft mit
+    # dem Worker-Schluessel. Der Prinzipal des ANLEGENDEN Aufrufs und dessen
+    # X-Test-Lauf werden darum hier, serverseitig, mit dem Job gespeichert —
+    # nie aus dem Rumpf (ein mitgegebener Wert wird entfernt).
+    from src.budget.test_ki_deckel import JOB_PRINZIPAL_KEY, LAUF_KOPF
+    attribution = {k: v for k, v in attribution.items() if k not in (JOB_PRINZIPAL_KEY, "test_lauf")}
+    _principal = getattr(request.state, "principal", None)
+    if _principal is not None and not getattr(_principal, "is_legacy", False):
+        attribution[JOB_PRINZIPAL_KEY] = _principal.name
+    _test_lauf = (request.headers.get(LAUF_KOPF) or "").strip()
+    if _test_lauf:
+        attribution["test_lauf"] = _test_lauf
     attribution = attribution or None
 
     # Placement veto (Autobahn): the job EXECUTES on THIS worker (spawn below),

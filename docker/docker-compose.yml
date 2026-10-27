@@ -130,10 +130,14 @@ services:
       - PREPAID_VISION_DAILY_CAP_ENABLED=true
       - PREPAID_VISION_DAILY_CAP_EUR=90
       # Test-KI-Deckel (nur Dev, nie Prod): Testkonten (tenants.account_type='test')
-      # von werking-works/werking-report bekommen echte KI nur mit claude-haiku-5-5,
-      # gedeckelt 0,50 EUR je Lauf und 10 EUR je App und Tag (fail-closed). Braucht
-      # Migration 072. Vertrag: docs/contracts/test-ki-deckel.md.
+      # von werking-works/werking-report bekommen echte KI nur mit claude-haiku-5-5
+      # ueber den Direktweg, gedeckelt 0,50 EUR je Lauf, 10 EUR je App und Tag,
+      # 20 EUR gesamt je Tag (fail-closed). Braucht Migration 072 und
+      # BRIDGE_PRINCIPALS_ENABLED. PROD_PRINZIPALE: Prinzipale, deren Aufrufe
+      # Produktion sind und nie gedeckelt werden (Works-Prod laeuft ueber diese
+      # Bridge). Vertrag: docs/contracts/test-ki-deckel.md.
       - BRIDGE_TEST_KI_DECKEL=1
+      - BRIDGE_TEST_KI_PROD_PRINZIPALE=engelmann-vercel-dev
       # Chat-job self-call timeout (claims/finalize). Default 600s cut long
       # Energy claims calls (observed 728s); align with MAX_TIMEOUT (2400s).
       - BRIDGE_CHAT_JOB_TIMEOUT_S=2400
@@ -338,10 +342,14 @@ services:
       - PREPAID_VISION_DAILY_CAP_ENABLED=true
       - PREPAID_VISION_DAILY_CAP_EUR=90
       # Test-KI-Deckel (nur Dev, nie Prod): Testkonten (tenants.account_type='test')
-      # von werking-works/werking-report bekommen echte KI nur mit claude-haiku-5-5,
-      # gedeckelt 0,50 EUR je Lauf und 10 EUR je App und Tag (fail-closed). Braucht
-      # Migration 072. Vertrag: docs/contracts/test-ki-deckel.md.
+      # von werking-works/werking-report bekommen echte KI nur mit claude-haiku-5-5
+      # ueber den Direktweg, gedeckelt 0,50 EUR je Lauf, 10 EUR je App und Tag,
+      # 20 EUR gesamt je Tag (fail-closed). Braucht Migration 072 und
+      # BRIDGE_PRINCIPALS_ENABLED. PROD_PRINZIPALE: Prinzipale, deren Aufrufe
+      # Produktion sind und nie gedeckelt werden (Works-Prod laeuft ueber diese
+      # Bridge). Vertrag: docs/contracts/test-ki-deckel.md.
       - BRIDGE_TEST_KI_DECKEL=1
+      - BRIDGE_TEST_KI_PROD_PRINZIPALE=engelmann-vercel-dev
       # Chat-job self-call timeout (claims/finalize). Default 600s cut long
       # Energy claims calls (observed 728s); align with MAX_TIMEOUT (2400s).
       - BRIDGE_CHAT_JOB_TIMEOUT_S=2400
@@ -546,10 +554,14 @@ services:
       - PREPAID_VISION_DAILY_CAP_ENABLED=true
       - PREPAID_VISION_DAILY_CAP_EUR=90
       # Test-KI-Deckel (nur Dev, nie Prod): Testkonten (tenants.account_type='test')
-      # von werking-works/werking-report bekommen echte KI nur mit claude-haiku-5-5,
-      # gedeckelt 0,50 EUR je Lauf und 10 EUR je App und Tag (fail-closed). Braucht
-      # Migration 072. Vertrag: docs/contracts/test-ki-deckel.md.
+      # von werking-works/werking-report bekommen echte KI nur mit claude-haiku-5-5
+      # ueber den Direktweg, gedeckelt 0,50 EUR je Lauf, 10 EUR je App und Tag,
+      # 20 EUR gesamt je Tag (fail-closed). Braucht Migration 072 und
+      # BRIDGE_PRINCIPALS_ENABLED. PROD_PRINZIPALE: Prinzipale, deren Aufrufe
+      # Produktion sind und nie gedeckelt werden (Works-Prod laeuft ueber diese
+      # Bridge). Vertrag: docs/contracts/test-ki-deckel.md.
       - BRIDGE_TEST_KI_DECKEL=1
+      - BRIDGE_TEST_KI_PROD_PRINZIPALE=engelmann-vercel-dev
       # Chat-job self-call timeout (claims/finalize). Default 600s cut long
       # Energy claims calls (observed 728s); align with MAX_TIMEOUT (2400s).
       - BRIDGE_CHAT_JOB_TIMEOUT_S=2400
@@ -754,10 +766,14 @@ services:
       - PREPAID_VISION_DAILY_CAP_ENABLED=true
       - PREPAID_VISION_DAILY_CAP_EUR=90
       # Test-KI-Deckel (nur Dev, nie Prod): Testkonten (tenants.account_type='test')
-      # von werking-works/werking-report bekommen echte KI nur mit claude-haiku-5-5,
-      # gedeckelt 0,50 EUR je Lauf und 10 EUR je App und Tag (fail-closed). Braucht
-      # Migration 072. Vertrag: docs/contracts/test-ki-deckel.md.
+      # von werking-works/werking-report bekommen echte KI nur mit claude-haiku-5-5
+      # ueber den Direktweg, gedeckelt 0,50 EUR je Lauf, 10 EUR je App und Tag,
+      # 20 EUR gesamt je Tag (fail-closed). Braucht Migration 072 und
+      # BRIDGE_PRINCIPALS_ENABLED. PROD_PRINZIPALE: Prinzipale, deren Aufrufe
+      # Produktion sind und nie gedeckelt werden (Works-Prod laeuft ueber diese
+      # Bridge). Vertrag: docs/contracts/test-ki-deckel.md.
       - BRIDGE_TEST_KI_DECKEL=1
+      - BRIDGE_TEST_KI_PROD_PRINZIPALE=engelmann-vercel-dev
       # Chat-job self-call timeout (claims/finalize). Default 600s cut long
       # Energy claims calls (observed 728s); align with MAX_TIMEOUT (2400s).
       - BRIDGE_CHAT_JOB_TIMEOUT_S=2400

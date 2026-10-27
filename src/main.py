@@ -3340,24 +3340,34 @@ async def _chat_completions_lauf(
             )
 
         # =======================================================================
-        # TEST-KI-DECKEL: Testkonten von Works/Report nur Haiku, gedeckelt
+        # TEST-KI-DECKEL: Testkonten von Works/Report nur Haiku, Direktweg, gedeckelt
         # =======================================================================
-        # Direkt am aufgeloesten Backend, damit das TATSAECHLICH geroutete
-        # Modell zaehlt (Alias, App-Regel, Tier, Pin). Inert ohne
+        # Nach jeder anderen Wegwahl (Pin, App-Regel, Tier, Text-Wegwahl): das
+        # Tor ZWINGT gedeckelte Testaufrufe auf den Direktweg (ein Messages-API-
+        # Aufruf, max_tokens wirksam, Usage gemessen) und prueft das Ergebnis am
+        # aufgeloesten Backend. Herkunft nur ueber den Prinzipal. Inert ohne
         # BRIDGE_TEST_KI_DECKEL=1. Regeln: src/budget/test_ki_deckel.py.
         from src.budget import test_ki_deckel as _test_ki_deckel
-        await _test_ki_deckel.pruefe_und_reserviere(
+
+        def _test_ki_direktweg():
+            _cfg = resolve_backend_config(
+                backend=BackendType.ANTHROPIC,
+                model=_test_ki_deckel.MODELL,
+                provider_tier=_test_ki_deckel.DIREKT_TIER,
+            )
+            _cfg.provider_model = _test_ki_deckel.MODELL
+            return _cfg
+
+        _test_ki_cfg = await _test_ki_deckel.tor(
+            request=request,
+            request_body=request_body,
             attribution=extract_attribution_context(request),
-            backend=(
-                getattr(backend_config.backend, "value", backend_config.backend)
-                if backend_config else None
-            ),
-            effektives_modell=(
-                (backend_config.provider_model if backend_config else None) or resolved_model
-            ),
-            eingabe_tokens=_arrival_est_tokens or len(str(request_body.messages)) // 3,
-            max_tokens=getattr(request_body, "max_tokens", None),
+            resolved_model=resolved_model,
+            erzwinge_direktweg=_test_ki_direktweg,
         )
+        if _test_ki_cfg is not None:
+            backend_config = _test_ki_cfg
+            request_body.provider_tier = _test_ki_deckel.DIREKT_TIER
 
         # =======================================================================
         # GEMINI-BILDWEG: geht der Aufruf wirklich zu Gemini?
@@ -3900,6 +3910,8 @@ async def _chat_completions_lauf(
             try:
                 response_data = await call_anthropic_direct(request_body, backend_config)
             except Exception as direct_err:
+                # Test-KI-Deckel: nichts gemessen -> Reservierung bleibt voll stehen.
+                await _test_ki_deckel.abrechnen(None)
                 await _persist_direct_usage(
                     input_tokens=0, output_tokens=0, status="error",
                     duration_ms=int((time.time() - start_time) * 1000),
@@ -3909,6 +3921,9 @@ async def _chat_completions_lauf(
                 raise
             duration = time.time() - start_time
             usage = response_data.get("usage") or {}
+            # Test-KI-Deckel: Abrechnung NUR aus der gemessenen API-Usage; fehlt
+            # sie, bleibt die volle Reservierung stehen.
+            await _test_ki_deckel.abrechnen(usage if response_data.get("usage") else None)
             logger.info(f"✅ Direct Anthropic request completed in {duration:.2f}s (tier={direct_tier})")
             await _persist_direct_usage(
                 input_tokens=usage.get("prompt_tokens", 0) or 0,

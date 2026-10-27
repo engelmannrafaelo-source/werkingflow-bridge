@@ -1,52 +1,75 @@
 # Vertrag: Test-KI-Deckel (gedeckelte echte KI für Testkonten)
 
-Stand: 27.10.2026. Auftrag: KD 91624155, Grundlage Rafael 27.10. 16:36Z. Code: `src/budget/test_ki_deckel.py`, Migration `072_test_ki_deckel.sql`.
+Stand: 27.10.2026, R2 nach Codex R1. Auftrag: KD 91624155, Grundlage Rafael 27.10. 16:36Z. Code: `src/budget/test_ki_deckel.py`, Migration `072_test_ki_deckel.sql`.
 
 ## Zweck
 
-Tester von werking-works und werking-report prüfen mit echter KI, aber nur mit Haiku und gedeckelt. Die Apps sperren Testaufrufe selbst (`KI_IM_TEST_GESPERRT`). Sie lassen nur `claude-haiku-5-5` durch, und das nur, wenn ihr eigener Schalter `KI_TEST_ECHT_GEDECKELT=1` gesetzt ist. Diese Bridge-Seite ist der Deckel dahinter. Den App-Schalter erst setzen, wenn Bridge-Rollout und Migration 072 durch sind.
+Tester von werking-works und werking-report prüfen mit echter KI: nur Haiku, nur gedeckelt.
 
-## Konfiguration
+Die Apps sperren Testaufrufe selbst (`KI_IM_TEST_GESPERRT`). Sie lassen nur Haiku-Chat in der **Preview** durch, und nur mit ihrem Schalter `KI_TEST_ECHT_GEDECKELT=1`. Dabei setzen sie `X-Test-Lauf`. Diese Bridge-Seite ist der Deckel dahinter.
 
-| Variable | Wo | Wert |
-|---|---|---|
-| `BRIDGE_TEST_KI_DECKEL` | Worker, `docker/docker-compose.yml` (Dev-Bridge) | `1` = Tor aktiv. Fehlt oder ≠ `1`: Code inert, Verhalten unverändert. `docker-compose-prod.yml` trägt ihn nie. |
+## Konfiguration (nur Worker, `docker/docker-compose.yml` = Dev-Bridge)
 
-Kein Secret. Lauf- und Tagesdeckel (0,50 € / 10 €) stehen als Konstanten im Code. Eine Änderung braucht einen Commit, keinen Schalter.
+| Variable | Wert |
+|---|---|
+| `BRIDGE_TEST_KI_DECKEL` | Bei `1` ist das Tor aktiv. Ist er nicht gesetzt oder ≠ `1`, ist der Code inert. Prod setzt ihn nie. |
+| `BRIDGE_TEST_KI_PROD_PRINZIPALE` | Kommagetrennte `service_principals.name`. Aufrufe dieser Prinzipale sind Produktion und werden nie gedeckelt. Dev: `engelmann-vercel-dev`, weil Works-Prod über diese Bridge läuft. |
+
+Kein Secret. Die Deckel (0,50 € je Lauf, 10 € je App und Tag, 20 € gesamt je Tag) sind Konstanten im Code. Voraussetzung ist `BRIDGE_PRINCIPALS_ENABLED=true`. Ohne aufgelösten Prinzipal greift keine Ausnahme, das Tor sperrt also.
 
 ## Wann das Tor greift
 
-Alle vier Bedingungen müssen zutreffen, sonst bleibt der Aufruf unberührt:
+Alle Bedingungen müssen zutreffen, sonst bleibt der Aufruf unberührt:
 
-1. `BRIDGE_TEST_KI_DECKEL=1`.
-2. Die App (`X-App-ID` bzw. `X-Client-ID`) ist `werking-report`, `werking-works` oder `engelmann`. `engelmann` ist die Bridge-App-ID von Works; beide zählen als ein Tagesdeckel.
-3. `X-App-Env` ist nicht `production`. Grund: Works-Prod ruft dieselbe Dev-Bridge auf, und der Works-Mandant `engelmann` hat `account_type='test'`. Ein fehlender Header zählt als Nicht-Prod, das Tor greift also.
-4. In der Bridge-DB gilt `tenants.account_type = 'test'` für den Mandanten des Nutzers (`X-User-ID`: UUID oder E-Mail). Das Merkmal kommt nie aus einem Feld der Anfrage.
+1. Der Schalter steht auf `1`.
+2. Die App (`X-App-ID` bzw. `X-Client-ID`) ist `werking-report`, `werking-works` oder `engelmann`.
+3. Der Prinzipal des Aufrufs steht **nicht** in `BRIDGE_TEST_KI_PROD_PRINZIPALE`.
+   - Maßgeblich ist nur der aus dem Token aufgelöste Prinzipal, nie ein Kopf.
+   - **`X-App-Env` spielt keine Rolle.**
+   - Sonderfall Job-Selbstaufruf (Worker-Schlüssel): Er übernimmt den Prinzipal, den `POST /v1/jobs` serverseitig mit dem Job gespeichert hat, aber nur für einen laufenden Job desselben Nutzers.
+4. `tenants.account_type = 'test'` für den Nutzer (`X-User-ID`: UUID oder E-Mail). Geprüft wird über platform-api.
 
-## Antworten
+## Was dann gilt
 
 | Fall | HTTP | `error.code` | Zusatz |
 |---|---|---|---|
-| Geroutetes Modell ≠ `claude-haiku-5-5` oder Backend kein Claude-Weg (Alias, Tier, App-Regel, Pin) | 403 | `KI_IM_TEST_GESPERRT` | `grund: modell_nicht_haiku` |
-| Kein `X-Workflow-ID` | 403 | `KI_IM_TEST_GESPERRT` | `grund: ohne_lauf` |
-| Lauf- oder Tagesdeckel überschritten | 402 | `KI_TEST_DECKEL_ERREICHT` | `ebene` (`lauf`/`tag`), `summe_eur`, `deckel_eur` |
-| DB/platform-api nicht les- oder schreibbar | 503 | `KI_TEST_DECKEL_NICHT_LESBAR` | fail-closed |
+| Angefragtes Modell (nach Alias) ≠ `claude-haiku-5-5` | 403 | `KI_IM_TEST_GESPERRT` | `grund: modell_nicht_haiku` |
+| `enable_tools=true` | 403 | `KI_IM_TEST_GESPERRT` | `grund: werkzeuge` |
+| Direktweg mit Haiku nicht herstellbar | 403 | `KI_IM_TEST_GESPERRT` | `grund: weg` |
+| `X-Test-Lauf` fehlt oder ist nicht 64 Hex | 403 | `KI_IM_TEST_GESPERRT` | `grund: ohne_lauf` (keine Buchung) |
+| Deckel überschritten oder Lauf/Tag geschlossen | 402 | `KI_TEST_DECKEL_ERREICHT` | `ebene`, `grund`, `summe_eur`, `deckel_eur`, `reservierung_eur` |
+| platform-api nicht erreichbar oder Antwort unklar | 503 | `KI_TEST_DECKEL_NICHT_LESBAR` | fail-closed |
 
-Die Fehlerhülle ist `{"detail": {"error": {...}}}`. Für Testaufrufe sind die Fallback-Ketten auf andere Anbieter abgeschaltet.
+**Weg.** Jeder gedeckelte Aufruf läuft über `claude-direct-notools` mit `claude-haiku-5-5`: ein Messages-API-Aufruf ohne Werkzeuge, `max_tokens` wirksam, Usage gemessen, Streaming als Minimal-SSE. Das kostet echtes Geld auf dem Prepaid-Schlüssel (KD D-1), daher greift zusätzlich die bestehende 90-€-Rolling-Grenze. Fallback-Ketten sind gesperrt.
 
-## Lauf und Kosten
+**Reservierung (Obergrenze).**
+- Eingabe ≤ UTF-8-Bytes aller Texte + 64 je Nachricht + 2.000 fest + 6.000 je Bild.
+- Die Eingabe wird zum **Cache-Anlage-Satz 2×** bewertet, Ausgabe = `max_tokens`. Fehlt `max_tokens`, gilt 4.096, und dieser Wert wird auch dem Aufruf mitgegeben.
+- Alle Sätze stammen aus der **höchsten** Preiszeile des Modells.
 
-- Ein Lauf ist der Schlüssel aus UTC-Tag, Bridge-Nutzer-UUID und `X-Workflow-ID`. Der Tag steckt im Schlüssel, weil Apps teils feste Workflow-Namen senden.
-- Vor dem Aufruf wird eine Schätzung reserviert: Eingabe-Tokens plus `max_tokens` (ohne Angabe 8192), bewertet zum Listenpreis nach `src/pricing.py`. Lauf- und Tageszeile werden in einer Transaktion unter `FOR UPDATE` geprüft und gebucht.
-- Nach dem Aufruf verrechnet `persist_ai_call_activity` die Schätzung auf die Ist-Kosten. Eine nie verrechnete Reservierung bleibt stehen: Sie zählt zu viel, nie zu wenig.
-- Protokollzeilen: `test-ki echt, gedeckelt app=… lauf=… reserviert|ist=… lauf_summe=x/0.50 tag_summe=y/10.00 EUR`.
+**Abrechnung.**
+- Nur aus der **gemessenen** API-Usage, zu denselben pessimistischen Sätzen.
+- Ohne Messung (Fehler, Abbruch) bleibt die volle Reservierung stehen.
+- Liegt der Ist-Wert über der Reservierung, wird er gebucht, und **Lauf und App-Tag werden geschlossen**.
+
+**Lauf.** Schlüssel aus UTC-Tag, Bridge-Nutzer-UUID und `X-Test-Lauf`. `X-Workflow-ID` bleibt unberührt und dient weiter den Projektbudgets.
+
+**Idempotenz.**
+- `reservierung_id` (uuid4 je Aufruf) ist Primärschlüssel in `test_ki_buchung`.
+- Wiederholtes Reservieren gibt das gespeicherte Urteil zurück und bucht nichts.
+- Abrechnen geht genau einmal (`offen` → `abgerechnet`).
+- **Einziger Schreibweg ist platform-api; ein DB-Rückfall im Worker existiert nicht.**
+
+**Protokoll.** `test-ki echt, gedeckelt app=… lauf=… reserviert|ist=… lauf_summe=x/0.50 tag_summe=y/10.00 gesamt=z/20.00 EUR` sowie `test-ki deckel erreicht …` und `test-ki gesperrt …`.
 
 ## Innen-API (platform-api, Service-Token)
 
-`POST /v1/internal/test-ki-deckel/testkonto`, `…/reservieren` und `…/verrechnen`. Der Worker geht über platform-api. Bei `PlatformUnavailable` greift er direkt auf die DB zu, sofern er sie hat. Sonst antwortet er mit 503.
+`POST /v1/internal/test-ki-deckel/testkonto`, `…/reservieren` und `…/abrechnen`.
 
 ## Rollout-Reihenfolge
 
-1. Migration 072 per `bin/bridge-migrate.sh` auf die Dev-Bridge-DB.
-2. Bridge-Deploy (Dev) mit dem Schalter in `docker-compose.yml`.
-3. Danach erst die App-Schalter `KI_TEST_ECHT_GEDECKELT=1` (Works/Report, Preview).
+1. **Gegenprobe der Herkunft.** Aus den Worker-Logs bzw. dem Ledger feststellen, welche Prinzipale heute als engelmann/report mit einem Testmandanten KI aufrufen. Jeder produktive davon gehört in `BRIDGE_TEST_KI_PROD_PRINZIPALE`; sonst bekommt er laut 403.
+2. Migration 072 per `bin/bridge-migrate.sh` auf die Dev-Bridge-DB.
+3. Bridge-Deploy (Dev) mit beiden Variablen.
+4. **Works:** Der Prinzipal muss geteilt sein. Works-Preview braucht einen **eigenen** Prinzipal, der nicht in der Liste steht (KD D-2). Erst danach `KI_TEST_ECHT_GEDECKELT=1` setzen, nur im Vercel-Scope `preview`.
+5. **Report:** `KI_TEST_ECHT_GEDECKELT=1` nur `preview`. `report-vercel-dev` steht nicht in der Liste.
