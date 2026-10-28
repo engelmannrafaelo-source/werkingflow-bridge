@@ -45,6 +45,7 @@ def main():
     parser.add_argument('--source',required=True)
     parser.add_argument('--coordinator-host',required=True)
     parser.add_argument('--coordinator-url',required=True)
+    parser.add_argument('--coordinator-local-url',default='http://platform-api:8000')
     parser.add_argument('--worker-host',action='append',default=[])
     parser.add_argument('--gpu-host')
     args=parser.parse_args()
@@ -59,7 +60,7 @@ def main():
     token=tokenfile.read_text().strip()
     assert args.coordinator_url.startswith('http://100.') or args.coordinator_url.startswith('https://')
     for host in dict.fromkeys([args.coordinator_host,*args.worker_host]):
-        subprocess.run(['ssh',host,'python3 -c '+shlex.quote(REMOTE)],input=json.dumps({'url':args.coordinator_url,'token':token}),text=True,check=True)
+        subprocess.run(['ssh',host,'python3 -c '+shlex.quote(REMOTE)],input=json.dumps({'url':args.coordinator_local_url if host == args.coordinator_host else args.coordinator_url,'token':token}),text=True,check=True)
     if args.gpu_host:
         subprocess.run(['sudo','-n','-u','claude-user','ssh',args.gpu_host,'python3 -c '+shlex.quote(REMOTE_GPU)],input=json.dumps({'url':args.coordinator_url,'token':token}),text=True,check=True)
     script=root/'refresh.py';shutil.copy2(pathlib.Path(__file__).with_name('refresh-api-credit-pool.py'),script)
