@@ -10,6 +10,22 @@ set -euo pipefail
 exec 9>/root/.privacy-deploy.lock
 flock -n 9 || { echo 'Another GPU deploy is running'; exit 1; }
 cd /root/werkingflow-bridge
+# Fail before changing the runtime when Tailnet policy blocks the coordinator.
+python3 - <<'PYCREDIT'
+import pathlib,urllib.request,json
+p=pathlib.Path('secrets/api-credit-pool-client.env')
+cfg=dict(line.split('=',1) for line in p.read_text().splitlines() if '=' in line) if p.exists() else {}
+url=cfg.get('ANTHROPIC_CREDIT_POOL_URL','')
+if url:
+ req=urllib.request.Request(url.rstrip('/')+'/v1/internal/api-credit-pool/status',headers={'X-Credit-Pool-Token':cfg.get('ANTHROPIC_CREDIT_POOL_TOKEN','')})
+ try:
+  with urllib.request.urlopen(req,timeout=10) as r: data=json.load(r)
+ except Exception:
+  raise SystemExit('Credit coordinator unreachable; GPU runtime unchanged')
+ print('Credit coordinator reachable; accounts',len(data.get('accounts',[])))
+else:
+ print('GPU credit pool disabled; retaining existing provider')
+PYCREDIT
 git diff --quiet && git diff --cached --quiet || { echo 'Tracked GPU files modified'; exit 1; }
 old_sha=$(git rev-parse HEAD)
 old_image=$(docker inspect --format '{{.Image}}' gpu-privacy-pdf-service)
@@ -66,6 +82,14 @@ for attempt in $(seq 1 60); do
  sleep 5
 done
 if [[ "$healthy" != 1 ]]; then rollback_runtime; exit 1; fi
+if ! docker exec -i gpu-privacy-pdf-service python - <<'PYCREDITRUNTIME'
+import os,urllib.request,json
+url=os.getenv('ANTHROPIC_CREDIT_POOL_URL','')
+if url:
+ req=urllib.request.Request(url.rstrip('/')+'/v1/internal/api-credit-pool/status',headers={'X-Credit-Pool-Token':os.environ['ANTHROPIC_CREDIT_POOL_TOKEN']})
+ with urllib.request.urlopen(req,timeout=10) as r: json.load(r)
+PYCREDITRUNTIME
+then rollback_runtime; exit 1; fi
 docker exec gpu-privacy-pdf-service python -c 'import ast,pathlib; tree=ast.parse(pathlib.Path("/app/src/privacy_service/app.py").read_text()); model=next(ast.literal_eval(n.value) for n in tree.body if isinstance(n,ast.Assign) and any(isinstance(t,ast.Name) and t.id=="HAIKU_MODEL" for t in n.targets)); assert model=="claude-haiku-5-5"; print("GPU model:", model)' || { rollback_runtime; exit 1; }
 printf '%s\n' "$target" > .privacy-deployed-sha
 echo "GPU deploy healthy: $target"
