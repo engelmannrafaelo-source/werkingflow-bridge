@@ -13,7 +13,8 @@ verwenden dieselbe `ANTHROPIC_CREDIT_POOL_URL` und einen eigenen
 `ANTHROPIC_CREDIT_POOL_TOKEN`. Die internen Routen sind nicht über nginx
 veröffentlicht. `/accounts` gibt Schlüssel nur nach Prüfung dieses Tokens aus;
 `/status` enthält ausschließlich Budget- und Herkunftsdaten, keine Schlüssel.
-Der gemeinsame GPU-Privacy-Dienst benutzt denselben Client. Auf dem Primary-Host
+Der gemeinsame GPU-Privacy-Dienst kann denselben Client benutzen, sobald
+der Koordinator aus seinem Netz erreichbar ist. Auf dem Primary-Host
 verwenden die Container die Docker-Adresse http://platform-api:8000; entfernte
 Clients verwenden die Tailnet-Adresse. Die eigene Tailnet-Publikation ist aus
 den Primary-Containern nicht per Hairpin erreichbar.
@@ -83,3 +84,29 @@ Rückweg: alten geprüften Commit über das Deploy-Werkzeug ausrollen. Die alten
 Schlüssel wurden nicht ersetzt; alter Code ignoriert die Pool-Variablen. Für
 eine bewusste Rückkehr zum alten Pfad auf neuem Code Pool-URL entfernen und
 regulär deployen. Reservierungstabelle und alte Guthabenbelege behalten.
+
+## Verifizierter Rollout am 28.10.2026
+
+Dev läuft auf `3806dc5` (Branch `codex/api-credit-pool-runtime-20261028`): vier
+Worker und der Koordinator aktiv, 15/15 Smoke-Probes bestanden. Echte Bildaufrufe
+mit Office und Werking sind im gemeinsamen Ledger abgerechnet. Der öffentliche
+Dev-Test mit der bestehenden Hop-Markierung liefert `api_vision_bypass` und
+HTTP 200. Ohne diese gezielte Dev-Routenwahl geht Standardverkehr gemäß der
+bestehenden Topologie zuerst zur Produktions-Bridge; deren Aktivierung fehlt
+noch. Die internen Schlüsselrouten antworten öffentlich mit 404.
+
+Produktion: Secrets vorbereitet, Koordinator-Netz erreichbar, Laufzeit noch
+`dcba6ba`. Der reguläre Dev-first-Rollout umfasst ungefähr 50 weitere Commits
+(Budget, Auth, Jobs); Rafaels Entscheidung dazu ist ausstehend. Keine aktive
+Guthaben-Nutzung durch die alten Prod-Worker behaupten.
+
+GPU: Client-Code `5a2bd5d` vorhanden, Pool wieder deaktiviert, weil der GPU-Host
+den Primary-Koordinator nicht erreichen kann. Installation mit
+`--disable-gpu-pool` erhält den bisherigen Provider. Erst Netzfreigabe prüfen,
+dann diesen Schalter weglassen und regulär deployen. Das verbesserte
+GPU-Deploy-Werkzeug prüft die Verbindung vor Aktivierung und erneut im Container.
+
+Chrome/Engelmann und Safari/Gmail brauchen noch einen Console-Login und eigene
+Bridge-Schlüssel. Office/Opera und Werking/Arc sind bestätigt; je 200 USD
+ursprüngliches Guthaben, tatsächliche aktuelle Beträge im Manifest/Console.
+API-Guthaben und Partner-Browser-Logins sind unabhängige Arbeitsstränge.
