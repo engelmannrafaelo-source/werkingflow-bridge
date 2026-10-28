@@ -83,6 +83,7 @@ from src.sandbox.routes import router as sandbox_router  # noqa: E402
 from src.sandbox.conversation_routes import router as sandbox_conversations_router  # noqa: E402
 from src.principals_routes import router as principals_router  # noqa: E402
 from src.internal_routes import router as internal_router  # noqa: E402
+from src.providers.credit_pool_routes import router as credit_pool_router  # noqa: E402
 
 from src.tenant import TenantMiddleware  # noqa: E402
 
@@ -209,6 +210,7 @@ app.include_router(sandbox_router)
 app.include_router(sandbox_conversations_router)
 app.include_router(principals_router)
 app.include_router(internal_router)
+app.include_router(credit_pool_router)
 logger.info("✅ Platform routes mounted")
 
 # CORS — same policy as workers

@@ -18,16 +18,20 @@ git fetch origin "$branch:refs/remotes/origin/$branch"
 target=$(git rev-parse "$1^{commit}")
 git merge-base --is-ancestor "$old_sha" "$target" || { echo 'Not a fast-forward'; exit 1; }
 # This release must not ship unrelated changes on the shared privacy host.
-unexpected=$(git diff --name-only "$old_sha" "$target" | grep -vE '^(src/privacy_service/app.py|scripts/bridge-deploy.sh|scripts/gpu-privacy-deploy.sh)$' || true)
+unexpected=$(git diff --name-only "$old_sha" "$target" | grep -vE '^(src/privacy_service/app.py|src/vision_provider.py|src/providers/credit_pool.py|scripts/bridge-deploy.sh|scripts/gpu-privacy-deploy.sh)$' || true)
 [[ -z "$unexpected" ]] || { echo "Unexpected files: $unexpected"; exit 1; }
 git merge --ff-only "$target"
 override=$(mktemp /root/privacy-release-XXXXXX.yml)
 rollback=$(mktemp /root/privacy-rollback-XXXXXX.yml)
 trap 'rm -f "$override" "$rollback"' EXIT
 python3 - "$override" "$rollback" "$target" "$old_sha" "$old_image" <<'PYCONFIG'
-import sys,json
+import sys,json,pathlib
 out,back,new,old,image=sys.argv[1:]
-json.dump({"services":{"privacy-service":{"labels":{"bridge.git.commit":new}}}},open(out,"w"))
+service={"labels":{"bridge.git.commit":new}}
+credit_env='/root/werkingflow-bridge/secrets/api-credit-pool-client.env'
+if pathlib.Path(credit_env).exists():
+ service['env_file']=[credit_env]
+json.dump({"services":{"privacy-service":service}},open(out,"w"))
 json.dump({"services":{"privacy-service":{"image":image,"labels":{"bridge.git.commit":old}}}},open(back,"w"))
 PYCONFIG
 base=(-f /root/docker-compose.privacy-gpu.yml -f /root/docker-compose.privacy-gpu.override.yml)

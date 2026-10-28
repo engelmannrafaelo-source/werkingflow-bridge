@@ -276,6 +276,9 @@ def is_tier_usable(tier_id: str) -> bool:
             logger.warning(f"⚠️ Provider tier '{tier_id}' skipped: {config.api_key_env} not set")
             return False
     if config.backend in (BackendType.ANTHROPIC_DIRECT, BackendType.GEMINI_API):
+        from src.providers.credit_pool import enabled as credit_pool_enabled
+        if config.backend == BackendType.ANTHROPIC_DIRECT and credit_pool_enabled():
+            return True
         if config.api_key_env and not os.getenv(config.api_key_env):
             logger.warning(f"⚠️ Provider tier '{tier_id}' skipped: {config.api_key_env} not set")
             return False
