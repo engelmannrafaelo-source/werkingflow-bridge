@@ -48,6 +48,7 @@ def main():
     parser.add_argument('--coordinator-local-url',default='http://platform-api:8000')
     parser.add_argument('--worker-host',action='append',default=[])
     parser.add_argument('--gpu-host')
+    parser.add_argument('--disable-gpu-pool',action='store_true',help='Keep GPU on its existing provider until coordinator connectivity is available')
     args=parser.parse_args()
     if os.getuid()!=0:raise SystemExit('Run on Dev as root')
     root=pathlib.Path('/root/.local/share/bridge-api-credit-pool');root.mkdir(mode=0o700,parents=True,exist_ok=True)
@@ -62,7 +63,7 @@ def main():
     for host in dict.fromkeys([args.coordinator_host,*args.worker_host]):
         subprocess.run(['ssh',host,'python3 -c '+shlex.quote(REMOTE)],input=json.dumps({'url':args.coordinator_local_url if host == args.coordinator_host else args.coordinator_url,'token':token}),text=True,check=True)
     if args.gpu_host:
-        subprocess.run(['sudo','-n','-u','claude-user','ssh',args.gpu_host,'python3 -c '+shlex.quote(REMOTE_GPU)],input=json.dumps({'url':args.coordinator_url,'token':token}),text=True,check=True)
+        subprocess.run(['sudo','-n','-u','claude-user','ssh',args.gpu_host,'python3 -c '+shlex.quote(REMOTE_GPU)],input=json.dumps({'url':'' if args.disable_gpu_pool else args.coordinator_url,'token':'' if args.disable_gpu_pool else token}),text=True,check=True)
     script=root/'refresh.py';shutil.copy2(pathlib.Path(__file__).with_name('refresh-api-credit-pool.py'),script)
     python=root/'venv/bin/python'
     if not python.exists():subprocess.run(['uv','venv',str(root/'venv'),'--python','3.12'],check=True)
