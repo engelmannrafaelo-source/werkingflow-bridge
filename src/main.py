@@ -2776,7 +2776,12 @@ async def _chat_completions_lauf(
     # Gemini-Bildweg (provider_tier="gemini-vision"): keine Pool-Zulassung
     # gegen das Claude-Abo; jeder andere Aufruf wird wie bisher zugelassen.
     _gemini_vision_lane = is_gemini_vision_request(request)
-    if not _gemini_vision_lane:
+    from src.providers.credit_pool import enabled as credit_pool_enabled
+    _credit_vision_lane = credit_pool_enabled() and has_vision_content(
+        prepare_messages_for_vision(request_body.messages)
+    )
+    _external_vision_lane = _gemini_vision_lane or _credit_vision_lane
+    if not _external_vision_lane:
         await enforce_pool_admission(request)
 
     # Force tools-policy: tools are research-only (X-Claude-Allowed-Tools header).
@@ -2796,7 +2801,7 @@ async def _chat_completions_lauf(
     # Validate Claude Code authentication
     auth_valid, auth_info = validate_claude_code_auth()
 
-    if not auth_valid:
+    if not auth_valid and not _credit_vision_lane:
         # Log authentication failure event
         EventLogger.log_authentication(
             success=False,
@@ -2962,12 +2967,12 @@ async def _chat_completions_lauf(
                 f"(Org/Ratelimit) dieses Workers gelten nicht"
             )
         _org_block = (
-            None if _gemini_vision_lane else _org_disabled_precheck(worker_id)
+            None if _external_vision_lane else _org_disabled_precheck(worker_id)
         )
         if _org_block is not None:
             return _org_block
         from src.claude_cli import rate_limit_tracker
-        if not _gemini_vision_lane and rate_limit_tracker.should_reject_new_request(
+        if not _external_vision_lane and rate_limit_tracker.should_reject_new_request(
             worker_id
         ):
             retry_after = rate_limit_tracker.get_retry_after(worker_id) or 0

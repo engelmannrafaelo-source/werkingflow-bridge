@@ -13,7 +13,16 @@ verwenden dieselbe `ANTHROPIC_CREDIT_POOL_URL` und einen eigenen
 `ANTHROPIC_CREDIT_POOL_TOKEN`. Die internen Routen sind nicht über nginx
 veröffentlicht. `/accounts` gibt Schlüssel nur nach Prüfung dieses Tokens aus;
 `/status` enthält ausschließlich Budget- und Herkunftsdaten, keine Schlüssel.
-Der gemeinsame GPU-Privacy-Dienst kann denselben Client benutzen.
+Der gemeinsame GPU-Privacy-Dienst benutzt denselben Client. Auf dem Primary-Host
+verwenden die Container die Docker-Adresse http://platform-api:8000; entfernte
+Clients verwenden die Tailnet-Adresse. Die eigene Tailnet-Publikation ist aus
+den Primary-Containern nicht per Hairpin erreichbar.
+
+Echte Bildinhalte auf /v1/chat/completions werden im nginx-Router anhand des
+Bodies erkannt und brauchen keine freie Abo-Kapazität. Im Worker überspringt
+ein aktiver Guthaben-Pool für Bildanfragen Abo-Zulassung, Abo-Login und
+Abo-Kontosperren. API-Authentifizierung, Nutzer-Pins und Budgetregeln bleiben
+wirksam. Reine Textanfragen erhalten diese Ausnahme nicht.
 
 Vor jeder Text-/Bildanfrage zählt Anthropic die Eingabetokens. Die platform-api
 reserviert unter einer PostgreSQL-Transaktionssperre pro Gutschrift die obere
