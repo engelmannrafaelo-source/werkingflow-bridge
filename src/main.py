@@ -11598,7 +11598,8 @@ async def bridge_error_handler(request: Request, exc: BridgeError):
             )
         except Exception:
             return exc.response
-        return await _run_api_reserve_fallback(reserve_request, request, cause=err_type)
+        result = await _run_api_reserve_fallback(reserve_request, request, cause=err_type)
+        return JSONResponse(content=result) if isinstance(result, dict) else result
 
     except HTTPException as reserve_error:
         return JSONResponse(status_code=reserve_error.status_code, content={"error": {

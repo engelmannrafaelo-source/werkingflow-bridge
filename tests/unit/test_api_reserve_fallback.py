@@ -44,3 +44,21 @@ async def test_reserve_reenters_normal_security_pipeline_and_restores_state():
     assert exc.value.status_code == 401
     assert req.state.api_reserve_retry is False
     assert body.provider_tier != 'claude-direct-notools'
+
+
+@pytest.mark.asyncio
+async def test_admission_exception_returns_response_not_plain_dict():
+    from fastapi.responses import JSONResponse
+    body = {'model':'claude-sonnet-5','messages':[{'role':'user','content':'hello'}], 'enable_tools': False}
+    req = SimpleNamespace(state=SimpleNamespace(cached_body_dict=body), headers={},
+                          url=SimpleNamespace(path='/v1/chat/completions'))
+    exc = main.BridgeError(JSONResponse(status_code=429, content={'error':{
+        'source':'bridge_account','bridge_type':'account_exhausted'}}))
+    with patch('src.providers.credit_pool.enabled', return_value=True), \
+         patch.object(main, '_cross_worker_retry', AsyncMock(return_value=None)), \
+         patch.object(main, '_ehrliche_antwort', side_effect=lambda req, resp: resp), \
+         patch.object(main, '_run_api_reserve_fallback', AsyncMock(return_value={'choices':[]})) as reserve:
+        response = await main.bridge_error_handler(req, exc)
+    assert response.status_code == 200
+    assert response.body == b'{"choices":[]}'
+    reserve.assert_awaited_once()
