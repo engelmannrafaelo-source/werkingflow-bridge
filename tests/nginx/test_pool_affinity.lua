@@ -254,7 +254,7 @@ do
     local empty = pool()
     for _, account in pairs(empty) do account.available = false end
     local st = { accounts = empty, api_reserve = { state = "available", active_on_this_bridge = true,
-        automatic_paid_fallback = false, available_usd = 790 }, body = {messages = {}, enable_tools = false} }
+        automatic_paid_fallback = false, available = true }, body = {messages = {}, enable_tools = false} }
     local v = run_router({uri = "/v1/chat/completions"}, st)
     check(v.x_pool_decision == "api_reserve_candidate", "empty subscriptions must reach reserve admission")
     st.body.session_id = "existing-session"

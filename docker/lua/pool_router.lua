@@ -420,7 +420,7 @@ local function api_reserve_candidate(reserve)
     if type(reserve) ~= "table" or reserve.state ~= "available"
         or reserve.active_on_this_bridge ~= true
         or reserve.automatic_paid_fallback ~= false
-        or tonumber(reserve.available_usd or 0) <= 0 then return false end
+        or reserve.available ~= true then return false end
     ngx.req.read_body()
     local raw = ngx.req.get_body_data()
     if not raw then return false end -- Large/file-backed calls retain normal rejection.

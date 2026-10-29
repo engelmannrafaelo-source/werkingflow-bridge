@@ -1160,13 +1160,22 @@ def get_account_pool_state():
             penalties.pop(k, None)
         _write_penalties(penalties)
 
-    result: dict = {"ts": now, "accounts": accounts, "api_reserve": api_reserve_snapshot()}
+    reserve = api_reserve_snapshot()
+    # The pool router reads this route without a key. Expose only routing
+    # availability here; monetary details belong to the protected endpoint.
+    routing_reserve = {
+        "state": reserve["state"],
+        "active_on_this_bridge": reserve["active_on_this_bridge"],
+        "automatic_paid_fallback": False,
+        "available": reserve["state"] == "available" and (reserve.get("available_usd") or 0) > 0,
+    }
+    result: dict = {"ts": now, "accounts": accounts, "api_reserve": routing_reserve}
     if errors:
         result["errors"] = errors
     return result
 
 
-@app.get("/v1/metrics/api-reserve")
+@app.get("/v1/metrics/api-reserve", dependencies=OPERATOR)
 def get_api_reserve():
     return api_reserve_snapshot()
 
