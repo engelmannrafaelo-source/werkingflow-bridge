@@ -23,7 +23,8 @@ Echte Bildinhalte auf /v1/chat/completions werden im nginx-Router anhand des
 Bodies erkannt und brauchen keine freie Abo-Kapazität. Im Worker überspringt
 ein aktiver Guthaben-Pool für Bildanfragen Abo-Zulassung, Abo-Login und
 Abo-Kontosperren. API-Authentifizierung, Nutzer-Pins und Budgetregeln bleiben
-wirksam. Reine Textanfragen erhalten diese Ausnahme nicht.
+wirksam. Reine Textanfragen beginnen weiterhin im Abo-Pool; nur der unten
+beschriebene Reserve-Fallback nimmt sie aus der Abo-Zulassung heraus.
 
 Vor jeder Text-/Bildanfrage zählt Anthropic die Eingabetokens. Die platform-api
 reserviert unter einer PostgreSQL-Transaktionssperre pro Gutschrift die obere
@@ -43,6 +44,33 @@ Snapshot älter als eine Stunde, unbekannter Modellpreis oder Ablauf in weniger
 als einer Stunde: keine Freigabe. Ein aktiver Pool fällt nie auf den bisherigen
 bezahlten Vision-Schlüssel zurück. Die bestehende tägliche Vision-Kappe bleibt
 zusätzlich bestehen. Die Schlüssel sind keine Admin-Schlüssel.
+
+## Automatische Reserve und Anzeige
+
+Seit Rafaels Auftrag vom 29.10.2026 gilt für ungebundene Claude-Anfragen:
+Abo-Pool → Promotional-API-Reserve → warten/ablehnen. Die automatische Kette
+enthält weder OpenRouter noch den undurchsichtigen Notfall-Peer oder einen
+bezahlten Legacy-Schlüssel. Auch bloße Pool-Sättigung aktiviert keinen bezahlten
+Research-Cloud-Overflow. Ausdrückliche Betreiber-Pins bleiben verbindlich.
+
+Die Reserve unterstützt aktuell Text und Bilder ohne Werkzeuge und ohne
+fortgesetzte Sitzung. Sie ist kein zusätzlicher Claude-Code-Platz. Ein interner
+Reserve-Versuch durchläuft nochmals die normale Authentifizierung, Pin-Auflösung
+und Budgetprüfung. Eine fehlende Reserve oder ein Widerspruch führt zur Absage,
+nicht zur nächsten bezahlten Route. nginx kann bei leerem Abo-Pool eine passende
+Textanfrage an diese Worker-Prüfung weitergeben; es vergibt selbst kein Guthaben.
+
+`GET /v1/metrics/api-reserve` verlangt den Betreiber-Schlüssel und liefert eine
+aggregierte USD-Reserve mit freigegebenem Betrag, Restbetrag, Reservierungen,
+Ablaufzeit und Messzeit. Der interne Koordinator stellt dafür `/summary` bereit.
+Die schlüssellose `account-pool-state`-Route enthält lediglich einen Wahrheitswert
+zur Reserve-Verfügbarkeit, keine Geldbeträge. Ausfall oder veraltete Messung
+bedeuten unbekannt/gesperrt, niemals frei verfügbares altes Geld.
+
+Die CUI liest beide Bridges über `/api/bridge/api-reserve` (nur Admin) und zeigt
+einen gemeinsamen Balken. Gleiche Pool-Identitäten werden niemals addiert;
+unterschiedliche Identitäten oder ungültige Antworten ergeben keine verlässliche
+Gesamtsumme. Der Betrag wird nicht in die Auswahl freier CLI-Konten eingerechnet.
 
 ## Aktualisierung und Betrieb
 
@@ -85,7 +113,7 @@ Schlüssel wurden nicht ersetzt; alter Code ignoriert die Pool-Variablen. Für
 eine bewusste Rückkehr zum alten Pfad auf neuem Code Pool-URL entfernen und
 regulär deployen. Reservierungstabelle und alte Guthabenbelege behalten.
 
-## Verifizierter Rollout am 28.10.2026
+## Historischer Rollout-Zwischenstand am 28.10.2026
 
 Dev läuft auf `3806dc5` (Branch `codex/api-credit-pool-runtime-20261028`): vier
 Worker und der Koordinator aktiv, 15/15 Smoke-Probes bestanden. Echte Bildaufrufe
