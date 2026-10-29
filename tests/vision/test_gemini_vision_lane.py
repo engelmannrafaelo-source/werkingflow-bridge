@@ -420,7 +420,8 @@ def test_a_gemini_model_name_in_the_model_field_is_rejected():
     for name in ("gemini-flash-lite", "gemini-2.5-flash-lite"):
         resolved, msg = resolve_model(name)
         assert resolved is None, f"{name} sollte nicht aufloesen"
-    assert resolve_model("claude-sonnet-5")[0] == "claude-sonnet-5"
+    from src.model_registry import get_default_model
+    assert resolve_model("claude-sonnet-5")[0] == get_default_model("sonnet")
 
 
 # ── Kollision mit der App-Provider-Regel ────────────────────────────────────

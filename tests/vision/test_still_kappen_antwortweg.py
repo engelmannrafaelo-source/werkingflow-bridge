@@ -35,11 +35,12 @@ def _config():
 ])
 async def test_direct_meldet_echten_abbruchgrund(monkeypatch, stop_reason, expected):
     async def fake(**kw):
-        return SimpleNamespace(content="abc", model="m", usage={}, stop_reason=stop_reason)
+        return SimpleNamespace(content="abc", model="m", usage={}, stop_reason=stop_reason, extra_meta={"funding_source":"subscription_api_credit"})
 
     monkeypatch.setattr(anthropic_direct, "route_to_vision", fake)
     out = await anthropic_direct.call_anthropic_direct(_request(), _config())
     assert out["choices"][0]["finish_reason"] == expected
+    assert out["x_api_reserve"]["funding_source"] == "subscription_api_credit"
 
 
 async def test_direct_reicht_max_tokens_durch_und_meldet_vorgabe(monkeypatch):
@@ -47,7 +48,7 @@ async def test_direct_reicht_max_tokens_durch_und_meldet_vorgabe(monkeypatch):
 
     async def fake(**kw):
         seen.update(kw)
-        return SimpleNamespace(content="x", model="m", usage={}, stop_reason="end_turn")
+        return SimpleNamespace(content="x", model="m", usage={}, stop_reason="end_turn", extra_meta={})
 
     monkeypatch.setattr(anthropic_direct, "route_to_vision", fake)
     out = await anthropic_direct.call_anthropic_direct(_request(max_tokens=777), _config())
