@@ -164,6 +164,8 @@ async def _run_chat(body: dict, *, locked: bool):
          patch.object(src.main, "get_tenant_from_request", side_effect=_PassedPrecheck):
         try:
             resp = await handler(ChatCompletionRequest(**body), req, None, None)
+        except src.main.BridgeError as exc:
+            resp = exc.response
         except _PassedPrecheck:
             return "passed", org_check, admission
     return resp, org_check, admission

@@ -28,12 +28,23 @@ def authenticate(x_credit_pool_token: str | None = Header(default=None)) -> None
         raise HTTPException(403, "Credit pool authentication required")
 
 
-def manifest() -> list[dict]:
+def _manifest_data() -> dict:
     path = os.getenv("ANTHROPIC_CREDIT_POOL_ACCOUNTS_FILE", "/app/secrets/api-credit-pool.json")
     try:
         data = json.loads(Path(path).read_text())
+        if not isinstance(data.get("accounts"), list) or not data["accounts"]:
+            raise ValueError("Missing account inventory")
+        return data
+    except (OSError, ValueError, AttributeError, TypeError) as exc:
+        raise HTTPException(503, "Credit pool manifest unavailable or invalid") from exc
+
+
+def manifest(data: dict | None = None) -> list[dict]:
+    try:
+        data = _manifest_data() if data is None else data
         now = datetime.now(timezone.utc)
         accounts = []
+        seen_grants = set()
         for a in data["accounts"]:
             # A failed individual refresh cannot be hidden by another account.
             observed = datetime.fromisoformat(a["observed_at"].replace("Z", "+00:00"))
@@ -42,6 +53,13 @@ def manifest() -> list[dict]:
             if not a.get("api_key") or a.get("disabled"):
                 continue
             for g in a["grants"]:
+                if g["id"] in seen_grants:
+                    raise ValueError("Duplicate credit grant")
+                seen_grants.add(g["id"])
+                for field in ("granted_usd", "remaining_usd"):
+                    value = Decimal(str(g[field]))
+                    if not value.is_finite() or value < 0:
+                        raise ValueError("Invalid credit balance")
                 expires = datetime.fromisoformat(g["expires_at"].replace("Z", "+00:00"))
                 if expires <= now + timedelta(hours=1):
                     continue
@@ -168,3 +186,64 @@ async def status():
                            "expires_at": a["expires_at"], "available_usd": float(max(Decimal(0), await available(conn, a))),
                            "requests": row["requests"], "pending": row["pending"], "charged_usd": float(row["charged"])})
     return {"accounts": result, "paid_fallback": False}
+
+
+@router.get("/summary", dependencies=[Depends(authenticate)])
+async def summary():
+    """One shared monetary reserve, never four additional subscription slots.
+
+    No account identities, organization IDs, cookies or keys leave this route.
+    Expired/stale observations do not contribute spendable money.
+    """
+    data = _manifest_data()
+    eligible = manifest(data)
+    now = datetime.now(timezone.utc)
+    granted = balance = reserved = usable = Decimal(0)
+    observed_at, expires_at = [], []
+    stale = blocked = 0
+    try:
+        for account in data["accounts"]:
+            observed = datetime.fromisoformat(account["observed_at"].replace("Z", "+00:00"))
+            if now - observed > timedelta(hours=1) or observed > now + timedelta(minutes=1):
+                stale += 1
+                continue
+            if account.get("disabled") or not account.get("api_key"):
+                blocked += 1
+                continue
+            observed_at.append(observed)
+            for grant in account["grants"]:
+                expiry = datetime.fromisoformat(grant["expires_at"].replace("Z", "+00:00"))
+                if expiry <= now + timedelta(hours=1):
+                    continue
+                amounts = [Decimal(str(grant[k])) for k in ("granted_usd", "remaining_usd")]
+                if any(not amount.is_finite() or amount < 0 for amount in amounts):
+                    raise ValueError("Invalid credit balance")
+                granted += amounts[0]
+                balance += amounts[1]
+                expires_at.append(expiry)
+        async with get_pool().acquire() as conn:
+            for account in eligible:
+                usable += max(Decimal(0), await available(conn, account))
+                reserved += await conn.fetchval(
+                    "SELECT COALESCE(sum(charged_usd),0) FROM anthropic_credit_reservations WHERE grant_id=$1 AND state='reserved'",
+                    account["grant_id"],
+                )
+    except (ValueError, KeyError, TypeError, ArithmeticError) as exc:
+        raise HTTPException(503, "API reserve summary unavailable") from exc
+    state = "available" if usable > 0 else "unavailable" if stale or blocked else "exhausted"
+    return {
+        "pool_id": "anthropic-subscription-api-reserve", "currency": "USD",
+        "shared_across_bridges": True, "state": state,
+        "granted_usd": float(granted), "remaining_usd": float(balance),
+        "available_usd": float(usable), "reserved_usd": float(reserved),
+        "account_count": len(data["accounts"]),
+        "eligible_accounts": len({a["id"] for a in eligible}),
+        "stale_accounts": stale, "blocked_accounts": blocked,
+        "measured_at": min(observed_at).isoformat() if observed_at else None,
+        "checked_at": now.isoformat(),
+        "next_expiry_at": min(expires_at).isoformat() if expires_at else None,
+        "automatic_paid_fallback": False,
+        "supported_operations": ["text", "vision"],
+        "supports_tools": False, "supports_claude_code": False,
+        "requires_stateless_request": True,
+    }

@@ -181,3 +181,41 @@ async def test_only_rejected_requests_can_move_to_next_account(monkeypatch):
     assert response.status_code==200 and meta['credit_pool_account']=='two'
     settled=[d for p,d in events if p=='/settle']
     assert settled[0]['rejected'] is True and 'usage' in settled[1]
+
+
+@pytest.mark.asyncio
+async def test_summary_is_one_pool_and_deducts_reservations(db):
+    before = await ledger.summary()
+    assert before['granted_usd'] == 200
+    assert before['available_usd'] == 198
+    assert before['supports_claude_code'] is False
+    assert before['automatic_paid_fallback'] is False
+    await ledger.reserve(request())
+    after = await ledger.summary()
+    assert after['available_usd'] < before['available_usd']
+    assert after['reserved_usd'] > 0
+    assert after['pool_id'] == before['pool_id']
+    wire = json.dumps(after)
+    for secret in ('secret-test-key', 'org-one', 'grant-one', 'werking'):
+        assert secret not in wire
+
+
+@pytest.mark.asyncio
+async def test_summary_stale_money_is_not_available(db, configured):
+    path, data = configured
+    data['accounts'][0]['observed_at'] = (datetime.now(timezone.utc)-timedelta(hours=2)).isoformat()
+    path.write_text(json.dumps(data))
+    summary = await ledger.summary()
+    assert summary['available_usd'] == 0
+    assert summary['state'] == 'unavailable'
+
+
+def test_invalid_or_duplicate_credit_grants_fail_closed(configured):
+    path, data = configured
+    data['accounts'].append(dict(data['accounts'][0]))
+    path.write_text(json.dumps(data))
+    with pytest.raises(HTTPException): ledger.manifest()
+    data['accounts'].pop()
+    data['accounts'][0]['grants'][0]['remaining_usd'] = 'NaN'
+    path.write_text(json.dumps(data))
+    with pytest.raises(HTTPException): ledger.manifest()

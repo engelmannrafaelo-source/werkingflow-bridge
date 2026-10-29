@@ -415,6 +415,21 @@ end
 -- Images use an external API, never a Claude subscription account. Inspect
 -- actual chat content; a caller-supplied routing header is not sufficient.
 -- Workers still enforce authentication, provider pins and the API budget.
+local function api_reserve_candidate(reserve)
+    if ngx.var.uri ~= "/v1/chat/completions" then return false end
+    if type(reserve) ~= "table" or reserve.state ~= "available"
+        or reserve.active_on_this_bridge ~= true
+        or reserve.automatic_paid_fallback ~= false
+        or tonumber(reserve.available_usd or 0) <= 0 then return false end
+    ngx.req.read_body()
+    local raw = ngx.req.get_body_data()
+    if not raw then return false end -- Large/file-backed calls retain normal rejection.
+    local body = cjson.decode(raw)
+    if type(body) ~= "table" or type(body.messages) ~= "table" then return false end
+    return body.enable_tools ~= true and not body.session_id and not body.tools
+        and not body.backend and not body.provider_tier
+end
+
 local function has_chat_image()
     if ngx.var.uri ~= "/v1/chat/completions" then return false end
     ngx.req.read_body()
@@ -547,6 +562,15 @@ function M.choose(opts)
     end
 
     if not picked then
+        -- Route only to normal worker admission; the worker rechecks identity,
+        -- operator pins and central credit reservation before any API request.
+        if api_reserve_candidate(data.api_reserve) then
+            local pick = round_robin_worker()
+            count_decision(pick)
+            ngx.var.target_worker = pick
+            ngx.var.x_pool_decision = "api_reserve_candidate"
+            return
+        end
         if affinity_key then
             affinity_fallback(affinity_key, affinity or "fallback:no_eligible",
                               "preferred=" .. tostring(preferred))
