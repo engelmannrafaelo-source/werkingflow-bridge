@@ -30,7 +30,10 @@ Design (decided 2026-05-16, tightened 2026-05-28):
     asking for "the" plan of an app then silently charges the wrong pot. See
     src/budget/plan_resolution.py. An unresolvable plan fails CLOSED for the
     same reason a malformed identity does: a call nobody can bill is the
-    failure mode, not a transient one.
+    failure mode, not a transient one. Since BA6 (30.10.2026) it leaves the
+    gate as HTTPException 409 `billing_plan_unresolved`: the callers re-raise
+    HTTPException and swallow every other error, so a bare PlanResolutionError
+    had become a silent pass after all (Befund B1).
 
 See ADR 0007 lineage / token-tracking consolidation.
 """
@@ -51,6 +54,7 @@ from src.federation import (
 from src.budget.plan_resolution import PlanResolutionError, resolve_billing_plan
 from src.budget.plans import (
     AmbiguousPlanCatalog,
+    PlanCatalogUnavailable,
     find_monthly_plan_for_app,
     find_project_plans_for_app,
 )
@@ -133,6 +137,54 @@ def _budget_state_unavailable(user_id, project_id, why: str) -> HTTPException:
         headers={"X-Bridge-Dependency-Unavailable": BUDGET_STATE_DEPENDENCY},
     )
 
+def _known_hard_cap_raw(user_id, project_id, hint: bool) -> bool:
+    """_known_hard_cap before the identity is resolved (raw caller value)."""
+    if hint:
+        return True
+    try:
+        return _known_hard_cap(uuid.UUID(str(user_id).strip()), project_id, False)
+    except ValueError:  # silent-ok: an e-mail identity cannot hit the uid-keyed cache
+        return False
+
+
+def _plan_unresolved(app_id, user_id, project_id, exc: Exception) -> HTTPException:
+    """409 for a call that cannot be attributed to exactly one paying plan (B1/BA6).
+
+    Raised as an HTTPException ON PURPOSE: every caller of enforce_budget
+    re-raises HTTPException and swallows everything else ("letting call
+    through"). A bare PlanResolutionError therefore used to end in exactly the
+    silent pass this policy exists to prevent (main.py chat/research/doc-agent/
+    convert catch-alls, Befund B1 27.10.2026).
+    """
+    from src.billing.project_budgets_service import AmbiguousProjectBudget
+
+    if isinstance(exc, AmbiguousPlanCatalog):
+        reason = "ambiguous_plan_catalog"
+    elif isinstance(exc.__cause__, AmbiguousProjectBudget):
+        reason = "ambiguous_project_budget"
+    else:
+        reason = "billing_plan_unresolved"
+    logger.error(
+        "budget gate: REJECTED (409 %s) app=%s user=%s project=%s — no single paying plan: %s",
+        reason, app_id, user_id, project_id, exc,
+    )
+    return HTTPException(
+        status_code=409,
+        detail={
+            "error": "billing_plan_unresolved",
+            "reason": reason,
+            "retryable": False,
+            "appId": app_id,
+            "projectId": project_id,
+            "message": (
+                "Dieser Aufruf lässt sich keinem eindeutigen Abrechnungstopf zuordnen "
+                f"({reason}). Er wird nicht ungemessen durchgelassen; die Zuordnung "
+                "(Projektbudget/Plan) muss bereinigt werden."
+            ),
+        },
+    )
+
+
 # Reasons that hard-block the call.
 #   *_exhausted / *_exceeded_no_topup / trial_expired = "had budget, it's gone"
 #   unlicensed = "never had a plan entry" (added 2026-05-28 — was implicit grant)
@@ -171,7 +223,21 @@ async def enforce_budget(
     # plan catalog is not budget-gated at all, and it must stay that way even
     # if its caller sends a shaky identity (the identity policy below would
     # otherwise start rejecting calls that were never metered to begin with).
-    if find_monthly_plan_for_app(app_id) is None and not find_project_plans_for_app(app_id):
+    try:
+        in_catalog = (
+            find_monthly_plan_for_app(app_id) is not None
+            or bool(find_project_plans_for_app(app_id))
+        )
+    except PlanCatalogUnavailable as e:
+        # Infra (catalog not loaded): fail-open like every other infra error,
+        # EXCEPT for a known hard-cap project. Before BA6 this escaped the gate
+        # entirely and the callers' catch-alls waved it through even with the
+        # X-Budget-Hard-Cap hint (dev worker log 29./30.10.2026).
+        if project_id and _known_hard_cap_raw(user_id, project_id, hard_cap_hint):
+            raise _budget_state_unavailable(user_id, project_id, f"plan catalog: {e}") from e
+        logger.error("budget gate: plan catalog unavailable (%s) — letting call through", e)
+        return
+    if not in_catalog:
         return
 
     # ADR-0011 pre-flight: a FOREIGN-origin request whose home bridge is not
@@ -239,17 +305,14 @@ async def enforce_budget(
 
     try:
         plan = await resolve_billing_plan(app_id, uid, project_id)
-    except (AmbiguousPlanCatalog, PlanResolutionError):
+    except (AmbiguousPlanCatalog, PlanResolutionError) as e:
         # CONFIGURATION / DATA bug, not infra. Same split as the malformed
         # identity above: we cannot name the pot that pays, so we must not
         # serve the call. Guessing is how a paid Akt got charged to a monthly
         # trial pot in the first place. The boot invariant makes the catalog
         # half of this unreachable in a healthy process.
-        logger.exception(
-            "budget gate: cannot resolve a billing plan for app=%s user=%s project=%s",
-            app_id, user_id, project_id,
-        )
-        raise
+        # Visible 409, never a bare raise: the callers swallow non-HTTP errors.
+        raise _plan_unresolved(app_id, user_id, project_id, e) from e
     except Exception as e:  # noqa: BLE001 — fail-open: infra error must not kill the AI path
         if project_id and _known_hard_cap(uid, project_id, hard_cap_hint):
             raise _budget_state_unavailable(uid, project_id, f"plan resolution: {e}") from e

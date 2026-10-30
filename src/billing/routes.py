@@ -1058,17 +1058,28 @@ async def consume_project_credit(
 # See project_budgets_service.py ("Auftragsbudget") and
 # ENTWURF-AUFTRAGSBUDGET-8462d3f6-20261027.md, Abschnitt 4.
 #
-# Service-Token only: the Energy starter creates the row BEFORE the run's first
-# LLM call (fail-closed), raises it on revision, reads it for display. The
+# The Energy starter creates the row BEFORE the run's first LLM call
+# (fail-closed), reads it for display; an operator raises it on revision. The
 # operator token has no app binding, so every write is restricted to
 # kind='auftrag' rows and protocolled with the caller's X-App-ID/X-Agent-ID.
+#
+# BA6 (30.10.2026): create/get/list also accept the bound
+# X-Bridge-Auftragsbudget-Token (anlegen / lesen, plan energy-project only);
+# `raise` stays operator-only (X-Bridge-Service-Token). Vertrag:
+# docs/contracts/auftragsbudget-token.md.
 # ---------------------------------------------------------------------------
 
 from decimal import Decimal as _Decimal  # noqa: E402
 
 from fastapi import Header  # noqa: E402
 
-from src.api_auth import get_tenant_of_user  # noqa: E402
+from src.api_auth import (  # noqa: E402
+    RECHT_ANLEGEN,
+    RECHT_LESEN,
+    enforce_auftragsbudget_binding,
+    get_tenant_of_user,
+    require_auftragsbudget_token,
+)
 from src.billing.project_budgets_service import (  # noqa: E402
     AUFTRAG_BUDGET_MAX_EUR,
     AUFTRAG_PROJECT_ID_PATTERN,
@@ -1141,10 +1152,19 @@ class AuftragBudgetListResponse(BaseModel):
     summeLimitEur: float
 
 
-def _auftrag_actor(x_app_id: Optional[str], x_agent_id: Optional[str]) -> str:
-    """Protocol identity of the caller: X-App-ID/X-Agent-ID, else 'service'."""
+def _auftrag_actor(
+    x_app_id: Optional[str], x_agent_id: Optional[str], claims: Optional[AuthClaims] = None
+) -> str:
+    """Protocol identity of the caller: X-App-ID/X-Agent-ID, else 'service'.
+
+    A bound-token caller is marked as such ('auftragsbudget-token:' prefix) so
+    the protocol tells it apart from an operator sending the same headers.
+    """
     parts = [p.strip() for p in (x_app_id, x_agent_id) if p and p.strip()]
-    return "/".join(parts) if parts else "service"
+    base = "/".join(parts) if parts else "service"
+    if claims is not None and claims.kind == "auftragsbudget":
+        return f"auftragsbudget-token:{base}"
+    return base
 
 
 def _auftrag_error(e: project_budgets_service.AuftragBudgetError) -> HTTPException:
@@ -1173,10 +1193,11 @@ async def create_auftrag_budget(
     response: Response,
     x_app_id: Optional[str] = Header(default=None),
     x_agent_id: Optional[str] = Header(default=None),
-    _claims: AuthClaims = Depends(require_service_token),
+    _claims: AuthClaims = Depends(require_auftragsbudget_token(RECHT_ANLEGEN)),
 ) -> Dict[str, Any]:
     """
-    Auftragsbudget anlegen (Service-Token only): eine hard_cap-Zeile in
+    Auftragsbudget anlegen (Service-Token oder gebundenes Auftragsbudget-Token
+    mit Recht `anlegen`, dann nur plan_id energy-project, sonst 403): eine hard_cap-Zeile in
     project_budgets fuer genau diese workflow_id, ohne Credit-Slot.
 
     201 neu angelegt, 200 dieselbe Zeile (Limit und Eltern gleich) schon da,
@@ -1188,6 +1209,7 @@ async def create_auftrag_budget(
     bei project_id ausserhalb des Pfad-/Header-sicheren Musters. Muss VOR
     dem ersten Aufruf des Laufs geschehen.
     """
+    enforce_auftragsbudget_binding(_claims, body.plan_id, x_app_id)
     uid = _parse_user_id(user_id)
     try:
         get_plan(body.plan_id)
@@ -1207,7 +1229,7 @@ async def create_auftrag_budget(
             project_id=body.project_id,
             limit_eur=body.limit_eur,
             grund=body.grund,
-            actor=_auftrag_actor(x_app_id, x_agent_id),
+            actor=_auftrag_actor(x_app_id, x_agent_id, _claims),
             parent_project_id=body.parent_project_id,
         )
     except project_budgets_service.AuftragBudgetError as e:
@@ -1233,7 +1255,8 @@ async def raise_auftrag_budget(
     _claims: AuthClaims = Depends(require_service_token),
 ) -> Dict[str, Any]:
     """
-    Auftragsbudget anheben (Service-Token only), nur nach oben, limit_eur ist
+    Auftragsbudget anheben (Service-Token only — nie mit dem gebundenen
+    Auftragsbudget-Token, das ist hier 401), nur nach oben, limit_eur ist
     der neue absolute Zielwert. Wirkt sofort: Gate und Abzug lesen ohne Cache.
 
     200 angehoben (oder gleich: changed=false; oder Schluessel schon
@@ -1267,9 +1290,12 @@ async def get_auftrag_budget(
     user_id: str,
     project_id: str,
     plan_id: str = "energy-project",
-    _claims: AuthClaims = Depends(require_service_token),
+    x_app_id: Optional[str] = Header(default=None),
+    _claims: AuthClaims = Depends(require_auftragsbudget_token(RECHT_LESEN)),
 ) -> Dict[str, Any]:
-    """Stand einer Auftragszeile (Service-Token only) samt letzter Anhebung; 404 ohne Zeile."""
+    """Stand einer Auftragszeile (Service-Token oder Auftragsbudget-Token mit
+    Recht `lesen`) samt letzter Anhebung; 404 ohne Zeile."""
+    enforce_auftragsbudget_binding(_claims, plan_id, x_app_id)
     uid = _parse_user_id(user_id)
     budget = await project_budgets_service.get_auftrag_budget(uid, plan_id, project_id)
     if budget is None:
@@ -1291,13 +1317,16 @@ async def list_auftrag_budgets(
     user_id: str,
     parent_project_id: str = Query(min_length=1, max_length=200),
     plan_id: str = "energy-project",
-    _claims: AuthClaims = Depends(require_service_token),
+    x_app_id: Optional[str] = Header(default=None),
+    _claims: AuthClaims = Depends(require_auftragsbudget_token(RECHT_LESEN)),
 ) -> Dict[str, Any]:
     """
-    Auftragszeilen eines Kundenprojekts (Service-Token only) plus
+    Auftragszeilen eines Kundenprojekts (Service-Token oder
+    Auftragsbudget-Token mit Recht `lesen`) plus
     projektSummeEur (Elternzeile used + Summe Auftrag used) und summeLimitEur.
     Hier ist die Projektsumme ablesbar; /project-budgets zeigt nur kind='projekt'.
     """
+    enforce_auftragsbudget_binding(_claims, plan_id, x_app_id)
     uid = _parse_user_id(user_id)
     try:
         return await project_budgets_service.list_auftrag_budgets(uid, plan_id, parent_project_id)

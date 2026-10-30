@@ -2870,7 +2870,9 @@ async def _chat_completions_lauf(
         # ===================================================================
         # BUDGET GATE — hard 402 when the user's app budget is exhausted.
         # Runs before the LLM call. Fail-open on infra errors; only a real
-        # "budget empty" blocks. See src/budget/gate.py.
+        # "budget empty" blocks. See src/budget/gate.py. Every refusal the gate
+        # decides on (402, 400, 409 billing_plan_unresolved, 503) arrives as
+        # HTTPException; the catch-all below only sees unclassified errors.
         # ===================================================================
         try:
             from src.budget.gate import enforce_budget, hard_cap_hint_from_request
@@ -11875,11 +11877,19 @@ async def http_exception_handler(request: Request, exc: StarletteHTTPException):
             # keeps its label (Report's durable drivers retry on it).
             type_override=(
                 detail["error"]
-                if exc.status_code == 402
-                and detail.get("reason") == "project_budget_exhausted"
-                and detail.get("hardCap") is True
-                and detail.get("retryable") is False
-                and isinstance(detail.get("error"), str)
+                if (
+                    exc.status_code == 402
+                    and detail.get("reason") == "project_budget_exhausted"
+                    and detail.get("hardCap") is True
+                    and detail.get("retryable") is False
+                    and isinstance(detail.get("error"), str)
+                )
+                # Budget gate (BA6): no single paying plan — its own type, not
+                # an internal error.
+                or (
+                    exc.status_code == 409
+                    and detail.get("error") == "billing_plan_unresolved"
+                )
                 else None
             ),
         )
