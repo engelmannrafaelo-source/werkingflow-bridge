@@ -228,6 +228,10 @@ async def enforce_budget(
             find_monthly_plan_for_app(app_id) is not None
             or bool(find_project_plans_for_app(app_id))
         )
+    except AmbiguousPlanCatalog as e:
+        # The catalog lookup itself can already detect an incoherent catalog;
+        # same 409 as from resolve_billing_plan below, never a bare raise.
+        raise _plan_unresolved(app_id, user_id, project_id, e) from e
     except PlanCatalogUnavailable as e:
         # Infra (catalog not loaded): fail-open like every other infra error,
         # EXCEPT for a known hard-cap project. Before BA6 this escaped the gate

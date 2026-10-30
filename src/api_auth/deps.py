@@ -207,9 +207,11 @@ def _auftragsbudget_rechte(token: str) -> frozenset:
     import hmac
     anlege = config.auftragsbudget_token_raw
     lese = config.auftragsbudget_lesetoken_raw
-    # Compare against both every time (no early exit on the first match).
-    is_anlege = bool(anlege) and hmac.compare_digest(token, anlege)
-    is_lese = bool(lese) and hmac.compare_digest(token, lese)
+    # Compare against both every time (no early exit on the first match). Bytes,
+    # so a non-ASCII header is a 401 like any other wrong value, not a TypeError.
+    given = token.encode("utf-8", "surrogateescape")
+    is_anlege = bool(anlege) and hmac.compare_digest(given, anlege.encode("utf-8"))
+    is_lese = bool(lese) and hmac.compare_digest(given, lese.encode("utf-8"))
     if is_anlege:
         return frozenset({RECHT_ANLEGEN, RECHT_LESEN})
     if is_lese:

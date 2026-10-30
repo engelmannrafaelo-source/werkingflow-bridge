@@ -12,9 +12,10 @@ Stand: 30.10.2026. Auftrag: KD 91624155 (BA6/B1, Entscheid F5 vom 29.10.2026 13:
 |---|---|---|---|---|
 | Ein Projekt ist unter mehreren Plänen zugeteilt (`AmbiguousProjectBudget`) | 409 | `billing_plan_unresolved` | `ambiguous_project_budget` | false |
 | Zuteilung zeigt auf einen Plan, der den Aufruf nicht bezahlen kann; App mit mehreren Projektplänen ohne Zuteilung | 409 | `billing_plan_unresolved` | `billing_plan_unresolved` | false |
-| Plankatalog widersprüchlich (`AmbiguousPlanCatalog`) | 409 | `billing_plan_unresolved` | `ambiguous_plan_catalog` | false |
+| Plankatalog widersprüchlich (`AmbiguousPlanCatalog`, schon bei der Katalogprüfung) | 409 | `billing_plan_unresolved` | `ambiguous_plan_catalog` | false |
+| Zuteilung unter einem Plan, der nicht (mehr) im aktiven Katalog steht | 409 | `billing_plan_unresolved` | `billing_plan_unresolved` | false |
 
-Den Fehlertyp setzt der zentrale Fehlerhandler ausdrücklich. Ohne diese Setzung hieße ein 409 dort `bridge_throttle`, und Report wiederholt bei `bridge_throttle`. Die Abweisung erscheint im Log als `budget gate: REJECTED (409 …)`. nginx reicht 409 unverändert durch, abgefangen werden dort nur 429 und 5xx.
+Die Hülle mit `error.type` gilt für die Worker-Wege (Chat, Research, Doc-Agent, DOCX). Die Sandbox-Lease läuft in der platform-api mit dem Standard-Handler von FastAPI und antwortet dort mit `{"detail": {...}}`; Status 409 und `reason` sind gleich. Den Fehlertyp setzt der zentrale Fehlerhandler ausdrücklich. Ohne diese Setzung hieße ein 409 dort `bridge_throttle`, und Report wiederholt bei `bridge_throttle`. Die Abweisung erscheint im Log als `budget gate: REJECTED (409 …)`. nginx reicht 409 unverändert durch, abgefangen werden dort nur 429 und 5xx.
 
 **Unverändert:** Infrastrukturfehler (DB/platform-api nicht erreichbar) bleiben fail-open, wie in `gate.py` beschlossen. Ausnahme ist ein bekanntes hard_cap-Projekt (Cache oder Kopf `X-Budget-Hard-Cap`): Dafür gilt seit 26.10. die Antwort 503 `budget_unavailable` mit `X-Bridge-Dependency-Unavailable: budget-state`. **Neu** fällt darunter auch der nicht geladene Plankatalog (`PlanCatalogUnavailable`). Er entkam dem Gate bisher vor jeder Prüfung, und ein hard_cap-Projekt lief dann trotz Kopf durch (Dev-Worker-Log 29.10. und 30.10.2026).
 
