@@ -50,7 +50,7 @@ def manifest(data: dict | None = None) -> list[dict]:
             observed = datetime.fromisoformat(a["observed_at"].replace("Z", "+00:00"))
             if now - observed > timedelta(hours=1) or observed > now + timedelta(minutes=1):
                 continue
-            if not a.get("api_key") or a.get("disabled"):
+            if not a.get("api_key") or a.get("disabled") or a.get("billing_guard") != "free_only_verified":
                 continue
             for g in a["grants"]:
                 if g["id"] in seen_grants:
@@ -99,6 +99,14 @@ def usage_cost(model: str, usage: dict) -> Decimal:
              + Decimal(usage["output_tokens"]) * Decimal(str(p["out"]))
              + Decimal(usage["cache_read_input_tokens"]) * Decimal(str(p["in"])) * Decimal(str(p.get("cache_read_mult", .1)))
              + Decimal(usage["cache_creation_input_tokens"]) * Decimal(str(p["in"])) * 2) / 1_000_000
+    server = usage.get("server_tool_use", {})
+    if not isinstance(server, dict):
+        raise HTTPException(422, "Unknown server tool usage; reservation retained")
+    if any(k not in ("web_search_requests", "web_fetch_requests") for k in server):
+        raise HTTPException(422, "Unpriced server usage; reservation retained")
+    if any(type(v) is not int or v < 0 for v in server.values()):
+        raise HTTPException(422, "Invalid server tool usage; reservation retained")
+    value += Decimal(server.get("web_search_requests", 0)) * Decimal("0.01")
     return (value * Decimal("1.1")).quantize(Decimal("0.000000001"), rounding=ROUND_CEILING)
 
 
@@ -125,8 +133,8 @@ class Reserve(BaseModel):
     account_id: str
     grant_id: str
     model: str
-    input_tokens: int = Field(ge=0, le=2_000_000, strict=True)
-    max_tokens: int = Field(gt=0, le=1_000_000, strict=True)
+    input_tokens: int = Field(ge=0, le=32_000_000, strict=True)
+    max_tokens: int = Field(gt=0, le=8_000_000, strict=True)
 
 
 @router.post("/reserve", dependencies=[Depends(authenticate)])
@@ -207,7 +215,7 @@ async def summary():
             if now - observed > timedelta(hours=1) or observed > now + timedelta(minutes=1):
                 stale += 1
                 continue
-            if account.get("disabled") or not account.get("api_key"):
+            if account.get("disabled") or not account.get("api_key") or account.get("billing_guard") != "free_only_verified":
                 blocked += 1
                 continue
             observed_at.append(observed)

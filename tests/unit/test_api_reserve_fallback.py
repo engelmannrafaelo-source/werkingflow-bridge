@@ -62,3 +62,27 @@ async def test_admission_exception_returns_response_not_plain_dict():
     assert response.status_code == 200
     assert response.body == b'{"choices":[]}'
     reserve.assert_awaited_once()
+
+@pytest.mark.asyncio
+async def test_energy_skips_subscription_but_still_authenticates():
+    from starlette.requests import Request
+    body=ChatCompletionRequest(model='claude-sonnet-5-5',messages=[{'role':'user','content':'test'}],enable_tools=False)
+    req=Request({'type':'http','method':'POST','path':'/v1/chat/completions','headers':[(b'x-app-id',b'werking-energy')]})
+    admission=AsyncMock(side_effect=AssertionError('subscription reached'))
+    verify=AsyncMock(side_effect=HTTPException(401,'test authentication stop'))
+    with patch('src.providers.credit_pool.enabled',return_value=True),patch.object(main,'enforce_pool_admission',admission),patch.object(main,'verify_api_key',verify):
+        with pytest.raises(HTTPException) as e:
+            await main._chat_completions_lauf(body,req,None)
+    assert e.value.status_code==401
+    admission.assert_not_awaited();verify.assert_awaited_once()
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('extra',[{'provider_tier':'gemini-vision'},{'provider_tier':'openrouter'},{'session_id':'old-session'},{'enable_tools':True}])
+async def test_energy_refuses_paid_or_unsupported_paths(extra):
+    from starlette.requests import Request
+    body=ChatCompletionRequest(**{'model':'claude-sonnet-5-5','messages':[{'role':'user','content':'test'}],'enable_tools':False,**extra})
+    req=Request({'type':'http','method':'POST','path':'/v1/chat/completions','headers':[(b'x-app-id',b'werking-energy')]})
+    with patch('src.providers.credit_pool.enabled',return_value=True):
+        with pytest.raises(HTTPException) as e:
+            await main._chat_completions_lauf(body,req,None)
+    assert e.value.status_code==409

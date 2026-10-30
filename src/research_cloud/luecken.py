@@ -348,12 +348,15 @@ def messages_api_pruefer(
     *,
     url: str = "https://api.anthropic.com/v1/messages",
     timeout_seconds: float = 120.0,
+    promotional_only: bool = False,
 ) -> Pruefer:
     """Cloud path: a forced tool call, so the answer IS the schema."""
 
     async def pruefe(system: str, anfrage: str) -> PruefAntwort:
-        if not api_key:
+        if not api_key and not promotional_only:
             raise LueckenPruefFehler("kein API-Schlüssel für den Prüfaufruf (RESEARCH_CLOUD_API_KEY)")
+        if promotional_only:
+            system = system.replace("perplexity_search", "web_search").replace("Perplexity", "Websuche")
         body = {
             "model": PRUEF_MODELL,
             "max_tokens": 4000,
@@ -366,11 +369,17 @@ def messages_api_pruefer(
             "tool_choice": {"type": "tool", "name": PRUEF_WERKZEUG},
             "messages": [{"role": "user", "content": anfrage}],
         }
+        if promotional_only:
+            body["tools"] = json.loads(json.dumps(body["tools"]).replace("perplexity_search", "web_search"))
         headers = {"Content-Type": "application/json", "x-api-key": api_key, "anthropic-version": "2023-06-01"}
         eigener = client is None
         c = client or httpx.AsyncClient(timeout=timeout_seconds)
         try:
-            antwort = await c.post(url, headers=headers, json=body)
+            if promotional_only:
+                from src.providers.credit_pool import post_messages
+                antwort, _ = await post_messages(body, timeout_seconds)
+            else:
+                antwort = await c.post(url, headers=headers, json=body)
         except httpx.HTTPError as e:
             raise LueckenPruefFehler(f"Prüfaufruf nicht erreichbar: {type(e).__name__}: {e}") from e
         finally:
@@ -456,6 +465,9 @@ class Nachkontrolle:
                 self.pruef_kosten_usd += antwort.kosten_usd
             return lies_befund(antwort.daten)
         except Exception as e:  # named, logged, never read as "no gaps"
+            from fastapi import HTTPException
+            if isinstance(e, HTTPException):
+                raise  # Credit-pool refusal must stop the entire research run.
             meldung = f"{phase}: {type(e).__name__}: {e}"
             self.pruef_fehler.append(meldung[:500])
             logger.error(f"research Lücken-Nachkontrolle: Prüfung fehlgeschlagen ({meldung})")

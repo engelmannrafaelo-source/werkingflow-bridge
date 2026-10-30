@@ -68,6 +68,7 @@ class ResearchCloudConfig(BaseModel):
     """Fixed executor configuration — Rafael-Go 2026-07-25 decisions, not
     request-controllable (a caller cannot raise its own cost ceiling)."""
 
+    promotional_only: bool = False
     model: str = "claude-sonnet-5"
     # Raised from 20000 on 2026-09-05. Adaptive thinking bills its tokens against
     # this ceiling too, so a report backed by library full texts reaches it far

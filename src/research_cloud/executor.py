@@ -456,14 +456,15 @@ async def run_research_cloud(
     # eigene Schluessel, ist das jetzt ein lauter Konfigurationsfehler und kein
     # stilles Umbuchen auf die Kunden-Bildanalyse.
     api_key = api_key or os.environ.get("RESEARCH_CLOUD_API_KEY")
-    if not api_key:
+    if not api_key and not config.promotional_only:
         raise ResearchCloudExecutorError(
             "RESEARCH_CLOUD_API_KEY not set — refusing to run the "
             "research-cloud executor. Set RESEARCH_CLOUD_ANTHROPIC_KEY in "
             "docker/.env (the research lane pays from its OWN key; falling "
             "back to the image lane's key is no longer allowed)."
         )
-    _log_key_lane_once(api_key)
+    if not config.promotional_only:
+        _log_key_lane_once(api_key)
 
     headers = {
         "Content-Type": "application/json",
@@ -487,6 +488,11 @@ async def run_research_cloud(
             "research library is enabled but no index was loaded for this run"
         )
     perplexity_cfg = perplexity_config or load_perplexity_config()
+    if config.promotional_only:
+        from src.providers.funding_policy import require_pool
+        require_pool()
+        perplexity_cfg = PerplexityConfig(enabled=False)
+
     try:
         check_perplexity_usable(perplexity_cfg)
     except PerplexityUnavailableError as e:
@@ -497,11 +503,20 @@ async def run_research_cloud(
             "perplexity_search is enabled but no anonymizer was handed to the executor — "
             "refusing to offer a tool whose queries would leave unanonymized"
         )
-    if nachkontrolle is not None and not perplexity_enabled(perplexity_cfg):
+    if nachkontrolle is not None and not perplexity_enabled(perplexity_cfg) and not config.promotional_only:
         raise ResearchCloudExecutorError(
             "Lücken-Nachkontrolle ohne perplexity_search — die Rückrunde hätte nichts zum Suchen"
         )
     tools = _build_tools(config, library_cfg, perplexity_cfg)
+    if config.promotional_only:
+        # No code execution/container charges. Only bounded web tools.
+        for tool in tools:
+            if tool.get("name") == "web_search":
+                tool["type"] = "web_search_20250305"
+            elif tool.get("name") == "web_fetch":
+                tool["type"] = "web_fetch_20250910"
+                tool["max_content_tokens"] = 20000
+            tool.pop("allowed_callers", None)
     client_tools = _client_tool_names(tools)
     system: List[Dict[str, Any]] = [
         {"type": "text", "text": system_prompt, "cache_control": {"type": "ephemeral"}}
@@ -555,7 +570,17 @@ async def run_research_cloud(
                             # "container_id is required..." (eval-verified 2026-07-24).
                             body["container"] = container_id
 
-                        response = await http_client.post(ANTHROPIC_API_URL, headers=headers, json=body)
+                        if config.promotional_only:
+                            from fastapi import HTTPException
+                            from src.providers.credit_pool import post_messages
+                            try:
+                                response, _ = await post_messages(body, config.http_timeout_seconds)
+                            except HTTPException as exc:
+                                raise ResearchCloudExecutorError(
+                                    f"promotional_only stopped: {exc.detail}", status_code=exc.status_code
+                                ) from exc
+                        else:
+                            response = await http_client.post(ANTHROPIC_API_URL, headers=headers, json=body)
                         if response.status_code != 200:
                             raise ResearchCloudExecutorError(
                                 f"research-cloud Messages API call failed: HTTP {response.status_code}: "
@@ -761,7 +786,7 @@ async def run_research_cloud(
                     # run with its error — in the return round too; the report from
                     # before is not handed out as a success then.
                     sperre_pruefen(sperre, fehler_typ=ResearchCloudExecutorError)
-                    if phase != "rueckrunde":
+                    if config.promotional_only or phase != "rueckrunde":
                         raise
                     # The return round failed otherwise: the report written before
                     # it is still a finished report — hand that out and say why.
@@ -792,7 +817,7 @@ async def run_research_cloud(
                 offene = await nachkontrolle.entscheide(
                     _report_text(parsed),
                     protokoll_aus_cloud_nachrichten(base_messages + [{"role": "assistant", "content": parsed.content}]),
-                    perplexity_rest=config.perplexity_max_uses - perplexity_calls,
+                    perplexity_rest=config.web_search_max_uses if config.promotional_only else config.perplexity_max_uses - perplexity_calls,
                 )
                 if not offene:
                     break
@@ -803,9 +828,9 @@ async def run_research_cloud(
                     {"role": "assistant", "content": parsed.content},
                     {"role": "user", "content": baue_rueckrunden_auftrag(
                         offene,
-                        perplexity_werkzeug=PERPLEXITY_TOOL_NAME,
-                        dokument_werkzeug=FETCH_DOCUMENT_TOOL_NAME,
-                        perplexity_rest=config.perplexity_max_uses - perplexity_calls,
+                        perplexity_werkzeug="web_search" if config.promotional_only else PERPLEXITY_TOOL_NAME,
+                        dokument_werkzeug="web_fetch" if config.promotional_only else FETCH_DOCUMENT_TOOL_NAME,
+                        perplexity_rest=config.web_search_max_uses if config.promotional_only else config.perplexity_max_uses - perplexity_calls,
                         dokument_rest=max(config.fetch_document_max_uses - doc_counters.calls, 0),
                         ziel=(
                             "Gib danach den VOLLSTÄNDIGEN Bericht als Antwort aus — den ganzen Bericht mit den "

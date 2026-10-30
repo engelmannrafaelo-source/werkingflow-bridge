@@ -18,7 +18,7 @@ from src.providers import credit_pool_routes as ledger
 def configured(tmp_path, monkeypatch):
     now = datetime.now(timezone.utc)
     data = {"accounts": [{"id": "werking", "org_id": "org-one", "api_key": "secret-test-key",
-        "observed_at": now.isoformat(), "grants": [{"id": "grant-one", "granted_usd": 200,
+        "billing_guard": "free_only_verified", "observed_at": now.isoformat(), "grants": [{"id": "grant-one", "granted_usd": 200,
         "remaining_usd": 200, "expires_at": (now + timedelta(days=3)).isoformat()}]}]}
     path = tmp_path / "manifest.json"
     path.write_text(json.dumps(data))
@@ -219,3 +219,14 @@ def test_invalid_or_duplicate_credit_grants_fail_closed(configured):
     data['accounts'][0]['grants'][0]['remaining_usd'] = 'NaN'
     path.write_text(json.dumps(data))
     with pytest.raises(HTTPException): ledger.manifest()
+
+
+def test_unverified_or_mixed_wallet_is_never_eligible(configured):
+    path, data = configured
+    del data['accounts'][0]['billing_guard']
+    path.write_text(json.dumps(data))
+    assert ledger.manifest() == []
+    data['accounts'][0]['billing_guard'] = 'free_only_verified'
+    data['accounts'][0]['disabled'] = True
+    path.write_text(json.dumps(data))
+    assert ledger.manifest() == []
