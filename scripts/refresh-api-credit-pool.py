@@ -3,8 +3,8 @@
 
 Private input has {accounts:[{id,org_id,api_key,cookies:[domain,name,value]}]}.
 Requires curl_cffi in an isolated tools venv. Publishes atomically to the ONE
-coordinator, over SSH. A failed account retains its old observation timestamp
-and expires after one hour; a failed run never renews stale credit eligibility.
+coordinator, over SSH. An account whose billing state cannot be verified is disabled immediately.
+Only prepaid organizations with no other balance and no auto-reload are eligible.
 """
 import argparse
 import datetime as dt
@@ -15,6 +15,27 @@ import subprocess
 from decimal import Decimal
 
 from curl_cffi import requests
+
+
+def free_only_block_reason(org, credits):
+    """A key cannot select promotional versus purchased funds in one wallet."""
+    if org.get('billing_type') != 'prepaid':
+        return 'billing_not_verified_prepaid'
+    required = ('amount_without_scoped_credits', 'auto_reload_settings', 'currency', 'pending_invoice_amount_cents')
+    if any(k not in credits for k in required) or credits['currency'] != 'USD':
+        return 'billing_state_unknown'
+    if credits['auto_reload_settings'] is not None:
+        return 'auto_reload_not_confirmed_off'
+    try:
+        other = Decimal(str(credits['amount_without_scoped_credits']))
+        pending = Decimal(str(credits['pending_invoice_amount_cents'] or 0))
+        if not other.is_finite() or not pending.is_finite():
+            return 'billing_state_unknown'
+        if other != 0 or pending != 0:
+            return 'mixed_or_paid_credit_balance'
+    except (ValueError, ArithmeticError, TypeError):
+        return 'billing_state_unknown'
+    return None
 
 
 def refresh(source, previous):
@@ -29,10 +50,12 @@ def refresh(source, previous):
             orgs=session.get('https://platform.claude.com/api/organizations',timeout=25)
             if orgs.status_code!=200 or not any(o.get('uuid')==a['org_id'] for o in orgs.json()):
                 raise RuntimeError('Console identity could not be verified')
+            org=next(o for o in orgs.json() if o.get('uuid')==a['org_id'])
             observed=dt.datetime.now(dt.timezone.utc).isoformat()
             r=session.get('https://platform.claude.com/api/organizations/'+a['org_id']+'/prepaid/credits',timeout=25)
             if r.status_code!=200:raise RuntimeError('Console credits unavailable')
             d=r.json();grants=[]
+            blocked=free_only_block_reason(org,d)
             for g in d.get('promo_tranches',[]):
                 if g.get('program_id')!='subscription_api_credit' or g.get('currency')!='USD':continue
                 scope=g.get('scope',{})
@@ -42,11 +65,13 @@ def refresh(source, previous):
                     'granted_usd':str(Decimal(g['granted_amount_minor_units'])/100),
                     'remaining_usd':str(Decimal(g['remaining_amount_minor_units'])/100)})
             result.append({'id':a['id'],'org_id':a['org_id'],'api_key':a['api_key'],
-                           'observed_at':observed,'grants':grants})
-            print(a['id']+': refreshed '+str(len(grants))+' promotional grants',flush=True)
+                           'observed_at':observed,'grants':grants,
+                           'disabled':bool(blocked),'disabled_reason':blocked,
+                           'billing_guard':'free_only_verified' if not blocked else 'blocked'})
+            print(a['id']+': '+('blocked: '+blocked if blocked else 'free-only verified')+', '+str(len(grants))+' promotional grants',flush=True)
         except Exception as exc:
-            if a['id'] in old:result.append(old[a['id']])
-            print(a['id']+': refresh failed ('+type(exc).__name__+'); prior timestamp retained',flush=True)
+            if a['id'] in old:result.append({**old[a['id']], 'disabled':True, 'disabled_reason':'billing_verification_failed'})
+            print(a['id']+': refresh failed ('+type(exc).__name__+'); account disabled',flush=True)
     return {'accounts':result}
 
 

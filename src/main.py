@@ -2800,6 +2800,16 @@ async def _chat_completions_lauf(
 
     # Gemini-Bildweg (provider_tier="gemini-vision"): keine Pool-Zulassung
     # gegen das Claude-Abo; jeder andere Aufruf wird wie bisher zugelassen.
+    from src.providers.funding_policy import promotional_only, require_pool
+    _free_only = promotional_only(request)
+    if _free_only:
+        require_pool()
+        # Deliberately reject old Gemini callers until they adopt the new
+        # image contract. Never disguise a provider change as a Gemini result.
+        if (request_body.provider_tier not in (None, "claude-direct-notools")
+                or request_body.enable_tools or request_body.session_id):
+            raise HTTPException(409, "promotional_only: incompatible route/tools/session; no paid fallback")
+        request.state.api_reserve_retry = True
     _gemini_vision_lane = is_gemini_vision_request(request)
     from src.providers.credit_pool import enabled as credit_pool_enabled
     _credit_vision_lane = credit_pool_enabled() and has_vision_content(
@@ -6816,6 +6826,10 @@ async def _execute_research_cloud_impl(
     from src.research_cloud.prompt import build_system_prompt, search_budget_for_depth
 
     start_time = time.time()
+    from src.providers.funding_policy import promotional_only, require_pool
+    free_only = promotional_only(request)
+    if free_only:
+        require_pool()
 
     try:
         anonymized_query = await anonymize_query_for_cloud(request, request_body.query)
@@ -6870,13 +6884,20 @@ async def _execute_research_cloud_impl(
         )
     from src.research_cloud.perplexity import load_perplexity_config, perplexity_enabled
     perplexity_cfg = load_perplexity_config()
+    if free_only:
+        perplexity_cfg = perplexity_cfg.model_copy(update={"enabled": False, "api_key": None})
     system_prompt = build_system_prompt(
         request_body.depth,
         library_index=library_index,
         perplexity=perplexity_enabled(perplexity_cfg),
     )
     search_max_uses, fetch_max_uses = search_budget_for_depth(request_body.depth)
-    config = ResearchCloudConfig(web_search_max_uses=search_max_uses, web_fetch_max_uses=fetch_max_uses)
+    config = ResearchCloudConfig(
+        model=request_body.model if free_only else "claude-sonnet-5",
+        web_search_max_uses=min(search_max_uses, 3) if free_only else search_max_uses,
+        web_fetch_max_uses=min(fetch_max_uses, 3) if free_only else fetch_max_uses,
+        promotional_only=free_only,
+    )
 
     # Lücken-Nachkontrolle (Rafael 03.10.2026): same switch semantics as the
     # pool path; the checker is a forced tool call on the research lane's key.
@@ -6897,11 +6918,11 @@ async def _execute_research_cloud_impl(
         abgewaehlt_nk = Nachkontrolle(pruefer=None)
         abgewaehlt_nk.ueberspringen("pruefung", ABWAHL_GRUND)
     try:
-        if nachkontrolle_aktiv(perplexity_enabled(perplexity_cfg)) and abgewaehlt_nk is None:
+        if nachkontrolle_aktiv(free_only or perplexity_enabled(perplexity_cfg)) and abgewaehlt_nk is None:
             # Same key as the executor; without it the executor itself refuses
             # the run before the checker could ever be asked.
             nachkontrolle = Nachkontrolle(
-                pruefer=messages_api_pruefer(os.environ.get("RESEARCH_CLOUD_API_KEY"))
+                pruefer=messages_api_pruefer(os.environ.get("RESEARCH_CLOUD_API_KEY"), promotional_only=free_only)
             )
     except LueckenKonfigFehler as e:
         logger.error(f"research-cloud: Lücken-Nachkontrolle falsch konfiguriert, Lauf wird nicht gestartet: {e}")
@@ -7267,7 +7288,10 @@ async def _execute_research_cloud_with_pool_fallback(
         result = await _execute_research_cloud_impl(
             request, request_body, attribution_ctx=attribution_ctx
         )
-        if result.status != "error":
+        from src.providers.funding_policy import promotional_only
+        if promotional_only(request):
+            result.funding_policy = "promotional_only"
+        if result.status != "error" or promotional_only(request):
             return result
         logger.error(
             f"research-cloud run failed (attempt {attempt}/{_RESEARCH_CLOUD_MAX_ATTEMPTS}): "
@@ -7608,7 +7632,13 @@ async def research(
         )
 
     _use_research_cloud = False
-    if _research_pinned == "bedrock":
+    from src.providers.funding_policy import promotional_only, require_pool
+    if promotional_only(request):
+        require_pool()
+        if _research_operator_pinned not in (None, "anthropic"):
+            raise HTTPException(409, "promotional_only conflicts with operator pin; no paid fallback")
+        _use_research_cloud = True
+    elif _research_pinned == "bedrock":
         # RESEARCH EXCEPTION TO THE GLOBAL BEDROCK PIN (Rafael 2026-07-27):
         # research cannot run on Bedrock at all — WebSearch is not available
         # there (DESIGN.md options matrix, verified against AWS docs
@@ -8273,6 +8303,9 @@ async def doc_agent(
     _org_block = _org_disabled_precheck(worker_id)
     if _org_block is not None:
         return _org_block
+    from src.providers.funding_policy import promotional_only
+    if promotional_only(request):
+        raise HTTPException(409, "promotional_only: doc-agent unsupported; no paid fallback")
     from src.claude_cli import rate_limit_tracker as _da_rlt
     if _da_rlt.should_reject_new_request(worker_id):
         retry_after = _da_rlt.get_retry_after(worker_id)

@@ -3,7 +3,8 @@
 Rafaels Auftrag vom 28.10.2026: die vier verknüpften Max-API-Guthaben auf beiden
 Bridges nutzen, insbesondere für Vision. Die vorhandenen OAuth-Konten bleiben
 unabhängig davon. Der aktivierte Pool setzt den normalen Vision-Standard auf
-Anthropic; ein ausdrücklich angefragter Gemini- oder Bedrock-Weg bleibt erhalten.
+Anthropic. Für andere Apps bleiben ausdrücklich angefragte Anbieterwege erhalten.
+Energy unterliegt seit 30.10.2026 der unten beschriebenen Gratis-only-Regel.
 
 ## Aufbau
 
@@ -23,8 +24,9 @@ Echte Bildinhalte auf /v1/chat/completions werden im nginx-Router anhand des
 Bodies erkannt und brauchen keine freie Abo-Kapazität. Im Worker überspringt
 ein aktiver Guthaben-Pool für Bildanfragen Abo-Zulassung, Abo-Login und
 Abo-Kontosperren. API-Authentifizierung, Nutzer-Pins und Budgetregeln bleiben
-wirksam. Reine Textanfragen beginnen weiterhin im Abo-Pool; nur der unten
-beschriebene Reserve-Fallback nimmt sie aus der Abo-Zulassung heraus.
+wirksam. Energy-Textanfragen beginnen direkt in der Gratisreserve. Andere Textanfragen
+beginnen weiterhin im Abo-Pool; der Reserve-Fallback nimmt sie bei Bedarf aus
+der Abo-Zulassung heraus.
 
 Vor jeder Text-/Bildanfrage zählt Anthropic die Eingabetokens. Die platform-api
 reserviert unter einer PostgreSQL-Transaktionssperre pro Gutschrift die obere
@@ -53,8 +55,8 @@ enthält weder OpenRouter noch den undurchsichtigen Notfall-Peer oder einen
 bezahlten Legacy-Schlüssel. Auch bloße Pool-Sättigung aktiviert keinen bezahlten
 Research-Cloud-Overflow. Ausdrückliche Betreiber-Pins bleiben verbindlich.
 
-Die Reserve unterstützt aktuell Text und Bilder ohne Werkzeuge und ohne
-fortgesetzte Sitzung. Sie ist kein zusätzlicher Claude-Code-Platz. Ein interner
+Der Chat-Endpunkt unterstützt Text und Bilder ohne Werkzeuge und ohne
+fortgesetzte Sitzung. Energy-Recherche hat einen eigenen, werkzeugfähigen Weg. Sie ist kein zusätzlicher Claude-Code-Platz. Ein interner
 Reserve-Versuch durchläuft nochmals die normale Authentifizierung, Pin-Auflösung
 und Budgetprüfung. Eine fehlende Reserve oder ein Widerspruch führt zur Absage,
 nicht zur nächsten bezahlten Route. nginx kann bei leerem Abo-Pool eine passende
@@ -71,6 +73,50 @@ Die CUI liest beide Bridges über `/api/bridge/api-reserve` (nur Admin) und zeig
 einen gemeinsamen Balken. Gleiche Pool-Identitäten werden niemals addiert;
 unterschiedliche Identitäten oder ungültige Antworten ergeben keine verlässliche
 Gesamtsumme. Der Betrag wird nicht in die Auswahl freier CLI-Konten eingerechnet.
+
+## Energy: Gratis-only seit 30.10.2026
+
+`X-App-ID: werking-energy` ist serverseitig auf `promotional_only` festgelegt.
+Text geht sofort auf den direkten Messages-Weg, unabhängig von freier Abo-Kapazität.
+API-Schlüssel, Abrechnungsidentität, Projektbudget und Betreiber-Pins werden weiterhin
+geprüft. Ein widersprechender Anbieter, eine CLI-Sitzung oder Chat-Werkzeuge werden
+abgewiesen. Es gibt keinen Rückfall auf Abo, Legacy-Key, Gemini, OpenRouter oder
+Bedrock. Ein nicht konfigurierter Koordinator endet vor dem Modellaufruf mit 503;
+fehlende Guthabendeckung mit 429.
+
+Die Energy-App benennt für Bilder Claude Sonnet ausdrücklich in Anfrage und
+Cache-Fingerprint. Der alte Konfigurationswert `VISION_MODEL=gemini` wird mit
+Warnung migriert. Alte, noch nicht ausgelieferte Clients, die weiterhin explizit
+`gemini-vision` senden, werden von der Bridge abgewiesen; es wird kein falsches
+Gemini-Ergebnis vorgetäuscht.
+
+`/v1/research` verwendet den bestehenden Cloud-Runner, dessen Anonymisierung und
+Bibliotheksschutz bestehen bleiben. Jede Modellrunde und die Lücken-Nachprüfung
+laufen über `credit_pool.post_messages`. Perplexity ist für diesen Modus aus;
+Rückfragen verwenden Websuche und Webseitenabruf. Ein Budgetfehler in einer
+Nachprüfung oder Rückrunde beendet die Recherche, statt den vorherigen Bericht
+als erfolgreich abgenommen auszugeben. Die Antwort nennt `funding_policy`.
+
+Server-Werkzeuge sind auf `web_search_20250305` und `web_fetch_20250910` mit
+je höchstens drei Nutzungen pro Messages-Aufruf begrenzt; keine Code-Execution-
+Container oder unbekannten Zusatzgebühren. Der Koordinator reserviert für jede
+mögliche interne Werkzeugrunde konservativ zwei Millionen Eingabetokens plus
+das jeweilige Ausgabelimit. Die gemeldete Websuchgebühr wird zusätzlich zu den
+Tokens abgerechnet. Client-Werkzeuge werden in die Tokenzählung aufgenommen.
+Unklare Kosten behalten wie zuvor ihre Reservierung. Das ist bewusst konservativ:
+Eine große Recherche kann mangels reservierbarer Deckung stoppen, obwohl noch
+kleines Restguthaben angezeigt wird.
+
+Nur ein verifiziertes Prepaid-Konto mit ausgeschalteter automatischer Aufladung,
+null anderem Guthaben und keiner offenen Rechnung ist freigegeben. Der
+Koordinator verlangt selbst `billing_guard=free_only_verified`; eine fehlende
+Kennzeichnung reicht nicht aus. Der Console-Abgleich läuft alle zehn Minuten;
+eine gescheiterte Prüfung sperrt das Konto. Die Frische- und Ablaufgrenzen oben
+gelten zusätzlich. Ein API-Key kann beim Anbieter kein bestimmtes Guthabenfach
+wählen. Die Absicherung setzt daher voraus, dass niemand nach der Prüfung die
+Organisationsabrechnung ändert oder gekauftes Guthaben hinzufügt. Die Bridge
+aktiviert selbst weder Aufladung noch Rechnungskauf und verändert diese
+Anbietereinstellungen nicht.
 
 ## Aktualisierung und Betrieb
 

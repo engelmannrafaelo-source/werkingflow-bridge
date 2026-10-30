@@ -51,13 +51,23 @@ async def _finish(reservation: str, **data: Any) -> None:
 
 
 async def post_messages(body: dict, timeout: float) -> tuple[httpx.Response, dict]:
-    if body.get("tools") or body.get("stream") or body.get("speed") or body.get("inference_geo"):
+    if body.get("stream") or body.get("speed") or body.get("inference_geo") or body.get("container"):
         raise HTTPException(400, "Credit pool supports standard non-streaming text/vision requests")
+    server_steps = 0
+    for tool in body.get("tools", []):
+        if "type" not in tool:
+            continue  # Client schemas execute no provider-side tool.
+        if tool["type"] not in ("web_search_20250305", "web_fetch_20250910"):
+            raise HTTPException(400, "Unpriced server tool; promotional_only stopped")
+        uses = tool.get("max_uses")
+        if type(uses) is not int or not 1 <= uses <= 3:
+            raise HTTPException(400, "Server tools require max_uses between 1 and 3")
+        server_steps += uses
     accounts = (await coordinator("GET", "/accounts"))["accounts"]
     async with httpx.AsyncClient(timeout=timeout) as client:
         for account in accounts:
             headers = {"x-api-key": account["api_key"], "anthropic-version": VERSION}
-            counted = {k: body[k] for k in ("model", "messages", "system", "thinking") if k in body}
+            counted = {k: body[k] for k in ("model", "messages", "system", "thinking", "tools", "tool_choice") if k in body}
             try:
                 count = await client.post(API + "/count_tokens", headers=headers, json=counted)
             except httpx.HTTPError as exc:
@@ -73,7 +83,12 @@ async def post_messages(body: dict, timeout: float) -> tuple[httpx.Response, dic
             try:
                 await coordinator("POST", "/reserve", {
                     "id": reservation, "account_id": account["id"], "grant_id": account["grant_id"],
-                    "model": body["model"], "input_tokens": tokens, "max_tokens": body["max_tokens"],
+                    "model": body["model"],
+                    # Reserve whole context windows for internal tool turns,
+                    # plus output ceilings and search fees conservatively as
+                    # token budget. No extra fee column / idempotency gap.
+                    "input_tokens": max(tokens, 2_000_000 * (server_steps + 1)) if server_steps else tokens,
+                    "max_tokens": body["max_tokens"] * (server_steps + 1),
                 })
             except HTTPException as exc:
                 if exc.status_code in (409, 429):
@@ -83,7 +98,8 @@ async def post_messages(body: dict, timeout: float) -> tuple[httpx.Response, dic
             # generated a paid answer. Keep the reservation, fail visibly.
             response = await client.post(API, headers=headers, json=body)
             meta = {"credit_pool_account": account["id"], "credit_pool_org": account["org_id"],
-                    "credit_pool_grant": account["grant_id"], "credit_pool_reservation": reservation}
+                    "credit_pool_grant": account["grant_id"], "credit_pool_reservation": reservation,
+                    "funding_policy": "promotional_only", "automatic_paid_fallback": False}
             if response.status_code == 200:
                 try:
                     usage = response.json()["usage"]
