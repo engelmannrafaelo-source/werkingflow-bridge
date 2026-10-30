@@ -57,7 +57,7 @@ class AuthClaims:
       - Service token + X-User-ID → acting_user_id == that header value
       - Service token without X-User-ID → acting_user_id is None (operator)
     """
-    kind: str                       # "user" | "service"
+    kind: str                       # "user" | "service" | "auftragsbudget"
     user_id: Optional[str]          # set when kind == "user"
     email: Optional[str]
     tenant_id: Optional[str]
@@ -178,6 +178,123 @@ def require_service_token(
     # proxy for an end-user (e.g. budget top-up after Mollie webhook). No
     # X-User-ID handling here — the acting_user_id stays None (operator).
     return _verify_service_token(x_bridge_service_token)
+
+
+# ---------------------------------------------------------------------------
+# Gebundenes Auftragsbudget-Token (BA6, Entwurf S7 P10/H4/F6, 30.10.2026)
+# ---------------------------------------------------------------------------
+#
+# The operator service token is global (is_admin, every billing route incl.
+# TopUp and `raise`). Energy must never hold it: a worker that can raise its own
+# run ceiling makes the ceiling worthless. Two bound tokens instead, accepted
+# ONLY by the Auftragsbudget routes that ask for them:
+#   BRIDGE_AUFTRAGSBUDGET_TOKEN      rights {anlegen, lesen}  (Energy API process)
+#   BRIDGE_AUFTRAGSBUDGET_LESETOKEN  rights {lesen}           (Energy worker)
+# Neither can `raise` — that route keeps require_service_token, which reads only
+# X-Bridge-Service-Token, so a bound token there is a 401.
+
+AUFTRAGSBUDGET_TOKEN_HEADER = "X-Bridge-Auftragsbudget-Token"
+#: The binding: a bound token acts for this plan of this app and nothing else.
+AUFTRAGSBUDGET_PLAN_ID = "energy-project"
+AUFTRAGSBUDGET_APP_ID = "werking-energy"
+RECHT_ANLEGEN = "anlegen"
+RECHT_LESEN = "lesen"
+_AUFTRAGSBUDGET_RECHTE = (RECHT_ANLEGEN, RECHT_LESEN)
+
+
+def _auftragsbudget_rechte(token: str) -> frozenset:
+    """Rights of a bound token; 401 when it matches neither configured token."""
+    import hmac
+    anlege = config.auftragsbudget_token_raw
+    lese = config.auftragsbudget_lesetoken_raw
+    # Compare against both every time (no early exit on the first match). Bytes,
+    # so a non-ASCII header is a 401 like any other wrong value, not a TypeError.
+    given = token.encode("utf-8", "surrogateescape")
+    is_anlege = bool(anlege) and hmac.compare_digest(given, anlege.encode("utf-8"))
+    is_lese = bool(lese) and hmac.compare_digest(given, lese.encode("utf-8"))
+    if is_anlege:
+        return frozenset({RECHT_ANLEGEN, RECHT_LESEN})
+    if is_lese:
+        return frozenset({RECHT_LESEN})
+    raise HTTPException(status_code=401, detail="Invalid Auftragsbudget token")
+
+
+def require_auftragsbudget_token(recht: str):
+    """Dependency factory: operator service token OR a bound token with `recht`.
+
+    X-Bridge-Service-Token, when sent, decides alone (operator, unchanged
+    behaviour; an invalid one is a 401, no fallback to the other header).
+    Otherwise X-Bridge-Auftragsbudget-Token must carry `recht` (403 if the token
+    is valid but lacks it). The route checks the plan/app binding via
+    enforce_auftragsbudget_binding — the dependency cannot see the body.
+    """
+    if recht not in _AUFTRAGSBUDGET_RECHTE:
+        raise ValueError(f"unknown Auftragsbudget right {recht!r}")
+
+    def _dep(
+        x_bridge_service_token: Optional[str] = Header(default=None),
+        x_bridge_auftragsbudget_token: Optional[str] = Header(default=None),
+    ) -> AuthClaims:
+        if x_bridge_service_token:
+            return _verify_service_token(x_bridge_service_token)
+        if not x_bridge_auftragsbudget_token:
+            raise HTTPException(
+                status_code=401,
+                detail=(
+                    "Missing X-Bridge-Service-Token or "
+                    f"{AUFTRAGSBUDGET_TOKEN_HEADER} header"
+                ),
+            )
+        rechte = _auftragsbudget_rechte(x_bridge_auftragsbudget_token)
+        if recht not in rechte:
+            raise HTTPException(
+                status_code=403,
+                detail={
+                    "reason": "auftragsbudget_recht_fehlt",
+                    "message": f"Dieses Auftragsbudget-Token hat das Recht {recht!r} nicht.",
+                },
+            )
+        return AuthClaims(
+            kind="auftragsbudget",
+            user_id=None,
+            email=None,
+            tenant_id=None,
+            is_admin=False,
+            acting_user_id=None,
+            role="auftragsbudget:" + "+".join(sorted(rechte)),
+        )
+
+    return _dep
+
+
+def enforce_auftragsbudget_binding(
+    claims: AuthClaims, plan_id: str, x_app_id: Optional[str]
+) -> None:
+    """403 when a bound-token caller leaves its binding (plan, app). Operator: no-op."""
+    if claims.kind != "auftragsbudget":
+        return
+    if plan_id != AUFTRAGSBUDGET_PLAN_ID:
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "reason": "auftragsbudget_bindung",
+                "message": (
+                    f"Das Auftragsbudget-Token gilt nur für plan_id "
+                    f"{AUFTRAGSBUDGET_PLAN_ID!r}, nicht für {plan_id!r}."
+                ),
+            },
+        )
+    if x_app_id is not None and x_app_id.strip() != AUFTRAGSBUDGET_APP_ID:
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "reason": "auftragsbudget_bindung",
+                "message": (
+                    f"Das Auftragsbudget-Token gilt nur für die App "
+                    f"{AUFTRAGSBUDGET_APP_ID!r}, nicht für {x_app_id!r}."
+                ),
+            },
+        )
 
 
 def require_jwt_or_service(
