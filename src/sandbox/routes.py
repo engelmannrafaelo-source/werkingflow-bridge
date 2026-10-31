@@ -35,6 +35,7 @@ from src.api_auth import (
 )
 from src.db.client import get_pool
 from src.budget.gate import enforce_budget
+from src.budget.plans import find_monthly_plan_for_app, find_project_plans_for_app
 from src.identity.user_resolver import resolve_user_id, UnresolvableUserIdentity
 from src.sandbox import account_router as _ar
 from src.sandbox import lease_service as _ls
@@ -77,6 +78,20 @@ async def _deduct_sandbox_budget(
             )
     except Exception as e:  # noqa: BLE001
         logger.warning("sandbox post-record budget deduction failed (non-blocking): %s", e)
+
+def lease_braucht_projektbindung(app: str) -> bool:
+    """App verkauft NUR Projektpläne (Energy): ein Lease ohne projectId hat keinen Topf.
+
+    Das Gate ließe es (Schätzung 0, kein project_id) still durch, und die Sitzung
+    liefe ungebunden auf dem Abo-Konto — weder Auftragsdeckel noch Projekt-Paket
+    greifen. Apps mit Monatsplan (Report, Engelmann, …) buchen aufs Monatsbudget
+    und brauchen keine Bindung; Apps ohne Plan sind nicht budgetverfolgt.
+    """
+    return (
+        find_monthly_plan_for_app(app) is None
+        and bool(find_project_plans_for_app(app))
+    )
+
 
 router = APIRouter(prefix="/v1/sandbox", tags=["sandbox"])
 
@@ -180,6 +195,28 @@ async def lease_token(
                 detail={"error": "lease_not_applicable", "billing_mode": billing_mode},
             )
 
+        # 2a. Projektplan-App ohne Projektbindung: kein stiller Durchlass. 400,
+        # nicht 402 — der Aufrufer (Daemon) hat die Bindung nicht mitgesendet,
+        # Geld ist nicht die Frage (Doktrin wie malformed_billing_identity).
+        if body.projectId is None and lease_braucht_projektbindung(body.app):
+            logger.warning(
+                "sandbox lease REFUSED: app=%s user=%s has only project plans "
+                "but no projectId",
+                body.app, uid,
+            )
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "error": "project_binding_required",
+                    "app": body.app,
+                    "message": (
+                        f"{body.app} verkauft einen Projektplan: das Sandbox-Lease "
+                        "braucht die Projekt-/Auftragsbindung (projectId), sonst "
+                        "greifen weder Projektbudget noch Auftragsdeckel."
+                    ),
+                },
+            )
+
         # 2. Pre-gate: block if user's budget is exhausted.
         # estimated_cost=0: we only need to detect "budget gone" states
         # (all_exhausted / monthly_exceeded_no_topup / trial_expired); the
@@ -187,7 +224,16 @@ async def lease_token(
         # Fail-open on DB/infra errors (enforce_budget swallows them), except for a
         # known hard-cap project (503 budget_unavailable). No single paying plan
         # = 409 billing_plan_unresolved (was a 500 before BA6).
-        await enforce_budget(str(uid), body.app, 0.0, project_id=body.projectId)
+        # Mit projectId: call_kind "sandbox-lease" gibt einem Auftragsdeckel eine
+        # Schätzung > 0 (sonst ließe hard_cap 0,0001 EUR durch), require_allocation
+        # verlangt einen angelegten Topf (402 project_budget_unallocated) — eine
+        # Sandbox-Sitzung alloziert nie selbst.
+        await enforce_budget(
+            str(uid), body.app, 0.0,
+            project_id=body.projectId,
+            call_kind="sandbox-lease" if body.projectId else None,
+            require_allocation=bool(body.projectId),
+        )
 
         # 4. Pick best account — S7 fair round-robin: pass recent lease counts
         # so the router prefers under-used accounts over the highest-headroom

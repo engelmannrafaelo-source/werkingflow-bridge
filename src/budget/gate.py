@@ -86,7 +86,14 @@ HARD_CAP_HEADER = "X-Budget-Hard-Cap"
 #: "remaining > 0" let a whole wave through (A2 measurement 26.10.2026). Roughly the
 #: observed p90 of Energy calls of that kind; adjust with measurement 3. Applies ONLY to
 #: hard-cap budgets and ONLY when the caller's estimate is 0 (a larger one wins).
-HARD_CAP_DEFAULT_ESTIMATE_EUR = {"research": 2.00, "doc-agent": 1.00, "convert": 0.50}
+#: "sandbox-lease": der OAuth-Lease des Sandbox-Editors (/v1/sandbox/lease-token)
+#: kommt mit Schätzung 0 — ein Auftragsdeckel von 0,0001 EUR (Schutz einer
+#: Projektkopie) ließe ihn sonst durch, obwohl jeder Zug der Sitzung mehr kostet.
+#: Eine Sitzung ist mindestens ein Agentenzug mit Werkzeugen, also wie "doc-agent"
+#: bemessen (31.10.2026).
+HARD_CAP_DEFAULT_ESTIMATE_EUR = {
+    "research": 2.00, "doc-agent": 1.00, "convert": 0.50, "sandbox-lease": 1.00,
+}
 
 #: Value of X-Bridge-Dependency-Unavailable on the fail-closed 503.
 BUDGET_STATE_DEPENDENCY = "budget-state"
@@ -203,6 +210,7 @@ async def enforce_budget(
     project_id: Optional[str] = None,
     hard_cap_hint: bool = False,
     call_kind: Optional[str] = None,
+    require_allocation: bool = False,
 ) -> None:
     """
     Raise HTTPException(402) if the user's budget for this app is exhausted.
@@ -214,6 +222,13 @@ async def enforce_budget(
     call is allowed — the entitling slot was already consumed by the app and the
     post-call deduction lazily allocates the budget. Project plans never gate on
     the monthly tenant budget.
+
+    `require_allocation=True` (sandbox lease): the caller cannot lazily
+    allocate — a sandbox session is metered by usage/record only, never
+    deducted from a project pot — so a project WITHOUT an allocated budget
+    (never paid, never ran, or a copy without an Auftragsbudget) is refused
+    with 402 `project_budget_unallocated` instead of being let through as
+    "first call".
     """
     # No user / no app → not a user-budgeted call (internal job). Let through.
     if not user_id or not app_id:
@@ -420,6 +435,29 @@ async def enforce_budget(
                     "projectId": project_id,
                     "totalRemainingEur": total_remaining,
                     "message": "Projekt- und TopUp-Guthaben aufgebraucht. Bitte ein neues Projekt-Paket buchen oder Guthaben aufladen.",
+                },
+            )
+        if require_allocation:
+            logger.info(
+                "budget gate: BLOCKED (unallocated) user=%s app=%s plan=%s "
+                "project=%s kind=%s — caller requires an allocated project budget",
+                user_id, app_id, plan.id, project_id, call_kind,
+            )
+            raise HTTPException(
+                status_code=402,
+                detail={
+                    "error": "project_budget_unallocated",
+                    "reason": "project_budget_unallocated",
+                    "retryable": False,
+                    "appId": app_id,
+                    "planId": plan.id,
+                    "projectId": project_id,
+                    "totalRemainingEur": 0.0,
+                    "message": (
+                        "Für dieses Projekt ist kein Projektbudget angelegt (kein "
+                        "Projekt-Paket gebucht oder noch kein Lauf). Der Assistent "
+                        "startet erst mit gebuchtem Projekt-Paket bzw. Auftragsbudget."
+                    ),
                 },
             )
         # Not allocated yet (the project's first call). The entitling slot was

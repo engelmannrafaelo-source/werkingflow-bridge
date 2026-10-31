@@ -403,8 +403,17 @@ class TestPreGateOnLease:
         mock_pool = MagicMock()
         mock_pool.acquire.return_value = mock_conn
 
+        # Seit 31.10.2026 fragt die Lease-Route den Plankatalog (Projektbindungs-
+        # pflicht nur für Apps ohne Monatsplan); ein leerer Katalog ist ein
+        # Infrastrukturfehler (500) — hier gilt Engelmann als Monatsplan-App.
+        from src.budget.plans import PlanConfig
+        katalog = {"engelmann_basis": PlanConfig(
+            id="engelmann_basis", app_id="engelmann", name="Engelmann", price=0.0,
+            interval="month", api_budget_eur=10.0, description="",
+        )}
         with patch("src.sandbox.routes.enforce_budget", side_effect=_gate_raises), \
-             patch("src.sandbox.routes.get_pool", return_value=mock_pool):
+             patch("src.sandbox.routes.get_pool", return_value=mock_pool), \
+             patch("src.budget.plans.PLANS", katalog):
             client = TestClient(app_instance, raise_server_exceptions=False)
             resp = client.post(
                 "/v1/sandbox/lease-token",
