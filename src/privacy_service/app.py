@@ -525,9 +525,6 @@ async def _read_uploaded_file(request: Request) -> Tuple[bytes, str, Optional[st
         "context_hint": form.get("context_hint"),
         "describe_images": form.get("describe_images"),
         "describe_prompt": form.get("describe_prompt"),
-        # Betreiber-Finanzierungsregel, von der Bridge serverseitig gesetzt
-        # (X-App-ID werking-energy → "promotional_only"); nie vom Endkunden.
-        "funding_policy": form.get("funding_policy"),
     }
     return content, filename, mime_hint, extras
 
@@ -581,23 +578,6 @@ async def document_convert_endpoint(request: Request):
         raise HTTPException(status_code=500, detail=str(e))
 
     body = result.to_response()
-    promotional_only = (extras.get("funding_policy") or "").strip().lower() == "promotional_only"
-
-    # promotional_only (Rafael R3, 31.10.2026): Bildbeschreibungen nur aus dem
-    # Promotional-Pool, nie über den bezahlten ANTHROPIC_VISION_API_KEY. Die
-    # Prüfung steht NACH Docling (PDFs ohne Bilder laufen unverändert durch) und
-    # VOR dem ersten Vision-Aufruf (keine bezahlte Arbeit vor der Absage).
-    if promotional_only and want_descriptions and result.images:
-        from src.providers import credit_pool
-        if not credit_pool.enabled():
-            logger.error(
-                "document/convert abgelehnt (409): promotional_only, "
-                f"{len(result.images)} Bilder, Credit-Pool aus"
-            )
-            raise HTTPException(
-                status_code=409,
-                detail="promotional_only: document vision not pool-funded; no paid fallback",
-            )
 
     # Opt-in: run extracted images through Vision and append the descriptions to
     # the Markdown, so the converted document is self-contained without the raw
@@ -610,26 +590,13 @@ async def document_convert_endpoint(request: Request):
     # threshold nothing changes (to_describe == result.images, triage_meta None).
     if want_descriptions and result.images:
         triage_prompt = extras.get("triage_prompt") or ""
-        funding_log: Optional[List[dict]] = [] if promotional_only else None
-        if promotional_only:
-            to_describe, skipped_labels, triage_meta = await plan_image_descriptions(
-                result.images, triage_prompt=triage_prompt,
-                promotional_only=True, funding_log=funding_log,
-            )
-        else:
-            to_describe, skipped_labels, triage_meta = await plan_image_descriptions(
-                result.images, triage_prompt=triage_prompt
-            )
+        to_describe, skipped_labels, triage_meta = await plan_image_descriptions(
+            result.images, triage_prompt=triage_prompt
+        )
         try:
-            if promotional_only:
-                descriptions = await describe_images(
-                    to_describe, context=filename, describe_prompt=describe_prompt,
-                    promotional_only=True, funding_log=funding_log,
-                )
-            else:
-                descriptions = await describe_images(
-                    to_describe, context=filename, describe_prompt=describe_prompt
-                )
+            descriptions = await describe_images(
+                to_describe, context=filename, describe_prompt=describe_prompt
+            )
         except ValueError as e:
             # Konfigurationsfehler aus dem Vision-Provider (der Pre-Flight oben
             # faengt den leeren Key; hier landet, was der Provider sonst noch
@@ -645,18 +612,6 @@ async def document_convert_endpoint(request: Request):
         if triage_meta:
             body["described_count"] = len(to_describe)
             body["triage"] = triage_meta
-        if promotional_only:
-            # Attestierung nur, wenn JEDER Vision-Aufruf nachweislich aus dem
-            # Pool bezahlt wurde (credit_meta des Koordinators). Sonst laut.
-            unfunded = [e for e in funding_log if not (e.get("credit_meta") or {}).get("credit_pool_reservation")]
-            if unfunded:
-                logger.error(f"document/convert: {len(unfunded)} Vision-Aufrufe ohne Pool-Nachweis")
-                raise HTTPException(
-                    status_code=409,
-                    detail="promotional_only: document vision not pool-funded; no paid fallback",
-                )
-            body["vision_funding"] = "credit_pool"
-            body["vision_usage"] = funding_log
 
     duration = _time.time() - t_start
     logger.info(
