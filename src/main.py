@@ -11798,7 +11798,8 @@ async def get_account_pool_state():
     # (pool_router.lua, sandbox/account_router.py), keyed on usage_known.
     ceilings = [inflight_headroom_pct]
     if usage_known:
-        ceilings.append(max(0.0, 100.0 - session_pct))
+        if session_pct is not None:
+            ceilings.append(max(0.0, 100.0 - session_pct))
         ceilings.append(max(0.0, 100.0 - weekly_pct))
     headroom_pct = round(min(ceilings), 1)
     headroom = int(safety_cap * headroom_pct / 100.0) if safety_cap > 0 else 0
@@ -11880,8 +11881,13 @@ async def get_account_pool_state():
         # Unmeasured usage does NOT make a worker unavailable — see the
         # headroom comment above. It makes it *last choice*, which the rankers
         # enforce via usage_known.
+        "reserve_blocked": not usage_known or weekly_pct is None or weekly_pct >= 90.0,
+        "automation_weekly_limit": 90.0,
+        "reserve_reason": ("Nutzerreserve: Wochenverbrauch nicht frisch gemessen" if not usage_known
+                           else "10 % Nutzerreserve — Automatik gesperrt" if weekly_pct is not None and weekly_pct >= 90.0 else None),
         "available": (
-            not cap_lock.is_locked(worker_id)
+            usage_known and weekly_pct is not None and weekly_pct < 90.0
+            and not cap_lock.is_locked(worker_id)
             and (session_pct is None or session_pct < 95.0)
             and headroom > 0
             and not tracker_is_limited

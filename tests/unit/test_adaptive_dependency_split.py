@@ -37,6 +37,7 @@ def _request(body: dict = None, *, raises: bool = False):
 async def test_cache_dependency_estimates_but_never_admits():
     req = _request({"messages": [{"role": "user", "content": "hello"}]})
     limiter = MagicMock()
+    limiter._account_usage = {"known": True, "weekly_pct": 20}
     with patch("src.middleware.adaptive_limiter.get_adaptive_limiter", return_value=limiter):
         await cache_request_body_dependency(req)
 
@@ -65,6 +66,7 @@ async def test_cache_dependency_invokes_the_input_limit_gate(monkeypatch):
     monkeypatch.setenv("BRIDGE_MAX_INPUT_TOKENS", "10")
     req = _request({"messages": [{"role": "user", "content": "x" * 1000}]})
     limiter = MagicMock()
+    limiter._account_usage = {"known": True, "weekly_pct": 20}
     with patch("src.middleware.adaptive_limiter.get_adaptive_limiter", return_value=limiter):
         with pytest.raises(BridgeError):
             await cache_request_body_dependency(req)
@@ -76,6 +78,7 @@ async def test_admission_without_an_estimate_passes_through_loudly(caplog):
     not silent: an unmeasured request skipping admission is worth seeing."""
     req = _request()
     limiter = MagicMock()
+    limiter._account_usage = {"known": True, "weekly_pct": 20}
     with patch("src.middleware.adaptive_limiter.get_adaptive_limiter", return_value=limiter):
         await enforce_pool_admission(req)   # must not raise
 
@@ -88,6 +91,7 @@ async def test_admission_admits_when_the_limiter_accepts():
     req = _request()
     req.state.adaptive_est_tokens = 1234
     limiter = MagicMock()
+    limiter._account_usage = {"known": True, "weekly_pct": 20}
     limiter.acquire_with_wait = AsyncMock(return_value=(True, None, {}, 0.0))
     with patch("src.middleware.adaptive_limiter.get_adaptive_limiter", return_value=limiter):
         await enforce_pool_admission(req)   # must not raise
@@ -102,9 +106,23 @@ async def test_admission_raises_bridge_error_when_the_limiter_rejects():
     req = _request()
     req.state.adaptive_est_tokens = 999
     limiter = MagicMock()
+    limiter._account_usage = {"known": True, "weekly_pct": 20}
     limiter.acquire_with_wait = AsyncMock(
         return_value=(False, "cap full", {"cap_tokens": 10, "inflight_tokens": 10}, 0.0)
     )
     with patch("src.middleware.adaptive_limiter.get_adaptive_limiter", return_value=limiter):
         with pytest.raises(BridgeError):
             await enforce_pool_admission(req)
+
+
+@pytest.mark.asyncio
+async def test_missing_body_estimate_does_not_bypass_weekly_reserve():
+    from src.middleware.bridge_error import BridgeError
+    req = _request()
+    limiter = MagicMock()
+    limiter._account_usage = {"known": True, "weekly_pct": 90}
+    with patch("src.middleware.adaptive_limiter.get_adaptive_limiter", return_value=limiter):
+        with pytest.raises(BridgeError) as exc:
+            await enforce_pool_admission(req)
+    assert exc.value.response.status_code == 503
+    limiter.acquire_with_wait.assert_not_called()
