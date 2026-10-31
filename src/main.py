@@ -10170,6 +10170,9 @@ async def _proxy_document_endpoint(
     ``funding_policy=promotional_only`` is set server-side (caller value
     overridden); a /document/convert answer with images + requested
     descriptions must attest ``vision_funding: "credit_pool"``, else 409.
+    Bau C: for that case the privacy service gets ``describe_images=false`` and
+    the worker describes the returned ``images`` itself through the credit pool
+    (src/docconvert_worker_vision.py); its errors keep their status 1:1.
     """
     _start = time.time()
     privacy_client = get_privacy_client()
@@ -10196,10 +10199,16 @@ async def _proxy_document_endpoint(
                 continue
             if isinstance(value, str):
                 extra_data[key] = value
+        _wanted = str(extra_data.get("describe_images", "")).strip().lower() in ("1", "true", "yes", "on")
+        # Bau C: Energy-Bilder beschreibt der Worker selbst über den Pool; der
+        # Privacy-Dienst (ohne Pool-Netz) konvertiert nur.
+        _worker_vision = _promo and _wanted and downstream_path == "/document/convert"
         if _promo:
             # Betreiberregel (Rafael R3): Energy-Bildbeschreibungen nur aus dem
             # Promotional-Pool. Serverseitig gesetzt; ein Aufruferwert gilt nicht.
             extra_data["funding_policy"] = "promotional_only"
+        if _worker_vision:
+            extra_data["describe_images"] = "false"
 
         content = await _maybe_repair_pdf_actualtext(
             content, filename, content_type, extra_data.get("mime_type_hint", ""),
@@ -10223,9 +10232,16 @@ async def _proxy_document_endpoint(
             # Interne Nutzungsliste (Pool-Konto/Reservierung je Bild) nicht an
             # den Aufrufer; nur für die ehrliche Aktivitätsbuchung.
             request.state.document_vision_usage = payload.pop("vision_usage", None)
+            if (_worker_vision and payload.get("images")
+                    and payload.get("vision_funding") != "credit_pool"):
+                from src.docconvert_worker_vision import describe_in_worker
+                _status_code, payload, request.state.document_vision_usage = await describe_in_worker(
+                    payload, extra_data, filename,
+                    deadline=time.monotonic() - (time.time() - _start) + timeout,
+                    request=request,
+                )
             _image_count = payload.get("image_count") or len(payload.get("images") or {})
-            _wanted = str(extra_data.get("describe_images", "")).strip().lower() in ("1", "true", "yes", "on")
-            if (downstream_path == "/document/convert" and _image_count and _wanted
+            if (_status_code < 400 and downstream_path == "/document/convert" and _image_count and _wanted
                     and payload.get("vision_funding") != "credit_pool"):
                 # Auch eine unbekannte Fallback-Instanz ohne Pool-Code landet hier.
                 logger.error(
