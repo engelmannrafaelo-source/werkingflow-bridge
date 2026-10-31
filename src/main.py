@@ -10165,10 +10165,17 @@ async def _proxy_document_endpoint(
     pipeline (see _record_document_call_metrics) for every caller of this
     shared helper — centralized here so /v1/document/convert and
     /v1/document/convert-and-anonymize don't each need their own tracking.
+
+    promotional_only (X-App-ID werking-energy): the form field
+    ``funding_policy=promotional_only`` is set server-side (caller value
+    overridden); a /document/convert answer with images + requested
+    descriptions must attest ``vision_funding: "credit_pool"``, else 409.
     """
     _start = time.time()
     privacy_client = get_privacy_client()
     _concurrent_before = None
+    from src.providers.funding_policy import promotional_only as _promotional_only
+    _promo = _promotional_only(request)
     try:
         form = await request.form()
         file = form.get("file")
@@ -10189,6 +10196,10 @@ async def _proxy_document_endpoint(
                 continue
             if isinstance(value, str):
                 extra_data[key] = value
+        if _promo:
+            # Betreiberregel (Rafael R3): Energy-Bildbeschreibungen nur aus dem
+            # Promotional-Pool. Serverseitig gesetzt; ein Aufruferwert gilt nicht.
+            extra_data["funding_policy"] = "promotional_only"
 
         content = await _maybe_repair_pdf_actualtext(
             content, filename, content_type, extra_data.get("mime_type_hint", ""),
@@ -10207,6 +10218,26 @@ async def _proxy_document_endpoint(
             payload = response.json()
         except Exception:
             payload = {"status": "error", "error": response.text[:500]}
+        _status_code = response.status_code
+        if _promo and _status_code < 400 and isinstance(payload, dict):
+            # Interne Nutzungsliste (Pool-Konto/Reservierung je Bild) nicht an
+            # den Aufrufer; nur für die ehrliche Aktivitätsbuchung.
+            request.state.document_vision_usage = payload.pop("vision_usage", None)
+            _image_count = payload.get("image_count") or len(payload.get("images") or {})
+            _wanted = str(extra_data.get("describe_images", "")).strip().lower() in ("1", "true", "yes", "on")
+            if (downstream_path == "/document/convert" and _image_count and _wanted
+                    and payload.get("vision_funding") != "credit_pool"):
+                # Auch eine unbekannte Fallback-Instanz ohne Pool-Code landet hier.
+                logger.error(
+                    f"Document proxy ({downstream_path}): promotional_only, "
+                    f"{_image_count} Bilder ohne Pool-Attestierung → 409"
+                )
+                request.state.document_vision_usage = None
+                _status_code = 409
+                payload = {
+                    "status": "error",
+                    "error": "promotional_only: document vision not pool-funded; no paid fallback",
+                }
         # DSGVO Rechenschaftspflicht: if the proxied response carries a value-free
         # attestation (only convert-and-anonymize does), persist it to audit_log;
         # if an anonymize call failed, record that too. NB: never log the filename
@@ -10250,12 +10281,12 @@ async def _proxy_document_endpoint(
             logger.warning(f"pii attestation audit write failed (non-blocking): {_ae}")
         _record_document_call_metrics(
             request, agent_id=agent_id, model=model,
-            status="success" if response.status_code < 400 else "error",
+            status="success" if _status_code < 400 else "error",
             duration_ms=int((time.time() - _start) * 1000),
             concurrent_calls_at_start=_concurrent_before,
-            error_code=str(response.status_code) if response.status_code >= 400 else None,
+            error_code=str(_status_code) if _status_code >= 400 else None,
         )
-        return JSONResponse(status_code=response.status_code, content=payload)
+        return JSONResponse(status_code=_status_code, content=payload)
 
     except Exception as e:
         logger.error(f"Document proxy ({downstream_path}) failed: {e}", exc_info=True)
@@ -10305,21 +10336,58 @@ async def convert_document_endpoint(
                     _err_msg = str(_raw)[:500]
             except Exception:
                 _err_msg = None  # silent-ok: kaputter Body aendert nichts daran, dass Code+Status persistiert werden
-        await persist_ai_call_activity(
-            provider=PROVIDER_LOCAL,
-            app_id=_attr.get("app_id"),
-            user_id=_attr.get("user_id"),
-            agent_id="dokument-konvertierung",
-            workflow_id=_attr.get("workflow_id"),
-            model="docling",
-            input_tokens=0,
-            output_tokens=0,
-            status=_status,
-            duration_ms=int((time.time() - _start) * 1000),
-            error_code=str(result.status_code) if _status == "error" else None,
-            error_message=_err_msg,
-            app_env=_attr.get("app_env"),
-        )
+        _vision_usage = getattr(request.state, "document_vision_usage", None)
+        # Nur eine echte Liste vom Privacy-Dienst zählt (sonst docling/0 wie bisher).
+        if _status == "success" and isinstance(_vision_usage, list) and _vision_usage:
+            # Ehrliche Buchung der Bildaufrufe (promotional_only): je Modell die
+            # Summen + Pool-Reservierungen statt "docling"/0 Tokens.
+            _je_modell: Dict[str, Dict[str, Any]] = {}
+            for _e in _vision_usage:
+                _m = _je_modell.setdefault(str(_e.get("model") or "unknown"), {
+                    "input_tokens": 0, "output_tokens": 0, "calls": 0, "reservations": []})
+                _m["input_tokens"] += int(_e.get("input_tokens") or 0)
+                _m["output_tokens"] += int(_e.get("output_tokens") or 0)
+                _m["calls"] += 1
+                _res = (_e.get("credit_meta") or {}).get("credit_pool_reservation")
+                if _res:
+                    _m["reservations"].append(_res)
+            for _model, _sum in _je_modell.items():
+                await persist_ai_call_activity(
+                    provider=PROVIDER_ANTHROPIC,
+                    app_id=_attr.get("app_id"),
+                    user_id=_attr.get("user_id"),
+                    agent_id="dokument-konvertierung",
+                    workflow_id=_attr.get("workflow_id"),
+                    model=_model,
+                    input_tokens=_sum["input_tokens"],
+                    output_tokens=_sum["output_tokens"],
+                    status=_status,
+                    duration_ms=int((time.time() - _start) * 1000),
+                    app_env=_attr.get("app_env"),
+                    provider_meta={
+                        "usage_source": "document_convert_vision",
+                        "funding_policy": "promotional_only",
+                        "automatic_paid_fallback": False,
+                        "vision_calls": _sum["calls"],
+                        "credit_pool_reservations": _sum["reservations"],
+                    },
+                )
+        else:
+            await persist_ai_call_activity(
+                provider=PROVIDER_LOCAL,
+                app_id=_attr.get("app_id"),
+                user_id=_attr.get("user_id"),
+                agent_id="dokument-konvertierung",
+                workflow_id=_attr.get("workflow_id"),
+                model="docling",
+                input_tokens=0,
+                output_tokens=0,
+                status=_status,
+                duration_ms=int((time.time() - _start) * 1000),
+                error_code=str(result.status_code) if _status == "error" else None,
+                error_message=_err_msg,
+                app_env=_attr.get("app_env"),
+            )
     except Exception as _te:
         logger.warning(f"dokument-konvertierung activity tracking failed (non-blocking): {_te}")
     return result

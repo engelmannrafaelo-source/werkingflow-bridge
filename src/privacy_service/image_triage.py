@@ -36,6 +36,8 @@ import os
 import re
 from typing import Dict, List, Optional, Tuple
 
+from fastapi import HTTPException
+
 from src.vision_provider import get_vision_provider
 from src.model_registry import get_default_model
 from src.privacy_service.document_converter import _downscale_b64_png
@@ -143,7 +145,8 @@ def _parse_verdict(text: str) -> Dict[str, dict]:
 
 
 async def _triage_one_batch(
-    provider, batch: List[Tuple[str, str]], model: str, system_prompt: str
+    provider, batch: List[Tuple[str, str]], model: str, system_prompt: str,
+    promotional_only: bool = False, funding_log: Optional[List[dict]] = None,
 ) -> Dict[str, dict]:
     """Triage one batch of ``(name, b64)`` figures → ``{name: {relevant, label}}``.
 
@@ -168,6 +171,9 @@ async def _triage_one_batch(
             temperature=0.0,
             system_prompt=system_prompt,
         )
+        if funding_log is not None:
+            from src.privacy_service.image_describer import record_vision_funding
+            record_vision_funding(funding_log, "triage", resp)
         parsed = _parse_verdict(resp.content or "")
     except ValueError as e:
         # Misconfiguration from the provider (no vision key) propagates; a JSON
@@ -177,6 +183,9 @@ async def _triage_one_batch(
         logger.warning(f"[image_triage] unparseable batch reply, keeping all relevant: {e}")
         parsed = {}
     except Exception as e:  # noqa: BLE001 — never let a batch error drop images
+        if promotional_only and isinstance(e, HTTPException):
+            # promotional_only: Pool-Fehler (429/503) beendet den Aufruf laut.
+            raise
         logger.warning(f"[image_triage] batch failed, keeping all relevant: {e}")
         parsed = {}
 
@@ -197,6 +206,8 @@ async def select_relevant_images(
     batch_size: Optional[int] = None,
     model: Optional[str] = None,
     max_concurrency: int = 4,
+    promotional_only: bool = False,
+    funding_log: Optional[List[dict]] = None,
 ) -> Dict[str, dict]:
     """Return ``{name: {"relevant": bool, "label": str}}`` for every figure.
 
@@ -217,9 +228,23 @@ async def select_relevant_images(
 
     async def run_batch(batch: List[Tuple[str, str]]) -> Dict[str, dict]:
         async with sem:
-            return await _triage_one_batch(provider, batch, model, system_prompt)
+            if not promotional_only:
+                return await _triage_one_batch(provider, batch, model, system_prompt)
+            return await _triage_one_batch(
+                provider, batch, model, system_prompt, True, funding_log
+            )
 
-    verdicts = await asyncio.gather(*(run_batch(b) for b in batches))
+    if not promotional_only:
+        verdicts = await asyncio.gather(*(run_batch(b) for b in batches))
+    else:
+        tasks = [asyncio.ensure_future(run_batch(b)) for b in batches]
+        try:
+            verdicts = await asyncio.gather(*tasks)
+        except BaseException:
+            for t in tasks:
+                t.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            raise
     merged: Dict[str, dict] = {}
     for v in verdicts:
         merged.update(v)
@@ -230,6 +255,8 @@ async def plan_image_descriptions(
     images: Dict[str, str],
     *,
     triage_prompt: str = "",
+    promotional_only: bool = False,
+    funding_log: Optional[List[dict]] = None,
 ) -> Tuple[Dict[str, str], Dict[str, str], Optional[dict]]:
     """Decide which images to fully describe.
 
@@ -240,15 +267,25 @@ async def plan_image_descriptions(
     - ``triage_meta``: summary dict, or ``None`` when no triage happened (in which
       case ``to_describe == images`` and the response stays byte-identical).
 
-    Fail-safe: any triage failure falls back to describing ALL images.
+    Fail-safe: any triage failure falls back to describing ALL images —
+    except under ``promotional_only``, where a pool ``HTTPException`` (429/503)
+    ends the whole call loudly with its status (no silent "keep all").
     """
     figures, rendered = split_figures_and_pages(images)
     if not should_triage(figures):
         return dict(images), {}, None
 
     try:
-        verdict = await select_relevant_images(figures, triage_prompt=triage_prompt)
+        if promotional_only:
+            verdict = await select_relevant_images(
+                figures, triage_prompt=triage_prompt,
+                promotional_only=True, funding_log=funding_log,
+            )
+        else:
+            verdict = await select_relevant_images(figures, triage_prompt=triage_prompt)
     except Exception as e:  # noqa: BLE001 — triage must never break conversion
+        if promotional_only and isinstance(e, HTTPException):
+            raise
         logger.warning(
             f"[image_triage] triage failed ({e}); describing all {len(figures)} figures.",
             exc_info=True,
