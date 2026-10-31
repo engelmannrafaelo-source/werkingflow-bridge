@@ -381,6 +381,36 @@ async def enforce_budget(
             eff_estimate = estimated_cost_eur
             if pr.get("hardCap") and eff_estimate <= 0:
                 eff_estimate = HARD_CAP_DEFAULT_ESTIMATE_EUR.get(call_kind or "", 0.0)
+            # Sandbox-Lease (Schätzung 0) auf einem LEEREN Topf ohne Deckel: evaluate()
+            # lässt `0 <= 0` durch, weil ein abrechenbarer Aufruf den Rest nachträglich
+            # bucht. Eine Sandbox-Sitzung bucht nie — Credits sollen greifen (H1, R1):
+            # Projekt- und TopUp-Rest zusammen <= 0 → 402, kein Lease.
+            if call_kind == "sandbox-lease" and not pr.get("hardCap"):
+                rest = pr.get("remainingEur", 0.0) + pr.get("topUpRemainingEur", 0.0)
+                if rest <= 0:
+                    logger.info(
+                        "budget gate: BLOCKED (sandbox-lease, pot empty) user=%s "
+                        "app=%s plan=%s project=%s projectRemaining=%.4f "
+                        "topUpRemaining=%.4f",
+                        user_id, app_id, plan.id, project_id,
+                        pr.get("remainingEur", 0.0), pr.get("topUpRemainingEur", 0.0),
+                    )
+                    raise HTTPException(
+                        status_code=402,
+                        detail={
+                            "error": "budget_exhausted",
+                            "reason": "project_budget_exhausted",
+                            "retryable": False,
+                            "appId": app_id,
+                            "planId": plan.id,
+                            "projectId": project_id,
+                            "totalRemainingEur": rest,
+                            "message": (
+                                "Das Projektbudget ist aufgebraucht. Der Assistent "
+                                "startet erst mit neuem Projekt-Paket oder Guthaben."
+                            ),
+                        },
+                    )
             if pr.get("allowed") and not (
                 pr.get("hardCap") and pr.get("remainingEur", 0.0) < eff_estimate
             ):

@@ -34,8 +34,13 @@ from src.api_auth import (
     AuthClaims,
 )
 from src.db.client import get_pool
-from src.budget.gate import enforce_budget
-from src.budget.plans import find_monthly_plan_for_app, find_project_plans_for_app
+from src.budget.gate import _plan_unresolved, enforce_budget
+from src.budget.plans import (
+    AmbiguousPlanCatalog,
+    PlanCatalogUnavailable,
+    find_monthly_plan_for_app,
+    find_project_plans_for_app,
+)
 from src.identity.user_resolver import resolve_user_id, UnresolvableUserIdentity
 from src.sandbox import account_router as _ar
 from src.sandbox import lease_service as _ls
@@ -79,18 +84,31 @@ async def _deduct_sandbox_budget(
     except Exception as e:  # noqa: BLE001
         logger.warning("sandbox post-record budget deduction failed (non-blocking): %s", e)
 
-def lease_braucht_projektbindung(app: str) -> bool:
+def lease_braucht_projektbindung(app: str, user_id: object = None) -> bool:
     """App verkauft NUR Projektpläne (Energy): ein Lease ohne projectId hat keinen Topf.
 
     Das Gate ließe es (Schätzung 0, kein project_id) still durch, und die Sitzung
     liefe ungebunden auf dem Abo-Konto — weder Auftragsdeckel noch Projekt-Paket
     greifen. Apps mit Monatsplan (Report, Engelmann, …) buchen aufs Monatsbudget
     und brauchen keine Bindung; Apps ohne Plan sind nicht budgetverfolgt.
+
+    Katalogfehler werden wie im Gate abgebildet (H4, R1): ein widersprüchlicher
+    Katalog → 409 billing_plan_unresolved; ein nicht geladener Katalog → fail-open
+    (laut geloggt, keine Bindungspflicht), nie ein nackter 500.
     """
-    return (
-        find_monthly_plan_for_app(app) is None
-        and bool(find_project_plans_for_app(app))
-    )
+    try:
+        return (
+            find_monthly_plan_for_app(app) is None
+            and bool(find_project_plans_for_app(app))
+        )
+    except AmbiguousPlanCatalog as e:
+        raise _plan_unresolved(app, user_id, None, e) from e
+    except PlanCatalogUnavailable as e:
+        logger.error(
+            "sandbox lease: plan catalog unavailable (%s) — no binding required",
+            e,
+        )
+        return False
 
 
 router = APIRouter(prefix="/v1/sandbox", tags=["sandbox"])
@@ -198,7 +216,7 @@ async def lease_token(
         # 2a. Projektplan-App ohne Projektbindung: kein stiller Durchlass. 400,
         # nicht 402 — der Aufrufer (Daemon) hat die Bindung nicht mitgesendet,
         # Geld ist nicht die Frage (Doktrin wie malformed_billing_identity).
-        if body.projectId is None and lease_braucht_projektbindung(body.app):
+        if body.projectId is None and lease_braucht_projektbindung(body.app, uid):
             logger.warning(
                 "sandbox lease REFUSED: app=%s user=%s has only project plans "
                 "but no projectId",
