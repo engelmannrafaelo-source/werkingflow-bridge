@@ -108,6 +108,7 @@ async def call_anthropic_direct(
             }
         ],
         "usage": result.usage,
+        "x_api_reserve": result.extra_meta,
         "x_bridge_max_tokens": request.max_tokens or DEFAULT_MAX_TOKENS,
         "x_bridge_max_tokens_defaulted": max_tokens_defaulted,
     }

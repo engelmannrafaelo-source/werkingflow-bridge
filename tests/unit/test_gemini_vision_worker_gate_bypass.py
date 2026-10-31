@@ -164,6 +164,8 @@ async def _run_chat(body: dict, *, locked: bool):
          patch.object(src.main, "get_tenant_from_request", side_effect=_PassedPrecheck):
         try:
             resp = await handler(ChatCompletionRequest(**body), req, None, None)
+        except src.main.BridgeError as exc:
+            resp = exc.response
         except _PassedPrecheck:
             return "passed", org_check, admission
     return resp, org_check, admission
@@ -353,3 +355,20 @@ async def test_locked_worker_gemini_tier_app_tier_rule_is_409(gemini_armed):
     policy = AppTierPolicy(target_tier="claude-direct-notools", billing_account=None)
     resp, _ = await _run_chat_to_end(GEMINI_IMAGE_BODY, tier_policy=policy)
     _assert_overridden_409(resp)
+
+@pytest.mark.asyncio
+async def test_credit_image_passes_locked_subscription_worker(monkeypatch):
+    monkeypatch.setenv('ANTHROPIC_CREDIT_POOL_URL', 'http://pool')
+    body = dict(CLAUDE_BODY, messages=[{'role':'user','content':[
+        {'type':'image_url','image_url':{'url':_PNG}}]}])
+    result, org, admission = await _run_chat(body, locked=True)
+    assert result == 'passed'
+    org.assert_not_called()
+    admission.assert_not_awaited()
+
+@pytest.mark.asyncio
+async def test_credit_pool_does_not_exempt_text_from_subscription_limits(monkeypatch):
+    monkeypatch.setenv('ANTHROPIC_CREDIT_POOL_URL', 'http://pool')
+    result, org, admission = await _run_chat(CLAUDE_BODY, locked=True)
+    assert result.status_code == 429
+    admission.assert_awaited_once()

@@ -97,11 +97,11 @@ async def test_overflow_requested_but_pool_not_saturated_stays_on_pool(monkeypat
 
 
 @pytest.mark.asyncio
-async def test_overflow_requested_and_pool_saturated_routes_to_cloud(monkeypatch):
+async def test_overflow_requested_and_pool_saturated_stays_on_subscription(monkeypatch):
     monkeypatch.setenv("RESEARCH_CLOUD_ENABLED", "true")
     p1, p2, p3 = _patches(pinned=None, saturated=True, over_cap=False)
     with p1, p2, p3:
-        assert await resolve_research_cloud_routing("user-1", cloud_overflow=True) is True
+        assert await resolve_research_cloud_routing("user-1", cloud_overflow=True) is False
 
 
 @pytest.mark.asyncio
@@ -127,12 +127,11 @@ async def test_daily_cap_defers_explicit_pin_instead_of_falling_back(monkeypatch
 
 
 @pytest.mark.asyncio
-async def test_daily_cap_defers_overflow_eligibility_instead_of_falling_back(monkeypatch):
+async def test_no_automatic_paid_cloud_even_if_overflow_requested(monkeypatch):
     monkeypatch.setenv("RESEARCH_CLOUD_ENABLED", "true")
     p1, p2, p3 = _patches(pinned=None, saturated=True, over_cap=True)
     with p1, p2, p3:
-        with pytest.raises(ResearchCloudCapExceededError):
-            await resolve_research_cloud_routing("user-1", cloud_overflow=True)
+        assert await resolve_research_cloud_routing("user-1", cloud_overflow=True) is False
 
 
 # ---------------------------------------------------------------------------

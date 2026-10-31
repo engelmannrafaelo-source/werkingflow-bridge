@@ -88,14 +88,12 @@ class TestFullFallbackChain:
 
             from src.providers.fallback import execute_with_fallback as ewf
 
-            result = await ewf(
-                primary_tier="claude-premium",
-                execute_fn=execute_fn,
-                resolve_config_fn=resolve_config_fn,
-            )
+            with pytest.raises(AllTokensExhausted):
+                await ewf(primary_tier="claude-premium", execute_fn=execute_fn,
+                          resolve_config_fn=resolve_config_fn)
 
-        assert result == prod_bridge_response
-        assert call_count["n"] == 3  # claude-premium + openrouter + prod-bridge
+        assert call_count["n"] == 1  # Never consume the configured paid fallbacks.
+
 
 
 # =============================================================================
@@ -152,13 +150,10 @@ class TestMissingProdFallbackUrl:
             from src.providers.fallback import execute_with_fallback
 
             resolve_config_fn = MagicMock(return_value=MagicMock())
-            result = await execute_with_fallback(
-                primary_tier="claude-premium",
-                execute_fn=execute_fn,
-                resolve_config_fn=resolve_config_fn,
-            )
+            with pytest.raises(ProviderError):
+                await execute_with_fallback(primary_tier="claude-premium", execute_fn=execute_fn,
+                                            resolve_config_fn=resolve_config_fn)
 
-        assert result == openrouter_response
 
 
 # =============================================================================
@@ -187,6 +182,7 @@ class TestClaudeDirectNotoolsTier:
         becomes eligible, and sits before openrouter-claude (same model,
         closest fallback) in the chain."""
         with patch.dict(os.environ, {
+            "ANTHROPIC_CREDIT_POOL_URL": "http://test-pool",
             "ANTHROPIC_VISION_API_KEY": "test-vision-key",
             "OPENROUTER_API_KEY": "test-openrouter-key",
         }):
@@ -196,7 +192,7 @@ class TestClaudeDirectNotoolsTier:
             from src.providers.fallback import get_fallback_tiers
             chain = get_fallback_tiers("claude-premium", tools_required=False)
             assert "claude-direct-notools" in chain
-            assert chain.index("claude-direct-notools") < chain.index("openrouter-claude")
+            assert chain == ["claude-premium", "claude-direct-notools"]
 
     def test_tier_not_usable_without_vision_key(self):
         """is_tier_usable returns False when ANTHROPIC_VISION_API_KEY is not set —
@@ -245,7 +241,7 @@ class TestClaudeDirectNotoolsTier:
             )
             assert config.backend == BackendType.ANTHROPIC_DIRECT
             assert config.provider_api_key == "test-vision-key"
-            assert config.provider_model == "claude-sonnet-5"
+            assert config.provider_model == "claude-sonnet-5-5"
 
 
 # =============================================================================

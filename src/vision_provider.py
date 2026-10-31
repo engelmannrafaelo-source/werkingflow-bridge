@@ -20,6 +20,7 @@ from fastapi import HTTPException
 from config.logging_config import get_logger
 from src.model_request import adapt_model_request
 from src.model_registry import get_default_model, model_supports_temperature
+from src.providers import credit_pool
 
 logger = get_logger(__name__)
 
@@ -62,6 +63,7 @@ class VisionResponse:
     stop_reason: str
     # Nur der Anthropic-Messages-Weg setzt sie (_vision_response_from).
     messung: Optional[UsageMessung] = None
+    credit_meta: Optional[Dict[str, Any]] = None
 
 
 class VisionProvider:
@@ -86,7 +88,7 @@ class VisionProvider:
         # ONLY use ANTHROPIC_VISION_API_KEY (set directly in docker-compose.yml)
         # NO fallback to ANTHROPIC_API_KEY — that key must never exist in environment!
         self.api_key = os.getenv("ANTHROPIC_VISION_API_KEY")
-        if not self.api_key:
+        if not self.api_key and not credit_pool.enabled():
             logger.warning("ANTHROPIC_VISION_API_KEY not set - vision requests will fail")
             logger.warning("Set ANTHROPIC_VISION_API_KEY in docker-compose.yml for image analysis")
 
@@ -349,7 +351,7 @@ class VisionProvider:
         Returns:
             VisionResponse with analysis result
         """
-        if not self.api_key:
+        if not self.api_key and not credit_pool.enabled():
             raise ValueError(
                 "ANTHROPIC_VISION_API_KEY environment variable not set. "
                 "Vision/Image requests require direct API access (not OAuth)."
@@ -409,17 +411,17 @@ class VisionProvider:
 
         adapt_model_request(model, request_body)
 
-        # Make API request
-        async with httpx.AsyncClient(timeout=timeout) as client:
-            response = await client.post(
-                self.ANTHROPIC_API_URL,
-                headers={
-                    "Content-Type": "application/json",
-                    "x-api-key": self.api_key,
-                    "anthropic-version": self.ANTHROPIC_VERSION
-                },
-                json=request_body
-            )
+        credit_meta = None
+        if credit_pool.enabled():
+            response, credit_meta = await credit_pool.post_messages(request_body, timeout)
+        else:
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                response = await client.post(
+                    self.ANTHROPIC_API_URL,
+                    headers={"Content-Type": "application/json", "x-api-key": self.api_key,
+                             "anthropic-version": self.ANTHROPIC_VERSION},
+                    json=request_body,
+                )
 
         if response.status_code != 200:
             error_body = response.text
@@ -447,7 +449,9 @@ class VisionProvider:
             UpstreamResponseUnreadable,
         )
         try:
-            return _vision_response_from(response.json(), model)
+            result = _vision_response_from(response.json(), model)
+            result.credit_meta = credit_meta
+            return result
         except UNREADABLE_RESPONSE_ERRORS as exc:
             raise UpstreamResponseUnreadable("anthropic", exc) from exc
 
@@ -576,4 +580,4 @@ def vision_available() -> bool:
     gpu-privacy-1 jede describe_images-Anfrage erst NACH der Docling-Arbeit an
     einem unhandled ValueError sterben (Kunde: werking-energy, 3x 500).
     """
-    return bool(os.getenv("ANTHROPIC_VISION_API_KEY"))
+    return credit_pool.enabled() or bool(os.getenv("ANTHROPIC_VISION_API_KEY"))

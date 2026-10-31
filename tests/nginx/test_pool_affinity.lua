@@ -168,7 +168,7 @@ print("pool_router: affinity variables, header and log")
 local STATE
 local logs
 package.loaded["cjson.safe"] = {
-    decode = function() return STATE end,
+    decode = function(raw) if raw == "body" then return STATE.body end; return STATE end,
     encode = function() return "{}" end,
 }
 package.loaded["resty.http"] = {}
@@ -187,7 +187,9 @@ local function run_router(headers, state, stale)
             set = function(_, k, v) store[k] = v end,
             incr = function(_, k, n, init) store[k] = (store[k] or init or 0) + n; return store[k] end,
         } },
+        req = { read_body = function() end, get_body_data = function() return "body" end },
         var = {
+            uri = headers.uri,
             request_length = "100",
             http_x_cache_affinity_key = headers.key,
             affinity_upstream = "claude_workers",
@@ -246,6 +248,24 @@ do
     local v = run_router({ key = string.rep("k", 300) }, { accounts = pool() })
     check(v.x_cache_affinity == "fallback:key_too_long" and v.affinity_upstream == "claude_workers",
           "overlong key: fallback, old pool")
+end
+
+do
+    local empty = pool()
+    for _, account in pairs(empty) do account.available = false end
+    local st = { accounts = empty, api_reserve = { state = "available", active_on_this_bridge = true,
+        automatic_paid_fallback = false, available = true }, body = {messages = {}, enable_tools = false} }
+    local v = run_router({uri = "/v1/chat/completions"}, st)
+    check(v.x_pool_decision == "api_reserve_candidate", "empty subscriptions must reach reserve admission")
+    st.body.session_id = "existing-session"
+    v = run_router({uri = "/v1/chat/completions"}, st)
+    check(v.target_worker == "unavailable", "continued sessions must not use reserve")
+    st.body.session_id = nil; st.body.enable_tools = true
+    v = run_router({uri = "/v1/chat/completions"}, st)
+    check(v.target_worker == "unavailable", "tool calls must not use reserve")
+    st.body.enable_tools = false; st.api_reserve.state = "unavailable"
+    v = run_router({uri = "/v1/chat/completions"}, st)
+    check(v.target_worker == "unavailable", "unknown reserve must not claim capacity")
 end
 
 print(string.format("pool_affinity: %d checks, %d failures", checks, failures))

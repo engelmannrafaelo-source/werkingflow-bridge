@@ -153,7 +153,10 @@ async def resolve_research_cloud_routing(
         return False
 
     pinned = "cloud" if implicit_pin else await get_user_research_pin(raw_user_id)
-    wants_overflow = bool(cloud_overflow)
+    # A saturated subscription is not permission to spend purchased credits.
+    # Explicit operator research pins remain explicit choices; automatic
+    # overflow now waits on the subscription pool instead.
+    wants_overflow = False
 
     if pinned != "cloud" and not (wants_overflow and is_worker_pool_saturated()):
         return False

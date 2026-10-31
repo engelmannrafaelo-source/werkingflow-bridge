@@ -228,6 +228,7 @@ def _resolve_provider_tier(
         )
 
     elif config.backend == BackendType.ANTHROPIC_DIRECT:
+        from src.providers.credit_pool import enabled as credit_pool_enabled
         # Tier maps to the direct Anthropic Messages API, no CLI subprocess
         # (e.g. 'claude-direct-notools' — see src/providers/anthropic_direct.py).
         # Reuses the OPENAI_COMPATIBLE BackendConfig fields (provider_api_key/
@@ -235,7 +236,7 @@ def _resolve_provider_tier(
         # backend == ANTHROPIC_DIRECT and calls call_anthropic_direct(), not
         # call_openai_compatible().
         api_key = get_provider_api_key(config)
-        if not api_key:
+        if not api_key and not credit_pool_enabled():
             raise RuntimeError(
                 f"Provider '{tier_id}' not configured: {config.api_key_env} env var missing"
             )

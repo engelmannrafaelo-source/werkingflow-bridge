@@ -36,6 +36,7 @@ COPY src/middleware/rolling_metrics.py              /app/src/middleware/rolling_
 # Copy the reader app itself.
 COPY src/metrics_reader/__init__.py                 /app/src/metrics_reader/__init__.py
 COPY src/metrics_reader/main.py                     /app/src/metrics_reader/main.py
+COPY src/metrics_reader/api_reserve.py              /app/src/metrics_reader/api_reserve.py
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \

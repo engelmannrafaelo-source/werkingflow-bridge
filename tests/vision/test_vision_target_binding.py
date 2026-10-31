@@ -25,7 +25,7 @@ def _chat_completions_node() -> ast.AsyncFunctionDef:
     src = pathlib.Path(__file__).resolve().parents[2] / "src" / "main.py"
     tree = ast.parse(src.read_text())
     for node in tree.body:
-        if isinstance(node, ast.AsyncFunctionDef) and node.name == "chat_completions":
+        if isinstance(node, ast.AsyncFunctionDef) and node.name == "_chat_completions_lauf":
             return node
     raise AssertionError("chat_completions nicht in src/main.py gefunden")
 

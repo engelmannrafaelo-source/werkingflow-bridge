@@ -2,8 +2,7 @@
 
 Defines fallback chains per primary provider tier:
 - claude-premium   → claude-direct-notools (same model, no CLI subprocess,
-  skipped when the request needs tools) → openrouter-claude (same model,
-  different infra) → bridge-prod-emergency (last resort)
+  only with configured promotional reserve; skipped for tools) → stop
 - claude-dsgvo     → (no fallback — DSGVO data must stay in EU)
 - openrouter-claude → (no fallback — OpenRouter has its own internal failover)
 
@@ -33,11 +32,8 @@ logger = logging.getLogger(__name__)
 # =============================================================================
 
 FALLBACK_CHAINS: dict[str, list[str]] = {
-    # Claude Code SDK (CLI subprocess) down/hung → direct Anthropic (same
-    # model, no tools — get_fallback_tiers() drops this hop for
-    # tools_required=True) → OpenRouter → Production Bridge (last resort:
-    # token exhaustion)
-    "claude-premium": ["claude-direct-notools", "openrouter-claude", "bridge-prod-emergency"],
+    # Automatic fallback is restricted to the centrally reserved promotional pool.
+    "claude-premium": ["claude-direct-notools"],
 
     # DSGVO: No fallback — data residency must stay in EU (Bedrock Frankfurt)
     # "claude-dsgvo": [],
@@ -171,9 +167,14 @@ def get_fallback_tiers(primary_tier: str, tools_required: bool = True) -> list[s
     going to use tools anyway.
     """
     from src.providers.registry import is_tier_usable, PROVIDERS
+    from src.providers.credit_pool import enabled as credit_pool_enabled
 
     chain = [primary_tier]
-    chain.extend(FALLBACK_CHAINS.get(primary_tier, []))
+    # Rafael 29.10.2026: subscription -> promotional API reserve -> stop.
+    # Never use a legacy paid key, OpenRouter, or a peer's opaque paid chain
+    # as an automatic fallback. Explicit primary provider choices stay explicit.
+    if primary_tier == "claude-premium" and credit_pool_enabled():
+        chain.append("claude-direct-notools")
 
     usable = []
     for tier_id in chain:

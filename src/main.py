@@ -2772,6 +2772,31 @@ async def chat_completions(
         return JSONResponse(status_code=499, content={"error": {"message": "caller gone"}})
 
 
+async def _run_api_reserve_fallback(request_body, request, *, cause):
+    """Re-enter the normal authenticated, pinned and budgeted direct path.
+
+    Never call a provider straight from an admission exception: admission can
+    fail before authentication or the operator's data-residency pin is known.
+    This internal state flag is not accepted from a client header/body.
+    """
+    from src.providers.credit_pool import enabled
+    if (not enabled() or request_body.enable_tools or request_body.session_id
+            or getattr(request.state, "api_reserve_retry", False)):
+        raise HTTPException(429, "API reserve cannot serve this request; no paid fallback")
+    retry = request_body.model_copy(deep=True)
+    retry.provider_tier = "claude-direct-notools"
+    request.state.api_reserve_retry = True
+    try:
+        result = await _chat_completions_lauf(retry, request, None)
+        if isinstance(result, dict):
+            result["x_fallback"] = {"used": True, "original_provider": "claude-premium",
+                "fallback_provider": "api-credit-reserve", "trigger": cause,
+                "automatic_paid_fallback": False}
+        return result
+    finally:
+        request.state.api_reserve_retry = False
+
+
 async def _chat_completions_lauf(
     request_body: ChatCompletionRequest,
     request: Request,
@@ -2786,8 +2811,24 @@ async def _chat_completions_lauf(
 
     # Gemini-Bildweg (provider_tier="gemini-vision"): keine Pool-Zulassung
     # gegen das Claude-Abo; jeder andere Aufruf wird wie bisher zugelassen.
+    from src.providers.funding_policy import promotional_only, require_pool
+    _free_only = promotional_only(request)
+    if _free_only:
+        require_pool()
+        # Deliberately reject old Gemini callers until they adopt the new
+        # image contract. Never disguise a provider change as a Gemini result.
+        if (request_body.provider_tier not in (None, "claude-direct-notools")
+                or request_body.enable_tools or request_body.session_id):
+            raise HTTPException(409, "promotional_only: incompatible route/tools/session; no paid fallback")
+        request.state.api_reserve_retry = True
     _gemini_vision_lane = is_gemini_vision_request(request)
-    if not _gemini_vision_lane:
+    from src.providers.credit_pool import enabled as credit_pool_enabled
+    _credit_vision_lane = credit_pool_enabled() and has_vision_content(
+        prepare_messages_for_vision(request_body.messages)
+    )
+    _reserve_retry = bool(getattr(request.state, "api_reserve_retry", False))
+    _external_vision_lane = _gemini_vision_lane or _credit_vision_lane or _reserve_retry
+    if not _external_vision_lane:
         await enforce_pool_admission(request)
 
     # Force tools-policy: tools are research-only (X-Claude-Allowed-Tools header).
@@ -2807,7 +2848,7 @@ async def _chat_completions_lauf(
     # Validate Claude Code authentication
     auth_valid, auth_info = validate_claude_code_auth()
 
-    if not auth_valid:
+    if not auth_valid and not (_credit_vision_lane or _reserve_retry):
         # Log authentication failure event
         EventLogger.log_authentication(
             success=False,
@@ -2975,12 +3016,12 @@ async def _chat_completions_lauf(
                 f"(Org/Ratelimit) dieses Workers gelten nicht"
             )
         _org_block = (
-            None if _gemini_vision_lane else _org_disabled_precheck(worker_id)
+            None if _external_vision_lane else _org_disabled_precheck(worker_id)
         )
         if _org_block is not None:
             return _org_block
         from src.claude_cli import rate_limit_tracker
-        if not _gemini_vision_lane and rate_limit_tracker.should_reject_new_request(
+        if not _external_vision_lane and rate_limit_tracker.should_reject_new_request(
             worker_id
         ):
             retry_after = rate_limit_tracker.get_retry_after(worker_id) or 0
@@ -3025,7 +3066,7 @@ async def _chat_completions_lauf(
                     f"⏳ Worker {worker_id} {limit_type} penalty — rejecting "
                     f"(NGINX failover), retry in {retry_after}s"
                 )
-                return JSONResponse(
+                raise BridgeError(JSONResponse(
                     status_code=429,
                     content={"error": {
                         "message": f"[Bridge {worker_id}] Worker rate-limited ({limit_type})",
@@ -3039,7 +3080,7 @@ async def _chat_completions_lauf(
                         "retry_after_s": retry_after,
                     }},
                     headers={"Retry-After": str(retry_after or 30)}
-                )
+                ))
 
         # =======================================================================
         # TENANT CONTEXT — resolved here only for downstream usage tracking
@@ -3399,6 +3440,23 @@ async def _chat_completions_lauf(
         # M3, 10.10.2026). Der Pin selbst bleibt unangetastet: er traegt die
         # vertragliche EU-Datenresidenz eines echten Kunden, dessen Daten
         # gehoeren erst recht nicht zu Google.
+        if _reserve_retry:
+            # App rules may clear an incoming direct tier. Only the unpinned
+            # Anthropic path may be converted back to the promotional reserve.
+            # A real operator pin, foreign provider, tool use or SDK session
+            # must never be weakened by skipping subscription admission.
+            if (operator_pinned_provider or request_body.enable_tools or request_body.session_id
+                    or backend_config.backend not in (BackendType.ANTHROPIC, BackendType.ANTHROPIC_DIRECT)):
+                raise HTTPException(409, "API reserve conflicts with request routing; no paid fallback")
+            backend_config = resolve_backend_config(
+                backend=BackendType.ANTHROPIC, model=resolved_model,
+                privacy=request_body.privacy or PrivacyMode.AUTO,
+                provider_tier="claude-direct-notools",
+            )
+            backend_config.provider_model = resolved_model
+            from src.jobs.selbstaufruf import ledger_provider_merken
+            ledger_provider_merken(request, ledger_provider_for_backend(backend_config.backend))
+
         _gemini_vision_wanted = _gemini_vision_lane or _client_asked_for_gemini_vision
         _resolves_to_gemini = bool(
             backend_config and backend_config.backend == BackendType.GEMINI_API
@@ -3889,6 +3947,8 @@ async def _chat_completions_lauf(
             logger.info(f"🔀 Routing to direct Anthropic Messages API (tier={direct_tier})")
             direct_attribution = extract_attribution_context(request)
 
+            direct_credit_meta = {}
+
             async def _persist_direct_usage(
                 *, input_tokens: int, output_tokens: int, status: str,
                 duration_ms: int, error_code: Optional[str] = None,
@@ -3917,6 +3977,7 @@ async def _chat_completions_lauf(
                         "api_key_lane": "vision_prepaid",
                         "provider_tier": direct_tier,
                         "usage_source": "anthropic_messages_api",
+                        **direct_credit_meta,
                         "user_pinned": bool(user_pinned_provider),
                     },
                 )
@@ -3928,6 +3989,7 @@ async def _chat_completions_lauf(
                 response_data = await call_anthropic_direct(
                     request_body, backend_config, messung_ziel=_test_ki_messung,
                 )
+                direct_credit_meta = response_data.get("x_api_reserve", {})
             except Exception as direct_err:
                 # Test-KI-Deckel: nichts gemessen -> Reservierung bleibt voll stehen.
                 await _test_ki_deckel.abrechnen(None)
@@ -5165,71 +5227,11 @@ async def _chat_completions_lauf(
                 # enable_tools=false — see claude-direct-notools in
                 # src/providers/fallback.py, which is otherwise excluded.
                 _fallback_chain = _fb_tiers(
-                    _primary_tier, tools_required=bool(request_body.enable_tools)
+                    _primary_tier, tools_required=bool(request_body.enable_tools or request_body.session_id)
                 )[1:]  # skip primary
 
-                for _ft in _fallback_chain:
-                    try:
-                        logger.warning(
-                            f"⚠️ Worker rate-limited on {_primary_tier}. "
-                            f"Cross-bridge fallback: {_ft}"
-                        )
-                        await _fb_asyncio.sleep(_fb_delay)
-
-                        _fb_cfg = resolve_backend_config(
-                            backend=request_body.backend or BackendType.ANTHROPIC,
-                            model=(resolved_model if 'resolved_model' in locals() else request_body.model),
-                            privacy=request_body.privacy or PrivacyMode.AUTO,
-                            bedrock_region=request_body.bedrock_region,
-                            provider_tier=_ft,
-                        )
-
-                        if _fb_cfg.backend == BackendType.OPENAI_COMPATIBLE:
-                            from src.providers.openai_compatible import call_openai_compatible
-                            _fb_resp = await call_openai_compatible(
-                                request_body,
-                                _fb_cfg.provider_base_url,
-                                _fb_cfg.provider_api_key,
-                                model_override=_fb_cfg.provider_model,
-                            )
-                            _fb_ok(_ft)
-                            logger.info(
-                                f"✅ Cross-bridge fallback {_ft} succeeded "
-                                f"(primary worker rate-limited)"
-                            )
-                            _fb_resp["x_fallback"] = {
-                                "used": True,
-                                "original_provider": _primary_tier,
-                                "fallback_provider": _ft,
-                                "original_error": f"worker rate-limited: {wue}",
-                                "trigger": "worker_unavailable",
-                            }
-                            return _fb_resp
-                        elif _fb_cfg.backend == BackendType.ANTHROPIC_DIRECT:
-                            from src.providers.anthropic_direct import call_anthropic_direct
-                            _fb_resp = await call_anthropic_direct(request_body, _fb_cfg)
-                            _fb_ok(_ft)
-                            logger.info(
-                                f"✅ Cross-bridge fallback {_ft} succeeded "
-                                f"(primary worker rate-limited)"
-                            )
-                            _fb_resp["x_fallback"] = {
-                                "used": True,
-                                "original_provider": _primary_tier,
-                                "fallback_provider": _ft,
-                                "original_error": f"worker rate-limited: {wue}",
-                                "trigger": "worker_unavailable",
-                            }
-                            return _fb_resp
-                    except Exception as _fb_err:
-                        _fb_fail(_ft, str(_fb_err)[:200])
-                        logger.warning(f"⚠️ Cross-bridge fallback {_ft} failed: {_fb_err}")
-                        continue
-
-                logger.error(
-                    f"❌ All cross-bridge fallbacks exhausted for {_primary_tier} "
-                    f"(worker rate-limited)"
-                )
+                if "claude-direct-notools" in _fallback_chain:
+                    return await _run_api_reserve_fallback(request_body, request, cause="worker_unavailable")
             except ImportError:
                 pass  # fallback module unavailable — fall through to raise
             except Exception as _fb_setup_err:
@@ -5239,6 +5241,8 @@ async def _chat_completions_lauf(
         # Fallback didn't help (or streaming) — re-raise so nginx can try
         # another worker and/or the 503 envelope reaches the client.
         raise
+    except BridgeError:
+        raise  # Preserve admission source/type for the global reserve decision.
     except Exception as e:
         # =======================================================================
         # FALLBACK: Attempt alternate providers if primary failed (non-streaming)
@@ -5265,110 +5269,11 @@ async def _chat_completions_lauf(
                     # enable_tools=false — see claude-direct-notools in
                     # src/providers/fallback.py, which is otherwise excluded.
                     fallback_tiers = get_fallback_tiers(
-                        primary_tier, tools_required=bool(request_body.enable_tools)
+                        primary_tier, tools_required=bool(request_body.enable_tools or request_body.session_id)
                     )[1:]  # Skip primary
 
-                    for fallback_tier in fallback_tiers:
-                        try:
-                            logger.warning(
-                                f"⚠️ {primary_tier} failed: {e}. "
-                                f"Attempting fallback: {fallback_tier}"
-                            )
-                            await asyncio.sleep(FALLBACK_DELAY_SECONDS)
-
-                            fallback_config = resolve_backend_config(
-                                backend=request_body.backend or BackendType.ANTHROPIC,
-                                model=resolved_model,
-                                privacy=request_body.privacy or PrivacyMode.AUTO,
-                                bedrock_region=request_body.bedrock_region,
-                                provider_tier=fallback_tier,
-                            )
-
-                            if fallback_config.backend == BackendType.OPENAI_COMPATIBLE:
-                                from src.providers.openai_compatible import call_openai_compatible
-                                response_data = await call_openai_compatible(
-                                    request_body,
-                                    fallback_config.provider_base_url,
-                                    fallback_config.provider_api_key,
-                                    model_override=fallback_config.provider_model,
-                                )
-
-                                fb_duration = time.time() - start_time
-                                record_success(fallback_tier)
-                                logger.info(
-                                    f"✅ Fallback to {fallback_tier} successful "
-                                    f"in {fb_duration:.2f}s"
-                                )
-
-                                # Track usage
-                                usage = response_data.get("usage", {})
-                                if tenant and usage:
-                                    from src.tenant import track_request_usage
-                                    attribution = extract_attribution_context(request)
-                                    await track_request_usage(
-                                        tenant=tenant,
-                                        model=fallback_config.provider_model or resolved_model,
-                                        input_tokens=usage.get("prompt_tokens", 0),
-                                        output_tokens=usage.get("completion_tokens", 0),
-                                        endpoint="/v1/chat/completions",
-                                        latency_ms=int(fb_duration * 1000),
-                                        status="fallback_success",
-                                        **attribution
-                                    )
-
-                                # Mark response with fallback metadata
-                                response_data["x_fallback"] = {
-                                    "used": True,
-                                    "original_provider": primary_tier,
-                                    "fallback_provider": fallback_tier,
-                                    "original_error": str(e)[:200],
-                                }
-                                return response_data
-
-                            elif fallback_config.backend == BackendType.ANTHROPIC_DIRECT:
-                                from src.providers.anthropic_direct import call_anthropic_direct
-                                response_data = await call_anthropic_direct(request_body, fallback_config)
-
-                                fb_duration = time.time() - start_time
-                                record_success(fallback_tier)
-                                logger.info(
-                                    f"✅ Fallback to {fallback_tier} successful "
-                                    f"in {fb_duration:.2f}s"
-                                )
-
-                                usage = response_data.get("usage", {})
-                                if tenant and usage:
-                                    from src.tenant import track_request_usage
-                                    attribution = extract_attribution_context(request)
-                                    await track_request_usage(
-                                        tenant=tenant,
-                                        model=fallback_config.provider_model or resolved_model,
-                                        input_tokens=usage.get("prompt_tokens", 0),
-                                        output_tokens=usage.get("completion_tokens", 0),
-                                        endpoint="/v1/chat/completions",
-                                        latency_ms=int(fb_duration * 1000),
-                                        status="fallback_success",
-                                        **attribution
-                                    )
-
-                                response_data["x_fallback"] = {
-                                    "used": True,
-                                    "original_provider": primary_tier,
-                                    "fallback_provider": fallback_tier,
-                                    "original_error": str(e)[:200],
-                                }
-                                return response_data
-
-                        except Exception as fallback_error:
-                            record_failure(fallback_tier, str(fallback_error)[:200])
-                            logger.warning(
-                                f"⚠️ Fallback {fallback_tier} also failed: {fallback_error}"
-                            )
-                            continue
-
-                    logger.error(
-                        f"❌ All fallback providers exhausted for {primary_tier}"
-                    )
+                    if "claude-direct-notools" in fallback_tiers:
+                        return await _run_api_reserve_fallback(request_body, request, cause="provider_failure")
             except ImportError:
                 pass  # Fallback module not available, continue to error handler
 
@@ -6980,6 +6885,10 @@ async def _execute_research_cloud_impl(
     from src.research_cloud.prompt import build_system_prompt, search_budget_for_depth
 
     start_time = time.time()
+    from src.providers.funding_policy import promotional_only, require_pool
+    free_only = promotional_only(request)
+    if free_only:
+        require_pool()
 
     try:
         anonymized_query = await anonymize_query_for_cloud(request, request_body.query)
@@ -7034,13 +6943,20 @@ async def _execute_research_cloud_impl(
         )
     from src.research_cloud.perplexity import load_perplexity_config, perplexity_enabled
     perplexity_cfg = load_perplexity_config()
+    if free_only:
+        perplexity_cfg = perplexity_cfg.model_copy(update={"enabled": False, "api_key": None})
     system_prompt = build_system_prompt(
         request_body.depth,
         library_index=library_index,
         perplexity=perplexity_enabled(perplexity_cfg),
     )
     search_max_uses, fetch_max_uses = search_budget_for_depth(request_body.depth)
-    config = ResearchCloudConfig(web_search_max_uses=search_max_uses, web_fetch_max_uses=fetch_max_uses)
+    config = ResearchCloudConfig(
+        model=request_body.model if free_only else "claude-sonnet-5",
+        web_search_max_uses=min(search_max_uses, 3) if free_only else search_max_uses,
+        web_fetch_max_uses=min(fetch_max_uses, 3) if free_only else fetch_max_uses,
+        promotional_only=free_only,
+    )
 
     # Lücken-Nachkontrolle (Rafael 03.10.2026): same switch semantics as the
     # pool path; the checker is a forced tool call on the research lane's key.
@@ -7061,11 +6977,11 @@ async def _execute_research_cloud_impl(
         abgewaehlt_nk = Nachkontrolle(pruefer=None)
         abgewaehlt_nk.ueberspringen("pruefung", ABWAHL_GRUND)
     try:
-        if nachkontrolle_aktiv(perplexity_enabled(perplexity_cfg)) and abgewaehlt_nk is None:
+        if nachkontrolle_aktiv(free_only or perplexity_enabled(perplexity_cfg)) and abgewaehlt_nk is None:
             # Same key as the executor; without it the executor itself refuses
             # the run before the checker could ever be asked.
             nachkontrolle = Nachkontrolle(
-                pruefer=messages_api_pruefer(os.environ.get("RESEARCH_CLOUD_API_KEY"))
+                pruefer=messages_api_pruefer(os.environ.get("RESEARCH_CLOUD_API_KEY"), promotional_only=free_only)
             )
     except LueckenKonfigFehler as e:
         logger.error(f"research-cloud: Lücken-Nachkontrolle falsch konfiguriert, Lauf wird nicht gestartet: {e}")
@@ -7431,7 +7347,10 @@ async def _execute_research_cloud_with_pool_fallback(
         result = await _execute_research_cloud_impl(
             request, request_body, attribution_ctx=attribution_ctx
         )
-        if result.status != "error":
+        from src.providers.funding_policy import promotional_only
+        if promotional_only(request):
+            result.funding_policy = "promotional_only"
+        if result.status != "error" or promotional_only(request):
             return result
         logger.error(
             f"research-cloud run failed (attempt {attempt}/{_RESEARCH_CLOUD_MAX_ATTEMPTS}): "
@@ -7772,7 +7691,13 @@ async def research(
         )
 
     _use_research_cloud = False
-    if _research_pinned == "bedrock":
+    from src.providers.funding_policy import promotional_only, require_pool
+    if promotional_only(request):
+        require_pool()
+        if _research_operator_pinned not in (None, "anthropic"):
+            raise HTTPException(409, "promotional_only conflicts with operator pin; no paid fallback")
+        _use_research_cloud = True
+    elif _research_pinned == "bedrock":
         # RESEARCH EXCEPTION TO THE GLOBAL BEDROCK PIN (Rafael 2026-07-27):
         # research cannot run on Bedrock at all — WebSearch is not available
         # there (DESIGN.md options matrix, verified against AWS docs
@@ -8437,6 +8362,9 @@ async def doc_agent(
     _org_block = _org_disabled_precheck(worker_id)
     if _org_block is not None:
         return _org_block
+    from src.providers.funding_policy import promotional_only
+    if promotional_only(request):
+        raise HTTPException(409, "promotional_only: doc-agent unsupported; no paid fallback")
     from src.claude_cli import rate_limit_tracker as _da_rlt
     if _da_rlt.should_reject_new_request(worker_id):
         retry_after = _da_rlt.get_retry_after(worker_id)
@@ -11676,7 +11604,7 @@ async def bridge_error_handler(request: Request, exc: BridgeError):
     Cross-bridge escape hatch: when the BridgeError was raised by the adaptive
     limiter (account_exhausted / throttle / queue_timeout on /v1/chat/completions)
     AND a usable fallback tier exists AND we have the cached request body, we
-    try the fallback chain (terminating in `bridge-prod-emergency`) BEFORE
+    try the promotional API reserve (never a paid provider) BEFORE
     surfacing the envelope. This closes the gap where dep-raised BridgeErrors
     never reached the route handler's own fallback path.
 
@@ -11690,7 +11618,7 @@ async def bridge_error_handler(request: Request, exc: BridgeError):
         path = request.url.path
         is_chat_completions = path.endswith("/v1/chat/completions")
         cached_body = getattr(request.state, "cached_body_dict", None)
-        if not is_chat_completions or not cached_body or cached_body.get("stream"):
+        if not is_chat_completions or not cached_body:
             return exc.response
 
         # Provider-pinned traffic (users.provider_config, e.g. Bedrock for
@@ -11713,7 +11641,7 @@ async def bridge_error_handler(request: Request, exc: BridgeError):
         err_type = err_fields.get("bridge_type", "")
         # Only these dep-raised categories warrant cross-bridge fallback.
         if not (
-            (err_source == "bridge_account" and err_type == "account_exhausted")
+            (err_source == "bridge_account" and err_type in ("account_exhausted", "worker_unavailable"))
             or (err_source == "bridge_internal" and err_type in ("throttle", "queue_timeout"))
         ):
             return exc.response
@@ -11752,78 +11680,24 @@ async def bridge_error_handler(request: Request, exc: BridgeError):
         # envelope the caller gets (also on the cross-bridge path's fall-throughs).
         exc.response = _ehrliche_antwort(request, exc.response)
 
-        from src.providers.fallback import (
-            get_fallback_tiers as _fb_tiers,
-            record_failure as _fb_fail,
-            record_success as _fb_ok,
-            FALLBACK_DELAY_SECONDS as _fb_delay,
-        )
-        import asyncio as _fb_asyncio
-
-        primary_tier = cached_body.get("provider_tier") or "claude-premium"
-        # Do NOT record_failure here: an adaptive-limiter dep_bridge_error is a
-        # throttle/capacity signal, not provider brokenness. Recording it pinned
-        # the provider "down" in /health forever (transient throttle → marked
-        # down → no success to reset → no time-decay). Same fix as the worker
-        # rate-limit path above. The fallback below still runs.
-        fallback_chain = _fb_tiers(primary_tier)[1:]  # skip primary
-        if not fallback_chain:
-            return exc.response  # nothing to try
-
-        # Build ChatCompletionRequest from cached body so call_openai_compatible
-        # has the right shape. Any validation error → fall back to envelope.
-        try:
-            _req = ChatCompletionRequest(**cached_body)
-        except Exception as _rebuild_err:
-            logger.warning(
-                f"Cross-bridge fallback: could not rebuild request model: {_rebuild_err}"
-            )
+        from src.providers.credit_pool import enabled as credit_pool_enabled
+        if not credit_pool_enabled():
             return exc.response
+        try:
+            reserve_request = ChatCompletionRequest(**cached_body)
+            reserve_request.enable_tools = enforce_tools_policy(
+                reserve_request.enable_tools, request.headers.get("X-Claude-Allowed-Tools", "")
+            )
+        except Exception:
+            return exc.response
+        result = await _run_api_reserve_fallback(reserve_request, request, cause=err_type)
+        return JSONResponse(content=result) if isinstance(result, dict) else result
 
-        for _ft in fallback_chain:
-            try:
-                logger.warning(
-                    f"⚠️ Adaptive limiter raised {err_type} on {primary_tier}. "
-                    f"Cross-bridge fallback (dep-level): {_ft}"
-                )
-                await _fb_asyncio.sleep(_fb_delay)
-                _fb_cfg = resolve_backend_config(
-                    backend=BackendType.ANTHROPIC,
-                    model=_req.model,
-                    privacy=_req.privacy or PrivacyMode.AUTO,
-                    bedrock_region=_req.bedrock_region,
-                    provider_tier=_ft,
-                )
-                if _fb_cfg.backend != BackendType.OPENAI_COMPATIBLE:
-                    continue  # Only OPENAI_COMPATIBLE tiers are fallback-callable here
-                from src.providers.openai_compatible import call_openai_compatible
-                _fb_resp = await call_openai_compatible(
-                    _req,
-                    _fb_cfg.provider_base_url,
-                    _fb_cfg.provider_api_key,
-                    model_override=_fb_cfg.provider_model,
-                )
-                _fb_ok(_ft)
-                logger.info(
-                    f"✅ Cross-bridge fallback {_ft} succeeded "
-                    f"(dep-level: {err_type})"
-                )
-                _fb_resp["x_fallback"] = {
-                    "used": True,
-                    "original_provider": primary_tier,
-                    "fallback_provider": _ft,
-                    "original_error": f"{err_type} from adaptive limiter",
-                    "trigger": "dep_bridge_error",
-                }
-                return JSONResponse(content=_fb_resp)
-            except Exception as _fb_err:
-                _fb_fail(_ft, str(_fb_err)[:200])
-                logger.warning(f"⚠️ Cross-bridge fallback {_ft} failed: {_fb_err}")
-                continue
-
-        logger.error(
-            f"❌ All cross-bridge fallbacks exhausted (dep-level {err_type})"
-        )
+    except HTTPException as reserve_error:
+        return JSONResponse(status_code=reserve_error.status_code, content={"error": {
+            "message": str(reserve_error.detail), "code": "api_reserve_unavailable",
+            "retryable": reserve_error.status_code in (429, 503), "automatic_paid_fallback": False,
+        }})
     except Exception as _handler_err:
         # Any error inside the fallback helper itself → fall through to envelope.
         logger.error(f"bridge_error_handler cross-fallback error: {_handler_err}")

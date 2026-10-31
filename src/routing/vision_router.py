@@ -78,6 +78,11 @@ def default_vision_target() -> str:
     Tippfehler in der Compose-Zeile soll auffallen, nicht monatelang so
     aussehen, als liefe alles ueber Gemini.
     """
+    # Operator opt-in: shared subscription API credits serve ordinary vision
+    # on BOTH bridges. Explicit X-Vision-Provider routing remains authoritative.
+    from src.providers.credit_pool import enabled as credit_pool_enabled
+    if credit_pool_enabled():
+        return VISION_TARGET_ANTHROPIC
     raw = (os.getenv("BRIDGE_VISION_DEFAULT_PROVIDER") or "").strip().lower()
     if not raw:
         return VISION_TARGET_ANTHROPIC
@@ -236,6 +241,7 @@ async def route_to_vision(
         ledger_provider=PROVIDER_ANTHROPIC,
         api_key_lane=LANE_ANTHROPIC_PREPAID,
         messung=vision_response.messung,
+        extra_meta=vision_response.credit_meta or {},
     )
 
 

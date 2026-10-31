@@ -73,6 +73,7 @@ from fastapi.responses import JSONResponse
 # from /app/src/middleware/... inside the container.
 from src.middleware.bridge_metrics_store import get_request_log, get_cc_usage_store
 from src.middleware.prompt_metrics import get_prompt_metrics, DOCUMENT_AGENT_IDS
+from src.metrics_reader.api_reserve import api_reserve_snapshot
 
 logger = logging.getLogger("metrics-reader")
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
@@ -1159,10 +1160,24 @@ def get_account_pool_state():
             penalties.pop(k, None)
         _write_penalties(penalties)
 
-    result: dict = {"ts": now, "accounts": accounts}
+    reserve = api_reserve_snapshot()
+    # The pool router reads this route without a key. Expose only routing
+    # availability here; monetary details belong to the protected endpoint.
+    routing_reserve = {
+        "state": reserve["state"],
+        "active_on_this_bridge": reserve["active_on_this_bridge"],
+        "automatic_paid_fallback": False,
+        "available": reserve["state"] == "available" and (reserve.get("available_usd") or 0) > 0,
+    }
+    result: dict = {"ts": now, "accounts": accounts, "api_reserve": routing_reserve}
     if errors:
         result["errors"] = errors
     return result
+
+
+@app.get("/v1/metrics/api-reserve", dependencies=OPERATOR)
+def get_api_reserve():
+    return api_reserve_snapshot()
 
 
 @app.post("/v1/metrics/sandbox-observed-rate-limit", dependencies=OPERATOR_OR_SERVICE)
