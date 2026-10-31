@@ -37,6 +37,7 @@ from dataclasses import dataclass, asdict, field
 from typing import Optional, Dict, Any, List
 
 from fastapi import HTTPException, Request
+from src.middleware.account_reserve import reserve_reason, require_account_reserve, valid_percent, AUTOMATION_WEEKLY_LIMIT
 
 from src.middleware.bridge_error import (
     BridgeError,
@@ -141,7 +142,7 @@ WEEKLY_CACHE_TTL_SEC        = int(os.getenv("ADAPTIVE_WEEKLY_CACHE_TTL_SEC", "30
 # must be sped up, not accommodated by widening the window: a stale number is
 # only marginally better than no number, and pretending otherwise is what let
 # a whole bridge report 0% for months.
-CC_USAGE_MAX_AGE_SEC = float(os.getenv("CC_USAGE_MAX_AGE_SEC", "5400"))
+CC_USAGE_MAX_AGE_SEC = float(os.getenv("CC_USAGE_MAX_AGE_SEC", "1800"))
 
 # How often an unresolved "usage unknown" is re-logged, so a permanent outage
 # leaves a periodic trace without spamming a line every TTL.
@@ -471,29 +472,29 @@ class AdaptiveLoadLimiter:
 
         weekly_raw = (acc.get("weeklyAllModels") or {}).get("percent")
         session_raw = (acc.get("currentSession") or {}).get("percent")
-        if weekly_raw is None or session_raw is None:
+        if not valid_percent(weekly_raw) or (session_raw is not None and not valid_percent(session_raw)):
             self._mark_usage_unknown(
                 f"snapshot entry for {WORKER_ACCOUNT!r} is missing "
-                f"weeklyAllModels/currentSession percent", now
+                f"valid weeklyAllModels/currentSession percent", now
             )
             return
 
         weekly = float(weekly_raw)
-        session = float(session_raw)
+        session = float(session_raw) if session_raw is not None else None
         self._maybe_release_capacity_lock(weekly, session, snap_ts)
         self._maybe_set_capacity_lock(acc)
         if not self._account_usage.get("known"):
             logger.info(
                 f"account usage for worker {self.worker!r} (account "
                 f"{WORKER_ACCOUNT!r}) is MEASURED again: weekly={weekly:.1f}% "
-                f"session={session:.1f}% (snapshot {int(now - (snap_ts or now))}s old)"
+                f"session={session}% (snapshot {int(now - (snap_ts or now))}s old)"
             )
             self._usage_last_log_reason = None
         self._account_usage = {
             "known": True,
             "weekly_pct": weekly,
             "session_pct": session,
-            "budget_multiplier": _weekly_budget_multiplier(weekly, session),
+            "budget_multiplier": _weekly_budget_multiplier(weekly, session if session is not None else 0.0),
             "source_ts": snap_ts,
             "ts": now,
             "reason": "",
@@ -605,6 +606,11 @@ class AdaptiveLoadLimiter:
                 "account_usage_reason": acct.get("reason") or "",
                 "weekly_budget_multiplier": round(budget_mult, 3),
             }
+            reserve = reserve_reason(acct)
+            snapshot["reserve_blocked"] = reserve is not None
+            snapshot["automation_weekly_limit"] = AUTOMATION_WEEKLY_LIMIT
+            if reserve:
+                return False, reserve, snapshot
             if inflight_count >= HARD_REQUEST_CEILING:
                 return False, (
                     f"Hard request ceiling reached "
@@ -675,7 +681,7 @@ class AdaptiveLoadLimiter:
         start = time.time()
         # Fast path — usually capacity is available, no queueing needed.
         accepted, reason, snap = await self.can_accept(est_tokens)
-        if accepted or timeout_s <= 0:
+        if accepted or snap.get("reserve_blocked") or timeout_s <= 0:
             return accepted, reason, snap, time.time() - start
 
         # Fast-fail when the request size ALONE exceeds the effective cap.
@@ -1102,6 +1108,8 @@ async def enforce_pool_admission(request: Request) -> None:
     queue itself times out. Requires cache_request_body_dependency() to have
     run first.
     """
+    # Also applies when the body estimate is missing; fixed-account calls cannot bypass it.
+    require_account_reserve()
     est = getattr(request.state, "adaptive_est_tokens", None)
     if est is None:
         # No estimate → nothing to enforce against. Pre-existing pass-through

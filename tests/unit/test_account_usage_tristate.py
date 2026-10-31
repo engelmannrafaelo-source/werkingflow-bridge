@@ -320,3 +320,15 @@ async def test_sandbox_picker_treats_a_missing_flag_as_unmeasured(monkeypatch):
     monkeypatch.setattr(ar, "_fetch_pool_state", fake_state)
     picked = await ar.pick_account()
     assert picked.account_id == "gmail"
+
+
+def test_weekly_only_snapshot_is_measured(limiter, monkeypatch, store):
+    from src.middleware import adaptive_limiter as al
+    monkeypatch.setattr(al, "WORKER_ACCOUNT", "engelmann")
+    monkeypatch.setattr("src.middleware.bridge_metrics_store.get_cc_usage_store", lambda: store)
+    with open(store.JSONL_PATH, "w") as f:
+        f.write(_snapshot(time.time(), [("engelmann", 90.0, None)]) + "\n")
+    _force_refresh(limiter)
+    assert limiter._account_usage["known"] is True
+    assert limiter._account_usage["weekly_pct"] == 90
+    assert limiter._account_usage["session_pct"] is None

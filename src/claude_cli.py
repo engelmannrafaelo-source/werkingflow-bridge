@@ -175,6 +175,9 @@ def _apply_open_process_patch() -> None:
             and command
             and str(command[0]).endswith("claude")
         )
+        if is_claude_cmd and ("--print" in command or "-p" in command):
+            from src.middleware.account_reserve import require_account_reserve
+            require_account_reserve()
         if is_claude_cmd:
             # BRLZR P3: the CLI and everything it starts (MCP servers, tool
             # shells) get a process group of their own, so a run aborted at its
@@ -1917,6 +1920,8 @@ class ClaudeCodeCLI:
 
         Returns session metadata including session_id and directory path.
         """
+        from src.middleware.account_reserve import require_account_reserve
+        require_account_reserve()
         logger.info("🔧 Using native CLI fallback for slash command execution")
 
         if not session_dir:
@@ -2049,6 +2054,9 @@ class ClaudeCodeCLI:
                         protocol names the final message as the answer and
                         no OUTPUT_FILE_PATH is injected.
         """
+        # Every completion/resume/retry, including callers bypassing HTTP routing.
+        from src.middleware.account_reserve import require_account_reserve
+        require_account_reserve()
         # timeout_s (BRREF-LAUFZEIT): the caller's remaining time, e.g. the
         # research run's overall deadline. Never longer than MAX_TIMEOUT. When
         # it fires, asyncio.timeout cancels the SDK query, whose finally closes
