@@ -129,17 +129,6 @@ services:
       # Kill switch: set ENABLED=false + recreate. See src/routing/prepaid_cap.py.
       - PREPAID_VISION_DAILY_CAP_ENABLED=true
       - PREPAID_VISION_DAILY_CAP_EUR=90
-      # Test-KI-Deckel (nur Dev, nie Prod): Testaufrufe (Prinzipal aus
-      # TEST_KI_PRINZIPALE, Job eines solchen Prinzipals, oder X-Test-Lauf) duerfen
-      # nur Haiku-Chat ueber den Direktweg, gedeckelt 0,50 EUR je Lauf, 10 EUR je
-      # App und Tag, 20 EUR gesamt je Tag (fail-closed); jeder andere Weg 403.
-      # Nichts davon befreit; alle anderen Aufrufe bleiben unberuehrt. Braucht
-      # Migration 072. Vertrag: docs/contracts/test-ki-deckel.md. Kein Secret.
-      # PRINZIPALE bewusst LEER (K67, 27.10.2026, Works-Berater 3afd926f ueber
-      # den Vize): Works und Report nur ueber X-Test-Lauf gedeckelt; ein Eintrag
-      # sperrte jeden Nicht-Chat-Weg aller Nutzer dieses Prinzipals (403 KI_TEST_NUR_CHAT).
-      - BRIDGE_TEST_KI_DECKEL=1
-      - BRIDGE_TEST_KI_PRINZIPALE=
       # Chat-job self-call timeout (claims/finalize). Default 600s cut long
       # Energy claims calls (observed 728s); align with MAX_TIMEOUT (2400s).
       - BRIDGE_CHAT_JOB_TIMEOUT_S=2400
@@ -343,17 +332,6 @@ services:
       # Kill switch: set ENABLED=false + recreate. See src/routing/prepaid_cap.py.
       - PREPAID_VISION_DAILY_CAP_ENABLED=true
       - PREPAID_VISION_DAILY_CAP_EUR=90
-      # Test-KI-Deckel (nur Dev, nie Prod): Testaufrufe (Prinzipal aus
-      # TEST_KI_PRINZIPALE, Job eines solchen Prinzipals, oder X-Test-Lauf) duerfen
-      # nur Haiku-Chat ueber den Direktweg, gedeckelt 0,50 EUR je Lauf, 10 EUR je
-      # App und Tag, 20 EUR gesamt je Tag (fail-closed); jeder andere Weg 403.
-      # Nichts davon befreit; alle anderen Aufrufe bleiben unberuehrt. Braucht
-      # Migration 072. Vertrag: docs/contracts/test-ki-deckel.md. Kein Secret.
-      # PRINZIPALE bewusst LEER (K67, 27.10.2026, Works-Berater 3afd926f ueber
-      # den Vize): Works und Report nur ueber X-Test-Lauf gedeckelt; ein Eintrag
-      # sperrte jeden Nicht-Chat-Weg aller Nutzer dieses Prinzipals (403 KI_TEST_NUR_CHAT).
-      - BRIDGE_TEST_KI_DECKEL=1
-      - BRIDGE_TEST_KI_PRINZIPALE=
       # Chat-job self-call timeout (claims/finalize). Default 600s cut long
       # Energy claims calls (observed 728s); align with MAX_TIMEOUT (2400s).
       - BRIDGE_CHAT_JOB_TIMEOUT_S=2400
@@ -557,17 +535,6 @@ services:
       # Kill switch: set ENABLED=false + recreate. See src/routing/prepaid_cap.py.
       - PREPAID_VISION_DAILY_CAP_ENABLED=true
       - PREPAID_VISION_DAILY_CAP_EUR=90
-      # Test-KI-Deckel (nur Dev, nie Prod): Testaufrufe (Prinzipal aus
-      # TEST_KI_PRINZIPALE, Job eines solchen Prinzipals, oder X-Test-Lauf) duerfen
-      # nur Haiku-Chat ueber den Direktweg, gedeckelt 0,50 EUR je Lauf, 10 EUR je
-      # App und Tag, 20 EUR gesamt je Tag (fail-closed); jeder andere Weg 403.
-      # Nichts davon befreit; alle anderen Aufrufe bleiben unberuehrt. Braucht
-      # Migration 072. Vertrag: docs/contracts/test-ki-deckel.md. Kein Secret.
-      # PRINZIPALE bewusst LEER (K67, 27.10.2026, Works-Berater 3afd926f ueber
-      # den Vize): Works und Report nur ueber X-Test-Lauf gedeckelt; ein Eintrag
-      # sperrte jeden Nicht-Chat-Weg aller Nutzer dieses Prinzipals (403 KI_TEST_NUR_CHAT).
-      - BRIDGE_TEST_KI_DECKEL=1
-      - BRIDGE_TEST_KI_PRINZIPALE=
       # Chat-job self-call timeout (claims/finalize). Default 600s cut long
       # Energy claims calls (observed 728s); align with MAX_TIMEOUT (2400s).
       - BRIDGE_CHAT_JOB_TIMEOUT_S=2400
@@ -771,17 +738,6 @@ services:
       # Kill switch: set ENABLED=false + recreate. See src/routing/prepaid_cap.py.
       - PREPAID_VISION_DAILY_CAP_ENABLED=true
       - PREPAID_VISION_DAILY_CAP_EUR=90
-      # Test-KI-Deckel (nur Dev, nie Prod): Testaufrufe (Prinzipal aus
-      # TEST_KI_PRINZIPALE, Job eines solchen Prinzipals, oder X-Test-Lauf) duerfen
-      # nur Haiku-Chat ueber den Direktweg, gedeckelt 0,50 EUR je Lauf, 10 EUR je
-      # App und Tag, 20 EUR gesamt je Tag (fail-closed); jeder andere Weg 403.
-      # Nichts davon befreit; alle anderen Aufrufe bleiben unberuehrt. Braucht
-      # Migration 072. Vertrag: docs/contracts/test-ki-deckel.md. Kein Secret.
-      # PRINZIPALE bewusst LEER (K67, 27.10.2026, Works-Berater 3afd926f ueber
-      # den Vize): Works und Report nur ueber X-Test-Lauf gedeckelt; ein Eintrag
-      # sperrte jeden Nicht-Chat-Weg aller Nutzer dieses Prinzipals (403 KI_TEST_NUR_CHAT).
-      - BRIDGE_TEST_KI_DECKEL=1
-      - BRIDGE_TEST_KI_PRINZIPALE=
       # Chat-job self-call timeout (claims/finalize). Default 600s cut long
       # Energy claims calls (observed 728s); align with MAX_TIMEOUT (2400s).
       - BRIDGE_CHAT_JOB_TIMEOUT_S=2400

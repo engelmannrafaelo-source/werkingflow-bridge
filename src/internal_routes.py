@@ -597,69 +597,6 @@ async def post_project_budget_deduct(
         raise HTTPException(status_code=400, detail=str(e))
 
 
-# ── Test-KI-Deckel (KD 91624155, 27.10.2026; R2/R4) ──────────────────────
-# Worker-Seite und Regeln: src/budget/test_ki_deckel.py. Dies ist der EINZIGE
-# Schreibweg (kein DB-Rueckfall im Worker). reservieren und abrechnen sind je
-# reservierung_id idempotent (test_ki_buchung, Primaerschluessel). Ein DB-Fehler
-# bleibt ein 5xx; der Worker behandelt jede Nicht-200-Antwort fail-closed.
-
-class KiDeckelReservierenRequest(BaseModel):
-    reservierung_id: str
-    app: str = Field(min_length=1, max_length=64)
-    tag: str = Field(min_length=10, max_length=10)
-    lauf: str = Field(min_length=12, max_length=400)
-    betrag_eur: float = Field(ge=0)
-
-
-class KiDeckelAbrechnenRequest(BaseModel):
-    reservierung_id: str
-    ist_eur: Optional[float] = Field(default=None, ge=0)
-
-
-def _test_ki_uuid(raw: str, was: str):
-    import uuid as _uuid
-
-    try:
-        return _uuid.UUID(raw)
-    except (ValueError, AttributeError, TypeError):
-        raise HTTPException(status_code=400, detail=f"Invalid {was}: {raw!r}")
-
-
-@router.post("/test-ki-deckel/reservieren")
-async def post_test_ki_reservieren(
-    body: KiDeckelReservierenRequest,
-    _claims: AuthClaims = Depends(require_service_token),
-) -> Dict[str, Any]:
-    """Mirrors src.budget.test_ki_deckel.db_reservieren. Deckel stehen im Code
-    (nicht im Rumpf); eine ID, die zu einer anderen Buchung gehoert, ist 409."""
-    from src.budget.test_ki_deckel import db_reservieren
-
-    try:
-        return await db_reservieren(
-            reservierung_id=_test_ki_uuid(body.reservierung_id, "reservierung_id"),
-            app=body.app, tag=body.tag, lauf=body.lauf, betrag_eur=body.betrag_eur,
-        )
-    except ValueError as e:
-        raise HTTPException(status_code=409, detail=str(e))
-
-
-@router.post("/test-ki-deckel/abrechnen")
-async def post_test_ki_abrechnen(
-    body: KiDeckelAbrechnenRequest,
-    _claims: AuthClaims = Depends(require_service_token),
-) -> Dict[str, Any]:
-    """Mirrors src.budget.test_ki_deckel.db_abrechnen — hoechstens einmal je ID."""
-    from src.budget.test_ki_deckel import db_abrechnen
-
-    try:
-        return await db_abrechnen(
-            reservierung_id=_test_ki_uuid(body.reservierung_id, "reservierung_id"),
-            ist_eur=body.ist_eur,
-        )
-    except LookupError as e:
-        raise HTTPException(status_code=404, detail=str(e))
-
-
 # ── 2c/C5: app-tier policy (who pays for this call-site) ─────────────────
 
 @router.get("/app-tier-policy")

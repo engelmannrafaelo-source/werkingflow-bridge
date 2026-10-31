@@ -67,17 +67,6 @@ class BridgeConfig:
     job_attempt_identity_enabled: bool = False
     """Enable call_id/attempt_id validation and public lookup; opt-in only."""
 
-    # -- Gebundene Auftragsbudget-Token (BA6, 30.10.2026) ----------------
-    # Only the Auftragsbudget routes accept them, only for plan energy-project,
-    # never `raise` (src/api_auth/deps.py: require_auftragsbudget_token).
-    # Unset = that credential does not exist (401); the operator service token
-    # keeps working unchanged. Vertrag: docs/contracts/auftragsbudget-token.md.
-    auftragsbudget_token_raw: str | None = None
-    """BRIDGE_AUFTRAGSBUDGET_TOKEN: anlegen + lesen (Energy API process)."""
-
-    auftragsbudget_lesetoken_raw: str | None = None
-    """BRIDGE_AUFTRAGSBUDGET_LESETOKEN: lesen only (Energy worker)."""
-
     @property
     def db_enabled(self) -> bool:
         return self.db_url is not None and self.db_url != ""
@@ -124,31 +113,7 @@ def _load() -> BridgeConfig:
         mollie_api_key_raw=os.getenv("MOLLIE_API_KEY") or None,
         service_token_raw=os.getenv("BRIDGE_SERVICE_TOKEN") or None,
         job_attempt_identity_enabled=_bool("BRIDGE_JOB_ATTEMPT_IDENTITY_ENABLED"),
-        auftragsbudget_token_raw=os.getenv("BRIDGE_AUFTRAGSBUDGET_TOKEN") or None,
-        auftragsbudget_lesetoken_raw=os.getenv("BRIDGE_AUFTRAGSBUDGET_LESETOKEN") or None,
     )
-
-    # A bound token that equals another credential would silently carry that
-    # credential's rights (the operator token can raise; the Anlege-token can
-    # create). Refuse at boot rather than at the first request.
-    _bound = {
-        "BRIDGE_AUFTRAGSBUDGET_TOKEN": cfg.auftragsbudget_token_raw,
-        "BRIDGE_AUFTRAGSBUDGET_LESETOKEN": cfg.auftragsbudget_lesetoken_raw,
-    }
-    for _name, _value in _bound.items():
-        if _value is None:
-            continue
-        if len(_value) < 32:
-            raise RuntimeError(f"{_name} must be at least 32 characters.")
-        if _value == cfg.service_token_raw:
-            raise RuntimeError(f"{_name} must differ from BRIDGE_SERVICE_TOKEN.")
-    if (
-        cfg.auftragsbudget_token_raw is not None
-        and cfg.auftragsbudget_token_raw == cfg.auftragsbudget_lesetoken_raw
-    ):
-        raise RuntimeError(
-            "BRIDGE_AUFTRAGSBUDGET_TOKEN and BRIDGE_AUFTRAGSBUDGET_LESETOKEN must differ."
-        )
 
     if cfg.db_enabled:
         # DB-backed routes (identity/budget/billing/activity/admin) need these.

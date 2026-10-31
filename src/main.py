@@ -951,17 +951,6 @@ from src.middleware.event_logger import EventLogger
 # Re-enabled: Pure ASGI implementation, not affected by BaseHTTPMiddleware bug
 app.add_middleware(PerformanceMonitorMiddleware)
 
-# Test-KI-Deckel (R4): ein Testaufruf (Test-Prinzipal, Job eines Test-
-# Prinzipals, X-Test-Lauf) darf an diesem Worker nur Haiku-Chat ueber das Tor
-# — jede andere Route ausser der kostenfreien Erlaubnisliste antwortet 403
-# KI_TEST_NUR_CHAT, bei Schalter aus jeder Testaufruf 403 KI_TEST_DECKEL_INAKTIV.
-# Eine Stelle fuer ALLE Routen, vor jeder Kostenwirkung (src/budget/test_ki_deckel.py).
-from src.budget.test_ki_deckel import TestKiWegeMiddleware
-app.add_middleware(
-    TestKiWegeMiddleware,
-    antwort=lambda request, exc: http_exception_handler(request, exc),
-)
-
 # ADR-0011: request-scoped HOME-bridge origin (X-Bridge-Origin, LB-stamped).
 # Added LAST → outermost, so the origin is in context before ANY other layer
 # (tenant, attribution, endpoints) touches identity/budget/ledger paths.
@@ -2911,9 +2900,7 @@ async def _chat_completions_lauf(
         # ===================================================================
         # BUDGET GATE — hard 402 when the user's app budget is exhausted.
         # Runs before the LLM call. Fail-open on infra errors; only a real
-        # "budget empty" blocks. See src/budget/gate.py. Every refusal the gate
-        # decides on (402, 400, 409 billing_plan_unresolved, 503) arrives as
-        # HTTPException; the catch-all below only sees unclassified errors.
+        # "budget empty" blocks. See src/budget/gate.py.
         # ===================================================================
         try:
             from src.budget.gate import enforce_budget, hard_cap_hint_from_request
@@ -3392,37 +3379,6 @@ async def _chat_completions_lauf(
                     }
                 }
             )
-
-        # =======================================================================
-        # TEST-KI-DECKEL: Testkonten von Works/Report nur Haiku, Direktweg, gedeckelt
-        # =======================================================================
-        # Nach jeder anderen Wegwahl (Pin, App-Regel, Tier, Text-Wegwahl): das
-        # Tor ZWINGT gedeckelte Testaufrufe auf den Direktweg (ein Messages-API-
-        # Aufruf, max_tokens wirksam, Usage gemessen) und prueft das Ergebnis am
-        # aufgeloesten Backend. Testaufruf = Test-Prinzipal, Job eines Test-
-        # Prinzipals oder X-Test-Lauf; nichts davon befreit. Regeln und die
-        # Wege-Schicht fuer alle anderen Routen: src/budget/test_ki_deckel.py.
-        from src.budget import test_ki_deckel as _test_ki_deckel
-
-        def _test_ki_direktweg():
-            _cfg = resolve_backend_config(
-                backend=BackendType.ANTHROPIC,
-                model=_test_ki_deckel.MODELL,
-                provider_tier=_test_ki_deckel.DIREKT_TIER,
-            )
-            _cfg.provider_model = _test_ki_deckel.MODELL
-            return _cfg
-
-        _test_ki_cfg = await _test_ki_deckel.tor(
-            request=request,
-            request_body=request_body,
-            attribution=extract_attribution_context(request),
-            resolved_model=resolved_model,
-            erzwinge_direktweg=_test_ki_direktweg,
-        )
-        if _test_ki_cfg is not None:
-            backend_config = _test_ki_cfg
-            request_body.provider_tier = _test_ki_deckel.DIREKT_TIER
 
         # =======================================================================
         # GEMINI-BILDWEG: geht der Aufruf wirklich zu Gemini?
@@ -3982,17 +3938,10 @@ async def _chat_completions_lauf(
                     },
                 )
 
-            # Test-KI-Deckel: ein FRISCHES, nur diesem Aufruf gehoerendes Messziel —
-            # und nur, wenn das Tor reserviert hat. Die Messung geht nie in die Antwort.
-            _test_ki_messung = _test_ki_deckel.MessungZiel() if _test_ki_deckel.ist_gedeckelt() else None
             try:
-                response_data = await call_anthropic_direct(
-                    request_body, backend_config, messung_ziel=_test_ki_messung,
-                )
+                response_data = await call_anthropic_direct(request_body, backend_config)
                 direct_credit_meta = response_data.get("x_api_reserve", {})
             except Exception as direct_err:
-                # Test-KI-Deckel: nichts gemessen -> Reservierung bleibt voll stehen.
-                await _test_ki_deckel.abrechnen(None)
                 await _persist_direct_usage(
                     input_tokens=0, output_tokens=0, status="error",
                     duration_ms=int((time.time() - start_time) * 1000),
@@ -4002,9 +3951,6 @@ async def _chat_completions_lauf(
                 raise
             duration = time.time() - start_time
             usage = response_data.get("usage") or {}
-            # Test-KI-Deckel: Abrechnung NUR aus der vollstaendigen UsageMessung der
-            # Rohantwort; sonst bleibt die volle Reservierung stehen.
-            await _test_ki_deckel.abrechnen(_test_ki_messung.messung if _test_ki_messung else None)
             logger.info(f"✅ Direct Anthropic request completed in {duration:.2f}s (tier={direct_tier})")
             await _persist_direct_usage(
                 input_tokens=usage.get("prompt_tokens", 0) or 0,
@@ -5203,12 +5149,9 @@ async def _chat_completions_lauf(
         # very host where this was measured) is not the answer to one dead
         # account.
         # =====================================================================
-        # Test-KI-Deckel: kein Wechsel auf andere Anbieter/Modelle.
-        from src.budget.test_ki_deckel import ist_gedeckelt as _test_ki_gedeckelt
         if (
             not request_body.stream
             and not user_pinned_provider
-            and not _test_ki_gedeckelt()
             and not isinstance(wue, OrgSubscriptionDisabledError)
         ):
             try:
@@ -5248,9 +5191,7 @@ async def _chat_completions_lauf(
         # FALLBACK: Attempt alternate providers if primary failed (non-streaming)
         # Provider-pinned users (provider_config) are excluded: no fallback by design.
         # =======================================================================
-        # Test-KI-Deckel: kein Fallback auf andere Anbieter/Modelle.
-        from src.budget.test_ki_deckel import ist_gedeckelt as _test_ki_gedeckelt
-        if not request_body.stream and not user_pinned_provider and not _test_ki_gedeckelt():
+        if not request_body.stream and not user_pinned_provider:
             try:
                 from src.providers.fallback import (
                     is_retryable_error, is_breaker_failure, record_failure, record_success,
@@ -11751,19 +11692,11 @@ async def http_exception_handler(request: Request, exc: StarletteHTTPException):
             # keeps its label (Report's durable drivers retry on it).
             type_override=(
                 detail["error"]
-                if (
-                    exc.status_code == 402
-                    and detail.get("reason") == "project_budget_exhausted"
-                    and detail.get("hardCap") is True
-                    and detail.get("retryable") is False
-                    and isinstance(detail.get("error"), str)
-                )
-                # Budget gate (BA6): no single paying plan — its own type, not
-                # an internal error.
-                or (
-                    exc.status_code == 409
-                    and detail.get("error") == "billing_plan_unresolved"
-                )
+                if exc.status_code == 402
+                and detail.get("reason") == "project_budget_exhausted"
+                and detail.get("hardCap") is True
+                and detail.get("retryable") is False
+                and isinstance(detail.get("error"), str)
                 else None
             ),
         )

@@ -19,7 +19,7 @@ through this direct path instead, once they're not tool-capable anyway.
 import logging
 import time
 import uuid
-from typing import Any, Dict, Optional
+from typing import Any, Dict
 
 from src.models import ChatCompletionRequest
 from src.routing.backend_router import BackendConfig
@@ -42,7 +42,6 @@ async def call_anthropic_direct(
     request: ChatCompletionRequest,
     config: BackendConfig,
     timeout: float = DEFAULT_TIMEOUT_S,
-    messung_ziel: Optional[Any] = None,
 ) -> Dict[str, Any]:
     """Call the direct Anthropic Messages API and return an OpenAI-compatible
     chat-completion response dict — same shape call_openai_compatible()
@@ -57,10 +56,6 @@ async def call_anthropic_direct(
             validation but unused here, VisionProvider reads
             ANTHROPIC_VISION_API_KEY from env itself).
         timeout: HTTP timeout in seconds — see DEFAULT_TIMEOUT_S.
-        messung_ziel: nur der Test-KI-Torzweig in main.py uebergibt hier ein
-            frisches test_ki_deckel.MessungZiel; es bekommt die UsageMessung
-            der Rohantwort. Sie geht NIE in das Antwort-dict (JSON, SSE,
-            Job-Ergebnis und die Fallback-Aufrufe sehen sie nicht).
 
     Returns:
         OpenAI-compatible response dict with choices and usage.
@@ -91,8 +86,6 @@ async def call_anthropic_direct(
         thinking=request.thinking,
         output_config=request.output_config,
     )
-    if messung_ziel is not None:
-        messung_ziel.setzen(result.messung)
 
     return {
         "id": f"chatcmpl-direct-{uuid.uuid4().hex[:16]}",

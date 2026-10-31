@@ -372,8 +372,6 @@ _ATTRIBUTION_HEADERS = {
     # this header from the docker-internal subnet (see $bridge_origin_out),
     # so the inner request bills against the same budget domain as the job.
     "bridge_origin": "X-Bridge-Origin",
-    # Test-KI-Deckel: Laufkennung der App-Sperre (src/budget/test_ki_deckel.py).
-    "test_lauf": "X-Test-Lauf",
 }
 
 # Last-resort caller identity for self-calls whose triggering job carried NO

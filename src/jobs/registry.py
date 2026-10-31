@@ -420,19 +420,6 @@ async def _ausfuehren(
     confirmed it stopped the run on the owner's cancel (FK25B2). The
     executor's own exceptions propagate unchanged."""
     from src.jobs.selbstaufruf import JobLaufAbgebrochen
-    from src.budget.test_ki_deckel import job_lauf_pruefen
-
-    # Test-KI-Deckel (R4): vor JEDEM Executor, auch Erkunder (eigener Transport)
-    # und Jobs, die vor einer Schalter-/Listenaenderung gespeichert wurden.
-    _abweisung = job_lauf_pruefen(kind, attribution)
-    if _abweisung is not None:
-        from src.jobs.executors import ExecutorHTTPError
-
-        raise ExecutorHTTPError(
-            _abweisung.status_code,
-            f"{_abweisung.detail.get('code')}: {_abweisung.detail.get('message')}",
-            retryable=False, details={"fehler_code": _abweisung.detail.get("code")},
-        )
 
     if kind not in JOB_ABBRECHBAR_IM_LAUF or not (attribution or {}).get(EIGENTUEMER_KEY):
         return await executor(payload, attribution, report_progress)

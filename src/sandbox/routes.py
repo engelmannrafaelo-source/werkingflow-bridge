@@ -185,8 +185,7 @@ async def lease_token(
         # (all_exhausted / monthly_exceeded_no_topup / trial_expired); the
         # gate lets unlicensed users through so trial users reach the sandbox.
         # Fail-open on DB/infra errors (enforce_budget swallows them), except for a
-        # known hard-cap project (503 budget_unavailable). No single paying plan
-        # = 409 billing_plan_unresolved (was a 500 before BA6).
+        # known hard-cap project (503 budget_unavailable).
         await enforce_budget(str(uid), body.app, 0.0, project_id=body.projectId)
 
         # 4. Pick best account — S7 fair round-robin: pass recent lease counts

@@ -302,10 +302,6 @@ async def create_job_endpoint(
     """Dispatch a job and return immediately. The work runs off-request (here on
     the Bridge), so the caller never holds a long connection — poll GET /v1/jobs/{id}."""
     await verify_api_key(request, credentials)
-    # Test-KI-Deckel (R4): ein Testaufruf legt nur chat/ping an, chat nur mit
-    # gueltigem X-Test-Lauf; ein leerer/ungueltiger Kopf ist schon hier 403.
-    from src.budget.test_ki_deckel import job_anlegen_pruefen
-    _test_lauf = await job_anlegen_pruefen(request, body.kind)
     if body.kind == "erkunder":
         from pydantic import ValidationError
 
@@ -365,18 +361,6 @@ async def create_job_endpoint(
     attribution = {k: v for k, v in (attribution or {}).items() if k != EIGENTUEMER_KEY}
     if _attribution_extractor is not None:
         attribution[EIGENTUEMER_KEY] = _idempotency_owner(request)
-
-    # Test-KI-Deckel (src/budget/test_ki_deckel.py): der Selbstaufruf laeuft mit
-    # dem Worker-Schluessel. Der Prinzipal des ANLEGENDEN Aufrufs und dessen
-    # GEPRUEFTER X-Test-Lauf werden darum hier, serverseitig, mit dem Job
-    # gespeichert — nie aus dem Rumpf (ein mitgegebener Wert wird entfernt).
-    from src.budget.test_ki_deckel import JOB_LAUF_KEY, JOB_PRINZIPAL_KEY
-    attribution = {k: v for k, v in attribution.items() if k not in (JOB_PRINZIPAL_KEY, JOB_LAUF_KEY)}
-    _principal = getattr(request.state, "principal", None)
-    if _principal is not None and not getattr(_principal, "is_legacy", False):
-        attribution[JOB_PRINZIPAL_KEY] = _principal.name
-    if _test_lauf is not None:
-        attribution[JOB_LAUF_KEY] = _test_lauf
     attribution = attribution or None
 
     # Placement veto (Autobahn): the job EXECUTES on THIS worker (spawn below),

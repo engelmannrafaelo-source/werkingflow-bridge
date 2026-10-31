@@ -93,16 +93,7 @@ async def resolve_billing_plan(
         except AmbiguousProjectBudget as e:
             raise PlanResolutionError(str(e)) from e
         if allocated_id:
-            try:
-                plan = get_plan(allocated_id)
-            except ValueError as e:
-                # Allocated under a plan the catalog no longer carries (e.g.
-                # deactivated with live allocations): a data fault, not infra —
-                # nobody can bill this call (BA6; was fail-open via the gate).
-                raise PlanResolutionError(
-                    f"project_id={project_id!r} is allocated under plan {allocated_id!r}, "
-                    f"which is not in the active plan catalog."
-                ) from e
+            plan = get_plan(allocated_id)
             if plan.app_id != app_id or plan.interval != "project":
                 # The allocation is the proof of payment; if it points at a
                 # plan that cannot pay for this call, something wrote a row
