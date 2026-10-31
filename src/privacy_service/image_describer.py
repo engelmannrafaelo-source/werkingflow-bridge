@@ -17,13 +17,20 @@ Failure policy (defensive, no silent fail):
 - A completely missing ANTHROPIC_VISION_API_KEY (provider raises ValueError on
   the first call) PROPAGATES: the caller explicitly asked for descriptions and
   the service is misconfigured — fail loud, do not pretend it worked.
+- ``promotional_only`` (operator funding policy, e.g. werking-energy): a
+  ``HTTPException`` (credit pool 429/503 or a provider 4xx) ends the WHOLE call
+  with its status 1:1 instead of a per-image marker, and the remaining images
+  are cancelled. A marker in an HTTP-200 answer would be cached by the caller
+  as a complete document — the pool gap must be loud.
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
-from typing import Dict, Tuple
+from typing import Dict, List, Optional, Tuple
+
+from fastapi import HTTPException
 
 from src.vision_provider import get_vision_provider
 from src.model_registry import get_default_model
@@ -48,8 +55,26 @@ _USER_PROMPT = (
 )
 
 
+def record_vision_funding(funding_log: Optional[List[dict]], kind: str, resp) -> None:
+    """Append the honest per-call usage + credit-pool attestation of ``resp``.
+
+    Only used under ``promotional_only``; ``funding_log`` None = no-op.
+    """
+    if funding_log is None:
+        return
+    usage = getattr(resp, "usage", None) or {}
+    funding_log.append({
+        "kind": kind,
+        "model": getattr(resp, "model", None),
+        "input_tokens": int(usage.get("prompt_tokens", 0) or 0),
+        "output_tokens": int(usage.get("completion_tokens", 0) or 0),
+        "credit_meta": getattr(resp, "credit_meta", None),
+    })
+
+
 async def _describe_one(
-    provider, b64: str, model: str, context: str, describe_prompt: str = ""
+    provider, b64: str, model: str, context: str, describe_prompt: str = "",
+    funding_log: Optional[List[dict]] = None,
 ) -> str:
     # A caller-supplied describe_prompt REPLACES the app-neutral default system
     # prompt (per-app override). Without it, behaviour is byte-for-byte the
@@ -78,6 +103,7 @@ async def _describe_one(
         temperature=0.1,
         system_prompt=system_prompt,
     )
+    record_vision_funding(funding_log, "describe", resp)
     text = (resp.content or "").strip()
     if getattr(resp, "stop_reason", None) == "max_tokens":
         # Abgeschnittene Beschreibung geht als Text in den KI-Kontext des
@@ -94,6 +120,8 @@ async def describe_images(
     model: str = DEFAULT_VISION_MODEL,
     max_concurrency: int = 4,
     describe_prompt: str = "",
+    promotional_only: bool = False,
+    funding_log: Optional[List[dict]] = None,
 ) -> Dict[str, str]:
     """Return ``{filename: description}`` for every extracted image.
 
@@ -103,6 +131,9 @@ async def describe_images(
     ``describe_prompt`` is an optional per-app override for the system prompt.
     Empty (the default) keeps the app-neutral factual prompt, so existing
     callers are unaffected.
+
+    ``promotional_only``/``funding_log``: see module docstring. Both default
+    off, so callers without a funding policy behave exactly as before.
     """
     if not images:
         return {}
@@ -114,18 +145,32 @@ async def describe_images(
         async with sem:
             try:
                 return name, await _describe_one(
-                    provider, b64, model, context, describe_prompt
+                    provider, b64, model, context, describe_prompt, funding_log
                 )
             except ValueError:
                 # Misconfiguration (e.g. no ANTHROPIC_VISION_API_KEY) — surface loudly.
                 raise
             except Exception as e:  # per-image failure: visible, never silently dropped
+                if promotional_only and isinstance(e, HTTPException):
+                    # Pool leer/unerreichbar: ganzer Aufruf laut, Status 1:1.
+                    raise
                 logger.error(
                     f"[image_describer] Vision failed for {name}: {e}", exc_info=True
                 )
                 return name, f"_[Bildbeschreibung fehlgeschlagen: {e}]_"
 
-    pairs = await asyncio.gather(*(run(n, b) for n, b in images.items()))
+    if not promotional_only:
+        pairs = await asyncio.gather(*(run(n, b) for n, b in images.items()))
+        return dict(pairs)
+    tasks = [asyncio.ensure_future(run(n, b)) for n, b in images.items()]
+    try:
+        pairs = await asyncio.gather(*tasks)
+    except BaseException:
+        # Erster Abbruch beendet den Aufruf: keine weiteren Pool-Aufrufe.
+        for t in tasks:
+            t.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        raise
     return dict(pairs)
 
 
