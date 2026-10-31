@@ -10337,7 +10337,8 @@ async def convert_document_endpoint(
             except Exception:
                 _err_msg = None  # silent-ok: kaputter Body aendert nichts daran, dass Code+Status persistiert werden
         _vision_usage = getattr(request.state, "document_vision_usage", None)
-        if _status == "success" and _vision_usage:
+        # Nur eine echte Liste vom Privacy-Dienst zählt (sonst docling/0 wie bisher).
+        if _status == "success" and isinstance(_vision_usage, list) and _vision_usage:
             # Ehrliche Buchung der Bildaufrufe (promotional_only): je Modell die
             # Summen + Pool-Reservierungen statt "docling"/0 Tokens.
             _je_modell: Dict[str, Dict[str, Any]] = {}
