@@ -34,7 +34,7 @@ git fetch origin "$branch:refs/remotes/origin/$branch"
 target=$(git rev-parse "$1^{commit}")
 git merge-base --is-ancestor "$old_sha" "$target" || { echo 'Not a fast-forward'; exit 1; }
 # This release must not ship unrelated changes on the shared privacy host.
-unexpected=$(git diff --name-only "$old_sha" "$target" | grep -vE '^(src/privacy_service/app.py|src/privacy_service/image_describer.py|src/privacy_service/image_triage.py|src/vision_provider.py|src/providers/credit_pool.py|scripts/bridge-deploy.sh|scripts/gpu-privacy-deploy.sh)$' || true)
+unexpected=$(git diff --name-only "$old_sha" "$target" | grep -vE '^(src/privacy_service/app.py|src/vision_provider.py|src/providers/credit_pool.py|scripts/bridge-deploy.sh|scripts/gpu-privacy-deploy.sh)$' || true)
 [[ -z "$unexpected" ]] || { echo "Unexpected files: $unexpected"; exit 1; }
 git merge --ff-only "$target"
 override=$(mktemp /root/privacy-release-XXXXXX.yml)
