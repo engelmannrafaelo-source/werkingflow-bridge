@@ -50,7 +50,38 @@ async def _finish(reservation: str, **data: Any) -> None:
         log.error("Credit reservation %s remains charged at its upper bound", reservation)
 
 
-async def post_messages(body: dict, timeout: float) -> tuple[httpx.Response, dict]:
+class PinnedAccountLost(HTTPException):
+    """The account a run is pinned to can no longer serve it (409). Raised only
+    with ``pin``; never for a coordinator 409 or any other pool failure, so a
+    caller can tell "pinned account gone" apart from every other refusal."""
+
+    def __init__(self, detail: str):
+        super().__init__(409, detail)
+
+
+def _account_bound_400(response: httpx.Response) -> bool:
+    """A 400 that depends on the ACCOUNT, not on the request: blocks carrying
+    encrypted_content of another organisation, or an empty credit balance.
+    Every other 400 is the request itself and is the same on every account."""
+    if response.status_code != 400:
+        return False
+    text = response.text.lower()
+    return "encrypted_content" in text or "credit balance" in text
+
+
+async def post_messages(body: dict, timeout: float, pin: dict | None = None) -> tuple[httpx.Response, dict]:
+    """``pin``: Zustand EINES Laufs (leeres dict). Der erste erfolgreiche Aufruf
+    heftet das Konto an; jeder Folgeaufruf darf nur dieses Konto nehmen, weil
+    encrypted_content (web_search_tool_result) an Organisation/Schluessel des
+    erzeugenden Aufrufs gebunden ist. Ist das Konto nicht mehr verfuegbar oder
+    lehnt es ab: PinnedAccountLost (409), laut, kein Wechsel auf ein anderes Konto.
+
+    count_tokens mit ``pin``: Vor der Anheftung darf ein kontogebundener 400
+    (_account_bound_400) aufs naechste Konto gehen; es gibt noch keinen Block,
+    der an ein Konto gebunden waere. Nach der Anheftung ist jeder kontogebundene
+    400 des angehefteten Kontos ein laut gemeldeter PinnedAccountLost. Ohne
+    ``pin`` (Vision, Lueckenpruefung) bleibt alles wie bisher: der 400 geht
+    unveraendert zurueck."""
     if body.get("stream") or body.get("speed") or body.get("inference_geo") or body.get("container"):
         raise HTTPException(400, "Credit pool supports standard non-streaming text/vision requests")
     server_steps = 0
@@ -64,6 +95,12 @@ async def post_messages(body: dict, timeout: float) -> tuple[httpx.Response, dic
             raise HTTPException(400, "Server tools require max_uses between 1 and 3")
         server_steps += uses
     accounts = (await coordinator("GET", "/accounts"))["accounts"]
+    pinned = (pin or {}).get("account_id")
+    if pinned:
+        accounts = [a for a in accounts if a["id"] == pinned]
+        if not accounts:
+            raise PinnedAccountLost(f"pinned credit account {pinned} unavailable; encrypted_content of this run "
+                                    "is bound to it, no switch to another account")
     async with httpx.AsyncClient(timeout=timeout) as client:
         for account in accounts:
             headers = {"x-api-key": account["api_key"], "anthropic-version": VERSION}
@@ -75,6 +112,12 @@ async def post_messages(body: dict, timeout: float) -> tuple[httpx.Response, dic
             if count.status_code in (401, 403, 429):
                 continue
             if count.status_code != 200:
+                if pin is not None and _account_bound_400(count):
+                    if pinned:
+                        raise PinnedAccountLost(
+                            f"pinned credit account {pinned} rejected count_tokens (HTTP 400, account-bound: "
+                            "encrypted_content/credit balance); no switch to another account")
+                    continue
                 return count, {}
             tokens = count.json().get("input_tokens")
             if type(tokens) is not int or tokens < 0:
@@ -101,6 +144,8 @@ async def post_messages(body: dict, timeout: float) -> tuple[httpx.Response, dic
                     "credit_pool_grant": account["grant_id"], "credit_pool_reservation": reservation,
                     "funding_policy": "promotional_only", "automatic_paid_fallback": False}
             if response.status_code == 200:
+                if pin is not None:
+                    pin.setdefault("account_id", account["id"])
                 try:
                     usage = response.json()["usage"]
                 except (ValueError, KeyError, TypeError):
@@ -110,8 +155,15 @@ async def post_messages(body: dict, timeout: float) -> tuple[httpx.Response, dic
                 return response, meta
             if 400 <= response.status_code < 500:
                 await _finish(reservation, rejected=True)
+                if pinned and response.status_code == 400 and "encrypted_content" in response.text.lower():
+                    raise PinnedAccountLost(
+                        f"pinned credit account {pinned} rejected encrypted_content of its own run (HTTP 400); "
+                        "no switch to another account")
                 exhausted = response.status_code == 400 and "credit balance" in response.text.lower()
                 if exhausted or response.status_code in (401, 403, 429):
                     continue
             return response, meta
+    if pinned:
+        raise PinnedAccountLost(f"pinned credit account {pinned} refused (count/reserve/limit); no switch to "
+                                "another account because of encrypted_content")
     raise HTTPException(429, "No eligible Anthropic API credit budget available; paid fallback disabled")

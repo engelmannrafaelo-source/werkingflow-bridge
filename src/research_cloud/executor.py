@@ -172,6 +172,10 @@ class ResearchCloudExecutorError(Exception):
     # privacy_service_unreachable, anonymize_gate.privacy_urteil).
     fehler_code: Optional[str] = None
     retryable: Optional[bool] = None
+    # promotional_only: the credit account this run is pinned to is gone
+    # (credit_pool.PinnedAccountLost). Only this lets a failed return round
+    # keep the report from before on the pool path.
+    konto_angeheftet_verloren: bool = False
 
     def __init__(self, message: str, *, status_code: Optional[int] = None):
         super().__init__(message)
@@ -419,6 +423,7 @@ async def run_research_cloud(
     perplexity_client: Optional[httpx.AsyncClient] = None,
     fetch_document_kwargs: Optional[Dict[str, Any]] = None,
     nachkontrolle: Optional[Nachkontrolle] = None,
+    lauf_bezug: Optional[str] = None,
 ) -> ResearchCloudResult:
     """Run one research-cloud job to completion (all pause_turn continuations).
 
@@ -440,6 +445,9 @@ async def run_research_cloud(
     checked against this run's tool log; unsearched gaps with budget left get
     exactly ONE continuation of the same conversation. A failing return round
     keeps the report from before it (named in ``rueckrunde_fehler``).
+
+    ``lauf_bezug`` (optional): job/workflow reference, only for the log line
+    naming the credit account of each promotional_only Messages call.
     """
     config = config or ResearchCloudConfig()
     # Workers deliberately never carry ANTHROPIC_API_KEY — claude_cli.py
@@ -531,6 +539,7 @@ async def run_research_cloud(
     perplexity_cost_missing = 0
     doc_counters = DocumentCounters(max_uses=config.fetch_document_max_uses)
     container_id: Optional[str] = None
+    pool_pin: Dict[str, str] = {}  # promotional_only: Konto je Lauf anheften (encrypted_content)
     iteration = 0
     gesamt_iterationen = 0
     phase = "bericht"
@@ -572,13 +581,31 @@ async def run_research_cloud(
 
                         if config.promotional_only:
                             from fastapi import HTTPException
-                            from src.providers.credit_pool import post_messages
+                            from src.providers.credit_pool import PinnedAccountLost, post_messages
                             try:
-                                response, _ = await post_messages(body, config.http_timeout_seconds)
+                                response, pool_meta = await post_messages(
+                                    body, config.http_timeout_seconds, pin=pool_pin
+                                )
                             except HTTPException as exc:
-                                raise ResearchCloudExecutorError(
+                                logger.error(
+                                    f"research-cloud pool call refused: runde={phase} iteration={iteration} "
+                                    f"angeheftet={pool_pin.get('account_id')} status={exc.status_code} "
+                                    f"lauf={lauf_bezug}"
+                                )
+                                fehler = ResearchCloudExecutorError(
                                     f"promotional_only stopped: {exc.detail}", status_code=exc.status_code
-                                ) from exc
+                                )
+                                fehler.konto_angeheftet_verloren = isinstance(exc, PinnedAccountLost)
+                                raise fehler from exc
+                            # Only the account label of the coordinator manifest
+                            # (no key, no content) — evidence which account served
+                            # each round of this run.
+                            logger.info(
+                                f"research-cloud pool call: runde={phase} iteration={iteration} "
+                                f"konto={pool_meta.get('credit_pool_account')} "
+                                f"angeheftet={pool_pin.get('account_id')} status={response.status_code} "
+                                f"lauf={lauf_bezug}"
+                            )
                         else:
                             response = await http_client.post(ANTHROPIC_API_URL, headers=headers, json=body)
                         if response.status_code != 200:
@@ -786,7 +813,11 @@ async def run_research_cloud(
                     # run with its error — in the return round too; the report from
                     # before is not handed out as a success then.
                     sperre_pruefen(sperre, fehler_typ=ResearchCloudExecutorError)
-                    if config.promotional_only or phase != "rueckrunde":
+                    # promotional_only: nur ein verlorenes angeheftetes Konto
+                    # (PinnedAccountLost, nicht jeder 409 — auch der Koordinator
+                    # antwortet 409) darf den Bericht von vorher behalten, laut ueber
+                    # rueckrunde_fehler; andere Pool-Fehler stoppen weiter.
+                    if phase != "rueckrunde" or (config.promotional_only and not e.konto_angeheftet_verloren):
                         raise
                     # The return round failed otherwise: the report written before
                     # it is still a finished report — hand that out and say why.

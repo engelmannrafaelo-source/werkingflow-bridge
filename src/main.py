@@ -6857,6 +6857,20 @@ def _transient_error(message: str, retry_after_s: Optional[int] = None) -> Dict[
     }
 
 
+def _research_lauf_bezug(request: Request, attribution_ctx: Optional[Dict[str, Any]]) -> Optional[str]:
+    """Job id of the marked self-call and the caller's workflow id, for the
+    research-cloud log only (which credit account served which run)."""
+    from src.jobs.selbstaufruf import job_lauf
+    teile = []
+    job = job_lauf(request)
+    if job:
+        teile.append(f"job={job}")
+    workflow = (attribution_ctx or {}).get("workflow_id")
+    if workflow:
+        teile.append(f"workflow={workflow}")
+    return " ".join(teile) or None
+
+
 async def _execute_research_cloud_impl(
     request: Request,
     request_body: ResearchRequest,
@@ -7005,6 +7019,7 @@ async def _execute_research_cloud_impl(
             # the prompt above before it leaves for the third party.
             anonymize=lambda text: anonymize_query_for_cloud(request, text),
             nachkontrolle=nachkontrolle,
+            lauf_bezug=_research_lauf_bezug(request, attribution_ctx),
         )
     except ResearchCloudModelAbbruch as e:
         return await _cloud_modell_abbruch_antwort(

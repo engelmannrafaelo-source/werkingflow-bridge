@@ -56,7 +56,7 @@ async def test_research_uses_pool_each_round_not_legacy_or_perplexity(monkeypatc
     monkeypatch.setenv('ANTHROPIC_CREDIT_POOL_URL','http://pool')
     monkeypatch.delenv('RESEARCH_CLOUD_API_KEY',raising=False)
     calls=[]
-    async def post(body,timeout):
+    async def post(body,timeout,pin=None):
         calls.append(body)
         assert all(t['name']!='perplexity_search' for t in body['tools'])
         assert all('20260209' not in t.get('type','') for t in body['tools'])
