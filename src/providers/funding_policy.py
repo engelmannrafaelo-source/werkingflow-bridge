@@ -21,6 +21,18 @@ Without either, the strict promotional_only behaviour is unchanged. A prod
 bridge (``BRIDGE_ORIGIN_ID=prod``) stays strict even if the switch were set by
 mistake.
 
+On top, the REQUEST must belong to this bridge (ADR-0011 origin, set by
+federation.OriginMiddleware from the LB-stamped ``X-Bridge-Origin``). The prod
+upstreams carry the dev bridge as backup (docker/upstreams-prod.conf; nginx
+retries 503/429 there): a prod Energy call that lands on a dev worker arrives
+with origin ``prod`` and is billed on prod (ADR-0011) — it must never run on
+the dev subscription, so it stays strict. nginx resets every untrusted
+sender's origin to its own ``${BRIDGE_ID}`` (``$bridge_origin_out``), so a
+Railway staging backend or an external caller of the dev bridge reaches the
+worker as origin ``dev``. A request without any origin never passed the LB
+(direct worker call) and counts as own, the same rule as
+federation.is_foreign_origin().
+
 Visible markers (kept small; a later "Finanzierungsquelle" branch may extend
 them):
 
@@ -72,12 +84,19 @@ def require_pool():
 
 
 def staging_subscription_fallback_allowed() -> bool:
-    """True only on a bridge that names itself as an allowed non-prod bridge
-    AND has the operator switch on. Never derived from the request."""
+    """True only on a bridge that names itself as an allowed non-prod bridge,
+    has the operator switch on, AND serves a request of its own origin (not a
+    peer bridge's request relayed here, see module doc). The switch and the
+    identity come from the worker environment; the origin is the LB-stamped
+    ADR-0011 value, never a raw client header."""
     if (os.getenv(FALLBACK_SWITCH_ENV) or "").strip().lower() not in _TRUTHY:
         return False
-    from src.federation import self_origin_id
-    return self_origin_id().strip().lower() in SUBSCRIPTION_FALLBACK_BRIDGES
+    from src.federation import get_request_origin, self_origin_id
+    own = self_origin_id().strip().lower()
+    if own not in SUBSCRIPTION_FALLBACK_BRIDGES:
+        return False
+    origin = get_request_origin()
+    return origin is None or origin == own
 
 
 def fallback_cause(request) -> Optional[str]:

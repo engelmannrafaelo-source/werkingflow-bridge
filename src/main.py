@@ -2780,6 +2780,13 @@ async def _run_api_reserve_fallback(request_body, request, *, cause):
     This internal state flag is not accepted from a client header/body.
     """
     from src.providers.credit_pool import enabled
+    from src.providers.funding_policy import subscription_fallback_active
+    if subscription_fallback_active(request):
+        # Staging subscription fallback: the pool already could not fund this
+        # call — no second pool attempt, and a pool-funded answer must not be
+        # marked as subscription-served.
+        raise HTTPException(429, "subscription_staging_fallback: API reserve not retried after the credit "
+                                 "pool failed; no paid fallback")
     if (not enabled() or request_body.enable_tools or request_body.session_id
             or getattr(request.state, "api_reserve_retry", False)):
         raise HTTPException(429, "API reserve cannot serve this request; no paid fallback")
@@ -3501,7 +3508,7 @@ async def _chat_completions_lauf(
         # M3, 10.10.2026). Der Pin selbst bleibt unangetastet: er traegt die
         # vertragliche EU-Datenresidenz eines echten Kunden, dessen Daten
         # gehoeren erst recht nicht zu Google.
-        if _subscription_fallback and not _reserve_retry and (
+        if _subscription_fallback and (
                 backend_config is None or backend_config.backend != BackendType.ANTHROPIC
                 or operator_pinned_provider not in (None, "anthropic")):
             # Staging subscription fallback: only the CLI subscription may
