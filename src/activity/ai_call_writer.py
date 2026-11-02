@@ -455,6 +455,14 @@ async def persist_ai_call_activity(
     # a cancelled request task or an OOM-kill — can lose the fact that this
     # call happened.
     replaying = _call_uid is not None
+    if not replaying:
+        # Funding marker of the live request (funding_policy, e.g. the Energy
+        # staging subscription fallback). Explicit per-call meta wins; the
+        # spool record carries the merged dict, so a replay keeps it.
+        from src.providers.funding_policy import ledger_marker
+        _marker = ledger_marker()
+        if _marker:
+            provider_meta = {**_marker, **(provider_meta or {})}
     call_uid = _call_uid or ledger_spool.new_call_uid()
     call_ts = _call_ts if _call_ts is not None else time.time()
 

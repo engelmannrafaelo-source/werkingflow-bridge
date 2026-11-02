@@ -2750,7 +2750,7 @@ async def chat_completions(
 
         return await unter_job_aufsicht(
             request,
-            _chat_completions_lauf(request_body, request, credentials, _adaptive),
+            _chat_completions_finanziert(request_body, request, credentials, _adaptive),
             attribution=extract_attribution_context(request),
             model=request_body.model,
             endpunkt="/v1/chat/completions",
@@ -2764,7 +2764,7 @@ async def chat_completions(
         return _cw.frist_zu_kurz_error(rest)
     try:
         return await _cw.unter_aufsicht(
-            _chat_completions_lauf(request_body, request, credentials, _adaptive), bis
+            _chat_completions_finanziert(request_body, request, credentials, _adaptive), bis
         )
     except _cw.FristAbgelaufen:
         return _cw.frist_abgelaufen_error(bis)
@@ -2780,6 +2780,13 @@ async def _run_api_reserve_fallback(request_body, request, *, cause):
     This internal state flag is not accepted from a client header/body.
     """
     from src.providers.credit_pool import enabled
+    from src.providers.funding_policy import subscription_fallback_active
+    if subscription_fallback_active(request):
+        # Staging subscription fallback: the pool already could not fund this
+        # call — no second pool attempt, and a pool-funded answer must not be
+        # marked as subscription-served.
+        raise HTTPException(429, "subscription_staging_fallback: API reserve not retried after the credit "
+                                 "pool failed; no paid fallback")
     if (not enabled() or request_body.enable_tools or request_body.session_id
             or getattr(request.state, "api_reserve_retry", False)):
         raise HTTPException(429, "API reserve cannot serve this request; no paid fallback")
@@ -2797,13 +2804,56 @@ async def _run_api_reserve_fallback(request_body, request, *, cause):
         request.state.api_reserve_retry = False
 
 
+async def _chat_completions_finanziert(
+    request_body: ChatCompletionRequest,
+    request: Request,
+    credentials: Optional[HTTPAuthorizationCredentials],
+    _adaptive=None,
+):
+    """The chat call with its funding decision (see chat_completions).
+
+    Funding (src/providers/funding_policy.py): an Energy call is pool-funded
+    (promotional_only). Only on a bridge that allows the staging subscription
+    fallback, a pool that is missing or cannot fund the call
+    (credit_pool.PoolUnavailable, raised before any Messages request) hands
+    the UNCHANGED original request to the normal subscription path — same
+    authentication, budget gate and pool admission/limiter as any other app.
+    Never a paid route: the subscription run refuses every non-CLI backend.
+    """
+    from src.providers import funding_policy as _fp
+    if not _fp.fallback_eligible(request):
+        result = await _chat_completions_lauf(request_body, request, credentials, _adaptive)
+        return _fp.mark_chat_response(request, result)
+    from src.providers.credit_pool import PoolUnavailable, enabled as _pool_enabled
+    if not _pool_enabled():
+        _fp.activate_subscription_fallback(request, _fp.CAUSE_POOL_MISSING)
+        logger.warning("💳 werking-energy: credit pool not configured — staging subscription fallback")
+        result = await _chat_completions_lauf(request_body, request, credentials, _adaptive)
+        return _fp.mark_chat_response(request, result)
+    original = request_body.model_copy(deep=True)
+    try:
+        result = await _chat_completions_lauf(request_body, request, credentials, _adaptive)
+        return _fp.mark_chat_response(request, result)
+    except PoolUnavailable as exc:
+        logger.warning(
+            f"💳 werking-energy: credit pool cannot fund the call ({exc.status_code}: {exc.detail}) "
+            "— staging subscription fallback, no paid route"
+        )
+    # Reset what the pool attempt left on the request; the rerun starts clean.
+    request.state.api_reserve_retry = False
+    request.state.ai_call_error_persisted = False
+    _fp.activate_subscription_fallback(request, _fp.CAUSE_POOL_UNAVAILABLE)
+    result = await _chat_completions_lauf(original, request, credentials, _adaptive)
+    return _fp.mark_chat_response(request, result)
+
+
 async def _chat_completions_lauf(
     request_body: ChatCompletionRequest,
     request: Request,
     credentials: Optional[HTTPAuthorizationCredentials],
     _adaptive=None,
 ):
-    """The chat call itself (see chat_completions)."""
+    """The chat call itself, one run (funding: _chat_completions_finanziert)."""
     import time
     from fastapi.responses import JSONResponse
     from src.middleware.adaptive_limiter import is_gemini_vision_request
@@ -2811,8 +2861,22 @@ async def _chat_completions_lauf(
 
     # Gemini-Bildweg (provider_tier="gemini-vision"): keine Pool-Zulassung
     # gegen das Claude-Abo; jeder andere Aufruf wird wie bisher zugelassen.
-    from src.providers.funding_policy import promotional_only, require_pool
-    _free_only = promotional_only(request)
+    from src.providers.funding_policy import promotional_only, require_pool, subscription_fallback_active
+    _subscription_fallback = subscription_fallback_active(request)
+    _free_only = promotional_only(request) and not _subscription_fallback
+    if _subscription_fallback:
+        # Staging subscription fallback (funding_policy): the same request
+        # shape the pool path accepts, served by the CLI subscription. Images
+        # have no subscription path (vision is API-only → paid), a foreign
+        # tier would be a paid provider: both refused, never rerouted.
+        if (request_body.provider_tier not in (None, "claude-direct-notools")
+                or request_body.enable_tools or request_body.session_id):
+            raise HTTPException(409, "subscription_staging_fallback: incompatible route/tools/session; "
+                                     "no paid fallback")
+        if has_vision_content(prepare_messages_for_vision(request_body.messages)):
+            raise HTTPException(409, "subscription_staging_fallback: images need the credit pool "
+                                     "(no subscription vision path); no paid fallback")
+        request_body.provider_tier = None
     if _free_only:
         require_pool()
         # Deliberately reject old Gemini callers until they adopt the new
@@ -3322,6 +3386,10 @@ async def _chat_completions_lauf(
             user_pinned_provider is None
             or (_provider_from_app_rule and user_pinned_provider == "anthropic")
         )
+        if _subscription_fallback:
+            # The direct way books on the API key (paid without the pool):
+            # the staging subscription fallback stays on the CLI subscription.
+            _text_rule_allowed = False
         if _text_rule_allowed and not request_body.provider_tier:
             from src.routing.text_direct_routing import (
                 TextDirectRoutingError, apply_text_direct_routing,
@@ -3440,6 +3508,16 @@ async def _chat_completions_lauf(
         # M3, 10.10.2026). Der Pin selbst bleibt unangetastet: er traegt die
         # vertragliche EU-Datenresidenz eines echten Kunden, dessen Daten
         # gehoeren erst recht nicht zu Google.
+        if _subscription_fallback and (
+                backend_config is None or backend_config.backend != BackendType.ANTHROPIC
+                or operator_pinned_provider not in (None, "anthropic")):
+            # Staging subscription fallback: only the CLI subscription may
+            # serve it. Any pin, app rule or tier that resolves elsewhere
+            # (direct API key, Bedrock, Gemini, OpenAI-compatible) would be a
+            # paid route — refused loudly, never weakened.
+            raise HTTPException(409, "subscription_staging_fallback conflicts with request routing "
+                                     f"(backend={getattr(backend_config, 'backend', None)!r}, "
+                                     f"pin={operator_pinned_provider!r}); no paid fallback")
         if _reserve_retry:
             # App rules may clear an incoming direct tier. Only the unpinned
             # Anthropic path may be converted back to the promotional reserve.
@@ -6092,6 +6170,11 @@ async def _execute_research_impl(
         pool_doc = None
         pool_sdk_mcp_servers = None
         _pplx_cfg = load_perplexity_config()
+        from src.providers.funding_policy import subscription_fallback_active as _fallback_active
+        if _fallback_active(request):
+            # Staging subscription fallback: Perplexity is a paid third-party
+            # API — never offered on this run (same rule as promotional_only).
+            _pplx_cfg = _pplx_cfg.model_copy(update={"enabled": False, "api_key": None})
         if perplexity_enabled(_pplx_cfg):
             try:
                 check_perplexity_usable(_pplx_cfg)
@@ -7028,6 +7111,16 @@ async def _execute_research_cloud_impl(
     except ResearchCloudExecutorError as e:
         execution_time = time.time() - start_time
         logger.error(f"research-cloud: executor failed: {e}", exc_info=True)
+        if free_only and getattr(e, "pool_unavailable", False):
+            from src.providers.funding_policy import fallback_eligible
+            if fallback_eligible(request):
+                # The failed pool attempt is still booked below as an error row
+                # (real cost 0); the caller then reruns on the subscription.
+                _research_fallback_pending = True
+            else:
+                _research_fallback_pending = False
+        else:
+            _research_fallback_pending = False
         try:
             from src.activity.ai_call_writer import persist_ai_call_activity
             await persist_ai_call_activity(
@@ -7049,6 +7142,8 @@ async def _execute_research_cloud_impl(
             )
         except Exception as _track_err:
             logger.warning(f"research-cloud error activity tracking failed (non-fatal): {_track_err}")
+        if _research_fallback_pending:
+            raise _ResearchPoolUnavailable(str(e)) from e
         from src.research_cloud.executor import TRANSIENT_HTTP_STATUSES
         error_message = str(e)
         if e.fehler_code is not None:
@@ -7336,6 +7431,87 @@ RESEARCH_MIN_INLINE_REPORT_CHARS = 500
 _RESEARCH_CLOUD_MAX_ATTEMPTS = 2
 
 
+class _ResearchPoolUnavailable(Exception):
+    """Internal: the credit pool could not fund a promotional research round
+    on a bridge that allows the staging subscription fallback. Never leaves
+    _execute_research_cloud_with_pool_fallback."""
+
+
+def _research_subscription_route(request_body: ResearchRequest) -> None:
+    """Point a research request at the CLI subscription backend."""
+    request_body.backend = BackendType.ANTHROPIC
+    request_body.bedrock_region = None
+
+
+def _research_subscription_gate(request, backend_config, request_body) -> Optional[ResearchResponse]:
+    """Under the staging subscription fallback only the CLI subscription may
+    serve the run; anything else would be a paid route → loud refusal."""
+    from src.providers.funding_policy import subscription_fallback_active
+    if not subscription_fallback_active(request):
+        return None
+    if backend_config is not None and backend_config.backend == BackendType.ANTHROPIC:
+        return None
+    return ResearchResponse(
+        status="error", query=request_body.query, model=request_body.model,
+        error=("subscription_staging_fallback: research resolved to backend "
+               f"{getattr(backend_config, 'backend', None)!r}; only the CLI subscription "
+               "may serve it — no paid fallback"),
+        funding_policy="subscription_staging_fallback",
+    )
+
+
+async def _research_mit_finanzierungsvermerk(request, lauf):
+    """Stamp funding_policy on a pool-path research result (Energy only)."""
+    result = await lauf
+    from src.providers.funding_policy import current_policy
+    policy = current_policy(request)
+    if policy is not None and isinstance(result, ResearchResponse):
+        result.funding_policy = policy
+    return result
+
+
+async def _research_subscription_fallback(
+    request: Optional[Request],
+    request_body: ResearchRequest,
+    attribution_ctx: Optional[Dict[str, Any]] = None,
+    grund: str = "",
+) -> ResearchResponse:
+    """Rerun a promotional research the pool could not fund on the normal
+    subscription research path: same pool admission/limiter as every other
+    app (no free account → retryable error, no bypass), CLI backend only."""
+    from src.providers import funding_policy as _fp
+    _fp.activate_subscription_fallback(request, _fp.CAUSE_POOL_UNAVAILABLE)
+    logger.warning(f"💳 werking-energy research: credit pool cannot fund the run ({grund}) "
+                   "— staging subscription fallback, no paid route")
+    worker_id = os.getenv("INSTANCE_NAME", "unknown")
+    reject = await _admit_research_to_pool(request, worker_id)
+    if reject is not None:
+        return ResearchResponse(
+            status="error", query=request_body.query, model=request_body.model,
+            funding_policy=_fp.SUBSCRIPTION_STAGING_FALLBACK,
+            **_transient_error("credit pool cannot fund the run and the subscription pool has "
+                               "no free capacity right now; no paid fallback"),
+        )
+    _research_subscription_route(request_body)
+    try:
+        backend_config = resolve_backend_config(
+            backend=BackendType.ANTHROPIC, model=request_body.model,
+            privacy=request_body.privacy or PrivacyMode.AUTO, bedrock_region=None,
+        )
+    except RuntimeError as e:
+        return ResearchResponse(status="error", query=request_body.query, model=request_body.model,
+                                error=str(e), funding_policy=_fp.SUBSCRIPTION_STAGING_FALLBACK)
+    refusal = _research_subscription_gate(request, backend_config, request_body)
+    if refusal is not None:
+        return refusal
+    if request is not None:
+        from src.jobs.selbstaufruf import ledger_provider_merken
+        ledger_provider_merken(request, ledger_provider_for_backend(backend_config.backend))
+    return await _research_mit_finanzierungsvermerk(request, _execute_research_impl(
+        request_body, backend_config, attribution_ctx=attribution_ctx, request=request
+    ))
+
+
 async def _execute_research_cloud_with_pool_fallback(
     request: Optional[Request],
     request_body: ResearchRequest,
@@ -7359,9 +7535,16 @@ async def _execute_research_cloud_with_pool_fallback(
     """
     result: Optional[ResearchResponse] = None
     for attempt in range(1, _RESEARCH_CLOUD_MAX_ATTEMPTS + 1):
-        result = await _execute_research_cloud_impl(
-            request, request_body, attribution_ctx=attribution_ctx
-        )
+        try:
+            result = await _execute_research_cloud_impl(
+                request, request_body, attribution_ctx=attribution_ctx
+            )
+        except _ResearchPoolUnavailable as e:
+            # Only raised on a bridge that allows the staging subscription
+            # fallback (funding_policy): the pool could not fund a round.
+            return await _research_subscription_fallback(
+                request, request_body, attribution_ctx=attribution_ctx, grund=str(e)
+            )
         from src.providers.funding_policy import promotional_only
         if promotional_only(request):
             result.funding_policy = "promotional_only"
@@ -7423,9 +7606,9 @@ async def _run_async_research_job(
                 request, request_body, attribution_ctx=attribution_ctx
             )
         else:
-            result = await _execute_research_impl(
+            result = await _research_mit_finanzierungsvermerk(request, _execute_research_impl(
                 request_body, backend_config, attribution_ctx=attribution_ctx, request=request
-            )
+            ))
         _save_research_job(job_id, {
             "status": "done" if result.status == "success" else "error",
             "started_at": started_at,
@@ -7706,12 +7889,22 @@ async def research(
         )
 
     _use_research_cloud = False
+    from src.providers import funding_policy as _fp
     from src.providers.funding_policy import promotional_only, require_pool
+    from src.providers.credit_pool import enabled as _research_pool_enabled
     if promotional_only(request):
-        require_pool()
         if _research_operator_pinned not in (None, "anthropic"):
             raise HTTPException(409, "promotional_only conflicts with operator pin; no paid fallback")
-        _use_research_cloud = True
+        if not _research_pool_enabled() and _fp.fallback_eligible(request):
+            # Staging subscription fallback (funding_policy): no pool → the
+            # normal subscription research path (CLI, pool admission below).
+            _fp.activate_subscription_fallback(request, _fp.CAUSE_POOL_MISSING)
+            _research_subscription_route(request_body)
+            logger.warning("💳 werking-energy research: credit pool not configured — "
+                           "staging subscription fallback")
+        else:
+            require_pool()
+            _use_research_cloud = True
     elif _research_pinned == "bedrock":
         # RESEARCH EXCEPTION TO THE GLOBAL BEDROCK PIN (Rafael 2026-07-27):
         # research cannot run on Bedrock at all — WebSearch is not available
@@ -7883,6 +8076,9 @@ async def research(
                 model=request_body.model,
                 error=str(e)
             )
+        _research_fallback_refusal = _research_subscription_gate(request, backend_config, request_body)
+        if _research_fallback_refusal is not None:
+            return _research_fallback_refusal
 
         # BEDROCK-GATE: wie bei chat completions — Bedrock nur per Operator-Pin.
         _research_bedrock_attr = extract_attribution_context(request)
@@ -7984,9 +8180,9 @@ async def research(
         )
     else:
         ledger_provider_merken(request, ledger_provider_for_backend(backend_config.backend))
-        lauf = _execute_research_impl(
+        lauf = _research_mit_finanzierungsvermerk(request, _execute_research_impl(
             request_body, backend_config, attribution_ctx=_research_attr, request=request
-        )
+        ))
     return await unter_job_aufsicht(
         request, lauf, attribution=_research_attr,
         model=request_body.model, endpunkt="/v1/research",

@@ -176,6 +176,11 @@ class ResearchCloudExecutorError(Exception):
     # (credit_pool.PinnedAccountLost). Only this lets a failed return round
     # keep the report from before on the pool path.
     konto_angeheftet_verloren: bool = False
+    # promotional_only: the pool as a whole could not fund a round
+    # (credit_pool.PoolUnavailable, nothing sent) BEFORE any account was
+    # pinned. Only the staging subscription fallback (funding_policy) acts on
+    # it; after the pin a PoolUnavailable counts as konto_angeheftet_verloren.
+    pool_unavailable: bool = False
 
     def __init__(self, message: str, *, status_code: Optional[int] = None):
         super().__init__(message)
@@ -581,7 +586,7 @@ async def run_research_cloud(
 
                         if config.promotional_only:
                             from fastapi import HTTPException
-                            from src.providers.credit_pool import PinnedAccountLost, post_messages
+                            from src.providers.credit_pool import PinnedAccountLost, PoolUnavailable, post_messages
                             try:
                                 response, pool_meta = await post_messages(
                                     body, config.http_timeout_seconds, pin=pool_pin
@@ -595,7 +600,17 @@ async def run_research_cloud(
                                 fehler = ResearchCloudExecutorError(
                                     f"promotional_only stopped: {exc.detail}", status_code=exc.status_code
                                 )
-                                fehler.konto_angeheftet_verloren = isinstance(exc, PinnedAccountLost)
+                                # Once a round ran on a pinned account, the run's
+                                # content is bound to it: a coordinator failure now
+                                # (GET /accounts precedes every round) is a lost
+                                # pinned account — loud, the report from before
+                                # stays — never "pool cannot pay" → a rerun on the
+                                # subscription would run the whole research twice.
+                                angeheftet = bool(pool_pin.get("account_id"))
+                                fehler.konto_angeheftet_verloren = isinstance(exc, PinnedAccountLost) or (
+                                    angeheftet and isinstance(exc, PoolUnavailable)
+                                )
+                                fehler.pool_unavailable = isinstance(exc, PoolUnavailable) and not angeheftet
                                 raise fehler from exc
                             # Only the account label of the coordinator manifest
                             # (no key, no content) — evidence which account served
