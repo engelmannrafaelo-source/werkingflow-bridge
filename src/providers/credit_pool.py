@@ -3,9 +3,19 @@
 Never exported as ANTHROPIC_API_KEY: the CLI subscription path stays separate.
 Only non-streaming, tool-free Messages requests are supported here. A lost
 response keeps its full reservation; no speculative release or paid fallback.
+
+Reservation outcome (KD, 02.11.2026):
+- provably NOT sent to Anthropic (failure/cancel before the Messages post, or
+  a connect/pool error that precedes every request byte) -> released
+  (settle rejected=True);
+- sent, outcome unknown (cancel/transport error during the post, 5xx, paid
+  200 with unreadable usage) -> stays reserved at its upper bound AND is
+  marked ``outcome=unknown`` via ``/unknown`` so status endpoints show it.
+  Never silently released: Anthropic may have billed it.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import uuid
@@ -17,6 +27,11 @@ from fastapi import HTTPException
 log = logging.getLogger(__name__)
 API = "https://api.anthropic.com/v1/messages"
 VERSION = "2023-06-01"
+# Raised before any request byte left this process: no connection was ever
+# obtained (pool wait) or established (TCP/TLS). Everything else after the
+# post started may have reached Anthropic and is treated as outcome unknown.
+NOT_SENT_ERRORS = (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout)
+_background: set[asyncio.Task] = set()
 
 
 def enabled() -> bool:
@@ -56,7 +71,44 @@ async def _finish(reservation: str, **data: Any) -> None:
     except Exception:
         # A conservative pending debit survives process/network loss. Never
         # discard a paid successful response just because accounting is down.
-        log.error("Credit reservation %s remains charged at its upper bound", reservation)
+        # The coordinator client maps 404 to 503, so the cause is not known here.
+        if data.get("rejected"):
+            log.error("Credit reservation %s: release not confirmed (coordinator unavailable, or the "
+                      "reservation was never committed); if it was committed it stays reserved at its "
+                      "upper bound and shows up as hanging", reservation)
+        else:
+            log.error("Credit reservation %s: settlement not stored; remains charged at its upper bound",
+                      reservation)
+
+
+async def _survive_cancel(coro) -> None:
+    """Run ledger bookkeeping to completion even while the caller is being
+    cancelled. A cancellation of the caller while waiting here is re-raised
+    (never swallowed: a cancelled call must not continue with the next account
+    or return a response normally); the shielded task keeps running in the
+    background until the bookkeeping is done."""
+    task = asyncio.ensure_future(coro)
+    _background.add(task)
+    task.add_done_callback(_background.discard)
+    await asyncio.shield(task)
+
+
+async def _release_unsent(reservation: str) -> None:
+    # Nothing reached Anthropic: free the budget. If /reserve itself never
+    # committed, the coordinator answers 404 and _finish only logs.
+    await _survive_cancel(_finish(reservation, rejected=True))
+
+
+async def _mark_unknown(reservation: str, reason: str) -> None:
+    async def mark():
+        try:
+            await coordinator("POST", "/unknown", {"id": reservation, "reason": reason})
+        except Exception:
+            log.error("Credit reservation %s: outcome unknown (%s), marker not stored; "
+                      "remains charged at its upper bound", reservation, reason)
+    log.warning("Credit reservation %s: request may have reached Anthropic (%s); "
+                "retained at upper bound, marked outcome unknown", reservation, reason)
+    await _survive_cancel(mark())
 
 
 class PinnedAccountLost(HTTPException):
@@ -145,10 +197,28 @@ async def post_messages(body: dict, timeout: float, pin: dict | None = None) -> 
             except HTTPException as exc:
                 if exc.status_code in (409, 429):
                     continue
+                # A coordinator timeout may still have committed the row.
+                await _release_unsent(reservation)
+                raise
+            except asyncio.CancelledError:
+                await _release_unsent(reservation)
                 raise
             # No retry after a transport failure or 5xx: it may already have
             # generated a paid answer. Keep the reservation, fail visibly.
-            response = await client.post(API, headers=headers, json=body)
+            try:
+                response = await client.post(API, headers=headers, json=body)
+            except NOT_SENT_ERRORS:
+                await _release_unsent(reservation)
+                raise
+            except asyncio.CancelledError:
+                await _mark_unknown(reservation, "cancelled")
+                raise
+            except httpx.HTTPError:
+                await _mark_unknown(reservation, "transport_error")
+                raise
+            except Exception:
+                await _mark_unknown(reservation, "error")
+                raise
             meta = {"credit_pool_account": account["id"], "credit_pool_org": account["org_id"],
                     "credit_pool_grant": account["grant_id"], "credit_pool_reservation": reservation,
                     "funding_policy": "promotional_only", "automatic_paid_fallback": False}
@@ -159,11 +229,12 @@ async def post_messages(body: dict, timeout: float, pin: dict | None = None) -> 
                     usage = response.json()["usage"]
                 except (ValueError, KeyError, TypeError):
                     log.error("Credit reservation %s: unreadable paid response; retained", reservation)
+                    await _mark_unknown(reservation, "unreadable_usage")
                 else:
-                    await _finish(reservation, usage=usage)
+                    await _survive_cancel(_finish(reservation, usage=usage))
                 return response, meta
             if 400 <= response.status_code < 500:
-                await _finish(reservation, rejected=True)
+                await _survive_cancel(_finish(reservation, rejected=True))
                 if pinned and response.status_code == 400 and "encrypted_content" in response.text.lower():
                     raise PinnedAccountLost(
                         f"pinned credit account {pinned} rejected encrypted_content of its own run (HTTP 400); "
@@ -171,6 +242,8 @@ async def post_messages(body: dict, timeout: float, pin: dict | None = None) -> 
                 exhausted = response.status_code == 400 and "credit balance" in response.text.lower()
                 if exhausted or response.status_code in (401, 403, 429):
                     continue
+            else:
+                await _mark_unknown(reservation, "http_status")
             return response, meta
     if pinned:
         raise PinnedAccountLost(f"pinned credit account {pinned} refused (count/reserve/limit); no switch to "

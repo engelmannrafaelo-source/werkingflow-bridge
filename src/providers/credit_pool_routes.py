@@ -11,6 +11,7 @@ import os
 from datetime import datetime, timezone, timedelta
 from decimal import Decimal, ROUND_CEILING
 from pathlib import Path
+from typing import Literal
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, Header, HTTPException
@@ -20,6 +21,9 @@ from src.db.client import get_pool
 from src.pricing import price_entry
 
 router = APIRouter(prefix="/v1/internal/api-credit-pool", tags=["internal"])
+# Longer than any single pool request may legitimately run (research-cloud
+# read timeout 900 s). A reservation still 'reserved' after this is hanging.
+HANGING_AFTER = timedelta(hours=1)
 
 
 def authenticate(x_credit_pool_token: str | None = Header(default=None)) -> None:
@@ -182,6 +186,52 @@ async def settle(body: Settle):
     return {"id": str(body.id), "state": state}
 
 
+class Unknown(BaseModel):
+    id: UUID
+    reason: Literal["cancelled", "transport_error", "http_status", "unreadable_usage", "error"]
+
+
+@router.post("/unknown", dependencies=[Depends(authenticate)])
+async def unknown(body: Unknown):
+    """The request may have reached Anthropic and been billed. Keep the full
+    upper-bound debit (state stays 'reserved', still deducted by available())
+    and mark it in the existing ``usage`` JSONB so it is visible; no schema
+    change. A later /settle with usage or rejected=True still finishes it."""
+    async with get_pool().acquire() as conn, conn.transaction():
+        row = await conn.fetchrow("SELECT state FROM anthropic_credit_reservations WHERE id=$1 FOR UPDATE", body.id)
+        if not row:
+            raise HTTPException(404, "Unknown reservation")
+        if row["state"] != "reserved":
+            return {"id": str(body.id), "state": row["state"]}
+        await conn.execute("""UPDATE anthropic_credit_reservations SET usage=jsonb_build_object(
+            'outcome','unknown','reason',$2::text,'marked_at',now()) WHERE id=$1""", body.id, body.reason)
+    return {"id": str(body.id), "state": "reserved", "outcome": "unknown"}
+
+
+async def hanging(conn, grant_ids: list[str]) -> dict:
+    """Aggregate only: counts, sums and ages. No reservation IDs, accounts or
+    grants leave this function, so it is safe for /summary and metrics."""
+    row = await conn.fetchrow("""SELECT
+        count(*) FILTER (WHERE state='reserved') AS reserved,
+        min(created_at) FILTER (WHERE state='reserved') AS oldest,
+        count(*) FILTER (WHERE state='reserved' AND created_at < now() - $2::interval) AS hanging,
+        COALESCE(sum(charged_usd) FILTER (WHERE state='reserved' AND created_at < now() - $2::interval),0) AS hanging_usd,
+        count(*) FILTER (WHERE state='reserved' AND usage->>'outcome'='unknown') AS unknown,
+        COALESCE(sum(charged_usd) FILTER (WHERE state='reserved' AND usage->>'outcome'='unknown'),0) AS unknown_usd,
+        now() AS now
+        FROM anthropic_credit_reservations WHERE grant_id = ANY($1::text[])""", grant_ids, HANGING_AFTER)
+    oldest = row["oldest"]
+    return {
+        "reserved_count": row["reserved"],
+        "oldest_reserved_age_s": int((row["now"] - oldest).total_seconds()) if oldest else None,
+        "hanging_reserved_count": row["hanging"],
+        "hanging_reserved_usd": float(row["hanging_usd"]),
+        "hanging_after_s": int(HANGING_AFTER.total_seconds()),
+        "unknown_outcome_count": row["unknown"],
+        "unknown_outcome_usd": float(row["unknown_usd"]),
+    }
+
+
 @router.get("/status", dependencies=[Depends(authenticate)])
 async def status():
     result = []
@@ -192,7 +242,8 @@ async def status():
                 COALESCE(sum(charged_usd),0) AS charged FROM anthropic_credit_reservations WHERE grant_id=$1""", a["grant_id"])
             result.append({"account": a["id"], "org_id": a["org_id"], "grant_id": a["grant_id"],
                            "expires_at": a["expires_at"], "available_usd": float(max(Decimal(0), await available(conn, a))),
-                           "requests": row["requests"], "pending": row["pending"], "charged_usd": float(row["charged"])})
+                           "requests": row["requests"], "pending": row["pending"], "charged_usd": float(row["charged"]),
+                           **await hanging(conn, [a["grant_id"]])})
     return {"accounts": result, "paid_fallback": False}
 
 
@@ -202,6 +253,14 @@ async def summary():
 
     No account identities, organization IDs, cookies or keys leave this route.
     Expired/stale observations do not contribute spendable money.
+
+    Scope of the reservation fields differs on purpose:
+    - ``reserved_usd`` (like ``available_usd``) counts ONLY eligible grants,
+      i.e. money that currently limits admission;
+    - ``reserved_count``, ``oldest_reserved_age_s``, ``hanging_reserved_*`` and
+      ``unknown_outcome_*`` cover EVERY grant of the inventory, eligible or
+      not (exhausted, stale, blocked), so stuck money never disappears from
+      view. Hence ``hanging_reserved_usd`` may exceed ``reserved_usd``.
     """
     data = _manifest_data()
     eligible = manifest(data)
@@ -236,6 +295,10 @@ async def summary():
                     "SELECT COALESCE(sum(charged_usd),0) FROM anthropic_credit_reservations WHERE grant_id=$1 AND state='reserved'",
                     account["grant_id"],
                 )
+            # Over every grant of the inventory, eligible or not: money stuck
+            # on an exhausted/stale grant must stay visible too.
+            reservations = await hanging(conn, sorted({g["id"] for a in data["accounts"] for g in a.get("grants") or []
+                                               if isinstance(g, dict) and g.get("id")}))
     except (ValueError, KeyError, TypeError, ArithmeticError) as exc:
         raise HTTPException(503, "API reserve summary unavailable") from exc
     state = "available" if usable > 0 else "unavailable" if stale or blocked else "exhausted"
@@ -251,6 +314,7 @@ async def summary():
         "checked_at": now.isoformat(),
         "next_expiry_at": min(expires_at).isoformat() if expires_at else None,
         "automatic_paid_fallback": False,
+        **reservations,
         "supported_operations": ["text", "vision"],
         "supports_tools": False, "supports_claude_code": False,
         "requires_stateless_request": True,
