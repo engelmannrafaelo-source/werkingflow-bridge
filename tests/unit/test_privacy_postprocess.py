@@ -109,6 +109,23 @@ class TestRueckrechnung:
             spans_aus_antwort("Die Müller GmbH und MÜLLER GMBH.", "Die SN_ORGANIZATION_001 und SN_ORGANIZATION_001.",
                               {"SN_ORGANIZATION_001": "Müller GmbH"}, "SN")
 
+    def test_literal_verdeckt_mappingwert_bleibt_fehler(self):
+        # H-1 (R2 02.11.2026): der Dienst meldet 002 -> Firma, laesst die Firma aber stehen; das Wort
+        # ANON_ORGANIZATION_002 steht nur als Literal im Auftrag. Ohne Sicherung: Mapping {}, Firma im
+        # Klartext, kein Fehler. Mit Sicherung: benannter AlignmentError ohne Klartext.
+        text = "Recherche fuer ANON_ORGANIZATION_002: Angebote von Beta Heizsysteme AG pruefen."
+        with pytest.raises(AlignmentError) as e:
+            spans_aus_antwort(text, text, {"ANON_ORGANIZATION_002": "Beta Heizsysteme AG"}, "ANON")
+        msg = str(e.value)
+        assert msg.startswith("literal_verdeckt_mappingwert")
+        assert "ANON_ORGANIZATION_002 (ORGANIZATION)" in msg and "Offset 15" in msg
+        assert "erwartete Spanne 19 Zeichen" in msg and "Mapping-Wert im Original an Offset 51" in msg
+        assert "Beta" not in msg
+        # Dieselbe Antwort mit einer echten Ersetzung desselben Platzhalters bleibt in Ordnung (N1-Fall).
+        anon = "Recherche fuer ANON_ORGANIZATION_002: Angebote von ANON_ORGANIZATION_002 pruefen."
+        spans = spans_aus_antwort(text, anon, {"ANON_ORGANIZATION_002": "Beta Heizsysteme AG"}, "ANON")
+        assert [text[s.start:s.end] for s in spans] == ["Beta Heizsysteme AG"]
+
     def test_befund_nennt_typ_platzhalter_offset_laengen_ohne_klartext(self):
         with pytest.raises(AlignmentError) as e:
             spans_aus_antwort("Hallo Anna, bis bald", "Hallo SN_PERSON_001, bis bald", {"SN_PERSON_001": "Bertram"}, "SN")

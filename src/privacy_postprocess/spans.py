@@ -96,6 +96,11 @@ def spans_aus_antwort(
 
     ``protokoll`` (optional) erhaelt ``platzhalterwoerter_im_original``: Anzahl der
     Platzhalterwoerter, die schon im Original standen und deshalb Text bleiben.
+
+    Sicherung (H-1, 02.11.2026): Ein Platzhalter, der NUR als solches Platzhalterwort vorkam
+    (keine Ersetzung des Dienstes), dessen gemeldeter Mapping-Wert aber im Original steht,
+    ist ein Widerspruch der Antwort — der Dienst behauptet eine Ersetzung, die nirgends
+    stattfand, und der Wert stuende ungeschwaerzt im Ausgabetext. Laut abbrechen, nie raten.
     """
     if not mapping:
         if anonymisiert != original:
@@ -107,6 +112,8 @@ def spans_aus_antwort(
     treffer = list(muster.finditer(anonymisiert))
     spans: List[Span] = []
     literale = 0
+    ersetzt: set = set()  # Platzhalter mit mindestens einer Ersetzung des Dienstes
+    nur_literal: Dict[str, int] = {}  # Platzhalter -> Offset des ersten Platzhalterworts im Original
     pos = 0
     zuletzt = 0
     for i, m in enumerate(treffer):
@@ -121,11 +128,13 @@ def spans_aus_antwort(
         if original.startswith(wert, pos):
             # Ersetzung des Dienstes: an dieser Stelle stand der Mapping-Wert.
             spans.append(Span(pos, pos + len(wert), typ, "detektor", PRIO_DETEKTOR, float(conf.get(ph, 1.0))))
+            ersetzt.add(ph)
             pos += len(wert)
         elif original.startswith(ph, pos):
             # Das Platzhalterwort stand schon woertlich im Original (fruehere Pseudonymisierung):
             # keine Ersetzung des Dienstes, es bleibt Text. Kein Span, kein Mapping-Eintrag.
             literale += 1
+            nur_literal.setdefault(ph, pos)
             pos += len(ph)
         else:
             naechster = treffer[i + 1].start() if i + 1 < len(treffer) else len(anonymisiert)
@@ -135,6 +144,17 @@ def spans_aus_antwort(
     if original[pos:] != anonymisiert[zuletzt:]:
         raise AlignmentError(f"Textende weicht vom Original ab (Offset {pos}, Rest Original {len(original) - pos} "
                              f"Zeichen, Rest Antwort {len(anonymisiert) - zuletzt} Zeichen)")
+    for ph, offset in nur_literal.items():
+        if ph in ersetzt:
+            continue
+        wert_offset = original.find(mapping[ph])
+        if wert_offset >= 0:
+            typ = typen.get(ph) or platzhalter_typ(ph, prefix)
+            raise AlignmentError(
+                _befund("literal_verdeckt_mappingwert: Platzhalter kam nur als Platzhalterwort vor, "
+                        "sein Mapping-Wert steht aber ungeschwaerzt im Original", ph, typ, offset,
+                        len(mapping[ph]), None)
+                + f"; Mapping-Wert im Original an Offset {wert_offset}")
     if protokoll is not None:
         protokoll["platzhalterwoerter_im_original"] = literale
     return spans

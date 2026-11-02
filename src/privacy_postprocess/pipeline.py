@@ -34,7 +34,7 @@ from .spans import PRIO_BEKANNT, PRIO_DETEKTOR, Span, ausgeben, spans_aus_antwor
 
 logger = logging.getLogger(__name__)
 
-VERSION = "2026-11-02.1"
+VERSION = "2026-11-02.2"
 
 # Hartes PII: der Originalwert darf nie im Ausgabetext stehen bleiben (Lecktest).
 HARTE_TYPEN = frozenset({
