@@ -158,7 +158,8 @@ async def test_count_reserve_generate_settle_order_and_uncertain_cost(monkeypatc
     monkeypatch.setattr(client.httpx,'AsyncClient',lambda **kw: original(transport=httpx.MockTransport(handler),**kw))
     with pytest.raises(httpx.ReadTimeout):
         await client.post_messages({'model':'claude-haiku-5-5','max_tokens':10,'messages':[]},10)
-    assert events==['/accounts','count','/reserve','generate']
+    # Sent, outcome unknown: retained (no /settle) but marked visibly.
+    assert events==['/accounts','count','/reserve','generate','/unknown']
 
 
 @pytest.mark.asyncio
@@ -230,3 +231,21 @@ def test_unverified_or_mixed_wallet_is_never_eligible(configured):
     data['accounts'][0]['disabled'] = True
     path.write_text(json.dumps(data))
     assert ledger.manifest() == []
+
+
+@pytest.mark.asyncio
+async def test_unknown_outcome_stays_debited_and_hanging_is_visible(db):
+    r = request(); await ledger.reserve(r)
+    assert (await ledger.unknown(ledger.Unknown(id=r.id, reason='cancelled')))['outcome'] == 'unknown'
+    s = await ledger.summary()
+    assert s['unknown_outcome_count'] == 1 and s['unknown_outcome_usd'] == s['reserved_usd'] > 0
+    assert s['reserved_count'] == 1 and s['hanging_reserved_count'] == 0
+    async with db.acquire() as c:
+        await c.execute("UPDATE anthropic_credit_reservations SET created_at=now()-interval '30 hours'")
+    s = await ledger.summary(); a = (await ledger.status())['accounts'][0]
+    assert s['hanging_reserved_count'] == 1 and s['oldest_reserved_age_s'] >= 30*3600 - 5
+    assert a['hanging_reserved_usd'] == s['hanging_reserved_usd'] > 0
+    # A later definitive answer still finishes it; the marker never blocks settle.
+    await ledger.settle(ledger.Settle(id=r.id, rejected=True))
+    s = await ledger.summary()
+    assert s['reserved_count'] == 0 and s['unknown_outcome_count'] == 0 and s['oldest_reserved_age_s'] is None

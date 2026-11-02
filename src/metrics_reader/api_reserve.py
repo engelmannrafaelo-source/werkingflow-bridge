@@ -18,7 +18,13 @@ _FIELDS = {
     "checked_at", "next_expiry_at", "automatic_paid_fallback",
     "supported_operations", "supports_tools", "supports_claude_code",
     "requires_stateless_request",
+    # Hanging reservations: aggregates only (no reservation/account IDs).
+    "reserved_count", "oldest_reserved_age_s", "hanging_reserved_count",
+    "hanging_reserved_usd", "hanging_after_s", "unknown_outcome_count",
+    "unknown_outcome_usd",
 }
+_COUNTS = ("reserved_count", "hanging_reserved_count", "hanging_reserved_usd",
+           "hanging_after_s", "unknown_outcome_count", "unknown_outcome_usd")
 
 
 def api_reserve_snapshot() -> dict:
@@ -47,6 +53,15 @@ def api_reserve_snapshot() -> dict:
                     value = data.get(field)
                     if type(value) not in (int, float) or not math.isfinite(value) or value < 0:
                         raise ValueError("Invalid reserve amount")
+                # Optional (older coordinators omit them); if present they
+                # must be sane, never passed through as arbitrary content.
+                for field in _COUNTS:
+                    value = data.get(field)
+                    if value is not None and (type(value) not in (int, float) or not math.isfinite(value) or value < 0):
+                        raise ValueError("Invalid reservation aggregate")
+                age = data.get("oldest_reserved_age_s")
+                if age is not None and (type(age) is not int or age < 0):
+                    raise ValueError("Invalid reservation age")
                 if (data.get("shared_across_bridges") is not True
                         or data.get("supports_tools") is not False
                         or data.get("supports_claude_code") is not False
