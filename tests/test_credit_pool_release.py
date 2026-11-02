@@ -27,19 +27,28 @@ USAGE = {"input_tokens": 1, "output_tokens": 1, "cache_read_input_tokens": 0, "c
 class Coordinator:
     """Fake coordinator with a tiny in-memory ledger (state per reservation)."""
 
-    def __init__(self, reserve_error=None, reserve_delay=0.0, mark_delay=0.0):
+    def __init__(self, reserve_error=None, reserve_delay=0.0, mark_delay=0.0, settle_delay=0.0,
+                 commit_before_reply=False, accounts=1):
         self.calls = []
         self.state = {}
         self.marks = {}
         self.reserve_error = reserve_error
         self.reserve_delay = reserve_delay
         self.mark_delay = mark_delay
+        self.settle_delay = settle_delay
+        # True: /reserve commits the row first, THEN its reply is lost
+        # (delay/error) -- the row exists although the client never saw it.
+        self.commit_before_reply = commit_before_reply
+        self.accounts = [{"id": f"a{i}", "org_id": "o", "grant_id": f"g{i}", "api_key": "k"}
+                         for i in range(accounts)]
 
     async def __call__(self, method, path, data=None):
         self.calls.append(path)
         if path == "/accounts":
-            return {"accounts": [{"id": "a", "org_id": "o", "grant_id": "g", "api_key": "k"}]}
+            return {"accounts": self.accounts}
         if path == "/reserve":
+            if self.commit_before_reply:
+                self.state[data["id"]] = "reserved"
             if self.reserve_delay:
                 await asyncio.sleep(self.reserve_delay)
             if self.reserve_error:
@@ -47,6 +56,8 @@ class Coordinator:
             self.state[data["id"]] = "reserved"
             return {"state": "reserved"}
         if path == "/settle":
+            if self.settle_delay:
+                await asyncio.sleep(self.settle_delay)
             if data["id"] not in self.state:
                 raise HTTPException(503, "Anthropic credit coordinator rejected request")
             self.state[data["id"]] = "released" if data.get("rejected") else "settled"
@@ -226,6 +237,126 @@ async def test_unreachable_coordinator_on_marker_keeps_original_error(pool, monk
     with pytest.raises(httpx.ReadTimeout):
         await client.post_messages(BODY, 10)
     assert coord.only() == "reserved"
+
+
+# --- caller cancellation always propagates (no swallowed CancelledError) -----
+
+async def _cancel_when(coord, path, task):
+    while path not in coord.calls:
+        await asyncio.sleep(0)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    await asyncio.gather(*list(client._background))
+
+
+@pytest.mark.asyncio
+async def test_cancel_during_settle_of_paid_200_propagates_and_still_settles(pool):
+    async def ok(req):
+        return httpx.Response(200, json={"usage": USAGE, "content": []})
+    coord = pool(ok, settle_delay=0.05)
+    task = asyncio.create_task(client.post_messages(BODY, 10))
+    await _cancel_when(coord, "/settle", task)
+    assert coord.only() == "settled" and coord.calls.count("/reserve") == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status,text", [(401, "unauthorized"), (429, "rate limited"),
+                                         (400, "Your credit balance is too low")])
+async def test_cancel_during_settle_of_4xx_never_tries_next_account(pool, status, text):
+    posts = []
+
+    async def rejected(req):
+        posts.append(1)
+        return httpx.Response(status, json={"error": text})
+    coord = pool(rejected, settle_delay=0.05, accounts=2)
+    task = asyncio.create_task(client.post_messages(BODY, 10))
+    await _cancel_when(coord, "/settle", task)
+    # Without the fix the loop moved on: count_tokens, /reserve, a 2nd post.
+    assert coord.calls.count("/reserve") == 1 and posts == [1]
+    assert list(coord.state.values()) == ["released"]
+
+
+@pytest.mark.asyncio
+async def test_4xx_without_cancel_still_moves_to_next_account(pool):
+    async def rejected(req):
+        return httpx.Response(401, json={"error": "unauthorized"})
+    coord = pool(rejected, accounts=2)
+    with pytest.raises(HTTPException) as e:
+        await client.post_messages(BODY, 10)
+    assert e.value.status_code == 429 and coord.calls.count("/reserve") == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", [500, 529])
+async def test_cancel_during_marker_of_5xx_propagates(pool, status):
+    async def overloaded(req):
+        return httpx.Response(status, json={"error": "overloaded"})
+    coord = pool(overloaded, mark_delay=0.05, accounts=2)
+    task = asyncio.create_task(client.post_messages(BODY, 10))
+    await _cancel_when(coord, "/unknown", task)
+    assert coord.calls.count("/reserve") == 1 and "/settle" not in coord.calls
+    assert coord.only() == "reserved" and list(coord.marks.values()) == ["http_status"]
+
+
+@pytest.mark.asyncio
+async def test_cancel_during_marker_of_unreadable_200_propagates(pool):
+    async def unreadable(req):
+        return httpx.Response(200, json={"content": []})
+    coord = pool(unreadable, mark_delay=0.05)
+    task = asyncio.create_task(client.post_messages(BODY, 10))
+    await _cancel_when(coord, "/unknown", task)
+    assert coord.only() == "reserved" and list(coord.marks.values()) == ["unreadable_usage"]
+
+
+@pytest.mark.asyncio
+async def test_cancel_during_release_after_connect_error_raises_cancelled(pool):
+    coord = pool(_raise(httpx.ConnectError("refused")), settle_delay=0.05)
+    task = asyncio.create_task(client.post_messages(BODY, 10))
+    await _cancel_when(coord, "/settle", task)  # CancelledError, not ConnectError
+    assert coord.only() == "released"
+
+
+@pytest.mark.asyncio
+async def test_cancel_during_release_after_reserve_failure_raises_cancelled(pool):
+    async def gen(req):
+        raise AssertionError("must not post without reservation")
+    coord = pool(gen, reserve_error=HTTPException(503, "coordinator unavailable"),
+                 commit_before_reply=True, settle_delay=0.05)
+    task = asyncio.create_task(client.post_messages(BODY, 10))
+    await _cancel_when(coord, "/settle", task)  # CancelledError, not HTTPException
+    assert coord.only() == "released"
+
+
+@pytest.mark.asyncio
+async def test_cancel_during_reserve_releases_the_committed_row(pool):
+    """/reserve committed, its reply is lost because the caller is cancelled:
+    the row exists in the ledger and the follow-up release frees it."""
+    posted = []
+
+    async def gen(req):
+        posted.append(1)
+        return httpx.Response(200, json={"usage": USAGE})
+    coord = pool(gen, reserve_delay=5, commit_before_reply=True)
+    task = asyncio.create_task(client.post_messages(BODY, 10))
+    while "/reserve" not in coord.calls:
+        await asyncio.sleep(0)
+    assert coord.only() == "reserved"  # row exists before the reply
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    await asyncio.gather(*list(client._background))
+    assert posted == [] and coord.only() == "released" and coord.marks == {}
+
+
+@pytest.mark.asyncio
+async def test_lost_reserve_reply_with_committed_row_is_released(pool):
+    async def gen(req):
+        raise AssertionError("must not post without reservation")
+    coord = pool(gen, reserve_error=HTTPException(503, "coordinator unavailable"), commit_before_reply=True)
+    with pytest.raises(HTTPException) as e:
+        await client.post_messages(BODY, 10)
+    assert e.value.status_code == 503 and coord.only() == "released"
 
 
 # --- coordinator side without a database ------------------------------------

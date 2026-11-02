@@ -253,6 +253,14 @@ async def summary():
 
     No account identities, organization IDs, cookies or keys leave this route.
     Expired/stale observations do not contribute spendable money.
+
+    Scope of the reservation fields differs on purpose:
+    - ``reserved_usd`` (like ``available_usd``) counts ONLY eligible grants,
+      i.e. money that currently limits admission;
+    - ``reserved_count``, ``oldest_reserved_age_s``, ``hanging_reserved_*`` and
+      ``unknown_outcome_*`` cover EVERY grant of the inventory, eligible or
+      not (exhausted, stale, blocked), so stuck money never disappears from
+      view. Hence ``hanging_reserved_usd`` may exceed ``reserved_usd``.
     """
     data = _manifest_data()
     eligible = manifest(data)

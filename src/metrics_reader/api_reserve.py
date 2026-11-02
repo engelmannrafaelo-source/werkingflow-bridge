@@ -19,6 +19,8 @@ _FIELDS = {
     "supported_operations", "supports_tools", "supports_claude_code",
     "requires_stateless_request",
     # Hanging reservations: aggregates only (no reservation/account IDs).
+    # reserved_usd counts eligible grants only; the fields below cover every
+    # grant of the inventory (see credit_pool_routes.summary).
     "reserved_count", "oldest_reserved_age_s", "hanging_reserved_count",
     "hanging_reserved_usd", "hanging_after_s", "unknown_outcome_count",
     "unknown_outcome_usd",

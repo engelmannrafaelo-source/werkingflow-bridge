@@ -62,20 +62,26 @@ async def _finish(reservation: str, **data: Any) -> None:
     except Exception:
         # A conservative pending debit survives process/network loss. Never
         # discard a paid successful response just because accounting is down.
-        log.error("Credit reservation %s remains charged at its upper bound", reservation)
+        # The coordinator client maps 404 to 503, so the cause is not known here.
+        if data.get("rejected"):
+            log.error("Credit reservation %s: release not confirmed (coordinator unavailable, or the "
+                      "reservation was never committed); if it was committed it stays reserved at its "
+                      "upper bound and shows up as hanging", reservation)
+        else:
+            log.error("Credit reservation %s: settlement not stored; remains charged at its upper bound",
+                      reservation)
 
 
 async def _survive_cancel(coro) -> None:
     """Run ledger bookkeeping to completion even while the caller is being
-    cancelled. A second cancellation leaves it running in the background; the
-    caller re-raises its own CancelledError afterwards."""
+    cancelled. A cancellation of the caller while waiting here is re-raised
+    (never swallowed: a cancelled call must not continue with the next account
+    or return a response normally); the shielded task keeps running in the
+    background until the bookkeeping is done."""
     task = asyncio.ensure_future(coro)
     _background.add(task)
     task.add_done_callback(_background.discard)
-    try:
-        await asyncio.shield(task)
-    except asyncio.CancelledError:
-        pass
+    await asyncio.shield(task)
 
 
 async def _release_unsent(reservation: str) -> None:
