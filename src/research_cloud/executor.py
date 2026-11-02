@@ -176,6 +176,10 @@ class ResearchCloudExecutorError(Exception):
     # (credit_pool.PinnedAccountLost). Only this lets a failed return round
     # keep the report from before on the pool path.
     konto_angeheftet_verloren: bool = False
+    # promotional_only: the pool as a whole could not fund a round
+    # (credit_pool.PoolUnavailable, nothing sent). Only the staging
+    # subscription fallback (funding_policy) acts on it.
+    pool_unavailable: bool = False
 
     def __init__(self, message: str, *, status_code: Optional[int] = None):
         super().__init__(message)
@@ -581,7 +585,7 @@ async def run_research_cloud(
 
                         if config.promotional_only:
                             from fastapi import HTTPException
-                            from src.providers.credit_pool import PinnedAccountLost, post_messages
+                            from src.providers.credit_pool import PinnedAccountLost, PoolUnavailable, post_messages
                             try:
                                 response, pool_meta = await post_messages(
                                     body, config.http_timeout_seconds, pin=pool_pin
@@ -596,6 +600,7 @@ async def run_research_cloud(
                                     f"promotional_only stopped: {exc.detail}", status_code=exc.status_code
                                 )
                                 fehler.konto_angeheftet_verloren = isinstance(exc, PinnedAccountLost)
+                                fehler.pool_unavailable = isinstance(exc, PoolUnavailable)
                                 raise fehler from exc
                             # Only the account label of the coordinator manifest
                             # (no key, no content) — evidence which account served

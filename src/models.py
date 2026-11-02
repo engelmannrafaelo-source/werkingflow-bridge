@@ -704,7 +704,8 @@ class ResearchResponse(ErrorVerdictFields):
 
     Returns both container and host file paths, plus execution metadata.
     """
-    funding_policy: Optional[Literal["promotional_only"]] = None
+    # src/providers/funding_policy.py: which funding served this run.
+    funding_policy: Optional[Literal["promotional_only", "subscription_staging_fallback"]] = None
     status: Literal["success", "error"]
     query: str
     model: str

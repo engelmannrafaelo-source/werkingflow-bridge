@@ -23,22 +23,31 @@ def enabled() -> bool:
     return bool(os.getenv("ANTHROPIC_CREDIT_POOL_URL"))
 
 
+class PoolUnavailable(HTTPException):
+    """The pool as a whole cannot fund this call: coordinator not configured,
+    unreachable or refusing, or no account with eligible budget. Raised before
+    any Messages request was sent. Status codes are unchanged (503/429/409);
+    the subclass only lets a caller tell "pool cannot pay" apart from a
+    request or provider failure (staging subscription fallback,
+    src/providers/funding_policy.py)."""
+
+
 async def coordinator(method: str, path: str, data: dict | None = None) -> dict:
     url = os.getenv("ANTHROPIC_CREDIT_POOL_URL", "").rstrip("/")
     token = os.getenv("ANTHROPIC_CREDIT_POOL_TOKEN", "")
     if not url or not token:
-        raise HTTPException(503, "Anthropic credit coordinator is not configured")
+        raise PoolUnavailable(503, "Anthropic credit coordinator is not configured")
     try:
         async with httpx.AsyncClient(timeout=15) as client:
             r = await client.request(method, url + "/v1/internal/api-credit-pool" + path,
                                      headers={"X-Credit-Pool-Token": token}, json=data)
         if r.status_code != 200:
             # Never log the body: /accounts carries API keys.
-            raise HTTPException(r.status_code if r.status_code in (409, 429) else 503,
-                                "Anthropic credit coordinator rejected request")
+            raise PoolUnavailable(r.status_code if r.status_code in (409, 429) else 503,
+                                  "Anthropic credit coordinator rejected request")
         return r.json()
     except (httpx.HTTPError, ValueError) as exc:
-        raise HTTPException(503, "Anthropic credit coordinator unavailable") from exc
+        raise PoolUnavailable(503, "Anthropic credit coordinator unavailable") from exc
 
 
 async def _finish(reservation: str, **data: Any) -> None:
@@ -166,4 +175,4 @@ async def post_messages(body: dict, timeout: float, pin: dict | None = None) -> 
     if pinned:
         raise PinnedAccountLost(f"pinned credit account {pinned} refused (count/reserve/limit); no switch to "
                                 "another account because of encrypted_content")
-    raise HTTPException(429, "No eligible Anthropic API credit budget available; paid fallback disabled")
+    raise PoolUnavailable(429, "No eligible Anthropic API credit budget available; paid fallback disabled")
