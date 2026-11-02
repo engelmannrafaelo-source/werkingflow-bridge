@@ -34,7 +34,7 @@ from .spans import PRIO_BEKANNT, PRIO_DETEKTOR, Span, ausgeben, spans_aus_antwor
 
 logger = logging.getLogger(__name__)
 
-VERSION = "2026-10-06.2"
+VERSION = "2026-11-02.1"
 
 # Hartes PII: der Originalwert darf nie im Ausgabetext stehen bleiben (Lecktest).
 HARTE_TYPEN = frozenset({
@@ -394,6 +394,11 @@ def _platzhalter_vergeben(
         else:
             typ = typ_je_wert.get(voll) or bekannt_werte.get(voll) or s.type
             belegt_nr[typ] += 1
+            # Steht das Platzhalterwort schon woertlich im Original (fruehere Pseudonymisierung,
+            # siehe spans.py), bekaeme der Rueckweg zwei Bedeutungen fuer ein Wort: Nummer ueberspringen.
+            while f"{prefix}_{typ}_{belegt_nr[typ]:03d}" in text:
+                stat["platzhalter_nummer_uebersprungen"] += 1
+                belegt_nr[typ] += 1
             ph = f"{prefix}_{typ}_{belegt_nr[typ]:03d}"
             vergeben[voll] = ph
         s.platzhalter = ph
@@ -440,7 +445,8 @@ def postprocess_smart_anonymize(
     typen = {e.get("placeholder"): e.get("type") for e in (antwort.get("detected_entities") or []) if e.get("placeholder")}
     konf = {e.get("placeholder"): e.get("confidence") or 1.0 for e in (antwort.get("detected_entities") or []) if e.get("placeholder")}
 
-    detektor = spans_aus_antwort(original, anon, mapping_alt, prefix, typen, konf)
+    rueckrechnung: Dict[str, int] = {}
+    detektor = spans_aus_antwort(original, anon, mapping_alt, prefix, typen, konf, protokoll=rueckrechnung)
     verworfen: Counter = Counter()
     behalten: List[Span] = []
     for s in detektor:
@@ -496,6 +502,7 @@ def postprocess_smart_anonymize(
         "postprocessing": {
             "version": VERSION,
             "detector_spans": len(detektor),
+            **rueckrechnung,
             "dropped": dict(verworfen),
             "rule_spans_by_type": dict(regel_typen),
             "spans_by_source": dict(quellen),

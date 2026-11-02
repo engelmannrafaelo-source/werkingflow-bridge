@@ -87,6 +87,36 @@ class TestRueckrechnung:
                                   {"SN_ORGANIZATION_100": "B", "SN_ORGANIZATION_1000": "A"}, "SN")
         assert [(s.start, s.end) for s in spans] == [(0, 1), (2, 3)]
 
+    def test_platzhalterwort_im_original_bleibt_text(self):
+        # Befund N1 Phase 4 (02.11.2026): der Rechercheauftrag traegt Platzhalter frueherer
+        # Pseudonymisierung woertlich; der Dienst vergibt dieselbe Nummer neu.
+        text = "Betreiber ANON_ORGANIZATION_002 meldet an Stadtwerke Musterstadt GmbH und Fernwärme Beispiel AG."
+        anon = ("Betreiber ANON_ORGANIZATION_002 meldet an ANON_ORGANIZATION_001 und ANON_ORGANIZATION_002.")
+        mapping = {"ANON_ORGANIZATION_001": "Stadtwerke Musterstadt GmbH", "ANON_ORGANIZATION_002": "Fernwärme Beispiel AG"}
+        protokoll: Dict[str, int] = {}
+        spans = spans_aus_antwort(text, anon, mapping, "ANON", protokoll=protokoll)
+        assert [text[s.start:s.end] for s in spans] == ["Stadtwerke Musterstadt GmbH", "Fernwärme Beispiel AG"]
+        assert protokoll == {"platzhalterwoerter_im_original": 1}
+
+    def test_dienst_maskiert_platzhalterwort_selbst_hat_vorrang(self):
+        spans = spans_aus_antwort("x ANON_ORGANIZATION_001 y", "x ANON_ORGANIZATION_001 y",
+                                  {"ANON_ORGANIZATION_001": "ANON_ORGANIZATION_001"}, "ANON")
+        assert [(s.start, s.end) for s in spans] == [(2, 23)]
+
+    def test_variante_unter_demselben_platzhalter_bleibt_fehler(self):
+        # Keine Abschwaechung: weicht der woertliche Text ab, ist es ein Fehler (der Dienst fuellt woertlich nach).
+        with pytest.raises(AlignmentError):
+            spans_aus_antwort("Die Müller GmbH und MÜLLER GMBH.", "Die SN_ORGANIZATION_001 und SN_ORGANIZATION_001.",
+                              {"SN_ORGANIZATION_001": "Müller GmbH"}, "SN")
+
+    def test_befund_nennt_typ_platzhalter_offset_laengen_ohne_klartext(self):
+        with pytest.raises(AlignmentError) as e:
+            spans_aus_antwort("Hallo Anna, bis bald", "Hallo SN_PERSON_001, bis bald", {"SN_PERSON_001": "Bertram"}, "SN")
+        msg = str(e.value)
+        assert "SN_PERSON_001 (PERSON)" in msg and "Offset 6" in msg
+        assert "erwartete Spanne 7 Zeichen" in msg and "4 Zeichen" in msg  # bis zum Anker ", bis bald"
+        assert "Anna" not in msg and "Bertram" not in msg
+
 
 # ── Regel-Erkenner ───────────────────────────────────────────────────────────
 
@@ -414,6 +444,18 @@ class TestVereinheitlichung:
         r = lauf(text, [], prefix="ENGDOCBBBB", known_entities=bekannt)
         assert r["smart_anonymized_text"] == "Verfasser Brandschutzplanung ENGDOCAAAA_ORGANIZATION_004, KG ENGDOCAAAA_LOCATION_002."
         assert r["mapping"] == bekannt
+
+    def test_neue_nummern_ueberspringen_platzhalterwoerter_im_original(self):
+        # Das Wort SN_ORGANIZATION_001 steht schon im Original; der simulierte Dienst vergibt dieselbe
+        # Nummer neu (wie anonymizer.py ab 001). Rueckrechnung: das Literal bleibt Text; Vergabe: die
+        # Firma bekommt 002, der Rueckweg bleibt eindeutig und bytegleich.
+        text = "Betreiber SN_ORGANIZATION_001 meldet an Stadtwerke Musterstadt GmbH."
+        r = lauf(text, [("Stadtwerke Musterstadt GmbH", "ORGANIZATION")])
+        assert r["mapping"] == {"SN_ORGANIZATION_002": "Stadtwerke Musterstadt GmbH"}
+        assert r["smart_anonymized_text"] == "Betreiber SN_ORGANIZATION_001 meldet an SN_ORGANIZATION_002."
+        assert rueck(r) == text
+        assert r["postprocessing"]["platzhalter_nummer_uebersprungen"] == 1
+        assert r["postprocessing"]["platzhalterwoerter_im_original"] == 1
 
     def test_bekannte_variante_und_neue_nummern_kollidieren_nicht(self):
         text = "Herr Esterl prüft. Frau Lindtner."
