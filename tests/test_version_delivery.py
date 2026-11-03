@@ -195,13 +195,24 @@ def test_public_version_run_needs_no_credentials(monkeypatch, profile):
 
 def test_generator_version_pool_has_no_backup(tmp_path):
     import os
-    result = subprocess.run(["bash", str(ROOT / "scripts/generate-bridge-upstreams.sh"), "all"],
-                            env={**os.environ, "UPSTREAMS_OUT_DIR": str(tmp_path)},
-                            capture_output=True, text=True, timeout=10)
-    assert result.returncode == 0, result.stderr
+    variants = {}
+    for energy in ("0", "1"):
+        out = tmp_path / f"energy-{energy}"
+        out.mkdir()
+        result = subprocess.run(["bash", str(ROOT / "scripts/generate-bridge-upstreams.sh"), "all"],
+                                env={**os.environ, "UPSTREAMS_OUT_DIR": str(out),
+                                     "ENERGY_SUBSCRIPTION_NO_HOP": energy},
+                                capture_output=True, text=True, timeout=10)
+        assert result.returncode == 0, result.stderr
+        variants[energy] = out
     for topology in ("primary", "prod"):
-        generated = (tmp_path / f"upstreams-{topology}.conf").read_text()
+        generated = (variants["0"] / f"upstreams-{topology}.conf").read_text()
         upstream = block(generated, "upstream claude_version")
         assert "backup" not in upstream
         assert "BRIDGE_BACKUP_HOST" not in upstream
-        assert generated == (ROOT / f"docker/upstreams-{topology}.conf").read_text()
+        # Committed = the default, or (during an Energy-Abo window, 3e6b288) the
+        # ENERGY_SUBSCRIPTION_NO_HOP=1 variant — never anything else.
+        committed = (ROOT / f"docker/upstreams-{topology}.conf").read_text()
+        allowed = (generated, (variants["1"] / f"upstreams-{topology}.conf").read_text())
+        assert committed in allowed
+        assert "backup" not in block(committed, "upstream claude_version")
