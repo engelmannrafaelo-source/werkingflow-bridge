@@ -296,6 +296,30 @@ async def _job_runs_off_pool(
         return False
 
 
+#: Job kinds whose self-call spends THIS worker's CLI account (chat,
+#: research, doc-agent). ping/proxy/convert-html-to-pdf/erkunder: no reserve veto.
+_RESERVE_VETO_KINDS = frozenset({"chat", "research", "doc-agent"})
+
+
+def _reserve_veto_applies(body: "JobCreateRequest", attribution: Optional[Dict[str, Any]]) -> bool:
+    """Only subscription-funded jobs (Abo-Modus, decided at this POST and stored
+    as attribution.funding_source) of the LLM kinds."""
+    from src.providers.funding_policy import FUNDING_SOURCE_SUBSCRIPTION
+    return (body.kind in _RESERVE_VETO_KINDS
+            and (attribution or {}).get(FUNDING_SOURCE_KEY) == FUNDING_SOURCE_SUBSCRIPTION)
+
+
+def _account_reserve_reason() -> Optional[str]:
+    """The 90-%-reserve verdict of THIS worker's account — the same decision
+    require_account_reserve() takes inside the job (src/middleware/account_reserve.py)."""
+    from src.middleware.account_reserve import reserve_reason
+    from src.middleware.adaptive_limiter import get_adaptive_limiter
+
+    limiter = get_adaptive_limiter()
+    limiter._refresh_account_usage()
+    return reserve_reason(limiter._account_usage)
+
+
 @router.post("/v1/jobs")
 async def create_job_endpoint(
     body: JobCreateRequest,
@@ -452,6 +476,27 @@ async def create_job_endpoint(
         return account_exhausted_error(
             retry_after_s=retry_after, limit_window=_lock_info.get("reason")
         )
+
+    # Energy-Abo-Modus (N1F P2, 03.11.2026): a subscription-funded job runs its
+    # LLM work through THIS worker's CLI account (the self-call pins to
+    # localhost), and require_account_reserve() refuses every call there once
+    # the account is at >= 90 % weekly — the job would be created and die with
+    # 503 "Nutzerreserve". Same placement veto as the capacity lock above, at
+    # the same point (nothing persisted yet, so the reject is retry-safe):
+    # 429, which nginx's /v1/jobs locations retry on the next worker
+    # (proxy_next_upstream http_429 non_idempotent). All workers reserved ->
+    # every worker answers 429 -> loud @bridge_full, never the pool or a paid
+    # route. Scoped to subscription-funded jobs of the LLM kinds, so every
+    # other job and app keeps today's behaviour.
+    if (_reserve_veto_applies(body, attribution)
+            and not await _job_runs_off_pool(body, attribution)):
+        _reserve = _account_reserve_reason()
+        if _reserve is not None:
+            logger.warning(
+                f"🔒 job submission rejected: worker {_worker_id} account reserve "
+                f"({_reserve}) — subscription job, nginx retries on next worker"
+            )
+            return account_exhausted_error(retry_after_s=120, limit_window="weekly_reserve")
 
     # ADR-0012: the id names the bridge whose store will hold this row, so the
     # later GET can be routed to it without anybody keeping state. Fail CLOSED

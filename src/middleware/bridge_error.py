@@ -319,6 +319,9 @@ _LIMIT_WINDOW_PHRASE = {
     # Not a usage window: the organization blocked subscription access. Named
     # anyway so a capacity-locked job rejection says what actually happened.
     "org_subscription_disabled": "a hard stop (their organization disabled Claude subscription access for Claude Code)",
+    # The bridge's own 90 % weekly reserve (src/middleware/account_reserve.py) —
+    # Energy-Abo-Modus job placement veto (src/jobs/routes.py).
+    "weekly_reserve": "the 90 % weekly user reserve (automation paused, 'Nutzerreserve')",
 }
 # What we say when nobody could tell us WHICH limit was hit. Saying "weekly"
 # anyway is the bug this vocabulary exists to fix (see account_exhausted_error).

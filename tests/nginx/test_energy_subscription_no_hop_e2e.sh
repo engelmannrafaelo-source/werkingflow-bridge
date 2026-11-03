@@ -83,6 +83,10 @@ class H(BaseHTTPRequestHandler):
         self._hit()
         if PEER and self.headers.get("X-Stub-Peer") == "workers429":
             return self._send(429, {"error": {"reason": "account_exhausted"}})
+        # Reserve veto stand-in (src/jobs/routes.py): the named workers answer
+        # a job POST with 429 BEFORE creating anything.
+        if self.path == "/v1/jobs" and NAME in (self.headers.get("X-Stub-Reserve") or "").split(","):
+            return self._send(429, {"error": {"reason": "account_exhausted", "limit_window": "weekly_reserve"}})
         key = self.headers.get("Idempotency-Key")
         if key is None or self.path != "/v1/jobs":
             return self._send(200, {"worker": NAME})
@@ -249,8 +253,28 @@ for HOP in 1 0; do
     others_checks "on/hop$HOP" $([ "$HOP" = 1 ] && echo yes || echo no)
 done
 
-echo "############ COMMITTED default (switch off, PRIMARY_PEER_HOP=1) ############"
-start_stack "$D/upstreams-primary.conf"
+echo "############ Abo-Job-Platzierung: 429 der Reserve -> naechster Worker (N1F P2) ############"
+start_stack "$WORK/gen1/upstreams-primary.conf"
+created_before=$(ls "$WORK/db" | wc -l)
+c=$(req POST /v1/jobs "$O" -H "$E" -H "X-Stub-Reserve: worker1,worker2,worker4")
+check "reserve: unkeyed abo job accepted" "$c" = 200
+check "reserve: answered by the only free worker" "$(field "$O" worker)" = worker3
+c=$(req POST /v1/jobs "$O" -H "$E" -H "X-Stub-Reserve: worker1,worker2,worker4" -H "Idempotency-Key: K-RES-1")
+check "reserve: keyed abo job created once" "$c" = 201
+check "reserve: keyed job on the free worker" "$(field "$O" worker)" = worker3
+check "reserve: exactly one keyed row" "$(( $(ls "$WORK/db" | wc -l) - created_before ))" -eq 1
+check "reserve: keyed POST hit no other worker successfully" "$(hits K-RES-1 worker3)" -eq 1
+c=$(req POST /v1/jobs "$O" -H "$E" -H "X-Stub-Reserve: worker1,worker2,worker3,worker4")
+check "reserve: all workers reserved -> loud, not 2xx" "$c" -ge 429
+check "reserve: nothing reached the prod bridge" "$(all_peer_hits)" -eq 0
+
+echo "############ switch off (ENERGY_SUBSCRIPTION_NO_HOP=0, PRIMARY_PEER_HOP=1) ############"
+# Generated explicitly: since a3d4b5e the COMMITTED include may be the NO_HOP=1
+# variant (Energy-Abo window); "off" is the generator default, not the file.
+mkdir -p "$WORK/genoff"
+ENERGY_SUBSCRIPTION_NO_HOP=0 PRIMARY_PEER_HOP=1 UPSTREAMS_OUT_DIR="$WORK/genoff" \
+    "$REPO/scripts/generate-bridge-upstreams.sh" primary >/dev/null
+start_stack "$WORK/genoff/upstreams-primary.conf"
 c=$(req POST /v1/chat/completions "$O" -H "$E"); check "off: energy chat → prod bridge first (ADR-0010)" "$(field "$O" worker)" = backup-host
 c=$(req POST /v1/document/convert "$O" -H "$E" -H "$P"); check "off: energy document/convert + X-Priority → prod bridge (as before)" "$(field "$O" worker)" = backup-host
 c=$(req POST /v1/document/convert "$O" -H "$E"); check "off: energy document/convert → dev worker (as before)" "$(field "$O" worker)" != backup-host
