@@ -214,6 +214,11 @@ energy_local_checks() { # <label>
     c=$(req POST /v1/document/convert "$O" -H "X-App-ID: Werking-Energy" -H "$P"); check "$L energy (case) document/convert: dev worker" "$(field "$O" worker)" != backup-host
     c=$(req POST /v1/privacy/smart-anonymize "$O" -H "$E" -H "$P"); check "$L energy other location-/ path + X-Priority: dev worker" "$(field "$O" worker)" != backup-host
     c=$(get /v1/auth/status "$O" -H "$E" -H "$P"); check "$L energy /v1/auth/status + X-Priority: dev worker" "$(field "$O" worker)" != backup-host
+    for PV in Production PRODUCTION; do
+        c=$(req POST /v1/document/convert "$O" -H "$E" -H "X-Priority: $PV"); check "$L energy document/convert + X-Priority $PV: dev worker" "$(field "$O" worker)" != backup-host
+        c=$(req POST /v1/chat/completions "$O" -H "X-App-ID: WERKING-ENERGY" -H "X-Priority: $PV"); check "$L energy (upper) chat + X-Priority $PV: dev worker" "$(field "$O" worker)" != backup-host
+    done
+    c=$(req POST /v1/document/convert "$O" -H "$E" -H "$P" -H "X-Vision-Provider: gemini"); check "$L energy+gemini+X-Priority on location /: dev worker" "$(field "$O" worker)" != backup-host
     check "$L energy: nothing reached the prod bridge" "$(( $(all_peer_hits) - before ))" -eq 0
 }
 
@@ -223,7 +228,10 @@ others_checks() { # <label> <expect chat-without-priority at peer: yes|no>
     c=$(req POST /v1/document/convert "$O" -H "X-App-ID: werking-report"); check "$L report document/convert: dev worker" "$(field "$O" worker)" != backup-host
     c=$(req POST /v1/document/convert "$O" -H "X-App-ID: werking-energy-x" -H "$P"); check "$L werking-energy-x + X-Priority: prod bridge" "$(field "$O" worker)" = backup-host
     c=$(req POST /v1/chat/completions "$O" -H "X-App-ID: werking-report" -H "$P"); check "$L report chat + X-Priority: prod bridge" "$(field "$O" worker)" = backup-host
-    c=$(req POST /v1/document/convert "$O" -H "$E" -H "$P" -H "X-Vision-Provider: gemini"); check "$L energy+gemini+X-Priority on location /: as before (prod bridge)" "$(field "$O" worker)" = backup-host
+    for PV in Production PRODUCTION; do
+        c=$(req POST /v1/document/convert "$O" -H "X-App-ID: werking-report" -H "X-Priority: $PV"); check "$L report document/convert + X-Priority $PV: prod bridge (as before)" "$(field "$O" worker)" = backup-host
+    done
+    c=$(req POST /v1/document/convert "$O" -H "X-App-ID: werking-report" -H "X-Priority: production:x"); check "$L report document/convert + X-Priority production:x: dev worker (as before)" "$(field "$O" worker)" != backup-host
     if [ "$2" = yes ]; then
         c=$(req POST /v1/chat/completions "$O" -H "X-App-ID: werking-report"); check "$L report chat: prod bridge first (ADR-0010)" "$(field "$O" worker)" = backup-host
     else
@@ -246,6 +254,11 @@ start_stack "$D/upstreams-primary.conf"
 c=$(req POST /v1/chat/completions "$O" -H "$E"); check "off: energy chat → prod bridge first (ADR-0010)" "$(field "$O" worker)" = backup-host
 c=$(req POST /v1/document/convert "$O" -H "$E" -H "$P"); check "off: energy document/convert + X-Priority → prod bridge (as before)" "$(field "$O" worker)" = backup-host
 c=$(req POST /v1/document/convert "$O" -H "$E"); check "off: energy document/convert → dev worker (as before)" "$(field "$O" worker)" != backup-host
+for PV in Production PRODUCTION; do
+    c=$(req POST /v1/document/convert "$O" -H "$E" -H "X-Priority: $PV"); check "off: energy document/convert + X-Priority $PV → prod bridge (as before)" "$(field "$O" worker)" = backup-host
+done
+c=$(req POST /v1/document/convert "$O" -H "$E" -H "X-Priority: production:x"); check "off: energy document/convert + production:x → dev worker (as before)" "$(field "$O" worker)" != backup-host
+c=$(req POST /v1/document/convert "$O" -H "$E" -H "$P" -H "X-Vision-Provider: gemini"); check "off: energy+gemini+X-Priority on location / → prod bridge (as before)" "$(field "$O" worker)" = backup-host
 others_checks "off" yes
 
 echo

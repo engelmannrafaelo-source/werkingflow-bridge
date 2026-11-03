@@ -62,7 +62,7 @@ def _map(text: str, var: str):
         elif key.startswith("~"):
             regexes.append((re.compile(key[1:]), value))
         else:
-            exact[key] = value
+            exact[key.lower()] = value  # nginx map: exact strings match case-insensitively
     return m.group(1), default, exact, regexes
 
 
@@ -73,8 +73,8 @@ def _resolve(text: str, var: str, **vals) -> str:
         key = key.replace(f"${name}", val)
     if "$" in key:
         key = re.sub(r"\$[a-z_]+", "", key)  # variables not given are empty
-    if key in exact:
-        return exact[key]
+    if key.lower() in exact:
+        return exact[key.lower()]
     for rx, value in regexes:
         if rx.search(key):
             return value
@@ -158,41 +158,71 @@ def test_wrong_value_fails_before_writing(tmp_path, bad):
         assert (out / f).read_text() == (DOCKER / f).read_text(), f
 
 
-# --- location / : $backend_pool in the shared nginx.conf (Zweitprüfung B2) ----
+# --- location / : $backend_pool_location in the shared nginx.conf (B2) -------
 
 NGINX_CONF = (DOCKER / "nginx.conf").read_text()
+PRIOS = ("", "production", "Production", "PRODUCTION", "production:x", "low", " production")
+APPS = ("", "werking-energy", "Werking-Energy", "WERKING-ENERGY", "werking-report", "werking-energy-x",
+        "x-werking-energy")
 _GRID = [dict(hopped=h, prio=p, vision=vi, app=a)
-         for h in ("0", "1") for p in ("", "production", "PRODUCTION", "low")
-         for vi in ("", "gemini", "GEMINI", "anthropic")
-         for a in ("", "werking-energy", "Werking-Energy", "werking-report", "werking-energy-x")]
+         for h in ("0", "1") for p in PRIOS for vi in ("", "gemini", "GEMINI", "anthropic") for a in APPS]
 
 
-def _backend_pool(include: str, hopped, prio, vision, app) -> str:
+def _location_pool(include: str, hopped, prio, vision, app) -> str:
     llm = _pool(include, hopped=hopped, prio=prio, vision=vision, app=app)
-    return _resolve(NGINX_CONF, "backend_pool", bridge_hopped=hopped, http_x_priority=prio,
-                    http_x_vision_provider=vision, llm_backend_pool=llm, http_x_app_id=app)
+    first = _jobs_first(include, prio=prio, app=app)
+    base = _resolve(NGINX_CONF, "backend_pool", bridge_hopped=hopped, http_x_priority=prio)
+    out = _resolve(NGINX_CONF, "backend_pool_location", backend_pool=base, llm_backend_pool=llm,
+                   jobs_peer_first=first, http_x_app_id=app)
+    return base if out == "$backend_pool" else out
 
 
 def _old_backend_pool(hopped, prio, **_):
-    return "claude_production" if f"{hopped}:{prio}" == "0:production" else "claude_workers"
+    """Die Map auf develop 69155c0: exakter, groß/klein-unabhängiger Vergleich."""
+    return "claude_production" if f"{hopped}:{prio}".lower() == "0:production" else "claude_workers"
+
+
+def test_old_backend_pool_map_is_bit_identical():
+    old = ('    map "$bridge_hopped:$http_x_priority" $backend_pool {\n'
+           '        "0:production"  claude_production;\n'
+           '        default         claude_workers;\n'
+           '    }\n')
+    assert old in NGINX_CONF
 
 
 @pytest.mark.parametrize("hop", [None, "0", "1"])
 @pytest.mark.parametrize("topology", ["upstreams-primary.conf", "upstreams-prod.conf"])
-def test_backend_pool_unchanged_without_switch(v, hop, topology):
-    """Switch off (and on the prod LB always): the reworked map answers like
-    the former "0:production" -> claude_production for every request shape."""
+def test_location_pool_unchanged_without_switch(v, hop, topology):
+    """Schalter 0 (und Prod immer): location / routet für jede Anfrageform wie
+    die alte Map — auch Production/PRODUCTION/production:x und App-Varianten."""
     include = v[(hop, "0")][topology]
     for case in _GRID:
-        assert _backend_pool(include, **case) == _old_backend_pool(**case), case
+        assert _location_pool(include, **case) == _old_backend_pool(**case), case
 
 
 @pytest.mark.parametrize("hop", ["0", "1"])
-def test_backend_pool_switch_on_keeps_energy_local_only(v, hop):
+def test_location_pool_switch_on_keeps_only_energy_local(v, hop):
     on = v[(hop, "1")]["upstreams-primary.conf"]
     for case in _GRID:
         want = _old_backend_pool(**case)
-        if (case["hopped"] == "0" and case["prio"] == "production"
-                and case["app"].lower() == "werking-energy" and case["vision"].lower() != "gemini"):
+        if want == "claude_production" and case["app"].strip().lower() == "werking-energy":
             want = "claude_workers"
-        assert _backend_pool(on, **case) == want, case
+        assert _location_pool(on, **case) == want, case
+
+
+def test_location_pool_prod_include_never_changes_with_switch(v):
+    for case in _GRID:
+        assert (_location_pool(v[(None, "1")]["upstreams-prod.conf"], **case)
+                == _old_backend_pool(**case)), case
+
+
+@pytest.mark.parametrize("hop", ["1", "0"])
+def test_on_jobs_and_llm_pool_unchanged_for_others_all_variants(v, hop):
+    off = v[(hop, "0")]["upstreams-primary.conf"]
+    on = v[(hop, "1")]["upstreams-primary.conf"]
+    for case in _GRID:
+        if case["app"].strip().lower() == "werking-energy":
+            continue
+        assert _pool(on, **case) == _pool(off, **case), case
+        jc = dict(prio=case["prio"], app=case["app"])
+        assert _jobs_first(on, **jc) == _jobs_first(off, **jc), case

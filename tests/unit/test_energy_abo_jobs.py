@@ -25,6 +25,8 @@ from src.models import ResearchRequest  # noqa: E402
 from src.providers import funding_policy as fp  # noqa: E402
 
 ENERGY = {"X-App-ID": "werking-energy", "X-User-ID": USER_A}
+# Echter Client vor jedem Fixture-Patch (der abo-Fixture sperrt httpx.AsyncClient).
+_REAL_CLIENT = httpx.AsyncClient
 
 
 @pytest.fixture
@@ -51,7 +53,7 @@ async def _post(headers, body=None):
     app = FastAPI()
     app.include_router(routes.router)
     transport = httpx.ASGITransport(app=app)
-    async with httpx.AsyncClient(transport=transport, base_url="http://bridge") as c:
+    async with _REAL_CLIENT(transport=transport, base_url="http://bridge") as c:
         return await c.post("/v1/jobs", json=body or {"kind": "abo-probe", "payload": {}}, headers=headers)
 
 
@@ -74,12 +76,15 @@ async def test_job_post_stores_validated_value_not_body(dev_bridge, jobs):
     body = {"kind": "abo-probe", "payload": {},
             "attribution": {"app_id": "werking-energy", "funding_source": "subscription"}}
     r = await _post(ENERGY, body=body)
-    assert r.status_code == 200 and "funding_source" not in (jobs[-1]["attribution"] or {})
+    # Rumpfwert verworfen; ohne Header und ohne Schalter: ausdrücklich Pool.
+    assert r.status_code == 200 and jobs[-1]["attribution"]["funding_source"] == "pool"
 
 
 async def test_job_post_without_header_unchanged(dev_bridge, jobs):
+    """Ohne Angabe: Energy-Job wird ausdrücklich als Pool gespeichert (= heutiges
+    Verhalten; der Selbstaufruf kann nicht selbst umschalten)."""
     r = await _post(ENERGY)
-    assert r.status_code == 200 and "funding_source" not in (jobs[-1]["attribution"] or {})
+    assert r.status_code == 200 and jobs[-1]["attribution"]["funding_source"] == "pool"
 
 
 def test_self_call_carries_funding_source():
@@ -136,3 +141,59 @@ async def test_job_research_self_call_bypasses_pool(dev_bridge, abo, pool_trap, 
     cloud.assert_not_called()
     pool_trap.assert_not_called()
     assert fp.pool_umgangen(req)
+
+
+# --- Nicht-Blocker 1: Abo-Entscheid beim POST, nicht aus body.attribution ----
+
+USER_FREMD = "00000000-0000-4000-8000-0000000000dd"
+
+
+async def test_job_post_implicit_mode_decided_from_headers(dev_bridge, switch, jobs):
+    """Header-User in der Allowlist, Rumpf nennt einen anderen user_id: der
+    Job wird trotzdem als Abo gespeichert (kein Ausweichen auf den Pool)."""
+    body = {"kind": "abo-probe", "payload": {},
+            "attribution": {"app_id": "werking-energy", "user_id": USER_FREMD}}
+    r = await _post(ENERGY, body=body)
+    assert r.status_code == 200, r.text
+    assert jobs[-1]["attribution"]["funding_source"] == "subscription"
+
+
+async def test_job_post_body_user_cannot_gain_subscription(dev_bridge, switch, jobs):
+    """Umgekehrt: Header-User nicht in der Liste, Rumpf nennt den gelisteten —
+    der Job bleibt ausdrücklich beim Pool (heutiges Verhalten)."""
+    body = {"kind": "abo-probe", "payload": {},
+            "attribution": {"app_id": "werking-energy", "user_id": USER_A}}
+    r = await _post({"X-App-ID": "werking-energy", "X-User-ID": USER_FREMD}, body=body)
+    assert r.status_code == 200, r.text
+    assert jobs[-1]["attribution"]["funding_source"] == "pool"
+
+
+async def test_body_user_mismatch_self_call_still_bypasses_pool(dev_bridge, switch, jobs, abo, pool_trap):
+    """Ende zu Ende mit Pool-Falle: gespeicherte Attribution → Selbstaufruf."""
+    cli, _, _ = abo
+    body = {"kind": "abo-probe", "payload": {},
+            "attribution": {"app_id": "werking-energy", "user_id": USER_FREMD}}
+    await _post(ENERGY, body=body)
+    req = _self_call_request(jobs[-1]["attribution"], "/v1/chat/completions")
+    with ExitStack() as stack:
+        _handler(stack, AsyncMock(return_value=None))
+        out = await main._chat_completions_finanziert(_img_body(), req, None)
+    pool_trap.assert_not_called()
+    assert len(cli.calls) == 1 and out["x_funding"]["pool_umgangen"] is True
+
+
+async def test_body_user_listed_self_call_stays_pool_first(dev_bridge, switch, jobs, abo, pool_trap):
+    body = {"kind": "abo-probe", "payload": {},
+            "attribution": {"app_id": "werking-energy", "user_id": USER_A}}
+    await _post({"X-App-ID": "werking-energy", "X-User-ID": USER_FREMD}, body=body)
+    req = _self_call_request(jobs[-1]["attribution"], "/v1/chat/completions")
+    with ExitStack() as stack:
+        _handler(stack, AsyncMock(return_value=None), cap=AsyncMock(return_value=(False, 0.0, 0.0)))
+        with pytest.raises(Exception):
+            await main._chat_completions_finanziert(_img_body(), req, None)
+    assert pool_trap.call_count >= 1   # Pool zuerst, kein erzwungenes Abo
+
+
+async def test_other_app_jobs_get_no_funding_header(dev_bridge, switch, jobs):
+    r = await _post({"X-App-ID": "werking-report", "X-User-ID": USER_A})
+    assert r.status_code == 200 and "funding_source" not in (jobs[-1]["attribution"] or {})

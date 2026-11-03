@@ -355,10 +355,18 @@ async def create_job_endpoint(
     # like on the direct routes (unknown value 400, subscription where it does
     # not apply 409) and handed to the self-call (executors._ATTRIBUTION_HEADERS).
     # A body-supplied value is dropped: it would skip this check.
+    # The implicit mode (switch + allowlist) is decided HERE as well, from the
+    # POST's own headers, and stored explicitly: the self-call takes app_id /
+    # user_id from the attribution, which body.attribution may set freely — a
+    # different user_id there must neither dodge nor gain the subscription.
     from src.providers import funding_policy as _fp
     _funding = _fp.requested_funding_source(request)
-    if _funding == _fp.FUNDING_SOURCE_SUBSCRIPTION:
-        _fp.subscription_mode_cause(request)
+    _cause = _fp.subscription_mode_cause(request)
+    if _cause is not None:
+        _funding = _fp.FUNDING_SOURCE_SUBSCRIPTION
+    elif _funding is None and (_fp.promotional_only(request) or str(
+            (attribution or {}).get("app_id") or "").strip().lower() == "werking-energy"):
+        _funding = _fp.FUNDING_SOURCE_POOL   # explicit: the self-call cannot switch on its own
     attribution = {k: v for k, v in (attribution or {}).items() if k != FUNDING_SOURCE_KEY}
     if _funding:
         attribution[FUNDING_SOURCE_KEY] = _funding

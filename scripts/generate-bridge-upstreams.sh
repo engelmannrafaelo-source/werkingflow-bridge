@@ -404,7 +404,7 @@ emit_keyed_job_routing() {
             echo "map \"\$http_x_priority:\$http_x_app_id\" \$jobs_peer_first {"
             echo "    default    0;"
             echo "    \"~*^[^:]*:${ENERGY_APP_RE}\" 0;"
-            echo "    \"~^production:\" 1;"
+            echo "    \"~*^production:[^:]*\$\" 1;"
             echo "}"
         else
             echo "map \$http_x_app_id \$jobs_peer_first {"

@@ -100,8 +100,11 @@ direkt wie als Job:
 - Der geprüfte Wert wird serverseitig mit dem Job gespeichert
   (`attribution.funding_source`). Ein Wert aus dem Rumpf wird verworfen.
 - Der Selbstaufruf trägt ihn als Header (`executors._ATTRIBUTION_HEADERS`).
-- Schalter und Allowlist wirken dort über die weitergereichten `X-App-ID`
-  und `X-User-ID`.
+- Auch der Entscheid über Schalter und Allowlist fällt beim POST, aus dessen
+  eigenen Headern. Er wird ausdrücklich gespeichert: `subscription`, bzw.
+  `pool` für Energy-Jobs ohne Abo-Treffer. Grund: `body.attribution` darf
+  `app_id` und `user_id` des Selbstaufrufs frei setzen. Ein abweichender
+  `user_id` im Rumpf kann das Abo deshalb weder umgehen noch erzwingen.
 
 | Angabe | Wirkung |
 |---|---|
@@ -171,18 +174,28 @@ regelt das:
   mit `X-Priority: production`. Alle anderen Aufrufer laufen genau wie ohne
   den Schalter. Polls und Abbrüche von Jobs mit Prod-Heimatmarker erreichen
   weiter den Peer (ADR-0012).
-- `location /` und `/v1/auth/status` (zum Beispiel `/v1/document/convert`,
-  `/v1/privacy/*`) routen über die statische Map `$backend_pool` in
-  `docker/nginx.conf`, früher `"0:production"` → `claude_production`. Diese
-  Map liest jetzt zusätzlich `$llm_backend_pool` und `X-App-ID`.
-  - Werking-energy mit `X-Priority: production` bleibt dort nur dann lokal,
-    wenn das generierte Include Energy lokal führt, also nur mit Schalter 1.
-  - Ohne Schalter und auf dem Prod-LB antwortet die Map für jede
-    Anfrageform wie vorher. Das zeigt `test_backend_pool_unchanged_without_switch`
-    über ein Raster aus Hop, Priorität, Bild-Anbieter und App.
-  - Der Gemini-Bildweg ist ausgenommen, wie bisher.
-  - `nginx.conf` ist damit **textlich** geändert, im Verhalten aber gleich.
-    Die generierten Includes bleiben bei Schalter 0 byte-identisch.
+- `location /` und `/v1/auth/status` (zum Beispiel `/v1/document/convert`
+  oder `/v1/privacy/*`) routen über `$backend_pool_location`.
+  - Die alte Map `$backend_pool` mit `"0:production"` → `claude_production`
+    (exakter Vergleich, Groß/Klein egal) bleibt **bitgleich**.
+  - Eine zweite Map setzt deren `claude_production` nur dann auf
+    `claude_workers`, wenn alle vier Bedingungen gelten: `X-App-ID` ist
+    werking-energy (Groß/Klein egal), das Include führt Energy lokal
+    (`$llm_backend_pool=claude_workers`), es gibt keinen Peer-Vorrang
+    (`$jobs_peer_first=0`), und die alte Map sagt `claude_production`. Das
+    trifft nur mit Schalter 1 zu.
+  - Ihr Schlüssel besteht nur aus diesen Werten, und die kann der Client
+    nicht frei wählen: Die Pool-Werte kommen aus nginx bzw. dem Include,
+    `X-App-ID` gilt nur für Energy.
+  - Ohne Schalter und auf dem Prod-LB ist das Ergebnis immer gleich der alten
+    Map.
+- Belegt in zwei Stufen:
+  - Rastertest in Python mit den Map-Regeln von nginx:
+    `X-Priority` ``""``, `production`, `Production`, `PRODUCTION`,
+    `production:x`, `low`; App-Varianten; Bild-Anbieter; Hop.
+  - Echte OpenResty (`tests/nginx/test_energy_location_pool_openresty.py`):
+    alte gegen neue Map für das Primary-Include (beide `PRIMARY_PEER_HOP`)
+    und das Prod-Include, bei Schalter 0 und 1.
 - Weitere Routen ohne Energy-Sonderfall, weil sie den Peer nicht über die
   Priorität erreichen: `/v1/erkunder/` ist immer lokal; Job-Polls und
   -Abbrüche folgen dem Heimatmarker; `/health/production` ist eine Probe.
@@ -257,7 +270,8 @@ regelt das:
 Unit-Tests ohne Netz: `tests/unit/test_energy_abo_bildweg.py` und
 `tests/unit/test_energy_abo_modus.py`, `tests/unit/test_energy_abo_jobs.py`
 (Fake-CLI, Pool als Falle, nur Platzhalter-IDs) sowie
-`tests/nginx/test_energy_subscription_no_hop.py` und
+`tests/nginx/test_energy_subscription_no_hop.py`,
+`tests/nginx/test_energy_location_pool_openresty.py` und
 `tests/nginx/test_energy_subscription_no_hop_e2e.sh` (echte OpenResty).
 `tests/billing/test_ledger_real_cost.py` bleibt unverändert (Hausregel).
 
@@ -298,3 +312,8 @@ Unit-Tests ohne Netz: `tests/unit/test_energy_abo_bildweg.py` und
 - **N5:** Ein Abo-Bildaufruf wartet bis zu 120 s auf einen Platz und bekommt
   dann 429. Bei Chat mit nahem Fristende kann die Frist des Aufrufers vorher
   ablaufen. Der Wert ist die Konstante `ABO_VISION_SLOT_WAIT_S`.
+- **Nachprüfung, Nicht-Blocker 2:** Ein 503 (Strom ohne Abschluss) oder 504
+  (Zeitgrenze) des Abo-Bildwegs wird vom LB wie jeder 503/504 über weitere
+  Worker wiederholt, im Chat bis zur Kette von 1200 s. Jeder Versuch ist ein
+  neuer CLI-Lauf; er kostet Abo-Zeit, kein Geld. Deterministische Fehler sind
+  422 und werden nicht wiederholt.
