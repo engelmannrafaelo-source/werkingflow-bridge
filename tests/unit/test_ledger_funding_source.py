@@ -332,13 +332,46 @@ async def test_szenario_pool_recherche_ohne_mandant_eine_zeile_je_lauf(seam, mon
     for _ in range(3):
         await credit_pool.post_messages(body, 5)
     req = MagicMock()
-    req.headers = {"X-Bridge-Job-Lauf": "job-42"}
+    req.headers = {"X-Bridge-Job-Lauf": "job_dev_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}
     meta = main._research_pool_ledger_meta(req, log)
     await _persist(provider=PROVIDER_RESEARCH_CLOUD, meta=meta, wf="muehl-pt-p3")
     assert len(seam.rows) == 1
     row = seam.rows[0]
     pm = row["provider_metadata"]
     assert len(pm["credit_pool_reservations"]) == 3
-    assert pm["bridge_job_id"] == "job-42" and pm["workflow_id"] == "muehl-pt-p3"
+    assert pm["bridge_job_id"] == "job_dev_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" and pm["workflow_id"] == "muehl-pt-p3"
     assert pm["no_tenant"] is True and row["real_cost_eur"] == 0.0
     assert row["hypothetical_cost_eur"] > 0
+
+
+@pytest.mark.parametrize("header", [
+    "job-42", "x" * 5000, "job_dev_" + "a" * 32 + "\n", "job_DEV_" + "a" * 32,
+    "job_" + "a" * 31, "'; DROP TABLE usage_events; --", "",
+])
+def test_client_job_header_garbage_not_in_ledger_meta(header):
+    """X-Bridge-Job-Lauf is a client header: only the job-id grammar
+    (src/jobs/job_id.py) reaches provider_metadata."""
+    main = _import_main()
+    req = MagicMock()
+    req.headers = {"X-Bridge-Job-Lauf": header}
+    meta = main._research_pool_ledger_meta(req, [{"reservation": "r1", "grant": "g1"}])
+    assert "bridge_job_id" not in meta and meta["credit_pool_reservations"] == ["r1"]
+
+
+@pytest.mark.parametrize("header", ["job_dev_" + "b" * 32, "job_" + "c" * 32])
+def test_real_job_ids_accepted(header):
+    main = _import_main()
+    req = MagicMock()
+    req.headers = {"X-Bridge-Job-Lauf": header}
+    assert main._research_pool_ledger_meta(req, [{"reservation": "r1", "grant": "g1"}])["bridge_job_id"] == header
+
+
+async def test_client_meta_cannot_forge_no_tenant_fields(seam):
+    """Per-call meta claiming no_tenant/no_tenant_user_id is overwritten by the
+    writer's own fallback marker (it is merged last)."""
+    meta = {"credit_pool_reservation": "r1", "funding_policy": "promotional_only",
+            "no_tenant": False, "no_tenant_user_id": "forged", "no_tenant_reason": "forged"}
+    await _persist(meta=meta)
+    pm = seam.rows[0]["provider_metadata"]
+    assert pm["no_tenant"] is True and pm["no_tenant_user_id"] == USER
+    assert pm["no_tenant_reason"] == "users_tenants_row_missing"

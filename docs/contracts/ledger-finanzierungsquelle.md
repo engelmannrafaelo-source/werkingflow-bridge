@@ -87,3 +87,42 @@ Unit-Tests ohne Netz: `tests/unit/test_ledger_funding_source.py`.
   Spool des ausführenden Workers. Nach `BRIDGE_LEDGER_SPOOL_MAX_ATTEMPTS` bzw.
   `MAX_AGE_S` wird sie mit Log begraben. In der Heimat ist sie dann nicht
   sichtbar.
+
+### Offene Punkte aus der Zweitprüfung (nicht gebaut)
+
+1. **Nur der Fall „UUID ohne Mandant“ ist geschlossen.** `skipped:no_user`,
+   `skipped:email_unknown` und `skipped:not_a_user` überspringen die Zeile
+   weiter, auch wenn der Aufruf über den Pool lief.
+2. **Abbruch mitten im Lauf.** Bei `CancelledError` (Aufrufer weg, Job-Stopp,
+   Worker-Ende) während eines Research-cloud-Laufs wird `persist_ai_call_activity`
+   nie erreicht. Es entsteht keine Zeile, die Reservierungen stehen nur in der
+   Pool-Tabelle.
+3. **Fehlerzeilen kosten 0.** Research-Fehler- und Modellabbruchzeilen mit
+   Status `error` haben `hypothetical_cost_eur = 0`. Die Pool-Kosten der Runden
+   davor stehen nur über die Reservierungen.
+4. **Lücken bei der Dokumentkonvertierung.** Nicht abgedeckt sind:
+   - der Privacy-Dienst-Pfad: `vision_usage` wird nur bei Status < 400
+     übernommen;
+   - der Proxy-409 bei fehlender Attestierung;
+   - `/v1/document/convert-and-anonymize`.
+
+   Außerdem erzeugen die jetzt gebuchten Vision-Zeilen eines gescheiterten
+   Dokuments (Status `success`) bei einem Mandanten mit Plan einen
+   **Budgetabzug für ein Dokument, das der Kunde nicht erhalten hat**. Ob das
+   gewollt ist, entscheidet die KD (Alternative: diese Zeilen mit
+   `billing_account` intern buchen oder den Abzug auslassen).
+5. **`_hop_meta` beim Replay.** Beim Spool-Replay wird die Herkunft aus dem
+   Datensatz wiederhergestellt, `bridge_executed_on` stammt aber aus dem
+   *replayenden* Prozess. Der Wert wird nicht im Spool-Datensatz
+   eingefroren. Meist ist das derselbe Worker, sicher ist es nicht.
+6. **`no_tenant_user_id` steht nur in der Meta.** `user_id` der Zeile ist die
+   anonyme Identität. Abfragen je Nutzer, Budget und Plattform-Admin-Ansichten
+   sehen den echten Nutzer nicht, nur `provider_metadata->>'no_tenant_user_id'`.
+
+Gehärtet nach der Zweitprüfung: `bridge_job_id` wird nur übernommen, wenn der
+Header `X-Bridge-Job-Lauf` vollständig der Job-ID-Grammatik entspricht
+(`src/jobs/job_id.py`, getaggt oder alt, höchstens 64 Zeichen). Andere Werte
+werden mit Log verworfen. `no_tenant*` aus der Call-Meta wird vom Writer
+überschrieben, weil sein Marker zuletzt gemischt wird. Ist ein Mandant
+vorhanden, wird dieses Feld nicht gesetzt; die Call-Meta stammt dort nur aus
+Bridge-Code.

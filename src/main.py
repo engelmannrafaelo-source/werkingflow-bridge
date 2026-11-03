@@ -7310,9 +7310,23 @@ def _research_pool_ledger_meta(request: Optional[Request], pool_log: Optional[li
             job = job_lauf(request)
         except Exception:  # noqa: BLE001 — a missing job id never costs the row
             job = None
-        if job:
+        # X-Bridge-Job-Lauf is a request header: only a value in the job-id
+        # grammar (src/jobs/job_id.py, tagged or legacy; bounded length by
+        # construction) goes into the ledger, anything else is dropped.
+        if _valid_ledger_job_id(job):
             meta["bridge_job_id"] = job
+        elif job:
+            logger.warning("research-cloud ledger: X-Bridge-Job-Lauf is not a job id — not booked")
     return meta
+
+
+_LEDGER_JOB_ID_MAX_LEN = 64
+
+
+def _valid_ledger_job_id(job: Any) -> bool:
+    from src.jobs.job_id import LEGACY_JOB_ID_RE, TAGGED_JOB_ID_RE
+    return (isinstance(job, str) and 0 < len(job) <= _LEDGER_JOB_ID_MAX_LEN
+            and bool(TAGGED_JOB_ID_RE.fullmatch(job) or LEGACY_JOB_ID_RE.fullmatch(job)))
 
 
 async def _cloud_modell_abbruch_antwort(
