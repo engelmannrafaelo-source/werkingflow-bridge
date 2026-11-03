@@ -81,6 +81,39 @@ PROD_WORKER_TARGETS[worker-erk]="100.93.143.105:8004"
 #          `backup` in both pools. This already IS Level1-first; only
 #          X-Priority:production picks the claude_production pool (identical
 #          order), everything else rides claude_workers.
+#
+# --- PRIMARY_PEER_HOP: the dev -> prod hop is OFF by default (03.11.2026) ---
+# KD-Entscheid 03.11.2026: the ADR-0010 peer-first routing on the DEV bridge
+# was not intended to put dev/staging load (werking-energy staging, CUI,
+# orchestrator, partner-platform) on the prod workers — measured in the prod
+# LB log on 01./02.11. (origin=dev, hopped_trusted=1). Dev staging runs on the
+# dev accounts and the dev pool. So on primary:
+#   PRIMARY_PEER_HOP=0 (DEFAULT)  no peer-first for unprioritised traffic:
+#       chat/research, POST /v1/jobs (keyed and unkeyed), the jobs list and
+#       unmarked polls ride the LOCAL claude_workers (with the Lua account gate).
+#       Deliberately still crossing to ${BRIDGE_BACKUP_HOST}:
+#         * X-Priority: production (claude_production stays remote-first —
+#           that header means real prod-priority traffic; keyed X-Priority
+#           submissions follow it, $jobs_peer_first),
+#         * polls/cancels of jobs whose id names the prod bridge
+#           (claude_jobs_peer, ADR-0012) — jobs in flight must not die,
+#         * /health/production (shared nginx.conf, a probe, no account).
+#   PRIMARY_PEER_HOP=1  the ADR-0010 behaviour (every non-hopped LLM request
+#       rides claude_production = prod bridge first). Rollback only:
+#       PRIMARY_PEER_HOP=1 scripts/generate-bridge-upstreams.sh primary,
+#       commit docker/upstreams-primary.conf, deploy the dev LB.
+# On production the flag has NO effect: upstreams-prod.conf is byte-identical
+# for both values (tests/nginx/test_dev_no_prod_hop.py proves it).
+# Contract + pyramid scenarios: docs/contracts/dev-kein-prod-hop.md.
+
+# Validated value of PRIMARY_PEER_HOP (see above): prints 0 or 1, fails loud
+# on anything else — a typo must not silently pick a routing.
+primary_peer_hop() {
+    case "${PRIMARY_PEER_HOP:-0}" in
+        0|1) echo "${PRIMARY_PEER_HOP:-0}" ;;
+        *) echo "ERROR: PRIMARY_PEER_HOP must be 0 or 1, got '${PRIMARY_PEER_HOP}'" >&2; return 1 ;;
+    esac
+}
 
 # $1 = worker name, $2 = NAME (string) of the associative targets array in
 # scope (e.g. "PROD_WORKER_TARGETS") -> "host:port", defaulting to the
@@ -307,13 +340,21 @@ MAPHEAD
 #                           max_fails=0 — where the fixed bridge is local.
 #   $jobs_peer_first        1 where the fixed bridge is the peer (primary),
 #                           0 where it is the local one (production).
+#                           primary with PRIMARY_PEER_HOP=0 (default): 1 only
+#                           for X-Priority: production (same split as the
+#                           unkeyed pool), 0 for everything else — the
+#                           claude_jobs_keyed_peer block stays emitted because
+#                           nginx.conf names it statically.
 #
 # $1 = topology id, $2 = targets-array NAME, then worker names
 emit_keyed_job_routing() {
-    local first id="$1" targets_name="$2" w target
+    local first id="$1" targets_name="$2" w target hop
     shift 2
     case "$id" in
-        primary)    first=1 ;;
+        primary)
+            hop="$(primary_peer_hop)" || return 1
+            if [ "$hop" = 1 ]; then first=1; else first=priority; fi
+            ;;
         production) first=0 ;;
         *) echo "ERROR: emit_keyed_job_routing: unknown topology '$id'" >&2; return 1 ;;
     esac
@@ -330,9 +371,19 @@ emit_keyed_job_routing() {
     echo "    keepalive 8;"
     echo "}"
     echo
-    echo "map \$host \$jobs_peer_first {"
-    echo "    default ${first};"
-    echo "}"
+    if [ "$first" = priority ]; then
+        echo "# PRIMARY_PEER_HOP=0: a keyed job lives HERE unless it is real"
+        echo "# prod-priority traffic (X-Priority: production, exact value as in"
+        echo "# \$llm_backend_pool) — that one keeps its fixed bridge at the peer."
+        echo "map \$http_x_priority \$jobs_peer_first {"
+        echo "    default    0;"
+        echo "    production 1;"
+        echo "}"
+    else
+        echo "map \$host \$jobs_peer_first {"
+        echo "    default ${first};"
+        echo "}"
+    fi
 }
 
 # Emits the nginx `map` body (just the entries, caller wraps the map{} block)
@@ -440,7 +491,28 @@ HEADER
     echo "# \$bridge_hopped (nginx.conf) is 1 when the request already crossed a"
     echo "# bridge once (X-Bridge-Hop); hopped traffic is ALWAYS served from the"
     echo "# local tier — that is the one-hop loop guard."
-    if [ "$id" = "primary" ]; then
+    if [ "$id" = "primary" ] && [ "$(primary_peer_hop)" = 0 ]; then
+        echo "# primary, PRIMARY_PEER_HOP=0 (DEFAULT since 03.11.2026, KD-Entscheid):"
+        echo "# NO peer-first. Dev/staging load stays on the dev pool and the dev"
+        echo "# accounts (local claude_workers, full Lua account gate). Only real"
+        echo "# prod-priority traffic (X-Priority: production, same split as on"
+        echo "# production) still rides claude_production = the prod bridge first."
+        echo "# The Gemini image path stays local even with X-Priority — it does"
+        echo "# not exist on the prod bridge (no GEMINI_VISION_API_KEY there,"
+        echo "# avv.md 5.4; measured 06.09.2026)."
+        echo "# Rollback: PRIMARY_PEER_HOP=1 (generator header, docs/contracts/"
+        echo "# dev-kein-prod-hop.md)."
+        cat <<'MAP'
+map "$bridge_hopped:$http_x_priority:$http_x_vision_provider" $llm_backend_pool {
+    default                    claude_workers;
+    "~*^0:production:gemini$"  claude_workers;
+    "~*^0:production:"         claude_production;
+}
+MAP
+    elif [ "$id" = "primary" ]; then
+        # PRIMARY_PEER_HOP=1 (ADR-0010 rollback mode). Output kept
+        # byte-identical to the pre-03.11.2026 include on purpose, so the
+        # rollback is provably the old routing (test_dev_no_prod_hop.py).
         echo "# primary: every non-hopped request rides the Level-1-first pool,"
         echo "# with or without X-Priority (ADR-0010: one pool, two tiers)."
         echo "# REAKTIVIERT 2026-08-31 (Rafael-Direktfreigabe, Session 7f122be0),"
@@ -521,6 +593,8 @@ HEADER
 
 main() {
     local target="${1:-all}"
+    # Validate the switch BEFORE any file is truncated by a redirect.
+    primary_peer_hop >/dev/null
     case "$target" in
         primary)
             generate primary > "${OUT_DIR}/upstreams-primary.conf"; echo "[gen] wrote docker/upstreams-primary.conf"
