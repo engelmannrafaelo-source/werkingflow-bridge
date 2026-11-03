@@ -305,10 +305,22 @@ Unit-Tests ohne Netz: `tests/unit/test_energy_abo_bildweg.py` und
 - **N3:** Gemini-Regex im LB. Die Energy-Regel zieht nur ohne
   `X-Vision-Provider: gemini`; Gemini bleibt in allen Varianten lokal bzw. wie
   bisher. `X-Vision-Provider` wird groß/klein-unabhängig verglichen (`(?i:gemini)`).
-- **N4:** Im Abo-Modus nutzt die Recherche Perplexity, wenn
-  `RESEARCH_PERPLEXITY_ENABLED` auf der Dev-Bridge gesetzt ist. Perplexity ist
-  ein bezahltes Fremdwerkzeug und kein Rückfall-Anbieter. Ob es im Abo-Modus
-  abgeschaltet werden soll, entscheidet die KD.
+- **N4 (korrigiert 03.11.2026, KD: Perplexity im Abo-Modus AUS):** Im
+  Abo-Modus wird Perplexity nie angeboten oder aufgerufen, auch wenn
+  `RESEARCH_PERPLEXITY_ENABLED` und `PERPLEXITY_API_KEY` gesetzt sind.
+  - `enter_subscription_mode` aktiviert den Rückfall-Marker. Der CLI-Weg der
+    Recherche schaltet dann `_pplx_cfg` ab (`enabled=False`, `api_key=None`).
+    Es gibt dann kein `PoolPerplexityTool`, kein `fetch_document` als
+    SDK-MCP, keinen Perplexity-Prompt-Abschnitt und keinen Aufruf von
+    `ask_perplexity`.
+  - Der Cloud-Weg wird im Abo-Modus nicht betreten; für Energy
+    (`free_only`) schaltet auch er Perplexity ab.
+  - Die Recherche läuft über die CLI auf dem Abo mit der Claude-Websuche
+    (`WebSearch` bleibt erlaubt) und liefert ein Ergebnis.
+  - Beleg: `tests/unit/test_energy_abo_research_ohne_perplexity.py`
+    (Header und Schalter + Allowlist; Fallen auf Perplexity, Pool und Cloud;
+    Ergebnis `success`). Eine Mutationsprobe zeigt: Wird die Abschaltung
+    entfernt, wird der Test rot.
 - **N5:** Ein Abo-Bildaufruf wartet bis zu 120 s auf einen Platz und bekommt
   dann 429. Bei Chat mit nahem Fristende kann die Frist des Aufrufers vorher
   ablaufen. Der Wert ist die Konstante `ABO_VISION_SLOT_WAIT_S`.
