@@ -374,6 +374,9 @@ _ATTRIBUTION_HEADERS = {
     "bridge_origin": "X-Bridge-Origin",
     # Test-KI-Deckel: Laufkennung der App-Sperre (src/budget/test_ki_deckel.py).
     "test_lauf": "X-Test-Lauf",
+    # Energy-Abo-Modus: the job POST's validated X-Funding-Source
+    # (jobs/routes.py FUNDING_SOURCE_KEY) — the self-call is funded the same way.
+    "funding_source": "X-Funding-Source",
 }
 
 # Last-resort caller identity for self-calls whose triggering job carried NO

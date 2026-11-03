@@ -1997,8 +1997,14 @@ class ClaudeCodeCLI:
         cache_boundary: Optional[int] = None,
         antwort_im_text: bool = False,
         timeout_s: Optional[float] = None,
+        cli_tools: Optional[List[str]] = None,
     ) -> AsyncGenerator[Dict[str, Any], None]:
         """Run Claude Code using the Python SDK and yield response chunks.
+
+        cli_tools: the ONLY built-in tools the CLI loads (``--tools``, via the
+            SDK's extra_args). Unlike allowed_tools this is a real restriction
+            under bypassPermissions (measured with CLI 2.1.310: the init message
+            lists exactly these tools). Used by the Abo-Bildweg (["Read"]).
 
         Args:
             prompt: The user prompt to send to Claude
@@ -2494,6 +2500,9 @@ class ClaudeCodeCLI:
                 # === END SYSTEM PROMPT HANDLING ===
 
                 # Set tool restrictions
+                if cli_tools is not None:
+                    options.extra_args = {**(getattr(options, "extra_args", None) or {}),
+                                          "tools": ",".join(cli_tools)}
                 if allowed_tools:
                     options.allowed_tools = allowed_tools
                 if disallowed_tools:

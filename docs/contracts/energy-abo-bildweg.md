@@ -35,13 +35,23 @@ und `scripts/generate-bridge-upstreams.sh` (LB).
   - Bildinhalte und Base64 stehen nie im Log.
 - CLI-Lauf:
   - Ohne Sitzung und ohne Resume, `max_turns` = Bilder + 2.
-  - Erlaubt ist nur `Read`; Bash, Write, Edit, Web, Task, Glob, Grep, LS und
-    `mcp__*` sind verboten. Weil der Worker mit `bypassPermissions` läuft,
-    trägt die Verbotsliste die Grenze.
+  - Die tragende Werkzeuggrenze ist `--tools Read` (run_completion
+    `cli_tools`, über `extra_args` des SDK 0.0.22). Damit lädt die CLI nur
+    `Read`, auch unter `bypassPermissions`. Gemessen am 03.11.2026 mit dem
+    Worker-Pin CLI 2.1.310 ohne Zugangsdaten, also ohne Modellaufruf: Die
+    init-Meldung nennt `"tools":["Read"]`.
+  - Zweite Grenze: Nennt die init-Meldung eines Laufs mehr Werkzeuge als
+    `Read`, oder fehlt sie, wird die Antwort verworfen (422).
+  - Dritte Grenze: Eine breite Verbotsliste, unter anderem Bash, Monitor,
+    Write, Edit, Web, Task*, Cron*, RemoteTrigger, EnterWorktree,
+    PushNotification und `mcp__*`.
   - Prompt-Injektion über den Bildinhalt: Die Antwort wird nur ausgegeben,
     wenn die CLI ausschließlich die eigenen Bilddateien gelesen hat und jede
     davon. Jeder andere Werkzeugaufruf oder Pfad, auch `..`, verwirft die
-    Antwort mit 502, nicht wiederholbar.
+    Antwort mit 422, nicht wiederholbar.
+  - Aufräumen folgt nie einem Symlink: `lstat` vor dem Öffnen, nur reguläre
+    Dateien werden mit `O_NOFOLLOW` überschrieben; Symlinks und andere
+    Einträge werden nur entfernt.
 - Zulassung ohne Umgehung:
   - `require_account_reserve()` mit der 90-%-Reserve, die Ratelimit-Sperre
     des Workers und `acquire_with_wait` des adaptiven Limiters.
@@ -59,11 +69,20 @@ und `scripts/generate-bridge-upstreams.sh` (LB).
   - Kein stilles Kürzen. Am Ausgabelimit der CLI endet die Antwort mit
     `stop_reason=max_tokens`; im Chat ist das `finish_reason=length` (Energy:
     `vision_output_truncated`), in Dokumenten erscheint ein Vermerk.
-  - Ist die Antwort länger als 200 000 Zeichen, ist das ein Fehler (502); sie
+  - Ist die Antwort länger als 200 000 Zeichen, ist das ein Fehler (422); sie
     wird nicht gekürzt.
-  - Ein unfertiger Lauf (`error_max_turns`, kein Ergebnis) ergibt 502, ein
+  - Ein unfertiger Lauf (`error_max_turns`, kein Ergebnis) ergibt 422, ein
     Strom ohne Abschluss 503. Eine Ablehnung durch das Modell wird als
     `content_filter` gemeldet.
+- Fehlerstatus 1:1, auch im Chat (der Abo-Fehler geht an `classify_exception`
+  vorbei):
+  - Was derselbe Aufruf auf jedem Worker wieder auslöst, bekommt **422** und
+    `retryable=false`: Injektionsverdacht, ungelesenes Bild, unfertiger Lauf,
+    Überlänge, nicht belegte Werkzeugsperre. nginx wiederholt 5xx und 429 auf
+    jedem Worker (`proxy_next_upstream`); 422 wiederholt es nicht.
+  - Vorübergehendes bleibt 429 (Limiter, Reserve, Platz belegt), 503 (Strom
+    ohne Abschluss) oder 504 (Zeit).
+  - Kein Abo erlaubt ergibt 409.
 - Nie ein bezahlter Weg: kein `ANTHROPIC_VISION_API_KEY`, kein Pool-Nachversuch,
   kein Gemini (auch nicht als Dev-Standard, ein Gemini-Ziel bekommt 409), kein
   Bedrock und keine Prepaid-Tageskappe. Die 409-Riegel für Werkzeuge,
@@ -73,7 +92,16 @@ und `scripts/generate-bridge-upstreams.sh` (LB).
 
 Im Abo-Modus berührt die Bridge den Credit-Pool **nie**, auch wenn er
 konfiguriert ist: kein `/accounts`, kein reserve, kein Messages-Aufruf. Das
-gilt für Chat (Text und Bild), `/v1/document/convert` und `/v1/research`.
+gilt für Chat (Text und Bild), `/v1/document/convert` und `/v1/research`,
+direkt wie als Job:
+
+- `POST /v1/jobs` prüft `X-Funding-Source` wie die Direktrouten: ein
+  unbekannter Wert ergibt 400, Abo ohne Erlaubnis ergibt 409.
+- Der geprüfte Wert wird serverseitig mit dem Job gespeichert
+  (`attribution.funding_source`). Ein Wert aus dem Rumpf wird verworfen.
+- Der Selbstaufruf trägt ihn als Header (`executors._ATTRIBUTION_HEADERS`).
+- Schalter und Allowlist wirken dort über die weitergereichten `X-App-ID`
+  und `X-User-ID`.
 
 | Angabe | Wirkung |
 |---|---|
@@ -143,7 +171,33 @@ regelt das:
   mit `X-Priority: production`. Alle anderen Aufrufer laufen genau wie ohne
   den Schalter. Polls und Abbrüche von Jobs mit Prod-Heimatmarker erreichen
   weiter den Peer (ADR-0012).
+- `location /` und `/v1/auth/status` (zum Beispiel `/v1/document/convert`,
+  `/v1/privacy/*`) routen über die statische Map `$backend_pool` in
+  `docker/nginx.conf`, früher `"0:production"` → `claude_production`. Diese
+  Map liest jetzt zusätzlich `$llm_backend_pool` und `X-App-ID`.
+  - Werking-energy mit `X-Priority: production` bleibt dort nur dann lokal,
+    wenn das generierte Include Energy lokal führt, also nur mit Schalter 1.
+  - Ohne Schalter und auf dem Prod-LB antwortet die Map für jede
+    Anfrageform wie vorher. Das zeigt `test_backend_pool_unchanged_without_switch`
+    über ein Raster aus Hop, Priorität, Bild-Anbieter und App.
+  - Der Gemini-Bildweg ist ausgenommen, wie bisher.
+  - `nginx.conf` ist damit **textlich** geändert, im Verhalten aber gleich.
+    Die generierten Includes bleiben bei Schalter 0 byte-identisch.
+- Weitere Routen ohne Energy-Sonderfall, weil sie den Peer nicht über die
+  Priorität erreichen: `/v1/erkunder/` ist immer lokal; Job-Polls und
+  -Abbrüche folgen dem Heimatmarker; `/health/production` ist eine Probe.
 - `upstreams-prod.conf` bleibt immer byte-identisch.
+- Echte OpenResty (`tests/nginx/test_energy_subscription_no_hop_e2e.sh`,
+  Stubs im Docker-Testnetz, kein Netz außerhalb), mit Schalter 1 und beiden
+  `PRIMARY_PEER_HOP`-Werten:
+  - Energy bleibt lokal bei chat, chat + X-Priority, research, Job, Job mit
+    Schlüssel + X-Priority, `document/convert` + X-Priority, ein anderer
+    `location /`-Pfad + X-Priority und `/v1/auth/status` + X-Priority.
+  - Andere Apps, `werking-energy-x` und Gemini + X-Priority routen
+    unverändert.
+  - Committeter Default: Energy hoppt nach ADR-0010.
+  - Die vorhandenen e2e-Läufe (dev-kein-prod-hop, pool-gate, keyed-jobs,
+    cache-affinity) sind grün.
 - Einschalten: `ENERGY_SUBSCRIPTION_NO_HOP=1 scripts/generate-bridge-upstreams.sh
   primary`, `docker/upstreams-primary.conf` committen und den Dev-LB ausrollen.
   Das ist ein Betriebsschritt mit Freigabe.
@@ -170,15 +224,20 @@ regelt das:
     falsche Signatur und ein gefälschter media type werden laut abgewiesen.
   - Injektion: Der Bildtext verlangt Bash, `~/.claude/.credentials.json` oder
     `../../etc/passwd`, oder ein Bild wird nicht gelesen: die Antwort wird
-    verworfen.
+    verworfen (422, im Chat 1:1). Die init-Meldung nennt mehr als Read oder
+    fehlt: verworfen.
   - Dateien: Der Aufrufertext erscheint nie im Pfad; Datei 0600 und
-    Verzeichnis 0700 werden danach gelöscht, auch bei einem CLI-Fehler.
+    Verzeichnis 0700 werden danach gelöscht, auch bei einem CLI-Fehler. Ein
+    Symlink im Verzeichnis wird entfernt, sein Ziel bleibt unberührt.
 - **Grenzen:** Reserve oder Limiter oder Ratelimit sperren, bevor die CLI
   startet. 7 parallele Aufrufe laufen höchstens zu zweit gleichzeitig; ist
   die Wartefrist für einen Platz voll, kommt 429. Ausgabe am Limit wird
-  `length`, eine Überlänge 502. Ein unfertiger Lauf ergibt 502, eine
+  `length`, eine Überlänge 422. Ein unfertiger Lauf ergibt 422, eine
   Ablehnung `content_filter`.
 - **Abo-Modus:**
+  - Job-Chat und Job-Research mit Header bzw. mit Schalter und Allowlist:
+    Pool nie berührt. Ein ungültiger Header beim Job-POST ergibt 400, Abo auf
+    Prod 409; ein Wert aus dem Rumpf wird verworfen.
   - Mit vorhandenem Pool berühren Header oder Schalter (Allowlist-Treffer)
     den Pool bei Chat-Text, Chat-Bild, Dokument und Recherche nie.
   - Ohne Angabe bleibt alles wie heute (Pool zuerst). Ebenso, wenn die Liste
@@ -188,15 +247,18 @@ regelt das:
     ergibt 409 ohne Pool-Zugriff; ein unbekannter Header-Wert 400; der Header
     `pool` schlägt den Schalter.
   - Der Prüfausdruck stimmt auf Dev und auf Prod.
-- **LB:** Bei Default 0 ist die Datei byte-identisch und auf Prod immer.
+- **LB:** Bei Default 0 ist die Datei byte-identisch und auf Prod immer;
+  `$backend_pool` ist im Verhalten gleich.
   Mit 1 bleibt Energy lokal (mit und ohne `X-Priority`, beide
-  `PRIMARY_PEER_HOP`-Werte). Alle anderen sowie `werking-energy-x` und
+  `PRIMARY_PEER_HOP`-Werte, auch `location /` mit `document/convert`). Alle anderen sowie `werking-energy-x` und
   `not-werking-energy` laufen unverändert, Polls zum Prod-Heimatmarker gehen
   weiter zum Peer. Ein Tippfehler schreibt keine Datei.
 
 Unit-Tests ohne Netz: `tests/unit/test_energy_abo_bildweg.py` und
-`tests/unit/test_energy_abo_modus.py` (Fake-CLI, Pool als Falle, nur
-Platzhalter-IDs) sowie `tests/nginx/test_energy_subscription_no_hop.py`.
+`tests/unit/test_energy_abo_modus.py`, `tests/unit/test_energy_abo_jobs.py`
+(Fake-CLI, Pool als Falle, nur Platzhalter-IDs) sowie
+`tests/nginx/test_energy_subscription_no_hop.py` und
+`tests/nginx/test_energy_subscription_no_hop_e2e.sh` (echte OpenResty).
 `tests/billing/test_ledger_real_cost.py` bleibt unverändert (Hausregel).
 
 ## Offene Punkte
@@ -218,3 +280,21 @@ Platzhalter-IDs) sowie `tests/nginx/test_energy_subscription_no_hop.py`.
   bilden Limiter und Reserve.
 - Live nicht nachgewiesen: Ob der Worker-CLI-Pfad Bilder per Read genauso
   annimmt wie die lokale Probe, zeigt erst die Live-Probe im Worker.
+
+## Nicht-Blocker der Zweitprüfung (03.11.2026, nicht gebaut)
+
+- **N2:** Abo-Bildaufrufe der Dokument-Vision fragen den Limiter
+  (`acquire_with_wait`), zählen aber nicht als In-Flight: Es gibt kein
+  `record_arrival`, weil das die Fehler- und Erfolgsmetriken des Workers
+  mitzählen würde. Die Grenze dort bilden die 2 Plätze je Worker und die
+  Reserve.
+- **N3:** Gemini-Regex im LB. Die Energy-Regel zieht nur ohne
+  `X-Vision-Provider: gemini`; Gemini bleibt in allen Varianten lokal bzw. wie
+  bisher. `X-Vision-Provider` wird groß/klein-unabhängig verglichen (`(?i:gemini)`).
+- **N4:** Im Abo-Modus nutzt die Recherche Perplexity, wenn
+  `RESEARCH_PERPLEXITY_ENABLED` auf der Dev-Bridge gesetzt ist. Perplexity ist
+  ein bezahltes Fremdwerkzeug und kein Rückfall-Anbieter. Ob es im Abo-Modus
+  abgeschaltet werden soll, entscheidet die KD.
+- **N5:** Ein Abo-Bildaufruf wartet bis zu 120 s auf einen Platz und bekommt
+  dann 429. Bei Chat mit nahem Fristende kann die Frist des Aufrufers vorher
+  ablaufen. Der Wert ist die Konstante `ABO_VISION_SLOT_WAIT_S`.

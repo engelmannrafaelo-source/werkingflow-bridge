@@ -240,7 +240,7 @@ async def test_research_bypasses_pool(dev_bridge, switch, abo, pool_trap):
         stack.enter_context(patch("src.activity.ai_call_writer.persist_ai_call_activity", AsyncMock()))
         out = await main.research(body, req, None)
     admit.assert_awaited_once()
-    cloud.assert_not_awaited()
+    cloud.assert_not_called()
     pool_trap.assert_not_called()
     assert fp.pool_umgangen(req) and getattr(out, "status_code", None) == 429
 

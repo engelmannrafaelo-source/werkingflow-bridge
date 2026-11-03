@@ -72,6 +72,9 @@ from src.lauf_abschluss import abschluss_eines_ergebnisses
 logger = logging.getLogger(__name__)
 router = APIRouter()
 
+#: Attribution key of the job's X-Funding-Source (Energy-Abo-Modus).
+FUNDING_SOURCE_KEY = "funding_source"
+
 # Injected by main.py at startup (canonical X-* header → attribution dict).
 _attribution_extractor: Optional[Callable[[Request], Dict[str, Any]]] = None
 
@@ -346,6 +349,19 @@ async def create_job_endpoint(
     attribution = body.attribution
     if attribution is None and _attribution_extractor is not None:
         attribution = _attribution_extractor(request)
+
+    # Energy-Abo-Modus (docs/contracts/energy-abo-bildweg.md): the funding wish
+    # comes from the job POST's X-Funding-Source header only — validated HERE
+    # like on the direct routes (unknown value 400, subscription where it does
+    # not apply 409) and handed to the self-call (executors._ATTRIBUTION_HEADERS).
+    # A body-supplied value is dropped: it would skip this check.
+    from src.providers import funding_policy as _fp
+    _funding = _fp.requested_funding_source(request)
+    if _funding == _fp.FUNDING_SOURCE_SUBSCRIPTION:
+        _fp.subscription_mode_cause(request)
+    attribution = {k: v for k, v in (attribution or {}).items() if k != FUNDING_SOURCE_KEY}
+    if _funding:
+        attribution[FUNDING_SOURCE_KEY] = _funding
 
     # ADR-0011: the job's HOME bridge comes from the LB-stamped request
     # context, NEVER from the body — a body-supplied bridge_origin would let a

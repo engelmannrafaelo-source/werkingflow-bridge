@@ -4526,6 +4526,13 @@ async def _chat_completions_lauf(
                     # _chat_completions_finanziert faehrt den Aufruf auf dem
                     # Abo-Bildweg neu — dieselbe Regel wie beim Text.
                     raise
+                from src.providers.subscription_vision import is_abo_vision_error as _is_abo_error
+                if _is_abo_error(e):
+                    # Abo-Bildweg: Status 1:1 (422 = nicht wiederholbar, nginx
+                    # retryt ihn nicht; 429/503/504 = voruebergehend). classify_exception
+                    # wuerde ihn zu 429/500 umdeuten.
+                    logger.error(f"❌ Abo-Bildweg: {e.status_code} {e.detail.get('error')}")
+                    raise
                 logger.error(f"❌ Vision request failed: {e}", exc_info=True)
                 # Erschoepfung des Prepaid-Bildschluessels hinterliess bisher
                 # GAR KEINE Ledger-Zeile: Anthropic lehnt den Call ab, der

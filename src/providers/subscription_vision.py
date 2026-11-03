@@ -25,8 +25,10 @@ Wie:
   Löschfehler wird laut geloggt (ohne Inhalt).
 * Die CLI läuft über den vorhandenen ``ClaudeCodeCLI.run_completion`` der Bridge
   (dort gelten ``require_account_reserve()`` und das Verbot von
-  ``ANTHROPIC_API_KEY``), ohne Sitzung/Resume, mit wenigen Zügen, erlaubt ist
-  nur ``Read``; alle anderen Werkzeuge und alle MCP-Werkzeuge sind verboten.
+  ``ANTHROPIC_API_KEY``), ohne Sitzung/Resume, mit wenigen Zügen. Die CLI lädt
+  nur ``Read`` (``--tools Read``, auch unter bypassPermissions); die
+  init-Meldung jedes Laufs wird darauf geprüft, und eine breite Verbotsliste
+  kommt hilfsweise dazu (siehe CLI_TOOLS).
   Vorher: 90-%-Reserve (``require_account_reserve``), Worker-Sperre des
   Ratelimit-Trackers und der adaptive Limiter (Warten wie beim Chat). Dazu eine
   eigene, kleine Obergrenze gleichzeitiger Abo-Bildaufrufe je Worker
@@ -34,13 +36,13 @@ Wie:
 * Prompt-Injektion über den Bildinhalt: Der Bildinhalt kann nur ``Read``
   auslösen. Die Antwort wird nur ausgegeben, wenn die CLI ausschließlich die
   eigenen Bilddateien gelesen und jede davon gelesen hat; jedes andere
-  Werkzeug oder jeder andere Pfad verwirft die Antwort (502, nicht
+  Werkzeug oder jeder andere Pfad verwirft die Antwort (422, nicht
   wiederholbar). Damit kann ein Bild keine Datei des Workers in die Antwort
   holen.
 * Ausgabe: kein stilles Abschneiden. Endet die Antwort an der Ausgabegrenze der
   CLI, trägt die ``VisionResponse`` ``stop_reason="max_tokens"`` (Chat:
   ``finish_reason="length"``, Dokument: sichtbarer Vermerk). Ist sie länger als
-  ``ABO_VISION_MAX_OUTPUT_CHARS``, ist das ein Fehler (502), kein Kürzen.
+  ``ABO_VISION_MAX_OUTPUT_CHARS``, ist das ein Fehler (422), kein Kürzen.
 * Ergebnis in der bestehenden ``VisionResponse``-Form; Ledger-Felder in
   ``ledger_meta`` (``funding_policy=subscription_staging_fallback``,
   ``automatic_paid_fallback=false``, ``api_key_lane=vision_subscription``),
@@ -58,6 +60,7 @@ import binascii
 import logging
 import os
 import shutil
+import stat
 import tempfile
 import time
 from pathlib import Path
@@ -106,14 +109,30 @@ ABO_VISION_MAX_OUTPUT_CHARS = 200_000
 #: Laufzeit eines Abo-Bildaufrufs höchstens (Sekunden).
 ABO_VISION_TIMEOUT_S = 300.0
 
+#: Status für Fehler, die derselbe Aufruf auf jedem Worker wieder auslöst
+#: (Injektionsverdacht, ungelesenes Bild, unfertiger Lauf, Überlänge, nicht
+#: belegte Werkzeugsperre): 422. nginx wiederholt 5xx/429 auf jedem Worker
+#: (proxy_next_upstream) — ein Injektionsbild liefe sonst bis zu 4x durch die
+#: CLI. Vorübergehendes bleibt 429/503/504 (wiederholbar).
+NICHT_WIEDERHOLBAR = 422
+
 ALLOWED_TOOLS = ["Read"]
-#: Alles außer Read. Der Worker läuft mit bypassPermissions, deshalb wirkt
-#: allowed_tools dort nicht als Grenze — die Verbotsliste ist die Grenze, die
-#: Nachprüfung der Werkzeugaufrufe (``_pruefe_werkzeuge``) die zweite.
+#: Die Grenze: ``--tools Read`` (run_completion ``cli_tools``) lädt in der CLI
+#: NUR das Read-Werkzeug — auch unter bypassPermissions, wo allowed_tools
+#: nichts begrenzt. Gemessen mit CLI 2.1.310 (Worker-Pin) am 03.11.2026: die
+#: init-Meldung nennt ``"tools":["Read"]``. Zweite Grenze: die init-Meldung
+#: jedes Laufs wird geprüft (``_pruefe_init``), sonst wird verworfen. Dritte:
+#: die Nachprüfung der Werkzeugaufrufe (``_pruefe_werkzeuge``).
+CLI_TOOLS = ["Read"]
+#: Hilfsweise zusätzlich verboten (falls eine CLI ``--tools`` je ignorierte);
+#: bewusst breit, die tragende Grenze ist CLI_TOOLS.
 DISALLOWED_TOOLS = [
-    "Bash", "BashOutput", "KillShell", "Write", "Edit", "MultiEdit", "NotebookEdit",
-    "WebFetch", "WebSearch", "Task", "Agent", "TodoWrite", "Glob", "Grep", "LS",
-    "SlashCommand", "Skill", "ExitPlanMode", "mcp__*",
+    "Bash", "BashOutput", "KillShell", "Monitor", "PowerShell", "Write", "Edit", "MultiEdit",
+    "NotebookEdit", "WebFetch", "WebSearch", "Task", "TaskOutput", "TaskStop", "TaskCreate",
+    "TaskUpdate", "TaskList", "TaskGet", "Agent", "TodoWrite", "Glob", "Grep", "LS",
+    "SlashCommand", "Skill", "ExitPlanMode", "EnterPlanMode", "EnterWorktree", "ExitWorktree",
+    "CronCreate", "CronDelete", "CronList", "RemoteTrigger", "PushNotification", "SendMessage",
+    "ToolSearch", "ListMcpResourcesTool", "ReadMcpResourceTool", "mcp__*",
 ]
 
 # Dateisignatur → (media type, Endung). Der angegebene media type des
@@ -160,6 +179,12 @@ def _fehler(status: int, code: str, message: str, *, retryable: bool) -> HTTPExc
     return HTTPException(status, {"error": code, "message": message, "retryable": retryable,
                                   "funding_policy": "subscription_staging_fallback",
                                   "automatic_paid_fallback": False})
+
+
+def is_abo_vision_error(exc: BaseException) -> bool:
+    """Ein Fehler dieses Moduls (Status und Rumpf sollen 1:1 beim Aufrufer ankommen)."""
+    return (isinstance(exc, HTTPException) and isinstance(exc.detail, dict)
+            and str(exc.detail.get("error", "")).startswith("abo_vision_"))
 
 
 def _format_von(daten: bytes) -> Optional[Tuple[str, str]]:
@@ -229,18 +254,37 @@ def _dateien_schreiben(bilder: List[Tuple[bytes, str, str]]) -> Tuple[Path, List
 
 def _aufraeumen(verzeichnis: Path) -> None:
     """Überschreiben, löschen, laut bei Fehlern (ohne Inhalt, nur der Name des
-    privaten Verzeichnisses)."""
+    privaten Verzeichnisses). Folgt nie einem Symlink: jeder Eintrag wird per
+    lstat geprüft; nur reguläre Dateien werden über ``O_NOFOLLOW`` geöffnet und
+    überschrieben, alles andere (Symlink, Verzeichnis, Gerät) wird nur
+    entfernt, nie geöffnet."""
     try:
-        for pfad in verzeichnis.iterdir():
-            try:
-                groesse = pfad.stat().st_size
-                with open(pfad, "r+b") as f:
-                    f.write(b"\0" * groesse)
-                    f.flush()
-                    os.fsync(f.fileno())
-            except OSError as exc:
-                logger.error(f"abo-bildweg: Überschreiben fehlgeschlagen ({type(exc).__name__})")
-        shutil.rmtree(verzeichnis)
+        eintraege = list(os.scandir(verzeichnis))
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        logger.error(f"abo-bildweg: privates Bildverzeichnis {verzeichnis.name} nicht lesbar: {type(exc).__name__}")
+        return
+    for eintrag in eintraege:
+        pfad = Path(eintrag.path)
+        try:
+            st = os.lstat(pfad)
+            if stat.S_ISREG(st.st_mode):
+                fd = os.open(pfad, os.O_WRONLY | getattr(os, "O_NOFOLLOW", 0))
+                try:
+                    os.write(fd, b"\0" * st.st_size)
+                    os.fsync(fd)
+                finally:
+                    os.close(fd)
+                os.unlink(pfad)
+            elif stat.S_ISDIR(st.st_mode):
+                shutil.rmtree(pfad)  # rmtree folgt keinen Symlinks
+            else:
+                os.unlink(pfad)      # Symlink & Co.: nur der Eintrag, nie das Ziel
+        except OSError as exc:
+            logger.error(f"abo-bildweg: Eintrag im Bildverzeichnis nicht sicher entfernt ({type(exc).__name__})")
+    try:
+        os.rmdir(verzeichnis)
     except FileNotFoundError:
         return
     except OSError as exc:
@@ -305,6 +349,23 @@ def _werkzeugaufrufe(chunks: List[Any]) -> List[Tuple[str, Dict[str, Any]]]:
     return aufrufe
 
 
+def _pruefe_init(chunks: List[Any]) -> None:
+    """Die init-Meldung der CLI muss genau die Werkzeuge aus CLI_TOOLS nennen.
+    Fehlt sie oder nennt sie mehr, wird die Antwort verworfen (422)."""
+    for chunk in chunks:
+        if not isinstance(chunk, dict) or chunk.get("subtype") != "init":
+            continue
+        daten = chunk.get("data") if isinstance(chunk.get("data"), dict) else chunk
+        tools = daten.get("tools")
+        if isinstance(tools, list) and sorted(map(str, tools)) == sorted(CLI_TOOLS):
+            return
+        logger.error(f"abo-bildweg: CLI meldet Werkzeuge {tools!r} statt {CLI_TOOLS} — Antwort verworfen")
+        raise _fehler(NICHT_WIEDERHOLBAR, "abo_vision_tools_not_restricted",
+                      f"CLI lud Werkzeuge {tools!r} statt nur {CLI_TOOLS}; Antwort verworfen", retryable=False)
+    raise _fehler(NICHT_WIEDERHOLBAR, "abo_vision_tools_not_restricted",
+                  "CLI ohne init-Meldung: Werkzeugbeschränkung nicht belegt; Antwort verworfen", retryable=False)
+
+
 def _pruefe_werkzeuge(chunks: List[Any], dateien: List[Path]) -> None:
     """Nur Read, nur die eigenen Dateien, jede gelesen. Sonst wird die Antwort
     verworfen (Prompt-Injektion über den Bildinhalt kann keinen fremden Inhalt
@@ -315,13 +376,13 @@ def _pruefe_werkzeuge(chunks: List[Any], dateien: List[Path]) -> None:
         pfad = eingabe.get("file_path") or eingabe.get("path")
         if name != "Read" or not isinstance(pfad, str) or os.path.normpath(pfad) not in erlaubt:
             logger.error(f"abo-bildweg: unerwarteter Werkzeugaufruf {name!r} — Antwort verworfen")
-            raise _fehler(502, "abo_vision_unexpected_tool_use",
+            raise _fehler(NICHT_WIEDERHOLBAR, "abo_vision_unexpected_tool_use",
                           f"CLI rief {name!r} außerhalb der Bilddateien auf; Antwort verworfen",
                           retryable=False)
         gelesen.add(os.path.normpath(pfad))
     fehlend = erlaubt - gelesen
     if fehlend:
-        raise _fehler(502, "abo_vision_image_not_read",
+        raise _fehler(NICHT_WIEDERHOLBAR, "abo_vision_image_not_read",
                       f"CLI hat {len(fehlend)} von {len(erlaubt)} Bildern nicht gelesen; keine Antwort ohne Bild",
                       retryable=False)
 
@@ -376,7 +437,7 @@ async def analyze_via_subscription(
 
     if not _fp.staging_subscription_fallback_allowed():
         # Zweite Prüfung: kein Abo-Bildweg ohne Kennung + eigene Herkunft.
-        raise _fehler(503, "abo_vision_not_allowed",
+        raise _fehler(409, "abo_vision_not_allowed",
                       "subscription vision only on the dev bridge in the staging fallback; no paid fallback",
                       retryable=False)
     if _runner is None:
@@ -415,6 +476,7 @@ async def analyze_via_subscription(
                     stream=True,
                     max_turns=len(dateien) + ABO_VISION_EXTRA_TURNS,
                     allowed_tools=list(ALLOWED_TOOLS),
+                    cli_tools=list(CLI_TOOLS),
                     disallowed_tools=list(DISALLOWED_TOOLS),
                     session_id=None,
                     continue_session=False,
@@ -429,6 +491,7 @@ async def analyze_via_subscription(
         if verzeichnis is not None:
             _aufraeumen(verzeichnis)
 
+    _pruefe_init(chunks)
     _pruefe_werkzeuge(chunks, dateien)
 
     from src.claude_cli import detect_quota_exhaustion, extract_result_usage, lauf_abschluss
@@ -441,7 +504,7 @@ async def analyze_via_subscription(
         stop_reason = "refusal"
     elif abschluss.unfertig is not None:
         # error_max_turns, Fehler-Subtyp, kein Ergebnis: keine Teilantwort.
-        raise _fehler(502, "abo_vision_run_unfinished",
+        raise _fehler(NICHT_WIEDERHOLBAR, "abo_vision_run_unfinished",
                       f"CLI-Lauf nicht vollständig ({abschluss.unfertig}); keine Teilantwort", retryable=False)
     elif abschluss.finish_reason == "length":
         stop_reason = "max_tokens"
@@ -449,7 +512,7 @@ async def analyze_via_subscription(
     else:
         stop_reason = "end_turn"
     if len(text) > ABO_VISION_MAX_OUTPUT_CHARS:
-        raise _fehler(502, "abo_vision_output_over_limit",
+        raise _fehler(NICHT_WIEDERHOLBAR, "abo_vision_output_over_limit",
                       f"Antwort {len(text)} Zeichen über {ABO_VISION_MAX_OUTPUT_CHARS}; nicht gekürzt, verworfen",
                       retryable=False)
     if text and detect_quota_exhaustion(text):

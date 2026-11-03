@@ -60,6 +60,7 @@ class FakeCli:
         self.seen_files: list[dict] = []
         self.active = 0
         self.max_active = 0
+        self.symlink_target = None
 
     async def run_completion(self, **kw):
         self.calls.append(kw)
@@ -74,6 +75,12 @@ class FakeCli:
                                         "bytes": Path(p).read_bytes()})
             if self.delay:
                 await asyncio.sleep(self.delay)
+            if self.symlink_target is not None:
+                # Ein fremder Prozess legt einen Symlink ins private Verzeichnis.
+                os.symlink(self.symlink_target, os.path.join(os.path.dirname(pfade[0]), "boese-link"))
+            if self.mode != "no_init":
+                tools = ["Read", "Bash"] if self.mode == "init_more_tools" else ["Read"]
+                yield {"subtype": "init", "data": {"tools": tools, "permissionMode": "bypassPermissions"}}
             if self.mode == "raise":
                 raise RuntimeError("cli boom")
             lesen = pfade
@@ -200,7 +207,10 @@ async def test_happy_path_isolated_file_only_read_no_session(dev_bridge, abo, ca
     caplog.set_level(logging.DEBUG)
     resp = await _analyze([_block(data)], system="App-Auftrag: sachlich")
     (kw,) = cli.calls
-    assert kw["allowed_tools"] == ["Read"]
+    assert kw["allowed_tools"] == ["Read"] and kw["cli_tools"] == ["Read"]  # --tools Read
+    for neu in ("Monitor", "TaskOutput", "TaskStop", "CronCreate", "RemoteTrigger", "EnterWorktree",
+                "PushNotification"):
+        assert neu in kw["disallowed_tools"]
     for verboten in ("Bash", "Write", "Edit", "WebFetch", "WebSearch", "Task", "Glob", "Grep", "mcp__*"):
         assert verboten in kw["disallowed_tools"]
     assert kw["session_id"] is None and kw["continue_session"] is False
@@ -234,7 +244,7 @@ async def test_prod_bridge_never_runs_cli(prod_bridge, abo):
     cli, gates, _ = abo
     with pytest.raises(HTTPException) as e:
         await _analyze([_block(_b64())])
-    assert e.value.status_code == 503 and cli.calls == [] and not gates["limiter"].await_count
+    assert e.value.status_code == 409 and cli.calls == [] and not gates["limiter"].await_count
 
 
 async def test_reserve_blocks_before_cli(dev_bridge, abo):
@@ -267,7 +277,7 @@ async def test_prompt_injection_answer_withheld(dev_bridge, abo, mode, code):
     cli.mode = mode
     with pytest.raises(HTTPException) as e:
         await _analyze([_block(_b64()), _block(_b64("JPEG"))])
-    assert e.value.status_code == 502 and e.value.detail["error"] == code
+    assert e.value.status_code == 422 and e.value.detail["error"] == code
     assert e.value.detail["retryable"] is False
     assert all(not os.path.exists(s["path"]) for s in cli.seen_files)
 
@@ -294,8 +304,8 @@ async def test_output_limit_visible_not_silent(dev_bridge, abo, monkeypatch):
     assert e.value.detail["error"] == "abo_vision_output_over_limit"
 
 
-@pytest.mark.parametrize("mode,status,code", [("max_turns", 502, "abo_vision_run_unfinished"),
-                                              ("no_result", 502, "abo_vision_run_unfinished")])
+@pytest.mark.parametrize("mode,status,code", [("max_turns", 422, "abo_vision_run_unfinished"),
+                                              ("no_result", 422, "abo_vision_run_unfinished")])
 async def test_unfinished_run_is_error(dev_bridge, abo, mode, status, code):
     cli, _, _ = abo
     cli.mode = mode
@@ -592,3 +602,66 @@ def test_doc_estimate_uses_abo_parallelism():
     from src import docconvert_worker_vision as dw
     assert dw._runden(8, dw._abo_parallel()) == 8 // sv.ABO_VISION_MAX_PARALLEL
     assert dw._runden(8) == 2
+
+
+@pytest.mark.parametrize("mode", ["init_more_tools", "no_init"])
+async def test_tools_not_restricted_answer_withheld(dev_bridge, abo, mode):
+    """Zweite Grenze: nennt die init-Meldung mehr als Read (oder fehlt sie),
+    wird verworfen — auch wenn die Antwort sonst sauber wäre."""
+    cli, _, _ = abo
+    cli.mode = mode
+    with pytest.raises(HTTPException) as e:
+        await _analyze([_block(_b64())])
+    assert e.value.status_code == 422 and e.value.detail["error"] == "abo_vision_tools_not_restricted"
+
+
+async def test_cleanup_never_follows_symlink(dev_bridge, abo, tmp_path):
+    cli, _, _ = abo
+    fremd = tmp_path / "fremde-datei.txt"
+    fremd.write_bytes(b"NICHT UEBERSCHREIBEN")
+    cli.symlink_target = str(fremd)
+    await _analyze([_block(_b64())])
+    assert fremd.read_bytes() == b"NICHT UEBERSCHREIBEN"
+    assert not os.path.exists(os.path.dirname(cli.seen_files[0]["path"]))
+
+
+def test_run_completion_maps_cli_tools_to_tools_flag():
+    """claude_cli: cli_tools wird zu extra_args {"tools": "Read"} (SDK 0.0.22
+    reicht extra_args als --tools Read an die CLI)."""
+    import inspect
+    import src.claude_cli as cc
+    src_text = inspect.getsource(cc.ClaudeCodeCLI.run_completion)
+    assert "cli_tools" in inspect.signature(cc.ClaudeCodeCLI.run_completion).parameters
+    assert '"tools": ",".join(cli_tools)' in src_text
+
+
+@pytest.mark.parametrize("mode,status,code", [
+    ("bash", 422, "abo_vision_unexpected_tool_use"),
+    ("skip_read", 422, "abo_vision_image_not_read"),
+    ("no_result", 422, "abo_vision_run_unfinished"),
+])
+async def test_chat_abo_error_status_one_to_one(dev_bridge, abo, mode, status, code):
+    """Zweitprüfung N1: der Chat-Bildweg gibt den Status des Abo-Bildwegs 1:1
+    weiter (422 wird von nginx nicht auf weiteren Workern wiederholt) — kein
+    Umdeuten zu 429/500 durch classify_exception."""
+    cli, _, _ = abo
+    cli.mode = mode
+    with ExitStack() as stack:
+        _handler(stack, AsyncMock(return_value=None))
+        with patch.object(credit_pool, "enabled", return_value=False):
+            with pytest.raises(HTTPException) as e:
+                await main._chat_completions_finanziert(_img_body(), _req(), None)
+    assert e.value.status_code == status and e.value.detail["error"] == code
+    assert len(cli.calls) == 1
+
+
+async def test_chat_abo_busy_stays_429(dev_bridge, abo, monkeypatch):
+    cli, gates, _ = abo
+    gates["limiter"].return_value = (False, "cap full", {}, 60.0)
+    with ExitStack() as stack:
+        _handler(stack, AsyncMock(return_value=None))
+        with patch.object(credit_pool, "enabled", return_value=False):
+            with pytest.raises(HTTPException) as e:
+                await main._chat_completions_finanziert(_img_body(), _req(), None)
+    assert e.value.status_code == 429 and e.value.detail["error"] == "abo_vision_limiter"
+    assert e.value.detail["retryable"] is True and cli.calls == []

@@ -46,7 +46,7 @@ def v(tmp_path_factory):
 
 
 def _map(text: str, var: str):
-    m = re.search(r'map "?([^"\n{]*?)"? \$' + var + r" \{(.*?)\n\}", text, re.S)
+    m = re.search(r'map "?([^"\n{]*?)"? \$' + var + r" \{(.*?)\n\s*\}", text, re.S)
     assert m, var
     default, exact, regexes = None, {}, []
     for line in m.group(2).strip().splitlines():
@@ -156,3 +156,43 @@ def test_wrong_value_fails_before_writing(tmp_path, bad):
     assert proc.returncode != 0 and "ENERGY_SUBSCRIPTION_NO_HOP must be 0 or 1" in proc.stderr
     for f in FILES:
         assert (out / f).read_text() == (DOCKER / f).read_text(), f
+
+
+# --- location / : $backend_pool in the shared nginx.conf (Zweitprüfung B2) ----
+
+NGINX_CONF = (DOCKER / "nginx.conf").read_text()
+_GRID = [dict(hopped=h, prio=p, vision=vi, app=a)
+         for h in ("0", "1") for p in ("", "production", "PRODUCTION", "low")
+         for vi in ("", "gemini", "GEMINI", "anthropic")
+         for a in ("", "werking-energy", "Werking-Energy", "werking-report", "werking-energy-x")]
+
+
+def _backend_pool(include: str, hopped, prio, vision, app) -> str:
+    llm = _pool(include, hopped=hopped, prio=prio, vision=vision, app=app)
+    return _resolve(NGINX_CONF, "backend_pool", bridge_hopped=hopped, http_x_priority=prio,
+                    http_x_vision_provider=vision, llm_backend_pool=llm, http_x_app_id=app)
+
+
+def _old_backend_pool(hopped, prio, **_):
+    return "claude_production" if f"{hopped}:{prio}" == "0:production" else "claude_workers"
+
+
+@pytest.mark.parametrize("hop", [None, "0", "1"])
+@pytest.mark.parametrize("topology", ["upstreams-primary.conf", "upstreams-prod.conf"])
+def test_backend_pool_unchanged_without_switch(v, hop, topology):
+    """Switch off (and on the prod LB always): the reworked map answers like
+    the former "0:production" -> claude_production for every request shape."""
+    include = v[(hop, "0")][topology]
+    for case in _GRID:
+        assert _backend_pool(include, **case) == _old_backend_pool(**case), case
+
+
+@pytest.mark.parametrize("hop", ["0", "1"])
+def test_backend_pool_switch_on_keeps_energy_local_only(v, hop):
+    on = v[(hop, "1")]["upstreams-primary.conf"]
+    for case in _GRID:
+        want = _old_backend_pool(**case)
+        if (case["hopped"] == "0" and case["prio"] == "production"
+                and case["app"].lower() == "werking-energy" and case["vision"].lower() != "gemini"):
+            want = "claude_workers"
+        assert _backend_pool(on, **case) == want, case
