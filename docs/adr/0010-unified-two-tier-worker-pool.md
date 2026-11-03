@@ -1,5 +1,14 @@
 # ADR-0010: Ein Worker-Pool, zwei Schichten (Level 1 = Prod-Konten zuerst, fuer ALLE)
 
+**Nachtrag 03.11.2026 (KD-Entscheid):** Auf der Dev-Bridge ist der
+Peer-first-Weg fuer nicht priorisierten Verkehr standardmaessig AUS
+(Generator `PRIMARY_PEER_HOP=0`). Dev-/Staging-Last bleibt auf dem Dev-Pool;
+nur `X-Priority: production` und Abfragen von Jobs mit Heimat `prod` gehen
+weiter zur Prod-Bridge. Die Prod-Bridge ist unveraendert, ihr Ueberlauf auf
+Dev bleibt. Ruecknahme ist `PRIMARY_PEER_HOP=1`. Vertrag und Liste aller
+Stellen: `docs/contracts/dev-kein-prod-hop.md`. Der Text unten beschreibt den
+Zustand bis zu diesem Nachtrag.
+
 **Status:** ACCEPTED und LIVE, einschliesslich der Default-Pool-Stufe: nach
 ADR-0011 (Budget-Foederation) am 2026-08-31 11:43Z mit Rafaels Direktfreigabe
 reaktiviert (Commit `e5e0533`), von Rafael in ADR-0012 (03.09.) bestaetigt.

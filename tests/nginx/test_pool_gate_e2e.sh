@@ -242,8 +242,9 @@ start_stack() { # $1 = exhausted|healthy  $2 = METRICS_READER_TARGET for nginx (
 assert() {
     local label="$1" path="$2" want_code="$3" want_marker="$4" hdr="${5:-}"
     local out code body marker
-    # X-Bridge-Hop: 1 = the LOCAL tier. Without it the default pool is
-    # claude_production (ADR-0010: Level 1 = the peer bridge first), whose
+    # X-Bridge-Hop: 1 = the LOCAL tier. Under PRIMARY_PEER_HOP=1 (ADR-0010
+    # rollback mode) the default pool is claude_production (the peer bridge
+    # first; default since 03.11.2026 is local, dev-kein-prod-hop.md), whose
     # location has no pool gate — every assertion would then measure the
     # backup stub instead of the gate (that is how this harness read green
     # until 2026-10-10 while testing nothing).

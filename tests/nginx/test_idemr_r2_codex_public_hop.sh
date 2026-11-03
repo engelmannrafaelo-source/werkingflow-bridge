@@ -156,9 +156,20 @@ start_stack() { # <primary|prod>
     docker network create --internal "$NET" >/dev/null
     sed "s/\${BRIDGE_ID}/$id/g; s/\${BRIDGE_BACKUP_HOST}/192.0.2.10/g; s/\${BRIDGE_NET_GATEWAY}/192.0.2.1/g; s/\${METRICS_READER_TARGET}/metrics-elsewhere:8000/g" \
         "$D/nginx.conf" > "$WORK/nginx.conf"
+    # Since 03.11.2026 the committed primary include does NOT pick the peer
+    # as fixed bridge (PRIMARY_PEER_HOP=0, docs/contracts/dev-kein-prod-hop.md;
+    # proven in test_dev_no_prod_hop_e2e.sh). The peer mechanics tested here
+    # remain the supported rollback (PRIMARY_PEER_HOP=1), so primary runs
+    # against exactly that generated variant.
+    local src="$D/upstreams-$topo.conf"
+    if [ "$topo" = primary ]; then
+        mkdir -p "$WORK/gen"
+        PRIMARY_PEER_HOP=1 UPSTREAMS_OUT_DIR="$WORK/gen" "$REPO/scripts/generate-bridge-upstreams.sh" primary >/dev/null
+        src="$WORK/gen/upstreams-primary.conf"
+    fi
     # Worker addresses of the production file → the stub aliases worker1..4.
     sed -E "s/\\$\\{BRIDGE_BACKUP_HOST\\}/backup-host/g; s/\\$\\{BRIDGE_ID\\}/$id/g; s/[0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+:800([1-4])/worker\\1:8000/g" \
-        "$D/upstreams-$topo.conf" > "$WORK/upstreams.conf"
+        "$src" > "$WORK/upstreams.conf"
     # Guard: only stub hosts may be configured as upstream targets.
     if grep -E 'server +[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' "$WORK/upstreams.conf"; then
         echo "ABORT: real IP in upstreams under test"; exit 2
