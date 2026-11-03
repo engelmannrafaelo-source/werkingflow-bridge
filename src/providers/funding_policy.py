@@ -167,3 +167,31 @@ def mark_chat_response(request, result: Any) -> Any:
 def ledger_marker() -> dict:
     """provider_metadata additions for the call being booked right now."""
     return dict(_ledger_marker.get() or {})
+
+
+def pool_reservations(meta: Optional[dict]) -> list:
+    """Credit-pool reservation ids a ledger row's provider_metadata names.
+
+    Two shapes exist: ``credit_pool_reservation`` (one call: chat direct,
+    vision) and ``credit_pool_reservations`` (one row for many calls:
+    research-cloud run, document vision). Only what the coordinator handed
+    back for this call counts; nothing is derived from app name or headers."""
+    if not isinstance(meta, dict):
+        return []
+    out: list = []
+    single = meta.get("credit_pool_reservation")
+    if isinstance(single, str) and single:
+        out.append(single)
+    many = meta.get("credit_pool_reservations")
+    if isinstance(many, list):
+        out.extend(r for r in many if isinstance(r, str) and r)
+    return out
+
+
+def pool_funded(meta: Optional[dict]) -> bool:
+    """True when the call's own metadata proves promotional pool funding:
+    ``funding_policy == promotional_only`` AND at least one reservation id.
+    The policy marker alone is not enough (it can be stamped from the
+    request), the reservation is the coordinator's evidence (KD 03.11.2026)."""
+    return (isinstance(meta, dict) and meta.get("funding_policy") == PROMOTIONAL_ONLY
+            and bool(pool_reservations(meta)))

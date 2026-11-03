@@ -35,6 +35,11 @@ Contract:
     Such calls still land in in-memory prompt-metrics. App calls always
     carry X-User-ID (Layer-0 enforced), so in practice every app call is
     persisted.
+  • Exception (KD 03.11.2026): a credit-pool booking (reservation id in the
+    call's provider_meta) whose user has no users⋈tenants row is written
+    under the migration-032 anonymous identity with
+    provider_metadata.no_tenant=true (+ no_tenant_user_id), no budget
+    deduction. Schema-free: tenant_id/user_id stay NOT NULL.
 """
 from __future__ import annotations
 
@@ -60,7 +65,12 @@ from src.activity.delivery import (
     caller_gone,
     get_delivery_probe,
 )
-from src.activity.providers import PROVIDER_VERTEX_EU, REAL_COST_PROVIDERS, normalize_ledger_provider
+from src.activity.providers import (
+    PROVIDER_RESEARCH_CLOUD,
+    PROVIDER_VERTEX_EU,
+    REAL_COST_PROVIDERS,
+    normalize_ledger_provider,
+)
 from src.attribution import ANONYMOUS_USER_ID
 from src.budget.plan_resolution import PlanResolutionError
 from src.budget.plans import AmbiguousPlanCatalog, PlanCatalogUnavailable
@@ -93,6 +103,30 @@ _skip_counts: dict = defaultdict(int)
 # this is where callers expect to find it.
 
 
+def _pool_reservations(provider_meta: Optional[dict]) -> list:
+    from src.providers.funding_policy import pool_reservations
+    return pool_reservations(provider_meta)
+
+
+def _pool_booking_without_tenant(provider_meta: Optional[dict]) -> bool:
+    """A call whose own meta names a credit-pool reservation: it consumed (or
+    reserved) pool money and must get a ledger row even without a tenant.
+    Every other tenantless call keeps the unchanged skip:no_tenant."""
+    return bool(_pool_reservations(provider_meta))
+
+
+def _hop_meta() -> dict:
+    """ADR-0011 home booking, made traceable (KD 03.11.2026): a call that
+    ORIGINATED on the peer bridge is written into the HOME bridge's ledger
+    (ledger_client → call_platform(domain="user")); this says on that home
+    row which bridge/worker actually executed it. Empty for own-origin calls,
+    so their rows stay byte-for-byte unchanged."""
+    from src.federation import get_request_origin, is_foreign_origin, served_by_value
+    if not is_foreign_origin():
+        return {}
+    return {"bridge_origin": get_request_origin(), "bridge_executed_on": served_by_value()}
+
+
 def _buchung_gesichert() -> None:
     """Tell a job self-call that this booking is durable (FK25B2,
     src/jobs/teilverbrauch.py). Synchronous: no cancellation point."""
@@ -108,7 +142,8 @@ def _job_hook(name: str, *args: Any) -> None:
 
 
 def resolve_ledger_cost(
-    billing_mode_text: str, provider: str, call_cost_eur: float
+    billing_mode_text: str, provider: str, call_cost_eur: float,
+    *, provider_meta: Optional[dict] = None,
 ) -> tuple:
     """Map (tenant billing mode, serving provider) to the usage_events row's
     (billing_mode enum, real_cost_eur).
@@ -121,12 +156,23 @@ def resolve_ledger_cost(
       while the AWS invoice grows.
     - research-cloud (Weg C, direct Anthropic API key, no subscription
       coverage) is pay-per-use the same way — same reasoning as Bedrock.
-    - pay_per_token tenants pay per call → real == hypothetical.
+      EXCEPT a research-cloud run that the promotional credit pool paid for
+      (KD Finanzierungsquelle 03.11.2026): no cash leaves us, real 0.0,
+      hypothetical keeps the list price. Recognised ONLY from the call's own
+      provider_meta (funding_policy promotional_only + coordinator
+      reservation ids, funding_policy.pool_funded) — never from the app.
+    - pay_per_token tenants pay per call → real == hypothetical (unchanged,
+      also for pool-funded rows).
 
-    Pure function — unit-tested in tests/billing/test_ledger_real_cost.py.
+    Pure function — unit-tested in tests/billing/test_ledger_real_cost.py
+    (3-argument form) and tests/unit/test_ledger_funding_source.py.
     """
     if billing_mode_text == "pay_per_token":
         return "pay_per_token", call_cost_eur
+    if provider == PROVIDER_RESEARCH_CLOUD and provider_meta:
+        from src.providers.funding_policy import pool_funded
+        if pool_funded(provider_meta):
+            return "flat_rate_estimated", 0.0
     return "flat_rate_estimated", call_cost_eur if provider in REAL_COST_PROVIDERS else 0.0
 
 
@@ -617,6 +663,9 @@ async def persist_ai_call_activity(
     # never toward dropping it.
     outcome = OUTCOME_FAILED
     ledger_written = False
+    # Set only when a pool booking without tenant is written under the
+    # anonymous identity (see the billing-context block below).
+    no_tenant_meta: dict = {}
 
     from src.attribution import anonymous_reason
     anon_reason = anonymous_reason(user_id)
@@ -722,6 +771,42 @@ async def persist_ai_call_activity(
         _ctx = await ledger_client.load_billing_context(user_id)
         tenant_id = _ctx["tenantId"] if _ctx else None
         billing_mode_text = _ctx["billingMode"] if _ctx else "subscription"
+        if not tenant_id and _pool_booking_without_tenant(provider_meta):
+            # A credit-pool booking (coordinator reservation in the call's
+            # own meta) must never vanish from the ledger (KD 03.11.2026,
+            # Befund 02.11.: 185 pool bookings vs 33 rows; Mandant phasentest
+            # has no tenants row). usage_events.user_id/tenant_id are NOT
+            # NULL with FKs (migration 016), so the row books to the
+            # migration-032 anonymous identity — resolved through the same
+            # leaf, no hard-coded tenant — and says so in provider_metadata.
+            # No customer budget is touched (anonymous user, see deduction).
+            _anon_ctx = await ledger_client.load_billing_context(ANONYMOUS_USER_ID)
+            if not _anon_ctx or not _anon_ctx.get("tenantId"):
+                # NOT a skip: owed until migration 032's identity exists.
+                logger.error(
+                    "persist_ai_call_activity: pool booking without tenant "
+                    "(user=%s app=%s reservations=%s) and the anonymous identity "
+                    "%s has no tenant — run migration 032. The billing row is "
+                    "held in the spool until it exists.",
+                    user_id, app_id, _pool_reservations(provider_meta), ANONYMOUS_USER_ID,
+                )
+                return _settle(OUTCOME_FAILED)
+            no_tenant_meta = {
+                "no_tenant": True,
+                "no_tenant_user_id": user_id,
+                "no_tenant_reason": "users_tenants_row_missing",
+            }
+            logger.warning(
+                "persist_ai_call_activity: no users+tenants row for user=%s "
+                "(app=%s model=%s) — pool booking %s written under the "
+                "anonymous tenant %s with provider_metadata.no_tenant=true; "
+                "no budget deducted",
+                user_id, app_id, model, _pool_reservations(provider_meta),
+                _anon_ctx["tenantId"],
+            )
+            user_id = ANONYMOUS_USER_ID
+            tenant_id = _anon_ctx["tenantId"]
+            billing_mode_text = _anon_ctx.get("billingMode") or "subscription"
         if not tenant_id:
             # Skip is correct — a usage_events row is tenant-scoped and there
             # is no tenant to scope it to. But say so: this was the last
@@ -818,8 +903,10 @@ async def persist_ai_call_activity(
         # HERE, on the worker: platform-api records the decision, it does not
         # make it.
         bm_enum, real_cost = resolve_ledger_cost(
-            billing_mode_text, provider, call_cost_eur
+            billing_mode_text, provider, call_cost_eur, provider_meta=provider_meta,
         )
+        if no_tenant_meta:
+            payload["noTenant"] = True
 
         # Idempotent by construction (ADR-0009 Schritt 1, now over HTTP).
         # Two things make a replay safe rather than a second charge:
@@ -888,6 +975,9 @@ async def persist_ai_call_activity(
                 #   provider_metadata->>'app_id_raw'
                 **({"app_id_raw": app_id_rejected} if app_id_rejected else {}),
                 **(provider_meta or {}),
+                # Last, so no per-call meta can mask the fallback booking.
+                **no_tenant_meta,
+                **_hop_meta(),
             },
             "audit_event_type": event_type,
             "audit_payload": payload,
