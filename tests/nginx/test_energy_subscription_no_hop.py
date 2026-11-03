@@ -93,8 +93,11 @@ def _jobs_first(text, prio="", app=""):
 def test_default_off_is_byte_identical_and_committed(v):
     for hop in (None, "0", "1"):
         assert v[(hop, None)] == v[(hop, "0")]
+    # Committed = the default, or (during an Energy-Abo window) the NO_HOP=1
+    # variant — never anything else.
     for f in FILES:
-        assert v[(None, None)][f] == (DOCKER / f).read_text(), f
+        committed = (DOCKER / f).read_text()
+        assert committed in (v[(None, None)][f], v[(None, "1")][f]), f
 
 
 @pytest.mark.parametrize("hop", [None, "0", "1"])

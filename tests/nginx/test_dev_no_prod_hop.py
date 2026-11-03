@@ -77,6 +77,12 @@ def test_default_is_adr0010_and_committed(variants):
     peer-first) — and that is what is committed, i.e. what a dev LB deploy
     rolls out. The no-hop variant (0) is opt-in only."""
     assert variants[None] == variants["1"]
+    committed = (DOCKER / "upstreams-primary.conf").read_text()
+    if "ENERGY_SUBSCRIPTION_NO_HOP=1" in committed:
+        # Schalterfenster Energy-Abo (03.11.2026): the committed include is the
+        # NO_HOP=1 variant of the ADR-0010 default; the switch is checked in
+        # test_energy_subscription_no_hop.py.
+        return
     for f in FILES:
         assert (DOCKER / f).read_text() == variants[None][f], f
 
