@@ -119,3 +119,11 @@ Tests ohne Netz: `tests/nginx/test_dev_no_prod_hop.py` (Generator) und
   außerhalb laufender Energy-Läufe mit Schlüssel umstellen.
 - Die Jobliste zeigt keine Jobs mehr, die vorher auf Prod angelegt wurden.
   Abfragen per Kennung funktionieren weiter.
+
+## Ergänzung 03.11.2026: `ENERGY_SUBSCRIPTION_NO_HOP`
+
+Ein eigener Generator-Schalter (Default 0, Ausgabe byte-identisch) hält nur
+`X-App-ID: werking-energy` auf den lokalen Dev-Workern, damit der Energy-Abo-Modus
+nicht per Hop auf der Prod-Bridge über den Pool läuft. Vertrag:
+`energy-abo-bildweg.md` Abschnitt 3, Tests:
+`tests/nginx/test_energy_subscription_no_hop.py`.

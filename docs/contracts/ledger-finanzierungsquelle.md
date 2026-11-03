@@ -47,6 +47,13 @@ Entscheid KD 03.11.2026. Keine Migration, keine Umbuchung bestehender Zeilen.
 6. Der Nutzeraufruf bricht nie an der Buchung. Jeder Fehler bleibt „offen im
    Spool“ oder wird geloggt.
 
+7. **Abo-Bildweg und Abo-Modus** (`energy-abo-bildweg.md`). Zeilen auf dem
+   Abo tragen `funding_policy=subscription_staging_fallback`,
+   `funding_source=subscription` und `pool_umgangen` (true im Abo-Modus) und
+   keine Pool-Reservierung. Bildzeilen haben die Fahrspur
+   `vision_subscription`. `real_cost_eur` bleibt bei der bestehenden
+   Abo-Regel. Das erweitert die Felder von Punkt 1, ohne sie umzudeuten.
+
 ## Grenzen
 
 - Ein Recherche-Lauf ergibt eine Zeile und N Reservierungen. Die Anzahl der

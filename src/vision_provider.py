@@ -64,6 +64,10 @@ class VisionResponse:
     # Nur der Anthropic-Messages-Weg setzt sie (_vision_response_from).
     messung: Optional[UsageMessung] = None
     credit_meta: Optional[Dict[str, Any]] = None
+    # Nur der Abo-Bildweg (src/providers/subscription_vision.py) setzt sie:
+    # eigene Ledger-Fahrspur statt vision_prepaid und die Finanzierungsfelder.
+    api_key_lane: Optional[str] = None
+    ledger_meta: Optional[Dict[str, Any]] = None
 
 
 class VisionProvider:
@@ -325,9 +329,17 @@ class VisionProvider:
         timeout: float = 300.0,
         thinking: Optional[Dict[str, Any]] = None,
         output_config: Optional[Dict[str, Any]] = None,
+        subscription_fallback: Optional[bool] = None,
     ) -> VisionResponse:
         """
         Analyze images using direct Anthropic API.
+
+        ``subscription_fallback`` (Abo-Bildweg, KD 03.11.2026): True = der
+        Aufrufer weiß, dass seine Anfrage im Staging-Rückfall läuft (Chat-Pfad,
+        request.state); None = aus dem Marker der laufenden Anfrage lesen
+        (Dokument-Vision, funding_policy.subscription_fallback_in_context).
+        Dann geht das Bild über die CLI (src/providers/subscription_vision.py)
+        und NIE über den Pool oder ANTHROPIC_VISION_API_KEY.
 
         ``timeout`` defaults to 300s (fine for image analysis) but callers
         reusing this path for non-vision fallback (see
@@ -351,6 +363,23 @@ class VisionProvider:
         Returns:
             VisionResponse with analysis result
         """
+        if subscription_fallback is None:
+            # Erst der Schalter, dann der Import: der GPU-Privacy-Dienst nutzt
+            # diese Datei ohne den Rückfall (dort nie gesetzt) und braucht
+            # src/providers/funding_policy.py dann nicht.
+            subscription_fallback = False
+            if os.getenv("ENERGY_STAGING_SUBSCRIPTION_FALLBACK"):
+                from src.providers import funding_policy as _fp
+                subscription_fallback = _fp.subscription_fallback_in_context()
+        if subscription_fallback:
+            # Abo-Bildweg vor jedem anderen Zweig: kein Pool-Nachversuch, kein
+            # bezahlter Schlüssel. Die Prüfung der Kennung wiederholt das Modul.
+            from src.providers.subscription_vision import analyze_via_subscription
+            anthropic_messages, extracted_system = self._convert_to_anthropic_messages(messages)
+            return await analyze_via_subscription(
+                anthropic_messages, system_prompt=system_prompt or extracted_system, model=model,
+                max_tokens=max_tokens, thinking=thinking, output_config=output_config, timeout=timeout,
+            )
         if not self.api_key and not credit_pool.enabled():
             raise ValueError(
                 "ANTHROPIC_VISION_API_KEY environment variable not set. "

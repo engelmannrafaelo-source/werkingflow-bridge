@@ -107,7 +107,8 @@ async def test_chat_pool_missing_runs_subscription(dev_bridge):
     assert seen == [fp.CAUSE_POOL_MISSING]
     assert result["x_funding"] == {"funding_policy": "subscription_staging_fallback",
                                    "automatic_paid_fallback": False,
-                                   "funding_fallback_cause": "credit_pool_missing"}
+                                   "funding_fallback_cause": "credit_pool_missing",
+                                   "funding_source": "subscription", "pool_umgangen": False}
 
 
 @pytest.mark.asyncio
@@ -182,10 +183,10 @@ async def test_fallback_goes_through_subscription_admission(dev_bridge):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("extra", [{"provider_tier": "openrouter"}, {"provider_tier": "gemini-vision"},
-                                   {"enable_tools": True}, {"session_id": "old"},
-                                   {"messages": [{"role": "user", "content": [
-                                       {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}}]}]}])
+                                   {"enable_tools": True}, {"session_id": "old"}])
 async def test_fallback_refuses_paid_or_unsupported_shapes(dev_bridge, extra):
+    # Bilder sind seit dem Abo-Bildweg (03.11.2026) kein 409 mehr, sondern
+    # laufen über die CLI: tests/unit/test_energy_abo_bildweg.py.
     admission = AsyncMock(side_effect=AssertionError("must refuse before admission"))
     with patch.object(credit_pool, "enabled", return_value=False), patch.object(main, "enforce_pool_admission", admission):
         with pytest.raises(HTTPException) as e:
@@ -267,9 +268,11 @@ async def test_ledger_row_carries_funding_marker(dev_bridge):
         fp.activate_subscription_fallback(_req(), fp.CAUSE_POOL_UNAVAILABLE)
         await _persist_once(spooled)
     await asyncio.create_task(run())
+    # Abo-Modus (03.11.2026) erweitert um funding_source/pool_umgangen.
     assert spooled["provider_meta"] == {"funding_policy": "subscription_staging_fallback",
                                         "funding_fallback_cause": "credit_pool_unavailable",
-                                        "automatic_paid_fallback": False, "usage_source": "cli"}
+                                        "automatic_paid_fallback": False, "usage_source": "cli",
+                                        "funding_source": "subscription", "pool_umgangen": False}
 
 
 @pytest.mark.asyncio

@@ -26,6 +26,21 @@ Laute Grenzen (kein Marker, keine stille Teilantwort, nie der bezahlte Schlüsse
 - Pool-/Provider-``HTTPException`` (429/503/4xx) → Status 1:1.
 - Trennt der Aufrufer die Verbindung, wird die Beschreibung abgebrochen (keine
   weitere Pool-Ausgabe für eine Antwort, die niemand mehr liest).
+
+Abo-Bildweg (KD 03.11.2026, docs/contracts/energy-abo-bildweg.md): Nur auf der
+Dev-Bridge im Staging-Rückfall (``funding_policy``) laufen Triage und
+Beschreibung über das Abo (``src/providers/subscription_vision.py``):
+
+- Pool im Worker aus → der Aufrufer hat den Rückfall schon aktiviert
+  (``credit_pool_missing``), es entsteht kein Pool-Aufruf.
+- Pool an, aber ``PoolUnavailable`` (kein Konto mit Budget, Koordinator weg)
+  und noch kein Pool-Aufruf gelungen → Rückfall (``credit_pool_unavailable``)
+  und der ganze Lauf beginnt einmal neu auf dem Abo. Ist schon ein Bild über
+  den Pool gelaufen, bleibt es beim lauten Fehler (keine gemischte
+  Finanzierung in einem Dokument).
+- Schätzung der Frist mit ``ABO_VISION_MAX_PARALLEL`` Aufrufen je Runde.
+- Attestierung ``vision_funding: "subscription_staging_fallback"`` nur, wenn
+  jeder Aufruf den Abo-Nachweis trägt; sonst 409 wie beim Pool.
 """
 from __future__ import annotations
 
@@ -41,6 +56,9 @@ from fastapi import HTTPException
 logger = logging.getLogger(__name__)
 
 NOT_POOL_FUNDED = "promotional_only: document vision not pool-funded; no paid fallback"
+NOT_SUBSCRIPTION_FUNDED = "subscription_staging_fallback: document vision not subscription-funded; no paid fallback"
+#: Wert von ``vision_funding`` für ein Dokument, dessen Bilder das Abo beschrieb.
+FUNDING_SUBSCRIPTION = "subscription_staging_fallback"
 
 # Gleiche Parallelität wie describe_images/select_relevant_images (Standard 4).
 _PARALLEL = 4
@@ -65,8 +83,8 @@ def _error(status: int, message: str) -> Tuple[int, Dict[str, Any], None]:
     return status, {"status": "error", "error": message}, None
 
 
-def _runden(n: int) -> int:
-    return math.ceil(n / _PARALLEL) if n > 0 else 0
+def _runden(n: int, parallel: int = _PARALLEL) -> int:
+    return math.ceil(n / parallel) if n > 0 else 0
 
 
 async def _watch_disconnect(request) -> str:
@@ -100,12 +118,14 @@ async def describe_in_worker(
     gefüllt mit den Aufrufen, die tatsächlich liefen (Ledger-Buchung).
     """
     from src.providers import credit_pool
+    from src.providers import funding_policy as _fp
 
     images = payload.get("images") or {}
     if not isinstance(images, dict) or not images:
         return 200, payload, None
 
-    if not credit_pool.enabled():
+    abo = _fp.subscription_fallback_in_context()
+    if not credit_pool.enabled() and not abo:
         logger.error(f"docconvert worker vision: {len(images)} Bilder, Credit-Pool im Worker aus → 409")
         return _error(409, NOT_POOL_FUNDED)
 
@@ -135,6 +155,32 @@ async def describe_in_worker(
             f"{max_total / 2**20:g} MB (Base64); keine Beschreibung gestartet"
         ))
 
+    # Caller-owned when given: then the pool calls that DID run stay visible to
+    # the caller even when this returns an error (no usage list), so the ledger
+    # can still book them (KD Finanzierungsquelle 03.11.2026).
+    if funding_log is None:
+        funding_log = []
+    status, body, usage = await _beschreiben(images, payload, fields, filename, deadline, request,
+                                             funding_log, abo=abo, s_per_call=s_per_call)
+    if status == _POOL_KANN_NICHT_ZAHLEN:
+        # Pool kann das erste Bild nicht zahlen (vor jeder Messages-Anfrage):
+        # einmal neu auf dem Abo, wenn der Rückfall hier gilt.
+        if not funding_log and request is not None and _fp.fallback_eligible(request):
+            logger.warning("docconvert worker vision: Pool kann nicht zahlen → Abo-Bildweg (Staging-Rückfall)")
+            _fp.activate_subscription_fallback(request, _fp.CAUSE_POOL_UNAVAILABLE)
+            return await _beschreiben(images, payload, fields, filename, deadline, request,
+                                      funding_log, abo=True, s_per_call=s_per_call)
+        exc = body
+        logger.error(f"docconvert worker vision: {exc.status_code} {exc.detail}")
+        return _error(exc.status_code, str(exc.detail))
+    return status, body, usage
+
+
+_POOL_KANN_NICHT_ZAHLEN = -1
+
+
+async def _beschreiben(images, payload, fields, filename, deadline, request, funding_log, *,
+                       abo: bool, s_per_call: float):
     from src.privacy_service.image_describer import (
         append_descriptions_to_markdown,
         describe_images,
@@ -145,20 +191,18 @@ async def describe_in_worker(
         should_triage,
         split_figures_and_pages,
     )
+    from src.providers.credit_pool import PoolUnavailable
 
     describe_prompt = fields.get("describe_prompt") or ""
     triage_prompt = fields.get("triage_prompt") or ""
-    # Caller-owned when given: then the pool calls that DID run stay visible to
-    # the caller even when this returns an error (no usage list), so the ledger
-    # can still book them (KD Finanzierungsquelle 03.11.2026).
-    if funding_log is None:
-        funding_log = []
+    parallel = _abo_parallel() if abo else _PARALLEL
 
     def remaining() -> float:
         return deadline - time.monotonic()
 
     figures, _rendered = split_figures_and_pages(images)
-    triage_calls = _runden(math.ceil(len(figures) / _triage_batch_size())) if should_triage(figures) else 0
+    triage_calls = (_runden(math.ceil(len(figures) / _triage_batch_size()), parallel)
+                    if should_triage(figures) else 0)
     # Vorab: Triage plus mindestens eine Beschreibungsrunde muss in die Restfrist passen.
     need = (triage_calls + 1) * s_per_call
     if need > remaining():
@@ -176,7 +220,7 @@ async def describe_in_worker(
         to_describe, skipped, triage_meta = await plan_image_descriptions(
             images, triage_prompt=triage_prompt, promotional_only=True, funding_log=funding_log,
         )
-        need_describe = _runden(len(to_describe)) * s_per_call
+        need_describe = _runden(len(to_describe), parallel) * s_per_call
         if need_describe > remaining():
             raise _Frist(
                 f"document vision: Restfrist {max(0.0, remaining()):.0f} s reicht nicht für "
@@ -211,6 +255,12 @@ async def describe_in_worker(
     except _Frist as exc:
         logger.error(f"docconvert worker vision: {exc}")
         return _error(504, str(exc))
+    except PoolUnavailable as exc:
+        if abo:
+            # Kann im Abo-Lauf nicht entstehen (kein Pool-Aufruf); falls doch: laut.
+            logger.error(f"docconvert worker vision: Pool-Fehler im Abo-Lauf: {exc.status_code} {exc.detail}")
+            return _error(exc.status_code, str(exc.detail))
+        return _POOL_KANN_NICHT_ZAHLEN, exc, None
     except HTTPException as exc:
         # Pool 429/503, Koordinator 409, Provider-4xx: Status 1:1, kein Marker.
         logger.error(f"docconvert worker vision: {exc.status_code} {exc.detail}")
@@ -222,10 +272,18 @@ async def describe_in_worker(
         logger.error(f"docconvert worker vision: {type(exc).__name__}: {exc}", exc_info=True)
         return _error(502, f"document vision failed: {type(exc).__name__}: {exc}")
 
-    unfunded = [e for e in funding_log if not (e.get("credit_meta") or {}).get("credit_pool_reservation")]
-    if unfunded:
-        logger.error(f"docconvert worker vision: {len(unfunded)} Vision-Aufrufe ohne Pool-Nachweis → 409")
-        return _error(409, NOT_POOL_FUNDED)
+    if abo:
+        unfunded = [e for e in funding_log
+                    if (e.get("ledger_meta") or {}).get("funding_policy") != FUNDING_SUBSCRIPTION
+                    or e.get("credit_meta")]
+        if unfunded:
+            logger.error(f"docconvert worker vision: {len(unfunded)} Vision-Aufrufe ohne Abo-Nachweis → 409")
+            return _error(409, NOT_SUBSCRIPTION_FUNDED)
+    else:
+        unfunded = [e for e in funding_log if not (e.get("credit_meta") or {}).get("credit_pool_reservation")]
+        if unfunded:
+            logger.error(f"docconvert worker vision: {len(unfunded)} Vision-Aufrufe ohne Pool-Nachweis → 409")
+            return _error(409, NOT_POOL_FUNDED)
     if to_describe and not any(e.get("kind") == "describe" for e in funding_log):
         # Jede Beschreibung ist am Anbieter gescheitert (5xx/unlesbar → Marker):
         # kein Dokument „mit Bildbeschreibungen“, das keine einzige enthält.
@@ -240,8 +298,13 @@ async def describe_in_worker(
     if triage_meta:
         body["described_count"] = len(to_describe)
         body["triage"] = triage_meta
-    body["vision_funding"] = "credit_pool"
+    body["vision_funding"] = FUNDING_SUBSCRIPTION if abo else "credit_pool"
     return 200, body, funding_log
+
+
+def _abo_parallel() -> int:
+    from src.providers.subscription_vision import ABO_VISION_MAX_PARALLEL
+    return ABO_VISION_MAX_PARALLEL
 
 
 class _Frist(Exception):

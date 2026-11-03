@@ -43,8 +43,11 @@ weiterhin verhindern). Code: `src/providers/funding_policy.py`.
   Text-Wegwahl auf den direkten Weg, Perplexity — wird mit 409 bzw. Fehler
   abgewiesen oder abgeschaltet, nie umgeleitet. `automatic_paid_fallback` bleibt
   `false`.
-- Nicht umgestellt (bleiben strikt): Dokumentkonvertierung mit
-  Bildbeschreibungen (kein Abo-Bildweg), `/v1/doc-agent`.
+- Bilder (Chat und Dokumentkonvertierung) laufen seit 03.11.2026 über den
+  Abo-Bildweg (CLI, nur `Read`), siehe `energy-abo-bildweg.md`. Dort steht
+  auch der Abo-Modus (`X-Funding-Source: subscription` bzw.
+  `ENERGY_STAGING_SUBSCRIPTION_ONLY` + Allowlist), in dem der Pool gar nicht
+  erst gefragt wird. Strikt bleibt `/v1/doc-agent`.
 
 ## Sichtbarkeit
 

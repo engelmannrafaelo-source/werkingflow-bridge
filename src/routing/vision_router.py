@@ -161,9 +161,14 @@ async def route_to_vision(
     output_config: Optional[Dict[str, Any]] = None,
     target: str = VISION_TARGET_ANTHROPIC,
     gemini_thinking_budget: Optional[int] = None,
+    subscription_fallback: bool = False,
 ) -> VisionResult:
     """
     Route request to Vision API
+
+    ``subscription_fallback`` (Abo-Bildweg): the request runs in the Energy
+    staging fallback. Then only the CLI subscription may see the image —
+    a Gemini target is refused (409), never served.
 
     Args:
         messages: Messages in vision-compatible format (use prepare_messages_for_vision)
@@ -183,6 +188,10 @@ async def route_to_vision(
     Raises:
         Exception: If vision analysis fails
     """
+    if subscription_fallback and target != VISION_TARGET_ANTHROPIC:
+        from fastapi import HTTPException
+        raise HTTPException(409, "subscription_staging_fallback: images only over the CLI subscription "
+                                 f"(target {target!r} refused); no paid fallback")
     if target == VISION_TARGET_GEMINI:
         from src.providers.gemini_vision import (
             get_gemini_vision_provider,
@@ -230,7 +239,8 @@ async def route_to_vision(
         temperature=temperature,
         timeout=timeout,
         thinking=thinking,
-        output_config=output_config
+        output_config=output_config,
+        subscription_fallback=subscription_fallback,
     )
 
     return VisionResult(
@@ -239,9 +249,11 @@ async def route_to_vision(
         usage=vision_response.usage,
         stop_reason=vision_response.stop_reason,
         ledger_provider=PROVIDER_ANTHROPIC,
-        api_key_lane=LANE_ANTHROPIC_PREPAID,
+        # Abo-Bildweg: eigene Fahrspur (vision_subscription), nie die der
+        # Prepaid-Tageskappe.
+        api_key_lane=vision_response.api_key_lane or LANE_ANTHROPIC_PREPAID,
         messung=vision_response.messung,
-        extra_meta=vision_response.credit_meta or {},
+        extra_meta=vision_response.credit_meta or vision_response.ledger_meta or {},
     )
 
 
@@ -254,6 +266,7 @@ async def check_and_route_vision(
     output_config: Optional[Dict[str, Any]] = None,
     target: str = VISION_TARGET_ANTHROPIC,
     gemini_thinking_budget: Optional[int] = None,
+    subscription_fallback: bool = False,
 ) -> Optional[VisionResult]:
     """
     Check if messages need vision routing, and route if needed
@@ -293,4 +306,5 @@ async def check_and_route_vision(
         output_config=output_config,
         target=target,
         gemini_thinking_budget=gemini_thinking_budget,
+        subscription_fallback=subscription_fallback,
     )

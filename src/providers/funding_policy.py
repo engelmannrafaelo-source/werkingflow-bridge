@@ -43,6 +43,31 @@ them):
 
 They appear in the chat response (``x_funding``), the research response
 (``funding_policy``) and in the ledger row's ``provider_metadata``.
+
+Abo-Modus (KD 03.11.2026, Energy-Owner): the caller may ask for the
+subscription EXPLICITLY, then the pool is not touched at all (no /accounts,
+no reserve, no Messages call) — chat (text and images), research and the
+document vision. Contract (docs/contracts/energy-abo-bildweg.md):
+
+* header ``X-Funding-Source: subscription`` (alias ``abo``); ``pool`` or no
+  header = today's behaviour; any other value = 400;
+* or the worker switch ``ENERGY_STAGING_SUBSCRIPTION_ONLY`` — only for the
+  Energy calls whose ``X-User-ID`` is in ``ENERGY_STAGING_SUBSCRIPTION_ONLY_USERS``
+  (comma list, UUID or e-mail, case-insensitive; empty = the switch has no
+  effect, fail-closed), unless the header says ``pool``. The list separates
+  environments by convention: under the shared API key X-User-ID is
+  caller-claimed, not proof of origin (no secure origin detection today);
+* effective only where the staging fallback is allowed (switch, dev identity,
+  own origin) and for werking-energy. A header asking for the subscription
+  where that does not hold is refused with 409 — never a silent pool route.
+* causes ``subscription_requested`` / ``subscription_mode``; markers add
+  ``pool_umgangen`` and ``funding_source``. Worker check:
+  ``pool_umgehung_status()``.
+
+Images (Abo-Bildweg, KD 03.11.2026): in the fallback, images go over the CLI
+subscription with only the Read tool (src/providers/subscription_vision.py,
+docs/contracts/energy-abo-bildweg.md) — chat and /v1/document/convert. Every
+other image route (paid vision key, Gemini, Bedrock) stays refused.
 """
 from __future__ import annotations
 
@@ -57,6 +82,18 @@ SUBSCRIPTION_STAGING_FALLBACK = "subscription_staging_fallback"
 
 CAUSE_POOL_MISSING = "credit_pool_missing"
 CAUSE_POOL_UNAVAILABLE = "credit_pool_unavailable"
+#: Abo-Modus: the pool is bypassed on purpose, never asked.
+CAUSE_SUBSCRIPTION_REQUESTED = "subscription_requested"
+CAUSE_SUBSCRIPTION_MODE = "subscription_mode"
+_BYPASS_CAUSES = (CAUSE_SUBSCRIPTION_REQUESTED, CAUSE_SUBSCRIPTION_MODE)
+_ALL_CAUSES = (CAUSE_POOL_MISSING, CAUSE_POOL_UNAVAILABLE, *_BYPASS_CAUSES)
+
+FUNDING_SOURCE_HEADER = "x-funding-source"
+SUBSCRIPTION_ONLY_ENV = "ENERGY_STAGING_SUBSCRIPTION_ONLY"
+SUBSCRIPTION_ONLY_USERS_ENV = "ENERGY_STAGING_SUBSCRIPTION_ONLY_USERS"
+FUNDING_SOURCE_SUBSCRIPTION = "subscription"
+FUNDING_SOURCE_POOL = "pool"
+_SUBSCRIPTION_VALUES = frozenset({"subscription", "abo"})
 
 FALLBACK_SWITCH_ENV = "ENERGY_STAGING_SUBSCRIPTION_FALLBACK"
 #: Bridge identities (BRIDGE_ORIGIN_ID) on which the switch may take effect.
@@ -105,7 +142,7 @@ def fallback_cause(request) -> Optional[str]:
     if request is None:
         return None
     cause = getattr(getattr(request, "state", None), _STATE_ATTR, None)
-    return cause if cause in (CAUSE_POOL_MISSING, CAUSE_POOL_UNAVAILABLE) else None
+    return cause if cause in _ALL_CAUSES else None
 
 
 def subscription_fallback_active(request) -> bool:
@@ -126,7 +163,110 @@ def activate_subscription_fallback(request, cause: str) -> None:
                                  "no paid fallback")
     setattr(request.state, _STATE_ATTR, cause)
     _ledger_marker.set({"funding_policy": SUBSCRIPTION_STAGING_FALLBACK,
-                        "funding_fallback_cause": cause, "automatic_paid_fallback": False})
+                        "funding_fallback_cause": cause, "automatic_paid_fallback": False,
+                        "funding_source": FUNDING_SOURCE_SUBSCRIPTION,
+                        "pool_umgangen": cause in _BYPASS_CAUSES})
+
+
+def requested_funding_source(request) -> Optional[str]:
+    """``X-Funding-Source`` of the request: "subscription", "pool" or None.
+    An unknown value is a caller error (400), not a silent default."""
+    if request is None:
+        return None
+    raw = (request.headers.get(FUNDING_SOURCE_HEADER) or "").strip().lower()
+    if not raw:
+        return None
+    if raw in _SUBSCRIPTION_VALUES:
+        return FUNDING_SOURCE_SUBSCRIPTION
+    if raw == FUNDING_SOURCE_POOL:
+        return FUNDING_SOURCE_POOL
+    raise HTTPException(400, {"error": "funding_source_invalid",
+                              "message": f"X-Funding-Source={raw!r} unknown; allowed: subscription, abo, pool"})
+
+
+def _switch_on(name: str) -> bool:
+    return (os.getenv(name) or "").strip().lower() in _TRUTHY
+
+
+def _subscription_only_users() -> frozenset:
+    raw = os.getenv(SUBSCRIPTION_ONLY_USERS_ENV) or ""
+    return frozenset(v.strip().lower() for v in raw.split(",") if v.strip())
+
+
+def _user_allowed(request) -> bool:
+    users = _subscription_only_users()
+    user = (request.headers.get("x-user-id") or "").strip().lower() if request is not None else ""
+    return bool(users) and bool(user) and user in users
+
+
+def subscription_mode_cause(request) -> Optional[str]:
+    """The Abo-Modus cause of this request, or None (today's behaviour).
+
+    Raises 409 when the header asks for the subscription where it is not
+    allowed (other app, prod bridge, foreign origin, switch off): an explicit
+    funding wish that cannot be met is refused, never served from the pool."""
+    source = requested_funding_source(request)
+    if source == FUNDING_SOURCE_POOL:
+        return None
+    if source == FUNDING_SOURCE_SUBSCRIPTION:
+        if not (promotional_only(request) and staging_subscription_fallback_allowed()):
+            raise HTTPException(409, {
+                "error": "subscription_funding_not_available",
+                "message": ("X-Funding-Source: subscription only for werking-energy on the dev bridge "
+                            "with the staging switch and own origin; no pool, no paid fallback"),
+                "automatic_paid_fallback": False})
+        return CAUSE_SUBSCRIPTION_REQUESTED
+    if (_switch_on(SUBSCRIPTION_ONLY_ENV) and promotional_only(request) and _user_allowed(request)
+            and staging_subscription_fallback_allowed()):
+        return CAUSE_SUBSCRIPTION_MODE
+    return None
+
+
+def enter_subscription_mode(request) -> bool:
+    """Switch this request to the subscription BEFORE any pool step when the
+    Abo-Modus applies. True = the request runs on the subscription."""
+    if subscription_fallback_active(request):
+        return True
+    cause = subscription_mode_cause(request)
+    if cause is None:
+        return False
+    activate_subscription_fallback(request, cause)
+    return True
+
+
+def pool_umgangen(request) -> bool:
+    """True when this request bypasses the pool on purpose (Abo-Modus)."""
+    return fallback_cause(request) in _BYPASS_CAUSES
+
+
+def pool_umgehung_status(user_id: Optional[str] = None) -> dict:
+    """Worker check without a request (origin = own bridge): would an Energy
+    call bypass the pool with / without the header? ``user_id`` = the
+    X-User-ID to check against the allowlist (None: any listed user). The
+    decision is one and the same for every path, ``wege`` names them."""
+    gruende = []
+    if not _switch_on(FALLBACK_SWITCH_ENV):
+        gruende.append(f"{FALLBACK_SWITCH_ENV} nicht gesetzt")
+    from src.federation import self_origin_id
+    own = self_origin_id().strip().lower()
+    if own not in SUBSCRIPTION_FALLBACK_BRIDGES:
+        gruende.append(f"BRIDGE_ORIGIN_ID={own!r} nicht in {sorted(SUBSCRIPTION_FALLBACK_BRIDGES)}")
+    erlaubt = not gruende
+    users = _subscription_only_users()
+    user_ok = bool(users) and (user_id is None or user_id.strip().lower() in users)
+    ohne = erlaubt and _switch_on(SUBSCRIPTION_ONLY_ENV) and user_ok
+    if erlaubt and not _switch_on(SUBSCRIPTION_ONLY_ENV):
+        gruende.append(f"{SUBSCRIPTION_ONLY_ENV} nicht gesetzt: ohne Header gilt Pool zuerst")
+    elif erlaubt and not users:
+        gruende.append(f"{SUBSCRIPTION_ONLY_USERS_ENV} leer: Schalter wirkt nicht (fail-closed)")
+    elif erlaubt and not user_ok:
+        gruende.append(f"X-User-ID {user_id!r} nicht in {SUBSCRIPTION_ONLY_USERS_ENV}")
+    wege = ("chat", "bild", "document_convert", "research")
+    return {"pool_umgangen_mit_header": erlaubt, "pool_umgangen_ohne_header": ohne,
+            "wege_mit_header": {w: erlaubt for w in wege},
+            "wege_ohne_header": {w: ohne for w in wege},
+            "allowlist_eintraege": len(users),
+            "bridge_origin_id": own, "gruende": gruende}
 
 
 def current_policy(request) -> Optional[str]:
@@ -144,6 +284,8 @@ def response_marker(request) -> Optional[dict]:
     marker = {"funding_policy": policy, "automatic_paid_fallback": False}
     if policy == SUBSCRIPTION_STAGING_FALLBACK:
         marker["funding_fallback_cause"] = fallback_cause(request)
+        marker["funding_source"] = FUNDING_SOURCE_SUBSCRIPTION
+        marker["pool_umgangen"] = pool_umgangen(request)
     return marker
 
 
@@ -152,6 +294,10 @@ def mark_chat_response(request, result: Any) -> Any:
     marker = response_marker(request)
     if marker is None:
         return result
+    if hasattr(result, "model_dump") and not hasattr(result, "headers"):
+        # Pydantic response (vision branch: ChatCompletionResponse) — as the
+        # dict FastAPI would serialise anyway, so the marker is not lost.
+        result = result.model_dump(mode="json")
     if isinstance(result, dict):
         result["x_funding"] = marker
     else:
@@ -162,6 +308,16 @@ def mark_chat_response(request, result: Any) -> Any:
             except Exception:  # noqa: BLE001 — immutable header container: body stays as is
                 pass
     return result
+
+
+def subscription_fallback_in_context() -> bool:
+    """For code without the request (VisionProvider in the document vision):
+    the current request was switched to the staging subscription fallback
+    (activate_subscription_fallback set the marker in this context) AND the
+    bridge/origin rule holds right now. Never true from a header."""
+    marker = _ledger_marker.get()
+    return (isinstance(marker, dict) and marker.get("funding_policy") == SUBSCRIPTION_STAGING_FALLBACK
+            and staging_subscription_fallback_allowed())
 
 
 def ledger_marker() -> dict:

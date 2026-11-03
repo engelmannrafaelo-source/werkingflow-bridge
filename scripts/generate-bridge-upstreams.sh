@@ -116,6 +116,31 @@ primary_peer_hop() {
     esac
 }
 
+# --- ENERGY_SUBSCRIPTION_NO_HOP: werking-energy stays on the dev workers (03.11.2026) ---
+# KD-Entscheid 03.11.2026 (Energy-Abo-Modus, docs/contracts/energy-abo-bildweg.md):
+# the Energy staging subscription mode (ENERGY_STAGING_SUBSCRIPTION_ONLY) is a
+# DEV-worker switch. A werking-energy call the dev LB hops to the prod bridge
+# would be pool-funded there, i.e. bypass the switch. So, on primary only:
+#   ENERGY_SUBSCRIPTION_NO_HOP=0 (DEFAULT)  nothing changes; the committed
+#       include is byte-identical to the one without this switch.
+#   ENERGY_SUBSCRIPTION_NO_HOP=1  X-App-ID werking-energy (case-insensitive)
+#       never takes claude_production: chat/research and POST /v1/jobs (keyed
+#       and unkeyed, also with X-Priority: production) ride the LOCAL workers.
+#       Every other caller keeps ADR-0010 / PRIMARY_PEER_HOP exactly. Polls of
+#       jobs whose id names the prod bridge still reach the peer (ADR-0012).
+# On production the switch has NO effect (upstreams-prod.conf byte-identical).
+# Activation: ENERGY_SUBSCRIPTION_NO_HOP=1 scripts/generate-bridge-upstreams.sh
+# primary, commit docker/upstreams-primary.conf, deploy the dev LB.
+energy_subscription_no_hop() {
+    case "${ENERGY_SUBSCRIPTION_NO_HOP:-0}" in
+        0|1) echo "${ENERGY_SUBSCRIPTION_NO_HOP:-0}" ;;
+        *) echo "ERROR: ENERGY_SUBSCRIPTION_NO_HOP must be 0 or 1, got '${ENERGY_SUBSCRIPTION_NO_HOP}'" >&2; return 1 ;;
+    esac
+}
+
+# nginx map regex for the werking-energy app id at the END of a map key.
+ENERGY_APP_RE='\s*werking-energy\s*$'
+
 # $1 = worker name, $2 = NAME (string) of the associative targets array in
 # scope (e.g. "PROD_WORKER_TARGETS") -> "host:port", defaulting to the
 # same-host-DNS target. Reads the array via indirect expansion rather than a
@@ -372,7 +397,22 @@ emit_keyed_job_routing() {
     echo "    keepalive 8;"
     echo "}"
     echo
-    if [ "$first" = priority ]; then
+    if [ "$id" = primary ] && [ "$(energy_subscription_no_hop)" = 1 ]; then
+        echo "# ENERGY_SUBSCRIPTION_NO_HOP=1: a keyed werking-energy job always lives"
+        echo "# HERE (dev subscription mode); everyone else as without the switch."
+        if [ "$first" = priority ]; then
+            echo "map \"\$http_x_priority:\$http_x_app_id\" \$jobs_peer_first {"
+            echo "    default    0;"
+            echo "    \"~*^[^:]*:${ENERGY_APP_RE}\" 0;"
+            echo "    \"~^production:\" 1;"
+            echo "}"
+        else
+            echo "map \$http_x_app_id \$jobs_peer_first {"
+            echo "    default ${first};"
+            echo "    \"~*^${ENERGY_APP_RE}\" 0;"
+            echo "}"
+        fi
+    elif [ "$first" = priority ]; then
         echo "# PRIMARY_PEER_HOP=0: a keyed job lives HERE unless it is real"
         echo "# prod-priority traffic (X-Priority: production, exact value as in"
         echo "# \$llm_backend_pool) — that one keeps its fixed bridge at the peer."
@@ -492,7 +532,30 @@ HEADER
     echo "# \$bridge_hopped (nginx.conf) is 1 when the request already crossed a"
     echo "# bridge once (X-Bridge-Hop); hopped traffic is ALWAYS served from the"
     echo "# local tier — that is the one-hop loop guard."
-    if [ "$id" = "primary" ] && [ "$(primary_peer_hop)" = 0 ]; then
+    if [ "$id" = "primary" ] && [ "$(energy_subscription_no_hop)" = 1 ]; then
+        echo "# primary, ENERGY_SUBSCRIPTION_NO_HOP=1 (Energy-Abo-Modus, KD 03.11.2026):"
+        echo "# X-App-ID werking-energy never rides claude_production; every other"
+        echo "# caller exactly as with PRIMARY_PEER_HOP=$(primary_peer_hop) alone."
+        if [ "$(primary_peer_hop)" = 0 ]; then
+            cat <<MAP
+map "\$bridge_hopped:\$http_x_priority:\$http_x_vision_provider:\$http_x_app_id" \$llm_backend_pool {
+    default                    claude_workers;
+    "~*^0:production:gemini:"  claude_workers;
+    "~*^0:production:[^:]*:${ENERGY_APP_RE}"  claude_workers;
+    "~*^0:production:"         claude_production;
+}
+MAP
+        else
+            cat <<MAP
+map "\$bridge_hopped:\$http_x_vision_provider:\$http_x_app_id" \$llm_backend_pool {
+    default         claude_production;
+    "~^1:"          claude_workers;
+    "~*^0:gemini:"  claude_workers;
+    "~*^0:[^:]*:${ENERGY_APP_RE}"  claude_workers;
+}
+MAP
+        fi
+    elif [ "$id" = "primary" ] && [ "$(primary_peer_hop)" = 0 ]; then
         echo "# primary, PRIMARY_PEER_HOP=0 (DEFAULT since 03.11.2026, KD-Entscheid):"
         echo "# NO peer-first. Dev/staging load stays on the dev pool and the dev"
         echo "# accounts (local claude_workers, full Lua account gate). Only real"
@@ -594,8 +657,9 @@ HEADER
 
 main() {
     local target="${1:-all}"
-    # Validate the switch BEFORE any file is truncated by a redirect.
+    # Validate the switches BEFORE any file is truncated by a redirect.
     primary_peer_hop >/dev/null
+    energy_subscription_no_hop >/dev/null
     case "$target" in
         primary)
             generate primary > "${OUT_DIR}/upstreams-primary.conf"; echo "[gen] wrote docker/upstreams-primary.conf"

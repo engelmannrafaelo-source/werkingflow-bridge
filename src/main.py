@@ -72,7 +72,7 @@ from src.tool_leak_detector import hardened_system_prompt, looks_like_tool_leak
 from src.vision_provider import VisionProvider, get_vision_provider
 from src.routing.vision_router import (
     check_and_route_vision, prepare_messages_for_vision, has_vision_content,
-    resolve_vision_target, VISION_TARGET_GEMINI,
+    resolve_vision_target, VISION_TARGET_GEMINI, VISION_TARGET_ANTHROPIC,
 )
 from src.routing.gemini_vision_gate import (
     assert_gemini_vision_allowed, GeminiVisionRefused,
@@ -330,6 +330,10 @@ claude_cli = ClaudeCodeCLI(
     timeout=int(os.getenv("MAX_TIMEOUT", "2400000")),
     cwd=os.getenv("CLAUDE_CWD")
 )
+# Abo-Bildweg (src/providers/subscription_vision.py) laeuft ueber DIESELBE
+# CLI-Instanz wie der Chat (Reserve, Limiter, kein ANTHROPIC_API_KEY).
+from src.providers import subscription_vision as _subscription_vision  # noqa: E402
+_subscription_vision.set_cli_runner(claude_cli)
 
 
 async def cleanup_old_sessions():
@@ -1677,6 +1681,11 @@ async def generate_streaming_response(
             backend_config and backend_config.backend == BackendType.BEDROCK
         )
         _vision_target = resolve_vision_target(backend_config)
+        from src.providers.funding_policy import subscription_fallback_active as _stream_fallback_active
+        _stream_subscription = bool(fastapi_request is not None and _stream_fallback_active(fastapi_request))
+        if _stream_subscription:
+            # Abo-Bildweg (wie der Zweig ohne Streaming): nur die CLI sieht das Bild.
+            _vision_target = VISION_TARGET_ANTHROPIC
 
         if has_vision_content(messages_for_vision) and not _vision_is_bedrock:
             if _vision_target == VISION_TARGET_GEMINI:
@@ -1707,7 +1716,7 @@ async def generate_streaming_response(
             # nicht-streamenden Zweig.
             _cap_over, _cap_spent, _cap_max = (
                 (False, 0.0, 0.0)
-                if _vision_target == VISION_TARGET_GEMINI
+                if _vision_target == VISION_TARGET_GEMINI or _stream_subscription
                 else await prepaid_vision_over_cap()
             )
             if _cap_over:
@@ -1735,6 +1744,7 @@ async def generate_streaming_response(
                     output_config=request.output_config,
                     target=_vision_target,
                     gemini_thinking_budget=request.gemini_thinking_budget,
+                    subscription_fallback=_stream_subscription,
                 )
 
                 # Stream vision response as SSE chunks.
@@ -2821,6 +2831,12 @@ async def _chat_completions_finanziert(
     Never a paid route: the subscription run refuses every non-CLI backend.
     """
     from src.providers import funding_policy as _fp
+    if _fp.enter_subscription_mode(request):
+        # Abo-Modus (X-Funding-Source: subscription / ENERGY_STAGING_SUBSCRIPTION_ONLY):
+        # the pool is never asked — straight to the subscription run.
+        logger.info(f"💳 werking-energy: Abo-Modus ({_fp.fallback_cause(request)}) — credit pool bypassed")
+        result = await _chat_completions_lauf(request_body, request, credentials, _adaptive)
+        return _fp.mark_chat_response(request, result)
     if not _fp.fallback_eligible(request):
         result = await _chat_completions_lauf(request_body, request, credentials, _adaptive)
         return _fp.mark_chat_response(request, result)
@@ -2866,16 +2882,15 @@ async def _chat_completions_lauf(
     _free_only = promotional_only(request) and not _subscription_fallback
     if _subscription_fallback:
         # Staging subscription fallback (funding_policy): the same request
-        # shape the pool path accepts, served by the CLI subscription. Images
-        # have no subscription path (vision is API-only → paid), a foreign
-        # tier would be a paid provider: both refused, never rerouted.
+        # shape the pool path accepts, served by the CLI subscription. A
+        # foreign tier would be a paid provider: refused, never rerouted.
+        # Images take the Abo-Bildweg (src/providers/subscription_vision.py:
+        # CLI with only Read, same admission/limiter) — never the paid
+        # vision key, Gemini or Bedrock.
         if (request_body.provider_tier not in (None, "claude-direct-notools")
                 or request_body.enable_tools or request_body.session_id):
             raise HTTPException(409, "subscription_staging_fallback: incompatible route/tools/session; "
                                      "no paid fallback")
-        if has_vision_content(prepare_messages_for_vision(request_body.messages)):
-            raise HTTPException(409, "subscription_staging_fallback: images need the credit pool "
-                                     "(no subscription vision path); no paid fallback")
         request_body.provider_tier = None
     if _free_only:
         require_pool()
@@ -2887,7 +2902,10 @@ async def _chat_completions_lauf(
         request.state.api_reserve_retry = True
     _gemini_vision_lane = is_gemini_vision_request(request)
     from src.providers.credit_pool import enabled as credit_pool_enabled
-    _credit_vision_lane = credit_pool_enabled() and has_vision_content(
+    # Abo-Bildweg: im Rueckfall ist ein Bild kein Pool-Aufruf, sondern ein
+    # CLI-Lauf auf dem Abo — dann gelten Zulassung (Limiter, Reserve) und die
+    # CLI-Authentifizierung wie fuer jeden Abo-Aufruf.
+    _credit_vision_lane = (not _subscription_fallback) and credit_pool_enabled() and has_vision_content(
         prepare_messages_for_vision(request_body.messages)
     )
     _reserve_retry = bool(getattr(request.state, "api_reserve_retry", False))
@@ -4256,6 +4274,10 @@ async def _chat_completions_lauf(
         # gebaut wurde. backend_config steht seit der Backend-Aufloesung fest
         # und aendert sich bis dorthin nicht, der Wert ist also derselbe.
         _vision_target = resolve_vision_target(backend_config)
+        if _subscription_fallback:
+            # Abo-Bildweg: ein Gemini-Standard der Dev-Bridge gilt hier nicht
+            # (Gemini ist ein bezahlter Schluessel); das Bild sieht nur die CLI.
+            _vision_target = VISION_TARGET_ANTHROPIC
 
         # gemini_thinking_budget ist Gemini-EIGENE Semantik. Auf einem anderen
         # Weg taete es nichts — und ein Feld, das je nach Backend still
@@ -4344,7 +4366,8 @@ async def _chat_completions_lauf(
                     # blockiert werden.
                     _cap_over, _cap_spent, _cap_max = (
                         (False, 0.0, 0.0)
-                        if _vision_target == VISION_TARGET_GEMINI
+                        # Abo-Bildweg: belastet den Prepaid-Schluessel nicht.
+                        if _vision_target == VISION_TARGET_GEMINI or _subscription_fallback
                         else await prepaid_vision_over_cap()
                     )
                     if _cap_over:
@@ -4368,6 +4391,7 @@ async def _chat_completions_lauf(
                         output_config=request_body.output_config,
                         target=_vision_target,
                         gemini_thinking_budget=request_body.gemini_thinking_budget,
+                        subscription_fallback=_subscription_fallback,
                     )
 
                 if vision_result:
@@ -4495,6 +4519,13 @@ async def _chat_completions_lauf(
                     }},
                 )
             except Exception as e:
+                from src.providers.credit_pool import PoolUnavailable as _VisionPoolUnavailable
+                from src.providers.funding_policy import fallback_eligible as _vision_fallback_eligible
+                if isinstance(e, _VisionPoolUnavailable) and _vision_fallback_eligible(request):
+                    # Pool kann das Bild nicht zahlen (vor jeder Messages-Anfrage):
+                    # _chat_completions_finanziert faehrt den Aufruf auf dem
+                    # Abo-Bildweg neu — dieselbe Regel wie beim Text.
+                    raise
                 logger.error(f"❌ Vision request failed: {e}", exc_info=True)
                 # Erschoepfung des Prepaid-Bildschluessels hinterliess bisher
                 # GAR KEINE Ledger-Zeile: Anthropic lehnt den Call ab, der
@@ -7942,10 +7973,17 @@ async def research(
     from src.providers import funding_policy as _fp
     from src.providers.funding_policy import promotional_only, require_pool
     from src.providers.credit_pool import enabled as _research_pool_enabled
+    # Abo-Modus (funding_policy.subscription_mode_cause): decided before any
+    # pool step; a header asking for it where it is not allowed is a 409.
+    _research_abo_modus = _fp.enter_subscription_mode(request)
     if promotional_only(request):
         if _research_operator_pinned not in (None, "anthropic"):
             raise HTTPException(409, "promotional_only conflicts with operator pin; no paid fallback")
-        if not _research_pool_enabled() and _fp.fallback_eligible(request):
+        if _research_abo_modus:
+            _research_subscription_route(request_body)
+            logger.warning(f"💳 werking-energy research: Abo-Modus ({_fp.fallback_cause(request)}) — "
+                           "credit pool bypassed")
+        elif not _research_pool_enabled() and _fp.fallback_eligible(request):
             # Staging subscription fallback (funding_policy): no pool → the
             # normal subscription research path (CLI, pool admission below).
             _fp.activate_subscription_fallback(request, _fp.CAUSE_POOL_MISSING)
@@ -10439,7 +10477,13 @@ async def _proxy_document_endpoint(
     privacy_client = get_privacy_client()
     _concurrent_before = None
     from src.providers.funding_policy import promotional_only as _promotional_only
+    from src.providers import funding_policy as _doc_mode_fp
     _promo = _promotional_only(request)
+    # Abo-Modus: before the try (its 400/409 must reach the caller as such,
+    # not as a 500) and before any pool step of the document vision.
+    if _doc_mode_fp.enter_subscription_mode(request):
+        logger.info(f"💳 werking-energy document: Abo-Modus ({_doc_mode_fp.fallback_cause(request)}) — "
+                    "credit pool bypassed")
     try:
         form = await request.form()
         file = form.get("file")
@@ -10496,6 +10540,14 @@ async def _proxy_document_endpoint(
             if (_worker_vision and payload.get("images")
                     and payload.get("vision_funding") != "credit_pool"):
                 from src.docconvert_worker_vision import describe_in_worker
+                from src.providers import credit_pool as _doc_pool, funding_policy as _doc_fp
+                if (not _doc_fp.subscription_fallback_active(request) and not _doc_pool.enabled()
+                        and _doc_fp.fallback_eligible(request)):
+                    # Abo-Bildweg (Staging-Rueckfall): kein Pool im Worker →
+                    # die Bilder beschreibt das Abo (CLI, nur Read).
+                    _doc_fp.activate_subscription_fallback(request, _doc_fp.CAUSE_POOL_MISSING)
+                    logger.warning("💳 werking-energy: document vision without credit pool — "
+                                   "staging subscription fallback (Abo-Bildweg)")
                 _vision_log: List[dict] = []
                 _status_code, payload, request.state.document_vision_usage = await describe_in_worker(
                     payload, extra_data, filename,
@@ -10507,8 +10559,11 @@ async def _proxy_document_endpoint(
                     # pool paid for them): booked by the endpoint, never dropped.
                     request.state.document_vision_usage_failed = list(_vision_log)
             _image_count = payload.get("image_count") or len(payload.get("images") or {})
+            from src.providers.funding_policy import subscription_fallback_active as _doc_fallback_active
+            _attested = {"credit_pool"} | (
+                {"subscription_staging_fallback"} if _doc_fallback_active(request) else set())
             if (_status_code < 400 and downstream_path == "/document/convert" and _image_count and _wanted
-                    and payload.get("vision_funding") != "credit_pool"):
+                    and payload.get("vision_funding") not in _attested):
                 # Auch eine unbekannte Fallback-Instanz ohne Pool-Code landet hier.
                 logger.error(
                     f"Document proxy ({downstream_path}): promotional_only, "
@@ -10640,7 +10695,22 @@ async def convert_document_endpoint(
                 _res = (_e.get("credit_meta") or {}).get("credit_pool_reservation")
                 if _res:
                     _m["reservations"].append(_res)
+            from src.providers import funding_policy as _row_fp
+            _abo_cause = _row_fp.fallback_cause(request)
             for _model, _sum in _je_modell.items():
+                if _abo_cause:
+                    # Abo-Bildweg: CLI-Aufrufe ohne Pool-Reservierung.
+                    _funding_meta = {
+                        "funding_policy": _row_fp.SUBSCRIPTION_STAGING_FALLBACK,
+                        "funding_fallback_cause": _abo_cause,
+                        "subscription_vision": True,
+                        "api_key_lane": "vision_subscription",
+                    }
+                else:
+                    _funding_meta = {
+                        "funding_policy": "promotional_only",
+                        "credit_pool_reservations": _sum["reservations"],
+                    }
                 await persist_ai_call_activity(
                     provider=PROVIDER_ANTHROPIC,
                     app_id=_attr.get("app_id"),
@@ -10657,10 +10727,9 @@ async def convert_document_endpoint(
                     app_env=_attr.get("app_env"),
                     provider_meta={
                         "usage_source": "document_convert_vision",
-                        "funding_policy": "promotional_only",
+                        **_funding_meta,
                         "automatic_paid_fallback": False,
                         "vision_calls": _sum["calls"],
-                        "credit_pool_reservations": _sum["reservations"],
                         **({"document_status": "error",
                             "document_error_code": str(result.status_code)}
                            if _status == "error" else {}),

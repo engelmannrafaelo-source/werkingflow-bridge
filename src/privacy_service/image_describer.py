@@ -69,6 +69,8 @@ def record_vision_funding(funding_log: Optional[List[dict]], kind: str, resp) ->
         "input_tokens": int(usage.get("prompt_tokens", 0) or 0),
         "output_tokens": int(usage.get("completion_tokens", 0) or 0),
         "credit_meta": getattr(resp, "credit_meta", None),
+        # Abo-Bildweg: Finanzierungsnachweis des CLI-Aufrufs (keine Reservierung).
+        "ledger_meta": getattr(resp, "ledger_meta", None),
     })
 
 
