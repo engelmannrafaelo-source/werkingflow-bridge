@@ -31,15 +31,29 @@ PEER = {"primary": "prod", "production": "dev"}
 
 
 @pytest.fixture(scope="module")
-def generated():
+def generated(tmp_path_factory):
     """Run the generator and read what it wrote — the committed includes are
     generated artefacts, so the test must prove the GENERATOR produces this,
-    not that somebody hand-edited a file that says DO NOT EDIT."""
+    not that somebody hand-edited a file that says DO NOT EDIT.
+
+    Into a temporary directory (UPSTREAMS_OUT_DIR), never into docker/: running
+    the generator in place rewrote the committed include with the default
+    variant and silently reset a committed ENERGY_SUBSCRIPTION_NO_HOP=1 window
+    (03.11.2026). The switch value is taken from the committed primary include
+    (the generator writes its marker only for the =1 variant), so the
+    comparison below stays exact for whichever variant is committed."""
+    import os
+
+    out = tmp_path_factory.mktemp("upstreams")
+    committed_primary = INCLUDES["primary"].read_text()
+    energy = "1" if "ENERGY_SUBSCRIPTION_NO_HOP=1" in committed_primary else "0"
+    env = {k: v for k, v in os.environ.items() if k not in ("PRIMARY_PEER_HOP", "ENERGY_SUBSCRIPTION_NO_HOP")}
+    env.update(UPSTREAMS_OUT_DIR=str(out), ENERGY_SUBSCRIPTION_NO_HOP=energy)
     subprocess.run(
         ["bash", str(GENERATOR), "all"], cwd=REPO_ROOT, check=True,
-        capture_output=True, text=True,
+        capture_output=True, text=True, env=env,
     )
-    return {k: v.read_text() for k, v in INCLUDES.items()}
+    return {k: (out / v.name).read_text() for k, v in INCLUDES.items()}
 
 
 @pytest.mark.parametrize("topology", ["primary", "production"])
