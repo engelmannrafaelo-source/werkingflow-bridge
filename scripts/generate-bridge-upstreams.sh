@@ -341,7 +341,7 @@ MAPHEAD
 #                           max_fails=0 — where the fixed bridge is local.
 #   $jobs_peer_first        1 where the fixed bridge is the peer (primary),
 #                           0 where it is the local one (production).
-#                           primary with PRIMARY_PEER_HOP=0 (default): 1 only
+#                           primary with PRIMARY_PEER_HOP=0 (optional no-hop variant): 1 only
 #                           for X-Priority: production (same split as the
 #                           unkeyed pool), 0 for everything else — the
 #                           claude_jobs_keyed_peer block stays emitted because

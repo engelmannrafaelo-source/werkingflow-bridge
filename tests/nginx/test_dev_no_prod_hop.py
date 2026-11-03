@@ -3,7 +3,7 @@ unprioritised LLM traffic to the prod bridge any more — generator level, no
 network, no docker. The real-nginx proof is test_dev_no_prod_hop_e2e.sh.
 
 Pinned here:
-  * the committed primary include is the PRIMARY_PEER_HOP=0 variant (default),
+  * the committed primary include is the PRIMARY_PEER_HOP=0 variant (optional),
   * the production include is byte-identical for every value of the switch,
   * PRIMARY_PEER_HOP=1 restores exactly the ADR-0010 routing,
   * the cross-host entries left on primary are an explicit, closed list — a new

@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
-# DEV-KEIN-PROD-HOP (KD-Entscheid 03.11.2026) — end to end against a real
+# DEV-KEIN-PROD-HOP variant 0 (optional switch; KD-Entscheid 03.11.2026 taken back) — end to end against a real
 # OpenResty with the REAL shared docker/nginx.conf, the REAL start script
 # (docker/nginx-start.sh) and the COMMITTED docker/upstreams-primary.conf
-# (generator default PRIMARY_PEER_HOP=0).
+# (generator default PRIMARY_PEER_HOP=1 = ADR-0010, taken back 03.11.2026) and
+# the generated no-hop variant PRIMARY_PEER_HOP=0.
 #
 # What it proves (contract: docs/contracts/dev-kein-prod-hop.md):
 #   * dev/staging traffic without X-Priority never reaches the peer (= the
@@ -200,10 +201,12 @@ OWN="job_dev_0123456789abcdef0123456789abcdef"
 PRODJOB="job_prod_0123456789abcdef0123456789abcdef"
 PRODJOB2="job_prod_fedcba9876543210fedcba9876543210"
 
-echo "############ PRIMARY, committed include (PRIMARY_PEER_HOP=0) ############"
-grep -q 'map "$bridge_hopped:$http_x_priority:$http_x_vision_provider" $llm_backend_pool' "$D/upstreams-primary.conf" \
-    || { echo "ABORT: committed upstreams-primary.conf is not the PRIMARY_PEER_HOP=0 variant"; exit 2; }
-start_stack "$D/upstreams-primary.conf"
+echo "############ PRIMARY, generated variant PRIMARY_PEER_HOP=0 ############"
+mkdir -p "$WORK/gen0"
+PRIMARY_PEER_HOP=0 UPSTREAMS_OUT_DIR="$WORK/gen0" "$REPO/scripts/generate-bridge-upstreams.sh" primary >/dev/null
+grep -q 'map "$bridge_hopped:$http_x_priority:$http_x_vision_provider" $llm_backend_pool' "$WORK/gen0/upstreams-primary.conf" \
+    || { echo "ABORT: generated PRIMARY_PEER_HOP=0 file lacks the no-hop map"; exit 2; }
+start_stack "$WORK/gen0/upstreams-primary.conf"
 
 echo "=== 1. dev/staging traffic without X-Priority stays on the dev workers ==="
 c=$(req POST /v1/chat/completions "$O" -H "X-App-ID: werking-energy"); check "chat: status" "$c" = 200
@@ -246,13 +249,11 @@ c=$(req POST /v1/chat/completions "$O" -H "X-Priority: production" -H "X-Stub-Pe
 check "X-Priority, prod bridge 429 → dev workers as backup (unchanged)" "$(field "$O" worker)" != backup-host
 check "peer saw exactly the four X-Priority requests" "$(( $(all_peer_hits) - before ))" -eq 4
 
-echo "############ ROLLBACK variant (PRIMARY_PEER_HOP=1) ############"
-mkdir -p "$WORK/gen"
-PRIMARY_PEER_HOP=1 UPSTREAMS_OUT_DIR="$WORK/gen" "$REPO/scripts/generate-bridge-upstreams.sh" primary >/dev/null
-start_stack "$WORK/gen/upstreams-primary.conf"
-c=$(req POST /v1/chat/completions "$O"); check "rollback: chat without X-Priority → prod bridge first again" "$(field "$O" worker)" = backup-host
-c=$(req POST /v1/jobs "$O" -H "Idempotency-Key: K-RB-1"); check "rollback: keyed job → prod bridge again" "$(field "$O" worker)" = backup-host
-c=$(get /v1/jobs/legacy-unmarked-id "$O"); check "rollback: unmarked poll → prod bridge first" "$(field "$O" worker)" = backup-host
+echo "############ COMMITTED default (PRIMARY_PEER_HOP=1, ADR-0010) ############"
+start_stack "$D/upstreams-primary.conf"
+c=$(req POST /v1/chat/completions "$O"); check "default: chat without X-Priority → prod bridge first again" "$(field "$O" worker)" = backup-host
+c=$(req POST /v1/jobs "$O" -H "Idempotency-Key: K-RB-1"); check "default: keyed job → prod bridge again" "$(field "$O" worker)" = backup-host
+c=$(get /v1/jobs/legacy-unmarked-id "$O"); check "default: unmarked poll → prod bridge first" "$(field "$O" worker)" = backup-host
 
 echo
 if [ "$FAILURES" -eq 0 ]; then echo "ALL PASS"; else echo "$FAILURES FAILURE(S)"; docker logs "dh-nginx-$SUFFIX" 2>&1 | grep -i "emerg\|error" | tail -8; fi

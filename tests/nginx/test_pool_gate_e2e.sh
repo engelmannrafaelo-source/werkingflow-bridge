@@ -244,7 +244,7 @@ assert() {
     local out code body marker
     # X-Bridge-Hop: 1 = the LOCAL tier. Under PRIMARY_PEER_HOP=1 (ADR-0010
     # rollback mode) the default pool is claude_production (the peer bridge
-    # first; default since 03.11.2026 is local, dev-kein-prod-hop.md), whose
+    # first; default is ADR-0010 peer-first (PRIMARY_PEER_HOP=1), dev-kein-prod-hop.md), whose
     # location has no pool gate — every assertion would then measure the
     # backup stub instead of the gate (that is how this harness read green
     # until 2026-10-10 while testing nothing).

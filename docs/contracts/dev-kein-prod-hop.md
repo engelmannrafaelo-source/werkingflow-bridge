@@ -22,8 +22,8 @@ byteweise gleich.
 
 ## Vertrag
 
-- `PRIMARY_PEER_HOP=0` ist der Standard; auch ohne gesetzten Wert gilt 0.
-  Nicht gehoppte Anfragen ohne `X-Priority: production` laufen auf der
+- `PRIMARY_PEER_HOP=0` ist die optionale Variante ohne Sprung (Standard ist seit
+  der Rücknahme 1). Mit 0 laufen nicht gehoppte Anfragen ohne `X-Priority: production` laufen auf der
   Dev-Bridge lokal über `claude_workers`, mit dem Lua-Kontengate:
   `/v1/chat/completions`, `/v1/research`, `POST /v1/jobs` mit und ohne
   `Idempotency-Key`, `/v1/jobs/lookup`, die Jobliste `GET /v1/jobs` und
@@ -49,8 +49,8 @@ byteweise gleich.
     ist Prod-Verhalten und nicht Teil dieser Entscheidung.
 - Der Gemini-Bildweg (`X-Vision-Provider: gemini`) bleibt auch mit
   X-Priority lokal, weil es ihn auf der Prod-Bridge nicht gibt.
-- `PRIMARY_PEER_HOP=1` ist nur zur Rücknahme da. Die erzeugte Datei ist
-  byteweise das Include vor dem 03.11.2026, also das ADR-0010-Routing.
+- `PRIMARY_PEER_HOP=1` ist der Standard (ADR-0010). Die erzeugte Datei ist
+  byteweise das Include vor dem 03.11.2026.
 - Andere Werte führen zum Abbruch des Generators, bevor er eine Datei
   anfasst.
 - Auf der Topologie `production` hat der Schalter keine Wirkung.
@@ -78,11 +78,11 @@ hätte. Maßgeblich ist der Generator.
 
 ## Schalter setzen und zurücknehmen
 
-Setzen bzw. Standard: Generator ohne `PRIMARY_PEER_HOP` (oder mit `0`) für
+Variante ohne Sprung setzen: Generator mit `PRIMARY_PEER_HOP=0` für
 `primary` laufen lassen, `docker/upstreams-primary.conf` committen und den
 Dev-LB ausrollen (`bridge-deploy.sh hetzner nginx`).
 
-Rücknahme: `PRIMARY_PEER_HOP=1 scripts/generate-bridge-upstreams.sh primary`,
+Zurück zum Standard (ADR-0010): `PRIMARY_PEER_HOP=1 scripts/generate-bridge-upstreams.sh primary`,
 die Datei committen und den Dev-LB ausrollen. `bridge-parity-check.sh`
 vergleicht den Container mit der Datei im Repo. Ein nicht committeter Wert
 fällt dort deshalb als Drift auf.
