@@ -223,8 +223,10 @@ async def test_happy_path_isolated_file_only_read_no_session(dev_bridge, abo, ca
     assert resp.content == "Rotes Rechteck, Text TESTBILD 4711" and resp.stop_reason == "end_turn"
     assert resp.credit_meta is None and resp.api_key_lane == sv.LANE_SUBSCRIPTION
     # voller Eingang: 1500 ungecacht + 3 cache_creation + 7 cache_read
-    assert resp.usage == {"prompt_tokens": 1510, "completion_tokens": 40, "total_tokens": 1550}
+    assert resp.usage == {"prompt_tokens": 1510, "completion_tokens": 40, "total_tokens": 1550,
+                          "uncached_input_tokens": 1500, "cache_read_tokens": 7, "cache_creation_tokens": 3}
     assert resp.ledger_meta["uncached_input_tokens"] == 1500
+    assert (resp.usage["uncached_input_tokens"], resp.usage["cache_read_tokens"], resp.usage["cache_creation_tokens"]) == (1500, 7, 3)
     meta = resp.ledger_meta
     assert meta["funding_policy"] == "subscription_staging_fallback" and meta["automatic_paid_fallback"] is False
     assert meta["usage_source"] == "subscription_cli" and meta["subscription_vision"] is True
@@ -567,7 +569,7 @@ async def test_doc_pool_missing_described_by_abo_and_booked(dev_bridge, abo, mon
     assert row["provider"] == "anthropic" and meta["funding_policy"] == "subscription_staging_fallback"
     assert meta["funding_fallback_cause"] == "credit_pool_missing" and meta["vision_calls"] == 3
     assert "credit_pool_reservations" not in meta and meta["automatic_paid_fallback"] is False
-    assert (row["input_tokens"], row["output_tokens"]) == (4530, 120)  # voller Eingang inkl. Cache-Felder (Befund N1F P3)
+    assert (row["input_tokens"], row["output_tokens"]) == (4500, 120)  # ungecacht; Cache-Felder getrennt
     paid.assert_not_called()
 
 

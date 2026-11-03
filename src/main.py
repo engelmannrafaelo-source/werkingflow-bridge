@@ -1808,8 +1808,10 @@ async def generate_streaming_response(
                         agent_id=_vision_attr.get("agent_id"),
                         workflow_id=_vision_attr.get("workflow_id"),
                         model=vision_result.model,
-                        input_tokens=vision_result.usage["prompt_tokens"],
+                        input_tokens=vision_result.usage.get("uncached_input_tokens", vision_result.usage["prompt_tokens"]),
                         output_tokens=vision_result.usage["completion_tokens"],
+                        cache_read_tokens=vision_result.usage.get("cache_read_tokens", 0),
+                        cache_creation_tokens=vision_result.usage.get("cache_creation_tokens", 0),
                         status="success",
                         duration_ms=int((time.time() - stream_start_time) * 1000),
                         app_env=_vision_attr.get("app_env"),
@@ -4468,8 +4470,10 @@ async def _chat_completions_lauf(
                             agent_id=_vision_attr.get("agent_id"),
                             workflow_id=_vision_attr.get("workflow_id"),
                             model=vision_result.model,
-                            input_tokens=vision_result.usage["prompt_tokens"],
+                            input_tokens=vision_result.usage.get("uncached_input_tokens", vision_result.usage["prompt_tokens"]),
                             output_tokens=vision_result.usage["completion_tokens"],
+                            cache_read_tokens=vision_result.usage.get("cache_read_tokens", 0),
+                            cache_creation_tokens=vision_result.usage.get("cache_creation_tokens", 0),
                             status="success",
                             duration_ms=int(duration * 1000),
                             app_env=_vision_attr.get("app_env"),
@@ -10695,7 +10699,10 @@ async def convert_document_endpoint(
             _je_modell: Dict[str, Dict[str, Any]] = {}
             for _e in _vision_usage:
                 _m = _je_modell.setdefault(str(_e.get("model") or "unknown"), {
-                    "input_tokens": 0, "output_tokens": 0, "calls": 0, "reservations": []})
+                    "input_tokens": 0, "output_tokens": 0, "calls": 0, "reservations": [],
+                    "cache_read_tokens": 0, "cache_creation_tokens": 0})
+                _m["cache_read_tokens"] += int(_e.get("cache_read_tokens") or 0)
+                _m["cache_creation_tokens"] += int(_e.get("cache_creation_tokens") or 0)
                 _m["input_tokens"] += int(_e.get("input_tokens") or 0)
                 _m["output_tokens"] += int(_e.get("output_tokens") or 0)
                 _m["calls"] += 1
@@ -10727,6 +10734,8 @@ async def convert_document_endpoint(
                     model=_model,
                     input_tokens=_sum["input_tokens"],
                     output_tokens=_sum["output_tokens"],
+                    cache_read_tokens=_sum["cache_read_tokens"],
+                    cache_creation_tokens=_sum["cache_creation_tokens"],
                     # The vision calls themselves completed (and were paid),
                     # also when the document as a whole failed afterwards.
                     status="success",

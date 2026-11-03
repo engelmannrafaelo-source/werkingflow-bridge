@@ -66,7 +66,10 @@ def record_vision_funding(funding_log: Optional[List[dict]], kind: str, resp) ->
     funding_log.append({
         "kind": kind,
         "model": getattr(resp, "model", None),
-        "input_tokens": int(usage.get("prompt_tokens", 0) or 0),
+        # Abo-Bildweg: ungecacht + Cache-Felder getrennt (Ledger-Semantik).
+        "input_tokens": int(usage.get("uncached_input_tokens", usage.get("prompt_tokens", 0)) or 0),
+        "cache_read_tokens": int(usage.get("cache_read_tokens", 0) or 0),
+        "cache_creation_tokens": int(usage.get("cache_creation_tokens", 0) or 0),
         "output_tokens": int(usage.get("completion_tokens", 0) or 0),
         "credit_meta": getattr(resp, "credit_meta", None),
         # Abo-Bildweg: Finanzierungsnachweis des CLI-Aufrufs (keine Reservierung).

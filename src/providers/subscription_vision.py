@@ -554,7 +554,12 @@ async def analyze_via_subscription(
         content=text,
         model=model,
         usage={"prompt_tokens": eingang_gesamt, "completion_tokens": usage["output_tokens"],
-               "total_tokens": eingang_gesamt + usage["output_tokens"]},
+               "total_tokens": eingang_gesamt + usage["output_tokens"],
+               # Ledger-Semantik (wie Textweg): ungecacht + Cache-Felder getrennt,
+               # damit cost_eur jedes Feld zum eigenen Satz bewertet.
+               "uncached_input_tokens": usage["input_tokens"],
+               "cache_read_tokens": usage["cache_read_tokens"],
+               "cache_creation_tokens": usage["cache_creation_tokens"]},
         stop_reason=stop_reason,
         messung=None,
         credit_meta=None,
