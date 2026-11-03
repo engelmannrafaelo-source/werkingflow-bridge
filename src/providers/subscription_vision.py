@@ -523,8 +523,15 @@ async def analyze_via_subscription(
         u = extract_result_usage(chunk)
         if u:
             usage = u
+    # Voller Eingang wie im Abo-Textweg (OpenAI-Semantik, main.py: prompt_tokens =
+    # ungecacht + cache_creation + cache_read). Die CLI meldet Bild und Prompt fast
+    # ganz ueber die Cache-Felder; nur input_tokens zu melden liess Energy den
+    # Eingang als unbelegt (4 Token) verwerfen (Befund N1F P3, 03.11.2026).
+    eingang_gesamt = (usage["input_tokens"] + usage["cache_creation_tokens"]
+                      + usage["cache_read_tokens"])
     marker = _fp.ledger_marker()
     ledger_meta: Dict[str, Any] = {
+        "uncached_input_tokens": usage["input_tokens"],
         "funding_policy": _fp.SUBSCRIPTION_STAGING_FALLBACK,
         "automatic_paid_fallback": False,
         "usage_source": USAGE_SOURCE,
@@ -546,8 +553,8 @@ async def analyze_via_subscription(
     return VisionResponse(
         content=text,
         model=model,
-        usage={"prompt_tokens": usage["input_tokens"], "completion_tokens": usage["output_tokens"],
-               "total_tokens": usage["input_tokens"] + usage["output_tokens"]},
+        usage={"prompt_tokens": eingang_gesamt, "completion_tokens": usage["output_tokens"],
+               "total_tokens": eingang_gesamt + usage["output_tokens"]},
         stop_reason=stop_reason,
         messung=None,
         credit_meta=None,
