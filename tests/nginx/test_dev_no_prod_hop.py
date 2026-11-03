@@ -72,10 +72,11 @@ LLM_MAP_OFF = 'map "$bridge_hopped:$http_x_priority:$http_x_vision_provider" $ll
 LLM_MAP_ON = 'map "$bridge_hopped:$http_x_vision_provider" $llm_backend_pool'
 
 
-def test_default_is_off_and_committed(variants):
-    """Without any setting the dev bridge does NOT hop — and that is what is
-    committed, i.e. what a dev LB deploy rolls out."""
-    assert variants[None] == variants["0"]
+def test_default_is_adr0010_and_committed(variants):
+    """Without any setting the dev bridge follows ADR-0010 (Rafael 31.08.2026,
+    peer-first) — and that is what is committed, i.e. what a dev LB deploy
+    rolls out. The no-hop variant (0) is opt-in only."""
+    assert variants[None] == variants["1"]
     for f in FILES:
         assert (DOCKER / f).read_text() == variants[None][f], f
 

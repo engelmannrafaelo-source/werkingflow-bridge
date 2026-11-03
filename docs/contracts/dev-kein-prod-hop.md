@@ -1,4 +1,11 @@
-# Dev-Bridge: kein Sprung zur Prod-Bridge (Schalter `PRIMARY_PEER_HOP`)
+# Dev-Bridge: Schalter `PRIMARY_PEER_HOP` (Default 1 = ADR-0010 Level-1-first)
+
+> **STAND 03.11.2026 nachmittags: KD hat den Entscheid unten zurueckgenommen.** ADR-0010 ist
+> Rafaels ausdrueckliche Entscheidung (31.08.2026). Default des Generators ist wieder `1`
+> (Peer-first, `docker/upstreams-primary.conf` byte-gleich zum Stand vor dem Schalter).
+> `0` (kein Sprung zu Prod) bleibt als bewusst gesetzte Variante. Der Text unten beschreibt
+> die Variante `0`.
+
 
 Grundlage: KD-Entscheid vom 03.11.2026. Der Peer-first-Weg der Dev-Bridge
 (ADR-0010, Topologie `primary`) war nicht dafür gedacht, Dev-/Staging-Last auf

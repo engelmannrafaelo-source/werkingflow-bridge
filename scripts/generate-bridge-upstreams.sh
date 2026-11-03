@@ -82,13 +82,15 @@ PROD_WORKER_TARGETS[worker-erk]="100.93.143.105:8004"
 #          X-Priority:production picks the claude_production pool (identical
 #          order), everything else rides claude_workers.
 #
-# --- PRIMARY_PEER_HOP: the dev -> prod hop is OFF by default (03.11.2026) ---
-# KD-Entscheid 03.11.2026: the ADR-0010 peer-first routing on the DEV bridge
+# --- PRIMARY_PEER_HOP: DEFAULT 1 = ADR-0010 Level-1-first (Rafael 31.08.2026; 03.11.2026 restored) ---
+# History: KD decided on 03.11.2026 morning that the dev->prod hop was not intended and set the default to 0;
+# KD withdrew that the same day because ADR-0010 is Rafael's explicit decision (31.08.2026). Default is 1 again;
+# 0 stays available as an explicit, opt-in variant (never the committed default). Original text of the 0 variant: the ADR-0010 peer-first routing on the DEV bridge
 # was not intended to put dev/staging load (werking-energy staging, CUI,
 # orchestrator, partner-platform) on the prod workers — measured in the prod
 # LB log on 01./02.11. (origin=dev, hopped_trusted=1). Dev staging runs on the
 # dev accounts and the dev pool. So on primary:
-#   PRIMARY_PEER_HOP=0 (DEFAULT)  no peer-first for unprioritised traffic:
+#   PRIMARY_PEER_HOP=0 (opt-in only)  no peer-first for unprioritised traffic:
 #       chat/research, POST /v1/jobs (keyed and unkeyed), the jobs list and
 #       unmarked polls ride the LOCAL claude_workers (with the Lua account gate).
 #       Deliberately still crossing to ${BRIDGE_BACKUP_HOST}:
@@ -98,10 +100,9 @@ PROD_WORKER_TARGETS[worker-erk]="100.93.143.105:8004"
 #         * polls/cancels of jobs whose id names the prod bridge
 #           (claude_jobs_peer, ADR-0012) — jobs in flight must not die,
 #         * /health/production (shared nginx.conf, a probe, no account).
-#   PRIMARY_PEER_HOP=1  the ADR-0010 behaviour (every non-hopped LLM request
-#       rides claude_production = prod bridge first). Rollback only:
-#       PRIMARY_PEER_HOP=1 scripts/generate-bridge-upstreams.sh primary,
-#       commit docker/upstreams-primary.conf, deploy the dev LB.
+#   PRIMARY_PEER_HOP=1 (DEFAULT)  the ADR-0010 behaviour (every non-hopped LLM request
+#       rides claude_production = prod bridge first). Committed docker/upstreams-primary.conf
+#       is byte-identical to the file before the 03.11. switch (adbd697).
 # On production the flag has NO effect: upstreams-prod.conf is byte-identical
 # for both values (tests/nginx/test_dev_no_prod_hop.py proves it).
 # Contract + pyramid scenarios: docs/contracts/dev-kein-prod-hop.md.
@@ -109,8 +110,8 @@ PROD_WORKER_TARGETS[worker-erk]="100.93.143.105:8004"
 # Validated value of PRIMARY_PEER_HOP (see above): prints 0 or 1, fails loud
 # on anything else — a typo must not silently pick a routing.
 primary_peer_hop() {
-    case "${PRIMARY_PEER_HOP:-0}" in
-        0|1) echo "${PRIMARY_PEER_HOP:-0}" ;;
+    case "${PRIMARY_PEER_HOP:-1}" in
+        0|1) echo "${PRIMARY_PEER_HOP:-1}" ;;
         *) echo "ERROR: PRIMARY_PEER_HOP must be 0 or 1, got '${PRIMARY_PEER_HOP}'" >&2; return 1 ;;
     esac
 }
