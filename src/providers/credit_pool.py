@@ -19,7 +19,8 @@ import asyncio
 import logging
 import os
 import uuid
-from typing import Any
+from contextvars import ContextVar
+from typing import Any, Optional
 
 import httpx
 from fastapi import HTTPException
@@ -32,6 +33,49 @@ VERSION = "2023-06-01"
 # post started may have reached Anthropic and is treated as outcome unknown.
 NOT_SENT_ERRORS = (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout)
 _background: set[asyncio.Task] = set()
+
+# Pool booking log of ONE ledger row (KD Finanzierungsquelle, 03.11.2026).
+# A research-cloud run is many Messages calls (rounds, gap checker) but one
+# usage_events row; without this log the row cannot name the reservations
+# that paid for it, and pool hours cannot be attributed to a job. Set by the
+# booking caller (start_booking_log), filled here for every committed
+# reservation, read back into provider_metadata (booking_ledger_meta).
+# asyncio copies the context into child tasks, so the list object is shared.
+_booking_log: ContextVar[Optional[list]] = ContextVar("credit_pool_booking_log", default=None)
+
+
+def start_booking_log() -> list:
+    """Start collecting the pool reservations of the current run."""
+    entries: list = []
+    _booking_log.set(entries)
+    return entries
+
+
+def _note_booking(reservation: str, grant_id: Any) -> None:
+    entries = _booking_log.get()
+    if entries is not None:
+        entries.append({"reservation": reservation, "grant": grant_id})
+
+
+def booking_ledger_meta(entries: Optional[list]) -> dict:
+    """provider_metadata fields for a row funded by these pool reservations.
+
+    Only reservation and grant ids plus the policy marker: never the account
+    label, organisation or key (KD: "grant ohne Kontoidentitaeten/Schluessel").
+    Empty dict when the run made no pool reservation, so a run that never
+    touched the pool carries no funding claim."""
+    if not entries:
+        return {}
+    grants: list = []
+    for e in entries:
+        if e.get("grant") is not None and e["grant"] not in grants:
+            grants.append(e["grant"])
+    return {
+        "funding_policy": "promotional_only",
+        "automatic_paid_fallback": False,
+        "credit_pool_reservations": [e["reservation"] for e in entries],
+        "credit_pool_grants": grants,
+    }
 
 
 def enabled() -> bool:
@@ -203,6 +247,9 @@ async def post_messages(body: dict, timeout: float, pin: dict | None = None) -> 
             except asyncio.CancelledError:
                 await _release_unsent(reservation)
                 raise
+            # Committed: from here on the pool table has a row for it, whatever
+            # its later state (settled / released / unknown).
+            _note_booking(reservation, account["grant_id"])
             # No retry after a transport failure or 5xx: it may already have
             # generated a paid answer. Keep the reservation, fail visibly.
             try:

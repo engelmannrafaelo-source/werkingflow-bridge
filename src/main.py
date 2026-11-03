@@ -6986,6 +6986,11 @@ async def _execute_research_cloud_impl(
     free_only = promotional_only(request)
     if free_only:
         require_pool()
+    # Every credit-pool reservation of this run (rounds + gap checker) lands
+    # here and goes into the run's ONE ledger row — success and error alike
+    # (KD Finanzierungsquelle 03.11.2026). Empty for a run on the paid key.
+    from src.providers.credit_pool import start_booking_log
+    _pool_log = start_booking_log()
 
     try:
         anonymized_query = await anonymize_query_for_cloud(request, request_body.query)
@@ -7107,6 +7112,7 @@ async def _execute_research_cloud_impl(
     except ResearchCloudModelAbbruch as e:
         return await _cloud_modell_abbruch_antwort(
             request_body, attribution_ctx, start_time, str(e), e.usage, e.abschluss,
+            pool_meta=_research_pool_ledger_meta(request, _pool_log),
         )
     except ResearchCloudExecutorError as e:
         execution_time = time.time() - start_time
@@ -7139,6 +7145,9 @@ async def _execute_research_cloud_impl(
                 # Der error_code hier ist eine feste Kennung und erklaert nichts —
                 # ohne den Text bleibt offen, WARUM der Call scheiterte.
                 error_message=str(e),
+                # Rounds before the failure may have spent pool money: their
+                # reservations stay findable from this row (tokens still 0).
+                provider_meta=_research_pool_ledger_meta(request, _pool_log) or None,
             )
         except Exception as _track_err:
             logger.warning(f"research-cloud error activity tracking failed (non-fatal): {_track_err}")
@@ -7183,6 +7192,7 @@ async def _execute_research_cloud_impl(
     except ModellAbbruch as e:
         return await _cloud_modell_abbruch_antwort(
             request_body, attribution_ctx, start_time, str(e), result.usage, _cloud_abschluss,
+            pool_meta=_research_pool_ledger_meta(request, _pool_log),
         )
     except LaufUnfertig as e:
         # The executor only returns complete reports; one that is not is a
@@ -7191,9 +7201,11 @@ async def _execute_research_cloud_impl(
             request_body, attribution_ctx, start_time,
             f"research-cloud executor returned a report that did not end complete: {e}",
             result.usage, _cloud_abschluss, fehler_code=None,
+            pool_meta=_research_pool_ledger_meta(request, _pool_log),
         )
 
-    # Real-cost ledger booking — research-cloud always books real cost
+    # Real-cost ledger booking — research-cloud books real cost unless the
+    # row's own meta proves pool funding (then real 0, hypothetical stays)
     # (src.activity.ai_call_writer.resolve_ledger_cost), tokens + web_search
     # fees together (persist_ai_call_activity's search_count param).
     try:
@@ -7238,6 +7250,11 @@ async def _execute_research_cloud_impl(
                 # see src/research_cloud/pricing_tiers.py docstring.
                 "customer_price_eur": customer_price_eur(request_body.depth),
                 **(nachkontrolle.as_meta() if nachkontrolle is not None else {}),
+                # Funding source (KD 03.11.2026): reservations/grants of the
+                # pool calls that paid for this run. With them
+                # resolve_ledger_cost books real_cost_eur 0 (hypothetical
+                # stays); without them (paid key) nothing changes.
+                **_research_pool_ledger_meta(request, _pool_log),
             },
         )
     except Exception as _track_err:
@@ -7280,9 +7297,41 @@ async def _execute_research_cloud_impl(
 USAGE_FEHLT_RESEARCH_CLOUD_OHNE_USAGE = "research_cloud_ohne_usage"
 
 
+def _research_pool_ledger_meta(request: Optional[Request], pool_log: Optional[list]) -> Dict[str, Any]:
+    """provider_metadata of a research-cloud row for its pool funding:
+    reservations + grants (credit_pool.booking_ledger_meta, no account/org/key)
+    and the job id of a supervised self-call, so pool hours are attributable to
+    the job. Empty when the run made no pool reservation."""
+    from src.providers.credit_pool import booking_ledger_meta
+    meta = booking_ledger_meta(pool_log)
+    if meta and request is not None:
+        from src.jobs.selbstaufruf import job_lauf
+        try:
+            job = job_lauf(request)
+        except Exception:  # noqa: BLE001 — a missing job id never costs the row
+            job = None
+        # X-Bridge-Job-Lauf is a request header: only a value in the job-id
+        # grammar (src/jobs/job_id.py, tagged or legacy; bounded length by
+        # construction) goes into the ledger, anything else is dropped.
+        if _valid_ledger_job_id(job):
+            meta["bridge_job_id"] = job
+        elif job:
+            logger.warning("research-cloud ledger: X-Bridge-Job-Lauf is not a job id — not booked")
+    return meta
+
+
+_LEDGER_JOB_ID_MAX_LEN = 64
+
+
+def _valid_ledger_job_id(job: Any) -> bool:
+    from src.jobs.job_id import LEGACY_JOB_ID_RE, TAGGED_JOB_ID_RE
+    return (isinstance(job, str) and 0 < len(job) <= _LEDGER_JOB_ID_MAX_LEN
+            and bool(TAGGED_JOB_ID_RE.fullmatch(job) or LEGACY_JOB_ID_RE.fullmatch(job)))
+
+
 async def _cloud_modell_abbruch_antwort(
     request_body, attribution_ctx, start_time: float, message: str, usage, abschluss,
-    *, fehler_code: Optional[str] = "modell_abbruch",
+    *, fehler_code: Optional[str] = "modell_abbruch", pool_meta: Optional[Dict[str, Any]] = None,
 ) -> ResearchResponse:
     """research-cloud run not accepted (BRREF): status=error, not retryable —
     with the usage of every round up to the stop, in the response and in the
@@ -7307,6 +7356,7 @@ async def _cloud_modell_abbruch_antwort(
             app_env=attribution_ctx.get("app_env") if attribution_ctx else None,
             provider="research-cloud",
             error_message=message,
+            provider_meta=pool_meta or None,
         )
     except Exception as _track_err:
         logger.warning(f"research-cloud error activity tracking failed (non-fatal): {_track_err}")
@@ -10446,11 +10496,16 @@ async def _proxy_document_endpoint(
             if (_worker_vision and payload.get("images")
                     and payload.get("vision_funding") != "credit_pool"):
                 from src.docconvert_worker_vision import describe_in_worker
+                _vision_log: List[dict] = []
                 _status_code, payload, request.state.document_vision_usage = await describe_in_worker(
                     payload, extra_data, filename,
                     deadline=time.monotonic() - (time.time() - _start) + timeout,
-                    request=request,
+                    request=request, funding_log=_vision_log,
                 )
+                if _status_code >= 400 and _vision_log:
+                    # The document failed, but these vision calls ran (and the
+                    # pool paid for them): booked by the endpoint, never dropped.
+                    request.state.document_vision_usage_failed = list(_vision_log)
             _image_count = payload.get("image_count") or len(payload.get("images") or {})
             if (_status_code < 400 and downstream_path == "/document/convert" and _image_count and _wanted
                     and payload.get("vision_funding") != "credit_pool"):
@@ -10564,8 +10619,15 @@ async def convert_document_endpoint(
             except Exception:
                 _err_msg = None  # silent-ok: kaputter Body aendert nichts daran, dass Code+Status persistiert werden
         _vision_usage = getattr(request.state, "document_vision_usage", None)
-        # Nur eine echte Liste vom Privacy-Dienst zählt (sonst docling/0 wie bisher).
-        if _status == "success" and isinstance(_vision_usage, list) and _vision_usage:
+        _vision_failed = getattr(request.state, "document_vision_usage_failed", None)
+        if _status == "error" and isinstance(_vision_failed, list) and _vision_failed:
+            # Dokument gescheitert (504/499/502/409 …), aber diese Bildaufrufe
+            # liefen und der Pool hat sie bezahlt: als eigene Zeile(n) buchen,
+            # danach folgt unverändert die docling-Fehlerzeile.
+            _vision_usage = _vision_failed
+        _vision_rows = isinstance(_vision_usage, list) and bool(_vision_usage) and (
+            _status == "success" or _vision_usage is _vision_failed)
+        if _vision_rows:
             # Ehrliche Buchung der Bildaufrufe (promotional_only): je Modell die
             # Summen + Pool-Reservierungen statt "docling"/0 Tokens.
             _je_modell: Dict[str, Dict[str, Any]] = {}
@@ -10588,7 +10650,9 @@ async def convert_document_endpoint(
                     model=_model,
                     input_tokens=_sum["input_tokens"],
                     output_tokens=_sum["output_tokens"],
-                    status=_status,
+                    # The vision calls themselves completed (and were paid),
+                    # also when the document as a whole failed afterwards.
+                    status="success",
                     duration_ms=int((time.time() - _start) * 1000),
                     app_env=_attr.get("app_env"),
                     provider_meta={
@@ -10597,9 +10661,12 @@ async def convert_document_endpoint(
                         "automatic_paid_fallback": False,
                         "vision_calls": _sum["calls"],
                         "credit_pool_reservations": _sum["reservations"],
+                        **({"document_status": "error",
+                            "document_error_code": str(result.status_code)}
+                           if _status == "error" else {}),
                     },
                 )
-        else:
+        if not _vision_rows or _status == "error":
             await persist_ai_call_activity(
                 provider=PROVIDER_LOCAL,
                 app_id=_attr.get("app_id"),

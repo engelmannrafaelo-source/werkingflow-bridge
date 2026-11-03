@@ -90,11 +90,14 @@ async def describe_in_worker(
     filename: str,
     deadline: float,
     request=None,
+    funding_log: Optional[List[dict]] = None,
 ) -> Tuple[int, Dict[str, Any], Optional[List[dict]]]:
     """Beschreibt ``payload["images"]`` über den Pool. Rückgabe ``(status, body, usage)``.
 
     ``deadline`` ist ``time.monotonic()``-basiert (Ende der Proxy-Frist).
     ``usage`` ist die ehrliche Liste je Vision-Aufruf (nur bei 200), sonst None.
+    ``funding_log`` (optional, vom Aufrufer): dieselbe Liste, auch bei Fehlern
+    gefüllt mit den Aufrufen, die tatsächlich liefen (Ledger-Buchung).
     """
     from src.providers import credit_pool
 
@@ -145,7 +148,11 @@ async def describe_in_worker(
 
     describe_prompt = fields.get("describe_prompt") or ""
     triage_prompt = fields.get("triage_prompt") or ""
-    funding_log: List[dict] = []
+    # Caller-owned when given: then the pool calls that DID run stay visible to
+    # the caller even when this returns an error (no usage list), so the ledger
+    # can still book them (KD Finanzierungsquelle 03.11.2026).
+    if funding_log is None:
+        funding_log = []
 
     def remaining() -> float:
         return deadline - time.monotonic()
