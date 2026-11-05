@@ -14,6 +14,7 @@
 #   bridge-migrate.sh                # apply all pending
 #   bridge-migrate.sh --dry-run      # list what would run
 #   bridge-migrate.sh --status       # show applied + pending
+#   bridge-migrate.sh --dir /path/to/migrations --dry-run  # explicit source
 #
 # Restore note: this script never DOWN-migrates. Forward-only by design.
 # A "fix" for a bad migration is a NEW migration that compensates.
@@ -23,11 +24,31 @@ set -euo pipefail
 readonly CONTAINER="bridge-postgres-prod"
 readonly DB_USER="bridge"
 readonly DB_NAME="bridge"
-readonly MIGRATIONS_DIR="/root/werkingflow-bridge/docker/migrations"
-readonly MODE="${1:---apply}"
+MIGRATIONS_DIR="/root/werkingflow-bridge/docker/migrations"
+MODE="--apply"
 
 log() { printf "[migrate %s] %s\n" "$(date +%H:%M:%S)" "$*" >&2; }
 die() { log "FATAL: $*"; exit 1; }
+
+# Parse and validate the source BEFORE any database access. The default remains
+# the deployed checkout; --dir allows an explicitly reviewed pre-deploy source.
+mode_seen=false
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --apply|--dry-run|--status)
+            [[ "$mode_seen" == false ]] || die "only one mode may be specified"
+            MODE="$1"; mode_seen=true; shift ;;
+        --dir)
+            [[ $# -ge 2 && -n "$2" && "$2" != --* ]] || die "--dir requires a migration directory"
+            MIGRATIONS_DIR="$2"; shift 2 ;;
+        --help|-h)
+            printf 'Usage: %s [--apply|--dry-run|--status] [--dir DIRECTORY]\n' "$0"
+            exit 0 ;;
+        *) die "unknown argument: $1 (use --apply / --dry-run / --status / --dir DIRECTORY)" ;;
+    esac
+done
+readonly MIGRATIONS_DIR MODE
+[ -d "${MIGRATIONS_DIR}" ] || die "migrations dir not found: ${MIGRATIONS_DIR}"
 
 psql() { docker exec -i "${CONTAINER}" psql -U "${DB_USER}" -d "${DB_NAME}" "$@"; }
 
@@ -40,8 +61,7 @@ CREATE TABLE IF NOT EXISTS schema_migrations (
 );
 SQL
 
-# 2) Enumerate migration files (must exist)
-[ -d "${MIGRATIONS_DIR}" ] || die "migrations dir not found: ${MIGRATIONS_DIR}"
+# 2) Enumerate migration files (source was validated before database access)
 mapfile -t FILES < <(find "${MIGRATIONS_DIR}" -maxdepth 1 -name '*.sql' -printf '%f\n' | sort)
 [ "${#FILES[@]}" -gt 0 ] || die "no .sql files in ${MIGRATIONS_DIR}"
 
