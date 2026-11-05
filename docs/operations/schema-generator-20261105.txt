@@ -37,7 +37,7 @@ Regulärer NichtProd-Auslieferungsweg (hier NICHT ausgeführt):
    Mail zunächst nicht konfigurieren. c760 führt genau einen vorgesehenen
    mailfreien Textlauf mit Workflow-ID, Ledger und Ergebnis durch.
 
-Prüfung: 14 neue synthetische Fälle +43 bestehende Fälle =57 bestanden.
+Prüfung: 16 neue synthetische Fälle +43 bestehende Fälle =59 bestanden.
 Erfasst: Alias-Kataloginvarianten,1000!=100, fehlenderTopf ohneTrial, unverändertes
 Grant-Budget, identischerUser, sequentielle Schema/Report-Abbuchung auf gesperrter
 Zeile, fehlendesProdukt/Identität/Budgetserver. Keine echte DB-/Migration-/
@@ -49,3 +49,17 @@ S3-Lifetime-/IP-Zähleratomarität und physische30TageLöschung bleiben Website/
 Betriebsanschluss. Personenbezogene Mail-/Consent-Daten nicht Teil dieses Pakets.
 R-H: legitimer Adminvorgang059671f0 BLOCKED, kein Secretwriter/Checkout zugeordnet.
 Keine Owner-JWT-Synthese, keine Prodwirkung, kein Modell-/Mailaufruf hier.
+
+Fachruecklauf c760: Der Budgetresolver leitet den Plan aus dem App-Katalog ab,
+nicht aus der Subscription des angemeldeten Users (plan_resolution.py59-118).
+Der zusaetzliche Test fuehrt echtes Gate -> echten Resolver -> echte Evaluation
+mit vorhandenen Trialdaten und OHNE Schema-Subscription aus (nur I/O ersetzt).
+Er passiert bis zur unveraenderten Restgrenze und wird darueber402; kein Nutzer-
+oder Kostentraegertausch. Auch Schema/Report-Abzug auf denselben Trialschluessel
+ist getestet. Dies ist kein Beleg des gesamten HTTP-/Principal-/JWT-Livewegs.
+Bei ganz fehlendem Topf neutralen Hinweis anzeigen (keine Nutzungsberechtigung/
+kein verfuegbares Kontingent), keine fingierte Erschoepfung oder Neubuchung.
+
+Beim Zusatztest sichtbar: bestehender Float-Rechner kann0.6 bei rechnerisch
+0.5999999999999996 Rest vorzeitig ablehnen. Kein Ueberziehen; nicht durch diese
+Aenderung behoben. Alias-Regressionsfall verwendet exakt darstellbare0.5+0.5.

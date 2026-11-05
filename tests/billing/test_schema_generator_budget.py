@@ -74,8 +74,11 @@ async def test_seed_endpoint_cannot_bypass_transactional_grant():
         await provision_subscription(str(UID), PLAN, 1)
 
 @pytest.mark.asyncio
-async def test_report_and_schema_deduct_one_locked_lane():
-    state = {POT: {'limitEur': 1000, 'usedEur': 990, 'resetAt': ANCHOR}}
+@pytest.mark.parametrize('pot,limit,used,first,last', [(POT,1000,990,4,6), ('trial',5,4,.5,.5)])
+async def test_report_and_schema_deduct_one_locked_lane(pot, limit, used, first, last):
+    if pot == 'trial':
+        PLANS['trial'] = PlanConfig('trial', 'werking-report', 'Trial', 0, 'month', 5, '', trial=True)
+    state = {pot: {'limitEur': limit, 'usedEur': used, 'resetAt': ANCHOR}}
     conn = AsyncMock()
     async def fetch(*args): return {'monthly_budgets': json.loads(json.dumps(state))}
     async def execute(sql, raw, uid):
@@ -88,10 +91,10 @@ async def test_report_and_schema_deduct_one_locked_lane():
     conn.transaction = context
     pool = MagicMock(); pool.acquire = context
     with patch('src.budget.routes.get_pool', return_value=pool), patch('src.budget.routes._load_topup_lots', AsyncMock(return_value=[])), patch('src.budget.routes._persist_topup_lots', AsyncMock()):
-        await apply_budget_deduction(UID, PLAN, 4)
-        await apply_budget_deduction(UID, POT, 6)
+        await apply_budget_deduction(UID, PLAN, first)
+        await apply_budget_deduction(UID, POT, last)
         with pytest.raises(BudgetDeductionDenied): await apply_budget_deduction(UID, PLAN, .01)
-    assert state == {POT: {'limitEur': 1000, 'usedEur': 1000, 'resetAt': ANCHOR}}
+    assert state == {pot: {'limitEur': limit, 'usedEur': limit, 'resetAt': ANCHOR}}
     assert all('FOR UPDATE' in c.args[0] for c in conn.fetchrow.call_args_list)
 
 @pytest.mark.asyncio
@@ -119,4 +122,19 @@ async def test_existing_registered_trial_is_reused_not_reset():
     assert ok['allowed'] and ok['effectivePlanId'] == 'trial'
     assert not no['allowed']
     assert budget.monthly_budgets['trial'].used_eur == 4
+    provision.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_registered_trial_actual_gate_and_resolver_need_no_new_subscription():
+    PLANS['trial'] = PlanConfig('trial', 'werking-report', 'Trial', 0, 'month', 5, '', trial=True)
+    budget = UserBudget(str(UID), {'trial': MonthlyBudgetEntry(5, 4, ANCHOR)}, [])
+    # Only I/O is replaced: real gate -> real catalog resolver -> real budget
+    # evaluator. There is deliberately no schema subscription or grant.
+    with patch('src.budget.gate.resolve_user_id', AsyncMock(return_value=UID)), patch('src.budget.routes._load_budget_via_platform', AsyncMock(return_value=budget)) as load, patch('src.budget.routes._ensure_trial_via_platform', AsyncMock()) as provision:
+        await enforce_budget(str(UID), APP, 1, project_id='schema-local-test')
+        with pytest.raises(HTTPException) as e:
+            await enforce_budget(str(UID), APP, 1.01, project_id='schema-local-test')
+    assert e.value.status_code == 402
+    assert all(c.args == (UID,) for c in load.call_args_list)
     provision.assert_not_called()
