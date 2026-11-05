@@ -41,7 +41,8 @@ import re
 import subprocess
 import sys
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
+from bridge_smoke_accounts import local_accounts
 from typing import Callable, Optional
 
 import requests
@@ -93,6 +94,7 @@ class ProbeResult:
     # infrastructure STATE, not a verdict on the deployed code.
     capacity_reason: Optional[str] = None
     retry_after_s: Optional[int] = None
+    capacity_preflight: bool = False
     # Who wrote the refusal (envelope `source`/`bridge_type`). Only
     # bridge_nginx/pool_exhausted is the LB's pool router refusing BEFORE the
     # request reached the image; bridge_account comes from a worker, i.e. from
@@ -237,7 +239,8 @@ POOL_GATED_PROBES = {"research", "chat_completions", "chat_cache_boundary"}
 # Target check — did the DEPLOYED bridge answer? (BR6 E1, 2026-10-10)
 # ---------------------------------------------------------------------------
 # ADR-0010: chat/research/jobs sent to the dev URL are served by the PROD
-# workers first; only X-Bridge-Hop keeps them local. Until 2026-10-10 the
+# workers first. Legacy bootstraps use X-Bridge-Hop; policy consumers use a
+# fresh released local account preference below. Until 2026-10-10 the
 # hetzner smoke sent no hop header, so its research and chat probes — and the
 # distribution test — "proved" each new dev build with answers from prod
 # (BR2D §7: not one smoke call in any dev worker log). A green probe that hit
@@ -956,7 +959,22 @@ def run(base_url: str, profile: str, only: Optional[str], extra_header: dict, at
         last = None
         for attempt in range(1, attempts + 1):
             try:
-                last = p.fn(ctx)
+                probe_ctx = ctx
+                if p.name in POOL_GATED_PROBES:
+                    # Fresh on every attempt; a preference never overrides release/capacity.
+                    minimum = (sum(len(b['text']) for b in CACHE_BOUNDARY_SMOKE_BODY['messages'][0]['content']) // 4
+                               if p.name == 'chat_cache_boundary' else 100)
+                    accounts = local_accounts(ctx.base_url, ctx.headers(), minimum)
+                    if accounts == []:
+                        last = ProbeResult(p.name, p.endpoint, False,
+                            'UNPROVEN: no released eligible local account — endpoint not exercised',
+                            capacity_reason='no_eligible_local_account', capacity_preflight=True)
+                        break
+                    if accounts is not None:
+                        extra = {k: v for k, v in ctx.extra_header.items() if k.lower() != 'x-bridge-account'}
+                        extra['X-Bridge-Account'] = accounts[0]
+                        probe_ctx = replace(ctx, extra_header=extra)
+                last = p.fn(probe_ctx)
             except Exception as e:  # a probe raising = that probe FAILS loud, never skipped
                 last = ProbeResult(p.name, p.endpoint, False, f"probe raised: {type(e).__name__}: {e}")
             if last.ok or not p.retry:
@@ -998,7 +1016,8 @@ def partition_results(results: list) -> tuple:
     both directions.
     """
     passed = [r for r in results if r.ok]
-    refused = [r for r in results if not r.ok and r.capacity_reason]
+    preflight = [r for r in results if not r.ok and r.capacity_preflight]
+    refused = [r for r in results if not r.ok and r.capacity_reason and not r.capacity_preflight]
     dependency = [r for r in results
                   if not r.ok and not r.capacity_reason and r.dependency_reason]
     unproven = [r for r in results
@@ -1015,8 +1034,8 @@ def partition_results(results: list) -> tuple:
     if refused and not pool_proven_healthy:
         for r in refused:
             r.detail += " [no pool-gated probe passed — cannot rule out the deployed image]"
-        return passed, dependency + unproven, failures + refused
-    return passed, refused + dependency + unproven, failures
+        return passed, preflight + dependency + unproven, failures + refused
+    return passed, preflight + refused + dependency + unproven, failures
 
 
 def main():
@@ -1144,9 +1163,9 @@ def main():
               f"{len(capacity_gaps)} UNVERIFIED — pool capacity unavailable: {names} "
               f"(profile={args.profile})", file=sys.stderr)
         print(
-            "  ⚠️  These endpoints were refused by the account-capacity gate before reaching "
-            "the deployed code — the Bridge's own envelope says retryable. That is "
-            "infrastructure STATE (all Anthropic accounts at their session/weekly wall), not "
+            "  ⚠️  These endpoints were not exercised: local preflight or the account-capacity gate blocked "
+            "the call. This is an explicit verification gap, "
+            "based on account release/capacity state, not "
             "a regression in this build, so it does NOT roll the deploy back. It also does "
             "NOT prove these endpoints work. Re-run once the pool recovers: "
             "python3 scripts/bridge_smoke.py --base-url <url> --profile <profile> --only <probe>. "
