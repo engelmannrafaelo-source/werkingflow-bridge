@@ -104,8 +104,18 @@ def main() -> int:
         targets.append((f"peer:{name}", url, peer_token, own))
 
     states = []
+    local_url = targets[0][1].rstrip("/")
+    local_result = None
     for label, url, tok, origin in targets:
-        result = _ask(url, tok, origin)
+        if label != "local" and url.rstrip("/") == local_url:
+            # The unfiltered local probe already covers ALL origins in this
+            # exact store. Reuse every verdict (including errors/missing), not
+            # a second authentication attempt with a regression peer's token.
+            result = dict(local_result, covered_by="local/all_origins")
+        else:
+            result = _ask(url, tok, origin)
+        if label == "local":
+            local_result = dict(result)
         result["target"] = label
         if origin:
             result["origin"] = origin

@@ -111,13 +111,13 @@ class _Fake:
         self.server.shutdown()
 
 
-def _probe(local: _Fake, peer: _Fake | None, own="dev"):
+def _probe(local: _Fake, peer: _Fake | None, own="dev", peer_suffix=""):
     env = {k: v for k, v in os.environ.items() if not k.startswith(("FEDERATION", "BRIDGE_"))}
     env.update(BRIDGE_ORIGIN_ID=own, BRIDGE_SERVICE_TOKEN="local-token",
                PLATFORM_API_URL=local.url)
     if peer is not None:
         env["FEDERATION_PEERS"] = json.dumps(
-            {"prod": {"platformUrl": peer.url, "tokenEnv": "FEDERATION_TOKEN_PROD"}})
+            {"prod": {"platformUrl": peer.url + peer_suffix, "tokenEnv": "FEDERATION_TOKEN_PROD"}})
         env["FEDERATION_TOKEN_PROD"] = "peer-token"
     # Exactly as the deploy runs it: the script over stdin, inside the worker.
     done = subprocess.run([sys.executable, "-I", "-"], input=PROBE.read_text(),
@@ -185,3 +185,34 @@ def test_busy_wins_over_missing(fakes):
     cannot be seen yet."""
     rc, _ = _probe(fakes(active=1), fakes(status=404))
     assert rc == 1
+
+
+@pytest.mark.parametrize("suffix", ["", "/", "///"])
+@pytest.mark.parametrize("status,active,expected_rc,state", [
+    (200, 0, 0, "idle"),
+    (200, 2, 1, "busy"),
+    (500, 0, 2, "error"),
+    (401, 0, 2, "error"),
+    (404, 0, 3, "missing"),
+])
+def test_self_alias_reuses_complete_all_origin_verdict(fakes, suffix, status, active, expected_rc, state):
+    local = fakes(status=status, active=active)
+    rc, lines = _probe(local, local, peer_suffix=suffix)
+    assert rc == expected_rc
+    assert len(local.seen) == 1
+    assert local.seen[0]["query"] == {}
+    assert local.seen[0]["token"] == "local-token"
+    assert lines[0]["state"] == lines[1]["state"] == state
+    assert lines[1] == dict(lines[0], target="peer:prod", origin="dev",
+                            covered_by="local/all_origins")
+
+
+def test_different_peer_401_still_checked_and_rejected(fakes):
+    local, peer = fakes(), fakes(status=401)
+    rc, lines = _probe(local, peer)
+    assert rc == 2
+    assert len(local.seen) == len(peer.seen) == 1
+    assert peer.seen[0]["query"] == {"origin": ["dev"]}
+    assert peer.seen[0]["token"] == "peer-token"
+    assert lines[1]["state"] == "error" and lines[1]["detail"] == "HTTP 401"
+    assert "covered_by" not in lines[1]
