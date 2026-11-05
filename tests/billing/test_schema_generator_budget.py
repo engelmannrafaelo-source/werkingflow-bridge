@@ -51,7 +51,7 @@ async def test_check_uses_actual_1000_limit_not_catalog_100_and_real_user():
     assert set(budget.monthly_budgets) == {POT}
 
 @pytest.mark.asyncio
-async def test_missing_pot_never_provisions_trial():
+async def test_missing_pot_without_catalog_trial_fails_closed():
     with patch('src.budget.routes._load_budget_via_platform', AsyncMock(return_value=UserBudget(str(UID), {}, []))), patch('src.budget.routes._ensure_trial_via_platform', AsyncMock()) as provision:
         result = await evaluate_budget(UID, PLAN, 0)
     assert not result['allowed']

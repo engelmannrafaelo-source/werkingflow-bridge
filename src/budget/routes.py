@@ -273,24 +273,19 @@ async def evaluate_budget(
     # the atomicity that mattered here (provision, then observe the result)
     # is preserved on whichever side actually answers.
     budget = await _load_budget_via_platform(user_id)
-    if is_shared_monthly and plan_id not in budget.monthly_budgets:
-        # Existing registered Check users may own a trial instead of the
-        # paid pot. Reuse only an already-existing entry, never create one.
-        trial = find_trial_plan_for(plan_id)
-        if trial is not None and trial.id in budget.monthly_budgets:
-            effective_plan_id = trial.id
-        else:
-            return {"allowed": False, "reason": "monthly_exceeded_no_topup",
-                    "effectivePlanId": plan_id, "monthlyRemainingEur": 0.0,
-                    "topUpRemainingEur": 0.0, "totalRemainingEur": 0.0}
-
-    # Auto-provision trial when user is unlicensed and a trial sibling exists.
-    if budget.monthly_budgets.get(plan_id) is None and not is_shared_monthly:
+    # Resolve aliases before first-use funding: a newly registered Check user
+    # has no budget yet. Use the canonical plan's existing lazy trial path,
+    # never provision an alias pot or reset an existing (even expired) trial.
+    if budget.monthly_budgets.get(plan_id) is None:
         trial = find_trial_plan_for(plan_id)
         if trial is not None:
             effective_plan_id = trial.id
             if budget.monthly_budgets.get(trial.id) is None:
                 budget = await _ensure_trial_via_platform(user_id, plan_id, trial)
+        elif is_shared_monthly:
+            return {"allowed": False, "reason": "monthly_exceeded_no_topup",
+                    "effectivePlanId": plan_id, "monthlyRemainingEur": 0.0,
+                    "topUpRemainingEur": 0.0, "totalRemainingEur": 0.0}
 
     # Faelligen Monatstopf zuruecksetzen, BEVOR das Tor rechnet. Ohne das ist
     # ein "Monatsbudget" ein Lebenszeit-Deckel (s. rollover_monthly_if_due).
