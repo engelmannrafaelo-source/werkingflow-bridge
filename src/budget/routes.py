@@ -274,9 +274,15 @@ async def evaluate_budget(
     # is preserved on whichever side actually answers.
     budget = await _load_budget_via_platform(user_id)
     if is_shared_monthly and plan_id not in budget.monthly_budgets:
-        return {"allowed": False, "reason": "monthly_exceeded_no_topup",
-                "effectivePlanId": plan_id, "monthlyRemainingEur": 0.0,
-                "topUpRemainingEur": 0.0, "totalRemainingEur": 0.0}
+        # Existing registered Check users may own a trial instead of the
+        # paid pot. Reuse only an already-existing entry, never create one.
+        trial = find_trial_plan_for(plan_id)
+        if trial is not None and trial.id in budget.monthly_budgets:
+            effective_plan_id = trial.id
+        else:
+            return {"allowed": False, "reason": "monthly_exceeded_no_topup",
+                    "effectivePlanId": plan_id, "monthlyRemainingEur": 0.0,
+                    "topUpRemainingEur": 0.0, "totalRemainingEur": 0.0}
 
     # Auto-provision trial when user is unlicensed and a trial sibling exists.
     if budget.monthly_budgets.get(plan_id) is None and not is_shared_monthly:
@@ -464,11 +470,15 @@ async def apply_budget_deduction(
                 top_up_lots=old_lots,
             )
 
-            if is_shared_monthly and plan_id not in monthly_budgets:
-                raise BudgetDeductionDenied("BUDGET_EXCEEDED")
-
-            # Auto-provision trial when user is unlicensed and a trial sibling exists.
             effective_plan_id = plan_id
+            if is_shared_monthly and plan_id not in monthly_budgets:
+                trial = find_trial_plan_for(plan_id)
+                if trial is not None and trial.id in monthly_budgets:
+                    effective_plan_id = trial.id
+                else:
+                    raise BudgetDeductionDenied("BUDGET_EXCEEDED")
+
+            # Auto-provision trial only for ordinary, non-alias plans.
             if budget.monthly_budgets.get(plan_id) is None and not is_shared_monthly:
                 trial = find_trial_plan_for(plan_id)
                 if trial is not None:

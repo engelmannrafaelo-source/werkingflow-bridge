@@ -910,6 +910,14 @@ async def _ensure_monthly_budget_pot(conn: Any, user_uuid: uuid.UUID, plan_id: s
             user_uuid, pot.id,
         )
         if not exists:
+            from src.budget.plans import find_trial_plan_for
+            trial = find_trial_plan_for(pot.id)
+            if trial is not None:
+                exists = await conn.fetchval(
+                    "SELECT COALESCE(monthly_budgets ? $2, FALSE) FROM user_budgets WHERE user_id = $1",
+                    user_uuid, trial.id,
+                )
+        if not exists:
             raise ValueError(f"Existing monthly budget required: {pot.id}")
         # Keep the real limit (e.g. 1000), usage and reset anchor byte-for-byte.
         # The catalog default (e.g. 100) must never overwrite this account.

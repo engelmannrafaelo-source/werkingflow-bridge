@@ -107,3 +107,16 @@ async def test_schema_gate_fails_closed_on_budget_read_error():
     with patch('src.budget.gate.resolve_user_id', AsyncMock(return_value=UID)), patch('src.budget.gate.resolve_billing_plan', AsyncMock(return_value=PLANS[PLAN])), patch('src.budget.gate.evaluate_budget', AsyncMock(side_effect=RuntimeError('synthetic unavailable'))):
         with pytest.raises(HTTPException) as e: await enforce_budget(str(UID), APP, 0)
     assert e.value.status_code == 503
+
+
+@pytest.mark.asyncio
+async def test_existing_registered_trial_is_reused_not_reset():
+    PLANS['trial'] = PlanConfig('trial', 'werking-report', 'Trial', 0, 'month', 5, '', trial=True)
+    budget = UserBudget(str(UID), {'trial': MonthlyBudgetEntry(5, 4, ANCHOR)}, [])
+    with patch('src.budget.routes._load_budget_via_platform', AsyncMock(return_value=budget)), patch('src.budget.routes._ensure_trial_via_platform', AsyncMock()) as provision:
+        ok = await evaluate_budget(UID, PLAN, 1)
+        no = await evaluate_budget(UID, PLAN, 1.01)
+    assert ok['allowed'] and ok['effectivePlanId'] == 'trial'
+    assert not no['allowed']
+    assert budget.monthly_budgets['trial'].used_eur == 4
+    provision.assert_not_called()

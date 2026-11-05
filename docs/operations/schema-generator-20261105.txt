@@ -13,6 +13,8 @@ bestehenden Topf. Der normale Monatsrollover bleibt bestehen; die Einrichtung
 resettiert nichts. Alte Report-/Check-Abbuchungen und neue Schema-Abbuchungen
 nehmen dieselbe Zeilensperre und denselben Budgetschlüssel.
 Kein neuer Trial/Topf bei fehlender Zuordnung; Operatorgrant scheitert dann.
+Bereits vorhandene Trials angemeldeter Nutzer werden mit unverändertem
+Verbrauch und Ablauf wiederverwendet; fehlende Trials werden nicht erzeugt.
 Schema-Gate schließt bei fehlendem Produkt/Identität/Budgetdaten. Projekt-Credit-
 Aliases behalten die bisherigen same-app/Projektregeln.
 
@@ -35,7 +37,7 @@ Regulärer NichtProd-Auslieferungsweg (hier NICHT ausgeführt):
    Mail zunächst nicht konfigurieren. c760 führt genau einen vorgesehenen
    mailfreien Textlauf mit Workflow-ID, Ledger und Ergebnis durch.
 
-Prüfung: 13 neue synthetische Fälle +43 bestehende Fälle =56 bestanden.
+Prüfung: 14 neue synthetische Fälle +43 bestehende Fälle =57 bestanden.
 Erfasst: Alias-Kataloginvarianten,1000!=100, fehlenderTopf ohneTrial, unverändertes
 Grant-Budget, identischerUser, sequentielle Schema/Report-Abbuchung auf gesperrter
 Zeile, fehlendesProdukt/Identität/Budgetserver. Keine echte DB-/Migration-/
