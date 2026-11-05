@@ -179,7 +179,7 @@ from src.api_auth import require_service_token, AuthClaims
 from src.middleware.adaptive_limiter import (
     adaptive_limit_dependency,
     cache_request_body_dependency,
-    enforce_pool_admission,
+    enforce_pool_admission as _capacity_pool_admission,
     get_adaptive_limiter,
     estimate_request_tokens,
 )
@@ -1179,6 +1179,31 @@ async def worker_unavailable_handler(request: Request, exc: WorkerUnavailableErr
 # header carries the cumulative list of already-tried workers so loop
 # prevention is local to the call chain (no shared state required).
 # =============================================================================
+async def enforce_pool_admission(request: Request):
+    """Every NEW subscription admission checks the operator's central release.
+
+    This runs after external-provider routing, so an API-funded image is not
+    disabled by a subscription star. Already running calls are not cancelled.
+    """
+    from src.account_policy.client import fetch_policy, PolicyUnavailable
+    from src.account_policy.model import rank
+    from src.middleware.adaptive_limiter import WORKER_ACCOUNT
+    try:
+        policy = await fetch_policy()
+    except PolicyUnavailable as exc:
+        raise HTTPException(503, detail="bridge_account_policy_unavailable") from exc
+    if not WORKER_ACCOUNT or rank(policy, WORKER_ACCOUNT) is None:
+        raise HTTPException(429, detail="bridge_account_disabled", headers={"Retry-After": "5"})
+    request.state.bridge_account_policy_revision = policy["revision"]
+    await _capacity_pool_admission(request)
+
+
+async def _operator_adaptive_limit_dependency(request: Request):
+    """Abo-only endpoints use the same release guard as chat/research."""
+    await cache_request_body_dependency(request)
+    await enforce_pool_admission(request)
+
+
 async def _pick_alternative_worker(
     exclude_workers: set[str],
     benoetigt_tokens: int = 500,
@@ -1197,20 +1222,32 @@ async def _pick_alternative_worker(
     from src.chat_weiterleitung import pool_lage
     try:
         async with httpx.AsyncClient(timeout=3.0) as client:
-            r = await client.get(
-                "http://metrics-reader:8000/v1/metrics/account-pool-state"
-            )
+            metrics = os.environ.get("METRICS_READER_TARGET", "metrics-reader:8000").rstrip("/")
+            if not metrics.startswith(("http://", "https://")):
+                metrics = "http://" + metrics
+            r = await client.get(metrics + "/v1/metrics/account-pool-state")
             r.raise_for_status()
             data = r.json()
     except Exception as exc:
         logger.warning(f"_pick_alternative_worker: fetch failed: {exc}")
         data = {}
 
-    lage = pool_lage(
-        data.get("accounts") or {},
-        benoetigt_tokens=benoetigt_tokens,
-        ausgeschlossen=exclude_workers,
-    )
+    # Retry is a new admission, never a way around a disabled star.
+    from src.account_policy.client import fetch_policy, PolicyUnavailable
+    from src.account_policy.model import rank, choose
+    try:
+        policy = await fetch_policy()
+    except PolicyUnavailable:
+        return None
+    accounts = {key: value for key, value in (data.get("accounts") or {}).items()
+                if rank(policy, key) is not None}
+    lage = pool_lage(accounts, benoetigt_tokens=benoetigt_tokens, ausgeschlossen=exclude_workers)
+    eligible_workers = {row["worker"] for row in lage["worker"]
+                        if row["zustand"] == "frei" and not row["ausgeschlossen"]}
+    eligible_ids = [key for key, info in accounts.items() if info.get("worker") in eligible_workers]
+    preferred = request.headers.get("x-bridge-account") if request is not None else None
+    selected = choose(policy, eligible_ids, preferred)
+    lage["ziel"] = accounts[selected]["worker"] if selected else None
     if request is not None:
         request.state.chat_pool_lage = lage
     if lage["ziel"] is None:
@@ -8359,7 +8396,7 @@ async def doc_agent(
     request_body: DocAgentRequest,
     request: Request,
     credentials: Optional[HTTPAuthorizationCredentials] = Depends(security),
-    _adaptive=Depends(adaptive_limit_dependency)
+    _adaptive=Depends(_operator_adaptive_limit_dependency)
 ):
     """
     Claude-Code-Agent über einem geseedeten Dokumenten-Workdir.

@@ -14,7 +14,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Install only what the reader needs. No poetry, no Anthropic, no Presidio.
 RUN pip install --no-cache-dir \
     "fastapi>=0.110,<1" \
-    "uvicorn[standard]>=0.29,<1"
+    "uvicorn[standard]>=0.29,<1" \
+    "httpx>=0.27,<1"
 
 WORKDIR /app
 
@@ -32,6 +33,8 @@ RUN mkdir -p /app/src /app/src/middleware /app/src/metrics_reader \
 COPY src/middleware/bridge_metrics_store.py         /app/src/middleware/bridge_metrics_store.py
 COPY src/middleware/prompt_metrics.py               /app/src/middleware/prompt_metrics.py
 COPY src/middleware/rolling_metrics.py              /app/src/middleware/rolling_metrics.py
+
+COPY src/account_policy/ /app/src/account_policy/
 
 # Copy the reader app itself.
 COPY src/metrics_reader/__init__.py                 /app/src/metrics_reader/__init__.py

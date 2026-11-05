@@ -41,6 +41,9 @@ M.WEEKLY_HARD_EXCLUDE_PCT = 96
 -- reason in the X-Cache-Affinity header and the log).
 function M.account_rejection(info, min_required)
     if type(info) ~= "table" then return "unknown_account" end
+    if info.bridge_enabled ~= true then return "bridge_not_released" end
+    if type(info.bridge_priority) ~= "number" or info.bridge_priority < 1
+        or type(info.bridge_policy_revision) ~= "number" then return "policy_unknown" end
     local cooldown   = tonumber(info.cooldown_remaining_s) or 0
     local eff_cap    = tonumber(info.effective_cap_tokens) or 0
     local in_flight  = tonumber(info.current_in_flight_tokens) or 0
@@ -116,6 +119,20 @@ function M.pick_weighted_account(accounts, est_tokens, rand)
     -- unspecified, and an unstable order makes the draw unreproducible.
     table.sort(eligible, function(a, b) return a.name < b.name end)
 
+    -- Manual order precedes automatic capacity balancing. The latter remains
+    -- useful only for equal ranks (the current UI supplies unique ranks).
+    local best_rank = math.huge
+    for _, e in ipairs(eligible) do
+        best_rank = math.min(best_rank, accounts[e.name].bridge_priority)
+    end
+    local ranked, ranked_total = {}, 0
+    for _, e in ipairs(eligible) do
+        if accounts[e.name].bridge_priority == best_rank then
+            ranked[#ranked + 1] = e
+            ranked_total = ranked_total + e.weight
+        end
+    end
+    eligible, total = ranked, ranked_total
     local r, acc = rand() * total, 0
     for _, e in ipairs(eligible) do
         acc = acc + e.weight
@@ -198,6 +215,9 @@ function M.pick_with_affinity(accounts, est_tokens, key, rand, worker_ok)
         reason = "no_accounts"
     else
         reason = M.account_rejection(info, est_tokens or 0)
+        if reason == nil and name and info.bridge_priority > accounts[name].bridge_priority then
+            reason = "manual_priority"
+        end
         if reason == nil and info.usage_known ~= true and from_measured and name ~= nil then
             -- A measured account could take it: the unmeasured preferred one
             -- stays held back, exactly like in the weighted pick.

@@ -99,6 +99,9 @@ class LeaseTokenRequest(BaseModel):
 
 
 class LeaseTokenResponse(BaseModel):
+    requestedAccountId: Optional[str] = None
+    accountSelectionReason: str = "automatic"
+    policyRevision: Optional[int] = None
     leaseId: uuid.UUID
     accountId: str
     oauthToken: str
@@ -237,6 +240,9 @@ async def lease_token(
     )
 
     return LeaseTokenResponse(
+        requestedAccountId=body.preferredAccountId,
+        accountSelectionReason=picked.selection_reason,
+        policyRevision=picked.policy_revision,
         leaseId=lease_id,
         accountId=picked.account_id,
         oauthToken=oauth_token,
