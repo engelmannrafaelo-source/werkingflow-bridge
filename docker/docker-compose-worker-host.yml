@@ -146,6 +146,7 @@ x-worker-common: &worker-common
   # this file does not make BRIDGE_DB_URL reachable by itself).
   env_file:
     - ../secrets/platform.env
+    - ../secrets/account-policy.env
   healthcheck:
     test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
     interval: 30s
@@ -253,6 +254,7 @@ services:
     # 503 (fail closed). Same file the workers read the key from.
     env_file:
       - ../secrets/platform.env
+      - ../secrets/account-policy.env
     environment:
       - METRICS_DIR=/app/logs
       - LOG_LEVEL=INFO

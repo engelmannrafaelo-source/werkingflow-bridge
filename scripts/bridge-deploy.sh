@@ -409,16 +409,36 @@ acquire_deploy_lock() {
         esac
     fi
     local lockfile="${BRIDGE_DEPLOY_LOCK_DIR:-/var/lock}/bridge-deploy.${host_label}.lock"
-    # Append-Modus: das Öffnen darf die Holder-Info eines laufenden Deploys
-    # nicht trunkieren (ein '>' würde das tun, noch VOR dem flock-Versuch).
-    eval "exec ${fd}>>\"\$lockfile\""
+    # Existing files must be opened WITHOUT O_CREAT: protected_regular=2
+    # rejects even root's append/create open of another user's file in /run/lock.
+    # Create only a missing lock, exclusively; a concurrent creator is harmless.
+    if [[ ! -e "$lockfile" ]]; then
+        (set -o noclobber; : > "$lockfile") 2>/dev/null || [[ -e "$lockfile" ]] || {
+            error_ "Cannot create deploy lock: ${lockfile}"; return 1;
+        }
+    fi
+    # Linux flock supports an exclusive lock on a read-only descriptor.
+    # Neither opening nor a failed lock attempt changes the current holder text.
+    eval "exec ${fd}<\"\$lockfile\""
     if ! flock -n "$fd"; then
         error_ "Another bridge-deploy for '${host_label}' is already running (holder: $(tail -1 "$lockfile" 2>/dev/null || echo unbekannt), lock: ${lockfile})."
         error_ "Warten bis der laufende Deploy fertig ist — NIEMALS parallel deployen (Mixed-Code-Race)."
         exit 1
     fi
-    truncate -s 0 "$lockfile"
-    printf 'pid=%s started=%s user=%s\n' "$$" "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$(whoami)" >&"$fd"
+    # Write holder metadata through the locked inode, again without O_CREAT.
+    # The original descriptor stays open (and locked) until this process exits.
+    python3 -I - "$fd" "$$" "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$(whoami)" <<'PYLOCK'
+import os, sys
+fd = os.open('/proc/self/fd/' + sys.argv[1], os.O_WRONLY)
+try:
+    os.ftruncate(fd, 0)
+    with os.fdopen(fd, 'w') as output:
+        fd = -1
+        output.write('pid=%s started=%s user=%s\n' % tuple(sys.argv[2:5]))
+finally:
+    if fd >= 0:
+        os.close(fd)
+PYLOCK
 }
 case "$SERVER" in
     hetzner|smoke-nachholen) acquire_deploy_lock "hetzner" 210 ;;
@@ -2133,6 +2153,23 @@ phase_rollback() {
 # tests and the key the container runs are identical by construction. It is
 # fail-loud (empty key / missing file / verify mismatch → abort, no recreate),
 # idempotent (no-op when already in sync), and preserves every other line.
+
+# Dedicated least-scope environment: do not expose the full platform.env to nginx.
+phase_reconcile_account_policy() {
+    local host="$1" policy_url policy_token
+    if [[ "$DRY_RUN" == "true" ]]; then
+        info "[DRY-RUN] would reconcile dedicated account-policy.env from existing Prod Bridge service credentials"
+        return 0
+    fi
+    source /root/.infisical/infisical-api.sh 2>/dev/null || return 1
+    policy_url=$(infisical_get_secret "${INFISICAL_WS_DEV_SERVER}" dev AI_BRIDGE_URL_PROD 2>/dev/null) || return 1
+    policy_token=$(infisical_get_secret "${INFISICAL_WS_DEV_SERVER}" dev BRIDGE_SERVICE_TOKEN_PROD 2>/dev/null) || return 1
+    # Values travel on stdin only, never in argv or logs.
+    printf '%s\0%s\0' "$policy_url" "$policy_token" |
+        python3 -c 'import sys,json; p=sys.stdin.buffer.read().split(b"\0"); print(json.dumps({"url":p[0].decode(),"token":p[1].decode()}))' |
+        rssh "$host" "python3 '${REMOTE_REPO}/scripts/account-policy-env.py' '${REMOTE_REPO}/secrets/account-policy.env'"
+}
+
 phase_reconcile_worker_key() {
     local host="$1"
     step "Phase 3.5: reconcile worker AI_BRIDGE_API_KEY (${host})"
@@ -3098,6 +3135,16 @@ deploy_server() {
 
     # === Phase 2 ===
     phase_code_update "$host" || return 1
+
+    # The new dedicated env_file must exist BEFORE compose config validation.
+    # No container is touched here; errors retain all previous credentials.
+    phase_reconcile_account_policy "$host" || {
+        error_ "Account policy configuration failed before container changes"
+        if [[ "$DRY_RUN" == "false" ]]; then
+            rssh "$host" "cd ${REMOTE_REPO} && git reset --hard '${ROLLBACK_SHA}'" || true
+        fi
+        return 1
+    }
 
     # === Phase 3 ===
     phase_validate "$host" "$compose" || {
