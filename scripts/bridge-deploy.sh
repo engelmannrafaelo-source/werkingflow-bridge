@@ -2133,6 +2133,23 @@ phase_rollback() {
 # tests and the key the container runs are identical by construction. It is
 # fail-loud (empty key / missing file / verify mismatch → abort, no recreate),
 # idempotent (no-op when already in sync), and preserves every other line.
+
+# Dedicated least-scope environment: do not expose the full platform.env to nginx.
+phase_reconcile_account_policy() {
+    local host="$1" policy_url policy_token
+    if [[ "$DRY_RUN" == "true" ]]; then
+        info "[DRY-RUN] would reconcile dedicated account-policy.env from existing Prod Bridge service credentials"
+        return 0
+    fi
+    source /root/.infisical/infisical-api.sh 2>/dev/null || return 1
+    policy_url=$(infisical_get_secret "${INFISICAL_WS_DEV_SERVER}" dev AI_BRIDGE_URL_PROD 2>/dev/null) || return 1
+    policy_token=$(infisical_get_secret "${INFISICAL_WS_DEV_SERVER}" dev BRIDGE_SERVICE_TOKEN_PROD 2>/dev/null) || return 1
+    # Values travel on stdin only, never in argv or logs.
+    printf '%s\0%s\0' "$policy_url" "$policy_token" |
+        python3 -c 'import sys,json; p=sys.stdin.buffer.read().split(b"\0"); print(json.dumps({"url":p[0].decode(),"token":p[1].decode()}))' |
+        rssh "$host" "python3 '${REMOTE_REPO}/scripts/account-policy-env.py' '${REMOTE_REPO}/secrets/account-policy.env'"
+}
+
 phase_reconcile_worker_key() {
     local host="$1"
     step "Phase 3.5: reconcile worker AI_BRIDGE_API_KEY (${host})"
@@ -3098,6 +3115,16 @@ deploy_server() {
 
     # === Phase 2 ===
     phase_code_update "$host" || return 1
+
+    # The new dedicated env_file must exist BEFORE compose config validation.
+    # No container is touched here; errors retain all previous credentials.
+    phase_reconcile_account_policy "$host" || {
+        error_ "Account policy configuration failed before container changes"
+        if [[ "$DRY_RUN" == "false" ]]; then
+            rssh "$host" "cd ${REMOTE_REPO} && git reset --hard '${ROLLBACK_SHA}'" || true
+        fi
+        return 1
+    }
 
     # === Phase 3 ===
     phase_validate "$host" "$compose" || {

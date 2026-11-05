@@ -206,6 +206,8 @@ app.include_router(invoices_router)
 app.include_router(metrics_router)
 app.include_router(system_router)
 app.include_router(impersonation_router)
+from src.account_policy.routes import router as account_policy_router
+app.include_router(account_policy_router)
 app.include_router(sandbox_router)
 app.include_router(sandbox_conversations_router)
 app.include_router(principals_router)
