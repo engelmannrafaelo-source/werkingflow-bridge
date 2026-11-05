@@ -20,15 +20,19 @@ services:
   worker-sahori:
     env_file:
       - ../secrets/platform.env
+      - ../secrets/account-policy.env
   worker-kurt:
     env_file:
       - ../secrets/platform.env
+      - ../secrets/account-policy.env
   worker-coach:
     env_file:
       - ../secrets/platform.env
+      - ../secrets/account-policy.env
   worker-erk:
     env_file:
       - ../secrets/platform.env
+      - ../secrets/account-policy.env
 
   postgres-prod:
     image: postgres:16-alpine
@@ -88,6 +92,7 @@ services:
       - /root/werkingflow-bridge/secrets:/app/secrets:ro
     env_file:
       - ../secrets/platform.env
+      - ../secrets/account-policy.env
     environment:
       - TZ=Europe/Vienna
       - LOG_LEVEL=INFO
@@ -95,6 +100,9 @@ services:
       - FILTER_SENSITIVE_DATA=true
       - CORS_ORIGINS=["*"]
       - BRIDGE_SECRETS_DIR=/app/secrets
+      - BRIDGE_ACCOUNT_POLICY_AUTHORITY=1
+      - BRIDGE_ACCOUNT_POLICY_PARTNER_POOL_URL=http://${METRICS_READER_TARGET:?METRICS_READER_TARGET fehlt}/v1/metrics/account-pool-state
+      - BRIDGE_ACCOUNT_POLICY_DEV_POOL_URL=http://${BRIDGE_PRIMARY_HOST:?BRIDGE_PRIMARY_HOST fehlt}:8000/v1/metrics/account-pool-state
       # Zaehldienst: DIESELBE Quelle wie der Verteiler (nginx.conf setzt
       # $metrics_reader aus METRICS_READER_TARGET). Beim Worker-Umzug am
       # 03.09.2026 wurde nur der Verteiler nachgezogen; die API fiel auf ihren

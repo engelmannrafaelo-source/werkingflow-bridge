@@ -3,6 +3,8 @@ services:
   # NGINX Load Balancer - Round-Robin über 3 aktive Worker
   # =============================================================================
   nginx:
+    env_file:
+      - ../secrets/account-policy.env
     build:
       context: ..
       dockerfile: docker/Dockerfile.nginx-lb
@@ -89,6 +91,7 @@ services:
       - claude_token_1
     env_file:
       - ../secrets/platform.env
+      - ../secrets/account-policy.env
     environment:
       - CLAUDE_CODE_OAUTH_TOKEN_FILE=/run/secrets/claude_token_1
       - TZ=Europe/Vienna
@@ -303,6 +306,7 @@ services:
       - claude_token_2
     env_file:
       - ../secrets/platform.env
+      - ../secrets/account-policy.env
     environment:
       - CLAUDE_CODE_OAUTH_TOKEN_FILE=/run/secrets/claude_token_2
       - TZ=Europe/Vienna
@@ -517,6 +521,7 @@ services:
       - claude_token_3
     env_file:
       - ../secrets/platform.env
+      - ../secrets/account-policy.env
     environment:
       - CLAUDE_CODE_OAUTH_TOKEN_FILE=/run/secrets/claude_token_3
       - TZ=Europe/Vienna
@@ -731,6 +736,7 @@ services:
       - claude_token_4
     env_file:
       - ../secrets/platform.env
+      - ../secrets/account-policy.env
     environment:
       - CLAUDE_CODE_OAUTH_TOKEN_FILE=/run/secrets/claude_token_4
       - TZ=Europe/Vienna
@@ -953,6 +959,7 @@ services:
     # 503 (fail closed). Same file the workers read the key from.
     env_file:
       - ../secrets/platform.env
+      - ../secrets/account-policy.env
     environment:
       - METRICS_DIR=/app/logs
       - LOG_LEVEL=INFO

@@ -20,6 +20,8 @@ services:
   # NGINX — Eigener Load Balancer mit Fallback auf Server 1
   # ===========================================================================
   nginx:
+    env_file:
+      - ../secrets/account-policy.env
     # SINGLE SOURCE (ADR-0006 B/C): production now runs the SAME OpenResty+Lua
     # image + the SAME docker/nginx.conf as primary. nginx-prod.conf is gone; the
     # only per-bridge difference is upstreams-prod.conf (worker set + backup host).
@@ -770,6 +772,7 @@ services:
     # 503 (fail closed). Same file the workers read the key from.
     env_file:
       - ../secrets/platform.env
+      - ../secrets/account-policy.env
     environment:
       - METRICS_DIR=/app/logs
       - LOG_LEVEL=INFO

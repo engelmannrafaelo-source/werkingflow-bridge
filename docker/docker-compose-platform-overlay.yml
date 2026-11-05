@@ -21,24 +21,28 @@ services:
   worker1:
     env_file:
       - ../secrets/platform.env
+      - ../secrets/account-policy.env
     networks:
       - bridge-net
       - bridge-prod-net    # access to postgres-prod
   worker2:
     env_file:
       - ../secrets/platform.env
+      - ../secrets/account-policy.env
     networks:
       - bridge-net
       - bridge-prod-net
   worker3:
     env_file:
       - ../secrets/platform.env
+      - ../secrets/account-policy.env
     networks:
       - bridge-net
       - bridge-prod-net
   worker4:
     env_file:
       - ../secrets/platform.env
+      - ../secrets/account-policy.env
     networks:
       - bridge-net
       - bridge-prod-net
@@ -80,6 +84,7 @@ services:
       - /root/werkingflow-bridge/secrets:/app/secrets:ro
     env_file:
       - ../secrets/platform.env
+      - ../secrets/account-policy.env
     environment:
       - TZ=Europe/Vienna
       - LOG_LEVEL=INFO
@@ -87,6 +92,7 @@ services:
       - FILTER_SENSITIVE_DATA=true
       - CORS_ORIGINS=["*"]
       - BRIDGE_SECRETS_DIR=/app/secrets
+      - BRIDGE_ACCOUNT_POLICY_AUTHORITY=0
       # Sandbox-Kontovergabe: Prod-Worker-Konten zuerst (Rafael 02.10.2026).
       # Pool-State der Prod-Bridge; deren Login-Token muessen als
       # claude_token_<konto>.txt im Secrets-Verzeichnis oben liegen, sonst wird
