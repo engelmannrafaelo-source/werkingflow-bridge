@@ -215,6 +215,10 @@ async def enforce_budget(
     post-call deduction lazily allocates the budget. Project plans never gate on
     the monthly tenant budget.
     """
+    strict_monthly = app_id == "werking-schema-generator"
+    # This public acquisition product must not become an unmetered internal call.
+    if strict_monthly and not user_id:
+        raise HTTPException(status_code=400, detail={"error": "missing_billing_identity"})
     # No user / no app → not a user-budgeted call (internal job). Let through.
     if not user_id or not app_id:
         return
@@ -239,9 +243,13 @@ async def enforce_budget(
         # X-Budget-Hard-Cap hint (dev worker log 29./30.10.2026).
         if project_id and _known_hard_cap_raw(user_id, project_id, hard_cap_hint):
             raise _budget_state_unavailable(user_id, project_id, f"plan catalog: {e}") from e
+        if strict_monthly:
+            raise HTTPException(status_code=503, detail={"error": "budget_state_unavailable"}) from e
         logger.error("budget gate: plan catalog unavailable (%s) — letting call through", e)
         return
     if not in_catalog:
+        if strict_monthly:
+            raise HTTPException(status_code=503, detail={"error": "budget_product_unconfigured"})
         return
 
     # ADR-0011 pre-flight: a FOREIGN-origin request whose home bridge is not
@@ -304,6 +312,8 @@ async def enforce_budget(
         # DATA condition — a well-formed email with no Bridge user behind it.
         # Whether an unlicensed address should be blocked is a business call,
         # not an architectural one, so the pre-existing fail-open policy stays.
+        if strict_monthly:
+            raise HTTPException(status_code=400, detail={"error": "unresolved_billing_identity"}) from e
         logger.warning("budget gate: unknown user_id %r (%s) — letting call through", user_id, e)
         return
 
@@ -320,10 +330,14 @@ async def enforce_budget(
     except Exception as e:  # noqa: BLE001 — fail-open: infra error must not kill the AI path
         if project_id and _known_hard_cap(uid, project_id, hard_cap_hint):
             raise _budget_state_unavailable(uid, project_id, f"plan resolution: {e}") from e
+        if strict_monthly:
+            raise HTTPException(status_code=503, detail={"error": "budget_state_unavailable"}) from e
         logger.error("budget gate: plan resolution failed (%s) — letting call through", e)
         return
 
     if plan is None:
+        if strict_monthly:
+            raise HTTPException(status_code=503, detail={"error": "budget_product_unconfigured"})
         # App left the plan catalog between the check above and here (hot
         # reload). Not budget-gated.
         return
@@ -431,6 +445,11 @@ async def enforce_budget(
     try:
         result = await evaluate_budget(uid, plan.id, estimated_cost_eur)
     except Exception as e:  # noqa: BLE001 — fail-open: infra error must not kill the AI path
+        if plan.budget_plan_id is not None:
+            raise HTTPException(status_code=503, detail={
+                "error": "budget_state_unavailable", "appId": app_id,
+                "message": "Gemeinsames Budget derzeit nicht prüfbar.",
+            }) from e
         logger.error("budget gate: evaluate_budget failed (%s) — letting call through", e)
         return
 

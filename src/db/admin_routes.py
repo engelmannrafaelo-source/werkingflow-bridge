@@ -124,7 +124,7 @@ def _user_row_to_dict(row: Any) -> Dict[str, Any]:
 
 _ALLOWED_APP_IDS = {
     "werking-report", "werking-energy", "werking-safety",
-    "werking-noise", "engelmann",
+    "werking-noise", "engelmann", "werking-schema-generator",
 }
 
 
@@ -723,7 +723,7 @@ async def anonymize_user(
 # instead of a confusing 500 from Postgres on an unknown enum literal.
 _ALLOWED_PLAN_IDS = {
     "trial", "report-standard", "energy-project", "safety-project",
-    "noise-tbd", "engelmann-custom",
+    "noise-tbd", "engelmann-custom", "schema-generator",
 }
 
 

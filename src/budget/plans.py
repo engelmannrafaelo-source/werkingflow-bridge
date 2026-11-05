@@ -36,6 +36,8 @@ class PlanConfig:
     # 066). Set = a pure credit kind: a consumed slot allocates its API budget
     # under this pot plan, and the pot plan's own credits are accepted for it
     # (see accepted_credit_plan_ids). Pot resolution never sees credit kinds.
+    # For an internal, zero-allowance monthly product this is the existing
+    # user's monthly pot; no new allowance or trial is provisioned.
     budget_plan_id: "str | None" = None
 
 
@@ -195,6 +197,23 @@ def budget_plan_for(plan: PlanConfig) -> PlanConfig:
     return plan if plan.budget_plan_id is None else get_plan(plan.budget_plan_id)
 
 
+def monthly_budget_plan(plan: PlanConfig) -> PlanConfig:
+    """Resolve an explicit monthly product alias; never allocate another pot.
+
+    Aliases are internal, non-sellable products with zero new allowance. They
+    share the existing user's pot (identity is never replaced by a sponsor).
+    Project credit kinds keep their original same-app rules.
+    """
+    if plan.interval != "month" or plan.budget_plan_id is None:
+        return plan
+    pot = get_plan(plan.budget_plan_id)
+    if (pot.interval != "month" or pot.trial or pot.budget_plan_id is not None
+            or plan.trial or plan.sellable or plan.api_budget_eur != 0
+            or plan.price != 0):
+        raise AmbiguousPlanCatalog(f"Invalid monthly budget alias {plan.id!r}")
+    return pot
+
+
 def accepted_credit_plan_ids(plan_id: str) -> "tuple[str, ...]":
     """
     Credit rows (manual_project_credits.plan_id) that may be consumed for
@@ -245,6 +264,11 @@ def assert_catalog_is_unambiguous() -> None:
         if plan.budget_plan_id is None:
             continue
         pot = PLANS.get(plan.budget_plan_id)
+        if plan.interval == "month":
+            if pot is None:
+                raise AmbiguousPlanCatalog(f"Missing monthly pot for {plan.id!r}")
+            monthly_budget_plan(plan)
+            continue
         # A credit kind must point at an active pot of the SAME app that is
         # itself a pot — otherwise its slot allocates somewhere no call of the
         # app is ever metered against.

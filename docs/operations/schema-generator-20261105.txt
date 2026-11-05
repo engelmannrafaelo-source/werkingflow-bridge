@@ -1,0 +1,49 @@
+WerkIng Schema-Generator — Repository-Entwurf, NICHT eingerichtet
+Quelle: Rafael05.11.08:14, bestehender Homepage-/Bridge-Auftrag; KD08:34 bestätigt Reparatur.
+
+Produkt/App: werking-schema-generator; interner Plan: schema-generator.
+Kein Verkaufspreis/Checkout und kein neues Guthaben: price=0, api_budget_eur=0,
+sellable=false. budget_plan_id=report-standard bindet denselben Monatstopf
+DES TATSAECHLICHEN USERS. Der technische Check-Nutzer bleibt nur anonymen
+Anfragen zugeordnet. Angemeldete UUIDs werden nie durch den Dienstnutzer ersetzt.
+
+Die vorhandene Check-Kontokonfiguration beträgt1000EUR, Katalogdefault100EUR.
+Dieser Patch kopiert keinen dieser Werte: Limit, usedEur, resetAt bleiben am
+bestehenden Topf. Der normale Monatsrollover bleibt bestehen; die Einrichtung
+resettiert nichts. Alte Report-/Check-Abbuchungen und neue Schema-Abbuchungen
+nehmen dieselbe Zeilensperre und denselben Budgetschlüssel.
+Kein neuer Trial/Topf bei fehlender Zuordnung; Operatorgrant scheitert dann.
+Schema-Gate schließt bei fehlendem Produkt/Identität/Budgetdaten. Projekt-Credit-
+Aliases behalten die bisherigen same-app/Projektregeln.
+
+Regulärer NichtProd-Auslieferungsweg (hier NICHT ausgeführt):
+1. Aliasfähigen Code in platform-api UND auf allen beteiligten Workern regulär
+   aus geprüftem Commit ausliefern. Mischstände vor Aktivierung ausschließen.
+2. 074 (nur Enum) committen, danach075 (Katalog), regulärer Migrationsmechanismus.
+   Vorhandene Katalogzeile bei erneutem Lauf vergleichen, nicht blind ändern.
+3. Katalog in allen beteiligten Prozessen laden/verifizieren.
+4. Vorhandenen technischen Check-Nutzer aus dessen Infisical-Referenz lesen;
+   Budget/Limits/Verbrauch vorher sichern (Metadaten, keine Secretwerte).
+   Regulärer transaktionaler Admin-grant für App/Plan oben, kein Seed-/Checkout.
+   Fehlender vorhandener Monatstopf ist eine echte fehlende Zuordnung, kein
+   Anlass zur automatisch neuen100EUR- oder1000EUR-Finanzierung.
+5. Principal-Scope serverseitig regulär einrichten; keine Keywerte senden oder
+   kopieren. Website-Adapter erhält App-ID erst als LIVE eingerichtet bestätigt.
+6. Vorher/Nachher: exakt gleiche Budgetschlüssel/Limit/Verbrauch/Anker;
+   Subscription active mit App/Plan, gültiger Principal, Host/Deployment-SHA.
+7. R-H-Secret+Stagingroute separat nach legitimem Operatoranschluss;
+   Mail zunächst nicht konfigurieren. c760 führt genau einen vorgesehenen
+   mailfreien Textlauf mit Workflow-ID, Ledger und Ergebnis durch.
+
+Prüfung: 13 neue synthetische Fälle +43 bestehende Fälle =56 bestanden.
+Erfasst: Alias-Kataloginvarianten,1000!=100, fehlenderTopf ohneTrial, unverändertes
+Grant-Budget, identischerUser, sequentielle Schema/Report-Abbuchung auf gesperrter
+Zeile, fehlendesProdukt/Identität/Budgetserver. Keine echte DB-/Migration-/
+Concurrencyprüfung, kein Live-GO und kein unabhängiges Prüf-PASS.
+
+Grenzen: Budgetvorprüfung ist wie bisher keine Reservierung der Modellkosten;
+atomare Abbuchung allein beweist keine Vorabreservierung konkurrierender Calls.
+S3-Lifetime-/IP-Zähleratomarität und physische30TageLöschung bleiben Website/
+Betriebsanschluss. Personenbezogene Mail-/Consent-Daten nicht Teil dieses Pakets.
+R-H: legitimer Adminvorgang059671f0 BLOCKED, kein Secretwriter/Checkout zugeordnet.
+Keine Owner-JWT-Synthese, keine Prodwirkung, kein Modell-/Mailaufruf hier.

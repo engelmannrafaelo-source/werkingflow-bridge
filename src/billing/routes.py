@@ -35,7 +35,7 @@ router = APIRouter(prefix="/v1/billing", tags=["billing"])
 
 _ALLOWED_APP_IDS = {
     "werking-report", "werking-energy", "werking-safety",
-    "werking-noise", "engelmann",
+    "werking-noise", "engelmann", "werking-schema-generator",
 }
 
 _ALLOWED_ACCOUNT_TYPES = {"customer", "test", "internal"}

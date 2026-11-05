@@ -50,7 +50,7 @@ from src.budget.calculator import (
     topup_balance_eur,
     next_topup_expiry,
 )
-from src.budget.plans import PlanConfig, get_plan, find_trial_plan_for
+from src.budget.plans import PlanConfig, get_plan, find_trial_plan_for, monthly_budget_plan
 from src.budget import deduction_keys as _dedup
 from src.budget.topup_store import (
     LegacyTopUpBalanceError,
@@ -260,7 +260,9 @@ async def evaluate_budget(
 
     Returns the same dict shape the /check endpoint returns.
     """
-    _require_month_interval(plan_id)  # raises on unknown / project / unsupported interval
+    requested_plan = _require_month_interval(plan_id)
+    is_shared_monthly = requested_plan.budget_plan_id is not None
+    plan_id = monthly_budget_plan(requested_plan).id
 
     effective_plan_id = plan_id
 
@@ -271,9 +273,13 @@ async def evaluate_budget(
     # the atomicity that mattered here (provision, then observe the result)
     # is preserved on whichever side actually answers.
     budget = await _load_budget_via_platform(user_id)
+    if is_shared_monthly and plan_id not in budget.monthly_budgets:
+        return {"allowed": False, "reason": "monthly_exceeded_no_topup",
+                "effectivePlanId": plan_id, "monthlyRemainingEur": 0.0,
+                "topUpRemainingEur": 0.0, "totalRemainingEur": 0.0}
 
     # Auto-provision trial when user is unlicensed and a trial sibling exists.
-    if budget.monthly_budgets.get(plan_id) is None:
+    if budget.monthly_budgets.get(plan_id) is None and not is_shared_monthly:
         trial = find_trial_plan_for(plan_id)
         if trial is not None:
             effective_plan_id = trial.id
@@ -325,6 +331,9 @@ async def evaluate_budget(
     result = check_budget(budget, effective_plan_id, estimated_cost_eur)
 
     reason = result.reason
+    if is_shared_monthly and not result.allowed:
+        # Missing/exhausted funding is a hard refusal, never free access.
+        reason = "monthly_exceeded_no_topup"
     if result.allowed and effective_plan_id != plan_id:
         reason = "trial_active"
 
@@ -419,7 +428,9 @@ async def apply_budget_deduction(
     purchase first, expired lots skipped) and the reduced lot amounts are
     persisted in the same transaction.
     """
-    _require_month_interval(plan_id)  # raises on unknown / project / unsupported interval
+    requested_plan = _require_month_interval(plan_id)
+    is_shared_monthly = requested_plan.budget_plan_id is not None
+    plan_id = monthly_budget_plan(requested_plan).id
 
     pool = get_pool()
 
@@ -453,9 +464,12 @@ async def apply_budget_deduction(
                 top_up_lots=old_lots,
             )
 
+            if is_shared_monthly and plan_id not in monthly_budgets:
+                raise BudgetDeductionDenied("BUDGET_EXCEEDED")
+
             # Auto-provision trial when user is unlicensed and a trial sibling exists.
             effective_plan_id = plan_id
-            if budget.monthly_budgets.get(plan_id) is None:
+            if budget.monthly_budgets.get(plan_id) is None and not is_shared_monthly:
                 trial = find_trial_plan_for(plan_id)
                 if trial is not None:
                     effective_plan_id = trial.id

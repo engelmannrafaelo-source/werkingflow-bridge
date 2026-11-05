@@ -902,6 +902,18 @@ async def _ensure_monthly_budget_pot(conn: Any, user_uuid: uuid.UUID, plan_id: s
     plan = get_plan(plan_id)  # raises ValueError for unknown plan
     if plan.trial or plan.interval != "month":
         return
+    if plan.budget_plan_id is not None:
+        from src.budget.plans import monthly_budget_plan
+        pot = monthly_budget_plan(plan)
+        exists = await conn.fetchval(
+            "SELECT COALESCE(monthly_budgets ? $2, FALSE) FROM user_budgets WHERE user_id = $1",
+            user_uuid, pot.id,
+        )
+        if not exists:
+            raise ValueError(f"Existing monthly budget required: {pot.id}")
+        # Keep the real limit (e.g. 1000), usage and reset anchor byte-for-byte.
+        # The catalog default (e.g. 100) must never overwrite this account.
+        return
     await _provision_plan_budget(conn, user_uuid, plan)
 
 
@@ -1838,6 +1850,8 @@ async def provision_subscription(
     from src.budget.plans import get_plan
 
     plan = get_plan(plan_id)  # raises ValueError for unknown plan
+    if plan.interval == "month" and plan.budget_plan_id is not None:
+        raise ValueError("Shared monthly products require the transactional operator grant")
     if plan.trial:
         raise ValueError(
             f"provision_subscription: cannot provision trial plan '{plan_id}' — "
