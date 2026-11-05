@@ -509,6 +509,20 @@ HEADER
     emit_upstream claude_version 8 nobackup "$targets_name" "${workers[@]}"
     echo
 
+    # Direct policy targets never retry a different account behind the picker.
+    # A new attempt must get a fresh release/priority decision.
+    echo "# Operator-selected account/peer targets (no implicit backup account)."
+    local pw
+    for pw in "${workers[@]}"; do
+        emit_upstream "bridge_policy_${pw}" 16 nobackup "$targets_name" "$pw"
+        echo
+    done
+    echo 'upstream bridge_policy_peer {'
+    echo '    server ${BRIDGE_BACKUP_HOST}:8000 max_fails=0;'
+    echo '    keepalive 16;'
+    echo '}'
+    echo
+
     echo "# Account-affinity groups (CACHE2) — one per worker, see emit_affinity_upstreams."
     emit_affinity_upstreams "$default_backup" "$targets_name" "${workers[@]}"
     echo

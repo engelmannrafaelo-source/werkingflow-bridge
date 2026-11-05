@@ -209,7 +209,7 @@ async def test_tiebreak_by_shorter_cooldown(monkeypatch):
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
-async def test_round_robin_picks_least_used_account(monkeypatch):
+async def test_user_priority_precedes_lease_count(monkeypatch):
     """
     Same headroom on both accounts — the one with fewer recent leases wins.
     Without S7 the order was deterministic-but-unfair (dict-order + max-headroom);
@@ -222,11 +222,11 @@ async def test_round_robin_picks_least_used_account(monkeypatch):
     })
     lease_counts = {"engelmann": 178, "office": 22, "gmail": 4}
     picked = await pick_account(lease_counts=lease_counts)
-    assert picked.account_id == "gmail"  # least-used
+    assert picked.account_id == "engelmann"  # user priority precedes lease count
 
 
 @pytest.mark.asyncio
-async def test_round_robin_missing_account_treated_as_zero(monkeypatch):
+async def test_missing_lease_count_does_not_override_user_priority(monkeypatch):
     """
     A never-used (or recently-idle) account is absent from lease_counts.
     It MUST be treated as 0 and naturally win the rotation against any account
@@ -239,7 +239,7 @@ async def test_round_robin_missing_account_treated_as_zero(monkeypatch):
     # werking absent → defaults to 0 leases → wins over engelmann's 178
     lease_counts = {"engelmann": 178}
     picked = await pick_account(lease_counts=lease_counts)
-    assert picked.account_id == "werking"
+    assert picked.account_id == "engelmann"
 
 
 @pytest.mark.asyncio
@@ -366,3 +366,12 @@ async def test_stale_fallback_still_honours_no_capacity(monkeypatch):
     _patch_pool_state_unreachable(monkeypatch)
     with pytest.raises(NoCapacityError):
         await pick_account()
+
+
+@pytest.fixture(autouse=True)
+def _bridge_user_policy(monkeypatch):
+    from src.account_policy import client
+    from src.account_policy.model import initial_policy
+    async def fresh():
+        return initial_policy()
+    monkeypatch.setattr(client, "fetch_policy", fresh)

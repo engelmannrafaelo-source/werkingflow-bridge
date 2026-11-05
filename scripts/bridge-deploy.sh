@@ -1446,7 +1446,7 @@ phase_smoke_test() {
 }
 
 # ============================================================================
-# Phase 5b: Distribution Test — validates pool-router spreads load across workers
+# Phase 5b: Distribution Test — validates explicit released-account selection across workers
 # ============================================================================
 # Phase 5c: Zugangs-Kanarienvogel (access_canary.py)
 # ============================================================================
@@ -1805,7 +1805,7 @@ phase_distribution_test() {
 
 # distribution_assertion <url> <expect-bridge>
 # 8 sequential chat/completions calls through the pool router; >=2 distinct
-# workers of <expect-bridge> = the router spreads load. 0 also for SKIP_DIST_TEST
+# workers of <expect-bridge> = explicit account selection reaches local workers. 0 also for SKIP_DIST_TEST
 # and DIST_SKIP (both reported loudly).
 distribution_assertion() {
     local url="$1"
@@ -1827,11 +1827,13 @@ distribution_assertion() {
     fi
 
     # 8 sequential chat/completions calls; parse X-Target-Worker header
-    info "Sending 8 chat/completions calls to ${url} to validate worker distribution..."
+    info "Sending 8 chat/completions calls to ${url} to validate explicit eligible-account selection..."
     local dist_out
-    dist_out=$(DIST_URL="${url}" DIST_API_KEY="${api_key}" DIST_BRIDGE="${expect_bridge}" python3 - <<'PYEOF'
+    dist_out=$(DIST_URL="${url}" DIST_API_KEY="${api_key}" DIST_BRIDGE="${expect_bridge}" DIST_SCRIPTS="$(dirname "${BASH_SOURCE[0]}")" python3 - <<'PYEOF'
 import os, sys, json, requests
 from collections import Counter
+sys.path.insert(0, os.environ["DIST_SCRIPTS"])
+from bridge_smoke_accounts import local_accounts, PoolStateError
 
 url     = os.environ["DIST_URL"]
 api_key = os.environ["DIST_API_KEY"]
@@ -1844,8 +1846,8 @@ headers = {
     # Same contract as the smoke test: deploy probes book anonymous, not
     # unattributed (the dist test fires 8 chat calls per rollout).
     "X-User-ID": "anonymous:bridge-deploy-dist-test",
-    # LOCAL tier. Without it ADR-0010 sends dev chat to the prod workers
-    # first: until 2026-10-10 this test reported "DIST_OK 4/4" for the four
+    # Legacy-bootstrap LOCAL tier only. Policy consumers ignore this header
+    # and use fresh released-account preselection below. Historically: until 2026-10-10 this test reported "DIST_OK 4/4" for the four
     # PROD workers on every dev deploy (BR2D §7) and said nothing about dev.
     "X-Bridge-Hop": "1",
 }
@@ -1892,7 +1894,28 @@ workers_hit = []
 refused = 0
 foreign = []   # answers stamped by another bridge — the test then measures nothing
 unstamped = 0  # 200 without X-Bridge-Served-By — workers predate the stamp
+selected_accounts = set()
+policy_mode = False
+preflight_blocked = False
 for i in range(8):
+    try:
+        eligible_now = local_accounts(url, headers)
+    except PoolStateError as exc:
+        print(f"DIST_FAIL: {exc}", file=sys.stderr)
+        sys.exit(1)
+    if eligible_now is not None:
+        policy_mode = True
+        if not eligible_now:
+            preflight_blocked = True
+            print("  UNPROVEN: no released eligible local account; no provider request")
+            break
+        # Prefer an as-yet untested eligible ID, then rotate the fresh ranked list.
+        account = next((a for a in eligible_now if a not in selected_accounts),
+                       eligible_now[i % len(eligible_now)])
+        headers['X-Bridge-Account'] = account
+        selected_accounts.add(account)
+    else:
+        headers.pop('X-Bridge-Account', None)
     try:
         r = requests.post(
             f"{url}/v1/chat/completions",
@@ -1923,6 +1946,9 @@ for i in range(8):
     if is_pool_exhausted(r):
         refused += 1
         note = " (router refused: pool exhausted — no worker reached)"
+    elif r.status_code == 429 and policy_mode:
+        refused += 1
+        note = " (429 capacity/policy refusal — explicit selection remains unproven)"
     elif r.status_code == 429:
         note = " (429 worker rate-limited — counts as hit via LB pick)"
         worker = lb_pick if lb_pick != "unknown" else None
@@ -1962,7 +1988,7 @@ if len(unique_workers) >= 2:
 # call to the one account (or refusing all of them) is the correct behaviour —
 # failing here would report infrastructure STATE as a code defect, the same
 # confusion that made the deploy smoke roll back good builds (f32c801).
-eligible = eligible_account_count()
+eligible = len(selected_accounts) if policy_mode else eligible_account_count()
 
 # A refusal is the router stating, at call time, that nothing was eligible.
 # `eligible` is sampled seconds later and the pool moves fast (a single account
@@ -1970,14 +1996,14 @@ eligible = eligible_account_count()
 # are the authoritative signal and the later count is reported as context, not
 # used to contradict them. Deciding on that race would produce exactly the kind
 # of flaky red the smoke fix (f32c801) removed.
-if refused or (0 <= eligible < 2):
+if preflight_blocked or refused or (0 <= eligible < 2):
     facts = [f"{len(unique_workers)} worker(s) hit"]
     if refused:
         facts.append(f"{refused}/8 refused by the router (pool_exhausted)")
-    facts.append(f"{eligible} account(s) eligible when sampled afterwards"
+    facts.append(f"{eligible} account(s) selected from fresh local policy (legacy: sampled afterwards)"
                  if eligible >= 0 else "eligibility unknown (state probe failed)")
     print(
-        f"DIST_SKIP: load-spreading is not assertable right now — "
+        f"DIST_SKIP: explicit account selection is UNPROVEN right now — "
         f"{'; '.join(facts)}. With no spare account, refusing calls or "
         f"concentrating them on the only account with headroom is the CORRECT "
         f"behaviour, not a router defect. Re-run once >=2 accounts have headroom.",
@@ -1993,8 +2019,8 @@ if refused or (0 <= eligible < 2):
 print(
     f"DIST_FAIL: only {len(unique_workers)} unique worker(s) hit across 8 calls "
     f"(need >=2): {sorted(unique_workers)}, while {eligible} account(s) were "
-    f"eligible and none were refused. Pool router is not distributing load — "
-    f"check pool_router.lua tie-breaker logic.",
+    f"eligible and none were refused. Explicit account selection did not reach distinct workers — "
+    f"check account preference routing.",
     file=sys.stderr,
 )
 sys.exit(1)
@@ -2012,7 +2038,7 @@ PYEOF
     fi
 
     if [[ $rc_dist -ne 0 ]] || ! echo "$dist_out" | grep -q 'DIST_OK:'; then
-        error_ "Distribution test FAILED — pool router not spreading load across workers"
+        error_ "Distribution test FAILED — explicit account selection did not reach distinct workers"
         return 1
     fi
     return 0

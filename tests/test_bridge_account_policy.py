@@ -61,6 +61,22 @@ def test_route_user_rejected_and_operator_cas(monkeypatch):
     assert c.get("/v1/admin/bridge-account-policy").status_code==503
 
 @pytest.mark.asyncio
+async def test_sandbox_fresh_star_read_and_explicit_no_fallback(monkeypatch):
+    from src.sandbox import account_router as ar
+    p=initial_policy()
+    monkeypatch.setattr(client,"fetch_policy",AsyncMock(side_effect=lambda:deepcopy(p)))
+    monkeypatch.setattr(ar,"_PROD_POOL_STATE_URL","")
+    state={x:{"available":True,"headroom_percent":40,"cooldown_remaining_s":0,"usage_known":True} for x in ["sahori","erk"]}
+    monkeypatch.setattr(ar,"_load_state",AsyncMock(return_value=state))
+    assert (await ar.pick_account()).account_id=="sahori"
+    p["accounts"][0]["enabled"]=False
+    assert (await ar.pick_account()).account_id=="erk"
+    picked = await ar.pick_account("sahori")
+    assert picked.account_id == "erk"
+    assert picked.selection_reason == "preferred_unavailable_fallback"
+    # Existing lease heartbeat/release are separate, unchanged endpoints.
+
+@pytest.mark.asyncio
 async def test_runtime_merges_houses_without_foreign_accounts(monkeypatch):
     from src.account_policy.runtime import runtime_snapshot
     class Response:

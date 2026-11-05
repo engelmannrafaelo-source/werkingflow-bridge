@@ -90,6 +90,8 @@ class PickedAccount:
     account_id: str
     headroom_percent: float
     tier: str = TIER_DEV
+    policy_revision: Optional[int] = None
+    selection_reason: str = "automatic"
 
 
 def _require(info: dict[str, Any], key: str, acct_name: str) -> Any:
@@ -315,122 +317,66 @@ async def pick_account(
     lease_counts: Optional[dict[str, int]] = None,
     has_token: Optional[Callable[[str], bool]] = None,
 ) -> PickedAccount:
-    """
-    Return the best account for a new lease — Prod-Worker-Konten zuerst
-    (Stufe 1), Dev-Konten als Ersatz (Stufe 2).
-
-    Reihenfolge: gemessene Prod-Konten -> gemessene Dev-Konten -> ungemessene
-    Prod-Konten -> ungemessene Dev-Konten (beides laut geloggt). Jeder Wechsel
-    auf eine niedrigere Stufe wird mit Grund geloggt.
-
-    Args:
-        preferred_account_id: caller hint; wins if eligible in the served tier.
-        lease_counts: optional {account_id: recent_lease_count} for fairness
-            ranking (typically leases-issued-in-last-24h from sandbox_leases).
-            Missing accounts default to 0.
-        has_token: Pruefung "liegt fuer dieses Konto ein Login-Token auf
-            diesem Host?" — gilt fuer Prod-Konten (deren Token kommen nicht
-            mit dem Host). Ohne Pruefung ist Stufe 1 aus (laut geloggt).
-
-    Raises:
-        RuntimeError: kein Prod-Konto zulaessig UND Dev-Pool-State nicht
-            lesbar (unreachable / malformed / empty, kein frischer Snapshot);
-            ausserdem bei Namensgleichheit eines Prod- und eines Dev-Kontos.
-        NoCapacityError: no account in either tier passes the filters;
-            carries per-account exclusion reasons (prefixed prod:/dev:).
-    """
+    """Fresh user policy first; technical/token guards still apply to every candidate."""
+    from src.account_policy.client import fetch_policy
+    from src.account_policy.model import choose, rank
+    policy = await fetch_policy()  # never reuse a cached authorization
     lease_counts = lease_counts or {}
-    exclusion_reasons: dict[str, str] = {}
-    all_cooldowns: list[int] = []
-    prod_measured: list[_Row] = []
-    prod_unmeasured: list[_Row] = []
-    prod_names: set[str] = set()
+    reasons: dict[str, str] = {}
+    cooldowns: list[int] = []
+    measured, unmeasured = [], []
+    seen = set()
+    tiers = {}
 
-    if not _PROD_POOL_STATE_URL:
-        logger.warning(
-            "pick_account: SANDBOX_PROD_POOL_STATE_URL not set — prod-worker tier "
-            "DISABLED, leasing dev accounts only"
-        )
-        exclusion_reasons["prod"] = "tier disabled (SANDBOX_PROD_POOL_STATE_URL not set)"
-    elif has_token is None:
-        logger.error("pick_account: no token check supplied — prod-worker tier DISABLED")
-        exclusion_reasons["prod"] = "tier disabled (no token check)"
-    else:
+    async def collect(url, tier, token_check=None):
+        accounts = await _load_state(url)
+        if tier == TIER_PROD:
+            accounts = _overlay_penalties(accounts, await _fetch_observed_penalties())
+        clash = seen & set(accounts)
+        if clash:
+            raise RuntimeError("duplicate account in BOTH pool sources: " + ",".join(sorted(clash)))
+        seen.update(accounts)
+        allowed = {}
+        for account, info in accounts.items():
+            if rank(policy, account) is None:
+                reasons[tier + ":" + account] = "bridge_disabled"
+            else:
+                allowed[account] = info
+                tiers[account] = tier
+        m, u = _split(allowed, lease_counts, reasons, cooldowns, tier, token_check)
+        measured.extend(m); unmeasured.extend(u)
+
+    if _PROD_POOL_STATE_URL and has_token is not None:
         try:
-            prod_accounts = _overlay_penalties(
-                await _load_state(_PROD_POOL_STATE_URL), await _fetch_observed_penalties()
-            )
+            await collect(_PROD_POOL_STATE_URL, TIER_PROD, has_token)
         except RuntimeError as exc:
-            logger.error(f"pick_account: prod-worker pool state unavailable — falling to dev tier: {exc}")
-            # Detail (URL/host) only in the log — reasons go back to the client.
-            exclusion_reasons["prod"] = "pool state unavailable (see bridge log)"
-        else:
-            prod_names = set(prod_accounts)
-            prod_measured, prod_unmeasured = _split(
-                prod_accounts, lease_counts, exclusion_reasons, all_cooldowns,
-                TIER_PROD, has_token,
-            )
-            if prod_measured:
-                if preferred_account_id and preferred_account_id not in {r[0] for r in prod_measured}:
-                    logger.info(
-                        "pick_account: preferred=%s not an eligible prod account — "
-                        "prod tier wins (Kontovergabe Prod zuerst)", preferred_account_id,
-                    )
-                return _choose(prod_measured, preferred_account_id, TIER_PROD, exclusion_reasons)
-            logger.warning(
-                "pick_account: no measured prod-worker account eligible — trying dev tier. "
-                "prod exclusions: %s",
-                {k: v for k, v in exclusion_reasons.items() if k.startswith("prod")},
-            )
-
-    dev_accounts = await _load_state(_METRICS_READER_URL)
-    clash = prod_names & set(dev_accounts)
-    if clash:
-        # lease_counts, usage rows and token files are keyed by bare account
-        # id — a shared name would mix two accounts' books. Only checked when
-        # both states are loaded (prod tier had nothing eligible); a prod win
-        # does not read the dev state at all.
-        raise RuntimeError(
-            f"account id(s) {sorted(clash)} exist in BOTH prod-worker and dev pool state"
-        )
-    dev_measured, dev_unmeasured = _split(
-        dev_accounts, lease_counts, exclusion_reasons, all_cooldowns, TIER_DEV,
-    )
-    if dev_measured:
-        if prod_unmeasured:
-            logger.info(
-                "pick_account: %d prod account(s) held back as UNMEASURED (%s)",
-                len(prod_unmeasured), ", ".join(a[0] for a in prod_unmeasured),
-            )
-        if dev_unmeasured:
-            logger.info(
-                "pick_account: %d dev account(s) held back as UNMEASURED (%s)",
-                len(dev_unmeasured), ", ".join(a[0] for a in dev_unmeasured),
-            )
-        return _choose(dev_measured, preferred_account_id, TIER_DEV, exclusion_reasons)
-
-    # Measured accounts win outright. Ranking here is headroom-driven, and an
-    # unmeasured account reports the most attractive headroom there is (the
-    # in-flight ceiling alone, unreduced by any weekly/session consumption) —
-    # so without this split the picker systematically prefers exactly the
-    # accounts nobody can see. Same reasoning as pool_router.lua; unmeasured
-    # accounts are held back, not excluded, so a blind spot cannot become a
-    # capacity outage.
-    for tier, unmeasured in ((TIER_PROD, prod_unmeasured), (TIER_DEV, dev_unmeasured)):
-        if unmeasured:
-            logger.error(
-                "pick_account: NO measured account eligible — falling back to %d %s "
-                "account(s) with UNKNOWN usage (%s). Their weekly/session %% is not "
-                "being delivered; check the cc-usage snapshot producer for that bridge.",
-                len(unmeasured), tier, ", ".join(a[0] for a in unmeasured),
-            )
-            return _choose(unmeasured, preferred_account_id, tier, exclusion_reasons)
-
-    # retry_after_s: shortest non-zero cooldown across both pools, or 30s
-    # baseline if no cooldowns set (e.g. capacity_lock-only scenarios).
-    non_zero = [c for c in all_cooldowns if c > 0]
-    retry_after = min(non_zero) if non_zero else 30
-    logger.warning(
-        f"pick_account NO_CAPACITY: retry_after={retry_after}s reasons={exclusion_reasons}"
-    )
-    raise NoCapacityError(retry_after_s=retry_after, reasons=exclusion_reasons)
+            if "duplicate account" in str(exc):
+                raise
+            reasons["prod"] = "pool state unavailable"
+            logger.error("policy admission: prod-worker pool state unavailable")
+    else:
+        reasons["prod"] = "tier disabled (URL or token check unavailable)"
+        logger.warning("prod-worker tier DISABLED: %s", reasons["prod"])
+    if not measured:
+        logger.warning("no measured prod-worker account eligible: %s", reasons)
+    try:
+        await collect(_METRICS_READER_URL, TIER_DEV)
+    except RuntimeError as exc:
+        if "duplicate account" in str(exc):
+            raise
+        if not measured and not unmeasured:
+            raise
+        reasons["dev"] = "pool state unavailable"
+    eligible = measured or unmeasured
+    selected = choose(policy, [r[0] for r in eligible], preferred_account_id)
+    if selected is None:
+        if preferred_account_id:
+            reasons["preferred"] = "preferred account disabled or technically unavailable; no eligible fallback"
+        raise NoCapacityError(min([c for c in cooldowns if c > 0] or [30]), reasons)
+    row = next(r for r in eligible if r[0] == selected)
+    logger.info("pick_account policy_revision=%s account=%s priority=%s tier=%s",
+                policy["revision"], selected, rank(policy, selected), tiers[selected])
+    return PickedAccount(account_id=selected, headroom_percent=row[1], tier=tiers[selected],
+                         policy_revision=policy["revision"],
+                         selection_reason=("preferred" if selected == preferred_account_id else
+                                           "preferred_unavailable_fallback" if preferred_account_id else "priority"))

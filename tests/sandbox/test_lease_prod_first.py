@@ -79,14 +79,14 @@ async def test_prod_account_wins_over_a_better_dev_account(pools):
     picked = await ar.pick_account(has_token=_all_tokens)
     assert picked.tier == ar.TIER_PROD
     assert picked.account_id == "sahori"
-    # Dev state is not even read when a prod account is eligible.
-    assert pools["calls"] == ["prod"]
+    # Both houses are measured because a manual order may put Dev first.
+    assert pools["calls"] == ["prod", "dev"]
 
 
-async def test_round_robin_by_lease_count_inside_the_prod_tier(pools):
+async def test_user_priority_precedes_lease_count_inside_the_prod_tier(pools):
     counts = {"coach": 5, "erk": 1, "kurt": 3, "sahori": 2, "engelmann": 0}
     picked = await ar.pick_account(lease_counts=counts, has_token=_all_tokens)
-    assert (picked.tier, picked.account_id) == (ar.TIER_PROD, "erk")
+    assert (picked.tier, picked.account_id) == (ar.TIER_PROD, "sahori")
 
 
 async def test_all_prod_locked_falls_to_dev_with_reasons_logged(pools, caplog):
@@ -164,9 +164,9 @@ async def test_penalties_unreadable_does_not_lease_prod_blind(pools):
     assert picked.tier == ar.TIER_DEV
 
 
-async def test_preferred_dev_account_does_not_pull_lease_down_a_tier(pools):
+async def test_explicit_dev_preference_precedes_default_partner_priority(pools):
     picked = await ar.pick_account(preferred_account_id="engelmann", has_token=_all_tokens)
-    assert picked.tier == ar.TIER_PROD
+    assert picked.tier == ar.TIER_DEV
 
 
 async def test_preferred_prod_account_is_honoured(pools):
@@ -279,3 +279,12 @@ def test_has_oauth_token_rejects_path_like_ids(tmp_path, monkeypatch):
     (tmp_path / "claude_token_x.txt").write_text("secret")
     assert ls.has_oauth_token("../claude_token_x") is False
     assert ls.has_oauth_token("") is False
+
+
+@pytest.fixture(autouse=True)
+def _bridge_user_policy(monkeypatch):
+    from src.account_policy import client
+    from src.account_policy.model import initial_policy
+    async def fresh():
+        return initial_policy()
+    monkeypatch.setattr(client, "fetch_policy", fresh)

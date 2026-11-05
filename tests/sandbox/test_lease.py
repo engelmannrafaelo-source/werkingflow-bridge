@@ -111,8 +111,8 @@ class TestLeaseHappyPath:
         conn.execute.assert_called_once()
 
     @pytest.mark.asyncio
-    async def test_pick_account_selects_highest_headroom(self):
-        """pick_account returns the account with highest headroom_percent."""
+    async def test_pick_account_selects_user_priority(self):
+        """User priority wins among technically eligible accounts."""
         from src.sandbox.account_router import pick_account
 
         pool_response = {
@@ -150,8 +150,8 @@ class TestLeaseHappyPath:
 
             picked = await pick_account()
 
-        assert picked.account_id == "office"
-        assert picked.headroom_percent == 80.0
+        assert picked.account_id == "engelmann"
+        assert picked.headroom_percent == 45.0
 
     @pytest.mark.asyncio
     async def test_pick_account_respects_preferred(self):
@@ -479,3 +479,12 @@ class TestJitUserProvisioning:
             await ls.get_tenant_info(conn2, uuid.uuid4(), app="engelmann")
         assert exc_info.value.status_code == 404
         assert conn2.execute.call_count == 0
+
+
+@pytest.fixture(autouse=True)
+def _bridge_policy(monkeypatch):
+    from src.account_policy import client
+    from src.account_policy.model import initial_policy
+    async def fresh():
+        return initial_policy()
+    monkeypatch.setattr(client, "fetch_policy", fresh)

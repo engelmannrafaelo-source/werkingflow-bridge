@@ -1169,7 +1169,15 @@ def get_account_pool_state():
         "automatic_paid_fallback": False,
         "available": reserve["state"] == "available" and (reserve.get("available_usd") or 0) > 0,
     }
-    result: dict = {"ts": now, "accounts": accounts, "api_reserve": routing_reserve}
+    from src.account_policy.client import fetch_policy_sync, PolicyUnavailable
+    from src.account_policy.model import overlay
+    try:
+        policy = fetch_policy_sync()
+    except PolicyUnavailable:
+        raise HTTPException(503, detail="bridge_account_policy_unavailable") from None
+    accounts = overlay(policy, accounts)
+    result: dict = {"ts": now, "accounts": accounts, "api_reserve": routing_reserve,
+                    "bridge_policy_revision": policy["revision"]}
     if errors:
         result["errors"] = errors
     return result

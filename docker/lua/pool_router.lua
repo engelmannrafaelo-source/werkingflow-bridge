@@ -492,75 +492,25 @@ function M.choose(opts)
         if affinity_key then affinity_fallback(affinity_key, "fallback:api_vision_bypass") end
         return
     end
-    local state_str      = shared:get("state")
-    local state_ts       = tonumber(shared:get("ts")) or 0
-    local age            = ngx.now() - state_ts
-    local refresh_status = shared:get("last_refresh_status") or "unknown"
-    local refresh_err    = shared:get("last_refresh_err") or ""
-
-    -- Stale state: deterministic round-robin fallback (never random — avoids clustering)
-    if not state_str or age > STALE_THRESHOLD_S then
-        local pick = round_robin_worker()
-        count_decision(pick)
-        ngx.var.target_worker   = pick
-        ngx.var.x_pool_decision = "round_robin_fallback"
-        ngx.log(ngx.WARN, "pool_router.choose: state stale",
-                " state_age_s=", string.format("%.1f", age),
-                " refresh_status=", refresh_status,
-                " last_err=", refresh_err,
-                " — round_robin_fallback to ", pick)
-        if affinity_key then affinity_fallback(affinity_key, "fallback:state_stale") end
-        return
-    end
-
-    local ok_d, data = pcall(cjson.decode, state_str)
-    if not ok_d or type(data) ~= "table" or type(data.accounts) ~= "table" then
-        local pick = round_robin_worker()
-        count_decision(pick)
-        ngx.var.target_worker   = pick
-        ngx.var.x_pool_decision = "round_robin_fallback"
-        ngx.log(ngx.ERR, "pool_router.choose: invalid cached state",
-                " state_age_s=", string.format("%.1f", age),
-                " refresh_status=", refresh_status,
-                " last_err=", refresh_err,
-                " — round_robin_fallback to ", pick)
-        if affinity_key then affinity_fallback(affinity_key, "fallback:state_invalid") end
-        return
-    end
-
-    -- Empty accounts (workers not yet exposing metrics endpoint)
-    local has_any = false
-    for _ in pairs(data.accounts) do has_any = true; break end
-    if not has_any then
-        local pick = round_robin_worker()
-        count_decision(pick)
-        ngx.var.target_worker   = pick
-        ngx.var.x_pool_decision = "round_robin_fallback"
-        ngx.log(ngx.WARN, "pool_router.choose: empty accounts",
-                " state_age_s=", string.format("%.1f", age),
-                " refresh_status=", refresh_status,
-                " — round_robin_fallback to ", pick)
-        if affinity_key then affinity_fallback(affinity_key, "fallback:no_accounts") end
-        return
-    end
-
-    -- Token estimation from Content-Length (access phase: request_length is available)
-    local req_len    = tonumber(ngx.var.request_length) or 1000
+    -- Central operator order replaces house-default and cache-affinity order.
+    -- One fresh policy/technical snapshot per NEW request. Worker admission
+    -- independently rechecks release immediately before subscription use.
+    local req_len = tonumber(ngx.var.request_length) or 1000
     local est_tokens = math.max(500, math.floor(req_len / 4))
-
-    local picked, picked_worker, picked_weight, total_weight, from_measured,
-          unmeasured_names, affinity, preferred =
-        pool_pick.pick_with_affinity(data.accounts, est_tokens, affinity_key, nil, worker_ok)
-
-    if picked and not from_measured then
-        -- Loud: the pool is routing on capacity numbers nobody has verified.
-        ngx.log(ngx.ERR, "pool_router: NO measured account eligible — routing on ",
-                #unmeasured_names, " account(s) with UNKNOWN usage (",
-                table.concat(unmeasured_names, ","), "). Their weekly/session % is ",
-                "not being delivered; check the cc-usage snapshot producer for ",
-                "this bridge.")
+    local selected, data, selection_reason = require("bridge_account_selection").select(
+        est_tokens, worker_ok, ngx.var.bridge_policy_hopped == "1", ngx.var.http_x_bridge_account)
+    if not data then
+        ngx.var.target_worker = "unavailable"
+        ngx.var.x_pool_decision = selection_reason
+        return
     end
-
+    local picked = data.selected
+    local picked_worker = selected and selected.worker
+    -- Preserve separately funded overflow admission, which does not consume
+    -- an enabled subscription account. Workers still enforce the actual route.
+    local cached = cjson.decode(shared:get("state") or "{}")
+    data.api_reserve = type(cached) == "table" and cached.api_reserve or nil
+    local affinity, preferred = nil, nil
     if not picked then
         -- Route only to normal worker admission; the worker rechecks identity,
         -- operator pins and central credit reservation before any API request.
@@ -599,8 +549,7 @@ function M.choose(opts)
                     " — no eligible account; routing to ", pick,
                     " with X-Pool-Exhausted:1 so the app can choose pool vs. overflow",
                     " est_tokens=", est_tokens,
-                    " state_age_s=", string.format("%.1f", age),
-                    " refresh_status=", refresh_status)
+                    " policy_revision=", data.revision)
             return
         end
         -- All accounts exhausted → caller turns this into @pool_exhausted_response
@@ -608,45 +557,23 @@ function M.choose(opts)
         ngx.var.x_pool_decision = "all_unavail"
         ngx.log(ngx.WARN, "pool_router.choose: all_unavail",
                 " est_tokens=", est_tokens,
-                " state_age_s=", string.format("%.1f", age),
-                " refresh_status=", refresh_status)
+                " policy_revision=", data.revision)
         return
     end
 
     -- Route: weighted-random by (effective_cap − in_flight) per account.
     -- Worker comes from the account's own `.worker` field (carried through
     -- pick_weighted_account) — no hardcoded account→worker map.
-    local worker = picked_worker or WORKER_NAMES[1]
+    local worker = picked_worker
     count_decision(worker)
-    ngx.var.target_worker   = worker
-    -- Distinct decision label when the pick came from the unmeasured bucket, so
-    -- "we routed blind" is visible in the access log and in /internal/
-    -- pool-router/state instead of being indistinguishable from a normal pick.
-    local decision = from_measured and "weighted_capacity" or "weighted_capacity_unmeasured"
-    if affinity == "hit" then
-        -- Only a hit changes WHERE the request goes: the preferred worker's
-        -- group, with every other worker as retry backup.
-        if set_affinity_vars("hit", AFFINITY_UPSTREAM_PREFIX .. worker) then
-            decision = "affinity"
-            shared:incr("affinity_hit", 1, 0)
-        else
-            decision = decision .. "+affinity_fallback"
-        end
-    elseif affinity then
-        affinity_fallback(affinity_key, affinity, "preferred=" .. tostring(preferred))
-        -- keep the weighted/unmeasured label, append the fallback
-        decision = decision .. "+affinity_fallback"
-    end
-    ngx.var.x_pool_decision = decision
-    local share_pct = (total_weight > 0) and (picked_weight * 100.0 / total_weight) or 0
-    ngx.log(ngx.INFO, "pool_router.choose: routed_to=", worker,
-            " reason=", decision,
-            " account=", picked,
-            " weight=", picked_weight,
-            " share_pct=", string.format("%.1f", share_pct),
-            " total_weight=", total_weight,
-            " est_tokens=", est_tokens,
-            " state_age_s=", string.format("%.1f", age))
+    ngx.var.target_worker = worker
+    ngx.var.x_pool_decision = selection_reason
+    ngx.var.affinity_upstream = worker_ok(worker) and ("bridge_policy_" .. worker) or "bridge_policy_peer"
+    -- Cache affinity is advisory and may never override an operator rank.
+    if affinity_key then set_affinity_vars("fallback:manual_priority", nil) end
+    ngx.log(ngx.INFO, "pool_router: operator policy revision=", data.revision,
+            " account=", picked, " worker=", worker, " reason=", selection_reason)
+
 end
 
 -- Mode "affinity": the preferred account of the key, or the reason it is not
@@ -677,34 +604,10 @@ end
 -- bridge as backup on production). Only mode "affinity" changes the upstream,
 -- and only on a hit.
 function M.priority_pool(mode)
-    local key, problem = read_affinity_key()
-    if key == nil and problem == nil then return end
-    if mode == "peer" then return end          -- decided by the peer; see header filter
-    if mode == "affinity" then
-        if problem then
-            affinity_fallback(nil, problem, "(priority pool)")
-            return
-        end
-        local status, worker, preferred = priority_affinity_pick(key)
-        if status == "hit" and set_affinity_vars("hit", AFFINITY_UPSTREAM_PREFIX .. worker) then
-            shared:incr("affinity_hit", 1, 0)
-            ngx.log(ngx.INFO, "pool_router.priority_pool: affinity hit worker=", worker,
-                    " account=", tostring(preferred))
-            return
-        end
-        if status == "hit" then status = "fallback:vars_undeclared" end
-        affinity_fallback(key, status, "preferred=" .. tostring(preferred) .. " (priority pool)")
-        return
+    M.choose({ overflow_capable = (ngx.var.pool_overflow_capable == "1") })
+    if ngx.var.target_worker == "unavailable" then
+        return ngx.exec("@pool_exhausted_response")
     end
-    if mode ~= "bypass" then
-        ngx.log(ngx.ERR, "pool_router.priority_pool: unknown $priority_pool_affinity '",
-                tostring(mode), "' — treating as bypass. Regenerate the upstreams include.")
-    end
-    local status = problem or BYPASS_PRIORITY_POOL
-    set_affinity_vars(status, nil)
-    affinity_bypassed(key, status,
-        "X-Priority pool claude_production routes round-robin without the account "
-        .. "pick; X-Cache-Affinity-Key has no effect on this path")
 end
 
 -- Header filter of the same locations, for mode "peer" only: the peer bridge
