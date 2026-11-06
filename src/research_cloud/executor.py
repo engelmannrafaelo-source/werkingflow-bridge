@@ -183,6 +183,7 @@ class ResearchCloudExecutorError(Exception):
     # privacy_service_unreachable, anonymize_gate.privacy_urteil).
     fehler_code: Optional[str] = None
     retryable: Optional[bool] = None
+    retry_after_s: Optional[int] = None
     # promotional_only: the credit account this run is pinned to is gone
     # (credit_pool.PinnedAccountLost). Only this lets a failed return round
     # keep the report from before on the pool path.
@@ -199,8 +200,13 @@ class ResearchCloudExecutorError(Exception):
 
 
 # fehler_code of a Messages-API call that did not answer within the
-# contract's transportzeit_s (ResearchResponse.fehler_code).
+# contract's transportzeit_s (ResearchResponse.fehler_code). For the caller
+# it keeps the verdict the global handler gave before the contract existed
+# (upstream_timeout: HTTP 429, retryable, Retry-After 15 s — see
+# src/middleware/bridge_error.py): retryable=true, retry_after_s=15. The
+# cloud loop itself does NOT run again on it (R2-2, Berater 2e77ac12).
 TRANSPORT_TIMEOUT = "transport_timeout"
+TRANSPORT_TIMEOUT_RETRY_AFTER_S = 15
 
 
 class ResearchCloudLaufzeitErschoepft(ResearchCloudExecutorError):
@@ -460,13 +466,15 @@ def _transport_timeout(
             f"transportzeit_s={float(config.http_timeout_seconds):.0f} s — the bridge stopped waiting, "
             "the remote call may still be running; no partial report"
         )
-        # A named cause with a final verdict (R1 W3): not retried on the same
-        # path — the remote call may still be running (a retry would pay the
-        # research twice), and the remaining deadline seldom holds a second
-        # full run. Same rule as the job self-call's read timeout
-        # (src/jobs/executors._post_self).
+        # Named cause; the caller's verdict is the one the global handler gave
+        # before (retryable, retry after 15 s) — its wait/retry strategy and
+        # the job's parking on 429 stay as they were (R2-2). The cloud loop
+        # does not run again on it: the remote call may still be running (a
+        # second run would pay the research twice) and the remaining
+        # deadline seldom holds one.
         fehler.fehler_code = TRANSPORT_TIMEOUT
-        fehler.retryable = False
+        fehler.retryable = True
+        fehler.retry_after_s = TRANSPORT_TIMEOUT_RETRY_AFTER_S
     fehler.__cause__ = exc
     return fehler
 

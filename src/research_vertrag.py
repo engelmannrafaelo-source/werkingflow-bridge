@@ -46,6 +46,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 from typing import Any, Dict, List, Literal, Optional, Set, Tuple, Union
 
@@ -54,13 +55,17 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 import src.research_laufzeit as _rl
 from src.research_laufzeit import PRUEFER_MIN_REST_S, RUECKRUNDE_MIN_REST_S
 
+logger = logging.getLogger(__name__)
+
 SCHEMA = "research-vertrag/1"
 FEHLER_VERSION_ABWEICHEND = "vertrag_version_abweichend"
 FEHLER_NICHT_DURCHSETZBAR = "vertrag_nicht_durchsetzbar"
 FEHLER_VERTRAG_UNGUELTIG = "vertrag_ungueltig"
 
 Pfad = Literal["pool", "cloud"]
-Grund = Literal["server", "client", "depth", "promotional", "snapshot"]
+# "unwirksam": the routed path cannot enforce this limit (nicht_durchsetzbar)
+# — the value is shown, nothing binds (R2-5).
+Grund = Literal["server", "client", "depth", "promotional", "snapshot", "unwirksam"]
 
 # The nine limits: (name, env, default, geltung). Defaults = the values live
 # on 06.11.2026, so a caller without a wish runs as before — except
@@ -134,14 +139,40 @@ def _lies(env: str, default: Optional[float], ganzzahlig: bool) -> Union[int, fl
 
 
 def obergrenzen() -> Dict[str, Union[int, float]]:
-    """The server's ceilings, from env (defaults = live values 06.11.2026)."""
-    return {name: _lies(env, default, name in GANZZAHLIG) for name, env, default, _ in GRENZEN}
+    """The server's ceilings, from env (defaults = live values 06.11.2026),
+    clamped into the time chain: gesamtzeit_s <= GESAMTFRIST_S,
+    transportzeit_s <= gesamtzeit_s, fortsetzungen >= one round. A value
+    outside is clamped and logged, never a start failure (R2-4) — a host
+    with a shorter chain (RESEARCH_GESAMTFRIST_S, MAX_TIMEOUT) still
+    starts; a non-number or a value <= 0 stays a loud error."""
+    g = {name: _lies(env, default, name in GANZZAHLIG) for name, env, default, _ in GRENZEN}
+    kette = float(_rl.GESAMTFRIST_S)
+    if g["gesamtzeit_s"] > kette:
+        logger.warning(
+            f"research-vertrag: gesamtzeit_s={g['gesamtzeit_s']:.0f} geklemmt auf "
+            f"RESEARCH_GESAMTFRIST_S={kette:.0f}"
+        )
+        g["gesamtzeit_s"] = kette
+    if g["transportzeit_s"] > g["gesamtzeit_s"]:
+        logger.warning(
+            f"research-vertrag: transportzeit_s={g['transportzeit_s']:.0f} geklemmt auf "
+            f"gesamtzeit_s={g['gesamtzeit_s']:.0f}"
+        )
+        g["transportzeit_s"] = float(g["gesamtzeit_s"])
+    if g["fortsetzungen"] < FORTSETZUNGEN_JE_RUNDE:
+        logger.warning(
+            f"research-vertrag: fortsetzungen={g['fortsetzungen']} geklemmt auf "
+            f"fortsetzungen_je_runde={FORTSETZUNGEN_JE_RUNDE}"
+        )
+        g["fortsetzungen"] = FORTSETZUNGEN_JE_RUNDE
+    return g
 
 
 def pruefe_obergrenzen(grenzen: Optional[Dict[str, Union[int, float]]] = None) -> None:
-    """Raise ValueError unless the contract's time ceilings fit the time chain
-    (gesamtzeit_s <= GESAMTFRIST_S, transportzeit_s <= gesamtzeit_s) and the
-    run-wide continuation ceiling holds at least one round."""
+    """Raise ValueError unless ``grenzen`` fit the time chain. What
+    obergrenzen() returns always does (it clamps); the check guards a dict
+    handed in from elsewhere, and the import-time call below is the
+    self-test that the clamping holds."""
     g = grenzen or obergrenzen()
     fehler = []
     if not g["gesamtzeit_s"] <= _rl.GESAMTFRIST_S:
@@ -318,12 +349,18 @@ class ResearchVertrag(BaseModel):
 
     def fuer_pfad(self, pfad: Pfad) -> "ResearchVertrag":
         """The path's view. Raises VertragNichtDurchsetzbar when the caller
-        asked for a limit this path cannot enforce."""
+        asked for a limit this path cannot enforce. Limits the path cannot
+        enforce are marked ``begrenzt_durch: unwirksam`` — their value is
+        shown (a soft wish, the ceiling), nothing binds (R2-5)."""
         unerfuellbar = [n for n in self.verlangt if n in NICHT_DURCHSETZBAR_JE_PFAD[pfad]]
         if unerfuellbar:
             raise VertragNichtDurchsetzbar(pfad, unerfuellbar)
+        begrenzt = dict(self.begrenzt_durch)
+        for n in NICHT_DURCHSETZBAR_JE_PFAD[pfad]:
+            begrenzt[n] = "unwirksam"
         return self.model_copy(update={
             "pfad": pfad, "nicht_durchsetzbar": list(NICHT_DURCHSETZBAR_JE_PFAD[pfad]),
+            "begrenzt_durch": begrenzt,
         })
 
     def senken(self, name: str, wert: Union[int, float], grund: Grund) -> "ResearchVertrag":

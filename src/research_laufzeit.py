@@ -169,12 +169,27 @@ class Laufzeit:
     def fuer_anfrage(cls, request: Any, *, hoechstens_s: Optional[float] = None, **kw: Any) -> "Laufzeit":
         """Deadline of a /v1/research request (frist_bis), as remaining time —
         never more than ``hoechstens_s`` (the contract's gesamtzeit_s,
-        src/research_vertrag.py). A forwarded deadline (cross-worker retry)
-        and the contract both only shorten; nothing here starts a new one."""
-        rest = max(0.0, frist_bis(request) - time.time())
+        src/research_vertrag.py). The contract's deadline is fixed ONCE per
+        request (request.state.research_vertragsfrist_bis = first call +
+        gesamtzeit_s): a same-path retry gets the remainder, never the full
+        contract time again (R2-1). A forwarded deadline (cross-worker
+        retry) and the contract both only shorten; nothing here starts a
+        new one."""
+        bis = frist_bis(request)
+        jetzt = time.time()  # after frist_bis: the remainder never exceeds the chain
         if hoechstens_s is not None:
-            rest = min(rest, max(0.0, float(hoechstens_s)))
-        return cls(rest, **kw)
+            vertragsfrist = jetzt + max(0.0, float(hoechstens_s))
+            state = getattr(request, "state", None) if request is not None else None
+            gemerkt = getattr(state, "research_vertragsfrist_bis", None) if state is not None else None
+            if isinstance(gemerkt, float):
+                vertragsfrist = min(vertragsfrist, gemerkt)
+            elif state is not None:
+                try:
+                    state.research_vertragsfrist_bis = vertragsfrist
+                except Exception:
+                    pass
+            bis = min(bis, vertragsfrist)
+        return cls(max(0.0, bis - jetzt), **kw)
 
     def beginne(self, runde: str) -> None:
         self._laufend[runde] = self._uhr()

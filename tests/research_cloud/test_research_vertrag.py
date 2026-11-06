@@ -110,16 +110,20 @@ def test_version_bindet_grenzen_und_capabilities(monkeypatch):
 
 
 def test_obergrenzen_muessen_in_die_zeitkette_passen(monkeypatch):
+    # obergrenzen() clamps into the chain (R2-4); pruefe_obergrenzen guards a
+    # dict handed in from elsewhere.
     monkeypatch.setenv("RESEARCH_VERTRAG_GESAMTZEIT_S_MAX", str(rl.GESAMTFRIST_S + 1))
+    assert rv.obergrenzen()["gesamtzeit_s"] == rl.GESAMTFRIST_S
     with pytest.raises(ValueError, match="gesamtzeit_s"):
-        rv.pruefe_obergrenzen()
+        rv.pruefe_obergrenzen({**rv.obergrenzen(), "gesamtzeit_s": rl.GESAMTFRIST_S + 1})
     monkeypatch.setenv("RESEARCH_VERTRAG_GESAMTZEIT_S_MAX", "100")
     monkeypatch.setenv("RESEARCH_VERTRAG_TRANSPORTZEIT_S_MAX", "101")
+    assert rv.obergrenzen()["transportzeit_s"] == 100.0
     with pytest.raises(ValueError, match="transportzeit_s"):
-        rv.pruefe_obergrenzen()
+        rv.pruefe_obergrenzen({**rv.obergrenzen(), "transportzeit_s": 101.0})
     monkeypatch.setenv("RESEARCH_VERTRAG_FORTSETZUNGEN_MAX", "0")
     with pytest.raises(ValueError, match="must be > 0"):
-        rv.pruefe_obergrenzen()
+        rv.obergrenzen()
 
 
 def test_legacy_ohne_wunsch_bekommt_die_obergrenzen_und_beide_pfade():
@@ -536,9 +540,11 @@ async def test_pool_turns_frist_und_werkzeugdeckel_aus_dem_vertrag(spy_cli, pers
     # The SDK stub (sys.modules MagicMock) loses these two attributes once an
     # earlier module's monkeypatch undo deleted them — the pre-existing cause
     # of the red pool tests in test_research_pool_perplexity; pinned here.
+    # Set WITHOUT monkeypatch undo: the undo re-breaks the stub for every
+    # module that runs after this one (measured 06.11.: 34 pool tests red).
     sdk = sys.modules["claude_code_sdk"]
-    monkeypatch.setattr(sdk, "create_sdk_mcp_server", MagicMock(return_value={"type": "sdk"}), raising=False)
-    monkeypatch.setattr(sdk, "tool", MagicMock(return_value=lambda fn: fn), raising=False)
+    sdk.create_sdk_mcp_server = MagicMock(return_value={"type": "sdk"})
+    sdk.tool = MagicMock(return_value=lambda fn: fn)
     req = _pool_req()  # max_turns=10
     req.vertrag = rv.ResearchVertragWunsch(iterationen=4, perplexity_suchen=2, dokument_abrufe=3, gesamtzeit_s=700)
     req.luecken_nachkontrolle = False  # the spy must see the MAIN run's CLI call, not the checker's
@@ -1004,9 +1010,9 @@ async def test_r1_cloud_retry_wiederholt_keine_endgueltigen_fehler():
     with patch("src.main._execute_research_cloud_impl", AsyncMock(return_value=_err(fehler_code="laufzeit_erschoepft", retryable=False))) as impl:
         out = await src.main._execute_research_cloud_with_pool_fallback(request, req, attribution_ctx={})
     assert impl.await_count == 1 and out.fehler_code == "laufzeit_erschoepft"
-    with patch("src.main._execute_research_cloud_impl", AsyncMock(return_value=_err(fehler_code="transport_timeout", retryable=False))) as impl:
+    with patch("src.main._execute_research_cloud_impl", AsyncMock(return_value=_err(fehler_code="transport_timeout", retryable=True, retry_after_s=15))) as impl:
         await src.main._execute_research_cloud_with_pool_fallback(request, req, attribution_ctx={})
-    assert impl.await_count == 1
+    assert impl.await_count == 1  # the caller's to retry, not this loop's (R2-2)
     # a named cause that IS retryable keeps its retry
     with patch("src.main._execute_research_cloud_impl", AsyncMock(return_value=_err(fehler_code="privacy_service_unreachable", retryable=True))) as impl:
         await src.main._execute_research_cloud_with_pool_fallback(request, req, attribution_ctx={})
@@ -1018,11 +1024,11 @@ async def test_r1_cloud_retry_wiederholt_keine_endgueltigen_fehler():
 
 
 @pytest.mark.asyncio
-async def test_r1_transport_timeout_ist_endgueltig():
+async def test_r1_transport_timeout_ist_benannt():
     from src.research_cloud.executor import _transport_timeout
 
     fehler = _transport_timeout(httpx.ReadTimeout("x"), 900.0, ResearchCloudConfig(), None, "bericht", 0)
-    assert fehler.retryable is False and fehler.fehler_code == "transport_timeout"
+    assert fehler.fehler_code == "transport_timeout"
     req = _cloud_req()
     req.vertrag = None
     request = MagicMock()
@@ -1032,7 +1038,7 @@ async def test_r1_transport_timeout_ist_endgueltig():
     p = _cloud_patches(executor_mock)
     with p[0], p[1], p[2], p[3]:
         result = await src.main._execute_research_cloud_impl(request, req, attribution_ctx={})
-    assert result.status == "error" and result.retryable is False and result.fehler_code == "transport_timeout"
+    assert result.status == "error" and result.fehler_code == "transport_timeout"
     assert "transportzeit_s" in result.error and "may still be running" in result.error
 
 
@@ -1044,8 +1050,7 @@ def test_r1_gesamtzeit_default_folgt_der_gesamtfrist(monkeypatch):
     assert g["gesamtzeit_s"] == 1000.0
     rv.pruefe_obergrenzen(g)  # no start risk with a shorter chain
     monkeypatch.setenv("RESEARCH_VERTRAG_GESAMTZEIT_S_MAX", "1200")
-    with pytest.raises(ValueError, match="gesamtzeit_s"):
-        rv.pruefe_obergrenzen()  # an explicit ceiling above the chain still fails loud
+    assert rv.obergrenzen()["gesamtzeit_s"] == 1000.0  # an explicit ceiling above the chain is clamped (R2-4)
 
 
 # H5 — hard cap per Messages-API call --------------------------------------------
@@ -1083,3 +1088,113 @@ async def test_r1_vertragsfehler_aus_dem_lauf_sind_422():
     assert not isinstance(out, ResearchResponse) and out.status_code == 422
     body = json.loads(bytes(out.body))
     assert body["fehler_code"] == rv.FEHLER_NICHT_DURCHSETZBAR and body["vertrag"]["version"] == rv.version()
+
+
+# ── 10. Nacharbeit R2 (PRUEFBEFUND-R2-c63fdec-20261106) ─────────────────────────
+# Run against c63fdec BEFORE the fix: red (ergebnisse/.../tests-R2-rot-vor-fix.txt).
+
+class _Zeit:
+    """A fake wall clock for research_laufzeit (frist_bis / fuer_anfrage)."""
+
+    monotonic = staticmethod(time.monotonic)  # before `time` shadows the module name below
+
+    def __init__(self, t=1_000_000.0):
+        self.t = t
+
+    def time(self):
+        return self.t
+
+
+def test_r2_vertragsfrist_wird_einmal_fixiert_retry_bekommt_den_rest(monkeypatch):
+    zeit = _Zeit()
+    monkeypatch.setattr(rl, "time", zeit)
+    request = MagicMock()
+    request.headers = {}
+    request.state = SimpleNamespace()
+    assert rl.Laufzeit.fuer_anfrage(request, hoechstens_s=1000).frist_s == 1000.0
+    zeit.t += 400.0  # the first attempt failed after 400 s
+    assert rl.Laufzeit.fuer_anfrage(request, hoechstens_s=1000).frist_s == pytest.approx(600.0)
+    zeit.t += 700.0
+    assert rl.Laufzeit.fuer_anfrage(request, hoechstens_s=1000).frist_s == 0.0
+
+
+@pytest.mark.asyncio
+async def test_r2_cloud_retry_laeuft_unter_der_restfrist(monkeypatch):
+    """gesamtzeit_s=1000, the first run fails (unclassified) after 400 s:
+    the second attempt gets ~600 s, not 1000 again."""
+    zeit = _Zeit()
+    monkeypatch.setattr(rl, "time", zeit)
+    req = _cloud_req()
+    req.vertrag = rv.ResearchVertragWunsch(gesamtzeit_s=1000)
+    request = MagicMock()
+    request.headers = {}
+    request.state = SimpleNamespace()
+    fristen = []
+
+    async def lauf(*a, **kw):
+        fristen.append(kw["laufzeit"].frist_s)
+        if len(fristen) == 1:
+            zeit.t += 400.0
+            raise ResearchCloudExecutorError("hiccup")
+        return _cloud_result()
+
+    executor_mock = AsyncMock(side_effect=lauf)
+    p = _cloud_patches(executor_mock)
+    with p[0], p[1], p[2], p[3]:
+        out = await src.main._execute_research_cloud_with_pool_fallback(request, req, attribution_ctx={})
+    assert out.status == "success" and len(fristen) == 2
+    assert fristen[0] == 1000.0 and fristen[1] == pytest.approx(600.0)
+
+
+@pytest.mark.asyncio
+async def test_r2_transport_timeout_bleibt_fuer_aufrufer_wiederholbar_ohne_zweitversuch():
+    """Base behaviour for the caller (global handler: 429, retryable,
+    Retry-After 15 s) is kept in the verdict: retryable=true, retry_after_s=15,
+    fehler_code transport_timeout — but the cloud loop does not run again."""
+    from src.research_cloud.executor import _transport_timeout
+
+    fehler = _transport_timeout(httpx.ReadTimeout("x"), 900.0, ResearchCloudConfig(), None, "bericht", 0)
+    assert fehler.fehler_code == "transport_timeout" and fehler.retryable is True and fehler.retry_after_s == 15
+    req = _cloud_req()
+    req.vertrag = None
+    request = MagicMock()
+    request.headers = {}
+    request.state = SimpleNamespace()
+    executor_mock = AsyncMock(side_effect=fehler)
+    p = _cloud_patches(executor_mock)
+    with p[0], p[1], p[2], p[3]:
+        result = await src.main._execute_research_cloud_with_pool_fallback(request, req, attribution_ctx={})
+    assert executor_mock.await_count == 1  # no internal second attempt
+    assert result.status == "error" and result.fehler_code == "transport_timeout"
+    assert result.retryable is True and result.retry_after_s == 15
+    assert "503" in result.error and "may still be running" in result.error
+    # at the run's deadline it stays final
+    spaet = _transport_timeout(httpx.ReadTimeout("x"), 30.0, ResearchCloudConfig(), rl.Laufzeit(30.0), "bericht", 0)
+    assert spaet.fehler_code == "laufzeit_erschoepft" and spaet.retryable is False
+
+
+def test_r2_obergrenzen_klemmen_statt_importfehler(monkeypatch):
+    monkeypatch.setattr(rl, "GESAMTFRIST_S", 500.0)  # a host with a short chain
+    g = rv.obergrenzen()
+    assert g["gesamtzeit_s"] == 500.0 and g["transportzeit_s"] == 500.0  # 900 clamped
+    monkeypatch.setenv("RESEARCH_VERTRAG_GESAMTZEIT_S_MAX", "1200")
+    monkeypatch.setenv("RESEARCH_VERTRAG_FORTSETZUNGEN_MAX", "3")
+    with patch.object(rv, "logger") as lg:
+        g = rv.obergrenzen()
+    assert g["gesamtzeit_s"] == 500.0 and g["fortsetzungen"] == rv.FORTSETZUNGEN_JE_RUNDE
+    assert lg.warning.call_count == 3 and all("geklemmt" in str(c) for c in lg.warning.call_args_list)
+    rv.pruefe_obergrenzen()  # never raises for what obergrenzen() returns
+    monkeypatch.setenv("RESEARCH_VERTRAG_FORTSETZUNGEN_MAX", "x")
+    with pytest.raises(ValueError, match="not a number"):
+        rv.obergrenzen()
+
+
+def test_r2_weicher_wunsch_ist_in_der_antwort_unwirksam_markiert():
+    v = rv.vertrag_erstellen(_body(vertrag={"ausgabe_tokens": 100, "verlangt": []})).fuer_pfad("pool")
+    assert "ausgabe_tokens" in v.nicht_durchsetzbar
+    assert v.begrenzt_durch["ausgabe_tokens"] == "unwirksam"
+    assert all(v.begrenzt_durch[n] == "unwirksam" for n in v.nicht_durchsetzbar)
+    assert v.begrenzt_durch["gesamtzeit_s"] == "server"
+    c = rv.vertrag_erstellen(_body()).fuer_pfad("cloud")
+    assert c.begrenzt_durch["iterationen"] == "unwirksam"
+    assert json.loads(json.dumps(c.ausgabe()))["begrenzt_durch"]["iterationen"] == "unwirksam"

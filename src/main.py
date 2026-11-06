@@ -7273,10 +7273,19 @@ async def _execute_research_cloud_impl(
         from src.research_cloud.executor import TRANSIENT_HTTP_STATUSES
         error_message = str(e)
         if e.fehler_code is not None:
-            # A cause the executor named (anonymize gate): its own verdict,
-            # the message unchanged.
-            error_fields = {"error": error_message, "fehler_code": e.fehler_code,
-                            "retryable": e.retryable}
+            # A cause the executor named (anonymize gate, transport_timeout,
+            # laufzeit_erschoepft): its own verdict, the message unchanged —
+            # except a cause that names a retry_after (transport_timeout):
+            # that is the transient kind the global handler answered with a
+            # 429 envelope before, so it also carries the text marker older
+            # classifiers read (_mark_retryable), like every transient error.
+            _nachfrist = getattr(e, "retry_after_s", None)
+            error_fields = {
+                "error": _mark_retryable(error_message) if (e.retryable and _nachfrist is not None) else error_message,
+                "fehler_code": e.fehler_code,
+                "retryable": e.retryable,
+                "retry_after_s": _nachfrist,
+            }
         elif e.status_code in TRANSIENT_HTTP_STATUSES:
             # A capacity/availability-shaped upstream failure (429/5xx) —
             # mark it recognizable-retryable so the caller defers instead of
@@ -7684,6 +7693,11 @@ async def _research_subscription_fallback(
     ))
 
 
+# fehler_codes the cloud loop never runs a second attempt on, whatever their
+# retryable verdict for the caller says (research_cloud.executor).
+_RESEARCH_CLOUD_KEIN_ZWEITVERSUCH = frozenset({"transport_timeout"})
+
+
 async def _execute_research_cloud_with_pool_fallback(
     request: Optional[Request],
     request_body: ResearchRequest,
@@ -7722,13 +7736,16 @@ async def _execute_research_cloud_with_pool_fallback(
             result.funding_policy = "promotional_only"
         if result.status != "error" or promotional_only(request):
             return result
-        if result.fehler_code is not None and result.retryable is False:
-            # A NAMED cause with a final verdict (laufzeit_erschoepft,
-            # transport_timeout, a contract refusal, privacy_gate_failed,
-            # modell_abbruch): not run again (R1 W3). An unclassified failure
-            # keeps its one same-path retry (the "transient hiccup" intent
-            # above); the deadline does not start afresh for it either
-            # (frist_bis keeps the remembered one).
+        if result.fehler_code in _RESEARCH_CLOUD_KEIN_ZWEITVERSUCH or (
+            result.fehler_code is not None and result.retryable is False
+        ):
+            # A NAMED cause with a final verdict (laufzeit_erschoepft, a
+            # contract refusal, privacy_gate_failed, modell_abbruch) or one
+            # that is the caller's to retry, not this loop's
+            # (transport_timeout, R2-2): not run again (R1 W3). An
+            # unclassified failure keeps its one same-path retry (the
+            # "transient hiccup" intent above) — under the remainder of the
+            # contract's deadline, never a fresh one (Laufzeit.fuer_anfrage).
             return result
         logger.error(
             f"research-cloud run failed (attempt {attempt}/{_RESEARCH_CLOUD_MAX_ATTEMPTS}): "

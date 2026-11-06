@@ -34,11 +34,12 @@ ist eine neue Version.
 | gesamtzeit_s | RESEARCH_VERTRAG_GESAMTZEIT_S_MAX | = RESEARCH_GESAMTFRIST_S (3300) | gesamter Lauf inkl. Werkzeuge, Bibliothek, Prüfer, Rückrunde, Nachmessung | pool, cloud |
 | transportzeit_s | RESEARCH_VERTRAG_TRANSPORTZEIT_S_MAX | 900 | je Messages-API-Aufruf, nie länger als Restfrist | cloud |
 
-Importprüfung: `gesamtzeit_s ≤ RESEARCH_GESAMTFRIST_S`, `transportzeit_s ≤ gesamtzeit_s`,
-`fortsetzungen ≥ 8`; sonst startet der Worker nicht. Ohne gesetztes
-`RESEARCH_VERTRAG_GESAMTZEIT_S_MAX` ist die Obergrenze die Gesamtfrist der Zeitkette
-selbst — eine kürzere Kette auf einem Host ist damit kein Startrisiko; nur ein
-ausdrücklich darüber gesetzter Wert scheitert laut.
+Zeitkette: `gesamtzeit_s ≤ RESEARCH_GESAMTFRIST_S`, `transportzeit_s ≤ gesamtzeit_s`,
+`fortsetzungen ≥ 8`. Werte darüber bzw. darunter werden beim Lesen **geklemmt und als
+Warnung protokolliert**, nie zum Startfehler (ein Host mit kürzerer Kette, etwa gesenktem
+`MAX_TIMEOUT`, startet wie bisher). Ohne gesetztes `RESEARCH_VERTRAG_GESAMTZEIT_S_MAX`
+ist die Obergrenze die Gesamtfrist der Zeitkette selbst. Laut scheitert nur ein Wert, der
+keine Zahl oder ≤ 0 ist.
 
 ## Wünschen (Requestfeld `vertrag`)
 
@@ -53,8 +54,10 @@ unbekannte Felder werden abgewiesen (FastAPI-Validierungsfehler 422 ohne
 Pfad (er muss sie durchsetzen, sonst Ablehnung). `verlangt` (Liste von Grenznamen)
 benennt die Forderungen ausdrücklich; die übrigen gesetzten Grenzen sind dann weich:
 sie binden, wo der Pfad sie durchsetzen kann, und stehen sonst in
-`nicht_durchsetzbar` ohne Ablehnung. `max_turns` ist nie eine Forderung — auch nicht
-sein Default 30 im Selbstaufruf eines Jobs.
+`nicht_durchsetzbar` ohne Ablehnung. In der Antwort trägt jede Grenze, die der Pfad
+nicht durchsetzen kann, `begrenzt_durch: unwirksam` — ihr Wert in `grenzen` (weicher
+Wunsch oder Obergrenze) ist dort Anzeige, nichts bindet. `max_turns` ist nie eine
+Forderung — auch nicht sein Default 30 im Selbstaufruf eines Jobs.
 
 ## Admission
 
@@ -90,26 +93,35 @@ wiederholt die Pool-Admission), wird ebenfalls als HTTP 422 beantwortet.
 
 `vertrag` in jeder ResearchResponse (Erfolg und Fehler, sync und async-Datei):
 `version`, `server_version`, `quelle` (anfrage|snapshot), `grenzen` (exakt wirksame
-Werte), `begrenzt_durch` je Grenze (server|client|depth|promotional|snapshot),
-`geltung`, `pfad`, `nicht_durchsetzbar`. `laufzeit` jetzt auf beiden Pfaden.
+Werte; bei `unwirksam` nur Anzeige), `begrenzt_durch` je Grenze
+(server|client|depth|promotional|snapshot|unwirksam), `geltung`, `pfad`,
+`nicht_durchsetzbar`. `laufzeit` jetzt auf beiden Pfaden.
 
 Fehlersemantik: `laufzeit_erschoepft` (Hauptlauf/Fortsetzung/Modellaufruf an der Frist;
 kein Teilbericht; `retryable=false`); Rückrunde an der Frist → Bericht von vorher,
 `nachkontrolle.rueckrunde_fehler`; `transport_timeout` (Cloud: ein Messages-API-Aufruf
-hat innerhalb `transportzeit_s` nicht geantwortet; harte Obergrenze je Aufruf, nicht nur
-je HTTP-Phase; kein Teilbericht; `retryable=false`). Jeder Abbruch an der Frist sagt
-„the remote call may still be running“ — die Bridge hat aufgehört zu warten, ein Ende
-des Fernaufrufs wird nicht behauptet.
+hat innerhalb `transportzeit_s` nicht geantwortet; harte Obergrenze je Aufruf über
+`asyncio.wait_for`, nicht nur je HTTP-Phase; kein Teilbericht; **`retryable=true`,
+`retry_after_s=15`** — dasselbe Urteil, das der globale Handler vor dem Vertrag für einen
+Upstream-Timeout gab, damit Warte-/Wiederholstrategie der Aufrufer und das Parken von
+Jobs unverändert greifen). Jeder Abbruch an der Frist sagt „the remote call may still be
+running“ — die Bridge hat aufgehört zu warten, ein Ende des Fernaufrufs wird nicht
+behauptet. Grenze der harten Obergrenze: `wait_for` umschließt den Aufruf samt Abschluss;
+eine Antwort, die genau an der Grenze eintrifft, kann verworfen werden, obwohl sie bezahlt
+wurde — die Kontenführung (Pool-Buchung, Ledger) ist davon nicht berührt, der Lauf endet
+als `transport_timeout`.
 
 **Wiederholung auf demselben Pfad (Cloud).** Der bestehende zweite Versuch bei einem
 Cloud-Fehler bleibt für unklassifizierte Fehler und für benannte, als wiederholbar
-gekennzeichnete Ursachen (z. B. `privacy_service_unreachable`). Eine **benannte Ursache
-mit endgültigem Urteil** (`laufzeit_erschoepft`, `transport_timeout`, `vertrag_*`,
-`privacy_gate_failed`, `modell_abbruch`) wird nicht wiederholt. Entscheidung für den
-Transport-Timeout: der Fernaufruf kann noch laufen (ein zweiter Lauf zahlt die Recherche
-doppelt), und die Restfrist trägt selten einen zweiten vollen Lauf — dieselbe Regel wie
-beim Lese-Timeout des Job-Selbstaufrufs. Die Frist beginnt bei einer Wiederholung nie
-neu: `frist_bis` liest die am Request gemerkte Frist zurück.
+gekennzeichnete Ursachen (z. B. `privacy_service_unreachable`). Nicht wiederholt werden
+eine **benannte Ursache mit endgültigem Urteil** (`laufzeit_erschoepft`, `vertrag_*`,
+`privacy_gate_failed`, `modell_abbruch`, `antwort_abgeschnitten`) und der
+**`transport_timeout`** (Entscheidung des Beraters 06.11.: wiederholbar für den Aufrufer,
+kein interner Zweitversuch — der Fernaufruf kann noch laufen, ein zweiter Lauf zahlt die
+Recherche doppelt, die Restfrist trägt selten einen zweiten vollen Lauf). Die Frist
+beginnt bei einer Wiederholung nie neu: die vertragliche Frist wird beim ersten Versuch
+fixiert (`request.state.research_vertragsfrist_bis` = Start + `gesamtzeit_s`), ein
+Zweitversuch erhält nur den Rest; `frist_bis` liest zusätzlich die Kettenfrist zurück.
 
 ## Dauerhafte Jobs
 
@@ -140,8 +152,15 @@ Version → 422 `vertrag_version_abweichend`; kein Job.
   3300 s) über Modellaufrufe, Werkzeuge, Bibliothek, Prüfer, Rückrunde und Nachmessung;
   vorher gab es nur das HTTP-Timeout je Aufruf. Prüfung/Rückrunde/Nachmessung starten
   nur noch mit ausreichender Restzeit. `fortsetzungen` zählt über alle Runden (Obergrenze
-  16 = bisheriges Maximum 8 + 8; je Runde weiterhin 8). Ein Transport-Timeout ist jetzt
-  `fehler_code transport_timeout` mit `retryable=false` (vorher: unbehandelte Ausnahme).
+  16 = bisheriges Maximum 8 + 8; je Runde weiterhin 8). Ein Transport-Timeout war vorher
+  eine `httpx`-Ausnahme, die der globale Handler als HTTP 429 `upstream_timeout`
+  (retryable, Retry-After 15 s) beantwortete; jetzt ist er eine 200-Antwort mit
+  `status: error`, `fehler_code transport_timeout`, `retryable=true`, `retry_after_s=15`
+  — gleiches Aufruferurteil, anderer Transport (ResearchResponse statt 429-Hülle).
+  Benannte endgültige Ursachen (`modell_abbruch`, `privacy_gate_failed`,
+  `antwort_abgeschnitten`, `laufzeit_erschoepft`) liefen vorher zweimal auf dem Cloud-Pfad
+  (zweiter Versuch der Schleife); jetzt einmal. Unklassifizierte Fehler laufen weiterhin
+  zweimal, der zweite Versuch aber nur in der Restfrist.
 - **Antworten:** neues Feld `vertrag`; `laufzeit` auch auf dem Cloud-Pfad; HTTP 422 für
   Vertragsablehnungen (vorher gab es keine).
 - **Jobs:** `attribution.research_vertrag` wird serverseitig gesetzt; Rumpf und
