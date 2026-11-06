@@ -176,7 +176,7 @@ class PoolPerplexityTool:
                         ask_perplexity(anonymized, self.config, c), self.frist, "perplexity_search"
                     )
         except RestfristErschoepft as e:
-            logger.error(f"research pool: perplexity_search stopped at the run's deadline: {e}")
+            logger.error(f"research pool: perplexity_search abandoned at the run's deadline: {e}")
             raise PoolToolError(str(e)) from e
         except PerplexityCallError as e:
             logger.warning(f"research pool: perplexity_search failed (fail-soft): {e}")

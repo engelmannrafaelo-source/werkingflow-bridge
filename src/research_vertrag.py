@@ -49,9 +49,10 @@ import json
 import os
 from typing import Any, Dict, List, Literal, Optional, Set, Tuple, Union
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-from src.research_laufzeit import GESAMTFRIST_S, PRUEFER_MIN_REST_S, RUECKRUNDE_MIN_REST_S
+import src.research_laufzeit as _rl
+from src.research_laufzeit import PRUEFER_MIN_REST_S, RUECKRUNDE_MIN_REST_S
 
 SCHEMA = "research-vertrag/1"
 FEHLER_VERSION_ABWEICHEND = "vertrag_version_abweichend"
@@ -66,7 +67,7 @@ Grund = Literal["server", "client", "depth", "promotional", "snapshot"]
 # fortsetzungen, which now counts the WHOLE run (all rounds): 16 is today's
 # maximum (8 per round, main round + return round), the per-round cap of 8
 # stays as a capability.
-GRENZEN: Tuple[Tuple[str, str, float, str], ...] = (
+GRENZEN: Tuple[Tuple[str, str, Optional[float], str], ...] = (
     ("ausgabe_tokens", "RESEARCH_VERTRAG_AUSGABE_TOKENS_MAX", 32000,
      "je Modellantwort (Messages-API max_tokens); cloud"),
     ("iterationen", "RESEARCH_VERTRAG_ITERATIONEN_MAX", 40,
@@ -81,7 +82,10 @@ GRENZEN: Tuple[Tuple[str, str, float, str], ...] = (
      "gesamter Lauf (perplexity_search, inkl. Rückrunde); pool und cloud"),
     ("dokument_abrufe", "RESEARCH_VERTRAG_DOKUMENTE_MAX", 10,
      "gesamter Lauf (fetch_document, inkl. Rückrunde); pool und cloud"),
-    ("gesamtzeit_s", "RESEARCH_VERTRAG_GESAMTZEIT_S_MAX", 3300,
+    # Default None = the run deadline of the time chain (research_laufzeit
+    # GESAMTFRIST_S, env RESEARCH_GESAMTFRIST_S) — read at call time, so a
+    # shorter chain never makes the worker's start fail (R1 W4).
+    ("gesamtzeit_s", "RESEARCH_VERTRAG_GESAMTZEIT_S_MAX", None,
      "gesamter Lauf: Modellaufrufe, Werkzeuge, Bibliothek, Prüfer, Rückrunde, Nachmessung; eine Frist, "
      "keine neue bei Fortsetzung/Rückrunde/Cross-Worker-Retry; pool und cloud"),
     ("transportzeit_s", "RESEARCH_VERTRAG_TRANSPORTZEIT_S_MAX", 900,
@@ -111,12 +115,14 @@ NICHT_DURCHSETZBAR_JE_PFAD: Dict[str, List[str]] = {
     "cloud": ["iterationen"],
 }
 
-WUNSCHFELDER = ["version"] + list(NAMEN)
+WUNSCHFELDER = ["version"] + list(NAMEN) + ["verlangt"]
 
 
-def _lies(env: str, default: float, ganzzahlig: bool) -> Union[int, float]:
+def _lies(env: str, default: Optional[float], ganzzahlig: bool) -> Union[int, float]:
     roh = os.getenv(env)
     if roh is None or roh == "":
+        if default is None:  # gesamtzeit_s: the time chain's run deadline
+            return float(_rl.GESAMTFRIST_S)
         return int(default) if ganzzahlig else float(default)
     try:
         wert = int(roh) if ganzzahlig else float(roh)
@@ -138,9 +144,9 @@ def pruefe_obergrenzen(grenzen: Optional[Dict[str, Union[int, float]]] = None) -
     run-wide continuation ceiling holds at least one round."""
     g = grenzen or obergrenzen()
     fehler = []
-    if not g["gesamtzeit_s"] <= GESAMTFRIST_S:
+    if not g["gesamtzeit_s"] <= _rl.GESAMTFRIST_S:
         fehler.append(
-            f"gesamtzeit_s={g['gesamtzeit_s']:.0f} must be <= RESEARCH_GESAMTFRIST_S={GESAMTFRIST_S:.0f}"
+            f"gesamtzeit_s={g['gesamtzeit_s']:.0f} must be <= RESEARCH_GESAMTFRIST_S={_rl.GESAMTFRIST_S:.0f}"
         )
     if not g["transportzeit_s"] <= g["gesamtzeit_s"]:
         fehler.append(
@@ -199,7 +205,16 @@ def protokoll(version_text: str) -> str:
 
 class ResearchVertragWunsch(BaseModel):
     """What a caller may ask for: the version it read, and lower limits.
-    Unknown fields are refused (a typo must not pass as 'no wish')."""
+    Unknown fields are refused (a typo must not pass as 'no wish').
+
+    A limit set below the ceiling is a DEMAND: the routed path must enforce
+    it or the request is refused. ``verlangt`` narrows that: when present,
+    only the limits named there are demands; the others are soft — they
+    bind where the path can enforce them and are shown as
+    ``nicht_durchsetzbar`` where it cannot, without a refusal. The server's
+    own job snapshot always carries ``verlangt`` (the demands admitted at
+    submit), so a self-call never turns a mirrored default into a demand
+    (R1 B1). ``max_turns`` is never a demand."""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -222,9 +237,32 @@ class ResearchVertragWunsch(BaseModel):
     dokument_abrufe: Optional[int] = Field(default=None, ge=1, description=GELTUNG["dokument_abrufe"])
     gesamtzeit_s: Optional[float] = Field(default=None, gt=0, description=GELTUNG["gesamtzeit_s"])
     transportzeit_s: Optional[float] = Field(default=None, gt=0, description=GELTUNG["transportzeit_s"])
+    verlangt: Optional[List[str]] = Field(
+        default=None,
+        description=(
+            "Which of the set limits are demands (must be enforceable on the routed path). "
+            "Absent: every limit set below the ceiling. Written by the server into a job's snapshot."
+        ),
+    )
+
+    @field_validator("verlangt")
+    @classmethod
+    def _nur_grenzen(cls, v: Optional[List[str]]) -> Optional[List[str]]:
+        if v is None:
+            return None
+        fremd = [n for n in v if n not in NAMEN]
+        if fremd:
+            raise ValueError(f"verlangt names no limit: {', '.join(fremd)}")
+        return [n for n in NAMEN if n in v]
 
     def gesetzt(self) -> Set[str]:
         return {n for n in NAMEN if n in self.model_fields_set and getattr(self, n) is not None}
+
+    def forderungen(self, grenzen: Dict[str, Union[int, float]]) -> List[str]:
+        """The demands of this wish under ``grenzen``: set, below the
+        ceiling, and (when ``verlangt`` is given) named there."""
+        kandidaten = self.gesetzt() if self.verlangt is None else (self.gesetzt() & set(self.verlangt))
+        return [n for n in NAMEN if n in kandidaten and getattr(self, n) < grenzen[n]]
 
 
 class VertragVersionAbweichend(ValueError):
@@ -301,9 +339,10 @@ class ResearchVertrag(BaseModel):
         return self.model_copy(update={"grenzen": grenzen, "begrenzt_durch": begrenzt})
 
     def als_wunsch(self) -> Dict[str, Any]:
-        """The contract as the wish that reproduces it exactly: version plus
-        every effective limit. A durable job's snapshot."""
-        return {"version": self.version, **{k: self.grenzen[k] for k in NAMEN}}
+        """The contract as the wish that reproduces it exactly: version,
+        every effective limit, and which of them were demands. A durable
+        job's snapshot."""
+        return {"version": self.version, **{k: self.grenzen[k] for k in NAMEN}, "verlangt": list(self.verlangt)}
 
     def ausgabe(self) -> Dict[str, Any]:
         return self.model_dump()
@@ -355,10 +394,19 @@ def vertrag_erstellen(
                 wunsch.version, aktuell, f"above the current ceiling: {', '.join(zu_hoch)}"
             )
         effektiv = {n: _wert(n, getattr(wunsch, n)) for n in NAMEN}
+        begrenzt: Dict[str, Grund] = {n: "snapshot" for n in NAMEN}
+        # max_turns lowers the turns here as everywhere (R1 W2) — a legacy
+        # field, never a demand.
+        max_turns = _max_turns(request_body)
+        if max_turns is not None and max_turns < effektiv["iterationen"]:
+            effektiv["iterationen"] = max_turns
+            begrenzt["iterationen"] = "client"
+        # Demands: the ones the snapshot names. A hand-written contract
+        # without `verlangt` is read conservatively — every limit below the
+        # CURRENT ceiling is a demand (refuse rather than run silently).
         return ResearchVertrag(
             version=wunsch.version, server_version=aktuell, quelle="snapshot",
-            grenzen=effektiv, begrenzt_durch={n: "snapshot" for n in NAMEN},
-            verlangt=[n for n in NAMEN if effektiv[n] < g[n]],
+            grenzen=effektiv, begrenzt_durch=begrenzt, verlangt=wunsch.forderungen(g),
         )
 
     wuensche: Dict[str, Optional[Union[int, float]]] = {
@@ -366,9 +414,10 @@ def vertrag_erstellen(
     }
     # The existing field max_turns lowers the pool's turns like a wish (it
     # bound there before this contract existed; a default of 30 stays 30).
-    # It is not a contract demand: a legacy caller is routed as before.
-    max_turns = getattr(request_body, "max_turns", None)
-    if isinstance(max_turns, int) and not isinstance(max_turns, bool) and max_turns >= 1:
+    # It is not a contract demand: a legacy caller is routed as before, and
+    # a self-call's mirrored default never refuses the cloud path (R1 B1).
+    max_turns = _max_turns(request_body)
+    if max_turns is not None:
         w = wuensche["iterationen"]
         wuensche["iterationen"] = max_turns if w is None else min(w, max_turns)
 
@@ -383,12 +432,18 @@ def vertrag_erstellen(
         else:
             effektiv[name] = _wert(name, decke)
             begrenzt[name] = "server"
-    gesetzt = wunsch.gesetzt() if wunsch is not None else set()
-    verlangt = [n for n in NAMEN if n in gesetzt and effektiv[n] < g[n]]
     return ResearchVertrag(
         version=aktuell, server_version=aktuell, grenzen=effektiv, begrenzt_durch=begrenzt,
-        verlangt=verlangt,
+        verlangt=wunsch.forderungen(g) if wunsch is not None else [],
     )
+
+
+def _max_turns(request_body: Any) -> Optional[int]:
+    """The legacy field as a number, or None (unset, or a test double)."""
+    max_turns = getattr(request_body, "max_turns", None)
+    if isinstance(max_turns, int) and not isinstance(max_turns, bool) and max_turns >= 1:
+        return max_turns
+    return None
 
 
 def _state(request: Any) -> Any:
@@ -456,7 +511,12 @@ def beschreibung() -> Dict[str, Any]:
             "vertrag (version, server_version, quelle, grenzen, begrenzt_durch, geltung, pfad, "
             "nicht_durchsetzbar)"
         ),
-        "zeitkette": {"gesamtfrist_s": GESAMTFRIST_S},
+        "forderungen": (
+            "eine unter der Obergrenze gesetzte Grenze ist eine Forderung an den Pfad; `verlangt` "
+            "benennt die Forderungen ausdruecklich (dann sind die uebrigen gesetzten Grenzen weich); "
+            "max_turns ist nie eine Forderung"
+        ),
+        "zeitkette": {"gesamtfrist_s": _rl.GESAMTFRIST_S},
     }
 
 
@@ -477,10 +537,14 @@ def snapshot_fuer_job(payload: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     if roh is not None and not isinstance(roh, dict):
         raise ValueError(f"payload.vertrag must be an object, got {type(roh).__name__}")
     wunsch = ResearchVertragWunsch.model_validate(roh) if roh is not None else None
+    # The self-call validates the payload as a ResearchRequest; its defaults
+    # (max_turns 30) bind there. The snapshot mirrors exactly that (R1 B1):
+    # what it says is what the run will bind.
+    from src.models import ResearchRequest  # at call time: models imports this module
 
     class _Rumpf:
         vertrag = wunsch
-        max_turns = payload.get("max_turns")
+        max_turns = payload.get("max_turns", ResearchRequest.model_fields["max_turns"].default)
 
     return vertrag_erstellen(_Rumpf()).als_wunsch()
 

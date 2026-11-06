@@ -815,6 +815,7 @@ class ResearchResponse(ErrorVerdictFields):
     fehler_code: Optional[Literal[
         "antwort_abgeschnitten", "modell_abbruch", "privacy_gate_failed", "privacy_service_unreachable",
         "laufzeit_erschoepft", "vertrag_version_abweichend", "vertrag_nicht_durchsetzbar",
+        "transport_timeout",
     ]] = Field(
         default=None,
         description=(
@@ -837,7 +838,10 @@ class ResearchResponse(ErrorVerdictFields):
             "vertrag carries the current server contract (retryable=false). "
             "'vertrag_nicht_durchsetzbar' = the request asked for a limit the routed path cannot "
             "enforce — refused before pool admission, backend and budget (HTTP 422, "
-            "retryable=false). None for every other error."
+            "retryable=false). 'transport_timeout' = research-cloud only: one Messages-API "
+            "call did not answer within the contract's transportzeit_s; the bridge stopped "
+            "waiting, the remote call may still be running, no partial report, not run "
+            "again on the same path (retryable=false). None for every other error."
         ),
     )
     vertrag: Optional[Dict[str, Any]] = Field(

@@ -175,7 +175,7 @@ def test_pfad_lehnt_wunsch_ab_den_er_nicht_durchsetzen_kann():
 
 def test_fremde_version_nur_als_vollstaendig_bestimmter_vertrag(monkeypatch):
     alt = rv.vertrag_erstellen(_body(vertrag={"gesamtzeit_s": 1200})).als_wunsch()
-    assert set(alt) == {"version", *rv.NAMEN}
+    assert set(alt) == {"version", "verlangt", *rv.NAMEN}
     monkeypatch.setenv("RESEARCH_VERTRAG_SUCHEN_MAX", "25")  # new server policy
     neu = rv.version()
     assert alt["version"] != neu
@@ -183,9 +183,9 @@ def test_fremde_version_nur_als_vollstaendig_bestimmter_vertrag(monkeypatch):
     assert v.quelle == "snapshot" and v.version == alt["version"] and v.server_version == neu
     assert v.grenzen == {k: alt[k] for k in rv.NAMEN}
     assert set(v.begrenzt_durch.values()) == {"snapshot"}
-    # the old ceiling 20 is below the new 25: under the new policy it is a
-    # demand of the snapshot (checked against the path like any other)
-    assert v.verlangt == ["suchen", "gesamtzeit_s"]
+    # the snapshot names its demands: the old ceiling 20 (below the new 25)
+    # is none (R1 W2); without `verlangt` it would be (conservative reading)
+    assert v.verlangt == ["gesamtzeit_s"]
     # incomplete -> refused
     with pytest.raises(rv.VertragVersionAbweichend, match="not fully specified"):
         rv.vertrag_erstellen(_body(vertrag={"version": alt["version"], "gesamtzeit_s": 10}))
@@ -801,3 +801,285 @@ def test_smoke_probe_prueft_die_form_des_vertrags(monkeypatch):
     assert not p.fn(ctx).ok
     seen["body"] = {**rv.beschreibung(), "grenzen": {"a": 1}}
     assert not p.fn(ctx).ok
+
+
+# ── 9. Nacharbeit R1 (Prüfbefund PRUEFBEFUND-R1-fbbf289-20261106) ─────────────
+# Every test here was run against fbbf289 BEFORE the fix and was red
+# (ergebnisse/.../tests-R1-rot-vor-fix.txt).
+
+# B1 / W2 — demand semantics -------------------------------------------------
+
+def test_r1_max_turns_default_ist_nie_eine_forderung():
+    """A self-call sends the snapshot (all nine limits) and the request's
+    max_turns default 30: iterationen 30 binds, but it is NOT a demand — the
+    cloud path (which cannot enforce iterationen) accepts the run."""
+    snap = rv.vertrag_erstellen(_body()).als_wunsch()
+    v = rv.vertrag_erstellen(_body(vertrag=snap, max_turns=30))
+    assert v.grenzen["iterationen"] == 30
+    assert v.verlangt == []
+    assert v.fuer_pfad("cloud").pfad == "cloud"
+    # an explicit wish for iterationen below the ceiling stays a demand
+    w = rv.vertrag_erstellen(_body(vertrag={"iterationen": 5}, max_turns=30))
+    assert w.verlangt == ["iterationen"]
+    with pytest.raises(rv.VertragNichtDurchsetzbar):
+        w.fuer_pfad("cloud")
+
+
+def test_r1_snapshot_spiegelt_den_gebundenen_vertrag():
+    """The snapshot of a job without max_turns says what the self-call will
+    bind: ResearchRequest's max_turns default (30), not the ceiling (40)."""
+    default_turns = ResearchRequest.model_fields["max_turns"].default
+    snap = rv.snapshot_fuer_job({"query": "q"})
+    assert snap["iterationen"] == default_turns == 30
+    assert snap["verlangt"] == []
+    body = rv.selbstaufruf_rumpf({"query": "q"}, {rv.JOB_VERTRAG_KEY: snap})
+    v = rv.vertrag_erstellen(ResearchRequest(**body))
+    assert {k: v.grenzen[k] for k in rv.NAMEN} == {k: snap[k] for k in rv.NAMEN}
+    assert v.verlangt == [] and v.fuer_pfad("cloud").pfad == "cloud"
+    # an explicit max_turns in the payload is mirrored too
+    assert rv.snapshot_fuer_job({"query": "q", "max_turns": 7})["iterationen"] == 7
+
+
+def test_r1_snapshot_traegt_forderungen_ausdruecklich():
+    snap = rv.snapshot_fuer_job({"query": "q", "vertrag": {"ausgabe_tokens": 100}})
+    assert snap["verlangt"] == ["ausgabe_tokens"]
+    body = rv.selbstaufruf_rumpf({"query": "q"}, {rv.JOB_VERTRAG_KEY: snap})
+    v = rv.vertrag_erstellen(ResearchRequest(**body))
+    assert v.verlangt == ["ausgabe_tokens"]
+    with pytest.raises(rv.VertragNichtDurchsetzbar):
+        v.fuer_pfad("pool")
+    assert v.fuer_pfad("cloud").grenzen["ausgabe_tokens"] == 100
+    # a wish at the ceiling or a wish not named in verlangt is no demand
+    v2 = rv.vertrag_erstellen(_body(vertrag={"ausgabe_tokens": 100, "gesamtzeit_s": 10, "verlangt": ["gesamtzeit_s"]}))
+    assert v2.verlangt == ["gesamtzeit_s"] and v2.grenzen["ausgabe_tokens"] == 100
+    assert v2.fuer_pfad("pool").nicht_durchsetzbar == rv.NICHT_DURCHSETZBAR_JE_PFAD["pool"]
+    with pytest.raises(ValueError):
+        rv.ResearchVertragWunsch.model_validate({"verlangt": ["foo"]})
+
+
+def test_r1_snapshot_nach_policy_aenderung_keine_neuen_forderungen_und_max_turns_gilt(monkeypatch):
+    snap = rv.snapshot_fuer_job({"query": "q"})  # legacy job, no demands
+    monkeypatch.setenv("RESEARCH_VERTRAG_SUCHEN_MAX", "25")  # a cloud-only ceiling raised
+    assert rv.version() != snap["version"]
+    v = rv.vertrag_erstellen(_body(vertrag=snap, max_turns=10))
+    assert v.quelle == "snapshot"
+    assert v.verlangt == []  # the old ceiling 20 is no demand on the pool
+    assert v.grenzen["suchen"] == 20
+    assert v.grenzen["iterationen"] == 10  # max_turns applies in the snapshot branch too
+    assert v.fuer_pfad("pool").pfad == "pool"
+    # a demand recorded at submit survives the policy change
+    snap2 = rv.snapshot_fuer_job({"query": "q", "vertrag": {"ausgabe_tokens": 100}})
+    v2 = rv.vertrag_erstellen(_body(vertrag=snap2))
+    assert v2.verlangt == ["ausgabe_tokens"]
+    # a hand-written old contract without verlangt: every limit below the
+    # current ceiling counts as a demand (conservative, refuses rather than silent)
+    alt = {k: snap[k] for k in ("version", *rv.NAMEN)}
+    assert "suchen" in rv.vertrag_erstellen(_body(vertrag=alt)).verlangt
+
+
+# B1 — the real path: job -> self-call -> handler -> cloud -----------------------
+
+class _HandlerClient:
+    """Stands in for httpx.AsyncClient in the job's self-call: the POST lands
+    on the REAL /v1/research handler (admission, routing, cloud wrapper); only
+    the Messages API itself is a mock. Network lock is active throughout."""
+
+    def __init__(self, handler_patches):
+        self._patches = handler_patches
+        self.calls = []
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *a):
+        return False
+
+    async def post(self, url, json=None, headers=None):
+        from fastapi import Request as FRequest
+        from fastapi.responses import JSONResponse
+        from contextlib import ExitStack
+
+        self.calls.append({"url": url, "json": json, "headers": headers})
+        scope_headers = [(k.lower().encode(), str(v).encode()) for k, v in (headers or {}).items()]
+        req = FRequest({"type": "http", "method": "POST", "path": "/v1/research",
+                        "headers": scope_headers, "query_string": b""})
+        body = ResearchRequest(**json)
+        with ExitStack() as stack:
+            for p in self._patches:
+                stack.enter_context(p)
+            out = await src.main.research(body, req, credentials=MagicMock())
+        if isinstance(out, JSONResponse):
+            import json as _json
+            return _FakeResp(out.status_code, _json.loads(bytes(out.body)), text=bytes(out.body).decode())
+        return _FakeResp(200, out.model_dump(mode="json"))
+
+
+def _cloud_handler_patches(executor_mock):
+    admit = AsyncMock(return_value=None)
+    return (
+        patch("src.main.verify_api_key", AsyncMock()),
+        patch("src.main.enforce_attribution", MagicMock()),
+        patch("src.main.resolve_model", return_value=("claude-sonnet-5", "ok")),
+        patch("src.pricing.is_priced", return_value=True),
+        patch("src.routing.user_provider_override.enforce_user_provider_override", AsyncMock(return_value=None)),
+        patch("src.routing.app_provider_policy.resolve_app_provider_policy", return_value=(None, None)),
+        patch("src.research_cloud.routing.resolve_research_cloud_routing", AsyncMock(return_value=True)),
+        patch("src.main.resolve_backend_config", return_value=MagicMock(backend=src.main.BackendType.ANTHROPIC, env_vars=None)),
+        patch("src.routing.user_provider_override.assert_bedrock_is_pinned", MagicMock()),
+        patch("src.routing.user_provider_override.assert_bedrock_attribution_complete", MagicMock()),
+        patch("src.main._admit_research_to_pool", admit),
+        patch("src.budget.gate.enforce_budget", AsyncMock()),
+        *_cloud_patches(executor_mock),
+    )
+
+
+@pytest.mark.asyncio
+async def test_r1_job_selbstaufruf_laeuft_auf_cloud_erststart_und_reclaim(research_job, monkeypatch):
+    """A research job without any contract wish, routed to the cloud: the
+    first dispatch AND the reclaim after a restart run the job (no
+    vertrag_nicht_durchsetzbar), and the result's contract says pfad=cloud
+    with the snapshot's limits."""
+    from src.jobs import registry, store_client
+
+    r = await _post(body={"kind": "research", "payload": {"query": "q"}}, key=KEY)
+    assert r.status_code == 201
+    job_id = r.json()["job_id"]
+    payload, attribution = research_job["dispatch"][0]
+    snap = attribution[rv.JOB_VERTRAG_KEY]
+
+    executor_mock = AsyncMock(return_value=_cloud_result())
+    client = _HandlerClient(_cloud_handler_patches(executor_mock))
+    done, errors = [], []
+    monkeypatch.setattr(store_client, "mark_running", AsyncMock(return_value=True))
+    monkeypatch.setattr(store_client, "heartbeat", AsyncMock())
+    monkeypatch.setattr(store_client, "update_progress", AsyncMock())
+    monkeypatch.setattr(store_client, "mark_done", AsyncMock(side_effect=lambda jid, res: done.append(res)))
+    monkeypatch.setattr(store_client, "mark_error", AsyncMock(side_effect=lambda *a, **k: errors.append((a, k))))
+    from src.jobs.executors import research_executor
+    monkeypatch.setitem(registry._EXECUTORS, "research", research_executor)  # the real one
+    with patch("httpx.AsyncClient", return_value=client), patch("src.auth.auth_manager.get_api_key", return_value="k"):
+        # first dispatch, as routes.run_generic_job would have started it
+        await registry.run_generic_job(job_id, "research", payload, attribution)
+        # reclaim after a restart: the row's payload + attribution, body runner
+        await registry._run_body(job_id, "research", dict(payload), dict(attribution))
+
+    assert errors == [], errors
+    assert len(done) == 2 and len(client.calls) == 2
+    for res in done:
+        assert res["status"] == "success"
+        assert res["vertrag"]["pfad"] == "cloud"
+        assert res["vertrag"]["version"] == snap["version"]
+        assert res["vertrag"]["grenzen"]["iterationen"] == snap["iterationen"] == 30
+        assert res["vertrag"]["grenzen"]["ausgabe_tokens"] == snap["ausgabe_tokens"]
+    for call in client.calls:
+        assert call["json"]["vertrag"] == snap and call["json"]["async_mode"] is False
+    assert executor_mock.await_count == 2
+    cfg = executor_mock.await_args.kwargs["config"]
+    assert cfg.max_tokens == snap["ausgabe_tokens"] and cfg.max_continuations == snap["fortsetzungen"]
+
+
+# W3 — deadline on retry, no retry of final errors ------------------------------
+
+def test_r1_frist_bis_liest_die_gemerkte_frist_zurueck():
+    request = MagicMock()
+    request.headers = {}
+    request.state = SimpleNamespace(research_frist_bis=123.0)
+    assert rl.frist_bis(request) == 123.0
+    request.state = SimpleNamespace(research_frist_bis=time.time() + 50.0)
+    lz1 = rl.Laufzeit.fuer_anfrage(request)
+    lz2 = rl.Laufzeit.fuer_anfrage(request)  # a retry from this worker
+    assert lz1.frist_s <= 50.0 and lz2.frist_s <= lz1.frist_s
+
+
+@pytest.mark.asyncio
+async def test_r1_cloud_retry_wiederholt_keine_endgueltigen_fehler():
+    request = MagicMock()
+    request.headers = {}
+    request.state = SimpleNamespace()
+    req = _cloud_req()
+
+    def _err(**kw):
+        return ResearchResponse(status="error", query="q", model="m", error="x", **kw)
+
+    with patch("src.main._execute_research_cloud_impl", AsyncMock(return_value=_err(fehler_code="laufzeit_erschoepft", retryable=False))) as impl:
+        out = await src.main._execute_research_cloud_with_pool_fallback(request, req, attribution_ctx={})
+    assert impl.await_count == 1 and out.fehler_code == "laufzeit_erschoepft"
+    with patch("src.main._execute_research_cloud_impl", AsyncMock(return_value=_err(fehler_code="transport_timeout", retryable=False))) as impl:
+        await src.main._execute_research_cloud_with_pool_fallback(request, req, attribution_ctx={})
+    assert impl.await_count == 1
+    # a named cause that IS retryable keeps its retry
+    with patch("src.main._execute_research_cloud_impl", AsyncMock(return_value=_err(fehler_code="privacy_service_unreachable", retryable=True))) as impl:
+        await src.main._execute_research_cloud_with_pool_fallback(request, req, attribution_ctx={})
+    assert impl.await_count == src.main._RESEARCH_CLOUD_MAX_ATTEMPTS
+    # an unclassified error keeps its one same-path retry (unchanged)
+    with patch("src.main._execute_research_cloud_impl", AsyncMock(return_value=_err())) as impl:
+        await src.main._execute_research_cloud_with_pool_fallback(request, req, attribution_ctx={})
+    assert impl.await_count == src.main._RESEARCH_CLOUD_MAX_ATTEMPTS
+
+
+@pytest.mark.asyncio
+async def test_r1_transport_timeout_ist_endgueltig():
+    from src.research_cloud.executor import _transport_timeout
+
+    fehler = _transport_timeout(httpx.ReadTimeout("x"), 900.0, ResearchCloudConfig(), None, "bericht", 0)
+    assert fehler.retryable is False and fehler.fehler_code == "transport_timeout"
+    req = _cloud_req()
+    req.vertrag = None
+    request = MagicMock()
+    request.headers = {}
+    request.state = SimpleNamespace()
+    executor_mock = AsyncMock(side_effect=fehler)
+    p = _cloud_patches(executor_mock)
+    with p[0], p[1], p[2], p[3]:
+        result = await src.main._execute_research_cloud_impl(request, req, attribution_ctx={})
+    assert result.status == "error" and result.retryable is False and result.fehler_code == "transport_timeout"
+    assert "transportzeit_s" in result.error and "may still be running" in result.error
+
+
+# W4 — the default deadline follows the time chain ------------------------------
+
+def test_r1_gesamtzeit_default_folgt_der_gesamtfrist(monkeypatch):
+    monkeypatch.setattr(rl, "GESAMTFRIST_S", 1000.0)
+    g = rv.obergrenzen()
+    assert g["gesamtzeit_s"] == 1000.0
+    rv.pruefe_obergrenzen(g)  # no start risk with a shorter chain
+    monkeypatch.setenv("RESEARCH_VERTRAG_GESAMTZEIT_S_MAX", "1200")
+    with pytest.raises(ValueError, match="gesamtzeit_s"):
+        rv.pruefe_obergrenzen()  # an explicit ceiling above the chain still fails loud
+
+
+# H5 — hard cap per Messages-API call --------------------------------------------
+
+@pytest.mark.asyncio
+async def test_r1_messages_aufruf_hat_eine_harte_obergrenze():
+    client = MagicMock()
+
+    async def post(url, headers=None, json=None, timeout=None):
+        await asyncio.sleep(1.0)  # a client that ignores its per-phase timeout
+        return _done()
+
+    client.post = post
+    t0 = time.monotonic()
+    with pytest.raises(ResearchCloudExecutorError, match="transportzeit_s"):
+        await run_research_cloud("q", "s", config=ResearchCloudConfig(http_timeout_seconds=0.05), api_key="sk-test", client=client)
+    assert time.monotonic() - t0 < 0.9
+
+
+# H6 — contract refusals from inside the run are 422 too --------------------------
+
+@pytest.mark.asyncio
+async def test_r1_vertragsfehler_aus_dem_lauf_sind_422():
+    """The staging subscription fallback runs the pool admission after the
+    handler's own: a refusal there must reach the caller as 422, not 200."""
+    impl = AsyncMock(return_value=ResearchResponse(
+        status="error", query="q", model="m", error="x", fehler_code=rv.FEHLER_NICHT_DURCHSETZBAR, retryable=False,
+    ))
+    ps = _handler_patches(impl, AsyncMock(return_value=None), AsyncMock())
+    from contextlib import ExitStack
+    with ExitStack() as stack:
+        for p in ps:
+            stack.enter_context(p)
+        out = await src.main.research(ResearchRequest(query="q"), _frequest(), credentials=MagicMock())
+    assert not isinstance(out, ResearchResponse) and out.status_code == 422
+    body = json.loads(bytes(out.body))
+    assert body["fehler_code"] == rv.FEHLER_NICHT_DURCHSETZBAR and body["vertrag"]["version"] == rv.version()

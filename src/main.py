@@ -7282,6 +7282,9 @@ async def _execute_research_cloud_impl(
             # mark it recognizable-retryable so the caller defers instead of
             # treating it as a permanent break (see _mark_retryable).
             error_fields = _transient_error(error_message)
+        elif e.retryable is not None:
+            # A verdict without a code (transport timeout: final).
+            error_fields = {"error": error_message, "retryable": e.retryable}
         else:
             error_fields = {"error": error_message}
         return ResearchResponse(
@@ -7719,6 +7722,14 @@ async def _execute_research_cloud_with_pool_fallback(
             result.funding_policy = "promotional_only"
         if result.status != "error" or promotional_only(request):
             return result
+        if result.fehler_code is not None and result.retryable is False:
+            # A NAMED cause with a final verdict (laufzeit_erschoepft,
+            # transport_timeout, a contract refusal, privacy_gate_failed,
+            # modell_abbruch): not run again (R1 W3). An unclassified failure
+            # keeps its one same-path retry (the "transient hiccup" intent
+            # above); the deadline does not start afresh for it either
+            # (frist_bis keeps the remembered one).
+            return result
         logger.error(
             f"research-cloud run failed (attempt {attempt}/{_RESEARCH_CLOUD_MAX_ATTEMPTS}): "
             f"{result.error}"
@@ -7888,6 +7899,18 @@ def _research_antwort_mit_vertrag(antwort, request, request_body):
         antwort.vertrag = vertrag_fuer(request, request_body).ausgabe()
     except Exception as e:
         logger.error(f"research: Vertrag nicht an die Antwort gestempelt: {e}")
+    return antwort
+
+
+def _vertrag_fehler_als_422(antwort):
+    """A contract refusal decided INSIDE the run (the staging subscription
+    fallback runs the pool admission after the handler's own) reaches the
+    caller as HTTP 422 like every other admission refusal (R1 H6)."""
+    from src.research_vertrag import FEHLER_NICHT_DURCHSETZBAR, FEHLER_VERSION_ABWEICHEND
+    if isinstance(antwort, ResearchResponse) and antwort.status == "error" and antwort.fehler_code in (
+        FEHLER_NICHT_DURCHSETZBAR, FEHLER_VERSION_ABWEICHEND,
+    ):
+        return JSONResponse(status_code=422, content=antwort.model_dump())
     return antwort
 
 
@@ -8439,7 +8462,7 @@ async def research(
         request, lauf, attribution=_research_attr,
         model=request_body.model, endpunkt="/v1/research",
     )
-    return _research_antwort_mit_vertrag(antwort, request, request_body)
+    return _vertrag_fehler_als_422(_research_antwort_mit_vertrag(antwort, request, request_body))
 
 
 @app.get("/v1/research/async/{request_id}", response_model=AsyncResearchStatus)

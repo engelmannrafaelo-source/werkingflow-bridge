@@ -32,6 +32,8 @@ from typing import Any, Awaitable, Callable, Dict, List, Optional
 
 import httpx
 
+import asyncio
+
 from src.lauf_abschluss import LaufUnfertig, ModellAbbruch, abschluss_aus_stop_reason, annehmen
 from src.research_laufzeit import (
     LAUFZEIT_ERSCHOEPFT,
@@ -194,6 +196,11 @@ class ResearchCloudExecutorError(Exception):
     def __init__(self, message: str, *, status_code: Optional[int] = None):
         super().__init__(message)
         self.status_code = status_code
+
+
+# fehler_code of a Messages-API call that did not answer within the
+# contract's transportzeit_s (ResearchResponse.fehler_code).
+TRANSPORT_TIMEOUT = "transport_timeout"
 
 
 class ResearchCloudLaufzeitErschoepft(ResearchCloudExecutorError):
@@ -453,6 +460,13 @@ def _transport_timeout(
             f"transportzeit_s={float(config.http_timeout_seconds):.0f} s — the bridge stopped waiting, "
             "the remote call may still be running; no partial report"
         )
+        # A named cause with a final verdict (R1 W3): not retried on the same
+        # path — the remote call may still be running (a retry would pay the
+        # research twice), and the remaining deadline seldom holds a second
+        # full run. Same rule as the job self-call's read timeout
+        # (src/jobs/executors._post_self).
+        fehler.fehler_code = TRANSPORT_TIMEOUT
+        fehler.retryable = False
     fehler.__cause__ = exc
     return fehler
 
@@ -679,10 +693,13 @@ async def run_research_cloud(
                             from fastapi import HTTPException
                             from src.providers.credit_pool import PinnedAccountLost, PoolUnavailable, post_messages
                             try:
-                                response, pool_meta = await post_messages(
-                                    body, aufruf_timeout, pin=pool_pin
+                                # httpx applies its timeout per phase; the
+                                # outer wait_for is the hard cap per call (R1 H5).
+                                response, pool_meta = await asyncio.wait_for(
+                                    post_messages(body, aufruf_timeout, pin=pool_pin),
+                                    timeout=aufruf_timeout,
                                 )
-                            except httpx.TimeoutException as exc:
+                            except (httpx.TimeoutException, asyncio.TimeoutError) as exc:
                                 raise _transport_timeout(exc, aufruf_timeout, config, laufzeit, phase, iteration)
                             except HTTPException as exc:
                                 logger.error(
@@ -716,10 +733,13 @@ async def run_research_cloud(
                             )
                         else:
                             try:
-                                response = await http_client.post(
-                                    ANTHROPIC_API_URL, headers=headers, json=body, timeout=aufruf_timeout
+                                response = await asyncio.wait_for(
+                                    http_client.post(
+                                        ANTHROPIC_API_URL, headers=headers, json=body, timeout=aufruf_timeout
+                                    ),
+                                    timeout=aufruf_timeout,
                                 )
-                            except httpx.TimeoutException as exc:
+                            except (httpx.TimeoutException, asyncio.TimeoutError) as exc:
                                 raise _transport_timeout(exc, aufruf_timeout, config, laufzeit, phase, iteration)
                         if response.status_code != 200:
                             raise ResearchCloudExecutorError(

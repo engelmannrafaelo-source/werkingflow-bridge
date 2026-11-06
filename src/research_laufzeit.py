@@ -118,11 +118,16 @@ pruefe_staffelung()
 
 
 def frist_bis(request: Any) -> float:
-    """Absolute deadline of this research request: the one a cross-worker
-    retry forwarded (never later than a fresh one), else now + deadline.
-    Remembered on request.state for a later retry from this worker."""
+    """Absolute deadline of this research request: the one remembered on
+    request.state (a retry from this worker keeps the FIRST deadline, R1
+    W3), else the one a cross-worker retry forwarded (never later than a
+    fresh one), else now + deadline. Remembered on request.state."""
     jetzt = time.time()
     bis = jetzt + GESAMTFRIST_S
+    state = getattr(request, "state", None) if request is not None else None
+    gemerkt = getattr(state, "research_frist_bis", None) if state is not None else None
+    if isinstance(gemerkt, float):
+        bis = min(bis, gemerkt)
     roh = None
     try:
         roh = request.headers.get(FRIST_HEADER) if request is not None else None
@@ -133,8 +138,7 @@ def frist_bis(request: Any) -> float:
             bis = min(bis, float(roh))
         except ValueError:
             logger.error(f"research: malformed {FRIST_HEADER}={roh!r} — using a fresh deadline")
-    state = getattr(request, "state", None) if request is not None else None
-    if state is not None and not isinstance(getattr(state, "research_frist_bis", None), float):
+    if state is not None and not isinstance(gemerkt, float):
         try:
             state.research_frist_bis = bis
         except Exception:
