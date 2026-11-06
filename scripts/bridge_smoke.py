@@ -909,6 +909,43 @@ def _metrics_jobs_retention(ctx: Ctx) -> ProbeResult:
                        r.status_code, ms)
 
 
+_RV_EP = "/v1/research/vertrag"
+
+
+@probe("research_vertrag", _RV_EP, {"hetzner", "server2"},
+       repro="curl $AI_BRIDGE_URL" + _RV_EP
+       + " -H 'Authorization: Bearer $AI_BRIDGE_API_KEY' " + ATTRIBUTION_REPRO)
+def _research_vertrag(ctx: Ctx) -> ProbeResult:
+    """P6-VERTRAG: the research execution contract is readable before
+    admission (src/research_vertrag.py). Read-only GET, no run, no spend.
+    Shape only: a version of the current protocol, the nine ceilings and the
+    per-path capabilities — the numbers are deployment policy, not judged."""
+    name, ep = "research_vertrag", _RV_EP
+    r, ms = _timed(lambda: requests.get(f"{ctx.base_url}{ep}",
+                                        headers=ctx.headers(), timeout=30))
+    if r.status_code != 200:
+        return ProbeResult(name, ep, False, f"HTTP {r.status_code}: {r.text[:200]}",
+                           r.status_code, ms)
+    d = r.json()
+    bad = []
+    version = d.get("version")
+    if not (isinstance(version, str) and version.startswith("research-vertrag/1+")):
+        bad.append("version")
+    grenzen = d.get("grenzen")
+    if not (isinstance(grenzen, dict) and len(grenzen) == 9
+            and all(isinstance(v, (int, float)) and v > 0 for v in grenzen.values())):
+        bad.append("grenzen")
+    pfade = (d.get("capabilities") or {}).get("pfade")
+    if not (isinstance(pfade, dict) and {"pool", "cloud"} <= set(pfade)):
+        bad.append("capabilities.pfade")
+    if bad:
+        return ProbeResult(name, ep, False,
+                           f"missing/invalid key(s) {bad}: {str(d)[:150]}",
+                           r.status_code, ms)
+    return ProbeResult(name, ep, True, f"version={version} grenzen={grenzen}",
+                       r.status_code, ms)
+
+
 # Endpoints covered by dedicated probes above but whose canonical route differs
 # from the probe endpoint are mapped here so the coverage validator sees them.
 COVERED_ALIASES = {

@@ -48,11 +48,14 @@ peer does not start a fresh 3300 s behind a waiter that started earlier.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import time
 from contextlib import contextmanager
-from typing import Any, Callable, Dict, Iterator, Optional
+from typing import Any, Awaitable, Callable, Dict, Iterator, Optional, TypeVar
+
+T = TypeVar("T")
 
 logger = logging.getLogger(__name__)
 
@@ -159,9 +162,15 @@ class Laufzeit:
         self._laufend: Dict[str, float] = {}
 
     @classmethod
-    def fuer_anfrage(cls, request: Any, **kw: Any) -> "Laufzeit":
-        """Deadline of a /v1/research request (frist_bis), as remaining time."""
-        return cls(max(0.0, frist_bis(request) - time.time()), **kw)
+    def fuer_anfrage(cls, request: Any, *, hoechstens_s: Optional[float] = None, **kw: Any) -> "Laufzeit":
+        """Deadline of a /v1/research request (frist_bis), as remaining time —
+        never more than ``hoechstens_s`` (the contract's gesamtzeit_s,
+        src/research_vertrag.py). A forwarded deadline (cross-worker retry)
+        and the contract both only shorten; nothing here starts a new one."""
+        rest = max(0.0, frist_bis(request) - time.time())
+        if hoechstens_s is not None:
+            rest = min(rest, max(0.0, float(hoechstens_s)))
+        return cls(rest, **kw)
 
     def beginne(self, runde: str) -> None:
         self._laufend[runde] = self._uhr()
@@ -210,6 +219,37 @@ class Laufzeit:
             "frist_s": self.frist_s,
             "runden": dict(self.runden),
         }
+
+
+class RestfristErschoepft(LaufzeitErschoepft):
+    """A remote call (tool, library, checker) was abandoned at the run's
+    deadline. Abandoned, not stopped: the bridge cancelled its own waiting
+    coroutine; whether the remote side still works on the request is not
+    known and is not claimed."""
+
+
+async def unter_restfrist(
+    arbeit: Awaitable[T], rest: Optional[Callable[[], float]], was: str
+) -> T:
+    """Await ``arbeit`` for at most the run's remaining time (``rest()``,
+    e.g. Laufzeit.rest). No deadline (None) = as before. Zero or negative
+    remaining time refuses the call before it starts."""
+    if rest is None:
+        return await arbeit
+    verbleibend = rest()
+    if verbleibend <= 0:
+        if asyncio.iscoroutine(arbeit):
+            arbeit.close()
+        raise RestfristErschoepft(
+            f"{was} not started: the run's overall deadline is already reached"
+        )
+    try:
+        return await asyncio.wait_for(arbeit, timeout=verbleibend)
+    except asyncio.TimeoutError as e:
+        raise RestfristErschoepft(
+            f"{was} abandoned after {verbleibend:.0f} s at the run's overall deadline — the "
+            "bridge stopped waiting; the remote call may still be running"
+        ) from e
 
 
 def als_laufzeitfehler(exc: BaseException, laufzeit: Optional[Laufzeit]) -> BaseException:

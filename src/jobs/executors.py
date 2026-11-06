@@ -574,7 +574,11 @@ async def research_executor(
     false success."""
     # Force blocking: if the caller left async_mode=true we'd get a job-id back
     # instead of the result. The job layer is the durability mechanism here.
-    body = {**payload, "async_mode": False}
+    # The persisted execution contract (research_vertrag.JOB_VERTRAG_KEY in
+    # the attribution) becomes the self-call's wish: the run binds exactly
+    # the version and limits admitted at submit, on reclaim too.
+    from src.research_vertrag import selbstaufruf_rumpf
+    body = {**selbstaufruf_rumpf(payload, attribution), "async_mode": False}
     await report_progress({"phase": "research", "model": body.get("model")})
     result = await _self_post_json(
         "/v1/research", body, attribution, RESEARCH_SELF_CALL_TIMEOUT_S

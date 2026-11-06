@@ -26,6 +26,7 @@ raises PoolToolError for every refusal.
 from __future__ import annotations
 
 import logging
+from src.research_laufzeit import RestfristErschoepft, unter_restfrist
 from typing import Any, Awaitable, Callable, Dict, Optional
 
 import httpx
@@ -101,11 +102,15 @@ class PoolPerplexityTool:
         anonymize: Callable[[str], Awaitable[str]],
         client: Optional[httpx.AsyncClient],
         max_uses: int,
+        frist: Optional[Callable[[], float]] = None,
     ) -> None:
         self.config = config
         self.anonymize = anonymize
         self.client = client
         self.max_uses = max_uses
+        # Remaining time of the run (research_laufzeit.Laufzeit.rest): a tool
+        # call never waits past the run's deadline (P6-VERTRAG gesamtzeit_s).
+        self.frist = frist
         self.calls = 0
         self.cost_usd = 0.0
         self.cost_missing = 0
@@ -160,12 +165,19 @@ class PoolPerplexityTool:
             ) from e
         try:
             if self.client is not None:
-                answer = await ask_perplexity(anonymized, self.config, self.client)
+                answer = await unter_restfrist(
+                    ask_perplexity(anonymized, self.config, self.client), self.frist, "perplexity_search"
+                )
             else:
                 # Per call: the research run has no place that would close a
                 # client opened for its whole duration.
                 async with httpx.AsyncClient() as c:
-                    answer = await ask_perplexity(anonymized, self.config, c)
+                    answer = await unter_restfrist(
+                        ask_perplexity(anonymized, self.config, c), self.frist, "perplexity_search"
+                    )
+        except RestfristErschoepft as e:
+            logger.error(f"research pool: perplexity_search stopped at the run's deadline: {e}")
+            raise PoolToolError(str(e)) from e
         except PerplexityCallError as e:
             logger.warning(f"research pool: perplexity_search failed (fail-soft): {e}")
             raise PoolToolError(f"Perplexity nicht erreichbar: {e}. Weiter mit WebSearch.") from e
@@ -226,13 +238,18 @@ class PoolDocumentTool:
     that carries the named reason (src/research_cloud/fetch_document.py).
     """
 
-    def __init__(self, max_uses: int, **fetch_kwargs: Any) -> None:
+    def __init__(self, max_uses: int, frist: Optional[Callable[[], float]] = None, **fetch_kwargs: Any) -> None:
         self.counters = DocumentCounters(max_uses=max_uses)
         self._fetch_kwargs = fetch_kwargs
+        self.frist = frist
 
     async def handle(self, args: Dict[str, Any]) -> Dict[str, Any]:
         try:
-            text = await fetch_document(args, self.counters, **self._fetch_kwargs)
+            text = await unter_restfrist(
+                fetch_document(args, self.counters, **self._fetch_kwargs), self.frist, "fetch_document"
+            )
+        except RestfristErschoepft as e:
+            raise PoolToolError(str(e)) from e
         except DocumentFetchError as e:
             raise PoolToolError(f"fetch_document: {e}") from e
         return {"content": [{"type": "text", "text": text}]}

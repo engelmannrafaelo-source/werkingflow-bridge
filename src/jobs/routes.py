@@ -456,6 +456,38 @@ async def create_job_endpoint(
         if held is not None:
             return _replay(held, idem_key)
 
+    # Execution contract of a research job (src/research_vertrag.py): decided
+    # HERE, after the idempotency replay (a retry with the unchanged body
+    # finds its job whatever the server's ceilings are today) and BEFORE the
+    # row exists — persisted as a snapshot in the server-side attribution,
+    # never in the body (the digest stays the client's body). The self-call
+    # (first dispatch and reclaim after a restart) sends this snapshot, so the
+    # run binds the version and limits admitted at submit. A body-supplied
+    # snapshot is dropped. The path (pool/cloud) is decided at execution: a
+    # wish the routed path cannot enforce ends the job with
+    # vertrag_nicht_durchsetzbar there.
+    if body.kind == "research":
+        from src.research_vertrag import (
+            FEHLER_VERTRAG_UNGUELTIG,
+            JOB_VERTRAG_KEY,
+            VertragVersionAbweichend,
+            snapshot_fuer_job,
+        )
+        try:
+            _snapshot = snapshot_fuer_job(body.payload)
+        except VertragVersionAbweichend as e:
+            return JSONResponse(
+                status_code=422,
+                content={"detail": {"reason": e.fehler_code, "message": str(e)}},
+            )
+        except (ValueError, TypeError) as e:  # pydantic ValidationError is a ValueError
+            return JSONResponse(
+                status_code=400,
+                content={"detail": {"reason": FEHLER_VERTRAG_UNGUELTIG, "message": str(e)}},
+            )
+        attribution = {k: v for k, v in (attribution or {}).items() if k != JOB_VERTRAG_KEY}
+        attribution[JOB_VERTRAG_KEY] = _snapshot
+
     from src.middleware.capacity_lock import get_capacity_lock
     from src.middleware.bridge_error import account_exhausted_error
 

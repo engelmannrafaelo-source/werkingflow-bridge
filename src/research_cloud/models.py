@@ -79,7 +79,13 @@ class ResearchCloudConfig(BaseModel):
     # headroom while staying comfortably inside the non-streaming HTTP timeout
     # below (this executor posts without streaming).
     max_tokens: int = 32000
-    max_continuations: int = 8
+    # Messages-API calls of the WHOLE run (every round: report, return round)
+    # — the contract's fortsetzungen (src/research_vertrag.py). 16 = what two
+    # rounds of 8 could use before; a client limit does not reset per round.
+    max_continuations: int = 16
+    # Calls one round may use (unchanged 8): a round that does not finish in
+    # 8 is broken, whatever the run-wide budget still holds.
+    max_continuations_je_runde: int = 8
     http_timeout_seconds: float = 900.0
     web_search_max_uses: int = 15
     web_fetch_max_uses: int = 10

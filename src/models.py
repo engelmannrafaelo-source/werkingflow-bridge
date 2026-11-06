@@ -6,6 +6,7 @@ import uuid
 
 from config.logging_config import get_logger
 from src.model_registry import get_default_model
+from src.research_vertrag import ResearchVertragWunsch
 
 logger = get_logger(__name__)
 
@@ -546,7 +547,11 @@ class ResearchRequest(BaseModel):
     # Claude Code SDK Options
     max_tokens: Optional[int] = Field(
         default=4000,
-        description="Maximum tokens for response generation"
+        description=(
+            "Not effective on either research path: the pool CLI takes no output-token "
+            "limit, the research-cloud path uses the execution contract. The binding "
+            "output limit is vertrag.ausgabe_tokens (P6-VERTRAG, 06.11.2026)."
+        )
     )
 
     temperature: Optional[float] = Field(
@@ -558,7 +563,10 @@ class ResearchRequest(BaseModel):
 
     max_turns: Optional[int] = Field(
         default=30,
-        description="Maximum conversation turns for research task (increased for deep research)"
+        description=(
+            "Maximum CLI turns on the worker-pool path; lowers vertrag.iterationen, never "
+            "raises it above the server ceiling (GET /v1/research/vertrag)."
+        )
     )
 
     # Backend selection for multi-provider support
@@ -635,6 +643,23 @@ class ResearchRequest(BaseModel):
             "Gap check for this request. false: no gap checker and no return round; the "
             "response field nachkontrolle says status=uebersprungen with the reason. "
             "null/true (default): the deployment setting decides."
+        ),
+    )
+
+
+    # Execution contract (P6-VERTRAG, 06.11.2026, src/research_vertrag.py): the
+    # version the caller read and lower limits. The server's ceilings are the
+    # upper bound on both paths; the response field `vertrag` carries what
+    # actually bound. A named version other than the current one is refused
+    # before any run (fehler_code vertrag_version_abweichend).
+    vertrag: Optional[ResearchVertragWunsch] = Field(
+        default=None,
+        description=(
+            "Execution contract wish: version (as read from GET /v1/research/vertrag) and "
+            "lower limits (ausgabe_tokens, iterationen, fortsetzungen, suchen, abrufe, "
+            "perplexity_suchen, dokument_abrufe, gesamtzeit_s, transportzeit_s). A wish only "
+            "lowers the server ceiling; unknown fields are refused. The response field "
+            "vertrag says which version and limits bound the run."
         ),
     )
 
@@ -789,7 +814,7 @@ class ResearchResponse(ErrorVerdictFields):
     )
     fehler_code: Optional[Literal[
         "antwort_abgeschnitten", "modell_abbruch", "privacy_gate_failed", "privacy_service_unreachable",
-        "laufzeit_erschoepft",
+        "laufzeit_erschoepft", "vertrag_version_abweichend", "vertrag_nicht_durchsetzbar",
     ]] = Field(
         default=None,
         description=(
@@ -806,7 +831,22 @@ class ResearchResponse(ErrorVerdictFields):
             "is back. 'laufzeit_erschoepft' = a mandatory round (main run, repair "
             "round) did not finish within the run's overall deadline (laufzeit.frist_s) or "
             "the CLI's MAX_TIMEOUT; the agent was terminated, no partial report "
-            "(retryable=false). None for every other error."
+            "(retryable=false). 'vertrag_version_abweichend' = the request (or a durable "
+            "job's persisted payload) named an execution-contract version that is not the "
+            "current one and cannot be taken over unchanged — refused before any run (HTTP 422); "
+            "vertrag carries the current server contract (retryable=false). "
+            "'vertrag_nicht_durchsetzbar' = the request asked for a limit the routed path cannot "
+            "enforce — refused before pool admission, backend and budget (HTTP 422, "
+            "retryable=false). None for every other error."
+        ),
+    )
+    vertrag: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description=(
+            "success AND error, both paths (P6-VERTRAG): the execution contract that bound "
+            "this run — version, grenzen (effective limits), begrenzt_durch (server|client "
+            "per limit), pfad (pool|cloud), nicht_durchsetzbar (limits this path cannot "
+            "enforce). On vertrag_version_abweichend: the current server contract."
         ),
     )
     nachkontrolle: Optional[Dict[str, Any]] = Field(
@@ -825,7 +865,7 @@ class ResearchResponse(ErrorVerdictFields):
     laufzeit: Optional[Dict[str, Any]] = Field(
         default=None,
         description=(
-            "Pool path, success AND error: gesamt_s = run time of the whole call (every "
+            "Both paths, success AND error: gesamt_s = run time of the whole call (every "
             "round), frist_s = the run's overall deadline, runden = seconds per round "
             "(hauptlauf, reparatur, pruefer, rueckrunde, nachmessung). execution_time_seconds "
             "is the same whole-call time."

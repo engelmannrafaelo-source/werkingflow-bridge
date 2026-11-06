@@ -6121,7 +6121,17 @@ async def _execute_research_impl(
     pool_pplx = None
     # The run's overall deadline and per-round run time (research_laufzeit).
     from src.research_laufzeit import Laufzeit
-    laufzeit = Laufzeit.fuer_anfrage(request)
+    # Execution contract (src/research_vertrag.py): the pool's view of the
+    # admitted limits — turns, the two MCP tool budgets and the deadline.
+    from src.research_vertrag import VertragNichtDurchsetzbar, vertrag_fuer
+    try:
+        vertrag = vertrag_fuer(request, request_body, "pool")
+    except VertragNichtDurchsetzbar as _v_err:
+        return ResearchResponse(
+            status="error", query=request_body.query, model=request_body.model,
+            error=str(_v_err), fehler_code=_v_err.fehler_code, retryable=_v_err.retryable,
+        )
+    laufzeit = Laufzeit.fuer_anfrage(request, hoechstens_s=vertrag.grenze("gesamtzeit_s"))
     nachkontrolle = None
 
     try:
@@ -6286,12 +6296,13 @@ async def _execute_research_impl(
                 _pplx_cfg,
                 lambda text: anonymize_query_for_cloud(request, text),
                 None,
-                ResearchCloudConfig().perplexity_max_uses,
+                int(vertrag.grenze("perplexity_suchen")),
+                frist=laufzeit.rest,
             )
             # fetch_document kommt mit Perplexity: Perplexity findet das
             # Datenblatt, fetch_document liest es (WebFetch lieferte aus einem
             # PDF mit Textebene nichts Lesbares, Dev 02.10.2026).
-            pool_doc = PoolDocumentTool(ResearchCloudConfig().fetch_document_max_uses)
+            pool_doc = PoolDocumentTool(int(vertrag.grenze("dokument_abrufe")), frist=laufzeit.rest)
             pool_sdk_mcp_servers = {
                 MCP_SERVER_NAME: pool_pplx.server(),
                 DOC_MCP_SERVER_NAME: pool_doc.server(),
@@ -6328,7 +6339,7 @@ async def _execute_research_impl(
             prompt=research_prompt,
             append_system_prompt=library_append_prompt,
             model=request_body.model,
-            max_turns=request_body.max_turns,
+            max_turns=int(vertrag.grenze("iterationen")),
             allowed_tools=None,
             disallowed_tools=list(RESEARCH_TEXT_CONTRACT_DISALLOWED_TOOLS) if antwort_im_text else None,
             antwort_im_text=antwort_im_text,
@@ -7132,10 +7143,36 @@ async def _execute_research_cloud_impl(
         perplexity=perplexity_enabled(perplexity_cfg),
     )
     search_max_uses, fetch_max_uses = search_budget_for_depth(request_body.depth)
+    # Execution contract (src/research_vertrag.py): the admitted limits,
+    # lowered here only by what this path knows — the depth budget and the
+    # promotional cap — and said so; the response shows the values that bound.
+    from src.research_laufzeit import Laufzeit
+    from src.research_vertrag import PROMOTIONAL_CAP, VertragNichtDurchsetzbar, vertrag_fuer, vertrag_merken
+    try:
+        vertrag = vertrag_fuer(request, request_body, "cloud")
+    except VertragNichtDurchsetzbar as _v_err:
+        return ResearchResponse(
+            status="error", query=request_body.query, model=request_body.model,
+            execution_time_seconds=round(time.time() - start_time, 2),
+            error=str(_v_err), fehler_code=_v_err.fehler_code, retryable=_v_err.retryable,
+        )
+    vertrag = vertrag.senken("suchen", search_max_uses, "depth").senken("abrufe", fetch_max_uses, "depth")
+    if free_only:
+        vertrag = (
+            vertrag.senken("suchen", PROMOTIONAL_CAP["suchen"], "promotional")
+            .senken("abrufe", PROMOTIONAL_CAP["abrufe"], "promotional")
+        )
+    vertrag = vertrag_merken(request, vertrag)
+    laufzeit = Laufzeit.fuer_anfrage(request, hoechstens_s=vertrag.grenze("gesamtzeit_s"))
     config = ResearchCloudConfig(
         model=request_body.model if free_only else "claude-sonnet-5",
-        web_search_max_uses=min(search_max_uses, 3) if free_only else search_max_uses,
-        web_fetch_max_uses=min(fetch_max_uses, 3) if free_only else fetch_max_uses,
+        max_tokens=int(vertrag.grenze("ausgabe_tokens")),
+        max_continuations=int(vertrag.grenze("fortsetzungen")),
+        http_timeout_seconds=float(vertrag.grenze("transportzeit_s")),
+        web_search_max_uses=int(vertrag.grenze("suchen")),
+        web_fetch_max_uses=int(vertrag.grenze("abrufe")),
+        perplexity_max_uses=int(vertrag.grenze("perplexity_suchen")),
+        fetch_document_max_uses=int(vertrag.grenze("dokument_abrufe")),
         promotional_only=free_only,
     )
 
@@ -7187,6 +7224,7 @@ async def _execute_research_cloud_impl(
             anonymize=lambda text: anonymize_query_for_cloud(request, text),
             nachkontrolle=nachkontrolle,
             lauf_bezug=_research_lauf_bezug(request, attribution_ctx),
+            laufzeit=laufzeit,
         )
     except ResearchCloudModelAbbruch as e:
         return await _cloud_modell_abbruch_antwort(
@@ -7255,6 +7293,7 @@ async def _execute_research_cloud_impl(
             # The executor raises without the usage of the rounds before the
             # failure; the ledger row above books 0 for the same reason.
             usage_fehlt=USAGE_FEHLT_RESEARCH_CLOUD,
+            laufzeit=laufzeit.details(),
         )
 
     # The acceptance point on what the executor returned, too: whatever path
@@ -7369,6 +7408,7 @@ async def _execute_research_cloud_impl(
         antwort_quelle="text",
         antwort_ende=result.stop_reason,
         nachkontrolle=abgewaehlt_nk.status() if abgewaehlt_nk is not None else None,
+        laufzeit=laufzeit.details(),
         **_cloud_usage_felder(result.usage),
     )
 
@@ -7738,6 +7778,7 @@ async def _run_async_research_job(
             result = await _research_mit_finanzierungsvermerk(request, _execute_research_impl(
                 request_body, backend_config, attribution_ctx=attribution_ctx, request=request
             ))
+        result = _research_antwort_mit_vertrag(result, request, request_body)
         _save_research_job(job_id, {
             "status": "done" if result.status == "success" else "error",
             "started_at": started_at,
@@ -7837,6 +7878,43 @@ async def _cleanup_old_research_jobs() -> None:
             logger.warning(f"⚠️ Research job cleanup error: {e}", exc_info=True)
 
 
+def _research_antwort_mit_vertrag(antwort, request, request_body):
+    """Stamp the contract that bound this run (request.state.research_vertrag,
+    src/research_vertrag.py) onto the response — success and error alike."""
+    if not isinstance(antwort, ResearchResponse) or antwort.vertrag is not None:
+        return antwort
+    try:
+        from src.research_vertrag import vertrag_fuer
+        antwort.vertrag = vertrag_fuer(request, request_body).ausgabe()
+    except Exception as e:
+        logger.error(f"research: Vertrag nicht an die Antwort gestempelt: {e}")
+    return antwort
+
+
+def _vertrag_abgelehnt(request_body, fehler, vertrag: Optional[Dict[str, Any]]) -> JSONResponse:
+    """An admission refusal of the execution contract: HTTP 422 with the
+    ResearchResponse shape (status=error, fehler_code, retryable=false),
+    nothing started, no pool admission, no budget."""
+    antwort = ResearchResponse(
+        status="error", query=request_body.query, model=request_body.model,
+        error=str(fehler), fehler_code=fehler.fehler_code, retryable=fehler.retryable,
+        vertrag=vertrag,
+    )
+    return JSONResponse(status_code=422, content=antwort.model_dump())
+
+
+@app.get("/v1/research/vertrag")
+async def research_vertrag_lesen(
+    request: Request,
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(security)
+):
+    """The execution contract of /v1/research, readable before admission:
+    version, server ceilings, per-path capabilities (src/research_vertrag.py)."""
+    await verify_api_key(request, credentials)
+    from src.research_vertrag import beschreibung
+    return beschreibung()
+
+
 @app.post("/v1/research", response_model=ResearchResponse)
 async def research(
     request_body: ResearchRequest,
@@ -7914,6 +7992,33 @@ async def research(
             query=request_body.query,
             model=resolved_model,
             error=f"Model '{resolved_model}' has no price in the billing table and is blocked (no silent zero-cost serving). Add it to src/pricing.py MODEL_PRICING or use a priced model."
+        )
+
+    # EXECUTION CONTRACT, step 1 (src/research_vertrag.py): decided once from
+    # the server ceilings and the caller's wish, before routing, pool
+    # admission and budget. A wish naming another version that cannot be
+    # taken over unchanged is refused here — nothing runs under limits the
+    # caller did not read.
+    from src.research_vertrag import (
+        VertragNichtDurchsetzbar,
+        VertragVersionAbweichend,
+        beschreibung as _vertrag_beschreibung,
+        vertrag_annehmen,
+    )
+    try:
+        _research_vertrag = vertrag_annehmen(request, request_body)
+    except VertragVersionAbweichend as _v_err:
+        return _vertrag_abgelehnt(request_body, _v_err, _vertrag_beschreibung())
+    except (ValueError, TypeError) as _v_err:
+        # An unusable wish that passed pydantic (e.g. a non-object) — same
+        # shape as every other admission refusal, no code of its own.
+        return JSONResponse(
+            status_code=422,
+            content=ResearchResponse(
+                status="error", query=request_body.query, model=request_body.model,
+                error=f"research contract wish unusable: {_v_err}", retryable=False,
+                vertrag=_vertrag_beschreibung(),
+            ).model_dump(),
         )
 
     # PER-USER PROVIDER OVERRIDE: same enforcement as chat completions —
@@ -8176,6 +8281,15 @@ async def research(
         f"-> use_research_cloud={_use_research_cloud}"
     )
 
+    # EXECUTION CONTRACT, step 2: the routed path's view. A wish for a limit
+    # this path cannot enforce is refused NOW — before pool admission, backend
+    # and budget — never executed as an apparent promise, never rerouted.
+    try:
+        _research_vertrag = _research_vertrag.fuer_pfad("cloud" if _use_research_cloud else "pool")
+        request.state.research_vertrag = _research_vertrag
+    except VertragNichtDurchsetzbar as _v_err:
+        return _vertrag_abgelehnt(request_body, _v_err, _research_vertrag.ausgabe())
+
     # ---- POOL ADMISSION ----------------------------------------------------
     # Every subscription-pool capacity gate lives HERE, after the execution
     # path is resolved, and applies ONLY to the pool-bound branch.
@@ -8287,6 +8401,7 @@ async def research(
             # dispatch for a legacy (pre-heartbeat) file.
             "heartbeat_at": time.time(),
             "query": request_body.query[:100],
+            "vertrag": _research_vertrag.ausgabe(),
         })
         asyncio.create_task(_run_async_research_job(
             request_body, backend_config, job_id, attribution_ctx=_research_attr,
@@ -8298,6 +8413,7 @@ async def research(
             query=request_body.query,
             model=request_body.model,
             request_id=job_id,
+            vertrag=_research_vertrag.ausgabe(),
         )
 
     # Sync path: execute and return the full result
@@ -8319,10 +8435,11 @@ async def research(
         lauf = _research_mit_finanzierungsvermerk(request, _execute_research_impl(
             request_body, backend_config, attribution_ctx=_research_attr, request=request
         ))
-    return await unter_job_aufsicht(
+    antwort = await unter_job_aufsicht(
         request, lauf, attribution=_research_attr,
         model=request_body.model, endpunkt="/v1/research",
     )
+    return _research_antwort_mit_vertrag(antwort, request, request_body)
 
 
 @app.get("/v1/research/async/{request_id}", response_model=AsyncResearchStatus)

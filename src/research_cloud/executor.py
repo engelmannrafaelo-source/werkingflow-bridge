@@ -33,6 +33,15 @@ from typing import Any, Awaitable, Callable, Dict, List, Optional
 import httpx
 
 from src.lauf_abschluss import LaufUnfertig, ModellAbbruch, abschluss_aus_stop_reason, annehmen
+from src.research_laufzeit import (
+    LAUFZEIT_ERSCHOEPFT,
+    PRUEFER_MIN_REST_S,
+    RUECKRUNDE_MIN_REST_S,
+    Laufzeit,
+    LaufzeitErschoepft,
+    RestfristErschoepft,
+    unter_restfrist,
+)
 from src.research_cloud.anonymize_gate import (
     CloudAnonymizeError,
     Sperrstand,
@@ -185,6 +194,16 @@ class ResearchCloudExecutorError(Exception):
     def __init__(self, message: str, *, status_code: Optional[int] = None):
         super().__init__(message)
         self.status_code = status_code
+
+
+class ResearchCloudLaufzeitErschoepft(ResearchCloudExecutorError):
+    """The run reached its overall deadline (contract gesamtzeit_s) in a
+    mandatory round, or a Messages-API/tool call was abandoned at it. The
+    bridge stopped waiting; whether the remote side still works is not
+    known and is not claimed. No partial report."""
+
+    fehler_code = LAUFZEIT_ERSCHOEPFT
+    retryable = False
 
 
 class ResearchCloudModelAbbruch(ResearchCloudExecutorError):
@@ -414,6 +433,30 @@ async def _handle_library_tool_call(
         }
 
 
+def _transport_timeout(
+    exc: BaseException, aufruf_timeout: float, config: ResearchCloudConfig,
+    laufzeit: Optional[Laufzeit], phase: str, iteration: int,
+) -> ResearchCloudExecutorError:
+    """A Messages-API call that did not answer in time. At the run's deadline
+    (the call was shortened below the transport time) that is the deadline;
+    otherwise the transport limit. Either way the bridge stopped waiting —
+    whether the API still works on the request is not known."""
+    if laufzeit is not None and aufruf_timeout < float(config.http_timeout_seconds):
+        fehler: ResearchCloudExecutorError = ResearchCloudLaufzeitErschoepft(
+            f"research-cloud Messages API call ({phase}, iteration {iteration}) abandoned after "
+            f"{aufruf_timeout:.0f} s at the run's overall deadline of {laufzeit.frist_s:.0f} s — "
+            "the bridge stopped waiting, the remote call may still be running; no partial report"
+        )
+    else:
+        fehler = ResearchCloudExecutorError(
+            f"research-cloud Messages API call ({phase}, iteration {iteration}) did not answer within "
+            f"transportzeit_s={float(config.http_timeout_seconds):.0f} s — the bridge stopped waiting, "
+            "the remote call may still be running; no partial report"
+        )
+    fehler.__cause__ = exc
+    return fehler
+
+
 async def run_research_cloud(
     query: str,
     system_prompt: str,
@@ -429,8 +472,17 @@ async def run_research_cloud(
     fetch_document_kwargs: Optional[Dict[str, Any]] = None,
     nachkontrolle: Optional[Nachkontrolle] = None,
     lauf_bezug: Optional[str] = None,
+    laufzeit: Optional[Laufzeit] = None,
 ) -> ResearchCloudResult:
     """Run one research-cloud job to completion (all pause_turn continuations).
+
+    ``laufzeit`` (P6-VERTRAG): the run's ONE deadline. Every Messages-API
+    call waits at most min(http_timeout_seconds, remaining time); every
+    client tool (perplexity_search, fetch_document, library), the gap
+    checker and the re-check wait at most the remaining time; the optional
+    rounds start only when enough remains (named in nachkontrolle); a
+    mandatory round that reaches it ends the run with
+    ResearchCloudLaufzeitErschoepft. Nothing here starts a new deadline.
 
     Fail loud: raises ResearchCloudExecutorError if ANTHROPIC_API_KEY is unset
     or the Messages API returns a non-200, or the loop exhausts
@@ -556,6 +608,21 @@ async def run_research_cloud(
     usage_vor_rueckrunde: Optional[ResearchCloudUsage] = None
     t0 = time.monotonic()
     parsed: Optional[AnthropicMessagesResponse] = None
+    rest = laufzeit.rest if laufzeit is not None else None
+
+    async def _unter_rest(arbeit, was: str):
+        try:
+            return await unter_restfrist(arbeit, rest, was)
+        except RestfristErschoepft as e:
+            raise ResearchCloudLaufzeitErschoepft(str(e)) from e
+
+    def _lz_beginne(runde: str) -> None:
+        if laufzeit is not None:
+            laufzeit.beginne(runde)
+
+    def _lz_beende(runde: str) -> None:
+        if laufzeit is not None:
+            laufzeit.beende(runde)
 
     owns_client = client is None
     http_client = client or httpx.AsyncClient(timeout=config.http_timeout_seconds)
@@ -565,7 +632,22 @@ async def run_research_cloud(
         try:
             while True:
                 try:
-                    for iteration in range(config.max_continuations):
+                    # Continuations: the run-wide budget (contract
+                    # fortsetzungen, counted over every round — a client's
+                    # limit does not reset in the return round) and the
+                    # per-round cap.
+                    runden_budget = min(
+                        config.max_continuations_je_runde,
+                        config.max_continuations - gesamt_iterationen,
+                    )
+                    if runden_budget <= 0:
+                        raise ResearchCloudExecutorError(
+                            f"research-cloud executor: the run's continuation budget "
+                            f"max_continuations={config.max_continuations} is used up before "
+                            f"the {phase} round ({gesamt_iterationen} calls so far)"
+                        )
+                    _lz_beginne(phase)
+                    for iteration in range(runden_budget):
                         _mark_cache_control(messages)
                         body: Dict[str, Any] = {
                             "model": config.model,
@@ -584,13 +666,24 @@ async def run_research_cloud(
                             # "container_id is required..." (eval-verified 2026-07-24).
                             body["container"] = container_id
 
+                        # This call waits at most the contract's transport time,
+                        # and never past the run's deadline.
+                        aufruf_timeout = float(config.http_timeout_seconds)
+                        if laufzeit is not None:
+                            try:
+                                aufruf_timeout = min(aufruf_timeout, laufzeit.frist_fuer(phase))
+                            except LaufzeitErschoepft as e:
+                                raise ResearchCloudLaufzeitErschoepft(str(e)) from e
+
                         if config.promotional_only:
                             from fastapi import HTTPException
                             from src.providers.credit_pool import PinnedAccountLost, PoolUnavailable, post_messages
                             try:
                                 response, pool_meta = await post_messages(
-                                    body, config.http_timeout_seconds, pin=pool_pin
+                                    body, aufruf_timeout, pin=pool_pin
                                 )
+                            except httpx.TimeoutException as exc:
+                                raise _transport_timeout(exc, aufruf_timeout, config, laufzeit, phase, iteration)
                             except HTTPException as exc:
                                 logger.error(
                                     f"research-cloud pool call refused: runde={phase} iteration={iteration} "
@@ -622,7 +715,12 @@ async def run_research_cloud(
                                 f"lauf={lauf_bezug}"
                             )
                         else:
-                            response = await http_client.post(ANTHROPIC_API_URL, headers=headers, json=body)
+                            try:
+                                response = await http_client.post(
+                                    ANTHROPIC_API_URL, headers=headers, json=body, timeout=aufruf_timeout
+                                )
+                            except httpx.TimeoutException as exc:
+                                raise _transport_timeout(exc, aufruf_timeout, config, laufzeit, phase, iteration)
                         if response.status_code != 200:
                             raise ResearchCloudExecutorError(
                                 f"research-cloud Messages API call failed: HTTP {response.status_code}: "
@@ -708,9 +806,9 @@ async def run_research_cloud(
                                         })
                                         continue
                                     perplexity_calls += 1
-                                    tool_result, answer = await _handle_perplexity_tool_call(
+                                    tool_result, answer = await _unter_rest(_handle_perplexity_tool_call(
                                         tool_block, perplexity_cfg, anonymize, pplx_client, sperre
-                                    )
+                                    ), "perplexity_search")
                                     if answer is not None:
                                         if answer.kosten_usd is None:
                                             perplexity_cost_missing += 1
@@ -731,9 +829,9 @@ async def run_research_cloud(
                                     continue
                                 if tool_block.get("name") == FETCH_DOCUMENT_TOOL_NAME:
                                     try:
-                                        text = await fetch_document(
+                                        text = await _unter_rest(fetch_document(
                                             tool_block.get("input") or {}, doc_counters, **(fetch_document_kwargs or {})
-                                        )
+                                        ), "fetch_document")
                                         tool_results.append({
                                             "type": "tool_result", "tool_use_id": tool_block.get("id"),
                                             "content": [{"type": "text", "text": text}],
@@ -744,9 +842,9 @@ async def run_research_cloud(
                                             "content": [{"type": "text", "text": f"fetch_document: {e}"}],
                                         })
                                     continue
-                                tool_result = await _handle_library_tool_call(
+                                tool_result = await _unter_rest(_handle_library_tool_call(
                                     tool_block, library_cfg, library_index or {}
-                                )
+                                ), "library")
                                 library_calls += 1
                                 _log_library_call(tool_block, tool_result, time.monotonic() - t_start)
                                 tool_results.append(tool_result)
@@ -820,10 +918,13 @@ async def run_research_cloud(
                         ]
                     else:
                         raise ResearchCloudExecutorError(
-                            f"research-cloud executor exceeded max_continuations="
-                            f"{config.max_continuations} without finishing (still {parsed.stop_reason})"
+                            f"research-cloud executor exceeded max_continuations={config.max_continuations} "
+                            f"(Lauf; je Runde {config.max_continuations_je_runde}; this {phase} round had "
+                            f"{runden_budget}, {gesamt_iterationen} used before) without finishing "
+                            f"(still {parsed.stop_reason})"
                         )
                 except ResearchCloudExecutorError as e:
+                    _lz_beende(phase)
                     # Privacy check point: a gate that broke in this round ends the
                     # run with its error — in the return round too; the report from
                     # before is not handed out as a success then.
@@ -840,6 +941,7 @@ async def run_research_cloud(
                     logger.error(f"research-cloud: Rückrunde fehlgeschlagen, Bericht von vorher bleibt: {e}")
                     parsed = vorher_parsed
                     break
+                _lz_beende(phase)
                 gesamt_iterationen += iteration + 1
                 sperre_pruefen(sperre, fehler_typ=ResearchCloudExecutorError)
                 if nachkontrolle is None:
@@ -856,16 +958,53 @@ async def run_research_cloud(
                         logger.error(f"research-cloud: {nachkontrolle.rueckrunde_fehler}")
                         parsed = vorher_parsed
                         break
-                    await nachkontrolle.nachmessen(
-                        neu, protokoll_aus_cloud_nachrichten(base_messages + [{"role": "assistant", "content": parsed.content}])
+                    # The re-check only when the remaining time allows; a
+                    # re-check abandoned at the deadline is named, the
+                    # revised report stays (same as the pool path).
+                    if laufzeit is not None and not laufzeit.reicht(PRUEFER_MIN_REST_S):
+                        nachkontrolle.ueberspringen(
+                            "nachmessung",
+                            f"laufzeit: {laufzeit.rest():.0f} s Rest, Nachmessung braucht {PRUEFER_MIN_REST_S:.0f} s",
+                        )
+                        break
+                    _lz_beginne("nachmessung")
+                    try:
+                        await _unter_rest(nachkontrolle.nachmessen(
+                            neu, protokoll_aus_cloud_nachrichten(base_messages + [{"role": "assistant", "content": parsed.content}])
+                        ), "nachmessung")
+                    except ResearchCloudLaufzeitErschoepft as e:
+                        nachkontrolle.ueberspringen("nachmessung", str(e))
+                    finally:
+                        _lz_beende("nachmessung")
+                    break
+                # Optional rounds start only when the remaining time is enough
+                # for them — skipped and named otherwise, never started to
+                # overrun (research_laufzeit, same rule as the pool path).
+                if laufzeit is not None and not laufzeit.reicht(PRUEFER_MIN_REST_S):
+                    nachkontrolle.ueberspringen(
+                        "pruefung", f"laufzeit: {laufzeit.rest():.0f} s Rest, Prüfung braucht {PRUEFER_MIN_REST_S:.0f} s",
                     )
                     break
-                offene = await nachkontrolle.entscheide(
-                    _report_text(parsed),
-                    protokoll_aus_cloud_nachrichten(base_messages + [{"role": "assistant", "content": parsed.content}]),
-                    perplexity_rest=config.web_search_max_uses if config.promotional_only else config.perplexity_max_uses - perplexity_calls,
-                )
+                _lz_beginne("pruefer")
+                try:
+                    offene = await _unter_rest(nachkontrolle.entscheide(
+                        _report_text(parsed),
+                        protokoll_aus_cloud_nachrichten(base_messages + [{"role": "assistant", "content": parsed.content}]),
+                        perplexity_rest=config.web_search_max_uses if config.promotional_only else config.perplexity_max_uses - perplexity_calls,
+                    ), "pruefung")
+                except ResearchCloudLaufzeitErschoepft as e:
+                    nachkontrolle.ueberspringen("pruefung", str(e))
+                    break
+                finally:
+                    _lz_beende("pruefer")
                 if not offene:
+                    break
+                if laufzeit is not None and not laufzeit.reicht(RUECKRUNDE_MIN_REST_S + PRUEFER_MIN_REST_S):
+                    nachkontrolle.ueberspringen(
+                        "rueckrunde",
+                        f"laufzeit: {laufzeit.rest():.0f} s Rest, Rückrunde und Nachmessung brauchen "
+                        f"{RUECKRUNDE_MIN_REST_S + PRUEFER_MIN_REST_S:.0f} s",
+                    )
                     break
                 phase = "rueckrunde"
                 vorher_parsed = parsed
@@ -893,6 +1032,8 @@ async def run_research_cloud(
                 raise
             raise gewinner from e
     finally:
+        if laufzeit is not None:
+            laufzeit.beende_alle()
         if owns_client:
             await http_client.aclose()
         if owns_pplx_client and pplx_client is not None:

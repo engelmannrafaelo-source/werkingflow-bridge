@@ -15,6 +15,7 @@ Keine Zugangsdaten in Dokumentation oder Quellcode eintragen.
 |---------|----------|-------|
 | POST | `/v1/chat/completions` | OpenAI-kompatible KI-Anfragen |
 | POST | `/v1/research` | Recherche |
+| GET | `/v1/research/vertrag` | Ausfuehrungsvertrag der Recherche (Version, Grenzen, Capabilities) |
 | GET | `/v1/research/{session_id}/content` | Recherche-Ergebnis abrufen |
 | GET | `/v1/models` | Verfuegbare Modelle |
 | GET | `/health` | Erreichbarkeit pruefen |
@@ -29,6 +30,12 @@ nicht. Modelle aus der Modellliste der Zielumgebung beziehen.
 `quick`, `standard`, `deep` und `exhaustive`. Die Antwort kann den Inhalt direkt
 enthalten und eine `session_id` fuer den spaeteren Download liefern.
 Laufzeit und Ausgabeumfang haengen von Anfrage, Modell und Auslastung ab.
+
+Die Grenzen eines Laufs (Ausgabe, Turns/Fortsetzungen, Such-/Abrufdeckel,
+Gesamt- und Transportzeit) stehen versioniert in `GET /v1/research/vertrag`;
+mit dem Requestfeld `vertrag` senkt ein Aufrufer sie, nie erhoeht er sie. Die
+Antwort nennt im Feld `vertrag`, was tatsaechlich galt. Einzelheiten:
+[docs/contracts/research-vertrag.md](docs/contracts/research-vertrag.md).
 
 Fuer App-Integration den bestehenden Bridge-Client der Anwendung verwenden.
 Auf Dev und Partner stehen zusaetzlich vorkonfigurierte Recherche-Kommandos
