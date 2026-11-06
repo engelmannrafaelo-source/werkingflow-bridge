@@ -118,3 +118,16 @@ Nachtrag 06.11.2026 (Zweig fix/schema-generator-rest-20261106, Basis develop dde
 - Tests tests/billing + tests/budget: Basis develop 14 failed/431 passed/11 skipped,
   neu 14 failed/447 passed/11 skipped; Rotmenge identisch (vorbestehend:
   TestDeterminesTaxRate, Rechnung/Pending-Order).
+- Gegenprobe 06.11. gegen Wegwerf-Postgres (postgres:16-alpine, lokal, danach
+  entfernt; keine Bridge-DB berührt): alle Migrationen 001..076 in Reihenfolge
+  je Datei als eigene Transaktion fehlerfrei; Katalogzeile schema-generator
+  0/0/sellable=f/budget_plan_id=report-standard; reload_plans +
+  assert_catalog_is_unambiguous grün. Ablauf mit abgeschalteter platform-api
+  (Direkt-DB-Rückfall): Neunutzer 2x Gate -> beide allowed/trial_active, genau
+  EIN Trial {limitEur 5.0, usedEur 0}; Abzug 0.5 mit Schlüssel K -> gebucht,
+  Wiederholung K -> duplicate, K mit 0.7 -> DeductionKeyConflict, K über
+  report-standard -> duplicate; Ergebnis usedEur 0.5, eine budget_deductions-
+  Zeile (report-standard, 0.5). Neunutzer direkt Abzug ohne Gate ->
+  BUDGET_EXCEEDED, 0 user_budgets-Zeilen, 0 verbrannte Schlüssel.
+  Probe-Skript nicht eingecheckt (Testregel 20.10.); kein Beleg des HTTP-/
+  Principal-/JWT-Livewegs und keiner platform-api-Aliasfähigkeit im Betrieb.
