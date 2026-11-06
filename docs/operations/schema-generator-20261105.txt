@@ -35,7 +35,7 @@ Regulärer NichtProd-Auslieferungsweg (hier NICHT ausgeführt):
    (bin/bridge-migrate.sh: je Datei eine eigene Transaktion, lexikografisch;
    074 ist auf develop bereits 074_bridge_account_policy.sql).
    Vorhandene Katalogzeile bei erneutem Lauf vergleichen, nicht blind ändern.
-3. Katalog in allen beteiligten Prozessen laden/verifizieren.
+3. 076 legt die Katalogzeile INAKTIV an (is_active=FALSE, 06.11.2026: sonst booten Prozesse mit altem Code, auch nach Auto-Rollback, nicht). Aktivierung bewusst erst nach Rollout und Principal: UPDATE plans SET is_active=TRUE WHERE id='schema-generator'; danach reload/Neustart und Katalog in allen Prozessen verifizieren.
 4. Vorhandenen technischen Check-Nutzer aus dessen Infisical-Referenz lesen;
    Budget/Limits/Verbrauch vorher sichern (Metadaten, keine Secretwerte).
    Regulärer transaktionaler Admin-grant für App/Plan oben, kein Seed-/Checkout.
@@ -70,7 +70,7 @@ Regulärer NichtProd-Auslieferungsweg (hier NICHT ausgeführt):
    Mail zunächst nicht konfigurieren. c760 führt genau einen vorgesehenen
    mailfreien Textlauf mit Workflow-ID, Ledger und Ergebnis durch.
 
-Prüfung: 16 neue synthetische Fälle +43 bestehende Fälle =59 bestanden.
+Prüfung: Entwurfstests (16 synthetische Fälle) wurden vor der Integration auf develop entfernt (Testregel 20.10.: kein Unit-Test je Fix); Nachweis siehe Befundtabelle in der Bauer-Lieferung 06.11. und Pyramiden-Szenario.
 Erfasst: Alias-Kataloginvarianten,1000!=100, fehlenderTopf ohneTrial, unverändertes
 Grant-Budget, identischerUser, sequentielle Schema/Report-Abbuchung auf gesperrter
 Zeile, fehlendesProdukt/Identität/Budgetserver. Keine echte DB-/Migration-/
