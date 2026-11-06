@@ -498,7 +498,12 @@ function M.choose(opts)
     local req_len = tonumber(ngx.var.request_length) or 1000
     local est_tokens = math.max(500, math.floor(req_len / 4))
     local selected, data, selection_reason = require("bridge_account_selection").select(
-        est_tokens, worker_ok, ngx.var.bridge_policy_hopped == "1", ngx.var.http_x_bridge_account)
+        est_tokens, worker_ok,
+        -- Local-only pick: a real peer policy hop, or werking-energy on the dev
+        -- LB with ENERGY_SUBSCRIPTION_NO_HOP=1 ($energy_policy_local_only is
+        -- generated only there; undefined elsewhere -> nil -> unchanged).
+        ngx.var.bridge_policy_hopped == "1" or ngx.var.energy_policy_local_only == "1",
+        ngx.var.http_x_bridge_account)
     if not data then
         ngx.var.target_worker = "unavailable"
         ngx.var.x_pool_decision = selection_reason

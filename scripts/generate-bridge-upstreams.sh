@@ -569,6 +569,23 @@ map "\$bridge_hopped:\$http_x_vision_provider:\$http_x_app_id" \$llm_backend_poo
 }
 MAP
         fi
+        # E1 (06.11.2026): the pool map above does not reach the operator
+        # account picker (pool_router.choose -> bridge_account_selection) on
+        # chat/research. A picked account on a non-local worker routed
+        # werking-energy to bridge_policy_peer anyway (measured 06.11.2026
+        # 21:33Z: X-Bridge-Served-By prod/…, funding_policy promotional_only).
+        # This variable makes the picker treat Energy like a real policy hop:
+        # LOCAL workers only. Emitted ONLY here — on production and on primary
+        # with the switch off nginx never defines it, Lua reads nil, nothing
+        # changes (docs/contracts/energy-abo-bildweg.md §3).
+        echo "# Account picker (pool_router.lua): werking-energy may only pick an"
+        echo "# account on a LOCAL worker — never bridge_policy_peer (E1, 06.11.2026)."
+        cat <<MAP
+map \$http_x_app_id \$energy_policy_local_only {
+    default 0;
+    "~*^${ENERGY_APP_RE}" 1;
+}
+MAP
     elif [ "$id" = "primary" ] && [ "$(primary_peer_hop)" = 0 ]; then
         echo "# primary, PRIMARY_PEER_HOP=0 (DEFAULT since 03.11.2026, KD-Entscheid):"
         echo "# NO peer-first. Dev/staging load stays on the dev pool and the dev"

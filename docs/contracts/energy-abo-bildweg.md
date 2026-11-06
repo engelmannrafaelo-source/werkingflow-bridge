@@ -199,6 +199,18 @@ regelt das:
 - Weitere Routen ohne Energy-Sonderfall, weil sie den Peer nicht über die
   Priorität erreichen: `/v1/erkunder/` ist immer lokal; Job-Polls und
   -Abbrüche folgen dem Heimatmarker; `/health/production` ist eine Probe.
+- Betreiber-Kontowahl (E1, 06.11.2026): Auf chat/research wählt
+  `pool_router.choose` → `bridge_account_selection.select` das Konto; ein
+  Konto auf einem nicht lokalen Worker führt dort zu `bridge_policy_peer`,
+  unabhängig von `$llm_backend_pool`. Gemessen 06.11. 21:33Z: Energy-Abo-Aufruf
+  mit `X-Bridge-Served-By prod/…`, `funding_policy promotional_only`. Deshalb
+  erzeugt der Generator nur bei primary + Schalter 1 zusätzlich
+  `$energy_policy_local_only` (werking-energy, Groß/Klein egal); die Kontowahl
+  behandelt das wie einen echten Policy-Hop und wählt nur lokale Worker. Ist dort
+  kein Konto frei, gilt das bestehende Muster (`all_unavail` →
+  `@pool_exhausted_response`, nie Peer). Ohne Schalter und auf dem Prod-LB ist die
+  Variable undefiniert (Lua liest `nil`), Verhalten unverändert. Beleg:
+  `tests/nginx/test_energy_policy_local_only.py` (echte OpenResty + echtes Lua).
 - `upstreams-prod.conf` bleibt immer byte-identisch.
 - Echte OpenResty (`tests/nginx/test_energy_subscription_no_hop_e2e.sh`,
   Stubs im Docker-Testnetz, kein Netz außerhalb), mit Schalter 1 und beiden
