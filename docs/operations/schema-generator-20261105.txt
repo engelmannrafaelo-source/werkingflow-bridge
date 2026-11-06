@@ -12,16 +12,28 @@ Dieser Patch kopiert keinen dieser Werte: Limit, usedEur, resetAt bleiben am
 bestehenden Topf. Der normale Monatsrollover bleibt bestehen; die Einrichtung
 resettiert nichts. Alte Report-/Check-Abbuchungen und neue Schema-Abbuchungen
 nehmen dieselbe Zeilensperre und denselben Budgetschlüssel.
-Kein neuer Trial/Topf bei fehlender Zuordnung; Operatorgrant scheitert dann.
+Kein neuer Topf bei fehlender Zuordnung; Operatorgrant scheitert dann.
 Bereits vorhandene Trials angemeldeter Nutzer werden mit unverändertem
-Verbrauch und Ablauf wiederverwendet; fehlende Trials werden nicht erzeugt.
+Verbrauch und Ablauf wiederverwendet (auch abgelaufene: kein Reset).
+Erstnutzung (Stand 06.11., Commit "Fix schema first use through canonical
+Check trial provisioning"): ein neu registrierter Nutzer OHNE report-standard
+und OHNE Trial bekommt im Gate genau den BESTEHENDEN Lazy-Trial des kanonischen
+Plans (src/budget/routes.py evaluate_budget -> find_trial_plan_for
+('report-standard') -> Katalogplan 'trial', api_budget_eur aus dem Katalog
+(Migration 020: 5 EUR), _provision_trial INSERT ... WHERE Schluessel IS NULL).
+Kein Alias-Topf, kein 100/1000-EUR-Topf, kein neuer Tarif. Die Abbuchung
+(apply_budget_deduction) legt fuer den Alias selbst NIE etwas an; fehlt
+Topf und Trial dort, BUDGET_EXCEEDED.
 Schema-Gate schließt bei fehlendem Produkt/Identität/Budgetdaten. Projekt-Credit-
 Aliases behalten die bisherigen same-app/Projektregeln.
 
 Regulärer NichtProd-Auslieferungsweg (hier NICHT ausgeführt):
 1. Aliasfähigen Code in platform-api UND auf allen beteiligten Workern regulär
    aus geprüftem Commit ausliefern. Mischstände vor Aktivierung ausschließen.
-2. 074 (nur Enum) committen, danach075 (Katalog), regulärer Migrationsmechanismus.
+2. 075_schema_generator_ids.sql (nur Enum) committen, danach
+   076_schema_generator_catalog.sql (Katalog), regulärer Migrationsmechanismus
+   (bin/bridge-migrate.sh: je Datei eine eigene Transaktion, lexikografisch;
+   074 ist auf develop bereits 074_bridge_account_policy.sql).
    Vorhandene Katalogzeile bei erneutem Lauf vergleichen, nicht blind ändern.
 3. Katalog in allen beteiligten Prozessen laden/verifizieren.
 4. Vorhandenen technischen Check-Nutzer aus dessen Infisical-Referenz lesen;
@@ -31,6 +43,27 @@ Regulärer NichtProd-Auslieferungsweg (hier NICHT ausgeführt):
    Anlass zur automatisch neuen100EUR- oder1000EUR-Finanzierung.
 5. Principal-Scope serverseitig regulär einrichten; keine Keywerte senden oder
    kopieren. Website-Adapter erhält App-ID erst als LIVE eingerichtet bestätigt.
+   Belegter Weg (Code-Stand develop ddec1ef):
+   a) Ein BESTEHENDES Principal um eine App ERWEITERN hat keinen regulären Weg:
+      src/principals_routes.py kennt nur create / list / rotate / set-active;
+      scripts/sync-principals.sh fügt nur fehlende NAMEN ein (nie Update) und
+      bricht bei gleichem Namen mit abweichendem Scope ab (exit 1);
+      scripts/check-principal-drift.sh vergleicht apps=... je Host. Ein
+      SQL-Update auf einem Host erzeugt also Drift. Nicht so machen.
+   b) Regulär: NEUES env-benanntes Principal (Konvention seit 07.07., z.B.
+      'schema-generator-dev') per POST /v1/admin/service-principals (Admin-JWT)
+      mit allowed_apps=["werking-schema-generator"], allowed_paths = genau die
+      vom Website-Adapter benutzten Pfade (offen: Pfadliste vom Adapter-Owner),
+      monthly_cap_eur optional. Token wird EINMAL zurückgegeben -> sofort in den
+      Infisical-Pfad des Aufrufers (R-H-Secret-Create = externe Grenze KD).
+   c) Danach scripts/sync-principals.sh (DRY_RUN=true zuerst; bridge-deploy.sh
+      Phase 3.6) verteilt den Namen auf alle Hosts; scripts/check-principal-
+      drift.sh muss exit 0 liefern. Soll das Principal NUR auf dev leben:
+      Name in scripts/principals-dev-only.txt eintragen (mit Begründung).
+   d) Laufzeitprüfung: src/auth.py:610 principal.may_use_app(X-App-ID) und
+      :615 may_use_path; Website muss X-App-ID: werking-schema-generator und
+      die echte User-UUID (X-User-ID) senden, sonst 400 missing_billing_identity
+      (src/budget/gate.py, strict_monthly).
 6. Vorher/Nachher: exakt gleiche Budgetschlüssel/Limit/Verbrauch/Anker;
    Subscription active mit App/Plan, gültiger Principal, Host/Deployment-SHA.
 7. R-H-Secret+Stagingroute separat nach legitimem Operatoranschluss;
@@ -63,3 +96,25 @@ kein verfuegbares Kontingent), keine fingierte Erschoepfung oder Neubuchung.
 Beim Zusatztest sichtbar: bestehender Float-Rechner kann0.6 bei rechnerisch
 0.5999999999999996 Rest vorzeitig ablehnen. Kein Ueberziehen; nicht durch diese
 Aenderung behoben. Alias-Regressionsfall verwendet exakt darstellbare0.5+0.5.
+
+Nachtrag 06.11.2026 (Zweig fix/schema-generator-rest-20261106, Basis develop ddec1ef)
+- Migrationen 074/075 -> 075/076 umnummeriert (Kollision 074_bridge_account_policy).
+- Idempotenz: Monatsabbuchung je Modellaufruf über budget_deductions
+  (src/budget/deduction_keys.py claim/record, Schlüssel = call_uid aus
+  src/activity/ai_call_writer.py; Spool-Replay nutzt dieselbe call_uid).
+  Der Alias wird VOR dem claim auf report-standard normalisiert
+  (apply_budget_deduction), Wiederholung = gleicher Plan -> duplicate, kein
+  zweiter Abzug. Trial-Erstanlage ist per ON CONFLICT ... WHERE NULL
+  wiederholsicher; Operatorgrant (_ensure_monthly_budget_pot) liest für Aliase
+  nur. Eine erneut gesendete HTTP-Anfrage ist ein neuer Modellaufruf und wird
+  korrekt erneut belastet; Job-Wiederholungen dedupliziert src/jobs/store.py
+  (idempotency_owner+key). project_id spielt für den Alias keine Rolle: der
+  Katalog hat für die App nur den Monatsplan (kein interval=project).
+- Nicht gebaut, offen: identity/routes.py _REGISTER_ALLOWED_APP_IDS enthält die
+  neue App bewusst NICHT (keine eigene Registrierung; Nutzer kommen über Check/
+  Report). Entscheid nötig, falls die Website Nutzer direkt unter dieser App
+  registrieren soll.
+- Float-Randnotiz unverändert offen (s.o.), nicht Teil dieses Pakets.
+- Tests tests/billing + tests/budget: Basis develop 14 failed/431 passed/11 skipped,
+  neu 14 failed/447 passed/11 skipped; Rotmenge identisch (vorbestehend:
+  TestDeterminesTaxRate, Rechnung/Pending-Order).
