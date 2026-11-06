@@ -70,8 +70,9 @@ def main():
     with (directory / (key + '.lock')).open('a') as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         if path.exists():
+            previous = json.loads(path.read_text())
             print('infra-fix: existing incident ' + key + '; inspect receipt before any resend')
-            return 0
+            return 0 if previous.get('state') == 'delivered_pending_acceptance' else 1
         state = {'incidentId': key, 'ownerSessionId': owner, 'createdAt': time.time(),
                  'label': label, 'summary': summary, 'state': 'sending', 'accepted': False}
         def persist():
