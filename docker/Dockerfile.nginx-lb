@@ -3,7 +3,7 @@ FROM openresty/openresty:1.27.1.1-alpine
 # envsubst needed for ${BRIDGE_PROD_HOST}/${BRIDGE_ID} template substitution
 # (replicates the nginx:alpine behavior used in the original service)
 # perl required by opm package manager.
-RUN apk add --no-cache gettext curl perl
+RUN apk add --no-cache ca-certificates gettext curl perl
 
 # lua-resty-http — used by pool_router.lua to fetch /v1/metrics/account-pool-state.
 # VENDORED (docker/lua-vendor/resty, pinned v0.17.2, MIT) instead of a
