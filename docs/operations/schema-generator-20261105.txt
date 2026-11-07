@@ -51,7 +51,8 @@ Regulärer NichtProd-Auslieferungsweg (hier NICHT ausgeführt):
       scripts/check-principal-drift.sh vergleicht apps=... je Host. Ein
       SQL-Update auf einem Host erzeugt also Drift. Nicht so machen.
    b) Regulär: NEUES env-benanntes Principal (Konvention seit 07.07., z.B.
-      'schema-generator-dev') per POST /v1/admin/service-principals (Admin-JWT)
+      'schema-generator-dev') per POST /v1/admin/service-principals (regulaerer Operator: vorhandener
+      X-Bridge-Service-Token ohne X-User-ID; alternativ echter Admin-JWT)
       mit allowed_apps=["werking-schema-generator"], allowed_paths = genau die
       vom Website-Adapter benutzten Pfade (offen: Pfadliste vom Adapter-Owner),
       monthly_cap_eur optional. Token wird EINMAL zurückgegeben -> sofort in den
@@ -131,3 +132,13 @@ Nachtrag 06.11.2026 (Zweig fix/schema-generator-rest-20261106, Basis develop dde
   BUDGET_EXCEEDED, 0 user_budgets-Zeilen, 0 verbrannte Schlüssel.
   Probe-Skript nicht eingecheckt (Testregel 20.10.); kein Beleg des HTTP-/
   Principal-/JWT-Livewegs und keiner platform-api-Aliasfähigkeit im Betrieb.
+
+Nachtrag 07.11.2026: Der bestehende Service-Token-Operator wurde LIVE mit
+GET /v1/admin/service-principals (HTTP 200) nachgewiesen. Ein eigener
+Admin-JWT ist fuer Principal-Anlage und Grant NICHT erforderlich.
+Infisical ist separat: regulaerer CLI-Userlogin oder schreibberechtigte MI,
+keine Synthese eines Owner-JWT. Ausfuehrbarer Zugangsvorbereiter:
+scripts/provision-schema-generator-access.py (standardmaessig nur lesend;
+--apply nur nach legitimer Anmeldung und ausgelieferter dev-only-Deklaration).
+Er aendert weder Budgets noch Grants, Katalog, Worker oder Mailkonfiguration.
+Weitere Abnahme siehe schema-generator-operator-20261107.txt.

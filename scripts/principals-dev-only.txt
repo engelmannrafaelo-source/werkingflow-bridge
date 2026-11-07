@@ -15,3 +15,7 @@
 # erkunder run in production is Rafael's open question e-pva-erkunder-prodort
 # (Bauplan Erkunder v2, R12). Until he decides, the key stays off prod.
 energy-erkunder-dev
+
+# Schema generator preview uses the dev Check/Report pot only (07.11.2026).
+# Its principal must not be copied to production by the regular sync.
+schema-generator-dev

@@ -1,0 +1,109 @@
+Generatoranschluss — 07.11.2026, vorbereitet, noch NICHT aktiviert
+
+Belegter Ausgangsstand
+- Dev-Bridge http://100.112.98.39:8300 (Container wt-platform-api:8000):
+  GET /v1/admin/service-principals mit vorhandenem X-Bridge-Service-Token,
+  OHNE X-User-ID -> 200. Kein Admin-JWT erforderlich.
+- schema-generator-dev fehlt. report-vercel-dev darf nur werking-report/check.
+- GET /v1/billing/plans enthält schema-generator noch nicht.
+- Infisical http://100.79.71.99, Workspace werking-report
+  7172a9a1-41b4-41c7-96d8-06629215eb87, secretPath /:
+  dev/SCHEMA_CHECK_BRIDGE_API_KEY -> 404 mit Dev-MI;
+  staging/CHECK_KONTO_SERVICE_SECRET -> 403 mit Dev-MI.
+- Offizieller CLI-Userlogin auf Dev root und claude-user nicht vorhanden.
+- Homepage GET http://127.0.0.1:3010/api/schema-erzeugen/ -> verfuegbar:false.
+  Previewcode sendet noch X-App-ID werking-report; keine Aktivierung vor Umstellung.
+
+Regulärer Login (kein erneuter Arbeitsauftrag/keine JWT-Synthese)
+  infisical login --domain=http://100.79.71.99/api --method=user
+Der offizielle Browserfluss erzeugt einen konkreten callback_port. Bei Login
+auf Dev muss derselbe Port vom Mac auf Dev weitergeleitet werden, damit der
+Browser die offizielle CLI erreichen kann. Kein Token gehört in einen Chat.
+Die am 07.11. vorbereitete Sitzung verwendet callback_port=33721; ein später
+neu gestarteter Login kann einen anderen Port liefern.
+
+Benötigte Rechte, nicht pauschal Administrator an Laufzeit-Apps vergeben:
+- Ein echter Admin-/Writerlogin darf genau diese Secrets read/create:
+  werking-report/dev/SCHEMA_CHECK_BRIDGE_API_KEY
+  werking-report/staging/CHECK_KONTO_SERVICE_SECRET
+- Die Partner-Machine-Identity benötigt auf genau diesen Referenzen read.
+  Die Report-Staging-Laufzeit benötigt read auf CHECK_KONTO_SERVICE_SECRET.
+- Der Bridge-Service-Token bleibt ausschließlich im Operatorweg. Die Homepage
+  erhält nur den neuen schmalen Principal-Token, niemals den Service-Token.
+
+Auslieferungsreihenfolge
+1. Geprüften Commit regulär ausliefern: scripts/principals-dev-only.txt enthält
+   schema-generator-dev. Keine Handänderung der laufenden Bridge-Hosts. Alle
+   beteiligten Worker müssen den bereits vorhandenen Alias-Code und dieselbe
+   relevante Vertragsfassung haben. Keine laufenden Jobs für dieses Setup abbrechen.
+2. Auf Dev im freigegebenen Worktree:
+   python3 scripts/provision-schema-generator-access.py
+   Das liest beide Referenzen und den Principal. 403 ist nie "fehlt".
+   Erst nach erfolgreichem lesendem Lauf:
+   python3 scripts/provision-schema-generator-access.py --apply
+   Vorhandene andere Scopes/Keys werden nicht ersetzt, keine automatische Rotation.
+   Neue Principal-Tokens gehen über eine 0600-Datei an den offiziellen CLI-Writer,
+   nicht über argv oder Logs. Bei fehlgeschlagener Ablage wird der neu angelegte
+   Principal deaktiviert; ein 0600-Recoveryrecord bindet seine echte ID.
+   Bestehende aktive fremde Tokens werden weder wiederverwendet noch verändert.
+   Es gibt einen lokalen exklusiven Setup-Lock. Nicht gleichzeitig einen zweiten
+   externen Writer für dieselben Secrets betreiben: CLI set ist ein Upsert.
+3. Partner-MI-Leserecht regulär konfigurieren und beide gezielten GETs als Partner
+   prüfen: Status 200, Wert vorhanden (Wert niemals ausgeben).
+4. Nach belegtem Alias-Code-Rollout und Principal/Secret-Readback die explizite,
+   getrennte Dev-Aktivierung mit dem REGULÄREN Migrationsrunner ausführen:
+   bin/bridge-migrate.sh --dir "$PWD/ops/schema-generator-dev-activation" --dry-run
+   bin/bridge-migrate.sh --dir "$PWD/ops/schema-generator-dev-activation"
+   Diese Migration ist NICHT im automatischen All-Environment-Migrationsordner.
+   Sie prüft den exakt eingeschränkten aktiven Principal und Kataloginvarianten
+   (price=0, allowance=0, sellable=false, budget_plan_id=report-standard).
+   Sie ändert ausschließlich is_active dieser Katalogzeile. Keine direkte
+   SQL-Handänderung außerhalb des versionierten Migrationsprozesses.
+5. Über den regulären Operator POST /v1/billing/plans/reload ausführen; den aktiven
+   Plan per GET /v1/billing/plans und bei allen beteiligten Prozessen verifizieren.
+   Keine Annahme, ein GET am Loadbalancer beweise alle Worker.
+6. Tatsächliche Check-User-ID aus werking-report/dev/CHECK_PUBLIC_BRIDGE_USER_ID
+   lesen. Vorher GET /v1/budget/{user_id} sichern (nur Budgetmetadaten).
+   Vorhandener report-standard-Topf ist zwingend; kein automatisches Seed/Topup.
+   Regulärer Grant:
+     POST /v1/admin/users/{user_id}/subscriptions
+     {"app_id":"werking-schema-generator","plan_id":"schema-generator","seats":1}
+   Nachher GET /v1/budget/{user_id}: gleiche Schlüssel, Limits und resetAt;
+   Verbrauch darf nicht zurückgesetzt werden. Grant/HTTP-Erfolg alleine ist keine
+   Abnahme. GET /v1/billing/{user_id}/subscriptions muss den aktiven Alias belegen.
+7. Report-Kontoprüfroute mit staging-Secret bereitstellen/prüfen. Ihre tatsächliche
+   Deployment-URL aus dem Report-Paket übernehmen, nicht erfinden. Dieser Schritt
+   ist noch nicht als LIVE belegt. Test mit synthetischer Adresse: 200 und exakt
+   {"exists":boolean}; falsches Secret -> 401/403, keine Nutzerdaten.
+8. Homepage-App-ID-Patch erst nach Liveanschluss einspielen; bestehende 37 dirty
+   Previewänderungen vorher sichern und nicht überschreiben. Startadapter setzen:
+   SCHEMA_CHECK_REF_KEY=SCHEMA_CHECK_BRIDGE_API_KEY,
+   SCHEMA_CHECK_KONTO_URL=tatsächlich geprüfte Report-Staging-Route,
+   SCHEMA_ERZEUGEN_AKTIV=1. Vorhandene Dev-S3-Referenzen beibehalten und validieren.
+   Mailzugang für den Prüflauf im App-Kind ausdrücklich entfernen
+   (RESEND_API_KEY/FROM_EMAIL); keine externe Mail versenden.
+
+Genau ein echter mailfreier Textlauf
+- Vorab GET /api/schema-erzeugen/ -> 200, {"verfuegbar":true}.
+- Ein POST /api/schema-erzeugen/ mit JSON, eindeutiger synthetischer .invalid-
+  Adresse, einwilligung=true und Beschreibung:
+  "Eine Fernwärmeübergabe versorgt über einen Plattenwärmetauscher einen
+  Heizkörperkreis. Im Vorlauf des Heizkörperkreises sitzt eine Pumpe.
+  Beide Kreise besitzen Vorlauf und Rücklauf. Keine Messwerte bekannt."
+- Kein automatisches Wiederholen bei Timeout: zuerst Job/Workflow und Ledger
+  prüfen, sonst würde ein zweiter Modellauftrag ausgelöst.
+- Abnahme: genau ein Workflow, echtes Modellresultat und gültige Bauteil-/
+  Verbindungsreferenzen, gespeichertes Ergebnis mit zugriffsgeschütztem Link,
+  sichtbarer Entwurf-Hinweis, Browserdarstellung Desktop/Mobil, keine erfundenen
+  Messwerte. Ergebnislink einmal öffnen, fehlender/falscher Zugriffstoken verweigert.
+- Ledger auf werking-schema-generator und tatsächliche Check-Identität prüfen;
+  Abbuchung am vorhandenen report-standard-Topf, kein neuer Budgettopf/Reset.
+  Mail darf nicht als gesendet gemeldet sein. Ein erwartetes "fehlgeschlagen"
+  wegen bewusst fehlendem Mailzugang ist kein Nachweis produktiven Mailversands.
+- Erst nach dieser Abnahme Generator als funktionsfähig melden. Website
+  mailfrei zu prüfen ist nicht gleich vollständiger Produktions-/Mailfreigabe.
+
+Prüfgrenzen dieses Pakets
+Python-Syntax und read-only STOP bei fehlendem Login geprüft. Keine Migration,
+kein Principalcreate, keine Secretmutation, kein Grant, kein Modell-/Maillauf.
+Der Live-Writer und das endgültige Report-Endpoint fehlen weiterhin.
