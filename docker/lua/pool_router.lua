@@ -502,7 +502,10 @@ function M.choose(opts)
         -- Local-only pick: a real peer policy hop, or werking-energy on the dev
         -- LB with ENERGY_SUBSCRIPTION_NO_HOP=1 ($energy_policy_local_only is
         -- generated only there; undefined elsewhere -> nil -> unchanged).
-        ngx.var.bridge_policy_hopped == "1" or ngx.var.energy_policy_local_only == "1",
+        -- The Dev-only generator principal uses the same local account filter;
+        -- it never gains auth, capacity, funding or a peer fallback from this.
+        ngx.var.bridge_policy_hopped == "1" or ngx.var.energy_policy_local_only == "1"
+            or ngx.var.schema_generator_policy_local_only == "1",
         ngx.var.http_x_bridge_account)
     if not data then
         ngx.var.target_worker = "unavailable"

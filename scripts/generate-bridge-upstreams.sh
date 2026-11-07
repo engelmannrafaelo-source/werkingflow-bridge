@@ -502,6 +502,20 @@ generate() {
 
 HEADER
 
+    # The generator principal and its Check budget belong to this Dev house.
+    # Its normal account pick must not cross to the peer merely because that
+    # account ranks first. Other apps and production topology stay unchanged.
+    if [ "$id" = "primary" ]; then
+        cat <<'MAP'
+# Dev-only generator principal: exact app match, normal local account admission.
+map $http_x_app_id $schema_generator_policy_local_only {
+    default 0;
+    "~^werking-schema-generator$" 1;
+}
+
+MAP
+    fi
+
     echo "# Round-robin default pool (used by /health, Lua-routed /v1 SSE, default /)."
     emit_upstream claude_workers 32 "$default_backup" "$targets_name" "${workers[@]}"
     echo
