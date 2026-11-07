@@ -37,6 +37,8 @@ from src.identity.webhook_config import BRIDGE_AUTH_APP_IDS, get_webhook_config
 from src.billing import billing_service
 
 router = APIRouter(prefix="/v1/auth", tags=["auth"])
+from src.identity.account_exists import router as account_exists_router
+router.include_router(account_exists_router)
 _bearer = HTTPBearer(auto_error=False)
 
 _SESSION_TTL_HOURS = 8
