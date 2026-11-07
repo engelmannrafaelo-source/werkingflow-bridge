@@ -12,7 +12,7 @@ Belegter Ausgangsstand
   staging/CHECK_KONTO_SERVICE_SECRET -> 403 mit Dev-MI.
 - Offizieller CLI-Userlogin auf Dev root und claude-user nicht vorhanden.
 - Homepage GET http://127.0.0.1:3010/api/schema-erzeugen/ -> verfuegbar:false.
-  Previewcode sendet noch X-App-ID werking-report; keine Aktivierung vor Umstellung.
+  Previewcode wurde auf werking-schema-generator und separaten Staging-Bypassheader korrigiert; Generator bleibt AUS.
 
 Regulärer Login (kein erneuter Arbeitsauftrag/keine JWT-Synthese)
   infisical login --domain=http://100.79.71.99/api --method=user
@@ -71,15 +71,24 @@ Auslieferungsreihenfolge
    Nachher GET /v1/budget/{user_id}: gleiche Schlüssel, Limits und resetAt;
    Verbrauch darf nicht zurückgesetzt werden. Grant/HTTP-Erfolg alleine ist keine
    Abnahme. GET /v1/billing/{user_id}/subscriptions muss den aktiven Alias belegen.
-7. Report-Kontoprüfroute mit staging-Secret bereitstellen/prüfen. Ihre tatsächliche
-   Deployment-URL aus dem Report-Paket übernehmen, nicht erfinden. Dieser Schritt
-   ist noch nicht als LIVE belegt. Test mit synthetischer Adresse: 200 und exakt
+7. Report-Kontoprüfroute: https://staging-werking-report.vercel.app/api/check/konto-vorhanden
+   Vorhandene Commits: 569c6c6b88, 5e65857a5f, 6ad8f048b1. Live mit echtem
+   VERCEL_AUTOMATION_BYPASS_SECRET aus werking-report/dev: /api/version 200
+   (speicher=dev), POST Konto 503 speicher_nicht_erreichbar. Ohne Bypass greift
+   Vercel Protection mit401. Nach Bereitstellung des staging-Dienstsecrets
+   muss die Report-Preview denselben Wert erhalten und regulär neu deployed
+   werden. Der allgemeine Vercel-Sync liest dev/prod, NICHT automatisch diese
+   staging-Referenz; gezielte Preview-Konfiguration ist erforderlich.
+   Test mit synthetischer Adresse und beiden korrekten Headern: 200 und exakt
    {"exists":boolean}; falsches Secret -> 401/403, keine Nutzerdaten.
 8. Homepage-App-ID-Patch erst nach Liveanschluss einspielen; bestehende 37 dirty
    Previewänderungen vorher sichern und nicht überschreiben. Startadapter setzen:
    SCHEMA_CHECK_REF_KEY=SCHEMA_CHECK_BRIDGE_API_KEY,
-   SCHEMA_CHECK_KONTO_URL=tatsächlich geprüfte Report-Staging-Route,
+   SCHEMA_CHECK_KONTO_URL=https://staging-werking-report.vercel.app/api/check/konto-vorhanden,
+   INFISICAL_URL=http://100.79.71.99 und SCHEMA_ADAPTER_GRUPPEN=s3_dev,bridge_konto,
    SCHEMA_ERZEUGEN_AKTIV=1. Vorhandene Dev-S3-Referenzen beibehalten und validieren.
+   SCHEMA_CHECK_KONTO_BYPASS kommt separat aus bestehendem Report/dev
+   VERCEL_AUTOMATION_BYPASS_SECRET. Nie den Bypass in die URL schreiben.
    Mailzugang für den Prüflauf im App-Kind ausdrücklich entfernen
    (RESEND_API_KEY/FROM_EMAIL); keine externe Mail versenden.
 
@@ -106,4 +115,8 @@ Genau ein echter mailfreier Textlauf
 Prüfgrenzen dieses Pakets
 Python-Syntax und read-only STOP bei fehlendem Login geprüft. Keine Migration,
 kein Principalcreate, keine Secretmutation, kein Grant, kein Modell-/Maillauf.
-Der Live-Writer und das endgültige Report-Endpoint fehlen weiterhin.
+Der Live-Writer und die Bereitstellung des Dienstsecrets in Report-Preview fehlen weiterhin.
+Provisioning: 5 simulierte Sicherheitsfälle PASS. Konto-Header: 5 gezielte Laufzeitproben PASS; keine Secrets an fremden Host, 401 bleibt Fehler.
+Homepage-Patch ist am Preview angewendet; originaler Owner/Modus aus Sicherung wiederhergestellt.
+Die sichere Dateiablage ist /root/schema-generator-anschluss-20261107/preview-before-connection.tar.gz.
+Keine Rücksetzung anderer Änderungen. Der vollständige Modelllauf bleibt unbewiesen.

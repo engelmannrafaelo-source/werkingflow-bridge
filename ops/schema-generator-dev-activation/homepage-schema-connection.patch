@@ -1,0 +1,81 @@
+--- a/apps/werking-tools/src/lib/schema-erzeugen/ki.ts
++++ b/apps/werking-tools/src/lib/schema-erzeugen/ki.ts
+@@ -60,8 +60,8 @@
+ // Bridge-Zuordnung (Attribution/Abrechnung) wie der kostenlose Gratis-Check (report: services/check/check-attribution.ts)
+ // ---------------------------------------------------------------------------
+ 
+-/** Produktweg „kostenlos“: Der Bridge-Key gehört zu einem Principal mit allowed_apps werking-report/werking-check. */
+-export const BRIDGE_APP_ID = 'werking-report'
++/** Eigener Generator-Principal; Abrechnung über den bestehenden Check-/Report-Topf laut Bridge-Katalog. */
++export const BRIDGE_APP_ID = 'werking-schema-generator'
+ export const BRIDGE_AGENT_ID = 'schema-erzeugen'
+ 
+ /** Bridge-Identitäten sind UUIDs; alles andere weist die Bridge fail-closed ab (wie check-attribution.ts). */
+--- a/apps/werking-tools/src/lib/schema-erzeugen/konto.ts
++++ b/apps/werking-tools/src/lib/schema-erzeugen/konto.ts
+@@ -3,17 +3,25 @@
+ /** Namen der Variablen (Tools-Secret = Report-seitig CHECK_KONTO_SERVICE_SECRET, gleicher Wert). Nur Namen, Werte nie lesen/ausgeben. */
+ export const ENV_KONTO_URL = 'SCHEMA_CHECK_KONTO_URL'
+ export const ENV_KONTO_SECRET = 'SCHEMA_CHECK_KONTO_SECRET'
++export const ENV_KONTO_BYPASS = 'SCHEMA_CHECK_KONTO_BYPASS'
++const REPORT_STAGING_HOST = 'staging-werking-report.vercel.app'
++
++function istGeschuetztesReportStaging(url: string): boolean {
++  try { return new URL(url).hostname === REPORT_STAGING_HOST } catch { return false }
++}
+ 
+ export const KONTO_PRUEFUNG_ZEITLIMIT_MS = 5_000
+ 
+-export interface KontoPruefKonfiguration { url: string; secret: string }
++export interface KontoPruefKonfiguration { url: string; secret: string; protectionBypass?: string }
+ 
+ /** Konfiguration der Konto-Vorabprüfung oder null, wenn URL (http/https) oder Secret fehlen. */
+ export function kontoPruefKonfiguration(env: Record<string, string | undefined>): KontoPruefKonfiguration | null {
+   const url = env[ENV_KONTO_URL]?.trim()
+   const secret = env[ENV_KONTO_SECRET]?.trim()
+   if (!url || !secret || !/^https?:\/\//i.test(url)) return null
+-  return { url, secret }
++  const protectionBypass = env[ENV_KONTO_BYPASS]?.trim()
++  if (istGeschuetztesReportStaging(url) && !protectionBypass) return null
++  return { url, secret, ...(istGeschuetztesReportStaging(url) ? { protectionBypass } : {}) }
+ }
+ 
+ /** Fehlende Namen für das Betriebslog (nur Namen). */
+@@ -21,12 +29,15 @@
+   const f: string[] = []
+   if (!env[ENV_KONTO_URL]?.trim() || !/^https?:\/\//i.test(env[ENV_KONTO_URL]!.trim())) f.push(`${ENV_KONTO_URL} (fehlt oder keine http(s)-URL)`)
+   if (!env[ENV_KONTO_SECRET]?.trim()) f.push(ENV_KONTO_SECRET)
++  const url = env[ENV_KONTO_URL]?.trim()
++  if (url && istGeschuetztesReportStaging(url) && !env[ENV_KONTO_BYPASS]?.trim()) f.push(ENV_KONTO_BYPASS)
+   return f
+ }
+ 
+ /** Service-Authentisierung (vom Report festgelegt: Authorization: Bearer). Einzige Stelle, die die Aufrufform kapselt. */
+-function authKopfzeilen(secret: string): Record<string, string> {
+-  return { Authorization: `Bearer ${secret}` }
++function authKopfzeilen(cfg: KontoPruefKonfiguration): Record<string, string> {
++  // Deployment protection stays enabled; send its credential only to the known Report staging host.
++  return { Authorization: `Bearer ${cfg.secret}`, ...(istGeschuetztesReportStaging(cfg.url) && cfg.protectionBypass ? { 'x-vercel-protection-bypass': cfg.protectionBypass } : {}) }
+ }
+ 
+ export const nichtVerfuegbar = (): ErzeugenFehler =>
+@@ -45,7 +56,7 @@
+     try {
+       res = await fetchImpl(cfg.url, {
+         method: 'POST',
+-        headers: { 'Content-Type': 'application/json', Accept: 'application/json', ...authKopfzeilen(cfg.secret) },
++        headers: { 'Content-Type': 'application/json', Accept: 'application/json', ...authKopfzeilen(cfg) },
+         body: JSON.stringify({ email }),
+         signal: ctrl.signal,
+         cache: 'no-store',
+--- a/apps/werking-tools/scripts/start-mit-check-aliasen.py
++++ b/apps/werking-tools/scripts/start-mit-check-aliasen.py
+@@ -58,6 +58,8 @@
+     # Report-Secret (gleicher Wert wie CHECK_KONTO_SERVICE_SECRET im Report). Ablage unter diesem Namen/Pfad ist
+     # UNBELEGT; Name ueber SCHEMA_CHECK_REF_KONTO_SECRET aenderbar (nur Name!).
+     "SCHEMA_CHECK_KONTO_SECRET": ("SCHEMA_CHECK_REF_KONTO_SECRET", "CHECK_KONTO_SERVICE_SECRET"),
++    # Existing Report dev automation credential, not the Report service secret.
++    "SCHEMA_CHECK_KONTO_BYPASS": ("SCHEMA_CHECK_REF_KONTO_BYPASS", "VERCEL_AUTOMATION_BYPASS_SECRET"),
+ }
+ 
+ # Je Alias: (Variable fuer Workspace-ID, Variable fuer Umgebung, Standard-Umgebung). Nur das Konto-Secret liegt in
