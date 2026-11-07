@@ -77,6 +77,8 @@ def bridge(method,path,body=None):
 def check_scope(principal):
     if sorted(principal.get('allowed_apps',[])) != APPS or sorted(principal.get('allowed_paths',[])) != PATHS:
         raise Stop('Existing principal has different scope; not changed')
+    if principal.get('monthly_cap_eur') is not None:
+        raise Stop('Existing principal has an anonymous budget cap; not changed')
 
 def dev_only_declared():
     p=subprocess.run(['ssh','-o','ConnectTimeout=8',BRIDGE_HOST,

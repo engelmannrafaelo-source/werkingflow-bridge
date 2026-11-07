@@ -26,7 +26,8 @@ Benötigte Rechte, nicht pauschal Administrator an Laufzeit-Apps vergeben:
 - Ein echter Admin-/Writerlogin darf genau diese Secrets read/create:
   werking-report/dev/SCHEMA_CHECK_BRIDGE_API_KEY
   werking-report/staging/CHECK_KONTO_SERVICE_SECRET
-- Die Partner-Machine-Identity benötigt auf genau diesen Referenzen read.
+- Die Partner-Machine-Identity 1463090e-0491-412d-ab54-bf1c3253f06e
+  benötigt auf genau diesen Referenzen read.
   Die Report-Staging-Laufzeit benötigt read auf CHECK_KONTO_SERVICE_SECRET.
 - Der Bridge-Service-Token bleibt ausschließlich im Operatorweg. Die Homepage
   erhält nur den neuen schmalen Principal-Token, niemals den Service-Token.
