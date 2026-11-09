@@ -196,6 +196,8 @@ app.include_router(billing_router)
 app.include_router(pending_orders_router)
 app.include_router(admin_orders_router)
 app.include_router(project_credits_router)
+from src.billing.schema_generator_credits import router as schema_generator_credits_router
+app.include_router(schema_generator_credits_router)
 app.include_router(project_resets_router)
 app.include_router(activity_router)
 app.include_router(feedback_router)

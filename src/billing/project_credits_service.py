@@ -128,56 +128,74 @@ async def consume_credit(
     budget as a run ceiling (no TopUp fallback, see project_budgets_service). Omitting project_id keeps the legacy
     behaviour (slot only; the budget then self-provisions lazily downstream).
     """
-    from src.budget.plans import accepted_credit_plan_ids, budget_plan_for, get_plan
-
-    requested = get_plan(plan_id)  # unknown plan → ValueError, before any DB work
-    accepted = accepted_credit_plan_ids(plan_id)
-
+    from src.budget.plans import get_plan
+    get_plan(plan_id)  # preserve validation before acquiring a connection
     pool = get_pool()
     async with pool.acquire() as conn:
         async with conn.transaction():
-            row = None
-            for credit_plan_id in accepted:
-                row = await conn.fetchrow(
-                    """
-                    SELECT id, plan_id, tenant_id, quantity, used, granted_at, order_id
-                      FROM manual_project_credits
-                     WHERE user_id = $1
-                       AND plan_id = $2
-                       AND used < quantity
-                     ORDER BY granted_at ASC
-                     LIMIT 1
-                       FOR UPDATE
-                    """,
-                    user_id,
-                    credit_plan_id,
-                )
-                if row:
-                    break
-            if not row:
-                raise CreditsExhaustedError(plan_id)
+            return await consume_credit_on_connection(conn, user_id, plan_id, project_id, hard_cap)
 
-            await conn.execute(
-                "UPDATE manual_project_credits SET used = used + 1 WHERE id = $1",
-                row["id"],
-            )
 
-            if project_id:
-                # Allocate this project's API budget atomically with the slot,
-                # under the pot plan; the limit is the paying kind's budget.
-                from src.billing.project_budgets_service import allocate_budget
+async def consume_credit_on_connection(
+    conn, user_id: uuid.UUID, plan_id: str, project_id: Optional[str] = None,
+    hard_cap: bool = False,
+    *, allowed_credit_plan_ids: Optional[tuple[str, ...]] = None,
+) -> Dict[str, Any]:
+    """Same credit operation on the caller's transaction; caller MUST own transaction.
 
-                paying = get_plan(row["plan_id"])
-                await allocate_budget(
-                    conn,
-                    user_id=user_id,
-                    tenant_id=row["tenant_id"],
-                    plan_id=budget_plan_for(requested).id,
-                    project_id=project_id,
-                    limit_eur=float(paying.api_budget_eur),
-                    credit_id=row["id"],
-                    hard_cap=hard_cap,
-                )
+    Used when a durable app receipt must commit atomically with credit consumption.
+    The public service-only route still calls consume_credit with its own transaction.
+    """
+    from src.budget.plans import accepted_credit_plan_ids, budget_plan_for, get_plan
+    requested = get_plan(plan_id)
+    accepted = accepted_credit_plan_ids(plan_id)
+    if allowed_credit_plan_ids is not None and (
+        not set(accepted).issubset(allowed_credit_plan_ids)
+        or budget_plan_for(requested).id not in allowed_credit_plan_ids
+    ):
+        raise ValueError("Credit catalog exceeds enrolled app scope")
+    row = None
+    for credit_plan_id in accepted:
+        row = await conn.fetchrow(
+            """
+            SELECT id, plan_id, tenant_id, quantity, used, granted_at, order_id
+              FROM manual_project_credits
+             WHERE user_id = $1
+               AND plan_id = $2
+               AND used < quantity
+             ORDER BY granted_at ASC
+             LIMIT 1
+               FOR UPDATE
+            """,
+            user_id,
+            credit_plan_id,
+        )
+        if row:
+            break
+    if not row:
+        raise CreditsExhaustedError(plan_id)
+
+    await conn.execute(
+        "UPDATE manual_project_credits SET used = used + 1 WHERE id = $1",
+        row["id"],
+    )
+
+    if project_id:
+        # Allocate this project's API budget atomically with the slot,
+        # under the pot plan; the limit is the paying kind's budget.
+        from src.billing.project_budgets_service import allocate_budget
+
+        paying = get_plan(row["plan_id"])
+        await allocate_budget(
+            conn,
+            user_id=user_id,
+            tenant_id=row["tenant_id"],
+            plan_id=budget_plan_for(requested).id,
+            project_id=project_id,
+            limit_eur=float(paying.api_budget_eur),
+            credit_id=row["id"],
+            hard_cap=hard_cap,
+        )
 
     return {
         "creditId": str(row["id"]),
