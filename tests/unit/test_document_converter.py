@@ -341,7 +341,7 @@ def test_render_pages_within_edge_cap():
     if not BAUPLAN_PDF.exists():
         pytest.skip("Bauplan reference PDF not present in this environment")
     rendered = dc._render_pdf_pages(BAUPLAN_PDF.read_bytes(), [0, 1])
-    assert set(rendered) == {"page-001.png", "page-002.png"}
+    assert set(rendered) == {"page-001.jpg", "page-002.jpg"}
     for b64 in rendered.values():
         w, h = _decoded_size(b64)
         assert max(w, h) <= RENDER_PAGE_MAX_EDGE
@@ -367,7 +367,7 @@ def test_convert_pdf_oversized_plan_renders_pages(monkeypatch):
     assert meta["docling_parsed"] is True
     assert "Plan text" in markdown  # docling text preserved
     # Both oversized pages rendered whole …
-    assert "page-001.png" in images and "page-002.png" in images
+    assert "page-001.jpg" in images and "page-002.jpg" in images
     assert meta["rendered_page_numbers"] == [1, 2]
     # … and the 132-MP figure was down-scaled by the guard.
     fw, fh = _decoded_size(images["figure-1.png"])
@@ -390,9 +390,9 @@ def test_convert_pdf_docling_failure_renders_all_pages(monkeypatch):
     markdown, meta, images = convert_pdf_bytes(BAUPLAN_PDF.read_bytes())
 
     assert meta["docling_parsed"] is False
-    assert set(images) == {"page-001.png", "page-002.png"}
+    assert set(images) == {"page-001.jpg", "page-002.jpg"}
     # Render-only markdown references each page so descriptions attach cleanly.
-    assert "page-001.png" in markdown and "page-002.png" in markdown
+    assert "page-001.jpg" in markdown and "page-002.jpg" in markdown
 
 
 # ---------------------------------------------------------------------------

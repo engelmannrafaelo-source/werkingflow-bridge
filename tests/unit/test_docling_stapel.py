@@ -476,7 +476,9 @@ def _noise_pdf(pages: int) -> bytes:
     from reportlab.pdfgen import canvas
 
     rnd = random.Random(1)
-    im = Image.frombytes("RGB", (400, 566), bytes(rnd.getrandbits(8) for _ in range(400 * 566 * 3)))
+    # Each encoded page must fit the per-image limit so these probes still
+    # reach the SUM budget (higher-entropy pages now correctly fail earlier).
+    im = Image.frombytes("RGB", (200, 283), bytes(rnd.getrandbits(8) for _ in range(200 * 283 * 3)))
     img = io.BytesIO()
     im.save(img, "JPEG", quality=60)
     buf = io.BytesIO()
@@ -507,7 +509,7 @@ def test_render_budget_refuses_with_413_reason_and_stops_rendering(monkeypatch):
     """Render-all fallback over pages that render large: refused once the
     budget is crossed, with the reason — not after rendering every page."""
     pytest.importorskip("pypdfium2")
-    pdf = _noise_pdf(12)
+    pdf = _noise_pdf(16)
     monkeypatch.setenv("PDF_RENDER_MAX_MB", "4")
     monkeypatch.setattr(
         dc, "_docling_convert_pdf", lambda b: (_ for _ in ()).throw(RuntimeError("docling kaputt"))
@@ -518,8 +520,8 @@ def test_render_budget_refuses_with_413_reason_and_stops_rendering(monkeypatch):
     msg = str(exc.value)
     assert "PDF_RENDER_MAX_MB" in msg and "4 MB" in msg
     assert "Docling das Dokument nicht lesen konnte" in msg
-    assert "von 12 als Bild gerenderten Seiten" in msg
-    assert 1 <= len(rendered) < 12
+    assert "von 16 als Bild gerenderten Seiten" in msg
+    assert 1 <= len(rendered) < 16
 
 
 def test_render_budget_also_guards_the_scan_path(monkeypatch):
@@ -695,6 +697,9 @@ def test_figures_and_rendered_pages_share_one_budget(monkeypatch):
     monkeypatch.setenv("PDF_RENDER_MAX_MB", "4")
     figures = {"image_000000_x.png": "A" * (3 * 2**20)}
     monkeypatch.setattr(dc, "_docling_convert_pdf", lambda b: ("", 12, figures, None, None, []))
+    # This probe isolates the SUM budget with synthetic byte counters; real
+    # figure encoding/refusal is covered by scripts/probe_pdf_render.py.
+    monkeypatch.setattr(dc, "_prepare_pdf_figures", lambda images, md, *args: (images, md))
     with pytest.raises(DocumentTooLargeError) as exc:
         convert_pdf_bytes(pdf)
     msg = str(exc.value)
