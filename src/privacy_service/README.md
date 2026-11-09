@@ -60,7 +60,7 @@ deterministic adapters can parse:
 
 | Order | Adapter pipeline | When it runs |
 |-------|------------------|--------------|
-| 1 | `PdfAdapter` — Docling (OCR + tables) | `.pdf` / `application/pdf`. Returns base64 PNG images alongside Markdown |
+| 1 | `PdfAdapter` — Docling (OCR + tables) | `.pdf` / `application/pdf`. Returns bounded base64 PNG/JPEG images alongside Markdown |
 | 2 | `DocxAdapter` — LibreOffice → PDF → Docling | `.docx` / `.doc` |
 | 3 | `PptxAdapter` — LibreOffice → PDF → Docling | `.pptx` / `.ppt` (best-effort for complex layouts) |
 | 4 | `XlsxAdapter` — openpyxl + pandas | `.xlsx` / `.xls`. One `## SheetName` heading per sheet, truncates above 5000 rows |
@@ -70,6 +70,30 @@ deterministic adapters can parse:
 | 8 | `EmlAdapter` — stdlib `email` | `.eml` (RFC822). Falls back to markdownify for HTML-only mails |
 | 9 | `ImageAdapter` — Docling vision OCR | `.png` / `.jpg` / `.tif` / `.webp` |
 | 10 | `AiFallbackAdapter` — Bridge self-call (Claude) | Anything else, or any deterministic adapter that fails |
+
+**PDF image contract**
+
+Whole pages use a 1600-pixel long edge. Large-format pages (>1700 pt) are
+`page-NNN.jpg`; smaller pages retain `page-NNN.png` when their PNG fits the
+limit, otherwise they also use JPEG. `PDF_IMAGE_MAX_B64_BYTES` is a strict
+700 KiB base64 ceiling (716800 bytes), leaving 324 KiB below the subscription
+SDK's 1 MiB JSON-line cap for the tool envelope. JPEG quality descends through
+85, 75, 65, 55 at unchanged resolution. If none fits, `DocumentTooLargeError`
+refuses the whole conversion with HTTP 413, identifying the page, size and
+limit. No page is omitted, and there is no automatic tiling.
+
+Docling figures retain the 2000-pixel edge guard. Small figures keep their
+bytes/names; figures still over the base64 ceiling become JPEG with matching
+Markdown, per-page Markdown and figure metadata names. Name collisions refuse
+the conversion. The total response budget (`PDF_RENDER_MAX_MB`) still applies,
+including figures and rendered pages; Docling's raw figure budget also remains
+as a memory guard. Vision and triage declare PNG/JPEG from the actual bytes.
+
+Callers must treat the returned image dictionary keys as authoritative, rather
+than constructing `.png` filenames. `docling_failed_pages` and page-number/count
+metadata keep their meaning; the failure notice names the actual render files.
+`scripts/probe_pdf_render.py` checks encoding, budgets, references and MIME
+offline; `--pdf PATH` adds numeric measurements without emitting source content.
 
 **AI fallback (`AiFallbackAdapter`)**
 

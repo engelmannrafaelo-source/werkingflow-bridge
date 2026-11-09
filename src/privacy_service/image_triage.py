@@ -14,7 +14,7 @@ Design (backward-compatible by construction):
 - The convert response shape is unchanged. Triage only changes WHICH of the
   already-extracted images get a full description. Below the threshold, behaviour
   is byte-for-byte the old "describe every image".
-- ``page-NNN.png`` render images (whole scan/oversize pages the converter
+- ``page-NNN.png``/``page-NNN.jpg`` render images (whole scan/oversize pages the converter
   deliberately rasterised for Vision) are NEVER triaged away — they are
   high-value by construction. Triage only ranks Docling-extracted figures.
 - Criteria are caller-supplied (``triage_prompt``), mirroring ``describe_prompt``
@@ -41,6 +41,7 @@ from fastapi import HTTPException
 from src.vision_provider import get_vision_provider
 from src.model_registry import get_default_model
 from src.privacy_service.document_converter import _downscale_b64_png
+from src.privacy_service.image_encoding import image_data_url
 
 logger = logging.getLogger("privacy-service.image-triage")
 
@@ -100,7 +101,7 @@ def _triage_batch_size() -> int:
 def split_figures_and_pages(images: Dict[str, str]) -> Tuple[Dict[str, str], Dict[str, str]]:
     """Split the converter's image dict into ``(figures, rendered_pages)``.
 
-    Rendered pages (``page-NNN.png``) are a deliberate converter decision and are
+    Rendered pages (``page-NNN.png``/``.jpg``) are a deliberate converter decision and are
     never triaged away; only Docling-extracted figures are candidates for triage.
     """
     figures = {k: v for k, v in images.items() if not k.startswith(_RENDERED_PAGE_PREFIX)}
@@ -159,7 +160,7 @@ async def _triage_one_batch(
         thumb = _downscale_b64_png(b64, max_edge=_TRIAGE_THUMB_EDGE)
         content.append({"type": "text", "text": f"Bild {idx}:"})
         content.append(
-            {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{thumb}"}}
+            {"type": "image_url", "image_url": {"url": image_data_url(thumb)}}
         )
     messages = [{"role": "user", "content": content}]
 

@@ -119,7 +119,7 @@ class ConversionResult:
     markdown: str
     fmt: str
     metadata: Dict[str, Any]
-    images: Optional[Dict[str, str]] = None  # base64-encoded PNGs (PDF path only)
+    images: Optional[Dict[str, str]] = None  # base64 PNG/JPEG images (PDF path only)
 
     def to_response(self) -> Dict[str, Any]:
         out: Dict[str, Any] = {
@@ -267,7 +267,7 @@ def _mojibake_repaired(fn):
 #   1. Docling runs over the whole document for rich text/table Markdown.
 #   2. A page that has (almost) no native text layer, OR is an oversized
 #      large-format drawing, OR belongs to a document Docling could not parse at
-#      all, is RENDERED to a down-scaled PNG and added to the ``images`` dict.
+#      all, is RENDERED to a bounded image and added to the ``images`` dict.
 #   3. Every image (Docling-extracted figures AND rendered pages) is pushed
 #      through a uniform down-scale guard so no giant raster ever reaches Vision.
 # The rendered pages ride the exact same ``images`` dict that the endpoint hands
@@ -279,6 +279,12 @@ def _mojibake_repaired(fn):
 # small enough to avoid the giant-raster blow-up, detailed enough for Vision to
 # read zoning/hull/PV off the drawing.
 RENDER_PAGE_MAX_EDGE = 1600
+
+# Claude's subscription SDK limits a JSON line (including a Read image result)
+# to 1 MiB. Bound BASE64, not compressed bytes; 700 KiB leaves 324 KiB for the
+# JSON/tool envelope. Keep resolution fixed and try JPEG qualities in order.
+PDF_IMAGE_MAX_B64_BYTES = 700 * 1024
+PDF_IMAGE_JPEG_QUALITIES = (85, 75, 65, 55)
 
 # Hard down-scale ceiling applied to EVERY image (Docling figures included).
 # Anything whose long edge exceeds this is resized before it can reach Vision —
@@ -432,6 +438,30 @@ def _pdf_page_geometry(pdf_bytes: bytes) -> List[Tuple[int, float]]:
     return geometry
 
 
+def _encode_vision_jpeg(image: Any, label: str) -> str:
+    """Encode at fixed resolution, or refuse the entire conversion with 413.
+
+    Never return the last oversized attempt or quietly omit an image. The
+    label identifies the page/figure without including document contents.
+    """
+    rgb = image.convert("RGB")
+    try:
+        for quality in PDF_IMAGE_JPEG_QUALITIES:
+            with io.BytesIO() as buf:
+                rgb.save(buf, format="JPEG", quality=quality)
+                b64 = base64.b64encode(buf.getvalue()).decode("ascii")
+            if len(b64) < PDF_IMAGE_MAX_B64_BYTES:
+                return b64
+        raise DocumentTooLargeError(
+            f"{label}: JPEG bei Qualitaet {quality} hat {len(b64)} Byte Base64; "
+            f"erforderlich sind weniger als {PDF_IMAGE_MAX_B64_BYTES} Byte "
+            f"(PDF_IMAGE_MAX_B64_BYTES). Bitte den Bildbereich aufteilen und "
+            f"erneut umwandeln. Keine Bilder dieser Antwort wurden ausgeliefert."
+        )
+    finally:
+        rgb.close()
+
+
 def _render_pdf_pages(
     pdf_bytes: bytes,
     page_indices: List[int],
@@ -441,9 +471,11 @@ def _render_pdf_pages(
     already_bytes: int = 0,
     why: str = "",
 ) -> Dict[str, str]:
-    """Render the given 0-indexed pages to down-scaled PNGs.
+    """Render the given 0-indexed pages to size-bounded PNG/JPEG images.
 
-    Returns ``{"page-NNN.png": base64-png}`` (1-indexed in the filename so it
+    Large-format pages use ``page-NNN.jpg``; small pages retain ``page-NNN.png``
+    if their PNG fits the base64 limit, otherwise they also use JPEG.
+    Filenames are 1-indexed so each page
     reads naturally in the appended descriptions). The render scale is chosen so
     the long edge lands at ``max_edge`` px, which both avoids the giant-raster
     blow-up and keeps CAD detail legible for Vision.
@@ -474,14 +506,21 @@ def _render_pdf_pages(
                 # pypdfium2 renders at ``scale`` px per point (scale=1 → 72 DPI).
                 scale = min(max_edge / long_edge_pt, 4.0)
                 bitmap = page.render(scale=scale)
-                pil_image = bitmap.to_pil()
+                try:
+                    with bitmap.to_pil() as pil_image:
+                        b64 = ""
+                        extension = "png"
+                        if long_edge_pt <= OVERSIZE_PAGE_LONG_EDGE_PT:
+                            with io.BytesIO() as buf:
+                                pil_image.save(buf, format="PNG")
+                                b64 = base64.b64encode(buf.getvalue()).decode("ascii")
+                        if not b64 or len(b64) >= PDF_IMAGE_MAX_B64_BYTES:
+                            b64 = _encode_vision_jpeg(pil_image, f"Seite {idx + 1}")
+                            extension = "jpg"
+                finally:
+                    bitmap.close()
             finally:
                 page.close()
-            if pil_image.mode not in ("RGB", "L"):
-                pil_image = pil_image.convert("RGB")
-            buf = io.BytesIO()
-            pil_image.save(buf, format="PNG")
-            b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
             page_bytes += len(b64)
             total_bytes = already_bytes + page_bytes
             if max_total_bytes is not None and total_bytes > max_total_bytes:
@@ -503,7 +542,7 @@ def _render_pdf_pages(
                     f"Bitte in Teile mit hoechstens {max(1, int(room_mb / per_page_mb))} "
                     f"solchen Seiten zerlegen und einzeln umwandeln."
                 )
-            rendered[f"page-{idx + 1:03d}.png"] = b64
+            rendered[f"page-{idx + 1:03d}.{extension}"] = b64
     finally:
         pdf.close()
     return rendered
@@ -541,6 +580,71 @@ def _downscale_b64_png(b64: str, max_edge: int = MAX_IMAGE_EDGE) -> str:
     except Exception as e:  # noqa: BLE001 — never let the guard itself break conversion
         logger.warning(f"[pdf] image down-scale skipped (unparseable image): {e}")
         return b64
+
+
+def _prepare_pdf_figures(
+    figures: dict[str, str],
+    markdown: str,
+    page_markdowns: list[dict[str, Any]] | None,
+    figure_meta: list[dict[str, Any]] | None,
+) -> tuple[dict[str, str], str]:
+    """Bound figures and update all exported references at one boundary.
+
+    Small figures retain their bytes and names. Only figures still oversized
+    after the existing edge guard are JPEG-encoded. No failure here falls back
+    to Docling/page rendering; the whole conversion is refused instead.
+    """
+    from PIL import Image
+
+    prepared: dict[str, str] = {}
+    renames: dict[str, str] = {}
+    for index, (name, original) in enumerate(figures.items(), start=1):
+        b64 = _downscale_b64_png(original)
+        new_name = name
+        if len(b64) >= PDF_IMAGE_MAX_B64_BYTES:
+            try:
+                with (
+                    Image.open(io.BytesIO(base64.b64decode(b64))) as image,
+                    image.convert("RGBA") as rgba,
+                    Image.new("RGB", image.size, "white") as opaque,
+                ):
+                    # Flatten transparency against the PDF's white background.
+                    opaque.paste(rgba, mask=rgba.getchannel("A"))
+                    b64 = _encode_vision_jpeg(opaque, f"Abbildung {index} ({name})")
+            except DocumentTooLargeError:
+                raise
+            except (OSError, ValueError) as exc:
+                raise DocumentTooLargeError(
+                    f"Abbildung {index} ({name}): {len(b64)} Byte Base64 erreichen "
+                    f"die Grenze {PDF_IMAGE_MAX_B64_BYTES}; JPEG-Kodierung nicht "
+                    f"moeglich. Keine Bilder ausgeliefert."
+                ) from exc
+            new_name = os.path.splitext(name)[0] + ".jpg"
+        if new_name in prepared or (new_name != name and new_name in figures):
+            raise DocumentTooLargeError(
+                f"Abbildung {index}: JPEG-Dateiname {new_name} ist bereits belegt; "
+                f"keine Bilder ausgeliefert."
+            )
+        prepared[new_name] = b64
+        if new_name != name:
+            renames[name] = new_name
+
+    if renames:
+        # Single substitution, never chained renames; matches the generated
+        # filename also in relative artifact paths, but not a longer filename.
+        pattern = re.compile(
+            r"(?<![\w.-])(?:" + "|".join(re.escape(n) for n in renames) + r")(?![\w.-])"
+        )
+
+        def renamed(text: str) -> str:
+            return pattern.sub(lambda match: renames[match.group()], text)
+
+        markdown = renamed(markdown)
+        for page in page_markdowns or []:
+            page["markdown"] = renamed(page["markdown"])
+        for figure in figure_meta or []:
+            figure["name"] = renames.get(figure["name"], figure["name"])
+    return prepared, markdown
 
 
 # Caption search window below a figure, in PDF points (top-left origin). A caption
@@ -981,9 +1085,9 @@ def convert_pdf_bytes(pdf_bytes: bytes) -> Tuple[str, Dict[str, Any], Dict[str, 
 
     Docling handles the text/table layer; pages that are image/scan-only or
     large-format drawings (and every page of a PDF Docling cannot parse) are
-    rendered to down-scaled PNGs and returned in ``images`` so the endpoint's
-    Vision pass describes them. Every returned image passes a hard down-scale
-    guard, so a giant embedded raster never reaches Vision.
+    rendered to bounded PNG/JPEG images and returned in ``images`` so the
+    endpoint's Vision pass describes them. Every image has an edge limit and
+    a strict base64 byte limit; an unfit image refuses the entire conversion.
     """
     geometry = _pdf_page_geometry(pdf_bytes)
     total_pages = len(geometry)
@@ -1053,6 +1157,15 @@ def convert_pdf_bytes(pdf_bytes: bytes) -> Tuple[str, Dict[str, Any], Dict[str, 
         pages_to_render = list(range(total_pages))
         why = "Docling das Dokument nicht lesen konnte und deshalb jede Seite gerendert wird"
 
+    # Keep the raw figure budget as a memory guard, then account for the final
+    # encoded bytes in the combined response budget. This normalization is
+    # outside the Docling fallback: an image refusal must propagate unchanged.
+    figure_bytes = sum(len(v) for v in figures.values())
+    if figure_bytes > render_max_bytes:
+        _check_figure_budget(figure_bytes, total_pages, total_pages)
+    figures, docling_markdown = _prepare_pdf_figures(
+        figures, docling_markdown, page_markdowns, figure_meta
+    )
     figure_bytes = sum(len(v) for v in figures.values())
     if figure_bytes > render_max_bytes:
         _check_figure_budget(figure_bytes, total_pages, total_pages)
@@ -1064,10 +1177,8 @@ def convert_pdf_bytes(pdf_bytes: bytes) -> Tuple[str, Dict[str, Any], Dict[str, 
         why=why,
     )
 
-    # 3. Uniform down-scale guard over ALL images (figures + rendered pages).
-    images: Dict[str, str] = {
-        name: _downscale_b64_png(b64) for name, b64 in figures.items()
-    }
+    # 3. Both sources are already bounded; retain matching names and encodings.
+    images: Dict[str, str] = dict(figures)
     images.update(rendered_pages)  # rendered pages are already within the cap
 
     # 4. Markdown: Docling's text if we have it, else a render-only body that
@@ -1075,7 +1186,10 @@ def convert_pdf_bytes(pdf_bytes: bytes) -> Tuple[str, Dict[str, Any], Dict[str, 
     if docling_ok:
         markdown = docling_markdown
         if docling_failed_pages:
-            names = ", ".join(f"page-{p:03d}.png" for p in docling_failed_pages)
+            names = ", ".join(
+                name for p in docling_failed_pages for name in rendered_pages
+                if name.rsplit(".", 1)[0] == f"page-{p:03d}"
+            )
             plural = len(docling_failed_pages) > 1
             markdown = (
                 f"{markdown.rstrip()}\n\n> **Hinweis:** Docling konnte "

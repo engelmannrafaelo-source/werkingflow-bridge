@@ -1,7 +1,7 @@
 """
 Vision-based image description for converted documents.
 
-Docling extracts figures/charts/photos from a PDF as base64 PNGs and references
+The converter supplies figures/charts/photos/pages as base64 PNG/JPEG and references
 them in the Markdown, but it does NOT describe them. This module runs each
 extracted image through the Bridge ``VisionProvider`` so a converted document
 carries textual descriptions of its images. That way every consumer (Report,
@@ -34,6 +34,7 @@ from fastapi import HTTPException
 
 from src.vision_provider import get_vision_provider
 from src.model_registry import get_default_model
+from src.privacy_service.image_encoding import image_data_url
 
 logger = logging.getLogger(__name__)
 
@@ -96,7 +97,7 @@ async def _describe_one(
                 {"type": "text", "text": user_text},
                 {
                     "type": "image_url",
-                    "image_url": {"url": f"data:image/png;base64,{b64}"},
+                    "image_url": {"url": image_data_url(b64)},
                 },
             ],
         }
