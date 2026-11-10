@@ -843,6 +843,11 @@ def _reject_foreign_or_malformed(job_id: str) -> Optional[JSONResponse]:
     return None
 
 
+def _gespeicherter_zeitkontext(job: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    zk = (job.get("attribution") or {}).get(ZEITKONTEXT_KEY)
+    return zk if isinstance(zk, dict) else None
+
+
 @router.get("/v1/jobs/{job_id}")
 async def get_job_endpoint(
     job_id: str,
@@ -903,6 +908,9 @@ async def get_job_endpoint(
             job_error_view(job.get("error"))
             if job["status"] == store.JOB_STATUS_ERROR else None
         ),
+        # Annahme-Echo (docs/contracts/zeitkontext.md): stored
+        # attribution.zeitkontext or null.
+        "zeitkontext": _gespeicherter_zeitkontext(job),
         **_deferral_view(job),
     }
 

@@ -1,8 +1,8 @@
 import asyncio
 import json
 import os
-import subprocess
 import shlex
+import subprocess
 import sys
 import uuid
 import time
@@ -160,13 +160,23 @@ def apply_zeitkontext_settings(options: Any, zeitkontext: Optional[Dict[str, Any
             "refusing to overwrite it (docs/contracts/zeitkontext.md)"
         )
     inhalt = json.dumps(zeitkontext_settings(zeitkontext))
-    with tempfile.NamedTemporaryFile(
-        mode="w", suffix=".json", prefix="bridge_zeitkontext_settings_",
-        delete=False, encoding="utf-8",
-    ) as f:
-        f.write(inhalt)
-    options.settings = f.name
-    return f.name
+    pfad: Optional[str] = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".json", prefix="bridge_zeitkontext_settings_",
+            delete=False, encoding="utf-8",
+        ) as f:
+            pfad = f.name
+            f.write(inhalt)
+    except Exception as err:
+        if pfad:
+            try:
+                os.unlink(pfad)
+            except OSError:
+                pass
+        raise RuntimeError(f"zeitkontext: writing the settings file failed: {err}") from err
+    options.settings = pfad
+    return pfad
 
 
 def _inject_cli_options(command, file_options: list) -> list:
@@ -3264,6 +3274,13 @@ class ClaudeCodeCLI:
                         )
 
             finally:
+                # Zeitkontext settings file: first action, before any other cleanup
+                if _zeitkontext_settings_path:
+                    try:
+                        os.unlink(_zeitkontext_settings_path)
+                    except Exception as zk_cleanup_err:
+                        logger.warning(f"zeitkontext settings cleanup failed: {zk_cleanup_err}")
+
                 # Progress tracking: Write final response
                 if progress_tracking_enabled:
                     duration = (datetime.now() - start_time).total_seconds()
@@ -3336,12 +3353,6 @@ class ClaudeCodeCLI:
                         )
                     finally:
                         _current_append_sys_prompt_tempfile.set(None)
-
-                if _zeitkontext_settings_path:
-                    try:
-                        os.unlink(_zeitkontext_settings_path)
-                    except Exception as zk_cleanup_err:
-                        logger.warning(f"zeitkontext settings cleanup failed: {zk_cleanup_err}")
 
                 # Restore original environment (if we changed anything)
                 if original_env:

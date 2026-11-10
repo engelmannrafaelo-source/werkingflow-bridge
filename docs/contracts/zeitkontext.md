@@ -25,7 +25,8 @@ bricht nichts ab — der Aufrufer bleibt die einzige Quelle der Zeit.
   **keine Restzeit**, **nicht im payload**. `payload_digest` und damit die
   Idempotenz bleiben unberührt: dieselbe `Idempotency-Key`-Wiederholung mit
   anderem Zeitkontext ist derselbe Payload. Gespeichert bleibt dabei der
-  Zeitkontext der ersten Annahme.
+  Zeitkontext der ersten Annahme (gewollt: ein Replay liefert den ALTEN Job
+  mit der ALTEN Frist).
 - `422` (`detail.code = "zeitkontext_invalid"`), laut und vor dem Anlegen:
   kein Integer; unplausibel (vor Epoch 1600000000 oder mehr als 30 Tage
   voraus — fängt Millisekunden und „Restzeit statt Frist“); Phase-Ende ohne
@@ -56,7 +57,9 @@ bricht nichts ab — der Aufrufer bleibt die einzige Quelle der Zeit.
 - Nur der Abo-CLI-Weg (`run_completion`) eines Job-Selbstaufrufs. Direkte
   Aufrufe ohne Job und Nicht-CLI-Provider bekommen keinen Zeitkontext.
 - Wird der Selbstaufruf an einen anderen Worker weitergereicht
-  (`x-bridge-chat-frist-bis`), läuft er dort ohne Zeitkontext.
+  (`x-bridge-chat-frist-bis`, Peer-Chat-Fall), läuft er dort ohne Zeitkontext
+  und ohne Hinweis im Log; dieser Fall ist nur dokumentiert.
+- Jeder Selbstaufruf macht einen zusätzlichen `get_job` (Owner nimmt das an).
 - Die Angabe erreicht das Modell erst an der nächsten Hook-Grenze (Prompt-
   Eingang, Ende eines Werkzeugaufrufs); ein Lauf ohne Werkzeuge sieht sie
   einmal am Anfang.
@@ -69,3 +72,11 @@ bricht nichts ab — der Aufrufer bleibt die einzige Quelle der Zeit.
 `GET /v1/jobs/{job_id}` liefert zusätzlich `created_at` und `finished_at`
 (UTC-Epoch-Sekunden, float, 3 Nachkommastellen; `finished_at` ist `null`, bis
 der Job terminal ist). Quelle ist die Store-Zeile.
+
+## Annahme-Echo
+
+`GET /v1/jobs/{job_id}` liefert zusätzlich `zeitkontext` = gespeicherter
+`attribution.zeitkontext` (`{lauf_ende_epoch, phase_ende_epoch}`) oder `null`.
+Nur dieses Feld, additiv. Im gemischten Rolling sieht der Aufrufer so, ob der
+Job den Zeitkontext trägt: Energy darf sich auf den Hook erst nach vollendetem
+Rolling verlassen; Prüfung per GET-Feld.
