@@ -4,6 +4,7 @@ Tools owns result storage and verifies its owner before calling. This endpoint
 never trusts X-User-ID, body user IDs, arbitrary plans or global service tokens.
 """
 import json
+import logging
 import uuid
 from typing import Optional
 
@@ -14,6 +15,8 @@ from src.api_auth import AuthClaims, require_jwt
 from src.db.client import get_pool
 from src.principals import get_principal_row_by_hash, hash_token
 from src.billing.project_credits_service import CreditsExhaustedError, consume_credit_on_connection
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(tags=['billing'])
 PATH = '/v1/billing/schema-generator/credit-consumption'
@@ -91,8 +94,9 @@ async def consume_generator_credit(
         receipt = await consume_once(user_id, body.project_id)
     except CreditsExhaustedError:
         raise HTTPException(402, 'No available generator download credit') from None
-    except Exception:
-        # No internal exception/SQL/JWT/email in response or application log.
+    except Exception as e:
+        # Log only the exception class, never exception details or user data.
+        logger.warning("Generator credit consumption failed: %s", type(e).__name__)
         raise HTTPException(503, 'Credit consumption unavailable') from None
     response.headers['Cache-Control'] = 'no-store'
     return receipt

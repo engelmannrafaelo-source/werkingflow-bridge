@@ -1,4 +1,5 @@
 """Scoped machine-only identity existence read; never an anonymous email oracle."""
+import logging
 import time
 from collections import OrderedDict
 from typing import Optional
@@ -8,6 +9,8 @@ from pydantic import BaseModel, ConfigDict, EmailStr
 
 from src.principals import get_principal_row_by_hash, hash_token
 from src.identity.user_resolver import lookup_user_id_by_email
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter()
 PATH = "/v1/auth/account-exists"
@@ -33,7 +36,8 @@ async def scoped_reader(
         raise HTTPException(401, "Invalid reader credential")
     try:
         principal = await get_principal_row_by_hash(hash_token(token))
-    except Exception:
+    except Exception as e:
+        logger.warning("Identity reader authorization failed: %s", type(e).__name__)
         raise HTTPException(503, "Identity service unavailable") from None
     if not principal:
         raise HTTPException(401, "Invalid reader credential")
@@ -61,7 +65,8 @@ async def account_exists(body: AccountExistsRequest, response: Response,
         _windows.popitem(last=False)
     try:
         exists = await lookup_user_id_by_email(str(body.email).strip().lower()) is not None
-    except Exception:
+    except Exception as e:
+        logger.warning("Account existence lookup failed: %s", type(e).__name__)
         raise HTTPException(503, "Identity service unavailable") from None
     response.headers["Cache-Control"] = "no-store"
     return {"exists": exists}
