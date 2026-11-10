@@ -120,6 +120,31 @@ async def _wunsch_im_store(job_id: str) -> bool:
     return bool(state and state.get("cancel_requested"))
 
 
+async def _zeitkontext_binden(job_id: str) -> Any:
+    """Hand the job's STORED attribution.zeitkontext (validated at submit,
+    jobs/routes.py) to the CLI runner of this self-call
+    (docs/contracts/zeitkontext.md). Read from the store, never from a
+    header. Returns the reset token, or None when the job has none. A failed
+    read is logged loudly and the run goes on without the time hint — the
+    hint must never break a job."""
+    from src.jobs import store_client
+
+    try:
+        job = await store_client.get_job(job_id)
+    except Exception as e:  # noqa: BLE001
+        logger.error(
+            f"🕒 job self-call {job_id}: zeitkontext lookup failed, run continues "
+            f"WITHOUT time hint: {type(e).__name__}: {e}"
+        )
+        return None
+    zeitkontext = ((job or {}).get("attribution") or {}).get("zeitkontext")
+    if not isinstance(zeitkontext, dict):
+        return None
+    from src import claude_cli as _cli
+
+    return _cli.zeitkontext_binden(zeitkontext)
+
+
 async def unter_job_aufsicht(
     request: Any,
     arbeit: Awaitable[T],
@@ -137,11 +162,16 @@ async def unter_job_aufsicht(
     from src.activity.delivery import caller_gone
     from src.jobs import store_client, teilverbrauch
 
+    zk_token = await _zeitkontext_binden(job_id)
     sammler, token = teilverbrauch.beginnen()
     try:
         task = asyncio.ensure_future(arbeit)  # copies the collector into its context
     finally:
         teilverbrauch.beenden(token)
+        if zk_token is not None:
+            from src import claude_cli as _cli
+
+            _cli.zeitkontext_loesen(zk_token)
     event = asyncio.Event()
     _LAUFENDE.setdefault(job_id, set()).add(event)
     beginn = time.time()
