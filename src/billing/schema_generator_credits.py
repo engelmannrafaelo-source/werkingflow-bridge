@@ -37,7 +37,8 @@ async def generator_writer(
         raise HTTPException(401, 'Missing generator credential')
     try:
         p = await get_principal_row_by_hash(hash_token(x_schema_generator_key))
-    except Exception:
+    except Exception as e:
+        logger.warning("Generator authority lookup failed: %s", type(e).__name__)
         raise HTTPException(503, 'Generator authority unavailable') from None
     if not p:
         raise HTTPException(401, 'Invalid generator credential')
