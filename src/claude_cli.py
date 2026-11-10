@@ -2265,6 +2265,9 @@ class ClaudeCodeCLI:
             os.environ['DISABLE_COACH_MCP'] = 'true'
             logger.info("🚫 Coach MCP disabled for wrapper session (prevents spawn loop)")
             
+            # Before the try so the finally can never hit an UnboundLocalError.
+            _zeitkontext_settings_path: Optional[str] = None  # per-run hook settings
+
             try:
                 # Session-specific directory for ALL sessions
                 # Creates: instances/{instance}/YYYY-MM-DD-HHMM_{cli_session_id}/
@@ -2484,7 +2487,6 @@ class ClaudeCodeCLI:
                 chunks_buffer = []
                 _sys_prompt_tempfile_path: Optional[str] = None  # cleanup target for large system_prompt
                 _append_sys_prompt_tempfile_path: Optional[str] = None  # ditto, appended block
-                _zeitkontext_settings_path: Optional[str] = None  # per-run hook settings
 
                 # Build SDK options
                 options = ClaudeCodeOptions(

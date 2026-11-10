@@ -58,7 +58,10 @@ bricht nichts ab — der Aufrufer bleibt die einzige Quelle der Zeit.
   Aufrufe ohne Job und Nicht-CLI-Provider bekommen keinen Zeitkontext.
 - Wird der Selbstaufruf an einen anderen Worker weitergereicht
   (`x-bridge-chat-frist-bis`, Peer-Chat-Fall), läuft er dort ohne Zeitkontext
-  und ohne Hinweis im Log; dieser Fall ist nur dokumentiert.
+  und ohne Hook; im Log steht eine WARN-Zeile (`peer relay run without
+  zeitkontext hook`). Das GET-Echo `zeitkontext` beweist die Annahme, nicht den
+  Hook-Lauf; ein über den Peer-Relay (`x-bridge-chat-frist-bis`) laufender
+  Chat-Selbstaufruf läuft ohne Hook.
 - Jeder Selbstaufruf macht einen zusätzlichen `get_job` (Owner nimmt das an).
 - Die Angabe erreicht das Modell erst an der nächsten Hook-Grenze (Prompt-
   Eingang, Ende eines Werkzeugaufrufs); ein Lauf ohne Werkzeuge sieht sie
@@ -80,3 +83,7 @@ der Job terminal ist). Quelle ist die Store-Zeile.
 Nur dieses Feld, additiv. Im gemischten Rolling sieht der Aufrufer so, ob der
 Job den Zeitkontext trägt: Energy darf sich auf den Hook erst nach vollendetem
 Rolling verlassen; Prüfung per GET-Feld.
+
+## Nachlaufposten
+
+- Zeitkontext im Peer-Zweig binden (eigener Auftrag nach dem Rolling).

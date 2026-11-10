@@ -2804,6 +2804,16 @@ async def chat_completions(
             model=request_body.model,
             endpunkt="/v1/chat/completions",
         )
+    from src.jobs.selbstaufruf import job_lauf as _job_lauf
+
+    _relay_job = _job_lauf(request)
+    if _relay_job:
+        # No store read here: the job may carry a zeitkontext, but this peer
+        # relay branch runs without the hook (contract: zeitkontext.md).
+        logger.warning(
+            f"job {_relay_job}: peer relay run without zeitkontext hook "
+            "(may carry a zeitkontext; no hook on the peer)"
+        )
     rest = _cw.rest_s(bis)
     if rest < _cw.CHAT_RELAY_MIN_REST_S:
         logger.warning(
