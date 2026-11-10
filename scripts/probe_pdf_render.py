@@ -16,6 +16,18 @@ import io
 import json
 import random
 import sys
+import os
+import socket
+import subprocess
+
+
+def no_network(*args, **kwargs):
+    raise RuntimeError("Offline probe: network access forbidden")
+
+
+socket.socket.connect = no_network
+socket.create_connection = no_network
+socket.getaddrinfo = no_network
 import time
 import types
 from pathlib import Path
@@ -99,15 +111,24 @@ def check_boundary():
 
 def check_pathological():
     with Image.frombytes("RGB", (1600, 1600), random.Random(42).randbytes(1600 * 1600 * 3)) as image:
-        refuse(lambda: dc._encode_vision_jpeg(image, "Seite 9"), "Seite 9", "55", 700 * 1024)
+        encoded = dc._encode_vision_jpeg(image, "Seite 9")
+        with Image.open(io.BytesIO(base64.b64decode(encoded))) as reduced:
+            assert 900 <= max(reduced.size) < 1600
+            details = dict(before_px=[1600, 1600], after_px=list(reduced.size), after_b64_bytes=len(encoded))
+        with patch.object(dc, "PDF_IMAGE_MAX_B64_BYTES", 1000):
+            refuse(lambda: dc._encode_vision_jpeg(image, "Seite 9"), "Seite 9", "55", 1000, "900 px")
         # Real PDF rendering must propagate the refusal; no successful subset.
         out = io.BytesIO()
         image.save(out, format="PDF", resolution=24, quality=100)
-        refuse(lambda: dc._render_pdf_pages(out.getvalue(), [0]), "Seite 1", "55")
+        with patch.object(dc, "PDF_IMAGE_MAX_B64_BYTES", 1000):
+            refuse(lambda: dc._render_pdf_pages(out.getvalue(), [0]), "Seite 1", "55", "900 px")
+        details["refusal_limit"] = 1000
+        details["refusal_edge"] = 900
+        return details
 
 
 def check_quality_steps():
-    with Image.frombytes("RGB", (600, 600), random.Random(7).randbytes(600 * 600 * 3)) as image:
+    with Image.frombytes("RGB", (400, 400), random.Random(7).randbytes(400 * 400 * 3)) as image:
         candidates = {}
         for q in dc.PDF_IMAGE_JPEG_QUALITIES:
             with patch.object(dc, "PDF_IMAGE_JPEG_QUALITIES", (q,)):
@@ -226,8 +247,8 @@ def check_mime():
 def mutations():
     source = Path(dc.__file__).read_text()
     variants = [
-        ("binary_instead_of_base64", "if len(b64) < PDF_IMAGE_MAX_B64_BYTES:", "if len(base64.b64decode(b64)) < PDF_IMAGE_MAX_B64_BYTES:", check_boundary),
-        ("allows_equal_limit", "if len(b64) < PDF_IMAGE_MAX_B64_BYTES:", "if len(b64) <= PDF_IMAGE_MAX_B64_BYTES:", check_boundary),
+        ("binary_instead_of_base64", "if len(b64) < limit:", "if len(base64.b64decode(b64)) < limit:", check_boundary),
+        ("allows_equal_limit", "if len(b64) < limit:", "if len(b64) <= limit:", check_boundary),
         ("drops_last_page", "enumerate(page_indices, start=1)", "enumerate(page_indices[:-1], start=1)", check_pages),
         ("ignores_response_budget", "if max_total_bytes is not None and total_bytes > max_total_bytes:", "if False:", check_budget),
         ("stale_page_reference", 'page["markdown"] = renamed(page["markdown"])', 'page["markdown"] = page["markdown"]', check_figures),
@@ -254,7 +275,15 @@ def mutations():
     return outcomes
 
 
-def measurements(paths):
+def measurements(paths, baseline_ref):
+    baseline = None
+    if baseline_ref:
+        source = subprocess.check_output(
+            ["git", "show", f"{baseline_ref}:src/privacy_service/document_converter.py"], cwd=ROOT, text=True
+        )
+        baseline = types.ModuleType("pdf_probe_baseline")
+        sys.modules[baseline.__name__] = baseline
+        exec(compile(source, "baseline", "exec"), vars(baseline))
     rows = []
     for sample, path in enumerate(paths, 1):
         raw = Path(path).read_bytes()
@@ -268,42 +297,76 @@ def measurements(paths):
                     try:
                         with bitmap.to_pil() as image:
                             original_png = png(image)
-                            before = len(original_png)
-                            candidates = {}
-                            for q in dc.PDF_IMAGE_JPEG_QUALITIES:
-                                with patch.object(dc, "PDF_IMAGE_JPEG_QUALITIES", (q,)):
-                                    try:
-                                        candidates[q] = dc._encode_vision_jpeg(image, "probe")
-                                    except dc.DocumentTooLargeError:
-                                        pass
+                            before_size = image.size
                     finally:
                         bitmap.close()
                 finally:
                     page.close()
+                row = {"sample": sample, "page": idx + 1, "pages": len(doc),
+                       "width_pt": size[0], "height_pt": size[1],
+                       "png_b64_bytes": len(original_png), "before_px": before_size}
+                old_b64 = None
+                if baseline:
+                    try:
+                        old_b64 = next(iter(baseline._render_pdf_pages(raw, [idx]).values()))
+                        row["before_b64_bytes"] = len(old_b64)
+                    except baseline.DocumentTooLargeError as exc:
+                        row["before_refused"] = str(exc)
                 start = time.perf_counter()
-                result = dc._render_pdf_pages(raw, [idx])
-                elapsed = time.perf_counter() - start
+                attempts = []
+                save = Image.Image.save
+                def record_save(image, fp, *args, **kwargs):
+                    if kwargs.get("format") == "JPEG":
+                        attempts.append({"edge": max(image.size), "quality": kwargs["quality"]})
+                    return save(image, fp, *args, **kwargs)
+                try:
+                    with patch.object(Image.Image, "save", record_save):
+                        result = dc._render_pdf_pages(raw, [idx])
+                except dc.DocumentTooLargeError as exc:
+                    row.update(status=413, error=str(exc), attempts=attempts)
+                    rows.append(row)
+                    continue
                 name, b64 = next(iter(result.items()))
-                assert len(b64) < dc.PDF_IMAGE_MAX_B64_BYTES
+                assert len(b64) < dc._pdf_image_max_b64_bytes()
                 if name.endswith(".png"):
                     assert b64 == original_png
-                quality = next((q for q, candidate in candidates.items() if candidate == b64), None)
-                rows.append({"sample": sample, "page": idx + 1, "pages": len(doc), "width_pt": size[0], "height_pt": size[1],
-                             "before_b64_bytes": before, "after_b64_bytes": len(b64), "jpeg_quality": quality,
-                             "jpeg": int(name.endswith(".jpg")), "seconds": round(elapsed, 4)})
+                with Image.open(io.BytesIO(base64.b64decode(b64))) as image:
+                    after_size = image.size
+                row.update(status=200, after_b64_bytes=len(b64), after_px=after_size,
+                           byte_identical_to_baseline=b64 == old_b64 if old_b64 else None,
+                           edge_retained_percent=round(100 * max(after_size) / max(before_size), 2),
+                           pixel_area_retained_percent=round(100 * after_size[0] * after_size[1] / (before_size[0] * before_size[1]), 2),
+                           jpeg_quality=attempts[-1]["quality"] if attempts else None,
+                           attempts=attempts, seconds=round(time.perf_counter() - start, 4))
+                rows.append(row)
         finally:
             doc.close()
     return rows
 
 
+def check_config():
+    for raw, expected in [("", 300000), (" 123456 ", 123456)]:
+        with patch.dict(os.environ, PDF_IMAGE_MAX_B64_BYTES=raw):
+            assert dc._pdf_image_max_b64_bytes() == expected
+    for raw in ("0", "-1", "abc", "1.5"):
+        with patch.dict(os.environ, PDF_IMAGE_MAX_B64_BYTES=raw):
+            try:
+                dc._pdf_image_max_b64_bytes()
+            except dc.ServiceConfigError:
+                pass
+            else:
+                raise AssertionError("Invalid limit accepted")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--pdf", action="append", default=[])
+    parser.add_argument("--baseline-ref")
     args = parser.parse_args()
-    checks = [check_pages, check_boundary, check_quality_steps, check_pathological, check_budget, check_figures, check_conversion, check_mime]
-    for check in checks:
-        check()
-    print(json.dumps({"checks": {check.__name__: "PASS" for check in checks}, "mutations": mutations(), "measurements": measurements(args.pdf)}, indent=2))
+    os.environ.pop("PDF_IMAGE_MAX_B64_BYTES", None)
+    checks = [check_config, check_pages, check_boundary, check_quality_steps, check_pathological, check_budget, check_figures, check_conversion, check_mime]
+    details = {check.__name__: check() for check in checks}
+    print(json.dumps({"checks": {check.__name__: "PASS" for check in checks}, "details": {k: v for k, v in details.items() if v is not None}, "mutations": mutations(), "measurements": measurements(args.pdf, args.baseline_ref)}, indent=2))
 
 
 if __name__ == "__main__":

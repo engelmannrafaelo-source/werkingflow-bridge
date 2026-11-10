@@ -281,9 +281,10 @@ def _mojibake_repaired(fn):
 RENDER_PAGE_MAX_EDGE = 1600
 
 # Claude's subscription SDK limits a JSON line (including a Read image result)
-# to 1 MiB. Bound BASE64, not compressed bytes; 700 KiB leaves 324 KiB for the
-# JSON/tool envelope. Keep resolution fixed and try JPEG qualities in order.
-PDF_IMAGE_MAX_B64_BYTES = 700 * 1024
+# to 1 MiB. Bound BASE64, not compressed bytes: the SDK envelope can duplicate
+# the payload. Override the conservative default via PDF_IMAGE_MAX_B64_BYTES.
+PDF_IMAGE_MAX_B64_BYTES = 300000
+PDF_IMAGE_MIN_EDGE = 900
 PDF_IMAGE_JPEG_QUALITIES = (85, 75, 65, 55)
 
 # Hard down-scale ceiling applied to EVERY image (Docling figures included).
@@ -366,6 +367,11 @@ def _positive_int_env(name: str, default: int) -> int:
     return value
 
 
+def _pdf_image_max_b64_bytes() -> int:
+    """Strict per-image base64 bound, shared by rendered pages and figures."""
+    return _positive_int_env("PDF_IMAGE_MAX_B64_BYTES", PDF_IMAGE_MAX_B64_BYTES)
+
+
 def _docling_batch_pages() -> int:
     """Pages per Docling ``convert`` call (``DOCLING_BATCH_PAGES``)."""
     return _positive_int_env("DOCLING_BATCH_PAGES", DOCLING_BATCH_PAGES_DEFAULT)
@@ -439,24 +445,40 @@ def _pdf_page_geometry(pdf_bytes: bytes) -> List[Tuple[int, float]]:
 
 
 def _encode_vision_jpeg(image: Any, label: str) -> str:
-    """Encode at fixed resolution, or refuse the entire conversion with 413.
+    """Try quality then edge reductions, or refuse the entire conversion with 413.
 
     Never return the last oversized attempt or quietly omit an image. The
     label identifies the page/figure without including document contents.
     """
+    from PIL import Image
+
+    limit = _pdf_image_max_b64_bytes()
     rgb = image.convert("RGB")
     try:
-        for quality in PDF_IMAGE_JPEG_QUALITIES:
-            with io.BytesIO() as buf:
-                rgb.save(buf, format="JPEG", quality=quality)
-                b64 = base64.b64encode(buf.getvalue()).decode("ascii")
-            if len(b64) < PDF_IMAGE_MAX_B64_BYTES:
-                return b64
+        while True:
+            for quality in PDF_IMAGE_JPEG_QUALITIES:
+                with io.BytesIO() as buf:
+                    rgb.save(buf, format="JPEG", quality=quality)
+                    b64 = base64.b64encode(buf.getvalue()).decode("ascii")
+                if len(b64) < limit:
+                    return b64
+            edge = max(rgb.size)
+            if edge <= PDF_IMAGE_MIN_EDGE:
+                break
+            next_edge = max(PDF_IMAGE_MIN_EDGE, int(edge * 0.85))
+            ratio = next_edge / edge
+            resized = rgb.resize(
+                (max(1, round(rgb.width * ratio)), max(1, round(rgb.height * ratio))),
+                Image.Resampling.LANCZOS,
+            )
+            rgb.close()
+            rgb = resized
         raise DocumentTooLargeError(
             f"{label}: JPEG bei Qualitaet {quality} hat {len(b64)} Byte Base64; "
-            f"erforderlich sind weniger als {PDF_IMAGE_MAX_B64_BYTES} Byte "
-            f"(PDF_IMAGE_MAX_B64_BYTES). Bitte den Bildbereich aufteilen und "
-            f"erneut umwandeln. Keine Bilder dieser Antwort wurden ausgeliefert."
+            f"erforderlich sind weniger als {limit} Byte "
+            f"(PDF_IMAGE_MAX_B64_BYTES), letzte Kantenlaenge {edge} px. "
+            f"Bitte den Bildbereich aufteilen und erneut umwandeln. "
+            f"Keine Bilder dieser Antwort wurden ausgeliefert."
         )
     finally:
         rgb.close()
@@ -488,6 +510,8 @@ def _render_pdf_pages(
     if not page_indices:
         return {}
 
+    image_limit = _pdf_image_max_b64_bytes()
+
     import pypdfium2 as pdfium
 
     try:
@@ -514,7 +538,7 @@ def _render_pdf_pages(
                             with io.BytesIO() as buf:
                                 pil_image.save(buf, format="PNG")
                                 b64 = base64.b64encode(buf.getvalue()).decode("ascii")
-                        if not b64 or len(b64) >= PDF_IMAGE_MAX_B64_BYTES:
+                        if not b64 or len(b64) >= image_limit:
                             b64 = _encode_vision_jpeg(pil_image, f"Seite {idx + 1}")
                             extension = "jpg"
                 finally:
@@ -596,12 +620,13 @@ def _prepare_pdf_figures(
     """
     from PIL import Image
 
+    image_limit = _pdf_image_max_b64_bytes()
     prepared: dict[str, str] = {}
     renames: dict[str, str] = {}
     for index, (name, original) in enumerate(figures.items(), start=1):
         b64 = _downscale_b64_png(original)
         new_name = name
-        if len(b64) >= PDF_IMAGE_MAX_B64_BYTES:
+        if len(b64) >= image_limit:
             try:
                 with (
                     Image.open(io.BytesIO(base64.b64decode(b64))) as image,
@@ -616,7 +641,7 @@ def _prepare_pdf_figures(
             except (OSError, ValueError) as exc:
                 raise DocumentTooLargeError(
                     f"Abbildung {index} ({name}): {len(b64)} Byte Base64 erreichen "
-                    f"die Grenze {PDF_IMAGE_MAX_B64_BYTES}; JPEG-Kodierung nicht "
+                    f"die Grenze {image_limit}; JPEG-Kodierung nicht "
                     f"moeglich. Keine Bilder ausgeliefert."
                 ) from exc
             new_name = os.path.splitext(name)[0] + ".jpg"

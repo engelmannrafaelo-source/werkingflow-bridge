@@ -373,3 +373,21 @@ durch einen Worker-Deploy mit Versionsprobe nachgewiesen, nicht durch
 
 Offline-Regressionsprobe: `python3 -m pytest -o addopts= -q
  tests/test_deploy_version_scope.py tests/test_version_delivery.py`.
+
+## PDF image size bound
+
+`PDF_IMAGE_MAX_B64_BYTES` sets the strict per-image base64 limit for rendered
+PDF pages and existing Docling figure guards (default: `300000`). Empty/unset
+uses the default; non-integers and values below 1 raise `ServiceConfigError`.
+Small PNGs below the limit retain their bytes. JPEG encoding tries qualities
+85/75/65/55 at the existing dimensions, then reduces the long edge by 15% per
+step down to 900 px, retrying all qualities at each step. Images already below
+900 px are never enlarged. Exhaustion raises `DocumentTooLargeError` (HTTP 413)
+with page/figure, final base64 size, limit and last edge. Lower resolution loses
+detail; the byte bound alone does not prove legibility or SDK acceptance.
+
+Offline measurement: `python scripts/probe_pdf_render.py --baseline-ref REF
+--pdf PATH` (repeat `--pdf` for multiple inputs). Requires Pillow and pypdfium2;
+uses the default limit, blocks socket connections, and substitutes Docling/OCR.
+Reports per-page previous/current sizes, dimensions, JPEG attempts and retained
+pixel area. No model or service calls are made.
