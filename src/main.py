@@ -2807,28 +2807,38 @@ async def chat_completions(
     from src.jobs.selbstaufruf import job_lauf as _job_lauf
 
     _relay_job = _job_lauf(request)
+    _zk_token = None
     if _relay_job:
-        # No store read here: the job may carry a zeitkontext, but this peer
-        # relay branch runs without the hook (contract: zeitkontext.md).
-        logger.warning(
-            f"job {_relay_job}: peer relay run without zeitkontext hook "
-            "(may carry a zeitkontext; no hook on the peer)"
+        # Same binding as the normal branch (zeitkontext.md); the run task is
+        # created inside unter_aufsicht and copies this context.
+        from src.jobs.selbstaufruf import _zeitkontext_binden
+
+        _zk_token = await _zeitkontext_binden(_relay_job)
+        logger.info(
+            f"peer relay run with zeitkontext job={_relay_job} "
+            f"bound={_zk_token is not None}"
         )
-    rest = _cw.rest_s(bis)
-    if rest < _cw.CHAT_RELAY_MIN_REST_S:
-        logger.warning(
-            f"🛑 relayed chat call refused: {rest:.0f}s of the caller's deadline left "
-            f"(< {_cw.CHAT_RELAY_MIN_REST_S:.0f}s)"
-        )
-        return _cw.frist_zu_kurz_error(rest)
     try:
-        return await _cw.unter_aufsicht(
-            _chat_completions_finanziert(request_body, request, credentials, _adaptive), bis
-        )
-    except _cw.FristAbgelaufen:
-        return _cw.frist_abgelaufen_error(bis)
-    except _cw.AufruferWeg:
-        return JSONResponse(status_code=499, content={"error": {"message": "caller gone"}})
+        rest = _cw.rest_s(bis)
+        if rest < _cw.CHAT_RELAY_MIN_REST_S:
+            logger.warning(
+                f"🛑 relayed chat call refused: {rest:.0f}s of the caller's deadline left "
+                f"(< {_cw.CHAT_RELAY_MIN_REST_S:.0f}s)"
+            )
+            return _cw.frist_zu_kurz_error(rest)
+        try:
+            return await _cw.unter_aufsicht(
+                _chat_completions_finanziert(request_body, request, credentials, _adaptive), bis
+            )
+        except _cw.FristAbgelaufen:
+            return _cw.frist_abgelaufen_error(bis)
+        except _cw.AufruferWeg:
+            return JSONResponse(status_code=499, content={"error": {"message": "caller gone"}})
+    finally:
+        if _zk_token is not None:
+            from src import claude_cli as _cli_zk
+
+            _cli_zk.zeitkontext_loesen(_zk_token)
 
 
 async def _run_api_reserve_fallback(request_body, request, *, cause):

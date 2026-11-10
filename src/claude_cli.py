@@ -119,7 +119,9 @@ def zeitkontext_loesen(token: Any) -> None:
     _current_zeitkontext.reset(token)
 
 
-def zeitkontext_settings(zeitkontext: Dict[str, Any]) -> Dict[str, Any]:
+def zeitkontext_settings(
+    zeitkontext: Dict[str, Any], log_datei: Optional[str] = None
+) -> Dict[str, Any]:
     """CLI settings (hooks only) that run the Zeitkontext-Hook at
     UserPromptSubmit and after every tool use. The script is called through
     the interpreter (``python3 <path>``), so a noexec mount does not matter."""
@@ -138,6 +140,9 @@ def zeitkontext_settings(zeitkontext: Dict[str, Any]) -> Dict[str, Any]:
     )
     if phase is not None:
         command += f" --phase-ende {phase}"
+    job_id = zeitkontext.get("job_id")
+    if log_datei and isinstance(job_id, str) and job_id:
+        command += f" --job {shlex.quote(job_id)} --log-datei {shlex.quote(log_datei)}"
     hook = {"type": "command", "command": command, "timeout": 10}
     return {
         "hooks": {
@@ -145,6 +150,37 @@ def zeitkontext_settings(zeitkontext: Dict[str, Any]) -> Dict[str, Any]:
             "PostToolUse": [{"matcher": "*", "hooks": [hook]}],
         }
     }
+
+
+_HOOKLOG_PREFIX = "bridge_zeitkontext_hooklog_"
+_SETTINGS_PREFIX = "bridge_zeitkontext_settings_"
+
+
+def zeitkontext_hooklog_pfad(settings_pfad: str) -> str:
+    """Hook log file next to the settings file (same random part, 0600)."""
+    ordner, name = os.path.split(settings_pfad)
+    return os.path.join(ordner, _HOOKLOG_PREFIX + name[len(_SETTINGS_PREFIX):].removesuffix(".json") + ".log")
+
+
+def zeitkontext_hooklog_weiterleiten(settings_pfad: str) -> None:
+    """After the run: one worker-log line per hook firing (max 200), then
+    remove the file. Never raises."""
+    pfad = zeitkontext_hooklog_pfad(settings_pfad)
+    try:
+        with open(pfad, encoding="utf-8", errors="replace") as f:
+            zeilen = [z.rstrip("\n") for _, z in zip(range(200), f)]
+        for zeile in zeilen:
+            logger.info("zeitkontext hook fired " + zeile)
+    except FileNotFoundError:
+        pass
+    except Exception as err:  # noqa: BLE001
+        logger.warning(f"zeitkontext hook log read failed: {err}")
+    try:
+        os.unlink(pfad)
+    except FileNotFoundError:
+        pass
+    except Exception as err:  # noqa: BLE001
+        logger.warning(f"zeitkontext hook log cleanup failed: {err}")
 
 
 def apply_zeitkontext_settings(options: Any, zeitkontext: Optional[Dict[str, Any]]) -> Optional[str]:
@@ -159,21 +195,23 @@ def apply_zeitkontext_settings(options: Any, zeitkontext: Optional[Dict[str, Any
             "zeitkontext: the CLI run already carries a --settings option; "
             "refusing to overwrite it (docs/contracts/zeitkontext.md)"
         )
-    inhalt = json.dumps(zeitkontext_settings(zeitkontext))
     pfad: Optional[str] = None
     try:
         with tempfile.NamedTemporaryFile(
-            mode="w", suffix=".json", prefix="bridge_zeitkontext_settings_",
+            mode="w", suffix=".json", prefix=_SETTINGS_PREFIX,
             delete=False, encoding="utf-8",
         ) as f:
             pfad = f.name
-            f.write(inhalt)
+            logpfad = zeitkontext_hooklog_pfad(pfad)
+            os.close(os.open(logpfad, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600))
+            f.write(json.dumps(zeitkontext_settings(zeitkontext, logpfad)))
     except Exception as err:
         if pfad:
-            try:
-                os.unlink(pfad)
-            except OSError:
-                pass
+            for weg in (pfad, zeitkontext_hooklog_pfad(pfad)):
+                try:
+                    os.unlink(weg)
+                except OSError:
+                    pass
         raise RuntimeError(f"zeitkontext: writing the settings file failed: {err}") from err
     options.settings = pfad
     return pfad
@@ -3282,6 +3320,7 @@ class ClaudeCodeCLI:
                         os.unlink(_zeitkontext_settings_path)
                     except Exception as zk_cleanup_err:
                         logger.warning(f"zeitkontext settings cleanup failed: {zk_cleanup_err}")
+                    zeitkontext_hooklog_weiterleiten(_zeitkontext_settings_path)
 
                 # Progress tracking: Write final response
                 if progress_tracking_enabled:

@@ -142,7 +142,7 @@ async def _zeitkontext_binden(job_id: str) -> Any:
         return None
     from src import claude_cli as _cli
 
-    return _cli.zeitkontext_binden(zeitkontext)
+    return _cli.zeitkontext_binden({**zeitkontext, "job_id": job_id})
 
 
 async def unter_job_aufsicht(

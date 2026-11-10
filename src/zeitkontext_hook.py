@@ -11,8 +11,11 @@ ein Hook darf den Lauf nie brechen.
 
 Aufruf: python3 zeitkontext_hook.py --lauf-ende <epoch> [--phase-ende <epoch>]
         (statt der Argumente: --datei <json mit lauf_ende_epoch/phase_ende_epoch>)
+        optional: --job <id> --log-datei <pfad>  (eine Logzeile je Ausloesung)
 """
 import json
+import os
+import re
 import sys
 import time
 from datetime import datetime, timezone
@@ -48,8 +51,12 @@ def _epoch(wert) -> int:
     return int(wert)
 
 
+_JOB_ID = re.compile(r"[A-Za-z0-9_-]{1,64}")
+
+
 def _fristen(argv):
-    lauf = phase = None
+    """Returns (lauf, phase, job, log_datei); job/log_datei may be None."""
+    lauf = phase = job = log_datei = None
     i = 0
     while i < len(argv):
         name = argv[i]
@@ -64,17 +71,44 @@ def _fristen(argv):
             lauf = _epoch(daten["lauf_ende_epoch"])
             if daten.get("phase_ende_epoch") is not None:
                 phase = _epoch(daten["phase_ende_epoch"])
+        elif name == "--job":
+            job = wert if _JOB_ID.fullmatch(wert) else None
+        elif name == "--log-datei":
+            log_datei = wert
         else:
             raise ValueError(f"unbekanntes Argument {name!r}")
         i += 2
     if lauf is None:
         raise ValueError("lauf-ende fehlt")
-    return lauf, phase
+    return lauf, phase, job, log_datei
+
+
+def log_zeile(job, ereignis: str, lauf_ende: int, jetzt=None) -> str:
+    """``job=<id> event=<name> rest_s=<n|abgelaufen> t=<epoch>`` — nur diese
+    vier Felder, kein Hook-Text, keine Frist-ISO, keine Prompt-/Tool-Inhalte."""
+    jetzt = time.time() if jetzt is None else jetzt
+    rest = int(lauf_ende - jetzt)
+    rest_s = "abgelaufen" if rest < 0 else str(rest)
+    ereignis = ereignis if _JOB_ID.fullmatch(ereignis) else "?"
+    return f"job={job or '-'} event={ereignis} rest_s={rest_s} t={int(jetzt)}"
+
+
+def _logge(pfad, zeile: str) -> None:
+    if not pfad:
+        return
+    try:
+        fd = os.open(pfad, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+        try:
+            os.write(fd, (zeile + "\n").encode("utf-8"))
+        finally:
+            os.close(fd)
+    except BaseException:  # noqa: BLE001 — Logzeile ist Beiwerk, nie Grund zu scheitern
+        pass
 
 
 def main(argv=None) -> int:
     try:
-        lauf, phase = _fristen(sys.argv[1:] if argv is None else argv)
+        lauf, phase, job, log_datei = _fristen(sys.argv[1:] if argv is None else argv)
         ereignis = json.loads(sys.stdin.read())["hook_event_name"]
         if not isinstance(ereignis, str) or not ereignis:
             raise ValueError("hook_event_name fehlt")
@@ -85,6 +119,7 @@ def main(argv=None) -> int:
             }
         })
         sys.stdout.write(ausgabe + "\n")
+        _logge(log_datei, log_zeile(job, ereignis, lauf))
     except BaseException:  # noqa: BLE001 — der Hook darf den Lauf nie brechen
         return 0
     return 0

@@ -57,11 +57,10 @@ bricht nichts ab — der Aufrufer bleibt die einzige Quelle der Zeit.
 - Nur der Abo-CLI-Weg (`run_completion`) eines Job-Selbstaufrufs. Direkte
   Aufrufe ohne Job und Nicht-CLI-Provider bekommen keinen Zeitkontext.
 - Wird der Selbstaufruf an einen anderen Worker weitergereicht
-  (`x-bridge-chat-frist-bis`, Peer-Chat-Fall), läuft er dort ohne Zeitkontext
-  und ohne Hook; im Log steht eine WARN-Zeile (`peer relay run without
-  zeitkontext hook`). Das GET-Echo `zeitkontext` beweist die Annahme, nicht den
-  Hook-Lauf; ein über den Peer-Relay (`x-bridge-chat-frist-bis`) laufender
-  Chat-Selbstaufruf läuft ohne Hook.
+  (`x-bridge-chat-frist-bis`, Peer-Chat-Fall), bindet der Peer-Zweig denselben
+  Zeitkontext aus dem Store (`_zeitkontext_binden`, Reset im `finally`); im Log
+  steht INFO `peer relay run with zeitkontext job=<id> bound=<true|false>`.
+  Das GET-Echo `zeitkontext` beweist die Annahme, nicht den Hook-Lauf.
 - Jeder Selbstaufruf macht einen zusätzlichen `get_job` (Owner nimmt das an).
 - Die Angabe erreicht das Modell erst an der nächsten Hook-Grenze (Prompt-
   Eingang, Ende eines Werkzeugaufrufs); ein Lauf ohne Werkzeuge sieht sie
@@ -84,6 +83,17 @@ Nur dieses Feld, additiv. Im gemischten Rolling sieht der Aufrufer so, ob der
 Job den Zeitkontext trägt: Energy darf sich auf den Hook erst nach vollendetem
 Rolling verlassen; Prüfung per GET-Feld.
 
+## Hook-Logzeile
+
+Je Hook-Auslösung (UserPromptSubmit/PostToolUse) hängt der Hook eine Zeile an
+eine Datei neben der settings-Datei (`bridge_zeitkontext_hooklog_*`, 0600):
+`job=<id> event=<hook_event_name> rest_s=<n|abgelaufen> t=<epoch>` — nur diese
+vier Felder, kein Hook-Text, keine Frist-ISO, keine Prompt-/Tool-Inhalte. Nach
+Jobende liest `claude_cli.py` die Datei (max. 200 Zeilen), schreibt je Zeile
+`zeitkontext hook fired <zeile>` ins Worker-Log und entfernt die Datei. Die
+Zeilen erscheinen also erst nach dem Lauf. Schreibfehler im Hook werden still
+ignoriert (Exit 0). `rest_s` bezieht sich auf die Lauf-Frist.
+
 ## Nachlaufposten
 
-- Zeitkontext im Peer-Zweig binden (eigener Auftrag nach dem Rolling).
+- keine offen (Peer-Zweig und Hook-Logzeile erledigt).
