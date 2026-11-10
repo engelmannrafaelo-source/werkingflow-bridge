@@ -11989,6 +11989,7 @@ async def get_queue_forecast(
     except Exception as e:
         logger.warning(f"queue-forecast: cannot read cc-usage-history: {e}")
 
+    from src.middleware.account_reserve import capacity_lock_weekly_threshold
     account_to_worker = {
         "engelmann": "worker1",
         "office":    "worker2",
@@ -12008,7 +12009,7 @@ async def get_queue_forecast(
                 "account": name,
                 "weekly_percent": weekly,
                 "session_percent": session,
-                "active": (weekly < 95) and (session < 95),
+                "active": (weekly < capacity_lock_weekly_threshold(name)) and (session < 95),
             }
 
     # Compute simple forecast

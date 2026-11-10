@@ -42,7 +42,7 @@ def local_accounts(base_url, headers, min_tokens=100):
             if (a['bridge_enabled'] and a.get('available') is True
                     and number('cooldown_remaining_s') == 0
                     and number('effective_cap_tokens') - number('current_in_flight_tokens') > min_tokens
-                    and not (a.get('usage_known') is True and number('weekly_percent') >= 96)):
+                    and not (a.get('usage_known') is True and number('weekly_percent') >= 97)):  # = account_reserve.WEEKLY_POOL_WALL
                 eligible.append((rank, name))
         return [name for _, name in sorted(eligible)]
     except (requests.RequestException, ValueError, KeyError, TypeError) as exc:

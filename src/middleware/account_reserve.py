@@ -15,6 +15,16 @@ OWNER_WEEKLY_LIMIT = {"rafael": 97.0}
 # Accounts missing here (e.g. the Partner workers) are unknown -> 90 %.
 ACCOUNT_OWNER = {"engelmann": "rafael", "office": "rafael", "gmail": "rafael", "werking": "rafael"}
 
+# Highest per-account automation limit = the weekly wall of pool routing
+# (docker/lua/pool_pick.lua WEEKLY_HARD_EXCLUDE_PCT, scripts/bridge-deploy.sh,
+# scripts/bridge_smoke_accounts.py mirror this value; keep them equal).
+WEEKLY_POOL_WALL = max([AUTOMATION_WEEKLY_LIMIT, *OWNER_WEEKLY_LIMIT.values()])
+# Weekly capacity lock (lock until weekly reset) never below the account's own limit.
+CAPACITY_LOCK_WEEKLY_MIN = 95.0
+
+def capacity_lock_weekly_threshold(account: Optional[str] = None) -> float:
+    return max(CAPACITY_LOCK_WEEKLY_MIN, automation_weekly_limit(account))
+
 def valid_percent(value) -> bool:
     return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value) and value >= 0
 
@@ -23,7 +33,8 @@ def automation_weekly_limit(account: Optional[str] = None) -> float:
     if account is None:
         from src.middleware.adaptive_limiter import WORKER_ACCOUNT  # lazy: limiter imports this module
         account = WORKER_ACCOUNT
-    return OWNER_WEEKLY_LIMIT.get(ACCOUNT_OWNER.get(account or ""), AUTOMATION_WEEKLY_LIMIT)
+    limit = OWNER_WEEKLY_LIMIT.get(ACCOUNT_OWNER.get(account) if isinstance(account, str) else None)
+    return float(limit) if valid_percent(limit) and limit <= 100 else AUTOMATION_WEEKLY_LIMIT
 
 def reserve_reason(usage: dict, account: Optional[str] = None) -> Optional[str]:
     weekly = usage.get("weekly_pct")

@@ -37,7 +37,7 @@ from dataclasses import dataclass, asdict, field
 from typing import Optional, Dict, Any, List
 
 from fastapi import HTTPException, Request
-from src.middleware.account_reserve import reserve_reason, require_account_reserve, valid_percent, automation_weekly_limit
+from src.middleware.account_reserve import reserve_reason, require_account_reserve, valid_percent, automation_weekly_limit, capacity_lock_weekly_threshold
 
 from src.middleware.bridge_error import (
     BridgeError,
@@ -528,13 +528,13 @@ class AdaptiveLoadLimiter:
             logger.error(f"_maybe_release_capacity_lock failed: {e}")
 
     def _maybe_set_capacity_lock(self, acc: dict) -> None:
-        """Lock this worker until Anthropic's reported reset time when at quota wall (≥95%)."""
+        """Lock this worker until Anthropic's reported reset time when at quota wall (weekly: max(95, account limit); session ≥95%)."""
         try:
             from src.middleware.capacity_lock import get_capacity_lock
             cap_lock = get_capacity_lock()
             weekly_pct  = float(acc.get("weeklyAllModels", {}).get("percent", 0) or 0)
             session_pct = float(acc.get("currentSession",  {}).get("percent", 0) or 0)
-            if weekly_pct >= 95:
+            if weekly_pct >= capacity_lock_weekly_threshold():
                 reset_in = _parse_reset_string(
                     acc.get("weeklyAllModels", {}).get("resetDate", "")
                 )

@@ -1886,7 +1886,7 @@ def eligible_account_count() -> int:
         if a.get("available")
         and (a.get("cooldown_remaining_s") or 0) == 0
         and (a.get("effective_cap_tokens") or 0) > (a.get("current_in_flight_tokens") or 0)
-        and (a.get("weekly_percent") or 0) < 96
+        and (a.get("weekly_percent") or 0) < 97  # = account_reserve.WEEKLY_POOL_WALL
     )
 
 
