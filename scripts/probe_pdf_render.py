@@ -40,6 +40,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from src.privacy_service import document_converter as dc
 from src.privacy_service.image_encoding import image_data_url
+from src.privacy_service import image_encoding
 
 
 def png(image):
@@ -245,27 +246,27 @@ def check_mime():
 
 
 def mutations():
-    source = Path(dc.__file__).read_text()
     variants = [
-        ("binary_instead_of_base64", "if len(b64) < limit:", "if len(base64.b64decode(b64)) < limit:", check_boundary),
-        ("allows_equal_limit", "if len(b64) < limit:", "if len(b64) <= limit:", check_boundary),
-        ("drops_last_page", "enumerate(page_indices, start=1)", "enumerate(page_indices[:-1], start=1)", check_pages),
-        ("ignores_response_budget", "if max_total_bytes is not None and total_bytes > max_total_bytes:", "if False:", check_budget),
-        ("stale_page_reference", 'page["markdown"] = renamed(page["markdown"])', 'page["markdown"] = page["markdown"]', check_figures),
-        ("stale_figure_metadata", 'figure["name"] = renames.get(figure["name"], figure["name"])', 'figure["name"] = figure["name"]', check_figures),
+        (image_encoding, "binary_instead_of_base64", "if len(b64) < limit:", "if len(base64.b64decode(b64)) < limit:", check_boundary),
+        (image_encoding, "allows_equal_limit", "if len(b64) < limit:", "if len(b64) <= limit:", check_boundary),
+        (dc, "drops_last_page", "enumerate(page_indices, start=1)", "enumerate(page_indices[:-1], start=1)", check_pages),
+        (dc, "ignores_response_budget", "if max_total_bytes is not None and total_bytes > max_total_bytes:", "if False:", check_budget),
+        (dc, "stale_page_reference", 'page["markdown"] = renamed(page["markdown"])', 'page["markdown"] = page["markdown"]', check_figures),
+        (dc, "stale_figure_metadata", 'figure["name"] = renames.get(figure["name"], figure["name"])', 'figure["name"] = figure["name"]', check_figures),
     ]
     outcomes = {}
-    for label, old, new, check in variants:
+    for target, label, old, new, check in variants:
+        source = Path(target.__file__).read_text()
         assert source.count(old) == 1, label
         # Replace only function objects; don't mutate files or runtime services.
         tree = ast.parse(source.replace(old, new))
         funcs = [n for n in tree.body if isinstance(n, ast.FunctionDef)]
-        ns = dict(vars(dc))
+        ns = dict(vars(target))
         module = ast.Module(body=[ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0)] + funcs, type_ignores=[])
         exec(compile(ast.fix_missing_locations(module), "mutation", "exec"), ns)  # noqa: S102 — fixed mutations of local source
         with contextlib.ExitStack() as stack:
             for node in funcs:
-                stack.enter_context(patch.object(dc, node.name, ns[node.name]))
+                stack.enter_context(patch.object(target, node.name, ns[node.name]))
             try:
                 check()
             except AssertionError:

@@ -24,9 +24,24 @@ und `scripts/generate-bridge-upstreams.sh` (LB).
 - Technik:
   - Jedes Bild wird geprüft. Das Format kommt aus der Dateisignatur (PNG,
     JPEG, GIF oder WebP), nie aus dem media type des Aufrufers.
-  - Grenzen: höchstens 5 MB Base64 je Bild, 20 MB je Aufruf und 20 Bilder je
-    Aufruf (die Triage-Gruppe). Das Bild muss Base64 sein, eine URL wird
-    abgewiesen.
+  - Grenzen: strikt weniger als 400000 Byte Base64 je Bild vor CLI/Datei
+    (positive Integer-Env `ABO_VISION_MAX_IMAGE_B64`, leer = Standard),
+    weiterhin 20 MiB Eingangsdaten je Aufruf und 20 Bilder (Triage-Gruppe).
+    Das Bild muss Base64 sein, eine URL wird abgewiesen.
+  - Bilder ab der Einzelgrenze nutzen dieselbe JPEG-Kaskade wie PDF-Seiten:
+    Qualität 85/75/65/55, dann lange Kante × 0,85 bis mindestens 900 px
+    (kleinere Originale werden nicht vergrößert). Gemeinsamer Code:
+    `src/privacy_service/image_encoding.py`. Transparenz wird weiß hinterlegt.
+    Kleine Bilder bleiben bytegleich. MIME und CLI-Dateiendung folgen den
+    erzeugten Bytes; JPEG darf PNG ersetzen. Dokument-Schlüssel bleiben
+    logische Referenzen, damit Markdown und Metadaten gültig bleiben.
+  - Passt auch der letzte Versuch nicht, folgt 413 mit Bildnummer/Name,
+    Base64-Größe, Grenze und letzter Kante. Jede Neukodierung protokolliert
+    Kennung, alte/neue Kante, Qualität und Größe, keine Inhalte.
+  - Die Worker-Vorbereitung gilt nur im Abo-Zweig, einschließlich des
+    PoolUnavailable-Rückfalls. Die Pool-/Anthropic-Grenze bleibt 5 MiB.
+    Netzfreie Probe: `python3 scripts/probe_abo_image.py`; sie prüft auch
+    Bytegleichheit, 413, MIME/Datei, Worker-Rückfall und die 5-MiB-Mutation.
   - Die Bilder liegen in einem frischen Verzeichnis (`mkdtemp`, 0700). Jede
     Datei ist 0600 und wird mit `O_EXCL|O_NOFOLLOW` geschrieben. Der Name ist
     fest (`bild-<n>.<ext>`), kein Teil des Pfads stammt vom Aufrufer.

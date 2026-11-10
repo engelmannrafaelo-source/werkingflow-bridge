@@ -57,6 +57,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import binascii
+import io
 import logging
 import os
 import shutil
@@ -94,9 +95,9 @@ ABO_VISION_SLOT_WAIT_S = 120.0
 #: Dokument-Vision schickt Vorschaubilder in Gruppen von
 #: image_triage._DEFAULT_BATCH_SIZE (20). Mehr ist 413, kein Teilen.
 ABO_VISION_MAX_IMAGES = 20
-#: Base64-Länge je Bild; dieselbe Grenze wie die Dokument-Vision (5 MB =
-#: Anthropic-Grenze je Bild).
-ABO_VISION_MAX_IMAGE_B64 = 5 * 2**20
+#: Strict Base64 bound: the CLI Read result duplicates images in a 1-MiB SDK line.
+#: Override via ABO_VISION_MAX_IMAGE_B64 (positive integer, bytes).
+ABO_VISION_MAX_IMAGE_B64 = 400000
 #: Base64-Länge aller Bilder eines Aufrufs (die Dateien liegen kurz auf der
 #: Platte des Workers).
 ABO_VISION_MAX_TOTAL_B64 = 20 * 2**20
@@ -196,6 +197,57 @@ def _format_von(daten: bytes) -> Optional[Tuple[str, str]]:
     return None
 
 
+def _image_limit() -> int:
+    raw = os.getenv("ABO_VISION_MAX_IMAGE_B64", "").strip()
+    try:
+        limit = int(raw) if raw else ABO_VISION_MAX_IMAGE_B64
+        if limit < 1:
+            raise ValueError
+    except ValueError:
+        raise _fehler(500, "abo_vision_config",
+                      "ABO_VISION_MAX_IMAGE_B64 muss eine positive ganze Zahl sein",
+                      retryable=False) from None
+    return limit
+
+
+def bild_vorbereiten(data: str, label: str) -> Tuple[bytes, str, str]:
+    """Validate and bound one image before any CLI/file access; small bytes survive."""
+    limit = _image_limit()
+    try:
+        raw = base64.b64decode(data, validate=True)
+    except (binascii.Error, ValueError):
+        raise _fehler(400, "abo_vision_image_invalid_base64",
+                      f"{label}: ungültiges Base64", retryable=False) from None
+    fmt = _format_von(raw)
+    if fmt is None:
+        raise _fehler(415, "abo_vision_image_format",
+                      f"{label}: kein PNG, JPEG, GIF oder WebP (Dateisignatur)", retryable=False)
+    if len(data) >= limit:
+        from PIL import Image
+        from src.privacy_service.image_encoding import ImageTooLargeError, encode_vision_jpeg
+
+        edge = "unbekannt"
+        try:
+            with Image.open(io.BytesIO(raw)) as image:
+                edge = max(image.size)
+                with image.convert("RGBA") as rgba, Image.new("RGB", image.size, "white") as opaque:
+                    opaque.paste(rgba, mask=rgba.getchannel("A"))
+                    encoded = encode_vision_jpeg(
+                        opaque, label, limit=limit, limit_name="ABO_VISION_MAX_IMAGE_B64",
+                    )
+            raw = base64.b64decode(encoded)
+            fmt = ("image/jpeg", "jpg")
+        except ImageTooLargeError as exc:
+            raise _fehler(413, "abo_vision_image_too_large",
+                          f"{exc} Eingangsgröße {len(data)} Byte Base64.", retryable=False) from exc
+        except (OSError, ValueError, Image.DecompressionBombError) as exc:
+            raise _fehler(413, "abo_vision_image_too_large",
+                          f"{label}: {len(data)} Byte Base64, Grenze < {limit}; "
+                          f"letzte Kantenlaenge {edge} px; JPEG-Kodierung nicht möglich.",
+                          retryable=False) from exc
+    return raw, fmt[0], fmt[1]
+
+
 def bilder_pruefen(images: List[Dict[str, Any]]) -> List[Tuple[bytes, str, str]]:
     """Anthropic-Bildblöcke → [(bytes, media type, Endung)]. Laut bei jedem
     Verstoß, bevor eine Datei entsteht oder ein Konto belastet wird."""
@@ -214,20 +266,7 @@ def bilder_pruefen(images: List[Dict[str, Any]]) -> List[Tuple[bytes, str, str]]
         data = source.get("data")
         if not isinstance(data, str) or not data:
             raise _fehler(400, "abo_vision_image_empty", f"Bild {i}: kein Base64-Inhalt", retryable=False)
-        if len(data) > ABO_VISION_MAX_IMAGE_B64:
-            raise _fehler(413, "abo_vision_image_too_large",
-                          f"Bild {i}: {len(data)} Byte Base64 über {ABO_VISION_MAX_IMAGE_B64}",
-                          retryable=False)
-        try:
-            raw = base64.b64decode(data, validate=True)
-        except (binascii.Error, ValueError):
-            raise _fehler(400, "abo_vision_image_invalid_base64", f"Bild {i}: ungültiges Base64",
-                          retryable=False) from None
-        fmt = _format_von(raw)
-        if fmt is None:
-            raise _fehler(415, "abo_vision_image_format",
-                          f"Bild {i}: kein PNG, JPEG, GIF oder WebP (Dateisignatur)", retryable=False)
-        out.append((raw, fmt[0], fmt[1]))
+        out.append(bild_vorbereiten(data, f"Bild {i}"))
     total = sum(len(b["source"]["data"]) for b in images)
     if total > ABO_VISION_MAX_TOTAL_B64:
         raise _fehler(413, "abo_vision_images_too_large",

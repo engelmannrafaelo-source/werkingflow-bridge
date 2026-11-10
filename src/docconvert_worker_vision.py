@@ -16,7 +16,7 @@ erreicht den Pool-Koordinator nicht (Tailnet-ACL); der Worker schon
 
 Laute Grenzen (kein Marker, keine stille Teilantwort, nie der bezahlte Schlüssel):
 - Pool im Worker aus → 409, bevor irgendein Vision-Aufruf entsteht.
-- Ein Bild > ``BRIDGE_DOCCONVERT_VISION_MAX_IMAGE_MB`` (Base64-Länge, Standard 5 =
+- Im Pool-Zweig: Ein Bild > ``BRIDGE_DOCCONVERT_VISION_MAX_IMAGE_MB`` (Base64-Länge, Standard 5 =
   Anthropic-Grenze je Bild) oder alle Bilder zusammen >
   ``BRIDGE_DOCCONVERT_VISION_MAX_TOTAL_MB`` (Standard 128) → 413 vor jedem Aufruf.
 - Zeitgrenze: Konvertierung + Beschreibung zusammen innerhalb der Proxy-Frist
@@ -45,6 +45,7 @@ Beschreibung über das Abo (``src/providers/subscription_vision.py``):
 from __future__ import annotations
 
 import asyncio
+import base64
 import logging
 import math
 import os
@@ -130,7 +131,8 @@ async def describe_in_worker(
         return _error(409, NOT_POOL_FUNDED)
 
     try:
-        max_image = int(_env_float("BRIDGE_DOCCONVERT_VISION_MAX_IMAGE_MB", 5.0) * 2**20)
+        max_image = (None if abo else
+                     int(_env_float("BRIDGE_DOCCONVERT_VISION_MAX_IMAGE_MB", 5.0) * 2**20))
         max_total = int(_env_float("BRIDGE_DOCCONVERT_VISION_MAX_TOTAL_MB", 128.0) * 2**20)
         s_per_call = _env_float("BRIDGE_DOCCONVERT_VISION_S_PER_CALL", 30.0)
     except HTTPException as exc:
@@ -140,7 +142,7 @@ async def describe_in_worker(
     bad = [n for n, b in images.items() if not isinstance(b, str) or not b]
     if bad:
         return _error(502, f"document vision: {len(bad)} Bilder der Konvertierung ohne Base64-Inhalt")
-    too_big = sorted(n for n, b in images.items() if len(b) > max_image)
+    too_big = sorted(n for n, b in images.items() if max_image is not None and len(b) > max_image)
     if too_big:
         logger.error(f"docconvert worker vision: {len(too_big)} Bilder über {max_image} Byte → 413")
         return _error(413, (
@@ -181,6 +183,19 @@ _POOL_KANN_NICHT_ZAHLEN = -1
 
 async def _beschreiben(images, payload, fields, filename, deadline, request, funding_log, *,
                        abo: bool, s_per_call: float):
+    if abo:
+        # Also reached by the pool-unavailable retry. Prepare before triage,
+        # retaining logical figure IDs for markdown/metadata. CLI filenames
+        # and the downstream data-URL MIME are derived from the actual bytes.
+        from src.providers.subscription_vision import bild_vorbereiten
+
+        try:
+            images = {
+                name: base64.b64encode(bild_vorbereiten(b64, f"Bild {i} ({name})")[0]).decode("ascii")
+                for i, (name, b64) in enumerate(images.items(), 1)
+            }
+        except HTTPException as exc:
+            return _error(exc.status_code, str(exc.detail))
     from src.privacy_service.image_describer import (
         append_descriptions_to_markdown,
         describe_images,

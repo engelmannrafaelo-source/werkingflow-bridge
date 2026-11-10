@@ -447,50 +447,17 @@ def _pdf_page_geometry(pdf_bytes: bytes) -> List[Tuple[int, float]]:
 
 
 def _encode_vision_jpeg(image: Any, label: str) -> str:
-    """Try quality then edge reductions, or refuse the entire conversion with 413.
+    """Use the shared quality/edge cascade; preserve the PDF 413 contract."""
+    from .image_encoding import ImageTooLargeError, encode_vision_jpeg
 
-    Never return the last oversized attempt or quietly omit an image. The
-    label identifies the page/figure without including document contents.
-    """
-    from PIL import Image
-
-    limit = _pdf_image_max_b64_bytes()
-    rgb = image.convert("RGB")
-    original_edge = encoded_edge = max(rgb.size)
     try:
-        while True:
-            for quality in PDF_IMAGE_JPEG_QUALITIES:
-                with io.BytesIO() as buf:
-                    rgb.save(buf, format="JPEG", quality=quality)
-                    b64 = base64.b64encode(buf.getvalue()).decode("ascii")
-                encoded_edge = max(rgb.size)
-                if len(b64) < limit:
-                    return b64
-            edge = max(rgb.size)
-            if edge <= PDF_IMAGE_MIN_EDGE:
-                break
-            next_edge = max(PDF_IMAGE_MIN_EDGE, int(edge * 0.85))
-            ratio = next_edge / edge
-            resized = rgb.resize(
-                (max(1, round(rgb.width * ratio)), max(1, round(rgb.height * ratio))),
-                Image.Resampling.LANCZOS,
-            )
-            rgb.close()
-            rgb = resized
-        raise DocumentTooLargeError(
-            f"{label}: JPEG bei Qualitaet {quality} hat {len(b64)} Byte Base64; "
-            f"erforderlich sind weniger als {limit} Byte "
-            f"(PDF_IMAGE_MAX_B64_BYTES), letzte Kantenlaenge {edge} px. "
-            f"Bitte den Bildbereich aufteilen und erneut umwandeln. "
-            f"Keine Bilder dieser Antwort wurden ausgeliefert."
+        return encode_vision_jpeg(
+            image, label, limit=_pdf_image_max_b64_bytes(),
+            limit_name="PDF_IMAGE_MAX_B64_BYTES",
+            qualities=PDF_IMAGE_JPEG_QUALITIES, min_edge=PDF_IMAGE_MIN_EDGE,
         )
-    finally:
-        if encoded_edge < original_edge:
-            logger.info(
-                "[pdf] %s: JPEG edge reduced %d -> %d px; quality=%d; base64_bytes=%d; limit=%d",
-                label, original_edge, encoded_edge, quality, len(b64), limit,
-            )
-        rgb.close()
+    except ImageTooLargeError as exc:
+        raise DocumentTooLargeError(str(exc)) from exc
 
 
 def _render_pdf_pages(
