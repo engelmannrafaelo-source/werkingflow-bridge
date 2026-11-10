@@ -225,7 +225,8 @@ def bild_vorbereiten(data: str, label: str) -> Tuple[bytes, str, str]:
     from PIL import Image
     from src.privacy_service.image_encoding import ImageTooLargeError, encode_vision_jpeg
 
-    pixel_limit = _image_limit("ABO_VISION_MAX_IMAGE_PIXELS", 40_000_000)
+    # Bound decode memory under concurrent preparation; equality remains allowed.
+    pixel_limit = _image_limit("ABO_VISION_MAX_IMAGE_PIXELS", 25_000_000)
     try:
         # Image.open reads the header lazily. Never allocate full pixel buffers
         # before this check, even when the compressed input is below the B64 limit.

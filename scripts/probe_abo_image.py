@@ -200,7 +200,7 @@ def check_pixel_guard():
             sv.bild_vorbereiten(data, "Bild 100MP")
         except HTTPException as exc:
             assert exc.status_code == 413
-            for fragment in ("10000x10000", "100000000", "40000000"):
+            for fragment in ("10000x10000", "100000000", "25000000"):
                 assert fragment in exc.detail["message"]
         else:
             raise AssertionError("100 MP accepted")
@@ -208,6 +208,37 @@ def check_pixel_guard():
             "elapsed_s": round(time.perf_counter() - start, 6),
             "maxrss_before_kib": before,
             "maxrss_after_kib": resource.getrusage(resource.RUSAGE_SELF).ru_maxrss}
+
+
+
+def check_pixel_boundary():
+    results = {}
+    for size in (5000, 6000):
+        with Image.new("RGB", (size, size), "white") as image:
+            # Real pixels force the accepted image through the JPEG cascade.
+            with Image.frombytes("RGB", (400, 400), random.Random(25).randbytes(400 * 400 * 3)) as noise:
+                image.paste(noise)
+            data = block(png(image))["source"]["data"]
+        assert len(data) >= 400000
+        if size == 5000:
+            raw, mime, ext = sv.bild_vorbereiten(data, "Bild 25MP")
+            assert mime == "image/jpeg" and ext == "jpg" and raw.startswith(b"\xff\xd8\xff")
+            assert len(base64.b64encode(raw)) < 400000
+            results["5000x5000"] = {"status": "ok", "mime": mime}
+        else:
+            with patch.object(Image.Image, "load", side_effect=AssertionError("Pixel decode attempted")):
+                try:
+                    sv.bild_vorbereiten(data, "Bild 36MP")
+                except HTTPException as exc:
+                    assert exc.status_code == 413
+                    assert exc.detail["error"] == "abo_vision_image_too_large"
+                    for fragment in ("6000x6000", "36000000", "25000000"):
+                        assert fragment in exc.detail["message"]
+                    results["6000x6000"] = {"status": 413, "error": exc.detail["error"],
+                                           "decode": "not called"}
+                else:
+                    raise AssertionError("36 MP accepted")
+    return results
 
 
 def check_high_depth():
@@ -259,9 +290,14 @@ def main():
     if "--pixel-child" in sys.argv:
         print(json.dumps(check_pixel_guard()))
         return
+    if "--boundary-child" in sys.argv:
+        print(json.dumps(check_pixel_boundary()))
+        return
     logging.basicConfig(level=logging.INFO)
     pixel_guard = json.loads(subprocess.check_output(
         [sys.executable, __file__, "--pixel-child"], text=True))
+    pixel_boundary = json.loads(subprocess.check_output(
+        [sys.executable, __file__, "--boundary-child"], text=True))
     high_depth = check_high_depth()
     small, big = samples()
     check_early_guards(small)
@@ -277,7 +313,7 @@ def main():
             mutation = "RED (killed)"
         else:
             raise AssertionError("Mutation survived: 5 MiB remains")
-    print(json.dumps({"checks": "PASS", "pixel_guard": pixel_guard, "high_depth": high_depth, "small_png": "byte-identical", "image": result,
+    print(json.dumps({"checks": "PASS", "pixel_guard": pixel_guard, "pixel_boundary": pixel_boundary, "high_depth": high_depth, "small_png": "byte-identical", "image": result,
                       "refusal": refusal, "worker_abo_pool_retry": "PASS",
                       "pdf_shared_cascade": "PASS", "mutation_5_mib": mutation}, indent=2))
 

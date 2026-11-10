@@ -361,10 +361,13 @@ Unit-Tests ohne Netz: `tests/unit/test_energy_abo_bildweg.py` und
 ### Header- und Rechenschutz beim Abo-Bildweg
 
 Vor jedem Decode prüft der lazy gelesene Header die Pixelzahl. Standard:
-höchstens 40.000.000 Pixel, überschreibbar mit
+höchstens 25.000.000 Pixel, überschreibbar mit
 `ABO_VISION_MAX_IMAGE_PIXELS` (positive ganze Zahl; leer = Standard,
 ungültig = 500). Darüber: 413 mit Abmessungen, Pixelzahl und Grenze, ohne
-Decode. Pillows eigener `MAX_IMAGE_PIXELS`-Schutz bleibt zusätzlich aktiv.
+Decode. Genau 5000×5000 Pixel sind erlaubt (strikt `>`); 6000×6000
+werden mit `abo_vision_image_too_large` abgewiesen. Die niedrigere
+Standardgrenze begrenzt den Decode-Speicher bei paralleler Vorbereitung
+im 2-GB-Prozessrahmen. Pillows eigener `MAX_IMAGE_PIXELS`-Schutz bleibt zusätzlich aktiv.
 Hochpräzise Graustufen (`I;16*`, `I`, `F`) werden mit 415 abgewiesen;
 der Aufrufer muss sie bewusst als 8-Bit-Bild bereitstellen. Unlesbare Bilder:
 415. Unterstützte kleine Bilder bleiben bytegleich.
