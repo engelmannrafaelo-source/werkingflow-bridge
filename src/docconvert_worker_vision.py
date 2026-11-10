@@ -191,7 +191,8 @@ async def _beschreiben(images, payload, fields, filename, deadline, request, fun
 
         try:
             images = {
-                name: base64.b64encode(bild_vorbereiten(b64, f"Bild {i} ({name})")[0]).decode("ascii")
+                name: base64.b64encode((await asyncio.to_thread(
+                    bild_vorbereiten, b64, f"Bild {i} ({name})"))[0]).decode("ascii")
                 for i, (name, b64) in enumerate(images.items(), 1)
             }
         except HTTPException as exc:

@@ -23,6 +23,11 @@ import json
 import logging
 import os
 import random
+import resource
+import struct
+import subprocess
+import time
+import zlib
 import sys
 import types
 from pathlib import Path
@@ -171,11 +176,95 @@ def check_pdf_shared():
                 raise AssertionError("PDF refusal lost")
 
 
+
+def check_pixel_guard():
+    # Build valid 100 MP PNG scanlines incrementally, never allocate a 100 MP image.
+    def chunk(kind, data):
+        return (struct.pack(">I", len(data)) + kind + data
+                + struct.pack(">I", zlib.crc32(kind + data) & 0xffffffff))
+    compressor = zlib.compressobj()
+    parts = []
+    row = b"\0" + b"\xff" * (10000 * 3)
+    for _ in range(10000):
+        parts.append(compressor.compress(row))
+    parts.append(compressor.flush())
+    raw = (b"\x89PNG\r\n\x1a\n"
+           + chunk(b"IHDR", struct.pack(">IIBBBBB", 10000, 10000, 8, 2, 0, 0, 0))
+           + chunk(b"IDAT", b"".join(parts)) + chunk(b"IEND", b""))
+    data = block(raw)["source"]["data"]
+    before = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    start = time.perf_counter()
+    # Any attempted pixel load fails this probe, independent of timing/RSS.
+    with patch.object(Image.Image, "load", side_effect=AssertionError("Pixel decode attempted")):
+        try:
+            sv.bild_vorbereiten(data, "Bild 100MP")
+        except HTTPException as exc:
+            assert exc.status_code == 413
+            for fragment in ("10000x10000", "100000000", "40000000"):
+                assert fragment in exc.detail["message"]
+        else:
+            raise AssertionError("100 MP accepted")
+    return {"status": 413, "input_b64": len(data), "decode": "not called",
+            "elapsed_s": round(time.perf_counter() - start, 6),
+            "maxrss_before_kib": before,
+            "maxrss_after_kib": resource.getrusage(resource.RUSAGE_SELF).ru_maxrss}
+
+
+def check_high_depth():
+    # A real 16-bit gradient; old RGBA conversion yielded mean ~254.
+    import array
+    values = array.array("H", (x * 257 for y in range(64) for x in range(256)))
+    if sys.byteorder != "little":
+        values.byteswap()
+    raw = png(Image.frombytes("I;16", (256, 64), values.tobytes()))
+    for limit in ("400000", "1000"):
+        with patch.dict(os.environ, ABO_VISION_MAX_IMAGE_B64=limit):
+            try:
+                sv.bild_vorbereiten(block(raw)["source"]["data"], "16-Bit-Verlauf")
+            except HTTPException as exc:
+                assert exc.status_code == 415
+                assert "8-Bit" in exc.detail["message"]
+            else:
+                raise AssertionError("16-bit gradient silently converted/passed")
+    return {"status": 415, "output_mean": None, "silent_white_output": False}
+
+
+def check_early_guards(small):
+    data = block(small)["source"]["data"]
+    with patch.dict(os.environ, ABO_VISION_MAX_IMAGE_PIXELS="767"):
+        try:
+            sv.bild_vorbereiten(data, "small")
+        except HTTPException as exc:
+            assert exc.status_code == 413 and "767" in exc.detail["message"]
+        else:
+            raise AssertionError("Pixel override ignored")
+    with patch.object(sv, "ABO_VISION_MAX_TOTAL_B64", 1), patch.object(
+        sv, "bild_vorbereiten", side_effect=AssertionError("encoding before total guard")
+    ):
+        try:
+            sv.bilder_pruefen([block(small)])
+        except HTTPException as exc:
+            assert exc.status_code == 413
+    try:
+        sv.bild_vorbereiten(block(b"\x89PNG\r\n\x1a\ninvalid")["source"]["data"], "broken")
+    except HTTPException as exc:
+        assert exc.status_code == 415
+    else:
+        raise AssertionError("Broken image accepted")
+
 def main():
     os.environ.pop("ABO_VISION_MAX_IMAGE_B64", None)
     os.environ.pop("PDF_IMAGE_MAX_B64_BYTES", None)
+    os.environ.pop("ABO_VISION_MAX_IMAGE_PIXELS", None)
+    if "--pixel-child" in sys.argv:
+        print(json.dumps(check_pixel_guard()))
+        return
     logging.basicConfig(level=logging.INFO)
+    pixel_guard = json.loads(subprocess.check_output(
+        [sys.executable, __file__, "--pixel-child"], text=True))
+    high_depth = check_high_depth()
     small, big = samples()
+    check_early_guards(small)
     result = check_images(small, big)
     refusal = check_refusal()
     check_config_and_boundary(small)
@@ -188,7 +277,7 @@ def main():
             mutation = "RED (killed)"
         else:
             raise AssertionError("Mutation survived: 5 MiB remains")
-    print(json.dumps({"checks": "PASS", "small_png": "byte-identical", "image": result,
+    print(json.dumps({"checks": "PASS", "pixel_guard": pixel_guard, "high_depth": high_depth, "small_png": "byte-identical", "image": result,
                       "refusal": refusal, "worker_abo_pool_retry": "PASS",
                       "pdf_shared_cascade": "PASS", "mutation_5_mib": mutation}, indent=2))
 

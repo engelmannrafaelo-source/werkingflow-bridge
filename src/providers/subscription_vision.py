@@ -197,15 +197,15 @@ def _format_von(daten: bytes) -> Optional[Tuple[str, str]]:
     return None
 
 
-def _image_limit() -> int:
-    raw = os.getenv("ABO_VISION_MAX_IMAGE_B64", "").strip()
+def _image_limit(name: str = "ABO_VISION_MAX_IMAGE_B64", default: Optional[int] = None) -> int:
+    raw = os.getenv(name, "").strip()
     try:
-        limit = int(raw) if raw else ABO_VISION_MAX_IMAGE_B64
+        limit = int(raw) if raw else (ABO_VISION_MAX_IMAGE_B64 if default is None else default)
         if limit < 1:
             raise ValueError
     except ValueError:
         raise _fehler(500, "abo_vision_config",
-                      "ABO_VISION_MAX_IMAGE_B64 muss eine positive ganze Zahl sein",
+                      f"{name} muss eine positive ganze Zahl sein",
                       retryable=False) from None
     return limit
 
@@ -222,29 +222,48 @@ def bild_vorbereiten(data: str, label: str) -> Tuple[bytes, str, str]:
     if fmt is None:
         raise _fehler(415, "abo_vision_image_format",
                       f"{label}: kein PNG, JPEG, GIF oder WebP (Dateisignatur)", retryable=False)
-    if len(data) >= limit:
-        from PIL import Image
-        from src.privacy_service.image_encoding import ImageTooLargeError, encode_vision_jpeg
+    from PIL import Image
+    from src.privacy_service.image_encoding import ImageTooLargeError, encode_vision_jpeg
 
-        edge = "unbekannt"
-        try:
-            with Image.open(io.BytesIO(raw)) as image:
-                edge = max(image.size)
+    pixel_limit = _image_limit("ABO_VISION_MAX_IMAGE_PIXELS", 40_000_000)
+    try:
+        # Image.open reads the header lazily. Never allocate full pixel buffers
+        # before this check, even when the compressed input is below the B64 limit.
+        with Image.open(io.BytesIO(raw)) as image:
+            width, height = image.size
+            if width * height > pixel_limit:
+                raise _fehler(
+                    413, "abo_vision_image_too_large",
+                    f"{label}: {width}x{height} = {width * height} Pixel über "
+                    f"{pixel_limit} (ABO_VISION_MAX_IMAGE_PIXELS); kein Decode.",
+                    retryable=False,
+                )
+            if image.mode.startswith("I;16") or image.mode in ("I", "F"):
+                raise _fehler(
+                    415, "abo_vision_image_format",
+                    f"{label}: Bildmodus {image.mode} wird nicht verlustfrei auf 8 Bit "
+                    "konvertiert. Bitte als 8-Bit-Bild bereitstellen.",
+                    retryable=False,
+                )
+            if len(data) >= limit:
                 with image.convert("RGBA") as rgba, Image.new("RGB", image.size, "white") as opaque:
                     opaque.paste(rgba, mask=rgba.getchannel("A"))
                     encoded = encode_vision_jpeg(
                         opaque, label, limit=limit, limit_name="ABO_VISION_MAX_IMAGE_B64",
                     )
-            raw = base64.b64decode(encoded)
-            fmt = ("image/jpeg", "jpg")
-        except ImageTooLargeError as exc:
-            raise _fehler(413, "abo_vision_image_too_large",
-                          f"{exc} Eingangsgröße {len(data)} Byte Base64.", retryable=False) from exc
-        except (OSError, ValueError, Image.DecompressionBombError) as exc:
-            raise _fehler(413, "abo_vision_image_too_large",
-                          f"{label}: {len(data)} Byte Base64, Grenze < {limit}; "
-                          f"letzte Kantenlaenge {edge} px; JPEG-Kodierung nicht möglich.",
-                          retryable=False) from exc
+                raw = base64.b64decode(encoded)
+                fmt = ("image/jpeg", "jpg")
+    except ImageTooLargeError as exc:
+        raise _fehler(413, "abo_vision_image_too_large",
+                      f"{exc} Eingangsgröße {len(data)} Byte Base64.", retryable=False) from exc
+    except Image.DecompressionBombError as exc:
+        raise _fehler(413, "abo_vision_image_too_large",
+                      f"{label}: Pillow-Pixelschutz: {exc}; "
+                      f"ABO_VISION_MAX_IMAGE_PIXELS={pixel_limit}.", retryable=False) from exc
+    except (OSError, ValueError) as exc:
+        raise _fehler(415, "abo_vision_image_format",
+                      f"{label}: beschädigtes oder nicht lesbares Bild; "
+                      "JPEG-Kodierung nicht möglich.", retryable=False) from exc
     return raw, fmt[0], fmt[1]
 
 
@@ -257,7 +276,7 @@ def bilder_pruefen(images: List[Dict[str, Any]]) -> List[Tuple[bytes, str, str]]
         raise _fehler(413, "abo_vision_too_many_images",
                       f"{len(images)} Bilder in einem Aufruf, Abo-Bildweg erlaubt {ABO_VISION_MAX_IMAGES}",
                       retryable=False)
-    out: List[Tuple[bytes, str, str]] = []
+    inputs: List[str] = []
     for i, block in enumerate(images, 1):
         source = block.get("source") if isinstance(block, dict) else None
         if not isinstance(source, dict) or source.get("type") != "base64":
@@ -266,12 +285,12 @@ def bilder_pruefen(images: List[Dict[str, Any]]) -> List[Tuple[bytes, str, str]]
         data = source.get("data")
         if not isinstance(data, str) or not data:
             raise _fehler(400, "abo_vision_image_empty", f"Bild {i}: kein Base64-Inhalt", retryable=False)
-        out.append(bild_vorbereiten(data, f"Bild {i}"))
-    total = sum(len(b["source"]["data"]) for b in images)
+        inputs.append(data)
+    total = sum(map(len, inputs))
     if total > ABO_VISION_MAX_TOTAL_B64:
         raise _fehler(413, "abo_vision_images_too_large",
                       f"Bilder gesamt {total} Byte Base64 über {ABO_VISION_MAX_TOTAL_B64}", retryable=False)
-    return out
+    return [bild_vorbereiten(data, f"Bild {i}") for i, data in enumerate(inputs, 1)]
 
 
 def _dateien_schreiben(bilder: List[Tuple[bytes, str, str]]) -> Tuple[Path, List[Path]]:
@@ -484,7 +503,7 @@ async def analyze_via_subscription(
 
     images = [b for m in anthropic_messages if isinstance(m.get("content"), list)
               for b in m["content"] if isinstance(b, dict) and b.get("type") == "image"]
-    bilder = bilder_pruefen(images)
+    bilder = await asyncio.to_thread(bilder_pruefen, images)
     ignoriert = [n for n, v in (("thinking", thinking), ("output_config", output_config)) if v is not None]
     if ignoriert:
         logger.warning(f"abo-bildweg: {ignoriert} gelten auf dem CLI-Weg nicht (im Ledger vermerkt)")

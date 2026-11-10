@@ -356,3 +356,19 @@ Unit-Tests ohne Netz: `tests/unit/test_energy_abo_bildweg.py` und
   Worker wiederholt, im Chat bis zur Kette von 1200 s. Jeder Versuch ist ein
   neuer CLI-Lauf; er kostet Abo-Zeit, kein Geld. Deterministische Fehler sind
   422 und werden nicht wiederholt.
+
+
+### Header- und Rechenschutz beim Abo-Bildweg
+
+Vor jedem Decode prüft der lazy gelesene Header die Pixelzahl. Standard:
+höchstens 40.000.000 Pixel, überschreibbar mit
+`ABO_VISION_MAX_IMAGE_PIXELS` (positive ganze Zahl; leer = Standard,
+ungültig = 500). Darüber: 413 mit Abmessungen, Pixelzahl und Grenze, ohne
+Decode. Pillows eigener `MAX_IMAGE_PIXELS`-Schutz bleibt zusätzlich aktiv.
+Hochpräzise Graustufen (`I;16*`, `I`, `F`) werden mit 415 abgewiesen;
+der Aufrufer muss sie bewusst als 8-Bit-Bild bereitstellen. Unlesbare Bilder:
+415. Unterstützte kleine Bilder bleiben bytegleich.
+Die Chat-Gesamtgrenze wird vor der Kodierung geprüft. Vorbereitung und
+Neukodierung laufen in beiden asynchronen Abo-Einstiegen über
+`asyncio.to_thread`, im Chat weiterhin vor Limiter/Slot; die bestehende
+Worker-Restfristprüfung folgt danach.
