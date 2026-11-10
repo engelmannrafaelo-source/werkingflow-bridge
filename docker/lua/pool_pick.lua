@@ -33,7 +33,10 @@ local M = {}
 -- 0.10 (eligible at ~127K capacity) and 0.0 (excluded). The flicker would
 -- briefly route real traffic to a near-wall account and trigger Anthropic
 -- 429s that the cross-worker retry then has to clean up.
-M.WEEKLY_HARD_EXCLUDE_PCT = 96
+-- 97 = highest per-account automation limit (Rafael-owned accounts, Rafael
+-- 10.11.2026); lower limits (90 %) already arrive as available=false from the
+-- worker's reserve check, so the wall never undercuts the account policy.
+M.WEEKLY_HARD_EXCLUDE_PCT = 97
 
 -- Eligibility of ONE account — the single definition used by the weighted pick
 -- and by the affinity check, so "eligible" cannot mean two things.

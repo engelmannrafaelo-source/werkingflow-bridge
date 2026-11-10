@@ -37,7 +37,7 @@ from dataclasses import dataclass, asdict, field
 from typing import Optional, Dict, Any, List
 
 from fastapi import HTTPException, Request
-from src.middleware.account_reserve import reserve_reason, require_account_reserve, valid_percent, AUTOMATION_WEEKLY_LIMIT
+from src.middleware.account_reserve import reserve_reason, require_account_reserve, valid_percent, automation_weekly_limit
 
 from src.middleware.bridge_error import (
     BridgeError,
@@ -608,7 +608,7 @@ class AdaptiveLoadLimiter:
             }
             reserve = reserve_reason(acct)
             snapshot["reserve_blocked"] = reserve is not None
-            snapshot["automation_weekly_limit"] = AUTOMATION_WEEKLY_LIMIT
+            snapshot["automation_weekly_limit"] = automation_weekly_limit()
             if reserve:
                 return False, reserve, snapshot
             if inflight_count >= HARD_REQUEST_CEILING:

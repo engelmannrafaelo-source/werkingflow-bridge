@@ -512,7 +512,7 @@ async def create_job_endpoint(
     # Energy-Abo-Modus (N1F P2, 03.11.2026): a subscription-funded job runs its
     # LLM work through THIS worker's CLI account (the self-call pins to
     # localhost), and require_account_reserve() refuses every call there once
-    # the account is at >= 90 % weekly — the job would be created and die with
+    # the account is at its automation weekly limit (90 %, Rafael-owned 97 %) — the job would be created and die with
     # 503 "Nutzerreserve". Same placement veto as the capacity lock above, at
     # the same point (nothing persisted yet, so the reject is retry-safe):
     # 429, which nginx's /v1/jobs locations retry on the next worker
