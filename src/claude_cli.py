@@ -1,6 +1,7 @@
 import asyncio
 import json
 import os
+import shlex
 import subprocess
 import sys
 import uuid
@@ -95,6 +96,87 @@ _current_append_sys_prompt_tempfile: ContextVar[Optional[str]] = ContextVar(
 )
 
 _open_process_patch_applied: bool = False
+
+
+# ---------------------------------------------------------------------------
+# Zeitkontext (docs/contracts/zeitkontext.md): absolute Fristen eines Jobs,
+# gebunden vom Selbstaufruf (jobs/selbstaufruf._zeitkontext_binden). Ist er
+# gesetzt, bekommt GENAU dieser CLI-Lauf eine eigene settings-Datei mit dem
+# Zeitkontext-Hook; ohne ihn wird nichts an den Optionen veraendert.
+# ---------------------------------------------------------------------------
+_current_zeitkontext: ContextVar[Optional[Dict[str, Any]]] = ContextVar(
+    "bridge_zeitkontext", default=None
+)
+_ZEITKONTEXT_HOOK_SCRIPT = Path(__file__).resolve().parent / "zeitkontext_hook.py"
+
+
+def zeitkontext_binden(zeitkontext: Optional[Dict[str, Any]]) -> Any:
+    """Bind the zeitkontext for the CLI runs started from this context."""
+    return _current_zeitkontext.set(zeitkontext)
+
+
+def zeitkontext_loesen(token: Any) -> None:
+    _current_zeitkontext.reset(token)
+
+
+def zeitkontext_settings(zeitkontext: Dict[str, Any]) -> Dict[str, Any]:
+    """CLI settings (hooks only) that run the Zeitkontext-Hook at
+    UserPromptSubmit and after every tool use. The script is called through
+    the interpreter (``python3 <path>``), so a noexec mount does not matter."""
+    lauf = zeitkontext.get("lauf_ende_epoch")
+    phase = zeitkontext.get("phase_ende_epoch")
+    for name, wert in (("lauf_ende_epoch", lauf), ("phase_ende_epoch", phase)):
+        if isinstance(wert, bool) or not isinstance(wert, int):
+            if name == "phase_ende_epoch" and wert is None:
+                continue
+            raise RuntimeError(f"zeitkontext.{name} must be an int epoch, got {wert!r}")
+    if not _ZEITKONTEXT_HOOK_SCRIPT.is_file():
+        raise RuntimeError(f"zeitkontext hook script missing: {_ZEITKONTEXT_HOOK_SCRIPT}")
+    command = (
+        f"{shlex.quote(sys.executable or 'python3')} "
+        f"{shlex.quote(str(_ZEITKONTEXT_HOOK_SCRIPT))} --lauf-ende {lauf}"
+    )
+    if phase is not None:
+        command += f" --phase-ende {phase}"
+    hook = {"type": "command", "command": command, "timeout": 10}
+    return {
+        "hooks": {
+            "UserPromptSubmit": [{"hooks": [hook]}],
+            "PostToolUse": [{"matcher": "*", "hooks": [hook]}],
+        }
+    }
+
+
+def apply_zeitkontext_settings(options: Any, zeitkontext: Optional[Dict[str, Any]]) -> Optional[str]:
+    """With a zeitkontext: write the per-run settings file, set
+    ``options.settings`` and return the path (caller removes it after the
+    run). Without: touch nothing, return None. An already present settings
+    option is a conflict and raised — never overwritten, never skipped."""
+    if not zeitkontext:
+        return None
+    if getattr(options, "settings", None) or "settings" in (getattr(options, "extra_args", None) or {}):
+        raise RuntimeError(
+            "zeitkontext: the CLI run already carries a --settings option; "
+            "refusing to overwrite it (docs/contracts/zeitkontext.md)"
+        )
+    inhalt = json.dumps(zeitkontext_settings(zeitkontext))
+    pfad: Optional[str] = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".json", prefix="bridge_zeitkontext_settings_",
+            delete=False, encoding="utf-8",
+        ) as f:
+            pfad = f.name
+            f.write(inhalt)
+    except Exception as err:
+        if pfad:
+            try:
+                os.unlink(pfad)
+            except OSError:
+                pass
+        raise RuntimeError(f"zeitkontext: writing the settings file failed: {err}") from err
+    options.settings = pfad
+    return pfad
 
 
 def _inject_cli_options(command, file_options: list) -> list:
@@ -2183,6 +2265,9 @@ class ClaudeCodeCLI:
             os.environ['DISABLE_COACH_MCP'] = 'true'
             logger.info("🚫 Coach MCP disabled for wrapper session (prevents spawn loop)")
             
+            # Before the try so the finally can never hit an UnboundLocalError.
+            _zeitkontext_settings_path: Optional[str] = None  # per-run hook settings
+
             try:
                 # Session-specific directory for ALL sessions
                 # Creates: instances/{instance}/YYYY-MM-DD-HHMM_{cli_session_id}/
@@ -2498,6 +2583,13 @@ class ClaudeCodeCLI:
                             f"📎 append_system_prompt set ({len(append_system_prompt):,} chars)"
                         )
                 # === END SYSTEM PROMPT HANDLING ===
+
+                # Zeitkontext-Hook (only when a job's zeitkontext is bound)
+                _zeitkontext_settings_path = apply_zeitkontext_settings(
+                    options, _current_zeitkontext.get()
+                )
+                if _zeitkontext_settings_path:
+                    logger.info(f"🕒 zeitkontext hook settings: {_zeitkontext_settings_path}")
 
                 # Set tool restrictions
                 if cli_tools is not None:
@@ -3184,6 +3276,13 @@ class ClaudeCodeCLI:
                         )
 
             finally:
+                # Zeitkontext settings file: first action, before any other cleanup
+                if _zeitkontext_settings_path:
+                    try:
+                        os.unlink(_zeitkontext_settings_path)
+                    except Exception as zk_cleanup_err:
+                        logger.warning(f"zeitkontext settings cleanup failed: {zk_cleanup_err}")
+
                 # Progress tracking: Write final response
                 if progress_tracking_enabled:
                     duration = (datetime.now() - start_time).total_seconds()

@@ -75,6 +75,73 @@ router = APIRouter()
 #: Attribution key of the job's X-Funding-Source (Energy-Abo-Modus).
 FUNDING_SOURCE_KEY = "funding_source"
 
+#: Zeitkontext (docs/contracts/zeitkontext.md): absolute Fristen des Aufrufers,
+#: nur ueber diese Kopfzeilen des Job-POST, gespeichert in der attribution
+#: (NICHT im payload — payload_digest/Idempotenz bleiben unberuehrt).
+ZEITKONTEXT_KEY = "zeitkontext"
+ZEITKONTEXT_LAUF_HEADER = "X-Zeitkontext-Lauf-Ende"
+ZEITKONTEXT_PHASE_HEADER = "X-Zeitkontext-Phase-Ende"
+#: Plausibilitaet einer UTC-Epoch-SEKUNDE: nach 2020-09-13, hoechstens 30 Tage
+#: voraus (faengt Millisekunden und Restzeit-statt-Frist ab).
+_ZEITKONTEXT_MIN_EPOCH = 1_600_000_000
+_ZEITKONTEXT_MAX_VORAUS_S = 30 * 86400
+
+
+def _zeitkontext_422(message: str) -> HTTPException:
+    return HTTPException(status_code=422, detail={"code": "zeitkontext_invalid", "message": message})
+
+
+def _zeitkontext_epoch(name: str, roh: str, jetzt: float) -> int:
+    wert = roh.strip()
+    if not (wert.isascii() and wert.isdigit()) or len(wert) > 12:
+        raise _zeitkontext_422(f"{name} must be an integer UTC epoch in seconds")
+    epoch = int(wert)
+    if not _ZEITKONTEXT_MIN_EPOCH <= epoch <= jetzt + _ZEITKONTEXT_MAX_VORAUS_S:
+        raise _zeitkontext_422(
+            f"{name}={epoch} is not a plausible UTC epoch in seconds "
+            f"(absolute deadline, not a remaining time, not milliseconds)"
+        )
+    return epoch
+
+
+def zeitkontext_aus_kopfzeilen(
+    headers: Any, body_attribution: Optional[Dict[str, Any]], jetzt: Optional[float] = None
+) -> Optional[Dict[str, Any]]:
+    """Validated ``attribution.zeitkontext`` of a job POST, or None without the
+    headers. Raises 422 for anything invalid — and for a zeitkontext in the
+    body attribution: there is exactly one way in."""
+    if ZEITKONTEXT_KEY in (body_attribution or {}):
+        raise _zeitkontext_422(
+            f"attribution.{ZEITKONTEXT_KEY} is not accepted in the body — send "
+            f"{ZEITKONTEXT_LAUF_HEADER} / {ZEITKONTEXT_PHASE_HEADER} headers"
+        )
+    jetzt = time.time() if jetzt is None else jetzt
+    lauf_roh = headers.get(ZEITKONTEXT_LAUF_HEADER)
+    phase_roh = headers.get(ZEITKONTEXT_PHASE_HEADER)
+    if lauf_roh is None and phase_roh is None:
+        return None
+    if lauf_roh is None:
+        raise _zeitkontext_422(f"{ZEITKONTEXT_PHASE_HEADER} requires {ZEITKONTEXT_LAUF_HEADER}")
+    lauf = _zeitkontext_epoch(ZEITKONTEXT_LAUF_HEADER, lauf_roh, jetzt)
+    phase = None
+    if phase_roh is not None:
+        phase = _zeitkontext_epoch(ZEITKONTEXT_PHASE_HEADER, phase_roh, jetzt)
+        if phase > lauf:
+            raise _zeitkontext_422(
+                f"{ZEITKONTEXT_PHASE_HEADER}={phase} must be <= {ZEITKONTEXT_LAUF_HEADER}={lauf}"
+            )
+    return {"lauf_ende_epoch": lauf, "phase_ende_epoch": phase}
+
+
+def _epoch_s(wert: Any) -> Optional[float]:
+    """Store timestamp → UTC epoch seconds (3 decimals), None when absent."""
+    if not isinstance(wert, datetime):
+        return None
+    if wert.tzinfo is None:
+        wert = wert.replace(tzinfo=timezone.utc)
+    return round(wert.timestamp(), 3)
+
+
 # Injected by main.py at startup (canonical X-* header → attribution dict).
 _attribution_extractor: Optional[Callable[[Request], Dict[str, Any]]] = None
 
@@ -370,6 +437,9 @@ async def create_job_endpoint(
             detail=f"Unknown job kind '{body.kind}'. Registered: {registered_kinds()}",
         )
 
+    # Zeitkontext: validated BEFORE anything is stored; 422 on any defect.
+    _zeitkontext = zeitkontext_aus_kopfzeilen(request.headers, body.attribution)
+
     attribution = body.attribution
     if attribution is None and _attribution_extractor is not None:
         attribution = _attribution_extractor(request)
@@ -425,6 +495,8 @@ async def create_job_endpoint(
         attribution[JOB_PRINZIPAL_KEY] = _principal.name
     if _test_lauf is not None:
         attribution[JOB_LAUF_KEY] = _test_lauf
+    if _zeitkontext is not None:
+        attribution[ZEITKONTEXT_KEY] = _zeitkontext
     attribution = attribution or None
 
     # Placement veto (Autobahn): the job EXECUTES on THIS worker (spawn below),
@@ -771,6 +843,11 @@ def _reject_foreign_or_malformed(job_id: str) -> Optional[JSONResponse]:
     return None
 
 
+def _gespeicherter_zeitkontext(job: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    zk = (job.get("attribution") or {}).get(ZEITKONTEXT_KEY)
+    return zk if isinstance(zk, dict) else None
+
+
 @router.get("/v1/jobs/{job_id}")
 async def get_job_endpoint(
     job_id: str,
@@ -813,6 +890,10 @@ async def get_job_endpoint(
         "kind": job["kind"],
         "status": job["status"],
         "elapsed_seconds": elapsed,
+        # Jobzeitbeleg: UTC epoch seconds from the store row; finished_at is
+        # null until the job is terminal.
+        "created_at": _epoch_s(job.get("created_at")),
+        "finished_at": _epoch_s(job.get("finished_at")),
         "progress": job.get("progress"),
         "result": job.get("result") if job["status"] == store.JOB_STATUS_DONE else None,
         # done = executed, not "a finished answer": a chat job whose model
@@ -827,6 +908,9 @@ async def get_job_endpoint(
             job_error_view(job.get("error"))
             if job["status"] == store.JOB_STATUS_ERROR else None
         ),
+        # Annahme-Echo (docs/contracts/zeitkontext.md): stored
+        # attribution.zeitkontext or null.
+        "zeitkontext": _gespeicherter_zeitkontext(job),
         **_deferral_view(job),
     }
 
