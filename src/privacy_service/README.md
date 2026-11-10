@@ -76,7 +76,10 @@ deterministic adapters can parse:
 Whole pages start with a 1600-pixel long edge. Large-format pages (>1700 pt) are
 `page-NNN.jpg`; smaller pages retain `page-NNN.png` when their PNG fits the
 limit, otherwise they also use JPEG. The strict base64 ceiling defaults to
-300000 bytes and is configurable via `PDF_IMAGE_MAX_B64_BYTES`. JPEG quality
+400000 bytes and is configurable via `PDF_IMAGE_MAX_B64_BYTES`. This leaves
+120832 bytes (about 120 kB) below the Energy owner's measured last successful
+payload of 520832 bytes (first failure: 527780). The SDK line carries the image
+twice: 2 × 524288 bytes equals its 1 MiB cap, before envelope overhead. JPEG quality
 descends through 85, 75, 65, 55 at each size, then the long edge is multiplied
 by 0.85 down to 900 px, retrying all qualities at each step. Images already
 below 900 px are never enlarged. If none fits, `DocumentTooLargeError`

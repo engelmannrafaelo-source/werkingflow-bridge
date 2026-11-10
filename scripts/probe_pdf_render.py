@@ -345,7 +345,7 @@ def measurements(paths, baseline_ref):
 
 
 def check_config():
-    for raw, expected in [("", 300000), (" 123456 ", 123456)]:
+    for raw, expected in [("", 400000), (" 123456 ", 123456)]:
         with patch.dict(os.environ, PDF_IMAGE_MAX_B64_BYTES=raw):
             assert dc._pdf_image_max_b64_bytes() == expected
     for raw in ("0", "-1", "abc", "1.5"):

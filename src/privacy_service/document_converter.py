@@ -282,8 +282,10 @@ RENDER_PAGE_MAX_EDGE = 1600
 
 # Claude's subscription SDK limits a JSON line (including a Read image result)
 # to 1 MiB. Bound BASE64, not compressed bytes: the SDK envelope can duplicate
-# the payload. Override the conservative default via PDF_IMAGE_MAX_B64_BYTES.
-PDF_IMAGE_MAX_B64_BYTES = 300000
+# the payload (2 * 524288 bytes = line cap, before envelope overhead).
+# The default leaves 120832 bytes below the Energy owner's last OK (520832).
+# Override the conservative default via PDF_IMAGE_MAX_B64_BYTES.
+PDF_IMAGE_MAX_B64_BYTES = 400000
 PDF_IMAGE_MIN_EDGE = 900
 PDF_IMAGE_JPEG_QUALITIES = (85, 75, 65, 55)
 
@@ -485,8 +487,8 @@ def _encode_vision_jpeg(image: Any, label: str) -> str:
     finally:
         if encoded_edge < original_edge:
             logger.info(
-                "[pdf] %s: JPEG edge reduced %d -> %d px; quality=%d; base64_bytes=%d",
-                label, original_edge, encoded_edge, quality, len(b64),
+                "[pdf] %s: JPEG edge reduced %d -> %d px; quality=%d; base64_bytes=%d; limit=%d",
+                label, original_edge, encoded_edge, quality, len(b64), limit,
             )
         rgb.close()
 
