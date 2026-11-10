@@ -73,12 +73,13 @@ deterministic adapters can parse:
 
 **PDF image contract**
 
-Whole pages use a 1600-pixel long edge. Large-format pages (>1700 pt) are
+Whole pages start with a 1600-pixel long edge. Large-format pages (>1700 pt) are
 `page-NNN.jpg`; smaller pages retain `page-NNN.png` when their PNG fits the
-limit, otherwise they also use JPEG. `PDF_IMAGE_MAX_B64_BYTES` is a strict
-700 KiB base64 ceiling (716800 bytes), leaving 324 KiB below the subscription
-SDK's 1 MiB JSON-line cap for the tool envelope. JPEG quality descends through
-85, 75, 65, 55 at unchanged resolution. If none fits, `DocumentTooLargeError`
+limit, otherwise they also use JPEG. The strict base64 ceiling defaults to
+300000 bytes and is configurable via `PDF_IMAGE_MAX_B64_BYTES`. JPEG quality
+descends through 85, 75, 65, 55 at each size, then the long edge is multiplied
+by 0.85 down to 900 px, retrying all qualities at each step. Images already
+below 900 px are never enlarged. If none fits, `DocumentTooLargeError`
 refuses the whole conversion with HTTP 413, identifying the page, size and
 limit. No page is omitted, and there is no automatic tiling.
 

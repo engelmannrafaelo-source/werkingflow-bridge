@@ -454,12 +454,14 @@ def _encode_vision_jpeg(image: Any, label: str) -> str:
 
     limit = _pdf_image_max_b64_bytes()
     rgb = image.convert("RGB")
+    original_edge = encoded_edge = max(rgb.size)
     try:
         while True:
             for quality in PDF_IMAGE_JPEG_QUALITIES:
                 with io.BytesIO() as buf:
                     rgb.save(buf, format="JPEG", quality=quality)
                     b64 = base64.b64encode(buf.getvalue()).decode("ascii")
+                encoded_edge = max(rgb.size)
                 if len(b64) < limit:
                     return b64
             edge = max(rgb.size)
@@ -481,6 +483,11 @@ def _encode_vision_jpeg(image: Any, label: str) -> str:
             f"Keine Bilder dieser Antwort wurden ausgeliefert."
         )
     finally:
+        if encoded_edge < original_edge:
+            logger.info(
+                "[pdf] %s: JPEG edge reduced %d -> %d px; quality=%d; base64_bytes=%d",
+                label, original_edge, encoded_edge, quality, len(b64),
+            )
         rgb.close()
 
 
