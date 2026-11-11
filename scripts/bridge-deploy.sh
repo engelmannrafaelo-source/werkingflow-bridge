@@ -2061,8 +2061,16 @@ lb_nach_workerwechsel() {
         info "[DRY-RUN] would reload ${HETZNER_SVC_nginx} and probe /health via the LB (scripts/lb-nach-workerwechsel.sh)"
         return 0
     fi
-    local out rc
-    out=$(rssh "$host" "cd ${REMOTE_REPO} && bash scripts/lb-nach-workerwechsel.sh '${HETZNER_SVC_nginx}' 'worker1 worker2 worker3 worker4'" 2>&1)
+    # The script is shipped via stdin from THIS checkout (not read from the remote
+    # repo): after a rollback `git reset --hard` the old SHA may not contain it.
+    # Worker list = the generated upstreams file (no hard-coded worker1..4).
+    local script_file workers b64 out rc
+    script_file="$(dirname "${BASH_SOURCE[0]}")/lb-nach-workerwechsel.sh"
+    [[ -f "$script_file" ]] || { error_ "lb-nach-workerwechsel.sh missing next to bridge-deploy.sh"; return 2; }
+    workers=$(sed -n 's/^#   workers  : //p' "$(dirname "${BASH_SOURCE[0]}")/../docker/upstreams-primary.conf" 2>/dev/null | head -1)
+    [[ -n "$workers" ]] || workers="worker1 worker2 worker3 worker4"
+    b64=$(base64 -w0 < "$script_file")
+    out=$(rssh "$host" "echo '${b64}' | base64 -d > /tmp/lb-nach-workerwechsel.sh && bash /tmp/lb-nach-workerwechsel.sh '${HETZNER_SVC_nginx}' '${workers}'; r=\$?; rm -f /tmp/lb-nach-workerwechsel.sh; exit \$r" 2>&1)
     rc=$?
     while IFS= read -r line; do [[ -n "$line" ]] && info "  lb: ${line}"; done <<< "$out"
     return $rc
@@ -3297,8 +3305,13 @@ deploy_server() {
     # === LB re-resolves worker IPs: reload + probe (hetzner) ===
     if [[ "$server_name" == "hetzner" ]]; then
         step "Phase 4b: LB reload + worker probe (hetzner)"
-        if ! lb_nach_workerwechsel "$host"; then
-            error_ "LB probe failed after Phase 4 — stale upstream or reload error — initiating rollback"
+        lb_nach_workerwechsel "$host"
+        local lb_rc=$?
+        if (( lb_rc == 2 )); then
+            error_ "LB reload/config error after Phase 4 (workers unchanged and healthy) — NOT rolling back; fix the LB config and run: bash scripts/lb-nach-workerwechsel.sh"
+            return 1
+        elif (( lb_rc != 0 )); then
+            error_ "LB probe failed after Phase 4 — stale upstream or worker not answering — initiating rollback"
             if [[ ${#DEPLOYED_SERVICES[@]} -gt 0 ]]; then
                 phase_rollback "$host" "$compose" "$ROLLBACK_SHA" "$build_list" "${DEPLOYED_SERVICES[@]}"
                 local rc=$?
