@@ -2045,6 +2045,30 @@ PYEOF
 }
 
 # ============================================================================
+# LB nach Worker-Wechsel: neu laden + Nicht-Worker-Ziele erkennen (11.11.2026)
+# ============================================================================
+# upstreams-primary.conf loest worker1..4 beim nginx-Start einmal auf. Wechseln die
+# Container ihre IPs (gleichzeitiges force-recreate, andere Reihenfolge), zeigt eine
+# alte Worker-IP spaeter auf platform-api -> ~1/4 der Default-Pool-Anfragen bekam 404.
+# Darum nach jeder Phase 4 auf Hetzner: LB neu laden und 24 /health-Anfragen ueber den
+# LB messen (alle 200 von einem Worker, jeder Worker getroffen). Skript:
+# scripts/lb-nach-workerwechsel.sh (auch von Hand nach jedem manuellen Recreate).
+# Gilt nur fuer Hetzner (Container-DNS-Namen); die Prod-Upstreams sind feste Tailnet-
+# IP:Port-Paare des Worker-Hosts und davon nicht betroffen.
+lb_nach_workerwechsel() {
+    local host="$1"
+    if [[ "$DRY_RUN" == "true" ]]; then
+        info "[DRY-RUN] would reload ${HETZNER_SVC_nginx} and probe /health via the LB (scripts/lb-nach-workerwechsel.sh)"
+        return 0
+    fi
+    local out rc
+    out=$(rssh "$host" "cd ${REMOTE_REPO} && bash scripts/lb-nach-workerwechsel.sh '${HETZNER_SVC_nginx}' 'worker1 worker2 worker3 worker4'" 2>&1)
+    rc=$?
+    while IFS= read -r line; do [[ -n "$line" ]] && info "  lb: ${line}"; done <<< "$out"
+    return $rc
+}
+
+# ============================================================================
 # Phase 6: Rollback
 # ============================================================================
 phase_rollback() {
@@ -2156,6 +2180,9 @@ phase_rollback() {
     done
 
     [[ "$failed" == "true" ]] && { error_ "CRITICAL: partial rollback failure on ${host}"; return 2; }
+    if [[ "$host" == "${HETZNER_HOST:-}" ]] || [[ "${server_name:-}" == "hetzner" ]]; then
+        lb_nach_workerwechsel "$host" || warn "LB probe after rollback is RED on ${host} — reload/probe by hand: bash scripts/lb-nach-workerwechsel.sh"
+    fi
     warn "Rollback complete on ${host}"
     return 0
 }
@@ -3266,6 +3293,20 @@ deploy_server() {
             return 1
         fi
     done
+
+    # === LB re-resolves worker IPs: reload + probe (hetzner) ===
+    if [[ "$server_name" == "hetzner" ]]; then
+        step "Phase 4b: LB reload + worker probe (hetzner)"
+        if ! lb_nach_workerwechsel "$host"; then
+            error_ "LB probe failed after Phase 4 — stale upstream or reload error — initiating rollback"
+            if [[ ${#DEPLOYED_SERVICES[@]} -gt 0 ]]; then
+                phase_rollback "$host" "$compose" "$ROLLBACK_SHA" "$build_list" "${DEPLOYED_SERVICES[@]}"
+                local rc=$?
+                (( rc == 2 )) && return 2
+            fi
+            return 1
+        fi
+    fi
 
     # === prod-zusammen stage: stop here, the joint end does the rest ===
     # Only the per-host smoke is deferred (it cannot pass with one half new);
