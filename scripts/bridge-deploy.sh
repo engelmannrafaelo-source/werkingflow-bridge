@@ -2068,7 +2068,7 @@ lb_nach_workerwechsel() {
     script_file="$(dirname "${BASH_SOURCE[0]}")/lb-nach-workerwechsel.sh"
     [[ -f "$script_file" ]] || { error_ "lb-nach-workerwechsel.sh missing next to bridge-deploy.sh"; return 2; }
     workers=$(sed -n 's/^#   workers  : //p' "$(dirname "${BASH_SOURCE[0]}")/../docker/upstreams-primary.conf" 2>/dev/null | head -1)
-    [[ -n "$workers" ]] || workers="worker1 worker2 worker3 worker4"
+    [[ -n "$workers" ]] || { warn "worker list not found in docker/upstreams-primary.conf — using worker1..4"; workers="worker1 worker2 worker3 worker4"; }
     b64=$(base64 -w0 < "$script_file")
     out=$(rssh "$host" "echo '${b64}' | base64 -d > /tmp/lb-nach-workerwechsel.sh && bash /tmp/lb-nach-workerwechsel.sh '${HETZNER_SVC_nginx}' '${workers}'; r=\$?; rm -f /tmp/lb-nach-workerwechsel.sh; exit \$r" 2>&1)
     rc=$?
@@ -3305,8 +3305,8 @@ deploy_server() {
     # === LB re-resolves worker IPs: reload + probe (hetzner) ===
     if [[ "$server_name" == "hetzner" ]]; then
         step "Phase 4b: LB reload + worker probe (hetzner)"
-        lb_nach_workerwechsel "$host"
-        local lb_rc=$?
+        local lb_rc=0
+        lb_nach_workerwechsel "$host" || lb_rc=$?
         if (( lb_rc == 2 )); then
             error_ "LB reload/config error after Phase 4 (workers unchanged and healthy) — NOT rolling back; fix the LB config and run: bash scripts/lb-nach-workerwechsel.sh"
             return 1
