@@ -33,7 +33,7 @@ services:
         GIT_COMMIT: ${GIT_COMMIT:-unknown}
     container_name: wt-prod-lb
     ports:
-      - "178.104.178.79:8000:80"   # N8: nur oeffentliche IPv4, kein [::]
+      # 12.11.2026: oeffentliches :8000 entfernt (Kanzler/Rafael); nur Loopback + Tailnet-Listener
       - "127.0.0.1:8000:80"        # host-lokal
       - "100.126.91.53:8000:81"    # N8: Tailnet-Listener (nginx listen 81, Allowlist nach Listener)
     volumes:
