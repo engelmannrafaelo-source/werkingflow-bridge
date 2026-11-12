@@ -12,7 +12,7 @@ services:
         GIT_COMMIT: ${GIT_COMMIT:-unknown}
     container_name: wt-wrapper-lb
     ports:
-      - "49.12.72.66:8000:80"      # Primary API (N8: nur oeffentliche IPv4, kein [::])
+      # 12.11.2026: oeffentliches :8000 entfernt (Kanzler/Rafael); nur Loopback + Tailnet-Listener
       - "127.0.0.1:8000:80"        # host-lokal
       - "100.112.98.39:8000:81"    # N8: Tailnet-Listener (nginx listen 81, Allowlist nach Listener)
       - "8010:80"      # eco-backend compatibility
