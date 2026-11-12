@@ -15,8 +15,7 @@ services:
       # 12.11.2026: oeffentliches :8000 entfernt (Kanzler/Rafael); nur Loopback + Tailnet-Listener
       - "127.0.0.1:8000:80"        # host-lokal
       - "100.112.98.39:8000:81"    # N8: Tailnet-Listener (nginx listen 81, Allowlist nach Listener)
-      - "8010:80"      # eco-backend compatibility
-      - "8020:80"      # eco-diagnostics compatibility
+      # 12.11.2026: 8010/8020 (eco-Kompatibilitaet) entfernt, ungenutzt (Kanzler)
     volumes:
       - ./nginx.conf:/etc/nginx/nginx.conf:ro
       # Per-topology worker set (ADR-0006 B/C) — envsubst'd to /tmp/upstreams.conf
