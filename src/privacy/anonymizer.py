@@ -97,9 +97,10 @@ _anonymizer_engine = None
 # "Von: Anna Beispiel <a@b.invalid>" yields the WHOLE display name (NER may tag only
 # the first token; equal score 1.0 -> the longer span wins).
 _MAIL_ADDRESS_RE = (
-    r"(?<![\w.%+\-])[A-Za-z0-9._%+\-]+@"
-    r"[A-Za-z0-9](?:[A-Za-z0-9\-]*[A-Za-z0-9])?"
-    r"(?:\.[A-Za-z0-9](?:[A-Za-z0-9\-]*[A-Za-z0-9])?)+"
+    r"(?<![\w.%+\-])[\p{L}\p{N}._%+\-]+@"
+    r"(?:[\p{L}\p{N}](?:[\p{L}\p{N}\-]*[\p{L}\p{N}])?\.)+"
+    # final label must start with a letter and have >= 2 chars: "28.0@35.1" (measurements) is no address
+    r"\p{L}[\p{L}\p{N}\-]*[\p{L}\p{N}]"
 )
 _MAIL_HEADER_NAME_RE = (
     r"(?:^|(?<=\s))(?:Von|From|An|To|Cc|Bcc|Reply-To|Absender)[ \t]*:[ \t]*\"?"
