@@ -97,14 +97,21 @@ _anonymizer_engine = None
 # "Von: Anna Beispiel <a@b.invalid>" yields the WHOLE display name (NER may tag only
 # the first token; equal score 1.0 -> the longer span wins).
 _MAIL_ADDRESS_RE = (
-    r"(?<![\w.%+\-])[\p{L}\p{N}._%+\-]+@"
+    # local part starts with a letter/digit (quote/apostrophe before it is not part of the address);
+    # unicode letters (IDN/SMTPUTF8), plus, apostrophe (o'brien) and underscore allowed
+    r"(?<![\w.%+\-])[\p{L}\p{N}][\p{L}\p{N}._%+\-']*@"
     r"(?:[\p{L}\p{N}](?:[\p{L}\p{N}\-]*[\p{L}\p{N}])?\.)+"
     # final label must start with a letter and have >= 2 chars: "28.0@35.1" (measurements) is no address
     r"\p{L}[\p{L}\p{N}\-]*[\p{L}\p{N}]"
 )
-_MAIL_HEADER_NAME_RE = (
-    r"(?:^|(?<=\s))(?:Von|From|An|To|Cc|Bcc|Reply-To|Absender)[ \t]*:[ \t]*\"?"
-    r"(?P<name>[^<>\n\"@:]{2,80}?)\"?[ \t]*<[^<>\s@]+@"
+# Header lines are matched ONLY at the start of a line (real anchor; only non-word characters such as blanks, '>' or an
+# emoji may precede the keyword, so inline "Messung von: ..." never matches), including
+# folded continuation lines (leading blanks). Every "Name <addr>" recipient in the value is handled.
+_MAIL_HEADER_LINE_RE = (
+    r"^[^\w\n]*(?:Von|From|An|To|Cc|Bcc|Reply-To|Absender)[ \t]*:(?P<rest>[^\n]*(?:\n[ \t]+[^\n]*)*)"
+)
+_MAIL_RECIPIENT_RE = (
+    r"(?:^|[,;])[ \t\n]*(?:\"(?P<q>[^\"\n]{2,80})\"|(?P<n>[^<>,;\"@:\n]{2,80}?))[ \t\n]*<(?P<addr>[^<>\s@]+@[^<>\s]+)>"
 )
 
 
@@ -112,19 +119,36 @@ def build_mail_recognizers(language: str) -> list:
     """Extra deterministic recognizers for mail addresses and header display names."""
     from presidio_analyzer import EntityRecognizer, Pattern, PatternRecognizer, RecognizerResult
 
-    class MailHeaderNameRecognizer(EntityRecognizer):
+    class MailHeaderRecognizer(EntityRecognizer):
+        """Header lines only: each recipient's display name -> PERSON (complete), its <address> -> EMAIL_ADDRESS
+        (also internal hosts without a dot, e.g. <anna@intranet>). Score 1.0 beats URL 0.5 and a first-name NER
+        span of equal score by span length."""
+
         def load(self) -> None:  # nothing to load
             pass
 
         def analyze(self, text, entities, nlp_artifacts=None):
-            if "PERSON" not in entities:
+            want_person = "PERSON" in entities
+            want_mail = "EMAIL_ADDRESS" in entities
+            if not (want_person or want_mail):
                 return []
-            rx = re.compile(_MAIL_HEADER_NAME_RE, re.IGNORECASE | re.MULTILINE)
-            return [
-                RecognizerResult(entity_type="PERSON", start=m.start("name"),
-                                 end=m.end("name"), score=1.0)
-                for m in rx.finditer(text) if m.group("name").strip()
-            ]
+            hdr = re.compile(_MAIL_HEADER_LINE_RE, re.IGNORECASE | re.MULTILINE)
+            rcp = re.compile(_MAIL_RECIPIENT_RE, re.IGNORECASE)
+            out = []
+            for h in hdr.finditer(text):
+                rest, base = h.group("rest"), h.start("rest")
+                for m in rcp.finditer(rest):
+                    grp = "q" if m.group("q") is not None else "n"
+                    name = m.group(grp)
+                    if want_person and name and name.strip():
+                        lead = len(name) - len(name.lstrip())
+                        s0 = base + m.start(grp) + lead
+                        out.append(RecognizerResult(entity_type="PERSON", start=s0,
+                                                    end=s0 + len(name.strip()), score=1.0))
+                    if want_mail:
+                        out.append(RecognizerResult(entity_type="EMAIL_ADDRESS", start=base + m.start("addr"),
+                                                    end=base + m.end("addr"), score=1.0))
+            return out
 
     return [
         PatternRecognizer(
@@ -133,9 +157,9 @@ def build_mail_recognizers(language: str) -> list:
             patterns=[Pattern(name="mail_address_syntax", regex=_MAIL_ADDRESS_RE, score=1.0)],
             supported_language=language,
         ),
-        MailHeaderNameRecognizer(supported_entities=["PERSON"],
-                                 name=f"mail_header_name_{language}",
-                                 supported_language=language),
+        MailHeaderRecognizer(supported_entities=["PERSON", "EMAIL_ADDRESS"],
+                             name=f"mail_header_{language}",
+                             supported_language=language),
     ]
 
 
