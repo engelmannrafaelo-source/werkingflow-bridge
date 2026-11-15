@@ -3506,7 +3506,7 @@ async def _chat_completions_lauf(
             )
 
         # SCHEMA-BEDROCK-GUARD: the Schema generator must run on Bedrock EU (operator pin, eu-central-1,
-        # approved model) on a Bedrock-capable worker; anything else is refused BEFORE dispatch — no
+        # approved model) on every bridge whose BRIDGE_ORIGIN_ID is not 'dev'; anything else is refused BEFORE dispatch — no
         # Anthropic fallback, and a client X-App-Env cannot downgrade it. See routing/schema_bedrock_guard.py.
         from src.routing.schema_bedrock_guard import (
             guard_applies as _schema_guard_applies,
@@ -3514,8 +3514,23 @@ async def _chat_completions_lauf(
         )
         from src.routing.app_provider_policy import _resolve_app_id as _schema_resolve_app_id
         from src.auth import bedrock_credential_manager as _schema_bedrock_creds
+        from src.federation import self_origin_id as _schema_origin_id
         _schema_app_id, _ = _schema_resolve_app_id(request)
-        if _schema_guard_applies(_schema_app_id, _schema_bedrock_creds.validate()[0]):
+        if _schema_guard_applies(_schema_app_id, _schema_origin_id()):
+            if not _schema_bedrock_creds.validate()[0]:
+                # Active bridge without Bedrock access: refuse (never fall back to Anthropic).
+                raise HTTPException(
+                    status_code=503,
+                    detail={
+                        "error": {
+                            "message": "Schema generator requires Bedrock EU, but this worker has no Bedrock access. Nothing was routed elsewhere.",
+                            "type": "configuration_error",
+                            "code": "schema_bedrock_unavailable",
+                            "retryable": False,
+                            "hint": "Restore the worker's Bedrock credentials; Schema traffic is Bedrock-EU only.",
+                        }
+                    },
+                )
             try:
                 if backend_config is None:
                     raise SchemaBedrockExpectationError(
@@ -7598,6 +7613,19 @@ async def research(
     """
     # Verify API key
     await verify_api_key(request, credentials)
+
+    # SCHEMA-BEDROCK-GUARD: this dispatcher may switch Bedrock to Anthropic by design -> refused for Schema.
+    from src.routing.schema_bedrock_guard import (
+        assert_schema_research_refused, SchemaBedrockExpectationError as _SchemaResearchError,
+    )
+    from src.routing.app_provider_policy import _resolve_app_id as _schema_research_app
+    try:
+        assert_schema_research_refused(_schema_research_app(request)[0])
+    except _SchemaResearchError as e:
+        raise HTTPException(
+            status_code=403,
+            detail={"error": {"message": str(e), "type": "permission_error", "code": e.code}},
+        )
 
     # Attribution enforcement
     enforce_attribution(request)

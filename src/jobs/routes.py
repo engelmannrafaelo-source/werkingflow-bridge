@@ -347,6 +347,32 @@ async def create_job_endpoint(
     if attribution is None and _attribution_extractor is not None:
         attribution = _attribution_extractor(request)
 
+    # SCHEMA-BEDROCK-GUARD: Schema jobs are chat or proxy->smart-anonymize only, and their identity is pinned to
+    # the validated request (headers/principal), never to body.attribution: the worker-key self-call turns the
+    # attribution into X-App-ID/X-User-ID, so a divergent body value could dodge the Bedrock/research guard.
+    from src.routing.app_provider_policy import _resolve_app_id as _schema_job_app
+    from src.routing.schema_bedrock_guard import (
+        SCHEMA_APP_ID as _SCHEMA_APP_ID, assert_schema_job_allowed, bind_schema_job_attribution,
+        SchemaBedrockExpectationError as _SchemaJobError,
+    )
+    _schema_auth_app = _schema_job_app(request)[0]
+    _schema_claimed_app = (attribution or {}).get("app_id")
+    try:
+        assert_schema_job_allowed(
+            authenticated_app=_schema_auth_app, claimed_app=_schema_claimed_app,
+            kind=body.kind, payload=body.payload,
+        )
+        if _SCHEMA_APP_ID in (_schema_auth_app, _schema_claimed_app):
+            _derived = _attribution_extractor(request) if _attribution_extractor is not None else {}
+            if _derived.get("app_id") is None:
+                _derived = {**_derived, "app_id": _schema_auth_app}
+            attribution = bind_schema_job_attribution(attribution, _derived)
+    except _SchemaJobError as e:
+        raise HTTPException(
+            status_code=403,
+            detail={"error": {"message": str(e), "type": "permission_error", "code": e.code}},
+        )
+
     # ADR-0011: the job's HOME bridge comes from the LB-stamped request
     # context, NEVER from the body — a body-supplied bridge_origin would let a
     # caller redirect whose budget pays. Persisted with the job so a reclaim
