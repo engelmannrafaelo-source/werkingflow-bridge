@@ -56,7 +56,14 @@ def check_recipients(recipients: Iterable[str]) -> None:
     ]
     for rcpt in recipients:
         addr = (rcpt or "").strip().lower()
-        if not any(fnmatch.fnmatchcase(addr, p) for p in patterns):
+        # Genau EINE schlichte Adresse: keine Liste, kein Anzeigename, kein Whitespace, genau ein "@".
+        # Sonst liessen sich Mehrfach-/Anzeigeformen am Muster vorbei durchreichen.
+        if (
+            not addr
+            or addr.count("@") != 1
+            or any(ch in addr for ch in ' \t\r\n,;<>()[]"\'')
+            or not any(fnmatch.fnmatchcase(addr, p) for p in patterns)
+        ):
             raise RuntimeError(
                 "Testtransport aktiv: Empfaenger nicht erlaubt (nur Muster aus "
                 "RESEND_TEST_ALLOWED_RECIPIENTS)."

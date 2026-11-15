@@ -912,9 +912,13 @@ async def _dispatch_invoice_email(pool: Any, r: Any) -> Dict[str, Any]:
     from src.billing.resend_transport import check_recipients, resend_emails_url
     try:
         check_recipients([recipient])
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    try:
         _resend_url = resend_emails_url()
     except RuntimeError as exc:
-        raise HTTPException(status_code=409, detail=str(exc))
+        # Konfigurationsfehler (z. B. RESEND_REQUIRE_TEST_BASE ohne Basis), analog fehlendem Key: 503.
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
     async with _httpx.AsyncClient(timeout=10.0) as client:
         resp = await client.post(
             _resend_url,

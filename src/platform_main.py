@@ -90,6 +90,10 @@ from src.tenant import TenantMiddleware  # noqa: E402
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Resend-Transport: reine Env-Pruefung, deshalb ganz vorn (vor DB-Pool/Dispatcher): in Produktion
+    # nie eine andere Basis als api.resend.com (Startfehler, nicht abgefangen).
+    from src.billing.resend_transport import assert_startup_config as _resend_startup_check
+    _resend_startup_check()
     if not is_db_enabled():
         # platform-api requires BRIDGE_DB_URL — fail loud on startup.
         raise RuntimeError(
@@ -134,10 +138,6 @@ async def lifespan(app: FastAPI):
     dispatcher.start()
     app.state.webhook_dispatcher = dispatcher
     logger.info("✅ Webhook dispatcher started")
-
-    # Resend-Transport: in Produktion nie eine andere Basis als api.resend.com (Startfehler, nicht abgefangen).
-    from src.billing.resend_transport import assert_startup_config as _resend_startup_check
-    _resend_startup_check()
 
     # Taegliche DB-Sweeps — hierher gezogen aus der Worker-Lifespan (ADR-0009
     # Schritt 2d): der Prozess, der den Pool haelt, faehrt die Sweeps. Vorher
