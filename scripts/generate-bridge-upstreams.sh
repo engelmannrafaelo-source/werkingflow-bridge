@@ -138,8 +138,25 @@ energy_subscription_no_hop() {
     esac
 }
 
+# --- SCHEMA_GENERATOR_JOBS_LOCAL: werking-schema-generator keyed jobs stay on the dev workers (15.11.2026) ---
+# Homepage Mini-Schema (Dev staging): its dev-only principal (homepage-mini-schema-dev) exists only on
+# the Dev bridge, and every Mini job POST carries an Idempotency-Key. Without this switch a keyed job
+# is fixed to the peer = prod bridge ($jobs_peer_first default 1) and fails there with 401.
+# On primary only, INDEPENDENT of ENERGY_SUBSCRIPTION_NO_HOP:
+#   SCHEMA_GENERATOR_JOBS_LOCAL=0 (DEFAULT)  nothing changes (include byte-identical).
+#   SCHEMA_GENERATOR_JOBS_LOCAL=1            X-App-ID werking-schema-generator: $jobs_peer_first=0.
+# On production the switch has NO effect (upstreams-prod.conf byte-identical).
+# Activation: SCHEMA_GENERATOR_JOBS_LOCAL=1 [ENERGY_SUBSCRIPTION_NO_HOP=1] scripts/generate-bridge-upstreams.sh primary
+schema_generator_jobs_local() {
+    case "${SCHEMA_GENERATOR_JOBS_LOCAL:-0}" in
+        0|1) echo "${SCHEMA_GENERATOR_JOBS_LOCAL:-0}" ;;
+        *) echo "ERROR: SCHEMA_GENERATOR_JOBS_LOCAL must be 0 or 1, got '${SCHEMA_GENERATOR_JOBS_LOCAL}'" >&2; return 1 ;;
+    esac
+}
+
 # nginx map regex for the werking-energy app id at the END of a map key.
 ENERGY_APP_RE='\s*werking-energy\s*$'
+SCHEMA_GENERATOR_APP_RE='\s*werking-schema-generator\s*$'
 
 # $1 = worker name, $2 = NAME (string) of the associative targets array in
 # scope (e.g. "PROD_WORKER_TARGETS") -> "host:port", defaulting to the
@@ -397,19 +414,32 @@ emit_keyed_job_routing() {
     echo "    keepalive 8;"
     echo "}"
     echo
-    if [ "$id" = primary ] && [ "$(energy_subscription_no_hop)" = 1 ]; then
-        echo "# ENERGY_SUBSCRIPTION_NO_HOP=1: a keyed werking-energy job always lives"
-        echo "# HERE (dev subscription mode); everyone else as without the switch."
+    local energy_local=0 schema_local=0
+    if [ "$id" = primary ]; then
+        energy_local="$(energy_subscription_no_hop)" || return 1
+        schema_local="$(schema_generator_jobs_local)" || return 1
+    fi
+    if [ "$energy_local" = 1 ] || [ "$schema_local" = 1 ]; then
+        if [ "$energy_local" = 1 ]; then
+            echo "# ENERGY_SUBSCRIPTION_NO_HOP=1: a keyed werking-energy job always lives"
+            echo "# HERE (dev subscription mode); everyone else as without the switch."
+        fi
+        if [ "$schema_local" = 1 ]; then
+            echo "# SCHEMA_GENERATOR_JOBS_LOCAL=1: a keyed werking-schema-generator job always lives"
+            echo "# HERE (Dev-only Mini-Schema principal); independent of the Energy switch."
+        fi
         if [ "$first" = priority ]; then
             echo "map \"\$http_x_priority:\$http_x_app_id\" \$jobs_peer_first {"
             echo "    default    0;"
-            echo "    \"~*^[^:]*:${ENERGY_APP_RE}\" 0;"
+            [ "$energy_local" = 1 ] && echo "    \"~*^[^:]*:${ENERGY_APP_RE}\" 0;"
+            [ "$schema_local" = 1 ] && echo "    \"~*^[^:]*:${SCHEMA_GENERATOR_APP_RE}\" 0;"
             echo "    \"~*^production:[^:]*\$\" 1;"
             echo "}"
         else
             echo "map \$http_x_app_id \$jobs_peer_first {"
             echo "    default ${first};"
-            echo "    \"~*^${ENERGY_APP_RE}\" 0;"
+            [ "$energy_local" = 1 ] && echo "    \"~*^${ENERGY_APP_RE}\" 0;"
+            [ "$schema_local" = 1 ] && echo "    \"~*^${SCHEMA_GENERATOR_APP_RE}\" 0;"
             echo "}"
         fi
     elif [ "$first" = priority ]; then
