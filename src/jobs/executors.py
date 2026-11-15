@@ -374,6 +374,9 @@ _ATTRIBUTION_HEADERS = {
     "bridge_origin": "X-Bridge-Origin",
     # Test-KI-Deckel: Laufkennung der App-Sperre (src/budget/test_ki_deckel.py).
     "test_lauf": "X-Test-Lauf",
+    # Schema-EU route stamp (path B v2): persisted by POST /v1/jobs from the LB header only; the self-call to
+    # localhost bypasses the LB, so without it _chat_completions_lauf refuses the Schema chat (schema_route_required).
+    "schema_route": "X-Bridge-Schema-Route",
 }
 
 # Last-resort caller identity for self-calls whose triggering job carried NO
