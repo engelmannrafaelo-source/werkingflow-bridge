@@ -3514,13 +3514,14 @@ async def _chat_completions_lauf(
         )
         from src.routing.app_provider_policy import _resolve_app_id as _schema_resolve_app_id
         from src.auth import bedrock_credential_manager as _schema_bedrock_creds
-        from src.federation import self_origin_id as _schema_origin_id
+        from src.federation import self_origin_id as _schema_origin_id, get_request_origin as _schema_request_origin
         _schema_app_id, _ = _schema_resolve_app_id(request)
-        if _schema_guard_applies(_schema_app_id, _schema_origin_id()):
+        if _schema_guard_applies(_schema_app_id, _schema_origin_id(), _schema_request_origin()):
             if not _schema_bedrock_creds.validate()[0]:
-                # Active bridge without Bedrock access: refuse (never fall back to Anthropic).
+                # Active guard without Bedrock access: refuse with a status the LB does NOT retry (424), so the
+                # Prod LB cannot fail over to the Dev backup because of it (never fall back to Anthropic).
                 raise HTTPException(
-                    status_code=503,
+                    status_code=424,
                     detail={
                         "error": {
                             "message": "Schema generator requires Bedrock EU, but this worker has no Bedrock access. Nothing was routed elsewhere.",

@@ -8,12 +8,16 @@ EU processing, so a silent Anthropic answer is a data-residency breach, not a de
 
 Scope is deliberately narrow:
 * only ``werking-schema-generator`` (the authenticated app, see app_provider_policy._resolve_app_id),
-* on every bridge whose origin id is not exactly ``dev``: federation.self_origin_id() reads only the
-  process ENV ``BRIDGE_ORIGIN_ID`` (never a client header, never X-App-Env); unset/unknown/prod = active,
-  only ``dev`` is exempt. Activation never depends on Bedrock credentials. This is a PRODUCTION patch
-  (branch on daabf89, not for the Dev deploy); other apps are untouched.
-* no new configuration variable: the facts used are the app identity, the existing origin id, the
-  worker's own Bedrock credential state (503 if missing) and the already resolved routing result.
+* on every bridge whose own origin id is not ``dev`` (``federation.self_origin_id()``, process ENV
+  ``BRIDGE_ORIGIN_ID``) AND, on the Dev bridge, for every request that arrives stamped with a non-dev origin
+  (``federation.get_request_origin()``, the LB-stamped ``X-Bridge-Origin``). The request origin can only switch
+  the guard ON, never off. This closes the Prod-LB failover to the Dev backup: a Prod request that lands on a
+  Dev worker (502/timeout/worker outage/retried status) is stamped ``prod`` by the Prod LB, preserved by the Dev LB's
+  trusted peer listener, and is rejected there instead of being answered by Anthropic.
+* Guard refusals are never retried by the LB: they use 403/424 (the LB retries only 500/502/503/504/429), so the
+  guard itself cannot trigger the failover.
+* no new configuration variable: the facts used are the app identity, the existing origin id, the LB-stamped request
+  origin, the worker's Bedrock credential state (424 if missing) and the already resolved routing result.
 
 The check runs on the RESOLVED routing result (backend/region/model after pin, app policy,
 tier resolution and the non-prod downgrade), before dispatch. It therefore also catches a client
@@ -45,14 +49,25 @@ class SchemaBedrockExpectationError(RuntimeError):
 DEV_ORIGIN_ID = "dev"
 
 
-def guard_applies(app_id: Optional[str], origin_id: Optional[str]) -> bool:
-    """True for the (authenticated or, for wildcard/legacy callers, self-declared) Schema app on every
-    bridge except the one whose server-side origin id is exactly ``dev``.
+def guard_applies(app_id: Optional[str], self_origin_id: Optional[str], request_origin: Optional[str] = None) -> bool:
+    """True for the Schema app unless BOTH this bridge is ``dev`` AND the request carries no non-dev origin.
 
-    Fail-closed: an unset/empty/unknown origin id is NOT dev, so the guard is active. Activation does not
-    depend on Bedrock credentials: a worker without them gets a 503 from the caller, never Anthropic.
+    Fail-closed: an unset/empty/unknown own origin counts as NOT dev (guard active). The request origin only
+    switches the guard ON: a stamp that is empty or ``dev`` changes nothing, a non-dev stamp (``prod`` or any
+    foreign id) activates it even on the Dev bridge. It never switches the guard off, so a forged or stripped
+    stamp cannot weaken it.
     """
-    return app_id == SCHEMA_APP_ID and (origin_id or "").strip().lower() != DEV_ORIGIN_ID
+    if app_id != SCHEMA_APP_ID:
+        return False
+    if (self_origin_id or "").strip().lower() != DEV_ORIGIN_ID:
+        return True
+    return (request_origin or "").strip().lower() not in ("", DEV_ORIGIN_ID)
+
+
+#: HTTP status used for "this bridge cannot serve Schema on Bedrock" / "guard refused": NOT in the LB's
+#: ``proxy_next_upstream`` set (500, 502, 503, 504, 429), so the Prod LB never fails over to the Dev backup because of it.
+UNAVAILABLE_STATUS = 424
+REFUSAL_STATUS = 403
 
 
 #: Schema mini contract: chat completions and ONE proxy target. No research, no other job kinds.
