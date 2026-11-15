@@ -12,6 +12,16 @@
 # Additiv vor dem bestehenden LB: reine Weiterleitung an den OpenResty-LB
 # (Compose-Service `nginx`), KEINE eigene Routing-/Failover-Logik hier.
 bridge.werking.tools {
+	# Sicherheitsvorfall 12.11.2026 (Kanzler 59e00bf0): /internal/* nie oeffentlich.
+	# Caddy steht im vertrauten Docker-Netz; die IP-Allowlist im LB greift hinter Caddy nicht.
+	@intern_public path /internal /internal/* /v1/db/health /v1/auth/status
+	respond @intern_public 404
+	# /lb-status: legitime Nutzer nur Dev, Partner, Prod-Bridge, Dev-Bridge (+ Tailnet)
+	@lb_status_fremd {
+		path /lb-status
+		not remote_ip 138.199.229.172 162.55.169.151 178.104.178.79 49.12.72.66 100.64.0.0/10 fd7a:115c:a1e0::/48 172.16.0.0/12
+	}
+	respond @lb_status_fremd 404
 	# ADR-0011: Caddy wohnt im Docker-Netz — sein remote_addr faellt beim LB
 	# in den vertrauten Bereich. Ohne diesen Strip koennte JEDER externe
 	# HTTPS-Client einen X-Bridge-Origin faelschen und damit umleiten,
