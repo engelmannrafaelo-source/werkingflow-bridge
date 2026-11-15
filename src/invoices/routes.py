@@ -909,9 +909,15 @@ async def _dispatch_invoice_email(pool: Any, r: Any) -> Dict[str, Any]:
     )
     subject = f"Rechnung {invoice_dict['invoiceNumber']} — Werkingflow"
 
+    from src.billing.resend_transport import check_recipients, resend_emails_url
+    try:
+        check_recipients([recipient])
+        _resend_url = resend_emails_url()
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
     async with _httpx.AsyncClient(timeout=10.0) as client:
         resp = await client.post(
-            "https://api.resend.com/emails",
+            _resend_url,
             headers={
                 "Authorization": f"Bearer {resend_key}",
                 "Content-Type": "application/json",
@@ -1011,6 +1017,18 @@ async def auto_approve_and_send_invoice(invoice_id: str, actor: str) -> Dict[str
     Platform Admin). Deliberately a separate function rather than a refactor of
     approve_invoice(), so the admin-triggered path stays untouched.
     """
+    # HOM-STAGE-S3: NUR wenn BRIDGE_ORIGIN_ID ausdruecklich dev oder staging ist und
+    # INVOICE_REQUIRE_APPROVAL an ist: keine automatische Freigabe, kein Versand (auch nicht im
+    # Webhook-paid-Pfad). Fehlt BRIDGE_ORIGIN_ID oder hat es einen anderen Wert (z. B. prod):
+    # bitgenau unveraendert — Rafaels Produktentscheid 2026-07-29 (siehe Docstring):
+    # report-check-credit wird automatisch fakturiert.
+    from src.federation import self_origin_id
+    if self_origin_id().lower() in ("dev", "staging") and _approval_required():
+        logger.info(
+            "Invoice %s held for operator approval (INVOICE_REQUIRE_APPROVAL on, origin dev/staging) — auto-approve+send skipped",
+            invoice_id,
+        )
+        return {"held": True, "invoiceId": invoice_id, "reason": "approval_required"}
     pool = get_pool()
     async with pool.acquire() as conn:
         async with conn.transaction():

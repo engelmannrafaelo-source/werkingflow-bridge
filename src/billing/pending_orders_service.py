@@ -248,9 +248,11 @@ async def _send_order_email(invoice_id: str, user_id: str) -> None:
     html_body = _render_html(inv_dict)
     subject = f"Rechnung {inv_dict['invoiceNumber']} — Bestellung ausstehend"
 
+    from src.billing.resend_transport import check_recipients, resend_emails_url
+    check_recipients([recipient])
     async with httpx.AsyncClient(timeout=10.0) as client:
         resp = await client.post(
-            "https://api.resend.com/emails",
+            resend_emails_url(),
             headers={
                 "Authorization": f"Bearer {resend_key}",
                 "Content-Type": "application/json",

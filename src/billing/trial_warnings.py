@@ -156,9 +156,11 @@ async def _send_via_resend(
     sender: str,
 ) -> None:
     """POST to Resend. Raises RuntimeError on non-2xx."""
+    from src.billing.resend_transport import check_recipients, resend_emails_url
+    check_recipients([recipient])
     async with httpx.AsyncClient(timeout=10.0) as client:
         resp = await client.post(
-            "https://api.resend.com/emails",
+            resend_emails_url(),
             headers={
                 "Authorization": f"Bearer {resend_key}",
                 "Content-Type": "application/json",

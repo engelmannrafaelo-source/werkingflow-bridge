@@ -135,6 +135,10 @@ async def lifespan(app: FastAPI):
     app.state.webhook_dispatcher = dispatcher
     logger.info("✅ Webhook dispatcher started")
 
+    # Resend-Transport: in Produktion nie eine andere Basis als api.resend.com (Startfehler, nicht abgefangen).
+    from src.billing.resend_transport import assert_startup_config as _resend_startup_check
+    _resend_startup_check()
+
     # Taegliche DB-Sweeps — hierher gezogen aus der Worker-Lifespan (ADR-0009
     # Schritt 2d): der Prozess, der den Pool haelt, faehrt die Sweeps. Vorher
     # lief jede Loop auf JEDEM Worker (nur ueber DB-Stempel idempotent) und
