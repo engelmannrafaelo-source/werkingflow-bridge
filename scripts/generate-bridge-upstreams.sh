@@ -48,6 +48,24 @@ ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 # the committed files are always generated into docker/.
 OUT_DIR="${UPSTREAMS_OUT_DIR:-${ROOT}/docker}"
 
+# Persistent generator switches (non-secret) for the committed include: docker/upstreams-primary.flags
+# (lines KEY=0|1; only ENERGY_SUBSCRIPTION_NO_HOP and SCHEMA_GENERATOR_JOBS_LOCAL are read; a variable
+# already set in the environment wins). Applied ONLY when writing into docker/ (UPSTREAMS_OUT_DIR unset)
+# or when UPSTREAMS_FLAGS_FILE names a file, so test/variant renders keep the switch defaults (0).
+# Without this, a plain `generate-bridge-upstreams.sh` would silently drop the dev-only exceptions.
+FLAGS_FILE="${UPSTREAMS_FLAGS_FILE:-}"
+if [ -z "$FLAGS_FILE" ] && [ -z "${UPSTREAMS_OUT_DIR:-}" ]; then
+    FLAGS_FILE="${ROOT}/docker/upstreams-primary.flags"
+fi
+if [ -n "$FLAGS_FILE" ] && [ -f "$FLAGS_FILE" ]; then
+    while IFS='=' read -r _flag_k _flag_v || [ -n "$_flag_k" ]; do
+        case "$_flag_k" in
+            ENERGY_SUBSCRIPTION_NO_HOP|SCHEMA_GENERATOR_JOBS_LOCAL)
+                if [ -z "${!_flag_k+x}" ]; then export "$_flag_k=$_flag_v"; fi ;;
+        esac
+    done < "$FLAGS_FILE"
+fi
+
 PRIMARY_WORKERS=(worker1 worker2 worker3 worker4)
 PROD_WORKERS=(worker-sahori worker-kurt worker-coach worker-erk)
 declare -A PRIMARY_WORKER_TARGETS=()
