@@ -3505,6 +3505,42 @@ async def _chat_completions_lauf(
                 }},
             )
 
+        # SCHEMA-BEDROCK-GUARD: the Schema generator must run on Bedrock EU (operator pin, eu-central-1,
+        # approved model) on a Bedrock-capable worker; anything else is refused BEFORE dispatch — no
+        # Anthropic fallback, and a client X-App-Env cannot downgrade it. See routing/schema_bedrock_guard.py.
+        from src.routing.schema_bedrock_guard import (
+            guard_applies as _schema_guard_applies,
+            assert_schema_expected_bedrock, SchemaBedrockExpectationError,
+        )
+        from src.routing.app_provider_policy import _resolve_app_id as _schema_resolve_app_id
+        from src.auth import bedrock_credential_manager as _schema_bedrock_creds
+        _schema_app_id, _ = _schema_resolve_app_id(request)
+        if _schema_guard_applies(_schema_app_id, _schema_bedrock_creds.validate()[0]):
+            try:
+                if backend_config is None:
+                    raise SchemaBedrockExpectationError(
+                        "schema_requires_bedrock",
+                        "Schema generator call has no resolved backend; refused (no Anthropic fallback).",
+                    )
+                assert_schema_expected_bedrock(
+                    effective_backend=backend_config.backend,
+                    operator_pin=operator_pinned_provider,
+                    region=backend_config.region,
+                    model_id=backend_config.model_id,
+                )
+            except SchemaBedrockExpectationError as e:
+                raise HTTPException(
+                    status_code=403,
+                    detail={
+                        "error": {
+                            "message": str(e),
+                            "type": "permission_error",
+                            "code": e.code,
+                            "hint": "Schema generator traffic is Bedrock-EU only; fix the operator pin/model/region, nothing was routed elsewhere.",
+                        }
+                    },
+                )
+
         # BEDROCK-GATE: effektiver Backend darf nur per Operator-Pin Bedrock
         # sein (deckt backend=bedrock UND Bedrock-provider_tiers ab) — jeder
         # Bedrock-Call muss einem echten User zuordenbar sein.
