@@ -64,6 +64,30 @@ def guard_applies(app_id: Optional[str], self_origin_id: Optional[str], request_
     return (request_origin or "").strip().lower() not in ("", DEV_ORIGIN_ID)
 
 
+#: Schema-EU route stamp (Root review R3, path B). The LB sets it ONLY in ``/__schema_local`` (local workers,
+#: no cross-bridge entry) and clears every inbound copy (``more_clear_input_headers``). A Schema call on a
+#: non-dev bridge without it did not come through the no-backup route and is refused before dispatch.
+SCHEMA_ROUTE_HEADER = "x-bridge-schema-route"
+SCHEMA_ROUTE_VALUE = "local"
+
+
+def assert_schema_route(self_origin_id: Optional[str], route_stamp: Optional[str]) -> None:
+    """Raise unless a Schema call on a non-dev bridge carries the LB's Schema-EU route stamp.
+
+    Called only where ``guard_applies`` is True. On the Dev bridge (own origin ``dev``) nothing is required:
+    under path B a production Schema request never reaches dev (no peer entry in ``claude_schema_local``, and
+    the Dev LB refuses hopped Schema requests with 421). Fail-closed: unset own origin counts as NOT dev.
+    The stamp can only add a refusal; forging it does not bypass the Bedrock checks that follow.
+    """
+    if (self_origin_id or "").strip().lower() == DEV_ORIGIN_ID:
+        return
+    if (route_stamp or "").strip().lower() != SCHEMA_ROUTE_VALUE:
+        raise SchemaBedrockExpectationError(
+            "schema_route_required",
+            "Schema generator calls on this bridge must arrive via the Schema-EU LB route (no cross-bridge backup).",
+        )
+
+
 #: HTTP status used for "this bridge cannot serve Schema on Bedrock" / "guard refused": NOT in the LB's
 #: ``proxy_next_upstream`` set (500, 502, 503, 504, 429), so the Prod LB never fails over to the Dev backup because of it.
 UNAVAILABLE_STATUS = 424

@@ -3517,6 +3517,17 @@ async def _chat_completions_lauf(
         from src.federation import self_origin_id as _schema_origin_id, get_request_origin as _schema_request_origin
         _schema_app_id, _ = _schema_resolve_app_id(request)
         if _schema_guard_applies(_schema_app_id, _schema_origin_id(), _schema_request_origin()):
+            # Path B (Root review R3): on a non-dev bridge the call must have come through the LB's
+            # no-backup Schema route; refused before dispatch with 403 (not retried by the LB).
+            from src.routing.schema_bedrock_guard import assert_schema_route, SCHEMA_ROUTE_HEADER
+            try:
+                assert_schema_route(_schema_origin_id(), request.headers.get(SCHEMA_ROUTE_HEADER))
+            except SchemaBedrockExpectationError as e:
+                raise HTTPException(
+                    status_code=403,
+                    detail={"error": {"message": str(e), "type": "permission_error", "code": e.code,
+                                      "hint": "Call the bridge through its LB; Schema traffic uses the local Schema-EU route only."}},
+                )
             if not _schema_bedrock_creds.validate()[0]:
                 # Active guard without Bedrock access: refuse with a status the LB does NOT retry (424), so the
                 # Prod LB cannot fail over to the Dev backup because of it (never fall back to Anthropic).
