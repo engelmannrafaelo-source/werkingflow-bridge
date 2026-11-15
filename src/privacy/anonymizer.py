@@ -87,6 +87,56 @@ _presidio_available: Optional[bool] = None
 _analyzer_engine = None
 _anonymizer_engine = None
 
+# --- Mail address / mail header spans (15.11.2026, Mini-Schema E2E privacy FAIL) ---
+# Presidio's EmailRecognizer validates the TLD against the public suffix list, so
+# addresses on .invalid/.test/.example (synthetic fixtures, internal hosts) are
+# dropped as EMAIL — while the URL recognizer fires on a ccTLD prefix INSIDE them
+# ("anna.be|ispiel@", "example.in|valid"), leaving name/domain fragments in the text.
+# Fix: a syntactic EMAIL pattern (no TLD validation, score 1.0 = beats URL 0.5 in the
+# overlap resolution of anonymize()), plus a header display-name recognizer so that
+# "Von: Anna Beispiel <a@b.invalid>" yields the WHOLE display name (NER may tag only
+# the first token; equal score 1.0 -> the longer span wins).
+_MAIL_ADDRESS_RE = (
+    r"(?<![\w.%+\-])[A-Za-z0-9._%+\-]+@"
+    r"[A-Za-z0-9](?:[A-Za-z0-9\-]*[A-Za-z0-9])?"
+    r"(?:\.[A-Za-z0-9](?:[A-Za-z0-9\-]*[A-Za-z0-9])?)+"
+)
+_MAIL_HEADER_NAME_RE = (
+    r"(?:^|(?<=\s))(?:Von|From|An|To|Cc|Bcc|Reply-To|Absender)[ \t]*:[ \t]*\"?"
+    r"(?P<name>[^<>\n\"@:]{2,80}?)\"?[ \t]*<[^<>\s@]+@"
+)
+
+
+def build_mail_recognizers(language: str) -> list:
+    """Extra deterministic recognizers for mail addresses and header display names."""
+    from presidio_analyzer import EntityRecognizer, Pattern, PatternRecognizer, RecognizerResult
+
+    class MailHeaderNameRecognizer(EntityRecognizer):
+        def load(self) -> None:  # nothing to load
+            pass
+
+        def analyze(self, text, entities, nlp_artifacts=None):
+            if "PERSON" not in entities:
+                return []
+            rx = re.compile(_MAIL_HEADER_NAME_RE, re.IGNORECASE | re.MULTILINE)
+            return [
+                RecognizerResult(entity_type="PERSON", start=m.start("name"),
+                                 end=m.end("name"), score=1.0)
+                for m in rx.finditer(text) if m.group("name").strip()
+            ]
+
+    return [
+        PatternRecognizer(
+            supported_entity="EMAIL_ADDRESS",
+            name=f"mail_address_syntax_{language}",
+            patterns=[Pattern(name="mail_address_syntax", regex=_MAIL_ADDRESS_RE, score=1.0)],
+            supported_language=language,
+        ),
+        MailHeaderNameRecognizer(supported_entities=["PERSON"],
+                                 name=f"mail_header_name_{language}",
+                                 supported_language=language),
+    ]
+
 
 def _check_presidio_available() -> bool:
     """Check if Presidio is installed and available."""
@@ -315,6 +365,10 @@ class PresidioAnonymizer:
         )
 
         analyzer.registry.add_recognizer(phone_recognizer)
+
+        for _lang in ('de', 'en'):
+            for _rec in build_mail_recognizers(_lang):
+                analyzer.registry.add_recognizer(_rec)
 
         # Swap the NER brain: drop spaCy's SpacyRecognizer (it tags nearly every
         # capitalised German technical noun as PERSON/LOCATION/ORG → the 85%
