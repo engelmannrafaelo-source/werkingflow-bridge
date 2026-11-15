@@ -1,0 +1,5 @@
+# Generator switches for docker/upstreams-primary.conf (Dev bridge, topology primary). Non-secret.
+# Read by scripts/generate-bridge-upstreams.sh when it writes into docker/ (see the script header).
+# Production topology ignores both. Environment variables override this file.
+ENERGY_SUBSCRIPTION_NO_HOP=1
+SCHEMA_GENERATOR_JOBS_LOCAL=1
