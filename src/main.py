@@ -7176,8 +7176,12 @@ async def _execute_research_cloud_impl(
             execution_time_seconds=round(time.time() - start_time, 2),
             error=str(_v_err), fehler_code=_v_err.fehler_code, retryable=_v_err.retryable,
         )
-    vertrag = vertrag.senken("suchen", search_max_uses, "depth").senken("abrufe", fetch_max_uses, "depth")
-    if free_only:
+    if not free_only:
+        vertrag = vertrag.senken("suchen", search_max_uses, "depth").senken("abrufe", fetch_max_uses, "depth")
+    else:
+        # The promotional table is itself per depth (incl. the academic
+        # floor); the depth budget must not lower abrufe first, or the floor
+        # never binds (Zweitprüfung R2 B1: academic+quick 3 instead of 5).
         # promotional_only reads through fetch_document only (executor), so
         # the read cap lowers both abrufe and dokument_abrufe — shown in the
         # contract, not applied silently (Zweitprüfung R1 A3).
