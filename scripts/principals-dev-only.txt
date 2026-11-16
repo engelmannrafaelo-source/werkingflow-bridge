@@ -15,3 +15,9 @@
 # erkunder run in production is Rafael's open question e-pva-erkunder-prodort
 # (Bauplan Erkunder v2, R12). Until he decides, the key stays off prod.
 energy-erkunder-dev
+# Schema-Generator Dev-Identitaeten (T-SCHEMA-PROD-BRIDGE, 16.11.2026): Dev-Bridge-Schluessel des Check-Adapters und
+# der Homepage (Demo + oeffentlicher Uebergangsbetrieb). Auf Prod gibt es einen eigenen Principal; ein Dev-Schluessel
+# darf dort nie gueltig werden (sonst Prod-Budget/Prod-Konten ueber einen Dev-Schluessel).
+schema-generator-dev
+homepage-mini-schema-dev
+homepage-mini-schema-public
