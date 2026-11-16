@@ -45,9 +45,21 @@ class SetActiveRequest(BaseModel):
     active: bool
 
 
-def _new_token() -> str:
-    """64 hex chars — same shape/length as the AI_BRIDGE_API_KEY it replaces."""
-    return secrets.token_hex(32)
+#: Token prefix of principals that may act ONLY as the public Schema generator. The prod LB recognises a Schema
+#: call by this prefix even WITHOUT X-App-ID and routes it like one (local Schema route, no Dev backup) —
+#: docker/nginx.conf $is_schema_key. Root clarification 16.11.2026: the header-less error path must never
+#: fail over to the Dev bridge. Must stay in sync with that map.
+SCHEMA_TOKEN_PREFIX = "wsg_"
+SCHEMA_ONLY_APPS = ["werking-schema-generator"]
+
+
+def _new_token(allowed_apps: Optional[List[str]] = None) -> str:
+    """64 hex chars — same shape/length as the AI_BRIDGE_API_KEY it replaces.
+    A Schema-only principal gets SCHEMA_TOKEN_PREFIX in front (see above)."""
+    token = secrets.token_hex(32)
+    if list(allowed_apps or []) == SCHEMA_ONLY_APPS:
+        return SCHEMA_TOKEN_PREFIX + token
+    return token
 
 
 @router.post("/v1/admin/service-principals", status_code=201)
@@ -58,7 +70,7 @@ async def create_principal(
     """Create a principal and return its cleartext token ONCE. Store the token in
     the caller's Infisical workspace immediately — it is not recoverable."""
     _require_db()
-    token = _new_token()
+    token = _new_token(body.allowed_apps)
     try:
         principal = await principals_repo.create_principal(
             name=body.name,
@@ -95,7 +107,9 @@ async def rotate_principal(
     """Issue a new token for an existing principal and return it ONCE. The old
     token stops working immediately (resolution cache is invalidated)."""
     _require_db()
-    token = _new_token()
+    # Keep the Schema prefix across rotation: look up the principal's apps first.
+    current = [p for p in await principals_repo.list_principals() if p.get("name") == body.name]
+    token = _new_token(current[0].get("allowed_apps") if current else None)
     ok = await principals_repo.rotate_principal_token(body.name, token)
     if not ok:
         raise HTTPException(status_code=404, detail=f"no principal named '{body.name}'")
