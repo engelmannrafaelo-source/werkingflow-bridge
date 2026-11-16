@@ -2226,6 +2226,8 @@ phase_reconcile_account_policy() {
     # the header via process substitution, never argv. Only key NAMES, an HTTP status and a
     # verdict leave the host — never a value. Missing/invalid file = hard
     # error, no fallback. Checked before the dry-run exit so a dry run proves it too.
+    # Remove once a regular reader for dev-server/dev exists (Root/SEC), together with the
+    # Phase 3.5 switch.
     if [[ "${BRIDGE_KEY_RECONCILE:-}" == "keep-host" ]]; then
         warn "BRIDGE_KEY_RECONCILE=keep-host: SSoT not read; keeping the host's account-policy.env unchanged (${host})"
         local pchk
