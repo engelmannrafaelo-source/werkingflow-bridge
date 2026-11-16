@@ -476,6 +476,14 @@ async def enforce_budget(
 
     # Not allowed for some other reason (future enum values). Let through and log
     # loud so we notice if a new reason needs adding to _BLOCKING_REASONS.
+    # strict_monthly refuses instead: an unknown "not allowed" must not become an unmetered call (Pruefung R1 B1).
+    if strict_monthly:
+        raise HTTPException(status_code=402, detail={
+            "error": "budget_exhausted", "reason": reason, "appId": app_id,
+            "planId": result.get("effectivePlanId", plan.id),
+            "totalRemainingEur": result.get("totalRemainingEur", 0.0),
+            "message": "API-Budget nicht verfügbar.",
+        })
     logger.warning(
         "budget gate: not-allowed reason=%s NOT in _BLOCKING_REASONS — letting call through (check if this reason should block)",
         reason,

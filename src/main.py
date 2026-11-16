@@ -2981,6 +2981,19 @@ async def _chat_completions_lauf(
                     )
             raise  # 402 — propagate to the client
         except Exception as _ge:  # noqa: BLE001 — gate must never crash the path
+            # strict_monthly (werking-schema-generator): the public product must never run unmetered —
+            # an unclassified gate error refuses instead of letting the call through (Pruefung R1 B1).
+            try:
+                from src.routing.app_provider_policy import _resolve_app_id as _strict_resolve_app
+                _strict_app = _strict_resolve_app(request)[0]
+            except Exception:  # noqa: BLE001 — fall back to the raw claim, refusing is the safe side
+                _strict_app = request.headers.get("X-App-ID")
+            if _strict_app == "werking-schema-generator":
+                logger.error(f"budget gate unexpected error for werking-schema-generator (refusing 503): {_ge}")
+                raise HTTPException(status_code=503, detail={
+                    "error": "budget_state_unavailable", "appId": "werking-schema-generator",
+                    "message": "Budget derzeit nicht prüfbar.",
+                }) from _ge
             logger.error(f"budget gate unexpected error (letting call through): {_ge}")
         try:
             from src.middleware.rolling_metrics import get_rolling_metrics
