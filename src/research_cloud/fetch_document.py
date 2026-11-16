@@ -90,6 +90,30 @@ FETCH_DOCUMENT_TOOL: Dict[str, Any] = {
 }
 
 
+# Promotional-only research (Messages API on the credit pool) offers no
+# server-side web_fetch: web_fetch_20250910 hands a fetched PDF back WHOLE as
+# base64, max_content_tokens does not cut it (measured 16.11.2026: a 4 MB PDF
+# with max_content_tokens=20000 -> 588,460 input tokens; a manufacturer data
+# booklet fetched inside a continuation -> HTTP 400 "prompt is too long:
+# 11,708,980 tokens > 1,000,000"). There this tool is the ONE reader, for web
+# pages too, so every fetched source reaches the model bounded by
+# MAX_RESULT_CHARS.
+FETCH_DOCUMENT_TOOL_MIT_WEBSEITEN: Dict[str, Any] = {
+    **FETCH_DOCUMENT_TOOL,
+    "description": (
+        "Lädt eine öffentliche Quelle von einer URL und liefert ihren Text — Webseiten (HTML) ebenso wie "
+        "Dokumente (PDF, DOCX, PPTX, XLSX); Dokumente mit Seitenzahlen. Das ist das Werkzeug, um eine "
+        "gefundene Quelle zu lesen (Herstellerseite, Datenblatt, Normauszug, Gesetzesstelle). Optional "
+        "`seiten` (z. B. \"3-5\" oder \"2,7\") oder `suchbegriff` (z. B. eine Typbezeichnung), um bei "
+        "langen Quellen nur die passenden Stellen zu bekommen; die Antwort ist auf "
+        f"{MAX_RESULT_CHARS} Zeichen begrenzt.\n"
+        "Zitiere Kennwerte mit URL und (bei Dokumenten) Seite. Liefert das Werkzeug einen Fehler (kein "
+        "Textinhalt, zu groß, nicht erreichbar) oder steht die gesuchte Angabe nicht in der Quelle, suchst "
+        "du eine zweite Fundstelle, bevor du einen Wert als „nicht bestätigt“ führst."
+    ),
+}
+
+
 class DocumentFetchError(Exception):
     """One call failed for a NAMED reason. Becomes an error tool_result —
     the run continues, the model sees why."""
@@ -188,9 +212,13 @@ async def download_document(
     raise DocumentFetchError(f"mehr als {MAX_REDIRECTS} Weiterleitungen")
 
 
-def detect_document_type(content: bytes, content_type: str, url: str) -> Tuple[str, str]:
+def detect_document_type(
+    content: bytes, content_type: str, url: str, *, webseiten: bool = False
+) -> Tuple[str, str]:
     """Return (mime, extension). Magic bytes first — many servers send PDFs as
-    application/octet-stream; a web page is refused with its reason."""
+    application/octet-stream; a web page is refused with its reason, unless
+    ``webseiten`` (promotional-only research, where this tool replaces
+    web_fetch): then it goes to the same converter as HTML."""
     if content.startswith(b"%PDF-"):
         return "application/pdf", "pdf"
     if content_type in _DOCUMENT_TYPES:
@@ -201,7 +229,9 @@ def detect_document_type(content: bytes, content_type: str, url: str) -> Tuple[s
             if path.endswith("." + ext):
                 return mime, ext
     head = content[:512].lstrip().lower()
-    if content_type.startswith("text/html") or head.startswith((b"<!doctype html", b"<html")):
+    if content_type.startswith(("text/html", "application/xhtml+xml")) or head.startswith((b"<!doctype html", b"<html")):
+        if webseiten:
+            return "text/html", "html"
         raise DocumentFetchError(
             "die URL liefert eine Webseite, kein Dokument — Webseiten mit web_fetch lesen; "
             "steht dort ein Link auf das PDF, diesen Link hier übergeben"
@@ -380,6 +410,7 @@ async def fetch_document(
     client: Optional[httpx.AsyncClient] = None,
     convert: Converter = convert_via_privacy_service,
     check_url: Callable[[str], Awaitable[None]] = _check_public_url,
+    webseiten: bool = False,
 ) -> str:
     """Run one fetch_document call. Returns the text for the model; raises
     DocumentFetchError with a named reason (budget, download, conversion)."""
@@ -397,7 +428,7 @@ async def fetch_document(
         else:
             async with httpx.AsyncClient() as c:
                 content, content_type, final_url = await download_document(url, c, check_url=check_url)
-        mime, ext = detect_document_type(content, content_type, final_url)
+        mime, ext = detect_document_type(content, content_type, final_url, webseiten=webseiten)
         body = await convert(content, f"dokument.{ext}", mime)
         doc = parse_converted(body)
         text = render_document(

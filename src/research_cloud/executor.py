@@ -61,6 +61,7 @@ from src.research_cloud.library import (
 )
 from src.research_cloud.fetch_document import (
     FETCH_DOCUMENT_TOOL,
+    FETCH_DOCUMENT_TOOL_MIT_WEBSEITEN,
     FETCH_DOCUMENT_TOOL_NAME,
     DocumentCounters,
     DocumentFetchError,
@@ -596,14 +597,22 @@ async def run_research_cloud(
         )
     tools = _build_tools(config, library_cfg, perplexity_cfg)
     if config.promotional_only:
-        # No code execution/container charges. Only bounded web tools.
+        # No code execution/container charges. Only bounded web tools: the
+        # server-side web_search, and reading through the bridge's own
+        # fetch_document (pages AND documents, bounded text) instead of the
+        # server-side web_fetch. web_fetch_20250910 returns a fetched PDF
+        # whole as base64 — max_content_tokens does not cut it — so one
+        # manufacturer data booklet inside a continuation pushed the prompt
+        # past the 1M window (HTTP 400 "prompt is too long: 11,708,980 tokens",
+        # 16.11.2026; 4 MB PDF with max_content_tokens=20000 -> 588,460 input
+        # tokens), and below the window it would ride along in every later
+        # round of the run.
+        tools = [t for t in tools if t.get("name") not in ("web_fetch", FETCH_DOCUMENT_TOOL_NAME)]
         for tool in tools:
             if tool.get("name") == "web_search":
                 tool["type"] = "web_search_20250305"
-            elif tool.get("name") == "web_fetch":
-                tool["type"] = "web_fetch_20250910"
-                tool["max_content_tokens"] = 20000
             tool.pop("allowed_callers", None)
+        tools.append(copy.deepcopy(FETCH_DOCUMENT_TOOL_MIT_WEBSEITEN))
     client_tools = _client_tool_names(tools)
     system: List[Dict[str, Any]] = [
         {"type": "text", "text": system_prompt, "cache_control": {"type": "ephemeral"}}
@@ -616,7 +625,12 @@ async def run_research_cloud(
     searches = fetches = library_calls = perplexity_calls = 0
     perplexity_cost_usd = 0.0
     perplexity_cost_missing = 0
-    doc_counters = DocumentCounters(max_uses=config.fetch_document_max_uses)
+    # promotional_only: fetch_document is the run's only reader, so it also
+    # carries the contract's fetch limit ("abrufe", web_fetch_max_uses).
+    doc_counters = DocumentCounters(
+        max_uses=min(config.fetch_document_max_uses, config.web_fetch_max_uses)
+        if config.promotional_only else config.fetch_document_max_uses
+    )
     container_id: Optional[str] = None
     pool_pin: Dict[str, str] = {}  # promotional_only: Konto je Lauf anheften (encrypted_content)
     iteration = 0
@@ -858,7 +872,8 @@ async def run_research_cloud(
                                 if tool_block.get("name") == FETCH_DOCUMENT_TOOL_NAME:
                                     try:
                                         text = await _unter_rest(fetch_document(
-                                            tool_block.get("input") or {}, doc_counters, **(fetch_document_kwargs or {})
+                                            tool_block.get("input") or {}, doc_counters,
+                                            **{"webseiten": config.promotional_only, **(fetch_document_kwargs or {})},
                                         ), "fetch_document")
                                         tool_results.append({
                                             "type": "tool_result", "tool_use_id": tool_block.get("id"),
@@ -1042,9 +1057,9 @@ async def run_research_cloud(
                     {"role": "user", "content": baue_rueckrunden_auftrag(
                         offene,
                         perplexity_werkzeug="web_search" if config.promotional_only else PERPLEXITY_TOOL_NAME,
-                        dokument_werkzeug="web_fetch" if config.promotional_only else FETCH_DOCUMENT_TOOL_NAME,
+                        dokument_werkzeug=FETCH_DOCUMENT_TOOL_NAME,
                         perplexity_rest=config.web_search_max_uses if config.promotional_only else config.perplexity_max_uses - perplexity_calls,
-                        dokument_rest=max(config.fetch_document_max_uses - doc_counters.calls, 0),
+                        dokument_rest=max(doc_counters.max_uses - doc_counters.calls, 0),
                         ziel=(
                             "Gib danach den VOLLSTÄNDIGEN Bericht als Antwort aus — den ganzen Bericht mit den "
                             "Ergänzungen, nicht nur die geänderten Stellen."
