@@ -190,7 +190,7 @@ async def _check_public_url(url: str) -> str:
     return sorted(addrs, key=lambda a: (":" in a, a))[0]
 
 
-def _pinned_request(url: str, address: Optional[str]) -> Tuple[str, Dict[str, str], Dict[str, Any]]:
+def _pinned_request(url: str, address: str) -> Tuple[str, Dict[str, str], Dict[str, Any]]:
     """URL, extra headers and httpx extensions for one hop. With an address,
     the TCP connection goes to it while Host header, TLS SNI and certificate
     check keep the name (httpcore verifies the certificate against
@@ -201,8 +201,6 @@ def _pinned_request(url: str, address: Optional[str]) -> Tuple[str, Dict[str, st
     If that address does not answer, the call fails loudly as a tool error
     ("Abruf fehlgeschlagen: ConnectError ...") and the model looks for a
     second source; it is never retried unpinned."""
-    if address is None:
-        return url, {}, {}
     try:
         u = httpx.URL(url)
         name = u.host
@@ -222,15 +220,21 @@ async def download_document(
     *,
     max_bytes: int = MAX_DOWNLOAD_BYTES,
     timeout: float = DOWNLOAD_TIMEOUT_SECONDS,
-    check_url: Callable[[str], Awaitable[Optional[str]]] = _check_public_url,
+    check_url: Callable[[str], Awaitable[str]] = _check_public_url,
 ) -> Tuple[bytes, str, str]:
     """Return (content, content_type, final_url). Redirects are followed by
     hand so every hop passes the public-address check, and each hop connects
     to the address that check returned (see _pinned_request). A check that
-    returns None (test doubles) leaves the connection to httpx."""
+    returns no address is a programming error and fails loudly — there is
+    no unpinned fetch."""
     current = url
     for _hop in range(MAX_REDIRECTS + 1):
         address = await check_url(current)
+        if not isinstance(address, str) or not address:
+            raise RuntimeError(
+                f"fetch_document: check_url lieferte keine geprüfte Adresse für {current!r} "
+                f"({address!r}) — ungeprüfter Abruf verweigert"
+            )
         target, extra_headers, extensions = _pinned_request(current, address)
         try:
             async with client.stream(
@@ -471,7 +475,7 @@ async def fetch_document(
     *,
     client: Optional[httpx.AsyncClient] = None,
     convert: Converter = convert_via_privacy_service,
-    check_url: Callable[[str], Awaitable[Optional[str]]] = _check_public_url,
+    check_url: Callable[[str], Awaitable[str]] = _check_public_url,
     webseiten: bool = False,
 ) -> str:
     """Run one fetch_document call. Returns the text for the model; raises

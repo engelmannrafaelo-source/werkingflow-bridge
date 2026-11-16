@@ -60,13 +60,15 @@ _PAGES = (
 
 def _transport(routes):
     def handler(request: httpx.Request) -> httpx.Response:
-        r = routes[str(request.url)]
+        # download_document pins the connection to the checked address; the
+        # route is the URL by NAME (Host header), as the caller wrote it.
+        r = routes[str(request.url.copy_with(netloc=request.headers["host"].encode()))]
         return r() if callable(r) else r
     return httpx.MockTransport(handler)
 
 
 async def _ok(url):  # public-address check that needs no DNS
-    return None
+    return "93.184.215.14"
 
 
 async def _call(args, body=None, routes=None, counters=None, convert=None):
@@ -196,6 +198,7 @@ async def test_redirect_hops_are_each_checked():
 
     async def check(u):
         checked.append(u)
+        return "93.184.215.14"
 
     async with httpx.AsyncClient(transport=_transport(routes)) as client:
         text = await fetch_document({"url": URL}, DocumentCounters(max_uses=2), client=client,
