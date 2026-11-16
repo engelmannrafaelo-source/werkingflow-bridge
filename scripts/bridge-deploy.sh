@@ -96,6 +96,10 @@ fi
 # ============================================================================
 HETZNER_HOST="49.12.72.66"
 SERVER2_HOST="178.104.178.79"
+# Smoke/probe target of the prod LB. Since N8 (2c7346e, 12.11.2026) :8000 is no longer published on the
+# public address; the LB answers on 127.0.0.1:8000 (listener 80) and on the Tailnet address 100.126.91.53:8000
+# (listener 81). From the deploy host only the Tailnet listener is reachable (16.11.: public 000, Tailnet 200).
+SERVER2_SMOKE_URL="http://100.126.91.53:8000"
 # ADR-0009: worker-only host, addressed over Tailscale (tailnet hostname
 # prod-workers-1) — no public function, not a customer-facing bridge.
 WORKERHOST_HOST="100.93.143.105"
@@ -2653,7 +2657,7 @@ lb_schutz_geladen() {
 #   /v1/sessions                -> 403 (Notsperre BR13-B, from anywhere)
 #   /openapi.json + XFF         -> 403 (Schutzregel alone)
 lb_schutz_messen() {
-    local url="http://${SERVER2_HOST}:8000" rc=0 code p path hdr
+    local url="${SERVER2_SMOKE_URL}" rc=0 code p path hdr
     for p in "/v1/metrics/request-log|X-Forwarded-For: 203.0.113.9" "/v1/sessions|" "/openapi.json|X-Forwarded-For: 203.0.113.9"; do
         path="${p%%|*}"; hdr="${p#*|}"
         if [[ -n "$hdr" ]]; then
@@ -3037,7 +3041,7 @@ deploy_prod_zusammen() {
     else
         # required: the workers answering are the ones THIS run deployed, so
         # a missing X-Bridge-Served-By stamp is a failure, not UNPROVEN.
-        phase_smoke_test "server2" "http://${SERVER2_HOST}:8000" "${server2_bridge}" required \
+        phase_smoke_test "server2" "${SERVER2_SMOKE_URL}" "${server2_bridge}" required \
             - - "X-Priority: production" || smoke_ok=false
     fi
     if [[ "$DRY_RUN" == "true" ]]; then
@@ -3292,7 +3296,7 @@ deploy_server() {
         # smoke. The prod workers deploy separately (prod-workers), so a
         # missing stamp is UNPROVEN, not a failure — a server2 deploy must not
         # depend on a worker rollout.
-        [[ -n "$server2_bridge" ]] && phase_smoke_test "server2" "http://${SERVER2_HOST}:8000" "${server2_bridge}" optional \
+        [[ -n "$server2_bridge" ]] && phase_smoke_test "server2" "${SERVER2_SMOKE_URL}" "${server2_bridge}" optional \
             - - "X-Priority: production" || {
             error_ "Smoke test failed for server2 — rolling back"
             if [[ ${#DEPLOYED_SERVICES[@]} -gt 0 ]]; then
