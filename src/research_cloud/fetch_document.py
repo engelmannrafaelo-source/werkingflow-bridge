@@ -141,26 +141,73 @@ class DocumentCounters:
 # Download
 # ---------------------------------------------------------------------------
 
+_NAT64_WELL_KNOWN = ipaddress.ip_network("64:ff9b::/96")
+_IPV4_COMPATIBLE = ipaddress.ip_network("::/96")
+
+
 def _is_public_address(addr: str) -> bool:
     ip = ipaddress.ip_address(addr)
-    if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped:
-        ip = ip.ipv4_mapped
+    if isinstance(ip, ipaddress.IPv6Address):
+        if ip.ipv4_mapped:
+            ip = ip.ipv4_mapped
+        elif ip in _NAT64_WELL_KNOWN or ip in _IPV4_COMPATIBLE:
+            # The address only carries an IPv4 one (NAT64 translation, the
+            # deprecated IPv4-compatible form; "::" and "::1" fall in here
+            # too and stay non-global): judge that embedded IPv4.
+            ip = ipaddress.IPv4Address(ip.packed[-4:])
     return ip.is_global and not ip.is_multicast
 
 
-async def _check_public_url(url: str) -> None:
-    parsed = urlparse(url)
-    if parsed.scheme not in ("http", "https") or not parsed.hostname:
-        raise DocumentFetchError(f"keine öffentliche http(s)-URL: {url!r}")
-    host = parsed.hostname
+async def _check_public_url(url: str) -> str:
+    """Resolve the URL's host ONCE, refuse it unless every address is public,
+    and return the address the connection has to go to. The caller connects
+    to exactly this address (download_document pins it), so a second DNS
+    answer — rebinding with TTL 0 — never decides where the request lands."""
     try:
-        infos = await asyncio.get_running_loop().getaddrinfo(host, parsed.port or 443, type=socket.SOCK_STREAM)
+        parsed = urlparse(url)
+        host = parsed.hostname
+        port = parsed.port
+    except ValueError as e:  # "Invalid IPv6 URL", "Port out of range"
+        raise DocumentFetchError(f"URL nicht lesbar: {url!r} ({e})") from e
+    if parsed.scheme not in ("http", "https") or not host:
+        raise DocumentFetchError(f"keine öffentliche http(s)-URL: {url!r}")
+    try:
+        infos = await asyncio.get_running_loop().getaddrinfo(
+            host, port or (443 if parsed.scheme == "https" else 80), type=socket.SOCK_STREAM
+        )
     except socket.gaierror as e:
         raise DocumentFetchError(f"Host {host!r} nicht auflösbar: {e}") from e
+    except (UnicodeError, ValueError) as e:  # IDNA: empty label, label > 63 chars
+        raise DocumentFetchError(f"Hostname {host!r} nicht gültig: {e}") from e
     addrs = {info[4][0] for info in infos}
-    blocked = sorted(a for a in addrs if not _is_public_address(a))
+    try:
+        blocked = sorted(a for a in addrs if not _is_public_address(a))
+    except ValueError as e:  # scoped/odd address string from the resolver
+        raise DocumentFetchError(f"Host {host!r}: Adresse nicht prüfbar ({e}) — abgelehnt") from e
     if not addrs or blocked:
         raise DocumentFetchError(f"Host {host!r} zeigt auf keine öffentliche Adresse ({blocked or 'keine'}) — abgelehnt")
+    # IPv4 first: the bridge containers do not all route IPv6.
+    return sorted(addrs, key=lambda a: (":" in a, a))[0]
+
+
+def _pinned_request(url: str, address: Optional[str]) -> Tuple[str, Dict[str, str], Dict[str, Any]]:
+    """URL, extra headers and httpx extensions for one hop. With an address,
+    the TCP connection goes to it while Host header, TLS SNI and certificate
+    check keep the name (httpcore verifies the certificate against
+    ``sni_hostname``)."""
+    if address is None:
+        return url, {}, {}
+    try:
+        u = httpx.URL(url)
+        name = u.host
+        pinned = str(u.copy_with(host=address))
+    except (httpx.InvalidURL, ValueError, UnicodeError) as e:
+        raise DocumentFetchError(f"URL nicht lesbar: {url!r} ({e})") from e
+    host_header = name if u.port is None else f"{name}:{u.port}"
+    if ":" in name and not name.startswith("["):
+        host_header = f"[{name}]" if u.port is None else f"[{name}]:{u.port}"
+    ext = {"sni_hostname": name} if u.scheme == "https" else {}
+    return pinned, {"Host": host_header}, ext
 
 
 async def download_document(
@@ -169,17 +216,22 @@ async def download_document(
     *,
     max_bytes: int = MAX_DOWNLOAD_BYTES,
     timeout: float = DOWNLOAD_TIMEOUT_SECONDS,
-    check_url: Callable[[str], Awaitable[None]] = _check_public_url,
+    check_url: Callable[[str], Awaitable[Optional[str]]] = _check_public_url,
 ) -> Tuple[bytes, str, str]:
     """Return (content, content_type, final_url). Redirects are followed by
-    hand so every hop passes the public-address check."""
+    hand so every hop passes the public-address check, and each hop connects
+    to the address that check returned (see _pinned_request). A check that
+    returns None (test doubles) leaves the connection to httpx."""
     current = url
     for _hop in range(MAX_REDIRECTS + 1):
-        await check_url(current)
+        address = await check_url(current)
+        target, extra_headers, extensions = _pinned_request(current, address)
         try:
             async with client.stream(
-                "GET", current, timeout=timeout, follow_redirects=False,
-                headers={"User-Agent": "Mozilla/5.0 (compatible; werkingflow-research/1.0)", "Accept": "*/*"},
+                "GET", target, timeout=timeout, follow_redirects=False,
+                headers={"User-Agent": "Mozilla/5.0 (compatible; werkingflow-research/1.0)", "Accept": "*/*",
+                         **extra_headers},
+                extensions=extensions,
             ) as resp:
                 if resp.status_code in (301, 302, 303, 307, 308):
                     location = resp.headers.get("location")
@@ -207,7 +259,7 @@ async def download_document(
                 return b"".join(chunks), content_type, current
         except httpx.TimeoutException as e:
             raise DocumentFetchError(f"Zeitgrenze {timeout:.0f} s beim Abruf überschritten") from e
-        except httpx.HTTPError as e:
+        except (httpx.HTTPError, httpx.InvalidURL) as e:
             raise DocumentFetchError(f"Abruf fehlgeschlagen: {type(e).__name__}: {e}") from e
     raise DocumentFetchError(f"mehr als {MAX_REDIRECTS} Weiterleitungen")
 
@@ -294,7 +346,8 @@ def parse_converted(body: Dict[str, Any]) -> ConvertedDocument:
     full_text = _clean(body.get("markdown") or "")
     if not full_text and not any(t for _, t in pages or []):
         raise DocumentFetchError(
-            "das Dokument enthält keinen lesbaren Text (vermutlich ein gescanntes Bild-PDF) — "
+            "die Quelle enthält keinen lesbaren Text (gescanntes Bild-PDF oder eine Seite, die ihren "
+            "Inhalt erst per Skript lädt) — "
             "zweite Fundstelle suchen"
         )
     return ConvertedDocument(pages=pages, full_text=full_text, page_count=page_count)
@@ -390,10 +443,13 @@ def render_document(
         used += len(block) + 2
         kept += 1
     if kept < len(blocks):
+        cut = ""
         if kept == 0:
-            out += blocks[0][: max_chars - used] + "\n\n"
+            room = max(max_chars - used, 0)
+            out += blocks[0][:room] + "\n\n"
+            cut = f"Abschnitt 1 nach {room} von {len(blocks[0])} Zeichen abgeschnitten; "
         out += (
-            f"[GEKÜRZT: {len(blocks) - max(kept, 1)} von {len(blocks)} Abschnitten nicht enthalten "
+            f"[GEKÜRZT: {cut}{len(blocks) - max(kept, 1)} von {len(blocks)} Abschnitten nicht enthalten "
             f"(Grenze {max_chars} Zeichen) — mit `seiten` oder `suchbegriff` gezielt nachladen.]"
         )
     return out.strip()
@@ -409,7 +465,7 @@ async def fetch_document(
     *,
     client: Optional[httpx.AsyncClient] = None,
     convert: Converter = convert_via_privacy_service,
-    check_url: Callable[[str], Awaitable[None]] = _check_public_url,
+    check_url: Callable[[str], Awaitable[Optional[str]]] = _check_public_url,
     webseiten: bool = False,
 ) -> str:
     """Run one fetch_document call. Returns the text for the model; raises
@@ -426,7 +482,9 @@ async def fetch_document(
         if client is not None:
             content, content_type, final_url = await download_document(url, client, check_url=check_url)
         else:
-            async with httpx.AsyncClient() as c:
+            # trust_env=False: no proxy variables, no ~/.netrc credentials —
+            # the connection goes exactly to the checked address.
+            async with httpx.AsyncClient(trust_env=False) as c:
                 content, content_type, final_url = await download_document(url, c, check_url=check_url)
         mime, ext = detect_document_type(content, content_type, final_url, webseiten=webseiten)
         body = await convert(content, f"dokument.{ext}", mime)

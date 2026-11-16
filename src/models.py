@@ -785,6 +785,14 @@ class ResearchResponse(ErrorVerdictFields):
         default=None,
         description="research-cloud only: number of web_fetch tool calls in this run"
     )
+    dokument_abrufe: Optional[int] = Field(
+        default=None,
+        description=(
+            "research-cloud only: number of fetch_document calls in this run (incl. "
+            "refused ones). On promotional-only runs this is the run's source reader "
+            "(web_fetches stays 0 there)"
+        ),
+    )
     library_calls: Optional[int] = Field(
         default=None,
         description=(

@@ -7167,7 +7167,7 @@ async def _execute_research_cloud_impl(
     # lowered here only by what this path knows — the depth budget and the
     # promotional cap — and said so; the response shows the values that bound.
     from src.research_laufzeit import Laufzeit
-    from src.research_vertrag import PROMOTIONAL_CAP, VertragNichtDurchsetzbar, vertrag_fuer, vertrag_merken
+    from src.research_vertrag import VertragNichtDurchsetzbar, promotional_grenzen, vertrag_fuer, vertrag_merken
     try:
         vertrag = vertrag_fuer(request, request_body, "cloud")
     except VertragNichtDurchsetzbar as _v_err:
@@ -7178,9 +7178,14 @@ async def _execute_research_cloud_impl(
         )
     vertrag = vertrag.senken("suchen", search_max_uses, "depth").senken("abrufe", fetch_max_uses, "depth")
     if free_only:
+        # promotional_only reads through fetch_document only (executor), so
+        # the read cap lowers both abrufe and dokument_abrufe — shown in the
+        # contract, not applied silently (Zweitprüfung R1 A3).
+        _promo = promotional_grenzen(request_body.depth)
         vertrag = (
-            vertrag.senken("suchen", PROMOTIONAL_CAP["suchen"], "promotional")
-            .senken("abrufe", PROMOTIONAL_CAP["abrufe"], "promotional")
+            vertrag.senken("suchen", _promo["suchen"], "promotional")
+            .senken("abrufe", _promo["abrufe"], "promotional")
+            .senken("dokument_abrufe", _promo["abrufe"], "promotional")
         )
     vertrag = vertrag_merken(request, vertrag)
     laufzeit = Laufzeit.fuer_anfrage(request, hoechstens_s=vertrag.grenze("gesamtzeit_s"))
@@ -7436,6 +7441,7 @@ async def _execute_research_cloud_impl(
         error=None,
         web_searches=result.searches,
         web_fetches=result.fetches,
+        dokument_abrufe=result.fetch_document_calls,
         library_calls=result.library_calls,
         antwort_quelle="text",
         antwort_ende=result.stop_reason,

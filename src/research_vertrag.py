@@ -103,6 +103,32 @@ GELTUNG: Dict[str, str] = {n: g for n, _, _, g in GRENZEN}
 FORTSETZUNGEN_JE_RUNDE = 8
 PROMOTIONAL_CAP = {"suchen": 3, "abrufe": 3}
 
+# Promotional-only research (credit pool, no paid key) per depth. Since
+# 16.11.2026 that path reads every source through fetch_document (no
+# server-side web_fetch, whose PDFs came back unbounded as base64), so
+# "abrufe" and "dokument_abrufe" there both mean: sources read per WHOLE run
+# (incl. the return round), each read bounded to MAX_RESULT_CHARS. "suchen"
+# stays per Messages request (web_search max_uses). Values are configuration
+# (env RESEARCH_PROMOTIONAL_<SUCHEN|ABRUFE>_<DEPTH>), not code; a caller's
+# contract wish can only lower them. Defaults: Energy wish 16.11.2026
+# (e258822b: deep >= 8 reads, >= 5 searches; quick 3).
+PROMOTIONAL_JE_TIEFE_DEFAULT: Dict[str, Dict[str, int]] = {
+    "suchen": {"quick": 3, "standard": 3, "deep": 5, "exhaustive": 5},
+    "abrufe": {"quick": 3, "standard": 5, "deep": 8, "exhaustive": 10},
+}
+
+
+def promotional_grenzen(depth: Optional[str]) -> Dict[str, int]:
+    """{"suchen", "abrufe"} for a promotional-only run of ``depth`` (unknown
+    depth -> standard, as search_budget_for_depth). A value that is not a
+    positive integer is a loud error, like every contract ceiling."""
+    tiefe = depth if depth in PROMOTIONAL_JE_TIEFE_DEFAULT["suchen"] else "standard"
+    aus: Dict[str, int] = {}
+    for art, je_tiefe in PROMOTIONAL_JE_TIEFE_DEFAULT.items():
+        env = f"RESEARCH_PROMOTIONAL_{art.upper()}_{tiefe.upper()}"
+        aus[art] = int(_lies(env, je_tiefe[tiefe], True))
+    return aus
+
 # What binds on which path, and what a path cannot enforce.
 WIRKSAM_JE_PFAD: Dict[str, List[str]] = {
     "pool": ["iterationen", "perplexity_suchen", "dokument_abrufe", "gesamtzeit_s"],
@@ -211,6 +237,11 @@ def capabilities() -> Dict[str, Any]:
         "fortsetzungen_je_runde": FORTSETZUNGEN_JE_RUNDE,
         "depth_budget": {"suchen": dict(_SEARCH_MAX_USES), "abrufe": dict(_FETCH_MAX_USES)},
         "promotional_cap": dict(PROMOTIONAL_CAP),
+        "promotional_je_tiefe": {
+            t: promotional_grenzen(t) for t in PROMOTIONAL_JE_TIEFE_DEFAULT["suchen"]
+        },
+        "promotional_leser": "fetch_document (kein Servertool web_fetch); abrufe und dokument_abrufe "
+                             "zaehlen dort Quellenlesungen je gesamtem Lauf",
         "zeit_minima": {
             "pruefer_min_rest_s": PRUEFER_MIN_REST_S,
             "rueckrunde_min_rest_s": RUECKRUNDE_MIN_REST_S,
