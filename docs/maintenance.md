@@ -374,6 +374,22 @@ durch einen Worker-Deploy mit Versionsprobe nachgewiesen, nicht durch
 Offline-Regressionsprobe: `python3 -m pytest -o addopts= -q
  tests/test_deploy_version_scope.py tests/test_version_delivery.py`.
 
+## Abbruch eines laufenden bridge-deploy.sh und der Env-Sync-Cron (16.11.2026)
+
+- **Ein gebautes Image wird automatisch ausgerollt.** Auf dem Dev-Host führt der root-Cron
+  `/root/projekte/orchestrator/bin/sync-infisical-to-bridge` alle 15 Minuten je Worker
+  `docker compose up -d` aus (Protokoll `/var/log/bridge-env-sync.log`). Hat ein Deploy das Image
+  eines Workers schon gebaut, aber noch nicht eingesetzt, übernimmt der nächste Lauf dieses Image und
+  legt den Container neu an: am 16.11.2026 19:00Z wurde so `wt-wrapper-worker1` neu gestartet, obwohl der
+  Rollout bewusst nur worker2–4 betraf (Abbruch vor dem Ersetzen, Image-Build lief auf dem Host zu Ende).
+- **Wer abbricht, muss auch das gebaute Image zurücksetzen bzw. neu taggen**, sonst rollt der Cron es aus.
+  Vor dem Abbruch prüfen, ob der Build des betroffenen Workers schon läuft oder fertig ist.
+- **SIGTERM an `bridge-deploy.sh` beendet laufende compose-Kinder nicht**: die remote gestartete
+  `docker compose build` läuft weiter (ssh-Kinder des Skripts), auch nach dem Ende des Skripts und seiner
+  systemd-Unit. Ein sicherer Abbruch geht nur zwischen zwei Workern (vor dem Build des nächsten Dienstes);
+  kein `kill -9` mitten im Ersetzen. Soll ein Worker ausgelassen werden, ihn gar nicht in die Dienstliste
+  aufnehmen (`bridge-deploy.sh hetzner worker2 worker3 worker4`), statt ihn abzubrechen.
+
 ## PDF image size bound
 
 `PDF_IMAGE_MAX_B64_BYTES` sets the strict per-image base64 limit for rendered
