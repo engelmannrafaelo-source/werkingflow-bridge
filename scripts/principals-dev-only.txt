@@ -19,3 +19,7 @@ energy-erkunder-dev
 # Schema generator preview uses the dev Check/Report pot only (07.11.2026).
 # Its principal must not be copied to production by the regular sync.
 schema-generator-dev
+# Homepage-Schema-Generator auf der Dev-Bridge (T-SCHEMA-PROD-BRIDGE, 16.11.2026): Demo- und Uebergangsschluessel.
+# Auf Prod gibt es einen eigenen Principal (principals-prod-only.txt); ein Dev-Schluessel darf dort nie gueltig werden.
+homepage-mini-schema-dev
+homepage-mini-schema-public
