@@ -2184,6 +2184,28 @@ phase_rollback() {
 # Dedicated least-scope environment: do not expose the full platform.env to nginx.
 phase_reconcile_account_policy() {
     local host="$1" policy_url policy_token
+    # Same explicit per-run opt-in as Phase 3.5 (BRIDGE_KEY_RECONCILE=keep-host): the SSoT
+    # reader for dev-server/dev is disabled, so keep the host's account-policy.env unchanged
+    # after proving it carries exactly the two required keys, once each, with a clean value,
+    # AND that the authority accepts it right now (GET with the file's token -> HTTP 200, the
+    # same read src/account_policy/client.py does; a revoked token fails). The token goes into
+    # the header via process substitution, never argv. Only key NAMES, an HTTP status and a
+    # verdict leave the host — never a value. Missing/invalid file = hard
+    # error, no fallback. Checked before the dry-run exit so a dry run proves it too.
+    if [[ "${BRIDGE_KEY_RECONCILE:-}" == "keep-host" ]]; then
+        warn "BRIDGE_KEY_RECONCILE=keep-host: SSoT not read; keeping the host's account-policy.env unchanged (${host})"
+        local pchk
+        pchk=$(rssh "$host" "f='${REMOTE_REPO}/secrets/account-policy.env'; [ -f \"\$f\" ] || { echo MISSING; exit 0; }; r=OK; for k in BRIDGE_ACCOUNT_POLICY_URL BRIDGE_ACCOUNT_POLICY_TOKEN; do n=\$(grep -cE \"^\$k=\" \"\$f\"); v=\$(grep -E \"^\$k=\" \"\$f\" | head -1 | cut -d= -f2-); case \"\$v\" in ''|null|NOT_FOUND|*[[:space:]]*) r=\"BAD:\$k\";; esac; [ \"\$n\" = 1 ] || r=\"BAD:\$k\"; done; o=\$(grep -vE '^(BRIDGE_ACCOUNT_POLICY_URL|BRIDGE_ACCOUNT_POLICY_TOKEN)=' \"\$f\" | grep -cvE '^[[:space:]]*(#|\$)'); [ \"\$o\" = 0 ] || r=BAD:fremde_zeilen; if [ \"\$r\" = OK ]; then u=\$(grep -E '^BRIDGE_ACCOUNT_POLICY_URL=' \"\$f\" | cut -d= -f2-); c=\$(curl -sS -o /dev/null -w '%{http_code}' --max-time 10 --proto '=http,https' -H @<(printf 'X-Bridge-Service-Token: %s\\n' \"\$(grep -E '^BRIDGE_ACCOUNT_POLICY_TOKEN=' \"\$f\" | cut -d= -f2-)\") \"\$u\" 2>/dev/null); [ \"\$c\" = 200 ] || r=\"BAD:authority_http_\${c:-000}\"; fi; echo \"\$r\"" 2>/dev/null) || pchk="BAD:ssh"
+        if [[ "$pchk" != "OK" ]]; then
+            error_ "keep-host: account-policy.env on ${host} missing or invalid (${pchk}) — refusing"
+            return 1
+        fi
+        info "keep-host: account-policy.env on ${host} has BRIDGE_ACCOUNT_POLICY_URL and BRIDGE_ACCOUNT_POLICY_TOKEN once each, authority answers 200, unchanged"
+        return 0
+    elif [[ -n "${BRIDGE_KEY_RECONCILE:-}" ]]; then
+        error_ "BRIDGE_KEY_RECONCILE='${BRIDGE_KEY_RECONCILE}' unknown (only keep-host) — refusing"
+        return 1
+    fi
     if [[ "$DRY_RUN" == "true" ]]; then
         info "[DRY-RUN] would reconcile dedicated account-policy.env from existing Prod Bridge service credentials"
         return 0
