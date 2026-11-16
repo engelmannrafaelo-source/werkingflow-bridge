@@ -514,8 +514,9 @@ async def test_cloud_promotional_cap_ist_im_vertrag_sichtbar():
         await src.main._execute_research_cloud_impl(request, req, attribution_ctx={})
     cfg = executor_mock.await_args.kwargs["config"]
     v = request.state.research_vertrag
-    # deep: promotional_grenzen (16.11.2026) — 5 searches, 8 source reads per run.
-    assert cfg.web_search_max_uses == 5 == v.grenzen["suchen"] and v.begrenzt_durch["suchen"] == "promotional"
+    # deep: promotional_grenzen (16.11.2026) — 5 searches, 8 source reads per run; the
+    # searches per Messages request are clamped to the credit-pool cap (max_uses 1..3).
+    assert cfg.web_search_max_uses == 3 == v.grenzen["suchen"] and v.begrenzt_durch["suchen"] == "pool_cap"
     assert cfg.web_fetch_max_uses == 8 == v.grenzen["abrufe"] and v.begrenzt_durch["abrufe"] == "promotional"
     assert cfg.fetch_document_max_uses == 8 == v.grenzen["dokument_abrufe"]
     assert v.begrenzt_durch["dokument_abrufe"] == "promotional"

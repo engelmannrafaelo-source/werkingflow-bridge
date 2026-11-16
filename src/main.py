@@ -7167,7 +7167,7 @@ async def _execute_research_cloud_impl(
     # lowered here only by what this path knows — the depth budget and the
     # promotional cap — and said so; the response shows the values that bound.
     from src.research_laufzeit import Laufzeit
-    from src.research_vertrag import VertragNichtDurchsetzbar, promotional_grenzen, vertrag_fuer, vertrag_merken
+    from src.research_vertrag import PROMOTIONAL_CAP, VertragNichtDurchsetzbar, promotional_grenzen, vertrag_fuer, vertrag_merken
     try:
         vertrag = vertrag_fuer(request, request_body, "cloud")
     except VertragNichtDurchsetzbar as _v_err:
@@ -7190,6 +7190,12 @@ async def _execute_research_cloud_impl(
             vertrag.senken("suchen", _promo["suchen"], "promotional")
             .senken("abrufe", _promo["abrufe"], "promotional")
             .senken("dokument_abrufe", _promo["abrufe"], "promotional")
+            # credit_pool.post_messages refuses a server tool whose max_uses is
+            # outside 1..3 (HTTP 400 "Server tools require max_uses between 1
+            # and 3"): the web_search limit is per Messages request, so it is
+            # clamped to the pool cap here and shown as pool_cap in the contract
+            # (deep/exhaustive 5 -> 3, 16.11.2026). Reads ("abrufe") stay per run.
+            .senken("suchen", PROMOTIONAL_CAP["suchen"], "pool_cap")
         )
     vertrag = vertrag_merken(request, vertrag)
     laufzeit = Laufzeit.fuer_anfrage(request, hoechstens_s=vertrag.grenze("gesamtzeit_s"))

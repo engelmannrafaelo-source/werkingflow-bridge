@@ -65,7 +65,7 @@ FEHLER_VERTRAG_UNGUELTIG = "vertrag_ungueltig"
 Pfad = Literal["pool", "cloud"]
 # "unwirksam": the routed path cannot enforce this limit (nicht_durchsetzbar)
 # — the value is shown, nothing binds (R2-5).
-Grund = Literal["server", "client", "depth", "promotional", "snapshot", "unwirksam"]
+Grund = Literal["server", "client", "depth", "promotional", "pool_cap", "snapshot", "unwirksam"]
 
 # The nine limits: (name, env, default, geltung). Defaults = the values live
 # on 06.11.2026, so a caller without a wish runs as before — except
