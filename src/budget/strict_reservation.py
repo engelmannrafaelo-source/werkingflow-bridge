@@ -60,7 +60,7 @@ current: contextvars.ContextVar[Optional[StrictReservation]] = contextvars.Conte
 
 # ── Obergrenze (Worker) ──────────────────────────────────────────────────────
 
-def cost_upper_bound_eur(model: Optional[str], request_body: Any) -> float:
+def cost_upper_bound_eur(model: Optional[str], request_body: Any, versuche: int = 1) -> float:
     """Obergrenze zu den hoechsten Saetzen des Modells: Eingabe = UTF-8-Bytes (>= Tokens) wie der
     Test-KI-Deckel, als Cache-Anlage bewertet (teuerster Eingabesatz); Ausgabe = max_tokens."""
     from src.budget.test_ki_deckel import CACHE_ANLAGE_MULT, eingabe_obergrenze_tokens
@@ -77,7 +77,10 @@ def cost_upper_bound_eur(model: Optional[str], request_body: Any) -> float:
     if not request_body.max_tokens or request_body.max_tokens > MAX_TOKENS_CAP:
         raise ValueError(f"max_tokens {request_body.max_tokens!r} nicht begrenzt (Grenze {MAX_TOKENS_CAP})")
     ausgabe = int(request_body.max_tokens)
-    usd = (eingabe * ein * CACHE_ANLAGE_MULT + ausgabe * aus) / 1_000_000.0
+    if not isinstance(versuche, int) or versuche < 1:
+        raise ValueError(f"versuche {versuche!r} ungueltig")
+    # versuche: wie oft der Anbieter-Client denselben Aufruf hoechstens absetzt (jeder kann berechnet werden).
+    usd = versuche * (eingabe * ein * CACHE_ANLAGE_MULT + ausgabe * aus) / 1_000_000.0
     return round(usd * usd_to_eur_rate(), 6)
 
 

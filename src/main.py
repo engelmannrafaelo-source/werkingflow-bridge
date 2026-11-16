@@ -2934,10 +2934,23 @@ async def _chat_completions_lauf(
             _strict_bound = None
             if _gate_attr.get("app_id") == "werking-schema-generator":
                 from src.budget import strict_reservation as _strict_mod
+                if getattr(request_body, "stream", False):
+                    # Pruefung R4 N1: ein abgebrochener Stream bucht nur die Eingabe (output_tokens kommen
+                    # erst am Stromende) und schliesst die Reservierung ab, AWS berechnet die Ausgabe trotzdem.
+                    raise HTTPException(status_code=403, detail={
+                        "error": "strict_stream_not_allowed", "appId": "werking-schema-generator",
+                        "message": "Streaming ist für die Schemafunktion nicht freigegeben.",
+                    })
                 _mt = getattr(request_body, "max_tokens", None)
                 if not _mt or _mt > _strict_mod.MAX_TOKENS_CAP:
                     request_body.max_tokens = _strict_mod.MAX_TOKENS_CAP
-                _strict_bound = _strict_mod.cost_upper_bound_eur(getattr(request_body, "model", None), request_body)
+                # Pruefung R4 N2: botocore wiederholt nach Read-Timeout; AWS kann jeden Versuch berechnen,
+                # gebucht wird nur der letzte -> Obergrenze x Versuchszahl der Bedrock-Konfiguration.
+                from src.bedrock_service import _BEDROCK_BOTO_CONFIG as _bcfg
+                _strict_bound = _strict_mod.cost_upper_bound_eur(
+                    getattr(request_body, "model", None), request_body,
+                    versuche=int((getattr(_bcfg, "retries", None) or {})["max_attempts"]),
+                )
             await enforce_budget(
                 user_id=_gate_attr.get("user_id"),
                 app_id=_gate_attr.get("app_id"),
