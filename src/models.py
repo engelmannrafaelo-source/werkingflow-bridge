@@ -856,8 +856,9 @@ class ResearchResponse(ErrorVerdictFields):
         default=None,
         description=(
             "success AND error, both paths (P6-VERTRAG): the execution contract that bound "
-            "this run — version, grenzen (effective limits), begrenzt_durch (server|client "
-            "per limit), pfad (pool|cloud), nicht_durchsetzbar (limits this path cannot "
+            "this run — version, grenzen (effective limits), begrenzt_durch (server|client|"
+            "depth|promotional|pool_cap per limit; pool_cap = web_search capped per request "
+            "round at the credit-pool limit of 3), pfad (pool|cloud), nicht_durchsetzbar (limits this path cannot "
             "enforce). On vertrag_version_abweichend: the current server contract."
         ),
     )

@@ -83,7 +83,11 @@ wiederholt die Pool-Admission), wird ebenfalls als HTTP 422 beantwortet.
   `perplexity_suchen`/`dokument_abrufe` und der Restfrist; Gesamtfrist =
   `min(weitergetragene Frist, gesamtzeit_s)`; CLI-Prozess wird an der Frist terminiert.
 - Cloud: `ResearchCloudConfig` aus dem Vertrag; `suchen`/`abrufe` zusätzlich durch
-  depth-Budget und Promotional-Cap gesenkt (`begrenzt_durch: depth|promotional`);
+  depth-Budget und Promotional-Cap gesenkt (`begrenzt_durch: depth|promotional|pool_cap`;
+  `pool_cap`: im Credit-Pool-Pfad (App werking-energy) ist `suchen` je Messages-Anfrage auf
+  höchstens 3 begrenzt, weil `credit_pool.post_messages` max_uses ausserhalb 1..3 ablehnt;
+  das gilt je Anfrage-Runde, nicht als Lauf-Summe, und `abrufe` bleibt unberührt —
+  deep hat damit höchstens 3 Suchen je Runde, mehr sind keine Garantie);
   jeder Messages-API-Aufruf wartet `min(transportzeit_s, Restfrist)`; Werkzeuge,
   Prüfer und Nachmessung laufen unter der Restfrist; Prüfung/Rückrunde/Nachmessung
   nur bei ausreichender Restzeit (benannt in `nachkontrolle.uebersprungen`).
@@ -94,7 +98,7 @@ wiederholt die Pool-Admission), wird ebenfalls als HTTP 422 beantwortet.
 `vertrag` in jeder ResearchResponse (Erfolg und Fehler, sync und async-Datei):
 `version`, `server_version`, `quelle` (anfrage|snapshot), `grenzen` (exakt wirksame
 Werte; bei `unwirksam` nur Anzeige), `begrenzt_durch` je Grenze
-(server|client|depth|promotional|snapshot|unwirksam), `geltung`, `pfad`,
+(server|client|depth|promotional|pool_cap|snapshot|unwirksam), `geltung`, `pfad`,
 `nicht_durchsetzbar`. `laufzeit` jetzt auf beiden Pfaden.
 
 Fehlersemantik: `laufzeit_erschoepft` (Hauptlauf/Fortsetzung/Modellaufruf an der Frist;
