@@ -307,7 +307,7 @@ async def _deduct_call_cost(
         from src.budget.strict_reservation import current as _strict_current
         _strict = _strict_current.get()
         _strict_id = None
-        if (_strict is not None and not _strict.abgerechnet and not _strict.freigegeben
+        if (_strict is not None and not _strict.abgerechnet
                 and _strict.plan_id == plan.id and _strict.user_id == str(uid)):
             _strict_id = _strict.reservation_id
         try:

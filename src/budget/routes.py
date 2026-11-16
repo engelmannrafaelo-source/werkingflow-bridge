@@ -380,10 +380,6 @@ class StrictReserveRequest(BaseModel):
     amountEur: float = Field(gt=0)
 
 
-class StrictReleaseRequest(BaseModel):
-    reservationId: uuid.UUID
-
-
 def _parse_raw_monthly(budget_row: Any) -> dict:
     if not budget_row:
         return {}
@@ -630,9 +626,10 @@ async def apply_budget_deduction_via_platform(
 @router.post("/strict/reserve")
 async def budget_strict_reserve(
     body: StrictReserveRequest,
-    _claims: AuthClaims = Depends(require_jwt_or_service),
+    _claims: AuthClaims = Depends(require_service_token),
 ) -> Dict[str, Any]:
-    """Atomare Reservierung fuer strict_monthly (siehe src/budget/strict_reservation.py)."""
+    """Atomare Reservierung fuer strict_monthly (siehe src/budget/strict_reservation.py).
+    Service-Token only (wie /topup/credit): ein Nutzer-JWT koennte sonst fremde Toepfe blockieren."""
     from src.budget.strict_reservation import db_reserve
 
     try:
@@ -640,19 +637,6 @@ async def budget_strict_reserve(
                                 plan_id=body.planId, amount_eur=body.amountEur)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
-
-
-@router.post("/strict/release")
-async def budget_strict_release(
-    body: StrictReleaseRequest,
-    _claims: AuthClaims = Depends(require_jwt_or_service),
-) -> Dict[str, Any]:
-    from src.budget.strict_reservation import db_release
-
-    try:
-        return await db_release(reservation_id=body.reservationId)
-    except LookupError as e:
-        raise HTTPException(status_code=404, detail=str(e))
 
 
 @router.post("/deduct")
