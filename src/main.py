@@ -980,6 +980,21 @@ app.add_middleware(DeliveryProbeMiddleware)
 # ADR-0010 hop the dev URL is served by prod workers. Pure ASGI.
 app.add_middleware(ServedByMiddleware)
 
+
+@app.middleware("http")
+async def _strict_reservation_release(request: Request, call_next):
+    """strict_monthly: a request that reserved budget but ended with an error and without a
+    deduction releases its reservation (src/budget/strict_reservation.py). Otherwise the
+    reservation expires by TTL — it only ever blocks, never overspends."""
+    from src.budget.strict_reservation import release_if_unsettled
+    try:
+        response = await call_next(request)
+    except Exception:
+        await release_if_unsettled(request, 500)
+        raise
+    await release_if_unsettled(request, response.status_code)
+    return response
+
 # Concurrency limiter — only memory-threshold safety net.
 # Adaptive cap_tokens does the real throttling per worker; hardcoded
 # concurrency caps would override that learning. Default is effectively
@@ -2928,13 +2943,24 @@ async def _chat_completions_lauf(
                 _arrival_est_tokens,
                 _gate_out_tokens,
             )
+            # strict_monthly (werking-schema-generator): reserve a cost UPPER BOUND atomically
+            # (src/budget/strict_reservation.py). max_tokens is pinned so the bound holds.
+            _strict_bound = None
+            if _gate_attr.get("app_id") == "werking-schema-generator":
+                from src.budget import strict_reservation as _strict_mod
+                if not getattr(request_body, "max_tokens", None):
+                    request_body.max_tokens = _strict_mod.DEFAULT_MAX_TOKENS
+                _strict_bound = _strict_mod.cost_upper_bound_eur(getattr(request_body, "model", None), request_body)
             await enforce_budget(
                 user_id=_gate_attr.get("user_id"),
                 app_id=_gate_attr.get("app_id"),
                 estimated_cost_eur=_gate_cost,
                 project_id=_gate_attr.get("workflow_id"),
                 hard_cap_hint=hard_cap_hint_from_request(request),
+                strict_reserve_eur=_strict_bound,
             )
+            if _strict_bound is not None:
+                request.state.strict_reservation = _strict_mod.current.get()
         except HTTPException as _budget_402:
             # A 402 (budget exhausted) rejects the call before any usage_events
             # row would ever be written — persist_ai_call_activity is only

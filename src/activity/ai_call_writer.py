@@ -302,10 +302,21 @@ async def _deduct_call_cost(
                     cost_eur_amount, call_month,
                 )
 
+        # strict_monthly: settle the gate's reservation in the same deduction transaction
+        # (src/budget/strict_reservation.py). Only the reservation of THIS user/plan, once.
+        from src.budget.strict_reservation import current as _strict_current
+        _strict = _strict_current.get()
+        _strict_id = None
+        if (_strict is not None and not _strict.abgerechnet and not _strict.freigegeben
+                and _strict.plan_id == plan.id and _strict.user_id == str(uid)):
+            _strict_id = _strict.reservation_id
         try:
             await apply_budget_deduction_via_platform(
                 uid, plan.id, cost_eur_amount, idempotency_key=call_uid,
+                **({"reservation_id": _strict_id} if _strict_id is not None else {}),
             )
+            if _strict_id is not None:
+                _strict.abgerechnet = True
         except BudgetDeductionDenied as denied:
             # The call already happened (the gate ran pre-call). A denial
             # here only means the running tally could not fully absorb the

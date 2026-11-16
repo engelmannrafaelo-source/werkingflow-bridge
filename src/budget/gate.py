@@ -42,7 +42,7 @@ from __future__ import annotations
 import logging
 import time
 import uuid
-from typing import Optional
+from typing import Any, Optional
 
 from fastapi import HTTPException
 
@@ -203,8 +203,13 @@ async def enforce_budget(
     project_id: Optional[str] = None,
     hard_cap_hint: bool = False,
     call_kind: Optional[str] = None,
+    strict_reserve_eur: Optional[float] = None,
 ) -> None:
     """
+    strict_monthly (werking-schema-generator): instead of a pre-check, an ATOMIC reservation of
+    strict_reserve_eur (the caller's cost upper bound) — src/budget/strict_reservation.py. A strict call
+    without an upper bound is refused (only the chat path computes one).
+
     Raise HTTPException(402) if the user's budget for this app is exhausted.
     Returns None (lets the call proceed) in every other case.
 
@@ -442,6 +447,10 @@ async def enforce_budget(
         # plans never gate on the monthly tenant budget.
         return
 
+    if strict_monthly:
+        await _strict_reserve(uid, app_id, plan, strict_reserve_eur)
+        return
+
     try:
         result = await evaluate_budget(uid, plan.id, estimated_cost_eur)
     except Exception as e:  # noqa: BLE001 — fail-open: infra error must not kill the AI path
@@ -488,3 +497,36 @@ async def enforce_budget(
         "budget gate: not-allowed reason=%s NOT in _BLOCKING_REASONS — letting call through (check if this reason should block)",
         reason,
     )
+
+
+async def _strict_reserve(uid: Any, app_id: str, plan: Any, amount: Optional[float]) -> None:
+    """strict_monthly: atomic reservation or refusal — never a pass-through (Root-Klarstellung 16.11.2026)."""
+    from src.budget.strict_reservation import StrictReservation, current, reserve_via_platform
+
+    current.set(None)
+    if plan.trial or plan.interval != "month":
+        raise HTTPException(status_code=503, detail={"error": "budget_product_unconfigured", "appId": app_id})
+    if amount is None or not (amount > 0):
+        raise HTTPException(status_code=403, detail={
+            "error": "strict_reservation_required", "appId": app_id,
+            "message": "Dieser Weg ist für die Schemafunktion nicht freigegeben.",
+        })
+    try:
+        erg = await reserve_via_platform(user_id=uid, plan_id=plan.id, amount_eur=amount)
+    except Exception as e:  # noqa: BLE001 — no clear answer: fail closed
+        logger.error("budget gate: strict reservation without clear answer (%s) — refusing 503", e)
+        raise HTTPException(status_code=503, detail={
+            "error": "budget_state_unavailable", "appId": app_id, "message": "Budget derzeit nicht prüfbar.",
+        }) from e
+    if not erg.get("ok"):
+        logger.info("budget gate: STRICT BLOCKED user=%s app=%s plan=%s reason=%s amount=%.6f remaining=%s",
+                    uid, app_id, plan.id, erg.get("reason"), amount, erg.get("remainingEur"))
+        raise HTTPException(status_code=402, detail={
+            "error": "budget_exhausted", "reason": erg.get("reason") or "strict_monthly_exhausted",
+            "appId": app_id, "planId": plan.id, "totalRemainingEur": erg.get("remainingEur", 0.0),
+            "message": "API-Budget aufgebraucht.",
+        })
+    current.set(StrictReservation(reservation_id=erg["reservationId"], user_id=str(uid),
+                                  plan_id=plan.id, amount_eur=amount))
+    logger.info("budget gate: strict reserved id=%s user=%s plan=%s amount=%.6f remaining=%s",
+                erg["reservationId"], uid, plan.id, amount, erg.get("remainingEur"))
