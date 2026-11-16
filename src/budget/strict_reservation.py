@@ -52,6 +52,20 @@ class StrictReservation:
     abgerechnet: bool = False
 
 
+@dataclass
+class StrictPending:
+    """Im Tor geprueft, noch NICHT reserviert (Weg A: Reservierung direkt vor dem Versand)."""
+    uid: Any
+    app_id: str
+    plan: Any
+    amount_eur: float
+
+
+#: Gesetzt vom Tor (Chat-Weg), verbraucht von gate.strict_reserve_pending() direkt vor dem Versand.
+pending: contextvars.ContextVar[Optional[StrictPending]] = contextvars.ContextVar(
+    "strict_monthly_pending", default=None,
+)
+
 #: Gesetzt vom Tor im Anfrage-Kontext; gelesen von der Abbuchung (ai_call_writer).
 current: contextvars.ContextVar[Optional[StrictReservation]] = contextvars.ContextVar(
     "strict_monthly_reservation", default=None,

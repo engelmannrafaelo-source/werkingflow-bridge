@@ -204,6 +204,7 @@ async def enforce_budget(
     hard_cap_hint: bool = False,
     call_kind: Optional[str] = None,
     strict_reserve_eur: Optional[float] = None,
+    strict_defer: bool = False,
 ) -> None:
     """
     strict_monthly (werking-schema-generator): instead of a pre-check, an ATOMIC reservation of
@@ -448,7 +449,12 @@ async def enforce_budget(
         return
 
     if strict_monthly:
-        await _strict_reserve(uid, app_id, plan, strict_reserve_eur)
+        if strict_defer:
+            # Weg A (16.11.): die Reservierung erfolgt DIREKT VOR DEM VERSAND (strict_reserve_pending,
+            # main.py vor dem Backend-Versand), damit Ablehnungen davor (Guard, 424, Routing) keinen Topf binden.
+            _strict_prepare(uid, app_id, plan, strict_reserve_eur)
+        else:
+            await _strict_reserve(uid, app_id, plan, strict_reserve_eur)
         return
 
     try:
@@ -499,11 +505,7 @@ async def enforce_budget(
     )
 
 
-async def _strict_reserve(uid: Any, app_id: str, plan: Any, amount: Optional[float]) -> None:
-    """strict_monthly: atomic reservation or refusal — never a pass-through (Root-Klarstellung 16.11.2026)."""
-    from src.budget.strict_reservation import StrictReservation, current, reserve_via_platform
-
-    current.set(None)
+def _strict_check(app_id: str, plan: Any, amount: Optional[float]) -> None:
     if plan.trial or plan.interval != "month":
         raise HTTPException(status_code=503, detail={"error": "budget_product_unconfigured", "appId": app_id})
     if amount is None or not (amount > 0):
@@ -511,6 +513,39 @@ async def _strict_reserve(uid: Any, app_id: str, plan: Any, amount: Optional[flo
             "error": "strict_reservation_required", "appId": app_id,
             "message": "Dieser Weg ist für die Schemafunktion nicht freigegeben.",
         })
+
+
+def _strict_prepare(uid: Any, app_id: str, plan: Any, amount: Optional[float]) -> None:
+    """strict_monthly, Chat-Weg: alles pruefen, Reservierung als ausstehend merken (noch kein Topf gebunden)."""
+    from src.budget.strict_reservation import StrictPending, current, pending
+
+    current.set(None)
+    pending.set(None)
+    _strict_check(app_id, plan, amount)
+    pending.set(StrictPending(uid=uid, app_id=app_id, plan=plan, amount_eur=float(amount)))
+
+
+async def strict_reserve_pending() -> None:
+    """Direkt vor dem Versand: die im Tor vorbereitete Reservierung jetzt atomar anlegen (oder ablehnen).
+    Ohne vorbereitete Reservierung: 503 — eine strict-App wird nie ungedeckt versandt."""
+    from src.budget.strict_reservation import pending
+
+    p = pending.get()
+    pending.set(None)
+    if p is None:
+        raise HTTPException(status_code=503, detail={
+            "error": "budget_state_unavailable", "appId": "werking-schema-generator",
+            "message": "Budget derzeit nicht prüfbar.",
+        })
+    await _strict_reserve(p.uid, p.app_id, p.plan, p.amount_eur)
+
+
+async def _strict_reserve(uid: Any, app_id: str, plan: Any, amount: Optional[float]) -> None:
+    """strict_monthly: atomic reservation or refusal — never a pass-through (Root-Klarstellung 16.11.2026)."""
+    from src.budget.strict_reservation import StrictReservation, current, reserve_via_platform
+
+    current.set(None)
+    _strict_check(app_id, plan, amount)
     try:
         erg = await reserve_via_platform(user_id=uid, plan_id=plan.id, amount_eur=amount)
     except Exception as e:  # noqa: BLE001 — no clear answer: fail closed

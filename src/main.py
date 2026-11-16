@@ -2944,9 +2944,9 @@ async def _chat_completions_lauf(
                 _mt = getattr(request_body, "max_tokens", None)
                 if not _mt or _mt > _strict_mod.MAX_TOKENS_CAP:
                     request_body.max_tokens = _strict_mod.MAX_TOKENS_CAP
-                # Pruefung R4 N2: botocore wiederholt nach Read-Timeout; AWS kann jeden Versuch berechnen,
-                # gebucht wird nur der letzte -> Obergrenze x Versuchszahl der Bedrock-Konfiguration.
-                from src.bedrock_service import _BEDROCK_BOTO_CONFIG as _bcfg
+                # Weg A (16.11.): diese App ruft Bedrock mit dem Ein-Versuch-Client; die Obergrenze rechnet mit
+                # dessen gelesener Versuchszahl (fail closed, falls sie nicht 1 ist, wird entsprechend mehr reserviert).
+                from src.bedrock_service import _BEDROCK_BOTO_CONFIG_EIN_VERSUCH as _bcfg
                 _strict_bound = _strict_mod.cost_upper_bound_eur(
                     getattr(request_body, "model", None), request_body,
                     versuche=_strict_mod.anbieter_versuche(_bcfg),
@@ -2958,9 +2958,8 @@ async def _chat_completions_lauf(
                 project_id=_gate_attr.get("workflow_id"),
                 hard_cap_hint=hard_cap_hint_from_request(request),
                 strict_reserve_eur=_strict_bound,
+                strict_defer=_strict_bound is not None,
             )
-            if _strict_bound is not None:
-                request.state.strict_reservation = _strict_mod.current.get()
         except HTTPException as _budget_402:
             # A 402 (budget exhausted) rejects the call before any usage_events
             # row would ever be written — persist_ai_call_activity is only
@@ -3698,6 +3697,22 @@ async def _chat_completions_lauf(
                 )
 
         # =======================================================================
+        # STRICT_MONTHLY (werking-schema-generator), Weg A 16.11.2026: Reservierung DIREKT VOR DEM VERSAND.
+        # Alle Ablehnungen davor (Schema-Guard, 424, Routing, Text-Wegwahl) binden keinen Topf. Versand nur
+        # ueber Bedrock ohne Stream mit dem Ein-Versuch-Client; jeder andere Backend-Zweig wird abgewiesen.
+        # Hinter diesem Punkt liegen ALLE Backend-Zweige (Bedrock, Vertex, anthropic_direct, OpenAI, Gemini, SDK).
+        # =======================================================================
+        _strict_dispatch = extract_attribution_context(request).get("app_id") == "werking-schema-generator"
+        if _strict_dispatch:
+            if not (backend_config and backend_config.backend == BackendType.BEDROCK) or request_body.stream:
+                raise HTTPException(status_code=403, detail={
+                    "error": "strict_backend_not_allowed", "appId": "werking-schema-generator",
+                    "message": "Dieser Weg ist für die Schemafunktion nicht freigegeben.",
+                })
+            from src.budget.gate import strict_reserve_pending
+            await strict_reserve_pending()
+
+        # =======================================================================
         # BEDROCK ROUTING: Direct boto3 call, bypass Claude Code SDK
         # =======================================================================
         if backend_config and backend_config.backend == BackendType.BEDROCK:
@@ -3813,7 +3828,7 @@ async def _chat_completions_lauf(
                 )
             else:
                 try:
-                    response = await call_bedrock(request_body, backend_config.region)
+                    response = await call_bedrock(request_body, backend_config.region, ein_versuch=_strict_dispatch)
                 except HTTPException as bedrock_err:
                     await _persist_bedrock_usage(
                         input_tokens=0, output_tokens=0, status="error",
