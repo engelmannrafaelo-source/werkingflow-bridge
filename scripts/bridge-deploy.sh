@@ -2178,6 +2178,26 @@ phase_reconcile_worker_key() {
     local host="$1"
     step "Phase 3.5: reconcile worker AI_BRIDGE_API_KEY (${host})"
 
+    # Explicit, per-run opt-in (never a default): since 12.11.2026 the admin-token reader behind
+    # infisical_get_secret is disabled (get-admin-token.py exit 78) and no regular reader covers
+    # dev-server/dev, so this phase cannot read the SSoT. BRIDGE_KEY_RECONCILE=keep-host keeps the
+    # key ALREADY on the host unchanged after proving it is present and a single clean token.
+    # It writes nothing. Remove once a regular reader for dev-server/dev exists.
+    if [[ "${BRIDGE_KEY_RECONCILE:-}" == "keep-host" ]]; then
+        warn "BRIDGE_KEY_RECONCILE=keep-host: SSoT not read; keeping the host's AI_BRIDGE_API_KEY unchanged (${host})"
+        local chk
+        chk=$(rssh "$host" "f='${REMOTE_REPO}/secrets/platform.env'; v=\$(grep -E '^AI_BRIDGE_API_KEY=' \"\$f\" | head -1 | cut -d= -f2-); n=\$(grep -cE '^AI_BRIDGE_API_KEY=' \"\$f\"); case \"\$v\" in ''|null|*[[:space:]]*) echo BAD;; *) echo \"OK \$n \${#v}\";; esac" 2>/dev/null) || chk="BAD"
+        if [[ "$chk" != OK\ 1\ * ]]; then
+            error_ "keep-host: AI_BRIDGE_API_KEY on ${host} missing, duplicated or not a clean token (${chk%% *}) — refusing"
+            return 1
+        fi
+        info "keep-host: AI_BRIDGE_API_KEY present once on ${host} (length ${chk##* }), unchanged"
+        return 0
+    elif [[ -n "${BRIDGE_KEY_RECONCILE:-}" ]]; then
+        error_ "BRIDGE_KEY_RECONCILE='${BRIDGE_KEY_RECONCILE}' unknown (only keep-host) — refusing"
+        return 1
+    fi
+
     # shellcheck source=/root/.infisical/infisical-api.sh
     source /root/.infisical/infisical-api.sh 2>/dev/null || true
     local api_key
