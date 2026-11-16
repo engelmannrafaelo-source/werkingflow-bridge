@@ -118,15 +118,27 @@ PROMOTIONAL_JE_TIEFE_DEFAULT: Dict[str, Dict[str, int]] = {
 }
 
 
-def promotional_grenzen(depth: Optional[str]) -> Dict[str, int]:
+# research_mode "academic" (literature/standards/studies) needs at least the
+# standard breadth whatever the depth (Energy P4, e258822b 16.11.2026): a
+# floor, raised further by deep/exhaustive. Env RESEARCH_PROMOTIONAL_
+# <SUCHEN|ABRUFE>_ACADEMIC_MIN.
+PROMOTIONAL_ACADEMIC_MIN_DEFAULT: Dict[str, int] = {"suchen": 3, "abrufe": 5}
+
+
+def promotional_grenzen(depth: Optional[str], research_mode: Optional[str] = None) -> Dict[str, int]:
     """{"suchen", "abrufe"} for a promotional-only run of ``depth`` (unknown
-    depth -> standard, as search_budget_for_depth). A value that is not a
-    positive integer is a loud error, like every contract ceiling."""
+    depth -> standard, as search_budget_for_depth); in research_mode
+    "academic" at least the academic floor. A value that is not a positive
+    integer is a loud error, like every contract ceiling."""
     tiefe = depth if depth in PROMOTIONAL_JE_TIEFE_DEFAULT["suchen"] else "standard"
     aus: Dict[str, int] = {}
     for art, je_tiefe in PROMOTIONAL_JE_TIEFE_DEFAULT.items():
         env = f"RESEARCH_PROMOTIONAL_{art.upper()}_{tiefe.upper()}"
         aus[art] = int(_lies(env, je_tiefe[tiefe], True))
+        if research_mode == "academic":
+            boden = int(_lies(f"RESEARCH_PROMOTIONAL_{art.upper()}_ACADEMIC_MIN",
+                              PROMOTIONAL_ACADEMIC_MIN_DEFAULT[art], True))
+            aus[art] = max(aus[art], boden)
     return aus
 
 # What binds on which path, and what a path cannot enforce.
@@ -240,6 +252,7 @@ def capabilities() -> Dict[str, Any]:
         "promotional_je_tiefe": {
             t: promotional_grenzen(t) for t in PROMOTIONAL_JE_TIEFE_DEFAULT["suchen"]
         },
+        "promotional_academic_min": promotional_grenzen("quick", "academic"),
         "promotional_leser": "fetch_document (kein Servertool web_fetch); abrufe und dokument_abrufe "
                              "zaehlen dort Quellenlesungen je gesamtem Lauf",
         "zeit_minima": {

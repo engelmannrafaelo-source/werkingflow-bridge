@@ -194,7 +194,13 @@ def _pinned_request(url: str, address: Optional[str]) -> Tuple[str, Dict[str, st
     """URL, extra headers and httpx extensions for one hop. With an address,
     the TCP connection goes to it while Host header, TLS SNI and certificate
     check keep the name (httpcore verifies the certificate against
-    ``sni_hostname``)."""
+    ``sni_hostname``).
+
+    Known limit (accepted, e258822b 16.11.2026): exactly ONE checked address
+    is used, IPv4 first — no Happy-Eyeballs fallback to a second address.
+    If that address does not answer, the call fails loudly as a tool error
+    ("Abruf fehlgeschlagen: ConnectError ...") and the model looks for a
+    second source; it is never retried unpinned."""
     if address is None:
         return url, {}, {}
     try:

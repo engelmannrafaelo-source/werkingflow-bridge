@@ -7181,7 +7181,7 @@ async def _execute_research_cloud_impl(
         # promotional_only reads through fetch_document only (executor), so
         # the read cap lowers both abrufe and dokument_abrufe — shown in the
         # contract, not applied silently (Zweitprüfung R1 A3).
-        _promo = promotional_grenzen(request_body.depth)
+        _promo = promotional_grenzen(request_body.depth, getattr(request_body, "research_mode", None))
         vertrag = (
             vertrag.senken("suchen", _promo["suchen"], "promotional")
             .senken("abrufe", _promo["abrufe"], "promotional")
