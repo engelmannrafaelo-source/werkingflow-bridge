@@ -347,6 +347,32 @@ async def create_job_endpoint(
     if attribution is None and _attribution_extractor is not None:
         attribution = _attribution_extractor(request)
 
+    # SCHEMA-BEDROCK-GUARD: Schema jobs are chat or proxy->smart-anonymize only, and their identity is pinned to
+    # the validated request (headers/principal), never to body.attribution: the worker-key self-call turns the
+    # attribution into X-App-ID/X-User-ID, so a divergent body value could dodge the Bedrock/research guard.
+    from src.routing.app_provider_policy import _resolve_app_id as _schema_job_app
+    from src.routing.schema_bedrock_guard import (
+        SCHEMA_APP_ID as _SCHEMA_APP_ID, assert_schema_job_allowed, bind_schema_job_attribution,
+        SchemaBedrockExpectationError as _SchemaJobError,
+    )
+    _schema_auth_app = _schema_job_app(request)[0]
+    _schema_claimed_app = (attribution or {}).get("app_id")
+    try:
+        assert_schema_job_allowed(
+            authenticated_app=_schema_auth_app, claimed_app=_schema_claimed_app,
+            kind=body.kind, payload=body.payload,
+        )
+        if _SCHEMA_APP_ID in (_schema_auth_app, _schema_claimed_app):
+            _derived = _attribution_extractor(request) if _attribution_extractor is not None else {}
+            if _derived.get("app_id") is None:
+                _derived = {**_derived, "app_id": _schema_auth_app}
+            attribution = bind_schema_job_attribution(attribution, _derived)
+    except _SchemaJobError as e:
+        raise HTTPException(
+            status_code=403,
+            detail={"error": {"message": str(e), "type": "permission_error", "code": e.code}},
+        )
+
     # ADR-0011: the job's HOME bridge comes from the LB-stamped request
     # context, NEVER from the body — a body-supplied bridge_origin would let a
     # caller redirect whose budget pays. Persisted with the job so a reclaim
@@ -358,6 +384,28 @@ async def create_job_endpoint(
         attribution["bridge_origin"] = _origin
     elif attribution and "bridge_origin" in attribution:
         attribution = {k: v for k, v in attribution.items() if k != "bridge_origin"}
+
+    # SCHEMA-EU route (path B v2, Root review 2534): on a non-dev bridge a Schema job is accepted only when the
+    # LB took its local keyed handler (@keyed_jobs_local stamps X-Bridge-Schema-Route; every inbound copy is
+    # cleared at the LB). The stamp is persisted from the HEADER, never from the body, and forwarded by the
+    # executor's self-call (executors._ATTRIBUTION_HEADERS), where _chat_completions_lauf requires it again.
+    attribution = {k: v for k, v in (attribution or {}).items() if k != "schema_route"}
+    if attribution.get("app_id") == _SCHEMA_APP_ID or _schema_auth_app == _SCHEMA_APP_ID:
+        from src.federation import self_origin_id as _schema_self_origin
+        from src.routing.schema_bedrock_guard import (
+            SCHEMA_ROUTE_HEADER as _SCHEMA_ROUTE_HEADER, SCHEMA_ROUTE_VALUE as _SCHEMA_ROUTE_VALUE,
+            assert_schema_route as _assert_schema_route,
+        )
+        _schema_stamp = request.headers.get(_SCHEMA_ROUTE_HEADER)
+        try:
+            _assert_schema_route(_schema_self_origin(), _schema_stamp)
+        except _SchemaJobError as e:
+            raise HTTPException(
+                status_code=403,
+                detail={"error": {"message": str(e), "type": "permission_error", "code": e.code}},
+            )
+        if (_schema_stamp or "").strip().lower() == _SCHEMA_ROUTE_VALUE:
+            attribution["schema_route"] = _SCHEMA_ROUTE_VALUE
 
     # FK25B2: who may cancel this job, bound at submit to the caller's
     # AUTHENTICATED identity — the IDEMR owner (_idempotency_owner), never
