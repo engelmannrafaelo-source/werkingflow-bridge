@@ -3413,7 +3413,8 @@ if [[ -f "$sync_principals" ]]; then
     if sync_out=$(DRY_RUN="$DRY_RUN" bash "$sync_principals" 2>&1); then
         # Dev-only skips (principals-dev-only.txt) are a standing exception — WARN, not INFO.
         while IFS= read -r line; do
-            if [[ "$line" == *"SKIPPED dev-only"* || "$line" == *"dev-only principal"*EXISTS* ]]; then warn "$line"; else info "$line"; fi
+            if [[ "$line" == *"SKIPPED dev-only"* || "$line" == *"dev-only principal"*EXISTS* \
+                  || "$line" == *"SKIPPED prod-only"* || "$line" == *"prod-only principal"*EXISTS* ]]; then warn "$line"; else info "$line"; fi
         done <<< "$sync_out"
     else
         warn "Principal sync did not converge (conflict or query error) — reconcile deliberately:"

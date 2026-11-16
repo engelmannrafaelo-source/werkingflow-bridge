@@ -1,0 +1,16 @@
+# principals-prod-only.txt — service principals that live ONLY on the prod bridge
+# (server2, 178.104.178.79) and must never be copied to the dev bridge (49.12.72.66).
+#
+# Mirror of principals-dev-only.txt, read by sync-principals.sh (bridge-deploy.sh
+# Phase 3.6) and check-principal-drift.sh. The union rule (Rafael 2026-07-07)
+# deliberately does NOT apply: sync skips these names for the dev host and says so
+# loudly on every run; the drift check leaves them out of the comparison and
+# reports a copy on the dev host as a leak.
+#
+# One name per line; text after '#' is a comment. Remove a name only together
+# with the decision that lifts the reason given next to it.
+
+# Oeffentlicher Schema-Generator werking.tools auf der Prod-Bridge
+# (T-SCHEMA-PROD-BRIDGE, Rafael 16.11.2026): Prod-Budget, Bedrock-EU-Pin, Weg-B-Route.
+# Auf Dev gueltig hiesse: Prod-Identitaet ueber die Dev-Bridge ohne EU-Guard.
+homepage-mini-schema-prod

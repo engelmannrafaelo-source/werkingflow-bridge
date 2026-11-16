@@ -37,6 +37,11 @@ FROM service_principals WHERE active ORDER BY name;"
 DEV_ONLY_FILE="${DEV_ONLY_FILE:-$(dirname "${BASH_SOURCE[0]}")/principals-dev-only.txt}"
 [[ -f "$DEV_ONLY_FILE" ]] || { echo "ERROR: dev-only list missing: $DEV_ONLY_FILE" >&2; exit 2; }
 DEV_ONLY=$(sed -e 's/#.*//' -e 's/[[:space:]]//g' "$DEV_ONLY_FILE" | grep -v '^$' || true)
+# Prod-only principals (principals-prod-only.txt): the mirror case — on the prod
+# host by design, a leak when active on the dev host (HOSTS[0]).
+PROD_ONLY_FILE="${PROD_ONLY_FILE:-$(dirname "${BASH_SOURCE[0]}")/principals-prod-only.txt}"
+[[ -f "$PROD_ONLY_FILE" ]] || { echo "ERROR: prod-only list missing: $PROD_ONLY_FILE" >&2; exit 2; }
+PROD_ONLY=$(sed -e 's/#.*//' -e 's/[[:space:]]//g' "$PROD_ONLY_FILE" | grep -v '^$' || true)
 
 declare -A SNAP
 LEAK=0
@@ -55,8 +60,15 @@ for h in "${HOSTS[@]}"; do
       LEAK=1
     fi
   fi
+  if [[ "$h" == "${HOSTS[0]}" ]]; then
+    leaked=$(printf '%s\n' "$out" | awk -F'|' 'NR==FNR { if ($0 != "") skip[$0]=1; next } ($1 in skip) { print $1 }' <(printf '%s\n' "$PROD_ONLY") -)
+    if [[ -n "$leaked" ]]; then
+      echo "❌ PROD-ONLY PRINCIPAL ACTIVE ON ${h}: $(tr '\n' ' ' <<< "$leaked")— must not exist on the dev bridge (principals-prod-only.txt). Deactivate it there deliberately." >&2
+      LEAK=1
+    fi
+  fi
   SNAP["$h"]="$(printf '%s\n' "$out" | grep -v '^[[:space:]]*$' \
-    | awk -F'|' 'NR==FNR { if ($0 != "") skip[$0]=1; next } !($1 in skip)' <(printf '%s\n' "$DEV_ONLY") - \
+    | awk -F'|' 'NR==FNR { if ($0 != "") skip[$0]=1; next } !($1 in skip)' <(printf '%s\n%s\n' "$DEV_ONLY" "$PROD_ONLY") - \
     | sort)"
 done
 
@@ -80,6 +92,9 @@ fi
 
 if [[ -n "$DEV_ONLY" ]]; then
   echo "NOTE: dev-only principals excluded from parity (principals-dev-only.txt; Prod-Ort offen bei Rafael, e-pva-erkunder-prodort): $(tr '\n' ' ' <<< "$DEV_ONLY")" >&2
+fi
+if [[ -n "$PROD_ONLY" ]]; then
+  echo "NOTE: prod-only principals excluded from parity (principals-prod-only.txt): $(tr '\n' ' ' <<< "$PROD_ONLY")" >&2
 fi
 n=$(printf '%s\n' "${SNAP[$ref_host]}" | grep -c . || true)
 echo "PRINCIPAL_OK: all ${#HOSTS[@]} hosts agree on ${n} active service_principals."

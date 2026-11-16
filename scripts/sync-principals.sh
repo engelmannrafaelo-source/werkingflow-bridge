@@ -37,6 +37,11 @@ DEV_ONLY_FILE="${DEV_ONLY_FILE:-$(dirname "${BASH_SOURCE[0]}")/principals-dev-on
 [[ -f "$DEV_ONLY_FILE" ]] || { echo "ERROR: dev-only list missing: $DEV_ONLY_FILE" >&2; exit 2; }
 DEV_ONLY=$(sed -e 's/#.*//' -e 's/[[:space:]]//g' "$DEV_ONLY_FILE" | grep -v '^$' || true)
 is_dev_only() { grep -qxF "$1" <<< "$DEV_ONLY"; }
+# Prod-only principals: never copied onto the dev host, see principals-prod-only.txt.
+PROD_ONLY_FILE="${PROD_ONLY_FILE:-$(dirname "${BASH_SOURCE[0]}")/principals-prod-only.txt}"
+[[ -f "$PROD_ONLY_FILE" ]] || { echo "ERROR: prod-only list missing: $PROD_ONLY_FILE" >&2; exit 2; }
+PROD_ONLY=$(sed -e 's/#.*//' -e 's/[[:space:]]//g' "$PROD_ONLY_FILE" | grep -v '^$' || true)
+is_prod_only() { grep -qxF "$1" <<< "$PROD_ONLY"; }
 
 psql_on() { # host, sql-on-stdin
   sudo -n ssh $SSH_OPTS "root@${1}" \
@@ -88,7 +93,15 @@ for h in "${HOSTS[@]}"; do
       echo "❌ dev-only principal '${name}' EXISTS on ${h} — must not exist off the dev bridge (principals-dev-only.txt; e-pva-erkunder-prodort). Deactivate it there deliberately." >&2
       continue
     fi
+    if [[ "$h" == "$DEV_HOST" ]] && is_prod_only "$name" && grep -qxF "$name" <<< "${ALLNAMES[$h]}"; then
+      echo "❌ prod-only principal '${name}' EXISTS on ${h} — must not exist on the dev bridge (principals-prod-only.txt). Deactivate it there deliberately." >&2
+      continue
+    fi
     grep -qxF "$name" <<< "${ALLNAMES[$h]}" && continue
+    if [[ "$h" == "$DEV_HOST" ]] && is_prod_only "$name"; then
+      echo "⚠️  SKIPPED prod-only principal '${name}' for ${h}: not copied onto the dev bridge (principals-prod-only.txt)." >&2
+      continue
+    fi
     if [[ "$h" != "$DEV_HOST" ]] && is_dev_only "$name"; then
       echo "⚠️  SKIPPED dev-only principal '${name}' for ${h}: not copied off the dev bridge (principals-dev-only.txt; Prod-Ort offen bei Rafael, e-pva-erkunder-prodort)." >&2
       continue
