@@ -84,6 +84,23 @@ def cost_upper_bound_eur(model: Optional[str], request_body: Any, versuche: int 
     return round(usd * usd_to_eur_rate(), 6)
 
 
+def anbieter_versuche(boto_config: Any) -> int:
+    """Wie oft botocore denselben Aufruf HOECHSTENS absetzt (jeder Versuch kann berechnet werden).
+    botocore-Semantik: retries["total_max_attempts"] = Gesamtzahl; retries["max_attempts"] = Wiederholungen
+    NACH dem ersten Versuch (gemessen 16.11.: max_attempts 2 -> 3 Verbindungen). Ohne ausdrueckliche
+    Angabe gilt botocores Modus-Vorgabe — die nehmen wir nicht an: fail closed."""
+    r = getattr(boto_config, "retries", None) or {}
+    if "total_max_attempts" in r:
+        n = int(r["total_max_attempts"])
+    elif "max_attempts" in r:
+        n = int(r["max_attempts"]) + 1
+    else:
+        raise ValueError("Bedrock-Konfiguration ohne ausdrueckliche Versuchszahl — strict_monthly reserviert nicht")
+    if n < 1:
+        raise ValueError(f"Versuchszahl {n} ungueltig")
+    return n
+
+
 # ── Datenbank (NUR platform-api) ─────────────────────────────────────────────
 
 async def _lock_and_roll(conn, user_id: uuid.UUID, plan_id: str):

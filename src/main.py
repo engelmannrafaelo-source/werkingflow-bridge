@@ -2949,7 +2949,7 @@ async def _chat_completions_lauf(
                 from src.bedrock_service import _BEDROCK_BOTO_CONFIG as _bcfg
                 _strict_bound = _strict_mod.cost_upper_bound_eur(
                     getattr(request_body, "model", None), request_body,
-                    versuche=int((getattr(_bcfg, "retries", None) or {})["max_attempts"]),
+                    versuche=_strict_mod.anbieter_versuche(_bcfg),
                 )
             await enforce_budget(
                 user_id=_gate_attr.get("user_id"),
