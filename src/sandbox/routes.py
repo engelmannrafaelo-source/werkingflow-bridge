@@ -117,7 +117,11 @@ class LeaseTokenResponse(BaseModel):
     policyRevision: Optional[int] = None
     leaseId: uuid.UUID
     accountId: str
-    oauthToken: str
+    # Gebundene Aufrufer (bpx) bekommen KEIN Provider-OAuth (Wire-Vertrag v2): tokenKind "bridge_proxy"
+    # und proxyPath; der Daemon leitet den Anthropic-Hauptpfad ueber die Bridge. Sonst "oauth" wie bisher.
+    tokenKind: str = "oauth"
+    oauthToken: Optional[str] = None
+    proxyPath: Optional[str] = None
     billingMode: str
     expiresAt: datetime
     tenantId: str
@@ -233,11 +237,18 @@ async def lease_token(
             raise HTTPException(status_code=503, detail={"error": "pool_state_unavailable", "detail": str(exc)})
 
         # 5. Read token file — fail loud on missing/empty
-        try:
-            oauth_token = _ls.read_oauth_token(picked.account_id)
-        except RuntimeError as exc:
-            logger.error(f"Token file read failed: {exc}")
-            raise HTTPException(status_code=500, detail={"error": "token_file_error", "detail": str(exc)})
+        oauth_token: Optional[str] = None
+        if bound:
+            # OAuth bleibt serverseitig; nur pruefen, dass das Konto ein Token hat (Proxy liest es je Aufruf).
+            if not _ls.has_oauth_token(picked.account_id):
+                logger.error(f"Token file missing for account {picked.account_id}")
+                raise HTTPException(status_code=500, detail={"error": "token_file_error"})
+        else:
+            try:
+                oauth_token = _ls.read_oauth_token(picked.account_id)
+            except RuntimeError as exc:
+                logger.error(f"Token file read failed: {exc}")
+                raise HTTPException(status_code=500, detail={"error": "token_file_error", "detail": str(exc)})
 
         # 6. Insert lease
         dauer_min = body.estimatedDurationMin
@@ -260,17 +271,24 @@ async def lease_token(
         f"tier={picked.tier} app={body.app} expires={expires_at.isoformat()}"
     )
 
-    return LeaseTokenResponse(
+    antwort = LeaseTokenResponse(
         requestedAccountId=body.preferredAccountId,
         accountSelectionReason=picked.selection_reason,
         policyRevision=picked.policy_revision,
         leaseId=lease_id,
         accountId=picked.account_id,
+        tokenKind="bridge_proxy" if bound else "oauth",
         oauthToken=oauth_token,
+        proxyPath=f"/v1/sandbox/lease-token/{lease_id}/anthropic" if bound else None,
         billingMode=billing_mode,
         expiresAt=expires_at,
         tenantId=tenant_id,
     )
+    if bound:
+        # Vertrag v2: das Feld oauthToken fehlt fuer gebundene Aufrufer ganz (nicht null).
+        from fastapi.responses import JSONResponse
+        return JSONResponse(antwort.model_dump(mode="json", exclude={"oauthToken"}))
+    return antwort
 
 
 # ---------------------------------------------------------------------------
@@ -335,6 +353,10 @@ async def record_usage(
 
     # Compute hypothetical cost if Daemon didn't send it
     hyp_cost = body.hypotheticalCostEur
+    if _claims.kind == "bound":
+        # Wire-Vertrag v2: Usage gebundener Leases verbucht die Bridge im Anthropic-Proxy selbst;
+        # eine Meldung des Daemons wuerde doppelt zaehlen.
+        raise HTTPException(status_code=409, detail={"error": "usage_serverseitig"})
     if _claims.kind == "bound":
         # H-KD-1: gebundene Aufrufer melden keine Kosten selbst. Die Bridge rechnet aus Modell und
         # Tokens; ein Kostenwert im Body, ein unbepreistes Modell, negative Tokens oder eine fehlende
