@@ -194,7 +194,7 @@ def test_gegenprobe(text, treffer, maske, frei):
     ("Der Kaltwasserverteiler KV-01a ist neu.", "KV-01a", "ORGANIZATION"),      # keine Kennungsform
     ("Der Kaltwasserverteiler Kv-01 ist neu.", "Kv-01", "ORGANIZATION"),        # keine Kennungsform
     ("Der Kaltwasserverteiler KVXYZ-01 ist neu.", "KVXYZ-01", "ORGANIZATION"),  # Praefix zu lang
-    ("Der KALTWASSERVERTEILER KV-01 ist neu.", "KV-01", "ORGANIZATION"),        # kein Normal-Substantiv
+    ("Der KaltWasserVerteiler KV-01 ist neu.", "KV-01", "ORGANIZATION"),  # gemischte Schreibung (R3b: Versalien/klein zulaessig)
     ("Der Kaltwasserverteiler\nKV-01 ist neu.", "KV-01", "ORGANIZATION"),       # andere Zeile
     ("Der Kaltwasserverteiler KV-01 ist neu.", "KV-01", "PERSON"),              # harter Typ
     ("Der Kaltwasserverteiler KV-01 ist neu.", "KV-01", "NRP"),                 # anderer weicher Typ
@@ -780,3 +780,31 @@ def test_R3b_unterstrich_ist_keine_wortgrenze(t):
     for s in r["postprocessing"]["anlagenkontext"]["technical_retentions"]["spans"]:
         assert out[s["start"] - 1:s["start"]] != "_" and out[s["end"]:s["end"] + 1] != "_"
     assert "FI-01_" not in out and "_FI-01" not in out
+
+
+@pytest.mark.parametrize("wort", ["PUMPE", "Pumpe", "pumpe", "WÄRMETAUSCHER", "WAERMETAUSCHER", "Wärmetauscher",
+                                  "wärmetauscher", "KALTWASSERVERTEILER", "SCHLUCKBRUNNEN", "HEIZKREIS",
+                                  "ROHRLEITUNG", "UMWÄLZPUMPEN"])
+def test_R3b_schreibweise_versal_klein(wort):
+    # Root R3b-Check: Tabellenueberschriften in Versalien; Vergleich normalisiert gegen DIESELBE positive Liste
+    assert ak.ist_bauteil(wort), wort
+    t = f"{wort} P-01 ist eingebaut."
+    frei, _ = _ent(t, [(t.index("P-01"), t.index("P-01") + 4, "ORGANIZATION", "detektor")])
+    assert list(frei.values()) == [wort]
+
+
+@pytest.mark.parametrize("wort", ["LANDKREIS", "landkreis", "FREUNDESKREIS", "GESCHÄFTSLEITUNG", "HANDELSREGISTER",
+                                  "LEITUNG", "VERTEILER", "FIRMA", "FAMILIE", "BEWOHNER", "PuMpE", "Pumpe-Haus"])
+def test_R3b_versal_keine_breitere_freigabe(wort):
+    assert not ak.ist_bauteil(wort), wort
+    t = f"{wort} LK-12 ist eingetragen."
+    frei, _ = _ent(t, [(t.index("LK-12"), t.index("LK-12") + 5, "LOCATION", "detektor")])
+    assert frei == {}, wort
+
+
+@pytest.mark.parametrize("t", ["Der Brunnen B-02, BEWOHNERIN des Hauses, meldet.", "Der Brunnen B-02 ist PATIENT.",
+                               "Der Brunnen B-02 (FAMILIE Sonnwendt) meldet."])
+def test_R3b_rolle_danach_in_versalien(t):
+    k = t.index("B-02")
+    frei, _ = _ent(t, [(k, k + 4, "LOCATION", "detektor")])
+    assert frei == {}, t

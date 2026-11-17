@@ -42,6 +42,10 @@ WEICHE_TYPEN = frozenset({"ORGANIZATION", "LOCATION"})
 _KENNUNG = re.compile(r"[A-Z]{1,4}-\d{1,4}")
 # Bauteilwort in Normalschreibung: Grossbuchstabe, dann nur Kleinbuchstaben (Umlaute, ß, Binnenbindestrich)
 _SUBSTANTIV = re.compile(r"[A-ZÄÖÜ][a-zäöüß]{3,}(?:-[A-ZÄÖÜa-zäöüß][a-zäöüß]+)*")
+# R3b (Root 17.11.): dieselben Fachwoerter auch in Versalien/klein ("PUMPE P-01", "pumpe P-01") - nur einheitliche
+# Schreibung je Wort, Vergleich danach normalisiert gegen DIESELBE positive Liste (keine breitere Freigabe).
+_VERSAL = re.compile(r"[A-ZÄÖÜẞ]{4,}(?:-[A-ZÄÖÜẞ]+)*")
+_KLEIN = re.compile(r"[a-zäöüß]{4,}(?:-[a-zäöüß]+)*")
 # Zeichen, die eine Kennung in eine groessere Einheit einbetten (Mail, URL, Pfad, Wortteil)
 _EINBETTUNG = set("@._/\\-:#&+=")
 
@@ -133,12 +137,14 @@ _FLEXION = ("", "e", "n", "en", "s", "es", "er", "ern")
 
 
 def _norm(w: str) -> str:
-    return (w.casefold().replace("ä", "ae").replace("ö", "oe").replace("ü", "ue").replace("ß", "ss"))
+    return (w.casefold().replace("ẞ", "ss").replace("ä", "ae").replace("ö", "oe").replace("ü", "ue").replace("ß", "ss"))
 
 
 def ist_bauteil(wort: str) -> bool:
     """Positive Fachliste (R3b): Kopf-Grundwort beliebig komponiert, sonst nur ganzes/definiertes Wort; Marker gehen vor."""
-    if not wort or not _SUBSTANTIV.fullmatch(wort) or ist_marker(wort):
+    if not wort or not (_SUBSTANTIV.fullmatch(wort) or _VERSAL.fullmatch(wort) or _KLEIN.fullmatch(wort)):
+        return False
+    if ist_marker(wort):
         return False
     n = _norm(wort)
     for c in {n.replace("-", ""), n.rsplit("-", 1)[-1]}:
@@ -334,7 +340,7 @@ def _rolle_an_stelle(text: str, ende: int) -> Optional[str]:
     zelle = trenner in (";", "|") or rest[:1] == "\t" or (trenner == "," and rest[:1] == "," and rest[1:2] not in (" ", ""))
     if zelle:
         return None
-    if re.fullmatch(r"[A-ZÄÖÜ][a-zäöüß][\wäöüß-]*", w) and not ist_bauteil(w):
+    if (re.fullmatch(r"[A-ZÄÖÜ][a-zäöüß][\wäöüß-]*", w) or _VERSAL.fullmatch(w)) and not ist_bauteil(w):
         return w
     return None
 
