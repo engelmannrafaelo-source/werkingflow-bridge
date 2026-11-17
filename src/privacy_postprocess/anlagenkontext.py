@@ -317,32 +317,81 @@ def _texte(text: str) -> List[Tuple[int, int]]:
 # als Apposition direkt NACH der Kennung, innerhalb derselben Zelle/Zeile: "B-02 ist unser Ansprechpartner",
 # "B-02, Bewohnerin", "B-02 (Kontakt)", "B-02: Herr ...". Ein Rollenwort anderswo im Satz oder in einer anderen
 # Tabellenzelle sperrt NICHT (Rafael 17.11.: "Die Pumpe P-03 hat Ole Fennimann eingebaut" -> P-03 frei, Name maskiert).
-_ROLLE_NACH = re.compile(
-    r"[ \t]*(?:,|;|\||\(|:|=|–|ist|war|sind|waren|als|heisst|heißt)[ \t]*"
-    r"(?:(?:der|die|das|den|dem|unser|unsere|unserem|unseren|unserer|ein|eine|einen|einem|ihr|ihre|sein|seine)[ \t]+)*"
-    r"([A-ZÄÖÜ][\wäöüß-]*)")
+# R3c (Review FINAL P-PRV-8): das ERSTE Wort nach der Kennung in derselben Zeile, nach BELIEBIGEM Trenner
+# ("B-02 - Herr", "B-02 / Familie", "B-02 [Mieterin]", "B-02 — Mieterin", "B-02 Mieterin"), in jeder einheitlichen
+# Schreibung. Uebersprungen werden nur Kopula und Artikel/Possessiva (geschlossene Wortklassen); Zelltrenner
+# (; | Tab, CSV-Komma ohne Leerzeichen) und Satzende (. ! ? + Leerraum) beenden die Pruefung.
+_KOPULA_ARTIKEL = frozenset("""ist war sind waren wird wurde bleibt als heisst heißt der die das den dem des ein eine
+einen einem einer unser unsere unserem unseren unserer ihr ihre ihrem ihren ihrer sein seine seinem seinen seiner
+""".split())
+# Funktionswoerter, die in Zeilen ohne Grossschreibung (bzw. ganz in Versalien) als erstes Wort NICHT sperren.
+_FUNKTIONSWORT = frozenset("""und oder sowie mit ohne im in am an auf aus bei fuer für von vom nach vor zu zum zur
+ueber über unter zwischen hinter neben ab bis durch gegen um ins
+""".split())
+_WORT = re.compile(r"[A-Za-zÄÖÜäöüßẞ]+(?:-[A-Za-zÄÖÜäöüßẞ]+)*")
+
+
+def _zeilenstil(zeile: str) -> str:
+    """'klein' (keine Grossbuchstaben ausser in Kennungen), 'versal' (keine Kleinbuchstaben) oder 'normal'."""
+    ohne = _KENNUNG_IM_TEXT.sub(" ", zeile)
+    if not any(c.isupper() for c in ohne):
+        return "klein"
+    if not any(c.islower() for c in ohne):
+        return "versal"
+    return "normal"
+
+
+_KENNUNG_IM_TEXT = re.compile(r"(?<![A-Za-z0-9])[A-Z]{1,4}-\d{1,4}(?![0-9])")
 
 
 def _rolle_an_stelle(text: str, ende: int) -> Optional[str]:
-    """Rollenbindung DERSELBEN Stelle nach der Kennung (R3b, Review R3 P-PRV-7: POSITIV gefasst): Apposition oder
-    Praedikat ("B-02, Bewohnerin ...", "B-02 ist Patient", "B-02 (Familie ...)") mit einem Substantiv, das kein
-    Bauteil der Fachliste ist, sperrt die Stelle; Marker sperren immer. Ausnahme: Zelltrenner (; | Tab, CSV-Komma
-    ohne Leerzeichen) - Tabellenzellen sind getrennte Daten (Rafael 17.11.); dort sperren nur Marker."""
+    """Rollenbindung DERSELBEN Stelle nach der Kennung (R3b P-PRV-7 positiv, R3c P-PRV-8 beliebiger Trenner): das
+    erste Wort nach der Kennung in derselben Zeile (Kopula/Artikel uebersprungen) sperrt, wenn es ein Marker ist oder
+    ein Substantiv, das kein Bauteil der Fachliste ist. Normal geschriebene Zeile: Substantiv = Grossschreibung
+    (kleines Wort = Verb/Praeposition/Adjektiv, sperrt nicht - Rafael: "P-03 hat Ole Fennimann eingebaut" frei).
+    Zeile ohne Grossschreibung bzw. ganz in Versalien: jedes Wort ausser Funktionswort/Bauteil sperrt (fail-closed).
+    Zelltrenner und Satzende beenden; folgt eine weitere Kennung (Aufzaehlung) oder eine Zahl, sperrt nichts."""
+    zs = text.rfind("\n", 0, ende) + 1
     ze = text.find("\n", ende)
-    rest = text[ende: ze if ze != -1 else len(text)]
-    m = _ROLLE_NACH.match(rest)
-    if not m:
-        return None
-    w = m.group(1)
-    if ist_marker(w):
+    ze = ze if ze != -1 else len(text)
+    rest = text[ende:ze]
+    stil = _zeilenstil(text[zs:ze])
+    i = 0
+    while True:
+        j = i
+        while j < len(rest) and not rest[j].isalnum():
+            j += 1
+        trenner = rest[i:j]
+        if j >= len(rest) or rest[j].isdigit():
+            return None
+        if i == 0:
+            t = trenner.strip()
+            if (t in (";", "|") or "\t" in trenner or (trenner[:1] == "," and len(trenner) == 1)):
+                return None  # Tabellenzelle: getrennte Daten (Rafael 17.11.)
+        if re.search(r"[.!?]\s", trenner):
+            return None  # Satzende
+        km = _KENNUNG_IM_TEXT.match(rest, j)
+        if km:
+            return None  # Aufzaehlung weiterer Kennungen
+        m = _WORT.match(rest, j)
+        if not m:
+            return None
+        w = m.group(0)
+        if w.casefold() in _KOPULA_ARTIKEL:
+            i = m.end()
+            continue
+        if ist_marker(w):
+            return w
+        if ist_bauteil(w):
+            return None
+        if stil == "normal":
+            gross = re.fullmatch(r"[A-ZÄÖÜ][a-zäöüß][\wäöüß-]*", w) or _VERSAL.fullmatch(w)
+            return w if gross else None
+        if w.casefold() in _FUNKTIONSWORT:
+            return None
+        if stil == "versal" and len(w) <= 3:
+            return None  # Einheiten/Abkuerzungen (DN, PN, KW)
         return w
-    trenner = rest[: m.start(1)].strip()
-    zelle = trenner in (";", "|") or rest[:1] == "\t" or (trenner == "," and rest[:1] == "," and rest[1:2] not in (" ", ""))
-    if zelle:
-        return None
-    if (re.fullmatch(r"[A-ZÄÖÜ][a-zäöüß][\wäöüß-]*", w) or _VERSAL.fullmatch(w)) and not ist_bauteil(w):
-        return w
-    return None
 
 
 _PRAEPOSITIONEN = frozenset({
@@ -408,10 +457,10 @@ def entscheide(text: str, kandidaten: List[Tuple[int, int, str, str]],
                 rolle = _rolle_an_stelle(text, en)
                 if art == "marker":
                     grund = "marker:" + wort
-                elif rolle:
-                    grund = "rolle-an-stelle:" + rolle
                 elif art == "keiner":
                     grund = "kein-lokaler-technischer-beleg"
+                elif rolle:
+                    grund = "rolle-an-stelle:" + rolle
                 else:
                     definiert = definiert or art == "definition"
                     urteile.append((st, en, nr, True, (art, wort)))
