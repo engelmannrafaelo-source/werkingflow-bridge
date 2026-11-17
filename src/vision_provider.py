@@ -77,6 +77,10 @@ class VisionResponse:
     provider_message_id: Optional[str] = None
     requested_model: Optional[str] = None
     usage_iterations: Optional[List[Dict[str, Any]]] = None
+    # S1: Inhaltsbloecke type "fallback" (Uebergabe zwischen Modellen) roh und
+    # ob der Aufruf den Anbieter-Fallback bestellt hat (mit seiner Kette).
+    fallback_blocks: Optional[List[Dict[str, Any]]] = None
+    fallback_kette: Optional[List[str]] = None
 
 
 class VisionProvider:
@@ -339,6 +343,7 @@ class VisionProvider:
         thinking: Optional[Dict[str, Any]] = None,
         output_config: Optional[Dict[str, Any]] = None,
         subscription_fallback: Optional[bool] = None,
+        fallback_kette: Optional[List[str]] = None,
     ) -> VisionResponse:
         """
         Analyze images using direct Anthropic API.
@@ -380,6 +385,14 @@ class VisionProvider:
             if os.getenv("ENERGY_STAGING_SUBSCRIPTION_FALLBACK"):
                 from src.providers import funding_policy as _fp
                 subscription_fallback = _fp.subscription_fallback_in_context()
+        if fallback_kette is not None and (subscription_fallback or not credit_pool.enabled()):
+            # S1: der Anbieter-Fallback wird nur ueber den Pool abgerechnet
+            # (Settlement je Modell). Nie still ohne Fallback weiter.
+            from src.providers.fallback_faehigkeit import FallbackNichtMoeglich
+            raise FallbackNichtMoeglich(
+                "fallback_not_enabled",
+                "abo_bildweg" if subscription_fallback else "pool_aus",
+            )
         if subscription_fallback:
             # Abo-Bildweg vor jedem anderen Zweig: kein Pool-Nachversuch, kein
             # bezahlter Schlüssel. Die Prüfung der Kennung wiederholt das Modul.
@@ -428,7 +441,12 @@ class VisionProvider:
             "max_tokens": max_tokens,
             "messages": anthropic_messages
         }
-        if model_supports_temperature(model):
+        if fallback_kette is not None:
+            # API-Version 2026-10-21 (Opt-in): temperature fuehrt zu 400
+            # (Beleg b0e0e525c4b0 Z. 127) — nie gesetzt; ein ausdruecklicher
+            # Aufruferwert wurde vorher laut abgewiesen (anthropic_direct).
+            pass
+        elif model_supports_temperature(model):
             request_body["temperature"] = temperature
         else:
             logger.info(
@@ -450,7 +468,22 @@ class VisionProvider:
         adapt_model_request(model, request_body)
 
         credit_meta = None
-        if credit_pool.enabled():
+        if fallback_kette is not None:
+            from src.providers import fallback_faehigkeit as _ff
+            request_body["fallbacks"] = _ff.MODUS
+            _ff.body_vorpruefen(request_body)
+            response, credit_meta = await credit_pool.post_messages(
+                request_body, timeout,
+                anthropic_version=_ff.API_VERSION_OPT_IN,
+                extra_headers={_ff.BETA_KOPF[0]: _ff.BETA_KOPF[1]},
+                kette={
+                    "fallback_models": list(fallback_kette),
+                    "kategorienliste_version": BERECHNETE_ABLEHNUNGSKATEGORIEN["version"],
+                    "vorpruefung_c4": True,
+                    "bewerter": lambda antwort: fallback_bewerten(antwort, model, fallback_kette),
+                },
+            )
+        elif credit_pool.enabled():
             response, credit_meta = await credit_pool.post_messages(request_body, timeout)
         else:
             async with httpx.AsyncClient(timeout=timeout) as client:
@@ -489,6 +522,7 @@ class VisionProvider:
         try:
             result = _vision_response_from(response.json(), model)
             result.credit_meta = credit_meta
+            result.fallback_kette = list(fallback_kette) if fallback_kette is not None else None
             result.provider_request_id = _request_id_aus(response)
             return result
         except UNREADABLE_RESPONSE_ERRORS as exc:
@@ -586,6 +620,10 @@ def _vision_response_from(data: Dict[str, Any], model: str) -> VisionResponse:
             [e for e in iterationen if isinstance(e, dict)]
             if isinstance(iterationen, list) else None
         ),
+        fallback_blocks=[
+            b for b in (data.get("content") or [])
+            if isinstance(b, dict) and b.get("type") == "fallback"
+        ] or None,
     )
 
 
@@ -805,8 +843,14 @@ def abschluss_felder(
     provider_message_id: Optional[str] = None,
     messung: Optional[UsageMessung] = None,
     usage_iterations: Optional[List[Dict[str, Any]]] = None,
+    fallback_kette: Optional[List[str]] = None,
+    fallback_blocks: Optional[List[Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
-    """x_bridge_finish einer Messages-API-Antwort (Schema S-1/S-2).
+    """x_bridge_finish einer Messages-API-Antwort (Schema S-1/S-2, S-6).
+
+    ``fallback_kette`` (nicht None) = der Aufruf hat den Anbieter-Fallback
+    bestellt; die Lage wird dann nach S-6 bestimmt (fallback_belegt,
+    sticky_belegt, kein_fallback, sonst abweichung_unbelegt).
 
     Baut auf lauf_abschluss.abschluss_aus_stop_reason(...).details() auf und
     UEBERSCHREIBT dessen vollstaendig ausdruecklich mit Regel V (Review B2):
@@ -845,6 +889,7 @@ def abschluss_felder(
 
     # Iterationen: jede gelieferte Position (K3), sonst ein Eintrag aus usage.
     kv = BERECHNETE_ABLEHNUNGSKATEGORIEN["version"]
+    blocks = [b for b in (fallback_blocks or []) if isinstance(b, dict)]
     roh_iter = [e for e in (usage_iterations or []) if isinstance(e, dict)]
     if roh_iter:
         quellen = [("iterations", e) for e in roh_iter]
@@ -863,13 +908,22 @@ def abschluss_felder(
         it_model = _str_oder_none(e.get("model"), "iterations.model") or responding_model
         tokens = _token_felder(e)
         abgelehnt = (i == letzte and refusal) or (i < letzte and e.get("type") == "message")
-        it_category = (
-            _str_oder_none(e.get("category"), "iterations.category") if "category" in e
-            else (category if i == letzte else None)
-        )
+        # Ausloesende Kategorie eines frueheren abgelehnten Versuchs: aus dem
+        # fallback-Block der Uebergabe i -> i+1 (Doku Z. 660), sonst unbekannt.
+        trigger = ((blocks[i] if i < len(blocks) else {}).get("trigger") or {}) if i < letzte else {}
+        if not isinstance(trigger, dict):
+            trigger = {}
+        if "category" in e:
+            it_category = _str_oder_none(e.get("category"), "iterations.category")
+        elif i == letzte:
+            it_category = category
+        else:
+            it_category = _str_oder_none(trigger.get("category"), "fallback.trigger.category")
         if abgelehnt:
             kategorie_bekannt = (
-                "category" in e or (i == letzte and details is not None and "category" in details)
+                "category" in e
+                or (i == letzte and details is not None and "category" in details)
+                or (i < letzte and "category" in trigger)
             )
             billed, regel = _billed_fuer_ablehnung(it_category, kategorie_bekannt=kategorie_bekannt)
         else:
@@ -916,26 +970,31 @@ def abschluss_felder(
     f["cost_schaetzung_eur"] = round(sum(schaetzungen), 6) if unbekannt and schaetzungen else None
     f["kategorienliste_version"] = kv
 
-    # Modellvergleich (B3): Alias/datierte ID gelten als gleich.
-    grund = None
-    if _modell_kanon(responding_model) != _modell_kanon(requested_model):
-        grund = "antwortmodell_ungleich_angefragt"
-    elif len(roh_iter) > 1:
-        grund = "iterationen_ohne_fallback"
-    f["modell_abweichung"] = grund is not None
+    lage, grund = _lage_bestimmen(
+        requested_model=requested_model, responding_model=responding_model,
+        roh_iter=roh_iter, blocks=blocks, fallback_kette=fallback_kette,
+    )
+    f["modell_abweichung"] = lage == "abweichung_unbelegt"
     f["modell_abweichung_grund"] = grund
     if grund:
         logger.error(
-            "Modellabweichung ohne Fallback-Bestellung: angefragt=%s geantwortet=%s iterationen=%d grund=%s",
-            requested_model, responding_model, len(roh_iter), grund,
+            "Modellabweichung: angefragt=%s geantwortet=%s iterationen=%d bestellt=%s grund=%s",
+            requested_model, responding_model, len(roh_iter), fallback_kette is not None, grund,
         )
     f["verwertbar"] = not refusal and grund is None
     f["retryable"] = False if refusal else None
-    f["fallback_angefordert"] = False
+    f["fallback_angefordert"] = fallback_kette is not None
+    erster, letzter_block = (blocks[0], blocks[-1]) if blocks else ({}, {})
     f["fallback"] = {
-        "lage": "abweichung_unbelegt" if grund else "kein_fallback",
-        "from": None, "to": None, "trigger": None,
+        "lage": lage,
+        "from": (erster.get("from") or {}).get("model") if blocks else None,
+        "to": (letzter_block.get("to") or {}).get("model") if blocks else None,
+        "trigger": (erster.get("trigger") if blocks else None),
+        "bloecke": blocks or None,
     }
+    f["antwort_iteration"] = None if refusal else len(iterations) - 1
+    if fallback_kette is not None:
+        f["fallback_kette"] = list(fallback_kette)
     f["bridge_worker"] = _bridge_worker()
     f["build_sha"] = _build_sha()
     if refusal:
@@ -1024,6 +1083,87 @@ def ablehnung_ohne_marke(finish: Dict[str, Any]) -> Any:
     return BridgeError(antwort)
 
 
+def _lage_bestimmen(
+    *, requested_model: Optional[str], responding_model: Optional[str],
+    roh_iter: List[Dict[str, Any]], blocks: List[Dict[str, Any]],
+    fallback_kette: Optional[List[str]],
+) -> Tuple[str, Optional[str]]:
+    """(lage, grund) nach Schema S-6 (Doku Z. 652, 660, 712, 714, 762-773).
+    grund ist None ausser bei abweichung_unbelegt. Alias und datierte ID sind
+    gleich (B3). Eine Ablehnung wird NICHT hier, sondern ueber stop_reason
+    erkannt."""
+    angefragt = _modell_kanon(requested_model)
+    geantwortet = _modell_kanon(responding_model)
+    if fallback_kette is None:
+        if geantwortet != angefragt:
+            return "abweichung_unbelegt", "antwortmodell_ungleich_angefragt"
+        if len(roh_iter) > 1 or blocks:
+            return "abweichung_unbelegt", "iterationen_ohne_fallback"
+        return "kein_fallback", None
+    kette = {_modell_kanon(m) for m in fallback_kette}
+    if len(roh_iter) > 1 + len(fallback_kette):
+        return "abweichung_unbelegt", f"versuche_ueber_kette:{len(roh_iter)}>{1 + len(fallback_kette)}"
+    typen = [e.get("type") for e in roh_iter]
+    modelle = [_modell_kanon(e.get("model")) for e in roh_iter]
+    if not blocks:
+        if geantwortet == angefragt and (not roh_iter or (typen == ["message"] and modelle == [angefragt])):
+            return "kein_fallback", None
+        if (typen == ["fallback_message"] and modelle == [geantwortet]
+                and geantwortet != angefragt and geantwortet in kette):
+            return "sticky_belegt", None
+        return "abweichung_unbelegt", "ohne_block_nicht_belegt"
+    # Mit Block: Kette message(angefragt) ... fallback_message(geantwortet).
+    if not roh_iter:
+        return "abweichung_unbelegt", "block_ohne_iterations"
+    if len(blocks) != len(roh_iter) - 1:
+        return "abweichung_unbelegt", "bloecke_passen_nicht_zu_iterations"
+    if typen[0] != "message" or modelle[0] != angefragt:
+        return "abweichung_unbelegt", "erster_versuch_nicht_angefragt"
+    if any(t != "fallback_message" for t in typen[1:]):
+        return "abweichung_unbelegt", "folgeversuch_kein_fallback_message"
+    if modelle[-1] != geantwortet:
+        return "abweichung_unbelegt", "letzter_versuch_nicht_antwortmodell"
+    if any(m not in kette for m in modelle[1:]):
+        return "abweichung_unbelegt", "zielmodell_ausserhalb_kette"
+    for k, b in enumerate(blocks):
+        von = _modell_kanon((b.get("from") or {}).get("model"))
+        nach = _modell_kanon((b.get("to") or {}).get("model"))
+        if von != modelle[k] or nach != modelle[k + 1]:
+            return "abweichung_unbelegt", f"block_{k}_widerspricht_iterations"
+    return "fallback_belegt", None
+
+
+def fallback_bewerten(antwort: Dict[str, Any], requested_model: str, fallback_kette: List[str]) -> Dict[str, Any]:
+    """Bewerter fuer den Pool (credit_pool.post_messages ``kette["bewerter"]``):
+    die rohe 200-Antwort -> {iterations, lage, antwort_iteration}. billed je
+    Iteration nach derselben Regel wie x_bridge_finish; der Pool leitet nichts
+    selbst ab. Tokenfelder sind int (nie None)."""
+    vr = _vision_response_from(antwort, requested_model)
+    f = abschluss_felder(
+        content=vr.content, stop_reason=vr.stop_reason, stop_details=vr.stop_details,
+        requested_model=requested_model, responding_model=vr.model, messung=vr.messung,
+        usage_iterations=vr.usage_iterations, fallback_kette=fallback_kette,
+        fallback_blocks=vr.fallback_blocks,
+    )
+    # Genau die Felder des Pool-Vertrags (credit_pool_routes ITER_PFLICHT =
+    # ITER_ERLAUBT seit 978bb4f): weitere Schemafelder wuerden abgewiesen.
+    pool_felder = ("type", "model", "input_tokens", "output_tokens", "cache_read_input_tokens",
+                   "cache_creation_input_tokens", "billed")
+    iterations = []
+    for it in f["iterations"]:
+        for feld in ("input_tokens", "output_tokens", "cache_read_input_tokens", "cache_creation_input_tokens"):
+            if type(it.get(feld)) is not int:
+                # Unvollstaendige Messung: kein erfundener Wert -> Pool haelt
+                # die Reservierung (Bewertung scheitert laut).
+                raise ValueError(f"iteration {it.get('index')}: {feld} fehlt")
+        iterations.append({k: it[k] for k in pool_felder})
+    return {
+        "iterations": iterations,
+        "lage": f["fallback"]["lage"],
+        "antwort_iteration": f["antwort_iteration"],
+    }
+
+
 def ledger_felder(finish: Dict[str, Any]) -> Dict[str, Any]:
     """provider_metadata-Felder einer Antwort fuer das Ledger. Wirft nie: die
     Buchung eines bezahlten Aufrufs darf an der Auswertung nicht scheitern
@@ -1065,6 +1205,24 @@ def _ledger_felder(finish: Dict[str, Any]) -> Dict[str, Any]:
     if finish.get("auswertung_fehler"):
         # B3 (Codepruefung R2): der Notabschluss ist in der Ledger-Zeile sichtbar.
         meta["auswertung_fehler"] = finish["auswertung_fehler"]
+    if finish.get("fallback_angefordert"):
+        its = finish.get("iterations") or []
+        meta["fallback_lage"] = (finish.get("fallback") or {}).get("lage")
+        meta["responding_model"] = finish.get("responding_model")
+        meta["iterations"] = [
+            {k: it.get(k) for k in ("index", "type", "model", "input_tokens", "output_tokens",
+                                    "cache_read_input_tokens", "cache_creation_input_tokens",
+                                    "billed", "cost_eur", "category")}
+            for it in its
+        ]
+        from src.pricing import price_entry
+        preise = {repr(price_entry(it.get("model"))) for it in its if it.get("billed") in (True, "unbekannt")}
+        if len(preise) > 1:
+            # Eine Zeile kann Versuche mit verschiedenen Saetzen nicht genau
+            # abbilden: laut markieren, Betrag je Versuch steht in iterations.
+            meta["ledger_preis_je_modell_abweichend"] = True
+            logger.error("Fallback-Ledger: Versuche mit verschiedenen Preisen in einer Zeile (%s)",
+                         [it.get("model") for it in its])
     if finish.get("refusal"):
         sd = finish.get("stop_details") or {}
         meta["stop_details"] = {

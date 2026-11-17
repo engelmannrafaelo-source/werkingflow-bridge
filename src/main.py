@@ -2841,6 +2841,15 @@ async def chat_completions(
     from fastapi.responses import JSONResponse
     from src import chat_weiterleitung as _cw
 
+    if request_body.provider_fallback is not None:
+        # S1: Anbieter-Fallback nur nicht streamend und ohne Bild (Pool-Weg,
+        # Direktweg). Frueh und laut statt still ohne Fallback.
+        from src.providers.fallback_faehigkeit import FallbackNichtMoeglich
+        if request_body.stream:
+            raise FallbackNichtMoeglich("fallback_nicht_verfuegbar_pfad", "stream")
+        if any(hasattr(m, "has_images") and m.has_images() for m in request_body.messages):
+            raise FallbackNichtMoeglich("fallback_nicht_verfuegbar_pfad", "bild")
+
     try:
         bis = _cw.frist_bis(request)  # anchored at the call's arrival on this worker
     except _cw.UngueltigeFrist as exc:
@@ -3665,6 +3674,17 @@ async def _chat_completions_lauf(
             from src.jobs.selbstaufruf import ledger_provider_merken
             ledger_provider_merken(request, ledger_provider_for_backend(backend_config.backend))
 
+        # S1 Anbieter-Fallback: nur auf dem Direktweg. Jeder andere Weg wuerde
+        # die Bestellung still uebergehen -> lauter 400 (Schema S-5).
+        if getattr(request_body, "provider_fallback", None) is not None and not (
+            backend_config and backend_config.backend == BackendType.ANTHROPIC_DIRECT
+        ):
+            from src.providers.fallback_faehigkeit import FallbackNichtMoeglich
+            raise FallbackNichtMoeglich(
+                "fallback_nicht_verfuegbar_pfad",
+                f"backend:{backend_config.backend.value if backend_config else None}",
+            )
+
         _gemini_vision_wanted = _gemini_vision_lane or _client_asked_for_gemini_vision
         _resolves_to_gemini = bool(
             backend_config and backend_config.backend == BackendType.GEMINI_API
@@ -4163,6 +4183,7 @@ async def _chat_completions_lauf(
                 error_message: Optional[str] = None,
                 cache_read_tokens: int = 0, cache_creation_tokens: int = 0,
                 abschluss_meta: Optional[Dict[str, Any]] = None,
+                ledger_model: Optional[str] = None,
             ) -> None:
                 if status != "success":
                     request.state.ai_call_error_persisted = True
@@ -4172,7 +4193,7 @@ async def _chat_completions_lauf(
                     user_id=direct_attribution.get("user_id"),
                     agent_id=direct_attribution.get("agent_id"),
                     workflow_id=direct_attribution.get("workflow_id"),
-                    model=backend_config.provider_model or resolved_model,
+                    model=ledger_model or backend_config.provider_model or resolved_model,
                     input_tokens=input_tokens,
                     output_tokens=output_tokens,
                     cache_read_tokens=cache_read_tokens,
@@ -4222,14 +4243,33 @@ async def _chat_completions_lauf(
                 ablehnung_ohne_marke, ablehnungs_kopf, ablehnungsmarke_angekuendigt, ledger_felder,
             )
             _direct_finish = response_data.get("x_bridge_finish") or {}
+            # A3: ungecacht + Cache getrennt (vision_provider._usage_mit_cache),
+            # gleiche Grundlage wie x_bridge_finish.iterations.
+            _ledger_tokens = {
+                "input_tokens": usage.get("uncached_input_tokens", usage.get("prompt_tokens", 0)) or 0,
+                "output_tokens": usage.get("completion_tokens", 0) or 0,
+                "cache_read_tokens": usage.get("cache_read_tokens", 0) or 0,
+                "cache_creation_tokens": usage.get("cache_creation_tokens", 0) or 0,
+            }
+            _ledger_model = None
+            if _direct_finish.get("fallback_angefordert") and len(_direct_finish.get("iterations") or []) > 1:
+                # S1: Top-Level-usage beschreibt nur den liefernden Versuch
+                # (Doku Z. 758). Eine Ledger-Zeile traegt die Summe aller
+                # berechneten oder unbelegten Versuche zum Modell, das die
+                # Antwort lieferte; die Aufteilung je Versuch steht in
+                # provider_metadata.iterations (Zeilen je Iteration: Entwurf).
+                _its = [i for i in _direct_finish["iterations"] if i.get("billed") in (True, "unbekannt")]
+                _ledger_tokens = {
+                    "input_tokens": sum(i.get("input_tokens") or 0 for i in _its),
+                    "output_tokens": sum(i.get("output_tokens") or 0 for i in _its),
+                    "cache_read_tokens": sum(i.get("cache_read_input_tokens") or 0 for i in _its),
+                    "cache_creation_tokens": sum(i.get("cache_creation_input_tokens") or 0 for i in _its),
+                }
+                _ledger_model = _direct_finish.get("responding_model")
             await _persist_direct_usage(
                 abschluss_meta=ledger_felder(_direct_finish),
-                # A3: ungecacht + Cache getrennt (vision_provider._usage_mit_cache),
-                # gleiche Grundlage wie x_bridge_finish.iterations.
-                input_tokens=usage.get("uncached_input_tokens", usage.get("prompt_tokens", 0)) or 0,
-                output_tokens=usage.get("completion_tokens", 0) or 0,
-                cache_read_tokens=usage.get("cache_read_tokens", 0) or 0,
-                cache_creation_tokens=usage.get("cache_creation_tokens", 0) or 0,
+                ledger_model=_ledger_model,
+                **_ledger_tokens,
                 status="success",
                 duration_ms=int(duration * 1000),
             )
@@ -9409,6 +9449,15 @@ async def health_check(request: Request):
     # unreadable source = smoke "unbekannt", never "proven".
     from src.deploy_proof import read_deploy_proof
     result["deploy"] = read_deploy_proof()
+    # S1 (Owner 51c8185c): Faehigkeit des Anbieter-Fallbacks, abgeleitet
+    # (src/providers/fallback_faehigkeit.py). Liest die Ketten nur, wenn Pool
+    # und Ketten-Settlement da sind; sonst kein Aussenkontakt.
+    try:
+        from src.providers.fallback_faehigkeit import faehigkeit as _fallback_faehigkeit
+        result["provider_fallback"] = await _fallback_faehigkeit()
+    except Exception as e:  # noqa: BLE001 — health must answer; reported, not hidden
+        logger.error("health: provider_fallback nicht bestimmbar: %s: %s", type(e).__name__, e)
+        result["provider_fallback"] = {"enabled": False, "grund": f"fehler:{type(e).__name__}"}
 
     # ADR-0012: which job store this worker writes to — the marker it stamps
     # into every job_id, and the one the load balancer routes polls by. Exposed

@@ -207,6 +207,19 @@ class ChatCompletionRequest(BaseModel):
             "Without it a refusal is HTTP 422 fehler_code modell_abbruch, not retryable."
         ),
     )
+    # S1 (Bridge-Owner 51c8185c, Schema S-5): Anbieter-Fallback je Aufruf
+    # bestellen. Nur "default", nur Direktweg (claude-direct-notools), nicht
+    # streamend, ohne Bild; alles andere ist ein lauter 400. Vorher wurde das
+    # Feld wegen extra="ignore" still verworfen.
+    provider_fallback: Optional[str] = Field(
+        default=None,
+        description=(
+            "Order the provider's server-side fallback for this call: only 'default'. "
+            "Direct tier only; see GET /health provider_fallback for availability. "
+            "Every attempt is reported in x_bridge_finish.iterations; a fallback answer "
+            "is never presented as a normal one."
+        ),
+    )
 
     # Backend selection for multi-provider support
     backend: Optional[BackendType] = Field(

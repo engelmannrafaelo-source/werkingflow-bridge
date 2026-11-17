@@ -86,7 +86,27 @@ async def call_anthropic_direct(
             DEFAULT_MAX_TOKENS,
         )
 
+    # S1: Anbieter-Fallback nur auf ausdrueckliche Bestellung je Aufruf.
+    # Jede Unvertraeglichkeit ist ein lauter 4xx (fallback_faehigkeit), nie
+    # ein stiller Aufruf ohne Fallback.
+    fallback_kette = None
+    bestellung = getattr(request, "provider_fallback", None)
+    if bestellung is not None:
+        from src.providers import fallback_faehigkeit as _ff
+        if bestellung != _ff.MODUS:
+            raise _ff.FallbackNichtMoeglich("provider_fallback_wert_unzulaessig", repr(bestellung))
+        if getattr(request, "stream", False):
+            raise _ff.FallbackNichtMoeglich("fallback_nicht_verfuegbar_pfad", "stream")
+        gesetzt = getattr(request, "model_fields_set", set()) or set()
+        ausdruecklich = sorted(f for f in ("temperature", "top_p") if f in gesetzt)
+        if ausdruecklich:
+            # API-Version 2026-10-21: 400 auch beim Standardwert (Beleg
+            # b0e0e525c4b0 Z. 127). Nie still verwerfen.
+            raise _ff.FallbackNichtMoeglich("fallback_body_unvertraeglich", f"ausdruecklich gesetzt: {ausdruecklich}")
+        fallback_kette = await _ff.bestellung_pruefen(config.provider_model or request.model)
+
     result = await route_to_vision(
+        **({"fallback_kette": fallback_kette} if fallback_kette is not None else {}),
         messages=messages,
         model=config.provider_model or request.model,
         max_tokens=request.max_tokens or DEFAULT_MAX_TOKENS,
@@ -111,6 +131,8 @@ async def call_anthropic_direct(
         provider_message_id=getattr(result, "provider_message_id", None),
         messung=getattr(result, "messung", None),
         usage_iterations=getattr(result, "usage_iterations", None),
+        fallback_kette=fallback_kette,
+        fallback_blocks=getattr(result, "fallback_blocks", None),
     )
 
     return {
