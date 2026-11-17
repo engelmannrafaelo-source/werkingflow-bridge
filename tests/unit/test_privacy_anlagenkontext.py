@@ -87,11 +87,13 @@ def test_A3_company_same_shape():
 def test_A4_global_placeholder_collision_per_span():
     t = "Die Firma KV-01 betreut das Projekt. Der Kaltwasserverteiler KV-01 versorgt den Umluftkühler UK-01."
     r = lauf(t, [("KV-01", "ORGANIZATION"), ("UK-01", "ORGANIZATION")])
-    # Firmenstelle bleibt maskiert; die Bauteilstelle wird je Fundstelle wieder nachgezogen (mehrdeutig -> maskiert)
+    # Firmenstelle -> der Wert ist im Dokument mehrdeutig -> JEDE Stelle bleibt maskiert (keine Teilfreigabe)
     assert "Firma KV-01" not in r["smart_anonymized_text"]
-    assert maskiert(r, "KV-01")
+    assert maskiert(r, "KV-01") and "Kaltwasserverteiler KV-01" not in r["smart_anonymized_text"]
     assert klar(r, "UK-01")
-    assert r["postprocessing"]["anlagenkontext"]["wieder_maskiert"] == 1
+    a = r["postprocessing"]["anlagenkontext"]
+    assert {"wert": "KV-01", "stellen": 2, "grund": "mehrdeutig-marker:Firma"} in a["nicht_herabgestuft"]
+    assert a["wieder_maskiert"] == 0
 
 
 def test_A5_contact_context():
@@ -301,24 +303,36 @@ def test_V6_flag_aus_auch_mit_principal(umgebung, monkeypatch):
     assert _v(_req()) is False
 
 
-# ── Bedingungen einzeln (schliessen Mutanten M1/M4/M16) ─────────────────────
+# ── Bedingungen einzeln: entscheide() (Dokumentweite Definition/Referenz, Runde 1 nach Replay 7K3Q) ──
 
 T_OK = "Der Kaltwasserverteiler KV-01 ist neu."
 S_OK = (T_OK.index("KV-01"), T_OK.index("KV-01") + 5)
 
 
-def test_pruefe_positiv_referenz():
-    assert ak.pruefe(T_OK, *S_OK, "ORGANIZATION", "detektor", [], []) == "Kaltwasserverteiler"
+def _ent(text, kandidaten, hart=(), alle=None):
+    return ak.entscheide(text, list(kandidaten), list(hart), list(alle if alle is not None else
+                                                                  [(k[0], k[1]) for k in kandidaten]))
+
+
+def test_entscheide_positiv_referenz():
+    frei, ab = _ent(T_OK, [(*S_OK, "ORGANIZATION", "detektor")])
+    assert frei == {S_OK: "Kaltwasserverteiler"} and ab == []
 
 
 @pytest.mark.parametrize("quelle", ["regel:strasse", "bekannt", "nachzug", ""])
-def test_pruefe_nur_detektor(quelle):
-    assert ak.pruefe(T_OK, *S_OK, "ORGANIZATION", quelle, [], []) is None
+def test_entscheide_nur_detektor(quelle):
+    frei, ab = _ent(T_OK, [(*S_OK, "ORGANIZATION", quelle)])
+    assert frei == {} and ab[0]["grund"] == "harter-oder-anderer-typ"
 
 
-def test_pruefe_harte_ueberlappung():
-    assert ak.pruefe(T_OK, *S_OK, "ORGANIZATION", "detektor", [(S_OK[0] - 3, S_OK[1])], []) is None
-    assert ak.pruefe(T_OK, *S_OK, "ORGANIZATION", "detektor", [(S_OK[0] + 1, S_OK[0] + 2)], []) is None
+def test_entscheide_harte_ueberlappung_und_anhaengen():
+    frei, ab = _ent(T_OK, [(*S_OK, "ORGANIZATION", "detektor")], hart=[(S_OK[0] - 3, S_OK[1])])
+    assert frei == {} and ab[0]["grund"] == "an-harter-pii"
+    t = "Herr Bernd Quastenberg (KV-01) prüft den Kaltwasserverteiler KV-01."
+    p = t.index("Bernd"); k1 = t.index("KV-01"); k2 = t.rindex("KV-01")
+    frei, ab = _ent(t, [(k1, k1 + 5, "ORGANIZATION", "detektor"), (k2, k2 + 5, "ORGANIZATION", "detektor")],
+                    hart=[(p, p + len("Bernd Quastenberg"))])
+    assert frei == {} and ab[0]["grund"] == "an-harter-pii"
 
 
 @pytest.mark.parametrize("text", [
@@ -330,13 +344,65 @@ def test_pruefe_harte_ueberlappung():
     "Der Kaltwasserverteiler KV-01_alt ist neu.",
     "Der Kaltwasserverteiler #KV-01 ist neu.",
 ])
-def test_pruefe_einbettung(text):
+def test_entscheide_einbettung(text):
     s = text.index("KV-01")
-    assert ak.pruefe(text, s, s + 5, "ORGANIZATION", "detektor", [], []) is None
+    frei, ab = _ent(text, [(s, s + 5, "ORGANIZATION", "detektor")])
+    assert frei == {}
 
 
 @pytest.mark.parametrize("text", ["Der Schluckbrunnen B-02.", "Der Schluckbrunnen B-02, gebohrt.",
                                   "Der Schluckbrunnen B-02: gebohrt.", "(Der Schluckbrunnen B-02)"])
-def test_pruefe_satzzeichen_erlaubt(text):
+def test_entscheide_satzzeichen_erlaubt(text):
     s = text.index("B-02")
-    assert ak.pruefe(text, s, s + 4, "LOCATION", "detektor", [], []) == "Schluckbrunnen"
+    frei, _ = _ent(text, [(s, s + 4, "LOCATION", "detektor")])
+    assert frei == {(s, s + 4): "Schluckbrunnen"}
+
+
+def test_entscheide_tabellendefinition_und_referenzen():
+    t = ("KV-01;Kaltwasserverteiler;Verteilung;DN 100;\n"
+         "Der Pufferspeicher liegt zwischen KV-01 und WT-01.\n| KV-01 | Verteiler |")
+    ks = [(m, m + 5, "ORGANIZATION", "detektor") for m in [i for i in range(len(t)) if t.startswith("KV-01", i)]]
+    frei, ab = _ent(t, ks)
+    assert len(frei) == 3 and set(frei.values()) == {"Kaltwasserverteiler"} and ab == []
+
+
+def test_entscheide_nur_referenzen_ohne_definition():
+    t = "Der Pufferspeicher liegt zwischen KV-01 und WT-01. Siehe auch KV-01."
+    ks = [(i, i + 5, "ORGANIZATION", "detektor") for i in range(len(t)) if t.startswith("KV-01", i)]
+    frei, ab = _ent(t, ks)
+    assert frei == {} and ab[0]["grund"] == "keine-definition-im-dokument"
+
+
+def test_entscheide_tabellenzelle_marker():
+    t = "KV-01;Firma;Wartung;\nDer Kaltwasserverteiler KV-01 ist neu."
+    ks = [(i, i + 5, "ORGANIZATION", "detektor") for i in range(len(t)) if t.startswith("KV-01", i)]
+    frei, ab = _ent(t, ks)
+    assert frei == {} and ab[0]["grund"] == "mehrdeutig-marker:Firma"
+
+
+def test_entscheide_gemischter_typ_einer_stelle():
+    t = "Der Kaltwasserverteiler KV-01 ist neu. Herr KV-01 prüft."
+    k1 = t.index("KV-01"); k2 = t.rindex("KV-01")
+    frei, ab = _ent(t, [(k1, k1 + 5, "ORGANIZATION", "detektor"), (k2, k2 + 5, "PERSON", "detektor")])
+    assert frei == {}
+
+
+def test_entscheide_bauteilwort_ist_weiche_fundstelle():
+    t = "Der Brunnen Kleinmariazell KV-01 ist neu."
+    k = t.index("KV-01"); o = t.index("Kleinmariazell")
+    frei, ab = _ent(t, [(k, k + 5, "ORGANIZATION", "detektor"), (o, o + 14, "LOCATION", "detektor")])
+    assert frei == {} and ab[0]["grund"] == "keine-definition-im-dokument"
+
+
+def test_entscheide_harte_pii_direkt_danach():
+    t = "Der Kaltwasserverteiler KV-01 (Bernd Quastenberg) ist neu."
+    k = t.index("KV-01"); p = t.index("Bernd")
+    frei, ab = _ent(t, [(k, k + 5, "ORGANIZATION", "detektor")], hart=[(p, p + 17)])
+    assert frei == {} and ab[0]["grund"] == "an-harter-pii"
+
+
+def test_entscheide_nur_kennungswerte_im_bericht():
+    t = "Herr Bernd Quastenberg prüft den Kaltwasserverteiler KV-01."
+    p = t.index("Bernd"); k = t.index("KV-01")
+    frei, ab = _ent(t, [(p, p + 17, "PERSON", "detektor"), (k, k + 5, "ORGANIZATION", "detektor")], hart=[(p, p + 17)])
+    assert ab == [] and list(frei.values()) == ["Kaltwasserverteiler"]

@@ -13,13 +13,15 @@ eine Detektor-Fundstelle wird an GENAU DIESER Stelle nicht maskiert, wenn ALLE B
      Entitaeten werden nie angefasst);
   3. Kennungsform: 1–4 Grossbuchstaben, Bindestrich, 1–4 Ziffern, frei stehend (nicht Teil von
      Mail, URL, Pfad oder einem laengeren Wort);
-  4. Bauteilbezug syntaktisch gebunden: das Wort UNMITTELBAR davor (gleiche Zeile, nur Leerraum
-     dazwischen) ist ein Substantiv in Normalschreibung, das selbst keine Fundstelle ist und kein
-     Rollen-, Personen- oder Organisationsmarker (Firma, Herr, Kontaktperson, ...);
-  5. keine Ueberlappung mit einer harten Fundstelle.
-Sonst bleibt die Maskierung (fail-closed). Die Entscheidung gilt je Fundstelle: wird derselbe Wert
-an anderer Stelle maskiert (z. B. "Die Firma KV-01"), zieht ``_gleiche_werte_nachziehen`` ihn auch
-hier wieder nach — nie eine globale Wiederherstellung.
+  4. Bauteilbezug: das Dokument DEFINIERT die Kennung als Bauteil — Substantiv unmittelbar davor
+     ("Kaltwasserverteiler KV-01") oder als naechste Tabellenzelle ("KV-01;Kaltwasserverteiler;...") —
+     und KEINE Stelle desselben Werts traegt einen Rollen-/Organisations-/Ortsmarker ("Firma KV-01",
+     "Kontaktperson B-02"); dann gelten auch die Verweise im selben Dokument ("zwischen KV-01 und WT-01")
+     als Bauteil (Replay 7K3Q, Runde 1: technische Texte definieren einmal und verweisen dann);
+  5. keine Stelle des Werts ueberlappt harte PII oder haengt unmittelbar an ihr ("Quastenberg (KV-01)").
+Sonst bleibt JEDE Stelle des Werts maskiert (fail-closed, mehrdeutig = maskiert). Entschieden wird je
+Wert innerhalb DIESES Dokuments, angewandt je Fundstelle — keine Wertliste, keine dokumentuebergreifende
+Wiederherstellung.
 """
 
 from __future__ import annotations
@@ -101,22 +103,114 @@ def _ueberlappt(a: int, b: int, bereiche: Iterable[Tuple[int, int]]) -> bool:
     return any(a < e and s < b for s, e in bereiche)
 
 
-def pruefe(text: str, start: int, ende: int, typ: str, quelle: str,
-           harte_bereiche: List[Tuple[int, int]], alle_bereiche: List[Tuple[int, int]]) -> Optional[str]:
-    """Bauteilwort, wenn diese Fundstelle herabgestuft werden darf; sonst None (= maskieren)."""
-    if quelle != "detektor" or typ not in WEICHE_TYPEN:
+def _ist_zelle(text: str, start: int, ende: int) -> bool:
+    """Steht die Kennung als eigene Tabellenzelle (CSV ; , Tab, Markdown |)?"""
+    zs = text.rfind("\n", 0, start) + 1
+    vor = text[zs:start].rstrip(" \t")
+    if vor and vor[-1] not in ";,|\t":
+        return False
+    nach = text[ende:ende + 2].lstrip(" ")
+    return bool(nach) and nach[0] in ";,|\t"
+
+
+def _zellen_nachbar(text: str, ende: int) -> Optional[str]:
+    """Erstes Wort der NAECHSTEN Zelle derselben Zeile (Tabellen-Definition 'KV-01;Kaltwasserverteiler;...')."""
+    i = ende
+    while i < len(text) and text[i] == " ":
+        i += 1
+    if i >= len(text) or text[i] not in ";,|\t":
         return None
-    if not kennungsform(text, start, ende):
-        return None
-    if _ueberlappt(start, ende, harte_bereiche):
-        return None
+    i += 1
+    while i < len(text) and text[i] in " \t":
+        i += 1
+    j = i
+    while j < len(text) and (text[j].isalpha() or text[j] == "-"):
+        j += 1
+    return text[i:j] or None
+
+
+def _bindung(text: str, start: int, ende: int, alle_bereiche: List[Tuple[int, int]]) -> Tuple[str, Optional[str]]:
+    """Art der syntaktischen Bindung dieser Kennungsstelle:
+    ("marker", wort)     Rollen-/Organisations-/Ortsmarker unmittelbar davor ("Firma KV-01", "Kontaktperson B-02");
+    ("definition", wort) Bauteil-Substantiv unmittelbar davor ("Kaltwasserverteiler KV-01") oder als naechste
+                         Tabellenzelle ("KV-01;Kaltwasserverteiler;...") — das Dokument erklaert die Kennung;
+    ("referenz", None)   sonst (Verweis auf eine anderswo definierte Kennung: "zwischen KV-01 und", "auf KV-01").
+    Ein Wort, das selbst Fundstelle ist, zaehlt nicht als Bauteilwort."""
     wort = bauteilwort(text, start)
-    if wort is None or not _SUBSTANTIV.fullmatch(wort) or ist_marker(wort):
-        return None
-    w_ende = len(text[:start].rstrip(" \t"))
-    if _ueberlappt(w_ende - len(wort), w_ende, alle_bereiche):
-        return None  # das Bauteilwort ist selbst eine Fundstelle (z. B. als Person erkannt)
-    return wort
+    if wort:
+        if ist_marker(wort):
+            return "marker", wort
+        w_ende = len(text[:start].rstrip(" \t"))
+        if _SUBSTANTIV.fullmatch(wort) and not _ueberlappt(w_ende - len(wort), w_ende, alle_bereiche):
+            return "definition", wort
+    if _ist_zelle(text, start, ende):
+        z = _zellen_nachbar(text, ende)
+        if z and ist_marker(z):
+            return "marker", z
+        if z and _SUBSTANTIV.fullmatch(z):
+            return "definition", z
+    return "referenz", None
+
+
+def _haengt_an_harter_pii(start: int, ende: int, text: str, harte_bereiche: List[Tuple[int, int]]) -> bool:
+    """Harte Fundstelle ueberlappt oder grenzt an (nur Leerraum/Klammer/Komma dazwischen): 'Quastenberg (KV-01)'."""
+    if _ueberlappt(start, ende, harte_bereiche):
+        return True
+    for s, e in harte_bereiche:
+        if e <= start and text[e:start].strip(" \t(),;:") == "":
+            return True
+        if ende <= s and text[ende:s].strip(" \t(),;:") == "":
+            return True
+    return False
+
+
+def entscheide(text: str, kandidaten: List[Tuple[int, int, str, str]],
+               harte_bereiche: List[Tuple[int, int]], alle_bereiche: List[Tuple[int, int]]) -> Tuple[dict, list]:
+    """Dokumentweite Entscheidung je WERT, angewandt je Fundstelle.
+
+    kandidaten: (start, ende, typ, quelle) aller Detektor-Fundstellen.
+    Ein Wert gilt als Anlagenkennung dieses Dokuments, wenn
+      - JEDE seiner Fundstellen Detektor ORG/LOC in Kennungsform ist, nicht an harter PII haengt,
+      - mindestens EINE Fundstelle eine Definition ist (das Dokument erklaert die Kennung als Bauteil),
+      - KEINE Fundstelle einen Rollen-/Organisations-/Ortsmarker traegt (sonst mehrdeutig -> alles maskiert).
+    Dann werden seine Fundstellen herabgestuft (Definition und Referenzen). Sonst bleibt jede maskiert.
+    Rueckgabe: ({(start, ende): beleg}, [nicht herabgestufte Werte mit Grund]) — beides geht ins Ergebnis."""
+    nach_wert: dict = {}
+    for st, en, typ, quelle in kandidaten:
+        nach_wert.setdefault(text[st:en], []).append((st, en, typ, quelle))
+    frei: dict = {}
+    abgelehnt: list = []
+    for wert, stellen in nach_wert.items():
+        if not _KENNUNG.fullmatch(wert):
+            continue
+        grund = None
+        defs, marker = [], []
+        for st, en, typ, quelle in stellen:
+            if quelle != "detektor" or typ not in WEICHE_TYPEN:
+                grund = grund or "harter-oder-anderer-typ"
+                continue
+            if not kennungsform(text, st, en):
+                grund = grund or "eingebettet"
+                continue
+            if _haengt_an_harter_pii(st, en, text, harte_bereiche):
+                grund = grund or "an-harter-pii"
+                continue
+            art, wort = _bindung(text, st, en, alle_bereiche)
+            if art == "marker":
+                marker.append(wort)
+            elif art == "definition":
+                defs.append(wort)
+        if grund is None and marker:
+            grund = "mehrdeutig-marker:" + marker[0]
+        if grund is None and not defs:
+            grund = "keine-definition-im-dokument"
+        if grund:
+            abgelehnt.append({"wert": wert, "stellen": len(stellen), "grund": grund})
+            continue
+        beleg = defs[0]
+        for st, en, _, _ in stellen:
+            frei[(st, en)] = beleg
+    return frei, abgelehnt
 
 
 def flag_an() -> bool:

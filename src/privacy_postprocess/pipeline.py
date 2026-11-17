@@ -455,20 +455,23 @@ def postprocess_smart_anonymize(
     verworfen: Counter = Counter()
     behalten: List[Span] = []
     herabgestuft: List[Dict[str, Any]] = []
+    nicht_herabgestuft: List[Dict[str, Any]] = []
+    _frei: Dict[Tuple[int, int], str] = {}
     if anlagenkontext:
         from . import anlagenkontext as _ak
         _regel_vorab = erkenne(original)
+        # harte Bereiche aus den ORIGINAL-Fundstellen VOR jedem Plausibilitaetsfilter (SEC-Zusatzbedingung)
         _hart = [(x.start, x.end) for x in list(detektor) + _regel_vorab if x.type in HARTE_TYPEN]
         _alle = [(x.start, x.end) for x in list(detektor) + _regel_vorab]
+        _frei, nicht_herabgestuft = _ak.entscheide(
+            original, [(x.start, x.end, x.type, x.quelle) for x in detektor], _hart, _alle)
     for s in detektor:
-        if anlagenkontext:
-            _ohne_s = [b for b in _alle if b != (s.start, s.end)]
-            _bauteil = _ak.pruefe(original, s.start, s.end, s.type, s.quelle, _hart, _ohne_s)
-            if _bauteil is not None:
-                verworfen[_ak.GRUND] += 1
-                herabgestuft.append({"original": s.wert(original), "type": s.type, "start": s.start,
-                                     "confidence": s.confidence, "bauteilwort": _bauteil, "grund": _ak.GRUND})
-                continue
+        if anlagenkontext and (s.start, s.end) in _frei:
+            verworfen[_ak.GRUND] += 1
+            herabgestuft.append({"original": s.wert(original), "type": s.type, "start": s.start,
+                                 "confidence": s.confidence, "bauteilwort": _frei[(s.start, s.end)],
+                                 "grund": _ak.GRUND})
+            continue
         if s.type not in HARTE_TYPEN:
             grund = verwerfen(original, s, fl)
         else:
@@ -531,6 +534,7 @@ def postprocess_smart_anonymize(
             **({"anlagenkontext": {
                 "aktiv": True,
                 "herabgestuft": herabgestuft,
+                "nicht_herabgestuft": nicht_herabgestuft,
                 # Herabgestufte Stellen, die _gleiche_werte_nachziehen wieder maskiert hat (derselbe
                 # Wert steht anderswo als echte Fundstelle) - je Fundstelle, nie globale Wiederherstellung.
                 "wieder_maskiert": sum(1 for h in herabgestuft if any(
