@@ -20,7 +20,8 @@ import logging
 import os
 import uuid
 from contextvars import ContextVar
-from typing import Any, Optional
+import re
+from typing import Any, Callable, Optional
 
 import httpx
 from fastapi import HTTPException
@@ -28,6 +29,11 @@ from fastapi import HTTPException
 log = logging.getLogger(__name__)
 API = "https://api.anthropic.com/v1/messages"
 VERSION = "2023-06-01"
+# PL-1: Positivliste der API-Versionen. 2026-10-21 nur mit Fallback-Kette und Vorpruefung C4 der Bridge.
+VERSIONS_ERLAUBT = ("2023-06-01", "2026-10-21")
+VERSION_FALLBACK = "2026-10-21"
+# PV-3: einziger zusaetzlicher Kopf (Doku Server-Fallback Z. 259/499); nur mit Kette, nie fuer count_tokens.
+KOPF_ERLAUBT = ("anthropic-beta", "server-side-fallback-2026-07-01")
 # Raised before any request byte left this process: no connection was ever
 # obtained (pool wait) or established (TCP/TLS). Everything else after the
 # post started may have reached Anthropic and is treated as outcome unknown.
@@ -155,6 +161,24 @@ async def _mark_unknown(reservation: str, reason: str) -> None:
     await _survive_cancel(mark())
 
 
+async def _kette_abrechnen(reservation: str, body: dict, kette: dict, antwort: dict, usage: dict) -> None:
+    erlaubt = {_norm(m) for m in [body["model"], *kette["fallback_models"]]}
+    if not isinstance(antwort.get("model"), str) or _norm(antwort["model"]) not in erlaubt:
+        log.error("Credit reservation %s: answering model outside the chain; retained", reservation)
+        await _mark_unknown(reservation, "modell_abweichung")
+        return
+    try:
+        bewertung = kette["bewerter"](antwort)
+        daten = {"usage": usage, "iterations": bewertung["iterations"], "lage": bewertung["lage"],
+                 "antwort_iteration": bewertung.get("antwort_iteration"),
+                 "kategorienliste_version": kette["kategorienliste_version"]}
+    except Exception:
+        log.error("Credit reservation %s: chain evaluation failed; retained at upper bound", reservation)
+        await _mark_unknown(reservation, "bewertung_fehlt")
+        return
+    await _survive_cancel(_finish(reservation, **daten))
+
+
 class PinnedAccountLost(HTTPException):
     """The account a run is pinned to can no longer serve it (409). Raised only
     with ``pin``; never for a coordinator 409 or any other pool failure, so a
@@ -174,7 +198,40 @@ def _account_bound_400(response: httpx.Response) -> bool:
     return "encrypted_content" in text or "credit balance" in text
 
 
-async def post_messages(body: dict, timeout: float, pin: dict | None = None) -> tuple[httpx.Response, dict]:
+def _norm(model: str) -> str:
+    from src.pricing import normalize_model_id
+    return re.sub(r"-\d{8}$", "", normalize_model_id(model))
+
+
+def _opt_in_pruefen(body: dict, anthropic_version: str | None, extra_headers: dict | None,
+                    kette: dict | None) -> tuple[str, dict]:
+    """Sofortmassnahme + PL-1/PV-3. Rueckgabe (Version, zusaetzliche Koepfe). Ohne Opt-in: (VERSION, {})."""
+    if kette is None:
+        if "fallbacks" in body:
+            raise HTTPException(400, "pool_settlement_je_modell_fehlt: fallbacks require a chain contract")
+        if anthropic_version is not None or extra_headers:
+            raise HTTPException(400, "fallback_body_unvertraeglich: version/headers only with a chain")
+        return VERSION, {}
+    modelle = kette.get("fallback_models")
+    if (not isinstance(modelle, list) or not modelle or not all(isinstance(m, str) and m for m in modelle)
+            or not isinstance(kette.get("kategorienliste_version"), str) or not kette["kategorienliste_version"]
+            or kette.get("vorpruefung_c4") is not True or not callable(kette.get("bewerter"))
+            or "fallbacks" not in body):
+        raise HTTPException(400, "fallback_body_unvertraeglich: incomplete chain contract")
+    version = anthropic_version or VERSION
+    if version not in VERSIONS_ERLAUBT:
+        raise HTTPException(400, "fallback_body_unvertraeglich: anthropic-version not allowed")
+    koepfe: dict = {}
+    for name, wert in (extra_headers or {}).items():
+        if (str(name).lower(), wert) != KOPF_ERLAUBT or koepfe:
+            raise HTTPException(400, "kopf_nicht_erlaubt")
+        koepfe[KOPF_ERLAUBT[0]] = KOPF_ERLAUBT[1]
+    return version, koepfe
+
+
+async def post_messages(body: dict, timeout: float, pin: dict | None = None, *,
+                        anthropic_version: str | None = None, extra_headers: dict | None = None,
+                        kette: dict | None = None) -> tuple[httpx.Response, dict]:
     """``pin``: Zustand EINES Laufs (leeres dict). Der erste erfolgreiche Aufruf
     heftet das Konto an; jeder Folgeaufruf darf nur dieses Konto nehmen, weil
     encrypted_content (web_search_tool_result) an Organisation/Schluessel des
@@ -186,7 +243,13 @@ async def post_messages(body: dict, timeout: float, pin: dict | None = None) -> 
     der an ein Konto gebunden waere. Nach der Anheftung ist jeder kontogebundene
     400 des angehefteten Kontos ein laut gemeldeter PinnedAccountLost. Ohne
     ``pin`` (Vision, Lueckenpruefung) bleibt alles wie bisher: der 400 geht
-    unveraendert zurueck."""
+    unveraendert zurueck.
+
+    ``kette`` (Server-Fallback, Entwurf V2 E3): ``{fallback_models, kategorienliste_version,
+    vorpruefung_c4: True, bewerter}``. ``bewerter(antwort_json) -> {iterations, lage,
+    antwort_iteration}`` liefert die Bridge (51c8185c): billed je Iteration, der Pool leitet nichts ab.
+    Ohne ``kette`` ist ein Body mit ``fallbacks`` gesperrt (400), alles andere byte-gleich."""
+    version, zusatz_koepfe = _opt_in_pruefen(body, anthropic_version, extra_headers, kette)
     if body.get("stream") or body.get("speed") or body.get("inference_geo") or body.get("container"):
         raise HTTPException(400, "Credit pool supports standard non-streaming text/vision requests")
     server_steps = 0
@@ -208,7 +271,7 @@ async def post_messages(body: dict, timeout: float, pin: dict | None = None) -> 
                                     "is bound to it, no switch to another account")
     async with httpx.AsyncClient(timeout=timeout) as client:
         for account in accounts:
-            headers = {"x-api-key": account["api_key"], "anthropic-version": VERSION}
+            headers = {"x-api-key": account["api_key"], "anthropic-version": version}
             counted = {k: body[k] for k in ("model", "messages", "system", "thinking", "tools", "tool_choice") if k in body}
             try:
                 count = await client.post(API + "/count_tokens", headers=headers, json=counted)
@@ -227,17 +290,44 @@ async def post_messages(body: dict, timeout: float, pin: dict | None = None) -> 
             tokens = count.json().get("input_tokens")
             if type(tokens) is not int or tokens < 0:
                 raise HTTPException(502, "Anthropic returned an invalid input token count")
+
+            def _mit_werkzeug(n: int) -> int:
+                # Reserve whole context windows for internal tool turns,
+                # plus output ceilings and search fees conservatively as
+                # token budget. No extra fee column / idempotency gap.
+                return max(n, 2_000_000 * (server_steps + 1)) if server_steps else n
+
+            reserve = {"id": "", "account_id": account["id"], "grant_id": account["grant_id"],
+                       "model": body["model"], "input_tokens": _mit_werkzeug(tokens),
+                       "max_tokens": body["max_tokens"] * (server_steps + 1)}
+            if kette is not None:
+                # R5: count_tokens je Kettenmodell Pflicht (kostenlos, eigenes RPM-Kontingent; Beleg
+                # BELEG-R5-COUNT-TOKENS-KOSTEN-RPM-c9a50d3b-20261117.md). Kein Faktor, keine Schaetzung.
+                je_modell = {body["model"]: _mit_werkzeug(tokens)}
+                naechstes_konto = False
+                for m in kette["fallback_models"]:
+                    try:
+                        c2 = await client.post(API + "/count_tokens", headers=headers, json={**counted, "model": m})
+                    except httpx.HTTPError as exc:
+                        raise HTTPException(503, "Anthropic token count unavailable; no credit reserved") from exc
+                    if c2.status_code in (401, 403, 429):
+                        naechstes_konto = True
+                        break
+                    t2 = c2.json().get("input_tokens") if c2.status_code == 200 else None
+                    if type(t2) is not int or t2 < 0:
+                        raise HTTPException(502, f"count_tokens for chain model failed (HTTP {c2.status_code}); "
+                                                 "no credit reserved")
+                    je_modell[m] = _mit_werkzeug(t2)
+                if naechstes_konto:
+                    continue
+                reserve.update({"fallback_models": list(kette["fallback_models"]), "input_tokens_je_modell": je_modell,
+                                "anthropic_version": version,
+                                "anthropic_beta": zusatz_koepfe.get(KOPF_ERLAUBT[0]),
+                                "kategorienliste_version": kette["kategorienliste_version"]})
             reservation = str(uuid.uuid4())
+            reserve["id"] = reservation
             try:
-                await coordinator("POST", "/reserve", {
-                    "id": reservation, "account_id": account["id"], "grant_id": account["grant_id"],
-                    "model": body["model"],
-                    # Reserve whole context windows for internal tool turns,
-                    # plus output ceilings and search fees conservatively as
-                    # token budget. No extra fee column / idempotency gap.
-                    "input_tokens": max(tokens, 2_000_000 * (server_steps + 1)) if server_steps else tokens,
-                    "max_tokens": body["max_tokens"] * (server_steps + 1),
-                })
+                await coordinator("POST", "/reserve", reserve)
             except HTTPException as exc:
                 if exc.status_code in (409, 429):
                     continue
@@ -253,7 +343,7 @@ async def post_messages(body: dict, timeout: float, pin: dict | None = None) -> 
             # No retry after a transport failure or 5xx: it may already have
             # generated a paid answer. Keep the reservation, fail visibly.
             try:
-                response = await client.post(API, headers=headers, json=body)
+                response = await client.post(API, headers={**headers, **zusatz_koepfe}, json=body)
             except NOT_SENT_ERRORS:
                 await _release_unsent(reservation)
                 raise
@@ -273,12 +363,20 @@ async def post_messages(body: dict, timeout: float, pin: dict | None = None) -> 
                 if pin is not None:
                     pin.setdefault("account_id", account["id"])
                 try:
-                    usage = response.json()["usage"]
+                    antwort = response.json()
+                    usage = antwort["usage"]
                 except (ValueError, KeyError, TypeError):
                     log.error("Credit reservation %s: unreadable paid response; retained", reservation)
                     await _mark_unknown(reservation, "unreadable_usage")
                 else:
-                    await _survive_cancel(_finish(reservation, usage=usage))
+                    if kette is None:
+                        await _survive_cancel(_finish(reservation, usage=usage))
+                    else:
+                        await _kette_abrechnen(reservation, body, kette, antwort, usage)
+                return response, meta
+            if kette is not None and 400 <= response.status_code < 500:
+                # Ob mit fallbacks vor einem 4xx schon ein Versuch lief, ist nicht belegt: nie freigeben.
+                await _mark_unknown(reservation, "http_status")
                 return response, meta
             if 400 <= response.status_code < 500:
                 await _survive_cancel(_finish(reservation, rejected=True))

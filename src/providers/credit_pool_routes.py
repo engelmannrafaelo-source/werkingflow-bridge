@@ -5,22 +5,54 @@ locks serialize grant admission across platform processes and worker hosts.
 """
 from __future__ import annotations
 
+import hashlib
 import hmac
 import json
+import logging
 import os
+import re
 from datetime import datetime, timezone, timedelta
 from decimal import Decimal, ROUND_CEILING
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, Header, HTTPException
 from pydantic import BaseModel, Field
 
 from src.db.client import get_pool
-from src.pricing import price_entry
+from src.pricing import normalize_model_id, price_entry
 
+log = logging.getLogger(__name__)
 router = APIRouter(prefix="/v1/internal/api-credit-pool", tags=["internal"])
+
+# Iterationsabrechnung (Entwurf ENTWURF-POOL-ITERATIONSABRECHNUNG-V2-c9a50d3b-20261117.md, R4 Envelope).
+ENVELOPE_VERSION = 2
+LAGEN = ("kein_fallback", "fallback_belegt", "sticky_belegt", "abweichung_unbelegt")
+ITER_TYPEN = ("message", "fallback_message")
+TOKEN_FELDER = ("input_tokens", "output_tokens", "cache_read_input_tokens", "cache_creation_input_tokens")
+
+
+def _fallback_max() -> int | None:
+    """Hoechstzahl Versuche je Kette (Ausgangsmodell + Ersatz). Ohne Konfiguration: keine Kette (fail closed)."""
+    raw = os.getenv("ANTHROPIC_CREDIT_POOL_FALLBACK_ITERATIONEN_MAX", "").strip()
+    try:
+        value = int(raw)
+    except ValueError:
+        return None
+    return value if value >= 2 else None
+
+
+def _norm(model: str) -> str:
+    return re.sub(r"-\d{8}$", "", normalize_model_id(model))
+
+
+def _jsonb(value: Any) -> Any:
+    return json.loads(value) if isinstance(value, str) else value
+
+
+def _kanonisch(value: Any) -> str:
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
 # Longer than any single pool request may legitimately run (research-cloud
 # read timeout 900 s). A reservation still 'reserved' after this is hanging.
 HANGING_AFTER = timedelta(hours=1)
@@ -139,6 +171,43 @@ class Reserve(BaseModel):
     model: str
     input_tokens: int = Field(ge=0, le=32_000_000, strict=True)
     max_tokens: int = Field(gt=0, le=8_000_000, strict=True)
+    # Kette (Server-Fallback). Ohne fallback_models: Vertrag byte-gleich zu vorher.
+    fallback_models: list[str] = Field(default_factory=list)
+    input_tokens_je_modell: dict[str, int] | None = None
+    anthropic_version: str | None = None
+    anthropic_beta: str | None = None
+    kategorienliste_version: str | None = None
+
+
+def _reserve_vertrag(body: Reserve) -> tuple[dict | None, Decimal]:
+    """(unveraenderliche Reserve-Envelope oder None, Betrag). Ohne Kette exakt die alte Rechnung."""
+    extra = (body.input_tokens_je_modell, body.anthropic_version, body.anthropic_beta, body.kategorienliste_version)
+    if not body.fallback_models:
+        if any(v is not None for v in extra):
+            raise HTTPException(400, "Chain fields without fallback_models")
+        return None, reservation_cost(body.model, body.input_tokens, body.max_tokens)
+    deckel = _fallback_max()
+    if deckel is None:
+        raise HTTPException(400, "Fallback chain not configured (ANTHROPIC_CREDIT_POOL_FALLBACK_ITERATIONEN_MAX)")
+    kette = [body.model, *body.fallback_models]
+    if len(kette) > deckel:
+        raise HTTPException(400, "Fallback chain longer than configured maximum")
+    if len({_norm(m) for m in kette}) != len(kette):
+        raise HTTPException(400, "Duplicate model in fallback chain")
+    tokens = body.input_tokens_je_modell or {}
+    if set(tokens) != set(kette) or any(type(v) is not int or v < 0 for v in tokens.values()):
+        # P5/R5: count_tokens je Modell ist Pflicht; keine Schaetzung, kein Faktor.
+        raise HTTPException(400, "count_tokens_fehlt: input_tokens_je_modell must cover every chain model")
+    if tokens[body.model] != body.input_tokens:
+        raise HTTPException(400, "input_tokens differs from input_tokens_je_modell[model]")
+    if not body.kategorienliste_version or not body.anthropic_version:
+        raise HTTPException(400, "Chain requires anthropic_version and kategorienliste_version")
+    amount = sum((reservation_cost(m, tokens[m], body.max_tokens) for m in kette), Decimal(0))
+    vertrag = {"model": body.model, "fallback_models": list(body.fallback_models), "input_tokens_je_modell": tokens,
+               "max_tokens": body.max_tokens, "anthropic_version": body.anthropic_version,
+               "anthropic_beta": body.anthropic_beta, "kategorienliste_version": body.kategorienliste_version,
+               "amount_usd": str(amount)}
+    return vertrag, amount
 
 
 @router.post("/reserve", dependencies=[Depends(authenticate)])
@@ -146,49 +215,184 @@ async def reserve(body: Reserve):
     a = next((a for a in manifest() if a["id"] == body.account_id and a["grant_id"] == body.grant_id), None)
     if not a:
         raise HTTPException(409, "Grant expired or unavailable")
-    amount = reservation_cost(body.model, body.input_tokens, body.max_tokens)
+    vertrag, amount = _reserve_vertrag(body)
     async with get_pool().acquire() as conn, conn.transaction():
         await conn.execute("SELECT pg_advisory_xact_lock(hashtextextended($1,0))", body.grant_id)
         old = await conn.fetchrow("SELECT * FROM anthropic_credit_reservations WHERE id=$1", body.id)
         if old:
             if any(old[k] != getattr(body, k) for k in ("account_id", "grant_id", "model", "input_tokens", "max_tokens")):
                 raise HTTPException(409, "Reservation identity conflict")
+            alt = _jsonb(old["usage"]) or {}
+            alt_vertrag = alt.get("reserve") if isinstance(alt, dict) and alt.get("v") == ENVELOPE_VERSION else None
+            if alt_vertrag != vertrag:
+                raise HTTPException(409, "Reservation identity conflict")
             return {"id": str(body.id), "state": old["state"]}
         if amount > await available(conn, a):
             raise HTTPException(429, "Insufficient promotional credit budget")
-        await conn.execute("""INSERT INTO anthropic_credit_reservations
-            (id,account_id,grant_id,model,input_tokens,max_tokens,reserved_usd,charged_usd)
-            VALUES ($1,$2,$3,$4,$5,$6,$7,$7)""", body.id, body.account_id, body.grant_id,
-                           body.model, body.input_tokens, body.max_tokens, amount)
+        if vertrag is None:
+            await conn.execute("""INSERT INTO anthropic_credit_reservations
+                (id,account_id,grant_id,model,input_tokens,max_tokens,reserved_usd,charged_usd)
+                VALUES ($1,$2,$3,$4,$5,$6,$7,$7)""", body.id, body.account_id, body.grant_id,
+                               body.model, body.input_tokens, body.max_tokens, amount)
+        else:
+            await conn.execute("""INSERT INTO anthropic_credit_reservations
+                (id,account_id,grant_id,model,input_tokens,max_tokens,reserved_usd,charged_usd,usage)
+                VALUES ($1,$2,$3,$4,$5,$6,$7,$7,$8::jsonb)""", body.id, body.account_id, body.grant_id,
+                               body.model, body.input_tokens, body.max_tokens, amount,
+                               json.dumps({"v": ENVELOPE_VERSION, "reserve": vertrag, "unknown": []}))
     return {"id": str(body.id), "state": "reserved"}
+
+
+class Iteration(BaseModel):
+    type: str
+    model: str
+    input_tokens: int
+    output_tokens: int
+    cache_read_input_tokens: int
+    cache_creation_input_tokens: int
+    # Setzt die Bridge nach ihrer Regel (51c8185c, BERECHNETE_ABLEHNUNGSKATEGORIEN). Der Pool leitet nichts ab.
+    billed: bool | Literal["unbekannt"]
 
 
 class Settle(BaseModel):
     id: UUID
     usage: dict | None = None
     rejected: bool = False
+    iterations: list[Iteration] | None = None
+    lage: str | None = None
+    antwort_iteration: int | None = None
+    kategorienliste_version: str | None = None
+
+
+def _iterationen_pruefen(vertrag: dict, body: Settle) -> str | None:
+    """Form- und Lagepruefung. Rueckgabe: Fehlertext oder None. Keine Ableitung von billed."""
+    its = body.iterations or []
+    kette = [vertrag["model"], *vertrag["fallback_models"]]
+    erlaubt = {_norm(m) for m in kette}
+    if body.lage not in LAGEN:
+        return "lage_ungueltig"
+    if body.kategorienliste_version != vertrag.get("kategorienliste_version"):
+        return "kategorienliste_version_abweichend"
+    if not its or len(its) > len(kette):
+        return "iterationen_anzahl"
+    for it in its:
+        if it.type not in ITER_TYPEN:
+            return "iteration_typ"
+        if not it.model or _norm(it.model) not in erlaubt or price_entry(it.model) is None:
+            return "iteration_modell"
+        if any(type(getattr(it, f)) is not int or getattr(it, f) < 0 for f in TOKEN_FELDER):
+            return "iteration_tokens"
+        if not (it.billed is True or it.billed is False or it.billed == "unbekannt"):
+            return "iteration_billed"
+    if body.lage == "kein_fallback" and (len(its) != 1 or _norm(its[0].model) != _norm(vertrag["model"])):
+        return "lage_kein_fallback_widerspruch"
+    if body.antwort_iteration is not None:
+        if not 0 <= body.antwort_iteration < len(its):
+            return "antwort_iteration_ausserhalb"
+        oben = body.usage or {}
+        if any(oben.get(f) != getattr(its[body.antwort_iteration], f) for f in TOKEN_FELDER):
+            return "top_level_usage_abweichend"
+    return None
+
+
+def _replay_hash(body: Settle) -> str:
+    roh = {"usage": body.usage, "lage": body.lage, "antwort_iteration": body.antwort_iteration,
+           "kategorienliste_version": body.kategorienliste_version,
+           "iterations": [it.model_dump() for it in (body.iterations or [])]}
+    return hashlib.sha256(_kanonisch(roh).encode()).hexdigest()
+
+
+async def _settle_envelope(conn, row, envelope: dict, body: Settle) -> dict:
+    """Kette (usage.v == 2). PV-1: Response unveraenderlich, Replay nur Vergleich, kein rejected auf 0,
+    unbekannt-Zeilen schliesst kein Client. PV-2: charged_usd >= belegter Betrag."""
+    if body.rejected:
+        raise HTTPException(409, "rejected_nicht_zulaessig: chain reservation cannot be released by a client")
+    if body.iterations is None:
+        raise HTTPException(422, "Chain reservation requires iterations; reservation retained")
+    neu = _replay_hash(body)
+    if envelope.get("response") is not None:
+        if envelope["response"].get("replay_hash") == neu:
+            return {"id": str(body.id), "state": row["state"]}
+        log.error("Credit reservation %s: settle_konflikt (different response for an already settled chain)", body.id)
+        raise HTTPException(409, "settle_konflikt")
+    if row["state"] != "reserved":
+        raise HTTPException(409, "settle_konflikt")
+    vertrag = envelope["reserve"]
+    fehler = _iterationen_pruefen(vertrag, body)
+    belegt = frei = Decimal(0)
+    unbekannt = 0
+    if fehler is None:
+        try:
+            for it in body.iterations:
+                betrag = usage_cost(it.model, {f: getattr(it, f) for f in TOKEN_FELDER})
+                if body.lage == "abweichung_unbelegt" or it.billed == "unbekannt":
+                    unbekannt += 1
+                elif it.billed is True:
+                    belegt += betrag
+                else:
+                    frei += betrag
+        except HTTPException as exc:
+            fehler = f"kosten:{exc.detail}"
+    if fehler is not None:
+        # Nichts gekappt, nichts verworfen: Zeile bleibt auf der Obergrenze, sichtbar markiert.
+        await conn.execute("""UPDATE anthropic_credit_reservations SET usage = jsonb_set(usage, '{unknown}',
+            COALESCE(usage->'unknown','[]'::jsonb) || jsonb_build_array(jsonb_build_object(
+            'reason','iterations_ungueltig','detail',$2::text,'marked_at',now()))) WHERE id=$1""", body.id, fehler)
+        return {"_fehler": fehler}
+    reserved = Decimal(row["reserved_usd"])
+    if belegt > reserved:
+        log.error("Credit reservation %s: belegt %s USD > Obergrenze %s USD (ueberschreitung_usd=%s)",
+                  body.id, belegt, reserved, belegt - reserved)
+    response = {"iterations": [it.model_dump() for it in body.iterations], "lage": body.lage,
+                "antwort_iteration": body.antwort_iteration, "usage": body.usage,
+                "kategorienliste_version": body.kategorienliste_version, "belegt_usd": str(belegt),
+                "frei_usd": str(frei), "unbekannt_anzahl": unbekannt, "replay_hash": neu}
+    if unbekannt == 0:
+        state, charged = "settled", belegt
+        await conn.execute("""UPDATE anthropic_credit_reservations SET state=$2, charged_usd=$3, settled_at=now(),
+            usage = jsonb_set(usage, '{response}', $4::jsonb) WHERE id=$1""", body.id, state, charged, json.dumps(response))
+    else:
+        # R1/PV-1: bleibt reserved; Abschluss nur ueber Betreiberabgleich (Anbieterbeleg, Audit, Idempotenz), kein Timeout.
+        state, charged = "reserved", max(reserved, belegt)
+        await conn.execute("""UPDATE anthropic_credit_reservations SET charged_usd=$2,
+            usage = jsonb_set(jsonb_set(usage, '{response}', $3::jsonb), '{unknown}',
+                COALESCE(usage->'unknown','[]'::jsonb) || jsonb_build_array(jsonb_build_object(
+                'reason','billed_unbekannt','marked_at',now()))) WHERE id=$1""", body.id, charged, json.dumps(response))
+    return {"id": str(body.id), "state": state, "unbekannt_anzahl": unbekannt}
 
 
 @router.post("/settle", dependencies=[Depends(authenticate)])
 async def settle(body: Settle):
     if body.rejected == (body.usage is not None):
         raise HTTPException(422, "Provide usage OR a confirmed rejection")
+    fehler = None
     async with get_pool().acquire() as conn, conn.transaction():
         row = await conn.fetchrow("SELECT * FROM anthropic_credit_reservations WHERE id=$1 FOR UPDATE", body.id)
         if not row:
             raise HTTPException(404, "Unknown reservation")
-        if row["state"] != "reserved":
-            return {"id": str(body.id), "state": row["state"]}
-        cost = Decimal(0) if body.rejected else usage_cost(row["model"], body.usage)
-        state = "released" if body.rejected else "settled"
-        await conn.execute("""UPDATE anthropic_credit_reservations SET state=$2, charged_usd=$3,
-            settled_at=now(), usage=$4::jsonb WHERE id=$1""", body.id, state, cost, json.dumps(body.usage))
-    return {"id": str(body.id), "state": state}
+        envelope = _jsonb(row["usage"])
+        if isinstance(envelope, dict) and envelope.get("v") == ENVELOPE_VERSION:
+            result = await _settle_envelope(conn, row, envelope, body)
+            fehler = result.pop("_fehler", None)
+        else:
+            if body.iterations is not None or body.lage is not None:
+                raise HTTPException(422, "Iterations only for chain reservations")
+            if row["state"] != "reserved":
+                return {"id": str(body.id), "state": row["state"]}
+            cost = Decimal(0) if body.rejected else usage_cost(row["model"], body.usage)
+            state = "released" if body.rejected else "settled"
+            await conn.execute("""UPDATE anthropic_credit_reservations SET state=$2, charged_usd=$3,
+                settled_at=now(), usage=$4::jsonb WHERE id=$1""", body.id, state, cost, json.dumps(body.usage))
+            result = {"id": str(body.id), "state": state}
+    if fehler is not None:
+        raise HTTPException(422, f"iterations_ungueltig ({fehler}); reservation retained")
+    return result
 
 
 class Unknown(BaseModel):
     id: UUID
-    reason: Literal["cancelled", "transport_error", "http_status", "unreadable_usage", "error"]
+    reason: Literal["cancelled", "transport_error", "http_status", "unreadable_usage", "error",
+                    "modell_abweichung", "bewertung_fehlt"]
 
 
 @router.post("/unknown", dependencies=[Depends(authenticate)])
@@ -196,13 +400,21 @@ async def unknown(body: Unknown):
     """The request may have reached Anthropic and been billed. Keep the full
     upper-bound debit (state stays 'reserved', still deducted by available())
     and mark it in the existing ``usage`` JSONB so it is visible; no schema
-    change. A later /settle with usage or rejected=True still finishes it."""
+    change. Without a chain (old form) a later /settle with usage or rejected=True
+    still finishes it. A chain reservation (usage.v == 2) only gets the mark
+    appended; its reserve contract is kept and no client can close it (PV-1)."""
     async with get_pool().acquire() as conn, conn.transaction():
-        row = await conn.fetchrow("SELECT state FROM anthropic_credit_reservations WHERE id=$1 FOR UPDATE", body.id)
+        row = await conn.fetchrow("SELECT state, usage FROM anthropic_credit_reservations WHERE id=$1 FOR UPDATE", body.id)
         if not row:
             raise HTTPException(404, "Unknown reservation")
         if row["state"] != "reserved":
             return {"id": str(body.id), "state": row["state"]}
+        envelope = _jsonb(row.get("usage"))  # asyncpg.Record und dict kennen .get
+        if isinstance(envelope, dict) and envelope.get("v") == ENVELOPE_VERSION:
+            await conn.execute("""UPDATE anthropic_credit_reservations SET usage = jsonb_set(usage, '{unknown}',
+                COALESCE(usage->'unknown','[]'::jsonb) || jsonb_build_array(jsonb_build_object(
+                'reason',$2::text,'marked_at',now()))) WHERE id=$1""", body.id, body.reason)
+            return {"id": str(body.id), "state": "reserved", "outcome": "unknown"}
         await conn.execute("""UPDATE anthropic_credit_reservations SET usage=jsonb_build_object(
             'outcome','unknown','reason',$2::text,'marked_at',now()) WHERE id=$1""", body.id, body.reason)
     return {"id": str(body.id), "state": "reserved", "outcome": "unknown"}
@@ -216,8 +428,10 @@ async def hanging(conn, grant_ids: list[str]) -> dict:
         min(created_at) FILTER (WHERE state='reserved') AS oldest,
         count(*) FILTER (WHERE state='reserved' AND created_at < now() - $2::interval) AS hanging,
         COALESCE(sum(charged_usd) FILTER (WHERE state='reserved' AND created_at < now() - $2::interval),0) AS hanging_usd,
-        count(*) FILTER (WHERE state='reserved' AND usage->>'outcome'='unknown') AS unknown,
-        COALESCE(sum(charged_usd) FILTER (WHERE state='reserved' AND usage->>'outcome'='unknown'),0) AS unknown_usd,
+        count(*) FILTER (WHERE state='reserved' AND (usage->>'outcome'='unknown'
+            OR jsonb_typeof(usage->'unknown')='array' AND jsonb_array_length(usage->'unknown')>0)) AS unknown,
+        COALESCE(sum(charged_usd) FILTER (WHERE state='reserved' AND (usage->>'outcome'='unknown'
+            OR jsonb_typeof(usage->'unknown')='array' AND jsonb_array_length(usage->'unknown')>0)),0) AS unknown_usd,
         now() AS now
         FROM anthropic_credit_reservations WHERE grant_id = ANY($1::text[])""", grant_ids, HANGING_AFTER)
     oldest = row["oldest"]

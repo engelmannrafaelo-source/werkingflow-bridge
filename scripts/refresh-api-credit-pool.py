@@ -38,6 +38,29 @@ def free_only_block_reason(org, credits):
     return None
 
 
+_SCOPE_VERBOTEN=('key','token','secret','cookie','session')
+
+
+def scope_sauber(scope):
+    """Grant-Scope unveraendert uebernehmen (R6), aber nur JSON-Grundtypen und ohne geheimnisartige
+    Schluessel. Verstoss -> ValueError (Tranche wird laut verworfen, nie still gekuerzt)."""
+    def pruefen(v,pfad):
+        if v is None or isinstance(v,(str,bool,int,float)):return
+        if isinstance(v,list):
+            for i,x in enumerate(v):pruefen(x,pfad+'['+str(i)+']')
+            return
+        if isinstance(v,dict):
+            for k,x in v.items():
+                if not isinstance(k,str) or any(w in k.lower() for w in _SCOPE_VERBOTEN):
+                    raise ValueError('scope key not allowed at '+pfad)
+                pruefen(x,pfad+'.'+k)
+            return
+        raise ValueError('scope value type not allowed at '+pfad)
+    if not isinstance(scope,dict):raise ValueError('scope is not an object')
+    pruefen(scope,'scope')
+    return json.loads(json.dumps(scope))
+
+
 def refresh(source, previous):
     old={a['id']:a for a in previous.get('accounts',[])}
     result=[]
@@ -61,9 +84,13 @@ def refresh(source, previous):
                 scope=g.get('scope',{})
                 if scope.get('kind')!='scoped' or not any(x.get('product')=='api' for x in scope.get('applies_to',[])):continue
                 if not g.get('expires_at') or not g.get('id'):continue
+                try:sauber=scope_sauber(scope)
+                except ValueError as exc:
+                    print(a['id']+': grant scope rejected ('+str(exc)+'); tranche skipped',flush=True);continue
                 grants.append({'id':g['id'],'expires_at':g['expires_at'],
                     'granted_usd':str(Decimal(g['granted_amount_minor_units'])/100),
-                    'remaining_usd':str(Decimal(g['remaining_amount_minor_units'])/100)})
+                    'remaining_usd':str(Decimal(g['remaining_amount_minor_units'])/100),
+                    'scope':sauber,'scope_gelesen_am':observed})
             result.append({'id':a['id'],'org_id':a['org_id'],'api_key':a['api_key'],
                            'observed_at':observed,'grants':grants,
                            'disabled':bool(blocked),'disabled_reason':blocked,
