@@ -24,6 +24,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
 
 from src.api_auth import require_service_token, AuthClaims
+from src.api_auth.deps import require_service_or_bound  # gebundener Lease-Token A
 from src.db.client import get_pool
 
 logger = logging.getLogger(__name__)
@@ -108,7 +109,7 @@ async def list_conversations(
     app: str = Query(...),
     resource_id: Optional[str] = Query(None),
     include_archived: bool = Query(False),
-    _claims: AuthClaims = Depends(require_service_token),
+    _claims: AuthClaims = Depends(require_service_or_bound),
 ):
     """List a user's conversations. Without resource_id: every conversation of
     the user in this app (cross-resource — e.g. the AI editor's full view)."""
@@ -139,7 +140,7 @@ async def list_conversations(
 async def upsert_conversation(
     conversation_id: str,
     body: ConversationUpsertRequest,
-    _claims: AuthClaims = Depends(require_service_token),
+    _claims: AuthClaims = Depends(require_service_or_bound),
 ):
     """Create-or-update one conversation index row (write-through from the
     daemon). tenant_id is resolved from the user — fail loud if unknown."""
@@ -198,7 +199,7 @@ async def upsert_conversation(
 async def upsert_transcript(
     conversation_id: str,
     body: TranscriptUpsertRequest,
-    _claims: AuthClaims = Depends(require_service_token),
+    _claims: AuthClaims = Depends(require_service_or_bound),
 ):
     """Store a gzip-compressed Claude Code jsonl snapshot for a conversation."""
     try:
@@ -242,7 +243,7 @@ async def upsert_transcript(
 @router.get("/conversations/{conversation_id}/transcript", response_model=TranscriptResponse)
 async def get_transcript(
     conversation_id: str,
-    _claims: AuthClaims = Depends(require_service_token),
+    _claims: AuthClaims = Depends(require_service_or_bound),
 ):
     pool = get_pool()
     async with pool.acquire() as conn:

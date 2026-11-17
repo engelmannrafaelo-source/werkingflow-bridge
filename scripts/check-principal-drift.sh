@@ -30,7 +30,7 @@ SSH_OPTS="-o StrictHostKeyChecking=no -o ConnectTimeout=15"
 # Fingerprint an active principal by name + first 12 hex of its token_hash + its
 # scope. Full token_hash is never printed (it is a credential digest).
 QUERY="SELECT name || '|' || left(token_hash,12) || '|apps=' || array_to_string(allowed_apps,',') \
-FROM service_principals WHERE active ORDER BY name;"
+FROM service_principals WHERE active AND COALESCE(jsonb_array_length(to_jsonb(service_principals)->'proxy_routes'), 0) = 0 ORDER BY name;"
 
 # Dev-only principals (principals-dev-only.txt) exist on the dev host by design
 # and are left out of the comparison — named on every run instead of silenced.

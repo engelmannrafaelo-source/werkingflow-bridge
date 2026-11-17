@@ -54,6 +54,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator
 
 from src.api_auth import require_admin, require_jwt_or_service, require_self_or_admin, AuthClaims, get_tenant_of_user
+from src.api_auth.deps import require_admin_or_bound  # Lookup nur eigene E-Mail (gebunden)
 from src.billing import billing_service
 from src.billing import vat_id as vat_id_module
 from src.db.client import get_pool
@@ -784,7 +785,7 @@ class UserLookupResponse(BaseModel):
 @router.get("/v1/admin/users/lookup", response_model=UserLookupResponse)
 async def lookup_user_by_email(
     email: EmailStr = Query(..., description="Email to look up. EmailStr-validated."),
-    _claims: AuthClaims = Depends(require_admin),
+    _claims: AuthClaims = Depends(require_admin_or_bound),
 ) -> Dict[str, Any]:
     """
     Operator-only: look up a user by email.

@@ -57,7 +57,7 @@ class AuthClaims:
       - Service token + X-User-ID → acting_user_id == that header value
       - Service token without X-User-ID → acting_user_id is None (operator)
     """
-    kind: str                       # "user" | "service" | "auftragsbudget"
+    kind: str                       # "user" | "service" | "auftragsbudget" | "bound"
     user_id: Optional[str]          # set when kind == "user"
     email: Optional[str]
     tenant_id: Optional[str]
@@ -316,7 +316,135 @@ def enforce_auftragsbudget_binding(
         )
 
 
-def require_jwt_or_service(
+# ---------------------------------------------------------------------------
+# Gebundener Token (ProxyV2 + Sandbox-Lease A, SEC-Entscheid 17.11.2026)
+# ---------------------------------------------------------------------------
+#
+# Transport b: der gebundene Token kommt im bestehenden Kopf
+# X-Bridge-Service-Token. Das Praefix waehlt NUR den strikten Verifier; es
+# authentisiert nichts. Ein Token mit Praefix wird NIE mit dem Operator-Token
+# verglichen und faellt bei jedem Fehler auf 401/403, nie auf Operator/Legacy.
+# Der Verifier setzt request.state.principal NICHT (Vertrag der Jobs-Eigentuemer-
+# pruefung, src/auth.py); er setzt request.state.bound_principal.
+
+def _is_bound_token(token: str) -> bool:
+    from src.principals import BOUND_TOKEN_PREFIX
+    return token.startswith(BOUND_TOKEN_PREFIX)
+
+
+def _bound_deny(status: int, grund: str, bp=None, request: Optional[Request] = None) -> HTTPException:
+    import logging
+    logging.getLogger("bridge.bound_token").warning(
+        "bound token denied: grund=%s principal=%s route=%s",
+        grund, getattr(bp, "name", "-"), _route_key(request) if request is not None else "-",
+    )
+    return HTTPException(status_code=status, detail=f"bound token: {grund}")
+
+
+def _route_key(request: Request) -> str:
+    route = request.scope.get("route")
+    return f"{request.method} {getattr(route, 'path', '?')}"
+
+
+async def _verify_bound_token(token: str, request: Request) -> AuthClaims:
+    """Strikter Verifier. Reihenfolge: Token (Hash, aktiv, Ablauf) -> Route ->
+    Nutzer/Mandant -> App -> Bindung an Pfad, Query und Rumpf -> Lease/Gespraech."""
+    import json as _json
+    from src import principals as _p
+
+    if not _p.is_wellformed_bound_token(token):
+        raise _bound_deny(401, "malformed", request=request)
+    bp = await _p.get_bound_principal_by_token(token)
+    if bp is None:
+        raise _bound_deny(401, "unknown, revoked or expired", request=request)
+    if _route_key(request) not in bp.routes:
+        raise _bound_deny(403, "route not allowed", bp, request)
+    if bp.user_tenant_id is None or bp.user_tenant_id != bp.tenant_id:
+        raise _bound_deny(403, "user/tenant binding broken", bp, request)
+
+    def _gleich_nutzer(v: object) -> bool:
+        return str(v) == bp.user_id or (bp.user_email is not None and str(v) == bp.user_email)
+
+    # Koepfe
+    xuid = request.headers.get("x-user-id")
+    if xuid is not None and xuid != bp.user_id:
+        raise _bound_deny(403, "foreign X-User-ID", bp, request)
+    xapp = request.headers.get("x-app-id")
+    if xapp is not None and xapp != bp.app_id:
+        raise _bound_deny(403, "foreign app", bp, request)
+    # Pfad
+    pp = request.path_params
+    if "user_id" in pp and str(pp["user_id"]) != bp.user_id:
+        raise _bound_deny(403, "foreign user (path)", bp, request)
+    if "lease_id" in pp and not await _p.bound_owns_lease(bp, pp["lease_id"]):
+        raise _bound_deny(403, "foreign lease", bp, request)
+    if "conversation_id" in pp and await _p.bound_owns_conversation(bp, pp["conversation_id"]) is False:
+        raise _bound_deny(403, "foreign conversation", bp, request)
+    # Query
+    q = request.query_params
+    for k in ("user_id", "userId"):
+        if k in q and not _gleich_nutzer(q[k]):
+            raise _bound_deny(403, "foreign user (query)", bp, request)
+    for k in ("app", "appId"):
+        if k in q and q[k] != bp.app_id:
+            raise _bound_deny(403, "foreign app (query)", bp, request)
+    if "tenantId" in q and q["tenantId"] != bp.tenant_id:
+        raise _bound_deny(403, "foreign tenant (query)", bp, request)
+    if request.url.path == "/v1/admin/users/lookup" and q.get("email") != bp.user_email:
+        raise _bound_deny(403, "lookup only for own email", bp, request)
+    # Rumpf (Starlette cached request.body(); FastAPI parst denselben Inhalt)
+    if request.method in ("POST", "PUT", "PATCH"):
+        raw = await request.body()
+        try:
+            body = _json.loads(raw) if raw else {}
+        except ValueError:
+            raise _bound_deny(400, "body not JSON", bp, request)
+        if not isinstance(body, dict):
+            raise _bound_deny(400, "body not an object", bp, request)
+        if "userId" not in body and _route_key(request) in _BOUND_BODY_USER_ROUTES:
+            raise _bound_deny(403, "userId required", bp, request)
+        if "userId" in body and not _gleich_nutzer(body["userId"]):
+            raise _bound_deny(403, "foreign user (body)", bp, request)
+        if "app" in body and body["app"] != bp.app_id:
+            raise _bound_deny(403, "foreign app (body)", bp, request)
+        for k in ("tenantId", "tenant_id"):
+            if k in body and body[k] != bp.tenant_id:
+                raise _bound_deny(403, "foreign tenant (body)", bp, request)
+        if body.get("leaseId") is not None and not await _p.bound_owns_lease(bp, body["leaseId"]):
+            raise _bound_deny(403, "foreign lease (body)", bp, request)
+
+    request.state.bound_principal = bp
+    return AuthClaims(
+        kind="bound", user_id=bp.user_id, email=None, tenant_id=bp.tenant_id,
+        is_admin=False, acting_user_id=bp.user_id,
+    )
+
+
+#: Routen, deren Rumpf den Ziel-Nutzer traegt: ohne userId kein Zugriff.
+_BOUND_BODY_USER_ROUTES = frozenset({
+    "POST /v1/sandbox/lease-token",
+    "POST /v1/sandbox/usage/record",
+    "POST /v1/budget/check",
+    "POST /v1/budget/deduct",
+    "PUT /v1/sandbox/conversations/{conversation_id}",
+})
+
+
+async def require_service_or_bound(
+    request: Request,
+    x_bridge_service_token: Optional[str] = Header(default=None),
+) -> AuthClaims:
+    """Fuer Service-Routen, die zusaetzlich einen gebundenen Token zulassen
+    (Sandbox-Lease A). Operator-Weg unveraendert wie require_service_token."""
+    if not x_bridge_service_token:
+        raise HTTPException(status_code=401, detail="Missing X-Bridge-Service-Token header")
+    if _is_bound_token(x_bridge_service_token):
+        return await _verify_bound_token(x_bridge_service_token, request)
+    return _verify_service_token(x_bridge_service_token)
+
+
+async def require_jwt_or_service(
+    request: Request,
     credentials: Optional[HTTPAuthorizationCredentials] = Depends(_bearer),
     x_bridge_service_token: Optional[str] = Header(default=None),
     x_user_id: Optional[str] = Header(default=None),
@@ -337,6 +465,8 @@ def require_jwt_or_service(
     (that would be an identity-spoofing vector).
     """
     if x_bridge_service_token:
+        if _is_bound_token(x_bridge_service_token):
+            return await _verify_bound_token(x_bridge_service_token, request)
         return _verify_service_token(x_bridge_service_token, x_user_id=x_user_id)
     if credentials and credentials.credentials:
         # x_user_id is intentionally NOT passed — JWT sub is the acting identity.
@@ -345,6 +475,17 @@ def require_jwt_or_service(
         status_code=401,
         detail="Missing credentials (need Authorization: Bearer <jwt> or X-Bridge-Service-Token)",
     )
+
+
+async def require_admin_or_bound(
+    request: Request,
+    claims: AuthClaims = Depends(require_jwt_or_service),
+) -> AuthClaims:
+    """Wie require_admin; zusaetzlich ein gebundener Token, dessen Route der
+    Verifier freigegeben hat (Lookup nur fuer die eigene E-Mail)."""
+    if claims.kind == "bound" or claims.is_operator:
+        return claims
+    raise HTTPException(status_code=403, detail="Admin privileges required")
 
 
 def require_admin(claims: AuthClaims = Depends(require_jwt_or_service)) -> AuthClaims:
