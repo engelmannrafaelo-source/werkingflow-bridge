@@ -52,7 +52,7 @@ from src.api_auth import require_jwt_or_service, require_self_or_admin
 def _operator_claims() -> AuthClaims:
     return AuthClaims(
         kind="service", user_id=None, email=None, tenant_id=None,
-        is_admin=True, acting_user_id=None,
+        is_admin=True, acting_user_id=None, global_token_verified=True,
     )
 
 
