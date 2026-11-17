@@ -163,9 +163,12 @@ def _aufloesen(spans: List[Span], text: str) -> List[Span]:
     return out
 
 
-def _gleiche_werte_nachziehen(text: str, spans: List[Span]) -> List[Span]:
-    """Jeder maskierte Wert wird an allen weiteren Stellen des Dokuments maskiert."""
-    belegt = sorted((s.start, s.end) for s in spans)
+def _gleiche_werte_nachziehen(text: str, spans: List[Span],
+                              geschuetzt: Tuple[Tuple[int, int], ...] = ()) -> List[Span]:
+    """Jeder maskierte Wert wird an allen weiteren Stellen des Dokuments maskiert.
+    ``geschuetzt``: Stellen, die die Anlagenkontext-Regel je Stelle freigegeben hat (keine wertglobale
+    Rueckmaskierung; leer = Verhalten wie bisher)."""
+    belegt = sorted([(s.start, s.end) for s in spans] + list(geschuetzt))
     neu: List[Span] = []
     werte: Dict[str, Span] = {}
     for s in spans:
@@ -431,8 +434,13 @@ def postprocess_smart_anonymize(
     prefix: Optional[str] = None,
     known_entities: Optional[Dict[str, str]] = None,
     freiliste: Optional[Freiliste] = None,
+    anlagenkontext: bool = False,
 ) -> Dict[str, Any]:
-    """Nimmt die Antwort des Privacy-Dienstes und gibt eine Antwort derselben Form zurueck."""
+    """Nimmt die Antwort des Privacy-Dienstes und gibt eine Antwort derselben Form zurueck.
+
+    ``anlagenkontext=True`` nur, wenn der Aufrufer (main.py) serverseitig die Schema-App, den
+    deklarierten Anlagenkontext und das Flag belegt hat (siehe anlagenkontext.py). Ohne ihn ist
+    die Ausgabe byte-gleich zum Stand davor."""
     if antwort.get("status") != "success":
         return antwort
     prefix = prefix or "ANON"
@@ -449,7 +457,25 @@ def postprocess_smart_anonymize(
     detektor = spans_aus_antwort(original, anon, mapping_alt, prefix, typen, konf, protokoll=rueckrechnung)
     verworfen: Counter = Counter()
     behalten: List[Span] = []
+    herabgestuft: List[Dict[str, Any]] = []
+    nicht_herabgestuft: List[Dict[str, Any]] = []
+    _frei: Dict[Tuple[int, int], str] = {}
+    if anlagenkontext:
+        from . import anlagenkontext as _ak
+        _regel_vorab = erkenne(original)
+        # harte Bereiche aus den ORIGINAL-Fundstellen VOR jedem Plausibilitaetsfilter (SEC-Zusatzbedingung)
+        _hart = [(x.start, x.end) for x in list(detektor) + _regel_vorab if x.type in HARTE_TYPEN]
+        _alle = [(x.start, x.end) for x in list(detektor) + _regel_vorab]
+        _frei, nicht_herabgestuft, _zusatz = _ak.entscheide(
+            original, [(x.start, x.end, x.type, x.quelle) for x in detektor], _hart, _alle)
     for s in detektor:
+        if anlagenkontext and (s.start, s.end) in _frei:
+            verworfen[_ak.GRUND] += 1
+            herabgestuft.append({"original": s.wert(original), "type": s.type, "start": s.start,
+                                 "confidence": s.confidence, "bauteilwort": _frei[(s.start, s.end)],
+                                 "beleg": _ak._lokaler_beleg(original, s.start, s.end, _alle)[0],
+                                 "grund": _ak.GRUND})
+            continue
         if s.type not in HARTE_TYPEN:
             grund = verwerfen(original, s, fl)
         else:
@@ -472,11 +498,25 @@ def postprocess_smart_anonymize(
     ]
     bekannte = _bekannte_nachziehen(original, bekannt)
     spans = _aufloesen(behalten + regel + bekannte, original)
-    spans = _aufloesen(_gleiche_werte_nachziehen(original, spans), original)
+    if anlagenkontext:
+        # ungemeldete, unklare Vorkommen eines Kennungswerts: zusaetzlich maskieren (fail-closed)
+        spans = spans + [Span(a, b, t, "anlagenkontext-unklar", PRIO_DETEKTOR, 1.0) for a, b, t in _zusatz]
+    spans = _aufloesen(_gleiche_werte_nachziehen(
+        original, spans, tuple(_frei) if anlagenkontext else ()), original)
     spans = _aufloesen(_vollform_einschliessen(original, spans, bekannt), original)
     spans, mapping, stat = _platzhalter_vergeben(original, spans, prefix, bekannt)
     text_aus = ausgeben(original, spans)
     _invarianten(text_aus, mapping, spans, original)
+    retentions = None
+    if anlagenkontext:
+        retentions, abbruch = _technische_retentionen(original, text_aus, spans, mapping, herabgestuft)
+        if abbruch:
+            # fail-closed: Rueckhaltung nicht exakt belegbar -> vollstaendig maskierte Fassung (wie Flag aus)
+            logger.error("privacy anlagenkontext: retention nicht belegbar (%s) - volle Maskierung", abbruch)
+            aus = postprocess_smart_anonymize(original, antwort, prefix=prefix, known_entities=known_entities,
+                                              freiliste=freiliste, anlagenkontext=False)
+            aus["postprocessing"]["anlagenkontext"] = {"aktiv": False, "abbruch": abbruch}
+            return aus
 
     quellen = Counter(s.quelle.split(":")[0] for s in spans)
     regel_typen = Counter(s.type for s in spans if s.quelle.startswith("regel"))
@@ -509,5 +549,61 @@ def postprocess_smart_anonymize(
             "known_entities_in": len(bekannt),
             "placeholders": len(mapping),
             **stat,
+            **({"anlagenkontext": {
+                "aktiv": True,
+                "herabgestuft": herabgestuft,
+                "nicht_herabgestuft": nicht_herabgestuft,
+                # Herabgestufte Stellen, die _gleiche_werte_nachziehen wieder maskiert hat (derselbe
+                # Wert steht anderswo als echte Fundstelle) - je Fundstelle, nie globale Wiederherstellung.
+                "wieder_maskiert": sum(1 for h in herabgestuft if any(
+                    x.start <= h["start"] < x.end for x in spans)),
+                "technical_retentions": retentions,
+            }} if anlagenkontext else {}),
         },
     }
+
+
+# ── Anlagenkontext: Antwortvertrag technical_retentions (Root-Vorschlag, version 1) ──────────────
+
+def _technische_retentionen(original: str, text_aus: str, spans: List[Span], mapping: Dict[str, str],
+                            herabgestuft: List[Dict[str, Any]]) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+    """Exakte Spans der tatsaechlich frei gebliebenen Detektor-Stellen im AUSGABEtext (Unicode-Codepoints,
+    zusammengefuegter Text inkl. Dokumenttrenner). Belegt, dass jedes freie Vorkommen eines Kennungswerts aus
+    ``mapping`` genau ein solcher Span ist (sonst Abbruch -> Aufrufer maskiert voll)."""
+    import hashlib
+    sortiert = sorted(spans, key=lambda s: s.start)
+    aus = []
+    for h in herabgestuft:
+        a = h["start"]
+        b = a + len(h["original"])
+        if any(s.start < b and a < s.end for s in sortiert):
+            continue  # wieder maskiert: kein Retentions-Span
+        delta = sum(len(s.platzhalter) - (s.end - s.start) for s in sortiert if s.end <= a)
+        oa, ob = a + delta, b + delta
+        if text_aus[oa:ob] != h["original"] or original[a:b] != h["original"]:
+            return None, "span-versatz"
+        # Grenze wie Adapter (451d80c): Buchstabe, Ziffer oder '_' direkt neben dem Span ist keine Wortgrenze
+        if any(c.isalnum() or c == "_" for c in (text_aus[oa - 1:oa], text_aus[ob:ob + 1]) if c):
+            return None, "span-grenze"
+        aus.append({"start": oa, "end": ob, "value": h["original"], "entity_type": h["type"]})
+    aus.sort(key=lambda x: x["start"])
+    if any(x["end"] > y["start"] for x, y in zip(aus, aus[1:])):
+        return None, "span-ueberlappung"
+    if any(x["entity_type"] not in ("ORGANIZATION", "LOCATION") for x in aus):
+        return None, "span-typ"
+    belegt = {(x["start"], x["end"]) for x in aus}
+    # Gegenprobe wie der Homepage-Vertrag (contract.js): jedes freie Vorkommen eines Kennungswerts aus mapping,
+    # ohne Buchstabe/Ziffer davor/danach, muss genau ein Retentions-Span sein.
+    from .anlagenkontext import _KENNUNG
+    for wert in set(mapping.values()):
+        if not _KENNUNG.fullmatch(wert):
+            continue
+        for m in re.finditer(r"(?<![^\W_])" + re.escape(wert) + r"(?![^\W_])", text_aus):
+            if (m.start(), m.end()) not in belegt:
+                return None, "freies-vorkommen-ohne-span"
+    return {
+        "version": 1,
+        "index_unit": "unicode_codepoint",
+        "output_sha256": hashlib.sha256(text_aus.encode("utf-8")).hexdigest(),
+        "spans": aus,
+    }, None
