@@ -35,6 +35,14 @@ def bestellt(request: Any) -> bool:
     return getattr(request, "modell_exakt", None) is True
 
 
+def vertraeglich_pruefen(request: Any) -> None:
+    """Auflage A1 (18962da3 R1): exakte Wahl und Anbieter-Fallback schliessen
+    sich aus. Ein Fallback antwortet mit einem ANDEREN Modell; zusammen mit
+    modell_exakt waere das ein stiller Modellwechsel -> lauter 400."""
+    if getattr(request, "provider_fallback", None) is not None:
+        raise ModellExaktNichtMoeglich("modell_exakt_mit_fallback", "fallback_waere_modellwechsel")
+
+
 def aufloesen(model_input: Optional[str]) -> str:
     """Exakt registrierte ID -> dieselbe ID. Sonst laut ablehnen."""
     from src.model_registry import _MODEL_BY_ID

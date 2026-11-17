@@ -3313,6 +3313,7 @@ async def _chat_completions_lauf(
         from src.providers import modell_exakt as _modell_exakt
         if _modell_exakt.bestellt(request_body):
             # Explizite Versionswahl: exakt registrierte ID, kein Upgrade/Alias (laut 400 sonst).
+            _modell_exakt.vertraeglich_pruefen(request_body)
             resolved_model, resolution_msg = _modell_exakt.aufloesen(original_model), None
         else:
             resolved_model, resolution_msg = resolve_model(original_model)
