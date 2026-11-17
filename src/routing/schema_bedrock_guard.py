@@ -179,6 +179,72 @@ def assert_schema_research_refused(app_id: Optional[str]) -> None:
         )
 
 
+#: Vertex EU (Rafael 17.11.2026: Homepage "fuers Erste non-Bedrock", EU-Vorgabe unveraendert). Claude-Modelle laufen
+#: auf Vertex nur ueber den EU-Multi-Region-Endpunkt mit EU-Verarbeitung (Google "Data residency", Partnermodell-Tabelle:
+#: Sonnet 5.5 EU multi-region ja, europe-west1/-west4 nein). Daher exakt Location ``eu`` und exakt dieser Host.
+VERTEX_EU_PROVIDER = "vertex_eu"
+VERTEX_EU_REGION = "eu"
+VERTEX_EU_ENDPOINT_HOST = "aiplatform.eu.rep.googleapis.com"
+
+#: Zugelassene Schema-Routen: Backend -> Region. Der OPERATOR-PIN waehlt genau eine davon; es gibt keinen
+#: Wechsel zwischen ihnen zur Laufzeit (kein Bedrock-Rueckfall fuer einen Vertex-Pin und umgekehrt).
+ALLOWED_SCHEMA_ROUTES = {EXPECTED_PROVIDER: EXPECTED_REGION, VERTEX_EU_PROVIDER: VERTEX_EU_REGION}
+
+
+def _host_exact(url: Optional[str]) -> Optional[str]:
+    from urllib.parse import urlsplit
+    try:
+        u = urlsplit((url or "").strip())
+    except ValueError:
+        return None
+    if u.scheme != "https" or u.port is not None or u.username or u.password or u.path not in ("", "/") or u.query:
+        return None
+    return u.hostname
+
+
+def assert_schema_expected_route(
+    *,
+    effective_backend: Any,
+    operator_pin: Optional[str],
+    region: Optional[str],
+    model_id: Optional[str],
+    vertex_endpoint: Optional[str] = None,
+) -> None:
+    """Raise unless the resolved route is one of ALLOWED_SCHEMA_ROUTES, chosen by the matching operator pin,
+    in its EU region, with the approved model. For Vertex additionally the exact EU multi-region host.
+
+    Fail-closed: unknown backend, pin != backend (no fallback across routes), wrong region/model/host -> refused.
+    ``vertex_endpoint`` is the endpoint the Vertex client will call (``VERTEX_EU_ENDPOINT`` or its default)."""
+    backend = getattr(effective_backend, "value", effective_backend)
+    if backend not in ALLOWED_SCHEMA_ROUTES:
+        raise SchemaBedrockExpectationError(
+            "schema_route_not_allowed",
+            f"Schema generator calls must run on an approved EU route {sorted(ALLOWED_SCHEMA_ROUTES)}, "
+            f"but this call resolved to backend={backend!r}. No fallback is attempted.",
+        )
+    if operator_pin != backend:
+        raise SchemaBedrockExpectationError(
+            "schema_requires_matching_operator_pin",
+            f"Schema generator calls need the operator pin of the resolved route (users.provider_config.provider="
+            f"{backend!r}); pin={operator_pin!r}. No switching between routes.",
+        )
+    if region != ALLOWED_SCHEMA_ROUTES[backend]:
+        raise SchemaBedrockExpectationError(
+            "schema_route_region_mismatch",
+            f"Schema generator on {backend!r} must use region {ALLOWED_SCHEMA_ROUTES[backend]!r}, resolved region={region!r}.",
+        )
+    if model_id != EXPECTED_MODEL:
+        raise SchemaBedrockExpectationError(
+            "schema_route_model_mismatch",
+            f"Schema generator calls must use model {EXPECTED_MODEL!r}, resolved model={model_id!r}.",
+        )
+    if backend == VERTEX_EU_PROVIDER and _host_exact(vertex_endpoint) != VERTEX_EU_ENDPOINT_HOST:
+        raise SchemaBedrockExpectationError(
+            "schema_vertex_endpoint_not_eu",
+            f"Schema generator on Vertex must call exactly https://{VERTEX_EU_ENDPOINT_HOST} (EU multi-region).",
+        )
+
+
 def assert_schema_expected_bedrock(
     *,
     effective_backend: Any,

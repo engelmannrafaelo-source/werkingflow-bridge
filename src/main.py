@@ -2947,10 +2947,15 @@ async def _chat_completions_lauf(
                 # Weg A (16.11.): diese App ruft Bedrock mit dem Ein-Versuch-Client; die Obergrenze rechnet mit
                 # dessen gelesener Versuchszahl (fail closed, falls sie nicht 1 ist, wird entsprechend mehr reserviert).
                 from src.bedrock_service import _BEDROCK_BOTO_CONFIG_EIN_VERSUCH as _bcfg
-                _strict_bound = _strict_mod.cost_upper_bound_eur(
+                # Vertex EU (zweite zugelassene Schema-Route, 17.11.): ein einziger httpx-POST (call_vertex_eu) und
+                # Ledger-Preis * VERTEX_EU_PRICE_MULT. Die Route steht hier noch nicht fest (Pin wird erst danach
+                # aufgeloest) -> die Obergrenze nimmt fuer BEIDE Routen das Maximum: Versuche max(Bedrock, 1) und
+                # Preisfaktor max(1, Vertex). Ueberblockung moeglich, Ueberziehung nie.
+                from src.pricing import VERTEX_EU_PRICE_MULT as _vx_mult
+                _strict_bound = round(_strict_mod.cost_upper_bound_eur(
                     getattr(request_body, "model", None), request_body,
-                    versuche=_strict_mod.anbieter_versuche(_bcfg),
-                )
+                    versuche=max(_strict_mod.anbieter_versuche(_bcfg), 1),
+                ) * max(1.0, float(_vx_mult)), 6)
             await enforce_budget(
                 user_id=_gate_attr.get("user_id"),
                 app_id=_gate_attr.get("app_id"),
@@ -3548,7 +3553,7 @@ async def _chat_completions_lauf(
         # Anthropic fallback, and a client X-App-Env cannot downgrade it. See routing/schema_bedrock_guard.py.
         from src.routing.schema_bedrock_guard import (
             guard_applies as _schema_guard_applies,
-            assert_schema_expected_bedrock, SchemaBedrockExpectationError,
+            assert_schema_expected_route, SchemaBedrockExpectationError,
         )
         from src.routing.app_provider_policy import _resolve_app_id as _schema_resolve_app_id
         from src.auth import bedrock_credential_manager as _schema_bedrock_creds
@@ -3566,18 +3571,32 @@ async def _chat_completions_lauf(
                     detail={"error": {"message": str(e), "type": "permission_error", "code": e.code,
                                       "hint": "Call the bridge through its LB; Schema traffic uses the local Schema-EU route only."}},
                 )
-            if not _schema_bedrock_creds.validate()[0]:
+            _schema_backend = getattr(getattr(backend_config, "backend", None), "value", None)
+            _schema_ready = False
+            if _schema_backend == "vertex_eu":
+                # Vertex-Route (Pin vertex_eu): Schalter + Service-Account muessen da sein, sonst 424 (kein LB-Retry,
+                # kein anderer Weg). Kein Bedrock-Rueckfall.
+                from src.vertex_eu_service import readiness as _schema_vertex_ready, VertexEUNotConfigured as _SchemaVNC
+                try:
+                    _schema_vertex_ready()
+                    _schema_ready = True
+                except _SchemaVNC:
+                    _schema_ready = False
+            else:
+                _schema_ready = bool(_schema_bedrock_creds.validate()[0])
+            if not _schema_ready:
                 # Active guard without Bedrock access: refuse with a status the LB does NOT retry (424), so the
                 # Prod LB cannot fail over to the Dev backup because of it (never fall back to Anthropic).
                 raise HTTPException(
                     status_code=424,
                     detail={
                         "error": {
-                            "message": "Schema generator requires Bedrock EU, but this worker has no Bedrock access. Nothing was routed elsewhere.",
+                            "message": ("Schema generator route is not available on this worker "
+                                        f"(backend={_schema_backend!r}: missing switch or credentials). Nothing was routed elsewhere."),
                             "type": "configuration_error",
-                            "code": "schema_bedrock_unavailable",
+                            "code": "schema_vertex_eu_unavailable" if _schema_backend == "vertex_eu" else "schema_bedrock_unavailable",
                             "retryable": False,
-                            "hint": "Restore the worker's Bedrock credentials; Schema traffic is Bedrock-EU only.",
+                            "hint": "Restore the pinned route's credentials; Schema traffic uses only its EU route.",
                         }
                     },
                 )
@@ -3587,11 +3606,14 @@ async def _chat_completions_lauf(
                         "schema_requires_bedrock",
                         "Schema generator call has no resolved backend; refused (no Anthropic fallback).",
                     )
-                assert_schema_expected_bedrock(
+                import os as _schema_os
+                from src.vertex_eu_service import DEFAULT_ENDPOINT as _SCHEMA_VERTEX_DEFAULT_ENDPOINT
+                assert_schema_expected_route(
                     effective_backend=backend_config.backend,
                     operator_pin=operator_pinned_provider,
                     region=backend_config.region,
                     model_id=backend_config.model_id,
+                    vertex_endpoint=(_schema_os.getenv("VERTEX_EU_ENDPOINT") or _SCHEMA_VERTEX_DEFAULT_ENDPOINT),
                 )
             except SchemaBedrockExpectationError as e:
                 raise HTTPException(
@@ -3601,7 +3623,7 @@ async def _chat_completions_lauf(
                             "message": str(e),
                             "type": "permission_error",
                             "code": e.code,
-                            "hint": "Schema generator traffic is Bedrock-EU only; fix the operator pin/model/region, nothing was routed elsewhere.",
+                            "hint": "Schema generator traffic uses only its pinned EU route; fix the operator pin/model/region, nothing was routed elsewhere.",
                         }
                     },
                 )
@@ -3704,7 +3726,9 @@ async def _chat_completions_lauf(
         # =======================================================================
         _strict_dispatch = extract_attribution_context(request).get("app_id") == "werking-schema-generator"
         if _strict_dispatch:
-            if not (backend_config and backend_config.backend == BackendType.BEDROCK) or request_body.stream:
+            # Zugelassen: Bedrock (Ein-Versuch-Client) und Vertex EU (ein einziger httpx-POST, call_vertex_eu), jeweils
+            # ohne Stream. Welche der beiden, entscheidet allein der Schema-Guard oben (Operator-Pin).
+            if not (backend_config and backend_config.backend in (BackendType.BEDROCK, BackendType.VERTEX_EU)) or request_body.stream:
                 raise HTTPException(status_code=403, detail={
                     "error": "strict_backend_not_allowed", "appId": "werking-schema-generator",
                     "message": "Dieser Weg ist für die Schemafunktion nicht freigegeben.",
