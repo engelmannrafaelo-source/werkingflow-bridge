@@ -29,6 +29,7 @@ The text marker of _mark_retryable stays in research messages for existing
 text classifiers (werking-report isTransientInfraError). It is set by the same
 helper that sets the structured field, so the two cannot drift apart.
 """
+import math
 from typing import Any, Dict, Optional
 
 # HTTP statuses that mean "try again later" when no explicit verdict exists.
@@ -126,10 +127,21 @@ def ablehnung_aus_antwort(body: Any) -> Optional[Dict[str, Any]]:
       * x_bridge_finish only as a mapping, category / provider_request_id only
         as text;
       * usage = sum over x_bridge_finish.iterations when EVERY iteration has
-        integer input_tokens and output_tokens; otherwise usage_fehlt (a
-        refusal was usually paid — "no tokens known" must not read as 0).
-    cost_eur stays unknown (no ledger price on this path); cost_status is the
-    one the refusal itself states."""
+        input_tokens and output_tokens as integers >= 0 and its cache fields
+        absent/null or integers >= 0; otherwise usage_fehlt (a refusal was
+        usually paid — "no tokens known" must not read as 0, a negative count
+        is unreadable, not a credit). Shape and meaning as result.usage
+        (vision_provider._usage_mit_cache): prompt_tokens = whole input
+        (uncached + cache), the three parts in their own keys (Zweitpruefung
+        E3-1 R1 A1).
+    cost_eur = x_bridge_finish.cost_total_eur only when the refusal states
+    cost_status "belegt" (the provider bills this category) with a number
+    (R1 A2). That amount is the bridge's own price-list calculation from the
+    tokens, NOT a provider debit: cost_source "bridge_berechnet", cost_status
+    "berechnet" (Hauptkoordination 17.11.2026). Otherwise cost_eur null,
+    cost_source and cost_status "unbekannt" — the caller's regular reserve,
+    never an estimate here. Whether the provider bills stays in
+    x_bridge_finish (cost_status, iterations[].billed), unchanged."""
     if not isinstance(body, dict):
         return None
     err = body.get("error") if isinstance(body.get("error"), dict) else body
@@ -141,30 +153,40 @@ def ablehnung_aus_antwort(body: Any) -> Optional[Dict[str, Any]]:
         wert = err.get(key, finish.get(key))
         if isinstance(wert, str) and wert:
             ablehnung[key] = wert
+    def _zahl(wert: Any) -> bool:
+        return type(wert) is int and wert >= 0
+
     iterationen = finish.get("iterations")
     ganz = (isinstance(iterationen, list) and iterationen
             and all(isinstance(it, dict)
-                    and all(isinstance(it.get(k), int) and not isinstance(it.get(k), bool)
-                            for k in ("input_tokens", "output_tokens"))
+                    and all(_zahl(it.get(k)) for k in ("input_tokens", "output_tokens"))
+                    and all(it.get(k) is None or _zahl(it.get(k))
+                            for k in ("cache_read_input_tokens", "cache_creation_input_tokens"))
                     for it in iterationen))
     if not ganz:
         return {"ablehnung": ablehnung, "usage_felder": {"usage_fehlt": "ablehnung_ohne_tokenangabe"}}
 
     def _summe(key: str) -> int:
-        return sum(it[key] for it in iterationen
-                   if isinstance(it.get(key), int) and not isinstance(it.get(key), bool))
+        return sum(it.get(key) or 0 for it in iterationen)
+    ungecacht = _summe("input_tokens")
+    lesen = _summe("cache_read_input_tokens")
+    anlage = _summe("cache_creation_input_tokens")
     usage: Dict[str, Any] = {
-        "prompt_tokens": _summe("input_tokens"),
+        "prompt_tokens": ungecacht + lesen + anlage,
         "completion_tokens": _summe("output_tokens"),
-        "cache_read_input_tokens": _summe("cache_read_input_tokens"),
-        "cache_creation_input_tokens": _summe("cache_creation_input_tokens"),
+        "uncached_input_tokens": ungecacht,
+        "cache_read_tokens": lesen,
+        "cache_creation_tokens": anlage,
         "cost_eur": None,
         "cost_source": "unbekannt",
+        "cost_status": "unbekannt",
         "quelle": "x_bridge_finish.iterations",
     }
     usage["total_tokens"] = usage["prompt_tokens"] + usage["completion_tokens"]
-    if isinstance(finish.get("cost_status"), str):
-        usage["cost_status"] = finish["cost_status"]
+    gesamt = finish.get("cost_total_eur")
+    if (finish.get("cost_status") == "belegt" and isinstance(gesamt, (int, float))
+            and not isinstance(gesamt, bool) and math.isfinite(gesamt) and gesamt >= 0):
+        usage.update(cost_eur=gesamt, cost_source="bridge_berechnet", cost_status="berechnet")
     return {"ablehnung": ablehnung, "usage_felder": {"usage": usage}}
 
 
