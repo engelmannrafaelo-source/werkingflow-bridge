@@ -42,6 +42,11 @@ KOPF_EIN = ("anthropic-version", "anthropic-beta", "content-type", "accept")
 KOPF_AUS = ("content-type", "request-id", "retry-after")
 KOPF_AUS_PRAEFIX = ("anthropic-ratelimit-",)
 UPSTREAM_TIMEOUT = httpx.Timeout(connect=10.0, read=600.0, write=60.0, pool=10.0)
+# Konservative Buchung bei unvollstaendigem Strom (R1 N1, 18962da3): fehlt das Ende (message_delta bzw.
+# message_stop, oder bei JSON eine lesbare usage), bucht die Bridge output = max(beobachtet, max_tokens).
+# max_tokens ist bei /v1/messages Pflicht (sonst 400 upstream, keine Buchung); fehlt es oder ist es
+# ungueltig, gilt dieser Default (hoechstes Ausgabelimit der aktuellen Modellfamilie).
+MAX_TOKENS_DEFAULT_KONSERVATIV = 64000
 
 
 def _client() -> httpx.AsyncClient:
@@ -86,6 +91,8 @@ class _SseZaehler:
 
     def __init__(self) -> None:
         self.puffer = b""
+        self.ende = False      # message_delta (finale kumulierte usage) oder message_stop gesehen
+        self.start = False     # message_start gesehen (input/cache bekannt)
         self.usage = {"input_tokens": 0, "output_tokens": 0, "cache_read_input_tokens": 0,
                       "cache_creation_input_tokens": 0}
 
@@ -102,12 +109,16 @@ class _SseZaehler:
                 continue
             if not isinstance(ev, dict):
                 continue
-            if ev.get("type") == "message_start":
+            if ev.get("type") == "message_stop":
+                self.ende = True
+            elif ev.get("type") == "message_start":
+                self.start = True
                 u = _usage_felder((ev.get("message") or {}).get("usage"))
                 for k in ("input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens"):
                     self.usage[k] = max(self.usage[k], u[k])
                 self.usage["output_tokens"] = max(self.usage["output_tokens"], u["output_tokens"])
             elif ev.get("type") == "message_delta":
+                self.ende = True
                 u = _usage_felder(ev.get("usage"))
                 self.usage["output_tokens"] = max(self.usage["output_tokens"], u["output_tokens"])
                 for k in ("input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens"):
@@ -147,6 +158,24 @@ async def _verbuchen(lease: Dict[str, Any], lease_id: uuid.UUID, model: str, usa
             )
     except Exception:  # silent-ok: Buchungsfehler nach gestreamter Antwort - laut geloggt, Deckel zaehlt Lease-Minuten
         logger.exception("bound proxy usage booking failed lease=%s", lease_id)
+
+
+def _max_tokens(body: Dict[str, Any]) -> int:
+    v = body.get("max_tokens")
+    if isinstance(v, int) and not isinstance(v, bool) and v > 0:
+        return v
+    return MAX_TOKENS_DEFAULT_KONSERVATIV
+
+
+def _konservativ(usage: Dict[str, int], max_tokens: int, eingabe_bekannt: bool,
+                 anfrage_bytes: int) -> Dict[str, int]:
+    """Unvollstaendiger Strom: Ausgabe mindestens max_tokens; Eingabe, falls nie gemeldet,
+    mindestens die Anfragegroesse in Bytes (obere Schranke fuer Text-Tokens)."""
+    out = dict(usage)
+    out["output_tokens"] = max(out["output_tokens"], max_tokens)
+    if not eingabe_bekannt:
+        out["input_tokens"] = max(out["input_tokens"], anfrage_bytes)
+    return out
 
 
 def _kopf_aus(h: httpx.Headers, status: int) -> Dict[str, str]:
@@ -203,6 +232,7 @@ async def anthropic_messages(
     ctype = resp.headers.get("content-type", "")
     request_id = resp.headers.get("request-id")
     model = body["model"]
+    max_tok = _max_tokens(body)
     kopf_aus = _kopf_aus(resp.headers, status)
 
     async def strom() -> AsyncIterator[bytes]:
@@ -221,11 +251,17 @@ async def anthropic_messages(
             if status == 200:
                 if zaehler is not None:
                     usage = zaehler.usage
+                    if not zaehler.ende:
+                        usage = _konservativ(usage, max_tok, zaehler.start, len(raw))
                 else:
                     try:
-                        usage = _usage_aus_json(json.loads(b"".join(gesammelt) or b"{}"))
+                        daten = json.loads(b"".join(gesammelt) or b"{}")
                     except ValueError:
-                        usage = _usage_felder(None)
+                        daten = None
+                    vollstaendig = isinstance(daten, dict) and isinstance(daten.get("usage"), dict)
+                    usage = _usage_aus_json(daten)
+                    if not vollstaendig:
+                        usage = _konservativ(usage, max_tok, False, len(raw))
                 await _verbuchen(lease, lease_id, model, usage, request_id)
 
     return StreamingResponse(strom(), status_code=status, headers=kopf_aus, media_type=None)
