@@ -390,20 +390,44 @@ class BoundPrincipal:
 # kurze Lease-Laufzeit begrenzt das Ueberschiessen einer laufenden Session.
 BOUND_DECKEL_MAX_EUR = 100
 BOUND_LEASE_MAX_MIN = 15
+# H-KD-1: Unabhaengiger, serverseitig gemessener Mindestverbrauch je Lease-Minute. Er gilt auch, wenn
+# der Daemon nichts oder 0 meldet. Konservativ (eher zu hoch): 100 EUR Deckel = 100 Lease-Minuten.
+BOUND_PAUSCHALE_EUR_PRO_MIN = 1
 
 
 async def bound_spent_eur(bp: "BoundPrincipal") -> "Decimal":
-    """Verbrauch seit Anlage: usage_events (source sandbox) des gebundenen Nutzers fuer die gebundene App.
+    """Verbrauch seit Anlage, unabhaengig von Selbstmeldungen (H-KD-1):
+    je Lease des gebundenen Nutzers/der App = max(serverseitig berechnete Usage dieser Lease,
+    Lease-Minuten x BOUND_PAUSCHALE_EUR_PRO_MIN); dazu Usage ohne zuordenbare Lease.
+    Lease-Minuten = leased_at bis Ablauf oder jetzt (das Fruehere), von der Bridge gemessen; eine fruehe
+    Freigabe senkt sie NICHT (Rohtoken bleibt nutzbar). Mit Rohtoken ist das ein Lease-Zeit-Deckel,
+    kein Nutzungsdeckel.
     Kein Cache; DB-Fehler steigen auf (fail-loud -> 5xx, nie ein Lease ohne Pruefung)."""
     from decimal import Decimal
     import uuid as _uuid
     async with get_pool().acquire() as conn:
         v = await conn.fetchval(
             """
-            SELECT COALESCE(SUM(hypothetical_cost_eur), 0) FROM usage_events
-             WHERE source = 'sandbox' AND user_id = $1 AND app = $2 AND recorded_at >= $3
+            WITH l AS (
+                SELECT lease_id::text AS lid,
+                       -- R2 (18962da3 N1): released_at zaehlt NICHT. Der gebundene Aufrufer haelt das rohe
+                       -- OAuth-Token und kann frueh freigeben, das Token bleibt nutzbar. Untergrenze =
+                       -- gewaehrte Lease-Zeit bis Ablauf oder jetzt.
+                       GREATEST(EXTRACT(EPOCH FROM (LEAST(expires_at, NOW()) - leased_at)) / 60.0, 0) AS minuten
+                  FROM sandbox_leases
+                 WHERE user_id = $1 AND app = $2 AND leased_at >= $3
+            ), u AS (
+                SELECT provider_metadata->>'lease_id' AS lid, SUM(hypothetical_cost_eur) AS eur
+                  FROM usage_events
+                 WHERE source = 'sandbox' AND user_id = $1 AND app = $2 AND recorded_at >= $3
+                 GROUP BY 1
+            )
+            SELECT COALESCE((SELECT SUM(GREATEST(COALESCE(u.eur, 0), l.minuten * $4::numeric))
+                               FROM l LEFT JOIN u ON u.lid = l.lid), 0)
+                 + COALESCE((SELECT SUM(u.eur) FROM u
+                              WHERE u.lid IS NULL OR u.lid NOT IN (SELECT lid FROM l)), 0)
             """,
-            _uuid.UUID(bp.user_id), bp.app_id, bp.created_at,
+            _uuid.UUID(bp.user_id), bp.app_id, bp.created_at, Decimal(str(BOUND_PAUSCHALE_EUR_PRO_MIN)),
         )
     return Decimal(str(v))
 
