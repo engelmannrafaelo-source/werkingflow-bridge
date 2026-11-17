@@ -4,8 +4,8 @@ Aufruf IM Worker-Container der Ziel-Bridge (BRIDGE_DB_URL gesetzt):
 
   pruefen    nur lesen; meldet je Bedingung ok/FEHLT als JSON auf stderr; rc 0 nur wenn alles ok
   anlegen    erst dieselbe Pruefung (fail-closed), dann create_bound_principal. Der Token geht
-             AUSSCHLIESSLICH auf stdout (genau eine Zeile) und nur, wenn stdout KEIN Terminal ist.
-             Der Aufrufer leitet stdout in eine root-eigene 0600-Datei um, z. B.
+             AUSSCHLIESSLICH auf stdout (genau eine Zeile) und nur, wenn stdout KEIN Terminal ist;
+             der einzige vorgesehene Empfaenger ist die root-eigene 0600-Uebergabedatei:
                ssh root@<dev-host> 'umask 077; docker exec -i <worker> python -I -B -m src.bound_provision \
                  anlegen ... > /root/bound-uebergabe/<name>.token'
              Bericht (id, Ablauf, Hash12 + Laenge des Tokens) auf stderr. Nie Klartext im Bericht.
@@ -33,6 +33,10 @@ from typing import Any, Dict, List, Optional
 ZIEL_ERLAUBT = "dev"
 APP_ERLAUBT = "werking-works"
 MAX_GUELTIG_STUNDEN = 72
+# Fetcher-Services je gebundenem Daemon (ACL B, SEC 19:04Z). Root setzt den Token daraus per
+# Rotation-Writer als BRIDGE_SERVICE_TOKEN_SANDBOX in das Projekt des Service. Das Werkzeug
+# schreibt NICHT nach Infisical; es nennt den Service im Bericht.
+BOUND_SERVICES = frozenset({"daemon-works-stoller", "daemon-works-gf"})
 
 
 def _fp(token: str) -> Dict[str, Any]:
@@ -74,11 +78,7 @@ async def pruefe(conn: Any, a: argparse.Namespace) -> List[Dict[str, Any]]:
 
     grund = _ziel_ok(a.ziel)
     z("ziel_dev", grund is None, grund)
-    try:
-        uuid.UUID(a.infisical_projekt)
-        z("infisical_projekt_uuid", True, a.infisical_projekt)
-    except ValueError:
-        z("infisical_projekt_uuid", False, None)
+    z("service_bekannt", a.service in BOUND_SERVICES, a.service)
     z("app_werking_works", a.app == APP_ERLAUBT, a.app)
     unbekannt = sorted(set(a.routen) - BOUND_ROUTEN_OBERGRENZE)
     z("routen_in_obergrenze", bool(a.routen) and not unbekannt, unbekannt or len(a.routen))
@@ -179,7 +179,7 @@ async def lauf_anlegen(a: argparse.Namespace) -> int:
     sys.stdout.write(token + "\n")
     sys.stdout.flush()
     _melde({"modus": "anlegen", "angelegt": neu, "token": _fp(token),
-            "uebergabe_an_infisical_projekt": a.infisical_projekt})
+            "uebergabe_service": a.service, "uebergabe_schluessel": "BRIDGE_SERVICE_TOKEN_SANDBOX"})
     return 0
 
 
@@ -229,9 +229,8 @@ def parser() -> argparse.ArgumentParser:
         p.add_argument("--deckel", required=True)
         p.add_argument("--gueltig-stunden", type=int, required=True)
         p.add_argument("--route", dest="routen", action="append", required=True)
-        # Ziel der Uebergabe (Infisical-Projekt je Daemon, ACL B). Kommt aus der Lauf-Konfiguration,
-        # nie hardcodiert; das Werkzeug schreibt NICHT nach Infisical, es nennt das Ziel im Bericht.
-        p.add_argument("--infisical-projekt", required=True)
+        # Fetcher-Service des Daemons (ACL B); Projekt-ID steht nur in der Fetcher-Konfiguration.
+        p.add_argument("--service", required=True)
     w = sp.add_parser("widerrufen")
     w.add_argument("--ziel", required=True)
     w.add_argument("--id", required=True)
