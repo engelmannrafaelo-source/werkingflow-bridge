@@ -272,6 +272,22 @@ log() {
 info()    { log "INFO " "$@"; }
 warn()    { log "WARN " "$@" >&2; }
 error_()  { log "ERROR" "$@" >&2; }
+
+# Smoke-/Verteilungs-Schluessel ueber den REGULAEREN Leser (seit 12.11.2026):
+# Identitaet dev-daemon-reader-dev-server (ProjectViewer dev-server, nur lesen),
+# Aufruf ueber fetch-service-secrets.py (Login im Speicher, JSON nur auf stdout).
+# Der alte Weg infisical_get_secret -> batch-get-secret.py/get-admin-token.py ist
+# abgeschaltet (exit 78). Ausgabe: der Wert auf stdout fuer eine Kommando-
+# substitution des Aufrufers; nie loggen, nie exportieren. Leer => Rueckgabe 1.
+dev_bridge_api_key_lesen() {
+    local ws="${INFISICAL_WS_DEV_SERVER:-}"
+    [[ -n "$ws" ]] || { error_ "Smoke-Schluessel: INFISICAL_WS_DEV_SERVER fehlt (infisical-api.sh nicht geladen)"; return 1; }
+    sudo -n python3 /root/.infisical/fetch-service-secrets.py daemon "$ws" dev 2>/dev/null \
+      | python3 -I -c 'import json,sys
+d=json.load(sys.stdin); s=d.get("secrets", []) if isinstance(d, dict) else []
+v=[x.get("secretValue") or "" for x in s if x.get("secretKey") == "AI_BRIDGE_API_KEY"]
+sys.exit(1) if len(v) != 1 or not v[0] or any(c.isspace() for c in v[0]) else sys.stdout.write(v[0])'
+}
 step()    { log "STEP " "=== $* ===" ; }
 
 # ============================================================================
@@ -1362,8 +1378,15 @@ phase_smoke_test() {
     # shellcheck source=/root/.infisical/infisical-api.sh
     source /root/.infisical/infisical-api.sh 2>/dev/null || true
 
+    local smoke_key
+    if ! smoke_key=$(dev_bridge_api_key_lesen); then
+        error_ "Smoke-Schluessel AI_BRIDGE_API_KEY ueber den Regel-Leser (dev-daemon-reader-dev-server) nicht lesbar"
+        return 1
+    fi
+    info "Smoke-Schluessel: Regel-Leser dev-daemon-reader-dev-server, fp=$(printf %s "$smoke_key" | sha256sum | cut -c1-12), Laenge ${#smoke_key}"
+
     local smoke_out
-    if smoke_out=$(python3 "$smoke_script" --base-url "$url" --profile "$profile" \
+    if smoke_out=$(AI_BRIDGE_API_KEY="$smoke_key" python3 "$smoke_script" --base-url "$url" --profile "$profile" \
             --attempts 3 "${extra_args[@]}" 2>&1); then
         while IFS= read -r line; do info "  smoke: ${line}"; done <<< "$smoke_out"
         # SMOKE_TARGET = exit 0, NOT a clean pass: the endpoints answered, but
@@ -1824,9 +1847,9 @@ distribution_assertion() {
     # shellcheck source=/root/.infisical/infisical-api.sh
     source /root/.infisical/infisical-api.sh 2>/dev/null || true
     local api_key
-    api_key=$(infisical_get_secret "${INFISICAL_WS_DEV_SERVER}" dev AI_BRIDGE_API_KEY 2>/dev/null) || true
+    api_key=$(dev_bridge_api_key_lesen) || true
     if [[ -z "${api_key:-}" ]]; then
-        error_ "Failed to retrieve AI_BRIDGE_API_KEY from Infisical"
+        error_ "Failed to retrieve AI_BRIDGE_API_KEY (Regel-Leser dev-daemon-reader-dev-server)"
         return 1
     fi
 
