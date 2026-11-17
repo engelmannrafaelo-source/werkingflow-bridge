@@ -38,9 +38,12 @@ logger = logging.getLogger(__name__)
 STRICT_APP_ID = "werking-schema-generator"
 #: Periodenlaenge des Monatstopfs — gleich rollover_monthly_if_due (src/budget/calculator.py).
 PERIOD_DAYS = 30
-#: Hoechstzahl Ausgabe-Tokens fuer diese App. Das Tor setzt max_tokens = min(angefragt, Grenze);
-#: das Anfragemodell hat sonst den Standard 64000 (src/models.py). Die Homepage sendet 6000.
-MAX_TOKENS_CAP = 8000
+#: Hoechstzahl Ausgabe-Tokens NUR fuer werking-schema-generator (einzige Verwendung: main.py-Zweig dieser App
+#: und cost_upper_bound_eur der strikten Reservierung; andere Apps unberuehrt). Das Tor setzt
+#: max_tokens = min(angefragt, Grenze); das Anfragemodell hat sonst den Standard 64000 (src/models.py).
+#: 16000 = Wert des Homepage-Clients (werking-tools schema-erzeugen/ki.ts KI_MAX_AUSGABE_TOKEN; 8000 schnitt
+#: grosse Anlagen ab, Analyse 09.11.2026). Kanzler-Entscheid 17.11.2026 nach Weg-A-Pruefung R1 (K2).
+MAX_TOKENS_CAP = 16000
 
 
 @dataclass
