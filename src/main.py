@@ -2612,6 +2612,13 @@ async def _schema_noneu_principal_name(request: Request) -> Optional[str]:
     job_id = (request.headers.get(JOB_LAUF_HEADER) or "").strip()
     if not job_id:
         return None
+    # Pruefung R2 H5: den Job-Kopf nur vom worker-internen Selbstaufruf annehmen (executors.SELF_BASE_URL
+    # http://localhost:8000 -> Peer ist Loopback). uvicorn uebernimmt X-Forwarded-For nur von 127.0.0.1
+    # (FORWARDED_ALLOW_IPS-Vorgabe, auf Prod nicht gesetzt), ein externer Aufrufer kann den Peer also nicht faelschen.
+    # Ueber nginx gesprungene Selbstaufrufe (Kapazitaets-429-Hop) bleiben damit zu (fail-closed).
+    _peer = getattr(getattr(request, "client", None), "host", None)
+    if _peer not in ("127.0.0.1", "::1"):
+        return None
     from src.jobs import store_client
     from src.budget.test_ki_deckel import JOB_PRINZIPAL_KEY
     try:
