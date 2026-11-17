@@ -72,7 +72,30 @@ class Principal:
     def may_use_path(self, path: Optional[str]) -> bool:
         if not self.allowed_paths or WILDCARD in self.allowed_paths:
             return True
-        return path in self.allowed_paths
+        if path is None:
+            return False
+        if path in self.allowed_paths:
+            return True
+        return any(_segment_match(entry, path) for entry in self.allowed_paths)
+
+
+# Ein-Segment-Eintrag in allowed_paths: "/v1/jobs/*" erlaubt "/v1/jobs/<id>",
+# aber weder "/v1/jobs" noch "/v1/jobs/<id>/<mehr>". Pfade mit ID (Job-Poll,
+# DELETE /v1/jobs/{id}) waren bisher nur ueber den Voll-Joker "*" freigebbar.
+# Kein Praefix ueber mehrere Segmente: ein Eintrag soll nie still Routen
+# freigeben, die erst spaeter unter demselben Praefix entstehen.
+SEGMENT_SUFFIX = "/" + WILDCARD
+
+
+def _segment_match(entry: str, path: str) -> bool:
+    if not entry.endswith(SEGMENT_SUFFIX) or len(entry) <= len(SEGMENT_SUFFIX):
+        return False
+    stem = entry[: -len(WILDCARD)]  # "/v1/jobs/"
+    if not path.startswith(stem):
+        return False
+    segment = path[len(stem):]
+    # Genau ein nicht leeres Segment; "." und ".." sind keine IDs.
+    return bool(segment) and "/" not in segment and segment not in (".", "..")
 
 
 # Synthetic identity the shared AI_BRIDGE_API_KEY maps to while callers are being
