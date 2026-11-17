@@ -261,7 +261,7 @@ def _bedrock_raising(monkeypatch, exc):
         raise exc
     boto = SimpleNamespace(invoke_model_with_response_stream=invoke)
     monkeypatch.setattr(bedrock_service, "get_bedrock_client", lambda: SimpleNamespace(
-        default_region="eu-central-1", get_client=lambda region: boto))
+        default_region="eu-central-1", get_client=lambda region, ein_versuch=False: boto))
 
 
 async def _bedrock_last(monkeypatch, exc) -> str:
@@ -292,7 +292,7 @@ def _producers():
         boto = SimpleNamespace(invoke_model_with_response_stream=lambda **kw: {
             "body": [], "ResponseMetadata": {"RequestId": "r"}})
         mp.setattr(bedrock_service, "get_bedrock_client", lambda: SimpleNamespace(
-            default_region="eu-central-1", get_client=lambda region: boto))
+            default_region="eu-central-1", get_client=lambda region, ein_versuch=False: boto))
         return [c async for c in bedrock_service.stream_bedrock(_req(), usage_sink={})][-1]
 
     async def bedrock_no_credentials(mp):
@@ -303,7 +303,7 @@ def _producers():
 
     async def bedrock_unknown_model(mp):
         mp.setattr(bedrock_service, "get_bedrock_client", lambda: SimpleNamespace(
-            default_region="eu-central-1", get_client=lambda region: None))
+            default_region="eu-central-1", get_client=lambda region, ein_versuch=False: None))
         mp.setattr(bedrock_service, "resolve_model", lambda m: (None, None))
         return [c async for c in bedrock_service.stream_bedrock(_req(), usage_sink={})][-1]
 

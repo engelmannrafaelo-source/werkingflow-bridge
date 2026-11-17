@@ -67,7 +67,7 @@ def _client(events=None, raises=None):
             raise raises
         return {"body": events, "ResponseMetadata": {"RequestId": "r"}}
     boto = SimpleNamespace(invoke_model_with_response_stream=invoke)
-    return SimpleNamespace(default_region="eu-central-1", get_client=lambda region: boto)
+    return SimpleNamespace(default_region="eu-central-1", get_client=lambda region, ein_versuch=False: boto)
 
 
 async def _bedrock(monkeypatch, **kw):

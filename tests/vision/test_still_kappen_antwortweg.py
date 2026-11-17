@@ -89,7 +89,7 @@ class _FakeBoto:
 ])
 async def test_bedrock_stream_meldet_stop_reason(monkeypatch, stop_reason, expected):
     fake_client = SimpleNamespace(
-        default_region="eu-central-1", get_client=lambda region: _FakeBoto(stop_reason)
+        default_region="eu-central-1", get_client=lambda region, ein_versuch=False: _FakeBoto(stop_reason)
     )
     monkeypatch.setattr(bedrock_service, "get_bedrock_client", lambda: fake_client)
     chunks = [c async for c in bedrock_service.stream_bedrock(_request(stream=True))]

@@ -170,7 +170,7 @@ def test_openai_compatible_good_stream_is_unchanged(monkeypatch):
 def _bedrock_client(monkeypatch):
     boto = SimpleNamespace(invoke_model_with_response_stream=lambda **kw: {"body": []})
     monkeypatch.setattr(bedrock_service, "get_bedrock_client", lambda: SimpleNamespace(
-        default_region="eu-central-1", get_client=lambda region: boto))
+        default_region="eu-central-1", get_client=lambda region, ein_versuch=False: boto))
 
 
 def test_bedrock_region_mismatch_is_an_http_400(monkeypatch):
@@ -277,7 +277,7 @@ def _raising_client(monkeypatch, exc):
         raise exc
     boto = SimpleNamespace(invoke_model_with_response_stream=invoke, invoke_model=invoke)
     monkeypatch.setattr(bedrock_service, "get_bedrock_client", lambda: SimpleNamespace(
-        default_region="eu-central-1", get_client=lambda region: boto))
+        default_region="eu-central-1", get_client=lambda region, ein_versuch=False: boto))
 
 
 _TRANSPORT = [

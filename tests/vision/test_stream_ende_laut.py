@@ -39,7 +39,7 @@ def _fake_client(events):
     boto = SimpleNamespace(invoke_model_with_response_stream=lambda **kw: {
         "body": events, "ResponseMetadata": {"RequestId": "r"},
     })
-    return SimpleNamespace(default_region="eu-central-1", get_client=lambda region: boto)
+    return SimpleNamespace(default_region="eu-central-1", get_client=lambda region, ein_versuch=False: boto)
 
 
 async def _run_stream(monkeypatch, events):
@@ -110,7 +110,7 @@ async def test_direktweg_ohne_stop_reason_ist_fehlerantwort(monkeypatch):
     resp = {"body": SimpleNamespace(read=lambda: json.dumps(body).encode()),
             "ResponseMetadata": {"RequestId": "r"}}
     boto = SimpleNamespace(invoke_model=lambda **kw: resp)
-    client = SimpleNamespace(default_region="eu-central-1", get_client=lambda region: boto)
+    client = SimpleNamespace(default_region="eu-central-1", get_client=lambda region, ein_versuch=False: boto)
     monkeypatch.setattr(bedrock_service, "get_bedrock_client", lambda: client)
     with pytest.raises(HTTPException) as exc:
         await bedrock_service.call_bedrock(_request())
