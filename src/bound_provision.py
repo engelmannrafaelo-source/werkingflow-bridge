@@ -108,7 +108,13 @@ async def pruefe(conn: Any, a: argparse.Namespace) -> List[Dict[str, Any]]:
     aktiv = await conn.fetchval(
         "SELECT count(*) FROM service_principals WHERE proxy_user_id = $1 AND active "
         "AND cardinality(proxy_routes) > 0", uid) if cols == 5 else None   # wie Unique-Index 082
-    z("kein_aktiver_gebundener_principal", aktiv == 0, aktiv)
+    alt = await conn.fetch(
+        "SELECT id FROM service_principals WHERE proxy_user_id = $1 AND active "
+        "AND cardinality(proxy_routes) > 0", uid) if cols == 5 else []
+    # H-KD-3: auch ein ABGELAUFENER, aber aktiver Principal blockiert die Neuanlage (Unique-Index 082).
+    z("kein_aktiver_gebundener_principal", aktiv == 0,
+      aktiv if not alt else {"anzahl": aktiv, "zuerst_widerrufen": [
+          f"python -m src.bound_provision widerrufen --ziel dev --id {r['id']}" for r in alt]})
     return erg
 
 
