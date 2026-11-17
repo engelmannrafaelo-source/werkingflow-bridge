@@ -321,9 +321,35 @@ def _texte(text: str) -> List[Tuple[int, int]]:
 # ("B-02 - Herr", "B-02 / Familie", "B-02 [Mieterin]", "B-02 — Mieterin", "B-02 Mieterin"), in jeder einheitlichen
 # Schreibung. Uebersprungen werden nur Kopula und Artikel/Possessiva (geschlossene Wortklassen); Zelltrenner
 # (; | Tab, CSV-Komma ohne Leerzeichen) und Satzende (. ! ? + Leerraum) beenden die Pruefung.
-_KOPULA_ARTIKEL = frozenset("""ist war sind waren wird wurde bleibt als heisst heißt der die das den dem des ein eine
-einen einem einer unser unsere unserem unseren unserer ihr ihre ihrem ihren ihrer sein seine seinem seinen seiner
-""".split())
+_KOPULA = frozenset("ist war sind waren wird wurde bleibt als heisst heißt".split())
+_ARTIKEL = frozenset("""der die das den dem des ein eine einen einem einer unser unsere unserem unseren unserer ihr
+ihre ihrem ihren ihrer sein seine seinem seinen seiner""".split())
+_KOPULA_ARTIKEL = _KOPULA | _ARTIKEL
+# R3d (SEC/Rafael zu H-F-3): in Zeilen ohne Grossschreibung bzw. ganz in Versalien fehlt das Substantiv-Signal der
+# Grossschreibung. Gesperrt wird dort nur bei echter Rollenbindung: Marker, Personen-Substantiv (diese Liste, nur
+# SPERRENDE Richtung - sie gibt nie etwas frei), oder Apposition/Artikel vor einem Wort, das weder Bauteil noch
+# Funktionswort noch Verb-/Partizipform ist. Verben/Partizipien/Adjektive als Praedikat ("ist eingebaut") sperren nicht.
+_PERSONEN_GRUNDWORTE = (
+    "familie", "bewohner", "patient", "kollege", "kolleg", "klient", "nachbar", "schueler", "schüler", "bewerber",
+    "besitzer", "kaeufer", "käufer", "verkaeufer", "verkäufer", "vertreter", "absender", "empfaenger", "empfänger",
+    "angehoerig", "angehörig", "haushalt", "gast", "eltern", "kind", "sohn", "tochter", "ehepaar", "ehemann", "mann",
+    "witwe", "witwer", "erbe", "erbin", "hausmeister", "verwalter", "sachbearbeiter", "bearbeiter", "beauftragt",
+    "vermieter", "untermieter", "pächter", "paechter", "anwohner", "einwohner", "bürger", "buerger", "besucher",
+    "teilnehmer", "student", "rentner", "pfleger", "betreuer", "vormund", "dr", "prof",
+    # Personenwoerter in Partizip-/ge-Form (stehen vor _VERBFORM): Angestellte, Geselle, Genosse, Gefaehrte
+    "angestellt", "gesell", "genoss", "gefaehrt", "gefährt", "gesandt", "geschwister", "gemahl", "geliebt",
+)
+
+
+def _ist_personenwort(w: str) -> bool:
+    """Personen-/Rollen-Substantiv (auch als Kompositum-Ende, mit Flexion/Femininform). Nur sperrende Richtung."""
+    n = w.casefold()
+    return any(n.endswith(g + e) for g in _PERSONEN_GRUNDWORTE
+               for e in ("", "e", "n", "en", "s", "es", "in", "innen", "er", "ern"))
+
+
+_VERBFORM = re.compile(r"(?:(?:ab|an|auf|aus|ein|nach|um|vor|zu|zurueck|zurück|aus|durch|ueber|über|unter)?ge[a-zäöüß]{2,}(?:t|en|et)|[a-zäöüß]{3,}iert|[a-zäöüß]{2,}(?:lich|ig|isch|bar|los|haft))",
+                       re.IGNORECASE)
 # Funktionswoerter, die in Zeilen ohne Grossschreibung (bzw. ganz in Versalien) als erstes Wort NICHT sperren.
 _FUNKTIONSWORT = frozenset("""und oder sowie mit ohne im in am an auf aus bei fuer für von vom nach vor zu zum zur
 ueber über unter zwischen hinter neben ab bis durch gegen um ins
@@ -357,6 +383,8 @@ def _rolle_an_stelle(text: str, ende: int) -> Optional[str]:
     rest = text[ende:ze]
     stil = _zeilenstil(text[zs:ze])
     i = 0
+    artikel = False
+    apposition = False
     while True:
         j = i
         while j < len(rest) and not rest[j].isalnum():
@@ -367,9 +395,14 @@ def _rolle_an_stelle(text: str, ende: int) -> Optional[str]:
         if i == 0:
             t = trenner.strip()
             if (t in (";", "|") or "\t" in trenner or (trenner[:1] == "," and len(trenner) == 1)):
-                return None  # Tabellenzelle: getrennte Daten (Rafael 17.11.)
+                # Tabellenzelle: getrennte Daten (Rafael 17.11.) - in der Nachbarzelle sperrt NUR ein Marker
+                # (wie 2ddac66; Vorbefund P-PRV-9): "B-02;Kontaktperson ...", "B-02|Mieterin" maskiert,
+                # "B-02;Familie Sonnwendt" bzw. ein Name ohne Marker sperrt nicht.
+                zm = _WORT.match(rest, j)
+                return zm.group(0) if zm and ist_marker(zm.group(0)) else None
         if re.search(r"[.!?]\s", trenner):
             return None  # Satzende
+        apposition = apposition or bool(trenner.strip())
         km = _KENNUNG_IM_TEXT.match(rest, j)
         if km:
             return None  # Aufzaehlung weiterer Kennungen
@@ -378,6 +411,7 @@ def _rolle_an_stelle(text: str, ende: int) -> Optional[str]:
             return None
         w = m.group(0)
         if w.casefold() in _KOPULA_ARTIKEL:
+            artikel = artikel or w.casefold() in _ARTIKEL
             i = m.end()
             continue
         if ist_marker(w):
@@ -387,11 +421,16 @@ def _rolle_an_stelle(text: str, ende: int) -> Optional[str]:
         if stil == "normal":
             gross = re.fullmatch(r"[A-ZÄÖÜ][a-zäöüß][\wäöüß-]*", w) or _VERSAL.fullmatch(w)
             return w if gross else None
-        if w.casefold() in _FUNKTIONSWORT:
+        # Zeile ohne Grossschreibung / ganz in Versalien (R3d): nur echte Rollenbindung sperrt
+        if _ist_personenwort(w):
+            return w
+        if w.casefold() in _FUNKTIONSWORT or _VERBFORM.fullmatch(w):
             return None
         if stil == "versal" and len(w) <= 3:
             return None  # Einheiten/Abkuerzungen (DN, PN, KW)
-        return w
+        if apposition or artikel:
+            return w  # Apposition/Artikel + unbekanntes Wort: fail-closed
+        return None  # Praedikat (Verb/Adjektiv) ohne Rollenbindung
 
 
 _PRAEPOSITIONEN = frozenset({
