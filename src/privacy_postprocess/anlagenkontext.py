@@ -59,7 +59,15 @@ _MARKER_GRUNDWORTE = (
     "person", "kontakt", "ansprech", "herr", "frau", "mitarbeiter", "kunde", "mieter", "nutzer",
     "leiter", "planer", "prüfer", "pruefer", "gutachter", "techniker", "monteur", "ingenieur",
     "büro", "buero", "kanzlei", "team", "abteilung", "partner",
+    # adressaehnliche Kennungen (Review R1 P-PRV-3): "Wohnung W-12", "Haus B-02", "Stiege A-2", "Postfach PF-12"
+    # bleiben maskiert. Kosten: echte Bauteile wie "Pumpenhaus PH-01" bleiben fail-closed maskiert.
+    "wohnung", "haus", "stiege", "stock", "etage", "geschoss", "top", "tür", "tuer", "zimmer", "postfach",
+    "hausnummer", "objekt", "liegenschaft", "parzelle", "grundstück", "grundstueck",
 )
+# Trenner, mit dem die Schema-App mehrere Texte in EINEM Aufruf verbindet (homepage-schema pseudonymize.js).
+# Geltungsbereich der Entscheidung ist der einzelne Text dazwischen (Review R1 D-PRV-1).
+_TEXT_TRENNER = re.compile(r"WERKING_DOCUMENT_[0-9a-fA-F-]{36}")
+_SATZENDE = re.compile(r"[.!?;]\s|\n")
 
 
 def kennungsform(text: str, start: int, ende: int) -> bool:
@@ -78,25 +86,58 @@ def kennungsform(text: str, start: int, ende: int) -> bool:
     return True
 
 
-def bauteilwort(text: str, start: int) -> Optional[str]:
-    """Das Wort unmittelbar vor der Fundstelle (nur Leerzeichen/Tab dazwischen, gleiche Zeile)."""
+_AUFZAEHLUNG = re.compile(r"(?:,\s*|\s+(?:und|oder|sowie)\s+)$")
+
+
+def _vorwort_stelle(text: str, start: int, tiefe: int = 0) -> Optional[Tuple[int, int]]:
+    """Stelle (von, bis) des Worts, an das die Kennung bei ``start`` syntaktisch gebunden ist:
+      - unmittelbar davor, nur Leerzeichen/Tab dazwischen ("Kaltwasserverteiler KV-01"), auch am Anfang einer
+        Tabellenzelle ("…;Kreis UK-01", "…,Ruecklauf UK-01");
+      - davor eine oeffnende Klammer ("Umwaelzpumpe (P-02"), gleiche Zeile;
+      - Aufzaehlung: steht davor ", " / " und " / " oder " / " sowie " und davor wieder eine freie Kennung,
+        gilt deren Bindung ("Verbraucher RLT-01, UK-01"; hoechstens 6 Glieder).
+    Sonst None."""
+    if tiefe > 6:
+        return None
+    zs = text.rfind("\n", 0, start) + 1
+    vor = text[zs:start]
+    m = _AUFZAEHLUNG.search(vor)
+    if m and tiefe < 6:
+        k_ende = zs + m.start()
+        km = re.search(r"[A-Z]{1,4}-\d{1,4}$", text[zs:k_ende])
+        if km:
+            k_start = zs + km.start()
+            if kennungsform(text, k_start, k_ende) or text[k_ende:k_ende + 1] == ",":
+                return _vorwort_stelle(text, k_start, tiefe + 1)
     i = start
-    while i > 0 and text[i - 1] in " \t":
+    while i > zs and text[i - 1] in " \t":
         i -= 1
+    if i > zs and text[i - 1] == "(":
+        i -= 1
+        while i > zs and text[i - 1] in " \t":
+            i -= 1
     if i == start:
         return None  # nichts dazwischen = angeklebt
     j = i
-    while j > 0 and (text[j - 1].isalpha() or text[j - 1] == "-"):
+    while j > zs and (text[j - 1].isalpha() or text[j - 1] == "-"):
         j -= 1
-    wort = text[j:i]
-    if not wort or (j > 0 and text[j - 1] not in " \t\n|(\"'„"):
+    if j == i or (j > zs and text[j - 1] not in " \t|(\"'„;,"):
         return None
-    return wort
+    return j, i
+
+
+def bauteilwort(text: str, start: int) -> Optional[str]:
+    """Das Wort, an das die Kennung gebunden ist (siehe _vorwort_stelle), sonst None."""
+    st = _vorwort_stelle(text, start)
+    return text[st[0]:st[1]] if st else None
 
 
 def ist_marker(wort: str) -> bool:
     w = wort.casefold().rsplit("-", 1)[-1]
-    return any(w.endswith(t) for t in _MARKER_GRUNDWORTE) or w.startswith(("kontakt", "ansprech"))
+    # Grundwort inkl. Flexions-/Femininendung ("Lieferanten", "Planerin", "Mitarbeiterinnen", "Firmen")
+    return (any(w.endswith(t + e) for t in _MARKER_GRUNDWORTE for e in ("", "e", "n", "en", "s", "es", "in", "innen"))
+            or any(w.endswith(t[:-1] + "en") for t in _MARKER_GRUNDWORTE if t.endswith("a"))
+            or w.startswith(("kontakt", "ansprech")))
 
 
 def _ueberlappt(a: int, b: int, bereiche: Iterable[Tuple[int, int]]) -> bool:
@@ -113,8 +154,7 @@ def _ist_zelle(text: str, start: int, ende: int) -> bool:
     return bool(nach) and nach[0] in ";,|\t"
 
 
-def _zellen_nachbar(text: str, ende: int) -> Optional[str]:
-    """Erstes Wort der NAECHSTEN Zelle derselben Zeile (Tabellen-Definition 'KV-01;Kaltwasserverteiler;...')."""
+def _zellen_nachbar_stelle(text: str, ende: int) -> Optional[Tuple[int, int]]:
     i = ende
     while i < len(text) and text[i] == " ":
         i += 1
@@ -126,7 +166,7 @@ def _zellen_nachbar(text: str, ende: int) -> Optional[str]:
     j = i
     while j < len(text) and (text[j].isalpha() or text[j] == "-"):
         j += 1
-    return text[i:j] or None
+    return (i, j) if j > i else None
 
 
 def _bindung(text: str, start: int, ende: int, alle_bereiche: List[Tuple[int, int]]) -> Tuple[str, Optional[str]]:
@@ -136,18 +176,21 @@ def _bindung(text: str, start: int, ende: int, alle_bereiche: List[Tuple[int, in
                          Tabellenzelle ("KV-01;Kaltwasserverteiler;...") — das Dokument erklaert die Kennung;
     ("referenz", None)   sonst (Verweis auf eine anderswo definierte Kennung: "zwischen KV-01 und", "auf KV-01").
     Ein Wort, das selbst Fundstelle ist, zaehlt nicht als Bauteilwort."""
-    wort = bauteilwort(text, start)
-    if wort:
+    ws = _vorwort_stelle(text, start)
+    if ws:
+        wort = text[ws[0]:ws[1]]
         if ist_marker(wort):
             return "marker", wort
-        w_ende = len(text[:start].rstrip(" \t"))
-        if _SUBSTANTIV.fullmatch(wort) and not _ueberlappt(w_ende - len(wort), w_ende, alle_bereiche):
+        if _SUBSTANTIV.fullmatch(wort) and not _ueberlappt(ws[0], ws[1], alle_bereiche):
             return "definition", wort
     if _ist_zelle(text, start, ende):
-        z = _zellen_nachbar(text, ende)
+        zs = _zellen_nachbar_stelle(text, ende)
+        z = text[zs[0]:zs[1]] if zs else None
         if z and ist_marker(z):
             return "marker", z
-        if z and _SUBSTANTIV.fullmatch(z):
+        # Nachbarzelle nur als Definition, wenn sie selbst keine Fundstelle ist (Review R1 P-PRV-2:
+        # "LF-02;Huberwerk;..." -> LF-02 ist firmennah, bleibt maskiert)
+        if z and _SUBSTANTIV.fullmatch(z) and not _ueberlappt(zs[0], zs[1], alle_bereiche):
             return "definition", z
     return "referenz", None
 
@@ -164,53 +207,152 @@ def _haengt_an_harter_pii(start: int, ende: int, text: str, harte_bereiche: List
     return False
 
 
-def entscheide(text: str, kandidaten: List[Tuple[int, int, str, str]],
-               harte_bereiche: List[Tuple[int, int]], alle_bereiche: List[Tuple[int, int]]) -> Tuple[dict, list]:
-    """Dokumentweite Entscheidung je WERT, angewandt je Fundstelle.
+def _alle_vorkommen(text: str, wert: str) -> set:
+    return {(m.start(), m.end()) for m in re.finditer(re.escape(wert), text)}
 
-    kandidaten: (start, ende, typ, quelle) aller Detektor-Fundstellen.
-    Ein Wert gilt als Anlagenkennung dieses Dokuments, wenn
-      - JEDE seiner Fundstellen Detektor ORG/LOC in Kennungsform ist, nicht an harter PII haengt,
-      - mindestens EINE Fundstelle eine Definition ist (das Dokument erklaert die Kennung als Bauteil),
-      - KEINE Fundstelle einen Rollen-/Organisations-/Ortsmarker traegt (sonst mehrdeutig -> alles maskiert).
-    Dann werden seine Fundstellen herabgestuft (Definition und Referenzen). Sonst bleibt jede maskiert.
-    Rueckgabe: ({(start, ende): beleg}, [nicht herabgestufte Werte mit Grund]) — beides geht ins Ergebnis."""
-    nach_wert: dict = {}
+
+def _texte(text: str) -> List[Tuple[int, int]]:
+    """Grenzen der einzelnen Texte eines Aufrufs (zwischen den Trennern der Schema-App)."""
+    grenzen, pos = [], 0
+    for m in _TEXT_TRENNER.finditer(text):
+        grenzen.append((pos, m.start()))
+        pos = m.end()
+    grenzen.append((pos, len(text)))
+    return grenzen
+
+
+def _satz(text: str, start: int, ende: int, t0: int, t1: int) -> Tuple[int, int]:
+    s = t0
+    for m in _SATZENDE.finditer(text, t0, start):
+        s = m.end()
+    m = _SATZENDE.search(text, ende, t1)
+    return s, (m.start() + 1 if m else t1)
+
+
+_GROSSWORT = re.compile(r"[A-ZÄÖÜ][\wäöüß-]*")
+
+
+def _marker_im_satz(text: str, start: int, ende: int, t0: int, t1: int) -> Optional[str]:
+    """Rollen-/Organisations-/Orts-/Adressmarker IRGENDWO im selben Satz (Review R1 D-PRV-1)."""
+    s, e = _satz(text, start, ende, t0, t1)
+    for m in _GROSSWORT.finditer(text, s, e):
+        if m.start() <= start < m.end():
+            continue
+        if ist_marker(m.group(0)):
+            return m.group(0)
+    return None
+
+
+# PII-Spuren im Satz/in der Tabellenzeile OHNE Detektortreffer (SEC R2): Mail-Zeichen, Telefon-artige
+# Ziffernfolge (>= 7 Ziffern, Leerzeichen/Schraegstrich/Bindestrich erlaubt), Adresse "Wort + Hausnummer" mit PLZ.
+_PII_SPUR = re.compile(r"@|(?<![\w.])\+?\d(?:[ /-]?\d){6,}(?![\w])|\b\d{4,5}\s+[A-ZÄÖÜ][a-zäöüß]+")
+
+
+def _pii_im_satz(text: str, start: int, ende: int, t0: int, t1: int) -> Optional[str]:
+    s, e = _satz(text, start, ende, t0, t1)
+    m = _PII_SPUR.search(text[s:start] + " " + text[ende:e])
+    return m.group(0) if m else None
+
+
+# Geschlossene grammatische Wortklasse (Praepositionen), KEINE Werteliste: "auf KV-01", "zwischen KV-01 und WT-01",
+# "fuer UK-01". Sie belegt eine technische Referenz nur zusammen mit einer Definition desselben Werts im Aufruf.
+_PRAEPOSITIONEN = frozenset({
+    "an", "am", "auf", "aus", "bei", "beim", "bis", "durch", "fuer", "für", "gegen", "hinter", "im", "in", "ins",
+    "mit", "nach", "neben", "ueber", "über", "um", "unter", "vom", "von", "vor", "zu", "zum", "zur", "zwischen",
+    "hinter", "oberhalb", "unterhalb", "parallel",
+})
+
+
+def _lokaler_beleg(text: str, start: int, ende: int, alle_bereiche: List[Tuple[int, int]]) -> Tuple[str, Optional[str]]:
+    """Lokaler technischer Beleg EINER Stelle: ("marker", w) | ("definition", w) | ("referenz", w) | ("keiner", None).
+    referenz = Praeposition unmittelbar davor bzw. am Kopf der Aufzaehlung ("P-02 fuer RLT-01, P-03 fuer UK-01")."""
+    art, wort = _bindung(text, start, ende, alle_bereiche)
+    if art in ("marker", "definition"):
+        return art, wort
+    ws = _vorwort_stelle(text, start)
+    if ws and text[ws[0]:ws[1]].casefold() in _PRAEPOSITIONEN:
+        return "referenz", text[ws[0]:ws[1]]
+    return "keiner", None
+
+
+def entscheide(text: str, kandidaten: List[Tuple[int, int, str, str]],
+               harte_bereiche: List[Tuple[int, int]], alle_bereiche: List[Tuple[int, int]]) -> Tuple[dict, list, list]:
+    """Entscheidung JE STELLE (SEC-Designentscheid R2, Praezisierung mit Source-Owner).
+
+    Fuer einen Wert in Kennungsform, dessen Detektor-Stellen alle ORG/LOC sind, gilt fuer JEDES textuelle
+    Vorkommen im Aufruf (auch vom Dienst nicht gemeldete und eingebettete):
+      frei  NUR wenn die Stelle LOKAL technisch belegt ist (Bauteil-Definition an der Stelle, oder Praeposition/
+            Aufzaehlung als Referenz) UND sauber ist (Kennungsform, nicht an harter PII, kein Rollen-/Firmen-/Orts-/
+            Adress-/Kontaktmarker an der Stelle oder im Satz bzw. in der Tabellenzeile inkl. Nachbarzellen, keine
+            PII-Spur im Satz) UND der Wert IRGENDWO im Aufruf als Bauteil definiert ist (dateiuebergreifender HINWEIS,
+            der allein nie freigibt);
+      sonst maskiert — eine ungemeldete unklare Stelle wird ZUSAETZLICH maskiert (zusatz).
+    Eine maskierte Stelle exponiert nie eine andere und eine freie Stelle wird nicht wertglobal zurueckmaskiert:
+    der Aufrufer schuetzt die freien Stellen vor dem Nachzug (geschuetzt) und maskiert die zusatz-Stellen.
+    Rueckgabe: ({(start, ende): beleg} freie Detektor-Stellen, [abgelehnte Stellen mit Grund], [(start, ende, typ)] zusatz)."""
+    texte = _texte(text)
+    werte: dict = {}
     for st, en, typ, quelle in kandidaten:
-        nach_wert.setdefault(text[st:en], []).append((st, en, typ, quelle))
+        werte.setdefault(text[st:en], []).append((st, en, typ, quelle))
     frei: dict = {}
     abgelehnt: list = []
-    for wert, stellen in nach_wert.items():
+    zusatz: list = []
+    for wert, stellen in werte.items():
         if not _KENNUNG.fullmatch(wert):
             continue
-        grund = None
-        defs, marker = [], []
-        for st, en, typ, quelle in stellen:
-            if quelle != "detektor" or typ not in WEICHE_TYPEN:
-                grund = grund or "harter-oder-anderer-typ"
-                continue
-            if not kennungsform(text, st, en):
-                grund = grund or "eingebettet"
-                continue
-            if _haengt_an_harter_pii(st, en, text, harte_bereiche):
-                grund = grund or "an-harter-pii"
-                continue
-            art, wort = _bindung(text, st, en, alle_bereiche)
-            if art == "marker":
-                marker.append(wort)
-            elif art == "definition":
-                defs.append(wort)
-        if grund is None and marker:
-            grund = "mehrdeutig-marker:" + marker[0]
-        if grund is None and not defs:
-            grund = "keine-definition-im-dokument"
-        if grund:
-            abgelehnt.append({"wert": wert, "stellen": len(stellen), "grund": grund})
+        if any(q != "detektor" or t not in WEICHE_TYPEN for _, _, t, q in stellen):
+            abgelehnt.append({"wert": wert, "text": 0, "pos": None, "grund": "harter-oder-anderer-typ"})
             continue
-        beleg = defs[0]
-        for st, en, _, _ in stellen:
-            frei[(st, en)] = beleg
-    return frei, abgelehnt
+        typ0 = stellen[0][2]
+        gemeldet = {(st, en) for st, en, _, _ in stellen}
+        urteile = []  # (st, en, nr, frei?, grund/beleg)
+        definiert = False
+        for st, en in sorted(_alle_vorkommen(text, wert)):
+            nr = next(i for i, (t0, t1) in enumerate(texte, start=1) if t0 <= st <= t1)
+            t0, t1 = texte[nr - 1]
+            grund = None
+            if not kennungsform(text, st, en):
+                grund = "eingebettet"
+            elif _haengt_an_harter_pii(st, en, text, harte_bereiche):
+                grund = "an-harter-pii"
+            else:
+                art, wort = _lokaler_beleg(text, st, en, alle_bereiche)
+                mk = _marker_im_satz(text, st, en, t0, t1)
+                if art == "marker":
+                    grund = "marker:" + wort
+                elif mk:
+                    grund = "marker-im-satz:" + mk
+                elif _pii_im_satz(text, st, en, t0, t1):
+                    grund = "pii-spur-im-satz"
+                elif art == "keiner":
+                    grund = "kein-lokaler-technischer-beleg"
+                else:
+                    definiert = definiert or art == "definition"
+                    urteile.append((st, en, nr, True, wort))
+                    continue
+            urteile.append((st, en, nr, False, grund))
+        # Im selben TEXT mehrdeutig (Root A4: "Die Firma KV-01 ... Kaltwasserverteiler KV-01"): eine Marker-,
+        # PII- oder Einbettungs-Verwendung sperrt alle Stellen des Werts in DIESEM Text; andere Texte entscheiden
+        # je Stelle (SEC: "Ansprechpartner B-02" anderswo bleibt maskiert, technische Stellen bleiben frei).
+        mehrdeutig = {nr for _, _, nr, ok, info in urteile
+                      if not ok and info != "kein-lokaler-technischer-beleg"}
+        urteile = [(st, en, nr, False, "mehrdeutig-im-text") if ok and nr in mehrdeutig else (st, en, nr, ok, info)
+                   for st, en, nr, ok, info in urteile]
+        for st, en, nr, ok, info in urteile:
+            if ok and not definiert:
+                ok, info = False, "keine-definition-im-aufruf"
+            if ok and (st, en) in gemeldet:
+                frei[(st, en)] = info
+            elif not ok:
+                abgelehnt.append({"wert": wert, "text": nr, "pos": st, "grund": info})
+                if (st, en) not in gemeldet:
+                    zusatz.append((st, en, typ0))
+        if any((st, en) not in {(u[0], u[1]) for u in urteile} for st, en in gemeldet):
+            # fail-closed: eine gemeldete Stelle, die die Vorkommenssuche nicht sieht -> nichts freigeben
+            for k in [k for k in frei if text[k[0]:k[1]] == wert]:
+                del frei[k]
+            abgelehnt.append({"wert": wert, "text": 0, "pos": None, "grund": "stelle-ohne-pruefung"})
+    return frei, abgelehnt, zusatz
 
 
 def flag_an() -> bool:
