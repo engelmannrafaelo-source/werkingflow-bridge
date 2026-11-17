@@ -44,5 +44,7 @@ def sign_jwt(
 
 
 def verify_jwt(token: str) -> Dict[str, Any]:
-    """Raises jwt.InvalidTokenError if invalid/expired."""
-    return jwt.decode(token, _secret(), algorithms=[_ALGORITHM])
+    """Raises jwt.InvalidTokenError if invalid/expired. `exp` and `sub` are
+    REQUIRED (H-BT-4): a token without expiry was valid forever before."""
+    return jwt.decode(token, _secret(), algorithms=[_ALGORITHM],
+                      options={"require": ["exp", "sub"], "verify_exp": True})
