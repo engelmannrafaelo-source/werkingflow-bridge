@@ -30,6 +30,7 @@ to be.
 from __future__ import annotations
 
 import hashlib
+import re
 import logging
 import os
 import time
@@ -456,19 +457,33 @@ def validate_bound_spec(routes: List[str], user_id: str, tenant_id: str,
         raise ValueError("bound principal needs proxy_user_id and proxy_tenant_id")
 
 
+#: Opaker Zufallstoken: BOUND_TOKEN_PREFIX + base64url(32 Zufallsbytes) = 43 Zeichen.
+#: Der Token traegt KEINE Claims; Scope, Nutzer, Mandant, Ablauf und Widerruf
+#: kommen ausschliesslich aus der Registry (service_principals, Suche per sha256).
+BOUND_TOKEN_RANDOM_BYTES = 32
+_BOUND_TOKEN_RE = re.compile(r"^" + re.escape(BOUND_TOKEN_PREFIX) + r"[A-Za-z0-9_-]{43}$")
+
+
 def new_bound_token() -> str:
     import secrets as _secrets
-    return BOUND_TOKEN_PREFIX + _secrets.token_urlsafe(32)
+    return BOUND_TOKEN_PREFIX + _secrets.token_urlsafe(BOUND_TOKEN_RANDOM_BYTES)
 
 
-async def create_bound_principal(name: str, token: str, app_id: str, routes: List[str],
+def is_wellformed_bound_token(token: str) -> bool:
+    """Formpruefung (Praefix + genau 43 base64url-Zeichen). Keine Authentisierung:
+    sie spart nur den DB-Lookup fuer offensichtlich falsche Werte."""
+    return bool(_BOUND_TOKEN_RE.fullmatch(token))
+
+
+async def create_bound_principal(name: str, app_id: str, routes: List[str],
                                  user_id: str, tenant_id: str, expires_at) -> dict:
     """Legt einen gebundenen Principal an. Prueft in DERSELBEN Transaktion, dass
     der Nutzer existiert und serverseitig zu tenant_id gehoert (keine Slug-Annahme)."""
     import uuid as _uuid
     validate_bound_spec(routes, user_id, tenant_id, [app_id])
-    if not token.startswith(BOUND_TOKEN_PREFIX):
-        raise ValueError("bound token must carry the bound prefix")
+    # Der Token wird NUR hier erzeugt (32 Zufallsbytes); ein Aufrufer kann keinen
+    # eigenen, womoeglich schwachen Wert einbringen. Rueckgabe einmalig im Ergebnis.
+    token = new_bound_token()
     uid = _uuid.UUID(user_id)
     async with get_pool().acquire() as conn:
         async with conn.transaction():
@@ -490,4 +505,5 @@ async def create_bound_principal(name: str, token: str, app_id: str, routes: Lis
     invalidate_cache()
     return {"id": str(row["id"]), "name": row["name"], "allowed_apps": list(row["allowed_apps"]),
             "proxy_routes": list(row["proxy_routes"]), "proxy_user_id": str(row["proxy_user_id"]),
-            "proxy_tenant_id": row["proxy_tenant_id"], "proxy_expires_at": row["proxy_expires_at"].isoformat()}
+            "proxy_tenant_id": row["proxy_tenant_id"], "proxy_expires_at": row["proxy_expires_at"].isoformat(),
+            "token": token}

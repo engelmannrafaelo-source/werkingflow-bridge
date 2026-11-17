@@ -333,6 +333,8 @@ async def _verify_bound_token(token: str, request: Request) -> AuthClaims:
     import json as _json
     from src import principals as _p
 
+    if not _p.is_wellformed_bound_token(token):
+        raise _bound_deny(401, "malformed", request=request)
     bp = await _p.get_bound_principal_by_token(token)
     if bp is None:
         raise _bound_deny(401, "unknown, revoked or expired", request=request)
