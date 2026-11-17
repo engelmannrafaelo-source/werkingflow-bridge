@@ -149,20 +149,41 @@ async def _release_unsent(reservation: str) -> None:
     await _survive_cancel(_finish(reservation, rejected=True))
 
 
-async def _nicht_gesendet(reservation: str, kette: dict | None) -> None:
+async def _nicht_gesendet(reservation: str, kette: dict | None, phase: str = "versand",
+                          exc: BaseException | None = None) -> None:
     """Belegt nicht gesendet. Ohne Kette wie bisher freigeben. Mit Kette (B1, Root 01a1e624) bleibt die
     Reserve erhalten und die Zeile wird als unknown/nicht_gesendet markiert; aufloesen darf sie nur der
-    auditierte Betreiberabgleich, nie der Client, nie ein Timeout."""
+    auditierte Betreiberabgleich, nie der Client, nie ein Timeout. L4: Phase und Ausnahmeklasse als Beleg."""
     if kette is None:
         await _release_unsent(reservation)
     else:
-        await _mark_unknown(reservation, "nicht_gesendet")
+        await _mark_unknown(reservation, "nicht_gesendet", phase=phase,
+                            detail=type(exc).__name__ if exc is not None else None)
 
 
-async def _mark_unknown(reservation: str, reason: str) -> None:
+def _request_id(response: httpx.Response) -> str | None:
+    rid = response.headers.get("request-id")
+    return rid if isinstance(rid, str) and re.fullmatch(r"[A-Za-z0-9_\-]{1,128}", rid) else None
+
+
+async def _gesendet(reservation: str, response: httpx.Response) -> None:
+    """L2 (Kanzler-Entscheid E3): Versandbeleg sofort nach Eingang der Anbieterantwort festhalten, VOR jeder
+    Abrechnung oder Markierung. Danach ist eine Marke nicht_gesendet fuer diese Zeile widerlegt."""
+    async def schreiben():
+        try:
+            await coordinator("POST", "/gesendet", {"id": reservation, "request_id": _request_id(response),
+                                                    "status": response.status_code})
+        except Exception:
+            log.error("Credit reservation %s: send receipt not stored (request-id kept in later mark)", reservation)
+    await _survive_cancel(schreiben())
+
+
+async def _mark_unknown(reservation: str, reason: str, **beleg: Any) -> None:
+    daten = {"id": reservation, "reason": reason, **{k: v for k, v in beleg.items() if v is not None}}
+
     async def mark():
         try:
-            await coordinator("POST", "/unknown", {"id": reservation, "reason": reason})
+            await coordinator("POST", "/unknown", daten)
         except Exception:
             log.error("Credit reservation %s: outcome unknown (%s), marker not stored; "
                       "remains charged at its upper bound", reservation, reason)
@@ -171,20 +192,70 @@ async def _mark_unknown(reservation: str, reason: str) -> None:
     await _survive_cancel(mark())
 
 
-async def _kette_abrechnen(reservation: str, body: dict, kette: dict, antwort: dict, usage: dict) -> None:
+# P-1 (Kanzler, R2 978bb4f; Schema-Nachtrag S1-4 von 51c8185c, MAPPING-ITERATIONEN-15-AUF-7 bf7d01d38c45):
+# kanonische Iterationsform ist die von abschluss_felder()/fallback_bewerten(). Der Koordinator bleibt streng
+# bei genau diesen 7 Schluesseln; der Client bildet ausdruecklich und ohne Lax-Umwandlung darauf ab.
+ITER_SETTLE = ("type", "model", "input_tokens", "output_tokens", "cache_read_input_tokens",
+               "cache_creation_input_tokens", "billed")
+# Bekannte Zusatzfelder der S1-4-Form, die das Settlement nicht traegt (Begruendung im Ruecklauf P-1):
+# index = Listenposition (geprueft), kategorienliste_version in cost_basis = Aufrufebene (geprueft), Rest Anzeige/Ledger.
+ITER_S14_ZUSATZ = frozenset({"index", "stop_reason", "category", "recommended_model", "cost_eur",
+                             "cost_schaetzung_eur", "cost_basis", "quelle"})
+
+
+def iterationen_abbilden(roh: Any, kategorienliste_version: str) -> list[dict]:
+    """S1-4-Iterationen (7er- oder 15er-Form) -> genau die 7 Settle-Schluessel. Wirft ValueError statt
+    umzuwandeln: fehlendes Pflichtfeld, Token nicht int >= 0 (auch None = usage unvollstaendig), billed
+    ausserhalb true|false|"unbekannt", unbekannter Zusatzschluessel, index != Position, abweichende
+    kategorienliste_version. Folge beim Aufrufer: Marke bewertung_fehlt, Reserve bleibt."""
+    if not isinstance(roh, list) or not roh:
+        raise ValueError("iterations fehlen")
+    aus = []
+    for pos, it in enumerate(roh):
+        if not isinstance(it, dict):
+            raise ValueError(f"iteration {pos}: kein Objekt")
+        fremd = set(it) - set(ITER_SETTLE) - ITER_S14_ZUSATZ
+        if fremd:
+            raise ValueError(f"iteration {pos}: unbekannte Schluessel {sorted(fremd)}")
+        fehlt = [k for k in ITER_SETTLE if k not in it]
+        if fehlt:
+            raise ValueError(f"iteration {pos}: fehlt {fehlt}")
+        if not isinstance(it["type"], str) or not isinstance(it["model"], str) or not it["model"]:
+            raise ValueError(f"iteration {pos}: type/model")
+        if any(type(it[k]) is not int or it[k] < 0 for k in ITER_SETTLE[2:6]):
+            raise ValueError(f"iteration {pos}: Tokenfelder nicht int >= 0")
+        b = it["billed"]
+        if not (b is True or b is False or (isinstance(b, str) and b == "unbekannt")):
+            raise ValueError(f"iteration {pos}: billed")
+        if "index" in it and (type(it["index"]) is not int or it["index"] != pos):
+            raise ValueError(f"iteration {pos}: index != Position")
+        basis = it.get("cost_basis")
+        if basis is not None and (not isinstance(basis, dict)
+                                  or basis.get("kategorienliste_version", kategorienliste_version) != kategorienliste_version):
+            raise ValueError(f"iteration {pos}: kategorienliste_version abweichend")
+        aus.append({k: it[k] for k in ITER_SETTLE})
+    return aus
+
+
+async def _kette_abrechnen(reservation: str, body: dict, kette: dict, antwort: dict, usage: dict,
+                          request_id: str | None = None) -> None:
     erlaubt = {_norm(m) for m in [body["model"], *kette["fallback_models"]]}
     if not isinstance(antwort.get("model"), str) or _norm(antwort["model"]) not in erlaubt:
         log.error("Credit reservation %s: answering model outside the chain; retained", reservation)
-        await _mark_unknown(reservation, "modell_abweichung")
+        await _mark_unknown(reservation, "modell_abweichung", request_id=request_id, usage=usage,
+                            model=antwort.get("model"))
         return
     try:
         bewertung = kette["bewerter"](antwort)
-        daten = {"usage": usage, "iterations": bewertung["iterations"], "lage": bewertung["lage"],
+        daten = {"usage": usage, "iterations": iterationen_abbilden(bewertung["iterations"],
+                                                                   kette["kategorienliste_version"]),
+                 "lage": bewertung["lage"],
                  "antwort_iteration": bewertung.get("antwort_iteration"),
                  "kategorienliste_version": kette["kategorienliste_version"]}
     except Exception:
         log.error("Credit reservation %s: chain evaluation failed; retained at upper bound", reservation)
-        await _mark_unknown(reservation, "bewertung_fehlt")
+        await _mark_unknown(reservation, "bewertung_fehlt", request_id=request_id, usage=usage,
+                            model=antwort.get("model"))
         return
     await _survive_cancel(_finish(reservation, **daten))
 
@@ -348,10 +419,10 @@ async def post_messages(body: dict, timeout: float, pin: dict | None = None, *,
                 if exc.status_code in (409, 429):
                     continue
                 # A coordinator timeout may still have committed the row.
-                await _nicht_gesendet(reservation, kette)
+                await _nicht_gesendet(reservation, kette, "reserve", exc)
                 raise
-            except asyncio.CancelledError:
-                await _nicht_gesendet(reservation, kette)
+            except asyncio.CancelledError as exc:
+                await _nicht_gesendet(reservation, kette, "reserve", exc)
                 raise
             # Committed: from here on the pool table has a row for it, whatever
             # its later state (settled / released / unknown).
@@ -360,8 +431,8 @@ async def post_messages(body: dict, timeout: float, pin: dict | None = None, *,
             # generated a paid answer. Keep the reservation, fail visibly.
             try:
                 response = await client.post(API, headers={**headers, **zusatz_koepfe}, json=body)
-            except NOT_SENT_ERRORS:
-                await _nicht_gesendet(reservation, kette)
+            except NOT_SENT_ERRORS as exc:
+                await _nicht_gesendet(reservation, kette, "versand", exc)
                 raise
             except asyncio.CancelledError:
                 await _mark_unknown(reservation, "cancelled")
@@ -375,6 +446,10 @@ async def post_messages(body: dict, timeout: float, pin: dict | None = None, *,
             meta = {"credit_pool_account": account["id"], "credit_pool_org": account["org_id"],
                     "credit_pool_grant": account["grant_id"], "credit_pool_reservation": reservation,
                     "funding_policy": "promotional_only", "automatic_paid_fallback": False}
+            rid = None
+            if kette is not None:
+                rid = _request_id(response)
+                await _gesendet(reservation, response)
             if response.status_code == 200:
                 if pin is not None:
                     pin.setdefault("account_id", account["id"])
@@ -383,16 +458,16 @@ async def post_messages(body: dict, timeout: float, pin: dict | None = None, *,
                     usage = antwort["usage"]
                 except (ValueError, KeyError, TypeError):
                     log.error("Credit reservation %s: unreadable paid response; retained", reservation)
-                    await _mark_unknown(reservation, "unreadable_usage")
+                    await _mark_unknown(reservation, "unreadable_usage", request_id=rid)
                 else:
                     if kette is None:
                         await _survive_cancel(_finish(reservation, usage=usage))
                     else:
-                        await _kette_abrechnen(reservation, body, kette, antwort, usage)
+                        await _kette_abrechnen(reservation, body, kette, antwort, usage, rid)
                 return response, meta
             if kette is not None and 400 <= response.status_code < 500:
                 # Ob mit fallbacks vor einem 4xx schon ein Versuch lief, ist nicht belegt: nie freigeben.
-                await _mark_unknown(reservation, "http_status")
+                await _mark_unknown(reservation, "http_status", request_id=rid)
                 return response, meta
             if 400 <= response.status_code < 500:
                 await _survive_cancel(_finish(reservation, rejected=True))
@@ -404,7 +479,7 @@ async def post_messages(body: dict, timeout: float, pin: dict | None = None, *,
                 if exhausted or response.status_code in (401, 403, 429):
                     continue
             else:
-                await _mark_unknown(reservation, "http_status")
+                await _mark_unknown(reservation, "http_status", request_id=rid)
             return response, meta
     if pinned:
         raise PinnedAccountLost(f"pinned credit account {pinned} refused (count/reserve/limit); no switch to "

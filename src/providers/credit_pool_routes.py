@@ -126,6 +126,10 @@ def reservation_cost(model: str, inputs: int, outputs: int) -> Decimal:
 
 
 def usage_cost(model: str, usage: dict) -> Decimal:
+    """Grant-Verbrauch in USD, bewusst konservativ (Kanzler-Festlegung S0 A3, 17.11.2026): Cache-Anlage zum
+    1h-Satz (2 x Eingabe), Cache-Lesen mit cache_read_mult, Websuche 0,01 je Anfrage, plus 10 % Aufschlag.
+    Weicht damit absichtlich vom Bridge-Ledger ab (dort Cache nach tatsaechlicher Stufe, Energy-Preis kommt
+    allein aus dem Ledger). Keine Angleichung: der Pool-Betrag ist Deckung, kein Preis."""
     names = ("input_tokens", "output_tokens", "cache_read_input_tokens", "cache_creation_input_tokens")
     if any(type(usage.get(n)) is not int or usage[n] < 0 for n in names):
         raise HTTPException(422, "Incomplete usage; reservation retained")
@@ -413,6 +417,76 @@ class Unknown(BaseModel):
     id: UUID
     reason: Literal["cancelled", "transport_error", "http_status", "unreadable_usage", "error",
                     "modell_abweichung", "bewertung_fehlt", "nicht_gesendet"]
+    # L2-L4 (Betreiberabgleich): optionaler Beleg, nur bei Kettenzeilen gespeichert, nie abrechnungswirksam.
+    # Roh angenommen: ein ungueltiger Beleg darf die Marke nie verhindern (nur beleg_ungueltig).
+    request_id: Any = None
+    usage: Any = None
+    model: Any = None
+    phase: Any = None
+    detail: Any = None
+
+
+REQUEST_ID_MUSTER = re.compile(r"[A-Za-z0-9_\-]{1,128}")
+NICHT_GESENDET_KLASSEN = ("ConnectError", "ConnectTimeout", "PoolTimeout")
+
+
+def beleg_usage_pruefen(usage: Any) -> bool:
+    """Beleg-usage streng (A4-Regeln): 4 Tokenfelder int >= 0; optional iterations (je model + 4 Tokenfelder)."""
+    if not isinstance(usage, dict) or any(type(usage.get(f)) is not int or usage[f] < 0 for f in TOKEN_FELDER):
+        return False
+    its = usage.get("iterations")
+    if its is None:
+        return True
+    return isinstance(its, list) and all(
+        isinstance(i, dict) and isinstance(i.get("model"), str) and i["model"]
+        and all(type(i.get(f)) is int and i[f] >= 0 for f in TOKEN_FELDER) for i in its)
+
+
+def _beleg(body: "Unknown") -> dict:
+    eintrag: dict = {}
+    ungueltig = []
+    for feld, ok in (("request_id", isinstance(body.request_id, str) and REQUEST_ID_MUSTER.fullmatch(body.request_id)),
+                     ("usage", beleg_usage_pruefen(body.usage)),
+                     ("model", isinstance(body.model, str) and 0 < len(body.model) <= 128),
+                     ("phase", body.phase in ("reserve", "versand")),
+                     ("detail", isinstance(body.detail, str) and re.fullmatch(r"[A-Za-z]{1,64}", body.detail))):
+        wert = getattr(body, feld)
+        if wert is None:
+            continue
+        if ok:
+            eintrag[feld] = wert
+        else:
+            ungueltig.append(feld)
+    if ungueltig:
+        eintrag["beleg_ungueltig"] = ungueltig
+    return eintrag
+
+
+class Gesendet(BaseModel):
+    id: UUID
+    request_id: Any = None
+    status: Any = None
+
+
+@router.post("/gesendet", dependencies=[Depends(authenticate)])
+async def gesendet(body: Gesendet):
+    """L2 (Kanzler-Entscheid E3): Versandbeleg einer Kettenzeile, vom Client sofort nach Eingang der Anbieter-
+    antwort und VOR jeder Abrechnung/Markierung gemeldet. Nur anhaengen, kein Zustandswechsel, keine
+    Abrechnungswirkung. Widerlegt jede spaetere Marke nicht_gesendet (Betreiberabgleich N weist dann ab)."""
+    eintrag = {"request_id": body.request_id if isinstance(body.request_id, str)
+               and REQUEST_ID_MUSTER.fullmatch(body.request_id) else None,
+               "status": body.status if type(body.status) is int and 100 <= body.status <= 599 else None}
+    async with get_pool().acquire() as conn, conn.transaction():
+        row = await conn.fetchrow("SELECT state, usage FROM anthropic_credit_reservations WHERE id=$1 FOR UPDATE", body.id)
+        if not row:
+            raise HTTPException(404, "Unknown reservation")
+        envelope = _jsonb(row.get("usage"))
+        if not (isinstance(envelope, dict) and envelope.get("v") == ENVELOPE_VERSION):
+            raise HTTPException(400, "send receipt only for chain reservations")
+        await conn.execute("""UPDATE anthropic_credit_reservations SET usage = jsonb_set(usage, '{gesendet}',
+            COALESCE(usage->'gesendet','[]'::jsonb) || jsonb_build_array($2::jsonb || jsonb_build_object('at',now())))
+            WHERE id=$1""", body.id, json.dumps(eintrag))
+    return {"id": str(body.id), "state": row["state"]}
 
 
 @router.post("/unknown", dependencies=[Depends(authenticate)])
@@ -431,9 +505,14 @@ async def unknown(body: Unknown):
             return {"id": str(body.id), "state": row["state"]}
         envelope = _jsonb(row.get("usage"))  # asyncpg.Record und dict kennen .get
         if isinstance(envelope, dict) and envelope.get("v") == ENVELOPE_VERSION:
+            eintrag = {"reason": body.reason, **_beleg(body)}
+            if body.reason == "nicht_gesendet" and (envelope.get("gesendet") or envelope.get("response") is not None):
+                # Kanzler-Entscheid E3: Versand ist belegt -> Marke widerspricht; sichtbar halten, nie aufloesbar.
+                eintrag["widerspruch_versand"] = True
+                log.error("Credit reservation %s: nicht_gesendet contradicts a stored send receipt", body.id)
             await conn.execute("""UPDATE anthropic_credit_reservations SET usage = jsonb_set(usage, '{unknown}',
-                COALESCE(usage->'unknown','[]'::jsonb) || jsonb_build_array(jsonb_build_object(
-                'reason',$2::text,'marked_at',now()))) WHERE id=$1""", body.id, body.reason)
+                COALESCE(usage->'unknown','[]'::jsonb) || jsonb_build_array($2::jsonb || jsonb_build_object(
+                'marked_at',now()))) WHERE id=$1""", body.id, json.dumps(eintrag))
             return {"id": str(body.id), "state": "reserved", "outcome": "unknown"}
         await conn.execute("""UPDATE anthropic_credit_reservations SET usage=jsonb_build_object(
             'outcome','unknown','reason',$2::text,'marked_at',now()) WHERE id=$1""", body.id, body.reason)
