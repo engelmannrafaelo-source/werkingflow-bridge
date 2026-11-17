@@ -76,6 +76,10 @@ class VisionResponse:
     provider_request_id: Optional[str] = None
     provider_message_id: Optional[str] = None
     requested_model: Optional[str] = None
+    # Modell laut Anbieterantwort, roh (None, wenn die Antwort keines nennt). ``model``
+    # oben faellt dann auf das angefragte zurueck; die explizite Versionswahl meldet
+    # stattdessen "unbekannt" (modell_exakt.wahl), nie ein erfundenes Modell.
+    anbieter_modell: Optional[str] = None
     usage_iterations: Optional[List[Dict[str, Any]]] = None
     # S1: Inhaltsbloecke type "fallback" (Uebergabe zwischen Modellen) roh und
     # ob der Aufruf den Anbieter-Fallback bestellt hat (mit seiner Kette).
@@ -610,6 +614,7 @@ def _vision_response_from(data: Dict[str, Any], model: str) -> VisionResponse:
     return VisionResponse(
         content=response_text,
         model=data.get("model", model),
+        anbieter_modell=data.get("model") if isinstance(data.get("model"), str) and data.get("model") else None,
         usage=_usage_mit_cache(usage),
         stop_reason=_stop_reason_or_unknown(data.get("stop_reason")),
         messung=messung,
@@ -1233,6 +1238,8 @@ def _ledger_felder(finish: Dict[str, Any]) -> Dict[str, Any]:
     if finish.get("auswertung_fehler"):
         # B3 (Codepruefung R2): der Notabschluss ist in der Ledger-Zeile sichtbar.
         meta["auswertung_fehler"] = finish["auswertung_fehler"]
+    if isinstance(finish.get("modell_wahl"), dict):
+        meta["modell_wahl"] = dict(finish["modell_wahl"])
     if finish.get("fallback_angefordert"):
         its = finish.get("iterations") or []
         meta["fallback_lage"] = (finish.get("fallback") or {}).get("lage")

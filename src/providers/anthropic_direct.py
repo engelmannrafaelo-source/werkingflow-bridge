@@ -105,6 +105,12 @@ async def call_anthropic_direct(
             raise _ff.FallbackNichtMoeglich("fallback_body_unvertraeglich", f"ausdruecklich gesetzt: {ausdruecklich}")
         fallback_kette = await _ff.bestellung_pruefen(config.provider_model or request.model)
 
+    from src.providers import modell_exakt as _modell_exakt
+    exakt = _modell_exakt.bestellt(request)
+    if exakt:
+        # Vor jedem Anbieteraufruf: nicht gelistet / Liste unbekannt -> laut, kein Aufruf.
+        await _modell_exakt.verfuegbar_pruefen(config.provider_model or request.model)
+
     result = await route_to_vision(
         **({"fallback_kette": fallback_kette} if fallback_kette is not None else {}),
         messages=messages,
@@ -134,6 +140,9 @@ async def call_anthropic_direct(
         fallback_kette=fallback_kette,
         fallback_blocks=getattr(result, "fallback_blocks", None),
     )
+    if exakt:
+        finish["modell_wahl"] = _modell_exakt.wahl(request.model, gesendetes_modell,
+                                                    getattr(result, "anbieter_modell", None))
 
     return {
         "id": f"chatcmpl-direct-{uuid.uuid4().hex[:16]}",

@@ -67,6 +67,8 @@ class VisionResult:
     #: S1 Anbieter-Fallback: fallback-Inhaltsbloecke roh und die bestellte Kette.
     fallback_blocks: Optional[List[Dict[str, Any]]] = None
     fallback_kette: Optional[List[str]] = None
+    # Modell laut Anbieterantwort, roh (explizite Versionswahl: sonst "unbekannt").
+    anbieter_modell: Optional[str] = None
 
 
 def default_vision_target() -> str:
@@ -280,6 +282,7 @@ async def route_to_vision(
         usage_iterations=vision_response.usage_iterations,
         fallback_blocks=getattr(vision_response, "fallback_blocks", None),
         fallback_kette=getattr(vision_response, "fallback_kette", None),
+        anbieter_modell=getattr(vision_response, "anbieter_modell", None),
     )
 
 

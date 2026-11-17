@@ -211,6 +211,19 @@ class ChatCompletionRequest(BaseModel):
     # bestellen. Nur "default", nur Direktweg (claude-direct-notools), nicht
     # streamend, ohne Bild; alles andere ist ein lauter 400. Vorher wurde das
     # Feld wegen extra="ignore" still verworfen.
+    # Explizite Versionswahl (Rafael-Auftrag 17.11.2026): exakt registrierte ID
+    # unveraendert bedienen, nur Direktweg, Verfuegbarkeit laut Models API.
+    # Ohne das Feld (None) bleibt die Modellaufloesung wie bisher.
+    modell_exakt: Optional[bool] = Field(
+        default=None,
+        description=(
+            "true: serve exactly the requested registered model ID (no alias, no upgrade, no downgrade). "
+            "Direct tier only; the model must be listed by the provider Models API. Otherwise a loud 4xx "
+            "with fehler_code (modell_exakt_unbekannt, modell_exakt_weg_nicht_unterstuetzt, "
+            "modell_nicht_verfuegbar, modell_verfuegbarkeit_unbekannt). x_bridge_finish.modell_wahl "
+            "reports requested / resolved / responding."
+        ),
+    )
     provider_fallback: Optional[str] = Field(
         default=None,
         description=(

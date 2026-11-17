@@ -3310,7 +3310,12 @@ async def _chat_completions_lauf(
 
         # MODEL RESOLUTION: Fuzzy match model names (e.g., "sonnet" -> "claude-sonnet-4-5-20250929")
         original_model = request_body.model
-        resolved_model, resolution_msg = resolve_model(original_model)
+        from src.providers import modell_exakt as _modell_exakt
+        if _modell_exakt.bestellt(request_body):
+            # Explizite Versionswahl: exakt registrierte ID, kein Upgrade/Alias (laut 400 sonst).
+            resolved_model, resolution_msg = _modell_exakt.aufloesen(original_model), None
+        else:
+            resolved_model, resolution_msg = resolve_model(original_model)
 
         if resolved_model is None:
             # Model not found - return clear error
@@ -3673,6 +3678,20 @@ async def _chat_completions_lauf(
             backend_config.provider_model = resolved_model
             from src.jobs.selbstaufruf import ledger_provider_merken
             ledger_provider_merken(request, ledger_provider_for_backend(backend_config.backend))
+
+        # Explizite Versionswahl: nur auf dem Direktweg (dort ist die Verfuegbarkeit belegt).
+        from src.providers import modell_exakt as _modell_exakt_weg
+        if _modell_exakt_weg.bestellt(request_body) and not (
+            backend_config and backend_config.backend == BackendType.ANTHROPIC_DIRECT
+        ):
+            raise _modell_exakt_weg.ModellExaktNichtMoeglich(
+                "modell_exakt_weg_nicht_unterstuetzt",
+                f"backend:{backend_config.backend.value if backend_config else None}",
+            )
+        if _modell_exakt_weg.bestellt(request_body):
+            # Der Direkt-Tier traegt sonst sein eigenes Modell (registry.py:118
+            # _DEFAULT_SONNET). Bei expliziter Wahl geht genau die angefragte ID raus.
+            backend_config.provider_model = resolved_model
 
         # S1 Anbieter-Fallback: nur auf dem Direktweg. Jeder andere Weg wuerde
         # die Bestellung still uebergehen -> lauter 400 (Schema S-5).
