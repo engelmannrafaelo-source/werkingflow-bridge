@@ -194,6 +194,19 @@ class ChatCompletionRequest(BaseModel):
     user: Optional[str] = None
     session_id: Optional[str] = Field(default=None, description="Optional session ID for conversation continuity")
     enable_tools: Optional[bool] = Field(default=False, description="Enable Claude Code tools (Read, Write, Bash, etc.) - disabled by default for OpenAI compatibility")
+    # Codepruefung S0 A1 (Kanzler-Entscheid 17.11.2026): wer die
+    # Ablehnungsmarke (200 + content_filter + x_bridge_finish) versteht,
+    # kuendigt sie an — als Feld (uebersteht /v1/jobs) oder Kopf
+    # X-Bridge-Ablehnungsmarke: 1. Ohne Ankuendigung ist eine Ablehnung ein
+    # 422 modell_abbruch (nicht wiederholbar), nie ein leerer Erfolg.
+    bridge_ablehnungsmarke: Optional[bool] = Field(
+        default=None,
+        description=(
+            "Caller understands the refusal marker: a provider refusal then comes as HTTP 200 with "
+            "finish_reason content_filter and x_bridge_finish (refusal true, verwertbar false). "
+            "Without it a refusal is HTTP 422 fehler_code modell_abbruch, not retryable."
+        ),
+    )
 
     # Backend selection for multi-provider support
     backend: Optional[BackendType] = Field(

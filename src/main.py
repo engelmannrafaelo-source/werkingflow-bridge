@@ -1800,7 +1800,9 @@ async def generate_streaming_response(
                 # Ledger-Persist (der Prepaid-Spend ist real).
                 from src.vision_provider import finish_reason_for as _finish_reason_for
                 from src.vision_provider import (
-                    abschluss_felder as _abschluss_felder,
+                    abschluss_felder_sicher as _abschluss_felder,
+                    ablehnung_ohne_marke as _ablehnung_ohne_marke,
+                    ablehnungsmarke_angekuendigt as _marke_angekuendigt,
                     ist_ablehnung as _ist_ablehnung,
                     ledger_felder as _ledger_felder,
                 )
@@ -1886,13 +1888,29 @@ async def generate_streaming_response(
                     logger.warning(
                         f"⚠️ Vision streaming usage tracking failed (non-fatal): {_vision_track_err}"
                     )
+                if _stream_finish is not None and not _marke_angekuendigt(fastapi_request, request):
+                    # A1: ohne Ankuendigung ein Fehlerereignis mit dem 422-
+                    # Umschlag modell_abbruch (nicht wiederholbar) statt 502.
+                    _fehler = json.loads(_ablehnung_ohne_marke(_stream_finish).response.body)
+                    yield f"event: error\ndata: {json.dumps(_fehler)}\n\n"
+                    yield "data: [DONE]\n\n"
+                    return
                 if _stream_finish is not None:
-                    # Nach dem Persist: ein einziger Abschluss-Chunk mit der
-                    # Ablehnungsmarke, dann [DONE]. Kein Inhalt, kein Fehler.
+                    # Nach dem Persist: Teiltext (wie ohne Strom, N-1) und der
+                    # Abschluss-Chunk mit der Ablehnungsmarke, dann [DONE].
+                    # Der Kopf X-Bridge-Finish fehlt im Strom: die Koepfe
+                    # stehen vor dem Anbieteraufruf fest (Schema S-4).
+                    if vision_result.content:
+                        _teil_chunk = ChatCompletionStreamResponse(
+                            id=request_id,
+                            model=vision_result.model,
+                            choices=[StreamChoice(index=0, delta={"role": "assistant", "content": vision_result.content}, finish_reason=None)],
+                        )
+                        yield f"data: {_teil_chunk.model_dump_json()}\n\n"
                     _marke_chunk = ChatCompletionStreamResponse(
                         id=request_id,
                         model=vision_result.model,
-                        choices=[StreamChoice(index=0, delta={"role": "assistant", "content": ""}, finish_reason="content_filter")],
+                        choices=[StreamChoice(index=0, delta={} if vision_result.content else {"role": "assistant", "content": ""}, finish_reason="content_filter")],
                         x_bridge_finish=_stream_finish,
                     )
                     yield f"data: {_marke_chunk.model_dump_json()}\n\n"
@@ -4199,17 +4217,24 @@ async def _chat_completions_lauf(
             # Rohantwort; sonst bleibt die volle Reservierung stehen.
             await _test_ki_deckel.abrechnen(_test_ki_messung.messung if _test_ki_messung else None)
             logger.info(f"✅ Direct Anthropic request completed in {duration:.2f}s (tier={direct_tier})")
-            from src.vision_provider import ablehnungs_kopf, ledger_felder
+            from src.vision_provider import (
+                ablehnung_ohne_marke, ablehnungs_kopf, ablehnungsmarke_angekuendigt, ledger_felder,
+            )
             _direct_finish = response_data.get("x_bridge_finish") or {}
             await _persist_direct_usage(
                 abschluss_meta=ledger_felder(_direct_finish),
-                input_tokens=usage.get("prompt_tokens", 0) or 0,
+                # A3: ungecacht + Cache getrennt (vision_provider._usage_mit_cache),
+                # gleiche Grundlage wie x_bridge_finish.iterations.
+                input_tokens=usage.get("uncached_input_tokens", usage.get("prompt_tokens", 0)) or 0,
                 output_tokens=usage.get("completion_tokens", 0) or 0,
-                cache_read_tokens=usage.get("cache_read_input_tokens", 0) or 0,
-                cache_creation_tokens=usage.get("cache_creation_input_tokens", 0) or 0,
+                cache_read_tokens=usage.get("cache_read_tokens", 0) or 0,
+                cache_creation_tokens=usage.get("cache_creation_tokens", 0) or 0,
                 status="success",
                 duration_ms=int(duration * 1000),
             )
+            if _direct_finish.get("refusal") and not ablehnungsmarke_angekuendigt(request, request_body):
+                # A1: ohne Ankuendigung nie ein leerer Erfolg (nach der Buchung).
+                raise ablehnung_ohne_marke(_direct_finish)
             if tenant and usage:
                 from src.tenant import track_request_usage
                 await track_request_usage(
@@ -4563,8 +4588,10 @@ async def _chat_completions_lauf(
                         )
 
                     from src.vision_provider import (
+                        ablehnung_ohne_marke,
                         ablehnungs_kopf,
-                        abschluss_felder,
+                        ablehnungsmarke_angekuendigt,
+                        abschluss_felder_sicher as abschluss_felder,
                         ist_ablehnung,
                         ledger_felder,
                     )
@@ -4629,6 +4656,11 @@ async def _chat_completions_lauf(
                             f"⚠️ Vision usage tracking failed (non-fatal): {_vision_track_err}"
                         )
 
+                    if _vision_finish is not None and not ablehnungsmarke_angekuendigt(request, request_body):
+                        # A1: Aufrufer ohne Ankuendigung (Report, Works,
+                        # Engelmann, safety …) bekommen einen Fehlerstatus,
+                        # nie einen leeren Erfolg — nach der Buchung.
+                        raise ablehnung_ohne_marke(_vision_finish)
                     if _vision_finish is not None:
                         # Ablehnungsmarke (Variante A), nach dem Persist:
                         # 200, content_filter, x_bridge_finish (refusal,

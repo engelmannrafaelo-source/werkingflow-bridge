@@ -508,6 +508,32 @@ def _request_id_aus(response: Any) -> Optional[str]:
     return str(wert)
 
 
+def _int0(wert: Any) -> int:
+    return wert if type(wert) is int and wert >= 0 else 0
+
+
+def _usage_mit_cache(usage: Any) -> Dict[str, int]:
+    """OpenAI-usage mit Ledger-Semantik wie der Abo-Bildweg (Codepruefung S0 A3):
+    prompt_tokens = gesamter Eingang (ungecacht + Cache), dazu ungecacht und
+    beide Cache-Felder getrennt, damit Ledger und x_bridge_finish dieselben
+    Werte zum jeweils eigenen Satz rechnen. Bis 17.11.2026 fehlte der Cache
+    hier, das Ledger buchte ihn mit 0."""
+    u = usage if isinstance(usage, dict) else {}
+    ungecacht = _int0(u.get("input_tokens"))
+    lesen = _int0(u.get("cache_read_input_tokens"))
+    anlage = _int0(u.get("cache_creation_input_tokens"))
+    ausgabe = _int0(u.get("output_tokens"))
+    eingang = ungecacht + lesen + anlage
+    return {
+        "prompt_tokens": eingang,
+        "completion_tokens": ausgabe,
+        "total_tokens": eingang + ausgabe,
+        "uncached_input_tokens": ungecacht,
+        "cache_read_tokens": lesen,
+        "cache_creation_tokens": anlage,
+    }
+
+
 def _vision_response_from(data: Dict[str, Any], model: str) -> VisionResponse:
     """Die 200-Antwort der Anthropic Messages API -> VisionResponse."""
     # Extract response content
@@ -543,11 +569,7 @@ def _vision_response_from(data: Dict[str, Any], model: str) -> VisionResponse:
     return VisionResponse(
         content=response_text,
         model=data.get("model", model),
-        usage={
-            "prompt_tokens": usage.get("input_tokens", 0),
-            "completion_tokens": usage.get("output_tokens", 0),
-            "total_tokens": usage.get("input_tokens", 0) + usage.get("output_tokens", 0)
-        },
+        usage=_usage_mit_cache(usage),
         stop_reason=_stop_reason_or_unknown(data.get("stop_reason")),
         messung=messung,
         stop_details=stop_details,
@@ -711,8 +733,19 @@ def _build_sha() -> Optional[str]:
     return _build_sha_cache["sha"]
 
 
+def _str_oder_none(wert: Any, feld: str) -> Optional[str]:
+    """Typwaechter (Codepruefung S0 A2): Anbieterfelder sind Strings oder
+    fehlen. Alles andere wird None und laut geloggt — nie ein 500 nach einem
+    bezahlten Aufruf."""
+    if wert is None or isinstance(wert, str):
+        return wert
+    logger.warning("Anbieterfeld %s mit unerwartetem Typ %s — als fehlend behandelt", feld, type(wert).__name__)
+    return None
+
+
 def ist_ablehnung(stop_reason: Optional[str], stop_details: Optional[Dict[str, Any]]) -> bool:
-    return stop_reason == "refusal" or (stop_details or {}).get("type") == "refusal"
+    sd = stop_details if isinstance(stop_details, dict) else {}
+    return stop_reason == "refusal" or sd.get("type") == "refusal"
 
 
 def _billed_fuer_ablehnung(category: Optional[str], *, kategorie_bekannt: bool) -> Tuple[Any, str]:
@@ -777,7 +810,7 @@ def abschluss_felder(
     roh_stop = None if stop_reason in (None, "", "unknown") else stop_reason
     details = dict(stop_details) if isinstance(stop_details, dict) else None
     refusal = ist_ablehnung(roh_stop, details)
-    category = (details or {}).get("category") if refusal else None
+    category = _str_oder_none((details or {}).get("category"), "category") if refusal else None
 
     f: Dict[str, Any] = abschluss_aus_stop_reason(
         "refusal" if refusal else roh_stop, category=category,
@@ -792,12 +825,14 @@ def abschluss_felder(
     f["refusal"] = refusal
     f["empty_response"] = not content
     f["category"] = category
-    f["explanation"] = (details or {}).get("explanation") if refusal else None
-    f["recommended_model"] = (details or {}).get("recommended_model") if refusal else None
+    f["explanation"] = _str_oder_none((details or {}).get("explanation"), "explanation") if refusal else None
+    f["recommended_model"] = (
+        _str_oder_none((details or {}).get("recommended_model"), "recommended_model") if refusal else None
+    )
     f["stop_details"] = details
     f.setdefault("folgezuege", 0)
-    f["provider_request_id"] = provider_request_id
-    f["provider_message_id"] = provider_message_id
+    f["provider_request_id"] = _str_oder_none(provider_request_id, "request-id")
+    f["provider_message_id"] = _str_oder_none(provider_message_id, "id")
     f["requested_model"] = requested_model
     f["responding_model"] = responding_model
 
@@ -818,10 +853,13 @@ def abschluss_felder(
     iterations: List[Dict[str, Any]] = []
     letzte = len(quellen) - 1
     for i, (quelle, e) in enumerate(quellen):
-        it_model = e.get("model") or responding_model
+        it_model = _str_oder_none(e.get("model"), "iterations.model") or responding_model
         tokens = _token_felder(e)
         abgelehnt = (i == letzte and refusal) or (i < letzte and e.get("type") == "message")
-        it_category = e.get("category") if "category" in e else (category if i == letzte else None)
+        it_category = (
+            _str_oder_none(e.get("category"), "iterations.category") if "category" in e
+            else (category if i == letzte else None)
+        )
         if abgelehnt:
             kategorie_bekannt = (
                 "category" in e or (i == letzte and details is not None and "category" in details)
@@ -829,7 +867,10 @@ def abschluss_felder(
             billed, regel = _billed_fuer_ablehnung(it_category, kategorie_bekannt=kategorie_bekannt)
         else:
             billed, regel = True, "regulaer"
-        tokens_vollstaendig = quelle == "iterations" or (messung is not None and messung.vollstaendig)
+        tokens_vollstaendig = (
+            all(type(e.get(k)) is int and e.get(k) >= 0 for k in _MESSUNG_FELDER) if quelle == "iterations"
+            else (messung is not None and messung.vollstaendig)
+        )
         if tokens_vollstaendig:
             cost, schaetzung = _iterations_kosten(it_model, tokens, billed)
         else:
@@ -896,10 +937,100 @@ def abschluss_felder(
     return f
 
 
+def abschluss_felder_sicher(**kw: Any) -> Dict[str, Any]:
+    """abschluss_felder, die nie werfen (Codepruefung S0 A2). Scheitert die
+    Auswertung an einer unerwarteten Anbieterantwort, entsteht ein Notabschluss:
+    Ablehnung nach stop_reason, nicht verwertbar, Kosten unbekannt — laut."""
+    try:
+        return abschluss_felder(**kw)
+    except Exception as e:  # noqa: BLE001 — nach einem bezahlten Aufruf nie 500
+        logger.error("abschluss_felder: Auswertung gescheitert (%s: %s) — Notabschluss", type(e).__name__, e)
+        stop = kw.get("stop_reason")
+        sd = kw.get("stop_details")
+        refusal = stop == "refusal" or (isinstance(sd, dict) and sd.get("type") == "refusal")
+        return {
+            "auswertung_fehler": type(e).__name__,
+            "stop_reason": stop if isinstance(stop, str) else None,
+            "refusal": refusal,
+            "vollstaendig_unbestimmt": True,
+            "empty_response": not kw.get("content"),
+            "verwertbar": False,
+            "retryable": False if refusal else None,
+            "cost_status": "unbekannt",
+            "cost_total_eur": None,
+            "cost_schaetzung_eur": None,
+            "iterations": [],
+            "kategorienliste_version": BERECHNETE_ABLEHNUNGSKATEGORIEN["version"],
+            "bridge_worker": _bridge_worker(),
+        }
+
+
+#: Ankuendigung eines Aufrufers, dass er die Ablehnungsmarke (200 +
+#: content_filter + x_bridge_finish) versteht (Kanzler-Entscheid zu
+#: Codepruefung S0 A1). Kopf fuer direkte Aufrufer; das gleichnamige Body-Feld
+#: ``bridge_ablehnungsmarke`` uebersteht auch /v1/jobs (der Job-Selbstaufruf
+#: reicht nur Attributionskoepfe weiter, jobs/executors._build_headers).
+ABLEHNUNGSMARKE_KOPF = "X-Bridge-Ablehnungsmarke"
+
+
+def ablehnungsmarke_angekuendigt(http_request: Any, request_body: Any) -> bool:
+    if getattr(request_body, "bridge_ablehnungsmarke", None) is True:
+        return True
+    try:
+        wert = http_request.headers.get(ABLEHNUNGSMARKE_KOPF) if http_request is not None else None
+    except AttributeError:
+        wert = None
+    return (wert or "").strip().lower() in ("1", "true", "ja")
+
+
+def ablehnung_ohne_marke(finish: Dict[str, Any]) -> Any:
+    """Antwort fuer Aufrufer OHNE Ankuendigung (Kanzler-Entscheid A1): ein
+    Fehlerstatus statt 200, damit keine App eine Ablehnung still als leeren
+    Erfolg verwertet. 422 modell_abbruch, nicht wiederholbar (wie der
+    Waechter), Kopf X-Bridge-Finish, x_bridge_finish im Fehlerobjekt."""
+    from src.middleware.bridge_error import (
+        BridgeError, SOURCE_UPSTREAM_ANTHROPIC, TYPE_UPSTREAM_ERROR, bridge_error,
+    )
+    antwort = bridge_error(
+        source=SOURCE_UPSTREAM_ANTHROPIC,
+        error_type=TYPE_UPSTREAM_ERROR,
+        reason="modell_abbruch",
+        message=(
+            "Der Anbieter hat die Antwort abgelehnt (stop_reason refusal, "
+            f"category {finish.get('category')!r}). Nicht wiederholen: eine Ablehnung ist kein "
+            "Transportfehler. Die Ablehnungsmarke als 200 gibt es mit "
+            f"{ABLEHNUNGSMARKE_KOPF}: 1 bzw. bridge_ablehnungsmarke: true."
+        ),
+        status_code=422,
+        retryable_override=False,
+        extra={
+            "fehler_code": "modell_abbruch",
+            "stop_reason": "refusal",
+            "category": finish.get("category"),
+            "provider_request_id": finish.get("provider_request_id"),
+            "x_bridge_finish": finish,
+        },
+    )
+    antwort.headers["X-Bridge-Finish"] = "content_filter"
+    return BridgeError(antwort)
+
+
 def ledger_felder(finish: Dict[str, Any]) -> Dict[str, Any]:
-    """provider_metadata-Felder einer Antwort fuer das Ledger. Bei
-    cost_status "unbekannt" ist die Ledger-Zeile nur eine Schaetzung aus usage
-    (R1): ai_call_writer meldet sie dann nie als Preis (Kostenkopf)."""
+    """provider_metadata-Felder einer Antwort fuer das Ledger. Wirft nie: die
+    Buchung eines bezahlten Aufrufs darf an der Auswertung nicht scheitern
+    (Codepruefung S0 A2); ein Fehler wird laut als auswertung_fehler gebucht."""
+    try:
+        return _ledger_felder(finish)
+    except Exception as e:  # noqa: BLE001 — gebucht wird trotzdem, laut markiert
+        logger.error("ledger_felder: Auswertung gescheitert (%s: %s) — Buchung mit cost_status unbekannt",
+                     type(e).__name__, e)
+        return {"auswertung_fehler": type(e).__name__, "cost_status": "unbekannt",
+                "cost_art": "schaetzung_aus_usage"}
+
+
+def _ledger_felder(finish: Dict[str, Any]) -> Dict[str, Any]:
+    """Bei cost_status "unbekannt" ist die Ledger-Zeile nur eine Schaetzung aus
+    usage (R1): ai_call_writer meldet sie dann nie als Preis (Kostenkopf)."""
     billed_werte = [it.get("billed") for it in finish.get("iterations") or []]
     if "unbekannt" in billed_werte:
         billed: Any = "unbekannt"
@@ -928,7 +1059,7 @@ def ledger_felder(finish: Dict[str, Any]) -> Dict[str, Any]:
             "type": sd.get("type"),
             "category": sd.get("category"),
             "recommended_model": sd.get("recommended_model"),
-            "explanation": (sd.get("explanation") or "")[:300] or None,
+            "explanation": (sd.get("explanation")[:300] or None) if isinstance(sd.get("explanation"), str) else None,
         }
     return meta
 

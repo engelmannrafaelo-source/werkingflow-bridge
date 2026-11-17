@@ -24,7 +24,7 @@ from typing import Any, Dict, Optional
 from src.models import ChatCompletionRequest
 from src.routing.backend_router import BackendConfig
 from src.routing.vision_router import prepare_messages_for_vision, route_to_vision
-from src.vision_provider import abschluss_felder, finish_reason_for
+from src.vision_provider import abschluss_felder_sicher, finish_reason_for
 
 logger = logging.getLogger(__name__)
 
@@ -101,7 +101,7 @@ async def call_anthropic_direct(
     gesendetes_modell = config.provider_model or request.model
     # getattr: Felder, die nur der Anthropic-Messages-Weg setzt (VisionResult);
     # fehlen sie, gilt "nicht gemeldet" (None), nie ein Ersatzwert.
-    finish = abschluss_felder(
+    finish = abschluss_felder_sicher(
         content=result.content,
         stop_reason=result.stop_reason,
         stop_details=getattr(result, "stop_details", None),
