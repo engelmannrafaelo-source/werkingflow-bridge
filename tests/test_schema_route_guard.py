@@ -202,3 +202,76 @@ def test_eu_routes_unchanged_by_allowlist():
 def test_allowlist_parser_strict():
     assert noneu_test_users(f" {RAFAEL_TEST} , {ANDERER},foo") == frozenset({RAFAEL_TEST, ANDERER})
     assert noneu_test_principals(f" {TEST_PRINCIPAL} ,legacy,*,a b") == frozenset({TEST_PRINCIPAL})
+
+
+# --- Schema-Direktweg = Prod-eigener Schluessel, nie Pool (Kanzler-Wort 17.11.2026) ---
+import asyncio  # noqa: E402
+
+
+def _vp(monkeypatch, key, pool_url):
+    from src import vision_provider as vp
+    monkeypatch.setenv("ANTHROPIC_CREDIT_POOL_URL", pool_url) if pool_url else monkeypatch.delenv("ANTHROPIC_CREDIT_POOL_URL", raising=False)
+    monkeypatch.setenv("ANTHROPIC_VISION_API_KEY", key) if key else monkeypatch.delenv("ANTHROPIC_VISION_API_KEY", raising=False)
+    return vp, vp.VisionProvider()
+
+
+class _Resp:
+    status_code = 200
+    text = ""
+
+    def json(self):
+        return {"content": [{"type": "text", "text": "ok"}], "model": EXPECTED_MODEL, "stop_reason": "end_turn",
+                "usage": {"input_tokens": 3, "output_tokens": 1}}
+
+
+def _run_analyze(monkeypatch, *, key, pool_url, prod_key_only):
+    from src.providers import credit_pool
+    vp, prov = _vp(monkeypatch, key, pool_url)
+    calls = {"pool": 0, "direct": 0, "key": None}
+
+    async def _pool(body, timeout):
+        calls["pool"] += 1
+        return _Resp(), {"credit_pool_account": "x"}
+
+    async def _post(self, url, headers=None, json=None, **kw):
+        calls["direct"] += 1
+        calls["key"] = (headers or {}).get("x-api-key")
+        return _Resp()
+
+    monkeypatch.setattr(credit_pool, "post_messages", _pool)
+    monkeypatch.setattr(vp.httpx.AsyncClient, "post", _post)
+    tok = credit_pool.PROD_KEY_ONLY.set(prod_key_only)
+    try:
+        asyncio.run(prov.analyze(messages=[{"role": "user", "content": "synthetisch"}], model=EXPECTED_MODEL, max_tokens=1))
+    finally:
+        credit_pool.PROD_KEY_ONLY.reset(tok)
+    return calls
+
+
+def test_schema_direct_uses_prod_key_never_pool(monkeypatch):
+    c = _run_analyze(monkeypatch, key="k-prod", pool_url="http://pool.invalid", prod_key_only=True)
+    assert c["pool"] == 0 and c["direct"] == 1 and c["key"] == "k-prod"
+
+
+def test_schema_direct_without_prod_key_fails_closed_no_pool(monkeypatch):
+    from fastapi import HTTPException
+    with pytest.raises(HTTPException) as e:
+        _run_analyze(monkeypatch, key=None, pool_url="http://pool.invalid", prod_key_only=True)
+    assert e.value.status_code == 424 and e.value.detail["error"]["code"] == "schema_prod_key_missing"
+
+
+def test_other_apps_keep_pool_unchanged(monkeypatch):
+    c = _run_analyze(monkeypatch, key="k-prod", pool_url="http://pool.invalid", prod_key_only=False)
+    assert c["pool"] == 1 and c["direct"] == 0
+
+
+def test_pool_for_this_call_flag(monkeypatch):
+    from src.providers import credit_pool
+    monkeypatch.setenv("ANTHROPIC_CREDIT_POOL_URL", "http://pool.invalid")
+    assert credit_pool.pool_for_this_call() is True
+    tok = credit_pool.PROD_KEY_ONLY.set(True)
+    try:
+        assert credit_pool.pool_for_this_call() is False
+    finally:
+        credit_pool.PROD_KEY_ONLY.reset(tok)
+    assert credit_pool.PROD_KEY_ONLY.get() is False

@@ -3622,8 +3622,9 @@ async def _chat_completions_lauf(
             if _schema_backend == "anthropic_direct":
                 # Privater Nicht-EU-Testweg (nur Allowlist-Benutzer, siehe schema_bedrock_guard.NONEU_TEST_PROVIDER):
                 # bereit, wenn das Direkt-Tier nutzbar ist (Credit-Pool oder Prepaid-Schluessel). Sonst 424.
-                from src.providers.registry import is_tier_usable as _schema_tier_usable
-                _schema_ready = bool(_schema_tier_usable("claude-direct-notools"))
+                # Kanzler-Wort 17.11.: Schema-Direktweg nur ueber den Prod-eigenen Schluessel, nie den Pool -> bereit
+                # NUR, wenn ANTHROPIC_VISION_API_KEY gesetzt ist (ein aktiver Pool macht diesen Weg NICHT bereit).
+                _schema_ready = bool(os.getenv("ANTHROPIC_VISION_API_KEY"))
             elif _schema_backend == "vertex_eu":
                 # Vertex-Route (Pin vertex_eu): Schalter + Service-Account muessen da sein, sonst 424 (kein LB-Retry,
                 # kein anderer Weg). Kein Bedrock-Rueckfall.
@@ -4203,9 +4204,15 @@ async def _chat_completions_lauf(
             # und nur, wenn das Tor reserviert hat. Die Messung geht nie in die Antwort.
             _test_ki_messung = _test_ki_deckel.MessungZiel() if _test_ki_deckel.ist_gedeckelt() else None
             try:
-                response_data = await call_anthropic_direct(
-                    request_body, backend_config, messung_ziel=_test_ki_messung,
-                )
+                # Schema-Strict-Dispatch: Prod-eigener Schluessel, nie Pool (credit_pool.PROD_KEY_ONLY, fail-closed).
+                from src.providers.credit_pool import PROD_KEY_ONLY as _prod_key_only
+                _pko_token = _prod_key_only.set(bool(_strict_dispatch))
+                try:
+                    response_data = await call_anthropic_direct(
+                        request_body, backend_config, messung_ziel=_test_ki_messung,
+                    )
+                finally:
+                    _prod_key_only.reset(_pko_token)
                 direct_credit_meta = response_data.get("x_api_reserve", {})
             except Exception as direct_err:
                 # Test-KI-Deckel: nichts gemessen -> Reservierung bleibt voll stehen.

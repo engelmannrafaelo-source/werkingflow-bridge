@@ -351,6 +351,11 @@ class VisionProvider:
         Returns:
             VisionResponse with analysis result
         """
+        if credit_pool.PROD_KEY_ONLY.get() and not self.api_key:
+            # Schema-Direktweg: nur der Prod-eigene Schluessel, kein Rueckfall auf den Pool (fail-closed, nicht retrybar).
+            raise HTTPException(status_code=424, detail={
+                "error": {"message": "Prod key for the Schema direct route is not configured; no pool fallback.",
+                          "type": "service_unavailable", "code": "schema_prod_key_missing"}})
         if not self.api_key and not credit_pool.enabled():
             raise ValueError(
                 "ANTHROPIC_VISION_API_KEY environment variable not set. "
@@ -412,7 +417,7 @@ class VisionProvider:
         adapt_model_request(model, request_body)
 
         credit_meta = None
-        if credit_pool.enabled():
+        if credit_pool.pool_for_this_call():
             response, credit_meta = await credit_pool.post_messages(request_body, timeout)
         else:
             async with httpx.AsyncClient(timeout=timeout) as client:
