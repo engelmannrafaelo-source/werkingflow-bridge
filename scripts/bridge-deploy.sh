@@ -1383,7 +1383,7 @@ phase_smoke_test() {
         error_ "Smoke-Schluessel AI_BRIDGE_API_KEY ueber den Regel-Leser (dev-daemon-reader-dev-server) nicht lesbar"
         return 1
     fi
-    info "Smoke-Schluessel: Regel-Leser dev-daemon-reader-dev-server, fp=$(printf %s "$smoke_key" | sha256sum | cut -c1-12), Laenge ${#smoke_key}"
+    info "Smoke-Schluessel: Regel-Leser dev-daemon-reader-dev-server (gelesen; Pruefung durch den Smoke selbst)"
 
     local smoke_out
     if smoke_out=$(AI_BRIDGE_API_KEY="$smoke_key" python3 "$smoke_script" --base-url "$url" --profile "$profile" \
