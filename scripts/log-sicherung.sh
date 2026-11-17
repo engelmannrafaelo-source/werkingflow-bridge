@@ -33,6 +33,34 @@ LOG_SICHERUNG_BASIS="${LOG_SICHERUNG_BASIS:-${REMOTE_REPO}/log-sicherung}"
 LOG_SICHERUNG_WARN_GB="${LOG_SICHERUNG_WARN_GB:-20}"
 # Exit-Code, den gitleaks bei einem Fund liefert (alles andere ausser 0 = Scannerfehler).
 LOG_SICHERUNG_FUND_RC=3
+# rc von deploy_one_service, wenn NUR die Log-Sicherung scheiterte (Zweitpruefung L R1, L-1):
+# der Dienst wurde nicht neu erzeugt und darf auch im Rollback nicht neu erzeugt werden.
+LOG_SICHERUNG_RC=4
+
+# Vorpruefung EINMAL je Host vor Phase 4 (L-1 (b)): Scanner per Digest vorhanden, RepoDigest gleich.
+# Scheitert sie, ist noch kein Container angefasst; deploy_server setzt nur den Code zurueck.
+log_sicherung_vorpruefung() {
+    local host="$1"
+    if [[ "$host" != "$HETZNER_HOST" ]]; then
+        return 0
+    fi
+    if [[ "$LOG_SICHERUNG_GITLEAKS" != *@sha256:* ]]; then
+        error_ "Log-Sicherung: Scanner ohne Digest (${LOG_SICHERUNG_GITLEAKS})"
+        return 1
+    fi
+    if [[ "$DRY_RUN" == "true" ]]; then
+        info "[DRY-RUN] Log-Sicherung-Vorpruefung: Scanner ${LOG_SICHERUNG_GITLEAKS} auf ${host}"
+        return 0
+    fi
+    local digests
+    digests=$(rssh "$host" "docker image inspect -f '{{range .RepoDigests}}{{println .}}{{end}}' '${LOG_SICHERUNG_GITLEAKS}' 2>/dev/null") || digests=""
+    if ! grep -qxF "$LOG_SICHERUNG_GITLEAKS" <<< "$digests"; then
+        error_ "Log-Sicherung-Vorpruefung: Scanner ${LOG_SICHERUNG_GITLEAKS} fehlt auf ${host} oder RepoDigest abweichend — kein Recreate"
+        return 1
+    fi
+    info "Log-Sicherung-Vorpruefung: Scanner per Digest auf ${host} vorhanden"
+    return 0
+}
 
 log_sichern() {
     local host="$1"

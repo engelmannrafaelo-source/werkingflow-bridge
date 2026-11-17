@@ -1107,7 +1107,7 @@ deploy_one_service() {
     # and verify it first; without a proven copy there is no recreate.
     log_sichern "$host" "$container" || {
         error_ "Log-Sicherung fuer ${container} nicht belegt — ${svc} wird NICHT neu erzeugt"
-        return 1
+        return "$LOG_SICHERUNG_RC"
     }
 
     # Recreate — NEVER --remove-orphans
@@ -3295,6 +3295,16 @@ deploy_server() {
         return 1
     }
 
+    # === Phase 3.8: log backup prerequisites (Plan V2.1 §11 (iii), L-1 (b)) ===
+    # Scanner present by digest BEFORE the first recreate; nothing touched yet.
+    log_sicherung_vorpruefung "$host" || {
+        error_ "Log backup prerequisites missing — reverting code to ${ROLLBACK_SHA}"
+        if [[ "$DRY_RUN" == "false" ]]; then
+            rssh "$host" "cd ${REMOTE_REPO} && git reset --hard '${ROLLBACK_SHA}'" || return 2
+        fi
+        return 1
+    }
+
     # Shared image is built once; routine unchanged Erkunder releases are skipped.
     prepare_erkunder_deploy "$host" "$compose" || {
         error_ "Erkunder preparation failed — reverting code to ${ROLLBACK_SHA}"
@@ -3334,7 +3344,9 @@ deploy_server() {
         local container
         container=$(container_for_svc "$server_prefix" "$svc")
 
-        # Include a failed recreation/healthcheck in rollback, too.
+        # Include a failed recreation/healthcheck in rollback, too — but not a
+        # service whose log backup failed: it was never recreated (L-1 (a)).
+        local vorher=${#DEPLOYED_SERVICES[@]}
         if [[ "$svc" == erkunder-ausgang ]]; then
             local group=()
             read -ra group <<< "$ERKUNDER_SERVICES"
@@ -3342,10 +3354,20 @@ deploy_server() {
         elif [[ "$svc" != erkunder* ]]; then
             DEPLOYED_SERVICES+=("$svc")
         fi
-        if deploy_one_service "$host" "$compose" "$svc" "$container" "$build_list"; then
+        local dos_rc=0
+        deploy_one_service "$host" "$compose" "$svc" "$container" "$build_list" || dos_rc=$?
+        if (( dos_rc == LOG_SICHERUNG_RC )); then
+            # Not recreated: drop it (and its erkunder group) from the rollback set.
+            DEPLOYED_SERVICES=("${DEPLOYED_SERVICES[@]:0:vorher}")
+            if [[ "$svc" == erkunder-ausgang && "$DRY_RUN" == "false" ]]; then
+                rssh "$host" "cd ${REMOTE_REPO} && docker compose ${compose} start erkunder" || \
+                    error_ "CRITICAL: Erkunder admission could not be restarted after refused log backup"
+            fi
+        fi
+        if (( dos_rc == 0 )); then
             :
         else
-            error_ "Deploy failed for ${svc} — initiating rollback"
+            error_ "Deploy failed for ${svc} (rc=${dos_rc}) — initiating rollback of recreated services only"
             if [[ ${#DEPLOYED_SERVICES[@]} -gt 0 ]]; then
                 phase_rollback "$host" "$compose" "$ROLLBACK_SHA" "$build_list" "${DEPLOYED_SERVICES[@]}"
                 local rc=$?
