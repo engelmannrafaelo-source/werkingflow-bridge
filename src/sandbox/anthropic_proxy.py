@@ -45,7 +45,7 @@ UPSTREAM_TIMEOUT = httpx.Timeout(connect=10.0, read=600.0, write=60.0, pool=10.0
 # Konservative Buchung bei unvollstaendigem Strom (R1 N1, 18962da3): fehlt das Ende (message_delta bzw.
 # message_stop, oder bei JSON eine lesbare usage), bucht die Bridge output = max(beobachtet, max_tokens).
 # max_tokens ist bei /v1/messages Pflicht (sonst 400 upstream, keine Buchung); fehlt es oder ist es
-# ungueltig, gilt dieser Default (hoechstes Ausgabelimit der aktuellen Modellfamilie).
+# ungueltig, gilt dieser Default (bewusst hoch gewaehlter Bridge-Wert, kein Anbieterlimit).
 MAX_TOKENS_DEFAULT_KONSERVATIV = 64000
 
 
