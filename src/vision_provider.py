@@ -1085,6 +1085,27 @@ def ablehnung_ohne_marke(finish: Dict[str, Any]) -> Any:
     return BridgeError(antwort)
 
 
+def _roh_typen_modelle(
+    roh_iter: List[Dict[str, Any]], blocks: List[Dict[str, Any]],
+) -> Tuple[List[Optional[str]], List[Optional[str]]]:
+    """Typ und Modell je rohem usage.iterations-Eintrag. Fehlt "type", gilt
+    "message" (dieselbe Regel wie die oeffentliche Iteration, abschluss_felder).
+    Fehlt "model", wird es NUR aus einem fallback-Block abgeleitet (Eintrag 0 =
+    from.model des ersten Blocks, Eintrag k = to.model von Block k-1); sonst
+    bleibt es None. Ein vorhandenes Modell wird nie ersetzt."""
+    typen: List[Optional[str]] = []
+    modelle: List[Optional[str]] = []
+    for k, e in enumerate(roh_iter):
+        typen.append(e.get("type") or "message")
+        m = _modell_kanon(e.get("model"))
+        if m is None and blocks:
+            b = blocks[0] if k == 0 else (blocks[k - 1] if k - 1 < len(blocks) else {})
+            seite = "from" if k == 0 else "to"
+            m = _modell_kanon(((b.get(seite) or {}) if isinstance(b, dict) else {}).get("model"))
+        modelle.append(m)
+    return typen, modelle
+
+
 def _lage_bestimmen(
     *, requested_model: Optional[str], responding_model: Optional[str],
     roh_iter: List[Dict[str, Any]], blocks: List[Dict[str, Any]],
@@ -1105,10 +1126,15 @@ def _lage_bestimmen(
     kette = {_modell_kanon(m) for m in fallback_kette}
     if len(roh_iter) > 1 + len(fallback_kette):
         return "abweichung_unbelegt", f"versuche_ueber_kette:{len(roh_iter)}>{1 + len(fallback_kette)}"
-    typen = [e.get("type") for e in roh_iter]
-    modelle = [_modell_kanon(e.get("model")) for e in roh_iter]
+    typen, modelle = _roh_typen_modelle(roh_iter, blocks)
     if not blocks:
-        if geantwortet == angefragt and (not roh_iter or (typen == ["message"] and modelle == [angefragt])):
+        # Normalfall (Entwurf S-6 Nr. 1): Antwortmodell = angefragt, kein Block, kein
+        # fallback_message. Der Anbieter liefert im einzigen usage.iterations-Eintrag nicht
+        # immer "model" (HBG37 P2, 17.11.2026 09:12Z: [None] -> "ohne_block_nicht_belegt",
+        # verwertbar false bei einem normalen Erfolg). Ein FEHLENDES Modell ist kein
+        # Widerspruch; ein ANDERES Modell bleibt einer.
+        if geantwortet == angefragt and (
+                not roh_iter or (typen == ["message"] and modelle[0] in (angefragt, None))):
             return "kein_fallback", None
         if (typen == ["fallback_message"] and modelle == [geantwortet]
                 and geantwortet != angefragt and geantwortet in kette):
