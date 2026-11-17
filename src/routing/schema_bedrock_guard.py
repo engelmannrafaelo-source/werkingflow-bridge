@@ -202,6 +202,26 @@ def _host_exact(url: Optional[str]) -> Optional[str]:
     return u.hostname
 
 
+#: PRIVATER NICHT-EU-TESTWEG (Rafael 17.11.2026, nur synthetische Daten, nur seine Test-Identitaet): Anthropic
+#: Messages-API per API-Key (Pin ``anthropic_direct``, Tier claude-direct-notools). KEINE EU-Route und deshalb NICHT
+#: in ALLOWED_SCHEMA_ROUTES. Zugelassen nur, wenn ZWEI unabhaengige Schloesser stimmen: (1) Operator-Pin
+#: users.provider_config.provider='anthropic_direct' am Benutzer und (2) dieser Benutzer steht in der Worker-Env
+#: SCHEMA_NONEU_TEST_USER_IDS (kommagetrennte UUIDs). Leer/fehlend -> jeder Aufruf auf diesem Weg wird abgewiesen.
+NONEU_TEST_PROVIDER = "anthropic_direct"
+NONEU_TEST_USERS_ENV = "SCHEMA_NONEU_TEST_USER_IDS"
+
+
+def noneu_test_users(raw: Optional[str]) -> frozenset:
+    """Parse the allowlist strictly: only canonical lowercase-comparable 36-char UUIDs; anything else is ignored."""
+    import re
+    out = set()
+    for part in (raw or "").split(","):
+        v = part.strip().lower()
+        if re.fullmatch(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", v):
+            out.add(v)
+    return frozenset(out)
+
+
 def assert_schema_expected_route(
     *,
     effective_backend: Any,
@@ -209,6 +229,8 @@ def assert_schema_expected_route(
     region: Optional[str],
     model_id: Optional[str],
     vertex_endpoint: Optional[str] = None,
+    user_id: Optional[str] = None,
+    noneu_test_users: frozenset = frozenset(),
 ) -> None:
     """Raise unless the resolved route is one of ALLOWED_SCHEMA_ROUTES, chosen by the matching operator pin,
     in its EU region, with the approved model. For Vertex additionally the exact EU multi-region host.
@@ -216,6 +238,23 @@ def assert_schema_expected_route(
     Fail-closed: unknown backend, pin != backend (no fallback across routes), wrong region/model/host -> refused.
     ``vertex_endpoint`` is the endpoint the Vertex client will call (``VERTEX_EU_ENDPOINT`` or its default)."""
     backend = getattr(effective_backend, "value", effective_backend)
+    if backend == NONEU_TEST_PROVIDER:
+        if operator_pin != NONEU_TEST_PROVIDER:
+            raise SchemaBedrockExpectationError(
+                "schema_requires_matching_operator_pin",
+                f"The non-EU test route needs the operator pin {NONEU_TEST_PROVIDER!r}; pin={operator_pin!r}.",
+            )
+        if not user_id or str(user_id).strip().lower() not in noneu_test_users:
+            raise SchemaBedrockExpectationError(
+                "schema_noneu_test_user_not_allowed",
+                f"The non-EU test route is reserved for the users in {NONEU_TEST_USERS_ENV}; this user is not listed.",
+            )
+        if model_id != EXPECTED_MODEL:
+            raise SchemaBedrockExpectationError(
+                "schema_route_model_mismatch",
+                f"Schema generator calls must use model {EXPECTED_MODEL!r}, resolved model={model_id!r}.",
+            )
+        return
     if backend not in ALLOWED_SCHEMA_ROUTES:
         raise SchemaBedrockExpectationError(
             "schema_route_not_allowed",

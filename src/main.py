@@ -3573,7 +3573,12 @@ async def _chat_completions_lauf(
                 )
             _schema_backend = getattr(getattr(backend_config, "backend", None), "value", None)
             _schema_ready = False
-            if _schema_backend == "vertex_eu":
+            if _schema_backend == "anthropic_direct":
+                # Privater Nicht-EU-Testweg (nur Allowlist-Benutzer, siehe schema_bedrock_guard.NONEU_TEST_PROVIDER):
+                # bereit, wenn das Direkt-Tier nutzbar ist (Credit-Pool oder Prepaid-Schluessel). Sonst 424.
+                from src.providers.registry import is_tier_usable as _schema_tier_usable
+                _schema_ready = bool(_schema_tier_usable("claude-direct-notools"))
+            elif _schema_backend == "vertex_eu":
                 # Vertex-Route (Pin vertex_eu): Schalter + Service-Account muessen da sein, sonst 424 (kein LB-Retry,
                 # kein anderer Weg). Kein Bedrock-Rueckfall.
                 from src.vertex_eu_service import readiness as _schema_vertex_ready, VertexEUNotConfigured as _SchemaVNC
@@ -3594,7 +3599,8 @@ async def _chat_completions_lauf(
                             "message": ("Schema generator route is not available on this worker "
                                         f"(backend={_schema_backend!r}: missing switch or credentials). Nothing was routed elsewhere."),
                             "type": "configuration_error",
-                            "code": "schema_vertex_eu_unavailable" if _schema_backend == "vertex_eu" else "schema_bedrock_unavailable",
+                            "code": {"vertex_eu": "schema_vertex_eu_unavailable", "anthropic_direct": "schema_noneu_test_unavailable"}.get(
+                                _schema_backend, "schema_bedrock_unavailable"),
                             "retryable": False,
                             "hint": "Restore the pinned route's credentials; Schema traffic uses only its EU route.",
                         }
@@ -3608,12 +3614,17 @@ async def _chat_completions_lauf(
                     )
                 import os as _schema_os
                 from src.vertex_eu_service import DEFAULT_ENDPOINT as _SCHEMA_VERTEX_DEFAULT_ENDPOINT
+                from src.routing.schema_bedrock_guard import (
+                    noneu_test_users as _schema_noneu_users, NONEU_TEST_USERS_ENV as _SCHEMA_NONEU_ENV,
+                )
                 assert_schema_expected_route(
                     effective_backend=backend_config.backend,
                     operator_pin=operator_pinned_provider,
                     region=backend_config.region,
                     model_id=backend_config.model_id,
                     vertex_endpoint=(_schema_os.getenv("VERTEX_EU_ENDPOINT") or _SCHEMA_VERTEX_DEFAULT_ENDPOINT),
+                    user_id=extract_attribution_context(request).get("user_id"),
+                    noneu_test_users=_schema_noneu_users(_schema_os.getenv(_SCHEMA_NONEU_ENV)),
                 )
             except SchemaBedrockExpectationError as e:
                 raise HTTPException(
@@ -3728,7 +3739,11 @@ async def _chat_completions_lauf(
         if _strict_dispatch:
             # Zugelassen: Bedrock (Ein-Versuch-Client) und Vertex EU (ein einziger httpx-POST, call_vertex_eu), jeweils
             # ohne Stream. Welche der beiden, entscheidet allein der Schema-Guard oben (Operator-Pin).
-            if not (backend_config and backend_config.backend in (BackendType.BEDROCK, BackendType.VERTEX_EU)) or request_body.stream:
+            # Dazu der private Nicht-EU-Testweg anthropic_direct (nur Allowlist-Benutzer mit Operator-Pin, vom Guard
+            # oben geprueft): genau ein bezahlter Versuch (credit_pool.post_messages: 4xx unberechnet, 5xx/Transport
+            # ohne Wiederholung), Ledger-Preis Faktor 1 -> von derselben Obergrenze gedeckt.
+            if not (backend_config and backend_config.backend in (
+                    BackendType.BEDROCK, BackendType.VERTEX_EU, BackendType.ANTHROPIC_DIRECT)) or request_body.stream:
                 raise HTTPException(status_code=403, detail={
                     "error": "strict_backend_not_allowed", "appId": "werking-schema-generator",
                     "message": "Dieser Weg ist für die Schemafunktion nicht freigegeben.",

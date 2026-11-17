@@ -55,9 +55,14 @@ def test_bedrock_route_still_passes_unchanged():
                                    region="eu-central-1", model_id=EXPECTED_MODEL)
 
 
-@pytest.mark.parametrize("backend", [_BT.ANTHROPIC, _BT.ANTHROPIC_DIRECT, "openai_compatible", None, ""])
+@pytest.mark.parametrize("backend", [_BT.ANTHROPIC, "openai_compatible", None, ""])
 def test_non_eu_backends_refused(backend):
     assert _code(effective_backend=backend, operator_pin=getattr(backend, "value", backend)) == "schema_route_not_allowed"
+
+
+def test_anthropic_direct_refused_without_allowlist():
+    # Nicht-EU-Testweg ohne Allowlist (Standard): abgewiesen, auch mit passendem Pin.
+    assert _code(effective_backend=_BT.ANTHROPIC_DIRECT, operator_pin="anthropic_direct") == "schema_noneu_test_user_not_allowed"
 
 
 @pytest.mark.parametrize("backend,pin", [
@@ -115,3 +120,68 @@ def test_strict_bound_covers_vertex_price_for_same_tokens():
     ledger = cost_eur(EXPECTED_MODEL, 4000, sr.MAX_TOKENS_CAP) * VERTEX_EU_PRICE_MULT
     assert grenze >= ledger > 0
     assert VERTEX_EU_PRICE_MULT >= 1.0
+
+
+# --- Privater Nicht-EU-Testweg (anthropic_direct), Rafael 17.11.2026: nur Allowlist-Benutzer + Operator-Pin ---
+from src.routing.schema_bedrock_guard import NONEU_TEST_PROVIDER, noneu_test_users  # noqa: E402
+
+RAFAEL_TEST = "0f0e0d0c-0b0a-4908-8706-050403020100"
+ANDERER = "11111111-2222-4333-8444-555555555555"
+
+
+def _direct(**kw):
+    base = dict(effective_backend=_BT.ANTHROPIC_DIRECT, operator_pin="anthropic_direct", region=None,
+                model_id=EXPECTED_MODEL, vertex_endpoint=None, user_id=RAFAEL_TEST,
+                noneu_test_users=noneu_test_users(RAFAEL_TEST))
+    base.update(kw)
+    return assert_schema_expected_route(**base)
+
+
+def _direct_code(**kw):
+    with pytest.raises(SchemaBedrockExpectationError) as e:
+        _direct(**kw)
+    return e.value.code
+
+
+def test_noneu_route_is_not_an_eu_route():
+    assert NONEU_TEST_PROVIDER not in ALLOWED_SCHEMA_ROUTES
+
+
+def test_noneu_route_passes_only_for_listed_user_with_pin():
+    _direct()
+    _direct(user_id=RAFAEL_TEST.upper())
+
+
+@pytest.mark.parametrize("raw", [None, "", " ", ",", "nicht-uuid", ANDERER, "*", "all"])
+def test_noneu_route_refused_when_user_not_listed(raw):
+    assert _direct_code(noneu_test_users=noneu_test_users(raw)) == "schema_noneu_test_user_not_allowed"
+
+
+@pytest.mark.parametrize("user", [None, "", ANDERER, RAFAEL_TEST + "x"])
+def test_noneu_route_refused_for_other_users(user):
+    assert _direct_code(user_id=user) == "schema_noneu_test_user_not_allowed"
+
+
+@pytest.mark.parametrize("pin", [None, "", "bedrock", "vertex_eu", "anthropic"])
+def test_noneu_route_requires_direct_pin(pin):
+    assert _direct_code(operator_pin=pin) == "schema_requires_matching_operator_pin"
+
+
+def test_noneu_route_model_must_be_approved():
+    assert _direct_code(model_id="claude-haiku-5-5") == "schema_route_model_mismatch"
+
+
+def test_allowlist_does_not_open_other_non_eu_backends():
+    # Eine Allowlist macht nur anthropic_direct moeglich, nie das Abo-/SDK-Backend.
+    with pytest.raises(SchemaBedrockExpectationError) as e:
+        _route(effective_backend=_BT.ANTHROPIC, operator_pin="anthropic", user_id=RAFAEL_TEST,
+               noneu_test_users=noneu_test_users(RAFAEL_TEST))
+    assert e.value.code == "schema_route_not_allowed"
+
+
+def test_eu_routes_unchanged_by_allowlist():
+    _route(user_id=ANDERER, noneu_test_users=noneu_test_users(RAFAEL_TEST))
+
+
+def test_allowlist_parser_strict():
+    assert noneu_test_users(f" {RAFAEL_TEST} , {ANDERER},foo") == frozenset({RAFAEL_TEST, ANDERER})
