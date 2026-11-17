@@ -56,6 +56,17 @@ class VisionResult:
     #: UsageMessung aus der Anthropic-Rohantwort (vision_provider); nur der
     #: Anthropic-Zweig setzt sie, Gemini nie (Test-KI-Deckel, keine Ersatzquelle).
     messung: Optional[Any] = None
+    #: S0 Ablehnung ehrlich ausweisen (Review A1): ohne diese Felder gingen
+    #: Kategorie, request-id und Iterationen hier verloren. Nur der
+    #: Anthropic-Zweig setzt sie; Gemini laesst sie None.
+    stop_details: Optional[Dict[str, Any]] = None
+    provider_request_id: Optional[str] = None
+    provider_message_id: Optional[str] = None
+    requested_model: Optional[str] = None
+    usage_iterations: Optional[List[Dict[str, Any]]] = None
+    #: S1 Anbieter-Fallback: fallback-Inhaltsbloecke roh und die bestellte Kette.
+    fallback_blocks: Optional[List[Dict[str, Any]]] = None
+    fallback_kette: Optional[List[str]] = None
 
 
 def default_vision_target() -> str:
@@ -162,6 +173,7 @@ async def route_to_vision(
     target: str = VISION_TARGET_ANTHROPIC,
     gemini_thinking_budget: Optional[int] = None,
     subscription_fallback: bool = False,
+    fallback_kette: Optional[List[str]] = None,
 ) -> VisionResult:
     """
     Route request to Vision API
@@ -188,6 +200,11 @@ async def route_to_vision(
     Raises:
         Exception: If vision analysis fails
     """
+    if fallback_kette is not None and target != VISION_TARGET_ANTHROPIC:
+        # S1: der Anbieter-Fallback gibt es nur auf dem Anthropic-Weg; nie
+        # still auf einem anderen Ziel ohne Fallback bedienen.
+        from src.providers.fallback_faehigkeit import FallbackNichtMoeglich
+        raise FallbackNichtMoeglich("fallback_nicht_verfuegbar_pfad", f"ziel:{target}")
     if subscription_fallback and target != VISION_TARGET_ANTHROPIC:
         from fastapi import HTTPException
         raise HTTPException(409, "subscription_staging_fallback: images only over the CLI subscription "
@@ -241,6 +258,8 @@ async def route_to_vision(
         thinking=thinking,
         output_config=output_config,
         subscription_fallback=subscription_fallback,
+        # Nur wenn bestellt: alle anderen Aufrufe bleiben byte-gleich.
+        **({"fallback_kette": fallback_kette} if fallback_kette is not None else {}),
     )
 
     return VisionResult(
@@ -254,6 +273,13 @@ async def route_to_vision(
         api_key_lane=vision_response.api_key_lane or LANE_ANTHROPIC_PREPAID,
         messung=vision_response.messung,
         extra_meta=vision_response.credit_meta or vision_response.ledger_meta or {},
+        stop_details=vision_response.stop_details,
+        provider_request_id=vision_response.provider_request_id,
+        provider_message_id=vision_response.provider_message_id,
+        requested_model=vision_response.requested_model or model,
+        usage_iterations=vision_response.usage_iterations,
+        fallback_blocks=getattr(vision_response, "fallback_blocks", None),
+        fallback_kette=getattr(vision_response, "fallback_kette", None),
     )
 
 

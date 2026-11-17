@@ -24,7 +24,7 @@ from typing import Any, Dict, Optional
 from src.models import ChatCompletionRequest
 from src.routing.backend_router import BackendConfig
 from src.routing.vision_router import prepare_messages_for_vision, route_to_vision
-from src.vision_provider import finish_reason_for
+from src.vision_provider import abschluss_felder_sicher, finish_reason_for
 
 logger = logging.getLogger(__name__)
 
@@ -46,8 +46,12 @@ async def call_anthropic_direct(
 ) -> Dict[str, Any]:
     """Call the direct Anthropic Messages API and return an OpenAI-compatible
     chat-completion response dict — same shape call_openai_compatible()
-    returns, so both fallback dispatch sites in main.py can handle either
-    uniformly.
+    returns. Called from the direct-tier branch in main.py.
+
+    The answer always carries ``x_bridge_finish`` (vision_provider.
+    abschluss_felder). A provider refusal is the Ablehnungsmarke: finish_reason
+    content_filter, refusal true, retryable false, verwertbar false — never
+    retried, never rerouted (S0, 17.11.2026).
 
     Args:
         request: The original chat completion request (OpenAI format).
@@ -82,7 +86,27 @@ async def call_anthropic_direct(
             DEFAULT_MAX_TOKENS,
         )
 
+    # S1: Anbieter-Fallback nur auf ausdrueckliche Bestellung je Aufruf.
+    # Jede Unvertraeglichkeit ist ein lauter 4xx (fallback_faehigkeit), nie
+    # ein stiller Aufruf ohne Fallback.
+    fallback_kette = None
+    bestellung = getattr(request, "provider_fallback", None)
+    if bestellung is not None:
+        from src.providers import fallback_faehigkeit as _ff
+        if bestellung != _ff.MODUS:
+            raise _ff.FallbackNichtMoeglich("provider_fallback_wert_unzulaessig", repr(bestellung))
+        if getattr(request, "stream", False):
+            raise _ff.FallbackNichtMoeglich("fallback_nicht_verfuegbar_pfad", "stream")
+        gesetzt = getattr(request, "model_fields_set", set()) or set()
+        ausdruecklich = sorted(f for f in ("temperature", "top_p") if f in gesetzt)
+        if ausdruecklich:
+            # API-Version 2026-10-21: 400 auch beim Standardwert (Beleg
+            # b0e0e525c4b0 Z. 127). Nie still verwerfen.
+            raise _ff.FallbackNichtMoeglich("fallback_body_unvertraeglich", f"ausdruecklich gesetzt: {ausdruecklich}")
+        fallback_kette = await _ff.bestellung_pruefen(config.provider_model or request.model)
+
     result = await route_to_vision(
+        **({"fallback_kette": fallback_kette} if fallback_kette is not None else {}),
         messages=messages,
         model=config.provider_model or request.model,
         max_tokens=request.max_tokens or DEFAULT_MAX_TOKENS,
@@ -94,6 +118,23 @@ async def call_anthropic_direct(
     if messung_ziel is not None:
         messung_ziel.setzen(result.messung)
 
+    gesendetes_modell = config.provider_model or request.model
+    # getattr: Felder, die nur der Anthropic-Messages-Weg setzt (VisionResult);
+    # fehlen sie, gilt "nicht gemeldet" (None), nie ein Ersatzwert.
+    finish = abschluss_felder_sicher(
+        content=result.content,
+        stop_reason=result.stop_reason,
+        stop_details=getattr(result, "stop_details", None),
+        requested_model=getattr(result, "requested_model", None) or gesendetes_modell,
+        responding_model=result.model,
+        provider_request_id=getattr(result, "provider_request_id", None),
+        provider_message_id=getattr(result, "provider_message_id", None),
+        messung=getattr(result, "messung", None),
+        usage_iterations=getattr(result, "usage_iterations", None),
+        fallback_kette=fallback_kette,
+        fallback_blocks=getattr(result, "fallback_blocks", None),
+    )
+
     return {
         "id": f"chatcmpl-direct-{uuid.uuid4().hex[:16]}",
         "object": "chat.completion",
@@ -104,11 +145,12 @@ async def call_anthropic_direct(
                 "index": 0,
                 "message": {"role": "assistant", "content": result.content},
                 # Echter Abbruchgrund: max_tokens -> "length", nie pauschal "stop".
-                "finish_reason": finish_reason_for(result.stop_reason),
+                "finish_reason": "content_filter" if finish["refusal"] else finish_reason_for(result.stop_reason),
             }
         ],
         "usage": result.usage,
         "x_api_reserve": result.extra_meta,
         "x_bridge_max_tokens": request.max_tokens or DEFAULT_MAX_TOKENS,
         "x_bridge_max_tokens_defaulted": max_tokens_defaulted,
+        "x_bridge_finish": finish,
     }

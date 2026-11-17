@@ -616,7 +616,14 @@ async def persist_ai_call_activity(
         # X-Bridge-Cost-Eur, see DeliveryProbeMiddleware). A job reads it from
         # there — re-pricing from the OpenAI `usage` block would be wrong:
         # its prompt_tokens include cache traffic that is priced separately.
-        _probe.note_cost(call_uid, call_cost_eur, PRICING_VERSION)
+        if (provider_meta or {}).get("cost_status") == "unbekannt":
+            # R1/Review B1: ob der Anbieter diese Ablehnung berechnet hat, ist
+            # nicht belegt. Die Ledger-Zeile ist nur eine Schaetzung aus usage
+            # (konservativ fuer die Prepaid-Kappe) und geht NIE als Preis
+            # (X-Bridge-Cost-Eur / usage.cost_eur) zum Aufrufer.
+            _probe.note_cost_unbekannt(call_uid, PRICING_VERSION)
+        else:
+            _probe.note_cost(call_uid, call_cost_eur, PRICING_VERSION)
 
     # Resolved from the user row inside the DB block below; initialised here so
     # the post-call deduction (which runs after that block, even if it failed)
@@ -840,13 +847,28 @@ async def persist_ai_call_activity(
         # Folding the last into ai-call-error would make it look like a failed
         # model run — which is exactly the confusion this change is about.
         if status == STATUS_UNDELIVERED:
-            event_type = f"ai-call-undelivered:{feature}"
+            event_prefix = "ai-call-undelivered:"
         elif status != "success":
-            event_type = f"ai-call-error:{feature}"
+            event_prefix = "ai-call-error:"
         else:
-            event_type = f"ai-call:{feature}"
+            event_prefix = "ai-call:"
+        event_type = f"{event_prefix}{feature}"
+        # activities.event_type is VARCHAR(128) (migration 001). A longer one
+        # (agent_id of 169 chars, Befund 17.11.2026) made the audit row fail
+        # silently on the platform-api side. Shorten deterministically and
+        # marked: prefix + head of feature + "~" + sha256(feature)[:12]; the
+        # full feature stays in payload["feature"].
+        event_type_gekuerzt = len(event_type) > 128
+        if event_type_gekuerzt:
+            import hashlib
+            _kopf = 128 - len(event_prefix) - 13
+            event_type = (
+                f"{event_prefix}{feature[:_kopf]}~"
+                f"{hashlib.sha256(feature.encode('utf-8')).hexdigest()[:12]}"
+            )
         payload = {
             "feature": feature,
+            **({"eventTypeGekuerzt": True} if event_type_gekuerzt else {}),
             "model": model,
             # promptTokens = UNCACHED input only (Anthropic usage semantics).
             # Cache traffic is reported separately so the UI can show the

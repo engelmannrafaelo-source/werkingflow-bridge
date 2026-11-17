@@ -499,6 +499,11 @@ def attach_ledger_cost(result: Any, headers: Any) -> Any:
     if raw is None:
         usage["cost_eur"] = None
         usage["cost_source"] = "unbekannt"
+        # R1/Review B1: the ledger said explicitly that the provider's billing
+        # is not established (refusal outside the billed categories). The
+        # estimate stays in x_bridge_finish.cost_schaetzung_eur, never here.
+        if headers is not None and headers.get("x-bridge-cost-status") == "unbekannt":
+            usage["cost_status"] = "unbekannt"
         return result
     try:
         usage["cost_eur"] = float(raw)

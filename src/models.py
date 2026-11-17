@@ -194,6 +194,32 @@ class ChatCompletionRequest(BaseModel):
     user: Optional[str] = None
     session_id: Optional[str] = Field(default=None, description="Optional session ID for conversation continuity")
     enable_tools: Optional[bool] = Field(default=False, description="Enable Claude Code tools (Read, Write, Bash, etc.) - disabled by default for OpenAI compatibility")
+    # Codepruefung S0 A1 (Kanzler-Entscheid 17.11.2026): wer die
+    # Ablehnungsmarke (200 + content_filter + x_bridge_finish) versteht,
+    # kuendigt sie an — als Feld (uebersteht /v1/jobs) oder Kopf
+    # X-Bridge-Ablehnungsmarke: 1. Ohne Ankuendigung ist eine Ablehnung ein
+    # 422 modell_abbruch (nicht wiederholbar), nie ein leerer Erfolg.
+    bridge_ablehnungsmarke: Optional[bool] = Field(
+        default=None,
+        description=(
+            "Caller understands the refusal marker: a provider refusal then comes as HTTP 200 with "
+            "finish_reason content_filter and x_bridge_finish (refusal true, verwertbar false). "
+            "Without it a refusal is HTTP 422 fehler_code modell_abbruch, not retryable."
+        ),
+    )
+    # S1 (Bridge-Owner 51c8185c, Schema S-5): Anbieter-Fallback je Aufruf
+    # bestellen. Nur "default", nur Direktweg (claude-direct-notools), nicht
+    # streamend, ohne Bild; alles andere ist ein lauter 400. Vorher wurde das
+    # Feld wegen extra="ignore" still verworfen.
+    provider_fallback: Optional[str] = Field(
+        default=None,
+        description=(
+            "Order the provider's server-side fallback for this call: only 'default'. "
+            "Direct tier only; see GET /health provider_fallback for availability. "
+            "Every attempt is reported in x_bridge_finish.iterations; a fallback answer "
+            "is never presented as a normal one."
+        ),
+    )
 
     # Backend selection for multi-provider support
     backend: Optional[BackendType] = Field(
@@ -415,7 +441,11 @@ class ChatCompletionResponse(BaseModel):
             "reported it; on finish_reason content_filter also category and folgezuege; "
             "fortsetzungen = the CLI continued the answer past its output limit this "
             "often and content holds every part, joined directly at each seam "
-            "(stop_reason 'max_tokens_fortgesetzt', finish_reason 'stop')"
+            "(stop_reason 'max_tokens_fortgesetzt', finish_reason 'stop'). Direct and "
+            "vision path (Messages API): schema SCHEMA-ABLEHNUNG-FALLBACK (refusal, "
+            "category, provider_request_id, iterations with billed/cost_eur, "
+            "cost_status, verwertbar, retryable, modell_abweichung, bridge_worker, "
+            "build_sha); a refusal is never retryable and never usable"
         ),
     )
     # BRREF (12.10.2026): a CLI run can make several model calls (tool turns,

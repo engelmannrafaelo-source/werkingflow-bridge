@@ -1799,8 +1799,32 @@ async def generate_streaming_response(
                 # Final-Chunk, kein [DONE]); der Fehler folgt nach dem
                 # Ledger-Persist (der Prepaid-Spend ist real).
                 from src.vision_provider import finish_reason_for as _finish_reason_for
+                from src.vision_provider import (
+                    abschluss_felder_sicher as _abschluss_felder,
+                    ablehnung_ohne_marke as _ablehnung_ohne_marke,
+                    ablehnungsmarke_angekuendigt as _marke_angekuendigt,
+                    ist_ablehnung as _ist_ablehnung,
+                    ledger_felder as _ledger_felder,
+                    messung_kostenstatus as _messung_kostenstatus,
+                )
                 _vision_empty = not vision_result.content
-                if not _vision_empty:
+                # S0 (Entscheid 4, R2): Ablehnung -> Ablehnungsmarke im letzten
+                # Chunk statt event: error mit 502-retryable-Umschlag.
+                _stream_finish = (
+                    _abschluss_felder(
+                        content=vision_result.content,
+                        stop_reason=vision_result.stop_reason,
+                        stop_details=vision_result.stop_details,
+                        requested_model=vision_result.requested_model or request.model,
+                        responding_model=vision_result.model,
+                        provider_request_id=vision_result.provider_request_id,
+                        provider_message_id=vision_result.provider_message_id,
+                        messung=vision_result.messung,
+                        usage_iterations=vision_result.usage_iterations,
+                    )
+                    if _ist_ablehnung(vision_result.stop_reason, vision_result.stop_details) else None
+                )
+                if not _vision_empty and _stream_finish is None:
                     initial_chunk = ChatCompletionStreamResponse(
                         id=request_id,
                         model=vision_result.model,
@@ -1857,6 +1881,7 @@ async def generate_streaming_response(
                             "endpoint": "vision",
                             "api_key_lane": vision_result.api_key_lane,
                             "image_count": _vision_images,
+                            **(_ledger_felder(_stream_finish) if _stream_finish else _messung_kostenstatus(vision_result.messung)),
                             **vision_result.extra_meta,
                         },
                     )
@@ -1864,6 +1889,34 @@ async def generate_streaming_response(
                     logger.warning(
                         f"⚠️ Vision streaming usage tracking failed (non-fatal): {_vision_track_err}"
                     )
+                if _stream_finish is not None and not _marke_angekuendigt(fastapi_request, request):
+                    # A1: ohne Ankuendigung ein Fehlerereignis mit dem 422-
+                    # Umschlag modell_abbruch (nicht wiederholbar) statt 502.
+                    _fehler = json.loads(_ablehnung_ohne_marke(_stream_finish).response.body)
+                    yield f"event: error\ndata: {json.dumps(_fehler)}\n\n"
+                    yield "data: [DONE]\n\n"
+                    return
+                if _stream_finish is not None:
+                    # Nach dem Persist: Teiltext (wie ohne Strom, N-1) und der
+                    # Abschluss-Chunk mit der Ablehnungsmarke, dann [DONE].
+                    # Der Kopf X-Bridge-Finish fehlt im Strom: die Koepfe
+                    # stehen vor dem Anbieteraufruf fest (Schema S-4).
+                    if vision_result.content:
+                        _teil_chunk = ChatCompletionStreamResponse(
+                            id=request_id,
+                            model=vision_result.model,
+                            choices=[StreamChoice(index=0, delta={"role": "assistant", "content": vision_result.content}, finish_reason=None)],
+                        )
+                        yield f"data: {_teil_chunk.model_dump_json()}\n\n"
+                    _marke_chunk = ChatCompletionStreamResponse(
+                        id=request_id,
+                        model=vision_result.model,
+                        choices=[StreamChoice(index=0, delta={} if vision_result.content else {"role": "assistant", "content": ""}, finish_reason="content_filter")],
+                        x_bridge_finish=_stream_finish,
+                    )
+                    yield f"data: {_marke_chunk.model_dump_json()}\n\n"
+                    yield "data: [DONE]\n\n"
+                    return
                 if _vision_empty:
                     from src.middleware.bridge_error import vision_empty_response_error
                     _empty_env = json.loads(vision_empty_response_error(vision_result.stop_reason).body)
@@ -2788,6 +2841,15 @@ async def chat_completions(
     from fastapi.responses import JSONResponse
     from src import chat_weiterleitung as _cw
 
+    if request_body.provider_fallback is not None:
+        # S1: Anbieter-Fallback nur nicht streamend und ohne Bild (Pool-Weg,
+        # Direktweg). Frueh und laut statt still ohne Fallback.
+        from src.providers.fallback_faehigkeit import FallbackNichtMoeglich
+        if request_body.stream:
+            raise FallbackNichtMoeglich("fallback_nicht_verfuegbar_pfad", "stream")
+        if any(hasattr(m, "has_images") and m.has_images() for m in request_body.messages):
+            raise FallbackNichtMoeglich("fallback_nicht_verfuegbar_pfad", "bild")
+
     try:
         bis = _cw.frist_bis(request)  # anchored at the call's arrival on this worker
     except _cw.UngueltigeFrist as exc:
@@ -3612,6 +3674,17 @@ async def _chat_completions_lauf(
             from src.jobs.selbstaufruf import ledger_provider_merken
             ledger_provider_merken(request, ledger_provider_for_backend(backend_config.backend))
 
+        # S1 Anbieter-Fallback: nur auf dem Direktweg. Jeder andere Weg wuerde
+        # die Bestellung still uebergehen -> lauter 400 (Schema S-5).
+        if getattr(request_body, "provider_fallback", None) is not None and not (
+            backend_config and backend_config.backend == BackendType.ANTHROPIC_DIRECT
+        ):
+            from src.providers.fallback_faehigkeit import FallbackNichtMoeglich
+            raise FallbackNichtMoeglich(
+                "fallback_nicht_verfuegbar_pfad",
+                f"backend:{backend_config.backend.value if backend_config else None}",
+            )
+
         _gemini_vision_wanted = _gemini_vision_lane or _client_asked_for_gemini_vision
         _resolves_to_gemini = bool(
             backend_config and backend_config.backend == BackendType.GEMINI_API
@@ -4109,6 +4182,8 @@ async def _chat_completions_lauf(
                 duration_ms: int, error_code: Optional[str] = None,
                 error_message: Optional[str] = None,
                 cache_read_tokens: int = 0, cache_creation_tokens: int = 0,
+                abschluss_meta: Optional[Dict[str, Any]] = None,
+                ledger_model: Optional[str] = None,
             ) -> None:
                 if status != "success":
                     request.state.ai_call_error_persisted = True
@@ -4118,7 +4193,7 @@ async def _chat_completions_lauf(
                     user_id=direct_attribution.get("user_id"),
                     agent_id=direct_attribution.get("agent_id"),
                     workflow_id=direct_attribution.get("workflow_id"),
-                    model=backend_config.provider_model or resolved_model,
+                    model=ledger_model or backend_config.provider_model or resolved_model,
                     input_tokens=input_tokens,
                     output_tokens=output_tokens,
                     cache_read_tokens=cache_read_tokens,
@@ -4134,6 +4209,9 @@ async def _chat_completions_lauf(
                         "usage_source": "anthropic_messages_api",
                         **direct_credit_meta,
                         "user_pinned": bool(user_pinned_provider),
+                        # S0: stop_reason, Ablehnung (Kategorie, request-id),
+                        # billed/cost_status (vision_provider.ledger_felder).
+                        **(abschluss_meta or {}),
                     },
                 )
 
@@ -4161,11 +4239,42 @@ async def _chat_completions_lauf(
             # Rohantwort; sonst bleibt die volle Reservierung stehen.
             await _test_ki_deckel.abrechnen(_test_ki_messung.messung if _test_ki_messung else None)
             logger.info(f"✅ Direct Anthropic request completed in {duration:.2f}s (tier={direct_tier})")
+            from src.vision_provider import (
+                ablehnung_ohne_marke, ablehnungs_kopf, ablehnungsmarke_angekuendigt, ledger_felder,
+            )
+            _direct_finish = response_data.get("x_bridge_finish") or {}
+            # A3: ungecacht + Cache getrennt (vision_provider._usage_mit_cache),
+            # gleiche Grundlage wie x_bridge_finish.iterations.
+            _ledger_tokens = {
+                "input_tokens": usage.get("uncached_input_tokens", usage.get("prompt_tokens", 0)) or 0,
+                "output_tokens": usage.get("completion_tokens", 0) or 0,
+                "cache_read_tokens": usage.get("cache_read_tokens", 0) or 0,
+                "cache_creation_tokens": usage.get("cache_creation_tokens", 0) or 0,
+            }
+            _ledger_model = None
+            # A4 (Codepruefung S1 R1): jede Lage ausser kein_fallback — auch
+            # sticky_belegt mit nur einem Versuch — bucht zum Antwortmodell.
+            if _direct_finish.get("fallback_angefordert") and (
+                (_direct_finish.get("fallback") or {}).get("lage") != "kein_fallback"
+                or len(_direct_finish.get("iterations") or []) > 1
+            ):
+                # S1: Top-Level-usage beschreibt nur den liefernden Versuch
+                # (Doku Z. 758). Eine Ledger-Zeile traegt die Summe aller
+                # berechneten oder unbelegten Versuche zum Modell, das die
+                # Antwort lieferte; die Aufteilung je Versuch steht in
+                # provider_metadata.iterations (Zeilen je Iteration: Entwurf).
+                _its = [i for i in _direct_finish["iterations"] if i.get("billed") in (True, "unbekannt")]
+                _ledger_tokens = {
+                    "input_tokens": sum(i.get("input_tokens") or 0 for i in _its),
+                    "output_tokens": sum(i.get("output_tokens") or 0 for i in _its),
+                    "cache_read_tokens": sum(i.get("cache_read_input_tokens") or 0 for i in _its),
+                    "cache_creation_tokens": sum(i.get("cache_creation_input_tokens") or 0 for i in _its),
+                }
+                _ledger_model = _direct_finish.get("responding_model")
             await _persist_direct_usage(
-                input_tokens=usage.get("prompt_tokens", 0) or 0,
-                output_tokens=usage.get("completion_tokens", 0) or 0,
-                cache_read_tokens=usage.get("cache_read_input_tokens", 0) or 0,
-                cache_creation_tokens=usage.get("cache_creation_input_tokens", 0) or 0,
+                abschluss_meta=ledger_felder(_direct_finish),
+                ledger_model=_ledger_model,
+                **_ledger_tokens,
                 status="success",
                 duration_ms=int(duration * 1000),
             )
@@ -4181,6 +4290,10 @@ async def _chat_completions_lauf(
                     status="success",
                     **direct_attribution
                 )
+            if _direct_finish.get("refusal") and not ablehnungsmarke_angekuendigt(request, request_body):
+                # A1: ohne Ankuendigung nie ein leerer Erfolg — erst nach
+                # Ledger-Buchung UND Tenant-Tracking (Codepruefung R2 B2).
+                raise ablehnung_ohne_marke(_direct_finish)
             response_data["x_backend_info"] = get_backend_info_dict(backend_config)
             if request_body.stream:
                 # The direct path is request/response; expose it as a minimal
@@ -4206,6 +4319,10 @@ async def _chat_completions_lauf(
                         "choices": [{"index": 0, "delta": {}, "finish_reason": _finish}],
                         "usage": usage,
                         "x_backend_info": response_data["x_backend_info"],
+                        # Wie der CLI-Strom: x_bridge_finish im letzten Chunk.
+                        # Diese Huelle entsteht NACH der fertigen Antwort und
+                        # ist nie ein Anbieterstrom (billed bleibt wie gemeldet).
+                        "x_bridge_finish": _direct_finish,
                     }) + "\n\n"
                     yield "data: [DONE]\n\n"
 
@@ -4216,8 +4333,12 @@ async def _chat_completions_lauf(
                         "Connection": "keep-alive",
                         "X-Backend": "anthropic_direct",
                         "X-Provider-Tier": direct_tier,
+                        **ablehnungs_kopf(_direct_finish),
                     },
                 )
+            if _direct_finish.get("refusal"):
+                # Ablehnungsmarke (Variante A): 200 + content_filter + Kopf.
+                return JSONResponse(content=response_data, headers=ablehnungs_kopf(_direct_finish))
             return response_data
 
         # =======================================================================
@@ -4513,6 +4634,34 @@ async def _chat_completions_lauf(
                             **attribution
                         )
 
+                    from src.vision_provider import (
+                        ablehnung_ohne_marke,
+                        ablehnungs_kopf,
+                        ablehnungsmarke_angekuendigt,
+                        abschluss_felder_sicher as abschluss_felder,
+                        ist_ablehnung,
+                        ledger_felder,
+                        messung_kostenstatus,
+                    )
+                    # S0 (Entscheid 4): eine Ablehnung bekommt die
+                    # Ablehnungsmarke statt 502 "Retry moeglich".
+                    _vision_abgelehnt = ist_ablehnung(
+                        vision_result.stop_reason, vision_result.stop_details
+                    )
+                    _vision_finish = (
+                        abschluss_felder(
+                            content=vision_result.content,
+                            stop_reason=vision_result.stop_reason,
+                            stop_details=vision_result.stop_details,
+                            requested_model=vision_result.requested_model or request_body.model,
+                            responding_model=vision_result.model,
+                            provider_request_id=vision_result.provider_request_id,
+                            provider_message_id=vision_result.provider_message_id,
+                            messung=vision_result.messung,
+                            usage_iterations=vision_result.usage_iterations,
+                        )
+                        if _vision_abgelehnt else None
+                    )
                     # Ledger write — vision previously returned here WITHOUT
                     # any usage_events row (only the legacy tenant tracker
                     # above, a no-op without Supabase): the prepaid-key spend
@@ -4541,6 +4690,7 @@ async def _chat_completions_lauf(
                                 "image_count": image_count,
                                 "stop_reason": vision_result.stop_reason,
                                 "empty_response": not vision_result.content,
+                                **(ledger_felder(_vision_finish) if _vision_finish else messung_kostenstatus(vision_result.messung)),
                                 # Was der Anbieter ueber SEINEN Aufruf zu sagen
                                 # hat (Gemini: gesetztes Denk-Budget + echte
                                 # Denk-Tokens). E3 liest die Einstellung aus dem
@@ -4553,6 +4703,20 @@ async def _chat_completions_lauf(
                         logger.warning(
                             f"⚠️ Vision usage tracking failed (non-fatal): {_vision_track_err}"
                         )
+
+                    if _vision_finish is not None and not ablehnungsmarke_angekuendigt(request, request_body):
+                        # A1: Aufrufer ohne Ankuendigung (Report, Works,
+                        # Engelmann, safety …) bekommen einen Fehlerstatus,
+                        # nie einen leeren Erfolg — nach der Buchung.
+                        raise ablehnung_ohne_marke(_vision_finish)
+                    if _vision_finish is not None:
+                        # Ablehnungsmarke (Variante A), nach dem Persist:
+                        # 200, content_filter, x_bridge_finish (refusal,
+                        # retryable false, verwertbar false) und Kopf.
+                        _marke = response.model_dump()
+                        _marke["choices"][0]["finish_reason"] = "content_filter"
+                        _marke["x_bridge_finish"] = _vision_finish
+                        return JSONResponse(content=_marke, headers=ablehnungs_kopf(_vision_finish))
 
                     # FAIL-LOUD fuer leeren Content — BEWUSST erst NACH dem
                     # Ledger-Persist: der Prepaid-Spend ist real und speist
@@ -9290,6 +9454,15 @@ async def health_check(request: Request):
     # unreadable source = smoke "unbekannt", never "proven".
     from src.deploy_proof import read_deploy_proof
     result["deploy"] = read_deploy_proof()
+    # S1 (Owner 51c8185c): Faehigkeit des Anbieter-Fallbacks, abgeleitet
+    # (src/providers/fallback_faehigkeit.py). Liest die Ketten nur, wenn Pool
+    # und Ketten-Settlement da sind; sonst kein Aussenkontakt.
+    try:
+        from src.providers.fallback_faehigkeit import faehigkeit as _fallback_faehigkeit
+        result["provider_fallback"] = await _fallback_faehigkeit()
+    except Exception as e:  # noqa: BLE001 — health must answer; reported, not hidden
+        logger.error("health: provider_fallback nicht bestimmbar: %s: %s", type(e).__name__, e)
+        result["provider_fallback"] = {"enabled": False, "grund": f"fehler:{type(e).__name__}"}
 
     # ADR-0012: which job store this worker writes to — the marker it stamps
     # into every job_id, and the one the load balancer routes polls by. Exposed
