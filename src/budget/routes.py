@@ -40,6 +40,7 @@ from src.api_auth import (
     require_admin,
     AuthClaims,
 )
+from src.api_auth.deps import enforce_budget_target_user
 from src.budget.calculator import (
     rollover_monthly_if_due,
     UserBudget,
@@ -353,6 +354,7 @@ async def budget_check(
     body: CheckRequest,
     _claims: AuthClaims = Depends(require_jwt_or_service),
 ) -> Dict[str, Any]:
+    enforce_budget_target_user(_claims, body.userId)
     user_id = _parse_user_id(body.userId)
     try:
         return await evaluate_budget(user_id, body.planId, body.estimatedCostEur)
@@ -663,6 +665,7 @@ async def budget_deduct(
     body: DeductRequest,
     _claims: AuthClaims = Depends(require_jwt_or_service),
 ) -> Dict[str, Any]:
+    enforce_budget_target_user(_claims, body.userId)
     user_id = _parse_user_id(body.userId)
     try:
         return await apply_budget_deduction(

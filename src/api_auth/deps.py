@@ -64,6 +64,9 @@ class AuthClaims:
     is_admin: bool                  # raw privilege claim — gate authz on is_operator, never on this
     acting_user_id: Optional[str] = field(default=None)
     role: Optional[str] = field(default=None)  # platform role from JWT; None for service tokens
+    # True ONLY when _verify_service_token matched the one global operator token
+    # (config.service_token). Never set for JWTs or any other credential kind.
+    global_token_verified: bool = field(default=False)
 
     @property
     def is_user(self) -> bool:
@@ -92,6 +95,21 @@ class AuthClaims:
             return self.acting_user_id is None
         # User JWT: operator only when explicitly flagged as admin.
         return self.is_admin
+
+    @property
+    def is_global_operator(self) -> bool:
+        """
+        The EXACT global operator contract (SEC 17.11.2026): the verified global
+        service token, without a proxied user. Unlike `is_operator` this is never
+        true for a JWT (not even isAdmin), for any other token kind, or merely
+        because X-User-ID is missing — the token verification itself must have
+        set `global_token_verified`.
+        """
+        return (
+            self.kind == "service"
+            and self.global_token_verified
+            and self.acting_user_id is None
+        )
 
     @property
     def effective_user_id(self) -> Optional[str]:
@@ -152,6 +170,7 @@ def _verify_service_token(token: str, x_user_id: Optional[str] = None) -> AuthCl
         tenant_id=None,
         is_admin=True,  # service tokens implicitly admin
         acting_user_id=x_user_id,  # None = operator, set = proxy for user
+        global_token_verified=True,  # matched config.service_token above
     )
 
 
@@ -376,3 +395,44 @@ def require_self_or_admin(
     if claims.user_id == user_id:
         return claims
     raise HTTPException(status_code=403, detail="Forbidden: can only act on own user")
+
+
+def enforce_budget_target_user(claims: AuthClaims, target_user_id: str) -> None:
+    """
+    Budget check/deduct act on ``body.userId``. Only the exact global operator
+    (see ``AuthClaims.is_global_operator``) may name another user. Everyone else
+    — user JWT (also isAdmin), service-token proxy with X-User-ID, any other
+    credential kind — must name exactly their own verified effective user id.
+
+    Runs BEFORE the budget service so a rejected call never reads or books.
+    Fail-closed: no effective identity, or an id that is not a UUID → 403.
+    """
+    if claims.is_global_operator:
+        return
+    import logging
+    import uuid as _uuid
+
+    effective = claims.effective_user_id
+    grund = None
+    if not effective:
+        grund = "identitaet_fehlt"
+    else:
+        try:
+            same = _uuid.UUID(str(effective)) == _uuid.UUID(str(target_user_id))
+        except (ValueError, TypeError, AttributeError):
+            same = False
+        if not same:
+            grund = "fremder_nutzer"
+    if grund is None:
+        return
+    logging.getLogger("bridge.budget_ziel").warning(
+        "budget target denied: grund=%s kind=%s", grund, claims.kind
+    )
+    raise HTTPException(
+        status_code=403,
+        detail={
+            "reason": "budget_zielnutzer",
+            "grund": grund,
+            "message": "Budget nur fuer den eigenen, verifizierten Nutzer.",
+        },
+    )
