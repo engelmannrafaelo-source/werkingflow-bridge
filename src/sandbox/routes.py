@@ -349,14 +349,14 @@ async def record_usage(
     request: Request,
     _claims: AuthClaims = Depends(require_service_or_bound),
 ):
+    if _claims.kind == "bound":
+        # Wire-Vertrag v2: Usage gebundener Leases verbucht die Bridge im Anthropic-Proxy selbst;
+        # eine Meldung des Daemons wuerde doppelt zaehlen. Vor jedem DB-Zugriff.
+        raise HTTPException(status_code=409, detail={"error": "usage_serverseitig"})
     pool = get_pool()
 
     # Compute hypothetical cost if Daemon didn't send it
     hyp_cost = body.hypotheticalCostEur
-    if _claims.kind == "bound":
-        # Wire-Vertrag v2: Usage gebundener Leases verbucht die Bridge im Anthropic-Proxy selbst;
-        # eine Meldung des Daemons wuerde doppelt zaehlen.
-        raise HTTPException(status_code=409, detail={"error": "usage_serverseitig"})
     if _claims.kind == "bound":
         # H-KD-1: gebundene Aufrufer melden keine Kosten selbst. Die Bridge rechnet aus Modell und
         # Tokens; ein Kostenwert im Body, ein unbepreistes Modell, negative Tokens oder eine fehlende
