@@ -4,24 +4,23 @@ Anlass: E2E 7K3Q — Flair-NER (geteilter Privacy-Dienst, kein Kontextkanal) wer
 Anlagenkennungen wie "Kaltwasserverteiler KV-01" oder "Schluckbrunnen B-02" als ORGANIZATION
 bzw. LOCATION (Score bis 0,999). Eine Schwelle loest das nicht, und der Dienst ist mit Prod geteilt.
 
-Regel (Kanzler/SEC 17.11.: eng gebundene Kontextregel, KEINE Wert- oder Musterliste, kein Modell):
-eine Detektor-Fundstelle wird an GENAU DIESER Stelle nicht maskiert, wenn ALLE Bedingungen gelten —
-  1. der Aufruf ist serverseitig als Schema-App verifiziert UND deklariert den Anlagenkontext
-     (``context_hint == ANLAGENKONTEXT``) UND ``BRIDGE_PRIVACY_ANLAGENKENNUNG=true`` (Standard aus);
-     das prueft der Aufrufer (main.py) und reicht nur dann ``anlagenkontext=True`` herein;
-  2. Quelle Detektor, Typ ORGANIZATION oder LOCATION (harte Typen, Regel-Erkenner, bekannte
-     Entitaeten werden nie angefasst);
-  3. Kennungsform: 1–4 Grossbuchstaben, Bindestrich, 1–4 Ziffern, frei stehend (nicht Teil von
-     Mail, URL, Pfad oder einem laengeren Wort);
-  4. Bauteilbezug: das Dokument DEFINIERT die Kennung als Bauteil — Substantiv unmittelbar davor
-     ("Kaltwasserverteiler KV-01") oder als naechste Tabellenzelle ("KV-01;Kaltwasserverteiler;...") —
-     und KEINE Stelle desselben Werts traegt einen Rollen-/Organisations-/Ortsmarker ("Firma KV-01",
-     "Kontaktperson B-02"); dann gelten auch die Verweise im selben Dokument ("zwischen KV-01 und WT-01")
-     als Bauteil (Replay 7K3Q, Runde 1: technische Texte definieren einmal und verweisen dann);
-  5. keine Stelle des Werts ueberlappt harte PII oder haengt unmittelbar an ihr ("Quastenberg (KV-01)").
-Sonst bleibt JEDE Stelle des Werts maskiert (fail-closed, mehrdeutig = maskiert). Entschieden wird je
-Wert innerhalb DIESES Dokuments, angewandt je Fundstelle — keine Wertliste, keine dokumentuebergreifende
-Wiederherstellung.
+Regel R3 (Rafael/SEC 17.11.2026 ~20:30Z: "Technische Anlagenkennungen muessen nicht pseudonymisiert werden";
+positive Bindung je Stelle, keine offene Substantiv-Sperrliste, kein Modell). Eine Detektor-Fundstelle bleibt an
+GENAU DIESER Stelle Klartext, wenn ALLES gilt:
+  1. Aufruf serverseitig als Schema-App verifiziert, ``context_hint == ANLAGENKONTEXT`` und
+     ``BRIDGE_PRIVACY_ANLAGENKENNUNG=true`` (Standard aus) - geprueft in main.py (kontext_verifiziert);
+  2. Quelle Detektor, Typ ORGANIZATION/LOCATION an allen Stellen des Werts (harte Typen nie);
+  3. Kennungsform ``[A-Z]{1,4}-[0-9]{1,4}``, nicht eingebettet (Mail, URL, Pfad, Wortteil);
+  4. POSITIVER technischer Beleg an der Stelle: Bauteilbegriff aus der Fachliste (``ist_bauteil``) direkt davor
+     bzw. am Kopf der Aufzaehlung oder als Nachbarzelle ("Durchflussmesser F-01", "F-01;Durchflussmesser;...") -
+     oder eine Praeposition als Querverweis ("zwischen KV-01 und WT-01"), wenn der Wert im Aufruf irgendwo als
+     Bauteil definiert ist (Hinweis, gibt allein nie frei);
+  5. keine harte PII ueberlappend oder direkt angrenzend; kein Rollen-/Organisations-/Ortsmarker gebunden an DIESE
+     Stelle (davor: "Firma KV-01", danach: "B-02, Ansprechpartner ..."). Personen/Kontakte anderswo im Satz oder in
+     anderen Tabellenzellen sperren NICHT - sie werden selbst maskiert.
+Sonst bleibt die Stelle maskiert; ungemeldete unklare Stellen werden zusaetzlich maskiert. Gleicher Wert technisch
+und als Firma/Person: je Stelle getrennt; Querverweise (Praeposition) eines solchen Werts im selben Text bleiben
+maskiert. Freie Stellen weist pipeline.py als ``technical_retentions`` (exakte Ausgabe-Spans) aus.
 """
 
 from __future__ import annotations
@@ -41,10 +40,10 @@ GRUND = "anlagenkennung-im-anlagenkontext"
 WEICHE_TYPEN = frozenset({"ORGANIZATION", "LOCATION"})
 
 _KENNUNG = re.compile(r"[A-Z]{1,4}-\d{1,4}")
+# Bauteilwort in Normalschreibung: Grossbuchstabe, dann nur Kleinbuchstaben (Umlaute, ß, Binnenbindestrich)
+_SUBSTANTIV = re.compile(r"[A-ZÄÖÜ][a-zäöüß]{3,}(?:-[A-ZÄÖÜa-zäöüß][a-zäöüß]+)*")
 # Zeichen, die eine Kennung in eine groessere Einheit einbetten (Mail, URL, Pfad, Wortteil)
 _EINBETTUNG = set("@._/\\-:#&+=")
-# Substantiv in Normalschreibung: Grossbuchstabe, dann nur Kleinbuchstaben (Umlaute, ß, Binnenbindestrich)
-_SUBSTANTIV = re.compile(r"[A-ZÄÖÜ][a-zäöüß]{3,}(?:-[A-ZÄÖÜa-zäöüß][a-zäöüß]+)*")
 
 # Rollen-, Personen- und Organisationsmarker. KEINE Liste von Werten (keine Kennung, kein Name,
 # kein Ort steht hier), sondern Grundwoerter, die eine nachfolgende Bezeichnung als Rolle,
@@ -64,10 +63,97 @@ _MARKER_GRUNDWORTE = (
     "wohnung", "haus", "stiege", "stock", "etage", "geschoss", "top", "tür", "tuer", "zimmer", "postfach",
     "hausnummer", "objekt", "liegenschaft", "parzelle", "grundstück", "grundstueck",
 )
+# R3 (Rafael/SEC 17.11.2026 ~20:30Z): POSITIVE technische Fachliste. Eine Bauteil-Definition liegt NUR vor, wenn das
+# gebundene Wort (direkt davor bzw. Nachbarzelle) in dieser Liste steht - nicht "jedes grossgeschriebene Substantiv"
+# (Review R2 P-PRV-4). Unbekannte Woerter belegen nichts (fail-closed). Marker haben Vorrang (ist_marker).
+# R3b (Review R3 P-PRV-6 / SEC H-R3-1): KEIN Wortende-Treffer fuer mehrdeutige Grundwoerter ("Freundeskreis",
+# "Landkreis", "Geschaeftsleitung", "Handelsregister", "Kapitalanlage", "Vertriebskanal" ...). Drei Klassen:
+#   1. _BAUTEIL_KOPF: Grundwoerter, die als Kompositum-Kopf nur Technik bilden -> beliebiges Kompositum
+#      ("Umwaelzpumpe", "Umluftkuehler"); keines davon bildet ein Personen-/Gruppen-/Haushalts-/Ortswort;
+#   2. _BAUTEIL_WORT: ganze Woerter (inkl. definierter Komposita) - mehrdeutige Grundwoerter NUR hier
+#      ("Heizkreis", "Rohrleitung", "Lueftungsanlage", "Kaltwasserverteiler"); "Leitung", "Register", "Anlage",
+#      "Kanal", "Verteiler", "Tauscher", "Schalter" allein sind bewusst NICHT enthalten;
+#   3. alles andere: kein Bauteil.
+# Bewusst gar nicht aufgenommen (Familienname/Personenwort): brenner, hahn, schieber, mischer, sammler, halter.
+# Schreibweise: casefold, ae/oe/ue/ss-normalisiert, Bindestriche entfernt (bzw. letzter Bindestrich-Teil).
+_BAUTEIL_KOPF = (
+    "pumpe", "ventil", "speicher", "behaelter", "gefaess", "sonde", "kollektor", "absorber", "filter", "abscheider",
+    "fuehler", "sensor", "kuehler", "erhitzer", "verdichter", "kompressor", "verdampfer", "verfluessiger",
+    "kondensator", "luefter", "ventilator", "geblaese", "heizkoerper", "heizstab", "wechselrichter", "umrichter",
+    "transformator", "schaltschrank", "aggregat", "druckhaltung", "durchflussmesser", "mengenmesser", "druckmesser",
+    "boiler",
+)
+_BAUTEIL_WORT = frozenset("""
+kreis kreislauf brunnen maschine geraet modul steuerung weiche rohr vorlauf ruecklauf zaehler regler motor puffer
+kessel klappe messstelle messpunkt antrieb trafo verbraucher erzeuger waermeerzeuger kaelteerzeuger
+heizkreis heizungskreis kuehlkreis kaeltekreis kaeltemittelkreis solekreis brunnenkreis ladekreis entladekreis
+verbraucherkreis erzeugerkreis primaerkreis sekundaerkreis wasserkreis kaltwasserkreis warmwasserkreis
+kuehlwasserkreis heizwasserkreis glykolkreis solarkreis pufferkreis speicherladekreis lueftungskreis regelkreis
+stromkreis serverraumkreis umluftkreis
+heizkreislauf kuehlkreislauf kaeltekreislauf brunnenkreislauf wasserkreislauf solekreislauf
+rohrleitung vorlaufleitung ruecklaufleitung steigleitung hauptleitung zuleitung verbindungsleitung anschlussleitung
+kaeltemittelleitung kondensatleitung gasleitung wasserleitung trinkwasserleitung heizungsleitung fernwaermeleitung
+steuerleitung druckleitung saugleitung soleleitung brunnenleitung stromleitung datenleitung abwasserleitung
+entleerungsleitung bypassleitung
+kuehlregister heizregister erhitzerregister waermeregister nacherhitzerregister vorerhitzerregister
+lueftungsanlage klimaanlage heizungsanlage heizanlage kaelteanlage kuehlanlage photovoltaikanlage
+solaranlage solarthermieanlage druckerhoehungsanlage enthaertungsanlage wasseraufbereitungsanlage
+brunnenanlage geothermieanlage sprinkleranlage brandmeldeanlage waermepumpenanlage entrauchungsanlage hebeanlage
+abwasserhebeanlage druckhalteanlage neutralisationsanlage filteranlage notstromanlage
+kabelkanal lueftungskanal luftkanal abluftkanal zuluftkanal fortluftkanal aussenluftkanal abgaskanal
+installationskanal
+heizstrang heizungsstrang steigstrang rohrstrang kabelstrang verteilstrang lueftungsstrang wasserstrang
+kaltwasserverteiler warmwasserverteiler heizungsverteiler heizkreisverteiler kuehlwasserverteiler
+kaeltewasserverteiler fussbodenheizungsverteiler hauptverteiler unterverteiler stromverteiler
+niederspannungsverteiler soleverteiler brunnenverteiler
+niederspannungsverteilung hauptverteilung unterverteilung waermeverteilung kaelteverteilung luftverteilung
+stromverteilung
+waermetauscher plattenwaermetauscher plattentauscher rohrbuendelwaermetauscher kreuzstromwaermetauscher
+gegenstromwaermetauscher waermeuebertrager plattenwaermeuebertrager
+schluckbrunnen foerderbrunnen saugbrunnen entnahmebrunnen rueckgabebrunnen infiltrationsbrunnen
+grundwasserbrunnen versickerungsbrunnen beobachtungsbrunnen
+leistungsschalter lasttrennschalter hauptschalter notausschalter druckschalter stroemungsschalter
+schwimmerschalter temperaturschalter endschalter
+heizkessel brennwertkessel gaskessel oelkessel pelletkessel dampfkessel niedertemperaturkessel spitzenlastkessel
+brandschutzklappe rueckschlagklappe luftklappe regelklappe absperrklappe jalousieklappe aussenluftklappe
+fortluftklappe mischluftklappe
+rueckflussverhinderer
+kaeltemaschine absorptionskaeltemaschine kompressionskaeltemaschine
+waermemengenzaehler waermezaehler kaeltemengenzaehler kaeltezaehler stromzaehler wasserzaehler gaszaehler
+volumenzaehler betriebsstundenzaehler
+volumenstromregler temperaturregler druckregler differenzdruckregler raumregler heizungsregler durchflussregler
+stellmotor pumpenmotor antriebsmotor elektromotor
+solarmodul photovoltaikmodul
+heizungssteuerung anlagensteuerung pumpensteuerung lueftungssteuerung
+lueftungsgeraet klimageraet kaeltegeraet rltgeraet zentralgeraet messgeraet steuergeraet regelgeraet heizgeraet
+heizungsrohr kupferrohr stahlrohr kunststoffrohr vorlaufrohr ruecklaufrohr abgasrohr sondenrohr schutzrohr
+heizungsvorlauf heizungsruecklauf brunnenvorlauf brunnenruecklauf
+""".split())
+_FLEXION = ("", "e", "n", "en", "s", "es", "er", "ern")
+
+
+def _norm(w: str) -> str:
+    return (w.casefold().replace("ä", "ae").replace("ö", "oe").replace("ü", "ue").replace("ß", "ss"))
+
+
+def ist_bauteil(wort: str) -> bool:
+    """Positive Fachliste (R3b): Kopf-Grundwort beliebig komponiert, sonst nur ganzes/definiertes Wort; Marker gehen vor."""
+    if not wort or not _SUBSTANTIV.fullmatch(wort) or ist_marker(wort):
+        return False
+    n = _norm(wort)
+    for c in {n.replace("-", ""), n.rsplit("-", 1)[-1]}:
+        for e in _FLEXION:
+            if e and not c.endswith(e):
+                continue
+            basis = c[: len(c) - len(e)]
+            if basis in _BAUTEIL_WORT or any(basis.endswith(k) for k in _BAUTEIL_KOPF):
+                return True
+    return False
+
+
 # Trenner, mit dem die Schema-App mehrere Texte in EINEM Aufruf verbindet (homepage-schema pseudonymize.js).
 # Geltungsbereich der Entscheidung ist der einzelne Text dazwischen (Review R1 D-PRV-1).
 _TEXT_TRENNER = re.compile(r"WERKING_DOCUMENT_[0-9a-fA-F-]{36}")
-_SATZENDE = re.compile(r"[.!?;]\s|\n")
 
 
 def kennungsform(text: str, start: int, ende: int) -> bool:
@@ -181,7 +267,7 @@ def _bindung(text: str, start: int, ende: int, alle_bereiche: List[Tuple[int, in
         wort = text[ws[0]:ws[1]]
         if ist_marker(wort):
             return "marker", wort
-        if _SUBSTANTIV.fullmatch(wort) and not _ueberlappt(ws[0], ws[1], alle_bereiche):
+        if ist_bauteil(wort) and not _ueberlappt(ws[0], ws[1], alle_bereiche):
             return "definition", wort
     if _ist_zelle(text, start, ende):
         zs = _zellen_nachbar_stelle(text, ende)
@@ -190,7 +276,7 @@ def _bindung(text: str, start: int, ende: int, alle_bereiche: List[Tuple[int, in
             return "marker", z
         # Nachbarzelle nur als Definition, wenn sie selbst keine Fundstelle ist (Review R1 P-PRV-2:
         # "LF-02;Huberwerk;..." -> LF-02 ist firmennah, bleibt maskiert)
-        if z and _SUBSTANTIV.fullmatch(z) and not _ueberlappt(zs[0], zs[1], alle_bereiche):
+        if z and ist_bauteil(z) and not _ueberlappt(zs[0], zs[1], alle_bereiche):
             return "definition", z
     return "referenz", None
 
@@ -221,41 +307,38 @@ def _texte(text: str) -> List[Tuple[int, int]]:
     return grenzen
 
 
-def _satz(text: str, start: int, ende: int, t0: int, t1: int) -> Tuple[int, int]:
-    s = t0
-    for m in _SATZENDE.finditer(text, t0, start):
-        s = m.end()
-    m = _SATZENDE.search(text, ende, t1)
-    return s, (m.start() + 1 if m else t1)
+# R3: Rollenbindung DERSELBEN Stelle (SEC: "mehrdeutige Rollenbindung derselben Stelle sperrt") - praedikativ oder
+# als Apposition direkt NACH der Kennung, innerhalb derselben Zelle/Zeile: "B-02 ist unser Ansprechpartner",
+# "B-02, Bewohnerin", "B-02 (Kontakt)", "B-02: Herr ...". Ein Rollenwort anderswo im Satz oder in einer anderen
+# Tabellenzelle sperrt NICHT (Rafael 17.11.: "Die Pumpe P-03 hat Ole Fennimann eingebaut" -> P-03 frei, Name maskiert).
+_ROLLE_NACH = re.compile(
+    r"[ \t]*(?:,|;|\||\(|:|=|–|ist|war|sind|waren|als|heisst|heißt)[ \t]*"
+    r"(?:(?:der|die|das|den|dem|unser|unsere|unserem|unseren|unserer|ein|eine|einen|einem|ihr|ihre|sein|seine)[ \t]+)*"
+    r"([A-ZÄÖÜ][\wäöüß-]*)")
 
 
-_GROSSWORT = re.compile(r"[A-ZÄÖÜ][\wäöüß-]*")
-
-
-def _marker_im_satz(text: str, start: int, ende: int, t0: int, t1: int) -> Optional[str]:
-    """Rollen-/Organisations-/Orts-/Adressmarker IRGENDWO im selben Satz (Review R1 D-PRV-1)."""
-    s, e = _satz(text, start, ende, t0, t1)
-    for m in _GROSSWORT.finditer(text, s, e):
-        if m.start() <= start < m.end():
-            continue
-        if ist_marker(m.group(0)):
-            return m.group(0)
+def _rolle_an_stelle(text: str, ende: int) -> Optional[str]:
+    """Rollenbindung DERSELBEN Stelle nach der Kennung (R3b, Review R3 P-PRV-7: POSITIV gefasst): Apposition oder
+    Praedikat ("B-02, Bewohnerin ...", "B-02 ist Patient", "B-02 (Familie ...)") mit einem Substantiv, das kein
+    Bauteil der Fachliste ist, sperrt die Stelle; Marker sperren immer. Ausnahme: Zelltrenner (; | Tab, CSV-Komma
+    ohne Leerzeichen) - Tabellenzellen sind getrennte Daten (Rafael 17.11.); dort sperren nur Marker."""
+    ze = text.find("\n", ende)
+    rest = text[ende: ze if ze != -1 else len(text)]
+    m = _ROLLE_NACH.match(rest)
+    if not m:
+        return None
+    w = m.group(1)
+    if ist_marker(w):
+        return w
+    trenner = rest[: m.start(1)].strip()
+    zelle = trenner in (";", "|") or rest[:1] == "\t" or (trenner == "," and rest[:1] == "," and rest[1:2] not in (" ", ""))
+    if zelle:
+        return None
+    if re.fullmatch(r"[A-ZÄÖÜ][a-zäöüß][\wäöüß-]*", w) and not ist_bauteil(w):
+        return w
     return None
 
 
-# PII-Spuren im Satz/in der Tabellenzeile OHNE Detektortreffer (SEC R2): Mail-Zeichen, Telefon-artige
-# Ziffernfolge (>= 7 Ziffern, Leerzeichen/Schraegstrich/Bindestrich erlaubt), Adresse "Wort + Hausnummer" mit PLZ.
-_PII_SPUR = re.compile(r"@|(?<![\w.])\+?\d(?:[ /-]?\d){6,}(?![\w])|\b\d{4,5}\s+[A-ZÄÖÜ][a-zäöüß]+")
-
-
-def _pii_im_satz(text: str, start: int, ende: int, t0: int, t1: int) -> Optional[str]:
-    s, e = _satz(text, start, ende, t0, t1)
-    m = _PII_SPUR.search(text[s:start] + " " + text[ende:e])
-    return m.group(0) if m else None
-
-
-# Geschlossene grammatische Wortklasse (Praepositionen), KEINE Werteliste: "auf KV-01", "zwischen KV-01 und WT-01",
-# "fuer UK-01". Sie belegt eine technische Referenz nur zusammen mit einer Definition desselben Werts im Aufruf.
 _PRAEPOSITIONEN = frozenset({
     "an", "am", "auf", "aus", "bei", "beim", "bis", "durch", "fuer", "für", "gegen", "hinter", "im", "in", "ins",
     "mit", "nach", "neben", "ueber", "über", "um", "unter", "vom", "von", "vor", "zu", "zum", "zur", "zwischen",
@@ -277,15 +360,15 @@ def _lokaler_beleg(text: str, start: int, ende: int, alle_bereiche: List[Tuple[i
 
 def entscheide(text: str, kandidaten: List[Tuple[int, int, str, str]],
                harte_bereiche: List[Tuple[int, int]], alle_bereiche: List[Tuple[int, int]]) -> Tuple[dict, list, list]:
-    """Entscheidung JE STELLE (SEC-Designentscheid R2, Praezisierung mit Source-Owner).
+    """Entscheidung JE STELLE (R3, siehe Modulkopf).
 
     Fuer einen Wert in Kennungsform, dessen Detektor-Stellen alle ORG/LOC sind, gilt fuer JEDES textuelle
     Vorkommen im Aufruf (auch vom Dienst nicht gemeldete und eingebettete):
-      frei  NUR wenn die Stelle LOKAL technisch belegt ist (Bauteil-Definition an der Stelle, oder Praeposition/
-            Aufzaehlung als Referenz) UND sauber ist (Kennungsform, nicht an harter PII, kein Rollen-/Firmen-/Orts-/
-            Adress-/Kontaktmarker an der Stelle oder im Satz bzw. in der Tabellenzeile inkl. Nachbarzellen, keine
-            PII-Spur im Satz) UND der Wert IRGENDWO im Aufruf als Bauteil definiert ist (dateiuebergreifender HINWEIS,
-            der allein nie freigibt);
+      frei  NUR wenn die Stelle LOKAL positiv technisch belegt ist (Bauteilbegriff der Fachliste an der Stelle,
+            oder Praeposition/Aufzaehlung als Referenz) UND sauber ist (Kennungsform, nicht an harter PII, kein
+            Marker davor, keine Rollenbindung danach) UND der Wert IRGENDWO im Aufruf als Bauteil definiert ist
+            (Hinweis, der allein nie freigibt); Referenzen eines Werts, der im selben Text auch als Marker/Rolle/
+            PII/eingebettet vorkommt, bleiben maskiert;
       sonst maskiert — eine ungemeldete unklare Stelle wird ZUSAETZLICH maskiert (zusatz).
     Eine maskierte Stelle exponiert nie eine andere und eine freie Stelle wird nicht wertglobal zurueckmaskiert:
     der Aufrufer schuetzt die freien Stellen vor dem Nachzug (geschuetzt) und maskiert die zusatz-Stellen.
@@ -309,7 +392,6 @@ def entscheide(text: str, kandidaten: List[Tuple[int, int, str, str]],
         definiert = False
         for st, en in sorted(_alle_vorkommen(text, wert)):
             nr = next(i for i, (t0, t1) in enumerate(texte, start=1) if t0 <= st <= t1)
-            t0, t1 = texte[nr - 1]
             grund = None
             if not kennungsform(text, st, en):
                 grund = "eingebettet"
@@ -317,27 +399,27 @@ def entscheide(text: str, kandidaten: List[Tuple[int, int, str, str]],
                 grund = "an-harter-pii"
             else:
                 art, wort = _lokaler_beleg(text, st, en, alle_bereiche)
-                mk = _marker_im_satz(text, st, en, t0, t1)
+                rolle = _rolle_an_stelle(text, en)
                 if art == "marker":
                     grund = "marker:" + wort
-                elif mk:
-                    grund = "marker-im-satz:" + mk
-                elif _pii_im_satz(text, st, en, t0, t1):
-                    grund = "pii-spur-im-satz"
+                elif rolle:
+                    grund = "rolle-an-stelle:" + rolle
                 elif art == "keiner":
                     grund = "kein-lokaler-technischer-beleg"
                 else:
                     definiert = definiert or art == "definition"
-                    urteile.append((st, en, nr, True, wort))
+                    urteile.append((st, en, nr, True, (art, wort)))
                     continue
             urteile.append((st, en, nr, False, grund))
-        # Im selben TEXT mehrdeutig (Root A4: "Die Firma KV-01 ... Kaltwasserverteiler KV-01"): eine Marker-,
-        # PII- oder Einbettungs-Verwendung sperrt alle Stellen des Werts in DIESEM Text; andere Texte entscheiden
-        # je Stelle (SEC: "Ansprechpartner B-02" anderswo bleibt maskiert, technische Stellen bleiben frei).
-        mehrdeutig = {nr for _, _, nr, ok, info in urteile
-                      if not ok and info != "kein-lokaler-technischer-beleg"}
-        urteile = [(st, en, nr, False, "mehrdeutig-im-text") if ok and nr in mehrdeutig else (st, en, nr, ok, info)
+        # R3 (SEC: same-value technisch/Person GETRENNT je Stelle): eine Marker-/Rollen-/PII-/Einbettungs-Verwendung
+        # sperrt im selben TEXT nur die REFERENZ-Stellen des Werts (Praeposition/Aufzaehlung ohne eigenen
+        # Bauteilbegriff); eine Stelle mit eigenem Bauteilbegriff ("Kaltwasserverteiler KV-01") bleibt frei.
+        konflikt = {nr for _, _, nr, ok, info in urteile
+                    if not ok and info != "kein-lokaler-technischer-beleg"}
+        urteile = [(st, en, nr, False, "referenz-bei-konflikt-im-text")
+                   if ok and nr in konflikt and info[0] == "referenz" else (st, en, nr, ok, info)
                    for st, en, nr, ok, info in urteile]
+        urteile = [(st, en, nr, ok, info[1] if ok else info) for st, en, nr, ok, info in urteile]
         for st, en, nr, ok, info in urteile:
             if ok and not definiert:
                 ok, info = False, "keine-definition-im-aufruf"

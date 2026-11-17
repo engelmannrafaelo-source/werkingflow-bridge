@@ -507,6 +507,16 @@ def postprocess_smart_anonymize(
     spans, mapping, stat = _platzhalter_vergeben(original, spans, prefix, bekannt)
     text_aus = ausgeben(original, spans)
     _invarianten(text_aus, mapping, spans, original)
+    retentions = None
+    if anlagenkontext:
+        retentions, abbruch = _technische_retentionen(original, text_aus, spans, mapping, herabgestuft)
+        if abbruch:
+            # fail-closed: Rueckhaltung nicht exakt belegbar -> vollstaendig maskierte Fassung (wie Flag aus)
+            logger.error("privacy anlagenkontext: retention nicht belegbar (%s) - volle Maskierung", abbruch)
+            aus = postprocess_smart_anonymize(original, antwort, prefix=prefix, known_entities=known_entities,
+                                              freiliste=freiliste, anlagenkontext=False)
+            aus["postprocessing"]["anlagenkontext"] = {"aktiv": False, "abbruch": abbruch}
+            return aus
 
     quellen = Counter(s.quelle.split(":")[0] for s in spans)
     regel_typen = Counter(s.type for s in spans if s.quelle.startswith("regel"))
@@ -547,6 +557,53 @@ def postprocess_smart_anonymize(
                 # Wert steht anderswo als echte Fundstelle) - je Fundstelle, nie globale Wiederherstellung.
                 "wieder_maskiert": sum(1 for h in herabgestuft if any(
                     x.start <= h["start"] < x.end for x in spans)),
+                "technical_retentions": retentions,
             }} if anlagenkontext else {}),
         },
     }
+
+
+# ── Anlagenkontext: Antwortvertrag technical_retentions (Root-Vorschlag, version 1) ──────────────
+
+def _technische_retentionen(original: str, text_aus: str, spans: List[Span], mapping: Dict[str, str],
+                            herabgestuft: List[Dict[str, Any]]) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+    """Exakte Spans der tatsaechlich frei gebliebenen Detektor-Stellen im AUSGABEtext (Unicode-Codepoints,
+    zusammengefuegter Text inkl. Dokumenttrenner). Belegt, dass jedes freie Vorkommen eines Kennungswerts aus
+    ``mapping`` genau ein solcher Span ist (sonst Abbruch -> Aufrufer maskiert voll)."""
+    import hashlib
+    sortiert = sorted(spans, key=lambda s: s.start)
+    aus = []
+    for h in herabgestuft:
+        a = h["start"]
+        b = a + len(h["original"])
+        if any(s.start < b and a < s.end for s in sortiert):
+            continue  # wieder maskiert: kein Retentions-Span
+        delta = sum(len(s.platzhalter) - (s.end - s.start) for s in sortiert if s.end <= a)
+        oa, ob = a + delta, b + delta
+        if text_aus[oa:ob] != h["original"] or original[a:b] != h["original"]:
+            return None, "span-versatz"
+        # Grenze wie Adapter (451d80c): Buchstabe, Ziffer oder '_' direkt neben dem Span ist keine Wortgrenze
+        if any(c.isalnum() or c == "_" for c in (text_aus[oa - 1:oa], text_aus[ob:ob + 1]) if c):
+            return None, "span-grenze"
+        aus.append({"start": oa, "end": ob, "value": h["original"], "entity_type": h["type"]})
+    aus.sort(key=lambda x: x["start"])
+    if any(x["end"] > y["start"] for x, y in zip(aus, aus[1:])):
+        return None, "span-ueberlappung"
+    if any(x["entity_type"] not in ("ORGANIZATION", "LOCATION") for x in aus):
+        return None, "span-typ"
+    belegt = {(x["start"], x["end"]) for x in aus}
+    # Gegenprobe wie der Homepage-Vertrag (contract.js): jedes freie Vorkommen eines Kennungswerts aus mapping,
+    # ohne Buchstabe/Ziffer davor/danach, muss genau ein Retentions-Span sein.
+    from .anlagenkontext import _KENNUNG
+    for wert in set(mapping.values()):
+        if not _KENNUNG.fullmatch(wert):
+            continue
+        for m in re.finditer(r"(?<![^\W_])" + re.escape(wert) + r"(?![^\W_])", text_aus):
+            if (m.start(), m.end()) not in belegt:
+                return None, "freies-vorkommen-ohne-span"
+    return {
+        "version": 1,
+        "index_unit": "unicode_codepoint",
+        "output_sha256": hashlib.sha256(text_aus.encode("utf-8")).hexdigest(),
+        "spans": aus,
+    }, None

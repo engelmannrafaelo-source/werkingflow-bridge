@@ -68,13 +68,13 @@ def test_A1_six_real_false_positives():
 
 
 def test_A2_person_and_phone_next_to_equipment():
-    # Root-Fall woertlich. SEC-Designentscheid R2 (strenger als Root-Erwartung "KV-01 retained"): Personenmarker
-    # "Herr" im selben Satz -> unklare Verwendung -> KV-01 bleibt maskiert. Person und Telefon maskiert.
+    # Root-Fall woertlich. R3 (Rafael/SEC 17.11.): Person im selben Satz sperrt die Kennung NICHT, die Person wird
+    # getrennt maskiert -> Root-Erwartung "KV-01 retained, person and telephone masked" erfuellt.
     t = "Herr Bernd Quastenberg prüft den Kaltwasserverteiler KV-01. Telefon 030 5550 1234."
     tr = [("Bernd Quastenberg", "PERSON"), ("KV-01", "ORGANIZATION"), ("030 5550 1234", "PHONE_NUMBER")]
     r = lauf(t, tr)
-    assert maskiert(r, "KV-01") and maskiert(r, "Bernd Quastenberg") and maskiert(r, "030 5550 1234")
-    assert r["postprocessing"]["anlagenkontext"]["nicht_herabgestuft"][0]["grund"] == "marker-im-satz:Herr"
+    assert klar(r, "KV-01") and maskiert(r, "Bernd Quastenberg") and maskiert(r, "030 5550 1234")
+    assert r["postprocessing"]["anlagenkontext"]["nicht_herabgestuft"] == []
     nicht_mehr_klartext_als_basis(t, tr, r)
     # Bauteilsatz getrennt von Person und Telefon: KV-01 frei, PII maskiert
     t3 = "Herr Bernd Quastenberg prüft heute.\nDer Kaltwasserverteiler KV-01 ist eingebaut.\nTelefon 030 5550 1234."
@@ -93,14 +93,18 @@ def test_A3_company_same_shape():
 def test_A4_global_placeholder_collision_per_span():
     t = "Die Firma KV-01 betreut das Projekt. Der Kaltwasserverteiler KV-01 versorgt den Umluftkühler UK-01."
     r = lauf(t, [("KV-01", "ORGANIZATION"), ("UK-01", "ORGANIZATION")])
-    # Firmenstelle -> der Wert ist im Dokument mehrdeutig -> JEDE Stelle bleibt maskiert (keine Teilfreigabe)
-    assert "Firma KV-01" not in r["smart_anonymized_text"]
-    assert maskiert(r, "KV-01") and "Kaltwasserverteiler KV-01" not in r["smart_anonymized_text"]
-    assert klar(r, "UK-01")
+    # R3 (SEC: same-value technisch/Person getrennt JE STELLE): Firmenstelle maskiert, die Stelle mit eigenem
+    # Bauteilbegriff frei; keine globale Wiederherstellung (Firmenstelle bleibt Platzhalter), Mischfall exakt
+    # ueber technical_retentions belegt.
+    out = r["smart_anonymized_text"]
+    assert "Firma KV-01" not in out and "Kaltwasserverteiler KV-01" in out and klar(r, "UK-01")
+    assert "KV-01" in r["mapping"].values()
     a = r["postprocessing"]["anlagenkontext"]
-    gruende = {x["grund"] for x in a["nicht_herabgestuft"] if x["wert"] == "KV-01"}
-    assert gruende == {"marker:Firma", "mehrdeutig-im-text"}
+    assert {x["grund"] for x in a["nicht_herabgestuft"] if x["wert"] == "KV-01"} == {"marker:Firma"}
     assert a["wieder_maskiert"] == 0
+    tr_ = a["technical_retentions"]
+    assert [(s["value"], out[s["start"]:s["end"]]) for s in tr_["spans"]] == [("KV-01", "KV-01"), ("UK-01", "UK-01")]
+    assert out.count("KV-01") == 1
 
 
 def test_A5_contact_context():
@@ -157,11 +161,11 @@ GEGEN = [
      [("Kleinmariazell", "LOCATION"), ("KV-01", "ORGANIZATION")], "Kleinmariazell", "KV-01"),
     ("Ansprechpartnerin Jana Wiesinger, Lindengasse 14, 3100 St. Pölten, j.wiesinger@example.net, betreut den Filter FI-01.",
      [("Jana Wiesinger", "PERSON"), ("St. Pölten", "LOCATION"), ("j.wiesinger@example.net", "EMAIL_ADDRESS"),
-      ("FI-01", "ORGANIZATION")], "Jana Wiesinger", None),  # R2: Kontakt im selben Satz -> FI-01 maskiert
+      ("FI-01", "ORGANIZATION")], "Jana Wiesinger", "FI-01"),  # R3: Kontakt im Satz sperrt nicht, Person maskiert
     ("Bauherr KV-01 beauftragt die Anlage.", [("KV-01", "ORGANIZATION")], "KV-01", None),
     ("Standort B-02 liegt in Kleinmariazell.", [("B-02", "LOCATION"), ("Kleinmariazell", "LOCATION")], "B-02", None),
     ("Lieferant AB-12 und der Wärmetauscher WT-01 sind bestellt.", [("AB-12", "ORGANIZATION"), ("WT-01", "ORGANIZATION")],
-     "AB-12", None),  # R2: Lieferantenmarker im selben Satz -> auch WT-01 maskiert
+     "AB-12", "WT-01"),  # R3: AB-12 (Lieferant) maskiert, WT-01 mit eigenem Bauteilbegriff frei
     ("Auftragnehmerfirma KV-01 montiert.", [("KV-01", "ORGANIZATION")], "KV-01", None),
     ("Herr KV-01 prüft.", [("KV-01", "ORGANIZATION")], "KV-01", None),
     ("Die Wiesinger Haustechnik KG in Gmünd wartet den Umluftkühler UK-01.",
@@ -343,7 +347,8 @@ def test_entscheide_harte_ueberlappung_und_anhaengen():
     p = t.index("Bernd"); k1 = t.index("KV-01"); k2 = t.rindex("KV-01")
     frei, ab = _ent(t, [(k1, k1 + 5, "ORGANIZATION", "detektor"), (k2, k2 + 5, "ORGANIZATION", "detektor")],
                     hart=[(p, p + len("Bernd Quastenberg"))])
-    assert frei == {} and ab[0]["grund"] == "an-harter-pii"
+    # R3 je Stelle: die an der Person haengende Stelle maskiert, die Bauteilstelle frei
+    assert frei == {(k2, k2 + 5): "Kaltwasserverteiler"} and [x["grund"] for x in ab] == ["an-harter-pii"]
 
 
 @pytest.mark.parametrize("text", [
@@ -371,11 +376,12 @@ def test_entscheide_satzzeichen_erlaubt(text):
 
 def test_entscheide_tabellendefinition_und_referenzen():
     t = ("KV-01;Kaltwasserverteiler;Verteilung;DN 100;\n"
-         "Der Pufferspeicher liegt zwischen KV-01 und WT-01.\n| KV-01 | Verteiler |")
+         "Der Pufferspeicher liegt zwischen KV-01 und WT-01.\n| KV-01 | Heizkreisverteiler |")
     ks = [(m, m + 5, "ORGANIZATION", "detektor") for m in [i for i in range(len(t)) if t.startswith("KV-01", i)]]
     frei, ab = _ent(t, ks)
-    # Definition (Tabellenzelle), Referenz (Praeposition "zwischen"), Markdown-Zelle "| KV-01 | Verteiler |"
-    assert len(frei) == 3 and set(frei.values()) == {"Kaltwasserverteiler", "zwischen", "Verteiler"} and ab == []
+    # Definition (Tabellenzelle), Referenz (Praeposition "zwischen"), Markdown-Zelle "| KV-01 | Heizkreisverteiler |"
+    # (R3b: "Verteiler" allein ist mehrdeutig - E-Mail-Verteiler = Personengruppe - und belegt nichts)
+    assert len(frei) == 3 and set(frei.values()) == {"Kaltwasserverteiler", "zwischen", "Heizkreisverteiler"} and ab == []
 
 
 def test_entscheide_nur_referenzen_ohne_definition():
@@ -389,8 +395,8 @@ def test_entscheide_tabellenzelle_marker():
     t = "KV-01;Firma;Wartung;\nDer Kaltwasserverteiler KV-01 ist neu."
     ks = [(i, i + 5, "ORGANIZATION", "detektor") for i in range(len(t)) if t.startswith("KV-01", i)]
     frei, ab = _ent(t, ks)
-    # gleicher Text: Firmenzeile macht den Wert im ganzen Text mehrdeutig
-    assert frei == {} and {x["grund"] for x in ab} == {"marker:Firma", "mehrdeutig-im-text"}
+    # R3: Firmenzeile maskiert, Bauteilstelle im selben Text frei (je Stelle)
+    assert list(frei.values()) == ["Kaltwasserverteiler"] and [x["grund"] for x in ab] == ["marker:Firma"]
 
 
 def test_entscheide_gemischter_typ_einer_stelle():
@@ -433,7 +439,8 @@ def test_R2_P1_ungemeldete_firmenstelle_bleibt_maskiert_pipeline():
     antwort = dienst(t, [("KV-01", "ORGANIZATION")], "SN")
     r = postprocess_smart_anonymize(t, antwort, prefix="SN", anlagenkontext=True)
     assert "Firma KV-01" not in r["smart_anonymized_text"]
-    assert "KV-01" not in r["smart_anonymized_text"]  # gleicher Text mehrdeutig -> beide maskiert
+    # R3: die ungemeldete Firmenstelle wird zusaetzlich maskiert, die Bauteilstelle bleibt frei
+    assert r["smart_anonymized_text"].count("KV-01") == 1 and "Kaltwasserverteiler KV-01" in r["smart_anonymized_text"]
 
 
 def test_R2_P1_ungemeldete_firmenstelle_anderer_text_zusatzmaske():
@@ -466,17 +473,17 @@ def test_R2_P1_kontakt_adresse_firma_ohne_detektortreffer(zweite):
         frei, ab, zusatz = _ent3(t, [(k, k + 5, "ORGANIZATION", "detektor")])
         k2 = t.rindex("KV-01")
         assert (k2, k2 + 5) not in frei
-        if verbindung == "\n":
-            assert frei == {}, zweite  # gleicher Text -> mehrdeutig
-        else:
-            assert (k2, k2 + 5, "ORGANIZATION") in zusatz, zweite
+        # R3: in beiden Faellen wird die Kontakt-/Firmenstelle zusaetzlich maskiert, die Bauteilstelle bleibt frei
+        assert (k2, k2 + 5, "ORGANIZATION") in zusatz, zweite
+        assert frei == {(k, k + 5): "Kaltwasserverteiler"}, zweite
 
 
 def test_R2_P1_eingebettetes_vorkommen():
     t = "Der Kaltwasserverteiler KV-01 ist neu.\nSiehe https://firma.example/KV-01 und KV-01_alt."
     k = t.index("KV-01")
     frei, ab = _ent(t, [(k, k + 5, "ORGANIZATION", "detektor")])
-    assert frei == {} and "eingebettet" in {x["grund"] for x in ab}
+    assert (k, k + 5) in frei and "eingebettet" in {x["grund"] for x in ab}
+    assert all(x["pos"] != k for x in ab)
 
 
 def test_R2_P2_nachbarzelle_ist_fundstelle():
@@ -504,7 +511,7 @@ def test_R2_B02_ueber_texte_je_stelle():
     ks = [(m.start(), m.end(), "LOCATION", "detektor") for m in re.finditer("B-02", t)]
     frei, ab = _ent(t, ks)
     assert list(frei) == [(ks[0][0], ks[0][1])]
-    assert ab == [{"wert": "B-02", "text": 2, "pos": ks[1][0], "grund": "marker-im-satz:Ansprechpartner"}]
+    assert ab == [{"wert": "B-02", "text": 2, "pos": ks[1][0], "grund": "kein-lokaler-technischer-beleg"}]
     r = postprocess_smart_anonymize(t, dienst(t, [("B-02", "LOCATION")], "SN"), prefix="SN", anlagenkontext=True)
     assert "Schluckbrunnen B-02" in r["smart_anonymized_text"] and "ist B-02" not in r["smart_anonymized_text"]
 
@@ -525,23 +532,32 @@ def test_R2_referenz_ohne_definition_im_aufruf():
     assert frei == {} and {x["grund"] for x in ab} == {"keine-definition-im-aufruf"}
 
 
-@pytest.mark.parametrize("satz", [
-    "Der Kaltwasserverteiler KV-01 gehört der Hausverwaltung.",
-    "Der Kaltwasserverteiler KV-01 wird vom Monteur getauscht.",
-    "Der Kaltwasserverteiler KV-01 steht am Standort Nord.",
-    "Der Kaltwasserverteiler KV-01, Rückruf 0664 1234567.",
-    "Der Kaltwasserverteiler KV-01 an service@example.org melden.",
+@pytest.mark.parametrize("satz,pii", [
+    ("Der Kaltwasserverteiler KV-01 gehört der Hausverwaltung.", None),
+    ("Der Kaltwasserverteiler KV-01 wird vom Monteur getauscht.", None),
+    ("Der Kaltwasserverteiler KV-01 steht am Standort Nord.", None),
+    ("Der Kaltwasserverteiler KV-01 ist defekt, Rückruf 0664 1234567.", ("0664 1234567", "PHONE_NUMBER")),
+    ("Der Kaltwasserverteiler KV-01 an service@example.org melden.", ("service@example.org", "EMAIL_ADDRESS")),
 ])
-def test_R2_marker_und_pii_spur_ohne_detektortreffer_im_satz(satz):
+def test_R3_rolle_oder_pii_anderswo_im_satz_sperrt_nicht(satz, pii):
+    # R3 (Rafael 17.11.: "Die Pumpe P-03 hat Ole Fennimann eingebaut" -> P-03 frei, Name maskiert): Rollenwort oder
+    # Kontakt anderswo im Satz sperrt die Kennung mit eigenem Bauteilbegriff nicht; der Kontakt bleibt maskiert.
     k = satz.index("KV-01")
     frei, _ = _ent(satz, [(k, k + 5, "ORGANIZATION", "detektor")])
-    assert frei == {}, satz
+    assert frei == {(k, k + 5): "Kaltwasserverteiler"}, satz
+    r = lauf(satz, [("KV-01", "ORGANIZATION")] + ([pii] if pii else []))
+    assert "Kaltwasserverteiler KV-01" in r["smart_anonymized_text"]
+    if pii:  # vom Dienst gemeldeter Kontakt bleibt maskiert
+        assert maskiert(r, pii[0]), pii
 
 
-def test_R2_tabellenzeile_nachbarzellen_kontakt():
+def test_R3_tabellenzeile_nachbarzellen_kontakt_getrennt():
+    # Rafael: Zellen sind getrennte Daten. Bauteilbezug in der Nachbarzelle -> F-01 frei; Name maskiert.
     t = "F-01,Brunnenkreis,Durchfluss,Ansprechpartnerin: Frau Ilka Sonnwendt"
     frei, ab = _ent(t, [(0, 4, "ORGANIZATION", "detektor")])
-    assert frei == {} and ab[0]["grund"].startswith("marker")
+    assert frei == {(0, 4): "Brunnenkreis"} and ab == []
+    r = lauf(t, [("F-01", "ORGANIZATION"), ("Ilka Sonnwendt", "PERSON")])
+    assert r["smart_anonymized_text"].startswith("F-01,Brunnenkreis") and maskiert(r, "Ilka Sonnwendt")
 
 
 @pytest.mark.parametrize("satz,w", [("Erzeuger WT-01, KM-01 und Verbraucher RLT-01, UK-01.", "UK-01"),
@@ -571,3 +587,196 @@ def test_R2_keine_wertglobale_rueckmaskierung_und_keine_reexposition():
     assert "Jana Wiesinger" not in out and "j.wiesinger@example.net" not in out
     assert "FI-01" in r["mapping"].values()
     nicht_mehr_klartext_als_basis(t, tr, r)
+
+
+# ── R3 (Rafael/SEC 17.11.2026 ~20:30Z): positive Bauteilbindung je Stelle, Zellen getrennt, Retentions-Vertrag ──
+
+@pytest.mark.parametrize("wort", ["Familie", "Bewohner", "Bewohnerin", "Patient", "Patientin", "Kollege", "Klient",
+                                  "Nachbar", "Vermieter", "Sachbearbeiter", "Endverbraucher", "Schüler", "Bewerber",
+                                  "Besitzer", "Käufer", "Vertreter", "Absender", "Empfänger", "Haushalt", "Gast"])
+def test_R3_P_PRV_4_personenwort_ist_kein_bauteil(wort):
+    # Review R2 P-PRV-4: frueher galt jedes grossgeschriebene Nicht-Marker-Substantiv als Definition. Jetzt nur die
+    # positive Fachliste -> Personen-/Haushaltswoerter belegen nichts (fail-closed), ohne Sperrliste.
+    t = f"{wort} B-02 meldet sich.\nDer Schluckbrunnen B-02 ist dicht."
+    ks = [(m.start(), m.end(), "LOCATION", "detektor") for m in re.finditer("B-02", t)]
+    frei, ab = _ent(t, ks)
+    assert (ks[0][0], ks[0][1]) not in frei and ab[0]["grund"] in ("kein-lokaler-technischer-beleg", "marker:" + wort), wort
+    assert frei == {(ks[1][0], ks[1][1]): "Schluckbrunnen"}
+    assert not ak.ist_bauteil(wort)
+
+
+@pytest.mark.parametrize("t,frei_w,name", [
+    ("Die Pumpe P-03 hat Ole Fennimann eingebaut.", "P-03", "Ole Fennimann"),
+    ("F-01;Durchflussmesser;Brunnenkreis;;geprueft von Ole Fennimann", "F-01", "Ole Fennimann"),
+    ("F-01;Durchflussmesser;Brunnenkreis;;geprueft von Herrn Ole Fennimann", "F-01", "Ole Fennimann"),
+])
+def test_R3_P_PRV_5_name_getrennt_maskiert(t, frei_w, name):
+    # Review R2 P-PRV-5 / Rafael: Name im Satz bzw. in anderer Zelle wird maskiert, die Kennung bleibt erhalten.
+    r = lauf(t, [(frei_w, "ORGANIZATION"), (name, "PERSON")])
+    assert klar(r, frei_w) and maskiert(r, name)
+    tr_ = r["postprocessing"]["anlagenkontext"]["technical_retentions"]
+    assert [s["value"] for s in tr_["spans"]] == [frei_w]
+
+
+@pytest.mark.parametrize("t", [
+    "Ansprechpartner B-02 ruft an.", "Ansprechpartner ist B-02, bitte anrufen.", "Familie B-02 zieht ein.",
+    "Bewohner B-02 meldet einen Schaden.", "Kontaktperson B-02, zuständig für den Schluckbrunnen.",
+    "Der Schluckbrunnen B-02, Ansprechpartner Herr Wiesinger.", "Der Schluckbrunnen B-02 ist unser Ansprechpartner.",
+    "Der Schluckbrunnen B-02: Frau Sonnwendt.", "Der Schluckbrunnen B-02 (Kontakt) ist dicht.",
+])
+def test_R3_B02_rollenfaelle_maskiert(t):
+    k = t.index("B-02")
+    frei, ab = _ent(t, [(k, k + 4, "LOCATION", "detektor")])
+    assert frei == {}, (t, ab)
+    r = lauf(t, [("B-02", "LOCATION")])
+    assert maskiert(r, "B-02")
+    assert r["postprocessing"]["anlagenkontext"]["technical_retentions"]["spans"] == []
+
+
+def test_R3_referenz_bei_konflikt_im_text_maskiert():
+    # Gleicher Text: Firmenstelle + Praepositions-Referenz -> Referenz maskiert, Stelle mit Bauteilbegriff frei
+    t = "Die Firma KV-01 liefert. Der Kaltwasserverteiler KV-01 ist neu. Die Leitung fuehrt zu KV-01."
+    ks = [(m.start(), m.end(), "ORGANIZATION", "detektor") for m in re.finditer("KV-01", t)]
+    frei, ab = _ent(t, ks)
+    assert frei == {(ks[1][0], ks[1][1]): "Kaltwasserverteiler"}
+    assert sorted(x["grund"] for x in ab) == ["marker:Firma", "referenz-bei-konflikt-im-text"]
+
+
+def test_R3_fachliste_ohne_marker_und_ohne_personennamen():
+    for g in list(ak._BAUTEIL_KOPF) + sorted(ak._BAUTEIL_WORT):
+        assert not ak.ist_marker(g), g
+    for w in ("Brenner", "Hahn", "Schieber", "Mischer", "Sammler", "Halter", "Herr", "Firma", "Haus", "Pumpenhaus"):
+        assert not ak.ist_bauteil(w), w
+    for w in ("Kaltwasserverteiler", "Umluftkühler", "Serverraum-Umluftkuehler", "Umwälzpumpe", "Durchflussmesser",
+              "Filter", "Schluckbrunnen", "Kreis", "Ruecklauf", "Brunnenkreis", "Verbraucher", "Erzeuger"):
+        assert ak.ist_bauteil(w), w
+
+
+# Vertrag technical_retentions (Root-Vorschlag version 1, Praezisierungen c9 1-6)
+
+def _hp_check(r):
+    """Nachbildung der Homepage-Pruefung (contract.js) MIT Retentions-Ausnahme: jedes freie Vorkommen eines
+    mapping-Werts muss genau ein Retentions-Span sein."""
+    out = r["smart_anonymized_text"]
+    ret = r["postprocessing"]["anlagenkontext"]["technical_retentions"]
+    import hashlib
+    assert ret["version"] == 1 and ret["index_unit"] == "unicode_codepoint"
+    assert ret["output_sha256"] == hashlib.sha256(out.encode("utf-8")).hexdigest()
+    belegt = set()
+    for s in ret["spans"]:
+        assert out[s["start"]:s["end"]] == s["value"] and s["entity_type"] in ("ORGANIZATION", "LOCATION")
+        belegt.add((s["start"], s["end"]))
+    st = [s["start"] for s in ret["spans"]]
+    assert st == sorted(st)
+    for w in r["mapping"].values():
+        for m in re.finditer(r"(?<![^\W_])" + re.escape(w) + r"(?![^\W_])", out):
+            assert (m.start(), m.end()) in belegt, w
+    return ret
+
+
+def test_R3_retentions_exakt_mit_mehrbyte_und_trennern():
+    t = ("Ümlaut-Zeile: Der Kältemaschinen-Kaltwasserverteiler KV-01 versorgt 😀 den Umluftkühler UK-01." + SEP +
+         "Die Firma KV-01 liefert; Herr Bernd Quastenberg prüft den Filter FI-01.")
+    tr = [("KV-01", "ORGANIZATION"), ("UK-01", "ORGANIZATION"), ("FI-01", "ORGANIZATION"),
+          ("Bernd Quastenberg", "PERSON")]
+    r = lauf(t, tr)
+    ret = _hp_check(r)
+    assert [s["value"] for s in ret["spans"]] == ["KV-01", "UK-01", "FI-01"]
+    assert "Firma KV-01" not in r["smart_anonymized_text"] and maskiert(r, "Bernd Quastenberg")
+
+
+def test_R3_retentions_fehlen_ohne_kontext():
+    r = lauf("Der Kaltwasserverteiler KV-01 ist neu.", [("KV-01", "ORGANIZATION")], anlagenkontext=False)
+    assert "anlagenkontext" not in r["postprocessing"]
+
+
+def test_R3_retentions_failclosed_bei_inkonsistenz(monkeypatch):
+    from src.privacy_postprocess import pipeline
+    t = "Der Kaltwasserverteiler KV-01 ist neu."
+    tr = [("KV-01", "ORGANIZATION")]
+    monkeypatch.setattr(pipeline, "_technische_retentionen", lambda *a, **k: (None, "span-versatz"))
+    r = lauf(t, tr)
+    assert maskiert(r, "KV-01")
+    assert r["postprocessing"]["anlagenkontext"] == {"aktiv": False, "abbruch": "span-versatz"}
+    assert r["smart_anonymized_text"] == basis(t, tr)["smart_anonymized_text"]
+
+
+def test_R3_retentions_gegenprobe_freies_vorkommen_ohne_span():
+    from src.privacy_postprocess.pipeline import _technische_retentionen
+    from src.privacy_postprocess.spans import Span, PRIO_DETEKTOR
+    orig = "Firma KV-01 und KV-01."
+    s = Span(6, 11, "ORGANIZATION", "detektor", PRIO_DETEKTOR, 1.0)
+    s.platzhalter = "SN_ORGANIZATION_001"
+    out = "Firma SN_ORGANIZATION_001 und KV-01."
+    ret, abbruch = _technische_retentionen(orig, out, [s], {"SN_ORGANIZATION_001": "KV-01"}, [])
+    assert ret is None and abbruch == "freies-vorkommen-ohne-span"
+
+
+# ── R3b (Review R3 e8511fe6: P-PRV-6, P-PRV-7; Adapter-Abgleich '_') ──────────────────────────────────────────
+
+@pytest.mark.parametrize("wort,kennung", [
+    ("Freundeskreis", "B-02"), ("Bekanntenkreis", "B-02"), ("Kundenkreis", "KK-01"), ("Familienkreis", "FK-01"),
+    ("Hauskreis", "HK-01"), ("Landkreis", "LK-12"), ("Wahlkreis", "WK-12"), ("Geschäftsleitung", "GL-01"),
+    ("Bauleitung", "BL-01"), ("Projektleitung", "PL-01"), ("Handelsregister", "HRB-1234"),
+    ("Firmenbuchregister", "FN-1234"), ("Kapitalanlage", "KA-01"), ("Geldanlage", "GA-01"),
+    ("Vertriebskanal", "VK-01"), ("Verteiler", "VT-01"), ("Mailverteiler", "MV-01"), ("Geldtauscher", "GT-01"),
+    ("Leitung", "L-1"), ("Register", "R-1"), ("Anlage", "A-1"), ("Kanal", "K-1"), ("Bankschalter", "BS-01"),
+    ("Talkessel", "TK-01"), ("Landvermesser", "LV-01"), ("Erbsenzähler", "EZ-01"), ("Kreisverband", "KV-01"),
+])
+def test_R3b_P_PRV_6_mehrdeutige_grundwoerter_geben_nicht_frei(wort, kennung):
+    t = f"Der {wort} {kennung} ist eingetragen."
+    k = t.index(kennung)
+    frei, ab = _ent(t, [(k, k + len(kennung), "ORGANIZATION", "detektor")])
+    assert frei == {}, (wort, ab)
+    assert not ak.ist_bauteil(wort), wort
+
+
+@pytest.mark.parametrize("wort", [
+    "Brunnenkreis", "Heizkreis", "Kältekreis", "Solekreis", "Serverraumkreis", "Kreis", "Rücklauf",
+    "Rohrleitung", "Rücklaufleitung", "Steuerleitung", "Steigleitung", "Lüftungsanlage", "Kabelkanal",
+    "Lüftungskanal", "Kühlregister", "Kaltwasserverteiler", "Wärmetauscher", "Schluckbrunnen", "Kältemaschine",
+    "Rückflussverhinderer", "Umwälzpumpe", "Umwaelzpumpen", "Serverraum-Umluftkuehler", "Durchflussmesser",
+    "Temperaturfühler", "Pufferspeicher", "Dreiwegeventil", "Filter", "Heizkreise", "Rohrleitungen",
+])
+def test_R3b_positive_komposita_und_koepfe(wort):
+    assert ak.ist_bauteil(wort), wort
+
+
+@pytest.mark.parametrize("t", [
+    "Der Brunnen B-02, Bewohnerin des Hauses, meldet.", "Der Brunnen B-02, Familie Sonnwendt, meldet.",
+    "Der Brunnen B-02 ist Patient der Praxis.", "Der Schluckbrunnen B-02 (Kollegin) prüft.",
+    "Der Schluckbrunnen B-02 – Nachbar – meldet.", "Der Schluckbrunnen B-02 ist unsere Mieterin.",
+    "Der Schluckbrunnen B-02: Bernd prüft.", "Der Schluckbrunnen B-02 als Vertreter der Eigentümer.",
+])
+def test_R3b_P_PRV_7_rolle_nach_kennung_positiv(t):
+    k = t.index("B-02")
+    frei, ab = _ent(t, [(k, k + 4, "LOCATION", "detektor")])
+    assert frei == {}, t
+    assert ab[0]["grund"].startswith("rolle-an-stelle:") or ab[0]["grund"].startswith("marker"), ab
+
+
+@pytest.mark.parametrize("t", [
+    "Der Pufferspeicher PS-01 (Wärmespeicher) liegt im Rücklauf.", "Der Schluckbrunnen B-02 ist dicht.",
+    "Der Kaltwasserverteiler KV-01, Heizkreisverteiler, ist neu.", "KV-01;Kaltwasserverteiler;Verteilung;DN 100;",
+    "T-03,Ruecklauf UK-01,Temperatur,", "| KV-01 | Kaltwasserverteiler | Familie Sonnwendt |",
+    "Der Schluckbrunnen B-02 (2.000 l) ist dicht.", "Der Schluckbrunnen B-02 (DN 100) ist dicht.",
+])
+def test_R3b_P_PRV_7_bauteil_apposition_und_zellen_bleiben_frei(t):
+    m = re.search(r"[A-Z]{1,4}-\d{1,4}(?= ist dicht| \(|,|;| \|)", t)
+    k0, k1 = (m.start(), m.end()) if m and "UK-01" not in t else (t.index("UK-01"), t.index("UK-01") + 5)
+    frei, ab = _ent(t, [(k0, k1, "ORGANIZATION", "detektor")])
+    assert (k0, k1) in frei, (t, ab)
+
+
+@pytest.mark.parametrize("t", ["Der Filter FI-01_alt ist neu.", "Der Filter _FI-01 ist neu.",
+                               "Der Filter FI-01_ ist neu.", "Datei Filter_FI-01.pdf"])
+def test_R3b_unterstrich_ist_keine_wortgrenze(t):
+    # Adapter-Abgleich 451d80c (e8511fe6): '_' neben der Kennung -> maskiert (Backend == Adapter)
+    k = t.index("FI-01")
+    frei, _ = _ent(t, [(k, k + 5, "ORGANIZATION", "detektor")])
+    assert frei == {}, t
+    r = lauf(t + "\nDer Filter FI-01 ist neu.", [("FI-01", "ORGANIZATION")])
+    out = r["smart_anonymized_text"]
+    for s in r["postprocessing"]["anlagenkontext"]["technical_retentions"]["spans"]:
+        assert out[s["start"] - 1:s["start"]] != "_" and out[s["end"]:s["end"] + 1] != "_"
+    assert "FI-01_" not in out and "_FI-01" not in out
