@@ -7,6 +7,7 @@ Die Detektor-Treffer sind die gemessenen Flair-Typen aus E2E 7K3Q (KV-01..FI-01 
 
 from __future__ import annotations
 
+import re
 import sys
 from pathlib import Path
 
@@ -67,14 +68,19 @@ def test_A1_six_real_false_positives():
 
 
 def test_A2_person_and_phone_next_to_equipment():
-    # Telefon in Inlandsschreibweise: das Test-Hilfsmittel ``dienst`` ersetzt per \\b und erfasst ein fuehrendes "+"
-    # nicht (Artefakt der Attrappe, nicht des Dienstes).
+    # Root-Fall woertlich. SEC-Designentscheid R2 (strenger als Root-Erwartung "KV-01 retained"): Personenmarker
+    # "Herr" im selben Satz -> unklare Verwendung -> KV-01 bleibt maskiert. Person und Telefon maskiert.
     t = "Herr Bernd Quastenberg prüft den Kaltwasserverteiler KV-01. Telefon 030 5550 1234."
     tr = [("Bernd Quastenberg", "PERSON"), ("KV-01", "ORGANIZATION"), ("030 5550 1234", "PHONE_NUMBER")]
     r = lauf(t, tr)
-    assert klar(r, "KV-01")
-    assert maskiert(r, "Bernd Quastenberg") and maskiert(r, "030 5550 1234")
+    assert maskiert(r, "KV-01") and maskiert(r, "Bernd Quastenberg") and maskiert(r, "030 5550 1234")
+    assert r["postprocessing"]["anlagenkontext"]["nicht_herabgestuft"][0]["grund"] == "marker-im-satz:Herr"
     nicht_mehr_klartext_als_basis(t, tr, r)
+    # Bauteilsatz getrennt von Person und Telefon: KV-01 frei, PII maskiert
+    t3 = "Herr Bernd Quastenberg prüft heute.\nDer Kaltwasserverteiler KV-01 ist eingebaut.\nTelefon 030 5550 1234."
+    r3 = lauf(t3, tr)
+    assert klar(r3, "KV-01") and maskiert(r3, "Bernd Quastenberg") and maskiert(r3, "030 5550 1234")
+    nicht_mehr_klartext_als_basis(t3, tr, r3)
 
 
 def test_A3_company_same_shape():
@@ -92,7 +98,8 @@ def test_A4_global_placeholder_collision_per_span():
     assert maskiert(r, "KV-01") and "Kaltwasserverteiler KV-01" not in r["smart_anonymized_text"]
     assert klar(r, "UK-01")
     a = r["postprocessing"]["anlagenkontext"]
-    assert {"wert": "KV-01", "stellen": 2, "grund": "mehrdeutig-marker:Firma"} in a["nicht_herabgestuft"]
+    gruende = {x["grund"] for x in a["nicht_herabgestuft"] if x["wert"] == "KV-01"}
+    assert gruende == {"marker:Firma", "mehrdeutig-im-text"}
     assert a["wieder_maskiert"] == 0
 
 
@@ -150,11 +157,11 @@ GEGEN = [
      [("Kleinmariazell", "LOCATION"), ("KV-01", "ORGANIZATION")], "Kleinmariazell", "KV-01"),
     ("Ansprechpartnerin Jana Wiesinger, Lindengasse 14, 3100 St. Pölten, j.wiesinger@example.net, betreut den Filter FI-01.",
      [("Jana Wiesinger", "PERSON"), ("St. Pölten", "LOCATION"), ("j.wiesinger@example.net", "EMAIL_ADDRESS"),
-      ("FI-01", "ORGANIZATION")], "Jana Wiesinger", "FI-01"),
+      ("FI-01", "ORGANIZATION")], "Jana Wiesinger", None),  # R2: Kontakt im selben Satz -> FI-01 maskiert
     ("Bauherr KV-01 beauftragt die Anlage.", [("KV-01", "ORGANIZATION")], "KV-01", None),
     ("Standort B-02 liegt in Kleinmariazell.", [("B-02", "LOCATION"), ("Kleinmariazell", "LOCATION")], "B-02", None),
     ("Lieferant AB-12 und der Wärmetauscher WT-01 sind bestellt.", [("AB-12", "ORGANIZATION"), ("WT-01", "ORGANIZATION")],
-     "AB-12", "WT-01"),
+     "AB-12", None),  # R2: Lieferantenmarker im selben Satz -> auch WT-01 maskiert
     ("Auftragnehmerfirma KV-01 montiert.", [("KV-01", "ORGANIZATION")], "KV-01", None),
     ("Herr KV-01 prüft.", [("KV-01", "ORGANIZATION")], "KV-01", None),
     ("Die Wiesinger Haustechnik KG in Gmünd wartet den Umluftkühler UK-01.",
@@ -206,7 +213,7 @@ def test_ausgabe_sichtbar_und_begruendet():
     r = lauf(t, [("B-02", "LOCATION")])
     h = r["postprocessing"]["anlagenkontext"]["herabgestuft"]
     assert h == [{"original": "B-02", "type": "LOCATION", "start": t.index("B-02"), "confidence": 0.9,
-                  "bauteilwort": "Schluckbrunnen", "grund": ak.GRUND}]
+                  "bauteilwort": "Schluckbrunnen", "beleg": "definition", "grund": ak.GRUND}]
 
 
 # ── Serverseitige Verifikation (kontext_verifiziert) ────────────────────────
@@ -310,6 +317,10 @@ S_OK = (T_OK.index("KV-01"), T_OK.index("KV-01") + 5)
 
 
 def _ent(text, kandidaten, hart=(), alle=None):
+    return _ent3(text, kandidaten, hart, alle)[:2]
+
+
+def _ent3(text, kandidaten, hart=(), alle=None):
     return ak.entscheide(text, list(kandidaten), list(hart), list(alle if alle is not None else
                                                                   [(k[0], k[1]) for k in kandidaten]))
 
@@ -363,21 +374,23 @@ def test_entscheide_tabellendefinition_und_referenzen():
          "Der Pufferspeicher liegt zwischen KV-01 und WT-01.\n| KV-01 | Verteiler |")
     ks = [(m, m + 5, "ORGANIZATION", "detektor") for m in [i for i in range(len(t)) if t.startswith("KV-01", i)]]
     frei, ab = _ent(t, ks)
-    assert len(frei) == 3 and set(frei.values()) == {"Kaltwasserverteiler"} and ab == []
+    # Definition (Tabellenzelle), Referenz (Praeposition "zwischen"), Markdown-Zelle "| KV-01 | Verteiler |"
+    assert len(frei) == 3 and set(frei.values()) == {"Kaltwasserverteiler", "zwischen", "Verteiler"} and ab == []
 
 
 def test_entscheide_nur_referenzen_ohne_definition():
     t = "Der Pufferspeicher liegt zwischen KV-01 und WT-01. Siehe auch KV-01."
     ks = [(i, i + 5, "ORGANIZATION", "detektor") for i in range(len(t)) if t.startswith("KV-01", i)]
     frei, ab = _ent(t, ks)
-    assert frei == {} and ab[0]["grund"] == "keine-definition-im-dokument"
+    assert frei == {} and {x["grund"] for x in ab} == {"keine-definition-im-aufruf", "kein-lokaler-technischer-beleg"}
 
 
 def test_entscheide_tabellenzelle_marker():
     t = "KV-01;Firma;Wartung;\nDer Kaltwasserverteiler KV-01 ist neu."
     ks = [(i, i + 5, "ORGANIZATION", "detektor") for i in range(len(t)) if t.startswith("KV-01", i)]
     frei, ab = _ent(t, ks)
-    assert frei == {} and ab[0]["grund"] == "mehrdeutig-marker:Firma"
+    # gleicher Text: Firmenzeile macht den Wert im ganzen Text mehrdeutig
+    assert frei == {} and {x["grund"] for x in ab} == {"marker:Firma", "mehrdeutig-im-text"}
 
 
 def test_entscheide_gemischter_typ_einer_stelle():
@@ -391,7 +404,7 @@ def test_entscheide_bauteilwort_ist_weiche_fundstelle():
     t = "Der Brunnen Kleinmariazell KV-01 ist neu."
     k = t.index("KV-01"); o = t.index("Kleinmariazell")
     frei, ab = _ent(t, [(k, k + 5, "ORGANIZATION", "detektor"), (o, o + 14, "LOCATION", "detektor")])
-    assert frei == {} and ab[0]["grund"] == "keine-definition-im-dokument"
+    assert frei == {} and ab[0]["grund"] == "kein-lokaler-technischer-beleg"
 
 
 def test_entscheide_harte_pii_direkt_danach():
@@ -402,7 +415,159 @@ def test_entscheide_harte_pii_direkt_danach():
 
 
 def test_entscheide_nur_kennungswerte_im_bericht():
-    t = "Herr Bernd Quastenberg prüft den Kaltwasserverteiler KV-01."
+    t = "Herr Bernd Quastenberg prüft heute.\nDer Kaltwasserverteiler KV-01 ist neu."
     p = t.index("Bernd"); k = t.index("KV-01")
     frei, ab = _ent(t, [(p, p + 17, "PERSON", "detektor"), (k, k + 5, "ORGANIZATION", "detektor")], hart=[(p, p + 17)])
     assert ab == [] and list(frei.values()) == ["Kaltwasserverteiler"]
+
+
+# ── Adversarialfaelle R2 (Review e8511fe6 P-PRV-1/2/3, SEC-Designentscheid R2) ──────────
+
+SEP = "\n\nWERKING_DOCUMENT_00000000-0000-4000-8000-000000000001\n\n"
+
+
+def test_R2_P1_ungemeldete_firmenstelle_bleibt_maskiert_pipeline():
+    # Dienst meldet nur die Bauteilstelle; die Firmenstelle (gleicher Text) darf nicht Klartext werden
+    t = "Der Kaltwasserverteiler KV-01 ist neu.\nRechnung an die Firma KV-01 bitte."
+    k = t.index("KV-01")
+    antwort = dienst(t, [("KV-01", "ORGANIZATION")], "SN")
+    r = postprocess_smart_anonymize(t, antwort, prefix="SN", anlagenkontext=True)
+    assert "Firma KV-01" not in r["smart_anonymized_text"]
+    assert "KV-01" not in r["smart_anonymized_text"]  # gleicher Text mehrdeutig -> beide maskiert
+
+
+def test_R2_P1_ungemeldete_firmenstelle_anderer_text_zusatzmaske():
+    t = "Der Kaltwasserverteiler KV-01 ist neu." + SEP + "Rechnung an die Firma KV-01 bitte."
+    k = t.index("KV-01")
+    frei, ab, zusatz = _ent3(t, [(k, k + 5, "ORGANIZATION", "detektor")])
+    k2 = t.rindex("KV-01")
+    assert frei == {(k, k + 5): "Kaltwasserverteiler"}
+    assert zusatz == [(k2, k2 + 5, "ORGANIZATION")]  # ungemeldete Firmenstelle wird zusaetzlich maskiert
+    # Pipeline: Firmenstelle maskiert, Bauteilstelle frei (je Stelle, keine wertglobale Angleichung)
+    antwort = {"status": "success", "anonymization_performed": True, "raw_anonymized_text": t.replace("KV-01", "SN_ORGANIZATION_001", 1),
+               "raw_entity_count": 1, "smart_anonymized_text": t.replace("KV-01", "SN_ORGANIZATION_001", 1),
+               "smart_entity_count": 1, "restored_entities": [], "mapping": {"SN_ORGANIZATION_001": "KV-01"},
+               "detected_entities": [{"placeholder": "SN_ORGANIZATION_001", "type": "ORGANIZATION", "original": "KV-01",
+                                      "confidence": 0.9, "decision": "KEEP", "reason": ""}]}
+    r = postprocess_smart_anonymize(t, antwort, prefix="SN", anlagenkontext=True)
+    assert "Firma KV-01" not in r["smart_anonymized_text"]
+    assert "Kaltwasserverteiler KV-01" in r["smart_anonymized_text"]
+
+
+@pytest.mark.parametrize("zweite", [
+    "Kontakt KV-01: 0664 1234567.", "Mail an kv-01@example.org oder KV-01 direkt.",
+    "KV-01, Lindengasse 14, 3100 Musterdorf.", "Die Hausverwaltung KV-01 ruft an.",
+    "Ansprechpartner ist KV-01, bitte anrufen.",
+])
+def test_R2_P1_kontakt_adresse_firma_ohne_detektortreffer(zweite):
+    for verbindung in ("\n", SEP):
+        t = "Der Kaltwasserverteiler KV-01 ist neu." + verbindung + zweite
+        k = t.index("KV-01")
+        frei, ab, zusatz = _ent3(t, [(k, k + 5, "ORGANIZATION", "detektor")])
+        k2 = t.rindex("KV-01")
+        assert (k2, k2 + 5) not in frei
+        if verbindung == "\n":
+            assert frei == {}, zweite  # gleicher Text -> mehrdeutig
+        else:
+            assert (k2, k2 + 5, "ORGANIZATION") in zusatz, zweite
+
+
+def test_R2_P1_eingebettetes_vorkommen():
+    t = "Der Kaltwasserverteiler KV-01 ist neu.\nSiehe https://firma.example/KV-01 und KV-01_alt."
+    k = t.index("KV-01")
+    frei, ab = _ent(t, [(k, k + 5, "ORGANIZATION", "detektor")])
+    assert frei == {} and "eingebettet" in {x["grund"] for x in ab}
+
+
+def test_R2_P2_nachbarzelle_ist_fundstelle():
+    t = "LF-02;Huberwerk;Lieferung\nWT-01;Waermetauscher;"
+    l = t.index("LF-02"); h = t.index("Huberwerk"); w = t.index("WT-01")
+    frei, ab = _ent(t, [(l, l + 5, "ORGANIZATION", "detektor"), (h, h + 9, "ORGANIZATION", "detektor"),
+                        (w, w + 5, "ORGANIZATION", "detektor")])
+    assert (l, l + 5) not in frei and frei.get((w, w + 5)) == "Waermetauscher"
+
+
+@pytest.mark.parametrize("satz", ["Die Wohnung W-12 ist vermietet.", "Das Haus B-02 steht leer.",
+                                  "Die Stiege A-2 ist gesperrt.", "Das Zimmer R-12 ist belegt.",
+                                  "Postfach PF-12 wird geleert.", "Top T-4 liegt im Stock S-2.",
+                                  "Die Etage E-3 ist frei.", "Die Liegenschaft L-17 wird verkauft."])
+def test_R2_P3_adressaehnliche_kennungen(satz):
+    for w in re.findall(r"[A-Z]{1,2}-\d+", satz):
+        s0 = satz.index(w)
+        frei, ab = _ent(satz, [(s0, s0 + len(w), "LOCATION", "detektor")])
+        assert frei == {}, (satz, w)
+
+
+def test_R2_B02_ueber_texte_je_stelle():
+    # SEC-Beispiel: technische Stelle frei, "Ansprechpartner B-02" in anderem Text maskiert
+    t = "Der Schluckbrunnen B-02 ist dicht." + SEP + "Ansprechpartner ist B-02, bitte anrufen."
+    ks = [(m.start(), m.end(), "LOCATION", "detektor") for m in re.finditer("B-02", t)]
+    frei, ab = _ent(t, ks)
+    assert list(frei) == [(ks[0][0], ks[0][1])]
+    assert ab == [{"wert": "B-02", "text": 2, "pos": ks[1][0], "grund": "marker-im-satz:Ansprechpartner"}]
+    r = postprocess_smart_anonymize(t, dienst(t, [("B-02", "LOCATION")], "SN"), prefix="SN", anlagenkontext=True)
+    assert "Schluckbrunnen B-02" in r["smart_anonymized_text"] and "ist B-02" not in r["smart_anonymized_text"]
+
+
+def test_R2_querverweis_als_hinweis_nicht_als_freigabe():
+    # Definition in Text 1 (Hinweis); Text 2 verweist mit Praeposition -> frei; Text 3 ohne lokalen Beleg -> maskiert
+    t = ("Der Schluckbrunnen B-02 ist dicht." + SEP + "Die Leitung fuehrt zu B-02." + SEP + "B-02 meldet sich morgen.")
+    ks = [(m.start(), m.end(), "LOCATION", "detektor") for m in re.finditer("B-02", t)]
+    frei, ab = _ent(t, ks)
+    assert set(frei) == {(ks[0][0], ks[0][1]), (ks[1][0], ks[1][1])}
+    assert ab == [{"wert": "B-02", "text": 3, "pos": ks[2][0], "grund": "kein-lokaler-technischer-beleg"}]
+
+
+def test_R2_referenz_ohne_definition_im_aufruf():
+    t = "Die Leitung fuehrt zu B-02." + SEP + "Der Ruecklauf geht ueber B-02."
+    ks = [(m.start(), m.end(), "LOCATION", "detektor") for m in re.finditer("B-02", t)]
+    frei, ab = _ent(t, ks)
+    assert frei == {} and {x["grund"] for x in ab} == {"keine-definition-im-aufruf"}
+
+
+@pytest.mark.parametrize("satz", [
+    "Der Kaltwasserverteiler KV-01 gehört der Hausverwaltung.",
+    "Der Kaltwasserverteiler KV-01 wird vom Monteur getauscht.",
+    "Der Kaltwasserverteiler KV-01 steht am Standort Nord.",
+    "Der Kaltwasserverteiler KV-01, Rückruf 0664 1234567.",
+    "Der Kaltwasserverteiler KV-01 an service@example.org melden.",
+])
+def test_R2_marker_und_pii_spur_ohne_detektortreffer_im_satz(satz):
+    k = satz.index("KV-01")
+    frei, _ = _ent(satz, [(k, k + 5, "ORGANIZATION", "detektor")])
+    assert frei == {}, satz
+
+
+def test_R2_tabellenzeile_nachbarzellen_kontakt():
+    t = "F-01,Brunnenkreis,Durchfluss,Ansprechpartnerin: Frau Ilka Sonnwendt"
+    frei, ab = _ent(t, [(0, 4, "ORGANIZATION", "detektor")])
+    assert frei == {} and ab[0]["grund"].startswith("marker")
+
+
+@pytest.mark.parametrize("satz,w", [("Erzeuger WT-01, KM-01 und Verbraucher RLT-01, UK-01.", "UK-01"),
+                                    ("Die Umwaelzpumpe (P-02) laeuft.", "P-02"),
+                                    ("P-03;Umwaelzpumpe;Kreis UK-01;3 m3/h;", "UK-01")])
+def test_R2_aufzaehlung_klammer_zelle_definieren(satz, w):
+    k = satz.index(w)
+    frei, _ = _ent(satz, [(k, k + len(w), "ORGANIZATION", "detektor")])
+    assert len(frei) == 1, satz
+
+
+def test_R2_aufzaehlung_marker_vererbt():
+    t = "Lieferanten AB-01, AB-02 und AB-03 liefern."
+    ks = [(m.start(), m.end(), "ORGANIZATION", "detektor") for m in re.finditer(r"AB-0\d", t)]
+    frei, _ = _ent(t, ks)
+    assert frei == {}
+
+
+def test_R2_keine_wertglobale_rueckmaskierung_und_keine_reexposition():
+    # Wert in Text 1 frei, in Text 2 (Kontakt) maskiert: Ausgabe zeigt Text-1-Stelle, Text-2-Stelle maskiert,
+    # Mapping enthaelt den Wert (Rueckweg intakt); harte PII bleibt maskiert.
+    t = "Der Filter FI-01 ist neu." + SEP + "Kontakt FI-01: Jana Wiesinger, j.wiesinger@example.net."
+    tr = [("FI-01", "ORGANIZATION"), ("Jana Wiesinger", "PERSON"), ("j.wiesinger@example.net", "EMAIL_ADDRESS")]
+    r = lauf(t, tr)
+    out = r["smart_anonymized_text"]
+    assert "Filter FI-01" in out and "Kontakt FI-01" not in out
+    assert "Jana Wiesinger" not in out and "j.wiesinger@example.net" not in out
+    assert "FI-01" in r["mapping"].values()
+    nicht_mehr_klartext_als_basis(t, tr, r)

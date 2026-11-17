@@ -163,9 +163,12 @@ def _aufloesen(spans: List[Span], text: str) -> List[Span]:
     return out
 
 
-def _gleiche_werte_nachziehen(text: str, spans: List[Span]) -> List[Span]:
-    """Jeder maskierte Wert wird an allen weiteren Stellen des Dokuments maskiert."""
-    belegt = sorted((s.start, s.end) for s in spans)
+def _gleiche_werte_nachziehen(text: str, spans: List[Span],
+                              geschuetzt: Tuple[Tuple[int, int], ...] = ()) -> List[Span]:
+    """Jeder maskierte Wert wird an allen weiteren Stellen des Dokuments maskiert.
+    ``geschuetzt``: Stellen, die die Anlagenkontext-Regel je Stelle freigegeben hat (keine wertglobale
+    Rueckmaskierung; leer = Verhalten wie bisher)."""
+    belegt = sorted([(s.start, s.end) for s in spans] + list(geschuetzt))
     neu: List[Span] = []
     werte: Dict[str, Span] = {}
     for s in spans:
@@ -457,13 +460,14 @@ def postprocess_smart_anonymize(
         # harte Bereiche aus den ORIGINAL-Fundstellen VOR jedem Plausibilitaetsfilter (SEC-Zusatzbedingung)
         _hart = [(x.start, x.end) for x in list(detektor) + _regel_vorab if x.type in HARTE_TYPEN]
         _alle = [(x.start, x.end) for x in list(detektor) + _regel_vorab]
-        _frei, nicht_herabgestuft = _ak.entscheide(
+        _frei, nicht_herabgestuft, _zusatz = _ak.entscheide(
             original, [(x.start, x.end, x.type, x.quelle) for x in detektor], _hart, _alle)
     for s in detektor:
         if anlagenkontext and (s.start, s.end) in _frei:
             verworfen[_ak.GRUND] += 1
             herabgestuft.append({"original": s.wert(original), "type": s.type, "start": s.start,
                                  "confidence": s.confidence, "bauteilwort": _frei[(s.start, s.end)],
+                                 "beleg": _ak._lokaler_beleg(original, s.start, s.end, _alle)[0],
                                  "grund": _ak.GRUND})
             continue
         if s.type not in HARTE_TYPEN:
@@ -488,7 +492,11 @@ def postprocess_smart_anonymize(
     ]
     bekannte = _bekannte_nachziehen(original, bekannt)
     spans = _aufloesen(behalten + regel + bekannte, original)
-    spans = _aufloesen(_gleiche_werte_nachziehen(original, spans), original)
+    if anlagenkontext:
+        # ungemeldete, unklare Vorkommen eines Kennungswerts: zusaetzlich maskieren (fail-closed)
+        spans = spans + [Span(a, b, t, "anlagenkontext-unklar", PRIO_DETEKTOR, 1.0) for a, b, t in _zusatz]
+    spans = _aufloesen(_gleiche_werte_nachziehen(
+        original, spans, tuple(_frei) if anlagenkontext else ()), original)
     spans = _aufloesen(_vollform_einschliessen(original, spans, bekannt), original)
     spans, mapping, stat = _platzhalter_vergeben(original, spans, prefix, bekannt)
     text_aus = ausgeben(original, spans)
