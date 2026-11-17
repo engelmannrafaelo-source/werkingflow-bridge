@@ -42,7 +42,7 @@ from __future__ import annotations
 import logging
 import time
 import uuid
-from typing import Optional
+from typing import Any, Optional
 
 from fastapi import HTTPException
 
@@ -203,8 +203,14 @@ async def enforce_budget(
     project_id: Optional[str] = None,
     hard_cap_hint: bool = False,
     call_kind: Optional[str] = None,
+    strict_reserve_eur: Optional[float] = None,
+    strict_defer: bool = False,
 ) -> None:
     """
+    strict_monthly (werking-schema-generator): instead of a pre-check, an ATOMIC reservation of
+    strict_reserve_eur (the caller's cost upper bound) — src/budget/strict_reservation.py. A strict call
+    without an upper bound is refused (only the chat path computes one).
+
     Raise HTTPException(402) if the user's budget for this app is exhausted.
     Returns None (lets the call proceed) in every other case.
 
@@ -442,9 +448,23 @@ async def enforce_budget(
         # plans never gate on the monthly tenant budget.
         return
 
+    if strict_monthly:
+        if strict_defer:
+            # Weg A (16.11.): die Reservierung erfolgt DIREKT VOR DEM VERSAND (strict_reserve_pending,
+            # main.py vor dem Backend-Versand), damit Ablehnungen davor (Guard, 424, Routing) keinen Topf binden.
+            _strict_prepare(uid, app_id, plan, strict_reserve_eur)
+        else:
+            await _strict_reserve(uid, app_id, plan, strict_reserve_eur)
+        return
+
     try:
         result = await evaluate_budget(uid, plan.id, estimated_cost_eur)
     except Exception as e:  # noqa: BLE001 — fail-open: infra error must not kill the AI path
+        if strict_monthly:
+            raise HTTPException(status_code=503, detail={
+                "error": "budget_state_unavailable", "appId": app_id,
+                "message": "Budget derzeit nicht prüfbar.",
+            }) from e
         if plan.budget_plan_id is not None:
             raise HTTPException(status_code=503, detail={
                 "error": "budget_state_unavailable", "appId": app_id,
@@ -476,7 +496,77 @@ async def enforce_budget(
 
     # Not allowed for some other reason (future enum values). Let through and log
     # loud so we notice if a new reason needs adding to _BLOCKING_REASONS.
+    # strict_monthly refuses instead: an unknown "not allowed" must not become an unmetered call (Pruefung R1 B1).
+    if strict_monthly:
+        raise HTTPException(status_code=402, detail={
+            "error": "budget_exhausted", "reason": reason, "appId": app_id,
+            "planId": result.get("effectivePlanId", plan.id),
+            "totalRemainingEur": result.get("totalRemainingEur", 0.0),
+            "message": "API-Budget nicht verfügbar.",
+        })
     logger.warning(
         "budget gate: not-allowed reason=%s NOT in _BLOCKING_REASONS — letting call through (check if this reason should block)",
         reason,
     )
+
+
+def _strict_check(app_id: str, plan: Any, amount: Optional[float]) -> None:
+    if plan.trial or plan.interval != "month":
+        raise HTTPException(status_code=503, detail={"error": "budget_product_unconfigured", "appId": app_id})
+    if amount is None or not (amount > 0):
+        raise HTTPException(status_code=403, detail={
+            "error": "strict_reservation_required", "appId": app_id,
+            "message": "Dieser Weg ist für die Schemafunktion nicht freigegeben.",
+        })
+
+
+def _strict_prepare(uid: Any, app_id: str, plan: Any, amount: Optional[float]) -> None:
+    """strict_monthly, Chat-Weg: alles pruefen, Reservierung als ausstehend merken (noch kein Topf gebunden)."""
+    from src.budget.strict_reservation import StrictPending, current, pending
+
+    current.set(None)
+    pending.set(None)
+    _strict_check(app_id, plan, amount)
+    pending.set(StrictPending(uid=uid, app_id=app_id, plan=plan, amount_eur=float(amount)))
+
+
+async def strict_reserve_pending() -> None:
+    """Direkt vor dem Versand: die im Tor vorbereitete Reservierung jetzt atomar anlegen (oder ablehnen).
+    Ohne vorbereitete Reservierung: 503 — eine strict-App wird nie ungedeckt versandt."""
+    from src.budget.strict_reservation import pending
+
+    p = pending.get()
+    pending.set(None)
+    if p is None:
+        raise HTTPException(status_code=503, detail={
+            "error": "budget_state_unavailable", "appId": "werking-schema-generator",
+            "message": "Budget derzeit nicht prüfbar.",
+        })
+    await _strict_reserve(p.uid, p.app_id, p.plan, p.amount_eur)
+
+
+async def _strict_reserve(uid: Any, app_id: str, plan: Any, amount: Optional[float]) -> None:
+    """strict_monthly: atomic reservation or refusal — never a pass-through (Root-Klarstellung 16.11.2026)."""
+    from src.budget.strict_reservation import StrictReservation, current, reserve_via_platform
+
+    current.set(None)
+    _strict_check(app_id, plan, amount)
+    try:
+        erg = await reserve_via_platform(user_id=uid, plan_id=plan.id, amount_eur=amount)
+    except Exception as e:  # noqa: BLE001 — no clear answer: fail closed
+        logger.error("budget gate: strict reservation without clear answer (%s) — refusing 503", e)
+        raise HTTPException(status_code=503, detail={
+            "error": "budget_state_unavailable", "appId": app_id, "message": "Budget derzeit nicht prüfbar.",
+        }) from e
+    if not erg.get("ok"):
+        logger.info("budget gate: STRICT BLOCKED user=%s app=%s plan=%s reason=%s amount=%.6f remaining=%s",
+                    uid, app_id, plan.id, erg.get("reason"), amount, erg.get("remainingEur"))
+        raise HTTPException(status_code=402, detail={
+            "error": "budget_exhausted", "reason": erg.get("reason") or "strict_monthly_exhausted",
+            "appId": app_id, "planId": plan.id, "totalRemainingEur": erg.get("remainingEur", 0.0),
+            "message": "API-Budget aufgebraucht.",
+        })
+    current.set(StrictReservation(reservation_id=erg["reservationId"], user_id=str(uid),
+                                  plan_id=plan.id, amount_eur=amount))
+    logger.info("budget gate: strict reserved id=%s user=%s plan=%s amount=%.6f remaining=%s",
+                erg["reservationId"], uid, plan.id, amount, erg.get("remainingEur"))

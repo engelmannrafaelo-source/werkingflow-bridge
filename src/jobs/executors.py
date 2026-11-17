@@ -388,6 +388,9 @@ _ATTRIBUTION_HEADERS = {
     # Energy-Abo-Modus: the job POST's validated X-Funding-Source
     # (jobs/routes.py FUNDING_SOURCE_KEY) — the self-call is funded the same way.
     "funding_source": "X-Funding-Source",
+    # Schema-EU route stamp (path B v2): persisted by POST /v1/jobs from the LB header only; the self-call to
+    # localhost bypasses the LB, so without it _chat_completions_lauf refuses the Schema chat (schema_route_required).
+    "schema_route": "X-Bridge-Schema-Route",
 }
 
 # Last-resort caller identity for self-calls whose triggering job carried NO

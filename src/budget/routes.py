@@ -378,6 +378,16 @@ class DeductRequest(BaseModel):
     idempotencyKey: Optional[str] = Field(
         default=None, min_length=_dedup.MIN_KEY_LENGTH, max_length=_dedup.MAX_KEY_LENGTH,
     )
+    # strict_monthly (src/budget/strict_reservation.py): the reservation this deduction settles,
+    # in the SAME transaction (offen -> abgerechnet). Optional; absent = old contract.
+    reservationId: Optional[uuid.UUID] = None
+
+
+class StrictReserveRequest(BaseModel):
+    reservationId: uuid.UUID
+    userId: str
+    planId: str
+    amountEur: float = Field(gt=0)
 
 
 def _parse_raw_monthly(budget_row: Any) -> dict:
@@ -412,6 +422,7 @@ async def apply_budget_deduction(
     plan_id: str,
     actual_cost_eur: float,
     idempotency_key: Optional[str] = None,
+    reservation_id: Optional[uuid.UUID] = None,
 ) -> Dict[str, Any]:
     """
     Atomically deduct actual_cost_eur from the user's MONTHLY budget + TopUp lots.
@@ -542,6 +553,11 @@ async def apply_budget_deduction(
 
             # Persist FIFO-reduced TopUp lots (only the changed ones).
             await _persist_topup_lots(conn, old_lots, result.new_top_up_lots)
+            if reservation_id is not None:
+                # strict_monthly: settle the reservation in THIS transaction (row lock held above).
+                from src.budget.strict_reservation import settle_in_tx
+                await settle_in_tx(conn, reservation_id=reservation_id, user_id=user_id,
+                                   plan_id=effective_plan_id, actual_eur=actual_cost_eur)
 
             answer = {
                 "fromMonthly": result.from_monthly,
@@ -561,6 +577,7 @@ async def apply_budget_deduction_via_platform(
     plan_id: str,
     actual_cost_eur: float,
     idempotency_key: Optional[str] = None,
+    reservation_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     """The worker's way to apply_budget_deduction, over POST /v1/budget/deduct
     (ADR-0009 Schritt 2c).
@@ -600,6 +617,7 @@ async def apply_budget_deduction_via_platform(
             "planId": plan_id,
             "actualCostEur": actual_cost_eur,
             **({"idempotencyKey": idempotency_key} if idempotency_key else {}),
+            **({"reservationId": reservation_id} if reservation_id else {}),
         },
         # Keyed: safe to retry a lost answer (see above). Keyless: never.
         retries=_dedup.DEDUCT_RETRIES_WITH_KEY if idempotency_key else 0,
@@ -624,6 +642,22 @@ async def apply_budget_deduction_via_platform(
     )
 
 
+@router.post("/strict/reserve")
+async def budget_strict_reserve(
+    body: StrictReserveRequest,
+    _claims: AuthClaims = Depends(require_service_token),
+) -> Dict[str, Any]:
+    """Atomare Reservierung fuer strict_monthly (siehe src/budget/strict_reservation.py).
+    Service-Token only (wie /topup/credit): ein Nutzer-JWT koennte sonst fremde Toepfe blockieren."""
+    from src.budget.strict_reservation import db_reserve
+
+    try:
+        return await db_reserve(reservation_id=body.reservationId, user_id=_parse_user_id(body.userId),
+                                plan_id=body.planId, amount_eur=body.amountEur)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
 @router.post("/deduct")
 async def budget_deduct(
     body: DeductRequest,
@@ -633,6 +667,7 @@ async def budget_deduct(
     try:
         return await apply_budget_deduction(
             user_id, body.planId, body.actualCostEur, body.idempotencyKey,
+            reservation_id=body.reservationId,
         )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))

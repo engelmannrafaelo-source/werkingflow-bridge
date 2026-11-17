@@ -381,6 +381,14 @@ class VisionProvider:
         Returns:
             VisionResponse with analysis result
         """
+        if credit_pool.PROD_KEY_ONLY.get() and not self.api_key:
+            # Schema-Direktweg: nur der Prod-eigene Schluessel, kein Rueckfall auf den Pool (fail-closed, nicht retrybar).
+            raise HTTPException(status_code=424, detail={
+                "error": {"message": "Prod key for the Schema direct route is not configured; no pool fallback.",
+                          "type": "service_unavailable", "code": "schema_prod_key_missing"}})
+        if credit_pool.PROD_KEY_ONLY.get():
+            # Schema-Direktweg (Prod-Schluessel, nie Pool): kein Abo-Bildweg, kein Pool-Fallback (Merge develop 17.11.).
+            subscription_fallback = False
         if subscription_fallback is None:
             # Erst der Schalter, dann der Import: der GPU-Privacy-Dienst nutzt
             # diese Datei ohne den Rückfall (dort nie gesetzt) und braucht
@@ -389,7 +397,7 @@ class VisionProvider:
             if os.getenv("ENERGY_STAGING_SUBSCRIPTION_FALLBACK"):
                 from src.providers import funding_policy as _fp
                 subscription_fallback = _fp.subscription_fallback_in_context()
-        if fallback_kette is not None and (subscription_fallback or not credit_pool.enabled()):
+        if fallback_kette is not None and (subscription_fallback or not credit_pool.pool_for_this_call()):
             # S1: der Anbieter-Fallback wird nur ueber den Pool abgerechnet
             # (Settlement je Modell). Nie still ohne Fallback weiter.
             from src.providers.fallback_faehigkeit import FallbackNichtMoeglich
@@ -487,7 +495,7 @@ class VisionProvider:
                     "bewerter": lambda antwort: fallback_bewerten(antwort, model, fallback_kette),
                 },
             )
-        elif credit_pool.enabled():
+        elif credit_pool.pool_for_this_call():
             response, credit_meta = await credit_pool.post_messages(request_body, timeout)
         else:
             async with httpx.AsyncClient(timeout=timeout) as client:

@@ -984,6 +984,7 @@ app.add_middleware(DeliveryProbeMiddleware)
 # ADR-0010 hop the dev URL is served by prod workers. Pure ASGI.
 app.add_middleware(ServedByMiddleware)
 
+
 # Concurrency limiter — only memory-threshold safety net.
 # Adaptive cap_tokens does the real throttling per worker; hardcoded
 # concurrency caps would override that learning. Default is effectively
@@ -2699,6 +2700,59 @@ def enforce_attribution(request: Request) -> dict:
     return attribution
 
 
+async def _schema_noneu_principal_name(request: Request) -> Optional[str]:
+    """Principal that OPENS the private non-EU Schema test route (Pruefung R1 A1).
+
+    Direct call: the authenticated, non-legacy ``request.state.principal``. Job self-call (worker key = legacy):
+    the principal that CREATED the job, stored server-side at POST /v1/jobs (attribution test_ki_prinzipal, never
+    from the body), and only if that job is running and its stored user is this call's user. Anything else -> None.
+    """
+    principal = getattr(request.state, "principal", None)
+    if principal is not None and not getattr(principal, "is_legacy", False):
+        return getattr(principal, "name", None)
+    from src.jobs.selbstaufruf import JOB_LAUF_HEADER
+    job_id = (request.headers.get(JOB_LAUF_HEADER) or "").strip()
+    if not job_id:
+        return None
+    # Pruefung R2 H5: den Job-Kopf nur vom worker-internen Selbstaufruf annehmen (executors.SELF_BASE_URL
+    # http://localhost:8000 -> Peer ist Loopback). uvicorn uebernimmt X-Forwarded-For nur von 127.0.0.1
+    # (FORWARDED_ALLOW_IPS-Vorgabe, auf Prod nicht gesetzt), ein externer Aufrufer kann den Peer also nicht faelschen.
+    # Ueber nginx gesprungene Selbstaufrufe (Kapazitaets-429-Hop) bleiben damit zu (fail-closed).
+    _peer = getattr(getattr(request, "client", None), "host", None)
+    if _peer not in ("127.0.0.1", "::1"):
+        return None
+    from src.jobs import store_client
+    from src.budget.test_ki_deckel import JOB_PRINZIPAL_KEY
+    try:
+        job = await store_client.get_job(job_id)
+    except Exception as e:  # noqa: BLE001 — not readable: the route stays closed
+        logger.error(f"schema non-EU test: job store not readable ({type(e).__name__}) — principal unknown, refused")
+        return None
+    if not isinstance(job, dict) or job.get("status") != "running":
+        return None
+    attr = job.get("attribution") or {}
+    if attr.get("user_id") != extract_attribution_context(request).get("user_id"):
+        return None
+    name = attr.get(JOB_PRINZIPAL_KEY)
+    return name if isinstance(name, str) and name else None
+
+
+async def _schema_assert_noneu(request: Request, operator_pin: Optional[str], model_id: Optional[str]) -> None:
+    """All three locks of the non-EU test route for THIS request (raises SchemaBedrockExpectationError)."""
+    import os as _nx_os
+    from src.routing.schema_bedrock_guard import (
+        assert_noneu_test_allowed, noneu_test_users, noneu_test_principals,
+        NONEU_TEST_USERS_ENV, NONEU_TEST_PRINCIPALS_ENV,
+    )
+    assert_noneu_test_allowed(
+        operator_pin=operator_pin, model_id=model_id,
+        user_id=extract_attribution_context(request).get("user_id"),
+        noneu_test_users=noneu_test_users(_nx_os.getenv(NONEU_TEST_USERS_ENV)),
+        principal_name=await _schema_noneu_principal_name(request),
+        noneu_test_principals=noneu_test_principals(_nx_os.getenv(NONEU_TEST_PRINCIPALS_ENV)),
+    )
+
+
 def extract_attribution_context(request: Request) -> dict:
     """
     Extract multi-dimension attribution headers from request.
@@ -3131,12 +3185,41 @@ async def _chat_completions_lauf(
                 _arrival_est_tokens,
                 _gate_out_tokens,
             )
+            # strict_monthly (werking-schema-generator): reserve a cost UPPER BOUND atomically
+            # (src/budget/strict_reservation.py). max_tokens is capped so the bound holds.
+            _strict_bound = None
+            if _gate_attr.get("app_id") == "werking-schema-generator":
+                from src.budget import strict_reservation as _strict_mod
+                if getattr(request_body, "stream", False):
+                    # Pruefung R4 N1: ein abgebrochener Stream bucht nur die Eingabe (output_tokens kommen
+                    # erst am Stromende) und schliesst die Reservierung ab, AWS berechnet die Ausgabe trotzdem.
+                    raise HTTPException(status_code=403, detail={
+                        "error": "strict_stream_not_allowed", "appId": "werking-schema-generator",
+                        "message": "Streaming ist für die Schemafunktion nicht freigegeben.",
+                    })
+                _mt = getattr(request_body, "max_tokens", None)
+                if not _mt or _mt > _strict_mod.MAX_TOKENS_CAP:
+                    request_body.max_tokens = _strict_mod.MAX_TOKENS_CAP
+                # Weg A (16.11.): diese App ruft Bedrock mit dem Ein-Versuch-Client; die Obergrenze rechnet mit
+                # dessen gelesener Versuchszahl (fail closed, falls sie nicht 1 ist, wird entsprechend mehr reserviert).
+                from src.bedrock_service import _BEDROCK_BOTO_CONFIG_EIN_VERSUCH as _bcfg
+                # Vertex EU (zweite zugelassene Schema-Route, 17.11.): ein einziger httpx-POST (call_vertex_eu) und
+                # Ledger-Preis * VERTEX_EU_PRICE_MULT. Die Route steht hier noch nicht fest (Pin wird erst danach
+                # aufgeloest) -> die Obergrenze nimmt fuer BEIDE Routen das Maximum: Versuche max(Bedrock, 1) und
+                # Preisfaktor max(1, Vertex). Ueberblockung moeglich, Ueberziehung nie.
+                from src.pricing import VERTEX_EU_PRICE_MULT as _vx_mult
+                _strict_bound = round(_strict_mod.cost_upper_bound_eur(
+                    getattr(request_body, "model", None), request_body,
+                    versuche=max(_strict_mod.anbieter_versuche(_bcfg), 1),
+                ) * max(1.0, float(_vx_mult)), 6)
             await enforce_budget(
                 user_id=_gate_attr.get("user_id"),
                 app_id=_gate_attr.get("app_id"),
                 estimated_cost_eur=_gate_cost,
                 project_id=_gate_attr.get("workflow_id"),
                 hard_cap_hint=hard_cap_hint_from_request(request),
+                strict_reserve_eur=_strict_bound,
+                strict_defer=_strict_bound is not None,
             )
         except HTTPException as _budget_402:
             # A 402 (budget exhausted) rejects the call before any usage_events
@@ -3184,6 +3267,19 @@ async def _chat_completions_lauf(
                     )
             raise  # 402 — propagate to the client
         except Exception as _ge:  # noqa: BLE001 — gate must never crash the path
+            # strict_monthly (werking-schema-generator): the public product must never run unmetered —
+            # an unclassified gate error refuses instead of letting the call through (Pruefung R1 B1).
+            try:
+                from src.routing.app_provider_policy import _resolve_app_id as _strict_resolve_app
+                _strict_app = _strict_resolve_app(request)[0]
+            except Exception:  # noqa: BLE001 — fall back to the raw claim, refusing is the safe side
+                _strict_app = request.headers.get("X-App-ID")
+            if _strict_app == "werking-schema-generator":
+                logger.error(f"budget gate unexpected error for werking-schema-generator (refusing 503): {_ge}")
+                raise HTTPException(status_code=503, detail={
+                    "error": "budget_state_unavailable", "appId": "werking-schema-generator",
+                    "message": "Budget derzeit nicht prüfbar.",
+                }) from _ge
             logger.error(f"budget gate unexpected error (letting call through): {_ge}")
         try:
             from src.middleware.rolling_metrics import get_rolling_metrics
@@ -3753,6 +3849,102 @@ async def _chat_completions_lauf(
                 }},
             )
 
+        # SCHEMA-BEDROCK-GUARD: the Schema generator must run on Bedrock EU (operator pin, eu-central-1,
+        # approved model) on every bridge whose BRIDGE_ORIGIN_ID is not 'dev'; anything else is refused BEFORE dispatch — no
+        # Anthropic fallback, and a client X-App-Env cannot downgrade it. See routing/schema_bedrock_guard.py.
+        from src.routing.schema_bedrock_guard import (
+            guard_applies as _schema_guard_applies,
+            assert_schema_expected_route, SchemaBedrockExpectationError,
+        )
+        from src.routing.app_provider_policy import _resolve_app_id as _schema_resolve_app_id
+        from src.auth import bedrock_credential_manager as _schema_bedrock_creds
+        from src.federation import self_origin_id as _schema_origin_id, get_request_origin as _schema_request_origin
+        _schema_app_id, _ = _schema_resolve_app_id(request)
+        if _schema_guard_applies(_schema_app_id, _schema_origin_id(), _schema_request_origin()):
+            # Path B (Root review R3): on a non-dev bridge the call must have come through the LB's
+            # no-backup Schema route; refused before dispatch with 403 (not retried by the LB).
+            from src.routing.schema_bedrock_guard import assert_schema_route, SCHEMA_ROUTE_HEADER
+            try:
+                assert_schema_route(_schema_origin_id(), request.headers.get(SCHEMA_ROUTE_HEADER))
+            except SchemaBedrockExpectationError as e:
+                raise HTTPException(
+                    status_code=403,
+                    detail={"error": {"message": str(e), "type": "permission_error", "code": e.code,
+                                      "hint": "Call the bridge through its LB; Schema traffic uses the local Schema-EU route only."}},
+                )
+            _schema_backend = getattr(getattr(backend_config, "backend", None), "value", None)
+            _schema_ready = False
+            if _schema_backend == "anthropic_direct":
+                # Privater Nicht-EU-Testweg (nur Allowlist-Benutzer, siehe schema_bedrock_guard.NONEU_TEST_PROVIDER):
+                # bereit, wenn das Direkt-Tier nutzbar ist (Credit-Pool oder Prepaid-Schluessel). Sonst 424.
+                # Kanzler-Wort 17.11.: Schema-Direktweg nur ueber den Prod-eigenen Schluessel, nie den Pool -> bereit
+                # NUR, wenn ANTHROPIC_VISION_API_KEY gesetzt ist (ein aktiver Pool macht diesen Weg NICHT bereit).
+                _schema_ready = bool(os.getenv("ANTHROPIC_VISION_API_KEY"))
+            elif _schema_backend == "vertex_eu":
+                # Vertex-Route (Pin vertex_eu): Schalter + Service-Account muessen da sein, sonst 424 (kein LB-Retry,
+                # kein anderer Weg). Kein Bedrock-Rueckfall.
+                from src.vertex_eu_service import readiness as _schema_vertex_ready, VertexEUNotConfigured as _SchemaVNC
+                try:
+                    _schema_vertex_ready()
+                    _schema_ready = True
+                except _SchemaVNC:
+                    _schema_ready = False
+            else:
+                _schema_ready = bool(_schema_bedrock_creds.validate()[0])
+            if not _schema_ready:
+                # Active guard without Bedrock access: refuse with a status the LB does NOT retry (424), so the
+                # Prod LB cannot fail over to the Dev backup because of it (never fall back to Anthropic).
+                raise HTTPException(
+                    status_code=424,
+                    detail={
+                        "error": {
+                            "message": ("Schema generator route is not available on this worker "
+                                        f"(backend={_schema_backend!r}: missing switch or credentials). Nothing was routed elsewhere."),
+                            "type": "configuration_error",
+                            "code": {"vertex_eu": "schema_vertex_eu_unavailable", "anthropic_direct": "schema_noneu_test_unavailable"}.get(
+                                _schema_backend, "schema_bedrock_unavailable"),
+                            "retryable": False,
+                            "hint": "Restore the pinned route's credentials; Schema traffic uses only its EU route.",
+                        }
+                    },
+                )
+            try:
+                if backend_config is None:
+                    raise SchemaBedrockExpectationError(
+                        "schema_requires_bedrock",
+                        "Schema generator call has no resolved backend; refused (no Anthropic fallback).",
+                    )
+                import os as _schema_os
+                from src.vertex_eu_service import DEFAULT_ENDPOINT as _SCHEMA_VERTEX_DEFAULT_ENDPOINT
+                from src.routing.schema_bedrock_guard import (
+                    noneu_test_users as _schema_noneu_users, NONEU_TEST_USERS_ENV as _SCHEMA_NONEU_ENV,
+                    noneu_test_principals as _schema_noneu_principals, NONEU_TEST_PRINCIPALS_ENV as _SCHEMA_NONEU_PRINC_ENV,
+                )
+                # Nicht-EU-Testweg: assert_schema_expected_route prueft alle drei Schloesser (Pin, Liste, Test-Principal).
+                assert_schema_expected_route(
+                    effective_backend=backend_config.backend,
+                    operator_pin=operator_pinned_provider,
+                    region=backend_config.region,
+                    model_id=backend_config.model_id,
+                    vertex_endpoint=(_schema_os.getenv("VERTEX_EU_ENDPOINT") or _SCHEMA_VERTEX_DEFAULT_ENDPOINT),
+                    user_id=extract_attribution_context(request).get("user_id"),
+                    noneu_test_users=_schema_noneu_users(_schema_os.getenv(_SCHEMA_NONEU_ENV)),
+                    principal_name=await _schema_noneu_principal_name(request),
+                    noneu_test_principals=_schema_noneu_principals(_schema_os.getenv(_SCHEMA_NONEU_PRINC_ENV)),
+                )
+            except SchemaBedrockExpectationError as e:
+                raise HTTPException(
+                    status_code=403,
+                    detail={
+                        "error": {
+                            "message": str(e),
+                            "type": "permission_error",
+                            "code": e.code,
+                            "hint": "Schema generator traffic uses only its pinned EU route; fix the operator pin/model/region, nothing was routed elsewhere.",
+                        }
+                    },
+                )
+
         # BEDROCK-GATE: effektiver Backend darf nur per Operator-Pin Bedrock
         # sein (deckt backend=bedrock UND Bedrock-provider_tiers ab) — jeder
         # Bedrock-Call muss einem echten User zuordenbar sein.
@@ -3842,6 +4034,39 @@ async def _chat_completions_lauf(
                         }
                     },
                 )
+
+        # =======================================================================
+        # STRICT_MONTHLY (werking-schema-generator), Weg A 16.11.2026: Reservierung DIREKT VOR DEM VERSAND.
+        # Alle Ablehnungen davor (Schema-Guard, 424, Routing, Text-Wegwahl) binden keinen Topf. Versand nur
+        # ueber Bedrock ohne Stream mit dem Ein-Versuch-Client; jeder andere Backend-Zweig wird abgewiesen.
+        # Hinter diesem Punkt liegen ALLE Backend-Zweige (Bedrock, Vertex, anthropic_direct, OpenAI, Gemini, SDK).
+        # =======================================================================
+        _strict_dispatch = extract_attribution_context(request).get("app_id") == "werking-schema-generator"
+        if _strict_dispatch:
+            # Zugelassen: Bedrock (Ein-Versuch-Client) und Vertex EU (ein einziger httpx-POST, call_vertex_eu), jeweils
+            # ohne Stream. Welche der beiden, entscheidet allein der Schema-Guard oben (Operator-Pin).
+            # Dazu der private Nicht-EU-Testweg anthropic_direct (nur Allowlist-Benutzer mit Operator-Pin, vom Guard
+            # oben geprueft): genau ein bezahlter Versuch (credit_pool.post_messages: 4xx unberechnet, 5xx/Transport
+            # ohne Wiederholung), Ledger-Preis Faktor 1 -> von derselben Obergrenze gedeckt.
+            if not (backend_config and backend_config.backend in (
+                    BackendType.BEDROCK, BackendType.VERTEX_EU, BackendType.ANTHROPIC_DIRECT)) or request_body.stream:
+                raise HTTPException(status_code=403, detail={
+                    "error": "strict_backend_not_allowed", "appId": "werking-schema-generator",
+                    "message": "Dieser Weg ist für die Schemafunktion nicht freigegeben.",
+                })
+            if backend_config.backend == BackendType.ANTHROPIC_DIRECT:
+                # Pruefung R1 H2: der Nicht-EU-Testweg wird hier IM SELBEN REQUEST erneut gegen alle drei Schloesser
+                # geprueft — auch wo der Schema-Guard aus ist (Dev-Bridge ohne Prod-Stempel). Kein Topf gebunden.
+                from src.routing.schema_bedrock_guard import SchemaBedrockExpectationError as _SxErr
+                try:
+                    await _schema_assert_noneu(request, operator_pinned_provider, backend_config.model_id)
+                except _SxErr as e:
+                    raise HTTPException(status_code=403, detail={
+                        "error": "strict_backend_not_allowed", "code": e.code, "appId": "werking-schema-generator",
+                        "message": "Dieser Weg ist für die Schemafunktion nicht freigegeben.",
+                    })
+            from src.budget.gate import strict_reserve_pending
+            await strict_reserve_pending()
 
         # =======================================================================
         # BEDROCK ROUTING: Direct boto3 call, bypass Claude Code SDK
@@ -3959,7 +4184,7 @@ async def _chat_completions_lauf(
                 )
             else:
                 try:
-                    response = await call_bedrock(request_body, backend_config.region)
+                    response = await call_bedrock(request_body, backend_config.region, ein_versuch=_strict_dispatch)
                 except HTTPException as bedrock_err:
                     await _persist_bedrock_usage(
                         input_tokens=0, output_tokens=0, status="error",
@@ -4239,9 +4464,15 @@ async def _chat_completions_lauf(
             # und nur, wenn das Tor reserviert hat. Die Messung geht nie in die Antwort.
             _test_ki_messung = _test_ki_deckel.MessungZiel() if _test_ki_deckel.ist_gedeckelt() else None
             try:
-                response_data = await call_anthropic_direct(
-                    request_body, backend_config, messung_ziel=_test_ki_messung,
-                )
+                # Schema-Strict-Dispatch: Prod-eigener Schluessel, nie Pool (credit_pool.PROD_KEY_ONLY, fail-closed).
+                from src.providers.credit_pool import PROD_KEY_ONLY as _prod_key_only
+                _pko_token = _prod_key_only.set(bool(_strict_dispatch))
+                try:
+                    response_data = await call_anthropic_direct(
+                        request_body, backend_config, messung_ziel=_test_ki_messung,
+                    )
+                finally:
+                    _prod_key_only.reset(_pko_token)
                 direct_credit_meta = response_data.get("x_api_reserve", {})
             except Exception as direct_err:
                 # Test-KI-Deckel: nichts gemessen -> Reservierung bleibt voll stehen.
@@ -8212,6 +8443,19 @@ async def research(
     """
     # Verify API key
     await verify_api_key(request, credentials)
+
+    # SCHEMA-BEDROCK-GUARD: this dispatcher may switch Bedrock to Anthropic by design -> refused for Schema.
+    from src.routing.schema_bedrock_guard import (
+        assert_schema_research_refused, SchemaBedrockExpectationError as _SchemaResearchError,
+    )
+    from src.routing.app_provider_policy import _resolve_app_id as _schema_research_app
+    try:
+        assert_schema_research_refused(_schema_research_app(request)[0])
+    except _SchemaResearchError as e:
+        raise HTTPException(
+            status_code=403,
+            detail={"error": {"message": str(e), "type": "permission_error", "code": e.code}},
+        )
 
     # Attribution enforcement
     enforce_attribution(request)

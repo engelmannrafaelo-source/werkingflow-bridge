@@ -538,11 +538,32 @@ def _principal_app_from_client_id(client_id: Optional[str]) -> Optional[str]:
     return parts[0] if parts else None
 
 
+#: Praefix der Schema-Principal-Schluessel (src/principals_routes.py, nginx $is_schema_key).
+SCHEMA_TOKEN_PREFIX = "wsg_"
+
+
+def _is_job_path(path: Optional[str]) -> bool:
+    return path == "/v1/jobs" or (path or "").startswith("/v1/jobs/")
+
+
 async def verify_api_key(request: Request, credentials: Optional[HTTPAuthorizationCredentials] = None):
     """
     Verify API key if one is configured for FastAPI endpoint protection.
     This is separate from Claude Code authentication.
     """
+    # Schema-Schluessel (wsg_, src/principals_routes.py) nur im Job-Pfad (Kanzler-Entscheid Weg A 16.11.2026):
+    # der Job-Runner ruft den Chat mit dem Worker-Schluessel und uebernimmt die Wiederholungen. Vor JEDER
+    # anderen Pruefung — auch wenn kein API-Schluessel konfiguriert ist — und unabhaengig von
+    # BRIDGE_PRINCIPALS_ENABLED.
+    if credentials is None:
+        credentials = await security(request)
+    if (credentials and (credentials.credentials or "").startswith(SCHEMA_TOKEN_PREFIX)
+            and not _is_job_path(request.url.path)):
+        raise HTTPException(
+            status_code=403,
+            detail="schema key may only call /v1/jobs",
+        )
+
     # Get the active API key (environment or runtime-generated)
     active_api_key = auth_manager.get_api_key()
     

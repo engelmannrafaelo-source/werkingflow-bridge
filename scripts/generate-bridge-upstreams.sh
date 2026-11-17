@@ -570,6 +570,12 @@ MAP
     echo "# Local build provenance only: no cross-bridge backup."
     emit_upstream claude_version 8 nobackup "$targets_name" "${workers[@]}"
     echo
+    echo "# Schema-EU route (werking-schema-generator, X-App-ID): local workers ONLY."
+    echo "# No cross-bridge entry on EITHER topology - a Schema request must never be"
+    echo "# answered by the peer bridge (Bedrock-EU promise; Root review R3, path B)."
+    echo "# Consumed by /__schema_local in the shared nginx.conf."
+    emit_upstream claude_schema_local 16 nobackup "$targets_name" "${workers[@]}"
+    echo
 
     # Direct policy targets never retry a different account behind the picker.
     # A new attempt must get a fresh release/priority decision.

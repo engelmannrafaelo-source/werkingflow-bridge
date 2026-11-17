@@ -97,6 +97,20 @@ class PoolUnavailable(HTTPException):
     src/providers/funding_policy.py)."""
 
 
+#: Schema-Direktweg (werking-schema-generator, anthropic_direct; Kanzler-Wort 17.11.2026): dieser Aufruf nutzt NUR den
+#: Prod-eigenen Schluessel ANTHROPIC_VISION_API_KEY, NIE den Pool (der Pool-Koordinator liegt auf der Dev-Bridge).
+#: Fehlt der Schluessel -> fail-closed (424), kein Rueckfall auf den Pool. Gesetzt nur im Direkt-Zweig von main.py fuer
+#: den Strict-Dispatch der Schema-App; alle anderen Apps sehen den Standard (False) und den Pool unveraendert.
+from contextvars import ContextVar  # noqa: E402
+
+PROD_KEY_ONLY: ContextVar[bool] = ContextVar("credit_pool_prod_key_only", default=False)
+
+
+def pool_for_this_call() -> bool:
+    """Pool only when enabled AND this call is not bound to the prod-own key."""
+    return enabled() and not PROD_KEY_ONLY.get()
+
+
 async def coordinator(method: str, path: str, data: dict | None = None) -> dict:
     url = os.getenv("ANTHROPIC_CREDIT_POOL_URL", "").rstrip("/")
     token = os.getenv("ANTHROPIC_CREDIT_POOL_TOKEN", "")

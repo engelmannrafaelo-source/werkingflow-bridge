@@ -50,6 +50,14 @@ _BEDROCK_BOTO_CONFIG = Config(
     retries={"max_attempts": 2, "mode": "standard"},
 )
 
+# strict_monthly (werking-schema-generator, src/budget/strict_reservation.py): GENAU EIN Versuch.
+# Jeder botocore-Versuch kann bei AWS berechnet werden, gebucht wird nur der erfolgreiche; deshalb
+# wiederholt fuer diese App nicht botocore, sondern der Job-Runner — mit je eigener Reservierung
+# (Pruefung Fix-N1N2, Kanzler-Entscheid Weg A 16.11.2026). Andere Apps behalten _BEDROCK_BOTO_CONFIG.
+_BEDROCK_BOTO_CONFIG_EIN_VERSUCH = _BEDROCK_BOTO_CONFIG.merge(
+    Config(retries={"total_max_attempts": 1, "mode": "standard"})
+)
+
 # AWS error codes that are identical on every worker (account/IAM/model-access
 # misconfiguration). Raised as 424 so nginx does NOT cross-worker-retry and
 # mask the real cause as "capacity_busy" — the client must see the message.
@@ -215,14 +223,15 @@ class BedrockClient:
 
         logger.info(f"Bedrock client initialized (region={self.default_region})")
 
-    def get_client(self, region: Optional[str] = None):
-        """Get boto3 bedrock-runtime client for specified region."""
+    def get_client(self, region: Optional[str] = None, ein_versuch: bool = False):
+        """Get boto3 bedrock-runtime client for specified region.
+        ein_versuch=True: Client ohne botocore-Wiederholung (strict_monthly)."""
         return boto3.client(
             "bedrock-runtime",
             region_name=region or self.default_region,
             aws_access_key_id=self.aws_access_key,
             aws_secret_access_key=self.aws_secret_key,
-            config=_BEDROCK_BOTO_CONFIG,
+            config=_BEDROCK_BOTO_CONFIG_EIN_VERSUCH if ein_versuch else _BEDROCK_BOTO_CONFIG,
         )
 
 
@@ -309,7 +318,8 @@ def convert_messages_to_anthropic(messages: List[Message]) -> tuple[Optional[str
 
 async def call_bedrock(
     request: ChatCompletionRequest,
-    region: Optional[str] = None
+    region: Optional[str] = None,
+    ein_versuch: bool = False,
 ) -> ChatCompletionResponse:
     """Call Bedrock API and return OpenAI-compatible response."""
 
@@ -383,7 +393,7 @@ async def call_bedrock(
     logger.info(f"Calling Bedrock: model={bedrock_model_id}, region={actual_region}")
 
     try:
-        boto_client = client.get_client(actual_region)
+        boto_client = client.get_client(actual_region, ein_versuch=ein_versuch)
 
         # boto3 is synchronous — called inline it parks the WHOLE uvicorn event
         # loop for the duration of the generation (read_timeout grants up to
