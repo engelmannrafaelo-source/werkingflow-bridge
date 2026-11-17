@@ -638,6 +638,7 @@ phase_preflight() {
     if [[ "$DRY_RUN" == "false" ]]; then
         info "Reclaiming disk (dangling images + build cache)..."
         local prune_out
+        log_sicherung_scanner_anheften "$host"
         prune_out=$(rssh "$host" "docker image prune -f >/dev/null 2>&1; docker builder prune -af 2>&1 | tail -1" 2>&1 || true)
         info "  ${prune_out:-prune done}"
     else

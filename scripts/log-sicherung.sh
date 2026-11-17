@@ -37,6 +37,23 @@ LOG_SICHERUNG_FUND_RC=3
 # der Dienst wurde nicht neu erzeugt und darf auch im Rollback nicht neu erzeugt werden.
 LOG_SICHERUNG_RC=4
 
+# Lokaler Halte-Tag fuer den Scanner (Fenster 17.11.2026, 08:09Z): ein nur per Digest gezogenes Image
+# hat keinen Tag und gilt fuer `docker image prune -f` (phase_preflight) als "dangling" -> der Deploy
+# loeschte seinen eigenen Scanner, die Vorpruefung brach ab. Der Tag zeigt auf DASSELBE Image (kein Pull,
+# kein neues Image); aufgerufen und geprueft wird weiter nur per Digest.
+LOG_SICHERUNG_GITLEAKS_HALT="${LOG_SICHERUNG_GITLEAKS_HALT:-bridge-log-sicherung/gitleaks:digest-halt}"
+
+# Vor jedem Image-Prune auf dem Dev-Host: Scanner anheften, falls vorhanden. Fehlt er, aendert sich
+# nichts; dann bricht die Vorpruefung (Phase 3.8) laut ab.
+log_sicherung_scanner_anheften() {
+    local host="$1"
+    if [[ "$host" != "$HETZNER_HOST" ]]; then
+        return 0
+    fi
+    rssh "$host" "docker image inspect '${LOG_SICHERUNG_GITLEAKS}' >/dev/null 2>&1 && docker tag '${LOG_SICHERUNG_GITLEAKS}' '${LOG_SICHERUNG_GITLEAKS_HALT}'" >/dev/null 2>&1 || true
+    return 0
+}
+
 # Vorpruefung EINMAL je Host vor Phase 4 (L-1 (b)): Scanner per Digest vorhanden, RepoDigest gleich.
 # Scheitert sie, ist noch kein Container angefasst; deploy_server setzt nur den Code zurueck.
 log_sicherung_vorpruefung() {
